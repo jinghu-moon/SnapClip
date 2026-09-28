@@ -218,30 +218,44 @@ pin://closed.v1
 
 ## 10. 分阶段引入
 
-### M0：前端基线
+两份设计文档使用同一条依赖顺序：契约先行，后端历史底座先于剪贴板接入，前端历史 UI 作为后端查询的消费层，截图能力随后接入。
 
-- 保持 Vue 3 + TypeScript + Vite。
-- 引入 Pinia、VueUse、Tabler Icons、Reka UI 和 CSS Tokens。
+### M0：统一契约与工程基线
+
+- 固定 Rust 2024、Vue 3/TypeScript、版本化 DTO、错误码和事件命名。
 - 建立 `infrastructure/tauri`、`app`、按需的 `features` 与 `shared/ui` 目录。
-- 移除脚手架欢迎页，完成主窗口基础布局和空状态。
+- 完成构建、类型检查、Rust 测试和许可证/依赖记录基线。
 
-### M1：历史 UI
+### M1：历史数据底座
 
-- 接入分页历史查询 DTO、虚拟列表、搜索和筛选；只将可见页轻量状态保存在 Pinia。
-- 完成文本、图片、HTML/RTF 和文件路径的预览状态。
-- 完成复制、收藏、置顶、删除和恢复的反馈闭环。
+- 实现 SQLite schema/migration、WAL/FTS5、单写者队列、BLAKE3 BlobStore 和 payload 引用；跨语义类型可共享字节文件但保留独立 payload 元数据。
+- 提供分页/游标历史查询 command；读连接与写连接职责分离。
+- 验证多格式 publication、事务一致性、BlobStore 原子写入、FTS 同步和启动时孤儿载荷回收；备份/恢复协议作为后续存储验收项。
 
-### M2：截图与任务反馈
+### M2：剪贴板与历史最小闭环
 
-- 接入截图开始、进度、完成和失败事件。
-- 接入 OCR 状态、取消和重试。
-- 完成预览、导出、贴图入口和任务通知。
+- 接入 `AddClipboardFormatListener`/`WM_CLIPBOARDUPDATE`、格式快照读取、序列号/自身写入去重。
+- 将文本、图片、HTML/RTF 和文件路径写入 M1 的 SQLite/BlobStore，完成复制回写和隐私规则。
 
-### M3：质量和性能
+### M3：主 UI 历史消费层
 
-- 增加 Playwright 交互测试和视觉回归。
-- 测量列表滚动、搜索响应、首屏渲染和 WebView 内存。
-- 根据真实组件数量决定是否引入 Histoire 和自动类型生成。
+- 在单 MainUI WebView 中接入分页查询 DTO、虚拟列表、搜索和筛选；只将可见页轻量状态保存在 Pinia。
+- 完成文本、图片、HTML/RTF 和文件路径的预览状态，以及收藏、置顶、删除、恢复反馈。
+
+### M4：截图与贴图闭环
+
+- 接入 SnapClip-old 的原生覆盖层、标注、复制、保存和贴图能力，完成原生窗口闭环。
+- 按 Windows 版本捕获能力矩阵验证区域/窗口/全屏、DPI、多显示器、设备恢复和降级路径。
+
+### M5：OCR 和截图增强
+
+- 接入可取消 OCR worker、截图 OCR 入库、取色、二维码和窗口/元素吸附。
+- 按负载基准选择 Response/Channel 或文件/映射传输，SharedBuffer 仅按需评估。
+
+### M6：滚动截图、质量与进程演进
+
+- 实现滚动截图 provider、撤销和拼接算法的渐进升级。
+- 增加 Playwright/视觉回归、性能基线和资源诊断；根据数据决定是否拆分 ClipAgent/CaptureHost/Worker。
 
 ## 11. 当前决策与待定事项
 
@@ -347,7 +361,7 @@ crates/
 ### 12.4 后端实施顺序
 
 1. 定义领域类型、publication/payload 模型、错误类型、版本化 DTO 和 Tauri command/event 适配层。
-2. 实现 SQLite schema/migration、WAL/FTS5、单写者队列、BlobStore、备份恢复和基础历史查询。
+2. 实现 SQLite schema/migration、WAL/FTS5、单写者队列、BlobStore 和基础历史查询；备份恢复策略在数据生命周期验收阶段完善。
 3. 实现剪贴板事件监听、全格式快照读取、去重、隐私规则和发布回滚。
 4. 建立单 MainUI WebView 的历史、搜索和设置界面，接入分页查询及虚拟列表。
 5. 接入 SnapClip-old 的截图、标注、复制、保存和贴图能力，完成原生窗口闭环及兼容矩阵验证。

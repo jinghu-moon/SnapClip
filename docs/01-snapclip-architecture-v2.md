@@ -299,42 +299,45 @@ SnapClip 自己写入剪贴板后会再次收到更新事件。发布器必须�
 
 ```sql
 CREATE TABLE clips (
-  id INTEGER PRIMARY KEY,
-  primary_type TEXT NOT NULL,
+  id TEXT PRIMARY KEY,
+  created_at_unix_ms INTEGER NOT NULL,
+  primary_kind TEXT NOT NULL,
   preview_text TEXT,
-  source_app TEXT,
-  created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL,
-  is_pinned INTEGER NOT NULL DEFAULT 0,
-  is_favorite INTEGER NOT NULL DEFAULT 0,
-  deleted_at INTEGER
+  source_app TEXT
 );
+CREATE INDEX clips_created_id ON clips(created_at_unix_ms DESC, id DESC);
 
 CREATE TABLE payloads (
-  id INTEGER PRIMARY KEY,
-  content_hash TEXT NOT NULL UNIQUE,
+  id TEXT PRIMARY KEY,
+  content_hash TEXT NOT NULL,
   kind TEXT NOT NULL,
-  size_bytes INTEGER NOT NULL,
-  storage_path TEXT,
-  text_content TEXT,
+  size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
+  storage_path TEXT NOT NULL,
   mime_type TEXT,
   width INTEGER,
-  height INTEGER
+  height INTEGER,
+  UNIQUE(content_hash, kind)
 );
 
 CREATE TABLE clip_payloads (
-  clip_id INTEGER NOT NULL REFERENCES clips(id),
-  payload_id INTEGER NOT NULL REFERENCES payloads(id),
+  clip_id TEXT NOT NULL REFERENCES clips(id) ON DELETE CASCADE,
+  payload_id TEXT NOT NULL REFERENCES payloads(id),
   role TEXT NOT NULL,
   PRIMARY KEY (clip_id, payload_id, role)
 );
+CREATE INDEX clip_payloads_payload_id ON clip_payloads(payload_id);
 
 CREATE TABLE clip_search (
-  clip_id INTEGER PRIMARY KEY REFERENCES clips(id),
+  clip_id TEXT PRIMARY KEY REFERENCES clips(id) ON DELETE CASCADE,
   text_content TEXT,
   ocr_text TEXT
 );
 ```
+
+迁移版本由 `schema_migrations` 记录。当前 M1 使用 `clips.id` 保存 publication ID，时间字段为 Unix 毫秒；
+payload 元数据按 `(content_hash, kind)` 去重，Blob 文件只按字节 BLAKE3 哈希去重，路径为
+`payloads/ab/<blake3>.blob`。写入先原子落 Blob，再由唯一写者在 SQLite 事务中写入 publication 和关联；
+崩溃留下的未引用 Blob 文件会在下次启动时清理。
 
 `clips` 表代表一次剪贴板 publication，`payloads` 表按内容哈希去重具体格式，关联表支持一次复制同时持有多种格式。
 `clip_search` 是为全文检索维护的轻量投影，可聚合文本和 OCR 内容，不承载二进制载荷。
@@ -352,7 +355,7 @@ Unicode 字符的查询不命中；短查询使用受限 LIKE 子串回退并限
 
 %LOCALAPPDATA%/SnapClip/
   data/snapclip.db
-  payloads/ab/<blake3>.bin
+  payloads/ab/<blake3>.blob
   thumbnails/<blake3>.webp
   models/
   temp/
@@ -485,27 +488,29 @@ pin://closed.v1
 
 ## 14. 分阶段迁移计划
 
-### M0：统一契约
+### M0：统一契约与工程基线
 
-- 定义 `ClipItem`、`PayloadRef`、`BgraImage`、事件和错误类型。
+- 建立构建、类型检查、Rust 测试和许可证/依赖记录基线；定义 `ClipItem`、`PayloadRef`、`BgraImage`、事件和错误类型。
 - 将 SnapClip-old 图像/标注模型与 ClipVault 存储模型适配。
 - 固定协议版本和枚举追加规则。
 
 ### M1：历史数据底座
 
-- 实现 SQLite schema/migration、WAL/FTS5、单写者队列、BlobStore、payload 引用和历史查询 API。
-- 定义一条 `Clipboard Publication` 可关联多个格式化 `Payload` 的模型，并支持事务一致性、备份/恢复和孤儿载荷回收。
+- 实现 SQLite schema/migration、WAL/FTS5、单写者队列、BLAKE3 BlobStore、payload 引用和 `history_page` 分页查询 command。
+- `Clipboard Publication` 可关联多个格式化 `Payload`；相同字节跨语义类型共享物理 blob，但保留独立 payload 元数据。
+- 验证写入事务、稳定游标、FTS external-content 同步和启动时孤儿载荷回收；备份/恢复协议进入后续存储验收。
 
 ### M2：剪贴板与历史最小闭环
 
-- 实现事件驱动剪贴板监听、文本和图片读取、序列号/自身写入去重。
-- 将剪贴板格式快照写入 M1 的 SQLite/BlobStore，完成分页历史查询和复制回写。
+- 实现事件驱动剪贴板监听、文本、图片、HTML/RTF 和文件路径格式读取，加入序列号/自身写入去重。
+- 将剪贴板格式快照写入 M1 的 SQLite/BlobStore，完成分页历史查询、复制回写、隐私策略和基本搜索。
 - 验证内容模型、隐私策略、存储恢复和基本搜索闭环。
 
-### M3：主 UI 和历史
+### M3：主 UI 历史消费层
 
 - Vue 3 主界面、搜索、虚拟列表、设置和预览；优先复用 ClipVault Vue 组件。
 - 以分页/游标查询和轻量可见项元数据驱动 UI，不把全量历史载入 Pinia。
+- 提供收藏、置顶、删除和恢复的交互反馈。
 - 主窗口隐藏/显示与应用退出生命周期明确；首期单进程退出后不承诺后台 Agent 继续运行。
 
 ### M4：截图和贴图闭环
@@ -513,7 +518,6 @@ pin://closed.v1
 - 复用 SnapClip-old 原生覆盖层、标注、复制、保存和贴图能力，并按 AGPL-3.0 履行来源和发布要求。
 - 预创建覆盖层；完成显示/导出同源。
 - 完成单显示器 SDR 起步验收，再覆盖 100/125/150/200% DPI、多显示器和设备恢复。
-- 增加 HTML/RTF/PNG/DIBV5/文件剪贴板格式、发布回滚和兼容性测试。
 
 ### M5：OCR 和截图增强
 
