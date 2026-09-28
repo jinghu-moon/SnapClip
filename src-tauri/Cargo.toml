@@ -1,9 +1,10 @@
 [package]
 name = "snapclip"
 version = "0.1.0"
-description = "A Tauri App"
+description = "Windows screenshot, clipboard history, and pinboard utility"
 authors = ["you"]
-edition = "2021"
+license = "AGPL-3.0-only"
+edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
