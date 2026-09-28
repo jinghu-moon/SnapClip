@@ -236,6 +236,7 @@ pin://closed.v1
 
 - 接入 `AddClipboardFormatListener`/`WM_CLIPBOARDUPDATE`、格式快照读取、序列号/自身写入去重。
 - 将文本、图片、HTML/RTF 和文件路径写入 M1 的 SQLite/BlobStore，完成复制回写和隐私规则。
+- 尊重 Windows 剪贴板排除监控标记并记录来源进程名；用户可配置的暂停和应用黑名单由设置 UI 阶段接入。
 
 ### M3：主 UI 历史消费层
 

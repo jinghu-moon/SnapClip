@@ -1,4 +1,6 @@
 pub mod domain;
+#[cfg(windows)]
+mod platform;
 pub mod store;
 
 use tauri::Manager;
@@ -39,6 +41,10 @@ pub fn run() {
             app.manage(
                 Store::open(root).map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?,
             );
+            #[cfg(windows)]
+            app.manage(platform::windows::clipboard::ClipboardMonitor::start(
+                app.state::<Store>().inner().clone(),
+            )?);
             Ok(())
         })
         .plugin(tauri_plugin_opener::init())
