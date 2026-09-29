@@ -8,7 +8,7 @@ use std::{
     thread,
 };
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
+use rusqlite::{Connection, OpenFlags, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -160,6 +160,32 @@ impl Store {
         cursor: Option<String>,
         requested_limit: Option<u32>,
     ) -> Result<HistoryPage, StoreError> {
+        self.history_page_matching(None, None, cursor, requested_limit)
+    }
+
+    pub fn search_history_page(
+        &self,
+        query: String,
+        kind: Option<PayloadKind>,
+        cursor: Option<String>,
+        requested_limit: Option<u32>,
+    ) -> Result<HistoryPage, StoreError> {
+        let query = query.trim().chars().take(256).collect::<String>();
+        self.history_page_matching(
+            (!query.is_empty()).then_some(query),
+            kind,
+            cursor,
+            requested_limit,
+        )
+    }
+
+    fn history_page_matching(
+        &self,
+        query: Option<String>,
+        kind: Option<PayloadKind>,
+        cursor: Option<String>,
+        requested_limit: Option<u32>,
+    ) -> Result<HistoryPage, StoreError> {
         let cursor = cursor
             .map(|value| serde_json::from_str::<HistoryCursor>(&value))
             .transpose()
@@ -173,17 +199,50 @@ impl Store {
         )?;
         connection.busy_timeout(std::time::Duration::from_secs(2))?;
 
+        let query_mode = query
+            .as_ref()
+            .map(|value| i64::from(value.chars().count() >= 3));
+        let fts_query = query
+            .as_ref()
+            .map(|value| format!("\"{}\"", value.replace('"', "\"\"")));
+        let like_query = query.as_ref().map(|value| {
+            let escaped = value
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            format!("%{escaped}%")
+        });
         let mut statement = connection.prepare(
-            "SELECT id, created_at_unix_ms, primary_kind, preview_text, source_app
+            "SELECT id, created_at_unix_ms, primary_kind, preview_text, source_app, source_exe_path
              FROM clips
-             WHERE (?1 IS NULL OR created_at_unix_ms < ?1
-                OR (created_at_unix_ms = ?1 AND id < ?2))
+             WHERE (?1 IS NULL OR id IN (
+                 SELECT clip_id FROM clip_search
+                 WHERE (?2 = 1 AND rowid IN (
+                     SELECT rowid FROM clip_search_fts WHERE clip_search_fts MATCH ?3
+                 )) OR (?2 = 0 AND text_content LIKE ?4 ESCAPE '\\')
+             ))
+             AND (?5 IS NULL OR created_at_unix_ms < ?5
+                OR (created_at_unix_ms = ?5 AND id < ?6))
+             AND (?7 IS NULL OR EXISTS (
+                 SELECT 1 FROM clip_payloads cp
+                 JOIN payloads p ON p.id = cp.payload_id
+                 WHERE cp.clip_id = clips.id AND p.kind = ?7
+             ))
              ORDER BY created_at_unix_ms DESC, id DESC
-             LIMIT ?3",
+             LIMIT ?8",
         )?;
         let cursor_time = cursor.as_ref().map(|value| value.created_at_unix_ms);
         let cursor_id = cursor.as_ref().map(|value| value.id.as_str()).unwrap_or("");
-        let mut rows = statement.query(params![cursor_time, cursor_id, i64::from(limit + 1)])?;
+        let mut rows = statement.query(params![
+            query,
+            query_mode,
+            fts_query,
+            like_query,
+            cursor_time,
+            cursor_id,
+            kind.as_ref().map(payload_kind_name),
+            i64::from(limit + 1)
+        ])?;
         let mut summaries = Vec::new();
         while let Some(row) = rows.next()? {
             summaries.push(ClipSummary {
@@ -192,6 +251,7 @@ impl Store {
                 primary_kind: parse_payload_kind(row.get::<_, String>(2)?.as_str())?,
                 preview_text: row.get(3)?,
                 source_app: row.get(4)?,
+                source_exe_path: row.get(5)?,
                 thumbnail: None,
                 payloads: Vec::new(),
             });
@@ -313,80 +373,88 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
             applied_at_unix_ms INTEGER NOT NULL
         );",
     )?;
-    let applied = connection
-        .query_row(
-            "SELECT 1 FROM schema_migrations WHERE version = 1",
-            [],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some();
-    if applied {
-        return Ok(());
-    }
-
-    let transaction = connection.unchecked_transaction()?;
-    transaction.execute_batch(
-        "CREATE TABLE clips (
-            id TEXT PRIMARY KEY,
-            created_at_unix_ms INTEGER NOT NULL,
-            primary_kind TEXT NOT NULL,
-            preview_text TEXT,
-            source_app TEXT
-        );
-        CREATE INDEX clips_created_id ON clips(created_at_unix_ms DESC, id DESC);
-
-        CREATE TABLE payloads (
-            id TEXT PRIMARY KEY,
-            content_hash TEXT NOT NULL,
-            kind TEXT NOT NULL,
-            size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
-            storage_path TEXT NOT NULL,
-            mime_type TEXT,
-            width INTEGER,
-            height INTEGER,
-            UNIQUE(content_hash, kind)
-        );
-
-        CREATE TABLE clip_payloads (
-            clip_id TEXT NOT NULL REFERENCES clips(id) ON DELETE CASCADE,
-            payload_id TEXT NOT NULL REFERENCES payloads(id),
-            role TEXT NOT NULL,
-            PRIMARY KEY (clip_id, payload_id, role)
-        );
-        CREATE INDEX clip_payloads_payload_id ON clip_payloads(payload_id);
-
-        CREATE TABLE clip_search (
-            clip_id TEXT PRIMARY KEY REFERENCES clips(id) ON DELETE CASCADE,
-            text_content TEXT,
-            ocr_text TEXT
-        );
-        CREATE VIRTUAL TABLE clip_search_fts USING fts5(
-            text_content, ocr_text,
-            content='clip_search',
-            content_rowid='rowid',
-            tokenize='trigram'
-        );
-        CREATE TRIGGER clip_search_ai AFTER INSERT ON clip_search BEGIN
-            INSERT INTO clip_search_fts(rowid, text_content, ocr_text)
-            VALUES (new.rowid, new.text_content, new.ocr_text);
-        END;
-        CREATE TRIGGER clip_search_ad AFTER DELETE ON clip_search BEGIN
-            INSERT INTO clip_search_fts(clip_search_fts, rowid, text_content, ocr_text)
-            VALUES ('delete', old.rowid, old.text_content, old.ocr_text);
-        END;
-        CREATE TRIGGER clip_search_au AFTER UPDATE ON clip_search BEGIN
-            INSERT INTO clip_search_fts(clip_search_fts, rowid, text_content, ocr_text)
-            VALUES ('delete', old.rowid, old.text_content, old.ocr_text);
-            INSERT INTO clip_search_fts(rowid, text_content, ocr_text)
-            VALUES (new.rowid, new.text_content, new.ocr_text);
-        END;",
+    let current: i64 = connection.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+        [],
+        |row| row.get(0),
     )?;
     let now = unix_time_ms();
-    transaction.execute(
-        "INSERT INTO schema_migrations(version, applied_at_unix_ms) VALUES (1, ?1)",
-        [now],
-    )?;
+    let transaction = connection.unchecked_transaction()?;
+
+    if current < 1 {
+        transaction.execute_batch(
+            "CREATE TABLE clips (
+                id TEXT PRIMARY KEY,
+                created_at_unix_ms INTEGER NOT NULL,
+                primary_kind TEXT NOT NULL,
+                preview_text TEXT,
+                source_app TEXT
+            );
+            CREATE INDEX clips_created_id ON clips(created_at_unix_ms DESC, id DESC);
+
+            CREATE TABLE payloads (
+                id TEXT PRIMARY KEY,
+                content_hash TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
+                storage_path TEXT NOT NULL,
+                mime_type TEXT,
+                width INTEGER,
+                height INTEGER,
+                UNIQUE(content_hash, kind)
+            );
+
+            CREATE TABLE clip_payloads (
+                clip_id TEXT NOT NULL REFERENCES clips(id) ON DELETE CASCADE,
+                payload_id TEXT NOT NULL REFERENCES payloads(id),
+                role TEXT NOT NULL,
+                PRIMARY KEY (clip_id, payload_id, role)
+            );
+            CREATE INDEX clip_payloads_payload_id ON clip_payloads(payload_id);
+
+            CREATE TABLE clip_search (
+                clip_id TEXT PRIMARY KEY REFERENCES clips(id) ON DELETE CASCADE,
+                text_content TEXT,
+                ocr_text TEXT
+            );
+            CREATE VIRTUAL TABLE clip_search_fts USING fts5(
+                text_content, ocr_text,
+                content='clip_search',
+                content_rowid='rowid',
+                tokenize='trigram'
+            );
+            CREATE TRIGGER clip_search_ai AFTER INSERT ON clip_search BEGIN
+                INSERT INTO clip_search_fts(rowid, text_content, ocr_text)
+                VALUES (new.rowid, new.text_content, new.ocr_text);
+            END;
+            CREATE TRIGGER clip_search_ad AFTER DELETE ON clip_search BEGIN
+                INSERT INTO clip_search_fts(clip_search_fts, rowid, text_content, ocr_text)
+                VALUES ('delete', old.rowid, old.text_content, old.ocr_text);
+            END;
+            CREATE TRIGGER clip_search_au AFTER UPDATE ON clip_search BEGIN
+                INSERT INTO clip_search_fts(clip_search_fts, rowid, text_content, ocr_text)
+                VALUES ('delete', old.rowid, old.text_content, old.ocr_text);
+                INSERT INTO clip_search_fts(rowid, text_content, ocr_text)
+                VALUES (new.rowid, new.text_content, new.ocr_text);
+            END;",
+        )?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at_unix_ms) VALUES (1, ?1)",
+            [now],
+        )?;
+    }
+
+    if current < 2 {
+        transaction.execute_batch(
+            "ALTER TABLE clips ADD COLUMN source_exe_path TEXT;
+             CREATE INDEX clips_source_app ON clips(source_app, created_at_unix_ms DESC);",
+        )?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at_unix_ms) VALUES (2, ?1)",
+            [now],
+        )?;
+    }
+
     transaction.commit()?;
     Ok(())
 }
@@ -432,14 +500,15 @@ fn insert_publication(
 
     let transaction = connection.unchecked_transaction()?;
     transaction.execute(
-        "INSERT INTO clips(id, created_at_unix_ms, primary_kind, preview_text, source_app)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO clips(id, created_at_unix_ms, primary_kind, preview_text, source_app, source_exe_path)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             publication.publication_id,
             publication.captured_at_unix_ms,
             payload_kind_name(&primary.payload.kind),
             preview_text,
             publication.source_app,
+            publication.source_exe_path,
         ],
     )?;
 
@@ -593,6 +662,7 @@ mod tests {
             publication_id: id.into(),
             captured_at_unix_ms: time,
             source_app: Some("test".into()),
+            source_exe_path: Some(r"C:\Apps\test.exe".into()),
             payloads: payloads.iter().map(|value| value.payload.clone()).collect(),
         }
     }
@@ -646,6 +716,47 @@ mod tests {
     }
 
     #[test]
+    fn history_search_uses_trigram_and_short_query_fallback() {
+        let dir = TestDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        let payloads = vec![
+            payload(PayloadKind::Text, "截图搜索".as_bytes(), "search-text"),
+            payload(PayloadKind::Image, b"image bytes", "search-image"),
+        ];
+        store
+            .save_publication(publication("searchable-clip", 1, &payloads), payloads)
+            .unwrap();
+
+        let trigram = store
+            .search_history_page("截图搜索".into(), None, None, None)
+            .unwrap();
+        assert_eq!(trigram.items.len(), 1);
+        assert_eq!(trigram.items[0].id, "searchable-clip");
+
+        let short = store
+            .search_history_page("图".into(), None, None, None)
+            .unwrap();
+        assert_eq!(short.items.len(), 1);
+
+        let no_match = store
+            .search_history_page("不存在".into(), None, None, None)
+            .unwrap();
+        assert!(no_match.items.is_empty());
+
+        let text_only = store
+            .search_history_page(String::new(), Some(PayloadKind::Text), None, None)
+            .unwrap();
+        assert_eq!(text_only.items.len(), 1);
+        assert_eq!(text_only.items[0].primary_kind, PayloadKind::Text);
+
+        let image_only = store
+            .search_history_page(String::new(), Some(PayloadKind::Image), None, None)
+            .unwrap();
+        assert_eq!(image_only.items.len(), 1);
+        assert_eq!(image_only.items[0].primary_kind, PayloadKind::Text);
+    }
+
+    #[test]
     fn identical_bytes_keep_distinct_semantic_payloads() {
         let dir = TestDir::new();
         let store = Store::open(&dir.0).unwrap();
@@ -669,5 +780,109 @@ mod tests {
         let dir = TestDir::new();
         let store = Store::open(&dir.0).unwrap();
         assert!(store.history_page(Some("bad cursor".into()), None).is_err());
+    }
+
+    #[test]
+    fn persists_source_app_and_exe_path() {
+        let dir = TestDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        let payloads = vec![payload(PayloadKind::Text, b"from vscode", "source-text")];
+        store
+            .save_publication(publication("source-clip", 1, &payloads), payloads)
+            .unwrap();
+
+        let page = store.history_page(None, None).unwrap();
+        assert_eq!(page.items[0].source_app.as_deref(), Some("test"));
+        assert_eq!(
+            page.items[0].source_exe_path.as_deref(),
+            Some(r"C:\Apps\test.exe")
+        );
+    }
+
+    #[test]
+    fn migration_upgrades_existing_v1_database() {
+        let dir = TestDir::new();
+        let db_path = dir.0.join("data/snapclip.db");
+        fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        {
+            let connection = Connection::open(&db_path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE schema_migrations (
+                        version INTEGER PRIMARY KEY,
+                        applied_at_unix_ms INTEGER NOT NULL
+                    );
+                    CREATE TABLE clips (
+                        id TEXT PRIMARY KEY,
+                        created_at_unix_ms INTEGER NOT NULL,
+                        primary_kind TEXT NOT NULL,
+                        preview_text TEXT,
+                        source_app TEXT
+                    );
+                    CREATE TABLE payloads (
+                        id TEXT PRIMARY KEY,
+                        content_hash TEXT NOT NULL,
+                        kind TEXT NOT NULL,
+                        size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
+                        storage_path TEXT NOT NULL,
+                        mime_type TEXT,
+                        width INTEGER,
+                        height INTEGER,
+                        UNIQUE(content_hash, kind)
+                    );
+                    CREATE TABLE clip_payloads (
+                        clip_id TEXT NOT NULL REFERENCES clips(id) ON DELETE CASCADE,
+                        payload_id TEXT NOT NULL REFERENCES payloads(id),
+                        role TEXT NOT NULL,
+                        PRIMARY KEY (clip_id, payload_id, role)
+                    );
+                    CREATE TABLE clip_search (
+                        clip_id TEXT PRIMARY KEY REFERENCES clips(id) ON DELETE CASCADE,
+                        text_content TEXT,
+                        ocr_text TEXT
+                    );
+                    CREATE VIRTUAL TABLE clip_search_fts USING fts5(
+                        text_content, ocr_text,
+                        content='clip_search',
+                        content_rowid='rowid',
+                        tokenize='trigram'
+                    );
+                    CREATE TRIGGER clip_search_ai AFTER INSERT ON clip_search BEGIN
+                        INSERT INTO clip_search_fts(rowid, text_content, ocr_text)
+                        VALUES (new.rowid, new.text_content, new.ocr_text);
+                    END;
+                    CREATE TRIGGER clip_search_ad AFTER DELETE ON clip_search BEGIN
+                        INSERT INTO clip_search_fts(clip_search_fts, rowid, text_content, ocr_text)
+                        VALUES ('delete', old.rowid, old.text_content, old.ocr_text);
+                    END;
+                    CREATE TRIGGER clip_search_au AFTER UPDATE ON clip_search BEGIN
+                        INSERT INTO clip_search_fts(clip_search_fts, rowid, text_content, ocr_text)
+                        VALUES ('delete', old.rowid, old.text_content, old.ocr_text);
+                        INSERT INTO clip_search_fts(rowid, text_content, ocr_text)
+                        VALUES (new.rowid, new.text_content, new.ocr_text);
+                    END;
+                    INSERT INTO schema_migrations(version, applied_at_unix_ms) VALUES (1, 0);",
+                )
+                .unwrap();
+        }
+
+        let store = Store::open(&dir.0).unwrap();
+        let payloads = vec![payload(PayloadKind::Text, b"legacy", "legacy-text")];
+        store
+            .save_publication(publication("legacy-clip", 1, &payloads), payloads)
+            .unwrap();
+        let page = store.history_page(None, None).unwrap();
+        assert_eq!(
+            page.items[0].source_exe_path.as_deref(),
+            Some(r"C:\Apps\test.exe")
+        );
+
+        let connection = Connection::open(&db_path).unwrap();
+        let max_version: i64 = connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(max_version, 2);
     }
 }

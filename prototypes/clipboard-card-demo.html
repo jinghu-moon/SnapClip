@@ -1,0 +1,1480 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SnapClip · 剪切板列表卡片设计 Demo</title>
+<style>
+  :root {
+    --bg: #eef1f3;
+    --panel: #f7f8f9;
+    --card: #ffffff;
+    --ink: #252d33;
+    --ink-2: #536b7b;
+    --muted: #74828c;
+    --muted-2: #9aa5ad;
+    --line: #d8e0e5;
+    --line-soft: #e7ecef;
+    --accent: #357fab;
+    --accent-soft: #e7f2fa;
+    --accent-border: #9bbdd2;
+    --pin: #c47a1a;
+    --pin-soft: #faf1e2;
+    --danger: #c65329;
+    --danger-soft: #fbefeb;
+    --ok: #2f7d5c;
+    --code-bg: #f4f7f9;
+    --shadow: 0 1px 2px rgba(28, 42, 53, .04);
+    --radius: 8px;
+    --font: "Segoe UI", "PingFang SC", "Microsoft YaHei", "Helvetica Neue", sans-serif;
+    --mono: "Cascadia Code", "SF Mono", Consolas, "Courier New", monospace;
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    font-family: var(--font);
+    color: var(--ink);
+    background: var(--bg);
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  button { font: inherit; cursor: pointer; border: 0; background: none; color: inherit; }
+  code, .mono { font-family: var(--mono); }
+
+  /* ── Page chrome ── */
+  .page {
+    width: min(1180px, calc(100% - 32px));
+    margin: 0 auto;
+    padding: 28px 0 64px;
+  }
+  .page-header {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 16px;
+    margin-bottom: 18px;
+    flex-wrap: wrap;
+  }
+  .page-header h1 {
+    margin: 0 0 4px;
+    font-size: 20px;
+    font-weight: 650;
+    letter-spacing: -0.01em;
+  }
+  .page-header p {
+    margin: 0;
+    color: var(--muted);
+    font-size: 13px;
+    max-width: 640px;
+  }
+  .scheme-switch {
+    display: inline-flex;
+    padding: 3px;
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    background: var(--card);
+    box-shadow: var(--shadow);
+  }
+  .scheme-switch button {
+    padding: 7px 12px;
+    border-radius: 6px;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .scheme-switch button.active {
+    background: var(--ink);
+    color: #fff;
+    font-weight: 600;
+  }
+  .scheme-switch .tag {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 0 5px;
+    border-radius: 4px;
+    background: rgba(255,255,255,.18);
+    font-size: 10px;
+  }
+  .scheme-switch button:not(.active) .tag {
+    background: var(--accent-soft);
+    color: var(--accent);
+  }
+
+  .section-title {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    margin: 28px 0 12px;
+  }
+  .section-title h2 {
+    margin: 0;
+    font-size: 14px;
+    font-weight: 650;
+    letter-spacing: .01em;
+  }
+  .section-title span {
+    color: var(--muted);
+    font-size: 12px;
+  }
+
+  .hint {
+    margin: 0 0 12px;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.7;
+  }
+  .hint kbd {
+    display: inline-block;
+    min-width: 18px;
+    padding: 1px 5px;
+    border: 1px solid var(--line);
+    border-bottom-width: 2px;
+    border-radius: 4px;
+    background: var(--card);
+    color: var(--ink-2);
+    font-family: var(--font);
+    font-size: 11px;
+    text-align: center;
+  }
+
+  /* ── App window ── */
+  .app-window {
+    display: flex;
+    flex-direction: column;
+    height: 640px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: var(--panel);
+    box-shadow: 0 12px 40px rgba(28, 42, 53, .08), 0 1px 2px rgba(28, 42, 53, .04);
+    overflow: hidden;
+  }
+  .titlebar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 40px;
+    padding: 0 12px 0 16px;
+    border-bottom: 1px solid var(--line-soft);
+    background: #fafbfc;
+  }
+  .titlebar__brand {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    font-weight: 650;
+    color: var(--ink);
+  }
+  .titlebar__logo {
+    display: grid;
+    place-items: center;
+    width: 20px;
+    height: 20px;
+    border-radius: 5px;
+    background: linear-gradient(135deg, #357fab, #5aa0c8);
+    color: #fff;
+  }
+  .titlebar__actions {
+    display: flex;
+    gap: 2px;
+  }
+  .icon-btn {
+    display: grid;
+    place-items: center;
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    color: var(--muted);
+  }
+  .icon-btn:hover { background: #edf1f3; color: var(--ink-2); }
+  .icon-btn.danger:hover { background: var(--danger-soft); color: var(--danger); }
+
+  .toolbar {
+    display: flex;
+    gap: 8px;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--line-soft);
+    background: var(--panel);
+  }
+  .search {
+    display: flex;
+    flex: 1;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+    height: 40px;
+    padding: 0 12px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--card);
+    color: var(--muted);
+  }
+  .search:focus-within {
+    border-color: var(--accent-border);
+    box-shadow: 0 0 0 3px rgba(53, 127, 171, .12);
+  }
+  .search input {
+    flex: 1;
+    min-width: 0;
+    border: 0;
+    outline: 0;
+    background: transparent;
+    color: var(--ink);
+    font-size: 13px;
+  }
+  .search input::placeholder { color: var(--muted-2); }
+  .search .clear {
+    display: none;
+    width: 22px;
+    height: 22px;
+    border-radius: 4px;
+    color: var(--muted-2);
+  }
+  .search.has-value .clear { display: grid; place-items: center; }
+  .search .clear:hover { background: #edf1f3; color: var(--ink-2); }
+
+  .list {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 10px 12px 18px;
+  }
+  .list::-webkit-scrollbar { width: 10px; }
+  .list::-webkit-scrollbar-thumb {
+    border: 3px solid transparent;
+    border-radius: 999px;
+    background: #c5d0d6;
+    background-clip: content-box;
+  }
+
+  .group-label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 6px 4px 8px;
+    color: var(--muted-2);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .04em;
+    text-transform: uppercase;
+  }
+  .group-label::after {
+    content: "";
+    flex: 1;
+    height: 1px;
+    background: var(--line-soft);
+  }
+
+  /* ── Card ── */
+  .card {
+    position: relative;
+    display: block;
+    width: 100%;
+    margin: 0 0 8px;
+    padding: 12px 14px 11px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--card);
+    text-align: left;
+    box-shadow: var(--shadow);
+    transition: border-color .12s ease, box-shadow .12s ease, background .12s ease;
+    cursor: pointer;
+    user-select: none;
+  }
+  .card:hover {
+    border-color: var(--accent-border);
+    box-shadow: 0 1px 3px rgba(28, 42, 53, .06);
+  }
+  .card.is-selected {
+    border-color: var(--accent-border);
+    box-shadow: 0 0 0 2px rgba(97, 153, 187, .16);
+  }
+  .card.is-selected:hover {
+    box-shadow: 0 0 0 2px rgba(97, 153, 187, .22);
+  }
+  .card.is-pinned {
+    border-left: 3px solid var(--pin);
+    padding-left: 12px;
+  }
+  .card.is-code .card__content {
+    font-family: var(--mono);
+    font-size: 12.5px;
+    line-height: 1.55;
+  }
+
+  /* Content layer — always full width; actions float above with reserved gutter */
+  .card__content {
+    display: -webkit-box;
+    overflow: hidden;
+    margin: 0 0 8px;
+    padding-right: 0;
+    color: var(--ink);
+    font-size: 14px;
+    line-height: 1.55;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    transition: padding-right .12s ease;
+  }
+  /* Reserve action gutter on hover/selected-hover so buttons never cover text */
+  .card:hover .card__content,
+  .card:focus-visible .card__content {
+    padding-right: 72px;
+  }
+  body[data-scheme="B"] .card:hover .card__content,
+  body[data-scheme="B"] .card:focus-visible .card__content {
+    padding-right: 100px;
+  }
+
+  .card__meta {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    min-width: 0;
+    color: var(--muted);
+    font-size: 11.5px;
+    line-height: 18px;
+  }
+  .card__source {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    min-width: 0;
+    color: var(--ink-2);
+  }
+  .card__source-icon {
+    flex: 0 0 auto;
+    display: grid;
+    place-items: center;
+    width: 16px;
+    height: 16px;
+    border-radius: 3px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-size: 9px;
+    font-weight: 700;
+  }
+  .card__source-icon img {
+    width: 16px;
+    height: 16px;
+    border-radius: 3px;
+    object-fit: contain;
+  }
+  .card__source-name {
+    overflow: hidden;
+    max-width: 160px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .dot { color: #c2cad0; }
+  .card__time { flex: 0 0 auto; }
+  .card__size { flex: 0 0 auto; color: var(--muted-2); }
+  .card__tags {
+    display: inline-flex;
+    gap: 4px;
+    margin-left: 2px;
+  }
+  .chip {
+    padding: 0 6px;
+    border-radius: 4px;
+    background: #eef2f5;
+    color: var(--muted);
+    font-size: 10px;
+    line-height: 16px;
+  }
+  .chip.pin {
+    background: var(--pin-soft);
+    color: var(--pin);
+    font-weight: 600;
+  }
+
+  /* Hover actions — absolute, no layout shift */
+  .card__actions {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    display: flex;
+    gap: 4px;
+    padding: 2px;
+    border: 1px solid var(--line-soft);
+    border-radius: 7px;
+    background: rgba(255, 255, 255, .96);
+    box-shadow: 0 2px 8px rgba(28, 42, 53, .08);
+    opacity: 0;
+    pointer-events: none;
+    transform: translateY(-1px);
+    transition: opacity .12s ease, transform .12s ease;
+  }
+  .card:hover .card__actions,
+  .card:focus-visible .card__actions,
+  .card.is-menu-open .card__actions {
+    opacity: 1;
+    pointer-events: auto;
+    transform: none;
+  }
+  /* Keep visible on selected+hover via :hover already; also force when keyboard-focused */
+  .card.is-selected:hover .card__actions { opacity: 1; pointer-events: auto; }
+
+  .act {
+    display: grid;
+    place-items: center;
+    width: 28px;
+    height: 28px;
+    border-radius: 5px;
+    color: var(--ink-2);
+  }
+  .act:hover { background: #edf1f3; color: var(--ink); }
+  .act.primary {
+    width: auto;
+    padding: 0 10px;
+    gap: 5px;
+    grid-auto-flow: column;
+    background: var(--accent);
+    color: #fff;
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .act.primary:hover { background: #2d6f95; color: #fff; }
+  .act.is-on {
+    background: var(--pin-soft);
+    color: var(--pin);
+  }
+  .act.is-on:hover { background: #f3e4c8; color: var(--pin); }
+  .act.danger:hover { background: var(--danger-soft); color: var(--danger); }
+
+  /* Scheme A: no inline copy button, whole card is copy */
+  body[data-scheme="A"] .act.copy-inline { display: none; }
+  body[data-scheme="A"] .card { cursor: copy; }
+  body[data-scheme="B"] .card { cursor: pointer; }
+
+  /* Static demo cards in gallery / comparison */
+  .card[data-static] { cursor: default; }
+
+  /* ── Context menu ── */
+  .menu {
+    position: fixed;
+    z-index: 50;
+    min-width: 176px;
+    padding: 5px;
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    background: var(--card);
+    box-shadow: 0 12px 32px rgba(28, 42, 53, .16), 0 2px 6px rgba(28, 42, 53, .06);
+    display: none;
+  }
+  .menu.open { display: block; }
+  .menu button {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    width: 100%;
+    padding: 7px 10px;
+    border-radius: 6px;
+    color: var(--ink);
+    font-size: 12.5px;
+    text-align: left;
+  }
+  .menu button:hover { background: #edf1f3; }
+  .menu button.danger { color: var(--danger); }
+  .menu button.danger:hover { background: var(--danger-soft); }
+  .menu button .kbd {
+    margin-left: auto;
+    color: var(--muted-2);
+    font-size: 11px;
+  }
+  .menu hr {
+    margin: 4px 6px;
+    border: 0;
+    border-top: 1px solid var(--line-soft);
+  }
+
+  /* ── Toast ── */
+  .toast {
+    position: fixed;
+    left: 50%;
+    bottom: 28px;
+    z-index: 60;
+    padding: 10px 16px;
+    border-radius: 8px;
+    background: #252d33;
+    color: #fff;
+    font-size: 12.5px;
+    box-shadow: 0 8px 24px rgba(28, 42, 53, .22);
+    opacity: 0;
+    pointer-events: none;
+    transform: translate(-50%, 8px);
+    transition: opacity .18s ease, transform .18s ease;
+  }
+  .toast.show {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+
+  /* ── Gallery / comparison ── */
+  .grid-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+  .grid-3 {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 12px;
+  }
+  @media (max-width: 900px) {
+    .grid-2, .grid-3 { grid-template-columns: 1fr; }
+  }
+
+  .panel {
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--card);
+    padding: 14px;
+    box-shadow: var(--shadow);
+  }
+  .panel h3 {
+    margin: 0 0 6px;
+    font-size: 13px;
+    font-weight: 650;
+  }
+  .panel p {
+    margin: 0 0 12px;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.65;
+  }
+  .panel .stage {
+    border: 1px dashed var(--line);
+    border-radius: 8px;
+    background: var(--panel);
+    padding: 10px;
+  }
+  .panel .stage.dark-label {
+    position: relative;
+  }
+
+  .compare-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+  .compare-table th,
+  .compare-table td {
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--line-soft);
+    text-align: left;
+    vertical-align: top;
+  }
+  .compare-table th {
+    color: var(--muted);
+    font-weight: 600;
+    font-size: 11px;
+  }
+  .compare-table tr:last-child td { border-bottom: 0; }
+  .compare-table .best {
+    color: var(--ok);
+    font-weight: 600;
+  }
+  .compare-table .ok { color: var(--ink-2); }
+  .compare-table .weak { color: var(--muted-2); }
+
+  .verdict {
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+    margin-top: 12px;
+    padding: 12px;
+    border-radius: 8px;
+    background: var(--accent-soft);
+    color: var(--ink-2);
+    font-size: 12px;
+    line-height: 1.7;
+  }
+  .verdict strong { color: var(--accent); }
+
+  .layer-stack {
+    display: grid;
+    gap: 8px;
+  }
+  .layer {
+    display: grid;
+    grid-template-columns: 72px 1fr;
+    gap: 12px;
+    align-items: start;
+    padding: 10px 12px;
+    border: 1px solid var(--line-soft);
+    border-radius: 8px;
+    background: var(--panel);
+  }
+  .layer b {
+    font-size: 11px;
+    color: var(--accent);
+    letter-spacing: .02em;
+  }
+  .layer div {
+    color: var(--ink-2);
+    font-size: 12px;
+    line-height: 1.65;
+  }
+
+  .state-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+  .state-row > * {
+    flex: 1 1 280px;
+    min-width: 260px;
+  }
+  .state-label {
+    margin: 0 0 6px;
+    color: var(--muted-2);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .03em;
+    text-transform: uppercase;
+  }
+
+  .narrow-frame {
+    width: 320px;
+    max-width: 100%;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--panel);
+    padding: 10px;
+  }
+
+  .footer-tabs {
+    display: flex;
+    gap: 2px;
+    padding: 8px 12px;
+    border-top: 1px solid var(--line-soft);
+    background: #fafbfc;
+  }
+  .footer-tabs button {
+    flex: 1;
+    height: 34px;
+    border-radius: 6px;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .footer-tabs button:hover { background: #edf1f3; }
+  .footer-tabs button.active {
+    background: var(--card);
+    color: var(--ink);
+    font-weight: 600;
+    box-shadow: var(--shadow);
+    border: 1px solid var(--line-soft);
+  }
+
+  .hotkey-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 14px;
+    margin-top: 10px;
+    padding: 10px 12px;
+    border: 1px solid var(--line-soft);
+    border-radius: 8px;
+    background: var(--card);
+    color: var(--muted);
+    font-size: 11.5px;
+  }
+  .hotkey-bar span { display: inline-flex; align-items: center; gap: 6px; }
+
+  /* Forced demo states for gallery (not interactive) */
+  .force-hover {
+    border-color: var(--accent-border) !important;
+    box-shadow: 0 1px 3px rgba(28, 42, 53, .06) !important;
+  }
+  .force-hover .card__actions {
+    opacity: 1 !important;
+    pointer-events: auto !important;
+    transform: none !important;
+  }
+  .force-hover .card__content { padding-right: 72px; }
+  .force-hover.wide-actions .card__content { padding-right: 100px; }
+  .force-selected {
+    border-color: var(--accent-border) !important;
+    box-shadow: 0 0 0 2px rgba(97, 153, 187, .16) !important;
+  }
+</style>
+</head>
+<body data-scheme="A">
+<div class="page">
+  <header class="page-header">
+    <div>
+      <h1>SnapClip · 剪切板列表卡片</h1>
+      <p>面向桌面端高频扫描场景：内容优先、辅助信息一行、状态克制、操作按需浮现。仅覆盖文本剪切板。</p>
+    </div>
+    <div class="scheme-switch" id="schemeSwitch" title="切换点击卡片的交互方案">
+      <button type="button" data-scheme="A" class="active">方案 A · 点击即复制</button>
+      <button type="button" data-scheme="B">方案 B · 点击选中</button>
+    </div>
+  </header>
+
+  <p class="hint">
+    快捷键：列表聚焦后 <kbd>↑</kbd><kbd>↓</kbd> 移动 · <kbd>Enter</kbd> / <kbd>C</kbd> 复制 · <kbd>P</kbd> 固定 · <kbd>Delete</kbd> 删除 · <kbd>Esc</kbd> 关闭菜单。
+    点击右上角 <b>···</b> 查看低频操作。切换上方方案后，在真实列表中体验两种点击语义。
+  </p>
+
+  <!-- ══════════ Main live app ══════════ -->
+  <div class="app-window" id="appWindow" tabindex="0" aria-label="SnapClip 历史列表">
+    <div class="titlebar">
+      <div class="titlebar__brand">
+        <div class="titlebar__logo" aria-hidden="true">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M4 16V6a2 2 0 0 1 2-2h10"/></svg>
+        </div>
+        SnapClip
+      </div>
+      <div class="titlebar__actions">
+        <button class="icon-btn" title="清空搜索筛选"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 6h16M7 12h10M10 18h4"/></svg></button>
+        <button class="icon-btn" title="设置"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1A1.7 1.7 0 0 0 8.9 19a1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 5 8.9a1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H9.5a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9v.1a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg></button>
+      </div>
+    </div>
+
+    <div class="toolbar">
+      <div class="search" id="searchBox">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+        <input id="searchInput" type="search" placeholder="搜索剪切板历史…" autocomplete="off" />
+        <button class="clear" type="button" id="searchClear" title="清除">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
+      </div>
+    </div>
+
+    <div class="list" id="clipList"></div>
+
+    <div class="footer-tabs">
+      <button type="button" class="active">全部</button>
+      <button type="button">固定</button>
+      <button type="button">文本</button>
+      <button type="button">代码</button>
+    </div>
+  </div>
+
+  <div class="hotkey-bar">
+    <span><kbd>↑↓</kbd> 选择</span>
+    <span><kbd>Enter</kbd> / <kbd>C</kbd> 复制</span>
+    <span><kbd>P</kbd> 固定 / 取消固定</span>
+    <span><kbd>Delete</kbd> 删除</span>
+    <span><kbd>Esc</kbd> 关闭菜单</span>
+    <span id="schemeHint">当前：方案 A — 点击卡片即复制，悬停仅显示 ···</span>
+  </div>
+
+  <!-- ══════════ Information architecture ══════════ -->
+  <div class="section-title">
+    <h2>信息层级</h2>
+    <span>默认卡片只承载扫描所需信息，其余下沉到 Hover / 菜单 / 详情</span>
+  </div>
+  <div class="layer-stack">
+    <div class="layer"><b>第一层</b><div><strong>复制内容</strong>（预览，最多 2 行）— 唯一高视觉优先级。长内容截断 + 省略号，卡片高度固定节奏，滚动时靠内容本身区分记录。</div></div>
+    <div class="layer"><b>第二层</b><div><strong>来源 · 时间</strong>（同一行）— 应用图标 + 名称 + 相对时间。尺寸/字数不进默认层（Hover 或详情再看）。</div></div>
+    <div class="layer"><b>第三层</b><div><strong>状态</strong> — 仅「固定」常驻（左侧色条 + 标签）。标签、重复等不默认展示。</div></div>
+    <div class="layer"><b>第四层</b><div><strong>操作</strong> — Hover / 键盘聚焦后出现。高频直出，低频进 ···，破坏性弱化且不直出。</div></div>
+  </div>
+
+  <!-- ══════════ Scheme comparison ══════════ -->
+  <div class="section-title">
+    <h2>点击 vs 复制按钮</h2>
+    <span>两种方案均可用上方开关在真实列表中体验</span>
+  </div>
+  <div class="grid-2">
+    <div class="panel">
+      <h3>方案 A · 点击卡片直接复制</h3>
+      <p>Hover 仅 <code>···</code>。整卡是主操作，路径最短。</p>
+      <div class="stage">
+        <div class="card force-hover" style="cursor:copy" data-static="1">
+          <div class="card__content">这是剪切板内容，点击卡片即可重新复制到系统剪切板。</div>
+          <div class="card__meta">
+            <span class="card__source"><span class="card__source-icon">C</span><span class="card__source-name">Google Chrome</span></span>
+            <span class="dot">·</span>
+            <span class="card__time">2 分钟前</span>
+          </div>
+          <div class="card__actions">
+            <button class="act" type="button" title="更多操作"><svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg></button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="panel">
+      <h3>方案 B · 点击选中，Hover 显式复制</h3>
+      <p>Hover 显示 <code>复制 + ···</code>。选中态可扩展预览/批量。</p>
+      <div class="stage">
+        <div class="card force-hover wide-actions" style="cursor:pointer" data-static="1">
+          <div class="card__content">这是剪切板内容，点击卡片进入选中态，复制按钮在悬停时出现。</div>
+          <div class="card__meta">
+            <span class="card__source"><span class="card__source-icon">C</span><span class="card__source-name">Google Chrome</span></span>
+            <span class="dot">·</span>
+            <span class="card__time">2 分钟前</span>
+          </div>
+          <div class="card__actions">
+            <button class="act primary" type="button" title="复制"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></svg>复制</button>
+            <button class="act" type="button" title="更多操作"><svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg></button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-top:12px">
+    <h3>对比结论</h3>
+    <table class="compare-table">
+      <thead>
+        <tr><th>维度</th><th>方案 A · 点击复制</th><th>方案 B · 点击选中</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>操作效率</td><td class="best">最高（1 次点击）</td><td class="ok">多一步（定位按钮或快捷键）</td></tr>
+        <tr><td>可发现性</td><td class="weak">依赖习惯 / 提示（首次需告知）</td><td class="best">按钮显式，无需学习</td></tr>
+        <tr><td>视觉简洁度</td><td class="best">Hover 只留 ···</td><td class="ok">多一个主按钮</td></tr>
+        <tr><td>高频体验</td><td class="best">连续粘贴/复用时极快</td><td class="ok">稳定，略慢</td></tr>
+        <tr><td>误操作</td><td class="ok">点击即覆盖剪切板（可撤销/历史可找回）</td><td class="best">几乎无误触复制</td></tr>
+        <tr><td>扩展性</td><td class="ok">选中语义弱，批量/详情需另设计</td><td class="best">天然支持详情面板、多选</td></tr>
+      </tbody>
+    </table>
+    <div class="verdict">
+      <div>
+        <strong>推荐：默认方案 A，方案 B 作为「专注模式」可切换。</strong>
+        剪切板管理器的核心动作就是「放回剪切板」，A 的效率优势在全天高频使用中非常明显。
+        误覆盖可通过历史回溯缓解；若产品要承载详情/批量/预览，再启用 B 或双击预览。
+        Demo 默认 A，顶部可切换，两种都可在完整列表中实操。
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════ Actions breakdown ══════════ -->
+  <div class="section-title">
+    <h2>Hover 操作分配</h2>
+    <span>高频直出 · 低频进菜单 · 破坏性不直出</span>
+  </div>
+  <div class="grid-3">
+    <div class="panel">
+      <h3>直出（Hover 右上角）</h3>
+      <p>方案 A：仅 <b>···</b><br/>方案 B：<b>复制</b> + <b>···</b><br/>已固定时 Pin 保持点亮（可在此取消）。</p>
+      <div class="stage">
+        <div class="card force-hover is-pinned" data-static="1" style="margin:0">
+          <div class="card__content">已固定内容：Hover 取消固定按钮点亮。</div>
+          <div class="card__meta">
+            <span class="card__source"><span class="card__source-icon">V</span><span class="card__source-name">VS Code</span></span>
+            <span class="dot">·</span><span class="card__time">昨天</span>
+            <span class="chip pin">固定</span>
+          </div>
+          <div class="card__actions">
+            <button class="act is-on" type="button" title="取消固定"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M14 2l8 8-3 1-1.5 5.5L13 13l-7 7-1-1 7-7-3.5-4.5L13 6l1-3z"/></svg></button>
+            <button class="act" type="button"><svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg></button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="panel">
+      <h3>「···」更多菜单</h3>
+      <p>低频但有用的操作收纳于此，避免卡片按钮爆炸。</p>
+      <div class="stage" style="min-height:160px;display:grid;place-items:center">
+        <div class="menu open" style="position:static;display:block">
+          <button type="button"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></svg>复制<span class="kbd">C</span></button>
+          <button type="button"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M14 2l8 8-3 1-1.5 5.5L13 13l-7 7-1-1 7-7-3.5-4.5L13 6l1-3z"/></svg>固定 / 取消固定<span class="kbd">P</span></button>
+          <button type="button"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 7h16M4 12h16M4 17h10"/></svg>查看完整内容</button>
+          <button type="button"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M7 7h10v10H7z"/><path d="M9 3h6M9 21h6"/></svg>复制纯文本</button>
+          <hr />
+          <button type="button" class="danger"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 7h16M9 7V5h6v2M7 7l1 12h8l1-12"/></svg>删除<span class="kbd">Del</span></button>
+        </div>
+      </div>
+    </div>
+    <div class="panel">
+      <h3>固定 vs 收藏</h3>
+      <p>
+        两者语义高度重复。剪切板场景真正需要的是<b>「不被清理、置顶」</b>——这是「固定」。
+        「收藏」若只是筛选入口，会增加卡片上第二个星标，扫视成本上升。
+      </p>
+      <div class="verdict" style="margin-top:0">
+        <div>
+          <strong>结论：卡片只保留「固定」。</strong>
+          不引入独立收藏。若未来要「知识库式收藏」，放到详情或标签体系，而不是列表卡片第二颗星。
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════ States gallery ══════════ -->
+  <div class="section-title">
+    <h2>状态与内容形态</h2>
+    <span>固定高度节奏 · 长文本截断 · Hover 不跳动</span>
+  </div>
+
+  <div class="state-row" style="margin-bottom:12px">
+    <div>
+      <div class="state-label">普通 · 短文本</div>
+      <div class="card" data-static="1" style="margin:0">
+        <div class="card__content">list-row</div>
+        <div class="card__meta">
+          <span class="card__source"><span class="card__source-icon">E</span><span class="card__source-name">Microsoft Edge</span></span>
+          <span class="dot">·</span><span class="card__time">今天 00:27</span>
+        </div>
+      </div>
+    </div>
+    <div>
+      <div class="state-label">Hover</div>
+      <div class="card force-hover" data-static="1" style="margin:0">
+        <div class="card__content">Hover 时操作区右上角浮现，内容右侧自动让位，不遮挡文字。</div>
+        <div class="card__meta">
+          <span class="card__source"><span class="card__source-icon">E</span><span class="card__source-name">Microsoft Edge</span></span>
+          <span class="dot">·</span><span class="card__time">2 分钟前</span>
+        </div>
+        <div class="card__actions">
+          <button class="act" type="button"><svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg></button>
+        </div>
+      </div>
+    </div>
+    <div>
+      <div class="state-label">Selected</div>
+      <div class="card is-selected force-selected" data-static="1" style="margin:0">
+        <div class="card__content">选中态用于键盘导航与方案 B 的焦点记录，外圈光晕轻量。</div>
+        <div class="card__meta">
+          <span class="card__source"><span class="card__source-icon">T</span><span class="card__source-name">Windows Terminal</span></span>
+          <span class="dot">·</span><span class="card__time">8 分钟前</span>
+        </div>
+      </div>
+    </div>
+    <div>
+      <div class="state-label">Selected + Hover</div>
+      <div class="card is-selected force-selected force-hover" data-static="1" style="margin:0">
+        <div class="card__content">选中后悬停：光晕 + 操作区同时存在，高度与普通卡一致。</div>
+        <div class="card__meta">
+          <span class="card__source"><span class="card__source-icon">T</span><span class="card__source-name">Windows Terminal</span></span>
+          <span class="dot">·</span><span class="card__time">8 分钟前</span>
+        </div>
+        <div class="card__actions">
+          <button class="act" type="button"><svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg></button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="state-row">
+    <div>
+      <div class="state-label">已固定</div>
+      <div class="card is-pinned" data-static="1" style="margin:0">
+        <div class="card__content">API_KEY=sk-live-9f3a…（固定后左侧色条 + 标签常驻）</div>
+        <div class="card__meta">
+          <span class="card__source"><span class="card__source-icon">W</span><span class="card__source-name">WeChat</span></span>
+          <span class="dot">·</span><span class="card__time">昨天</span>
+          <span class="chip pin">固定</span>
+        </div>
+      </div>
+    </div>
+    <div>
+      <div class="state-label">长单行（截断）</div>
+      <div class="card" data-static="1" style="margin:0">
+        <div class="card__content">sk-326e729e36889c4c1244eb119d4b90e989435bdc7b73265a1c8e4f0b2d91aa77c4e81b0f3a6d2c5e7890abcdef1234567890abcdef</div>
+        <div class="card__meta">
+          <span class="card__source"><span class="card__source-icon">C</span><span class="card__source-name">Google Chrome</span></span>
+          <span class="dot">·</span><span class="card__time">21:55</span>
+        </div>
+      </div>
+    </div>
+    <div>
+      <div class="state-label">多行文本</div>
+      <div class="card" data-static="1" style="margin:0">
+        <div class="card__content">下一步直接做第 6 项：管理员提权任务计划模式。
+需要先确认 UAC 弹窗文案，再接入计划任务注册接口……</div>
+        <div class="card__meta">
+          <span class="card__source"><span class="card__source-icon">N</span><span class="card__source-name">记事本</span></span>
+          <span class="dot">·</span><span class="card__time">22:20</span>
+        </div>
+      </div>
+    </div>
+    <div>
+      <div class="state-label">代码</div>
+      <div class="card is-code" data-static="1" style="margin:0">
+        <div class="card__content">const name = item.sourceApp || "未知来源";
+// 等宽 + 浅底，扫视时与普通文本区分</div>
+        <div class="card__meta">
+          <span class="card__source"><span class="card__source-icon">V</span><span class="card__source-name">Visual Studio Code</span></span>
+          <span class="dot">·</span><span class="card__time">21:55</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="grid-2" style="margin-top:12px">
+    <div class="panel">
+      <h3>长文本 + Hover（内容不被遮挡）</h3>
+      <p>操作区绝对定位浮在右上；内容预留 gutter，两行截断 + 省略号。</p>
+      <div class="stage">
+        <div class="card force-hover" data-static="1" style="margin:0">
+          <div class="card__content">我正在设计一款桌面端剪切板管理软件，目前在设计剪切板内容列表中的「列表卡片」。需要考虑短文本、长文本、多行、代码与特殊字符在列表中的视觉一致性……</div>
+          <div class="card__meta">
+            <span class="card__source"><span class="card__source-icon">E</span><span class="card__source-name">Microsoft Edge</span></span>
+            <span class="dot">·</span><span class="card__time">今天 00:32</span>
+          </div>
+          <div class="card__actions">
+            <button class="act" type="button"><svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg></button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="panel">
+      <h3>窄宽度（约 320px）</h3>
+      <p>来源名称省略号，时间保留；操作区仍右上角；高度不变。</p>
+      <div class="stage" style="display:flex;justify-content:center">
+        <div class="narrow-frame">
+          <div class="card force-hover" data-static="1" style="margin:0">
+            <div class="card__content">窄窗口下内容依旧两行截断，不会把卡片撑成参差高度。</div>
+            <div class="card__meta">
+              <span class="card__source"><span class="card__source-icon">E</span><span class="card__source-name">Microsoft Edge WebView2</span></span>
+              <span class="dot">·</span><span class="card__time">00:27</span>
+            </div>
+            <div class="card__actions">
+              <button class="act" type="button"><svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg></button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════ Design rules ══════════ -->
+  <div class="section-title">
+    <h2>布局与交互规则</h2>
+    <span>桌面端长期高频使用</span>
+  </div>
+  <div class="grid-2">
+    <div class="panel">
+      <h3>布局</h3>
+      <p>
+        卡片高度固定节奏（约 88–100px）：内容 2 行截断 + 单行 meta。
+        上下 padding 12/11，左右 14，圆角 8。列表间距 8，连续排列时呼吸均匀。
+        不使用渐变、玻璃拟态、重阴影；颜色只服务于状态（蓝选中 / 琥珀固定 / 红删除）。
+      </p>
+    </div>
+    <div class="panel">
+      <h3>Hover / 焦点</h3>
+      <p>
+        按钮绝对定位，<b>不改变卡片高度</b>，无布局跳动。鼠标移入按钮时仍保持卡片 hover（同卡片内）。
+        内容右侧预留 gutter，避免遮字。Tooltip 仅用于图标按钮。
+        Selected + Hover 同时保留光晕与操作区。
+      </p>
+    </div>
+    <div class="panel">
+      <h3>操作权重</h3>
+      <p>
+        复制（高频）在方案 B 才直出；固定可直出点亮态；删除<b>不直出</b>，仅菜单内红色项。
+        键盘可完成复制 / 固定 / 删除，与鼠标路径对等。
+      </p>
+    </div>
+    <div class="panel">
+      <h3>不放进默认卡片的信息</h3>
+      <p>
+        字数/字节、格式数量、重复标记、完整时间戳、标签编辑——放 Hover 提示、菜单或详情面板。
+        信息进卡片的唯一标准：<b>是否帮助「扫一眼就认出这条」</b>。
+      </p>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+<div class="menu" id="ctxMenu" role="menu"></div>
+
+<script>
+(function () {
+  "use strict";
+
+  const icons = {
+    more: '<svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg>',
+    copy: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></svg>',
+    pin: '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M14 2l8 8-3 1-1.5 5.5L13 13l-7 7-1-1 7-7-3.5-4.5L13 6l1-3z"/></svg>',
+  };
+
+  const samples = [
+    {
+      id: "c1",
+      content: "list-row",
+      source: "Microsoft Edge",
+      short: "E",
+      time: "今天 00:27",
+      kind: "text",
+    },
+    {
+      id: "c2",
+      content:
+        "我正在设计一款**桌面端剪切板管理软件**，目前在设计剪切板内容列表中的「列表卡片」。需要考虑短文本、长文本、多行、代码与特殊字符在列表中的视觉一致性，以及 Hover 时操作按钮如何不遮挡内容……",
+      source: "Microsoft Edge",
+      short: "E",
+      time: "今天 00:32",
+      kind: "text",
+    },
+    {
+      id: "c3",
+      content:
+        "sk-326e729e36889c4c1244eb119d4b90e989435bdc7b73265a1c8e4f0b2d91aa77c4e81b0f3a6d2c5e7890abcdef1234567890abcdef",
+      source: "Google Chrome",
+      short: "C",
+      time: "今天 21:55",
+      kind: "text",
+    },
+    {
+      id: "c4",
+      content:
+        'const name = item.sourceApp || "未知来源";\nif (!name) return "未知来源";\nreturn name;',
+      source: "Visual Studio Code",
+      short: "V",
+      time: "今天 21:55",
+      kind: "code",
+    },
+    {
+      id: "c5",
+      content:
+        "下一步直接做第 6 项：管理员提权任务计划模式。\n需要先确认 UAC 弹窗文案，再接入计划任务注册接口。\n回归点：任务创建失败时的回滚日志。",
+      source: "记事本",
+      short: "N",
+      time: "昨天 22:20",
+      kind: "text",
+    },
+    {
+      id: "c6",
+      content: "https://free.9e.nz/keys",
+      source: "Google Chrome",
+      short: "C",
+      time: "今天 21:55",
+      kind: "text",
+    },
+    {
+      id: "c7",
+      content:
+        'SELECT id, created_at_unix_ms, primary_kind, preview_text, source_app, source_exe_path FROM clips WHERE (?1 IS NULL OR id IN (SELECT clip_id FROM clip_search)) ORDER BY created_at_unix_ms DESC, id DESC LIMIT ?8',
+      source: "Windows Terminal",
+      short: "T",
+      time: "今天 13:59",
+      kind: "code",
+    },
+    {
+      id: "c8",
+      content: "特殊字符测试：¥128 · 50% + 3√2 ≈ 4.24 · <html> & \"quotes\" · emoji 🎯 · ｡･ω･｡",
+      source: "WeChat",
+      short: "W",
+      time: "昨天 18:02",
+      kind: "text",
+      pinned: true,
+    },
+    {
+      id: "c9",
+      content:
+        "C:\\Users\\seeyuer\\桌面\\PixPin_2026-09-28_13-58-29.png",
+      source: "PixPin",
+      short: "P",
+      time: "今天 13:58",
+      kind: "text",
+    },
+    {
+      id: "c10",
+      content: "SnapClip M2 runtime smoke test 2",
+      source: "Windows Terminal",
+      short: "T",
+      time: "今天 13:30",
+      kind: "text",
+    },
+  ];
+
+  const state = {
+    scheme: "A",
+    selectedId: null,
+    items: samples.map((item) => ({ ...item })),
+    menuFor: null,
+  };
+
+  const listEl = document.getElementById("clipList");
+  const toastEl = document.getElementById("toast");
+  const menuEl = document.getElementById("ctxMenu");
+  const schemeHint = document.getElementById("schemeHint");
+
+  function escapeHtml(value) {
+    return String(value)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  function showToast(message) {
+    toastEl.textContent = message;
+    toastEl.classList.add("show");
+    clearTimeout(showToast._timer);
+    showToast._timer = setTimeout(() => toastEl.classList.remove("show"), 1600);
+  }
+
+  function closeMenu() {
+    menuEl.classList.remove("open");
+    state.menuFor = null;
+    listEl.querySelectorAll(".card.is-menu-open").forEach((el) => el.classList.remove("is-menu-open"));
+  }
+
+  function openMenu(cardEl, item) {
+    const rect = cardEl.getBoundingClientRect();
+    state.menuFor = item.id;
+    cardEl.classList.add("is-menu-open");
+    menuEl.innerHTML = [
+      '<button type="button" data-act="copy"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></svg>复制<span class="kbd">C</span></button>',
+      '<button type="button" data-act="pin">' +
+        icons.pin +
+        (item.pinned ? "取消固定" : "固定") +
+        '<span class="kbd">P</span></button>',
+      '<button type="button" data-act="expand"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 7h16M4 12h16M4 17h10"/></svg>查看完整内容</button>',
+      '<button type="button" data-act="plain"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M7 7h10v10H7z"/><path d="M9 3h6M9 21h6"/></svg>复制纯文本</button>',
+      "<hr />",
+      '<button type="button" class="danger" data-act="delete"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 7h16M9 7V5h6v2M7 7l1 12h8l1-12"/></svg>删除<span class="kbd">Del</span></button>',
+    ].join("");
+
+    const menuWidth = 176;
+    const menuHeight = 250;
+    let left = rect.right - menuWidth - 8;
+    let top = rect.top + 8;
+    if (left < 8) left = 8;
+    if (top + menuHeight > window.innerHeight - 8) top = window.innerHeight - menuHeight - 8;
+    menuEl.style.left = left + "px";
+    menuEl.style.top = top + "px";
+    menuEl.classList.add("open");
+  }
+
+  function copyItem(item) {
+    const text = item.content;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).catch(() => {});
+    }
+    showToast("已复制：" + (text.length > 28 ? text.slice(0, 28) + "…" : text));
+  }
+
+  function togglePin(item) {
+    item.pinned = !item.pinned;
+    render();
+    showToast(item.pinned ? "已固定" : "已取消固定");
+  }
+
+  function deleteItem(item) {
+    state.items = state.items.filter((x) => x.id !== item.id);
+    if (state.selectedId === item.id) state.selectedId = null;
+    render();
+    showToast("已删除（Demo 仅本地移除）");
+  }
+
+  function activateItem(item) {
+    if (state.scheme === "A") {
+      copyItem(item);
+    } else {
+      state.selectedId = item.id;
+      render();
+    }
+  }
+
+  function cardHtml(item) {
+    const classes = ["card"];
+    if (item.kind === "code") classes.push("is-code");
+    if (item.pinned) classes.push("is-pinned");
+    if (item.id === state.selectedId) classes.push("is-selected");
+
+    const pinChip = item.pinned ? '<span class="chip pin">固定</span>' : "";
+    const copyBtn =
+      state.scheme === "B"
+        ? '<button class="act primary copy-inline" type="button" data-act="copy" title="复制">' +
+          icons.copy +
+          "复制</button>"
+        : "";
+    const pinBtn =
+      '<button class="act' +
+      (item.pinned ? " is-on" : "") +
+      '" type="button" data-act="pin" title="' +
+      (item.pinned ? "取消固定" : "固定") +
+      '">' +
+      icons.pin +
+      "</button>";
+
+    return (
+      '<div role="button" tabindex="0" class="' +
+      classes.join(" ") +
+      '" data-id="' +
+      item.id +
+      '">' +
+      '<div class="card__content">' +
+      escapeHtml(item.content) +
+      "</div>" +
+      '<div class="card__meta">' +
+      '<span class="card__source"><span class="card__source-icon">' +
+      escapeHtml(item.short) +
+      '</span><span class="card__source-name">' +
+      escapeHtml(item.source) +
+      "</span></span>" +
+      '<span class="dot">·</span><span class="card__time">' +
+      escapeHtml(item.time) +
+      "</span>" +
+      pinChip +
+      "</div>" +
+      '<div class="card__actions">' +
+      copyBtn +
+      pinBtn +
+      '<button class="act" type="button" data-act="more" title="更多操作">' +
+      icons.more +
+      "</button>" +
+      "</div>" +
+      "</div>"
+    );
+  }
+
+  function render() {
+    const pinned = state.items.filter((i) => i.pinned);
+    const rest = state.items.filter((i) => !i.pinned);
+    let html = "";
+    if (pinned.length) {
+      html += '<div class="group-label">固定</div>';
+      html += pinned.map(cardHtml).join("");
+    }
+    if (rest.length) {
+      html += '<div class="group-label">今天</div>';
+      html += rest.map(cardHtml).join("");
+    }
+    if (!state.items.length) {
+      html = '<div style="padding:32px;text-align:center;color:var(--muted);font-size:13px">没有匹配的剪切板记录</div>';
+    }
+    listEl.innerHTML = html;
+  }
+
+  listEl.addEventListener("click", (event) => {
+    const actionBtn = event.target.closest("[data-act]");
+    const card = event.target.closest(".card[data-id]");
+    if (!card) return;
+    const item = state.items.find((x) => x.id === card.dataset.id);
+    if (!item) return;
+
+    if (actionBtn) {
+      event.preventDefault();
+      event.stopPropagation();
+      const act = actionBtn.dataset.act;
+      if (act === "copy") copyItem(item);
+      else if (act === "pin") togglePin(item);
+      else if (act === "more") {
+        if (state.menuFor === item.id) closeMenu();
+        else openMenu(card, item);
+      }
+      return;
+    }
+
+    closeMenu();
+    activateItem(item);
+  });
+
+  menuEl.addEventListener("click", (event) => {
+    const btn = event.target.closest("[data-act]");
+    if (!btn) return;
+    const item = state.items.find((x) => x.id === state.menuFor);
+    if (!item) return closeMenu();
+    const act = btn.dataset.act;
+    closeMenu();
+    if (act === "copy" || act === "plain") copyItem(item);
+    else if (act === "pin") togglePin(item);
+    else if (act === "expand") showToast("完整内容：Demo 中可接详情面板");
+    else if (act === "delete") deleteItem(item);
+  });
+
+  document.addEventListener("click", (event) => {
+    if (!event.target.closest("#ctxMenu") && !event.target.closest('[data-act="more"]')) {
+      closeMenu();
+    }
+  });
+
+  // Scheme switch
+  document.getElementById("schemeSwitch").addEventListener("click", (event) => {
+    const btn = event.target.closest("[data-scheme]");
+    if (!btn) return;
+    state.scheme = btn.dataset.scheme;
+    document.body.dataset.scheme = state.scheme;
+    document.querySelectorAll("#schemeSwitch button").forEach((el) => {
+      el.classList.toggle("active", el.dataset.scheme === state.scheme);
+    });
+    schemeHint.textContent =
+      state.scheme === "A"
+        ? "当前：方案 A — 点击卡片即复制，悬停仅显示 ···"
+        : "当前：方案 B — 点击选中，悬停显示「复制 + ···」";
+    closeMenu();
+    render();
+  });
+
+  // Search filter (demo)
+  const searchInput = document.getElementById("searchInput");
+  const searchBox = document.getElementById("searchBox");
+  const searchClear = document.getElementById("searchClear");
+  function applySearch() {
+    const q = searchInput.value.trim().toLowerCase();
+    searchBox.classList.toggle("has-value", !!q);
+    if (!q) {
+      state.items = samples.map((s) => {
+        const live = state.items.find((x) => x.id === s.id);
+        return live ? { ...live } : { ...s };
+      });
+    } else {
+      state.items = samples
+        .filter((s) => (s.content + s.source).toLowerCase().includes(q))
+        .map((s) => {
+          const live = state.items.find((x) => x.id === s.id);
+          return live ? { ...live } : { ...s };
+        });
+    }
+    render();
+  }
+  searchInput.addEventListener("input", applySearch);
+  searchClear.addEventListener("click", () => {
+    searchInput.value = "";
+    applySearch();
+    searchInput.focus();
+  });
+
+  // Keyboard
+  document.getElementById("appWindow").addEventListener("keydown", (event) => {
+    if (event.target === searchInput) {
+      if (event.key === "Escape") {
+        searchInput.value = "";
+        applySearch();
+        searchInput.blur();
+      }
+      return;
+    }
+    const ids = state.items.map((i) => i.id);
+    if (!ids.length) return;
+    const index = Math.max(0, ids.indexOf(state.selectedId));
+
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      const next =
+        event.key === "ArrowDown"
+          ? Math.min(ids.length - 1, state.selectedId == null ? 0 : index + 1)
+          : Math.max(0, state.selectedId == null ? 0 : index - 1);
+      state.selectedId = ids[next];
+      render();
+      listEl.querySelector(".card.is-selected")?.scrollIntoView({ block: "nearest" });
+    } else if (event.key === "Enter" || event.key.toLowerCase() === "c") {
+      if (state.selectedId) {
+        event.preventDefault();
+        const item = state.items.find((x) => x.id === state.selectedId);
+        if (item) copyItem(item);
+      }
+    } else if (event.key.toLowerCase() === "p") {
+      if (state.selectedId) {
+        event.preventDefault();
+        const item = state.items.find((x) => x.id === state.selectedId);
+        if (item) togglePin(item);
+      }
+    } else if (event.key === "Delete" || event.key === "Backspace") {
+      if (state.selectedId) {
+        event.preventDefault();
+        const item = state.items.find((x) => x.id === state.selectedId);
+        if (item) deleteItem(item);
+      }
+    } else if (event.key === "Escape") {
+      closeMenu();
+    }
+  });
+
+  render();
+})();
+</script>
+</body>
+</html>

@@ -26,6 +26,7 @@ export interface ClipboardPublication {
   publicationId: string;
   capturedAtUnixMs: number;
   sourceApp: string | null;
+  sourceExePath: string | null;
   payloads: PayloadRef[];
 }
 
@@ -35,6 +36,7 @@ export interface ClipSummary {
   primaryKind: PayloadKind;
   previewText: string | null;
   sourceApp: string | null;
+  sourceExePath: string | null;
   thumbnail: PayloadRef | null;
   payloads: PayloadRef[];
 }

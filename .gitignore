@@ -24,3 +24,11 @@ dist-ssr
 *.sw?
 
 refer
+
+# Large third-party font binaries (only used by local design prototypes)
+src/assets/fonts/
+
+# Local scratch / backup artifacts
+*-backup.html
+*.backup.*
+.playwright-cli/

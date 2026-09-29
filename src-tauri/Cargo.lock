@@ -694,6 +694,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dashmap"
+version = "6.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6361d5c062261c78a176addb82d4c821ae42bed6089de0e12603cd25de2059c"
+dependencies = [
+ "cfg-if",
+ "crossbeam-utils",
+ "hashbrown 0.14.5",
+ "lock_api",
+ "once_cell",
+ "parking_lot_core",
+]
+
+[[package]]
 name = "dbus"
 version = "0.9.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3235,6 +3249,7 @@ checksum = "f9395f0f0eee849a9b707b2f06bb92a6a422090e2123bb2ef8e87a0e61892a8e"
 name = "snapclip"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "blake3",
  "rusqlite",
  "serde",
@@ -3243,6 +3258,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-opener",
  "thiserror 2.0.21",
+ "win-icon-extractor",
  "windows-sys 0.59.0",
 ]
 
@@ -4389,6 +4405,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "win-icon-extractor"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d44398466322023956768b83f07e5a06d3c417578befcb94e41677fab055b89"
+dependencies = [
+ "dashmap",
+ "miniz_oxide 0.8.9",
+ "thiserror 2.0.21",
+ "windows 0.61.3",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "winapi"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4895,6 +4924,12 @@ dependencies = [
  "once_cell",
  "pkg-config",
 ]
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "550a2b930b62486a393c52d5c3b84bff264b28aa437ed64694d31e93b1757af7"
 
 [[package]]
 name = "yoke"

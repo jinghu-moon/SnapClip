@@ -1,160 +1,145 @@
 <script setup lang="ts">
-import { ref } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
+import { storeToRefs } from "pinia";
+import { useVirtualizer } from "@tanstack/vue-virtual";
+import {
+  IconClipboardText,
+  IconFile,
+  IconFileText,
+  IconPhoto,
+  IconRefresh,
+  IconSearch,
+  IconX,
+} from "@tabler/icons-vue";
+import HistoryItem from "./components/HistoryItem.vue";
+import { useHistoryStore } from "./stores/history";
+import type { PayloadKind } from "./shared/contracts";
 
-const greetMsg = ref("");
-const name = ref("");
+const history = useHistoryStore();
+const { items, isLoading, error, hasLoaded } = storeToRefs(history);
+const queryInput = ref("");
+const listRef = ref<HTMLElement | null>(null);
+const searchInput = ref<HTMLInputElement | null>(null);
+const rowHeight = 112;
 
-async function greet() {
-  // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-  greetMsg.value = await invoke("greet", { name: name.value });
+const visibleItems = computed(() => items.value);
+const virtualizer = useVirtualizer(computed(() => ({
+  count: visibleItems.value.length,
+  getScrollElement: () => listRef.value,
+  estimateSize: () => rowHeight,
+  overscan: 8,
+})));
+const virtualRows = computed(() => virtualizer.value.getVirtualItems());
+
+let searchTimer: ReturnType<typeof setTimeout> | undefined;
+watch(queryInput, (value) => {
+  if (searchTimer) clearTimeout(searchTimer);
+  searchTimer = setTimeout(async () => {
+    history.setQuery(value);
+    await history.refresh();
+    await nextTick();
+    virtualizer.value.measure();
+  }, 220);
+});
+
+watch(() => history.kind, () => void history.refresh());
+
+function selectVisible(index: number) {
+  const item = visibleItems.value[index];
+  if (item) history.select(item.id);
 }
+
+function onListScroll() {
+  const element = listRef.value;
+  if (!element || isLoading.value || !history.nextCursor) return;
+  if (element.scrollTop + element.clientHeight >= element.scrollHeight - rowHeight * 3) {
+    void history.loadMore();
+  }
+}
+
+function onKeydown(event: KeyboardEvent) {
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "f") {
+    event.preventDefault();
+    searchInput.value?.focus();
+  } else if (event.key === "Escape" && document.activeElement === searchInput.value) {
+    queryInput.value = "";
+    searchInput.value?.blur();
+  }
+}
+
+function clearSearch() {
+  queryInput.value = "";
+  searchInput.value?.focus();
+}
+
+function setKind(kind: PayloadKind | "all") {
+  history.setKind(kind);
+}
+
+onMounted(() => {
+  window.addEventListener("keydown", onKeydown);
+  void history.loadMore();
+});
+onUnmounted(() => {
+  window.removeEventListener("keydown", onKeydown);
+  if (searchTimer) clearTimeout(searchTimer);
+});
 </script>
 
 <template>
-  <main class="container">
-    <h1>Welcome to Tauri + Vue</h1>
+  <div class="shell">
+    <main class="main">
+      <header class="toolbar">
+        <label class="search">
+          <IconSearch :size="17" />
+          <input ref="searchInput" v-model="queryInput" type="text" placeholder="搜索历史内容" />
+          <button v-if="queryInput" type="button" title="清除搜索" @click="clearSearch"><IconX :size="15" /></button>
+        </label>
+        <button class="toolbar__action" type="button" title="刷新历史" @click="history.refresh"><IconRefresh :size="17" /></button>
+      </header>
 
-    <div class="row">
-      <a href="https://vite.dev" target="_blank">
-        <img src="/vite.svg" class="logo vite" alt="Vite logo" />
-      </a>
-      <a href="https://tauri.app" target="_blank">
-        <img src="/tauri.svg" class="logo tauri" alt="Tauri logo" />
-      </a>
-      <a href="https://vuejs.org/" target="_blank">
-        <img src="./assets/vue.svg" class="logo vue" alt="Vue logo" />
-      </a>
-    </div>
-    <p>Click on the Tauri, Vite, and Vue logos to learn more.</p>
+      <section class="history-area">
+        <div ref="listRef" class="list-scroll" @scroll="onListScroll">
+          <div v-if="error" class="status status--error">
+            <div><div>{{ error }}</div><button type="button" @click="history.refresh">重试</button></div>
+          </div>
+          <div v-else-if="hasLoaded && visibleItems.length === 0" class="status">没有匹配的历史记录</div>
+          <div v-else-if="!hasLoaded && isLoading" class="status">正在加载历史记录…</div>
+          <div v-else class="list-virtual" :style="{ height: `${virtualizer.getTotalSize()}px` }">
+            <div
+              v-for="row in virtualRows"
+              :key="visibleItems[row.index]?.id"
+              class="list-row"
+              :style="{ transform: `translateY(${row.start}px)` }"
+            >
+              <HistoryItem
+                v-if="visibleItems[row.index]"
+                :item="visibleItems[row.index]"
+                :selected="visibleItems[row.index].id === history.selectedId"
+                @select="selectVisible(row.index)"
+              />
+            </div>
+          </div>
+          <button v-if="history.nextCursor && !isLoading" class="load-more" type="button" @click="history.loadMore">加载更多</button>
+          <div v-if="isLoading && hasLoaded" class="status">正在加载更多…</div>
+        </div>
+      </section>
 
-    <form class="row" @submit.prevent="greet">
-      <input id="greet-input" v-model="name" placeholder="Enter a name..." />
-      <button type="submit">Greet</button>
-    </form>
-    <p>{{ greetMsg }}</p>
-  </main>
+      <footer class="filter-bar" aria-label="按内容类型筛选">
+        <button class="filter" :class="{ 'filter--active': history.kind === 'all' }" :aria-pressed="history.kind === 'all'" type="button" @click="setKind('all')">
+          <IconClipboardText :size="18" /><span>全部</span>
+        </button>
+        <button class="filter" :class="{ 'filter--active': history.kind === 'text' }" :aria-pressed="history.kind === 'text'" type="button" @click="setKind('text')">
+          <IconFileText :size="18" /><span>文本</span>
+        </button>
+        <button class="filter" :class="{ 'filter--active': history.kind === 'image' }" :aria-pressed="history.kind === 'image'" type="button" @click="setKind('image')">
+          <IconPhoto :size="18" /><span>图片</span>
+        </button>
+        <button class="filter" :class="{ 'filter--active': history.kind === 'files' }" :aria-pressed="history.kind === 'files'" type="button" @click="setKind('files')">
+          <IconFile :size="18" /><span>文件</span>
+        </button>
+        <span class="result-count">{{ items.length }}</span>
+      </footer>
+    </main>
+  </div>
 </template>
-
-<style scoped>
-.logo.vite:hover {
-  filter: drop-shadow(0 0 2em #747bff);
-}
-
-.logo.vue:hover {
-  filter: drop-shadow(0 0 2em #249b73);
-}
-
-</style>
-<style>
-:root {
-  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
-  font-size: 16px;
-  line-height: 24px;
-  font-weight: 400;
-
-  color: #0f0f0f;
-  background-color: #f6f6f6;
-
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  -webkit-text-size-adjust: 100%;
-}
-
-.container {
-  margin: 0;
-  padding-top: 10vh;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  text-align: center;
-}
-
-.logo {
-  height: 6em;
-  padding: 1.5em;
-  will-change: filter;
-  transition: 0.75s;
-}
-
-.logo.tauri:hover {
-  filter: drop-shadow(0 0 2em #24c8db);
-}
-
-.row {
-  display: flex;
-  justify-content: center;
-}
-
-a {
-  font-weight: 500;
-  color: #646cff;
-  text-decoration: inherit;
-}
-
-a:hover {
-  color: #535bf2;
-}
-
-h1 {
-  text-align: center;
-}
-
-input,
-button {
-  border-radius: 8px;
-  border: 1px solid transparent;
-  padding: 0.6em 1.2em;
-  font-size: 1em;
-  font-weight: 500;
-  font-family: inherit;
-  color: #0f0f0f;
-  background-color: #ffffff;
-  transition: border-color 0.25s;
-  box-shadow: 0 2px 2px rgba(0, 0, 0, 0.2);
-}
-
-button {
-  cursor: pointer;
-}
-
-button:hover {
-  border-color: #396cd8;
-}
-button:active {
-  border-color: #396cd8;
-  background-color: #e8e8e8;
-}
-
-input,
-button {
-  outline: none;
-}
-
-#greet-input {
-  margin-right: 5px;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    color: #f6f6f6;
-    background-color: #2f2f2f;
-  }
-
-  a:hover {
-    color: #24c8db;
-  }
-
-  input,
-  button {
-    color: #ffffff;
-    background-color: #0f0f0f98;
-  }
-  button:active {
-    background-color: #0f0f0f69;
-  }
-}
-
-</style>

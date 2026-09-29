@@ -37,6 +37,7 @@ pub struct ClipboardPublication {
     pub publication_id: String,
     pub captured_at_unix_ms: i64,
     pub source_app: Option<String>,
+    pub source_exe_path: Option<String>,
     pub payloads: Vec<PayloadRef>,
 }
 
@@ -48,6 +49,7 @@ pub struct ClipSummary {
     pub primary_kind: PayloadKind,
     pub preview_text: Option<String>,
     pub source_app: Option<String>,
+    pub source_exe_path: Option<String>,
     pub thumbnail: Option<PayloadRef>,
     pub payloads: Vec<PayloadRef>,
 }
@@ -90,6 +92,7 @@ mod tests {
             publication_id: "publication-1".into(),
             captured_at_unix_ms: 42,
             source_app: None,
+            source_exe_path: None,
             payloads: vec![PayloadRef {
                 payload_id: "payload-1".into(),
                 content_hash: "abc123".into(),

@@ -8,7 +8,7 @@ use std::{
 };
 
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, GetLastError, HWND, LPARAM, LRESULT, WPARAM},
+    Foundation::{GetLastError, HWND, LPARAM, LRESULT, WPARAM},
     System::{
         DataExchange::{
             CloseClipboard, GetClipboardData, GetClipboardOwner, GetClipboardSequenceNumber,
@@ -17,18 +17,14 @@ use windows_sys::Win32::{
         LibraryLoader::GetModuleHandleW,
         Memory::{GlobalLock, GlobalSize, GlobalUnlock},
         Ole::{CF_DIB, CF_HDROP, CF_UNICODETEXT},
-        Threading::{
-            GetCurrentThreadId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-            QueryFullProcessImageNameW,
-        },
+        Threading::GetCurrentThreadId,
     },
     UI::{
         Shell::DragQueryFileW,
         WindowsAndMessaging::{
             CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow,
-            DispatchMessageW, GetMessageW, GetWindowThreadProcessId, MSG, PeekMessageW,
-            PostThreadMessageW, RegisterClassW, TranslateMessage, UnregisterClassW,
-            WM_CLIPBOARDUPDATE, WM_QUIT, WNDCLASSW,
+            DispatchMessageW, GetMessageW, MSG, PeekMessageW, PostThreadMessageW, RegisterClassW,
+            TranslateMessage, UnregisterClassW, WM_CLIPBOARDUPDATE, WM_QUIT, WNDCLASSW,
         },
     },
 };
@@ -37,6 +33,8 @@ use crate::{
     domain::{ClipboardPublication, ImageDimensions, PayloadKind, PayloadRef},
     store::{PayloadData, Store},
 };
+
+use super::source_app::{self, SourceWindowSnapshot};
 
 const LISTENER_CLASS: &[u16] = &[
     83, 110, 97, 112, 67, 108, 105, 112, 67, 108, 105, 112, 98, 111, 97, 114, 100, 0,
@@ -175,8 +173,16 @@ fn listener_thread(store: Store, ready: SyncSender<Result<u32, String>>) {
             break;
         }
         if message.message == WM_CLIPBOARDUPDATE {
+            // Snapshot owner/foreground immediately: the worker may run later,
+            // after the user has already switched windows.
+            let snapshot = SourceWindowSnapshot::capture();
             let sequence = unsafe { GetClipboardSequenceNumber() };
-            match event_tx.try_send(sequence) {
+            let event = ClipboardEvent {
+                sequence,
+                owner: snapshot.owner,
+                foreground: snapshot.foreground,
+            };
+            match event_tx.try_send(event) {
                 Ok(()) | Err(TrySendError::Full(_)) => {}
                 Err(TrySendError::Disconnected(_)) => break,
             }
@@ -205,7 +211,7 @@ unsafe extern "system" fn window_proc(
     unsafe { DefWindowProcW(window, message, wparam, lparam) }
 }
 
-fn clipboard_worker(events: Receiver<u32>, store: Store) {
+fn clipboard_worker(events: Receiver<ClipboardEvent>, store: Store) {
     let html_format = unsafe { RegisterClipboardFormatW(HTML_FORMAT.as_ptr()) };
     let rtf_format = unsafe { RegisterClipboardFormatW(RTF_FORMAT.as_ptr()) };
     let png_format = unsafe { RegisterClipboardFormatW(PNG_FORMAT.as_ptr()) };
@@ -213,12 +219,12 @@ fn clipboard_worker(events: Receiver<u32>, store: Store) {
     let exclude_format = unsafe { RegisterClipboardFormatW(exclude_format_name.as_ptr()) };
     let mut last_sequence = None;
 
-    for sequence in events {
-        if last_sequence == Some(sequence) {
+    for event in events {
+        if last_sequence == Some(event.sequence) {
             continue;
         }
         let captured_at_unix_ms = unix_time_ms();
-        let Ok((current_sequence, owner, mut captured)) =
+        let Ok((current_sequence, owner_now, mut captured)) =
             read_clipboard(html_format, rtf_format, png_format, exclude_format)
         else {
             continue;
@@ -230,6 +236,15 @@ fn clipboard_worker(events: Receiver<u32>, store: Store) {
             last_sequence = Some(current_sequence);
             continue;
         }
+
+        let source = source_app::resolve_source(SourceWindowSnapshot {
+            owner: if event.owner != 0 {
+                event.owner
+            } else {
+                owner_now as usize
+            },
+            foreground: event.foreground,
+        });
 
         let publication_id = format!("clipboard-{captured_at_unix_ms}-{current_sequence}");
         let payloads = captured
@@ -250,7 +265,8 @@ fn clipboard_worker(events: Receiver<u32>, store: Store) {
         let publication = ClipboardPublication {
             publication_id,
             captured_at_unix_ms,
-            source_app: clipboard_owner_process_name(owner),
+            source_app: source.as_ref().map(|info| info.display_name.clone()),
+            source_exe_path: source.as_ref().map(|info| info.exe_path.clone()),
             payloads: payloads
                 .iter()
                 .map(|payload| payload.payload.clone())
@@ -260,6 +276,13 @@ fn clipboard_worker(events: Receiver<u32>, store: Store) {
             last_sequence = Some(current_sequence);
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ClipboardEvent {
+    sequence: u32,
+    owner: usize,
+    foreground: usize,
 }
 
 type CapturedPayload = (PayloadKind, String, Option<ImageDimensions>, Vec<u8>);
@@ -466,34 +489,6 @@ fn unix_time_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
         .as_millis() as i64
-}
-
-fn clipboard_owner_process_name(owner: HWND) -> Option<String> {
-    if owner.is_null() {
-        return None;
-    }
-    let mut process_id = 0;
-    unsafe { GetWindowThreadProcessId(owner, &mut process_id) };
-    if process_id == 0 {
-        return None;
-    }
-    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
-    if process.is_null() {
-        return None;
-    }
-    let mut path = vec![0u16; 32768];
-    let mut length = path.len() as u32;
-    let success = unsafe { QueryFullProcessImageNameW(process, 0, path.as_mut_ptr(), &mut length) };
-    unsafe { CloseHandle(process) };
-    if success == 0 || length == 0 {
-        return None;
-    }
-    String::from_utf16(&path[..length as usize])
-        .ok()?
-        .rsplit(['\\', '/'])
-        .next()
-        .filter(|name| !name.is_empty())
-        .map(str::to_owned)
 }
 
 fn wide_nul(value: &str) -> Vec<u16> {
