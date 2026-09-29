@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const IPC_SCHEMA_VERSION: u16 = 1;
+pub const IPC_SCHEMA_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -11,6 +11,75 @@ pub enum PayloadKind {
     Image,
     Files,
     Other,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OcrStatus {
+    None,
+    Queued,
+    Running,
+    Done,
+    Failed,
+    Skipped,
+}
+
+impl OcrStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "none" => Some(Self::None),
+            "queued" => Some(Self::Queued),
+            "running" => Some(Self::Running),
+            "done" => Some(Self::Done),
+            "failed" => Some(Self::Failed),
+            "skipped" => Some(Self::Skipped),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OcrErrorCode {
+    LanguageUnavailable,
+    DecodeFailed,
+    Timeout,
+    Cancelled,
+    EngineFailed,
+}
+
+impl OcrErrorCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LanguageUnavailable => "language_unavailable",
+            Self::DecodeFailed => "decode_failed",
+            Self::Timeout => "timeout",
+            Self::Cancelled => "cancelled",
+            Self::EngineFailed => "engine_failed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "language_unavailable" => Some(Self::LanguageUnavailable),
+            "decode_failed" => Some(Self::DecodeFailed),
+            "timeout" => Some(Self::Timeout),
+            "cancelled" => Some(Self::Cancelled),
+            "engine_failed" => Some(Self::EngineFailed),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -52,6 +121,10 @@ pub struct ClipSummary {
     pub source_exe_path: Option<String>,
     pub thumbnail: Option<PayloadRef>,
     pub payloads: Vec<PayloadRef>,
+    pub ocr_status: OcrStatus,
+    pub ocr_engine: Option<String>,
+    pub ocr_updated_at: Option<i64>,
+    pub ocr_error_code: Option<OcrErrorCode>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

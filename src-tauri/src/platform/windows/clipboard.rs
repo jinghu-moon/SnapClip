@@ -31,10 +31,13 @@ use windows_sys::Win32::{
 
 use crate::{
     domain::{ClipboardPublication, ImageDimensions, PayloadKind, PayloadRef},
-    store::{PayloadData, Store},
+    store::{PayloadData, QueueDecision, Store},
 };
 
-use super::source_app::{self, SourceWindowSnapshot};
+use super::{
+    image_norm,
+    source_app::{self, SourceWindowSnapshot},
+};
 
 const LISTENER_CLASS: &[u16] = &[
     83, 110, 97, 112, 67, 108, 105, 112, 67, 108, 105, 112, 98, 111, 97, 114, 100, 0,
@@ -55,11 +58,14 @@ pub struct ClipboardMonitor {
 }
 
 impl ClipboardMonitor {
-    pub fn start(store: Store) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn start(
+        store: Store,
+        ocr: Option<crate::ocr::OcrEnqueuer>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name("snapclip-clipboard-listener".into())
-            .spawn(move || listener_thread(store, ready_tx))?;
+            .spawn(move || listener_thread(store, ocr, ready_tx))?;
         let thread_id = ready_rx.recv()??;
         Ok(Self {
             thread_id,
@@ -79,7 +85,11 @@ impl Drop for ClipboardMonitor {
     }
 }
 
-fn listener_thread(store: Store, ready: SyncSender<Result<u32, String>>) {
+fn listener_thread(
+    store: Store,
+    ocr: Option<crate::ocr::OcrEnqueuer>,
+    ready: SyncSender<Result<u32, String>>,
+) {
     let thread_id = unsafe { GetCurrentThreadId() };
     let mut initial_message: MSG = unsafe { zeroed() };
     unsafe { PeekMessageW(&mut initial_message, null_mut(), 0, 0, 0) };
@@ -131,7 +141,7 @@ fn listener_thread(store: Store, ready: SyncSender<Result<u32, String>>) {
     let (event_tx, event_rx) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
     let worker = thread::Builder::new()
         .name("snapclip-clipboard-worker".into())
-        .spawn(move || clipboard_worker(event_rx, store));
+        .spawn(move || clipboard_worker(event_rx, store, ocr));
     let worker = match worker {
         Ok(worker) => worker,
         Err(error) => {
@@ -211,7 +221,11 @@ unsafe extern "system" fn window_proc(
     unsafe { DefWindowProcW(window, message, wparam, lparam) }
 }
 
-fn clipboard_worker(events: Receiver<ClipboardEvent>, store: Store) {
+fn clipboard_worker(
+    events: Receiver<ClipboardEvent>,
+    store: Store,
+    ocr: Option<crate::ocr::OcrEnqueuer>,
+) {
     let html_format = unsafe { RegisterClipboardFormatW(HTML_FORMAT.as_ptr()) };
     let rtf_format = unsafe { RegisterClipboardFormatW(RTF_FORMAT.as_ptr()) };
     let png_format = unsafe { RegisterClipboardFormatW(PNG_FORMAT.as_ptr()) };
@@ -272,8 +286,29 @@ fn clipboard_worker(events: Receiver<ClipboardEvent>, store: Store) {
                 .map(|payload| payload.payload.clone())
                 .collect(),
         };
-        if store.save_publication(publication, payloads).is_ok() {
+        if store.save_publication(publication.clone(), payloads).is_ok() {
             last_sequence = Some(current_sequence);
+            if let Some(image) = publication
+                .payloads
+                .iter()
+                .find(|payload| payload.kind == PayloadKind::Image)
+            {
+                let clip_id = publication.publication_id.clone();
+                let hash = image.content_hash.clone();
+                match store.enqueue_ocr(clip_id.clone(), hash.clone()) {
+                    Ok(QueueDecision::Enqueued { attempt }) => {
+                        let queued = ocr
+                            .as_ref()
+                            .map(|queue| queue.try_enqueue(&clip_id, &hash))
+                            .unwrap_or(true);
+                        if !queued {
+                            let _ = store.release_queued(clip_id, attempt);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => {}
+                }
+            }
         }
     }
 }
@@ -372,30 +407,46 @@ unsafe fn read_open_clipboard(
         }
     }
 
-    let mut image = None;
-    for format in [17, png_format, CF_DIB as u32] {
+    // Prefer PNG; otherwise normalize DIB/DIBV5 → PNG so Store/OCR never see raw DIB.
+    let mut image_png: Option<(Option<ImageDimensions>, Vec<u8>)> = None;
+    for format in [png_format, 17, CF_DIB as u32] {
         if format == 0 || unsafe { IsClipboardFormatAvailable(format) } == 0 {
             continue;
         }
-        if let Some(bytes) = unsafe { read_global(format, MAX_CLIPBOARD_BYTES - total_size)? } {
-            if bytes.is_empty() {
-                continue;
-            }
-            let (mime_type, dimensions) = match format {
-                value if value == png_format => ("image/png", None),
-                17 => ("application/x-ms-dibv5", dib_dimensions(&bytes)),
-                _ => ("application/x-ms-dib", dib_dimensions(&bytes)),
-            };
-            image = Some((mime_type, dimensions, bytes));
+        let Some(bytes) = (unsafe { read_global(format, MAX_CLIPBOARD_BYTES - total_size) })?
+        else {
+            continue;
+        };
+        if bytes.is_empty() {
+            continue;
+        }
+        if format == png_format {
+            let dimensions = image_norm::png_dimensions(&bytes).map(|(width, height)| {
+                ImageDimensions { width, height }
+            });
+            image_png = Some((dimensions, bytes));
             break;
         }
+        match image_norm::dib_to_png(&bytes) {
+            Ok((png, width, height)) => {
+                image_png = Some((
+                    Some(ImageDimensions { width, height }),
+                    png,
+                ));
+                break;
+            }
+            Err(error) => {
+                eprintln!("[snapclip][clipboard] dib normalize failed: {error}");
+                continue;
+            }
+        }
     }
-    if let Some((mime_type, dimensions, bytes)) = image {
+    if let Some((dimensions, bytes)) = image_png {
         push_payload(
             &mut captured,
             &mut total_size,
             PayloadKind::Image,
-            mime_type,
+            "image/png",
             dimensions,
             bytes,
         )?;
@@ -454,6 +505,7 @@ fn bytes_to_utf16(bytes: &[u8]) -> Vec<u16> {
         .collect()
 }
 
+#[cfg(test)]
 fn dib_dimensions(bytes: &[u8]) -> Option<ImageDimensions> {
     if bytes.len() < 12 {
         return None;

@@ -27,6 +27,7 @@ blake3 = "1.5"
 rusqlite = { version = "0.32", features = ["bundled"] }
 thiserror = "2"
 base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "bmp"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
@@ -40,6 +41,13 @@ windows-sys = { version = "0.59", features = [
   "Win32_System_Threading",
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
+] }
+windows = { version = "0.61", features = [
+  "Foundation",
+  "Graphics_Imaging",
+  "Media_Ocr",
+  "Storage",
+  "Storage_Streams",
 ] }
 win-icon-extractor = { version = "0.3", default-features = false, features = ["png", "cache"] }
 

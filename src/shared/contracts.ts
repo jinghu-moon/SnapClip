@@ -1,4 +1,4 @@
-export const IPC_SCHEMA_VERSION = 1 as const;
+export const IPC_SCHEMA_VERSION = 2 as const;
 
 export type PayloadKind =
   | "text"
@@ -7,6 +7,21 @@ export type PayloadKind =
   | "image"
   | "files"
   | "other";
+
+export type OcrStatus =
+  | "none"
+  | "queued"
+  | "running"
+  | "done"
+  | "failed"
+  | "skipped";
+
+export type OcrErrorCode =
+  | "language_unavailable"
+  | "decode_failed"
+  | "timeout"
+  | "cancelled"
+  | "engine_failed";
 
 export interface ImageDimensions {
   width: number;
@@ -39,6 +54,10 @@ export interface ClipSummary {
   sourceExePath: string | null;
   thumbnail: PayloadRef | null;
   payloads: PayloadRef[];
+  ocrStatus: OcrStatus;
+  ocrEngine: string | null;
+  ocrUpdatedAt: number | null;
+  ocrErrorCode: OcrErrorCode | null;
 }
 
 export interface HistoryPage {

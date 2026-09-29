@@ -8,12 +8,13 @@ use std::{
     thread,
 };
 
-use rusqlite::{Connection, OpenFlags, params, params_from_iter};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::domain::{
-    ClipSummary, ClipboardPublication, ErrorCode, HistoryPage, IpcError, PayloadKind, PayloadRef,
+    ClipSummary, ClipboardPublication, ErrorCode, HistoryPage, IpcError, OcrErrorCode, OcrStatus,
+    PayloadKind, PayloadRef,
 };
 
 pub use blob::{BlobRef, BlobStore};
@@ -76,6 +77,84 @@ enum WriterRequest {
         payloads: Vec<PayloadData>,
         response: mpsc::Sender<Result<(), StoreError>>,
     },
+    EnqueueOcr {
+        clip_id: String,
+        content_hash: String,
+        response: mpsc::Sender<Result<QueueDecision, StoreError>>,
+    },
+    ClaimOcrJob {
+        clip_id: String,
+        content_hash: String,
+        response: mpsc::Sender<Result<Option<u32>, StoreError>>,
+    },
+    FinishOcrJob {
+        clip_id: String,
+        attempt: u32,
+        outcome: OcrFinishOutcome,
+        response: mpsc::Sender<Result<bool, StoreError>>,
+    },
+    ReleaseQueued {
+        clip_id: String,
+        attempt: u32,
+        response: mpsc::Sender<Result<bool, StoreError>>,
+    },
+    ResetStaleOcrJobs {
+        response: mpsc::Sender<Result<u32, StoreError>>,
+    },
+    ListOcrCandidates {
+        filter: OcrCandidateFilter,
+        limit: u32,
+        response: mpsc::Sender<Result<Vec<OcrCandidate>, StoreError>>,
+    },
+    ReadPayloadBytes {
+        content_hash: String,
+        kind: PayloadKind,
+        response: mpsc::Sender<Result<Vec<u8>, StoreError>>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueDecision {
+    Enqueued { attempt: u32 },
+    AlreadyPending,
+    NotImage,
+    NotFound,
+}
+
+#[derive(Debug, Clone)]
+pub enum OcrFinishOutcome {
+    Done {
+        text: String,
+        engine: String,
+    },
+    Failed {
+        error_code: OcrErrorCode,
+        engine: Option<String>,
+    },
+    Skipped {
+        error_code: OcrErrorCode,
+        engine: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OcrCandidateFilter {
+    None,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OcrCandidate {
+    pub clip_id: String,
+    pub content_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OcrStatusInfo {
+    pub status: OcrStatus,
+    pub engine: Option<String>,
+    pub updated_at: Option<i64>,
+    pub error_code: Option<OcrErrorCode>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -155,6 +234,115 @@ impl Store {
             .map_err(|_| StoreError::WriterUnavailable)?
     }
 
+    pub fn enqueue_ocr(
+        &self,
+        clip_id: String,
+        content_hash: String,
+    ) -> Result<QueueDecision, StoreError> {
+        self.send_request(|response| WriterRequest::EnqueueOcr {
+            clip_id,
+            content_hash,
+            response,
+        })
+    }
+
+    pub fn claim_ocr_job(
+        &self,
+        clip_id: String,
+        content_hash: String,
+    ) -> Result<Option<u32>, StoreError> {
+        self.send_request(|response| WriterRequest::ClaimOcrJob {
+            clip_id,
+            content_hash,
+            response,
+        })
+    }
+
+    pub fn finish_ocr_job(
+        &self,
+        clip_id: String,
+        attempt: u32,
+        outcome: OcrFinishOutcome,
+    ) -> Result<bool, StoreError> {
+        self.send_request(|response| WriterRequest::FinishOcrJob {
+            clip_id,
+            attempt,
+            outcome,
+            response,
+        })
+    }
+
+    pub fn release_queued(&self, clip_id: String, attempt: u32) -> Result<bool, StoreError> {
+        self.send_request(|response| WriterRequest::ReleaseQueued {
+            clip_id,
+            attempt,
+            response,
+        })
+    }
+
+    pub fn reset_stale_ocr_jobs(&self) -> Result<u32, StoreError> {
+        self.send_request(|response| WriterRequest::ResetStaleOcrJobs { response })
+    }
+
+    pub fn list_ocr_candidates(
+        &self,
+        filter: OcrCandidateFilter,
+        limit: u32,
+    ) -> Result<Vec<OcrCandidate>, StoreError> {
+        self.send_request(|response| WriterRequest::ListOcrCandidates {
+            filter,
+            limit,
+            response,
+        })
+    }
+
+    pub fn read_payload_bytes(
+        &self,
+        content_hash: String,
+        kind: PayloadKind,
+    ) -> Result<Vec<u8>, StoreError> {
+        self.send_request(|response| WriterRequest::ReadPayloadBytes {
+            content_hash,
+            kind,
+            response,
+        })
+    }
+
+    /// Read-only OCR status (separate connection is fine for SELECT).
+    pub fn ocr_status_of(&self, clip_id: &str) -> Result<OcrStatusInfo, StoreError> {
+        let connection = Connection::open_with_flags(
+            &self.database_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        connection.busy_timeout(std::time::Duration::from_secs(2))?;
+        let (status, engine, updated_at, error_code): (String, Option<String>, Option<i64>, Option<String>) =
+            connection.query_row(
+                "SELECT ocr_status, ocr_engine, ocr_updated_at, ocr_error_code
+                 FROM clip_search WHERE clip_id = ?1",
+                [clip_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+        Ok(OcrStatusInfo {
+            status: OcrStatus::parse(&status).unwrap_or(OcrStatus::None),
+            engine,
+            updated_at,
+            error_code: error_code.as_deref().and_then(OcrErrorCode::parse),
+        })
+    }
+
+    fn send_request<T>(
+        &self,
+        build: impl FnOnce(mpsc::Sender<Result<T, StoreError>>) -> WriterRequest,
+    ) -> Result<T, StoreError> {
+        let (response_tx, response_rx) = mpsc::channel();
+        self.writer
+            .send(build(response_tx))
+            .map_err(|_| StoreError::WriterUnavailable)?;
+        response_rx
+            .recv()
+            .map_err(|_| StoreError::WriterUnavailable)?
+    }
+
     pub fn history_page(
         &self,
         cursor: Option<String>,
@@ -213,22 +401,28 @@ impl Store {
             format!("%{escaped}%")
         });
         let mut statement = connection.prepare(
-            "SELECT id, created_at_unix_ms, primary_kind, preview_text, source_app, source_exe_path
+            "SELECT clips.id, clips.created_at_unix_ms, clips.primary_kind, clips.preview_text,
+                    clips.source_app, clips.source_exe_path,
+                    cs.ocr_status, cs.ocr_engine, cs.ocr_updated_at, cs.ocr_error_code
              FROM clips
-             WHERE (?1 IS NULL OR id IN (
+             LEFT JOIN clip_search cs ON cs.clip_id = clips.id
+             WHERE (?1 IS NULL OR clips.id IN (
                  SELECT clip_id FROM clip_search
                  WHERE (?2 = 1 AND rowid IN (
                      SELECT rowid FROM clip_search_fts WHERE clip_search_fts MATCH ?3
-                 )) OR (?2 = 0 AND text_content LIKE ?4 ESCAPE '\\')
+                 )) OR (?2 = 0 AND (
+                     text_content LIKE ?4 ESCAPE '\\'
+                     OR ocr_text LIKE ?4 ESCAPE '\\'
+                 ))
              ))
-             AND (?5 IS NULL OR created_at_unix_ms < ?5
-                OR (created_at_unix_ms = ?5 AND id < ?6))
+             AND (?5 IS NULL OR clips.created_at_unix_ms < ?5
+                OR (clips.created_at_unix_ms = ?5 AND clips.id < ?6))
              AND (?7 IS NULL OR EXISTS (
                  SELECT 1 FROM clip_payloads cp
                  JOIN payloads p ON p.id = cp.payload_id
                  WHERE cp.clip_id = clips.id AND p.kind = ?7
              ))
-             ORDER BY created_at_unix_ms DESC, id DESC
+             ORDER BY clips.created_at_unix_ms DESC, clips.id DESC
              LIMIT ?8",
         )?;
         let cursor_time = cursor.as_ref().map(|value| value.created_at_unix_ms);
@@ -245,6 +439,8 @@ impl Store {
         ])?;
         let mut summaries = Vec::new();
         while let Some(row) = rows.next()? {
+            let ocr_status_raw: Option<String> = row.get(6)?;
+            let ocr_error_raw: Option<String> = row.get(9)?;
             summaries.push(ClipSummary {
                 id: row.get(0)?,
                 created_at_unix_ms: row.get(1)?,
@@ -254,6 +450,13 @@ impl Store {
                 source_exe_path: row.get(5)?,
                 thumbnail: None,
                 payloads: Vec::new(),
+                ocr_status: ocr_status_raw
+                    .as_deref()
+                    .and_then(OcrStatus::parse)
+                    .unwrap_or(OcrStatus::None),
+                ocr_engine: row.get(7)?,
+                ocr_updated_at: row.get(8)?,
+                ocr_error_code: ocr_error_raw.as_deref().and_then(OcrErrorCode::parse),
             });
         }
 
@@ -343,8 +546,250 @@ fn writer_loop(connection: Connection, blob_store: BlobStore, receiver: Receiver
                 let result = insert_publication(&connection, &blob_store, publication, payloads);
                 let _ = response.send(result);
             }
+            WriterRequest::EnqueueOcr {
+                clip_id,
+                content_hash,
+                response,
+            } => {
+                let _ = response.send(enqueue_ocr(&connection, &clip_id, &content_hash));
+            }
+            WriterRequest::ClaimOcrJob {
+                clip_id,
+                content_hash,
+                response,
+            } => {
+                let _ = response.send(claim_ocr_job(&connection, &clip_id, &content_hash));
+            }
+            WriterRequest::FinishOcrJob {
+                clip_id,
+                attempt,
+                outcome,
+                response,
+            } => {
+                let _ = response.send(finish_ocr_job(&connection, &clip_id, attempt, &outcome));
+            }
+            WriterRequest::ReleaseQueued {
+                clip_id,
+                attempt,
+                response,
+            } => {
+                let _ = response.send(release_queued(&connection, &clip_id, attempt));
+            }
+            WriterRequest::ResetStaleOcrJobs { response } => {
+                let _ = response.send(reset_stale_ocr_jobs(&connection));
+            }
+            WriterRequest::ListOcrCandidates {
+                filter,
+                limit,
+                response,
+            } => {
+                let _ = response.send(list_ocr_candidates(&connection, filter, limit));
+            }
+            WriterRequest::ReadPayloadBytes {
+                content_hash,
+                kind,
+                response,
+            } => {
+                let _ =
+                    response.send(read_payload_bytes(&connection, &blob_store, &content_hash, kind));
+            }
         }
     }
+}
+
+fn enqueue_ocr(
+    connection: &Connection,
+    clip_id: &str,
+    content_hash: &str,
+) -> Result<QueueDecision, StoreError> {
+    let kind: Option<String> = connection
+        .query_row(
+            "SELECT primary_kind FROM clips WHERE id = ?1",
+            [clip_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(kind) = kind else {
+        return Ok(QueueDecision::NotFound);
+    };
+    if kind != "image" {
+        return Ok(QueueDecision::NotImage);
+    }
+
+    let status: Option<String> = connection.query_row(
+        "SELECT ocr_status FROM clip_search WHERE clip_id = ?1",
+        [clip_id],
+        |row| row.get(0),
+    ).optional()?;
+
+    let status = status.unwrap_or_else(|| OcrStatus::None.as_str().to_string());
+    match status.as_str() {
+        "queued" | "running" | "done" => return Ok(QueueDecision::AlreadyPending),
+        "failed" | "skipped" | "none" => {}
+        _ => return Ok(QueueDecision::NotFound),
+    }
+
+    let updated = connection.execute(
+        "UPDATE clip_search
+         SET ocr_status = 'queued',
+             ocr_attempt = ocr_attempt + 1,
+             ocr_content_hash = ?2,
+             ocr_error_code = NULL,
+             ocr_updated_at = ?3
+         WHERE clip_id = ?1 AND ocr_status = ?4",
+        params![clip_id, content_hash, unix_time_ms(), status.as_str()],
+    )?;
+    if updated == 0 {
+        connection.execute(
+            "INSERT INTO clip_search(clip_id, text_content, ocr_text, ocr_status, ocr_attempt, ocr_content_hash, ocr_updated_at)
+             VALUES (?1, NULL, NULL, 'queued', 1, ?2, ?3)
+             ON CONFLICT(clip_id) DO UPDATE SET
+                ocr_status = 'queued',
+                ocr_attempt = clip_search.ocr_attempt + 1,
+                ocr_content_hash = excluded.ocr_content_hash,
+                ocr_error_code = NULL,
+                ocr_updated_at = excluded.ocr_updated_at",
+            params![clip_id, content_hash, unix_time_ms()],
+        )?;
+    }
+    let attempt: u32 = connection.query_row(
+        "SELECT ocr_attempt FROM clip_search WHERE clip_id = ?1",
+        [clip_id],
+        |row| row.get(0),
+    )?;
+    Ok(QueueDecision::Enqueued { attempt })
+}
+
+fn claim_ocr_job(
+    connection: &Connection,
+    clip_id: &str,
+    content_hash: &str,
+) -> Result<Option<u32>, StoreError> {
+    let updated = connection.execute(
+        "UPDATE clip_search
+         SET ocr_status = 'running', ocr_updated_at = ?3
+         WHERE clip_id = ?1 AND ocr_status = 'queued' AND ocr_content_hash = ?2",
+        params![clip_id, content_hash, unix_time_ms()],
+    )?;
+    if updated == 0 {
+        return Ok(None);
+    }
+    let attempt: u32 = connection.query_row(
+        "SELECT ocr_attempt FROM clip_search WHERE clip_id = ?1",
+        [clip_id],
+        |row| row.get(0),
+    )?;
+    Ok(Some(attempt))
+}
+
+fn finish_ocr_job(
+    connection: &Connection,
+    clip_id: &str,
+    attempt: u32,
+    outcome: &OcrFinishOutcome,
+) -> Result<bool, StoreError> {
+    let now = unix_time_ms();
+    let updated = match outcome {
+        OcrFinishOutcome::Done { text, engine } => connection.execute(
+            "UPDATE clip_search
+             SET ocr_status = 'done', ocr_text = ?3, ocr_engine = ?4,
+                 ocr_error_code = NULL, ocr_updated_at = ?5
+             WHERE clip_id = ?1 AND ocr_status = 'running' AND ocr_attempt = ?2",
+            params![clip_id, attempt, text, engine, now],
+        )?,
+        OcrFinishOutcome::Failed { error_code, engine } => connection.execute(
+            "UPDATE clip_search
+             SET ocr_status = 'failed', ocr_engine = ?3, ocr_error_code = ?4, ocr_updated_at = ?5
+             WHERE clip_id = ?1 AND ocr_status = 'running' AND ocr_attempt = ?2",
+            params![clip_id, attempt, engine, error_code.as_str(), now],
+        )?,
+        OcrFinishOutcome::Skipped { error_code, engine } => connection.execute(
+            "UPDATE clip_search
+             SET ocr_status = 'skipped', ocr_engine = ?3, ocr_error_code = ?4, ocr_updated_at = ?5
+             WHERE clip_id = ?1 AND ocr_status = 'running' AND ocr_attempt = ?2",
+            params![clip_id, attempt, engine, error_code.as_str(), now],
+        )?,
+    };
+    Ok(updated == 1)
+}
+
+fn release_queued(
+    connection: &Connection,
+    clip_id: &str,
+    attempt: u32,
+) -> Result<bool, StoreError> {
+    let updated = connection.execute(
+        "UPDATE clip_search
+         SET ocr_status = 'none', ocr_updated_at = ?3
+         WHERE clip_id = ?1 AND ocr_status = 'queued' AND ocr_attempt = ?2",
+        params![clip_id, attempt, unix_time_ms()],
+    )?;
+    Ok(updated == 1)
+}
+
+fn reset_stale_ocr_jobs(connection: &Connection) -> Result<u32, StoreError> {
+    let updated = connection.execute(
+        "UPDATE clip_search
+         SET ocr_status = 'none', ocr_updated_at = ?1
+         WHERE ocr_status IN ('queued', 'running')",
+        [unix_time_ms()],
+    )?;
+    Ok(updated as u32)
+}
+
+fn list_ocr_candidates(
+    connection: &Connection,
+    filter: OcrCandidateFilter,
+    limit: u32,
+) -> Result<Vec<OcrCandidate>, StoreError> {
+    let status = match filter {
+        OcrCandidateFilter::None => "none",
+        OcrCandidateFilter::Failed => "failed",
+    };
+    let mut statement = connection.prepare(
+        "SELECT cs.clip_id, cs.ocr_content_hash
+         FROM clip_search cs
+         JOIN clips c ON c.id = cs.clip_id
+         WHERE cs.ocr_status = ?1
+           AND c.primary_kind = 'image'
+           AND cs.ocr_content_hash IS NOT NULL
+           AND EXISTS (
+             SELECT 1 FROM clip_payloads cp
+             JOIN payloads p ON p.id = cp.payload_id
+             WHERE cp.clip_id = cs.clip_id AND p.kind = 'image'
+           )
+         ORDER BY cs.ocr_updated_at IS NULL, cs.ocr_updated_at
+         LIMIT ?2",
+    )?;
+    let rows = statement.query_map(params![status, i64::from(limit)], |row| {
+        Ok(OcrCandidate {
+            clip_id: row.get(0)?,
+            content_hash: row.get(1)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+fn read_payload_bytes(
+    connection: &Connection,
+    blob_store: &BlobStore,
+    content_hash: &str,
+    kind: PayloadKind,
+) -> Result<Vec<u8>, StoreError> {
+    let storage_path: Option<String> = connection
+        .query_row(
+            "SELECT storage_path FROM payloads WHERE content_hash = ?1 AND kind = ?2",
+            params![content_hash, payload_kind_name(&kind)],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(_) = storage_path else {
+        return Err(StoreError::InvalidPublication(
+            "payload not found for content hash".into(),
+        ));
+    };
+    // BlobStore::read is content-addressed; never trust caller paths.
+    blob_store.read(content_hash)
 }
 
 fn sweep_orphans(connection: &Connection, blob_store: &BlobStore) -> Result<(), StoreError> {
@@ -431,7 +876,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
                 INSERT INTO clip_search_fts(clip_search_fts, rowid, text_content, ocr_text)
                 VALUES ('delete', old.rowid, old.text_content, old.ocr_text);
             END;
-            CREATE TRIGGER clip_search_au AFTER UPDATE ON clip_search BEGIN
+            CREATE TRIGGER clip_search_au AFTER UPDATE OF text_content, ocr_text ON clip_search BEGIN
                 INSERT INTO clip_search_fts(clip_search_fts, rowid, text_content, ocr_text)
                 VALUES ('delete', old.rowid, old.text_content, old.ocr_text);
                 INSERT INTO clip_search_fts(rowid, text_content, ocr_text)
@@ -451,6 +896,29 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
         )?;
         transaction.execute(
             "INSERT INTO schema_migrations(version, applied_at_unix_ms) VALUES (2, ?1)",
+            [now],
+        )?;
+    }
+
+    if current < 3 {
+        transaction.execute_batch(
+            "ALTER TABLE clip_search ADD COLUMN ocr_status TEXT NOT NULL DEFAULT 'none';
+             ALTER TABLE clip_search ADD COLUMN ocr_engine TEXT;
+             ALTER TABLE clip_search ADD COLUMN ocr_attempt INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE clip_search ADD COLUMN ocr_content_hash TEXT;
+             ALTER TABLE clip_search ADD COLUMN ocr_error_code TEXT;
+             ALTER TABLE clip_search ADD COLUMN ocr_updated_at INTEGER;
+             CREATE INDEX clip_search_ocr_status ON clip_search(ocr_status);
+             DROP TRIGGER IF EXISTS clip_search_au;
+             CREATE TRIGGER clip_search_au AFTER UPDATE OF text_content, ocr_text ON clip_search BEGIN
+                 INSERT INTO clip_search_fts(clip_search_fts, rowid, text_content, ocr_text)
+                 VALUES ('delete', old.rowid, old.text_content, old.ocr_text);
+                 INSERT INTO clip_search_fts(rowid, text_content, ocr_text)
+                 VALUES (new.rowid, new.text_content, new.ocr_text);
+             END;",
+        )?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at_unix_ms) VALUES (3, ?1)",
             [now],
         )?;
     }
@@ -497,6 +965,11 @@ fn insert_publication(
         .iter()
         .find(|input| input.payload.kind == PayloadKind::Text)
         .map(|input| String::from_utf8_lossy(&input.bytes).into_owned());
+    // MVP: at most one image participates in OCR — first Image payload is canonical.
+    let canonical_image_hash = payloads
+        .iter()
+        .find(|input| input.payload.kind == PayloadKind::Image)
+        .map(|input| input.payload.content_hash.clone());
 
     let transaction = connection.unchecked_transaction()?;
     transaction.execute(
@@ -557,9 +1030,12 @@ fn insert_publication(
     }
 
     transaction.execute(
-        "INSERT INTO clip_search(clip_id, text_content, ocr_text) VALUES (?1, ?2, NULL)
-         ON CONFLICT(clip_id) DO UPDATE SET text_content = excluded.text_content",
-        params![publication.publication_id, search_text],
+        "INSERT INTO clip_search(clip_id, text_content, ocr_text, ocr_status, ocr_content_hash)
+         VALUES (?1, ?2, NULL, 'none', ?3)
+         ON CONFLICT(clip_id) DO UPDATE SET
+            text_content = excluded.text_content,
+            ocr_content_hash = COALESCE(excluded.ocr_content_hash, clip_search.ocr_content_hash)",
+        params![publication.publication_id, search_text, canonical_image_hash],
     )?;
     transaction.commit()?;
     Ok(())
@@ -616,7 +1092,9 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use crate::domain::{ClipboardPublication, ImageDimensions, PayloadKind, PayloadRef};
+    use crate::domain::{
+        ClipboardPublication, ImageDimensions, OcrStatus, PayloadKind, PayloadRef,
+    };
     use rusqlite::Connection;
 
     use super::{PayloadData, Store};
@@ -883,6 +1361,120 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(max_version, 2);
+        assert_eq!(max_version, 3);
+    }
+
+    #[test]
+    fn ocr_state_machine_enqueue_claim_finish() {
+        let dir = TestDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        let payloads = vec![payload(PayloadKind::Image, b"fake-png-bytes", "ocr-img")];
+        store
+            .save_publication(publication("ocr-clip", 1, &payloads), payloads)
+            .unwrap();
+
+        let decision = store
+            .enqueue_ocr("ocr-clip".into(), blake3::hash(b"fake-png-bytes").to_hex().to_string())
+            .unwrap();
+        let attempt = match decision {
+            crate::store::QueueDecision::Enqueued { attempt } => attempt,
+            other => panic!("expected enqueued, got {other:?}"),
+        };
+        assert_eq!(attempt, 1);
+
+        // Cannot enqueue while queued.
+        let again = store
+            .enqueue_ocr("ocr-clip".into(), blake3::hash(b"fake-png-bytes").to_hex().to_string())
+            .unwrap();
+        assert_eq!(again, crate::store::QueueDecision::AlreadyPending);
+
+        let claimed = store
+            .claim_ocr_job("ocr-clip".into(), blake3::hash(b"fake-png-bytes").to_hex().to_string())
+            .unwrap();
+        assert_eq!(claimed, Some(1));
+
+        // Wrong attempt is ignored.
+        let stale = store
+            .finish_ocr_job(
+                "ocr-clip".into(),
+                99,
+                crate::store::OcrFinishOutcome::Done {
+                    text: "stale".into(),
+                    engine: "test".into(),
+                },
+            )
+            .unwrap();
+        assert!(!stale);
+
+        let ok = store
+            .finish_ocr_job(
+                "ocr-clip".into(),
+                attempt,
+                crate::store::OcrFinishOutcome::Done {
+                    text: "你好 OCR".into(),
+                    engine: "test".into(),
+                },
+            )
+            .unwrap();
+        assert!(ok);
+
+        let page = store
+            .search_history_page("你".into(), None, None, None)
+            .unwrap();
+        assert_eq!(page.items.len(), 1, "single-char OCR search should hit");
+        let page = store
+            .search_history_page("你好".into(), None, None, None)
+            .unwrap();
+        assert_eq!(page.items.len(), 1, "two-char OCR search should hit");
+        assert_eq!(page.items[0].ocr_status, OcrStatus::Done);
+    }
+
+    #[test]
+    fn ocr_reset_stale_requeues_running() {
+        let dir = TestDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        let payloads = vec![payload(PayloadKind::Image, b"img-bytes", "stale-img")];
+        store
+            .save_publication(publication("stale-clip", 1, &payloads), payloads)
+            .unwrap();
+        let hash = blake3::hash(b"img-bytes").to_hex().to_string();
+        let attempt = match store.enqueue_ocr("stale-clip".into(), hash.clone()).unwrap() {
+            crate::store::QueueDecision::Enqueued { attempt } => attempt,
+            _ => panic!("enqueue"),
+        };
+        assert!(store.claim_ocr_job("stale-clip".into(), hash).unwrap().is_some());
+        let _ = attempt;
+        let reset = store.reset_stale_ocr_jobs().unwrap();
+        assert!(reset >= 1);
+        let info = store.ocr_status_of("stale-clip").unwrap();
+        assert_eq!(info.status, OcrStatus::None);
+    }
+
+    #[test]
+    fn ocr_empty_text_is_done() {
+        let dir = TestDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        let payloads = vec![payload(PayloadKind::Image, b"empty-ocr", "empty-img")];
+        store
+            .save_publication(publication("empty-clip", 1, &payloads), payloads)
+            .unwrap();
+        let hash = blake3::hash(b"empty-ocr").to_hex().to_string();
+        let attempt = match store.enqueue_ocr("empty-clip".into(), hash.clone()).unwrap() {
+            crate::store::QueueDecision::Enqueued { attempt } => attempt,
+            _ => panic!("enqueue"),
+        };
+        store.claim_ocr_job("empty-clip".into(), hash).unwrap();
+        assert!(store
+            .finish_ocr_job(
+                "empty-clip".into(),
+                attempt,
+                crate::store::OcrFinishOutcome::Done {
+                    text: String::new(),
+                    engine: "test".into(),
+                },
+            )
+            .unwrap());
+        let info = store.ocr_status_of("empty-clip").unwrap();
+        assert_eq!(info.status, OcrStatus::Done);
     }
 }
