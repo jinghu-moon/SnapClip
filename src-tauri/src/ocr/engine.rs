@@ -1,8 +1,8 @@
 //! OCR engine contract.
 
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 
 #[derive(Debug, Clone)]
@@ -20,6 +20,7 @@ pub struct OcrText {
 pub enum OcrError {
     LanguageUnavailable,
     Decode,
+    #[allow(dead_code)]
     Timeout,
     Cancelled,
     #[allow(dead_code)]
@@ -72,9 +73,5 @@ impl OcrCancel {
 pub trait OcrEngine: Send + Sync {
     fn name(&self) -> &'static str;
     fn is_available(&self) -> bool;
-    fn recognize(
-        &self,
-        input: &OcrInput,
-        cancel: &OcrCancel,
-    ) -> Result<OcrText, OcrError>;
+    fn recognize(&self, input: &OcrInput, cancel: &OcrCancel) -> Result<OcrText, OcrError>;
 }

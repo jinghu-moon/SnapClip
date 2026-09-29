@@ -55,6 +55,7 @@ export interface ClipSummary {
   thumbnail: PayloadRef | null;
   payloads: PayloadRef[];
   ocrStatus: OcrStatus;
+  ocrText: string | null;
   ocrEngine: string | null;
   ocrUpdatedAt: number | null;
   ocrErrorCode: OcrErrorCode | null;

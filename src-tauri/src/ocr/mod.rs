@@ -5,5 +5,5 @@ mod win_ocr;
 mod worker;
 
 pub use engine::OcrEngine;
-pub use win_ocr::{init_apartment, WindowsOcrEngine};
+pub use win_ocr::{WindowsOcrEngine, init_apartment};
 pub use worker::{OcrEnqueuer, OcrService, OcrServiceHandle};

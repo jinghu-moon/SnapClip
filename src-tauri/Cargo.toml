@@ -51,6 +51,7 @@ windows = { version = "0.61", features = [
   "Win32_System_Com",
 ] }
 win-icon-extractor = { version = "0.3", default-features = false, features = ["png", "cache"] }
+arboard = "3.6"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

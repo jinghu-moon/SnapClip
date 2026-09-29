@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { storeToRefs } from "pinia";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useVirtualizer } from "@tanstack/vue-virtual";
 import {
   IconClipboardText,
@@ -20,6 +21,7 @@ const { items, isLoading, error, hasLoaded } = storeToRefs(history);
 const queryInput = ref("");
 const listRef = ref<HTMLElement | null>(null);
 const searchInput = ref<HTMLInputElement | null>(null);
+const notice = ref("");
 const rowHeight = 112;
 
 const visibleItems = computed(() => items.value);
@@ -32,6 +34,9 @@ const virtualizer = useVirtualizer(computed(() => ({
 const virtualRows = computed(() => virtualizer.value.getVirtualItems());
 
 let searchTimer: ReturnType<typeof setTimeout> | undefined;
+let stopClipboardListener: UnlistenFn | undefined;
+let stopOcrListener: UnlistenFn | undefined;
+let noticeTimer: ReturnType<typeof setTimeout> | undefined;
 watch(queryInput, (value) => {
   if (searchTimer) clearTimeout(searchTimer);
   searchTimer = setTimeout(async () => {
@@ -76,14 +81,29 @@ function setKind(kind: PayloadKind | "all") {
   history.setKind(kind);
 }
 
-onMounted(() => {
+onMounted(async () => {
   window.addEventListener("keydown", onKeydown);
   void history.loadMore();
+  stopClipboardListener = await listen("clipboard://updated.v1", () => {
+    void history.refresh();
+  });
+  stopOcrListener = await listen("ocr://status.v1", () => {
+    void history.refresh();
+  });
 });
 onUnmounted(() => {
   window.removeEventListener("keydown", onKeydown);
   if (searchTimer) clearTimeout(searchTimer);
+  stopClipboardListener?.();
+  stopOcrListener?.();
+  if (noticeTimer) clearTimeout(noticeTimer);
 });
+
+function showNotice(message: string) {
+  notice.value = message;
+  if (noticeTimer) clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(() => { notice.value = ""; }, 1800);
+}
 </script>
 
 <template>
@@ -117,6 +137,7 @@ onUnmounted(() => {
                 :item="visibleItems[row.index]"
                 :selected="visibleItems[row.index].id === history.selectedId"
                 @select="selectVisible(row.index)"
+                @copied="showNotice"
               />
             </div>
           </div>
@@ -124,6 +145,8 @@ onUnmounted(() => {
           <div v-if="isLoading && hasLoaded" class="status">正在加载更多…</div>
         </div>
       </section>
+
+      <div v-if="notice" class="notice" role="status">{{ notice }}</div>
 
       <footer class="filter-bar" aria-label="按内容类型筛选">
         <button class="filter" :class="{ 'filter--active': history.kind === 'all' }" :aria-pressed="history.kind === 'all'" type="button" @click="setKind('all')">

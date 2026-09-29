@@ -315,13 +315,17 @@ impl Store {
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         connection.busy_timeout(std::time::Duration::from_secs(2))?;
-        let (status, engine, updated_at, error_code): (String, Option<String>, Option<i64>, Option<String>) =
-            connection.query_row(
-                "SELECT ocr_status, ocr_engine, ocr_updated_at, ocr_error_code
+        let (status, engine, updated_at, error_code): (
+            String,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+        ) = connection.query_row(
+            "SELECT ocr_status, ocr_engine, ocr_updated_at, ocr_error_code
                  FROM clip_search WHERE clip_id = ?1",
-                [clip_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )?;
+            [clip_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
         Ok(OcrStatusInfo {
             status: OcrStatus::parse(&status).unwrap_or(OcrStatus::None),
             engine,
@@ -403,7 +407,7 @@ impl Store {
         let mut statement = connection.prepare(
             "SELECT clips.id, clips.created_at_unix_ms, clips.primary_kind, clips.preview_text,
                     clips.source_app, clips.source_exe_path,
-                    cs.ocr_status, cs.ocr_engine, cs.ocr_updated_at, cs.ocr_error_code
+                    cs.ocr_status, cs.ocr_text, cs.ocr_engine, cs.ocr_updated_at, cs.ocr_error_code
              FROM clips
              LEFT JOIN clip_search cs ON cs.clip_id = clips.id
              WHERE (?1 IS NULL OR clips.id IN (
@@ -440,7 +444,7 @@ impl Store {
         let mut summaries = Vec::new();
         while let Some(row) = rows.next()? {
             let ocr_status_raw: Option<String> = row.get(6)?;
-            let ocr_error_raw: Option<String> = row.get(9)?;
+            let ocr_error_raw: Option<String> = row.get(10)?;
             summaries.push(ClipSummary {
                 id: row.get(0)?,
                 created_at_unix_ms: row.get(1)?,
@@ -454,8 +458,9 @@ impl Store {
                     .as_deref()
                     .and_then(OcrStatus::parse)
                     .unwrap_or(OcrStatus::None),
-                ocr_engine: row.get(7)?,
-                ocr_updated_at: row.get(8)?,
+                ocr_text: row.get(7)?,
+                ocr_engine: row.get(8)?,
+                ocr_updated_at: row.get(9)?,
                 ocr_error_code: ocr_error_raw.as_deref().and_then(OcrErrorCode::parse),
             });
         }
@@ -590,8 +595,12 @@ fn writer_loop(connection: Connection, blob_store: BlobStore, receiver: Receiver
                 kind,
                 response,
             } => {
-                let _ =
-                    response.send(read_payload_bytes(&connection, &blob_store, &content_hash, kind));
+                let _ = response.send(read_payload_bytes(
+                    &connection,
+                    &blob_store,
+                    &content_hash,
+                    kind,
+                ));
             }
         }
     }
@@ -1003,11 +1012,17 @@ fn insert_publication(
         .ok_or_else(|| StoreError::InvalidPublication("publication has no payloads".into()))?;
     let preview_text = payloads
         .iter()
-        .find(|input| input.payload.kind == PayloadKind::Text)
+        .find(|input| {
+            input.payload.kind == PayloadKind::Text
+                && !String::from_utf8_lossy(&input.bytes).trim().is_empty()
+        })
         .map(|input| truncate_chars(&String::from_utf8_lossy(&input.bytes), PREVIEW_CHAR_LIMIT));
     let search_text = payloads
         .iter()
-        .find(|input| input.payload.kind == PayloadKind::Text)
+        .find(|input| {
+            input.payload.kind == PayloadKind::Text
+                && !String::from_utf8_lossy(&input.bytes).trim().is_empty()
+        })
         .map(|input| String::from_utf8_lossy(&input.bytes).into_owned());
     // MVP: at most one image participates in OCR — first Image payload is canonical.
     let canonical_image_hash = payloads
@@ -1079,7 +1094,11 @@ fn insert_publication(
          ON CONFLICT(clip_id) DO UPDATE SET
             text_content = excluded.text_content,
             ocr_content_hash = COALESCE(excluded.ocr_content_hash, clip_search.ocr_content_hash)",
-        params![publication.publication_id, search_text, canonical_image_hash],
+        params![
+            publication.publication_id,
+            search_text,
+            canonical_image_hash
+        ],
     )?;
     transaction.commit()?;
     Ok(())
@@ -1235,6 +1254,26 @@ mod tests {
             )
             .unwrap();
         assert_eq!(indexed_matches, 3);
+    }
+
+    #[test]
+    fn whitespace_text_does_not_hide_image_preview() {
+        let dir = TestDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        let text = payload(PayloadKind::Text, b" ", "blank-text");
+        let image = payload(PayloadKind::Image, b"image-bytes", "blank-image");
+        let payloads = vec![text, image];
+        store
+            .save_publication(publication("blank-text-image", 1, &payloads), payloads)
+            .unwrap();
+        let page = store.history_page(None, Some(1)).unwrap();
+        assert_eq!(page.items[0].preview_text, None);
+        assert!(
+            page.items[0]
+                .payloads
+                .iter()
+                .any(|p| p.kind == PayloadKind::Image)
+        );
     }
 
     #[test]
@@ -1418,7 +1457,10 @@ mod tests {
             .unwrap();
 
         let decision = store
-            .enqueue_ocr("ocr-clip".into(), blake3::hash(b"fake-png-bytes").to_hex().to_string())
+            .enqueue_ocr(
+                "ocr-clip".into(),
+                blake3::hash(b"fake-png-bytes").to_hex().to_string(),
+            )
             .unwrap();
         let attempt = match decision {
             crate::store::QueueDecision::Enqueued { attempt } => attempt,
@@ -1428,12 +1470,18 @@ mod tests {
 
         // Cannot enqueue while queued.
         let again = store
-            .enqueue_ocr("ocr-clip".into(), blake3::hash(b"fake-png-bytes").to_hex().to_string())
+            .enqueue_ocr(
+                "ocr-clip".into(),
+                blake3::hash(b"fake-png-bytes").to_hex().to_string(),
+            )
             .unwrap();
         assert_eq!(again, crate::store::QueueDecision::AlreadyPending);
 
         let claimed = store
-            .claim_ocr_job("ocr-clip".into(), blake3::hash(b"fake-png-bytes").to_hex().to_string())
+            .claim_ocr_job(
+                "ocr-clip".into(),
+                blake3::hash(b"fake-png-bytes").to_hex().to_string(),
+            )
             .unwrap();
         assert_eq!(claimed, Some(1));
 
@@ -1482,11 +1530,19 @@ mod tests {
             .save_publication(publication("stale-clip", 1, &payloads), payloads)
             .unwrap();
         let hash = blake3::hash(b"img-bytes").to_hex().to_string();
-        let attempt = match store.enqueue_ocr("stale-clip".into(), hash.clone()).unwrap() {
+        let attempt = match store
+            .enqueue_ocr("stale-clip".into(), hash.clone())
+            .unwrap()
+        {
             crate::store::QueueDecision::Enqueued { attempt } => attempt,
             _ => panic!("enqueue"),
         };
-        assert!(store.claim_ocr_job("stale-clip".into(), hash).unwrap().is_some());
+        assert!(
+            store
+                .claim_ocr_job("stale-clip".into(), hash)
+                .unwrap()
+                .is_some()
+        );
         let _ = attempt;
         let reset = store.reset_stale_ocr_jobs().unwrap();
         assert!(reset >= 1);
@@ -1503,21 +1559,26 @@ mod tests {
             .save_publication(publication("empty-clip", 1, &payloads), payloads)
             .unwrap();
         let hash = blake3::hash(b"empty-ocr").to_hex().to_string();
-        let attempt = match store.enqueue_ocr("empty-clip".into(), hash.clone()).unwrap() {
+        let attempt = match store
+            .enqueue_ocr("empty-clip".into(), hash.clone())
+            .unwrap()
+        {
             crate::store::QueueDecision::Enqueued { attempt } => attempt,
             _ => panic!("enqueue"),
         };
         store.claim_ocr_job("empty-clip".into(), hash).unwrap();
-        assert!(store
-            .finish_ocr_job(
-                "empty-clip".into(),
-                attempt,
-                crate::store::OcrFinishOutcome::Done {
-                    text: String::new(),
-                    engine: "test".into(),
-                },
-            )
-            .unwrap());
+        assert!(
+            store
+                .finish_ocr_job(
+                    "empty-clip".into(),
+                    attempt,
+                    crate::store::OcrFinishOutcome::Done {
+                        text: String::new(),
+                        engine: "test".into(),
+                    },
+                )
+                .unwrap()
+        );
         let info = store.ocr_status_of("empty-clip").unwrap();
         assert_eq!(info.status, OcrStatus::Done);
     }
@@ -1534,7 +1595,10 @@ mod tests {
             .unwrap();
 
         let decision = store
-            .enqueue_ocr("mixed-clip".into(), blake3::hash(b"mixed-image").to_hex().to_string())
+            .enqueue_ocr(
+                "mixed-clip".into(),
+                blake3::hash(b"mixed-image").to_hex().to_string(),
+            )
             .unwrap();
         assert!(matches!(
             decision,
@@ -1554,7 +1618,10 @@ mod tests {
         {
             let connection = Connection::open(dir.0.join("data/snapclip.db")).unwrap();
             connection
-                .execute("UPDATE clip_search SET ocr_content_hash = NULL WHERE clip_id = 'derive-clip'", [])
+                .execute(
+                    "UPDATE clip_search SET ocr_content_hash = NULL WHERE clip_id = 'derive-clip'",
+                    [],
+                )
                 .unwrap();
         }
         let candidates = store
@@ -1577,18 +1644,26 @@ mod tests {
             .save_publication(publication("restart-clip", 1, &payloads), payloads)
             .unwrap();
         let hash = blake3::hash(b"restart-img").to_hex().to_string();
-        let attempt = match store.enqueue_ocr("restart-clip".into(), hash.clone()).unwrap() {
+        let attempt = match store
+            .enqueue_ocr("restart-clip".into(), hash.clone())
+            .unwrap()
+        {
             crate::store::QueueDecision::Enqueued { attempt } => attempt,
             _ => panic!("enqueue"),
         };
-        store.claim_ocr_job("restart-clip".into(), hash.clone()).unwrap();
+        store
+            .claim_ocr_job("restart-clip".into(), hash.clone())
+            .unwrap();
         store.reset_stale_ocr_jobs().unwrap();
         assert_eq!(
             store.ocr_status_of("restart-clip").unwrap().status,
             OcrStatus::None
         );
         // compensation: enqueue first (none→queued), then claim
-        let attempt2 = match store.enqueue_ocr("restart-clip".into(), hash.clone()).unwrap() {
+        let attempt2 = match store
+            .enqueue_ocr("restart-clip".into(), hash.clone())
+            .unwrap()
+        {
             crate::store::QueueDecision::Enqueued { attempt } => attempt,
             _ => panic!("re-enqueue"),
         };

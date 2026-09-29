@@ -77,8 +77,7 @@ unsafe fn exe_path_from_pid(pid: u32) -> Option<String> {
     }
     let mut path = vec![0u16; 32768];
     let mut length = path.len() as u32;
-    let success =
-        unsafe { QueryFullProcessImageNameW(process, 0, path.as_mut_ptr(), &mut length) };
+    let success = unsafe { QueryFullProcessImageNameW(process, 0, path.as_mut_ptr(), &mut length) };
     unsafe { CloseHandle(process) };
     if success == 0 || length == 0 {
         return None;
@@ -107,7 +106,9 @@ unsafe fn resolve_uwp_exe(hwnd: HWND, exe_path: &str) -> Option<String> {
         unsafe { GetWindowThreadProcessId(child, &mut child_pid) };
         if child_pid != 0 && child_pid != data.host_pid {
             if let Some(path) = unsafe { exe_path_from_pid(child_pid) } {
-                let name = Path::new(&path).file_name().and_then(|value| value.to_str());
+                let name = Path::new(&path)
+                    .file_name()
+                    .and_then(|value| value.to_str());
                 if !name.is_some_and(|value| value.eq_ignore_ascii_case("ApplicationFrameHost.exe"))
                 {
                     data.found_path = Some(path);
@@ -191,9 +192,7 @@ fn file_description(exe_path: &str) -> Option<String> {
         }
         let block_ptr = block.as_ptr() as *const c_void;
 
-        let trans_path: Vec<u16> = "\\VarFileInfo\\Translation\0"
-            .encode_utf16()
-            .collect();
+        let trans_path: Vec<u16> = "\\VarFileInfo\\Translation\0".encode_utf16().collect();
         let mut trans_ptr: *mut c_void = std::ptr::null_mut();
         let mut trans_len: u32 = 0;
         if VerQueryValueW(
@@ -219,7 +218,7 @@ fn file_description(exe_path: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{fallback_display_name, SourceAppInfo, SourceWindowSnapshot};
+    use super::{SourceAppInfo, SourceWindowSnapshot, fallback_display_name};
 
     #[test]
     fn fallback_display_name_uses_file_stem() {

@@ -3,9 +3,9 @@
 use std::{
     collections::HashSet,
     sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc::{sync_channel, Receiver, SyncSender, TrySendError},
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{Receiver, SyncSender, TrySendError, sync_channel},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -93,7 +93,11 @@ impl Drop for OcrServiceHandle {
 pub struct OcrService;
 
 impl OcrService {
-    pub fn start(store: Store, app: tauri::AppHandle, engine: Arc<dyn OcrEngine>) -> OcrServiceHandle {
+    pub fn start(
+        store: Store,
+        app: tauri::AppHandle,
+        engine: Arc<dyn OcrEngine>,
+    ) -> OcrServiceHandle {
         let (tx, rx) = sync_channel::<OcrJob>(QUEUE_CAP);
         let seen = Arc::new(Mutex::new(HashSet::new()));
         let stop = Arc::new(AtomicBool::new(false));
@@ -104,7 +108,15 @@ impl OcrService {
         let handle = thread::Builder::new()
             .name("snapclip-ocr-worker".into())
             .spawn(move || {
-                worker_loop(store, app, engine, rx, worker_seen, worker_stop, worker_cancel)
+                worker_loop(
+                    store,
+                    app,
+                    engine,
+                    rx,
+                    worker_seen,
+                    worker_stop,
+                    worker_cancel,
+                )
             })
             .expect("spawn ocr worker");
         OcrServiceHandle {
@@ -222,7 +234,8 @@ fn process_job(
     cancel: &OcrCancel,
 ) {
     if !engine.is_available() {
-        if let Ok(Some(attempt)) = store.claim_ocr_job(job.clip_id.clone(), job.content_hash.clone())
+        if let Ok(Some(attempt)) =
+            store.claim_ocr_job(job.clip_id.clone(), job.content_hash.clone())
         {
             let committed = store
                 .finish_ocr_job(
@@ -235,7 +248,13 @@ fn process_job(
                 )
                 .unwrap_or(false);
             if committed {
-                emit_status(app, &job.clip_id, "skipped", engine.name(), Some("language_unavailable"));
+                emit_status(
+                    app,
+                    &job.clip_id,
+                    "skipped",
+                    engine.name(),
+                    Some("language_unavailable"),
+                );
             }
         }
         return;
@@ -247,7 +266,8 @@ fn process_job(
         Err(_) => return,
     };
 
-    let bytes = match store.read_payload_bytes(job.content_hash.clone(), crate::domain::PayloadKind::Image)
+    let bytes = match store
+        .read_payload_bytes(job.content_hash.clone(), crate::domain::PayloadKind::Image)
     {
         Ok(bytes) => bytes,
         Err(_) => {
@@ -262,7 +282,13 @@ fn process_job(
                 )
                 .unwrap_or(false);
             if committed {
-                emit_status(app, &job.clip_id, "failed", engine.name(), Some("decode_failed"));
+                emit_status(
+                    app,
+                    &job.clip_id,
+                    "failed",
+                    engine.name(),
+                    Some("decode_failed"),
+                );
             }
             return;
         }
@@ -287,6 +313,12 @@ fn process_job(
             }
         }
         Err(error) => {
+            eprintln!(
+                "[snapclip][ocr] recognition failed: clip_id={} code={} detail={}",
+                job.clip_id,
+                error.code().as_str(),
+                error
+            );
             let code = error.code();
             let (status, code_str) = match code {
                 OcrErrorCode::LanguageUnavailable => ("skipped", "language_unavailable"),
@@ -316,7 +348,13 @@ fn process_job(
     }
 }
 
-fn emit_status(app: &tauri::AppHandle, clip_id: &str, status: &str, engine: &str, error: Option<&str>) {
+fn emit_status(
+    app: &tauri::AppHandle,
+    clip_id: &str,
+    status: &str,
+    engine: &str,
+    error: Option<&str>,
+) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)

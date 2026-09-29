@@ -7,16 +7,23 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+const CLIPBOARD_UPDATED_EVENT: &str = "clipboard://updated.v1";
+
 use windows_sys::Win32::{
-    Foundation::{GetLastError, HWND, LPARAM, LRESULT, WPARAM},
+    Foundation::{GetLastError, GlobalFree, HWND, LPARAM, LRESULT, WPARAM},
+    Graphics::Gdi::{
+        BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, GetDC, GetDIBits, GetObjectW,
+        ReleaseDC,
+    },
     System::{
         DataExchange::{
-            CloseClipboard, GetClipboardData, GetClipboardOwner, GetClipboardSequenceNumber,
-            IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW,
+            CloseClipboard, EnumClipboardFormats, GetClipboardData, GetClipboardFormatNameW,
+            GetClipboardOwner, GetClipboardSequenceNumber, IsClipboardFormatAvailable,
+            OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
         },
         LibraryLoader::GetModuleHandleW,
-        Memory::{GlobalLock, GlobalSize, GlobalUnlock},
-        Ole::{CF_DIB, CF_HDROP, CF_UNICODETEXT},
+        Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock},
+        Ole::{CF_BITMAP, CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT},
         Threading::GetCurrentThreadId,
     },
     UI::{
@@ -52,6 +59,33 @@ const EXCLUDE_FORMAT_NAME: &str = "ExcludeClipboardContentFromMonitorProcessing"
 const MAX_CLIPBOARD_BYTES: usize = 64 * 1024 * 1024;
 const EVENT_QUEUE_CAPACITY: usize = 32;
 
+/// Marks clipboard content written by SnapClip so the monitor does not capture it again.
+/// The marker is a private one-byte format; consumer applications ignore it.
+pub fn mark_clipboard_excluded() {
+    let format_name = wide_nul(EXCLUDE_FORMAT_NAME);
+    let format = unsafe { RegisterClipboardFormatW(format_name.as_ptr()) };
+    if format == 0 || unsafe { OpenClipboard(null_mut()) } == 0 {
+        return;
+    }
+    unsafe {
+        let handle = GlobalAlloc(GMEM_MOVEABLE, 1);
+        if !handle.is_null() {
+            let ptr = GlobalLock(handle);
+            if !ptr.is_null() {
+                *(ptr as *mut u8) = 1;
+                GlobalUnlock(handle);
+                if SetClipboardData(format, handle).is_null() {
+                    // Ownership remains with us when SetClipboardData fails.
+                    GlobalFree(handle);
+                }
+            } else {
+                GlobalFree(handle);
+            }
+        }
+        CloseClipboard();
+    }
+}
+
 pub struct ClipboardMonitor {
     thread_id: u32,
     thread: Option<JoinHandle<()>>,
@@ -61,11 +95,12 @@ impl ClipboardMonitor {
     pub fn start(
         store: Store,
         ocr: Option<crate::ocr::OcrEnqueuer>,
+        app: tauri::AppHandle,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name("snapclip-clipboard-listener".into())
-            .spawn(move || listener_thread(store, ocr, ready_tx))?;
+            .spawn(move || listener_thread(store, ocr, app, ready_tx))?;
         let thread_id = ready_rx.recv()??;
         Ok(Self {
             thread_id,
@@ -88,6 +123,7 @@ impl Drop for ClipboardMonitor {
 fn listener_thread(
     store: Store,
     ocr: Option<crate::ocr::OcrEnqueuer>,
+    app: tauri::AppHandle,
     ready: SyncSender<Result<u32, String>>,
 ) {
     let thread_id = unsafe { GetCurrentThreadId() };
@@ -141,7 +177,7 @@ fn listener_thread(
     let (event_tx, event_rx) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
     let worker = thread::Builder::new()
         .name("snapclip-clipboard-worker".into())
-        .spawn(move || clipboard_worker(event_rx, store, ocr));
+        .spawn(move || clipboard_worker(event_rx, store, ocr, app));
     let worker = match worker {
         Ok(worker) => worker,
         Err(error) => {
@@ -225,6 +261,7 @@ fn clipboard_worker(
     events: Receiver<ClipboardEvent>,
     store: Store,
     ocr: Option<crate::ocr::OcrEnqueuer>,
+    app: tauri::AppHandle,
 ) {
     let html_format = unsafe { RegisterClipboardFormatW(HTML_FORMAT.as_ptr()) };
     let rtf_format = unsafe { RegisterClipboardFormatW(RTF_FORMAT.as_ptr()) };
@@ -238,9 +275,35 @@ fn clipboard_worker(
             continue;
         }
         let captured_at_unix_ms = unix_time_ms();
-        let Ok((current_sequence, owner_now, mut captured)) =
-            read_clipboard(html_format, rtf_format, png_format, exclude_format)
-        else {
+        let mut clipboard_result = None;
+        for attempt in 0..5 {
+            let Ok(result) = read_clipboard(html_format, rtf_format, png_format, exclude_format)
+            else {
+                if attempt < 4 {
+                    thread::sleep(Duration::from_millis(40));
+                }
+                continue;
+            };
+            let has_image = result
+                .2
+                .iter()
+                .any(|payload| payload.0 == PayloadKind::Image);
+            let has_rich_text = result
+                .2
+                .iter()
+                .any(|payload| matches!(payload.0, PayloadKind::Html | PayloadKind::Rtf));
+            if has_image || (!has_rich_text && !result.2.is_empty()) {
+                clipboard_result = Some(result);
+                break;
+            }
+            // Word and some screenshot tools publish delayed clipboard formats.
+            // Give them a short window before treating the event as text-only.
+            clipboard_result = Some(result);
+            if attempt < 4 {
+                thread::sleep(Duration::from_millis(40));
+            }
+        }
+        let Some((current_sequence, owner_now, mut captured)) = clipboard_result else {
             continue;
         };
         if last_sequence == Some(current_sequence) {
@@ -286,8 +349,12 @@ fn clipboard_worker(
                 .map(|payload| payload.payload.clone())
                 .collect(),
         };
-        if store.save_publication(publication.clone(), payloads).is_ok() {
+        if store
+            .save_publication(publication.clone(), payloads)
+            .is_ok()
+        {
             last_sequence = Some(current_sequence);
+            let _ = tauri::Emitter::emit(&app, CLIPBOARD_UPDATED_EVENT, ());
             if let Some(image) = publication
                 .payloads
                 .iter()
@@ -367,7 +434,7 @@ unsafe fn read_open_clipboard(
     {
         let text = String::from_utf16_lossy(&bytes_to_utf16(&bytes));
         let text = text.trim_end_matches('\0');
-        if !text.is_empty() {
+        if !text.trim().is_empty() {
             push_payload(
                 &mut captured,
                 &mut total_size,
@@ -407,9 +474,10 @@ unsafe fn read_open_clipboard(
         }
     }
 
-    // Prefer PNG; otherwise normalize DIB/DIBV5 → PNG so Store/OCR never see raw DIB.
+    // Prefer PNG; otherwise normalize DIB/DIBV5/CF_BITMAP → PNG so Store/OCR
+    // never see raw Windows bitmap formats.
     let mut image_png: Option<(Option<ImageDimensions>, Vec<u8>)> = None;
-    for format in [png_format, 17, CF_DIB as u32] {
+    for format in [png_format, CF_DIBV5 as u32, CF_DIB as u32] {
         if format == 0 || unsafe { IsClipboardFormatAvailable(format) } == 0 {
             continue;
         }
@@ -434,10 +502,7 @@ unsafe fn read_open_clipboard(
         }
         match image_norm::dib_to_png(&bytes) {
             Ok((png, width, height)) => {
-                image_png = Some((
-                    Some(ImageDimensions { width, height }),
-                    png,
-                ));
+                image_png = Some((Some(ImageDimensions { width, height }), png));
                 break;
             }
             Err(error) => {
@@ -445,6 +510,25 @@ unsafe fn read_open_clipboard(
                 continue;
             }
         }
+    }
+    if image_png.is_none() && unsafe { IsClipboardFormatAvailable(CF_BITMAP as u32) } != 0 {
+        match unsafe { read_bitmap_dib() } {
+            Ok(Some(bytes)) => match image_norm::dib_to_png(&bytes) {
+                Ok((png, width, height)) => {
+                    image_png = Some((Some(ImageDimensions { width, height }), png));
+                }
+                Err(error) => {
+                    eprintln!("[snapclip][clipboard] CF_BITMAP normalize failed: {error}");
+                }
+            },
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("[snapclip][clipboard] CF_BITMAP read failed: {error}");
+            }
+        }
+    }
+    if image_png.is_none() {
+        unsafe { log_clipboard_formats() };
     }
     if let Some((dimensions, bytes)) = image_png {
         push_payload(
@@ -458,6 +542,121 @@ unsafe fn read_open_clipboard(
     }
 
     Ok(captured)
+}
+
+/// Convert a clipboard-owned HBITMAP (CF_BITMAP) into a raw 32-bit DIB.
+/// The returned bytes intentionally use the same format accepted by `dib_to_png`.
+unsafe fn read_bitmap_dib() -> Result<Option<Vec<u8>>, String> {
+    let handle = unsafe { GetClipboardData(CF_BITMAP as u32) };
+    if handle.is_null() {
+        return Ok(None);
+    }
+
+    let mut bitmap: BITMAP = unsafe { zeroed() };
+    let copied = unsafe {
+        GetObjectW(
+            handle,
+            std::mem::size_of::<BITMAP>() as i32,
+            (&mut bitmap as *mut BITMAP).cast(),
+        )
+    };
+    if copied == 0 || bitmap.bmWidth <= 0 || bitmap.bmHeight <= 0 {
+        return Err("invalid CF_BITMAP dimensions".into());
+    }
+    let width = u32::try_from(bitmap.bmWidth).map_err(|_| "invalid CF_BITMAP width")?;
+    let height = u32::try_from(bitmap.bmHeight).map_err(|_| "invalid CF_BITMAP height")?;
+    let pixels = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or_else(|| "CF_BITMAP dimensions overflow".to_string())?;
+    if pixels > 24_000_000 {
+        return Err("image exceeds max decode pixels".into());
+    }
+    let image_size = pixels
+        .checked_mul(4)
+        .and_then(|size| usize::try_from(size).ok())
+        .ok_or_else(|| "CF_BITMAP image size overflow".to_string())?;
+    if image_size > MAX_CLIPBOARD_BYTES {
+        return Err("CF_BITMAP exceeds clipboard size limit".into());
+    }
+
+    let mut header: BITMAPINFO = unsafe { zeroed() };
+    header.bmiHeader = BITMAPINFOHEADER {
+        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+        biWidth: bitmap.bmWidth,
+        biHeight: bitmap.bmHeight,
+        biPlanes: 1,
+        biBitCount: 32,
+        biCompression: BI_RGB,
+        biSizeImage: u32::try_from(image_size).map_err(|_| "CF_BITMAP image too large")?,
+        biXPelsPerMeter: 0,
+        biYPelsPerMeter: 0,
+        biClrUsed: 0,
+        biClrImportant: 0,
+    };
+    let mut pixels_bgra = vec![0u8; image_size];
+    let screen_dc = unsafe { GetDC(null_mut()) };
+    if screen_dc.is_null() {
+        return Err(last_error("GetDC"));
+    }
+    let copied_lines = unsafe {
+        GetDIBits(
+            screen_dc,
+            handle,
+            0,
+            height,
+            pixels_bgra.as_mut_ptr().cast(),
+            &mut header as *mut BITMAPINFO,
+            DIB_RGB_COLORS,
+        )
+    };
+    unsafe { ReleaseDC(null_mut(), screen_dc) };
+    if copied_lines <= 0 {
+        return Err(last_error("GetDIBits"));
+    }
+
+    let mut dib = Vec::with_capacity(std::mem::size_of::<BITMAPINFOHEADER>() + image_size);
+    let header_bytes = unsafe {
+        std::slice::from_raw_parts(
+            (&header.bmiHeader as *const BITMAPINFOHEADER).cast::<u8>(),
+            std::mem::size_of::<BITMAPINFOHEADER>(),
+        )
+    };
+    dib.extend_from_slice(header_bytes);
+    dib.extend_from_slice(&pixels_bgra);
+    Ok(Some(dib))
+}
+
+unsafe fn log_clipboard_formats() {
+    let mut formats = Vec::new();
+    let mut previous = 0u32;
+    for _ in 0..64 {
+        let format = unsafe { EnumClipboardFormats(previous) };
+        if format == 0 {
+            break;
+        }
+        let mut name = [0u16; 128];
+        let name_len =
+            unsafe { GetClipboardFormatNameW(format, name.as_mut_ptr(), name.len() as i32) };
+        let label = if name_len > 0 {
+            String::from_utf16_lossy(&name[..name_len as usize])
+        } else {
+            match format {
+                2 => "CF_BITMAP".into(),
+                8 => "CF_DIB".into(),
+                13 => "CF_UNICODETEXT".into(),
+                15 => "CF_HDROP".into(),
+                17 => "CF_DIBV5".into(),
+                _ => "standard/unnamed".into(),
+            }
+        };
+        formats.push(format!("{format}:{label}"));
+        previous = format;
+    }
+    if !formats.is_empty() {
+        eprintln!(
+            "[snapclip][clipboard] no supported image payload; clipboard formats={formats:?}"
+        );
+    }
 }
 
 unsafe fn read_global(format: u32, max_size: usize) -> Result<Option<Vec<u8>>, String> {

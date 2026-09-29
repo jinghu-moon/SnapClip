@@ -1,11 +1,10 @@
 //! Windows.Media.Ocr engine (WinRT).
 //!
 //! Threading contract: call `init_apartment()` once on the OCR worker thread.
-//! `recognize` runs on that worker; timeout/cancel calls `IAsyncOperation::Cancel`
-//! then joins the await helper so no thread or WinRT op is leaked.
+//! All WinRT image decoding and OCR calls stay on that same apartment, matching
+//! the Windows OCR usage pattern used by clipvault.
 
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
 
 use super::engine::{OcrCancel, OcrEngine, OcrError, OcrInput, OcrText};
 
@@ -44,7 +43,7 @@ impl Drop for ComApartment {
 /// Initialize WinRT/COM apartment on the long-lived OCR worker thread.
 #[cfg(windows)]
 pub fn init_apartment() -> Result<ComApartment, OcrError> {
-    use ::windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+    use ::windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
     unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
         .ok()
         .map_err(|e| OcrError::Engine(e.to_string()))?;
@@ -89,7 +88,6 @@ fn engine_create() -> Result<::windows::Media::Ocr::OcrEngine, OcrError> {
 
 #[cfg(windows)]
 fn recognize_png(png: &[u8], cancel: &OcrCancel) -> Result<OcrText, OcrError> {
-    use std::sync::mpsc;
     use ::windows::Graphics::Imaging::{BitmapDecoder, BitmapPixelFormat, SoftwareBitmap};
     use ::windows::Storage::Streams::{DataWriter, InMemoryRandomAccessStream};
 
@@ -105,8 +103,14 @@ fn recognize_png(png: &[u8], cancel: &OcrCancel) -> Result<OcrText, OcrError> {
         .map_err(map_engine)?
         .get()
         .map_err(map_engine)?;
-    writer.FlushAsync().map_err(map_engine)?.get().map_err(map_engine)?;
-    drop(writer);
+    writer
+        .FlushAsync()
+        .map_err(map_engine)?
+        .get()
+        .map_err(map_engine)?;
+    // DataWriter closes its attached output stream when dropped. Detach it
+    // first, otherwise BitmapDecoder sees 0x80000013 (object closed).
+    let _output_stream = writer.DetachStream().map_err(map_engine)?;
     stream.Seek(0).map_err(map_engine)?;
 
     let decoder = BitmapDecoder::CreateAsync(&stream)
@@ -125,46 +129,18 @@ fn recognize_png(png: &[u8], cancel: &OcrCancel) -> Result<OcrText, OcrError> {
     }
 
     let engine = engine_create()?;
-    let op = engine
+    let result = engine
         .RecognizeAsync(&bgra)
-        .map_err(|e| OcrError::Engine(e.to_string()))?;
-
-    // Await on one helper thread; on timeout/cancel call Cancel() then join — no leak.
-    let await_op = op.clone();
-    let (tx, rx) = mpsc::channel();
-    let helper = std::thread::Builder::new()
-        .name("snapclip-ocr-await".into())
-        .spawn(move || {
-            let result = await_op
-                .get()
-                .map_err(map_engine)
-                .and_then(|result| result.Text().map_err(map_engine));
-            let _ = tx.send(result);
-        })
-        .map_err(map_engine)?;
-
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let outcome = loop {
-        if cancel.is_cancelled() {
-            let _ = op.Cancel();
-            break Err(OcrError::Cancelled);
-        }
-        if Instant::now() >= deadline {
-            let _ = op.Cancel();
-            break Err(OcrError::Timeout);
-        }
-        match rx.recv_timeout(Duration::from_millis(20)) {
-            Ok(result) => break result,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                break Err(OcrError::Engine("ocr await dropped".into()))
-            }
-        }
-    };
-
-    // Always join the helper so the thread cannot outlive this call.
-    let _ = helper.join();
-    let text = outcome?.to_string();
+        .map_err(|e| OcrError::Engine(format!("RecognizeAsync: {e}")))?
+        .get()
+        .map_err(|e| OcrError::Engine(format!("RecognizeAsync.get: {e}")))?;
+    if cancel.is_cancelled() {
+        return Err(OcrError::Cancelled);
+    }
+    let text = result
+        .Text()
+        .map_err(|e| OcrError::Engine(format!("OcrResult.Text: {e}")))?
+        .to_string();
     Ok(OcrText {
         text,
         engine: "windows",

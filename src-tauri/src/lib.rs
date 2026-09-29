@@ -8,6 +8,7 @@ pub mod store;
 
 use std::sync::Arc;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use tauri::Manager;
 
 use crate::{
@@ -15,6 +16,9 @@ use crate::{
     ocr::{OcrService, OcrServiceHandle, WindowsOcrEngine},
     store::{OcrCandidateFilter, QueueDecision, Store},
 };
+
+#[cfg(windows)]
+use std::borrow::Cow;
 
 #[tauri::command]
 async fn history_page(
@@ -37,6 +41,103 @@ async fn history_page(
         trace_id: None,
     })?
     .map_err(IpcError::from)
+}
+
+#[tauri::command]
+async fn image_payload_data_url(
+    state: tauri::State<'_, Store>,
+    content_hash: String,
+) -> Result<String, IpcError> {
+    let store = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let bytes = store.read_payload_bytes(content_hash, PayloadKind::Image)?;
+        Ok::<_, crate::store::StoreError>(format!("data:image/png;base64,{}", BASE64.encode(bytes)))
+    })
+    .await
+    .map_err(internal_ipc)?
+    .map_err(IpcError::from)
+}
+
+#[cfg(windows)]
+#[tauri::command]
+async fn copy_payload(
+    state: tauri::State<'_, Store>,
+    content_hash: String,
+    kind: PayloadKind,
+) -> Result<(), IpcError> {
+    let store = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let bytes = store.read_payload_bytes(content_hash, kind.clone())?;
+        match kind {
+            PayloadKind::Image => {
+                let decoded = image::load_from_memory(&bytes)
+                    .map_err(|error| {
+                        crate::store::StoreError::InvalidPublication(format!(
+                            "image decode failed: {error}"
+                        ))
+                    })?
+                    .to_rgba8();
+                let (width, height) = decoded.dimensions();
+                let mut clipboard = arboard::Clipboard::new().map_err(|error| {
+                    crate::store::StoreError::InvalidPublication(format!(
+                        "clipboard unavailable: {error}"
+                    ))
+                })?;
+                clipboard
+                    .set_image(arboard::ImageData {
+                        width: width as usize,
+                        height: height as usize,
+                        bytes: Cow::Owned(decoded.into_raw()),
+                    })
+                    .map_err(|error| {
+                        crate::store::StoreError::InvalidPublication(format!(
+                            "copy image failed: {error}"
+                        ))
+                    })?;
+            }
+            PayloadKind::Text | PayloadKind::Html | PayloadKind::Rtf | PayloadKind::Other => {
+                let text = String::from_utf8(bytes).map_err(|error| {
+                    crate::store::StoreError::InvalidPublication(format!(
+                        "text decode failed: {error}"
+                    ))
+                })?;
+                let mut clipboard = arboard::Clipboard::new().map_err(|error| {
+                    crate::store::StoreError::InvalidPublication(format!(
+                        "clipboard unavailable: {error}"
+                    ))
+                })?;
+                clipboard.set_text(text).map_err(|error| {
+                    crate::store::StoreError::InvalidPublication(format!(
+                        "copy text failed: {error}"
+                    ))
+                })?;
+            }
+            PayloadKind::Files => {
+                return Err(crate::store::StoreError::InvalidPublication(
+                    "file payload copy is not supported yet".into(),
+                ));
+            }
+        }
+        crate::platform::windows::clipboard::mark_clipboard_excluded();
+        Ok::<_, crate::store::StoreError>(())
+    })
+    .await
+    .map_err(internal_ipc)?
+    .map_err(IpcError::from)
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+async fn copy_payload(
+    _state: tauri::State<'_, Store>,
+    _content_hash: String,
+    _kind: PayloadKind,
+) -> Result<(), IpcError> {
+    Err(IpcError {
+        code: crate::domain::ErrorCode::Unsupported,
+        message: Some("clipboard copy is only available on Windows".into()),
+        trace_id: None,
+    })
 }
 
 #[tauri::command]
@@ -196,6 +297,7 @@ pub fn run() {
             app.manage(platform::windows::clipboard::ClipboardMonitor::start(
                 store,
                 Some(enqueuer),
+                app.handle().clone(),
             )?);
             #[cfg(not(windows))]
             drop(enqueuer);
@@ -205,6 +307,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             greet,
             history_page,
+            image_payload_data_url,
+            copy_payload,
             get_app_icon,
             ocr_backfill,
             ocr_retry_failed,

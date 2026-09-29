@@ -128,10 +128,26 @@ fn dib_to_bmp(dib: &[u8]) -> Result<Vec<u8>, String> {
     }
     let _ = bit_count;
 
-    // Pixel offset = file header (14) + DIB header.
+    let colors_used = u32::from_le_bytes(dib[32..36].try_into().unwrap()) as usize;
+    let color_table_entries = if bit_count <= 8 {
+        if colors_used > 0 {
+            colors_used
+        } else {
+            1usize << bit_count
+        }
+    } else if header_size == 40 && colors_used > 0 {
+        colors_used
+    } else {
+        0
+    };
+
+    // Pixel offset = file header (14) + DIB header + palette.
     // BI_BITFIELDS on BITMAPINFOHEADER (40) has 3 masks AFTER the header (+12).
     // BITMAPV4 (108) / V5 (124) already contain masks inside the header.
-    let mut offset = 14 + header_size;
+    let mut offset = 14usize
+        .checked_add(header_size)
+        .and_then(|value| value.checked_add(color_table_entries.checked_mul(4)?))
+        .ok_or_else(|| "DIB pixel offset overflow".to_string())?;
     if compression == 3 && header_size == 40 {
         offset += 12;
     }
@@ -189,6 +205,19 @@ mod tests {
     }
 
     #[test]
+    fn paletted_dib_includes_color_table_in_pixel_offset() {
+        let mut dib = vec![0u8; 40 + 4 * 16];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes());
+        dib[4..8].copy_from_slice(&1i32.to_le_bytes());
+        dib[8..12].copy_from_slice(&1i32.to_le_bytes());
+        dib[12..14].copy_from_slice(&1u16.to_le_bytes());
+        dib[14..16].copy_from_slice(&4u16.to_le_bytes());
+        let bmp = dib_to_bmp(&dib).unwrap();
+        let offset = u32::from_le_bytes(bmp[10..14].try_into().unwrap());
+        assert_eq!(offset, 14 + 40 + 16 * 4);
+    }
+
+    #[test]
     fn png_dimensions_reads_ihdr() {
         let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
         png.extend_from_slice(&13u32.to_be_bytes());
@@ -208,7 +237,11 @@ mod tests {
         png.extend_from_slice(&20_000u32.to_be_bytes());
         png.extend_from_slice(&20_000u32.to_be_bytes());
         png.extend_from_slice(&[0; 5]);
-        assert!(normalize_png(&png).unwrap_err().contains("max decode pixels"));
+        assert!(
+            normalize_png(&png)
+                .unwrap_err()
+                .contains("max decode pixels")
+        );
     }
 
     #[test]
