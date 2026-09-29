@@ -602,25 +602,41 @@ fn enqueue_ocr(
     clip_id: &str,
     content_hash: &str,
 ) -> Result<QueueDecision, StoreError> {
-    let kind: Option<String> = connection
+    // Image presence is payload-based (publication may be text+image).
+    let has_image: bool = connection
         .query_row(
-            "SELECT primary_kind FROM clips WHERE id = ?1",
+            "SELECT EXISTS (
+                 SELECT 1 FROM clip_payloads cp
+                 JOIN payloads p ON p.id = cp.payload_id
+                 WHERE cp.clip_id = ?1 AND p.kind = 'image'
+             )",
+            [clip_id],
+            |row| row.get::<_, i64>(0).map(|v| v != 0),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !has_image {
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM clips WHERE id = ?1)",
+                [clip_id],
+                |row| row.get::<_, i64>(0).map(|v| v != 0),
+            )
+            .unwrap_or(false);
+        return if exists {
+            Ok(QueueDecision::NotImage)
+        } else {
+            Ok(QueueDecision::NotFound)
+        };
+    }
+
+    let status: Option<String> = connection
+        .query_row(
+            "SELECT ocr_status FROM clip_search WHERE clip_id = ?1",
             [clip_id],
             |row| row.get(0),
         )
         .optional()?;
-    let Some(kind) = kind else {
-        return Ok(QueueDecision::NotFound);
-    };
-    if kind != "image" {
-        return Ok(QueueDecision::NotImage);
-    }
-
-    let status: Option<String> = connection.query_row(
-        "SELECT ocr_status FROM clip_search WHERE clip_id = ?1",
-        [clip_id],
-        |row| row.get(0),
-    ).optional()?;
 
     let status = status.unwrap_or_else(|| OcrStatus::None.as_str().to_string());
     match status.as_str() {
@@ -746,18 +762,30 @@ fn list_ocr_candidates(
         OcrCandidateFilter::None => "none",
         OcrCandidateFilter::Failed => "failed",
     };
+    // Derive hash when ocr_content_hash is missing (legacy rows / reset after crash).
     let mut statement = connection.prepare(
-        "SELECT cs.clip_id, cs.ocr_content_hash
+        "SELECT cs.clip_id,
+                COALESCE(
+                  cs.ocr_content_hash,
+                  (SELECT p.content_hash FROM clip_payloads cp
+                    JOIN payloads p ON p.id = cp.payload_id
+                    WHERE cp.clip_id = cs.clip_id AND p.kind = 'image'
+                    ORDER BY p.rowid, p.id LIMIT 1)
+                ) AS content_hash
          FROM clip_search cs
-         JOIN clips c ON c.id = cs.clip_id
          WHERE cs.ocr_status = ?1
-           AND c.primary_kind = 'image'
-           AND cs.ocr_content_hash IS NOT NULL
            AND EXISTS (
              SELECT 1 FROM clip_payloads cp
              JOIN payloads p ON p.id = cp.payload_id
              WHERE cp.clip_id = cs.clip_id AND p.kind = 'image'
            )
+           AND COALESCE(
+                 cs.ocr_content_hash,
+                 (SELECT p.content_hash FROM clip_payloads cp
+                   JOIN payloads p ON p.id = cp.payload_id
+                   WHERE cp.clip_id = cs.clip_id AND p.kind = 'image'
+                   ORDER BY p.rowid, p.id LIMIT 1)
+               ) IS NOT NULL
          ORDER BY cs.ocr_updated_at IS NULL, cs.ocr_updated_at
          LIMIT ?2",
     )?;
@@ -776,19 +804,19 @@ fn read_payload_bytes(
     content_hash: &str,
     kind: PayloadKind,
 ) -> Result<Vec<u8>, StoreError> {
-    let storage_path: Option<String> = connection
+    let exists: Option<i64> = connection
         .query_row(
-            "SELECT storage_path FROM payloads WHERE content_hash = ?1 AND kind = ?2",
+            "SELECT 1 FROM payloads WHERE content_hash = ?1 AND kind = ?2",
             params![content_hash, payload_kind_name(&kind)],
             |row| row.get(0),
         )
         .optional()?;
-    let Some(_) = storage_path else {
+    if exists.is_none() {
         return Err(StoreError::InvalidPublication(
             "payload not found for content hash".into(),
         ));
-    };
-    // BlobStore::read is content-addressed; never trust caller paths.
+    }
+    // Content-addressed read; never trust external paths.
     blob_store.read(content_hash)
 }
 
@@ -916,6 +944,22 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
                  INSERT INTO clip_search_fts(rowid, text_content, ocr_text)
                  VALUES (new.rowid, new.text_content, new.ocr_text);
              END;",
+        )?;
+        // Backfill canonical image hash for legacy clips so backfill/compensation work.
+        transaction.execute_batch(
+            "UPDATE clip_search
+             SET ocr_content_hash = (
+               SELECT p.content_hash FROM clip_payloads cp
+               JOIN payloads p ON p.id = cp.payload_id
+               WHERE cp.clip_id = clip_search.clip_id AND p.kind = 'image'
+               ORDER BY p.rowid, p.id LIMIT 1
+             )
+             WHERE ocr_content_hash IS NULL
+               AND EXISTS (
+                 SELECT 1 FROM clip_payloads cp
+                 JOIN payloads p ON p.id = cp.payload_id
+                 WHERE cp.clip_id = clip_search.clip_id AND p.kind = 'image'
+               );",
         )?;
         transaction.execute(
             "INSERT INTO schema_migrations(version, applied_at_unix_ms) VALUES (3, ?1)",
@@ -1476,5 +1520,82 @@ mod tests {
             .unwrap());
         let info = store.ocr_status_of("empty-clip").unwrap();
         assert_eq!(info.status, OcrStatus::Done);
+    }
+
+    #[test]
+    fn ocr_text_and_image_publication_can_enqueue() {
+        let dir = TestDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        let text = payload(PayloadKind::Text, b"hello mixed", "mixed-text");
+        let image = payload(PayloadKind::Image, b"mixed-image", "mixed-img");
+        let payloads = vec![text, image];
+        store
+            .save_publication(publication("mixed-clip", 1, &payloads), payloads)
+            .unwrap();
+
+        let decision = store
+            .enqueue_ocr("mixed-clip".into(), blake3::hash(b"mixed-image").to_hex().to_string())
+            .unwrap();
+        assert!(matches!(
+            decision,
+            crate::store::QueueDecision::Enqueued { .. }
+        ));
+    }
+
+    #[test]
+    fn ocr_candidates_derive_hash_without_content_hash_column() {
+        let dir = TestDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        let payloads = vec![payload(PayloadKind::Image, b"derive-hash", "derive-img")];
+        store
+            .save_publication(publication("derive-clip", 1, &payloads), payloads)
+            .unwrap();
+        // Simulate legacy row: clear ocr_content_hash after save.
+        {
+            let connection = Connection::open(dir.0.join("data/snapclip.db")).unwrap();
+            connection
+                .execute("UPDATE clip_search SET ocr_content_hash = NULL WHERE clip_id = 'derive-clip'", [])
+                .unwrap();
+        }
+        let candidates = store
+            .list_ocr_candidates(crate::store::OcrCandidateFilter::None, 10)
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].content_hash,
+            blake3::hash(b"derive-hash").to_hex().to_string()
+        );
+    }
+
+    #[test]
+    fn ocr_restart_none_is_requeued_then_claimable() {
+        // Simulates: reset_stale → none → enqueue → claim (compensation path).
+        let dir = TestDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        let payloads = vec![payload(PayloadKind::Image, b"restart-img", "restart-p")];
+        store
+            .save_publication(publication("restart-clip", 1, &payloads), payloads)
+            .unwrap();
+        let hash = blake3::hash(b"restart-img").to_hex().to_string();
+        let attempt = match store.enqueue_ocr("restart-clip".into(), hash.clone()).unwrap() {
+            crate::store::QueueDecision::Enqueued { attempt } => attempt,
+            _ => panic!("enqueue"),
+        };
+        store.claim_ocr_job("restart-clip".into(), hash.clone()).unwrap();
+        store.reset_stale_ocr_jobs().unwrap();
+        assert_eq!(
+            store.ocr_status_of("restart-clip").unwrap().status,
+            OcrStatus::None
+        );
+        // compensation: enqueue first (none→queued), then claim
+        let attempt2 = match store.enqueue_ocr("restart-clip".into(), hash.clone()).unwrap() {
+            crate::store::QueueDecision::Enqueued { attempt } => attempt,
+            _ => panic!("re-enqueue"),
+        };
+        assert!(attempt2 > attempt);
+        assert_eq!(
+            store.claim_ocr_job("restart-clip".into(), hash).unwrap(),
+            Some(attempt2)
+        );
     }
 }

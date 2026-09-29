@@ -48,6 +48,7 @@ windows = { version = "0.61", features = [
   "Media_Ocr",
   "Storage",
   "Storage_Streams",
+  "Win32_System_Com",
 ] }
 win-icon-extractor = { version = "0.3", default-features = false, features = ["png", "cache"] }
 

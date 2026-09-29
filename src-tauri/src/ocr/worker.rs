@@ -15,7 +15,7 @@ use tauri::Emitter;
 
 use super::engine::{OcrCancel, OcrEngine, OcrInput, OcrText};
 use crate::domain::OcrErrorCode;
-use crate::store::{OcrCandidateFilter, OcrFinishOutcome, Store};
+use crate::store::{OcrCandidateFilter, OcrFinishOutcome, QueueDecision, Store};
 
 const QUEUE_CAP: usize = 64;
 const COMPENSATE_EVERY: u32 = 8;
@@ -120,6 +120,8 @@ fn worker_loop(
 
     // Startup recovery: clear stale queued/running.
     let _ = store.reset_stale_ocr_jobs();
+    // WinRT/COM apartment belongs to this long-lived OCR thread.
+    let _ = super::init_apartment();
 
     while !stop.load(Ordering::SeqCst) {
         let job = match rx.recv_timeout(Duration::from_millis(200)) {
@@ -153,7 +155,12 @@ fn worker_loop(
     }
 }
 
-fn compensate(store: &Store, app: &tauri::AppHandle, engine: &dyn OcrEngine, seen: &Arc<Mutex<HashSet<String>>>) {
+fn compensate(
+    store: &Store,
+    app: &tauri::AppHandle,
+    engine: &dyn OcrEngine,
+    seen: &Arc<Mutex<HashSet<String>>>,
+) {
     if let Ok(candidates) = store.list_ocr_candidates(OcrCandidateFilter::None, 8) {
         for candidate in candidates {
             {
@@ -162,15 +169,21 @@ fn compensate(store: &Store, app: &tauri::AppHandle, engine: &dyn OcrEngine, see
                     continue;
                 }
             }
-            process_job(
-                store,
-                app,
-                engine,
-                &OcrJob {
-                    clip_id: candidate.clip_id.clone(),
-                    content_hash: candidate.content_hash,
-                },
-            );
+            // none/failed → queued first (claim only accepts queued).
+            match store.enqueue_ocr(candidate.clip_id.clone(), candidate.content_hash.clone()) {
+                Ok(QueueDecision::Enqueued { .. }) | Ok(QueueDecision::AlreadyPending) => {
+                    process_job(
+                        store,
+                        app,
+                        engine,
+                        &OcrJob {
+                            clip_id: candidate.clip_id.clone(),
+                            content_hash: candidate.content_hash,
+                        },
+                    );
+                }
+                _ => {}
+            }
             let mut guard = seen.lock().unwrap_or_else(|e| e.into_inner());
             guard.remove(&candidate.clip_id);
         }
@@ -179,18 +192,21 @@ fn compensate(store: &Store, app: &tauri::AppHandle, engine: &dyn OcrEngine, see
 
 fn process_job(store: &Store, app: &tauri::AppHandle, engine: &dyn OcrEngine, job: &OcrJob) {
     if !engine.is_available() {
-        // claim if possible then skip
         if let Ok(Some(attempt)) = store.claim_ocr_job(job.clip_id.clone(), job.content_hash.clone())
         {
-            let _ = store.finish_ocr_job(
-                job.clip_id.clone(),
-                attempt,
-                OcrFinishOutcome::Skipped {
-                    error_code: OcrErrorCode::LanguageUnavailable,
-                    engine: Some(engine.name().to_string()),
-                },
-            );
-            emit_status(app, &job.clip_id, "skipped", engine.name(), Some("language_unavailable"));
+            let committed = store
+                .finish_ocr_job(
+                    job.clip_id.clone(),
+                    attempt,
+                    OcrFinishOutcome::Skipped {
+                        error_code: OcrErrorCode::LanguageUnavailable,
+                        engine: Some(engine.name().to_string()),
+                    },
+                )
+                .unwrap_or(false);
+            if committed {
+                emit_status(app, &job.clip_id, "skipped", engine.name(), Some("language_unavailable"));
+            }
         }
         return;
     }
@@ -206,15 +222,19 @@ fn process_job(store: &Store, app: &tauri::AppHandle, engine: &dyn OcrEngine, jo
     {
         Ok(bytes) => bytes,
         Err(_) => {
-            let _ = store.finish_ocr_job(
-                job.clip_id.clone(),
-                attempt,
-                OcrFinishOutcome::Failed {
-                    error_code: OcrErrorCode::DecodeFailed,
-                    engine: Some(engine.name().to_string()),
-                },
-            );
-            emit_status(app, &job.clip_id, "failed", engine.name(), Some("decode_failed"));
+            let committed = store
+                .finish_ocr_job(
+                    job.clip_id.clone(),
+                    attempt,
+                    OcrFinishOutcome::Failed {
+                        error_code: OcrErrorCode::DecodeFailed,
+                        engine: Some(engine.name().to_string()),
+                    },
+                )
+                .unwrap_or(false);
+            if committed {
+                emit_status(app, &job.clip_id, "failed", engine.name(), Some("decode_failed"));
+            }
             return;
         }
     };
@@ -223,15 +243,19 @@ fn process_job(store: &Store, app: &tauri::AppHandle, engine: &dyn OcrEngine, jo
     let result = engine.recognize(&input, &cancel);
     match result {
         Ok(OcrText { text, engine: name }) => {
-            let _ = store.finish_ocr_job(
-                job.clip_id.clone(),
-                attempt,
-                OcrFinishOutcome::Done {
-                    text,
-                    engine: name.to_string(),
-                },
-            );
-            emit_status(app, &job.clip_id, "done", name, None);
+            let committed = store
+                .finish_ocr_job(
+                    job.clip_id.clone(),
+                    attempt,
+                    OcrFinishOutcome::Done {
+                        text,
+                        engine: name.to_string(),
+                    },
+                )
+                .unwrap_or(false);
+            if committed {
+                emit_status(app, &job.clip_id, "done", name, None);
+            }
         }
         Err(error) => {
             let code = error.code();
@@ -253,8 +277,12 @@ fn process_job(store: &Store, app: &tauri::AppHandle, engine: &dyn OcrEngine, jo
                     engine: Some(engine.name().to_string()),
                 }
             };
-            let _ = store.finish_ocr_job(job.clip_id.clone(), attempt, outcome);
-            emit_status(app, &job.clip_id, status, engine.name(), Some(code_str));
+            let committed = store
+                .finish_ocr_job(job.clip_id.clone(), attempt, outcome)
+                .unwrap_or(false);
+            if committed {
+                emit_status(app, &job.clip_id, status, engine.name(), Some(code_str));
+            }
         }
     }
 }

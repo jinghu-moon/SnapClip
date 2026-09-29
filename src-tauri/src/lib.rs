@@ -187,7 +187,7 @@ pub fn run() {
             #[cfg(windows)]
             icon::init_state(app.handle())?;
 
-            let engine = Arc::new(WindowsOcrEngine) as Arc<dyn ocr::OcrEngine>;
+            let engine = Arc::new(WindowsOcrEngine::new()) as Arc<dyn ocr::OcrEngine>;
             let ocr_handle = OcrService::start(store.clone(), app.handle().clone(), engine);
             let enqueuer = ocr_handle.enqueuer();
             app.manage(ocr_handle);

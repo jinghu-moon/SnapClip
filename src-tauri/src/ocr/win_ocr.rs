@@ -1,8 +1,45 @@
-//! Windows.Media.Ocr engine (WinRT) with cancellation.
+//! Windows.Media.Ocr engine (WinRT).
+//!
+//! Threading contract: call `init_apartment()` once on the OCR worker thread.
+//! `recognize` runs on that worker; timeout/cancel calls `IAsyncOperation::Cancel`
+//! then joins the await helper so no thread or WinRT op is leaked.
+
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use super::engine::{OcrCancel, OcrEngine, OcrError, OcrInput, OcrText};
 
-pub struct WindowsOcrEngine;
+pub struct WindowsOcrEngine {
+    available: OnceLock<bool>,
+}
+
+impl Default for WindowsOcrEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WindowsOcrEngine {
+    pub fn new() -> Self {
+        Self {
+            available: OnceLock::new(),
+        }
+    }
+}
+
+/// Initialize WinRT/COM apartment on the long-lived OCR worker thread.
+#[cfg(windows)]
+pub fn init_apartment() -> Result<(), OcrError> {
+    use ::windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+    unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
+        .ok()
+        .map_err(|e| OcrError::Engine(e.to_string()))
+}
+
+#[cfg(not(windows))]
+pub fn init_apartment() -> Result<(), OcrError> {
+    Ok(())
+}
 
 impl OcrEngine for WindowsOcrEngine {
     fn name(&self) -> &'static str {
@@ -12,7 +49,7 @@ impl OcrEngine for WindowsOcrEngine {
     fn is_available(&self) -> bool {
         #[cfg(windows)]
         {
-            engine_create().is_ok()
+            *self.available.get_or_init(|| engine_create().is_ok())
         }
         #[cfg(not(windows))]
         {
@@ -38,7 +75,6 @@ fn engine_create() -> Result<::windows::Media::Ocr::OcrEngine, OcrError> {
 #[cfg(windows)]
 fn recognize_png(png: &[u8], cancel: &OcrCancel) -> Result<OcrText, OcrError> {
     use std::sync::mpsc;
-    use std::time::{Duration, Instant};
     use ::windows::Graphics::Imaging::{BitmapDecoder, BitmapPixelFormat, SoftwareBitmap};
     use ::windows::Storage::Streams::{DataWriter, InMemoryRandomAccessStream};
 
@@ -78,40 +114,46 @@ fn recognize_png(png: &[u8], cancel: &OcrCancel) -> Result<OcrText, OcrError> {
         .RecognizeAsync(&bgra)
         .map_err(|e| OcrError::Engine(e.to_string()))?;
 
-    // Await on a helper thread so this worker can honor cancel/timeout.
-    // On cancel/timeout we stop waiting; the WinRT operation is left to finish
-    // in the background (no IAsyncInfo::Cancel binding on this windows crate version).
+    // Await on one helper thread; on timeout/cancel call Cancel() then join — no leak.
+    let await_op = op.clone();
     let (tx, rx) = mpsc::channel();
-    std::thread::Builder::new()
+    let helper = std::thread::Builder::new()
         .name("snapclip-ocr-await".into())
         .spawn(move || {
-            let _ = tx.send(op.get().map(|result| result.Text().map(|t| t.to_string())));
+            let result = await_op
+                .get()
+                .map_err(map_engine)
+                .and_then(|result| result.Text().map_err(map_engine));
+            let _ = tx.send(result);
         })
         .map_err(map_engine)?;
 
     let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
+    let outcome = loop {
         if cancel.is_cancelled() {
-            return Err(OcrError::Cancelled);
+            let _ = op.Cancel();
+            break Err(OcrError::Cancelled);
         }
         if Instant::now() >= deadline {
-            return Err(OcrError::Timeout);
+            let _ = op.Cancel();
+            break Err(OcrError::Timeout);
         }
         match rx.recv_timeout(Duration::from_millis(20)) {
-            Ok(Ok(Ok(text))) => {
-                return Ok(OcrText {
-                    text,
-                    engine: "windows",
-                })
-            }
-            Ok(Ok(Err(_))) => return Err(OcrError::Engine("read text failed".into())),
-            Ok(Err(_)) => return Err(OcrError::Engine("recognize failed".into())),
+            Ok(result) => break result,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(OcrError::Engine("ocr await dropped".into()))
+                break Err(OcrError::Engine("ocr await dropped".into()))
             }
         }
-    }
+    };
+
+    // Always join the helper so the thread cannot outlive this call.
+    let _ = helper.join();
+    let text = outcome?.to_string();
+    Ok(OcrText {
+        text,
+        engine: "windows",
+    })
 }
 
 #[cfg(windows)]
