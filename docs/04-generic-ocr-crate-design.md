@@ -8,11 +8,24 @@
 | 目标 | 建设可被 SnapClip 及其他 Rust 项目复用的本地 OCR crate |
 | 首发模型 | PP-OCRv6 multi medium |
 | 首发运行时 | ONNX Runtime，通过 `ort` crate 接入 |
-| 首发平台 | Windows、Linux；Windows 优先验证 CPU/DirectML |
-| 首发输入 | PNG/JPEG 字节、RGB/RGBA 内存图像、文件路径 |
+| 首发平台 | 核心 API 跨平台；Windows 优先验证 CPU/DirectML；Linux 首发只承诺纯 CPU CI |
+| 首发输入 | 编码图片、带 stride 的 RGB/RGBA/BGRA/Gray 像素视图、文件路径、可选 ROI |
 | 首发输出 | 文本、置信度、行框、检测框、阶段耗时 |
 
 本方案把 OCR 算法、模型加载和推理运行时从 SnapClip 中抽离。SnapClip 只负责剪贴板来源、任务队列、数据库和 UI；通用 crate 不依赖 Tauri、SQLite、剪贴板或任何具体应用。
+
+### 1.1 二次评审修订
+
+两份审核报告和官方资料交叉核对后，本版作以下调整：
+
+1. 保留“通用 PP-OCR pipeline”定位，但把 Windows 屏幕输入作为一等适配场景；核心 crate 仍不依赖 Windows API。
+2. 公共输入增加 `PixelView`、stride、通道顺序、bottom-up、DPI hint 和 ROI，避免截图必须先编码 PNG 再解码。
+3. `medium` 仍是端到端准确率/契约基线；`small` 是桌面默认候选，`tiny` 是吞吐候选，最终档位由同一评测集和硬件基准决定。
+4. 长边 1920 不再作为不可变算法规则。缩放、放大、分块和 ROI 策略由 `PreprocessPolicy` 控制，并以屏幕黄金集验证。
+5. DirectML 从“性能路线”改为“可选实验路线”。CPU 是首发基线；只有在固定硬件、固定模型和固定数据集上优于 CPU 才允许应用默认启用。
+6. 服务线程、latest-wins、队列和 Windows OCR fallback 属于应用/平台层，不塞入通用核心 crate。
+
+报告中的推断性性能数字、第三方单机反馈和未核实的 Windows OCR 产品结论不作为本设计的事实依据；它们只能形成待验证实验项。
 
 ## 2. 结论摘要
 
@@ -32,7 +45,7 @@ cls = disabled
 rec = enabled
 ```
 
-原因是 PP-OCRv6 注册表提供检测和识别模型，没有对应的 v6 分类模型。第一版不混入 PP-OCRv4 分类模型，避免跨版本组合和额外推理开销。
+本地参考项目的 PP-OCRv6 registry 提供检测和识别模型，未提供可直接配套的 v6 分类 artifact。官方高层 API 是否在某些发行版中使用文本行方向模型，需要按具体模型包核验；因此第一版不混入 PP-OCRv4 分类模型，避免跨版本组合和额外推理开销。方向分类接口保留，但只有 manifest 明确提供兼容 classifier 时才启用。
 
 `medium` 是一致性和准确率基线，不代表最终默认性能配置。使用同一套 pipeline 另外注册 `small` 和 `tiny`，完成基准后由应用选择默认档位。
 
@@ -122,11 +135,11 @@ OcrModelBundle
 
 | profile | detector | recognizer | 用途 |
 |---|---|---|---|
-| `ppocrv6-multi-medium` | `PP-OCRv6_det_medium` | `PP-OCRv6_rec_medium` | 准确率/一致性基线 |
-| `ppocrv6-multi-small` | `PP-OCRv6_det_small` | `PP-OCRv6_rec_small` | 日常桌面默认候选 |
-| `ppocrv6-multi-tiny` | `PP-OCRv6_det_tiny` | `PP-OCRv6_rec_tiny` | 低配置和高吞吐候选 |
+| `ppocrv6-multi-medium` | `PP-OCRv6_det_medium` | `PP-OCRv6_rec_medium` + 该 profile 声明的字典 | 准确率/契约基线 |
+| `ppocrv6-multi-small` | `PP-OCRv6_det_small` | `PP-OCRv6_rec_small` + 该 profile 声明的字典 | 日常桌面默认候选 |
+| `ppocrv6-multi-tiny` | `PP-OCRv6_det_tiny` | `PP-OCRv6_rec_tiny` + 该 profile 声明的字典 | 低配置和高吞吐候选 |
 
-这三个 profile 共享完全相同的 pipeline 和输出类型。模型差异只通过 manifest 和模型文件表达。
+这三个 profile 共享完全相同的 pipeline 和输出类型。模型差异只通过 manifest 和模型文件表达；不能假设 tiny、small、medium 永远共用同一个字典。
 
 ### 5.2 模型 manifest
 
@@ -178,6 +191,7 @@ crates/
   ocr-core/       # 输入、输出、错误、模型包、公共 trait
   ocr-ppocr/      # PP-OCRv6 det/rec pipeline
   ocr-runtime/    # ort Session、provider、线程和模型校验
+  ocr-screen/     # 可选 Windows BGRA/WIC/DPI 适配，不进入核心 pipeline
   ocr-models/     # 可选 manifest、下载与校验工具
   ocr-cli/        # 可选命令行，不进入核心依赖
 ```
@@ -198,13 +212,38 @@ SnapClip adapter / other applications
 
 `ocr-core` 不依赖 `ort`，这样其他运行时或未来的纯 Rust backend 可以复用公共类型。
 
+`ocr-screen` 只接收/产生安全的 `PixelView`，集中处理 WIC、DIB、BGRA、预乘 alpha、DPI 元数据和 Windows `unsafe`。DXGI/WGC/BitBlt 的捕获生命周期仍属于应用或平台层；核心 crate 不持有 COM、纹理或映射指针。
+
+核心 API 保持同步；工作线程、取消、超时、latest-wins、队列背压和引擎 fallback 由 SnapClip 或其他应用的 service layer 实现。需要阶段性 UI 反馈的应用可以在 service layer 中调用检测/识别阶段 API，但不为此把应用调度器塞进 `ocr-core`。
+
 ## 7. 公共 API
 
 ### 7.1 输入
 
 ```rust
+pub enum PixelFormat {
+    Bgra8,
+    Rgba8,
+    Rgb8,
+    Gray8,
+}
+
+pub struct PixelView<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub stride: usize,
+    pub format: PixelFormat,
+    pub bottom_up: bool,
+    pub data: &'a [u8],
+}
+```
+
+`PixelView` 构造或进入 pipeline 时必须验证：每行字节数不小于 `width * bytes_per_pixel`、`stride * height` 不溢出且不超过 `data.len()`，格式与 alpha 语义明确。`bottom_up` 只描述内存行顺序，不改变输出坐标系。
+
+```rust
 pub enum OcrInput<'a> {
     Encoded(&'a [u8]),
+    Pixels(PixelView<'a>),
     Rgb {
         width: u32,
         height: u32,
@@ -219,7 +258,32 @@ pub enum OcrInput<'a> {
 }
 ```
 
-应用可以在进入 crate 前自行完成 PNG 规范化和像素上限检查；crate 仍必须对尺寸、通道数、整数溢出和解码错误做二次校验。
+请求级元数据和 ROI 单独表达，避免把 Windows/DPI 语义硬编码到像素格式：
+
+```rust
+pub struct OcrRequest<'a> {
+    pub input: OcrInput<'a>,
+    pub roi: Option<RectU32>,
+    pub scale_hint: Option<f32>,
+    pub preprocess: PreprocessPolicy,
+}
+```
+
+ROI 坐标以输入图像像素为单位；输出 polygon 也以输入图像像素为单位，并由 pipeline 负责加回 ROI 原点。`scale_hint` 仅是 DPI/显示缩放提示，不是未经测量的强制放大倍数。
+
+应用可以在进入 crate 前完成 PNG 规范化，但不应为了适配 crate 强制走 PNG 往返；crate 仍必须对尺寸、通道数、stride、整数溢出和解码错误做二次校验。
+
+```rust
+pub struct PreprocessPolicy {
+    pub max_decode_pixels: u64,
+    pub max_side: Option<u32>,
+    pub min_text_scale: Option<f32>,
+    pub tile: Option<TilePolicy>,
+    pub enhance: EnhancementPolicy,
+}
+```
+
+默认策略只提供安全上限和保守缩放，不预先启用反色、对比度拉伸或锐化。深色主题、低对比度、ClearType、小字号等处理必须先经过黄金集 CER/召回评测，再作为可选策略启用。
 
 ### 7.2 Engine
 
@@ -249,7 +313,7 @@ pub struct OcrLine {
     pub text: String,
     pub score: f32,
     pub polygon: Polygon,
-    pub words: Option<Vec<OcrWord>>,
+    pub words: Option<Vec<OcrWord>>, // 仅在模型/配置支持字符级对齐时提供
 }
 
 pub struct OcrWord {
@@ -259,7 +323,7 @@ pub struct OcrWord {
 }
 ```
 
-`text` 是按阅读顺序拼接的便捷字段；结构化消费者应使用 `lines` 和 `polygon`，避免重新解析纯文本。
+`text` 是按阅读顺序拼接的便捷字段；结构化消费者应使用 `lines` 和 `polygon`，避免重新解析纯文本。P0 不承诺字符级 `words`：CTC 输出本身不等于字符几何框，只有实现并验证时间步对齐后才填充该字段。
 
 ### 7.4 Provider
 
@@ -284,7 +348,7 @@ provider 回退必须在初始化时明确记录。不能仅凭 provider 构造�
 ```text
 decode input
   -> EXIF/orientation normalization
-  -> pixel/side limit
+  -> pixel/side limit and optional ROI/tile plan
   -> detector preprocess
   -> detector inference
   -> DB postprocess / polygons
@@ -300,12 +364,16 @@ decode input
 
 ### 8.1 预处理约束
 
-- 输入长边限制由配置控制，默认不超过 1920；
+- 输入长边和像素上限由 `PreprocessPolicy` 控制，不把 1920 固化为所有屏幕的规则；
 - 解码前检查声明的宽高和像素总数；
 - 拒绝 0 尺寸、整数乘法溢出和超过上限的图片；
 - 统一内部颜色顺序，建议使用 RGB 或 BGR 之一，不允许阶段间隐式切换；
 - 检测阶段和识别阶段分别维护 scratch buffer，避免每行文本重复分配；
-- 识别 batch 按文本框宽高比排序，减少 padding 浪费。
+- 对 BGRA/RGBA 输入，评估将通道重排、缩放、归一化和 CHW 写入融合到一次遍历；只有基准证明预处理占主要耗时后才引入 SIMD 或平台特化路径；
+- 识别 batch 按宽高比分桶，而不是只排序，减少 padding 和动态 shape 碎片；
+- 大图可按 tile 规划检测，tile 必须有重叠区并在原图坐标中做 polygon 去重；小 ROI 可走放大/快速路径；具体阈值由评测集扫描确定。
+
+屏幕输入的推荐策略不是无条件缩小：4K 全屏可能需要分块，小选区可能需要适度放大，DPI hint 只参与策略选择。HDR 色调映射、受保护窗口黑屏判断和截图捕获 API 属于 `ocr-screen`/应用层，不放入 PP-OCR 核心。
 
 ### 8.2 Session 生命周期
 
@@ -314,6 +382,7 @@ decode input
 - 单个 engine 默认串行执行；
 - 多并发由应用创建多个 engine，并显式控制内存预算；
 - 启动阶段可以选择 lazy load，但首次识别延迟必须可观测。
+- 可选空闲卸载必须由应用或服务层控制，并以实测内存收益和重载代价决定；核心 engine 不自行创建后台线程。
 
 ## 9. 运行时和 feature 设计
 
@@ -329,9 +398,11 @@ download-models = ["dep:reqwest", "dep:sha2"]
 cli = ["dep:clap"]
 ```
 
-默认构建只启用 CPU，避免所有用户都携带 GPU provider。Windows 发布包单独验证 DirectML DLL、ORT DLL 和 Tauri bundle 的复制规则。
+默认构建只启用 CPU，避免所有用户都携带 GPU provider。CUDA 不属于 Windows 首发验收范围；DirectML 仅作为 opt-in 实验 provider。Windows 发布包单独验证 DirectML DLL、ORT DLL 和 Tauri bundle 的复制规则。
 
-`ort` 版本必须锁定并在 Windows CI 中构建验证。参考项目使用 `2.0.0-rc.10`，新 crate 不应无条件跟随浮动版本；升级 RC 或正式版必须重新运行模型契约测试和性能基准。
+`ort` 版本必须锁定并在 Windows CI 中构建验证。参考项目使用 `2.0.0-rc.10`；官方 `ort` 文档目前展示的 API reference 已到 `2.0.0-rc.13`，但不能仅凭版本号升级，必须在目标 Windows toolchain 上重新运行模型契约、DLL 加载、准确率和性能基准。
+
+DirectML 的 provider 可用不等于 OCR 更快。检测输入尺寸和识别行宽具有动态性，provider 选择、顺序执行/内存配置、shape bucket 和会话创建成本都必须实测。首发默认 CPU；应用只有在固定硬件和屏幕数据集上的 warm P95、峰值内存与准确率均满足门槛时才启用 DirectML。
 
 ## 10. 错误和取消
 
