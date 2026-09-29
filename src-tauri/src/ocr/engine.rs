@@ -26,6 +26,18 @@ pub enum OcrError {
     Engine(String),
 }
 
+impl std::fmt::Display for OcrError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LanguageUnavailable => write!(f, "language unavailable"),
+            Self::Decode => write!(f, "decode failed"),
+            Self::Timeout => write!(f, "timeout"),
+            Self::Cancelled => write!(f, "cancelled"),
+            Self::Engine(message) => write!(f, "engine: {message}"),
+        }
+    }
+}
+
 impl OcrError {
     pub fn code(&self) -> crate::domain::OcrErrorCode {
         use crate::domain::OcrErrorCode;

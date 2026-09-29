@@ -11,6 +11,11 @@ const MAX_DECODE_PIXELS: u64 = 24_000_000;
 
 /// Decode raw CF_DIB / CF_DIBV5 clipboard bytes to PNG (downscaled if huge).
 pub fn dib_to_png(dib: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
+    // Reject oversized bitmaps from the DIB header before any decode.
+    let (bw, bh) = dib_header_dimensions(dib)?;
+    if u64::from(bw) * u64::from(bh) > MAX_DECODE_PIXELS {
+        return Err("image exceeds max decode pixels".into());
+    }
     let bmp = dib_to_bmp(dib)?;
     let reader = Cursor::new(bmp.as_slice());
     let mut img = image::ImageReader::new(reader)
@@ -22,9 +27,6 @@ pub fn dib_to_png(dib: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
     if width == 0 || height == 0 {
         return Err("dib has zero dimensions".into());
     }
-    if u64::from(width) * u64::from(height) > MAX_DECODE_PIXELS {
-        return Err("image exceeds max decode pixels".into());
-    }
     img = downscale(img);
     let width = img.width();
     let height = img.height();
@@ -32,6 +34,30 @@ pub fn dib_to_png(dib: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
     img.write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
         .map_err(|e| format!("encode png: {e}"))?;
     Ok((png, width, height))
+}
+
+/// Normalize a PNG payload: enforce pixel cap and downscale long side.
+/// Dimension check uses IHDR only (no full decode when within limits).
+pub fn normalize_png(png: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
+    let (width, height) = png_dimensions(png).ok_or_else(|| "invalid png header".to_string())?;
+    if u64::from(width) * u64::from(height) > MAX_DECODE_PIXELS {
+        return Err("image exceeds max decode pixels".into());
+    }
+    if width.max(height) <= MAX_OCR_SIDE {
+        return Ok((png.to_vec(), width, height));
+    }
+    let reader = Cursor::new(png);
+    let img = image::ImageReader::new(reader)
+        .with_guessed_format()
+        .map_err(|e| format!("guess png: {e}"))?
+        .decode()
+        .map_err(|e| format!("decode png: {e}"))?;
+    let img = downscale(img);
+    let (width, height) = (img.width(), img.height());
+    let mut out = Vec::new();
+    img.write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png)
+        .map_err(|e| format!("encode png: {e}"))?;
+    Ok((out, width, height))
 }
 
 /// Cheap PNG IHDR parse — avoids a full decode just for dimensions.
@@ -50,6 +76,19 @@ pub fn png_dimensions(png: &[u8]) -> Option<(u32, u32)> {
     let width = u32::from_be_bytes(png[16..20].try_into().ok()?);
     let height = u32::from_be_bytes(png[20..24].try_into().ok()?);
     (width > 0 && height > 0).then_some((width, height))
+}
+
+/// Width/height from BITMAPINFOHEADER without decoding pixels.
+fn dib_header_dimensions(dib: &[u8]) -> Result<(u32, u32), String> {
+    if dib.len() < 12 {
+        return Err("dib too short".into());
+    }
+    let width = i32::from_le_bytes(dib[4..8].try_into().unwrap());
+    let height = i32::from_le_bytes(dib[8..12].try_into().unwrap());
+    if width <= 0 || height == 0 {
+        return Err("invalid dib dimensions".into());
+    }
+    Ok((width as u32, height.unsigned_abs()))
 }
 
 fn downscale(img: image::DynamicImage) -> image::DynamicImage {
@@ -158,5 +197,40 @@ mod tests {
         png.extend_from_slice(&48u32.to_be_bytes());
         png.extend_from_slice(&[0; 5]);
         assert_eq!(png_dimensions(&png), Some((32, 48)));
+    }
+
+    #[test]
+    fn normalize_png_rejects_huge_ihdr_before_decode() {
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        // ~30MP > 24MP cap — must fail from header alone.
+        png.extend_from_slice(&20_000u32.to_be_bytes());
+        png.extend_from_slice(&20_000u32.to_be_bytes());
+        png.extend_from_slice(&[0; 5]);
+        assert!(normalize_png(&png).unwrap_err().contains("max decode pixels"));
+    }
+
+    #[test]
+    fn normalize_png_keeps_small_png() {
+        // Minimal invalid payload but valid IHDR — within caps so no decode required.
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&16u32.to_be_bytes());
+        png.extend_from_slice(&16u32.to_be_bytes());
+        png.extend_from_slice(&[0; 5]);
+        let (out, w, h) = normalize_png(&png).unwrap();
+        assert_eq!((w, h), (16, 16));
+        assert_eq!(out, png);
+    }
+
+    #[test]
+    fn dib_header_rejects_oversize_before_decode() {
+        let mut dib = vec![0u8; 40];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes());
+        dib[4..8].copy_from_slice(&20_000i32.to_le_bytes());
+        dib[8..12].copy_from_slice(&20_000i32.to_le_bytes());
+        assert!(dib_to_png(&dib).unwrap_err().contains("max decode pixels"));
     }
 }

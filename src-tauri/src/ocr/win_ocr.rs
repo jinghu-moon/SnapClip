@@ -27,18 +27,33 @@ impl WindowsOcrEngine {
     }
 }
 
+/// RAII COM apartment for the OCR worker thread.
+pub struct ComApartment {
+    _private: (),
+}
+
+impl Drop for ComApartment {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        unsafe {
+            ::windows::Win32::System::Com::CoUninitialize();
+        }
+    }
+}
+
 /// Initialize WinRT/COM apartment on the long-lived OCR worker thread.
 #[cfg(windows)]
-pub fn init_apartment() -> Result<(), OcrError> {
+pub fn init_apartment() -> Result<ComApartment, OcrError> {
     use ::windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
     unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
         .ok()
-        .map_err(|e| OcrError::Engine(e.to_string()))
+        .map_err(|e| OcrError::Engine(e.to_string()))?;
+    Ok(ComApartment { _private: () })
 }
 
 #[cfg(not(windows))]
-pub fn init_apartment() -> Result<(), OcrError> {
-    Ok(())
+pub fn init_apartment() -> Result<ComApartment, OcrError> {
+    Ok(ComApartment { _private: () })
 }
 
 impl OcrEngine for WindowsOcrEngine {

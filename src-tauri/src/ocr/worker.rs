@@ -67,6 +67,8 @@ impl OcrEnqueuer {
 pub struct OcrServiceHandle {
     enqueuer: OcrEnqueuer,
     stop: Arc<AtomicBool>,
+    /// Shared with in-flight jobs; cancelled on drop so shutdown is prompt.
+    shutdown_cancel: OcrCancel,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -79,6 +81,8 @@ impl OcrServiceHandle {
 impl Drop for OcrServiceHandle {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        // Cancel any recognize() in flight so worker join does not wait for timeout.
+        self.shutdown_cancel.cancel();
         let _ = self.enqueuer.wake();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -93,15 +97,20 @@ impl OcrService {
         let (tx, rx) = sync_channel::<OcrJob>(QUEUE_CAP);
         let seen = Arc::new(Mutex::new(HashSet::new()));
         let stop = Arc::new(AtomicBool::new(false));
+        let shutdown_cancel = OcrCancel::new();
         let worker_seen = seen.clone();
         let worker_stop = stop.clone();
+        let worker_cancel = shutdown_cancel.clone();
         let handle = thread::Builder::new()
             .name("snapclip-ocr-worker".into())
-            .spawn(move || worker_loop(store, app, engine, rx, worker_seen, worker_stop))
+            .spawn(move || {
+                worker_loop(store, app, engine, rx, worker_seen, worker_stop, worker_cancel)
+            })
             .expect("spawn ocr worker");
         OcrServiceHandle {
             enqueuer: OcrEnqueuer { tx, seen },
             stop,
+            shutdown_cancel,
             worker: Some(handle),
         }
     }
@@ -114,20 +123,31 @@ fn worker_loop(
     rx: Receiver<OcrJob>,
     seen: Arc<Mutex<HashSet<String>>>,
     stop: Arc<AtomicBool>,
+    shutdown_cancel: OcrCancel,
 ) {
     let mut completed: u32 = 0;
     let mut last_compensate = Instant::now();
 
     // Startup recovery: clear stale queued/running.
     let _ = store.reset_stale_ocr_jobs();
+
     // WinRT/COM apartment belongs to this long-lived OCR thread.
-    let _ = super::init_apartment();
+    let com_guard = match super::init_apartment() {
+        Ok(guard) => Some(guard),
+        Err(error) => {
+            eprintln!("[snapclip][ocr] COM init failed: {error}");
+            None
+        }
+    };
 
     while !stop.load(Ordering::SeqCst) {
         let job = match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(job) => job,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                compensate(&store, &app, engine.as_ref(), &seen);
+                if last_compensate.elapsed() >= COMPENSATE_INTERVAL {
+                    last_compensate = Instant::now();
+                    compensate(&store, &app, engine.as_ref(), &seen, &shutdown_cancel);
+                }
                 continue;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -136,23 +156,25 @@ fn worker_loop(
         if job.clip_id.is_empty() {
             if last_compensate.elapsed() >= COMPENSATE_INTERVAL {
                 last_compensate = Instant::now();
-                compensate(&store, &app, engine.as_ref(), &seen);
+                compensate(&store, &app, engine.as_ref(), &seen, &shutdown_cancel);
             }
             continue;
         }
 
-        process_job(&store, &app, engine.as_ref(), &job);
+        process_job(&store, &app, engine.as_ref(), &job, &shutdown_cancel);
         {
             let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
             seen.remove(&job.clip_id);
         }
         completed = completed.saturating_add(1);
-        if completed >= COMPENSATE_EVERY {
+        if completed >= COMPENSATE_EVERY && last_compensate.elapsed() >= COMPENSATE_INTERVAL {
             completed = 0;
             last_compensate = Instant::now();
-            compensate(&store, &app, engine.as_ref(), &seen);
+            compensate(&store, &app, engine.as_ref(), &seen, &shutdown_cancel);
         }
     }
+
+    drop(com_guard);
 }
 
 fn compensate(
@@ -160,6 +182,7 @@ fn compensate(
     app: &tauri::AppHandle,
     engine: &dyn OcrEngine,
     seen: &Arc<Mutex<HashSet<String>>>,
+    shutdown_cancel: &OcrCancel,
 ) {
     if let Ok(candidates) = store.list_ocr_candidates(OcrCandidateFilter::None, 8) {
         for candidate in candidates {
@@ -180,6 +203,7 @@ fn compensate(
                             clip_id: candidate.clip_id.clone(),
                             content_hash: candidate.content_hash,
                         },
+                        shutdown_cancel,
                     );
                 }
                 _ => {}
@@ -190,7 +214,13 @@ fn compensate(
     }
 }
 
-fn process_job(store: &Store, app: &tauri::AppHandle, engine: &dyn OcrEngine, job: &OcrJob) {
+fn process_job(
+    store: &Store,
+    app: &tauri::AppHandle,
+    engine: &dyn OcrEngine,
+    job: &OcrJob,
+    cancel: &OcrCancel,
+) {
     if !engine.is_available() {
         if let Ok(Some(attempt)) = store.claim_ocr_job(job.clip_id.clone(), job.content_hash.clone())
         {
@@ -217,7 +247,6 @@ fn process_job(store: &Store, app: &tauri::AppHandle, engine: &dyn OcrEngine, jo
         Err(_) => return,
     };
 
-    let cancel = OcrCancel::new();
     let bytes = match store.read_payload_bytes(job.content_hash.clone(), crate::domain::PayloadKind::Image)
     {
         Ok(bytes) => bytes,
@@ -240,7 +269,7 @@ fn process_job(store: &Store, app: &tauri::AppHandle, engine: &dyn OcrEngine, jo
     };
 
     let input = OcrInput::Png(bytes.into());
-    let result = engine.recognize(&input, &cancel);
+    let result = engine.recognize(&input, cancel);
     match result {
         Ok(OcrText { text, engine: name }) => {
             let committed = store

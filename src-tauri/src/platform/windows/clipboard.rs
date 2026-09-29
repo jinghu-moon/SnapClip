@@ -421,11 +421,16 @@ unsafe fn read_open_clipboard(
             continue;
         }
         if format == png_format {
-            let dimensions = image_norm::png_dimensions(&bytes).map(|(width, height)| {
-                ImageDimensions { width, height }
-            });
-            image_png = Some((dimensions, bytes));
-            break;
+            match image_norm::normalize_png(&bytes) {
+                Ok((png, width, height)) => {
+                    image_png = Some((Some(ImageDimensions { width, height }), png));
+                    break;
+                }
+                Err(error) => {
+                    eprintln!("[snapclip][clipboard] png normalize failed: {error}");
+                    continue;
+                }
+            }
         }
         match image_norm::dib_to_png(&bytes) {
             Ok((png, width, height)) => {
