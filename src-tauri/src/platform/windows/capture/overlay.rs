@@ -21,6 +21,7 @@ use std::time::Instant;
 
 use windows_sys::Win32::{
     Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT, WPARAM},
+    Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT},
     System::LibraryLoader::GetModuleHandleW,
     System::Threading::GetCurrentThreadId,
     UI::{
@@ -845,9 +846,36 @@ where
     }
 
     fn render(&mut self, damage: Vec<Rect>) {
+        let session_id = self.session_id();
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
+        // Phase 0 observability: the per-Present cost. An empty damage list is a
+        // full-surface repaint (WM_PAINT, first frame). Phase 2 must shrink the
+        // crosshair-dominated bbox recorded here.
+        let frame = renderer.frame();
+        let (rects, damaged_px, bbox) = if damage.is_empty() {
+            (0usize, frame.area(), frame)
+        } else {
+            let mut union = damage[0];
+            let mut area: i64 = 0;
+            for rect in &damage {
+                union = union.union(*rect);
+                area += rect.area();
+            }
+            (damage.len(), area, union)
+        };
+        eprintln!(
+            "[snapclip][capture] render session={} rects={} damaged_px={} bbox=({},{},{},{}) frame_px={}",
+            session_id,
+            rects,
+            damaged_px,
+            bbox.left,
+            bbox.top,
+            bbox.right,
+            bbox.bottom,
+            frame.area()
+        );
         let cursor_visible = self.cursor_visible && self.session.state().is_active();
         let state = OverlayFrameState {
             selection: self.session.selection(),
@@ -965,7 +993,15 @@ where
             WM_NCHITTEST => Some(HTCLIENT as LRESULT),
             WM_ERASEBKGND => Some(1),
             WM_PAINT => {
+                // Acknowledge the update region with BeginPaint/EndPaint. Skipping it
+                // leaves WM_PAINT permanently pending and the message loop re-renders
+                // the full surface continuously (~180 Presents/s measured in Phase 0).
+                // The pixels themselves come from the DirectComposition visual, so the
+                // HDC is intentionally unused.
+                let mut paint: PAINTSTRUCT = unsafe { zeroed() };
+                unsafe { BeginPaint(self.window, &mut paint) };
                 self.render(Vec::new());
+                unsafe { EndPaint(self.window, &paint) };
                 Some(0)
             }
             WM_DPICHANGED | WM_DISPLAYCHANGE | WM_DEVICECHANGE => {

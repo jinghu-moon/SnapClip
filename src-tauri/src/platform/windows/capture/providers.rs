@@ -90,9 +90,21 @@ impl FrozenFrame {
                 "frozen frame has a texture but no device to read it back with".into(),
             ));
         };
+        // Phase 0 observability: this transfer is always frame-sized today, whatever
+        // the eventual selection is. Phase 3 replaces it with a region readback and
+        // will be judged against these byte counts.
+        let started_at = std::time::Instant::now();
         let pixels = device
             .read_back_bgra(&gpu.texture)
             .map_err(|message| classify_device_error("GPU readback", message))?;
+        eprintln!(
+            "[snapclip][capture] readback provider={} frame={}x{} bytes={} elapsed_ms={}",
+            self.frame.provider,
+            self.frame.width,
+            self.frame.height,
+            pixels.len(),
+            started_at.elapsed().as_millis()
+        );
         // A racing reader may have won; either buffer is equivalent.
         Ok(self.pixels.get_or_init(|| pixels))
     }

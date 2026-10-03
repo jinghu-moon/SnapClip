@@ -23,15 +23,25 @@ impl PixelFormat {
     }
 }
 
-/// Lifecycle of one capture session. Mirrors the transitions documented in
-/// `docs/08-screenshot-mvp-tasklist.md` §3.1.
+/// Lifecycle of one capture session.
+///
+/// The value set is the frozen Phase 0 contract from
+/// `docs/11-screenshot-fullflow-ui-refactor-tasklist.md` §2.2:
+/// Idle → Preparing → Armed → Selecting → Selected → Adjusting → Annotating →
+/// Exporting → Idle. `Preparing`, `Adjusting`, `Annotating` and `Exporting` are
+/// emitted once their phases introduce them; `Finishing` is the current
+/// produce-artifact state and is replaced by `Exporting` in Phase 3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureState {
     Idle,
+    Preparing,
     Armed,
     Selecting,
     Selected,
+    Adjusting,
+    Annotating,
+    Exporting,
     Finishing,
 }
 
@@ -39,9 +49,13 @@ impl CaptureState {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Idle => "idle",
+            Self::Preparing => "preparing",
             Self::Armed => "armed",
             Self::Selecting => "selecting",
             Self::Selected => "selected",
+            Self::Adjusting => "adjusting",
+            Self::Annotating => "annotating",
+            Self::Exporting => "exporting",
             Self::Finishing => "finishing",
         }
     }
@@ -94,9 +108,13 @@ mod tests {
     fn capture_state_reports_activity() {
         assert!(!CaptureState::Idle.is_active());
         for state in [
+            CaptureState::Preparing,
             CaptureState::Armed,
             CaptureState::Selecting,
             CaptureState::Selected,
+            CaptureState::Adjusting,
+            CaptureState::Annotating,
+            CaptureState::Exporting,
             CaptureState::Finishing,
         ] {
             assert!(state.is_active(), "{state:?} should be active");

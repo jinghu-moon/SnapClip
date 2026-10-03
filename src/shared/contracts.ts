@@ -5,11 +5,20 @@
  * as a TypeScript error in the feature that consumes it.
  */
 
+/**
+ * Frozen Phase 0 contract (docs/11 §2.2): the full lifecycle the native
+ * overlay publishes. `preparing`/`adjusting`/`annotating`/`exporting` arrive with
+ * their phases; `finishing` is the current produce state, replaced by `exporting`.
+ */
 export type CaptureState =
   | "idle"
+  | "preparing"
   | "armed"
   | "selecting"
   | "selected"
+  | "adjusting"
+  | "annotating"
+  | "exporting"
   | "finishing";
 
 export type PublicationOrigin = "clipboard" | "capture";

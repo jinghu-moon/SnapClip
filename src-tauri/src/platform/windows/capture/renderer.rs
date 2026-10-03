@@ -89,8 +89,6 @@ impl Win32Renderer {
     }
 
     /// Local frame rectangle (origin at the monitor's top-left).
-    /// Monitor-local frame rectangle currently rendered.
-    #[allow(dead_code)]
     pub fn frame(&self) -> Rect {
         self.frame
     }

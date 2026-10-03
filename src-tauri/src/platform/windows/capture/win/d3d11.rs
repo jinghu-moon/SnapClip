@@ -517,6 +517,31 @@ mod tests {
         assert!(wrong.contains("does not match"));
     }
 
+    /// Phase 0 baseline (docs/11): the export readback is always frame-sized today,
+    /// whatever selection `confirm()` later crops out. Records bytes and duration
+    /// for the reference sizes so Phase 3 region readback can be judged against it.
+    #[test]
+    fn readback_always_copies_the_whole_frame() {
+        let Ok(device) = GraphicsDevice::create() else {
+            return;
+        };
+        for (width, height) in [(1920u32, 1080u32), (3840u32, 2160u32)] {
+            let frame = device
+                .create_bgra_texture(width, height, &vec![0u8; (width * height * 4) as usize])
+                .unwrap();
+            let started_at = std::time::Instant::now();
+            let pixels = device.read_back_bgra(&frame.texture).unwrap();
+            eprintln!(
+                "[snapclip][bench] readback frame={}x{} selection=300x200 selection_bytes=240000 readback_bytes={} elapsed_ms={}",
+                width,
+                height,
+                pixels.len(),
+                started_at.elapsed().as_millis()
+            );
+            assert_eq!(pixels.len(), (width * height * 4) as usize);
+        }
+    }
+
     #[test]
     fn swap_chain_can_be_created_and_presented() {
         let Ok(device) = GraphicsDevice::create() else {

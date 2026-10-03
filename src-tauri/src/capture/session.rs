@@ -402,6 +402,12 @@ mod tests {
                     session.begin_finish().unwrap();
                 }
                 CaptureState::Idle => unreachable!("idle is not an active state"),
+                CaptureState::Preparing
+                | CaptureState::Adjusting
+                | CaptureState::Annotating
+                | CaptureState::Exporting => {
+                    unreachable!("{state:?} belongs to the docs/11 contract but is not reachable until its phase lands")
+                }
             }
             assert_eq!(session.state(), state);
 

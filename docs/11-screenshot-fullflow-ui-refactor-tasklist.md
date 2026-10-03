@@ -820,12 +820,14 @@ src-tauri/src/
 
 ### Phase 0：基线和契约冻结
 
-- [ ] 记录当前 `cargo test --lib`、`cargo check --all-targets`、`npm run typecheck`、`npm run build`。
-- [ ] 记录当前 F5 到 overlay visible 的 P50/P95。
-- [ ] 记录鼠标移动 10 秒 CPU、Private Bytes、GPU memory。
-- [ ] 记录确认 300x200、1920x1080、3840x2160 的 readback 字节数。
-- [ ] 增加 `generation`、stage timestamp、provider、readback bytes、dirty area 日志。
-- [ ] 冻结 capture event DTO 和错误码，不冻结内部 Win32 API。
+- [x] 记录当前 `cargo test --lib`、`cargo check --all-targets`、`npm run typecheck`、`npm run build`。
+- [x] 记录当前 F5 到 overlay visible 的 P50/P95。
+- [x] 记录鼠标移动 10 秒 CPU、Private Bytes、GPU memory。
+- [x] 记录确认 300x200、1920x1080、3840x2160 的 readback 字节数。
+- [x] 增加 `generation`、stage timestamp、provider、readback bytes、dirty area 日志。
+- [x] 冻结 capture event DTO 和错误码，不冻结内部 Win32 API。
+
+以上各项的结果与证据见 `docs/13-screenshot-refactor-verification.md` Phase 0 章节。
 
 ### Phase 1：捕获与 overlay 解耦
 
