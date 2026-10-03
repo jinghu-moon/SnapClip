@@ -1,0 +1,445 @@
+//! Capture artifact production.
+//!
+//! Takes the frozen frame the overlay was showing, crops the confirmed selection
+//! out of it and turns it into a durable [`CaptureArtifact`] — without ever
+//! touching the clipboard, the store or OCR.
+//!
+//! The overlay owns the GPU texture, so it supplies pixels through
+//! [`PixelSliceSource`]; the service owns everything after that (validation,
+//! encoding, atomic file write).
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::infrastructure::image;
+
+use crate::capture::geometry::Rect;
+use crate::capture::session::CapturedFrame;
+use crate::capture::{CaptureError, CaptureResult};
+use crate::domain::{CaptureArtifact, CapturePayload, PixelFormat};
+
+/// Supplies the pixels of the frozen frame that the overlay is displaying.
+///
+/// Implementations borrow their frame, so consumers take `&impl PixelSliceSource`
+/// rather than a trait object: the capture path never needs to store one.
+pub trait PixelSliceSource {
+    /// Read BGRA8 pixels of `region` (monitor-local physical pixels, top-down,
+    /// tightly packed) from the frozen frame.
+    fn read_bgra(&self, region: Rect) -> CaptureResult<Vec<u8>>;
+}
+
+/// Encodes pixels into an artifact payload.
+pub trait ArtifactEncoder: Send + Sync + 'static {
+    fn encode_png(&self, width: u32, height: u32, bgra: &[u8]) -> CaptureResult<Vec<u8>>;
+}
+
+/// BGRA → PNG encoder backed by [`crate::infrastructure::image`].
+pub struct PngArtifactEncoder;
+
+impl ArtifactEncoder for PngArtifactEncoder {
+    fn encode_png(&self, width: u32, height: u32, bgra: &[u8]) -> CaptureResult<Vec<u8>> {
+        let image = image::Bgra8Image::new(width, height, bgra.to_vec()).ok_or_else(|| {
+            CaptureError::EncodeFailed(format!(
+                "bgra buffer of {} bytes does not match {width}x{height}",
+                bgra.len()
+            ))
+        })?;
+        image::encode_png(&image).map_err(CaptureError::EncodeFailed)
+    }
+}
+
+/// Directory where capture artifacts may be written. Supplied by the application
+/// root so platform code never invents paths.
+pub trait ArtifactDir: Send + Sync + 'static {
+    fn artifact_dir(&self) -> PathBuf;
+}
+
+static ARTIFACT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Produces capture artifacts.
+pub struct CaptureService<D, E> {
+    artifacts: D,
+    encoder: E,
+}
+
+impl<D, E> CaptureService<D, E>
+where
+    D: ArtifactDir,
+    E: ArtifactEncoder,
+{
+    pub fn new(artifacts: D, encoder: E) -> Self {
+        Self {
+            artifacts,
+            encoder,
+        }
+    }
+
+    /// Crop `selection` out of `frame` and encode it to PNG bytes.
+    pub fn encode_selection(
+        &self,
+        frame: &CapturedFrame,
+        selection: Rect,
+        pixels: &dyn PixelSliceSource,
+    ) -> CaptureResult<(Vec<u8>, Rect)> {
+        let clipped = validate(frame, selection)?;
+        let bgra = pixels.read_bgra(clipped)?;
+        let expected = clipped.width() as usize * clipped.height() as usize * 4;
+        if bgra.len() != expected {
+            return Err(CaptureError::EncodeFailed(format!(
+                "pixel readback returned {} bytes, expected {expected}",
+                bgra.len()
+            )));
+        }
+        let png = self
+            .encoder
+            .encode_png(clipped.width() as u32, clipped.height() as u32, &bgra)?;
+        Ok((png, clipped))
+    }
+
+    /// Encode the selection and write it to the artifact directory.
+    pub fn produce_artifact(
+        &self,
+        session_id: &str,
+        frame: &CapturedFrame,
+        selection: Rect,
+        dpi: u32,
+        monitor_device_name: Option<String>,
+        pixels: &dyn PixelSliceSource,
+    ) -> CaptureResult<CaptureArtifact> {
+        let (png, clipped) = self.encode_selection(frame, selection, pixels)?;
+        let path = self.write_artifact(session_id, &png)?;
+        Ok(CaptureArtifact {
+            session_id: session_id.to_string(),
+            width: clipped.width() as u32,
+            height: clipped.height() as u32,
+            dpi,
+            pixel_format: PixelFormat::Bgra8Unorm,
+            captured_at_unix_ms: frame.captured_at_unix_ms,
+            monitor_device_name,
+            payload: CapturePayload::PngFile { path },
+        })
+    }
+
+    /// Write the PNG atomically into the artifact directory.
+    pub fn write_artifact(&self, session_id: &str, png: &[u8]) -> CaptureResult<PathBuf> {
+        let directory = self.artifacts.artifact_dir();
+        fs::create_dir_all(&directory).map_err(|error| {
+            CaptureError::EncodeFailed(format!("create artifact directory failed: {error}"))
+        })?;
+        let sequence = ARTIFACT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = directory.join(format!("{session_id}-{sequence}.png"));
+        write_atomically(&path, png).map_err(|error| {
+            CaptureError::EncodeFailed(format!("write artifact failed: {error}"))
+        })?;
+        Ok(path)
+    }
+}
+
+/// Validate the selection against the frozen frame, clipping it to the frame.
+pub fn validate(frame: &CapturedFrame, selection: Rect) -> CaptureResult<Rect> {
+    if selection.is_empty() {
+        return Err(CaptureError::InvalidState(
+            "selection is empty; nothing to capture".into(),
+        ));
+    }
+    let clipped = selection.intersect(frame.rect());
+    if clipped.is_empty() {
+        return Err(CaptureError::InvalidState(
+            "selection does not overlap the captured monitor".into(),
+        ));
+    }
+    Ok(clipped)
+}
+
+fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let temporary = path.with_extension("png.tmp");
+    fs::write(&temporary, bytes)?;
+    match fs::rename(&temporary, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            Err(error)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capture::geometry::Rect;
+
+    struct FixedDir(PathBuf);
+
+    impl ArtifactDir for FixedDir {
+        fn artifact_dir(&self) -> PathBuf {
+            self.0.clone()
+        }
+    }
+
+    struct CountingEncoder {
+        calls: AtomicU64,
+    }
+
+    impl ArtifactEncoder for CountingEncoder {
+        fn encode_png(&self, width: u32, height: u32, bgra: &[u8]) -> CaptureResult<Vec<u8>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            // Deterministic fake PNG: header + dimensions + first pixel.
+            let mut png = vec![0x89, b'P', b'N', b'G'];
+            png.extend_from_slice(&width.to_le_bytes());
+            png.extend_from_slice(&height.to_le_bytes());
+            png.extend_from_slice(&bgra[..4.min(bgra.len())]);
+            Ok(png)
+        }
+    }
+
+    /// Frame source whose pixels encode their own coordinates, so cropping is
+    /// verifiable.
+    struct GridPixels {
+        width: i32,
+        height: i32,
+        reads: AtomicU64,
+    }
+
+    impl GridPixels {
+        fn new(width: i32, height: i32) -> Self {
+            Self {
+                width,
+                height,
+                reads: AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl PixelSliceSource for GridPixels {
+        fn read_bgra(&self, region: Rect) -> CaptureResult<Vec<u8>> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            let clipped = region.intersect(Rect::new(0, 0, self.width, self.height));
+            let mut bytes = Vec::with_capacity((clipped.area() * 4) as usize);
+            for y in clipped.top..clipped.bottom {
+                for x in clipped.left..clipped.right {
+                    bytes.extend_from_slice(&[x as u8, y as u8, 0, 255]);
+                }
+            }
+            Ok(bytes)
+        }
+    }
+
+    fn frame(width: u32, height: u32) -> CapturedFrame {
+        CapturedFrame {
+            width,
+            height,
+            pixel_format: PixelFormat::Bgra8Unorm,
+            captured_at_unix_ms: 1_700_000_000_000,
+            provider: "test",
+        }
+    }
+
+    fn test_dir(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "snapclip-capture-service-{}-{name}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn crops_the_selection_out_of_the_frozen_frame() {
+        let dir = test_dir("crop");
+        let service = CaptureService::new(
+            FixedDir(dir.clone()),
+            CountingEncoder {
+                calls: AtomicU64::new(0),
+            },
+        );
+        let pixels = GridPixels::new(100, 50);
+        let (png, clipped) = service
+            .encode_selection(&frame(100, 50), Rect::new(10, 5, 13, 8), &pixels)
+            .unwrap();
+        assert_eq!(clipped, Rect::new(10, 5, 13, 8));
+        // 3x3 pixels, first pixel is (10, 5).
+        assert_eq!(&png[..4], &[0x89, b'P', b'N', b'G']);
+        assert_eq!(u32::from_le_bytes(png[4..8].try_into().unwrap()), 3);
+        assert_eq!(u32::from_le_bytes(png[8..12].try_into().unwrap()), 3);
+        assert_eq!(&png[12..16], &[10, 5, 0, 255]);
+        assert_eq!(pixels.reads.load(Ordering::Relaxed), 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn selection_is_clipped_to_the_frame_before_readback() {
+        let dir = test_dir("clip");
+        let service = CaptureService::new(
+            FixedDir(dir.clone()),
+            CountingEncoder {
+                calls: AtomicU64::new(0),
+            },
+        );
+        let pixels = GridPixels::new(100, 50);
+        let (_, clipped) = service
+            .encode_selection(&frame(100, 50), Rect::new(95, 45, 200, 200), &pixels)
+            .unwrap();
+        assert_eq!(clipped, Rect::new(95, 45, 100, 50));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn empty_or_offscreen_selections_are_rejected() {
+        let dir = test_dir("reject");
+        let service = CaptureService::new(
+            FixedDir(dir.clone()),
+            CountingEncoder {
+                calls: AtomicU64::new(0),
+            },
+        );
+        let pixels = GridPixels::new(100, 50);
+        for selection in [Rect::default(), Rect::new(500, 500, 600, 600)] {
+            assert!(matches!(
+                service.encode_selection(&frame(100, 50), selection, &pixels),
+                Err(CaptureError::InvalidState(_))
+            ));
+        }
+        assert_eq!(
+            pixels.reads.load(Ordering::Relaxed),
+            0,
+            "no readback must happen for a rejected selection"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn readback_of_the_wrong_size_is_rejected() {
+        struct WrongPixels;
+        impl PixelSliceSource for WrongPixels {
+            fn read_bgra(&self, _region: Rect) -> CaptureResult<Vec<u8>> {
+                Ok(vec![0; 4])
+            }
+        }
+        let dir = test_dir("wrong-size");
+        let service = CaptureService::new(
+            FixedDir(dir.clone()),
+            CountingEncoder {
+                calls: AtomicU64::new(0),
+            },
+        );
+        let error = service
+            .encode_selection(&frame(100, 50), Rect::new(0, 0, 10, 10), &WrongPixels)
+            .unwrap_err();
+        assert!(matches!(error, CaptureError::EncodeFailed(_)));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn artifact_is_written_to_the_artifact_directory() {        let dir = test_dir("artifact");
+        let service = CaptureService::new(
+            FixedDir(dir.clone()),
+            CountingEncoder {
+                calls: AtomicU64::new(0),
+            },
+        );
+        let pixels = GridPixels::new(100, 50);
+        let artifact = service
+            .produce_artifact(
+                "session-1",
+                &frame(100, 50),
+                Rect::new(1, 2, 6, 7),
+                144,
+                Some(r"\\.\DISPLAY2".into()),
+                &pixels,
+            )
+            .unwrap();
+        assert_eq!(artifact.session_id, "session-1");
+        assert_eq!((artifact.width, artifact.height), (5, 5));
+        assert_eq!(artifact.dpi, 144);
+        assert_eq!(artifact.monitor_device_name.as_deref(), Some(r"\\.\DISPLAY2"));
+        let path = artifact.png_path().unwrap().to_path_buf();
+        assert!(path.starts_with(&dir));
+        assert!(path.exists());
+        assert_eq!(fs::read(&path).unwrap().len(), 12 + 4);
+        // No temporary files may be left behind.
+        let leftovers = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(leftovers, 0);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn artifacts_get_unique_paths_within_a_session() {
+        let dir = test_dir("unique");
+        let service = CaptureService::new(
+            FixedDir(dir.clone()),
+            CountingEncoder {
+                calls: AtomicU64::new(0),
+            },
+        );
+        let first = service.write_artifact("session-1", b"a").unwrap();
+        let second = service.write_artifact("session-1", b"b").unwrap();
+        assert_ne!(first, second);
+        assert_eq!(fs::read(&first).unwrap(), b"a");
+        assert_eq!(fs::read(&second).unwrap(), b"b");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn real_png_encoder_round_trips_the_selection() {
+        let dir = test_dir("png");
+        let service = CaptureService::new(FixedDir(dir.clone()), PngArtifactEncoder);
+        let pixels = GridPixels::new(4, 4);
+        let (png, clipped) = service
+            .encode_selection(&frame(4, 4), Rect::new(1, 1, 3, 3), &pixels)
+            .unwrap();
+        assert_eq!(clipped, Rect::new(1, 1, 3, 3));
+        let decoded = image::decode_to_bgra8(&png).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (2, 2));
+        assert_eq!(decoded.bytes(), &[1, 1, 0, 255, 2, 1, 0, 255, 1, 2, 0, 255, 2, 2, 0, 255]);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Section 8.1 of the tasklist: the whole capture pipeline must run with no
+    /// clipboard, no database and no OCR model in the process.
+    ///
+    /// This test never touches `platform::windows::clipboard`, `Store` or the OCR
+    /// module, and still produces a complete, readable artifact.
+    #[test]
+    fn capture_pipeline_is_independent_of_clipboard_store_and_ocr() {
+        let dir = test_dir("isolated");
+        let service = CaptureService::new(FixedDir(dir.clone()), PngArtifactEncoder);
+        let pixels = GridPixels::new(32, 24);
+        let frozen = CapturedFrame {
+            width: 32,
+            height: 24,
+            pixel_format: PixelFormat::Bgra8Unorm,
+            captured_at_unix_ms: 1_700_000_000_000,
+            provider: "test",
+        };
+
+        let artifact = service
+            .produce_artifact(
+                "capture-isolated",
+                &frozen,
+                Rect::new(4, 4, 20, 16),
+                120,
+                None,
+                &pixels,
+            )
+            .unwrap();
+
+        assert_eq!(artifact.session_id, "capture-isolated");
+        assert_eq!((artifact.width, artifact.height), (16, 12));
+        assert_eq!(artifact.dpi, 120);
+
+        // The artifact is a self-contained file: decode it back from disk.
+        let path = artifact.png_path().unwrap();
+        let bytes = fs::read(path).unwrap();
+        let decoded = image::decode_to_bgra8(&bytes).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (16, 12));
+        // The pixel grid encodes its own coordinates, so cropping is verifiable.
+        assert_eq!(&decoded.bytes()[..4], &[4, 4, 0, 255]);
+        let _ = fs::remove_dir_all(dir);
+    }
+}

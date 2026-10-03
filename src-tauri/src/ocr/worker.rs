@@ -11,15 +11,20 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tauri::Emitter;
+
 
 use super::engine::{OcrCancel, OcrEngine, OcrInput, OcrText};
 use crate::domain::OcrErrorCode;
-use crate::store::{OcrCandidateFilter, OcrFinishOutcome, QueueDecision, Store};
+use crate::infrastructure::store::{OcrCandidateFilter, OcrFinishOutcome, QueueDecision, Store};
 
 const QUEUE_CAP: usize = 64;
 const COMPENSATE_EVERY: u32 = 8;
 const COMPENSATE_INTERVAL: Duration = Duration::from_secs(30);
+/// How long the worker waits before its first backlog sweep.
+///
+/// A sweep can load the OCR model, which must not happen while the window is still being
+/// created. Explicitly queued jobs are unaffected and start immediately.
+const STARTUP_BACKFILL_DELAY: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct OcrJob {
@@ -138,7 +143,15 @@ fn worker_loop(
     shutdown_cancel: OcrCancel,
 ) {
     let mut completed: u32 = 0;
-    let mut last_compensate = Instant::now();
+    // Startup backfill is deliberately deferred.
+    //
+    // `compensate` sweeps clips that are already in the database, and a sweep runs the
+    // engine — which loads the OCR model — immediately. Doing that during startup put a
+    // model load in front of window creation on any machine that had a backlog, and the
+    // OS reported the window as unresponsive. Explicit jobs are still processed as soon as
+    // they arrive; only the backlog sweep waits.
+    let startup = Instant::now();
+    let mut last_compensate = startup;
 
     // Startup recovery: clear stale queued/running.
     let _ = store.reset_stale_ocr_jobs();
@@ -153,10 +166,14 @@ fn worker_loop(
     };
 
     while !stop.load(Ordering::SeqCst) {
+        // The first sweep is deferred so the model load never races window creation.
+        let backfill_due =
+            startup.elapsed() >= STARTUP_BACKFILL_DELAY && last_compensate.elapsed() >= COMPENSATE_INTERVAL;
+
         let job = match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(job) => job,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if last_compensate.elapsed() >= COMPENSATE_INTERVAL {
+                if backfill_due {
                     last_compensate = Instant::now();
                     compensate(&store, &app, engine.as_ref(), &seen, &shutdown_cancel);
                 }
@@ -166,7 +183,7 @@ fn worker_loop(
         };
 
         if job.clip_id.is_empty() {
-            if last_compensate.elapsed() >= COMPENSATE_INTERVAL {
+            if backfill_due {
                 last_compensate = Instant::now();
                 compensate(&store, &app, engine.as_ref(), &seen, &shutdown_cancel);
             }
@@ -179,7 +196,7 @@ fn worker_loop(
             seen.remove(&job.clip_id);
         }
         completed = completed.saturating_add(1);
-        if completed >= COMPENSATE_EVERY && last_compensate.elapsed() >= COMPENSATE_INTERVAL {
+        if completed >= COMPENSATE_EVERY && backfill_due {
             completed = 0;
             last_compensate = Instant::now();
             compensate(&store, &app, engine.as_ref(), &seen, &shutdown_cancel);
@@ -364,14 +381,19 @@ fn emit_status(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    let _ = app.emit(
-        "ocr://status.v1",
-        serde_json::json!({
-            "clipId": clip_id,
-            "status": status,
-            "engine": engine,
-            "errorCode": error,
-            "updatedAt": now,
-        }),
+    // Routed through the shared emitter so the name and the versioned envelope stay in
+    // one place; a literal name here would silently drop when Tauri rejects it.
+    crate::events::emit(
+        app,
+        crate::events::OCR_STATUS_EVENT,
+        crate::events::OcrStatusChanged {
+            clip_id: clip_id.to_string(),
+            status: status.to_string(),
+            engine: engine.to_string(),
+            error_code: error.map(str::to_string),
+            updated_at: now,
+        },
     );
 }
+
+

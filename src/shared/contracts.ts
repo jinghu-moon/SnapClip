@@ -1,4 +1,18 @@
-export const IPC_SCHEMA_VERSION = 2 as const;
+/**
+ * Contract types mirrored from the Rust DTOs.
+ *
+ * Anything that crosses the IPC boundary is declared here, so a mismatch shows up
+ * as a TypeScript error in the feature that consumes it.
+ */
+
+export type CaptureState =
+  | "idle"
+  | "armed"
+  | "selecting"
+  | "selected"
+  | "finishing";
+
+export type PublicationOrigin = "clipboard" | "capture";
 
 export type PayloadKind =
   | "text"
@@ -23,6 +37,15 @@ export type OcrErrorCode =
   | "cancelled"
   | "engine_failed";
 
+export type ErrorCode =
+  | "invalid_argument"
+  | "not_found"
+  | "conflict"
+  | "unsupported"
+  | "cancelled"
+  | "storage"
+  | "internal";
+
 export interface ImageDimensions {
   width: number;
   height: number;
@@ -37,8 +60,10 @@ export interface PayloadRef {
   imageDimensions: ImageDimensions | null;
 }
 
-export interface ClipboardPublication {
+/** One observation of user content: a clipboard snapshot or a finished capture. */
+export interface Publication {
   publicationId: string;
+  origin: PublicationOrigin;
   capturedAtUnixMs: number;
   sourceApp: string | null;
   sourceExePath: string | null;
@@ -48,6 +73,7 @@ export interface ClipboardPublication {
 export interface ClipSummary {
   id: string;
   createdAtUnixMs: number;
+  origin: PublicationOrigin;
   primaryKind: PayloadKind;
   previewText: string | null;
   sourceApp: string | null;
@@ -67,17 +93,77 @@ export interface HistoryPage {
   nextCursor: string | null;
 }
 
-export type ErrorCode =
-  | "invalid_argument"
-  | "not_found"
-  | "conflict"
-  | "unsupported"
-  | "cancelled"
-  | "storage"
-  | "internal";
+export interface OcrStatusView {
+  status: OcrStatus;
+  engine: string | null;
+  updatedAt: number | null;
+  errorCode: OcrErrorCode | null;
+}
 
 export interface IpcError {
   code: ErrorCode;
   message: string | null;
   traceId: string | null;
 }
+
+// ---- event payloads -------------------------------------------------------
+
+export interface CaptureStartedEvent {
+  sessionId: string;
+  monitorLeft: number;
+  monitorTop: number;
+  monitorWidth: number;
+  monitorHeight: number;
+  dpi: number;
+  provider: string;
+}
+
+export interface CaptureStateChangedEvent {
+  sessionId: string;
+  state: CaptureState;
+  dpi: number | null;
+}
+
+export interface CaptureCompletedEvent {
+  sessionId: string;
+  /** Restricted reference: a file inside the application artifact directory. */
+  artifactRef: string;
+  width: number;
+  height: number;
+}
+
+export interface CaptureCancelledEvent {
+  sessionId: string;
+  reason: string;
+}
+
+export interface CaptureFailedEvent {
+  sessionId: string | null;
+  errorCode: string;
+  provider: string;
+  message: string;
+}
+
+export interface ClipboardUpdatedEvent {
+  publicationId: string;
+  origin: PublicationOrigin;
+  payloadKinds: PayloadKind[];
+}
+
+/**
+ * Event names, versioned so the contract can evolve without ambiguity.
+ *
+ * Only `[a-z0-9-]` may appear here. Tauri validates event names against a narrow
+ * whitelist and a rejected name silently drops the event, so no `.` or `scheme://`
+ * prefix. These strings must match `src-tauri/src/events/mod.rs` exactly.
+ */
+export const CAPTURE_EVENTS = {
+  started: "capture-started-v1",
+  state: "capture-state-v1",
+  completed: "capture-completed-v1",
+  cancelled: "capture-cancelled-v1",
+  failed: "capture-failed-v1",
+} as const;
+
+export const CLIPBOARD_UPDATED_EVENT = "clipboard-updated-v1";
+export const OCR_STATUS_EVENT = "ocr-status-v1";

@@ -28,11 +28,10 @@ impl AppIconState {
 }
 
 /// Returns a `data:image/png;base64,...` URL for the given executable.
-#[tauri::command]
-pub fn get_app_icon(
-    state: tauri::State<'_, AppIconState>,
-    exe_path: String,
-) -> Result<String, IpcError> {
+///
+/// Plain function, not a Tauri command: the command wrapper lives in
+/// `commands::clipboard` so all IPC adapters stay in one layer.
+pub fn get_app_icon(state: &AppIconState, exe_path: String) -> Result<String, IpcError> {
     let exe_path = exe_path.trim();
     if exe_path.is_empty() {
         return Err(IpcError {

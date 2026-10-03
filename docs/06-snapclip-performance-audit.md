@@ -100,6 +100,40 @@ src/components/HistoryItem.vue 当前有两个明显问题：
 - 完整图只加载当前选中项；
 - 图标缓存改成有上限的 LRU，当前 src-tauri/src/icon.rs 的 `HashMap` 无上限。
 
+**Tauri 前后端通信热点**
+
+当前 IPC 的主要浪费不是 `invoke` 本身，而是把大数据和“整页刷新”放进了 IPC：
+
+1. `clipboard://updated.v1` 当前只发送空 payload，前端收到后调用 `history.refresh()`，清空列表并重新查询整页。
+2. `ocr://status.v1` 虽然已经带 `clipId`，前端仍然整页刷新，重复传输未变化的历史记录。
+3. `image_payload_data_url` 将完整图片读入 Rust、BLAKE3 校验、Base64 编码，再经过 JSON/IPC、WebView 字符串和图片解码器，多处同时持有同一份数据。
+4. 搜索请求使用版本号丢弃旧结果，但旧的 Rust/SQLite 查询仍会继续执行；快速输入时会造成无效 CPU 和数据库占用。
+
+建议将通信拆成“控制面”和“数据面”：
+
+| 通道 | 只传什么 | 规则 |
+| --- | --- | --- |
+| Tauri `invoke` | 查询条件、content hash、设置、开始/停止命令 | typed struct；限制字符串长度和分页上限；不传 `Vec<u8>`、Base64 或视频帧 |
+| Tauri event/`Channel<T>` | 增量状态、进度、错误 | 事件带 `schemaVersion`、`sequence`/`generation` 和领域 ID；合并同类事件，不能每个鼠标移动或每帧发送；多窗口时使用定向 `emit_to` |
+| 受限 asset/custom protocol | 缩略图和用户明确打开的完整图片 | 只接受 content hash，后端验证数据库映射和 MIME；浏览器直接流式读取文件，禁止开放任意本地路径 |
+| Agent/子进程命名管道 | OCR/截图/录屏控制和小型结果 | 长度前缀 + 协议版本 + 请求 ID；图片通过内容寻址文件传递，录屏不传帧 |
+
+事件模型应从“刷新通知”改为“增量通知”，例如：
+
+```text
+clipboard.updated { schemaVersion, sequence, clipId, createdAt }
+ocr.updated       { schemaVersion, generation, clipId, status, errorCode }
+history.removed   { schemaVersion, clipId }
+```
+
+前端 store 按 `clipId` 插入/更新/删除，只有事件指向当前查询之外的记录时才标记 dirty；用户主动刷新或查询条件变化时才重新分页。事件入口使用 50–100 ms 合并窗口和有界队列，队列满时保留每个 `clipId` 的最新状态。
+
+事件不是可靠消息队列。窗口隐藏、WebView 挂起或进程重启后，前端应使用 `lastSequence` 调用一次轻量 `history_delta`/`history_snapshot` 对账，而不是让后端无限缓存事件；后端只保留有限序号和最新状态。关闭窗口时立即取消监听，重新打开时先取快照再订阅增量。
+
+搜索和详情读取需要真正的取消/背压：新查询生成 `generation`，后端查询 worker 在执行阶段检查取消标记；同一查询最多一个 in-flight 请求，过期结果在 Rust 侧也不再序列化返回。对于录屏状态，UI 只接收 5–10 Hz 的统计摘要（实际 FPS、丢帧数、队列深度），不接收视频帧。
+
+不要为了“更快”直接引入 MessagePack 或共享内存。小型控制消息使用 Tauri JSON 已足够；只有 profiling 证明序列化占据明显 CPU，且协议边界稳定后，才评估二进制协议。共享内存/D3D11 shared handle 仅用于明确的 GPU 管线需求，不能作为普通历史图片 IPC 的默认方案。
+
 **SQLite 和文件存储**
 
 当前已经使用 WAL 和 `synchronous=NORMAL`，方向是正确的。SQLite 官方说明 WAL 能让读写并行，但 WAL 文件过大时读性能会下降，应定期 checkpoint：

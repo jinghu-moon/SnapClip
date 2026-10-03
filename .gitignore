@@ -45,6 +45,9 @@ OCR-test-image/
 .comparison-old/
 comparison-*/
 
+# Local build / model-download artifacts at the repository root
+/target/
+
 # rapid-ocr-rs is a separate repository with its own remote; src-tauri depends on
 # it by path, so clone it alongside this repository (or convert it to a submodule).
 crates/

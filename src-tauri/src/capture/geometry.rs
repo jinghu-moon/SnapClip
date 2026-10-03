@@ -1,0 +1,1036 @@
+//! Pure selection geometry: normalisation, handle hit testing, resize/move math,
+//! size-label placement and magnifier placement.
+//!
+//! Everything in this module works in **physical pixels of one monitor's client
+//! area**. The overlay window is borderless and exactly as large as the monitor, so
+//! screen coordinates, client coordinates and back-buffer coordinates differ only by
+//! the monitor origin. Keeping the maths here means DPI, multi-monitor and handle
+//! behaviour can be unit tested without a window station.
+
+use super::CaptureError;
+
+/// Point in physical pixels. `x`/`y` may be negative for monitors left of or above
+/// the primary display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Point {
+    pub x: i32,
+    pub y: i32,
+}
+
+impl Point {
+    pub const fn new(x: i32, y: i32) -> Self {
+        Self { x, y }
+    }
+}
+
+/// Axis-aligned rectangle in physical pixels.
+///
+/// `right`/`bottom` are exclusive. Construction through [`Rect::from_corners`]
+/// always normalises so callers never have to reason about drag direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Rect {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
+impl Rect {
+    pub const fn new(left: i32, top: i32, right: i32, bottom: i32) -> Self {
+        Self {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    /// Normalised rectangle spanning two arbitrary corners.
+    pub fn from_corners(a: Point, b: Point) -> Self {
+        Self {
+            left: a.x.min(b.x),
+            top: a.y.min(b.y),
+            right: a.x.max(b.x),
+            bottom: a.y.max(b.y),
+        }
+    }
+
+    pub fn from_origin_size(origin: Point, width: i32, height: i32) -> Self {
+        Self {
+            left: origin.x,
+            top: origin.y,
+            right: origin.x + width,
+            bottom: origin.y + height,
+        }
+    }
+
+    pub fn width(&self) -> i32 {
+        self.right.saturating_sub(self.left)
+    }
+
+    pub fn height(&self) -> i32 {
+        self.bottom.saturating_sub(self.top)
+    }
+
+    /// A selection is usable only when it covers at least one pixel in both axes.
+    pub fn is_empty(&self) -> bool {
+        self.width() <= 0 || self.height() <= 0
+    }
+
+    pub fn area(&self) -> i64 {
+        i64::from(self.width()) * i64::from(self.height())
+    }
+
+    pub fn center(&self) -> Point {
+        Point::new(
+            self.left + self.width() / 2,
+            self.top + self.height() / 2,
+        )
+    }
+
+    pub fn contains(&self, point: Point) -> bool {
+        point.x >= self.left
+            && point.x < self.right
+            && point.y >= self.top
+            && point.y < self.bottom
+    }
+
+    pub fn inflate(&self, amount: i32) -> Self {
+        Self {
+            left: self.left - amount,
+            top: self.top - amount,
+            right: self.right + amount,
+            bottom: self.bottom + amount,
+        }
+    }
+
+    pub fn translate(&self, delta: Point) -> Self {
+        Self {
+            left: self.left + delta.x,
+            top: self.top + delta.y,
+            right: self.right + delta.x,
+            bottom: self.bottom + delta.y,
+        }
+    }
+
+    /// Move the rectangle so it fits inside `bounds` without changing its size.
+    ///
+    /// When the rectangle is wider or taller than `bounds` it is pinned to the bounds
+    /// on that axis rather than left off-screen: dragging a large selection far past an
+    /// edge must keep it visible.
+    pub fn clamped_into(&self, bounds: Rect) -> Self {
+        let mut result = *self;
+        if result.width() <= bounds.width() {
+            if result.left < bounds.left {
+                result.right += bounds.left - result.left;
+                result.left = bounds.left;
+            }
+            if result.right > bounds.right {
+                result.left -= result.right - bounds.right;
+                result.right = bounds.right;
+            }
+        } else if result.right <= bounds.left {
+            let width = result.width();
+            result.left = bounds.left;
+            result.right = bounds.left + width;
+        } else if result.left >= bounds.right {
+            let width = result.width();
+            result.right = bounds.right;
+            result.left = bounds.right - width;
+        }
+        if result.height() <= bounds.height() {
+            if result.top < bounds.top {
+                result.bottom += bounds.top - result.top;
+                result.top = bounds.top;
+            }
+            if result.bottom > bounds.bottom {
+                result.top -= result.bottom - bounds.bottom;
+                result.bottom = bounds.bottom;
+            }
+        } else if result.bottom <= bounds.top {
+            let height = result.height();
+            result.top = bounds.top;
+            result.bottom = bounds.top + height;
+        } else if result.top >= bounds.bottom {
+            let height = result.height();
+            result.bottom = bounds.bottom;
+            result.top = bounds.bottom - height;
+        }
+        // Final guarantee: an oversized rectangle is pinned to the bounds so its origin
+        // stays on screen even when it cannot fit.
+        result.left = result.left.clamp(bounds.left, (bounds.right - result.width()).max(bounds.left));
+        result.top = result.top.clamp(bounds.top, (bounds.bottom - result.height()).max(bounds.top));
+        result.right = result.left + result.width();
+        result.bottom = result.top + result.height();
+        result
+    }
+
+    pub fn intersect(&self, other: Rect) -> Self {
+        Self {
+            left: self.left.max(other.left),
+            top: self.top.max(other.top),
+            right: self.right.min(other.right),
+            bottom: self.bottom.min(other.bottom),
+        }
+    }
+
+    pub fn union(&self, other: Rect) -> Self {
+        Self {
+            left: self.left.min(other.left),
+            top: self.top.min(other.top),
+            right: self.right.max(other.right),
+            bottom: self.bottom.max(other.bottom),
+        }
+    }
+
+    /// Four rectangles covering everything inside `self` but outside `hole`.
+    /// Used by the L1 mask so the selected pixels keep the raw back-buffer
+    /// brightness instead of being re-drawn.
+    pub fn surround(&self, hole: Rect) -> [Rect; 4] {
+        let hole = hole.intersect(*self);
+        if hole.is_empty() {
+            return [*self, Rect::default(), Rect::default(), Rect::default()];
+        }
+        [
+            Rect::new(self.left, self.top, self.right, hole.top),
+            Rect::new(self.left, hole.bottom, self.right, self.bottom),
+            Rect::new(self.left, hole.top, hole.left, hole.bottom),
+            Rect::new(hole.right, hole.top, self.right, hole.bottom),
+        ]
+    }
+}
+
+/// One monitor's physical geometry and DPI.
+///
+/// The display device name is deliberately not carried here: it is only needed for
+/// diagnostics, and reading it requires `MONITORINFOEXW` by value, which the
+/// `windows-sys` bindings do not expose directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MonitorLayout {
+    /// Monitor rectangle in virtual-desktop physical pixels.
+    pub bounds: Rect,
+    /// Work area in virtual-desktop physical pixels (taskbar excluded).
+    pub work_area: Rect,
+    /// Effective DPI as reported by `GetDpiForMonitor` (96 = 100%).
+    pub dpi: u32,
+    pub primary: bool,
+}
+
+impl MonitorLayout {
+    /// Scale factor from DIP to physical pixels.
+    pub fn scale(&self) -> f32 {
+        self.dpi as f32 / 96.0
+    }
+
+    /// Convert a virtual-desktop physical point into monitor-local physical pixels.
+    pub fn to_local(&self, screen: Point) -> Point {
+        Point::new(screen.x - self.bounds.left, screen.y - self.bounds.top)
+    }
+
+    /// Convert monitor-local physical pixels back into virtual-desktop coordinates.
+    pub fn to_screen(&self, local: Point) -> Point {
+        Point::new(local.x + self.bounds.left, local.y + self.bounds.top)
+    }
+
+    pub fn local_bounds(&self) -> Rect {
+        Rect::from_origin_size(Point::new(0, 0), self.bounds.width(), self.bounds.height())
+    }
+
+    pub fn local_work_area(&self) -> Rect {
+        Rect::new(
+            self.work_area.left - self.bounds.left,
+            self.work_area.top - self.bounds.top,
+            self.work_area.right - self.bounds.left,
+            self.work_area.bottom - self.bounds.top,
+        )
+    }
+}
+
+/// The eight resize grips, numbered clockwise from the top-left corner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Handle {
+    TopLeft,
+    Top,
+    TopRight,
+    Right,
+    BottomRight,
+    Bottom,
+    BottomLeft,
+    Left,
+}
+
+impl Handle {
+    pub const ALL: [Handle; 8] = [
+        Handle::TopLeft,
+        Handle::Top,
+        Handle::TopRight,
+        Handle::Right,
+        Handle::BottomRight,
+        Handle::Bottom,
+        Handle::BottomLeft,
+        Handle::Left,
+    ];
+
+    /// Anchor point of the grip in monitor-local physical pixels.
+    pub fn anchor(self, rect: Rect) -> Point {
+        let mid_x = rect.left + rect.width() / 2;
+        let mid_y = rect.top + rect.height() / 2;
+        match self {
+            Handle::TopLeft => Point::new(rect.left, rect.top),
+            Handle::Top => Point::new(mid_x, rect.top),
+            Handle::TopRight => Point::new(rect.right, rect.top),
+            Handle::Right => Point::new(rect.right, mid_y),
+            Handle::BottomRight => Point::new(rect.right, rect.bottom),
+            Handle::Bottom => Point::new(mid_x, rect.bottom),
+            Handle::BottomLeft => Point::new(rect.left, rect.bottom),
+            Handle::Left => Point::new(rect.left, mid_y),
+        }
+    }
+
+    /// Logical size of the grip in DIP. Visual size and hit size are independent;
+    /// callers scale the hit size with DPI.
+    pub fn visual_size(self) -> f32 {
+        match self {
+            Handle::Top
+            | Handle::Right
+            | Handle::Bottom
+            | Handle::Left => 10.0,
+            Handle::TopLeft | Handle::TopRight | Handle::BottomRight | Handle::BottomLeft => 12.0,
+        }
+    }
+}
+
+/// The four corner grips, checked before the edge grips.
+pub const CORNER_HANDLES: [Handle; 4] = [
+    Handle::TopLeft,
+    Handle::TopRight,
+    Handle::BottomRight,
+    Handle::BottomLeft,
+];
+
+/// The four edge grips.
+pub const EDGE_HANDLES: [Handle; 4] =
+    [Handle::Top, Handle::Right, Handle::Bottom, Handle::Left];
+
+/// Which edges of the selection the pointer is close to; used for the resize cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Edge {
+    pub left: bool,
+    pub right: bool,
+    pub top: bool,
+    pub bottom: bool,
+}
+
+impl Edge {
+    pub fn any(self) -> bool {
+        self.left || self.right || self.top || self.bottom
+    }
+
+    /// Handle corresponding to an active edge pair, if exactly one is defined.
+    pub fn handle(self) -> Option<Handle> {
+        match (self.left, self.right, self.top, self.bottom) {
+            (true, false, true, false) => Some(Handle::TopLeft),
+            (false, false, true, false) => Some(Handle::Top),
+            (false, true, true, false) => Some(Handle::TopRight),
+            (false, true, false, false) => Some(Handle::Right),
+            (false, true, false, true) => Some(Handle::BottomRight),
+            (false, false, false, true) => Some(Handle::Bottom),
+            (true, false, false, true) => Some(Handle::BottomLeft),
+            (true, false, false, false) => Some(Handle::Left),
+            _ => None,
+        }
+    }
+}
+
+/// How a drag mutates an existing selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizeMode {
+    /// Dragging inside the selection translates it.
+    Move,
+    /// Dragging a grip changes one or two edges.
+    Handle(Handle),
+}
+
+/// Result of hit testing the pointer against the current selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionGeometry {
+    /// Nothing selected yet: the drag creates a new selection.
+    Create,
+    Move,
+    Resize(Handle),
+    /// The selection exists but the pointer is outside it.
+    Outside,
+}
+
+/// One immutable view of the selection used by rendering and hit testing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectionSnapshot {
+    pub rect: Rect,
+    /// Corner radius in physical pixels.
+    pub corner_radius: i32,
+    /// Hit tolerance in physical pixels (already DPI scaled).
+    pub hit_slop: i32,
+}
+
+impl SelectionSnapshot {
+    pub fn new(rect: Rect, dpi: u32) -> Self {
+        let scale = dpi.max(96) as f32 / 96.0;
+        Self {
+            rect,
+            corner_radius: (8.0 * scale).round() as i32,
+            hit_slop: (6.0 * scale).round() as i32,
+        }
+    }
+
+    pub fn visual_handle_size(&self, handle: Handle, dpi: u32) -> f32 {
+        let scale = dpi.max(96) as f32 / 96.0;
+        handle.visual_size() * scale
+    }
+
+    /// Keep the effective grip size usable on high DPI displays.
+    pub fn hit_handle_size(&self, handle: Handle, dpi: u32) -> i32 {
+        (self.visual_handle_size(handle, dpi) + self.hit_slop as f32).round() as i32
+    }
+
+    /// Hit test a monitor-local point.
+    ///
+    /// Priority is deliberate:
+    /// 1. an empty selection starts a new one;
+    /// 2. the four corner grips win over everything, because a small selection can sit
+    ///    entirely inside a corner's hit area;
+    /// 3. the border itself is grabbable along the edges;
+    /// 4. the interior moves the selection.
+    pub fn hit_test(&self, point: Point, dpi: u32) -> SelectionGeometry {
+        if self.rect.is_empty() {
+            return SelectionGeometry::Create;
+        }
+        for handle in CORNER_HANDLES {
+            let anchor = handle.anchor(self.rect);
+            let size = self.hit_handle_size(handle, dpi);
+            if (point.x - anchor.x).abs() <= size && (point.y - anchor.y).abs() <= size {
+                return SelectionGeometry::Resize(handle);
+            }
+        }
+        let edges = self.edges_at(point);
+        if edges.any() {
+            return SelectionGeometry::Resize(
+                edges.handle().unwrap_or(Handle::BottomRight),
+            );
+        }
+        for handle in EDGE_HANDLES {
+            let anchor = handle.anchor(self.rect);
+            let size = self.hit_handle_size(handle, dpi);
+            if (point.x - anchor.x).abs() <= size && (point.y - anchor.y).abs() <= size {
+                return SelectionGeometry::Resize(handle);
+            }
+        }
+        if self.rect.contains(point) {
+            return SelectionGeometry::Move;
+        }
+        SelectionGeometry::Outside
+    }
+
+    /// Which selection edges the pointer is within `hit_slop` of.
+    pub fn edges_at(&self, point: Point) -> Edge {
+        if self.rect.is_empty() {
+            return Edge::default();
+        }
+        let slop = self.hit_slop.max(1);
+        Edge {
+            left: (point.x - self.rect.left).abs() <= slop,
+            right: (point.x - self.rect.right).abs() <= slop,
+            top: (point.y - self.rect.top).abs() <= slop,
+            bottom: (point.y - self.rect.bottom).abs() <= slop,
+        }
+    }
+
+    /// Enforce minimum size while keeping the dragged edges pinned.
+    pub fn with_minimum_size(&self, rect: Rect, mode: ResizeMode, minimum: i32) -> Rect {
+        let minimum = minimum.max(1);
+        let mut result = rect;
+        match mode {
+            ResizeMode::Move => {}
+            ResizeMode::Handle(handle) => {
+                let grows_left = matches!(
+                    handle,
+                    Handle::TopLeft | Handle::BottomLeft | Handle::Left
+                );
+                let grows_top = matches!(handle, Handle::TopLeft | Handle::Top | Handle::TopRight);
+                if result.width() < minimum {
+                    if grows_left {
+                        result.left = result.right - minimum;
+                    } else {
+                        result.right = result.left + minimum;
+                    }
+                }
+                if result.height() < minimum {
+                    if grows_top {
+                        result.top = result.bottom - minimum;
+                    } else {
+                        result.bottom = result.top + minimum;
+                    }
+                }
+            }
+        }
+        result
+    }
+}
+
+/// Snapshot plus the pointer position where the current drag began.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectionDrag {
+    pub snapshot: SelectionSnapshot,
+    pub anchor: Point,
+}
+
+impl SelectionDrag {
+    /// Build a drag session from the selection and the pointer position that
+    /// started it.
+    pub fn new(rect: Rect, dpi: u32, anchor: Point) -> Self {
+        Self {
+            snapshot: SelectionSnapshot::new(rect, dpi),
+            anchor,
+        }
+    }
+
+    /// Apply a drag and clamp the result to the monitor.
+    ///
+    /// Resizing is edge based rather than delta based: the dragged edges follow the
+    /// pointer exactly, which keeps the geometry stable when the drag crosses over
+    /// the opposite edge or leaves the monitor.
+    ///
+    /// Moving translates and then re-fits, so the selection keeps its size even when
+    /// it is larger than the monitor.
+    pub fn apply(&self, mode: ResizeMode, pointer: Point, bounds: Rect) -> Rect {
+        let rect = self.snapshot.rect;
+        let candidate = match mode {
+            ResizeMode::Move => {
+                return rect
+                    .translate(Point::new(
+                        pointer.x - self.anchor.x,
+                        pointer.y - self.anchor.y,
+                    ))
+                    .clamped_into(bounds);
+            }
+            ResizeMode::Handle(handle) => {
+                let mut left = rect.left;
+                let mut top = rect.top;
+                let mut right = rect.right;
+                let mut bottom = rect.bottom;
+                match handle {
+                    Handle::TopLeft => {
+                        left = pointer.x;
+                        top = pointer.y;
+                    }
+                    Handle::Top => top = pointer.y,
+                    Handle::TopRight => {
+                        right = pointer.x;
+                        top = pointer.y;
+                    }
+                    Handle::Right => right = pointer.x,
+                    Handle::BottomRight => {
+                        right = pointer.x;
+                        bottom = pointer.y;
+                    }
+                    Handle::Bottom => bottom = pointer.y,
+                    Handle::BottomLeft => {
+                        left = pointer.x;
+                        bottom = pointer.y;
+                    }
+                    Handle::Left => left = pointer.x,
+                }
+                // Normalise: dragging an edge past the opposite edge flips the
+                // rectangle instead of producing a negative width.
+                Rect::from_corners(Point::new(left, top), Point::new(right, bottom))
+            }
+        };
+        let candidate = clamp_edges(candidate, bounds);
+        self.snapshot
+            .with_minimum_size(candidate, mode, self.snapshot.minimum_size())
+    }
+}
+
+impl SelectionSnapshot {
+    pub fn minimum_size(&self) -> i32 {
+        self.hit_slop.max(1) * 2
+    }
+}
+
+fn clamp_edges(rect: Rect, bounds: Rect) -> Rect {
+    Rect {
+        left: rect.left.clamp(bounds.left, bounds.right),
+        top: rect.top.clamp(bounds.top, bounds.bottom),
+        right: rect.right.clamp(bounds.left, bounds.right),
+        bottom: rect.bottom.clamp(bounds.top, bounds.bottom),
+    }
+}
+
+/// Where the magnifier panel is drawn, in monitor-local physical pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MagnifierGeometry {
+    /// Image area containing the magnified frame.
+    pub panel: Rect,
+    /// Dark metadata strip below the image area.
+    pub info_panel: Rect,
+    /// Union of image and metadata areas, used for damage tracking.
+    pub bounds: Rect,
+    /// Source rectangle sampled from the frozen back buffer.
+    pub source: Rect,
+    pub zoom: u32,
+    /// Whether the panel was flipped horizontally / vertically to stay visible.
+    pub flipped_x: bool,
+    pub flipped_y: bool,
+}
+
+/// Fixed magnifier configuration for the MVP. Values are physical pixels and are
+/// scaled by DPI at the call site so the panel stays the same physical size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MagnifierConfig {
+    pub zoom: u32,
+    pub source_size: i32,
+    pub gap: i32,
+}
+
+impl Default for MagnifierConfig {
+    fn default() -> Self {
+        Self {
+            zoom: 4,
+            source_size: 30,
+            gap: 24,
+        }
+    }
+}
+
+impl MagnifierConfig {
+    pub fn scaled(&self, dpi: u32) -> Self {
+        let scale = dpi.max(96) as f32 / 96.0;
+        Self {
+            zoom: self.zoom,
+            // Keep the sampled area in physical pixels proportional to the panel.
+            source_size: (self.source_size as f32 * scale).round() as i32,
+            gap: (self.gap as f32 * scale).round() as i32,
+        }
+    }
+
+    pub fn panel_size(&self) -> i32 {
+        let zoom = self.zoom.max(1) as i32;
+        self.source_size.max(1).saturating_mul(zoom).min(240)
+    }
+}
+
+/// Place the magnifier next to the cursor, flipping and clamping to stay on screen.
+///
+/// The panel never covers the cursor hotspot: a gap the size of the configured
+/// offset is kept between the hotspot and the nearest panel edge.
+pub fn magnifier_geometry(
+    cursor: Point,
+    config: MagnifierConfig,
+    frame: Rect,
+    work_area: Rect,
+) -> MagnifierGeometry {
+    let zoom = config.zoom.max(1);
+    let size = config.panel_size().max(1);
+    // Keep the sampled area smaller than the destination panel so DrawBitmap
+    // performs the configured magnification instead of a 1:1 copy.
+    let source_size = (size / zoom as i32).max(1).min(config.source_size.max(1));
+    let half = source_size / 2;
+
+    let info_height = (config.source_size.max(1) + 4).min(40);
+    let total_height = size + info_height;
+    let right_edge = cursor.x + config.gap + size;
+    let left_edge = cursor.x - config.gap - size;
+    let flipped_x = right_edge > work_area.right && left_edge >= work_area.left;
+    let mut left = if flipped_x {
+        cursor.x - config.gap - size
+    } else {
+        cursor.x + config.gap
+    };
+
+    let bottom_edge = cursor.y + config.gap + total_height;
+    let top_edge = cursor.y - config.gap - total_height;
+    let flipped_y = bottom_edge > work_area.bottom && top_edge >= work_area.top;
+    let mut top = if flipped_y {
+        cursor.y - config.gap - total_height
+    } else {
+        cursor.y + config.gap
+    };
+
+    left = left.clamp(work_area.left, (work_area.right - size).max(work_area.left));
+    top = top.clamp(work_area.top, (work_area.bottom - total_height).max(work_area.top));
+    let panel = Rect::from_origin_size(Point::new(left, top), size, size);
+    let info_panel = Rect::from_origin_size(Point::new(left, top + size), size, info_height);
+    let bounds = panel.union(info_panel);
+
+    // The cursor is centered in the sampled region, then the region is clamped to
+    // the captured frame so magnified pixels always come from the real back buffer.
+    let source_left = (cursor.x - half)
+        .clamp(frame.left, (frame.right - source_size).max(frame.left));
+    let source_top = (cursor.y - half)
+        .clamp(frame.top, (frame.bottom - source_size).max(frame.top));
+    let source = Rect::from_origin_size(
+        Point::new(source_left, source_top),
+        source_size,
+        source_size,
+    );
+
+    MagnifierGeometry {
+        panel,
+        info_panel,
+        bounds,
+        source,
+        zoom,
+        flipped_x,
+        flipped_y,
+    }
+}
+
+/// Placement of the `width × height` label relative to the selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SizeLabelPlacement {
+    pub rect: Rect,
+    /// True when the label had to be moved above the selection.
+    pub above: bool,
+}
+
+/// Place the size label at the selection's top-left edge, preferring above the
+/// selection and falling below it when the monitor top edge leaves no room.
+pub fn size_label_placement(
+    selection: Rect,
+    label_size: (i32, i32),
+    work_area: Rect,
+    gap: i32,
+) -> Option<SizeLabelPlacement> {
+    let (label_width, label_height) = (label_size.0.max(1), label_size.1.max(1));
+    let above_top = selection.top - gap - label_height;
+    let above_fits = above_top >= work_area.top;
+    let below_top = selection.bottom + gap;
+    let below_fits = below_top + label_height <= work_area.bottom;
+
+    // A label that fits neither below nor above the selection would have to overlap
+    // it, covering the very pixels the user is choosing. The label is preview-only, so
+    // it is dropped instead: the selection stays truthful.
+    if !below_fits && !above_fits {
+        return None;
+    }
+
+    let (mut top, above) = if above_fits {
+        (above_top, true)
+    } else {
+        (below_top, false)
+    };
+
+    let max_left = (work_area.right - label_width).max(work_area.left);
+    let left = selection.left.clamp(work_area.left, max_left);
+    let max_top = (work_area.bottom - label_height).max(work_area.top);
+    top = top.clamp(work_area.top, max_top);
+
+    Some(SizeLabelPlacement {
+        rect: Rect::from_origin_size(Point::new(left, top), label_width, label_height),
+        above,
+    })
+}
+
+/// Validate that a selection can produce an artifact.
+pub fn validate_selection(rect: Rect, frame: Rect) -> Result<Rect, CaptureError> {
+    let clipped = rect.intersect(frame);
+    if clipped.is_empty() {
+        return Err(CaptureError::InvalidState(
+            "selection does not overlap the captured monitor".into(),
+        ));
+    }
+    Ok(clipped)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn monitor() -> Rect {
+        Rect::new(0, 0, 1920, 1080)
+    }
+
+    #[test]
+    fn drag_in_any_direction_normalises_the_rectangle() {
+        let corners = [
+            (Point::new(100, 200), Point::new(400, 500)),
+            (Point::new(400, 500), Point::new(100, 200)),
+            (Point::new(400, 200), Point::new(100, 500)),
+            (Point::new(100, 500), Point::new(400, 200)),
+        ];
+        for (start, end) in corners {
+            let rect = Rect::from_corners(start, end);
+            assert_eq!(rect, Rect::new(100, 200, 400, 500), "{start:?} -> {end:?}");
+            assert!(rect.left <= rect.right && rect.top <= rect.bottom);
+        }
+    }
+
+    #[test]
+    fn selection_is_clipped_to_the_monitor() {
+        let selection = Rect::new(-50, -20, 2500, 1400);
+        let clipped = validate_selection(selection, monitor()).unwrap();
+        assert_eq!(clipped, monitor());
+
+        let outside = Rect::new(2000, 1200, 2200, 1300);
+        assert!(validate_selection(outside, monitor()).is_err());
+    }
+
+    #[test]
+    fn rectangles_surrounding_a_hole_cover_the_mask() {
+        let frame = Rect::new(0, 0, 100, 100);
+        let hole = Rect::new(20, 30, 60, 80);
+        let bands = frame.surround(hole);
+        let covered = bands.iter().map(Rect::area).sum::<i64>();
+        assert_eq!(covered, frame.area() - hole.area());
+        for band in bands {
+            assert_eq!(band.intersect(hole).area(), 0, "{band:?} overlaps the hole");
+        }
+    }
+
+    #[test]
+    fn surrounds_with_no_hole_returns_the_whole_frame() {
+        let frame = Rect::new(0, 0, 100, 100);
+        let bands = frame.surround(Rect::default());
+        assert_eq!(bands[0], frame);
+        assert_eq!(bands[1].area(), 0);
+    }
+
+    #[test]
+    fn handles_hit_test_at_their_anchor_points() {
+        let rect = Rect::new(100, 100, 300, 200);
+        let snapshot = SelectionSnapshot::new(rect, 96);
+        for handle in Handle::ALL {
+            let anchor = handle.anchor(rect);
+            assert_eq!(
+                snapshot.hit_test(anchor, 96),
+                SelectionGeometry::Resize(handle),
+                "{handle:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dpi_scales_the_handle_hit_area() {
+        let rect = Rect::new(100, 100, 900, 700);
+        let point = Point::new(100 + 20, 100 + 20);
+        let at_100 = SelectionSnapshot::new(rect, 96).hit_test(point, 96);
+        let at_200 = SelectionSnapshot::new(rect, 192).hit_test(point, 192);
+        // The visual grip is the same physical size, but the hit area grows with DPI.
+        assert_eq!(at_100, SelectionGeometry::Move);
+        assert_eq!(at_200, SelectionGeometry::Resize(Handle::TopLeft));
+    }
+
+    #[test]
+    fn interior_hit_tests_as_move_and_exterior_as_outside() {
+        let rect = Rect::new(100, 100, 300, 200);
+        let snapshot = SelectionSnapshot::new(rect, 96);
+        assert_eq!(
+            snapshot.hit_test(Point::new(200, 150), 96),
+            SelectionGeometry::Move
+        );
+        assert_eq!(
+            snapshot.hit_test(Point::new(800, 800), 96),
+            SelectionGeometry::Outside
+        );
+    }
+
+    #[test]
+    fn empty_snapshot_creates_a_new_selection() {
+        let snapshot = SelectionSnapshot::new(Rect::default(), 96);
+        assert_eq!(
+            snapshot.hit_test(Point::new(10, 10), 96),
+            SelectionGeometry::Create
+        );
+    }
+
+    #[test]
+    fn resize_follows_the_pointer_and_clamps_into_the_monitor() {
+        let rect = Rect::new(100, 100, 300, 200);
+        let drag = SelectionDrag::new(rect, 96, Point::new(300, 200));
+        let resized = drag.apply(ResizeMode::Handle(Handle::BottomRight), Point::new(500, 400), monitor());
+        assert_eq!(resized, Rect::new(100, 100, 500, 400));
+
+        let clamped = drag.apply(
+            ResizeMode::Handle(Handle::BottomRight),
+            Point::new(5000, 5000),
+            monitor(),
+        );
+        assert_eq!(clamped, Rect::new(100, 100, 1920, 1080));
+    }
+
+    #[test]
+    fn resize_can_cross_over_the_opposite_edge() {
+        let rect = Rect::new(100, 100, 300, 200);
+        let drag = SelectionDrag::new(rect, 96, Point::new(300, 200));
+        // Drag the right edge to the left of the left edge: the rectangle must
+        // normalise instead of inverting.
+        let resized = drag.apply(ResizeMode::Handle(Handle::Right), Point::new(50, 200), monitor());
+        assert_eq!(resized, Rect::new(50, 100, 100, 200));
+    }
+
+    #[test]
+    fn minimum_size_is_enforced_while_resizing() {
+        let rect = Rect::new(100, 100, 300, 200);
+        let drag = SelectionDrag::new(rect, 96, Point::new(300, 200));
+        let tiny = drag.apply(
+            ResizeMode::Handle(Handle::BottomRight),
+            Point::new(102, 102),
+            monitor(),
+        );
+        assert!(tiny.width() >= drag.snapshot.minimum_size());
+        assert!(tiny.height() >= drag.snapshot.minimum_size());
+        assert_eq!(tiny.left, 100);
+        assert_eq!(tiny.top, 100);
+    }
+
+    #[test]
+    fn move_keeps_the_size_and_stays_inside_the_monitor() {
+        let rect = Rect::new(100, 100, 300, 200);
+        let drag = SelectionDrag::new(rect, 96, Point::new(200, 150));
+        let moved = drag.apply(ResizeMode::Move, Point::new(250, 200), monitor());
+        assert_eq!(moved, Rect::new(150, 150, 350, 250));
+
+        let pinned = drag.apply(ResizeMode::Move, Point::new(-500, -500), monitor());
+        assert_eq!(pinned, Rect::new(0, 0, 200, 100));
+
+        let pinned = drag.apply(ResizeMode::Move, Point::new(5000, 5000), monitor());
+        assert_eq!(pinned, Rect::new(1720, 980, 1920, 1080));
+    }
+
+    #[test]
+    fn local_coordinates_follow_the_monitor_origin() {
+        let monitor_layout = MonitorLayout {
+            bounds: Rect::new(-1920, 200, 0, 1280),
+            work_area: Rect::new(-1920, 200, 0, 1240),
+            dpi: 144,
+            primary: false,
+        };
+        assert_eq!(monitor_layout.to_local(Point::new(-1920, 200)), Point::new(0, 0));
+        assert_eq!(monitor_layout.to_screen(Point::new(0, 0)), Point::new(-1920, 200));
+        assert_eq!(monitor_layout.local_bounds(), Rect::new(0, 0, 1920, 1080));
+        assert_eq!(monitor_layout.local_work_area(), Rect::new(0, 0, 1920, 1040));
+        assert!((monitor_layout.scale() - 1.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn size_label_prefers_above_and_aligns_to_left_edge() {
+        let work_area = Rect::new(0, 0, 1000, 800);
+        let selection = Rect::new(400, 400, 600, 500);
+        let above = size_label_placement(selection, (120, 28), work_area, 8).unwrap();
+        assert!(above.above);
+        assert_eq!(above.rect.top, 364);
+        assert_eq!(above.rect.left, 400);
+
+        // Nothing fits above at the monitor's top edge: place it below.
+        let top_selection = Rect::new(400, 5, 600, 50);
+        let below = size_label_placement(top_selection, (120, 28), work_area, 8).unwrap();
+        assert!(!below.above);
+        assert_eq!(below.rect.top, 58);
+        assert_eq!(below.rect.left, 400);
+    }
+
+    #[test]
+    fn size_label_is_dropped_when_it_would_cover_the_selection() {
+        let work_area = Rect::new(0, 0, 1000, 800);
+        // A selection taller than the work area leaves no room on either side.
+        let tall_selection = Rect::new(400, 0, 600, 800);
+        assert_eq!(
+            size_label_placement(tall_selection, (120, 28), work_area, 8),
+            None
+        );
+
+        // A selection that fills the whole work area likewise has no room.
+        assert_eq!(
+            size_label_placement(work_area, (120, 28), work_area, 8),
+            None
+        );
+    }
+
+    #[test]
+    fn size_label_stays_inside_horizontal_work_area_bounds() {
+        let work_area = Rect::new(0, 0, 1000, 800);
+        let selection = Rect::new(0, 100, 40, 200);
+        let placement = size_label_placement(selection, (200, 28), work_area, 8).unwrap();
+        assert!(placement.rect.left >= work_area.left);
+        assert!(placement.rect.right <= work_area.right);
+    }
+
+    #[test]
+    fn magnifier_flips_on_every_screen_edge_and_stays_visible() {
+        let frame = Rect::new(0, 0, 1920, 1080);
+        let work_area = frame;
+        let config = MagnifierConfig::default().scaled(96);
+        let size = config.panel_size();
+
+        // Centre: no flip.
+        let centre = magnifier_geometry(Point::new(960, 540), config, frame, work_area);
+        assert!(!centre.flipped_x && !centre.flipped_y);
+        assert!(centre.panel.right <= work_area.right);
+        assert!(centre.panel.bottom <= work_area.bottom);
+
+        // Right edge: flip horizontally.
+        let right = magnifier_geometry(Point::new(1910, 540), config, frame, work_area);
+        assert!(right.flipped_x);
+        assert!(right.panel.left >= work_area.left);
+        assert!(right.panel.right <= work_area.right);
+
+        // Bottom edge: flip vertically.
+        let bottom = magnifier_geometry(Point::new(960, 1070), config, frame, work_area);
+        assert!(bottom.flipped_y);
+        assert!(bottom.panel.top >= work_area.top);
+        assert!(bottom.panel.bottom <= work_area.bottom);
+
+        // Bottom-right corner: both.
+        let corner = magnifier_geometry(Point::new(1918, 1078), config, frame, work_area);
+        assert!(corner.flipped_x && corner.flipped_y);
+
+        // Top-left corner: no room to the left or above, so no flip is possible and
+        // the panel must be clamped instead.
+        let origin = magnifier_geometry(Point::new(0, 0), config, frame, work_area);
+        assert!(origin.panel.left >= work_area.left);
+        assert!(origin.panel.top >= work_area.top);
+        assert_eq!(origin.panel.width(), size);
+
+        for geometry in [centre, right, bottom, corner, origin] {
+            assert!(geometry.panel.left >= work_area.left);
+            assert!(geometry.panel.top >= work_area.top);
+            assert!(geometry.panel.right <= work_area.right);
+            assert!(geometry.panel.bottom <= work_area.bottom);
+            assert!(geometry.info_panel.left >= work_area.left);
+            assert!(geometry.info_panel.top >= work_area.top);
+            assert!(geometry.info_panel.right <= work_area.right);
+            assert!(geometry.info_panel.bottom <= work_area.bottom);
+            assert!(geometry.source.left >= frame.left);
+            assert!(geometry.source.top >= frame.top);
+            assert!(geometry.source.right <= frame.right);
+            assert!(geometry.source.bottom <= frame.bottom);
+        }
+    }
+
+    #[test]
+    fn magnifier_source_keeps_the_cursor_centred_away_from_edges() {
+        let frame = Rect::new(0, 0, 1920, 1080);
+        let config = MagnifierConfig::default().scaled(96);
+        let geometry = magnifier_geometry(Point::new(960, 540), config, frame, frame);
+        assert_eq!(geometry.source.center(), Point::new(960, 540));
+        assert_eq!(geometry.source.width(), config.source_size);
+        assert_eq!(geometry.source.height(), config.source_size);
+        assert_eq!(geometry.panel.width(), config.panel_size());
+        assert_eq!(geometry.panel.width(), geometry.source.width() * geometry.zoom as i32);
+        assert_eq!(geometry.zoom, 4);
+    }
+
+    #[test]
+    fn edges_report_the_matching_handle() {
+        let rect = Rect::new(100, 100, 300, 200);
+        let snapshot = SelectionSnapshot::new(rect, 96);
+        assert_eq!(
+            snapshot.edges_at(Point::new(100, 100)).handle(),
+            Some(Handle::TopLeft)
+        );
+        assert_eq!(
+            snapshot.edges_at(Point::new(300, 150)).handle(),
+            Some(Handle::Right)
+        );
+        assert_eq!(snapshot.edges_at(Point::new(150, 150)).handle(), None);
+    }
+}

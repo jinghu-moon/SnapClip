@@ -1,6 +1,5 @@
-import { createApp } from "vue";
-import { createPinia } from "pinia";
-import App from "./App.vue";
-import "./styles.css";
+import { bootstrap } from "./app/bootstrap";
 
-createApp(App).use(createPinia()).mount("#app");
+performance.mark("snapclip-main-loaded");
+console.info("[snapclip][frontend] main module loaded");
+bootstrap();

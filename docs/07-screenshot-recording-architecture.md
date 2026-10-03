@@ -87,6 +87,27 @@ native overlay -> coalesced state event -> Vue toolbar
 
 不建议做一个覆盖整个桌面的 WebView 截图框：透明 WebView 的合成、DPI 换算、焦点和 4K 图像传输都会增加延迟和内存，而且无法自然复用 D2D/DirectComposition 的 GPU 纹理。
 
+### 2.3 原生覆盖层如何保持视觉质量
+
+原生窗口不等于使用老式 GDI 控件。外观应由 Direct2D/DirectWrite 和 DirectComposition 负责，工具栏再使用 Tauri/Vue 的 Fluent 风格组件：
+
+```text
+L0  D3D11 截图纹理
+L1  一个全屏半透明暗色遮罩（选区区域挖空或直接显示原图）
+L2  选区边框、四角手柄、尺寸标签、放大镜（D2D 脏矩形）
+L3  Tauri 工具栏/属性面板（小窗口，不参与像素合成）
+```
+
+- 选区外使用一次 GPU 半透明填充，不逐像素修改原图；选区边框使用 1–2 个物理像素的高对比强调色，并提供明暗主题和 Windows 高对比度回退。
+- 手柄、边框、尺寸标签按 DPI 缩放，手柄命中区域大于视觉区域；拖拽时给旧矩形与新矩形的并集加边距做失效，避免残影和闪烁。
+- 线、圆角矩形、箭头和文字使用 Direct2D/DirectWrite 抗锯齿；阴影使用 DirectComposition/DWM 的轻量效果，不在全屏覆盖层使用 `backdrop-filter` 或逐帧模糊。
+- 工具栏采用固定的 8px 间距基线、8px 左右圆角、32–36px 控件高度和 Segoe UI/Segoe Fluent Icons；按钮只显示熟悉图标，悬停时提供 tooltip，颜色/线宽使用真正的色板和步进控件。
+- 工具栏位置根据选区自动选择下方或上方，并限制在当前显示器工作区；移动/淡入动画控制在约 120–180ms，录制和拖拽期间不做持续动画。
+- 主题颜色从系统主题/强调色初始化，工具栏提供可读的 hover、pressed、focus ring 状态；Win10 不支持系统材质时回退到不透明或半透明纯色面板，不能因为材质失败而让窗口变黑。
+- 文本编辑使用原生 EDIT/系统 IME 或临时 Tauri 输入窗口，提交后转成 DirectWrite 文本对象；不要让 WebView Canvas 成为标注的最终光栅源。
+
+老项目的 `D2dWindow`、脏矩形和工具栏定位逻辑可复用其交互经验，但应把整图 CPU 合成替换为“底图纹理 + 遮罩 + 矢量覆盖层”。视觉验收除了截图对比，还要检查 100/125/150/200% DPI、浅色/深色主题、HDR、低对比度背景和高对比度模式。
+
 ## 3. 标注实现：模型由 Rust 持有，预览分层绘制
 
 推荐采用“Rust 文档模型 + 原生覆盖层绘制 + 前端工具栏”的混合方案：
@@ -347,6 +368,10 @@ WebView2 是多进程浏览器内核；每个 WebView 会带来 browser、render
 - 不传输 Base64 大图或视频帧。使用严格 scope 的 Tauri asset/custom protocol，按 content hash 返回缩略图；不要为了方便开放任意本地路径。
 - 生产构建关闭 DevTools/HMR，使用 Evergreen WebView2 Runtime；资源和脚本按页面功能懒加载。
 - 前端与 Rust 的 IPC 只传小型 command/state；批量发送、合并同类事件，避免每个 OCR 状态或鼠标移动都触发一次 JSON RPC。
+- 将 IPC 分为控制面和数据面：`invoke`/event/`Channel<T>` 只传 typed command、领域 ID、状态和进度；缩略图/完整图片通过受限 content-hash asset protocol 流式读取。命名管道只承载 OCR/截图/录屏控制与小型结果，不承载逐帧像素。
+- `clipboard.updated` 和 `ocr.updated` 必须携带 `schemaVersion`、`sequence`/`generation`、`clipId`；前端按 ID 增量更新，不能收到通知就清空列表并重新查询。
+- 所有高频生产者使用有界队列和 latest-wins 合并；搜索、详情和录制状态使用 generation/取消标记，过期结果在 Rust 侧停止序列化。录制状态摘要限制在 5–10 Hz，鼠标移动和视频帧完全留在原生窗口/录制进程。
+- 事件不是可靠队列：窗口隐藏或 WebView 恢复后先取轻量快照，再按序号订阅增量；多窗口使用 `emit_to` 定向发送，避免无关 WebView 被唤醒。
 
 ### 11.3 验收方式
 
@@ -390,6 +415,93 @@ WebView：接收受限资源 URL，不接收大图 Base64/JSON
 ### 12.3 这项优化的边界
 
 磁盘驻留降低的是应用主动持有的 Private Bytes，不等于物理内存完全不增加：Windows 文件缓存、WebView 图片解码器和 GPU 纹理仍会占用 Working Set/显存。验收必须同时记录磁盘 I/O、Private Bytes、Working Set、GPU memory、首张缩略图延迟和详情首帧延迟；只有在这些指标的组合结果更好时，才扩大缓存或提高内存预算。
+
+## 13. 常驻进程策略
+
+### 13.1 先区分“按需能力”和“独立进程”
+
+“用户没有启用”首先意味着不创建对应的线程、模型、GPU 资源和窗口；是否再放到独立进程，是第二个决策。独立进程有崩溃隔离和更清晰的资源边界，但会增加启动延迟、IPC、安装包和诊断复杂度，不能把每个模块都机械拆出去。
+
+当前目标的常驻/按需策略如下：
+
+| 组件 | 是否独立进程 | 生命周期 |
+| --- | --- | --- |
+| 剪贴板监听、托盘、SQLite/BlobStore | 首期与主进程同进程；后续可成为 Agent | 托盘模式常驻，显式退出才结束 |
+| Tauri/Vue 主窗口 | 否；WebView2 由 Tauri 管理 | 按需显示；关闭 UI 不应自动启动 OCR/录屏 |
+| OCR | **按需 `SnapClipOcr.exe`**（首版也可先做进程内 lazy worker） | 首次 OCR/批处理时启动；空闲 30–60 秒退出 |
+| 录屏捕获和编码 | **按需 `SnapClipRecorder.exe`** | 点击录制时启动；停止、设备移除或错误后退出 |
+| 原生截图框、工具栏、贴图窗口 | 首期与主 Rust/Agent 同进程；可整体移入 `SnapClipCapture.exe` | 截图会话开始时显示，完成导出/取消后退出或释放 |
+| 截图 WGC/DXGI、D2D、DirectComposition | 与截图框保持同一进程 | 截图会话内初始化；不要跨进程传递每帧纹理 |
+| 录屏 WGC/DXGI、D3D11、Media Foundation | 与 `SnapClipRecorder.exe` 同进程 | 录制进程内保持 GPU texture 零拷贝；结束后释放 |
+| WebView2 browser/renderer/GPU 子进程 | 由 WebView2 自动管理 | 主 UI WebView 存在时可能常驻；不能当作业务 worker 管理 |
+
+当前代码的 `src-tauri/src/lib.rs` 在 `setup` 中无条件调用 `OcrService::start`，与“未启用不启动 OCR”的目标不一致；实现时应改为 `OcrRuntime`，默认只有 `None`/关闭状态，收到首次 OCR 请求后才启动 worker 或子进程。剪贴板监听在 OCR 关闭时传入 `None`，不得为了保留 API 而启动空转 worker。
+
+`SnapClipRecorder.exe` 不应每帧启动 `ffmpeg.exe`。它自己持有 WGC/DXGI、D3D11 texture ring 和 Media Foundation 编码器，主进程只通过命名管道发送开始/停止、区域、FPS 和标注对象更新。GIF/转码是录制结束后的短生命周期任务，不占用录制过程的捕获线程。
+
+### 13.2 为什么 OCR 可以拆，录屏必须特殊处理
+
+| 能力 | 推荐方案 | 原因 |
+| --- | --- | --- |
+| OCR | 按需独立进程优先；模型较小且需要快速迭代时可先做进程内 lazy worker | OCR 不要求逐帧低延迟；模型/ONNX Runtime/DirectML 可能占用大量 Private Bytes，进程隔离能回收内存并隔离崩溃。输入只传内容寻址文件路径和 hash，结果传小型 JSON，不传整张图片 |
+| 录屏 | 按需独立录制进程，捕获和编码必须在同一进程 | WGC/DXGI 返回的 D3D11 texture 要在同一设备上完成合成和硬件编码。若主进程捕获、子进程编码，跨进程共享句柄和同步容易退化为 GPU/CPU 拷贝，直接损害高分辨率高帧率流畅性 |
+
+因此“可选进程”不是把录屏拆成 `capture.exe`、`encode.exe` 两段，而是启动一个拥有完整 GPU 管线的 `SnapClipRecorder.exe`。主进程只传控制消息和矢量标注，不能传每帧像素。
+
+### 13.3 截图进程的选择
+
+静态截图不需要录屏的持续高帧率管线。截图框命中、鼠标拖拽、滚动输入、标注和 WGC/DXGI 设备需要共享 HWND、焦点和 GPU 资源，因此它们应作为一个截图会话单元：
+
+| 部署形态 | 截图进程策略 | 适用条件 |
+| --- | --- | --- |
+| 首期单 `SnapClip.exe` | 截图会话在主 Rust 进程内按需创建原生窗口和 D3D/D2D 对象 | 启动延迟最低，代码和错误恢复最简单；会话结束后释放捕获对象 |
+| `SnapClipAgent.exe` + 按需 UI | 截图会话放在常驻 Agent 内，UI 只发送小型命令 | UI/WebView 可关闭，但托盘、热键和截图必须继续工作 |
+| `SnapClipCapture.exe` 按需子进程 | 子进程同时拥有截图框、WGC/DXGI、标注渲染和 PNG/WebP 导出；完成后返回文件路径 | 需要隔离捕获崩溃，或 Agent 必须保持极小；不适合再拆成独立 capture/overlay/encode 进程 |
+
+截图进程只在截图会话期间存在，不应随系统启动常驻。启动时需要把目标显示器/窗口、DPI、裁剪区域和临时文件目录作为小型协议传入；结果通过内容寻址文件和元数据返回。长截图期间进程保持到滚动状态机结束，不能每滚动一步重新启动。
+
+### 13.4 WebView2 子进程不是可忽略的内存
+
+WebView2 使用 browser、renderer、GPU 等多进程模型，实际数量取决于页面 origin、站点隔离和 WebView 实例。它们不是 SnapClip 的业务常驻进程，但会计入用户看到的应用资源占用：
+
+- 保持一个主 WebView，并复用同一个 WebView2 environment 和 user-data folder。
+- 截图/录屏进入原生窗口后，主界面只显示轻量状态；不要创建全屏或每个贴图一个 WebView。
+- UI 隐藏时停止轮询和动画；能访问底层 `CoreWebView2` 时再评估 `TrySuspendAsync`/低内存目标，否则通过隐藏窗口和释放临时资源降低 CPU/Working Set。
+- 不能假设隐藏 WebView 会立即释放 browser 进程；必须按进程组测量。
+
+### 13.5 目标方案：按基准决定是否拆出 Agent
+
+如果单进程在“主界面隐藏、剪贴板监听开启”的 60 秒基线中超过内存门槛，或 WebView 崩溃会连带丢失剪贴板监听，再拆成：
+
+```text
+SnapClipAgent.exe  常驻、无 WebView2
+  ├─ 托盘/全局热键/剪贴板监听
+  ├─ SQLite/BlobStore
+  ├─ 原生截图框/贴图（或按需委托给 SnapClipCapture.exe）
+  └─ 命名管道或本地 RPC
+
+按需子进程
+  ├─ SnapClipOcr.exe       模型、OCR 队列，空闲超时退出
+  └─ SnapClipRecorder.exe  WGC/DXGI + D3D11 + Media Foundation，录制结束退出
+
+SnapClip.exe       按需启动的 Tauri/Vue UI
+  └─ 历史、搜索、设置、录制状态和标注工具栏
+```
+
+Agent 拆分的收益是：UI 关闭后不再保留 WebView2 进程组，剪贴板不会被前端崩溃影响；OCR/录屏仍可独立回收。代价是安装包、升级、单实例、命名管道权限、协议版本和跨进程错误恢复都会增加。Agent 与 UI/子进程只传小型命令/状态和受限文件 URL，不能传输整帧图像。
+
+拆分门槛应由实测决定，而不是预先增加复杂度：
+
+1. 单进程隐藏 UI 的 Private Bytes/Working Set 连续超过目标预算；
+2. WebView2 renderer/GPU 在空闲状态仍有持续 CPU 或唤醒；
+3. 长时间运行出现 WebView 内存增长而刷新/挂起无法恢复；
+4. 需要 UI 频繁重启但剪贴板监听必须连续运行。
+
+在没有满足门槛前，保持单进程更容易验证正确性；满足任一门槛后，优先拆 Agent，而不是继续在 WebView 内堆叠缓存和节流补丁。
+
+### 13.6 不应纳入“常驻进程”的对象
+
+`explorer.exe`、`dwm.exe`、`RuntimeBroker.exe` 和 WebView2 Runtime 的系统协作进程由 Windows 管理，不能由 SnapClip 主动结束。验收时应把它们作为外部基线或子进程组单独统计，不把结束系统进程当作优化方案。
 
 ## 官方资料
 

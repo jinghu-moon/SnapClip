@@ -75,12 +75,13 @@ release 构建、固定数据集和真实 Windows 桌面测试确认，不作为
                               └────────────────┘
 ```
 
-上图是可演进的目标进程模型，不代表首期交付结构。首期为一个 Tauri/Rust 进程，图中的
-`ClipAgent`、`CaptureHost` 和 `Worker` 是未来可能拆出的进程边界。
+上图是可演进的目标进程模型，不代表首期交付结构。`ClipAgent`、`CaptureHost` 和 `Worker` 是可按需启停的进程边界：未启用 OCR/录屏时，不启动对应 worker；录屏 worker 必须在同一进程内完成捕获和编码，不能把每帧纹理经 IPC 传输。
 
 ### 3.2 渐进部署策略
 
-首期采用单 Tauri 应用进程，剪贴板、历史、截图和 UI 能力在领域模块内隔离；原生覆盖层和贴图使用独立原生窗口，但不因此单独拆进程。只有性能、稳定性或生命周期数据证明有必要时，才评估拆出 `ClipAgent`、`CaptureHost` 或 worker 进程。进程拆分不能改变领域接口，届时只替换传输层。
+首期仍可采用单 Tauri 应用进程承载剪贴板、历史、截图和 UI，但 OCR 必须是 lazy 生命周期，录屏必须是按需生命周期；未启用时不加载模型、不创建 worker、不初始化录屏设备。完成基准后，可把 OCR 拆为 `SnapClipOcr.exe`，把录屏拆为 `SnapClipRecorder.exe`，进程拆分只替换传输层，不改变领域接口。
+
+常驻进程清单、WebView2 子进程边界和 `SnapClipAgent.exe` 的拆分门槛见 `docs/07-screenshot-recording-architecture.md` §13。
 
 ### 3.3 分层
 
@@ -164,7 +165,7 @@ release 构建、固定数据集和真实 Windows 桌面测试确认，不作为
 - Windows OCR、RapidOCR、图片编码、缩略图、二维码和用户脚本。
 - 有界优先级调度、取消令牌、超时、输出大小限制和 generation 过期任务丢弃。
 - 捕获后处理/复制为用户可见高优先级，剪贴板持久化和搜索为常规优先级，OCR/缩略图/QR 为后台优先级；用户脚本隔离执行，不得占满其他队列。
-- OCR 模型懒加载，可选低优先级预热；失败时引擎降级。Windows OCR 的 WinRT 初始化、异步调用和 apartment 行为必须在平台适配层验证，不把“必须 MTA”作为未经验证的硬编码前提。
+- OCR 默认关闭并懒启动；用户首次 OCR 或批处理时才加载模型、初始化 WinRT/ONNX Runtime。首选按需 `SnapClipOcr.exe`，也可先用进程内 lazy worker 建立基线；空闲超时后退出/卸载。失败时引擎降级，Windows OCR 的 apartment 行为必须在平台适配层验证。
 - 缩略图按可见项、邻近预取、后台生成分级；与 worker scheduler 协调预算。高频状态事件按领域 ID 合并为最新状态，搜索及可替换的预览请求采用 generation 取消，避免过期结果覆盖当前视图。
 
 ## 6. 截图实现
@@ -192,6 +193,8 @@ Windows 10 1809，必须实现并测试独立兼容路径；捕获能力在启�
 失败必须返回结构化 `CaptureError`，并记录当前后端、错误码和降级原因。HDR 场景必须查询显示器 HDR 状态和 SDR 白点，预览与导出使用同一色彩转换。
 
 ### 6.2 区域截图
+
+截图 MVP 的分阶段实施、模块边界、F5/Esc 状态机和 L0/L1/L2 验收清单见 `docs/08-screenshot-mvp-tasklist.md`。
 
 1. 热键触发后获取鼠标所在显示器和物理矩形。
 2. 复用隐藏覆盖层窗口，避免反复创建 HWND 和 swap chain。
