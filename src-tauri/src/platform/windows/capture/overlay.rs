@@ -5,6 +5,10 @@
 //! * the overlay window class and its hidden, pre-created window,
 //! * the D3D11/D2D renderer and the DirectComposition target.
 //!
+//! Pixel capture does **not** happen here: `F5` submits a [`StartRequest`] to the
+//! [`CaptureWorker`] and the thread keeps pumping, so `Esc` cancels a session
+//! while the screen is still being frozen (docs/11 §3.1).
+//!
 //! Everything else in the process talks to it through [`WindowsOverlay`], which only
 //! posts small messages — never pixels.
 //!
@@ -32,7 +36,8 @@ use windows_sys::Win32::{
             LoadCursorW,
             SetCursor,
             CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow,
-            DispatchMessageW, GetForegroundWindow, GetMessageW, MSG, PeekMessageW, PostQuitMessage,
+            DispatchMessageW, GetCursorPos, GetForegroundWindow, GetMessageW, MSG, PeekMessageW,
+            PostQuitMessage,
             PostThreadMessageW, RegisterClassW, SW_HIDE, SW_SHOW, SetForegroundWindow,
             SetWindowPos,
             ShowWindow, TranslateMessage, UnregisterClassW, WM_APP, WM_DESTROY, WM_DEVICECHANGE,
@@ -53,9 +58,10 @@ use crate::capture::geometry::{
 use crate::capture::session::{CaptureSession, FinishingOutcome};
 use crate::capture::{CaptureError, CaptureResult, CaptureState};
 
+use super::capture_worker::{self, CaptureWorker, StartRequest};
 use super::hotkey;
 use super::monitor::{self, CapturedMonitor};
-use super::providers::{CaptureProviders, FrozenFrame, FrozenFramePixels};
+use super::providers::{FrozenFrame, FrozenFramePixels};
 use super::renderer::{OverlayFrameState, Win32Renderer};
 
 /// `WM_APP`-based command delivered from any thread to the overlay thread.
@@ -76,11 +82,15 @@ enum OverlayCommand {
     Cancel,
     Confirm,
     Shutdown,
+    /// Sentinel `wparam` on [`capture_worker::FRAME_READY_MESSAGE`] so the
+    /// worker's wake-up shares the command dispatch path.
+    FrameReady,
 }
 
 impl OverlayCommand {
     fn from_wparam(wparam: WPARAM) -> Option<Self> {
         match wparam as i32 {
+            value if value == Self::FrameReady as i32 => Some(Self::FrameReady),
             value if value == Self::Start as i32 => Some(Self::Start),
             value if value == Self::Cancel as i32 => Some(Self::Cancel),
             value if value == Self::Confirm as i32 => Some(Self::Confirm),
@@ -278,7 +288,9 @@ where
     sink: Arc<dyn CaptureEventSink>,
     shared: Arc<Mutex<OverlayShared>>,
     window: HWND,
-    providers: Option<CaptureProviders>,
+    /// Captures run on the worker thread; the overlay only submits requests
+    /// and drains the capacity-1 result mailbox.
+    worker: CaptureWorker,
     renderer: Option<Win32Renderer>,
     session: CaptureSession,
     frozen: Option<FrozenFrame>,
@@ -287,6 +299,8 @@ where
     cursor_visible: bool,
     dirty: Vec<Rect>,
     session_counter: u64,
+    /// Generation of the session currently awaiting a worker result.
+    current_generation: u64,
     /// Window that owned the foreground before the overlay appeared.
     previous_foreground: HWND,
 }
@@ -307,7 +321,7 @@ where
             sink,
             shared,
             window,
-            providers: None,
+            worker: CaptureWorker::new(),
             renderer: None,
             session: CaptureSession::new("idle"),
             frozen: None,
@@ -316,6 +330,7 @@ where
             cursor_visible: false,
             dirty: Vec::new(),
             session_counter: 0,
+            current_generation: 0,
             previous_foreground: null_mut(),
         }
     }
@@ -343,12 +358,17 @@ where
             .on_state(&self.session_id(), self.session.state(), layout.as_ref());
     }
 
-    /// `F5`: freeze the screen, show the overlay, enter `Selecting`.
+    /// `F5`: submit a capture request and enter `Preparing`.
+    ///
+    /// Nothing here waits on WGC/BitBlt: the freeze happens on the worker
+    /// thread and the message pump keeps running, so `Esc` cancels while the
+    /// screen is still being captured (docs/11 §2.2/§3.3).
     fn start_session(&mut self) {
         let started_at = Instant::now();
         eprintln!("[snapclip][capture] starting session from hotkey/command");
         if self.session.state().is_active() {
-            // A repeated hotkey press restarts rather than stacking sessions.
+            // A repeated hotkey press restarts rather than stacking sessions;
+            // `cancel` bumps the generation so the old request's result dies.
             self.cancel("hotkey-restart");
         }
 
@@ -371,41 +391,15 @@ where
             monitor.layout.dpi,
             started_at.elapsed().as_millis()
         );
-
-        if self.providers.is_none() {
-            match CaptureProviders::new() {
-                Ok(providers) => self.providers = Some(providers),
-                Err(error) => {
-                    eprintln!("[snapclip][capture] provider initialization failed: {error}");
-                    self.fail(None, error, "none");
-                    return;
-                }
-            }
-        }
-
-        // Capture BEFORE the overlay becomes visible so the overlay can never appear
-        // inside its own screenshot.
-        let captured = self
-            .providers
-            .as_mut()
-            .expect("providers were just created")
-            .capture(&monitor);
-        let frozen = match captured {
-            Ok(frozen) => frozen,
-            Err(error) => {
-                eprintln!("[snapclip][capture] frame capture failed: {error}");
-                self.fail(None, error, "provider");
-                return;
-            }
-        };
         eprintln!(
-            "[snapclip][capture] frame frozen provider={} size={}x{} elapsed_ms={}",
-            frozen.frame.provider,
-            frozen.frame.width,
-            frozen.frame.height,
+            "[snapclip][bench] stage=monitor_ready generation_pending elapsed_ms={}",
             started_at.elapsed().as_millis()
         );
 
+        // The generation counter is owned by the worker mailbox so starts and
+        // cancellations cannot diverge from it.
+        let generation = self.worker.next_generation();
+        self.current_generation = generation;
         self.session_counter += 1;
         let session_id = format!(
             "capture-{}-{}",
@@ -413,22 +407,87 @@ where
             self.session_counter
         );
         self.session = CaptureSession::new(session_id);
+        if let Err(error) = self.session.preparing() {
+            eprintln!("[snapclip][capture] session preparing transition failed: {error}");
+            self.fail(None, error, "none");
+            return;
+        }
+        self.publish_state();
+        let layout = monitor.layout.clone();
+        self.sink.on_started(&self.session_id(), &layout);
 
+        let mut cursor = unsafe { zeroed() };
+        unsafe { GetCursorPos(&mut cursor) };
+        let request = StartRequest {
+            generation,
+            monitor,
+            cursor_screen: Point::new(cursor.x, cursor.y),
+            requested_at: started_at,
+            notify_thread: unsafe { GetCurrentThreadId() },
+        };
+        if let Err(message) = self.worker.start(request) {
+            eprintln!("[snapclip][capture] worker start failed: {message}");
+            let error = CaptureError::CaptureFailed(message);
+            self.fail(None, error, "worker");
+        }
+    }
+
+    /// Drain a ready worker result. Called for every
+    /// [`capture_worker::FRAME_READY_MESSAGE`] and defensively on other wake
+    /// ups; returns without doing anything when nothing is ready or the
+    /// result belongs to a superseded generation.
+    fn on_frame_ready(&mut self) {
+        let Some(ready) = self.worker.take_ready() else {
+            return;
+        };
+        if self.current_generation == 0 || self.session.state() != CaptureState::Preparing {
+            // The session ended (Esc/destroy) while the frame was in flight.
+            return;
+        }
+        match ready {
+            Ok(prepared) => self.apply_prepared(prepared),
+            Err(failure) => {
+                let stage = failure.stage;
+                if matches!(failure.error, CaptureError::DeviceRemoved(_)) {
+                    self.worker.invalidate_providers();
+                    self.renderer = None;
+                }
+                self.fail(None, failure.error, stage);
+            }
+        }
+    }
+
+    /// The frozen frame arrived for the current generation: prepare the
+    /// renderer off-screen, arm the session and show the overlay.
+    fn apply_prepared(&mut self, prepared: capture_worker::PreparedFrame) {
+        let started_at = Instant::now();
+        eprintln!(
+            "[snapclip][bench] stage=frame_ready provider={} size={}x{} freeze_to_ready_ms={}",
+            prepared.frozen.frame.provider,
+            prepared.frozen.frame.width,
+            prepared.frozen.frame.height,
+            prepared.captured_at.elapsed().as_millis()
+        );
+        let monitor = prepared.monitor;
+        let provider = prepared.frozen.frame.provider;
+        let frozen = prepared.frozen;
         if let Err(error) = self.prepare_overlay(&monitor, &frozen) {
-            let provider = frozen.frame.provider;
             eprintln!(
                 "[snapclip][capture] renderer preparation failed provider={} error={}",
                 provider, error
             );
+            if matches!(error, CaptureError::DeviceRemoved(_)) {
+                self.worker.invalidate_providers();
+            }
             self.fail(None, error, provider);
             return;
         }
         eprintln!(
-            "[snapclip][capture] renderer prepared elapsed_ms={}",
+            "[snapclip][bench] stage=renderer_ready provider={} elapsed_ms={}",
+            provider,
             started_at.elapsed().as_millis()
         );
 
-        let provider = frozen.frame.provider;
         if let Err(error) = self.session.arm(frozen.frame.clone(), &monitor.layout) {
             eprintln!("[snapclip][capture] session arm failed error={error}");
             self.fail(None, error, provider);
@@ -436,12 +495,9 @@ where
         }
         self.frozen = Some(frozen);
 
-        let layout = monitor.layout.clone();
-        self.sink.on_started(&self.session_id(), &layout);
         eprintln!(
-            "[snapclip][capture] overlay session armed session={} elapsed_ms={}",
-            self.session_id(),
-            started_at.elapsed().as_millis()
+            "[snapclip][capture] overlay session armed session={}",
+            self.session_id()
         );
         if let Err(error) = self.session.overlay_ready() {
             eprintln!("[snapclip][capture] overlay ready transition failed error={error}");
@@ -453,9 +509,9 @@ where
         // retains the previous swap-chain contents, so showing first would expose
         // the previous session's selection for one compositor frame.
         self.request_redraw(None);
-        self.show_overlay(&layout);
+        self.show_overlay(&monitor.layout);
         eprintln!(
-            "[snapclip][capture] overlay shown session={} elapsed_ms={}",
+            "[snapclip][bench] stage=visible session={} prepare_elapsed_ms={}",
             self.session_id(),
             started_at.elapsed().as_millis()
         );
@@ -470,16 +526,14 @@ where
             // `self.window` uses the `windows-sys` bindings; the renderer needs the
             // typed handle. Both are the same `*mut c_void` at the ABI level.
             let window = ::windows::Win32::Foundation::HWND(self.window);
-            let device = self
-                .providers
-                .as_ref()
-                .ok_or_else(|| {
-                    CaptureError::ProviderUnavailable(
-                        "capture providers are not initialized".into(),
-                    )
-                })?
-                .shared_device();
-            self.renderer = Some(Win32Renderer::new(window, &monitor.layout, device).map_err(
+            // The renderer must share the capture worker's device: the frozen
+            // texture it displays was created there and D2D cannot cross devices.
+            let device = frozen.device().ok_or_else(|| {
+                CaptureError::ProviderUnavailable(
+                    "frozen frame carries no device to render with".into(),
+                )
+            })?;
+            self.renderer = Some(Win32Renderer::new(window, &monitor.layout, device.clone()).map_err(
                 |message| {
                     if Win32Renderer::is_device_lost(&message) {
                         CaptureError::DeviceRemoved(message)
@@ -570,6 +624,10 @@ where
 
     /// The single cancellation path used by Esc, right click, repeated F5, window
     /// destruction, display changes and device removal.
+    ///
+    /// Bumps the generation first: a frame the worker is still freezing becomes
+    /// stale and is dropped on arrival, releasing its GPU references without the
+    /// overlay ever waiting on the worker (docs/11 §3.3).
     fn cancel(&mut self, reason: &str) {
         let session_id = self.session_id();
         let was_active = self.session.state().is_active();
@@ -577,6 +635,8 @@ where
             "[snapclip][capture] cancel session={} reason={} active={}",
             session_id, reason, was_active
         );
+        self.worker.cancel();
+        self.current_generation = 0;
         self.release_session();
         if was_active {
             self.sink.on_cancelled(&session_id, reason);
@@ -688,6 +748,8 @@ where
             "[snapclip][capture] failed session={} provider={} error={}",
             id, provider, error
         );
+        self.worker.cancel();
+        self.current_generation = 0;
         self.sink.on_failed(Some(&id), &error, provider);
         self.session.fail();
         self.release_session();
@@ -888,7 +950,7 @@ where
             if Win32Renderer::is_device_lost(&error) {
                 eprintln!("[snapclip][capture] graphics device removed: {error}");
                 self.renderer = None;
-                self.providers = None;
+                self.worker.invalidate_providers();
                 self.fail(None, CaptureError::DeviceRemoved(error), "overlay");
             } else {
                 eprintln!("[snapclip][capture] render failed: {error}");
@@ -941,10 +1003,18 @@ where
                     }
                     Some(OverlayCommand::Shutdown) => {
                         self.cancel("shutdown");
+                        // Stop the thread before quitting the pump; the worker
+                        // holds the providers and their device references.
+                        self.worker.shutdown();
                         unsafe { PostQuitMessage(0) };
                     }
+                    Some(OverlayCommand::FrameReady) => self.on_frame_ready(),
                     None => {}
                 }
+                Some(0)
+            }
+            capture_worker::FRAME_READY_MESSAGE => {
+                self.on_frame_ready();
                 Some(0)
             }
             WM_HOTKEY => {
@@ -1008,9 +1078,11 @@ where
                 if self.session.state().is_active() {
                     self.cancel("display-change");
                 }
-                // Force a full rebuild on the next session.
+                // Force a full rebuild on the next session: the renderer is
+                // dropped here and the worker rebuilds its providers (and the
+                // D3D device inside) when the next request arrives.
                 self.renderer = None;
-                self.providers = None;
+                self.worker.invalidate_providers();
                 Some(0)
             }
             WM_DESTROY => {
@@ -1171,6 +1243,17 @@ fn overlay_thread<D, E>(
         if result <= 0 {
             break;
         }
+        if message.hwnd.is_null() {
+            // Thread messages posted with `PostThreadMessageW` (the worker's
+            // `FRAME_READY_MESSAGE`, the `WM_OVERLAY_COMMAND` channel, shutdown)
+            // carry no window handle, so `DispatchMessageW` would silently drop
+            // them and their window procedure would never run. Route them to the
+            // controller here; only genuine window messages go to the pump.
+            unsafe {
+                controller.handle(message.message, message.wParam, message.lParam);
+            }
+            continue;
+        }
         unsafe {
             TranslateMessage(&message);
             DispatchMessageW(&message);
@@ -1297,6 +1380,7 @@ mod tests {
             OverlayCommand::Cancel,
             OverlayCommand::Confirm,
             OverlayCommand::Shutdown,
+            OverlayCommand::FrameReady,
         ] {
             assert_eq!(OverlayCommand::from_wparam(command as usize), Some(command));
         }

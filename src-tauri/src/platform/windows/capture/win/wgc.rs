@@ -12,8 +12,12 @@ use ::windows::Graphics::Capture::{
 };
 use ::windows::Graphics::DirectX::DirectXPixelFormat;
 use ::windows::Graphics::SizeInt32;
+use ::windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use ::windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use ::windows::Win32::Graphics::Dxgi::IDXGIDevice;
+use ::windows::Win32::System::Threading::{
+    CreateEventW, ResetEvent, SetEvent, WaitForSingleObjectEx,
+};
 use ::windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
 };
@@ -25,7 +29,9 @@ use super::d3d11::{GraphicsDevice, GpuFrame};
 
 /// How long to wait for the first frame before falling back to another provider.
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_millis(1500);
-const FRAME_POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// Poll interval for the degenerate case where the arrival handler cannot be
+/// installed; the normal path waits on the event instead.
+const FRAME_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// Whether this Windows build exposes Windows Graphics Capture at all.
 ///
@@ -72,6 +78,28 @@ pub fn capture_monitor(
         size,
     )
     .map_err(|error| super::hresult("Direct3D11CaptureFramePool::CreateFreeThreaded", &error))?;
+
+    // Event-driven first-frame wait (docs/11 §3.2): `FrameArrived` signals a
+    // manual-reset event and the worker parks on it, replacing the old 20 ms
+    // `TryGetNextFrame` sleep-poll so arrival latency is no longer quantised.
+    // If the event or the registration is unavailable the wait degrades to a
+    // short poll; the capture itself never fails for this reason.
+    let arrival = FrameArrivalEvent::new();
+    let token = if arrival.is_valid() {
+        match pool.FrameArrived(&arrival.handler()) {
+            Ok(token) => Some(token),
+            Err(error) => {
+                eprintln!(
+                    "[snapclip][capture] WGC FrameArrived unavailable ({}); polling the frame pool",
+                    super::hresult("Direct3D11CaptureFramePool::FrameArrived", &error)
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let session = pool
         .CreateCaptureSession(&item)
         .map_err(|error| super::hresult("CreateCaptureSession", &error))?;
@@ -86,7 +114,21 @@ pub fn capture_monitor(
         .StartCapture()
         .map_err(|error| super::hresult("GraphicsCaptureSession::StartCapture", &error))?;
 
-    let frame = next_frame(&pool)?;
+    let frame = next_frame(&pool, &arrival, token.is_some());
+    let frame = match frame {
+        Ok(frame) => frame,
+        Err(error) => {
+            if let Some(token) = token {
+                let _ = pool.RemoveFrameArrived(token);
+            }
+            let _ = session.Close();
+            let _ = pool.Close();
+            return Err(error);
+        }
+    };
+    if let Some(token) = token {
+        let _ = pool.RemoveFrameArrived(token);
+    }
     let surface = frame
         .Surface()
         .map_err(|error| super::hresult("Direct3D11CaptureFrame::Surface", &error))?;
@@ -110,22 +152,106 @@ pub fn capture_monitor(
     })
 }
 
+/// A manual-reset event signalled from the pool's `FrameArrived` handler.
+///
+/// The Windows 0.61 bindings do not expose `CreateWaitable`/`WaitHandle` yet, so
+/// the event-driven arrival required by docs/11 §3.2 is built on the free-threaded
+/// pool plus a delegate: the callback runs on a system thread-pool thread and only
+/// touches the event handle, while the capture worker parks on it instead of
+/// sleep-polling `TryGetNextFrame`.
+struct FrameArrivalEvent(HANDLE);
+
+/// The delegate type the pool expects, spelled once for the handler factory.
+type ArrivalHandler = ::windows::Foundation::TypedEventHandler<
+    Direct3D11CaptureFramePool,
+    ::windows::core::IInspectable,
+>;
+
+impl FrameArrivalEvent {
+    fn new() -> Self {
+        let handle = unsafe {
+            CreateEventW(None, true, false, ::windows::core::PCWSTR::null())
+        }
+        .unwrap_or(HANDLE(core::ptr::null_mut()));
+        Self(handle)
+    }
+
+    fn is_valid(&self) -> bool {
+        !self.0 .0.is_null() && self.0 .0 != (-1isize as *mut core::ffi::c_void)
+    }
+
+    fn handler(&self) -> ArrivalHandler {
+        // The callback holds only the raw HANDLE value (not a reference to
+        // this struct), so it stays valid for as long as the event exists.
+        let handle = self.0 .0 as isize;
+        ArrivalHandler::new(move |_sender, _args| {
+            let handle = HANDLE(handle as *mut core::ffi::c_void);
+            unsafe {
+                let _ = SetEvent(handle);
+            }
+            Ok(())
+        })
+    }
+}
+
+impl Drop for FrameArrivalEvent {
+    fn drop(&mut self) {
+        if self.is_valid() {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+/// Block until the pool delivers the first frame or the timeout expires.
+///
+/// With a registered arrival handler the worker sleeps on the event and wakes the
+/// moment a frame is queued; `TryGetNextFrame` is still the source of truth (the
+/// event merely says "look again"), and the handler-less fallback polls.
 fn next_frame(
     pool: &Direct3D11CaptureFramePool,
-) -> Result<windows::Graphics::Capture::Direct3D11CaptureFrame, String> {
+    arrival: &FrameArrivalEvent,
+    event_driven: bool,
+) -> Result<::windows::Graphics::Capture::Direct3D11CaptureFrame, String> {
     let deadline = Instant::now() + FIRST_FRAME_TIMEOUT;
-    let mut last_error = String::new();
-    while Instant::now() < deadline {
+    loop {
         match pool.TryGetNextFrame() {
             Ok(frame) => return Ok(frame),
-            Err(error) => last_error = super::hresult("TryGetNextFrame", &error),
+            Err(error) => {
+                // The most recent failure is reported if the budget expires
+                // right here; otherwise it is discarded and re-probed next
+                // iteration, so no stale value is carried across the wait.
+                let message = super::hresult("TryGetNextFrame", &error);
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "Windows Graphics Capture produced no frame within {}ms ({message})",
+                        FIRST_FRAME_TIMEOUT.as_millis()
+                    ));
+                }
+            }
         }
-        std::thread::sleep(FRAME_POLL_INTERVAL);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if event_driven && arrival.is_valid() {
+            let millis = remaining.as_millis().min(u32::MAX as u128 - 1) as u32;
+            let status = unsafe { WaitForSingleObjectEx(arrival.0, millis, false) };
+            if status != WAIT_OBJECT_0 && status != WAIT_TIMEOUT {
+                return Err(format!(
+                    "WaitForSingleObjectEx on the WGC arrival event failed: {}",
+                    status.0
+                ));
+            }
+            // Manual reset: clear it so the next arrival signals again; a frame
+            // that arrived between the failed TryGetNextFrame and the Reset is
+            // picked up by the next loop's TryGetNextFrame before this Reset
+            // or immediately after it — either way no frame is lost.
+            unsafe {
+                let _ = ResetEvent(arrival.0);
+            }
+        } else {
+            std::thread::sleep(FRAME_POLL_INTERVAL);
+        }
     }
-    Err(format!(
-        "Windows Graphics Capture produced no frame within {}ms ({last_error})",
-        FIRST_FRAME_TIMEOUT.as_millis()
-    ))
 }
 
 /// Build a capture item for a monitor.

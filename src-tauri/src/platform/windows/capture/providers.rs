@@ -64,6 +64,16 @@ impl FrozenFrame {
         self.texture.as_ref()
     }
 
+    /// The device the texture lives on.
+    ///
+    /// The overlay builds its renderer from exactly this device: D2D surfaces can
+    /// only be created from a texture belonging to the same D3D11 device, and on
+    /// the async path the providers (and their device) now live on the capture
+    /// worker, so the frame has to carry the shared handle across.
+    pub fn device(&self) -> Option<&Arc<GraphicsDevice>> {
+        self.device.as_ref()
+    }
+
     /// GPU texture when available, otherwise CPU pixels uploaded into one.
     ///
     /// The overlay always has a texture to draw from; only a provider that failed on
@@ -234,22 +244,13 @@ impl CaptureProviders {
         &self.diagnostics
     }
 
-    /// Shared device used by WGC textures and the overlay renderer.
-    pub fn shared_device(&self) -> Arc<GraphicsDevice> {
-        self.device.clone()
-    }
-
     /// Capture one frozen frame of `monitor`.
     ///
     /// Tries the preferred provider first and falls back to BitBlt when WGC is
     /// unavailable, so a machine without WGC still gets a working screenshot.
     pub fn capture(&mut self, monitor: &CapturedMonitor) -> CaptureResult<FrozenFrame> {
         let started_at = Instant::now();
-        let mut attempts = Vec::new();
-        if self.preferred == Some(ProviderKind::Wgc) {
-            attempts.push(ProviderKind::Wgc);
-        }
-        attempts.push(ProviderKind::BitBlt);
+        let attempts = attempt_order(self.preferred);
 
         let mut last_error: Option<CaptureError> = None;
         for provider in attempts {
@@ -357,9 +358,29 @@ fn classify_device_error(context: &str, message: String) -> CaptureError {
     }
 }
 
+/// Providers tried for one capture, in order.
+///
+/// WGC is attempted first only when it is the preferred provider; BitBlt is always
+/// the final entry so a machine without WGC — or a WGC run whose first frame times
+/// out — still falls back to a frame instead of failing the session outright
+/// (docs/11 §3.2). Keeping this decision pure makes the fallback contract unit
+/// testable without a GPU.
+fn attempt_order(preferred: Option<ProviderKind>) -> Vec<ProviderKind> {
+    let mut attempts = Vec::new();
+    if preferred == Some(ProviderKind::Wgc) {
+        attempts.push(ProviderKind::Wgc);
+    }
+    attempts.push(ProviderKind::BitBlt);
+    attempts
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CaptureProviders, FrozenFrame, FrozenFramePixels, ProviderKind};
+    use super::{
+        attempt_order, classify_device_error, CaptureProviders, FrozenFrame, FrozenFramePixels,
+        GraphicsDevice, ProviderKind,
+    };
+    use crate::capture::CaptureError;
     use crate::capture::application::PixelSliceSource;
     use crate::capture::geometry::{MonitorLayout, Point, Rect};
     use crate::capture::session::CapturedFrame;
@@ -423,6 +444,58 @@ mod tests {
     fn provider_names_are_stable_for_events() {
         assert_eq!(ProviderKind::Wgc.name(), "wgc");
         assert_eq!(ProviderKind::BitBlt.name(), "bitblt");
+    }
+
+    #[test]
+    fn wgc_is_tried_before_the_bitblt_fallback() {
+        // A WGC-preferred session must attempt BitBlt as well, so a first-frame
+        // timeout cannot fail the session outright (docs/11 §3.2).
+        assert_eq!(
+            attempt_order(Some(ProviderKind::Wgc)),
+            vec![ProviderKind::Wgc, ProviderKind::BitBlt]
+        );
+    }
+
+    #[test]
+    fn bitblt_is_the_only_provider_once_wgc_is_dropped() {
+        // After a WGC failure the preferred provider is demoted to BitBlt; the
+        // next session must not re-attempt the broken WGC path, and a machine
+        // that never had WGC goes straight to BitBlt.
+        assert_eq!(attempt_order(Some(ProviderKind::BitBlt)), vec![ProviderKind::BitBlt]);
+        assert_eq!(attempt_order(None), vec![ProviderKind::BitBlt]);
+    }
+
+    #[test]
+    fn a_first_frame_timeout_is_a_fallback_eligible_failure() {
+        // `wgc::next_frame` yields this message when the first frame never lands.
+        // The trailing code is a wait timeout (DXGI_ERROR_WAIT_TIMEOUT), not a
+        // device-lost code, so it must be reported as a plain capture failure that
+        // lets `capture` fall back to BitBlt rather than tearing down the device.
+        let wait_timeout = 0x887A_0027u32 as i32;
+        let message = format!(
+            "Windows Graphics Capture produced no frame within 1500ms (TryGetNextFrame failed (timed out) #code={wait_timeout})"
+        );
+        assert!(
+            !GraphicsDevice::is_device_lost(&message),
+            "a wait timeout must not be mistaken for device removal"
+        );
+        assert!(matches!(
+            classify_device_error("Windows Graphics Capture", message),
+            CaptureError::CaptureFailed(_)
+        ));
+    }
+
+    #[test]
+    fn a_device_lost_hresult_is_classified_as_device_removal() {
+        // DXGI_ERROR_DEVICE_REMOVED must surface as `DeviceRemoved` so the overlay
+        // invalidates providers and rebuilds the device on the next session
+        // (docs/11 §2.2 device-removal cleanup path).
+        let removed = 0x887A_0005u32 as i32;
+        let message = format!("Windows Graphics Capture failed (device removed) #code={removed}");
+        assert!(GraphicsDevice::is_device_lost(&message));
+        let classified = classify_device_error("Windows Graphics Capture", message);
+        assert!(matches!(classified, CaptureError::DeviceRemoved(_)));
+        assert!(FrozenFrame::is_device_lost(&classified));
     }
 
     #[test]

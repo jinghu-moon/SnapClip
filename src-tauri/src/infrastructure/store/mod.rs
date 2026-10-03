@@ -1162,6 +1162,7 @@ mod tests {
         fs,
         path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
     };
 
     use crate::domain::{
@@ -1178,13 +1179,27 @@ mod tests {
 
     impl TestDir {
         fn new() -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "snapclip-store-test-{}-{}",
-                std::process::id(),
-                TEST_ID.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::create_dir_all(&path).unwrap();
-            Self(path)
+            // Key on pid + wall-clock nanos + counter, and create with `create_dir`
+            // (which fails when the path already exists) so a stale directory left
+            // behind by a force-killed run can never be reused. Windows reuses pids,
+            // so a pid+counter key alone occasionally collided with an old
+            // `snapclip.db`, surfacing as spurious `UNIQUE constraint failed:
+            // clips.id` errors in parallel runs.
+            let pid = std::process::id();
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            loop {
+                let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
+                let path =
+                    std::env::temp_dir().join(format!("snapclip-store-test-{pid}-{stamp}-{id}"));
+                match fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("create test store dir failed: {error}"),
+                }
+            }
         }
     }
 

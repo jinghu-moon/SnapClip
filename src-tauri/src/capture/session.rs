@@ -128,13 +128,29 @@ impl CaptureSession {
         self.snapshot().hit_test(point, self.dpi())
     }
 
-    /// `Idle -> Armed`. Fails when a session is already running.
+    /// `Idle -> Preparing`: the hotkey fired and a capture worker request was
+    /// submitted. The overlay keeps pumping messages in this state and Esc can
+    /// cancel before any frame exists (docs/11 §2.2).
+    pub fn preparing(&mut self) -> Result<(), CaptureError> {
+        if self.state.is_active() {
+            return Err(CaptureError::InvalidState(format!(
+                "session {} is already {}",
+                self.id,
+                self.state.as_str()
+            )));
+        }
+        self.state = CaptureState::Preparing;
+        Ok(())
+    }
+
+    /// `(Idle | Preparing) -> Armed`. Fails when a session is already running
+    /// past `Preparing`.
     pub fn arm(
         &mut self,
         frame: CapturedFrame,
         layout: &MonitorLayout,
     ) -> Result<(), CaptureError> {
-        if self.state.is_active() {
+        if self.state.is_active() && self.state != CaptureState::Preparing {
             return Err(CaptureError::InvalidState(format!(
                 "session {} is already {}",
                 self.id,
@@ -371,30 +387,38 @@ mod tests {
     #[test]
     fn esc_from_every_active_state_returns_to_idle() {
         // Each case builds the session up to the state under test, then cancels.
-        // `Armed` has no selection yet; `Selecting` is mid-drag; `Selected` has a
-        // committed selection; `Finishing` is resolving an artifact.
+        // `Preparing` is the worker round trip; `Armed` has no selection yet;
+        // `Selecting` is mid-drag; `Selected` has a committed selection;
+        // `Finishing` is resolving an artifact.
         for state in [
+            CaptureState::Preparing,
             CaptureState::Armed,
             CaptureState::Selecting,
             CaptureState::Selected,
             CaptureState::Finishing,
         ] {
             let mut session = CaptureSession::new("session-1");
-            session.arm(frame(), &layout()).unwrap();
+            session.preparing().unwrap();
             match state {
-                CaptureState::Armed => {}
+                CaptureState::Preparing => {}
+                CaptureState::Armed => {
+                    session.arm(frame(), &layout()).unwrap();
+                }
                 CaptureState::Selecting => {
+                    session.arm(frame(), &layout()).unwrap();
                     session.overlay_ready().unwrap();
                     session.pointer_pressed(Point::new(10, 10));
                     session.pointer_moved(Point::new(200, 200));
                 }
                 CaptureState::Selected => {
+                    session.arm(frame(), &layout()).unwrap();
                     session.overlay_ready().unwrap();
                     session.pointer_pressed(Point::new(10, 10));
                     session.pointer_moved(Point::new(200, 200));
                     session.pointer_released();
                 }
                 CaptureState::Finishing => {
+                    session.arm(frame(), &layout()).unwrap();
                     session.overlay_ready().unwrap();
                     session.pointer_pressed(Point::new(10, 10));
                     session.pointer_moved(Point::new(200, 200));
@@ -402,8 +426,7 @@ mod tests {
                     session.begin_finish().unwrap();
                 }
                 CaptureState::Idle => unreachable!("idle is not an active state"),
-                CaptureState::Preparing
-                | CaptureState::Adjusting
+                CaptureState::Adjusting
                 | CaptureState::Annotating
                 | CaptureState::Exporting => {
                     unreachable!("{state:?} belongs to the docs/11 contract but is not reachable until its phase lands")
@@ -417,6 +440,27 @@ mod tests {
             assert!(session.frame().is_none());
             assert_eq!(session.selection(), Rect::default());
         }
+    }
+
+    #[test]
+    fn preparing_accepts_the_frame_and_arms_the_session() {
+        let mut session = CaptureSession::new("session-1");
+        session.preparing().unwrap();
+        assert_eq!(session.state(), CaptureState::Preparing);
+        session.arm(frame(), &layout()).unwrap();
+        assert_eq!(session.state(), CaptureState::Armed);
+    }
+
+    #[test]
+    fn preparing_cannot_be_entered_twice() {
+        let mut session = CaptureSession::new("session-1");
+        session.preparing().unwrap();
+        let error = session.preparing().unwrap_err();
+        assert_eq!(
+            error.error_code(),
+            crate::capture::error::CaptureErrorCode::InvalidState
+        );
+        assert_eq!(session.state(), CaptureState::Preparing);
     }
 
     #[test]

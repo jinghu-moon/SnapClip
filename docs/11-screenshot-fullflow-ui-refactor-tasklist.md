@@ -164,11 +164,11 @@ Idle
 
 状态规则：
 
-- [ ] `Preparing` 阶段 Esc 必须可取消；不能等 WGC 超时后才响应。
-- [ ] 每个会话有 `generation`；旧 worker 返回结果必须丢弃。
+- [x] `Preparing` 阶段 Esc 必须可取消；不能等 WGC 超时后才响应。
+- [x] 每个会话有 `generation`；旧 worker 返回结果必须丢弃。
 - [ ] F5 重复触发不得把旧 texture、selection、magnifier 或 label 带入新会话。
 - [ ] `Exporting` 期间 overlay 不再接收新的确认；失败回到 `Selected` 或结束会话，策略需明确。
-- [ ] 设备移除、窗口销毁、显示器变化和用户取消共用清理路径。
+- [x] 设备移除、窗口销毁、显示器变化和用户取消共用清理路径。
 
 ### 2.3 快捷键和鼠标行为
 
@@ -225,13 +225,13 @@ Application service
 
 #### WGC：静态截图首选
 
-- [ ] 复用 D3D11 device，不在每次 F5 创建 device。
-- [ ] 活跃会话创建 monitor `GraphicsCaptureItem`、frame pool 和 session。
-- [ ] 使用 `CreateFreeThreaded`，通过 `FrameArrived` 或条件变量等待首帧。
-- [ ] `SetIsCursorCaptureEnabled(false)`，由 overlay 自己绘制鼠标/准星，避免鼠标被重复捕获。
-- [ ] `SetIsBorderRequired(false)`；失败时只记录能力，不把截图整体判定为失败。
-- [ ] 首帧超时后 fallback 到 BitBlt，并记录 provider/failure reason。
-- [ ] 会话结束立即关闭 WGC session/frame pool，释放 frame 引用。
+- [x] 复用 D3D11 device，不在每次 F5 创建 device。
+- [x] 活跃会话创建 monitor `GraphicsCaptureItem`、frame pool 和 session。
+- [x] 使用 `CreateFreeThreaded`，通过 `FrameArrived` 或条件变量等待首帧。
+- [x] `SetIsCursorCaptureEnabled(false)`，由 overlay 自己绘制鼠标/准星，避免鼠标被重复捕获。
+- [x] `SetIsBorderRequired(false)`；失败时只记录能力，不把截图整体判定为失败。
+- [x] 首帧超时后 fallback 到 BitBlt，并记录 provider/failure reason。
+- [x] 会话结束立即关闭 WGC session/frame pool，释放 frame 引用。
 
 #### DXGI Desktop Duplication：录屏和增量捕获预留
 
@@ -269,10 +269,10 @@ PreparedFrame {
 
 任务：
 
-- [ ] `generation` 不匹配时丢弃 frame 并释放 GPU 引用。
-- [ ] channel 容量固定为 1，新请求覆盖旧请求。
-- [ ] Cancel 使用原子标志或轻量消息，不等待 worker join。
-- [ ] 记录 `monitor_ready/provider_ready/frame_ready/renderer_ready/visible` 时间戳。
+- [x] `generation` 不匹配时丢弃 frame 并释放 GPU 引用。
+- [x] channel 容量固定为 1，新请求覆盖旧请求。
+- [x] Cancel 使用原子标志或轻量消息，不等待 worker join。
+- [x] 记录 `monitor_ready/provider_ready/frame_ready/renderer_ready/visible` 时间戳。
 
 ---
 
@@ -831,12 +831,17 @@ src-tauri/src/
 
 ### Phase 1：捕获与 overlay 解耦
 
-- [ ] 实现 `CaptureWorker` 和容量 1 mailbox。
-- [ ] `WM_HOTKEY` 只提交 `StartRequest`。
-- [ ] overlay 在 Preparing 状态继续泵消息。
-- [ ] Esc 可取消 worker，旧 generation 结果丢弃。
-- [ ] WGC 改为 FrameArrived/条件等待。
-- [ ] 添加 WGC timeout、BitBlt fallback 和设备移除测试。
+- [x] 实现 `CaptureWorker` 和容量 1 mailbox。
+- [x] `WM_HOTKEY` 只提交 `StartRequest`。
+- [x] overlay 在 Preparing 状态继续泵消息。
+- [x] Esc 可取消 worker，旧 generation 结果丢弃。
+- [x] WGC 改为 FrameArrived/条件等待。
+- [x] 添加 WGC timeout、BitBlt fallback 和设备移除测试。
+
+> 真机 F5 回归额外发现并修复根因缺陷：`overlay_thread` 消息泵把 `PostThreadMessageW`
+> 线程消息（`FRAME_READY_MESSAGE`/`WM_OVERLAY_COMMAND`/Shutdown）交给 `DispatchMessageW`
+> 后被静默丢弃（`MSG.hwnd == NULL` 不进窗口过程），导致 overlay 永不停在 `Preparing`。
+> 已改为对线程消息直接 `controller.handle(...)`。证据见 docs/13 P1.4/P1.5。
 
 ### Phase 2：渲染节奏和分层
 
