@@ -4,8 +4,8 @@
 
 | 项目 | 内容 |
 |---|---|
-| 文档状态 | 设计基线，待进入 P0 实现 |
-| 目标 | 建设可被 SnapClip 及其他 Rust 项目复用的本地 OCR crate |
+| 文档状态 | rapid-ocr-rs 核心代码已实现；正式发布前验证与发布工程待执行 |
+| 目标 | 建设可被多个 Rust 项目复用的本地 OCR crate；SnapClip 适配后置 |
 | 首发模型 | PP-OCRv6 multi medium |
 | 首发运行时 | ONNX Runtime，通过 `ort` crate 接入 |
 | 首发平台 | 核心 API 跨平台；Windows 优先验证 CPU/DirectML；Linux 首发只承诺纯 CPU CI |
@@ -62,6 +62,8 @@ PaddleOCR 官方仓库当前说明：
 - PP-OCR 系列支持通过 ONNX Runtime 等后端部署；
 - PaddleOCR 项目代码采用 Apache-2.0。
 
+官方公开指标是通用场景/模型基准，不是 Windows UI、ClearType、高 DPI 截图的保证；本项目必须自行建立屏幕黄金集。
+
 来源：
 
 - <https://github.com/PaddlePaddle/PaddleOCR>
@@ -93,7 +95,22 @@ ONNX Runtime 官方项目定位为跨平台推理运行时，支持图优化和�
 - <https://ort.pyke.io/>
 - <https://onnxruntime.ai/docs/execution-providers/DirectML-ExecutionProvider.html>
 
+官方资料只能证明 ONNX Runtime/`ort` 提供 execution provider 和硬件加速接口，不能证明某个 OCR 模型在某个桌面 GPU 上一定更快。DirectML、CUDA、OpenVINO 等 provider 的启用必须与模型 shape、驱动、DLL 和硬件一起验证。
+
 本地参考项目 `refer/paddle-ocr-rs-main` 已验证以下组合：`ort` Session、DB 检测、CTC 识别、纯 Rust 图像预处理、CPU provider 和 DirectML provider 配置。新 crate 可以复用其算法思路，但不直接暴露其 CLI、在线下载和应用级配置。
+
+### 3.4 对审核报告的取舍
+
+| 建议 | 决策 | 原因 |
+|---|---|---|
+| 增加 BGRA/stride/DPI/ROI | 采纳 | 这是输入契约缺口，不依赖性能猜测即可验证 |
+| medium 直接作为桌面默认 | 不采纳 | 官方模型规模信息不等于屏幕延迟；先做 medium 基线、small 候选 |
+| 1920 长边固定限制 | 不采纳 | 高 DPI 小字可能被过度缩小；改为可配置策略、ROI 和分块 |
+| DirectML 默认加速 | 不采纳 | provider 可用不等于端到端更快；固定 CPU 基线并实测 |
+| 把服务线程/latest-wins 放进核心 | 不采纳 | 属于应用调度，不应污染可复用同步 API |
+| 加 `ocr-screen` Windows 适配层 | 采纳 | 集中处理 BGRA/WIC/DPI/unsafe，保持核心跨平台 |
+| P0 承诺字符级 words | 不采纳 | 当前 pipeline 没有经过验证的 CTC 字符坐标算法 |
+| Windows OCR 提前作为产品基线 | 部分采纳 | 在 SnapClip P1 做对照基准，但不成为通用 crate 依赖 |
 
 ## 4. 目标与非目标
 
@@ -163,6 +180,8 @@ pub struct ModelArtifact {
 ```
 
 `source_url` 只用于模型清单和开发工具，不在 OCR 主线程中访问网络。
+
+运行时加载器应同时支持 `Path` 和已校验的 `Bytes` 来源；`Bytes` 适合安装包资源、内嵌测试 fixture 或应用自有缓存，但不改变 manifest 的哈希校验要求。
 
 PP-OCRv6 medium 的参考 SHA-256：
 
@@ -244,16 +263,6 @@ pub struct PixelView<'a> {
 pub enum OcrInput<'a> {
     Encoded(&'a [u8]),
     Pixels(PixelView<'a>),
-    Rgb {
-        width: u32,
-        height: u32,
-        data: &'a [u8],
-    },
-    Rgba {
-        width: u32,
-        height: u32,
-        data: &'a [u8],
-    },
     File(&'a Path),
 }
 ```
@@ -291,7 +300,7 @@ pub struct PreprocessPolicy {
 pub trait OcrEngine {
     fn model_id(&self) -> &str;
     fn provider(&self) -> ProviderInfo;
-    fn recognize(&mut self, input: OcrInput<'_>) -> Result<OcrOutput, OcrError>;
+    fn recognize(&mut self, request: OcrRequest<'_>) -> Result<OcrOutput, OcrError>;
 }
 ```
 
@@ -342,6 +351,20 @@ pub struct ProviderInfo {
 ```
 
 provider 回退必须在初始化时明确记录。不能仅凭 provider 构造成功就宣称所有计算已在 GPU 执行，必须配合基准和运行日志验证。
+
+### 7.5 阶段 API
+
+整体 `recognize` 是首发稳定 API。实现可额外暴露以下阶段接口，供标注工具或渐进式 UI 使用：
+
+```rust
+fn detect(&mut self, request: DetectionRequest<'_>) -> Result<DetectionOutput, OcrError>;
+fn recognize_lines(
+    &mut self,
+    request: LineRecognitionRequest<'_>,
+) -> Result<Vec<OcrLine>, OcrError>;
+```
+
+阶段 API 必须复用同一模型、预处理和坐标契约，不能形成第二套算法路径；若阶段结果没有明确消费者，则不实现。
 
 ## 8. Pipeline 设计
 
@@ -402,6 +425,8 @@ cli = ["dep:clap"]
 
 `ort` 版本必须锁定并在 Windows CI 中构建验证。参考项目使用 `2.0.0-rc.10`；官方 `ort` 文档目前展示的 API reference 已到 `2.0.0-rc.13`，但不能仅凭版本号升级，必须在目标 Windows toolchain 上重新运行模型契约、DLL 加载、准确率和性能基准。
 
+Windows 发布自检必须确认实际加载的 ORT DLL 版本和路径，不能假设系统目录中的同名 DLL 与构建版本一致；发布包应将匹配的 DLL 放在应用可控的加载目录，并在 smoke test 中验证。
+
 DirectML 的 provider 可用不等于 OCR 更快。检测输入尺寸和识别行宽具有动态性，provider 选择、顺序执行/内存配置、shape bucket 和会话创建成本都必须实测。首发默认 CPU；应用只有在固定硬件和屏幕数据集上的 warm P95、峰值内存与准确率均满足门槛时才启用 DirectML。
 
 ## 10. 错误和取消
@@ -409,12 +434,14 @@ DirectML 的 provider 可用不等于 OCR 更快。检测输入尺寸和识别�
 ```rust
 pub enum OcrError {
     InvalidInput(String),
+    UnsupportedInput(String),
     Decode(String),
     ModelNotFound(PathBuf),
     ModelHashMismatch { expected: String, actual: String },
     ModelContract(String),
     ProviderUnavailable(String),
     Inference(String),
+    Timeout,
     Cancelled,
 }
 ```
@@ -426,9 +453,11 @@ pub enum OcrError {
 
 不能承诺任意模型推理都能立即中断。应用关闭时应停止接收任务、发出取消、等待 worker，并将未完成任务标记为可重试。
 
-## 11. SnapClip 适配方式
+受保护窗口黑屏、HDR 色调映射失败和捕获句柄错误属于 `ocr-screen`/捕获层错误，不伪装成“无文本”；核心 crate 只报告它实际观察到的输入为空、无文本或解码失败。
 
-SnapClip 只实现适配器：
+## 11. SnapClip 适配方式（发布后）
+
+rapid-ocr-rs 正式发布后，SnapClip 只实现适配器；本阶段不实施以下调用链：
 
 ```text
 SnapClip OcrEngine
@@ -453,6 +482,7 @@ SnapClip OcrEngine
 ### 12.1 单元测试
 
 - 输入通道和 stride 校验；
+- `PixelView` 的 BGRA/RGBA/RGB/Gray、bottom-up、padding stride 和 ROI 坐标映射；
 - PNG/JPEG 解码和 EXIF 方向；
 - 超大图片在完整解码前拒绝；
 - 模型 manifest 解析和 SHA-256 校验；
@@ -461,16 +491,19 @@ SnapClip OcrEngine
 - polygon 坐标反变换；
 - provider 不可用时 CPU fallback；
 - 取消状态在每个阶段边界生效。
+- 属性测试覆盖 stride、尺寸乘法、ROI 往返映射；纯 Rust 像素核可增加 fuzz 测试。
 
 ### 12.2 集成测试
 
-固定一组不包含隐私内容的中英文截图：
+固定一组不包含隐私内容的屏幕黄金集和通用图片：
 
 - 中文短句；
 - 英文和数字混排；
 - 多行 UI 文本；
 - 小字号和高 DPI 截图；
-- 旋转文本（预期第一版不保证）。
+- 深色/浅色主题、低对比度、ClearType；
+- IDE/终端/网页/聊天/表格等真实场景；
+- 旋转文本（第一版不保证，仅记录能力边界）。
 
 验收指标：
 
@@ -483,6 +516,8 @@ SnapClip OcrEngine
 | 线程安全 | 单 engine 串行无数据竞争，多实例行为明确 |
 | 部署 | 离线环境可启动和识别 |
 
+精度指标至少包含：字符错误率（CER）、行检测召回/精度、polygon IoU，以及数字、URL、路径等关键字段的整串准确率。屏幕黄金集建议由 DirectWrite 合成样本加少量人工脱敏截图组成；样本和标注不进入运行时 crate。
+
 ### 12.3 性能基准
 
 必须分别记录：
@@ -494,8 +529,10 @@ SnapClip OcrEngine
 - 常驻内存和峰值内存；
 - CPU provider 与 DirectML provider 对比；
 - medium、small、tiny 对比。
+- 端到端 warm P50/P95、ROI 尺寸分档、峰值内存和空闲内存；
+- CPU 与 DirectML 的同机对比，检测和识别阶段分别记录。
 
-不在没有基准数据的情况下声称 DirectML 更快或 medium 更准确。
+P0 通过门槛必须包含屏幕黄金集 CER/检测召回和 warm P95；CI 性能只做相对回归，发布基准在固定硬件上执行。不在没有基准数据的情况下声称 DirectML 更快或 medium 更准确。
 
 ## 13. 许可证和供应链
 
@@ -512,13 +549,16 @@ SnapClip OcrEngine
 
 ## 14. 实施阶段
 
-### P0：模型包和 Session 契约
+### P0：输入、模型包和 CPU Session 契约
 
 - 固定 PP-OCRv6 medium 三件套；
+- 实现 `PixelView`、stride/ROI 校验和 `OcrRequest`；
 - 建立 manifest 和 SHA-256 校验；
 - 加载 detector/recognizer Session；
 - 验证输入输出 tensor contract；
-- 完成最小 fixture smoke test。
+- 完成 tiny/small fixture smoke test 和 medium 契约测试；
+- 建立屏幕黄金集、CER/检测召回计算和 CPU warm P50/P95 harness；
+- 以 medium 建立准确率基线，以 small 建立桌面默认候选。
 
 ### P1：完整 pipeline
 
@@ -526,22 +566,26 @@ SnapClip OcrEngine
 - 实现文本区域裁剪；
 - 实现 recognizer batch preprocess 和 CTC decode；
 - 输出 `OcrOutput`。
+- 实现融合预处理评估、识别宽度分桶和 ROI 快速路径；
+- `ocr-screen` 完成 Windows BGRA/WIC/DPI 适配，但不把捕获 API 放入核心。
+- SnapClip 同期保留/测量现有 Windows OCR 作为零模型体积基线；它属于 `ocr-win`/应用层，不作为本 crate 的依赖。
 
-### P2：性能和 provider
+### P2：性能和 provider 实验
 
 - 常驻 Session；
 - scratch buffer 复用；
 - medium/small/tiny profile；
 - CPU 基准；
-- DirectML 实机验证和 fallback。
+- DirectML 实机验证和 fallback；
+- 仅在同机数据证明收益时启用 shape bucket、provider 特化或 GPU 预处理；
+- 空闲卸载/预热由应用 service layer 评估。
 
-### P3：应用适配
+### P3：应用适配（暂缓）
 
-- SnapClip adapter；
-- Windows OCR fallback；
-- OCR layout 入库；
-- 搜索和 UI 展示；
-- 关闭、取消、失败重试回归。
+- 本阶段不进入 `rapid-ocr-rs` 首次发布范围；
+- rapid-ocr-rs 正式发布后，再由各应用实现独立适配器；
+- SnapClip 的数据库、队列、Windows OCR fallback、搜索和 UI 不属于本轮验收；
+- 适配前必须基于已发布 crate API 增加应用级前后回归测试。
 
 ### P4：发布和复用
 
@@ -552,6 +596,15 @@ SnapClip OcrEngine
 - `ocr-cli` 示例程序。
 
 ## 15. 最终决策
+
+### 15.1 当前实现状态（2026-09-30）
+
+- `crates/rapid-ocr-rs` 已从参考项目独立为内部可复用 crate，统一到 `ort 2.0.0-rc.13` 实际 API 和 `ndarray 0.17`；默认 CPU，DirectML 仅 Windows 可选，CUDA/CANN 为显式 feature。
+- `PixelView::to_bgr` 已覆盖 BGRA/RGBA/RGB/Gray、stride、bottom-up、ROI；编码图片/文件在读取尺寸后执行像素上限检查。
+- `RapidOcrEngine` 已实现通用 `OcrEngine` trait，输出文本、行 polygon、阶段耗时和 provider 回退信息；本轮只验证 crate 公共 API，不把任何应用适配视为发布条件。
+- SnapClip 适配、数据库字段、应用队列、Windows OCR fallback、搜索和 UI 均不属于本轮 rapid-ocr-rs 发布验收；现有应用改动保持独立，待 crate 正式发布后重新评估。
+- 当前没有随仓库提交模型权重。模型 manifest、权重校验和离线 smoke test 由 crate 使用方或发布包单独管理。
+- 尚未声称 PP-OCRv6 的真实准确率、DirectML 性能或语言包覆盖；屏幕黄金集、真机基准和离线打包验收仍是发布前任务。
 
 通用 crate 的第一条可执行基线是：
 
@@ -565,7 +618,15 @@ Rust pipeline
   + cls disabled
 ```
 
-`small` 和 `tiny` 作为同构 profile 预留并进行基准，不增加第二套算法实现。模型文件、应用队列、数据库和 UI 分离，确保该 crate 可以脱离 SnapClip 被其他项目复用。
+这只是准确率和模型契约基线，不是桌面默认档。`small` 是首选默认候选，`tiny` 是吞吐候选；必须经过同一屏幕黄金集和固定硬件基准后才能拍板。模型文件、应用队列、数据库和 UI 分离，确保该 crate 可以脱离 SnapClip 被其他项目复用。只有完成发布验收并发布 crate 后，才开始 SnapClip 适配。
+
+P0 完成的判定不是“模型能跑”，而是同时满足：
+
+1. `Encoded` 与 `PixelView(BGRA/RGBA/RGB + stride + ROI)` 都能离线识别；
+2. medium 契约和 small/tiny 冒烟测试通过；
+3. 屏幕黄金集有 CER、检测召回和关键字段准确率基线；
+4. CPU warm P95、峰值内存和取消/错误路径可观测；
+5. DirectML 未经同机基准证明前不作为默认 provider。
 
 ## 16. 参考资料
 

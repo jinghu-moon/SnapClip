@@ -6,14 +6,12 @@ mod ocr;
 mod platform;
 pub mod store;
 
-use std::sync::Arc;
-
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use tauri::Manager;
 
 use crate::{
     domain::{HistoryPage, IpcError, OcrErrorCode, OcrStatus, PayloadKind},
-    ocr::{OcrService, OcrServiceHandle, WindowsOcrEngine},
+    ocr::{OcrManager, OcrService, OcrServiceHandle},
     store::{OcrCandidateFilter, QueueDecision, Store},
 };
 
@@ -282,13 +280,15 @@ pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             let root = app.path().app_local_data_dir()?;
-            let store =
-                Store::open(root).map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
+            let store = Store::open(&root)
+                .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
             app.manage(store.clone());
             #[cfg(windows)]
             icon::init_state(app.handle())?;
 
-            let engine = Arc::new(WindowsOcrEngine::new()) as Arc<dyn ocr::OcrEngine>;
+            let engine =
+                std::sync::Arc::new(OcrManager::new(root.join("models/ocr/ppocrv6-medium")))
+                    as std::sync::Arc<dyn ocr::OcrEngine>;
             let ocr_handle = OcrService::start(store.clone(), app.handle().clone(), engine);
             let enqueuer = ocr_handle.enqueuer();
             app.manage(ocr_handle);

@@ -1,0 +1,263 @@
+/* SnapClip Primitive Tokens
+ * Stable scales, typography primitives, motion, layers, and raw color palettes.
+ * Layer source for prototypes/design-tokens-generic-v4.html.
+ */
+@font-face {
+   font-family : HarmonyOS;
+   src         : url('../assets/HarmonyOS_SansSC_Regular.woff2') format('woff2');
+   font-weight : 400;
+   font-display: swap
+}
+
+@font-face {
+   font-family : HarmonyOS;
+   src         : url('../assets/HarmonyOS_SansSC_Medium.woff2') format('woff2');
+   font-weight : 500;
+   font-display: swap
+}
+
+@font-face {
+   font-family : HarmonyOS;
+   src         : url('../assets/HarmonyOS_SansSC_Semibold.woff2') format('woff2');
+   font-weight : 600;
+   font-display: swap
+}
+
+@font-face {
+   font-family : HarmonyOS;
+   src         : url('../assets/HarmonyOS_SansSC_Bold.woff2') format('woff2');
+   font-weight : 700;
+   font-display: swap
+}
+
+@font-face {
+   font-family : FiraCode;
+   src         : url('../assets/FiraCode-Regular.woff2') format('woff2');
+   font-weight : 400;
+   font-display: swap
+}
+
+@font-face {
+   font-family : TCloudNumber;
+   src         : url('../assets/TCloudNumber-Regular.woff2') format('woff2');
+   font-weight : 400;
+   font-display: swap
+}
+
+:root {
+   --font-ui                   : HarmonyOS, system-ui, sans-serif;
+   --font-mono                 : FiraCode, ui-monospace, Consolas, monospace;
+   --font-number               : TCloudNumber, var(--font-mono);
+   --weight-regular            : 400;
+   --weight-medium             : 500;
+   --weight-semibold           : 600;
+   --weight-display            : 700;
+   --font-size-sm              : 12px;
+   --font-size-md              : 14px;
+   --font-size-lg              : 16px;
+   --font-size-xl              : 20px;
+   --font-size-2xl             : 24px;
+   --font-size-3xl             : 32px;
+   --font-size-display         : 40px;
+   --line-height-sm            : 16px;
+   --line-height-md            : 20px;
+   --line-height-lg            : 24px;
+   --line-height-xl            : 28px;
+   --line-height-2xl           : 32px;
+   --line-height-3xl           : 40px;
+   --line-height-display       : 48px;
+   --leading-tight             : 1.25;
+   --leading-normal            : 1.5;
+   --leading-relaxed           : 1.65;
+   --tracking-normal           : 0;
+   --tracking-wide             : .04em;
+   --space-0                   : 0px;
+   --space-2                   : 2px;
+   --space-4                   : 4px;
+   --space-8                   : 8px;
+   --space-12                  : 12px;
+   --space-16                  : 16px;
+   --space-24                  : 24px;
+   --space-32                  : 32px;
+   --space-48                  : 48px;
+   --space-64                  : 64px;
+   --size-12                   : 12px;
+   --size-16                   : 16px;
+   --size-20                   : 20px;
+   --size-24                   : 24px;
+   --size-28                   : 28px;
+   --size-32                   : 32px;
+   --size-40                   : 40px;
+   --size-48                   : 48px;
+   --size-56                   : 56px;
+   --radius-base               : 8px;
+   --radius-none               : 0px;
+   --radius-xs                 : calc(var(--radius-base)/4);
+   --radius-sm                 : calc(var(--radius-base)/2);
+   --radius-md                 : var(--radius-base);
+   --radius-lg                 : calc(var(--radius-base)*1.5);
+   --radius-xl                 : calc(var(--radius-base)*2);
+   --radius-full               : 9999px;
+   --border-0                  : 0px;
+   --border-1                  : 1px;
+   --border-2                  : 2px;
+   --border-3                  : 3px;
+   --border-4                  : 4px;
+   --border-5                  : 5px;
+   --focus-width               : var(--border-2);
+   --focus-offset              : var(--space-2);
+   --duration-fast             : 100ms;
+   --duration-normal           : 200ms;
+   --duration-slow             : 300ms;
+   --ease-standard             : cubic-bezier(.2, 0, .38, .9);
+   --ease-enter                : cubic-bezier(0, 0, .38, .9);
+   --ease-exit                 : cubic-bezier(.2, 0, 1, .9);
+   --opacity-hover             : .08;
+   --opacity-focus             : .10;
+   --opacity-pressed           : .10;
+   --opacity-dragged           : .16;
+   --opacity-disabled-content  : .38;
+   --opacity-disabled-container: .12;
+   --layer-base                : 0;
+   --layer-sticky              : 10;
+   --layer-dialog              : 20;
+   --layer-popover             : 30;
+   --layer-tooltip             : 40;
+   --layer-toast               : 50;
+   --gap-control-group         : var(--space-8);
+   --gap-form-field            : var(--space-12);
+   --gap-section               : var(--space-24);
+   --gap-page-section          : var(--space-32);
+   --neutral-0                 : #fff;
+   --neutral-50                : #fafafa;
+   --neutral-100               : #f5f5f5;
+   --neutral-200               : #eee;
+   --neutral-300               : #e0e0e0;
+   --neutral-400               : #c7c7c7;
+   --neutral-500               : #a3a3a3;
+   --neutral-600               : #737373;
+   --neutral-700               : #525252;
+   --neutral-800               : #333;
+   --neutral-900               : #1f1f1f;
+   --neutral-950               : #121212;
+   --neutral-1000              : #000;
+   --blue-50                   : #f4f9fc;
+   --blue-100                  : #e5f1f7;
+   --blue-200                  : #c6e2ee;
+   --blue-300                  : #a1ccde;
+   --blue-400                  : #7ab3cb;
+   --blue-500                  : #5a96b2;
+   --blue-600                  : #477b94;
+   --blue-700                  : #3b647a;
+   --blue-800                  : #325364;
+   --blue-900                  : #2b4351;
+   --blue-950                  : #192a35;
+   --red-50                    : #fff8f7;
+   --red-100                   : #ffecea;
+   --red-200                   : #ffd5d1;
+   --red-300                   : #feb3ab;
+   --red-400                   : #f6887e;
+   --red-500                   : #e66a5e;
+   --red-600                   : #c75146;
+   --red-700                   : #a14138;
+   --red-800                   : #843933;
+   --red-900                   : #6d342f;
+   --red-950                   : #3c1714;
+   --amber-50                  : #fffaed;
+   --amber-100                 : #fff4d3;
+   --amber-200                 : #ffe397;
+   --amber-300                 : #ffcd5c;
+   --amber-400                 : #f6b435;
+   --amber-500                 : #d69629;
+   --amber-600                 : #b37622;
+   --amber-700                 : #905a1d;
+   --amber-800                 : #75471b;
+   --amber-900                 : #623a1a;
+   --amber-950                 : #381d09;
+   --green-50                  : #f3faf6;
+   --green-100                 : #e0f2e7;
+   --green-200                 : #c1e6cf;
+   --green-300                 : #98d2ae;
+   --green-400                 : #6fb98d;
+   --green-500                 : #509b71;
+   --green-600                 : #40805c;
+   --green-700                 : #37674c;
+   --green-800                 : #2f523e;
+   --green-900                 : #274234;
+   --green-950                 : #12241b;
+   --azure-50                  : #f4f8fe;
+   --azure-100                 : #e6f0ff;
+   --azure-200                 : #cae0ff;
+   --azure-300                 : #a1c9ff;
+   --azure-400                 : #71adff;
+   --azure-500                 : #3c8ef7;
+   --azure-600                 : #1f75db;
+   --azure-700                 : #125fb8;
+   --azure-800                 : #0b4c97;
+   --azure-900                 : #0f3d76;
+   --azure-950                 : #0a284d;
+   --width-sm                  : 192px;
+   --width-md                  : 320px;
+   --width-lg                  : 480px;
+   --width-xl                  : 640px;
+   --container-text            : 720px;
+   --container-page            : 1180px
+}
+
+[data-theme=dark] {
+   --blue-50  : #f2f7fa;
+   --blue-100 : #e2eef4;
+   --blue-200 : #c1dce8;
+   --blue-300 : #98c3d5;
+   --blue-400 : #6fa8c0;
+   --blue-500 : #4e8aa5;
+   --blue-600 : #3b6f88;
+   --blue-700 : #315a70;
+   --blue-800 : #2b4c5d;
+   --blue-900 : #273f4c;
+   --blue-950 : #172832;
+   --red-50   : #fff5f4;
+   --red-100  : #fee8e6;
+   --red-200  : #fbcfcb;
+   --red-300  : #f5aaa3;
+   --red-400  : #ea7d73;
+   --red-500  : #d85d52;
+   --red-600  : #b9443a;
+   --red-700  : #96372f;
+   --red-800  : #7c322c;
+   --red-900  : #682f2b;
+   --red-950  : #391512;
+   --amber-50 : #fff9eb;
+   --amber-100: #fff0c6;
+   --amber-200: #fcdd88;
+   --amber-300: #f7c44d;
+   --amber-400: #eaa923;
+   --amber-500: #c98a12;
+   --amber-600: #a66a0d;
+   --amber-700: #85500f;
+   --amber-800: #6e4013;
+   --amber-900: #5d3615;
+   --amber-950: #351b07;
+   --green-50 : #f1f8f4;
+   --green-100: #ddefe4;
+   --green-200: #bce0ca;
+   --green-300: #8fc9a5;
+   --green-400: #64ae82;
+   --green-500: #438f65;
+   --green-600: #347451;
+   --green-700: #2d5d43;
+   --green-800: #284b38;
+   --green-900: #233e30;
+   --green-950: #102219;
+   --azure-50 : #f1f7ff;
+   --azure-100: #dfecfe;
+   --azure-200: #bed9fe;
+   --azure-300: #93c1ff;
+   --azure-400: #60a0f5;
+   --azure-500: #3581e2;
+   --azure-600: #1d67c1;
+   --azure-700: #17549e;
+   --azure-800: #174782;
+   --azure-900: #1a3c67;
+   --azure-950: #0f2644
+}

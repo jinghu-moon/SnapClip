@@ -1,0 +1,1666 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OCR 文本定位测试图 · 多案例集</title>
+<style>
+  :root { color-scheme: light; }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: #f3f5f7;
+    color: #18212b;
+    font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+
+  /* ---------------- 顶栏 ---------------- */
+  .topbar {
+    position: sticky;
+    top: 0;
+    z-index: 30;
+    background: #fff;
+    border-bottom: 1px solid #d9e0e6;
+    box-shadow: 0 2px 10px rgb(17 31 44 / 6%);
+  }
+
+  .topbar-inner {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 14px;
+    width: min(1600px, calc(100% - 48px));
+    margin: 0 auto;
+    padding: 13px 0;
+  }
+
+  .brand h1 { margin: 0; font-size: 19px; letter-spacing: 0; }
+  .brand p { margin: 3px 0 0; font-size: 12.5px; color: #64717d; }
+
+  .spacer { flex: 1 1 auto; }
+
+  .case-picker { display: flex; align-items: center; gap: 8px; }
+
+  select {
+    min-width: 300px;
+    padding: 7px 10px;
+    border: 1px solid #d9e0e6;
+    border-radius: 6px;
+    background: #fff;
+    color: #18212b;
+    font: inherit;
+    font-size: 13.5px;
+  }
+
+  button {
+    padding: 7px 12px;
+    border: 1px solid #d9e0e6;
+    border-radius: 6px;
+    background: #fff;
+    color: #18212b;
+    font: inherit;
+    font-size: 13px;
+    cursor: pointer;
+    transition: background .12s, border-color .12s;
+  }
+  button:hover:not(:disabled) { background: #f6f9fa; border-color: #b9c8d0; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+
+  button.primary {
+    background: #176b87;
+    border-color: #176b87;
+    color: #fff;
+    font-weight: 600;
+  }
+  button.primary:hover:not(:disabled) { background: #125a72; border-color: #125a72; }
+
+  .toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    color: #64717d;
+    cursor: pointer;
+    user-select: none;
+  }
+  .toggle input { accent-color: #176b87; }
+
+  /* ---------------- 主区域 ---------------- */
+  .viewport {
+    width: min(1600px, calc(100% - 48px));
+    margin: 18px auto 48px;
+  }
+
+  .stage-info {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 6px;
+  }
+
+  .stage-info .title { font-size: 15px; font-weight: 700; }
+  .stage-info .size { font-size: 12.5px; color: #64717d; font-variant-numeric: tabular-nums; }
+
+  .case-desc {
+    margin: 0 0 12px;
+    font-size: 13px;
+    line-height: 1.6;
+    color: #64717d;
+  }
+
+  .stage-wrap {
+    overflow: auto;
+    border: 1px solid #c9d1d8;
+    background: #dfe4e8;
+    box-shadow: 0 8px 24px rgb(17 31 44 / 10%);
+  }
+
+  .stage { position: relative; }
+
+  /* ---------------- 画布 ---------------- */
+  .canvas {
+    --ink: #18212b;
+    --muted: #64717d;
+    --line: #d9e0e6;
+    --accent: #176b87;
+
+    display: none;
+    position: relative;
+    width: 1600px;
+    height: 1000px;
+    overflow: hidden;
+    isolation: isolate;
+    background: #fff;
+    color: var(--ink);
+    font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+    font-size: 16px;
+    line-height: 1.4;
+  }
+
+  .canvas.active { display: block; }
+
+  .canvas.grid {
+    background-image:
+      linear-gradient(to right, rgb(31 80 102 / 8%) 1px, transparent 1px),
+      linear-gradient(to bottom, rgb(31 80 102 / 8%) 1px, transparent 1px);
+    background-size: 80px 80px;
+  }
+
+  .region {
+    position: absolute;
+    z-index: 1;
+    line-height: 1.35;
+  }
+
+  .region-label {
+    display: none;
+    position: absolute;
+    top: -20px;
+    left: 0;
+    padding: 2px 5px;
+    border-radius: 3px;
+    background: #176b87;
+    color: #fff;
+    font: 11px/1.2 Consolas, monospace;
+    white-space: nowrap;
+    writing-mode: horizontal-tb;
+    pointer-events: none;
+  }
+
+  .canvas.labels .region-label { display: block; }
+
+  /* ---------------- 通用文本组件 ---------------- */
+  .t-eyebrow {
+    color: #176b87;
+    font-size: 14px;
+    font-weight: 700;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+  }
+
+  .t-h {
+    margin: 6px 0;
+    color: #101820;
+    font-size: 44px;
+    font-weight: 700;
+    line-height: 1.12;
+    letter-spacing: 0;
+  }
+
+  .t-sub { margin: 0; color: #53616c; font-size: 19px; }
+
+  .t-panel {
+    padding: 16px 20px;
+    border: 1px solid #c8d9df;
+    border-left: 5px solid #176b87;
+    background: #f1f8fa;
+    color: #214655;
+    font-size: 17px;
+  }
+  .t-panel strong { display: block; margin-bottom: 3px; font-size: 20px; }
+
+  .t-card {
+    padding: 16px 18px;
+    border: 1px solid #d5dee4;
+    border-radius: 8px;
+    background: #fff;
+  }
+  .t-card b { display: block; margin-bottom: 6px; color: #176b87; font-size: 14px; letter-spacing: .5px; }
+  .t-card p { margin: 0 0 8px; font-size: 19px; line-height: 1.7; color: #1d2a33; }
+  .t-card small { color: #7b878f; font-size: 13px; }
+
+  .t-code {
+    padding: 14px 18px;
+    border: 1px solid #303b43;
+    border-radius: 6px;
+    background: #1d252b;
+    color: #d7e4e8;
+    font: 15px/1.7 Consolas, "Cascadia Mono", monospace;
+    white-space: pre;
+    overflow: hidden;
+  }
+  .t-code .c { color: #74d1d8; }
+  .t-code .y { color: #f3c969; }
+  .t-code .g { color: #93d6a2; }
+  .t-code .m { color: #8b98a2; }
+
+  .t-code-light {
+    padding: 14px 18px;
+    border: 1px solid #dbe3e8;
+    border-radius: 6px;
+    background: #f7fafb;
+    color: #24333d;
+    font: 15px/1.7 Consolas, "Cascadia Mono", monospace;
+    white-space: pre;
+    overflow: hidden;
+  }
+  .t-code-light .k { color: #a4398c; }
+  .t-code-light .s { color: #2c7a3f; }
+  .t-code-light .n { color: #1f5c9a; }
+
+  .t-serif {
+    color: #433c38;
+    font-family: Georgia, "Songti SC", serif;
+    font-size: 24px;
+    font-style: italic;
+  }
+
+  .t-number {
+    color: #ad3f32;
+    font-size: 42px;
+    font-weight: 800;
+    font-variant-numeric: tabular-nums;
+  }
+  .t-number small { color: #71808a; font-size: 16px; font-weight: 500; }
+
+  .t-url {
+    color: #1f5c9a;
+    font: 17px Consolas, "Cascadia Mono", monospace;
+    text-decoration: underline;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 4px;
+    overflow-wrap: anywhere;
+  }
+
+  .t-quote {
+    padding-left: 16px;
+    border-left: 4px solid #d5a23d;
+    color: #5c4c25;
+    font-size: 18px;
+  }
+  .t-quote em { font-style: normal; font-weight: 700; }
+
+  .t-badge {
+    display: inline-block;
+    padding: 7px 13px;
+    border-radius: 18px;
+    background: #e2f2e6;
+    color: #27633b;
+    font-size: 16px;
+    font-weight: 700;
+  }
+
+  .t-caption { color: #67747d; font-size: 15px; }
+
+  .t-path {
+    padding: 11px 15px;
+    border: 1px dashed #9aabb5;
+    color: #536a74;
+    font: 15px Consolas, "Cascadia Mono", monospace;
+    overflow-wrap: anywhere;
+  }
+
+  .t-dark {
+    padding: 16px 20px;
+    background: #2f3d46;
+    color: #f3f5f6;
+    font-size: 17px;
+  }
+  .t-dark span { color: #96d3dc; }
+
+  .t-columns {
+    column-count: 3;
+    column-gap: 28px;
+    color: #34434e;
+    font-size: 15px;
+    line-height: 1.6;
+    text-align: justify;
+  }
+  .t-columns p { margin: 0 0 10px; }
+
+  .t-highlight {
+    padding: 14px 18px;
+    background: #fff2a8;
+    color: #54440d;
+    font-size: 20px;
+    font-weight: 700;
+  }
+
+  .t-vertical {
+    writing-mode: vertical-rl;
+    text-orientation: mixed;
+    letter-spacing: 4px;
+    color: #7b3e83;
+    font-family: "Yu Mincho", "Songti SC", serif;
+    font-size: 20px;
+  }
+
+  .t-rot {
+    padding: 12px 16px;
+    border: 1px solid #bcd5dd;
+    border-radius: 6px;
+    background: #eef6f8;
+    color: #176b87;
+    font-size: 19px;
+    font-weight: 700;
+    text-align: center;
+  }
+
+  .t-micro { color: #a1a9ad; font: 12px Consolas, monospace; }
+
+  .t-smallprint { color: #7e898f; font-size: 13px; line-height: 1.55; }
+
+  .t-kv { font-size: 14px; }
+  .t-kv-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 5px 0;
+    border-bottom: 1px dashed #d7dfe4;
+  }
+  .t-kv-row .k { color: #64717d; }
+  .t-kv-row .v { color: #18212b; font-weight: 600; font-family: Consolas, monospace; }
+
+  .t-table { width: 100%; border-collapse: collapse; font-size: 14px; color: #2c3b45; }
+  .t-table th, .t-table td { border: 1px solid #c7d2d9; padding: 6px 10px; text-align: left; }
+  .t-table th { background: #eef4f6; font-weight: 700; }
+  .t-table .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .t-table caption { caption-side: top; text-align: left; padding-bottom: 6px; font-size: 13px; color: #64717d; }
+
+  /* ---------------- 页脚 ---------------- */
+  footer {
+    width: min(1600px, calc(100% - 48px));
+    margin: 0 auto 40px;
+    color: #64717d;
+    font-size: 13px;
+    line-height: 1.8;
+  }
+
+  .hint {
+    padding: 14px 18px;
+    border: 1px solid #dbe3e8;
+    border-radius: 8px;
+    background: #fff;
+  }
+  .hint b { color: #18212b; }
+
+  @media (max-width: 1280px) {
+    .topbar-inner { width: calc(100% - 32px); }
+    .viewport { width: calc(100% - 32px); }
+    footer { width: calc(100% - 32px); }
+    select { min-width: 220px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">
+      <h1>OCR 文本定位测试图</h1>
+      <p>12 张独立案例图 · 覆盖字形、方向、对比度、结构与混排</p>
+    </div>
+
+    <div class="spacer"></div>
+
+    <div class="case-picker">
+      <button id="prev" title="上一个（←）">←</button>
+      <select id="caseSelect" aria-label="选择案例"></select>
+      <button id="next" title="下一个（→）">→</button>
+    </div>
+
+    <label class="toggle"><input id="grid" type="checkbox">网格</label>
+    <label class="toggle"><input id="labels" type="checkbox">编号</label>
+
+    <button id="download" class="primary">下载当前 PNG</button>
+    <button id="downloadAll">下载全部</button>
+  </div>
+</div>
+
+<main class="viewport">
+  <div class="stage-info">
+    <span class="title" id="caseTitle"></span>
+    <span class="size" id="caseSize">1600 × 1000 px · 导出 2×</span>
+  </div>
+  <p class="case-desc" id="caseDesc"></p>
+
+  <div class="stage-wrap">
+    <div class="stage" id="stage">
+
+      <!-- ============================================================
+           案例 01 · 基础多位置文本
+           ============================================================ -->
+      <section class="canvas active"
+               data-title="基础多位置文本"
+               data-file="ocr-test-01-basic"
+               data-desc="标题、卡片、衬线体、大号数字、代码、URL、分栏正文、路径、深色块等常见排版，验证常规文本行的四边形定位。">
+
+        <div class="region" style="top:60px;left:80px;width:780px">
+          <span class="region-label">R01 hero</span>
+          <div class="t-eyebrow">Visual text benchmark</div>
+          <h2 class="t-h">多位置文本定位实验</h2>
+          <p class="t-sub">Mixed language: Clipboard OCR / 图片文字识别</p>
+        </div>
+
+        <div class="region t-panel" style="top:60px;left:980px;width:540px">
+          <span class="region-label">R02 panel</span>
+          <strong>状态：识别队列运行中</strong>
+          Windows / Local / No cloud service
+        </div>
+
+        <div class="region t-serif" style="top:250px;left:80px;width:560px">
+          <span class="region-label">R03 serif</span>
+          清晰的字形、适度的间距，以及不同的字体，都应该被稳定地检测出来。
+        </div>
+
+        <div class="region t-number" style="top:248px;left:700px">
+          <span class="region-label">R04 number</span>
+          98.76% <small>confidence</small>
+        </div>
+
+        <div class="region t-code" style="top:320px;left:980px;width:540px"><span class="region-label">R05 code</span><span class="c">let</span> result = <span class="y">ocr</span>.<span class="g">recognize</span>(image);
+<span class="c">assert</span>!(result.lines.len() &gt; <span class="y">0</span>);
+<span class="m">// polygon coordinates: (x, y)</span></div>
+
+        <div class="region t-url" style="top:400px;left:80px;width:520px">
+          <span class="region-label">R06 url</span>
+          https://github.com/rapidocr/rapid-ocr-rs
+        </div>
+
+        <div class="region" style="top:402px;left:700px">
+          <span class="region-label">R07 badge</span>
+          <span class="t-badge">PASS · LOCAL OCR</span>
+        </div>
+
+        <div class="region t-caption" style="top:452px;left:700px;width:250px">
+          <span class="region-label">R08 caption</span>
+          小字号 caption：tiny text / 细节测试 2026-09-30
+        </div>
+
+        <div class="region t-quote" style="top:470px;left:130px;width:440px">
+          <span class="region-label">R09 quote</span>
+          “<em>识别结果应该带着它在原图中的位置。</em>”<br>
+          <span style="font-size:16px">Coordinates make the result actionable.</span>
+        </div>
+
+        <div class="region t-columns" style="top:580px;left:80px;width:820px">
+          <span class="region-label">R10 columns</span>
+          <p>第一列：图片中的文字可能出现在边缘、卡片、标题或段落内部，检测器需要返回稳定的四边形坐标。</p>
+          <p>行距变化与中英混排 Mixed CJK + Latin text 都可能影响检测框的高度。</p>
+          <p>第二列：The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs.</p>
+          <p>Multiple regions should remain independently selectable after OCR is complete.</p>
+          <p>第三列：编号 A-17、版本 v0.4.2、温度 23.5°C、日期 2026/09/30，以及中英混排内容。</p>
+          <p>保持行间距和字距变化，检查识别框是否互相覆盖。</p>
+        </div>
+
+        <div class="region t-highlight" style="top:660px;left:980px;width:540px;transform:rotate(-2.5deg)">
+          <span class="region-label">R11 rotated-box</span>
+          重点文本：请返回这个黄色区域的旋转四边形。
+        </div>
+
+        <div class="region t-path" style="top:840px;left:80px;width:600px">
+          <span class="region-label">R12 path</span>
+          C:\Users\seeyuer\Projects\SnapClip\OCR-Model\PP-OCRv6\det.onnx
+        </div>
+
+        <div class="region t-dark" style="top:840px;left:720px;width:460px">
+          <span class="region-label">R13 dark</span>
+          深色背景上的浅色文本也需要被识别：<span>Invert / Contrast / 边界</span>
+        </div>
+
+        <div class="region t-micro" style="top:950px;left:80px">
+          <span class="region-label">R14 micro</span>
+          x: 1480  y: 912  score: 0.931
+        </div>
+
+        <div class="region t-smallprint" style="top:938px;left:1010px;width:500px">
+          <span class="region-label">R15 small-print</span>
+          边缘小字：Text near the corner tests padding, clipping and coordinate mapping. 请确认输出坐标仍在原图范围内。
+        </div>
+      </section>
+
+      <!-- ============================================================
+           案例 02 · 多语言与 RTL 混排
+           ============================================================ -->
+      <section class="canvas"
+               data-title="多语言与 RTL 混排"
+               data-file="ocr-test-02-multilingual"
+               data-desc="日语、韩语、俄语、阿拉伯语（RTL）、泰语、希伯来语与中英混排，验证多语种字形检测与文字方向判定。">
+
+        <div class="region" style="top:44px;left:80px;width:1440px">
+          <span class="region-label">R01 title</span>
+          <div class="t-eyebrow">Multilingual coverage</div>
+          <h2 class="t-h" style="font-size:38px">多语言与 RTL 文本混排</h2>
+        </div>
+
+        <div class="region t-card" style="top:180px;left:80px;width:450px">
+          <span class="region-label">R02 ja</span>
+          <b>日本語 · Japanese</b>
+          <p>文字認識の精度を確認するためのテスト文です。</p>
+          <small>用于确认日语文字识别精度。</small>
+        </div>
+
+        <div class="region t-card" style="top:180px;left:570px;width:450px">
+          <span class="region-label">R03 ko</span>
+          <b>한국어 · Korean</b>
+          <p>문자 인식 정확도를 확인하는 테스트입니다.</p>
+          <small>用于确认韩语文字识别精度。</small>
+        </div>
+
+        <div class="region t-card" style="top:180px;left:1060px;width:460px">
+          <span class="region-label">R04 ru</span>
+          <b>Русский · Russian</b>
+          <p>Проверка точности распознавания текста.</p>
+          <small>用于确认俄语文字识别精度。</small>
+        </div>
+
+        <div class="region t-card" style="top:400px;left:80px;width:450px" dir="rtl">
+          <span class="region-label">R05 ar</span>
+          <b>العربية · Arabic (RTL)</b>
+          <p>اختبار التعرف على النصوص العربية.</p>
+          <small>阿拉伯语从右向左书写。</small>
+        </div>
+
+        <div class="region t-card" style="top:400px;left:570px;width:450px">
+          <span class="region-label">R06 th</span>
+          <b>ไทย · Thai</b>
+          <p>ทดสอบความแม่นยำในการอ่านข้อความ</p>
+          <small>泰语无词间空格，检测器需自行切分。</small>
+        </div>
+
+        <div class="region t-card" style="top:400px;left:1060px;width:460px" dir="rtl">
+          <span class="region-label">R07 he</span>
+          <b>עברית · Hebrew (RTL)</b>
+          <p>בדיקת דיוק זיהוי טקסט</p>
+          <small>希伯来语从右向左书写。</small>
+        </div>
+
+        <div class="region" style="top:630px;left:80px;width:1440px">
+          <span class="region-label">R08 mixed-line</span>
+          <div style="font-size:22px;line-height:1.9;color:#1d2a33">
+            中文 日本語 한국어 Русский العربية ไทย עברית English — 混排在同一行内。
+          </div>
+        </div>
+
+        <div class="region t-panel" style="top:760px;left:80px;width:1440px">
+          <span class="region-label">R09 notes</span>
+          <strong>RTL 注意事项</strong>
+          阿拉伯语与希伯来语的 polygon 顺序可能与阅读方向相反；泰语、老挝语等无空格语言需要按字形聚类切分。
+        </div>
+      </section>
+
+      <!-- ============================================================
+           案例 03 · 旋转与倾斜
+           ============================================================ -->
+      <section class="canvas"
+               data-title="旋转与倾斜"
+               data-file="ocr-test-03-rotation"
+               data-desc="从 -25° 到 +25° 的多角度文本，验证检测器是否返回真实旋转四边形，而非轴对齐外接矩形。">
+
+        <div class="region" style="top:40px;left:80px;width:1200px">
+          <span class="region-label">R01 title</span>
+          <div class="t-eyebrow">Rotation robustness</div>
+          <h2 class="t-h" style="font-size:36px">旋转与倾斜文本</h2>
+        </div>
+
+        <div class="region" style="top:180px;left:110px;width:340px;transform:rotate(-15deg)">
+          <span class="region-label">R02 -15°</span>
+          <div class="t-rot">旋转 -15°</div>
+        </div>
+
+        <div class="region" style="top:190px;left:620px;width:340px;transform:rotate(-8deg)">
+          <span class="region-label">R03 -8°</span>
+          <div class="t-rot">旋转 -8° Rotated</div>
+        </div>
+
+        <div class="region" style="top:190px;left:1120px;width:340px;transform:rotate(8deg)">
+          <span class="region-label">R04 +8°</span>
+          <div class="t-rot">旋转 +8° Rotated</div>
+        </div>
+
+        <div class="region" style="top:400px;left:110px;width:340px;transform:rotate(15deg)">
+          <span class="region-label">R05 +15°</span>
+          <div class="t-rot">旋转 +15°</div>
+        </div>
+
+        <div class="region" style="top:400px;left:620px;width:340px;transform:rotate(-25deg)">
+          <span class="region-label">R06 -25°</span>
+          <div class="t-rot">旋转 -25°</div>
+        </div>
+
+        <div class="region" style="top:400px;left:1120px;width:340px;transform:rotate(25deg)">
+          <span class="region-label">R07 +25°</span>
+          <div class="t-rot">旋转 +25°</div>
+        </div>
+
+        <div class="region" style="top:630px;left:120px;width:560px;transform:rotate(-4deg)">
+          <span class="region-label">R08 -4°</span>
+          <div class="t-rot" style="font-size:17px;text-align:left">
+            小角度倾斜：扫描件常见的轻微歪斜，检测框应贴合基线。
+          </div>
+        </div>
+
+        <div class="region" style="top:630px;left:820px;width:560px;transform:rotate(4deg)">
+          <span class="region-label">R09 +4°</span>
+          <div class="t-rot" style="font-size:17px;text-align:left">
+            Small skew: 4 degrees clockwise, common in phone photos.
+          </div>
+        </div>
+
+        <div class="region t-highlight" style="top:780px;left:120px;width:560px;transform:rotate(-2.5deg)">
+          <span class="region-label">R10 highlight</span>
+          重点文本：请返回这个黄色区域的旋转四边形。
+        </div>
+
+        <div class="region" style="top:800px;left:850px;width:420px;transform:rotate(12deg)">
+          <span class="region-label">R11 +12°</span>
+          <div class="t-rot" style="background:#fdeef2;border-color:#e6b9c6;color:#a83b58">
+            旋转 12° Angle
+          </div>
+        </div>
+
+        <div class="region t-caption" style="top:935px;left:120px;width:1200px">
+          <span class="region-label">R12 note</span>
+          验证要点：旋转文本的 polygon 应为倾斜四边形；轴对齐外接矩形会导致浮层错位。
+        </div>
+      </section>
+
+      <!-- ============================================================
+           案例 04 · 表格与键值对
+           ============================================================ -->
+      <section class="canvas"
+               data-title="表格与键值对"
+               data-file="ocr-test-04-table"
+               data-desc="含表头、数字列、合并单元格的表格与键值对列表，验证行列结构是否被错误合并或拆分。">
+
+        <div class="region" style="top:40px;left:80px;width:1000px">
+          <span class="region-label">R01 title</span>
+          <div class="t-eyebrow">Structure parsing</div>
+          <h2 class="t-h" style="font-size:36px">表格与键值对</h2>
+        </div>
+
+        <div class="region" style="top:140px;left:80px;width:1440px">
+          <span class="region-label">R02 table-main</span>
+          <table class="t-table">
+            <caption>识别统计表 · Recognition statistics</caption>
+            <thead>
+              <tr>
+                <th style="width:22%">项目 Item</th>
+                <th style="width:14%">数量 Qty</th>
+                <th style="width:18%">金额 Amount</th>
+                <th style="width:18%">占比 Ratio</th>
+                <th>备注 Note</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td>识别正确 Right</td><td class="num">1,284</td><td class="num">¥ 12,840.00</td><td class="num">96.54%</td><td>置信度 &gt; 0.90</td></tr>
+              <tr><td>识别错误 Wrong</td><td class="num">37</td><td class="num">¥ 370.50</td><td class="num">2.78%</td><td>字形相近</td></tr>
+              <tr><td>漏检 Missed</td><td class="num">9</td><td class="num">¥ 90.25</td><td class="num">0.68%</td><td>低对比度</td></tr>
+              <tr><td>合计 Total</td><td class="num">1,330</td><td class="num">¥ 13,300.75</td><td class="num">100.00%</td><td>2026-09-30</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="region" style="top:470px;left:80px;width:620px">
+          <span class="region-label">R03 kv</span>
+          <div class="t-kv">
+            <div class="t-kv-row"><span class="k">设备编号 Device</span><span class="v">SC-2026-A17</span></div>
+            <div class="t-kv-row"><span class="k">模型版本 Model</span><span class="v">PP-OCRv6</span></div>
+            <div class="t-kv-row"><span class="k">推理耗时 Latency</span><span class="v">42.7 ms</span></div>
+            <div class="t-kv-row"><span class="k">置信度 Score</span><span class="v">0.931</span></div>
+            <div class="t-kv-row"><span class="k">更新时间 Updated</span><span class="v">2026-09-30 14:32</span></div>
+            <div class="t-kv-row"><span class="k">校验和 Checksum</span><span class="v">0x7F3A-DE91</span></div>
+          </div>
+        </div>
+
+        <div class="region" style="top:470px;left:780px;width:740px">
+          <span class="region-label">R04 table-merged</span>
+          <table class="t-table">
+            <thead>
+              <tr><th>区域 Region</th><th>文本类型 Type</th><th>行数 Lines</th></tr>
+            </thead>
+            <tbody>
+              <tr><td rowspan="2">左栏 Left</td><td>标题 Heading</td><td class="num">3</td></tr>
+              <tr><td>正文 Body</td><td class="num">12</td></tr>
+              <tr><td rowspan="2">右栏 Right</td><td>代码 Code</td><td class="num">6</td></tr>
+              <tr><td>表格 Table</td><td class="num">9</td></tr>
+              <tr><td colspan="2" style="text-align:right;font-weight:700">合计 Total</td><td class="num">30</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="region t-caption" style="top:800px;left:80px;width:1440px">
+          <span class="region-label">R05 note</span>
+          验证要点：表格行列不应跨列合并；数字列右对齐时检测框应贴合数字本身；合并单元格应有明确的坐标归属。
+        </div>
+
+        <div class="region t-path" style="top:870px;left:80px;width:1440px">
+          <span class="region-label">R06 report</span>
+          REPORT_ID: 2026-09-30-A17 | DEVICE: SC-2026-A17 | MODEL: PP-OCRv6 | LATENCY: 42.7ms | SCORE: 0.931
+        </div>
+      </section>
+
+      <!-- ============================================================
+           案例 05 · 代码与等宽字体
+           ============================================================ -->
+      <section class="canvas"
+               data-title="代码与等宽字体"
+               data-file="ocr-test-05-code"
+               data-desc="深色/浅色代码块、JSON、终端输出与内联代码，验证等宽字体、缩进、符号密集文本的定位。">
+
+        <div class="region" style="top:40px;left:80px;width:1000px">
+          <span class="region-label">R01 title</span>
+          <div class="t-eyebrow">Monospace & code</div>
+          <h2 class="t-h" style="font-size:36px">代码与等宽字体</h2>
+        </div>
+
+        <div class="region t-code" style="top:130px;left:80px;width:700px"><span class="region-label">R02 rust</span><span class="m">// Rust: run OCR on an image</span>
+<span class="c">use</span> rapid_ocr::{Engine, Image};
+
+<span class="c">fn</span> <span class="g">main</span>() -&gt; <span class="y">Result</span>&lt;()&gt; {
+    <span class="c">let</span> engine = Engine::<span class="g">new</span>(<span class="y">"det.onnx"</span>)?;
+    <span class="c">let</span> img = Image::<span class="g">open</span>(<span class="y">"test.png"</span>)?;
+    <span class="c">let</span> result = engine.<span class="g">run</span>(&amp;img)?;
+
+    <span class="c">for</span> line <span class="c">in</span> result.lines {
+        <span class="g">println!</span>(<span class="y">"{} -> {:?}"</span>, line.text, line.polygon);
+    }
+    <span class="y">Ok</span>(())
+}</div>
+
+        <div class="region t-code-light" style="top:130px;left:840px;width:680px"><span class="region-label">R03 python</span><span class="s"># Python: polygon post-processing</span>
+<span class="k">from</span> rapidocr <span class="k">import</span> RapidOCR
+
+engine = RapidOCR()
+result, elapse = engine(<span class="s">"test.png"</span>)
+
+<span class="k">for</span> box, text, score <span class="k">in</span> result:
+    x0, y0 = box[<span class="n">0</span>]
+    x2, y2 = box[<span class="n">2</span>]
+    <span class="k">print</span>(<span class="s">f"{text!r} {score:.4f} ({x0},{y0})-({x2},{y2})"</span>)</div>
+
+        <div class="region t-code-light" style="top:480px;left:80px;width:700px"><span class="region-label">R04 json</span>{
+  <span class="s">"request_id"</span>: <span class="s">"2026-09-30-A17"</span>,
+  <span class="s">"image"</span>: { <span class="s">"width"</span>: <span class="n">1600</span>, <span class="s">"height"</span>: <span class="n">1000</span> },
+  <span class="s">"lines"</span>: [
+    {
+      <span class="s">"text"</span>: <span class="s">"多位置文本定位实验"</span>,
+      <span class="s">"score"</span>: <span class="n">0.9312</span>,
+      <span class="s">"polygon"</span>: [[<span class="n">80</span>,<span class="n">118</span>],[<span class="n">780</span>,<span class="n">118</span>],[<span class="n">780</span>,<span class="n">168</span>],[<span class="n">80</span>,<span class="n">168</span>]]
+    }
+  ]
+}</div>
+
+        <div class="region t-code" style="top:480px;left:840px;width:680px"><span class="region-label">R05 terminal</span><span class="m">$ snapclip ocr --model pp-ocrv6 --input test.png</span>
+[<span class="g">INFO</span>] loading det.onnx ... <span class="g">ok</span> (128 ms)
+[<span class="g">INFO</span>] loading rec.onnx ... <span class="g">ok</span> (214 ms)
+[<span class="g">WARN</span>] low contrast region at (1010, 938) skipped
+[<span class="g">INFO</span>] 17 lines detected in <span class="y">42.7 ms</span>
+[<span class="g">DONE</span>] wrote result.json (2.4 KB)</div>
+
+        <div class="region" style="top:820px;left:80px;width:1440px">
+          <span class="region-label">R06 inline</span>
+          <div style="font-size:17px;line-height:2;color:#24333d">
+            内联代码：<code style="padding:2px 6px;border-radius:4px;background:#eef3f6;font-family:Consolas,monospace;font-size:16px">npm run ocr -- --input ./test.png</code>
+            与 <code style="padding:2px 6px;border-radius:4px;background:#eef3f6;font-family:Consolas,monospace;font-size:16px">det.onnx</code>
+            混排在正文中，符号 <b>{}[]()&lt;&gt;&amp;|/\\</b> 密集。
+          </div>
+        </div>
+      </section>
+
+      <!-- ============================================================
+           案例 06 · 低对比度与深色背景
+           ============================================================ -->
+      <section class="canvas"
+               data-title="低对比度与深色背景"
+               data-file="ocr-test-06-contrast"
+               data-desc="浅底浅字、深底深字、深底浅字、彩色底彩色字、半透明文字，验证检测阈值与二值化鲁棒性。">
+
+        <div class="region" style="top:40px;left:80px;width:1000px">
+          <span class="region-label">R01 title</span>
+          <div class="t-eyebrow">Contrast & polarity</div>
+          <h2 class="t-h" style="font-size:36px">对比度与明暗反转</h2>
+        </div>
+
+        <div class="region" style="top:140px;left:80px;width:440px;padding:18px 20px;background:#fdfdfd;border:1px solid #eeecec;border-radius:8px">
+          <span class="region-label">R02 low</span>
+          <div style="color:#d8dcdd;font-size:18px">极低对比度文本</div>
+          <div style="color:#c8cccd;font-size:17px;margin-top:8px">#C8CCCD on #FDFDFD</div>
+        </div>
+
+        <div class="region" style="top:140px;left:560px;width:440px;padding:18px 20px;background:#2b2b2b;border-radius:8px">
+          <span class="region-label">R03 dark-on-dark</span>
+          <div style="color:#3a3a3a;font-size:18px">深底深字文本</div>
+          <div style="color:#454545;font-size:17px;margin-top:8px">#454545 on #2B2B2B</div>
+        </div>
+
+        <div class="region" style="top:140px;left:1040px;width:480px;padding:18px 20px;background:#1d252b;border-radius:8px">
+          <span class="region-label">R04 light-on-dark</span>
+          <div style="color:#e8f1f4;font-size:18px">深底浅字：正常可读</div>
+          <div style="color:#74d1d8;font-size:17px;margin-top:8px">#74D1D8 on #1D252B</div>
+        </div>
+
+        <div class="region" style="top:360px;left:80px;width:440px;padding:18px 20px;background:#eaf4ff;border-radius:8px">
+          <span class="region-label">R05 blue-on-blue</span>
+          <div style="color:#5b8dc9;font-size:18px">蓝底蓝字</div>
+          <div style="color:#7ba5d6;font-size:17px;margin-top:8px">Blue on light blue</div>
+        </div>
+
+        <div class="region" style="top:360px;left:560px;width:440px;padding:18px 20px;background:#fff7e6;border-radius:8px">
+          <span class="region-label">R06 amber</span>
+          <div style="color:#c9a558;font-size:18px">黄底黄字</div>
+          <div style="color:#d8bb7a;font-size:17px;margin-top:8px">Amber on cream</div>
+        </div>
+
+        <div class="region" style="top:360px;left:1040px;width:480px;padding:18px 20px;border-radius:8px;background:linear-gradient(90deg,#f0f4f6 0%,#c9d6dc 100%)">
+          <span class="region-label">R07 gradient</span>
+          <div style="color:#6b7f8a;font-size:18px">渐变背景上的文字</div>
+          <div style="color:#7d919b;font-size:17px;margin-top:8px">Gradient background</div>
+        </div>
+
+        <div class="region" style="top:580px;left:80px;width:680px;padding:20px 22px;background:#ffffff;border:1px solid #e4e9ec;border-radius:8px">
+          <span class="region-label">R08 alpha</span>
+          <div style="color:rgba(24,33,43,0.28);font-size:19px">半透明文字 opacity 0.28</div>
+          <div style="color:rgba(24,33,43,0.45);font-size:19px;margin-top:8px">半透明文字 opacity 0.45</div>
+          <div style="color:rgba(24,33,43,0.70);font-size:19px;margin-top:8px">半透明文字 opacity 0.70</div>
+        </div>
+
+        <div class="region t-dark" style="top:580px;left:800px;width:720px">
+          <span class="region-label">R09 invert</span>
+          <div style="font-size:18px">反色文本：<span>Invert / Contrast / 边界</span></div>
+          <div style="margin-top:10px;padding:10px 12px;background:#111;color:#f3f5f6;font-size:16px">
+            Nested dark block with light text 嵌套深色块
+          </div>
+        </div>
+
+        <div class="region t-caption" style="top:820px;left:80px;width:1440px">
+          <span class="region-label">R10 note</span>
+          验证要点：低对比度区域容易被整块漏检；深底浅字需要反色预处理；半透明文字不应把背景误判为笔画。
+        </div>
+
+        <div class="region t-micro" style="top:900px;left:80px">
+          <span class="region-label">R11 micro</span>
+          threshold: 0.30  min_area: 12  unclip: 1.8
+        </div>
+      </section>
+
+      <!-- ============================================================
+           案例 07 · 小字号与密集排版
+           ============================================================ -->
+      <section class="canvas"
+               data-title="小字号与密集排版"
+               data-file="ocr-test-07-small-text"
+               data-desc="从 8px 到 20px 的字号阶梯、1.15 行距密集段落与超长单行，验证小目标召回与行切分。">
+
+        <div class="region" style="top:40px;left:80px;width:1000px">
+          <span class="region-label">R01 title</span>
+          <div class="t-eyebrow">Small text & density</div>
+          <h2 class="t-h" style="font-size:36px">小字号与密集排版</h2>
+        </div>
+
+        <div class="region" style="top:150px;left:80px;width:700px">
+          <span class="region-label">R02 size-ladder</span>
+          <div style="font-size:20px;color:#1d2a33">20px — 标准正文行 Standard body text</div>
+          <div style="font-size:18px;color:#1d2a33;margin-top:10px">18px — 稍小正文 Slightly smaller</div>
+          <div style="font-size:16px;color:#1d2a33;margin-top:10px">16px — 小字正文 Small body</div>
+          <div style="font-size:14px;color:#1d2a33;margin-top:10px">14px — 注释 Comment text</div>
+          <div style="font-size:12px;color:#1d2a33;margin-top:10px">12px — 微小字号 Micro label</div>
+          <div style="font-size:10px;color:#1d2a33;margin-top:10px">10px — 极小字号 Tiny label 2026-09-30</div>
+          <div style="font-size:8px;color:#1d2a33;margin-top:10px">8px — 极限字号 Extremely small text sample</div>
+        </div>
+
+        <div class="region" style="top:150px;left:880px;width:640px">
+          <span class="region-label">R03 dense</span>
+          <div style="font-size:14px;line-height:1.15;color:#2c3b45;text-align:justify">
+            行距 1.15 的密集段落。密集排版会让相邻文本行的检测框互相接触，检测器必须能够正确分离每一行，
+            不能把两行合并成一个框，也不能把一行拆成上下两半。The quick brown fox jumps over the lazy dog.
+            Pack my box with five dozen liquor jugs. 混合中英文可以进一步增加行切分的难度。
+            行距 1.15 的密集段落。密集排版会让相邻文本行的检测框互相接触，检测器必须能够正确分离每一行。
+          </div>
+        </div>
+
+        <div class="region" style="top:460px;left:80px;width:1440px">
+          <span class="region-label">R04 long-line</span>
+          <div style="font-size:13px;color:#2c3b45;white-space:nowrap;overflow:hidden">
+            超长单行：https://example.com/very/long/path/to/resource?query=ocr&amp;lang=zh-CN&amp;page=1&amp;limit=100&amp;sort=desc&amp;token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9 — 检测框应保持为单个长条而不是被截断。
+          </div>
+        </div>
+
+        <div class="region" style="top:530px;left:80px;width:460px">
+          <span class="region-label">R05 list-a</span>
+          <div style="font-size:12px;line-height:1.6;color:#3a4a55">
+            · 条目 A-01 编号<br>
+            · 条目 A-02 编号<br>
+            · 条目 A-03 编号<br>
+            · 条目 A-04 编号<br>
+            · 条目 A-05 编号<br>
+            · 条目 A-06 编号
+          </div>
+        </div>
+
+        <div class="region" style="top:530px;left:570px;width:460px">
+          <span class="region-label">R06 list-b</span>
+          <div style="font-size:12px;line-height:1.6;color:#3a4a55">
+            01 项 · value 1,204.55<br>
+            02 项 · value 2,318.10<br>
+            03 项 · value 3,090.75<br>
+            04 项 · value 4,512.30<br>
+            05 项 · value 5,880.00<br>
+            06 项 · value 6,001.25
+          </div>
+        </div>
+
+        <div class="region" style="top:530px;left:1060px;width:460px">
+          <span class="region-label">R07 list-c</span>
+          <div style="font-size:12px;line-height:1.6;color:#3a4a55">
+            [OK]   region-001  score 0.991<br>
+            [OK]   region-002  score 0.978<br>
+            [WARN] region-003  score 0.642<br>
+            [OK]   region-004  score 0.955<br>
+            [FAIL] region-005  score 0.310<br>
+            [OK]   region-006  score 0.902
+          </div>
+        </div>
+
+        <div class="region" style="top:740px;left:80px;width:1440px;padding:16px 18px;background:#f7fafb;border:1px solid #e1e8ec;border-radius:8px">
+          <span class="region-label">R08 mixed-size</span>
+          <div style="font-size:18px;color:#18212b">
+            大小混排：<span style="font-size:11px;color:#64717d">脚注 footnote</span>
+            <span style="font-size:24px;font-weight:700"> 重点强调 </span>
+            <span style="font-size:13px;color:#64717d">补充说明 supplemental</span>
+          </div>
+        </div>
+
+        <div class="region t-caption" style="top:870px;left:80px;width:1440px">
+          <span class="region-label">R09 note</span>
+          验证要点：8–12px 文本容易被整体漏检；1.15 行距时相邻行的检测框不应粘连；超长单行不应被强制拆分为多段。
+        </div>
+      </section>
+
+      <!-- ============================================================
+           案例 08 · 数字、公式与符号
+           ============================================================ -->
+      <section class="canvas"
+               data-title="数字、公式与符号"
+               data-file="ocr-test-08-numbers"
+               data-desc="金额、百分比、日期时间、科学计数、单位、数学符号与编号，验证数字密集与特殊字符的识别定位。">
+
+        <div class="region" style="top:40px;left:80px;width:1000px">
+          <span class="region-label">R01 title</span>
+          <div class="t-eyebrow">Numerals & symbols</div>
+          <h2 class="t-h" style="font-size:36px">数字、公式与符号</h2>
+        </div>
+
+        <div class="region" style="top:140px;left:80px;width:1440px;padding:20px 22px;border:1px solid #dde5ea;border-radius:8px">
+          <span class="region-label">R02 big-numbers</span>
+          <div style="display:flex;justify-content:space-between;gap:24px">
+            <div><div style="font-size:34px;font-weight:800;color:#176b87;font-variant-numeric:tabular-nums">12,840.55</div><div style="font-size:13px;color:#64717d">Total amount</div></div>
+            <div><div style="font-size:34px;font-weight:800;color:#27633b;font-variant-numeric:tabular-nums">96.54%</div><div style="font-size:13px;color:#64717d">Accuracy</div></div>
+            <div><div style="font-size:34px;font-weight:800;color:#ad3f32;font-variant-numeric:tabular-nums">0.9312</div><div style="font-size:13px;color:#64717d">Confidence</div></div>
+            <div><div style="font-size:34px;font-weight:800;color:#54440d;font-variant-numeric:tabular-nums">42.7 ms</div><div style="font-size:13px;color:#64717d">Latency</div></div>
+          </div>
+        </div>
+
+        <div class="region" style="top:300px;left:80px;width:700px">
+          <span class="region-label">R03 datetime</span>
+          <div style="font-size:18px;line-height:2;color:#24333d">
+            日期：2026-09-30 / 2026/09/30 / 2026年9月30日<br>
+            时间：14:32:07.215 / 02:32 PM / UTC+08:00<br>
+            时区：Asia/Shanghai · GMT+8
+          </div>
+        </div>
+
+        <div class="region" style="top:300px;left:840px;width:680px">
+          <span class="region-label">R04 science</span>
+          <div style="font-size:18px;line-height:2;color:#24333d">
+            科学计数：6.022×10²³ / 1.6e-19 / 3.0E+8 m/s<br>
+            单位：23.5°C · 101.325 kPa · 50 Hz · 12 Ω · 5 V<br>
+            货币：¥ 1,280.00 · $ 199.99 · € 88.50 · ₩ 12,000
+          </div>
+        </div>
+
+        <div class="region" style="top:480px;left:80px;width:700px;padding:18px 20px;background:#f7fafb;border:1px solid #e1e8ec;border-radius:8px">
+          <span class="region-label">R05 math</span>
+          <div style="font-size:22px;line-height:1.9;color:#1d2a33;font-family:Georgia,serif">
+            √2 ≈ 1.414 &nbsp; π ≈ 3.14159<br>
+            ∫₀^∞ e<sup>-x²</sup> dx = √π / 2<br>
+            a² + b² = c² &nbsp; ∑ᵢ₌₁ⁿ xᵢ<br>
+            x ≤ y ≥ z ≠ w ± 5 °
+          </div>
+        </div>
+
+        <div class="region" style="top:480px;left:840px;width:680px;padding:18px 20px;background:#f7fafb;border:1px solid #e1e8ec;border-radius:8px">
+          <span class="region-label">R06 symbols</span>
+          <div style="font-size:20px;line-height:2;color:#1d2a33">
+            ① ② ③ ④ ⑤ &nbsp; ★ ☆ ✓ ✗ ⚠<br>
+            → ← ↑ ↓ ↔ ⇒ ⇔<br>
+            § ¶ † ‡ © ® ™ №<br>
+            ｜ ／ ＼ ，。！？ “ ” ‘ ’
+          </div>
+        </div>
+
+        <div class="region" style="top:710px;left:80px;width:1440px">
+          <span class="region-label">R07 serial</span>
+          <table class="t-table">
+            <thead>
+              <tr><th style="width:18%">编号 No.</th><th style="width:22%">序列号 Serial</th><th style="width:18%">数值 Value</th><th style="width:18%">比例 Ratio</th><th>时间戳 Timestamp</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>A-17</td><td>SC-2026-A17-0001</td><td class="num">98.76%</td><td class="num">0.9876</td><td>2026-09-30T14:32:07.215+08:00</td></tr>
+              <tr><td>B-04</td><td>SC-2026-B04-0117</td><td class="num">-273.15°C</td><td class="num">0.0000</td><td>2026-09-30T14:32:07.230+08:00</td></tr>
+              <tr><td>C-92</td><td>SC-2026-C92-2301</td><td class="num">1,234,567.89</td><td class="num">1.2346</td><td>2026-09-30T14:32:07.245+08:00</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="region t-caption" style="top:930px;left:80px;width:1440px">
+          <span class="region-label">R08 note</span>
+          验证要点：千分位、小数点、负号、上下标不应破坏检测框；符号与数字混排时应保持同一行。
+        </div>
+      </section>
+
+      <!-- ============================================================
+           案例 09 · 竖排文本
+           ============================================================ -->
+      <section class="canvas"
+               data-title="竖排文本"
+               data-file="ocr-test-09-vertical"
+               data-desc="中文、日文竖排与横竖混排，验证 writing-mode 文本的行方向判定与坐标映射。">
+
+        <div class="region" style="top:40px;left:80px;width:1000px">
+          <span class="region-label">R01 title</span>
+          <div class="t-eyebrow">Vertical writing</div>
+          <h2 class="t-h" style="font-size:36px">竖排文本</h2>
+        </div>
+
+        <div class="region t-vertical" style="top:150px;left:120px;height:520px;font-size:26px">
+          <span class="region-label">R02 zh-1</span>
+          竖排文字定位测试
+        </div>
+
+        <div class="region t-vertical" style="top:150px;left:230px;height:520px;font-size:20px;color:#433c38">
+          <span class="region-label">R03 zh-2</span>
+          字距与行距变化时仍应返回正确四边形
+        </div>
+
+        <div class="region t-vertical" style="top:150px;left:360px;height:520px;font-size:22px;color:#1f5c9a">
+          <span class="region-label">R04 ja</span>
+          日本語の縦書きテストです
+        </div>
+
+        <div class="region t-vertical" style="top:150px;left:500px;height:520px;font-size:22px;color:#27633b">
+          <span class="region-label">R05 mixed</span>
+          竖排含英文 OCR 与数字 2026
+        </div>
+
+        <div class="region" style="top:170px;left:700px;width:800px">
+          <span class="region-label">R06 horizontal</span>
+          <div style="font-size:18px;line-height:2;color:#24333d">
+            横排对照区：同一段文字横排显示，用于比对竖排与横排的坐标差异。
+          </div>
+          <div style="margin-top:20px;font-size:18px;line-height:2;color:#24333d">
+            横排对照区：同一段文字横排显示，用于比对竖排与横排的坐标差异。
+          </div>
+        </div>
+
+        <div class="region" style="top:400px;left:700px;width:800px;padding:18px 20px;background:#f7fafb;border:1px solid #e1e8ec;border-radius:8px">
+          <span class="region-label">R07 note</span>
+          <div style="font-size:15px;line-height:1.9;color:#3a4a55">
+            竖排区域的 polygon 顺序通常为「右上 → 左上 → 左下 → 右下」，
+            与横排的「左上 → 右上 → 右下 → 左下」不同，接入时需要注意顶点顺序。
+          </div>
+        </div>
+
+        <div class="region t-vertical" style="top:700px;left:120px;height:230px;font-size:18px;color:#7b3e83">
+          <span class="region-label">R08 zh-3</span>
+          较短的竖排标签文字
+        </div>
+
+        <div class="region t-vertical" style="top:700px;left:230px;height:230px;font-size:16px;color:#a83b58">
+          <span class="region-label">R09 small</span>
+          小字号竖排标签
+        </div>
+
+        <div class="region" style="top:700px;left:400px;width:1100px">
+          <span class="region-label">R10 mixed-flow</span>
+          <div style="font-size:17px;line-height:2;color:#24333d">
+            混合流向：正文横排 <span style="font-weight:700;color:#176b87">强调内容</span>，
+            右侧插入竖排标签 →
+          </div>
+        </div>
+
+        <div class="region t-caption" style="top:930px;left:80px;width:1440px">
+          <span class="region-label">R11 note</span>
+          验证要点：竖排文本容易被误判为多个单字框；需要合并为整列并返回正确的长条四边形。
+        </div>
+      </section>
+
+      <!-- ============================================================
+           案例 10 · 长段落与分栏
+           ============================================================ -->
+      <section class="canvas"
+               data-title="长段落与分栏"
+               data-file="ocr-test-10-columns"
+               data-desc="2/3/4 栏排版、不同行高、首行缩进、两端对齐与左对齐，验证分栏顺序与段落边界。">
+
+        <div class="region" style="top:40px;left:80px;width:1000px">
+          <span class="region-label">R01 title</span>
+          <div class="t-eyebrow">Layout & columns</div>
+          <h2 class="t-h" style="font-size:36px">长段落与分栏</h2>
+        </div>
+
+        <div class="region" style="top:140px;left:80px;width:700px">
+          <span class="region-label">R02 two-col</span>
+          <div style="column-count:2;column-gap:32px;font-size:15px;line-height:1.75;color:#34434e;text-align:justify">
+            <p style="margin:0 0 12px;text-indent:2em">双栏排版的第一段。检测器需要按照阅读顺序输出文本，先左栏自上而下，再右栏自上而下，而不是按 y 坐标全局排序。</p>
+            <p style="margin:0 0 12px">The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs.</p>
+            <p style="margin:0 0 12px">双栏排版的第三段，用于测试段落边界与栏间距的判定是否稳定。</p>
+            <p style="margin:0">最后一段用于填充高度，让两栏长度基本一致。</p>
+          </div>
+        </div>
+
+        <div class="region" style="top:140px;left:840px;width:680px">
+          <span class="region-label">R03 three-col</span>
+          <div style="column-count:3;column-gap:24px;font-size:13px;line-height:1.6;color:#34434e;text-align:justify">
+            <p style="margin:0 0 10px">三栏排版。栏宽更窄，行数更多，检测框更容易在栏间发生横向粘连。</p>
+            <p style="margin:0 0 10px">Column three is narrower, so each line contains fewer characters.</p>
+            <p style="margin:0 0 10px">中英混排会进一步增加栏内行的宽度差异。</p>
+            <p style="margin:0 0 10px">检测器应保持栏内文本的独立性。</p>
+            <p style="margin:0 0 10px">不应把相邻两栏的同一行合并。</p>
+            <p style="margin:0">Should not merge lines across columns.</p>
+          </div>
+        </div>
+
+        <div class="region" style="top:480px;left:80px;width:1440px">
+          <span class="region-label">R04 four-col</span>
+          <div style="column-count:4;column-gap:26px;font-size:13px;line-height:1.7;color:#34434e">
+            <p style="margin:0 0 10px">第一栏：四栏排版常用于报纸和说明书，栏宽非常窄。</p>
+            <p style="margin:0 0 10px">第二栏：窄栏中的标点符号容易被裁切。</p>
+            <p style="margin:0 0 10px">第三栏：数字与英文单词在窄栏中容易被断开。</p>
+            <p style="margin:0 0 10px">第四栏：检测框应贴合每一栏的文本宽度。</p>
+            <p style="margin:0 0 10px">Column one: narrow layout.</p>
+            <p style="margin:0 0 10px">Column two: punctuation clipping.</p>
+            <p style="margin:0 0 10px">Column three: hyphenation risk.</p>
+            <p style="margin:0">Column four: box should hug text.</p>
+          </div>
+        </div>
+
+        <div class="region" style="top:760px;left:80px;width:700px">
+          <span class="region-label">R05 line-height</span>
+          <div style="font-size:15px;color:#34434e">
+            <div style="line-height:1.1">行高 1.1 — 非常紧密 Tight</div>
+            <div style="line-height:1.5;margin-top:6px">行高 1.5 — 常规 Normal</div>
+            <div style="line-height:2.0;margin-top:6px">行高 2.0 — 宽松 Loose</div>
+            <div style="line-height:2.8;margin-top:6px">行高 2.8 — 极宽松 Very loose</div>
+          </div>
+        </div>
+
+        <div class="region" style="top:760px;left:840px;width:680px">
+          <span class="region-label">R06 align</span>
+          <div style="font-size:15px;color:#34434e">
+            <div style="text-align:left">左对齐 Left aligned text sample</div>
+            <div style="text-align:right;margin-top:8px">右对齐 Right aligned text sample</div>
+            <div style="text-align:center;margin-top:8px">居中对齐 Centered text sample</div>
+            <div style="text-align:justify;margin-top:8px">两端对齐：Justified text stretches to both edges of the container, which changes inter-word spacing.</div>
+          </div>
+        </div>
+
+        <div class="region t-caption" style="top:930px;left:80px;width:1440px">
+          <span class="region-label">R07 note</span>
+          验证要点：分栏文本的阅读顺序应由栏决定，而非全局 y 排序；窄栏中的标点与数字不应被裁切。
+        </div>
+      </section>
+
+      <!-- ============================================================
+           案例 11 · 文字样式与特效
+           ============================================================ -->
+      <section class="canvas"
+               data-title="文字样式与特效"
+               data-file="ocr-test-11-effects"
+               data-desc="阴影、描边、渐变填充、下划线/删除线、背景高亮、上标下标，验证样式不影响字形定位。">
+
+        <div class="region" style="top:40px;left:80px;width:1000px">
+          <span class="region-label">R01 title</span>
+          <div class="t-eyebrow">Text effects</div>
+          <h2 class="t-h" style="font-size:36px">文字样式与特效</h2>
+        </div>
+
+        <div class="region" style="top:150px;left:80px;width:440px;padding:18px 20px;border:1px solid #e4e9ec;border-radius:8px">
+          <span class="region-label">R02 shadow</span>
+          <div style="font-size:22px;font-weight:700;color:#18212b;text-shadow:2px 2px 3px rgba(23,107,135,.45)">投影文字 Shadow</div>
+          <div style="font-size:20px;margin-top:12px;color:#fff;text-shadow:1px 1px 0 #176b87,2px 2px 0 #123f4f">硬阴影 Hard shadow</div>
+          <div style="font-size:20px;margin-top:12px;color:#18212b;text-shadow:0 0 6px rgba(23,107,135,.6)">发光文字 Glow</div>
+        </div>
+
+        <div class="region" style="top:150px;left:560px;width:440px;padding:18px 20px;border:1px solid #e4e9ec;border-radius:8px">
+          <span class="region-label">R03 stroke</span>
+          <div style="font-size:26px;font-weight:800;color:#fff;-webkit-text-stroke:1.5px #176b87">描边文字 Stroke</div>
+          <div style="font-size:22px;font-weight:800;color:#18212b;-webkit-text-stroke:1px #d5a23d;margin-top:14px">双色描边 Outline</div>
+        </div>
+
+        <div class="region" style="top:150px;left:1040px;width:480px;padding:18px 20px;border:1px solid #e4e9ec;border-radius:8px">
+          <span class="region-label">R04 gradient-text</span>
+          <div style="font-size:30px;font-weight:800;background:linear-gradient(90deg,#176b87,#27633b,#ad3f32);-webkit-background-clip:text;background-clip:text;color:transparent">渐变填充文字 Gradient</div>
+          <div style="font-size:18px;color:#64717d;margin-top:10px">背景裁剪为文字后仍需返回正确字形区域</div>
+        </div>
+
+        <div class="region" style="top:380px;left:80px;width:440px;padding:18px 20px;border:1px solid #e4e9ec;border-radius:8px">
+          <span class="region-label">R05 decoration</span>
+          <div style="font-size:19px;color:#24333d">
+            <div style="text-decoration:underline">下划线 underlined</div>
+            <div style="text-decoration:line-through;margin-top:12px">删除线 strikethrough</div>
+            <div style="text-decoration:underline wavy #ad3f32;margin-top:12px">波浪线 wavy underline</div>
+            <div style="text-decoration:overline;margin-top:12px">上划线 overline</div>
+          </div>
+        </div>
+
+        <div class="region" style="top:380px;left:560px;width:440px;padding:18px 20px;border:1px solid #e4e9ec;border-radius:8px">
+          <span class="region-label">R06 background</span>
+          <div style="font-size:19px;color:#24333d;line-height:2.1">
+            <span style="background:#fff2a8;padding:2px 4px">黄底高亮文本</span><br>
+            <span style="background:#176b87;color:#fff;padding:2px 4px">深底反白文本</span><br>
+            <span style="background:#e2f2e6;color:#27633b;padding:2px 4px">绿色背景标签</span>
+          </div>
+        </div>
+
+        <div class="region" style="top:380px;left:1040px;width:480px;padding:18px 20px;border:1px solid #e4e9ec;border-radius:8px">
+          <span class="region-label">R07 script</span>
+          <div style="font-size:19px;color:#24333d;line-height:2.2">
+            化学式：H<sub>2</sub>O · CO<sub>2</sub> · C<sub>6</sub>H<sub>12</sub>O<sub>6</sub><br>
+            数学：x<sup>2</sup> + y<sup>2</sup> = r<sup>2</sup> · 10<sup>-3</sup><br>
+            脚注标记：结论<sup>[1]</sup>与说明<sup>[2]</sup>
+          </div>
+        </div>
+
+        <div class="region" style="top:610px;left:80px;width:1440px;padding:22px;background:#f7fafb;border:1px solid #e1e8ec;border-radius:8px">
+          <span class="region-label">R08 combo</span>
+          <div style="font-size:24px;line-height:1.9;color:#18212b">
+            综合样式：<b>粗体 Bold</b> · <i>斜体 Italic</i> · <u>下划线</u> ·
+            <span style="font-weight:800;color:#ad3f32">彩色加粗</span> ·
+            <span style="font-size:14px;color:#64717d">缩小文字</span> ·
+            <span style="letter-spacing:6px">宽字距 Spaced</span>
+          </div>
+        </div>
+
+        <div class="region t-caption" style="top:790px;left:80px;width:1440px">
+          <span class="region-label">R09 note</span>
+          验证要点：描边与阴影不应扩大检测框；背景高亮不应被识别为文本块；渐变文字需要保持字形轮廓。
+        </div>
+
+        <div class="region t-micro" style="top:880px;left:80px">
+          <span class="region-label">R10 micro</span>
+          font-weight: 400 / 700 / 800 &nbsp;|&nbsp; letter-spacing: 0 / 2 / 6px &nbsp;|&nbsp; -webkit-text-stroke: 1–1.5px
+        </div>
+      </section>
+
+      <!-- ============================================================
+           案例 12 · 综合压力测试
+           ============================================================ -->
+      <section class="canvas"
+               data-title="综合压力测试"
+               data-file="ocr-test-12-stress"
+               data-desc="把标题、代码、表格、旋转、竖排、低对比度、小字号混在同一张图内，模拟真实截图场景。">
+
+        <div class="region" style="top:36px;left:60px;width:900px">
+          <span class="region-label">R01 hero</span>
+          <div class="t-eyebrow">Stress test</div>
+          <h2 class="t-h" style="font-size:34px">综合压力测试</h2>
+          <p class="t-sub" style="font-size:16px">Multi-region composite · 2026-09-30</p>
+        </div>
+
+        <div class="region t-panel" style="top:36px;left:1000px;width:540px;padding:14px 18px;font-size:15px">
+          <span class="region-label">R02 status</span>
+          <strong style="font-size:17px">任务状态：运行中</strong>
+          Windows / Local / 42.7 ms
+        </div>
+
+        <div class="region t-code" style="top:150px;left:60px;width:480px;font-size:13px"><span class="region-label">R03 code</span><span class="c">let</span> r = <span class="y">ocr</span>.<span class="g">run</span>(img);
+<span class="c">for</span> l <span class="c">in</span> r.lines {
+  <span class="g">emit</span>(l.text, l.poly);
+}</div>
+
+        <div class="region" style="top:150px;left:580px;width:420px">
+          <span class="region-label">R04 table</span>
+          <table class="t-table" style="font-size:12.5px">
+            <thead><tr><th>区域</th><th>行数</th><th>得分</th></tr></thead>
+            <tbody>
+              <tr><td>左侧</td><td class="num">12</td><td class="num">0.94</td></tr>
+              <tr><td>中部</td><td class="num">8</td><td class="num">0.91</td></tr>
+              <tr><td>右侧</td><td class="num">15</td><td class="num">0.88</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="region" style="top:150px;left:1040px;width:500px">
+          <span class="region-label">R05 kv</span>
+          <div class="t-kv" style="font-size:12.5px">
+            <div class="t-kv-row"><span class="k">模型 Model</span><span class="v">PP-OCRv6</span></div>
+            <div class="t-kv-row"><span class="k">耗时 Latency</span><span class="v">42.7 ms</span></div>
+            <div class="t-kv-row"><span class="k">置信度 Score</span><span class="v">0.931</span></div>
+            <div class="t-kv-row"><span class="k">更新时间 Updated</span><span class="v">14:32:07</span></div>
+          </div>
+        </div>
+
+        <div class="region t-columns" style="top:330px;left:60px;width:900px;font-size:13.5px;line-height:1.55">
+          <span class="region-label">R06 columns</span>
+          <p>第一栏：综合压力测试把多种排版难点放在同一画面里，模拟真实应用截图。</p>
+          <p>The quick brown fox jumps over the lazy dog. Pack my box.</p>
+          <p>第二栏：检测框之间可能互相接触，需要保证每个框都贴合自己的文本。</p>
+          <p>编号 A-17、版本 v0.4.2、温度 23.5°C、日期 2026/09/30。</p>
+          <p>第三栏：低对比度、小字号、旋转文本同时出现时，召回率通常明显下降。</p>
+          <p>Multiple regions should remain independently selectable.</p>
+        </div>
+
+        <div class="region t-highlight" style="top:330px;left:1000px;width:540px;font-size:17px;transform:rotate(-2deg)">
+          <span class="region-label">R07 rotated</span>
+          旋转高亮：请返回这个黄色区域的旋转四边形。
+        </div>
+
+        <div class="region" style="top:470px;left:1000px;width:540px">
+          <span class="region-label">R08 low-contrast</span>
+          <div style="font-size:15px;color:#c9cfd2;line-height:1.7">
+            低对比度文本 #C9CFD2 on #FFFFFF，用于测试检测阈值。
+          </div>
+          <div style="font-size:15px;color:#b9c0c4;margin-top:6px">Another low contrast line for recall testing.</div>
+        </div>
+
+        <div class="region t-vertical" style="top:330px;left:940px;height:280px;font-size:15px;color:#7b3e83">
+          <span class="region-label">R09 vertical</span>
+          竖排标签
+        </div>
+
+        <div class="region t-dark" style="top:600px;left:60px;width:480px;padding:14px 18px;font-size:14px">
+          <span class="region-label">R10 dark</span>
+          深色背景浅色文本：<span>Invert / Contrast</span>
+        </div>
+
+        <div class="region t-path" style="top:600px;left:580px;width:420px;font-size:12.5px;padding:9px 13px">
+          <span class="region-label">R11 path</span>
+          C:\Users\seeyuer\Projects\SnapClip\OCR-Model\PP-OCRv6\det.onnx
+        </div>
+
+        <div class="region" style="top:600px;left:1040px;width:500px">
+          <span class="region-label">R12 small</span>
+          <div style="font-size:11px;line-height:1.6;color:#3a4a55">
+            小字号列表：<br>
+            · region-001 score 0.991 ✓<br>
+            · region-002 score 0.978 ✓<br>
+            · region-003 score 0.642 ⚠<br>
+            · region-004 score 0.955 ✓
+          </div>
+        </div>
+
+        <div class="region" style="top:730px;left:60px;width:1440px">
+          <span class="region-label">R13 bar</span>
+          <div style="font-size:20px;font-weight:800;color:#176b87;font-variant-numeric:tabular-nums;letter-spacing:1px">
+            98.76% <span style="font-size:14px;font-weight:500;color:#71808a">confidence</span>
+            &nbsp;·&nbsp; 1,330 lines &nbsp;·&nbsp; 42.7 ms &nbsp;·&nbsp; 2026-09-30 14:32:07
+          </div>
+        </div>
+
+        <div class="region" style="top:790px;left:60px;width:900px;padding:16px 18px;background:#f7fafb;border:1px solid #e1e8ec;border-radius:8px">
+          <span class="region-label">R14 summary</span>
+          <div style="font-size:14px;line-height:1.9;color:#3a4a55">
+            本图同时包含：标题、卡片、表格、键值对、代码块、分栏、旋转、竖排、低对比度、小字号与深色背景。
+            检测器需要为每个区域返回独立的四边形，并且保证坐标不越界。
+          </div>
+        </div>
+
+        <div class="region" style="top:790px;left:1000px;width:540px;transform:rotate(3deg)">
+          <span class="region-label">R15 tilt</span>
+          <div class="t-rot" style="font-size:16px;background:#fdeef2;border-color:#e6b9c6;color:#a83b58">
+            小角度倾斜 3° Tilted block
+          </div>
+        </div>
+
+        <div class="region t-smallprint" style="top:935px;left:60px;width:700px">
+          <span class="region-label">R16 footnote</span>
+          边缘小字：Text near the corner tests padding, clipping and coordinate mapping. 请确认输出坐标仍在原图范围内。
+        </div>
+
+        <div class="region t-micro" style="top:935px;left:1000px">
+          <span class="region-label">R17 micro</span>
+          x: 1480  y: 912  score: 0.931
+        </div>
+      </section>
+
+    </div>
+  </div>
+</main>
+
+<footer>
+  <div class="hint">
+    <b>使用说明</b><br>
+    · 用顶栏下拉框或 <b>← / →</b> 方向键切换案例；勾选「网格」「编号」可在图上叠加辅助标记。<br>
+    · 点「下载当前 PNG」导出当前案例，导出时会自动隐藏网格与编号，输出 <b>2×</b> 分辨率的纯测试图（3200 × 2000）。<br>
+    · 点「下载全部」会依次导出全部 12 张案例图，请允许浏览器多次下载。<br>
+    · <b>验证要点</b>：每个输出 polygon 是否覆盖对应文本；旋转 / 竖排区域是否返回真实四边形而非轴对齐矩形；表格、键值对是否保持行列独立；低对比度与 8–12px 小字是否漏检；多语言与 RTL 文本的坐标是否仍在原图范围内。
+  </div>
+</footer>
+
+<script>
+(function () {
+  'use strict';
+
+  const stage      = document.getElementById('stage');
+  const canvases   = Array.from(stage.querySelectorAll('.canvas'));
+  const select     = document.getElementById('caseSelect');
+  const prevBtn    = document.getElementById('prev');
+  const nextBtn    = document.getElementById('next');
+  const gridBox    = document.getElementById('grid');
+  const labelsBox  = document.getElementById('labels');
+  const dlBtn      = document.getElementById('download');
+  const dlAllBtn   = document.getElementById('downloadAll');
+  const titleEl    = document.getElementById('caseTitle');
+  const descEl     = document.getElementById('caseDesc');
+  const sizeEl     = document.getElementById('caseSize');
+
+  let index = 0;
+  let busy = false;
+
+  /* ---------------- 下拉选项 ---------------- */
+  canvases.forEach((el, i) => {
+    const opt = document.createElement('option');
+    opt.value = String(i);
+    opt.textContent = String(i + 1).padStart(2, '0') + ' · ' + (el.dataset.title || '未命名案例');
+    select.appendChild(opt);
+  });
+
+  /* ---------------- 切换 ---------------- */
+  function show(i) {
+    index = (i + canvases.length) % canvases.length;
+    canvases.forEach((el, k) => el.classList.toggle('active', k === index));
+
+    const el = canvases[index];
+    select.value = String(index);
+    titleEl.textContent = String(index + 1).padStart(2, '0') + ' · ' + (el.dataset.title || '');
+    descEl.textContent = el.dataset.desc || '';
+    sizeEl.textContent = el.offsetWidth + ' × ' + el.offsetHeight + ' px · 导出 2×';
+    applyOptions();
+  }
+
+  function applyOptions() {
+    const g = gridBox.checked;
+    const l = labelsBox.checked;
+    canvases.forEach(el => {
+      el.classList.toggle('grid', g);
+      el.classList.toggle('labels', l);
+    });
+  }
+
+  select.addEventListener('change', () => show(Number(select.value)));
+  prevBtn.addEventListener('click', () => show(index - 1));
+  nextBtn.addEventListener('click', () => show(index + 1));
+  gridBox.addEventListener('change', applyOptions);
+  labelsBox.addEventListener('change', applyOptions);
+
+  document.addEventListener('keydown', (e) => {
+    if (e.target.matches('input, select, textarea')) return;
+    if (e.key === 'ArrowLeft')  { show(index - 1); }
+    if (e.key === 'ArrowRight') { show(index + 1); }
+  });
+
+  /* ---------------- 导出相关 ---------------- */
+
+  // 收集页面全部 CSS 规则文本
+  function collectCss() {
+    let css = '';
+    for (const sheet of document.styleSheets) {
+      let rules;
+      try {
+        rules = sheet.cssRules;
+      } catch (err) {
+        continue; // 跨域样式表跳过
+      }
+      if (!rules) continue;
+      for (const rule of rules) css += rule.cssText + '\n';
+    }
+    return css;
+  }
+
+  function loadImage(url) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error('图片解码失败'));
+      img.src = url;
+    });
+  }
+
+  // 把 Unicode 字符串安全地转成 base64（btoa 只接受 Latin-1）
+  function b64EncodeUnicode(str) {
+    const bytes = new TextEncoder().encode(str);
+    let binary = '';
+    const CHUNK = 0x8000;
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+    }
+    return btoa(binary);
+  }
+
+  /**
+   * 用 SVG foreignObject 把 DOM 原样渲染成 PNG。
+   *
+   * 关键点：使用 base64 data URL 加载 SVG，而不是 blob URL，
+   * 避免 Chrome 将 canvas 标记为 tainted 导致 toDataURL 抛错。
+   */
+  async function renderToPng(sourceEl, scale) {
+    scale = scale || 2;
+
+    const w = sourceEl.offsetWidth || 1600;
+    const h = sourceEl.offsetHeight || 1000;
+
+    const clone = sourceEl.cloneNode(true);
+    clone.classList.remove('labels', 'grid');
+    clone.classList.add('active');
+    clone.style.display = 'block';
+    clone.style.margin = '0';
+    clone.setAttribute('xmlns', 'http://www.w3.org/1999/xhtml');
+
+    const styleEl = document.createElement('style');
+    styleEl.textContent = collectCss();
+    clone.insertBefore(styleEl, clone.firstChild);
+
+    const xhtml = new XMLSerializer().serializeToString(clone);
+
+    const svg =
+      '<svg xmlns="http://www.w3.org/2000/svg" width="' + (w * scale) + '" height="' + (h * scale) + '" ' +
+      'viewBox="0 0 ' + w + ' ' + h + '">' +
+      '<foreignObject x="0" y="0" width="' + w + '" height="' + h + '">' +
+      xhtml +
+      '</foreignObject></svg>';
+
+    // data URL（不是 blob URL）→ 不污染 canvas
+    const dataUrl = 'data:image/svg+xml;base64,' + b64EncodeUnicode(svg);
+
+    const img = await loadImage(dataUrl);
+
+    const out = document.createElement('canvas');
+    out.width = w * scale;
+    out.height = h * scale;
+
+    const ctx = out.getContext('2d');
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, out.width, out.height);
+    ctx.drawImage(img, 0, 0, out.width, out.height);
+
+    return out.toDataURL('image/png');
+  }
+
+  function triggerDownload(dataUrl, filename) {
+    const a = document.createElement('a');
+    a.href = dataUrl;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  }
+
+  /* 根据序号 + 案例名称生成文件名，去掉空格与易混淆字符 */
+  function makeFilename(i) {
+    const num   = String(i + 1).padStart(2, '0');
+    const title = canvases[i].dataset.title || 'case';
+    const safe  = title
+      .replace(/\s+/g, '')                      // 去掉所有空白
+      .replace(/[、，,。.·/\\:*?"<>|]+/g, '');  // 去掉易混淆 / 非法字符
+    return num + safe + '.png';
+  }
+
+  async function downloadCase(i) {
+    const dataUrl = await renderToPng(canvases[i], 2);
+    triggerDownload(dataUrl, makeFilename(i));
+  }
+
+  dlBtn.addEventListener('click', async () => {
+    if (busy) return;
+    busy = true;
+    const old = dlBtn.textContent;
+    dlBtn.disabled = true;
+    dlBtn.textContent = '导出中…';
+    try {
+      await downloadCase(index);
+    } catch (err) {
+      console.error(err);
+      alert(
+        '导出失败：' + err.message +
+        '\n\n建议：\n' +
+        '· 使用最新版 Chrome / Edge\n' +
+        '· 如果通过 file:// 打开，请改用本地 HTTP 服务（例如 python -m http.server）'
+      );
+    } finally {
+      dlBtn.textContent = old;
+      dlBtn.disabled = false;
+      busy = false;
+    }
+  });
+
+  dlAllBtn.addEventListener('click', async () => {
+    if (busy) return;
+    busy = true;
+    const old = dlAllBtn.textContent;
+    dlAllBtn.disabled = true;
+    dlBtn.disabled = true;
+
+    try {
+      for (let i = 0; i < canvases.length; i++) {
+        dlAllBtn.textContent = '导出 ' + (i + 1) + '/' + canvases.length + '…';
+        await downloadCase(i);
+        await new Promise(r => setTimeout(r, 400));
+      }
+      dlAllBtn.textContent = '全部完成';
+      await new Promise(r => setTimeout(r, 1200));
+    } catch (err) {
+      console.error(err);
+      alert('批量导出中断：' + err.message);
+    } finally {
+      dlAllBtn.textContent = old;
+      dlAllBtn.disabled = false;
+      dlBtn.disabled = false;
+      busy = false;
+    }
+  });
+
+  /* ---------------- 初始化 ---------------- */
+  show(0);
+  window.addEventListener('resize', () => {
+    const el = canvases[index];
+    sizeEl.textContent = el.offsetWidth + ' × ' + el.offsetHeight + ' px · 导出 2×';
+  });
+})();
+</script>
+</body>
+</html>

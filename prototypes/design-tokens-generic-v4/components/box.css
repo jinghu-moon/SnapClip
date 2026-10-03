@@ -1,0 +1,72 @@
+/* SnapClip Box Component
+ * Surface box variants. Raised levels consume the semantic Level 2 / Level 3
+ * border roles, so the elevation steps stay distinguishable without shadow.
+ */
+.box {
+  margin: 0;
+  padding: var(--box-padding-md);
+  border: var(--box-border-width) solid var(--box-border-color);
+  border-radius: var(--box-border-radius-md);
+  background: var(--box-background-plain);
+  color: var(--box-color-plain);
+  box-shadow: var(--box-shadow-0);
+}
+.box[data-bordered] {
+  border-width: var(--border-1);
+}
+.box[data-tone="subtle"] {
+  background: var(--box-background-subtle);
+  color: var(--box-color-subtle);
+}
+.box[data-tone="raised"] {
+  background: var(--box-background-raised);
+  color: var(--box-color-raised);
+}
+.box[data-tone="inverse"] {
+  background: var(--box-background-inverse);
+  color: var(--box-color-inverse);
+}
+.box[data-tone="raised"][data-elevation="2"] {
+  background: var(--box-background-raised-2);
+  border-width: var(--box-border-width-raised-2);
+  border-color: var(--box-border-color-raised-2);
+}
+.box[data-tone="raised"][data-elevation="3"] {
+  background: var(--box-background-raised-3);
+  border-width: var(--box-border-width-raised-3);
+  border-color: var(--box-border-color-raised-3);
+}
+.box[data-elevation="1"] {
+  box-shadow: var(--box-shadow-1);
+}
+.box[data-elevation="2"] {
+  box-shadow: var(--box-shadow-2);
+}
+.box[data-elevation="3"] {
+  box-shadow: var(--box-shadow-3);
+}
+.box[data-size="sm"] {
+  padding: var(--box-padding-sm);
+  border-radius: var(--box-border-radius-sm);
+}
+.box[data-size="lg"] {
+  padding: var(--box-padding-lg);
+  border-radius: var(--box-border-radius-lg);
+}
+@media (forced-colors: active) {
+  /* High contrast mode drops authored colors, so the raised steps must fall
+   * back to the system border color to keep their hierarchy. */
+  .box[data-tone="raised"] {
+    border: var(--border-1) solid CanvasText;
+  }
+  .box[data-tone="inverse"] {
+    color: Canvas;
+    background: CanvasText;
+  }
+}
+.divider {
+  height: 0;
+  margin: var(--divider-margin-block) 0;
+  border: 0;
+  border-top: var(--divider-border-width) solid var(--divider-border-color);
+}

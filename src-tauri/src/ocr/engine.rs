@@ -13,6 +13,7 @@ pub enum OcrInput {
 #[derive(Debug, Clone)]
 pub struct OcrText {
     pub text: String,
+    pub layout: Option<String>,
     pub engine: &'static str,
 }
 

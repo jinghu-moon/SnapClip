@@ -1,0 +1,31 @@
+/* SnapClip Tag Component */
+.tag {
+  --h: var(--tag-height-md);
+  --px: var(--tag-padding-inline-md);
+  --fs: var(--tag-font-size-md);
+  height: var(--h);
+  padding: var(--tag-padding-block) var(--px);
+  border: var(--tag-border-width) solid var(--tag-border-color);
+  border-radius: var(--tag-border-radius);
+  background: var(--tag-background);
+  color: var(--tag-color);
+  font-size: var(--fs);
+}
+.tag:hover {
+  background: var(--tag-background-hover);
+}
+.tag[data-size="sm"] {
+  --h: var(--tag-height-sm);
+  --px: var(--tag-padding-inline-sm);
+  --fs: var(--tag-font-size-sm);
+}
+.tag[data-size="lg"] {
+  --h: var(--tag-height-lg);
+  --px: var(--tag-padding-inline-lg);
+  --fs: var(--tag-font-size-lg);
+}
+.tag[aria-pressed="true"] {
+  border-color: var(--tag-border-color-selected);
+  background: var(--tag-background-selected);
+  color: var(--tag-color-selected);
+}

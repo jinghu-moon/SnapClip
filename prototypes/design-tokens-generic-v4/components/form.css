@@ -1,0 +1,139 @@
+/* SnapClip Form Component
+ * Input, select, textarea, checkbox, radio, switch, and progress.
+ */
+.field {
+  display: grid;
+  gap: var(--gap-form-field);
+  min-width: min(var(--width-sm), 100%);
+}
+.field label {
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+  font-weight: var(--weight-medium);
+}
+.input,
+.select,
+.textarea {
+  --h: var(--input-height-md);
+  --px: var(--input-padding-inline-md);
+  --fs: var(--input-font-size-md);
+  width: 100%;
+  height: var(--h);
+  padding: var(--input-padding-block) var(--px);
+  border: var(--input-border-width) solid var(--input-border-color);
+  border-radius: var(--input-border-radius);
+  background: var(--input-background);
+  color: var(--input-color);
+  font-size: var(--fs);
+}
+.input[data-size="sm"],
+.select[data-size="sm"] {
+  --h: var(--input-height-sm);
+  --px: var(--input-padding-inline-sm);
+  --fs: var(--input-font-size-sm);
+}
+.input[data-size="lg"],
+.select[data-size="lg"] {
+  --h: var(--input-height-lg);
+  --px: var(--input-padding-inline-lg);
+  --fs: var(--input-font-size-lg);
+}
+.input::placeholder {
+  color: var(--input-placeholder-color);
+}
+.input:disabled {
+  background: var(--input-background-disabled);
+  color: var(--input-color-disabled);
+  border-color: var(--input-border-color-disabled);
+  cursor: not-allowed;
+}
+.input:hover,
+.select:hover {
+  border-color: var(--input-border-color-hover);
+}
+.input:focus,
+.select:focus {
+  border-color: var(--input-border-color-focus);
+  box-shadow: 0 0 0 var(--space-4) color-mix(in srgb, var(--input-border-color-focus) 24%, transparent);
+  outline: 0;
+}
+.input[aria-invalid="true"] {
+  border-color: var(--input-border-color-invalid);
+}
+.helper {
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+}
+.helper.error {
+  color: var(--error);
+}
+.check,
+.switch {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--gap-control-group);
+  height: var(--control-height-md);
+  font-size: var(--control-font-size-md);
+}
+.check input {
+  width: var(--checkbox-size);
+  height: var(--checkbox-size);
+  accent-color: var(--checkbox-accent-color);
+}
+.check input[type="radio"] {
+  width: var(--radio-size);
+  height: var(--radio-size);
+  accent-color: var(--radio-accent-color);
+}
+.switch input {
+  position: absolute;
+  opacity: 0;
+}
+.track {
+  width: var(--switch-width);
+  height: var(--switch-height);
+  padding: calc(var(--switch-inset) - var(--switch-border-width));
+  border: var(--switch-border-width) solid var(--switch-border-color);
+  border-radius: var(--switch-border-radius);
+  background: var(--switch-background);
+}
+.track:after {
+  content: "";
+  display: block;
+  width: var(--switch-thumb);
+  height: var(--switch-thumb);
+  border-radius: 50%;
+  background: var(--switch-thumb-color);
+  transition: transform var(--duration-fast) var(--ease-standard);
+}
+.switch input:checked + .track {
+  background: var(--switch-background-checked);
+}
+.switch input:checked + .track:after {
+  background: var(--switch-thumb-color-checked);
+  transform: translateX(var(--switch-thumb-shift));
+}
+.range {
+  width: 100%;
+  accent-color: var(--selection-bg);
+}
+.textarea {
+  height: auto;
+  padding: var(--textarea-padding-block) var(--px);
+  line-height: var(--textarea-line-height);
+  resize: vertical;
+  font-family: inherit;
+}
+.progress {
+  height: var(--progress-height);
+  border-radius: var(--progress-border-radius);
+  background: var(--progress-track);
+  overflow: hidden;
+}
+.progress span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--progress-fill);
+  transition: width var(--duration-normal) var(--ease-standard);
+}

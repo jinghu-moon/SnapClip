@@ -28,6 +28,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 thiserror = "2"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png", "bmp"] }
+rapid-ocr-rs = { path = "../crates/rapid-ocr-rs", default-features = false, features = ["ort-runtime"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

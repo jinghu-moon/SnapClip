@@ -125,6 +125,7 @@ pub enum QueueDecision {
 pub enum OcrFinishOutcome {
     Done {
         text: String,
+        layout: Option<String>,
         engine: String,
     },
     Failed {
@@ -407,7 +408,7 @@ impl Store {
         let mut statement = connection.prepare(
             "SELECT clips.id, clips.created_at_unix_ms, clips.primary_kind, clips.preview_text,
                     clips.source_app, clips.source_exe_path,
-                    cs.ocr_status, cs.ocr_text, cs.ocr_engine, cs.ocr_updated_at, cs.ocr_error_code
+                    cs.ocr_status, cs.ocr_text, cs.ocr_layout, cs.ocr_engine, cs.ocr_updated_at, cs.ocr_error_code
              FROM clips
              LEFT JOIN clip_search cs ON cs.clip_id = clips.id
              WHERE (?1 IS NULL OR clips.id IN (
@@ -444,7 +445,7 @@ impl Store {
         let mut summaries = Vec::new();
         while let Some(row) = rows.next()? {
             let ocr_status_raw: Option<String> = row.get(6)?;
-            let ocr_error_raw: Option<String> = row.get(10)?;
+            let ocr_error_raw: Option<String> = row.get(11)?;
             summaries.push(ClipSummary {
                 id: row.get(0)?,
                 created_at_unix_ms: row.get(1)?,
@@ -459,8 +460,9 @@ impl Store {
                     .and_then(OcrStatus::parse)
                     .unwrap_or(OcrStatus::None),
                 ocr_text: row.get(7)?,
-                ocr_engine: row.get(8)?,
-                ocr_updated_at: row.get(9)?,
+                ocr_layout: row.get(8)?,
+                ocr_engine: row.get(9)?,
+                ocr_updated_at: row.get(10)?,
                 ocr_error_code: ocr_error_raw.as_deref().and_then(OcrErrorCode::parse),
             });
         }
@@ -715,12 +717,16 @@ fn finish_ocr_job(
 ) -> Result<bool, StoreError> {
     let now = unix_time_ms();
     let updated = match outcome {
-        OcrFinishOutcome::Done { text, engine } => connection.execute(
+        OcrFinishOutcome::Done {
+            text,
+            layout,
+            engine,
+        } => connection.execute(
             "UPDATE clip_search
-             SET ocr_status = 'done', ocr_text = ?3, ocr_engine = ?4,
-                 ocr_error_code = NULL, ocr_updated_at = ?5
+             SET ocr_status = 'done', ocr_text = ?3, ocr_layout = ?4, ocr_engine = ?5,
+                 ocr_error_code = NULL, ocr_updated_at = ?6
              WHERE clip_id = ?1 AND ocr_status = 'running' AND ocr_attempt = ?2",
-            params![clip_id, attempt, text, engine, now],
+            params![clip_id, attempt, text, layout, engine, now],
         )?,
         OcrFinishOutcome::Failed { error_code, engine } => connection.execute(
             "UPDATE clip_search
@@ -972,6 +978,14 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
         )?;
         transaction.execute(
             "INSERT INTO schema_migrations(version, applied_at_unix_ms) VALUES (3, ?1)",
+            [now],
+        )?;
+    }
+
+    if current < 4 {
+        transaction.execute_batch("ALTER TABLE clip_search ADD COLUMN ocr_layout TEXT;")?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at_unix_ms) VALUES (4, ?1)",
             [now],
         )?;
     }
@@ -1444,7 +1458,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(max_version, 3);
+        assert_eq!(max_version, 4);
     }
 
     #[test]
@@ -1492,6 +1506,7 @@ mod tests {
                 99,
                 crate::store::OcrFinishOutcome::Done {
                     text: "stale".into(),
+                    layout: None,
                     engine: "test".into(),
                 },
             )
@@ -1504,6 +1519,7 @@ mod tests {
                 attempt,
                 crate::store::OcrFinishOutcome::Done {
                     text: "你好 OCR".into(),
+                    layout: Some(r#"[{"text":"你好 OCR"}]"#.into()),
                     engine: "test".into(),
                 },
             )
@@ -1519,6 +1535,10 @@ mod tests {
             .unwrap();
         assert_eq!(page.items.len(), 1, "two-char OCR search should hit");
         assert_eq!(page.items[0].ocr_status, OcrStatus::Done);
+        assert_eq!(
+            page.items[0].ocr_layout.as_deref(),
+            Some(r#"[{"text":"你好 OCR"}]"#)
+        );
     }
 
     #[test]
@@ -1574,6 +1594,7 @@ mod tests {
                     attempt,
                     crate::store::OcrFinishOutcome::Done {
                         text: String::new(),
+                        layout: None,
                         engine: "test".into(),
                     },
                 )

@@ -1,0 +1,18 @@
+/* SnapClip Design System Entry
+ * Single production entry for token and layer ordering.
+ *
+ * Cascade layer order (lowest -> highest precedence):
+ *   primitives -> semantics -> components -> implementations -> demo
+ * The demo layer is declared here so any consumer that does not load the
+ * demo stylesheet still gets a stable, predictable cascade.
+ *
+ * Layer sources:
+ *   primitives.css   - stable scales, raw color palettes, fonts, motion
+ *   semantics.css    - theme + interaction roles
+ *   components.css   - component geometry + visual contracts
+ */
+@layer primitives, semantics, components, implementations, demo;
+
+@import url('./primitives.css') layer(primitives);
+@import url('./semantics.css') layer(semantics);
+@import url('./components.css') layer(components);

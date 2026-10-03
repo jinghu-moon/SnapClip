@@ -297,13 +297,18 @@ fn process_job(
     let input = OcrInput::Png(bytes.into());
     let result = engine.recognize(&input, cancel);
     match result {
-        Ok(OcrText { text, engine: name }) => {
+        Ok(OcrText {
+            text,
+            layout,
+            engine: name,
+        }) => {
             let committed = store
                 .finish_ocr_job(
                     job.clip_id.clone(),
                     attempt,
                     OcrFinishOutcome::Done {
                         text,
+                        layout,
                         engine: name.to_string(),
                     },
                 )

@@ -27,8 +27,24 @@ refer
 
 # Large third-party font binaries (only used by local design prototypes)
 src/assets/fonts/
+prototypes/*/assets/
 
 # Local scratch / backup artifacts
 *-backup.html
 *.backup.*
 .playwright-cli/
+.playwright-mcp/
+.tmp-*.json
+docs/Temp/
+
+# Local OCR test data, model weights, and comparison run outputs (multi-GB,
+# not redistributable; see docs for how to regenerate or download them)
+OCR-Model/
+Formula-TestSet/
+OCR-test-image/
+.comparison-old/
+comparison-*/
+
+# rapid-ocr-rs is a separate repository with its own remote; src-tauri depends on
+# it by path, so clone it alongside this repository (or convert it to a submodule).
+crates/

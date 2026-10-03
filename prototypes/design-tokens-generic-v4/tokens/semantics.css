@@ -1,0 +1,163 @@
+/* SnapClip Semantic Tokens
+ * Theme and interaction roles. Components consume these roles instead of raw palette values.
+ * Layer source for prototypes/design-tokens-generic-v4.html.
+ */
+[data-theme=dark] {
+  color-scheme: dark
+}
+
+:root {
+  color-scheme           : light;
+  --page                 : var(--neutral-100);
+  --surface              : var(--neutral-0);
+  --surface-subtle       : var(--neutral-50);
+  --surface-component    : var(--neutral-200);
+  --surface-inverse      : var(--neutral-950);
+  --surface-level-2      : var(--neutral-0);
+  --surface-level-3      : var(--neutral-0);
+  /* Elevated surfaces are white in light mode, so hierarchy cannot come from
+   * the surface fill. These border roles are the non-shadow marker: Level 3
+   * must stay distinguishable from Level 2 even with elevation disabled. */
+  --surface-level-2-border: var(--border-divider);
+  --surface-level-3-border: var(--border-default);
+  --text-primary         : var(--neutral-900);
+  --text-secondary       : var(--neutral-700);
+  --text-placeholder     : var(--neutral-600);
+  --text-inverse         : var(--neutral-0);
+  --border-divider       : var(--neutral-200);
+  --border-default       : var(--neutral-300);
+  --border-strong        : var(--neutral-800);
+  --border-control       : var(--neutral-600);
+  --focus-ring           : var(--accent-border);
+  --action-primary       : var(--neutral-900);
+  --action-on-primary    : var(--neutral-0);
+  --action-danger        : var(--red-700);
+  --action-on-danger     : var(--neutral-0);
+  --selection-bg         : var(--accent-solid);
+  --selection-fg         : var(--on-accent);
+  --scrim                : rgb(0 0 0/.56);
+  --info                 : var(--blue-600);
+  --info-bg              : var(--blue-100);
+  --info-fg              : var(--blue-900);
+  --warning              : var(--amber-600);
+  --warning-bg           : var(--amber-100);
+  --warning-fg           : var(--amber-900);
+  --error                : var(--red-600);
+  --error-bg             : var(--red-100);
+  --error-fg             : var(--red-900);
+  --success              : var(--green-700);
+  --success-bg           : var(--green-200);
+  --success-fg           : var(--green-900);
+  --shadow-1             : 0 1px 2px rgb(0 0 0/.08), 0 6px 20px rgb(0 0 0/.06);
+  --shadow-2             : 0 12px 36px rgb(0 0 0/.16);
+  --shadow-3             : 0 18px 56px rgb(0 0 0/.22);
+  --elevation-panel      : var(--shadow-1);
+  --elevation-popover    : var(--shadow-2);
+  --elevation-dialog     : var(--shadow-3);
+  --disabled-container   : color-mix(in srgb, var(--text-primary) calc(var(--opacity-disabled-container)*100%), transparent);
+  --disabled-content     : color-mix(in srgb, var(--text-primary) calc(var(--opacity-disabled-content)*100%), transparent);
+  --accent-50            : var(--azure-50);
+  --accent-100           : var(--azure-100);
+  --accent-200           : var(--azure-200);
+  --accent-300           : var(--azure-300);
+  --accent-400           : var(--azure-400);
+  --accent-500           : var(--azure-500);
+  --accent-600           : var(--azure-600);
+  --accent-700           : var(--azure-700);
+  --accent-800           : var(--azure-800);
+  --accent-900           : var(--azure-900);
+  --accent-950           : var(--azure-950);
+  --accent-solid         : var(--accent-600);
+  --accent-text          : var(--accent-700);
+  --accent-subtle        : var(--accent-100);
+  --accent-subtle-text   : var(--accent-800);
+  --accent-border        : var(--accent-600);
+  --on-accent            : var(--neutral-0);
+  --text-link            : var(--accent-text);
+  --selected-background  : var(--accent-subtle);
+  --selected-color       : var(--accent-subtle-text);
+  --selected-marker-width: var(--border-2);
+  --selected-marker-color: var(--accent-solid);
+  --info-border          : var(--blue-300);
+  --success-border       : var(--green-300);
+  --warning-border       : var(--amber-300);
+  --error-border         : var(--red-300)
+}
+
+[data-theme=dark] {
+  --page              : #101010;
+  --surface           : #181818;
+  --surface-subtle    : #202020;
+  --surface-component : #2b2b2b;
+  --surface-inverse   : var(--neutral-100);
+  --surface-level-2   : #202020;
+  --surface-level-3   : #2b2b2b;
+  --surface-level-2-border: var(--border-divider);
+  --surface-level-3-border: var(--border-default);
+  --text-primary      : #f5f5f5;
+  --text-secondary    : #b8b8b8;
+  --text-placeholder  : #858585;
+  --text-inverse      : var(--neutral-950);
+  --border-divider    : #2b2b2b;
+  --border-default    : #383838;
+  --border-control    : #7a7a7a;
+  --action-primary    : var(--neutral-100);
+  --action-on-primary : var(--neutral-950);
+  --action-danger     : var(--error);
+  --action-on-danger  : var(--neutral-950);
+  --scrim             : rgb(0 0 0/.64);
+  --info              : var(--blue-300);
+  --info-bg           : var(--blue-950);
+  --info-fg           : var(--blue-100);
+  --warning           : var(--amber-300);
+  --warning-bg        : var(--amber-950);
+  --warning-fg        : var(--amber-100);
+  --error             : var(--red-300);
+  --error-bg          : var(--red-950);
+  --error-fg          : var(--red-100);
+  --success           : var(--green-400);
+  --success-bg        : var(--green-900);
+  --success-fg        : var(--green-100);
+  --shadow-1          : 0 1px 2px rgb(0 0 0/.28), 0 6px 20px rgb(0 0 0/.16);
+  --shadow-2          : 0 12px 36px rgb(0 0 0/.38);
+  --shadow-3          : 0 18px 56px rgb(0 0 0/.52);
+  --accent-solid      : var(--accent-600);
+  --accent-text       : var(--accent-300);
+  --accent-subtle     : var(--accent-950);
+  --accent-subtle-text: var(--accent-200);
+  --accent-border     : var(--accent-300);
+  --on-accent         : var(--neutral-0);
+  --info-border       : var(--blue-800);
+  --success-border    : var(--green-800);
+  --warning-border    : var(--amber-800);
+  --error-border      : var(--red-800)
+}
+
+[data-theme=dark] {
+  --border-strong: #9a9a9a
+}
+
+:root {
+  --list-row-color              : var(--text-primary);
+  --list-row-background-hover   : var(--button-ghost-background-hover);
+  --list-row-background-selected: var(--selected-background)
+}
+
+[data-accent=neutral] {
+  --accent-solid      : var(--neutral-900);
+  --accent-text       : var(--neutral-900);
+  --accent-subtle     : var(--neutral-200);
+  --accent-subtle-text: var(--neutral-900);
+  --accent-border     : var(--neutral-900);
+  --on-accent         : var(--neutral-0);
+  --link-decoration   : underline
+}
+
+[data-accent=neutral][data-theme=dark] {
+  --accent-solid      : var(--neutral-100);
+  --accent-text       : var(--neutral-100);
+  --accent-subtle     : var(--neutral-800);
+  --accent-subtle-text: var(--neutral-100);
+  --accent-border     : var(--neutral-100);
+  --on-accent         : var(--neutral-950)
+}

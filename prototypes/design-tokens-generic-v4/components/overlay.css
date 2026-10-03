@@ -1,0 +1,118 @@
+/* SnapClip Overlay Component
+ * Popover, dialog, tooltip, and menu surfaces.
+ * Elevated surfaces carry the semantic Level 2 / Level 3 border role so
+ * hierarchy survives shadow-free, forced-colors, and low-quality display
+ * environments; elevation is never the only hierarchy marker.
+ */
+.overlay {
+  min-height: 100px;
+  display: grid;
+  place-items: center;
+  border: var(--border-1) solid var(--surface-level-2-border);
+  border-radius: var(--radius-md);
+  background: var(--surface-level-2);
+  box-shadow: var(--elevation-popover);
+  font-size: var(--font-size-sm);
+}
+.overlay-level-3 {
+  border-color: var(--surface-level-3-border);
+  background: var(--surface-level-3);
+  box-shadow: var(--elevation-dialog);
+}
+.dialog-sample {
+  background: var(--box-background-dialog);
+  border: var(--box-border-width-dialog) solid var(--box-border-color-dialog);
+  border-radius: var(--box-border-radius-dialog);
+  box-shadow: var(--box-shadow-dialog);
+}
+.dialog-backdrop {
+  position: fixed;
+  z-index: var(--layer-dialog);
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: var(--box-padding-dialog);
+  background: var(--scrim);
+}
+.dialog-backdrop[hidden] {
+  display: none;
+}
+.tooltip {
+  padding: var(--box-padding-block-tooltip) var(--box-padding-inline-tooltip);
+  border-radius: var(--box-border-radius-tooltip);
+  background: var(--box-background-tooltip);
+  color: var(--box-color-tooltip);
+}
+.trigger {
+  position: relative;
+}
+.trigger:after {
+  content: attr(data-tooltip);
+  position: absolute;
+  z-index: var(--layer-tooltip);
+  right: 0;
+  bottom: calc(100% + var(--space-8));
+  width: max-content;
+  padding: var(--box-padding-block-tooltip) var(--box-padding-inline-tooltip);
+  border-radius: var(--box-border-radius-tooltip);
+  background: var(--box-background-tooltip);
+  color: var(--box-color-tooltip);
+  font-size: var(--box-font-size-tooltip);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(var(--space-4));
+  transition:
+    opacity var(--duration-fast) var(--ease-standard),
+    transform var(--duration-fast) var(--ease-standard);
+}
+.trigger:hover:after,
+.trigger:focus-visible:after {
+  opacity: 1;
+  transform: none;
+}
+.menu-wrap {
+  position: relative;
+  width: max-content;
+}
+.menu {
+  position: absolute;
+  z-index: var(--layer-popover);
+  top: calc(100% + var(--space-8));
+  right: 0;
+  width: var(--menu-width);
+  padding: var(--box-padding-popover);
+  border: var(--box-border-width-popover) solid var(--box-border-color-popover);
+  border-radius: var(--box-border-radius-popover);
+  background: var(--box-background-popover);
+  box-shadow: var(--box-shadow-popover);
+}
+.menu[hidden] {
+  display: none;
+}
+.menu button {
+  --h: var(--button-height-md);
+  --px: var(--button-padding-inline-md);
+  --fs: var(--button-font-size-md);
+  width: 100%;
+  height: var(--h);
+  display: flex;
+  align-items: center;
+  gap: var(--button-gap);
+  padding: var(--button-padding-block) var(--px);
+  border: 0;
+  border-radius: var(--menu-item-border-radius);
+  background: var(--button-ghost-background);
+  color: var(--menu-item-color);
+  text-align: left;
+  font-size: var(--fs);
+}
+.menu button:hover {
+  background: var(--menu-item-background-hover);
+}
+@media (forced-colors: active) {
+  .overlay,
+  .dialog-sample,
+  .menu {
+    border: var(--border-1) solid CanvasText;
+  }
+}

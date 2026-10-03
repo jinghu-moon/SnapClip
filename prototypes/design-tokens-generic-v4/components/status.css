@@ -1,0 +1,36 @@
+/* SnapClip Status Component
+ * Info / Success / Warning / Error message containers.
+ */
+.status {
+  display: flex;
+  gap: var(--status-gap);
+  padding: var(--status-padding-block) var(--status-padding-inline);
+  border: var(--status-border-width) solid var(--status-border);
+  border-radius: var(--status-border-radius);
+  background: var(--status-bg);
+  color: var(--status-fg);
+  font-size: var(--font-size-sm);
+}
+.status span {
+  opacity: 0.82;
+}
+.info {
+  --status-border: var(--info-border);
+  --status-bg: var(--info-bg);
+  --status-fg: var(--info-fg);
+}
+.warning {
+  --status-border: var(--warning-border);
+  --status-bg: var(--warning-bg);
+  --status-fg: var(--warning-fg);
+}
+.error {
+  --status-border: var(--error-border);
+  --status-bg: var(--error-bg);
+  --status-fg: var(--error-fg);
+}
+.success {
+  --status-border: var(--success-border);
+  --status-bg: var(--success-bg);
+  --status-fg: var(--success-fg);
+}

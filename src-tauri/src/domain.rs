@@ -123,6 +123,7 @@ pub struct ClipSummary {
     pub payloads: Vec<PayloadRef>,
     pub ocr_status: OcrStatus,
     pub ocr_text: Option<String>,
+    pub ocr_layout: Option<String>,
     pub ocr_engine: Option<String>,
     pub ocr_updated_at: Option<i64>,
     pub ocr_error_code: Option<OcrErrorCode>,

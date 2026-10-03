@@ -1,0 +1,1743 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light" data-theme-choice="system">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>通用设计体系 Demo</title>
+    <link rel="stylesheet" href="./assets/tabler-icons.min.css" />
+    <link rel="stylesheet" href="./tokens/index.css" />
+    <link rel="stylesheet" href="./components/index.css" />
+    <link rel="stylesheet" href="./demo/demo.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <strong>通用设计体系</strong
+        ><span>Tokens · Components · Accessibility</span>
+      </div>
+      <nav class="nav">
+        <a href="#foundations">基础</a><a href="#colors">颜色</a
+        ><a href="#controls">控件</a><a href="#overlays">浮层</a
+        ><a href="#a11y">可访问性</a><a href="#export">导出</a>
+      </nav>
+      <div class="themes" role="group" aria-label="主题色">
+        <button
+          data-accent-mode="azure"
+          aria-pressed="true"
+          title="Azure"
+          aria-label="Azure"
+        >
+          <span class="dot" style="background: var(--azure-600)"></span></button
+        ><button
+          data-accent-mode="neutral"
+          aria-pressed="false"
+          title="Neutral"
+          aria-label="Neutral"
+        >
+          <span class="dot" style="background: var(--text-primary)"></span>
+        </button>
+      </div>
+      <div class="themes" role="group" aria-label="主题模式">
+        <button
+          data-theme-mode="system"
+          aria-pressed="true"
+          title="跟随系统"
+          aria-label="跟随系统"
+        >
+          <i class="ti ti-device-desktop" aria-hidden="true"></i></button
+        ><button
+          data-theme-mode="light"
+          aria-pressed="false"
+          title="浅色"
+          aria-label="浅色"
+        >
+          <i class="ti ti-sun" aria-hidden="true"></i></button
+        ><button
+          data-theme-mode="dark"
+          aria-pressed="false"
+          title="深色"
+          aria-label="深色"
+        >
+          <i class="ti ti-moon" aria-hidden="true"></i>
+        </button>
+      </div>
+    </header>
+    <main class="shell">
+      <section class="intro">
+        <div>
+          <span class="eyebrow">Shared UI foundation</span>
+          <h1>让界面有秩序，<br />让状态可理解。</h1>
+          <p>
+            独立、无业务绑定的设计体系
+            Demo。颜色、排版、间距、控件状态和可访问性规则由稳定 Token
+            组成，可被不同项目复用。
+          </p>
+        </div>
+        <div class="principles">
+          <div class="principle">
+            <span class="principle-mark">1</span>
+            <div>
+              <strong>三层 Token</strong
+              ><span>Primitive → Semantic → Component</span>
+            </div>
+          </div>
+          <div class="principle">
+            <span class="principle-mark">2</span>
+            <div>
+              <strong>颜色不是唯一线索</strong
+              ><span>状态同时使用文字、图标和形状</span>
+            </div>
+          </div>
+          <div class="principle">
+            <span class="principle-mark">3</span>
+            <div>
+              <strong>父级负责 gap</strong><span>组件只负责自身内边距</span>
+            </div>
+          </div>
+          <div class="principle">
+            <span class="principle-mark">4</span>
+            <div>
+              <strong>对比度可验证</strong
+              ><span>正文 ≥ 4.5:1，UI 边界 ≥ 3:1</span>
+            </div>
+          </div>
+        </div>
+      </section>
+      <section class="section" id="foundations">
+        <div class="head">
+          <h2>基础尺度</h2>
+          <p>
+            原始数值按 CSS 属性的“数值约束”归类：space、size、radius、layer
+            四组尺度，其余是短序列。组件变量只引用它们，不写字面量。
+          </p>
+        </div>
+        <div class="grid three">
+          <article class="panel">
+            <h3>UI 字体</h3>
+            <p>中文、英文和普通正文。</p>
+            <div class="sample">
+              <span class="label">HarmonyOS Sans SC</span
+              ><span class="value">设计系统 Design System</span
+              ><span class="meta">常规 · 中等 · 半粗 · 展示</span>
+            </div>
+            <div class="weights">
+              <span style="font-weight: 400">常规<small>400</small></span
+              ><span style="font-weight: 500">中等<small>500</small></span
+              ><span style="font-weight: 600">半粗<small>600</small></span
+              ><span style="font-weight: 700"
+                >展示<small>700 · 仅展示</small></span
+              >
+            </div>
+          </article>
+          <article class="panel">
+            <h3>技术字体</h3>
+            <p>路径、快捷键、代码和稳定列宽字段。</p>
+            <div class="sample mono">
+              <span class="label">Fira Code</span
+              ><span class="value">Ctrl + Shift + P</span
+              ><span class="meta">D:\\Example\\path.txt</span>
+            </div>
+            <pre class="code">
+font-mono = Fira Code → ui-monospace → Consolas</pre
+            >
+          </article>
+          <article class="panel">
+            <h3>数字字体</h3>
+            <p>计数、百分比和时间值使用等宽数字。</p>
+            <div class="sample number">
+              <span class="label">TCloud Number</span
+              ><span class="value">0123456789</span
+              ><span class="value">00:00:00 / 02:14:08</span
+              ><span class="meta">23.976 · 64% · 128 项</span>
+            </div>
+            <pre class="code">font-number + tabular-nums</pre>
+          </article>
+        </div>
+        <div class="subhead">数值 Token · 按约束分类</div>
+        <div class="token-groups">
+          <article class="token-group">
+            <h3>Space</h3>
+            <p>margin、padding、gap、inset。按实际像素命名，小端细、大端粗。</p>
+            <dl class="token-list">
+              <div>
+                <dt>--space-0 … --space-16</dt>
+                <dd>0–16px</dd>
+              </div>
+              <div>
+                <dt>--space-24 … --space-64</dt>
+                <dd>24–64px</dd>
+              </div>
+            </dl>
+          </article>
+          <article class="token-group">
+            <h3>Size</h3>
+            <p>
+              width、height、min-size。控件、图标、命中区域从同一序列取值；尺码标签只是认知辅助，不是变量名。
+            </p>
+            <dl class="token-list">
+              <div>
+                <dt>--size-12 … --size-24</dt>
+                <dd>图标 12–24px</dd>
+              </div>
+              <div>
+                <dt>--size-28 … --size-56</dt>
+                <dd>控件与命中区域 28–56px</dd>
+              </div>
+              <div>
+                <dt>--width-* / --container-*</dt>
+                <dd>192 · 320 · 480 · 640 · 容器 720 / 1180</dd>
+              </div>
+              <div>
+                <dt>--control-* / --{组件}-*</dt>
+                <dd>组件变量引用 --size-*</dd>
+              </div>
+            </dl>
+          </article>
+          <article class="token-group">
+            <h3>Typography</h3>
+            <p>字号与行高成对并吸附 4px 网格；文字不复用 space。</p>
+            <dl class="token-list">
+              <div>
+                <dt>--font-size-sm … --font-size-display</dt>
+                <dd>12–40px</dd>
+              </div>
+              <div>
+                <dt>--line-height-sm … --line-height-display</dt>
+                <dd>16–48px</dd>
+              </div>
+              <div>
+                <dt>--weight-* / --tracking-*</dt>
+                <dd>400 · 500 · 600 · 展示 700</dd>
+              </div>
+            </dl>
+          </article>
+          <article class="token-group">
+            <h3>Short sequences</h3>
+            <p>边框、圆角、动效、透明度、层级：短序列，不再分层。</p>
+            <dl class="token-list">
+              <div>
+                <dt>--border-*</dt>
+                <dd>0 · 1 · 2px</dd>
+              </div>
+              <div>
+                <dt>--radius-base → xs … xl</dt>
+                <dd>8px → 2 · 4 · 8 · 12 · 16</dd>
+              </div>
+              <div>
+                <dt>--duration-* / --ease-*</dt>
+                <dd>100 · 200 · 300ms</dd>
+              </div>
+              <div>
+                <dt>--opacity-*</dt>
+                <dd>.08 · .10 · .16 · .38</dd>
+              </div>
+              <div>
+                <dt>--layer-*</dt>
+                <dd>0 · 10 · 20 · 30 · 40 · 50</dd>
+              </div>
+            </dl>
+          </article>
+        </div>
+        <div class="subhead">Space scale · 0–64px</div>
+        <div class="panel"><div class="scale" data-scale="space"></div></div>
+        <div class="subhead">Size scale · XS → S → M → L → XL → 2XL → 3XL</div>
+        <div class="panel"><div class="scale" data-scale="size"></div></div>
+      </section>
+      <section class="section" id="colors">
+        <div class="head">
+          <h2>Primitive 原始色阶</h2>
+          <p>
+            色阶可用于生成语义颜色，但业务组件不得直接引用。浅色主题显示 B
+            档，深色主题显示 A
+            档；扩展色按统一明度阶梯生成，按分组阅读即可。点击任意色块可复制
+            Hex。
+          </p>
+        </div>
+        <div class="palette-list" id="palettes"></div>
+        <div class="subhead">Semantic roles</div>
+        <div class="semantics" id="semantics"></div>
+      </section>
+      <section class="section" id="controls">
+        <div class="head">
+          <h2>Component Token 矩阵</h2>
+          <p>
+            保留最小视觉契约，完整交互由具体项目和 Reka UI
+            原语实现。基础组件（原子）：Box、Button、Input、Textarea、Checkbox、Radio、Switch、Tag、Link、Text、Icon、Divider、Progress、Spinner、Avatar。Box
+            是最底层的盒子，Panel、Popover、Dialog、Tooltip、Toast
+            是它的预设。其余（Select、Menu、Tabs、List、Table、Dialog……）是组合，直接复用原子的变量。这里用于检查组件
+            Token 在不同状态和主题下的映射。状态色统一规则：悬停 =
+            组件自身文字色以 8% 叠加在自身背景上，按下 =
+            10%；深浅主题自动反向，新增变体无需再逐个挑色。
+          </p>
+        </div>
+        <div class="grid">
+          <article class="panel">
+            <h3>Button</h3>
+            <div class="states">
+              <div class="state primary">
+                Default · --button-primary-background
+              </div>
+              <div class="state hover">
+                Hover · --button-primary-background-hover
+              </div>
+              <div class="state pressed">
+                Pressed · --button-primary-background-pressed
+              </div>
+              <div class="state focus">Focus · --focus-ring</div>
+              <div class="state disabled">Disabled · --disabled-container</div>
+            </div>
+          </article>
+          <article class="panel">
+            <h3>尺寸 · sm 28 / md 32 / lg 40</h3>
+            <div class="states">
+              <div class="row">
+                <button class="btn primary" data-size="sm">sm</button
+                ><button class="btn primary">md</button
+                ><button class="btn primary" data-size="lg">lg</button
+                ><button class="btn secondary" data-size="sm">sm</button
+                ><button class="btn secondary">md</button
+                ><button class="btn secondary" data-size="lg">lg</button>
+              </div>
+              <div class="row">
+                <input
+                  class="input"
+                  data-size="sm"
+                  placeholder="sm"
+                  style="flex: 1; min-width: 0"
+                /><input
+                  class="input"
+                  placeholder="md"
+                  style="flex: 1; min-width: 0"
+                /><input
+                  class="input"
+                  data-size="lg"
+                  placeholder="lg"
+                  style="flex: 1; min-width: 0"
+                />
+              </div>
+              <div class="row">
+                <button class="tag" data-size="sm">sm</button
+                ><button class="tag">md</button
+                ><button class="tag" data-size="lg">lg</button>
+              </div>
+            </div>
+          </article>
+          <article class="panel">
+            <h3>Input</h3>
+            <div class="states">
+              <div class="state">
+                Default · --input-background / --input-border-color
+              </div>
+              <div class="state hover">Hover · --input-border-color-hover</div>
+              <div class="state focus">Focus · --input-border-color-focus</div>
+              <div
+                class="state"
+                style="
+                  border-color: var(--input-border-color-invalid);
+                  color: var(--error);
+                "
+              >
+                Invalid · --input-border-color-invalid
+              </div>
+              <div class="state disabled">
+                Disabled · --input-background-disabled
+              </div>
+            </div>
+          </article>
+          <article class="panel">
+            <h3>List</h3>
+            <div class="list">
+              <div class="list-row">Default · --surface</div>
+              <div
+                class="list-row"
+                style="background: var(--button-ghost-background-hover)"
+              >
+                Highlighted · --list-row-background-hover
+              </div>
+              <div class="list-row selected">
+                Selected · --list-row-background-selected
+              </div>
+            </div>
+          </article>
+          <article class="panel">
+            <h3>Box · 最基础的盒子</h3>
+            <div class="states">
+              <div class="row">
+                <div class="box" data-bordered>plain</div>
+                <div class="box" data-tone="subtle">subtle</div>
+                <div
+                  class="box"
+                  data-tone="raised"
+                  data-bordered
+                  data-elevation="1"
+                >
+                  raised
+                </div>
+                <div class="box" data-tone="inverse">inverse</div>
+              </div>
+              <div class="row">
+                <div class="box" data-tone="subtle" data-size="sm">sm</div>
+                <div class="box" data-tone="subtle">md</div>
+                <div class="box" data-tone="subtle" data-size="lg">lg</div>
+              </div>
+              <div class="row">
+                <div class="box" data-tone="raised" data-bordered>0</div>
+                <div
+                  class="box"
+                  data-tone="raised"
+                  data-bordered
+                  data-elevation="1"
+                >
+                  1
+                </div>
+                <div
+                  class="box"
+                  data-tone="raised"
+                  data-bordered
+                  data-elevation="2"
+                >
+                  2
+                </div>
+                <div
+                  class="box"
+                  data-tone="raised"
+                  data-bordered
+                  data-elevation="3"
+                >
+                  3
+                </div>
+              </div>
+            </div>
+          </article>
+          <article class="panel">
+            <h3>Atoms · 新增基础组件</h3>
+            <div class="states">
+              <textarea
+                class="input textarea"
+                rows="3"
+                placeholder="Textarea"
+              ></textarea>
+              <div class="row">
+                <label class="check"
+                  ><input type="radio" name="r" checked />Radio A</label
+                ><label class="check"
+                  ><input type="radio" name="r" />Radio B</label
+                ><a class="link" href="#">Link</a>
+              </div>
+              <hr class="divider" />
+              <div
+                class="progress"
+                role="progressbar"
+                aria-valuenow="60"
+                aria-valuemin="0"
+                aria-valuemax="100"
+              >
+                <span style="width: 60%"></span>
+              </div>
+              <div class="row">
+                <span class="spinner" role="status" aria-label="加载中"></span
+                ><span class="avatar" data-size="sm">A</span
+                ><span class="avatar">B</span
+                ><span class="avatar" data-size="lg">C</span
+                ><span class="avatar" data-size="xl">D</span>
+              </div>
+            </div>
+          </article>
+          <article class="panel">
+            <h3>Accent · <span id="accent-name">azure</span></h3>
+            <div class="states">
+              <div class="row">
+                <button class="tag" aria-pressed="true">Selected</button
+                ><label class="switch"
+                  ><input type="checkbox" checked /><span class="track"></span
+                  >On</label
+                ><a class="link" href="#">链接文字</a>
+              </div>
+              <div
+                class="state"
+                style="
+                  border: 0;
+                  background: var(--accent-subtle);
+                  color: var(--accent-subtle-text);
+                "
+              >
+                Subtle · --accent-subtle
+              </div>
+              <div class="state focus">Focus · --accent-border</div>
+            </div>
+          </article>
+          <article class="panel">
+            <h3>Component aliases</h3>
+            <pre class="code">
+组件 = 背景 · 文本 · 边框 · 外边距 · 内边距 · 状态
+几何：--{组件}-{属性}[-{sm|md|lg}]
+颜色：--{组件}-{变体}-{属性}[-{状态}]</pre
+            >
+          </article>
+        </div>
+      </section>
+      <section class="section" id="overlays">
+        <div class="head">
+          <h2>浮层 Token 矩阵</h2>
+          <p>
+            仅保留浮层的视觉层级和状态预览。Dialog、Menu、Popover、Tooltip、Toast
+            的键盘和焦点行为由 Reka UI 提供。层级约定：popover、tooltip 高于
+            dialog，保证 Dialog 内可以打开 Select / Popover；Dialog
+            打开时对页面其余浮层的压制由 Reka UI 的 Portal
+            与遮罩负责，不依赖全局 z-index。
+          </p>
+        </div>
+        <div class="grid four">
+          <article class="panel">
+            <h3>Menu</h3>
+            <div class="overlay">
+              <span
+                >--box-background-popover<br />--box-border-color-popover<br />--menu-item-background-hover</span
+              >
+            </div>
+          </article>
+          <article class="panel">
+            <h3>Popover</h3>
+            <div class="overlay">
+              <span>Level 2<br />--elevation-popover</span>
+            </div>
+          </article>
+          <article class="panel">
+            <h3>Dialog</h3>
+            <div class="overlay dialog-sample">
+              <span
+                >Level 3<br />--box-background-dialog<br />--box-padding-dialog</span
+              >
+            </div>
+          </article>
+          <article class="panel">
+            <h3>Tooltip</h3>
+            <div class="overlay">
+              <span class="tooltip">--box-background-tooltip</span>
+            </div>
+          </article>
+        </div>
+        <div class="subhead">层级和遮罩</div>
+        <div class="grid four">
+          <div
+            class="panel"
+            style="
+              background: var(--page);
+              border-color: var(--border-divider);
+            "
+          >
+            <h3>Level 0</h3>
+            <p>页面背景 · --page</p>
+          </div>
+          <div
+            class="panel"
+            style="
+              border-color: var(--border-default);
+              box-shadow: var(--elevation-panel);
+            "
+          >
+            <h3>Level 1</h3>
+            <p>容器 · --elevation-panel</p>
+          </div>
+          <div
+            class="panel"
+            style="
+              background: var(--surface-level-2);
+              border-color: var(--surface-level-2-border);
+              box-shadow: var(--elevation-popover);
+            "
+          >
+            <h3>Level 2</h3>
+            <p>菜单 · --surface-level-2-border</p>
+          </div>
+          <div
+            class="panel"
+            style="
+              background: var(--surface-level-3);
+              border-color: var(--surface-level-3-border);
+              box-shadow: var(--elevation-dialog);
+            "
+          >
+            <h3>Level 3</h3>
+            <p>对话框 · --surface-level-3-border</p>
+          </div>
+        </div>
+      </section>
+      <section class="section" id="a11y">
+        <div class="head">
+          <h2>可访问性校验</h2>
+          <p>
+            正文、控件边界、焦点环和状态文字需要满足明确的对比度承诺。这张表只覆盖
+            Token 配对；层级顺序、无阴影边框契约、forced-colors
+            回退和移动端溢出由 <code>node tools/audit-design-tokens.mjs</code>
+            在真实浏览器中验证。实际 Vue 组件、Windows 高对比度原生控件、色弱与标注色叠加真实图片仍需专项评审。
+          </p>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>配对</th>
+                <th>前景</th>
+                <th>背景</th>
+                <th>承诺</th>
+                <th>Light</th>
+                <th>Dark</th>
+                <th>结果</th>
+              </tr>
+            </thead>
+            <tbody id="contrast"></tbody>
+          </table>
+        </div>
+        <div class="audit" id="audit">
+          <strong>正在检查</strong><code id="audit-value">--</code>
+        </div>
+      </section>
+      <section class="section" id="export">
+        <div class="head">
+          <h2>Token 导出</h2>
+          <p>
+            导出内容直接读取当前样式表中的 CSS
+            变量（原始尺度、语义颜色、组件变量），并附带断点常量说明，不维护第二份数据。
+          </p>
+        </div>
+        <div class="row" style="margin-bottom: var(--space-12)">
+          <button class="btn secondary" id="copy">复制 CSS</button
+          ><button class="btn primary" id="download">下载 CSS</button>
+        </div>
+        <pre class="export" id="export-code"></pre>
+      </section>
+    </main>
+    <div class="toast" id="toast" role="status" aria-live="polite">已完成</div>
+    <script>
+      const palettes = [
+        {
+          name: "Neutral",
+          note: "界面骨架 · 13 级",
+          className: "neutral",
+          values: [
+            ["0", "#ffffff"],
+            ["50", "#fafafa"],
+            ["100", "#f5f5f5"],
+            ["200", "#eeeeee"],
+            ["300", "#e0e0e0"],
+            ["400", "#c7c7c7"],
+            ["500", "#a3a3a3"],
+            ["600", "#737373"],
+            ["700", "#525252"],
+            ["800", "#333333"],
+            ["900", "#1f1f1f"],
+            ["950", "#121212"],
+            ["1000", "#000000"],
+          ],
+        },
+        {
+          name: "Steel Blue",
+          note: "浅色 B / 深色 A · 信息、处理中、焦点",
+          lightValues: [
+            ["50", "#f4f9fc"],
+            ["100", "#e5f1f7"],
+            ["200", "#c6e2ee"],
+            ["300", "#a1ccde"],
+            ["400", "#7ab3cb"],
+            ["500", "#5a96b2"],
+            ["600", "#477b94"],
+            ["700", "#3b647a"],
+            ["800", "#325364"],
+            ["900", "#2b4351"],
+            ["950", "#192a35"],
+          ],
+          darkValues: [
+            ["50", "#f2f7fa"],
+            ["100", "#e2eef4"],
+            ["200", "#c1dce8"],
+            ["300", "#98c3d5"],
+            ["400", "#6fa8c0"],
+            ["500", "#4e8aa5"],
+            ["600", "#3b6f88"],
+            ["700", "#315a70"],
+            ["800", "#2b4c5d"],
+            ["900", "#273f4c"],
+            ["950", "#172832"],
+          ],
+        },
+        {
+          name: "Red",
+          note: "浅色 B / 深色 A · 错误、删除、危险",
+          lightValues: [
+            ["50", "#fff8f7"],
+            ["100", "#ffecea"],
+            ["200", "#ffd5d1"],
+            ["300", "#feb3ab"],
+            ["400", "#f6887e"],
+            ["500", "#e66a5e"],
+            ["600", "#c75146"],
+            ["700", "#a14138"],
+            ["800", "#843933"],
+            ["900", "#6d342f"],
+            ["950", "#3c1714"],
+          ],
+          darkValues: [
+            ["50", "#fff5f4"],
+            ["100", "#fee8e6"],
+            ["200", "#fbcfcb"],
+            ["300", "#f5aaa3"],
+            ["400", "#ea7d73"],
+            ["500", "#d85d52"],
+            ["600", "#b9443a"],
+            ["700", "#96372f"],
+            ["800", "#7c322c"],
+            ["900", "#682f2b"],
+            ["950", "#391512"],
+          ],
+        },
+        {
+          name: "Amber",
+          note: "浅色 B / 深色 A · 警告、等待、注意",
+          lightValues: [
+            ["50", "#fffaed"],
+            ["100", "#fff4d3"],
+            ["200", "#ffe397"],
+            ["300", "#ffcd5c"],
+            ["400", "#f6b435"],
+            ["500", "#d69629"],
+            ["600", "#b37622"],
+            ["700", "#905a1d"],
+            ["800", "#75471b"],
+            ["900", "#623a1a"],
+            ["950", "#381d09"],
+          ],
+          darkValues: [
+            ["50", "#fff9eb"],
+            ["100", "#fff0c6"],
+            ["200", "#fcdd88"],
+            ["300", "#f7c44d"],
+            ["400", "#eaa923"],
+            ["500", "#c98a12"],
+            ["600", "#a66a0d"],
+            ["700", "#85500f"],
+            ["800", "#6e4013"],
+            ["900", "#5d3615"],
+            ["950", "#351b07"],
+          ],
+        },
+        {
+          name: "Green",
+          note: "浅色 B / 深色 A · 成功、完成、正常",
+          lightValues: [
+            ["50", "#f3faf6"],
+            ["100", "#e0f2e7"],
+            ["200", "#c1e6cf"],
+            ["300", "#98d2ae"],
+            ["400", "#6fb98d"],
+            ["500", "#509b71"],
+            ["600", "#40805c"],
+            ["700", "#37674c"],
+            ["800", "#2f523e"],
+            ["900", "#274234"],
+            ["950", "#12241b"],
+          ],
+          darkValues: [
+            ["50", "#f1f8f4"],
+            ["100", "#ddefe4"],
+            ["200", "#bce0ca"],
+            ["300", "#8fc9a5"],
+            ["400", "#64ae82"],
+            ["500", "#438f65"],
+            ["600", "#347451"],
+            ["700", "#2d5d43"],
+            ["800", "#284b38"],
+            ["900", "#233e30"],
+            ["950", "#102219"],
+          ],
+        },
+        {
+          name: "Violet",
+          note: "浅色 B / 深色 A · 主题强调色、选区、当前工具",
+          lightValues: [
+            ["50", "#f8f7fe"],
+            ["100", "#edecfe"],
+            ["200", "#d9d5fe"],
+            ["300", "#beb5fe"],
+            ["400", "#a28ffe"],
+            ["500", "#8568ee"],
+            ["600", "#6a4fc4"],
+            ["700", "#5842a2"],
+            ["800", "#493986"],
+            ["900", "#3c316c"],
+            ["950", "#281f4b"],
+          ],
+          darkValues: [
+            ["50", "#f6f5fe"],
+            ["100", "#e8e4fe"],
+            ["200", "#cdc2fd"],
+            ["300", "#aa96f0"],
+            ["400", "#9475eb"],
+            ["500", "#7c57d5"],
+            ["600", "#6644b4"],
+            ["700", "#543895"],
+            ["800", "#47327b"],
+            ["900", "#3b2d64"],
+            ["950", "#281d45"],
+          ],
+        },
+        {
+          name: "Orange",
+          note: "浅色 B / 深色 A · 橙 · 亮感在 300–400 档",
+          lightValues: [
+            ["50", "#fef6f2"],
+            ["100", "#ffece1"],
+            ["200", "#ffd6be"],
+            ["300", "#ffb68a"],
+            ["400", "#f49354"],
+            ["500", "#dc711c"],
+            ["600", "#bb5b02"],
+            ["700", "#9b4a03"],
+            ["800", "#7e3b01"],
+            ["900", "#652e00"],
+            ["950", "#431d01"],
+          ],
+          darkValues: [
+            ["50", "#fef5ef"],
+            ["100", "#ffe6d8"],
+            ["200", "#fdcdb1"],
+            ["300", "#f4af85"],
+            ["400", "#e08850"],
+            ["500", "#c96617"],
+            ["600", "#a75000"],
+            ["700", "#884102"],
+            ["800", "#733603"],
+            ["900", "#5c3010"],
+            ["950", "#3c1e09"],
+          ],
+        },
+        {
+          name: "Yellow",
+          note: "浅色 B / 深色 A · 黄 · 亮感在 300–400 档",
+          lightValues: [
+            ["50", "#faf8ee"],
+            ["100", "#f4f0d9"],
+            ["200", "#e8dfb1"],
+            ["300", "#d6c781"],
+            ["400", "#bfab4b"],
+            ["500", "#a48d02"],
+            ["600", "#887505"],
+            ["700", "#706000"],
+            ["800", "#5a4d00"],
+            ["900", "#483d01"],
+            ["950", "#2f2800"],
+          ],
+          darkValues: [
+            ["50", "#f8f7ed"],
+            ["100", "#f0ebd6"],
+            ["200", "#e0d8ad"],
+            ["300", "#ccbf7e"],
+            ["400", "#b09e44"],
+            ["500", "#958102"],
+            ["600", "#786804"],
+            ["700", "#625400"],
+            ["800", "#534600"],
+            ["900", "#453b08"],
+            ["950", "#2c2605"],
+          ],
+        },
+        {
+          name: "Lime",
+          note: "浅色 B / 深色 A · 青柠 · 亮感在 300–400 档",
+          lightValues: [
+            ["50", "#f4faef"],
+            ["100", "#e8f3dc"],
+            ["200", "#d0e6b6"],
+            ["300", "#b1d189"],
+            ["400", "#90b858"],
+            ["500", "#709b25"],
+            ["600", "#5a8103"],
+            ["700", "#496b02"],
+            ["800", "#3a5600"],
+            ["900", "#2d4400"],
+            ["950", "#1d2c03"],
+          ],
+          darkValues: [
+            ["50", "#f3f8ee"],
+            ["100", "#e4efd8"],
+            ["200", "#c9deb1"],
+            ["300", "#aac885"],
+            ["400", "#84a950"],
+            ["500", "#658d1a"],
+            ["600", "#4f7302"],
+            ["700", "#405e00"],
+            ["800", "#354e05"],
+            ["900", "#2e4111"],
+            ["950", "#1d2a09"],
+          ],
+        },
+        {
+          name: "Teal",
+          note: "浅色 B / 深色 A · 青绿",
+          lightValues: [
+            ["50", "#eefaf8"],
+            ["100", "#daf5ef"],
+            ["200", "#b2e9df"],
+            ["300", "#7ed6c7"],
+            ["400", "#3bbeac"],
+            ["500", "#09a08f"],
+            ["600", "#058577"],
+            ["700", "#056d61"],
+            ["800", "#02584e"],
+            ["900", "#02463e"],
+            ["950", "#002e28"],
+          ],
+          darkValues: [
+            ["50", "#edf9f6"],
+            ["100", "#d7f0eb"],
+            ["200", "#aee1d8"],
+            ["300", "#7ccdbf"],
+            ["400", "#38af9f"],
+            ["500", "#0b9182"],
+            ["600", "#047569"],
+            ["700", "#036055"],
+            ["800", "#035047"],
+            ["900", "#00443c"],
+            ["950", "#002c26"],
+          ],
+        },
+        {
+          name: "Cyan",
+          note: "浅色 B / 深色 A · 青",
+          lightValues: [
+            ["50", "#edfafc"],
+            ["100", "#d8f5f9"],
+            ["200", "#abe8f3"],
+            ["300", "#72d5e5"],
+            ["400", "#14bcd1"],
+            ["500", "#0c9cae"],
+            ["600", "#0a8291"],
+            ["700", "#056b77"],
+            ["800", "#015661"],
+            ["900", "#01454d"],
+            ["950", "#002d33"],
+          ],
+          darkValues: [
+            ["50", "#ecf9fb"],
+            ["100", "#d5f0f5"],
+            ["200", "#a9e1ea"],
+            ["300", "#73cbda"],
+            ["400", "#1dadc0"],
+            ["500", "#028e9f"],
+            ["600", "#017380"],
+            ["700", "#005e69"],
+            ["800", "#044e58"],
+            ["900", "#03424a"],
+            ["950", "#002b31"],
+          ],
+        },
+        {
+          name: "Azure",
+          note: "浅色 B / 深色 A · 湛蓝",
+          lightValues: [
+            ["50", "#f4f8fe"],
+            ["100", "#e6f0ff"],
+            ["200", "#cae0ff"],
+            ["300", "#a1c9ff"],
+            ["400", "#71adff"],
+            ["500", "#3c8ef7"],
+            ["600", "#1f75db"],
+            ["700", "#125fb8"],
+            ["800", "#0b4c97"],
+            ["900", "#0f3d76"],
+            ["950", "#0a284d"],
+          ],
+          darkValues: [
+            ["50", "#f1f7ff"],
+            ["100", "#dfecfe"],
+            ["200", "#bed9fe"],
+            ["300", "#93c1ff"],
+            ["400", "#60a0f5"],
+            ["500", "#3581e2"],
+            ["600", "#1d67c1"],
+            ["700", "#17549e"],
+            ["800", "#174782"],
+            ["900", "#1a3c67"],
+            ["950", "#0f2644"],
+          ],
+        },
+        {
+          name: "Purple",
+          note: "浅色 B / 深色 A · 紫",
+          lightValues: [
+            ["50", "#fcf6fe"],
+            ["100", "#f9ebff"],
+            ["200", "#f2d4fe"],
+            ["300", "#e9b3ff"],
+            ["400", "#d98ef6"],
+            ["500", "#c06be0"],
+            ["600", "#a651c5"],
+            ["700", "#8a40a5"],
+            ["800", "#703287"],
+            ["900", "#582a69"],
+            ["950", "#391b45"],
+          ],
+          darkValues: [
+            ["50", "#fbf4fe"],
+            ["100", "#f7e5fe"],
+            ["200", "#eecbfd"],
+            ["300", "#e0abf5"],
+            ["400", "#c783e2"],
+            ["500", "#af60cd"],
+            ["600", "#9248ad"],
+            ["700", "#783a8f"],
+            ["800", "#633275"],
+            ["900", "#502d5e"],
+            ["950", "#341c3d"],
+          ],
+        },
+        {
+          name: "Magenta",
+          note: "浅色 B / 深色 A · 洋红",
+          lightValues: [
+            ["50", "#fff5fb"],
+            ["100", "#ffe9f6"],
+            ["200", "#fed2ed"],
+            ["300", "#ffade2"],
+            ["400", "#f585d0"],
+            ["500", "#dd5fb7"],
+            ["600", "#c1459d"],
+            ["700", "#a23583"],
+            ["800", "#84296a"],
+            ["900", "#672353"],
+            ["950", "#441736"],
+          ],
+          darkValues: [
+            ["50", "#fff3fa"],
+            ["100", "#ffe4f4"],
+            ["200", "#ffc7ea"],
+            ["300", "#f6a5d9"],
+            ["400", "#e17bc0"],
+            ["500", "#ca55a7"],
+            ["600", "#aa3e8b"],
+            ["700", "#8c3271"],
+            ["800", "#732b5e"],
+            ["900", "#5d284d"],
+            ["950", "#3d1931"],
+          ],
+        },
+        {
+          name: "Rose",
+          note: "浅色 B / 深色 A · 玫瑰",
+          lightValues: [
+            ["50", "#fef6f7"],
+            ["100", "#ffeaee"],
+            ["200", "#fed4dc"],
+            ["300", "#ffb1c3"],
+            ["400", "#fe85a6"],
+            ["500", "#e85e88"],
+            ["600", "#cc4370"],
+            ["700", "#ab345c"],
+            ["800", "#8c284a"],
+            ["900", "#6d223b"],
+            ["950", "#481626"],
+          ],
+          darkValues: [
+            ["50", "#fef4f6"],
+            ["100", "#fee5ea"],
+            ["200", "#ffc9d5"],
+            ["300", "#fea5ba"],
+            ["400", "#eb7a99"],
+            ["500", "#d5547c"],
+            ["600", "#b33d63"],
+            ["700", "#943151"],
+            ["800", "#7a2b44"],
+            ["900", "#622839"],
+            ["950", "#401924"],
+          ],
+        },
+        {
+          name: "Slate",
+          note: "偏冷蓝灰 · 13 级",
+          className: "neutral",
+          values: [
+            ["0", "#ffffff"],
+            ["50", "#f7faff"],
+            ["100", "#f0f6fd"],
+            ["200", "#e7effa"],
+            ["300", "#d7e1ef"],
+            ["400", "#bdc8d7"],
+            ["500", "#99a4b2"],
+            ["600", "#6a7481"],
+            ["700", "#49535f"],
+            ["800", "#2b343f"],
+            ["900", "#192029"],
+            ["950", "#0d1219"],
+            ["1000", "#000000"],
+          ],
+        },
+        {
+          name: "Stone",
+          note: "偏暖灰 · 13 级",
+          className: "neutral",
+          values: [
+            ["0", "#ffffff"],
+            ["50", "#fcfaf7"],
+            ["100", "#f9f4ef"],
+            ["200", "#f3ede6"],
+            ["300", "#e6dfd6"],
+            ["400", "#cec6bc"],
+            ["500", "#aaa299"],
+            ["600", "#797269"],
+            ["700", "#585149"],
+            ["800", "#38322b"],
+            ["900", "#231e18"],
+            ["950", "#15110d"],
+            ["1000", "#000000"],
+          ],
+        },
+        {
+          name: "Haze",
+          note: "偏主题紫，与 Violet 同源 · 13 级",
+          className: "neutral",
+          values: [
+            ["0", "#ffffff"],
+            ["50", "#faf9ff"],
+            ["100", "#f5f4fd"],
+            ["200", "#eeedf9"],
+            ["300", "#e0deee"],
+            ["400", "#c8c5d6"],
+            ["500", "#a3a1b2"],
+            ["600", "#737181"],
+            ["700", "#53505f"],
+            ["800", "#33323e"],
+            ["900", "#1f1e28"],
+            ["950", "#121119"],
+            ["1000", "#000000"],
+          ],
+        },
+        {
+          name: "Mark 标注色",
+          note: "内容层 · 不随主题切换 · 荧光笔取 40% 不透明度",
+          className: "mark",
+          values: [
+            ["红", "#f03e3e"],
+            ["橙", "#ff922b"],
+            ["黄", "#fcc419"],
+            ["绿", "#40c057"],
+            ["蓝", "#339af0"],
+            ["紫", "#9775fa"],
+            ["黑", "#212529"],
+            ["白", "#ffffff"],
+          ],
+        },
+      ];
+
+      const paletteGroups = [
+        {
+          title: "基础 · 中性色与功能色",
+          desc: "界面骨架与状态语义。这一组保持不变。",
+          names: ["Neutral", "Steel Blue", "Red", "Amber", "Green"],
+        },
+        {
+          title: "主题强调色",
+          desc: "只用于“当前所在”：选区、当前工具、锁定标记。对应语义层的 --accent。",
+          names: ["Violet"],
+        },
+        {
+          title: "扩展色 · 统一明度阶梯",
+          desc: "9 组色相共用同一条明度阶梯：同一档位在所有色相上明度一致，所以对比度与色相无关。浅色主题 600 档配白字 ≥ 4.5:1，700 档 ≥ 6.2:1，800 档 ≥ 8.3:1；深色主题 A300 压在 #171717 表面上 ≥ 9.6:1，A500 ≥ 4.5:1。带 ● 的 600 档是实底填充档。只用于分类、标签与图表，不承担状态语义。",
+          names: [
+            "Orange",
+            "Yellow",
+            "Lime",
+            "Teal",
+            "Cyan",
+            "Azure",
+            "Purple",
+            "Magenta",
+            "Rose",
+          ],
+        },
+        {
+          title: "带色彩倾向的中性色",
+          desc: "与 Neutral 逐档同明度，对比度与 Neutral 相差不超过 0.08。需要一点色彩倾向的表面时可整组替换；界面默认仍使用无彩的 Neutral。",
+          names: ["Slate", "Stone", "Haze"],
+        },
+        {
+          title: "内容层",
+          desc: "叠加在屏幕内容上，不随主题切换，可由标注工具直接引用。荧光笔取 40% 不透明度。",
+          names: ["Mark 标注色"],
+        },
+      ];
+
+      const semantic = [
+        ["页面背景", "--page"],
+        ["基础表面", "--surface"],
+        ["组件表面", "--surface-component"],
+        ["反色表面", "--surface-inverse"],
+        ["主要文字", "--text-primary"],
+        ["次要文字", "--text-secondary"],
+        ["禁用文字", "--disabled-content"],
+        ["焦点环", "--focus-ring"],
+        ["默认边界", "--border-default"],
+        ["交互边界", "--border-control"],
+        ["主要操作", "--action-primary"],
+        ["结构性选中", "--selection-bg"],
+        ["信息", "--info"],
+        ["信息容器", "--info-bg"],
+        ["警告", "--warning"],
+        ["警告容器", "--warning-bg"],
+        ["错误", "--error"],
+        ["错误容器", "--error-bg"],
+        ["成功", "--success"],
+        ["成功容器", "--success-bg"],
+      ];
+      const pairs = [
+        ["正文 / 基础表面", "--text-primary", "--surface", 4.5],
+        ["次要文字 / 基础表面", "--text-secondary", "--surface", 4.5],
+        [
+          "主要操作文字 / 主要操作",
+          "--action-on-primary",
+          "--action-primary",
+          4.5,
+        ],
+        ["交互边界 / 基础表面", "--border-control", "--surface", 3],
+        ["焦点环 / 页面背景", "--focus-ring", "--page", 3],
+        ["信息文字 / 信息容器", "--info-fg", "--info-bg", 4.5],
+        ["错误文字 / 错误容器", "--error-fg", "--error-bg", 4.5],
+        ["成功文字 / 成功容器", "--success-fg", "--success-bg", 4.5],
+        [
+          "主按钮 悬停",
+          "--button-primary-color",
+          "--button-primary-background-hover",
+          4.5,
+        ],
+        [
+          "主按钮 按下",
+          "--button-primary-color",
+          "--button-primary-background-pressed",
+          4.5,
+        ],
+        [
+          "危险按钮",
+          "--button-danger-color",
+          "--button-danger-background",
+          4.5,
+        ],
+        [
+          "危险按钮 悬停",
+          "--button-danger-color",
+          "--button-danger-background-hover",
+          4.5,
+        ],
+        [
+          "危险按钮 按下",
+          "--button-danger-color",
+          "--button-danger-background-pressed",
+          4.5,
+        ],
+        [
+          "次按钮 悬停",
+          "--button-secondary-color",
+          "--button-secondary-background-hover",
+          4.5,
+        ],
+        [
+          "次按钮 按下",
+          "--button-secondary-color",
+          "--button-secondary-background-pressed",
+          4.5,
+        ],
+        [
+          "幽灵按钮 悬停",
+          "--button-ghost-color",
+          ["--surface", "--button-ghost-background-hover"],
+          4.5,
+        ],
+        ["选中项", "--selection-fg", "--selection-bg", 4.5],
+        ["输入文字 / 输入背景", "--input-color", "--input-background", 4.5],
+        [
+          "占位符 / 输入背景",
+          "--input-placeholder-color",
+          "--input-background",
+          4.5,
+        ],
+        [
+          "输入框边界 / 输入背景",
+          "--input-border-color",
+          "--input-background",
+          3,
+        ],
+        [
+          "菜单项 悬停",
+          "--menu-item-color",
+          ["--box-background-popover", "--menu-item-background-hover"],
+          4.5,
+        ],
+        [
+          "列表行 悬停",
+          "--list-row-color",
+          ["--surface", "--list-row-background-hover"],
+          4.5,
+        ],
+        ["主题色文字 / 基础表面", "--accent-text", "--surface", 4.5],
+        ["主题色文字 / 页面背景", "--accent-text", "--page", 4.5],
+        [
+          "主题色淡底文字 / 淡底",
+          "--accent-subtle-text",
+          "--accent-subtle",
+          4.5,
+        ],
+        ["选中文字 / 主题色", "--on-accent", "--accent-solid", 4.5],
+        ["主题色边界 / 基础表面", "--accent-border", "--surface", 3],
+        [
+          "Box subtle 文字",
+          "--box-color-subtle",
+          "--box-background-subtle",
+          4.5,
+        ],
+        [
+          "Box raised 文字（层级 3）",
+          "--box-color-raised",
+          "--box-background-raised-3",
+          4.5,
+        ],
+        [
+          "Box inverse 文字",
+          "--box-color-inverse",
+          "--box-background-inverse",
+          4.5,
+        ],
+        [
+          "输入框悬停边界 / 输入背景",
+          "--input-border-color-hover",
+          "--input-background",
+          3,
+        ],
+        ["强调边界 / 基础表面", "--border-strong", "--surface", 3],
+      ];
+      const root = document.documentElement,
+        value = (token, theme = root.dataset.theme) => {
+          const current = root.dataset.theme;
+          root.dataset.theme = theme;
+          const result = getComputedStyle(root).getPropertyValue(token).trim();
+          root.dataset.theme = current;
+          return result;
+        };
+      const color = (v) => {
+        const e = document.createElement("span");
+        e.style.color = v;
+        document.body.append(e);
+        const m = getComputedStyle(e)
+          .color.match(/[\d.]+/g)
+          ?.map(Number) || [0, 0, 0];
+        e.remove();
+        return m;
+      };
+      const lum = (v) =>
+        color(v)
+          .map((x) => x / 255)
+          .map((x) => (x <= 0.03928 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4))
+          .reduce((s, x, i) => s + x * [0.2126, 0.7152, 0.0722][i], 0);
+      const ratio = (a, b) => {
+        const foreground = lum(a),
+          background = lum(b);
+        return (
+          (Math.max(foreground, background) + 0.05) /
+          (Math.min(foreground, background) + 0.05)
+        );
+      };
+      const rgba = (v) => {
+        const e = document.createElement("span");
+        e.style.color = v;
+        document.body.append(e);
+        const c = getComputedStyle(e).color;
+        e.remove();
+        const n = (c.match(/-?\d*\.?\d+/g) || []).map(Number);
+        const k = c.startsWith("color(") ? 255 : 1;
+        return [n[0] * k, n[1] * k, n[2] * k, n.length > 3 ? n[3] : 1];
+      };
+      const flat = (layers) => {
+        const out = [0, 0, 0];
+        let first = true;
+        [].concat(layers).forEach((v) => {
+          const c = rgba(v);
+          for (let i = 0; i < 3; i++)
+            out[i] = first ? c[i] : c[i] * c[3] + out[i] * (1 - c[3]);
+          first = false;
+        });
+        return "rgb(" + out.map((x) => Math.round(x)).join(" ") + ")";
+      };
+      const copy = async (v) => {
+        try {
+          await navigator.clipboard.writeText(v);
+        } catch (_) {
+          const e = document.createElement("textarea");
+          e.value = v;
+          document.body.append(e);
+          e.select();
+          document.execCommand("copy");
+          e.remove();
+        }
+        show("已复制 " + v);
+      };
+      const show = (v) => {
+        const t = document.getElementById("toast");
+        t.textContent = v;
+        t.classList.add("show");
+        clearTimeout(show.timer);
+        show.timer = setTimeout(() => t.classList.remove("show"), 1600);
+      };
+      function renderSpacing() {
+        const scales = {
+          space: [0, 2, 4, 8, 12, 16, 24, 32, 48, 64],
+          size: [12, 16, 20, 24, 28, 32, 40, 48, 56],
+        };
+        const sizeTiers = [
+          ["XS", [12, 16]],
+          ["S", [20, 24]],
+          ["M", [28, 32]],
+          ["L", [40]],
+          ["XL", [48]],
+          ["2XL", [56]],
+          ["3XL", []],
+        ];
+        document
+          .querySelectorAll("#foundations [data-scale]")
+          .forEach((target) => {
+            const key = target.dataset.scale;
+            if (key === "size") {
+              target.innerHTML = sizeTiers
+                .map(
+                  ([tier, values]) =>
+                    `<div class="scale-tier${values.length ? "" : " is-reserved"}"><div class="scale-tier-title"><span>${tier}</span><small>${values.length ? values.map((px) => `--size-${px}`).join(" · ") : "预留扩展档"}</small></div>${values.map((px) => `<div class="scale-row"><div><strong>--size-${px}</strong><small>${px}px</small></div><div class="spacing-visual"><div class="spacing-track" aria-hidden="true"><span class="spacing-bar" style="--spacing-width:${px * 4}px"></span></div><span class="spacing-note">${px}px · 示意 ${px * 4}px</span></div></div>`).join("")}</div>`,
+                )
+                .join("");
+              return;
+            }
+            target.innerHTML = scales[key]
+              .map(
+                (px) =>
+                  `<div class="scale-row"><div><strong>--${key}-${px}</strong><small>${px}px</small></div><div class="spacing-visual"><div class="spacing-track" aria-hidden="true"><span class="spacing-bar" data-zero="${px === 0}" style="--spacing-width:${px * 4}px"></span></div><span class="spacing-note">${px === 0 ? "无间距" : `${px}px · 示意 ${px * 4}px`}</span></div></div>`,
+              )
+              .join("");
+          });
+      }
+      function render() {
+        renderSpacing();
+        const themeValues =
+          root.dataset.theme === "dark" ? "darkValues" : "lightValues";
+        const target = document.getElementById("palettes");
+        const rowHtml = (palette) =>
+          '<div class="palette-row"><div class="palette-title"><strong>' +
+          palette.name +
+          "</strong><span>" +
+          palette.note +
+          '</span></div><div class="swatch-strip ' +
+          (palette.className || "") +
+          '">' +
+          (palette[themeValues] || palette.values)
+            .map(([step, hex]) => {
+              const whiteRatio = ratio("#fff", hex);
+              const blackRatio = ratio("#111", hex);
+              const recommended =
+                whiteRatio >= blackRatio ? "白色文字" : "黑色文字";
+              const isMain = !palette.className && step === "600";
+              return (
+                '<button class="swatch' +
+                (isMain ? " is-main" : "") +
+                '" type="button" style="--swatch:' +
+                hex +
+                ";--swatch-text:" +
+                (lum(hex) < 0.34 ? "#fff" : "#111") +
+                '" data-copy="' +
+                hex +
+                '" title="' +
+                hex +
+                " · 白字 " +
+                whiteRatio.toFixed(2) +
+                ":1 · 黑字 " +
+                blackRatio.toFixed(2) +
+                ":1 · 推荐 " +
+                recommended +
+                '"><strong>' +
+                step +
+                "</strong><small>" +
+                hex +
+                "</small></button>"
+              );
+            })
+            .join("") +
+          "</div></div>";
+        target.innerHTML = paletteGroups
+          .map(
+            (group) =>
+              '<div class="scale-group"><h3>' +
+              group.title +
+              "</h3><p>" +
+              group.desc +
+              "</p></div>" +
+              group.names
+                .map((name) =>
+                  rowHtml(palettes.find((palette) => palette.name === name)),
+                )
+                .join(""),
+          )
+          .join("");
+        target
+          .querySelectorAll("[data-copy]")
+          .forEach((element) =>
+            element.addEventListener("click", () => copy(element.dataset.copy)),
+          );
+        document.getElementById("semantics").innerHTML = semantic
+          .map(
+            ([label, token]) =>
+              '<button class="semantic" data-copy="' +
+              token +
+              '"><span class="semantic-color" style="--semantic-color:var(' +
+              token +
+              ')"></span><span><strong>' +
+              label +
+              "</strong><code>" +
+              token +
+              "</code><code>" +
+              value(token) +
+              "</code></span></button>",
+          )
+          .join("");
+        document
+          .querySelectorAll(".semantic[data-copy]")
+          .forEach((element) =>
+            element.addEventListener("click", () => copy(element.dataset.copy)),
+          );
+        let passed = 0;
+        document.getElementById("contrast").innerHTML = pairs
+          .map(([label, foreground, background, minimum]) => {
+            const light = ratio(
+              flat(value(foreground, "light")),
+              flat([].concat(background).map((t) => value(t, "light"))),
+            );
+            const dark = ratio(
+              flat(value(foreground, "dark")),
+              flat([].concat(background).map((t) => value(t, "dark"))),
+            );
+            const ok = light >= minimum && dark >= minimum;
+            if (light >= minimum) passed += 1;
+            if (dark >= minimum) passed += 1;
+            return (
+              "<tr><td>" +
+              label +
+              "</td><td><code>" +
+              foreground +
+              "</code></td><td><code>" +
+              [].concat(background).join(" + ") +
+              "</code></td><td>≥ " +
+              minimum +
+              ":1</td><td>" +
+              light.toFixed(2) +
+              ":1</td><td>" +
+              dark.toFixed(2) +
+              ':1</td><td><span class="' +
+              (ok ? "pass" : "fail") +
+              '">' +
+              (ok ? "通过" : "需调整") +
+              "</span></td></tr>"
+            );
+          })
+          .join("");
+        document.getElementById("audit-value").textContent =
+          passed + "/" + pairs.length * 2 + " PASS";
+        document
+          .getElementById("audit")
+          .classList.toggle("fail", passed !== pairs.length * 2);
+        document.getElementById("export-code").textContent = exportCss();
+      }
+      function exportCss() {
+        const T = [
+          ["Font", (n) => /^font-/.test(n)],
+          [
+            "Typography",
+            (n) =>
+              /^(weight|leading|tracking)-|^(font-size|line-height)-(sm|md|lg|xl|2xl|3xl|display)$/.test(
+                n,
+              ),
+          ],
+          ["Space", (n) => /^space-/.test(n)],
+          ["Size", (n) => /^size-/.test(n)],
+          ["Width", (n) => /^(width|container)-/.test(n)],
+          ["Radius", (n) => /^radius-/.test(n)],
+          [
+            "Border / Focus",
+            (n) => /^(border-\d|focus-(width|offset))/.test(n),
+          ],
+          ["Motion", (n) => /^(duration|ease)-/.test(n)],
+          ["Opacity", (n) => /^opacity-/.test(n)],
+          ["Layer", (n) => /^layer-/.test(n)],
+          [
+            "Color primitives",
+            (n) => /^(neutral|blue|red|amber|green|azure)-\d/.test(n),
+          ],
+          [
+            "Component",
+            (n) =>
+              /^(control|button|input|textarea|tag|checkbox|radio|switch|link|divider|progress|spinner|avatar|icon|box|menu|status|badge)-/.test(
+                n,
+              ),
+          ],
+          ["Accent", (n) => /^(accent-|on-accent|text-link|link-)/.test(n)],
+          ["Semantic", () => true],
+        ];
+        const maps = { light: new Map(), dark: new Map() };
+        /* Flatten the stylesheet tree: token rules live inside cascade layer
+         * blocks (including the layers created by `@import ... layer(...)`),
+         * so the walker must descend through both layer and import rules. */
+        const collect = (list, out) => {
+          for (const r of list) {
+            if (r.styleSheet) {
+              try {
+                collect(r.styleSheet.cssRules, out);
+              } catch (_) {}
+              continue;
+            }
+            if (r.selectorText) out.push(r);
+            let nested = null;
+            try {
+              nested = r.cssRules;
+            } catch (_) {
+              nested = null;
+            }
+            if (nested && nested.length) collect(nested, out);
+          }
+        };
+        const flatRules = [];
+        for (const sheet of document.styleSheets) {
+          try {
+            collect(sheet.cssRules, flatRules);
+          } catch (_) {}
+        }
+        for (const r of flatRules) {
+          const q = r.selectorText.replace(/"/g, "").trim();
+          const k =
+            q === ":root"
+              ? "light"
+              : q === "[data-theme=dark]"
+                ? "dark"
+                : q.startsWith("[data-accent")
+                  ? "scope:" + r.selectorText
+                  : null;
+          if (!k) continue;
+          if (!maps[k]) maps[k] = new Map();
+          for (const n of r.style)
+            if (n.startsWith("--"))
+              maps[k].set(n, r.style.getPropertyValue(n).trim());
+        }
+        const block = (sel, map) => {
+          const used = new Set();
+          let o = sel + " {\n";
+          T.forEach(([title, test]) => {
+            const items = [...map].filter(
+              ([n]) => !used.has(n) && test(n.slice(2)),
+            );
+            if (!items.length) return;
+            items.forEach(([n]) => used.add(n));
+            o +=
+              "  /* " +
+              title +
+              " */\n" +
+              items.map(([n, v]) => "  " + n + ": " + v + ";").join("\n") +
+              "\n";
+          });
+          return o + "}";
+        };
+        return (
+          "/* Design Tokens · generated from live CSS variables */\n/* Layout constants (not CSS variables; @media cannot read them): sm 600 · md 840 · lg 1200 */\n\n" +
+          block(":root", maps.light) +
+          "\n\n" +
+          block('[data-theme="dark"]', maps.dark) +
+          Object.keys(maps)
+            .filter((k) => k.startsWith("scope:") && maps[k].size)
+            .map((k) => "\n\n" + block(k.slice(6), maps[k]))
+            .join("") +
+          "\n"
+        );
+      }
+      document.getElementById("copy").onclick = async () => {
+        const v = exportCss();
+        try {
+          await navigator.clipboard.writeText(v);
+        } catch (_) {
+          const e = document.createElement("textarea");
+          e.value = v;
+          document.body.append(e);
+          e.select();
+          document.execCommand("copy");
+          e.remove();
+        }
+        show("已复制 CSS");
+      };
+      document.getElementById("download").onclick = () => {
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(
+          new Blob([exportCss()], { type: "text/css" }),
+        );
+        a.download = "design-tokens.css";
+        a.click();
+        URL.revokeObjectURL(a.href);
+        show("已下载 design-tokens.css");
+      };
+      function accent(c) {
+        root.dataset.accent = c;
+        document
+          .querySelectorAll("[data-accent-mode]")
+          .forEach((e) =>
+            e.setAttribute("aria-pressed", String(e.dataset.accentMode === c)),
+          );
+        const n = document.getElementById("accent-name");
+        if (n) n.textContent = c;
+        render();
+      }
+      function theme(choice) {
+        root.dataset.theme =
+          choice === "dark" ||
+          (choice === "system" &&
+            matchMedia("(prefers-color-scheme:dark)").matches)
+            ? "dark"
+            : "light";
+        root.dataset.themeChoice = choice;
+        document
+          .querySelectorAll("[data-theme-mode]")
+          .forEach((e) =>
+            e.setAttribute(
+              "aria-pressed",
+              String(e.dataset.themeMode === choice),
+            ),
+          );
+        render();
+      }
+      document
+        .querySelectorAll("[data-theme-mode]")
+        .forEach((e) => (e.onclick = () => theme(e.dataset.themeMode)));
+      matchMedia("(prefers-color-scheme:dark)").addEventListener(
+        "change",
+        () => root.dataset.themeChoice === "system" && theme("system"),
+      );
+      document.querySelectorAll(".tag,.segmented button").forEach(
+        (e) =>
+          (e.onclick = () => {
+            const g = e.closest(".segmented");
+            if (g)
+              g.querySelectorAll("button").forEach((x) =>
+                x.setAttribute("aria-pressed", String(x === e)),
+              );
+            else
+              e.setAttribute(
+                "aria-pressed",
+                String(e.getAttribute("aria-pressed") !== "true"),
+              );
+          }),
+      );
+      document
+        .querySelectorAll("[data-accent-mode]")
+        .forEach((e) => (e.onclick = () => accent(e.dataset.accentMode)));
+      root.dataset.accent = "azure";
+      theme("system");
+    </script>
+  </body>
+</html>

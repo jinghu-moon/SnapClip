@@ -88,7 +88,7 @@ const ocrErrorLabels: Record<string, string> = {
   decode_failed: "图片解码失败",
   timeout: "OCR 超时",
   cancelled: "OCR 已取消",
-  engine_failed: "Windows OCR 引擎失败",
+  engine_failed: "OCR 引擎失败",
 };
 
 async function loadIcon() {

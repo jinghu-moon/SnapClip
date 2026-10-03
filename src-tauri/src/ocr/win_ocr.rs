@@ -143,6 +143,7 @@ fn recognize_png(png: &[u8], cancel: &OcrCancel) -> Result<OcrText, OcrError> {
         .to_string();
     Ok(OcrText {
         text,
+        layout: None,
         engine: "windows",
     })
 }
