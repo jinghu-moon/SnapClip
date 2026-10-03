@@ -242,3 +242,49 @@ P1.5 的挂起导致测试进程被强杀、跳过 `TestDir::drop` 清理；Wind
 | 多显示器 / 混合 DPI 捕获 | 未执行 | 本机单屏；Phase 7 人工清单 |
 
 ---
+
+## Phase 2：渲染节奏和分层
+
+### P2.1 设计决策
+
+保持单 target 单 swap chain，不引入 DirectComposition 多 visual 分层。
+根据：docs/11 §5.1 line 343 明确允许"暂时保持单 target，必须实现多个独立 damage clip、
+不得合并成全屏包围盒"；多 visual 会在 60Hz 下为省一次 DWM flip 增加 2-3× VRAM 与
+合成复杂度，而 Phase 0 实测瓶颈是 D2D 全帧重绘（而非 Present 拷贝），局部准星 + tick
+合并即可彻底消除。
+
+### P2.2 渲染节奏（tick 合并）
+
+- 新增 `WM_TIMER` 合并 tick（`RENDER_TICK_MS = 15ms`，≈ 60Hz）。
+- `invalidate()` 只更新 latest state、标脏 `self.dirty` + 首次挂 timer；
+  一个 tick 最多调用一次 `render → Present(1) → Commit`。
+- 输入路径（`WM_MOUSEMOVE`、`WM_LBUTTONDOWN/UP`、`WM_MOUSELEAVE`）均改为 `invalidate(None)`。
+- 首次 `paint_now(None)` 保留同步渲染，满足"确认 compositor 已提交后再显示 overlay"。
+- `release_session` 调 `disarm_render_tick()`，避免悬挂 timer 向已释放的 renderer 投递 WM_TIMER。
+
+### P2.3 局部准星（消除全屏单包围盒退化）
+
+- 新增纯函数 `geometry::crosshair_geometry(cursor, radius, frame)` + `crosshair_radius(dpi)`，
+  绘制和 damage 共用同一实现。
+- `draw_magnifier`：将全屏贯穿横竖线改为以光标为中心的短段（半径 = 28 DIP × scale）。
+- `cursor_damage`：返回 [放大镜 bounds, 准星 bounds]，均为局部矩形。
+- Hover（无拖拽）时 bbox 不再覆盖整帧；真机日志应显示 `bbox=(cx,cy,...)`
+  尺寸远小于 frame_px。
+
+### P2.4 验证
+
+| 项目 | 命令 | 结果 |
+| --- | --- | --- |
+| 单元测试（含 3 crosshair geometry + 1 GPU pointer-move） | `cargo test --lib` | 149 passed, 0 failed |
+| 编译零警告 | `cargo check --all-targets` | 0 warnings, 0 errors |
+| 链接 | `cargo build` | Finished (dev) |
+| GPU 回归测试 `pointer_move_updates_only_the_pointer_region` | 随机运行 | PASS（静态角像素 byte-equal，准星像素变化） |
+
+### P2.5 未执行项与原因
+
+| 项目 | 状态 | 原因 / 替代 |
+| --- | --- | --- |
+| 真机渲染日志确认局部 bbox | 未执行 | 沙箱 `GetCursorPos` error=5 (Access Denied)，无法启动 overlay；tick 合并与准星逻辑由单元 + GPU 测试覆盖 |
+| 真机 10 次鼠标移动只产生 1–2 次 render | 未执行 | 同上；合并逻辑由 `invalidate`/`on_render_tick` 确定实现 + 已有 `merge_damage` 单测保证 |
+
+---

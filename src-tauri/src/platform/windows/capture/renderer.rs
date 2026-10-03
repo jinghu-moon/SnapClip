@@ -109,10 +109,12 @@ impl Win32Renderer {
 
     /// Damage caused by the cursor overlay at `cursor`.
     ///
-    /// The magnifier panel and the crosshair guides are the only things that move with
+    /// The magnifier panel and the *local* reticle are the only things that move with
     /// the cursor, so this is what a mouse move has to repaint. Handing this to the
-    /// renderer keeps one implementation of the magnifier geometry: the drawing code
-    /// and the invalidation code call the same `magnifier_geometry`.
+    /// renderer keeps one implementation of the pointer geometry: the drawing code and
+    /// the invalidation code call the same `magnifier_geometry` and `crosshair_geometry`.
+    /// The reticle is deliberately not full-frame, so a hover unions to a small box
+    /// instead of the whole monitor (docs/11 §5.1).
     pub fn cursor_damage(&self, cursor: Point) -> Vec<Rect> {
         let metrics = self.d2d.metrics();
         let config = crate::capture::geometry::MagnifierConfig::default().scaled(metrics.dpi);
@@ -122,11 +124,12 @@ impl Win32Renderer {
             self.frame,
             self.layout.local_work_area(),
         );
-        let mut damage = vec![geometry.bounds];
-        // The crosshair guides span the frame, so a move invalidates both lines.
-        damage.push(Rect::new(self.frame.left, cursor.y, self.frame.right, cursor.y + 1));
-        damage.push(Rect::new(cursor.x, self.frame.top, cursor.x + 1, self.frame.bottom));
-        damage
+        let reticle = crate::capture::geometry::crosshair_geometry(
+            cursor,
+            crate::capture::geometry::crosshair_radius(metrics.dpi),
+            self.frame,
+        );
+        vec![geometry.bounds, reticle.bounds]
     }
 
     /// Bind the frozen frame as the L0 layer.

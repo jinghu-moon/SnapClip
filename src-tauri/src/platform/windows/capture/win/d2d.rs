@@ -701,20 +701,27 @@ impl OverlayRenderer {
                 None,
             );
 
-            // Full-height and full-width guides are drawn in screen space. The
+            // The pointer reticle is a *local* crosshair centred on the cursor, drawn
+            // from the same `crosshair_geometry` the damage code uses so a hover
+            // invalidates exactly this box and never the full frame (docs/11 §5.1). The
             // magnifier itself deliberately has no detached pixel marker: a marker
             // painted into a previous panel can otherwise survive a partial damage
             // redraw and appear as a stray dot outside the current panel.
+            let reticle = crate::capture::geometry::crosshair_geometry(
+                view.cursor,
+                crate::capture::geometry::crosshair_radius(metrics.dpi),
+                view.frame,
+            );
             self.d2d.DrawLine(
-                vector2(view.cursor.x as f32 + 0.5, view.frame.top as f32),
-                vector2(view.cursor.x as f32 + 0.5, view.frame.bottom as f32),
+                vector2(reticle.horizontal.left as f32 + 0.5, view.cursor.y as f32 + 0.5),
+                vector2(reticle.horizontal.right as f32 - 0.5, view.cursor.y as f32 + 0.5),
                 crosshair,
                 1.0,
                 None,
             );
             self.d2d.DrawLine(
-                vector2(view.frame.left as f32, view.cursor.y as f32 + 0.5),
-                vector2(view.frame.right as f32, view.cursor.y as f32 + 0.5),
+                vector2(view.cursor.x as f32 + 0.5, reticle.vertical.top as f32 + 0.5),
+                vector2(view.cursor.x as f32 + 0.5, reticle.vertical.bottom as f32 - 0.5),
                 crosshair,
                 1.0,
                 None,
@@ -872,7 +879,10 @@ mod tests {
     use super::{MASK_ALPHA, OverlayRenderer, RenderMetrics, RenderView, damage_clip, to_d2d};
     use ::windows::Win32::Graphics::Direct2D::Common::D2D1_ALPHA_MODE_PREMULTIPLIED;
     use ::windows::Win32::Graphics::Direct2D::D2D1_BITMAP_OPTIONS_TARGET;
-    use crate::capture::geometry::{Handle, Point, Rect, SizeLabelPlacement, size_label_placement};
+    use crate::capture::geometry::{
+        Handle, MagnifierConfig, Point, Rect, SizeLabelPlacement, crosshair_geometry,
+        crosshair_radius, magnifier_geometry, size_label_placement,
+    };
 
     /// A flat-coloured BGRA frame.
     fn solid_bgra(width: u32, height: u32, pixel: [u8; 4]) -> Vec<u8> {
@@ -1075,6 +1085,129 @@ mod tests {
         assert!(
             changed.is_empty(),
             "pixels outside the damage region were rewritten: {changed:?}"
+        );
+    }
+
+    /// The pointer layer changes only locally; the static scene stays byte-identical.
+    ///
+    /// This is the Phase 2 acceptance (docs/11 §"静态层像素不变、指针层局部变化") and the
+    /// regression guard for the old full-screen-crosshair degeneration. A hover moves the
+    /// magnifier and the local reticle, so the damage is the union of the two cursors'
+    /// pointer footprints. Everything outside that union — the frozen frame, the mask and
+    /// the selection chrome — must be untouched, which is only true because the reticle is
+    /// a *local* crosshair and not a full-frame pair of lines.
+    #[test]
+    fn pointer_move_updates_only_the_pointer_region() {
+        let Ok(device) = super::GraphicsDevice::create() else {
+            eprintln!("no D3D11 device in this session; skipping the pointer-layer check");
+            return;
+        };
+        let width = 400u32;
+        let height = 400u32;
+        let background = [120u8, 140, 160, 255];
+        let Ok(mut renderer) = OverlayRenderer::new(std::sync::Arc::new(device), 96) else {
+            return;
+        };
+        renderer
+            .update_frame(width, height, &solid_bgra(width, height, background))
+            .unwrap();
+        renderer.ensure_back_buffer(width, height).unwrap();
+        let target = renderer
+            .device()
+            .create_render_target_texture(width, height)
+            .unwrap();
+        let d2d_context = renderer.device().create_d2d_context().unwrap();
+        let target_bitmap = super::super::d3d11::create_bitmap_from_texture(
+            &d2d_context,
+            &target.texture,
+            D2D1_BITMAP_OPTIONS_TARGET,
+            D2D1_ALPHA_MODE_PREMULTIPLIED,
+        )
+        .unwrap();
+
+        let frame = Rect::from_origin_size(Point::new(0, 0), width as i32, height as i32);
+        let metrics = renderer.metrics();
+        let work_area = frame;
+        let config = MagnifierConfig::default().scaled(metrics.dpi);
+        // The pointer footprint a move must repaint: exactly what `cursor_damage` returns.
+        let pointer_damage = |cursor: Point| -> Vec<Rect> {
+            let magnifier = magnifier_geometry(cursor, config, frame, work_area);
+            let reticle = crosshair_geometry(cursor, crosshair_radius(metrics.dpi), frame);
+            vec![magnifier.bounds, reticle.bounds]
+        };
+
+        let selection = Rect::new(10, 10, 70, 70);
+        let cursor_a = Point::new(80, 80);
+        let cursor_b = Point::new(200, 80);
+
+        // First frame: full composition with the pointer at A.
+        let mut view_a = RenderView::new(frame);
+        view_a.selection = selection;
+        view_a.show_chrome = true;
+        view_a.cursor_visible = true;
+        view_a.cursor = cursor_a;
+        view_a.damage.clear();
+        renderer.draw_to(&target_bitmap, &view_a).unwrap();
+        let before = renderer.device().read_back_bgra(&target.texture).unwrap();
+
+        // Second frame: the pointer moved to B; only the two pointer footprints damaged.
+        let damage: Vec<Rect> = pointer_damage(cursor_a)
+            .into_iter()
+            .chain(pointer_damage(cursor_b))
+            .collect();
+        let mut union = damage[0];
+        for rect in &damage {
+            union = union.union(*rect);
+        }
+        // The degeneration this phase removes: a full-screen crosshair adds a whole-width
+        // and a whole-height line, so the union becomes exactly the frame and every hover
+        // repaints everything. The local reticle must keep the union strictly bounded in
+        // both dimensions, leaving the four corners of the screen untouched.
+        assert!(
+            union.width() < frame.width() && union.height() < frame.height(),
+            "pointer damage union {}x{} spans the {}x{} frame — the crosshair is not local",
+            union.width(),
+            union.height(),
+            frame.width(),
+            frame.height(),
+        );
+
+        let mut view_b = RenderView::new(frame);
+        view_b.selection = selection;
+        view_b.show_chrome = true;
+        view_b.cursor_visible = true;
+        view_b.cursor = cursor_b;
+        view_b.damage = damage;
+        renderer.draw_to(&target_bitmap, &view_b).unwrap();
+        let after = renderer.device().read_back_bgra(&target.texture).unwrap();
+
+        // Static pixels far outside every damaged rect are byte-identical: the L0 frame,
+        // the L1 mask and the selection chrome were not re-rasterised.
+        for (x, y) in [(390u32, 390u32), (30, 30), (390, 30), (30, 390), (250, 350)] {
+            assert!(
+                !union.contains(Point::new(x as i32, y as i32)),
+                "test sample ({x},{y}) unexpectedly lies inside the damage union"
+            );
+            assert_eq!(
+                pixel_at(&before, width, x, y),
+                pixel_at(&after, width, x, y),
+                "static pixel ({x},{y}) changed while only the pointer moved"
+            );
+        }
+
+        // The pointer region genuinely changed: a point on B's reticle that A never drew.
+        let b_reticle = crosshair_geometry(cursor_b, crosshair_radius(metrics.dpi), frame);
+        let moved_probe = Point::new(cursor_b.x + 10, b_reticle.horizontal.top);
+        assert!(
+            !pointer_damage(cursor_a)
+                .iter()
+                .any(|rect| rect.contains(moved_probe)),
+            "test probe must be outside A's footprint"
+        );
+        assert_ne!(
+            pixel_at(&before, width, moved_probe.x as u32, moved_probe.y as u32),
+            pixel_at(&after, width, moved_probe.x as u32, moved_probe.y as u32),
+            "the pointer layer must actually repaint at the new cursor"
         );
     }
 

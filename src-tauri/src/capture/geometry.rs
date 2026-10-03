@@ -684,6 +684,49 @@ pub fn magnifier_geometry(
     }
 }
 
+/// Half-length of the pointer reticle's guide segments, in DIP.
+///
+/// The crosshair is a *local* precision mark centred on the cursor, not a full-frame
+/// guide. Keeping it bounded is what stops a hover from invalidating the whole surface
+/// (docs/11 §5.1: 十字线默认限制为局部准星).
+const CROSSHAIR_RADIUS_DIP: f32 = 28.0;
+
+/// Reticle radius in physical pixels for a display DPI.
+pub fn crosshair_radius(dpi: u32) -> i32 {
+    (CROSSHAIR_RADIUS_DIP * (dpi.max(96) as f32 / 96.0)).round() as i32
+}
+
+/// The local crosshair footprint for a cursor at `cursor`, clamped to `frame`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CrosshairGeometry {
+    /// Horizontal 1px guide segment (right edge exclusive).
+    pub horizontal: Rect,
+    /// Vertical 1px guide segment (bottom edge exclusive).
+    pub vertical: Rect,
+    /// Union of the two segments, used for damage tracking.
+    pub bounds: Rect,
+}
+
+/// Compute the local "准星" segments for `cursor`.
+///
+/// One implementation is shared by the draw code (`draw_magnifier`) and the invalidation
+/// code (`cursor_damage`) so a hover repaints exactly the reticle box and never unions to
+/// the full monitor.
+pub fn crosshair_geometry(cursor: Point, radius: i32, frame: Rect) -> CrosshairGeometry {
+    let radius = radius.max(0);
+    let left = (cursor.x - radius).max(frame.left);
+    let right = (cursor.x + radius + 1).min(frame.right);
+    let top = (cursor.y - radius).max(frame.top);
+    let bottom = (cursor.y + radius + 1).min(frame.bottom);
+    let horizontal = Rect::new(left, cursor.y, right, cursor.y + 1);
+    let vertical = Rect::new(cursor.x, top, cursor.x + 1, bottom);
+    CrosshairGeometry {
+        horizontal,
+        vertical,
+        bounds: Rect::new(left, top, right, bottom),
+    }
+}
+
 /// Placement of the `width × height` label relative to the selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SizeLabelPlacement {
@@ -1032,5 +1075,34 @@ mod tests {
             Some(Handle::Right)
         );
         assert_eq!(snapshot.edges_at(Point::new(150, 150)).handle(), None);
+    }
+
+    #[test]
+    fn crosshair_is_local_and_centred_on_the_cursor() {
+        let frame = Rect::new(0, 0, 1920, 1080);
+        let geometry = crosshair_geometry(Point::new(960, 540), 28, frame);
+        assert_eq!(geometry.horizontal, Rect::new(932, 540, 989, 541));
+        assert_eq!(geometry.vertical, Rect::new(960, 512, 961, 569));
+        assert_eq!(geometry.bounds, Rect::new(932, 512, 989, 569));
+        // A hover must never invalidate the whole monitor: the reticle box stays small.
+        assert!((geometry.bounds.area()) < frame.area());
+    }
+
+    #[test]
+    fn crosshair_clamps_to_the_frame_at_the_edges() {
+        let frame = Rect::new(0, 0, 1920, 1080);
+        let top_left = crosshair_geometry(Point::new(0, 0), 28, frame);
+        assert_eq!(top_left.horizontal, Rect::new(0, 0, 29, 1));
+        assert_eq!(top_left.vertical, Rect::new(0, 0, 1, 29));
+        assert_eq!(top_left.bounds, Rect::new(0, 0, 29, 29));
+        let bottom_right = crosshair_geometry(Point::new(1919, 1079), 28, frame);
+        assert_eq!(bottom_right.bounds, Rect::new(1891, 1051, 1920, 1080));
+    }
+
+    #[test]
+    fn crosshair_radius_scales_with_dpi() {
+        assert_eq!(crosshair_radius(96), 28);
+        assert_eq!(crosshair_radius(144), 42);
+        assert!(crosshair_radius(0) == 28, "dpi below 96 clamps to the 96 baseline");
     }
 }

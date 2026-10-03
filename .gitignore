@@ -34,7 +34,7 @@ prototypes/*/assets/
 *.backup.*
 .playwright-cli/
 .playwright-mcp/
-.tmp-*.json
+.tmp-*
 docs/Temp/
 
 # Local OCR test data, model weights, and comparison run outputs (multi-GB,

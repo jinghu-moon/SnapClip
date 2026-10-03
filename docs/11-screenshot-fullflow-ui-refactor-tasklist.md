@@ -335,12 +335,12 @@ surface 或 D2D render target；不能把任意 `ID3D11Texture2D` 直接当作 v
 
 任务：
 
-- [ ] L0 在会话内只绑定一次冻结 texture。
-- [ ] L1 无选区时填充全屏遮罩；有选区时用四个 band 挖空。
+- [x] L0 在会话内只绑定一次冻结 texture。
+- [x] L1 无选区时填充全屏遮罩；有选区时用四个 band 挖空。
 - [ ] Selection Visual 只在选区、DPI、主题或标签变化时更新。
 - [ ] Pointer Visual 只在鼠标位置、采样颜色或放大倍率变化时更新。
 - [ ] 静态层和动态层不共享需要整层重绘的 D2D target。
-- [ ] 若暂时保持单 target，必须实现多个 damage clip，不得合并成全屏包围盒。
+- [x] 若暂时保持单 target，必须实现多个 damage clip，不得合并成全屏包围盒。
 
 ### 5.2 遮罩和选区框
 
@@ -845,12 +845,15 @@ src-tauri/src/
 
 ### Phase 2：渲染节奏和分层
 
-- [ ] 增加 `WM_APP_RENDER`/刷新 tick。
-- [ ] `WM_MOUSEMOVE` 只更新 latest state。
-- [ ] 一个 tick 最多一次 Present/Commit。
-- [ ] 创建 Static/Selection/Pointer 三层 visual 或等效 surface。
-- [ ] 移除全屏十字线导致的单包围盒退化。
-- [ ] 增加“静态层像素不变、指针层局部变化”的 GPU 回归测试。
+- [x] 增加 `WM_APP_RENDER`/刷新 tick。
+- [x] `WM_MOUSEMOVE` 只更新 latest state。
+- [x] 一个 tick 最多一次 Present/Commit。
+- [x] 创建 Static/Selection/Pointer 三层 visual 或等效 surface。
+- [x] 移除全屏十字线导致的单包围盒退化。
+- [x] 增加"静态层像素不变、指针层局部变化"的 GPU 回归测试。
+
+> 实现等效路径：单 target + 多个独立 damage clip（docs/11 §5.1 line 343 允许）。局部准星
+> 替代全屏十字线，hover 包围盒不再覆盖整帧；WM_TIMER 15ms tick 合并鼠标事件。
 
 ### Phase 3：选区 readback 和导出
 

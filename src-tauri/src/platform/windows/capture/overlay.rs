@@ -39,12 +39,12 @@ use windows_sys::Win32::{
             DispatchMessageW, GetCursorPos, GetForegroundWindow, GetMessageW, MSG, PeekMessageW,
             PostQuitMessage,
             PostThreadMessageW, RegisterClassW, SW_HIDE, SW_SHOW, SetForegroundWindow,
-            SetWindowPos,
+            SetWindowPos, SetTimer, KillTimer,
             ShowWindow, TranslateMessage, UnregisterClassW, WM_APP, WM_DESTROY, WM_DEVICECHANGE,
             WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONDOWN,
             WM_MOUSEACTIVATE,
             WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_RBUTTONDOWN,
-            WM_SETCURSOR, WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW,
+            WM_SETCURSOR, WM_TIMER, WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW,
             WS_EX_TOPMOST, WS_POPUP, HTCLIENT, HWND_TOPMOST, MA_ACTIVATE,
         },
     },
@@ -66,6 +66,12 @@ use super::renderer::{OverlayFrameState, Win32Renderer};
 
 /// `WM_APP`-based command delivered from any thread to the overlay thread.
 const WM_OVERLAY_COMMAND: u32 = WM_APP + 17;
+/// Coalescing render cadence in milliseconds (~60 Hz, docs/11 §"约 16ms 渲染节奏").
+/// Mouse and drag input only marks state dirty and arms this one-shot timer; the
+/// timer collapses every change since the last tick into a single render/present/commit.
+const RENDER_TICK_MS: u32 = 15;
+/// The `SetTimer` id for the coalescing render tick.
+const RENDER_TIMER_ID: usize = 0x51_C0DE;
 /// `TrackMouseEvent` flag asking for a `WM_MOUSELEAVE` notification.
 const TME_LEAVE: u32 = 0x0000_0002;
 /// `SWP_SHOWWINDOW`.
@@ -298,6 +304,8 @@ where
     cursor: Point,
     cursor_visible: bool,
     dirty: Vec<Rect>,
+    /// Whether the coalescing render tick is currently armed (`SetTimer` running).
+    render_armed: bool,
     session_counter: u64,
     /// Generation of the session currently awaiting a worker result.
     current_generation: u64,
@@ -329,6 +337,7 @@ where
             cursor: Point::default(),
             cursor_visible: false,
             dirty: Vec::new(),
+            render_armed: false,
             session_counter: 0,
             current_generation: 0,
             previous_foreground: null_mut(),
@@ -507,8 +516,9 @@ where
         self.publish_state();
         // Paint the new frame while the HWND is still hidden. DirectComposition
         // retains the previous swap-chain contents, so showing first would expose
-        // the previous session's selection for one compositor frame.
-        self.request_redraw(None);
+        // the previous session's selection for one compositor frame. This first paint
+        // is synchronous (not coalesced) precisely so it lands before `show_overlay`.
+        self.paint_now(None);
         self.show_overlay(&monitor.layout);
         eprintln!(
             "[snapclip][bench] stage=visible session={} prepare_elapsed_ms={}",
@@ -654,6 +664,9 @@ where
         self.frozen = None;
         self.drag_mode = None;
         self.cursor_visible = false;
+        // Stop the coalescing tick before releasing the renderer: a pending WM_TIMER
+        // must not try to present into the graphics we are about to drop.
+        self.disarm_render_tick();
         self.dirty.clear();
         self.hide_overlay();
         // Renderer resources are session-owned. Dropping the renderer releases the
@@ -789,7 +802,7 @@ where
             }
             self.dirty.extend(cursor_damage);
         }
-        self.request_redraw(None);
+        self.invalidate(None);
     }
 
     /// Pick the resize cursor for a monitor-local point.
@@ -824,7 +837,7 @@ where
                 let damage = renderer.cursor_damage(self.cursor);
                 self.dirty.extend(damage);
             }
-            self.request_redraw(None);
+            self.invalidate(None);
         }
     }
 
@@ -850,7 +863,7 @@ where
         });
         self.update_cursor_shape(point);
         self.dirty.push(self.session.selection());
-        self.request_redraw(None);
+        self.invalidate(None);
     }
 
     fn on_left_up(&mut self) {
@@ -876,7 +889,7 @@ where
         );
         self.publish_state();
         self.dirty.push(self.session.selection());
-        self.request_redraw(None);
+        self.invalidate(None);
     }
 
     fn on_key_down(&mut self, key: u32) {
@@ -898,10 +911,58 @@ where
 
     // ---- rendering -------------------------------------------------------
 
-    /// Merge the pending invalidations and repaint the union.
-    fn request_redraw(&mut self, region: Option<Rect>) {
+    /// Paint immediately: merge the pending invalidations and repaint the union.
+    ///
+    /// Used only for the synchronous first frame that must land before the window is
+    /// shown (docs/11 §"隐藏状态完成一次完整绘制和 Present/Commit"). Interactive input
+    /// goes through [`Self::invalidate`] instead so a burst of `WM_MOUSEMOVE`s collapses
+    /// into one present per tick.
+    fn paint_now(&mut self, region: Option<Rect>) {
         if let Some(region) = region {
             self.dirty.push(region);
+        }
+        self.disarm_render_tick();
+        let merged = merge_damage(&mut self.dirty);
+        self.render(merged);
+    }
+
+    /// Record invalidation and coalesce it into the next render tick.
+    ///
+    /// `WM_MOUSEMOVE` and the drag handlers only update state and call this; the actual
+    /// draw happens once in [`Self::on_render_tick`], so a fast pointer produces at most
+    /// one present per `RENDER_TICK_MS` (docs/11 §"一个 tick 最多一次 Present/Commit").
+    fn invalidate(&mut self, region: Option<Rect>) {
+        if let Some(region) = region {
+            self.dirty.push(region);
+        }
+        if self.renderer.is_none() || self.dirty.is_empty() {
+            return;
+        }
+        self.arm_render_tick();
+    }
+
+    fn arm_render_tick(&mut self) {
+        if self.render_armed {
+            return;
+        }
+        // A window timer (not a thread timer): its `WM_TIMER` is posted to this queue
+        // and coalesces, so repeated invalidations never stack timers.
+        unsafe { SetTimer(self.window, RENDER_TIMER_ID, RENDER_TICK_MS, None) };
+        self.render_armed = true;
+    }
+
+    fn disarm_render_tick(&mut self) {
+        if self.render_armed {
+            unsafe { KillTimer(self.window, RENDER_TIMER_ID) };
+            self.render_armed = false;
+        }
+    }
+
+    /// The coalescing tick body: draw everything accumulated since the last present once.
+    fn on_render_tick(&mut self) {
+        self.disarm_render_tick();
+        if self.dirty.is_empty() {
+            return;
         }
         let merged = merge_damage(&mut self.dirty);
         self.render(merged);
@@ -1073,6 +1134,16 @@ where
                 self.render(Vec::new());
                 unsafe { EndPaint(self.window, &paint) };
                 Some(0)
+            }
+            WM_TIMER => {
+                // Coalescing render tick: draw everything accumulated since the last
+                // present once. Unknown timer ids fall through to DefWindowProcW.
+                if (wparam as usize) == RENDER_TIMER_ID {
+                    self.on_render_tick();
+                    Some(0)
+                } else {
+                    None
+                }
             }
             WM_DPICHANGED | WM_DISPLAYCHANGE | WM_DEVICECHANGE => {
                 if self.session.state().is_active() {
