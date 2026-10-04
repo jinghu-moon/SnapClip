@@ -36,6 +36,7 @@
 
 pub mod gesture;
 pub mod hit_test;
+pub mod deep;
 pub mod model;
 pub mod provider;
 pub mod snapshot;

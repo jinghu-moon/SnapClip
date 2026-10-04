@@ -147,14 +147,30 @@ impl WindowIdentity {
 
 /// What kind of region a [`WindowTarget`] describes.
 ///
-/// v1 has exactly one variant. `ClientArea` and `UiElement` are v2 and must be added
-/// together with their provider, never by widening the v1 whole-window path
-/// (docs/14 §11).
+/// v1 uses [`Self::TopLevelWindowFrame`] only. `ClientArea` and `UiElement` belong to v2
+/// (docs/18): they are produced by the refinement worker and must never widen or alter
+/// the v1 whole-window path — a v2 failure falls back to the v1 frame, never the other
+/// way round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TargetKind {
     /// DWM top-level window frame: includes the title bar, excludes the invisible
     /// resize border.
     TopLevelWindowFrame,
+    /// v2: the window's client area (no title bar, no borders).
+    ClientArea,
+    /// v2: the deepest interactive UI element under the cursor.
+    UiElement,
+}
+
+impl TargetKind {
+    /// Whether this target comes from the v2 refinement path.
+    ///
+    /// Used by the overlay to keep the two layers apart: v2 targets may be refined
+    /// further or dropped back to the v1 frame, while a v1 frame is always the fallback
+    /// and never needs a refinement query of its own.
+    pub fn is_refined(self) -> bool {
+        matches!(self, Self::ClientArea | Self::UiElement)
+    }
 }
 
 /// One window observation inside a snapshot (docs/14 §5.1).
