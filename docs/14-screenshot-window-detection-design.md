@@ -8,6 +8,11 @@
 > 见 §7）；② 未引入空间索引（基准证明线性扫描远在预算内，见 §5.4/§10.2）；③ SnapClip 没有
 > “全屏十字线”，准星只存在于放大镜内部（见 §4.1 Settled 语义）。
 >
+> **交互变更（2026-10-04，已落地）**：确认手势由「Enter/工具栏」改为「**鼠标左键单击**」，
+> `Enter` 保留为等价快捷键。原条款「鼠标释放不确认吸附」被本变更**取代**。
+> 变更理由、影响面与被取代的条款见 §4.3；实现与实机证据见
+> `docs/17-window-detection-verification.md` 的「交互变更：左键确认」一节。
+>
 > 适用平台：Windows 10/11 x64，Per-Monitor-V2 DPI awareness
 >
 > 目标：截图进入选区阶段时，自动识别屏幕上各个窗口的边界（位置 + 宽高），支持"光标停稳后自动吸附最近的顶层窗口外框"，同时不破坏现有手动拖拽框选。
@@ -22,7 +27,7 @@
 
 1. **窗口发现采用快照模型，不做每帧枚举**：会话开始时 `EnumWindows` 建立 `WindowSnapshot`（含窗口身份、DWM 外框、Z 序）；`WM_MOUSEMOVE` 只对快照做缓存命中/最近距离查询。只有在会话新建、显示器变化、目标验证失败、排除集合变化、显式失效等时才刷新快照。**禁止在每次鼠标移动中执行 `EnumWindows + DwmGetWindowAttribute`。**
 1b. **hover 时效性与自动吸附有明确兜底**：定期（非鼠标移动路径）只对当前 hover HWND 做轻量重验证，边界变化或验证失败才刷新快照并重新命中；光标停稳超过防抖时间后，在吸附半径内选择最近窗口并更新吸附预览（见 §4.1、§5.5）。重验证的 Win32/DWM 调用运行在**独立窗口检测 worker 线程**，overlay 定时器只投递、结果回投后只校验与更新，同步 DWM 调用不得阻塞 overlay 消息循环。
-2. **停稳吸附与拖拽使用显式手势状态机**：鼠标移动停止后才允许产生 `AutoSnapPreview`；按下只记录指针手势，位移超过阈值才转 `ManualDrag`。自动吸附不依赖点击释放，`Enter` 或工具栏确认当前预览。这与现有 `session.pointer_pressed()` 按下即改选区的行为冲突，必须先重构输入状态再实现吸附。
+2. **停稳吸附与拖拽使用显式手势状态机**：鼠标移动停止后才允许产生吸附预览；按下只记录指针手势，位移超过阈值才转 `ManualDrag`。确认手势为**鼠标左键单击**（`Enter`/工具栏为等价入口，§4.3）。这与现有 `session.pointer_pressed()` 按下即改选区的行为冲突，必须先重构输入状态再实现吸附。
 3. **窗口目标必须有身份和版本**：`DetectedWindow` 只有 hwnd+bounds 不够安全（HWND 可能被关闭后重用）。快照条目携带 `WindowIdentity`（hwnd + process_id + class_name_hash）与 `snapshot_epoch`，应用自动吸附预览或确认前重新验证，验证失败刷新快照后重命中一次；重命中仍失败则**保持原选区不变、清除自动吸附预览**。
 4. **过滤规则修正**：不武断排除 `WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`；真正的点击穿透是 `WS_EX_LAYERED && WS_EX_TRANSPARENT`（单独 `WS_EX_TRANSPARENT` 不等于穿透）。SnapClip 自身窗口通过显式 `excluded_hwnds / excluded_process_ids` 集合排除。
 5. **v1 只做 `TopLevelWindowFrame`（顶层窗口外框）**：`DWMWA_EXTENDED_FRAME_BOUNDS` 是包含标题栏的窗口外框，**不是**客户区、不是网页内容区、不是"精确内容边界"。`ClientArea` 与 `UiElement`（UIA/MSAA 子元素深选）留给 v2，且 v2 与 v1 整窗吸附严格隔离。
@@ -84,9 +89,9 @@
 **snow_shot 的原始实现与 SnapClip v1 交互不是同一套语义**。snow_shot 的源码可见按下后进入 pending、释放时提交智能选区；这段流程仅作为拖拽阈值和 worker 分层的参考，**不作为 SnapClip v1 的实现要求**。SnapClip v1 改为停稳吸附，使用明确的手势状态机（拖拽阈值参考 `screenshotoverlayinputhandler.cpp`、`screenshotintelligentselectionmodel.cpp`）：
 
 ```
-鼠标停稳 -> AutoSnapPreview（不立即确认）
+鼠标停稳 -> 吸附预览（不立即确认）
 按下并移动超过阈值 -> ManualDrag
-Enter/工具栏确认 -> 提交当前吸附预览
+左键单击 / Enter / 工具栏确认 -> 提交当前吸附预览
 ```
 
 `shouldStartManualDrag(...)` 仍用位移平方和对比系统拖拽阈值。**关键点：停稳才产生吸附预览，按下时不会立即修改正式选区。**
@@ -143,7 +148,7 @@ Crisp 还对 Shell 类名和自家进程做了精确排除。SnapClip 应吸收�
 
 - **悬停**：鼠标移动时高亮光标下"用户看到的"窗口的**顶层窗口外框**（强调描边 + 半透明填充），仅预览，不改变已有选择。
 - **停稳自动吸附**：鼠标移动停止并持续达到防抖时间（初始 120ms，依据手感测试调整）后，在吸附半径内按点到窗口矩形的最短距离选择最近者，显示吸附预览并将选区预览贴合到该窗口在当前显示器的可见部分；不自动确认。点位于多个重叠窗口内时距离均为零，按 Z 序选择最上层窗口。
-- **确认**：按 `Enter` 或工具栏确认命令时，验证当前吸附目标并提交选区；目标失效时刷新快照并重命中一次，仍失败则不改变原选区。
+- **确认**：**鼠标左键单击**（按下后未超过系统拖拽阈值即松开）或按 `Enter`、或工具栏确认命令时，验证当前吸附目标并提交选区；目标失效时刷新快照并重命中一次，仍失败则不改变原选区。见 §4.3 的交互变更记录。
 - **确认后的编辑态**：吸附或手动框选确认后进入独立的 `Settled`/编辑态；此时关闭窗口 hover、dwell 自动吸附和全屏十字线，只保留已确认选区、移动/缩放手柄与工具栏。再次点击选区外是否重建选区由显式产品策略决定，不得让旧的 hover 预览隐式改写已确认选区。该分层参考 Crisp 的 `settled` 状态。
 - **拖拽**（按下后位移² ≥ 阈值）：立即取消自动吸附预览，维持现有自由橡皮筋框选。
 - **跨屏窗口**：当前截图会话只捕获当前显示器，因此跨屏窗口**只吸附当前显示器可见部分**，不承诺整窗。若未来产品要求"整窗吸附"，须改为虚拟桌面捕获，而不是继续使用单显示器 frozen frame（见 §6.2）。
@@ -156,11 +161,6 @@ Crisp 还对 Shell 类名和自家进程做了精确排除。SnapClip 应吸收�
 ```rust
 enum PointerGesture {
     None,
-    AutoSnapPreview {
-        target: WindowTarget,
-        preview_selection: Rect,
-        selection_before_preview: Rect,
-    },
     PendingPointer {
         press_point: Point,
         selection_before_press: Rect,
@@ -171,6 +171,17 @@ enum PointerGesture {
     },
     MoveSelection,
     ResizeSelection,
+}
+
+/// 吸附预览是**显示状态**，不是指针手势。
+///
+/// 按下不能销毁它，否则“左键单击确认”无法成立（§4.3）；这与 `Settled` 属于会话状态
+/// 而非指针手势是同一个道理：把“当前显示什么”和“当前鼠标在做什么”放进同一个枚举，
+/// 就会出现状态互相覆盖的缺陷。
+struct SnapPreview {
+    target: WindowTarget,
+    preview_selection: Rect,
+    selection_before_preview: Rect,
 }
 ```
 
@@ -184,23 +195,25 @@ PointerDown:
 
 PointerMove:
   1. 无按键 + 光标移动       -> 更新 hover，重置 dwell timer
-  2. 无按键 + 停稳达到 dwell -> 在 snap radius 内计算最近窗口并进入 AutoSnapPreview
-  3. PendingPointer + 超阈值 -> 清除 AutoSnapPreview（若存在），转 ManualDrag
+  2. 无按键 + 停稳达到 dwell -> 在 snap radius 内计算最近窗口并设置 SnapPreview
+  3. PendingPointer + 超阈值 -> 清除 SnapPreview，转 ManualDrag
   4. ManualDrag              -> 更新自由框选
 
 PointerUp:
-  1. PendingPointer -> 结束指针等待，不提交窗口吸附；吸附只能由 Enter/工具栏确认
+  1. PendingPointer -> 结束指针等待；**若存在 SnapPreview 则确认它**（左键单击确认，§4.3）；
+                       没有预览时单击不改变任何状态
   2. ManualDrag   -> 提交自由选区
   3. Move/Resize  -> 提交选区编辑
 
-Confirm (`Enter` / toolbar):
-  1. AutoSnapPreview -> 验证目标并提交预览选区
+Confirm (左键单击 / `Enter` / toolbar):
+  1. SnapPreview -> 验证目标并提交预览选区
   2. 目标失效        -> 刷新快照并重命中一次；仍失败则恢复确认前选区
 
-AutoSnapPreview:
-  1. 预览几何只用于绘制，不覆盖已确认 selection
+SnapPreview:
+  1. 预览几何只用于绘制，不覆盖已确认 selection；按下不销毁预览
   2. 光标移动到另一候选并重新停稳 -> 替换为新的最近窗口预览
   3. 离开所有候选的 snap radius -> 清除预览，恢复 hover/已有选区
+  4. 超过拖拽阈值 -> 清除预览并进入 ManualDrag（拖拽优先）
 
 Settled:
   1. 不再产生 WindowTarget hover 或 AutoSnapPreview
@@ -213,6 +226,38 @@ Settled:
 拖拽阈值沿用 snow_shot 的判别：`should_start_manual_drag(press_pt, cur_pt, d) = dx² + dy² ≥ d²`，`d` 取系统拖拽阈值（`SystemParametersInfo(SM_CXDRAG)` 折算像素），避免抖动误判。
 
 **必须如此设计的根因**：若在按下时先创建零尺寸选区，会引入点击时先产生零尺寸选区、窗口吸附状态与手动拖拽状态互相混淆等一类缺陷，这类缺陷无法在现有结构上局部修复。
+
+### 4.3 交互变更记录：确认手势由 Enter 改为鼠标左键单击（2026-10-04）
+
+**变更内容**：停稳产生吸附预览后，**鼠标左键单击**（按下后未超过系统拖拽阈值即松开）即确认该预览；
+`Enter` 与工具栏命令保留为等价入口。
+
+**被本变更取代的条款**（原文，现失效）：
+
+- §4.1「确认」条以及「不自动确认」中“必须用 Enter/工具栏”的限制；
+- §4.2 `PointerUp` 第 1 条「结束指针等待，不提交窗口吸附；吸附只能由 Enter/工具栏确认」；
+- §12.3「鼠标释放不会自动确认吸附」。
+
+**为什么原设计选择 Enter，以及该理由为何不再成立**：原设计的顾虑是历史上「按下即改选区」的缺陷——
+按下瞬间先创建零尺寸选区，使“点击”与“开始拖拽”两种意图无法区分。该缺陷的**根因是“按下就改选区”，
+不是“松开时确认”**：只要按下阶段只记录 `PendingPointer`、位移超过阈值就转 `ManualDrag`，
+松开时刻就不存在与拖拽冲突的风险。把确认放在松开时刻因此是安全的，也更符合“点一下选中这个窗口”的直觉。
+
+**必须同时满足的约束**（实现与测试均覆盖）：
+
+1. 按下仍然**不修改选区**；
+2. 按下**不销毁预览**（否则松开时已无对象可确认）——这正是 §4.2 中 `SnapPreview` 必须独立于
+   `PointerGesture` 的原因；
+3. 位移超过系统拖拽阈值 → 清除预览、进入 `ManualDrag`；此时松开**只提交自由选区，不确认吸附**；
+4. 没有预览时单击不改变任何状态（不重建选区、不清空已确认选区）；
+5. 确认仍在检测 worker 校验通过后才 `snap_to`；失败恢复确认前选区。
+
+**影响面**：`capture/window_detection/gesture.rs`（预览移出手势枚举）、
+`platform/windows/capture/overlay.rs`（`on_left_up` 的 Click 分支）、`docs/17` 的行为对比与验收表，
+以及原先断言“释放不确认”的单测（属预期行为的正确变化，非为让实现通过而修改断言）。
+
+**不受影响的语义**：hover、dwell 防抖、拖拽阈值、快照/epoch/request-id 校验、worker 分层、
+`Settled` 分层、渲染分层全部保持不变。
 
 ---
 
