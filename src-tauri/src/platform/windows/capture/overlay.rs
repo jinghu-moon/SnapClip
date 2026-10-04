@@ -30,7 +30,10 @@ use windows_sys::Win32::{
     System::Threading::GetCurrentThreadId,
     UI::{
         Controls::WM_MOUSELEAVE,
-        Input::KeyboardAndMouse::{GetKeyState, SetFocus, VK_CONTROL},
+        Input::Ime::{ImmGetContext, ImmReleaseContext, ImmSetOpenStatus},
+        Input::KeyboardAndMouse::{
+            GetKeyState, MapVirtualKeyW, SetFocus, VK_CONTROL, MAPVK_VSC_TO_VK,
+        },
         WindowsAndMessaging::{
             IDC_ARROW, IDC_CROSS, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE,
             LoadCursorW,
@@ -41,7 +44,8 @@ use windows_sys::Win32::{
             PostThreadMessageW, RegisterClassW, SW_HIDE, SW_SHOW, SetForegroundWindow,
             SetWindowPos, SetTimer, KillTimer,
             ShowWindow, TranslateMessage, UnregisterClassW, WM_APP, WM_DESTROY, WM_DEVICECHANGE,
-            WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONDOWN,
+            WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN,
+            WM_SETFOCUS, WM_LBUTTONDOWN,
             WM_MOUSEACTIVATE,
             WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_RBUTTONDOWN,
             WM_SETCURSOR, WM_TIMER, WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW,
@@ -739,6 +743,27 @@ where
         }
     }
 
+    /// Close the overlay's own IME context so `S`/`C`/`P` (and any future
+    /// letter hotkey) arrive as their real virtual-key codes instead of
+    /// `VK_PROCESSKEY (0xE5)`.
+    ///
+    /// `ImmSetOpenStatus` operates on the per-window input context, not the
+    /// thread- or system-wide IME setting, so the user's active Chinese IME in
+    /// Word/Chrome is untouched: they see their usual state once the overlay
+    /// releases focus. Called from `WM_SETFOCUS`, i.e. every time the overlay
+    /// gains the keyboard (session start, click-back, `WM_MOUSEACTIVATE`).
+    fn disable_ime_for_overlay(&self) {
+        unsafe {
+            let himc = ImmGetContext(self.window);
+            if himc.is_null() {
+                return;
+            }
+            // FALSE = switch this window's IME to alphanumeric ("English") mode.
+            let _ = ImmSetOpenStatus(himc, 0);
+            ImmReleaseContext(self.window, himc);
+        }
+    }
+
     /// Hand the foreground back to whatever had it before the overlay appeared.
     fn restore_foreground(&self) {
         let previous = self.previous_foreground;
@@ -1201,40 +1226,44 @@ where
     }
 
     fn on_key_down(&mut self, key: u32) {
-        eprintln!(
-            "[snapclip][capture] key down vk=0x{key:02X} session={} state={:?}",
-            self.session_id(),
-            self.session.state()
-        );
+        let state = self.session.state();
+        let is_active = state.is_active();
+        let has_selection = self.session.has_selection();
         match key {
             hotkey::ESCAPE_VIRTUAL_KEY => self.cancel("escape"),
             hotkey::RETURN_VIRTUAL_KEY => {
-                if self.session.has_selection() {
+                if has_selection {
                     self.confirm();
                 }
             }
             // 'A': Selected -> Annotating (selection is locked, tools go live).
-            k if k == b'A' as u32 && self.session.state() == CaptureState::Selected => {
-                if self.session.begin_annotating().is_ok() {
+            k if k == b'A' as u32 => {
+                if state == CaptureState::Selected && self.session.begin_annotating().is_ok() {
                     self.publish_state();
                     self.invalidate_all();
                 }
             }
             // 'S' (0x53): cycle colour display format (HEX → RGB → HSL → HEX).
-            k if k == b'S' as u32 && self.session.state().is_active() => {
-                self.magnifier_color_format = self.magnifier_color_format.next();
-                self.invalidate();
+            k if k == b'S' as u32 => {
+                if is_active {
+                    self.magnifier_color_format = self.magnifier_color_format.next();
+                    self.invalidate();
+                }
             }
             // 'C': copy the current colour value (in the active format) to clipboard.
-            k if k == b'C' as u32 && self.session.state().is_active() => {
-                self.copy_color_to_clipboard();
+            k if k == b'C' as u32 => {
+                if is_active {
+                    self.copy_color_to_clipboard();
+                }
             }
             // 'P': toggle global screen ↔ selection-relative coordinate in the info panel.
-            k if k == b'P' as u32 && self.session.state().is_active() => {
-                self.magnifier_relative = !self.magnifier_relative;
-                self.invalidate();
+            k if k == b'P' as u32 => {
+                if is_active {
+                    self.magnifier_relative = !self.magnifier_relative;
+                    self.invalidate();
+                }
             }
-            _ if self.session.state() == CaptureState::Annotating => self.on_annotation_key(key),
+            _ if state == CaptureState::Annotating => self.on_annotation_key(key),
             _ => {}
         }
     }
@@ -1243,12 +1272,13 @@ where
     /// the `S` cycle is on) to the Windows clipboard via arboard. Marks the
     /// write as excluded so the clip-monitor does not record our own copy.
     fn copy_color_to_clipboard(&mut self) {
-        let Some(text) = self.sampler.formatted(self.magnifier_color_format) else {
+        let format = self.magnifier_color_format;
+        let Some(text) = self.sampler.formatted(format) else {
             return;
         };
         match arboard::Clipboard::new() {
             Ok(mut cb) => {
-                if let Err(error) = cb.set_text(text) {
+                if let Err(error) = cb.set_text(text.clone()) {
                     eprintln!("[snapclip][capture] colour copy failed: {error}");
                 } else {
                     crate::platform::windows::clipboard::mark_clipboard_excluded();
@@ -1685,8 +1715,27 @@ where
                 Some(0)
             }
             WM_KEYDOWN => {
-                self.on_key_down(wparam as u32);
+                // When the user's IME is Chinese/Japanese/Korean the letter keys
+                // are handed to the IME as `WM_KEYDOWN vk=VK_PROCESSKEY (0xE5)`
+                // before we can match them. We already close the overlay's IMC
+                // on focus-in, but a stale IME (or a mid-session Win+Space
+                // layout swap) can still deliver 0xE5. Translate the physical
+                // scan code out of `lParam` bits 16-23 in that case so `S/C/P`
+                // keep firing.
+                let raw_vk = wparam as u32;
+                let vk = if raw_vk == 0xE5 {
+                    let scan = ((lparam as u32) >> 16) & 0xFF;
+                    let mapped = unsafe { MapVirtualKeyW(scan, MAPVK_VSC_TO_VK) };
+                    if mapped != 0 { mapped } else { raw_vk }
+                } else {
+                    raw_vk
+                };
+                self.on_key_down(vk);
                 Some(0)
+            }
+            WM_SETFOCUS => {
+                self.disable_ime_for_overlay();
+                None
             }
             // A click on the overlay must activate it so the following `WM_KEYDOWN`
             // for `Esc` / `Enter` is delivered here instead of to the previous window.
