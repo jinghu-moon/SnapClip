@@ -28,8 +28,9 @@ use ::windows::Win32::Graphics::DirectComposition::{
 use ::windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
 };use ::windows::Win32::Graphics::Dxgi::{
-    DXGI_PRESENT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
-    DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice, IDXGIFactory2, IDXGISurface, IDXGISwapChain1,
+    DXGI_ERROR_WAS_STILL_DRAWING, DXGI_PRESENT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1,
+    DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice, IDXGIFactory2,
+    IDXGISurface, IDXGISwapChain1,
 };
 use ::windows::core::{Interface, Result as WinResult};
 
@@ -211,9 +212,10 @@ impl GraphicsDevice {
 
     /// Create a texture that Direct2D can use as a render target.
     ///
-    /// Used by the offscreen composition harness: the real overlay renders into a
-    /// composition swap chain, which D2D already accepts as a target.
-    #[cfg(test)]
+    /// Used by the offscreen composition harness and by the annotated export path:
+    /// the real overlay renders into a composition swap chain, which D2D already
+    /// accepts as a target, so a CPU-readable offscreen target is only needed when
+    /// pixels must be captured back rather than presented.
     pub fn create_render_target_texture(
         &self,
         width: u32,
@@ -518,6 +520,11 @@ impl AsyncSampleBuffer {
             self.context.CopySubresourceRegion(
                 &self.slots[slot], 0, 0, 0, 0, source, 0, Some(&src_box),
             );
+            // Map(DO_NOT_WAIT) only ever reports a *completed* copy once the
+            // command list has actually been submitted to the GPU; without this
+            // Flush the queued copy can sit in the driver buffer indefinitely and
+            // every poll just returns STILL_DRAWING.
+            self.context.Flush();
         }
         self.pending[slot] = true;
         Ok(slot)
@@ -556,8 +563,12 @@ impl AsyncSampleBuffer {
                 Some(Ok(pixels))
             }
             Err(e) => {
-                // S_FALSE (code 1) means the copy hasn't finished yet.
-                if e.code().0 == 1 {
+                // "Copy not finished yet" arrives as either S_FALSE (documented)
+                // or DXGI_ERROR_WAS_STILL_DRAWING — real drivers return the
+                // latter. Both are in-flight; treating them as terminal failures
+                // would leave the info panel on "......" forever.
+                let code = e.code().0;
+                if code == 1 || code == DXGI_ERROR_WAS_STILL_DRAWING.0 {
                     return None;
                 }
                 self.pending[slot] = false;
@@ -606,7 +617,7 @@ pub fn create_bitmap_from_texture(
 
 #[cfg(test)]
 mod tests {
-    use super::GraphicsDevice;
+    use super::{GraphicsDevice, ID3D11Texture2D};
     use ::windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use ::windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use ::windows::Win32::UI::WindowsAndMessaging::{
@@ -760,6 +771,59 @@ mod tests {
         assert_eq!((pixel_size.width, pixel_size.height), (64, 48));
         // Present on an unattached swap chain is allowed and must not error.
         device.present(&swap_chain).unwrap();
+    }
+
+    /// The magnifier colour path, end to end: a tile copy queued on the immediate
+    /// context must land in its staging slot within a few *non-blocking* polls —
+    /// the overlay polls once per 15 ms render tick and keeps the info panel on
+    /// "......" until a tile arrives. If a submitted copy never flushes, this
+    /// probe fails exactly where the real overlay shows "......" forever.
+    fn probe_async_sample(device: &GraphicsDevice, source: &ID3D11Texture2D) {
+        use super::{AsyncSampleBuffer, SAMPLE_TILE};
+        use std::time::{Duration, Instant};
+
+        let mut buffer = AsyncSampleBuffer::new(device.device(), device.context()).unwrap();
+        let slot = buffer.submit(source, 64, 64, SAMPLE_TILE).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(1_000);
+        loop {
+            if let Some(result) = buffer.poll(slot) {
+                let pixels = result.expect("sample staging map failed");
+                assert_eq!(pixels.len(), (SAMPLE_TILE * SAMPLE_TILE * 4) as usize);
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "async sample never completed: the queued copy is not being flushed"
+            );
+            std::thread::sleep(Duration::from_millis(15));
+        }
+    }
+
+    #[test]
+    fn async_sample_from_an_uploaded_texture_lands_within_a_few_ticks() {
+        let Ok(device) = GraphicsDevice::create() else {
+            return;
+        };
+        let frame = device
+            .create_bgra_texture(256, 256, &vec![7u8; 256 * 256 * 4])
+            .unwrap();
+        probe_async_sample(&device, &frame.texture);
+    }
+
+    #[test]
+    fn async_sample_from_a_wgc_frame_lands_within_a_few_ticks() {
+        use crate::platform::windows::capture::monitor;
+
+        if !super::super::wgc::is_supported() {
+            eprintln!("Windows Graphics Capture unavailable; skipping the WGC sample probe");
+            return;
+        }
+        let Ok(device) = GraphicsDevice::create() else {
+            return;
+        };
+        let monitor = monitor::captured_monitor_at_cursor().unwrap();
+        let frame = super::super::wgc::capture_monitor(&device, &monitor).unwrap();
+        probe_async_sample(&device, &frame.texture);
     }
 }
 

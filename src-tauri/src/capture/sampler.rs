@@ -15,6 +15,33 @@ const THROTTLE_INTERVAL: Duration = Duration::from_micros(16_667);
 /// Tile size in pixels (must match `MagnifierConfig::tile_size`).
 const TILE_SIZE: i32 = 32;
 
+/// How the sampled colour is rendered in the magnifier info panel's secondary
+/// slot. `Hex` is no longer part of the `Shift` cycle — the info panel always
+/// shows it in its own dedicated slot, so only `Rgb` and `Hsl` alternate there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorFormat {
+    Hex,
+    Rgb,
+    Hsl,
+}
+
+impl Default for ColorFormat {
+    fn default() -> Self {
+        Self::Rgb
+    }
+}
+
+impl ColorFormat {
+    /// The next format in the `Shift` cycle (`Rgb <-> Hsl`). Anything not
+    /// already in the cycle (e.g. `Hex`) falls back to the cycle's start.
+    pub fn next(self) -> Self {
+        match self {
+            ColorFormat::Rgb => ColorFormat::Hsl,
+            ColorFormat::Hsl | ColorFormat::Hex => ColorFormat::Rgb,
+        }
+    }
+}
+
 /// Internal info about a sampling tile.
 #[derive(Debug, Clone)]
 struct TileInfo {
@@ -92,6 +119,15 @@ impl ColorSampler {
         self.last_submit = Some(now);
     }
 
+    /// Origin of the tile currently in-flight on the GPU, if any.
+    ///
+    /// The async completion must be labelled with the origin *submitted* — the
+    /// cursor may have drifted into another tile by the time the copy lands, and
+    /// recomputing the tile from the current cursor would misattribute the pixels.
+    pub fn pending_origin(&self) -> Option<Point> {
+        self.pending.as_ref().map(|p| p.origin)
+    }
+
     /// Called when the GPU copy completes and pixel data is available.
     ///
     /// `pixels` is 32×32 BGRA tightly packed (4096 bytes). Reads the center pixel
@@ -141,6 +177,20 @@ impl ColorSampler {
         self.hex.as_deref()
     }
 
+    /// The sampled colour rendered in `format`, ready for the info panel
+    /// (`#RRGGBB`, `rgb(r,g,b)` or `hsl(h,s%,l%)`).
+    pub fn formatted(&self, format: ColorFormat) -> Option<String> {
+        let (r, g, b) = self.rgb?;
+        Some(match format {
+            ColorFormat::Hex => format!("#{r:02X}{g:02X}{b:02X}"),
+            ColorFormat::Rgb => format!("rgb({r},{g},{b})"),
+            ColorFormat::Hsl => {
+                let (h, s, l) = rgb_to_hsl(r, g, b);
+                format!("hsl({h},{s}%,{l}%)")
+            }
+        })
+    }
+
     /// Current RGB tuple.
     pub fn rgb(&self) -> Option<(u8, u8, u8)> {
         self.rgb
@@ -166,6 +216,37 @@ impl Default for ColorSampler {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Convert 8-bit sRGB to HSL (hue in degrees 0..359, S/L in percent 0..100).
+pub fn rgb_to_hsl(r: u8, g: u8, b: u8) -> (u32, u32, u32) {
+    let rf = r as f32 / 255.0;
+    let gf = g as f32 / 255.0;
+    let bf = b as f32 / 255.0;
+    let max = rf.max(gf).max(bf);
+    let min = rf.min(gf).min(bf);
+    let lightness = (max + min) / 2.0;
+    let delta = max - min;
+    if delta == 0.0 {
+        return (0, 0, (lightness * 100.0).round() as u32);
+    }
+    let saturation = if lightness > 0.5 {
+        delta / (2.0 - max - min)
+    } else {
+        delta / (max + min)
+    };
+    let hue = if max == rf {
+        (gf - bf) / delta + if gf < bf { 6.0 } else { 0.0 }
+    } else if max == gf {
+        (bf - rf) / delta + 2.0
+    } else {
+        (rf - gf) / delta + 4.0
+    } * 60.0;
+    (
+        hue.round() as u32 % 360,
+        (saturation * 100.0).round() as u32,
+        (lightness * 100.0).round() as u32,
+    )
 }
 
 /// Read a pixel from a completed tile at the cursor's position.
@@ -287,6 +368,17 @@ mod tests {
     }
 
     #[test]
+    fn pending_origin_reports_the_submitted_tile() {
+        let mut sampler = ColorSampler::new();
+        assert_eq!(sampler.pending_origin(), None);
+        sampler.mark_submitted(Point::new(84, 84), Instant::now());
+        assert_eq!(sampler.pending_origin(), Some(Point::new(84, 84)));
+        // Completion clears the in-flight record.
+        sampler.complete(Point::new(84, 84), solid_tile(1, 2, 3), Point::new(100, 100));
+        assert_eq!(sampler.pending_origin(), None);
+    }
+
+    #[test]
     fn stale_preserves_last_color() {
         let mut sampler = ColorSampler::new();
         let tile_origin = Point::new(84, 84);
@@ -342,6 +434,41 @@ mod tests {
         pixels[3] = 255;
         sampler.complete(tile_origin, pixels, cursor);
         assert_eq!(sampler.hex(), Some("#EFCDAB"));
+    }
+
+    #[test]
+    fn formatted_renders_each_format() {
+        let mut sampler = ColorSampler::new();
+        // Pure red.
+        sampler.complete(Point::new(0, 0), solid_tile(255, 0, 0), Point::new(0, 0));
+        assert_eq!(sampler.formatted(ColorFormat::Hex).as_deref(), Some("#FF0000"));
+        assert_eq!(sampler.formatted(ColorFormat::Rgb).as_deref(), Some("rgb(255,0,0)"));
+        assert_eq!(sampler.formatted(ColorFormat::Hsl).as_deref(), Some("hsl(0,100%,50%)"));
+        // No sample yet → nothing to render.
+        sampler.reset();
+        assert_eq!(sampler.formatted(ColorFormat::Hex), None);
+    }
+
+    #[test]
+    fn format_cycles_rgb_and_hsl_only() {
+        let mut format = ColorFormat::default();
+        assert_eq!(format, ColorFormat::Rgb);
+        format = format.next();
+        assert_eq!(format, ColorFormat::Hsl);
+        format = format.next();
+        assert_eq!(format, ColorFormat::Rgb);
+    }
+
+    #[test]
+    fn rgb_to_hsl_known_colors() {
+        assert_eq!(rgb_to_hsl(255, 0, 0), (0, 100, 50)); // red
+        assert_eq!(rgb_to_hsl(0, 255, 0), (120, 100, 50)); // green
+        assert_eq!(rgb_to_hsl(0, 0, 255), (240, 100, 50)); // blue
+        assert_eq!(rgb_to_hsl(255, 255, 255), (0, 0, 100)); // white
+        assert_eq!(rgb_to_hsl(0, 0, 0), (0, 0, 0)); // black
+        assert_eq!(rgb_to_hsl(128, 128, 128), (0, 0, 50)); // grey
+        // Cyan sits at 180 degrees.
+        assert_eq!(rgb_to_hsl(0, 255, 255), (180, 100, 50));
     }
 
     #[test]

@@ -30,7 +30,7 @@ use windows_sys::Win32::{
     System::Threading::GetCurrentThreadId,
     UI::{
         Controls::WM_MOUSELEAVE,
-        Input::KeyboardAndMouse::SetFocus,
+        Input::KeyboardAndMouse::{GetKeyState, SetFocus, VK_CONTROL},
         WindowsAndMessaging::{
             IDC_ARROW, IDC_CROSS, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE,
             LoadCursorW,
@@ -50,13 +50,19 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::application::capture_service::{ArtifactEncoder, ArtifactDir, CaptureService};
+use crate::application::capture_service::{
+    ArtifactEncoder, ArtifactDir, CaptureService, SelectionPixels,
+};
+use crate::capture::annotation::{
+    AnnotationCommand, AnnotationDocument, AnnotationGeometry, AnnotationHandle, AnnotationId,
+    AnnotationItem, AnnotationKind, DocumentSnapshot,
+};
 use crate::capture::application::{CaptureEventSink, OverlayPlatform};
 use crate::capture::geometry::{
     Handle, MagnifierConfig, MonitorLayout, Point, Rect, ResizeMode, SelectionGeometry,
     magnifier_geometry,
 };
-use crate::capture::sampler::ColorSampler;
+use crate::capture::sampler::{ColorFormat, ColorSampler};
 use crate::capture::session::{CaptureSession, ExportOutcome};
 use crate::capture::{CaptureError, CaptureResult, CaptureState};
 
@@ -90,6 +96,10 @@ enum OverlayCommand {
     Start,
     Cancel,
     Confirm,
+    /// Wake-up sentinel for the annotation mailbox: the payload is drained from the
+    /// bounded channel, not from `wparam`, because a toolbar command carries arguments
+    /// (a colour, a width, a tool). Low frequency — one per toolbar click.
+    Annotation,
     Shutdown,
     /// Sentinel `wparam` on [`capture_worker::FRAME_READY_MESSAGE`] so the
     /// worker's wake-up shares the command dispatch path.
@@ -107,6 +117,7 @@ impl OverlayCommand {
             value if value == Self::Start as i32 => Some(Self::Start),
             value if value == Self::Cancel as i32 => Some(Self::Cancel),
             value if value == Self::Confirm as i32 => Some(Self::Confirm),
+            value if value == Self::Annotation as i32 => Some(Self::Annotation),
             value if value == Self::Shutdown as i32 => Some(Self::Shutdown),
             _ => None,
         }
@@ -132,6 +143,10 @@ pub struct WindowsOverlay {
     thread_id: String,
     thread: Mutex<Option<JoinHandle<()>>>,
     shared: Arc<Mutex<OverlayShared>>,
+    /// Producer end of the annotation mailbox. Tauri command threads push a toolbar
+    /// command here and post an [`OverlayCommand::Annotation`] wake-up; the overlay
+    /// thread owns the matching receiver and drains it on its own cadence.
+    annotation_tx: mpsc::SyncSender<AnnotationCommand>,
     shutting_down: AtomicBool,
 }
 
@@ -179,10 +194,13 @@ impl WindowsOverlay {
             window: None,
         }));
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        // Bounded so a stuck/slow overlay cannot let toolbar clicks pile up without
+        // limit; the capacity only needs to absorb a burst of discrete clicks.
+        let (annotation_tx, annotation_rx) = mpsc::sync_channel(64);
         let thread_shared = shared.clone();
         let thread = thread::Builder::new()
             .name("snapclip-capture-overlay".into())
-            .spawn(move || overlay_thread(service, sink, thread_shared, ready_tx))
+            .spawn(move || overlay_thread(service, sink, thread_shared, annotation_rx, ready_tx))
             .map_err(|error| format!("spawn overlay thread failed: {error}"))?;
 
         match ready_rx.recv() {
@@ -190,6 +208,7 @@ impl WindowsOverlay {
                 thread_id,
                 thread: Mutex::new(Some(thread)),
                 shared,
+                annotation_tx,
                 shutting_down: AtomicBool::new(false),
             }),
             Ok(Err(message)) => {
@@ -254,6 +273,22 @@ impl OverlayPlatform for WindowsOverlay {
             .map_err(|message| CaptureError::InvalidState(format!("confirm failed: {message}")))
     }
 
+    fn request_annotation(&self, command: AnnotationCommand) -> CaptureResult<()> {
+        // `try_send`, not `send`: a wedged overlay must never block a Tauri command
+        // thread. The bounded mailbox only needs to absorb a burst of clicks; if it is
+        // full the toolbar is simply told the overlay is not draining.
+        self.annotation_tx.try_send(command).map_err(|error| match error {
+            mpsc::TrySendError::Full(_) => CaptureError::InvalidState(
+                "annotation mailbox is full; the overlay is not draining".into(),
+            ),
+            mpsc::TrySendError::Disconnected(_) => {
+                CaptureError::InvalidState("overlay is not running".into())
+            }
+        })?;
+        self.post(OverlayCommand::Annotation)
+            .map_err(|message| CaptureError::InvalidState(format!("annotation command failed: {message}")))
+    }
+
     fn shutdown(&self) {
         // Order matters: `post` refuses to send once `shutting_down` is set, so the
         // shutdown message must go out first. Setting the flag first left the overlay
@@ -291,6 +326,28 @@ trait OverlayMessageHandler {
     unsafe fn handle(&mut self, message: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT>;
 }
 
+/// An in-progress annotation pointer gesture (overlay thread only).
+///
+/// A gesture spans one button-down / moves / button-up cycle. Undo snapshots are
+/// taken at gesture start and committed once at release, so a multi-move drag is a
+/// single undo step (docs/11 §8.2).
+enum AnnotationGesture {
+    /// Translating an existing item; `last` anchors the incremental delta.
+    Move {
+        id: AnnotationId,
+        snapshot: DocumentSnapshot,
+        last: Point,
+    },
+    /// Resizing an existing item by dragging one of its control points.
+    Resize {
+        id: AnnotationId,
+        handle: AnnotationHandle,
+        snapshot: DocumentSnapshot,
+    },
+    /// Drawing a new shape anchored at `start` (the draft tracks the pointer).
+    Create { start: Point },
+}
+
 /// Owns every session-scoped resource. Lives only on the overlay thread.
 struct OverlayController<D, E>
 where
@@ -313,11 +370,24 @@ where
     drag_mode: Option<ResizeMode>,
     cursor: Point,
     cursor_visible: bool,
-    dirty: Vec<Rect>,
+    dirty: bool,
     /// Pure color-sampling state machine (tile hit, throttle, hex formatting).
     sampler: ColorSampler,
+    /// Shift-cycled colour format shown in the magnifier info panel.
+    magnifier_color_format: ColorFormat,
+    /// When true the info-panel coordinate is relative to the selection origin (P toggle).
+    magnifier_relative: bool,
     /// The GPU slot index of the most recent async sample request.
     sample_slot: Option<usize>,
+    /// Object-based annotation document (L2 layer).
+    annotation_doc: AnnotationDocument,
+    /// Active annotation tool; `None` is the select / move / resize tool.
+    annotation_tool: Option<AnnotationKind>,
+    /// In-progress annotation pointer gesture, if the button is down.
+    annotation_gesture: Option<AnnotationGesture>,
+    /// Receiver end of the toolbar annotation mailbox; drained when an
+    /// [`OverlayCommand::Annotation`] wake-up arrives.
+    annotation_rx: mpsc::Receiver<AnnotationCommand>,
     /// Whether the coalescing render tick is currently armed (`SetTimer` running).
     render_armed: bool,
     /// Whether the session's graphics have been handed to the export worker.
@@ -340,12 +410,14 @@ where
         service: Arc<CaptureService<D, E>>,
         sink: Arc<dyn CaptureEventSink>,
         shared: Arc<Mutex<OverlayShared>>,
+        annotation_rx: mpsc::Receiver<AnnotationCommand>,
         window: HWND,
     ) -> Self {
         Self {
             service,
             sink,
             shared,
+            annotation_rx,
             window,
             worker: CaptureWorker::new(),
             export_worker: ExportWorker::new(),
@@ -355,9 +427,14 @@ where
             drag_mode: None,
             cursor: Point::default(),
             cursor_visible: false,
-            dirty: Vec::new(),
+            dirty: false,
             sampler: ColorSampler::new(),
+            magnifier_color_format: ColorFormat::default(),
+            magnifier_relative: false,
             sample_slot: None,
+            annotation_doc: AnnotationDocument::new(),
+            annotation_tool: None,
+            annotation_gesture: None,
             render_armed: false,
             graphics_released: false,
             session_counter: 0,
@@ -387,6 +464,31 @@ where
         let layout = self.layout();
         self.sink
             .on_state(&self.session_id(), self.session.state(), layout.as_ref());
+    }
+
+    /// Drain the toolbar annotation mailbox. Runs only on the overlay thread, so the
+    /// document needs no lock; a burst of clicks collapses into one repaint instead of
+    /// one per command (docs/11 §7.1 "工具栏不进入像素管线").
+    fn drain_annotation_commands(&mut self) {
+        let mut applied = false;
+        while let Ok(command) = self.annotation_rx.try_recv() {
+            self.apply_annotation_command(command);
+            applied = true;
+        }
+        if applied {
+            self.invalidate_all();
+        }
+    }
+
+    /// Route one toolbar command. Tool selection is controller-owned presentation
+    /// state; every document mutation is delegated to [`AnnotationDocument::execute`]
+    /// so the routing table lives beside the document, not scattered across the pump.
+    fn apply_annotation_command(&mut self, command: AnnotationCommand) {
+        match command {
+            AnnotationCommand::SelectTool => self.annotation_tool = None,
+            AnnotationCommand::Tool(kind) => self.annotation_tool = Some(kind),
+            other => self.annotation_doc.execute(other),
+        }
     }
 
     /// `F5`: submit a capture request and enter `Preparing`.
@@ -541,7 +643,7 @@ where
         // retains the previous swap-chain contents, so showing first would expose
         // the previous session's selection for one compositor frame. This first paint
         // is synchronous (not coalesced) precisely so it lands before `show_overlay`.
-        self.paint_now(None);
+        self.paint_now();
         self.show_overlay(&monitor.layout);
         eprintln!(
             "[snapclip][bench] stage=visible session={} prepare_elapsed_ms={}",
@@ -692,9 +794,14 @@ where
         // Stop the coalescing tick before releasing the renderer: a pending WM_TIMER
         // must not try to present into the graphics we are about to drop.
         self.disarm_render_tick();
-        self.dirty.clear();
+        self.dirty = false;
         self.sampler.reset();
+        self.magnifier_color_format = ColorFormat::default();
+        self.magnifier_relative = false;
         self.sample_slot = None;
+        self.annotation_doc.reset();
+        self.annotation_tool = None;
+        self.annotation_gesture = None;
         self.hide_overlay();
         // Renderer resources are session-owned. Dropping the renderer releases the
         // captured L0 bitmap, selection chrome, swap chain and composition visual;
@@ -738,11 +845,47 @@ where
         let dpi = self.session.dpi();
         // Region readback is the only step that touches the single-threaded D3D11
         // immediate context, so it stays here — synchronous, before the hand-off.
-        let prepared = self.service.prepare_selection(
-            &frozen.frame,
-            selection,
-            &FrozenFramePixels::new(frozen),
-        );
+        //
+        // With committed annotations, replay the same document through the D2D export
+        // path (chrome / selection box / draft suppressed) and crop the result, so the
+        // PNG is pixel-identical to the preview (docs/11 §8.2). With none, keep the
+        // direct frozen-frame region readback.
+        let prepared: CaptureResult<SelectionPixels> = if self.annotation_doc.items().is_empty() {
+            self.service.prepare_selection(
+                &frozen.frame,
+                selection,
+                &FrozenFramePixels::new(frozen),
+            )
+        } else {
+            // Mirror `prepare_selection`'s clip so `region` always equals the rect the
+            // exported BGRA actually covers (render_export crops to selection ∩ frame).
+            let clipped = selection.intersect(frozen.frame.rect());
+            let export_state = OverlayFrameState {
+                selection: clipped,
+                cursor: self.cursor,
+                cursor_visible: false,
+                show_chrome: false,
+                magnifier_rgb: None,
+                magnifier_hex_text: None,
+                magnifier_secondary_text: None,
+                magnifier_relative: false,
+                annotation_items: self.annotation_doc.items().to_vec(),
+                annotation_selected_id: None,
+                annotation_draft: None,
+            };
+            let Some(renderer) = self.renderer.as_mut() else {
+                self.cancel("annotation-export-without-renderer");
+                return;
+            };
+            renderer
+                .render_export(&export_state, None)
+                .map(|bgra| SelectionPixels {
+                    frame: frozen.frame.clone(),
+                    region: clipped,
+                    bgra,
+                })
+                .map_err(CaptureError::RenderFailed)
+        };
         let readback_ms = started_at.elapsed().as_millis();
         let prepared = match prepared {
             Ok(prepared) => prepared,
@@ -893,8 +1036,7 @@ where
         if !self.sampler.should_request(self.cursor, geometry.tile, now) {
             // Tile hit: extract color from cached pixels without GPU.
             if self.sampler.update_cursor(self.cursor) {
-                self.dirty.push(geometry.info_panel);
-                self.invalidate(None);
+                self.invalidate();
             }
             return;
         }
@@ -917,28 +1059,30 @@ where
         let Some(slot) = self.sample_slot.take() else { return; };
         let Some(renderer) = self.renderer.as_mut() else { return; };
         match renderer.poll_sample(slot) {
+            None => {
+                // Still in flight. Re-arm the tick so the poll keeps scheduling:
+                // once the pointer stops — precisely when the user is reading the
+                // colour value — no input event will ever arm another tick, and
+                // the landed result would sit unpicked (info panel stuck "......").
+                self.sample_slot = Some(slot);
+                self.arm_render_tick();
+            }
             Some(Ok(pixels)) => {
-                // Determine tile origin from the pending sampler state.
-                let dpi = renderer.layout().dpi;
-                let config = MagnifierConfig::default().scaled(dpi);
-                let geometry = magnifier_geometry(
-                    self.cursor,
-                    config,
-                    renderer.frame(),
-                    renderer.layout().local_work_area(),
-                );
-                let tile_origin = Point::new(geometry.tile.left, geometry.tile.top);
+                // Label the completion with the origin *submitted*, not one
+                // recomputed from the current cursor: the pointer can drift into
+                // another tile before the copy lands, which would misattribute
+                // every pixel in the tile.
+                let Some(tile_origin) = self.sampler.pending_origin() else {
+                    self.sampler.mark_stale();
+                    return;
+                };
                 self.sampler.complete(tile_origin, pixels, self.cursor);
                 if self.sampler.is_dirty() {
-                    self.dirty.push(geometry.info_panel);
+                    self.dirty = true;
                 }
             }
             Some(Err(_)) => {
                 self.sampler.mark_stale();
-            }
-            None => {
-                // Still in flight — re-register for next tick.
-                self.sample_slot = Some(slot);
             }
         }
     }
@@ -947,37 +1091,25 @@ where
 
     fn on_mouse_move(&mut self, client: POINT) {
         let point = Point::new(client.x, client.y);
-        let previous_cursor = self.cursor;
-        let was_visible = self.cursor_visible;
         self.cursor = point;
         self.cursor_visible = true;
 
-        let previous_selection = self.session.selection();
-        // The session owns the drag: the overlay only decides *whether* a drag is in
-        // progress, never how the geometry changes.
-        if self.drag_mode.is_some() {
-            self.session.pointer_moved(point);
-        }
-        let selection = self.session.selection();
-        self.update_cursor_shape(point);
-
-        if selection != previous_selection {
-            self.dirty.push(previous_selection);
-            self.dirty.push(selection);
-        }
-        // The magnifier and crosshair follow the cursor. Only those two regions need
-        // repainting: L0 and L1 are unchanged unless the selection moved, which is
-        // handled by the branch above.
-        if let Some(renderer) = self.renderer.as_ref() {
-            let mut cursor_damage = renderer.cursor_damage(point);
-            // The old cursor only leaves a mark if it was actually drawn.
-            if was_visible {
-                cursor_damage.extend(renderer.cursor_damage(previous_cursor));
+        if self.session.state() == CaptureState::Annotating {
+            // The pointer drives the annotation document, not the selection.
+            self.annotation_point_moved(point);
+            self.update_annotation_cursor(point);
+        } else {
+            // The session owns the drag: the overlay only decides *whether* a drag is in
+            // progress, never how the geometry changes.
+            if self.drag_mode.is_some() {
+                self.session.pointer_moved(point);
             }
-            self.dirty.extend(cursor_damage);
+            self.update_cursor_shape(point);
         }
+        // The magnifier and crosshair follow the cursor, so any move changes the image;
+        // `invalidate` coalesces it into a single full repaint per render tick.
         self.request_color_sample();
-        self.invalidate(None);
+        self.invalidate();
     }
 
     /// Pick the resize cursor for a monitor-local point.
@@ -1007,16 +1139,15 @@ where
     fn on_mouse_leave(&mut self) {
         if self.cursor_visible {
             self.cursor_visible = false;
-            // Only the magnifier and crosshair were drawn for the cursor.
-            if let Some(renderer) = self.renderer.as_ref() {
-                let damage = renderer.cursor_damage(self.cursor);
-                self.dirty.extend(damage);
-            }
-            self.invalidate(None);
+            self.invalidate();
         }
     }
 
     fn on_left_down(&mut self, client: POINT) {
+        if self.session.state() == CaptureState::Annotating {
+            self.annotation_point_down(Point::new(client.x, client.y));
+            return;
+        }
         if !matches!(
             self.session.state(),
             CaptureState::Selecting | CaptureState::Selected
@@ -1037,11 +1168,14 @@ where
             }
         });
         self.update_cursor_shape(point);
-        self.dirty.push(self.session.selection());
-        self.invalidate(None);
+        self.invalidate();
     }
 
     fn on_left_up(&mut self) {
+        if self.session.state() == CaptureState::Annotating {
+            self.annotation_point_up();
+            return;
+        }
         if !matches!(
             self.session.state(),
             CaptureState::Selecting | CaptureState::Selected
@@ -1063,8 +1197,7 @@ where
             self.session.state()
         );
         self.publish_state();
-        self.dirty.push(self.session.selection());
-        self.invalidate(None);
+        self.invalidate();
     }
 
     fn on_key_down(&mut self, key: u32) {
@@ -1080,37 +1213,320 @@ where
                     self.confirm();
                 }
             }
+            // 'A': Selected -> Annotating (selection is locked, tools go live).
+            k if k == b'A' as u32 && self.session.state() == CaptureState::Selected => {
+                if self.session.begin_annotating().is_ok() {
+                    self.publish_state();
+                    self.invalidate_all();
+                }
+            }
+            // VK_SHIFT (0x10): cycle colour display format (HEX → RGB → HSL → HEX).
+            0x10 if self.session.state().is_active() => {
+                self.magnifier_color_format = self.magnifier_color_format.next();
+                self.invalidate();
+            }
+            // 'C': copy the current colour value (in the active format) to clipboard.
+            k if k == b'C' as u32 && self.session.state().is_active() => {
+                self.copy_color_to_clipboard();
+            }
+            // 'P': toggle global screen ↔ selection-relative coordinate in the info panel.
+            k if k == b'P' as u32 && self.session.state().is_active() => {
+                self.magnifier_relative = !self.magnifier_relative;
+                self.invalidate();
+            }
+            _ if self.session.state() == CaptureState::Annotating => self.on_annotation_key(key),
             _ => {}
         }
     }
 
+    /// Copy the primary (`#RRGGBB`) colour string to the Windows clipboard via
+    /// arboard. Marks the write as excluded so the clip-monitor does not record
+    /// our own copy.
+    fn copy_color_to_clipboard(&mut self) {
+        let Some(text) = self.sampler.formatted(ColorFormat::Hex) else {
+            return;
+        };
+        match arboard::Clipboard::new() {
+            Ok(mut cb) => {
+                if let Err(error) = cb.set_text(text) {
+                    eprintln!("[snapclip][capture] colour copy failed: {error}");
+                } else {
+                    crate::platform::windows::clipboard::mark_clipboard_excluded();
+                }
+            }
+            Err(error) => eprintln!("[snapclip][capture] clipboard unavailable: {error}"),
+        }
+    }
+
+    /// Keyboard handling while the session is annotating.
+    fn on_annotation_key(&mut self, key: u32) {
+        // Tool selection: number row picks the tool, '1' returns to select/move.
+        let tool = match key {
+            k if k == b'1' as u32 => Some(None),
+            k if k == b'2' as u32 => Some(Some(AnnotationKind::Rectangle)),
+            k if k == b'3' as u32 => Some(Some(AnnotationKind::Ellipse)),
+            k if k == b'4' as u32 => Some(Some(AnnotationKind::Arrow)),
+            k if k == b'5' as u32 => Some(Some(AnnotationKind::Line)),
+            k if k == b'6' as u32 => Some(Some(AnnotationKind::Freehand)),
+            k if k == b'7' as u32 => Some(Some(AnnotationKind::Highlight)),
+            _ => None,
+        };
+        if let Some(tool) = tool {
+            self.annotation_tool = tool;
+            eprintln!("[snapclip][capture] annotate tool={tool:?}");
+            return;
+        }
+
+        let ctrl = unsafe { GetKeyState(VK_CONTROL as i32) < 0 };
+        match key {
+            k if ctrl && k == b'Z' as u32 => {
+                if self.annotation_doc.undo() {
+                    self.invalidate_all();
+                }
+            }
+            k if ctrl && k == b'Y' as u32 => {
+                if self.annotation_doc.redo() {
+                    self.invalidate_all();
+                }
+            }
+            k if ctrl && k == b'D' as u32 => {
+                if self.annotation_doc.selected_id().is_some() {
+                    self.annotation_doc.duplicate_selected();
+                    self.invalidate_all();
+                }
+            }
+            k if ctrl && k == b']' as u32 => {
+                if self.annotation_doc.selected_id().is_some() {
+                    self.annotation_doc.bring_to_front();
+                    self.invalidate_all();
+                }
+            }
+            k if ctrl && k == b'[' as u32 => {
+                if self.annotation_doc.selected_id().is_some() {
+                    self.annotation_doc.send_to_back();
+                    self.invalidate_all();
+                }
+            }
+            // Delete / Backspace remove the selected item.
+            0x2E | 0x08 => {
+                if self.annotation_doc.selected_id().is_some() {
+                    self.annotation_doc.delete_selected();
+                    self.invalidate_all();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ---- annotation interaction ------------------------------------------
+
+    /// Half-size, in physical pixels, of a control-point hit box.
+    fn annotation_handle_tol(&self) -> i32 {
+        (8.0 * self.session.dpi().max(96) as f32 / 96.0) as i32
+    }
+
+    /// Pointer moved while annotating: apply the active gesture; `invalidate` marks the
+    /// change and coalesces a full repaint into the next tick.
+    fn annotation_point_moved(&mut self, point: Point) {
+        // Destructure without holding a borrow of `self` across the `&mut self`
+        // document / dirty calls.
+        let gesture = self.annotation_gesture.take();
+        match gesture {
+            Some(AnnotationGesture::Move { id, snapshot, last }) => {
+                let dx = point.x - last.x;
+                let dy = point.y - last.y;
+                if dx != 0 || dy != 0 {
+                    self.annotation_doc.translate_item(id, dx, dy);
+                }
+                self.annotation_gesture = Some(AnnotationGesture::Move { id, snapshot, last: point });
+            }
+            Some(AnnotationGesture::Resize { id, handle, snapshot }) => {
+                self.annotation_doc.resize_item(id, handle, point);
+                self.annotation_gesture = Some(AnnotationGesture::Resize { id, handle, snapshot });
+            }
+            Some(g @ AnnotationGesture::Create { .. }) => {
+                if let AnnotationGesture::Create { start } = &g {
+                    self.update_draft_shape(*start, point);
+                }
+                self.annotation_gesture = Some(g);
+            }
+            None => {}
+        }
+        self.invalidate();
+    }
+
+    /// Drive the draft geometry from the press anchor to the current pointer.
+    fn update_draft_shape(&mut self, start: Point, current: Point) {
+        let kind = match self.annotation_doc.draft.as_ref() {
+            Some(d) => d.kind,
+            None => return,
+        };
+        match kind {
+            AnnotationKind::Freehand | AnnotationKind::Highlight => {
+                self.annotation_doc.push_draft_point(current);
+            }
+            _ => {
+                let geometry = match kind {
+                    AnnotationKind::Rectangle => AnnotationGeometry::Rect {
+                        bounds: Rect::from_corners(start, current),
+                    },
+                    AnnotationKind::Ellipse => AnnotationGeometry::Ellipse {
+                        bounds: Rect::from_corners(start, current),
+                    },
+                    AnnotationKind::Line => AnnotationGeometry::Line {
+                        start,
+                        end: current,
+                    },
+                    AnnotationKind::Arrow => AnnotationGeometry::Arrow {
+                        start,
+                        end: current,
+                    },
+                    _ => return,
+                };
+                self.annotation_doc.update_draft(geometry);
+            }
+        }
+    }
+
+    /// Initial geometry for a draft anchored at `point`.
+    fn initial_draft_geometry(kind: AnnotationKind, point: Point) -> AnnotationGeometry {
+        let degenerate = Rect::from_corners(point, point);
+        match kind {
+            AnnotationKind::Rectangle => AnnotationGeometry::Rect { bounds: degenerate },
+            AnnotationKind::Ellipse => AnnotationGeometry::Ellipse { bounds: degenerate },
+            AnnotationKind::Line => AnnotationGeometry::Line { start: point, end: point },
+            AnnotationKind::Arrow => AnnotationGeometry::Arrow { start: point, end: point },
+            AnnotationKind::Freehand => AnnotationGeometry::Freehand { points: vec![point] },
+            AnnotationKind::Highlight => AnnotationGeometry::Highlight { points: vec![point] },
+            AnnotationKind::Text => AnnotationGeometry::Text {
+                position: point,
+                content: String::new(),
+            },
+        }
+    }
+
+    /// A draft is committed only when it covers real pixels.
+    fn draft_is_significant(draft: &AnnotationItem) -> bool {
+        match &draft.geometry {
+            AnnotationGeometry::Rect { bounds } | AnnotationGeometry::Ellipse { bounds } => {
+                !bounds.is_empty()
+            }
+            AnnotationGeometry::Line { start, end } | AnnotationGeometry::Arrow { start, end } => {
+                start != end
+            }
+            AnnotationGeometry::Freehand { points } | AnnotationGeometry::Highlight { points } => {
+                points.len() >= 2
+            }
+            AnnotationGeometry::Text { .. } => false,
+        }
+    }
+
+    /// Pointer pressed while annotating: pick / start a move / start a resize, or
+    /// begin a new-shape draft for the active tool.
+    fn annotation_point_down(&mut self, point: Point) {
+        if self.annotation_tool.is_none() {
+            // Select tool: a control point resizes first, then the body moves.
+            if let Some(id) = self.annotation_doc.selected_id() {
+                if let Some(handle) = self.annotation_doc.handle_at(id, point, self.annotation_handle_tol()) {
+                    let snapshot = self.annotation_doc.snapshot();
+                    self.annotation_gesture = Some(AnnotationGesture::Resize { id, handle, snapshot });
+                    self.invalidate();
+                    return;
+                }
+            }
+            match self.annotation_doc.hit_test(point) {
+                Some(id) => {
+                    let snapshot = self.annotation_doc.snapshot();
+                    self.annotation_doc.select(Some(id));
+                    self.annotation_gesture = Some(AnnotationGesture::Move { id, snapshot, last: point });
+                }
+                None => self.annotation_doc.select(None),
+            }
+            self.invalidate();
+            return;
+        }
+        // Creation tool: begin a draft anchored at the press point.
+        let kind = self.annotation_tool.unwrap();
+        self.annotation_doc.start_draft(kind, Self::initial_draft_geometry(kind, point));
+        self.annotation_gesture = Some(AnnotationGesture::Create { start: point });
+        self.invalidate();
+    }
+
+    /// Pointer released while annotating: commit the active gesture as one undo step.
+    fn annotation_point_up(&mut self) {
+        match self.annotation_gesture.take() {
+            Some(AnnotationGesture::Move { snapshot, .. }) => {
+                self.annotation_doc.commit_drag(snapshot);
+            }
+            Some(AnnotationGesture::Resize { snapshot, .. }) => {
+                self.annotation_doc.commit_drag(snapshot);
+            }
+            Some(AnnotationGesture::Create { .. }) => {
+                let significant = self
+                    .annotation_doc
+                    .draft
+                    .as_ref()
+                    .map(Self::draft_is_significant)
+                    .unwrap_or(false);
+                if significant {
+                    self.annotation_doc.commit_draft();
+                } else {
+                    self.annotation_doc.clear_draft();
+                }
+            }
+            None => {}
+        }
+        self.invalidate();
+    }
+
+    /// Cursor for the select tool: resize over a handle, move over a body, arrow
+    /// otherwise. Creation tools always use the crosshair.
+    fn update_annotation_cursor(&mut self, point: Point) {
+        let cursor = if self.annotation_tool.is_some() {
+            IDC_CROSS
+        } else if self
+            .annotation_doc
+            .selected_id()
+            .and_then(|id| self.annotation_doc.handle_at(id, point, self.annotation_handle_tol()))
+            .is_some()
+        {
+            IDC_SIZEALL
+        } else if self.annotation_doc.hit_test(point).is_some() {
+            IDC_SIZEALL
+        } else {
+            IDC_ARROW
+        };
+        unsafe { SetCursor(LoadCursorW(null_mut(), cursor) as _) };
+    }
+
+    /// Mark the surface dirty for a discrete edit (undo / redo / delete / z-order /
+    /// toolbar command) and coalesce a full repaint into the next tick.
+    fn invalidate_all(&mut self) {
+        self.invalidate();
+    }
+
     // ---- rendering -------------------------------------------------------
 
-    /// Paint immediately: merge the pending invalidations and repaint the union.
+    /// Paint immediately with a full repaint.
     ///
     /// Used only for the synchronous first frame that must land before the window is
     /// shown (docs/11 §"隐藏状态完成一次完整绘制和 Present/Commit"). Interactive input
     /// goes through [`Self::invalidate`] instead so a burst of `WM_MOUSEMOVE`s collapses
     /// into one present per tick.
-    fn paint_now(&mut self, region: Option<Rect>) {
-        if let Some(region) = region {
-            self.dirty.push(region);
-        }
+    fn paint_now(&mut self) {
         self.disarm_render_tick();
-        let merged = merge_damage(&mut self.dirty);
-        self.render(merged);
+        self.dirty = false;
+        self.render();
     }
 
-    /// Record invalidation and coalesce it into the next render tick.
+    /// Mark the surface dirty and coalesce a full repaint into the next render tick.
     ///
     /// `WM_MOUSEMOVE` and the drag handlers only update state and call this; the actual
     /// draw happens once in [`Self::on_render_tick`], so a fast pointer produces at most
     /// one present per `RENDER_TICK_MS` (docs/11 §"一个 tick 最多一次 Present/Commit").
-    fn invalidate(&mut self, region: Option<Rect>) {
-        if let Some(region) = region {
-            self.dirty.push(region);
-        }
-        if self.renderer.is_none() || self.dirty.is_empty() {
+    fn invalidate(&mut self) {
+        self.dirty = true;
+        if self.renderer.is_none() {
             return;
         }
         self.arm_render_tick();
@@ -1133,19 +1549,19 @@ where
         }
     }
 
-    /// The coalescing tick body: draw everything accumulated since the last present once.
+    /// The coalescing tick body: repaint everything accumulated since the last present.
     fn on_render_tick(&mut self) {
         self.disarm_render_tick();
-        // Always poll the pending GPU sample — may extend dirty with info_panel.
+        // Always poll the pending GPU sample — may mark the info panel dirty.
         self.poll_color_sample();
-        if self.dirty.is_empty() {
+        if !self.dirty {
             return;
         }
-        let merged = merge_damage(&mut self.dirty);
-        self.render(merged);
+        self.dirty = false;
+        self.render();
     }
 
-    fn render(&mut self, damage: Vec<Rect>) {
+    fn render(&mut self) {
         // An export is in flight: the overlay is frozen at the confirmed selection
         // and must not present, so nothing races the hand-off (see confirm()).
         if self.graphics_released {
@@ -1155,31 +1571,12 @@ where
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
-        // Phase 0 observability: the per-Present cost. An empty damage list is a
-        // full-surface repaint (WM_PAINT, first frame). Phase 2 must shrink the
-        // crosshair-dominated bbox recorded here.
-        let frame = renderer.frame();
-        let (rects, damaged_px, bbox) = if damage.is_empty() {
-            (0usize, frame.area(), frame)
-        } else {
-            let mut union = damage[0];
-            let mut area: i64 = 0;
-            for rect in &damage {
-                union = union.union(*rect);
-                area += rect.area();
-            }
-            (damage.len(), area, union)
-        };
+        // Every present repaints the whole surface (see OverlayRenderer::draw_to); the
+        // render tick is what bounds the present rate to ~60 Hz.
         eprintln!(
-            "[snapclip][capture] render session={} rects={} damaged_px={} bbox=({},{},{},{}) frame_px={}",
+            "[snapclip][capture] render session={} frame_px={}",
             session_id,
-            rects,
-            damaged_px,
-            bbox.left,
-            bbox.top,
-            bbox.right,
-            bbox.bottom,
-            frame.area()
+            renderer.frame().area()
         );
         let cursor_visible = self.cursor_visible && self.session.state().is_active();
         let state = OverlayFrameState {
@@ -1187,19 +1584,31 @@ where
             cursor: self.cursor,
             cursor_visible,
             show_chrome: self.session.shows_chrome(),
-            damage,
             magnifier_rgb: self.sampler.rgb(),
-            magnifier_hex: self.sampler.hex().map(|s| s.to_owned()),
+            magnifier_hex_text: self.sampler.formatted(ColorFormat::Hex),
+            magnifier_secondary_text: self.sampler.formatted(self.magnifier_color_format),
+            magnifier_relative: self.magnifier_relative,
+            annotation_items: self.annotation_doc.items().to_vec(),
+            annotation_selected_id: self.annotation_doc.selected_id(),
+            annotation_draft: self.annotation_doc.draft.clone(),
         };
-        if let Err(error) = renderer.render(&state) {
-            if Win32Renderer::is_device_lost(&error) {
-                eprintln!("[snapclip][capture] graphics device removed: {error}");
-                self.renderer = None;
-                self.worker.invalidate_providers();
-                self.fail(None, CaptureError::DeviceRemoved(error), "overlay");
-            } else {
-                eprintln!("[snapclip][capture] render failed: {error}");
-                self.fail(None, CaptureError::RenderFailed(error), "overlay");
+        // Live borrow of annotation document avoids cloning items every tick.
+        match renderer.render(&state, Some(&self.annotation_doc)) {
+            Ok(()) => {
+                // The presented frame now carries the sampler's current value;
+                // clear the flag so a settled colour stops scheduling repaints.
+                self.sampler.mark_rendered();
+            }
+            Err(error) => {
+                if Win32Renderer::is_device_lost(&error) {
+                    eprintln!("[snapclip][capture] graphics device removed: {error}");
+                    self.renderer = None;
+                    self.worker.invalidate_providers();
+                    self.fail(None, CaptureError::DeviceRemoved(error), "overlay");
+                } else {
+                    eprintln!("[snapclip][capture] render failed: {error}");
+                    self.fail(None, CaptureError::RenderFailed(error), "overlay");
+                }
             }
         }
     }
@@ -1256,6 +1665,7 @@ where
                     }
                     Some(OverlayCommand::FrameReady) => self.on_frame_ready(),
                     Some(OverlayCommand::ExportReady) => self.on_export_ready(),
+                    Some(OverlayCommand::Annotation) => self.drain_annotation_commands(),
                     None => {}
                 }
                 Some(0)
@@ -1321,7 +1731,7 @@ where
                 // HDC is intentionally unused.
                 let mut paint: PAINTSTRUCT = unsafe { zeroed() };
                 unsafe { BeginPaint(self.window, &mut paint) };
-                self.render(Vec::new());
+                self.render();
                 unsafe { EndPaint(self.window, &paint) };
                 Some(0)
             }
@@ -1356,24 +1766,6 @@ where
     }
 }
 
-/// Merge a dirty list into a small set of disjoint-ish rectangles.
-fn merge_damage(dirty: &mut Vec<Rect>) -> Vec<Rect> {
-    let mut merged: Vec<Rect> = Vec::with_capacity(4);
-    for rect in dirty.drain(..) {
-        if rect.is_empty() {
-            continue;
-        }
-        match merged
-            .iter_mut()
-            .find(|existing| !existing.intersect(rect).is_empty())
-        {
-            Some(existing) => *existing = existing.union(rect),
-            None => merged.push(rect),
-        }
-    }
-    merged
-}
-
 fn point_from_lparam(lparam: LPARAM) -> POINT {
     POINT {
         x: (lparam & 0xFFFF) as u16 as i16 as i32,
@@ -1385,6 +1777,7 @@ fn overlay_thread<D, E>(
     service: Arc<CaptureService<D, E>>,
     sink: Arc<dyn CaptureEventSink>,
     shared: Arc<Mutex<OverlayShared>>,
+    annotation_rx: mpsc::Receiver<AnnotationCommand>,
     ready: mpsc::SyncSender<SystemResult>,
 ) where
     D: ArtifactDir,
@@ -1484,7 +1877,7 @@ fn overlay_thread<D, E>(
     }
 
     let mut controller: Box<dyn OverlayMessageHandler> =
-        Box::new(OverlayController::new(service, sink, shared, window));
+        Box::new(OverlayController::new(service, sink, shared, annotation_rx, window));
     let handler_ptr = (&mut controller) as *mut Box<dyn OverlayMessageHandler>;
     ACTIVE_HANDLER.with(|slot| slot.set(handler_ptr));
 
@@ -1577,8 +1970,7 @@ unsafe extern "system" {
 
 #[cfg(test)]
 mod tests {
-    use super::{merge_damage, point_from_lparam, OverlayCommand};
-    use crate::capture::geometry::Rect;
+    use super::{point_from_lparam, OverlayCommand};
 
     /// `WS_EX_NOACTIVATE`.
     ///
@@ -1646,27 +2038,6 @@ mod tests {
             assert_eq!(OverlayCommand::from_wparam(command as usize), Some(command));
         }
         assert_eq!(OverlayCommand::from_wparam(9999), None);
-    }
-
-    #[test]
-    fn damage_rectangles_merge_when_they_overlap() {
-        let mut dirty = vec![
-            Rect::new(0, 0, 100, 100),
-            Rect::new(50, 50, 150, 150),
-            Rect::new(400, 400, 500, 500),
-        ];
-        let merged = merge_damage(&mut dirty);
-        assert!(dirty.is_empty());
-        assert_eq!(merged.len(), 2, "overlapping rects collapse into one");
-        assert_eq!(merged[0], Rect::new(0, 0, 150, 150));
-        assert_eq!(merged[1], Rect::new(400, 400, 500, 500));
-    }
-
-    #[test]
-    fn empty_damage_rectangles_are_dropped() {
-        let mut dirty = vec![Rect::default(), Rect::new(1, 1, 2, 2), Rect::default()];
-        let merged = merge_damage(&mut dirty);
-        assert_eq!(merged, vec![Rect::new(1, 1, 2, 2)]);
     }
 }
 

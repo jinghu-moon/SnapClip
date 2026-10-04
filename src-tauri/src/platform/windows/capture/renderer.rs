@@ -11,6 +11,7 @@
 
 use std::sync::Arc;
 
+use crate::capture::annotation::{AnnotationDocument, AnnotationId, AnnotationItem};
 use crate::capture::geometry::{MonitorLayout, Point, Rect};
 
 use super::providers::FrozenFrame;
@@ -25,12 +26,21 @@ pub struct OverlayFrameState {
     pub cursor: Point,
     pub cursor_visible: bool,
     pub show_chrome: bool,
-    /// Regions invalidated since the previous draw.
-    pub damage: Vec<Rect>,
     /// Current color sample RGB from the magnifier sampler.
     pub magnifier_rgb: Option<(u8, u8, u8)>,
-    /// Formatted #RRGGBB hex string from the magnifier sampler.
-    pub magnifier_hex: Option<String>,
+    /// `#RRGGBB` — always shown in the info panel's primary slot.
+    pub magnifier_hex_text: Option<String>,
+    /// Shift-cycled secondary value (`rgb(...)` / `hsl(...)`) shown beside it.
+    pub magnifier_secondary_text: Option<String>,
+    /// Info-panel coordinate is relative to the selection origin (P toggle).
+    pub magnifier_relative: bool,
+    // ── Annotations ───────────────────────────────────────────────────────────
+    /// Committed annotation items to render at L2 (after mask, before chrome).
+    pub annotation_items: Vec<AnnotationItem>,
+    /// Id of the currently selected annotation (shows selection box).
+    pub annotation_selected_id: Option<AnnotationId>,
+    /// Item currently being drawn (not yet committed).
+    pub annotation_draft: Option<AnnotationItem>,
 }
 
 impl OverlayFrameState {
@@ -40,9 +50,13 @@ impl OverlayFrameState {
             cursor: Point::default(),
             cursor_visible: false,
             show_chrome: false,
-            damage: Vec::new(),
             magnifier_rgb: None,
-            magnifier_hex: None,
+            magnifier_hex_text: None,
+            magnifier_secondary_text: None,
+            magnifier_relative: false,
+            annotation_items: Vec::new(),
+            annotation_selected_id: None,
+            annotation_draft: None,
         }
     }
 }
@@ -118,31 +132,6 @@ impl Win32Renderer {
         Ok(())
     }
 
-    /// Damage caused by the cursor overlay at `cursor`.
-    ///
-    /// The magnifier panel and the *local* reticle are the only things that move with
-    /// the cursor, so this is what a mouse move has to repaint. Handing this to the
-    /// renderer keeps one implementation of the pointer geometry: the drawing code and
-    /// the invalidation code call the same `magnifier_geometry` and `crosshair_geometry`.
-    /// The reticle is deliberately not full-frame, so a hover unions to a small box
-    /// instead of the whole monitor (docs/11 §5.1).
-    pub fn cursor_damage(&self, cursor: Point) -> Vec<Rect> {
-        let metrics = self.d2d.metrics();
-        let config = crate::capture::geometry::MagnifierConfig::default().scaled(metrics.dpi);
-        let geometry = crate::capture::geometry::magnifier_geometry(
-            cursor,
-            config,
-            self.frame,
-            self.layout.local_work_area(),
-        );
-        let reticle = crate::capture::geometry::crosshair_geometry(
-            cursor,
-            crate::capture::geometry::crosshair_radius(metrics.dpi),
-            self.frame,
-        );
-        vec![geometry.bounds, reticle.bounds]
-    }
-
     /// Bind the frozen frame as the L0 layer.
     ///
     /// When the provider produced a GPU texture the bitmap is created directly over it,
@@ -163,7 +152,24 @@ impl Win32Renderer {
     }
 
     /// Draw and present one frame.
-    pub fn render(&mut self, state: &OverlayFrameState) -> Result<(), String> {
+    ///
+    /// `annotations` is borrowed from the overlay controller so we can avoid
+    /// cloning the item list every tick; `OverlayFrameState.annotation_items`
+    /// carries the data when the controller wants to decouple.
+    pub fn render(
+        &mut self,
+        state: &OverlayFrameState,
+        annotations: Option<&AnnotationDocument>,
+    ) -> Result<(), String> {
+        // Build the RenderView. Prefer live borrow when available.
+        let live_items: Vec<AnnotationItem> = annotations
+            .map(|d| d.items().to_vec())
+            .unwrap_or_else(|| state.annotation_items.clone());
+        let live_selected = annotations.and_then(|d| d.selected_id()).or(state.annotation_selected_id);
+        let live_draft = annotations
+            .and_then(|d| d.draft.clone())
+            .or(state.annotation_draft.clone());
+
         let view = RenderView {
             frame: self.frame,
             selection: state.selection,
@@ -172,13 +178,50 @@ impl Win32Renderer {
             cursor_visible: state.cursor_visible,
             show_chrome: state.show_chrome,
             work_area: self.layout.local_work_area(),
-            damage: state.damage.clone(),
             magnifier_rgb: state.magnifier_rgb,
-            magnifier_hex: state.magnifier_hex.clone(),
+            magnifier_hex_text: state.magnifier_hex_text.clone(),
+            magnifier_secondary_text: state.magnifier_secondary_text.clone(),
+            magnifier_relative: state.magnifier_relative,
+            annotation_items: live_items,
+            annotation_selected_id: live_selected,
+            annotation_draft: live_draft,
         };
         self.d2d.render(&view)?;
         self.d2d.present()?;
         self.composition.commit()
+    }
+
+    /// Produce the annotated export for `state.selection`.
+    ///
+    /// Replays the same [`AnnotationDocument`] the preview drew, but with chrome,
+    /// cursor, the selection box and the draft suppressed, and reads the selected
+    /// region back to CPU BGRA. This is what keeps the PNG pixel-identical to the
+    /// screen crop (docs/11 §8.2 "导出和预览重放同一份文档").
+    pub fn render_export(
+        &mut self,
+        state: &OverlayFrameState,
+        annotations: Option<&AnnotationDocument>,
+    ) -> Result<Vec<u8>, String> {
+        let live_items: Vec<AnnotationItem> = annotations
+            .map(|d| d.items().to_vec())
+            .unwrap_or_else(|| state.annotation_items.clone());
+        let view = RenderView {
+            frame: self.frame,
+            selection: state.selection,
+            cursor: state.cursor,
+            screen_origin: Point::new(self.layout.bounds.left, self.layout.bounds.top),
+            cursor_visible: false,
+            show_chrome: false,
+            work_area: self.layout.local_work_area(),
+            magnifier_rgb: None,
+            magnifier_hex_text: None,
+            magnifier_secondary_text: None,
+            magnifier_relative: false,
+            annotation_items: live_items,
+            annotation_selected_id: None,
+            annotation_draft: None,
+        };
+        self.d2d.render_export(&view)
     }
 
     /// Whether a failure message indicates a lost graphics device.

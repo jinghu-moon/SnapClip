@@ -23,6 +23,41 @@ export type CaptureState =
 
 export type PublicationOrigin = "clipboard" | "capture";
 
+/**
+ * Annotation tool kinds, mirroring the Rust `AnnotationKind` (camelCase).
+ */
+export type AnnotationKind =
+  | "rectangle"
+  | "ellipse"
+  | "arrow"
+  | "line"
+  | "text"
+  | "freehand"
+  | "highlight";
+
+/** RGBA channel, each in 0.0–1.0. */
+export type Rgba = [number, number, number, number];
+
+/**
+ * A coarse toolbar command, mirroring the Rust `AnnotationCommand`.
+ *
+ * Serde's default externally-tagged shape: unit variants are bare strings, single-
+ * payload variants are a one-key object. Deliberately low-frequency — the toolbar
+ * never drives per-pixel or per-move work (docs/11 §7.1).
+ */
+export type AnnotationCommand =
+  | "selectTool"
+  | { tool: AnnotationKind }
+  | { setStrokeColor: Rgba }
+  | { setFillColor: Rgba | null }
+  | { setStrokeWidth: number }
+  | "undo"
+  | "redo"
+  | "delete"
+  | "duplicate"
+  | "bringForward"
+  | "sendBackward";
+
 export type PayloadKind =
   | "text"
   | "html"

@@ -3,8 +3,7 @@
 //! Layer order, back to front:
 //! 1. **L0** the frozen capture frame, drawn 1:1 so the selection stays pixel exact;
 //! 2. **L1** a translucent dark mask over everything *except* the selection, drawn
-//!    as four rectangles so the selected pixels keep their original brightness and
-//!    so a drag only invalidates the union of the old and new selection;
+//!    as four rectangles so the selected pixels keep their original brightness;
 //! 3. **L2** rounded border, eight grips, the `width × height` label and the
 //!    magnifier.
 //!
@@ -15,28 +14,34 @@
 use windows_numerics::Vector2;
 use std::sync::Arc;
 use ::windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_ALPHA_MODE_IGNORE, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F,
-    D2D_SIZE_U,
+    D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
+    D2D_RECT_F, D2D_SIZE_U,
 };
 use ::windows::Win32::Graphics::Direct2D::{
-    D2D1_ANTIALIAS_MODE_ALIASED, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_OPTIONS_NONE,
-    D2D1_BITMAP_PROPERTIES1,
-    D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_ROUNDED_RECT,
-    D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1_ELLIPSE, ID2D1Bitmap1, ID2D1DeviceContext,
-    ID2D1SolidColorBrush,
+    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_OPTIONS_NONE,
+    D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1,
+    D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+    D2D1_LAYER_PARAMETERS1, D2D1_ROUNDED_RECT,
+    D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1_ELLIPSE,
+    ID2D1Bitmap1, ID2D1DeviceContext, ID2D1Geometry, ID2D1SolidColorBrush,
 };
 use ::windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use ::windows::Win32::Graphics::DirectWrite::{
-    DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
-    DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_METRICS, DWriteCreateFactory, IDWriteFactory,
+    DWRITE_FACTORY_TYPE_ISOLATED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+    DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL,
+    DWRITE_FONT_WEIGHT_SEMI_BOLD,
+    DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+    DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_METRICS,
+    DWriteCreateFactory, IDWriteFactory,
     IDWriteTextFormat,
 };
 use ::windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+use ::windows::Win32::Graphics::Gdi::AddFontMemResourceEx;
 use ::windows::Win32::Graphics::Dxgi::IDXGISwapChain1;
-use ::windows::core::PCWSTR;
+use ::windows::core::{Interface, PCWSTR};
 
 use super::d3d11::GraphicsDevice;
+use crate::capture::annotation::{AnnotationGeometry, AnnotationItem, AnnotationKind};
 use crate::capture::geometry::{Handle, MagnifierConfig, Point, Rect, SizeLabelPlacement};
 
 /// The font family used for the size label, per the tasklist (§6.3).
@@ -48,6 +53,45 @@ const LABEL_FONT_SIZE_DIP: f32 = 12.0;
 const BORDER_WIDTH_DIP: f32 = 1.5;
 /// Diameter of each solid circular grip in DIP.
 const HANDLE_SIZE_DIP: f32 = 12.0;
+
+/// Monospace family used for every numeric value in the magnifier info panel.
+const MONO_FONT_FAMILY: &str = "Consolas";
+const MONO_FONT_FALLBACK: &str = "Lucida Console";
+
+/// The info panel's primary typeface: a subsetted HarmonyOS Sans SC carrying only
+/// the Latin/digit/punctuation glyphs and the handful of CJK characters the panel
+/// draws (`格式复制坐标`). Embedded verbatim and registered privately for this
+/// process at renderer start, so no system font install or admin rights are needed.
+const INFO_EMBEDDED_FONT: &[u8] =
+    include_bytes!("../../../../../fonts/harmonyos-sans-sc-subset.ttf");
+/// Family name the embedded subset registers under (its name table was reduced to
+/// this single English entry during subsetting).
+const INFO_FONT_FAMILY: &str = "HarmonyOS Sans SC";
+
+/// Info-panel layout, in DIP at 96 DPI (see `RenderMetrics::for_dpi` for the
+/// scaling rule — everything here is multiplied by the same factor).
+/// Vertical/horizontal padding of the whole strip, and the gap between its
+/// three rows.
+const INFO_PADDING_V_DIP: f32 = 8.0;
+const INFO_PADDING_H_DIP: f32 = 10.0;
+const INFO_ROW_GAP_DIP: f32 = 8.0;
+/// Row 1: colour swatch size, corner radius and the gap to the value group.
+const INFO_SWATCH_SIZE_DIP: f32 = 20.0;
+const INFO_SWATCH_RADIUS_DIP: f32 = 4.0;
+const INFO_SWATCH_GAP_DIP: f32 = 8.0;
+/// Row 1: HEX (primary, large) and RGB/HSL (secondary, small) font sizes.
+const INFO_HEX_FONT_DIP: f32 = 11.0;
+const INFO_SECONDARY_FONT_DIP: f32 = 9.0;
+/// Row 2: coordinate label (X/Y) and value font sizes, plus intra/inter spacing.
+const INFO_COORD_LABEL_FONT_DIP: f32 = 9.0;
+const INFO_COORD_VALUE_FONT_DIP: f32 = 10.0;
+const INFO_COORD_LABEL_VALUE_GAP_DIP: f32 = 4.0;
+const INFO_COORD_ITEM_GAP_DIP: f32 = 12.0;
+/// Row 3: shortcut-hint font size, `<kbd>`-box padding and corner radius.
+const INFO_HINT_FONT_DIP: f32 = 8.0;
+const INFO_KBD_PADDING_DIP: f32 = 1.0;
+const INFO_KBD_RADIUS_DIP: f32 = 2.0;
+const INFO_KBD_TEXT_GAP_DIP: f32 = 3.0;
 
 /// Mask colour (opaque black at 45% opacity). Configurable in one place so the
 /// light/dark-background acceptance can be re-run with a different value.
@@ -129,12 +173,22 @@ pub struct RenderView {
     pub show_chrome: bool,
     /// Work area used to keep the label and magnifier on screen.
     pub work_area: Rect,
-    /// Regions that must be repainted; empty means "repaint everything".
-    pub damage: Vec<Rect>,
     /// Current color sample as RGB tuple for the info-panel swatch.
     pub magnifier_rgb: Option<(u8, u8, u8)>,
-    /// Formatted #RRGGBB hex string from the async sampler.
-    pub magnifier_hex: Option<String>,
+    /// `#RRGGBB` — always shown in the info panel's primary colour slot.
+    pub magnifier_hex_text: Option<String>,
+    /// Shift-cycled secondary value (`rgb(...)` / `hsl(...)`) shown beside it.
+    pub magnifier_secondary_text: Option<String>,
+    /// Show the info-panel coordinate relative to the selection origin instead
+    /// of as a global screen position (the P toggle).
+    pub magnifier_relative: bool,
+    // ── Annotations ───────────────────────────────────────────────────────────
+    /// Committed annotation items to render at L2.
+    pub annotation_items: Vec<crate::capture::annotation::AnnotationItem>,
+    /// Id of the currently selected annotation (drives selection box drawing).
+    pub annotation_selected_id: Option<crate::capture::annotation::AnnotationId>,
+    /// Item being actively drawn (draft, not yet in `annotation_items`).
+    pub annotation_draft: Option<crate::capture::annotation::AnnotationItem>,
 }
 
 impl RenderView {
@@ -152,9 +206,13 @@ impl RenderView {
             cursor_visible: false,
             show_chrome: false,
             work_area: frame,
-            damage: Vec::new(),
             magnifier_rgb: None,
-            magnifier_hex: None,
+            magnifier_hex_text: None,
+            magnifier_secondary_text: None,
+            magnifier_relative: false,
+            annotation_items: Vec::new(),
+            annotation_selected_id: None,
+            annotation_draft: None,
         }
     }
 }
@@ -170,10 +228,12 @@ struct ChromeResources {
     label_background: ID2D1SolidColorBrush,
     label_text: ID2D1SolidColorBrush,
     crosshair: ID2D1SolidColorBrush,
-    magnifier_border: ID2D1SolidColorBrush,
+    /// Light-blue translucent row/column bands through the sampled pixel.
+    magnifier_band: ID2D1SolidColorBrush,
     magnifier_grid: ID2D1SolidColorBrush,
+    /// Near-black: info-panel background, panel outline and the sampled cell's
+    /// counter-stroke.
     magnifier_info: ID2D1SolidColorBrush,
-    magnifier_focus: ID2D1SolidColorBrush,
 }
 
 /// Overlay renderer: owns the D2D/DirectWrite resources and the swap chain.
@@ -191,10 +251,43 @@ pub struct OverlayRenderer {
     label_background_brush: Option<ID2D1SolidColorBrush>,
     label_text_brush: Option<ID2D1SolidColorBrush>,
     crosshair_brush: Option<ID2D1SolidColorBrush>,
-    magnifier_border_brush: Option<ID2D1SolidColorBrush>,
+    magnifier_band_brush: Option<ID2D1SolidColorBrush>,
     magnifier_grid_brush: Option<ID2D1SolidColorBrush>,
     magnifier_info_brush: Option<ID2D1SolidColorBrush>,
-    magnifier_focus_brush: Option<ID2D1SolidColorBrush>,
+    // ── Magnifier info-panel palette (glassmorphism strip) ──
+    /// `rgba(20,20,20,0.4)` — the translucent background of the whole strip.
+    info_bg_brush: Option<ID2D1SolidColorBrush>,
+    /// `#3b82f6` — the theme-blue `X`/`Y` coordinate labels.
+    info_accent_brush: Option<ID2D1SolidColorBrush>,
+    /// Pure white — the primary HEX value.
+    info_hex_brush: Option<ID2D1SolidColorBrush>,
+    /// `#888` — the secondary RGB/HSL value.
+    info_secondary_brush: Option<ID2D1SolidColorBrush>,
+    /// `#aaa` — coordinate numeric values.
+    info_coord_value_brush: Option<ID2D1SolidColorBrush>,
+    /// `#777` — shortcut-hint description text ("格式" / "复制" / "坐标").
+    info_hint_brush: Option<ID2D1SolidColorBrush>,
+    /// `#ccc` — the key text drawn inside a `<kbd>` box.
+    info_kbd_text_brush: Option<ID2D1SolidColorBrush>,
+    /// `rgba(255,255,255,0.1)` — the `<kbd>` box fill.
+    info_kbd_fill_brush: Option<ID2D1SolidColorBrush>,
+    /// A slightly darker translucent white used as the `<kbd>` box's bottom
+    /// edge, faking the box-shadow's 3D lip without a real shadow effect.
+    info_kbd_bottom_brush: Option<ID2D1SolidColorBrush>,
+    /// Semi-transparent grey-white 1px border around the colour swatch.
+    info_swatch_border_brush: Option<ID2D1SolidColorBrush>,
+    /// Translucent black inner stroke, faking the swatch's inset shadow.
+    info_swatch_inset_brush: Option<ID2D1SolidColorBrush>,
+    /// Reusable mutable brush whose `SetColor` is updated to the sampled pixel
+    /// every frame, avoiding a fresh brush per repaint.
+    info_swatch_fill_brush: Option<ID2D1SolidColorBrush>,
+    /// Cache of every info-panel font variant, keyed by
+    /// `(family slot, rounded DIP size * 100, weight as u32, alignment as u32)`.
+    info_formats: Vec<((u8, u32, u32, u32), IDWriteTextFormat)>,
+    /// Mutable stroke brush reused for all annotation items (SetColor per item).
+    ann_stroke_brush: Option<ID2D1SolidColorBrush>,
+    /// Mutable fill brush reused for filled annotation items.
+    ann_fill_brush: Option<ID2D1SolidColorBrush>,
     metrics: RenderMetrics,
     size: (u32, u32),
 }
@@ -202,7 +295,14 @@ pub struct OverlayRenderer {
 impl OverlayRenderer {
     pub fn new(device: Arc<GraphicsDevice>, dpi: u32) -> Result<Self, String> {
         let d2d = device.create_d2d_context()?;
-        let dwrite: IDWriteFactory = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) }
+        // Register the embedded subset *before* the DirectWrite factory is created,
+        // then build an isolated factory whose first enumeration already contains
+        // "HarmonyOS Sans SC". windows-rs does not bind
+        // IDWriteFactory::ReloadSystemFonts, and a shared factory may have been
+        // cached earlier by another subsystem, so an isolated factory is what
+        // guarantees the private in-memory font resolves by family name.
+        register_info_font_once();
+        let dwrite: IDWriteFactory = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED) }
             .map_err(|error| super::hresult("DWriteCreateFactory", &error))?;
         Ok(Self {
             device,
@@ -218,10 +318,24 @@ impl OverlayRenderer {
             label_background_brush: None,
             label_text_brush: None,
             crosshair_brush: None,
-            magnifier_border_brush: None,
+            magnifier_band_brush: None,
             magnifier_grid_brush: None,
             magnifier_info_brush: None,
-            magnifier_focus_brush: None,
+            info_bg_brush: None,
+            info_accent_brush: None,
+            info_hex_brush: None,
+            info_secondary_brush: None,
+            info_coord_value_brush: None,
+            info_hint_brush: None,
+            info_kbd_text_brush: None,
+            info_kbd_fill_brush: None,
+            info_kbd_bottom_brush: None,
+            info_swatch_border_brush: None,
+            info_swatch_inset_brush: None,
+            info_swatch_fill_brush: None,
+            info_formats: Vec::new(),
+            ann_stroke_brush: None,
+            ann_fill_brush: None,
             metrics: RenderMetrics::for_dpi(dpi),
             size: (0, 0),
         })
@@ -341,6 +455,7 @@ impl OverlayRenderer {
     pub fn set_dpi(&mut self, dpi: u32) {
         self.metrics = RenderMetrics::for_dpi(dpi);
         self.label_formats.clear();
+        self.info_formats.clear();
     }
 
     /// Draw one frame of the overlay into the swap chain back buffer.
@@ -351,36 +466,76 @@ impl OverlayRenderer {
         self.draw_to(&target, view)
     }
 
-    /// Draw the L0/L1/L2 composition into an arbitrary D2D target.
+    /// Render the exportable composition into a fresh frame-sized offscreen target
+    /// and crop `view.selection` back to CPU BGRA.
+    ///
+    /// Reuses the exact [`Self::draw_to`] layer code the preview presents, so the
+    /// exported pixels are the same geometry + style path (docs/11 §8.3). The caller
+    /// supplies a view with `show_chrome`, the selection box and the draft cleared, so
+    /// the crop is the selected region's frozen frame plus its committed annotations —
+    /// never the mask, chrome, grips, magnifier or control points, which must not enter
+    /// the artifact (docs/11 §8.2/§8.4).
+    pub fn render_export(&mut self, view: &RenderView) -> Result<Vec<u8>, String> {
+        let (frame_w, frame_h) = self.size;
+        if frame_w == 0 || frame_h == 0 {
+            return Err("overlay renderer has no back-buffer size for export".into());
+        }
+        let selection = view.selection.intersect(view.frame);
+        if selection.is_empty() {
+            return Ok(Vec::new());
+        }
+        let gpu = self.device.create_render_target_texture(frame_w, frame_h)?;
+        let target = super::d3d11::create_bitmap_from_texture(
+            &self.d2d,
+            &gpu.texture,
+            D2D1_BITMAP_OPTIONS_TARGET,
+            D2D1_ALPHA_MODE_PREMULTIPLIED,
+        )
+        .map_err(|error| super::hresult("CreateBitmapFromDxgiSurface(export)", &error))?;
+
+        self.draw_to(&target, view)?;
+
+        // draw_to repoints the shared device context at the offscreen target; restore
+        // it to the swap chain so any later preview draw is unaffected.
+        unsafe {
+            match self.target.as_ref() {
+                Some(swap_target) => self.d2d.SetTarget(swap_target),
+                None => self.d2d.SetTarget(None),
+            }
+        }
+
+        self.device.read_back_region_bgra(
+            &gpu.texture,
+            selection.left.max(0) as u32,
+            selection.top.max(0) as u32,
+            selection.width() as u32,
+            selection.height() as u32,
+        )
+    }
+
+    /// Draw the full L0/L1/L2/L3 composition into an arbitrary D2D target.
     ///
     /// The swap chain path and the visual regression tests share this, so the tested
     /// composition is exactly the one the overlay presents.
     ///
-    /// The draw is clipped to the bounding box of `view.damage`. The back buffer keeps
-    /// its previous contents and full invalidations are expressed by damaging the whole
-    /// frame, so clipping to the damage is what stops a cursor move from rasterising
-    /// every pixel of the display.
+    /// The whole surface is repainted on every present. The swap chain is a
+    /// `FLIP_SEQUENTIAL` buffer pair whose back buffer is *not* cleared by `BeginDraw`,
+    /// so a pixel left outside a clip keeps the content it had two presents ago and is
+    /// flipped back in — exactly the trailing ghost a moving selection, crosshair or
+    /// size label would otherwise leave. Repainting the opaque L0 frame over the entire
+    /// target makes each presented buffer self-authoritative; the ≤60 Hz input
+    /// coalescing (one present per render tick) is what bounds the cost.
     pub fn draw_to(&mut self, target: &ID2D1Bitmap1, view: &RenderView) -> Result<(), String> {
-        let clip = damage_clip(view);
         unsafe {
             self.d2d.SetTarget(target);
             self.d2d.BeginDraw();
             self.d2d.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
             self.d2d
                 .SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-            if let Some(clip) = clip {
-                // Axis aligned, so the clip is exact and costs no extra geometry.
-                self.d2d.PushAxisAlignedClip(&to_d2d(clip), D2D1_ANTIALIAS_MODE_ALIASED);
-            }
         }
         let result = self.draw_layers(view);
-        let end_draw = unsafe {
-            if clip.is_some() {
-                self.d2d.PopAxisAlignedClip();
-            }
-            self.d2d.EndDraw(None, None)
-        }
-        .map_err(|error| super::hresult("ID2D1DeviceContext::EndDraw", &error));
+        let end_draw = unsafe { self.d2d.EndDraw(None, None) }
+            .map_err(|error| super::hresult("ID2D1DeviceContext::EndDraw", &error));
         result?;
         end_draw
     }
@@ -439,7 +594,19 @@ impl OverlayRenderer {
             }
         }
 
-        // L2: selection chrome.
+        // L2: annotations (inside selection only, after mask, before chrome).
+        if !view.annotation_items.is_empty() || view.annotation_draft.is_some() {
+            let clip_rect = if view.selection.is_empty() { view.frame } else { view.selection.intersect(view.frame) };
+            unsafe {
+                self.d2d.PushAxisAlignedClip(&to_d2d(clip_rect), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+            }
+            self.draw_annotations(view)?;
+            unsafe {
+                self.d2d.PopAxisAlignedClip();
+            }
+        }
+
+        // L3: selection chrome.
         if view.show_chrome && !view.selection.is_empty() {
             let resources = ChromeResources {
                 frame_bitmap,
@@ -449,14 +616,12 @@ impl OverlayRenderer {
                     .require_brush(&self.label_background_brush, "label background brush")?,
                 label_text: self.require_brush(&self.label_text_brush, "label text brush")?,
                 crosshair: self.require_brush(&self.crosshair_brush, "crosshair brush")?,
-                magnifier_border: self
-                    .require_brush(&self.magnifier_border_brush, "magnifier border brush")?,
+                magnifier_band: self
+                    .require_brush(&self.magnifier_band_brush, "magnifier band brush")?,
                 magnifier_grid: self
                     .require_brush(&self.magnifier_grid_brush, "magnifier grid brush")?,
                 magnifier_info: self
                     .require_brush(&self.magnifier_info_brush, "magnifier info brush")?,
-                magnifier_focus: self
-                    .require_brush(&self.magnifier_focus_brush, "magnifier focus brush")?,
             };
             self.draw_chrome(view, &resources)?;
         }
@@ -609,31 +774,98 @@ impl OverlayRenderer {
         let Some(bitmap) = resources.frame_bitmap.as_ref() else {
             return Ok(());
         };
-        let border = &resources.magnifier_border;
+        let band = &resources.magnifier_band;
         let crosshair = &resources.crosshair;
         let grid = &resources.magnifier_grid;
-        let info = &resources.magnifier_info;
-        let focus = &resources.magnifier_focus;
+        let dark = &resources.magnifier_info;
+        let white = &resources.label_text;
+        let panel = geometry.panel;
+        let zoom = geometry.zoom as i32;
+
+        // Rounded-corner clip: PushLayer with a geometric mask clips all content
+        // to a rounded rectangle, giving the panel the soft-cornered look.
+        let corner_radius = 8.0 * (metrics.dpi.max(96) as f32 / 96.0);
+        let factory = unsafe { self.d2d.GetFactory() }
+            .map_err(|e| super::hresult("ID2D1DeviceContext::GetFactory", &e))?;
+        let rounded_geo = unsafe {
+            factory.CreateRoundedRectangleGeometry(&D2D1_ROUNDED_RECT {
+                rect: to_d2d(geometry.bounds),
+                radiusX: corner_radius,
+                radiusY: corner_radius,
+            })
+        }
+        .map_err(|e| super::hresult("CreateRoundedRectangleGeometry", &e))?;
+        let geo_mask: ID2D1Geometry = rounded_geo
+            .cast()
+            .map_err(|e| super::hresult("cast to ID2D1Geometry", &e))?;
+        let layer = unsafe { self.d2d.CreateLayer(None) }
+            .map_err(|e| super::hresult("CreateLayer", &e))?;
 
         unsafe {
+            // Push the geometry-masked layer so all content is clipped to the
+            // rounded-rect bounds.
+            let lp = D2D1_LAYER_PARAMETERS1 {
+                contentBounds: to_d2d(geometry.bounds),
+                geometricMask: std::mem::ManuallyDrop::new(Some(geo_mask)),
+                maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                maskTransform: windows_numerics::Matrix3x2::identity(),
+                opacity: 1.0,
+                opacityBrush: std::mem::ManuallyDrop::new(None),
+                layerOptions: Default::default(),
+            };
+            self.d2d.PushLayer(&lp, &layer);
+
             // Clip so the magnified pixels cannot spill out of the panel.
             self.d2d
                 .PushAxisAlignedClip(&to_d2d(geometry.panel), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-            self.d2d.DrawBitmap(
-                bitmap,
-                Some(&to_d2d(geometry.panel)),
-                1.0,
-                D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
-                Some(&to_d2d(geometry.source)),
-                None,
+            // `geometry.source` is always exactly cursor-centred and may reach
+            // past the frame at a screen edge; fill the whole panel first so the
+            // out-of-frame margin shows a clean background instead of stale
+            // pixels, then blit only the part of the source that actually exists.
+            self.d2d.FillRectangle(&to_d2d(geometry.panel), dark);
+            let visible_source = geometry.source.intersect(view.frame);
+            if !visible_source.is_empty() {
+                let visible_panel = Rect::new(
+                    panel.left + (visible_source.left - geometry.source.left) * zoom,
+                    panel.top + (visible_source.top - geometry.source.top) * zoom,
+                    panel.left + (visible_source.right - geometry.source.left) * zoom,
+                    panel.top + (visible_source.bottom - geometry.source.top) * zoom,
+                );
+                self.d2d.DrawBitmap(
+                    bitmap,
+                    Some(&to_d2d(visible_panel)),
+                    1.0,
+                    D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                    Some(&to_d2d(visible_source)),
+                    None,
+                );
+            }
+
+            // The sampled source pixel is `geometry.center` by construction;
+            // since the source rect is built cursor-centred it always lands on
+            // the panel's own centre cell, never translated aside at an edge.
+            let half_w = (geometry.source.width() / 2).max(0);
+            let half_h = (geometry.source.height() / 2).max(0);
+            let center_x = panel.left + half_w * zoom;
+            let center_y = panel.top + half_h * zoom;
+            let center_cell = Rect::from_origin_size(Point::new(center_x, center_y), zoom, zoom);
+
+            // Light-blue crosshair bands through the sampled pixel's whole row
+            // and column: the eye follows them to the cell even before the ring.
+            self.d2d.FillRectangle(
+                &to_d2d(Rect::new(panel.left, center_y, panel.right, center_y + zoom)),
+                band,
             );
-            self.d2d.PopAxisAlignedClip();
+            self.d2d.FillRectangle(
+                &to_d2d(Rect::new(center_x, panel.top, center_x + zoom, panel.bottom)),
+                band,
+            );
 
             // Pixel grid: only at zoom >= 4 where each cell is wide enough to
             // render legibly. Integer-aligned to avoid sub-pixel blur.
-            let panel = geometry.panel;
             if geometry.zoom >= 4 {
                 let step = geometry.zoom as f32;
+                // Vertical separators: one between each pair of columns.
                 for index in 1..geometry.source.width() {
                     let x = panel.left as f32 + index as f32 * step + 0.5;
                     self.d2d.DrawLine(
@@ -643,6 +875,9 @@ impl OverlayRenderer {
                         1.0,
                         None,
                     );
+                }
+                // Horizontal separators: one between each pair of rows.
+                for index in 1..geometry.source.height() {
                     let y = panel.top as f32 + index as f32 * step + 0.5;
                     self.d2d.DrawLine(
                         vector2(panel.left as f32, y),
@@ -654,114 +889,244 @@ impl OverlayRenderer {
                 }
             }
 
-            // Outline the source pixel under the cursor rather than painting a
-            // detached marker. This remains aligned with the sampled pixel at every
-            // zoom level and cannot leak outside the magnifier damage rectangle.
-            let center = Point::new(
-                view.cursor
-                    .x
-                    .clamp(geometry.source.left, geometry.source.right.saturating_sub(1)),
-                view.cursor
-                    .y
-                    .clamp(geometry.source.top, geometry.source.bottom.saturating_sub(1)),
-            );
-            let center_x = panel.left + (center.x - geometry.source.left) * geometry.zoom as i32;
-            let center_y = panel.top + (center.y - geometry.source.top) * geometry.zoom as i32;
-            let center_cell = Rect::from_origin_size(
-                Point::new(center_x, center_y),
-                geometry.zoom as i32,
-                geometry.zoom as i32,
-            );
-            self.d2d.DrawRectangle(&to_d2d(center_cell), focus, 1.0, None);
+            // The sampled cell itself: white fill with a dark outline, so it
+            // reads on light and dark content alike.
+            self.d2d.FillRectangle(&to_d2d(center_cell), white);
+            self.d2d.DrawRectangle(&to_d2d(center_cell), dark, 1.0, None);
+            self.d2d.PopAxisAlignedClip();
 
-            self.d2d.FillRectangle(&to_d2d(geometry.info_panel), info);
-
-            // --- Info panel layout: [swatch 20px] [hex text] / [coords] ---
-            let swatch_size = 20i32;
+            // ── Info panel: 3-row glassmorphism layout ──
             let info = geometry.info_panel;
-            let swatch_rect = Rect::from_origin_size(
-                Point::new(info.left + 4, info.top + (info.height() - swatch_size) / 2),
-                swatch_size,
-                swatch_size,
-            );
-            // GPU color swatch: draw 1×1 pixel from the frame bitmap at center.
-            // This updates immediately without waiting for async CPU readback.
-            let src_pixel = Rect::from_origin_size(geometry.center, 1, 1);
-            self.d2d.DrawBitmap(
-                bitmap,
-                Some(&to_d2d(swatch_rect)),
-                1.0,
-                D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
-                Some(&to_d2d(src_pixel)),
-                None,
-            );
-            // Swatch border outline
-            self.d2d.DrawRectangle(&to_d2d(swatch_rect), border, 1.0, None);
+            let bg = self.require_brush(&self.info_bg_brush, "info bg")?;
+            let accent = self.require_brush(&self.info_accent_brush, "info accent")?;
+            let hex_brush = self.require_brush(&self.info_hex_brush, "info hex")?;
+            let sec_brush = self.require_brush(&self.info_secondary_brush, "info sec")?;
+            let coord_val_brush = self.require_brush(&self.info_coord_value_brush, "info coord")?;
+            let hint_brush = self.require_brush(&self.info_hint_brush, "info hint")?;
+            let kbd_text_brush = self.require_brush(&self.info_kbd_text_brush, "info kbd text")?;
+            let kbd_fill_brush = self.require_brush(&self.info_kbd_fill_brush, "info kbd fill")?;
+            let kbd_bottom_brush = self.require_brush(&self.info_kbd_bottom_brush, "info kbd bot")?;
+            let swatch_border = self.require_brush(&self.info_swatch_border_brush, "swatch border")?;
+            let swatch_inset = self.require_brush(&self.info_swatch_inset_brush, "swatch inset")?;
+            let swatch_fill = self.require_brush(&self.info_swatch_fill_brush, "swatch fill")?;
 
-            // Text area: right of swatch
-            let text_x = (swatch_rect.right + 6) as f32;
-            let line_height = metrics.label_font_size * 1.3;
-            let text_y_base = info.top as f32 + (info.height() as f32 - line_height * 2.0) / 2.0;
+            self.d2d.FillRectangle(&to_d2d(info), &bg);
 
-            // Line 1: #RRGGBB (or placeholder when color not yet available)
-            let hex_text = view.magnifier_hex.as_deref().unwrap_or("......");
-            let format = self.label_text_format_mut()?;
-            let wide_hex = hex_text.encode_utf16().collect::<Vec<u16>>();
-            let hex_rect = D2D_RECT_F {
-                left: text_x,
-                top: text_y_base,
-                right: info.right as f32 - metrics.label_padding_x,
-                bottom: text_y_base + line_height,
+            let scale = metrics.dpi.max(96) as f32 / 96.0;
+            let pad_v = INFO_PADDING_V_DIP * scale;
+            let pad_h = INFO_PADDING_H_DIP * scale;
+            let row_gap = INFO_ROW_GAP_DIP * scale;
+            let swatch_sz = INFO_SWATCH_SIZE_DIP * scale;
+            let swatch_radius = INFO_SWATCH_RADIUS_DIP * scale;
+            let swatch_gap = INFO_SWATCH_GAP_DIP * scale;
+            let hex_font_sz = INFO_HEX_FONT_DIP * scale;
+            let sec_font_sz = INFO_SECONDARY_FONT_DIP * scale;
+            let coord_label_sz = INFO_COORD_LABEL_FONT_DIP * scale;
+            let coord_value_sz = INFO_COORD_VALUE_FONT_DIP * scale;
+            let coord_lv_gap = INFO_COORD_LABEL_VALUE_GAP_DIP * scale;
+            let coord_item_gap = INFO_COORD_ITEM_GAP_DIP * scale;
+            let hint_font_sz = INFO_HINT_FONT_DIP * scale;
+            let kbd_pad = INFO_KBD_PADDING_DIP * scale;
+            let kbd_radius = INFO_KBD_RADIUS_DIP * scale;
+            let kbd_text_gap = INFO_KBD_TEXT_GAP_DIP * scale;
+
+            let row1_h = swatch_sz;
+            let row2_h = coord_value_sz * 1.4;
+            let row3_h = hint_font_sz * 1.5;
+            let content_start = info.top as f32 + pad_v;
+            let row1_y = content_start;
+            let row2_y = row1_y + row1_h + row_gap;
+            let row3_y = row2_y + row2_h + row_gap;
+            let content_l = info.left as f32 + pad_h;
+            let content_r = info.right as f32 - pad_h;
+
+            // ---- Row 1: Colour swatch + HEX + RGB/HSL ----
+            let swatch_rect = D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F {
+                    left: content_l,
+                    top: row1_y + (row1_h - swatch_sz) / 2.0,
+                    right: content_l + swatch_sz,
+                    bottom: row1_y + (row1_h + swatch_sz) / 2.0,
+                },
+                radiusX: swatch_radius,
+                radiusY: swatch_radius,
             };
-            self.d2d.DrawText(
-                &wide_hex,
-                &format,
-                &hex_rect,
-                &resources.label_text,
-                D2D1_DRAW_TEXT_OPTIONS_NONE,
-                DWRITE_MEASURING_MODE_NATURAL,
-            );
-
-            // Line 2: physical coordinate
-            let coordinate = format!(
-                "{},{}",
-                view.cursor.x + view.screen_origin.x,
-                view.cursor.y + view.screen_origin.y,
-            );
-            let wide_coord = coordinate.encode_utf16().collect::<Vec<u16>>();
-            let coord_rect = D2D_RECT_F {
-                left: text_x,
-                top: text_y_base + line_height,
-                right: info.right as f32 - metrics.label_padding_x,
-                bottom: text_y_base + line_height * 2.0,
+            {
+                let (r, g, b) = view.magnifier_rgb.unwrap_or((0, 0, 0));
+                let _ = swatch_fill.SetColor(&color(
+                    r as f32 / 255.0,
+                    g as f32 / 255.0,
+                    b as f32 / 255.0,
+                    1.0,
+                ));
+            }
+            self.d2d.FillRoundedRectangle(&swatch_rect, &swatch_fill);
+            self.d2d.DrawRoundedRectangle(&swatch_rect, &swatch_border, 1.0, None);
+            let inset_rect = D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F {
+                    left: swatch_rect.rect.left + 1.0,
+                    top: swatch_rect.rect.top + 1.0,
+                    right: swatch_rect.rect.right - 1.0,
+                    bottom: swatch_rect.rect.bottom - 1.0,
+                },
+                radiusX: (swatch_radius - 1.0).max(0.0),
+                radiusY: (swatch_radius - 1.0).max(0.0),
             };
-            self.d2d.DrawText(
-                &wide_coord,
-                &format,
-                &coord_rect,
-                &resources.label_text,
-                D2D1_DRAW_TEXT_OPTIONS_NONE,
-                DWRITE_MEASURING_MODE_NATURAL,
-            );
+            self.d2d.DrawRoundedRectangle(&inset_rect, &swatch_inset, 1.0, None);
 
-            let outline = D2D1_ROUNDED_RECT {
-                rect: to_d2d(geometry.panel),
-                radiusX: 2.0,
-                radiusY: 2.0,
+            let hex_text = view.magnifier_hex_text.as_deref().unwrap_or("--");
+            let hex_format = self.info_text_format_mut(true, INFO_HEX_FONT_DIP, DWRITE_FONT_WEIGHT_SEMI_BOLD, false)?;
+            let hex_w = self.measure_text_width_in(hex_text, &hex_format)?;
+            let hex_baseline_y = row1_y + (row1_h - hex_font_sz) / 2.0;
+            let hex_x = content_l + swatch_sz + swatch_gap;
+            {
+                let wide = hex_text.encode_utf16().collect::<Vec<u16>>();
+                self.d2d.DrawText(
+                    &wide, &hex_format,
+                    &D2D_RECT_F {
+                        left: hex_x, top: hex_baseline_y,
+                        right: hex_x + hex_w + 2.0, bottom: hex_baseline_y + hex_font_sz * 1.5,
+                    },
+                    &hex_brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL,
+                );
+            }
+
+            let sec_text = view.magnifier_secondary_text.as_deref().unwrap_or("");
+            if !sec_text.is_empty() {
+                let sec_format = self.info_text_format_mut(true, INFO_SECONDARY_FONT_DIP, DWRITE_FONT_WEIGHT_NORMAL, false)?;
+                let sec_w = self.measure_text_width_in(sec_text, &sec_format)?;
+                let sec_baseline_y = row1_y + (row1_h - sec_font_sz) / 2.0;
+                let sec_x = content_r - sec_w;
+                let wide = sec_text.encode_utf16().collect::<Vec<u16>>();
+                self.d2d.DrawText(
+                    &wide, &sec_format,
+                    &D2D_RECT_F {
+                        left: sec_x, top: sec_baseline_y,
+                        right: sec_x + sec_w + 2.0, bottom: sec_baseline_y + sec_font_sz * 1.5,
+                    },
+                    &sec_brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL,
+                );
+            }
+
+            // ---- Row 2: X / Y Coordinates ----
+            let (cx, cy) = if view.magnifier_relative && !view.selection.is_empty() {
+                (view.cursor.x - view.selection.left, view.cursor.y - view.selection.top)
+            } else {
+                (view.cursor.x + view.screen_origin.x, view.cursor.y + view.screen_origin.y)
             };
-            self.d2d.DrawRoundedRectangle(
-                &outline,
-                border,
-                metrics.border_width,
-                None,
-            );
+            let label_format = self.info_text_format_mut(false, INFO_COORD_LABEL_FONT_DIP, DWRITE_FONT_WEIGHT_BOLD, false)?;
+            let value_format = self.info_text_format_mut(true, INFO_COORD_VALUE_FONT_DIP, DWRITE_FONT_WEIGHT_NORMAL, false)?;
+            let label_w = self.measure_text_width_in("X", &label_format)?;
+            let x_str = cx.to_string();
+            let y_str = cy.to_string();
+            let x_val_w = self.measure_text_width_in(&x_str, &value_format)?;
+            let y_val_w = self.measure_text_width_in(&y_str, &value_format)?;
+            let row2_baseline_y = row2_y + (row2_h - coord_value_sz) / 2.0;
+            {
+                let lx = content_l;
+                let wide = b"X".iter().map(|&c| c as u16).collect::<Vec<u16>>();
+                self.d2d.DrawText(
+                    &wide, &label_format,
+                    &D2D_RECT_F {
+                        left: lx, top: row2_baseline_y,
+                        right: lx + label_w + 2.0, bottom: row2_baseline_y + coord_label_sz * 1.5,
+                    },
+                    &accent, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL,
+                );
+                let vx = lx + label_w + coord_lv_gap;
+                let wide_x = x_str.encode_utf16().collect::<Vec<u16>>();
+                self.d2d.DrawText(
+                    &wide_x, &value_format,
+                    &D2D_RECT_F {
+                        left: vx, top: row2_baseline_y,
+                        right: vx + x_val_w + 2.0, bottom: row2_baseline_y + coord_value_sz * 1.5,
+                    },
+                    &coord_val_brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL,
+                );
+                let ly = vx + x_val_w + coord_item_gap;
+                let wide = b"Y".iter().map(|&c| c as u16).collect::<Vec<u16>>();
+                self.d2d.DrawText(
+                    &wide, &label_format,
+                    &D2D_RECT_F {
+                        left: ly, top: row2_baseline_y,
+                        right: ly + label_w + 2.0, bottom: row2_baseline_y + coord_label_sz * 1.5,
+                    },
+                    &accent, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL,
+                );
+                let vy = ly + label_w + coord_lv_gap;
+                let wide_y = y_str.encode_utf16().collect::<Vec<u16>>();
+                self.d2d.DrawText(
+                    &wide_y, &value_format,
+                    &D2D_RECT_F {
+                        left: vy, top: row2_baseline_y,
+                        right: vy + y_val_w + 2.0, bottom: row2_baseline_y + coord_value_sz * 1.5,
+                    },
+                    &coord_val_brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL,
+                );
+            }
 
-            // The pointer reticle is a *local* crosshair centred on the cursor, drawn
-            // from the same `crosshair_geometry` the damage code uses so a hover
-            // invalidates exactly this box and never the full frame (docs/11 §5.1). The
-            // magnifier itself deliberately has no detached pixel marker: a marker
-            // painted into a previous panel can otherwise survive a partial damage
-            // redraw and appear as a stray dot outside the current panel.
+            // ---- Row 3: Shortcut hints (kbd-style boxes) ----
+            let hint_format = self.info_text_format_mut(false, INFO_HINT_FONT_DIP, DWRITE_FONT_WEIGHT_NORMAL, false)?;
+            let kbd_line_h = hint_font_sz + kbd_pad * 2.0;
+            let kbd_y = row3_y + (row3_h - kbd_line_h) / 2.0;
+            let hints: &[(&str, &str)] = &[("Shift", "色值格式"), ("C", "复制色值"), ("P", "坐标模式")];
+            let hint_gap = 6.0 * scale;
+            let mut kbd_x = content_l;
+            for (key, desc) in hints {
+                let key_w = self.measure_text_width_in(key, &hint_format)?;
+                let box_w = key_w + kbd_pad * 2.0;
+                let box_rect = D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: kbd_x, top: kbd_y,
+                        right: kbd_x + box_w, bottom: kbd_y + kbd_line_h,
+                    },
+                    radiusX: kbd_radius, radiusY: kbd_radius,
+                };
+                self.d2d.FillRoundedRectangle(&box_rect, &kbd_fill_brush);
+                let bot_rect = D2D_RECT_F {
+                    left: kbd_x + 1.0, top: kbd_y + kbd_line_h - 1.0,
+                    right: kbd_x + box_w - 1.0, bottom: kbd_y + kbd_line_h,
+                };
+                self.d2d.FillRectangle(&bot_rect, &kbd_bottom_brush);
+                {
+                    let wide = key.encode_utf16().collect::<Vec<u16>>();
+                    self.d2d.DrawText(
+                        &wide, &hint_format,
+                        &D2D_RECT_F {
+                            left: kbd_x, top: kbd_y,
+                            right: kbd_x + box_w, bottom: kbd_y + kbd_line_h,
+                        },
+                        &kbd_text_brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                }
+                kbd_x += box_w + kbd_text_gap;
+                let desc_w = self.measure_text_width_in(desc, &hint_format)?;
+                let wide_desc = desc.encode_utf16().collect::<Vec<u16>>();
+                self.d2d.DrawText(
+                    &wide_desc, &hint_format,
+                    &D2D_RECT_F {
+                        left: kbd_x, top: kbd_y,
+                        right: kbd_x + desc_w + 2.0, bottom: kbd_y + kbd_line_h,
+                    },
+                    &hint_brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL,
+                );
+                kbd_x += desc_w + hint_gap;
+            }
+
+            // Panel outline: a thin dark rounded frame around the magnifier.
+            let outline_rr = D2D1_ROUNDED_RECT {
+                rect: to_d2d(geometry.bounds),
+                radiusX: corner_radius,
+                radiusY: corner_radius,
+            };
+            self.d2d.DrawRoundedRectangle(&outline_rr, dark, 1.0, None);
+            self.d2d.PopLayer();
+            core::mem::drop(lp);
+
+            // The pointer reticle is a *local* crosshair centred on the cursor.
+            // The magnifier itself deliberately has no detached pixel marker: the
+            // sampled pixel is emphasised by the cell ring above, which moves with
+            // the panel and never paints outside it.
             let reticle = crate::capture::geometry::crosshair_geometry(
                 view.cursor,
                 crate::capture::geometry::crosshair_radius(metrics.dpi),
@@ -785,6 +1150,249 @@ impl OverlayRenderer {
         Ok(())
     }
 
+    /// Advance width of `text` rendered in a specific DirectWrite format.
+    fn measure_text_width_in(&self, text: &str, format: &IDWriteTextFormat) -> Result<f32, String> {
+        let wide = text.encode_utf16().collect::<Vec<u16>>();
+        let layout = unsafe {
+            self.dwrite
+                .CreateTextLayout(&wide, format, f32::INFINITY, f32::INFINITY)
+        }
+        .map_err(|e| super::hresult("IDWriteFactory::CreateTextLayout", &e))?;
+        let mut m = DWRITE_TEXT_METRICS::default();
+        unsafe { layout.GetMetrics(&mut m) }
+            .map_err(|e| super::hresult("IDWriteTextLayout::GetMetrics", &e))?;
+        Ok(m.width)
+    }
+
+    /// Resolve (and cache) a DirectWrite format for the info panel.
+    ///
+    /// `mono`: use Consolas/Lucida Console; otherwise Segoe UI Variable Display/Segoe UI.
+    /// `weight`: a `DWRITE_FONT_WEIGHT` constant (NORMAL/SEMI_BOLD/BOLD).
+    fn info_text_format_mut(
+        &mut self,
+        mono: bool,
+        size_dip: f32,
+        weight: DWRITE_FONT_WEIGHT,
+        center: bool,
+    ) -> Result<IDWriteTextFormat, String> {
+        let scale = self.metrics.dpi.max(96) as f32 / 96.0;
+        let font_size = size_dip * scale;
+        let family_slot = if mono { 1u8 } else { 0u8 };
+        let size_key = (font_size * 100.0).round() as u32;
+        let weight_val = weight.0 as u32;
+        let align_val = if center { 1u32 } else { 0u32 };
+        let key = (family_slot, size_key, weight_val, align_val);
+        if let Some((_, f)) = self.info_formats.iter().find(|(k, _)| *k == key) {
+            return Ok(f.clone());
+        }
+        let locale = to_wide("en-us");
+        // The embedded HarmonyOS subset is the primary family for every info-panel
+        // string; the slot's original fonts survive only as fallbacks in case the
+        // private registration was refused (e.g. a locked-down font host).
+        let fallbacks: &[&str] = if mono {
+            &[MONO_FONT_FAMILY, MONO_FONT_FALLBACK]
+        } else {
+            &[LABEL_FONT_FAMILY, LABEL_FONT_FALLBACK]
+        };
+        let families = std::iter::once(INFO_FONT_FAMILY).chain(fallbacks.iter().copied());
+        let dw_weight = weight;
+        let mut format = None;
+        let mut last_err = String::new();
+        for family in families {
+            let wide = to_wide(family);
+            match unsafe {
+                self.dwrite.CreateTextFormat(
+                    PCWSTR(wide.as_ptr()),
+                    None,
+                    dw_weight,
+                    DWRITE_FONT_STYLE_NORMAL,
+                    DWRITE_FONT_STRETCH_NORMAL,
+                    font_size,
+                    PCWSTR(locale.as_ptr()),
+                )
+            } {
+                Ok(created) => {
+                    unsafe {
+                        if center {
+                            let _ = created.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                        }
+                        let _ = created.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                    }
+                    format = Some(created);
+                    break;
+                }
+                Err(e) => {
+                    last_err = super::hresult(family, &e);
+                    continue;
+                }
+            }
+        }
+        let format = format.ok_or_else(|| format!("no usable info font family ({last_err})"))?;
+        self.info_formats.push((key, format.clone()));
+        Ok(format)
+    }
+
+    // ── Annotation rendering ─────────────────────────────────────────────────────────
+
+    fn draw_annotations(&mut self, view: &RenderView) -> Result<(), String> {
+        let stroke = self.require_brush(&self.ann_stroke_brush, "ann stroke brush")?;
+        let fill   = self.require_brush(&self.ann_fill_brush, "ann fill brush")?;
+
+        // L2-a: committed items.
+        for item in &view.annotation_items {
+            self.draw_annotation_item(item, &stroke, &fill)?;
+            if Some(item.id) == view.annotation_selected_id {
+                self.draw_selection_box(item, &stroke)?;
+            }
+        }
+        // L2-b: draft (currently being drawn, slightly translucent).
+        if let Some(draft) = &view.annotation_draft {
+            self.draw_annotation_item(draft, &stroke, &fill)?;
+        }
+        Ok(())
+    }
+
+    fn draw_annotation_item(
+        &mut self,
+        item: &AnnotationItem,
+        stroke: &ID2D1SolidColorBrush,
+        fill: &ID2D1SolidColorBrush,
+    ) -> Result<(), String> {
+        let opacity = item.style.opacity;
+        let sc = item.style.stroke_color;
+        let stroke_color = color(sc[0], sc[1], sc[2], sc[3] * opacity);
+        let _ = unsafe { stroke.SetColor(&stroke_color) };
+
+        if let Some(fc) = item.style.fill_color {
+            let fill_color = color(fc[0], fc[1], fc[2], fc[3] * opacity);
+            let _ = unsafe { fill.SetColor(&fill_color) };
+        }
+        let has_fill = item.style.fill_color.is_some();
+        let sw = item.style.stroke_width;
+
+        unsafe {
+            match &item.geometry {
+                AnnotationGeometry::Rect { bounds } => {
+                    let r = to_d2d(*bounds);
+                    if has_fill { self.d2d.FillRectangle(&r, fill); }
+                    self.d2d.DrawRectangle(&r, stroke, sw, None);
+                }
+                AnnotationGeometry::Ellipse { bounds } => {
+                    let cx = (bounds.left + bounds.right) as f32 / 2.0;
+                    let cy = (bounds.top + bounds.bottom) as f32 / 2.0;
+                    let ell = D2D1_ELLIPSE {
+                        point: vector2(cx, cy),
+                        radiusX: bounds.width() as f32 / 2.0,
+                        radiusY: bounds.height() as f32 / 2.0,
+                    };
+                    if has_fill { self.d2d.FillEllipse(&ell, fill); }
+                    self.d2d.DrawEllipse(&ell, stroke, sw, None);
+                }
+                AnnotationGeometry::Line { start, end } => {
+                    self.d2d.DrawLine(
+                        vector2(start.x as f32, start.y as f32),
+                        vector2(end.x as f32, end.y as f32),
+                        stroke, sw, None,
+                    );
+                }
+                AnnotationGeometry::Arrow { start, end } => {
+                    let sx = start.x as f32; let sy = start.y as f32;
+                    let ex = end.x as f32;   let ey = end.y as f32;
+                    // Shaft
+                    self.d2d.DrawLine(vector2(sx, sy), vector2(ex, ey), stroke, sw, None);
+                    // Two-line arrowhead
+                    let head = item.style.arrow_head_size;
+                    let angle = (ey - sy).atan2(ex - sx);
+                    let (cos_a, sin_a) = (angle.cos(), angle.sin());
+                    // Left barb
+                    let lx = ex - head * (cos_a * (30f32).to_radians().cos() + sin_a * (30f32).to_radians().sin());
+                    let ly = ey - head * (sin_a * (30f32).to_radians().cos() - cos_a * (30f32).to_radians().sin());
+                    // Right barb
+                    let rx = ex - head * (cos_a * (-30f32).to_radians().cos() + sin_a * (-30f32).to_radians().sin());
+                    let ry = ey - head * (sin_a * (-30f32).to_radians().cos() - cos_a * (-30f32).to_radians().sin());
+                    self.d2d.DrawLine(vector2(ex, ey), vector2(lx, ly), stroke, sw, None);
+                    self.d2d.DrawLine(vector2(ex, ey), vector2(rx, ry), stroke, sw, None);
+                }
+                AnnotationGeometry::Freehand { points }
+                | AnnotationGeometry::Highlight { points } => {
+                    if points.len() < 2 { return Ok(()); }
+                    let alpha_mult = if matches!(item.kind, AnnotationKind::Highlight) { 0.35f32 } else { 1.0 };
+                    let hl_width = if matches!(item.kind, AnnotationKind::Highlight) { sw * 3.0 } else { sw };
+                    let base = item.style.stroke_color;
+                    if alpha_mult < 1.0 {
+                        let hl_color = color(base[0], base[1], base[2], base[3] * alpha_mult * opacity);
+                        let _ = stroke.SetColor(&hl_color);
+                    }
+                    for w in points.windows(2) {
+                        self.d2d.DrawLine(
+                            vector2(w[0].x as f32, w[0].y as f32),
+                            vector2(w[1].x as f32, w[1].y as f32),
+                            stroke, hl_width, None,
+                        );
+                    }
+                }
+                AnnotationGeometry::Text { position, content } => {
+                    self.draw_annotation_text(item, position, content, stroke)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn draw_annotation_text(
+        &mut self,
+        item: &AnnotationItem,
+        position: &Point,
+        content: &str,
+        stroke: &ID2D1SolidColorBrush,
+    ) -> Result<(), String> {
+        if content.is_empty() { return Ok(()); }
+        let format = self.label_text_format_mut()?;
+        let wide = content.encode_utf16().collect::<Vec<u16>>();
+        let fs = item.style.font_size;
+        let approx_w = (content.chars().count() as f32 * fs * 0.55).max(10.0);
+        let approx_h = fs * 2.0;
+        let text_rect = D2D_RECT_F {
+            left: position.x as f32,
+            top: position.y as f32,
+            right: position.x as f32 + approx_w,
+            bottom: position.y as f32 + approx_h,
+        };
+        unsafe {
+            self.d2d.DrawText(
+                &wide,
+                &format,
+                &text_rect,
+                stroke,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+        }
+        Ok(())
+    }
+
+    fn draw_selection_box(
+        &mut self,
+        item: &AnnotationItem,
+        _stroke: &ID2D1SolidColorBrush,
+    ) -> Result<(), String> {
+        // Use a distinct accent colour for the selection box (not the item's own colour).
+        let sel_brush = self.require_brush(&self.border_brush, "border brush")?;
+        let b = to_d2d(item.bounds());
+        let handle_r = 4.0f32;
+        unsafe {
+            self.d2d.DrawRectangle(&b, &sel_brush, 1.5, None);
+            // Four corner handles.
+            for &(cx, cy) in &[
+                (b.left, b.top), (b.right, b.top),
+                (b.left, b.bottom), (b.right, b.bottom),
+            ] {
+                let grip = D2D1_ELLIPSE { point: vector2(cx, cy), radiusX: handle_r, radiusY: handle_r };
+                self.d2d.FillEllipse(&grip, &sel_brush);
+            }
+        }
+        Ok(())
+    }
     /// Resolve (and cache) the DirectWrite format used by the size label.
     fn label_text_format_mut(&mut self) -> Result<IDWriteTextFormat, String> {
         // Cache by rounded font size: WM_DPICHANGED is the only thing that changes it.
@@ -797,7 +1405,8 @@ impl OverlayRenderer {
         // `localeName` must be a real locale (or an empty string); passing null is
         // rejected with E_INVALIDARG on some DirectWrite versions.
         let locale = to_wide("en-us");
-        for family in [LABEL_FONT_FAMILY, LABEL_FONT_FALLBACK] {
+        // The size label uses the same embedded family, then the stock fallbacks.
+        for family in [INFO_FONT_FAMILY, LABEL_FONT_FAMILY, LABEL_FONT_FALLBACK] {
             let wide = to_wide(family);
             match unsafe {
                 self.dwrite.CreateTextFormat(
@@ -842,7 +1451,9 @@ impl OverlayRenderer {
         let white = color(1.0, 1.0, 1.0, 1.0);
         let panel = color(0.09, 0.09, 0.11, 0.92);
         let crosshair = color(1.0, 0.75, 0.0, 0.95);
-        let grid = color(1.0, 1.0, 1.0, 0.24);
+        // Dark charcoal grid lines: keep them legible when the magnified
+        // content is light (white-on-white was invisible on pale screens).
+        let grid = color(0.12, 0.12, 0.16, 0.55);
         let info = color(0.02, 0.02, 0.025, 0.94);
         self.mask_brush = Some(self.create_brush(&mask)?);
         self.border_brush = Some(self.create_brush(&accent)?);
@@ -850,10 +1461,46 @@ impl OverlayRenderer {
         self.label_background_brush = Some(self.create_brush(&panel)?);
         self.label_text_brush = Some(self.create_brush(&white)?);
         self.crosshair_brush = Some(self.create_brush(&crosshair)?);
-        self.magnifier_border_brush = Some(self.create_brush(&accent)?);
+        self.magnifier_band_brush =
+            Some(self.create_brush(&color(0.30, 0.55, 1.0, 0.45))?);
         self.magnifier_grid_brush = Some(self.create_brush(&grid)?);
         self.magnifier_info_brush = Some(self.create_brush(&info)?);
-        self.magnifier_focus_brush = Some(self.create_brush(&white)?);
+        // ── Glassmorphism info-panel palette ──
+        self.info_bg_brush = Some(self.create_brush(
+            &color(20.0 / 255.0, 20.0 / 255.0, 20.0 / 255.0, 0.88),
+        )?);
+        self.info_accent_brush = Some(self.create_brush(
+            &color(59.0 / 255.0, 130.0 / 255.0, 246.0 / 255.0, 1.0),
+        )?);
+        self.info_hex_brush = Some(self.create_brush(&color(1.0, 1.0, 1.0, 1.0))?);
+        self.info_secondary_brush = Some(self.create_brush(
+            &color(136.0 / 255.0, 136.0 / 255.0, 136.0 / 255.0, 1.0),
+        )?);
+        self.info_coord_value_brush = Some(self.create_brush(
+            &color(170.0 / 255.0, 170.0 / 255.0, 170.0 / 255.0, 1.0),
+        )?);
+        self.info_hint_brush = Some(self.create_brush(
+            &color(119.0 / 255.0, 119.0 / 255.0, 119.0 / 255.0, 1.0),
+        )?);
+        self.info_kbd_text_brush = Some(self.create_brush(
+            &color(204.0 / 255.0, 204.0 / 255.0, 204.0 / 255.0, 1.0),
+        )?);
+        self.info_kbd_fill_brush = Some(self.create_brush(
+            &color(1.0, 1.0, 1.0, 0.1),
+        )?);
+        self.info_kbd_bottom_brush = Some(self.create_brush(
+            &color(1.0, 1.0, 1.0, 0.06),
+        )?);
+        self.info_swatch_border_brush = Some(self.create_brush(
+            &color(1.0, 1.0, 1.0, 0.35),
+        )?);
+        self.info_swatch_inset_brush = Some(self.create_brush(
+            &color(0.0, 0.0, 0.0, 0.25),
+        )?);
+        self.info_swatch_fill_brush = Some(self.create_brush(&color(0.0, 0.0, 0.0, 1.0))?);
+        // Annotation brushes: initialised to accent blue; colour set per-item at draw time.
+        self.ann_stroke_brush = Some(self.create_brush(&color(0.0, 0.47, 0.83, 1.0))?);
+        self.ann_fill_brush = Some(self.create_brush(&color(0.0, 0.0, 0.0, 0.0))?);
         Ok(())
     }
 
@@ -877,11 +1524,46 @@ impl OverlayRenderer {
         self.label_background_brush = None;
         self.label_text_brush = None;
         self.crosshair_brush = None;
-        self.magnifier_border_brush = None;
+        self.magnifier_band_brush = None;
         self.magnifier_grid_brush = None;
         self.magnifier_info_brush = None;
-        self.magnifier_focus_brush = None;
+        self.info_bg_brush = None;
+        self.info_accent_brush = None;
+        self.info_hex_brush = None;
+        self.info_secondary_brush = None;
+        self.info_coord_value_brush = None;
+        self.info_hint_brush = None;
+        self.info_kbd_text_brush = None;
+        self.info_kbd_fill_brush = None;
+        self.info_kbd_bottom_brush = None;
+        self.info_swatch_border_brush = None;
+        self.info_swatch_inset_brush = None;
+        self.info_swatch_fill_brush = None;
+        self.ann_stroke_brush = None;
+        self.ann_fill_brush = None;
     }
+}
+
+/// Register the embedded info font privately for this process, once.
+///
+/// `AddFontMemResourceEx` loads the subset straight from the bytes baked into the
+/// binary — no temp file, no system install, no admin rights. `OverlayRenderer::new`
+/// follows with `IDWriteFactory::ReloadSystemFonts` so the shared DWrite factory
+/// re-enumerates and can resolve `"HarmonyOS Sans SC"` by name. The embedded slice
+/// is `'static`, so the registration stays valid for the whole process.
+fn register_info_font_once() {
+    static REGISTER: std::sync::Once = std::sync::Once::new();
+    REGISTER.call_once(|| unsafe {
+        let mut installed = 0u32;
+        // A failure here is non-fatal: every text format falls back to a stock
+        // family when the embedded one cannot be resolved.
+        let _ = AddFontMemResourceEx(
+            INFO_EMBEDDED_FONT.as_ptr().cast(),
+            INFO_EMBEDDED_FONT.len() as u32,
+            None,
+            &mut installed,
+        );
+    });
 }
 
 fn color(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
@@ -906,37 +1588,16 @@ fn to_wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// Bounding box of the damaged regions, intersected with the frame, in DIP.
-///
-/// `None` means "nothing to repaint". An empty damage list is treated as "repaint
-/// everything": a caller that forgot to declare damage must not end up with a stale
-/// window.
-fn damage_clip(view: &RenderView) -> Option<Rect> {
-    if view.damage.is_empty() {
-        return Some(view.frame);
-    }
-    let mut bounds: Option<Rect> = None;
-    for rect in &view.damage {
-        let rect = rect.intersect(view.frame);
-        if rect.is_empty() {
-            continue;
-        }
-        bounds = Some(match bounds {
-            Some(current) => current.union(rect),
-            None => rect,
-        });
-    }
-    bounds
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{MASK_ALPHA, OverlayRenderer, RenderMetrics, RenderView, damage_clip, to_d2d};
+    use super::{MASK_ALPHA, OverlayRenderer, RenderMetrics, RenderView, to_d2d};
+    use crate::capture::annotation::{
+        AnnotationGeometry, AnnotationItem, AnnotationKind, AnnotationStyle,
+    };
     use ::windows::Win32::Graphics::Direct2D::Common::D2D1_ALPHA_MODE_PREMULTIPLIED;
     use ::windows::Win32::Graphics::Direct2D::D2D1_BITMAP_OPTIONS_TARGET;
     use crate::capture::geometry::{
-        Handle, MagnifierConfig, Point, Rect, SizeLabelPlacement, crosshair_geometry,
-        crosshair_radius, magnifier_geometry, size_label_placement,
+        Handle, Point, Rect, SizeLabelPlacement, size_label_placement,
     };
 
     /// A flat-coloured BGRA frame.
@@ -1062,20 +1723,26 @@ mod tests {
         let _ = frame;
     }
 
-    /// A partial repaint must leave every pixel outside the damaged region untouched.
+    /// The annotated export must be byte-identical to the crop of the exact
+    /// composition the preview presents, with annotations baked in and the mask,
+    /// selection chrome and control handles excluded (docs/11 §8.2/§8.3).
     ///
-    /// This is what makes the dirty-rectangle optimisation real rather than declared: the
-    /// test renders a chrome frame into a persistent target, then repaints with a tiny
-    /// damage box and asserts that pixels well outside it are byte-identical.
+    /// `render_export` runs the same [`OverlayRenderer::draw_to`] layer path into a
+    /// frame-sized offscreen target, then reads `selection` back. This renders the
+    /// identical view through the swap-chain-style path (`draw_to` into a fresh
+    /// render-target bitmap) and asserts the returned crop equals that full frame's
+    /// selection region pixel-for-pixel, so a readback offset/pitch/format bug cannot
+    /// pass. It then spot-checks that a red fill landed inside the artifact while a
+    /// selected-but-unannotated pixel stayed at the raw frame brightness (no mask).
     #[test]
-    fn partial_repaint_does_not_touch_pixels_outside_the_damage() {
+    fn export_crop_matches_preview_and_bakes_annotations() {
         let Ok(device) = super::GraphicsDevice::create() else {
-            eprintln!("no D3D11 device in this session; skipping the damage check");
+            eprintln!("no D3D11 device in this session; skipping the export check");
             return;
         };
-        let width = 96u32;
-        let height = 96u32;
-        let background = [200u8, 180, 160, 255];
+        let width = 64u32;
+        let height = 48u32;
+        let background = [64u8, 96, 128, 255];
         let Ok(mut renderer) = OverlayRenderer::new(std::sync::Arc::new(device), 96) else {
             return;
         };
@@ -1083,6 +1750,8 @@ mod tests {
             .update_frame(width, height, &solid_bgra(width, height, background))
             .unwrap();
         renderer.ensure_back_buffer(width, height).unwrap();
+
+        // A preview target we can read the whole frame back from.
         let target = renderer
             .device()
             .create_render_target_texture(width, height)
@@ -1097,172 +1766,71 @@ mod tests {
         .unwrap();
 
         let frame = Rect::from_origin_size(Point::new(0, 0), width as i32, height as i32);
+        let selection = Rect::new(16, 12, 48, 36);
+        // A solid red filled rectangle sitting wholly inside the selection.
+        let item = AnnotationItem {
+            id: 1,
+            kind: AnnotationKind::Rectangle,
+            geometry: AnnotationGeometry::Rect {
+                bounds: Rect::new(20, 16, 40, 30),
+            },
+            style: AnnotationStyle {
+                stroke_color: [1.0, 0.0, 0.0, 1.0],
+                fill_color: Some([1.0, 0.0, 0.0, 1.0]),
+                ..AnnotationStyle::default()
+            },
+        };
 
-        // First pass: a large marquee, drawn in full.
-        let mut full = RenderView::new(frame);
-        full.selection = Rect::new(8, 8, 40, 40);
-        full.show_chrome = false;
-        full.cursor_visible = false;
-        full.damage.clear();
-        renderer.draw_to(&target_bitmap, &full).unwrap();
-        let before = renderer.device().read_back_bgra(&target.texture).unwrap();
+        // The view the export path uses: chrome/cursor/selection-box/draft all off.
+        let mut view = RenderView::new(frame);
+        view.selection = selection;
+        view.show_chrome = false;
+        view.cursor_visible = false;
+        view.annotation_items = vec![item];
+        view.annotation_selected_id = None;
+        view.annotation_draft = None;
 
-        // Second pass: the marquee's right edge pulls in from x=40 to x=24, but only the
-        // box (8,8)-(32,32) is declared damaged.
-        let damage = Rect::new(8, 8, 32, 32);
-        let mut partial = RenderView::new(frame);
-        partial.selection = Rect::new(8, 8, 24, 40);
-        partial.show_chrome = false;
-        partial.cursor_visible = false;
-        partial.damage = vec![damage];
-        renderer.draw_to(&target_bitmap, &partial).unwrap();
-        let after = renderer.device().read_back_bgra(&target.texture).unwrap();
+        // Reference: present the same view and read the whole frame back.
+        renderer.draw_to(&target_bitmap, &view).unwrap();
+        let full = renderer.device().read_back_bgra(&target.texture).unwrap();
 
-        // Inside the damage the change is visible: (24,10) was selected in the first pass
-        // and is masked now.
-        let inside_before = pixel_at(&before, width, 24, 10);
-        let inside_after = pixel_at(&after, width, 24, 10);
-        assert_ne!(
-            inside_before, inside_after,
-            "the damaged region must actually be repainted"
+        // The artifact crop.
+        let crop_w = selection.width() as u32;
+        let crop_h = selection.height() as u32;
+        let export = renderer.render_export(&view).unwrap();
+        assert_eq!(
+            export.len(),
+            (crop_w * crop_h * 4) as usize,
+            "export must be exactly the selection region, tightly packed"
         );
-        assert_eq!(inside_before, background, "was selected in the first pass");
-        assert_eq!(inside_after, masked(background), "is masked in the second pass");
 
-        // Outside the damage, every sampled pixel is untouched — including (40,10), which
-        // is still inside the selection and would have been repainted by a full redraw.
-        let mut changed = Vec::new();
-        for (x, y) in [(4, 4), (60, 60), (80, 20), (20, 80), (90, 90), (40, 10), (36, 16)] {
-            if pixel_at(&before, width, x, y) != pixel_at(&after, width, x, y) {
-                changed.push((x, y));
+        // Every exported pixel equals the preview's same location: same code path,
+        // correct row pitch and offset.
+        for y in 0..crop_h {
+            for x in 0..crop_w {
+                let preview = pixel_at(&full, width, selection.left as u32 + x, selection.top as u32 + y);
+                let artifact = pixel_at(&export, crop_w, x, y);
+                assert_eq!(
+                    artifact, preview,
+                    "export pixel ({x},{y}) must match the presented preview crop"
+                );
             }
         }
+
+        // The annotation is baked into the artifact (not just the preview):
+        // a fill-interior pixel is red, not the blue frame.
+        let red = pixel_at(&export, crop_w, (30 - selection.left) as u32, (23 - selection.top) as u32);
         assert!(
-            changed.is_empty(),
-            "pixels outside the damage region were rewritten: {changed:?}"
-        );
-    }
-
-    /// The pointer layer changes only locally; the static scene stays byte-identical.
-    ///
-    /// This is the Phase 2 acceptance (docs/11 §"静态层像素不变、指针层局部变化") and the
-    /// regression guard for the old full-screen-crosshair degeneration. A hover moves the
-    /// magnifier and the local reticle, so the damage is the union of the two cursors'
-    /// pointer footprints. Everything outside that union — the frozen frame, the mask and
-    /// the selection chrome — must be untouched, which is only true because the reticle is
-    /// a *local* crosshair and not a full-frame pair of lines.
-    #[test]
-    fn pointer_move_updates_only_the_pointer_region() {
-        let Ok(device) = super::GraphicsDevice::create() else {
-            eprintln!("no D3D11 device in this session; skipping the pointer-layer check");
-            return;
-        };
-        let width = 400u32;
-        let height = 400u32;
-        let background = [120u8, 140, 160, 255];
-        let Ok(mut renderer) = OverlayRenderer::new(std::sync::Arc::new(device), 96) else {
-            return;
-        };
-        renderer
-            .update_frame(width, height, &solid_bgra(width, height, background))
-            .unwrap();
-        renderer.ensure_back_buffer(width, height).unwrap();
-        let target = renderer
-            .device()
-            .create_render_target_texture(width, height)
-            .unwrap();
-        let d2d_context = renderer.device().create_d2d_context().unwrap();
-        let target_bitmap = super::super::d3d11::create_bitmap_from_texture(
-            &d2d_context,
-            &target.texture,
-            D2D1_BITMAP_OPTIONS_TARGET,
-            D2D1_ALPHA_MODE_PREMULTIPLIED,
-        )
-        .unwrap();
-
-        let frame = Rect::from_origin_size(Point::new(0, 0), width as i32, height as i32);
-        let metrics = renderer.metrics();
-        let work_area = frame;
-        let config = MagnifierConfig::default().scaled(metrics.dpi);
-        // The pointer footprint a move must repaint: exactly what `cursor_damage` returns.
-        let pointer_damage = |cursor: Point| -> Vec<Rect> {
-            let magnifier = magnifier_geometry(cursor, config, frame, work_area);
-            let reticle = crosshair_geometry(cursor, crosshair_radius(metrics.dpi), frame);
-            vec![magnifier.bounds, reticle.bounds]
-        };
-
-        let selection = Rect::new(10, 10, 70, 70);
-        let cursor_a = Point::new(80, 80);
-        let cursor_b = Point::new(200, 80);
-
-        // First frame: full composition with the pointer at A.
-        let mut view_a = RenderView::new(frame);
-        view_a.selection = selection;
-        view_a.show_chrome = true;
-        view_a.cursor_visible = true;
-        view_a.cursor = cursor_a;
-        view_a.damage.clear();
-        renderer.draw_to(&target_bitmap, &view_a).unwrap();
-        let before = renderer.device().read_back_bgra(&target.texture).unwrap();
-
-        // Second frame: the pointer moved to B; only the two pointer footprints damaged.
-        let damage: Vec<Rect> = pointer_damage(cursor_a)
-            .into_iter()
-            .chain(pointer_damage(cursor_b))
-            .collect();
-        let mut union = damage[0];
-        for rect in &damage {
-            union = union.union(*rect);
-        }
-        // The degeneration this phase removes: a full-screen crosshair adds a whole-width
-        // and a whole-height line, so the union becomes exactly the frame and every hover
-        // repaints everything. The local reticle must keep the union strictly bounded in
-        // both dimensions, leaving the four corners of the screen untouched.
-        assert!(
-            union.width() < frame.width() && union.height() < frame.height(),
-            "pointer damage union {}x{} spans the {}x{} frame — the crosshair is not local",
-            union.width(),
-            union.height(),
-            frame.width(),
-            frame.height(),
+            red[2] > 200 && red[0] < 60 && red[1] < 60,
+            "annotation fill must appear in the export, got {red:?}"
         );
 
-        let mut view_b = RenderView::new(frame);
-        view_b.selection = selection;
-        view_b.show_chrome = true;
-        view_b.cursor_visible = true;
-        view_b.cursor = cursor_b;
-        view_b.damage = damage;
-        renderer.draw_to(&target_bitmap, &view_b).unwrap();
-        let after = renderer.device().read_back_bgra(&target.texture).unwrap();
-
-        // Static pixels far outside every damaged rect are byte-identical: the L0 frame,
-        // the L1 mask and the selection chrome were not re-rasterised.
-        for (x, y) in [(390u32, 390u32), (30, 30), (390, 30), (30, 390), (250, 350)] {
-            assert!(
-                !union.contains(Point::new(x as i32, y as i32)),
-                "test sample ({x},{y}) unexpectedly lies inside the damage union"
-            );
-            assert_eq!(
-                pixel_at(&before, width, x, y),
-                pixel_at(&after, width, x, y),
-                "static pixel ({x},{y}) changed while only the pointer moved"
-            );
-        }
-
-        // The pointer region genuinely changed: a point on B's reticle that A never drew.
-        let b_reticle = crosshair_geometry(cursor_b, crosshair_radius(metrics.dpi), frame);
-        let moved_probe = Point::new(cursor_b.x + 10, b_reticle.horizontal.top);
-        assert!(
-            !pointer_damage(cursor_a)
-                .iter()
-                .any(|rect| rect.contains(moved_probe)),
-            "test probe must be outside A's footprint"
-        );
-        assert_ne!(
-            pixel_at(&before, width, moved_probe.x as u32, moved_probe.y as u32),
-            pixel_at(&after, width, moved_probe.x as u32, moved_probe.y as u32),
-            "the pointer layer must actually repaint at the new cursor"
+        // Selected-but-unannotated pixels keep the raw frame brightness: the L1 mask
+        // and the L3 selection chrome never enter the artifact.
+        let clear = pixel_at(&export, crop_w, 1, 1);
+        assert_eq!(
+            clear, background,
+            "selected, unannotated pixels must stay raw (no mask/chrome)"
         );
     }
 
@@ -1379,6 +1947,76 @@ mod tests {
         assert_eq!(panel[3], 255, "the label panel must be fully opaque");
     }
 
+    /// Regression for the drag ghost: every present repaints the whole surface, so a
+    /// moving selection cannot leave the previous frame's chrome behind. The size label
+    /// and grips are painted partly *outside* the selection rect, so a partial repaint
+    /// that only covered the raw selection would strand the old label — the exact ghost
+    /// this guards against.
+    #[test]
+    fn moving_the_selection_erases_the_previous_chrome() {
+        let Ok(device) = super::GraphicsDevice::create() else {
+            return;
+        };
+        let width = 640u32;
+        let height = 480u32;
+        let background = [200u8, 180, 160, 255];
+        let Ok(mut renderer) = OverlayRenderer::new(std::sync::Arc::new(device), 96) else {
+            return;
+        };
+        let frame = Rect::from_origin_size(Point::new(0, 0), width as i32, height as i32);
+        renderer
+            .update_frame(width, height, &solid_bgra(width, height, background))
+            .unwrap();
+        renderer.ensure_back_buffer(width, height).unwrap();
+        let target = renderer
+            .device()
+            .create_render_target_texture(width, height)
+            .unwrap();
+        let d2d_context = renderer.device().create_d2d_context().unwrap();
+        let bitmap = super::super::d3d11::create_bitmap_from_texture(
+            &d2d_context,
+            &target.texture,
+            D2D1_BITMAP_OPTIONS_TARGET,
+            D2D1_ALPHA_MODE_PREMULTIPLIED,
+        )
+        .unwrap();
+
+        let selection_a = Rect::new(120, 120, 240, 200);
+        let selection_b = Rect::new(360, 360, 480, 440);
+
+        // Frame A: selection at A, chrome drawn.
+        let mut view_a = RenderView::new(frame);
+        view_a.selection = selection_a;
+        view_a.show_chrome = true;
+        view_a.cursor_visible = false;
+        renderer.draw_to(&bitmap, &view_a).unwrap();
+        let after_a = renderer.device().read_back_bgra(&target.texture).unwrap();
+
+        // A probe on A's size label, above the top-left — outside the raw selection.
+        let probe = Point::new(selection_a.left + 12, selection_a.top - 12);
+        assert_ne!(
+            pixel_at(&after_a, width, probe.x as u32, probe.y as u32),
+            masked(background),
+            "frame A must paint the size label above the selection"
+        );
+
+        // Frame B: move the selection far away. Because the whole surface is repainted,
+        // the previous chrome is gone — a stale back buffer (the flip-model ghost) would
+        // leave the label behind.
+        let mut view_b = RenderView::new(frame);
+        view_b.selection = selection_b;
+        view_b.show_chrome = true;
+        view_b.cursor_visible = false;
+        renderer.draw_to(&bitmap, &view_b).unwrap();
+        let after_b = renderer.device().read_back_bgra(&target.texture).unwrap();
+
+        assert_eq!(
+            pixel_at(&after_b, width, probe.x as u32, probe.y as u32),
+            masked(background),
+            "moving the selection must erase the previous chrome (ghost regression)"
+        );
+    }
+
     #[test]
     fn metrics_scale_with_dpi() {
         let at_100 = RenderMetrics::for_dpi(96);
@@ -1417,56 +2055,6 @@ mod tests {
     #[test]
     fn mask_alpha_is_translucent_but_dark() {
         assert!(MASK_ALPHA > 0.0 && MASK_ALPHA < 1.0);
-    }
-
-    #[test]
-    fn damage_union_covers_both_selections() {
-        let frame = Rect::new(0, 0, 1000, 800);
-        let old = Rect::new(100, 100, 200, 200);
-        let new = Rect::new(300, 400, 500, 600);
-        let mut view = RenderView::new(frame);
-        view.selection = new;
-        view.damage = vec![old, new];
-        // The clip is the union of the damage, so both the old and the new selection
-        // are inside the repainted region.
-        assert_eq!(damage_clip(&view), Some(Rect::new(100, 100, 500, 600)));
-    }
-
-    #[test]
-    fn damage_clip_is_the_damage_bounding_box_not_the_whole_frame() {
-        let frame = Rect::new(0, 0, 1920, 1080);
-        let mut view = RenderView::new(frame);
-        view.damage = vec![
-            Rect::new(10, 20, 60, 40),
-            Rect::new(100, 200, 140, 260),
-        ];
-        let clip = damage_clip(&view).unwrap();
-        assert_eq!(clip, Rect::new(10, 20, 140, 260));
-        assert!(
-            clip.area() < frame.area() / 10,
-            "a small cursor move must not clip to the whole screen"
-        );
-    }
-
-    #[test]
-    fn empty_damage_means_repaint_everything() {
-        // A caller that declares no damage must not end up with a stale window.
-        let frame = Rect::new(0, 0, 640, 480);
-        let mut view = RenderView::new(frame);
-        view.damage.clear();
-        assert_eq!(damage_clip(&view), Some(frame));
-    }
-
-    #[test]
-    fn damage_outside_the_frame_is_ignored() {
-        let frame = Rect::new(0, 0, 640, 480);
-        let mut view = RenderView::new(frame);
-        view.damage = vec![Rect::new(700, 700, 800, 800)];
-        assert_eq!(damage_clip(&view), None, "nothing to repaint");
-
-        // Partially overlapping damage is trimmed to the frame.
-        view.damage = vec![Rect::new(600, 400, 700, 500)];
-        assert_eq!(damage_clip(&view), Some(Rect::new(600, 400, 640, 480)));
     }
 
     #[test]

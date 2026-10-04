@@ -6,6 +6,7 @@
 
 use tauri::State;
 
+use crate::capture::annotation::AnnotationCommand;
 use crate::capture::CaptureState;
 use crate::domain::IpcError;
 
@@ -62,6 +63,20 @@ pub fn capture_state(runtime_state: RuntimeState<'_>) -> CaptureStateView {
     }
 }
 
+/// Forward one coarse toolbar annotation command into the overlay's annotation
+/// mailbox. Low frequency by design — a single call per toolbar click, never per
+/// mouse move or pixel frame (docs/11 §7.1 "工具栏不进入像素管线").
+#[cfg(windows)]
+#[tauri::command]
+pub fn capture_annotation(
+    runtime_state: RuntimeState<'_>,
+    command: AnnotationCommand,
+) -> Result<(), IpcError> {
+    runtime(&runtime_state)
+        .annotation_command(command)
+        .map_err(IpcError::from)
+}
+
 #[cfg(not(windows))]
 #[tauri::command]
 pub fn capture_start() -> Result<bool, IpcError> {
@@ -86,6 +101,12 @@ pub fn capture_state() -> CaptureStateView {
     CaptureStateView {
         state: CaptureState::Idle,
     }
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+pub fn capture_annotation(_command: AnnotationCommand) -> Result<(), IpcError> {
+    Err(unsupported())
 }
 
 #[cfg(not(windows))]

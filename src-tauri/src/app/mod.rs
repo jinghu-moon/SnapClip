@@ -118,6 +118,7 @@ pub fn run() {
             crate::commands::capture::capture_cancel,
             crate::commands::capture::capture_confirm,
             crate::commands::capture::capture_state,
+            crate::commands::capture::capture_annotation,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,6 +1,7 @@
 //! Cross-thread entry point for the capture feature.
 
 use super::OverlayPlatform;
+use crate::capture::annotation::AnnotationCommand;
 use crate::capture::{CaptureResult, CaptureState};
 
 #[cfg(not(windows))]
@@ -47,6 +48,12 @@ impl CaptureRuntime {
     /// `Enter`: confirm the current selection.
     pub fn confirm_capture(&self) -> CaptureResult<()> {
         self.platform.request_confirm()
+    }
+
+    /// Forward one low-frequency toolbar instruction to the active session's
+    /// annotation document.
+    pub fn annotation_command(&self, command: AnnotationCommand) -> CaptureResult<()> {
+        self.platform.request_annotation(command)
     }
 }
 

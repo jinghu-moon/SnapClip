@@ -105,8 +105,10 @@ impl CaptureSession {
 
     /// Whether the overlay currently paints a selection.
     pub fn has_selection(&self) -> bool {
-        matches!(self.state, CaptureState::Selecting | CaptureState::Selected)
-            && !self.selection.is_empty()
+        matches!(
+            self.state,
+            CaptureState::Selecting | CaptureState::Selected | CaptureState::Annotating
+        ) && !self.selection.is_empty()
     }
 
     /// Whether the overlay should paint the selection chrome (border, handles,
@@ -238,13 +240,33 @@ impl CaptureSession {
         self.mode = None;
     }
 
+    /// `Selected -> Annotating`: the selection is locked and object annotations can
+    /// be created / edited on top of it (docs/11 §8). Requires a non-empty selection.
+    pub fn begin_annotating(&mut self) -> Result<(), CaptureError> {
+        if self.state != CaptureState::Selected {
+            return Err(CaptureError::InvalidState(format!(
+                "cannot annotate while {}",
+                self.state.as_str()
+            )));
+        }
+        if self.selection.is_empty() {
+            return Err(CaptureError::InvalidState("nothing selected".into()));
+        }
+        // Selection drags are over: drop any in-flight selection drag so the
+        // pointer now drives the annotation document instead.
+        self.drag = None;
+        self.mode = None;
+        self.state = CaptureState::Annotating;
+        Ok(())
+    }
+
     /// `Selected -> Exporting`. Returns the clipped selection to resolve.
     ///
     /// Entering `Exporting` is the overlay's signal to stop painting: from here the
     /// frozen frame is being handed to the export worker, and a repaint would race the
     /// region readback for the single-threaded D3D11 context.
     pub fn begin_export(&mut self) -> Result<ExportOutcome, CaptureError> {
-        if !matches!(self.state, CaptureState::Selected) {
+        if !matches!(self.state, CaptureState::Selected | CaptureState::Annotating) {
             return Err(CaptureError::InvalidState(format!(
                 "cannot confirm while {}",
                 self.state.as_str()
@@ -402,6 +424,7 @@ mod tests {
             CaptureState::Armed,
             CaptureState::Selecting,
             CaptureState::Selected,
+            CaptureState::Annotating,
             CaptureState::Exporting,
         ] {
             let mut session = CaptureSession::new("session-1");
@@ -433,7 +456,15 @@ mod tests {
                     session.begin_export().unwrap();
                 }
                 CaptureState::Idle => unreachable!("idle is not an active state"),
-                CaptureState::Adjusting | CaptureState::Annotating => {
+                CaptureState::Annotating => {
+                    session.arm(frame(), &layout()).unwrap();
+                    session.overlay_ready().unwrap();
+                    session.pointer_pressed(Point::new(10, 10));
+                    session.pointer_moved(Point::new(200, 200));
+                    session.pointer_released();
+                    session.begin_annotating().unwrap();
+                }
+                CaptureState::Adjusting => {
                     unreachable!("{state:?} belongs to the docs/11 contract but is not reachable until its phase lands")
                 }
             }
@@ -576,6 +607,45 @@ mod tests {
         assert!(session.shows_chrome());
         session.pointer_released();
         assert!(session.shows_chrome());
+    }
+
+    #[test]
+    fn annotating_locks_selection_and_stays_confirmable() {
+        let mut session = armed_session();
+        session.pointer_pressed(Point::new(100, 100));
+        session.pointer_moved(Point::new(400, 300));
+        assert_eq!(session.pointer_released(), CaptureState::Selected);
+
+        session.begin_annotating().unwrap();
+        assert_eq!(session.state(), CaptureState::Annotating);
+        // Chrome keeps painting and the selection is unchanged.
+        assert!(session.shows_chrome());
+        assert_eq!(session.selection(), Rect::new(100, 100, 400, 300));
+        // A pointer press in Annotating does not re-open a selection drag.
+        assert_eq!(session.pointer_pressed(Point::new(500, 500)), SelectionGeometry::Outside);
+        assert_eq!(session.selection(), Rect::new(100, 100, 400, 300));
+
+        // Confirm from Annotating produces the same clipped selection.
+        let outcome = session.begin_export().unwrap();
+        assert_eq!(
+            outcome,
+            ExportOutcome::Produce {
+                selection: Rect::new(100, 100, 400, 300)
+            }
+        );
+    }
+
+    #[test]
+    fn annotating_requires_a_selected_session() {
+        let mut session = armed_session();
+        // Still Selecting (no committed selection) -> rejected.
+        assert!(session.begin_annotating().is_err());
+        session.pointer_pressed(Point::new(10, 10));
+        session.pointer_moved(Point::new(100, 100));
+        session.pointer_released();
+        assert!(session.begin_annotating().is_ok());
+        // Cannot enter twice.
+        assert!(session.begin_annotating().is_err());
     }
 }
 

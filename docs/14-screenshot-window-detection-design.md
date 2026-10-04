@@ -423,9 +423,9 @@ SnapClip 采用三层保护：
 | HWND 重用 | 吸附前验证 PID/class hash/边界（§5.4） |
 | 快照过期 | 目标验证失败 → 刷新快照重命中一次；excluded 集合/显示器变化 → 快照失效 |
 | 窗口移动致 hover 过期 | 检测 worker 轻量重验证当前 hover HWND，`BoundsChanged` 经 `apply_candidate_update` 同步更新快照与 hover，`Invalid` 则刷新快照重命中（§5.5） |
-| DWM 同步调用阻塞消息循环 | hover 重验证在检测 worker 线程执行；overlay 线程只接收校验后的结果；点击路径的单次 `validate` 由 `window_validate_us` 监控（§5.5） |
+| DWM 同步调用阻塞消息循环 | hover 重验证在检测 worker 线程执行；overlay 线程只接收校验后的结果；确认路径的单次 `validate` 由 `window_validate_us` 监控（§5.5） |
 | BoundsChanged 后 hover 跳回旧位置 | 新矩形必须写回快照，`hit_test` 与 hover 共用同一数据源；回投结果按 epoch+HWND 校验，陈旧丢弃（§5.5） |
-| 吸附最终失败 | PointerUp 后不进入 ManualDrag：保持原选区、清除 PendingClick，等待下一次按下（§5.4） |
+| 吸附最终失败 | 确认时不提交新选区：恢复确认前选区、清除 AutoSnapPreview，等待下一次停稳（§5.4） |
 | overlay 命中自己 | 三层保护：affinity + excluded 集合 + 捕获降级（§7） |
 | 空/退化矩形 | `is_empty` + 最小尺寸过滤 |
 | 负虚拟桌面坐标 | `window_rect_to_local` 纯函数单测覆盖 |
@@ -465,7 +465,7 @@ mouse_move_coalesced_count
 缓存命中 P95 < 0.1 ms
 快照刷新 P95 < 10 ms
 鼠标移动处理不阻塞 overlay 消息循环
-点击路径单次 validate P95 < 1 ms（超出则按 §5.5 迁入 worker 异步提交）
+确认路径单次 validate P95 < 1 ms（超出则按 §5.5 迁入 worker 异步提交）
 hover 重验证不占用 overlay 消息循环线程时间片（worker 执行，§5.5）
 ```
 

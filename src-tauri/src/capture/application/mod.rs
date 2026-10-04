@@ -8,6 +8,7 @@ pub mod runtime;
 
 use crate::domain::CaptureState;
 
+use super::annotation::AnnotationCommand;
 use super::geometry::MonitorLayout;
 use super::{CaptureError, CaptureResult};
 
@@ -51,6 +52,15 @@ pub trait OverlayPlatform: Send + Sync + 'static {
     fn request_cancel(&self) -> CaptureResult<()>;
 
     fn request_confirm(&self) -> CaptureResult<()>;
+
+    /// Deliver one low-frequency toolbar instruction to the running session's
+    /// annotation document. The Vue toolbar emits at most one per click, never on
+    /// mouse-move or per pixel (docs/11 §7.1 "工具栏不进入像素管线"). The default
+    /// rejects the call so only platforms with a real overlay need to override it.
+    fn request_annotation(&self, command: AnnotationCommand) -> CaptureResult<()> {
+        let _ = command;
+        Err(CaptureError::Unsupported)
+    }
 
     fn shutdown(&self);
 }

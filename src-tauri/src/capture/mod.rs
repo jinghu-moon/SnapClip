@@ -10,6 +10,7 @@
 //! service), and the error type on the IPC boundary.
 
 mod error;
+pub mod annotation;
 pub mod geometry;
 pub mod sampler;
 pub mod session;
