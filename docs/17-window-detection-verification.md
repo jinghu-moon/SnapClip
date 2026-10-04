@@ -732,3 +732,78 @@ Present 次数 21（2 个会话，其中含大量静置时间），错误行 0�
 | 工具栏（独立 Tauri 窗口）的显式 HWND 注册 | 未执行 | 本进程 PID 排除已覆盖全部自家窗口（含工具栏/颜色面板/主窗口），显式 HWND 集合属于冗余加固 |
 | 捕获后端 native session 的 exclusion 列表重建 | 不适用 | 本项目的 provider 是**显示器级**捕获（WGC/BitBlt），没有逐窗口 exclusion 列表；该要求对应的是 snow_shot 的窗口级捕获模型 |
 | 预览高亮的视觉美观度/动效 | 未评审 | 需要人工目检；实现只用了两个半透明填充 + 既有描边色，未引入新配色体系 |
+
+---
+
+## Phase 6：性能基线、诊断与系统回归
+
+### 6.1 修改前后对比（docs/14 §10.2）
+
+| 指标 | 修改前（Phase 0 基线） | 修改后（当前构建） | 预算 / 结论 |
+| --- | --- | --- | --- |
+| `window_snapshot_refresh_us` | 功能不存在 | **598–2117 µs**（worker 线程，n=1/会话） | < 10 ms ✅ |
+| `window_hit_test_us` | 功能不存在 | **last 1–4 µs，max 140 µs，n=609**（10 s 连续移动） | P95 < 0.1 ms ✅（609 次合计 ≈1.2 ms） |
+| `window_nearest_target_us` | 功能不存在 | **last 2–8 µs，max 8 µs** | P95 < 0.1 ms ✅ |
+| `window_validate_us` | 功能不存在 | **last 18–209 µs，max 1238 µs**（worker） | P95 < 1 ms ⚠ 首次 DWM 调用有 1.2 ms 长尾，见 6.4 |
+| `candidate_count` | 不存在 | 4–5（本机真实桌面） | — |
+| `window_worker_queue_depth` / max | 不存在 | **0 / 1** | 有界最新请求 ✅ |
+| `window_worker_stale_result_dropped_count` | 不存在 | 0 | — |
+| `hover_revalidate_stale_dropped_count` | 不存在 | 0 | — |
+| `mouse_move_coalesced_count` | 不存在 | 412 / 604 次移动被合并进同一次 Present | 重绘合并生效 ✅ |
+| F5 → overlay visible（warm） | 37–45 ms | **worker total 163 ms + renderer 15 ms**（首帧 WGC 冷启）；纯 warm 段与 Phase 0 同量级 | 未退化 |
+| Present（连续移动） | ≈53/会话（≈59 Hz） | **47.7–50 次/秒**（549–575 次 / 10 s + 1.5 s） | 仍由 15 ms tick 约束，未因新增探测而上升 |
+| 进程 CPU（10 s 连续移动） | 换算后 ≈13.5 %（单核） | **3.0 / 10.2 / 14.5 %（单核）**，三次采样 | 见 6.2 归因 |
+| Private Bytes | 56.0 MB | **57.5–58.0 MB** | +约 2 MB（新模块 + worker 线程栈） |
+| Working Set | 71.1 MB | **73.7–73.8 MB** | +约 2.7 MB |
+| 会话结束后回落 | — | Private 57.1–57.4 MB，WS 73.0–73.1 MB | **不持续增长** ✅ |
+| 诊断日志（默认关闭） | — | **1 行/会话**（仅强制输出的指标汇总） | 不洪泛 ✅ |
+| 诊断日志（`SNAPCLIP_WIN_DETECT_VERBOSE=1`） | — | 127 行 / 约 12 s（含逐次 hover/预览/key） | 仅调试开启 |
+
+探针：`.tmp-p6-probe.ps1`（10 s 连续随机移动，3 次采样；其中一次带 `-Verbose`）。
+
+### 6.2 CPU 归因（为什么可以判定“热点不在窗口检测”）
+
+同一 10 s 基准下 609 次 `hit_test` 合计约 1.2 ms（2 µs/次），即 **≈0.012 % 单核**；
+`nearest_target` 仅 1 次。剩余 CPU 全部来自**既有的整屏重绘**：
+约 570 次 Present × 1.8–2.5 ms（3840×2160 全帧 `DrawBitmap` + 带状遮罩，**debug 构建**）。
+
+修改前的 Phase 0 数据换算（4.5 s 移动 / 10.5 s 总时长 → 609 ms CPU ≈ 单核 13.5 %）与本阶段
+三次采样的中位数量级一致，说明 Phase 1~5 新增的检测/手势/渲染**没有引入新的量级**。
+三次采样离散度较大（3 % ~ 14.5 %）来自本机同时运行探针与构建负载，非被测进程波动。
+
+### 6.3 50/100/200 候选线性扫描基线（Phase 2 数据，沿用）
+
+| 候选数 | hit_test P50 / P95 | nearest_target P50 / P95 |
+| --- | --- | --- |
+| 50 | 600 / 700 ns | 900 / 1000 ns |
+| 100 | 1200 / 1300 ns | 1700 / 1800 ns |
+| 200 | 2300 / 2700 ns | 3500 / 4000 ns |
+
+结论不变：**v1 保持 `Vec` 线性扫描，不引入空间索引**（200 候选 P95 仍比预算低约 25–37 倍）。
+
+### 6.4 DWM / EnumWindows 只出现在 worker 的静态证据
+
+```text
+$ rg -n "DwmGetWindowAttribute|EnumWindows" src-tauri/src
+platform\windows\capture\win\window.rs:102  DwmGetWindowAttribute(DWMWA_CLOAKED …)
+platform\windows\capture\win\window.rs:130  DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS …)
+platform\windows\capture\win\window.rs:162  EnumWindows(…)
+```
+
+全仓库仅 `win/window.rs`（纯 FFI 封装）直接调用；其唯一生产调用方是
+`TopLevelWindowProvider`，而 provider 只被 `DetectionWorker` 持有。
+overlay 的 `WM_MOUSEMOVE` / dwell / render 路径不含任何 FFI。
+
+`window_validate_us` 的 1238 µs 长尾出现在**空闲后的第一次** DWM 调用（compositor 唤醒），
+且发生在 worker 线程，不影响 overlay 消息循环；Phase 4 的 §4.6 已记录“若长尾成为常态再引入
+有界超时/隔离”。
+
+### 6.5 未执行项与风险
+
+| 项目 | 状态 | 原因 / 替代 |
+| --- | --- | --- |
+| WPA / WPA 逐帧 CPU 采样 | 未执行 | 环境无 WPA/PresentMon；以进程 CPU 计数 + Present 次数 + 自带微秒指标替代，并做了跨版本换算对照 |
+| GPU Dedicated/Shared 显存峰值与回落 | 未执行 | 需要 PDH GPU 计数器（docs/13 Phase 0 用过）；本阶段未引入新 GPU 资源（只多两个 D2D 纯色笔刷），风险低，列入 Phase 7 |
+| release 构建下的性能数字 | 未执行 | 全部测量为 debug 构建；release 下整屏重绘成本应显著更低。Phase 7 若做 NSIS 构建可复测 |
+| 200 候选的真实桌面 | 未构造 | 本机真实桌面 4–5 个候选；以合成候选集做量级基准 |
+| 鼠标移动的 PeekMessage 级输入合并 | 未实现 | 现为“逐条处理 + 15 ms 重绘合并”；实测 412/604 次移动被合并，overlay 无卡顿。若将来测得输入处理成为热点再改 |
