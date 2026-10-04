@@ -21,7 +21,7 @@ use ::windows::Win32::Graphics::Dwm::{
     DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
 };
 use ::windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GWL_EXSTYLE, GetClassNameW, GetWindowLongPtrW, GetWindowRect,
+    EnumChildWindows, EnumWindows, GWL_EXSTYLE, GetClassNameW, GetWindowLongPtrW, GetWindowRect,
     GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, WINDOW_EX_STYLE, WS_EX_LAYERED,
     WS_EX_TRANSPARENT,
 };
@@ -218,6 +218,59 @@ fn class_name_of(window: HWND) -> Option<String> {
     Some(String::from_utf16_lossy(&buffer[..length]))
 }
 
+/// Visible child-window rectangles of `parent`, clipped to `parent_bounds`.
+///
+/// Accessibility providers miss older and custom-drawn controls, but their child *windows*
+/// are still enumerable. This is the provider-free half of the deep-selection fallback
+/// (docs/18 §12.2), so it stays a pure Win32 read with no COM involved.
+///
+/// Children equal to the parent's own rectangle are dropped (they add no level), as are
+/// degenerate and fully-outside rectangles. The result is ordered smallest-first so callers
+/// can treat it as "most specific wins".
+pub fn visible_child_rects(parent: isize, parent_bounds: Rect) -> Vec<Rect> {
+    if !is_window(parent) {
+        return Vec::new();
+    }
+    struct Collector {
+        bounds: Rect,
+        rects: Vec<Rect>,
+    }
+
+    unsafe extern "system" fn collect(window: HWND, lparam: LPARAM) -> BOOL {
+        if !unsafe { IsWindowVisible(window) }.as_bool() {
+            return BOOL(1);
+        }
+        let mut rect = RECT::default();
+        if unsafe { GetWindowRect(window, &mut rect) }.is_err() {
+            return BOOL(1);
+        }
+        let collector = unsafe { &mut *(lparam.0 as *mut Collector) };
+        let clipped = to_rect(rect).intersect(collector.bounds);
+        if clipped.is_empty() || clipped == collector.bounds {
+            return BOOL(1);
+        }
+        collector.rects.push(clipped);
+        BOOL(1)
+    }
+
+    let mut collector = Collector {
+        bounds: parent_bounds,
+        rects: Vec::new(),
+    };
+    unsafe {
+        let _ = EnumChildWindows(
+            Some(to_hwnd(parent)),
+            Some(collect),
+            LPARAM(&mut collector as *mut Collector as isize),
+        );
+    }
+    collector.rects.sort_unstable_by_key(|rect| {
+        (rect.area(), rect.left, rect.top, rect.right, rect.bottom)
+    });
+    collector.rects.dedup();
+    collector.rects
+}
+
 /// Read the DWM attributes for a batch of candidates.
 ///
 /// Runs after enumeration, on the detection worker. Keeping it a separate entry point
@@ -248,7 +301,7 @@ mod tests {
         CreateWindowExW, DestroyWindow, DispatchMessageW, GetWindowInfo, HWND_TOPMOST, MSG,
         PM_REMOVE, PeekMessageW, SW_HIDE, SW_MINIMIZE, SW_SHOWNA, SWP_NOACTIVATE, SWP_NOMOVE,
         SWP_NOSIZE, SetWindowPos, ShowWindow, TranslateMessage, WINDOWINFO, WS_EX_NOACTIVATE,
-        WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
+        WS_CHILD, WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
     };
     use ::windows::core::w;
     use std::time::{Duration, Instant};
@@ -575,5 +628,55 @@ mod tests {
         assert!(reads[0].frame_bounds.is_some());
         assert_eq!(reads[1].hwnd, 0);
         assert_eq!(reads[1].frame_bounds, None);
+    }
+
+    #[test]
+    fn visible_child_rects_reports_child_windows_inside_the_parent() {
+        if !desktop_available() {
+            eprintln!("skipping: no interactive window station available");
+            return;
+        }
+        // A classic child-HWND hierarchy: this is the case the provider-free fallback exists
+        // for, because such controls never appear in the accessibility tree.
+        let parent = TestWindow::create(WINDOW_EX_STYLE(0), WS_OVERLAPPEDWINDOW | WS_VISIBLE)
+            .expect("desktop is available");
+        parent.bring_to_front();
+        let Some(parent_bounds) = frame_bounds(parent.handle()) else {
+            return;
+        };
+        let child = unsafe {
+            CreateWindowExW(
+                WS_EX_NOACTIVATE,
+                w!("STATIC"),
+                w!("SnapClip child fixture"),
+                WS_CHILD | WS_VISIBLE,
+                20,
+                40,
+                120,
+                60,
+                Some(parent.hwnd()),
+                None,
+                None,
+                None,
+            )
+        }
+        .expect("child window creation succeeds");
+        pump(60);
+
+        let rects = visible_child_rects(parent.handle(), parent_bounds);
+        assert!(
+            !rects.is_empty(),
+            "a visible child window must be reported inside its parent"
+        );
+        for rect in &rects {
+            assert!(!rect.is_empty());
+            assert!(
+                rect.intersect(parent_bounds) == *rect,
+                "child rectangles are clipped to the parent: {rect:?} vs {parent_bounds:?}"
+            );
+            assert_ne!(rect, &parent_bounds, "a full-size child adds no level");
+        }
+        let _ = unsafe { DestroyWindow(child) };
+        pump(20);
     }
 }

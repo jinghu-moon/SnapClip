@@ -27,8 +27,10 @@ use crate::capture::window_detection::deep::{
 };
 use crate::capture::window_detection::model::{SnapshotEpoch, TargetKind};
 use crate::capture::window_detection::uia::{
-    WalkBudget, WalkNode, WalkOutcome, is_descendable,
+    WalkBudget, WalkNode, WalkOutcome, fallback_hit_path, is_descendable, merge_hit_paths,
 };
+
+use super::win::window as win32;
 
 /// UIA provider: resolves the deepest element inside one window.
 #[derive(Debug, Default)]
@@ -46,6 +48,8 @@ pub struct UiaDeepSelectionProvider {
     children: HashMap<NodeKey, Vec<(IUIAutomationElement, WalkNode)>>,
     /// Snapshot generation the table belongs to.
     cache_epoch: Option<SnapshotEpoch>,
+    /// Provider-free child-window rectangles per window, valid for `cache_epoch`.
+    fallback_rects: HashMap<isize, Vec<Rect>>,
     /// Windows whose provider failed; skipped until the next snapshot generation.
     quarantined: HashSet<isize>,
 }
@@ -121,6 +125,7 @@ impl UiaDeepSelectionProvider {
     fn sync_cache_epoch(&mut self, epoch: SnapshotEpoch) {
         if self.cache_epoch != Some(epoch) {
             self.children.clear();
+            self.fallback_rects.clear();
             self.cache_epoch = Some(epoch);
         }
     }
@@ -208,6 +213,19 @@ impl UiaDeepSelectionProvider {
     pub fn cached_epoch(&self) -> Option<SnapshotEpoch> {
         self.cache_epoch
     }
+
+    /// Visible child-window rectangles of one window, cached for this generation.
+    ///
+    /// The enumeration is a cheap user-mode call, but it is still per-window work that has
+    /// no reason to repeat while the user moves inside the same window.
+    fn child_rects(&mut self, hwnd: isize, window_bounds: Rect) -> Vec<Rect> {
+        if let Some(cached) = self.fallback_rects.get(&hwnd) {
+            return cached.clone();
+        }
+        let rects = win32::visible_child_rects(hwnd, window_bounds);
+        self.fallback_rects.insert(hwnd, rects.clone());
+        rects
+    }
 }
 
 impl DeepSelectionProvider for UiaDeepSelectionProvider {
@@ -278,6 +296,18 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
             current = child;
             current_bounds = node.bounds;
         }
+
+        // Provider-free fallback (docs/18 §12.2): older and custom-drawn controls never show
+        // up in the accessibility tree, but their child windows do. Merging both sources is
+        // what turns "a big content pane" into "the control the user is pointing at".
+        let fallback = fallback_hit_path(
+            &self.child_rects(job.window.hwnd, window_bounds),
+            window_bounds,
+            job.point,
+        );
+        let merged = merge_hit_paths(&outcome.path, &fallback, window_bounds, job.point);
+        outcome.path = merged;
+        outcome.target = outcome.path.last().copied().unwrap_or(window_bounds);
         RefinementOutcome::Target(Box::new(finish(outcome, job)))
     }
 
@@ -286,6 +316,7 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
         self.quarantined.clear();
         // Cached geometry must not survive into a new generation either.
         self.children.clear();
+        self.fallback_rects.clear();
         self.cache_epoch = None;
     }
 }

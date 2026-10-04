@@ -512,3 +512,23 @@ COM/超时/线程层——那正是最容易被「看起来能跑」掩盖问题
 **实现顺序（下一步）**：先做 ③ 兜底路径（纯 `EnumChildWindows` + 缓存 + 合并，**不需要 COM**，
 可完整单测，且立刻能让文件列表区拿到子窗口级矩形）→ 再做 ①②④⑤ 的 MSAA 本体与超时隔离。
 这样即使 MSAA 部分延后，③ 也能独立提升现有 UIA 结果的精度。
+
+### 12.5 ③ 已完成：兜底路径 + 合并（零 COM）
+
+| 位置 | 内容 |
+| --- | --- |
+| `win/window.rs::visible_child_rects(parent, parent_bounds)` | `EnumChildWindows` 收集可见子窗口矩形；与父框求交、剔除退化与「与父框等大」、最小优先排序去重 |
+| `window_detection/uia.rs::{fallback_hit_path, merge_hit_paths, push_if_useful}` | 兜底命中路径构造 + 合并策略（更具体的 seed 胜出、按面积升序做包含链、去重、窗口外框收尾），全部纯函数 |
+| `uia_provider.rs` | UIA 下钻结果与兜底路径合并后发布；子窗口矩形按 `(hwnd, epoch)` 缓存，随 `sync_cache_epoch` / `release()` 失效 |
+
+测试：`uia.rs` 新增 4 项合并策略单测（更具体 seed、包含链、去重与嵌套序、不插入不含 tail 的兄弟），
+`win/window.rs` 新增真机单测 `visible_child_rects_reports_child_windows_inside_the_parent`
+（自建父子 HWND 夹具，断言子矩形被报告、被裁剪、且不含与父框等大的项）。
+`cargo test --lib` **331 passed / 0 failed**，`cargo check --all-targets` 0 warnings。
+
+**实机（资源管理器三点探针）**：文件列表停稳点的路径深度由 **2 提升到 3**，命令栏仍为 depth 4。
+
+**必须说明的局限**：发布矩形本身仍是整块内容区——因为资源管理器**文件项是 DirectUI，没有子 HWND**，
+`EnumChildWindows` 只能贡献内容面板这一层。也就是说 ③ 的收益体现在「经典子窗口控件」类应用上，
+Explorer 文件项的更细粒度必须靠 P3 本体（MSAA / UIA 条目级）。这一点在上一节的实测里已经体现，
+不夸大。

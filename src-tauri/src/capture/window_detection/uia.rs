@@ -172,6 +172,105 @@ impl WalkOutcome {
     }
 }
 
+// ── 兜底命中路径与合并（docs/18 §12.2）───────────────────────────────────────
+//
+// Accessibility trees miss older and custom-drawn controls entirely. The reference
+// selector therefore keeps a second, provider-free source of rectangles — the window's
+// visible child *windows* — and merges both paths. These functions are that policy, kept
+// pure so the merge rules can be tested without a COM or window station.
+
+fn contains_rect(outer: Rect, inner: Rect) -> bool {
+    !outer.is_empty()
+        && !inner.is_empty()
+        && inner.left >= outer.left
+        && inner.top >= outer.top
+        && inner.right <= outer.right
+        && inner.bottom <= outer.bottom
+}
+
+fn same_rect(left: Rect, right: Rect) -> bool {
+    left == right
+}
+
+/// Smallest-first ordering; ties broken by position so the result is deterministic.
+fn rect_sort_key(rect: Rect) -> (i64, i32, i32, i32, i32) {
+    (
+        rect.area(),
+        rect.left,
+        rect.top,
+        rect.right,
+        rect.bottom,
+    )
+}
+
+/// Push `rect` onto `path` when it is a usable, not-already-present entry.
+///
+/// A path entry must contain the point (otherwise it does not describe what the cursor is
+/// on) and must differ from the current tail (otherwise the path would repeat a node).
+fn push_if_useful(path: &mut Vec<Rect>, rect: Rect, point: Point) -> bool {
+    if rect.is_empty() || !rect.contains(point) {
+        return false;
+    }
+    if path.last() == Some(&rect) {
+        return false;
+    }
+    path.push(rect);
+    true
+}
+
+/// The provider-free hit path: every visible child window under the point, plus the frame.
+///
+/// Returned in the order they were collected; [`merge_hit_paths`] imposes the order.
+pub fn fallback_hit_path(child_rects: &[Rect], window_bounds: Rect, point: Point) -> Vec<Rect> {
+    let mut containing: Vec<Rect> = child_rects
+        .iter()
+        .copied()
+        .filter(|rect| rect.contains(point))
+        .collect();
+    push_if_useful(&mut containing, window_bounds, point);
+    containing
+}
+
+/// Merge an accessibility path with the fallback path into one ordered path.
+///
+/// Seed selection follows the reference: when the primary's first entry *contains* the
+/// fallback's first entry, the fallback entry is more specific and wins; otherwise the
+/// primary's first entry does. Everything is then ordered smallest-first and appended only
+/// when it strictly contains the current tail, which is what turns a bag of rectangles into
+/// a nested path. The window frame closes the path so `path[0]` is always the frame after
+/// re-ordering by the caller.
+pub fn merge_hit_paths(
+    primary: &[Rect],
+    fallback: &[Rect],
+    window_bounds: Rect,
+    point: Point,
+) -> Vec<Rect> {
+    let seed = match (primary.first().copied(), fallback.first().copied()) {
+        (Some(primary_seed), Some(fallback_seed)) if contains_rect(primary_seed, fallback_seed) => {
+            fallback_seed
+        }
+        (Some(primary_seed), _) => primary_seed,
+        (None, Some(fallback_seed)) => fallback_seed,
+        (None, None) => window_bounds,
+    };
+
+    let mut candidates: Vec<Rect> = primary.iter().copied().collect();
+    candidates.extend(fallback.iter().copied());
+    push_if_useful(&mut candidates, window_bounds, point);
+    candidates.sort_unstable_by_key(|rect| rect_sort_key(*rect));
+    candidates.dedup_by(|left, right| same_rect(*left, *right));
+
+    let mut path = vec![seed];
+    for candidate in candidates {
+        let tail = *path.last().expect("the path always keeps its seed");
+        if !same_rect(candidate, tail) && contains_rect(candidate, tail) {
+            path.push(candidate);
+        }
+    }
+    push_if_useful(&mut path, window_bounds, point);
+    path
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,5 +384,100 @@ mod tests {
         assert_eq!(outcome.stop_reason, StopReason::TraversalLimit);
         assert!(!outcome.push(rect(5000, 5000, 5100, 5100)));
         assert_eq!(outcome.path.len(), MAX_PATH_LEN);
+    }
+
+    #[test]
+    fn the_fallback_path_collects_the_children_under_the_point_and_the_frame() {
+        let window = rect(0, 0, 1000, 800);
+        let children = [
+            rect(0, 0, 200, 800),   // navigation pane
+            rect(200, 100, 1000, 700), // file list
+            rect(0, 800, 100, 900), // outside the window entirely
+        ];
+        let path = fallback_hit_path(&children, window, Point::new(600, 400));
+        assert!(path.contains(&rect(200, 100, 1000, 700)));
+        assert!(path.contains(&window), "the frame closes the path");
+        assert!(!path.contains(&rect(0, 800, 100, 900)), "off-window children stay out");
+        // A point on no child still yields the frame.
+        let bare = fallback_hit_path(&children, window, Point::new(900, 750));
+        assert_eq!(bare, vec![window]);
+    }
+
+    #[test]
+    fn merging_prefers_the_more_specific_seed() {
+        let window = rect(0, 0, 1000, 800);
+        let pane = rect(100, 100, 900, 700);
+        let control = rect(300, 300, 500, 400);
+        let point = Point::new(400, 350);
+
+        // The accessibility path is the coarse pane, the fallback knows the control: the
+        // control is seeded and the pane becomes its container.
+        let merged = merge_hit_paths(&[pane], &[control], window, point);
+        assert_eq!(merged.first(), Some(&control), "the more specific entry seeds");
+        assert_eq!(merged.last(), Some(&window), "the frame closes the path");
+        assert!(
+            merged.iter().any(|entry| *entry == pane),
+            "the coarser container is kept as a level: {merged:?}"
+        );
+
+        // Without a fallback the accessibility path is used as-is.
+        let only_primary = merge_hit_paths(&[pane, control], &[], window, point);
+        assert_eq!(only_primary.first(), Some(&pane));
+        assert_eq!(only_primary.last(), Some(&window));
+
+        // With neither, the path is just the frame.
+        let bare = merge_hit_paths(&[], &[], window, point);
+        assert_eq!(bare, vec![window]);
+    }
+
+    #[test]
+    fn merging_deduplicates_and_keeps_a_nested_order() {
+        let window = rect(0, 0, 1000, 800);
+        let outer = rect(100, 100, 900, 700);
+        let inner = rect(300, 300, 500, 400);
+        let deepest = rect(350, 330, 450, 370);
+        let point = Point::new(400, 350);
+        // Same rectangles from both sources, in different orders.
+        let merged = merge_hit_paths(
+            &[outer, inner],
+            &[deepest, inner, outer],
+            window,
+            point,
+        );
+        let unique: Vec<Rect> = {
+            let mut seen = Vec::new();
+            for entry in &merged {
+                if !seen.contains(entry) {
+                    seen.push(*entry);
+                }
+            }
+            seen
+        };
+        assert_eq!(unique.len(), merged.len(), "no duplicates: {merged:?}");
+        assert_eq!(
+            merged.first(),
+            Some(&deepest),
+            "the most specific entry across both sources seeds the path"
+        );
+        assert_eq!(merged.last(), Some(&window));
+        // Every level strictly contains the one before it (a nested path).
+        for pair in merged.windows(2) {
+            assert!(
+                !pair[1].is_empty() && pair[1] != pair[0],
+                "levels must differ: {merged:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn merging_never_adds_a_level_that_does_not_contain_the_current_tail() {
+        let window = rect(0, 0, 1000, 800);
+        // The seed is the caller's trusted first entry (the providers filter by containment
+        // before calling in); a sibling that contains the point but *not* the seed is not a
+        // level of this path and must not be spliced in.
+        let seed = rect(300, 300, 500, 400);
+        let sibling = rect(700, 600, 900, 780);
+        let merged = merge_hit_paths(&[seed], &[sibling], window, Point::new(400, 350));
+        assert_eq!(merged, vec![seed, window]);
     }
 }
