@@ -462,7 +462,7 @@ docs/14 §10.2 全部指标：`window_snapshot_refresh_us` / `window_snapshot_re
 | 在空白处按下 | 立刻产生零尺寸选区并进入 Selecting | 只记录 `PendingPointer`，选区不变 | 符合 docs/14 §4.2 |
 | 按下后轻微抖动并释放 | 释放即提交（或留下 1 px 选区） | 保持 Click，不提交、不改选区 | 抖动不误判 |
 | 光标停稳 | 无任何吸附行为 | 120 ms 后产生最近窗口预览 | 停稳才预览 |
-| 鼠标释放 | 无吸附语义 | **不确认**吸附 | 只能 Enter/工具栏确认 |
+| 鼠标释放 | 无吸附语义 | 未超阈值 → **左键单击确认预览**；超阈值 → 自由框选，不确认 | 见「交互变更：左键确认」 |
 | 按下前已有预览 | — | 按下即清除预览，超过阈值进入 ManualDrag | 拖拽让位 |
 | 命中手柄/选区内部 | 同（立即拖拽） | 同（立即拖拽，无阈值） | 不退化 |
 
@@ -543,7 +543,7 @@ docs/14 §10.2 全部指标：`window_snapshot_refresh_us` / `window_snapshot_re
 | 按下不会创建零尺寸选区 | 单测两处 + 实机日志 `outcome=Pending` / `selection=(0,0)->(0,0)` |
 | 轻微抖动不会误进入手动拖拽 | `a_tiny_jitter_stays_pending_and_a_real_move_starts_the_drag` |
 | 光标停稳会产生最近窗口预览 | 实机 `auto-snap preview …`；`window_nearest_target_us` 有采样 |
-| 鼠标释放不确认吸附 | `releasing_the_button_never_confirms_an_automatic_snap`；`WM_LBUTTONUP` 分支只在 `CommitDrag` 时提交 |
+| 确认手势（原「鼠标释放不确认吸附」，已由「交互变更：左键确认」取代） | `a_click_confirms_the_preview_but_a_drag_never_does`；实机 `pointer up` → `confirm requested` → `snap confirmed` |
 | Enter/工具栏确认入口清晰且不在鼠标线程同步验证 | 实机 `confirm requested` → worker（`window_validate_us`）→ `snap confirmed`；`on_key_down` 与鼠标路径互不调用 |
 | 手动框选、移动、缩放不被自动吸附破坏 | `a_press_on_a_handle_or_inside_starts_the_edit_immediately`、`session::dragging_inside_moves_the_existing_selection`（既有测试保持通过） |
 
@@ -873,3 +873,68 @@ overlay 的 `WM_MOUSEMOVE` / dwell / render 路径不含任何 FFI。
 
 以上均为**环境或人工依赖**，不涉及功能缺失；「判定 → 预览 → 确认 → 导出」的完整链路、过期处理、
 资源释放与构建产物均已通过自动化验证。
+
+---
+
+## 交互变更：左键确认（2026-10-04）
+
+### 变更内容与依据
+
+确认手势由「Enter/工具栏」改为「**鼠标左键单击**」（`Enter` 保留为等价快捷键）。
+该变更**与 docs/14 原条款冲突**（§4.1「不自动确认」、§4.2 `PointerUp`「不提交窗口吸附」、
+§12.3「鼠标释放不会自动确认吸附」），因此按「不得默默偏离文档」的要求，
+**先单独提交设计变更** `033d3f7`（docs/14 §4.3 记录冲突、原设计理由、为何该理由不再成立、
+必须同时满足的 5 条约束与影响面），再改实现。
+
+### 实现
+
+| 位置 | 变更 |
+| --- | --- |
+| `capture/window_detection/gesture.rs` | 吸附预览从 `PointerGesture` 枚举**移出**为独立字段 `GestureState::preview`；按下不再销毁预览；超过拖拽阈值才清除预览并转 `ManualDrag` |
+| `platform/windows/capture/overlay.rs` | `on_left_up` 的 `ReleaseOutcome::Click` 分支改为：先结束指针等待，再调用 `confirm_snap_preview()`（有预览才提交 worker 校验） |
+| 不变量 | 按下不改选区；无预览时单击不改变任何状态；确认仍需 worker 校验通过才 `snap_to` |
+
+预览移出手势枚举的根因：预览是**显示状态**，手势是**指针状态**。原实现让按下销毁预览，
+于是「松开确认」时已无对象可确认——两个状态放在同一个枚举里必然互相覆盖，
+这与 `Settled` 必须独立于 `PointerGesture` 是同一个道理（docs/14 §4.2/§4.3）。
+
+### 测试
+
+| 项目 | 命令 | 结果 |
+| --- | --- | --- |
+| 单元测试 | `cargo test --lib` | **293 passed / 0 failed**（Phase 7 基线 292 → +1，另有 2 项按新预期重写） |
+| 编译零告警 | `cargo check --all-targets` | exit 0，**0 warnings** |
+
+按新预期重写（**不是为了让实现通过而弱化断言**）：
+`a_click_confirms_the_preview_but_a_drag_never_does`（点击保留预览待确认；超阈值拖拽清除预览且不确认）、
+`the_preview_is_display_state_not_a_pointer_gesture`（预览不改变手势；按下不销毁预览）、
+`a_click_without_a_preview_changes_nothing`（无预览时单击零副作用）。
+
+### 实机证据（`.tmp-click-probe.ps1`，4K/DPI144/单屏 WGC）
+
+```text
+=== 会话 1：停稳 → 左键单击 → 再点一次（编辑） ===
+[win-detect] auto-snap preview hwnd=9899236 epoch=1 local=(2111,960)->(2719,1399)
+[capture] pointer down … point=(2400,1170), hit=Create, outcome=Pending     # 按下不创建选区
+[capture] pointer up   … selection=(0,0)->(0,0) state=Selecting             # 释放仍是 Click
+[win-detect] confirm requested hwnd=9899236 epoch=1 confirmation=6          # 左键触发确认
+[win-detect] snap confirmed hwnd=9899236 selection=(2111,960)->(2719,1399)  # worker 校验后提交
+[capture] pointer down … hit=Move, outcome=BeginEdit(Move)                  # 第二次点击 = 编辑
+[capture] pointer up   … selection=(2111,960)->(2719,1399) state=Selected   # 未重复确认
+
+=== 会话 2：按下 → 超过拖拽阈值 → 释放 ===
+[capture] pointer down … point=(1800,900), hit=Create, outcome=Pending
+[capture] pointer up   … selection=(1800,900)->(2550,1500) state=Selected   # 自由框选被提交
+snap_confirmed=1（全程仅会话 1 的那一次）previews=4 cancels=2 errors=0
+```
+
+结论：**左键单击确认预览**、**拖动超过阈值只提交自由框选且从不确认吸附**、
+**无预览时单击零副作用**（单测覆盖）、**已确认选区的再次点击进入编辑而非重复确认**，
+四条约束全部满足，且行为与 docs/14 §4.3 的新条款一致。
+
+### 遗留
+
+- `Enter` 目前**保留**为等价入口（工具栏同样有效）。若要求「只允许左键」，删除
+  `on_key_down` 的 Return 分支即可，属一行改动。
+- 单击确认的**误触风险**已由拖拽阈值兜底（系统 `SM_CXDRAG`，本机 DPI144 下 6 px），
+  但“点一下空白处”不会重置已确认选区（符合 §4.3 约束 4）；人工手感验收仍待你确认。

@@ -1709,6 +1709,9 @@ where
             }
             ReleaseOutcome::Click => {
                 self.session.pointer_left();
+                // Primary confirm gesture (docs/14 §4.3): a click on a previewed window
+                // commits it. A click with no preview leaves every state untouched.
+                self.confirm_snap_preview();
             }
         }
         let selection = self.session.selection();
