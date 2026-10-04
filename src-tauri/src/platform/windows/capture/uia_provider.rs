@@ -27,8 +27,7 @@ use crate::capture::window_detection::deep::{
 };
 use crate::capture::window_detection::model::{SnapshotEpoch, TargetKind};
 use crate::capture::window_detection::uia::{
-    WalkBudget, WalkNode, WalkOutcome, fallback_hit_path, is_descendable, may_try_sibling_branch,
-    merge_hit_paths,
+    WalkBudget, WalkNode, WalkOutcome, fallback_hit_path, is_descendable, merge_hit_paths,
 };
 
 use super::win::window as win32;
@@ -275,88 +274,46 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
         // Expanded levels are only valid for the snapshot generation they were read in.
         self.sync_cache_epoch(job.epoch);
 
-        // Bounded depth-first walk **with structural backtracking** (docs/18 §12.6 ①).
+        // Bounded descent (docs/18 §11 ①/⑤).
         //
-        // The previous linear descent stopped at the first dead end, so a redundant
-        // same-bounds pane sitting in front of the real content branch swallowed the whole
-        // hit (resource-manager file lists, Chromium-style trees). The stack keeps every
-        // branch that is still worth trying; `path` mirrors the frames that are currently
-        // committed, and `best_path` remembers the deepest committed path so abandoning a
-        // dead branch never loses a good answer.
-        struct Frame {
-            bounds: Rect,
-            /// The node this frame represents, kept so backtracking can ask whether a dead
-            /// branch was a redundant structural container.
-            node: WalkNode,
-            candidates: Vec<(IUIAutomationElement, WalkNode)>,
-            next: usize,
-        }
-
+        // The depth-first variant with structural backtracking (docs/18 §12.7) was reverted:
+        // it measured *worse* on real hardware — published targets became coarse enough that
+        // the scheduler's "moving inside the published path answers from cache" rule
+        // suppressed most re-queries (`refinement_submitted` fell below the window-switch
+        // count, and controls stopped following the cursor). Backtracking will be re-attempted
+        // only together with per-query instrumentation that can show what it changes.
         let mut budget = WalkBudget::new();
-        let mut path: Vec<Rect> = vec![window_bounds];
-        let mut best_path = path.clone();
-        let root_candidates = self.containing_children(
-            job.window.hwnd,
-            &request,
-            &root,
-            window_bounds,
-            job.point,
-            &mut budget,
-        );
-        let mut stack: Vec<Frame> = vec![Frame {
-            bounds: window_bounds,
-            node: WalkNode::new(window_bounds, 0, false, true),
-            candidates: root_candidates,
-            next: 0,
-        }];
-
-        while let Some(frame) = stack.last_mut() {
+        let mut current = root;
+        let mut current_bounds = window_bounds;
+        loop {
             if control.is_cancelled() {
                 outcome.stop_reason = StopReason::Cancelled;
                 break;
-            }
-            if frame.next >= frame.candidates.len() {
-                // Dead end. Backtrack only through a redundant structural node: a real control
-                // or a distinct container frame keeps its precedence and ends the walk.
-                let dead = stack.pop().expect("the loop only runs with a frame");
-                let parent_bounds = stack.last().map(|parent| parent.bounds);
-                let may_backtrack = parent_bounds
-                    .is_some_and(|parent| may_try_sibling_branch(dead.node, parent));
-                if !may_backtrack {
-                    break;
-                }
-                if path.len() > 1 {
-                    path.pop();
-                }
-                continue;
             }
             if !budget.enter_children() {
                 outcome.stop_reason = StopReason::TraversalLimit;
                 break;
             }
-            let (child, node) = frame.candidates[frame.next].clone();
-            frame.next += 1;
-            let child_candidates = self.containing_children(
-                job.window.hwnd,
-                &request,
-                &child,
-                node.bounds,
-                job.point,
-                &mut budget,
-            );
-            path.push(node.bounds);
-            if path.len() > best_path.len() {
-                best_path = path.clone();
+            let Some((child, node)) = self
+                .containing_children(
+                    job.window.hwnd,
+                    &request,
+                    &current,
+                    current_bounds,
+                    job.point,
+                    &mut budget,
+                )
+                .into_iter()
+                .next()
+            else {
+                break;
+            };
+            if !outcome.push(node.bounds) {
+                break;
             }
-            stack.push(Frame {
-                bounds: node.bounds,
-                node,
-                candidates: child_candidates,
-                next: 0,
-            });
+            current = child;
+            current_bounds = node.bounds;
         }
-        outcome.path = best_path;
-        outcome.target = outcome.path.last().copied().unwrap_or(window_bounds);
 
         // Provider-free fallback (docs/18 §12.2): older and custom-drawn controls never show
         // up in the accessibility tree, but their child windows do. Merging both sources is
