@@ -40,7 +40,10 @@ pub mod model;
 pub mod provider;
 pub mod snapshot;
 
-pub use gesture::{PointerGesture, should_start_manual_drag};
+pub use gesture::{
+    GestureState, MoveOutcome, PointerGesture, PressOutcome, ReleaseOutcome, SnapPreview,
+    should_start_manual_drag,
+};
 pub use hit_test::{point_distance_squared, rect_distance_squared};
 pub use model::{
     EpochCounter, HoverValidity, RequestGate, RequestId, SnapshotEpoch, TargetKind, WindowCandidate,

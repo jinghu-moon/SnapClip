@@ -429,3 +429,131 @@ docs/14 §10.2 全部指标：`window_snapshot_refresh_us` / `window_snapshot_re
 | overlay 真正在 `WM_MOUSEMOVE` 中调用 `hit_test` | 未接线 | 属于 Phase 3（输入状态机）与 Phase 5（渲染）的职责；本阶段先冻结可安全调用的接口与数据 |
 | provider 在非 test 构建下暂标 `dead_code` | 临时 | 检测 worker（Phase 4）接手其所有权；接线后移除该 allow |
 | 真实桌面 200 候选场景 | 未构造 | 本机常驻顶层窗口数量远小于 200；以合成候选集做量级基准，Phase 6 在真实桌面补测 |
+
+---
+
+## Phase 3：PointerGesture 与停稳自动吸附预览
+
+### 3.1 结论
+
+“按下即改选区”的隐式状态已被显式手势状态机替换：**按下不再修改选区**，拖动阈值以
+系统拖拽距离为准，光标停稳 120 ms 后对缓存快照求最近窗口产生预览，`Enter` 经检测 worker
+校验后才提交吸附。overlay 消息线程在整个过程中不执行 `EnumWindows`/DWM。
+
+### 3.2 落地内容
+
+| 能力 | 位置 | 说明 |
+| --- | --- | --- |
+| 手势状态机 | `capture/window_detection/gesture.rs::GestureState` | `press` / `move_cursor` / `release` / `apply_dwell` / `clear_preview` / `reset`；纯逻辑，无 Win32、无 GPU |
+| 手势结果 | 同上 `PressOutcome` / `MoveOutcome` / `ReleaseOutcome` | 明确告诉 overlay 该做什么，overlay 只做转发与渲染 |
+| 会话 API | `capture/session.rs` | 删除“按下即改选区”：`press` 只做命中判定；新增 `begin_drag(press_point, mode, creating)` 与 `snap_to(rect)`（裁剪 + 最小尺寸校验） |
+| 检测 worker | `platform/windows/capture/detection_worker.rs` | 容量 1 的**最新请求**邮箱；`Refresh`/`Confirm` 任务；`PostThreadMessageW(DETECTION_READY_MESSAGE)` 回投；结果带 request id；`shutdown` 幂等 |
+| 停稳计时器 | `overlay.rs`（`DWELL_TIMER_ID`） | 120 ms 一次性计时器；到期只做 generation 校验 + 缓存 `nearest_target` + 一次坐标转换 |
+| hover | `overlay.rs::update_hover` | 每次鼠标移动后查缓存快照；相同 hwnd 且相同矩形不重绘 |
+| 预览 | `overlay.rs::on_dwell` | 产生/替换/清除 `AutoSnapPreview`；按下即被 `PendingPointer` 取代（等于“超阈值取消预览”） |
+| 确认 | `overlay.rs::confirm_snap_preview` / `apply_confirmation` | `Enter` 投递 `Confirm{target}`；worker 回投后校验 identity 才 `snap_to`；失败则保留原选区、清预览、刷新快照 |
+| 自身排除 | `OverlayController::new` | 注册 overlay HWND + 本进程 PID（docs/14 §7 第 2 层）；防止全屏 overlay 命中自己 |
+| 诊断开关 | `capture/diagnostics.rs::VERBOSE_ENV` | `SNAPCLIP_WIN_DETECT_VERBOSE=1` 打开逐操作日志，默认关闭 |
+
+### 3.3 关键行为对比（修改前 / 修改后，实测）
+
+| 项目 | 修改前 | 修改后 | 预期 |
+| --- | --- | --- | --- |
+| 在空白处按下 | 立刻产生零尺寸选区并进入 Selecting | 只记录 `PendingPointer`，选区不变 | 符合 docs/14 §4.2 |
+| 按下后轻微抖动并释放 | 释放即提交（或留下 1 px 选区） | 保持 Click，不提交、不改选区 | 抖动不误判 |
+| 光标停稳 | 无任何吸附行为 | 120 ms 后产生最近窗口预览 | 停稳才预览 |
+| 鼠标释放 | 无吸附语义 | **不确认**吸附 | 只能 Enter/工具栏确认 |
+| 按下前已有预览 | — | 按下即清除预览，超过阈值进入 ManualDrag | 拖拽让位 |
+| 命中手柄/选区内部 | 同（立即拖拽） | 同（立即拖拽，无阈值） | 不退化 |
+
+### 3.4 静态与单元验证
+
+| 项目 | 命令 | 结果 |
+| --- | --- | --- |
+| 单元测试 | `cargo test --lib` | **290 passed / 0 failed**（Phase 2 基线 275 → +15） |
+| 编译零告警 | `cargo check --all-targets` | exit 0，**0 warnings** |
+| Clippy | `cargo clippy --lib --tests` | 本阶段新增文件 0 告警；overlay.rs 剩余告警均为既有 annotation/指针 cast 项（位置与 Phase 2 相同） |
+| 前端 | `npm run typecheck` / `npm run build` | exit 0 |
+
+新增测试要点：
+
+| 测试 | 断言 |
+| --- | --- |
+| `a_plain_press_never_creates_or_moves_a_selection` | 空白处按下 → `PendingPointer`，释放 → Click，选区不被触碰 |
+| `a_press_on_a_handle_or_inside_starts_the_edit_immediately` | 命中手柄/内部 → 立即 Resize/Move |
+| `a_tiny_jitter_stays_pending_and_a_real_move_starts_the_drag` | 2 px 抖动保持 Pending；跨 4 px 阈值转 ManualDrag 且锚点为按下点 |
+| `releasing_the_button_never_confirms_an_automatic_snap` | 有预览时按下 → 预览清除 → 释放为 Click（不确认） |
+| `a_stale_dwell_result_never_produces_a_preview` | 计时器 generation 与当前不符时**不产生**预览 |
+| `a_held_button_blocks_the_dwell_preview` | 按住按钮时 dwell 不产生预览 |
+| `dwell_replaces_a_preview_only_when_the_rectangle_changes` | 同矩形不重绘、换候选替换、离开半径清除 |
+| `the_preview_carries_the_selection_it_must_be_able_to_restore` | 预览携带确认前选区 |
+| `reset_drops_the_preview_and_the_pending_press` | 会话结束清理彻底，且 generation 前进 |
+| `session::a_press_alone_never_creates_a_zero_size_selection` | 生产侧 API 同样保证按下不产生选区 |
+| `session::pressing_outside_keeps_the_selection_until_the_drag_starts` | 点击不删除已确认选区；只有开始拖拽才替换 |
+| `session::snap_to_*`（2 项） | 采用可用矩形、越界裁剪、空/退化/过小/全屏外拒绝且不改状态 |
+| `detection_worker::*`（4 项） | 请求 id 回传、邮箱只留最新、确认返回有效性、shutdown 幂等且不阻塞 |
+
+### 3.5 实机端到端证据（`.tmp-p3-probe.ps1`，4K/DPI144/单屏 WGC）
+
+探针自建一个 420×300 的 WinForms 夹具窗口（属 PowerShell 进程，因此对检测可见），
+注入 F5 → 停稳 → 点击 → 再停稳 → Enter → Esc，并开启 `SNAPCLIP_WIN_DETECT_VERBOSE=1`。
+应用自身日志（节选，两次会话）：
+
+```text
+[win-detect] snapshot epoch=1 candidates=4
+[win-detect] hover hwnd=12583054 z=0 bounds=(2111,960)->(2719,1399)
+[win-detect] auto-snap preview hwnd=12583054 epoch=1 local=(2111,960)->(2719,1399)
+[win-detect] key down vk=0x1B state=Selecting          # Esc 取消
+[capture] cancel session=…-1 reason=escape active=true
+[win-detect] snapshot epoch=2 candidates=4             # 第二次 F5：新 epoch、无旧快照
+[win-detect] auto-snap preview hwnd=12583054 epoch=2 local=(2111,960)->(2719,1399)
+[win-detect] key down vk=0x0D state=Selecting          # Enter
+[win-detect] confirm requested hwnd=12583054 epoch=2 confirmation=3
+[win-detect] snap confirmed hwnd=12583054 selection=(2111,960)->(2719,1399)
+[win-detect] key down vk=0x1B state=Selected           # 已确认后 Esc
+```
+
+点击路径的日志（第二步）证明按下不再产生选区：
+
+```text
+[capture] pointer down session=…-1 point=(2550,1275), hit=Create, outcome=Pending
+[capture] pointer up   session=…-1 selection=(0,0)->(0,0) state=Selecting
+```
+
+会话指标（每次会话结束输出一行）：
+
+| 指标 | 会话 1 | 会话 2 |
+| --- | --- | --- |
+| `window_snapshot_refresh_us` | 760 / 792 µs（worker） | 1009 / 598 µs（worker） |
+| `window_hit_test_us` | last 1, max 3 µs, n=7 | last 2, max 6 µs, n=4 |
+| `window_nearest_target_us` | last 5, max 5 µs, n=4 | last 2, max 6 µs, n=2 |
+| `window_validate_us` | — | **last 28 µs, n=1**（Enter 校验） |
+| `candidate_count` | 4 | 4 |
+| `window_worker_queue_depth` / max | 0 / 1 | 0 / 1 |
+| `window_worker_stale_result_dropped_count` | 0 | 0 |
+| 错误行 | 0 | 0 |
+
+夹具窗口位于逻辑 (1400,640) 尺寸 420×300，被检测到的边界为
+`(2111,960)->(2719,1399)`（物理 630×439，等于 1.5×DPI 缩放后的值），确认后选区与之逐像素一致。
+
+### 3.6 质量门禁逐条对应
+
+| 门禁 | 证据 |
+| --- | --- |
+| 按下不会创建零尺寸选区 | 单测两处 + 实机日志 `outcome=Pending` / `selection=(0,0)->(0,0)` |
+| 轻微抖动不会误进入手动拖拽 | `a_tiny_jitter_stays_pending_and_a_real_move_starts_the_drag` |
+| 光标停稳会产生最近窗口预览 | 实机 `auto-snap preview …`；`window_nearest_target_us` 有采样 |
+| 鼠标释放不确认吸附 | `releasing_the_button_never_confirms_an_automatic_snap`；`WM_LBUTTONUP` 分支只在 `CommitDrag` 时提交 |
+| Enter/工具栏确认入口清晰且不在鼠标线程同步验证 | 实机 `confirm requested` → worker（`window_validate_us`）→ `snap confirmed`；`on_key_down` 与鼠标路径互不调用 |
+| 手动框选、移动、缩放不被自动吸附破坏 | `a_press_on_a_handle_or_inside_starts_the_edit_immediately`、`session::dragging_inside_moves_the_existing_selection`（既有测试保持通过） |
+
+### 3.7 未执行项与风险
+
+| 项目 | 状态 | 原因 / 替代 |
+| --- | --- | --- |
+| 预览/悬停高亮的**视觉**呈现 | 未实现 | 属于 Phase 5（D2D 绘制层）；本阶段以状态机 + 日志证明预览状态正确 |
+| hover 定期重验证（250 ms 定时器） | 未实现 | 属于 Phase 4；provider 的 `revalidate_hover` 已实现并有真机测试，缺少的是定时触发与回投处理 |
+| 窗口移动/关闭后的 `BoundsChanged` 在线写回 | 未实现 | 同上：`apply_candidate_update` 已单测覆盖，缺定时投递 |
+| 真实「点击后 120 ms 内再移动」的时序抖动 | 未专门构造 | 以 generation 单测覆盖；实机日志未见陈旧预览 |
+| 工具栏（Vue）确认入口 | 未接线 | 工具栏走 `OverlayCommand::Confirm`；预览确认目前只有 Enter 路径，Phase 5 统一 |
+| `mouse_move_coalesced_count` 语义 | 部分 | 目前统计“重绘 tick 已经挂起时到达的移动”（被合并进同一次 Present）；`WM_MOUSEMOVE` 本身仍逐条处理，Phase 6 若测得热点再改成 PeekMessage 级合并 |

@@ -42,7 +42,7 @@ use windows_sys::Win32::{
             DispatchMessageW, GetCursorPos, GetForegroundWindow, GetMessageW, MSG, PeekMessageW,
             PostQuitMessage,
             PostThreadMessageW, RegisterClassW, SW_HIDE, SW_SHOW, SetForegroundWindow,
-            SetWindowPos, SetTimer, KillTimer,
+            SetWindowPos, SetTimer, KillTimer, GetSystemMetrics, SM_CXDRAG,
             ShowWindow, TranslateMessage, UnregisterClassW, WM_APP, WM_DESTROY, WM_DEVICECHANGE,
             WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP,
             WM_MOUSEWHEEL, WM_SETFOCUS, WM_LBUTTONDOWN,
@@ -62,15 +62,22 @@ use crate::capture::annotation::{
     AnnotationItem, AnnotationKind, DocumentSnapshot,
 };
 use crate::capture::application::{CaptureEventSink, OverlayPlatform};
+use crate::capture::diagnostics::WindowDetectionMetrics;
 use crate::capture::geometry::{
     Handle, MagnifierConfig, MonitorLayout, Point, Rect, ResizeMode, SelectionGeometry,
-    magnifier_geometry,
+    magnifier_geometry, window_rect_to_local,
 };
 use crate::capture::sampler::{ColorFormat, ColorSampler};
 use crate::capture::session::{CaptureSession, ExportOutcome};
+use crate::capture::window_detection::model::RequestId;
+use crate::capture::window_detection::{
+    DEFAULT_DWELL_MS, DEFAULT_SNAP_RADIUS_PX, Exclusions, GestureState, MoveOutcome,
+    PressOutcome, ReleaseOutcome, WindowSnapshot, WindowTarget,
+};
 use crate::capture::{CaptureError, CaptureResult, CaptureState};
 
 use super::capture_worker::{self, CaptureWorker, StartRequest};
+use super::detection_worker::{self, DetectionResult, DetectionWorker};
 use super::export_worker::{self, ExportJob, ExportWorker};
 use super::hotkey;
 use super::monitor::{self, CapturedMonitor};
@@ -85,6 +92,10 @@ const WM_OVERLAY_COMMAND: u32 = WM_APP + 17;
 const RENDER_TICK_MS: u32 = 15;
 /// The `SetTimer` id for the coalescing render tick.
 const RENDER_TIMER_ID: usize = 0x51_C0DE;
+
+/// One-shot timer that fires once the cursor has been still for
+/// [`DEFAULT_DWELL_MS`]; the expiry handler only queries the cached snapshot.
+const DWELL_TIMER_ID: usize = 0x51_C0DF;
 /// `TrackMouseEvent` flag asking for a `WM_MOUSELEAVE` notification.
 const TME_LEAVE: u32 = 0x0000_0002;
 /// `SWP_SHOWWINDOW`.
@@ -371,7 +382,26 @@ where
     renderer: Option<Win32Renderer>,
     session: CaptureSession,
     frozen: Option<FrozenFrame>,
-    drag_mode: Option<ResizeMode>,
+    /// Explicit pointer gesture (docs/14 §4.2). Button-down no longer mutates the
+    /// selection; the gesture decides when a drag actually starts.
+    gesture: GestureState,
+    /// Window the cursor is over, in virtual-desktop screen coordinates.
+    hover_target: Option<WindowTarget>,
+    /// Latest window snapshot. Replaced wholesale when a refresh lands, never mutated
+    /// from the mouse path (except through `apply_candidate_update`).
+    snapshot: WindowSnapshot,
+    /// Refresh request currently outstanding; results tagged otherwise are dropped.
+    snapshot_request: Option<RequestId>,
+    /// Confirmation request currently outstanding.
+    confirm_request: Option<RequestId>,
+    /// HWND/process exclusions the snapshot is built with (docs/14 §7).
+    exclusions: Exclusions,
+    detector: DetectionWorker,
+    metrics: WindowDetectionMetrics,
+    /// Dwell generation the pending timer was armed for.
+    dwell_armed: Option<u64>,
+    /// Snap radius in physical pixels for the current session's DPI.
+    snap_radius: u32,
     cursor: Point,
     cursor_visible: bool,
     dirty: bool,
@@ -421,7 +451,17 @@ where
         shared: Arc<Mutex<OverlayShared>>,
         annotation_rx: mpsc::Receiver<AnnotationCommand>,
         window: HWND,
+        thread_id: u32,
     ) -> Self {
+        let metrics = WindowDetectionMetrics::new();
+        let detector = DetectionWorker::new(thread_id, metrics.clone());
+        // The overlay must never be offered as its own snap target: it is full-screen and
+        // frontmost, so a snapshot that included it would return the overlay for every
+        // point (docs/14 §7, layer 2). The process exclusion is the fallback for windows
+        // SnapClip creates later (toolbar, colour panel, main window).
+        let mut exclusions = Exclusions::new();
+        exclusions.exclude_hwnd(window as isize);
+        exclusions.exclude_process(std::process::id());
         Self {
             service,
             sink,
@@ -433,7 +473,16 @@ where
             renderer: None,
             session: CaptureSession::new("idle"),
             frozen: None,
-            drag_mode: None,
+            gesture: GestureState::new(system_drag_threshold(96)),
+            hover_target: None,
+            snapshot: WindowSnapshot::empty(),
+            snapshot_request: None,
+            confirm_request: None,
+            exclusions,
+            detector,
+            metrics,
+            dwell_armed: None,
+            snap_radius: DEFAULT_SNAP_RADIUS_PX,
             cursor: Point::default(),
             cursor_visible: false,
             dirty: false,
@@ -559,6 +608,10 @@ where
         self.publish_state();
         let layout = monitor.layout.clone();
         self.sink.on_started(&self.session_id(), &layout);
+
+        // Window detection is per-session (docs/14 §5.3): no hover, no preview, no
+        // snapshot and a fresh epoch. The refresh itself runs on the detection worker.
+        self.begin_window_detection(&monitor.layout);
 
         let mut cursor = unsafe { zeroed() };
         unsafe { GetCursorPos(&mut cursor) };
@@ -818,10 +871,21 @@ where
             self.session_id(),
             self.session.state()
         );
+        // Report the window-detection metrics for this session before clearing them, so
+        // every session leaves one line of evidence behind.
+        let summary = self.metrics.summary_line();
+        self.metrics.log_line(&summary, true);
+        self.metrics.reset();
         self.session.cancel();
         self.frozen = None;
         self.graphics_released = false;
-        self.drag_mode = None;
+        self.gesture.reset();
+        self.hover_target = None;
+        self.dwell_armed = None;
+        self.snapshot_request = None;
+        self.confirm_request = None;
+        self.snapshot.release();
+        self.disarm_dwell();
         self.cursor_visible = false;
         // Stop the coalescing tick before releasing the renderer: a pending WM_TIMER
         // must not try to present into the graphics we are about to drop.
@@ -1123,6 +1187,261 @@ where
 
     // ---- input -----------------------------------------------------------
 
+    /// Start a fresh window-detection cycle for a new session (docs/14 §5.3).
+    ///
+    /// Everything that could leak from the previous session — hover, preview, snapshot,
+    /// outstanding requests — is dropped here, and the refresh is handed to the detection
+    /// worker so the overlay thread never runs `EnumWindows`/DWM itself.
+    fn begin_window_detection(&mut self, layout: &MonitorLayout) {
+        self.gesture = GestureState::new(system_drag_threshold(layout.dpi));
+        self.snap_radius = snap_radius_px();
+        self.hover_target = None;
+        self.dwell_armed = None;
+        self.confirm_request = None;
+        self.snapshot.release();
+        self.request_snapshot_refresh();
+    }
+
+    /// Ask the detection worker for a new snapshot. Only the newest request is kept.
+    fn request_snapshot_refresh(&mut self) {
+        self.snapshot_request = Some(self.detector.request_refresh(&self.exclusions));
+    }
+
+    /// Monitor-local cursor position expressed in virtual-desktop coordinates.
+    fn cursor_screen(&self) -> Option<Point> {
+        self.layout().map(|layout| layout.to_screen(self.cursor))
+    }
+
+    /// Re-resolve the hovered window from the cached snapshot. **Pure cache read.**
+    fn update_hover(&mut self) {
+        if self.session.state() != CaptureState::Selecting {
+            self.clear_hover();
+            return;
+        }
+        let Some(screen) = self.cursor_screen() else {
+            self.clear_hover();
+            return;
+        };
+        let started = Instant::now();
+        let target = self.snapshot.hit_test(screen);
+        self.metrics.record_hit_test(started.elapsed());
+        let unchanged = match (&target, &self.hover_target) {
+            (None, None) => true,
+            (Some(new), Some(old)) => {
+                new.identity() == old.identity() && new.screen_bounds() == old.screen_bounds()
+            }
+            _ => false,
+        };
+        if unchanged {
+            return;
+        }
+        if target.is_some() {
+            self.metrics.record_hover_target_switch();
+        }
+        if let Some(target) = &target {
+            self.metrics.log_line(
+                &format!(
+                    "hover hwnd={} z={} bounds=({},{})->({},{})",
+                    target.identity().hwnd,
+                    target.candidate.z_order,
+                    target.screen_bounds().left,
+                    target.screen_bounds().top,
+                    target.screen_bounds().right,
+                    target.screen_bounds().bottom
+                ),
+                false,
+            );
+        }
+        self.hover_target = target;
+        self.invalidate();
+    }
+
+    fn clear_hover(&mut self) {
+        if self.hover_target.take().is_some() {
+            self.invalidate();
+        }
+    }
+
+    /// Arm the one-shot dwell timer for the current gesture generation.
+    fn arm_dwell(&mut self) {
+        let generation = self.gesture.dwell_generation();
+        if self.dwell_armed == Some(generation) {
+            return;
+        }
+        self.dwell_armed = Some(generation);
+        unsafe { SetTimer(self.window, DWELL_TIMER_ID, DEFAULT_DWELL_MS, None) };
+    }
+
+    fn disarm_dwell(&mut self) {
+        if self.dwell_armed.take().is_some() {
+            unsafe { KillTimer(self.window, DWELL_TIMER_ID) };
+        }
+    }
+
+    /// The dwell timer expired: decide whether an automatic-snap preview is shown.
+    ///
+    /// Everything here is a cached lookup plus one rectangle conversion — no Win32 and no
+    /// DWM call runs on this path (docs/14 §10.1).
+    fn on_dwell(&mut self) {
+        let Some(armed) = self.dwell_armed.take() else {
+            return;
+        };
+        if armed != self.gesture.dwell_generation() {
+            // A move slipped in between the timer firing and this handler: the position
+            // the timer was armed for is gone, so nothing is previewed.
+            return;
+        }
+        let preview = self.preview_for_cursor();
+        if self.gesture.apply_dwell(armed, preview) {
+            match self.gesture.snap_preview() {
+                Some(preview) => self.metrics.log_line(
+                    &format!(
+                        "auto-snap preview hwnd={} epoch={} local=({},{})->({},{})",
+                        preview.target.identity().hwnd,
+                        preview.target.candidate.snapshot_epoch,
+                        preview.selection.left,
+                        preview.selection.top,
+                        preview.selection.right,
+                        preview.selection.bottom
+                    ),
+                    false,
+                ),
+                None => self
+                    .metrics
+                    .log_line("auto-snap preview cleared", false),
+            }
+            self.invalidate();
+        }
+    }
+
+    /// Nearest window for the current cursor position, converted to monitor-local space.
+    fn preview_for_cursor(&mut self) -> Option<(WindowTarget, Rect, Rect)> {
+        if self.session.state() != CaptureState::Selecting {
+            return None;
+        }
+        let layout = self.layout()?;
+        let screen = layout.to_screen(self.cursor);
+        let started = Instant::now();
+        let target = self.snapshot.nearest_target(screen, self.snap_radius);
+        self.metrics.record_nearest_target(started.elapsed());
+        let target = target?;
+        let local = window_rect_to_local(target.screen_bounds(), &layout);
+        if local.is_empty() {
+            return None;
+        }
+        Some((target, local, self.session.selection()))
+    }
+
+    /// Drain one detection-worker result.
+    fn on_detection_ready(&mut self) {
+        let Some(result) = self.detector.take_result() else {
+            return;
+        };
+        match result {
+            DetectionResult::Refreshed { request, snapshot } => {
+                if self.snapshot_request != Some(request) {
+                    self.metrics.record_worker_stale_result_dropped();
+                    return;
+                }
+                self.snapshot_request = None;
+                match snapshot {
+                    Ok(snapshot) => {
+                        self.metrics.log_line(
+                            &format!(
+                                "snapshot epoch={} candidates={}",
+                                snapshot.epoch(),
+                                snapshot.len()
+                            ),
+                            false,
+                        );
+                        self.snapshot = snapshot;
+                        self.update_hover();
+                    }
+                    Err(error) => {
+                        eprintln!("[snapclip][capture] window snapshot failed: {error}");
+                    }
+                }
+            }
+            DetectionResult::Confirmed {
+                request,
+                target,
+                valid,
+            } => {
+                if self.confirm_request != Some(request) {
+                    self.metrics.record_worker_stale_result_dropped();
+                    return;
+                }
+                self.confirm_request = None;
+                self.apply_confirmation(target, valid);
+            }
+        }
+    }
+
+    /// `Enter` while a preview is shown: hand the target to the worker for validation.
+    ///
+    /// Returns whether a confirmation was started, so the caller can fall through to the
+    /// normal confirm path when there is no preview.
+    fn confirm_snap_preview(&mut self) -> bool {
+        let Some(preview) = self.gesture.snap_preview() else {
+            return false;
+        };
+        // Repeated Enter keeps only the newest confirmation.
+        let request = self.detector.request_confirm(preview.target);
+        self.confirm_request = Some(request);
+        self.metrics.log_line(
+            &format!(
+                "confirm requested hwnd={} epoch={} confirmation={}",
+                preview.target.identity().hwnd,
+                preview.target.candidate.snapshot_epoch,
+                request.get()
+            ),
+            true,
+        );
+        true
+    }
+
+    /// Apply a validated confirmation (docs/14 §5.4).
+    fn apply_confirmation(&mut self, target: WindowTarget, valid: bool) {
+        let Some(preview) = self.gesture.snap_preview() else {
+            return;
+        };
+        if preview.target.identity() != target.identity() {
+            self.metrics.record_worker_stale_result_dropped();
+            return;
+        }
+        if valid && self.session.snap_to(preview.selection) {
+            self.metrics.log_line(
+                &format!(
+                    "snap confirmed hwnd={} selection=({},{})->({},{})",
+                    target.identity().hwnd,
+                    preview.selection.left,
+                    preview.selection.top,
+                    preview.selection.right,
+                    preview.selection.bottom
+                ),
+                true,
+            );
+            self.gesture.clear_preview();
+            self.hover_target = None;
+            self.disarm_dwell();
+            self.publish_state();
+            self.invalidate_all();
+            return;
+        }
+        // The target turned out to be gone: keep the selection the user had, drop the
+        // preview, refresh the snapshot and let the next dwell try again.
+        self.metrics.record_stale_target();
+        eprintln!(
+            "[snapclip][capture] snap confirmation failed hwnd={} valid={}",
+            target.identity().hwnd,
+            valid
+        );
+        self.gesture.clear_preview();
+        self.request_snapshot_refresh();
+        self.update_hover();
+        self.invalidate_all();
+    }
+
     fn on_mouse_move(&mut self, client: POINT) {
         let point = Point::new(client.x, client.y);
         self.cursor = point;
@@ -1133,10 +1452,33 @@ where
             self.annotation_point_moved(point);
             self.update_annotation_cursor(point);
         } else {
-            // The session owns the drag: the overlay only decides *whether* a drag is in
-            // progress, never how the geometry changes.
-            if self.drag_mode.is_some() {
-                self.session.pointer_moved(point);
+            // The gesture machine decides whether this move is hover, a pending press or a
+            // drag (docs/14 §4.2). The session still owns *how* the geometry changes.
+            match self.gesture.move_cursor(point) {
+                MoveOutcome::Hover => {
+                    // Superseded before it could be painted: counted rather than queued.
+                    self.metrics
+                        .record_mouse_move_coalesced(u64::from(self.render_armed));
+                    // Hover resolves from the cached snapshot only — no Win32, no DWM.
+                    self.update_hover();
+                    self.arm_dwell();
+                }
+                MoveOutcome::Pending => {}
+                MoveOutcome::ManualDragStarted { press_point } => {
+                    // Crossing the drag threshold turns the pending press into a free
+                    // drag anchored at the press point. The snap preview is already gone:
+                    // the press replaced it.
+                    self.session.begin_drag(
+                        press_point,
+                        ResizeMode::Handle(Handle::BottomRight),
+                        true,
+                    );
+                    self.session.pointer_moved(point);
+                    self.disarm_dwell();
+                }
+                MoveOutcome::Dragging => {
+                    self.session.pointer_moved(point);
+                }
             }
             self.update_cursor_shape(point);
         }
@@ -1189,18 +1531,20 @@ where
             return;
         }
         let point = Point::new(client.x, client.y);
-        let hit = self.session.pointer_pressed(point);
+        // Ask what the press *would* do, then record the gesture. Neither step changes the
+        // selection (docs/14 §4.2).
+        let hit = self.session.press(point);
+        let outcome = self.gesture.press(point, hit, self.session.selection());
+        if let PressOutcome::BeginEdit(mode) = outcome {
+            // Grabbing a handle or the interior of a selection is deliberate: the drag
+            // starts immediately, with no threshold.
+            self.session.begin_drag(point, mode, false);
+            self.disarm_dwell();
+        }
         eprintln!(
-            "[snapclip][capture] pointer down session={} point=({},{}), hit={:?}",
-            self.session_id(), point.x, point.y, hit
+            "[snapclip][capture] pointer down session={} point=({},{}), hit={:?}, outcome={:?}",
+            self.session_id(), point.x, point.y, hit, outcome
         );
-        self.drag_mode = Some(match hit {
-            SelectionGeometry::Move => ResizeMode::Move,
-            SelectionGeometry::Resize(handle) => ResizeMode::Handle(handle),
-            SelectionGeometry::Create | SelectionGeometry::Outside => {
-                ResizeMode::Handle(Handle::BottomRight)
-            }
-        });
         self.update_cursor_shape(point);
         self.invalidate();
     }
@@ -1214,12 +1558,21 @@ where
             self.session.state(),
             CaptureState::Selecting | CaptureState::Selected
         ) {
-            self.drag_mode = None;
+            self.gesture.release();
             return;
         }
-        self.session.pointer_released();
-        self.session.pointer_left();
-        self.drag_mode = None;
+        // Releasing the button only ever commits an explicit drag or edit. A pending press
+        // is a click, and an automatic snap is **never** confirmed by releasing the button
+        // (docs/14 §4.2).
+        match self.gesture.release() {
+            ReleaseOutcome::CommitDrag => {
+                self.session.pointer_released();
+                self.session.pointer_left();
+            }
+            ReleaseOutcome::Click => {
+                self.session.pointer_left();
+            }
+        }
         let selection = self.session.selection();
         eprintln!(
             "[snapclip][capture] pointer up session={} selection=({},{})->({},{}) state={:?}",
@@ -1238,10 +1591,15 @@ where
         let state = self.session.state();
         let is_active = state.is_active();
         let has_selection = self.session.has_selection();
+        self.metrics
+            .log_line(&format!("key down vk=0x{key:02X} state={state:?}"), false);
         match key {
             hotkey::ESCAPE_VIRTUAL_KEY => self.cancel("escape"),
             hotkey::RETURN_VIRTUAL_KEY => {
-                if has_selection {
+                // A snap preview is confirmed through the detection worker — never
+                // validated synchronously on the overlay thread. A settled selection goes
+                // straight to the export path.
+                if !self.confirm_snap_preview() && has_selection {
                     self.confirm();
                 }
             }
@@ -1724,6 +2082,10 @@ where
                 self.on_export_ready();
                 Some(0)
             }
+            detection_worker::DETECTION_READY_MESSAGE => {
+                self.on_detection_ready();
+                Some(0)
+            }
             WM_HOTKEY => {
                 if (wparam as i32) == hotkey::CAPTURE_HOTKEY_ID {
                     eprintln!("[snapclip][capture] WM_HOTKEY F5 received");
@@ -1831,6 +2193,10 @@ where
                 if (wparam as usize) == RENDER_TIMER_ID {
                     self.on_render_tick();
                     Some(0)
+                } else if (wparam as usize) == DWELL_TIMER_ID {
+                    // Cursor rested long enough: query the cached snapshot for a preview.
+                    self.on_dwell();
+                    Some(0)
                 } else {
                     None
                 }
@@ -1854,6 +2220,22 @@ where
             _ => None,
         }
     }
+}
+
+/// System drag threshold (`SM_CXDRAG`) in physical pixels for a monitor DPI.
+///
+/// The value is a logical distance, so it is scaled the same way the reference selector
+/// scales `QApplication::startDragDistance()`. Below the threshold a press stays a click;
+/// above it the gesture becomes a free drag (docs/14 §4.2).
+fn system_drag_threshold(dpi: u32) -> i32 {
+    let base = unsafe { GetSystemMetrics(SM_CXDRAG) }.max(1);
+    let scaled = (base as f32) * (dpi.max(96) as f32 / 96.0);
+    scaled.round().max(1.0) as i32
+}
+
+/// Automatic-snap radius in physical pixels (docs/14 §5.4).
+fn snap_radius_px() -> u32 {
+    DEFAULT_SNAP_RADIUS_PX
 }
 
 fn point_from_lparam(lparam: LPARAM) -> POINT {
@@ -1967,7 +2349,14 @@ fn overlay_thread<D, E>(
     }
 
     let mut controller: Box<dyn OverlayMessageHandler> =
-        Box::new(OverlayController::new(service, sink, shared, annotation_rx, window));
+        Box::new(OverlayController::new(
+            service,
+            sink,
+            shared,
+            annotation_rx,
+            window,
+            thread_id,
+        ));
     let handler_ptr = (&mut controller) as *mut Box<dyn OverlayMessageHandler>;
     ACTIVE_HANDLER.with(|slot| slot.set(handler_ptr));
 
@@ -2130,10 +2519,3 @@ mod tests {
         assert_eq!(OverlayCommand::from_wparam(9999), None);
     }
 }
-
-
-
-
-
-
-

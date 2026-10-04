@@ -190,35 +190,61 @@ impl CaptureSession {
         }
     }
 
-    /// Left button pressed. Starts a new selection, a move, or a resize.
-    pub fn pointer_pressed(&mut self, point: Point) -> SelectionGeometry {
+    /// What a press at `point` would do. **Never mutates the selection.**
+    ///
+    /// The overlay records a gesture and only calls [`Self::begin_drag`] once the pointer
+    /// has actually crossed the drag threshold (docs/14 §4.2). That removes the old
+    /// "press creates a zero-size selection" path, which made a click-to-confirm
+    /// indistinguishable from the start of a drag and destroyed any snap preview.
+    pub fn press(&mut self, point: Point) -> SelectionGeometry {
         if !matches!(self.state, CaptureState::Selecting | CaptureState::Selected) {
             return SelectionGeometry::Outside;
         }
-        let snapshot = self.snapshot();
-        let geometry = snapshot.hit_test(point, self.dpi());
-        let starts_new_selection = matches!(
-            geometry,
-            SelectionGeometry::Create | SelectionGeometry::Outside
-        );
-        if starts_new_selection {
-            // A press outside the current selection begins a new one, anchored at the
-            // press point so the drag follows the pointer.
-            self.selection = Rect::new(point.x, point.y, point.x, point.y);
+        self.snapshot().hit_test(point, self.dpi())
+    }
+
+    /// Start a drag once the gesture has been decided.
+    ///
+    /// `creating` is true when the press landed outside an existing selection. The new
+    /// selection is anchored at the press point *now* — after the threshold, not at press
+    /// time — and the drag anchors on the resulting rectangle so the first move does not
+    /// jump.
+    pub fn begin_drag(&mut self, press_point: Point, mode: ResizeMode, creating: bool) -> bool {
+        if !matches!(self.state, CaptureState::Selecting | CaptureState::Selected) {
+            return false;
+        }
+        if creating {
+            self.selection =
+                Rect::new(press_point.x, press_point.y, press_point.x, press_point.y);
             self.state = CaptureState::Selecting;
         }
-        let mode = match geometry {
-            SelectionGeometry::Move => ResizeMode::Move,
-            SelectionGeometry::Resize(handle) => ResizeMode::Handle(handle),
-            SelectionGeometry::Create | SelectionGeometry::Outside => {
-                ResizeMode::Handle(super::geometry::Handle::BottomRight)
-            }
-        };
-        // The drag anchors on the selection that is current *after* the press was
-        // applied, so the first mouse move does not jump.
-        self.drag = Some(SelectionDrag::new(self.selection, self.dpi(), point));
+        self.drag = Some(SelectionDrag::new(self.selection, self.dpi(), press_point));
         self.mode = Some(mode);
-        geometry
+        true
+    }
+
+    /// Adopt a selection produced by automatic window snapping (docs/14 §5.4).
+    ///
+    /// Clipped to the captured monitor; rejected when the result is empty or smaller than
+    /// the minimum usable selection, so a window that was mid-close cannot leave the
+    /// session with a degenerate rectangle.
+    pub fn snap_to(&mut self, rect: Rect) -> bool {
+        if !matches!(self.state, CaptureState::Selecting | CaptureState::Selected) {
+            return false;
+        }
+        let clipped = rect.intersect(self.bounds());
+        if clipped.is_empty() {
+            return false;
+        }
+        let minimum = SelectionSnapshot::new(clipped, self.dpi()).minimum_size();
+        if clipped.width() < minimum || clipped.height() < minimum {
+            return false;
+        }
+        self.selection = clipped;
+        self.state = CaptureState::Selected;
+        self.drag = None;
+        self.mode = None;
+        true
     }
 
     /// Left button released. Non-empty selections move the session to `Selected`.
@@ -340,7 +366,7 @@ impl CaptureSession {
 #[cfg(test)]
 mod tests {
     use super::{CaptureSession, CapturedFrame, ExportOutcome, OverlayGeometry};
-    use crate::capture::geometry::{MonitorLayout, Point, Rect, SelectionGeometry};
+    use crate::capture::geometry::{Handle, MonitorLayout, Point, Rect, ResizeMode, SelectionGeometry};
     use crate::domain::{CapturePayload, CaptureState, PixelFormat};
 
     fn layout() -> MonitorLayout {
@@ -369,6 +395,28 @@ mod tests {
         session
     }
 
+    /// Test helper: the production press → threshold → drag sequence in one call.
+    ///
+    /// A press on its own never changes the selection (that is the point of the gesture
+    /// refactor), so tests that expect a drag have to begin it explicitly — exactly what
+    /// the overlay does when the pointer crosses the drag threshold.
+    fn press(session: &mut CaptureSession, point: Point) -> SelectionGeometry {
+        let hit = session.press(point);
+        let mode = match hit {
+            SelectionGeometry::Move => ResizeMode::Move,
+            SelectionGeometry::Resize(handle) => ResizeMode::Handle(handle),
+            SelectionGeometry::Create | SelectionGeometry::Outside => {
+                ResizeMode::Handle(Handle::BottomRight)
+            }
+        };
+        let creating = matches!(
+            hit,
+            SelectionGeometry::Create | SelectionGeometry::Outside
+        );
+        session.begin_drag(point, mode, creating);
+        hit
+    }
+
     #[test]
     fn happy_path_walks_through_every_state() {
         let mut session = CaptureSession::new("session-1");
@@ -381,7 +429,7 @@ mod tests {
         session.overlay_ready().unwrap();
         assert_eq!(session.state(), CaptureState::Selecting);
 
-        session.pointer_pressed(Point::new(100, 100));
+        press(&mut session, Point::new(100, 100));
         session.pointer_moved(Point::new(400, 300));
         assert_eq!(session.selection(), Rect::new(100, 100, 400, 300));
         assert_eq!(session.pointer_released(), CaptureState::Selected);
@@ -437,20 +485,20 @@ mod tests {
                 CaptureState::Selecting => {
                     session.arm(frame(), &layout()).unwrap();
                     session.overlay_ready().unwrap();
-                    session.pointer_pressed(Point::new(10, 10));
+                    press(&mut session, Point::new(10, 10));
                     session.pointer_moved(Point::new(200, 200));
                 }
                 CaptureState::Selected => {
                     session.arm(frame(), &layout()).unwrap();
                     session.overlay_ready().unwrap();
-                    session.pointer_pressed(Point::new(10, 10));
+                    press(&mut session, Point::new(10, 10));
                     session.pointer_moved(Point::new(200, 200));
                     session.pointer_released();
                 }
                 CaptureState::Exporting => {
                     session.arm(frame(), &layout()).unwrap();
                     session.overlay_ready().unwrap();
-                    session.pointer_pressed(Point::new(10, 10));
+                    press(&mut session, Point::new(10, 10));
                     session.pointer_moved(Point::new(200, 200));
                     session.pointer_released();
                     session.begin_export().unwrap();
@@ -459,7 +507,7 @@ mod tests {
                 CaptureState::Annotating => {
                     session.arm(frame(), &layout()).unwrap();
                     session.overlay_ready().unwrap();
-                    session.pointer_pressed(Point::new(10, 10));
+                    press(&mut session, Point::new(10, 10));
                     session.pointer_moved(Point::new(200, 200));
                     session.pointer_released();
                     session.begin_annotating().unwrap();
@@ -502,13 +550,13 @@ mod tests {
     #[test]
     fn window_destroy_and_device_removal_use_the_same_cleanup() {
         let mut destroyed = armed_session();
-        destroyed.pointer_pressed(Point::new(10, 10));
+        press(&mut destroyed, Point::new(10, 10));
         destroyed.pointer_moved(Point::new(110, 110));
         destroyed.cancel();
         assert_eq!(destroyed.state(), CaptureState::Idle);
 
         let mut removed = armed_session();
-        removed.pointer_pressed(Point::new(10, 10));
+        press(&mut removed, Point::new(10, 10));
         removed.pointer_moved(Point::new(110, 110));
         removed.fail();
         assert_eq!(removed.state(), CaptureState::Idle);
@@ -537,39 +585,82 @@ mod tests {
     }
 
     #[test]
-    fn empty_drag_does_not_enter_selected() {
+    fn a_press_alone_never_creates_a_zero_size_selection() {
         let mut session = armed_session();
-        session.pointer_pressed(Point::new(50, 50));
-        assert_eq!(session.selection(), Rect::new(50, 50, 50, 50));
+        let hit = session.press(Point::new(50, 50));
+        assert_eq!(hit, SelectionGeometry::Create);
+        assert_eq!(
+            session.selection(),
+            Rect::default(),
+            "the press must not create a zero-size selection (docs/14 §4.2)"
+        );
+        assert_eq!(session.state(), CaptureState::Selecting);
+        // Releasing without crossing the drag threshold is a click: nothing is committed.
         assert_eq!(session.pointer_released(), CaptureState::Selecting);
         assert_eq!(session.selection(), Rect::default());
-        // Still confirmable-false but not a hard error: state stays Selecting.
         assert!(session.begin_export().is_err());
     }
 
     #[test]
-    fn pressing_outside_starts_a_new_selection() {
+    fn pressing_outside_keeps_the_selection_until_the_drag_starts() {
         let mut session = armed_session();
-        session.pointer_pressed(Point::new(100, 100));
+        press(&mut session, Point::new(100, 100));
         session.pointer_moved(Point::new(300, 300));
         session.pointer_released();
         assert_eq!(session.state(), CaptureState::Selected);
+        let confirmed = Rect::new(100, 100, 300, 300);
 
-        let hit = session.pointer_pressed(Point::new(800, 800));
+        // The press alone changes nothing: a click outside must not erase the confirmed
+        // selection (this is the defect the gesture refactor removes).
+        let hit = session.press(Point::new(800, 800));
         assert_eq!(hit, SelectionGeometry::Outside);
-        assert_eq!(session.selection(), Rect::new(800, 800, 800, 800));
+        assert_eq!(session.selection(), confirmed);
+
+        // Only crossing the drag threshold replaces it, anchored at the press point.
+        assert!(session.begin_drag(
+            Point::new(800, 800),
+            ResizeMode::Handle(Handle::BottomRight),
+            true,
+        ));
+        session.pointer_moved(Point::new(900, 900));
+        assert_eq!(session.selection(), Rect::new(800, 800, 900, 900));
         assert_eq!(session.state(), CaptureState::Selecting);
+    }
+
+    #[test]
+    fn snap_to_adopts_a_usable_rectangle_and_relies_on_the_clip_for_edges() {
+        let mut session = armed_session();
+        assert!(session.snap_to(Rect::new(100, 100, 400, 300)));
+        assert_eq!(session.state(), CaptureState::Selected);
+        assert_eq!(session.selection(), Rect::new(100, 100, 400, 300));
+
+        // A window hanging off the captured monitor is clipped, not rejected.
+        let mut session = armed_session();
+        assert!(session.snap_to(Rect::new(-100, -50, 500, 400)));
+        assert_eq!(session.selection(), Rect::new(0, 0, 500, 400));
+    }
+
+    #[test]
+    fn snap_to_rejects_degenerate_rectangles_and_leaves_the_session_untouched() {
+        let mut session = armed_session();
+        assert!(!session.snap_to(Rect::default()));
+        assert!(!session.snap_to(Rect::new(10, 10, 10, 400)), "zero width");
+        assert!(!session.snap_to(Rect::new(10, 10, 400, 10)), "zero height");
+        assert!(!session.snap_to(Rect::new(9000, 9000, 9500, 9500)), "off the monitor");
+        assert!(!session.snap_to(Rect::new(20, 20, 22, 22)), "below the minimum size");
+        assert_eq!(session.state(), CaptureState::Selecting);
+        assert_eq!(session.selection(), Rect::default());
     }
 
     #[test]
     fn dragging_inside_moves_the_existing_selection() {
         let mut session = armed_session();
-        session.pointer_pressed(Point::new(100, 100));
+        press(&mut session, Point::new(100, 100));
         session.pointer_moved(Point::new(300, 300));
         session.pointer_released();
 
         assert_eq!(
-            session.pointer_pressed(Point::new(200, 200)),
+            press(&mut session, Point::new(200, 200)),
             SelectionGeometry::Move
         );
         session.pointer_moved(Point::new(250, 250));
@@ -581,7 +672,7 @@ mod tests {
     #[test]
     fn artifact_rejects_a_selection_outside_the_frozen_frame() {
         let mut session = armed_session();
-        session.pointer_pressed(Point::new(100, 100));
+        press(&mut session, Point::new(100, 100));
         session.pointer_moved(Point::new(300, 300));
         session.pointer_released();
         let error = session
@@ -602,7 +693,7 @@ mod tests {
     fn chrome_is_hidden_until_a_selection_exists() {
         let mut session = armed_session();
         assert!(!session.shows_chrome());
-        session.pointer_pressed(Point::new(10, 10));
+        press(&mut session, Point::new(10, 10));
         session.pointer_moved(Point::new(110, 110));
         assert!(session.shows_chrome());
         session.pointer_released();
@@ -612,7 +703,7 @@ mod tests {
     #[test]
     fn annotating_locks_selection_and_stays_confirmable() {
         let mut session = armed_session();
-        session.pointer_pressed(Point::new(100, 100));
+        press(&mut session, Point::new(100, 100));
         session.pointer_moved(Point::new(400, 300));
         assert_eq!(session.pointer_released(), CaptureState::Selected);
 
@@ -622,7 +713,7 @@ mod tests {
         assert!(session.shows_chrome());
         assert_eq!(session.selection(), Rect::new(100, 100, 400, 300));
         // A pointer press in Annotating does not re-open a selection drag.
-        assert_eq!(session.pointer_pressed(Point::new(500, 500)), SelectionGeometry::Outside);
+        assert_eq!(press(&mut session, Point::new(500, 500)), SelectionGeometry::Outside);
         assert_eq!(session.selection(), Rect::new(100, 100, 400, 300));
 
         // Confirm from Annotating produces the same clipped selection.
@@ -640,7 +731,7 @@ mod tests {
         let mut session = armed_session();
         // Still Selecting (no committed selection) -> rejected.
         assert!(session.begin_annotating().is_err());
-        session.pointer_pressed(Point::new(10, 10));
+        press(&mut session, Point::new(10, 10));
         session.pointer_moved(Point::new(100, 100));
         session.pointer_released();
         assert!(session.begin_annotating().is_ok());

@@ -20,6 +20,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+/// Environment variable that turns the per-operation diagnostics lines on.
+///
+/// Only the *verbosity* is switchable; the counters are always recorded, so a session
+/// that never sets this still produces a complete one-line summary at teardown.
+pub const VERBOSE_ENV: &str = "SNAPCLIP_WIN_DETECT_VERBOSE";
+
 /// `Duration` as whole microseconds, saturating instead of wrapping.
 fn micros(elapsed: Duration) -> u64 {
     elapsed.as_micros().min(u128::from(u64::MAX)) as u64
@@ -92,7 +98,14 @@ pub struct WindowDetectionMetrics {
 
 impl WindowDetectionMetrics {
     pub fn new() -> Self {
-        Self::default()
+        let metrics = Self::default();
+        // Diagnostics switch (docs/14 §10.2): per-operation lines stay off by default so
+        // the counters never flood stderr, and an acceptance probe can turn them on
+        // without a rebuild.
+        if std::env::var_os(VERBOSE_ENV).is_some() {
+            metrics.set_verbose(true);
+        }
+        metrics
     }
 
     /// Whether per-operation diagnostics lines should be emitted.

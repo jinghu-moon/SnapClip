@@ -14,6 +14,7 @@
 //! it never links against the clipboard module, the store, OCR or Tauri.
 
 pub mod capture_worker;
+pub mod detection_worker;
 pub mod export_worker;
 pub mod hotkey;
 pub mod monitor;
