@@ -53,6 +53,9 @@ pub struct RefinementResult {
     pub request: RequestId,
     pub epoch: SnapshotEpoch,
     pub outcome: RefinementOutcome,
+    /// How long the provider call took. Reported on the session summary so "deep selection
+    /// never triggers" can be told apart from "it triggers, but slowly".
+    pub elapsed: std::time::Duration,
 }
 
 struct Shared {
@@ -270,17 +273,23 @@ fn run(
         // A superseded query is never delivered: the overlay would drop it anyway, and
         // publishing it would evict the newest result from the single slot.
         if is_current(job.request) {
-            publish(&shared, job, outcome);
+            publish(&shared, job, outcome, started.elapsed());
         }
     }
 }
 
-fn publish(shared: &Arc<Shared>, job: Job, outcome: RefinementOutcome) {
+fn publish(
+    shared: &Arc<Shared>,
+    job: Job,
+    outcome: RefinementOutcome,
+    elapsed: std::time::Duration,
+) {
     if let Ok(mut slot) = shared.result.lock() {
         *slot = Some(RefinementResult {
             request: job.request,
             epoch: job.epoch,
             outcome,
+            elapsed,
         });
     }
     let _ = unsafe {

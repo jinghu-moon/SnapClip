@@ -59,6 +59,12 @@ struct Counters {
     worker_stale_result_dropped_count: AtomicU64,
     /// Gauge: mouse moves discarded because a newer position superseded them.
     mouse_move_coalesced_count: AtomicU64,
+    // ── v2 refinement (docs/18 §10) ───────────────────────────────────────────
+    refinement_submitted: AtomicU64,
+    refinement_published: AtomicU64,
+    refinement_empty: AtomicU64,
+    refinement_last_us: AtomicU64,
+    refinement_max_us: AtomicU64,
 }
 
 /// A copyable reading of every counter, for assertions and one-line reports.
@@ -87,6 +93,11 @@ pub struct WindowDetectionReading {
     pub worker_max_queue_depth: u64,
     pub worker_stale_result_dropped_count: u64,
     pub mouse_move_coalesced_count: u64,
+    pub refinement_submitted: u64,
+    pub refinement_published: u64,
+    pub refinement_empty: u64,
+    pub refinement_last_us: u64,
+    pub refinement_max_us: u64,
 }
 
 /// Shared diagnostics handle for the window-detection pipeline.
@@ -241,6 +252,38 @@ impl WindowDetectionMetrics {
             .fetch_add(dropped, Ordering::Relaxed);
     }
 
+    /// A v2 refinement query was handed to the refinement worker.
+    pub fn record_refinement_submitted(&self) {
+        self.counters
+            .refinement_submitted
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A refinement result was accepted and published (deep selection is live).
+    pub fn record_refinement_published(&self, elapsed: Duration) {
+        self.counters
+            .refinement_published
+            .fetch_add(1, Ordering::Relaxed);
+        let micros = micros(elapsed);
+        self.counters
+            .refinement_last_us
+            .store(micros, Ordering::Relaxed);
+        self.counters
+            .refinement_max_us
+            .fetch_max(micros, Ordering::Relaxed);
+    }
+
+    /// A refinement query came back with nothing usable (unsupported, cancelled, failed).
+    ///
+    /// This counter is what makes "deep selection never triggers" diagnosable without
+    /// turning on the verbose log: a session with `refinement_submitted > 0` and
+    /// `refinement_published == 0` means the provider answered but produced no path.
+    pub fn record_refinement_empty(&self) {
+        self.counters
+            .refinement_empty
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Read every counter.
     pub fn reading(&self) -> WindowDetectionReading {
         let counters = &self.counters;
@@ -272,6 +315,11 @@ impl WindowDetectionMetrics {
             worker_max_queue_depth: load(&counters.worker_max_queue_depth),
             worker_stale_result_dropped_count: load(&counters.worker_stale_result_dropped_count),
             mouse_move_coalesced_count: load(&counters.mouse_move_coalesced_count),
+            refinement_submitted: load(&counters.refinement_submitted),
+            refinement_published: load(&counters.refinement_published),
+            refinement_empty: load(&counters.refinement_empty),
+            refinement_last_us: load(&counters.refinement_last_us),
+            refinement_max_us: load(&counters.refinement_max_us),
         }
     }
 
@@ -288,7 +336,9 @@ impl WindowDetectionMetrics {
              hover_revalidate_stale_dropped_count={} \
              window_worker_queue_depth={} window_worker_max_queue_depth={} \
              window_worker_stale_result_dropped_count={} \
-             mouse_move_coalesced_count={}",
+             mouse_move_coalesced_count={} \
+             refinement_submitted={} refinement_published={} refinement_empty={} \
+             refinement_elapsed_us last={} max={}",
             reading.snapshot_refresh_last_us,
             reading.snapshot_refresh_max_us,
             reading.snapshot_refresh_count,
@@ -312,6 +362,11 @@ impl WindowDetectionMetrics {
             reading.worker_max_queue_depth,
             reading.worker_stale_result_dropped_count,
             reading.mouse_move_coalesced_count,
+            reading.refinement_submitted,
+            reading.refinement_published,
+            reading.refinement_empty,
+            reading.refinement_last_us,
+            reading.refinement_max_us,
         )
     }
 
@@ -344,6 +399,11 @@ impl WindowDetectionMetrics {
             &counters.worker_max_queue_depth,
             &counters.worker_stale_result_dropped_count,
             &counters.mouse_move_coalesced_count,
+            &counters.refinement_submitted,
+            &counters.refinement_published,
+            &counters.refinement_empty,
+            &counters.refinement_last_us,
+            &counters.refinement_max_us,
         ] {
             counter.store(0, Ordering::Relaxed);
         }
@@ -445,6 +505,10 @@ mod tests {
             "window_worker_queue_depth=",
             "window_worker_stale_result_dropped_count=1",
             "mouse_move_coalesced_count=9",
+            "refinement_submitted=",
+            "refinement_published=",
+            "refinement_empty=",
+            "refinement_elapsed_us",
         ] {
             assert!(line.contains(expected), "missing {expected} in: {line}");
         }

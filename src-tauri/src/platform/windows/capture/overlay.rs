@@ -1681,6 +1681,7 @@ where
             ),
             false,
         );
+        self.metrics.record_refinement_submitted();
         self.refinement
             .request(job.epoch, job.window, job.point, bounds);
     }
@@ -1716,12 +1717,14 @@ where
                     false,
                 );
                 self.deep_target = Some(*target);
+                self.metrics.record_refinement_published(result.elapsed);
                 self.refresh_preview_for_cursor();
                 self.invalidate_all();
             }
             RefinementOutcome::Empty(reason) => {
                 // Free the single-flight slot so the next dwell can try again.
                 if self.refine.on_failure(result.request) {
+                    self.metrics.record_refinement_empty();
                     self.metrics
                         .log_line(&format!("refinement empty reason={reason:?}"), false);
                 }
@@ -2366,10 +2369,16 @@ where
         };
         // Every present repaints the whole surface (see OverlayRenderer::draw_to); the
         // render tick is what bounds the present rate to ~60 Hz.
-        eprintln!(
-            "[snapclip][capture] render session={} frame_px={}",
-            session_id,
-            renderer.frame().area()
+        // Per-present logging is diagnostics, not telemetry: it used to print once per frame
+        // and bury everything else (a 10 s session produced thousands of lines). It is now
+        // behind the verbose switch, and the per-session summary carries the counters.
+        self.metrics.log_line(
+            &format!(
+                "render session={} frame_px={}",
+                session_id,
+                renderer.frame().area()
+            ),
+            false,
         );
         let cursor_visible = self.cursor_visible && self.session.state().is_active();
         let state = OverlayFrameState {

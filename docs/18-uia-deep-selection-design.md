@@ -292,3 +292,33 @@ refinement published hwnd=5967024 bounds=(0,47)->(3840,2088) depth=4 reason=Comp
 | v2-P3 MSAA 回退 | 未开始 |
 | v2-P4 overlay 层级路径渲染 | 预览矩形已跟随深选结果，但 `path` 的逐层描边未画 |
 | v2-P5 性能与验收 | UIA 单次查询 22 ms（首次，含 COM 初始化）已测得；延迟分布与 quarantine 命中率待实测 |
+
+### 实测反馈与根因：窗口内控件「很难触发」
+
+现场报告：应用窗口之间切换时吸附灵敏，但**在资源管理器内部很难触发**控件级吸附。
+
+排查的第一层是**可见性**：overlay 里所有 `refinement …` 行（以及 `hover`/`auto-snap preview`）
+都是 verbose 门控的，默认运行看不到任何 `[win-detect]` 输出（日志里只剩 `render session=` 刷屏），
+于是「没触发」与「触发了但看不到」无法区分。本次修掉：
+
+| 问题 | 修复 |
+| --- | --- |
+| `render session=` 每帧打印，几千行淹没日志 | 改为 verbose 门控；会话结束的汇总行承载计数 |
+| 无法判断精化是否发生 | 指标新增 `refinement_submitted` / `refinement_published` / `refinement_empty` / `refinement_elapsed_us(last/max)` 并进入每会话汇总行；`RefinementResult` 带回 provider 耗时 |
+
+第二层才是**真正的性能根因**（深调研参考实现后确认）。对比 `snow-ui-selector/src/windows/uia.rs`：
+
+| 参考实现 | 当前实现 | 影响 |
+| --- | --- | --- |
+| `refresh()` 里 `build_uia_window_cache()` 建**窗口缓存 + 窗口级空间索引**，`release_cache()` 释放 | 无 | — |
+| `query()` 先用空间索引在**进程内**命中窗口，再交给 `window.tree.query(...)`（**每窗口一棵 `WindowTree` 缓存**，跨查询复用） | 每次停稳都从窗口根节点**重新下钻** | 同一窗口内反复停稳要重复走完整棵树 |
+| 用 `CacheRequest` + `GetCachedChildren`，读 `CachedBoundingRectangle`/`CachedControlType`/`CachedIsOffscreen`（**一次批量取回**） | 每个节点 4 次 `Current*` 跨进程调用 | DirectUI 大树上单次查询变成数千次跨进程调用 |
+| `QueryClock` 预算 + `progress` 回调**增量发布**（`QueryControl::refinement` 发布间隔 32 ms） | 只在遍历结束发布 | 慢查询期间用户看不到任何反馈 |
+
+结论：资源管理器的 DirectUI 树让「每次从根重走 + 每节点 4 次跨进程调用」的查询慢到用户早已移动鼠标，
+而任何窗口/hover 变化都会 `invalidate_in_flight` 取消在途查询 —— 于是**永远没有结果发布**，
+表现就是「窗口内控件很难触发」。
+
+**下一步（v2-P2 收尾）**：按参考实现改造 provider —— ①`CacheRequest` 批量取属性（`Cached*`）；
+②每窗口 `WindowTree` 缓存（按快照 epoch 失效）；③遍历中按 32 ms 间隔增量发布已验证的最深元素；
+④保留 `WalkBudget` 与取消检查。完成后用资源管理器导航窗格 / 文件列表 / 命令栏三点验收。
