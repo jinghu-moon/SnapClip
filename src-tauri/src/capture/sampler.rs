@@ -15,9 +15,9 @@ const THROTTLE_INTERVAL: Duration = Duration::from_micros(16_667);
 /// Tile size in pixels (must match `MagnifierConfig::tile_size`).
 const TILE_SIZE: i32 = 32;
 
-/// How the sampled colour is rendered in the magnifier info panel's secondary
-/// slot. `Hex` is no longer part of the `Shift` cycle — the info panel always
-/// shows it in its own dedicated slot, so only `Rgb` and `Hsl` alternate there.
+/// How the sampled colour is rendered in the magnifier info panel's primary
+/// slot. `S` cycles the whole set — `Hex → Rgb → Hsl → Hex` — so the panel
+/// shows exactly one live format at a time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColorFormat {
     Hex,
@@ -27,17 +27,17 @@ pub enum ColorFormat {
 
 impl Default for ColorFormat {
     fn default() -> Self {
-        Self::Rgb
+        Self::Hex
     }
 }
 
 impl ColorFormat {
-    /// The next format in the `Shift` cycle (`Rgb <-> Hsl`). Anything not
-    /// already in the cycle (e.g. `Hex`) falls back to the cycle's start.
+    /// The next format in the `S` cycle (`Hex -> Rgb -> Hsl -> Hex`).
     pub fn next(self) -> Self {
         match self {
+            ColorFormat::Hex => ColorFormat::Rgb,
             ColorFormat::Rgb => ColorFormat::Hsl,
-            ColorFormat::Hsl | ColorFormat::Hex => ColorFormat::Rgb,
+            ColorFormat::Hsl => ColorFormat::Hex,
         }
     }
 }
@@ -450,13 +450,15 @@ mod tests {
     }
 
     #[test]
-    fn format_cycles_rgb_and_hsl_only() {
+    fn format_cycles_hex_rgb_hsl() {
         let mut format = ColorFormat::default();
+        assert_eq!(format, ColorFormat::Hex);
+        format = format.next();
         assert_eq!(format, ColorFormat::Rgb);
         format = format.next();
         assert_eq!(format, ColorFormat::Hsl);
         format = format.next();
-        assert_eq!(format, ColorFormat::Rgb);
+        assert_eq!(format, ColorFormat::Hex);
     }
 
     #[test]

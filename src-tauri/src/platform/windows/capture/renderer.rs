@@ -28,10 +28,10 @@ pub struct OverlayFrameState {
     pub show_chrome: bool,
     /// Current color sample RGB from the magnifier sampler.
     pub magnifier_rgb: Option<(u8, u8, u8)>,
-    /// `#RRGGBB` — always shown in the info panel's primary slot.
-    pub magnifier_hex_text: Option<String>,
-    /// Shift-cycled secondary value (`rgb(...)` / `hsl(...)`) shown beside it.
-    pub magnifier_secondary_text: Option<String>,
+    /// The sampled colour rendered in the current `ColorFormat` (`#RRGGBB` /
+    /// `rgb(...)` / `hsl(...)`), shown in the info panel's primary slot.
+    /// `S` cycles the format; there is no secondary slot any more.
+    pub magnifier_color_text: Option<String>,
     /// Info-panel coordinate is relative to the selection origin (P toggle).
     pub magnifier_relative: bool,
     // ── Annotations ───────────────────────────────────────────────────────────
@@ -51,8 +51,7 @@ impl OverlayFrameState {
             cursor_visible: false,
             show_chrome: false,
             magnifier_rgb: None,
-            magnifier_hex_text: None,
-            magnifier_secondary_text: None,
+            magnifier_color_text: None,
             magnifier_relative: false,
             annotation_items: Vec::new(),
             annotation_selected_id: None,
@@ -179,8 +178,7 @@ impl Win32Renderer {
             show_chrome: state.show_chrome,
             work_area: self.layout.local_work_area(),
             magnifier_rgb: state.magnifier_rgb,
-            magnifier_hex_text: state.magnifier_hex_text.clone(),
-            magnifier_secondary_text: state.magnifier_secondary_text.clone(),
+            magnifier_color_text: state.magnifier_color_text.clone(),
             magnifier_relative: state.magnifier_relative,
             annotation_items: live_items,
             annotation_selected_id: live_selected,
@@ -214,8 +212,7 @@ impl Win32Renderer {
             show_chrome: false,
             work_area: self.layout.local_work_area(),
             magnifier_rgb: None,
-            magnifier_hex_text: None,
-            magnifier_secondary_text: None,
+            magnifier_color_text: None,
             magnifier_relative: false,
             annotation_items: live_items,
             annotation_selected_id: None,

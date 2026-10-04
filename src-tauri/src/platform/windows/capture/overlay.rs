@@ -373,7 +373,8 @@ where
     dirty: bool,
     /// Pure color-sampling state machine (tile hit, throttle, hex formatting).
     sampler: ColorSampler,
-    /// Shift-cycled colour format shown in the magnifier info panel.
+    /// `S`-cycled colour format shown in the magnifier info panel's primary slot
+    /// (Hex → Rgb → Hsl → Hex).
     magnifier_color_format: ColorFormat,
     /// When true the info-panel coordinate is relative to the selection origin (P toggle).
     magnifier_relative: bool,
@@ -866,8 +867,7 @@ where
                 cursor_visible: false,
                 show_chrome: false,
                 magnifier_rgb: None,
-                magnifier_hex_text: None,
-                magnifier_secondary_text: None,
+                magnifier_color_text: None,
                 magnifier_relative: false,
                 annotation_items: self.annotation_doc.items().to_vec(),
                 annotation_selected_id: None,
@@ -1220,8 +1220,8 @@ where
                     self.invalidate_all();
                 }
             }
-            // VK_SHIFT (0x10): cycle colour display format (HEX → RGB → HSL → HEX).
-            0x10 if self.session.state().is_active() => {
+            // 'S' (0x53): cycle colour display format (HEX → RGB → HSL → HEX).
+            k if k == b'S' as u32 && self.session.state().is_active() => {
                 self.magnifier_color_format = self.magnifier_color_format.next();
                 self.invalidate();
             }
@@ -1239,11 +1239,11 @@ where
         }
     }
 
-    /// Copy the primary (`#RRGGBB`) colour string to the Windows clipboard via
-    /// arboard. Marks the write as excluded so the clip-monitor does not record
-    /// our own copy.
+    /// Copy the currently displayed colour string (HEX / RGB / HSL, whichever
+    /// the `S` cycle is on) to the Windows clipboard via arboard. Marks the
+    /// write as excluded so the clip-monitor does not record our own copy.
     fn copy_color_to_clipboard(&mut self) {
-        let Some(text) = self.sampler.formatted(ColorFormat::Hex) else {
+        let Some(text) = self.sampler.formatted(self.magnifier_color_format) else {
             return;
         };
         match arboard::Clipboard::new() {
@@ -1585,8 +1585,7 @@ where
             cursor_visible,
             show_chrome: self.session.shows_chrome(),
             magnifier_rgb: self.sampler.rgb(),
-            magnifier_hex_text: self.sampler.formatted(ColorFormat::Hex),
-            magnifier_secondary_text: self.sampler.formatted(self.magnifier_color_format),
+            magnifier_color_text: self.sampler.formatted(self.magnifier_color_format),
             magnifier_relative: self.magnifier_relative,
             annotation_items: self.annotation_doc.items().to_vec(),
             annotation_selected_id: self.annotation_doc.selected_id(),
