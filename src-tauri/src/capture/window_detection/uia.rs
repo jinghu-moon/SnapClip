@@ -133,6 +133,20 @@ pub fn is_structural_container(parent: Rect, node: WalkNode) -> bool {
     node.bounds == parent
 }
 
+/// Whether a dead-ended branch may give way to its siblings.
+///
+/// UIA sibling order is **not** a stacking guarantee: a redundant `Pane`/`Group` with the same
+/// bounds as its parent can sit in front of the branch that actually holds the content
+/// (Chromium-family apps do exactly this), and stopping at that dead end is why a hit inside
+/// such a window degrades to the coarse container (docs/18 §12.6 ①).
+///
+/// Only equal-bounds structural nodes are allowed to be skipped: a *real* control or a
+/// container with its own distinct frame keeps its precedence, so backtracking can never
+/// promote something the user is not pointing at.
+pub fn may_try_sibling_branch(dead: WalkNode, parent_bounds: Rect) -> bool {
+    !dead.offscreen && is_structural_container(parent_bounds, dead)
+}
+
 /// Result of a bounded walk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalkOutcome {
@@ -479,5 +493,25 @@ mod tests {
         let sibling = rect(700, 600, 900, 780);
         let merged = merge_hit_paths(&[seed], &[sibling], window, Point::new(400, 350));
         assert_eq!(merged, vec![seed, window]);
+    }
+
+    #[test]
+    fn only_an_equal_bounds_structural_branch_may_backtrack() {
+        let parent = rect(0, 0, 800, 600);
+        // A redundant same-bounds pane may be skipped in favour of a sibling branch.
+        assert!(may_try_sibling_branch(node(0, 0, 800, 600), parent));
+        // A real control keeps its precedence: its dead end ends the walk.
+        assert!(!may_try_sibling_branch(node(100, 100, 300, 200), parent));
+        // A container with its own distinct frame is not a redundant branch either.
+        assert!(!may_try_sibling_branch(node(50, 50, 700, 500), parent));
+        // An off-screen node has no branch to give way to.
+        assert!(!may_try_sibling_branch(
+            WalkNode::new(parent_rect(), 0, true, true),
+            parent
+        ));
+
+        fn parent_rect() -> Rect {
+            rect(0, 0, 800, 600)
+        }
     }
 }
