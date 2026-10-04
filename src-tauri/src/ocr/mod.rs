@@ -2,6 +2,10 @@
 
 mod engine;
 mod manager;
+// ONNX / PP-OCR engine adapter. Compiled only with the `ocr-rapid` feature, which
+// is OFF by default because `rapid-ocr-rs` is mid-refactor with an unstable API.
+// The built-in Windows OCR engine (`win_ocr`) stays available regardless.
+#[cfg(feature = "ocr-rapid")]
 mod rapid;
 mod win_ocr;
 mod worker;

@@ -28,7 +28,18 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 thiserror = "2"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png", "bmp"] }
-rapid-ocr-rs = { path = "../crates/rapid-ocr-rs", default-features = false, features = ["ort-runtime"] }
+# TEMPORARY: `rapid-ocr-rs` is mid-way through breaking changes and its API is
+# currently unstable, so the ONNX / PP-OCR engine is gated behind the non-default
+# `ocr-rapid` feature instead of being built into every target. SnapClip keeps the
+# built-in Windows OCR engine, which does not depend on this crate. Re-enable by
+# adding `ocr-rapid` once `rapid-ocr-rs`'s public API has settled.
+rapid-ocr-rs = { path = "../crates/rapid-ocr-rs", default-features = false, features = ["ort-runtime"], optional = true }
+
+[features]
+# Default build excludes the ONNX / PP-OCR path (see the `rapid-ocr-rs` note above).
+default = []
+# ONNX / PP-OCR engine via `rapid-ocr-rs`; opt in with `--features ocr-rapid`.
+ocr-rapid = ["dep:rapid-ocr-rs"]
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
