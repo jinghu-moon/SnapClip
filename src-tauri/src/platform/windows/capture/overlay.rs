@@ -55,10 +55,11 @@ use crate::capture::application::{CaptureEventSink, OverlayPlatform};
 use crate::capture::geometry::{
     Handle, MonitorLayout, Point, Rect, ResizeMode, SelectionGeometry,
 };
-use crate::capture::session::{CaptureSession, FinishingOutcome};
+use crate::capture::session::{CaptureSession, ExportOutcome};
 use crate::capture::{CaptureError, CaptureResult, CaptureState};
 
 use super::capture_worker::{self, CaptureWorker, StartRequest};
+use super::export_worker::{self, ExportJob, ExportWorker};
 use super::hotkey;
 use super::monitor::{self, CapturedMonitor};
 use super::providers::{FrozenFrame, FrozenFramePixels};
@@ -91,12 +92,16 @@ enum OverlayCommand {
     /// Sentinel `wparam` on [`capture_worker::FRAME_READY_MESSAGE`] so the
     /// worker's wake-up shares the command dispatch path.
     FrameReady,
+    /// Sentinel `wparam` on [`export_worker::EXPORT_READY_MESSAGE`]: the artifact was
+    /// encoded and written off the UI thread.
+    ExportReady,
 }
 
 impl OverlayCommand {
     fn from_wparam(wparam: WPARAM) -> Option<Self> {
         match wparam as i32 {
             value if value == Self::FrameReady as i32 => Some(Self::FrameReady),
+            value if value == Self::ExportReady as i32 => Some(Self::ExportReady),
             value if value == Self::Start as i32 => Some(Self::Start),
             value if value == Self::Cancel as i32 => Some(Self::Cancel),
             value if value == Self::Confirm as i32 => Some(Self::Confirm),
@@ -297,6 +302,9 @@ where
     /// Captures run on the worker thread; the overlay only submits requests
     /// and drains the capacity-1 result mailbox.
     worker: CaptureWorker,
+    /// Encoding and file writing run here, so `confirm` returns as soon as the
+    /// selection's pixels are in hand (docs/11 §Phase 3).
+    export_worker: ExportWorker,
     renderer: Option<Win32Renderer>,
     session: CaptureSession,
     frozen: Option<FrozenFrame>,
@@ -306,6 +314,10 @@ where
     dirty: Vec<Rect>,
     /// Whether the coalescing render tick is currently armed (`SetTimer` running).
     render_armed: bool,
+    /// Whether the session's graphics have been handed to the export worker.
+    /// While this is set the controller paints nothing: the D3D11 immediate context
+    /// the frozen texture lives on is single-threaded, and the export owns it.
+    graphics_released: bool,
     session_counter: u64,
     /// Generation of the session currently awaiting a worker result.
     current_generation: u64,
@@ -330,6 +342,7 @@ where
             shared,
             window,
             worker: CaptureWorker::new(),
+            export_worker: ExportWorker::new(),
             renderer: None,
             session: CaptureSession::new("idle"),
             frozen: None,
@@ -338,6 +351,7 @@ where
             cursor_visible: false,
             dirty: Vec::new(),
             render_armed: false,
+            graphics_released: false,
             session_counter: 0,
             current_generation: 0,
             previous_foreground: null_mut(),
@@ -503,6 +517,7 @@ where
             return;
         }
         self.frozen = Some(frozen);
+        self.graphics_released = false;
 
         eprintln!(
             "[snapclip][capture] overlay session armed session={}",
@@ -646,6 +661,7 @@ where
             session_id, reason, was_active
         );
         self.worker.cancel();
+        self.export_worker.cancel();
         self.current_generation = 0;
         self.release_session();
         if was_active {
@@ -662,6 +678,7 @@ where
         );
         self.session.cancel();
         self.frozen = None;
+        self.graphics_released = false;
         self.drag_mode = None;
         self.cursor_visible = false;
         // Stop the coalescing tick before releasing the renderer: a pending WM_TIMER
@@ -681,12 +698,14 @@ where
         }
     }
 
-    /// `Enter`: crop the frozen frame, encode it and write the artifact.
+    /// `Enter`: read the confirmed selection back on this thread, then hand encode +
+    /// write to the export worker so the message pump keeps answering `Esc` and
+    /// `WM_PAINT` while a large PNG is produced (docs/11 §Phase 3).
     fn confirm(&mut self) {
         let started_at = Instant::now();
-        let selection = match self.session.begin_finish() {
-            Ok(FinishingOutcome::Produce { selection }) => selection,
-            Ok(FinishingOutcome::Empty) => {
+        let selection = match self.session.begin_export() {
+            Ok(ExportOutcome::Produce { selection }) => selection,
+            Ok(ExportOutcome::Empty) => {
                 self.publish_state();
                 return;
             }
@@ -706,42 +725,114 @@ where
         };
         let session_id = self.session_id();
         let provider = frozen.frame.provider;
-        let pixels = FrozenFramePixels::new(frozen);
-        let result = self.service.produce_artifact(
-            &session_id,
+        let dpi = self.session.dpi();
+        // Region readback is the only step that touches the single-threaded D3D11
+        // immediate context, so it stays here — synchronous, before the hand-off.
+        let prepared = self.service.prepare_selection(
             &frozen.frame,
             selection,
-            self.session.dpi(),
-            None,
-            &pixels,
+            &FrozenFramePixels::new(frozen),
         );
-        match result {
-            Ok(artifact) => {
+        let readback_ms = started_at.elapsed().as_millis();
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
                 eprintln!(
-                    "[snapclip][capture] artifact written session={} path={} size={}x{} elapsed_ms={}",
+                    "[snapclip][capture] region readback failed session={} provider={} elapsed_ms={} error={}",
+                    session_id, provider, readback_ms, error
+                );
+                self.sink.on_failed(Some(&session_id), &error, provider);
+                self.session.fail();
+                self.finish_session();
+                self.sink.on_state(&session_id, CaptureState::Idle, None);
+                return;
+            }
+        };
+        let export_width = prepared.region.width();
+        let export_height = prepared.region.height();
+        // The overlay is frozen at the confirmed selection until the export lands, so
+        // cursor-follow repaints can neither race nor waste the hand-off.
+        self.graphics_released = true;
+        let service = self.service.clone();
+        let job = ExportJob {
+            generation: 0,
+            session_id: session_id.clone(),
+            prepared,
+            dpi,
+            monitor_device_name: None,
+            notify_thread: unsafe { GetCurrentThreadId() },
+            executor: Box::new(move |job: &ExportJob| {
+                service.finish_artifact(
+                    &job.session_id,
+                    &job.prepared,
+                    job.dpi,
+                    job.monitor_device_name.clone(),
+                )
+            }),
+        };
+        match self.export_worker.submit(job) {
+            Ok(Some(generation)) => {
+                eprintln!(
+                    "[snapclip][bench] export submitted session={} generation={} size={}x{} readback_ms={}",
+                    session_id, generation, export_width, export_height, readback_ms
+                );
+            }
+            Ok(None) | Err(_) => {
+                // The worker refused the job (shutting down) or could not start; no
+                // result will ever post back, so report the failure right here.
+                let error = CaptureError::EncodeFailed("export worker unavailable".to_string());
+                eprintln!(
+                    "[snapclip][capture] export submit failed session={} provider={} error={}",
+                    session_id, provider, error
+                );
+                self.sink.on_failed(Some(&session_id), &error, provider);
+                self.session.fail();
+                self.finish_session();
+                self.sink.on_state(&session_id, CaptureState::Idle, None);
+            }
+        }
+    }
+
+    /// Drain a finished export. Runs on the overlay thread when the worker posts
+    /// [`export_worker::EXPORT_READY_MESSAGE`]; ignored once the session has left
+    /// `Exporting` (an `Esc` cancelled it, and the worker already deleted the file).
+    fn on_export_ready(&mut self) {
+        let Some(ready) = self.export_worker.take_ready() else {
+            return;
+        };
+        if self.session.state() != CaptureState::Exporting {
+            return;
+        }
+        let session_id = self.session_id();
+        match ready {
+            Ok(completed) => {
+                let artifact = completed.artifact;
+                eprintln!(
+                    "[snapclip][capture] artifact ready session={} path={} size={}x{}",
                     session_id,
                     artifact
                         .png_path()
                         .map(|path| path.to_string_lossy())
                         .unwrap_or_default(),
                     artifact.width,
-                    artifact.height,
-                    started_at.elapsed().as_millis()
+                    artifact.height
                 );
                 self.sink.on_completed(&artifact);
                 self.session.complete();
                 self.finish_session();
                 self.sink.on_state(&session_id, CaptureState::Idle, None);
             }
-            Err(error) => {
+            Err(failure) => {
+                let stage = failure.stage;
                 eprintln!(
-                    "[snapclip][capture] artifact failed session={} provider={} elapsed_ms={} error={}",
-                    session_id,
-                    provider,
-                    started_at.elapsed().as_millis(),
-                    error
+                    "[snapclip][capture] export failed session={} stage={stage} error={}",
+                    session_id, failure.error
                 );
-                self.sink.on_failed(Some(&session_id), &error, provider);
+                if matches!(failure.error, CaptureError::DeviceRemoved(_)) {
+                    self.worker.invalidate_providers();
+                    self.renderer = None;
+                }
+                self.sink.on_failed(Some(&session_id), &failure.error, stage);
                 self.session.fail();
                 self.finish_session();
                 self.sink.on_state(&session_id, CaptureState::Idle, None);
@@ -969,6 +1060,11 @@ where
     }
 
     fn render(&mut self, damage: Vec<Rect>) {
+        // An export is in flight: the overlay is frozen at the confirmed selection
+        // and must not present, so nothing races the hand-off (see confirm()).
+        if self.graphics_released {
+            return;
+        }
         let session_id = self.session_id();
         let Some(renderer) = self.renderer.as_mut() else {
             return;
@@ -1064,18 +1160,24 @@ where
                     }
                     Some(OverlayCommand::Shutdown) => {
                         self.cancel("shutdown");
-                        // Stop the thread before quitting the pump; the worker
-                        // holds the providers and their device references.
+                        // Stop the threads before quitting the pump; the workers
+                        // hold the providers, the device and the in-flight export.
+                        self.export_worker.shutdown();
                         self.worker.shutdown();
                         unsafe { PostQuitMessage(0) };
                     }
                     Some(OverlayCommand::FrameReady) => self.on_frame_ready(),
+                    Some(OverlayCommand::ExportReady) => self.on_export_ready(),
                     None => {}
                 }
                 Some(0)
             }
             capture_worker::FRAME_READY_MESSAGE => {
                 self.on_frame_ready();
+                Some(0)
+            }
+            export_worker::EXPORT_READY_MESSAGE => {
+                self.on_export_ready();
                 Some(0)
             }
             WM_HOTKEY => {

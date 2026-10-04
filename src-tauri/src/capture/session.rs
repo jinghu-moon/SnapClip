@@ -47,10 +47,10 @@ impl OverlayGeometry {
     }
 }
 
-/// Outcome of [`CaptureSession::begin_finish`].
+/// Outcome of [`CaptureSession::begin_export`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FinishingOutcome {
-    /// The session is in `Finishing` and the caller must produce the artifact for
+pub enum ExportOutcome {
+    /// The session is in `Exporting` and the caller must produce the artifact for
     /// this clipped selection from the frozen frame.
     Produce { selection: Rect },
     /// Nothing usable is selected; the session returns to `Selected`.
@@ -238,8 +238,12 @@ impl CaptureSession {
         self.mode = None;
     }
 
-    /// `Selected -> Finishing`. Returns the clipped selection to resolve.
-    pub fn begin_finish(&mut self) -> Result<FinishingOutcome, CaptureError> {
+    /// `Selected -> Exporting`. Returns the clipped selection to resolve.
+    ///
+    /// Entering `Exporting` is the overlay's signal to stop painting: from here the
+    /// frozen frame is being handed to the export worker, and a repaint would race the
+    /// region readback for the single-threaded D3D11 context.
+    pub fn begin_export(&mut self) -> Result<ExportOutcome, CaptureError> {
         if !matches!(self.state, CaptureState::Selected) {
             return Err(CaptureError::InvalidState(format!(
                 "cannot confirm while {}",
@@ -248,10 +252,10 @@ impl CaptureSession {
         }
         let selection = self.selection.intersect(self.bounds());
         if selection.is_empty() {
-            return Ok(FinishingOutcome::Empty);
+            return Ok(ExportOutcome::Empty);
         }
-        self.state = CaptureState::Finishing;
-        Ok(FinishingOutcome::Produce { selection })
+        self.state = CaptureState::Exporting;
+        Ok(ExportOutcome::Produce { selection })
     }
 
     /// Build the domain artifact for a finished session.
@@ -278,6 +282,9 @@ impl CaptureSession {
     }
 
     /// Return to `Idle` after the artifact was produced.
+    ///
+    /// Named for the Phase 3 contract: the artifact is delivered by the export worker,
+    /// so completion is a distinct step from entering `Exporting`.
     pub fn complete(&mut self) {
         self.reset();
     }
@@ -310,7 +317,7 @@ impl CaptureSession {
 
 #[cfg(test)]
 mod tests {
-    use super::{CaptureSession, CapturedFrame, FinishingOutcome, OverlayGeometry};
+    use super::{CaptureSession, CapturedFrame, ExportOutcome, OverlayGeometry};
     use crate::capture::geometry::{MonitorLayout, Point, Rect, SelectionGeometry};
     use crate::domain::{CapturePayload, CaptureState, PixelFormat};
 
@@ -357,14 +364,14 @@ mod tests {
         assert_eq!(session.selection(), Rect::new(100, 100, 400, 300));
         assert_eq!(session.pointer_released(), CaptureState::Selected);
 
-        let outcome = session.begin_finish().unwrap();
+        let outcome = session.begin_export().unwrap();
         assert_eq!(
             outcome,
-            FinishingOutcome::Produce {
+            ExportOutcome::Produce {
                 selection: Rect::new(100, 100, 400, 300)
             }
         );
-        assert_eq!(session.state(), CaptureState::Finishing);
+        assert_eq!(session.state(), CaptureState::Exporting);
 
         let artifact = session
             .artifact(
@@ -389,13 +396,13 @@ mod tests {
         // Each case builds the session up to the state under test, then cancels.
         // `Preparing` is the worker round trip; `Armed` has no selection yet;
         // `Selecting` is mid-drag; `Selected` has a committed selection;
-        // `Finishing` is resolving an artifact.
+        // `Exporting` has handed its pixels to the export worker.
         for state in [
             CaptureState::Preparing,
             CaptureState::Armed,
             CaptureState::Selecting,
             CaptureState::Selected,
-            CaptureState::Finishing,
+            CaptureState::Exporting,
         ] {
             let mut session = CaptureSession::new("session-1");
             session.preparing().unwrap();
@@ -417,18 +424,16 @@ mod tests {
                     session.pointer_moved(Point::new(200, 200));
                     session.pointer_released();
                 }
-                CaptureState::Finishing => {
+                CaptureState::Exporting => {
                     session.arm(frame(), &layout()).unwrap();
                     session.overlay_ready().unwrap();
                     session.pointer_pressed(Point::new(10, 10));
                     session.pointer_moved(Point::new(200, 200));
                     session.pointer_released();
-                    session.begin_finish().unwrap();
+                    session.begin_export().unwrap();
                 }
                 CaptureState::Idle => unreachable!("idle is not an active state"),
-                CaptureState::Adjusting
-                | CaptureState::Annotating
-                | CaptureState::Exporting => {
+                CaptureState::Adjusting | CaptureState::Annotating => {
                     unreachable!("{state:?} belongs to the docs/11 contract but is not reachable until its phase lands")
                 }
             }
@@ -493,7 +498,7 @@ mod tests {
     #[test]
     fn confirming_without_a_selection_is_rejected() {
         let mut session = armed_session();
-        let error = session.begin_finish().unwrap_err();
+        let error = session.begin_export().unwrap_err();
         assert_eq!(
             error.error_code(),
             crate::capture::error::CaptureErrorCode::InvalidState
@@ -508,7 +513,7 @@ mod tests {
         assert_eq!(session.pointer_released(), CaptureState::Selecting);
         assert_eq!(session.selection(), Rect::default());
         // Still confirmable-false but not a hard error: state stays Selecting.
-        assert!(session.begin_finish().is_err());
+        assert!(session.begin_export().is_err());
     }
 
     #[test]

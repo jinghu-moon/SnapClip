@@ -15,7 +15,7 @@ use ::windows::Win32::Graphics::Direct2D::{
 };
 use ::windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use ::windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ,
+    D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_CPU_ACCESS_READ,
     D3D11_CREATE_DEVICE_BGRA_SUPPORT,
     D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_SUBRESOURCE_DATA,
     D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING, D3D11CreateDevice,
@@ -290,6 +290,77 @@ impl GraphicsDevice {
         unsafe { swap_chain.Present(1, DXGI_PRESENT(0)) }
             .ok()
             .map_err(|error| super::hresult("IDXGISwapChain::Present", &error))
+    }
+
+    /// Copy a **sub-region** of `texture` into a region-sized staging texture and
+    /// return its tightly-packed BGRA pixels.
+    ///
+    /// This is the Phase 3 optimization: instead of copying the whole monitor frame to
+    /// CPU and cropping (readback_bytes = frame_w × frame_h × 4), we ask the GPU to
+    /// transfer only the selection rectangle (`CopySubresourceRegion`). The staging
+    /// texture is sized to the selection, so the Map/row-copy touches only the pixels
+    /// the artifact actually needs.
+    ///
+    /// `x`/`y` are the top-left corner of the region in texture coordinates.
+    /// `width`/`height` are the region dimensions. The caller must ensure the region
+    /// stays within the texture bounds.
+    pub fn read_back_region_bgra(
+        &self,
+        texture: &ID3D11Texture2D,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, String> {
+        if width == 0 || height == 0 {
+            return Ok(Vec::new());
+        }
+        let staging_desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: 0,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            MiscFlags: 0,
+        };
+        let mut staging_texture: Option<ID3D11Texture2D> = None;
+        unsafe { self.d3d.CreateTexture2D(&staging_desc, None, Some(&mut staging_texture)) }
+            .map_err(|error| super::hresult("CreateTexture2D(region staging)", &error))?;
+        let staging_texture = staging_texture
+            .ok_or_else(|| "region staging CreateTexture2D returned nothing".to_string())?;
+
+        let src_box = D3D11_BOX {
+            left: x,
+            top: y,
+            front: 0,
+            right: x.saturating_add(width),
+            bottom: y.saturating_add(height),
+            back: 1,
+        };
+        unsafe {
+            self.context
+                .CopySubresourceRegion(&staging_texture, 0, 0, 0, 0, texture, 0, Some(&src_box));
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            self.context
+                .Map(&staging_texture, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .map_err(|error| super::hresult("Map(region staging)", &error))?;
+
+            let row_bytes = width as usize * 4;
+            let mut pixels = Vec::with_capacity(row_bytes * height as usize);
+            for row in 0..height as usize {
+                let source = (mapped.pData as *const u8).add(row * mapped.RowPitch as usize);
+                pixels.extend_from_slice(std::slice::from_raw_parts(source, row_bytes));
+            }
+            self.context.Unmap(&staging_texture, 0);
+            Ok(pixels)
+        }
     }
 
     /// Detect `DXGI_ERROR_DEVICE_REMOVED` / `DEVICE_RESET` / `DEVICE_HUNG`.

@@ -242,7 +242,7 @@ Application service
 #### BitBlt：兼容降级
 
 - [ ] 只用于 WGC 不可用、远程桌面或受限环境。
-- [ ] 已有 CPU DIB 时直接裁剪选区；禁止上传 GPU 后再整屏 readback。
+- [x] 已有 CPU DIB 时直接裁剪选区；禁止上传 GPU 后再整屏 readback。
 - [ ] 明确 HDR、分层窗口、受保护内容的限制并写入诊断信息。
 
 ### 3.3 Worker 请求协议
@@ -691,13 +691,13 @@ CaptureArtifact {
 
 ### 10.2 Export worker
 
-- [ ] `Enter` 只把 selection 和 frame 引用交给 export worker。
-- [ ] GPU 路径 `CopySubresourceRegion` 只读 selection。
-- [ ] 逐行处理 RowPitch，生成紧凑 BGRA buffer。
-- [ ] PNG/WIC 编码不在 overlay 线程执行。
-- [ ] 采用临时文件 + flush + atomic rename。
-- [ ] 输出路径、尺寸、provider、耗时写入诊断日志。
-- [ ] 失败时不留下半成品文件。
+- [x] `Enter` 只做选区 readback（唯一触碰 D3D11 即时上下文的步骤，须留在 overlay 线程），再把回读得到的选区像素交给 export worker；worker 收到的是像素而非 frame 引用（device 单线程，不能跨线程并发）。
+- [x] GPU 路径 `CopySubresourceRegion` 只读 selection。
+- [x] 逐行处理 RowPitch，生成紧凑 BGRA buffer。
+- [x] PNG/WIC 编码不在 overlay 线程执行。
+- [x] 采用临时文件 + flush + atomic rename。
+- [x] 输出路径、尺寸、provider、耗时写入诊断日志。
+- [x] 失败时不留下半成品文件（原子落盘 + 取消时删除已写文件）。
 
 ### 10.3 应用层集成顺序
 

@@ -28,9 +28,10 @@ impl PixelFormat {
 /// The value set is the frozen Phase 0 contract from
 /// `docs/11-screenshot-fullflow-ui-refactor-tasklist.md` §2.2:
 /// Idle → Preparing → Armed → Selecting → Selected → Adjusting → Annotating →
-/// Exporting → Idle. `Preparing`, `Adjusting`, `Annotating` and `Exporting` are
-/// emitted once their phases introduce them; `Finishing` is the current
-/// produce-artifact state and is replaced by `Exporting` in Phase 3.
+/// Exporting → Idle. `Adjusting` and `Annotating` are emitted once their phases
+/// introduce them. `Exporting` is entered when a selection is confirmed and covers
+/// the region readback on the overlay thread plus the encode/write on the export
+/// worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureState {
@@ -42,7 +43,6 @@ pub enum CaptureState {
     Adjusting,
     Annotating,
     Exporting,
-    Finishing,
 }
 
 impl CaptureState {
@@ -56,12 +56,15 @@ impl CaptureState {
             Self::Adjusting => "adjusting",
             Self::Annotating => "annotating",
             Self::Exporting => "exporting",
-            Self::Finishing => "finishing",
         }
     }
 
+    /// Whether a session owns resources that still have to be released.
+    ///
+    /// `Exporting` is active even though the overlay has stopped painting: the frozen
+    /// frame and the artifact are still owned by the session until the result lands.
     pub fn is_active(self) -> bool {
-        !matches!(self, Self::Idle)
+        self != Self::Idle
     }
 }
 
@@ -115,7 +118,6 @@ mod tests {
             CaptureState::Adjusting,
             CaptureState::Annotating,
             CaptureState::Exporting,
-            CaptureState::Finishing,
         ] {
             assert!(state.is_active(), "{state:?} should be active");
         }

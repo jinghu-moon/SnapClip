@@ -84,8 +84,10 @@ impl FrozenFrame {
 
     /// CPU pixels of the frozen frame, read back on first use.
     ///
-    /// This is the single GPU → CPU transfer on the capture path; it is deferred to
-    /// the moment the artifact is produced rather than paid while arming the session.
+    /// This is the *fallback* full-frame transfer: an artifact export goes through
+    /// [`Self::read_region`] instead, so a 300x200 selection never pays for a 4K
+    /// readback (docs/11 §Phase 3). Only a frame with no selection — the renderer's
+    /// CPU upload path and the tests — uses this.
     pub fn pixels(&self) -> CaptureResult<&[u8]> {
         if let Some(pixels) = self.pixels.get() {
             return Ok(pixels);
@@ -117,6 +119,84 @@ impl FrozenFrame {
         );
         // A racing reader may have won; either buffer is equivalent.
         Ok(self.pixels.get_or_init(|| pixels))
+    }
+
+    /// Tightly packed BGRA pixels of one region, **without** a full-frame transfer.
+    ///
+    /// The two provider paths converge here:
+    /// * BitBlt already holds CPU pixels, so the region is a pure memory crop.
+    /// * WGC copies only the requested box (`CopySubresourceRegion`) into a
+    ///   region-sized staging texture, so `readback_bytes == region area × 4` whatever
+    ///   the monitor resolution is.
+    ///
+    /// `region` is monitor-local and is clipped to the frame; a region that cannot
+    /// supply a single pixel — fully off-frame, or degenerate after clipping — is an
+    /// error rather than an empty buffer, so no encoder ever sees a zero-size image.
+    pub fn read_region(&self, region: Rect) -> CaptureResult<Vec<u8>> {
+        let frame_rect = self.frame.rect();
+        let clipped = region.intersect(frame_rect);
+        if clipped.is_empty() {
+            return Err(CaptureError::InvalidState(if region.is_empty() {
+                "artifact region is empty".into()
+            } else {
+                "artifact region does not overlap the frozen frame".into()
+            }));
+        }
+        let width = clipped.width() as usize;
+        let height = clipped.height() as usize;
+
+        // BitBlt kept its CPU pixels, so cropping them is cheaper than any GPU round
+        // trip — and it keeps the GPU out of the export path entirely.
+        if let Some(pixels) = self.pixels.get() {
+            return crop_pixel_rows(pixels, self.frame.width as usize * 4, clipped).ok_or_else(
+                || {
+                    CaptureError::CaptureFailed(
+                        "frozen frame pixel buffer is shorter than its geometry".into(),
+                    )
+                },
+            );
+        }
+
+        let gpu = self.texture.as_ref().ok_or_else(|| {
+            CaptureError::CaptureFailed("frozen frame has neither a texture nor pixels".into())
+        })?;
+        let device = self.device.as_ref().ok_or_else(|| {
+            CaptureError::CaptureFailed(
+                "frozen frame has a texture but no device to read it back with".into(),
+            )
+        })?;
+        // Phase 3 observability: the byte count is now the selection's, not the
+        // monitor's, which is exactly the acceptance criterion for this phase.
+        let started_at = std::time::Instant::now();
+        let pixels = device
+            .read_back_region_bgra(
+                &gpu.texture,
+                clipped.left.max(0) as u32,
+                clipped.top.max(0) as u32,
+                width as u32,
+                height as u32,
+            )
+            .map_err(|message| classify_device_error("GPU region readback", message))?;
+        eprintln!(
+            "[snapclip][capture] region readback provider={} region=({},{})-{}x{} frame={}x{} bytes={} elapsed_ms={}",
+            self.frame.provider,
+            clipped.left,
+            clipped.top,
+            width,
+            height,
+            self.frame.width,
+            self.frame.height,
+            pixels.len(),
+            started_at.elapsed().as_millis()
+        );
+        if pixels.len() != width * height * 4 {
+            return Err(CaptureError::CaptureFailed(format!(
+                "region readback returned {} bytes, expected {}",
+                pixels.len(),
+                width * height * 4
+            )));
+        }
+        Ok(pixels)
     }
 
     /// Whether the CPU pixels have been read back yet.
@@ -168,29 +248,36 @@ impl<'a> FrozenFramePixels<'a> {
 
 impl PixelSliceSource for FrozenFramePixels<'_> {
     fn read_bgra(&self, region: Rect) -> CaptureResult<Vec<u8>> {
-        let frame_rect = self.frame.frame.rect();
-        let clipped = region.intersect(frame_rect);
-        if clipped.is_empty() {
-            return Err(CaptureError::InvalidState(
-                "artifact region does not overlap the frozen frame".into(),
-            ));
-        }
-        // Triggers the single deferred readback on the first crop.
-        let pixels = self.frame.pixels()?;
-        let stride = self.frame.frame.width as usize * 4;
-        let mut output = Vec::with_capacity(clipped.area() as usize * 4);
-        for row in clipped.top..clipped.bottom {
-            let start = row as usize * stride + clipped.left as usize * 4;
-            let end = start + clipped.width() as usize * 4;
-            if end > pixels.len() {
-                return Err(CaptureError::CaptureFailed(
-                    "frozen frame pixel buffer is shorter than its geometry".into(),
-                ));
-            }
-            output.extend_from_slice(&pixels[start..end]);
-        }
-        Ok(output)
+        // One code path for both providers: the frame decides whether the region is a
+        // CPU crop (BitBlt) or a `CopySubresourceRegion` (WGC).
+        self.frame.read_region(region)
     }
+}
+
+/// Crop `region` out of a top-down BGRA buffer whose rows are `stride` bytes wide.
+///
+/// Kept separate from the pixel source because the two failure modes that matter — a
+/// padded (`RowPitch > width × 4`) source and a selection flush against the right/bottom
+/// edge — are properties of this arithmetic, not of the GPU or of Win32, so they can be
+/// tested exhaustively without either.
+///
+/// Returns `None` when `pixels` cannot supply every row of `region`.
+fn crop_pixel_rows(pixels: &[u8], stride: usize, region: Rect) -> Option<Vec<u8>> {
+    let width = usize::try_from(region.width()).ok()?;
+    let height = usize::try_from(region.height()).ok()?;
+    let left = usize::try_from(region.left).ok()?;
+    let top = usize::try_from(region.top).ok()?;
+    if width == 0 || height == 0 || stride < width * 4 || left > stride / 4 {
+        return None;
+    }
+    let mut output = Vec::with_capacity(width * height * 4);
+    for row in 0..height {
+        let source_row = top.checked_add(row)?;
+        let start = source_row.checked_mul(stride)?.checked_add(left.checked_mul(4)?)?;
+        let end = start.checked_add(width * 4)?;
+        output.extend_from_slice(pixels.get(start..end)?);
+    }
+    Some(output)
 }
 
 /// A device that has to be created before any provider can run.
@@ -306,13 +393,17 @@ impl CaptureProviders {
                     ProviderKind::Wgc,
                     Some(gpu),
                     self.device.clone(),
+                    None,
                 ))
             }
             ProviderKind::BitBlt => {
                 let captured = bitblt::capture_monitor(monitor)
                     .map_err(CaptureError::CaptureFailed)?;
                 // BitBlt hands back CPU pixels, so upload them once to get the same
-                // GPU-resident L0 representation the WGC path has.
+                // GPU-resident L0 representation the WGC path has. Phase 3: retain the
+                // original CPU pixels so the export path crops them directly instead of
+                // reading back from the GPU again.
+                let cpu_pixels = captured.pixels.clone();
                 let gpu = self
                     .device
                     .create_bgra_texture(captured.width, captured.height, &captured.pixels)
@@ -322,6 +413,7 @@ impl CaptureProviders {
                     ProviderKind::BitBlt,
                     Some(gpu),
                     self.device.clone(),
+                    Some(cpu_pixels),
                 ))
             }
         }
@@ -333,7 +425,12 @@ fn frozen_frame(
     provider: ProviderKind,
     texture: Option<GpuFrame>,
     device: Arc<GraphicsDevice>,
+    pre_materialized_pixels: Option<Vec<u8>>,
 ) -> FrozenFrame {
+    let pixels = OnceLock::new();
+    if let Some(buf) = pre_materialized_pixels {
+        let _ = pixels.set(buf);
+    }
     FrozenFrame {
         frame: CapturedFrame {
             width: monitor.width(),
@@ -346,7 +443,7 @@ fn frozen_frame(
         provider,
         texture,
         device: Some(device),
-        pixels: OnceLock::new(),
+        pixels,
     }
 }
 
@@ -355,6 +452,51 @@ fn classify_device_error(context: &str, message: String) -> CaptureError {
         CaptureError::DeviceRemoved(format!("{context}: {message}"))
     } else {
         CaptureError::CaptureFailed(format!("{context}: {message}"))
+    }
+}
+
+/// A frame whose pixels are already materialised, so the cropping and export paths
+/// can be exercised without a GPU, a monitor or a device.
+///
+/// The pixel grid encodes its own coordinates (`[x, y, 0, 255]`), which is what makes
+/// a crop verifiable byte for byte.
+#[cfg(test)]
+pub(crate) fn test_frozen_frame(width: u32, height: u32) -> FrozenFrame {
+    let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            pixels.extend_from_slice(&[x as u8, y as u8, 0, 255]);
+        }
+    }
+    FrozenFrame {
+        frame: CapturedFrame {
+            width,
+            height,
+            pixel_format: PixelFormat::Bgra8Unorm,
+            captured_at_unix_ms: 1,
+            provider: "test",
+        },
+        monitor: CapturedMonitor {
+            handle: 0,
+            layout: crate::capture::geometry::MonitorLayout {
+                bounds: Rect::from_origin_size(
+                    crate::capture::geometry::Point::new(0, 0),
+                    width as i32,
+                    height as i32,
+                ),
+                work_area: Rect::from_origin_size(
+                    crate::capture::geometry::Point::new(0, 0),
+                    width as i32,
+                    height as i32,
+                ),
+                dpi: 96,
+                primary: true,
+            },
+        },
+        provider: ProviderKind::BitBlt,
+        texture: None,
+        device: None,
+        pixels: OnceLock::from(pixels),
     }
 }
 
@@ -377,47 +519,17 @@ fn attempt_order(preferred: Option<ProviderKind>) -> Vec<ProviderKind> {
 #[cfg(test)]
 mod tests {
     use super::{
-        attempt_order, classify_device_error, CaptureProviders, FrozenFrame, FrozenFramePixels,
-        GraphicsDevice, ProviderKind,
+        attempt_order, classify_device_error, crop_pixel_rows, CaptureProviders, FrozenFrame,
+        FrozenFramePixels, GraphicsDevice, ProviderKind,
     };
     use crate::capture::CaptureError;
     use crate::capture::application::PixelSliceSource;
-    use crate::capture::geometry::{MonitorLayout, Point, Rect};
-    use crate::capture::session::CapturedFrame;
-    use crate::domain::PixelFormat;
-    use std::sync::OnceLock;
+    use crate::capture::geometry::Rect;
 
-    /// A frame whose pixels are already materialised, so the pure cropping logic can be
-    /// exercised without a GPU.
+    /// Shorthand for the shared test frame, which lives outside `tests` so the export
+    /// worker can build an `Arc<FrozenFrame>` with no GPU either.
     fn frozen(width: u32, height: u32) -> FrozenFrame {
-        let mut pixels = Vec::with_capacity((width * height * 4) as usize);
-        for y in 0..height {
-            for x in 0..width {
-                pixels.extend_from_slice(&[x as u8, y as u8, 0, 255]);
-            }
-        }
-        FrozenFrame {
-            frame: CapturedFrame {
-                width,
-                height,
-                pixel_format: PixelFormat::Bgra8Unorm,
-                captured_at_unix_ms: 1,
-                provider: "test",
-            },
-            monitor: super::CapturedMonitor {
-                handle: 0,
-                layout: MonitorLayout {
-                    bounds: Rect::from_origin_size(Point::new(0, 0), width as i32, height as i32),
-                    work_area: Rect::from_origin_size(Point::new(0, 0), width as i32, height as i32),
-                    dpi: 96,
-                    primary: true,
-                },
-            },
-            provider: ProviderKind::BitBlt,
-            texture: None,
-            device: None,
-            pixels: OnceLock::from(pixels),
-        }
+        super::test_frozen_frame(width, height)
     }
 
     #[test]
@@ -438,6 +550,76 @@ mod tests {
         let pixels = source.read_bgra(Rect::new(2, 2, 100, 100)).unwrap();
         assert_eq!(pixels, vec![2, 2, 0, 255, 3, 2, 0, 255]);
         assert!(source.read_bgra(Rect::new(50, 50, 60, 60)).is_err());
+    }
+
+    #[test]
+    fn read_region_only_transfers_the_selection() {
+        // The Phase 3 acceptance criterion in CPU form: a 2x1 read of a 4x3 frame
+        // hands back exactly 8 bytes and never materialises the frame around it.
+        let frame = frozen(4, 3);
+        let pixels = frame.read_region(Rect::new(1, 2, 3, 3)).unwrap();
+        assert_eq!(pixels, vec![1, 2, 0, 255, 2, 2, 0, 255]);
+        assert_eq!(pixels.len(), 2 * 4, "a 2x1 selection is exactly two BGRA pixels");
+    }
+
+    #[test]
+    fn read_region_clips_a_selection_hanging_off_the_right_and_bottom() {
+        let frame = frozen(4, 3);
+        let pixels = frame.read_region(Rect::new(3, 2, 40, 40)).unwrap();
+        assert_eq!(pixels, vec![3, 2, 0, 255]);
+    }
+
+    #[test]
+    fn read_region_clips_a_negative_origin_to_the_frame() {
+        // Monitor-local regions start at (0, 0), but a drag begun off-screen must not
+        // index the pixel buffer with a negative row/column: the region is clipped
+        // first, then cropped.
+        let frame = frozen(4, 3);
+        // `right`/`bottom` are exclusive, so a (-5,-5)-(1,1) request overlaps the
+        // frame's half-open [0,1)x[0,1) on exactly one pixel: clipping must produce
+        // that pixel, never index the buffer with a negative row or column.
+        let pixels = frame.read_region(Rect::new(-5, -5, 1, 1)).unwrap();
+        assert_eq!(pixels, vec![0, 0, 0, 255]);
+        // A region clipped down to nothing is refused, not silently empty.
+        assert!(matches!(
+            frame.read_region(Rect::new(-5, -5, -1, -1)),
+            Err(CaptureError::InvalidState(_))
+        ));
+        // Fully off-frame in the positive direction as well.
+        assert!(matches!(
+            frame.read_region(Rect::new(-8, -8, -4, -4)),
+            Err(CaptureError::InvalidState(_))
+        ));
+    }
+
+    #[test]
+    fn crop_handles_a_padded_row_pitch() {
+        // A staging texture whose `RowPitch` exceeds `width × 4` is the normal case on
+        // real hardware; cropping must skip the padding instead of shifting rows.
+        // Frame: 2x2, stride 12 (2 pixels + 4 bytes of padding).
+        let padded = vec![
+            10, 10, 0, 255, 11, 10, 0, 255, 0, 0, 0, 0, // row 0 + padding
+            12, 10, 0, 255, 13, 10, 0, 255, 0, 0, 0, 0, // row 1 + padding
+        ];
+        let cropped = crop_pixel_rows(&padded, 12, Rect::new(1, 1, 2, 2)).unwrap();
+        assert_eq!(cropped, vec![13, 10, 0, 255]);
+        let whole = crop_pixel_rows(&padded, 12, Rect::new(0, 0, 2, 2)).unwrap();
+        assert_eq!(
+            whole,
+            vec![10, 10, 0, 255, 11, 10, 0, 255, 12, 10, 0, 255, 13, 10, 0, 255]
+        );
+    }
+
+    #[test]
+    fn crop_rejects_a_buffer_shorter_than_the_selection() {
+        let padded = vec![10, 10, 0, 255, 11, 10, 0, 255, 0, 0, 0, 0];
+        // Two rows demanded, only one present.
+        assert!(crop_pixel_rows(&padded, 12, Rect::new(0, 0, 2, 2)).is_none());
+        // Stride narrower than the region can never be cropped.
+        assert!(crop_pixel_rows(&padded, 4, Rect::new(0, 0, 2, 1)).is_none());
+        // Degenerate regions are rejected rather than producing an empty success.
+        assert!(crop_pixel_rows(&padded, 12, Rect::new(0, 0, 0, 4)).is_none());
+        assert!(crop_pixel_rows(&padded, 12, Rect::new(-1, 0, 4, 4)).is_none());
     }
 
     #[test]
@@ -530,6 +712,38 @@ mod tests {
             }
             Err(error) => eprintln!("capture unavailable in this session: {error}"),
         }
+    }
+
+    /// The hard Phase 3 gate: on real hardware a small selection must not pull the
+    /// whole monitor across the bus.
+    #[test]
+    fn a_300x200_selection_reads_back_only_its_own_bytes() {
+        let _ = super::super::monitor::set_per_monitor_v2_awareness();
+        let Ok(mut providers) = CaptureProviders::new() else {
+            eprintln!("no D3D11 device in this session; skipping the region readback check");
+            return;
+        };
+        let Ok(monitor) = super::super::monitor::captured_monitor_at_cursor() else {
+            eprintln!("no monitor at the cursor; skipping the region readback check");
+            return;
+        };
+        let Ok(frozen) = providers.capture(&monitor) else {
+            eprintln!("capture unavailable in this session; skipping the region readback check");
+            return;
+        };
+        // WGC frames have no CPU pixels, so this exercises `CopySubresourceRegion`.
+        // A BitBlt frame is the CPU crop; both must return the selection's bytes.
+        let selection = Rect::new(0, 0, 300.min(monitor.width() as i32), 200.min(monitor.height() as i32));
+        let pixels = frozen.read_region(selection).unwrap();
+        assert_eq!(
+            pixels.len(),
+            300 * 200 * 4,
+            "readback bytes must be the selection's, not the monitor's"
+        );
+        assert!(
+            !frozen.pixels_read(),
+            "a region readback must never materialise the full frame"
+        );
     }
 }
 

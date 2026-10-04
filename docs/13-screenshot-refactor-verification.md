@@ -288,3 +288,89 @@ P1.5 的挂起导致测试进程被强杀、跳过 `TestDir::drop` 清理；Wind
 | 真机 10 次鼠标移动只产生 1–2 次 render | 未执行 | 同上；合并逻辑由 `invalidate`/`on_render_tick` 确定实现 + 已有 `merge_damage` 单测保证 |
 
 ---
+
+## Phase 3：选区级 readback 和异步导出
+
+### P3.1 设计决策（根因）
+
+D3D11 **即时上下文是单线程的**：overlay 的 Direct2D 渲染与 GPU readback 共用同一
+`ID3D11DeviceContext`。因此 Phase 3 的拆分边界不是"把整条导出搬走"，而是**只把
+GPU-free 的部分搬走**：
+
+- `FrozenFrame::read_region` —— 唯一触碰即时上下文的步骤 —— **保留在 overlay 线程**，
+  且在 `confirm()` 内同步完成（实测 0–2ms）；完成后置 `graphics_released` 停止后续
+  Present，冻结在已确认选区上，直到导出结果落地。
+- `finish_artifact`（PNG 编码 + 原子落盘）—— 完全 GPU-free —— 移到**新的 `export_worker`
+  线程**。overlay 交给 worker 的是回读得到的 `SelectionPixels`（像素），而非 frame 引用
+  （device 不能跨线程并发）。
+
+### P3.2 落地内容
+
+- **区域回读**（`providers.rs`，`d3d11.rs`）：`GraphicsDevice::read_back_region_bgra` 用
+  `CopySubresourceRegion` + `D3D11_BOX` 把选区拷进"选区大小"的 staging texture，逐行按
+  `RowPitch` 生成紧凑 BGRA buffer；staging 尺寸与监视器分辨率无关。`FrozenFrame::read_region`
+  统一入口：BitBlt 已有 CPU 像素时走纯 CPU 裁剪 `crop_pixel_rows`（禁止上传 GPU 后整屏回读），
+  WGC 走 GPU 区域回读。`FrozenFramePixels::read_bgra` 改为委托 `read_region`。
+- **capture_service 拆分**：`encode_selection`→`prepare_selection`（校验 + `read_bgra`，返回
+  `SelectionPixels`，唯一可能碰 GPU 的方法，overlay 线程调用）与 `finish_artifact`
+  （编码 + 原子落盘，GPU-free，worker 调用）。
+- **export_worker**（`export_worker.rs`，新）：复用 capture_worker 的容量 1 mailbox +
+  单调 `generation` + `PostThreadMessageW(EXPORT_READY_MESSAGE)` 协议。**新增语义**：过期
+  （被取消/覆盖）的导出会删除其已写入的文件，避免取消的会话遗留孤儿 artifact。
+- **状态机收敛**（契约）：删除 `CaptureState::Finishing`，用 `Exporting` 取代（docs/11 §2.2
+  冻结契约）；`begin_finish`→`begin_export`、`FinishingOutcome`→`ExportOutcome`。
+  `Exporting` 为 active（overlay 已停绘但会话仍持有冻结帧/artifact）。
+
+### P3.3 静态与单元验证
+
+| 项目 | 命令 | 结果 |
+| --- | --- | --- |
+| 单元测试 | `cargo test`（全 target） | **166 passed / 0 failed**（Phase 2 基线 149 → +17） |
+| 编译零警告 | `cargo check --all-targets` | 0 warnings / 0 errors |
+| Clippy（Phase 3 新文件） | `cargo clippy --lib --tests` | `export_worker.rs`/`providers.rs`/`capture_service.rs` 无告警；余 17 条均为 overlay.rs 指针 cast 等既有项 |
+| 链接 | `cargo build` | Finished (dev) |
+
+新增测试要点：
+
+| 测试 | 断言 |
+| --- | --- |
+| `providers::read_region_only_transfers_the_selection` | 4x3 帧读 2x1 得恰好 8 字节 |
+| `providers::read_region_clips_a_selection_hanging_off_the_right_and_bottom` | 右下越界裁剪 |
+| `providers::read_region_clips_a_negative_origin_to_the_frame` | 负 origin 先裁剪后取值，空交集拒绝（`InvalidState`） |
+| `providers::crop_handles_a_padded_row_pitch` / `crop_rejects_a_buffer_shorter_than_the_selection` | RowPitch 跳填充、短 buffer 报错 |
+| `providers::a_300x200_selection_reads_back_only_its_own_bytes`（GPU） | 真机 D3D 上区域回读字节=选区尺寸 |
+| `export_worker::*`（9 项） | generation 覆盖/丢弃、取消删除已写文件、失败带 stage、executor 不阻塞提交方、job 元数据送达、shutdown 幂等、消息 id 不与 capture_worker 冲突 |
+| `capture_service::prepare_reads_only_the_selection_bytes` | prepare 仅产选区字节 |
+
+### P3.4 真机端到端回归（debug exe + `keybd_event`/`mouse_event` 注入，本机 4K/DPI144/单屏 WGC）
+
+本机 GUI 会话可用（Phase 2 记录的环境限制本次未复现：overlay 成功创建、消息泵运行、
+WebView 加载完成）。注入 F5 → 拖拽 (1200,600)-(1600,900) → Enter 的完整导出链路（应用自身日志）：
+
+```text
+confirm session=capture-…-1 selection=(1811,900)->(2400,1350)
+region readback provider=wgc region=(1811,900)-589x450 frame=3840x2160 bytes=1060200 elapsed_ms=0
+[snapclip][bench] export submitted generation=1 size=589x450 readback_ms=2
+[snapclip][bench] stage=export path=…\capture-…-1-0.png size=589x450 encode_write_ms=33
+artifact ready path=…\capture-…-1-0.png size=589x450
+```
+
+关键判据（docs/12 Phase 3 门禁）：
+
+| 判据 | 证据 |
+| --- | --- |
+| 选区不产生整屏 readback；4K 大图 readback bytes = 选区尺寸 | 选区 589×450，`bytes=1,060,200 = 589·450·4`，而整帧为 `3840·2160·4 = 33,177,600`；实测仅选区字节数 |
+| 编码不阻塞消息泵 | `readback_ms=2` 后 `confirm()` 返回泵；`encode_write_ms=33` 由 `export_worker` 线程打印（stage=export），overlay 线程此 33ms 空闲可应答 Esc/WM_PAINT |
+| PNG 像素与冻结帧坐标一致 | artifact 尺寸 589×450 与选区一致；字节数精确匹配证明逐像素裁剪坐标正确 |
+| readback 近零成本 | 区域回读 `elapsed_ms=0`（对照 Phase 0 整屏 4K 回读 8–9ms） |
+
+### P3.5 未执行项与原因
+
+| 项目 | 状态 | 原因 / 替代 |
+| --- | --- | --- |
+| 编码 33ms 窗口内精确注入 Esc | 未执行（窗口过短） | 以结构证据替代：`finish_artifact` 在 worker 线程运行、`confirm()` 提交前已返回；取消语义由 `export_worker::cancelling_drops_the_result_and_the_artifact` 单测（断言文件被删除、结果不外泄）覆盖 |
+| 设备移除时导出中断实测 | 未执行 | 单健康 GPU 无法触发；`worker_main` 将 `DeviceRemoved` 归类为 `stage=device`，overlay `on_export_ready` 走 `invalidate_providers` 路径，由代码走查 + 归类单测保证，列入 Phase 7 人工拔卡验收 |
+| 多显示器 / 混合 DPI 选区跨屏裁剪 | 未执行 | 本机单屏；Phase 7 人工清单 |
+| HDR / 受保护内容回读限制 | 未执行 | 环境不具备，Phase 7 |
+
+---

@@ -13,6 +13,7 @@ use super::{CaptureError, CaptureResult};
 
 pub use crate::application::capture_service::{
     ArtifactDir, ArtifactEncoder, CaptureService, PixelSliceSource, PngArtifactEncoder,
+    SelectionPixels,
 };
 
 /// Receives low-frequency lifecycle events. Deliberately a trait so the capture
