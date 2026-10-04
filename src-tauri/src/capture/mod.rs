@@ -13,6 +13,7 @@ mod error;
 pub mod annotation;
 pub mod diagnostics;
 pub mod geometry;
+pub mod monitor_cache;
 pub mod sampler;
 pub mod session;
 pub mod window_detection;

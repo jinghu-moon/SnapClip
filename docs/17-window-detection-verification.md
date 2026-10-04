@@ -1,8 +1,11 @@
-# 窗口自动吸附 Phase 0：基线确认、契约冻结与诊断埋点
+# 窗口自动吸附（docs/14）验证记录：Phase 0 ~ Phase 7
 
-本文件是 `docs/14-screenshot-window-detection-design.md` 落地的 Phase 0 交付物：
-修改前的真实行为基线、参考源码审计结论、契约冻结内容与质量门禁证据。
-后续阶段（Phase 1~7）的基线与对比均以本文件为准。
+本文件是 `docs/14-screenshot-window-detection-design.md` 落地的逐阶段验证记录，
+与 `docs/13-screenshot-refactor-verification.md` 同构：每个阶段完成后追加一节，
+记录基线、契约冻结、实机证据、性能数据与未覆盖项。
+
+Phase 0 是修改前的真实行为基线、参考源码审计结论、契约冻结内容与质量门禁证据；
+后续阶段（Phase 1~7）的对比均以 Phase 0 数据为基准。
 
 - 基线提交：`581268c`（`main`，工作区仅有未跟踪的 `docs/16-*.md`）
 - 测量环境：Windows 11 IoT Enterprise LTSC build 26100 / AMD64 / MS-Terminator Z790-A
@@ -249,3 +252,91 @@ docs/14 §10.2 全部指标：`window_snapshot_refresh_us` / `window_snapshot_re
 | WPA / PresentMon 逐帧采集 | 未执行 | 环境无 PresentMon；以 Present 计数 + 进程 CPU/内存 + 阶段日志替代，Phase 6 再评估 |
 | affinity 三层排除的第 1 层 | 未实现 | 当前靠“先冻结后显示”；Phase 5 接入 `SetWindowDisplayAffinity` 与 excluded 集合 |
 | HDR / 高对比度 | 未执行 | 环境不具备 |
+
+---
+
+## Phase 1：DPI、几何与 Windows 窗口检测基础设施
+
+### 1.1 结论
+
+建立了窗口检测的坐标、过滤与 Win32/DWM 读取基础层。本阶段**不含**快照组装与命中
+算法（Phase 2），也**不改变** overlay 的输入行为：overlay 仍按原逻辑运行，
+新增能力由测试与后续阶段消费。
+
+### 1.2 落地内容
+
+| 能力 | 位置 | 说明 |
+| --- | --- | --- |
+| DPI 声明 | `platform/windows/capture/monitor.rs` | 按文档降级链 Per-Monitor V2 → Per-Monitor → System；已声明时读取实际 thread context，不降级；返回值用于日志 |
+| DPI 启动顺序 | `app/mod.rs` | 在 `tauri::Builder` 之前声明，早于任何窗口创建与光标读取 |
+| screen→local 转换 | `capture/geometry.rs::window_rect_to_local` | 裁剪到当前显示器并减去显示器原点；纯函数；不产生负尺寸 |
+| 显示器矩形缓存 | `capture/monitor_cache.rs` | 刷新周期内的显示器物理矩形集合；`intersects_any` 用半开区间做进程内相交，替代逐窗口 `MonitorFromRect`；`release()` 显式释放 |
+| Win32 FFI | `platform/windows/capture/win/window.rs` | `IsWindow`/`IsWindowVisible`/`IsIconic`/扩展样式/PID/类名/DWM cloaked/DWM frame bounds（失败或空才退 `GetWindowRect`，退后再查空） |
+| 两阶段过滤 | 同上 + `capture/window_detection/snapshot.rs` | `EnumWindows` 回调只做廉价检查并顺带读类名；DWM 查询由 `read_dwm_batch` 在回调**之后**批量执行 |
+| Shell 黑名单 | `capture/window_detection/provider.rs` | 8 个类名的**精确**匹配（不区分 ASCII 大小写，与 Win32 自身语义一致），不做前缀/样式判断 |
+| 排除集合 | 同上 `Exclusions` | `excluded_hwnds` + `excluded_process_ids`，带 `epoch`；集合实际变化才递增 epoch |
+| 过滤策略 | `capture/window_detection/snapshot.rs` | `passes_cheap_policy`（排除集合 + shell 面）、`passes_dwm_policy`（cloaked / 无边界 / 全屏外）、`classify`、`candidates_from_classified` |
+| Cargo feature | `Cargo.toml` | 补加 `Win32_Graphics_Dwm` |
+
+**不排除** `WS_EX_TOOLWINDOW` / `WS_EX_NOACTIVATE`；只有
+`WS_EX_LAYERED && WS_EX_TRANSPARENT` 同时成立才视为点击穿透。
+
+### 1.3 静态与单元验证
+
+| 项目 | 命令 | 结果 |
+| --- | --- | --- |
+| 单元测试 | `cargo test --lib` | **252 passed / 0 failed**（Phase 0 基线 219 → +33） |
+| 编译零告警 | `cargo check --all-targets` | exit 0，**0 warnings** |
+| Clippy（本阶段文件） | `cargo clippy --lib --tests` | 本阶段新增/修改文件 **0 告警** |
+| 前端 | `npm run typecheck` / `npm run build` | exit 0（未改前端，确认无退化） |
+
+新增测试要点：
+
+| 测试 | 断言 |
+| --- | --- |
+| `geometry::window_rect_conversion_subtracts_the_monitor_origin` | 负虚拟桌面原点（副屏在左上）转换正确 |
+| `geometry::window_rect_conversion_clips_a_window_that_spans_monitors` | 跨屏窗口只保留当前显示器可见带 |
+| `geometry::window_rect_conversion_rejects_rects_off_this_monitor` | 完全在屏外/仅贴边（半开）返回空 |
+| `geometry::window_rect_conversion_normalises_degenerate_input` | 退化/倒置矩形不产生负尺寸 |
+| `monitor_cache::*`（6 项） | 空缓存、退化矩形剔除、负坐标、半开边界、跨屏可见、`release` 后不再命中 |
+| `window::click_through_requires_both_layered_and_transparent` | 单独 `LAYERED`、单独 `TRANSPARENT` 不判穿透；组合与手写画布样式（`0x0a08_00a8`）判穿透 |
+| `window::a_visible_tool_window_is_enumerated_and_a_hidden_one_is_not` | 真机：可见 tool window 进入候选；`SW_HIDE` 后不再进入，句柄仍有效 |
+| `window::a_minimised_window_is_not_a_candidate` | 真机：`SW_MINIMIZE` 后 `IsIconic`/不可见，且不在候选内 |
+| `window::a_click_through_layered_window_is_not_a_candidate` | 真机：点击穿透 overlay 被剔除，其下方普通窗口仍可选 |
+| `window::frame_bounds_include_the_title_bar_and_exclude_the_invisible_border` | 真机：DWM 外框包含标题栏（在客户区之上）、不含不可见 resize border（对 `GetWindowRect` 的容差断言） |
+| `window::window_attributes_are_stable_for_a_live_window` | 类名 `Static`、PID 为本进程、可见、非最小化、非 cloaked |
+| `window::dwm_batch_returns_one_read_per_handle` | 批量 DWM 每个句柄一条结果；无效句柄无边界 |
+| `snapshot::pass_one_*` / `pass_two_*` / `classify_applies_both_passes_and_pairs_identities` | 两阶段过滤矩阵：自家窗口、shell 面、tool/no-activate、cloaked、无边界、屏外、退化矩形 |
+| `snapshot::class_name_hash_is_stable_and_class_sensitive` | 身份哈希稳定且类名敏感 |
+| `provider::*`（5 项） | 排除集合命中/epoch 语义、shell 面精确匹配、provider trait 可用纯实现替身 |
+| `monitor::a_second_declaration_never_downgrades_an_aware_process` | 重复声明不降级已有的 (V2/PM/System) 上下文 |
+
+**真机夹具方法**：测试自建窗口（`CreateWindowExW` + `STATIC`），`SW_SHOWNA` 避免抢焦点，
+泵消息 + 短 `Sleep` 等 DWM 提交后再读边界；坐标断言全部相对 `GetWindowInfo`/`GetWindowRect`
+而非写死像素（对齐 `Crisp tests/TestWindowPick.cpp` 的做法）。
+
+**一个必须记录的坑**：几何断言要求进程已声明 DPI 感知。未声明时 `GetWindowInfo`/
+`GetWindowRect` 返回**虚拟化**矩形而 `DWMWA_EXTENDED_FRAME_BOUNDS` 始终是物理像素，
+两者不可比较（实测：帧 368×259 @ (191,180) vs 客户区 244×141 @ (128,151)，比值正是
+150% 缩放）。测试因此在夹具建立前声明一次 Per-Monitor V2；这是应用启动路径本身的要求，
+不是测试特例。
+
+### 1.4 实机回归（debug exe + `keybd_event` 注入，4K/DPI144/单屏 WGC）
+
+| 指标 | Phase 0 基线 | Phase 1 复测 |
+| --- | --- | --- |
+| 启动 DPI 日志 | 无 | `[snapclip][startup] dpi awareness=per-monitor-v2` |
+| F5 → visible（warm） | 37–45 ms | 14–17 ms（`prepare_elapsed_ms`），worker 队列 0–33 ms |
+| 会话取消 | 5/5 干净 | 2/2 干净（`reason=escape`，`release session` 一一对应） |
+| Private Bytes / Working Set | 56.0 MB / 71.1 MB | **56.8 MB / 71.3 MB**（无退化） |
+| Present（会话内） | ≈53 次/会话 | 52 次/会话（104 / 2） |
+| 错误行 | 0 | 0 |
+
+### 1.5 未执行项与风险
+
+| 项目 | 状态 | 原因 / 替代 |
+| --- | --- | --- |
+| 普通/最大化/无边框窗口的**吸附**结果 | 不适用 | 吸附尚未实现；本阶段验证的是过滤与边界读取（普通/无边框/最小化/隐藏/穿透已覆盖） |
+| cloaked 真机夹具 | 未覆盖真机 | 合成 cloaked 窗口需要 UWP/虚拟桌面宿主；策略函数由纯单测覆盖，cloaked 的真机读取路径由 Phase 7 人工验收 |
+| 多显示器 / 混合 DPI 真机 | 未执行 | 本机单显示器；负坐标、跨屏裁剪、显示器缓存的纯单测已覆盖 |
+| `win::window` 的 FFI 面在非 test 构建下暂标 `dead_code` | 临时 | provider 编排在 Phase 2 接入；接入后移除该 allow（见文件头注释） |

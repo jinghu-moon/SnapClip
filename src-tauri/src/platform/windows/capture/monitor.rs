@@ -14,8 +14,8 @@ use ::windows::Win32::Graphics::Gdi::{
 };
 use ::windows::Win32::UI::HiDpi::{
     AreDpiAwarenessContextsEqual, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE,
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetThreadDpiAwarenessContext,
-    SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, DPI_AWARENESS_CONTEXT_SYSTEM_AWARE,
+    GetThreadDpiAwarenessContext, SetProcessDpiAwarenessContext,
 };
 use ::windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 
@@ -50,35 +50,56 @@ impl CapturedMonitor {
     }
 }
 
-/// Declare Per-Monitor V2 DPI awareness for the process.
+/// Declare DPI awareness for the process, preferring per-monitor V2.
 ///
-/// Must run before any window is created. Returns the mode that ended up active so
-/// failures are diagnosable instead of silently producing scaled bitmaps.
+/// Must run before any window is created, any cursor position is read and any window
+/// is enumerated (docs/14 §3): after the first window exists the declaration can no
+/// longer be changed, and a process that ends up with a coarser mode reports
+/// different rectangles than it draws.
+///
+/// The fallback order is the documented one — Per-Monitor V2, then Per-Monitor, then
+/// System — and the achieved mode is returned so callers can log it instead of
+/// guessing. A process that is already aware (the Tauri runtime declares its own
+/// context at startup) makes every `SetProcessDpiAwarenessContext` call fail with
+/// `ERROR_ACCESS_DENIED`, in which case the effective thread context is reported
+/// instead — that path never downgrades.
 pub fn set_per_monitor_v2_awareness() -> Result<&'static str, String> {
-    if unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }.is_ok() {
+    for context in [
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE,
+        DPI_AWARENESS_CONTEXT_SYSTEM_AWARE,
+    ] {
+        if unsafe { SetProcessDpiAwarenessContext(context) }.is_ok() {
+            if context == DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 {
+                return Ok("per-monitor-v2");
+            }
+            if context == DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE {
+                return Ok("per-monitor");
+            }
+            return Ok("system");
+        }
+    }
+
+    // Already declared by the host: report the context the thread actually has.
+    let current = unsafe { GetThreadDpiAwarenessContext() };
+    let matches = |expected| unsafe { AreDpiAwarenessContextsEqual(current, expected) }.as_bool();
+    if matches(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) {
         return Ok("per-monitor-v2");
     }
-    // Already set (for example by the Tauri runtime, which creates its window before
-    // capture starts) is fine as long as it is at least per-monitor aware; anything
-    // coarser would corrupt capture geometry.
-    let context = unsafe { GetThreadDpiAwarenessContext() };
-    let equal = unsafe {
-        AreDpiAwarenessContextsEqual(context, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
-    };
-    if equal.as_bool() {
-        return Ok("per-monitor-v2");
-    }
-    let per_monitor = unsafe {
-        AreDpiAwarenessContextsEqual(context, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE)
-    };
-    if per_monitor.as_bool() {
+    if matches(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE) {
         // Usable: coordinates stay per-monitor physical, only the automatic
         // non-client scaling behaviour differs.
         return Ok("per-monitor");
     }
+    if matches(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE) {
+        // Documented last-resort step. Capture geometry stays physical for the primary
+        // display at its native scale, so callers must log this loudly rather than
+        // assume per-monitor accuracy.
+        return Ok("system");
+    }
     Err(format!(
         "SetProcessDpiAwarenessContext failed with Win32 error {} and the active context is not \
-         per-monitor aware",
+         DPI aware at all",
         unsafe { ::windows::Win32::Foundation::GetLastError().0 }
     ))
 }
@@ -246,11 +267,32 @@ mod tests {
         let second = set_per_monitor_v2_awareness();
         assert_eq!(first.is_ok(), second.is_ok());
         if let Ok(mode) = first {
-            // Either we set V2 ourselves, or the host already established at least
-            // per-monitor awareness. Both keep capture geometry in physical pixels.
+            // The documented fallback chain ends at System awareness; anything outside
+            // the chain would mean the declaration silently produced an unknown state.
             assert!(
-                mode == "per-monitor-v2" || mode == "per-monitor",
+                matches!(mode, "per-monitor-v2" | "per-monitor" | "system"),
                 "unexpected DPI awareness mode {mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_second_declaration_never_downgrades_an_aware_process() {
+        // The Tauri runtime declares its own context before capture starts; repeating
+        // the declaration from the overlay thread must report the existing context
+        // rather than replacing it with a coarser one.
+        let first = set_per_monitor_v2_awareness();
+        let second = set_per_monitor_v2_awareness();
+        assert!(first.is_ok() && second.is_ok());
+        if let (Ok(first), Ok(second)) = (first, second) {
+            let rank = |mode: &str| match mode {
+                "per-monitor-v2" => 2,
+                "per-monitor" => 1,
+                _ => 0,
+            };
+            assert!(
+                rank(second) >= rank(first),
+                "repeating the declaration downgraded {first} to {second}"
             );
         }
     }
@@ -307,8 +349,6 @@ mod tests {
         assert!(monitor.width() > 0 && monitor.height() > 0);
     }
 }
-
-
 
 
 

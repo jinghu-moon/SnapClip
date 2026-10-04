@@ -917,6 +917,32 @@ pub fn size_label_placement(
     })
 }
 
+/// Clip a virtual-desktop window rectangle to one monitor and return it in that
+/// monitor's local physical pixels.
+///
+/// The window snapshot stores DWM frame bounds in **virtual-desktop physical pixels**
+/// (docs/14 §5.1); the overlay paints in **monitor-local physical pixels**. This is the
+/// only place that translates between the two, so the conversion is documented once
+/// and unit tested with negative virtual-desktop origins.
+///
+/// A window that spans monitors is deliberately reduced to the part visible on
+/// `monitor`: a v1 session only holds a frozen frame of one display, so promising the
+/// whole window would promise pixels it cannot export (docs/14 §6.2). The result is
+/// empty when the window does not reach this monitor at all.
+pub fn window_rect_to_local(win: Rect, monitor: &MonitorLayout) -> Rect {
+    let clipped = win.intersect(monitor.bounds);
+    if clipped.is_empty() {
+        // Normalise a disjoint intersection so callers only have to test `is_empty`.
+        return Rect::new(0, 0, 0, 0);
+    }
+    Rect::new(
+        clipped.left - monitor.bounds.left,
+        clipped.top - monitor.bounds.top,
+        clipped.right - monitor.bounds.left,
+        clipped.bottom - monitor.bounds.top,
+    )
+}
+
 /// Validate that a selection can produce an artifact.
 pub fn validate_selection(rect: Rect, frame: Rect) -> Result<Rect, CaptureError> {
     let clipped = rect.intersect(frame);
@@ -1272,5 +1298,78 @@ mod tests {
         assert_eq!(crosshair_radius(96), 28);
         assert_eq!(crosshair_radius(144), 42);
         assert!(crosshair_radius(0) == 28, "dpi below 96 clamps to the 96 baseline");
+    }
+
+    fn layout(bounds: Rect, dpi: u32) -> MonitorLayout {
+        MonitorLayout {
+            bounds,
+            work_area: bounds,
+            dpi,
+            primary: false,
+        }
+    }
+
+    #[test]
+    fn window_rect_conversion_subtracts_the_monitor_origin() {
+        let secondary = layout(Rect::new(-1920, 200, 0, 1280), 144);
+        // A window entirely on the secondary display, including its title bar.
+        let screen = Rect::new(-1800, 300, -1200, 900);
+        assert_eq!(
+            window_rect_to_local(screen, &secondary),
+            Rect::new(120, 100, 720, 700)
+        );
+        // A window on the primary display is unchanged when the monitor origin is 0.
+        let primary = layout(Rect::new(0, 0, 3840, 2160), 144);
+        assert_eq!(
+            window_rect_to_local(Rect::new(10, 20, 30, 40), &primary),
+            Rect::new(10, 20, 30, 40)
+        );
+    }
+
+    #[test]
+    fn window_rect_conversion_clips_a_window_that_spans_monitors() {
+        let primary = layout(Rect::new(0, 0, 3840, 2160), 144);
+        // A window hanging off the left and right edges keeps only the visible column
+        // band, and a window hanging off the bottom keeps only the visible row band.
+        assert_eq!(
+            window_rect_to_local(Rect::new(-500, 100, 4200, 900), &primary),
+            Rect::new(0, 100, 3840, 900)
+        );
+        assert_eq!(
+            window_rect_to_local(Rect::new(100, -300, 900, 2400), &primary),
+            Rect::new(100, 0, 900, 2160)
+        );
+    }
+
+    #[test]
+    fn window_rect_conversion_rejects_rects_off_this_monitor() {
+        let primary = layout(Rect::new(0, 0, 1920, 1080), 96);
+        // Entirely to the left of the monitor.
+        assert!(window_rect_to_local(Rect::new(-800, 0, -10, 400), &primary).is_empty());
+        // Entirely below it.
+        assert!(window_rect_to_local(Rect::new(0, 1200, 400, 1400), &primary).is_empty());
+        // Touching the right edge is *not* an overlap: the rectangle is half-open.
+        assert!(window_rect_to_local(Rect::new(1920, 0, 2200, 400), &primary).is_empty());
+    }
+
+    #[test]
+    fn window_rect_conversion_normalises_degenerate_input() {
+        let primary = layout(Rect::new(0, 0, 1920, 1080), 96);
+        // Zero-size and inverted rectangles never produce a negative-size local rect.
+        let zero = window_rect_to_local(Rect::new(50, 50, 50, 80), &primary);
+        assert!(zero.is_empty());
+        let inverted = window_rect_to_local(Rect::new(300, 300, 200, 200), &primary);
+        assert!(inverted.is_empty());
+        assert!(inverted.left >= 0 && inverted.top >= 0);
+    }
+
+    #[test]
+    fn window_rect_conversion_keeps_a_full_monitor_window_exact() {
+        let secondary = layout(Rect::new(-2560, -200, 0, 1240), 192);
+        // A maximised window on the secondary display maps onto the whole local frame.
+        assert_eq!(
+            window_rect_to_local(Rect::new(-2560, -200, 0, 1240), &secondary),
+            secondary.local_bounds()
+        );
     }
 }

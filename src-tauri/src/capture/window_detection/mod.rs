@@ -36,11 +36,18 @@
 
 pub mod gesture;
 pub mod model;
+pub mod provider;
+pub mod snapshot;
 
 pub use gesture::{PointerGesture, should_start_manual_drag};
 pub use model::{
-    HoverValidity, RequestGate, RequestId, SnapshotEpoch, EpochCounter, TargetKind, WindowCandidate,
+    EpochCounter, HoverValidity, RequestGate, RequestId, SnapshotEpoch, TargetKind, WindowCandidate,
     WindowIdentity, WindowSnapshot, WindowTarget,
+};
+pub use provider::{Exclusions, WindowDetectionError, WindowTargetProvider, is_shell_surface_class};
+pub use snapshot::{
+    CheapProbe, ClassifiedWindow, DwmRead, candidates_from_classified, class_name_hash, classify,
+    identity_for, passes_cheap_policy, passes_dwm_policy,
 };
 
 /// Cursor rest time before an automatic-snap preview may appear (docs/14 §4.1).

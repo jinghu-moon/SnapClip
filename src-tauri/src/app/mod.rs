@@ -37,6 +37,20 @@ pub struct OcrStatusView {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app_started = std::time::Instant::now();
+
+    // DPI awareness has to be declared before anything creates a window or reads a
+    // cursor position; once the Tauri window exists the declaration can no longer be
+    // changed, and capture geometry would be reported in virtualised coordinates
+    // (docs/14 §3). Doing it here means the overlay thread's own call is a no-op that
+    // simply reports the context already in effect.
+    #[cfg(windows)]
+    match crate::platform::windows::capture::monitor::set_per_monitor_v2_awareness() {
+        Ok(mode) => eprintln!("[snapclip][startup] dpi awareness={mode}"),
+        Err(message) => {
+            eprintln!("[snapclip][startup] dpi awareness declaration failed: {message}")
+        }
+    }
+
     tauri::Builder::default()
         .on_page_load(move |webview, payload| {
             eprintln!(
