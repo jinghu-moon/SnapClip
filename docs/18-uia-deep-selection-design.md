@@ -239,3 +239,23 @@ preview anim=(1966,752)->(2399,1075) target=(1961,750)->(2389,1069)
 
 两个方向都是单调收敛的 ~6 帧缓动（≈101 ms，15 ms 合并 tick），无跳变；
 v1 的 `auto-snap preview` 目标行保持不变，错误 0。
+
+---
+
+## 11. v2-P2 进展（进行中）
+
+| 已完成 | 内容 |
+| --- | --- |
+| 依赖 | `Cargo.toml` 的 `windows` features 增加 `Win32_UI_Accessibility`（`IUIAutomation` 所在地） |
+| 纯遍历策略 | `capture/window_detection/uia.rs`：`WalkNode`/`WalkBudget`/`WalkOutcome`、`deepest_child_at`（点内最小矩形胜出）、`is_descendable`（越界/离屏/退化子节点拒绝）、`is_structural_container`（同边界容器继续下钻）、路径去重与 `MAX_PATH_LEN` 上限；7 项单测 |
+
+策略层的三条关键规则都有测试固定：
+
+1. **点内最小矩形胜出** —— 控件优先于包住它的容器；
+2. **结构性容器必须下钻**（与父节点同边界的 `Pane`/`Group` 不作为最终答案），这是 Chromium 系应用内容不被结构分支吞掉的前提；
+3. **离屏/退化/父框外子节点一律拒绝**，预算耗尽或路径超长 → `TraversalLimit`。
+
+**待完成**：`platform/windows/capture/uia_provider.rs` —— 在 refinement worker 线程上惰性
+`CoInitializeEx(MTA)` + `CoCreateInstance(CUIAutomation)`，`ElementFromPoint` 起手，
+用 `RawViewWalker` 按上述策略自顶向下展开，映射为 `DeepTarget`，
+失败窗口加入 quarantine（`release()` 时清空）；随后接资源管理器真机验收。

@@ -41,6 +41,7 @@ pub mod model;
 pub mod provider;
 pub mod snapshot;
 pub mod transition;
+pub mod uia;
 
 pub use gesture::{
     GestureState, MoveOutcome, PointerGesture, PressOutcome, ReleaseOutcome, SnapPreview,
@@ -64,6 +65,10 @@ pub use snapshot::{
 };
 pub use transition::{
     PREVIEW_TRANSITION_MS, RectTransition, lerp_rect, out_quad,
+};
+pub use uia::{
+    MAX_DEPTH, MAX_NODES, MAX_PATH_LEN, WalkBudget, WalkNode, WalkOutcome, deepest_child_at,
+    is_descendable, is_structural_container,
 };
 
 /// Cursor rest time before an automatic-snap preview may appear (docs/14 §4.1).
