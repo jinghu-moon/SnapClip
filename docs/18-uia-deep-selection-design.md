@@ -322,3 +322,35 @@ refinement published hwnd=5967024 bounds=(0,47)->(3840,2088) depth=4 reason=Comp
 **下一步（v2-P2 收尾）**：按参考实现改造 provider —— ①`CacheRequest` 批量取属性（`Cached*`）；
 ②每窗口 `WindowTree` 缓存（按快照 epoch 失效）；③遍历中按 32 ms 间隔增量发布已验证的最深元素；
 ④保留 `WalkBudget` 与取消检查。完成后用资源管理器导航窗格 / 文件列表 / 命令栏三点验收。
+
+### ① 已完成：批量 CacheRequest（本次提交）
+
+`uia_provider.rs` 现在在 refinement 线程上惰性构建一个
+`IUIAutomationCacheRequest`（`AddProperty` × 3：`BoundingRectangle` / `ControlType` / `IsOffscreen`，
+`SetTreeScope(TreeScope_Children)`），遍历改为：
+
+```text
+每层：BuildUpdatedCache(request) ×1  →  GetCachedChildren() ×1  →  逐子节点读 Cached*（进程内）
+```
+
+即每层 2 次跨进程调用，替代原先「每节点 4 次 `Current*` + 每个兄弟一次 `GetNextSiblingElement`」。
+
+实测效果（`.tmp-uia-probe.ps1`，同一台机器、同类窗口）：
+
+| | 改造前 | 改造后 |
+| --- | --- | --- |
+| 路径深度 | 3 | **5** |
+| 发布矩形 | `(1336,511)->(2910,1482)`（1574×971，粗区域） | **`(1390,1253)->(1744,1282)`（354×29，控件级）** |
+| 查询耗时 | 20–41 ms | 20–66 ms |
+
+结论：单看耗时变化不大（受被测窗口自身的 provider 响应速度限制），但**同样的时间里探到了更深的层级**
+并给出了真正的控件级矩形——这正是「每层 2 次调用」换来的检索深度。`refinement_submitted=2 /
+published=2 / empty=0`，无错误。
+
+### ②③ 待完成
+
+| 项目 | 说明 |
+| --- | --- |
+| 每窗口树缓存 | 同一窗口内在不同控件间移动仍需重新下钻；需要按 `WindowTree` 缓存（按快照 epoch 失效） |
+| 增量发布（32 ms） | 目前只在遍历结束发布；慢 provider 期间用户看不到反馈 |
+| 资源管理器夹具 | 需要 `EnumWindows` + `CabinetWClass` 枚举，才能做导航窗格 / 文件列表 / 命令栏三点验收 |

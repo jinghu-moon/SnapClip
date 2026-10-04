@@ -16,7 +16,8 @@ use ::windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
 };
 use ::windows::Win32::UI::Accessibility::{
-    CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationTreeWalker,
+    CUIAutomation, IUIAutomation, IUIAutomationCacheRequest, IUIAutomationElement, TreeScope_Children,
+    UIA_BoundingRectanglePropertyId, UIA_ControlTypePropertyId, UIA_IsOffscreenPropertyId,
 };
 
 use crate::capture::geometry::{Point, Rect};
@@ -33,6 +34,9 @@ use crate::capture::window_detection::uia::{
 #[derive(Debug, Default)]
 pub struct UiaDeepSelectionProvider {
     automation: Option<IUIAutomation>,
+    /// Batched property request: one cross-process call per level instead of four per node
+    /// (docs/18 §11). Built lazily on the refinement thread.
+    cache: Option<IUIAutomationCacheRequest>,
     /// Windows whose provider failed; skipped until the next snapshot generation.
     quarantined: HashSet<isize>,
 }
@@ -56,53 +60,83 @@ impl UiaDeepSelectionProvider {
         self.automation.as_ref()
     }
 
-    /// Reduce one element to the data the traversal policy needs.
-    fn node(element: &IUIAutomationElement) -> Option<WalkNode> {
-        let bounds = unsafe { element.CurrentBoundingRectangle() }.ok()?;
+    /// The batched property request, built once on the refinement thread.
+    ///
+    /// `TreeScope_Children` is what makes this a *batch*: fetching an element with this
+    /// request also populates its direct children, so probing a level costs two
+    /// cross-process calls instead of four per node (docs/18 §11).
+    fn cache_request(&mut self) -> Option<&IUIAutomationCacheRequest> {
+        if self.cache.is_none() {
+            let automation = self.automation()?.clone();
+            let request = unsafe { automation.CreateCacheRequest() }.ok()?;
+            let configured = unsafe {
+                request
+                    .AddProperty(UIA_BoundingRectanglePropertyId)
+                    .and_then(|()| request.AddProperty(UIA_ControlTypePropertyId))
+                    .and_then(|()| request.AddProperty(UIA_IsOffscreenPropertyId))
+                    .and_then(|()| request.SetTreeScope(TreeScope_Children))
+            };
+            if configured.is_err() {
+                return None;
+            }
+            self.cache = Some(request);
+        }
+        self.cache.as_ref()
+    }
+
+    /// Reduce one element to the data the traversal policy needs, reading the values that
+    /// `BuildUpdatedCache` already fetched for it.
+    fn cached_node(element: &IUIAutomationElement) -> Option<WalkNode> {
+        let bounds = unsafe { element.CachedBoundingRectangle() }.ok()?;
         let bounds = to_rect(bounds);
         if bounds.is_empty() {
             return None;
         }
-        let control_type = unsafe { element.CurrentControlType() }.map(|kind| kind.0).unwrap_or(0);
-        let offscreen = unsafe { element.CurrentIsOffscreen() }
+        let control_type = unsafe { element.CachedControlType() }
+            .map(|kind| kind.0)
+            .unwrap_or(0);
+        let offscreen = unsafe { element.CachedIsOffscreen() }
             .map(|value| value.as_bool())
             .unwrap_or(false);
-        let enabled = unsafe { element.CurrentIsEnabled() }
-            .map(|value| value.as_bool())
-            .unwrap_or(true);
-        Some(WalkNode::new(bounds, control_type, offscreen, enabled))
+        Some(WalkNode::new(bounds, control_type, offscreen, true))
     }
 
     /// The smallest descendable child of `parent` that contains `point`.
     ///
-    /// Children are enumerated through the **raw** view so structural containers are seen;
-    /// the policy then decides which of them may be entered (docs/18 §3).
+    /// One `BuildUpdatedCache` + one `GetCachedChildren` probe the whole level, and the
+    /// per-child geometry reads are then in-process (docs/18 §11). The raw view is used so
+    /// structural containers are seen; the policy decides which of them may be entered.
     fn best_child(
-        walker: &IUIAutomationTreeWalker,
+        request: &IUIAutomationCacheRequest,
         parent: &IUIAutomationElement,
         parent_bounds: Rect,
         point: Point,
         budget: &mut WalkBudget,
     ) -> Option<(IUIAutomationElement, WalkNode)> {
-        let mut candidate = unsafe { walker.GetFirstChildElement(parent) }.ok();
+        let parent = unsafe { parent.BuildUpdatedCache(request) }.ok()?;
+        let children = unsafe { parent.GetCachedChildren() }.ok()?;
+        let count = unsafe { children.Length() }.ok()?.max(0) as usize;
         let mut best: Option<(IUIAutomationElement, WalkNode)> = None;
-        while let Some(child) = candidate {
+        for index in 0..count {
             if !budget.take_node() {
                 break;
             }
-            if let Some(node) = Self::node(&child)
-                && is_descendable(parent_bounds, node)
-                && node.bounds.contains(point)
-            {
-                let smaller = best
-                    .as_ref()
-                    .map(|(_, current)| node.bounds.area() < current.bounds.area())
-                    .unwrap_or(true);
-                if smaller {
-                    best = Some((child.clone(), node));
-                }
+            let Ok(child) = (unsafe { children.GetElement(index as i32) }) else {
+                continue;
+            };
+            let Some(node) = Self::cached_node(&child) else {
+                continue;
+            };
+            if !is_descendable(parent_bounds, node) || !node.bounds.contains(point) {
+                continue;
             }
-            candidate = unsafe { walker.GetNextSiblingElement(&child) }.ok();
+            let smaller = best
+                .as_ref()
+                .map(|(_, current)| node.bounds.area() < current.bounds.area())
+                .unwrap_or(true);
+            if smaller {
+                best = Some((child, node));
+            }
         }
         best
     }
@@ -139,10 +173,8 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
         };
 
         let mut outcome = WalkOutcome::window_only(window_bounds, StopReason::Complete);
-        // The parentheses are required: a block-like expression cannot directly follow
-        // `let PATTERN =` in a let-else statement.
-        let Ok(walker) = (unsafe { automation.RawViewWalker() }) else {
-            // Without a walker we can still answer with the window frame.
+        // Without a batched cache request we can still answer with the window frame.
+        let Some(request) = self.cache_request().cloned() else {
             return RefinementOutcome::Target(Box::new(finish(outcome, job)));
         };
 
@@ -159,7 +191,7 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
                 break;
             }
             let Some((child, node)) =
-                Self::best_child(&walker, &current, current_bounds, job.point, &mut budget)
+                Self::best_child(&request, &current, current_bounds, job.point, &mut budget)
             else {
                 break;
             };
