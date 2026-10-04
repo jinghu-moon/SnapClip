@@ -460,3 +460,55 @@ summary refinement_submitted=3  refinement_published=3  refinement_empty=0
 | v2-P3 MSAA 回退 provider | 未开始（UIA 覆盖不到的老控件/自绘控件才需要） |
 | v2-P4 `path` 逐层描边 | 未开始（预览矩形已跟随深选结果，缺的是层级可视化） |
 | v2-P5 性能与 quarantine 命中率 | 部分（单次查询 15–19 ms、缓存收益、`empty=0` 已测得；quarantine 命中率与延迟分布待补） |
+
+---
+
+## 12. v2-P3 MSAA 回退：调研结论与设计（**实现未开始**）
+
+### 12.1 为什么需要它
+
+资源管理器的文件列表区目前只解析到 depth 2（一大块内容区），命令栏能到 depth 4。UIA 覆盖不到的
+老式/自绘控件需要 MSAA（`IAccessible`）作为第二来源。调研 `snow-ui-selector/src/windows/msaa.rs`
+后确认：**它不是「调一个 API 取矩形」那么简单**，参考实现为它配了一整套防挂死机制。
+
+### 12.2 参考实现要点（真实源码）
+
+| 机制 | 参考代码 | 规格 |
+| --- | --- | --- |
+| 挂死窗口预检 | `IsHungAppWindow(hwnd)` | 命中即 `mark_unresponsive` 并跳过，**不发起 MSAA 调用** |
+| 失败隔离 | `msaa_quarantined` 标志 + `mark_unresponsive()` | 隔离持续到下一次快照刷新（快照重建时重置） |
+| 超时执行 | `self.worker.hit_test(hwnd, point, bounds, MSAA_REQUEST_TIMEOUT)`，`MSAA_REQUEST_TIMEOUT = 168 ms` | MSAA 调用跑在**可超时的独立 worker** 上；三态语义见下 |
+| 三态区分 | `Option<Result<Result<Vec<RECT>>>>` | `None` = 准入失败（worker 忙）→ **只重试、不隔离**；`Some(Err)` = 超时 → 隔离；`Some(Ok(Err))` = provider 报错 → 空结果 |
+| 无 MSAA 兜底路径 | `fallback_hit_path()` → `window::visible_child_window_rects(hwnd, bounds)` | 用 `EnumChildWindows` 收集可见子窗口矩形（与窗口求交、去重、剔除与窗口等大的），**按窗口缓存**（`get_or_insert_with`），再取所有包含该点的矩形 + 窗口外框 |
+| 路径合并 | `merge_hit_paths(msaa, fallback, bounds, point)` | 选 seed：MSAA 首矩形**包含**兜底首矩形时取兜底（更具体），否则取 MSAA，都没有则取窗口外框；再把全部候选矩形按面积排序、去重，逐个「包含当前 path 末项」时追加，最后补上窗口外框 |
+| 入口 | `AccessibleObjectFromWindow(hwnd, OBJID_WINDOW, IID_IAccessible, &mut raw)` | 取**窗口的** accessible 对象（不是 `AccessibleObjectFromPoint`），再做命中/遍历 |
+
+### 12.3 SnapClip 的落地契约（设计）
+
+新增 `platform/windows/capture/msaa_provider.rs`，实现既有的 `DeepSelectionProvider`：
+
+1. **预检**：`IsHungAppWindow(job.window.hwnd)` → 直接 `Empty(Unsupported)` 并隔离该窗口；
+2. **超时执行**：MSAA 查询提交给一个**独立的可超时 worker**（168 ms），超时 → `Empty(ProviderTimeout)`
+   并隔离；准入失败 → `Empty(ProviderTimeout)` 但**不隔离**（语义与参考一致，避免把「忙」误判成「坏」）；
+3. **兜底路径**：用 `EnumChildWindows` 收集可见子窗口矩形（按窗口缓存、快照 epoch 失效），
+   与 MSAA 结果按 §12.2 的 seed + 包含链合并；
+4. **映射**：合并后的 path 直接转 `DeepTarget`（`path[0] = ` 窗口外框，`kind = UiElement` 当 path 长度 > 1）；
+5. **隔离**：`quarantined: HashSet<isize>`，`release()`（快照换代）清空——与 UIA provider 同构。
+
+**回退顺序**：`FallbackDeepSelection` 组合两个 provider —— 先 UIA，`Empty(Unsupported)` 时再问 MSAA；
+两者都失败则保持 v1 整窗帧。这样 v1 路径与叠加动画都不受影响。
+
+### 12.4 为什么本轮**不实现**
+
+这不是「再包一层 API」的规模：它需要
+①可超时的独立执行体（含准入控制，超时后无法杀死阻塞中的 COM 调用，只能放弃该线程）；
+②`IsHungAppWindow` 预检；
+③`EnumChildWindows` 兜底路径及其按窗口缓存；
+④seed + 包含链的路径合并；
+⑤隔离语义与三态区分。
+按项目规则「代码改完不是完成，验证通过才是完成」，我不在剩余预算里开写一个无法完整验证的
+COM/超时/线程层——那正是最容易被「看起来能跑」掩盖问题的部分。
+
+**实现顺序（下一步）**：先做 ③ 兜底路径（纯 `EnumChildWindows` + 缓存 + 合并，**不需要 COM**，
+可完整单测，且立刻能让文件列表区拿到子窗口级矩形）→ 再做 ①②④⑤ 的 MSAA 本体与超时隔离。
+这样即使 MSAA 部分延后，③ 也能独立提升现有 UIA 结果的精度。
