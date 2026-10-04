@@ -557,3 +557,88 @@ docs/14 §10.2 全部指标：`window_snapshot_refresh_us` / `window_snapshot_re
 | 真实「点击后 120 ms 内再移动」的时序抖动 | 未专门构造 | 以 generation 单测覆盖；实机日志未见陈旧预览 |
 | 工具栏（Vue）确认入口 | 未接线 | 工具栏走 `OverlayCommand::Confirm`；预览确认目前只有 Enter 路径，Phase 5 统一 |
 | `mouse_move_coalesced_count` 语义 | 部分 | 目前统计“重绘 tick 已经挂起时到达的移动”（被合并进同一次 Present）；`WM_MOUSEMOVE` 本身仍逐条处理，Phase 6 若测得热点再改成 PeekMessage 级合并 |
+
+---
+
+## Phase 4：检测 worker、hover 重验证与过期处理
+
+### 4.1 结论
+
+hover 时效性路径打通：overlay 每 250 ms 只投递当前 hover 的 `{hwnd, identity, epoch}`，
+worker 执行单窗口重验证并回投 `Valid / BoundsChanged / Invalid`，overlay 校验
+epoch + identity 后处理。`BoundsChanged` **先写回快照再重算 hover/预览**，
+实机验证了“窗口移动后 hover/预览跟随新边界、不跳回旧位置”。
+
+### 4.2 落地内容
+
+| 能力 | 位置 | 说明 |
+| --- | --- | --- |
+| 重验证任务 | `detection_worker.rs::Job::Revalidate` | 与 `Refresh`/`Confirm` 共用同一个容量 1 的最新请求邮箱；`revalidate_hover` 在 worker 线程执行 |
+| hover 定时器 | `overlay.rs`（`HOVER_TIMER_ID`, 250 ms） | 会话可见时启动、会话结束停止；tick 只做 `hover_target` 判空 + 单飞检查 + 投递 |
+| 单飞控制 | `hover_request: Option<RequestId>` | 同一时刻只允许一个重验证在途，快速移动不会堆积 |
+| 结果处理 | `overlay.rs::on_detection_ready` → `apply_hover_validity` | `Valid` 无动作；`BoundsChanged` → `apply_candidate_update` 写回快照 → 重算 hover → 重算预览；`Invalid` → 丢弃 hover/预览 → 刷新快照 |
+| 陈旧结果丢弃 | 三处 request id 校验 | refresh / confirm / revalidate 各自比对当前请求；不匹配即计数丢弃 |
+| 会话清理 | `begin_window_detection` / `release_session` | 三个 request 与两个定时器统一复位；worker 由 `DetectionWorker::Drop` join（`shutdown` 幂等） |
+
+**为什么 `Invalid` 不立即用旧快照重命中**：旧快照里仍然列着那个已经消失的窗口，用它重命中
+会把刚判定失效的目标又取回来。实现是清 hover/预览 + 请求刷新，等新快照落地后再由
+`on_detection_ready → update_hover` 重命中一次——语义与 docs/14 §5.4 的“刷新快照后重命中一次”
+一致，只是把重命中放在了快照真正更新之后。
+
+### 4.3 静态与单元验证
+
+| 项目 | 命令 | 结果 |
+| --- | --- | --- |
+| 单元测试 | `cargo test --lib` | **291 passed / 0 failed**（Phase 3 基线 290 → +1：worker 重验证分类） |
+| 编译零告警 | `cargo check --all-targets` | exit 0，**0 warnings** |
+| 前端 | `npm run typecheck` / `npm run build` | exit 0 |
+
+Phase 2/4 已覆盖的相关单测（此处一并计入门禁证据）：
+`hit_test::bounds_changed_is_written_back_into_the_snapshot`、
+`hit_test::stale_or_mismatched_updates_are_ignored`、
+`window_detection::hover_revalidation_reports_bounds_changes_and_stale_targets`（真机）、
+`detection_worker::a_revalidate_request_classifies_the_hovered_window`、
+`detection_worker::the_mailbox_keeps_only_the_newest_request`。
+
+### 4.4 实机端到端证据（`.tmp-p4-probe.ps1`）
+
+夹具窗口初始逻辑 (1400,640)（物理 `(2111,960)-(2719,1399)`），光标停在其内部；
+随后把夹具移动到逻辑 (1300,580)（物理 `(1961,870)-(2569,1309)`，光标仍在窗口内），
+最后 `Hide()`。应用自身日志：
+
+```text
+[win-detect] snapshot epoch=1 candidates=4
+[win-detect] hover hwnd=18416204 z=0 bounds=(2111,960)->(2719,1399)
+[win-detect] auto-snap preview hwnd=18416204 epoch=1 local=(2111,960)->(2719,1399)
+[win-detect] hover bounds changed hwnd=18416204 new=(1961,870)->(2569,1309)   # worker 重读外框并写回
+[win-detect] hover hwnd=18416204 z=0 bounds=(1961,870)->(2569,1309)           # 与写回数据同源，未跳回旧矩形
+[win-detect] auto-snap preview hwnd=18416204 epoch=1 local=(1961,870)->(2569,1309)
+[win-detect] hover invalid hwnd=18416204                                      # 窗口被隐藏
+[win-detect] snapshot epoch=2 candidates=3                                    # 刷新后死窗口消失
+[win-detect] hover hwnd=5967024 z=0 bounds=(0,0)->(3840,2088)                 # 以当前光标重命中下层窗口
+[win-detect] auto-snap preview hwnd=5967024 epoch=2 local=(0,0)->(3840,2088)
+```
+
+会话指标：`window_validate_us` n=16、last 56 µs、max 219 µs（250 ms 周期、单飞）；
+`window_hit_test_us` n=28、max 1 µs；`window_nearest_target_us` n=7、max 2 µs；
+`window_worker_queue_depth=0`、`window_worker_max_queue_depth=1`、
+`window_worker_stale_result_dropped_count=0`、`hover_revalidate_stale_dropped_count=0`、
+`stale_target_count=1`（对应隐藏窗口）、错误行 0。
+
+### 4.5 质量门禁逐条对应
+
+| 门禁 | 证据 |
+| --- | --- |
+| 窗口移动后 hover/预览跟随新边界，不跳回旧位置 | 4.4 日志第 4~6 行（`hover bounds changed` → `hover` 新矩形 → 预览新矩形） |
+| 窗口关闭或 HWND 重用不会误吸旧矩形 | `hover invalid` + `apply_candidate_update` 的 identity 校验单测 + `read_target` 的 PID/类名哈希比对 |
+| overlay 消息循环不执行同步 DWM | hover tick 只投递；`window_validate_us` 由 worker 记录；`overlay.rs` 中 DWM 只出现在 provider 模块 |
+| 快速移动和连续刷新时陈旧结果被丢弃 | 三个 request id 校验 + `hover_revalidate_stale_dropped_count` 指标；`hit_test::stale_or_mismatched_updates_are_ignored` |
+| 关闭会话不会等待无限期 worker 或泄漏线程/资源 | `DetectionWorker::shutdown` 幂等 + `Drop` join；`release_session` 复位三个请求与两个定时器；实机 2 次会话无残留线程/句柄告警 |
+
+### 4.6 未执行项与风险
+
+| 项目 | 状态 | 原因 / 替代 |
+| --- | --- | --- |
+| provider 级 bounded timeout / quarantine | 未实现 | v1 不引入 UIA/MSAA；`DwmGetWindowAttribute` 本身无超时参数，实测单窗口重验证 max 219 µs。若 Phase 6 实测出现长尾，再按 docs/14 §5.5 引入隔离 |
+| HWND 真机重用（close→open 同句柄） | 未构造 | 需要精确控制句柄回收；以 `WindowIdentity` 三元组单测 + `read_target` 的 PID/类名校验覆盖，Phase 7 人工复核 |
+| 显示器拓扑变化时的 hover 失效 | 未覆盖 | 显示器变化走 `WM_DISPLAYCHANGE` → 取消会话（既有路径）；新会话重新建快照 |

@@ -23,7 +23,7 @@ use ::windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_APP};
 
 use crate::capture::diagnostics::WindowDetectionMetrics;
 use crate::capture::window_detection::model::{
-    RequestGate, RequestId, WindowSnapshot, WindowTarget,
+    HoverValidity, RequestGate, RequestId, WindowSnapshot, WindowTarget,
 };
 use crate::capture::window_detection::provider::{
     Exclusions, WindowDetectionError, WindowTargetProvider,
@@ -44,6 +44,10 @@ enum Job {
         request: RequestId,
         target: WindowTarget,
     },
+    Revalidate {
+        request: RequestId,
+        target: WindowTarget,
+    },
     Shutdown,
 }
 
@@ -58,6 +62,11 @@ pub enum DetectionResult {
         request: RequestId,
         target: WindowTarget,
         valid: bool,
+    },
+    Revalidated {
+        request: RequestId,
+        target: WindowTarget,
+        validity: HoverValidity,
     },
 }
 
@@ -111,6 +120,14 @@ impl DetectionWorker {
     /// Queue a confirmation check for one target.
     pub fn request_confirm(&self, target: WindowTarget) -> RequestId {
         self.enqueue(|request| Job::Confirm { request, target })
+    }
+
+    /// Queue a lightweight re-validation of the hovered window (docs/14 §5.5).
+    ///
+    /// The overlay keeps this single-flight: only one re-validation is outstanding at a
+    /// time, so a fast-moving cursor cannot build a backlog of pointless DWM reads.
+    pub fn request_revalidate(&self, target: WindowTarget) -> RequestId {
+        self.enqueue(|request| Job::Revalidate { request, target })
     }
 
     /// Take the pending result, if the worker produced one.
@@ -207,6 +224,16 @@ fn run(shared: Arc<Shared>, metrics: WindowDetectionMetrics) {
                     valid,
                 })
             }
+            Job::Revalidate { request, target } => {
+                let started = Instant::now();
+                let validity = provider.revalidate_hover(&target);
+                metrics.record_validate(started.elapsed());
+                Some(DetectionResult::Revalidated {
+                    request,
+                    target,
+                    validity,
+                })
+            }
         };
 
         if let Some(result) = result {
@@ -243,7 +270,8 @@ mod tests {
     fn request_of(result: &DetectionResult) -> RequestId {
         match result {
             DetectionResult::Refreshed { request, .. }
-            | DetectionResult::Confirmed { request, .. } => *request,
+            | DetectionResult::Confirmed { request, .. }
+            | DetectionResult::Revalidated { request, .. } => *request,
         }
     }
 
@@ -320,6 +348,21 @@ mod tests {
                 assert_eq!(t.identity().hwnd, 0xDEAD);
             }
             other => panic!("expected a confirmation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_revalidate_request_classifies_the_hovered_window() {
+        let worker = worker();
+        let request = worker.request_revalidate(target());
+        let result = wait_for_result(&worker);
+        assert_eq!(request_of(&result), request);
+        match result {
+            DetectionResult::Revalidated { validity, .. } => {
+                // A fabricated handle is gone: the overlay must refresh and re-hit.
+                assert_eq!(validity, HoverValidity::Invalid);
+            }
+            other => panic!("expected a re-validation, got {other:?}"),
         }
     }
 

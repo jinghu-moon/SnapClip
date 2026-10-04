@@ -71,8 +71,8 @@ use crate::capture::sampler::{ColorFormat, ColorSampler};
 use crate::capture::session::{CaptureSession, ExportOutcome};
 use crate::capture::window_detection::model::RequestId;
 use crate::capture::window_detection::{
-    DEFAULT_DWELL_MS, DEFAULT_SNAP_RADIUS_PX, Exclusions, GestureState, MoveOutcome,
-    PressOutcome, ReleaseOutcome, WindowSnapshot, WindowTarget,
+    DEFAULT_DWELL_MS, DEFAULT_HOVER_REVALIDATE_MS, DEFAULT_SNAP_RADIUS_PX, Exclusions, GestureState,
+    HoverValidity, MoveOutcome, PressOutcome, ReleaseOutcome, WindowSnapshot, WindowTarget,
 };
 use crate::capture::{CaptureError, CaptureResult, CaptureState};
 
@@ -96,6 +96,10 @@ const RENDER_TIMER_ID: usize = 0x51_C0DE;
 /// One-shot timer that fires once the cursor has been still for
 /// [`DEFAULT_DWELL_MS`]; the expiry handler only queries the cached snapshot.
 const DWELL_TIMER_ID: usize = 0x51_C0DF;
+
+/// Periodic timer that re-validates the hovered window on the detection worker
+/// (docs/14 §5.5). It only *enqueues*; the DWM read happens off this thread.
+const HOVER_TIMER_ID: usize = 0x51_C0E0;
 /// `TrackMouseEvent` flag asking for a `WM_MOUSELEAVE` notification.
 const TME_LEAVE: u32 = 0x0000_0002;
 /// `SWP_SHOWWINDOW`.
@@ -394,6 +398,8 @@ where
     snapshot_request: Option<RequestId>,
     /// Confirmation request currently outstanding.
     confirm_request: Option<RequestId>,
+    /// Single-flight hover re-validation request (docs/14 §5.5).
+    hover_request: Option<RequestId>,
     /// HWND/process exclusions the snapshot is built with (docs/14 §7).
     exclusions: Exclusions,
     detector: DetectionWorker,
@@ -478,6 +484,7 @@ where
             snapshot: WindowSnapshot::empty(),
             snapshot_request: None,
             confirm_request: None,
+            hover_request: None,
             exclusions,
             detector,
             metrics,
@@ -709,6 +716,9 @@ where
         // is synchronous (not coalesced) precisely so it lands before `show_overlay`.
         self.paint_now();
         self.show_overlay(&monitor.layout);
+        // Start the periodic hover re-validation now that there is something to hover
+        // over; it is disarmed with the session.
+        self.arm_hover_timer();
         eprintln!(
             "[snapclip][bench] stage=visible session={} prepare_elapsed_ms={}",
             self.session_id(),
@@ -886,6 +896,7 @@ where
         self.confirm_request = None;
         self.snapshot.release();
         self.disarm_dwell();
+        self.disarm_hover_timer();
         self.cursor_visible = false;
         // Stop the coalescing tick before releasing the renderer: a pending WM_TIMER
         // must not try to present into the graphics we are about to drop.
@@ -1198,6 +1209,7 @@ where
         self.hover_target = None;
         self.dwell_armed = None;
         self.confirm_request = None;
+        self.hover_request = None;
         self.snapshot.release();
         self.request_snapshot_refresh();
     }
@@ -1354,9 +1366,9 @@ where
                             ),
                             false,
                         );
-                        self.snapshot = snapshot;
-                        self.update_hover();
-                    }
+        self.snapshot = snapshot;
+        self.update_hover();
+    }
                     Err(error) => {
                         eprintln!("[snapclip][capture] window snapshot failed: {error}");
                     }
@@ -1374,7 +1386,117 @@ where
                 self.confirm_request = None;
                 self.apply_confirmation(target, valid);
             }
+            DetectionResult::Revalidated {
+                request,
+                target,
+                validity,
+            } => {
+                if self.hover_request != Some(request) {
+                    self.metrics.record_hover_revalidate_stale_dropped();
+                    return;
+                }
+                self.hover_request = None;
+                self.apply_hover_validity(target, validity);
+            }
         }
+    }
+
+    /// Persist a hover re-validation result (docs/14 §5.5).
+    ///
+    /// The ordering matters and is the whole point of this routine: `BoundsChanged` is
+    /// written **back into the snapshot** first, and only then is hover/preview recomputed
+    /// from the same data source. Updating the highlight without the snapshot would leave
+    /// the next `hit_test` reading the old rectangle and the highlight jumping back.
+    fn apply_hover_validity(&mut self, target: WindowTarget, validity: HoverValidity) {
+        let Some(current) = self.hover_target else {
+            return;
+        };
+        if current.identity() != target.identity() {
+            // A newer hover replaced this one while the worker was reading.
+            self.metrics.record_hover_revalidate_stale_dropped();
+            return;
+        }
+        match validity {
+            HoverValidity::Valid => {}
+            HoverValidity::BoundsChanged { .. } => {
+                if !validity.applies_to(self.snapshot.epoch(), target.identity()) {
+                    self.metrics.record_hover_revalidate_stale_dropped();
+                    return;
+                }
+                if !self.snapshot.apply_candidate_update(&validity) {
+                    return;
+                }
+                let new_bounds = validity.changed_bounds().unwrap_or(target.screen_bounds());
+                self.metrics.log_line(
+                    &format!(
+                        "hover bounds changed hwnd={} new=({},{})->({},{})",
+                        target.identity().hwnd,
+                        new_bounds.left,
+                        new_bounds.top,
+                        new_bounds.right,
+                        new_bounds.bottom
+                    ),
+                    false,
+                );
+                // Re-read from the snapshot that now holds the new rectangle.
+                self.hover_target = None;
+                self.update_hover();
+                self.refresh_preview_for_cursor();
+                self.invalidate_all();
+            }
+            HoverValidity::Invalid => {
+                self.metrics.record_stale_target();
+                self.metrics
+                    .log_line(&format!("hover invalid hwnd={}", target.identity().hwnd), false);
+                // Drop the highlight and the preview, then rebuild the snapshot. The
+                // re-hit happens when the fresh snapshot lands, so a re-entry point is
+                // never resolved against the snapshot that still lists the dead window.
+                self.hover_target = None;
+                self.gesture.clear_preview();
+                self.request_snapshot_refresh();
+                self.invalidate_all();
+            }
+        }
+    }
+
+    /// Re-evaluate the dwell preview for the current cursor position and generation.
+    fn refresh_preview_for_cursor(&mut self) {
+        let generation = self.gesture.dwell_generation();
+        let preview = self.preview_for_cursor();
+        if self.gesture.apply_dwell(generation, preview) {
+            self.invalidate();
+        }
+    }
+
+    /// Periodic hover re-validation tick. Only enqueues; never reads DWM here.
+    fn on_hover_tick(&mut self) {
+        if self.session.state() != CaptureState::Selecting {
+            return;
+        }
+        let Some(hover) = self.hover_target else {
+            return;
+        };
+        if self.hover_request.is_some() {
+            // Single-flight: one outstanding re-validation at a time.
+            return;
+        }
+        self.hover_request = Some(self.detector.request_revalidate(hover));
+    }
+
+    fn arm_hover_timer(&mut self) {
+        unsafe {
+            SetTimer(
+                self.window,
+                HOVER_TIMER_ID,
+                DEFAULT_HOVER_REVALIDATE_MS,
+                None,
+            )
+        };
+    }
+
+    fn disarm_hover_timer(&mut self) {
+        self.hover_request = None;
+        unsafe { KillTimer(self.window, HOVER_TIMER_ID) };
     }
 
     /// `Enter` while a preview is shown: hand the target to the worker for validation.
@@ -2196,6 +2318,11 @@ where
                 } else if (wparam as usize) == DWELL_TIMER_ID {
                     // Cursor rested long enough: query the cached snapshot for a preview.
                     self.on_dwell();
+                    Some(0)
+                } else if (wparam as usize) == HOVER_TIMER_ID {
+                    // Re-validate the hovered window on the detection worker; this thread
+                    // only enqueues (docs/14 §5.5).
+                    self.on_hover_tick();
                     Some(0)
                 } else {
                     None
