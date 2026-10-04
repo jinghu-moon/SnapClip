@@ -14,16 +14,23 @@
 use windows_numerics::Vector2;
 use std::sync::Arc;
 use ::windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
-    D2D_RECT_F, D2D_SIZE_U,
+    D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_BORDER_MODE_HARD,
+    D2D1_COLOR_F, D2D1_COMPOSITE_MODE_SOURCE_OVER, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
 };
 use ::windows::Win32::Graphics::Direct2D::{
+    CLSID_D2D1GaussianBlur,
     D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_OPTIONS_NONE,
     D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1,
-    D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
-    D2D1_LAYER_PARAMETERS1, D2D1_ROUNDED_RECT,
+    D2D1_DRAW_TEXT_OPTIONS_NONE,
+    D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED,
+    D2D1_GAUSSIANBLUR_PROP_BORDER_MODE,
+    D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION,
+    D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION,
+    D2D1_INTERPOLATION_MODE_LINEAR, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+    D2D1_LAYER_PARAMETERS1, D2D1_PROPERTY_TYPE_UNKNOWN, D2D1_ROUNDED_RECT,
     D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1_ELLIPSE,
-    ID2D1Bitmap1, ID2D1DeviceContext, ID2D1Geometry, ID2D1SolidColorBrush,
+    ID2D1Bitmap1, ID2D1DeviceContext, ID2D1Effect, ID2D1Geometry, ID2D1Image,
+    ID2D1SolidColorBrush,
 };
 use ::windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use ::windows::Win32::Graphics::DirectWrite::{
@@ -281,6 +288,14 @@ pub struct OverlayRenderer {
     /// Reusable mutable brush whose `SetColor` is updated to the sampled pixel
     /// every frame, avoiding a fresh brush per repaint.
     info_swatch_fill_brush: Option<ID2D1SolidColorBrush>,
+    /// Cached `CLSID_D2D1GaussianBlur` effect that samples the frozen frame into
+    /// a real backdrop for the info strip. Created once in `recreate_resources`;
+    /// per-frame work is just `SetInput` + `SetValue(std_dev)` + `DrawImage`
+    /// restricted to the info rectangle (see docs/15).
+    blur_effect: Option<ID2D1Effect>,
+    /// `#121214 @ 0.48` — the tint drawn over the blurred slice so text keeps
+    /// contrast without hiding the blur texture underneath.
+    info_tint_brush: Option<ID2D1SolidColorBrush>,
     /// Cache of every info-panel font variant, keyed by
     /// `(family slot, rounded DIP size * 100, weight as u32, alignment as u32)`.
     info_formats: Vec<((u8, u32, u32, u32), IDWriteTextFormat)>,
@@ -333,6 +348,8 @@ impl OverlayRenderer {
             info_swatch_border_brush: None,
             info_swatch_inset_brush: None,
             info_swatch_fill_brush: None,
+            blur_effect: None,
+            info_tint_brush: None,
             info_formats: Vec::new(),
             ann_stroke_brush: None,
             ann_fill_brush: None,
@@ -910,7 +927,60 @@ impl OverlayRenderer {
             let swatch_inset = self.require_brush(&self.info_swatch_inset_brush, "swatch inset")?;
             let swatch_fill = self.require_brush(&self.info_swatch_fill_brush, "swatch fill")?;
 
-            self.d2d.FillRectangle(&to_d2d(info), &bg);
+            // Info-strip backdrop: real Gaussian blur restricted to `info`, with
+            // a translucent tint on top. If either the effect or the tint brush
+            // is missing (or there is no frame to sample), fall back to the old
+            // solid `bg` so the strip never disappears.
+            let blur_owned = self.blur_effect.clone();
+            let tint_owned = self.info_tint_brush.clone();
+            if let (Some(fb), Some(blur), Some(tint)) = (
+                resources.frame_bitmap.as_ref(),
+                blur_owned.as_ref(),
+                tint_owned.as_ref(),
+            ) {
+                // Rebind the effect input every frame: the effect instance is
+                // cached across sessions, but `frame_bitmap` is rebuilt per
+                // session, so its input slot must be refreshed against the
+                // currently frozen frame. SetInput returns (), not Result.
+                let fb_img: ID2D1Image = fb
+                    .cast()
+                    .map_err(|error| super::hresult("ID2D1Bitmap1::cast", &error))?;
+                blur.SetInput(0, &fb_img, true);
+                // Mode A (context DPI = 96, coordinates in physical pixels):
+                // std_dev is expressed in DIP (= physical pixels here); the
+                // `* scale` widens the kernel proportionally on high-DPI
+                // displays so the perceived blur strength stays constant.
+                let std_dev = 12.0 * (metrics.dpi.max(96) as f32 / 96.0);
+                blur.SetValue(
+                    D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION.0 as u32,
+                    D2D1_PROPERTY_TYPE_UNKNOWN,
+                    &std_dev.to_ne_bytes(),
+                )
+                .map_err(|error| {
+                    super::hresult("ID2D1Effect::SetValue(STANDARD_DEVIATION)", &error)
+                })?;
+                // DrawImage is bounded to `info` via the source rectangle, so
+                // D2D only evaluates the blur over the region actually needed
+                // (info rect + kernel padding). Both optional pointers must be
+                // raw pointers in windows-rs 0.61 (`Option<*const _>`).
+                let dest = vector2(info.left as f32, info.top as f32);
+                let src = to_d2d(info);
+                let blur_img: ID2D1Image = blur
+                    .cast()
+                    .map_err(|error| super::hresult("ID2D1Effect::cast", &error))?;
+                self.d2d
+                    .DrawImage(
+                        &blur_img,
+                        Some(&dest as *const Vector2),
+                        Some(&src as *const D2D_RECT_F),
+                        D2D1_INTERPOLATION_MODE_LINEAR,
+                        D2D1_COMPOSITE_MODE_SOURCE_OVER,
+                    );
+                // 0.48 tint on top keeps text legible without hiding the texture.
+                self.d2d.FillRectangle(&to_d2d(info), tint);
+            } else {
+                self.d2d.FillRectangle(&to_d2d(info), &bg);
+            }
 
             let scale = metrics.dpi.max(96) as f32 / 96.0;
             let pad_v = INFO_PADDING_V_DIP * scale;
@@ -1466,8 +1536,11 @@ impl OverlayRenderer {
         self.magnifier_grid_brush = Some(self.create_brush(&grid)?);
         self.magnifier_info_brush = Some(self.create_brush(&info)?);
         // ── Glassmorphism info-panel palette ──
+        // The primary path uses a real Gaussian-blur backdrop + `info_tint_brush`.
+        // This solid `info_bg_brush` remains the fallback when the effect cannot
+        // be constructed; 0.68 keeps the strip legible without going fully opaque.
         self.info_bg_brush = Some(self.create_brush(
-            &color(20.0 / 255.0, 20.0 / 255.0, 20.0 / 255.0, 0.88),
+            &color(20.0 / 255.0, 20.0 / 255.0, 20.0 / 255.0, 0.68),
         )?);
         self.info_accent_brush = Some(self.create_brush(
             &color(59.0 / 255.0, 130.0 / 255.0, 246.0 / 255.0, 1.0),
@@ -1498,6 +1571,37 @@ impl OverlayRenderer {
             &color(0.0, 0.0, 0.0, 0.25),
         )?);
         self.info_swatch_fill_brush = Some(self.create_brush(&color(0.0, 0.0, 0.0, 1.0))?);
+        // ── Real Gaussian-blur backdrop for the info strip (docs/15) ──
+        // windows-rs 0.61 binds ID2D1Properties::SetValue as
+        //   (u32, D2D1_PROPERTY_TYPE, &[u8]) -> Result<()>
+        // rather than accepting a &PROPVARIANT, so raw little-endian bytes with
+        // D2D1_PROPERTY_TYPE_UNKNOWN is the correct call shape. SetInput returns
+        // () (no Result), and DrawImage's targetoffset / imagerectangle are
+        // Option<*const _> — see the call site in draw_magnifier for how those
+        // two differ from the intuitive C++ projection.
+        let blur: ID2D1Effect = unsafe { self.d2d.CreateEffect(&CLSID_D2D1GaussianBlur) }
+            .map_err(|error| super::hresult("ID2D1DeviceContext::CreateEffect", &error))?;
+        unsafe {
+            blur.SetValue(
+                D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION.0 as u32,
+                D2D1_PROPERTY_TYPE_UNKNOWN,
+                &(D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED.0 as u32).to_ne_bytes(),
+            )
+            .map_err(|error| {
+                super::hresult("ID2D1Effect::SetValue(OPTIMIZATION_MODE)", &error)
+            })?;
+            // HARD border mode: without it, the kernel would sample outside the
+            // info rect into transparent pixels near the frame edge and darken
+            // the strip's own edges (a visible halo at screen borders).
+            blur.SetValue(
+                D2D1_GAUSSIANBLUR_PROP_BORDER_MODE.0 as u32,
+                D2D1_PROPERTY_TYPE_UNKNOWN,
+                &(D2D1_BORDER_MODE_HARD.0 as u32).to_ne_bytes(),
+            )
+            .map_err(|error| super::hresult("ID2D1Effect::SetValue(BORDER_MODE)", &error))?;
+        }
+        self.blur_effect = Some(blur);
+        self.info_tint_brush = Some(self.create_brush(&color(0.07, 0.07, 0.08, 0.48))?);
         // Annotation brushes: initialised to accent blue; colour set per-item at draw time.
         self.ann_stroke_brush = Some(self.create_brush(&color(0.0, 0.47, 0.83, 1.0))?);
         self.ann_fill_brush = Some(self.create_brush(&color(0.0, 0.0, 0.0, 0.0))?);
@@ -1539,6 +1643,8 @@ impl OverlayRenderer {
         self.info_swatch_border_brush = None;
         self.info_swatch_inset_brush = None;
         self.info_swatch_fill_brush = None;
+        self.blur_effect = None;
+        self.info_tint_brush = None;
         self.ann_stroke_brush = None;
         self.ann_fill_brush = None;
     }

@@ -29,14 +29,15 @@
 
 | 主题 | windows-rs 0.61.3 实际形态 | 常见错误写法 |
 | :- | :- | :- |
-| `Effects` 命名空间 | **不存在**。`ID2D1Effect` / `CLSID_D2D1GaussianBlur` / `D2D1_GAUSSIANBLUR_PROP_*` / `D2D1_GAUSSIANBLUR_OPTIMIZATION_*` / `D2D1_BORDER_MODE_*` 全部直接位于 `windows::Win32::Graphics::Direct2D` 顶层 | ~~`Direct2D::Effects::CLSID_D2D1GaussianBlur`~~ |
+| `Effects` 命名空间 | **不存在**。`ID2D1Effect` / `ID2D1Image` / `CLSID_D2D1GaussianBlur` / `D2D1_GAUSSIANBLUR_PROP_*` / `D2D1_GAUSSIANBLUR_OPTIMIZATION_*` / `D2D1_PROPERTY_TYPE_*` / `D2D1_INTERPOLATION_MODE_*` 位于 `windows::Win32::Graphics::Direct2D` 顶层；`D2D1_BORDER_MODE_*` / `D2D1_COMPOSITE_MODE_*` / `D2D_RECT_F` 位于 `windows::Win32::Graphics::Direct2D::Common`（尽管名字看着像 Direct2D 根） | ~~`Direct2D::Effects::CLSID_D2D1GaussianBlur`~~ 或 ~~`Direct2D::D2D1_BORDER_MODE_HARD`~~ |
 | Cargo feature | 只需已有的 `Win32_Graphics_Direct2D` 和 `Win32_Graphics_Direct2D_Common`；**不存在** `Win32_Graphics_Direct2D_Effects` 这个 feature | ~~加 `Win32_Graphics_Direct2D_Effects`~~ |
 | `ID2D1Properties::SetValue` | `pub unsafe fn SetValue(&self, index: u32, r#type: D2D1_PROPERTY_TYPE, data: &[u8]) -> Result<()>` | ~~`(u32, &PROPVARIANT)`~~ |
 | `ID2D1Effect::SetInput` | `pub unsafe fn SetInput<P1>(&self, index: u32, input: P1, invalidate: bool)` **返回 `()`，无 `Result`** | ~~`blur.SetInput(0, &img, true)?;`~~ |
-| `ID2D1DeviceContext::DrawImage` | `DrawImage<P0: Param<ID2D1Image>>(&self, image, targetoffset: Option<*const Vector2>, imagerectangle: Option<*const D2D_RECT_F>, interpolationmode, compositemode) -> Result<()>`。目标偏移是 `Vector2` 不是 `D2D1_POINT_2F`；两个 rect/point 是 `Option<*const _>` | ~~`Some(&dest)` 直接引用~~ |
+| `ID2D1DeviceContext::DrawImage` | `DrawImage<P0: Param<ID2D1Image>>(&self, image, targetoffset: Option<*const Vector2>, imagerectangle: Option<*const Common::D2D_RECT_F>, interpolationmode, compositemode)` **返回 `()`，不是 `Result<()>`**（windows-rs 把 C++ HRESULT 丢掉了）；目标偏移是 `Vector2` 不是 `D2D1_POINT_2F`，两个 rect/point 是 `Option<*const _>` | ~~`self.d2d.DrawImage(...).map_err(...)?;`~~ |
 | `ID2D1Effect::CreateEffect` 输入图像 cast | `P1: Param<ID2D1Image>` 已支持从 `&ID2D1Bitmap1` / `&ID2D1Effect` 上转型；显式 `.cast::<ID2D1Image>()?` 是 belt-and-braces，可选 | — |
 | `PROPVARIANT` / `InitPropVariantFromFloat` | 存在于 `Win32::System::Com::StructuredStorage`（另一 feature），但**本方案用不到**，因为 SetValue 是 `&[u8]` | ~~propvar_f32 / propvar_u32 helper~~ |
 | Enum → u32 传值 | windows-rs 里 `D2D1_BORDER_MODE` / `D2D1_GAUSSIANBLUR_OPTIMIZATION` 是 `pub struct X(pub i32)`，写值时 `v.0 as u32` 再 `to_ne_bytes()` | — |
+| GaussianBlur 属性常量名 | `D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION` / `D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION` / `D2D1_GAUSSIANBLUR_PROP_BORDER_MODE`（**属性名无 `_MODE` 后缀**，与 C++ `D2D1_GAUSSIANBLUR_PROPERTY_PROP_OPTIMIZATION` 一致；enum 值才是 `D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED` 等） | ~~`D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION_MODE`~~ |
 
 `D2D1_PROPERTY_TYPE_UNKNOWN` 让 D2D 依据 effect schema 自解释原始字节，无需按类型
 手工挑 `FLOAT`/`UINT32`。
@@ -80,14 +81,17 @@ impl BlurProperty for ID2D1Effect {
 只用 clone 出来的引用。
 
 ```rust
-// 顶部 use（沿用现有 Direct2D 顶层命名空间，无 Effects 子模块）
+// 沿用现有 Direct2D 顶层命名空间（无 Effects 子模块）；
+// BORDER_MODE / COMPOSITE_MODE / D2D_RECT_F 在 Common 子模块。
+use windows::Win32::Graphics::Direct2D::Common::{
+    D2D1_BORDER_MODE_HARD, D2D1_COMPOSITE_MODE_SOURCE_OVER,
+};
 use windows::Win32::Graphics::Direct2D::{
     CLSID_D2D1GaussianBlur,
     D2D1_GAUSSIANBLUR_PROP_BORDER_MODE,
-    D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION_MODE,
+    D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION,
     D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION,
     D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED,
-    D2D1_BORDER_MODE_HARD,
     ID2D1Effect, ID2D1Image,
 };
 
@@ -103,9 +107,9 @@ use windows::Win32::Graphics::Direct2D::{
 unsafe {
     let blur: ID2D1Effect = self.d2d.CreateEffect(&CLSID_D2D1GaussianBlur)?;
 
-    // 静态属性只在这里设一次，不每帧改
+    // 静态属性只在这里设一次，不每帧改（windows-rs 里属性名无 `_MODE` 后缀）
     blur.set_u32(
-        D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION_MODE.0 as u32,
+        D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION.0 as u32,
         D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED.0 as u32,
     )?;
     blur.set_u32(
@@ -156,8 +160,11 @@ info_tint_brush: self.info_tint_brush.clone(),
 **替换为**（保持在外层 PushLayer 的圆角 mask 之内）：
 
 ```rust
+use windows::Win32::Graphics::Direct2D::Common::{
+    D2D1_COMPOSITE_MODE_SOURCE_OVER, D2D1_RECT_F,
+};
 use windows::Win32::Graphics::Direct2D::{
-    D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER,
+    D2D1_INTERPOLATION_MODE_LINEAR,
 };
 
 if let (Some(fb), Some(blur)) = (
@@ -186,10 +193,10 @@ if let (Some(fb), Some(blur)) = (
     self.d2d.DrawImage(
         &blur_img,
         Some(&dest as *const windows_numerics::Vector2),
-        Some(&src as *const windows::Win32::Graphics::Direct2D::Common::D2D1_RECT_F),
+        Some(&src as *const D2D_RECT_F),
         D2D1_INTERPOLATION_MODE_LINEAR,
         D2D1_COMPOSITE_MODE_SOURCE_OVER,
-    )?;
+    ); // ← DrawImage 返回 ()，不要加 .map_err(...)?
 
     // 4. 上层再叠 0.48 Tint（替换原来的 FillRectangle(bg)）
     let tint = self.require_brush(&resources.info_tint_brush, "info tint")?;
@@ -256,7 +263,7 @@ if let (Some(fb), Some(blur)) = (
 - [ ] **Helper**：`trait BlurProperty` 或两个内联 `SetValue` 调用（`&[..to_ne_bytes()]` + `D2D1_PROPERTY_TYPE_UNKNOWN`），**不引入 PROPVARIANT / InitPropVariantFrom* helper**。
 - [ ] **绘制替换**：在 `d2d.rs` 中原 `FillRectangle(&to_d2d(info), &bg)` 那一行（PushLayer 内、info panel 起始）替换为 §三.4 的 `SetInput + SetValue + DrawImage + FillRectangle(tint)` 块，带 `else` 分支 fallback。
 - [ ] **`SetInput` 无 `?`**：`blur.SetInput(0, &fb_img, true);`（返回 `()`，不是 Result）。
-- [ ] **`DrawImage` 指针参数**：`Some(&dest as *const Vector2)` 和 `Some(&src as *const D2D1_RECT_F)`；`D2D1_RECT_F` 完整路径是 `windows::Win32::Graphics::Direct2D::Common::D2D1_RECT_F`。
+- [ ] **`DrawImage` 指针参数 + 无 Result**：`Some(&dest as *const Vector2)` 和 `Some(&src as *const D2D1_RECT_F)`；`D2D1_RECT_F` 完整路径 `windows::Win32::Graphics::Direct2D::Common::D2D1_RECT_F`；windows-rs 0.61 中该方法返回 `()`，**不要** 写 `.map_err(...)?`。
 - [ ] **`info_bg_brush` alpha 从 0.88 降到 0.68**（作为 fallback 也不至于过黑）。
 - [ ] **真机验证**：100% / 125% / 150% DPI 下分别截图，检查
   - 模糊边缘是否自然、圆角是否被 PushLayer 完美裁掉；
