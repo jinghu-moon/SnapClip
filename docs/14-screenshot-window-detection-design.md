@@ -475,7 +475,7 @@ R-tree 等空间索引不在 v1 预置；仅当基准测试显示线性扫描成
 
 ## 11. 分期路线图
 
-- **v1（本方案）**：窗口快照 + 缓存命中 + `PointerGesture` 状态机重构 + 悬停高亮 + 单击吸附 `TopLevelWindowFrame` + 拖拽转手动 + 三层自身排除 + 目标验证与快照失效。依赖仅新增 `Win32_Graphics_Dwm`。
+- **v1（本方案）**：窗口快照 + 缓存命中/最近距离命中 + `PointerGesture` 状态机重构 + 停稳自动吸附预览 + Enter/工具栏确认 + 拖拽转手动 + 三层自身排除 + 目标验证与快照失效。依赖仅新增 `Win32_Graphics_Dwm`。
 - **v2（预留）**：子控件深选。引入 UIA/MSAA 命中路径服务，采用 snow_shot 的异步 coordinator 蓝本（前台 worker 刷新快照与普通命中；refinement worker 独立 COM apartment 做 UIA；单飞 + 最新点合并 + `epoch/generation/request_id` 去陈旧 + 鼠标静止 80ms 防抖 + 超时/取消 + `stopReason` 降级）。`WindowTargetProvider` 扩展 `UiAutomationTargetProvider` / `MsaaTargetProvider`，新增 `ClientArea` / `UiElement` 目标类型。**v2 不改动 v1 整窗吸附路径，两者严格隔离。**
 
 ---
@@ -488,7 +488,7 @@ R-tree 等空间索引不在 v1 预置；仅当基准测试显示线性扫描成
 - `hit_test.rs`：重叠窗口按 Z 序命中；半开矩形边界（点在右/下边缘外 1px 不命中、左/上边缘命中）；
 - `snapshot.rs` 过滤：`WS_EX_LAYERED + WS_EX_TRANSPARENT` 被排除；**单独 `WS_EX_TRANSPARENT` 不被排除**；cloaked / iconic / 不可见被排除；excluded hwnd/pid 被排除；
 - 目标失效：HWND 关闭后 `validate` 返回 false；PID/class 变化视为不同窗口，不吸附旧矩形；
-- `gesture.rs`：PendingClick 不改变选区；位移超阈值转 ManualDrag；PendingClick 抬起提交吸附；PendingClick 吸附最终失败时选区不变且手势归 None（不产生 ManualDrag）；Move/Resize 优先级高于 PendingClick；
+- `gesture.rs`：停稳产生 AutoSnapPreview 且不提交选区；PendingPointer 位移超阈值转 ManualDrag；PointerUp 不确认吸附；Enter/工具栏确认提交预览；确认最终失败时恢复确认前选区且手势归 None；Move/Resize 优先级高于自动吸附预览；
 - hover 去过期（§5.5）：模拟目标边界变化 → `BoundsChanged` 经 `apply_candidate_update` 只更新该 candidate、不触发全量刷新，且后续 `hit_test` 返回新矩形（回归"hover 跳回旧位置"缺陷）；epoch/identity 不匹配的更新为 no-op；模拟窗口关闭 → `Invalid` → 刷新重命中；无 hover 时定时器跳过投递；worker 回投结果 epoch/HWND 与当前 hover 失配时被丢弃（`hover_revalidate_stale_dropped_count` +1）。
 
 ### 12.2 Windows 集成测试（真机探针）
@@ -503,7 +503,7 @@ R-tree 等空间索引不在 v1 预置；仅当基准测试显示线性扫描成
 
 ### 12.3 交互与既有功能回归
 
-- 悬停高亮、单击吸附、拖拽自由框选、resize、move 四类互不破坏；特别验证：按下瞬间不再产生零尺寸选区；
+- 悬停高亮、停稳自动吸附预览、Enter 确认、拖拽自由框选、resize、move 五类互不破坏；特别验证：按下瞬间不再产生零尺寸选区，鼠标释放不会自动确认吸附；
 - 手动框选、放大镜、取色、标注、导出闭环不受影响；
 - 性能指标不劣于基线（§10.2）。
 
@@ -521,7 +521,7 @@ R-tree 等空间索引不在 v1 预置；仅当基准测试显示线性扫描成
 | `src-tauri/src/capture/window_detection/model.rs` | 新增：`WindowIdentity` / `WindowCandidate` / `WindowTarget` / `WindowSnapshot` / `TargetKind` |
 | `src-tauri/src/capture/window_detection/provider.rs` | 新增：`WindowTargetProvider` trait（含 `revalidate_hover`/`apply_candidate_update`）与 `Exclusions`、`HoverValidity`；接口只工作在虚拟桌面屏幕坐标系 |
 | `src-tauri/src/capture/window_detection/snapshot.rs` | 新增：快照构建（EnumWindows + DWM + 过滤），刷新时机与 epoch 管理 |
-| `src-tauri/src/capture/window_detection/hit_test.rs` | 新增：Z 序线性扫描、半开区间命中、多候选裁决 |
+| `src-tauri/src/capture/window_detection/hit_test.rs` | 新增：点内命中、吸附半径内最近距离、Z 序线性扫描、半开区间命中、多候选裁决 |
 | `src-tauri/src/capture/window_detection/gesture.rs` | 新增：`PointerGesture` 状态机 |
 | `src-tauri/src/platform/windows/capture/win/window.rs` | 新增：Win32 枚举 / DWM 边界 / 窗口属性读取（纯 FFI 封装） |
 | `src-tauri/src/capture/geometry.rs` | 新增 `window_rect_to_local` 纯函数 + 单测 |
