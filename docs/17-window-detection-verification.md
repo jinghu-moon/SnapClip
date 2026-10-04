@@ -938,3 +938,16 @@ snap_confirmed=1（全程仅会话 1 的那一次）previews=4 cancels=2 errors=
   `on_key_down` 的 Return 分支即可，属一行改动。
 - 单击确认的**误触风险**已由拖拽阈值兜底（系统 `SM_CXDRAG`，本机 DPI144 下 6 px），
   但“点一下空白处”不会重置已确认选区（符合 §4.3 约束 4）；人工手感验收仍待你确认。
+
+### 变更后的完整验收复跑
+
+代码改动晚于 Phase 7 的验收，因此按同样口径复跑了一遍全部自动化门禁：
+
+| 项目 | 结果 |
+| --- | --- |
+| `cargo test --lib` | **293 passed / 0 failed** |
+| `cargo check --all-targets` | 0 warnings |
+| `npm run typecheck` | exit 0 |
+| 20 次「F5 → 停稳 → **左键单击** → Esc」循环（`.tmp-p7-probe.ps1` 已改为点击确认） | `snap_confirmed=20/20`、`f5_visible=21`、`cancels=21`、`snapshots=21`、错误 0 |
+| 12 次循环资源稳定性（`.tmp-p7-leak.ps1`） | 暖机后线程 **57→57**、句柄 **628→628**、Private 55.5→56.1 MB、WS 72.5→73.0 MB（不再增长） |
+| release 构建 + NSIS 打包 | `npx tauri build --bundles nsis` exit 0，`SnapClip_0.1.0_x64-setup.exe` 2.39 MiB，release profile 1m45s |
