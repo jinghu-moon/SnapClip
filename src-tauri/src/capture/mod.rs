@@ -11,9 +11,11 @@
 
 mod error;
 pub mod annotation;
+pub mod diagnostics;
 pub mod geometry;
 pub mod sampler;
 pub mod session;
+pub mod window_detection;
 
 pub mod application;
 #[cfg(windows)]
