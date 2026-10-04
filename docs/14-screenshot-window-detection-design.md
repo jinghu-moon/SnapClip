@@ -216,7 +216,7 @@ SnapPreview:
   4. 超过拖拽阈值 -> 清除预览并进入 ManualDrag（拖拽优先）
 
 Settled:
-  1. 不再产生 WindowTarget hover 或 AutoSnapPreview
+  1. 不再产生 WindowTarget hover 或 SnapPreview
   2. PointerDown 命中手柄/内部 -> ResizeSelection/MoveSelection
   3. Enter/工具栏 -> 导出；Esc -> 取消会话
 ```
@@ -313,7 +313,8 @@ capture/window_detection/
   hit_test.rs    // 快照命中、Z 序裁决、半开区间
   monitor_cache.rs // 刷新周期内的显示器矩形缓存与可见部分裁剪
   spatial.rs     // 可选 R-tree/线性索引；仅基准证明有必要时启用
-  gesture.rs     // PointerGesture: AutoSnapPreview / PendingPointer / ManualDrag / Move / Resize
+gesture.rs     // PointerGesture: None / PendingPointer / ManualDrag / Move / Resize
+              // + GestureState::preview: Option<SnapPreview>（显示状态，独立于手势）
 
 platform/windows/capture/win/window.rs
                  // 只负责 Win32 枚举、DWM 边界、窗口属性读取（纯 FFI 封装）
@@ -435,13 +436,13 @@ process_id / class_name_hash 仍匹配   // 防 HWND 重用后指向另一个窗
 ```text
 自动吸附目标验证失败
   -> 刷新快照并重命中一次
-  -> 仍失败：恢复确认前选区，清除 AutoSnapPreview，恢复 hover 预览
+  -> 仍失败：恢复确认前选区，清除 SnapPreview，恢复 hover 预览
   -> 下一次光标停稳才重新产生吸附预览
 ```
 
 ### 5.5 hover 与自动吸附预览时效性（窗口移动的去过期）
 
-`WM_MOUSEMOVE` 只查快照的直接后果是：截图过程中窗口被移动/缩放时，`hover_target` 和 `AutoSnapPreview` 可能显示旧矩形。去过期策略如下，两条红线：**不得放入每次鼠标移动的同步路径；不得在 overlay 消息循环线程执行 DWM 同步调用**（`DwmGetWindowAttribute` 是同步调用，若与 overlay 同线程，回调本身就会暂时阻塞消息循环，"不阻塞"的承诺无法成立）：
+`WM_MOUSEMOVE` 只查快照的直接后果是：截图过程中窗口被移动/缩放时，`hover_target` 和 `SnapPreview` 可能显示旧矩形。去过期策略如下，两条红线：**不得放入每次鼠标移动的同步路径；不得在 overlay 消息循环线程执行 DWM 同步调用**（`DwmGetWindowAttribute` 是同步调用，若与 overlay 同线程，回调本身就会暂时阻塞消息循环，"不阻塞"的承诺无法成立）：
 
 **线程模型**：
 
@@ -471,7 +472,7 @@ worker 队列必须是有界的“最新请求”模型：
 - overlay 线程在每次有效鼠标移动后重置 `dwell_generation` 和 120ms 一次性计时器；
 - 计时器到期时先确认光标位置和 `dwell_generation` 仍未变化，再调用纯缓存 `nearest_target`；计时器不执行 Win32/DWM/UIA 调用；
 - 新鼠标移动、按下、拖拽、显示器变化或快照 epoch 变化都会使旧计时器失效；
-- `nearest_target` 无候选时清除 `AutoSnapPreview`，不改变已确认选区；有候选时只更新预览层，等待 `Enter`/工具栏确认。
+- `nearest_target` 无候选时清除 `SnapPreview`，不改变已确认选区；有候选时只更新预览层，等待**左键单击**/`Enter`/工具栏确认（§4.3）。
 
 **确认路径**：`on_confirm` 不在 overlay 线程执行 `validate`。它向检测 worker 投递 `{target, epoch, confirmation_id}`；worker 完成单窗口 Win32/DWM 校验后回投结果，overlay 只校验 `epoch + identity + confirmation_id`，成功才提交吸附选区，失败则恢复确认前选区。这样确认路径也不会阻塞 overlay 消息循环；`window_validate_us` 记录 worker 校验耗时。
 
@@ -539,16 +540,16 @@ SnapClip 采用三层保护：
 
 前提：§4 的 `PointerGesture` 状态机重构已落地。
 
-- `overlay.rs on_mouse_move`（`PointerGesture::None`、`PendingPointer` 或 `AutoSnapPreview`）：`screen_pt = monitor.to_screen(cursor)` → `self.window_snapshot.hit_test(screen_pt)`（**纯缓存命中，不调用 EnumWindows/DWM**）→ `window_rect_to_local(target.candidate.screen_bounds, monitor)` 得 `local_visible_bounds` → 存 `self.hover_target`（同 hwnd 且同矩形则跳过重算与重绘）→ 重置停稳计时器。光标停稳达到防抖时间后，调用 `self.window_snapshot.nearest_target(screen_pt, snap_radius)`，在吸附半径内选择最近候选并进入或替换 `AutoSnapPreview`，预览选区只更新画面、不提交会话状态。本地转换只发生在这里，Provider 不感知显示器。
-- `overlay.rs on_left_down`：按 §4.2 判定 Resize/Move/PendingPointer；若当前存在 `AutoSnapPreview`，按下后移动超过阈值即取消预览并进入手动拖拽，**不直接调用 `session.pointer_pressed()` 改选区**。
-- `overlay.rs on_mouse_move`（`PendingPointer`/`AutoSnapPreview`/`ManualDrag`）：按下后位移² ≥ 阈值时清除 `AutoSnapPreview`，转 `ManualDrag`，再调用现有 `session.pointer_moved` 更新橡皮筋。
-- `overlay.rs on_left_up`：`PendingPointer` 只结束指针等待，不提交吸附；`AutoSnapPreview` 不因鼠标释放而确认；`ManualDrag` → 现有 `pointer_released`。
-- `overlay.rs on_confirm`（Enter/工具栏）：`AutoSnapPreview` → 向检测 worker 投递 `{target, epoch, confirmation_id}`；worker `validate` 成功后回投，overlay 校验身份后 `session.snap_to(local_visible_bounds)`；失败则刷新快照重命中一次，仍失败则恢复确认前选区并清除预览（见 §5.4）。确认期间重复 Enter 只保留最新 `confirmation_id`。
+- `overlay.rs on_mouse_move`（`PointerGesture::None`、`PendingPointer` 或 `SnapPreview`）：`screen_pt = monitor.to_screen(cursor)` → `self.window_snapshot.hit_test(screen_pt)`（**纯缓存命中，不调用 EnumWindows/DWM**）→ `window_rect_to_local(target.candidate.screen_bounds, monitor)` 得 `local_visible_bounds` → 存 `self.hover_target`（同 hwnd 且同矩形则跳过重算与重绘）→ 重置停稳计时器。光标停稳达到防抖时间后，调用 `self.window_snapshot.nearest_target(screen_pt, snap_radius)`，在吸附半径内选择最近候选并进入或替换 `SnapPreview`，预览选区只更新画面、不提交会话状态。本地转换只发生在这里，Provider 不感知显示器。
+- `overlay.rs on_left_down`：按 §4.2 判定 Resize/Move/PendingPointer；若当前存在 `SnapPreview`，按下后移动超过阈值即取消预览并进入手动拖拽，**不直接调用 `session.pointer_pressed()` 改选区**。
+- `overlay.rs on_mouse_move`（`PendingPointer`/`SnapPreview`/`ManualDrag`）：按下后位移² ≥ 阈值时清除 `SnapPreview`，转 `ManualDrag`，再调用现有 `session.pointer_moved` 更新橡皮筋。
+- `overlay.rs on_left_up`：`PendingPointer` 结束指针等待；**若存在 `SnapPreview`，这次未超阈值的左键单击就确认它**（§4.3）；`ManualDrag` → 现有 `pointer_released`。没有预览时单击不改变任何状态。
+- `overlay.rs on_confirm`（**左键单击**/`Enter`/工具栏）：`SnapPreview` → 向检测 worker 投递 `{target, epoch, confirmation_id}`；worker `validate` 成功后回投，overlay 校验身份后 `session.snap_to(local_visible_bounds)`；失败则刷新快照重命中一次，仍失败则恢复确认前选区并清除预览（见 §5.4）。确认期间重复触发只保留最新 `confirmation_id`。
 - `session.rs snap_to(rect)`：非空且 ≥ 最小尺寸则设 selection + 置 `Selected`，否则忽略。
 - `d2d.rs`：在现有 crosshair 之后、info panel 之前画 `hover_target` 高亮（复用 band/label brush，无需新配色）。
 - 鼠标事件合并：处理循环只消费**最新点**，堆积的中间点丢弃（`mouse_move_coalesced_count` 指标可观测）。
 - 定时器（~250ms，overlay 线程）：只投递当前 hover 的 HWND/identity/epoch 给窗口检测 worker；worker 回投 `Valid/BoundsChanged/Invalid`，overlay 线程校验 epoch+HWND 后：`BoundsChanged` → `apply_candidate_update` 更新快照 + hover 高亮并重绘；`Invalid` → 刷新快照重命中（§5.5）。验证不落在鼠标移动路径，也不在 overlay 消息循环线程执行 DWM 调用。
-- 停稳计时器（初始 120ms，overlay 线程）：只执行代际校验和纯缓存 `nearest_target`，不执行 Win32/DWM/UIA；到期后产生或清除 `AutoSnapPreview`。
+- 停稳计时器（初始 120ms，overlay 线程）：只执行代际校验和纯缓存 `nearest_target`，不执行 Win32/DWM/UIA；到期后产生或清除 `SnapPreview`。
 
 ---
 
@@ -568,7 +569,7 @@ SnapClip 采用三层保护：
 | 窗口移动致 hover 过期 | 检测 worker 轻量重验证当前 hover HWND，`BoundsChanged` 经 `apply_candidate_update` 同步更新快照与 hover，`Invalid` 则刷新快照重命中（§5.5） |
 | DWM 同步调用阻塞消息循环 | hover 重验证与确认路径 `validate` 均在检测 worker 线程执行；overlay 线程只接收校验后的结果（§5.5） |
 | BoundsChanged 后 hover 跳回旧位置 | 新矩形必须写回快照，`hit_test` 与 hover 共用同一数据源；回投结果按 epoch+HWND 校验，陈旧丢弃（§5.5） |
-| 吸附最终失败 | 确认时不提交新选区：恢复确认前选区、清除 AutoSnapPreview，等待下一次停稳（§5.4） |
+| 吸附最终失败 | 确认时不提交新选区：恢复确认前选区、清除 SnapPreview，等待下一次停稳（§5.4） |
 | overlay 命中自己 | 三层保护：affinity + excluded 集合 + 捕获降级（§7） |
 | 快照资源残留 | 会话结束或快照失效时显式释放 `MonitorCache`、候选向量和可选空间索引；新会话不得复用旧 epoch 的索引 |
 | 空间索引错选重叠窗口 | R-tree 只做候选过滤，最终仍按半开区间和 `z_order` 裁决（§5.4） |
@@ -643,7 +644,7 @@ R-tree 等空间索引不在 v1 预置；仅当基准测试显示线性扫描成
 - 空间索引（仅启用时）：R-tree 命中后仍执行半开区间检查并按 Z 序裁决；小于等于 16 个候选走线性扫描；
 - DPI/显示器缓存：在创建 overlay 前完成 Per-Monitor V2 初始化；显示器布局变化时只刷新一次 `MonitorCache`，跨屏/负坐标裁剪结果稳定；
 - 目标失效：HWND 关闭后 `validate` 返回 false；PID/class 变化视为不同窗口，不吸附旧矩形；
-- `gesture.rs`：停稳产生 AutoSnapPreview 且不提交选区；PendingPointer 位移超阈值转 ManualDrag；PointerUp 不确认吸附；Enter/工具栏确认提交预览；确认最终失败时恢复确认前选区且手势归 None；Move/Resize 优先级高于自动吸附预览；离开 snap radius 清除预览；
+- `gesture.rs`：停稳产生 `SnapPreview` 且不提交选区；**按下不销毁预览**；PendingPointer 位移超阈值转 ManualDrag 并清除预览；`PointerUp` 未超阈值 → 左键单击确认提交预览，超阈值 → 只提交自由框选、不确认吸附；`Enter`/工具栏为等价入口；确认最终失败时恢复确认前选区且手势归 None；Move/Resize 优先级高于自动吸附预览；离开 snap radius 清除预览；
 - 停稳防抖：移动后 120ms 内再次移动时旧计时器不产生预览；计时器到期仅调用纯缓存 `nearest_target`；无候选时预览清除且已确认选区不变；快照 epoch 变化使旧 dwell 结果失效；
 - hover 去过期（§5.5）：模拟目标边界变化 → `BoundsChanged` 经 `apply_candidate_update` 只更新该 candidate、不触发全量刷新，且后续 `hit_test` / `nearest_target` 返回新矩形（回归"hover 跳回旧位置"缺陷）；epoch/identity 不匹配的更新为 no-op；模拟窗口关闭 → `Invalid` → 刷新重命中；无 hover 时定时器跳过投递；worker 回投结果 epoch/HWND 与当前 hover 失配时被丢弃（`hover_revalidate_stale_dropped_count` +1）。
 
@@ -661,7 +662,7 @@ R-tree 等空间索引不在 v1 预置；仅当基准测试显示线性扫描成
 
 ### 12.3 交互与既有功能回归
 
-- 悬停高亮、停稳自动吸附预览、Enter 确认、拖拽自由框选、resize、move 五类互不破坏；特别验证：按下瞬间不再产生零尺寸选区，鼠标释放不会自动确认吸附；
+- 悬停高亮、停稳自动吸附预览、左键单击确认、拖拽自由框选、resize、move 五类互不破坏；特别验证：按下瞬间不再产生零尺寸选区；未超阈值的左键单击确认预览；超过拖拽阈值的释放只提交自由框选、**不**确认吸附；无预览时单击零副作用；
 - 确认后进入 `Settled`/编辑态：窗口 hover、自动吸附和十字线均停止，已有选区仍可移动/缩放；再次启动新会话时旧选区、旧 hover 和旧 dwell generation 全部释放；
 - 手动框选、放大镜、取色、标注、导出闭环不受影响；
 - 性能指标不劣于基线（§10.2）。
