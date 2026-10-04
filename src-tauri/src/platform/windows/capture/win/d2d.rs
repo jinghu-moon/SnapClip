@@ -199,6 +199,9 @@ pub struct RenderView {
     /// Show the info-panel coordinate relative to the selection origin instead
     /// of as a global screen position (the P toggle).
     pub magnifier_relative: bool,
+    /// Current loupe zoom (`Z` + wheel). `0.1..=40.0`; drives both the panel's
+    /// source-window derivation and the numeric badge on the loupe's corner.
+    pub magnifier_zoom: f32,
     // ── Annotations ───────────────────────────────────────────────────────────
     /// Committed annotation items to render at L2.
     pub annotation_items: Vec<crate::capture::annotation::AnnotationItem>,
@@ -226,6 +229,7 @@ impl RenderView {
             magnifier_rgb: None,
             magnifier_color_text: None,
             magnifier_relative: false,
+            magnifier_zoom: MagnifierConfig::ZOOM_DEFAULT,
             annotation_items: Vec::new(),
             annotation_selected_id: None,
             annotation_draft: None,
@@ -304,6 +308,9 @@ pub struct OverlayRenderer {
     /// `#121214 @ 0.48` — the tint drawn over the blurred slice so text keeps
     /// contrast without hiding the blur texture underneath.
     info_tint_brush: Option<ID2D1SolidColorBrush>,
+    /// `rgba(60,60,60,0.82)` — background chip behind the zoom badge drawn in
+    /// the loupe panel's top-right corner.
+    info_badge_bg_brush: Option<ID2D1SolidColorBrush>,
     /// Cache of every info-panel font variant, keyed by
     /// `(family slot, rounded DIP size * 100, weight as u32, alignment as u32)`.
     info_formats: Vec<((u8, u32, u32, u32), IDWriteTextFormat)>,
@@ -357,6 +364,7 @@ impl OverlayRenderer {
             info_swatch_fill_brush: None,
             blur_effect: None,
             info_tint_brush: None,
+            info_badge_bg_brush: None,
             info_formats: Vec::new(),
             ann_stroke_brush: None,
             ann_fill_brush: None,
@@ -787,7 +795,7 @@ impl OverlayRenderer {
         resources: &ChromeResources,
         metrics: RenderMetrics,
     ) -> Result<(), String> {
-        let config = MagnifierConfig::default().scaled(metrics.dpi);
+        let config = MagnifierConfig::with_zoom(view.magnifier_zoom).scaled(metrics.dpi);
         let geometry = crate::capture::geometry::magnifier_geometry(
             view.cursor,
             config,
@@ -804,7 +812,9 @@ impl OverlayRenderer {
         let dark = &resources.magnifier_info;
         let white = &resources.label_text;
         let panel = geometry.panel;
-        let zoom = geometry.zoom as i32;
+        let zoom = geometry.zoom; // f32: physical pixels per source pixel
+        // Convert a source-pixel delta to a panel-pixel delta.
+        let z2p = |src_delta: i32| (src_delta as f32 * zoom).round() as i32;
 
         // Rounded-corner clip: PushLayer with a geometric mask clips all content
         // to a rounded rectangle, giving the panel the soft-cornered look.
@@ -850,16 +860,21 @@ impl OverlayRenderer {
             let visible_source = geometry.source.intersect(view.frame);
             if !visible_source.is_empty() {
                 let visible_panel = Rect::new(
-                    panel.left + (visible_source.left - geometry.source.left) * zoom,
-                    panel.top + (visible_source.top - geometry.source.top) * zoom,
-                    panel.left + (visible_source.right - geometry.source.left) * zoom,
-                    panel.top + (visible_source.bottom - geometry.source.top) * zoom,
+                    panel.left + z2p(visible_source.left - geometry.source.left),
+                    panel.top + z2p(visible_source.top - geometry.source.top),
+                    panel.left + z2p(visible_source.right - geometry.source.left),
+                    panel.top + z2p(visible_source.bottom - geometry.source.top),
                 );
+                let interp = if zoom < 1.0 {
+                    D2D1_INTERPOLATION_MODE_LINEAR
+                } else {
+                    D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR
+                };
                 self.d2d.DrawBitmap(
                     bitmap,
                     Some(&to_d2d(visible_panel)),
                     1.0,
-                    D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                    interp,
                     Some(&to_d2d(visible_source)),
                     None,
                 );
@@ -870,25 +885,26 @@ impl OverlayRenderer {
             // the panel's own centre cell, never translated aside at an edge.
             let half_w = (geometry.source.width() / 2).max(0);
             let half_h = (geometry.source.height() / 2).max(0);
-            let center_x = panel.left + half_w * zoom;
-            let center_y = panel.top + half_h * zoom;
-            let center_cell = Rect::from_origin_size(Point::new(center_x, center_y), zoom, zoom);
+            let center_x = panel.left + z2p(half_w);
+            let center_y = panel.top + z2p(half_h);
+            let cell_size = z2p(1).max(1);
+            let center_cell = Rect::from_origin_size(Point::new(center_x, center_y), cell_size, cell_size);
 
             // Light-blue crosshair bands through the sampled pixel's whole row
             // and column: the eye follows them to the cell even before the ring.
             self.d2d.FillRectangle(
-                &to_d2d(Rect::new(panel.left, center_y, panel.right, center_y + zoom)),
+                &to_d2d(Rect::new(panel.left, center_y, panel.right, center_y + cell_size)),
                 band,
             );
             self.d2d.FillRectangle(
-                &to_d2d(Rect::new(center_x, panel.top, center_x + zoom, panel.bottom)),
+                &to_d2d(Rect::new(center_x, panel.top, center_x + cell_size, panel.bottom)),
                 band,
             );
 
             // Pixel grid: only at zoom >= 4 where each cell is wide enough to
             // render legibly. Integer-aligned to avoid sub-pixel blur.
-            if geometry.zoom >= 4 {
-                let step = geometry.zoom as f32;
+            if geometry.zoom >= 4.0 {
+                let step = geometry.zoom;
                 // Vertical separators: one between each pair of columns.
                 for index in 1..geometry.source.width() {
                     let x = panel.left as f32 + index as f32 * step + 0.5;
@@ -917,6 +933,46 @@ impl OverlayRenderer {
             // reads on light and dark content alike.
             self.d2d.FillRectangle(&to_d2d(center_cell), white);
             self.d2d.DrawRectangle(&to_d2d(center_cell), dark, 1.0, None);
+
+            // ── Zoom badge (top-right corner of the loupe panel) ──
+            {
+                let badge_scale = metrics.dpi.max(96) as f32 / 96.0;
+                let badge_font_sz = 14.0 * badge_scale;
+                let badge_pad_h = 8.0 * badge_scale;
+                let badge_pad_v = 5.0 * badge_scale;
+                let badge_inset = 6.0 * badge_scale;
+                let badge_radius = 6.0 * badge_scale;
+                let label = if zoom >= 10.0 {
+                    format!("{:.0}x", zoom)
+                } else if zoom >= 1.0 {
+                    let r = zoom.round();
+                    if (zoom - r).abs() < 0.01 { format!("{:.0}x", r) } else { format!("{:.1}x", zoom) }
+                } else {
+                    format!("{:.1}x", zoom)
+                };
+                let badge_fmt = self.info_text_format_mut(false, 14.0, DWRITE_FONT_WEIGHT_BOLD, true)?;
+                let text_w = self.measure_text_width_in(&label, &badge_fmt)?;
+                let bw = text_w + badge_pad_h * 2.0;
+                let bh = badge_font_sz + badge_pad_v * 2.0;
+                let badge_rect = D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: panel.right as f32 - badge_inset - bw,
+                        top: panel.top as f32 + badge_inset,
+                        right: panel.right as f32 - badge_inset,
+                        bottom: panel.top as f32 + badge_inset + bh,
+                    },
+                    radiusX: badge_radius,
+                    radiusY: badge_radius,
+                };
+                let badge_bg = self.require_brush(&self.info_badge_bg_brush, "zoom badge bg")?;
+                self.d2d.FillRoundedRectangle(&badge_rect, &badge_bg);
+                let wide = label.encode_utf16().collect::<Vec<u16>>();
+                self.d2d.DrawText(
+                    &wide, &badge_fmt, &badge_rect.rect,
+                    white, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL,
+                );
+            }
+
             self.d2d.PopAxisAlignedClip();
 
             // ── Info panel: two-column glass layout ──
@@ -1023,7 +1079,7 @@ impl OverlayRenderer {
             let content_r = info.right as f32 - pad_h;
             let kbd_col_x = content_r - kbd_col_w;
             let left_col_right = kbd_col_x - lr_gap;
-            let kbd_col_h = kbd_line_h * 3.0 + kbd_row_gap * 2.0;
+            let kbd_col_h = kbd_line_h * 4.0 + kbd_row_gap * 3.0;
             let kbd_col_top = content_top + (content_h - kbd_col_h) / 2.0;
 
             // ---- Row 1 (left): colour swatch + S-cycled colour value ----
@@ -1145,7 +1201,12 @@ impl OverlayRenderer {
             // `info_text_format_mut`.
             let hint_format = self.info_text_format_mut(false, INFO_HINT_FONT_DIP, DWRITE_FONT_WEIGHT_NORMAL, false)?;
             let hint_centered = self.info_text_format_mut(false, INFO_HINT_FONT_DIP, DWRITE_FONT_WEIGHT_NORMAL, true)?;
-            let hints: &[(&str, &str)] = &[("S", "色值格式"), ("C", "复制色值"), ("P", "坐标模式")];
+            let hints: &[(&str, &str)] = &[
+                ("S", "色值格式"),
+                ("C", "复制色值"),
+                ("P", "坐标模式"),
+                ("Z", "滚轮缩放"),
+            ];
             for (i, (key, desc)) in hints.iter().enumerate() {
                 let row_y = kbd_col_top + i as f32 * (kbd_line_h + kbd_row_gap);
                 let key_w = self.measure_text_width_in(key, &hint_format)?;
@@ -1605,6 +1666,9 @@ impl OverlayRenderer {
         }
         self.blur_effect = Some(blur);
         self.info_tint_brush = Some(self.create_brush(&color(0.07, 0.07, 0.08, 0.48))?);
+        self.info_badge_bg_brush = Some(self.create_brush(&color(
+            60.0 / 255.0, 60.0 / 255.0, 60.0 / 255.0, 0.82,
+        ))?);
         // Annotation brushes: initialised to accent blue; colour set per-item at draw time.
         self.ann_stroke_brush = Some(self.create_brush(&color(0.0, 0.47, 0.83, 1.0))?);
         self.ann_fill_brush = Some(self.create_brush(&color(0.0, 0.0, 0.0, 0.0))?);
@@ -1647,6 +1711,7 @@ impl OverlayRenderer {
         self.info_swatch_fill_brush = None;
         self.blur_effect = None;
         self.info_tint_brush = None;
+        self.info_badge_bg_brush = None;
         self.ann_stroke_brush = None;
         self.ann_fill_brush = None;
     }

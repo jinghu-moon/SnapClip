@@ -44,8 +44,8 @@ use windows_sys::Win32::{
             PostThreadMessageW, RegisterClassW, SW_HIDE, SW_SHOW, SetForegroundWindow,
             SetWindowPos, SetTimer, KillTimer,
             ShowWindow, TranslateMessage, UnregisterClassW, WM_APP, WM_DESTROY, WM_DEVICECHANGE,
-            WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN,
-            WM_SETFOCUS, WM_LBUTTONDOWN,
+            WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP,
+            WM_MOUSEWHEEL, WM_SETFOCUS, WM_LBUTTONDOWN,
             WM_MOUSEACTIVATE,
             WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_RBUTTONDOWN,
             WM_SETCURSOR, WM_TIMER, WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW,
@@ -382,6 +382,10 @@ where
     magnifier_color_format: ColorFormat,
     /// When true the info-panel coordinate is relative to the selection origin (P toggle).
     magnifier_relative: bool,
+    /// Current loupe zoom (`Z` + wheel). `0.1..=40.0`.
+    magnifier_zoom: f32,
+    /// Whether the `Z` key is currently held (gates wheel-to-zoom).
+    z_held: bool,
     /// The GPU slot index of the most recent async sample request.
     sample_slot: Option<usize>,
     /// Object-based annotation document (L2 layer).
@@ -436,6 +440,8 @@ where
             sampler: ColorSampler::new(),
             magnifier_color_format: ColorFormat::default(),
             magnifier_relative: false,
+            magnifier_zoom: MagnifierConfig::ZOOM_DEFAULT,
+            z_held: false,
             sample_slot: None,
             annotation_doc: AnnotationDocument::new(),
             annotation_tool: None,
@@ -824,6 +830,8 @@ where
         self.sampler.reset();
         self.magnifier_color_format = ColorFormat::default();
         self.magnifier_relative = false;
+        self.magnifier_zoom = MagnifierConfig::ZOOM_DEFAULT;
+        self.z_held = false;
         self.sample_slot = None;
         self.annotation_doc.reset();
         self.annotation_tool = None;
@@ -894,6 +902,7 @@ where
                 magnifier_rgb: None,
                 magnifier_color_text: None,
                 magnifier_relative: false,
+                magnifier_zoom: self.magnifier_zoom,
                 annotation_items: self.annotation_doc.items().to_vec(),
                 annotation_selected_id: None,
                 annotation_draft: None,
@@ -1050,7 +1059,7 @@ where
         let Some(gpu_frame) = frozen.texture() else { return; };
         let texture = gpu_frame.texture.clone();
         let dpi = renderer.layout().dpi;
-        let config = MagnifierConfig::default().scaled(dpi);
+        let config = MagnifierConfig::with_zoom(self.magnifier_zoom).scaled(dpi);
         let geometry = magnifier_geometry(
             self.cursor,
             config,
@@ -1261,6 +1270,13 @@ where
                 if is_active {
                     self.magnifier_relative = !self.magnifier_relative;
                     self.invalidate();
+                }
+            }
+            // 'Z': held-key gate for wheel-to-zoom. Consumed only as a mode
+            // flag; the actual zoom change happens in WM_MOUSEWHEEL.
+            k if k == b'Z' as u32 => {
+                if is_active {
+                    self.z_held = true;
                 }
             }
             _ if state == CaptureState::Annotating => self.on_annotation_key(key),
@@ -1617,6 +1633,7 @@ where
             magnifier_rgb: self.sampler.rgb(),
             magnifier_color_text: self.sampler.formatted(self.magnifier_color_format),
             magnifier_relative: self.magnifier_relative,
+            magnifier_zoom: self.magnifier_zoom,
             annotation_items: self.annotation_doc.items().to_vec(),
             annotation_selected_id: self.annotation_doc.selected_id(),
             annotation_draft: self.annotation_doc.draft.clone(),
@@ -1732,6 +1749,31 @@ where
                 };
                 self.on_key_down(vk);
                 Some(0)
+            }
+            WM_KEYUP => {
+                let raw_vk = wparam as u32;
+                let vk = if raw_vk == 0xE5 {
+                    let scan = ((lparam as u32) >> 16) & 0xFF;
+                    let mapped = unsafe { MapVirtualKeyW(scan, MAPVK_VSC_TO_VK) };
+                    if mapped != 0 { mapped } else { raw_vk }
+                } else {
+                    raw_vk
+                };
+                if vk == b'Z' as u32 {
+                    self.z_held = false;
+                }
+                None
+            }
+            WM_MOUSEWHEEL => {
+                if self.z_held && self.session.state().is_active() {
+                    let delta = ((wparam >> 16) & 0xFFFF) as u16 as i16;
+                    let direction = if delta > 0 { 1 } else { -1 };
+                    self.magnifier_zoom = MagnifierConfig::zoom_step(self.magnifier_zoom, direction);
+                    self.invalidate();
+                    Some(0)
+                } else {
+                    None
+                }
             }
             WM_SETFOCUS => {
                 self.disable_ime_for_overlay();

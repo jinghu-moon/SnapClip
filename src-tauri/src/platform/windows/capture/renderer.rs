@@ -34,6 +34,8 @@ pub struct OverlayFrameState {
     pub magnifier_color_text: Option<String>,
     /// Info-panel coordinate is relative to the selection origin (P toggle).
     pub magnifier_relative: bool,
+    /// Current loupe zoom (`Z` + wheel). `0.1..=40.0`.
+    pub magnifier_zoom: f32,
     // ── Annotations ───────────────────────────────────────────────────────────
     /// Committed annotation items to render at L2 (after mask, before chrome).
     pub annotation_items: Vec<AnnotationItem>,
@@ -53,6 +55,7 @@ impl OverlayFrameState {
             magnifier_rgb: None,
             magnifier_color_text: None,
             magnifier_relative: false,
+            magnifier_zoom: 20.0,
             annotation_items: Vec::new(),
             annotation_selected_id: None,
             annotation_draft: None,
@@ -180,6 +183,7 @@ impl Win32Renderer {
             magnifier_rgb: state.magnifier_rgb,
             magnifier_color_text: state.magnifier_color_text.clone(),
             magnifier_relative: state.magnifier_relative,
+            magnifier_zoom: state.magnifier_zoom,
             annotation_items: live_items,
             annotation_selected_id: live_selected,
             annotation_draft: live_draft,
@@ -214,6 +218,7 @@ impl Win32Renderer {
             magnifier_rgb: None,
             magnifier_color_text: None,
             magnifier_relative: false,
+            magnifier_zoom: 20.0,
             annotation_items: live_items,
             annotation_selected_id: None,
             annotation_draft: None,

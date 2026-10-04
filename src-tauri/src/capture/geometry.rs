@@ -566,7 +566,7 @@ fn clamp_edges(rect: Rect, bounds: Rect) -> Rect {
 }
 
 /// Where the magnifier panel is drawn, in monitor-local physical pixels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MagnifierGeometry {
     /// Image area containing the magnified frame.
     pub panel: Rect,
@@ -580,8 +580,9 @@ pub struct MagnifierGeometry {
     /// cell; the renderer clips it against the real bitmap bounds instead of
     /// translating the whole rect.
     pub source: Rect,
-    /// Currently active zoom level.
-    pub zoom: u32,
+    /// Currently active zoom level (physical pixels per source pixel; < 1 means
+    /// the loupe is downscaling).
+    pub zoom: f32,
     /// Whether the panel was flipped horizontally / vertically to stay visible.
     pub flipped_x: bool,
     pub flipped_y: bool,
@@ -597,9 +598,9 @@ pub struct MagnifierGeometry {
 /// `tile_size` are in physical pixels and are **not** scaled by DPI — the
 /// magnifier works on raw pixel grid. Only `gap` and `info_height` scale so that
 /// text and spacing remain legible at high DPI.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MagnifierConfig {
-    pub zoom: u32,
+    pub zoom: f32,
     /// Columns of the magnifier source window (15 default → vertical band lands
     /// on column 8, the exact centre).
     pub source_width: i32,
@@ -623,7 +624,7 @@ impl Default for MagnifierConfig {
             // physical-pixel display; a 15×9 source window (135 cells) keeps the
             // sampled pixel exactly on column 8 / row 5 — the panel's centre —
             // while giving a wide, letterbox-shaped loupe (300×180 physical px).
-            zoom: 20,
+            zoom: Self::ZOOM_DEFAULT,
             source_width: 15,
             source_height: 9,
             tile_size: 32,
@@ -634,6 +635,68 @@ impl Default for MagnifierConfig {
 }
 
 impl MagnifierConfig {
+    /// Physical width/height the loupe panel keeps at every zoom step. The
+    /// source window is derived from these so the loupe never visually jumps
+    /// when the user adjusts zoom (`Z` + wheel) — only the pixel grid density
+    /// changes.
+    pub const PANEL_WIDTH_PHYSICAL: i32 = 300;
+    pub const PANEL_HEIGHT_PHYSICAL: i32 = 180;
+    pub const ZOOM_DEFAULT: f32 = 20.0;
+    pub const ZOOM_MIN: f32 = 0.1;
+    pub const ZOOM_MAX: f32 = 40.0;
+
+    /// Predefined zoom ladder — 17 stops from 0.1× to 40×.
+    /// Wheel up advances, wheel down retreats.
+    pub const ZOOM_LEVELS: &'static [f32] = &[
+        0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 10.0, 15.0, 20.0, 30.0,
+        40.0,
+    ];
+
+    /// Return the next higher (or lower) zoom stop from `current`.
+    /// `direction > 0` → up, `direction < 0` → down, 0 → unchanged.
+    pub fn zoom_step(current: f32, direction: i32) -> f32 {
+        if direction == 0 {
+            return current;
+        }
+        let levels = Self::ZOOM_LEVELS;
+        let idx = levels
+            .iter()
+            .position(|&z| (z - current).abs() < f32::EPSILON)
+            .unwrap_or_else(|| {
+                // Nearest stop if current is off-ladder.
+                levels
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| {
+                        ((**a - current).abs()).partial_cmp(&(**b - current).abs()).unwrap()
+                    })
+                    .map(|(i, _)| i)
+                    .unwrap_or(0)
+            });
+        if direction > 0 {
+            levels[idx.saturating_add(1).min(levels.len() - 1)]
+        } else {
+            levels[idx.saturating_sub(1)]
+        }
+    }
+
+    /// Build a config for a specific `zoom` level while keeping the loupe panel
+    /// at [`Self::PANEL_WIDTH_PHYSICAL`] × [`Self::PANEL_HEIGHT_PHYSICAL`].
+    /// The source window is `panel / zoom`, floored and clamped to at least
+    /// 1 cell; the panel's actual physical size may drift by up to
+    /// `zoom - 1` pixels due to integer rounding — imperceptible in practice.
+    pub fn with_zoom(zoom: f32) -> Self {
+        let zoom = zoom.clamp(Self::ZOOM_MIN, Self::ZOOM_MAX);
+        let source_width = ((Self::PANEL_WIDTH_PHYSICAL as f32 / zoom).round() as i32).max(1);
+        let source_height = ((Self::PANEL_HEIGHT_PHYSICAL as f32 / zoom).round() as i32).max(1);
+        Self {
+            zoom,
+            source_width,
+            source_height,
+            ..Self::default()
+        }
+    }
+
     /// Scale only DPI-dependent fields. Source and tile are fixed physical pixels.
     pub fn scaled(&self, dpi: u32) -> Self {
         let scale = dpi.max(96) as f32 / 96.0;
@@ -648,15 +711,16 @@ impl MagnifierConfig {
     }
 
     /// Physical pixel width of the magnified image panel.
+    ///
+    /// Always returns the fixed target; the source window adapts to zoom,
+    /// not the other way around.
     pub fn panel_width(&self) -> i32 {
-        let zoom = self.zoom.max(1) as i32;
-        self.source_width.max(1).saturating_mul(zoom)
+        Self::PANEL_WIDTH_PHYSICAL
     }
 
     /// Physical pixel height of the magnified image panel.
     pub fn panel_height(&self) -> i32 {
-        let zoom = self.zoom.max(1) as i32;
-        self.source_height.max(1).saturating_mul(zoom)
+        Self::PANEL_HEIGHT_PHYSICAL
     }
 }
 
@@ -677,7 +741,7 @@ pub fn magnifier_geometry(
     frame: Rect,
     work_area: Rect,
 ) -> MagnifierGeometry {
-    let zoom = config.zoom.max(1);
+    let zoom = config.zoom.max(0.1);
     let panel_w = config.panel_width().max(1);
     let panel_h = config.panel_height().max(1);
     let source_width = config.source_width.max(1);
@@ -1148,7 +1212,7 @@ mod tests {
         assert_eq!(geometry.panel.height(), config.panel_height());
         assert_eq!(geometry.panel.width(), geometry.source.width() * geometry.zoom as i32);
         assert_eq!(geometry.panel.height(), geometry.source.height() * geometry.zoom as i32);
-        assert_eq!(geometry.zoom, 20);
+        assert_eq!(geometry.zoom, 20.0);
         // A 15×9 window is odd in both axes, so the cursor's own pixel is the
         // exact centre cell: column 8 of 15, row 5 of 9 (1-based).
         assert_eq!(config.source_width, 15);
