@@ -9,7 +9,7 @@
 //! provider that has already hung is how a selector turns into a freeze, and the design
 //! budgets for exactly that (docs/18 §3).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use ::windows::Win32::Foundation::{HWND, RECT};
 use ::windows::Win32::System::Com::{
@@ -25,7 +25,7 @@ use crate::capture::window_detection::deep::{
     DeepSelectionProvider, DeepTarget, QueryControl, RefinementJob, RefinementOutcome,
     StopReason,
 };
-use crate::capture::window_detection::model::TargetKind;
+use crate::capture::window_detection::model::{SnapshotEpoch, TargetKind};
 use crate::capture::window_detection::uia::{
     WalkBudget, WalkNode, WalkOutcome, is_descendable,
 };
@@ -37,9 +37,25 @@ pub struct UiaDeepSelectionProvider {
     /// Batched property request: one cross-process call per level instead of four per node
     /// (docs/18 §11). Built lazily on the refinement thread.
     cache: Option<IUIAutomationCacheRequest>,
+    /// Expanded children per (window, parent bounds).
+    ///
+    /// Moving between controls of one window walks the same upper levels over and over;
+    /// remembering them turns a repeat query into "fetch the deepest level only" instead of
+    /// "walk from the window root again" (docs/18 §11 ②). The whole table is dropped when the
+    /// snapshot generation changes, so no stale geometry can be served.
+    children: HashMap<NodeKey, Vec<(IUIAutomationElement, WalkNode)>>,
+    /// Snapshot generation the table belongs to.
+    cache_epoch: Option<SnapshotEpoch>,
     /// Windows whose provider failed; skipped until the next snapshot generation.
     quarantined: HashSet<isize>,
 }
+
+/// Identity of one expanded node: window handle plus its screen rectangle.
+///
+/// Bounds are the practical identity here — two different elements of one window sharing the
+/// same rectangle are interchangeable for a hit test, and the reference selector treats
+/// same-bounds containers the same way.
+type NodeKey = (isize, i32, i32, i32, i32);
 
 impl UiaDeepSelectionProvider {
     pub fn new() -> Self {
@@ -101,33 +117,73 @@ impl UiaDeepSelectionProvider {
         Some(WalkNode::new(bounds, control_type, offscreen, true))
     }
 
-    /// The smallest descendable child of `parent` that contains `point`.
+    /// Drop the expanded-children table when the snapshot generation moved on.
+    fn sync_cache_epoch(&mut self, epoch: SnapshotEpoch) {
+        if self.cache_epoch != Some(epoch) {
+            self.children.clear();
+            self.cache_epoch = Some(epoch);
+        }
+    }
+
+    /// Fetch one node's direct children, with their properties already populated.
     ///
-    /// One `BuildUpdatedCache` + one `GetCachedChildren` probe the whole level, and the
-    /// per-child geometry reads are then in-process (docs/18 §11). The raw view is used so
-    /// structural containers are seen; the policy decides which of them may be entered.
-    fn best_child(
+    /// One `BuildUpdatedCache` + one `GetCachedChildren` probe the whole level; the per-child
+    /// geometry reads are then in-process (docs/18 §11 ①).
+    fn expand(
         request: &IUIAutomationCacheRequest,
         parent: &IUIAutomationElement,
-        parent_bounds: Rect,
-        point: Point,
-        budget: &mut WalkBudget,
-    ) -> Option<(IUIAutomationElement, WalkNode)> {
-        let parent = unsafe { parent.BuildUpdatedCache(request) }.ok()?;
-        let children = unsafe { parent.GetCachedChildren() }.ok()?;
-        let count = unsafe { children.Length() }.ok()?.max(0) as usize;
-        let mut best: Option<(IUIAutomationElement, WalkNode)> = None;
+    ) -> Vec<(IUIAutomationElement, WalkNode)> {
+        let Ok(parent) = (unsafe { parent.BuildUpdatedCache(request) }) else {
+            return Vec::new();
+        };
+        let Ok(children) = (unsafe { parent.GetCachedChildren() }) else {
+            return Vec::new();
+        };
+        let count = unsafe { children.Length() }.ok().unwrap_or(0).max(0) as usize;
+        let mut expanded = Vec::with_capacity(count);
         for index in 0..count {
-            if !budget.take_node() {
-                break;
-            }
             let Ok(child) = (unsafe { children.GetElement(index as i32) }) else {
                 continue;
             };
             let Some(node) = Self::cached_node(&child) else {
                 continue;
             };
-            if !is_descendable(parent_bounds, node) || !node.bounds.contains(point) {
+            expanded.push((child, node));
+        }
+        expanded
+    }
+
+    /// The smallest descendable child of a node that contains `point`.
+    ///
+    /// Children are read from the per-window table when that level was already expanded, so
+    /// moving between controls of one window only pays for the levels it has not seen yet.
+    fn best_child(
+        &mut self,
+        hwnd: isize,
+        request: &IUIAutomationCacheRequest,
+        parent: &IUIAutomationElement,
+        parent_bounds: Rect,
+        point: Point,
+        budget: &mut WalkBudget,
+    ) -> Option<(IUIAutomationElement, WalkNode)> {
+        let key: NodeKey = (
+            hwnd,
+            parent_bounds.left,
+            parent_bounds.top,
+            parent_bounds.right,
+            parent_bounds.bottom,
+        );
+        if !self.children.contains_key(&key) {
+            let expanded = Self::expand(request, parent);
+            self.children.insert(key, expanded);
+        }
+        let children = self.children.get(&key)?;
+        let mut best: Option<(IUIAutomationElement, WalkNode)> = None;
+        for (child, node) in children {
+            if !budget.take_node() {
+                break;
+            }
+            if !is_descendable(parent_bounds, *node) || !node.bounds.contains(point) {
                 continue;
             }
             let smaller = best
@@ -135,10 +191,22 @@ impl UiaDeepSelectionProvider {
                 .map(|(_, current)| node.bounds.area() < current.bounds.area())
                 .unwrap_or(true);
             if smaller {
-                best = Some((child, node));
+                best = Some((child.clone(), *node));
             }
         }
         best
+    }
+
+    /// Number of expanded levels held for the current generation (diagnostics and tests).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn cached_levels(&self) -> usize {
+        self.children.len()
+    }
+
+    /// Snapshot generation the expanded levels belong to (diagnostics and tests).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn cached_epoch(&self) -> Option<SnapshotEpoch> {
+        self.cache_epoch
     }
 }
 
@@ -177,6 +245,8 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
         let Some(request) = self.cache_request().cloned() else {
             return RefinementOutcome::Target(Box::new(finish(outcome, job)));
         };
+        // Expanded levels are only valid for the snapshot generation they were read in.
+        self.sync_cache_epoch(job.epoch);
 
         let mut budget = WalkBudget::new();
         let mut current = root;
@@ -191,7 +261,14 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
                 break;
             }
             let Some((child, node)) =
-                Self::best_child(&request, &current, current_bounds, job.point, &mut budget)
+                self.best_child(
+                    job.window.hwnd,
+                    &request,
+                    &current,
+                    current_bounds,
+                    job.point,
+                    &mut budget,
+                )
             else {
                 break;
             };
@@ -207,6 +284,9 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
     fn release(&mut self) {
         // Quarantine lasts exactly one snapshot generation; a rebuilt snapshot retries.
         self.quarantined.clear();
+        // Cached geometry must not survive into a new generation either.
+        self.children.clear();
+        self.cache_epoch = None;
     }
 }
 
@@ -373,5 +453,56 @@ mod tests {
         assert!(!target.screen_bounds.is_empty());
         // The published rectangle must be inside the window's visible area.
         assert!(!target.screen_bounds.intersect(bounds).is_empty());
+    }
+
+    #[test]
+    fn expanded_levels_are_reused_within_a_generation_and_dropped_across_them() {
+        let Some(fixture) = FixtureWindow::create() else {
+            eprintln!("skipping: no interactive window station available");
+            return;
+        };
+        let mut provider = UiaDeepSelectionProvider::new();
+        if provider.automation().is_none() {
+            eprintln!("skipping: UI Automation is unavailable in this environment");
+            return;
+        }
+        let bounds = Rect::new(200, 200, 560, 460);
+        let control = QueryControl::refinement(&|| false);
+
+        let _ = provider.resolve(&job(fixture.handle(), Point::new(280, 280)), bounds, &control);
+        let expanded = provider.cached_levels();
+        assert_eq!(provider.cached_epoch(), Some(1));
+        if expanded == 0 {
+            // A window whose tree UIA exposes nothing has no level to cache; the reuse rule
+            // then simply has nothing to do.
+            return;
+        }
+
+        // Same generation, another control: the already-walked upper levels are reused, so
+        // the table does not grow by re-fetching them.
+        let _ = provider.resolve(&job(fixture.handle(), Point::new(300, 300)), bounds, &control);
+        assert_eq!(
+            provider.cached_epoch(),
+            Some(1),
+            "the same generation keeps its table"
+        );
+        assert!(
+            provider.cached_levels() >= expanded,
+            "a second query may add levels but never loses the cached ones"
+        );
+
+        // A rebuilt snapshot invalidates the table before anything else happens.
+        let mut next = job(fixture.handle(), Point::new(280, 280));
+        next.epoch = 2;
+        let _ = provider.resolve(&next, bounds, &control);
+        assert_eq!(
+            provider.cached_epoch(),
+            Some(2),
+            "the table is rebuilt for the new generation"
+        );
+        assert!(
+            provider.cached_levels() <= expanded,
+            "levels from the previous generation cannot survive"
+        );
     }
 }

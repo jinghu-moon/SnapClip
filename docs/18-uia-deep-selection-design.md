@@ -396,3 +396,25 @@ refinement_elapsed_us last=43398  max=61331
 
 **这 4/26 的取代率正是 ② 树缓存要解决的问题**：同一窗口内换控件时，已展开的层级本可复用，
 而现在每次都要从窗口根重新下钻，慢 provider 上就会「查一半被取代」。
+
+### ⑤ 已完成：每窗口元素树缓存
+
+`uia_provider.rs` 增加按 `(hwnd, 父节点矩形)` 索引的**已展开子节点表**：
+
+```rust
+children: HashMap<(isize, i32, i32, i32, i32), Vec<(IUIAutomationElement, WalkNode)>>
+cache_epoch: Option<SnapshotEpoch>
+```
+
+- 命中即跳过 `BuildUpdatedCache` + `GetCachedChildren`，直接用已读几何做「点内最小矩形」裁决；
+- 表按快照 epoch 失效：`resolve` 入口 `sync_cache_epoch(job.epoch)`，`release()` 整表清空；
+- 键用「父节点矩形」而非 COM 指针：同一窗口内同矩形的节点对命中测试等价，正好对上策略层
+  「同边界容器」的处理方式。
+
+单测 `expanded_levels_are_reused_within_a_generation_and_dropped_across_them`（真机夹具窗口）：
+同一代内二次查询复用已展开层级、`cached_epoch` 保持 1；把 epoch 改成 2 后表被重建、旧代层级
+不会存活。`cargo test --lib` **326 passed / 0 failed**，`cargo check --all-targets` 0 warnings。
+
+**尚未测到收益**：探针的两个停稳点分别落在**不同窗口**（depth 5 与 depth 1），不构成缓存复用场景，
+因此耗时与改造前同级（20 / 66 ms）。要量化 ② 的收益必须用**同一个深树窗口内的两个控件**——
+也就是待补的资源管理器夹具（导航窗格 / 文件列表 / 命令栏）。
