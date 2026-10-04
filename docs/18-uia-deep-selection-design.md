@@ -255,7 +255,40 @@ v1 的 `auto-snap preview` 目标行保持不变，错误 0。
 2. **结构性容器必须下钻**（与父节点同边界的 `Pane`/`Group` 不作为最终答案），这是 Chromium 系应用内容不被结构分支吞掉的前提；
 3. **离屏/退化/父框外子节点一律拒绝**，预算耗尽或路径超长 → `TraversalLimit`。
 
-**待完成**：`platform/windows/capture/uia_provider.rs` —— 在 refinement worker 线程上惰性
-`CoInitializeEx(MTA)` + `CoCreateInstance(CUIAutomation)`，`ElementFromPoint` 起手，
-用 `RawViewWalker` 按上述策略自顶向下展开，映射为 `DeepTarget`，
-失败窗口加入 quarantine（`release()` 时清空）；随后接资源管理器真机验收。
+### v2-P2 provider（本次提交）
+
+`platform/windows/capture/uia_provider.rs`：
+
+- **COM 在 refinement 线程上惰性初始化**：provider 由 worker 通过 **factory** 构造
+  （`ProviderFactory`），而不是把值搬过线程——`IUIAutomation` 不是 `Send`，且设计要求
+  apartment 对象在其使用线程上创建；
+- `ElementFromHandle(窗口)` 起手（**不**回退到 `ElementFromPoint`：查询是「关于这个窗口」的，
+  用点命中会回答到另一个窗口的几何，属于凭空捏造），失败即 quarantine 并返回 `Unsupported`；
+- `RawViewWalker` 按 §3 的策略自顶向下展开（点内最小矩形胜出、同边界容器继续下钻、
+  越界/离屏/退化子节点拒绝），受 `WalkBudget`（4096 节点 / 24 层 / 24 段路径）与
+  `QueryControl::is_cancelled` 约束；
+- 结果映射为 `DeepTarget`：`path[0]` = 窗口外框，`kind` 在真正下钻后为 `UiElement`，
+  否则保持 `TopLevelWindowFrame`（于是 overlay 按 v1 方式渲染）。
+
+真机证据（`.tmp-uia-probe.ps1`，4K/DPI144；资源管理器窗口句柄未能从 shell 进程的
+`MainWindowHandle` 取到，故先落在屏幕中央的最大化真实窗口上）：
+
+```text
+refinement submit hwnd=5967024 point=(1257,173) epoch=1
+refinement hwnd=5967024 elapsed_us=22118 reason=Complete          # 首次查询 22 ms（含 COM 初始化）
+refinement published hwnd=5967024 bounds=(0,47)->(3840,2088) depth=4 reason=Complete
+```
+
+`depth=4` 说明路径是「窗口外框 → … → 元素」四层；发布矩形 `(0,47)` 比窗口帧 `(0,0)` 内缩 47px，
+即解析到了窗口内的内容区而不是回退整窗；`reason=Complete`。第二次停稳**没有**再触发查询，
+说明「完整缓存路径内移动不得触碰 refinement worker」在生产路径上生效。
+
+### 待完成
+
+| 项目 | 说明 |
+| --- | --- |
+| 资源管理器专项验收 | 探针未能从 `explorer.exe` 的 `MainWindowHandle` 取到 shell 窗口句柄（返回 0 或桌面窗口）；需要改为 `EnumWindows` + 类名 `CabinetWClass` 枚举，再分别验证导航窗格 / 文件列表 / 命令栏三个停稳点的 `path` 深度与 `stop_reason` |
+| 批次缓存 | 当前每次查询重新下钻；§3 要求的「按需展开一层 sibling + 批次缓存」尚未实现，`release()` 目前只清 quarantine |
+| v2-P3 MSAA 回退 | 未开始 |
+| v2-P4 overlay 层级路径渲染 | 预览矩形已跟随深选结果，但 `path` 的逐层描边未画 |
+| v2-P5 性能与验收 | UIA 单次查询 22 ms（首次，含 COM 初始化）已测得；延迟分布与 quarantine 命中率待实测 |

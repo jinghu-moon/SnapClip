@@ -23,9 +23,16 @@ use crate::capture::diagnostics::WindowDetectionMetrics;
 use crate::capture::geometry::{Point, Rect};
 use crate::capture::window_detection::deep::{
     DeepSelectionProvider, QueryControl, RefinementJob, RefinementOutcome,
-    UnsupportedDeepSelection,
 };
 use crate::capture::window_detection::model::{RequestGate, RequestId, SnapshotEpoch, WindowIdentity};
+
+use super::uia_provider::UiaDeepSelectionProvider;
+
+/// Creates the provider **on the refinement thread**.
+///
+/// A value could not be moved across: COM interfaces are not `Send`, and the design requires
+/// apartment-bound objects to be born on the thread that uses them (docs/18 §5).
+pub type ProviderFactory = Box<dyn FnOnce() -> Box<dyn DeepSelectionProvider> + Send>;
 
 /// Posted to the overlay thread when a refinement result is waiting.
 pub const REFINEMENT_READY_MESSAGE: u32 = WM_APP + 44;
@@ -74,19 +81,23 @@ pub struct RefinementWorker {
 }
 
 impl RefinementWorker {
-    /// Start the worker with the placeholder provider.
+    /// Start the worker with the real UIA provider.
     ///
-    /// Until v2-P2 supplies the UIA provider this reports `Unsupported`, which the overlay
-    /// answers by keeping the v1 whole-window frame.
+    /// If UI Automation is unavailable the provider reports `Unsupported` per query and the
+    /// overlay keeps the v1 whole-window frame.
     pub fn new(notify_thread: u32, metrics: WindowDetectionMetrics) -> Self {
-        Self::with_provider(notify_thread, metrics, Box::new(UnsupportedDeepSelection))
+        Self::with_provider(
+            notify_thread,
+            metrics,
+            Box::new(|| Box::new(UiaDeepSelectionProvider::new())),
+        )
     }
 
-    /// Start the worker with an explicit provider.
+    /// Start the worker with an explicit provider factory (tests inject fakes this way).
     pub fn with_provider(
         notify_thread: u32,
         metrics: WindowDetectionMetrics,
-        provider: Box<dyn DeepSelectionProvider>,
+        factory: ProviderFactory,
     ) -> Self {
         let shared = Arc::new(Shared {
             notify_thread,
@@ -101,7 +112,7 @@ impl RefinementWorker {
         let worker_metrics = metrics.clone();
         let thread = std::thread::Builder::new()
             .name("snapclip-refinement".into())
-            .spawn(move || run(worker_shared, worker_metrics, provider))
+            .spawn(move || run(worker_shared, worker_metrics, factory))
             .ok();
         Self {
             shared,
@@ -194,8 +205,10 @@ impl Drop for RefinementWorker {
 fn run(
     shared: Arc<Shared>,
     metrics: WindowDetectionMetrics,
-    mut provider: Box<dyn DeepSelectionProvider>,
+    factory: ProviderFactory,
 ) {
+    // Born here, on the thread that will use it: this is where COM gets initialised.
+    let mut provider = factory();
     loop {
         let job = {
             let mut pending = match shared.pending.lock() {
@@ -347,14 +360,17 @@ mod tests {
     #[test]
     fn a_query_produces_a_target_tagged_with_its_request_and_epoch() {
         let observed = Arc::new(AtomicBool::new(false));
+        let observed_for_provider = Arc::clone(&observed);
         let worker = RefinementWorker::with_provider(
             candidate_thread(),
             WindowDetectionMetrics::new(),
-            Box::new(SlowProvider {
-                delay: Duration::from_millis(1),
-                result: Some(deep(Rect::new(10, 10, 60, 40), StopReason::Complete)),
-                observed_cancel: Arc::clone(&observed),
-                calls: Arc::new(AtomicU32::new(0)),
+            Box::new(move || {
+                Box::new(SlowProvider {
+                    delay: Duration::from_millis(1),
+                    result: Some(deep(Rect::new(10, 10, 60, 40), StopReason::Complete)),
+                    observed_cancel: observed_for_provider,
+                    calls: Arc::new(AtomicU32::new(0)),
+                })
             }),
         );
         let request = worker.request(7, window(), Point::new(20, 20), Rect::new(0, 0, 100, 100));
@@ -372,14 +388,16 @@ mod tests {
     }
 
     #[test]
-    fn the_placeholder_provider_reports_unsupported() {
+    fn a_window_uia_cannot_resolve_degrades_to_unsupported() {
         let worker = RefinementWorker::new(candidate_thread(), WindowDetectionMetrics::new());
+        // A fabricated handle: no accessibility tree can be attributed to it, so the worker
+        // must report `Unsupported` and the overlay keeps the v1 frame.
         worker.request(1, window(), Point::new(5, 5), Rect::new(0, 0, 100, 100));
         let result = wait_for(&worker, Duration::from_secs(5)).expect("a result");
         assert_eq!(
             result.outcome,
             RefinementOutcome::Empty(StopReason::Unsupported),
-            "no geometry may be invented while the UIA provider is missing"
+            "no geometry may be invented for a window UIA cannot resolve"
         );
     }
 
@@ -387,14 +405,18 @@ mod tests {
     fn a_superseded_query_is_cancelled_cooperatively() {
         let observed = Arc::new(AtomicBool::new(false));
         let calls = Arc::new(AtomicU32::new(0));
+        let observed_for_provider = Arc::clone(&observed);
+        let calls_for_provider = Arc::clone(&calls);
         let worker = RefinementWorker::with_provider(
             candidate_thread(),
             WindowDetectionMetrics::new(),
-            Box::new(SlowProvider {
-                delay: Duration::from_millis(400),
-                result: Some(deep(Rect::new(10, 10, 60, 40), StopReason::Complete)),
-                observed_cancel: Arc::clone(&observed),
-                calls: Arc::clone(&calls),
+            Box::new(move || {
+                Box::new(SlowProvider {
+                    delay: Duration::from_millis(400),
+                    result: Some(deep(Rect::new(10, 10, 60, 40), StopReason::Complete)),
+                    observed_cancel: observed_for_provider,
+                    calls: calls_for_provider,
+                })
             }),
         );
         let _first = worker.request(1, window(), Point::new(20, 20), Rect::new(0, 0, 100, 100));

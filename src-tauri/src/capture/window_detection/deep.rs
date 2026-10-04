@@ -140,11 +140,11 @@ pub enum RefinementOutcome {
 
 /// Resolves the deepest element under a point inside one window (docs/18 §4).
 ///
-/// Implementations are owned by the refinement worker and run **only** on its thread, so
-/// every COM/UIA/MSAA object they create is created and dropped inside `resolve`. Nothing
-/// they produce may carry a native handle across the thread boundary — [`DeepTarget`] is
-/// plain geometry plus a stop reason for exactly that reason.
-pub trait DeepSelectionProvider: Send {
+/// Implementations are **constructed on the refinement thread** (the worker takes a factory,
+/// not a value) and run only there, so every COM/UIA/MSAA object they create is created and
+/// dropped inside `resolve`. Nothing they produce may carry a native handle across the thread
+/// boundary — [`DeepTarget`] is plain geometry plus a stop reason for exactly that reason.
+pub trait DeepSelectionProvider {
     /// Resolve `job.point` inside `window_bounds`.
     ///
     /// Must publish a partial path when the budget is exhausted or the query is cancelled,

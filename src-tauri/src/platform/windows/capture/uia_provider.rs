@@ -1,0 +1,345 @@
+//! Windows UI Automation deep-selection provider (docs/18 §4).
+//!
+//! Everything COM-related lives inside this file and runs on the refinement worker thread:
+//! the automation object is created lazily on first use (never on the overlay thread, which
+//! must not own apartment-bound objects) and only plain geometry crosses back through
+//! [`DeepTarget`].
+//!
+//! A window that fails to produce a tree is **quarantined** until `release()`: retrying a
+//! provider that has already hung is how a selector turns into a freeze, and the design
+//! budgets for exactly that (docs/18 §3).
+
+use std::collections::HashSet;
+
+use ::windows::Win32::Foundation::{HWND, RECT};
+use ::windows::Win32::System::Com::{
+    CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
+};
+use ::windows::Win32::UI::Accessibility::{
+    CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationTreeWalker,
+};
+
+use crate::capture::geometry::{Point, Rect};
+use crate::capture::window_detection::deep::{
+    DeepSelectionProvider, DeepTarget, QueryControl, RefinementJob, RefinementOutcome,
+    StopReason,
+};
+use crate::capture::window_detection::model::TargetKind;
+use crate::capture::window_detection::uia::{
+    WalkBudget, WalkNode, WalkOutcome, is_descendable,
+};
+
+/// UIA provider: resolves the deepest element inside one window.
+#[derive(Debug, Default)]
+pub struct UiaDeepSelectionProvider {
+    automation: Option<IUIAutomation>,
+    /// Windows whose provider failed; skipped until the next snapshot generation.
+    quarantined: HashSet<isize>,
+}
+
+impl UiaDeepSelectionProvider {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The automation object, created on the worker thread at first use.
+    ///
+    /// `CoInitializeEx` is allowed to fail with `RPC_E_CHANGED_MODE` when another library
+    /// already chose an apartment model for this thread; COM is initialised either way, so
+    /// the failure is ignored and only `CoCreateInstance` decides whether UIA is usable.
+    fn automation(&mut self) -> Option<&IUIAutomation> {
+        if self.automation.is_none() {
+            let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+            self.automation =
+                unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }.ok();
+        }
+        self.automation.as_ref()
+    }
+
+    /// Reduce one element to the data the traversal policy needs.
+    fn node(element: &IUIAutomationElement) -> Option<WalkNode> {
+        let bounds = unsafe { element.CurrentBoundingRectangle() }.ok()?;
+        let bounds = to_rect(bounds);
+        if bounds.is_empty() {
+            return None;
+        }
+        let control_type = unsafe { element.CurrentControlType() }.map(|kind| kind.0).unwrap_or(0);
+        let offscreen = unsafe { element.CurrentIsOffscreen() }
+            .map(|value| value.as_bool())
+            .unwrap_or(false);
+        let enabled = unsafe { element.CurrentIsEnabled() }
+            .map(|value| value.as_bool())
+            .unwrap_or(true);
+        Some(WalkNode::new(bounds, control_type, offscreen, enabled))
+    }
+
+    /// The smallest descendable child of `parent` that contains `point`.
+    ///
+    /// Children are enumerated through the **raw** view so structural containers are seen;
+    /// the policy then decides which of them may be entered (docs/18 §3).
+    fn best_child(
+        walker: &IUIAutomationTreeWalker,
+        parent: &IUIAutomationElement,
+        parent_bounds: Rect,
+        point: Point,
+        budget: &mut WalkBudget,
+    ) -> Option<(IUIAutomationElement, WalkNode)> {
+        let mut candidate = unsafe { walker.GetFirstChildElement(parent) }.ok();
+        let mut best: Option<(IUIAutomationElement, WalkNode)> = None;
+        while let Some(child) = candidate {
+            if !budget.take_node() {
+                break;
+            }
+            if let Some(node) = Self::node(&child)
+                && is_descendable(parent_bounds, node)
+                && node.bounds.contains(point)
+            {
+                let smaller = best
+                    .as_ref()
+                    .map(|(_, current)| node.bounds.area() < current.bounds.area())
+                    .unwrap_or(true);
+                if smaller {
+                    best = Some((child.clone(), node));
+                }
+            }
+            candidate = unsafe { walker.GetNextSiblingElement(&child) }.ok();
+        }
+        best
+    }
+}
+
+impl DeepSelectionProvider for UiaDeepSelectionProvider {
+    fn resolve(
+        &mut self,
+        job: &RefinementJob,
+        window_bounds: Rect,
+        control: &QueryControl<'_>,
+    ) -> RefinementOutcome {
+        if self.quarantined.contains(&job.window.hwnd) {
+            return RefinementOutcome::Empty(StopReason::Unsupported);
+        }
+        // Clone the interface pointer so the immutable borrow of `self` ends before any
+        // quarantine bookkeeping below.
+        let Some(automation) = self.automation().cloned() else {
+            self.quarantined.insert(job.window.hwnd);
+            return RefinementOutcome::Empty(StopReason::Unsupported);
+        };
+
+        let window = HWND(job.window.hwnd as *mut core::ffi::c_void);
+        // The query is *about this window*: if UIA cannot resolve the handle there is nothing
+        // truthful to publish. Falling back to a point hit test here would answer for
+        // whichever window happens to be under the cursor, i.e. invent geometry for the
+        // wrong window, so the failure is a quarantine instead.
+        let root = match unsafe { automation.ElementFromHandle(window) } {
+            Ok(element) => element,
+            Err(_) => {
+                self.quarantined.insert(job.window.hwnd);
+                return RefinementOutcome::Empty(StopReason::Unsupported);
+            }
+        };
+
+        let mut outcome = WalkOutcome::window_only(window_bounds, StopReason::Complete);
+        // The parentheses are required: a block-like expression cannot directly follow
+        // `let PATTERN =` in a let-else statement.
+        let Ok(walker) = (unsafe { automation.RawViewWalker() }) else {
+            // Without a walker we can still answer with the window frame.
+            return RefinementOutcome::Target(Box::new(finish(outcome, job)));
+        };
+
+        let mut budget = WalkBudget::new();
+        let mut current = root;
+        let mut current_bounds = window_bounds;
+        loop {
+            if control.is_cancelled() {
+                outcome.stop_reason = StopReason::Cancelled;
+                break;
+            }
+            if !budget.enter_children() {
+                outcome.stop_reason = StopReason::TraversalLimit;
+                break;
+            }
+            let Some((child, node)) =
+                Self::best_child(&walker, &current, current_bounds, job.point, &mut budget)
+            else {
+                break;
+            };
+            if !outcome.push(node.bounds) {
+                break;
+            }
+            current = child;
+            current_bounds = node.bounds;
+        }
+        RefinementOutcome::Target(Box::new(finish(outcome, job)))
+    }
+
+    fn release(&mut self) {
+        // Quarantine lasts exactly one snapshot generation; a rebuilt snapshot retries.
+        self.quarantined.clear();
+    }
+}
+
+/// Turn a bounded walk into the published target.
+fn finish(outcome: WalkOutcome, job: &RefinementJob) -> DeepTarget {
+    // `ClientArea`/`UiElement` only when the walk actually got below the window frame; a
+    // window-only answer keeps saying "whole frame" so the overlay renders it exactly like a
+    // v1 target.
+    let kind = if outcome.path.len() > 1 {
+        TargetKind::UiElement
+    } else {
+        TargetKind::TopLevelWindowFrame
+    };
+    DeepTarget {
+        window: job.window,
+        kind,
+        screen_bounds: outcome.target,
+        path: outcome.path,
+        stop_reason: outcome.stop_reason,
+    }
+}
+
+fn to_rect(rect: RECT) -> Rect {
+    Rect::new(rect.left, rect.top, rect.right, rect.bottom)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ::windows::Win32::UI::WindowsAndMessaging::{
+        DestroyWindow, DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, SW_SHOWNA, ShowWindow,
+        TranslateMessage, WS_POPUP, WS_VISIBLE, CreateWindowExW, WINDOW_EX_STYLE,
+    };
+    use ::windows::core::w;
+    use std::time::Duration;
+
+    fn job(hwnd: isize, point: Point) -> RefinementJob {
+        RefinementJob {
+            request: crate::capture::window_detection::model::RequestGate::new().issue(),
+            window: crate::capture::window_detection::model::WindowIdentity::new(hwnd, 1, 2),
+            epoch: 1,
+            point,
+        }
+    }
+
+    fn pump(millis: u64) {
+        let deadline = std::time::Instant::now() + Duration::from_millis(millis);
+        let mut message = MSG::default();
+        while std::time::Instant::now() < deadline {
+            while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+                let _ = unsafe { TranslateMessage(&message) };
+                unsafe { DispatchMessageW(&message) };
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// A real top-level window owned by this test process, so UIA has a tree to walk.
+    struct FixtureWindow(HWND);
+
+    impl FixtureWindow {
+        fn create() -> Option<Self> {
+            let window = unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("STATIC"),
+                    w!("SnapClip uia fixture"),
+                    WS_POPUP | WS_VISIBLE,
+                    140,
+                    140,
+                    360,
+                    260,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            }
+            .ok()?;
+            let _ = unsafe { ShowWindow(window, SW_SHOWNA) };
+            pump(60);
+            Some(Self(window))
+        }
+
+        fn handle(&self) -> isize {
+            self.0 .0 as isize
+        }
+    }
+
+    impl Drop for FixtureWindow {
+        fn drop(&mut self) {
+            let _ = unsafe { DestroyWindow(self.0) };
+            pump(20);
+        }
+    }
+
+    #[test]
+    fn an_unknown_window_is_quarantined_and_never_invents_geometry() {
+        let mut provider = UiaDeepSelectionProvider::new();
+        let control = QueryControl::refinement(&|| false);
+        // A fabricated handle: UIA cannot resolve it.
+        let outcome = provider.resolve(
+            &job(0xDEAD_BEEF, Point::new(10, 10)),
+            Rect::new(0, 0, 100, 100),
+            &control,
+        );
+        assert_eq!(outcome, RefinementOutcome::Empty(StopReason::Unsupported));
+        // Second attempt hits the quarantine and returns immediately.
+        assert_eq!(
+            provider.resolve(
+                &job(0xDEAD_BEEF, Point::new(10, 10)),
+                Rect::new(0, 0, 100, 100),
+                &control
+            ),
+            RefinementOutcome::Empty(StopReason::Unsupported)
+        );
+        // A new snapshot generation retries.
+        provider.release();
+        assert!(provider.quarantined.is_empty());
+    }
+
+    #[test]
+    fn a_cancelled_query_stops_before_touching_the_tree() {
+        let mut provider = UiaDeepSelectionProvider::new();
+        let control = QueryControl::refinement(&|| true);
+        // Cancellation is checked before the first descent, so an already-abandoned query
+        // must not walk (and must not publish a deep target).
+        match provider.resolve(
+            &job(0xDEAD_BEEF, Point::new(10, 10)),
+            Rect::new(0, 0, 100, 100),
+            &control,
+        ) {
+            RefinementOutcome::Empty(_) => {}
+            RefinementOutcome::Target(target) => {
+                assert_eq!(target.stop_reason, StopReason::Cancelled);
+            }
+        }
+    }
+
+    #[test]
+    fn a_real_window_yields_a_path_that_starts_at_the_window_frame() {
+        let Some(fixture) = FixtureWindow::create() else {
+            eprintln!("skipping: no interactive window station available");
+            return;
+        };
+        let mut provider = UiaDeepSelectionProvider::new();
+        if provider.automation().is_none() {
+            eprintln!("skipping: UI Automation is unavailable in this environment");
+            return;
+        }
+        let bounds = Rect::new(200, 200, 560, 460);
+        let control = QueryControl::refinement(&|| false);
+        let outcome = provider.resolve(
+            &job(fixture.handle(), Point::new(280, 280)),
+            bounds,
+            &control,
+        );
+        let RefinementOutcome::Target(target) = outcome else {
+            panic!("a live window must produce a target, got {outcome:?}");
+        };
+        assert_eq!(target.window.hwnd, fixture.handle());
+        assert_eq!(target.path[0], bounds, "the path always starts at the window frame");
+        assert_eq!(target.path.last(), Some(&target.screen_bounds));
+        assert!(!target.screen_bounds.is_empty());
+        // The published rectangle must be inside the window's visible area.
+        assert!(!target.screen_bounds.intersect(bounds).is_empty());
+    }
+}
