@@ -72,14 +72,16 @@ use crate::capture::sampler::{ColorFormat, ColorSampler};
 use crate::capture::session::{CaptureSession, ExportOutcome};
 use crate::capture::window_detection::model::RequestId;
 use crate::capture::window_detection::{
-    DEFAULT_DWELL_MS, DEFAULT_HOVER_REVALIDATE_MS, DEFAULT_SNAP_RADIUS_PX, Exclusions, GestureState,
-    HoverValidity, MoveOutcome, PressOutcome, ReleaseOutcome, WindowSnapshot, WindowTarget,
+    DEFAULT_DWELL_MS, DEFAULT_HOVER_REVALIDATE_MS, DEFAULT_SNAP_RADIUS_PX, DeepTarget, Exclusions,
+    GestureState, HoverValidity, MoveOutcome, PressOutcome, RefinementOutcome, RefinementScheduler,
+    ReleaseOutcome, WindowSnapshot, WindowTarget,
 };
 use crate::capture::{CaptureError, CaptureResult, CaptureState};
 
 use super::capture_worker::{self, CaptureWorker, StartRequest};
 use super::detection_worker::{self, DetectionResult, DetectionWorker};
 use super::export_worker::{self, ExportJob, ExportWorker};
+use super::refinement_worker::{self, RefinementWorker};
 use super::hotkey;
 use super::monitor::{self, CapturedMonitor};
 use super::providers::{FrozenFrame, FrozenFramePixels};
@@ -101,6 +103,11 @@ const DWELL_TIMER_ID: usize = 0x51_C0DF;
 /// Periodic timer that re-validates the hovered window on the detection worker
 /// (docs/14 §5.5). It only *enqueues*; the DWM read happens off this thread.
 const HOVER_TIMER_ID: usize = 0x51_C0E0;
+
+/// One-shot timer that fires once the hovered target has been still for
+/// [`crate::capture::window_detection::REFINEMENT_DWELL_MS`] (docs/18 §2). Expiry only
+/// *enqueues* a refinement query; the accessibility traversal runs on its own thread.
+const REFINEMENT_TIMER_ID: usize = 0x51_C0E1;
 /// `TrackMouseEvent` flag asking for a `WM_MOUSELEAVE` notification.
 const TME_LEAVE: u32 = 0x0000_0002;
 /// `SWP_SHOWWINDOW`.
@@ -404,6 +411,12 @@ where
     /// HWND/process exclusions the snapshot is built with (docs/14 §7).
     exclusions: Exclusions,
     detector: DetectionWorker,
+    /// v2 refinement: schedules and owns accessibility deep-selection queries
+    /// (docs/18 §2, §5). v1 never reads from it unless a path was published.
+    refine: RefinementScheduler,
+    refinement: RefinementWorker,
+    /// The published deep path, if the refinement worker produced one this session.
+    deep_target: Option<DeepTarget>,
     metrics: WindowDetectionMetrics,
     /// Dwell generation the pending timer was armed for.
     dwell_armed: Option<u64>,
@@ -462,6 +475,7 @@ where
     ) -> Self {
         let metrics = WindowDetectionMetrics::new();
         let detector = DetectionWorker::new(thread_id, metrics.clone());
+        let refinement = RefinementWorker::new(thread_id, metrics.clone());
         // The overlay must never be offered as its own snap target: it is full-screen and
         // frontmost, so a snapshot that included it would return the overlay for every
         // point (docs/14 §7, layer 2). The process exclusion is the fallback for windows
@@ -488,6 +502,9 @@ where
             hover_request: None,
             exclusions,
             detector,
+            refine: RefinementScheduler::new(),
+            refinement,
+            deep_target: None,
             metrics,
             dwell_armed: None,
             snap_radius: DEFAULT_SNAP_RADIUS_PX,
@@ -898,6 +915,10 @@ where
         self.snapshot.release();
         self.disarm_dwell();
         self.disarm_hover_timer();
+        self.refine.reset();
+        self.deep_target = None;
+        self.disarm_refinement();
+        self.refinement.retire();
         self.cursor_visible = false;
         // Stop the coalescing tick before releasing the renderer: a pending WM_TIMER
         // must not try to present into the graphics we are about to drop.
@@ -1214,6 +1235,11 @@ where
         self.dwell_armed = None;
         self.confirm_request = None;
         self.hover_request = None;
+        // v2 state is per-session too: no cached deep path, no in-flight query.
+        self.refine.reset();
+        self.deep_target = None;
+        self.disarm_refinement();
+        self.refinement.retire();
         self.snapshot.release();
         self.request_snapshot_refresh();
     }
@@ -1280,6 +1306,22 @@ where
                 false,
             );
         }
+        // v2 refinement (docs/18 §2): a hover change re-targets the deep query. The
+        // scheduler decides whether this needs a worker query at all — moving inside an
+        // already resolved path answers from cache without touching the worker.
+        let epoch = self.snapshot.epoch();
+        let actions = self
+            .refine
+            .on_cursor_moved(epoch, target.map(|target| target.identity()), screen);
+        if actions.invalidate_in_flight {
+            self.refinement.retire();
+        }
+        if actions.arm_dwell {
+            self.arm_refinement();
+        } else {
+            self.disarm_refinement();
+        }
+        self.deep_target = self.refine.cached().cloned();
         self.hover_target = target;
         self.invalidate();
     }
@@ -1314,6 +1356,9 @@ where
         let Some(armed) = self.dwell_armed.take() else {
             return;
         };
+        // `SetTimer` repeats; killing it here makes the dwell a one-shot, so a resting
+        // cursor does not keep waking the message loop every 120 ms.
+        unsafe { KillTimer(self.window, DWELL_TIMER_ID) };
         if armed != self.gesture.dwell_generation() {
             // A move slipped in between the timer firing and this handler: the position
             // the timer was armed for is gone, so nothing is previewed.
@@ -1353,7 +1398,17 @@ where
         let target = self.snapshot.nearest_target(screen, self.snap_radius);
         self.metrics.record_nearest_target(started.elapsed());
         let target = target?;
-        let local = window_rect_to_local(target.screen_bounds(), &layout);
+        // v2: when the refinement worker published a path for this window that covers the
+        // cursor, the preview follows the deepest element instead of the whole frame.
+        // Anything else — no provider, a partial path that does not cover the point, a
+        // stale window — keeps the v1 frame.
+        let bounds = match self.deep_target.as_ref() {
+            Some(deep) if deep.window == target.identity() && deep.covers(screen) => {
+                deep.screen_bounds
+            }
+            _ => target.screen_bounds(),
+        };
+        let local = window_rect_to_local(bounds, &layout);
         if local.is_empty() {
             return None;
         }
@@ -1382,8 +1437,13 @@ where
                             ),
                             false,
                         );
-        self.snapshot = snapshot;
-        self.update_hover();
+                        self.snapshot = snapshot;
+                        // A rebuilt snapshot invalidates every deep path and query
+                        // (docs/18 §2): they describe the previous generation's geometry.
+                        self.refine.on_snapshot_changed();
+                        self.deep_target = None;
+                        self.disarm_refinement();
+                        self.update_hover();
     }
                     Err(error) => {
                         eprintln!("[snapclip][capture] window snapshot failed: {error}");
@@ -1497,6 +1557,92 @@ where
             return;
         }
         self.hover_request = Some(self.detector.request_revalidate(hover));
+    }
+
+    /// Arm the one-shot refinement dwell timer for the current target.
+    fn arm_refinement(&mut self) {
+        unsafe {
+            SetTimer(
+                self.window,
+                REFINEMENT_TIMER_ID,
+                crate::capture::window_detection::REFINEMENT_DWELL_MS,
+                None,
+            )
+        };
+    }
+
+    fn disarm_refinement(&mut self) {
+        unsafe { KillTimer(self.window, REFINEMENT_TIMER_ID) };
+    }
+
+    /// The refinement dwell expired: submit a deep query if the scheduler allows one.
+    fn on_refinement_tick(&mut self) {
+        // The timer is periodic by nature; killing it here is what makes the dwell a
+        // one-shot. A new hover re-arms it.
+        unsafe { KillTimer(self.window, REFINEMENT_TIMER_ID) };
+        let Some(job) = self.refine.on_dwell_due() else {
+            return;
+        };
+        // The query needs the window frame; it comes from the same snapshot the hover came
+        // from, so a window that vanished simply skips its query.
+        let Some(bounds) = self.snapshot.find(job.window).map(|candidate| candidate.screen_bounds)
+        else {
+            self.refine.on_failure(job.request);
+            return;
+        };
+        self.metrics.log_line(
+            &format!(
+                "refinement submit hwnd={} point=({},{}) epoch={}",
+                job.window.hwnd, job.point.x, job.point.y, job.epoch
+            ),
+            false,
+        );
+        self.refinement
+            .request(job.epoch, job.window, job.point, bounds);
+    }
+
+    /// A deep-selection result arrived.
+    ///
+    /// A published path only ever *refines* the v1 whole-window target: the overlay keeps
+    /// painting the v1 frame when nothing came back, which is what makes a missing or
+    /// failing accessibility provider a degradation rather than a regression.
+    fn on_refinement_ready(&mut self) {
+        let Some(result) = self.refinement.take_result() else {
+            return;
+        };
+        match result.outcome {
+            RefinementOutcome::Target(target) => {
+                if !self
+                    .refine
+                    .on_result(result.request, result.epoch, (*target).clone())
+                {
+                    return;
+                }
+                self.metrics.log_line(
+                    &format!(
+                        "refinement published hwnd={} bounds=({},{})->({},{}) depth={} reason={:?}",
+                        target.window.hwnd,
+                        target.screen_bounds.left,
+                        target.screen_bounds.top,
+                        target.screen_bounds.right,
+                        target.screen_bounds.bottom,
+                        target.path.len(),
+                        target.stop_reason
+                    ),
+                    false,
+                );
+                self.deep_target = Some(*target);
+                self.refresh_preview_for_cursor();
+                self.invalidate_all();
+            }
+            RefinementOutcome::Empty(reason) => {
+                // Free the single-flight slot so the next dwell can try again.
+                if self.refine.on_failure(result.request) {
+                    self.metrics
+                        .log_line(&format!("refinement empty reason={reason:?}"), false);
+                }
+            }
+        }
     }
 
     fn arm_hover_timer(&mut self) {
@@ -2233,6 +2379,10 @@ where
                 self.on_detection_ready();
                 Some(0)
             }
+            refinement_worker::REFINEMENT_READY_MESSAGE => {
+                self.on_refinement_ready();
+                Some(0)
+            }
             WM_HOTKEY => {
                 if (wparam as i32) == hotkey::CAPTURE_HOTKEY_ID {
                     eprintln!("[snapclip][capture] WM_HOTKEY F5 received");
@@ -2348,6 +2498,11 @@ where
                     // Re-validate the hovered window on the detection worker; this thread
                     // only enqueues (docs/14 §5.5).
                     self.on_hover_tick();
+                    Some(0)
+                } else if (wparam as usize) == REFINEMENT_TIMER_ID {
+                    // The target held still long enough: hand a deep query to the
+                    // refinement worker (docs/18 §2).
+                    self.on_refinement_tick();
                     Some(0)
                 } else {
                     None

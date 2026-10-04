@@ -9,6 +9,7 @@
 
 use super::model::{RequestGate, RequestId, SnapshotEpoch, WindowIdentity};
 use crate::capture::geometry::{Point, Rect};
+use std::time::Duration;
 
 /// Cursor stillness before a refinement query is issued (docs/18 §2).
 ///
@@ -95,6 +96,88 @@ pub struct RefinementJob {
     pub window: WindowIdentity,
     pub epoch: SnapshotEpoch,
     pub point: Point,
+}
+
+/// Cooperative control handed to one provider call (docs/18 §3).
+///
+/// The worker cannot interrupt a COM call, so the provider polls this instead: the
+/// reference selector passes the same shape (`budget`, per-call limit, `cancelled`
+/// closure) into its UIA/MSAA queries, and the budget is enforced by the traversal
+/// checking it between nodes rather than by killing the call.
+pub struct QueryControl<'a> {
+    /// Total budget for the whole query.
+    pub budget: Duration,
+    /// Upper bound for a single provider call inside the query.
+    pub call_limit: Duration,
+    /// Whether the caller has already abandoned this query.
+    pub cancelled: &'a dyn Fn() -> bool,
+}
+
+impl<'a> QueryControl<'a> {
+    /// The documented refinement budgets (docs/18 §3).
+    pub fn refinement(cancelled: &'a dyn Fn() -> bool) -> Self {
+        Self {
+            budget: Duration::from_millis(u64::from(REFINEMENT_BUDGET_MS)),
+            call_limit: Duration::from_millis(u64::from(REFINEMENT_CALL_LIMIT_MS)),
+            cancelled,
+        }
+    }
+
+    /// Whether the provider should stop and publish what it has verified so far.
+    pub fn is_cancelled(&self) -> bool {
+        (self.cancelled)()
+    }
+}
+
+/// Result of one refinement query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefinementOutcome {
+    /// A verified path, possibly partial (`stop_reason` says how far it got).
+    Target(Box<DeepTarget>),
+    /// Nothing usable: the overlay keeps the v1 whole-window frame.
+    Empty(StopReason),
+}
+
+/// Resolves the deepest element under a point inside one window (docs/18 §4).
+///
+/// Implementations are owned by the refinement worker and run **only** on its thread, so
+/// every COM/UIA/MSAA object they create is created and dropped inside `resolve`. Nothing
+/// they produce may carry a native handle across the thread boundary — [`DeepTarget`] is
+/// plain geometry plus a stop reason for exactly that reason.
+pub trait DeepSelectionProvider: Send {
+    /// Resolve `job.point` inside `window_bounds`.
+    ///
+    /// Must publish a partial path when the budget is exhausted or the query is cancelled,
+    /// and must return within the control's budget as far as the platform allows.
+    fn resolve(
+        &mut self,
+        job: &RefinementJob,
+        window_bounds: Rect,
+        control: &QueryControl<'_>,
+    ) -> RefinementOutcome;
+
+    /// Drop cached batches. Called when the snapshot generation changes or the session
+    /// ends, so no stale tree survives into the next query.
+    fn release(&mut self) {}
+}
+
+/// The provider used until the UIA provider lands (v2-P2).
+///
+/// It reports [`StopReason::Unsupported`] so the overlay keeps publishing the v1
+/// whole-window frame: the refinement pipeline is live and measurable, and enabling deep
+/// selection is exactly "swap this provider", not "add a branch somewhere".
+#[derive(Debug, Default)]
+pub struct UnsupportedDeepSelection;
+
+impl DeepSelectionProvider for UnsupportedDeepSelection {
+    fn resolve(
+        &mut self,
+        _job: &RefinementJob,
+        _window_bounds: Rect,
+        _control: &QueryControl<'_>,
+    ) -> RefinementOutcome {
+        RefinementOutcome::Empty(StopReason::Unsupported)
+    }
 }
 
 /// The pending dwell target.
@@ -211,6 +294,19 @@ impl RefinementScheduler {
             return false;
         }
         self.cached = Some((epoch, target));
+        true
+    }
+
+    /// The worker produced nothing usable for `request`.
+    ///
+    /// Clears the single-flight slot so the next dwell can issue a fresh query; without
+    /// this a single `Unsupported` answer would wedge refinement for the rest of the
+    /// session. Returns whether the request was still current.
+    pub fn on_failure(&mut self, request: RequestId) -> bool {
+        if self.in_flight != Some(request) {
+            return false;
+        }
+        self.in_flight = None;
         true
     }
 
@@ -434,6 +530,48 @@ mod tests {
         assert!(scheduler.cached().is_none());
         assert!(!scheduler.is_in_flight());
         assert!(scheduler.on_dwell_due().is_none(), "no pending target survives a reset");
+    }
+
+    #[test]
+    fn an_empty_result_frees_the_single_flight_slot() {
+        let mut scheduler = RefinementScheduler::new();
+        let job = submit(&mut scheduler, 1, Point::new(150, 150));
+        assert!(scheduler.is_in_flight());
+        // The worker could not serve this window (`Unsupported`): the slot must be freed,
+        // otherwise refinement would be wedged for the whole session.
+        assert!(scheduler.on_failure(job.request));
+        assert!(!scheduler.is_in_flight());
+        assert!(scheduler.cached().is_none());
+
+        // A superseded request must not be able to free the slot of a newer one.
+        let first = submit(&mut scheduler, 1, Point::new(150, 150));
+        let _second = scheduler.on_cursor_moved(1, Some(window(0x100)), Point::new(160, 160));
+        assert!(!scheduler.on_failure(first.request));
+    }
+
+    #[test]
+    fn the_unsupported_provider_never_produces_a_path() {
+        // The placeholder used until v2-P2 lands must degrade to the v1 frame, never
+        // invent geometry.
+        let mut provider = UnsupportedDeepSelection;
+        let request = RequestGate::new().issue();
+        let job = RefinementJob {
+            request,
+            window: window(0x100),
+            epoch: 1,
+            point: Point::new(10, 10),
+        };
+        let control = QueryControl::refinement(&|| false);
+        assert_eq!(
+            provider.resolve(&job, rect(0, 0, 100, 100), &control),
+            RefinementOutcome::Empty(StopReason::Unsupported)
+        );
+        assert!(!control.is_cancelled());
+        assert_eq!(control.budget.as_millis(), u128::from(REFINEMENT_BUDGET_MS));
+        assert_eq!(
+            control.call_limit.as_millis(),
+            u128::from(REFINEMENT_CALL_LIMIT_MS)
+        );
     }
 
     #[test]

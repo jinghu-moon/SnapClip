@@ -45,6 +45,12 @@ pub use gesture::{
     GestureState, MoveOutcome, PointerGesture, PressOutcome, ReleaseOutcome, SnapPreview,
     should_start_manual_drag,
 };
+pub use deep::{
+    DeepSelectionProvider, DeepTarget, QueryControl, RefinementJob, RefinementOutcome,
+    RefinementScheduler, SchedulerActions, StopReason, UnsupportedDeepSelection,
+    REFINEMENT_BUDGET_MS, REFINEMENT_CALL_LIMIT_MS, REFINEMENT_DWELL_MS,
+    REFINEMENT_PUBLISH_INTERVAL_MS,
+};
 pub use hit_test::{point_distance_squared, rect_distance_squared};
 pub use model::{
     EpochCounter, HoverValidity, RequestGate, RequestId, SnapshotEpoch, TargetKind, WindowCandidate,

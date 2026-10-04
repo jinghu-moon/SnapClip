@@ -20,6 +20,7 @@ pub mod hotkey;
 pub mod monitor;
 pub mod overlay;
 pub mod providers;
+pub mod refinement_worker;
 pub mod renderer;
 pub mod win;
 pub mod window_detection;

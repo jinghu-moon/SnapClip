@@ -117,3 +117,48 @@ refinement worker 的邮箱是**容量 1 的最新点**模型（与 detection wo
 - 遍历：深度/节点/矩形上限触发 `TraversalLimit`；结构容器回溯不产生重复矩形。
 - 隔离：`capture/window_detection/**` 编译期不含 COM/UIA 引用（可用 `rg` 静态检查断言）；
   v2 失败时 hover/预览仍显示 v1 整窗目标。
+
+## 9. 实现进度
+
+### v2-P0（已提交 `bc52233`）
+
+`TargetKind` 增加 `ClientArea`/`UiElement`（`is_refined()`），新增
+`capture/window_detection/deep.rs`：`StopReason`、`DeepTarget`、`RefinementScheduler`、
+`QueryControl`、`DeepSelectionProvider`、`UnsupportedDeepSelection`。
+调度规则全部有单测：80 ms 停稳、单飞、最新点合并、epoch 失效、完整缓存路径复用、
+部分路径不复用、失败释放单飞槽。
+
+### v2-P1（本次提交）
+
+`platform/windows/capture/refinement_worker.rs`：独立线程 + 容量 1 最新点邮箱 +
+共享 request gate + 协作式取消（`QueryControl::is_cancelled`），并接入 overlay：
+hover 变化喂调度器 → 80 ms 一次性定时器 → 提交 → 结果回投 → 有路径则替换预览矩形，
+无路径则保持 v1 整窗帧。
+
+**P1 中发现并修复的两个根因缺陷**（都由实机诊断日志暴露，不是测试问题）：
+
+| 缺陷 | 现象 | 根因 | 修复 |
+| --- | --- | --- | --- |
+| refinement 线程立即退出 | 提交的 job 永远不执行，日志里既无 worker 行也无结果行 | 用「gate 没有 latest」判定 shutdown，而线程启动时本来就没有请求 → 启动即 `return` | 增加显式 `shutdown: AtomicBool`；`retire()` 只做取消，不再兼职关闭 |
+| dwell 定时器反复触发 | 一次停稳后每 80 ms 复投一次 tick（日志刷屏、空转唤醒消息循环） | `SetTimer` 是**周期性**定时器，而 120 ms/80 ms dwell 的注释与设计都是 **one-shot**，却只在少数路径 `KillTimer` | 到期即 `KillTimer`（`on_dwell` / `on_refinement_tick`），新 hover 再重新 arm |
+
+修复后的实机证据（`.tmp-v2-probe.ps1`，4K/DPI144/单屏 WGC）：
+
+```text
+[win-detect] refinement submit hwnd=9963044 point=(2850,1050) epoch=1
+[win-detect] refinement hwnd=9963044 point=(2850,1050) elapsed_us=0 reason=Unsupported  # worker 线程执行
+[win-detect] refinement empty reason=Unsupported                                        # 单飞槽被释放
+[win-detect] hover hwnd=9963044 z=1 bounds=(992,307)->(2912,1522)                      # v1 帧不变
+[win-detect] auto-snap preview hwnd=9963044 epoch=1 local=(992,307)->(2912,1522)
+```
+
+恰好一次提交、一次 worker 执行、一次结果消费，无 tick 刷屏、无错误 —— v2 管线已真实运行，
+且在 provider 缺失时**严格降级到 v1**。
+
+### v2-P2 的测试对象
+
+按产品建议，UIA provider 的初始验收对象定为 **Windows 资源管理器**（`CabinetWClass`）：
+它暴露层次丰富的 UIA 树（导航窗格 `SysTreeView32`、文件列表 `DirectUIHWND`、命令栏、
+地址栏），能同时验证「结构性容器回溯」与「最深可交互元素」两条规则。
+当前探针用的 `FindWindowW("CabinetWClass")` 未能取到窗口句柄（返回 0），
+P2 改为**枚举顶层窗口 + 过滤 `explorer.exe` 进程**并等待窗口出现，失败才回退到屏幕中央。
