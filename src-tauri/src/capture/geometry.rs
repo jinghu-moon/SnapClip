@@ -594,15 +594,16 @@ pub struct MagnifierGeometry {
     pub tile: Rect,
 }
 
-/// Fixed magnifier configuration for Phase 4. `zoom`, the source window and
-/// `tile_size` are in physical pixels and are **not** scaled by DPI — the
-/// magnifier works on raw pixel grid. Only `gap` and `info_height` scale so that
-/// text and spacing remain legible at high DPI.
+/// Fixed magnifier configuration for Phase 4. `zoom`, the source window,
+/// `tile_size`, the loupe panel and the info strip are in physical pixels and
+/// are **not** scaled by DPI — the magnifier is a fixed-size widget working on
+/// the raw pixel grid, and its info text must fit that DPI-invariant panel.
+/// Only `gap` (the cursor offset) scales.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MagnifierConfig {
     pub zoom: f32,
-    /// Columns of the magnifier source window (15 default → vertical band lands
-    /// on column 8, the exact centre).
+    /// Columns of the magnifier source window (17 default → vertical band lands
+    /// on column 9, the exact centre).
     pub source_width: i32,
     /// Rows of the magnifier source window (9 default → horizontal band lands
     /// on row 5, the exact centre).
@@ -611,9 +612,10 @@ pub struct MagnifierConfig {
     pub tile_size: i32,
     /// Offset between cursor and panel edge.
     pub gap: i32,
-    /// Height of the info strip below the panel (colour row, coordinate row,
-    /// shortcut-hint row — sized for three rows at 96 DPI with glassmorphism
-    /// padding: 8+20+8+14+8+12+8 = 78 px).
+    /// Height of the info strip below the panel, in physical pixels (matches
+    /// the DPI-invariant panel). Three rows — a colour+coordinates line and a
+    /// 2×2 shortcut grid — vertically centred:
+    /// 12+18+12+22+8+22+12 = 106 → rounded up to 108 px.
     pub info_height: i32,
 }
 
@@ -621,15 +623,15 @@ impl Default for MagnifierConfig {
     fn default() -> Self {
         Self {
             // 20 px per source pixel keeps a single pixel visibly square on a
-            // physical-pixel display; a 15×9 source window (135 cells) keeps the
-            // sampled pixel exactly on column 8 / row 5 — the panel's centre —
-            // while giving a wide, letterbox-shaped loupe (300×180 physical px).
+            // physical-pixel display; a 17×9 source window (153 cells) keeps the
+            // sampled pixel exactly on column 9 / row 5 — the panel's centre —
+            // while giving a wide, letterbox-shaped loupe (340×180 physical px).
             zoom: Self::ZOOM_DEFAULT,
-            source_width: 15,
+            source_width: 17,
             source_height: 9,
             tile_size: 32,
             gap: 24,
-            info_height: 78,
+            info_height: 108,
         }
     }
 }
@@ -639,7 +641,7 @@ impl MagnifierConfig {
     /// source window is derived from these so the loupe never visually jumps
     /// when the user adjusts zoom (`Z` + wheel) — only the pixel grid density
     /// changes.
-    pub const PANEL_WIDTH_PHYSICAL: i32 = 300;
+    pub const PANEL_WIDTH_PHYSICAL: i32 = 340;
     pub const PANEL_HEIGHT_PHYSICAL: i32 = 180;
     pub const ZOOM_DEFAULT: f32 = 20.0;
     pub const ZOOM_MIN: f32 = 0.1;
@@ -697,7 +699,10 @@ impl MagnifierConfig {
         }
     }
 
-    /// Scale only DPI-dependent fields. Source and tile are fixed physical pixels.
+    /// Scale only DPI-dependent fields. Source, tile, and the loupe panel are
+    /// fixed physical pixels (the panel is 340×180 regardless of DPI), so the
+    /// info strip height stays physical too — its text is laid out in physical
+    /// pixels to fit that DPI-invariant panel. Only `gap` scales.
     pub fn scaled(&self, dpi: u32) -> Self {
         let scale = dpi.max(96) as f32 / 96.0;
         Self {
@@ -706,7 +711,7 @@ impl MagnifierConfig {
             source_height: self.source_height,
             tile_size: self.tile_size,
             gap: (self.gap as f32 * scale).round() as i32,
-            info_height: (self.info_height as f32 * scale).round() as i32,
+            info_height: self.info_height,
         }
     }
 
@@ -1213,11 +1218,11 @@ mod tests {
         assert_eq!(geometry.panel.width(), geometry.source.width() * geometry.zoom as i32);
         assert_eq!(geometry.panel.height(), geometry.source.height() * geometry.zoom as i32);
         assert_eq!(geometry.zoom, 20.0);
-        // A 15×9 window is odd in both axes, so the cursor's own pixel is the
-        // exact centre cell: column 8 of 15, row 5 of 9 (1-based).
-        assert_eq!(config.source_width, 15);
+        // A 17×9 window is odd in both axes, so the cursor's own pixel is the
+        // exact centre cell: column 9 of 17, row 5 of 9 (1-based).
+        assert_eq!(config.source_width, 17);
         assert_eq!(config.source_height, 9);
-        assert_eq!(geometry.source.width() / 2, 7); // 0-based → column 8
+        assert_eq!(geometry.source.width() / 2, 8); // 0-based → column 9
         assert_eq!(geometry.source.height() / 2, 4); // 0-based → row 5
         // Tile must contain the cursor and be fixed-size
         assert_eq!(geometry.tile.width(), config.tile_size);

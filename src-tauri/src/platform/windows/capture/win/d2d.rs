@@ -39,6 +39,7 @@ use ::windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_WEIGHT_SEMI_BOLD,
     DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
     DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_METRICS,
+    DWRITE_WORD_WRAPPING_NO_WRAP,
     DWriteCreateFactory, IDWriteFactory,
     IDWriteTextFormat,
 };
@@ -77,38 +78,36 @@ const INFO_FONT_FAMILY: &str = "HarmonyOS Sans SC";
 
 /// Info-panel layout, in DIP at 96 DPI (see `RenderMetrics::for_dpi` for the
 /// scaling rule — everything here is multiplied by the same factor).
-/// Vertical/horizontal padding of the whole strip, and the gap between
-/// the two rows on the left column.
-const INFO_PADDING_V_DIP: f32 = 8.0;
-const INFO_PADDING_H_DIP: f32 = 10.0;
-const INFO_ROW_GAP_DIP: f32 = 8.0;
+/// Vertical/horizontal padding of the whole strip.
+const INFO_PADDING_V_DIP: f32 = 12.0;
+const INFO_PADDING_H_DIP: f32 = 12.0;
 /// Row 1: colour swatch size, corner radius and the gap to the value.
-const INFO_SWATCH_SIZE_DIP: f32 = 20.0;
+const INFO_SWATCH_SIZE_DIP: f32 = 18.0;
 const INFO_SWATCH_RADIUS_DIP: f32 = 4.0;
 const INFO_SWATCH_GAP_DIP: f32 = 8.0;
 /// Row 1: the S-cycled colour value (`#RRGGBB` / `rgb(...)` / `hsl(...)`),
-/// rendered in monospace at this size.
-const INFO_PRIMARY_COLOR_FONT_DIP: f32 = 11.0;
-/// Row 2: coordinate label (X/Y) and value font sizes, plus intra/inter spacing.
-const INFO_COORD_LABEL_FONT_DIP: f32 = 9.0;
-const INFO_COORD_VALUE_FONT_DIP: f32 = 10.0;
-const INFO_COORD_LABEL_VALUE_GAP_DIP: f32 = 4.0;
-const INFO_COORD_ITEM_GAP_DIP: f32 = 12.0;
-/// Right column: three stacked `<kbd>` hint rows. `hint_font_sz` drives both
-/// the key text inside the box and the CJK description beside it; the box
-/// itself uses the shared padding + corner radius.
-const INFO_HINT_FONT_DIP: f32 = 8.0;
-const INFO_KBD_PADDING_DIP: f32 = 1.5;
-const INFO_KBD_RADIUS_DIP: f32 = 2.0;
-const INFO_KBD_TEXT_GAP_DIP: f32 = 4.0;
+/// left-aligned on the same line as the right-aligned coordinates.
+const INFO_PRIMARY_COLOR_FONT_DIP: f32 = 13.0;
+/// Row 1: the position string `(x, y)`, right-aligned on the same line as the
+/// colour value. The colour value shares this 13 px size.
+const INFO_COORD_VALUE_FONT_DIP: f32 = 13.0;
+/// Horizontal gap between the colour value and the right-aligned position text.
+const INFO_COORD_BLOCK_GAP_DIP: f32 = 14.0;
+/// Rows 2–3: four `<kbd>` hint items in a 2×2 grid (key text inside the box +
+/// CJK description beside it). One point smaller than the colour/coordinate line.
+const INFO_HINT_FONT_DIP: f32 = 12.0;
+const INFO_KBD_PADDING_DIP: f32 = 3.0;
+const INFO_KBD_RADIUS_DIP: f32 = 4.0;
+const INFO_KBD_TEXT_GAP_DIP: f32 = 6.0;
 /// Vertical extent of one kbd row (box height; the text is vertically centred
-/// inside) and the gap between consecutive rows.
-const INFO_KBD_LINE_HEIGHT_DIP: f32 = 12.0;
-const INFO_KBD_ROW_GAP_DIP: f32 = 4.0;
-/// Fixed width of the right-hand shortcut column and the horizontal gap that
-/// separates it from the left column (colour + coordinates rows).
-const INFO_KBD_COL_WIDTH_DIP: f32 = 70.0;
-const INFO_LR_COLUMN_GAP_DIP: f32 = 16.0;
+/// inside). The four hints form a 2×2 grid.
+const INFO_KBD_LINE_HEIGHT_DIP: f32 = 22.0;
+/// Horizontal gap between the two kbd columns.
+const INFO_HINT_ITEM_GAP_DIP: f32 = 16.0;
+/// Vertical gap between the two kbd grid rows.
+const INFO_KBD_ROW_GAP_DIP: f32 = 8.0;
+/// Gap between the colour/coordinate line and the kbd grid below it.
+const INFO_KBD_BLOCK_GAP_DIP: f32 = 12.0;
 
 /// Mask colour (opaque black at 45% opacity). Configurable in one place so the
 /// light/dark-background acceptance can be re-run with a different value.
@@ -277,16 +276,14 @@ pub struct OverlayRenderer {
     // ── Magnifier info-panel palette (glassmorphism strip) ──
     /// `rgba(20,20,20,0.4)` — the translucent background of the whole strip.
     info_bg_brush: Option<ID2D1SolidColorBrush>,
-    /// `#3b82f6` — the theme-blue `X`/`Y` coordinate labels.
-    info_accent_brush: Option<ID2D1SolidColorBrush>,
     /// Pure white — the primary S-cycled colour value (`#RRGGBB` /
     /// `rgb(...)` / `hsl(...)`).
     info_hex_brush: Option<ID2D1SolidColorBrush>,
-    /// `#aaa` — coordinate numeric values.
+    /// `#f5f5f5` — coordinate numeric values.
     info_coord_value_brush: Option<ID2D1SolidColorBrush>,
-    /// `#777` — shortcut-hint description text ("格式" / "复制" / "坐标").
+    /// `#f5f5f5` — shortcut-hint description text ("色值格式" / "复制色值" …).
     info_hint_brush: Option<ID2D1SolidColorBrush>,
-    /// `#ccc` — the key text drawn inside a `<kbd>` box.
+    /// `#f5f5f5` — the key text drawn inside a `<kbd>` box.
     info_kbd_text_brush: Option<ID2D1SolidColorBrush>,
     /// `rgba(255,255,255,0.1)` — the `<kbd>` box fill.
     info_kbd_fill_brush: Option<ID2D1SolidColorBrush>,
@@ -352,7 +349,6 @@ impl OverlayRenderer {
             magnifier_grid_brush: None,
             magnifier_info_brush: None,
             info_bg_brush: None,
-            info_accent_brush: None,
             info_hex_brush: None,
             info_coord_value_brush: None,
             info_hint_brush: None,
@@ -929,10 +925,31 @@ impl OverlayRenderer {
                 }
             }
 
-            // The sampled cell itself: white fill with a dark outline, so it
-            // reads on light and dark content alike.
-            self.d2d.FillRectangle(&to_d2d(center_cell), white);
-            self.d2d.DrawRectangle(&to_d2d(center_cell), dark, 1.0, None);
+            // Mark the sampled cell with its true colour so it agrees with the
+            // info-strip swatch. Both read the same async `magnifier_rgb`, so
+            // filling (rather than relying on the blit's live-frame pixel) keeps
+            // them identical even when sampling lags a frame. A white ring on the
+            // cell edge plus a dark ring one pixel outside keep it readable on any
+            // background.
+            let cell_fill = self.require_brush(&self.info_swatch_fill_brush, "swatch fill")?;
+            {
+                let (r, g, b) = view.magnifier_rgb.unwrap_or((0, 0, 0));
+                let _ = cell_fill.SetColor(&color(
+                    r as f32 / 255.0,
+                    g as f32 / 255.0,
+                    b as f32 / 255.0,
+                    1.0,
+                ));
+            }
+            self.d2d.FillRectangle(&to_d2d(center_cell), &cell_fill);
+            self.d2d.DrawRectangle(&to_d2d(center_cell), white, 1.0, None);
+            let outer_cell = Rect::new(
+                center_cell.left - 1,
+                center_cell.top - 1,
+                center_cell.right + 1,
+                center_cell.bottom + 1,
+            );
+            self.d2d.DrawRectangle(&to_d2d(outer_cell), dark, 1.0, None);
 
             // ── Zoom badge (top-right corner of the loupe panel) ──
             {
@@ -980,7 +997,6 @@ impl OverlayRenderer {
             // (row 2). Right: three stacked `<kbd>` hint rows for S / C / P.
             let info = geometry.info_panel;
             let bg = self.require_brush(&self.info_bg_brush, "info bg")?;
-            let accent = self.require_brush(&self.info_accent_brush, "info accent")?;
             let primary_brush = self.require_brush(&self.info_hex_brush, "info primary colour")?;
             let coord_val_brush = self.require_brush(&self.info_coord_value_brush, "info coord")?;
             let hint_brush = self.require_brush(&self.info_hint_brush, "info hint")?;
@@ -1046,43 +1062,43 @@ impl OverlayRenderer {
                 self.d2d.FillRectangle(&to_d2d(info), &bg);
             }
 
-            let scale = metrics.dpi.max(96) as f32 / 96.0;
+            // The loupe is a single fixed **physical**-pixel box (340×180 image +
+            // info strip, DPI-invariant — see MagnifierConfig::PANEL_WIDTH_PHYSICAL)
+            // clipped to one rounded rect, so the info strip shares that fixed
+            // width. Its fonts and spacing therefore stay in physical pixels:
+            // scaling them by DPI while the box stays put would overflow it on
+            // high-DPI displays. On the single colour/coordinate line the panel is
+            // wide enough that both fit with room to spare (asserted by
+            // `widest_colour_value_fits_the_info_row`).
+            let scale = 1.0f32;
             let pad_v = INFO_PADDING_V_DIP * scale;
             let pad_h = INFO_PADDING_H_DIP * scale;
-            let row_gap = INFO_ROW_GAP_DIP * scale;
             let swatch_sz = INFO_SWATCH_SIZE_DIP * scale;
             let swatch_radius = INFO_SWATCH_RADIUS_DIP * scale;
             let swatch_gap = INFO_SWATCH_GAP_DIP * scale;
-            let primary_font_sz = INFO_PRIMARY_COLOR_FONT_DIP * scale;
-            let coord_label_sz = INFO_COORD_LABEL_FONT_DIP * scale;
-            let coord_value_sz = INFO_COORD_VALUE_FONT_DIP * scale;
-            let coord_lv_gap = INFO_COORD_LABEL_VALUE_GAP_DIP * scale;
-            let coord_item_gap = INFO_COORD_ITEM_GAP_DIP * scale;
+            let coord_block_gap = INFO_COORD_BLOCK_GAP_DIP * scale;
             let kbd_pad = INFO_KBD_PADDING_DIP * scale;
             let kbd_radius = INFO_KBD_RADIUS_DIP * scale;
             let kbd_text_gap = INFO_KBD_TEXT_GAP_DIP * scale;
             let kbd_line_h = INFO_KBD_LINE_HEIGHT_DIP * scale;
+            let hint_item_gap = INFO_HINT_ITEM_GAP_DIP * scale;
             let kbd_row_gap = INFO_KBD_ROW_GAP_DIP * scale;
-            let kbd_col_w = INFO_KBD_COL_WIDTH_DIP * scale;
-            let lr_gap = INFO_LR_COLUMN_GAP_DIP * scale;
+            let kbd_block_gap = INFO_KBD_BLOCK_GAP_DIP * scale;
 
-            // Two rows on the left column (colour + coordinates), three stacked
-            // kbd rows on the right. `content_h` is the vertical band inside
-            // the strip's padding; the kbd column is centred inside it.
-            let row1_h = swatch_sz;
-            let row2_h = coord_value_sz * 1.4;
-            let content_top = info.top as f32 + pad_v;
-            let content_h = (info.bottom - info.top) as f32 - pad_v * 2.0;
-            let row1_y = content_top;
-            let row2_y = row1_y + row1_h + row_gap;
+            // ── Row 1 (colour value + right-aligned coordinates) + 2×2 grid ──
+            // Row 1: [swatch] colour value  ............  (x, y)   (coords right-aligned)
+            // Row 2: [S 色值格式]  [C 复制色值]
+            // Row 3: [P 坐标模式]  [Z 滚轮缩放]
             let content_l = info.left as f32 + pad_h;
             let content_r = info.right as f32 - pad_h;
-            let kbd_col_x = content_r - kbd_col_w;
-            let left_col_right = kbd_col_x - lr_gap;
-            let kbd_col_h = kbd_line_h * 4.0 + kbd_row_gap * 3.0;
-            let kbd_col_top = content_top + (content_h - kbd_col_h) / 2.0;
+            let row1_h = swatch_sz; // colour/coordinate line height (swatch-sized)
+            let content_h = (info.bottom - info.top) as f32 - pad_v * 2.0;
+            let block_h = row1_h + kbd_block_gap + kbd_line_h * 2.0 + kbd_row_gap;
+            let row1_y = info.top as f32 + pad_v + (content_h - block_h).max(0.0) / 2.0;
+            let kbd_row_a_y = row1_y + row1_h + kbd_block_gap;
+            let kbd_row_b_y = kbd_row_a_y + kbd_line_h + kbd_row_gap;
 
-            // ---- Row 1 (left): colour swatch + S-cycled colour value ----
+            // ---- Row 1: swatch + colour value ----
             let swatch_rect = D2D1_ROUNDED_RECT {
                 rect: D2D_RECT_F {
                     left: content_l,
@@ -1116,114 +1132,104 @@ impl OverlayRenderer {
             };
             self.d2d.DrawRoundedRectangle(&inset_rect, &swatch_inset, 1.0, None);
 
-            let colour_text = view.magnifier_color_text.as_deref().unwrap_or("--");
-            let primary_format = self.info_text_format_mut(true, INFO_PRIMARY_COLOR_FONT_DIP, DWRITE_FONT_WEIGHT_SEMI_BOLD, false)?;
-            let colour_w = self.measure_text_width_in(colour_text, &primary_format)?;
-            let colour_top_y = row1_y + (row1_h - primary_font_sz) / 2.0;
-            let colour_x = content_l + swatch_sz + swatch_gap;
-            // Clip the colour value against the left column's right edge so an
-            // unusually wide `hsl(...)` never overlaps the kbd hints on the right.
-            let colour_right = (colour_x + colour_w + 2.0).min(left_col_right);
-            {
-                let wide = colour_text.encode_utf16().collect::<Vec<u16>>();
-                self.d2d.DrawText(
-                    &wide, &primary_format,
-                    &D2D_RECT_F {
-                        left: colour_x, top: colour_top_y,
-                        right: colour_right, bottom: colour_top_y + primary_font_sz * 1.5,
-                    },
-                    &primary_brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL,
-                );
-            }
-
-            // ---- Row 2 (left): X / Y Coordinates ----
+            // Position: a single "(x, y)" string, right-aligned on row 1, so the
+            // colour value keeps the remaining (left) width.
             let (cx, cy) = if view.magnifier_relative && !view.selection.is_empty() {
                 (view.cursor.x - view.selection.left, view.cursor.y - view.selection.top)
             } else {
                 (view.cursor.x + view.screen_origin.x, view.cursor.y + view.screen_origin.y)
             };
-            let label_format = self.info_text_format_mut(false, INFO_COORD_LABEL_FONT_DIP, DWRITE_FONT_WEIGHT_BOLD, false)?;
+            let pos_text = format!("({}, {})", cx, cy);
             let value_format = self.info_text_format_mut(true, INFO_COORD_VALUE_FONT_DIP, DWRITE_FONT_WEIGHT_NORMAL, false)?;
-            let label_w = self.measure_text_width_in("X", &label_format)?;
-            let x_str = cx.to_string();
-            let y_str = cy.to_string();
-            let x_val_w = self.measure_text_width_in(&x_str, &value_format)?;
-            let y_val_w = self.measure_text_width_in(&y_str, &value_format)?;
-            let row2_baseline_y = row2_y + (row2_h - coord_value_sz) / 2.0;
+            let pos_w = self.measure_text_width_in(&pos_text, &value_format)?;
+            let coord_left = content_r - pos_w;
+
+            // Colour value fills the band between the swatch and the position.
+            // The 340 px panel leaves ample room, so the widest value fits without
+            // ever reaching the position text (asserted by the info-row width test).
+            let colour_text = view.magnifier_color_text.as_deref().unwrap_or("--");
+            let primary_format = self.info_text_format_mut(true, INFO_PRIMARY_COLOR_FONT_DIP, DWRITE_FONT_WEIGHT_SEMI_BOLD, false)?;
+            let colour_x = content_l + swatch_sz + swatch_gap;
+            let colour_right = (coord_left - coord_block_gap).max(colour_x);
             {
-                let lx = content_l;
-                let wide = b"X".iter().map(|&c| c as u16).collect::<Vec<u16>>();
+                let wide = colour_text.encode_utf16().collect::<Vec<u16>>();
+                // Draw across the full row-1 band and let the format's paragraph
+                // centring put the text on the swatch's exact vertical centre; the
+                // earlier manual (row1_h - font)/2 offset compounded with paragraph
+                // centring pushed the glyphs ~3px below the swatch.
                 self.d2d.DrawText(
-                    &wide, &label_format,
+                    &wide, &primary_format,
                     &D2D_RECT_F {
-                        left: lx, top: row2_baseline_y,
-                        right: lx + label_w + 2.0, bottom: row2_baseline_y + coord_label_sz * 1.5,
+                        left: colour_x, top: row1_y,
+                        right: colour_right, bottom: row1_y + row1_h,
                     },
-                    &accent, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL,
+                    &primary_brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL,
                 );
-                let vx = lx + label_w + coord_lv_gap;
-                let wide_x = x_str.encode_utf16().collect::<Vec<u16>>();
+            }
+
+            // Right-aligned position text, sharing row 1's vertical centre.
+            {
+                let wide_pos = pos_text.encode_utf16().collect::<Vec<u16>>();
                 self.d2d.DrawText(
-                    &wide_x, &value_format,
+                    &wide_pos, &value_format,
                     &D2D_RECT_F {
-                        left: vx, top: row2_baseline_y,
-                        right: vx + x_val_w + 2.0, bottom: row2_baseline_y + coord_value_sz * 1.5,
-                    },
-                    &coord_val_brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL,
-                );
-                let ly = vx + x_val_w + coord_item_gap;
-                let wide = b"Y".iter().map(|&c| c as u16).collect::<Vec<u16>>();
-                self.d2d.DrawText(
-                    &wide, &label_format,
-                    &D2D_RECT_F {
-                        left: ly, top: row2_baseline_y,
-                        right: ly + label_w + 2.0, bottom: row2_baseline_y + coord_label_sz * 1.5,
-                    },
-                    &accent, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL,
-                );
-                let vy = ly + label_w + coord_lv_gap;
-                let wide_y = y_str.encode_utf16().collect::<Vec<u16>>();
-                self.d2d.DrawText(
-                    &wide_y, &value_format,
-                    &D2D_RECT_F {
-                        left: vy, top: row2_baseline_y,
-                        right: vy + y_val_w + 2.0, bottom: row2_baseline_y + coord_value_sz * 1.5,
+                        left: coord_left, top: row1_y,
+                        right: content_r, bottom: row1_y + row1_h,
                     },
                     &coord_val_brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL,
                 );
             }
 
-            // ---- Right column: three stacked `<kbd>` hint rows ----
-            // `hint_format` is used for measurement (leading-align keeps the
-            // CJK description left-flushed); `hint_centered` puts the single
-            // key letter in the middle of its `<kbd>` box. Both share the
-            // vertical-centre paragraph alignment baked into
-            // `info_text_format_mut`.
+            // ---- Row 2: four <kbd> hint items, laid out horizontally & centred ----
+            // `hint_format` measures the CJK description (left-flushed); `hint_centered`
+            // centres the single key letter inside its box. Both share the
+            // vertical-centre paragraph alignment baked into `info_text_format_mut`.
             let hint_format = self.info_text_format_mut(false, INFO_HINT_FONT_DIP, DWRITE_FONT_WEIGHT_NORMAL, false)?;
             let hint_centered = self.info_text_format_mut(false, INFO_HINT_FONT_DIP, DWRITE_FONT_WEIGHT_NORMAL, true)?;
-            let hints: &[(&str, &str)] = &[
+            let hints: [(&str, &str); 4] = [
                 ("S", "色值格式"),
                 ("C", "复制色值"),
                 ("P", "坐标模式"),
                 ("Z", "滚轮缩放"),
             ];
-            for (i, (key, desc)) in hints.iter().enumerate() {
-                let row_y = kbd_col_top + i as f32 * (kbd_line_h + kbd_row_gap);
-                let key_w = self.measure_text_width_in(key, &hint_format)?;
-                // Force the box to at least square-looking so single letters
-                // like `S`/`C`/`P` don't collapse into a 3 px chip.
-                let box_w = (key_w + kbd_pad * 2.0).max(kbd_line_h);
+            // Measure every item (box + gap + description); the two columns
+            // share the widest item width so the grid lines up, and the whole
+            // 2×2 block is centred inside the strip.
+            let mut box_ws = [0.0f32; 4];
+            let mut desc_ws = [0.0f32; 4];
+            let mut item_ws = [0.0f32; 4];
+            for i in 0..4 {
+                let key_w = self.measure_text_width_in(hints[i].0, &hint_format)?;
+                box_ws[i] = (key_w + kbd_pad * 2.0).max(kbd_line_h);
+                desc_ws[i] = self.measure_text_width_in(hints[i].1, &hint_format)?;
+                item_ws[i] = box_ws[i] + kbd_text_gap + desc_ws[i];
+            }
+            let col_w = item_ws.iter().cloned().fold(0.0f32, f32::max);
+            let grid_w = col_w * 2.0 + hint_item_gap;
+            let col0_x = (content_l + content_r - grid_w) / 2.0;
+            let col1_x = col0_x + col_w + hint_item_gap;
+            let slots = [
+                (col0_x, kbd_row_a_y),
+                (col1_x, kbd_row_a_y),
+                (col0_x, kbd_row_b_y),
+                (col1_x, kbd_row_b_y),
+            ];
+            for i in 0..4 {
+                let (key, desc) = hints[i];
+                let (item_x, row_y) = slots[i];
+                let box_w = box_ws[i];
+                let desc_w = desc_ws[i];
                 let box_rect = D2D1_ROUNDED_RECT {
                     rect: D2D_RECT_F {
-                        left: kbd_col_x, top: row_y,
-                        right: kbd_col_x + box_w, bottom: row_y + kbd_line_h,
+                        left: item_x, top: row_y,
+                        right: item_x + box_w, bottom: row_y + kbd_line_h,
                     },
                     radiusX: kbd_radius, radiusY: kbd_radius,
                 };
                 self.d2d.FillRoundedRectangle(&box_rect, &kbd_fill_brush);
                 let bot_rect = D2D_RECT_F {
-                    left: kbd_col_x + 1.0, top: row_y + kbd_line_h - 1.0,
-                    right: kbd_col_x + box_w - 1.0, bottom: row_y + kbd_line_h,
+                    left: item_x + 1.0, top: row_y + kbd_line_h - 1.0,
+                    right: item_x + box_w - 1.0, bottom: row_y + kbd_line_h,
                 };
                 self.d2d.FillRectangle(&bot_rect, &kbd_bottom_brush);
                 {
@@ -1231,20 +1237,19 @@ impl OverlayRenderer {
                     self.d2d.DrawText(
                         &wide, &hint_centered,
                         &D2D_RECT_F {
-                            left: kbd_col_x, top: row_y,
-                            right: kbd_col_x + box_w, bottom: row_y + kbd_line_h,
+                            left: item_x, top: row_y,
+                            right: item_x + box_w, bottom: row_y + kbd_line_h,
                         },
                         &kbd_text_brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL,
                     );
                 }
-                let desc_x = kbd_col_x + box_w + kbd_text_gap;
-                let desc_w = self.measure_text_width_in(desc, &hint_format)?;
+                let desc_x = item_x + box_w + kbd_text_gap;
                 let wide_desc = desc.encode_utf16().collect::<Vec<u16>>();
                 self.d2d.DrawText(
                     &wide_desc, &hint_format,
                     &D2D_RECT_F {
                         left: desc_x, top: row_y,
-                        right: (desc_x + desc_w + 2.0).min(content_r), bottom: row_y + kbd_line_h,
+                        right: desc_x + desc_w + 2.0, bottom: row_y + kbd_line_h,
                     },
                     &hint_brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL,
                 );
@@ -1354,6 +1359,8 @@ impl OverlayRenderer {
                             let _ = created.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
                         }
                         let _ = created.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                        // Info strings are always single-line; never wrap them.
+                        let _ = created.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
                     }
                     format = Some(created);
                     break;
@@ -1609,18 +1616,15 @@ impl OverlayRenderer {
         self.info_bg_brush = Some(self.create_brush(
             &color(20.0 / 255.0, 20.0 / 255.0, 20.0 / 255.0, 0.68),
         )?);
-        self.info_accent_brush = Some(self.create_brush(
-            &color(59.0 / 255.0, 130.0 / 255.0, 246.0 / 255.0, 1.0),
-        )?);
         self.info_hex_brush = Some(self.create_brush(&color(1.0, 1.0, 1.0, 1.0))?);
         self.info_coord_value_brush = Some(self.create_brush(
-            &color(170.0 / 255.0, 170.0 / 255.0, 170.0 / 255.0, 1.0),
+            &color(245.0 / 255.0, 245.0 / 255.0, 245.0 / 255.0, 1.0),
         )?);
         self.info_hint_brush = Some(self.create_brush(
-            &color(119.0 / 255.0, 119.0 / 255.0, 119.0 / 255.0, 1.0),
+            &color(245.0 / 255.0, 245.0 / 255.0, 245.0 / 255.0, 1.0),
         )?);
         self.info_kbd_text_brush = Some(self.create_brush(
-            &color(204.0 / 255.0, 204.0 / 255.0, 204.0 / 255.0, 1.0),
+            &color(245.0 / 255.0, 245.0 / 255.0, 245.0 / 255.0, 1.0),
         )?);
         self.info_kbd_fill_brush = Some(self.create_brush(
             &color(1.0, 1.0, 1.0, 0.1),
@@ -1665,7 +1669,7 @@ impl OverlayRenderer {
             .map_err(|error| super::hresult("ID2D1Effect::SetValue(BORDER_MODE)", &error))?;
         }
         self.blur_effect = Some(blur);
-        self.info_tint_brush = Some(self.create_brush(&color(0.07, 0.07, 0.08, 0.48))?);
+        self.info_tint_brush = Some(self.create_brush(&color(0.07, 0.07, 0.08, 0.78))?);
         self.info_badge_bg_brush = Some(self.create_brush(&color(
             60.0 / 255.0, 60.0 / 255.0, 60.0 / 255.0, 0.82,
         ))?);
@@ -1699,7 +1703,6 @@ impl OverlayRenderer {
         self.magnifier_grid_brush = None;
         self.magnifier_info_brush = None;
         self.info_bg_brush = None;
-        self.info_accent_brush = None;
         self.info_hex_brush = None;
         self.info_coord_value_brush = None;
         self.info_hint_brush = None;
@@ -2253,6 +2256,62 @@ mod tests {
         }
         let _ = Point::new(0, 0);
         let _ = to_d2d(Rect::new(1, 2, 3, 4));
+    }
+
+    /// The info row must fit the **widest** colour string the sampler can emit
+    /// (`hsl(360,100%,100%)`) alongside a representative position, so no colour
+    /// value can ever wrap or clip. Widths are measured with the real embedded
+    /// font, not an estimate — this is the correct way to prove the layout.
+    #[test]
+    fn widest_colour_value_fits_the_info_row() {
+        let Ok(device) = super::GraphicsDevice::create() else {
+            eprintln!("no D3D11 device; skipping the info-row width check");
+            return;
+        };
+        let Ok(mut renderer) = OverlayRenderer::new(std::sync::Arc::new(device), 96) else {
+            return;
+        };
+
+        let colour_fmt = renderer
+            .info_text_format_mut(
+                true,
+                super::INFO_PRIMARY_COLOR_FONT_DIP,
+                super::DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                false,
+            )
+            .unwrap();
+        let widest_colour = renderer
+            .measure_text_width_in("hsl(360,100%,100%)", &colour_fmt)
+            .unwrap();
+
+        let pos_fmt = renderer
+            .info_text_format_mut(
+                true,
+                super::INFO_COORD_VALUE_FONT_DIP,
+                super::DWRITE_FONT_WEIGHT_NORMAL,
+                false,
+            )
+            .unwrap();
+        let widest_pos = renderer
+            .measure_text_width_in("(2560, 1440)", &pos_fmt)
+            .unwrap();
+
+        // Horizontal budget at 96 DPI (scale = 1): the loupe is a fixed 340-
+        // physical-px box. The colour value (left) and the coordinates (right)
+        // share row 1, so both must fit in the space left after the swatch and
+        // the gap between them.
+        let content = crate::capture::geometry::MagnifierConfig::PANEL_WIDTH_PHYSICAL as f32
+            - 2.0 * super::INFO_PADDING_H_DIP;
+        let swatch_block = super::INFO_SWATCH_SIZE_DIP + super::INFO_SWATCH_GAP_DIP;
+        let available = content - swatch_block - super::INFO_COORD_BLOCK_GAP_DIP;
+
+        assert!(
+            widest_colour + widest_pos <= available,
+            "widest colour ({widest_colour}px) + coordinates ({widest_pos}px) do \
+             not share row 1 (available {available}px = content {content} - swatch \
+             {swatch_block} - gap {})",
+            super::INFO_COORD_BLOCK_GAP_DIP
+        );
     }
 }
 

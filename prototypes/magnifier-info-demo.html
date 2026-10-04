@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>放大镜信息栏布局方案对比</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: #d0d0d0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 30px;
+  font-family: "HarmonyOS Sans SC", "Segoe UI", sans-serif;
+  gap: 50px;
+}
+h2 { font-size: 16px; color: #333; margin-bottom: 4px; }
+.note { font-size: 12px; color: #666; margin-bottom: 12px; max-width: 360px; text-align: center; }
+.row { display: flex; gap: 30px; flex-wrap: wrap; justify-content: center; }
+
+/* ── 通用面板外壳 ── */
+.magnifier {
+  width: 340px;
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: 0 4px 24px rgba(0,0,0,0.25);
+}
+.loupe {
+  width: 340px; height: 180px;
+  background: repeating-conic-gradient(#f5f5f5 0% 25%, #fff 0% 50%) 0 0 / 15px 15px;
+  position: relative;
+}
+.loupe .cross-h { position: absolute; left:0; right:0; top:82px; height:16px; background:rgba(59,130,246,0.3); }
+.loupe .cross-v { position: absolute; top:0; bottom:0; left:162px; width:16px; background:rgba(59,130,246,0.3); }
+.loupe .center-cell { position: absolute; left:162px; top:82px; width:16px; height:16px; border:2px solid #fff; box-shadow:0 0 0 1px rgba(0,0,0,0.5); background:#ff6b35; }
+.zoom-badge {
+  position: absolute; top:6px; right:6px;
+  background:rgba(60,60,60,0.82); color:#fff;
+  font-size:14px; font-weight:700; padding:5px 8px; border-radius:6px; line-height:1;
+}
+
+/* ── 信息栏通用 ── */
+.info {
+  width: 340px;
+  background: rgba(18, 18, 20, 0.82);
+  backdrop-filter: blur(12px);
+  color: #fff;
+  padding: 8px 10px;
+}
+.swatch {
+  width: 18px; height: 18px; border-radius: 4px; flex-shrink: 0;
+  border: 1px solid rgba(255,255,255,0.2);
+  box-shadow: inset 0 0 0 1px rgba(0,0,0,0.12);
+}
+.colour-val {
+  font-family: "Cascadia Mono", "Consolas", monospace;
+  font-size: 13px; font-weight: 600; color: #fff;
+  white-space: nowrap; overflow: hidden;
+}
+.coord-l { font-size: 10px; font-weight: 700; color: #5b9cf6; }
+.coord-v { font-family: "Cascadia Mono", "Consolas", monospace; font-size: 13px; color: #f5f5f5; }
+.kbd {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 22px; height: 22px; padding: 0 4px;
+  background: rgba(255,255,255,0.12); border-bottom: 1px solid rgba(0,0,0,0.5);
+  border-radius: 4px; font-size: 12px; font-weight: 600; color: #f5f5f5;
+}
+.kbd-desc { font-size: 12px; color: #f5f5f5; white-space: nowrap; }
+
+/* ═══════════════════════════════════════════════════════
+   方案 A: 当前布局（左右分栏）
+   ═══════════════════════════════════════════════════════ */
+.info-a {
+  height: 88px;
+  display: flex; gap: 12px;
+}
+.info-a .left { flex:1; display:flex; flex-direction:column; justify-content:center; gap:6px; min-width:0; }
+.info-a .right { width:78px; display:flex; flex-direction:column; justify-content:center; gap:4px; flex-shrink:0; }
+.info-a .colour-line { display:flex; align-items:center; gap:8px; }
+.info-a .coord-line { display:flex; align-items:center; gap:12px; }
+.info-a .kbd-row { display:flex; align-items:center; gap:5px; height:14px; }
+
+/* ═══════════════════════════════════════════════════════
+   方案 B: 第一行色值+坐标，下方 2×2 快捷键网格
+   ═══════════════════════════════════════════════════════ */
+.info-b {
+  height: 108px;
+  display: flex; flex-direction: column; justify-content: center; gap: 12px;
+}
+.info-b .main-line {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+}
+.info-b .main-line .spacer { flex: 1; }
+.info-b .hint-grid {
+  display: grid; grid-template-columns: auto auto; justify-content: center;
+  column-gap: 16px; row-gap: 8px;
+}
+.info-b .hint-item { display: flex; align-items: center; gap: 6px; }
+
+/* ═══════════════════════════════════════════════════════
+   方案 C: 全宽双行（色值+坐标第一行，快捷键第二行 带分隔线）
+   ═══════════════════════════════════════════════════════ */
+.info-c {
+  height: 74px;
+  display: flex; flex-direction: column; justify-content: center; gap: 0;
+}
+.info-c .main-line {
+  display: flex; align-items: center; gap: 8px; padding-bottom: 8px;
+}
+.info-c .main-line .spacer { flex: 1; }
+.info-c .divider { height: 1px; background: rgba(255,255,255,0.08); margin-bottom: 8px; }
+.info-c .hint-line {
+  display: flex; align-items: center; justify-content: space-between;
+}
+.info-c .hint-item { display: flex; align-items: center; gap: 4px; }
+
+/* ═══════════════════════════════════════════════════════
+   方案 D: 紧凑单行 + 底部快捷键条
+   ═══════════════════════════════════════════════════════ */
+.info-d {
+  height: 62px;
+  display: flex; flex-direction: column; justify-content: center;
+}
+.info-d .main-line {
+  display: flex; align-items: center; gap: 6px; margin-bottom: 8px;
+}
+.info-d .main-line .spacer { flex:1; }
+.info-d .hint-line {
+  display: flex; align-items: center; gap: 10px;
+  border-top: 1px solid rgba(255,255,255,0.06); padding-top: 7px;
+}
+.info-d .hint-item { display: flex; align-items: center; gap: 3px; }
+.info-d .sep { color: rgba(255,255,255,0.15); font-size: 10px; }
+</style>
+</head>
+<body>
+
+<!-- ═══ 方案 A: 当前布局 ═══ -->
+<div>
+  <h2>方案 A — 当前（左右分栏）</h2>
+  <p class="note">左列：色值 + 坐标（2行）<br>右列：4行 kbd 竖排（78px 固定宽）</p>
+  <div class="row">
+    <div class="magnifier">
+      <div class="loupe"><div class="cross-h"></div><div class="cross-v"></div><div class="center-cell"></div><div class="zoom-badge">20x</div></div>
+      <div class="info info-a">
+        <div class="left">
+          <div class="colour-line"><div class="swatch" style="background:#ff6b35;"></div><span class="colour-val">hsl(16, 100%, 60%)</span></div>
+          <div class="coord-line"><span class="coord-l">X</span><span class="coord-v">1079</span><span class="coord-l">Y</span><span class="coord-v">854</span></div>
+        </div>
+        <div class="right">
+          <div class="kbd-row"><span class="kbd">S</span><span class="kbd-desc">色值格式</span></div>
+          <div class="kbd-row"><span class="kbd">C</span><span class="kbd-desc">复制色值</span></div>
+          <div class="kbd-row"><span class="kbd">P</span><span class="kbd-desc">坐标模式</span></div>
+          <div class="kbd-row"><span class="kbd">Z</span><span class="kbd-desc">滚轮缩放</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ 方案 B: 全宽双行 ═══ -->
+<div>
+  <h2>方案 B — 色值+坐标同行（居右）+ 2×2 快捷键网格（已采用）</h2>
+  <p class="note">340px 宽面板：色值居左、坐标 (x,y) 居右（共享一行）<br>下方：快捷键 2×2 网格，色值/坐标 13px、快捷键 12px、颜色 #f5f5f5<br>高度 108px</p>
+  <div class="row">
+    <div class="magnifier">
+      <div class="loupe"><div class="cross-h"></div><div class="cross-v"></div><div class="center-cell"></div><div class="zoom-badge">20x</div></div>
+      <div class="info info-b">
+        <div class="main-line">
+          <div class="swatch" style="background:#ff6b35;"></div>
+          <span class="colour-val">hsl(16, 100%, 60%)</span>
+          <span class="spacer"></span>
+          <span class="coord-v">(1079, 854)</span>
+        </div>
+        <div class="hint-grid">
+          <div class="hint-item"><span class="kbd">S</span><span class="kbd-desc">色值格式</span></div>
+          <div class="hint-item"><span class="kbd">C</span><span class="kbd-desc">复制色值</span></div>
+          <div class="hint-item"><span class="kbd">P</span><span class="kbd-desc">坐标模式</span></div>
+          <div class="hint-item"><span class="kbd">Z</span><span class="kbd-desc">滚轮缩放</span></div>
+        </div>
+      </div>
+    </div>
+    <div class="magnifier">
+      <div class="loupe"><div class="cross-h"></div><div class="cross-v"></div><div class="center-cell" style="background:#fff;"></div><div class="zoom-badge">4x</div></div>
+      <div class="info info-b">
+        <div class="main-line">
+          <div class="swatch" style="background:#fff;"></div>
+          <span class="colour-val">#FFFFFF</span>
+          <span class="spacer"></span>
+          <span class="coord-v">(2560, 1440)</span>
+        </div>
+        <div class="hint-grid">
+          <div class="hint-item"><span class="kbd">S</span><span class="kbd-desc">色值格式</span></div>
+          <div class="hint-item"><span class="kbd">C</span><span class="kbd-desc">复制色值</span></div>
+          <div class="hint-item"><span class="kbd">P</span><span class="kbd-desc">坐标模式</span></div>
+          <div class="hint-item"><span class="kbd">Z</span><span class="kbd-desc">滚轮缩放</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ 方案 C: 带分隔线 ═══ -->
+<div>
+  <h2>方案 C — 全宽双行 + 分隔线</h2>
+  <p class="note">同方案 B，增加细分隔线区分信息区和提示区<br>视觉层次更清晰</p>
+  <div class="row">
+    <div class="magnifier">
+      <div class="loupe"><div class="cross-h"></div><div class="cross-v"></div><div class="center-cell"></div><div class="zoom-badge">20x</div></div>
+      <div class="info info-c">
+        <div class="main-line">
+          <div class="swatch" style="background:#ff6b35;"></div>
+          <span class="colour-val">hsl(16, 100%, 60%)</span>
+          <span class="spacer"></span>
+          <span class="coord-l">X</span><span class="coord-v">1079</span>
+          <span class="coord-l">Y</span><span class="coord-v">854</span>
+        </div>
+        <div class="divider"></div>
+        <div class="hint-line">
+          <div class="hint-item"><span class="kbd">S</span><span class="kbd-desc">色值格式</span></div>
+          <div class="hint-item"><span class="kbd">C</span><span class="kbd-desc">复制色值</span></div>
+          <div class="hint-item"><span class="kbd">P</span><span class="kbd-desc">坐标模式</span></div>
+          <div class="hint-item"><span class="kbd">Z</span><span class="kbd-desc">滚轮缩放</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ 方案 D: 极紧凑 ═══ -->
+<div>
+  <h2>方案 D — 极紧凑（62px）</h2>
+  <p class="note">间距更紧，快捷键用 · 分隔<br>适合追求最小化信息栏的场景</p>
+  <div class="row">
+    <div class="magnifier">
+      <div class="loupe"><div class="cross-h"></div><div class="cross-v"></div><div class="center-cell"></div><div class="zoom-badge">20x</div></div>
+      <div class="info info-d">
+        <div class="main-line">
+          <div class="swatch" style="background:#ff6b35;"></div>
+          <span class="colour-val">hsl(16, 100%, 60%)</span>
+          <span class="spacer"></span>
+          <span class="coord-l">X</span><span class="coord-v">1079</span>
+          <span class="coord-l">Y</span><span class="coord-v">854</span>
+        </div>
+        <div class="hint-line">
+          <div class="hint-item"><span class="kbd">S</span><span class="kbd-desc">色值格式</span></div>
+          <span class="sep">·</span>
+          <div class="hint-item"><span class="kbd">C</span><span class="kbd-desc">复制色值</span></div>
+          <span class="sep">·</span>
+          <div class="hint-item"><span class="kbd">P</span><span class="kbd-desc">坐标模式</span></div>
+          <span class="sep">·</span>
+          <div class="hint-item"><span class="kbd">Z</span><span class="kbd-desc">滚轮缩放</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>
