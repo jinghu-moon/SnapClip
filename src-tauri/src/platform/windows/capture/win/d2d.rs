@@ -208,6 +208,13 @@ pub struct RenderView {
     pub annotation_selected_id: Option<crate::capture::annotation::AnnotationId>,
     /// Item being actively drawn (draft, not yet in `annotation_items`).
     pub annotation_draft: Option<crate::capture::annotation::AnnotationItem>,
+    // ── Window-snap hints (docs/14 §8) ────────────────────────────────────────
+    /// Window under the cursor, in back-buffer coordinates. Paint-only: it never
+    /// changes the selection.
+    pub hover_bounds: Option<Rect>,
+    /// Automatic-snap preview, in back-buffer coordinates. Painted as its own layer so a
+    /// preview can never be confused with a confirmed selection.
+    pub preview_bounds: Option<Rect>,
 }
 
 impl RenderView {
@@ -232,6 +239,8 @@ impl RenderView {
             annotation_items: Vec::new(),
             annotation_selected_id: None,
             annotation_draft: None,
+            hover_bounds: None,
+            preview_bounds: None,
         }
     }
 }
@@ -266,6 +275,10 @@ pub struct OverlayRenderer {
     frame_bitmap: Option<ID2D1Bitmap1>,
     border_brush: Option<ID2D1SolidColorBrush>,
     mask_brush: Option<ID2D1SolidColorBrush>,
+    /// `rgba(255,255,255,0.10)` — lifts the hovered window out of the dark mask.
+    hover_fill_brush: Option<ID2D1SolidColorBrush>,
+    /// Accent wash at low alpha — marks the automatic-snap preview.
+    preview_fill_brush: Option<ID2D1SolidColorBrush>,
     handle_brush: Option<ID2D1SolidColorBrush>,
     label_background_brush: Option<ID2D1SolidColorBrush>,
     label_text_brush: Option<ID2D1SolidColorBrush>,
@@ -341,6 +354,8 @@ impl OverlayRenderer {
             frame_bitmap: None,
             border_brush: None,
             mask_brush: None,
+            hover_fill_brush: None,
+            preview_fill_brush: None,
             handle_brush: None,
             label_background_brush: None,
             label_text_brush: None,
@@ -504,6 +519,14 @@ impl OverlayRenderer {
     /// never the mask, chrome, grips, magnifier or control points, which must not enter
     /// the artifact (docs/11 §8.2/§8.4).
     pub fn render_export(&mut self, view: &RenderView) -> Result<Vec<u8>, String> {
+        // Artifact pixels never contain interactive hints. Enforced here — the one place
+        // that produces them — so the invariant does not depend on every caller
+        // remembering to clear them (docs/14 §8).
+        let view = &RenderView {
+            hover_bounds: None,
+            preview_bounds: None,
+            ..view.clone()
+        };
         let (frame_w, frame_h) = self.size;
         if frame_w == 0 || frame_h == 0 {
             return Err("overlay renderer has no back-buffer size for export".into());
@@ -635,6 +658,12 @@ impl OverlayRenderer {
         }
 
         // L3: selection chrome.
+        // L2.5: window-snap hints. Painted between the annotations and the selection
+        // chrome so the preview reads as "this is what would be selected" without ever
+        // impersonating the confirmed selection (docs/14 §8).
+        self.draw_window_hints(view)?;
+
+        // L3: selection chrome.
         if view.show_chrome && !view.selection.is_empty() {
             let resources = ChromeResources {
                 frame_bitmap,
@@ -652,6 +681,46 @@ impl OverlayRenderer {
                     .require_brush(&self.magnifier_info_brush, "magnifier info brush")?,
             };
             self.draw_chrome(view, &resources)?;
+        }
+        Ok(())
+    }
+
+    /// L2.5: the hovered window and the automatic-snap preview (docs/14 §8).
+    ///
+    /// Hover is a neutral wash with a thin accent outline; the preview adds a stronger
+    /// accent wash at double stroke weight so it is unmistakably a preview. Both are
+    /// clipped to the back buffer, and neither touches the mask hole or the confirmed
+    /// selection: they are independent layers, which is what stops a preview from
+    /// silently rewriting a settled selection.
+    fn draw_window_hints(&mut self, view: &RenderView) -> Result<(), String> {
+        if view.hover_bounds.is_none() && view.preview_bounds.is_none() {
+            return Ok(());
+        }
+        let border = self.require_brush(&self.border_brush, "border brush")?;
+        let width = self.metrics.border_width;
+
+        if let Some(hover) = view.hover_bounds {
+            let rect = hover.intersect(view.frame);
+            if !rect.is_empty() {
+                let fill = self.require_brush(&self.hover_fill_brush, "hover fill brush")?;
+                unsafe {
+                    self.d2d.FillRectangle(&to_d2d(rect), &fill);
+                    self.d2d
+                        .DrawRectangle(&to_d2d(rect), &border, width, None);
+                }
+            }
+        }
+
+        if let Some(preview) = view.preview_bounds {
+            let rect = preview.intersect(view.frame);
+            if !rect.is_empty() {
+                let fill = self.require_brush(&self.preview_fill_brush, "preview fill brush")?;
+                unsafe {
+                    self.d2d.FillRectangle(&to_d2d(rect), &fill);
+                    self.d2d
+                        .DrawRectangle(&to_d2d(rect), &border, width * 2.0, None);
+                }
+            }
         }
         Ok(())
     }
@@ -1605,6 +1674,13 @@ impl OverlayRenderer {
         let info = color(0.02, 0.02, 0.025, 0.94);
         self.mask_brush = Some(self.create_brush(&mask)?);
         self.border_brush = Some(self.create_brush(&accent)?);
+        // Window-snap hints reuse the existing palette: a neutral wash for the hovered
+        // window and a low-alpha accent wash for the preview, so no new colour is
+        // introduced (docs/14 §8).
+        let hover_fill = color(1.0, 1.0, 1.0, 0.10);
+        self.hover_fill_brush = Some(self.create_brush(&hover_fill)?);
+        let preview_fill = color(31.0 / 255.0, 117.0 / 255.0, 219.0 / 255.0, 0.18);
+        self.preview_fill_brush = Some(self.create_brush(&preview_fill)?);
         self.handle_brush = Some(self.create_brush(&white)?);
         self.label_background_brush = Some(self.create_brush(&panel)?);
         self.label_text_brush = Some(self.create_brush(&white)?);
@@ -2068,6 +2144,88 @@ mod tests {
         );
     }
 
+    /// Hover and preview are painted as their own layers, and neither is baked into the
+    /// exported pixels (docs/14 §8).
+    #[test]
+    fn window_snap_hints_are_painted_but_never_exported() {
+        let Ok(device) = super::GraphicsDevice::create() else {
+            return;
+        };
+        let width = 64u32;
+        let height = 48u32;
+        let background = [200u8, 180, 160, 255];
+        let Ok(mut renderer) = OverlayRenderer::new(std::sync::Arc::new(device), 96) else {
+            return;
+        };
+        renderer
+            .update_frame(width, height, &solid_bgra(width, height, background))
+            .unwrap();
+        renderer.ensure_back_buffer(width, height).unwrap();
+        let target = renderer
+            .device()
+            .create_render_target_texture(width, height)
+            .unwrap();
+        let d2d_context = renderer.device().create_d2d_context().unwrap();
+        let bitmap = super::super::d3d11::create_bitmap_from_texture(
+            &d2d_context,
+            &target.texture,
+            D2D1_BITMAP_OPTIONS_TARGET,
+            D2D1_ALPHA_MODE_PREMULTIPLIED,
+        )
+        .unwrap();
+
+        let mut view = RenderView::new(Rect::from_origin_size(
+            Point::new(0, 0),
+            width as i32,
+            height as i32,
+        ));
+        view.cursor_visible = false;
+        let window = Rect::new(8, 8, 40, 32);
+        let sample = |pixels: &[u8], x: u32, y: u32| pixel_at(pixels, width, x, y);
+
+        // Baseline: no hint at all, so the whole frame is masked down.
+        renderer.draw_to(&bitmap, &view).unwrap();
+        let bare = renderer.device().read_back_bgra(&target.texture).unwrap();
+        let masked = sample(&bare, 20, 20);
+
+        // Hover: the window is lifted out of the mask, everything else is untouched.
+        view.hover_bounds = Some(window);
+        renderer.draw_to(&bitmap, &view).unwrap();
+        let hovered = renderer.device().read_back_bgra(&target.texture).unwrap();
+        let hover_pixel = sample(&hovered, 20, 20);
+        assert_ne!(hover_pixel, masked, "the hover wash must lighten the window");
+        assert_eq!(
+            sample(&hovered, 60, 44),
+            masked,
+            "the mask outside the hovered window must not change"
+        );
+
+        // Preview: its own accent wash, distinct from both the mask and the hover wash.
+        view.hover_bounds = None;
+        view.preview_bounds = Some(window);
+        renderer.draw_to(&bitmap, &view).unwrap();
+        let previewed = renderer.device().read_back_bgra(&target.texture).unwrap();
+        let preview_pixel = sample(&previewed, 20, 20);
+        assert_ne!(preview_pixel, masked, "the preview must be visible");
+        assert_ne!(
+            preview_pixel, hover_pixel,
+            "the preview must be distinguishable from the hover hint"
+        );
+
+        // Exporting the previewed rectangle must produce raw frozen pixels: a hint is a
+        // hint, and it must never reach the artifact.
+        view.hover_bounds = Some(window);
+        view.selection = window;
+        let exported = renderer.render_export(&view).unwrap();
+        assert_eq!(exported.len(), (window.width() * window.height() * 4) as usize);
+        assert!(
+            exported
+                .chunks_exact(4)
+                .all(|pixel| pixel == background.as_slice()),
+            "hover/preview hints must never be exported"
+        );
+    }
+
     /// The size label is painted with an opaque panel above the selection when there is room.
     #[test]
     fn size_label_panel_is_painted_at_the_selection_top_left() {
@@ -2318,14 +2476,5 @@ mod tests {
         );
     }
 }
-
-
-
-
-
-
-
-
-
 
 

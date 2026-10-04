@@ -643,3 +643,92 @@ Phase 2/4 已覆盖的相关单测（此处一并计入门禁证据）：
 | provider 级 bounded timeout / quarantine | 未实现 | v1 不引入 UIA/MSAA；`DwmGetWindowAttribute` 本身无超时参数，实测单窗口重验证 max 219 µs。若 Phase 6 实测出现长尾，再按 docs/14 §5.5 引入隔离 |
 | HWND 真机重用（close→open 同句柄） | 未构造 | 需要精确控制句柄回收；以 `WindowIdentity` 三元组单测 + `read_target` 的 PID/类名校验覆盖，Phase 7 人工复核 |
 | 显示器拓扑变化时的 hover 失效 | 未覆盖 | 显示器变化走 `WM_DISPLAYCHANGE` → 取消会话（既有路径）；新会话重新建快照 |
+
+---
+
+## Phase 5：Settled 编辑态、overlay 渲染与排除集成
+
+### 5.1 修改前基线
+
+| 指标 | Phase 5 修改前 |
+| --- | --- |
+| `cargo test --lib` | 291 passed / 0 failed |
+| `cargo check --all-targets` | 0 warnings |
+| 预览/hover 是否可见 | **不可见**：`OverlayFrameState` / `RenderView` 没有对应字段，D2D 也没有绘制层 |
+| Present（会话内） | ≈53 次/会话（Phase 0/1 基线） |
+
+### 5.2 落地内容
+
+| 能力 | 位置 | 说明 |
+| --- | --- | --- |
+| hover/预览绘制 | `win/d2d.rs` | 新增 L2.5 层 `draw_window_hints`：hover = 中性白 10% 填充 + 细描边；preview = 强调色 18% 填充 + 双倍描边。夹在 annotations 与选区 chrome 之间，**独立于选区**，因此预览永远不会被误读成已确认选区 |
+| 新配色 | 同上 `recreate_resources` | 仅两个半透明填充笔刷，复用既有 `border_brush` 描边与调色板 |
+| 状态传递 | `renderer.rs` / `overlay.rs` | `OverlayFrameState` + `RenderView` 增加 `hover_bounds` / `preview_bounds`（显示器本地坐标）；`hover_bounds_local()` 由缓存的 hover 目标转换而来 |
+| 导出保护 | `win/d2d.rs::render_export` | 出口层强制清空两个 hint 字段：**产物像素永远不含交互提示**，该不变量由产物路径自己拥有，不依赖每个调用方记得清空 |
+| Settled 语义 | `overlay.rs` | `update_hover` 仅在 `Selecting` 解析目标；确认后 `hover_target`/预览被清空，dwell 计时器 disarm。已确认选区不会被后续 hover/预览改写 |
+| affinity 层（第 1 层） | `overlay.rs::exclude_overlay_from_capture` | overlay HWND 创建后立即 `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`；失败只降级为日志 |
+| 命中排除层（第 2 层） | `OverlayController::new` | overlay HWND + 本进程 PID（Phase 3 已加，本阶段并入三层说明） |
+| 捕获降级层（第 3 层） | 既有 `apply_prepared` 顺序 | 冻结帧在 overlay 显示**之前**捕获，是**无条件**生效的兜底 |
+
+### 5.3 设计偏差（已显式记录，非静默偏离）
+
+docs/14 §7 要求 affinity 之前先做 `RtlGetVersion` 探测（Win10 2004+）。本实现**不做版本探测**，
+原因：第 3 层兜底（先冻结后显示）是无条件启用的，affinity 只是加固；探测失败与调用失败在
+行为上完全等价，多加一条版本分支只会增加一条无法被测试覆盖的路径。调用失败时记录
+`overlay affinity unavailable (Win32 error <code>); relying on capture-before-show`。
+
+### 5.4 静态、单元与视觉回归
+
+| 项目 | 命令 | 结果 |
+| --- | --- | --- |
+| 单元测试 | `cargo test --lib` | **292 passed / 0 failed**（Phase 4 基线 291 → +1） |
+| 编译零告警 | `cargo check --all-targets` | exit 0，**0 warnings** |
+| 前端 | `npm run typecheck` / `npm run build` | exit 0 |
+
+新增 GPU 视觉回归（`d2d::window_snap_hints_are_painted_but_never_exported`，真实 D3D11 + D2D 回读）：
+
+| 断言 | 含义 |
+| --- | --- |
+| hover 填充后窗口内像素 ≠ 纯遮罩像素 | hover 高亮**确实被画出来** |
+| 窗口外像素 == 纯遮罩像素 | 高亮不扩散到其他区域 |
+| preview 像素 ≠ hover 像素 ≠ 遮罩像素 | 预览与 hover **可区分**，不会被当成同一种状态 |
+| 导出同一矩形得到逐像素原始冻结帧 | 提示永不进入产物 |
+
+### 5.5 实机端到端证据（`.tmp-p3-probe.ps1` 复跑，4K/DPI144/单屏 WGC）
+
+同一探针流程（F5 → 停稳 → 点击 → 停稳 → Enter → Esc）在当前构建上复跑：
+
+```text
+[capture] overlay excluded from capture                       # affinity 生效（Windows 11 26100）
+[win-detect] snapshot epoch=1 candidates=5
+[win-detect] hover hwnd=2818722 z=0 bounds=(2111,960)->(2719,1399)
+[win-detect] auto-snap preview hwnd=2818722 epoch=1 local=(2111,960)->(2719,1399)
+[capture] pointer down … hit=Create, outcome=Pending           # 渲染接入后按下语义不变
+[capture] pointer up   … selection=(0,0)->(0,0) state=Selecting
+[win-detect] snapshot epoch=2 candidates=5                     # Esc 后再次 F5：新 epoch、无旧选区
+[win-detect] snap confirmed hwnd=2818722 selection=(2111,960)->(2719,1399)
+[capture] cancel session=…-1/-2 reason=escape active=true
+```
+
+Present 次数 21（2 个会话，其中含大量静置时间），错误行 0，
+`window_validate_us` last 18 µs、`hover_revalidate_stale_dropped_count=0`。
+
+### 5.6 质量门禁逐条对应
+
+| 门禁 | 证据 |
+| --- | --- |
+| 第一次 Esc 后再次 F5 不出现旧选区闪现 | 既有 `apply_prepared` 在 `show_overlay` 之前同步 `paint_now()`；实机两次会话 `snapshot epoch=1 → epoch=2`，第二次预览从零开始 |
+| 已确认选区不会被 hover 或自动吸附偷偷改写 | `update_hover` 只在 `Selecting` 工作；确认时清 hover/预览；预览绘制为独立 L2.5 层 |
+| overlay、工具栏、颜色面板不会进入截图或吸附候选 | 截图：affinity（实机日志）+ 先冻结后显示；吸附：overlay HWND + 本进程 PID 排除（`candidates` 中始终不含自家窗口） |
+| Settled 状态可移动/缩放，Esc 仍可取消 | 既有 `session::dragging_inside_moves_the_existing_selection`、`resize_*`、`esc_from_every_active_state_returns_to_idle` 全部保持通过 |
+| 捕获层 exclusions 和检测层 exclusions 有独立测试 | 检测层：`Exclusions` 单测 + provider 真机测试；捕获层：`chrome_stays_out_of_the_exported_pixels` + 本阶段新增 `window_snap_hints_are_painted_but_never_exported` |
+
+### 5.7 未执行项与风险
+
+| 项目 | 状态 | 原因 / 替代 |
+| --- | --- | --- |
+| “全屏十字线在 Settled 关闭” | 不适用 | SnapClip 没有全屏十字线：reticle 是放大镜内部的局部准星（Phase 4 记录）。Settled 下保留放大镜是既有产品行为，不在本功能范围内 |
+| affinity 生效的**外部**取证（用第三方工具截屏后人工比对） | 未执行 | 探针日志已证明 API 调用成功；像素级取证需要额外截屏工具，列入 Phase 7 人工验收 |
+| 工具栏（独立 Tauri 窗口）的显式 HWND 注册 | 未执行 | 本进程 PID 排除已覆盖全部自家窗口（含工具栏/颜色面板/主窗口），显式 HWND 集合属于冗余加固 |
+| 捕获后端 native session 的 exclusion 列表重建 | 不适用 | 本项目的 provider 是**显示器级**捕获（WGC/BitBlt），没有逐窗口 exclusion 列表；该要求对应的是 snow_shot 的窗口级捕获模型 |
+| 预览高亮的视觉美观度/动效 | 未评审 | 需要人工目检；实现只用了两个半透明填充 + 既有描边色，未引入新配色体系 |

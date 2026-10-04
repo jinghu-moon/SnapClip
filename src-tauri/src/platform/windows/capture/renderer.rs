@@ -43,6 +43,10 @@ pub struct OverlayFrameState {
     pub annotation_selected_id: Option<AnnotationId>,
     /// Item currently being drawn (not yet committed).
     pub annotation_draft: Option<AnnotationItem>,
+    /// Window under the cursor, in monitor-local coordinates (paint-only hint).
+    pub hover_bounds: Option<Rect>,
+    /// Automatic-snap preview, in monitor-local coordinates.
+    pub preview_bounds: Option<Rect>,
 }
 
 impl OverlayFrameState {
@@ -59,6 +63,8 @@ impl OverlayFrameState {
             annotation_items: Vec::new(),
             annotation_selected_id: None,
             annotation_draft: None,
+            hover_bounds: None,
+            preview_bounds: None,
         }
     }
 }
@@ -187,6 +193,8 @@ impl Win32Renderer {
             annotation_items: live_items,
             annotation_selected_id: live_selected,
             annotation_draft: live_draft,
+            hover_bounds: state.hover_bounds,
+            preview_bounds: state.preview_bounds,
         };
         self.d2d.render(&view)?;
         self.d2d.present()?;
@@ -222,6 +230,10 @@ impl Win32Renderer {
             annotation_items: live_items,
             annotation_selected_id: None,
             annotation_draft: None,
+            // Hover/preview hints are cleared by `OverlayRenderer::render_export`, which
+            // owns the "no hints in the artifact" invariant.
+            hover_bounds: state.hover_bounds,
+            preview_bounds: state.preview_bounds,
         };
         self.d2d.render_export(&view)
     }

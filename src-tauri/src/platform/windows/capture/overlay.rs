@@ -43,6 +43,7 @@ use windows_sys::Win32::{
             PostQuitMessage,
             PostThreadMessageW, RegisterClassW, SW_HIDE, SW_SHOW, SetForegroundWindow,
             SetWindowPos, SetTimer, KillTimer, GetSystemMetrics, SM_CXDRAG,
+            SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE,
             ShowWindow, TranslateMessage, UnregisterClassW, WM_APP, WM_DESTROY, WM_DEVICECHANGE,
             WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP,
             WM_MOUSEWHEEL, WM_SETFOCUS, WM_LBUTTONDOWN,
@@ -978,10 +979,13 @@ where
                 magnifier_color_text: None,
                 magnifier_relative: false,
                 magnifier_zoom: self.magnifier_zoom,
-                annotation_items: self.annotation_doc.items().to_vec(),
-                annotation_selected_id: None,
-                annotation_draft: None,
-            };
+            annotation_items: self.annotation_doc.items().to_vec(),
+            annotation_selected_id: None,
+            annotation_draft: None,
+            // The exported pixels must never contain a hover or preview hint.
+            hover_bounds: None,
+            preview_bounds: None,
+        };
             let Some(renderer) = self.renderer.as_mut() else {
                 self.cancel("annotation-export-without-renderer");
                 return;
@@ -1222,6 +1226,18 @@ where
     /// Monitor-local cursor position expressed in virtual-desktop coordinates.
     fn cursor_screen(&self) -> Option<Point> {
         self.layout().map(|layout| layout.to_screen(self.cursor))
+    }
+
+    /// The hovered window in monitor-local coordinates, ready for the paint layer.
+    ///
+    /// Returns `None` once the session is settled, which is what turns window hover off
+    /// after a confirmation (docs/14 §4.1) without a second state flag: `update_hover`
+    /// already refuses to resolve a target outside `Selecting`.
+    fn hover_bounds_local(&self) -> Option<Rect> {
+        let layout = self.layout()?;
+        let target = self.hover_target?;
+        let rect = window_rect_to_local(target.screen_bounds(), &layout);
+        (!rect.is_empty()).then_some(rect)
     }
 
     /// Re-resolve the hovered window from the cached snapshot. **Pure cache read.**
@@ -2094,6 +2110,10 @@ where
             return;
         }
         let session_id = self.session_id();
+        // Resolve the paint-only window hints before borrowing the renderer, so the
+        // snapshot lookup and the preview read do not overlap a mutable borrow.
+        let hover_bounds = self.hover_bounds_local();
+        let preview_bounds = self.gesture.snap_preview().map(|preview| preview.selection);
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
@@ -2117,6 +2137,8 @@ where
             annotation_items: self.annotation_doc.items().to_vec(),
             annotation_selected_id: self.annotation_doc.selected_id(),
             annotation_draft: self.annotation_doc.draft.clone(),
+            hover_bounds,
+            preview_bounds,
         };
         // Live borrow of annotation document avoids cloning items every tick.
         match renderer.render(&state, Some(&self.annotation_doc)) {
@@ -2349,6 +2371,20 @@ where
     }
 }
 
+/// Keep the overlay out of capture output (docs/14 §7, layer 1 of three).
+///
+/// `WDA_EXCLUDEFROMCAPTURE` requires Windows 10 2004+. SnapClip deliberately does not
+/// probe the OS version first: the capture path freezes the frame **before** the overlay
+/// is shown, so the fallback is unconditional and always in effect. A failure here only
+/// means the extra hardening is unavailable on this build — it can never mean the
+/// overlay could reach a screenshot.
+fn exclude_overlay_from_capture(window: HWND) -> Result<(), u32> {
+    if unsafe { SetWindowDisplayAffinity(window, WDA_EXCLUDEFROMCAPTURE) } != 0 {
+        return Ok(());
+    }
+    Err(unsafe { GetLastError() })
+}
+
 /// System drag threshold (`SM_CXDRAG`) in physical pixels for a monitor DPI.
 ///
 /// The value is a logical distance, so it is scaled the same way the reference selector
@@ -2448,6 +2484,17 @@ fn overlay_thread<D, E>(
             unsafe { GetLastError() }
         )));
         return;
+    }
+
+    // Layer 1 of the three-layer self-exclusion (docs/14 §7): keep the overlay out of any
+    // capture, even if a future path captures while it is visible. The hit-filter layer is
+    // registered by the controller, and the fallback is the capture-before-show ordering.
+    match exclude_overlay_from_capture(window) {
+        Ok(()) => eprintln!("[snapclip][capture] overlay excluded from capture"),
+        Err(code) => eprintln!(
+            "[snapclip][capture] overlay affinity unavailable (Win32 error {code}); \
+             relying on capture-before-show"
+        ),
     }
 
     if let Err(error) = hotkey::register_capture_hotkey(window) {
