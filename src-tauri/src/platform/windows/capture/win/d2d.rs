@@ -131,6 +131,10 @@ pub struct RenderView {
     pub work_area: Rect,
     /// Regions that must be repainted; empty means "repaint everything".
     pub damage: Vec<Rect>,
+    /// Current color sample as RGB tuple for the info-panel swatch.
+    pub magnifier_rgb: Option<(u8, u8, u8)>,
+    /// Formatted #RRGGBB hex string from the async sampler.
+    pub magnifier_hex: Option<String>,
 }
 
 impl RenderView {
@@ -149,6 +153,8 @@ impl RenderView {
             show_chrome: false,
             work_area: frame,
             damage: Vec::new(),
+            magnifier_rgb: None,
+            magnifier_hex: None,
         }
     }
 }
@@ -623,27 +629,29 @@ impl OverlayRenderer {
             );
             self.d2d.PopAxisAlignedClip();
 
-            // Draw a restrained pixel grid over the nearest-neighbour image. It
-            // makes the sampled source pixels legible without obscuring the frame.
-            let step = geometry.zoom.max(1) as f32;
+            // Pixel grid: only at zoom >= 4 where each cell is wide enough to
+            // render legibly. Integer-aligned to avoid sub-pixel blur.
             let panel = geometry.panel;
-            for index in 1..geometry.source.width() {
-                let x = panel.left as f32 + index as f32 * step + 0.5;
-                self.d2d.DrawLine(
-                    vector2(x, panel.top as f32),
-                    vector2(x, panel.bottom as f32),
-                    grid,
-                    1.0,
-                    None,
-                );
-                let y = panel.top as f32 + index as f32 * step + 0.5;
-                self.d2d.DrawLine(
-                    vector2(panel.left as f32, y),
-                    vector2(panel.right as f32, y),
-                    grid,
-                    1.0,
-                    None,
-                );
+            if geometry.zoom >= 4 {
+                let step = geometry.zoom as f32;
+                for index in 1..geometry.source.width() {
+                    let x = panel.left as f32 + index as f32 * step + 0.5;
+                    self.d2d.DrawLine(
+                        vector2(x, panel.top as f32),
+                        vector2(x, panel.bottom as f32),
+                        grid,
+                        1.0,
+                        None,
+                    );
+                    let y = panel.top as f32 + index as f32 * step + 0.5;
+                    self.d2d.DrawLine(
+                        vector2(panel.left as f32, y),
+                        vector2(panel.right as f32, y),
+                        grid,
+                        1.0,
+                        None,
+                    );
+                }
             }
 
             // Outline the source pixel under the cursor rather than painting a
@@ -667,23 +675,70 @@ impl OverlayRenderer {
             self.d2d.DrawRectangle(&to_d2d(center_cell), focus, 1.0, None);
 
             self.d2d.FillRectangle(&to_d2d(geometry.info_panel), info);
-            let coordinate = format!(
-                "({}, {})",
-                view.cursor.x + view.screen_origin.x,
-                view.cursor.y + view.screen_origin.y
+
+            // --- Info panel layout: [swatch 20px] [hex text] / [coords] ---
+            let swatch_size = 20i32;
+            let info = geometry.info_panel;
+            let swatch_rect = Rect::from_origin_size(
+                Point::new(info.left + 4, info.top + (info.height() - swatch_size) / 2),
+                swatch_size,
+                swatch_size,
             );
+            // GPU color swatch: draw 1×1 pixel from the frame bitmap at center.
+            // This updates immediately without waiting for async CPU readback.
+            let src_pixel = Rect::from_origin_size(geometry.center, 1, 1);
+            self.d2d.DrawBitmap(
+                bitmap,
+                Some(&to_d2d(swatch_rect)),
+                1.0,
+                D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                Some(&to_d2d(src_pixel)),
+                None,
+            );
+            // Swatch border outline
+            self.d2d.DrawRectangle(&to_d2d(swatch_rect), border, 1.0, None);
+
+            // Text area: right of swatch
+            let text_x = (swatch_rect.right + 6) as f32;
+            let line_height = metrics.label_font_size * 1.3;
+            let text_y_base = info.top as f32 + (info.height() as f32 - line_height * 2.0) / 2.0;
+
+            // Line 1: #RRGGBB (or placeholder when color not yet available)
+            let hex_text = view.magnifier_hex.as_deref().unwrap_or("......");
             let format = self.label_text_format_mut()?;
-            let wide = coordinate.encode_utf16().collect::<Vec<u16>>();
-            let text_rect = D2D_RECT_F {
-                left: geometry.info_panel.left as f32 + metrics.label_padding_x,
-                top: geometry.info_panel.top as f32,
-                right: geometry.info_panel.right as f32 - metrics.label_padding_x,
-                bottom: geometry.info_panel.bottom as f32,
+            let wide_hex = hex_text.encode_utf16().collect::<Vec<u16>>();
+            let hex_rect = D2D_RECT_F {
+                left: text_x,
+                top: text_y_base,
+                right: info.right as f32 - metrics.label_padding_x,
+                bottom: text_y_base + line_height,
             };
             self.d2d.DrawText(
-                &wide,
+                &wide_hex,
                 &format,
-                &text_rect,
+                &hex_rect,
+                &resources.label_text,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+
+            // Line 2: physical coordinate
+            let coordinate = format!(
+                "{},{}",
+                view.cursor.x + view.screen_origin.x,
+                view.cursor.y + view.screen_origin.y,
+            );
+            let wide_coord = coordinate.encode_utf16().collect::<Vec<u16>>();
+            let coord_rect = D2D_RECT_F {
+                left: text_x,
+                top: text_y_base + line_height,
+                right: info.right as f32 - metrics.label_padding_x,
+                bottom: text_y_base + line_height * 2.0,
+            };
+            self.d2d.DrawText(
+                &wide_coord,
+                &format,
+                &coord_rect,
                 &resources.label_text,
                 D2D1_DRAW_TEXT_OPTIONS_NONE,
                 DWRITE_MEASURING_MODE_NATURAL,

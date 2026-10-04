@@ -17,8 +17,9 @@ use ::windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use ::windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_CPU_ACCESS_READ,
     D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_SUBRESOURCE_DATA,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING, D3D11CreateDevice,
+    D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION,
+    D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
+    D3D11CreateDevice,
     ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
 };
 use ::windows::Win32::Graphics::DirectComposition::{
@@ -96,6 +97,11 @@ impl GraphicsDevice {
 
     pub fn device(&self) -> &ID3D11Device {
         &self.d3d
+    }
+
+    /// Access the immediate device context (same thread usage constraint as D2D).
+    pub fn context(&self) -> &ID3D11DeviceContext {
+        &self.context
     }
 
 
@@ -435,6 +441,135 @@ impl Drop for CompositionTarget {
         // Release the visual before the target and the device.
         let _ = unsafe { self.target.SetRoot(None) };
         let _ = unsafe { self.device.Commit() };
+    }
+}
+
+/// Three-slot async GPU staging sampler for magnifier color extraction.
+///
+/// Each slot owns a 32×32 BGRA staging texture.
+/// `submit` copies a tile into the next slot (queued, non-blocking).
+/// `poll` uses `Map(DO_NOT_WAIT)` to check if the GPU finished without blocking.
+pub struct AsyncSampleBuffer {
+    context: ID3D11DeviceContext,
+    slots: [ID3D11Texture2D; 3],
+    next_slot: usize,
+    pending: [bool; 3],
+}
+
+const SAMPLE_TILE: u32 = 32;
+const SLOT_COUNT: usize = 3;
+
+impl AsyncSampleBuffer {
+    /// Allocate staging textures. Call once per overlay session.
+    pub fn new(device: &ID3D11Device, context: &ID3D11DeviceContext) -> Result<Self, String> {
+        let staging_desc = D3D11_TEXTURE2D_DESC {
+            Width: SAMPLE_TILE,
+            Height: SAMPLE_TILE,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: 0,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            MiscFlags: 0,
+        };
+        let mut slot_vec: Vec<ID3D11Texture2D> = Vec::with_capacity(SLOT_COUNT);
+        for _ in 0..SLOT_COUNT {
+            let mut tex: Option<ID3D11Texture2D> = None;
+            unsafe { device.CreateTexture2D(&staging_desc, None, Some(&mut tex)) }
+                .map_err(|e| super::hresult("CreateTexture2D(sample staging)", &e))?;
+            slot_vec.push(tex.ok_or_else(|| "CreateTexture2D returned null".to_string())?);
+        }
+        let arr: [ID3D11Texture2D; 3] = slot_vec
+            .try_into()
+            .map_err(|_| "slot count mismatch".to_string())?;
+        Ok(Self {
+            context: context.clone(),
+            slots: arr,
+            next_slot: 0,
+            pending: [false; SLOT_COUNT],
+        })
+    }
+
+    /// Copy a `tile_size × tile_size` region starting at `(x, y)` from `source`
+    /// into the next free staging slot. Returns the slot index.
+    ///
+    /// Non-blocking: the GPU operation is queued to the immediate context.
+    /// Must be called from the overlay thread.
+    pub fn submit(
+        &mut self,
+        source: &ID3D11Texture2D,
+        x: u32,
+        y: u32,
+        tile_size: u32,
+    ) -> Result<usize, String> {
+        let slot = self.next_slot;
+        self.next_slot = (self.next_slot + 1) % SLOT_COUNT;
+        let src_box = D3D11_BOX {
+            left: x,
+            top: y,
+            front: 0,
+            right: x.saturating_add(tile_size),
+            bottom: y.saturating_add(tile_size),
+            back: 1,
+        };
+        unsafe {
+            self.context.CopySubresourceRegion(
+                &self.slots[slot], 0, 0, 0, 0, source, 0, Some(&src_box),
+            );
+        }
+        self.pending[slot] = true;
+        Ok(slot)
+    }
+
+    /// Non-blocking poll: attempts `Map(DO_NOT_WAIT)` on the staging texture.
+    /// Returns the full `tile_size × tile_size` BGRA data (tightly packed) on success.
+    /// Returns `None` if still in flight, `Some(Err(...))` on failure.
+    pub fn poll(&mut self, slot: usize) -> Option<Result<Vec<u8>, String>> {
+        if slot >= SLOT_COUNT || !self.pending[slot] {
+            return None;
+        }
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        let map_result = unsafe {
+            self.context.Map(
+                &self.slots[slot],
+                0,
+                D3D11_MAP_READ,
+                D3D11_MAP_FLAG_DO_NOT_WAIT.0 as u32,
+                Some(&mut mapped),
+            )
+        };
+        match map_result {
+            Ok(()) => {
+                let row_bytes = SAMPLE_TILE as usize * 4;
+                let mut pixels = vec![0u8; row_bytes * SAMPLE_TILE as usize];
+                for row in 0..SAMPLE_TILE as usize {
+                    let src = unsafe {
+                        (mapped.pData as *const u8).add(row * mapped.RowPitch as usize)
+                    };
+                    pixels[row * row_bytes..(row + 1) * row_bytes]
+                        .copy_from_slice(unsafe { std::slice::from_raw_parts(src, row_bytes) });
+                }
+                unsafe { self.context.Unmap(&self.slots[slot], 0) };
+                self.pending[slot] = false;
+                Some(Ok(pixels))
+            }
+            Err(e) => {
+                // S_FALSE (code 1) means the copy hasn't finished yet.
+                if e.code().0 == 1 {
+                    return None;
+                }
+                self.pending[slot] = false;
+                Some(Err(super::hresult("Map(sample staging)", &e)))
+            }
+        }
+    }
+
+    /// Abort all pending requests (e.g. on device lost or session reset).
+    pub fn reset(&mut self) {
+        self.pending = [false; SLOT_COUNT];
+        self.next_slot = 0;
     }
 }
 

@@ -53,8 +53,10 @@ use windows_sys::Win32::{
 use crate::application::capture_service::{ArtifactEncoder, ArtifactDir, CaptureService};
 use crate::capture::application::{CaptureEventSink, OverlayPlatform};
 use crate::capture::geometry::{
-    Handle, MonitorLayout, Point, Rect, ResizeMode, SelectionGeometry,
+    Handle, MagnifierConfig, MonitorLayout, Point, Rect, ResizeMode, SelectionGeometry,
+    magnifier_geometry,
 };
+use crate::capture::sampler::ColorSampler;
 use crate::capture::session::{CaptureSession, ExportOutcome};
 use crate::capture::{CaptureError, CaptureResult, CaptureState};
 
@@ -312,6 +314,10 @@ where
     cursor: Point,
     cursor_visible: bool,
     dirty: Vec<Rect>,
+    /// Pure color-sampling state machine (tile hit, throttle, hex formatting).
+    sampler: ColorSampler,
+    /// The GPU slot index of the most recent async sample request.
+    sample_slot: Option<usize>,
     /// Whether the coalescing render tick is currently armed (`SetTimer` running).
     render_armed: bool,
     /// Whether the session's graphics have been handed to the export worker.
@@ -350,6 +356,8 @@ where
             cursor: Point::default(),
             cursor_visible: false,
             dirty: Vec::new(),
+            sampler: ColorSampler::new(),
+            sample_slot: None,
             render_armed: false,
             graphics_released: false,
             session_counter: 0,
@@ -685,6 +693,8 @@ where
         // must not try to present into the graphics we are about to drop.
         self.disarm_render_tick();
         self.dirty.clear();
+        self.sampler.reset();
+        self.sample_slot = None;
         self.hide_overlay();
         // Renderer resources are session-owned. Dropping the renderer releases the
         // captured L0 bitmap, selection chrome, swap chain and composition visual;
@@ -860,6 +870,79 @@ where
         self.sink.on_state(&id, CaptureState::Idle, None);
     }
 
+    // ---- color sampler ---------------------------------------------------
+
+    /// Request an async tile copy if the cursor moved to a new tile and throttle allows.
+    fn request_color_sample(&mut self) {
+        if self.graphics_released || !self.cursor_visible {
+            return;
+        }
+        let Some(renderer) = self.renderer.as_mut() else { return; };
+        let Some(frozen) = self.frozen.as_ref() else { return; };
+        let Some(gpu_frame) = frozen.texture() else { return; };
+        let texture = gpu_frame.texture.clone();
+        let dpi = renderer.layout().dpi;
+        let config = MagnifierConfig::default().scaled(dpi);
+        let geometry = magnifier_geometry(
+            self.cursor,
+            config,
+            renderer.frame(),
+            renderer.layout().local_work_area(),
+        );
+        let now = Instant::now();
+        if !self.sampler.should_request(self.cursor, geometry.tile, now) {
+            // Tile hit: extract color from cached pixels without GPU.
+            if self.sampler.update_cursor(self.cursor) {
+                self.dirty.push(geometry.info_panel);
+                self.invalidate(None);
+            }
+            return;
+        }
+        let tile_x = geometry.tile.left.max(0) as u32;
+        let tile_y = geometry.tile.top.max(0) as u32;
+        let tile_origin = Point::new(geometry.tile.left, geometry.tile.top);
+        match renderer.request_sample(&texture, tile_x, tile_y, config.tile_size as u32) {
+            Ok(slot) => {
+                self.sampler.mark_submitted(tile_origin, now);
+                self.sample_slot = Some(slot);
+            }
+            Err(_) => {
+                self.sampler.mark_stale();
+            }
+        }
+    }
+
+    /// Poll the pending GPU slot; if complete, feed the tile data to the sampler.
+    fn poll_color_sample(&mut self) {
+        let Some(slot) = self.sample_slot.take() else { return; };
+        let Some(renderer) = self.renderer.as_mut() else { return; };
+        match renderer.poll_sample(slot) {
+            Some(Ok(pixels)) => {
+                // Determine tile origin from the pending sampler state.
+                let dpi = renderer.layout().dpi;
+                let config = MagnifierConfig::default().scaled(dpi);
+                let geometry = magnifier_geometry(
+                    self.cursor,
+                    config,
+                    renderer.frame(),
+                    renderer.layout().local_work_area(),
+                );
+                let tile_origin = Point::new(geometry.tile.left, geometry.tile.top);
+                self.sampler.complete(tile_origin, pixels, self.cursor);
+                if self.sampler.is_dirty() {
+                    self.dirty.push(geometry.info_panel);
+                }
+            }
+            Some(Err(_)) => {
+                self.sampler.mark_stale();
+            }
+            None => {
+                // Still in flight — re-register for next tick.
+                self.sample_slot = Some(slot);
+            }
+        }
+    }
+
     // ---- input -----------------------------------------------------------
 
     fn on_mouse_move(&mut self, client: POINT) {
@@ -893,6 +976,7 @@ where
             }
             self.dirty.extend(cursor_damage);
         }
+        self.request_color_sample();
         self.invalidate(None);
     }
 
@@ -1052,6 +1136,8 @@ where
     /// The coalescing tick body: draw everything accumulated since the last present once.
     fn on_render_tick(&mut self) {
         self.disarm_render_tick();
+        // Always poll the pending GPU sample — may extend dirty with info_panel.
+        self.poll_color_sample();
         if self.dirty.is_empty() {
             return;
         }
@@ -1102,6 +1188,8 @@ where
             cursor_visible,
             show_chrome: self.session.shows_chrome(),
             damage,
+            magnifier_rgb: self.sampler.rgb(),
+            magnifier_hex: self.sampler.hex().map(|s| s.to_owned()),
         };
         if let Err(error) = renderer.render(&state) {
             if Win32Renderer::is_device_lost(&error) {

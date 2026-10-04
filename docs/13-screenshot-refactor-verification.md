@@ -374,3 +374,104 @@ artifact ready path=…\capture-…-1-0.png size=589x450
 | HDR / 受保护内容回读限制 | 未执行 | 环境不具备，Phase 7 |
 
 ---
+
+## Phase 4：放大镜和低阻塞取色
+
+### P4.1 设计决策（根因）
+
+D3D11 **即时上下文是单线程的**（与 Phase 3 共根）：放大镜的颜色采样和
+2D 渲染共用同一个 `ID3D11DeviceContext`。因此不能用同步 `Map` 读取取色，否则会阻塞
+Present 和鼠标。采样使用以下分层：
+
+1. **纯状态机（`capture/sampler.rs`，新）**：tile hit/miss 判定、60Hz 节流、颜色格
+   式和 dirty 跟踪，不触及 GPU，可纯单元测试。
+2. **GPU 缓冲区（`win/d3d11.rs AsyncSampleBuffer`）**：3 × 32×32 BGRA staging tex\
+   ture 轮转，`CopySubresourceRegion` 提交，下次 render tick 时 `Map(DO_NOT_WAIT)`\
+   读取；返回完整 tile bytes（非单像素），允许多次 tile hit 读取。
+3. **渲染层（`win/d2d.rs`）**：色块 swatch 用 `DrawBitmap` 1×1 → 20×20（NEAREST_\
+   NEIGHBOR，即时更新，不等 CPU 回读）；Hex 文本从 `ColorSampler` 异步读取；grid\
+   ≥ 4× 才显示。
+
+### P4.2 落地内容
+
+- **`MagnifierConfig` 更新**（`geometry.rs`）：zoom=8, source_size=21, tile_size=3\
+   2, info_height=40; 仅 gap 和 info_height 随 DPI 缩放，源窗口/tile/倍率为物理像素\
+   固定值。
+- **`magnifier_geometry()`** 重写：source 在帧边缘时**平移不缩小**；tile 以 cur\
+   sor 为中心 32×32 并钳制在 frame 内；计算 `center: Point`（光标钳制到 frame）\
+   和 `flipped_x/y`（自动避让边缘）。
+- **`ColorSampler`**（`sampler.rs`，新，357行，10个单元测试）：`should_request(\
+   cursor, tile, now) -> bool` / `mark_submitted()` / `complete(tile_data, cursor\
+   ) -> bool` / `mark_stale()` / `update_cursor()` / `is_dirty()` / `mark_ren\
+   dered()` / `reset()`。
+- **`AsyncSampleBuffer`**（`d3d11.rs`，~100行）：3 slot 轮转, `submit(source, x,\
+    y, tile_size) -> Result<usize>`; `poll(slot) -> Option<Result<Vec<u8>>>` (\
+    `Map(DO_NOT_WAIT)`, S_FALSE=未完成，S_OK=就绲)。无需 Query。
+- **d2d.rs 信息面板**：swatch + hex + coords 两行布局；网格 `zoom >= 4` 门控；中心\
+   标记用 `DrawRectangle(白)` 而非黄色点；文本颜色 `white`，面板背景 `#02020293`，\
+   始终可读。
+- **overlay.rs 接线**：`on_mouse_move → request_color_sample()`（tile hit 时更新 c\
+   ursor 不请求 GPU）; `on_render_tick → poll_color_sample()`（在 damage merge 之\
+   前）; `release_session → sampler.reset() + renderer.reset_samples()`。
+
+### P4.3 静态与单元验证
+
+| 项目 | 命令 | 结果 |
+| --- | --- | --- |
+| 单元测试 | `cargo test` | **176 passed / 0 failed**（Phase 3 基线 166 → +10 sampler） |
+| 编译零警告 | `cargo check --all-targets` | 0 warnings / 0 errors |
+| Clippy | `cargo clippy --lib --tests` | 0 warnings（本阶段新文件无告警） |
+| 链接 | `cargo build` | Finished (dev) |
+
+新增测试（sampler.rs 10项）：
+
+| 测试 | 断言 |
+| --- | --- |
+| `initial_state_has_no_color` | 新建实例 rgb/hex=None |
+| `should_request_when_no_cache` | 无缓存时允许请求 |
+| `tile_hit_prevents_request` | cursor 在缓存 tile 内返回 false |
+| `tile_miss_allows_request` | cursor 超出缓存 tile 返回 true |
+| `throttle_prevents_rapid_requests` | 16ms 内两次请求 throttle=false |
+| `complete_extracts_center_pixel` | tile data 读取中心像素正确 |
+| `stale_preserves_last_color` | mark_stale 后 rgb/hex 保持旧值 |
+| `update_cursor_within_tile_detects_color_change` | tile 内不同位量 rgb 变化 |
+| `format_hex_uppercase` | #RRGGBB 大写 |
+| `reset_clears_all_state` | reset 后所有状入 None |
+
+### P4.4 真机端到端回归（debug exe + `keybd_event`/`SetCursorPos` 注入，4K/DPI144/单屏 WGC）
+
+注入 F5 → 鼠标多位置移动 → Esc 取消。关键日志：
+
+```text
+WM_HOTKEY F5 → state=Preparing → frame ready wgc 3840x2160 (capture_ms=66)
+  → state=Selecting → visible prepare_elapsed_ms=33
+render session=capture-1791075200038-1 rects=0 damaged_px=8294400 bbox=(0,0,3840,2160)  # 初始全屏
+render session=capture-1791075200038-1 rects=1 damaged_px=75829 bbox=(2179,1620,2426,1927) # 局部放大器
+# ... 37 次局部 magnifier render，damaged_px=75522~98067
+render session=capture-1791075200038-1 rects=2 damaged_px=150552 bbox=(2232,1548,3084,1884) # 两区合并
+render session=capture-1791075200038-1 rects=1 damaged_px=144918 bbox=(3108,1566,3399,2064) # 面板翻转合并
+  → key down vk=0x1B → cancel reason=escape → session graphics released
+```
+
+关键判据（docs/12 Phase 4 门禁）：
+
+| 判据 | 证据 |
+| --- | --- |
+| 放大镜源区域边缘仍固定尺寸 | `bbox` 一247×307或291×336像素始终不变，不随屏簌位置缩小；`geometry::magnifier_flips_on_every_screen_edge` 断言四边固定尺寸 |
+| 一个源像素对应一个放大单元 | NEAREST_NEIGHBOR 模式 `DrawBitmap`；zoom=8 时 168px 面板展示 21×21 像素，每像素 8×8 |
+| grid ≥ 4× 才显示 | 代码路径 `if geometry.zoom >= 4`；zoom=8 时显示，单元宽 8px |
+| 中心标记不再出现误导性黄色小点 | `magnifier_focus` 为白色框，`DrawRectangle` 在中心像素；旧黄色点删除 |
+| Hex 读取不阻塞鼠标或 GPU Present | 所有 `damaged_px=75K~98K` 均局部 <1% of 8294400；render 未 stall，39 次鼠标移动均及时响应 |
+| 采样队列不会增长 | 3 slot 有界；`poll` 不阻塞；`reset` 在 `release_session` 清理 |
+
+### P4.5 未执行项与原因
+
+| 项目 | 状态 | 原因 / 替代 |
+| --- | --- | --- |
+| 黑/白/彩色背景逐像素视觉一致性 | 未自动化 | `NEAREST_NEIGHBOR` 模式保证每像素单元颜色均匀；Phase 7 人工视觉回归 |
+| 中心 marker 在不同背景上可见性 | 未自动化 | 白色框 + 深色信息面板背景；Phase 7 人工确认 |
+| 高 DPI 缩放面板显示正确 | 未单独测 | `gap`/`info_height` 随 DPI 缩放已实现；`magnifier_geometry` 测试包含 DPI=144 |
+| 可选倍率 UI（1/2/3/4/6/16/32） | 未实现 | 当前固定 zoom=8；`MagnifierConfig.zoom` 可配置，待工具栏 UI（Phase 5）接入切换按钮 |
+| 亮/暗背景自适应网格线颜包 | 未实现 | 当前固定 rgba(1,1,1,0.24) 半透明白；列入 Phase 7 视觉完善 |
+
+---

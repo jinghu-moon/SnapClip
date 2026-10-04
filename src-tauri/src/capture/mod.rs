@@ -11,6 +11,7 @@
 
 mod error;
 pub mod geometry;
+pub mod sampler;
 pub mod session;
 
 pub mod application;

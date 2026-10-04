@@ -570,51 +570,71 @@ fn clamp_edges(rect: Rect, bounds: Rect) -> Rect {
 pub struct MagnifierGeometry {
     /// Image area containing the magnified frame.
     pub panel: Rect,
-    /// Dark metadata strip below the image area.
+    /// Dark metadata strip below the image area (swatch, hex, coordinates).
     pub info_panel: Rect,
     /// Union of image and metadata areas, used for damage tracking.
     pub bounds: Rect,
-    /// Source rectangle sampled from the frozen back buffer.
+    /// Source rectangle sampled from the frozen back buffer (fixed source_size).
     pub source: Rect,
+    /// Currently active zoom level.
     pub zoom: u32,
     /// Whether the panel was flipped horizontally / vertically to stay visible.
     pub flipped_x: bool,
     pub flipped_y: bool,
+    /// The exact pixel coordinate being sampled (cursor clamped into frame).
+    pub center: Point,
+    /// 32×32 tile in texture coordinates covering the cursor; used for async
+    /// staging color sampling. Cursor may move within this region without
+    /// triggering a new GPU copy ("tile hit").
+    pub tile: Rect,
 }
 
-/// Fixed magnifier configuration for the MVP. Values are physical pixels and are
-/// scaled by DPI at the call site so the panel stays the same physical size.
+/// Fixed magnifier configuration for Phase 4. `zoom`, `source_size` and `tile_size`
+/// are in physical pixels and are **not** scaled by DPI — the magnifier works on raw
+/// pixel grid. Only `gap` and `info_height` scale so that text and spacing remain
+/// legible at high DPI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MagnifierConfig {
     pub zoom: u32,
+    /// Visible magnifier source window (21×21 default, 15×15 compact).
     pub source_size: i32,
+    /// Staging tile for async color sampling (32×32 BGRA).
+    pub tile_size: i32,
+    /// Offset between cursor and panel edge.
     pub gap: i32,
+    /// Height of the info strip below the panel (swatch + hex + coords).
+    pub info_height: i32,
 }
 
 impl Default for MagnifierConfig {
     fn default() -> Self {
         Self {
-            zoom: 4,
-            source_size: 30,
+            zoom: 8,
+            source_size: 21,
+            tile_size: 32,
             gap: 24,
+            info_height: 40,
         }
     }
 }
 
 impl MagnifierConfig {
+    /// Scale only DPI-dependent fields. Source and tile are fixed physical pixels.
     pub fn scaled(&self, dpi: u32) -> Self {
         let scale = dpi.max(96) as f32 / 96.0;
         Self {
             zoom: self.zoom,
-            // Keep the sampled area in physical pixels proportional to the panel.
-            source_size: (self.source_size as f32 * scale).round() as i32,
+            source_size: self.source_size,
+            tile_size: self.tile_size,
             gap: (self.gap as f32 * scale).round() as i32,
+            info_height: (self.info_height as f32 * scale).round() as i32,
         }
     }
 
+    /// Physical pixel width/height of the magnified image panel.
     pub fn panel_size(&self) -> i32 {
         let zoom = self.zoom.max(1) as i32;
-        self.source_size.max(1).saturating_mul(zoom).min(240)
+        self.source_size.max(1).saturating_mul(zoom)
     }
 }
 
@@ -622,6 +642,10 @@ impl MagnifierConfig {
 ///
 /// The panel never covers the cursor hotspot: a gap the size of the configured
 /// offset is kept between the hotspot and the nearest panel edge.
+///
+/// Source rect is always exactly `config.source_size × config.source_size`.
+/// At frame edges it translates (not shrinks) so one source pixel maps to exactly
+/// one zoomed panel cell.
 pub fn magnifier_geometry(
     cursor: Point,
     config: MagnifierConfig,
@@ -630,13 +654,14 @@ pub fn magnifier_geometry(
 ) -> MagnifierGeometry {
     let zoom = config.zoom.max(1);
     let size = config.panel_size().max(1);
-    // Keep the sampled area smaller than the destination panel so DrawBitmap
-    // performs the configured magnification instead of a 1:1 copy.
-    let source_size = (size / zoom as i32).max(1).min(config.source_size.max(1));
+    let source_size = config.source_size.max(1);
+    let tile_size = config.tile_size.max(source_size); // tile >= source
     let half = source_size / 2;
 
-    let info_height = (config.source_size.max(1) + 4).min(40);
+    let info_height = config.info_height.max(1);
     let total_height = size + info_height;
+
+    // Horizontal placement: default right of cursor, flip left if clipped.
     let right_edge = cursor.x + config.gap + size;
     let left_edge = cursor.x - config.gap - size;
     let flipped_x = right_edge > work_area.right && left_edge >= work_area.left;
@@ -646,6 +671,7 @@ pub fn magnifier_geometry(
         cursor.x + config.gap
     };
 
+    // Vertical placement: default below cursor, flip above if clipped.
     let bottom_edge = cursor.y + config.gap + total_height;
     let top_edge = cursor.y - config.gap - total_height;
     let flipped_y = bottom_edge > work_area.bottom && top_edge >= work_area.top;
@@ -661,16 +687,34 @@ pub fn magnifier_geometry(
     let info_panel = Rect::from_origin_size(Point::new(left, top + size), size, info_height);
     let bounds = panel.union(info_panel);
 
-    // The cursor is centered in the sampled region, then the region is clamped to
-    // the captured frame so magnified pixels always come from the real back buffer.
-    let source_left = (cursor.x - half)
+    // Center pixel: the actual cursor position clamped to frame bounds.
+    let center = Point::new(
+        cursor.x.clamp(frame.left, frame.right - 1),
+        cursor.y.clamp(frame.top, frame.bottom - 1),
+    );
+
+    // Source rect: fixed source_size×source_size, translated at edges.
+    let source_left = (center.x - half)
         .clamp(frame.left, (frame.right - source_size).max(frame.left));
-    let source_top = (cursor.y - half)
+    let source_top = (center.y - half)
         .clamp(frame.top, (frame.bottom - source_size).max(frame.top));
     let source = Rect::from_origin_size(
         Point::new(source_left, source_top),
         source_size,
         source_size,
+    );
+
+    // Tile: tile_size×tile_size region containing the cursor for async staging copy.
+    // Translated at frame edges to maintain fixed tile_size.
+    let tile_half = tile_size / 2;
+    let tile_left = (center.x - tile_half)
+        .clamp(frame.left, (frame.right - tile_size).max(frame.left));
+    let tile_top = (center.y - tile_half)
+        .clamp(frame.top, (frame.bottom - tile_size).max(frame.top));
+    let tile = Rect::from_origin_size(
+        Point::new(tile_left, tile_top),
+        tile_size,
+        tile_size,
     );
 
     MagnifierGeometry {
@@ -681,6 +725,8 @@ pub fn magnifier_geometry(
         zoom,
         flipped_x,
         flipped_y,
+        center,
+        tile,
     }
 }
 
@@ -1046,6 +1092,13 @@ mod tests {
             assert!(geometry.source.top >= frame.top);
             assert!(geometry.source.right <= frame.right);
             assert!(geometry.source.bottom <= frame.bottom);
+            // Tile keeps fixed size at every edge
+            assert_eq!(geometry.tile.width(), config.tile_size);
+            assert_eq!(geometry.tile.height(), config.tile_size);
+            assert!(geometry.tile.left >= frame.left);
+            assert!(geometry.tile.top >= frame.top);
+            assert!(geometry.tile.right <= frame.right);
+            assert!(geometry.tile.bottom <= frame.bottom);
         }
     }
 
@@ -1059,7 +1112,11 @@ mod tests {
         assert_eq!(geometry.source.height(), config.source_size);
         assert_eq!(geometry.panel.width(), config.panel_size());
         assert_eq!(geometry.panel.width(), geometry.source.width() * geometry.zoom as i32);
-        assert_eq!(geometry.zoom, 4);
+        assert_eq!(geometry.zoom, 8);
+        // Tile must contain the cursor and be fixed-size
+        assert_eq!(geometry.tile.width(), config.tile_size);
+        assert_eq!(geometry.tile.height(), config.tile_size);
+        assert!(geometry.tile.contains(geometry.center));
     }
 
     #[test]

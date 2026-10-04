@@ -15,7 +15,8 @@ use crate::capture::geometry::{MonitorLayout, Point, Rect};
 
 use super::providers::FrozenFrame;
 use super::win::d2d::{OverlayRenderer as D2dRenderer, RenderMetrics, RenderView};
-use super::win::d3d11::{CompositionTarget, GraphicsDevice};
+use super::win::d3d11::{AsyncSampleBuffer, CompositionTarget, GraphicsDevice};
+use ::windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 
 /// Everything the overlay needs to draw one frame.
 #[derive(Debug, Clone)]
@@ -26,6 +27,10 @@ pub struct OverlayFrameState {
     pub show_chrome: bool,
     /// Regions invalidated since the previous draw.
     pub damage: Vec<Rect>,
+    /// Current color sample RGB from the magnifier sampler.
+    pub magnifier_rgb: Option<(u8, u8, u8)>,
+    /// Formatted #RRGGBB hex string from the magnifier sampler.
+    pub magnifier_hex: Option<String>,
 }
 
 impl OverlayFrameState {
@@ -36,6 +41,8 @@ impl OverlayFrameState {
             cursor_visible: false,
             show_chrome: false,
             damage: Vec::new(),
+            magnifier_rgb: None,
+            magnifier_hex: None,
         }
     }
 }
@@ -52,6 +59,7 @@ pub struct Win32Renderer {
     composition: CompositionTarget,
     layout: MonitorLayout,
     frame: Rect,
+    sample_buffer: AsyncSampleBuffer,
 }
 
 impl Win32Renderer {
@@ -64,6 +72,8 @@ impl Win32Renderer {
         layout: &MonitorLayout,
         device: Arc<GraphicsDevice>,
     ) -> Result<Self, String> {
+        let sample_buffer =
+            AsyncSampleBuffer::new(device.device(), device.context())?;
         let d2d = D2dRenderer::new(device, layout.dpi)?;
         let composition = d2d.composition_target(window)?;
         let mut renderer = Self {
@@ -71,6 +81,7 @@ impl Win32Renderer {
             composition,
             layout: layout.clone(),
             frame: layout.local_bounds(),
+            sample_buffer,
         };
         renderer.resize(layout)?;
         Ok(renderer)
@@ -162,6 +173,8 @@ impl Win32Renderer {
             show_chrome: state.show_chrome,
             work_area: self.layout.local_work_area(),
             damage: state.damage.clone(),
+            magnifier_rgb: state.magnifier_rgb,
+            magnifier_hex: state.magnifier_hex.clone(),
         };
         self.d2d.render(&view)?;
         self.d2d.present()?;
@@ -171,6 +184,30 @@ impl Win32Renderer {
     /// Whether a failure message indicates a lost graphics device.
     pub fn is_device_lost(message: &str) -> bool {
         GraphicsDevice::is_device_lost(message)
+    }
+
+    /// Submit a non-blocking tile copy for async color sampling.
+    /// Returns the slot index on success.
+    pub fn request_sample(
+        &mut self,
+        texture: &ID3D11Texture2D,
+        x: u32,
+        y: u32,
+        tile_size: u32,
+    ) -> Result<usize, String> {
+        self.sample_buffer.submit(texture, x, y, tile_size)
+    }
+
+    /// Poll a previously-submitted slot. Returns Some(Ok(tile_data)) when the GPU
+    /// copy is complete, None if still in-flight, Some(Err) on failure.
+    pub fn poll_sample(&mut self, slot: usize) -> Option<Result<Vec<u8>, String>> {
+        self.sample_buffer.poll(slot)
+    }
+
+    /// Reset all pending sample slots.
+    #[allow(dead_code)]
+    pub fn reset_samples(&mut self) {
+        self.sample_buffer.reset();
     }
 }
 
