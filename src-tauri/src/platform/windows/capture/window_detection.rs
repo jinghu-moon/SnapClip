@@ -9,11 +9,6 @@
 //! from the overlay message thread: it performs `EnumWindows` plus one DWM round trip per
 //! candidate, all of which block the caller.
 
-// The overlay/worker that consumes this provider arrives with the gesture and worker
-// phases; until then only this module's tests construct it. Remove this once
-// `platform::windows::capture::overlay` (or the worker) owns an instance.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use crate::capture::geometry::Rect;
 use crate::capture::monitor_cache::MonitorCache;
 use crate::capture::window_detection::model::{
@@ -48,11 +43,6 @@ impl TopLevelWindowProvider {
     pub fn reset(&mut self) {
         self.epochs.reset();
         self.monitors.release();
-    }
-
-    /// The rectangles the most recent snapshot was filtered against.
-    pub fn monitors(&self) -> &MonitorCache {
-        &self.monitors
     }
 
     /// Re-read the display topology once per refresh cycle, so window classification
@@ -271,17 +261,14 @@ mod tests {
         let mut provider = TopLevelWindowProvider::new();
         let snapshot = provider.refresh(&Exclusions::new()).expect("refresh succeeds");
         assert!(snapshot.epoch() >= 1);
-        assert!(!provider.monitors().is_empty());
+        assert!(!snapshot.monitors().is_empty());
 
         provider.reset();
-        assert!(
-            provider.monitors().is_empty(),
-            "the display cache is released with the session"
-        );
-        // The next session starts a fresh generation, so nothing from the previous
-        // one can be matched.
+        // The next session starts a fresh generation, so nothing from the previous one can
+        // be matched, and the display cache is rebuilt from the current topology.
         let next = provider.refresh(&Exclusions::new()).expect("refresh succeeds");
         assert_eq!(next.epoch(), 1, "a reset restarts the epoch sequence");
+        assert!(!next.monitors().is_empty(), "the cache is rebuilt for the new session");
     }
 
     #[test]

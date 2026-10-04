@@ -579,6 +579,7 @@ epoch + identity 后处理。`BoundsChanged` **先写回快照再重算 hover/�
 | 结果处理 | `overlay.rs::on_detection_ready` → `apply_hover_validity` | `Valid` 无动作；`BoundsChanged` → `apply_candidate_update` 写回快照 → 重算 hover → 重算预览；`Invalid` → 丢弃 hover/预览 → 刷新快照 |
 | 陈旧结果丢弃 | 三处 request id 校验 | refresh / confirm / revalidate 各自比对当前请求；不匹配即计数丢弃 |
 | 会话清理 | `begin_window_detection` / `release_session` | 三个 request 与两个定时器统一复位；worker 由 `DetectionWorker::Drop` join（`shutdown` 幂等） |
+| 过渡标记清理 | `win/window.rs`、`window_detection.rs` | Phase 1/2 为未接线代码临时加的 `cfg_attr(not(test), allow(dead_code))` 已删除：provider 现在被检测 worker 持有，FFI 面在生产构建中真实可达；顺带删除只被测试使用的 `extended_style()` 与 `TopLevelWindowProvider::monitors()` 访问器 |
 
 **为什么 `Invalid` 不立即用旧快照重命中**：旧快照里仍然列着那个已经消失的窗口，用它重命中
 会把刚判定失效的目标又取回来。实现是清 hover/预览 + 请求刷新，等新快照落地后再由

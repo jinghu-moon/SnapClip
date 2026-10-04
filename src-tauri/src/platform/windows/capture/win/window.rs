@@ -13,11 +13,6 @@
 //!   no cross-process compositor round trip;
 //! * DWM reads happen in [`read_dwm_batch`], after the callback returns.
 
-// The detection provider that consumes this module arrives with the snapshot phase;
-// until it is wired in, the only callers are this module's own real-window tests.
-// Remove this once `platform::windows::capture::window_detection` uses the surface.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::mem::size_of;
 
 use ::windows::Win32::Foundation::{HWND, LPARAM, RECT};
@@ -65,14 +60,6 @@ pub fn is_window_visible(hwnd: isize) -> bool {
 /// `IsIconic`.
 pub fn is_iconic(hwnd: isize) -> bool {
     is_window(hwnd) && unsafe { IsIconic(to_hwnd(hwnd)).as_bool() }
-}
-
-/// `GetWindowLongPtrW(GWL_EXSTYLE)`.
-pub fn extended_style(hwnd: isize) -> u32 {
-    if !is_window(hwnd) {
-        return 0;
-    }
-    unsafe { GetWindowLongPtrW(to_hwnd(hwnd), GWL_EXSTYLE) as u32 }
 }
 
 /// `GetWindowThreadProcessId`, or `0` when the window is gone.
@@ -563,7 +550,13 @@ mod tests {
         assert!(is_window_visible(handle));
         assert!(!is_iconic(handle));
         assert!(!is_cloaked(handle), "an ordinary window is not cloaked");
-        assert!(extended_style(handle) & WS_EX_NOACTIVATE.0 != 0);
+        // The cheap probe carries the extended style the policy layer will inspect.
+        let probe = enumerate_cheap_candidates()
+            .expect("EnumWindows succeeds")
+            .into_iter()
+            .find(|probe| probe.hwnd == handle)
+            .expect("the fixture is a candidate");
+        assert_ne!(probe.extended_style & WS_EX_NOACTIVATE.0, 0);
     }
 
     #[test]
