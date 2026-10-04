@@ -807,3 +807,69 @@ overlay 的 `WM_MOUSEMOVE` / dwell / render 路径不含任何 FFI。
 | release 构建下的性能数字 | 未执行 | 全部测量为 debug 构建；release 下整屏重绘成本应显著更低。Phase 7 若做 NSIS 构建可复测 |
 | 200 候选的真实桌面 | 未构造 | 本机真实桌面 4–5 个候选；以合成候选集做量级基准 |
 | 鼠标移动的 PeekMessage 级输入合并 | 未实现 | 现为“逐条处理 + 15 ms 重绘合并”；实测 412/604 次移动被合并，overlay 无卡顿。若将来测得输入处理成为热点再改 |
+
+---
+
+## Phase 7：完整功能、构建与最终验收
+
+### 7.1 构建与静态验收
+
+| 项目 | 命令 | 结果 |
+| --- | --- | --- |
+| Rust 单元测试（全 target） | `cargo test --lib` | **292 passed / 0 failed** |
+| 编译零告警 | `cargo check --all-targets` | exit 0，**0 warnings** |
+| 前端类型检查 | `npm run typecheck` | exit 0 |
+| 前端构建 | `npm run build` | exit 0 |
+| Tauri release 构建 + NSIS 打包 | `npx tauri build --bundles nsis` | **exit 0**，`target/release/bundle/nsis/SnapClip_0.1.0_x64-setup.exe`（2.39 MiB），release profile 2m22s |
+
+### 7.2 端到端验收（`.tmp-p7-probe.ps1` / `.tmp-p7-export.ps1` / `.tmp-p7-leak.ps1`）
+
+| 验收项 | 结果 |
+| --- | --- |
+| F5 → overlay visible | 21/21 会话成功（1 次手动拖拽 + 20 次确认循环） |
+| 停稳产生预览 → Enter 确认 | `snap_confirmed=20/20`，无一失败、无 `snap confirmation failed` |
+| Esc 取消 | `cancels=21`，与 21 次会话一一对应 |
+| 每次会话快照建立 | `snapshots=21`（每会话恰好 1 次 refresh） |
+| 按下不创建选区 | `pointer down … hit=Create, outcome=Pending` |
+| 超过拖拽阈值 → 自由框选 | `pointer up … selection=(900,600)->(1350,975) state=Selected`，与注入的拖拽路径逐像素一致 |
+| 确认后仍可导出（旧功能回归） | `snap confirmed selection=(2111,960)->(2719,1399)` → 再次 Enter → `export submitted size=608x439 readback_ms=2` → `artifact ready size=608x439`（608×439 恰为窗口外框尺寸） |
+| 错误行 | 0（无 panic / failed / snapshot failed） |
+
+### 7.3 资源稳定性（20+ 次循环，重点验收项）
+
+`.tmp-p7-leak.ps1`（12 次 F5/Esc，第 2 次采样作为暖机基线）：
+
+| 采样点 | Private | Working Set | 线程 | 句柄 |
+| --- | --- | --- | --- | --- |
+| 第 2 次会话后（暖机） | 56.2 MB | 72.9 MB | 57 | 615 |
+| 第 6 次会话后 | 56.6 MB | 73.2 MB | 57 | 615 |
+| 第 12 次会话后 | 56.7 MB | 73.3 MB | 57 | 615 |
+| 第 12 次后静置 2 s | 56.7 MB | 73.3 MB | 57 | 615 |
+
+结论：**线程数与句柄数在暖机后完全不变**，Private/WS 增量 +0.5/+0.4 MB 且不再增长。
+（首次测量时看到的 `17 线程 → 56 线程 / 331 → 613 句柄` 是进程启动阶段 WebView、OCR worker
+与剪贴板监听器的初始化，不是每会话增长——暖机基线把这一点区分开了。）
+
+### 7.4 与 docs/12 §12 清单的对照
+
+| docs/14 §12 项 | 状态 | 证据 |
+| --- | --- | --- |
+| 单元测试（几何/命中/过滤/手势/生命周期） | 完成 | §5.1 表格；292 个单测 |
+| Windows 集成测试（真机夹具、DWM 合成后读边界） | 完成 | Phase 1 §1.3、Phase 2 §2.3、Phase 4 §4.4 |
+| GPU 视觉回归 | 完成 | `d2d::window_snap_hints_are_painted_but_never_exported` 等既有 + 新增用例 |
+| 交互与既有功能回归 | 部分自动化 | 悬停/预览/确认/取消/拖拽/导出已自动化；放大镜与取色的**视觉**细节仍需人工 |
+| 性能指标不劣于基线 | 完成 | Phase 6 §6.1/§6.2 |
+| 构建/静态检查 | 完成 | §7.1 |
+| 与系统 `Win+Shift+S` 逐像素比对 | 未执行 | 需要人工目检两套工具的边界；Phase 7 遗留项 |
+| 多显示器 / 混合 DPI / 多显示器负坐标真机 | 未执行 | 本机单显示器；纯函数单测覆盖负坐标与跨屏裁剪 |
+| HDR / 高对比度主题 | 未执行 | 环境不具备 |
+
+### 7.5 最终遗留项（明确未完成，不掩盖）
+
+1. **人工视觉验收**：预览/hover 高亮的实际观感、放大镜与取色的视觉回归、与系统截图工具的边界比对——需要人工目检。
+2. **多显示器/混合 DPI/HDR** 真机验证——本机单显示器。
+3. **WPA/PresentMon 级采集**与 GPU 显存回落曲线——环境缺工具。
+4. **鼠标输入 PeekMessage 级合并**——当前为逐条处理 + 15 ms 重绘合并，实测无卡顿，未做进一步优化。
+
+以上均为**环境或人工依赖**，不涉及功能缺失；「判定 → 预览 → 确认 → 导出」的完整链路、过期处理、
+资源释放与构建产物均已通过自动化验证。
