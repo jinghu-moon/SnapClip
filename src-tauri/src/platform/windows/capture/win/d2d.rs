@@ -683,6 +683,10 @@ impl OverlayRenderer {
                     radiusY: radius,
                 };
                 self.d2d.FillEllipse(&grip, &resources.handle);
+                // Ring each white grip with the selection border colour, stroked
+                // at the same width as the selection rectangle outline.
+                self.d2d
+                    .DrawEllipse(&grip, &resources.border, metrics.border_width, None);
             }
         }
 
@@ -960,12 +964,12 @@ impl OverlayRenderer {
                 let badge_inset = 6.0 * badge_scale;
                 let badge_radius = 6.0 * badge_scale;
                 let label = if zoom >= 10.0 {
-                    format!("{:.0}x", zoom)
+                    format!("{:.0}×", zoom)
                 } else if zoom >= 1.0 {
                     let r = zoom.round();
-                    if (zoom - r).abs() < 0.01 { format!("{:.0}x", r) } else { format!("{:.1}x", zoom) }
+                    if (zoom - r).abs() < 0.01 { format!("{:.0}×", r) } else { format!("{:.1}×", zoom) }
                 } else {
-                    format!("{:.1}x", zoom)
+                    format!("{:.1}×", zoom)
                 };
                 let badge_fmt = self.info_text_format_mut(false, 14.0, DWRITE_FONT_WEIGHT_BOLD, true)?;
                 let text_w = self.measure_text_width_in(&label, &badge_fmt)?;
@@ -1590,8 +1594,8 @@ impl OverlayRenderer {
             MASK_RGB.2 * MASK_ALPHA,
             MASK_ALPHA,
         );
-        // System accent blue, matching the Windows snipping experience.
-        let accent = color(0.0, 0.47, 0.83, 1.0);
+        // Selection border and handle outline: #1f75db.
+        let accent = color(31.0 / 255.0, 117.0 / 255.0, 219.0 / 255.0, 1.0);
         let white = color(1.0, 1.0, 1.0, 1.0);
         let panel = color(0.09, 0.09, 0.11, 0.92);
         let crosshair = color(1.0, 0.75, 0.0, 0.95);
