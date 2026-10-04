@@ -354,3 +354,28 @@ published=2 / empty=0`，无错误。
 | 每窗口树缓存 | 同一窗口内在不同控件间移动仍需重新下钻；需要按 `WindowTree` 缓存（按快照 epoch 失效） |
 | 增量发布（32 ms） | 目前只在遍历结束发布；慢 provider 期间用户看不到反馈 |
 | 资源管理器夹具 | 需要 `EnumWindows` + `CabinetWClass` 枚举，才能做导航窗格 / 文件列表 / 命令栏三点验收 |
+
+### ④ 已完成：触发源改为「光标」而非「窗口」
+
+现场数据（产品自测 `npm run tauri dev`，默认日志的会话汇总行）：
+
+```text
+window_hit_test_us n=945        hover_target_switch_count=6
+refinement_submitted=6  refinement_published=6  refinement_empty=0
+refinement_elapsed_us last=10772  max=57977
+```
+
+`submitted` 与 `published` 1:1、单次 10–58 ms —— 精化**每次提交都成功**，既没被取消，
+provider 也不慢。但 `submitted` 恰好等于**窗口级** `hover_target_switch_count`。
+
+根因：`update_hover` 在「窗口目标未变」时提前返回，把喂调度器的代码一起跳过了，
+于是**触发条件是窗口变化，而不是光标位置**。在一个资源管理器窗口内部换控件时窗口没变，
+就再也不会查询 —— 深选停在第一次命中的控件上，表现即「窗口之间灵敏、窗口内控件很难触发」。
+
+修复：新增 `drive_refinement(screen, target)`，在**每次光标更新**时都喂调度器，早于
+「窗口未变」的重绘短路；由 `RefinementScheduler` 自己决定是否需要 worker（点落在已发布
+的完整路径内仍走缓存、不触发查询）。这样：
+
+- 停稳在某个控件上 → 查询并发布控件级矩形；
+- 在同一窗口内移到另一个控件并停稳 → 重新查询（新点落在已发布路径之外）；
+- 在同一控件内部微动 → 不触发查询，命中缓存。

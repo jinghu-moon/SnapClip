@@ -1292,6 +1292,15 @@ where
         let started = Instant::now();
         let target = self.snapshot.hit_test(screen);
         self.metrics.record_hit_test(started.elapsed());
+
+        // v2 refinement tracks the **cursor**, not the window. Inside one window the user
+        // changes the control under the pointer without changing the window, so feeding the
+        // scheduler only on window change made deep selection appear "hard to trigger": a
+        // query ran once per window and never followed the controls. The scheduler itself
+        // decides whether the new point needs the worker at all (moving inside the already
+        // published path still answers from cache), so this is cheap.
+        self.drive_refinement(screen, target);
+
         let unchanged = match (&target, &self.hover_target) {
             (None, None) => true,
             (Some(new), Some(old)) => {
@@ -1319,9 +1328,16 @@ where
                 false,
             );
         }
-        // v2 refinement (docs/18 §2): a hover change re-targets the deep query. The
-        // scheduler decides whether this needs a worker query at all — moving inside an
-        // already resolved path answers from cache without touching the worker.
+        self.hover_target = target;
+        self.invalidate();
+    }
+
+    /// Feed one cursor position to the v2 refinement scheduler.
+    ///
+    /// Called for **every** cursor update, not just when the hovered window changes: the
+    /// refinement target is the control under the pointer, and controls change far more
+    /// often than windows do (docs/18 §2).
+    fn drive_refinement(&mut self, screen: Point, target: Option<WindowTarget>) {
         let epoch = self.snapshot.epoch();
         let actions = self
             .refine
@@ -1334,9 +1350,19 @@ where
         } else {
             self.disarm_refinement();
         }
-        self.deep_target = self.refine.cached().cloned();
-        self.hover_target = target;
-        self.invalidate();
+        // Mirror the scheduler's published path: it is the single source of truth for
+        // "which deep target is live", and the paint layer reads it from here.
+        let published = self.refine.cached();
+        let changed = match (published, self.deep_target.as_ref()) {
+            (None, None) => false,
+            (Some(new), Some(old)) => {
+                new.window != old.window || new.screen_bounds != old.screen_bounds
+            }
+            _ => true,
+        };
+        if changed {
+            self.deep_target = published.cloned();
+        }
     }
 
     fn clear_hover(&mut self) {
