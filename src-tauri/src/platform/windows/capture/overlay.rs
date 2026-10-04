@@ -408,6 +408,11 @@ where
     confirm_request: Option<RequestId>,
     /// Single-flight hover re-validation request (docs/14 §5.5).
     hover_request: Option<RequestId>,
+    /// Preview rectangle currently painted (eased, monitor-local pixels).
+    preview_rect: Option<Rect>,
+    /// Preview rectangle the animation is heading for; `None` means no preview.
+    preview_target: Option<Rect>,
+    preview_transition: crate::capture::window_detection::RectTransition,
     /// HWND/process exclusions the snapshot is built with (docs/14 §7).
     exclusions: Exclusions,
     detector: DetectionWorker,
@@ -500,6 +505,12 @@ where
             snapshot_request: None,
             confirm_request: None,
             hover_request: None,
+            preview_rect: None,
+            preview_target: None,
+            preview_transition: crate::capture::window_detection::RectTransition::settled(
+                Rect::default(),
+                Instant::now(),
+            ),
             exclusions,
             detector,
             refine: RefinementScheduler::new(),
@@ -908,6 +919,7 @@ where
         self.frozen = None;
         self.graphics_released = false;
         self.gesture.reset();
+        self.set_preview_target(None);
         self.hover_target = None;
         self.dwell_armed = None;
         self.snapshot_request = None;
@@ -1230,6 +1242,7 @@ where
     /// worker so the overlay thread never runs `EnumWindows`/DWM itself.
     fn begin_window_detection(&mut self, layout: &MonitorLayout) {
         self.gesture = GestureState::new(system_drag_threshold(layout.dpi));
+        self.set_preview_target(None);
         self.snap_radius = snap_radius_px();
         self.hover_target = None;
         self.dwell_armed = None;
@@ -1332,6 +1345,74 @@ where
         }
     }
 
+    /// Make the painted preview rectangle follow the gesture's preview target.
+    ///
+    /// Three rules, taken from the reference transition (docs/18 §10.2):
+    /// * the **first** preview of a session is presented directly — nothing animates out of
+    ///   an empty frame;
+    /// * a new target eases from the rectangle currently on screen, so re-targeting
+    ///   mid-flight continues smoothly instead of snapping;
+    /// * the preview **disappears** directly; it never shrinks towards nothing.
+    fn sync_preview_rect(&mut self) {
+        self.set_preview_target(self.gesture.snap_preview().map(|preview| preview.selection));
+    }
+
+    fn set_preview_target(&mut self, target: Option<Rect>) {
+        if self.preview_target == target {
+            // Same target: no state change and no repaint, exactly like the reference.
+            return;
+        }
+        self.preview_target = target;
+        let now = Instant::now();
+        match (target, self.preview_rect) {
+            (Some(to), None) => {
+                self.preview_transition.present(to, now);
+                self.preview_rect = Some(to);
+            }
+            (Some(to), Some(from)) => self.preview_transition.start(from, to, now),
+            (None, _) => {
+                self.preview_transition.present(Rect::default(), now);
+                self.preview_rect = None;
+            }
+        }
+    }
+
+    /// Advance the preview animation and report whether the painted rectangle changed.
+    fn advance_preview_animation(&mut self) -> bool {
+        let now = Instant::now();
+        if self.preview_transition.is_running(now) {
+            let value = self.preview_transition.value_at(now);
+            if self.preview_rect != Some(value) {
+                self.preview_rect = Some(value);
+                self.metrics.log_line(
+                    &format!(
+                        "preview anim=({},{})->({},{}) target=({},{})->({},{})",
+                        value.left,
+                        value.top,
+                        value.right,
+                        value.bottom,
+                        self.preview_target.map(|target| target.left).unwrap_or_default(),
+                        self.preview_target.map(|target| target.top).unwrap_or_default(),
+                        self.preview_target.map(|target| target.right).unwrap_or_default(),
+                        self.preview_target.map(|target| target.bottom).unwrap_or_default(),
+                    ),
+                    false,
+                );
+                return true;
+            }
+            return false;
+        }
+        // Settled: make the final frame exactly the target so rounding never leaves the
+        // highlight a pixel away from the control it stands for.
+        if let Some(target) = self.preview_target
+            && self.preview_rect != Some(target)
+        {
+            self.preview_rect = Some(target);
+            return true;
+        }
+        false
+    }
+
     /// Arm the one-shot dwell timer for the current gesture generation.
     fn arm_dwell(&mut self) {
         let generation = self.gesture.dwell_generation();
@@ -1383,6 +1464,7 @@ where
                     .metrics
                     .log_line("auto-snap preview cleared", false),
             }
+            self.sync_preview_rect();
             self.invalidate();
         }
     }
@@ -1529,6 +1611,7 @@ where
                 // never resolved against the snapshot that still lists the dead window.
                 self.hover_target = None;
                 self.gesture.clear_preview();
+                self.sync_preview_rect();
                 self.request_snapshot_refresh();
                 self.invalidate_all();
             }
@@ -1540,6 +1623,7 @@ where
         let generation = self.gesture.dwell_generation();
         let preview = self.preview_for_cursor();
         if self.gesture.apply_dwell(generation, preview) {
+            self.sync_preview_rect();
             self.invalidate();
         }
     }
@@ -1706,6 +1790,7 @@ where
                 true,
             );
             self.gesture.clear_preview();
+            self.sync_preview_rect();
             self.hover_target = None;
             self.disarm_dwell();
             self.publish_state();
@@ -1721,6 +1806,7 @@ where
             valid
         );
         self.gesture.clear_preview();
+        self.sync_preview_rect();
         self.request_snapshot_refresh();
         self.update_hover();
         self.invalidate_all();
@@ -2245,11 +2331,21 @@ where
         self.disarm_render_tick();
         // Always poll the pending GPU sample — may mark the info panel dirty.
         self.poll_color_sample();
+        // Advance the preview transition on this same coalescing clock. While it runs it is
+        // what keeps the tick alive, so the highlight eases into place instead of jumping
+        // between control sizes (docs/18 §10).
+        if self.advance_preview_animation() {
+            self.dirty = true;
+        }
         if !self.dirty {
             return;
         }
         self.dirty = false;
         self.render();
+        if self.preview_transition.is_running(Instant::now()) {
+            // Schedule the next frame of the animation.
+            self.invalidate();
+        }
     }
 
     fn render(&mut self) {
@@ -2262,7 +2358,9 @@ where
         // Resolve the paint-only window hints before borrowing the renderer, so the
         // snapshot lookup and the preview read do not overlap a mutable borrow.
         let hover_bounds = self.hover_bounds_local();
-        let preview_bounds = self.gesture.snap_preview().map(|preview| preview.selection);
+        // The painted preview is the *eased* rectangle; the gesture keeps the true target
+        // for confirmation, so the animation can never change what gets committed.
+        let preview_bounds = self.preview_rect;
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
