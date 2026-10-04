@@ -1,0 +1,331 @@
+//! Windows top-level window provider (docs/14 §5.2, §5.3, §5.4).
+//!
+//! This is the only place where the platform FFI and the detection policy meet. It
+//! lives in the platform layer on purpose: `capture/` must stay free of Win32 so the
+//! contract, the filter and the hit-test algorithm can be unit tested without a desktop,
+//! and so the dependency direction in `lib.rs` (platform → capture) is preserved.
+//!
+//! Every method here runs on the **detection worker**. `refresh` callers must not run it
+//! from the overlay message thread: it performs `EnumWindows` plus one DWM round trip per
+//! candidate, all of which block the caller.
+
+// The overlay/worker that consumes this provider arrives with the gesture and worker
+// phases; until then only this module's tests construct it. Remove this once
+// `platform::windows::capture::overlay` (or the worker) owns an instance.
+#![cfg_attr(not(test), allow(dead_code))]
+
+use crate::capture::geometry::Rect;
+use crate::capture::monitor_cache::MonitorCache;
+use crate::capture::window_detection::model::{
+    EpochCounter, HoverValidity, WindowIdentity, WindowSnapshot, WindowTarget,
+};
+use crate::capture::window_detection::provider::{
+    Exclusions, WindowDetectionError, WindowTargetProvider,
+};
+use crate::capture::window_detection::snapshot::{
+    candidates_from_classified, class_name_hash, classify,
+};
+
+use super::monitor;
+use super::win::window as win32;
+
+/// Enumerates the desktop's top-level windows and validates snap targets.
+#[derive(Debug, Default)]
+pub struct TopLevelWindowProvider {
+    /// Snapshot generations issued by this provider. Reset when a session ends so a
+    /// new session cannot match a result from the previous one.
+    epochs: EpochCounter,
+    /// Display rectangles this provider's snapshots were filtered against.
+    monitors: MonitorCache,
+}
+
+impl TopLevelWindowProvider {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Forget the current epoch and display topology.
+    pub fn reset(&mut self) {
+        self.epochs.reset();
+        self.monitors.release();
+    }
+
+    /// The rectangles the most recent snapshot was filtered against.
+    pub fn monitors(&self) -> &MonitorCache {
+        &self.monitors
+    }
+
+    /// Re-read the display topology once per refresh cycle, so window classification
+    /// never issues a `MonitorFromRect` per candidate.
+    fn refresh_monitors(&mut self) {
+        self.monitors = MonitorCache::from_layouts(&monitor::enumerate());
+    }
+
+    /// Re-read one window's identity and frame, as the re-validation contract requires.
+    ///
+    /// Returns `None` when the window must be treated as gone: closed, hidden,
+    /// minimised, cloaked, or recycled by a different process/window class.
+    fn read_target(&self, identity: WindowIdentity) -> Option<Rect> {
+        let hwnd = identity.hwnd;
+        if !win32::is_window(hwnd)
+            || !win32::is_window_visible(hwnd)
+            || win32::is_iconic(hwnd)
+            || win32::is_cloaked(hwnd)
+        {
+            return None;
+        }
+        // `HWND` reuse is the reason this check exists: the handle alone is not an
+        // identity, so a recycled handle must not inherit the old rectangle.
+        if win32::process_id(hwnd) != identity.process_id {
+            return None;
+        }
+        let class_name = win32::class_name(hwnd)?;
+        if class_name_hash(&class_name) != identity.class_name_hash {
+            return None;
+        }
+        win32::frame_bounds(hwnd)
+    }
+}
+
+impl WindowTargetProvider for TopLevelWindowProvider {
+    fn refresh(
+        &mut self,
+        exclusions: &Exclusions,
+    ) -> Result<WindowSnapshot, WindowDetectionError> {
+        self.refresh_monitors();
+
+        // Stage one: cheap user-mode enumeration (no DWM inside the callback).
+        let probes = win32::enumerate_cheap_candidates()
+            .map_err(WindowDetectionError::EnumerationFailed)?;
+
+        // Stage two: one batched DWM pass over the survivors.
+        let handles: Vec<isize> = probes.iter().map(|probe| probe.hwnd).collect();
+        let reads = win32::read_dwm_batch(&handles);
+
+        // Policy passes (exclusions, shell surfaces, cloaked, off-screen) run on plain
+        // data; the epoch is stamped last so no candidate can carry a future value.
+        let classified = classify(&probes, &reads, exclusions, &self.monitors);
+        let epoch = self.epochs.bump();
+        let candidates = candidates_from_classified(&classified, epoch);
+        Ok(WindowSnapshot::new(epoch, candidates, self.monitors.clone()))
+    }
+
+    fn validate(&self, target: &WindowTarget) -> bool {
+        self.read_target(target.identity())
+            .is_some_and(|bounds| !bounds.is_empty())
+    }
+
+    fn revalidate_hover(&self, hover: &WindowTarget) -> HoverValidity {
+        match self.read_target(hover.identity()) {
+            None => HoverValidity::Invalid,
+            Some(bounds) if bounds == hover.candidate.screen_bounds => HoverValidity::Valid,
+            Some(bounds) => HoverValidity::BoundsChanged {
+                epoch: hover.candidate.snapshot_epoch,
+                identity: hover.identity(),
+                new_bounds: bounds,
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capture::geometry::Point;
+    use crate::capture::window_detection::snapshot::CheapProbe;
+
+    fn desktop_available() -> bool {
+        let _ = win32::enumerate_cheap_candidates();
+        monitor::set_per_monitor_v2_awareness().is_ok()
+    }
+
+    #[test]
+    fn refresh_builds_a_labelled_snapshot_with_ordered_candidates() {
+        if !desktop_available() {
+            eprintln!("skipping: no interactive window station available");
+            return;
+        }
+        let mut provider = TopLevelWindowProvider::new();
+        let snapshot = provider.refresh(&Exclusions::new()).expect("refresh succeeds");
+        assert!(snapshot.epoch() >= 1, "a refresh always issues a new epoch");
+        assert!(!snapshot.monitors().is_empty(), "display topology was cached");
+        assert!(
+            !snapshot.is_empty(),
+            "a desktop with at least this test process's window cannot be empty"
+        );
+        // Candidates are frontmost-first and all belong to this generation.
+        let z_orders: Vec<u32> = snapshot.candidates().iter().map(|c| c.z_order).collect();
+        assert!(z_orders.windows(2).all(|pair| pair[0] < pair[1]), "{z_orders:?}");
+        assert!(snapshot.candidates().iter().all(|c| c.snapshot_epoch == snapshot.epoch()));
+        // Every candidate is a real, non-degenerate, on-screen rectangle.
+        for candidate in snapshot.candidates() {
+            assert!(candidate.is_usable(), "{candidate:?}");
+            assert!(
+                snapshot.monitors().intersects_any(candidate.screen_bounds),
+                "{candidate:?} is filtered to the visible area"
+            );
+        }
+    }
+
+    #[test]
+    fn each_refresh_advances_the_epoch_and_drops_the_previous_snapshot() {
+        if !desktop_available() {
+            eprintln!("skipping: no interactive window station available");
+            return;
+        }
+        let mut provider = TopLevelWindowProvider::new();
+        let first = provider.refresh(&Exclusions::new()).expect("refresh succeeds");
+        let second = provider.refresh(&Exclusions::new()).expect("refresh succeeds");
+        assert!(second.epoch() > first.epoch());
+        // A target from the previous generation is stale for the new snapshot.
+        if let Some(target) = first.nearest_target(Point::new(0, 0), 4096) {
+            assert!(target.is_stale_for(second.epoch()));
+            // Even if the same window still exists, the candidate in the new snapshot
+            // carries the new generation — never the old one.
+            if let Some(candidate) = second.find(target.identity()) {
+                assert_eq!(candidate.snapshot_epoch, second.epoch());
+            }
+        }
+        // The old snapshot still answers for itself until it is dropped — that is what
+        // makes the swap safe: the overlay reads one value and replaces it atomically.
+        assert!(first.is_current(first.epoch()));
+    }
+
+    #[test]
+    fn exclusions_remove_a_window_from_the_snapshot() {
+        if !desktop_available() {
+            eprintln!("skipping: no interactive window station available");
+            return;
+        }
+        let mut provider = TopLevelWindowProvider::new();
+        let snapshot = provider.refresh(&Exclusions::new()).expect("refresh succeeds");
+        let Some(victim) = snapshot.candidates().first().copied() else {
+            return;
+        };
+
+        let mut exclusions = Exclusions::new();
+        exclusions.exclude_hwnd(victim.identity.hwnd);
+        let filtered = provider.refresh(&exclusions).expect("refresh succeeds");
+        assert!(
+            filtered.find(victim.identity).is_none(),
+            "an excluded handle must not survive the filter"
+        );
+    }
+
+    #[test]
+    fn our_own_process_can_be_excluded_entirely() {
+        if !desktop_available() {
+            eprintln!("skipping: no interactive window station available");
+            return;
+        }
+        let own_pid = std::process::id();
+        let mut exclusions = Exclusions::new();
+        exclusions.exclude_process(own_pid);
+        let mut provider = TopLevelWindowProvider::new();
+        let snapshot = provider.refresh(&exclusions).expect("refresh succeeds");
+        assert!(
+            snapshot
+                .candidates()
+                .iter()
+                .all(|candidate| candidate.identity.process_id != own_pid),
+            "the process exclusion is the fallback layer for SnapClip's own windows"
+        );
+    }
+
+    #[test]
+    fn a_filtered_probe_never_reaches_the_snapshot() {
+        // Pure policy check with a synthetic batch: the provider's job is to run the
+        // filters, and a shell surface must not appear even if its bounds are perfect.
+        let probes = vec![CheapProbe::new(0x10, 1, "Progman", 0)];
+        let reads = vec![crate::capture::window_detection::snapshot::DwmRead::new(
+            0x10,
+            false,
+            Some(Rect::new(0, 0, 1000, 1000)),
+        )];
+        let monitors = MonitorCache::from_bounds([Rect::new(0, 0, 1920, 1080)]);
+        let classified = classify(&probes, &reads, &Exclusions::new(), &monitors);
+        assert!(classified.is_empty());
+    }
+
+    #[test]
+    fn validating_an_unknown_handle_fails_closed() {
+        let provider = TopLevelWindowProvider::new();
+        let target = WindowTarget::top_level_window_frame(
+            crate::capture::window_detection::model::WindowCandidate::new(
+                WindowIdentity::new(0xDEAD, 1, 2),
+                Rect::new(0, 0, 10, 10),
+                0,
+                1,
+            ),
+        );
+        assert!(!provider.validate(&target));
+        assert_eq!(provider.revalidate_hover(&target), HoverValidity::Invalid);
+    }
+
+    #[test]
+    fn reset_clears_the_epoch_and_the_cached_topology() {
+        if !desktop_available() {
+            eprintln!("skipping: no interactive window station available");
+            return;
+        }
+        let mut provider = TopLevelWindowProvider::new();
+        let snapshot = provider.refresh(&Exclusions::new()).expect("refresh succeeds");
+        assert!(snapshot.epoch() >= 1);
+        assert!(!provider.monitors().is_empty());
+
+        provider.reset();
+        assert!(
+            provider.monitors().is_empty(),
+            "the display cache is released with the session"
+        );
+        // The next session starts a fresh generation, so nothing from the previous
+        // one can be matched.
+        let next = provider.refresh(&Exclusions::new()).expect("refresh succeeds");
+        assert_eq!(next.epoch(), 1, "a reset restarts the epoch sequence");
+    }
+
+    #[test]
+    fn hover_revalidation_reports_bounds_changes_and_stale_targets() {
+        if !desktop_available() {
+            eprintln!("skipping: no interactive window station available");
+            return;
+        }
+        let mut provider = TopLevelWindowProvider::new();
+        let snapshot = provider.refresh(&Exclusions::new()).expect("refresh succeeds");
+        let Some(candidate) = snapshot
+            .candidates()
+            .iter()
+            .find(|candidate| candidate.is_usable())
+            .copied()
+        else {
+            return;
+        };
+        let target = WindowTarget::top_level_window_frame(candidate);
+
+        // A freshly snapped target is still valid and has not moved.
+        assert!(provider.validate(&target));
+        assert_eq!(provider.revalidate_hover(&target), HoverValidity::Valid);
+
+        // The same window with a stale rectangle reports the new bounds, tagged with
+        // the snapshot generation the overlay must match.
+        let mut moved = target;
+        moved.candidate.screen_bounds = Rect::new(
+            candidate.screen_bounds.left + 37,
+            candidate.screen_bounds.top + 11,
+            candidate.screen_bounds.right + 37,
+            candidate.screen_bounds.bottom + 11,
+        );
+        match provider.revalidate_hover(&moved) {
+            HoverValidity::BoundsChanged {
+                epoch,
+                identity,
+                new_bounds,
+            } => {
+                assert_eq!(epoch, candidate.snapshot_epoch);
+                assert_eq!(identity, candidate.identity);
+                assert_eq!(new_bounds, candidate.screen_bounds);
+            }
+            other => panic!("expected a bounds change, got {other:?}"),
+        }
+    }
+}

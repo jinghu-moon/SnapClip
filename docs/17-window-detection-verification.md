@@ -340,3 +340,92 @@ docs/14 §10.2 全部指标：`window_snapshot_refresh_us` / `window_snapshot_re
 | cloaked 真机夹具 | 未覆盖真机 | 合成 cloaked 窗口需要 UWP/虚拟桌面宿主；策略函数由纯单测覆盖，cloaked 的真机读取路径由 Phase 7 人工验收 |
 | 多显示器 / 混合 DPI 真机 | 未执行 | 本机单显示器；负坐标、跨屏裁剪、显示器缓存的纯单测已覆盖 |
 | `win::window` 的 FFI 面在非 test 构建下暂标 `dead_code` | 临时 | provider 编排在 Phase 2 接入；接入后移除该 allow（见文件头注释） |
+
+---
+
+## Phase 2：WindowSnapshot、命中算法与生命周期
+
+### 2.1 结论
+
+快照成为 overlay 可以安全读取的唯一窗口数据源：命中与最近距离查询是纯缓存读，
+不触发 `EnumWindows`/DWM；快照携带 epoch、按 Z 序的候选与本次刷新周期的显示器缓存，
+失效时整体替换并显式释放。**未引入空间索引**——见 2.4 的基准数据。
+
+### 2.2 落地内容
+
+| 能力 | 位置 | 说明 |
+| --- | --- | --- |
+| 快照查询 | `capture/window_detection/hit_test.rs` | `WindowSnapshot::hit_test`（半开区间、Z 序最前）、`nearest_target`（半径内最近、距离相同先取**包含**该点的候选再按 Z 序）、`rect_distance_squared` |
+| 边界写回 | 同上 `apply_candidate_update` | `BoundsChanged` 仅在 `epoch` 与 `identity` 同时匹配时写回候选矩形（修复“hover 跳回旧位置”的根因）；`Valid`/`Invalid` 不改数据 |
+| 快照生命周期 | `capture/window_detection/model.rs` | `epoch + candidates + monitors`；`release()` 同时释放候选与显示器缓存；`is_current`/`find` 按身份查询 |
+| 代际隔离 | 同上 + `hit_test.rs` | 用一个 `is_live` 判据同时要求候选 `snapshot_epoch == snapshot.epoch` 且矩形可用：混入上一代的候选对象在任何查询里都不可见 |
+| Windows provider | `platform/windows/capture/window_detection.rs` | `TopLevelWindowProvider`：`refresh`（显示器缓存 → 廉价枚举 → 批量 DWM → 策略过滤 → 递增 epoch → 组装快照）、`validate`、`revalidate_hover` |
+| 身份校验 | 同上 `read_target` | 可见 / 非最小化 / 非 cloaked / PID 与类名哈希匹配（HWND 重用检测）/ 边界可读 |
+
+**距离语义**：几何距离取**闭包**（跨边对称：边左右各 5 px 都是 5），包含判定取**半开**
+（共享边只属于一个窗口）。两者在 `nearest_target` 汇合：距离相同先取真正包含该点的
+候选，再按 Z 序。没有这条规则时，正好落在共享边上的点会是“两个窗口距离都是 0”，
+只能由 Z 序静默决定用户意图。
+
+### 2.3 静态与单元验证
+
+| 项目 | 命令 | 结果 |
+| --- | --- | --- |
+| 单元测试 | `cargo test --lib` | **275 passed / 0 failed**（Phase 1 基线 252 → +23） |
+| 编译零告警 | `cargo check --all-targets` | exit 0，**0 warnings** |
+| Clippy（本阶段文件） | `cargo clippy --lib --tests` | 本阶段新增/修改文件 **0 告警** |
+
+新增测试要点：
+
+| 测试 | 断言 |
+| --- | --- |
+| `distance_is_zero_inside_a_rectangle_and_positive_outside` | 边界为 0；越界 1 px = 1；对角 = 3²+4²；左右对称 |
+| `a_shared_edge_is_zero_distance_from_both_but_belongs_to_one` | 共享边距离都为 0，但 `hit_test` 与 `nearest_target` 都选被包含的那个 |
+| `hit_test_picks_the_frontmost_overlapping_window` | 三窗重叠取 Z 序最前 |
+| `hit_test_uses_half_open_edges` | 左/上边命中、右/下边归邻窗、越过最后窗口为空 |
+| `nearest_target_respects_the_snap_radius` | 恰好 24 px 命中、25 px 不命中 |
+| `nearest_target_breaks_ties_by_z_order` | 等距时取 Z 序更小者 |
+| `a_point_in_two_overlapping_windows_belongs_to_the_frontmost` | 双覆盖点距离均为 0，按 Z 序裁决 |
+| `degenerate_rectangles_are_never_hit_or_snapped_to` | 零宽/倒置矩形既不命中也不参与吸附 |
+| `a_released_snapshot_answers_nothing` | `release()` 后两个查询都不返回目标 |
+| `candidates_from_another_generation_are_invisible` | 混入旧代候选时不返回旧对象 |
+| `bounds_changed_is_written_back_into_the_snapshot` | 写回后新矩形立即可命中、旧矩形立即失效、重复写回是 no-op |
+| `stale_or_mismatched_updates_are_ignored` | 错 epoch / HWND 重用 / 未知窗口 / 矩形未变 都不改写快照 |
+| `top_level_window_provider::refresh_builds_a_labelled_snapshot_with_ordered_candidates` | 真机：候选非空、Z 序严格递增、全部属于当前 epoch、全部落在显示器可见范围 |
+| 同上 `each_refresh_advances_the_epoch_and_drops_the_previous_snapshot` | 真机：epoch 严格递增，旧 target 对新快照即 stale |
+| 同上 `exclusions_remove_a_window_from_the_snapshot` / `our_own_process_can_be_excluded_entirely` | 真机：句柄排除与进程排除都生效 |
+| 同上 `hover_revalidation_reports_bounds_changes_and_stale_targets` | 真机：未移动 → `Valid`；矩形被改 → `BoundsChanged{epoch, identity, new_bounds}`；未知句柄 → `Invalid` |
+| 同上 `reset_clears_the_epoch_and_the_cached_topology` | `reset()` 后显示器缓存为空、下个会话 epoch 从 1 重新开始 |
+
+### 2.4 线性扫描基准证据（docs/14 §10.2 预算：P95 < 0.1 ms）
+
+`hit_test_and_nearest_target_stay_inside_the_latency_budget` 在 50 / 100 / 200 候选下各采样 2000 次，
+候选为「每窗 300×200、按 z 递增铺开」的真实量级：
+
+| 候选数 | hit_test P50 | hit_test P95 | nearest_target P50 | nearest_target P95 |
+| --- | --- | --- | --- | --- |
+| 50 | 600 ns | 700 ns | 900 ns | 1000 ns |
+| 100 | 1200 ns | 1300 ns | 1700 ns | 1800 ns |
+| 200 | 2300 ns | 2700 ns | 3500 ns | 4000 ns |
+
+即 200 候选下 P95 仍比预算低 **约 25~37 倍**（debug 构建）。结论：v1 使用 `Vec` 线性扫描，
+**不预置 R-tree**；只有将来真实桌面数据显示热点时才按 docs/14 §5.4 的规则引入空间索引，
+并保留半开区间二次校验与 Z 序裁决。
+
+### 2.5 质量门禁逐条对应
+
+| 门禁 | 证据 |
+| --- | --- |
+| `WM_MOUSEMOVE` 只使用快照，不触发 EnumWindows/DWM | `hit_test`/`nearest_target` 全部是 `&self` 纯读，模块内无任何 FFI 引用（`hit_test.rs` 只 `use` geometry/monitor_cache/model） |
+| 重叠窗口始终选择最顶层 | `hit_test_picks_the_frontmost_overlapping_window`、`a_point_in_two_overlapping_windows_belongs_to_the_frontmost` |
+| 远离候选不产生目标 | `nearest_target_respects_the_snap_radius`、`degenerate_rectangles_are_never_hit_or_snapped_to` |
+| 快照失效后旧对象无法返回有效目标 | `a_released_snapshot_answers_nothing`、`candidates_from_another_generation_are_invisible`、`stale_or_mismatched_updates_are_ignored` |
+| ≤16 候选线性扫描有基准证据，未证明前不预置 R-tree | 2.4 表格；`WindowSnapshot` 结构内**没有**索引字段，并附文档说明为什么没有 |
+
+### 2.6 未执行项与风险
+
+| 项目 | 状态 | 原因 / 替代 |
+| --- | --- | --- |
+| overlay 真正在 `WM_MOUSEMOVE` 中调用 `hit_test` | 未接线 | 属于 Phase 3（输入状态机）与 Phase 5（渲染）的职责；本阶段先冻结可安全调用的接口与数据 |
+| provider 在非 test 构建下暂标 `dead_code` | 临时 | 检测 worker（Phase 4）接手其所有权；接线后移除该 allow |
+| 真实桌面 200 候选场景 | 未构造 | 本机常驻顶层窗口数量远小于 200；以合成候选集做量级基准，Phase 6 在真实桌面补测 |

@@ -21,3 +21,4 @@ pub mod overlay;
 pub mod providers;
 pub mod renderer;
 pub mod win;
+pub mod window_detection;

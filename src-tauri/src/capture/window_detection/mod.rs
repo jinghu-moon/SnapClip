@@ -35,11 +35,13 @@
 //! must never enter this path (docs/14 §5.2, §11).
 
 pub mod gesture;
+pub mod hit_test;
 pub mod model;
 pub mod provider;
 pub mod snapshot;
 
 pub use gesture::{PointerGesture, should_start_manual_drag};
+pub use hit_test::{point_distance_squared, rect_distance_squared};
 pub use model::{
     EpochCounter, HoverValidity, RequestGate, RequestId, SnapshotEpoch, TargetKind, WindowCandidate,
     WindowIdentity, WindowSnapshot, WindowTarget,

@@ -21,6 +21,7 @@
 //! and every asynchronous result is checked against the epoch it was produced for.
 
 use crate::capture::geometry::Rect;
+use crate::capture::monitor_cache::MonitorCache;
 
 /// Version of one [`WindowSnapshot`].
 ///
@@ -271,12 +272,23 @@ impl HoverValidity {
 /// One immutable window observation set for a capture session (docs/14 §5.1).
 ///
 /// Built on the detection worker and read on the overlay thread; the overlay swaps
-/// the whole value when a refresh lands. The monitor cache and the optional spatial
-/// index join this struct in the geometry/index phases.
+/// the whole value when a refresh lands. Everything the snapshot needs — Z-ordered
+/// candidates and the monitor rectangles they were filtered against — is owned by the
+/// snapshot, so [`Self::release`] is a complete teardown and the next session cannot
+/// inherit a single value.
+///
+/// There is deliberately **no** spatial index field: measurements in
+/// [`crate::capture::window_detection::hit_test`] show a linear scan over realistic
+/// candidate counts is far inside the latency budget, and the design forbids adding an
+/// index without evidence.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WindowSnapshot {
-    epoch: SnapshotEpoch,
-    candidates: Vec<WindowCandidate>,
+    /// Visible to the sibling algorithm modules (`hit_test`), never outside
+    /// `window_detection`: callers read the snapshot through its accessors so the
+    /// "queries only ever see live candidates" rule cannot be bypassed.
+    pub(super) epoch: SnapshotEpoch,
+    pub(super) candidates: Vec<WindowCandidate>,
+    pub(super) monitors: MonitorCache,
 }
 
 impl WindowSnapshot {
@@ -286,6 +298,7 @@ impl WindowSnapshot {
         Self {
             epoch: 0,
             candidates: Vec::new(),
+            monitors: MonitorCache::empty(),
         }
     }
 
@@ -294,14 +307,22 @@ impl WindowSnapshot {
     /// Callers pass candidates already ordered by `z_order` (frontmost first); the
     /// ordering is asserted in tests rather than silently repaired, because a
     /// mis-ordered snapshot would make overlap resolution pick the wrong window.
-    pub fn new(epoch: SnapshotEpoch, candidates: Vec<WindowCandidate>) -> Self {
+    pub fn new(
+        epoch: SnapshotEpoch,
+        candidates: Vec<WindowCandidate>,
+        monitors: MonitorCache,
+    ) -> Self {
         debug_assert!(
             candidates
                 .windows(2)
                 .all(|pair| pair[0].z_order <= pair[1].z_order),
             "window snapshot candidates must be ordered by z_order (frontmost first)"
         );
-        Self { epoch, candidates }
+        Self {
+            epoch,
+            candidates,
+            monitors,
+        }
     }
 
     pub fn epoch(&self) -> SnapshotEpoch {
@@ -320,6 +341,11 @@ impl WindowSnapshot {
         &self.candidates
     }
 
+    /// The monitor rectangles this snapshot was filtered against.
+    pub fn monitors(&self) -> &MonitorCache {
+        &self.monitors
+    }
+
     /// Whether this snapshot carries data for `epoch`.
     pub fn is_current(&self, epoch: SnapshotEpoch) -> bool {
         self.epoch != 0 && self.epoch == epoch
@@ -332,11 +358,13 @@ impl WindowSnapshot {
             .find(|candidate| candidate.identity == identity)
     }
 
-    /// Drop every candidate and release the backing allocation. Called when a
-    /// session ends so the next session cannot hit-test against stale windows.
+    /// Drop every candidate and every cached monitor rectangle. Called when a session
+    /// ends so the next session cannot hit-test against stale windows or a stale
+    /// display topology.
     pub fn release(&mut self) {
         self.epoch = 0;
         self.candidates = Vec::new();
+        self.monitors.release();
     }
 }
 
@@ -381,7 +409,7 @@ mod tests {
         let mut counter = EpochCounter::new();
         let epoch = counter.bump();
         assert_ne!(epoch, 0);
-        let live = WindowSnapshot::new(epoch, vec![candidate(1, 0, epoch)]);
+        let live = WindowSnapshot::new(epoch, vec![candidate(1, 0, epoch)], MonitorCache::empty());
         assert!(live.is_current(epoch));
         // The placeholder still cannot impersonate the live snapshot.
         assert!(!snapshot.is_current(epoch));
@@ -461,8 +489,10 @@ mod tests {
         let mut snapshot = WindowSnapshot::new(
             epoch,
             vec![candidate(0x100, 0, epoch), candidate(0x200, 1, epoch)],
+            MonitorCache::from_bounds([rect(0, 0, 1920, 1080)]),
         );
         assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot.monitors().len(), 1);
         assert!(snapshot.find(identity(0x200)).is_some());
         assert!(snapshot.find(identity(0x999)).is_none());
         assert!(snapshot.find(identity(0x100)).is_some());
@@ -470,6 +500,7 @@ mod tests {
         snapshot.release();
         assert_eq!(snapshot.epoch(), 0);
         assert!(snapshot.is_empty());
+        assert!(snapshot.monitors().is_empty(), "the monitor cache is released too");
         assert!(
             snapshot.find(identity(0x100)).is_none(),
             "a released snapshot must not keep answering hits"
