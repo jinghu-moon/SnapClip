@@ -162,3 +162,49 @@ hover 变化喂调度器 → 80 ms 一次性定时器 → 提交 → 结果回�
 地址栏），能同时验证「结构性容器回溯」与「最深可交互元素」两条规则。
 当前探针用的 `FindWindowW("CabinetWClass")` 未能取到窗口句柄（返回 0），
 P2 改为**枚举顶层窗口 + 过滤 `explorer.exe` 进程**并等待窗口出现，失败才回退到屏幕中央。
+
+---
+
+## 10. 预览矩形变化动画（对齐 snow_shot）
+
+### 10.1 问题
+
+深选开启后，截图框优先贴合光标下**最近的一个控件**。鼠标横穿一个窗口时会连续经过不同的控件，
+目标矩形随之忽大忽小；如果直接把目标矩形画出来，高亮框会以鼠标事件频率跳动，观感上是抖动而非选择。
+
+### 10.2 参考实现（真实源码）
+
+`refer/snow-apps/snow_shot/include/snow_shot/presentation/screenshotsmartselectiontransition.h`
+与 `src/presentation/core/screenshotsmartselectiontransition.cpp` 定义了
+`ScreenshotSmartSelectionTransition`：
+
+| 参考行为 | 规格 |
+| --- | --- |
+| 时长 | `kDurationMs = 101` |
+| 缓动 | `kEasingCurve = QEasingCurve::OutQuad` |
+| 目标变化 | `stop()` → `setStartValue(m_displayedSelection)` → `setEndValue(新目标)` → `start()`：从**当前显示中的矩形**出发，因此打断重定向是平滑的 |
+| 首次出现 | `!m_hasPresentedSmartSelection` → `presentDirectly()`，**不播动画**（避免从“无”放大） |
+| 目标未变 | `selection == m_targetSelection` → 返回 `false`，不触发重绘 |
+| 无智能框选 | `smartFraming == false` 或选区无效/为空 → `presentDirectly()` |
+| 关闭动画 | `setEnabled(false)` 时若动画在跑 → 立即 `presentDirectly(m_targetSelection)` |
+
+### 10.3 SnapClip 的落地规格
+
+| 项目 | 决定 |
+| --- | --- |
+| 动画对象 | **预览/悬停矩形**（`preview_bounds` / `hover_bounds`，显示器本地像素）。已确认选区不参与动画：选区是用户（或确认动作）明确设定的几何，不做平滑 |
+| 时长/缓动 | 与参考一致：101 ms、OutQuad（`f(t) = 1 - (1-t)²`） |
+| 时钟 | overlay 既有的 15 ms 合并渲染 tick；动画未结束就保持 dirty，结束后停止请求重绘（不引入额外定时器） |
+| 起点 | 当前**显示中**的矩形；无显示中矩形时直接呈现（首次出现不播动画） |
+| 打断 | 新的目标矩形到达时直接以当前显示值为起点重新计时 |
+| 清空 | 预览消失（离开吸附半径、按下、确认、会话结束）→ **直接清除**，不做缩小动画 |
+| 关闭条件 | 会话结束 / 预览清空 / epoch 变化 → 停止动画并丢弃状态 |
+
+### 10.4 纯函数与测试
+
+`capture/window_detection/transition.rs::RectTransition`：保存 `from`/`to`/`started_at`/`duration`，
+`value_at(now)` 返回插值矩形，`is_running(now)` 判断是否还在动画中；
+不持有定时器、不依赖 Win32，因此可在单测中按任意时间点取值。
+
+必须覆盖：`t=0` 等于起点、`t=duration` 等于终点、OutQuad 在中点的取值、打断后以“显示中值”为起点、
+首次出现直接呈现（`from == None`）、`now` 早于起点与晚于终点的边界、以及“目标未变不产生变化”。
