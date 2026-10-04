@@ -379,3 +379,20 @@ provider 也不慢。但 `submitted` 恰好等于**窗口级** `hover_target_swi
 - 停稳在某个控件上 → 查询并发布控件级矩形；
 - 在同一窗口内移到另一个控件并停稳 → 重新查询（新点落在已发布路径之外）；
 - 在同一控件内部微动 → 不触发查询，命中缓存。
+
+**产品侧复验（`npm run tauri dev`，默认日志的会话汇总行）——修复生效**：
+
+```text
+window_hit_test_us n=1790   hover_target_switch_count=5
+refinement_submitted=26  refinement_published=22  refinement_empty=0
+refinement_elapsed_us last=43398  max=61331
+```
+
+修复前 `submitted == hover_target_switch_count`（=6，即每个窗口只查一次）；修复后
+`submitted=26` 对 `hover_target_switch_count=5`，**精化次数约为窗口变化次数的 5 倍**，
+说明它确实在跟随控件而不是窗口；`published=22/26` 的 4 次差额是光标先移动、查询在完成前被
+取代（`invalidate_in_flight`），`empty=0` 表示没有「不支持/失败」结果。单次 43 ms、峰值 61 ms，
+均在 1500 ms 预算内。
+
+**这 4/26 的取代率正是 ② 树缓存要解决的问题**：同一窗口内换控件时，已展开的层级本可复用，
+而现在每次都要从窗口根重新下钻，慢 provider 上就会「查一半被取代」。
