@@ -532,3 +532,65 @@ COM/超时/线程层——那正是最容易被「看起来能跑」掩盖问题
 `EnumChildWindows` 只能贡献内容面板这一层。也就是说 ③ 的收益体现在「经典子窗口控件」类应用上，
 Explorer 文件项的更细粒度必须靠 P3 本体（MSAA / UIA 条目级）。这一点在上一节的实测里已经体现，
 不夸大。
+
+### 12.6 二轮调研：解决思路（来自 `uia/cache.rs` 与 `screenshotselectorworkflow.cpp`）
+
+针对「DirectUI 文件项只解析到大块内容区」，二次深调研找到三条**当前实现确实缺少**的机制。
+
+#### ① 结构性回溯（主因）
+
+`snow-ui-selector/src/windows/uia/cache.rs::WindowTree::query`：
+
+```rust
+let Some(child) = children.hit_before(point, usize::MAX) else {
+    // UIA sibling order is not a stacking guarantee. A redundant structural leaf may cover
+    // the content branch (for example in Chromium windows).
+    // Only backtrack through equal-bounds structural nodes; actual controls and distinct
+    // container frames retain their existing precedence.
+    if let Some(alternative) = self.structural_alternative(current, point) {
+        current = alternative;
+        continue;
+    }
+    reason = StopReason::Complete;
+    break;
+};
+```
+
+**某条分支走到死路（没有子节点包含该点）时不能结束**：UIA 的兄弟顺序不是叠放保证，
+一个与父节点**等边界**的冗余 `Pane`/`Group` 可能挡在真正承载内容的分支前面；只回溯**等边界的
+结构性节点**，真实控件与不同边界的容器保持原优先级。
+
+这正是 SnapClip 当前「资源管理器文件列表只解析到整块内容区」的成因：我们按「点内最小矩形」选中
+那个冗余 Pane，下钻后发现其子节点都不包含该点，就在 `resolve` 里 `break` 收工，**从不回到它的
+兄弟分支**。
+
+**落地方案**：把 `resolve` 的线性下钻改成**带显式栈的 DFS**——每层记录已尝试的分支；死路时在
+同一层寻找「等边界结构性且未访问」的兄弟继续；仅当所有分支都无果才停止并保留当前最深结果。
+策略层先加纯函数 `structural_alternative(parent_bounds, tried, candidates)` 并用单测锁定
+「只回溯等边界结构性节点」，provider 再按栈消费。
+
+#### ② 精化结果「只在更深时应用」
+
+`snow_shot/src/presentation/selector/screenshotselectorworkflow.cpp::handleRefinement` 用
+`replacePath` 区分两种语义：`true` → 整体替换（目标变了）；`false` → 走
+`applyCanvasRefinementPath(...)`，而该函数在 `refined.size() <= m_hitRects.size()` 时返回 false。
+
+SnapClip 目前是「新结果一律覆盖」，会出现**精化后又被更粗的结果顶回去**（深度回退）。
+
+**落地方案**：`DeepTarget` 增加 `replace_path: bool`（或发布时带上「本次是否换目标」），
+overlay 侧：换目标 → 替换；同目标 → 仅当 `path.len()` 更大时应用。这条同样是纯逻辑，可单测。
+
+#### ③ 增量发布
+
+同一个 `query` 内：`control.publication_interval` 到期**且路径变化**时才 `progress(path)`，
+配合 `QueryClock` 的 deadline 逐层检查预算、`MAX_STEPS` 封顶。
+
+SnapClip 已实测单次 15.8–19.1 ms（低于 32 ms 间隔）故此前暂缓；**①落地后深度上升、耗时也会上升**，
+届时启用就有数据依据（触发条件仍见 §11 的约定）。
+
+#### 实施顺序（修订）
+
+1. **① 结构性回溯**（策略纯函数 + 单测 → provider DFS）——直接针对文件项/Chromium 类窗口；
+2. **② 更深才应用**（`replace_path` 语义 + 单测）——防止深度回退；
+3. ③ 增量发布（待 ① 落地后的实测数据）；
+4. 之后才是 MSAA 本体（超时执行 + 隔离三态），它是 ① 之后的兜底来源而非唯一希望。
