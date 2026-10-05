@@ -108,45 +108,6 @@ pub fn is_descendable(parent: Rect, child: WalkNode) -> bool {
     !child.bounds.intersect(parent).is_empty()
 }
 
-/// Pick the child that the cursor is inside, preferring the smallest such rectangle.
-///
-/// "Smallest wins" is the whole point of deep selection: when a control sits inside a
-/// container that also contains the point, the user means the control. Ties go to the
-/// first candidate, which preserves the tree's own sibling order.
-pub fn deepest_child_at(point: Point, candidates: &[WalkNode]) -> Option<WalkNode> {
-    candidates
-        .iter()
-        .copied()
-        .filter(|node| !node.offscreen && !node.bounds.is_empty() && node.bounds.contains(point))
-        .fold(None, |best: Option<WalkNode>, node| match best {
-            Some(current) if current.bounds.area() <= node.bounds.area() => Some(current),
-            _ => Some(node),
-        })
-}
-
-/// Whether a node is a structural container that adds no selection value.
-///
-/// Such a node is still part of the published path (the path is "window → … → element"),
-/// but it must never be the *final* answer while it has a descendable child under the
-/// cursor.
-pub fn is_structural_container(parent: Rect, node: WalkNode) -> bool {
-    node.bounds == parent
-}
-
-/// Whether a dead-ended branch may give way to its siblings.
-///
-/// UIA sibling order is **not** a stacking guarantee: a redundant `Pane`/`Group` with the same
-/// bounds as its parent can sit in front of the branch that actually holds the content
-/// (Chromium-family apps do exactly this), and stopping at that dead end is why a hit inside
-/// such a window degrades to the coarse container (docs/18 §12.6 ①).
-///
-/// Only equal-bounds structural nodes are allowed to be skipped: a *real* control or a
-/// container with its own distinct frame keeps its precedence, so backtracking can never
-/// promote something the user is not pointing at.
-pub fn may_try_sibling_branch(dead: WalkNode, parent_bounds: Rect) -> bool {
-    !dead.offscreen && is_structural_container(parent_bounds, dead)
-}
-
 /// Result of a bounded walk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalkOutcome {
@@ -306,43 +267,10 @@ mod tests {
     }
 
     #[test]
-    fn the_deepest_child_under_the_point_wins() {
-        let point = Point::new(150, 150);
-        let candidates = [
-            node(0, 0, 1000, 1000),   // window-sized container
-            node(100, 100, 400, 400), // pane
-            node(140, 140, 200, 200), // the control the cursor is on
-        ];
-        assert_eq!(
-            deepest_child_at(point, &candidates),
-            Some(node(140, 140, 200, 200))
-        );
-        // A point outside every child resolves to nothing, so the caller keeps the parent.
-        assert_eq!(deepest_child_at(Point::new(900, 900), &candidates[1..]), None);
-    }
-
-    #[test]
-    fn off_screen_and_degenerate_children_are_never_chosen() {
-        let point = Point::new(150, 150);
-        let candidates = [
-            WalkNode::new(rect(100, 100, 200, 200), 0, true, true), // off-screen
-            WalkNode::new(rect(150, 150, 150, 150), 0, false, true), // empty
-            node(120, 120, 300, 300),
-        ];
-        assert_eq!(
-            deepest_child_at(point, &candidates),
-            Some(node(120, 120, 300, 300))
-        );
-    }
-
-    #[test]
-    fn a_structural_container_is_descent_worthy_but_not_an_answer() {
+    fn a_same_bounds_container_is_descent_worthy() {
         let window = rect(0, 0, 800, 600);
         let container = node(0, 0, 800, 600);
         assert!(is_descendable(window, container), "same-bounds panes must be entered");
-        assert!(is_structural_container(window, container));
-        // A real control is not a structural container.
-        assert!(!is_structural_container(window, node(100, 100, 200, 200)));
     }
 
     #[test]
@@ -514,23 +442,4 @@ mod tests {
         assert_eq!(merged.last(), Some(&seed), "the sibling never becomes a level");
     }
 
-    #[test]
-    fn only_an_equal_bounds_structural_branch_may_backtrack() {
-        let parent = rect(0, 0, 800, 600);
-        // A redundant same-bounds pane may be skipped in favour of a sibling branch.
-        assert!(may_try_sibling_branch(node(0, 0, 800, 600), parent));
-        // A real control keeps its precedence: its dead end ends the walk.
-        assert!(!may_try_sibling_branch(node(100, 100, 300, 200), parent));
-        // A container with its own distinct frame is not a redundant branch either.
-        assert!(!may_try_sibling_branch(node(50, 50, 700, 500), parent));
-        // An off-screen node has no branch to give way to.
-        assert!(!may_try_sibling_branch(
-            WalkNode::new(parent_rect(), 0, true, true),
-            parent
-        ));
-
-        fn parent_rect() -> Rect {
-            rect(0, 0, 800, 600)
-        }
-    }
 }

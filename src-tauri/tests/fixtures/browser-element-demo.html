@@ -1,0 +1,409 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SnapClip browser element demo</title>
+<!--
+  Fixture page for `uia_provider::tests::browser_element_probe`.
+
+  Open it in a browser to look at it; the probe opens it with `?truth=1`, which makes the page
+  publish its own measured boxes (see `publishTruth` below) in the window title. That is the
+  point of this file:
+
+    * the page is the **single source of truth for geometry** — nothing about the boxes is
+      hand-computed, so a `<li>` or a table cell can never drift from its expectation;
+    * the manifest below is the single source for *intent* (which element, what it is, and what
+      a correct deep selection must publish for a probe point inside it).
+
+  `expect` says what the probe point must resolve to:
+    "self"   -> this fixture's own measured rectangle
+    "<id>"   -> another fixture's rectangle (stacking, nesting, container-vs-item cases)
+    "none"   -> nothing finer than the page: the fixture must not be in the accessibility tree
+                at all (`display:none`, `aria-hidden`)
+    "inside_self"  -> the answer must lie inside this fixture's rectangle (measured: Chromium
+                      exposes a text-only anchor as its text run, not as an anchor node)
+    "covers_self"  -> the fixture itself is not exposed, so the nearest exposed ancestor may
+                      answer — as long as it covers the fixture and stays local (measured: a
+                      disabled Chromium input is a Group holding a text run)
+  `probe` is an optional [dx, dy] offset inside this fixture's rectangle (default: its centre).
+  `role`/`name` are informational — the probe prints what the tree actually exposes next to them.
+  `optional: true` marks cases whose exact answer is implementation-defined (rotated boxes,
+  canvas, svg, iframe, shadow DOM, layout-only wrappers) and the one measured *limitation*
+  (`input-disabled`: Chromium paints a nameless `Pane` over the input — the system's own hit test
+  returns that pane — and the walk follows the overlay branch, answering a 298x101 container
+  instead of the 240x56 control beneath it). Those are measured and printed, never asserted.
+-->
+<style>
+  html, body { margin: 0; padding: 0; width: 1600px; height: 1020px; overflow: hidden;
+               background: #f6f7f9; font: 14px/1.3 "Segoe UI", sans-serif; color: #1d1f23; }
+  /* `margin: 0` is not cosmetic: an absolutely positioned element's `top` positions its margin
+     box, so an `<h2>`/`<p>`/`<ul>` default margin would push it 14–17 px below the declared
+     rectangle — and the fixture's declared layout is what the probe cross-checks. */
+  .fixture { position: absolute; box-sizing: border-box; margin: 0; }
+  .caption { position: absolute; font: 11px/1 Consolas, monospace; color: #8b8f96;
+             transform: translateY(-13px); white-space: nowrap; }
+  .frame { border: 1px solid #b9bec7; background: #fff; }
+  .dashed { border: 1px dashed #c2673a; background: #fff8f2; }
+  .front { background: rgba(40, 120, 220, .22); border: 1px solid #2878dc; }
+  .cap { display: flex; align-items: center; justify-content: center; background: #e8eefc;
+         border: 1px solid #4a6fb5; font-weight: 600; }
+  .muted { background: #e9ebef; border: 1px solid #c9ced6; }
+  .row { display: flex; align-items: center; height: 100%; }
+</style>
+</head>
+<body>
+<script type="application/json" id="manifest">
+[
+  {"id":"btn-plain","rect":[24,24,168,56],"kind":"button","role":"Button","name":"Button One",
+   "expect":"self","text":"Button One"},
+  {"id":"btn-disabled","rect":[208,24,168,56],"kind":"button","role":"Button",
+   "name":"Disabled Button","expect":"self","text":"Disabled Button","disabled":true},
+  {"id":"link-plain","rect":[392,24,168,56],"kind":"link","role":"Hyperlink","name":"Link Two",
+   "expect":"inside_self","text":"Link Two"},
+  {"id":"role-button","rect":[576,24,168,56],"kind":"role-button","role":"Button",
+   "name":"Aria Button","expect":"self","text":"Aria Button"},
+  {"id":"link-icon","rect":[760,24,168,56],"kind":"link-icon","role":"Hyperlink",
+   "name":"Icon Link","expect":"self"},
+  {"id":"input-text","rect":[944,24,240,56],"kind":"input","role":"Edit","name":"Text Input",
+   "expect":"self","text":"Input Field"},
+  {"id":"input-disabled","rect":[1200,24,240,56],"kind":"input","role":"Edit",
+   "name":"Disabled Input","expect":"self","text":"Read Only","readonly":true,"optional":true},
+
+  {"id":"checkbox","rect":[24,104,168,56],"kind":"checkbox","role":"CheckBox",
+   "name":"Checkbox Item","expect":"self","text":"Checkbox Item","optional":true},
+  {"id":"radio","rect":[208,104,168,56],"kind":"radio","role":"RadioButton","name":"Radio Item",
+   "expect":"self","text":"Radio Item","optional":true},
+  {"id":"toggle","rect":[392,104,168,56],"kind":"switch","role":"","name":"Toggle Switch",
+   "expect":"self","optional":true},
+  {"id":"select","rect":[576,104,200,56],"kind":"select","role":"ComboBox","name":"Select One",
+   "expect":"self"},
+  {"id":"slider","rect":[792,104,168,56],"kind":"range","role":"Slider","name":"Range Slider",
+   "expect":"self"},
+  {"id":"textarea","rect":[976,104,240,88],"kind":"textarea","role":"Edit","name":"Notes Area",
+   "expect":"self","text":"Line one\nLine two"},
+  {"id":"img-box","rect":[1232,104,208,88],"kind":"img","role":"Image","name":"Image Box",
+   "expect":"self"},
+
+  {"id":"heading","rect":[24,208,392,88],"kind":"heading","role":"","name":"Heading Node",
+   "expect":"self","text":"Heading Node","optional":true},
+  {"id":"para","rect":[432,208,392,88],"kind":"para","role":"","name":"Paragraph Node",
+   "expect":"self","text":"Paragraph Node","optional":true},
+  {"id":"list-box","rect":[840,208,280,124],"kind":"list","role":"List","name":"Item List",
+   "expect":"list-item-b","probe":[140,66],"optional":true},
+  {"id":"list-item-b","rect":[0,0,0,0],"kind":"generated","role":"ListItem","name":"List Item B",
+   "expect":"self"},
+  {"id":"table-box","rect":[1136,208,336,124],"kind":"table","role":"Table","name":"Data Table",
+   "expect":"table-cell-1","probe":[80,60],"optional":true},
+  {"id":"table-cell-1","rect":[0,0,0,0],"kind":"generated","role":"","name":"Cell One",
+   "expect":"self","optional":true},
+
+  {"id":"nested-outer","rect":[24,352,320,200],"kind":"nested-outer","role":"","name":"Nested Outer",
+   "expect":"nested-inner","probe":[160,100]},
+  {"id":"nested-mid","rect":[56,384,256,136],"kind":"nested-mid","role":"","name":"Nested Mid",
+   "expect":"nested-inner","probe":[128,68],"optional":true},
+  {"id":"nested-inner","rect":[88,416,192,72],"kind":"nested-inner","role":"","name":"Deep Span",
+   "expect":"self","text":"Deep Span"},
+  {"id":"stack-back","rect":[368,352,240,120],"kind":"stack-back","role":"Button",
+   "name":"Behind Button","expect":"stack-front","text":"Behind Button"},
+  {"id":"stack-front","rect":[424,376,240,120],"kind":"stack-front","role":"","name":"Front Overlay",
+   "expect":"self"},
+  {"id":"scroll-box","rect":[632,352,360,200],"kind":"scroll","role":"","name":"Scroll Container",
+   "expect":"scroll-item-2","probe":[180,68]},
+  {"id":"scroll-item-2","rect":[0,0,0,0],"kind":"generated","role":"ListItem",
+   "name":"Scroll Item 2","expect":"self"},
+  {"id":"iframe-box","rect":[1016,352,360,200],"kind":"iframe","role":"","name":"Iframe Host",
+   "expect":"iframe-button","optional":true},
+  {"id":"iframe-button","rect":[0,0,0,0],"kind":"generated","role":"Button",
+   "name":"Iframe Button","expect":"self","optional":true},
+  {"id":"canvas-box","rect":[1400,352,176,200],"kind":"canvas","role":"","name":"Canvas Area",
+   "expect":"self","optional":true},
+
+  {"id":"svg-box","rect":[24,576,176,200],"kind":"svg","role":"","name":"Vector Box",
+   "expect":"self","optional":true},
+  {"id":"shadow-box","rect":[224,576,280,200],"kind":"shadow","role":"","name":"Shadow Host",
+   "expect":"shadow-button","optional":true},
+  {"id":"shadow-button","rect":[0,0,0,0],"kind":"generated","role":"Button",
+   "name":"Shadow Button","expect":"self","optional":true},
+  {"id":"details-box","rect":[528,576,280,200],"kind":"details","role":"","name":"Details Node",
+   "expect":"details-summary","optional":true},
+  {"id":"details-summary","rect":[0,0,0,0],"kind":"generated","role":"","name":"Details Node",
+   "expect":"self","optional":true},
+  {"id":"contenteditable-box","rect":[832,576,280,200],"kind":"contenteditable","role":"Edit",
+   "name":"Rich Text","expect":"self","text":"Editable block"},
+  {"id":"hidden-box","rect":[1136,576,200,56],"kind":"hidden","role":"","name":"Hidden Node",
+   "expect":"none","text":"Hidden Node"},
+  {"id":"aria-hidden-box","rect":[1360,576,216,56],"kind":"aria-hidden","role":"",
+   "name":"Aria Hidden Node","expect":"none","text":"Aria Hidden Node"},
+
+  {"id":"rotated-box","rect":[24,800,240,120],"kind":"rotated","role":"","name":"Rotated Box",
+   "expect":"self","optional":true},
+  {"id":"link-image","rect":[288,800,240,120],"kind":"link-image","role":"Hyperlink",
+   "name":"Picture Link","expect":"self"},
+  {"id":"aria-hidden-button","rect":[552,800,240,120],"kind":"aria-hidden-button","role":"",
+   "name":"Ghost Button","expect":"none","text":"Ghost Button"},
+  {"id":"code-box","rect":[816,800,300,120],"kind":"para","role":"","name":"Code Node",
+   "expect":"self","text":"Code Node","optional":true},
+  {"id":"progress","rect":[1140,800,200,56],"kind":"progress","role":"ProgressBar",
+   "name":"Progress Bar","expect":"self"},
+  {"id":"meter-shell","rect":[1364,800,212,120],"kind":"nested-outer","role":"",
+   "name":"Empty Shell","expect":"self","optional":true}
+]
+</script>
+
+<script>
+const SVG_ICON = 'data:image/svg+xml;utf8,' + encodeURIComponent(
+  '<svg xmlns="http://www.w3.org/2000/svg" width="200" height="80">' +
+  '<rect width="200" height="80" fill="#dfe8ff" stroke="#4a6fb5"/>' +
+  '<circle cx="60" cy="40" r="22" fill="#4a6fb5"/>' +
+  '<rect x="100" y="24" width="76" height="32" rx="6" fill="#8fb0f0"/></svg>');
+
+function make(className) {
+  const element = document.createElement('div');
+  element.className = 'fixture ' + (className || '');
+  return element;
+}
+
+function listRow(id, label) {
+  return '<div id="' + id + '" role="listitem" style="height:28px;display:flex;align-items:center;' +
+    'padding-left:10px">' + label + '</div>';
+}
+
+// Each builder returns the tag name to create and fills `el` with attributes/children.
+const builders = {
+  button: (el, entry) => { el.className = 'fixture cap'; el.textContent = entry.text;
+                           el.disabled = !!entry.disabled; return 'button'; },
+  // A plain inline link: the flex-centred variant stops Chromium from exposing the anchor as a
+  // node of its own (measured — the accessibility tree then lists only its text run).
+  link: (el, entry) => { el.className = 'fixture frame';
+                         el.style.cssText += 'display:flex;align-items:center;' +
+                           'justify-content:center;font-weight:600';
+                         el.textContent = entry.text; el.href = '#'; return 'a'; },
+  'role-button': (el, entry) => { el.className = 'fixture cap'; el.textContent = entry.text;
+                                  el.tabIndex = 0; el.setAttribute('role', 'button'); return 'div'; },
+  'link-icon': (el) => { el.className = 'fixture cap'; el.setAttribute('aria-label', 'Icon Link');
+                         el.href = '#'; el.innerHTML = '<img alt="" width="120" height="40" src="' +
+                         SVG_ICON + '">'; return 'a'; },
+  input: (el, entry) => { el.className = 'fixture frame'; el.value = entry.text;
+                          // `readonly` + `aria-disabled`, not the `disabled` attribute: Chromium
+                          // does not expose a natively disabled form control as a control at all
+                          // (measured: it becomes a Group holding a text run), so a fixture that
+                          // used it would be asserting a box the tree does not contain.
+                          el.readOnly = !!entry.readonly;
+                          if (entry.readonly) {
+                            el.setAttribute('aria-disabled', 'true');
+                          }
+                          el.setAttribute('aria-label', entry.name); return 'input'; },
+  checkbox: (el, entry) => { el.className = 'fixture muted'; el.innerHTML =
+    '<label class="row" style="gap:8px"><input id="checkbox-input" type="checkbox" checked>' +
+    entry.text + '</label>'; return 'div'; },
+  radio: (el, entry) => { el.className = 'fixture muted'; el.innerHTML =
+    '<label class="row" style="gap:8px"><input id="radio-input" type="radio" checked>' +
+    entry.text + '</label>'; return 'div'; },
+  switch: (el) => { el.className = 'fixture muted'; el.tabIndex = 0;
+                    el.setAttribute('role', 'switch'); el.setAttribute('aria-checked', 'true');
+                    el.setAttribute('aria-label', 'Toggle Switch');
+                    el.innerHTML = '<span class="row" style="padding-left:12px">Toggle Switch</span>';
+                    return 'div'; },
+  select: (el) => { el.className = 'fixture frame'; el.setAttribute('aria-label', 'Select One');
+                    el.innerHTML = '<option>One</option><option>Two</option><option>Three</option>';
+                    return 'select'; },
+  range: (el) => { el.className = 'fixture frame'; el.type = 'range';
+                   el.setAttribute('aria-label', 'Range Slider'); return 'input'; },
+  textarea: (el, entry) => { el.className = 'fixture frame'; el.value = entry.text;
+                             el.setAttribute('aria-label', entry.name); return 'textarea'; },
+  img: (el) => { el.className = 'fixture frame'; el.src = SVG_ICON; el.alt = 'Image Box';
+                 return 'img'; },
+  heading: (el, entry) => { el.className = 'fixture cap'; el.textContent = entry.text;
+                            return 'h2'; },
+  para: (el, entry) => { el.style.padding = '10px';
+                         el.style.font = '15px/1.4 "Segoe UI", sans-serif';
+                         el.textContent = entry.text; return 'p'; },
+  list: (el) => { el.className = 'fixture frame';
+                  el.innerHTML = '<div style="padding:4px 10px">Item List</div>' +
+                    listRow('list-item-a', 'List Item A') +
+                    listRow('list-item-b', 'List Item B') +
+                    listRow('list-item-c', 'List Item C');
+                  return 'ul'; },
+  table: (el) => { el.className = 'fixture frame';
+                   el.innerHTML = '<div style="padding:4px 10px">Data Table</div>' +
+                     '<div style="display:grid;grid-template-columns:1fr 1fr">' +
+                     ['Cell One', 'Cell Two', 'Cell Three', 'Cell Four'].map((label, index) =>
+                       '<div id="table-cell-' + (index + 1) + '" style="height:34px;display:flex;' +
+                       'align-items:center;padding-left:10px">' + label + '</div>').join('') +
+                     '</div>';
+                   return 'table'; },
+  'nested-outer': (el, entry) => { el.className = 'fixture dashed';
+                                   el.setAttribute('aria-label', entry.name); return 'div'; },
+  'nested-mid': (el, entry) => { el.className = 'fixture frame';
+                                 el.setAttribute('aria-label', entry.name); return 'div'; },
+  'nested-inner': (el, entry) => { el.className = 'fixture cap'; el.textContent = entry.text;
+                                   el.style.background = '#e6f7ea';
+                                   el.style.borderColor = '#2f8f4a';
+                                   // A bare span is only a text run in the accessibility tree; the
+                                   // group role is what makes its *box* selectable, which is the
+                                   // shape the fixture asserts.
+                                   el.setAttribute('role', 'group');
+                                   el.setAttribute('aria-label', entry.name);
+                                   return 'span'; },
+  'stack-back': (el, entry) => { el.className = 'fixture cap'; el.textContent = entry.text;
+                                 return 'button'; },
+  'stack-front': (el, entry) => { el.className = 'fixture front';
+                                  el.setAttribute('aria-label', entry.name); return 'div'; },
+  scroll: (el) => { el.className = 'fixture frame'; el.style.overflow = 'auto';
+                    el.setAttribute('aria-label', 'Scroll Container');
+                    el.setAttribute('role', 'list');
+                    el.innerHTML = '<div style="height:20px"></div>' +
+                      Array.from({ length: 10 }, (_, index) =>
+                        listRow('scroll-item-' + (index + 1), 'Scroll Item ' + (index + 1))).join('');
+                    return 'div'; },
+  iframe: (el) => { el.className = 'fixture frame';
+                    el.srcdoc = '<!doctype html><body style="margin:0;font:14px sans-serif">' +
+                      '<button id="iframe-button" style="position:absolute;left:40px;top:40px;' +
+                      'width:160px;height:48px">Iframe Button</button></body>';
+                    return 'iframe'; },
+  canvas: (el, entry) => { el.className = 'fixture frame';
+                           el.setAttribute('aria-label', entry.name);
+                           el.width = 176; el.height = 200;
+                           return 'canvas'; },
+  svg: (el, entry) => { el.className = 'fixture frame';
+                        el.setAttribute('aria-label', entry.name);
+                        el.innerHTML = '<svg width="174" height="198" xmlns="http://www.w3.org/2000/svg">' +
+                          '<circle cx="86" cy="70" r="46" fill="#4a6fb5"/>' +
+                          '<rect x="30" y="130" width="114" height="40" rx="8" fill="#8fb0f0"/>' +
+                          '</svg>';
+                        return 'div'; },
+  shadow: (el) => { el.className = 'fixture frame'; return 'div'; },
+  details: (el) => { el.className = 'fixture frame'; el.innerHTML =
+      '<summary id="details-summary" style="height:44px;display:flex;align-items:center;' +
+      'padding-left:12px">Details Node</summary>' +
+      '<div style="padding:12px">Collapsed content</div>';
+      return 'details'; },
+  contenteditable: (el, entry) => { el.className = 'fixture frame';
+                                    el.style.padding = '12px';
+                                    el.contentEditable = 'true';
+                                    el.setAttribute('aria-label', entry.name);
+                                    el.textContent = entry.text; return 'div'; },
+  hidden: (el, entry) => { el.className = 'fixture cap'; el.style.display = 'none';
+                           el.textContent = entry.text; return 'div'; },
+  'aria-hidden': (el, entry) => { el.className = 'fixture cap';
+                                  el.setAttribute('aria-hidden', 'true');
+                                  el.textContent = entry.text; return 'div'; },
+  rotated: (el, entry) => { el.className = 'fixture cap';
+                            el.setAttribute('aria-label', entry.name);
+                            el.style.transform = 'rotate(-8deg)'; return 'div'; },
+  'link-image': (el) => { el.className = 'fixture'; el.href = '#';
+                          el.setAttribute('aria-label', 'Picture Link');
+                          el.innerHTML = '<img alt="" width="238" height="118" src="' + SVG_ICON + '">';
+                          return 'a'; },
+  'aria-hidden-button': (el, entry) => { el.className = 'fixture cap';
+                                         el.setAttribute('aria-hidden', 'true');
+                                         el.textContent = entry.text; return 'button'; },
+  progress: (el) => { el.className = 'fixture frame'; el.value = 62; el.max = 100;
+                      el.setAttribute('aria-label', 'Progress Bar'); return 'progress'; },
+};
+
+/// Post-creation work that needs the real element (a canvas context, a shadow root).
+const after = {
+  canvas: (node) => {
+    node.width = 176; node.height = 200;
+    const context = node.getContext('2d');
+    context.fillStyle = '#4a6fb5';
+    context.fillRect(20, 20, 136, 160);
+  },
+  shadow: (node) => {
+    node.attachShadow({ mode: 'open' }).innerHTML =
+      '<style>:host{display:block}</style>' +
+      '<button id="shadow-button" style="position:absolute;left:44px;top:60px;' +
+      'width:192px;height:56px">Shadow Button</button>';
+  },
+};
+
+const manifest = JSON.parse(document.getElementById('manifest').textContent);
+
+function buildFixtures() {
+  for (const entry of manifest) {
+    if (entry.kind === 'generated') {
+      continue; // lives inside another fixture; only its measured box is interesting
+    }
+    const [x, y, width, height] = entry.rect;
+    const holder = make('frame');
+    const tag = builders[entry.kind] ? builders[entry.kind](holder, entry) : 'div';
+    const node = document.createElement(tag);
+    for (const attribute of holder.attributes) {
+      node.setAttribute(attribute.name, attribute.value);
+    }
+    while (holder.firstChild) {
+      node.appendChild(holder.firstChild);
+    }
+    node.id = entry.id;
+    node.classList.add('fixture');
+    node.style.left = x + 'px';
+    node.style.top = y + 'px';
+    node.style.width = width + 'px';
+    node.style.height = height + 'px';
+    document.body.appendChild(node);
+    if (after[entry.kind]) {
+      after[entry.kind](node);
+    }
+
+    const caption = make('caption');
+    caption.style.left = x + 'px';
+    caption.style.top = y + 'px';
+    caption.textContent = entry.id;
+    document.body.appendChild(caption);
+  }
+}
+
+/// Publish every fixture's measured box, so the probe never has to guess a box model.
+///
+/// `[id]` also picks up the ids generated inside the fixtures (list rows, table cells, scroll
+/// rows); shadow DOM and iframe documents are outside `document.querySelectorAll`, so their
+/// elements are looked up explicitly — a same-origin `srcdoc` frame is readable, and its boxes
+/// need the frame's own offset added.
+function publishTruth() {
+  const truth = {};
+  for (const element of document.querySelectorAll('[id]')) {
+    if (element.id === 'manifest') continue;
+    const box = element.getBoundingClientRect();
+    truth[element.id] = [Math.round(box.left), Math.round(box.top),
+                         Math.round(box.width), Math.round(box.height)];
+  }
+  const host = document.getElementById('shadow-box');
+  const shadowButton = host && host.shadowRoot && host.shadowRoot.getElementById('shadow-button');
+  if (shadowButton) {
+    const box = shadowButton.getBoundingClientRect();
+    truth['shadow-button'] = [Math.round(box.left), Math.round(box.top),
+                              Math.round(box.width), Math.round(box.height)];
+  }
+  const frame = document.getElementById('iframe-box');
+  const inner = frame && frame.contentDocument && frame.contentDocument.getElementById('iframe-button');
+  if (inner) {
+    const outer = frame.getBoundingClientRect();
+    const box = inner.getBoundingClientRect();
+    truth['iframe-button'] = [Math.round(outer.left + box.left), Math.round(outer.top + box.top),
+                              Math.round(box.width), Math.round(box.height)];
+  }
+  if (location.search.includes('truth')) {
+    // The probe reads this back with GetWindowTextW: the only channel out of the page.
+    document.title = 'SNAPCLIP_TRUTH:' + JSON.stringify(truth);
+  }
+  return truth;
+}
+
+/// A broken fixture must say so through the same channel the probe reads, instead of looking
+/// like "the page never loaded".
+function report(error) {
+  document.title = 'SNAPCLIP_ERROR:' + (error && error.message ? error.message : String(error));
+}
+
+window.addEventListener('load', () => {
+  try {
+    buildFixtures();
+    publishTruth();
+  } catch (error) {
+    report(error);
+  }
+});
+</script>
+</body>
+</html>

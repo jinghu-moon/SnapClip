@@ -202,7 +202,7 @@ impl UiaDeepSelectionProvider {
         (expanded, stats)
     }
 
-    /// Every descendable child of a node that contains `point`, smallest first.
+    /// Every descendable child of a node that contains `point`, topmost (last listed by the provider) first.
     ///
     /// Returning *all* containing candidates (not just the smallest) is what makes structural
     /// backtracking possible: when the smallest one dead-ends, the walk must be able to come
@@ -239,15 +239,13 @@ impl UiaDeepSelectionProvider {
             }
             candidates.push((child.clone(), *node));
         }
-        candidates.sort_unstable_by_key(|(_, node)| {
-            (
-                node.bounds.area(),
-                node.bounds.left,
-                node.bounds.top,
-                node.bounds.right,
-                node.bounds.bottom,
-            )
-        });
+        // The reference selector's order (`uia/cache.rs`: `children.hit_before(point, usize::MAX)`):
+        // the child the provider lists **last** wins, i.e. the one painted on top. Ordering by area
+        // instead ("smallest wins") descended into a childless dead leaf at a Chromium window root,
+        // where two overlapping panes contain the cursor and the *smaller* one has no children —
+        // measured: a browser page scored 3/23 fixtures with the area order and 21/23 with this one,
+        // while a real File Explorer window also improved (3/25 → 12/25 points reached control level).
+        candidates.reverse();
         self.level += 1;
         self.metrics.log_line(
             &format!(
@@ -740,41 +738,42 @@ mod tests {
             "levels from the previous generation cannot survive"
         );
     }
+    /// One fixture from the demo page's manifest.
+    #[derive(Debug, serde::Deserialize)]
+    struct Fixture {
+        id: String,
+        /// Layout input for the absolutely positioned fixtures; generated children are measured
+        /// by the page instead.
+        #[serde(default)]
+        rect: [i32; 4],
+        #[serde(default)]
+        role: String,
+        #[serde(default)]
+        name: String,
+        /// `"self"`, another fixture id, or `"none"` (see the fixture file's header).
+        expect: String,
+        /// Offset inside the fixture's own box; defaults to its centre.
+        #[serde(default)]
+        probe: Option<[i32; 2]>,
+        #[serde(default)]
+        optional: bool,
+    }
 
-    /// The page the browser probe opens: a known grid of elements plus a nested pair.
-    const PROBE_PAGE: &str = r##"<!doctype html>
-<html><head><meta charset="utf-8"><title>SnapClip UIA probe</title>
-<style>
-  html,body{margin:0;padding:0;background:#fff;font:16px/1.2 "Segoe UI",sans-serif}
-  #grid{display:grid;grid-template-columns:repeat(3,220px);gap:16px;padding:24px}
-  .cell{height:120px;display:flex;align-items:center;justify-content:center;
-        border:2px solid #333;background:#eef}
-  #row2{margin:24px;padding:8px;border:2px dashed #c00}
-  #nested{padding:18px;border:2px solid #090;background:#efe}
-</style></head><body>
-<div id="grid">
-  <button class="cell" id="b1">Button One</button>
-  <div class="cell" id="d1">Div Two</div>
-  <a class="cell" id="a1" href="#">Link Three</a>
-</div>
-<div id="row2"><div id="nested"><span id="s1">Nested Span</span></div></div>
-<input id="i1" style="margin:24px;width:320px;height:40px" value="Input Field">
-</body></html>
-"##;
-
-    /// What our walk reaches inside a Chromium window.
+    /// What a correct deep selection must publish in a real web page.
     ///
-    /// Run explicitly — it launches its own browser on a throwaway profile, so the user's
-    /// browser state is untouched:
+    /// Run explicitly — it launches its own Chromium on a throwaway profile over the demo page in
+    /// `tests/fixtures/browser-element-demo.html`, so the user's browser state is untouched:
     ///
     /// ```text
     /// cargo test --lib browser_element_probe -- --ignored --nocapture
     /// ```
     ///
-    /// For each probe point it prints the raw accessibility chain Chromium exposes (control
-    /// type + name + rectangle per level) next to what [`UiaDeepSelectionProvider`] publishes.
-    /// That is the evidence behind "how far does deep selection get inside a web page". It is
-    /// deliberately **not** part of the default suite: it needs a browser and a visible window.
+    /// The page publishes its own measured boxes in the window title (`?truth=1`), so the
+    /// expectations cannot drift from the CSS: every row of the report compares our published
+    /// rectangle against the browser's own measurement, and against the raw accessibility chain
+    /// at that point. `optional` rows are printed but not asserted (rotated boxes, canvas, svg,
+    /// iframe, shadow DOM, layout-only wrappers). It is deliberately **not** part of the default
+    /// suite: it needs a browser and a visible window.
     #[test]
     #[ignore = "launches a browser; run explicitly with --ignored --nocapture"]
     fn browser_element_probe() {
@@ -782,24 +781,50 @@ mod tests {
             eprintln!("skipping: no Chromium-based browser found");
             return;
         };
+        // A test process is DPI-unaware by default, so user32 virtualises `GetClientRect` to
+        // logical pixels while DWM keeps reporting physical ones — the two disagreed by the
+        // display scale and every computed probe point was wrong. The app does exactly this on
+        // its overlay thread at startup.
+        let _ = crate::platform::windows::capture::monitor::set_per_monitor_v2_awareness();
+        let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/browser-element-demo.html");
+        let Ok(source) = std::fs::read_to_string(&fixture_path) else {
+            eprintln!("skipping: cannot read {}", fixture_path.display());
+            return;
+        };
+        let Some(manifest) = manifest_of(&source) else {
+            eprintln!("skipping: the fixture has no parsable manifest");
+            return;
+        };
+
         let dir = std::env::temp_dir().join("snapclip-browser-probe");
         let _ = std::fs::create_dir_all(&dir);
-        let page = dir.join("probe.html");
-        if std::fs::write(&page, PROBE_PAGE).is_err() {
-            eprintln!("skipping: cannot write the probe page");
-            return;
-        }
-        let url = format!("file:///{}", page.display().to_string().replace('\\', "/"));
+        // A reused profile makes Chromium restore the previous session: it ignores
+        // `--window-size`, opens a "restore pages?" bubble, and the page then renders in a window
+        // smaller than itself — which showed up as every probe point missing.
+        let profile = dir.join("profile");
+        let _ = std::fs::remove_dir_all(&profile);
+        let url = format!(
+            "file:///{}?truth=1",
+            fixture_path.display().to_string().replace('\\', "/")
+        );
         let spilled = std::process::Command::new(&browser)
             .args([
                 "--new-window",
                 "--no-first-run",
                 "--no-default-browser-check",
                 "--disable-session-crashed-bubble",
-                "--window-size=1280,980",
-                "--window-position=120,60",
+                "--disable-features=Translate,TranslateUI,InfiniteSessionRestore",
+                "--disable-background-networking",
+                "--disable-popup-blocking",
+                "--force-device-scale-factor=1",
+                "--hide-scrollbars",
+                // The requested size is the *outer* window, so it has to clear the fixture page
+                // plus Chromium's frame and tab strip for the client area to contain 1600x1020.
+                "--window-size=1800,1220",
+                "--window-position=40,20",
             ])
-            .arg(format!("--user-data-dir={}", dir.join("profile").display()))
+            .arg(format!("--user-data-dir={}", profile.display()))
             .arg(&url)
             .spawn();
         let Ok(mut child) = spilled else {
@@ -807,76 +832,395 @@ mod tests {
             return;
         };
 
+        // Collect every candidate instead of taking the first match: a Chromium window left over
+        // from an earlier probe run also carries the demo page (and its truth title) but keeps the
+        // default — smaller — window size, and probing *that* window made every point miss.
+        // Find the window first, and measure it *later*: `--window-size` is applied asynchronously,
+        // so a client rect read while the window is still settling disagrees with the one the page
+        // published its geometry against — which showed up as a viewport that could not be located.
         let deadline = std::time::Instant::now() + Duration::from_secs(40);
-        let mut window = None;
-        while window.is_none() && std::time::Instant::now() < deadline {
-            pump(100);
-            window = win32::enumerate_cheap_candidates()
+        let mut hwnd = None;
+        while hwnd.is_none() && std::time::Instant::now() < deadline {
+            pump(200);
+            hwnd = win32::enumerate_cheap_candidates()
                 .unwrap_or_default()
                 .into_iter()
                 .find(|probe| {
-                    probe.class_name == "Chrome_WidgetWin_1"
-                        && probe_title(probe.hwnd).contains("probe")
+                    if probe.class_name != "Chrome_WidgetWin_1" {
+                        return false;
+                    }
+                    let title = probe_title(probe.hwnd);
+                    title.contains("SNAPCLIP_TRUTH:")
+                        || title.contains("SNAPCLIP_ERROR:")
+                        || title.contains("browser element demo")
                 })
                 .map(|probe| probe.hwnd);
         }
-        let Some(hwnd) = window else {
+        let Some(hwnd) = hwnd else {
             let _ = child.kill();
-            eprintln!("skipping: the browser window never appeared");
+            eprintln!("skipping: the demo page never appeared");
             return;
         };
-        // Let the page lay out and Chromium bring its accessibility tree up.
+        // Chromium throttles a background (or covered) tab's accessibility tree, so the probe window
+        // is raised above whatever the terminal is showing. `SetForegroundWindow` alone fails here:
+        // Windows only lets the foreground process call it, and the test binary is not it.
+        unsafe {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                HWND_TOPMOST, SetForegroundWindow, SetWindowPos, SWP_SHOWWINDOW,
+            };
+            SetWindowPos(
+                hwnd as *mut core::ffi::c_void,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_SHOWWINDOW | windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
+                    | windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOSIZE,
+            );
+            SetForegroundWindow(hwnd as *mut core::ffi::c_void);
+        }
+        // The tree materialises asynchronously after the window appears; give Chromium time to
+        // answer for every fixture before measuring (see docs/18 §14.3 `AccessibilityPending`).
         pump(1500);
-        let Some(frame) = win32::frame_bounds(hwnd) else {
+
+        let title = probe_title(hwnd);
+        if let Some(message) = marker_payload(&title, "SNAPCLIP_ERROR:") {
             let _ = child.kill();
-            eprintln!("skipping: no frame bounds for the browser window");
+            panic!("the fixture page failed to build: {message}");
+        }
+        let (Some(truth), Some(frame), Some(client)) =
+            (truth_of(&title), win32::frame_bounds(hwnd), client_origin_and_size(hwnd))
+        else {
+            let _ = child.kill();
+            eprintln!("skipping: the demo page never reported its geometry");
             return;
         };
-        let client = client_origin_and_size(hwnd).unwrap_or(frame);
+        if client.width() < 1600 || client.height() < 1020 {
+            let _ = child.kill();
+            eprintln!(
+                "skipping: the browser client area is {}x{}, smaller than the 1600x1020 page",
+                client.width(),
+                client.height()
+            );
+            return;
+        }
         println!(
-            "[probe] browser={browser} hwnd={hwnd} frame={frame:?} client=({}, {}) size={}x{}",
-            client.left,
-            client.top,
-            client.right,
-            client.bottom
+            "[probe] browser={browser} hwnd={hwnd} frame={frame:?} client={client:?}"
         );
 
         let metrics = WindowDetectionMetrics::new();
         metrics.set_verbose(true);
         let mut provider = UiaDeepSelectionProvider::new(metrics);
         let walk = provider.automation().cloned().and_then(|auto| RawWalk::new(&auto));
-
-        for (label, fx, fy) in [
-            ("button-cell", 0.15_f32, 0.15_f32),
-            ("div-cell", 0.43, 0.15),
-            ("link-cell", 0.70, 0.15),
-            ("nested-span", 0.30, 0.42),
-            ("blank-body", 0.50, 0.92),
-        ] {
-            let point = Point::new(
-                client.left + (client.width() as f32 * fx) as i32,
-                client.top + (client.height() as f32 * fy) as i32,
-            );
-            println!("[probe] === {label} at ({}, {}) ===", point.x, point.y);
-            if let Some(walk) = &walk {
-                walk.dump(hwnd, point, 8);
+        // Fixture coordinates are viewport-relative, so the page origin — not the browser's
+        // client origin — is what they are relative to. Retried, because the tree can still be
+        // filling in while the window has already settled.
+        let viewport = (0..50).find_map(|attempt| {
+            if attempt > 0 {
+                pump(200);
             }
-            let control = QueryControl::refinement(&|| false);
-            match provider.resolve(&job(hwnd, point), frame, &control) {
-                RefinementOutcome::Target(target) => println!(
-                    "[probe] provider -> {:?} {}x{} depth={} reason={:?}",
-                    target.screen_bounds,
-                    target.screen_bounds.width(),
-                    target.screen_bounds.height(),
-                    target.path.len(),
-                    target.stop_reason
-                ),
-                RefinementOutcome::Empty(reason) => {
-                    println!("[probe] provider -> empty reason={reason:?}")
+            walk.as_ref()
+                .and_then(|walk| walk.viewport_ready(hwnd, client, 8))
+        });
+        let Some(viewport) = viewport else {
+            let _ = child.kill();
+            eprintln!(
+                "skipping: Chromium did not expose a populated page tree within 10 s — the probe \
+                 window is probably occluded or throttled, which says nothing about the walk"
+            );
+            return;
+        };
+        println!("[probe] viewport={viewport:?}");
+
+        let mut asserted = 0_usize;
+        let mut passed = 0_usize;
+        let mut retries = 0_usize;
+        let mut failures = Vec::new();
+        let mut layout_drift = Vec::new();
+        for fixture in &manifest {
+            let Some(box_) = truth.get(&fixture.id).copied() else {
+                println!("[probe] ?? {} not measured by the page", fixture.id);
+                continue;
+            };
+            // The declared layout and the measured box must agree, otherwise the fixture is
+            // describing something other than what it renders.
+            // A fixture that is not shown measures to an all-zero box: that is the point of the
+            // `none` cases, not a layout drift. Optional fixtures are exempt as well: a rotated
+            // box is *supposed* to render outside the rectangle it was laid out in.
+            if fixture.rect != [0, 0, 0, 0]
+                && box_[2] > 0
+                && box_[3] > 0
+                && !fixture.optional
+                && fixture
+                    .rect
+                    .iter()
+                    .zip(box_.iter())
+                    .any(|(declared, measured)| (declared - measured).abs() > 1)
+            {
+                layout_drift.push(format!(
+                    "{} declared {:?} but rendered {box_:?}",
+                    fixture.id, fixture.rect
+                ));
+            }
+            // A hidden fixture measures to an all-zero box, so its *declared* layout is what says
+            // where it would have been — that is the point the walk must not resolve to it.
+            let own = if box_[2] > 0 && box_[3] > 0 {
+                box_
+            } else {
+                fixture.rect
+            };
+            let [dx, dy] = fixture.probe.unwrap_or([own[2] / 2, own[3] / 2]);
+            let point = Point::new(viewport.left + own[0] + dx, viewport.top + own[1] + dy);
+            // DIAGNOSTIC: measure each fixture from a cold provider, to tell "the walk cannot get
+            // there" apart from "a level was cached while Chromium's tree was still empty".
+            if std::env::var_os("SNAPCLIP_PROBE_COLD").is_some() {
+                provider.release();
+            }
+            // Bounded retries: Chromium builds its accessibility tree lazily, so the first query
+            // for a window can legitimately answer "nothing below the page" and a later one finds
+            // the element. The product re-queries on every dwell, so the *eventual* answer is what
+            // the user sees; measuring a first try would report a readiness artefact as a defect.
+            let mut attempts = 0_usize;
+            let mut published = None;
+            let mut last_stop = None;
+            let mut last_depth = 0_usize;
+            for attempt in 0..4 {
+                if attempt > 0 {
+                    pump(250);
+                }
+                attempts += 1;
+                let outcome = provider
+                    .resolve(&job(hwnd, point), frame, &QueryControl::refinement(&|| false))
+                ;
+                published = match &outcome {
+                    RefinementOutcome::Target(target) => {
+                        last_stop = Some(target.stop_reason);
+                        last_depth = target.path.len();
+                        Some(target.screen_bounds)
+                    }
+                    RefinementOutcome::Empty(reason) => {
+                        last_stop = Some(*reason);
+                        last_depth = 0;
+                        None
+                    }
+                };
+                // An answer that covers the whole page means the walk never got below it: nothing
+                // to accept yet. Area, not corners: the page node's frame sits one pixel inside the
+                // viewport frame, so a containment test silently disabled every retry.
+                let stuck_on_page = published.is_some_and(|rect| {
+                    let published_area = i64::from(rect.width()) * i64::from(rect.height());
+                    let viewport_area = i64::from(viewport.width()) * i64::from(viewport.height());
+                    published_area * 100 >= viewport_area * 95
+                });
+                if !stuck_on_page {
+                    break;
                 }
             }
+            retries += attempts.saturating_sub(1);
+            let expected = match fixture.expect.as_str() {
+                "none" => None,
+                "self" | "inside_self" | "covers_self" => Some((fixture.id.as_str(), own)),
+                other => truth
+                    .get(other)
+                    .copied()
+                    .map(|measured| (other, measured)),
+            };
+            let expected_rect = expected.map(|(_, measured)| {
+                Rect::new(
+                    viewport.left + measured[0],
+                    viewport.top + measured[1],
+                    viewport.left + measured[0] + measured[2],
+                    viewport.top + measured[1] + measured[3],
+                )
+            });
+            // For a fixture that must not be in the tree at all, the comparison target is the box
+            // it would occupy — taken from the declared layout, since the page measures zeros.
+            let judged = if fixture.expect == "none" {
+                Some(Rect::new(
+                    viewport.left + fixture.rect[0],
+                    viewport.top + fixture.rect[1],
+                    viewport.left + fixture.rect[0] + fixture.rect[2],
+                    viewport.top + fixture.rect[1] + fixture.rect[3],
+                ))
+            } else {
+                expected_rect
+            };
+            let (ok, detail) = judge(fixture.expect.as_str(), judged, published);
+            let label = if fixture.optional {
+                "opt"
+            } else {
+                asserted += 1;
+                if ok {
+                    passed += 1;
+                } else {
+                    failures.push(format!(
+                        "{} (expect {}, got {})",
+                        fixture.id,
+                        fixture.expect,
+                        published.map(|rect| format!("{rect:?}")).unwrap_or("none".into())
+                    ));
+                }
+                "assert"
+            };
+            println!(
+                "[probe] {label} {:<20} expect={:<16} expected={:<26} published={:<28} {}{} \
+                 role={} name={}",
+                fixture.id,
+                fixture.expect,
+                expected_rect
+                    .map(|rect| format!(
+                        "{}x{} @({},{})",
+                        rect.width(),
+                        rect.height(),
+                        rect.left,
+                        rect.top
+                    ))
+                    .unwrap_or("(not in the tree)".into()),
+                published
+                    .map(|rect| format!("{}x{} @({},{})", rect.width(), rect.height(), rect.left, rect.top))
+                    .unwrap_or("none".into()),
+                if ok { "OK  " } else { "MISS" },
+                if ok {
+                    String::new()
+                } else {
+                    format!(" ({detail}) ")
+                },
+                if fixture.role.is_empty() {
+                    "-"
+                } else {
+                    fixture.role.as_str()
+                },
+                fixture.name
+            );
+            if !ok && let Some(rect) = published {
+                println!(
+                    "[probe]      got {rect:?} reason={last_stop:?} depth={last_depth} \
+                     attempts={attempts} (viewport {viewport:?})"
+                );
+                if let Some(walk) = &walk {
+                    // The system's own hit test: whichever element it names is the one the user
+                    // would be pointing at, so it settles "the walk chose badly" against "the
+                    // fixture sits under something else".
+                    println!("[probe]      system hit test: {}", walk.hit_test(point));
+                }
+            }
+            if let Some(walk) = &walk
+                && !ok
+            {
+                walk.dump(hwnd, point, 9);
+            }
         }
+
         let _ = child.kill();
+        println!(
+            "[probe] asserted={asserted} passed={passed} failed={} slow_fixtures={retries}",
+            asserted - passed,
+        );
+        for failure in &failures {
+            println!("[probe] FAIL {failure}");
+        }
+        for drift in &layout_drift {
+            println!("[probe] LAYOUT {drift}");
+        }
+        // Optional rows never fail the run, but an asserted row must: the probe is the gate for
+        // "web page element capture works", and a silently empty run would be worse than a
+        // failing one.
+        assert!(asserted > 0, "the fixture must assert something");
+        assert!(
+            layout_drift.is_empty(),
+            "the fixture's declared layout does not match what it renders: {layout_drift:#?}"
+        );
+        assert!(
+            failures.is_empty(),
+            "{} of {asserted} asserted fixtures did not resolve to the expected box: {failures:#?}",
+            asserted - passed
+        );
+    }
+
+    /// Compare what we published against what the page measured.
+    fn judge(expect: &str, expected: Option<Rect>, published: Option<Rect>) -> (bool, &'static str) {
+        const TOLERANCE: i32 = 3;
+        match (expect, expected, published) {
+            // `none` means the fixture is not in the tree at all, so the answer must be coarser
+            // than its box — anything else proves we captured a hidden element.
+            ("none", Some(expected), Some(published)) => {
+                let covers = published.left <= expected.left
+                    && published.top <= expected.top
+                    && published.right >= expected.right
+                    && published.bottom >= expected.bottom;
+                (covers, "a hidden fixture must not be selected")
+            }
+            // Some elements are not exposed by the browser's accessibility tree at all, so the
+            // honest assertion is the *shape* of the answer rather than its exact box:
+            // `inside_self` — the walk went into the element (its text run counts), and
+            // `covers_self` — the element is not exposed, so the nearest exposed ancestor must be
+            // returned, as long as it is local rather than the whole page.
+            ("inside_self", Some(expected), Some(published)) => {
+                let inside = published.left >= expected.left - TOLERANCE
+                    && published.top >= expected.top - TOLERANCE
+                    && published.right <= expected.right + TOLERANCE
+                    && published.bottom <= expected.bottom + TOLERANCE;
+                (inside, "the answer must sit inside the element")
+            }
+            ("covers_self", Some(expected), Some(published)) => {
+                let covers = published.left <= expected.left
+                    && published.top <= expected.top
+                    && published.right >= expected.right
+                    && published.bottom >= expected.bottom;
+                let published_area = i64::from(published.width()) * i64::from(published.height());
+                let expected_area = i64::from(expected.width()) * i64::from(expected.height());
+                (
+                    covers && published_area <= expected_area * 3,
+                    "a coarse answer may cover the element, but must stay local",
+                )
+            }
+            (_, None, _) => (false, "no expectation to compare"),
+            (_, Some(_), None) => (false, "nothing was published"),
+            (_, Some(expected), Some(published)) => {
+                let close = (published.left - expected.left).abs() <= TOLERANCE
+                    && (published.top - expected.top).abs() <= TOLERANCE
+                    && (published.right - expected.right).abs() <= TOLERANCE
+                    && (published.bottom - expected.bottom).abs() <= TOLERANCE;
+                (close, "published box != measured box")
+            }
+        }
+    }
+
+    /// The fixture manifest, embedded in the demo page as a JSON script block.
+    fn manifest_of(source: &str) -> Option<Vec<Fixture>> {
+        let start = source.find("\"manifest\">")? + "\"manifest\">".len();
+        let end = source[start..].find("</script>")? + start;
+        serde_json::from_str(&source[start..end]).ok()
+    }
+
+    /// The page's measured boxes, as published in the window title.
+    ///
+    /// The browser appends its own suffix to the window title (`"… - Google Chrome"`), so the
+    /// payload is located by its marker and cut at the matching brace rather than assumed to be
+    /// the whole string. Our payload holds no strings, so counting braces is enough.
+    fn truth_of(title: &str) -> Option<std::collections::HashMap<String, [i32; 4]>> {
+        let json = marker_payload(title, "SNAPCLIP_TRUTH:")?;
+        let start = json.find('{')?;
+        let mut depth = 0_i32;
+        for (index, character) in json[start..].char_indices() {
+            match character {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return serde_json::from_str(&json[start..=start + index]).ok();
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Everything after `marker` in `title`, or `None` when the marker is absent.
+    fn marker_payload<'a>(title: &'a str, marker: &str) -> Option<&'a str> {
+        title.find(marker).map(|at| &title[at + marker.len()..])
     }
 
     /// Standard install locations of a Chromium-based browser on Windows.
@@ -897,6 +1241,105 @@ mod tests {
             .find(|path| std::path::Path::new(path).is_file())
     }
 
+    /// Does a rule change make Explorer's answers coarser? Measure, do not eyeball.
+    ///
+    /// Runs the **product** walk over a grid of points inside a File Explorer window and prints the
+    /// published rectangle and depth for each. Two runs of this — one per candidate-order rule —
+    /// are what tells "this rule fixes Chromium without costing Explorer", which is exactly the
+    /// question docs/18 §14.5 left open when the browser work was rolled back.
+    ///
+    /// ```text
+    /// cargo test --lib explorer_rule_probe -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "opens a File Explorer window; run explicitly with --ignored --nocapture"]
+    fn explorer_rule_probe() {
+        let _ = crate::platform::windows::capture::monitor::set_per_monitor_v2_awareness();
+        let mut window = win32::enumerate_cheap_candidates()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|probe| probe.class_name == "CabinetWClass")
+            .map(|probe| probe.hwnd);
+        if window.is_none() {
+            let home = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".into());
+            let _ = std::process::Command::new("explorer.exe").arg(home).spawn();
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while window.is_none() && std::time::Instant::now() < deadline {
+                pump(200);
+                window = win32::enumerate_cheap_candidates()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|probe| probe.class_name == "CabinetWClass")
+                    .map(|probe| probe.hwnd);
+            }
+        }
+        let Some(hwnd) = window else {
+            eprintln!("skipping: no File Explorer window available");
+            return;
+        };
+        let Some(frame) = win32::frame_bounds(hwnd) else {
+            eprintln!("skipping: no frame bounds for the Explorer window");
+            return;
+        };
+        let Some(client) = client_origin_and_size(hwnd) else {
+            eprintln!("skipping: no client rect for the Explorer window");
+            return;
+        };
+        println!("[explorer] hwnd={hwnd} frame={frame:?} client={client:?}");
+
+        let mut provider = UiaDeepSelectionProvider::new(WindowDetectionMetrics::new());
+        let window_area = i64::from(client.width()) * i64::from(client.height());
+        let mut areas = Vec::new();
+        for fy in [30_i32, 40, 50, 60, 70] {
+            for fx in [45_i32, 55, 65, 75, 85] {
+                let point = Point::new(
+                    client.left + client.width() * fx / 100,
+                    client.top + client.height() * fy / 100,
+                );
+                let outcome = provider.resolve(
+                    &job(hwnd, point),
+                    frame,
+                    &QueryControl::refinement(&|| false),
+                );
+                let (rect, depth, reason) = match &outcome {
+                    RefinementOutcome::Target(target) => (
+                        target.screen_bounds,
+                        target.path.len(),
+                        target.stop_reason,
+                    ),
+                    RefinementOutcome::Empty(reason) => (Rect::default(), 0, *reason),
+                };
+                let area = i64::from(rect.width()) * i64::from(rect.height());
+                areas.push(area);
+                println!(
+                    "[explorer] point=({:>5},{:>5}) depth={:>2} box={}x{} at ({},{}) area_pct={:.1} \
+                     reason={reason:?}",
+                    point.x,
+                    point.y,
+                    depth,
+                    rect.width(),
+                    rect.height(),
+                    rect.left,
+                    rect.top,
+                    (area as f64) * 100.0 / (window_area.max(1) as f64),
+                );
+            }
+        }
+        areas.sort_unstable();
+        let median = areas[areas.len() / 2];
+        let control_level = areas
+            .iter()
+            .filter(|area| **area * 5 < window_area)
+            .count();
+        println!(
+            "[explorer] summary: median_area_pct={:.1} control_level_points={}/{} \
+             (a coarser rule raises the median and lowers the count)",
+            (median as f64) * 100.0 / (window_area.max(1) as f64),
+            control_level,
+            areas.len()
+        );
+    }
+
     /// Title of a top-level window, used to identify the probe page.
     fn probe_title(hwnd: isize) -> String {
         use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowTextLengthW, GetWindowTextW};
@@ -915,7 +1358,7 @@ mod tests {
         String::from_utf16_lossy(&buffer[..written.max(0) as usize])
     }
 
-    /// Client origin (screen pixels) and client size of `hwnd`.
+    /// The client rectangle of `hwnd` in screen pixels.
     fn client_origin_and_size(hwnd: isize) -> Option<Rect> {
         use windows_sys::Win32::Foundation::{POINT as SYS_POINT, RECT as SYS_RECT};
         use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
@@ -936,8 +1379,8 @@ mod tests {
         Some(Rect::new(
             origin.x,
             origin.y,
-            rect.right - rect.left,
-            rect.bottom - rect.top,
+            origin.x + (rect.right - rect.left),
+            origin.y + (rect.bottom - rect.top),
         ))
     }
 
@@ -992,6 +1435,73 @@ mod tests {
             out
         }
 
+        /// The page's viewport rectangle, in screen pixels.
+        ///
+        /// Chromium draws its own frame, so the *client* area is the whole window — tabs and
+        /// toolbar included — and the page starts lower down. Guessing that offset put every probe
+        /// point on Chrome's reload button, so the rectangle is read from the tree instead: walk
+        /// the window's **own subtree** for the node that spans the client's full width, touches
+        /// its bottom edge, and starts *below* its top edge. Chromium's window and its tab strip
+        /// fail the last condition; the web area satisfies all three (measured:
+        /// `Pane(48,107)-(1832,1232)` inside a client of `(48,20)-(1832,1232)`).
+        ///
+        /// Searching the subtree rather than the desktop is deliberate: a point-based hit test
+        /// returns whatever window is *on top* at that spot, which made this step depend on the
+        /// probe window being foreground — it silently returned another window's element whenever
+        /// the terminal was covering it.
+        /// The viewport, but only once `want` nodes are exposed *inside* it.
+        ///
+        /// Chromium builds its accessibility tree lazily and throttles it while the tab is not
+        /// active: reading too early returns a placeholder (`Pane(0,0)-(0,0)`, measured) and every
+        /// probe point then resolves to the page rectangle — which looked like a product failure
+        /// and was only a measurement that started too soon. Requiring real content under the
+        /// viewport is what makes the probe's verdict trustworthy.
+        fn viewport_ready(&self, hwnd: isize, client: Rect, want: usize) -> Option<Rect> {
+            let root = unsafe { self.automation.ElementFromHandle(HWND(hwnd as *mut _)) }.ok()?;
+            let mut frontier = std::collections::VecDeque::from([(root, 0_usize)]);
+            let mut visited = 0_usize;
+            let mut viewport = None;
+            let mut inside = 0_usize;
+            while let Some((element, depth)) = frontier.pop_front() {
+                visited += 1;
+                if visited > 3000 || depth > 14 {
+                    return None;
+                }
+                for (child, bounds, _, _) in self.children(&element) {
+                    if bounds.is_empty() {
+                        continue;
+                    }
+                    let is_viewport = bounds.left == client.left
+                        && bounds.right == client.right
+                        && bounds.bottom == client.bottom
+                        && bounds.top > client.top;
+                    match viewport {
+                        None => {
+                            if is_viewport {
+                                viewport = Some(bounds);
+                            }
+                            frontier.push_back((child, depth + 1));
+                        }
+                        Some(found) => {
+                            let strictly_inside = bounds.left >= found.left
+                                && bounds.top >= found.top
+                                && bounds.right <= found.right
+                                && bounds.bottom <= found.bottom;
+                            if strictly_inside {
+                                inside += 1;
+                                frontier.push_back((child, depth + 1));
+                                if inside >= want {
+                                    return viewport;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Only a *populated* subtree is a trustworthy basis for a verdict.
+            if inside >= want { viewport } else { None }
+        }
+
         /// Explore every containing branch from the window root, breadth-limited and depth-limited.
         ///
         /// Following only the first containing child hides the interesting case: Chromium's window
@@ -1004,6 +1514,33 @@ mod tests {
                 return;
             };
             self.explore(&root, point, 0, max_levels, "");
+        }
+
+        /// What the system itself says is under `point`.
+        fn hit_test(&self, point: Point) -> String {
+            let system_point = ::windows::Win32::Foundation::POINT {
+                x: point.x,
+                y: point.y,
+            };
+            let Ok(element) = (unsafe { self.automation.ElementFromPoint(system_point) }) else {
+                return "n/a".into();
+            };
+            let name = unsafe { element.CurrentName() }
+                .map(|name| name.to_string())
+                .unwrap_or_default();
+            let kind = unsafe { element.CurrentControlType() }
+                .map(|kind| kind.0)
+                .unwrap_or(0);
+            let bounds = to_rect(unsafe { element.CurrentBoundingRectangle() }.unwrap_or_default());
+            format!(
+                "{}({},{})-({},{}) {:?}",
+                control_type_name(kind),
+                bounds.left,
+                bounds.top,
+                bounds.right,
+                bounds.bottom,
+                name.chars().take(24).collect::<String>()
+            )
         }
 
         fn explore(
