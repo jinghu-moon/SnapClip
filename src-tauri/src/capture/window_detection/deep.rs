@@ -80,6 +80,62 @@ impl DeepTarget {
     }
 }
 
+/// How a newly resolved target relates to the one currently displayed (docs/18 §13.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Replacement {
+    /// Replace the displayed target now.
+    Immediate,
+    /// The target got **shallower while still containing** the displayed one: this is what a
+    /// cursor merely passing through a parent container looks like. Wait for the next dwell to
+    /// reproduce it before displaying anything, so a transit never expands the frame.
+    NeedsConfirmation,
+}
+
+/// Decide whether a result may replace the displayed target.
+///
+/// The reference selector sidesteps this entirely: its base path is computed **per point** and
+/// its refinement may only ever *deepen* it, so a shallower answer can never be displayed. In
+/// SnapClip the whole answer comes from the deep query, so the equivalent rule is expressed as
+/// a one-step confirmation for downgrades only:
+///
+/// * a **deeper** target (parent → child) applies immediately;
+/// * a **lateral** target (A → B, neither containing the other) applies immediately;
+/// * a **shallower target that contains the current one** waits for a second dwell.
+pub fn classify_replacement(current: Option<&DeepTarget>, next: &DeepTarget) -> Replacement {
+    let Some(current) = current else {
+        return Replacement::Immediate;
+    };
+    if current.window != next.window {
+        // A different window is a different question; never hold it back.
+        return Replacement::Immediate;
+    }
+    if current.screen_bounds == next.screen_bounds {
+        // Same answer: nothing to confirm, nothing to display.
+        return Replacement::Immediate;
+    }
+    let shallower = next.path.len() < current.path.len();
+    // The downgrade case: the new (shallower) target *covers* the one on screen, i.e. the
+    // cursor is inside a parent container of what it was pointing at.
+    let contains_current = contains(next.screen_bounds, current.screen_bounds);
+    if shallower && contains_current {
+        Replacement::NeedsConfirmation
+    } else {
+        Replacement::Immediate
+    }
+}
+
+/// Half-open-free containment used only for this decision: the container must cover the whole
+/// of the inner rectangle. Both are screen rectangles of real UI, so inclusive bounds are the
+/// intended semantics here.
+fn contains(outer: Rect, inner: Rect) -> bool {
+    !outer.is_empty()
+        && !inner.is_empty()
+        && inner.left >= outer.left
+        && inner.top >= outer.top
+        && inner.right <= outer.right
+        && inner.bottom <= outer.bottom
+}
+
 /// What the overlay must do after feeding the scheduler a cursor position.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SchedulerActions {
@@ -612,5 +668,80 @@ mod tests {
         ] {
             assert!(!reason.is_complete(), "{reason:?}");
         }
+    }
+
+    fn deep_with_depth(bounds: Rect, depth: usize) -> DeepTarget {
+        let mut path = vec![rect(0, 0, 1000, 800)];
+        for _ in 1..depth.saturating_sub(1) {
+            path.push(rect(50, 50, 950, 750));
+        }
+        path.push(bounds);
+        DeepTarget {
+            window: window(0x100),
+            kind: TargetKind::UiElement,
+            screen_bounds: *path.last().expect("path"),
+            path,
+            stop_reason: StopReason::Complete,
+        }
+    }
+
+    #[test]
+    fn a_deeper_target_replaces_immediately() {
+        // Parent → child: exactly the case that must never lag.
+        let parent = deep_with_depth(rect(100, 100, 900, 700), 3);
+        let child = deep_with_depth(rect(300, 300, 500, 400), 6);
+        assert_eq!(
+            classify_replacement(Some(&parent), &child),
+            Replacement::Immediate
+        );
+    }
+
+    #[test]
+    fn a_lateral_target_replaces_immediately() {
+        // A → B side by side: same depth, neither contains the other.
+        let a = deep_with_depth(rect(100, 100, 300, 200), 5);
+        let b = deep_with_depth(rect(400, 100, 700, 300), 5);
+        assert_eq!(classify_replacement(Some(&a), &b), Replacement::Immediate);
+    }
+
+    #[test]
+    fn a_shallower_target_that_contains_the_current_one_needs_confirmation() {
+        // The cursor drifted into a parent container while travelling between two controls:
+        // this is the "expand then shrink" artefact, so it waits one dwell.
+        let control = deep_with_depth(rect(300, 300, 500, 400), 6);
+        let container = deep_with_depth(rect(100, 100, 900, 700), 3);
+        assert_eq!(
+            classify_replacement(Some(&control), &container),
+            Replacement::NeedsConfirmation
+        );
+    }
+
+    #[test]
+    fn returning_to_a_parent_that_does_not_contain_the_old_target_is_immediate() {
+        // Scenario 2 from the defect report: the cursor leaves the small box for a *different*
+        // part of the parent. The new rect does not cover the old one, so nothing is delayed.
+        let small = deep_with_depth(rect(100, 100, 200, 200), 6);
+        let elsewhere = deep_with_depth(rect(600, 400, 900, 700), 3);
+        assert_eq!(
+            classify_replacement(Some(&small), &elsewhere),
+            Replacement::Immediate
+        );
+    }
+
+    #[test]
+    fn the_first_target_and_an_unchanged_target_are_immediate() {
+        let target = deep_with_depth(rect(300, 300, 500, 400), 6);
+        assert_eq!(classify_replacement(None, &target), Replacement::Immediate);
+        assert_eq!(
+            classify_replacement(Some(&target), &target),
+            Replacement::Immediate
+        );
+        // A path in another window is a different question entirely.
+        let mut other = target;
+        other.window = window(0x200);
+        assert_eq!(
+            classify_replacement(Some(&deep_with_depth(rect(300, 300, 500, 400), 6)), &other),
+            Replacement::Immediate
+        );
     }
 }

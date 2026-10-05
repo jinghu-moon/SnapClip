@@ -49,7 +49,8 @@ pub use gesture::{
 };
 pub use deep::{
     DeepSelectionProvider, DeepTarget, QueryControl, RefinementJob, RefinementOutcome,
-    RefinementScheduler, SchedulerActions, StopReason, UnsupportedDeepSelection,
+    RefinementScheduler, Replacement, SchedulerActions, StopReason, UnsupportedDeepSelection,
+    classify_replacement,
     REFINEMENT_BUDGET_MS, REFINEMENT_CALL_LIMIT_MS, REFINEMENT_DWELL_MS,
     REFINEMENT_PUBLISH_INTERVAL_MS,
 };

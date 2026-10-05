@@ -74,7 +74,7 @@ use crate::capture::window_detection::model::RequestId;
 use crate::capture::window_detection::{
     DEFAULT_DWELL_MS, DEFAULT_HOVER_REVALIDATE_MS, DEFAULT_SNAP_RADIUS_PX, DeepTarget, Exclusions,
     GestureState, HoverValidity, MoveOutcome, PressOutcome, RefinementOutcome, RefinementScheduler,
-    ReleaseOutcome, WindowSnapshot, WindowTarget,
+    ReleaseOutcome, Replacement, WindowSnapshot, WindowTarget, classify_replacement,
 };
 use crate::capture::{CaptureError, CaptureResult, CaptureState};
 
@@ -422,6 +422,11 @@ where
     refinement: RefinementWorker,
     /// The published deep path, if the refinement worker produced one this session.
     deep_target: Option<DeepTarget>,
+    /// A shallower target waiting for its confirming dwell (docs/18 §13.3).
+    ///
+    /// A cursor merely passing through a parent container produces one such result; displaying
+    /// it immediately is what made the frame grow and shrink again on the way from A to B.
+    pending_downgrade: Option<(Rect, Point)>,
     metrics: WindowDetectionMetrics,
     /// Dwell generation the pending timer was armed for.
     dwell_armed: Option<u64>,
@@ -516,6 +521,7 @@ where
             refine: RefinementScheduler::new(),
             refinement,
             deep_target: None,
+            pending_downgrade: None,
             metrics,
             dwell_armed: None,
             snap_radius: DEFAULT_SNAP_RADIUS_PX,
@@ -929,6 +935,7 @@ where
         self.disarm_hover_timer();
         self.refine.reset();
         self.deep_target = None;
+        self.pending_downgrade = None;
         self.disarm_refinement();
         self.refinement.retire();
         self.cursor_visible = false;
@@ -1252,6 +1259,7 @@ where
         // v2 state is per-session too: no cached deep path, no in-flight query.
         self.refine.reset();
         self.deep_target = None;
+        self.pending_downgrade = None;
         self.disarm_refinement();
         self.refinement.retire();
         self.snapshot.release();
@@ -1363,6 +1371,12 @@ where
     /// refinement target is the control under the pointer, and controls change far more
     /// often than windows do (docs/18 §2).
     fn drive_refinement(&mut self, screen: Point, target: Option<WindowTarget>) {
+        // A staged downgrade only survives while the cursor stays where it was staged.
+        if let Some((_, staged)) = self.pending_downgrade
+            && !points_close(staged, screen)
+        {
+            self.pending_downgrade = None;
+        }
         let epoch = self.snapshot.epoch();
         let actions = self
             .refine
@@ -1753,6 +1767,30 @@ where
                     .on_result(result.request, result.epoch, (*target).clone())
                 {
                     return;
+                }
+                // A downgrade (a shallower target that still contains what is on screen) is by
+                // far the most likely reading of "the cursor passed through a parent
+                // container". Show it only once the next dwell reproduces it at the same
+                // point; anything else would expand the frame during a transit (docs/18 §13.3).
+                if classify_replacement(self.deep_target.as_ref(), &target) == Replacement::NeedsConfirmation
+                {
+                    let cursor = self.cursor_screen();
+                    let confirmed = match (&self.pending_downgrade, cursor) {
+                        (Some((rect, staged)), Some(current)) => {
+                            *rect == target.screen_bounds && points_close(*staged, current)
+                        }
+                        _ => false,
+                    };
+                    if !confirmed {
+                        self.pending_downgrade = cursor.map(|point| (target.screen_bounds, point));
+                        // Ask again after the dwell: a resting cursor reproduces the target and
+                        // the downgrade is applied then; moving clears it.
+                        self.arm_refinement();
+                        return;
+                    }
+                    self.pending_downgrade = None;
+                } else {
+                    self.pending_downgrade = None;
                 }
                 self.metrics.log_line(
                     &format!(
@@ -2708,6 +2746,13 @@ fn exclude_overlay_from_capture(window: HWND) -> Result<(), u32> {
 /// The value is a logical distance, so it is scaled the same way the reference selector
 /// scales `QApplication::startDragDistance()`. Below the threshold a press stays a click;
 /// above it the gesture becomes a free drag (docs/14 §4.2).
+/// Whether two cursor positions count as "the cursor has not moved" for the downgrade
+/// confirmation. The dwell already guarantees stillness; a couple of pixels of jitter must not
+/// cancel a legitimate confirmation.
+fn points_close(left: Point, right: Point) -> bool {
+    (left.x - right.x).abs() <= 3 && (left.y - right.y).abs() <= 3
+}
+
 fn system_drag_threshold(dpi: u32) -> i32 {
     let base = unsafe { GetSystemMetrics(SM_CXDRAG) }.max(1);
     let scaled = (base as f32) * (dpi.max(96) as f32 / 96.0);
