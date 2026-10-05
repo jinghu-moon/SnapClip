@@ -731,6 +731,18 @@ containing`）给出：
 收尾后应决定是保留为长期诊断还是移除。① 结构性回溯仍处于「已回退、需重新取证」状态——
 本轮数据说明它未必必要（同边界链已能正常下钻），除非遇到「兄弟分支遮挡」的实例。
 
+**产品复验（`npm run tauri dev`，默认日志汇总行）——确认文件项级吸附生效**：
+
+```text
+window_hit_test_us n=6634      hover_target_switch_count=6
+refinement_submitted=36  refinement_published=34  refinement_empty=0
+refinement_elapsed_us last=24549  max=59174
+```
+
+同窗口内 `submitted(36) ≫ 窗口切换(6)`，说明精化在**文件项之间**持续跟随光标；
+34/36 发布成功（2 次是光标先走、查询在完成前被取代），`empty=0`、错误 0。
+峰值 59 ms（比面板级的 22 ms 高）符合「多下钻两层到文件项」的预期，且仍远低于 1500 ms 预算。
+
 **下一个取证假设（待验证）**：DirectUI 的虚拟化条目在未实现/未滚入视口时会把
 `CurrentBoundingRectangle` 报成**空矩形**，而 `cached_node()` 目前对空矩形直接返回 `None`，
 于是这些条目连同它们**可能报出真实矩形的子孙**一起被跳过。验证方式：加一个 verbose 统计
