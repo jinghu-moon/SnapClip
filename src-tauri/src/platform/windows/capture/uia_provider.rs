@@ -48,7 +48,7 @@ pub struct UiaDeepSelectionProvider {
     /// remembering them turns a repeat query into "fetch the deepest level only" instead of
     /// "walk from the window root again" (docs/18 §11 ②). The whole table is dropped when the
     /// snapshot generation changes, so no stale geometry can be served.
-    children: HashMap<NodeKey, (Vec<(IUIAutomationElement, WalkNode)>, LevelStats)>,
+    children: HashMap<NodeKey, ExpandedLevel>,
     /// Snapshot generation the table belongs to.
     cache_epoch: Option<SnapshotEpoch>,
     /// Provider-free child-window rectangles per window, valid for `cache_epoch`.
@@ -90,6 +90,20 @@ pub struct LevelStats {
 /// its cache by node index for the same reason. The pointer is a valid identity while the cache
 /// holds a reference to the element, which it does.
 type NodeKey = usize;
+
+/// One expanded node: the node itself, its children and the forensic counters of the level.
+///
+/// The entry **owns the parent element**. A [`NodeKey`] is only an identity while that element
+/// is alive; the walk's root comes fresh from `ElementFromHandle` and nothing else holds it, so
+/// once the walk stepped below it the allocator could hand its address to a newly read child.
+/// Measured on a maximized Edge window: that child was then filtered out as "already visited"
+/// (or served another node's children from this table), and the same point resolved to the
+/// control, the page or the whole window on consecutive queries.
+struct ExpandedLevel {
+    _parent: IUIAutomationElement,
+    children: Vec<(IUIAutomationElement, WalkNode)>,
+    stats: LevelStats,
+}
 
 impl UiaDeepSelectionProvider {
     pub fn new(metrics: WindowDetectionMetrics) -> Self {
@@ -222,14 +236,16 @@ impl UiaDeepSelectionProvider {
         // The element's own identity, never its rectangle: two nodes may share a rectangle.
         let _ = hwnd;
         let key: NodeKey = parent.as_raw() as usize;
-        if !self.children.contains_key(&key) {
-            let expanded = Self::expand(request, parent);
-            self.children.insert(key, expanded);
-        }
-        let Some((children, stats)) = self.children.get(&key) else {
-            return Vec::new();
-        };
-        let stats = *stats;
+        let level = self.children.entry(key).or_insert_with(|| {
+            let (children, stats) = Self::expand(request, parent);
+            ExpandedLevel {
+                _parent: parent.clone(),
+                children,
+                stats,
+            }
+        });
+        let stats = level.stats;
+        let children = &level.children;
         let mut candidates: Vec<(IUIAutomationElement, WalkNode)> = Vec::new();
         for (child, node) in children {
             if !budget.take_node() {
