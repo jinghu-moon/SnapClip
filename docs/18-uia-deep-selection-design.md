@@ -738,6 +738,39 @@ pub struct TimedCallRunner { /* max_in_flight + 原子计数 */ }
 `TimedCallRunner` 包裹查询 → `TimedOut` 隔离该窗口、`Busy` 仅重试、报错返回空；
 与 UIA 组成 `FallbackDeepSelection`（先 UIA，`Unsupported` 再问 MSAA）。
 
+### 12.12 P3 已完成：MSAA 查询本体 + 回退组合（本次提交）
+
+`platform/windows/capture/msaa_provider.rs`：
+
+| 环节 | 实现 |
+| --- | --- |
+| 依赖 | `windows` 0.61 features 增加 `Win32_System_Variant` **与** `Win32_System_Ole` —— `VARIANT` 及其实体在 windows-rs 里由 **Com + Ole 双 feature** 共同门控，只加 Variant 仍然不可见 |
+| 预检 | `IsHungAppWindow(hwnd)` 命中即隔离，**不发起** MSAA 调用 |
+| 超时 | 查询交给 `TimedCallRunner`（168 ms，与参考一致）；`TimedOut` → 隔离该窗口；`Busy` → **只重试不隔离**；provider 报错 → 空结果 |
+| 查询 | `AccessibleObjectFromWindow(hwnd, OBJID_WINDOW, IID_IAccessible)` → `accHitTest(point)` →（`VT_I4` 子 id 或 `VT_DISPATCH` 子对象）→ `accLocation` 取屏幕矩形 |
+| 线程 | 闭包在独立线程执行，`HWND` 以整数传递（裸指针不是 `Send`），COM 在线程内 `CoInitializeEx(APARTMENTTHREADED)` |
+| 生命周期 | 隔离持续到快照换代（`release()`），与 UIA provider 同构 |
+| 组合 | `FallbackDeepSelection`：先 UIA，仅在 UIA 返回 `Unsupported` 时问 MSAA；两者皆空 → overlay 保持 v1 整窗帧 |
+
+指标：`refinement_msaa_attempts / timeouts / busy / failures` 已加入 `WindowDetectionMetrics`
+（暴露「隔离是否必要」与「是否只是忙」的区分）。
+
+**实机（资源管理器三点 + 两个文件项）**：
+
+```text
+published (703,549)->(1036,1520)   depth=3  导航窗格
+published (1063,985)->(1960,1022)  depth=4  文件项 A  897×37
+published (1063,1200)->(1960,1237) depth=4  文件项 B  897×37
+published (1099,424)->(2087,460)   depth=4  命令栏   988×36
+refinement_submitted=5  published=5  empty=0
+```
+
+不同文件项给出不同矩形，说明深选确实跟随到条目级；`cargo test --lib` **339 passed / 0 failed**
+（新增 MSAA 单测 4 项），`cargo check --all-targets` 0 warnings。
+
+**已知小缺口**：`refinement_msaa_*` 计数已记录但**尚未出现在会话汇总行**（格式串漏加），
+下次一并补上——本轮不以「看似完整」掩盖它。
+
 **取证过程的一个教训**：第一次取证日志里的停稳点落在 `hwnd=5967024`（全屏最大化窗口），
 **不是资源管理器**——`Shell.Application.Windows()` 每个标签页返回一项，而 Windows 11 上它们
 **共用同一个 HWND**，所以「取最后一个窗口」并不等于「刚打开的那个」。探针已改为按

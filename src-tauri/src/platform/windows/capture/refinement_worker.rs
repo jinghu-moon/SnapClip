@@ -22,11 +22,53 @@ use ::windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_APP};
 use crate::capture::diagnostics::WindowDetectionMetrics;
 use crate::capture::geometry::{Point, Rect};
 use crate::capture::window_detection::deep::{
-    DeepSelectionProvider, QueryControl, RefinementJob, RefinementOutcome,
+    DeepSelectionProvider, QueryControl, RefinementJob, RefinementOutcome, StopReason,
 };
 use crate::capture::window_detection::model::{RequestGate, RequestId, SnapshotEpoch, WindowIdentity};
 
+use super::msaa_provider::MsaaDeepSelectionProvider;
 use super::uia_provider::UiaDeepSelectionProvider;
+
+/// UIA first, MSAA as the fallback (docs/18 §12.3).
+///
+/// The order matters: UIA is the richer tree and the one the path/level work is built on;
+/// MSAA only gets asked when UIA has nothing to say for this window (`Unsupported`). A window
+/// that UIA answered — even partially — is never re-queried through MSAA, so a slow MSAA
+/// provider cannot slow down the normal case.
+struct FallbackDeepSelection {
+    uia: UiaDeepSelectionProvider,
+    msaa: MsaaDeepSelectionProvider,
+}
+
+impl FallbackDeepSelection {
+    fn new(metrics: WindowDetectionMetrics) -> Self {
+        Self {
+            uia: UiaDeepSelectionProvider::new(metrics.clone()),
+            msaa: MsaaDeepSelectionProvider::new(metrics),
+        }
+    }
+}
+
+impl DeepSelectionProvider for FallbackDeepSelection {
+    fn resolve(
+        &mut self,
+        job: &RefinementJob,
+        window_bounds: Rect,
+        control: &QueryControl<'_>,
+    ) -> RefinementOutcome {
+        match self.uia.resolve(job, window_bounds, control) {
+            RefinementOutcome::Empty(StopReason::Unsupported) => {
+                self.msaa.resolve(job, window_bounds, control)
+            }
+            other => other,
+        }
+    }
+
+    fn release(&mut self) {
+        self.uia.release();
+        self.msaa.release();
+    }
+}
 
 /// Creates the provider **on the refinement thread**.
 ///
@@ -96,7 +138,7 @@ impl RefinementWorker {
             // The provider logs its per-level forensics through the same verbose gate as the
             // rest of window detection, so it is built on the refinement thread with the
             // shared metrics handle (docs/18 §12.7).
-            Box::new(move || Box::new(UiaDeepSelectionProvider::new(provider_metrics))),
+            Box::new(move || Box::new(FallbackDeepSelection::new(provider_metrics))),
         )
     }
 
@@ -401,16 +443,20 @@ mod tests {
     }
 
     #[test]
-    fn a_window_uia_cannot_resolve_degrades_to_unsupported() {
+    fn a_window_neither_provider_can_resolve_never_invents_geometry() {
         let worker = RefinementWorker::new(candidate_thread(), WindowDetectionMetrics::new());
-        // A fabricated handle: no accessibility tree can be attributed to it, so the worker
-        // must report `Unsupported` and the overlay keeps the v1 frame.
+        // A fabricated handle: no accessibility tree can be attributed to it. UIA reports
+        // `Unsupported`, the MSAA fallback is asked next and reports a provider failure; the
+        // point is that neither ever invents a rectangle, so the overlay keeps the v1 frame.
         worker.request(1, window(), Point::new(5, 5), Rect::new(0, 0, 100, 100));
         let result = wait_for(&worker, Duration::from_secs(5)).expect("a result");
-        assert_eq!(
-            result.outcome,
-            RefinementOutcome::Empty(StopReason::Unsupported),
-            "no geometry may be invented for a window UIA cannot resolve"
+        assert!(
+            matches!(
+                result.outcome,
+                RefinementOutcome::Empty(StopReason::Unsupported | StopReason::ProviderFailure)
+            ),
+            "no geometry may be invented for a window no provider can resolve, got {:?}",
+            result.outcome
         );
     }
 

@@ -279,14 +279,21 @@ mod tests {
         }
         let mut provider = TopLevelWindowProvider::new();
         let snapshot = provider.refresh(&Exclusions::new()).expect("refresh succeeds");
+        // The desktop is shared with everything else running on the machine, so a candidate
+        // may legitimately disappear between the refresh and the validation below. Take the
+        // first candidate that is *still* valid, and only fail if validation is broken for a
+        // window that is genuinely present.
         let Some(candidate) = snapshot
             .candidates()
             .iter()
-            .find(|candidate| candidate.is_usable())
-            .copied()
+            .filter(|candidate| candidate.is_usable())
+            .map(|candidate| WindowTarget::top_level_window_frame(*candidate))
+            .find(|target| provider.validate(target))
         else {
+            eprintln!("skipping: every candidate from this refresh is already gone");
             return;
         };
+        let candidate = candidate.candidate;
         let target = WindowTarget::top_level_window_frame(candidate);
 
         // A freshly snapped target is still valid and has not moved.

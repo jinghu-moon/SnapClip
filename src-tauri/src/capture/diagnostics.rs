@@ -65,6 +65,10 @@ struct Counters {
     refinement_empty: AtomicU64,
     refinement_last_us: AtomicU64,
     refinement_max_us: AtomicU64,
+    refinement_msaa_attempts: AtomicU64,
+    refinement_msaa_timeouts: AtomicU64,
+    refinement_msaa_busy: AtomicU64,
+    refinement_msaa_failures: AtomicU64,
 }
 
 /// A copyable reading of every counter, for assertions and one-line reports.
@@ -98,6 +102,10 @@ pub struct WindowDetectionReading {
     pub refinement_empty: u64,
     pub refinement_last_us: u64,
     pub refinement_max_us: u64,
+    pub refinement_msaa_attempts: u64,
+    pub refinement_msaa_timeouts: u64,
+    pub refinement_msaa_busy: u64,
+    pub refinement_msaa_failures: u64,
 }
 
 /// Shared diagnostics handle for the window-detection pipeline.
@@ -284,6 +292,37 @@ impl WindowDetectionMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// An MSAA fallback query was actually handed to the provider.
+    pub fn record_refinement_msaa_attempt(&self) {
+        self.counters
+            .refinement_msaa_attempts
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// An MSAA query exceeded its deadline (the window is quarantined until the next snapshot).
+    pub fn record_refinement_msaa_timeout(&self) {
+        self.counters
+            .refinement_msaa_timeouts
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// An MSAA query was refused because the runner was still holding an abandoned call.
+    ///
+    /// Deliberately separate from timeouts: "busy" means retry, "timeout" means the provider is
+    /// misbehaving, and conflating them would quarantine healthy windows.
+    pub fn record_refinement_msaa_busy(&self) {
+        self.counters
+            .refinement_msaa_busy
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The MSAA provider returned an error (no quarantine).
+    pub fn record_refinement_msaa_failure(&self) {
+        self.counters
+            .refinement_msaa_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Read every counter.
     pub fn reading(&self) -> WindowDetectionReading {
         let counters = &self.counters;
@@ -320,6 +359,10 @@ impl WindowDetectionMetrics {
             refinement_empty: load(&counters.refinement_empty),
             refinement_last_us: load(&counters.refinement_last_us),
             refinement_max_us: load(&counters.refinement_max_us),
+            refinement_msaa_attempts: load(&counters.refinement_msaa_attempts),
+            refinement_msaa_timeouts: load(&counters.refinement_msaa_timeouts),
+            refinement_msaa_busy: load(&counters.refinement_msaa_busy),
+            refinement_msaa_failures: load(&counters.refinement_msaa_failures),
         }
     }
 
@@ -338,7 +381,9 @@ impl WindowDetectionMetrics {
              window_worker_stale_result_dropped_count={} \
              mouse_move_coalesced_count={} \
              refinement_submitted={} refinement_published={} refinement_empty={} \
-             refinement_elapsed_us last={} max={}",
+             refinement_elapsed_us last={} max={} \
+             refinement_msaa_attempts={} refinement_msaa_timeouts={} \
+             refinement_msaa_busy={} refinement_msaa_failures={}",
             reading.snapshot_refresh_last_us,
             reading.snapshot_refresh_max_us,
             reading.snapshot_refresh_count,
@@ -367,6 +412,10 @@ impl WindowDetectionMetrics {
             reading.refinement_empty,
             reading.refinement_last_us,
             reading.refinement_max_us,
+            reading.refinement_msaa_attempts,
+            reading.refinement_msaa_timeouts,
+            reading.refinement_msaa_busy,
+            reading.refinement_msaa_failures,
         )
     }
 
@@ -404,6 +453,10 @@ impl WindowDetectionMetrics {
             &counters.refinement_empty,
             &counters.refinement_last_us,
             &counters.refinement_max_us,
+            &counters.refinement_msaa_attempts,
+            &counters.refinement_msaa_timeouts,
+            &counters.refinement_msaa_busy,
+            &counters.refinement_msaa_failures,
         ] {
             counter.store(0, Ordering::Relaxed);
         }

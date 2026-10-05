@@ -18,6 +18,7 @@ pub mod detection_worker;
 pub mod export_worker;
 pub mod hotkey;
 pub mod monitor;
+pub mod msaa_provider;
 pub mod overlay;
 pub mod providers;
 pub mod refinement_worker;
