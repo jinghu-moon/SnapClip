@@ -247,41 +247,49 @@ pub fn fallback_hit_path(child_rects: &[Rect], window_bounds: Rect, point: Point
 
 /// Merge an accessibility path with the fallback path into one ordered path.
 ///
-/// Seed selection follows the reference: when the primary's first entry *contains* the
-/// fallback's first entry, the fallback entry is more specific and wins; otherwise the
-/// primary's first entry does. Everything is then ordered smallest-first and appended only
-/// when it strictly contains the current tail, which is what turns a bag of rectangles into
-/// a nested path. The window frame closes the path so `path[0]` is always the frame after
-/// re-ordering by the caller.
+/// **The fallback may only refine, never coarsen.** The primary path already runs
+/// frame → deepest, so its last entry is the accessibility provider's most specific answer;
+/// starting the merged path from the fallback (as an earlier revision did) let a coarse
+/// child-window rectangle replace a fine control — and because the published rectangle is
+/// `path.last()`, that silently turned every refinement back into "the whole window".
+/// The fallback is therefore only ever *appended* when it lies strictly inside the current
+/// tail.
+///
+/// The result keeps [`super::model::WindowTarget`]'s documented order: `path[0]` is the
+/// window frame and the last entry is the most specific one, so `target = path.last()` is the
+/// control under the cursor.
 pub fn merge_hit_paths(
     primary: &[Rect],
     fallback: &[Rect],
     window_bounds: Rect,
     point: Point,
 ) -> Vec<Rect> {
-    let seed = match (primary.first().copied(), fallback.first().copied()) {
-        (Some(primary_seed), Some(fallback_seed)) if contains_rect(primary_seed, fallback_seed) => {
-            fallback_seed
-        }
-        (Some(primary_seed), _) => primary_seed,
-        (None, Some(fallback_seed)) => fallback_seed,
-        (None, None) => window_bounds,
-    };
+    // 1. The primary path, cleaned: usable entries only, frame first.
+    let mut path: Vec<Rect> = primary
+        .iter()
+        .copied()
+        .filter(|rect| !rect.is_empty() && rect.contains(point))
+        .collect();
+    if path.is_empty() {
+        path.push(window_bounds);
+    }
+    if path.first() != Some(&window_bounds) && window_bounds.contains(point) {
+        path.insert(0, window_bounds);
+    }
 
-    let mut candidates: Vec<Rect> = primary.iter().copied().collect();
-    candidates.extend(fallback.iter().copied());
-    push_if_useful(&mut candidates, window_bounds, point);
-    candidates.sort_unstable_by_key(|rect| rect_sort_key(*rect));
-    candidates.dedup_by(|left, right| same_rect(*left, *right));
-
-    let mut path = vec![seed];
-    for candidate in candidates {
-        let tail = *path.last().expect("the path always keeps its seed");
-        if !same_rect(candidate, tail) && contains_rect(candidate, tail) {
+    // 2. Extend downward with fallback rectangles that are strictly inside the current tail.
+    let mut deeper: Vec<Rect> = fallback
+        .iter()
+        .copied()
+        .filter(|rect| !rect.is_empty() && rect.contains(point))
+        .collect();
+    deeper.sort_unstable_by_key(|rect| rect_sort_key(*rect));
+    for candidate in deeper {
+        let tail = *path.last().expect("the path is never empty");
+        if !same_rect(candidate, tail) && contains_rect(tail, candidate) {
             path.push(candidate);
         }
     }
-    push_if_useful(&mut path, window_bounds, point);
     path
 }
 
@@ -418,26 +426,24 @@ mod tests {
     }
 
     #[test]
-    fn merging_prefers_the_more_specific_seed() {
+    fn merging_extends_the_primary_path_downwards_and_never_coarsens() {
         let window = rect(0, 0, 1000, 800);
         let pane = rect(100, 100, 900, 700);
         let control = rect(300, 300, 500, 400);
+        let finer = rect(320, 320, 480, 380);
         let point = Point::new(400, 350);
 
-        // The accessibility path is the coarse pane, the fallback knows the control: the
-        // control is seeded and the pane becomes its container.
-        let merged = merge_hit_paths(&[pane], &[control], window, point);
-        assert_eq!(merged.first(), Some(&control), "the more specific entry seeds");
-        assert_eq!(merged.last(), Some(&window), "the frame closes the path");
-        assert!(
-            merged.iter().any(|entry| *entry == pane),
-            "the coarser container is kept as a level: {merged:?}"
-        );
+        // The accessibility path runs frame → pane → control; the fallback knows something
+        // deeper, so it is appended and the published rectangle gets finer.
+        let merged = merge_hit_paths(&[window, pane, control], &[finer], window, point);
+        assert_eq!(merged, vec![window, pane, control, finer]);
+        assert_eq!(merged.last(), Some(&finer), "the deepest entry is published");
 
-        // Without a fallback the accessibility path is used as-is.
-        let only_primary = merge_hit_paths(&[pane, control], &[], window, point);
-        assert_eq!(only_primary.first(), Some(&pane));
-        assert_eq!(only_primary.last(), Some(&window));
+        // A *coarser* fallback rectangle must never replace the fine control — that was the
+        // regression that made every publish the whole window.
+        let unchanged = merge_hit_paths(&[window, pane, control], &[window], window, point);
+        assert_eq!(unchanged, vec![window, pane, control]);
+        assert_eq!(unchanged.last(), Some(&control));
 
         // With neither, the path is just the frame.
         let bare = merge_hit_paths(&[], &[], window, point);
@@ -470,15 +476,26 @@ mod tests {
         assert_eq!(unique.len(), merged.len(), "no duplicates: {merged:?}");
         assert_eq!(
             merged.first(),
-            Some(&deepest),
-            "the most specific entry across both sources seeds the path"
+            Some(&window),
+            "the path is published frame-first"
         );
-        assert_eq!(merged.last(), Some(&window));
-        // Every level strictly contains the one before it (a nested path).
+        assert_eq!(
+            merged.last(),
+            Some(&deepest),
+            "the deepest entry ends the path, so `target = last()` is the control"
+        );
+        // Each level is contained by the one before it: a nested, outermost-first path.
         for pair in merged.windows(2) {
             assert!(
-                !pair[1].is_empty() && pair[1] != pair[0],
+                !pair[0].is_empty() && pair[0] != pair[1],
                 "levels must differ: {merged:?}"
+            );
+            assert!(
+                pair[0].left <= pair[1].left
+                    && pair[0].top <= pair[1].top
+                    && pair[0].right >= pair[1].right
+                    && pair[0].bottom >= pair[1].bottom,
+                "each level must contain the next: {merged:?}"
             );
         }
     }
@@ -492,7 +509,9 @@ mod tests {
         let seed = rect(300, 300, 500, 400);
         let sibling = rect(700, 600, 900, 780);
         let merged = merge_hit_paths(&[seed], &[sibling], window, Point::new(400, 350));
-        assert_eq!(merged, vec![seed, window]);
+        // Frame first (the documented order), then the deepest entry that was published.
+        assert_eq!(merged, vec![window, seed]);
+        assert_eq!(merged.last(), Some(&seed), "the sibling never becomes a level");
     }
 
     #[test]
