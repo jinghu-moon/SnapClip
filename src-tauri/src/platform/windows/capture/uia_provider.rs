@@ -560,6 +560,70 @@ mod tests {
     }
 
     #[test]
+    fn the_real_pipeline_still_answers_in_the_second_capture_session() {
+        // End-to-end over the real accessibility stack: scheduler → refinement worker → UIA.
+        // Two sessions run back to back on **one** worker, exactly as two F5 presses do. The
+        // scheduler resets its id space between them; the worker must adopt the new ids, or the
+        // second session's answer is rejected as stale and deep selection dies silently
+        // (docs/18 §12.14).
+        use crate::capture::window_detection::deep::RefinementScheduler;
+        use crate::capture::window_detection::model::WindowIdentity;
+        use crate::platform::windows::capture::refinement_worker::RefinementWorker;
+
+        let Some(fixture) = FixtureWindow::create() else {
+            eprintln!("skipping: no interactive window station available");
+            return;
+        };
+        let bounds = Rect::new(200, 200, 560, 460);
+        let point = Point::new(300, 300);
+        let identity = WindowIdentity::new(fixture.handle(), std::process::id(), 0x5E7);
+        let metrics = WindowDetectionMetrics::new();
+        let worker = RefinementWorker::new(0, metrics);
+        let mut scheduler = RefinementScheduler::new();
+
+        for (session, epoch) in [(1u32, 1u64), (2, 2)] {
+            let actions = scheduler.on_cursor_moved(epoch, Some(identity), point);
+            assert!(actions.arm_dwell);
+            let job = scheduler
+                .on_dwell_due()
+                .unwrap_or_else(|| panic!("session {session} must issue a query"));
+            worker.request(job, bounds);
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let mut accepted = false;
+            while std::time::Instant::now() < deadline {
+                // The fixture window lives on *this* thread, so it has to keep pumping while the
+                // refinement worker calls into it — exactly what the overlay does while it waits.
+                pump(10);
+                let Some(result) = worker.take_result() else {
+                    continue;
+                };
+                if result.request != job.request {
+                    continue;
+                }
+                let RefinementOutcome::Target(target) = result.outcome else {
+                    panic!("session {session} produced no target: {:?}", result.outcome);
+                };
+                assert_eq!(target.window, identity);
+                assert!(!target.screen_bounds.is_empty());
+                accepted = scheduler.on_result(result.request, result.epoch, *target);
+                break;
+            }
+            assert!(
+                accepted,
+                "session {session}'s answer must still be the current question"
+            );
+            assert!(scheduler.cached().is_some());
+
+            // Session teardown, then the next F5: both sides start over.
+            if session == 1 {
+                scheduler.reset();
+                worker.retire();
+            }
+        }
+    }
+
+    #[test]
     fn a_real_window_yields_a_path_that_starts_at_the_window_frame() {
         let Some(fixture) = FixtureWindow::create() else {
             eprintln!("skipping: no interactive window station available");

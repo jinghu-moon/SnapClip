@@ -1026,4 +1026,11 @@ job 转交。两端从此共用一个 id 空间，任何一侧 `reset()/retire()
 - `refinement_worker::tests::a_superseded_query_is_cancelled_cooperatively`：按新不变量更新为
   「被取代的 job 回投 `Empty(Cancelled)`，最新 job 回投目标」。
 
-`cargo test --lib` 346 passed / 0 failed，`cargo check --all-targets` 0 warnings。
+**实机（真实 UIA 栈）端到端回归**：
+`uia_provider::tests::the_real_pipeline_still_answers_in_the_second_capture_session` 用测试自建的
+真实窗口（`FixtureWindow`）把 **调度器 → refinement worker → 真实 UIA provider** 串起来，
+在**同一个 worker** 上跑两次会话（中间 `scheduler.reset()` + `worker.retire()`，与两次 F5 同构），
+断言第二次会话的答案仍被接受。**故意把 worker 改回自建 id 空间后该测试失败（10.2 s 超时），
+修复版通过（0.27 s）**——这是"第二次 F5 失效"在真实 accessibility 栈上的红→绿证据。
+
+`cargo test --lib` 353 passed / 0 failed，`cargo check --all-targets` 0 warnings。
