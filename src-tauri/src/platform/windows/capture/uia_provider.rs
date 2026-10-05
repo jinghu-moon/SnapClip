@@ -1056,6 +1056,9 @@ mod tests {
         let mut asserted = 0_usize;
         let mut passed = 0_usize;
         let mut retries = 0_usize;
+        // Per-query latency of the **product** walk (backtracking, hollow look-through and the
+        // child-window check all run here). The refinement budget is 1500 ms per query.
+        let mut latencies: Vec<f64> = Vec::new();
         let mut failures = Vec::new();
         let mut layout_drift = Vec::new();
         for fixture in &manifest {
@@ -1110,9 +1113,10 @@ mod tests {
                     pump(250);
                 }
                 attempts += 1;
+                let query_started = std::time::Instant::now();
                 let outcome = provider
-                    .resolve(&job(hwnd, point), frame, &QueryControl::refinement(&|| false))
-                ;
+                    .resolve(&job(hwnd, point), frame, &QueryControl::refinement(&|| false));
+                latencies.push(query_started.elapsed().as_secs_f64() * 1000.0);
                 published = match &outcome {
                     RefinementOutcome::Target(target) => {
                         last_stop = Some(target.stop_reason);
@@ -1237,6 +1241,7 @@ mod tests {
             "[probe] asserted={asserted} passed={passed} failed={} slow_fixtures={retries}",
             asserted - passed,
         );
+        print_latency_summary("probe", &mut latencies);
         for failure in &failures {
             println!("[probe] FAIL {failure}");
         }
@@ -1343,6 +1348,29 @@ mod tests {
         title.find(marker).map(|at| &title[at + marker.len()..])
     }
 
+    /// n / p50 / p95 / max of the product walk's per-query latency, in milliseconds.
+    ///
+    /// The correctness gates say nothing about cost, and the walk grew (backtracking, look-through,
+    /// a `ChildWindowFromPointEx` per window-backed candidate), so every probe reports it: the
+    /// refinement budget is 1500 ms per query, and a regression here is as real as a wrong box.
+    fn print_latency_summary(label: &str, latencies: &mut Vec<f64>) {
+        if latencies.is_empty() {
+            return;
+        }
+        latencies.sort_by(f64::total_cmp);
+        let pick = |percent: usize| {
+            let index = (latencies.len() * percent).div_ceil(100).saturating_sub(1);
+            latencies[index.min(latencies.len() - 1)]
+        };
+        println!(
+            "[{label}] latency_ms n={} p50={:.1} p95={:.1} max={:.1}",
+            latencies.len(),
+            pick(50),
+            pick(95),
+            latencies[latencies.len() - 1]
+        );
+    }
+
     /// Standard install locations of a Chromium-based browser on Windows.
     fn find_chromium() -> Option<String> {
         let roots = [
@@ -1375,26 +1403,41 @@ mod tests {
     #[ignore = "opens a File Explorer window; run explicitly with --ignored --nocapture"]
     fn explorer_rule_probe() {
         let _ = crate::platform::windows::capture::monitor::set_per_monitor_v2_awareness();
-        let mut window = win32::enumerate_cheap_candidates()
-            .unwrap_or_default()
-            .into_iter()
-            .find(|probe| probe.class_name == "CabinetWClass")
-            .map(|probe| probe.hwnd);
-        if window.is_none() {
-            let home = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".into());
-            let _ = std::process::Command::new("explorer.exe").arg(home).spawn();
-            let deadline = std::time::Instant::now() + Duration::from_secs(20);
-            while window.is_none() && std::time::Instant::now() < deadline {
-                pump(200);
-                window = win32::enumerate_cheap_candidates()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .find(|probe| probe.class_name == "CabinetWClass")
-                    .map(|probe| probe.hwnd);
+        // **Deterministic content.** The grid metric depends entirely on what the window shows, so
+        // pointing it at the user's own Explorer window made the numbers move on their own
+        // (measured for the same code: 9/25, 11/25, 12/25 on different days and folders) — which is
+        // exactly the confound that made a rule change look like a regression. The probe now opens
+        // its own folder with a fixed set of files and measures *that* window.
+        let fixture = std::env::temp_dir().join("snapclip-explorer-fixture");
+        let _ = std::fs::create_dir_all(&fixture);
+        for index in 0..24 {
+            let file = fixture.join(format!("file-{index:02}.txt"));
+            if !file.exists() {
+                let _ = std::fs::write(&file, format!("snapclip fixture file {index}\n"));
             }
         }
+        let fixture_title = fixture
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let _ = std::process::Command::new("explorer.exe")
+            .arg(&fixture)
+            .spawn();
+        let deadline = std::time::Instant::now() + Duration::from_secs(25);
+        let mut window = None;
+        while window.is_none() && std::time::Instant::now() < deadline {
+            pump(250);
+            window = win32::enumerate_cheap_candidates()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|probe| {
+                    probe.class_name == "CabinetWClass"
+                        && probe_title(probe.hwnd).contains(&fixture_title)
+                })
+                .map(|probe| probe.hwnd);
+        }
         let Some(hwnd) = window else {
-            eprintln!("skipping: no File Explorer window available");
+            eprintln!("skipping: the deterministic Explorer fixture window never appeared");
             return;
         };
         let Some(frame) = win32::frame_bounds(hwnd) else {
@@ -1410,17 +1453,20 @@ mod tests {
         let mut provider = UiaDeepSelectionProvider::new(WindowDetectionMetrics::new());
         let window_area = i64::from(client.width()) * i64::from(client.height());
         let mut areas = Vec::new();
+        let mut latencies: Vec<f64> = Vec::new();
         for fy in [30_i32, 40, 50, 60, 70] {
             for fx in [45_i32, 55, 65, 75, 85] {
                 let point = Point::new(
                     client.left + client.width() * fx / 100,
                     client.top + client.height() * fy / 100,
                 );
+                let query_started = std::time::Instant::now();
                 let outcome = provider.resolve(
                     &job(hwnd, point),
                     frame,
                     &QueryControl::refinement(&|| false),
                 );
+                latencies.push(query_started.elapsed().as_secs_f64() * 1000.0);
                 let (rect, depth, reason) = match &outcome {
                     RefinementOutcome::Target(target) => (
                         target.screen_bounds,
@@ -1458,6 +1504,7 @@ mod tests {
             control_level,
             areas.len()
         );
+        print_latency_summary("explorer", &mut latencies);
     }
 
     /// Title of a top-level window, used to identify the probe page.
