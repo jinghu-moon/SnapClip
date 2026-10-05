@@ -367,12 +367,17 @@ impl RefinementScheduler {
             // geometry, so it is not published.
             return false;
         }
-        // The answer must still describe where the cursor *is*. A hand that drifted while the
-        // query ran gets its answer from the next dwell instead.
-        if let (Some(issued), Some(current)) = (issued_point, self.last_point)
-            && !points_close(issued, current)
-        {
-            return false;
+        // The answer must still describe where the cursor *is*. Comparing cursor pixels is the
+        // wrong test: a hand jitters continuously, so a 50 ms query would look "stale" almost
+        // every time and refinement would never publish (that was the "second F5 only snaps the
+        // window" defect). What matters is whether the resolved rectangle still covers the
+        // cursor — if it does, the answer is still the answer.
+        if let Some(current) = self.last_point {
+            let still_describes_cursor = target.covers(current)
+                || issued_point.is_some_and(|issued| points_close(issued, current));
+            if !still_describes_cursor {
+                return false;
+            }
         }
         self.cached = Some((epoch, target));
         true
