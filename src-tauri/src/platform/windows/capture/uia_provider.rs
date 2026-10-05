@@ -56,6 +56,9 @@ pub struct UiaDeepSelectionProvider {
     quarantined: HashSet<isize>,
     /// Diagnostics sink (same verbose gate as the rest of window detection).
     metrics: WindowDetectionMetrics,
+    /// Level counter for one query, so the forensics can tell a same-bounds *chain* apart from
+    /// a walk that is spinning on one node (docs/18 §12.7).
+    level: u32,
 }
 
 /// How many children a level offered and why the others were dropped.
@@ -97,6 +100,7 @@ impl UiaDeepSelectionProvider {
             fallback_rects: HashMap::new(),
             quarantined: HashSet::new(),
             metrics,
+            level: 0,
         }
     }
 
@@ -244,9 +248,12 @@ impl UiaDeepSelectionProvider {
                 node.bounds.bottom,
             )
         });
+        self.level += 1;
         self.metrics.log_line(
             &format!(
-                "refinement level parent=({},{})->({},{}) raw={} empty={} offscreen={} containing={}",
+                "refinement level #{} node={:#x} parent=({},{})->({},{}) raw={} empty={} offscreen={} containing={}",
+                self.level,
+                parent.as_raw() as usize,
                 parent_bounds.left,
                 parent_bounds.top,
                 parent_bounds.right,
@@ -324,6 +331,8 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
         };
         // Expanded levels are only valid for the snapshot generation they were read in.
         self.sync_cache_epoch(job.epoch);
+        // One level counter per query: the forensics must be readable per walk.
+        self.level = 0;
 
         // Bounded descent (docs/18 §11 ①/⑤).
         //
