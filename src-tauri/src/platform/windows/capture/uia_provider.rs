@@ -31,7 +31,7 @@ use crate::capture::window_detection::deep::{
 use crate::capture::window_detection::model::{SnapshotEpoch, TargetKind};
 use crate::capture::window_detection::uia::{
     WalkBudget, WalkNode, WalkOutcome, fallback_hit_path, is_descendable, is_structural_wrapper,
-    merge_hit_paths,
+    is_text_run_inside_element, merge_hit_paths,
 };
 
 use super::win::window as win32;
@@ -277,10 +277,23 @@ impl UiaDeepSelectionProvider {
     ) {
         // The element's own identity, never its rectangle: two nodes may share a rectangle.
         let key: NodeKey = parent.as_raw() as usize;
+        // An **empty** level is not a result. Chromium materialises its accessibility tree lazily —
+        // measured: a pane answers `raw=0` (or with a placeholder `Pane(0,0)-(0,0)`) and lists its
+        // children a moment later — so remembering that answer would pin the whole snapshot
+        // generation to "this node has no children" and every query would publish the coarse
+        // ancestor. The expansion is used for *this* query and the level is re-read on the next one.
+        if !self.children.contains_key(&key) {
+            let expanded = Self::expand(request, parent);
+            if expanded.children.is_empty() && expanded.hollow.is_empty() {
+                self.log_level(parent, parent_bounds, &expanded.stats, 0);
+                return;
+            }
+            self.children.insert(key, expanded);
+        }
         let level = self
             .children
-            .entry(key)
-            .or_insert_with(|| Self::expand(request, parent));
+            .get(&key)
+            .expect("the level was just inserted or was already cached");
         let stats = level.stats;
         let first = candidates.len();
         for (child, node) in &level.children {
@@ -315,6 +328,17 @@ impl UiaDeepSelectionProvider {
         // measured: a browser page scored 3/23 fixtures with the area order and 21/23 with this one,
         // while a real File Explorer window also improved (3/25 → 12/25 points reached control level).
         candidates[first..].reverse();
+        self.log_level(parent, parent_bounds, &stats, candidates.len() - first);
+    }
+
+    /// One verbose line per expanded level: the forensics that made every walk defect findable.
+    fn log_level(
+        &mut self,
+        parent: &IUIAutomationElement,
+        parent_bounds: Rect,
+        stats: &LevelStats,
+        containing: usize,
+    ) {
         self.level += 1;
         self.metrics.log_line(
             &format!(
@@ -328,7 +352,7 @@ impl UiaDeepSelectionProvider {
                 stats.raw,
                 stats.empty,
                 stats.offscreen,
-                candidates.len() - first
+                containing
             ),
             false,
         );
@@ -454,6 +478,16 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
                 .filter(|(child, _)| !visited.contains(&(child.as_raw() as usize)))
                 .collect();
             if !candidates.is_empty() {
+                // A `Text` run is the glyphs inside the element it labels, not the element the user
+                // means (measured: a 168x56 `Hyperlink` with a 56x20 `Text` child; a `role=group`
+                // span likewise). Stop on the element that owns it — `stack.last()` is the node the
+                // candidates are children of, and the root has no control type, so the window frame
+                // can never claim a run.
+                if let Some(parent) = stack.last().map(|level| level.node)
+                    && is_text_run_inside_element(parent, candidates[0].1)
+                {
+                    break 'walk;
+                }
                 let (child, node) = candidates.remove(0);
                 visited.insert(child.as_raw() as usize);
                 // Remaining siblings are popped from the back, so store them earliest-tried last.
@@ -806,6 +840,41 @@ mod tests {
         assert!(!target.screen_bounds.is_empty());
         // The published rectangle must be inside the window's visible area.
         assert!(!target.screen_bounds.intersect(bounds).is_empty());
+    }
+
+    /// An empty expansion must not be remembered (docs/21 §5.6).
+    ///
+    /// Chromium materialises its accessibility tree lazily: a node answers `raw=0` (or with the
+    /// placeholder `Pane(0,0)-(0,0)`) and lists its children a moment later. Caching that answer
+    /// pinned the whole snapshot generation to "this node has no children", so every query published
+    /// the coarse ancestor — one of the "sometimes stays on the parent box" causes. Reading it again
+    /// on the next query is what makes the walk recover on its own.
+    #[test]
+    fn an_empty_uia_level_is_never_remembered() {
+        let Some(fixture) = FixtureWindow::create() else {
+            eprintln!("skipping: no interactive window station available");
+            return;
+        };
+        let mut provider = UiaDeepSelectionProvider::new(WindowDetectionMetrics::new());
+        if provider.automation().is_none() {
+            eprintln!("skipping: UI Automation is unavailable in this environment");
+            return;
+        }
+        let bounds = Rect::new(200, 200, 560, 460);
+        let outcome = resolve_when_ready(&mut provider, fixture.handle(), Point::new(280, 280), bounds);
+        assert!(
+            matches!(outcome, RefinementOutcome::Target(_)),
+            "a live window must still resolve, got {outcome:?}"
+        );
+        let empty = provider
+            .children
+            .values()
+            .filter(|level| level.children.is_empty() && level.hollow.is_empty())
+            .count();
+        assert_eq!(
+            empty, 0,
+            "a level that listed nothing must be re-read, not cached for the generation"
+        );
     }
 
     #[test]

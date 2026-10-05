@@ -142,6 +142,28 @@ pub fn is_structural_wrapper(parent: Rect, node: WalkNode) -> bool {
     matches!(node.control_type, PANE_CONTROL_TYPE | GROUP_CONTROL_TYPE) && node.bounds == parent
 }
 
+/// `UIA_TextControlTypeId`: a run of glyphs, not a control.
+pub const TEXT_CONTROL_TYPE: i32 = 50020;
+
+/// Whether `child` is the glyph run *inside* the element it labels rather than a target of its own.
+///
+/// Measured on Chromium: `<a>Link Two</a>` is exposed as a 168x56 `Hyperlink` **with a 56x20
+/// `Text` child**, and a `role=group` span as the group plus the text run inside it. Publishing the
+/// run selects two words instead of the element the user is pointing at, which is why the browser
+/// fixture marked those cases as failures (`docs/21 §5.5`).
+///
+/// Only a **framed container** (`Pane`/`Group`) may claim its text run.
+///
+/// Letting *interactive controls* claim theirs was measured to halve File Explorer's control-level
+/// points (12/25 → 6/25): Explorer exposes a whole virtualised list as one `DataItem` whose text
+/// child is far finer, so "the control owns its text" would answer with the container. A framed
+/// `Pane`/`Group`, by contrast, is the element the user sees, which is what the `role=group` case in
+/// the browser fixture needs (docs/21 §5.6).
+pub fn is_text_run_inside_element(parent: WalkNode, child: WalkNode) -> bool {
+    child.control_type == TEXT_CONTROL_TYPE
+        && matches!(parent.control_type, PANE_CONTROL_TYPE | GROUP_CONTROL_TYPE)
+}
+
 /// Result of a bounded walk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalkOutcome {
@@ -330,6 +352,44 @@ mod tests {
         assert!(!is_structural_wrapper(parent, typed(parent, 50000)));
         // Unknown control types are not assumed to be structural.
         assert!(!is_structural_wrapper(parent, typed(parent, 0)));
+    }
+
+    #[test]
+    fn a_text_run_inside_an_element_is_not_a_target() {
+        let text = rect(100, 100, 160, 120);
+        let frame = rect(80, 80, 240, 180);
+        let mut run = node(100, 100, 160, 120);
+        run.control_type = TEXT_CONTROL_TYPE;
+        let with = |control_type| WalkNode::new(frame, control_type, false, true);
+
+        // Chromium exposes a `role=group` span as the group plus the text run inside it.
+        for element in [GROUP_CONTROL_TYPE, PANE_CONTROL_TYPE] {
+            assert!(
+                is_text_run_inside_element(with(element), run),
+                "{element} must claim its text run"
+            );
+        }
+        // An interactive control does **not** claim its text: Explorer exposes a whole virtualised
+        // list as one DataItem whose text child is far finer (measured 12/25 → 6/25 control-level
+        // points when controls were allowed to claim it).
+        for not_a_frame in [50000, 50005, 50004, 50007, 50029] {
+            assert!(
+                !is_text_run_inside_element(with(not_a_frame), run),
+                "{not_a_frame} must not claim the text run"
+            );
+        }
+        // Body text under the document is still the deepest truthful answer.
+        for not_an_element in [50030 /* Document */, 50032 /* Window */, 0] {
+            assert!(
+                !is_text_run_inside_element(with(not_an_element), run),
+                "{not_an_element} must not claim the text run"
+            );
+        }
+        // A real child keeps its own box.
+        assert!(!is_text_run_inside_element(
+            with(50005),
+            WalkNode::new(text, 50006, false, true)
+        ));
     }
 
     #[test]
