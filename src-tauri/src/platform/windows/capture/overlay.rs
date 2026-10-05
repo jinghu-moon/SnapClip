@@ -941,6 +941,10 @@ where
         // every session leaves one line of evidence behind.
         let summary = self.metrics.summary_line();
         self.metrics.log_line(&summary, true);
+        self.metrics.log_line(
+            &format!("last deep target {}", describe_deep(self.deep_target.as_ref())),
+            true,
+        );
         self.metrics.reset();
         self.session.cancel();
         self.frozen = None;
@@ -1831,6 +1835,7 @@ where
                 {
                     // A superseded result (another window's query, or one whose point the cursor
                     // has left) must not end the wait for the question we are still asking.
+                    self.metrics.record_refinement_superseded();
                     return;
                 }
                 // The current question has been answered. The staging branch below re-arms the
@@ -1850,6 +1855,7 @@ where
                         _ => false,
                     };
                     if !confirmed {
+                        self.metrics.record_refinement_downgrade_staged();
                         self.pending_downgrade = cursor.map(|point| (target.screen_bounds, point));
                         // Ask again after the dwell: a resting cursor reproduces the target and
                         // the downgrade is applied then; moving clears it.
@@ -1919,12 +1925,24 @@ where
         // Repeated Enter keeps only the newest confirmation.
         let request = self.detector.request_confirm(preview.target);
         self.confirm_request = Some(request);
+        // What the user is about to commit next to what deep selection last published, both in
+        // monitor-local pixels: the two disagreeing is exactly the "probe resolves the element,
+        // the app confirms the window" gap (docs/21 §8), and this line tells which side of that
+        // gap a session fell on.
+        let deep_local = self.layout().zip(self.deep_target.as_ref()).map(|(layout, deep)| {
+            window_rect_to_local(deep.screen_bounds, &layout)
+        });
         self.metrics.log_line(
             &format!(
-                "confirm requested hwnd={} epoch={} confirmation={}",
+                "confirm requested hwnd={} epoch={} confirmation={} preview_local={} \
+                 deep_local={} pending={} deep={}",
                 preview.target.identity().hwnd,
                 preview.target.candidate.snapshot_epoch,
-                request.get()
+                request.get(),
+                describe_rect(preview.selection),
+                deep_local.map_or_else(|| "none".to_owned(), describe_rect),
+                self.refinement_pending.is_some(),
+                describe_deep(self.deep_target.as_ref()),
             ),
             true,
         );
@@ -2810,6 +2828,25 @@ fn exclude_overlay_from_capture(window: HWND) -> Result<(), u32> {
         return Ok(());
     }
     Err(unsafe { GetLastError() })
+}
+
+fn describe_rect(rect: Rect) -> String {
+    format!("({},{})->({},{})", rect.left, rect.top, rect.right, rect.bottom)
+}
+
+/// One-line account of a deep target for the default (non-verbose) session log.
+fn describe_deep(deep: Option<&DeepTarget>) -> String {
+    match deep {
+        None => "none".to_owned(),
+        Some(deep) => format!(
+            "hwnd={} kind={:?} bounds={} depth={} reason={:?}",
+            deep.window.hwnd,
+            deep.kind,
+            describe_rect(deep.screen_bounds),
+            deep.path.len(),
+            deep.stop_reason
+        ),
+    }
 }
 
 /// System drag threshold (`SM_CXDRAG`) in physical pixels for a monitor DPI.

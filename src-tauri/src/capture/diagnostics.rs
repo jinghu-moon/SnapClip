@@ -78,6 +78,10 @@ struct Counters {
     refinement_quarantine_hit: AtomicU64,
     /// Queries the overlay abandoned because they outlived their in-flight budget.
     refinement_inflight_timeouts: AtomicU64,
+    /// Answers the scheduler rejected because the question had moved on.
+    refinement_superseded: AtomicU64,
+    /// Answers held back as a downgrade awaiting a second dwell (docs/18 §13.3).
+    refinement_downgrades_staged: AtomicU64,
 }
 
 /// A copyable reading of every counter, for assertions and one-line reports.
@@ -123,6 +127,8 @@ pub struct WindowDetectionReading {
     pub refinement_quarantine_added: u64,
     pub refinement_quarantine_hit: u64,
     pub refinement_inflight_timeouts: u64,
+    pub refinement_superseded: u64,
+    pub refinement_downgrades_staged: u64,
 }
 
 /// Shared diagnostics handle for the window-detection pipeline.
@@ -352,6 +358,23 @@ impl WindowDetectionMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A refinement answer arrived for a question the scheduler no longer asks.
+    pub fn record_refinement_superseded(&self) {
+        self.counters
+            .refinement_superseded
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A shallower answer was staged instead of displayed, pending a second dwell.
+    ///
+    /// Together with `refinement_published` this tells "the provider never got deep" apart
+    /// from "the provider got deep but the overlay did not adopt it".
+    pub fn record_refinement_downgrade_staged(&self) {
+        self.counters
+            .refinement_downgrades_staged
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// An MSAA fallback query was actually handed to the provider.
     pub fn record_refinement_msaa_attempt(&self) {
         self.counters
@@ -431,6 +454,8 @@ impl WindowDetectionMetrics {
             refinement_quarantine_added: load(&counters.refinement_quarantine_added),
             refinement_quarantine_hit: load(&counters.refinement_quarantine_hit),
             refinement_inflight_timeouts: load(&counters.refinement_inflight_timeouts),
+            refinement_superseded: load(&counters.refinement_superseded),
+            refinement_downgrades_staged: load(&counters.refinement_downgrades_staged),
         }
     }
 
@@ -454,7 +479,8 @@ impl WindowDetectionMetrics {
              refinement_msaa_busy={} refinement_msaa_failures={} \
              refinement_latency_buckets <16ms={} <32ms={} <64ms={} <256ms={} >=256ms={} \
              refinement_quarantine_added={} refinement_quarantine_hit={} \
-             refinement_inflight_timeouts={}",
+             refinement_inflight_timeouts={} \
+             refinement_superseded={} refinement_downgrades_staged={}",
             reading.snapshot_refresh_last_us,
             reading.snapshot_refresh_max_us,
             reading.snapshot_refresh_count,
@@ -495,6 +521,8 @@ impl WindowDetectionMetrics {
             reading.refinement_quarantine_added,
             reading.refinement_quarantine_hit,
             reading.refinement_inflight_timeouts,
+            reading.refinement_superseded,
+            reading.refinement_downgrades_staged,
         )
     }
 
@@ -543,6 +571,9 @@ impl WindowDetectionMetrics {
             &counters.refinement_latency_buckets[2],
             &counters.refinement_latency_buckets[3],
             &counters.refinement_latency_buckets[4],
+            &counters.refinement_inflight_timeouts,
+            &counters.refinement_superseded,
+            &counters.refinement_downgrades_staged,
         ] {
             counter.store(0, Ordering::Relaxed);
         }
@@ -656,6 +687,8 @@ mod tests {
             "refinement_quarantine_added=",
             "refinement_quarantine_hit=",
             "refinement_inflight_timeouts=",
+            "refinement_superseded=",
+            "refinement_downgrades_staged=",
         ] {
             assert!(line.contains(expected), "missing {expected} in: {line}");
         }
@@ -667,6 +700,9 @@ mod tests {
         metrics.record_snapshot_refresh(Duration::from_millis(2), 30);
         metrics.record_hit_test(Duration::from_micros(8));
         metrics.record_worker_enqueued();
+        metrics.record_refinement_inflight_timeout();
+        metrics.record_refinement_superseded();
+        metrics.record_refinement_downgrade_staged();
         metrics.reset();
         assert_eq!(metrics.reading(), WindowDetectionReading::default());
     }
