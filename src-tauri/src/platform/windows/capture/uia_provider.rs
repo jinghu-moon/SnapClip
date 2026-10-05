@@ -15,12 +15,14 @@ use ::windows::Win32::Foundation::{HWND, RECT};
 use ::windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
 };
+use ::windows::core::Interface;
 use ::windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationCacheRequest, IUIAutomationElement, TreeScope_Children,
     UIA_BoundingRectanglePropertyId, UIA_ControlTypePropertyId, UIA_IsOffscreenPropertyId,
 };
 
 use crate::capture::geometry::{Point, Rect};
+use crate::capture::diagnostics::WindowDetectionMetrics;
 use crate::capture::window_detection::deep::{
     DeepSelectionProvider, DeepTarget, QueryControl, RefinementJob, RefinementOutcome,
     StopReason,
@@ -33,37 +35,69 @@ use crate::capture::window_detection::uia::{
 use super::win::window as win32;
 
 /// UIA provider: resolves the deepest element inside one window.
-#[derive(Debug, Default)]
 pub struct UiaDeepSelectionProvider {
     automation: Option<IUIAutomation>,
     /// Batched property request: one cross-process call per level instead of four per node
     /// (docs/18 §11). Built lazily on the refinement thread.
     cache: Option<IUIAutomationCacheRequest>,
-    /// Expanded children per (window, parent bounds).
+    /// Expanded children per (window, parent bounds), with the forensic counters of the
+    /// level they came from.
     ///
     /// Moving between controls of one window walks the same upper levels over and over;
     /// remembering them turns a repeat query into "fetch the deepest level only" instead of
     /// "walk from the window root again" (docs/18 §11 ②). The whole table is dropped when the
     /// snapshot generation changes, so no stale geometry can be served.
-    children: HashMap<NodeKey, Vec<(IUIAutomationElement, WalkNode)>>,
+    children: HashMap<NodeKey, (Vec<(IUIAutomationElement, WalkNode)>, LevelStats)>,
     /// Snapshot generation the table belongs to.
     cache_epoch: Option<SnapshotEpoch>,
     /// Provider-free child-window rectangles per window, valid for `cache_epoch`.
     fallback_rects: HashMap<isize, Vec<Rect>>,
     /// Windows whose provider failed; skipped until the next snapshot generation.
     quarantined: HashSet<isize>,
+    /// Diagnostics sink (same verbose gate as the rest of window detection).
+    metrics: WindowDetectionMetrics,
 }
 
-/// Identity of one expanded node: window handle plus its screen rectangle.
+/// How many children a level offered and why the others were dropped.
 ///
-/// Bounds are the practical identity here — two different elements of one window sharing the
-/// same rectangle are interchangeable for a hit test, and the reference selector treats
-/// same-bounds containers the same way.
-type NodeKey = (isize, i32, i32, i32, i32);
+/// This is the evidence that decides whether resource-manager file items are missing
+/// because the provider never exposes them, because they report **empty rectangles**
+/// (virtualised DirectUI items do), or because they are simply outside the point
+/// (docs/18 §12.7).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LevelStats {
+    /// Children the provider returned for this level.
+    pub raw: usize,
+    /// Dropped because their bounding rectangle was empty or unreadable.
+    pub empty: usize,
+    /// Reported as off-screen.
+    pub offscreen: usize,
+    /// Contained the cursor.
+    pub containing: usize,
+}
+
+/// Identity of one expanded node: the element's own COM identity.
+///
+/// **Not its bounds.** The forensic log proved UIA hands back chains of *distinct* nodes with
+/// **identical rectangles** (Explorer's content panel reports exactly one child occupying the
+/// same rectangle as itself, and so on down). Keying the expansion cache by bounds made those
+/// nodes share one entry, so the walk kept picking the same child — descending "into itself"
+/// until the depth budget ran out and publishing the coarse panel. The reference selector keys
+/// its cache by node index for the same reason. The pointer is a valid identity while the cache
+/// holds a reference to the element, which it does.
+type NodeKey = usize;
 
 impl UiaDeepSelectionProvider {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(metrics: WindowDetectionMetrics) -> Self {
+        Self {
+            automation: None,
+            cache: None,
+            children: HashMap::new(),
+            cache_epoch: None,
+            fallback_rects: HashMap::new(),
+            quarantined: HashSet::new(),
+            metrics,
+        }
     }
 
     /// The automation object, created on the worker thread at first use.
@@ -137,25 +171,31 @@ impl UiaDeepSelectionProvider {
     fn expand(
         request: &IUIAutomationCacheRequest,
         parent: &IUIAutomationElement,
-    ) -> Vec<(IUIAutomationElement, WalkNode)> {
+    ) -> (Vec<(IUIAutomationElement, WalkNode)>, LevelStats) {
+        let mut stats = LevelStats::default();
         let Ok(parent) = (unsafe { parent.BuildUpdatedCache(request) }) else {
-            return Vec::new();
+            return (Vec::new(), stats);
         };
         let Ok(children) = (unsafe { parent.GetCachedChildren() }) else {
-            return Vec::new();
+            return (Vec::new(), stats);
         };
         let count = unsafe { children.Length() }.ok().unwrap_or(0).max(0) as usize;
         let mut expanded = Vec::with_capacity(count);
         for index in 0..count {
+            stats.raw += 1;
             let Ok(child) = (unsafe { children.GetElement(index as i32) }) else {
                 continue;
             };
             let Some(node) = Self::cached_node(&child) else {
+                stats.empty += 1;
                 continue;
             };
+            if node.offscreen {
+                stats.offscreen += 1;
+            }
             expanded.push((child, node));
         }
-        expanded
+        (expanded, stats)
     }
 
     /// Every descendable child of a node that contains `point`, smallest first.
@@ -174,20 +214,17 @@ impl UiaDeepSelectionProvider {
         point: Point,
         budget: &mut WalkBudget,
     ) -> Vec<(IUIAutomationElement, WalkNode)> {
-        let key: NodeKey = (
-            hwnd,
-            parent_bounds.left,
-            parent_bounds.top,
-            parent_bounds.right,
-            parent_bounds.bottom,
-        );
+        // The element's own identity, never its rectangle: two nodes may share a rectangle.
+        let _ = hwnd;
+        let key: NodeKey = parent.as_raw() as usize;
         if !self.children.contains_key(&key) {
             let expanded = Self::expand(request, parent);
             self.children.insert(key, expanded);
         }
-        let Some(children) = self.children.get(&key) else {
+        let Some((children, stats)) = self.children.get(&key) else {
             return Vec::new();
         };
+        let stats = *stats;
         let mut candidates: Vec<(IUIAutomationElement, WalkNode)> = Vec::new();
         for (child, node) in children {
             if !budget.take_node() {
@@ -207,6 +244,20 @@ impl UiaDeepSelectionProvider {
                 node.bounds.bottom,
             )
         });
+        self.metrics.log_line(
+            &format!(
+                "refinement level parent=({},{})->({},{}) raw={} empty={} offscreen={} containing={}",
+                parent_bounds.left,
+                parent_bounds.top,
+                parent_bounds.right,
+                parent_bounds.bottom,
+                stats.raw,
+                stats.empty,
+                stats.offscreen,
+                candidates.len()
+            ),
+            false,
+        );
         candidates
     }
 
@@ -308,6 +359,12 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
             else {
                 break;
             };
+            // Cycle guard: never step into the node we are already standing on. A genuine
+            // same-bounds *child* is still allowed (that is how Explorer nests its panes), but
+            // the walk must make progress.
+            if (child.as_raw() as usize) == (current.as_raw() as usize) {
+                break;
+            }
             if !outcome.push(node.bounds) {
                 break;
             }
@@ -434,7 +491,7 @@ mod tests {
 
     #[test]
     fn an_unknown_window_is_quarantined_and_never_invents_geometry() {
-        let mut provider = UiaDeepSelectionProvider::new();
+        let mut provider = UiaDeepSelectionProvider::new(WindowDetectionMetrics::new());
         let control = QueryControl::refinement(&|| false);
         // A fabricated handle: UIA cannot resolve it.
         let outcome = provider.resolve(
@@ -459,7 +516,7 @@ mod tests {
 
     #[test]
     fn a_cancelled_query_stops_before_touching_the_tree() {
-        let mut provider = UiaDeepSelectionProvider::new();
+        let mut provider = UiaDeepSelectionProvider::new(WindowDetectionMetrics::new());
         let control = QueryControl::refinement(&|| true);
         // Cancellation is checked before the first descent, so an already-abandoned query
         // must not walk (and must not publish a deep target).
@@ -481,7 +538,7 @@ mod tests {
             eprintln!("skipping: no interactive window station available");
             return;
         };
-        let mut provider = UiaDeepSelectionProvider::new();
+        let mut provider = UiaDeepSelectionProvider::new(WindowDetectionMetrics::new());
         if provider.automation().is_none() {
             eprintln!("skipping: UI Automation is unavailable in this environment");
             return;
@@ -510,7 +567,7 @@ mod tests {
             eprintln!("skipping: no interactive window station available");
             return;
         };
-        let mut provider = UiaDeepSelectionProvider::new();
+        let mut provider = UiaDeepSelectionProvider::new(WindowDetectionMetrics::new());
         if provider.automation().is_none() {
             eprintln!("skipping: UI Automation is unavailable in this environment");
             return;

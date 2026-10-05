@@ -89,10 +89,14 @@ impl RefinementWorker {
     /// If UI Automation is unavailable the provider reports `Unsupported` per query and the
     /// overlay keeps the v1 whole-window frame.
     pub fn new(notify_thread: u32, metrics: WindowDetectionMetrics) -> Self {
+        let provider_metrics = metrics.clone();
         Self::with_provider(
             notify_thread,
             metrics,
-            Box::new(|| Box::new(UiaDeepSelectionProvider::new())),
+            // The provider logs its per-level forensics through the same verbose gate as the
+            // rest of window detection, so it is built on the refinement thread with the
+            // shared metrics handle (docs/18 §12.7).
+            Box::new(move || Box::new(UiaDeepSelectionProvider::new(provider_metrics))),
         )
     }
 
