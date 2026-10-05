@@ -711,6 +711,33 @@ GPU 视觉回归（`window_snap_hints_are_painted_but_never_exported` 扩展）�
 取证日志（`refinement level #N node=…`）**决定保留**：它在两轮排查里都是唯一能分辨
 「同边界链前进」与「原地打转」的证据；保持 verbose 门控，默认不输出。
 
+### 12.11 P3 进行中：可超时执行体已完成
+
+`platform/windows/capture/timed_call.rs`（本次提交）实现了参考实现里 MSAA 那套防挂死机制的
+**执行体部分**——它不依赖 COM，因此可以完整单测：
+
+```rust
+pub enum TimedOutcome<T> { Completed(T), TimedOut, Busy }
+pub struct TimedCallRunner { /* max_in_flight + 原子计数 */ }
+```
+
+| 语义 | 实现与理由 |
+| --- | --- |
+| 按时返回 | `Completed(T)`；槽位在闭包返回时释放 |
+| 超过 deadline | `TimedOut`；**被放弃的调用仍占着槽位直到它真正返回** —— 这正是把「挂死的 provider」限制在有限线程内的机制（参考实现同构：超时后无法杀死阻塞中的 COM 调用，只能放弃线程） |
+| 达到容量 | `Busy`；**只重试、绝不隔离** —— 「忙」与「这个窗口有问题」是两件事（参考实现注释明确区分） |
+| 线程创建失败 | 释放槽位并返回 `Busy`（不因自身失败而隔离窗口） |
+
+单测 3 项：按时返回并释放槽位；超时后槽位仍被占用、第二次请求得到 `Busy`、被放弃的调用结束后
+容量恢复；容量 2 时第三个请求仍被拒绝。`cargo test --lib` **335 passed / 0 failed**。
+
+**尚未完成**：MSAA 的 COM 查询本体（`AccessibleObjectFromWindow(OBJID_WINDOW)` →
+`accHitTest` / `accLocation`）。它需要 `VARIANT`（`Win32_System_Variant` feature + VT_I4 联合体
+初始化），而 `accLocation`/`accHitTest` 都要求 `VARIANT` 参数——这部分单独一步做，避免在
+预算末尾留下编译不过的半成品。接入方式已定：provider 先 `IsHungAppWindow` 预检 → 用
+`TimedCallRunner` 包裹查询 → `TimedOut` 隔离该窗口、`Busy` 仅重试、报错返回空；
+与 UIA 组成 `FallbackDeepSelection`（先 UIA，`Unsupported` 再问 MSAA）。
+
 **取证过程的一个教训**：第一次取证日志里的停稳点落在 `hwnd=5967024`（全屏最大化窗口），
 **不是资源管理器**——`Shell.Application.Windows()` 每个标签页返回一项，而 Windows 11 上它们
 **共用同一个 HWND**，所以「取最后一个窗口」并不等于「刚打开的那个」。探针已改为按

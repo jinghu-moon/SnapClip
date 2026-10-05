@@ -22,6 +22,7 @@ pub mod overlay;
 pub mod providers;
 pub mod refinement_worker;
 pub mod renderer;
+pub mod timed_call;
 pub mod uia_provider;
 pub mod win;
 pub mod window_detection;
