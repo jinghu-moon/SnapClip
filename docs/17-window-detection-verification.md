@@ -951,3 +951,45 @@ snap_confirmed=1（全程仅会话 1 的那一次）previews=4 cancels=2 errors=
 | 20 次「F5 → 停稳 → **左键单击** → Esc」循环（`.tmp-p7-probe.ps1` 已改为点击确认） | `snap_confirmed=20/20`、`f5_visible=21`、`cancels=21`、`snapshots=21`、错误 0 |
 | 12 次循环资源稳定性（`.tmp-p7-leak.ps1`） | 暖机后线程 **57→57**、句柄 **628→628**、Private 55.5→56.1 MB、WS 72.5→73.0 MB（不再增长） |
 | release 构建 + NSIS 打包 | `npx tauri build --bundles nsis` exit 0，`SnapClip_0.1.0_x64-setup.exe` 2.39 MiB，release profile 1m45s |
+
+---
+
+## 附录 A：环境未覆盖清单（2026-10-05，单显示器）
+
+验收环境只有一台 3840×2160 / DPI144 显示器，因此下列项**在本机无法执行**。这里不是"跳过"，
+而是逐条给出**替代证据**、**为什么该不变量在结构上成立**，以及**单显示器仍可执行的那部分**。
+
+| 验收项 | 状态 | 替代证据 |
+| --- | --- | --- |
+| 多显示器：会话只覆盖光标所在显示器 | **无实机** | `geometry::tests::a_window_on_another_display_never_lands_on_this_overlay`（本轮新增）、`window_rect_conversion_*`（5 项）、`monitor_cache::tests::a_window_spanning_two_monitors_is_visible_on_both` |
+| 负虚拟桌面坐标（显示器在主屏左/上方） | **无实机** | `window_rect_conversion_subtracts_the_monitor_origin`（副屏 `(-1920,200)`）、`window_rect_conversion_keeps_a_full_monitor_window_exact`（`(-2560,-200)` @192 DPI）、`monitor_cache::tests::negative_virtual_desktop_origins_are_handled` |
+| 混合 DPI（两台显示器不同缩放同时存在） | **无实机** | 物理像素映射与 DPI 无关：`a_window_on_another_display_never_lands_on_this_overlay` 断言同一窗口在 96/192 DPI 布局下映射一致；单屏可切换缩放实测见下方清单第 1 条 |
+| HDR 显示器 | **无实机** | 环境无 HDR 显示设备 |
+
+**为什么"另一个显示器的窗口不会画到本显示器 overlay 上"在结构上成立**：显示器矩形在虚拟桌面内
+**互不重叠**，而 `window_rect_to_local` 是「减去显示器原点」这一**单调平移**再按本显示器局部界限
+裁剪。单调平移把不相交的区间仍然映到不相交的区间，因此另一台显示器上的任何矩形裁完必为空。
+新增的测试把这个性质连同混合 DPI 一起钉住了，避免以后有人把裁剪去掉或用绝对坐标绘制。
+
+### 单显示器仍可执行（建议 2 分钟走一遍）
+
+1. **缩放切换**：Windows 设置 → 显示 → 缩放，150% ↔ 100% 各切一次，每次按 F5 停稳一次。
+   期望：日志 `monitor bounds=… dpi=96`（切换后第一次），overlay 覆盖正确、吸附框贴合、
+   放大镜与十字线按新 DPI 缩放、导出像素与屏幕一致（取色比对）。
+2. **会话进行中改变显示设置**：按 F5 让 overlay 停在屏幕上，然后在设置里切换缩放。
+   期望：`[snapclip][capture] cancel session=… reason=display-change active=true`，overlay 干净退出；
+   再按 F5 一切正常（这条走的正是多显示器**拓扑变化**的同一段代码：`WM_DPICHANGED |
+   WM_DISPLAYCHANGE | WM_DEVICECHANGE` → `cancel("display-change")` + `renderer=None` +
+   `worker.invalidate_providers()`）。
+
+### 本轮顺带修复的测试基础设施缺陷（不是产品缺陷）
+
+真实 UIA fixture 测试在本轮出现过 **一次** 偶发失败（约 16 次全量运行中出现 1 次，且发生在
+重新编译后的第一次运行）：`expanded_levels_are_reused_within_a_generation_and_dropped_across_them`
+报 `cached_epoch() == None`。根因是**新创建窗口向 UIA 核心 provider 的注册是异步的**，
+冷启动时 `ElementFromHandle` 会短暂返回"该句柄不可解析"——这与"这个窗口没有树"是同一种回答，
+原来的固定 `pump(60)` 只是这个等待的一个弱版本。
+
+修复：fixture 测试改用 `resolve_when_ready()`（有界重试，最多 3 s，重试前 `release()` 掉误加的
+quarantine）。**断言一条没有放宽**——真正的回归仍然会在同一行断言上失败，只是要等到 deadline；
+实测 12 次模块级运行 + 3 次冷启动全量运行全绿（354 passed / 0 failed）。

@@ -1372,4 +1372,42 @@ mod tests {
             secondary.local_bounds()
         );
     }
+
+    #[test]
+    fn a_window_on_another_display_never_lands_on_this_overlay() {
+        // The multi-display property a single-screen machine cannot demonstrate by hand: a
+        // session covers **only** the display the cursor was on when it started (docs/14 §4.1),
+        // so another display's window must never be painted here. Displays never overlap in the
+        // virtual desktop and this mapping is a pure translation followed by a clip, which is
+        // why the property holds by construction — and why the test pins it down.
+        let secondary = layout(Rect::new(-1920, 0, 0, 1080), 96);
+        let primary = layout(Rect::new(0, 0, 3840, 2160), 192);
+
+        let on_primary = Rect::new(100, 120, 900, 700);
+        assert!(
+            window_rect_to_local(on_primary, &secondary).is_empty(),
+            "the primary display's window must not be drawn on the secondary overlay"
+        );
+        assert_eq!(
+            window_rect_to_local(on_primary, &primary),
+            Rect::new(100, 120, 900, 700),
+            "…and it is drawn unchanged on the display it belongs to"
+        );
+
+        let on_secondary = Rect::new(-1800, 100, -200, 900);
+        assert!(window_rect_to_local(on_secondary, &primary).is_empty());
+        assert_eq!(
+            window_rect_to_local(on_secondary, &secondary),
+            Rect::new(120, 100, 1720, 900)
+        );
+
+        // Mixed DPI does not enter the physical-pixel mapping: two displays of the same size
+        // at 100% and 200% agree exactly on where a window is.
+        let same_size_96 = layout(Rect::new(0, 0, 3840, 2160), 96);
+        let same_size_192 = layout(Rect::new(0, 0, 3840, 2160), 192);
+        assert_eq!(
+            window_rect_to_local(on_primary, &same_size_96),
+            window_rect_to_local(on_primary, &same_size_192)
+        );
+    }
 }

@@ -477,6 +477,38 @@ mod tests {
         }
     }
 
+    /// Resolve `point` in `hwnd`, waiting out the fixture's registration with the system.
+    ///
+    /// A window that was just created is registered with the compositor **and** with the UIA
+    /// core provider asynchronously, so a query landing in the first milliseconds can be told
+    /// the handle is unresolvable. That answer is indistinguishable from "this window has no
+    /// tree", and it made these fixture tests flaky (measured once in ~16 suite runs, right
+    /// after a cold rebuild) — the fixed 60 ms pump was a weaker version of this same wait.
+    ///
+    /// Retrying does not weaken any assertion: a genuine regression still fails, after the
+    /// deadline, on exactly the assertion it failed on before. The quarantine a failed attempt
+    /// leaves behind is released between attempts, because a cold start is not the window's
+    /// fault.
+    fn resolve_when_ready(
+        provider: &mut UiaDeepSelectionProvider,
+        hwnd: isize,
+        point: Point,
+        bounds: Rect,
+    ) -> RefinementOutcome {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let control = QueryControl::refinement(&|| false);
+            let outcome = provider.resolve(&job(hwnd, point), bounds, &control);
+            if !matches!(outcome, RefinementOutcome::Empty(StopReason::Unsupported))
+                || std::time::Instant::now() >= deadline
+            {
+                return outcome;
+            }
+            provider.release();
+            pump(25);
+        }
+    }
+
     /// A real top-level window owned by this test process, so UIA has a tree to walk.
     struct FixtureWindow(HWND);
 
@@ -578,6 +610,17 @@ mod tests {
         let point = Point::new(300, 300);
         let identity = WindowIdentity::new(fixture.handle(), std::process::id(), 0x5E7);
         let metrics = WindowDetectionMetrics::new();
+        // Wait until the fixture is registered with UIA *before* the pipeline runs: the point of
+        // this test is the id plumbing between sessions, so a cold-start "no tree yet" answer
+        // must not be mistaken for it.
+        {
+            let mut warmup = UiaDeepSelectionProvider::new(WindowDetectionMetrics::new());
+            let outcome = resolve_when_ready(&mut warmup, fixture.handle(), point, bounds);
+            assert!(
+                matches!(outcome, RefinementOutcome::Target(_)),
+                "the fixture must be resolvable before the pipeline is exercised, got {outcome:?}"
+            );
+        }
         let worker = RefinementWorker::new(0, metrics);
         let mut scheduler = RefinementScheduler::new();
 
@@ -635,12 +678,7 @@ mod tests {
             return;
         }
         let bounds = Rect::new(200, 200, 560, 460);
-        let control = QueryControl::refinement(&|| false);
-        let outcome = provider.resolve(
-            &job(fixture.handle(), Point::new(280, 280)),
-            bounds,
-            &control,
-        );
+        let outcome = resolve_when_ready(&mut provider, fixture.handle(), Point::new(280, 280), bounds);
         let RefinementOutcome::Target(target) = outcome else {
             panic!("a live window must produce a target, got {outcome:?}");
         };
@@ -666,7 +704,7 @@ mod tests {
         let bounds = Rect::new(200, 200, 560, 460);
         let control = QueryControl::refinement(&|| false);
 
-        let _ = provider.resolve(&job(fixture.handle(), Point::new(280, 280)), bounds, &control);
+        let _ = resolve_when_ready(&mut provider, fixture.handle(), Point::new(280, 280), bounds);
         let expanded = provider.cached_levels();
         assert_eq!(provider.cached_epoch(), Some(1));
         if expanded == 0 {
