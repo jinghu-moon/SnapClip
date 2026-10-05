@@ -34,6 +34,9 @@
 5. `ControlViewCondition` 树过滤（参考项目里有）**实测无效**：加与不加，Chromium 窗口根下
    都是 `raw=2 containing=2`，分数不变（3/23）。
 
+> **2026-10-05 更新（S1/S2/S2b 已提交，真机通过）**：app 里"确认成整窗"的根因已定位并修复，
+> 见 §5.4。S3（provider 命中测试）不再是浏览器可用的前提，降为增强项。
+
 ---
 
 ## 1. 目标与不变量（沿用 docs/14、docs/18，不要重开一套）
@@ -227,6 +230,33 @@ cargo test --lib explorer_rule_probe -- --ignored --nocapture
 
 `browser_element_probe` 在 D 组的有效运行：**69 次查询由 `ElementFromPoint` 命中路径服务**，
 断言 22/22；`refinement hit hwnd=… box=… depth=…` 是成功标志行。
+
+### 5.4 根因：同边界结构包装 Pane 排在内容分支之后（S2b）
+
+S1 的默认日志证明是**查询层**问题（`deep=… bounds=(63,159)->(3834,2082) depth=2`，
+`refinement_superseded=0 refinement_downgrades_staged=0`）。对用户的最大化 Edge
+（4K，frame `(0,0)-(3840,2088)`）逐层 dump：
+
+- 根：两个同边界 Pane，第一个 `children=0`，第二个是内容分支 → "最后列出者优先"选对；
+- 第 3 层：两个与父节点**同边界**的 Pane，**第一个**才是内容分支（下接 `Pane(61,156)…` 页面），
+  **最后一个**是 `children=0` 的死包装 → "最后列出者优先"选中死包装，走查在 depth=2 结束。
+
+所以只按面积、只按 provider 顺序都不够，必须有 snow-ui-selector 的 `structural_alternative`：
+死胡同时，若当前节点是**与父节点同边界的 `Pane`/`Group`**，回到父层尝试更早的、含光标的
+sibling，条件成立就继续上溯；真实控件与有独立边框的容器不回溯（不会把细结果变粗）。
+实现：`uia.rs::is_structural_wrapper` + `WalkBudget::leave_children`，`uia_provider.rs`
+的候选栈深度优先走查，回溯时打 `refinement backtrack` 日志。夹具窗口没有这个排列，所以
+S2 在探针里 21/23、在真机里整窗——**夹具门禁覆盖不到窗口级树形差异，真机日志必不可少**。
+
+| 项目 | S2 | S2b |
+| --- | --- | --- |
+| 用户 Edge (1625,776) | 整窗 depth=2 | `(1233,762)->(1689,797)` depth=10 |
+| 浏览器夹具 | 21/23 | 21/23（nested-outer/inner 仍为文字块问题，S4） |
+| Explorer 网格（同一窗口当日复测） | 9/25 | 11/25（0 次回溯，差异来自窗口内容；早先 12/25） |
+| app 真机 Edge | 确认成整窗 | `snap confirmed selection=(1877,599)->(1982,661)` depth=10 |
+| app 真机 Explorer | depth=3 内容区 | 文件项 `(1986,950)->(2229,979)` depth=5 |
+
+遗留：Explorer 网格中部分点仍停在 depth=3 内容区 `(1527,466)->(3101,1437)`，与回溯无关，单独排查。
 
 ---
 

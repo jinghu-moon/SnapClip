@@ -83,6 +83,13 @@ impl WalkBudget {
         self.depth_left -= 1;
         true
     }
+
+    /// Give one level of depth back when the walk backtracks out of a dead branch: depth
+    /// bounds how deep the current path is, not how many branches were tried (the node
+    /// budget bounds that).
+    pub fn leave_children(&mut self) {
+        self.depth_left = (self.depth_left + 1).min(MAX_DEPTH);
+    }
 }
 
 impl Default for WalkBudget {
@@ -106,6 +113,23 @@ pub fn is_descendable(parent: Rect, child: WalkNode) -> bool {
     }
     // Must actually overlap the parent; UIA occasionally reports children outside.
     !child.bounds.intersect(parent).is_empty()
+}
+
+/// `UIA_PaneControlTypeId`.
+pub const PANE_CONTROL_TYPE: i32 = 50033;
+/// `UIA_GroupControlTypeId`.
+pub const GROUP_CONTROL_TYPE: i32 = 50026;
+
+/// Whether a dead end may be backtracked out of to an earlier sibling.
+///
+/// UIA sibling order is not a stacking guarantee: Chromium lists a childless, window-sized
+/// `Pane` *after* the pane that holds the page, so taking the last-listed child first ends the
+/// walk on the wrapper and publishes the whole window. The reference selector
+/// (`uia/cache.rs: structural_alternative`) only lets a walk leave a node that is a pure
+/// wrapper — a `Pane`/`Group` with exactly its parent's bounds. Real controls and containers
+/// with a frame of their own keep their precedence, so the rule cannot coarsen a fine answer.
+pub fn is_structural_wrapper(parent: Rect, node: WalkNode) -> bool {
+    matches!(node.control_type, PANE_CONTROL_TYPE | GROUP_CONTROL_TYPE) && node.bounds == parent
 }
 
 /// Result of a bounded walk.
@@ -282,6 +306,32 @@ mod tests {
         assert!(!is_descendable(window, node(800, 0, 900, 100)));
         assert!(is_descendable(window, node(799, 0, 900, 100)));
         assert!(!is_descendable(window, WalkNode::new(rect(10, 10, 20, 20), 0, true, true)));
+    }
+
+    #[test]
+    fn only_same_bounds_panes_and_groups_are_structural_wrappers() {
+        let parent = rect(0, 0, 800, 600);
+        let typed = |bounds: Rect, control_type| WalkNode::new(bounds, control_type, false, true);
+        assert!(is_structural_wrapper(parent, typed(parent, PANE_CONTROL_TYPE)));
+        assert!(is_structural_wrapper(parent, typed(parent, GROUP_CONTROL_TYPE)));
+        // A container with a frame of its own is a real level, not a wrapper.
+        assert!(!is_structural_wrapper(parent, typed(rect(0, 40, 800, 600), PANE_CONTROL_TYPE)));
+        // A real control keeps its precedence even when it fills the parent (50000 = Button).
+        assert!(!is_structural_wrapper(parent, typed(parent, 50000)));
+        // Unknown control types are not assumed to be structural.
+        assert!(!is_structural_wrapper(parent, typed(parent, 0)));
+    }
+
+    #[test]
+    fn backtracking_gives_depth_back_but_never_beyond_the_bound() {
+        let mut budget = WalkBudget::new();
+        assert!(budget.enter_children());
+        assert!(budget.enter_children());
+        budget.leave_children();
+        assert_eq!(budget.depth_left(), MAX_DEPTH - 1);
+        budget.leave_children();
+        budget.leave_children();
+        assert_eq!(budget.depth_left(), MAX_DEPTH, "depth is capped at the declared bound");
     }
 
     #[test]

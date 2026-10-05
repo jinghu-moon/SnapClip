@@ -29,7 +29,8 @@ use crate::capture::window_detection::deep::{
 };
 use crate::capture::window_detection::model::{SnapshotEpoch, TargetKind};
 use crate::capture::window_detection::uia::{
-    WalkBudget, WalkNode, WalkOutcome, fallback_hit_path, is_descendable, merge_hit_paths,
+    WalkBudget, WalkNode, WalkOutcome, fallback_hit_path, is_descendable, is_structural_wrapper,
+    merge_hit_paths,
 };
 
 use super::win::window as win32;
@@ -204,8 +205,8 @@ impl UiaDeepSelectionProvider {
 
     /// Every descendable child of a node that contains `point`, topmost (last listed by the provider) first.
     ///
-    /// Returning *all* containing candidates (not just the smallest) is what makes structural
-    /// backtracking possible: when the smallest one dead-ends, the walk must be able to come
+    /// Returning *all* containing candidates (not just the first) is what makes structural
+    /// backtracking possible: when the first one dead-ends, the walk must be able to come
     /// back and try the next branch (docs/18 §12.6 ①). Children are read from the per-window
     /// table when that level was already expanded, so moving between controls of one window
     /// only pays for the levels it has not seen yet.
@@ -335,24 +336,26 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
         // One level counter per query: the forensics must be readable per walk.
         self.level = 0;
 
-        // Bounded descent (docs/18 §11 ①/⑤).
-        //
-        // The depth-first variant with structural backtracking (docs/18 §12.7) was reverted:
-        // it measured *worse* on real hardware — published targets became coarse enough that
-        // the scheduler's "moving inside the published path answers from cache" rule
-        // suppressed most re-queries (`refinement_submitted` fell below the window-switch
-        // count, and controls stopped following the cursor). Backtracking will be re-attempted
-        // only together with per-query instrumentation that can show what it changes.
+        // Bounded depth-first descent with structural backtracking (docs/18 §11 ①/⑤, docs/20
+        // §5.2). Each level takes the topmost containing child first; when a branch dead-ends,
+        // the walk may back out of it only through pure wrappers (`is_structural_wrapper`) and
+        // try the next earlier sibling that contains the point. Measured on a maximized Edge
+        // window: the root's content pane holds two window-sized panes, the page under the
+        // *first* and a childless one listed *last*, so without this the walk ended on the
+        // wrapper and published the whole window. (An earlier backtracking attempt was
+        // reverted because of a scheduler cache rule that has since been removed.)
         let mut budget = WalkBudget::new();
         let mut current = root;
         let mut current_bounds = window_bounds;
+        // The accepted path below the window frame; each entry keeps the siblings not tried yet.
+        let mut stack: Vec<Level> = Vec::new();
         // UIA can hand back cycles between same-bounds nodes (A → B → A). The forensic log
         // showed one such pair alternating until the depth budget ran out, which padded the
         // published path with duplicate levels. Visiting each node at most once bounds the
         // walk by the tree itself instead of by the budget.
         let mut visited: HashSet<usize> = HashSet::new();
         visited.insert(current.as_raw() as usize);
-        loop {
+        'walk: loop {
             if control.is_cancelled() {
                 outcome.stop_reason = StopReason::Cancelled;
                 break;
@@ -369,7 +372,10 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
                 outcome.stop_reason = StopReason::TraversalLimit;
                 break;
             }
-            let Some((child, node)) = self
+            // Cycle guard: never step into a node already on this walk. A genuine same-bounds
+            // *child* is still allowed (that is how Explorer nests its panes), but the walk must
+            // make progress.
+            let mut candidates: Vec<(IUIAutomationElement, WalkNode)> = self
                 .containing_children(
                     job.window.hwnd,
                     &request,
@@ -379,22 +385,62 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
                     &mut budget,
                 )
                 .into_iter()
-                .next()
-            else {
-                break;
-            };
-            // Cycle guard: never step into the node we are already standing on. A genuine
-            // same-bounds *child* is still allowed (that is how Explorer nests its panes), but
-            // the walk must make progress.
-            let child_id = child.as_raw() as usize;
-            if !visited.insert(child_id) {
+                .filter(|(child, _)| !visited.contains(&(child.as_raw() as usize)))
+                .collect();
+            if !candidates.is_empty() {
+                let (child, node) = candidates.remove(0);
+                visited.insert(child.as_raw() as usize);
+                // Remaining siblings are popped from the back, so store them earliest-tried last.
+                candidates.reverse();
+                stack.push(Level {
+                    node,
+                    parent_bounds: current_bounds,
+                    untried: candidates,
+                });
+                current = child;
+                current_bounds = node.bounds;
+                continue;
+            }
+
+            // Dead end: `current` has no containing child. The level entered for it is unused.
+            budget.leave_children();
+            while let Some(depth) = stack.len().checked_sub(1) {
+                let level = &mut stack[depth];
+                if !is_structural_wrapper(level.parent_bounds, level.node) {
+                    break 'walk;
+                }
+                if let Some((sibling, node)) = level.untried.pop() {
+                    self.metrics.log_line(
+                        &format!(
+                            "refinement backtrack depth={} from=({},{})->({},{}) to=({},{})->({},{})",
+                            depth + 1,
+                            level.node.bounds.left,
+                            level.node.bounds.top,
+                            level.node.bounds.right,
+                            level.node.bounds.bottom,
+                            node.bounds.left,
+                            node.bounds.top,
+                            node.bounds.right,
+                            node.bounds.bottom
+                        ),
+                        false,
+                    );
+                    visited.insert(sibling.as_raw() as usize);
+                    level.node = node;
+                    current = sibling;
+                    current_bounds = node.bounds;
+                    continue 'walk;
+                }
+                // No sibling left here: climb out of this wrapper too, while it is one.
+                stack.pop();
+                budget.leave_children();
+            }
+            break;
+        }
+        for level in &stack {
+            if !outcome.push(level.node.bounds) {
                 break;
             }
-            if !outcome.push(node.bounds) {
-                break;
-            }
-            current = child;
-            current_bounds = node.bounds;
         }
 
         // Provider-free fallback (docs/18 §12.2): older and custom-drawn controls never show
@@ -419,6 +465,14 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
         self.fallback_rects.clear();
         self.cache_epoch = None;
     }
+}
+
+/// One accepted level of the walk: the node chosen there and the containing siblings that
+/// remain to be tried if the branch under it dead-ends.
+struct Level {
+    node: WalkNode,
+    parent_bounds: Rect,
+    untried: Vec<(IUIAutomationElement, WalkNode)>,
 }
 
 /// Turn a bounded walk into the published target.
@@ -1384,7 +1438,6 @@ mod tests {
         ))
     }
 
-    /// Raw accessibility walk, for comparing our policy against what Chromium exposes.
     struct RawWalk {
         request: IUIAutomationCacheRequest,
         automation: IUIAutomation,
