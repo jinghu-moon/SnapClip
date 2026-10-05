@@ -1073,3 +1073,90 @@ session 10  mouse_move_coalesced_count=4305  hover_target_switch_count=1
 
 产品侧判定：四个验收场景（父级→子级 / 子级→父级 / A→B / 连续移动）与"多次 F5"全部通过，
 预览不再出现整窗中间态。
+
+## 14. 浏览器（网页）元素捕获：调研与实测（2026-10-05，**未实现**）
+
+### 14.1 结论先行
+
+网页元素**无法**从进程外读 DOM，也**不需要**读 DOM：Chromium（Edge/Chrome）、Firefox 把网页
+发布成**操作系统无障碍树**（Windows 上是 UIA），每个有角色的 DOM 元素就是一个 UIA 节点，
+**自带屏幕矩形**。所以"浏览器里更简单"这个直觉**对了一半**：树更规整（按钮、链接、输入框、
+文本都是明确的 control type + 真实矩形），但入口和 Win32 程序**完全相同**——同一条 UIA 走查。
+
+snow-shot 里**没有任何**浏览器专用代码（无 CDP、无扩展、无 DOM 注入）：整个 `snow-ui-selector`
+对浏览器和普通程序走同一个 `UiaBackend`。它对 Chromium 的特殊处理只有一条注释和一条很窄的规则
+（§14.3），却足以决定"能不能进到网页元素"。
+
+### 14.2 实测：网页的盒子确实在，但我们现在的走查进不去
+
+探针：`uia_provider::tests::browser_element_probe`（`#[ignore]`，自带临时 profile 启动本机
+Chromium，**不触碰用户浏览器状态**）。
+
+```text
+cargo test --lib browser_element_probe -- --ignored --nocapture
+```
+
+页面是 3 列网格（button / div / a）+ 嵌套 span + input。**Chromium 暴露的层级**（实测）：
+
+```text
+#0 Window            子节点=2，两个 Pane 边界几乎相同，都包含光标
+   ├─ Pane(127,60)-(1392,1033) name=""                     ← 死叶子：子节点=0
+   └─ Pane(127,60)-(1394,1033) name="SnapClip UIA probe - Google Chrome"
+        └─ Pane(同边界) ×4 层同边界 Pane                      ← 需要一路穿过
+             └─ Document(127,147)-(1393,1033) "SnapClip UIA probe"
+                  └─ Button(151,171)-(371,291)  "Button One"     ← 网页元素，真实矩形
+                     Text(469,222)-(525,244)    "Div Two"
+                     Hyperlink(623,171)-(843,295) "Link Three"
+                     Text(181,372)-(271,393)    "Nested Span"
+                     Edit(151,470)-(479,517)    ""
+```
+
+**现在的实现（实测）**：五个探针点（按钮格、div 格、链接格、嵌套 span、页面空白）**全部**发布
+`(189,90)-(1392,1033)` = 1203×943 ≈ 整个窗口，`depth=3`，`reason=Complete`——一次都没进到
+Document，更没进到网页元素。
+
+**根因（下钻偏好，不是 provider 能力问题）**：窗口根下两个 Pane 是**重叠兄弟**：
+
+| | 边界 | 面积 | 子节点 | 谁选中 |
+| --- | --- | --- | --- | --- |
+| 无名 Pane | `(127,60)-(1392,1033)` | 1 265×973（**2 px 更窄 → 更小**） | **0** | **我们选它** |
+| 标题 Pane | `(127,60)-(1394,1033)` | 1 267×973 | 有（内容分支） | 参考实现选它 |
+
+我们的 `deepest_child_at` 是"**最小者胜**"，于是选中那个**更小但已经没有子节点的死叶子**，
+走查到此结束。参考实现用的是另一条规则：`hit_before(point, usize::MAX)` 取**索引最大**（视觉上
+最靠上）的包含子节点，因此直接落到标题 Pane（内容分支）；当它也不含光标时才用
+`structural_alternative` 回溯到**更早的兄弟**。
+
+### 14.3 参考实现里与浏览器直接相关的四点（真实源码）
+
+| 位置 | 做法 | 为什么对浏览器重要 |
+| --- | --- | --- |
+| `uia.rs` `NativeProvider::new` | `request.SetTreeFilter(&automation.ControlViewCondition()?)` | 注释原文：Control view **去掉"只参与布局"的 pane**，"can obscure the content hit path"。Chromium 的布局层节点极多 |
+| `uia/cache.rs` `query` | `children.hit_before(point, usize::MAX)` —— **索引最大**的包含子节点优先 | 决定进"内容分支"而不是死叶子；UIA 兄弟顺序不是层叠保证，但对 Chromium 恰好有效 |
+| `uia/cache.rs` `structural_alternative` | 无包含子节点时，**只在**「当前节点是 structural(`Pane`/`Group`) **且与父节点同边界**」时，向**更早的兄弟**回溯；否则立即 `Complete` | 注释原文点名 **Chromium**："A redundant structural leaf may cover the content branch (for example in Chromium windows)"。我们 12.7 试过并回退的是**更宽**的版本（对所有重叠兄弟做栈式 DFS），语义不同 |
+| `uia.rs` `NativeProvider::set_timeouts` | `IUIAutomation2::SetConnectionTimeout/SetTransactionTimeout`，每次调用设为 `min(剩余预算, call_limit)`；超时 → `ProviderTimeout`，`retry_timeout` 时**每个节点重试一次** | 这是 UIA **客户端自己的**超时：卡死的 provider 会被 UIA 直接中止调用。我之前说"单次调用无法设限"是不准确的——参考实现正是这么做的（我们用 `CUIAutomation` 而非 `CUIAutomation8`，所以拿不到这两个接口） |
+
+另外参考实现有两处我们需要对照的语义：
+
+- `StopReason::AccessibilityPending`（`query.rs`）：**树尚未就绪**是一种独立结果，不是"窗口没有树"。
+  实测正好撞上：第一个探针点（窗口刚出现）读到的第 7 层只有一个 `Pane(0,0)-(0,0)` 占位节点，
+  几毫秒后的其余四个点才读到真正的 Button/Hyperlink/Edit。也就是说 **Chromium 的无障碍树是
+  异步物化的**，第一次查询可能落在占位态；把它当成最终答案就会一直停在整窗。
+- `StopReason::DecodingPending` + `publication_interval=32 ms`：同一批子节点分多次解码、期间
+  **增量发布**路径（§3 的"发布间隔"档位）。
+
+### 14.4 对 SnapClip 的落点（尚未实现，待确认）
+
+1. **下钻偏好**：`deepest_child_at` 从"最小者胜"改为"**最靠上的包含者优先**"，并在其死胡同时
+   按参考实现回溯到**下一个候选兄弟**（仅限包含光标的候选，数量天然很少），保留"最小者胜"作为
+   **同层级平局**的次序。这会改变 Win32 用例的既有行为，必须有 Explorer/示例程序的回归证据。
+2. **占位态**：空矩形/占位层级视为"树未就绪"，返回既有的 `StopReason` 语义（新增
+   `AccessibilityPending` 或复用）**而不是**发布整窗；调度器侧它等价于"这次没答案"，下一个
+   dwell 会重新查询（我们的调度器本来就每次位置都重查）。
+3. **ControlView 过滤 + UIA 级超时**：换 `CUIAutomation8`/`IUIAutomation2` 拿
+   `SetConnectionTimeout/SetTransactionTimeout`（顺带把 12.16 的"单次调用无法设限"补成真正的
+   调用级上限），并评估 ControlView 过滤对 Explorer 结果的影响（可能同时改善/改变已验收行为，
+   必须前后对比）。
+4. **回归夹具**：保留 `browser_element_probe` 作为人工探针；若要进自动化，则用参考项目那套做法
+   （`examples/support/native_fixture.rs` 风格：在测试里建**真实窗口并让 UIA 看见**），但浏览器
+   夹具依赖本机安装的浏览器，只能 `#[ignore]`。

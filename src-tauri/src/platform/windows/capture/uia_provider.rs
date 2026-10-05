@@ -740,4 +740,350 @@ mod tests {
             "levels from the previous generation cannot survive"
         );
     }
+
+    /// The page the browser probe opens: a known grid of elements plus a nested pair.
+    const PROBE_PAGE: &str = r##"<!doctype html>
+<html><head><meta charset="utf-8"><title>SnapClip UIA probe</title>
+<style>
+  html,body{margin:0;padding:0;background:#fff;font:16px/1.2 "Segoe UI",sans-serif}
+  #grid{display:grid;grid-template-columns:repeat(3,220px);gap:16px;padding:24px}
+  .cell{height:120px;display:flex;align-items:center;justify-content:center;
+        border:2px solid #333;background:#eef}
+  #row2{margin:24px;padding:8px;border:2px dashed #c00}
+  #nested{padding:18px;border:2px solid #090;background:#efe}
+</style></head><body>
+<div id="grid">
+  <button class="cell" id="b1">Button One</button>
+  <div class="cell" id="d1">Div Two</div>
+  <a class="cell" id="a1" href="#">Link Three</a>
+</div>
+<div id="row2"><div id="nested"><span id="s1">Nested Span</span></div></div>
+<input id="i1" style="margin:24px;width:320px;height:40px" value="Input Field">
+</body></html>
+"##;
+
+    /// What our walk reaches inside a Chromium window.
+    ///
+    /// Run explicitly — it launches its own browser on a throwaway profile, so the user's
+    /// browser state is untouched:
+    ///
+    /// ```text
+    /// cargo test --lib browser_element_probe -- --ignored --nocapture
+    /// ```
+    ///
+    /// For each probe point it prints the raw accessibility chain Chromium exposes (control
+    /// type + name + rectangle per level) next to what [`UiaDeepSelectionProvider`] publishes.
+    /// That is the evidence behind "how far does deep selection get inside a web page". It is
+    /// deliberately **not** part of the default suite: it needs a browser and a visible window.
+    #[test]
+    #[ignore = "launches a browser; run explicitly with --ignored --nocapture"]
+    fn browser_element_probe() {
+        let Some(browser) = find_chromium() else {
+            eprintln!("skipping: no Chromium-based browser found");
+            return;
+        };
+        let dir = std::env::temp_dir().join("snapclip-browser-probe");
+        let _ = std::fs::create_dir_all(&dir);
+        let page = dir.join("probe.html");
+        if std::fs::write(&page, PROBE_PAGE).is_err() {
+            eprintln!("skipping: cannot write the probe page");
+            return;
+        }
+        let url = format!("file:///{}", page.display().to_string().replace('\\', "/"));
+        let spilled = std::process::Command::new(&browser)
+            .args([
+                "--new-window",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-session-crashed-bubble",
+                "--window-size=1280,980",
+                "--window-position=120,60",
+            ])
+            .arg(format!("--user-data-dir={}", dir.join("profile").display()))
+            .arg(&url)
+            .spawn();
+        let Ok(mut child) = spilled else {
+            eprintln!("skipping: cannot launch {browser}");
+            return;
+        };
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(40);
+        let mut window = None;
+        while window.is_none() && std::time::Instant::now() < deadline {
+            pump(100);
+            window = win32::enumerate_cheap_candidates()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|probe| {
+                    probe.class_name == "Chrome_WidgetWin_1"
+                        && probe_title(probe.hwnd).contains("probe")
+                })
+                .map(|probe| probe.hwnd);
+        }
+        let Some(hwnd) = window else {
+            let _ = child.kill();
+            eprintln!("skipping: the browser window never appeared");
+            return;
+        };
+        // Let the page lay out and Chromium bring its accessibility tree up.
+        pump(1500);
+        let Some(frame) = win32::frame_bounds(hwnd) else {
+            let _ = child.kill();
+            eprintln!("skipping: no frame bounds for the browser window");
+            return;
+        };
+        let client = client_origin_and_size(hwnd).unwrap_or(frame);
+        println!(
+            "[probe] browser={browser} hwnd={hwnd} frame={frame:?} client=({}, {}) size={}x{}",
+            client.left,
+            client.top,
+            client.right,
+            client.bottom
+        );
+
+        let metrics = WindowDetectionMetrics::new();
+        metrics.set_verbose(true);
+        let mut provider = UiaDeepSelectionProvider::new(metrics);
+        let walk = provider.automation().cloned().and_then(|auto| RawWalk::new(&auto));
+
+        for (label, fx, fy) in [
+            ("button-cell", 0.15_f32, 0.15_f32),
+            ("div-cell", 0.43, 0.15),
+            ("link-cell", 0.70, 0.15),
+            ("nested-span", 0.30, 0.42),
+            ("blank-body", 0.50, 0.92),
+        ] {
+            let point = Point::new(
+                client.left + (client.width() as f32 * fx) as i32,
+                client.top + (client.height() as f32 * fy) as i32,
+            );
+            println!("[probe] === {label} at ({}, {}) ===", point.x, point.y);
+            if let Some(walk) = &walk {
+                walk.dump(hwnd, point, 8);
+            }
+            let control = QueryControl::refinement(&|| false);
+            match provider.resolve(&job(hwnd, point), frame, &control) {
+                RefinementOutcome::Target(target) => println!(
+                    "[probe] provider -> {:?} {}x{} depth={} reason={:?}",
+                    target.screen_bounds,
+                    target.screen_bounds.width(),
+                    target.screen_bounds.height(),
+                    target.path.len(),
+                    target.stop_reason
+                ),
+                RefinementOutcome::Empty(reason) => {
+                    println!("[probe] provider -> empty reason={reason:?}")
+                }
+            }
+        }
+        let _ = child.kill();
+    }
+
+    /// Standard install locations of a Chromium-based browser on Windows.
+    fn find_chromium() -> Option<String> {
+        let roots = [
+            std::env::var("ProgramFiles").ok(),
+            std::env::var("ProgramFiles(x86)").ok(),
+            std::env::var("LOCALAPPDATA").ok(),
+        ];
+        let relatives = [
+            r"Microsoft\Edge\Application\msedge.exe",
+            r"Google\Chrome\Application\chrome.exe",
+        ];
+        roots
+            .iter()
+            .flatten()
+            .flat_map(|root| relatives.iter().map(move |rel| format!("{root}\\{rel}")))
+            .find(|path| std::path::Path::new(path).is_file())
+    }
+
+    /// Title of a top-level window, used to identify the probe page.
+    fn probe_title(hwnd: isize) -> String {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowTextLengthW, GetWindowTextW};
+        let length = unsafe { GetWindowTextLengthW(hwnd as *mut core::ffi::c_void) };
+        if length <= 0 {
+            return String::new();
+        }
+        let mut buffer = vec![0u16; length as usize + 1];
+        let written = unsafe {
+            GetWindowTextW(
+                hwnd as *mut core::ffi::c_void,
+                buffer.as_mut_ptr(),
+                buffer.len() as i32,
+            )
+        };
+        String::from_utf16_lossy(&buffer[..written.max(0) as usize])
+    }
+
+    /// Client origin (screen pixels) and client size of `hwnd`.
+    fn client_origin_and_size(hwnd: isize) -> Option<Rect> {
+        use windows_sys::Win32::Foundation::{POINT as SYS_POINT, RECT as SYS_RECT};
+        use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect;
+        let mut rect = SYS_RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        if unsafe { GetClientRect(hwnd as *mut core::ffi::c_void, &mut rect) } == 0 {
+            return None;
+        }
+        let mut origin = SYS_POINT { x: 0, y: 0 };
+        if unsafe { ClientToScreen(hwnd as *mut core::ffi::c_void, &mut origin) } == 0 {
+            return None;
+        }
+        Some(Rect::new(
+            origin.x,
+            origin.y,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+        ))
+    }
+
+    /// Raw accessibility walk, for comparing our policy against what Chromium exposes.
+    struct RawWalk {
+        request: IUIAutomationCacheRequest,
+        automation: IUIAutomation,
+    }
+
+    impl RawWalk {
+        fn new(automation: &IUIAutomation) -> Option<Self> {
+            let request = unsafe { automation.CreateCacheRequest() }.ok()?;
+            unsafe {
+                request.AddProperty(UIA_BoundingRectanglePropertyId).ok()?;
+                request.AddProperty(UIA_ControlTypePropertyId).ok()?;
+                request
+                    .AddProperty(::windows::Win32::UI::Accessibility::UIA_NamePropertyId)
+                    .ok()?;
+                request.SetTreeScope(TreeScope_Children).ok()?;
+            }
+            Some(Self {
+                request,
+                automation: automation.clone(),
+            })
+        }
+
+        fn children(
+            &self,
+            element: &IUIAutomationElement,
+        ) -> Vec<(IUIAutomationElement, Rect, i32, String)> {
+            let mut out = Vec::new();
+            let Ok(cached) = (unsafe { element.BuildUpdatedCache(&self.request) }) else {
+                return out;
+            };
+            let Ok(array) = (unsafe { cached.GetCachedChildren() }) else {
+                return out;
+            };
+            let count = unsafe { array.Length() }.ok().unwrap_or(0).max(0) as usize;
+            for index in 0..count {
+                let Ok(child) = (unsafe { array.GetElement(index as i32) }) else {
+                    continue;
+                };
+                let Ok(rect) = (unsafe { child.CachedBoundingRectangle() }) else {
+                    continue;
+                };
+                let kind = unsafe { child.CachedControlType() }.map(|kind| kind.0).unwrap_or(0);
+                let name = unsafe { child.CachedName() }
+                    .map(|name| name.to_string())
+                    .unwrap_or_default();
+                out.push((child, to_rect(rect), kind, name));
+            }
+            out
+        }
+
+        /// Explore every containing branch from the window root, breadth-limited and depth-limited.
+        ///
+        /// Following only the first containing child hides the interesting case: Chromium's window
+        /// root offers two overlapping `Pane` siblings, and the first one is a dead leaf.
+        fn dump(&self, hwnd: isize, point: Point, max_levels: usize) {
+            let Ok(root) =
+                (unsafe { self.automation.ElementFromHandle(HWND(hwnd as *mut _)) })
+            else {
+                println!("[probe] raw: ElementFromHandle failed");
+                return;
+            };
+            self.explore(&root, point, 0, max_levels, "");
+        }
+
+        fn explore(
+            &self,
+            element: &IUIAutomationElement,
+            point: Point,
+            level: usize,
+            max_levels: usize,
+            indent: &str,
+        ) {
+            if level >= max_levels {
+                return;
+            }
+            let children = self.children(element);
+            let containing: Vec<_> = children
+                .iter()
+                .filter(|(_, bounds, _, _)| bounds.contains(point))
+                .collect();
+            println!(
+                "[probe] raw {indent}#{level} children={} containing={}",
+                children.len(),
+                containing.len()
+            );
+            // When nothing contains the point any more, print what *is* there: that is where the
+            // page's own boxes live, and whether they carry real rectangles decides whether deep
+            // selection can reach them at all.
+            if containing.is_empty() {
+                for (_, bounds, kind, name) in children.iter().take(6) {
+                    println!(
+                        "[probe] raw {indent}  ( ) {}({},{})-({},{}) {:?}",
+                        control_type_name(*kind),
+                        bounds.left,
+                        bounds.top,
+                        bounds.right,
+                        bounds.bottom,
+                        name.chars().take(28).collect::<String>()
+                    );
+                }
+                return;
+            }
+            // At most two branches per level: enough to show the dead leaf *and* the content
+            // branch, without letting a big page walk itself to death.
+            let branch = containing.len() <= 2;
+            for (child, bounds, kind, name) in containing {
+                println!(
+                    "[probe] raw {indent}  -> {}({},{})-({},{}) {:?}",
+                    control_type_name(*kind),
+                    bounds.left,
+                    bounds.top,
+                    bounds.right,
+                    bounds.bottom,
+                    name.chars().take(28).collect::<String>()
+                );
+                if branch {
+                    self.explore(child, point, level + 1, max_levels, &format!("{indent}    "));
+                }
+            }
+        }
+    }
+
+    /// The control types that matter when reading the probe output.
+    fn control_type_name(kind: i32) -> &'static str {
+        match kind {
+            50000 => "Button",
+            50003 => "ComboBox",
+            50004 => "Edit",
+            50005 => "Hyperlink",
+            50006 => "Image",
+            50007 => "ListItem",
+            50008 => "List",
+            50020 => "Text",
+            50025 => "Custom",
+            50026 => "Group",
+            50029 => "DataItem",
+            50030 => "Document",
+            50032 => "Window",
+            50033 => "Pane",
+            50034 => "Header",
+            0 => "Unknown",
+            _ => "Other",
+        }
+    }
 }
