@@ -326,6 +326,9 @@ pub struct RefinementScheduler {
     last_window: Option<WindowIdentity>,
     requests: RequestGate,
     cached: Option<(SnapshotEpoch, DeepTarget)>,
+    /// A dwell expired for a new position while a query was in flight; see
+    /// [`Self::take_follow_up`].
+    deferred: bool,
 }
 
 impl RefinementScheduler {
@@ -358,6 +361,7 @@ impl RefinementScheduler {
 
         let Some(window) = window else {
             self.pending = None;
+            self.deferred = false;
             self.cached = None;
             return actions;
         };
@@ -392,8 +396,13 @@ impl RefinementScheduler {
     /// The dwell timer expired: issue a query unless one is already running.
     pub fn on_dwell_due(&mut self) -> Option<RefinementJob> {
         if self.in_flight.is_some() {
-            // Single-flight: the running query gets to finish; a newer point re-armed the
-            // timer and will be picked up when its own dwell expires.
+            // Single-flight: the running query gets to finish. A *different* position whose
+            // dwell expired meanwhile is remembered and issued when the slot frees.
+            if let (Some(pending), Some(issued)) = (self.pending, self.in_flight_point)
+                && !points_close(pending.point, issued)
+            {
+                self.deferred = true;
+            }
             return None;
         }
         let pending = self.pending?;
@@ -479,6 +488,7 @@ impl RefinementScheduler {
     /// The snapshot generation changed: drop the cache and invalidate any query.
     pub fn on_snapshot_changed(&mut self) -> SchedulerActions {
         self.pending = None;
+        self.deferred = false;
         self.cached = None;
         self.in_flight_point = None;
         self.in_flight_since = None;
@@ -490,6 +500,21 @@ impl RefinementScheduler {
             invalidate_in_flight: invalidate,
             arm_dwell: false,
         }
+    }
+
+    /// The query that a finished, failed or abandoned one was holding back, if any.
+    ///
+    /// A dwell that expires while a query is in flight is deferred by single-flight, and the
+    /// one-shot timer that carried it is gone. Without this, a cursor that came to rest on a
+    /// child while its parent's query was still running was never asked about again: the
+    /// parent's answer covers the child's point, so it was published and stayed — the
+    /// "stuck on the parent box" defect. Call this whenever the slot frees.
+    pub fn take_follow_up(&mut self) -> Option<RefinementJob> {
+        if !self.deferred || self.in_flight.is_some() {
+            return None;
+        }
+        self.deferred = false;
+        self.on_dwell_due()
     }
 
     /// The currently published deep target, if any.
@@ -505,6 +530,7 @@ impl RefinementScheduler {
     /// Forget everything. Used on session teardown so nothing leaks into the next F5.
     pub fn reset(&mut self) {
         self.pending = None;
+        self.deferred = false;
         self.in_flight = None;
         self.in_flight_point = None;
         self.in_flight_since = None;
@@ -626,6 +652,78 @@ mod tests {
             1,
             deep_target(TargetKind::UiElement, rect(40, 40, 200, 200), StopReason::Complete)
         ));
+    }
+
+    #[test]
+    fn a_position_whose_dwell_expired_during_a_query_is_queried_afterwards() {
+        // The cursor rests on a container (query 1 runs), then moves into a child and rests
+        // there. The child's dwell expires while query 1 is still in flight, so single-flight
+        // must defer it — and the deferral must not lose the question: once query 1 lands, the
+        // child's position is queried. Losing it published the container's answer for the
+        // child's point (it covers it) and nothing ever asked again: "stuck on the parent".
+        let mut scheduler = RefinementScheduler::new();
+        let parent = submit(&mut scheduler, 1, Point::new(150, 150));
+        let actions = scheduler.on_cursor_moved(1, Some(window(0x100)), Point::new(320, 320));
+        assert!(actions.arm_dwell);
+        assert!(scheduler.on_dwell_due().is_none(), "single-flight defers the child's query");
+        assert!(scheduler.take_follow_up().is_none(), "nothing is issued while query 1 runs");
+
+        assert!(scheduler.on_result(
+            parent.request,
+            1,
+            deep_target(TargetKind::UiElement, rect(100, 100, 900, 700), StopReason::Complete)
+        ));
+        let child = scheduler
+            .take_follow_up()
+            .expect("the deferred position is queried once the slot is free");
+        assert_eq!(child.point, Point::new(320, 320));
+        assert!(scheduler.take_follow_up().is_none(), "the follow-up is issued once");
+    }
+
+    #[test]
+    fn a_deferred_position_survives_a_failed_or_abandoned_query() {
+        let mut scheduler = RefinementScheduler::new();
+        let first = submit(&mut scheduler, 1, Point::new(150, 150));
+        scheduler.on_cursor_moved(1, Some(window(0x100)), Point::new(320, 320));
+        assert!(scheduler.on_dwell_due().is_none());
+        assert!(scheduler.on_failure(first.request));
+        assert_eq!(
+            scheduler.take_follow_up().map(|job| job.point),
+            Some(Point::new(320, 320))
+        );
+
+        let mut scheduler = RefinementScheduler::new();
+        let first = submit(&mut scheduler, 1, Point::new(150, 150));
+        scheduler.on_cursor_moved(1, Some(window(0x100)), Point::new(320, 320));
+        assert!(scheduler.on_dwell_due().is_none());
+        let expired = std::time::Instant::now()
+            + Duration::from_millis(u64::from(REFINEMENT_INFLIGHT_TIMEOUT_MS));
+        assert_eq!(scheduler.on_in_flight_timeout(expired), Some(first.request));
+        assert_eq!(
+            scheduler.take_follow_up().map(|job| job.point),
+            Some(Point::new(320, 320))
+        );
+    }
+
+    #[test]
+    fn no_follow_up_without_a_deferred_dwell() {
+        // A query whose position did not change needs no repeat, and leaving the window drops
+        // the deferred question with everything else.
+        let mut scheduler = RefinementScheduler::new();
+        let job = submit(&mut scheduler, 1, Point::new(150, 150));
+        assert!(scheduler.on_dwell_due().is_none());
+        assert!(scheduler.on_result(
+            job.request,
+            1,
+            deep_target(TargetKind::UiElement, rect(100, 100, 300, 300), StopReason::Complete)
+        ));
+        assert!(scheduler.take_follow_up().is_none(), "the same position was just answered");
+
+        let _job = submit(&mut scheduler, 1, Point::new(150, 150));
+        scheduler.on_cursor_moved(1, Some(window(0x100)), Point::new(320, 320));
+        assert!(scheduler.on_dwell_due().is_none());
+        scheduler.on_cursor_moved(1, None, Point::new(5000, 5000));
+        assert!(scheduler.take_follow_up().is_none(), "no window, no question");
     }
 
     #[test]

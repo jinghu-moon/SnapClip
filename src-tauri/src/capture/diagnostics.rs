@@ -82,6 +82,8 @@ struct Counters {
     refinement_superseded: AtomicU64,
     /// Answers held back as a downgrade awaiting a second dwell (docs/18 §13.3).
     refinement_downgrades_staged: AtomicU64,
+    /// Queries issued for a position whose dwell expired while another query ran.
+    refinement_follow_ups: AtomicU64,
 }
 
 /// A copyable reading of every counter, for assertions and one-line reports.
@@ -129,6 +131,7 @@ pub struct WindowDetectionReading {
     pub refinement_inflight_timeouts: u64,
     pub refinement_superseded: u64,
     pub refinement_downgrades_staged: u64,
+    pub refinement_follow_ups: u64,
 }
 
 /// Shared diagnostics handle for the window-detection pipeline.
@@ -365,6 +368,13 @@ impl WindowDetectionMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A deferred position was queried once the single-flight slot freed.
+    pub fn record_refinement_follow_up(&self) {
+        self.counters
+            .refinement_follow_ups
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// A shallower answer was staged instead of displayed, pending a second dwell.
     ///
     /// Together with `refinement_published` this tells "the provider never got deep" apart
@@ -456,6 +466,7 @@ impl WindowDetectionMetrics {
             refinement_inflight_timeouts: load(&counters.refinement_inflight_timeouts),
             refinement_superseded: load(&counters.refinement_superseded),
             refinement_downgrades_staged: load(&counters.refinement_downgrades_staged),
+            refinement_follow_ups: load(&counters.refinement_follow_ups),
         }
     }
 
@@ -480,7 +491,8 @@ impl WindowDetectionMetrics {
              refinement_latency_buckets <16ms={} <32ms={} <64ms={} <256ms={} >=256ms={} \
              refinement_quarantine_added={} refinement_quarantine_hit={} \
              refinement_inflight_timeouts={} \
-             refinement_superseded={} refinement_downgrades_staged={}",
+             refinement_superseded={} refinement_downgrades_staged={} \
+             refinement_follow_ups={}",
             reading.snapshot_refresh_last_us,
             reading.snapshot_refresh_max_us,
             reading.snapshot_refresh_count,
@@ -523,6 +535,7 @@ impl WindowDetectionMetrics {
             reading.refinement_inflight_timeouts,
             reading.refinement_superseded,
             reading.refinement_downgrades_staged,
+            reading.refinement_follow_ups,
         )
     }
 
@@ -574,6 +587,7 @@ impl WindowDetectionMetrics {
             &counters.refinement_inflight_timeouts,
             &counters.refinement_superseded,
             &counters.refinement_downgrades_staged,
+            &counters.refinement_follow_ups,
         ] {
             counter.store(0, Ordering::Relaxed);
         }
@@ -689,6 +703,7 @@ mod tests {
             "refinement_inflight_timeouts=",
             "refinement_superseded=",
             "refinement_downgrades_staged=",
+            "refinement_follow_ups=",
         ] {
             assert!(line.contains(expected), "missing {expected} in: {line}");
         }
@@ -703,6 +718,7 @@ mod tests {
         metrics.record_refinement_inflight_timeout();
         metrics.record_refinement_superseded();
         metrics.record_refinement_downgrade_staged();
+        metrics.record_refinement_follow_up();
         metrics.reset();
         assert_eq!(metrics.reading(), WindowDetectionReading::default());
     }

@@ -73,7 +73,8 @@ use crate::capture::session::{CaptureSession, ExportOutcome};
 use crate::capture::window_detection::model::RequestId;
 use crate::capture::window_detection::{
     DEFAULT_DWELL_MS, DEFAULT_HOVER_REVALIDATE_MS, DEFAULT_SNAP_RADIUS_PX, DeepTarget, Exclusions,
-    GestureState, HoverValidity, MoveOutcome, PressOutcome, RefinementOutcome, RefinementScheduler,
+    GestureState, HoverValidity, MoveOutcome, PressOutcome, RefinementJob, RefinementOutcome,
+    RefinementScheduler,
     ReleaseOutcome, Replacement, WindowSnapshot, WindowTarget, classify_replacement,
     preview_bounds,
 };
@@ -82,7 +83,7 @@ use crate::capture::{CaptureError, CaptureResult, CaptureState};
 use super::capture_worker::{self, CaptureWorker, StartRequest};
 use super::detection_worker::{self, DetectionResult, DetectionWorker};
 use super::export_worker::{self, ExportJob, ExportWorker};
-use super::refinement_worker::{self, RefinementWorker};
+use super::refinement_worker::{self, RefinementResult, RefinementWorker};
 use super::hotkey;
 use super::monitor::{self, CapturedMonitor};
 use super::providers::{FrozenFrame, FrozenFramePixels};
@@ -1762,6 +1763,7 @@ where
         );
         self.refinement_pending = None;
         self.refresh_preview_for_cursor();
+        self.submit_follow_up();
     }
 
     /// Arm the one-shot refinement dwell timer for the current target.
@@ -1792,9 +1794,24 @@ where
         // The timer is periodic by nature; killing it here is what makes the dwell a
         // one-shot. A new hover re-arms it.
         unsafe { KillTimer(self.window, REFINEMENT_TIMER_ID) };
-        let Some(job) = self.refine.on_dwell_due() else {
-            return;
-        };
+        if let Some(job) = self.refine.on_dwell_due() {
+            self.submit_refinement(job);
+        }
+    }
+
+    /// The single-flight slot just freed: issue the position a dwell was deferred for, if any.
+    fn submit_follow_up(&mut self) {
+        if let Some(job) = self.refine.take_follow_up() {
+            self.metrics.record_refinement_follow_up();
+            // An answer for the current position is on its way again: hold the verified
+            // rectangle instead of letting the preview fall back to the whole window.
+            self.refinement_pending = Some(Instant::now());
+            self.submit_refinement(job);
+        }
+    }
+
+    /// Hand one scheduled query to the worker.
+    fn submit_refinement(&mut self, job: RefinementJob) {
         // The query needs the window frame; it comes from the same snapshot the hover came
         // from, so a window that vanished simply skips its query.
         let Some(bounds) = self.snapshot.find(job.window).map(|candidate| candidate.screen_bounds)
@@ -1827,6 +1844,13 @@ where
         let Some(result) = self.refinement.take_result() else {
             return;
         };
+        self.apply_refinement_result(result);
+        // Whatever happened to this answer, a position whose dwell expired while it ran has not
+        // been asked about yet.
+        self.submit_follow_up();
+    }
+
+    fn apply_refinement_result(&mut self, result: RefinementResult) {
         match result.outcome {
             RefinementOutcome::Target(target) => {
                 if !self
