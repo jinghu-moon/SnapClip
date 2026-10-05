@@ -21,7 +21,7 @@ use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::{
     Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT, WPARAM},
@@ -108,6 +108,12 @@ const HOVER_TIMER_ID: usize = 0x51_C0E0;
 /// [`crate::capture::window_detection::REFINEMENT_DWELL_MS`] (docs/18 §2). Expiry only
 /// *enqueues* a refinement query; the accessibility traversal runs on its own thread.
 const REFINEMENT_TIMER_ID: usize = 0x51_C0E1;
+
+/// How long the preview is withheld while waiting for a deep query to answer.
+///
+/// Long enough to cover the refinement dwell plus a normal query (measured 2–76 ms), short
+/// enough that a stuck or unsupported provider still degrades to the v1 window frame promptly.
+const REFINEMENT_HOLD_MS: u32 = 320;
 /// `TrackMouseEvent` flag asking for a `WM_MOUSELEAVE` notification.
 const TME_LEAVE: u32 = 0x0000_0002;
 /// `SWP_SHOWWINDOW`.
@@ -427,6 +433,13 @@ where
     /// A cursor merely passing through a parent container produces one such result; displaying
     /// it immediately is what made the frame grow and shrink again on the way from A to B.
     pending_downgrade: Option<(Rect, Point)>,
+    /// When a refinement query was armed for the current hover.
+    ///
+    /// While it is outstanding the preview is withheld instead of falling back to the whole
+    /// window: the preview dwell (120 ms) can fire before the refinement dwell (80 ms) *plus*
+    /// its query has finished, which made the frame appear as the whole window first and shrink
+    /// to the real box a moment later (docs/18 §13.4).
+    refinement_hold: Option<Instant>,
     metrics: WindowDetectionMetrics,
     /// Dwell generation the pending timer was armed for.
     dwell_armed: Option<u64>,
@@ -522,6 +535,7 @@ where
             refinement,
             deep_target: None,
             pending_downgrade: None,
+            refinement_hold: None,
             metrics,
             dwell_armed: None,
             snap_radius: DEFAULT_SNAP_RADIUS_PX,
@@ -936,6 +950,7 @@ where
         self.refine.reset();
         self.deep_target = None;
         self.pending_downgrade = None;
+        self.refinement_hold = None;
         self.disarm_refinement();
         self.refinement.retire();
         self.cursor_visible = false;
@@ -1260,6 +1275,7 @@ where
         self.refine.reset();
         self.deep_target = None;
         self.pending_downgrade = None;
+        self.refinement_hold = None;
         self.disarm_refinement();
         self.refinement.retire();
         self.snapshot.release();
@@ -1385,6 +1401,11 @@ where
             self.refinement.retire();
         }
         if actions.arm_dwell {
+            // A refinement is on its way for this hover: the preview waits for it rather than
+            // showing the whole window first.
+            if self.refinement_hold.is_none() {
+                self.refinement_hold = Some(Instant::now());
+            }
             self.arm_refinement();
         } else {
             self.disarm_refinement();
@@ -1545,6 +1566,19 @@ where
         let target = self.snapshot.nearest_target(screen, self.snap_radius);
         self.metrics.record_nearest_target(started.elapsed());
         let target = target?;
+        // Withhold the preview until the deep query answers, so the first thing the user sees
+        // for a window is the control they are pointing at — not the whole window (docs/18 §13.4).
+        // The hold is bounded: a stuck or unsupported provider still degrades to the v1 frame.
+        let deep_ready = self
+            .deep_target
+            .as_ref()
+            .is_some_and(|deep| deep.window == target.identity() && deep.covers(screen));
+        if !deep_ready
+            && let Some(armed_at) = self.refinement_hold
+            && armed_at.elapsed() < Duration::from_millis(u64::from(REFINEMENT_HOLD_MS))
+        {
+            return None;
+        }
         // v2: when the refinement worker published a path for this window that covers the
         // cursor, the preview follows the deepest element instead of the whole frame.
         // Anything else — no provider, a partial path that does not cover the point, a
@@ -1766,8 +1800,13 @@ where
                     .refine
                     .on_result(result.request, result.epoch, (*target).clone())
                 {
+                    // A superseded result (another window's query, or one whose point the cursor
+                    // has left) must not lift the hold for the question we are still waiting on.
                     return;
                 }
+                // The current question has been answered: the preview may fall back to the v1
+                // frame again, or use the published path immediately.
+                self.refinement_hold = None;
                 // A downgrade (a shallower target that still contains what is on screen) is by
                 // far the most likely reading of "the cursor passed through a parent
                 // container". Show it only once the next dwell reproduces it at the same
@@ -1813,6 +1852,7 @@ where
             RefinementOutcome::Empty(reason) => {
                 // Free the single-flight slot so the next dwell can try again.
                 if self.refine.on_failure(result.request) {
+                    self.refinement_hold = None;
                     self.metrics.record_refinement_empty();
                     self.metrics
                         .log_line(&format!("refinement empty reason={reason:?}"), false);
