@@ -1034,3 +1034,42 @@ job 转交。两端从此共用一个 id 空间，任何一侧 `reset()/retire()
 修复版通过（0.27 s）**——这是"第二次 F5 失效"在真实 accessibility 栈上的红→绿证据。
 
 `cargo test --lib` 353 passed / 0 failed，`cargo check --all-targets` 0 warnings。
+
+### 12.17 实机复验（产品确认，2026-10-05）
+
+三轮修复（`5ca3b11` id 空间、`2e7d85c` 预览回退策略 + 预算/看门狗、`c1e118c` 真实栈端到端回归）
+在 4K/DPI144/单屏 WGC、Windows 资源管理器上复验通过。
+
+**① 连续 9 次 F5（每次都在窗口内停稳）——"第二次起失效"不再出现**：
+
+```text
+session 1  refinement_submitted=1  refinement_published=1  last=26 ms
+session 2  refinement_submitted=1  refinement_published=1  last=19 ms
+session 3  refinement_submitted=1  refinement_published=1  last=26 ms
+session 4  refinement_submitted=1  refinement_published=1  last=20 ms
+session 5  refinement_submitted=1  refinement_published=1  last=24 ms
+session 6  refinement_submitted=0  refinement_published=0              （F5 太快，没到 80 ms 停稳）
+session 7  refinement_submitted=0  refinement_published=0
+session 8  refinement_submitted=1  refinement_published=0              （提交瞬间被下一次 F5 打断）
+session 9  refinement_submitted=2  refinement_published=2  last=20 ms  ← 紧接着就恢复正常
+```
+
+session 8/9 是这次修复最直接的证据：**会话在提交后立刻被 F5 打断，留下一个在途查询，下一次会话
+照样能提交并发布**。修复前从第二次会话起 `refinement_published` 恒为 0。
+
+**② 连续移动（真实手感）**：
+
+```text
+session 10  mouse_move_coalesced_count=4305  hover_target_switch_count=1
+            refinement_submitted=43  refinement_published=38  refinement_empty=0
+            refinement_latency_buckets <32ms=2 <64ms=36      （全部 16–64 ms）
+            refinement_inflight_timeouts=0   errors=0
+```
+
+同一窗口内 `submitted(43) ≫ 窗口切换(1)`：精化在**控件之间**持续跟随光标；38/43 发布成功，
+5 次是查询完成前光标已移开（协作式取消），无一次失败、无一次超时。会话汇总行新增的
+`refinement_inflight_timeouts` 全程为 0，说明 §12.16 的看门狗在本轮负载下从未触发，
+`REFINEMENT_BUDGET_MS` 也从未被真正用尽。
+
+产品侧判定：四个验收场景（父级→子级 / 子级→父级 / A→B / 连续移动）与"多次 F5"全部通过，
+预览不再出现整窗中间态。
