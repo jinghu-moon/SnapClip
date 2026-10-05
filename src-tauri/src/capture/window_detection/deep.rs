@@ -195,7 +195,10 @@ struct PendingTarget {
 /// * a query is only issued after the cursor has been still for [`REFINEMENT_DWELL_MS`];
 /// * at most one query is in flight (single-flight);
 /// * a new target invalidates the in-flight query instead of queueing it (latest point);
-/// * a complete cached path answers further cursor movement without touching the worker;
+/// * **every** cursor position is re-queried on its own dwell: the point decides the target,
+///   never the previous result (docs/18 §13). The provider's expanded-level cache is what makes
+///   those repeats cheap (measured 2.3–6.7 ms), and it is the only way a point that moves from a
+///   container into a child element can ever resolve to the child;
 /// * a snapshot epoch change invalidates both the query and the cache.
 #[derive(Debug, Default)]
 pub struct RefinementScheduler {
@@ -242,15 +245,15 @@ impl RefinementScheduler {
         {
             self.cached = None;
         }
-        if let Some((_, cached)) = self.cached.as_ref()
-            && cached.stop_reason.is_complete()
-            && cached.covers(point)
-        {
-            // Moving inside a fully resolved path must not touch the worker.
-            self.pending = None;
-            return actions;
-        }
-
+        // **Every** cursor position that has a window is a new question.
+        //
+        // An earlier revision skipped the query while the point stayed inside the published
+        // path, on the reference selector's "moving through complete cached paths must not
+        // touch the worker" rule. That rule is only sound when the *whole tree* under the point
+        // is cached: the published path is just the resolved chain, so once the target was a
+        // container every point inside it was "covered" and the deeper element under the
+        // cursor could never be found — the reported "parent → child never switches" defect.
+        // Re-querying is cheap because the provider keeps its expanded levels.
         self.pending = Some(PendingTarget {
             window,
             epoch,
@@ -442,7 +445,12 @@ mod tests {
     }
 
     #[test]
-    fn a_complete_cached_path_answers_movement_without_the_worker() {
+    fn moving_inside_the_published_path_still_re_queries() {
+        // The published path is only the *resolved chain*, not the whole tree under the point:
+        // a container that covers the cursor also covers every child inside it, so reusing it
+        // for a new point is exactly how "parent → child never switches" was produced
+        // (docs/18 §13). Every position gets its own dwell; the provider's expanded-level cache
+        // is what keeps the repeats cheap.
         let mut scheduler = RefinementScheduler::new();
         let job = submit(&mut scheduler, 1, Point::new(150, 150));
         assert!(scheduler.on_result(
@@ -451,14 +459,21 @@ mod tests {
             deep_target(TargetKind::UiElement, rect(100, 100, 300, 300), StopReason::Complete)
         ));
 
-        // Moving inside the resolved element: no dwell, no worker, the path still answers.
+        // Moving *inside the resolved element* arms a fresh dwell: the deeper element under the
+        // new point may still be a child of it.
         let actions = scheduler.on_cursor_moved(1, Some(window(0x100)), Point::new(200, 200));
-        assert_eq!(actions, SchedulerActions::default());
-        assert!(scheduler.on_dwell_due().is_none());
-        assert!(scheduler.cached().is_some());
-        assert!(scheduler.cached().unwrap().covers(Point::new(200, 200)));
+        assert!(
+            actions.arm_dwell,
+            "a point inside the published path is a new question, not a cache hit"
+        );
+        assert!(!actions.invalidate_in_flight);
+        let job = scheduler
+            .on_dwell_due()
+            .expect("the dwell expiry issues a query for the new point");
+        assert_eq!(job.point, Point::new(200, 200));
+        assert_eq!(job.window, window(0x100));
 
-        // Leaving the element (but staying in the window) needs a new query.
+        // A point inside a *different* part of the window behaves the same way.
         let actions = scheduler.on_cursor_moved(1, Some(window(0x100)), Point::new(700, 700));
         assert!(actions.arm_dwell);
     }
