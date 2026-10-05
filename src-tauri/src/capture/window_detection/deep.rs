@@ -260,6 +260,14 @@ struct PendingTarget {
 pub struct RefinementScheduler {
     pending: Option<PendingTarget>,
     in_flight: Option<RequestId>,
+    /// The point the in-flight request was issued for. A hand jitters constantly, so a query is
+    /// never cancelled just because the cursor moved a little; the *result* is judged against
+    /// this point when it arrives (docs/18 §13.4).
+    in_flight_point: Option<Point>,
+    /// Most recent cursor point, used for that judgement.
+    last_point: Option<Point>,
+    /// Window the last cursor position resolved to, so a *window* change is what cancels.
+    last_window: Option<WindowIdentity>,
     requests: RequestGate,
     cached: Option<(SnapshotEpoch, DeepTarget)>,
 }
@@ -280,9 +288,14 @@ impl RefinementScheduler {
         point: Point,
     ) -> SchedulerActions {
         let mut actions = SchedulerActions::default();
-        if self.in_flight.is_some() {
-            // Whatever the worker is computing describes where the cursor *was*.
+        self.last_point = Some(point);
+        let window_changed = self.last_window != window;
+        self.last_window = window;
+        // Only a *different question* cancels a running query: a hand that jitters one pixel
+        // must not keep killing work that is almost done, or precise targets never resolve.
+        if window_changed && self.in_flight.is_some() {
             self.in_flight = None;
+            self.in_flight_point = None;
             actions.invalidate_in_flight = true;
         }
 
@@ -329,6 +342,7 @@ impl RefinementScheduler {
         let pending = self.pending?;
         let request = self.requests.issue();
         self.in_flight = Some(request);
+        self.in_flight_point = Some(pending.point);
         Some(RefinementJob {
             request,
             window: pending.window,
@@ -346,10 +360,18 @@ impl RefinementScheduler {
         if self.in_flight != Some(request) || self.requests.latest() != Some(request) {
             return false;
         }
+        let issued_point = self.in_flight_point.take();
         self.in_flight = None;
         if self.pending.is_some_and(|pending| pending.epoch != epoch) {
             // The snapshot was rebuilt while the query ran; the path may describe stale
             // geometry, so it is not published.
+            return false;
+        }
+        // The answer must still describe where the cursor *is*. A hand that drifted while the
+        // query ran gets its answer from the next dwell instead.
+        if let (Some(issued), Some(current)) = (issued_point, self.last_point)
+            && !points_close(issued, current)
+        {
             return false;
         }
         self.cached = Some((epoch, target));
@@ -366,6 +388,7 @@ impl RefinementScheduler {
             return false;
         }
         self.in_flight = None;
+        self.in_flight_point = None;
         true
     }
 
@@ -373,6 +396,7 @@ impl RefinementScheduler {
     pub fn on_snapshot_changed(&mut self) -> SchedulerActions {
         self.pending = None;
         self.cached = None;
+        self.in_flight_point = None;
         let invalidate = self.in_flight.take().is_some();
         if invalidate {
             self.requests.retire();
@@ -397,9 +421,21 @@ impl RefinementScheduler {
     pub fn reset(&mut self) {
         self.pending = None;
         self.in_flight = None;
+        self.in_flight_point = None;
+        self.last_point = None;
+        self.last_window = None;
         self.cached = None;
         self.requests = RequestGate::new();
     }
+}
+
+/// Points within this many physical pixels count as "the cursor has not moved", for judging a
+/// finished query. Wide enough to absorb hand jitter, far below the 24 px snap radius.
+pub const POINT_MATCH_TOLERANCE_PX: i32 = 4;
+
+fn points_close(left: Point, right: Point) -> bool {
+    (left.x - right.x).abs() <= POINT_MATCH_TOLERANCE_PX
+        && (left.y - right.y).abs() <= POINT_MATCH_TOLERANCE_PX
 }
 
 #[cfg(test)]
@@ -476,12 +512,18 @@ mod tests {
     fn only_the_newest_cursor_position_is_queried() {
         let mut scheduler = RefinementScheduler::new();
         let first = submit(&mut scheduler, 1, Point::new(10, 10));
-        // The cursor moved before the worker answered.
+        // The cursor moved (inside the same window) before the worker answered. A hand jitters
+        // constantly, so the query is *not* cancelled — it is allowed to finish, and the result
+        // is judged against where the cursor is by then.
         let actions = scheduler.on_cursor_moved(1, Some(window(0x100)), Point::new(50, 50));
-        assert!(actions.invalidate_in_flight);
+        assert!(
+            !actions.invalidate_in_flight,
+            "a same-window jitter must not cancel work that is almost done"
+        );
         assert!(actions.arm_dwell);
 
-        // The stale result is rejected...
+        // The stale result is rejected because the cursor is no longer at the point it was
+        // issued for...
         assert!(!scheduler.on_result(
             first.request,
             1,
@@ -616,7 +658,8 @@ mod tests {
 
         // A superseded request must not be able to free the slot of a newer one.
         let first = submit(&mut scheduler, 1, Point::new(150, 150));
-        let _second = scheduler.on_cursor_moved(1, Some(window(0x100)), Point::new(160, 160));
+        // Moving to another *window* supersedes the running query instead.
+        let _second = scheduler.on_cursor_moved(1, Some(window(0x200)), Point::new(160, 160));
         assert!(!scheduler.on_failure(first.request));
     }
 
