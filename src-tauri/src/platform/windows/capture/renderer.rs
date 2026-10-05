@@ -47,6 +47,8 @@ pub struct OverlayFrameState {
     pub hover_bounds: Option<Rect>,
     /// Automatic-snap preview, in monitor-local coordinates.
     pub preview_bounds: Option<Rect>,
+    /// Deep-selection ancestor levels (frame → deepest), monitor-local.
+    pub path_bounds: Vec<Rect>,
 }
 
 impl OverlayFrameState {
@@ -65,6 +67,7 @@ impl OverlayFrameState {
             annotation_draft: None,
             hover_bounds: None,
             preview_bounds: None,
+            path_bounds: Vec::new(),
         }
     }
 }
@@ -195,6 +198,7 @@ impl Win32Renderer {
             annotation_draft: live_draft,
             hover_bounds: state.hover_bounds,
             preview_bounds: state.preview_bounds,
+            path_bounds: state.path_bounds.clone(),
         };
         self.d2d.render(&view)?;
         self.d2d.present()?;
@@ -234,6 +238,8 @@ impl Win32Renderer {
             // owns the "no hints in the artifact" invariant.
             hover_bounds: state.hover_bounds,
             preview_bounds: state.preview_bounds,
+            // Hover/preview/path hints are stripped by `OverlayRenderer::render_export`.
+            path_bounds: state.path_bounds.clone(),
         };
         self.d2d.render_export(&view)
     }

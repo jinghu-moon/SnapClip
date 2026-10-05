@@ -1018,6 +1018,7 @@ where
             // The exported pixels must never contain a hover or preview hint.
             hover_bounds: None,
             preview_bounds: None,
+            path_bounds: Vec::new(),
         };
             let Some(renderer) = self.renderer.as_mut() else {
                 self.cancel("annotation-export-without-renderer");
@@ -1277,6 +1278,30 @@ where
         let target = self.hover_target?;
         let rect = window_rect_to_local(target.screen_bounds(), &layout);
         (!rect.is_empty()).then_some(rect)
+    }
+
+    /// The deep-selection ancestor levels in monitor-local coordinates (frame → deepest).
+    ///
+    /// Empty unless the published deep target belongs to the window currently under the
+    /// cursor: a path for another window would draw outlines over unrelated pixels. The
+    /// deepest entry is left out because it is painted as the emphasised hover/preview
+    /// rectangle (docs/18 §12.2 的层级可视化).
+    fn deep_path_local(&self) -> Vec<Rect> {
+        let Some(layout) = self.layout() else {
+            return Vec::new();
+        };
+        let Some(deep) = self.deep_target.as_ref() else {
+            return Vec::new();
+        };
+        if self.hover_target.map(|target| target.identity()) != Some(deep.window) {
+            return Vec::new();
+        }
+        deep.path
+            .iter()
+            .take(deep.path.len().saturating_sub(1))
+            .map(|level| window_rect_to_local(*level, &layout))
+            .filter(|level| !level.is_empty())
+            .collect()
     }
 
     /// Re-resolve the hovered window from the cached snapshot. **Pure cache read.**
@@ -2390,6 +2415,7 @@ where
         // The painted preview is the *eased* rectangle; the gesture keeps the true target
         // for confirmation, so the animation can never change what gets committed.
         let preview_bounds = self.preview_rect;
+        let path_bounds = self.deep_path_local();
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
@@ -2421,6 +2447,7 @@ where
             annotation_draft: self.annotation_doc.draft.clone(),
             hover_bounds,
             preview_bounds,
+            path_bounds,
         };
         // Live borrow of annotation document avoids cloning items every tick.
         match renderer.render(&state, Some(&self.annotation_doc)) {

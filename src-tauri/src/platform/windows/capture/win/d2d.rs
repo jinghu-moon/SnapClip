@@ -215,6 +215,11 @@ pub struct RenderView {
     /// Automatic-snap preview, in back-buffer coordinates. Painted as its own layer so a
     /// preview can never be confused with a confirmed selection.
     pub preview_bounds: Option<Rect>,
+    /// Deep-selection ancestors (frame → deepest), in back-buffer coordinates.
+    ///
+    /// Only the *levels* are painted here; the deepest entry is drawn by
+    /// `hover_bounds`/`preview_bounds` so the emphasised rectangle is never duplicated.
+    pub path_bounds: Vec<Rect>,
 }
 
 impl RenderView {
@@ -241,6 +246,7 @@ impl RenderView {
             annotation_draft: None,
             hover_bounds: None,
             preview_bounds: None,
+            path_bounds: Vec::new(),
         }
     }
 }
@@ -525,6 +531,7 @@ impl OverlayRenderer {
         let view = &RenderView {
             hover_bounds: None,
             preview_bounds: None,
+            path_bounds: Vec::new(),
             ..view.clone()
         };
         let (frame_w, frame_h) = self.size;
@@ -693,11 +700,28 @@ impl OverlayRenderer {
     /// selection: they are independent layers, which is what stops a preview from
     /// silently rewriting a settled selection.
     fn draw_window_hints(&mut self, view: &RenderView) -> Result<(), String> {
-        if view.hover_bounds.is_none() && view.preview_bounds.is_none() {
+        if view.hover_bounds.is_none()
+            && view.preview_bounds.is_none()
+            && view.path_bounds.is_empty()
+        {
             return Ok(());
         }
         let border = self.require_brush(&self.border_brush, "border brush")?;
         let width = self.metrics.border_width;
+
+        // Ancestor levels of the deep-selection path: outline only, thin, drawn first so the
+        // emphasised rectangle below sits on top of them. The deepest entry is deliberately
+        // not drawn from here — it is the hover/preview rectangle.
+        let emphasised = view.preview_bounds.or(view.hover_bounds);
+        for level in &view.path_bounds {
+            let rect = level.intersect(view.frame);
+            if rect.is_empty() || Some(rect) == emphasised {
+                continue;
+            }
+            unsafe {
+                self.d2d.DrawRectangle(&to_d2d(rect), &border, width, None);
+            }
+        }
 
         if let Some(hover) = view.hover_bounds {
             let rect = hover.intersect(view.frame);
@@ -2212,6 +2236,20 @@ mod tests {
             "the preview must be distinguishable from the hover hint"
         );
 
+        // Deep-selection ancestors are outlined so the nesting is visible; the level that is
+        // also the emphasised rectangle is skipped instead of being stroked twice.
+        let ancestor = Rect::new(4, 4, 44, 36);
+        view.hover_bounds = None;
+        view.preview_bounds = Some(window);
+        view.path_bounds = vec![ancestor, window];
+        renderer.draw_to(&bitmap, &view).unwrap();
+        let with_path = renderer.device().read_back_bgra(&target.texture).unwrap();
+        assert_ne!(
+            sample(&with_path, 24, 4),
+            masked,
+            "an ancestor level must be outlined"
+        );
+
         // Exporting the previewed rectangle must produce raw frozen pixels: a hint is a
         // hint, and it must never reach the artifact.
         view.hover_bounds = Some(window);
@@ -2476,5 +2514,3 @@ mod tests {
         );
     }
 }
-
-
