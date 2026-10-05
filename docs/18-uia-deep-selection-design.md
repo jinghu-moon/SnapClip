@@ -9,6 +9,23 @@
 >
 > 适用平台：Windows 10/11 x64，Per-Monitor-V2 DPI awareness
 
+> **浏览器实测修订（2026-10-05，2026-10-06 补齐）**：本文件早期的“完整缓存路径内移动不得触碰
+> refinement”及“点内最小矩形胜出”规则已被后续实测取代。**当前实现**的规则是：
+>
+> - 每个新的光标位置都重新查询；缓存只记住 provider 已展开的 batch，且**空层不缓存**——
+>   浏览器无障碍树惰性物化，节点会先答 `raw=0`/占位 `Pane(0,0)-(0,0)`、随后才列出子节点，
+>   缓存那次空答案会把整个 generation 钉在粗框上（docs/21 §5.6 B）；
+> - Chromium 同层候选按 **provider 顺序**（最后列出者优先）；死胡同时只允许**与父同边界**的
+>   `Pane`/`Group` 回溯到更早的兄弟；面积不再是主排序（docs/21 §5.4）；
+> - **带边框的 `Pane`/`Group` 认领自己的 `Text` 跑条**，交互控件**不**认领——Explorer 把整个
+>   虚拟化列表暴露成一个 `DataItem`，认领会让答案变成容器（docs/21 §5.6 A）。
+>
+> **尚未实现**（不要按"已实现"调用）：`StopReason::AccessibilityPending`（惰性树由"空层重读 +
+> 下一次 dwell"与探针的"等树就绪、否则 skip"处理，因此当前**不需要**该变体）；以
+> `ElementFromPoint` 作为候选来源 + `CompareElements` 归属校验属于**可选增强**，实测与方案见
+> docs/21 §2.3/§3/§5.3，当前实现仍从 `ElementFromHandle` 根下钻。
+> 本文历史取证章节保留旧行为仅用于解释缺陷，不是当前实现规范。
+
 ## 1. 范围与不变量
 
 v2 在 v1 整窗吸附之上增加**子控件深选**：光标停稳后，把目标从「顶层窗口外框」细化到「客户区」或
@@ -33,7 +50,7 @@ v2 在 v1 整窗吸附之上增加**子控件深选**：光标停稳后，把目
 | `QTimer` 单次精确计时，`remaining = 80 - (now - targetChangedAt)` | 光标停稳 **80 ms**（`REFINEMENT_DWELL_MS`）后才提交 refinement；目标变化重新计时 |
 | `if (!ready \|\| hitTestInFlight \|\| hasPendingHitTestPoint \|\| refinementSubmitted)` 守卫 | **单飞**：同一时刻最多一个 refinement 在飞；有未消费的最新点时不提交 |
 | `invalidateRefinement()` + `cancelRefinement()` | 光标移动、按下、拖拽、快照 epoch 变化、显示器变化、会话结束 → 使在途请求失效 |
-| 「在完整缓存路径内移动不得触碰 refinement worker」 | 命中已缓存的深选路径时**不触发** refinement，直接复用 |
+| 「当前位置决定目标」 | 每个新的光标位置都重新触发 refinement；性能由 provider 的已展开批次缓存承担，不能由已发布路径抑制查询 |
 | `emit refinementReady(rects, displayId, replacePath)` | 结果发布携带 `replace_path` 语义：新路径要么替换、要么仅扩展 |
 
 ## 3. 预算、降级与隔离
@@ -46,7 +63,11 @@ v2 在 v1 整窗吸附之上增加**子控件深选**：光标停稳后，把目
 | refinement（v2 深选） | **1500 ms** | **500 ms** | **32 ms** | 是 |
 
 `StopReason`（沿用参考的枚举语义）：`Complete` / `BudgetExhausted` / `TraversalLimit` /
-`ProviderTimeout` / `ProviderFailure` / `Cancelled` / `Unsupported`。
+`ProviderTimeout` / `ProviderFailure` / `Cancelled` / `Unsupported`（**代码现状**，与参考实现相比
+缺 `AccessibilityPending`/`DecodingPending`）。参考实现里的 `AccessibilityPending` 表示"浏览器
+无障碍树仍在惰性物化"，我们**不用新增该变体**来覆盖它：provider 侧"空层不缓存、下次重查"
+（docs/21 §5.6 B）+ 调度侧每次 dwell 重发，已经让下一次查询自然收敛；探针侧则要求"等树就绪，
+否则 skip"。
 
 降级规则：
 
@@ -82,7 +103,7 @@ enum StopReason { Complete, BudgetExhausted, TraversalLimit, ProviderTimeout,
 ## 5. 线程模型
 
 ```text
-overlay 线程       : 80ms 停稳计时、命中缓存路径、绘制层级、单击确认（提交矩形）
+overlay 线程       : 80ms 停稳计时、读取已验证路径用于绘制、单击确认（提交矩形）；新点仍触发 refinement
 detection worker   : v1（EnumWindows/DWM/validate）—— v2 不新增任何调用
 refinement worker  : 独立 COM apartment；UIA（主）/MSAA（回退）；预算、取消、quarantine
 结果传递           : refinement -> overlay：PostMessage + epoch/request id 校验
@@ -102,7 +123,7 @@ refinement worker 的邮箱是**容量 1 的最新点**模型（与 detection wo
 
 | 阶段 | 内容 | 验收 |
 | --- | --- | --- |
-| v2-P0 | 契约（`TargetKind` 扩展、`DeepTarget`、`StopReason`）与**纯净调度状态机**（80ms 停稳、单飞、最新点合并、epoch 失效、缓存路径复用） | 纯单测覆盖全部分支；不需要 COM |
+| v2-P0 | 契约（`TargetKind` 扩展、`DeepTarget`、`StopReason`）与**纯净调度状态机**（80ms 停稳、单飞、最新点合并、epoch 失效、每点重新查询） | 纯单测覆盖全部分支；不需要 COM |
 | v2-P1 | refinement worker + 容量 1 邮箱 + 取消/超时；用假 provider 打通线程语义 | 线程/取消/超时/陈旧丢弃单测 |
 | v2-P2 | UIA provider：COM apartment、按需展开、批次缓存、预算与 `stop_reason`、quarantine | 真机 UIA 探针（记事本/浏览器/资源管理器） |
 | v2-P3 | MSAA 回退 provider | MSAA 探针 + 回退顺序 |
@@ -112,7 +133,7 @@ refinement worker 的邮箱是**容量 1 的最新点**模型（与 detection wo
 ## 8. 测试计划要点
 
 - 调度：停稳 80ms 才提交；连续移动只保留最新点；单飞期间的新点排队而非并发提交；
-  命中缓存路径不触发 refinement；epoch 变化丢弃在途结果。
+  每个新光标位置都触发 refinement，provider 缓存已展开批次；epoch 变化丢弃在途结果。
 - 预算：总预算耗尽发布部分路径 + `BudgetExhausted`；单次调用超时 → `ProviderTimeout` 并 quarantine。
 - 遍历：深度/节点/矩形上限触发 `TraversalLimit`；结构容器回溯不产生重复矩形。
 - 隔离：`capture/window_detection/**` 编译期不含 COM/UIA 引用（可用 `rg` 静态检查断言）；
@@ -125,7 +146,7 @@ refinement worker 的邮箱是**容量 1 的最新点**模型（与 detection wo
 `TargetKind` 增加 `ClientArea`/`UiElement`（`is_refined()`），新增
 `capture/window_detection/deep.rs`：`StopReason`、`DeepTarget`、`RefinementScheduler`、
 `QueryControl`、`DeepSelectionProvider`、`UnsupportedDeepSelection`。
-调度规则全部有单测：80 ms 停稳、单飞、最新点合并、epoch 失效、完整缓存路径复用、
+调度规则全部有单测：80 ms 停稳、单飞、最新点合并、epoch 失效、每点重新查询、
 部分路径不复用、失败释放单飞槽。
 
 ### v2-P1（本次提交）
@@ -247,11 +268,11 @@ v1 的 `auto-snap preview` 目标行保持不变，错误 0。
 | 已完成 | 内容 |
 | --- | --- |
 | 依赖 | `Cargo.toml` 的 `windows` features 增加 `Win32_UI_Accessibility`（`IUIAutomation` 所在地） |
-| 纯遍历策略 | `capture/window_detection/uia.rs`：`WalkNode`/`WalkBudget`/`WalkOutcome`、`deepest_child_at`（点内最小矩形胜出）、`is_descendable`（越界/离屏/退化子节点拒绝）、`is_structural_container`（同边界容器继续下钻）、路径去重与 `MAX_PATH_LEN` 上限；7 项单测 |
+| 纯遍历策略 | `capture/window_detection/uia.rs`：`WalkNode`/`WalkBudget`/`WalkOutcome`、可展开内容分支优先、provider 顺序优先于面积、`is_descendable`（越界/离屏/退化子节点拒绝）、同边界容器继续下钻、路径去重与 `MAX_PATH_LEN` 上限；7 项单测 |
 
 策略层的三条关键规则都有测试固定：
 
-1. **点内最小矩形胜出** —— 控件优先于包住它的容器；
+1. **可继续展开的内容分支胜出** —— 面积不能把 Chromium 的死叶子选在真实内容分支之前；同级可展开候选按 provider 顺序裁决，面积仅作同级次级排序；
 2. **结构性容器必须下钻**（与父节点同边界的 `Pane`/`Group` 不作为最终答案），这是 Chromium 系应用内容不被结构分支吞掉的前提；
 3. **离屏/退化/父框外子节点一律拒绝**，预算耗尽或路径超长 → `TraversalLimit`。
 
@@ -262,9 +283,11 @@ v1 的 `auto-snap preview` 目标行保持不变，错误 0。
 - **COM 在 refinement 线程上惰性初始化**：provider 由 worker 通过 **factory** 构造
   （`ProviderFactory`），而不是把值搬过线程——`IUIAutomation` 不是 `Send`，且设计要求
   apartment 对象在其使用线程上创建；
-- `ElementFromHandle(窗口)` 起手（**不**回退到 `ElementFromPoint`：查询是「关于这个窗口」的，
-  用点命中会回答到另一个窗口的几何，属于凭空捏造），失败即 quarantine 并返回 `Unsupported`；
-- `RawViewWalker` 按 §3 的策略自顶向下展开（点内最小矩形胜出、同边界容器继续下钻、
+- 默认以已命中的窗口 `ElementFromHandle(窗口)` 建立归属根；Chromium 浏览器元素查询允许
+  `ElementFromPoint` 提供候选，但必须沿 parent chain 用 `CompareElements` 回到该根，并校验
+  PID/窗口 identity/矩形。无法证明归属即丢弃并回落整窗，不能用 point hit 重新发现窗口；
+- `RawViewWalker` 按 §3 的策略自顶向下展开（可继续下钻/内容分支优先，provider 顺序优先于面积，
+  同边界容器继续下钻，
   越界/离屏/退化子节点拒绝），受 `WalkBudget`（4096 节点 / 24 层 / 24 段路径）与
   `QueryControl::is_cancelled` 约束；
 - 结果映射为 `DeepTarget`：`path[0]` = 窗口外框，`kind` 在真正下钻后为 `UiElement`，
@@ -281,7 +304,8 @@ refinement published hwnd=5967024 bounds=(0,47)->(3840,2088) depth=4 reason=Comp
 
 `depth=4` 说明路径是「窗口外框 → … → 元素」四层；发布矩形 `(0,47)` 比窗口帧 `(0,0)` 内缩 47px，
 即解析到了窗口内的内容区而不是回退整窗；`reason=Complete`。第二次停稳**没有**再触发查询，
-说明「完整缓存路径内移动不得触碰 refinement worker」在生产路径上生效。
+说明 provider 的层级缓存已生效；调度器仍会对每个新的光标位置重新查询，避免父级已发布矩形
+覆盖子级而抑制目标更新。
 
 ### 待完成
 
@@ -327,7 +351,7 @@ refinement published hwnd=5967024 bounds=(0,47)->(3840,2088) depth=4 reason=Comp
 
 `uia_provider.rs` 现在在 refinement 线程上惰性构建一个
 `IUIAutomationCacheRequest`（`AddProperty` × 3：`BoundingRectangle` / `ControlType` / `IsOffscreen`，
-`SetTreeScope(TreeScope_Children)`），遍历改为：
+`SetTreeScope(TreeScope_Element | TreeScope_Children)`），遍历改为：
 
 ```text
 每层：BuildUpdatedCache(request) ×1  →  GetCachedChildren() ×1  →  逐子节点读 Cached*（进程内）
@@ -406,7 +430,8 @@ children: HashMap<(isize, i32, i32, i32, i32), Vec<(IUIAutomationElement, WalkNo
 cache_epoch: Option<SnapshotEpoch>
 ```
 
-- 命中即跳过 `BuildUpdatedCache` + `GetCachedChildren`，直接用已读几何做「点内最小矩形」裁决；
+- provider 内部可命中已展开 batch 时，跳过重复的 `BuildUpdatedCache` + `GetCachedChildren`；
+  这不改变调度器对每个新光标位置重新查询的语义，且当前候选不能由旧缓存解释时必须重读；
 - 表按快照 epoch 失效：`resolve` 入口 `sync_cache_epoch(job.epoch)`，`release()` 整表清空；
 - 键用「父节点矩形」而非 COM 指针：同一窗口内同矩形的节点对命中测试等价，正好对上策略层
   「同边界容器」的处理方式。
