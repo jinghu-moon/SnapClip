@@ -12,12 +12,6 @@
 //! Capacity is what keeps abandoned calls from turning into an unbounded thread leak: a call
 //! that timed out keeps holding its slot until it actually returns.
 
-// The MSAA provider that consumes this runner lands in the next step (it needs
-// `Win32_System_Variant` + `VARIANT` plumbing for `accHitTest`/`accLocation`). Until then only
-// this module's tests exercise it; remove this attribute together with that provider
-// (docs/18 §12.11).
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -52,10 +46,16 @@ impl TimedCallRunner {
         }
     }
 
+    /// Slots currently held, including abandoned calls that have not returned yet.
+    ///
+    /// Only diagnostics and tests read this today; the MSAA provider acts on the outcome
+    /// instead of inspecting the counter.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn in_flight(&self) -> usize {
         self.in_flight.load(Ordering::SeqCst)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn max_in_flight(&self) -> usize {
         self.max_in_flight
     }
