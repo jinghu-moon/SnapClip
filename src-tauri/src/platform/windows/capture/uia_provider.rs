@@ -302,12 +302,14 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
         control: &QueryControl<'_>,
     ) -> RefinementOutcome {
         if self.quarantined.contains(&job.window.hwnd) {
+            self.metrics.record_refinement_quarantine_hit();
             return RefinementOutcome::Empty(StopReason::Unsupported);
         }
         // Clone the interface pointer so the immutable borrow of `self` ends before any
         // quarantine bookkeeping below.
         let Some(automation) = self.automation().cloned() else {
             self.quarantined.insert(job.window.hwnd);
+            self.metrics.record_refinement_quarantine_added();
             return RefinementOutcome::Empty(StopReason::Unsupported);
         };
 
@@ -320,6 +322,7 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
             Ok(element) => element,
             Err(_) => {
                 self.quarantined.insert(job.window.hwnd);
+                self.metrics.record_refinement_quarantine_added();
                 return RefinementOutcome::Empty(StopReason::Unsupported);
             }
         };

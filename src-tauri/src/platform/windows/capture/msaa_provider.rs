@@ -60,6 +60,7 @@ impl MsaaDeepSelectionProvider {
 
     fn quarantine(&mut self, hwnd: isize, why: &str) {
         if self.quarantined.insert(hwnd) {
+            self.metrics.record_refinement_quarantine_added();
             self.metrics.log_line(
                 &format!("msaa quarantine hwnd={hwnd} why={why}"),
                 false,
@@ -77,6 +78,7 @@ impl DeepSelectionProvider for MsaaDeepSelectionProvider {
     ) -> RefinementOutcome {
         let hwnd = job.window.hwnd;
         if self.quarantined.contains(&hwnd) {
+            self.metrics.record_refinement_quarantine_hit();
             return RefinementOutcome::Empty(StopReason::Unsupported);
         }
         if control.is_cancelled() {

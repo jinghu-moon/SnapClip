@@ -771,6 +771,35 @@ refinement_submitted=5  published=5  empty=0
 **已知小缺口**：`refinement_msaa_*` 计数已记录但**尚未出现在会话汇总行**（格式串漏加），
 下次一并补上——本轮不以「看似完整」掩盖它。
 
+### 12.13 P5 已完成：汇总行补齐 + 延迟分布 + quarantine 统计
+
+- **汇总行补齐**：`refinement_msaa_attempts/timeouts/busy/failures` 已进入会话汇总；断言
+  「汇总行包含全部指标名」的单测同步扩展（上一轮漏项被测试兜住）。
+- **延迟分布**：新增 5 档直方图（`<16ms / <32ms / <64ms / <256ms / >=256ms`）。分档依据是
+  该功能的可感阈值：32 ms 以下相对 80 ms 防抖不可感知，32–64 ms 在快速掠过多个控件时开始可感，
+  最高档才是 quarantine 真正发挥作用的地方。`record_refinement_published` 自动入桶。
+- **quarantine 统计**：`refinement_quarantine_added`（被隔离的窗口数）与
+  `refinement_quarantine_hit`（**直接从隔离回答、完全没碰 provider** 的查询数）——后者就是这套
+  机制省下的调用量；UIA 与 MSAA 两个 provider 的隔离点都已接入。
+
+**实机复验（资源管理器，重新测试）**：
+
+```text
+published (703,549)->(1036,1520)   depth=13  导航窗格 333×971
+published (1063,985)->(2076,1022)  depth=4   文件项 A  1013×37
+published (1063,1200)->(2076,1237) depth=4   文件项 B  1013×37
+published (1751,427)->(1833,454)   depth=6   命令栏上的**单个按钮** 82×27
+refinement_submitted=5  published=5  empty=0
+refinement_msaa_attempts/timeouts/busy/failures = 0        （UIA 已足够，未触发回退）
+refinement_latency_buckets <32ms=2 <64ms=3                  （全部 16–64 ms）
+refinement_quarantine_added/hit = 0
+errors = 0
+```
+
+命令栏由上一轮的整条 `988×36` 细化到 **`82×27` 的单个按钮**（depth 6），两个文件项各自给出
+自己的行矩形——深选已经落到控件/条目级。`cargo test --lib` 339 passed / 0 failed，
+`cargo check --all-targets` 0 warnings。
+
 **取证过程的一个教训**：第一次取证日志里的停稳点落在 `hwnd=5967024`（全屏最大化窗口），
 **不是资源管理器**——`Shell.Application.Windows()` 每个标签页返回一项，而 Windows 11 上它们
 **共用同一个 HWND**，所以「取最后一个窗口」并不等于「刚打开的那个」。探针已改为按

@@ -69,6 +69,13 @@ struct Counters {
     refinement_msaa_timeouts: AtomicU64,
     refinement_msaa_busy: AtomicU64,
     refinement_msaa_failures: AtomicU64,
+    /// Latency histogram for published refinements: `<16 ms`, `<32 ms`, `<64 ms`, `<256 ms`,
+    /// `>=256 ms`. Replaces guessing at a percentile from last/max alone.
+    refinement_latency_buckets: [AtomicU64; 5],
+    /// Windows sent to quarantine (their provider timed out or is hung).
+    refinement_quarantine_added: AtomicU64,
+    /// Queries answered from quarantine without touching a provider (the saving).
+    refinement_quarantine_hit: AtomicU64,
 }
 
 /// A copyable reading of every counter, for assertions and one-line reports.
@@ -106,6 +113,13 @@ pub struct WindowDetectionReading {
     pub refinement_msaa_timeouts: u64,
     pub refinement_msaa_busy: u64,
     pub refinement_msaa_failures: u64,
+    pub refinement_latency_under_16ms: u64,
+    pub refinement_latency_under_32ms: u64,
+    pub refinement_latency_under_64ms: u64,
+    pub refinement_latency_under_256ms: u64,
+    pub refinement_latency_over_256ms: u64,
+    pub refinement_quarantine_added: u64,
+    pub refinement_quarantine_hit: u64,
 }
 
 /// Shared diagnostics handle for the window-detection pipeline.
@@ -279,6 +293,38 @@ impl WindowDetectionMetrics {
         self.counters
             .refinement_max_us
             .fetch_max(micros, Ordering::Relaxed);
+        self.record_refinement_latency(elapsed);
+    }
+
+    /// Bucket one refinement latency.
+    ///
+    /// The buckets are the ones that matter for this feature: anything under 32 ms is
+    /// imperceptible next to the 80 ms dwell, 32-64 ms starts to be felt when the cursor
+    /// crosses several controls, and the top bucket is where quarantine earns its keep.
+    pub fn record_refinement_latency(&self, elapsed: Duration) {
+        let milliseconds = elapsed.as_millis();
+        let index = match milliseconds {
+            0..=15 => 0,
+            16..=31 => 1,
+            32..=63 => 2,
+            64..=255 => 3,
+            _ => 4,
+        };
+        self.counters.refinement_latency_buckets[index].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A window was quarantined because its provider timed out or is hung.
+    pub fn record_refinement_quarantine_added(&self) {
+        self.counters
+            .refinement_quarantine_added
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A query was answered straight from quarantine, without touching any provider.
+    pub fn record_refinement_quarantine_hit(&self) {
+        self.counters
+            .refinement_quarantine_hit
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// A refinement query came back with nothing usable (unsupported, cancelled, failed).
@@ -363,6 +409,13 @@ impl WindowDetectionMetrics {
             refinement_msaa_timeouts: load(&counters.refinement_msaa_timeouts),
             refinement_msaa_busy: load(&counters.refinement_msaa_busy),
             refinement_msaa_failures: load(&counters.refinement_msaa_failures),
+            refinement_latency_under_16ms: load(&counters.refinement_latency_buckets[0]),
+            refinement_latency_under_32ms: load(&counters.refinement_latency_buckets[1]),
+            refinement_latency_under_64ms: load(&counters.refinement_latency_buckets[2]),
+            refinement_latency_under_256ms: load(&counters.refinement_latency_buckets[3]),
+            refinement_latency_over_256ms: load(&counters.refinement_latency_buckets[4]),
+            refinement_quarantine_added: load(&counters.refinement_quarantine_added),
+            refinement_quarantine_hit: load(&counters.refinement_quarantine_hit),
         }
     }
 
@@ -383,7 +436,9 @@ impl WindowDetectionMetrics {
              refinement_submitted={} refinement_published={} refinement_empty={} \
              refinement_elapsed_us last={} max={} \
              refinement_msaa_attempts={} refinement_msaa_timeouts={} \
-             refinement_msaa_busy={} refinement_msaa_failures={}",
+             refinement_msaa_busy={} refinement_msaa_failures={} \
+             refinement_latency_buckets <16ms={} <32ms={} <64ms={} <256ms={} >=256ms={} \
+             refinement_quarantine_added={} refinement_quarantine_hit={}",
             reading.snapshot_refresh_last_us,
             reading.snapshot_refresh_max_us,
             reading.snapshot_refresh_count,
@@ -416,6 +471,13 @@ impl WindowDetectionMetrics {
             reading.refinement_msaa_timeouts,
             reading.refinement_msaa_busy,
             reading.refinement_msaa_failures,
+            reading.refinement_latency_under_16ms,
+            reading.refinement_latency_under_32ms,
+            reading.refinement_latency_under_64ms,
+            reading.refinement_latency_under_256ms,
+            reading.refinement_latency_over_256ms,
+            reading.refinement_quarantine_added,
+            reading.refinement_quarantine_hit,
         )
     }
 
@@ -457,6 +519,13 @@ impl WindowDetectionMetrics {
             &counters.refinement_msaa_timeouts,
             &counters.refinement_msaa_busy,
             &counters.refinement_msaa_failures,
+            &counters.refinement_quarantine_added,
+            &counters.refinement_quarantine_hit,
+            &counters.refinement_latency_buckets[0],
+            &counters.refinement_latency_buckets[1],
+            &counters.refinement_latency_buckets[2],
+            &counters.refinement_latency_buckets[3],
+            &counters.refinement_latency_buckets[4],
         ] {
             counter.store(0, Ordering::Relaxed);
         }
@@ -562,6 +631,13 @@ mod tests {
             "refinement_published=",
             "refinement_empty=",
             "refinement_elapsed_us",
+            "refinement_msaa_attempts=",
+            "refinement_msaa_timeouts=",
+            "refinement_msaa_busy=",
+            "refinement_msaa_failures=",
+            "refinement_latency_buckets <16ms=",
+            "refinement_quarantine_added=",
+            "refinement_quarantine_hit=",
         ] {
             assert!(line.contains(expected), "missing {expected} in: {line}");
         }
