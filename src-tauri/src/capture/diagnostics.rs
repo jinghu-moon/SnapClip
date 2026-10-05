@@ -76,6 +76,8 @@ struct Counters {
     refinement_quarantine_added: AtomicU64,
     /// Queries answered from quarantine without touching a provider (the saving).
     refinement_quarantine_hit: AtomicU64,
+    /// Queries the overlay abandoned because they outlived their in-flight budget.
+    refinement_inflight_timeouts: AtomicU64,
 }
 
 /// A copyable reading of every counter, for assertions and one-line reports.
@@ -120,6 +122,7 @@ pub struct WindowDetectionReading {
     pub refinement_latency_over_256ms: u64,
     pub refinement_quarantine_added: u64,
     pub refinement_quarantine_hit: u64,
+    pub refinement_inflight_timeouts: u64,
 }
 
 /// Shared diagnostics handle for the window-detection pipeline.
@@ -338,6 +341,17 @@ impl WindowDetectionMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A refinement query outlived its budget and was abandoned (docs/18 §3).
+    ///
+    /// Non-zero here means a provider did not return in time — the slot is released, deep
+    /// selection degrades to the v1 frame for this position, and the wedged call is left behind
+    /// rather than waited on.
+    pub fn record_refinement_inflight_timeout(&self) {
+        self.counters
+            .refinement_inflight_timeouts
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// An MSAA fallback query was actually handed to the provider.
     pub fn record_refinement_msaa_attempt(&self) {
         self.counters
@@ -416,6 +430,7 @@ impl WindowDetectionMetrics {
             refinement_latency_over_256ms: load(&counters.refinement_latency_buckets[4]),
             refinement_quarantine_added: load(&counters.refinement_quarantine_added),
             refinement_quarantine_hit: load(&counters.refinement_quarantine_hit),
+            refinement_inflight_timeouts: load(&counters.refinement_inflight_timeouts),
         }
     }
 
@@ -438,7 +453,8 @@ impl WindowDetectionMetrics {
              refinement_msaa_attempts={} refinement_msaa_timeouts={} \
              refinement_msaa_busy={} refinement_msaa_failures={} \
              refinement_latency_buckets <16ms={} <32ms={} <64ms={} <256ms={} >=256ms={} \
-             refinement_quarantine_added={} refinement_quarantine_hit={}",
+             refinement_quarantine_added={} refinement_quarantine_hit={} \
+             refinement_inflight_timeouts={}",
             reading.snapshot_refresh_last_us,
             reading.snapshot_refresh_max_us,
             reading.snapshot_refresh_count,
@@ -478,6 +494,7 @@ impl WindowDetectionMetrics {
             reading.refinement_latency_over_256ms,
             reading.refinement_quarantine_added,
             reading.refinement_quarantine_hit,
+            reading.refinement_inflight_timeouts,
         )
     }
 
@@ -638,6 +655,7 @@ mod tests {
             "refinement_latency_buckets <16ms=",
             "refinement_quarantine_added=",
             "refinement_quarantine_hit=",
+            "refinement_inflight_timeouts=",
         ] {
             assert!(line.contains(expected), "missing {expected} in: {line}");
         }

@@ -25,6 +25,15 @@ pub const REFINEMENT_CALL_LIMIT_MS: u32 = 500;
 /// How often a refinement query may publish an intermediate result.
 pub const REFINEMENT_PUBLISH_INTERVAL_MS: u32 = 32;
 
+/// Longest a single refinement query may hold the single-flight slot (docs/18 §3).
+///
+/// The provider enforces [`REFINEMENT_BUDGET_MS`] itself between nodes, which covers every
+/// traversal that keeps making progress. This is the outer guarantee for the one case it cannot
+/// cover: a COM call that never returns. Without it a wedged provider keeps the slot for the rest
+/// of the session and deep selection stops silently — the same user-visible failure as a lost
+/// result, which is why the slot is released by rule rather than by hope.
+pub const REFINEMENT_INFLIGHT_TIMEOUT_MS: u32 = REFINEMENT_BUDGET_MS + 500;
+
 /// Why a refinement query stopped (docs/18 §3).
 ///
 /// A query that stops for any reason other than [`Self::Complete`] still publishes the
@@ -145,6 +154,39 @@ pub struct SchedulerActions {
     pub arm_dwell: bool,
 }
 
+/// Which rectangle the auto-snap preview may show for a cursor at `point` inside `window`
+/// (docs/18 §13.5).
+///
+/// `deep` is the last verified deep target and `waiting` says whether an answer for the
+/// **current** position is still expected. The whole-window frame is *not* a neutral filler:
+/// showing it while a deeper answer is on its way is exactly the "expand to the window, then
+/// shrink to the box" the product rejected, and it is what made an ordinary move from a control
+/// into its parent container look like a wrong intermediate target.
+///
+/// * an answer that still covers the point is the answer → show it;
+/// * a verified rectangle from this window is kept while a better one is coming, so moving
+///   between controls of one window never falls back to the frame;
+/// * with nothing verified for this window yet, the preview is **withheld** rather than filled
+///   with the frame, so the first thing seen is the control under the cursor;
+/// * once the wait is over — nothing is pending any more — the v1 whole-window frame is the
+///   honest floor and is shown.
+///
+/// `None` means "paint no preview at all".
+pub fn preview_bounds(
+    deep: Option<&DeepTarget>,
+    window: WindowIdentity,
+    point: Point,
+    window_bounds: Rect,
+    waiting: bool,
+) -> Option<Rect> {
+    match deep.filter(|deep| deep.window == window) {
+        Some(deep) if deep.covers(point) => Some(deep.screen_bounds),
+        Some(deep) if waiting => Some(deep.screen_bounds),
+        _ if waiting => None,
+        _ => Some(window_bounds),
+    }
+}
+
 /// A refinement query to hand to the worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RefinementJob {
@@ -167,6 +209,8 @@ pub struct QueryControl<'a> {
     pub call_limit: Duration,
     /// Whether the caller has already abandoned this query.
     pub cancelled: &'a dyn Fn() -> bool,
+    /// When the query was handed to the provider, for [`Self::budget_exhausted`].
+    started: std::time::Instant,
 }
 
 impl<'a> QueryControl<'a> {
@@ -176,12 +220,22 @@ impl<'a> QueryControl<'a> {
             budget: Duration::from_millis(u64::from(REFINEMENT_BUDGET_MS)),
             call_limit: Duration::from_millis(u64::from(REFINEMENT_CALL_LIMIT_MS)),
             cancelled,
+            started: std::time::Instant::now(),
         }
     }
 
     /// Whether the provider should stop and publish what it has verified so far.
     pub fn is_cancelled(&self) -> bool {
         (self.cancelled)()
+    }
+
+    /// Whether the query has spent its total budget (docs/18 §3).
+    ///
+    /// A COM call cannot be interrupted, so the traversal checks this between nodes — the
+    /// cooperative half of the budget. Together with [`RefinementScheduler::on_in_flight_timeout`]
+    /// there is no path that lets one query hold the worker forever.
+    pub fn budget_exhausted(&self) -> bool {
+        self.started.elapsed() >= self.budget
     }
 }
 
@@ -264,6 +318,8 @@ pub struct RefinementScheduler {
     /// never cancelled just because the cursor moved a little; the *result* is judged against
     /// this point when it arrives (docs/18 §13.4).
     in_flight_point: Option<Point>,
+    /// When the in-flight query was issued, for the abandonment rule below.
+    in_flight_since: Option<std::time::Instant>,
     /// Most recent cursor point, used for that judgement.
     last_point: Option<Point>,
     /// Window the last cursor position resolved to, so a *window* change is what cancels.
@@ -296,6 +352,7 @@ impl RefinementScheduler {
         if window_changed && self.in_flight.is_some() {
             self.in_flight = None;
             self.in_flight_point = None;
+            self.in_flight_since = None;
             actions.invalidate_in_flight = true;
         }
 
@@ -343,12 +400,32 @@ impl RefinementScheduler {
         let request = self.requests.issue();
         self.in_flight = Some(request);
         self.in_flight_point = Some(pending.point);
+        self.in_flight_since = Some(std::time::Instant::now());
         Some(RefinementJob {
             request,
             window: pending.window,
             epoch: pending.epoch,
             point: pending.point,
         })
+    }
+
+    /// Give up on a query that has outlived [`REFINEMENT_INFLIGHT_TIMEOUT_MS`] (docs/18 §3).
+    ///
+    /// Returns the abandoned request id, or `None` while the query is still within its budget.
+    /// The caller retires the worker's gate: a COM call cannot be interrupted, so the thread stays
+    /// wedged until it returns on its own, and the overlay carries on degrading to the v1 frame.
+    /// `now` comes from the caller so the rule is testable without sleeping.
+    pub fn on_in_flight_timeout(&mut self, now: std::time::Instant) -> Option<RequestId> {
+        let started = self.in_flight_since?;
+        if now.saturating_duration_since(started)
+            < Duration::from_millis(u64::from(REFINEMENT_INFLIGHT_TIMEOUT_MS))
+        {
+            return None;
+        }
+        self.in_flight_since = None;
+        self.in_flight_point = None;
+        self.requests.retire();
+        self.in_flight.take()
     }
 
     /// Apply a worker result. Returns whether it was still current.
@@ -362,6 +439,7 @@ impl RefinementScheduler {
         }
         let issued_point = self.in_flight_point.take();
         self.in_flight = None;
+        self.in_flight_since = None;
         if self.pending.is_some_and(|pending| pending.epoch != epoch) {
             // The snapshot was rebuilt while the query ran; the path may describe stale
             // geometry, so it is not published.
@@ -394,6 +472,7 @@ impl RefinementScheduler {
         }
         self.in_flight = None;
         self.in_flight_point = None;
+        self.in_flight_since = None;
         true
     }
 
@@ -402,6 +481,7 @@ impl RefinementScheduler {
         self.pending = None;
         self.cached = None;
         self.in_flight_point = None;
+        self.in_flight_since = None;
         let invalidate = self.in_flight.take().is_some();
         if invalidate {
             self.requests.retire();
@@ -427,6 +507,7 @@ impl RefinementScheduler {
         self.pending = None;
         self.in_flight = None;
         self.in_flight_point = None;
+        self.in_flight_since = None;
         self.last_point = None;
         self.last_window = None;
         self.cached = None;
@@ -636,6 +717,50 @@ mod tests {
     }
 
     #[test]
+    fn a_wedged_query_is_abandoned_once_its_budget_is_spent() {
+        // A provider stuck inside a COM call never publishes. Without this rule the single-flight
+        // slot would stay held for the rest of the session (docs/18 §3).
+        let mut scheduler = RefinementScheduler::new();
+        let job = submit(&mut scheduler, 1, Point::new(150, 150));
+        let now = std::time::Instant::now();
+        assert_eq!(
+            scheduler.on_in_flight_timeout(now),
+            None,
+            "a query inside its budget is left alone"
+        );
+        assert!(scheduler.is_in_flight());
+
+        let expired = now + Duration::from_millis(u64::from(REFINEMENT_INFLIGHT_TIMEOUT_MS));
+        assert_eq!(scheduler.on_in_flight_timeout(expired), Some(job.request));
+        assert!(!scheduler.is_in_flight(), "the slot is released");
+        assert_eq!(
+            scheduler.on_in_flight_timeout(expired),
+            None,
+            "the rule fires once per query"
+        );
+
+        // The slot is genuinely reusable: the next dwell issues a fresh query.
+        let next = submit(&mut scheduler, 1, Point::new(160, 160));
+        assert_ne!(next.request, job.request);
+    }
+
+    #[test]
+    fn an_abandoned_query_cannot_publish_its_answer_afterwards() {
+        let mut scheduler = RefinementScheduler::new();
+        let job = submit(&mut scheduler, 1, Point::new(150, 150));
+        let expired =
+            std::time::Instant::now() + Duration::from_millis(u64::from(REFINEMENT_INFLIGHT_TIMEOUT_MS));
+        assert!(scheduler.on_in_flight_timeout(expired).is_some());
+        // The wedged call may still return long after the overlay gave up on it.
+        assert!(!scheduler.on_result(
+            job.request,
+            1,
+            deep_target(TargetKind::UiElement, rect(100, 100, 200, 200), StopReason::Complete)
+        ));
+        assert!(scheduler.cached().is_none());
+    }
+
+    #[test]
     fn reset_clears_the_pending_target_the_query_and_the_cache() {
         let mut scheduler = RefinementScheduler::new();
         let job = submit(&mut scheduler, 1, Point::new(150, 150));
@@ -690,6 +815,84 @@ mod tests {
         assert_eq!(
             control.call_limit.as_millis(),
             u128::from(REFINEMENT_CALL_LIMIT_MS)
+        );
+        assert!(!control.budget_exhausted(), "a fresh query has its budget");
+    }
+
+    /// The preview never falls back to the whole window frame while an answer for the current
+    /// position is on its way (docs/18 §13.5).
+    #[test]
+    fn a_pending_answer_keeps_the_last_verified_rectangle_of_the_window() {
+        let control = deep_target(TargetKind::UiElement, rect(300, 300, 500, 400), StopReason::Complete);
+        let frame = rect(0, 0, 1000, 800);
+        // The cursor left the control for its parent container: the frame must not flash while
+        // the refinement answers, even though the control no longer covers the point.
+        assert_eq!(
+            preview_bounds(
+                Some(&control),
+                window(0x100),
+                Point::new(600, 600),
+                frame,
+                true
+            ),
+            Some(rect(300, 300, 500, 400)),
+            "the last verified rectangle covers the wait, not the window frame"
+        );
+        // The wait is bounded: once nothing is pending, the frame is the honest floor.
+        assert_eq!(
+            preview_bounds(
+                Some(&control),
+                window(0x100),
+                Point::new(600, 600),
+                frame,
+                false
+            ),
+            Some(frame)
+        );
+    }
+
+    #[test]
+    fn the_first_hover_of_a_window_withholds_the_preview_until_it_answers() {
+        let frame = rect(0, 0, 1000, 800);
+        assert_eq!(
+            preview_bounds(None, window(0x100), Point::new(10, 10), frame, true),
+            None,
+            "the first thing shown must be the control, not the whole frame"
+        );
+        assert_eq!(
+            preview_bounds(None, window(0x100), Point::new(10, 10), frame, false),
+            Some(frame),
+            "an unsupported or failed provider still degrades to the v1 frame"
+        );
+    }
+
+    #[test]
+    fn a_verified_target_for_another_window_never_leaks_into_this_one() {
+        let frame = rect(0, 0, 1000, 800);
+        let elsewhere = deep_target(TargetKind::UiElement, rect(100, 100, 200, 200), StopReason::Complete);
+        assert_eq!(
+            preview_bounds(Some(&elsewhere), window(0x200), Point::new(150, 150), frame, true),
+            None,
+            "another window's path is not an answer for this one"
+        );
+        assert_eq!(
+            preview_bounds(Some(&elsewhere), window(0x200), Point::new(150, 150), frame, false),
+            Some(frame)
+        );
+    }
+
+    #[test]
+    fn a_target_that_still_covers_the_cursor_is_shown_even_when_nothing_is_pending() {
+        let control = deep_target(TargetKind::UiElement, rect(300, 300, 500, 400), StopReason::Complete);
+        assert_eq!(
+            preview_bounds(
+                Some(&control),
+                window(0x100),
+                Point::new(350, 350),
+                rect(0, 0, 1000, 800),
+                false
+            ),
+            Some(rect(300, 300, 500, 400))
         );
     }
 

@@ -359,6 +359,14 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
                 outcome.stop_reason = StopReason::Cancelled;
                 break;
             }
+            // The declared total budget, checked where it can be honoured: between levels. A
+            // single COM call below is uninterruptible, so the walk that keeps making progress
+            // is bounded here and the one that never returns is covered by the scheduler's
+            // in-flight timeout (docs/18 §3).
+            if control.budget_exhausted() {
+                outcome.stop_reason = StopReason::BudgetExhausted;
+                break;
+            }
             if !budget.enter_children() {
                 outcome.stop_reason = StopReason::TraversalLimit;
                 break;

@@ -911,6 +911,74 @@ refinement_elapsed_us last=24549  max=59174
 （每层「子节点数 / 空矩形数 / 越界数 / 包含该点数」），跑一次 Explorer 三点探针即可判断。
 只有在数据确认是空矩形导致之后，才按「空矩形节点允许下钻、路径沿用父矩形」来修（同样是纯策略改动）。
 
+### 12.15 预览回退策略：等待答案期间不回落整窗（已修复，对应缺陷报告场景 2/3/4）
+
+**现象**：从控件移动到它的**父级空白区**时，预览矩形先变成**整窗**（"最大的盒子"），片刻后再收缩
+到父级容器（场景 2）；A→B 之间也会出现同样的中间态（场景 3）。
+
+**根因（预览回退条件写错了对象）**：`preview_for_cursor` 只有两种取值——"命中的深层矩形"或
+**v1 整窗帧**。判断"是否该等答案"用的是 `refinement_hold`，而它 **只在等待序列的第一次移动时设置**
+（`if self.refinement_hold.is_none()`），并且在**第一次答案到达时就被清空**——包括
+`NeedsConfirmation` 那种**尚未发布**的暂存答案。于是只要满足任一条件：
+
+* 光标在本窗口内已经移动超过 320 ms 才停下；
+* 或者答案已到但降级还在等第二次停稳（§13.3）；
+
+…下一次重新计算预览（hover 复验 `BoundsChanged` 也会触发）就会落进整窗分支，把**整窗帧**画出来，
+答案到达后再收缩。整窗帧不是中性的填充物：它本身就是一个"更大的目标"。
+
+**修复（策略提纯为纯函数 + 等待锚定到"当前问题"）**：
+
+```rust
+pub fn preview_bounds(
+    deep: Option<&DeepTarget>, window: WindowIdentity, point: Point,
+    window_bounds: Rect, waiting: bool,
+) -> Option<Rect>
+```
+
+| 状态 | 预览 |
+| --- | --- |
+| 已验证矩形仍覆盖光标 | 该矩形 |
+| 该窗口有已验证矩形、但不再覆盖光标，且**答案在途** | **保留**该矩形（等待中不回退整窗） |
+| 该窗口**尚无可信矩形**，且答案在途 | **不画**（`None`）——第一次看到的就是光标下的控件，不是整窗 |
+| 无在途答案（provider 不可用 / 已超时 / 已放弃） | v1 整窗帧（诚实的下限） |
+
+`refinement_pending: Option<Instant>` 取代 `refinement_hold`，语义是"**当前位置**的答案正在路上"：
+**arm 即计时（含暂存降级重新 arm 的第二次停稳）**，答案落地、失败、窗口消失或会话结束即清零；
+上限沿用 320 ms（`REFINEMENT_PREVIEW_WAIT_MS`）。因此在 320 ms 内永远保留可信矩形、绝不闪整窗，
+超过上限才降级到 v1——"有界降级"的保证没有被削弱，只是把窗口期的取值从"整窗"换成了
+"上一次已验证的矩形"或"不画"。
+
+**测试（纯函数，`deep.rs`）**：等待中保留上一次矩形（即使它已不覆盖光标）；等待结束回落整窗；
+首次 hover 在途时不画；别的窗口的路径不得泄漏；覆盖光标的目标即使不在等待中也继续显示。
+
+`cargo test --lib` 352 passed / 0 failed，`cargo check --all-targets` 0 warnings。
+
+### 12.16 单飞槽的预算与看门狗（已修复）
+
+**背景**：`REFINEMENT_BUDGET_MS = 1500` / `REFINEMENT_CALL_LIMIT_MS = 500` 从 v2-P0 起就写在
+契约里（docs/18 §3），但**没有任何代码读它**——provider 只检查节点/深度预算与协作式取消。
+一个卡在单次 COM 调用里的 provider 会永久占住单飞槽：现象与 12.14 的 id 漂移**完全一样**
+（`refinement_submitted=1 refinement_published=0`，此后不再增长），但成因不同。
+
+**修复（两层，各自可用纯单测验证）**：
+
+1. **协作式总预算**：`QueryControl::budget_exhausted()`（`started + budget`），UIA 走查在**每层之间**
+   检查 → 超时即发布部分路径并标 `StopReason::BudgetExhausted`。这是 provider 能做到的那一半。
+2. **外层看门狗**：`RefinementScheduler::on_in_flight_timeout(now)`，上限
+   `REFINEMENT_INFLIGHT_TIMEOUT_MS = 1500 + 500`。超过即释放单飞槽、`retire()` 掉 worker 的 gate、
+   记 `refinement_inflight_timeouts`，并让预览回落到 v1 帧。`now` 由调用方传入，
+   规则不依赖 sleep 就能测。卡死的 COM 调用无法被杀，只能**放弃**（与 MSAA 的 `TimedCallRunner`
+   同一取舍：放弃线程，不阻塞调用方）。
+
+看门狗挂在 overlay 的周期性 hover tick 上（`poll_refinement_timeout`），因此不依赖光标继续移动：
+静止的光标也能等到降级。
+
+**测试**：预算内的查询不动它；超预算返回被放弃的 request id 且槽位可复用（下一次 dwell 能发新号）；
+被放弃的查询即使随后返回也不能再发布；`QueryControl` 新建时预算未耗尽。
+
+`cargo test --lib` 352 passed / 0 failed，`cargo check --all-targets` 0 warnings。
+
 ### 12.14 跨会话根因：refinement 有两个 request id 空间（已修复）
 
 **现象（产品复验）**：同一次进程里，**第一次 F5 深选正常**（`submitted=36 published=34`），
