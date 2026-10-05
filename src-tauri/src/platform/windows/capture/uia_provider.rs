@@ -348,6 +348,12 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
         let mut budget = WalkBudget::new();
         let mut current = root;
         let mut current_bounds = window_bounds;
+        // UIA can hand back cycles between same-bounds nodes (A → B → A). The forensic log
+        // showed one such pair alternating until the depth budget ran out, which padded the
+        // published path with duplicate levels. Visiting each node at most once bounds the
+        // walk by the tree itself instead of by the budget.
+        let mut visited: HashSet<usize> = HashSet::new();
+        visited.insert(current.as_raw() as usize);
         loop {
             if control.is_cancelled() {
                 outcome.stop_reason = StopReason::Cancelled;
@@ -374,7 +380,8 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
             // Cycle guard: never step into the node we are already standing on. A genuine
             // same-bounds *child* is still allowed (that is how Explorer nests its panes), but
             // the walk must make progress.
-            if (child.as_raw() as usize) == (current.as_raw() as usize) {
+            let child_id = child.as_raw() as usize;
+            if !visited.insert(child_id) {
                 break;
             }
             if !outcome.push(node.bounds) {
