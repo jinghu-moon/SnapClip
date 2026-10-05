@@ -11,6 +11,17 @@
 //! provider polls [`QueryControl::is_cancelled`] between nodes. The gate is checked from
 //! this object and read by the worker thread, which is what makes "the cursor moved, drop
 //! what you are doing" observable inside a long traversal.
+//!
+//! Two invariants this module owes the overlay:
+//!
+//! * **One id space.** The request id belongs to the scheduler, which is the side that decides
+//!   whether an answer is still the current question; the worker *adopts* it rather than
+//!   minting a second id. Two counters matched only while both happened to start at 1, so from
+//!   the second capture session on every result was rejected as stale and deep selection died
+//!   silently (docs/18 §2).
+//! * **Every job the worker starts reports back exactly once**, tagged with its own id — even
+//!   when a newer point superseded it while it ran. A silently dropped job leaves the overlay's
+//!   single-flight slot held with nothing to release it.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -170,34 +181,30 @@ impl RefinementWorker {
         }
     }
 
-    /// Queue a query for `point` inside `window_bounds`. Returns its request id.
-    pub fn request(
-        &self,
-        epoch: SnapshotEpoch,
-        window: WindowIdentity,
-        point: Point,
-        window_bounds: Rect,
-    ) -> RequestId {
-        let request = self
-            .shared
-            .requests
-            .lock()
-            .map(|mut gate| gate.issue())
-            .expect("the request gate is never poisoned");
+    /// Queue a query for the job the scheduler issued.
+    ///
+    /// The **caller's** request id is the one that travels back with the result
+    /// ([`RefinementResult::request`]) and the one the scheduler compares against its own
+    /// in-flight question, so the worker adopts it instead of minting a second id space. Two
+    /// counters drifted apart as soon as one session ended, and the scheduler then rejected
+    /// every later answer as stale — deep selection died silently after the first F5.
+    pub fn request(&self, job: RefinementJob, window_bounds: Rect) {
+        if let Ok(mut gate) = self.shared.requests.lock() {
+            gate.adopt(job.request);
+        }
         if let Ok(mut pending) = self.shared.pending.lock() {
             if pending.is_some() {
                 self.shared.cancelled.fetch_add(1, Ordering::Relaxed);
             }
             *pending = Some(Job {
-                request,
-                epoch,
-                window,
-                point,
+                request: job.request,
+                epoch: job.epoch,
+                window: job.window,
+                point: job.point,
                 window_bounds,
             });
         }
         self.shared.wake.notify_all();
-        request
     }
 
     /// Take the pending result, if the worker produced one.
@@ -318,9 +325,17 @@ fn run(
         );
         // A superseded query is never delivered: the overlay would drop it anyway, and
         // publishing it would evict the newest result from the single slot.
-        if is_current(job.request) {
-            publish(&shared, job, outcome, started.elapsed());
-        }
+        // **Always** publish, even when the job was superseded while it ran. Dropping it silently
+        // left the overlay's single-flight slot held forever (no result, no failure), so the next
+        // dwell could never issue a query and refinement stayed dead for the rest of the session.
+        // The overlay rejects a superseded result by request id, which is the right place for that
+        // decision — it just has to *hear* about it.
+        let outcome = if is_current(job.request) {
+            outcome
+        } else {
+            RefinementOutcome::Empty(StopReason::Cancelled)
+        };
+        publish(&shared, job, outcome, started.elapsed());
     }
 }
 
@@ -353,6 +368,7 @@ mod tests {
     use super::*;
     use crate::capture::window_detection::deep::{DeepTarget, StopReason};
     use crate::capture::window_detection::model::TargetKind;
+    use crate::capture::window_detection::RefinementScheduler;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::time::Duration;
 
@@ -412,6 +428,115 @@ mod tests {
         None
     }
 
+    /// A provider that answers every query with the same rectangle.
+    struct FixedProvider {
+        bounds: Rect,
+    }
+
+    impl DeepSelectionProvider for FixedProvider {
+        fn resolve(
+            &mut self,
+            _job: &RefinementJob,
+            _window_bounds: Rect,
+            _control: &QueryControl<'_>,
+        ) -> RefinementOutcome {
+            RefinementOutcome::Target(Box::new(deep(self.bounds, StopReason::Complete)))
+        }
+    }
+
+    /// A job tagged with a fresh request id, exactly as the scheduler hands it over.
+    fn job_for(epoch: SnapshotEpoch, point: Point) -> RefinementJob {
+        RefinementJob {
+            request: RequestGate::new().issue(),
+            window: window(),
+            epoch,
+            point,
+        }
+    }
+
+    /// The first delivered outcome tagged with `request`.
+    fn wait_for_request(
+        worker: &RefinementWorker,
+        request: RequestId,
+        timeout: Duration,
+    ) -> Option<RefinementResult> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if let Some(result) = worker.take_result()
+                && result.request == request
+            {
+                return Some(result);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        None
+    }
+
+    /// The scheduler owns the refinement id space; the worker only consumes it.
+    ///
+    /// Regression: the worker used to issue ids from a *second* gate while the scheduler issued
+    /// its own. Both counted from 1, so the first session matched by accident — and every later
+    /// session was off by however many queries the first one ran, because `begin_window_detection`
+    /// resets the scheduler's gate. The worker's result was then rejected as stale, the
+    /// single-flight slot was never freed, and deep selection was dead for the rest of the
+    /// session (`refinement_submitted=1 refinement_published=0`, "the second F5 only snaps the
+    /// window").
+    #[test]
+    fn a_second_session_still_accepts_the_worker_result() {
+        let worker = RefinementWorker::with_provider(
+            candidate_thread(),
+            WindowDetectionMetrics::new(),
+            Box::new(|| {
+                Box::new(FixedProvider {
+                    bounds: Rect::new(10, 10, 60, 40),
+                })
+            }),
+        );
+        let mut scheduler = RefinementScheduler::new();
+
+        // Session one.
+        assert!(
+            scheduler
+                .on_cursor_moved(1, Some(window()), Point::new(20, 20))
+                .arm_dwell
+        );
+        let job = scheduler.on_dwell_due().expect("session one issues a query");
+        worker.request(job, Rect::new(0, 0, 100, 100));
+        let result = wait_for(&worker, Duration::from_secs(5)).expect("session one answers");
+        let RefinementOutcome::Target(target) = result.outcome else {
+            panic!("the fixed provider always resolves");
+        };
+        assert!(
+            scheduler.on_result(result.request, result.epoch, *target),
+            "session one's answer is the current question"
+        );
+
+        // Session teardown and a second F5: both sides start over, and the *scheduler's* ids
+        // restart while the worker's mailbox keeps running.
+        scheduler.reset();
+        worker.retire();
+
+        assert!(
+            scheduler
+                .on_cursor_moved(2, Some(window()), Point::new(30, 30))
+                .arm_dwell
+        );
+        let job = scheduler.on_dwell_due().expect("session two issues a query");
+        worker.request(job, Rect::new(0, 0, 100, 100));
+        let result = wait_for(&worker, Duration::from_secs(5)).expect("session two answers");
+        let RefinementOutcome::Target(target) = result.outcome else {
+            panic!("the fixed provider always resolves");
+        };
+        assert!(
+            scheduler.on_result(result.request, result.epoch, *target),
+            "the second session's answer must still be the current question"
+        );
+        assert!(
+            scheduler.cached().is_some(),
+            "the second session publishes the deep target"
+        );
+    }
+
     #[test]
     fn a_query_produces_a_target_tagged_with_its_request_and_epoch() {
         let observed = Arc::new(AtomicBool::new(false));
@@ -428,7 +553,9 @@ mod tests {
                 })
             }),
         );
-        let request = worker.request(7, window(), Point::new(20, 20), Rect::new(0, 0, 100, 100));
+        let job = job_for(7, Point::new(20, 20));
+        let request = job.request;
+        worker.request(job, Rect::new(0, 0, 100, 100));
         let result = wait_for(&worker, Duration::from_secs(5)).expect("a result");
         assert_eq!(result.request, request);
         assert_eq!(result.epoch, 7);
@@ -448,7 +575,7 @@ mod tests {
         // A fabricated handle: no accessibility tree can be attributed to it. UIA reports
         // `Unsupported`, the MSAA fallback is asked next and reports a provider failure; the
         // point is that neither ever invents a rectangle, so the overlay keeps the v1 frame.
-        worker.request(1, window(), Point::new(5, 5), Rect::new(0, 0, 100, 100));
+        worker.request(job_for(1, Point::new(5, 5)), Rect::new(0, 0, 100, 100));
         let result = wait_for(&worker, Duration::from_secs(5)).expect("a result");
         assert!(
             matches!(
@@ -478,14 +605,27 @@ mod tests {
                 })
             }),
         );
-        let _first = worker.request(1, window(), Point::new(20, 20), Rect::new(0, 0, 100, 100));
+        let mut gate = RequestGate::new();
+        let first = RefinementJob {
+            request: gate.issue(),
+            window: window(),
+            epoch: 1,
+            point: Point::new(20, 20),
+        };
+        worker.request(first, Rect::new(0, 0, 100, 100));
         // Let the worker pick the first job up, then supersede it.
         let deadline = Instant::now() + Duration::from_secs(2);
         while calls.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1, "the first query started");
-        let second = worker.request(2, window(), Point::new(21, 21), Rect::new(0, 0, 100, 100));
+        let second = RefinementJob {
+            request: gate.issue(),
+            window: window(),
+            epoch: 2,
+            point: Point::new(21, 21),
+        };
+        worker.request(second, Rect::new(0, 0, 100, 100));
 
         // Cancellation is cooperative, so give the traversal a moment to poll it.
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -496,10 +636,18 @@ mod tests {
             observed.load(Ordering::SeqCst),
             "the running query must observe the cancellation"
         );
-        // The superseded result is not published; the newest request eventually is.
-        let result = wait_for(&worker, Duration::from_secs(5)).expect("a result");
-        assert_eq!(result.request, second);
+
+        // Every job the worker *starts* reports back exactly once, so neither side can wait
+        // forever on a query that was replaced. The superseded one reports its cancellation
+        // under its own id, which the scheduler then ignores; the newest id carries the target.
+        let result = wait_for_request(&worker, second.request, Duration::from_secs(5))
+            .expect("the newest query answers");
+        assert_eq!(result.request, second.request);
         assert_eq!(result.epoch, 2);
+        assert!(matches!(
+            result.outcome,
+            RefinementOutcome::Target(target) if target.screen_bounds == Rect::new(10, 10, 60, 40)
+        ));
     }
 
     #[test]
@@ -508,7 +656,7 @@ mod tests {
         worker.shutdown();
         worker.shutdown();
         // A request after shutdown is never executed and never blocks.
-        worker.request(1, window(), Point::new(1, 1), Rect::new(0, 0, 10, 10));
+        worker.request(job_for(1, Point::new(1, 1)), Rect::new(0, 0, 10, 10));
         assert!(worker.take_result().is_none());
     }
 

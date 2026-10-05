@@ -910,3 +910,52 @@ refinement_elapsed_us last=24549  max=59174
 于是这些条目连同它们**可能报出真实矩形的子孙**一起被跳过。验证方式：加一个 verbose 统计
 （每层「子节点数 / 空矩形数 / 越界数 / 包含该点数」），跑一次 Explorer 三点探针即可判断。
 只有在数据确认是空矩形导致之后，才按「空矩形节点允许下钻、路径沿用父矩形」来修（同样是纯策略改动）。
+
+### 12.14 跨会话根因：refinement 有两个 request id 空间（已修复）
+
+**现象（产品复验）**：同一次进程里，**第一次 F5 深选正常**（`submitted=36 published=34`），
+**第二次及以后完全失效**——只吸附整窗（"默认吸附软件窗口"）：
+
+```text
+session 1: refinement_submitted=40 refinement_published=35 refinement_latency_buckets <16ms=3 <32ms=1 <64ms=31
+session 2: refinement_submitted=1  refinement_published=0  refinement_empty=0
+           refinement_elapsed_us last=0 max=0   ← 一次都没有送达
+```
+
+`submitted=1` 且此后不再增长，说明**单飞槽被永久占住**：调度器在等一个永远不会被接受的答案。
+
+**根因（模块边界的 id 所有权错误，不是 provider 问题）**：refinement 有**两个** `RequestGate`，
+各自从 1 开始发号：
+
+| 位置 | 发号者 | 用途 |
+| --- | --- | --- |
+| `RefinementScheduler::on_dwell_due` | 调度器 | 记 `in_flight`，判定结果是否仍是当前问题 |
+| `RefinementWorker::request` | worker | 判定在途查询是否已被取消 |
+
+两者**只是碰巧同步**：只要每个 `on_dwell_due` 都恰好对应一次 `request()`，计数器就一致。而
+`begin_window_detection()` 每次会话都会 `refine.reset()`——调度器的计数器回到 0，worker 的计数器
+继续累加。于是第二次 F5 起，worker 回投的 id 与调度器 `in_flight` 恰好差「上一会话的查询条数」，
+`on_result()` 判为陈旧 → **静默丢弃**，`on_failure()` 同样不匹配 → 单飞槽永不释放 → 本会话只提交
+1 次查询。日志里 `published=0 / empty=0 / elapsed=0` 正是「结果被拒」与「结果从未产生」两种情况的
+共同表现，仅凭汇总行无法区分——这也是它拖了一轮才被定位的原因。
+
+**修复（单一 id authority）**：id 属于**拥有问题的一方**，即调度器。worker 不再发号，改为
+`RequestGate::adopt(job.request)` 接收调用方（调度器）给的 id；`request()` 的签名从
+`(epoch, window, point, bounds)` 变成 `(job: RefinementJob, window_bounds)`，overlay 直接把调度器的
+job 转交。两端从此共用一个 id 空间，任何一侧 `reset()/retire()` 都不会再产生漂移。
+
+同时把「worker 一旦开始执行某个 job 就**必定且仅回投一次**」写成模块不变量：被取代的 job 回投
+`Empty(Cancelled)`（带自己的 id，由调度器按陈旧丢弃），而不是静默消失——静默消失正是单飞槽"没有
+任何一方能释放它"的另一条路径。
+
+**回归测试（先红后绿）**：
+
+- `refinement_worker::tests::a_second_session_still_accepts_the_worker_result`：在**同一个 worker**
+  上跑两个会话（`scheduler.reset()` + `worker.retire()` 之后重新提交），断言第二个会话的结果仍然
+  是当前问题。旧实现下该断言失败（红），修复后通过（绿）。
+- `model::tests::an_adopted_id_becomes_the_newest_request_and_keeps_issue_monotonic`：adopt 之后
+  `latest` 即该 id，且后续 `issue()` 不会重发已用过的号。
+- `refinement_worker::tests::a_superseded_query_is_cancelled_cooperatively`：按新不变量更新为
+  「被取代的 job 回投 `Empty(Cancelled)`，最新 job 回投目标」。
+
+`cargo test --lib` 346 passed / 0 failed，`cargo check --all-targets` 0 warnings。

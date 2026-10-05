@@ -1781,8 +1781,9 @@ where
             false,
         );
         self.metrics.record_refinement_submitted();
-        self.refinement
-            .request(job.epoch, job.window, job.point, bounds);
+        // The scheduler's request id is the one that comes back with the result, so the
+        // worker is handed the whole job instead of issuing an id of its own.
+        self.refinement.request(job, bounds);
     }
 
     /// A deep-selection result arrived.

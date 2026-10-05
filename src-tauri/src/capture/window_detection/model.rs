@@ -100,6 +100,19 @@ impl RequestGate {
         id
     }
 
+    /// Adopt an id that was issued elsewhere as the newest request.
+    ///
+    /// Only the component that owns the *question* may issue ids, and there must be exactly one
+    /// such component per pipeline: the refinement worker holds the scheduler's id instead of
+    /// minting its own, because the result travels back tagged with it and the scheduler is the
+    /// side that decides whether it is still the current question. Two independent counters
+    /// matched only until the first session ended, and every result after that was rejected as
+    /// stale.
+    pub fn adopt(&mut self, id: RequestId) {
+        self.next = self.next.max(id.0);
+        self.latest = Some(id);
+    }
+
     /// The newest outstanding request, if any.
     pub fn latest(&self) -> Option<RequestId> {
         self.latest
@@ -453,6 +466,24 @@ mod tests {
         gate.retire();
         assert_eq!(gate.latest(), None);
         assert!(!gate.accepts(second), "no request is current after retiring");
+    }
+
+    #[test]
+    fn an_adopted_id_becomes_the_newest_request_and_keeps_issue_monotonic() {
+        // The refinement worker adopts the scheduler's id instead of issuing its own: the
+        // result travels back tagged with it, and the scheduler — the side that owns the
+        // question — is the one comparing. Two id spaces matched only by accident, and the
+        // mismatch silently rejected every result after the first session (docs/18 §2).
+        let mut gate = RequestGate::new();
+        let adopted = RequestGate::new().issue();
+        gate.adopt(adopted);
+        assert_eq!(gate.latest(), Some(adopted), "the adopted id is current");
+        assert!(gate.accepts(adopted));
+
+        // Issuing after adopting must not hand out an id that was already used.
+        let issued = gate.issue();
+        assert!(issued > adopted);
+        assert!(!gate.accepts(adopted), "the adopted id was superseded");
     }
 
     #[test]
