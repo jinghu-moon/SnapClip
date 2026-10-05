@@ -682,6 +682,19 @@ UIA 已经解析出的细控件替换成大矩形；发布矩形 `= path.last()`
 **仍未解决**：资源管理器**文件项**（DirectUI 虚拟化列表项）仍只到「文件列表面板」一级。
 这是 ① 结构性回溯（已回退，待取证）与 P3 本体要解决的范围，与本次合并语义缺陷是两件事。
 
+**产品复验（`npm run tauri dev`，默认日志汇总行）——修复确认**：
+
+| 指标 | 回归前（好） | 回归中（差） | 修复后 |
+| --- | --- | --- | --- |
+| `refinement_submitted` | 26 | 8 | **23** |
+| `hover_target_switch_count` | 5 | 12–13 | **6** |
+| `refinement_published` | 22 | 8 | **22** |
+| `refinement_elapsed_us` | last 43 / max 61 ms | last 3.9 / max 22.8 ms | **last 3.5 / max 22.6 ms** |
+| `window_hit_test_us` | n=1790 | n≈1200 | n=1963（max 123 µs） |
+
+`submitted ≫ 窗口切换次数` 的「跟随控件」特征恢复，`published/submitted = 22/23`（差额是光标先
+移动、查询在完成前被取代），`empty = 0`、错误 0；峰值耗时同时优于回归前的 61 ms。
+
 **下一个取证假设（待验证）**：DirectUI 的虚拟化条目在未实现/未滚入视口时会把
 `CurrentBoundingRectangle` 报成**空矩形**，而 `cached_node()` 目前对空矩形直接返回 `None`，
 于是这些条目连同它们**可能报出真实矩形的子孙**一起被跳过。验证方式：加一个 verbose 统计
