@@ -19,6 +19,7 @@ use ::windows::core::Interface;
 use ::windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationCacheRequest, IUIAutomationElement, TreeScope_Children,
     UIA_BoundingRectanglePropertyId, UIA_ControlTypePropertyId, UIA_IsOffscreenPropertyId,
+    UIA_NativeWindowHandlePropertyId,
 };
 
 use crate::capture::geometry::{Point, Rect};
@@ -147,6 +148,7 @@ impl UiaDeepSelectionProvider {
                     .AddProperty(UIA_BoundingRectanglePropertyId)
                     .and_then(|()| request.AddProperty(UIA_ControlTypePropertyId))
                     .and_then(|()| request.AddProperty(UIA_IsOffscreenPropertyId))
+                    .and_then(|()| request.AddProperty(UIA_NativeWindowHandlePropertyId))
                     .and_then(|()| request.SetTreeScope(TreeScope_Children))
             };
             if configured.is_err() {
@@ -171,7 +173,10 @@ impl UiaDeepSelectionProvider {
         let offscreen = unsafe { element.CachedIsOffscreen() }
             .map(|value| value.as_bool())
             .unwrap_or(false);
-        Some(WalkNode::new(bounds, control_type, offscreen, true))
+        let native_window = unsafe { element.CachedNativeWindowHandle() }
+            .map(|handle| handle.0 as isize)
+            .unwrap_or(0);
+        Some(WalkNode::new(bounds, control_type, offscreen, true).with_native_window(native_window))
     }
 
     /// Drop the expanded-children table when the snapshot generation moved on.
@@ -252,6 +257,15 @@ impl UiaDeepSelectionProvider {
                 break;
             }
             if !is_descendable(parent_bounds, *node) || !node.bounds.contains(point) {
+                continue;
+            }
+            // `IsOffscreen` does not cover a child window hidden *behind a sibling window*:
+            // File Explorer keeps every tab as a full-size, visible `ShellTabWindowClass` and
+            // lists the hidden tabs after the active one, so the topmost-listed rule walked into
+            // a background tab whose items are laid out differently (measured: 9 same-bounds tab
+            // panes; rows of the visible list resolved to the whole content area). Only the
+            // window manager knows which sibling is on screen at the point.
+            if node.native_window != 0 && !win32::is_shown_child_at(node.native_window, point) {
                 continue;
             }
             candidates.push((child.clone(), *node));

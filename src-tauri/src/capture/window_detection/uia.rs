@@ -29,6 +29,8 @@ pub struct WalkNode {
     /// `CurrentIsEnabled`; a disabled element is still a legitimate target (the user sees
     /// it), so this only feeds diagnostics today.
     pub enabled: bool,
+    /// `NativeWindowHandle`; `0` for elements that are not backed by their own window.
+    pub native_window: isize,
 }
 
 impl WalkNode {
@@ -38,6 +40,14 @@ impl WalkNode {
             control_type,
             offscreen,
             enabled,
+            native_window: 0,
+        }
+    }
+
+    pub const fn with_native_window(self, native_window: isize) -> Self {
+        Self {
+            native_window,
+            ..self
         }
     }
 }

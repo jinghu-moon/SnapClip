@@ -15,18 +15,20 @@
 
 use std::mem::size_of;
 
-use ::windows::Win32::Foundation::{HWND, LPARAM, RECT};
+use ::windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
 use ::windows::core::BOOL;
 use ::windows::Win32::Graphics::Dwm::{
     DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
 };
+use ::windows::Win32::Graphics::Gdi::ScreenToClient;
 use ::windows::Win32::UI::WindowsAndMessaging::{
-    EnumChildWindows, EnumWindows, GWL_EXSTYLE, GetClassNameW, GetWindowLongPtrW, GetWindowRect,
+    CWP_SKIPINVISIBLE, ChildWindowFromPointEx, EnumChildWindows, EnumWindows,
+    GA_PARENT, GWL_EXSTYLE, GetAncestor, GetClassNameW, GetDesktopWindow, GetWindowLongPtrW, GetWindowRect,
     GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, WINDOW_EX_STYLE, WS_EX_LAYERED,
     WS_EX_TRANSPARENT,
 };
 
-use crate::capture::geometry::Rect;
+use crate::capture::geometry::{Point, Rect};
 use crate::capture::window_detection::snapshot::{CheapProbe, DwmRead};
 
 /// Win32 class names are at most 256 characters including the terminator.
@@ -271,6 +273,39 @@ pub fn visible_child_rects(parent: isize, parent_bounds: Rect) -> Vec<Rect> {
     collector.rects
 }
 
+/// Whether child window `hwnd` is the one its parent shows at screen `point`.
+///
+/// Sibling child windows can share a rectangle and all be `WS_VISIBLE` while only the topmost
+/// is actually on screen: File Explorer keeps one full-size `ShellTabWindowClass` per tab and
+/// shows the active one by z-order alone. `ChildWindowFromPointEx` asks the window manager,
+/// which resolves exactly that, so an occluded sibling is told apart from the visible one
+/// without guessing from geometry. `WS_EX_TRANSPARENT` alone does not hide a window (see
+/// [`is_click_through_layered`]), so only invisible windows are skipped.
+pub fn is_shown_child_at(hwnd: isize, point: Point) -> bool {
+    if !is_window(hwnd) {
+        return false;
+    }
+    let child = to_hwnd(hwnd);
+    let parent = unsafe { GetAncestor(child, GA_PARENT) };
+    if parent.is_invalid() {
+        return false;
+    }
+    // Top-level windows (owned popups) are not siblings of anything this check can rank; asking
+    // the desktop would answer with whatever top-level window is above, the overlay included.
+    if parent == unsafe { GetDesktopWindow() } {
+        return true;
+    }
+    let mut local = POINT {
+        x: point.x,
+        y: point.y,
+    };
+    if !unsafe { ScreenToClient(parent, &mut local) }.as_bool() {
+        return false;
+    }
+    let shown = unsafe { ChildWindowFromPointEx(parent, local, CWP_SKIPINVISIBLE) };
+    shown == child
+}
+
 /// Read the DWM attributes for a batch of candidates.
 ///
 /// Runs after enumeration, on the detection worker. Keeping it a separate entry point
@@ -298,7 +333,7 @@ mod tests {
     use super::*;
     use ::windows::Win32::Foundation::POINT;
     use ::windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DestroyWindow, DispatchMessageW, GetWindowInfo, HWND_TOPMOST, MSG,
+        CreateWindowExW, DestroyWindow, DispatchMessageW, GetWindowInfo, HWND_TOP, HWND_TOPMOST, MSG,
         PM_REMOVE, PeekMessageW, SW_HIDE, SW_MINIMIZE, SW_SHOWNA, SWP_NOACTIVATE, SWP_NOMOVE,
         SWP_NOSIZE, SetWindowPos, ShowWindow, TranslateMessage, WINDOWINFO, WS_EX_NOACTIVATE,
         WS_CHILD, WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
@@ -628,6 +663,64 @@ mod tests {
         assert!(reads[0].frame_bounds.is_some());
         assert_eq!(reads[1].hwnd, 0);
         assert_eq!(reads[1].frame_bounds, None);
+    }
+
+    #[test]
+    fn only_the_topmost_of_stacked_child_windows_is_shown_at_a_point() {
+        if !desktop_available() {
+            eprintln!("skipping: no interactive window station available");
+            return;
+        }
+        // File Explorer's tabs: same-size, all `WS_VISIBLE`, only the top one on screen.
+        let parent = TestWindow::create(WINDOW_EX_STYLE(0), WS_OVERLAPPEDWINDOW | WS_VISIBLE)
+            .expect("desktop is available");
+        parent.bring_to_front();
+        let stacked = |title| unsafe {
+            CreateWindowExW(
+                WS_EX_NOACTIVATE,
+                w!("STATIC"),
+                title,
+                WS_CHILD | WS_VISIBLE,
+                20,
+                40,
+                120,
+                60,
+                Some(parent.hwnd()),
+                None,
+                None,
+                None,
+            )
+        }
+        .expect("child window creation succeeds");
+        let below = stacked(w!("SnapClip hidden tab"));
+        let above = stacked(w!("SnapClip active tab"));
+        // Explicit z-order: creation order alone does not say which sibling ends up on top.
+        unsafe {
+            SetWindowPos(above, Some(HWND_TOP), 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE)
+        }
+        .expect("restack the children");
+        pump(60);
+        let mut rect = RECT::default();
+        unsafe { GetWindowRect(above, &mut rect) }.expect("child rect");
+        let inside = Point::new((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
+        let outside = Point::new(rect.right + 10, rect.bottom + 10);
+
+        assert!(is_shown_child_at(above.0 as isize, inside));
+        assert!(
+            !is_shown_child_at(below.0 as isize, inside),
+            "a visible child covered by a sibling is not what the user sees"
+        );
+        assert!(!is_shown_child_at(above.0 as isize, outside));
+
+        unsafe { ShowWindow(above, SW_HIDE) }.ok().ok();
+        pump(20);
+        assert!(
+            is_shown_child_at(below.0 as isize, inside),
+            "once the sibling is hidden the lower child is the one on screen"
+        );
+        let _ = unsafe { DestroyWindow(above) };
+        let _ = unsafe { DestroyWindow(below) };
+        pump(20);
     }
 
     #[test]
