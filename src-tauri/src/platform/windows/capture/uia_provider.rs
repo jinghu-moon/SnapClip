@@ -103,6 +103,8 @@ type NodeKey = usize;
 struct ExpandedLevel {
     _parent: IUIAutomationElement,
     children: Vec<(IUIAutomationElement, WalkNode)>,
+    /// Children without a usable rectangle, in provider order (see `containing_children`).
+    hollow: Vec<IUIAutomationElement>,
     stats: LevelStats,
 }
 
@@ -192,67 +194,96 @@ impl UiaDeepSelectionProvider {
     ///
     /// One `BuildUpdatedCache` + one `GetCachedChildren` probe the whole level; the per-child
     /// geometry reads are then in-process (docs/18 §11 ①).
-    fn expand(
-        request: &IUIAutomationCacheRequest,
-        parent: &IUIAutomationElement,
-    ) -> (Vec<(IUIAutomationElement, WalkNode)>, LevelStats) {
-        let mut stats = LevelStats::default();
-        let Ok(parent) = (unsafe { parent.BuildUpdatedCache(request) }) else {
-            return (Vec::new(), stats);
+    fn expand(request: &IUIAutomationCacheRequest, parent: &IUIAutomationElement) -> ExpandedLevel {
+        let mut level = ExpandedLevel {
+            _parent: parent.clone(),
+            children: Vec::new(),
+            hollow: Vec::new(),
+            stats: LevelStats::default(),
         };
-        let Ok(children) = (unsafe { parent.GetCachedChildren() }) else {
-            return (Vec::new(), stats);
+        let Ok(cached) = (unsafe { parent.BuildUpdatedCache(request) }) else {
+            return level;
+        };
+        let Ok(children) = (unsafe { cached.GetCachedChildren() }) else {
+            return level;
         };
         let count = unsafe { children.Length() }.ok().unwrap_or(0).max(0) as usize;
-        let mut expanded = Vec::with_capacity(count);
+        level.children.reserve(count);
         for index in 0..count {
-            stats.raw += 1;
+            level.stats.raw += 1;
             let Ok(child) = (unsafe { children.GetElement(index as i32) }) else {
                 continue;
             };
             let Some(node) = Self::cached_node(&child) else {
-                stats.empty += 1;
+                level.stats.empty += 1;
+                level.hollow.push(child);
                 continue;
             };
             if node.offscreen {
-                stats.offscreen += 1;
+                level.stats.offscreen += 1;
             }
-            expanded.push((child, node));
+            level.children.push((child, node));
         }
-        (expanded, stats)
+        level
     }
 
     /// Every descendable child of a node that contains `point`, topmost (last listed by the provider) first.
     ///
     /// Returning *all* containing candidates (not just the first) is what makes structural
     /// backtracking possible: when the first one dead-ends, the walk must be able to come
-    /// back and try the next branch (docs/18 §12.6 ①). Children are read from the per-window
-    /// table when that level was already expanded, so moving between controls of one window
-    /// only pays for the levels it has not seen yet.
+    /// back and try the next branch (docs/18 §12.6 ①).
+    ///
+    /// A child without a rectangle is not necessarily a leaf: File Explorer's navigation pane
+    /// groups its tree items under nodes such as "桌面" that report `(0,0)-(0,0)` while their
+    /// items have real rectangles under the cursor (measured: every point of the pane resolved to
+    /// the whole pane). Such a node cannot be ranked against its siblings, so it is only looked
+    /// through when nothing with a rectangle explains the point — topmost-listed first, like the
+    /// rest of the walk, and through further hollow levels until a candidate turns up.
     fn containing_children(
         &mut self,
-        hwnd: isize,
         request: &IUIAutomationCacheRequest,
         parent: &IUIAutomationElement,
         parent_bounds: Rect,
         point: Point,
         budget: &mut WalkBudget,
     ) -> Vec<(IUIAutomationElement, WalkNode)> {
+        let mut candidates = Vec::new();
+        let mut hollow = Vec::new();
+        self.collect_level(request, parent, parent_bounds, point, budget, &mut candidates, &mut hollow);
+        while candidates.is_empty() {
+            let Some(next) = hollow.pop() else {
+                break;
+            };
+            self.collect_level(request, &next, parent_bounds, point, budget, &mut candidates, &mut hollow);
+        }
+        candidates
+    }
+
+    /// Append one node's containing, on-screen children (topmost first) to `candidates` and its
+    /// rectangle-less children to `hollow` (provider order, so `pop` takes the topmost first).
+    ///
+    /// Children are read from the per-window table when that level was already expanded, so
+    /// moving between controls of one window only pays for the levels it has not seen yet.
+    #[allow(clippy::too_many_arguments)]
+    fn collect_level(
+        &mut self,
+        request: &IUIAutomationCacheRequest,
+        parent: &IUIAutomationElement,
+        parent_bounds: Rect,
+        point: Point,
+        budget: &mut WalkBudget,
+        candidates: &mut Vec<(IUIAutomationElement, WalkNode)>,
+        hollow: &mut Vec<IUIAutomationElement>,
+    ) {
         // The element's own identity, never its rectangle: two nodes may share a rectangle.
-        let _ = hwnd;
         let key: NodeKey = parent.as_raw() as usize;
-        let level = self.children.entry(key).or_insert_with(|| {
-            let (children, stats) = Self::expand(request, parent);
-            ExpandedLevel {
-                _parent: parent.clone(),
-                children,
-                stats,
-            }
-        });
+        let level = self
+            .children
+            .entry(key)
+            .or_insert_with(|| Self::expand(request, parent));
         let stats = level.stats;
-        let children = &level.children;
-        let mut candidates: Vec<(IUIAutomationElement, WalkNode)> = Vec::new();
-        for (child, node) in children {
+        let first = candidates.len();
+        for (child, node) in &level.children {
             if !budget.take_node() {
                 break;
             }
@@ -270,13 +301,20 @@ impl UiaDeepSelectionProvider {
             }
             candidates.push((child.clone(), *node));
         }
+        // Each hollow child costs a node of budget, which also bounds the look-through.
+        for child in &level.hollow {
+            if !budget.take_node() {
+                break;
+            }
+            hollow.push(child.clone());
+        }
         // The reference selector's order (`uia/cache.rs`: `children.hit_before(point, usize::MAX)`):
         // the child the provider lists **last** wins, i.e. the one painted on top. Ordering by area
         // instead ("smallest wins") descended into a childless dead leaf at a Chromium window root,
         // where two overlapping panes contain the cursor and the *smaller* one has no children —
         // measured: a browser page scored 3/23 fixtures with the area order and 21/23 with this one,
         // while a real File Explorer window also improved (3/25 → 12/25 points reached control level).
-        candidates.reverse();
+        candidates[first..].reverse();
         self.level += 1;
         self.metrics.log_line(
             &format!(
@@ -290,11 +328,10 @@ impl UiaDeepSelectionProvider {
                 stats.raw,
                 stats.empty,
                 stats.offscreen,
-                candidates.len()
+                candidates.len() - first
             ),
             false,
         );
-        candidates
     }
 
     /// Number of expanded levels held for the current generation (diagnostics and tests).
@@ -407,7 +444,6 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
             // make progress.
             let mut candidates: Vec<(IUIAutomationElement, WalkNode)> = self
                 .containing_children(
-                    job.window.hwnd,
                     &request,
                     &current,
                     current_bounds,
