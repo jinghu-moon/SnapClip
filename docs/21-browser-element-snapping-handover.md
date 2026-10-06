@@ -448,11 +448,12 @@ last precision unavailable answer "SnapClipCaptureOverlay" 3840x2160 is not a de
 **剩下的一半（仍需实机确认）**：遮罩不再挡住命中测试之后，用户那页会落到两种结果之一——
 
 1. `adopted …`：走查虽然停在整窗（`depth=4, Complete`），provider 的更细盒子成了答案 → 现象消失。
-2. `not-finer provider=… walk=…`：那个点在 Chromium 的无障碍树里确实没有更细的可捕获节点
-   （Tailwind 这类 SPA 大量无 role 无文本的 `<div>` 会被无障碍树剪掉；夹具里
+2. `not-finer provider=… walk=…`：provider 的盒子没比整窗更细。**这一类的第一种成因不是"树里没有
+   更细的节点"，而是"它的盒子是布局盒"——见 §5.9**；只有排除了那一类，剩下的才是"那个点确实没有更细
+   的可捕获节点"（Tailwind 这类 SPA 大量无 role 无文本的 `<div>` 会被无障碍树剪掉；夹具里
    `checkbox`/`radio`/`para`/`table-cell-1`/`code-box` 五个 `optional` 行就是这个形状：走查与
-   `ElementFromPoint` 都答整页 `1784x1125`）。若实机是这一类，则 UIA 路线到此为止——要按 DOM 盒子
-   捕获就必须换数据源（用户自己 `docs/20` 里设计的那条路）。
+   `ElementFromPoint` 都答整页 `1784x1125`）。若是后者，UIA 路线到此为止——要按 DOM 盒子捕获就必须
+   换数据源（用户自己 `docs/20` 里设计的那条路）。
 
 两种都会在**每次会话强制输出**的 `last precision …` 行里明确写出来，不再需要 verbose。
 
@@ -482,6 +483,45 @@ provider 认为"最内层"的那个盒子是哪一个。
 补充：同一次运行若带上 `SNAPCLIP_WIN_DETECT_VERBOSE=1`，`refinement level #N node=… parent=… raw=…
 empty=… offscreen=… containing=…` 会逐层说明走查是在哪一层、因为什么（子节点数为 0 / 没有子节点含光标）
 停下来的。
+
+### 5.9 可见部分：布局盒，以及"更细"的判据（2026-10-06）
+
+遮罩修好之后（`fc9abb3`）用户的第二次运行给出了**下一层**的证据：
+
+```text
+refinement_precision_adopted=3  refinement_precision_not_finer=26  refinement_precision_unavailable=0
+last precision not-finer provider=1153x22623 at (1567,-9870) type=50026
+                class="min-h-8 text-message relative flex w-full flex-col items-end gap-2 text-start
+                       break-words whitespace-normal outline-none keyboard-focused:focus-ring
+                       [.text-message+&]:mt-1"  walk=3771x1923 at (63,159)
+```
+
+**几何是对的，判据是错的。** 那个 `class` 是**一条消息气泡**，22623 px 高、起点在屏幕上方——它就是
+光标底下的元素（一条很长的回答），只是 Chromium 报的是它的**布局盒**（含滚出视口的部分）。我们的规则
+拿"未裁切的面积"去比整窗（26M > 7.25M），于是把一个**比整窗更具体**的盒子判成"更粗"，退回了整窗。
+
+**修法（`fa76cc6`）**：候选框先按**祖先链 ∩ 窗口**裁成"可见部分"，再比较、再发布。
+
+- 对出现在视口内的普通元素，裁切是恒等操作：**零额外开销**（逐个祖先读矩形是跨进程调用，实测在
+  Explorer 的深链上会让 p95 涨 100 ms）。所以只有"原始框超出窗口"时才走那条路。
+- 裁切只在**结果仍含光标**时生效：Explorer 的虚拟化条目会报空/过时矩形（docs/18 §12.7），
+  一个和命中测试矛盾的祖先不允许把答案裁没（第一版没有这个守卫，实测
+  `provider_hit_available=24/25`，命中测试白白变成"不可用"）。
+- 走查自己发布的每一层同样按上一级裁切（同一个形状也会从走查侧漏出来）。
+
+**门禁**：夹具新增 `deep-scroll-box`/`deep-item` —— 一个 20000 px 高的元素放在 100 px 高、已滚到
+5000 px 的滚动视口里，Chromium 实测报 `358x20000 at (73,-3983)`（与用户那页同形），修复后发布
+`358x100`（视口内的可见部分）：
+
+```text
+[probe] assert deep-item  expect=inside_self  expected=358x20000 @(73,-3983)  published=358x100 @(73,1017)  OK
+```
+
+同时探针把三条不变式都变成**断言**（不只是打印）：更细必被采用、每个采样点的命中测试必须可用、
+**任何发布的框都必须在窗口内**（截图只能包含屏幕上的内容）。
+
+> **订正**：`91e6b08` 的提交信息声称探针已经"断言"了前两条，实际当时只打印、没有断言（这个提交
+> 补上了，并新增第三条）。以代码为准。
 
 ---
 
