@@ -793,6 +793,49 @@ Page.captureScreenshot{ format, clip, fromSurface: true, captureBeyondViewport: 
    面积/尺寸 ≥ N px 才作为终点"（`smart-screenshot` 的磁性吸附就是这么过滤的：`display`/`visibility`/
    `opacity` + 最小 10px）。**这条需要你定**：默认选中最深元素（忠实），还是跳过无绘制包装（好用）。
 
+### 5.16 已实现：MSAA 命中源接进精度补足（2026-10-06）
+
+产品决策：**先忠实**（最深元素胜出，不加"无绘制包装层"过滤），以后再加开关。实现如下。
+
+**1. MSAA 命中源**（`platform/windows/capture/msaa_provider.rs`）
+
+- `MsaaDeepSelectionProvider::hit(hwnd, point, window_bounds)`：先 `OBJID_CLIENT`、失败再 `OBJID_WINDOW`
+  （PixPin 的 `chrome.exe` 分支同理：Chromium 的 **client** 对象才是走渲染进程命中测试的那个）；
+  `accHitTest` **循环到 `CHILDID_SELF`**（上限 8 次，oleacc 的 `AccessibleObjectFromPoint` 就是这个循环，
+  只是我们不能用它——它会先做全局命中测试，被我们的遮罩答掉，而 `HTTRANSPARENT` 对 MSAA 无效）；
+  `accLocation` 取矩形；`get_accRole`/`get_accName` 取角色与名字。
+- **可见部分**：`accLocation` 是未裁切的（夹具里 20000px 高的元素回 `358x20000`），所以照 §5.9 的规矩沿
+  `accParent()` 链逐级求交（上限 16 层），只在"结果仍含光标"时才收缩；再与窗口求交。
+- **仍然全程 deadline 保护**：走既有的 `TimedCallRunner`（168ms）+ 每代 quarantine，MSAA 卡死不会拖住查询。
+- 命中框不含光标时返回失败（而不是发布一个没盖住光标的框）。
+
+**2. 判定与记录**（`refinement_worker.rs` 的组合层 + `uia_provider.rs` 报告自己的决定）
+
+- UIA provider 不再自己记 `record_precision`，而是把"这次命中测试的判定 + 事实"存下来，由组合层
+  `take_hit_decision()` 取走——**每次查询只记一条判定**，否则两个传输会让会话汇总里的计数器翻倍、无法解读。
+- 组合层的 `adopt_msaa_hit`：把 MSAA 的**可见部分**用与 UIA 完全相同的规则判定
+  （`should_adopt_msaa_box`：非空、含光标、严格更小、且角色不是 `ROLE_SYSTEM_TEXT/STATICTEXT`），
+  采纳则追加进 `path` 并把 kind 提升为 `UiElement`。
+- 强制取证行现在一行说清三方：`walk=… uia=[…] msaa=[role=… name=… depth=… 原始盒/可见盒 ADOPTED]`。
+- 计数器语义保持"每次查询一条"：`adopted` = 至少一个传输细化了走查答案；`not-finer` = 有传输回答但没细化；
+  `unavailable` = 两个传输都没给出可用框。
+
+**3. 门禁变化（同一台机器，4K@DPI144）**
+
+| 门禁 | 之前 | 现在 |
+| --- | --- | --- |
+| 浏览器夹具断言 | 27/27（6 行因 UIA 看不见而 `optional`） | **33/33**，6 行全部改成 `expect: self` 并**通过**（`plain-div`/`checkbox`/`radio`/`para`/`code-box`/`table-cell-1`） |
+| 浏览器探针重试 | `slow_fixtures=30` | **0**（MSAA 一次就给出答案，不再需要等 UIA 树物化） |
+| 浏览器延迟 | n=72 p50 17.5 / p95 29.0 / max 34.7 ms | n=48 p50 30.3 / p95 49.8 / max 61.3 ms（+一次 MSAA 调用，约 13ms） |
+| Explorer | 12/25、中位 65.8%、25/25 命中可用、p50 58.9 / p95 69.2 / max 151.9 ms | **12/25、65.8% 不变**，25/25 可用，p50 50.4 / p95 56.9 / max 68.3 ms |
+| 单元测试 | 361 passed | 361 passed（新增 MSAA 规则断言并入既有测试） |
+
+**4. 还没做的（按 §5.15 的清单）**
+
+- **祖先链上移（↑/↓ 或滚轮）**：这是"吸附到每一个元素盒子"的最后一块——忠实策略下最深元素一定胜出，
+  要选父盒子必须能上移。**尚未实现**。
+- **无绘制包装层的开关**：用户已定"先忠实、以后再加开关"，所以本轮没有加任何可见性/尺寸过滤。
+
 ---
 
 ## 6. 实测踩坑清单（每条都花了时间，务必先读）

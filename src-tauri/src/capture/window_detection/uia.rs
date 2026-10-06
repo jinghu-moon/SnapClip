@@ -145,6 +145,20 @@ pub fn is_structural_wrapper(parent: Rect, node: WalkNode) -> bool {
 /// `UIA_TextControlTypeId`: a run of glyphs, not a control.
 pub const TEXT_CONTROL_TYPE: i32 = 50020;
 
+/// MSAA roles that describe a bare text run rather than a box (docs/21 §5.15).
+///
+/// `ROLE_SYSTEM_STATICTEXT` / `ROLE_SYSTEM_TEXT` are the MSAA equivalents of the UIA `Text`
+/// control type the product refuses to adopt: publishing the glyphs inside a control instead of
+/// the control is a product decision, and it has to hold for both transports.
+pub const MSAA_STATIC_TEXT_ROLE: i32 = 0x29;
+pub const MSAA_TEXT_ROLE: i32 = 0x2a;
+
+/// The core of every refinement rule: the provider's box is used only when it is a strict
+/// refinement of the walk's answer (non-empty, still under the cursor, strictly smaller).
+pub fn is_finer_refinement(walk: Rect, hit: Rect, point: Point) -> bool {
+    !hit.is_empty() && hit.contains(point) && hit.area() < walk.area()
+}
+
 /// Whether `child` is the glyph run *inside* the element it labels rather than a target of its own.
 ///
 /// Measured on Chromium: `<a>Link Two</a>` is exposed as a 168x56 `Hyperlink` **with a 56x20
@@ -181,10 +195,16 @@ pub fn should_adopt_provider_box(
     hit_control_type: i32,
     point: Point,
 ) -> bool {
-    !hit.is_empty()
-        && hit.contains(point)
-        && hit_control_type != TEXT_CONTROL_TYPE
-        && hit.area() < walk.area()
+    is_finer_refinement(walk, hit, point) && hit_control_type != TEXT_CONTROL_TYPE
+}
+
+/// The same rule for a box whose "is it a bare text run?" answer comes from an MSAA role.
+///
+/// MSAA and UIA are separate transports over the same page, and the candidate they offer is
+/// compared against the walk's answer with the same rule (docs/21 §5.16).
+pub fn should_adopt_msaa_box(walk: Rect, hit: Rect, hit_role: i32, point: Point) -> bool {
+    is_finer_refinement(walk, hit, point)
+        && !matches!(hit_role, MSAA_TEXT_ROLE | MSAA_STATIC_TEXT_ROLE)
 }
 
 /// Result of a bounded walk.
@@ -438,6 +458,18 @@ mod tests {
             50033,
             point
         ));
+        // The MSAA transport answers the same question with a role instead of a control type.
+        assert!(should_adopt_msaa_box(walk, finer, 0x14, point), "a grouping");
+        assert!(
+            !should_adopt_msaa_box(walk, finer, MSAA_STATIC_TEXT_ROLE, point),
+            "ROLE_SYSTEM_STATICTEXT is the text run inside the box"
+        );
+        assert!(!should_adopt_msaa_box(walk, finer, MSAA_TEXT_ROLE, point));
+        assert!(!should_adopt_msaa_box(walk, walk, 0x14, point), "equal is not finer");
+        assert!(
+            !should_adopt_msaa_box(walk, rect(500, 500, 900, 900), 0x14, point),
+            "off the cursor is not an answer for it"
+        );
     }
 
     #[test]

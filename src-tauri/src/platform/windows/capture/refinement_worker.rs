@@ -33,33 +33,164 @@ use ::windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_APP};
 use crate::capture::diagnostics::WindowDetectionMetrics;
 use crate::capture::geometry::{Point, Rect};
 use crate::capture::window_detection::deep::{
-    DeepSelectionProvider, QueryControl, RefinementJob, RefinementOutcome, StopReason,
+    DeepSelectionProvider, DeepTarget, QueryControl, RefinementJob, RefinementOutcome, StopReason,
 };
-use crate::capture::window_detection::model::{RequestGate, RequestId, SnapshotEpoch, WindowIdentity};
+use crate::capture::window_detection::model::{
+    RequestGate, RequestId, SnapshotEpoch, TargetKind, WindowIdentity,
+};
+use crate::capture::window_detection::uia::{MAX_PATH_LEN, should_adopt_msaa_box};
 
-use super::msaa_provider::MsaaDeepSelectionProvider;
+use super::msaa_provider::{MsaaDeepSelectionProvider, MsaaHitBox, MsaaHitFailure};
 use super::uia_provider::UiaDeepSelectionProvider;
 use super::win::window as win32;
 
-/// UIA first, MSAA as the fallback (docs/18 §12.3).
+/// UIA for the tree walk, MSAA for a second opinion on the point (docs/18 §12.3, docs/21 §5.16).
 ///
-/// The order matters: UIA is the richer tree and the one the path/level work is built on;
-/// MSAA only gets asked when UIA has nothing to say for this window (`Unsupported`). A window
-/// that UIA answered — even partially — is never re-queried through MSAA, so a slow MSAA
-/// provider cannot slow down the normal case.
-struct FallbackDeepSelection {
+/// The division of labour is measured, not assumed. UIA owns the path/level work and the page's
+/// exposed structure; MSAA's `accHitTest` goes through Chromium's *renderer* hit test
+/// (`BrowserAccessibilityWin::accHitTest` -> `CachingAsyncHitTest`), which is the only way to see
+/// the layout-only boxes UIA never exposes — six fixture points that used to answer the whole page
+/// come back with their exact element boxes at ~1 ms (docs/21 §5.11). So MSAA is asked whenever UIA
+/// produced a target, and its box is adopted only by the same strict-refinement rule the UIA
+/// candidate goes through; when UIA has nothing at all for the window, MSAA is the whole answer,
+/// exactly as before.
+pub(crate) struct FallbackDeepSelection {
     uia: UiaDeepSelectionProvider,
     msaa: MsaaDeepSelectionProvider,
+    metrics: WindowDetectionMetrics,
 }
 
 impl FallbackDeepSelection {
-    fn new(metrics: WindowDetectionMetrics, pass_through: win32::HitTestPassThrough) -> Self {
+    pub(crate) fn new(
+        metrics: WindowDetectionMetrics,
+        pass_through: win32::HitTestPassThrough,
+    ) -> Self {
         Self {
             uia: UiaDeepSelectionProvider::new(metrics.clone())
                 .with_hit_test_pass_through(pass_through),
-            msaa: MsaaDeepSelectionProvider::new(metrics),
+            msaa: MsaaDeepSelectionProvider::new(metrics.clone()),
+            metrics,
         }
     }
+
+    /// Fold the MSAA hit into the published target, and report the query's **one** decision.
+    ///
+    /// One line per query, not one per transport: the forced forensics line has to answer "what did
+    /// this query look at, and what did it publish", and two counters per query would make the
+    /// session summary unreadable. The note carries both transports' raw facts, including which one
+    /// the box came from.
+    fn adopt_msaa_hit(
+        &self,
+        target: &mut DeepTarget,
+        hit: &Result<MsaaHitBox, MsaaHitFailure>,
+        uia: Option<&super::uia_provider::HitDecision>,
+        job: &RefinementJob,
+    ) -> (crate::capture::diagnostics::PrecisionOutcome, String) {
+        use crate::capture::diagnostics::PrecisionOutcome;
+        let walk = target.screen_bounds;
+        let mut note = format!(
+            "walk={}x{} at ({},{})",
+            walk.width(),
+            walk.height(),
+            walk.left,
+            walk.top
+        );
+        let uia_adopted = match uia {
+            Some(decision) => {
+                note.push_str(&format!(
+                    " uia=[{} {}]",
+                    decision_name(decision.outcome),
+                    decision.note
+                ));
+                decision.outcome == PrecisionOutcome::Adopted
+            }
+            None => false,
+        };
+        let (msaa_usable, msaa_adopted) = match hit {
+            Ok(hit) => {
+                let finer = should_adopt_msaa_box(walk, hit.visible, hit.role, job.point);
+                let adopted = finer && push_box(target, hit.visible);
+                note.push_str(&format!(
+                    " msaa=[role=0x{:x} name={:?} depth={} {}{}]",
+                    hit.role,
+                    hit.name.chars().take(24).collect::<String>(),
+                    hit.depth,
+                    describe_box(hit.raw, hit.visible),
+                    if adopted {
+                        " ADOPTED"
+                    } else if finer {
+                        " could not be appended to the path"
+                    } else {
+                        ""
+                    }
+                ));
+                (true, adopted)
+            }
+            Err(failure) => {
+                note.push_str(&format!(" msaa=[{}]", failure_name(*failure)));
+                (false, false)
+            }
+        };
+        let outcome = if msaa_adopted || uia_adopted {
+            PrecisionOutcome::Adopted
+        } else if msaa_usable || uia.is_some_and(|decision| decision.outcome != PrecisionOutcome::Unavailable) {
+            PrecisionOutcome::NotFiner
+        } else {
+            PrecisionOutcome::Unavailable
+        };
+        (outcome, note)
+    }
+}
+
+/// `adopted` / `not-finer` / `unavailable`, spelled the way the forced line does.
+fn decision_name(outcome: crate::capture::diagnostics::PrecisionOutcome) -> &'static str {
+    use crate::capture::diagnostics::PrecisionOutcome;
+    match outcome {
+        PrecisionOutcome::Adopted => "adopted",
+        PrecisionOutcome::NotFiner => "not-finer",
+        PrecisionOutcome::Unavailable => "unavailable",
+    }
+}
+
+/// `WxH at (x,y)`, with the visible part when the ancestors trimmed the box.
+fn describe_box(raw: Rect, visible: Rect) -> String {
+    if raw == visible {
+        format!("{}x{} at ({},{})", raw.width(), raw.height(), raw.left, raw.top)
+    } else {
+        format!(
+            "{}x{} at ({},{}) visible={}x{} at ({},{})",
+            raw.width(),
+            raw.height(),
+            raw.left,
+            raw.top,
+            visible.width(),
+            visible.height(),
+            visible.left,
+            visible.top
+        )
+    }
+}
+
+/// Why MSAA had no box, spelled the way the forced line does.
+fn failure_name(failure: MsaaHitFailure) -> &'static str {
+    match failure {
+        MsaaHitFailure::Busy => "busy",
+        MsaaHitFailure::TimedOut => "timeout",
+        MsaaHitFailure::Unavailable => "unavailable",
+    }
+}
+
+/// Append a box the caller has already judged finer, keeping the target's kind honest.
+fn push_box(target: &mut DeepTarget, bounds: Rect) -> bool {
+    if target.path.len() >= MAX_PATH_LEN {
+        return false;
+    }
+    if target.path.last() != Some(&bounds) {
+        target.path.push(bounds);
+    }
+    target.screen_bounds = bounds;
+    target.kind = TargetKind::UiElement;
+    true
 }
 
 impl DeepSelectionProvider for FallbackDeepSelection {
@@ -69,12 +200,22 @@ impl DeepSelectionProvider for FallbackDeepSelection {
         window_bounds: Rect,
         control: &QueryControl<'_>,
     ) -> RefinementOutcome {
-        match self.uia.resolve(job, window_bounds, control) {
-            RefinementOutcome::Empty(StopReason::Unsupported) => {
-                self.msaa.resolve(job, window_bounds, control)
-            }
-            other => other,
-        }
+        let outcome = self.uia.resolve(job, window_bounds, control);
+        // Whatever the hit test decided belongs to *this* query only.
+        let uia = self.uia.take_hit_decision();
+        let RefinementOutcome::Target(mut target) = outcome else {
+            return match outcome {
+                // UIA has nothing for this window at all: MSAA is the whole answer, as before.
+                RefinementOutcome::Empty(StopReason::Unsupported) => {
+                    self.msaa.resolve(job, window_bounds, control)
+                }
+                other => other,
+            };
+        };
+        let hit = self.msaa.hit(job.window.hwnd, job.point, window_bounds);
+        let (decision, note) = self.adopt_msaa_hit(&mut target, &hit, uia.as_ref(), job);
+        self.metrics.record_precision(decision, &note);
+        RefinementOutcome::Target(target)
     }
 
     fn release(&mut self) {

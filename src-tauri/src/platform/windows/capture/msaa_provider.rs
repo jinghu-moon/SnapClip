@@ -35,7 +35,41 @@ pub const MSAA_REQUEST_TIMEOUT: Duration = Duration::from_millis(168);
 /// `OBJID_WINDOW` / `CHILDID_SELF` are stable ABI values; the `windows` crate exposes them from
 /// a module this build does not import, so they are named here with their documented values.
 const OBJID_WINDOW: u32 = 0;
+/// `OBJID_CLIENT`: for Chromium this is the object whose `accHitTest` runs the renderer's own hit
+/// test, which is what sees the layout-only boxes UIA never exposes (docs/21 §5.11).
+const OBJID_CLIENT: u32 = u32::MAX - 3; // 0xFFFF_FFFC, i.e. -4
 const CHILDID_SELF: i32 = 0;
+
+/// How many `accHitTest` steps a single query may take before the answer is treated as unusable.
+const MAX_HIT_DEPTH: u32 = 8;
+/// How many ancestors may trim the box on its way up.
+const MAX_CLIP_DEPTH: usize = 16;
+
+/// What one MSAA hit test found, in the shape the refinement pipeline consumes (docs/21 §5.16).
+#[derive(Debug, Clone)]
+pub(crate) struct MsaaHitBox {
+    /// What `accLocation` reported. Unclipped: a scrolled container answers with its layout box.
+    pub raw: Rect,
+    /// The part of `raw` that survives its ancestors and the window — what may be published.
+    pub visible: Rect,
+    /// MSAA role (`ROLE_SYSTEM_*`), for the bare-text rule and the forensics.
+    pub role: i32,
+    /// Accessible name, for the forensics.
+    pub name: String,
+    /// How many `accHitTest` steps it took to reach `CHILDID_SELF`.
+    pub depth: u32,
+}
+
+/// Why a hit test produced no box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MsaaHitFailure {
+    /// A call is already in flight; the caller should retry on the next dwell.
+    Busy,
+    /// The provider wedged and is quarantined for this generation.
+    TimedOut,
+    /// The provider answered nothing usable.
+    Unavailable,
+}
 
 /// MSAA provider: one hit test per query, deadline-bounded, with per-window quarantine.
 pub struct MsaaDeepSelectionProvider {
@@ -67,6 +101,54 @@ impl MsaaDeepSelectionProvider {
             );
         }
     }
+
+    /// One deadline-bounded MSAA hit test on this window's **own** accessible object.
+    ///
+    /// `OBJID_CLIENT` first, `OBJID_WINDOW` as the fallback. Nothing global is involved, which is
+    /// the whole point: `AccessibleObjectFromPoint` is answered by the capture overlay (and
+    /// `WM_NCHITTEST -> HTTRANSPARENT`, which saves the UIA transport, does not save MSAA), whereas
+    /// asking the window itself never involves whatever is stacked on top of it (docs/21 §5.11).
+    pub(crate) fn hit(
+        &mut self,
+        hwnd: isize,
+        point: Point,
+        window_bounds: Rect,
+    ) -> Result<MsaaHitBox, MsaaHitFailure> {
+        // Cheapest possible guard: never call into a window the system already considers hung.
+        let window = HWND(hwnd as *mut core::ffi::c_void);
+        if unsafe { IsHungAppWindow(window) }.as_bool() {
+            self.metrics.record_refinement_msaa_timeout();
+            self.quarantine(hwnd, "hung");
+            return Err(MsaaHitFailure::TimedOut);
+        }
+        // The closure moves to a detached thread, and `HWND` is a raw pointer that is not `Send`;
+        // the handle travels as its integer form and is rebuilt on the other side.
+        let metrics = self.metrics.clone();
+        let outcome = self.runner.run(
+            move || {
+                metrics.record_refinement_msaa_attempt();
+                msaa_hit_test(HWND(hwnd as *mut core::ffi::c_void), point, window_bounds)
+            },
+            MSAA_REQUEST_TIMEOUT,
+        );
+        match outcome {
+            // Admission failure says nothing about the window: retry on the next dwell.
+            TimedOutcome::Busy => {
+                self.metrics.record_refinement_msaa_busy();
+                Err(MsaaHitFailure::Busy)
+            }
+            TimedOutcome::TimedOut => {
+                self.metrics.record_refinement_msaa_timeout();
+                self.quarantine(hwnd, "timeout");
+                Err(MsaaHitFailure::TimedOut)
+            }
+            TimedOutcome::Completed(None) => {
+                self.metrics.record_refinement_msaa_failure();
+                Err(MsaaHitFailure::Unavailable)
+            }
+            TimedOutcome::Completed(Some(hit)) => Ok(hit),
+        }
+    }
 }
 
 impl DeepSelectionProvider for MsaaDeepSelectionProvider {
@@ -85,42 +167,14 @@ impl DeepSelectionProvider for MsaaDeepSelectionProvider {
             return RefinementOutcome::Empty(StopReason::Cancelled);
         }
         // Cheapest possible guard: never call into a window the system already considers hung.
-        let window = HWND(hwnd as *mut core::ffi::c_void);
-        if unsafe { IsHungAppWindow(window) }.as_bool() {
-            self.metrics.record_refinement_msaa_timeout();
-            self.quarantine(hwnd, "hung");
-            return RefinementOutcome::Empty(StopReason::Unsupported);
-        }
-
-        let point = job.point;
-        // The closure moves to a detached thread, and `HWND` is a raw pointer that is not
-        // `Send`; the handle travels as its integer form and is rebuilt on the other side.
-        let hwnd_value = hwnd;
-        let metrics = self.metrics.clone();
-        let outcome = self.runner.run(
-            move || {
-                metrics.record_refinement_msaa_attempt();
-                msaa_hit_test(HWND(hwnd_value as *mut core::ffi::c_void), point)
-            },
-            MSAA_REQUEST_TIMEOUT,
-        );
-
-        match outcome {
-            // Admission failure says nothing about the window: retry on the next dwell.
-            TimedOutcome::Busy => {
-                self.metrics.record_refinement_msaa_busy();
-                RefinementOutcome::Empty(StopReason::ProviderTimeout)
-            }
-            TimedOutcome::TimedOut => {
-                self.metrics.record_refinement_msaa_timeout();
-                self.quarantine(hwnd, "timeout");
-                RefinementOutcome::Empty(StopReason::ProviderTimeout)
-            }
-            TimedOutcome::Completed(None) => {
-                self.metrics.record_refinement_msaa_failure();
+        match self.hit(hwnd, job.point, window_bounds) {
+            Err(MsaaHitFailure::Busy) => RefinementOutcome::Empty(StopReason::ProviderTimeout),
+            Err(MsaaHitFailure::TimedOut) => RefinementOutcome::Empty(StopReason::ProviderTimeout),
+            Err(MsaaHitFailure::Unavailable) => {
                 RefinementOutcome::Empty(StopReason::ProviderFailure)
             }
-            TimedOutcome::Completed(Some(hit)) => {
+            Ok(hit) => {
+                let hit = hit.visible;
                 let mut path = vec![window_bounds];
                 if hit != window_bounds && !hit.is_empty() {
                     path.push(hit);
@@ -156,33 +210,112 @@ impl DeepSelectionProvider for MsaaDeepSelectionProvider {
 /// One MSAA hit test, run inside the deadline-bounded runner.
 ///
 /// Runs on a detached thread, so it must initialise COM itself.
-fn msaa_hit_test(window: HWND, point: Point) -> Option<Rect> {
+fn msaa_hit_test(window: HWND, point: Point, window_bounds: Rect) -> Option<MsaaHitBox> {
     use ::windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
     // MSAA providers are apartment-bound; a failure here (for example `RPC_E_CHANGED_MODE`)
     // means COM was already initialised, which is fine.
     let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
 
+    let mut current = accessible_for(window, OBJID_CLIENT)
+        .or_else(|| accessible_for(window, OBJID_WINDOW))?;
+    // `accHitTest` hands back either "this object is it" (`CHILDID_SELF`) or the child that owns the
+    // point; oleacc's own `AccessibleObjectFromPoint` loops until the former, and a provider is free
+    // to answer one level at a time, so the loop is bounded rather than assumed to be absent.
+    let mut depth = 0;
+    loop {
+        let hit = unsafe { current.accHitTest(point.x, point.y) }.ok()?;
+        let vt = unsafe { hit.Anonymous.Anonymous.vt };
+        if vt == VT_I4 {
+            break;
+        }
+        if vt != VT_DISPATCH {
+            return None;
+        }
+        let dispatch = unsafe { &hit.Anonymous.Anonymous.Anonymous.pdispVal };
+        current = dispatch.as_ref()?.cast::<IAccessible>().ok()?;
+        depth += 1;
+        if depth >= MAX_HIT_DEPTH {
+            break;
+        }
+    }
+
+    let raw = location_of(&current, &child_self())?;
+    // A renderer hit test that names a node whose box does not cover the cursor is not an answer for
+    // this point (a layout box scrolled away, for instance); the caller keeps its own answer.
+    if !raw.contains(point) {
+        return None;
+    }
+    Some(MsaaHitBox {
+        raw,
+        visible: visible_part(&current, raw, point, window_bounds),
+        role: role_of(&current).unwrap_or(0),
+        name: name_of(&current).unwrap_or_default(),
+        depth,
+    })
+}
+
+/// The window's accessible object for one `OBJID`.
+fn accessible_for(window: HWND, object_id: u32) -> Option<IAccessible> {
     let mut raw: *mut core::ffi::c_void = std::ptr::null_mut();
     unsafe {
-        AccessibleObjectFromWindow(window, OBJID_WINDOW, &IAccessible::IID, &mut raw).ok()?;
+        AccessibleObjectFromWindow(window, object_id, &IAccessible::IID, &mut raw).ok()?;
     }
     if raw.is_null() {
         return None;
     }
-    let accessible: IAccessible = unsafe { IAccessible::from_raw(raw) };
+    Some(unsafe { IAccessible::from_raw(raw) })
+}
 
-    // `accHitTest` resolves the point in one call and hands back either a child id or a child
-    // object; both are turned into a rectangle with `accLocation`.
-    let hit = unsafe { accessible.accHitTest(point.x, point.y) }.ok()?;
-    match unsafe { hit.Anonymous.Anonymous.vt } {
-        VT_I4 => location_of(&accessible, &hit),
-        VT_DISPATCH => {
-            let dispatch = unsafe { &hit.Anonymous.Anonymous.Anonymous.pdispVal };
-            let child = dispatch.as_ref()?.cast::<IAccessible>().ok()?;
-            location_of(&child, &child_self())
+/// The part of `raw` that survives the node's ancestors and the window (docs/21 §5.9).
+///
+/// `accLocation` is unclipped — a container taller than its scrollport answers with its layout box,
+/// measured at 358x20000 on the fixture — so the same "what is on screen" rule the UIA transport
+/// uses has to run here. An ancestor that would clip the cursor away is ignored: a virtualised item
+/// can report an empty or stale rectangle, and it must not be allowed to remove the answer.
+fn visible_part(accessible: &IAccessible, raw: Rect, point: Point, window_bounds: Rect) -> Rect {
+    let mut visible = raw;
+    if raw.intersect(window_bounds) != raw {
+        visible = raw.intersect(window_bounds);
+    }
+    let mut current = match unsafe { accessible.accParent() }
+        .ok()
+        .and_then(|parent| parent.cast::<IAccessible>().ok())
+    {
+        Some(parent) => parent,
+        None => return visible,
+    };
+    for _ in 0..MAX_CLIP_DEPTH {
+        if let Some(parent_bounds) = location_of(&current, &child_self()) {
+            let clipped = visible.intersect(parent_bounds);
+            if !clipped.is_empty() && clipped.contains(point) {
+                visible = clipped;
+            }
         }
+        match unsafe { current.accParent() }
+            .ok()
+            .and_then(|parent| parent.cast::<IAccessible>().ok())
+        {
+            Some(parent) => current = parent,
+            None => break,
+        }
+    }
+    visible
+}
+
+/// The accessible role as an integer (`ROLE_SYSTEM_*`).
+fn role_of(accessible: &IAccessible) -> Option<i32> {
+    let role = unsafe { accessible.get_accRole(&child_self()) }.ok()?;
+    match unsafe { role.Anonymous.Anonymous.vt } {
+        VT_I4 => Some(unsafe { role.Anonymous.Anonymous.Anonymous.lVal }),
         _ => None,
     }
+}
+
+/// The accessible name, if the provider offers one.
+fn name_of(accessible: &IAccessible) -> Option<String> {
+    unsafe { accessible.get_accName(&child_self()) }
+        .ok()
+        .map(|name| name.to_string())
 }
 
 /// `accLocation` for `var_child`, converted to a screen rectangle.

@@ -64,6 +64,19 @@ pub struct UiaDeepSelectionProvider {
     /// Passes the point hit test through the capture overlay for the duration of that one call
     /// (docs/21 §5.7). Inert in tests and probes, where nothing of ours covers the desktop.
     hit_test_pass_through: win32::HitTestPassThrough,
+    /// What this provider's own point hit test decided for the most recent query (docs/21 §5.16).
+    ///
+    /// The *decision* is recorded once per query by the composite provider, which is also the side
+    /// that can ask the MSAA transport; this field is how that side learns what the UIA hit saw
+    /// without computing it twice.
+    last_hit: Option<HitDecision>,
+}
+
+/// One transport's verdict on the point hit test, for the per-query forensics line.
+#[derive(Debug, Clone)]
+pub(crate) struct HitDecision {
+    pub outcome: PrecisionOutcome,
+    pub note: String,
 }
 
 /// What the provider's own point hit test said about one query's position.
@@ -142,6 +155,7 @@ impl UiaDeepSelectionProvider {
             metrics,
             level: 0,
             hit_test_pass_through: win32::HitTestPassThrough::default(),
+            last_hit: None,
         }
     }
 
@@ -503,6 +517,14 @@ impl UiaDeepSelectionProvider {
         self
     }
 
+    /// Take what the point hit test decided for the last query (docs/21 §5.16).
+    ///
+    /// The composite provider records one decision per query, because it is also the side that can
+    /// consult MSAA; taking this leaves `None` behind, so a later query cannot inherit it.
+    pub(crate) fn take_hit_decision(&mut self) -> Option<HitDecision> {
+        self.last_hit.take()
+    }
+
     /// Number of expanded levels held for the current generation (diagnostics and tests).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn cached_levels(&self) -> usize {
@@ -755,26 +777,32 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
                     walk.top
                 ));
                 if adopted {
-                    self.metrics
-                        .record_precision(PrecisionOutcome::Adopted, &note);
+                    self.last_hit = Some(HitDecision {
+                        outcome: PrecisionOutcome::Adopted,
+                        note,
+                    });
                     self.metrics.log_line(
                         &format!("refinement adopted provider box={hit:?} (walk was coarser)"),
                         false,
                     );
                 } else if finer {
                     // Finer, but the path is full: the answer stays as the walk left it.
-                    self.metrics.record_precision(
-                        PrecisionOutcome::Unavailable,
-                        &format!("{note}: the hit could not be appended to the path"),
-                    );
+                    self.last_hit = Some(HitDecision {
+                        outcome: PrecisionOutcome::Unavailable,
+                        note: format!("{note}: the hit could not be appended to the path"),
+                    });
                 } else {
-                    self.metrics
-                        .record_precision(PrecisionOutcome::NotFiner, &note);
+                    self.last_hit = Some(HitDecision {
+                        outcome: PrecisionOutcome::NotFiner,
+                        note,
+                    });
                 }
             }
             ProviderHit::Unusable(why) => {
-                self.metrics
-                    .record_precision(PrecisionOutcome::Unavailable, &why);
+                self.last_hit = Some(HitDecision {
+                    outcome: PrecisionOutcome::Unavailable,
+                    note: why,
+                });
             }
         }
         RefinementOutcome::Target(Box::new(finish(outcome, job)))
@@ -1575,7 +1603,14 @@ mod tests {
 
         let metrics = WindowDetectionMetrics::new();
         metrics.set_verbose(true);
-        let mut provider = UiaDeepSelectionProvider::new(metrics);
+        let mut provider = UiaDeepSelectionProvider::new(metrics.clone());
+        // The assertion loop resolves through the **product's** provider chain, not the UIA provider
+        // alone: the MSAA second opinion lives in the composite (docs/21 §5.16), and a gate that
+        // skipped it would report the old behaviour no matter what the product does.
+        let mut pipeline = super::super::refinement_worker::FallbackDeepSelection::new(
+            metrics,
+            win32::HitTestPassThrough::default(),
+        );
         let walk = provider.automation().cloned().and_then(|auto| RawWalk::new(&auto));
         let hit_owner = provider.automation().cloned();
         // Fixture coordinates are viewport-relative, so the page origin — not the browser's
@@ -1658,6 +1693,7 @@ mod tests {
             // there" apart from "a level was cached while Chromium's tree was still empty".
             if std::env::var_os("SNAPCLIP_PROBE_COLD").is_some() {
                 provider.release();
+                pipeline.release();
             }
             // Bounded retries: Chromium builds its accessibility tree lazily, so the first query
             // for a window can legitimately answer "nothing below the page" and a later one finds
@@ -1673,7 +1709,7 @@ mod tests {
                 }
                 attempts += 1;
                 let query_started = std::time::Instant::now();
-                let outcome = provider
+                let outcome = pipeline
                     .resolve(&job(hwnd, point), frame, &QueryControl::refinement(&|| false));
                 latencies.push(query_started.elapsed().as_secs_f64() * 1000.0);
                 published = match &outcome {
