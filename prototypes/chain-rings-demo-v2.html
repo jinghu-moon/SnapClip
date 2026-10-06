@@ -1,0 +1,2027 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>SnapClip 智能吸附 · 整条链轮廓（③）v2 —— 动画 / UI / 布局预览</title>
+    <style>
+      :root {
+        --bg: #0e1218;
+        --panel: #161c25;
+        --panel2: #0f141b;
+        --line: #27303c;
+        --text: #d8dee7;
+        --dim: #8b95a3;
+        --accent: #3d8bfd;
+        --amber: #ffd479;
+        --green: #63d29b;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        height: 100%;
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font:
+          13px/1.55 "Segoe UI",
+          "Microsoft YaHei UI",
+          sans-serif;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
+      header {
+        padding: 12px 18px 10px;
+        border-bottom: 1px solid var(--line);
+        flex: 0 0 auto;
+      }
+      h1 {
+        font-size: 15px;
+        margin: 0 0 4px;
+        font-weight: 600;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+      .tag {
+        font-size: 10.5px;
+        color: var(--amber);
+        border: 1px solid rgba(255, 212, 121, 0.4);
+        border-radius: 3px;
+        padding: 1px 6px;
+        font-weight: 400;
+      }
+      .note {
+        color: var(--dim);
+        margin: 0 0 10px;
+        max-width: 1240px;
+        font-size: 12.5px;
+      }
+      .note code {
+        background: #1c2330;
+        padding: 1px 4px;
+        border-radius: 3px;
+      }
+      .bar {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      .seg {
+        display: flex;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        overflow: hidden;
+      }
+      .seg button {
+        background: var(--panel2);
+        color: var(--text);
+        border: 0;
+        border-right: 1px solid var(--line);
+        padding: 6px 12px;
+        cursor: pointer;
+        font: inherit;
+      }
+      .seg button:last-child {
+        border-right: 0;
+      }
+      .seg button.on {
+        background: rgba(61, 139, 253, 0.18);
+        color: #fff;
+        box-shadow: inset 0 0 0 1px var(--accent);
+      }
+      select,
+      button.mini {
+        background: var(--panel2);
+        color: var(--text);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 6px 8px;
+        font: inherit;
+        cursor: pointer;
+      }
+      .chip {
+        background: #1b2330;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        padding: 4px 8px;
+        font-variant-numeric: tabular-nums;
+        font-size: 12px;
+      }
+      main.app {
+        flex: 1 1 auto;
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 358px;
+        gap: 14px;
+        padding: 14px 18px;
+        min-height: 0;
+      }
+      .stagecell {
+        min-width: 0;
+        min-height: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      #holder {
+        position: relative;
+        flex: 0 0 auto;
+      }
+      #stage {
+        position: relative;
+        width: 1280px;
+        height: 720px;
+        background: #0a0d12;
+        border: 1px solid var(--line);
+        overflow: hidden;
+        cursor: none;
+        transform-origin: top left;
+        user-select: none;
+      }
+      #page {
+        position: absolute;
+        inset: 0;
+      }
+      #overlay {
+        position: absolute;
+        inset: 0;
+        width: 1280px;
+        height: 720px;
+      }
+      aside {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 10px 12px;
+        overflow-y: auto;
+        min-height: 0;
+      }
+      aside details {
+        border-bottom: 1px solid #1f2731;
+        padding: 2px 0 10px;
+        margin-bottom: 8px;
+      }
+      aside details:last-child {
+        border-bottom: 0;
+        margin-bottom: 0;
+      }
+      summary {
+        cursor: pointer;
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--text);
+        outline: none;
+        user-select: none;
+        list-style: none;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      summary::-webkit-details-marker {
+        display: none;
+      }
+      summary::before {
+        content: "▸";
+        color: var(--dim);
+        font-size: 10px;
+        transition: transform 0.12s;
+      }
+      details[open] > summary::before {
+        transform: rotate(90deg);
+      }
+      .shead {
+        font-weight: 400;
+        color: var(--dim);
+        font-size: 11px;
+        margin-left: auto;
+      }
+      .shead b {
+        color: var(--text);
+        font-weight: 600;
+      }
+      .shead .warn {
+        color: var(--amber);
+      }
+      .fine {
+        color: var(--dim);
+        font-size: 11.5px;
+        margin: 6px 0;
+        line-height: 1.5;
+      }
+      .kv {
+        display: flex;
+        justify-content: space-between;
+        gap: 10px;
+        margin: 4px 0;
+        font-size: 12px;
+      }
+      .kv .k {
+        color: var(--dim);
+      }
+      .kv b {
+        font-variant-numeric: tabular-nums;
+        font-weight: 600;
+      }
+      label.row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        margin: 7px 0;
+        font-size: 12px;
+      }
+      label.row .k {
+        color: var(--dim);
+      }
+      label.row > span:last-child {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+      }
+      label.row output {
+        font-variant-numeric: tabular-nums;
+      }
+      input[type="range"] {
+        width: 150px;
+      }
+      input[type="range"],
+      input[type="checkbox"] {
+        accent-color: var(--accent);
+      }
+      label.chk {
+        display: flex;
+        gap: 8px;
+        align-items: flex-start;
+        margin: 9px 0;
+        font-size: 12px;
+        cursor: pointer;
+        line-height: 1.5;
+      }
+      label.chk input {
+        margin-top: 3px;
+      }
+      #strip {
+        display: block;
+        background: var(--panel2);
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        margin: 8px 0 2px;
+      }
+      /* ---------- 图层栈 ---------- */
+      #stack {
+        position: relative;
+        max-height: 262px;
+        overflow: auto;
+        margin-top: 4px;
+        border: 1px solid #1f2731;
+        border-radius: 6px;
+        background: var(--panel2);
+        user-select: none;
+      }
+      #stack::before {
+        content: "";
+        position: absolute;
+        left: 15px;
+        top: 10px;
+        bottom: 10px;
+        width: 1px;
+        background: #2a323d;
+      }
+      .lrow {
+        display: grid;
+        grid-template-columns: 32px minmax(0, 1fr);
+        gap: 2px 4px;
+        align-items: center;
+        padding: 3px 8px 3px 0;
+        cursor: pointer;
+      }
+      .lrow:hover {
+        background: #1a212c;
+      }
+      .lrow.rsel {
+        background: rgba(61, 139, 253, 0.13);
+      }
+      .dot {
+        width: 32px;
+        display: flex;
+        justify-content: center;
+        position: relative;
+        z-index: 1;
+      }
+      .dot i {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+      }
+      .lrow.keep .dot i {
+        background: rgba(61, 139, 253, 0.85);
+        box-shadow: 0 0 0 1px rgba(61, 139, 253, 0.45);
+      }
+      .lrow.rsel .dot i {
+        background: var(--accent);
+        box-shadow: 0 0 6px rgba(61, 139, 253, 0.9);
+      }
+      .lrow.skip .dot i {
+        background: var(--panel2);
+        box-shadow: inset 0 0 0 1px #4a5563;
+      }
+      .lrow.drop .dot i {
+        background: var(--panel2);
+        box-shadow: inset 0 0 0 1px var(--amber);
+      }
+      .lbody {
+        min-width: 0;
+      }
+      .ltop {
+        display: flex;
+        gap: 6px;
+        align-items: baseline;
+      }
+      .lk {
+        color: var(--dim);
+        font-variant-numeric: tabular-nums;
+        font-size: 11px;
+        flex: 0 0 auto;
+      }
+      .lname {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 12px;
+      }
+      .lname.r-inner {
+        color: #9fb6dd;
+      }
+      .ltag {
+        margin-left: auto;
+        flex: 0 0 auto;
+        font-size: 10.5px;
+      }
+      .t-keep {
+        color: var(--green);
+      }
+      .t-skip {
+        color: #7d8794;
+      }
+      .t-drop {
+        color: var(--amber);
+      }
+      .t-sel {
+        color: #fff;
+        background: var(--accent);
+        border-radius: 3px;
+        padding: 0 5px;
+      }
+      .lwhy {
+        color: var(--dim);
+        font-size: 10.5px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      /* ---------- 舞台里的"页面" ---------- */
+      .lv {
+        position: absolute;
+        font-size: 11px;
+        color: #5b6675;
+      }
+      .lv-window {
+        background: #eef1f6;
+        border-radius: 9px;
+        box-shadow: 0 24px 70px rgba(0, 0, 0, 0.55);
+      }
+      .chrome {
+        position: absolute;
+        left: 0;
+        top: 0;
+        right: 0;
+        height: 34px;
+        background: #242a34;
+        border-radius: 9px 9px 0 0;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 0 14px;
+        color: #aeb8c6;
+        font-size: 12px;
+      }
+      .dots {
+        display: flex;
+        gap: 6px;
+      }
+      .dots i {
+        width: 11px;
+        height: 11px;
+        border-radius: 50%;
+        background: #3a4350;
+      }
+      .wsub {
+        margin-left: auto;
+        color: #6d7783;
+        font-size: 11px;
+      }
+      .lv-viewport {
+        background: #f4f6f9;
+        border-radius: 0 0 8px 8px;
+      }
+      .lv-shell {
+        background: #e9edf4;
+        box-shadow: inset 0 0 0 1px rgba(120, 132, 150, 0.22);
+      }
+      .appbar {
+        position: absolute;
+        left: 0;
+        top: 0;
+        right: 0;
+        height: 28px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 0 14px;
+        background: rgba(255, 255, 255, 0.55);
+        border-bottom: 1px solid rgba(120, 132, 150, 0.18);
+      }
+      .appbar b {
+        font-size: 12px;
+        color: #4a5563;
+      }
+      .appbar span {
+        color: #8b95a3;
+        font-size: 11px;
+        margin-left: auto;
+      }
+      .lv-list {
+        background: #fff;
+        box-shadow: inset 0 0 0 1px rgba(120, 132, 150, 0.18);
+      }
+      .lv-message {
+        background: #f0f3f8;
+        border-radius: 10px;
+      }
+      .avatar {
+        position: absolute;
+        left: 12px;
+        top: 12px;
+        width: 26px;
+        height: 26px;
+        border-radius: 50%;
+        background: linear-gradient(135deg, #3d8bfd, #7a5cff);
+        color: #fff;
+        font-weight: 600;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 12px;
+      }
+      .mhead {
+        position: absolute;
+        left: 48px;
+        top: 13px;
+        font-size: 11px;
+        color: #8b95a3;
+      }
+      .mtext {
+        position: absolute;
+        left: 48px;
+        top: 28px;
+        right: 14px;
+        font-size: 12px;
+        color: #4a5563;
+      }
+      .lv-codecard {
+        background: #0f141b;
+        border-radius: 8px;
+      }
+      .lv-scroller {
+        background: #0c1118;
+        border-radius: 0 0 7px 7px;
+      }
+      .lv-pre {
+        font:
+          12px/22px Consolas,
+          "Cascadia Mono",
+          Menlo,
+          monospace;
+        color: #d4d4d4;
+      }
+      .cl {
+        position: absolute;
+        left: 8px;
+        white-space: pre;
+      }
+      .kw {
+        color: #c586c0;
+      }
+      .ty {
+        color: #4ec9b0;
+      }
+      .cmt {
+        color: #6a9955;
+      }
+      .tok {
+        color: #dcdcaa;
+      }
+      .tok[data-answer] {
+        display: inline-block;
+        height: 22px;
+        line-height: 22px;
+      }
+      .lv-wrap.we {
+        background: #f4f6f9;
+        box-shadow: inset 0 0 0 1px rgba(120, 132, 150, 0.35);
+      }
+      .lv-wrap.wo {
+        background: #e9eef6;
+        box-shadow: inset 0 0 0 1px rgba(120, 132, 150, 0.35);
+      }
+      .wrapidx {
+        position: absolute;
+        left: 5px;
+        top: 3px;
+        font-size: 9.5px;
+        color: #9aa4b2;
+      }
+      .ans {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .ans-chip {
+        background: #1b2330;
+        color: #9ecbff;
+        box-shadow: inset 0 0 0 1px #2c3a52;
+        border-radius: 6px;
+        font:
+          12px Consolas,
+          "Cascadia Mono",
+          Menlo,
+          monospace;
+      }
+      .ans-pill {
+        background: #1b2330;
+        color: #cfe0ff;
+        box-shadow: inset 0 0 0 1px #33405a;
+        border-radius: 14px;
+        font-size: 12px;
+      }
+      .ans-target {
+        background: #fff;
+        box-shadow: inset 0 0 0 1px #c6d0de;
+        border-radius: 6px;
+        color: #4a5563;
+        font-weight: 600;
+      }
+      .dec {
+        position: absolute;
+        font-size: 11px;
+        color: #7d8794;
+      }
+      .dec-user {
+        background: #dbe7ff;
+        border-radius: 10px;
+        padding: 10px 14px;
+        color: #33507e;
+      }
+      .dec-msg {
+        background: #f0f3f8;
+        border-radius: 10px;
+        padding: 10px 14px;
+        color: #5b6675;
+      }
+      .dec-input {
+        background: #eef1f6;
+        box-shadow: inset 0 0 0 1px #dbe1ec;
+        border-radius: 13px;
+        color: #9aa4b2;
+        display: flex;
+        align-items: center;
+        padding: 0 12px;
+      }
+      .dec-thumb {
+        background: #e2e7f0;
+        border-radius: 3px;
+      }
+      .dec-inspector {
+        background: #e4e9f1;
+        border-radius: 8px;
+        padding: 12px;
+        overflow: hidden;
+      }
+      .ins-title {
+        font-weight: 600;
+        color: #4a5563;
+        margin-bottom: 8px;
+        font-size: 11.5px;
+      }
+      .ins-row {
+        display: flex;
+        justify-content: space-between;
+        background: rgba(255, 255, 255, 0.7);
+        border-radius: 5px;
+        padding: 6px 8px;
+        margin: 5px 0;
+        font-size: 10.5px;
+        color: #7d8794;
+      }
+      .ins-note {
+        margin-top: 10px;
+        font-size: 10.5px;
+        color: #98a2b0;
+        line-height: 1.55;
+      }
+      .dec-card {
+        background: #f0f3f8;
+        border-radius: 10px;
+        padding: 16px 18px;
+      }
+      .dec-card h3 {
+        margin: 0 0 6px;
+        font-size: 13px;
+        color: #4a5563;
+      }
+      .dec-card p {
+        margin: 0;
+        font-size: 11.5px;
+        color: #7d8794;
+        line-height: 1.6;
+      }
+      /* 图例 */
+      .lg {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin: 4px 0;
+        font-size: 12px;
+      }
+      .sw {
+        width: 26px;
+        height: 12px;
+        border: 1px solid;
+        border-radius: 2px;
+        flex: 0 0 auto;
+      }
+      .swSel {
+        border-width: 2px;
+        border-color: var(--accent);
+        background: rgba(61, 139, 253, 0.18);
+        height: 14px;
+      }
+      .swWin {
+        border-color: rgba(200, 208, 219, 0.5);
+      }
+      footer {
+        flex: 0 0 auto;
+        padding: 8px 18px;
+        border-top: 1px solid var(--line);
+        color: var(--dim);
+        font-size: 11.5px;
+      }
+      footer b {
+        color: var(--text);
+      }
+      @media (max-width: 1120px) {
+        body {
+          overflow: auto;
+          height: auto;
+        }
+        main.app {
+          grid-template-columns: 1fr;
+        }
+        .stagecell {
+          min-height: 480px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>
+        智能吸附 · 整条链轮廓（③）— v2 交互预览
+        <span class="tag">设计预览 · 非产品实现</span>
+      </h1>
+      <p class="note">
+        规则照 <code>docs/21 §5.22</code>：锚点（窗口 / 相邻两层 / 最深答案）+
+        间距塌缩（8 px）+ <b>强制上限 7</b> + 内层低透明度。
+        这一版把方案的口头保证换成可看的数字：右栏的 present
+        计数、耗时和帧活动条来自<b>本页真实渲染循环</b>（脏标记驱动，稳定期真的不重绘）；
+        「环参与渐隐」是故意留的反面演示，用来对照「环不参加 101 ms
+        过渡」这条取舍。 几何与真机同构：9 层里有一段 1 px
+        密排，走动时看它怎么被吃掉。
+      </p>
+      <div class="bar">
+        <div class="seg" id="implSeg">
+          <button data-impl="current">当前实现</button>
+          <button data-impl="a" class="on">③a 常显</button>
+          <button data-impl="b">③b 停止后淡出</button>
+        </div>
+        <select id="scenario">
+          <option value="deep">9 层 · 真机形态（1px 密排）</option>
+          <option value="wide">4 层 · 间距全 ≥ 8px</option>
+          <option value="flat">2 层 · 窗口 + 答案</option>
+          <option value="stress">12 层 · 压力（上限断言）</option>
+        </select>
+        <span class="chip" id="levelChip">—</span>
+        <button class="mini" id="resetSel">↓ 最深</button>
+      </div>
+    </header>
+
+    <main class="app">
+      <section class="stagecell" id="stagecell">
+        <div id="holder">
+          <div id="stage">
+            <div id="page"></div>
+            <canvas id="overlay"></canvas>
+          </div>
+        </div>
+      </section>
+
+      <aside>
+        <details open>
+          <summary>图层栈<span class="shead" id="stackStats"></span></summary>
+          <div class="fine">
+            悬停行 = 在画面上定位该层（被塌缩 / 丢弃的给幽灵底色）；点击行 =
+            跳到该层。走一遍滚轮，看 1 px 密排怎么被吃、上限怎么兜底。
+          </div>
+          <div id="stack"></div>
+        </details>
+
+        <details open>
+          <summary>动画与呈现</summary>
+          <label class="chk"
+            ><input type="checkbox" id="ease" checked /><span
+              ><b>选中层 101 ms 缓动</b>（OutQuad，RectTransition
+              同款）。标签锚在缓动中的矩形、文字用目标尺寸。</span
+            ></label
+          >
+          <label class="chk"
+            ><input type="checkbox" id="ringAnim" /><span
+              ><b>环参与渐隐 180 ms —— 反面演示</b
+              >。默认关：环是静态几何，换层即时到位、静止期 0 额外
+              present。勾上后新环淡入、旧环淡出，节奏与 101 ms
+              的选中层对不齐——正是方案里「几何在撒谎」的那幅画面，present
+              计数会立刻变贵。</span
+            ></label
+          >
+          <label class="chk"
+            ><input type="checkbox" id="dim" checked /><span
+              ><b>截图变暗遮罩</b>（整屏 0.34）。</span
+            ></label
+          >
+          <p class="fine">
+            ③b（工具栏第三档）：走动结束 1.2 s 后整条链按 8 步量化淡出（≈ 8
+            帧额外满屏）；任何换层或移动光标立刻复现——对应 ArmedHint /
+            on_hover_tick 的保活语义。
+          </p>
+        </details>
+
+        <details open>
+          <summary>验证 · present 计数（真实渲染循环）</summary>
+          <div class="kv">
+            <span class="k">present（舞台满屏重绘）</span><b id="mPresent">0</b>
+          </div>
+          <div class="kv">
+            <span class="k">其中环动画帧（缓动之外的）</span><b id="mRing">0</b>
+          </div>
+          <div class="kv">
+            <span class="k">绘制耗时 last / max</span><b id="mUs">— / —</b>
+          </div>
+          <div class="kv">
+            <span class="k">循环状态</span><b id="mState">—</b>
+          </div>
+          <canvas id="strip" width="220" height="22"></canvas>
+          <div class="fine">
+            每格 = 一个 rAF 帧，亮起 = 该帧发生了一次舞台重绘。③a
+            静止期应当完全安静。
+          </div>
+          <button class="mini" id="mReset">清零计数</button>
+        </details>
+
+        <details>
+          <summary>参数（③ 生效）</summary>
+          <label class="row"
+            ><span class="k">外侧透明度</span
+            ><span
+              ><input
+                type="range"
+                id="outerAlpha"
+                min="10"
+                max="90"
+                value="45"
+              />
+              <output id="outerAlphaOut">45%</output></span
+            ></label
+          >
+          <label class="row"
+            ><span class="k">内层透明度</span
+            ><span
+              ><input
+                type="range"
+                id="innerAlpha"
+                min="0"
+                max="60"
+                value="28"
+              />
+              <output id="innerAlphaOut">28%</output></span
+            ></label
+          >
+          <label class="row"
+            ><span class="k">塌缩阈值</span
+            ><span
+              ><input type="range" id="collapse" min="0" max="24" value="8" />
+              <output id="collapseOut">8 px</output></span
+            ></label
+          >
+          <label class="row"
+            ><span class="k">选中线宽</span
+            ><span
+              ><input
+                type="range"
+                id="selWidth"
+                min="2"
+                max="5"
+                step="1"
+                value="2"
+              />
+              <output id="selWidthOut">2 px</output></span
+            ></label
+          >
+          <label class="chk"
+            ><input type="checkbox" id="keepAnswer" checked /><span
+              ><b>保留最深答案的环</b>（回程点——按 ↓ 能回去的地方）。</span
+            ></label
+          >
+          <p class="fine">
+            内层透明度 28% / 塌缩 8 px / 保留最深环 =
+            方案里留给眼睛定的三个旋钮。
+          </p>
+        </details>
+
+        <details>
+          <summary>图例</summary>
+          <div class="lg">
+            <span class="sw" id="swOuter"></span>外侧祖先 · 1 px ·
+            <b id="lgOuter">45%</b>
+          </div>
+          <div class="lg">
+            <span class="sw swSel"></span>选中层 · 洗色 +
+            <b id="lgSel">2×</b> 描边
+          </div>
+          <div class="lg">
+            <span class="sw" id="swInner"></span>内层（③ 新增）· 1 px ·
+            <b id="lgInner">28%</b>
+          </div>
+          <div class="lg">
+            <span class="sw swWin"></span>整窗：中性色 · 1× · 标签「窗口」
+          </div>
+          <p class="fine">
+            链上的环不标 k/N
+            小牌——画面上只有一个标签（选中层的）。层号看左栏图层栈。
+          </p>
+        </details>
+      </aside>
+    </main>
+
+    <footer>
+      滚轮 / <b>↑ ↓</b> 换层 · 点击画面或图层栈行 = 跳到该层 · 悬停图层栈行 =
+      定位 · 按住 <b>C</b> 对照当前实现 · <b>R</b> 回最深
+    </footer>
+
+    <script>
+      "use strict";
+      // `getElementById` wants the bare id: passing "#mPresent" returns null, and because
+      // `renderStack()` runs early in `init()`, one such throw took the rest of `init()` with it
+      // (no canvas paint, no bindings, no render loop). Accept either form so a call site that
+      // writes "#id" cannot do that again.
+      const q = (s) => document.getElementById(s.replace(/^#/, ""));
+      const stage = q("stage"),
+        holder = q("holder"),
+        page = q("page"),
+        canvas = q("overlay"),
+        ctx = canvas.getContext("2d"),
+        stackEl = q("stack"),
+        strip = q("strip"),
+        sctx = strip.getContext("2d");
+
+      const ACCENT = "61,139,253",
+        NEUTRAL = "200,208,219";
+      const MAX_RINGS = 7;
+      let stageScale = 1;
+
+      /* ---------------------------------------------------------------- 场景
+   坐标 = 1280×720 舞台上的"显示器"坐标；path[0] 永远是窗口框，
+   最后一项永远是答案 —— 与产品 DeepTarget.path 同一个约定。 */
+      const CODE_HTML = [
+        '<span class="cmt">//! docs/21 §5.22 —— ③ 整条链轮廓：锚点 + 塌缩 + 上限</span>',
+        '<span class="kw">fn</span> <span class="tok" data-answer>deep_path_local</span>(path: <span class="ty">&amp;[Rect]</span>, k: <span class="ty">usize</span>) -&gt; <span class="ty">Vec&lt;ChainRing&gt;</span> {',
+        '    <span class="kw">let mut</span> rings = Vec::new();',
+        '    <span class="kw">for</span> (i, rect) <span class="kw">in</span> path.iter().enumerate() {',
+        "        rings.push(ChainRing::classify(i, rect, k));",
+        "    }",
+        "    rings.collapse(GAP_MIN).cap(MAX_RINGS)",
+        "}",
+      ]
+        .map(
+          (h, i) =>
+            '<div class="cl" style="top:' +
+            (8 + 22 * i) +
+            'px">' +
+            h +
+            "</div>",
+        )
+        .join("");
+
+      const SCENARIOS = {
+        deep: {
+          /* 9 层：真机形态，5/6/7 三层 1px 密排 */ answerInCode: true,
+          msgText: "这个函数决定 ③ 要画哪些环 —— 滚轮往外走，看链怎么塌缩：",
+          levels: [
+            { k: "window", id: "窗口 · Chromium", rect: [40, 24, 1200, 660] },
+            {
+              k: "viewport",
+              id: "#document · 视口",
+              rect: [41, 58, 1198, 626],
+            },
+            {
+              k: "shell",
+              id: "side-pane-shell-host",
+              rect: [53, 70, 1174, 602],
+            },
+            { k: "list", id: "message-list", rect: [65, 82, 880, 566] },
+            { k: "message", id: "text-message", rect: [69, 148, 848, 330] },
+            {
+              k: "codecard",
+              id: "code-block-viewer",
+              rect: [70, 196, 846, 272],
+            },
+            { k: "scroller", id: "cm-scroller", rect: [71, 197, 844, 270] },
+            { k: "pre", id: "pre.cm-content", rect: [87, 213, 812, 222] },
+            {
+              k: "answer",
+              id: "code span · deep_path_local",
+              rect: [117, 243, 105, 22],
+            },
+          ],
+          decor: [
+            {
+              cls: "dec-user",
+              rect: [85, 96, 760, 44],
+              html: "帮我把「选区能沿祖先链走」做出来 —— 得能看出我现在在第几层。",
+            },
+            {
+              cls: "dec-msg",
+              rect: [85, 492, 760, 110],
+              html: "链上 9 层里，1 px 密排的那几层会被塌缩吃掉；走到外面之后，内层换成更淡的线保持在场。这条回复本身不在链上。",
+            },
+            {
+              cls: "dec-input",
+              rect: [73, 614, 864, 26],
+              html: "给 assistant 发消息…（装饰）",
+            },
+            { cls: "dec-thumb", rect: [933, 110, 6, 140], html: "" },
+            {
+              cls: "dec-inspector",
+              rect: [961, 82, 250, 540],
+              html:
+                '<div class="ins-title">详情面板 · 不在链上</div>' +
+                '<div class="ins-row"><span>window_hit_test</span><span>0.8 ms</span></div>' +
+                '<div class="ins-row"><span>refresh</span><span>16.6 ms</span></div>' +
+                '<div class="ins-row"><span>path 缓存</span><span>命中</span></div>' +
+                '<div class="ins-row"><span>refinement</span><span>deep</span></div>' +
+                '<div class="ins-note">这些盒子不在 path 里，永远不会被划进轮廓 —— 轮廓只画检测器验证过的祖先链。</div>',
+            },
+          ],
+        },
+        wide: {
+          /* 4 层：每层间距 ≥ 8，塌缩永远吃不掉 */
+          msgText:
+            "这一页只有 4 层，彼此都隔着 ≥ 32 px —— 塌缩永远吃不掉任何一层：",
+          levels: [
+            { k: "window", id: "窗口 · Chromium", rect: [40, 24, 1200, 660] },
+            {
+              k: "shell",
+              id: "side-pane-shell-host",
+              rect: [72, 80, 1136, 552],
+            },
+            { k: "message", id: "text-message", rect: [104, 128, 1000, 400] },
+            {
+              k: "answer",
+              id: "code chip · Vec&lt;ChainRing&gt;",
+              rect: [136, 176, 336, 26],
+              cls: "ans-chip",
+              text: "Vec<ChainRing>",
+            },
+          ],
+          decor: [
+            {
+              cls: "dec-msg",
+              rect: [104, 544, 800, 44],
+              html: "（另一条消息，装饰 —— 不在链上。）",
+            },
+            {
+              cls: "dec-input",
+              rect: [120, 598, 940, 24],
+              html: "给 assistant 发消息…（装饰）",
+            },
+          ],
+        },
+        flat: {
+          /* 2 层：窗口 + 唯一答案 */
+          levels: [
+            { k: "window", id: "窗口 · Chromium", rect: [40, 24, 1200, 660] },
+            {
+              k: "answer",
+              id: "text span · 唯一元素",
+              rect: [460, 300, 360, 28],
+              cls: "ans-pill",
+              text: "我是这个页面上唯一的吸附目标",
+            },
+          ],
+          decor: [
+            {
+              cls: "dec-card",
+              rect: [420, 200, 440, 260],
+              under: true,
+              html: "<h3>独立页面</h3><p>这个页面只有一个可吸附目标：下面那个胶囊。链上就只有窗口和它 —— 最深一层同时也是答案，按 ↓ 一步就到头。</p>",
+            },
+          ],
+        },
+        stress: {
+          /* 12 层：间距全 16px —— 「12 层 → ≤7」上限断言的可见版本 */
+          levels: [
+            { k: "window", id: "窗口", rect: [24, 16, 1232, 688] },
+            { k: "wrap", id: "wrap-1", rect: [40, 56, 1200, 632] },
+            { k: "wrap", id: "wrap-2", rect: [56, 72, 1168, 600] },
+            { k: "wrap", id: "wrap-3", rect: [72, 88, 1136, 568] },
+            { k: "wrap", id: "wrap-4", rect: [88, 104, 1104, 536] },
+            { k: "wrap", id: "wrap-5", rect: [104, 120, 1072, 504] },
+            { k: "wrap", id: "wrap-6", rect: [120, 136, 1040, 472] },
+            { k: "wrap", id: "wrap-7", rect: [136, 152, 1008, 440] },
+            { k: "wrap", id: "wrap-8", rect: [152, 168, 976, 408] },
+            { k: "wrap", id: "wrap-9", rect: [168, 184, 944, 376] },
+            { k: "wrap", id: "wrap-10", rect: [184, 200, 912, 344] },
+            {
+              k: "answer",
+              id: "目标元素",
+              rect: [200, 216, 880, 40],
+              cls: "ans-target",
+              text: "目标元素 · 12/12",
+            },
+          ],
+          decor: [],
+        },
+      };
+
+      const state = {
+        impl: "a",
+        scenario: "deep",
+        selected: 0,
+        cursor: { x: 940, y: 600 },
+        outerAlpha: 0.45,
+        innerAlpha: 0.28,
+        collapse: 8,
+        selWidth: 2,
+        keepAnswer: true,
+        dim: true,
+        ease: true,
+        ringAnim: false,
+        hoverIndex: -1,
+        peek: false,
+        shown: null,
+        anim: null,
+        hintText: "",
+        hintUntil: 0,
+        taught: false,
+        chainVis: 1,
+        lastWalk: 0,
+      };
+
+      const levelsOf = () => SCENARIOS[state.scenario].levels;
+      const deepest = () => levelsOf().length - 1;
+      const effImpl = () => (state.peek ? "current" : state.impl);
+      const optsNow = () => ({
+        impl: effImpl(),
+        collapse: state.collapse,
+        keepAnswer: state.keepAnswer,
+      });
+
+      let dirty = true;
+      function requestDraw() {
+        dirty = true;
+      }
+
+      /* ---------------------------------------------------------------- 舞台缩放 */
+      function fitStage() {
+        const cell = q("stagecell").getBoundingClientRect();
+        const s = Math.min(1, (cell.width - 4) / 1280, (cell.height - 4) / 720);
+        stageScale = Math.max(0.3, s || 0.3);
+        stage.style.transform = "scale(" + stageScale + ")";
+        holder.style.width = 1280 * stageScale + "px";
+        holder.style.height = 720 * stageScale + "px";
+        const k = (window.devicePixelRatio || 1) * stageScale;
+        canvas.width = Math.max(2, Math.round(1280 * k));
+        canvas.height = Math.max(2, Math.round(720 * k));
+        ctx.setTransform(k, 0, 0, k, 0, 0);
+        requestDraw();
+      }
+
+      /* ---------------------------------------------------------------- 页面内容
+   环和盒子用同一份几何；答案盒子的宽度渲染后从真实 DOM 量回来。 */
+      function setPos(d, r) {
+        d.style.left = r[0] + "px";
+        d.style.top = r[1] + "px";
+        d.style.width = r[2] + "px";
+        d.style.height = r[3] + "px";
+      }
+      function renderPage() {
+        page.innerHTML = "";
+        const sc = SCENARIOS[state.scenario],
+          n = sc.levels.length;
+        const decorDivs = sc.decor.map((dec) => {
+          const d = document.createElement("div");
+          d.className = "dec " + dec.cls;
+          setPos(d, dec.rect);
+          d.innerHTML = dec.html || "";
+          return d;
+        });
+        for (let i = 0; i < decorDivs.length; i++)
+          if (sc.decor[i].under) page.appendChild(decorDivs[i]);
+        sc.levels.forEach((lv, i) => {
+          if (lv.k === "answer" && sc.answerInCode) return; // 答案已在代码行里
+          const d = document.createElement("div");
+          if (lv.k === "answer") {
+            d.className = "lv ans " + (lv.cls || "ans-chip");
+            d.dataset.answer = "1";
+            d.textContent = lv.text;
+          } else {
+            d.className =
+              "lv lv-" +
+              lv.k +
+              (lv.k === "wrap" ? (i % 2 ? " wo" : " we") : "");
+            if (lv.k === "window")
+              d.innerHTML =
+                '<div class="chrome"><span class="dots"><i></i><i></i><i></i></span><span>SnapClip — 智能吸附演示</span><span class="wsub">chromium</span></div>';
+            else if (lv.k === "shell")
+              d.innerHTML =
+                '<div class="appbar"><b>智能吸附 · 对话</b><span>side-pane</span></div>';
+            else if (lv.k === "message")
+              d.innerHTML =
+                '<div class="avatar">A</div><div class="mhead">assistant</div><div class="mtext">' +
+                sc.msgText +
+                "</div>";
+            else if (lv.k === "pre") d.innerHTML = CODE_HTML;
+            else if (lv.k === "wrap")
+              d.innerHTML =
+                '<span class="wrapidx">' + (i + 1) + "/" + n + "</span>";
+          }
+          setPos(d, lv.rect);
+          page.appendChild(d);
+        });
+        for (let i = 0; i < decorDivs.length; i++)
+          if (!sc.decor[i].under) page.appendChild(decorDivs[i]);
+      }
+      function syncAnswer() {
+        const el = page.querySelector("[data-answer]");
+        if (!el) return;
+        const pr = page.getBoundingClientRect(),
+          er = el.getBoundingClientRect();
+        const s = stageScale || 1;
+        levelsOf()[deepest()].rect = [
+          (er.left - pr.left) / s,
+          (er.top - pr.top) / s,
+          er.width / s,
+          er.height / s,
+        ];
+      }
+
+      /* ------------------------------------------------------------ 环的选取规则
+   ① 锚点：窗口 / 相邻两层 / 最深答案，不考虑阈值；
+   ② 其余层与"上一条已画环"四边间距 ≥ 阈值才画；
+   ③ 强制上限：含选中层共 ≤ 7 条，先丢非锚点里间距最小、离选中层最远的。 */
+      function edgeGap(a, b) {
+        return Math.min(
+          Math.abs(a[0] - b[0]),
+          Math.abs(a[1] - b[1]),
+          Math.abs(a[0] + a[2] - b[0] - b[2]),
+          Math.abs(a[1] + a[3] - b[1] - b[3]),
+        );
+      }
+      const fmtGap = (g) =>
+        g === Infinity ? "∞" : Math.round(g * 10) / 10 + " px";
+
+      function selectRings(levels, selected, opts) {
+        const n = levels.length,
+          last = n - 1;
+        if (opts.impl === "current") {
+          return levels.map((_, i) => {
+            if (i === selected)
+              return {
+                index: i,
+                role: "selected",
+                keep: true,
+                anchor: true,
+                gap: Infinity,
+                why: "选中层（你在这）",
+              };
+            if (i < selected)
+              return {
+                index: i,
+                role: "outer",
+                keep: true,
+                anchor: false,
+                gap: Infinity,
+                why: "当前实现：祖先全画，不塌缩",
+              };
+            return {
+              index: i,
+              role: "inner",
+              keep: false,
+              anchor: false,
+              gap: Infinity,
+              why: "当前实现：选中层之内不画",
+            };
+          });
+        }
+        const anchors = new Set([selected]);
+        if (selected > 0) anchors.add(0);
+        if (selected - 1 >= 0) anchors.add(selected - 1);
+        if (selected + 1 <= last) anchors.add(selected + 1);
+        if (opts.keepAnswer && last > selected + 1) anchors.add(last);
+
+        const rows = [],
+          kept = [];
+        for (let i = 0; i < n; i++) {
+          const role =
+            i === selected ? "selected" : i < selected ? "outer" : "inner";
+          const prev = kept[kept.length - 1];
+          const gap =
+            prev === undefined
+              ? Infinity
+              : edgeGap(levels[i].rect, levels[prev].rect);
+          if (i === selected) {
+            kept.push(i);
+            rows.push({
+              index: i,
+              role,
+              keep: true,
+              anchor: true,
+              gap,
+              why: "选中层 —— 只保留一个最强信号",
+            });
+            continue;
+          }
+          if (anchors.has(i)) {
+            kept.push(i);
+            let why;
+            if (i === 0) why = "窗口：最外参照";
+            else if (i === last) why = "最深答案：按 ↓ 能回去的地方";
+            else
+              why =
+                gap === Infinity || gap >= opts.collapse
+                  ? "锚点"
+                  : "锚点（与 " +
+                    (prev + 1) +
+                    "/" +
+                    n +
+                    " 差 " +
+                    fmtGap(gap) +
+                    "，贴着也画）";
+            rows.push({ index: i, role, keep: true, anchor: true, gap, why });
+            continue;
+          }
+          if (gap >= opts.collapse) {
+            kept.push(i);
+            rows.push({
+              index: i,
+              role,
+              keep: true,
+              anchor: false,
+              gap,
+              why: "差 " + fmtGap(gap) + " ≥ " + opts.collapse + " px → 画",
+            });
+          } else {
+            rows.push({
+              index: i,
+              role,
+              keep: false,
+              anchor: false,
+              gap,
+              why:
+                "与 " +
+                (prev + 1) +
+                "/" +
+                n +
+                " 差 " +
+                fmtGap(gap) +
+                " < " +
+                opts.collapse +
+                " px → 塌缩",
+            });
+          }
+        }
+        let drawn = rows.filter((r) => r.keep);
+        if (drawn.length > MAX_RINGS) {
+          const droppable = rows
+            .filter((r) => r.keep && !r.anchor && r.index !== selected)
+            .sort(
+              (a, b) =>
+                a.gap - b.gap ||
+                Math.abs(b.index - selected) - Math.abs(a.index - selected) ||
+                b.index - a.index,
+            );
+          for (const r of droppable) {
+            if (rows.filter((x) => x.keep).length <= MAX_RINGS) break;
+            r.keep = false;
+            r.dropped = true;
+            r.why =
+              "超上限 " +
+              MAX_RINGS +
+              " → 丢弃（先丢离选中层最远 / 间距最小的非锚点）";
+          }
+        }
+        return rows;
+      }
+
+      /* ---------------------------------------------------------------- 文案 */
+      function labelFor(i) {
+        const n = levelsOf().length,
+          lv = levelsOf()[i];
+        const kind = i === 0 ? "窗口" : i === n - 1 ? "元素" : "容器";
+        let t =
+          Math.round(lv.rect[2]) +
+          "×" +
+          Math.round(lv.rect[3]) +
+          " px  " +
+          kind;
+        if (n > 1 && i !== n - 1) t += " " + (i + 1) + "/" + n;
+        return t;
+      }
+      function chip(x, y, text, border, color) {
+        ctx.font = '12px "Segoe UI","Microsoft YaHei UI",sans-serif';
+        const w = Math.ceil(ctx.measureText(text).width) + 20,
+          h = 22;
+        const cx = Math.max(2, Math.min(x, 1280 - w - 2)),
+          cy = Math.max(2, Math.min(y, 720 - h - 2));
+        ctx.fillStyle = "rgba(18,24,32,.93)";
+        ctx.strokeStyle = border;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.roundRect(cx + 0.5, cy + 0.5, w - 1, h - 1, 4);
+        ctx.fill();
+        ctx.stroke();
+        ctx.fillStyle = color;
+        ctx.textBaseline = "top";
+        ctx.fillText(text, cx + 10, cy + 5);
+      }
+
+      /* ---------------------------------------------------------------- 绘制 */
+      function draw() {
+        const levels = levelsOf(),
+          n = levels.length,
+          sel = state.selected;
+        const eff = effImpl();
+        const rows = selectRings(levels, sel, optsNow());
+        const target = levels[sel].rect;
+        const whole = sel === 0;
+        const C = whole ? NEUTRAL : ACCENT;
+        const rect = state.shown || target;
+        ctx.clearRect(0, 0, 1280, 720);
+        if (state.dim) {
+          ctx.fillStyle = "rgba(0,0,0,.34)";
+          ctx.fillRect(0, 0, 1280, 720);
+        }
+
+        const cv = eff === "b" ? state.chainVis : 1; // ③b 的整链可见度
+        const line = (r, a, w) => {
+          if (a <= 0.004) return;
+          ctx.strokeStyle = "rgba(" + C + "," + a + ")";
+          ctx.lineWidth = w;
+          const h = w % 2 ? 0.5 : 0;
+          ctx.strokeRect(
+            Math.round(r[0]) + h,
+            Math.round(r[1]) + h,
+            Math.round(r[2]) - 2 * h,
+            Math.round(r[3]) - 2 * h,
+          );
+        };
+        const ringA = (role) =>
+          role === "outer" ? state.outerAlpha : state.innerAlpha;
+
+        // 1) 链上的环（静态几何，不参加 101 ms 过渡）
+        const seen = new Set();
+        for (const row of rows) {
+          if (!row.keep || row.index === sel) continue;
+          const fx = ringFx.get(row.index);
+          const a = ringA(row.role) * cv * (fx ? fx.a : 1);
+          if (fx && fx.fill > 0.004) {
+            ctx.fillStyle = "rgba(" + C + "," + fx.fill + ")";
+            ctx.fillRect.apply(ctx, levels[row.index].rect);
+          }
+          line(levels[row.index].rect, a, 1);
+          seen.add(row.index);
+        }
+        // 反面演示：正在淡出的环（已不在当前集合里，但 180 ms 还没走完）
+        for (const entry of ringFx) {
+          const i = entry[0],
+            fx = entry[1];
+          if (seen.has(i) || i === sel || fx.a <= 0.004) continue;
+          if (fx.fill > 0.004) {
+            ctx.fillStyle = "rgba(" + C + "," + fx.fill + ")";
+            ctx.fillRect.apply(ctx, levels[i].rect);
+          }
+          line(
+            levels[i].rect,
+            ringA(i < sel ? "outer" : "inner") * cv * fx.a,
+            1,
+          );
+        }
+        // 2) 图层栈悬停定位：画着的给亮框，被吃掉的给幽灵底色
+        if (state.hoverIndex >= 0 && state.hoverIndex !== sel) {
+          const hr = levels[state.hoverIndex].rect;
+          const row = rows.find((r) => r.index === state.hoverIndex);
+          if (row && row.keep) {
+            line(hr, 0.95, 1.5);
+          } else {
+            ctx.fillStyle = "rgba(" + C + ",.06)";
+            ctx.fillRect.apply(ctx, hr);
+            line(hr, 0.5, 1);
+          }
+        }
+        // 3) 选中层：唯一参加 101 ms 过渡的几何
+        ctx.fillStyle = "rgba(" + C + "," + (whole ? 0.1 : 0.18) + ")";
+        ctx.fillRect(rect[0], rect[1], rect[2], rect[3]);
+        line(rect, 1, whole ? 1 : state.selWidth);
+        // 4) 光标
+        ctx.strokeStyle = "rgba(255,255,255,.6)";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(state.cursor.x - 9, state.cursor.y + 0.5);
+        ctx.lineTo(state.cursor.x + 9, state.cursor.y + 0.5);
+        ctx.moveTo(state.cursor.x + 0.5, state.cursor.y - 9);
+        ctx.lineTo(state.cursor.x + 0.5, state.cursor.y + 9);
+        ctx.stroke();
+        // 5) 预览标签：锚在缓动矩形、文字用目标尺寸（上面放不下翻下面）
+        const text = labelFor(sel);
+        ctx.font = '12px "Segoe UI","Microsoft YaHei UI",sans-serif';
+        const tw = Math.ceil(ctx.measureText(text).width) + 20,
+          th = 22,
+          g = 6;
+        const above = rect[1] - g - th,
+          below = rect[1] + rect[3] + g;
+        let pl = null;
+        if (above >= 0) pl = [Math.max(0, Math.min(rect[0], 1280 - tw)), above];
+        else if (below + th <= 720)
+          pl = [Math.max(0, Math.min(rect[0], 1280 - tw)), below];
+        if (pl) {
+          ctx.fillStyle = "rgba(18,24,32,.93)";
+          ctx.strokeStyle = "rgba(255,255,255,.14)";
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.roundRect(pl[0] + 0.5, pl[1] + 0.5, tw - 1, th - 1, 4);
+          ctx.fill();
+          ctx.stroke();
+          ctx.fillStyle = "#e8edf4";
+          ctx.textBaseline = "top";
+          ctx.fillText(text, pl[0] + 10, pl[1] + 5);
+        }
+        // 6) 悬停名称浮签 / 一次性提示 / 对照徽标
+        if (state.hoverIndex >= 0) {
+          const hi = state.hoverIndex,
+            hv = levels[hi];
+          const role =
+            hi === 0
+              ? "窗口"
+              : hi === n - 1
+                ? "最深答案"
+                : hi < sel
+                  ? "外侧祖先"
+                  : "内层";
+          chip(
+            hv.rect[0],
+            hv.rect[1] - 26,
+            hi + 1 + "/" + n + " · " + hv.id + " · " + role,
+            "rgba(61,139,253,.75)",
+            "#cfe0ff",
+          );
+        }
+        if (state.hintText)
+          chip(
+            state.cursor.x + 14,
+            state.cursor.y + 16,
+            state.hintText,
+            "rgba(255,212,121,.55)",
+            "#ffd479",
+          );
+        if (state.peek)
+          chip(
+            10,
+            10,
+            "对照中：当前实现（松开 C 返回 ③）",
+            "rgba(255,212,121,.5)",
+            "#ffd479",
+          );
+      }
+
+      /* ------------------------------------------------- 环的渐隐（反面演示）+ ③b 淡出 */
+      const ringFx = new Map();
+      let fxActive = false,
+        chainFading = false,
+        easingNow = false;
+
+      function recomputeRingFx(prevSel, prevRows, newRows) {
+        ringFx.clear();
+        if (!state.ringAnim || effImpl() === "current") return;
+        const prev = new Set(
+          prevRows
+            .filter((r) => r.keep && r.index !== prevSel)
+            .map((r) => r.index),
+        );
+        const cur = new Set(
+          newRows
+            .filter((r) => r.keep && r.index !== state.selected)
+            .map((r) => r.index),
+        );
+        const now = performance.now();
+        for (const i of cur) {
+          if (i === prevSel)
+            ringFx.set(i, {
+              from: 1,
+              to: 1,
+              a: 1,
+              t0: now,
+              dur: 180,
+              fillFrom: 0.18,
+              fillTo: 0,
+              fill: 0.18,
+            }); // 旧选中层：洗色淡出
+          else if (!prev.has(i))
+            ringFx.set(i, { from: 0, to: 1, a: 0, t0: now, dur: 180 }); // 新环淡入
+        }
+        for (const i of prev) {
+          if (i !== state.selected && !cur.has(i))
+            ringFx.set(i, { from: 1, to: 0, a: 1, t0: now, dur: 180 }); // 旧环淡出
+        }
+      }
+      function stepRingFx(now) {
+        if (!state.ringAnim || effImpl() === "current") {
+          ringFx.clear();
+          fxActive = false;
+          return;
+        }
+        if (!ringFx.size) {
+          fxActive = false;
+          return;
+        }
+        let active = false;
+        for (const entry of ringFx) {
+          const i = entry[0],
+            fx = entry[1];
+          const t = Math.min(1, (now - fx.t0) / fx.dur),
+            e = t * (2 - t);
+          fx.a = fx.from + (fx.to - fx.from) * e;
+          if (fx.fillFrom !== undefined)
+            fx.fill = fx.fillFrom + (fx.fillTo - fx.fillFrom) * e;
+          if (t >= 1 && fx.to === 0) ringFx.delete(i);
+          else if (t < 1) active = true;
+        }
+        fxActive = active;
+      }
+      function stepChain(now) {
+        // ③b：空闲 1.2 s 后，整链按 8 步量化淡出（≈8 帧额外满屏）
+        chainFading = false;
+        if (effImpl() !== "b") return;
+        const idle = now - state.lastWalk;
+        if (idle < 1200) {
+          if (state.chainVis !== 1) {
+            state.chainVis = 1;
+            requestDraw();
+          }
+          return;
+        }
+        const t = Math.min(1, (idle - 1200) / 240);
+        const v = Math.round((1 - t) * 8) / 8;
+        chainFading = v > 0;
+        if (v !== state.chainVis) {
+          state.chainVis = v;
+          requestDraw();
+        }
+      }
+
+      /* ---------------------------------------------------------------- 渲染循环
+   脏标记驱动：没变化就不 present —— 计数是本页真实数字，不是装饰。 */
+      let presents = 0,
+        ringFrames = 0,
+        lastUs = 0,
+        maxUs = 0;
+      const HIST = 220,
+        hist = new Uint8Array(HIST);
+      let histHead = 0;
+
+      function present() {
+        const t0 = performance.now();
+        draw();
+        const us = Math.round((performance.now() - t0) * 1000);
+        if (us > 0) lastUs = us;
+        if (us > maxUs) maxUs = us;
+        presents++;
+        if ((fxActive || chainFading) && !easingNow) ringFrames++;
+        dirty = false;
+        q("#mPresent").textContent = presents;
+        q("#mRing").textContent = ringFrames;
+        q("#mUs").textContent = lastUs + " / " + maxUs + " µs";
+      }
+      function drawStrip() {
+        sctx.clearRect(0, 0, strip.width, strip.height);
+        sctx.fillStyle = "#2a323d";
+        sctx.fillRect(0, strip.height - 3, strip.width, 3);
+        sctx.fillStyle = "rgba(61,139,253,.85)";
+        for (let k = 0; k < HIST; k++) {
+          if (!hist[(histHead + k) % HIST]) continue;
+          sctx.fillRect(k, strip.height - 3 - 11, 1, 11);
+        }
+      }
+      function updateStatus(now) {
+        let s;
+        if (easingNow) s = "选中层缓动中（101 ms）";
+        else if (fxActive) s = "环渐隐中（180 ms · 反面演示）";
+        else if (chainFading) s = "③b：链淡出中";
+        else if (effImpl() === "b") {
+          const idle = now - state.lastWalk;
+          s =
+            idle < 1200
+              ? "稳定 · " + ((1200 - idle) / 1000).toFixed(1) + " s 后淡出"
+              : "稳定 · 链已淡出（换层或动光标复现）";
+        } else s = "稳定（0 重绘）";
+        q("#mState").textContent = s;
+      }
+      function frame(now) {
+        if (state.hintText && now >= state.hintUntil) {
+          state.hintText = "";
+          requestDraw();
+        }
+        easingNow = false;
+        if (state.anim) {
+          const t = Math.min(1, (now - state.anim.start) / state.anim.dur);
+          const e = 1 - (1 - t) * (1 - t); // OutQuad
+          state.shown = state.anim.from.map(
+            (v, i) => v + (state.anim.to[i] - v) * e,
+          );
+          if (t >= 1) {
+            state.anim = null;
+            state.shown = levelsOf()[state.selected].rect.slice();
+          }
+          easingNow = true;
+          requestDraw();
+        }
+        stepRingFx(now);
+        if (fxActive) requestDraw();
+        stepChain(now);
+        let presented = false;
+        if (dirty) {
+          present();
+          presented = true;
+        }
+        hist[histHead] = presented ? 1 : 0;
+        histHead = (histHead + 1) % HIST;
+        drawStrip();
+        updateStatus(now);
+        requestAnimationFrame(frame);
+      }
+      function resetMetrics() {
+        presents = 0;
+        ringFrames = 0;
+        lastUs = 0;
+        maxUs = 0;
+        hist.fill(0);
+        drawStrip();
+        q("#mPresent").textContent = "0";
+        q("#mRing").textContent = "0";
+        q("#mUs").textContent = "— / —";
+      }
+
+      /* ---------------------------------------------------------------- 走动 */
+      function setSelected(next) {
+        const levels = levelsOf(),
+          n = levels.length;
+        const c = Math.max(0, Math.min(n - 1, next));
+        if (c === state.selected) return;
+        const prevSel = state.selected;
+        const prevRows = selectRings(levels, prevSel, optsNow());
+        const from = state.shown
+          ? state.shown.slice()
+          : levels[prevSel].rect.slice();
+        state.selected = c;
+        const to = levels[c].rect;
+        state.lastWalk = performance.now();
+        state.chainVis = 1;
+        if (state.ease)
+          state.anim = { from, to, start: performance.now(), dur: 101 };
+        else {
+          state.anim = null;
+          state.shown = to.slice();
+        }
+        recomputeRingFx(prevSel, prevRows, selectRings(levels, c, optsNow()));
+        // 一次性提示：挂着的时候继续换层会跟着走；消失后不再复活（每会话只教一次）
+        const showing =
+          performance.now() < state.hintUntil && state.hintText !== "";
+        if (!state.taught || showing) {
+          state.taught = true;
+          state.hintText =
+            "吸附层级 " + (c + 1) + "/" + n + "（1=窗口）· 滚轮 / ↑↓ 切换";
+          state.hintUntil = performance.now() + 2600;
+        }
+        renderStack();
+        requestDraw();
+      }
+      function setPeek(v) {
+        if (state.peek === v) return;
+        state.peek = v;
+        ringFx.clear();
+        if (!v) state.lastWalk = performance.now();
+        renderStack();
+        requestDraw();
+      }
+
+      /* ---------------------------------------------------------------- 侧栏 */
+      function renderStack() {
+        const levels = levelsOf(),
+          n = levels.length,
+          eff = effImpl();
+        const rows = selectRings(levels, state.selected, optsNow());
+        const drawn = rows.filter((r) => r.keep).length;
+        const dropped = rows.filter((r) => r.dropped).length;
+        const collapsed = rows.filter((r) => !r.keep && !r.dropped).length;
+        let stats = n + " 层 → 画 <b>" + drawn + "</b>（含选中层）";
+        if (drawn > MAX_RINGS && eff === "current")
+          stats += "（当前实现不封顶）";
+        stats += " · 塌缩 " + collapsed;
+        if (dropped) stats += ' · 丢弃 <b class="warn">' + dropped + "</b>";
+        stats += " · 上限 " + MAX_RINGS;
+        q("#stackStats").innerHTML = stats;
+        q("#levelChip").textContent =
+          state.selected === n - 1
+            ? n + "/" + n + " · 最深"
+            : state.selected + 1 + "/" + n;
+        q("#stack").innerHTML = rows
+          .map((r) => {
+            const i = r.index,
+              lv = levels[i];
+            const role =
+              i === state.selected
+                ? "你在这"
+                : i === 0
+                  ? "窗口"
+                  : i === n - 1
+                    ? "最深答案"
+                    : i < state.selected
+                      ? "外侧祖先"
+                      : "内层";
+            const st =
+              i === state.selected
+                ? "rsel"
+                : r.keep
+                  ? "keep"
+                  : r.dropped
+                    ? "drop"
+                    : "skip";
+            const tag =
+              i === state.selected
+                ? "你在这"
+                : r.dropped
+                  ? "丢弃"
+                  : r.keep
+                    ? "画"
+                    : eff === "current"
+                      ? "不画"
+                      : "塌缩";
+            const tc =
+              i === state.selected
+                ? "t-sel"
+                : r.dropped
+                  ? "t-drop"
+                  : r.keep
+                    ? "t-keep"
+                    : "t-skip";
+            return (
+              '<div class="lrow ' +
+              st +
+              '" data-i="' +
+              i +
+              '">' +
+              '<span class="dot"><i></i></span>' +
+              '<span class="lbody"><span class="ltop">' +
+              '<span class="lk">' +
+              (i + 1) +
+              "/" +
+              n +
+              "</span>" +
+              '<span class="lname' +
+              (r.role === "inner" ? " r-inner" : "") +
+              '">' +
+              lv.id +
+              "</span>" +
+              '<span class="ltag ' +
+              tc +
+              '">' +
+              tag +
+              "</span></span>" +
+              '<span class="lwhy">' +
+              role +
+              " · " +
+              r.why +
+              "</span></span></div>"
+            );
+          })
+          .join("");
+      }
+      function updateLegend() {
+        q("#lgOuter").textContent = Math.round(state.outerAlpha * 100) + "%";
+        q("#lgInner").textContent = Math.round(state.innerAlpha * 100) + "%";
+        q("#lgSel").textContent = state.selWidth + "×";
+        q("#swOuter").style.borderColor =
+          "rgba(61,139,253," + state.outerAlpha + ")";
+        q("#swInner").style.borderColor =
+          "rgba(61,139,253," + state.innerAlpha + ")";
+      }
+      function paintSeg() {
+        document
+          .querySelectorAll("#implSeg button")
+          .forEach((b) =>
+            b.classList.toggle("on", b.dataset.impl === state.impl),
+          );
+      }
+
+      /* ---------------------------------------------------------------- 交互 */
+      function bindEvents() {
+        stage.addEventListener("mousemove", (e) => {
+          const b = stage.getBoundingClientRect();
+          state.cursor = {
+            x: (e.clientX - b.left) / stageScale,
+            y: (e.clientY - b.top) / stageScale,
+          };
+          if (state.impl === "b") state.lastWalk = performance.now(); // 光标保活（on_hover_tick 语义）
+          requestDraw();
+        });
+        stage.addEventListener(
+          "wheel",
+          (e) => {
+            e.preventDefault();
+            setSelected(state.selected + (e.deltaY > 0 ? 1 : -1));
+          },
+          { passive: false },
+        );
+        stage.addEventListener("click", (e) => {
+          const b = stage.getBoundingClientRect();
+          const x = (e.clientX - b.left) / stageScale,
+            y = (e.clientY - b.top) / stageScale;
+          let hit = -1;
+          levelsOf().forEach((lv, i) => {
+            const r = lv.rect;
+            if (x >= r[0] && x <= r[0] + r[2] && y >= r[1] && y <= r[1] + r[3])
+              hit = i;
+          });
+          if (hit >= 0) setSelected(hit);
+        });
+        window.addEventListener("keydown", (e) => {
+          if (e.code === "KeyC" && !e.repeat) setPeek(true);
+          else if (e.code === "KeyR") setSelected(deepest());
+          else if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+            if (
+              e.target.closest &&
+              e.target.closest("input,select,button,summary")
+            )
+              return;
+            e.preventDefault();
+            setSelected(state.selected + (e.key === "ArrowDown" ? 1 : -1));
+          }
+        });
+        window.addEventListener("keyup", (e) => {
+          if (e.code === "KeyC") setPeek(false);
+        });
+        window.addEventListener("blur", () => setPeek(false));
+
+        stackEl.addEventListener("click", (e) => {
+          const r = e.target.closest(".lrow");
+          if (r) setSelected(+r.dataset.i);
+        });
+        stackEl.addEventListener("mousemove", (e) => {
+          const r = e.target.closest(".lrow");
+          const i = r ? +r.dataset.i : -1;
+          if (i !== state.hoverIndex) {
+            state.hoverIndex = i;
+            requestDraw();
+          }
+        });
+        stackEl.addEventListener("mouseleave", () => {
+          state.hoverIndex = -1;
+          requestDraw();
+        });
+
+        q("#implSeg").addEventListener("click", (e) => {
+          const b = e.target.closest("button");
+          if (!b) return;
+          state.impl = b.dataset.impl;
+          paintSeg();
+          state.chainVis = 1;
+          state.lastWalk = performance.now();
+          ringFx.clear();
+          resetMetrics();
+          renderStack();
+          requestDraw();
+        });
+        q("#scenario").addEventListener("change", (e) => {
+          state.scenario = e.target.value;
+          state.selected = deepest();
+          state.anim = null;
+          state.taught = false;
+          state.hoverIndex = -1;
+          state.hintText = "滚轮 / ↑↓ 换吸附层级";
+          state.hintUntil = performance.now() + 2600;
+          state.chainVis = 1;
+          state.lastWalk = performance.now();
+          ringFx.clear();
+          resetMetrics();
+          renderPage();
+          syncAnswer();
+          state.shown = levelsOf()[state.selected].rect.slice();
+          renderStack();
+          requestDraw();
+        });
+        q("#resetSel").addEventListener("click", () => setSelected(deepest()));
+        q("#mReset").addEventListener("click", resetMetrics);
+      }
+      function bindRange(id, key, fmt) {
+        const input = q(id),
+          out = q(id + "Out");
+        const sync = () => {
+          state[key] = key.endsWith("Alpha")
+            ? Number(input.value) / 100
+            : Number(input.value);
+          out.textContent = fmt(Number(input.value));
+          renderStack();
+          updateLegend();
+          requestDraw();
+        };
+        input.addEventListener("input", sync);
+        sync();
+      }
+      function bindCheck(id, key, after) {
+        const el = q(id);
+        el.checked = !!state[key];
+        el.addEventListener("change", () => {
+          state[key] = el.checked;
+          if (after) after(el.checked);
+          requestDraw();
+        });
+      }
+
+      /* ---------------------------------------------------------------- 启动 */
+      (function init() {
+        state.selected = deepest();
+        state.lastWalk = performance.now();
+        renderPage();
+        syncAnswer();
+        state.shown = levelsOf()[state.selected].rect.slice();
+        state.hintText = "滚轮 / ↑↓ 换吸附层级";
+        state.hintUntil = performance.now() + 2600;
+        renderStack();
+        updateLegend();
+        paintSeg();
+
+        bindRange("outerAlpha", "outerAlpha", (v) => v + "%");
+        bindRange("innerAlpha", "innerAlpha", (v) => v + "%");
+        bindRange("collapse", "collapse", (v) => v + " px");
+        bindRange("selWidth", "selWidth", (v) => v + " px");
+        bindCheck("keepAnswer", "keepAnswer", () => renderStack());
+        bindCheck("dim", "dim");
+        bindCheck("ease", "ease", (v) => {
+          if (!v && state.anim) {
+            state.anim = null;
+            state.shown = levelsOf()[state.selected].rect.slice();
+          }
+        });
+        bindCheck("ringAnim", "ringAnim", (v) => {
+          if (!v) ringFx.clear();
+        });
+        bindEvents();
+
+        fitStage();
+        window.addEventListener("resize", fitStage);
+        requestAnimationFrame(frame);
+        if (document.fonts && document.fonts.ready)
+          document.fonts.ready.then(() => {
+            syncAnswer();
+            if (state.selected === deepest() && !state.anim)
+              state.shown = levelsOf()[state.selected].rect.slice();
+            renderStack();
+            requestDraw();
+          });
+      })();
+    </script>
+  </body>
+</html>
