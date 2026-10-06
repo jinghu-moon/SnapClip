@@ -33,6 +33,12 @@
   returns that pane — so the page's declared 240x56 control and the system's 284x40 box are two
   different questions about the same point, and the precision top-up in docs/21 §5.7 adopts the
   latter). Those are measured and printed, never asserted.
+
+  `deep-scroll-box` / `deep-item` are an asserted pair for the *layout box* shape: the item is one
+  element 20000 px tall inside a 100 px scrollport scrolled 5000 px down, so Chromium reports it as
+  `358x20000 at (73,-3983)` — the same shape a chat page measured in the product (`1153x22623`).
+  What may be published is its visible part (`358x100`), which is what the two rows assert, and the
+  probe fails the whole run if any published box sticks out of the window (docs/21 §5.9).
 -->
 <style>
   html, body { margin: 0; padding: 0; width: 1600px; height: 1020px; overflow: hidden;
@@ -147,7 +153,12 @@
   {"id":"progress","rect":[1140,800,200,56],"kind":"progress","role":"ProgressBar",
    "name":"Progress Bar","expect":"self"},
   {"id":"meter-shell","rect":[1364,800,212,120],"kind":"nested-outer","role":"",
-   "name":"Empty Shell","expect":"self","optional":true}
+   "name":"Empty Shell","expect":"self","optional":true},
+
+  {"id":"deep-scroll-box","rect":[24,910,360,100],"kind":"deep-scroll","role":"","name":"Deep Scroll",
+   "expect":"deep-scroll-box","probe":[180,50]},
+  {"id":"deep-item","rect":[0,0,0,0],"kind":"generated","role":"Group","name":"Deep Item",
+   "probe":[180,5050],"expect":"inside_self"}
 ]
 </script>
 
@@ -257,6 +268,17 @@ const builders = {
                       Array.from({ length: 10 }, (_, index) =>
                         listRow('scroll-item-' + (index + 1), 'Scroll Item ' + (index + 1))).join('');
                     return 'div'; },
+  // A scrollport holding **one** element far taller than the page, scrolled deep. Chromium reports
+  // such a node's *layout* box — hundreds of pixels wide and tens of thousands tall, starting above
+  // the window — which is the shape a chat page measured in the product (a message column
+  // 1153x22623 at (1567,-9870)). What is capturable is only its visible part, so the answer must be
+  // clipped by the scrollport above it; this fixture is the gate for that.
+  'deep-scroll': (el) => { el.className = 'fixture frame'; el.style.overflow = 'auto';
+                    el.setAttribute('aria-label', 'Deep Scroll');
+                    el.setAttribute('role', 'group');
+                    el.innerHTML = '<div id="deep-item" role="group" aria-label="Deep Item" ' +
+                      'style="height:20000px;background:#eef2ff">Deep Item</div>';
+                    return 'div'; },
   iframe: (el) => { el.className = 'fixture frame';
                     el.srcdoc = '<!doctype html><body style="margin:0;font:14px sans-serif">' +
                       '<button id="iframe-button" style="position:absolute;left:40px;top:40px;' +
@@ -305,6 +327,9 @@ const builders = {
 
 /// Post-creation work that needs the real element (a canvas context, a shadow root).
 const after = {
+  // Scroll the deep item's layout box far above the scrollport: its top ends up thousands of pixels
+  // off-screen, which is exactly what the product met on a chat page.
+  'deep-scroll': (node) => { node.scrollTop = 5000; },
   canvas: (node) => {
     node.width = 176; node.height = 200;
     const context = node.getContext('2d');

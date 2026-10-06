@@ -73,9 +73,11 @@ pub struct UiaDeepSelectionProvider {
 /// top-up that worked, which is a diagnosis round spent on the wrong hypothesis. Every arm ends
 /// up in the per-session forensics line.
 enum ProviderHit {
-    /// A box that belongs to the queried window.
+    /// A box that belongs to the queried window. `bounds` is the part of it the user can actually
+    /// see; `raw` is what the provider reported, kept for the forensics line.
     Box {
         bounds: Rect,
+        raw: Rect,
         control_type: i32,
         class: String,
     },
@@ -396,7 +398,7 @@ impl UiaDeepSelectionProvider {
     ///
     /// The capture overlay covers the desktop and would answer every query itself, so it is hidden
     /// from hit testing for the duration of the call.
-    fn provider_hit(&mut self, hwnd: isize, point: Point) -> ProviderHit {
+    fn provider_hit(&mut self, hwnd: isize, point: Point, window_bounds: Rect) -> ProviderHit {
         let Some(automation) = self.automation().cloned() else {
             return ProviderHit::Unusable("UI Automation unavailable".into());
         };
@@ -445,6 +447,18 @@ impl UiaDeepSelectionProvider {
         let Ok(walker) = (unsafe { automation.ControlViewWalker() }) else {
             return ProviderHit::Unusable("ControlViewWalker unavailable".into());
         };
+        // What the user can actually capture is the part of the box that survives every ancestor:
+        // Chromium reports a scrolled node's **layout** box — a chat page measured
+        // `1153x22623 at (1567,-9870)` for a message column — so publishing it raw would cover the
+        // whole screen, and comparing its *unclipped* area against the window made a box that is
+        // finer than the window look coarser. Only a box that sticks out of the window needs that
+        // work (`raw_inside_window`): reading a rectangle per ancestor is a cross-process call each,
+        // so the ordinary answer must not pay for it (measured: +100 ms p95 on File Explorer's deep
+        // chains).
+        let mut visible = bounds;
+        if bounds.intersect(window_bounds) != bounds {
+            visible = bounds.intersect(window_bounds);
+        }
         let mut current = hit.clone();
         for _ in 0..32 {
             if unsafe { automation.CompareElements(&current, &root) }
@@ -452,13 +466,27 @@ impl UiaDeepSelectionProvider {
                 .unwrap_or(false)
             {
                 return ProviderHit::Box {
-                    bounds,
+                    bounds: visible,
+                    raw: bounds,
                     control_type,
                     class,
                 };
             }
             match unsafe { walker.GetParentElement(&current) } {
-                Ok(parent) => current = parent,
+                Ok(parent) => {
+                    let parent_bounds =
+                        to_rect(unsafe { parent.CurrentBoundingRectangle() }.unwrap_or_default());
+                    // Shrink only while the result still covers the cursor: a virtualised list item
+                    // can report an empty or stale rectangle (docs/18 §12.7), and an ancestor that
+                    // disagrees with the hit test must not be allowed to clip the answer away.
+                    if !parent_bounds.is_empty() {
+                        let clipped = visible.intersect(parent_bounds);
+                        if !clipped.is_empty() && clipped.contains(point) {
+                            visible = clipped;
+                        }
+                    }
+                    current = parent;
+                }
                 Err(_) => break,
             }
         }
@@ -654,10 +682,19 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
             }
             break;
         }
+        // Publish the *visible* part of each accepted level: clipped by the level above it, which is
+        // what a scrollport does to a node that is taller than it (see `provider_hit`). For a box
+        // that already sits inside its parent this is the box itself, so nothing else changes.
+        let mut visible_parent = window_bounds;
         for level in &stack {
-            if !outcome.push(level.node.bounds) {
+            let visible = level.node.bounds.intersect(visible_parent);
+            if visible.is_empty() {
+                continue;
+            }
+            if !outcome.push(visible) {
                 break;
             }
+            visible_parent = visible;
         }
 
         // Provider-free fallback (docs/18 §12.2): older and custom-drawn controls never show
@@ -683,26 +720,40 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
         // indistinguishable from "the top-up did not run" in a non-verbose log, and that ambiguity
         // is what a user reporting "the elements inside this box are not recognized" runs into.
         let walk = outcome.target;
-        match self.provider_hit(job.window.hwnd, job.point) {
+        match self.provider_hit(job.window.hwnd, job.point, window_bounds) {
             ProviderHit::Box {
                 bounds: hit,
+                raw,
                 control_type,
                 class,
             } => {
                 let finer = should_adopt_provider_box(walk, hit, control_type, job.point);
                 let adopted = finer && outcome.push(hit);
-                let note = format!(
-                    "provider={}x{} at ({},{}) type={control_type} class={class:?} walk={}x{} at \
-                     ({},{})",
-                    hit.width(),
-                    hit.height(),
-                    hit.left,
-                    hit.top,
+                let mut note = format!(
+                    "provider={}x{} at ({},{})",
+                    raw.width(),
+                    raw.height(),
+                    raw.left,
+                    raw.top
+                );
+                if hit != raw {
+                    // Only worth printing when the ancestors trimmed it: this is the line that says
+                    // "the provider answered a layout box that runs off the window".
+                    note.push_str(&format!(
+                        " visible={}x{} at ({},{})",
+                        hit.width(),
+                        hit.height(),
+                        hit.left,
+                        hit.top
+                    ));
+                }
+                note.push_str(&format!(
+                    " type={control_type} class={class:?} walk={}x{} at ({},{})",
                     walk.width(),
                     walk.height(),
                     walk.left,
                     walk.top
-                );
+                ));
                 if adopted {
                     self.metrics
                         .record_precision(PrecisionOutcome::Adopted, &note);
@@ -1559,6 +1610,10 @@ mod tests {
         // only counted.
         let mut finer_not_adopted: Vec<String> = Vec::new();
         let mut provider_unusable: Vec<String> = Vec::new();
+        // Published boxes that stick out of the window. A screenshot can only contain what is on
+        // screen, so this is a gate for the layout-box shape (a tall node inside a scrollport)
+        // whichever side produced the box - the walk or the provider's hit test.
+        let mut off_window: Vec<String> = Vec::new();
         let mut failures = Vec::new();
         let mut layout_drift = Vec::new();
         for fixture in &manifest {
@@ -1645,7 +1700,7 @@ mod tests {
             // The provider's own hit test, through the **production** code path, so the gate below
             // covers the mechanism the product actually runs (`provider_hit` + the adoption rule)
             // rather than a probe-local copy of it.
-            match provider.provider_hit(hwnd, point) {
+            match provider.provider_hit(hwnd, point, frame) {
                 ProviderHit::Box {
                     bounds: hit_bounds,
                     control_type: hit_kind,
@@ -1706,6 +1761,14 @@ mod tests {
                 expected_rect
             };
             let (ok, detail) = judge(fixture.expect.as_str(), judged, published);
+            if let Some(rect) = published
+                && rect.intersect(frame) != rect
+            {
+                off_window.push(format!(
+                    "{}: {rect:?} is not inside the window {frame:?}",
+                    fixture.id
+                ));
+            }
             let label = if fixture.optional {
                 "opt"
             } else {
@@ -1967,6 +2030,26 @@ mod tests {
             "{} of {asserted} asserted fixtures did not resolve to the expected box: {failures:#?}",
             asserted - passed
         );
+        // The precision top-up and the window invariant are gates too, not counters: a strictly
+        // finer box that we failed to adopt, a hit test that answered nothing usable, or a published
+        // box that no screenshot could contain are each a real defect that used to be a printed line.
+        assert!(
+            finer_not_adopted.is_empty(),
+            "{} sampling points published a coarser box although the provider's hit test was \
+             strictly finer: {finer_not_adopted:#?}",
+            finer_not_adopted.len()
+        );
+        assert!(
+            provider_unusable.is_empty(),
+            "{} sampling points could not use the provider's hit test at all: {provider_unusable:#?}",
+            provider_unusable.len()
+        );
+        assert!(
+            off_window.is_empty(),
+            "{} published boxes extend outside the window, so no screenshot could contain them: \
+             {off_window:#?}",
+            off_window.len()
+        );
     }
 
     /// Compare what we published against what the page measured.
@@ -2222,7 +2305,7 @@ mod tests {
                 // production path. A hit box that is strictly smaller but still contains the point
                 // is a place our walk stopped above the innermost capturable box — and the
                 // adoption rule is supposed to remove exactly those.
-                let hit = match provider.provider_hit(hwnd, point) {
+                let hit = match provider.provider_hit(hwnd, point, frame) {
                     ProviderHit::Box {
                         bounds,
                         control_type,
