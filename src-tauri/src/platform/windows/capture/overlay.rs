@@ -32,7 +32,8 @@ use windows_sys::Win32::{
         Controls::WM_MOUSELEAVE,
         Input::Ime::{ImmGetContext, ImmReleaseContext, ImmSetOpenStatus},
         Input::KeyboardAndMouse::{
-            GetKeyState, MapVirtualKeyW, SetFocus, VK_CONTROL, MAPVK_VSC_TO_VK,
+            GetAsyncKeyState, GetKeyState, MapVirtualKeyW, SetFocus, VK_CONTROL, VK_LBUTTON,
+            VK_MBUTTON, VK_RBUTTON, MAPVK_VSC_TO_VK,
         },
         WindowsAndMessaging::{
             IDC_ARROW, IDC_CROSS, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE,
@@ -50,7 +51,7 @@ use windows_sys::Win32::{
             WM_MOUSEACTIVATE,
             WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_RBUTTONDOWN,
             WM_SETCURSOR, WM_TIMER, WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW,
-            WS_EX_TOPMOST, WS_POPUP, HTCLIENT, HWND_TOPMOST, MA_ACTIVATE,
+            WS_EX_TOPMOST, WS_POPUP, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, MA_ACTIVATE,
         },
     },
 };
@@ -83,6 +84,7 @@ use crate::capture::{CaptureError, CaptureResult, CaptureState};
 use super::capture_worker::{self, CaptureWorker, StartRequest};
 use super::detection_worker::{self, DetectionResult, DetectionWorker};
 use super::export_worker::{self, ExportJob, ExportWorker};
+use super::win::window;
 use super::refinement_worker::{self, RefinementResult, RefinementWorker};
 use super::hotkey;
 use super::monitor::{self, CapturedMonitor};
@@ -448,11 +450,11 @@ where
     /// a moment later is what the product rejected (docs/18 §13.4/§13.5). Bounded by
     /// [`REFINEMENT_PREVIEW_WAIT_MS`], so a provider that never answers still degrades to v1.
     refinement_pending: Option<Instant>,
-    /// Whether the overlay has taken `WS_EX_TRANSPARENT` for the sake of a point hit test that is
-    /// in flight (docs/21 §5.7). True only between [`Self::submit_refinement`] and the answer
-    /// landing ([`Self::on_refinement_ready`]) or the query being abandoned
-    /// ([`Self::abandon_refinement`]).
-    refinement_hit_through: bool,
+    /// Read by this window's `WM_NCHITTEST` while the refinement worker has an accessibility point
+    /// hit test in flight (docs/21 §5.7). Without it the hit test answers the overlay — it covers
+    /// the desktop — instead of the application underneath, which is what the precision top-up
+    /// needs; the flag only ever lives for one accessibility call.
+    hit_test_pass_through: window::HitTestPassThrough,
     metrics: WindowDetectionMetrics,
     /// Dwell generation the pending timer was armed for.
     dwell_armed: Option<u64>,
@@ -511,11 +513,15 @@ where
     ) -> Self {
         let metrics = WindowDetectionMetrics::new();
         let detector = DetectionWorker::new(thread_id, metrics.clone());
-        // The overlay window goes to the refinement worker so the UIA point hit test can be taken
-        // with the overlay hidden (docs/21 §5.7): it covers the desktop and would answer every hit
-        // test itself.
-        let refinement =
-            RefinementWorker::new(thread_id, Some(window as isize), metrics.clone());
+        // The refinement worker gets the pass-through flag this window's `WM_NCHITTEST` reads
+        // (docs/21 §5.7): the overlay covers the desktop, so without it the accessibility point hit
+        // test answers the overlay itself and the precision top-up can never fire.
+        let hit_test_pass_through = window::HitTestPassThrough::default();
+        let refinement = RefinementWorker::new(
+            thread_id,
+            hit_test_pass_through.clone(),
+            metrics.clone(),
+        );
         // The overlay must never be offered as its own snap target: it is full-screen and
         // frontmost, so a snapshot that included it would return the overlay for every
         // point (docs/14 §7, layer 2). The process exclusion is the fallback for windows
@@ -553,7 +559,7 @@ where
             deep_target: None,
             pending_downgrade: None,
             refinement_pending: None,
-            refinement_hit_through: false,
+            hit_test_pass_through,
             metrics,
             dwell_armed: None,
             snap_radius: DEFAULT_SNAP_RADIUS_PX,
@@ -982,7 +988,7 @@ where
         self.disarm_refinement();
         // The session is over: nothing is waiting for an answer, and whatever the last query
         // left behind must not survive into the next one.
-        self.abandon_refinement();
+        self.refinement.retire();
         self.cursor_visible = false;
         // Stop the coalescing tick before releasing the renderer: a pending WM_TIMER
         // must not try to present into the graphics we are about to drop.
@@ -1307,7 +1313,7 @@ where
         self.pending_downgrade = None;
         self.refinement_pending = None;
         self.disarm_refinement();
-        self.abandon_refinement();
+        self.refinement.retire();
         self.snapshot.release();
         self.request_snapshot_refresh();
     }
@@ -1430,7 +1436,7 @@ where
         if actions.invalidate_in_flight {
             // The cursor moved away from the question that query was asked: the answer coming
             // back is stale and will be dropped, so this is a retirement like any other.
-            self.abandon_refinement();
+            self.refinement.retire();
         }
         if actions.arm_dwell {
             // A deep answer for *this* position is on its way: arming the dwell is what marks
@@ -1775,7 +1781,7 @@ where
         let Some(expired) = self.refine.on_in_flight_timeout(Instant::now()) else {
             return;
         };
-        self.abandon_refinement();
+        self.refinement.retire();
         self.metrics.record_refinement_inflight_timeout();
         self.metrics.log_line(
             &format!("refinement timeout request={}", expired.get()),
@@ -1852,65 +1858,19 @@ where
         self.metrics.record_refinement_submitted();
         // The scheduler's request id is the one that comes back with the result, so the
         // worker is handed the whole job instead of issuing an id of its own.
-        // The overlay hides from UIA's point hit test for as long as this answer takes (docs/21
-        // §5.7): both ways a query can end restore it — taking the answer, and abandoning it.
-        self.set_refinement_hit_through(true);
         self.refinement.request(job, bounds);
     }
 
-    /// Drop the in-flight refinement query on a path that will never consume its answer.
+    /// Whether this window should currently let hit tests fall through to what is below it.
     ///
-    /// The overlay is transparent to hit testing exactly between submitting a query and taking its
-    /// answer back (see [`Self::set_refinement_hit_through`]), so *abandoning* a query has to put the
-    /// style back too: the worker still reports the retired job, that result is then dropped as
-    /// stale, and nothing else would ever clear the style. Every retirement goes through here so a
-    /// new one cannot forget it.
-    fn abandon_refinement(&mut self) {
-        self.refinement.retire();
-        self.set_refinement_hit_through(false);
-    }
-
-    /// Make the overlay transparent to UI Automation's point hit test while a query is in flight.
-    ///
-    /// A point hit test has no notion of Z order: with the overlay covering the desktop it answers
-    /// "the overlay" instead of the window underneath, which would make the precision top-up
-    /// (docs/21 §5.7) silently do nothing in the product while it worked in the probes. The
-    /// reference selector solves it the same way around its `ControlFromPoint` call
-    /// (`ScreenSnap-master/core/window_uia.py`, `set_click_through`).
-    ///
-    /// The exposure is one refinement query, and a query only starts once the cursor has been still
-    /// for 80 ms, i.e. when no click is in progress. It is set from the thread that owns the window
-    /// — the worker's [`ClickThroughGuard`] runs on the other thread and is only the net for callers
-    /// that do not manage an overlay — and cleared by the two paths that end a query:
-    /// [`Self::on_refinement_ready`] when the answer lands, [`Self::abandon_refinement`] when it is
-    /// retired. Should a query ever end without either, the effect is bounded and benign: the
-    /// overlay would keep answering its own hit test, and the top-up refuses a box that is not
-    /// strictly finer, so the walk's answer is published unchanged.
-    fn set_refinement_hit_through(&mut self, enabled: bool) {
-        if self.refinement_hit_through == enabled {
-            return;
-        }
-        const WS_EX_TRANSPARENT_LOCAL: isize = 0x0000_0020;
-        const GWL_EXSTYLE_LOCAL: i32 = -20;
-        let current = unsafe {
-            windows_sys::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
-                self.window,
-                GWL_EXSTYLE_LOCAL,
-            )
-        };
-        let updated = if enabled {
-            current | WS_EX_TRANSPARENT_LOCAL
-        } else {
-            current & !WS_EX_TRANSPARENT_LOCAL
-        };
-        unsafe {
-            windows_sys::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW(
-                self.window,
-                GWL_EXSTYLE_LOCAL,
-                updated,
-            );
-        }
-        self.refinement_hit_through = enabled;
+    /// The flag is set by the refinement worker around one accessibility point hit test
+    /// (docs/21 §5.7). A held mouse button vetoes it: `HTTRANSPARENT` is a genuine pass-through, so a
+    /// press or a release landing in that instant would go to the application underneath instead of
+    /// the overlay — and a query can legitimately run while a marquee drag sits still. The button
+    /// state is read with `GetAsyncKeyState` rather than `GetKeyState` so the veto follows the
+    /// physical buttons and not whichever messages this thread happens to have processed.
+    fn hit_test_passes_through(&self) -> bool {
+        self.hit_test_pass_through.is_active() && !any_mouse_button_down()
     }
 
     /// A deep-selection result arrived.
@@ -1922,8 +1882,6 @@ where
         let Some(result) = self.refinement.take_result() else {
             return;
         };
-        // The query is over: the overlay takes mouse input again before anything else happens.
-        self.set_refinement_hit_through(false);
         self.apply_refinement_result(result);
         // Whatever happened to this answer, a position whose dwell expired while it ran has not
         // been asked about yet.
@@ -2861,7 +2819,15 @@ where
                 self.update_cursor_shape(cursor);
                 Some(1)
             }
-            WM_NCHITTEST => Some(HTCLIENT as LRESULT),
+            // While the refinement worker has an accessibility point hit test in flight, this
+            // window lets that hit test fall through to the application underneath: UIA has no
+            // notion of Z order and would otherwise answer the overlay for every query, which is
+            // exactly what the precision top-up needs (docs/21 §5.7).
+            WM_NCHITTEST => Some(if self.hit_test_passes_through() {
+                HTTRANSPARENT as LRESULT
+            } else {
+                HTCLIENT as LRESULT
+            }),
             WM_ERASEBKGND => Some(1),
             WM_PAINT => {
                 // Acknowledge the update region with BeginPaint/EndPaint. Skipping it
@@ -2939,6 +2905,18 @@ fn describe_rect(rect: Rect) -> String {
 }
 
 /// One-line account of a deep target for the default (non-verbose) session log.
+/// Whether any mouse button is physically held down.
+///
+/// Used to veto the hit-test pass-through: the flag exists so that one accessibility point hit test
+/// can see through the overlay (docs/21 §5.7), and a genuine pass-through must never take a click or
+/// a release away from the overlay while the user is dragging.
+fn any_mouse_button_down() -> bool {
+    const DOWN: i16 = 0x8000_u16 as i16;
+    [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON]
+        .into_iter()
+        .any(|key| unsafe { GetAsyncKeyState(key as i32) } & DOWN != 0)
+}
+
 fn describe_deep(deep: Option<&DeepTarget>) -> String {
     match deep {
         None => "none".to_owned(),

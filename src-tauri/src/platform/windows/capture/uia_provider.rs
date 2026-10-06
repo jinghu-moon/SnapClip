@@ -61,9 +61,9 @@ pub struct UiaDeepSelectionProvider {
     /// Level counter for one query, so the forensics can tell a same-bounds *chain* apart from
     /// a walk that is spinning on one node (docs/18 §12.7).
     level: u32,
-    /// The capture overlay, hidden from hit testing while a point hit test runs (docs/21 §5.7).
-    /// `None` in tests and probes, where nothing of ours covers the desktop.
-    excluded_window: Option<isize>,
+    /// Passes the point hit test through the capture overlay for the duration of that one call
+    /// (docs/21 §5.7). Inert in tests and probes, where nothing of ours covers the desktop.
+    hit_test_pass_through: win32::HitTestPassThrough,
 }
 
 /// What the provider's own point hit test said about one query's position.
@@ -139,7 +139,7 @@ impl UiaDeepSelectionProvider {
             quarantined: HashSet::new(),
             metrics,
             level: 0,
-            excluded_window: None,
+            hit_test_pass_through: win32::HitTestPassThrough::default(),
         }
     }
 
@@ -408,15 +408,23 @@ impl UiaDeepSelectionProvider {
                 return ProviderHit::Unusable(format!("ElementFromHandle failed: {error}"));
             }
         };
-        let _guard = win32::ClickThroughGuard::new(self.excluded_window);
-        let hit = match unsafe {
-            automation.ElementFromPoint(::windows::Win32::Foundation::POINT {
-                x: point.x,
-                y: point.y,
-            })
-        } {
-            Ok(hit) => hit,
-            Err(error) => return ProviderHit::Unusable(format!("ElementFromPoint failed: {error}")),
+        // The overlay covers the desktop (it is what the user is looking at) and a point hit test
+        // has no notion of Z order, so it would answer *us* for every query. The guard is scoped to
+        // this one call: it is a real pass-through for mouse input too, and the shorter that window
+        // is, the smaller the chance a click lands on the window below (docs/21 §5.7).
+        let hit = {
+            let _pass_through = self.hit_test_pass_through.guard();
+            match unsafe {
+                automation.ElementFromPoint(::windows::Win32::Foundation::POINT {
+                    x: point.x,
+                    y: point.y,
+                })
+            } {
+                Ok(hit) => hit,
+                Err(error) => {
+                    return ProviderHit::Unusable(format!("ElementFromPoint failed: {error}"));
+                }
+            }
         };
         let bounds = to_rect(unsafe { hit.CurrentBoundingRectangle() }.unwrap_or_default());
         let class = unsafe { hit.CurrentClassName() }
@@ -461,9 +469,9 @@ impl UiaDeepSelectionProvider {
         ))
     }
 
-    /// Whether the overlay must be hidden from hit testing while a query runs (docs/21 §5.7).
-    pub fn with_excluded_window(mut self, overlay: Option<isize>) -> Self {
-        self.excluded_window = overlay;
+    /// Borrow the flag that lets the point hit test fall through the capture overlay (docs/21 §5.7).
+    pub fn with_hit_test_pass_through(mut self, pass_through: win32::HitTestPassThrough) -> Self {
+        self.hit_test_pass_through = pass_through;
         self
     }
 
@@ -887,9 +895,62 @@ mod tests {
     /// with the overlay's own flags models it faithfully. Created and re-styled by its own thread,
     /// as the product does.
     struct OverlayStandIn {
+        window: isize,
+        /// Shared with the stand-in's window procedure. The probe takes a guard from it exactly as
+        /// the refinement worker does in the product, so the lab exercises the real read path.
+        pass_through: win32::HitTestPassThrough,
         mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
         thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    /// Class name and title of the stand-in's own window class.
+    ///
+    /// The class matters: a stand-in on the system `STATIC` class was skipped by
+    /// `ElementFromPoint` even while it was the topmost window, the foreground window and
+    /// `WindowFromPoint`'s own answer — so UIA is not asking the window manager, and a system
+    /// class is not the same animal as the overlay's registered class.
+    const STAND_IN_CLASS: ::windows::core::PCWSTR = w!("SnapClipOverlayHitTestStandIn");
+    const STAND_IN_TITLE: ::windows::core::PCWSTR = w!("SnapClip overlay hit-test stand-in");
+
+    thread_local! {
+        /// The stand-in thread's copy of the pass-through flag, exactly as the overlay's window
+        /// procedure holds one: a worker thread sets the flag, the owning thread reads it here.
+        static STAND_IN_PASS_THROUGH: std::cell::RefCell<win32::HitTestPassThrough> =
+            std::cell::RefCell::new(win32::HitTestPassThrough::default());
+    }
+
+    /// Replace the stand-in thread's pass-through flag (called on the thread that owns the window).
+    fn set_stand_in_pass_through(flag: win32::HitTestPassThrough) {
+        STAND_IN_PASS_THROUGH.with(|slot| *slot.borrow_mut() = flag);
+    }
+
+    /// Whether the stand-in's window procedure should let the hit test through.
+    ///
+    /// `try_borrow`, because this runs inside a window procedure: a reentrant `WM_NCHITTEST` must
+    /// answer "the overlay owns the point", never panic.
+    fn stand_in_pass_through_active() -> bool {
+        STAND_IN_PASS_THROUGH
+            .with(|slot| slot.try_borrow().map(|flag| flag.is_active()).unwrap_or(false))
+    }
+
+    unsafe extern "system" fn stand_in_proc(
+        window: ::windows::Win32::Foundation::HWND,
+        message: u32,
+        wparam: ::windows::Win32::Foundation::WPARAM,
+        lparam: ::windows::Win32::Foundation::LPARAM,
+    ) -> ::windows::Win32::Foundation::LRESULT {
+        use ::windows::Win32::UI::WindowsAndMessaging::{
+            DefWindowProcW, HTCLIENT, HTTRANSPARENT, WM_NCHITTEST,
+        };
+        if message == WM_NCHITTEST {
+            return if stand_in_pass_through_active() {
+                ::windows::Win32::Foundation::LRESULT(HTTRANSPARENT as isize)
+            } else {
+                ::windows::Win32::Foundation::LRESULT(HTCLIENT as isize)
+            };
+        }
+        unsafe { DefWindowProcW(window, message, wparam, lparam) }
     }
 
     impl OverlayStandIn {
@@ -898,20 +959,34 @@ mod tests {
             use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
             let mode = std::sync::Arc::new(AtomicU8::new(OverlayStyle::Visible as u8));
             let stop = std::sync::Arc::new(AtomicBool::new(false));
-            let (ready_tx, ready_rx) = std::sync::mpsc::channel::<bool>();
+            // Created here, cloned into the stand-in thread: the two sides of the product's flag,
+            // one seen by the caller and one read by the window procedure.
+            let pass_through = win32::HitTestPassThrough::default();
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel::<isize>();
             let thread = {
                 let mode = std::sync::Arc::clone(&mode);
                 let stop = std::sync::Arc::clone(&stop);
+                let thread_pass_through = pass_through.clone();
                 std::thread::spawn(move || {
+                    set_stand_in_pass_through(thread_pass_through);
                     let width = unsafe { GetSystemMetrics(SM_CXSCREEN) }.max(1);
                     let height = unsafe { GetSystemMetrics(SM_CYSCREEN) }.max(1);
+                    // A registered class, exactly like the overlay's: see STAND_IN_CLASS.
+                    let window_class = ::windows::Win32::UI::WindowsAndMessaging::WNDCLASSW {
+                        lpfnWndProc: Some(stand_in_proc),
+                        lpszClassName: STAND_IN_CLASS,
+                        ..Default::default()
+                    };
+                    unsafe {
+                        ::windows::Win32::UI::WindowsAndMessaging::RegisterClassW(&window_class)
+                    };
                     let created = unsafe {
                         CreateWindowExW(
                             WINDOW_EX_STYLE(
                                 (WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP).0,
                             ),
-                            w!("STATIC"),
-                            w!("SnapClip overlay hit-test stand-in"),
+                            STAND_IN_CLASS,
+                            STAND_IN_TITLE,
                             WS_POPUP | WS_VISIBLE,
                             0,
                             0,
@@ -924,7 +999,7 @@ mod tests {
                         )
                     };
                     let Ok(window) = created else {
-                        let _ = ready_tx.send(false);
+                        let _ = ready_tx.send(0);
                         return;
                     };
                     unsafe {
@@ -938,7 +1013,7 @@ mod tests {
                             SWP_NOACTIVATE | SWP_SHOWWINDOW,
                         );
                     }
-                    let _ = ready_tx.send(true);
+                    let _ = ready_tx.send(window.0 as isize);
                     let base = (WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP).0
                         as isize;
                     let mut applied = OverlayStyle::Visible;
@@ -974,7 +1049,9 @@ mod tests {
                 })
             };
             match ready_rx.recv_timeout(Duration::from_secs(10)) {
-                Ok(true) => Some(Self {
+                Ok(window) if window != 0 => Some(Self {
+                    window,
+                    pass_through,
                     mode,
                     stop,
                     thread: Some(thread),
@@ -992,6 +1069,44 @@ mod tests {
             self.mode
                 .store(style as u8, std::sync::atomic::Ordering::Relaxed);
             pump(150);
+        }
+
+        fn hwnd(&self) -> isize {
+            self.window
+        }
+
+        /// Lever 2: cut a few pixels out of the window's *region* around `point`.
+        ///
+        /// A window region is what defines a shaped window for hit testing, so if anything in the
+        /// hit-test chain honours the shape, the point falls through to the page. Screen and window
+        /// coordinates coincide here: the stand-in sits at (0,0) and covers the primary screen.
+        fn punch_hole(&self, point: Point) {
+            use windows_sys::Win32::Graphics::Gdi::{
+                CombineRgn, CreateRectRgn, DeleteObject, RGN_DIFF, SetWindowRgn,
+            };
+            const HOLE: i32 = 2;
+            unsafe {
+                let full = CreateRectRgn(i32::MIN, i32::MIN, i32::MAX, i32::MAX);
+                let hole = CreateRectRgn(
+                    point.x - HOLE,
+                    point.y - HOLE,
+                    point.x + HOLE,
+                    point.y + HOLE,
+                );
+                CombineRgn(full, full, hole, RGN_DIFF);
+                DeleteObject(hole);
+                SetWindowRgn(self.window as *mut core::ffi::c_void, full, 1);
+            }
+            pump(250);
+        }
+
+        /// Drop the region again (`hwnd, NULL` = "no shape").
+        fn heal(&self) {
+            use windows_sys::Win32::Graphics::Gdi::SetWindowRgn;
+            unsafe {
+                SetWindowRgn(self.window as *mut core::ffi::c_void, std::ptr::null_mut(), 1);
+            }
+            pump(250);
         }
     }
 
@@ -1078,7 +1193,7 @@ mod tests {
                 "the fixture must be resolvable before the pipeline is exercised, got {outcome:?}"
             );
         }
-        let worker = RefinementWorker::new(0, None, metrics);
+        let worker = RefinementWorker::new(0, win32::HitTestPassThrough::default(), metrics);
         let mut scheduler = RefinementScheduler::new();
 
         for (session, epoch) in [(1u32, 1u64), (2, 2)] {
@@ -1688,33 +1803,60 @@ mod tests {
                 })
                 .next();
             if let Some((id, point, expected)) = sample {
-                let answer = |label: &str| {
+                // Returns whether the hit test answered our own stand-in: that is the state the
+                // product is in whenever it asks with the overlay up.
+                let answer = |label: &str| -> bool {
                     let hit = unsafe {
                         automation.ElementFromPoint(::windows::Win32::Foundation::POINT {
                             x: point.x,
                             y: point.y,
                         })
                     };
-                    let Ok(element) = hit else {
-                        println!("[overlay] {label}: ElementFromPoint failed");
-                        return;
+                    let (uia, ours) = match hit {
+                        Ok(element) => {
+                            let class = unsafe { element.CurrentClassName() }
+                                .map(|name| name.to_string())
+                                .unwrap_or_default();
+                            let kind = unsafe { element.CurrentControlType() }
+                                .map(|kind| kind.0)
+                                .unwrap_or(0);
+                            let bounds = to_rect(
+                                unsafe { element.CurrentBoundingRectangle() }.unwrap_or_default(),
+                            );
+                            (
+                                format!(
+                                    "{}({},{})-({},{}) type={kind} class={class:?}",
+                                    control_type_name(kind),
+                                    bounds.left,
+                                    bounds.top,
+                                    bounds.right,
+                                    bounds.bottom
+                                ),
+                                class == "SnapClipOverlayHitTestStandIn",
+                            )
+                        }
+                        Err(error) => (format!("ElementFromPoint failed: {error}"), false),
                     };
-                    let class = unsafe { element.CurrentClassName() }
-                        .map(|name| name.to_string())
-                        .unwrap_or_default();
-                    let kind = unsafe { element.CurrentControlType() }
-                        .map(|kind| kind.0)
-                        .unwrap_or(0);
-                    let bounds =
-                        to_rect(unsafe { element.CurrentBoundingRectangle() }.unwrap_or_default());
+                    // What the *window manager* thinks is at the point, and who owns the
+                    // foreground: UIA answers on the page while the overlay is up, and the
+                    // difference between the two answers is what says how to fix it.
+                    let window_at = unsafe {
+                        ::windows::Win32::UI::WindowsAndMessaging::WindowFromPoint(
+                            ::windows::Win32::Foundation::POINT {
+                                x: point.x,
+                                y: point.y,
+                            },
+                        )
+                    };
+                    let foreground = unsafe {
+                        ::windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow()
+                    };
                     println!(
-                        "[overlay] {label}: {}({},{})-({},{}) type={kind} class={class:?}",
-                        control_type_name(kind),
-                        bounds.left,
-                        bounds.top,
-                        bounds.right,
-                        bounds.bottom
+                        "[overlay] {label}: UIA={uia} | WindowFromPoint={:?} | foreground={:?}",
+                        describe_window(window_at.0 as isize),
+                        describe_window(foreground.0 as isize)
                     );
+                    ours
                 };
                 println!(
                     "[overlay] sample fixture={id} point=({},{}) fixture_box={}x{} at ({},{})",
@@ -1725,16 +1867,62 @@ mod tests {
                     expected.left,
                     expected.top
                 );
-                answer("no overlay");
+                let page_answers = !answer("no overlay");
+                assert!(
+                    page_answers,
+                    "the page must answer before any overlay exists, or this phase measures nothing"
+                );
                 match OverlayStandIn::create() {
                     Some(overlay) => {
+                        println!(
+                            "[overlay] stand-in window: {}",
+                            describe_window(overlay.hwnd())
+                        );
                         pump(300);
-                        answer("overlay topmost");
+                        // The reproduction, and the reason this phase exists: a window carrying the
+                        // overlay's shape *and* its own registered class is what UIA answers. A
+                        // stand-in on a system class is skipped instead (measured), which is how the
+                        // product-only failure stayed invisible for a round.
+                        assert!(
+                            answer("overlay topmost"),
+                            "the stand-in must be what the hit test answers, or this phase no \
+                             longer models the product"
+                        );
                         overlay.set_style(OverlayStyle::Transparent);
-                        answer("overlay +WS_EX_TRANSPARENT");
+                        let style_helped = !answer("overlay +WS_EX_TRANSPARENT");
+                        println!(
+                            "[overlay] verdict: WS_EX_TRANSPARENT alone {}",
+                            if style_helped {
+                                "lets the hit test through"
+                            } else {
+                                "does NOT let the hit test through"
+                            }
+                        );
                         overlay.set_style(OverlayStyle::LayeredTransparent);
                         answer("overlay +WS_EX_LAYERED|TRANSPARENT");
                         overlay.set_style(OverlayStyle::Visible);
+                        let pass_through = overlay.pass_through.guard();
+                        pump(150);
+                        // The lever the product pulls (docs/21 §5.7), through the product's own
+                        // plumbing: the guard is taken here, the stand-in's window procedure reads
+                        // the flag. If Windows ever stops honouring it the precision top-up silently
+                        // dies again, so fail here instead.
+                        assert!(
+                            !answer("overlay +HTTRANSPARENT on WM_NCHITTEST"),
+                            "HTTRANSPARENT must let the hit test through to the page, or the \
+                             precision top-up does nothing in the product"
+                        );
+                        drop(pass_through);
+                        pump(150);
+                        // …and the guard puts it back: the overlay owns the hit test again the
+                        // moment the accessibility call it wrapped is over.
+                        assert!(
+                            answer("overlay after the pass-through guard is dropped"),
+                            "the flag must be cleared again, or the overlay stops taking clicks"
+                        );
+                        overlay.punch_hole(point);
+                        answer("overlay + a hole in its region at the point");
+                        overlay.heal();
                         answer("overlay visible again");
                     }
                     None => println!("[overlay] the stand-in window could not be created"),
@@ -1864,6 +2052,23 @@ mod tests {
     /// Everything after `marker` in `title`, or `None` when the marker is absent.
     fn marker_payload<'a>(title: &'a str, marker: &str) -> Option<&'a str> {
         title.find(marker).map(|at| &title[at + marker.len()..])
+    }
+
+    /// `class="…" WxH at (x,y) visible=…` for a window handle, or `none` for "no window".
+    fn describe_window(hwnd: isize) -> String {
+        if hwnd == 0 {
+            return "none".into();
+        }
+        let class = win32::class_name(hwnd).unwrap_or_default();
+        let rect = win32::frame_bounds(hwnd).unwrap_or_default();
+        format!(
+            "{class:?} {}x{} at ({},{}) visible={}",
+            rect.width(),
+            rect.height(),
+            rect.left,
+            rect.top,
+            win32::is_window_visible(hwnd)
+        )
     }
 
     /// n / p50 / p95 / max of the product walk's per-query latency, in milliseconds.

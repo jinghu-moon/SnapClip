@@ -14,6 +14,8 @@
 //! * DWM reads happen in [`read_dwm_batch`], after the callback returns.
 
 use std::mem::size_of;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ::windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
 use ::windows::core::BOOL;
@@ -24,7 +26,7 @@ use ::windows::Win32::Graphics::Gdi::ScreenToClient;
 use ::windows::Win32::UI::WindowsAndMessaging::{
     CWP_SKIPINVISIBLE, ChildWindowFromPointEx, EnumChildWindows, EnumWindows,
     GA_PARENT, GWL_EXSTYLE, GetAncestor, GetClassNameW, GetDesktopWindow, GetWindowLongPtrW, GetWindowRect,
-    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, SetWindowLongPtrW,
+    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
     WINDOW_EX_STYLE, WS_EX_LAYERED, WS_EX_TRANSPARENT,
 };
 
@@ -46,49 +48,52 @@ pub fn is_click_through_layered(extended_style: u32) -> bool {
     WINDOW_EX_STYLE(extended_style).contains(WS_EX_LAYERED | WS_EX_TRANSPARENT)
 }
 
-/// Temporarily makes `window` transparent to hit testing, restoring the style on drop.
+/// Asks a window to answer `WM_NCHITTEST` with `HTTRANSPARENT` while a query runs.
 ///
-/// UIA's point hit test has no notion of Z order: with the capture overlay covering the desktop it
-/// would answer "the overlay" for every point, never the application underneath. The reference
-/// selector (`ScreenSnap-master/core/window_uia.py`, `set_click_through`) solves it the same way and
-/// restores the style immediately afterwards. Safe here because a refinement query only runs once the
-/// cursor has been still for 80 ms, and the overlay hides itself for the duration of that query.
-pub struct ClickThroughGuard {
-    window: isize,
-    previous: isize,
-    active: bool,
-}
+/// UI Automation's point hit test has no notion of Z order, and the capture overlay covers the
+/// desktop: with the overlay in the way the precision top-up (docs/21 §5.7) was answered by our own
+/// window for **every** query, so it did nothing in the product while it worked in the probes —
+/// which is also why the app and the probe disagreed for a whole round (docs/21 §5.2, §5.8).
+///
+/// The levers were measured on a stand-in carrying the overlay's own shape (topmost, full screen,
+/// tool window, no redirection bitmap, its own registered class, `browser_element_probe`'s
+/// `[overlay]` phase):
+///
+/// | lever | UIA's answer |
+/// | --- | --- |
+/// | none (overlay in the way) | the overlay |
+/// | `WS_EX_TRANSPARENT` | the overlay — **does not work** |
+/// | `WS_EX_LAYERED \| WS_EX_TRANSPARENT` | the page (but a DirectComposition window cannot be layered) |
+/// | `HTTRANSPARENT` from `WM_NCHITTEST` | **the page — the lever we use** |
+/// | a hole in the window region | the overlay — does not work |
+///
+/// So the overlay's own window procedure decides, and this flag is the only thing that crosses
+/// threads: a plain atomic the procedure reads. The guard is scoped to the single accessibility call
+/// it wraps, because while it is set a real mouse click would also fall through to the window below —
+/// the exposure is that call (single-digit milliseconds), not the whole query (20–50 ms measured,
+/// i.e. long enough to swallow the click a user makes just after the cursor stops).
+#[derive(Debug, Clone, Default)]
+pub struct HitTestPassThrough(Arc<AtomicBool>);
 
-impl ClickThroughGuard {
-    /// `window` is the overlay to hide from hit testing; `None` when there is nothing to hide.
-    pub fn new(window: Option<isize>) -> Self {
-        let Some(window) = window.filter(|window| is_window(*window)) else {
-            return Self {
-                window: 0,
-                previous: 0,
-                active: false,
-            };
-        };
-        let previous = unsafe { GetWindowLongPtrW(HWND(window as *mut _), GWL_EXSTYLE) };
-        let transparent = previous | WS_EX_TRANSPARENT.0 as isize;
-        // Applied on the thread that owns the window when possible (the overlay does that before it
-        // submits a job); this is the safety net for callers that do not manage an overlay.
-        unsafe { SetWindowLongPtrW(HWND(window as *mut _), GWL_EXSTYLE, transparent) };
-        Self {
-            window,
-            previous,
-            active: true,
-        }
+impl HitTestPassThrough {
+    /// Whether the window should currently let the hit test through to what is below it.
+    pub fn is_active(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// Pass hit tests through until the returned guard is dropped.
+    pub fn guard(&self) -> HitTestPassThroughGuard {
+        self.0.store(true, Ordering::Relaxed);
+        HitTestPassThroughGuard(Arc::clone(&self.0))
     }
 }
 
-impl Drop for ClickThroughGuard {
+/// Clears [`HitTestPassThrough`] when dropped.
+pub struct HitTestPassThroughGuard(Arc<AtomicBool>);
+
+impl Drop for HitTestPassThroughGuard {
     fn drop(&mut self) {
-        if self.active {
-            unsafe {
-                SetWindowLongPtrW(HWND(self.window as *mut _), GWL_EXSTYLE, self.previous);
-            }
-        }
+        self.0.store(false, Ordering::Relaxed);
     }
 }
 
@@ -513,41 +518,27 @@ mod tests {
         assert!(!is_click_through_layered((WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE).0));
     }
 
-    /// The hit-through guard must be invisible to everything but the query it wraps: it sets
-    /// `WS_EX_TRANSPARENT` for one point hit test and puts the style back on drop, whatever it
-    /// found. A leaked style would leave the capture overlay out of the hit test for the rest of
-    /// the session, so the restore is the part worth asserting.
+    /// The pass-through flag is the one thing that crosses threads between the refinement worker
+    /// (which sets it around one accessibility call) and the overlay's own window procedure (which
+    /// reads it for `WM_NCHITTEST`). It must be clear by default, set for exactly the lifetime of
+    /// the guard, and observable from another thread while it is set.
     #[test]
-    fn the_click_through_guard_restores_the_style_it_found() {
-        if !desktop_available() {
-            eprintln!("skipping: no interactive window station available");
-            return;
-        }
-        let Some(fixture) = TestWindow::create(WINDOW_EX_STYLE(0), WS_POPUP | WS_VISIBLE) else {
-            eprintln!("skipping: the fixture window could not be created");
-            return;
-        };
-        let handle = fixture.handle();
-        let style = |handle: isize| unsafe { GetWindowLongPtrW(HWND(handle as *mut _), GWL_EXSTYLE) };
-        let before = style(handle);
-        assert_eq!(
-            before & WS_EX_TRANSPARENT.0 as isize,
-            0,
-            "the fixture must start out interactive"
-        );
+    fn the_hit_test_pass_through_lasts_exactly_as_long_as_its_guard() {
+        let flag = HitTestPassThrough::default();
+        assert!(!flag.is_active(), "nothing passes through until a query asks");
         {
-            let _guard = ClickThroughGuard::new(Some(handle));
-            assert_ne!(
-                style(handle) & WS_EX_TRANSPARENT.0 as isize,
-                0,
-                "the guard hides the window from the hit test while it is alive"
-            );
+            let _guard = flag.guard();
+            assert!(flag.is_active(), "set for the accessibility call it wraps");
+            let other = flag.clone();
+            let seen = std::thread::spawn(move || other.is_active()).join().unwrap();
+            assert!(seen, "the window procedure and the worker share one flag");
         }
-        assert_eq!(style(handle), before, "the guard puts the style back on drop");
-        // Nothing to hide, and a handle that is not a window: no-ops rather than panics.
-        let _ = ClickThroughGuard::new(None);
-        let _ = ClickThroughGuard::new(Some(0xDEAD_BEEF));
-        assert_eq!(style(handle), before);
+        assert!(!flag.is_active(), "the guard clears it again, on every path");
+        // Two guards in sequence must not leave it set (a leaked flag would make the overlay
+        // miss real clicks for the rest of the session).
+        drop(flag.guard());
+        drop(flag.guard());
+        assert!(!flag.is_active());
     }
 
     #[test]
