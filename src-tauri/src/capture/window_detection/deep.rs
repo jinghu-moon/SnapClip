@@ -162,6 +162,218 @@ impl LevelChain {
     }
 }
 
+/// Which side of the selected level a chain ring sits on (docs/21 §5.22).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RingRole {
+    /// The level the user has walked to — the box that would be captured. The overlay paints this
+    /// one itself, with the capture colour and a double stroke; the ring brush never draws it.
+    Selected,
+    /// Shallower than the selection: the context outside it.
+    Outer,
+    /// Deeper than the selection: the layers the user walked out of, including the answer.
+    Inner,
+}
+
+/// One ring to paint: a level of the chain and the opacity it gets.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChainRing {
+    /// Index into `DeepTarget::path` (0 = window frame).
+    pub index: usize,
+    pub role: RingRole,
+    /// Effective alpha, after the outer/inner base and the distance ramp.
+    pub alpha: f32,
+}
+
+/// Which rings the level walk draws, and what was left out (docs/21 §5.22).
+///
+/// The three exclusion lists are diagnostics, not paint: the layer stack in the prototype shows
+/// them, and the session log can name them when a user asks why a level has no ring.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChainPlan {
+    /// In path order, outermost first.
+    pub rings: Vec<ChainRing>,
+    /// Below [`RingOptions::collapse_gap_px`] from the previous ring — it would draw a double line.
+    pub collapsed: Vec<usize>,
+    /// Within [`RingOptions::merge_gap_px`] of the selection: it *is* the selection's edge, so
+    /// painting it only thickens that border.
+    pub merged: Vec<usize>,
+    /// Dropped to respect [`RingOptions::max_rings`] (never an anchor, never the selection).
+    pub dropped: Vec<usize>,
+}
+
+/// How the chain is drawn. Defaults are the values the v2 prototype settled on (docs/21 §5.22).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RingOptions {
+    /// Minimum gap between two drawn rings, per edge.
+    pub collapse_gap_px: i32,
+    /// A ring this close to the selection is the selection's own edge.
+    pub merge_gap_px: i32,
+    /// Hard ceiling on drawn rings, including the selection.
+    pub max_rings: usize,
+    pub outer_alpha: f32,
+    pub inner_alpha: f32,
+    /// Fade rings with their distance from the selection (the floor is 65% of the base).
+    pub ramp: bool,
+    /// Keep the deepest level visible while the walk is above it — the way back down.
+    pub keep_answer: bool,
+}
+
+impl Default for RingOptions {
+    fn default() -> Self {
+        Self {
+            collapse_gap_px: 8,
+            merge_gap_px: 2,
+            max_rings: 7,
+            outer_alpha: 0.60,
+            inner_alpha: 0.60,
+            ramp: true,
+            keep_answer: true,
+        }
+    }
+}
+
+/// Smallest distance between the corresponding edges of two rectangles.
+///
+/// The *minimum* over the four edges, not the maximum: a ring that hugs the previous one on any
+/// side reads as a doubled line, which is what the collapse rule exists to prevent.
+fn edge_gap(a: Rect, b: Rect) -> i32 {
+    let left = (a.left - b.left).abs();
+    let top = (a.top - b.top).abs();
+    let right = ((a.left + a.width()) - (b.left + b.width())).abs();
+    let bottom = ((a.top + a.height()) - (b.top + b.height())).abs();
+    left.min(top).min(right).min(bottom)
+}
+
+/// Decide which rings the level walk paints (docs/21 §5.22).
+///
+/// The rules, in the order they are applied — the first three are what keep a nine-level chain
+/// readable, the fourth is what keeps it bounded:
+///
+/// 1. **Anchors**: the window frame, the level just outside the selection, the selection itself,
+///    the level just inside it, and (optionally) the deepest level — the way back down.
+/// 2. **Collapse**: any other level closer than `collapse_gap_px` to the last drawn ring is
+///    skipped; a 1 px-inset wrapper would only be a double line.
+/// 3. **Merge**: a ring within `merge_gap_px` of the selection is that edge, so it is skipped —
+///    drawing it thickens the selection's border and looks like a smeared stroke. This happens on
+///    real pages (`cm-scroller` sits 1 px inside `code-block-viewer`), not only in fixtures.
+/// 4. **Cap**: at most `max_rings` are drawn. Non-anchors are dropped first, the ones closest to
+///    the selection kept. Anchors are at most five, so the cap is always reachable without
+///    breaking the outermost/innermost references.
+pub fn chain_rings(path: &[Rect], selected: usize, options: RingOptions) -> ChainPlan {
+    let mut plan = ChainPlan {
+        rings: Vec::new(),
+        collapsed: Vec::new(),
+        merged: Vec::new(),
+        dropped: Vec::new(),
+    };
+    if path.is_empty() {
+        return plan;
+    }
+    let selected = selected.min(path.len() - 1);
+    let last = path.len() - 1;
+    let anchor = |index: usize| {
+        index == 0
+            || index == selected
+            || index + 1 == selected
+            || index == selected + 1
+            || (options.keep_answer && index == last)
+    };
+    let role_of = |index: usize| {
+        if index == selected {
+            RingRole::Selected
+        } else if index < selected {
+            RingRole::Outer
+        } else {
+            RingRole::Inner
+        }
+    };
+    let alpha_of = |index: usize| {
+        let base = match role_of(index) {
+            // Painted by the overlay, at full strength; the plan's number is never used for it.
+            RingRole::Selected => return 1.0,
+            RingRole::Outer => options.outer_alpha,
+            RingRole::Inner => options.inner_alpha,
+        };
+        if !options.ramp {
+            return base;
+        }
+        // Distance 1 (the selection's neighbours) keeps the base; each further step costs 12%,
+        // floored at 65% so the outermost ring — the "where am I" reference — stays visible.
+        let distance = index.abs_diff(selected).saturating_sub(1).min(6) as f32;
+        base * (1.0 - 0.12 * distance).max(0.65)
+    };
+
+    let mut kept: Vec<usize> = Vec::new();
+    for index in 0..path.len() {
+        if index == selected {
+            kept.push(index);
+            plan.rings.push(ChainRing {
+                index,
+                role: RingRole::Selected,
+                alpha: 1.0,
+            });
+            continue;
+        }
+        let previous = kept.last().copied();
+        let gap = previous.map_or(i32::MAX, |previous| edge_gap(path[index], path[previous]));
+        if anchor(index) {
+            if edge_gap(path[index], path[selected]) < options.merge_gap_px {
+                plan.merged.push(index);
+                continue;
+            }
+            kept.push(index);
+            plan.rings.push(ChainRing {
+                index,
+                role: role_of(index),
+                alpha: alpha_of(index),
+            });
+            continue;
+        }
+        if gap >= options.collapse_gap_px {
+            kept.push(index);
+            plan.rings.push(ChainRing {
+                index,
+                role: role_of(index),
+                alpha: alpha_of(index),
+            });
+        } else {
+            plan.collapsed.push(index);
+        }
+    }
+
+    while plan.rings.len() > options.max_rings {
+        // Drop the non-anchor ring that is furthest from the selection; at equal distance, the one
+        // with the smallest gap to its neighbour (it contributes the least shape).
+        let victim = plan
+            .rings
+            .iter()
+            .enumerate()
+            .filter(|(_, ring)| ring.index != selected && !anchor(ring.index))
+            .max_by_key(|(position, ring)| {
+                (
+                    ring.index.abs_diff(selected),
+                    -(edge_gap(
+                        path[ring.index],
+                        path[plan.rings[position.saturating_sub(1)].index],
+                    )),
+                )
+            })
+            .map(|(position, _)| position);
+        match victim {
+            Some(position) => {
+                let ring = plan.rings.remove(position);
+                plan.dropped.push(ring.index);
+            }
+            // Every remaining ring is an anchor, and anchors are at most five.
+            None => break,
+        }
+    }
+    plan.dropped.sort_unstable();
+    plan.collapsed.sort_unstable();
+    plan.merged.sort_unstable();
+    plan
+}
+
 /// How a newly resolved target relates to the one currently displayed (docs/18 §13.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Replacement {
@@ -1286,5 +1498,193 @@ mod tests {
             classify_replacement(Some(&deep_with_depth(rect(300, 300, 500, 400), 6)), &other),
             Replacement::Immediate
         );
+    }
+
+    /// The nine-level shape a real chat page produced (docs/21 §5.22), with the 1 px nesting the
+    /// prototype's fixture mirrors: `cm-scroller` sits 1 px inside `code-block-viewer`, and
+    /// `text-message` 1 px outside it.
+    fn nine_level_page() -> Vec<Rect> {
+        vec![
+            rect(40, 24, 1240, 684),      // 1/9 window frame
+            rect(41, 58, 1239, 684),      // 2/9 document
+            rect(53, 70, 1227, 672),      // 3/9 side-pane shell
+            rect(65, 82, 945, 648),       // 4/9 message list
+            rect(69, 148, 917, 478),      // 5/9 text message
+            rect(70, 196, 916, 468),      // 6/9 code block viewer (selected in these tests)
+            rect(71, 197, 915, 467),      // 7/9 cm-scroller  ← 1 px inside the selection
+            rect(87, 213, 899, 435),      // 8/9 pre.cm-content
+            rect(115, 243, 214, 265),     // 9/9 code span (the answer)
+        ]
+    }
+
+    /// The rule set as a whole, on the fixture the prototype uses — same numbers on both sides:
+    /// `9 层 → 画 6（外 3 · 内 2）· 塌缩 1 · 与选中层合并 2`.
+    #[test]
+    fn the_chain_plan_matches_the_prototype_on_the_nine_level_page() {
+        let path = nine_level_page();
+        let plan = chain_rings(&path, 5, RingOptions::default());
+        let drawn: Vec<usize> = plan.rings.iter().map(|ring| ring.index).collect();
+        assert_eq!(drawn, vec![0, 2, 3, 5, 7, 8], "window, two ancestors, selection, two inners");
+        assert_eq!(
+            plan.rings
+                .iter()
+                .filter(|ring| ring.role == RingRole::Outer)
+                .count(),
+            3
+        );
+        assert_eq!(
+            plan.rings
+                .iter()
+                .filter(|ring| ring.role == RingRole::Inner)
+                .count(),
+            2,
+            "the answer and the layer above it are still visible: the way back down"
+        );
+        // 2/9 is 1 px from 1/9 → a double line; 5/9 and 7/9 are 1 px from the selection.
+        assert_eq!(plan.collapsed, vec![1]);
+        assert_eq!(plan.merged, vec![4, 6]);
+        assert!(plan.dropped.is_empty(), "six rings fit under the cap of seven");
+    }
+
+    /// Ramp: the further a ring is from the selection, the fainter — with a floor so the window
+    /// frame stays readable (docs/21 §5.22 measured this in the prototype).
+    #[test]
+    fn rings_fade_with_distance_from_the_selection_and_floor_at_65_percent() {
+        let path = nine_level_page();
+        let plan = chain_rings(&path, 5, RingOptions::default());
+        let alpha = |index: usize| {
+            plan.rings
+                .iter()
+                .find(|ring| ring.index == index)
+                .map(|ring| ring.alpha)
+                .unwrap_or_default()
+        };
+        // One step away is 88% of the base (the 12% ramp), and the two rings *adjacent* to the
+        // selection in this fixture are exactly the ones the merge rule removes — which is why the
+        // ramp starts biting at distance two.
+        assert!((alpha(3) - 0.60 * 0.88).abs() < 1e-5, "one step out: {}", alpha(3));
+        assert!((alpha(7) - 0.60 * 0.88).abs() < 1e-5, "one step in: {}", alpha(7));
+        assert!(alpha(2) < alpha(3), "two steps out is fainter than one: {} vs {}", alpha(2), alpha(3));
+        assert!(
+            (alpha(0) - 0.60 * 0.65).abs() < 1e-5,
+            "the window frame is floored at 65% of the base: {}",
+            alpha(0)
+        );
+
+        // …and the ramp can be turned off, which is the comparison the prototype offers.
+        let flat = chain_rings(
+            &path,
+            5,
+            RingOptions {
+                ramp: false,
+                ..RingOptions::default()
+            },
+        );
+        assert!(flat
+            .rings
+            .iter()
+            .all(|ring| ring.role == RingRole::Selected || (ring.alpha - 0.60).abs() < 1e-6));
+    }
+
+    /// Twelve evenly spaced wrappers: the cap has to bite, and it must bite the *non-anchors*
+    /// furthest from the selection. Prototype: `12 层 → 画 7 · 丢弃 5`, keeping
+    /// `{0, 3, 4, 5, 6, 7, 11}`.
+    #[test]
+    fn the_cap_drops_the_furthest_non_anchors() {
+        let path: Vec<Rect> = (0..11)
+            .map(|step| {
+                let inset = step * 16;
+                rect(24 + inset, 16 + inset, 1256 - inset, 704 - inset)
+            })
+            .chain(std::iter::once(rect(200, 216, 1080, 256)))
+            .collect();
+        let plan = chain_rings(&path, 5, RingOptions::default());
+        let drawn: Vec<usize> = plan.rings.iter().map(|ring| ring.index).collect();
+        assert_eq!(drawn, vec![0, 3, 4, 5, 6, 7, 11]);
+        assert_eq!(plan.rings.len(), 7, "the cap holds");
+        assert!(plan.dropped.contains(&1), "the furthest non-anchor goes first: {:?}", plan.dropped);
+        // The anchors — window frame and the answer — never get dropped.
+        assert!(drawn.contains(&0) && drawn.contains(&11));
+    }
+
+    /// Two levels: the window and the answer. Nothing to collapse, merge or drop — and no inner
+    /// ring, which is why ③ changes nothing until the user actually walks.
+    #[test]
+    fn a_two_level_chain_draws_two_rings_and_no_inners() {
+        let path = vec![rect(0, 0, 1280, 720), rect(460, 300, 820, 328)];
+        let plan = chain_rings(&path, 1, RingOptions::default());
+        let drawn: Vec<usize> = plan.rings.iter().map(|ring| ring.index).collect();
+        assert_eq!(drawn, vec![0, 1]);
+        assert!(
+            plan.rings.iter().all(|ring| ring.role != RingRole::Inner),
+            "no inner rings: nothing has been walked out of yet"
+        );
+
+        // Walking all the way up to the window frame keeps the answer ring: that is the way back
+        // down, and it is the whole point of drawing the inner side at all.
+        let at_window = chain_rings(&path, 0, RingOptions::default());
+        assert_eq!(
+            at_window.rings.iter().map(|ring| ring.index).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(at_window.rings[1].role, RingRole::Inner);
+        // The level immediately inside the selection is an unconditional anchor — you are standing
+        // on it — so turning the "keep the answer" switch off changes nothing here. (The switch
+        // matters when the answer would otherwise be collapsed; see the test below.)
+        let without_answer = chain_rings(
+            &path,
+            0,
+            RingOptions {
+                keep_answer: false,
+                ..RingOptions::default()
+            },
+        );
+        assert_eq!(without_answer.rings.len(), 2);
+    }
+
+    /// `keep_answer` earns its keep only when the answer would otherwise be collapsed — a text run
+    /// sitting a hair inside its own wrapper, *and* the walk further than one level above it. Closer
+    /// than that, two other rules already cover the answer: the level just inside the selection is
+    /// an unconditional anchor, and a ring within the merge gap of the selection is skipped anyway.
+    #[test]
+    fn the_answer_ring_survives_collapse_only_while_it_is_kept() {
+        let path = vec![
+            rect(0, 0, 400, 300),
+            rect(40, 40, 360, 260),   // the level the walk is on
+            rect(100, 100, 300, 200), // the shell inside it
+            rect(104, 104, 296, 196), // the answer, 4 px inside that shell
+        ];
+        let kept = chain_rings(&path, 1, RingOptions::default());
+        assert!(
+            kept.rings.iter().any(|ring| ring.index == 3),
+            "the way back down is visible: {:?}",
+            kept.rings
+        );
+        let dropped = chain_rings(
+            &path,
+            1,
+            RingOptions {
+                keep_answer: false,
+                ..RingOptions::default()
+            },
+        );
+        assert!(!dropped.rings.iter().any(|ring| ring.index == 3));
+        assert_eq!(
+            dropped.collapsed,
+            vec![3],
+            "…and it is reported as collapsed, not silently gone"
+        );
+    }
+
+    /// A degenerate path (one level: the window) and an empty one must not panic.
+    #[test]
+    fn degenerate_paths_are_answered_without_rings_or_panics() {
+        assert!(chain_rings(&[], 0, RingOptions::default()).rings.is_empty());
+        let single = chain_rings(&[rect(0, 0, 100, 100)], 0, RingOptions::default());
+        assert_eq!(single.rings.len(), 1);
+        assert_eq!(single.rings[0].index, 0);
+        // An index past the end clamps to the deepest level rather than panicking.
+        let clamped = chain_rings(&nine_level_page(), 99, RingOptions::default());
+        assert!(clamped.rings.iter().any(|ring| ring.index == 8));
     }
 }
