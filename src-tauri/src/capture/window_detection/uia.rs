@@ -207,6 +207,31 @@ pub fn should_adopt_msaa_box(walk: Rect, hit: Rect, hit_role: i32, point: Point)
         && !matches!(hit_role, MSAA_TEXT_ROLE | MSAA_STATIC_TEXT_ROLE)
 }
 
+/// Append `bounds` to a level chain, dropping the levels that do not contain it (docs/21 §5.17).
+///
+/// The published box can come from a point hit test, which is a different view of the page than the
+/// walk that built the chain: the levels below the last one that contains the box are **not** its
+/// ancestors, and leaving them in would break the containment invariant the ancestor walk depends on
+/// (each level must contain the next, and the last one is the published box). Returns `false` when
+/// the chain is already at [`MAX_PATH_LEN`].
+pub fn push_box_keeping_containment(path: &mut Vec<Rect>, bounds: Rect) -> bool {
+    if path.last() == Some(&bounds) {
+        return true;
+    }
+    while path.len() > 1 {
+        let last = path.last().copied().expect("the loop keeps one level");
+        if last.contains_rect(bounds) {
+            break;
+        }
+        path.pop();
+    }
+    if path.len() >= MAX_PATH_LEN {
+        return false;
+    }
+    path.push(bounds);
+    true
+}
+
 /// Result of a bounded walk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalkOutcome {
@@ -470,6 +495,41 @@ mod tests {
             !should_adopt_msaa_box(walk, rect(500, 500, 900, 900), 0x14, point),
             "off the cursor is not an answer for it"
         );
+    }
+
+    #[test]
+    fn adopting_a_hit_keeps_the_chain_a_containment_chain() {
+        let frame = rect(0, 0, 1000, 800);
+        // A walk that went in through a sibling branch: 400x300 does not contain the hit.
+        let mut path = vec![frame, rect(100, 100, 500, 400), rect(300, 200, 420, 260)];
+        assert!(push_box_keeping_containment(
+            &mut path,
+            rect(600, 300, 700, 360)
+        ));
+        assert_eq!(
+            path,
+            vec![frame, rect(600, 300, 700, 360)],
+            "only the levels that contain the hit survive; the frame always does"
+        );
+        // A hit that the whole walk already contains keeps every level.
+        let mut nested = vec![frame, rect(100, 100, 500, 400)];
+        assert!(push_box_keeping_containment(
+            &mut nested,
+            rect(150, 150, 200, 200)
+        ));
+        assert_eq!(nested.len(), 3);
+        // The same box twice is not a second level.
+        assert!(push_box_keeping_containment(
+            &mut nested,
+            rect(150, 150, 200, 200)
+        ));
+        assert_eq!(nested.len(), 3);
+        // A full chain refuses rather than truncating.
+        let mut full: Vec<Rect> = (0..MAX_PATH_LEN)
+            .map(|step| rect(0, 0, 1000 - step as i32, 800 - step as i32))
+            .collect();
+        assert!(!push_box_keeping_containment(&mut full, rect(1, 1, 2, 2)));
+        assert_eq!(full.len(), MAX_PATH_LEN);
     }
 
     #[test]

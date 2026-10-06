@@ -95,6 +95,17 @@ impl Rect {
             && point.y < self.bottom
     }
 
+    /// Whether `other` lies inside `self` (edges may touch).
+    ///
+    /// The ancestor walk (docs/21 §5.17) needs this: a level chain is only meaningful when each level
+    /// contains the next, and that has to be checkable separately from point containment.
+    pub fn contains_rect(&self, other: Rect) -> bool {
+        other.left >= self.left
+            && other.top >= self.top
+            && other.right <= self.right
+            && other.bottom <= self.bottom
+    }
+
     pub fn inflate(&self, amount: i32) -> Self {
         Self {
             left: self.left - amount,

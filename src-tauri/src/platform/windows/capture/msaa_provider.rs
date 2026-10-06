@@ -58,6 +58,10 @@ pub(crate) struct MsaaHitBox {
     pub name: String,
     /// How many `accHitTest` steps it took to reach `CHILDID_SELF`.
     pub depth: u32,
+    /// The chain above the box, outermost first, every level containing `visible` and ending at the
+    /// window frame. This is what the ancestor walk (docs/21 §5.17) steps through, so it is built
+    /// from the same `accParent` walk that computes `visible`.
+    pub ancestors: Vec<Rect>,
 }
 
 /// Why a hit test produced no box.
@@ -245,12 +249,14 @@ fn msaa_hit_test(window: HWND, point: Point, window_bounds: Rect) -> Option<Msaa
     if !raw.contains(point) {
         return None;
     }
+    let (visible, ancestors) = visible_part_and_ancestors(&current, raw, point, window_bounds);
     Some(MsaaHitBox {
         raw,
-        visible: visible_part(&current, raw, point, window_bounds),
+        visible,
         role: role_of(&current).unwrap_or(0),
         name: name_of(&current).unwrap_or_default(),
         depth,
+        ancestors,
     })
 }
 
@@ -272,23 +278,44 @@ fn accessible_for(window: HWND, object_id: u32) -> Option<IAccessible> {
 /// measured at 358x20000 on the fixture — so the same "what is on screen" rule the UIA transport
 /// uses has to run here. An ancestor that would clip the cursor away is ignored: a virtualised item
 /// can report an empty or stale rectangle, and it must not be allowed to remove the answer.
-fn visible_part(accessible: &IAccessible, raw: Rect, point: Point, window_bounds: Rect) -> Rect {
+fn visible_part_and_ancestors(
+    accessible: &IAccessible,
+    raw: Rect,
+    point: Point,
+    window_bounds: Rect,
+) -> (Rect, Vec<Rect>) {
     let mut visible = raw;
     if raw.intersect(window_bounds) != raw {
         visible = raw.intersect(window_bounds);
     }
+    // Collected nearest-parent-first while walking up; the frame is prepended last, because the
+    // chain has to read outermost-first (`[frame, …, innermost]`) for the ancestor walk.
+    let mut ancestors: Vec<Rect> = Vec::new();
     let mut current = match unsafe { accessible.accParent() }
         .ok()
         .and_then(|parent| parent.cast::<IAccessible>().ok())
     {
         Some(parent) => parent,
-        None => return visible,
+        None => return (visible, ancestors),
     };
     for _ in 0..MAX_CLIP_DEPTH {
         if let Some(parent_bounds) = location_of(&current, &child_self()) {
             let clipped = visible.intersect(parent_bounds);
             if !clipped.is_empty() && clipped.contains(point) {
                 visible = clipped;
+            }
+            // Only levels *inside the window* that contain the published box belong in the chain
+            // (§5.17). MSAA's parent chain leaves the window — Chromium's root answers with the whole
+            // monitor, measured as (0,0)-(3840,2160) — and a level larger than the frame would make
+            // the chain say the frame sits inside a bigger box. Clipping rather than dropping keeps a
+            // frame-sized ancestor as the frame level itself, which the dedupe then folds away.
+            let level = parent_bounds.intersect(window_bounds);
+            if !level.is_empty()
+                && window_bounds.contains_rect(level)
+                && level.contains_rect(visible)
+                && !ancestors.contains(&level)
+            {
+                ancestors.push(level);
             }
         }
         match unsafe { current.accParent() }
@@ -299,7 +326,12 @@ fn visible_part(accessible: &IAccessible, raw: Rect, point: Point, window_bounds
             None => break,
         }
     }
-    visible
+    // Outermost first: the frame, then each ancestor from the outside in.
+    ancestors.reverse();
+    if ancestors.first() != Some(&window_bounds) {
+        ancestors.insert(0, window_bounds);
+    }
+    (visible, ancestors)
 }
 
 /// The accessible role as an integer (`ROLE_SYSTEM_*`).

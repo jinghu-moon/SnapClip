@@ -109,7 +109,7 @@ impl FallbackDeepSelection {
         let (msaa_usable, msaa_adopted) = match hit {
             Ok(hit) => {
                 let finer = should_adopt_msaa_box(walk, hit.visible, hit.role, job.point);
-                let adopted = finer && push_box(target, hit.visible);
+                let adopted = finer && push_box(target, hit.visible, &hit.ancestors);
                 note.push_str(&format!(
                     " msaa=[role=0x{:x} name={:?} depth={} {}{}]",
                     hit.role,
@@ -180,14 +180,31 @@ fn failure_name(failure: MsaaHitFailure) -> &'static str {
     }
 }
 
-/// Append a box the caller has already judged finer, keeping the target's kind honest.
-fn push_box(target: &mut DeepTarget, bounds: Rect) -> bool {
-    if target.path.len() >= MAX_PATH_LEN {
+/// Publish `bounds` together with **its own** ancestor chain (docs/21 §5.17).
+///
+/// The box comes from a transport's hit test, so the chain that has to travel with it is the one that
+/// transport reported — the walk's levels are another view of the page and are not necessarily above
+/// this box. Only levels that actually contain the box survive, which is what makes the published
+/// path a containment chain the ancestor walk can step through.
+fn push_box(target: &mut DeepTarget, bounds: Rect, ancestors: &[Rect]) -> bool {
+    let mut path: Vec<Rect> = ancestors
+        .iter()
+        .copied()
+        .filter(|level| level.contains_rect(bounds))
+        .collect();
+    if path.is_empty() {
+        // The chain always starts at the window frame; keep it if a caller ever gets here without one.
+        if let Some(frame) = target.path.first().copied() {
+            path.push(frame);
+        }
+    }
+    if path.len() >= MAX_PATH_LEN {
         return false;
     }
-    if target.path.last() != Some(&bounds) {
-        target.path.push(bounds);
+    if path.last() != Some(&bounds) {
+        path.push(bounds);
     }
+    target.path = path;
     target.screen_bounds = bounds;
     target.kind = TargetKind::UiElement;
     true

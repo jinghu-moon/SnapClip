@@ -31,7 +31,8 @@ use crate::capture::window_detection::deep::{
 use crate::capture::window_detection::model::{SnapshotEpoch, TargetKind};
 use crate::capture::window_detection::uia::{
     WalkBudget, WalkNode, WalkOutcome, fallback_hit_path, is_descendable, is_structural_wrapper,
-    is_text_run_inside_element, merge_hit_paths, should_adopt_provider_box,
+    is_text_run_inside_element, merge_hit_paths, push_box_keeping_containment,
+    should_adopt_provider_box,
 };
 
 use super::win::window as win32;
@@ -96,6 +97,20 @@ enum ProviderHit {
     },
     /// Nothing usable came back, and why.
     Unusable(String),
+}
+
+/// Append a hit box to the walk's published path, keeping the path a containment chain.
+///
+/// The hit comes from the provider's own point query, which is a different view of the page than the
+/// walk that built the path; the levels that do not contain it are dropped (docs/21 §5.17) so that
+/// "one level up" always lands on a box that contains the current answer.
+fn push_hit_box(outcome: &mut WalkOutcome, bounds: Rect) -> bool {
+    if !push_box_keeping_containment(&mut outcome.path, bounds) {
+        outcome.stop_reason = StopReason::TraversalLimit;
+        return false;
+    }
+    outcome.target = bounds;
+    true
 }
 
 /// How many children a level offered and why the others were dropped.
@@ -750,7 +765,7 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
                 class,
             } => {
                 let finer = should_adopt_provider_box(walk, hit, control_type, job.point);
-                let adopted = finer && outcome.push(hit);
+                let adopted = finer && push_hit_box(&mut outcome, hit);
                 let mut note = format!(
                     "provider={}x{} at ({},{})",
                     raw.width(),
@@ -1653,6 +1668,10 @@ mod tests {
         // screen, so this is a gate for the layout-box shape (a tall node inside a scrollport)
         // whichever side produced the box - the walk or the provider's hit test.
         let mut off_window: Vec<String> = Vec::new();
+        // Published paths that are not a containment chain. The ancestor walk (docs/21 §5.17) steps
+        // through `path`, so a level that does not contain the next one would make "one level up"
+        // jump to a box that does not contain the answer.
+        let mut broken_chains: Vec<String> = Vec::new();
         let mut failures = Vec::new();
         let mut layout_drift = Vec::new();
         for fixture in &manifest {
@@ -1703,6 +1722,7 @@ mod tests {
             let mut published = None;
             let mut last_stop = None;
             let mut last_depth = 0_usize;
+            let mut last_path: Option<Vec<Rect>> = None;
             for attempt in 0..4 {
                 if attempt > 0 {
                     pump(250);
@@ -1716,6 +1736,7 @@ mod tests {
                     RefinementOutcome::Target(target) => {
                         last_stop = Some(target.stop_reason);
                         last_depth = target.path.len();
+                        last_path = Some(target.path.clone());
                         Some(target.screen_bounds)
                     }
                     RefinementOutcome::Empty(reason) => {
@@ -1808,6 +1829,35 @@ mod tests {
                     "{}: {rect:?} is not inside the window {frame:?}",
                     fixture.id
                 ));
+            }
+            if let Some(path) = &last_path {
+                // Two pixels of slack: the fixture's own measured box and the accessibility tree's
+                // rectangle disagree by one pixel in places, and this gate is about the *shape* of
+                // the chain, not about that measurement gap.
+                const SLACK: i32 = 2;
+                let slack = |outer: Rect, inner: Rect| {
+                    inner.left >= outer.left - SLACK
+                        && inner.top >= outer.top - SLACK
+                        && inner.right <= outer.right + SLACK
+                        && inner.bottom <= outer.bottom + SLACK
+                };
+                if path.is_empty() {
+                    broken_chains.push(format!("{}: empty path", fixture.id));
+                }
+                if let Some(pair) = path.windows(2).find(|pair| !slack(pair[0], pair[1])) {
+                    broken_chains.push(format!(
+                        "{}: {:?} does not contain {:?} (path: {path:?})",
+                        fixture.id, pair[0], pair[1]
+                    ));
+                }
+                if path.last() != published.as_ref() {
+                    broken_chains.push(format!(
+                        "{}: path ends at {:?}, published {:?}",
+                        fixture.id,
+                        path.last(),
+                        published
+                    ));
+                }
             }
             let label = if fixture.optional {
                 "opt"
@@ -2124,6 +2174,14 @@ mod tests {
             "{} published boxes extend outside the window, so no screenshot could contain them: \
              {off_window:#?}",
             off_window.len()
+        );
+        // The ancestor walk steps through `path`, so the chain has to hold everywhere, not only on
+        // the rows that were asserted.
+        assert!(
+            broken_chains.is_empty(),
+            "{} published paths are not containment chains ending at the published box: \
+             {broken_chains:#?}",
+            broken_chains.len()
         );
     }
 
@@ -2648,12 +2706,20 @@ mod tests {
         }
         pump(400);
 
-        let mut provider = UiaDeepSelectionProvider::new(WindowDetectionMetrics::new());
+        let explorer_metrics = WindowDetectionMetrics::new();
+        let mut provider = UiaDeepSelectionProvider::new(explorer_metrics.clone());
+        // Resolve through the product's provider chain, not the UIA provider alone: the MSAA second
+        // opinion (docs/21 §5.16) and the containment invariant (§5.17) both live there.
+        let mut pipeline = super::super::refinement_worker::FallbackDeepSelection::new(
+            explorer_metrics,
+            win32::HitTestPassThrough::default(),
+        );
         let window_area = i64::from(client.width()) * i64::from(client.height());
         let mut areas = Vec::new();
         let mut latencies: Vec<f64> = Vec::new();
         let mut provider_finer = 0_usize;
         let mut provider_available = 0_usize;
+        let mut broken_chains: Vec<String> = Vec::new();
         for fy in [30_i32, 40, 50, 60, 70] {
             for fx in [45_i32, 55, 65, 75, 85] {
                 let point = Point::new(
@@ -2661,7 +2727,7 @@ mod tests {
                     client.top + client.height() * fy / 100,
                 );
                 let query_started = std::time::Instant::now();
-                let outcome = provider.resolve(
+                let outcome = pipeline.resolve(
                     &job(hwnd, point),
                     frame,
                     &QueryControl::refinement(&|| false),
@@ -2675,6 +2741,35 @@ mod tests {
                     ),
                     RefinementOutcome::Empty(reason) => (Rect::default(), 0, *reason),
                 };
+                if let RefinementOutcome::Target(target) = &outcome {
+                    // The ancestor walk steps through this chain (§5.17): each level has to contain
+                    // the next, and the last one has to be the published box.
+                    let slack = |outer: Rect, inner: Rect| {
+                        inner.left >= outer.left - 2
+                            && inner.top >= outer.top - 2
+                            && inner.right <= outer.right + 2
+                            && inner.bottom <= outer.bottom + 2
+                    };
+                    if let Some(pair) = target
+                        .path
+                        .windows(2)
+                        .find(|pair| !slack(pair[0], pair[1]))
+                    {
+                        broken_chains.push(format!(
+                            "point=({},{}): {:?} does not contain {:?}",
+                            point.x, point.y, pair[0], pair[1]
+                        ));
+                    }
+                    if target.path.last() != Some(&target.screen_bounds) {
+                        broken_chains.push(format!(
+                            "point=({},{}): path ends at {:?}, published {:?}",
+                            point.x,
+                            point.y,
+                            target.path.last(),
+                            target.screen_bounds
+                        ));
+                    }
+                }
                 let area = i64::from(rect.width()) * i64::from(rect.height());
                 areas.push(area);
                 // Precision yardstick: what the provider's own hit test answers, through the
@@ -2737,6 +2832,13 @@ mod tests {
             areas.len()
         );
         print_latency_summary("explorer", &mut latencies);
+        // The same containment invariant the browser gate asserts, on the other window class.
+        assert!(
+            broken_chains.is_empty(),
+            "{} Explorer sampling points published a path that is not a containment chain ending \
+             at the published box: {broken_chains:#?}",
+            broken_chains.len()
+        );
     }
 
     /// Title of a top-level window, used to identify the probe page.
