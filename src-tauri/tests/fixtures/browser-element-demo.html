@@ -39,6 +39,11 @@
   `358x20000 at (73,-3983)` — the same shape a chat page measured in the product (`1153x22623`).
   What may be published is its visible part (`358x100`), which is what the two rows assert, and the
   probe fails the whole run if any published box sticks out of the window (docs/21 §5.9).
+
+  `plain-div` exists to be **looked at**, not asserted: it is a layout-only wrapper with no role, no
+  name and no text of its own, which is the one shape Blink never exposes to platform accessibility
+  APIs (docs/21 §10). The probe's `[sources]` phase reports what each candidate source can see at a
+  point inside it — the control view answers the whole page, and the raw view adds nothing.
 -->
 <style>
   html, body { margin: 0; padding: 0; width: 1600px; height: 1020px; overflow: hidden;
@@ -158,7 +163,10 @@
   {"id":"deep-scroll-box","rect":[24,910,360,100],"kind":"deep-scroll","role":"","name":"Deep Scroll",
    "expect":"deep-scroll-box","probe":[180,50]},
   {"id":"deep-item","rect":[0,0,0,0],"kind":"generated","role":"Group","name":"Deep Item",
-   "probe":[180,5050],"expect":"inside_self"}
+   "probe":[180,5050],"expect":"inside_self"},
+
+  {"id":"plain-div","rect":[400,920,300,96],"kind":"plain-div","role":"","name":"Plain Wrapper",
+   "probe":[250,70],"expect":"self","optional":true}
 ]
 </script>
 
@@ -261,6 +269,13 @@ const builders = {
                                  return 'button'; },
   'stack-front': (el, entry) => { el.className = 'fixture front';
                                   el.setAttribute('aria-label', entry.name); return 'div'; },
+  // A layout-only wrapper: no role, no aria-label, no text of its own — the kind of `<div>` the
+  // accessibility tree prunes. Probing inside it but away from the inner span is the experiment for
+  // "can a source other than the control view see this box?" (docs/21 §10).
+  'plain-div': (el) => { el.className = 'fixture dashed';
+                         el.innerHTML = '<span style="position:absolute;left:20px;top:20px;' +
+                           'width:60px;height:20px">Inner</span>';
+                         return 'div'; },
   scroll: (el) => { el.className = 'fixture frame'; el.style.overflow = 'auto';
                     el.setAttribute('aria-label', 'Scroll Container');
                     el.setAttribute('role', 'list');

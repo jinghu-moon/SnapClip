@@ -824,6 +824,10 @@ fn to_rect(rect: RECT) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the source-comparison probe needs these: the raw view and the document's text pattern.
+    use ::windows::Win32::UI::Accessibility::{
+        IUIAutomationTextPattern, TreeScope_Descendants, UIA_TextPatternId,
+    };
     use ::windows::Win32::UI::WindowsAndMessaging::{
         DestroyWindow, DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, SW_SHOWNA, ShowWindow,
         TranslateMessage, WS_POPUP, WS_VISIBLE, CreateWindowExW, WINDOW_EX_STYLE,
@@ -1993,6 +1997,29 @@ mod tests {
             }
         }
 
+        // Which source could give the user the box they are pointing at? The control view is what
+        // the product uses; a layout-only `<div>` is the case that decides whether the raw view or
+        // the document's TextPattern is worth more (docs/21 §10).
+        if let Some(automation) = hit_owner.as_ref() {
+            for id in ["plain-div", "meter-shell", "deep-item"] {
+                let Some(fixture) = manifest.iter().find(|fixture| fixture.id == id) else {
+                    continue;
+                };
+                let Some(measured) = truth.get(id).copied() else {
+                    continue;
+                };
+                if measured[2] <= 0 || measured[3] <= 0 {
+                    continue;
+                }
+                let [dx, dy] = fixture.probe.unwrap_or([measured[2] / 2, measured[3] / 2]);
+                let point = Point::new(
+                    viewport.left + measured[0] + dx,
+                    viewport.top + measured[1] + dy,
+                );
+                report_sources(automation, hwnd, id, point);
+            }
+        }
+
         let _ = child.kill();
         println!(
             "[probe] asserted={asserted} passed={passed} failed={} slow_fixtures={retries}",
@@ -2135,6 +2162,163 @@ mod tests {
     /// Everything after `marker` in `title`, or `None` when the marker is absent.
     fn marker_payload<'a>(title: &'a str, marker: &str) -> Option<&'a str> {
         title.find(marker).map(|at| &title[at + marker.len()..])
+    }
+
+    /// `Type(x,y)-(x,y) class="…" control=… content=…` for one element.
+    fn describe_element(element: &IUIAutomationElement) -> String {
+        let kind = unsafe { element.CurrentControlType() }
+            .map(|kind| kind.0)
+            .unwrap_or(0);
+        let rect = to_rect(unsafe { element.CurrentBoundingRectangle() }.unwrap_or_default());
+        let class = unsafe { element.CurrentClassName() }
+            .map(|name| name.to_string())
+            .unwrap_or_default();
+        let control = unsafe { element.CurrentIsControlElement() }
+            .map(|value| value.as_bool())
+            .unwrap_or(false);
+        let content = unsafe { element.CurrentIsContentElement() }
+            .map(|value| value.as_bool())
+            .unwrap_or(false);
+        format!(
+            "{}({},{})-({},{}) class={class:?} control={control} content={content}",
+            control_type_name(kind),
+            rect.left,
+            rect.top,
+            rect.right,
+            rect.bottom
+        )
+    }
+
+    /// What every candidate source says is under `point` (docs/21 §10).
+    ///
+    /// Three sources are compared, because the product's ceiling is set by which one it can use:
+    ///
+    /// * the **control view** — what `ElementFromPoint` and the current walk use. Chromium prunes
+    ///   layout-only `<div>`s out of it, which is exactly the box the user is asking for;
+    /// * the **raw view** — documented by Chromium as a *superset* of the control view, so an
+    ///   "ignored" node (`role=kIgnored`, nameless) may still be there with its geometry;
+    /// * the document's **TextPattern** — `RangeFromPoint` answers with the text at that point, which
+    ///   can be finer than any node the tree exposes.
+    fn report_sources(automation: &IUIAutomation, hwnd: isize, label: &str, point: Point) {
+        let screen = ::windows::Win32::Foundation::POINT {
+            x: point.x,
+            y: point.y,
+        };
+        println!("[sources] {label} point=({},{})", point.x, point.y);
+        let hit = unsafe { automation.ElementFromPoint(screen) }.ok();
+        match &hit {
+            Some(element) => println!("[sources]   control hit : {}", describe_element(element)),
+            None => println!("[sources]   control hit : failed"),
+        }
+
+        // The raw view. Read every property straight off the node: batching the request returned
+        // empty rectangles for every node (a `FindAllBuildCache` + `TreeScope_Descendants` combination
+        // Chromium does not fill in), which made the first version of this measurement useless. The
+        // cost printed here is also the reason a production descent has to stay bounded rather than
+        // enumerate a page.
+        let raw = (|| -> Option<()> {
+            let root = unsafe { automation.ElementFromHandle(HWND(hwnd as *mut core::ffi::c_void)) }
+                .ok()?;
+            let condition = unsafe { automation.RawViewCondition() }.ok()?;
+            let started = std::time::Instant::now();
+            let all = unsafe { root.FindAll(TreeScope_Descendants, &condition) }.ok()?;
+            let count = unsafe { all.Length() }.ok().unwrap_or(0).max(0) as usize;
+            let mut with_rect = 0_usize;
+            let mut containing = 0_usize;
+            let mut raw_only = 0_usize;
+            let mut smallest: Option<(Rect, i32, String, bool)> = None;
+            for index in 0..count {
+                let Ok(element) = (unsafe { all.GetElement(index as i32) }) else {
+                    continue;
+                };
+                let rect = to_rect(unsafe { element.CurrentBoundingRectangle() }.unwrap_or_default());
+                if rect.is_empty() {
+                    continue;
+                }
+                with_rect += 1;
+                let control = unsafe { element.CurrentIsControlElement() }
+                    .map(|value| value.as_bool())
+                    .unwrap_or(false);
+                if !control {
+                    raw_only += 1;
+                }
+                if !rect.contains(point) {
+                    continue;
+                }
+                containing += 1;
+                if smallest
+                    .as_ref()
+                    .map(|(best, ..)| rect.area() < best.area())
+                    .unwrap_or(true)
+                {
+                    let kind = unsafe { element.CurrentControlType() }
+                        .map(|kind| kind.0)
+                        .unwrap_or(0);
+                    let class = unsafe { element.CurrentClassName() }
+                        .map(|name| name.to_string())
+                        .unwrap_or_default();
+                    smallest = Some((rect, kind, class, control));
+                }
+            }
+            println!(
+                "[sources]   raw view    : {count} nodes, {with_rect} with a rectangle, {raw_only} \
+                 raw-only, {containing} contain the point, {} ms",
+                started.elapsed().as_millis()
+            );
+            if let Some((rect, kind, class, control)) = smallest {
+                println!(
+                    "[sources]   raw smallest: {}({},{})-({},{}) class={class:?} \
+                     control={control}{}",
+                    control_type_name(kind),
+                    rect.left,
+                    rect.top,
+                    rect.right,
+                    rect.bottom,
+                    if control { "" } else { "  <- RAW-ONLY" }
+                );
+            }
+            Some(())
+        })();
+        if raw.is_none() {
+            println!("[sources]   raw view    : unavailable");
+        }
+
+        // TextPattern: walk up from the hit until a text provider answers, then ask it what text is
+        // under the cursor.
+        let mut current = hit.clone();
+        for depth in 0..8 {
+            let Some(element) = current else { break };
+            let pattern = unsafe {
+                element.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
+            };
+            let range = pattern.ok().and_then(|text| {
+                unsafe { text.RangeFromPoint(::windows::Win32::Foundation::POINT {
+                    x: point.x,
+                    y: point.y,
+                }) }
+                .ok()
+            });
+            if let Some(range) = range {
+                let snippet = unsafe { range.GetText(60) }
+                    .map(|text| text.to_string())
+                    .unwrap_or_default();
+                let enclosing = unsafe { range.GetEnclosingElement() }.ok();
+                let described = enclosing
+                    .as_ref()
+                    .map(describe_element)
+                    .unwrap_or_else(|| "none".into());
+                println!(
+                    "[sources]   text range  : depth={depth} enclosing={described} \
+                     text={:?}",
+                    snippet.chars().take(24).collect::<String>()
+                );
+                return;
+            }
+            current = unsafe { automation.ControlViewWalker() }
+                .ok()
+                .and_then(|walker| unsafe { walker.GetParentElement(&element) }.ok());
+        }
+        println!("[sources]   text range  : no TextPattern on the hit or its ancestors");
     }
 
     /// `class="…" WxH at (x,y) visible=…` for a window handle, or `none` for "no window".
