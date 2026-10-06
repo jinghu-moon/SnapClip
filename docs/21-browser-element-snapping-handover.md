@@ -683,6 +683,69 @@ this.highlightElement.style.top = `${rect.top + scrollY}px`;                   /
 只有当产品真的需要 DOM 语义时，才考虑扩展**——那时 §5.12 的这些实现细节（遮罩瞬间穿透、尺寸标签、
 连续模式、可见性过滤）可以直接复用。
 
+### 5.13 CDP 路线的两份现成实现（`refer/cdp-html-shot-main`、`refer/webshot-master`）
+
+两份都是 Rust + CDP，都能"按 CSS 选择器截元素"，但技术层次不同：前者是**手写 CDP 客户端**（只依赖
+`tokio-tungstenite` + `serde_json`，传输层 `src/transport.rs` 只有 8 KB），后者是**CLI 外壳**，把
+定位与截图交给 `headless_chrome` crate。对 SnapClip 有价值的是"完整管道长什么样、坑在哪"。
+
+**A. `cdp-html-shot`：手写 CDP 的完整配方**
+
+启动（`src/browser.rs`）：
+
+- 端口：用 `TcpListener::bind` 探测一个空闲端口；参数含 `--remote-debugging-port={port}`、
+  **`--user-data-dir=<临时目录>`**（正是 Chrome 136 起要求的"必须配非默认 profile"）、
+  `--headless=new`、`--no-first-run`、`--hide-scrollbars`、`--window-size=1200,1600`、
+  `--disable-features=…` 与一组 GPU 开关。
+- **发现 ws 地址靠 stderr 正则**：`listening on (.*/devtools/browser/.*)\s*$`（`wait_for_ws`）——
+  比解析 `DevToolsActivePort` 文件省事，且是 Chromium 的稳定输出；后台线程持续 drain stderr 以免管道满。
+- 找浏览器：显式安装路径 → `CHROME` 环境变量 → **注册表 `App Paths\chrome.exe` / `msedge.exe`**
+  （`winreg`，HKLM）；再用 `--version` 解析大版本，拼一个普通桌面 UA 来"不暴露 headless"。
+
+元素链路（`src/tab.rs` + `src/element.rs`，共 6 次调用）：
+
+```text
+DOM.getDocument                          → root.nodeId
+DOM.querySelector(root, selector)        → nodeId（**0 = 无匹配**，必须显式判错）
+DOM.describeNode(nodeId, depth:100)      → backendNodeId（跨节点引用稳定）
+DOM.getBoxModel(backendNodeId)           → model.border = 四角坐标（取 border，不是 content）
+  clip = { x: border[0], y: border[1],
+           width:  border[2]-border[0],
+           height: border[5]-border[1], scale: 1.0 }
+Page.captureScreenshot{ format, clip, fromSurface: true, captureBeyondViewport: full_page }
+轮次：Page.enable + Page.loadEventFired（set_content/goto）或每 100ms 轮询 wait_for_selector
+细节：截图前 Target.activateTarget；透明背景用 Emulation.setDefaultBackgroundColorOverride
+      （只对 PNG；用完发一次 {} 复位）；DPR 用 Emulation.setDeviceMetricsOverride
+      { width, height, deviceScaleFactor, mobile, screenOrientation }
+```
+
+**B. `webshot`：CLI 外壳 + 拼图**
+
+- 元素截图 = `tab.find_element(selector)` + `element.capture_screenshot()`；`headless_chrome` 的实现
+  （上游 `src/browser/tab/element/mod.rs`）是 **先 `scroll_into_view()` 再用元素盒子 clip 截图**——
+  即"元素在视口外"这件事，由滚动解决。
+- 视口/DPR 同样走 `Emulation.setDeviceMetricsOverride`；默认 1280×800、`retina=false`、
+  `timeout=30s`、`max_height=30000`、`scroll_delay=100ms`。
+- 全页与"超高元素"：`ScrollMode::{Viewport, FullPage, FullElement}`——**自己滚动 + `image` crate 拼接**
+  （FullElement 先 `Runtime.evaluate` 取 `{x, y, width: scrollWidth, height: scrollHeight}`，再逐屏截拼）；
+  批量任务用 `buffer_unordered(parallel)`；PDF 走 `PrintToPdfOptions`；截图前可执行 JS、可等元素。
+
+**对 SnapClip 的五条结论**：
+
+1. **管道成本很低且已有成熟做法**：启动、发现 ws、attach、选择器→盒子、截图、DPR、透明背景，
+   手写也就 8 KB 传输层 + 40 KB 主逻辑（`cdp-html-shot` 全量），不需要引入 CDP 封装库。
+2. **两份都不做"光标所在元素"**：它们只接受调用者给的 CSS 选择器。要按光标吸附仍必须用
+   `DOM.getNodeForLocation(x, y)`（§5.10 已确认 CDP 提供），这两份补的是**管道**，不是命中测试。
+3. **坐标事实（接入时必须记住）**：`DOM.getBoxModel` 的四角是**页面文档坐标系**的 CSS px；
+   `Page.captureScreenshot.clip` 用同一坐标系，输出像素 = clip × `scale`（或 × deviceScaleFactor）。
+   我们的 overlay 用**物理屏幕 px**，换算链是：浏览器窗口原点 + 页面原点相对 client 的偏移
+   （本机实测 87 px）+ 页面缩放 + DPR。§5.4 的坑（把 client 当作页面原点）在这里一模一样。
+4. **不要抄"滚动 + 拼图"**：CDP 有 `captureBeyondViewport: true` + 文档坐标 clip，元素高于视口时
+   一次就能截；webshot 的拼图正是另一份参考项目里 10 万字符坐标 bug 的来源。
+5. **产品形态**：这两份都是"**自己拉起 headless 浏览器（全新临时 profile）**"，从不 attach 用户正在用
+   的浏览器——与 §5.11 的结论一致（Chrome 136 起默认 profile 禁用远程调试）。所以 SnapClip 若走 CDP，
+   定位应是"在 SnapClip 启动的浏览器里做精准截图"，而不是"吸附你正在浏览的页面"。
+
 ---
 
 ## 6. 实测踩坑清单（每条都花了时间，务必先读）
