@@ -1330,6 +1330,10 @@ CSS transform 旋转盒 ✓、canvas/svg/表格/表单控件 ✓。真正剩下�
 **交互原型**：`prototypes/chain-rings-demo.html`（1280×720 的"显示器"，9 层真机形态 + 4 层 + 2 层三种场景；
 滚轮 / ↑↓ 换层，101 ms OutQuad 缓动；可切「当前实现」与「③a」直接对照；参数可调；侧栏给出每一层"画 / 跳过"
 与原因）。打开方式：直接双击，或 `npx serve prototypes` 后访问（`file://` 也可以）。
+**v2 原型（`prototypes/chain-rings-demo-v2.html`，用户提供）**在同一页里把状态也做成了开关：
+`模拟整窗兜底`（只截断"链"，页面照旧 —— 对应真机 `kind == TopLevelWindowFrame`、`path.len() == 1`）、
+`加降级标记 ?`（对应 `PrecisionOutcome::Unavailable`）、`⟳ 连续滚 6 格`（每 140 ms 一格，用来看
+"很多候选盒子同时在场"时绿色跟不跟得住），以及右栏的真实 present 计数。
 
 **v2 原型**（`prototypes/chain-rings-demo-v2.html`，用户提供 + 修一处 bug）：把"口头保证"换成**本页真实渲染循环的计数**
 （脏标记驱动，稳定期真的不重绘）。它给了 §5.22 几个必须固化的决定，以及第一组实测数字。

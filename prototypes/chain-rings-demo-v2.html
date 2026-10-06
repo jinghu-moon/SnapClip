@@ -775,6 +775,19 @@
               ><b>截图变暗遮罩</b>（整屏 0.34）。</span
             ></label
           >
+          <label class="chk"
+            ><input type="checkbox" id="forceWindow" /><span
+              ><b>模拟整窗兜底</b>（只答到窗口）—— 它是"没钻到元素"那种结果：
+              链被截成 1 层、没有任何环、选中层走中性灰。<b>对比绿色：没有绿，就说明
+              这一下拿到的只是窗口外壳</b>。</span
+            ></label
+          >
+          <label class="chk"
+            ><input type="checkbox" id="degraded" /><span
+              ><b>加降级标记 <code>?</code></b
+              >（真机里是"这个位置什么都没答上来"）——只影响标签文案。</span
+            ></label
+          >
           <p class="fine">
             ③b（工具栏第三档）：走动结束 1.2 s 后整条链按 8 步量化淡出（≈ 8
             帧额外满屏）；任何换层或移动光标立刻复现——对应 ArmedHint /
@@ -1156,6 +1169,8 @@
         ramp: true,
         collapse: 8,
         selFill: 0.18,
+        forceWindow: false,
+        degraded: false,
         selWidth: 2,
         keepAnswer: true,
         dim: true,
@@ -1173,7 +1188,12 @@
       };
 
       const levelsOf = () => SCENARIOS[state.scenario].levels;
-      const deepest = () => levelsOf().length - 1;
+      // 「链」与「页面」是两张不同的表：`levelsOf()` 描述**页面**（一直完整），
+      // `chainOf()` 描述**检测结果**。整窗兜底开关只截断后者——
+      // 真机里那是 `deep_target.kind == TopLevelWindowFrame`、`path.len() == 1` 的状态，
+      // 页面内容当然还在（只是没人能钻到窗口以下）。
+      const chainOf = () => (state.forceWindow ? levelsOf().slice(0, 1) : levelsOf());
+      const deepest = () => chainOf().length - 1;
       const effImpl = () => (state.peek ? "current" : state.impl);
       const optsNow = () => ({
         impl: effImpl(),
@@ -1262,7 +1282,9 @@
         const pr = page.getBoundingClientRect(),
           er = el.getBoundingClientRect();
         const s = stageScale || 1;
-        levelsOf()[deepest()].rect = [
+        // 写回**页面**里那一层的位置（与"链"是否被整窗兜底截断无关）。
+        const pageLevels = levelsOf();
+        pageLevels[pageLevels.length - 1].rect = [
           (er.left - pr.left) / s,
           (er.top - pr.top) / s,
           er.width / s,
@@ -1455,8 +1477,8 @@
 
       /* ---------------------------------------------------------------- 文案 */
       function labelFor(i) {
-        const n = levelsOf().length,
-          lv = levelsOf()[i];
+        const n = chainOf().length,
+          lv = chainOf()[i];
         const kind = i === 0 ? "窗口" : i === n - 1 ? "元素" : "容器";
         let t =
           Math.round(lv.rect[2]) +
@@ -1465,6 +1487,8 @@
           " px  " +
           kind;
         if (n > 1 && i !== n - 1) t += " " + (i + 1) + "/" + n;
+        // 整窗兜底 + 什么都没答上来（真机里 PrecisionOutcome::Unavailable）时标签带 `?`。
+        if (state.degraded) t += "?";
         return t;
       }
       function chip(x, y, text, border, color) {
@@ -1487,7 +1511,7 @@
 
       /* ---------------------------------------------------------------- 绘制 */
       function draw() {
-        const levels = levelsOf(),
+        const levels = chainOf(),
           n = levels.length,
           sel = state.selected;
         const eff = effImpl();
@@ -1808,7 +1832,7 @@
           );
           if (t >= 1) {
             state.anim = null;
-            state.shown = levelsOf()[state.selected].rect.slice();
+            state.shown = chainOf()[state.selected].rect.slice();
           }
           easingNow = true;
           requestDraw();
@@ -1841,7 +1865,7 @@
 
       /* ---------------------------------------------------------------- 走动 */
       function setSelected(next) {
-        const levels = levelsOf(),
+        const levels = chainOf(),
           n = levels.length;
         const c = Math.max(0, Math.min(n - 1, next));
         if (c === state.selected) return;
@@ -1884,7 +1908,7 @@
 
       /* ---------------------------------------------------------------- 侧栏 */
       function renderStack() {
-        const levels = levelsOf(),
+        const levels = chainOf(),
           n = levels.length,
           eff = effImpl();
         const rows = selectRings(levels, state.selected, optsNow());
@@ -2105,7 +2129,7 @@
           resetMetrics();
           renderPage();
           syncAnswer();
-          state.shown = levelsOf()[state.selected].rect.slice();
+          state.shown = chainOf()[state.selected].rect.slice();
           renderStack();
           requestDraw();
         });
@@ -2154,7 +2178,7 @@
         state.lastWalk = performance.now();
         renderPage();
         syncAnswer();
-        state.shown = levelsOf()[state.selected].rect.slice();
+        state.shown = chainOf()[state.selected].rect.slice();
         state.hintText = "滚轮 / ↑↓ 换吸附层级";
         state.hintUntil = performance.now() + 2600;
         renderStack();
@@ -2170,11 +2194,20 @@
         bindRange("selWidth", "selWidth", (v) => v + " px");
         bindCheck("keepAnswer", "keepAnswer", () => renderStack());
         bindCheck("ramp", "ramp", () => renderStack());
+        // 整窗兜底只截断"链"：页面照旧，选中层落到窗口那层，环全空。
+        bindCheck("forceWindow", "forceWindow", () => {
+          state.selected = state.forceWindow ? 0 : deepest();
+          state.anim = null;
+          state.shown = chainOf()[state.selected].rect.slice();
+          ringFx.clear();
+          renderStack();
+        });
+        bindCheck("degraded", "degraded", () => renderStack());
         bindCheck("dim", "dim");
         bindCheck("ease", "ease", (v) => {
           if (!v && state.anim) {
             state.anim = null;
-            state.shown = levelsOf()[state.selected].rect.slice();
+            state.shown = chainOf()[state.selected].rect.slice();
           }
         });
         bindCheck("ringAnim", "ringAnim", (v) => {
@@ -2189,7 +2222,7 @@
           document.fonts.ready.then(() => {
             syncAnswer();
             if (state.selected === deepest() && !state.anim)
-              state.shown = levelsOf()[state.selected].rect.slice();
+              state.shown = chainOf()[state.selected].rect.slice();
             renderStack();
             requestDraw();
           });
