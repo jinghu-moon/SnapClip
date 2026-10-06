@@ -124,6 +124,11 @@ const INFO_KBD_BLOCK_GAP_DIP: f32 = 12.0;
 /// Mask colour (opaque black at 45% opacity). Configurable in one place so the
 /// light/dark-background acceptance can be re-run with a different value.
 pub const MASK_ALPHA: f32 = 0.45;
+/// How much of the theme colour is laid over the neutral mask (docs/21 §5.22).
+///
+/// Deliberately small: the prototype measured a 30% blue tint pushing the background towards the
+/// rings' hue and dropping a blue ring from 3.1:1 to 1.2–1.8:1, while 10% costs almost nothing.
+pub const MASK_TINT_ALPHA: f32 = 0.10;
 pub const MASK_RGB: (f32, f32, f32) = (0.0, 0.0, 0.0);
 
 /// Sizes the renderer needs, all in physical pixels.
@@ -184,6 +189,17 @@ impl RenderMetrics {
     }
 }
 
+/// One ring of the level chain to paint (docs/21 §5.22), in back-buffer coordinates.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChainRingView {
+    pub rect: Rect,
+    /// Deeper than the selection. Inner rings are painted *after* the preview wash (see
+    /// [`RenderView::chain_rings`]); outer rings are painted before it.
+    pub inner: bool,
+    /// Effective opacity for the ring brush — the outer/inner base after the distance ramp.
+    pub alpha: f32,
+}
+
 /// One L0/L1/L2 composition request.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderView {
@@ -227,11 +243,14 @@ pub struct RenderView {
     /// Automatic-snap preview, in back-buffer coordinates. Painted as its own layer so a
     /// preview can never be confused with a confirmed selection.
     pub preview_bounds: Option<Rect>,
-    /// Deep-selection ancestors (frame → deepest), in back-buffer coordinates.
+    /// The level chain as rings to paint, in back-buffer coordinates (docs/21 §5.22).
     ///
-    /// Only the *levels* are painted here; the deepest entry is drawn by
-    /// `hover_bounds`/`preview_bounds` so the emphasised rectangle is never duplicated.
-    pub path_bounds: Vec<Rect>,
+    /// Which levels these are — anchors, collapse, merge, the cap of seven — is decided by
+    /// `chain_rings`, not here. The selected level is included but painted by the preview code
+    /// (capture colour, double stroke), and each ring carries whether it is inside the selection:
+    /// **inner rings are painted above the preview wash**, outer ones below it, because a wash
+    /// painted over the inner rings is what made them invisible in the prototype.
+    pub chain_rings: Vec<ChainRingView>,
     /// Text beside the automatic-snap preview (docs/21 §5.21); `None` = no label.
     pub preview_label: Option<String>,
     /// The previewed box is the whole window rather than an element: neutral wash, thin outline.
@@ -264,7 +283,7 @@ impl RenderView {
             annotation_draft: None,
             hover_bounds: None,
             preview_bounds: None,
-            path_bounds: Vec::new(),
+            chain_rings: Vec::new(),
             preview_label: None,
             preview_is_window: false,
             hint: None,
@@ -306,6 +325,13 @@ pub struct OverlayRenderer {
     hover_fill_brush: Option<ID2D1SolidColorBrush>,
     /// Accent wash at low alpha — marks the automatic-snap preview.
     preview_fill_brush: Option<ID2D1SolidColorBrush>,
+    /// Capture green at full opacity — the outline of the box that will be captured (docs/21 §5.22).
+    capture_brush: Option<ID2D1SolidColorBrush>,
+    /// Mutable ring brush: the level chain, with each ring's own opacity set per frame.
+    chain_ring_brush: Option<ID2D1SolidColorBrush>,
+    /// Theme colour laid over the neutral mask at a few percent (docs/21 §5.22): brand presence,
+    /// not darkening — the black mask does that.
+    mask_tint_brush: Option<ID2D1SolidColorBrush>,
     handle_brush: Option<ID2D1SolidColorBrush>,
     label_background_brush: Option<ID2D1SolidColorBrush>,
     label_text_brush: Option<ID2D1SolidColorBrush>,
@@ -383,6 +409,9 @@ impl OverlayRenderer {
             mask_brush: None,
             hover_fill_brush: None,
             preview_fill_brush: None,
+            capture_brush: None,
+            chain_ring_brush: None,
+            mask_tint_brush: None,
             handle_brush: None,
             label_background_brush: None,
             label_text_brush: None,
@@ -552,7 +581,7 @@ impl OverlayRenderer {
         let view = &RenderView {
             hover_bounds: None,
             preview_bounds: None,
-            path_bounds: Vec::new(),
+            chain_rings: Vec::new(),
             preview_label: None,
             preview_is_window: false,
             hint: None,
@@ -638,6 +667,29 @@ impl OverlayRenderer {
     }
 
     fn draw_layers(&mut self, view: &RenderView) -> Result<(), String> {
+        // Fill the mask geometry — the frame, minus the selection hole — with `brush`. Four bands
+        // instead of re-drawing the frame inside the hole keeps the selected pixels at their
+        // original brightness; the same geometry is reused for the theme tint below.
+        fn fill_mask(
+            context: &ID2D1DeviceContext,
+            frame: Rect,
+            selection: Rect,
+            brush: &ID2D1SolidColorBrush,
+        ) {
+            unsafe {
+                if selection.is_empty() {
+                    context.FillRectangle(&to_d2d(frame), brush);
+                } else {
+                    let hole = selection.intersect(frame);
+                    for band in frame.surround(hole) {
+                        if band.is_empty() {
+                            continue;
+                        }
+                        context.FillRectangle(&to_d2d(band), brush);
+                    }
+                }
+            }
+        }
         let frame_bitmap = self.frame_bitmap.clone();
         let mask = self.require_brush(&self.mask_brush, "mask brush")?;
 
@@ -662,18 +714,13 @@ impl OverlayRenderer {
         // L1: mask everything outside the selection. Using four bands (instead of
         // re-drawing the frame inside the hole) keeps the selected pixels at their
         // original brightness and lets a drag touch only the changed bands.
-        unsafe {
-            if view.selection.is_empty() {
-                self.d2d.FillRectangle(&to_d2d(view.frame), &mask);
-            } else {
-                let hole = view.selection.intersect(view.frame);
-                for band in view.frame.surround(hole) {
-                    if band.is_empty() {
-                        continue;
-                    }
-                    self.d2d.FillRectangle(&to_d2d(band), &mask);
-                }
-            }
+        fill_mask(&self.d2d, view.frame, view.selection, &mask);
+        // …and a trace of the theme colour on top of it (docs/21 §5.22). Black does the darkening;
+        // the tint is only brand presence. The prototype measured why it stays small: at 30% the
+        // screen shifts towards the rings' hue and a blue ring drops from 3.1:1 to 1.2–1.8:1,
+        // while 10% costs almost nothing.
+        if let Some(tint) = self.mask_tint_brush.clone() {
+            fill_mask(&self.d2d, view.frame, view.selection, &tint);
         }
 
         // L2: annotations (inside selection only, after mask, before chrome).
@@ -726,27 +773,26 @@ impl OverlayRenderer {
     fn draw_window_hints(&mut self, view: &RenderView) -> Result<(), String> {
         if view.hover_bounds.is_none()
             && view.preview_bounds.is_none()
-            && view.path_bounds.is_empty()
+            && view.chain_rings.is_empty()
             && view.hint.is_none()
         {
             return Ok(());
         }
         let border = self.require_brush(&self.border_brush, "border brush")?;
+        let capture = self.require_brush(&self.capture_brush, "capture brush")?;
         let width = self.metrics.border_width;
 
-        // Ancestor levels of the deep-selection path: outline only, thin, drawn first so the
-        // emphasised rectangle below sits on top of them. The deepest entry is deliberately
-        // not drawn from here — it is the hover/preview rectangle.
-        let emphasised = view.preview_bounds.or(view.hover_bounds);
-        for level in &view.path_bounds {
-            let rect = level.intersect(view.frame);
-            if rect.is_empty() || Some(rect) == emphasised {
-                continue;
-            }
-            unsafe {
-                self.d2d.DrawRectangle(&to_d2d(rect), &border, width, None);
-            }
-        }
+        // ── The level chain, in two passes around the washes (docs/21 §5.22) ──
+        //
+        // Outer rings first: they are the context *around* the selection, and the washes below
+        // should read as sitting inside them. Inner rings are painted after the preview wash
+        // instead — they live inside it, and painting them underneath (the prototype's first
+        // version) hides them completely: accent line under accent wash is nearly nothing.
+        //
+        // One rectangle, one stroke: the hovered window frame is `path[0]`, so its ring is skipped
+        // when the hover box is the same rectangle — otherwise the window frame gets two outlines.
+        let hovered = view.hover_bounds;
+        self.paint_chain_rings(view, false, hovered, None)?;
 
         if let Some(hover) = view.hover_bounds {
             let rect = hover.intersect(view.frame);
@@ -766,21 +812,30 @@ impl OverlayRenderer {
                 // A whole-window answer is the v1 fallback, not an element pick: it reads as the
                 // neutral hover wash with a thin outline, so "we could not get below the window" is
                 // visible instead of looking like a confident element preview (docs/21 §5.21).
-                let (fill, width) = if view.preview_is_window {
-                    (self.require_brush(&self.hover_fill_brush, "hover fill brush")?, width)
+                // An element answer is the *capture*: the green that says "this is what you get",
+                // distinct from the blue that means "a level on the chain" (docs/21 §5.22).
+                let (fill, stroke, stroke_width) = if view.preview_is_window {
+                    (
+                        self.require_brush(&self.hover_fill_brush, "hover fill brush")?,
+                        border.clone(),
+                        width,
+                    )
                 } else {
                     (
                         self.require_brush(&self.preview_fill_brush, "preview fill brush")?,
+                        capture.clone(),
                         width * 2.0,
                     )
                 };
                 unsafe {
                     self.d2d.FillRectangle(&to_d2d(rect), &fill);
                     self.d2d
-                        .DrawRectangle(&to_d2d(rect), &border, width, None);
+                        .DrawRectangle(&to_d2d(rect), &stroke, stroke_width, None);
                 }
             }
         }
+        // …and now the inner rings, above the wash that would otherwise cover them.
+        self.paint_chain_rings(view, true, hovered, view.preview_bounds)?;
         // The preview's own label: size, kind, level and whether anything answered for this
         // position. Drawn last so it sits above every outline it describes.
         if let (Some(preview), Some(text)) = (view.preview_bounds, view.preview_label.as_deref()) {
@@ -791,6 +846,45 @@ impl OverlayRenderer {
         }
         if let Some((at, text)) = view.hint.as_ref() {
             self.draw_hint_at(Rect::new(at.x, at.y, at.x, at.y), text, view, self.metrics)?;
+        }
+        Ok(())
+    }
+
+    /// A small panel with `text` anchored to `anchor` (docs/21 §5.21).
+    /// Paint one pass of the level chain: `inner == false` for the rings outside the selection,
+    /// `inner == true` for the ones inside it (docs/21 §5.22).
+    ///
+    /// `skip` rectangles are drawn by other layers — the hovered window frame and the preview box
+    /// have their own strokes, and a level that coincides with one of them must not be stroked a
+    /// second time.
+    fn paint_chain_rings(
+        &mut self,
+        view: &RenderView,
+        inner: bool,
+        skip: Option<Rect>,
+        also_skip: Option<Rect>,
+    ) -> Result<(), String> {
+        if view.chain_rings.is_empty() {
+            return Ok(());
+        }
+        let brush = self.require_brush(&self.chain_ring_brush, "chain ring brush")?;
+        let width = self.metrics.border_width.min(1.0);
+        for ring in view.chain_rings.iter().filter(|ring| ring.inner == inner) {
+            let rect = ring.rect.intersect(view.frame);
+            if rect.is_empty() {
+                continue;
+            }
+            if skip.is_some_and(|other| other.intersect(view.frame) == rect)
+                || also_skip.is_some_and(|other| other.intersect(view.frame) == rect)
+            {
+                continue;
+            }
+            // One mutable brush, `SetColor` per ring: at most seven calls a frame and no
+            // allocation, the same trick the annotation strokes already use.
+            let _ = unsafe { brush.SetColor(&chain_ring_color(ring.alpha)) };
+            unsafe {
+                self.d2d.DrawRectangle(&to_d2d(rect), &brush, width, None);
+            }
         }
         Ok(())
     }
@@ -1790,8 +1884,29 @@ impl OverlayRenderer {
         // introduced (docs/14 §8).
         let hover_fill = color(1.0, 1.0, 1.0, 0.10);
         self.hover_fill_brush = Some(self.create_brush(&hover_fill)?);
-        let preview_fill = color(31.0 / 255.0, 117.0 / 255.0, 219.0 / 255.0, 0.18);
+        // The preview is the *capture* (docs/21 §5.22): green wash + green outline, so the box that
+        // would be taken is one colour and the blue chain around it is another.
+        let preview_fill = color(
+            CAPTURE_RGB.0,
+            CAPTURE_RGB.1,
+            CAPTURE_RGB.2,
+            0.18,
+        );
         self.preview_fill_brush = Some(self.create_brush(&preview_fill)?);
+        self.capture_brush = Some(self.create_brush(&color(
+            CAPTURE_RGB.0,
+            CAPTURE_RGB.1,
+            CAPTURE_RGB.2,
+            1.0,
+        ))?);
+        // Mutable: `paint_chain_rings` sets each ring's own opacity.
+        self.chain_ring_brush = Some(self.create_brush(&chain_ring_color(1.0))?);
+        self.mask_tint_brush = Some(self.create_brush(&color(
+            accent.r * 1.0,
+            accent.g * 1.0,
+            accent.b * 1.0,
+            MASK_TINT_ALPHA,
+        ))?);
         self.handle_brush = Some(self.create_brush(&white)?);
         self.label_background_brush = Some(self.create_brush(&panel)?);
         self.label_text_brush = Some(self.create_brush(&white)?);
@@ -1886,6 +2001,11 @@ impl OverlayRenderer {
         self.size = (0, 0);
         self.border_brush = None;
         self.mask_brush = None;
+        self.preview_fill_brush = None;
+        self.hover_fill_brush = None;
+        self.capture_brush = None;
+        self.chain_ring_brush = None;
+        self.mask_tint_brush = None;
         self.handle_brush = None;
         self.label_background_brush = None;
         self.label_text_brush = None;
@@ -1937,6 +2057,31 @@ fn color(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F { r, g, b, a }
 }
 
+/// The chain's ring colour: the same hue as the brand blue, one step lighter (docs/21 §5.22).
+///
+/// The brand blue (`border_brush`) sits on *unmasked* content where it is fine; a ring is drawn on
+/// top of the mask, where it measured only 2.0:1 even at full opacity. `#4a9bff` reaches 3.1:1 on
+/// light content and 2.1:1 on dark at 60%, which is what makes the chain readable without letting
+/// it compete with the capture green.
+const CHAIN_RING_RGB: (f32, f32, f32) = (74.0 / 255.0, 155.0 / 255.0, 255.0 / 255.0);
+
+/// The capture green (`#1bb15f`): the box that would be taken, and only that.
+///
+/// Measured on the masked content: 3.2:1 on dark, 7.5:1 on light, and 3.2:1 even over a
+/// blue-tinted mask — which is why the decisive element can carry the colour while the chain stays
+/// blue (docs/21 §5.22).
+const CAPTURE_RGB: (f32, f32, f32) = (27.0 / 255.0, 177.0 / 255.0, 95.0 / 255.0);
+
+/// The ring brush is mutable (`SetColor` per ring) because each level carries its own opacity.
+fn chain_ring_color(alpha: f32) -> D2D1_COLOR_F {
+    color(
+        CHAIN_RING_RGB.0,
+        CHAIN_RING_RGB.1,
+        CHAIN_RING_RGB.2,
+        alpha.clamp(0.0, 1.0),
+    )
+}
+
 /// Build the point type Direct2D expects.
 fn vector2(x: f32, y: f32) -> Vector2 {
     Vector2 { X: x, Y: y }
@@ -1957,7 +2102,10 @@ fn to_wide(value: &str) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MASK_ALPHA, OverlayRenderer, RenderMetrics, RenderView, to_d2d};
+    use super::{
+        ChainRingView, MASK_ALPHA, MASK_TINT_ALPHA, OverlayRenderer, RenderMetrics, RenderView,
+        to_d2d,
+    };
     use crate::capture::annotation::{
         AnnotationGeometry, AnnotationItem, AnnotationKind, AnnotationStyle,
     };
@@ -1988,14 +2136,38 @@ mod tests {
     }
 
     /// The exact pixel the L1 mask produces for an opaque source pixel.
+    ///
+    /// Derived from the palette constants rather than hard-coded, so adding a layer to the mask (the
+    /// theme tint, docs/21 §5.22) moves every assertion with it instead of breaking a dozen tests.
+    /// Straight (non-premultiplied) blends; the readback is BGRA, so channel 0 is blue.
     fn masked(pixel: [u8; 4]) -> [u8; 4] {
-        let scale = 1.0 - MASK_ALPHA;
+        // The neutral mask is black at MASK_ALPHA…
+        let masked = [0, 1, 2].map(|channel| pixel[channel] as f32 * (1.0 - MASK_ALPHA));
+        // …and the theme tint is `#1f75db` at MASK_TINT_ALPHA, written in BGRA like a readback.
+        const ACCENT_BGRA: [f32; 3] = [219.0, 117.0, 31.0];
+        let out = [0, 1, 2].map(|channel| {
+            masked[channel] * (1.0 - MASK_TINT_ALPHA) + ACCENT_BGRA[channel] * MASK_TINT_ALPHA
+        });
         [
-            (pixel[0] as f32 * scale).round() as u8,
-            (pixel[1] as f32 * scale).round() as u8,
-            (pixel[2] as f32 * scale).round() as u8,
+            out[0].round() as u8,
+            out[1].round() as u8,
+            out[2].round() as u8,
             255,
         ]
+    }
+
+    /// Compare a readback pixel with the palette's expected value, tolerating one unit per channel.
+    ///
+    /// The mask's layers are composited by Direct2D in premultiplied space, rounding at each stage,
+    /// while `masked()` is a straight-alpha calculation — the two can disagree by one. Anything
+    /// beyond that is a real difference and still fails.
+    fn assert_pixel_close(actual: [u8; 4], expected: [u8; 4], what: &str) {
+        for channel in 0..3 {
+            assert!(
+                (actual[channel] as i32 - expected[channel] as i32).abs() <= 1,
+                "{what}: got {actual:?}, expected {expected:?}",
+            );
+        }
     }
 
     /// Visual regression for the L0/L1/L2 composition.
@@ -2052,10 +2224,10 @@ mod tests {
         let unselected = renderer.device().read_back_bgra(&target.texture).unwrap();
         // Before the first drag every pixel is masked; the frame shows through at the
         // mask's complement.
-        assert_eq!(
+        assert_pixel_close(
             pixel_at(&unselected, width, 32, 24),
             masked(background),
-            "an unselected frame must be uniformly masked"
+            "an unselected frame must be uniformly masked",
         );
 
         view.selection = selection;
@@ -2081,10 +2253,10 @@ mod tests {
             outside[0] < background[0] && outside[1] < background[1] && outside[2] < background[2],
             "masked pixel {outside:?} must be darker than the frame {background:?}"
         );
-        assert_eq!(
+        assert_pixel_close(
             outside,
             masked(background),
-            "mask alpha must match the configured value"
+            "mask alpha must match the configured value",
         );
 
         let _ = frame;
@@ -2328,13 +2500,52 @@ mod tests {
         let ancestor = Rect::new(4, 4, 44, 36);
         view.hover_bounds = None;
         view.preview_bounds = Some(window);
-        view.path_bounds = vec![ancestor, window];
+        view.chain_rings = vec![
+            ChainRingView { rect: ancestor, inner: false, alpha: 0.6 },
+            ChainRingView { rect: window, inner: false, alpha: 0.6 },
+        ];
         renderer.draw_to(&bitmap, &view).unwrap();
         let with_path = renderer.device().read_back_bgra(&target.texture).unwrap();
         assert_ne!(
             sample(&with_path, 24, 4),
             masked,
             "an ancestor level must be outlined"
+        );
+
+        // The chain ring is the lighter blue, not the brand blue of the chrome (docs/21 §5.22):
+        // over masked content the brand blue measures 2.0:1 even at full opacity.
+        let ring = sample(&with_path, 24, 4);
+        assert!(
+            ring[0] > ring[2] && ring[0] > masked[0],
+            "the ring should be blue (BGRA: more blue than red) and brighter than the mask: {:?}",
+            ring,
+        );
+
+        // An inner ring is painted *above* the preview wash. This is the whole point of the
+        // two-pass order: painted underneath, an accent line on an accent wash is invisible — which
+        // is exactly what the prototype showed before it was fixed.
+        let inner = Rect::new(12, 12, 36, 28);
+        view.chain_rings = vec![ChainRingView {
+            rect: inner,
+            inner: true,
+            alpha: 0.6,
+        }];
+        renderer.draw_to(&bitmap, &view).unwrap();
+        let with_inner = renderer.device().read_back_bgra(&target.texture).unwrap();
+        let washed = sample(&with_inner, 24, 20);
+        assert_ne!(
+            sample(&with_inner, 24, 12),
+            washed,
+            "the inner ring must survive the preview wash it sits in"
+        );
+        // …and it must be brighter than the wash, not darker: a same-hue line under a same-hue wash
+        // is what the old order produced.
+        let inner_ring = sample(&with_inner, 24, 12);
+        assert!(
+            inner_ring[0] as i32 > washed[0] as i32 + 10,
+            "inner ring {:?} should stand out from the wash {:?}",
+            inner_ring,
+            washed
         );
 
         // Exporting the previewed rectangle must produce raw frozen pixels: a hint is a
@@ -2473,10 +2684,10 @@ mod tests {
         renderer.draw_to(&bitmap, &view_b).unwrap();
         let after_b = renderer.device().read_back_bgra(&target.texture).unwrap();
 
-        assert_eq!(
+        assert_pixel_close(
             pixel_at(&after_b, width, probe.x as u32, probe.y as u32),
             masked(background),
-            "moving the selection must erase the previous chrome (ghost regression)"
+            "moving the selection must erase the previous chrome (ghost regression)",
         );
     }
 

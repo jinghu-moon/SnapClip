@@ -74,7 +74,7 @@ use crate::capture::session::{CaptureSession, ExportOutcome};
 use crate::capture::window_detection::model::RequestId;
 use crate::capture::window_detection::{
     DEFAULT_ADOPT_TEXT_RUNS, DEFAULT_DWELL_MS, DEFAULT_HOVER_REVALIDATE_MS, DEFAULT_SNAP_RADIUS_PX,
-    DeepTarget, Exclusions, LevelChain,
+    DeepTarget, Exclusions, LevelChain, RingOptions, RingRole, chain_rings,
     GestureState, HoverValidity, MoveOutcome, PressOutcome, RefinementJob, RefinementOutcome,
     RefinementScheduler,
     ReleaseOutcome, Replacement, WindowSnapshot, WindowTarget, classify_replacement,
@@ -91,6 +91,7 @@ use super::hotkey;
 use super::monitor::{self, CapturedMonitor};
 use super::providers::{FrozenFrame, FrozenFramePixels};
 use super::renderer::{OverlayFrameState, Win32Renderer};
+use super::win::d2d::ChainRingView;
 
 /// `WM_APP`-based command delivered from any thread to the overlay thread.
 const WM_OVERLAY_COMMAND: u32 = WM_APP + 17;
@@ -1109,7 +1110,7 @@ where
                 // The exported pixels must never contain a hover or preview hint.
                 hover_bounds: None,
                 preview_bounds: None,
-                path_bounds: Vec::new(),
+                chain_rings: Vec::new(),
                 // …and neither a preview label nor the one-shot hint.
                 preview_label: None,
                 preview_is_window: false,
@@ -1517,13 +1518,15 @@ where
         moved
     }
 
-    /// The deep-selection ancestor levels in monitor-local coordinates (frame → deepest).
+    /// The level chain as rings to paint, in monitor-local coordinates (docs/21 §5.22).
     ///
-    /// Empty unless the published deep target belongs to the window currently under the
-    /// cursor: a path for another window would draw outlines over unrelated pixels. The
-    /// deepest entry is left out because it is painted as the emphasised hover/preview
-    /// rectangle (docs/18 §12.2 的层级可视化).
-    fn deep_path_local(&self) -> Vec<Rect> {
+    /// Which levels are drawn is `chain_rings`'s decision — anchors, collapse, merge, the cap of
+    /// seven — and this function only converts the result into the paint layer's coordinates and
+    /// drops the selected level, which the preview paints with the capture colour.
+    ///
+    /// Empty unless the published deep target belongs to the window currently under the cursor: a
+    /// path for another window would draw outlines over unrelated pixels.
+    fn chain_rings_local(&self) -> Vec<ChainRingView> {
         let Some(layout) = self.layout() else {
             return Vec::new();
         };
@@ -1533,17 +1536,22 @@ where
         if self.hover_target.map(|target| target.identity()) != Some(deep.window) {
             return Vec::new();
         }
-        // Outlines only above the selected level: the selected one is painted as the emphasised
-        // preview rectangle, and the levels *below* it are not part of what the user chose.
         let selected = self
             .deep_levels
             .map(|chain| chain.index())
             .unwrap_or(deep.path.len().saturating_sub(1));
-        deep.path
+        chain_rings(&deep.path, selected, RingOptions::default())
+            .rings
             .iter()
-            .take(selected)
-            .map(|level| window_rect_to_local(*level, &layout))
-            .filter(|level| !level.is_empty())
+            .filter(|ring| ring.role != RingRole::Selected)
+            .filter_map(|ring| {
+                let rect = window_rect_to_local(deep.path[ring.index], &layout);
+                (!rect.is_empty()).then_some(ChainRingView {
+                    rect,
+                    inner: ring.role == RingRole::Inner,
+                    alpha: ring.alpha,
+                })
+            })
             .collect()
     }
 
@@ -2825,7 +2833,7 @@ where
         // The painted preview is the *eased* rectangle; the gesture keeps the true target
         // for confirmation, so the animation can never change what gets committed.
         let preview_bounds = self.preview_rect;
-        let path_bounds = self.deep_path_local();
+        let chain_rings = self.chain_rings_local();
         // …and the two label texts, for the same reason: they read the level chain and the
         // last precision decision, which are `self` reads.
         let preview_label = self.preview_label_text();
@@ -2862,7 +2870,7 @@ where
             annotation_draft: self.annotation_doc.draft.clone(),
             hover_bounds,
             preview_bounds,
-            path_bounds,
+            chain_rings,
             preview_label,
             preview_is_window,
             hint,

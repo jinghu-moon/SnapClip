@@ -15,7 +15,9 @@ use crate::capture::annotation::{AnnotationDocument, AnnotationId, AnnotationIte
 use crate::capture::geometry::{MonitorLayout, Point, Rect};
 
 use super::providers::FrozenFrame;
-use super::win::d2d::{OverlayRenderer as D2dRenderer, RenderMetrics, RenderView};
+use super::win::d2d::{
+    ChainRingView, OverlayRenderer as D2dRenderer, RenderMetrics, RenderView,
+};
 use super::win::d3d11::{AsyncSampleBuffer, CompositionTarget, GraphicsDevice};
 use ::windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 
@@ -48,7 +50,9 @@ pub struct OverlayFrameState {
     /// Automatic-snap preview, in monitor-local coordinates.
     pub preview_bounds: Option<Rect>,
     /// Deep-selection ancestor levels (frame → deepest), monitor-local.
-    pub path_bounds: Vec<Rect>,
+    /// Which rings those are is decided by `chain_rings` (docs/21 §5.22); this is the paint-ready
+    /// form, monitor-local, with the selected level already removed (the preview paints it).
+    pub chain_rings: Vec<ChainRingView>,
     /// Text drawn beside the automatic-snap preview (docs/21 §5.21); `None` = no label.
     ///
     /// Built by the overlay, which is the side that knows the level chain, the target kind and
@@ -78,7 +82,7 @@ impl OverlayFrameState {
             annotation_draft: None,
             hover_bounds: None,
             preview_bounds: None,
-            path_bounds: Vec::new(),
+            chain_rings: Vec::new(),
             preview_label: None,
             preview_is_window: false,
             hint: None,
@@ -212,7 +216,7 @@ impl Win32Renderer {
             annotation_draft: live_draft,
             hover_bounds: state.hover_bounds,
             preview_bounds: state.preview_bounds,
-            path_bounds: state.path_bounds.clone(),
+            chain_rings: state.chain_rings.clone(),
             preview_label: state.preview_label.clone(),
             preview_is_window: state.preview_is_window,
             hint: state.hint.clone(),
@@ -256,7 +260,7 @@ impl Win32Renderer {
             hover_bounds: state.hover_bounds,
             preview_bounds: state.preview_bounds,
             // Hover/preview/path hints are stripped by `OverlayRenderer::render_export`.
-            path_bounds: state.path_bounds.clone(),
+            chain_rings: state.chain_rings.clone(),
             // …and so are the labels and the one-shot hint: an artifact never carries UI.
             preview_label: None,
             preview_is_window: false,
