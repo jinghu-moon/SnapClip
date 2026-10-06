@@ -462,6 +462,14 @@ where
     /// Once per session: the sentence belongs to the moment the number appears, and a user who
     /// keeps walking does not need it again — the label carries the numbers from then on.
     hint_taught: bool,
+    /// When the chain was last *touched*: a level walk, a new answer, or a cursor move (docs/21
+    /// §5.22). Idle time is measured from here for the ③b fade.
+    chain_touched_at: Instant,
+    /// How visible the chain rings are right now, `1.0` down to `0.0` in steps of `1/8`.
+    ///
+    /// Quantised, and that is the point: each step is one full-surface repaint, so the fade costs at
+    /// most eight of them however long the fade lasts (the prototype measured seven).
+    chain_visibility: f32,
     /// A shallower target waiting for its confirming dwell (docs/18 §13.3).
     ///
     /// A cursor merely passing through a parent container produces one such result; displaying
@@ -588,6 +596,8 @@ where
             deep_levels: None,
             hint: None,
             hint_taught: false,
+            chain_touched_at: Instant::now(),
+            chain_visibility: 1.0,
             pending_downgrade: None,
             refinement_pending: None,
             hit_test_pass_through,
@@ -1360,6 +1370,8 @@ where
         // counter is a different sentence, and it is armed later, by the first level walk.
         self.hint_taught = false;
         self.arm_hint(LEVEL_HINT.to_owned(), LEVEL_HINT_MS);
+        // ③b starts from "just touched": a session opens with the chain fully visible.
+        self.touch_chain();
     }
 
     /// Ask the detection worker for a new snapshot. Only the newest request is kept.
@@ -1505,6 +1517,47 @@ where
             .is_some_and(|hint| Instant::now() < hint.until)
     }
 
+    /// The chain was just used: walk, new answer, or a cursor move (docs/21 §5.22).
+    ///
+    /// Brings it straight back to full visibility — a fade in progress must never make the user wait
+    /// to see what they are pointing at.
+    fn touch_chain(&mut self) {
+        self.chain_touched_at = Instant::now();
+        self.chain_visibility = 1.0;
+    }
+
+    /// Advance the ③b fade; returns whether anything changed and therefore needs a repaint.
+    ///
+    /// Called from the coalescing render tick, which also keeps itself alive while the fade is still
+    /// moving (`chain_fade_running`), so the fade is driven by the same 15 ms clock as everything
+    /// else rather than by a timer of its own.
+    fn advance_chain_fade(&mut self) -> bool {
+        if self.chain_visibility <= 0.0 {
+            return false;
+        }
+        let visibility = chain_visibility_at(self.chain_touched_at.elapsed());
+        if (visibility - self.chain_visibility).abs() < f32::EPSILON {
+            return false;
+        }
+        self.chain_visibility = visibility;
+        true
+    }
+
+    /// Whether there is still a fade to come or to finish (docs/21 §5.22).
+    ///
+    /// True from the moment the chain is touched until it has faded out, so the hover tick can keep
+    /// *one* repaint alive to notice the 1.2 s deadline. It is deliberately not what keeps the
+    /// render tick armed — see `chain_fade_running`.
+    fn chain_fade_pending(&self) -> bool {
+        self.chain_visibility > 0.0
+    }
+
+    /// Whether the fade is *moving* right now: only then does the render tick re-arm itself, so the
+    /// 1.2 s of waiting costs nothing (docs/21 §5.22).
+    fn chain_fade_running(&self) -> bool {
+        self.chain_visibility > 0.0 && self.chain_visibility < 1.0
+    }
+
     /// Step the deep-selection level: `-1` toward the window frame, `+1` toward the published box.
     ///
     /// Returns whether anything moved, so the wheel can decide whether to consume the event.
@@ -1526,9 +1579,11 @@ where
             chain.deeper()
         };
         if moved {
-            // The first successful walk is where the counter appears, so that is where it gets
-            // explained (docs/21 §5.21).
-            self.arm_level_hint();
+        // The first successful walk is where the counter appears, so that is where it gets
+        // explained (docs/21 §5.21).
+        self.arm_level_hint();
+            // A walk is the clearest "I am looking at the chain" there is (docs/21 §5.22).
+            self.touch_chain();
             self.refresh_preview_for_cursor();
             self.invalidate();
         }
@@ -1566,7 +1621,9 @@ where
                 (!rect.is_empty()).then_some(ChainRingView {
                     rect,
                     inner: ring.role == RingRole::Inner,
-                    alpha: ring.alpha,
+                    // ③b: the whole chain fades as one after the walk goes quiet (docs/21 §5.22).
+                    // The badge and the capture box do not — they are the answer, not the context.
+                    alpha: ring.alpha * self.chain_visibility,
                 })
             })
             .collect()
@@ -1666,6 +1723,9 @@ where
         };
         if changed {
             self.deep_target = published.cloned();
+            // A new answer is a new chain to look at, so it counts as activity for ③b (docs/21
+            // §5.22) — otherwise the chain could be born already faded.
+            self.touch_chain();
             // A new answer for the pointer resets the level walk to the published box (docs/21
             // §5.17): a chain belongs to the answer it was walked on, and carrying an index over to a
             // different element is how a walk ends up publishing a box nobody asked for.
@@ -1990,6 +2050,12 @@ where
         if self.hint_text().is_some() {
             self.invalidate();
         }
+        // Same reason, for ③b: the fade's 1.2 s deadline is on the wall clock too, and a resting
+        // cursor produces no other repaint. One tick is enough to notice the deadline; from there
+        // the render tick drives the fade itself (docs/21 §5.22).
+        if self.chain_fade_pending() {
+            self.invalidate();
+        }
         self.poll_refinement_timeout();
         let Some(hover) = self.hover_target else {
             return;
@@ -2295,6 +2361,9 @@ where
         let point = Point::new(client.x, client.y);
         self.cursor = point;
         self.cursor_visible = true;
+        // Moving the cursor is the user still *looking*, so it counts as chain activity (docs/21
+        // §5.22): without this the chain fades out while the hand is on its way to inspect it.
+        self.touch_chain();
 
         if self.session.state() == CaptureState::Annotating {
             // The pointer drives the annotation document, not the selection.
@@ -2826,13 +2895,18 @@ where
         if self.advance_preview_animation() {
             self.dirty = true;
         }
+        // …and the ③b chain fade, on the same clock: it is a series of quantised steps, so the tick
+        // only marks dirty when the step actually changes (docs/21 §5.22).
+        if self.advance_chain_fade() {
+            self.dirty = true;
+        }
         if !self.dirty {
             return;
         }
         self.dirty = false;
         self.render();
-        if self.preview_transition.is_running(Instant::now()) {
-            // Schedule the next frame of the animation.
+        if self.preview_transition.is_running(Instant::now()) || self.chain_fade_running() {
+            // Schedule the next frame: the animation or the fade is still moving.
             self.invalidate();
         }
     }
@@ -3171,6 +3245,33 @@ fn exclude_overlay_from_capture(window: HWND) -> Result<(), u32> {
 
 fn describe_rect(rect: Rect) -> String {
     format!("({},{})->({},{})", rect.left, rect.top, rect.right, rect.bottom)
+}
+
+/// The one-shot hint that explains the level walk (docs/21 §5.21).
+/// How long the chain stays fully visible after the last touch (docs/21 §5.22).
+///
+/// Long enough to read the chain after a wheel notch, short enough that it does not sit over the
+/// page while the user is doing something else with the overlay open.
+const CHAIN_FADE_AFTER_MS: u64 = 1200;
+/// How long the fade itself takes. Eight steps over 240 ms is one repaint every 30 ms — bounded,
+/// and fast enough to read as a fade rather than as a sequence of pictures.
+const CHAIN_FADE_MS: u64 = 240;
+/// Steps the fade is quantised into. Each step is a full-surface present, so this *is* the cost.
+const CHAIN_FADE_STEPS: u32 = 8;
+
+/// How visible the chain is, `idle` after the last touch (docs/21 §5.22).
+///
+/// Pure so the shape is testable: flat at 1.0 while the chain has been touched recently, then a
+/// quantised ramp to 0. The quantisation is what bounds the fade's cost — the alternative, a
+/// per-frame alpha, would repaint ~15 times as often for a difference nobody can see.
+pub(crate) fn chain_visibility_at(idle: Duration) -> f32 {
+    let idle_ms = idle.as_millis() as u64;
+    if idle_ms < CHAIN_FADE_AFTER_MS {
+        return 1.0;
+    }
+    let through = (idle_ms - CHAIN_FADE_AFTER_MS) as f32 / CHAIN_FADE_MS as f32;
+    let remaining = (1.0 - through.clamp(0.0, 1.0)) * CHAIN_FADE_STEPS as f32;
+    (remaining.round() / CHAIN_FADE_STEPS as f32).clamp(0.0, 1.0)
 }
 
 /// The one-shot hint that explains the level walk (docs/21 §5.21).
@@ -3529,7 +3630,10 @@ unsafe extern "system" {
 
 #[cfg(test)]
 mod tests {
-    use super::{level_hint, point_from_lparam, preview_label, should_teach, OverlayCommand};
+    use super::{
+        CHAIN_FADE_AFTER_MS, CHAIN_FADE_MS, CHAIN_FADE_STEPS, chain_visibility_at, level_hint,
+        point_from_lparam, preview_label, should_teach, OverlayCommand,
+    };
     use crate::capture::geometry::Rect;
     use crate::capture::window_detection::LevelChain;
 
@@ -3634,6 +3738,47 @@ mod tests {
         );
         assert_eq!(preview_label(rect, true, false, true), "3840×2088 px  窗口?");
         assert_eq!(preview_label(rect, false, true, true), "3840×2088 px  容器?");
+    }
+
+    /// The teaching sentence's two rules, as a truth table: once per session, but it follows a
+    /// ③b's shape: flat while the chain is being used, then a ramp to nothing — and the number of
+    /// distinct values in that ramp *is* its cost, because each one is a full-surface repaint.
+    #[test]
+    fn the_chain_fade_is_flat_then_quantised_into_a_bounded_number_of_steps() {
+        use std::time::Duration;
+
+        // Flat for the whole idle window, including the instant before the deadline.
+        assert_eq!(chain_visibility_at(Duration::ZERO), 1.0);
+        assert_eq!(chain_visibility_at(Duration::from_millis(1199)), 1.0);
+        // Then it starts coming down, in steps of 1/8.
+        let first = chain_visibility_at(Duration::from_millis(CHAIN_FADE_AFTER_MS));
+        assert_eq!(first, 1.0, "the fade begins at the deadline, not before it");
+        let a_step_down = chain_visibility_at(Duration::from_millis(CHAIN_FADE_AFTER_MS + 30));
+        assert!(
+            a_step_down < 1.0 && a_step_down >= 1.0 - 1.0 / CHAIN_FADE_STEPS as f32,
+            "one step down: {a_step_down}",
+        );
+        // Gone at the end of the fade, and it stays gone.
+        assert_eq!(
+            chain_visibility_at(Duration::from_millis(
+                CHAIN_FADE_AFTER_MS + CHAIN_FADE_MS
+            )),
+            0.0
+        );
+        assert_eq!(chain_visibility_at(Duration::from_secs(60)), 0.0);
+
+        // The bound: at most one distinct value per step, which is at most eight repaints however
+        // often the fade is sampled. A per-frame alpha would have been ~16 values over the same
+        // 240 ms (docs/21 §5.22).
+        let sampled: std::collections::BTreeSet<u32> =
+            (0..=CHAIN_FADE_AFTER_MS + CHAIN_FADE_MS + 100)
+                .map(|ms| (chain_visibility_at(Duration::from_millis(ms)) * 1000.0) as u32)
+                .collect();
+        assert!(
+            sampled.len() as u32 <= CHAIN_FADE_STEPS + 1,
+            "the fade took {} distinct values",
+            sampled.len(),
+        );
     }
 
     /// The teaching sentence's two rules, as a truth table: once per session, but it follows a
