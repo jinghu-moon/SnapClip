@@ -92,7 +92,7 @@
         border-right: 0;
       }
       .seg button.on {
-        background: rgba(61, 139, 253, 0.18);
+        background: rgba(31, 117, 219, 0.18);
         color: #fff;
         box-shadow: inset 0 0 0 1px var(--accent);
       }
@@ -305,7 +305,7 @@
         background: #1a212c;
       }
       .lrow.rsel {
-        background: rgba(61, 139, 253, 0.13);
+        background: rgba(31, 117, 219, 0.13);
       }
       .dot {
         width: 32px;
@@ -320,12 +320,12 @@
         border-radius: 50%;
       }
       .lrow.keep .dot i {
-        background: rgba(61, 139, 253, 0.85);
-        box-shadow: 0 0 0 1px rgba(61, 139, 253, 0.45);
+        background: rgba(31, 117, 219, 0.85);
+        box-shadow: 0 0 0 1px rgba(31, 117, 219, 0.45);
       }
       .lrow.rsel .dot i {
         background: var(--accent);
-        box-shadow: 0 0 6px rgba(61, 139, 253, 0.9);
+        box-shadow: 0 0 6px rgba(31, 117, 219, 0.9);
       }
       .lrow.skip .dot i {
         background: var(--panel2);
@@ -669,7 +669,7 @@
       .swSel {
         border-width: 2px;
         border-color: var(--accent);
-        background: rgba(61, 139, 253, 0.18);
+        background: rgba(31, 117, 219, 0.18);
         height: 14px;
       }
       .swWin {
@@ -813,9 +813,9 @@
                 id="outerAlpha"
                 min="10"
                 max="90"
-                value="45"
+                value="60"
               />
-              <output id="outerAlphaOut">45%</output></span
+              <output id="outerAlphaOut">60%</output></span
             ></label
           >
           <label class="row"
@@ -826,9 +826,9 @@
                 id="innerAlpha"
                 min="0"
                 max="90"
-                value="45"
+                value="60"
               />
-              <output id="innerAlphaOut">45%</output></span
+              <output id="innerAlphaOut">60%</output></span
             ></label
           >
           <label class="row"
@@ -870,9 +870,40 @@
               ><b>保留最深答案的环</b>（回程点——按 ↓ 能回去的地方）。</span
             ></label
           >
+          <label class="chk"
+            ><input type="checkbox" id="ramp" checked /><span
+              ><b>环浓度随层级递减</b>（离选中层越远越淡，下限 45%）——
+              外圈是背景，近处才是与你有关的上下文。</span
+            ></label
+          >
+          <label class="row"
+            ><span class="k">遮罩 · 主题色</span
+            ><span
+              ><input type="range" id="maskAlpha" min="0" max="30" value="10" />
+              <output id="maskAlphaOut">10%</output></span
+            ></label
+          >
+          <label class="row"
+            ><span class="k">遮罩 · 中性黑</span
+            ><span
+              ><input type="range" id="maskBlack" min="10" max="60" value="32" />
+              <output id="maskBlackOut">32%</output></span
+            ></label
+          >
           <p class="fine">
-            内层透明度 28% / 塌缩 8 px / 保留最深环 =
-            方案里留给眼睛定的三个旋钮。
+            三色分工（实测对比度见下）：<br />
+            · <b>品牌蓝 #1f75db</b>（= 产品 `border_brush`）—— 未遮罩内容上的 chrome（确认选区、把手）、
+            hover 幽灵、遮罩的品牌染（≤10%）；
+            <br />
+            · <b>环蓝 #4a9bff</b>（同色相浅一档）—— 画在遮罩之上的链环：外侧 3.07–3.85:1。
+            产品那个 #1f75db 在深色内容上满浓度也只有 2.02:1，压上遮罩就没法看；
+            <br />
+            · <b>捕获绿 #1bb15f</b> —— 只管"将被截下的那一层"：边框 3.16:1、浅底 7.5:1、
+            连在被蓝染过的底上也有 3.15:1。
+            <br />
+            <b>遮罩别用主题色去染</b>：30% 蓝染把环压到 1.2–1.8:1（连绿边框也掉到 3.15）；
+            中性黑负责压暗，主题色最多 10% 当品牌感。整窗兜底仍是中性灰——它表示"没钻到元素"，
+            所以不该用捕获绿。
           </p>
         </details>
 
@@ -930,8 +961,21 @@
         strip = q("strip"),
         sctx = strip.getContext("2d");
 
-      const ACCENT = "61,139,253",
+      // 品牌蓝 = 产品 `border_brush` 的 #1f75db：用于遮罩的品牌染、hover 幽灵，
+      // 以及产品侧未遮罩区域上的 chrome（确认选区边框、把手）。
+      const THEME = "31,117,219",
+        // 环蓝：**画在遮罩之上**的链环用它。同色相浅一档，因为 #1f75db 在深色内容上
+        // 满浓度也只有 2.02:1（遮罩再一压就没法看）；#4a9bff @60% 在浅底 3.13:1、深底 2.06:1。
+        // 这不是第二个品牌色，是同一条蓝色刻度上的两档（600 / 400）。
+        RING = "74,155,255",
+        // 捕获绿：**当前会被截下来的那一层**用它，与"上下文"（蓝）分开。
+        // 蓝色说"这是一条链上的层"，绿色说"这是你要的东西"。
+        // #1bb15f 满浓度：浅底 7.5:1、深代码区 3.27:1、连在被蓝染过的底上也有 3.15:1。
+        CAPTURE = "27,177,95",
+        // 整窗兜底仍是中性灰：它表示"没能钻到元素"，
+        // 所以它不该用捕获绿（那会在视觉上说"捕获到了一个元素"）。
         NEUTRAL = "200,208,219";
+      const ACCENT = THEME;
       const MAX_RINGS = 7;
       let stageScale = 1;
 
@@ -1104,8 +1148,11 @@
         scenario: "deep",
         selected: 0,
         cursor: { x: 940, y: 600 },
-        outerAlpha: 0.45,
-        innerAlpha: 0.45,
+        outerAlpha: 0.6,
+        innerAlpha: 0.6,
+        maskAlpha: 0.10,
+        maskBlack: 0.32,
+        ramp: true,
         collapse: 8,
         selFill: 0.18,
         selWidth: 2,
@@ -1238,6 +1285,18 @@
         g === Infinity ? "∞" : Math.round(g * 10) / 10 + " px";
 
       function selectRings(levels, selected, opts) {
+        // 一环的有效浓度（主题蓝 alpha）：外侧 / 内层各一个基准，再按"离选中层多远"递减。
+        // 递减给链一个方向感：外圈是背景，越靠近选中层的层越是"与你有关"的上下文。
+        // 下限是基准的 45%——窗口框是"我在哪"的参照，不能淡到看不见。
+        const ringAlpha = (i, role) => {
+          const base = role === "outer" ? state.outerAlpha : state.innerAlpha;
+          if (!state.ramp) return base;
+          const step = Math.max(0, Math.min(6, Math.abs(i - selected)) - 1);
+          // 下限 65%：主题蓝 #1f75db 比 demo 原来那个浅蓝暗，压得太低在深色内容上就看不见了
+          // （实测：基准 45% + 下限 45% 时，最深那圈与背景只差 Δ51，外侧环 Δ74；下限提到 65%、
+          //  基准 60% 之后同样两处是 Δ~70 / Δ~105）。
+          return base * Math.max(0.65, 1 - 0.12 * step);
+        };
         const n = levels.length,
           last = n - 1;
         if (opts.impl === "current") {
@@ -1333,7 +1392,10 @@
                     " 差 " +
                     fmtGap(gap) +
                     "，贴着也画）";
-            rows.push({ index: i, role, keep: true, anchor: true, gap, why });
+            rows.push({
+              index: i, role, keep: true, anchor: true, gap, why,
+              alpha: ringAlpha(i, role),
+            });
             continue;
           }
           if (gap >= opts.collapse) {
@@ -1345,6 +1407,7 @@
               anchor: false,
               gap,
               why: "差 " + fmtGap(gap) + " ≥ " + opts.collapse + " px → 画",
+              alpha: ringAlpha(i, role),
             });
           } else {
             rows.push({
@@ -1430,18 +1493,29 @@
         const rows = selectRings(levels, sel, optsNow());
         const target = levels[sel].rect;
         const whole = sel === 0;
-        const C = whole ? NEUTRAL : ACCENT;
+        const C = whole ? NEUTRAL : CAPTURE;   // 选中层用捕获绿（整窗兜底仍是中性灰）
+        const R = RING;                        // 链上的环一律环蓝（画在遮罩之上，要浅一档）
         const rect = state.shown || target;
         ctx.clearRect(0, 0, 1280, 720);
         if (state.dim) {
-          ctx.fillStyle = "rgba(0,0,0,.34)";
-          ctx.fillRect(0, 0, 1280, 720);
+          // 遮罩 = 主题色一层 + 中性黑一层：主题色负责"这是 overlay 的界面"，
+          // 黑负责把内容压暗（只靠主题色的半透明会把深色内容洗成蓝，浅色内容又压不下去）。
+          // 顺序也重要：先中性黑压暗，再叠主题色的品牌感。反过来先铺主题色再压黑，
+          // 等于给整屏加一层灰，冰蓝会变成脏蓝。
+          if (state.maskBlack > 0) {
+            ctx.fillStyle = "rgba(0,0,0," + state.maskBlack + ")";
+            ctx.fillRect(0, 0, 1280, 720);
+          }
+          if (state.maskAlpha > 0) {
+            ctx.fillStyle = "rgba(" + THEME + "," + state.maskAlpha + ")";
+            ctx.fillRect(0, 0, 1280, 720);
+          }
         }
 
         const cv = eff === "b" ? state.chainVis : 1; // ③b 的整链可见度
-        const line = (r, a, w) => {
+        const line = (r, a, w, c) => {
           if (a <= 0.004) return;
-          ctx.strokeStyle = "rgba(" + C + "," + a + ")";
+          ctx.strokeStyle = "rgba(" + (c || C) + "," + a + ")";
           ctx.lineWidth = w;
           const h = w % 2 ? 0.5 : 0;
           ctx.strokeRect(
@@ -1451,8 +1525,13 @@
             Math.round(r[3]) - 2 * h,
           );
         };
-        const ringA = (role) =>
-          role === "outer" ? state.outerAlpha : state.innerAlpha;
+        // 每一环各自的有效透明度：`selectRings` 已经算好（外侧 / 内层各一个基准 + 距离递减），
+        // 这里只是按索引取；不在当前集合里的（反面演示里正在淡出的）退回基准值。
+        const ringA = (i, role) => {
+          const row = rows.find((r) => r.index === i);
+          if (row && row.alpha !== undefined) return row.alpha;
+          return role === "outer" ? state.outerAlpha : state.innerAlpha;
+        };
 
         // 链上的环（静态几何，不参加 101 ms 过渡）分两趟画，分界就是选中层：
         //   外侧环（index < sel）画在选中层洗色**之下**——它们是"外面那圈上下文"；
@@ -1463,15 +1542,15 @@
           const fx = ringFx.get(i);
           const a = alpha * cv * (fx ? fx.a : 1);
           if (fx && fx.fill > 0.004) {
-            ctx.fillStyle = "rgba(" + C + "," + fx.fill + ")";
+            ctx.fillStyle = "rgba(" + CAPTURE + "," + fx.fill + ")";
             ctx.fillRect.apply(ctx, levels[i].rect);
           }
-          line(levels[i].rect, a, 1);
+          line(levels[i].rect, a, 1, R);
         };
         const seen = new Set();
         for (const row of rows) {
           if (!row.keep || row.index === sel || row.role !== "outer") continue;
-          drawRing(row.index, ringA("outer"));
+          drawRing(row.index, ringA(row.index, "outer"));
           seen.add(row.index);
         }
         // 反面演示：正在淡出的外侧环（已不在当前集合里，但 180 ms 还没走完）
@@ -1479,18 +1558,18 @@
           const i = entry[0],
             fx = entry[1];
           if (seen.has(i) || i === sel || i > sel || fx.a <= 0.004) continue;
-          drawRing(i, ringA("outer"));
+          drawRing(i, ringA(i, "outer"));
         }
         // 2) 图层栈悬停定位：画着的给亮框，被吃掉的给幽灵底色
         if (state.hoverIndex >= 0 && state.hoverIndex !== sel) {
           const hr = levels[state.hoverIndex].rect;
           const row = rows.find((r) => r.index === state.hoverIndex);
           if (row && row.keep) {
-            line(hr, 0.95, 1.5);
+            line(hr, 0.95, 1.5, R);
           } else {
-            ctx.fillStyle = "rgba(" + C + ",.06)";
+            ctx.fillStyle = "rgba(" + R + ",.06)";
             ctx.fillRect.apply(ctx, hr);
-            line(hr, 0.5, 1);
+            line(hr, 0.5, 1, R);
           }
         }
         // 3) 选中层：唯一参加 101 ms 过渡的几何
@@ -1502,14 +1581,14 @@
         //     走动之后，你走出来的那几层（含原答案）仍然是可见的回程点。
         for (const row of rows) {
           if (!row.keep || row.index === sel || row.role !== "inner") continue;
-          drawRing(row.index, ringA("inner"));
+          drawRing(row.index, ringA(row.index, "inner"));
           seen.add(row.index);
         }
         for (const entry of ringFx) {
           const i = entry[0],
             fx = entry[1];
           if (seen.has(i) || i === sel || i < sel || fx.a <= 0.004) continue;
-          drawRing(i, ringA("inner"));
+          drawRing(i, ringA(i, "inner"));
         }
         // 4) 光标
         ctx.strokeStyle = "rgba(255,255,255,.6)";
@@ -1560,7 +1639,7 @@
             hv.rect[0],
             hv.rect[1] - 26,
             hi + 1 + "/" + n + " · " + hv.id + " · " + role,
-            "rgba(61,139,253,.75)",
+            "rgba(31,117,219,.75)",
             "#cfe0ff",
           );
         }
@@ -1694,7 +1773,7 @@
         sctx.clearRect(0, 0, strip.width, strip.height);
         sctx.fillStyle = "#2a323d";
         sctx.fillRect(0, strip.height - 3, strip.width, 3);
-        sctx.fillStyle = "rgba(61,139,253,.85)";
+        sctx.fillStyle = "rgba(31,117,219,.85)";
         for (let k = 0; k < HIST; k++) {
           if (!hist[(histHead + k) % HIST]) continue;
           sctx.fillRect(k, strip.height - 3 - 11, 1, 11);
@@ -1917,9 +1996,9 @@
         q("#lgInner").textContent = Math.round(state.innerAlpha * 100) + "%";
         q("#lgSel").textContent = state.selWidth + "×";
         q("#swOuter").style.borderColor =
-          "rgba(61,139,253," + state.outerAlpha + ")";
+          "rgba(" + THEME + "," + state.outerAlpha + ")";
         q("#swInner").style.borderColor =
-          "rgba(61,139,253," + state.innerAlpha + ")";
+          "rgba(" + THEME + "," + state.innerAlpha + ")";
       }
       function paintSeg() {
         document
@@ -2071,9 +2150,12 @@
         bindRange("outerAlpha", "outerAlpha", (v) => v + "%", true);
         bindRange("innerAlpha", "innerAlpha", (v) => v + "%", true);
         bindRange("selFill", "selFill", (v) => v + "%", true);
+        bindRange("maskAlpha", "maskAlpha", (v) => v + "%", true);
+        bindRange("maskBlack", "maskBlack", (v) => v + "%", true);
         bindRange("collapse", "collapse", (v) => v + " px");
         bindRange("selWidth", "selWidth", (v) => v + " px");
         bindCheck("keepAnswer", "keepAnswer", () => renderStack());
+        bindCheck("ramp", "ramp", () => renderStack());
         bindCheck("dim", "dim");
         bindCheck("ease", "ease", (v) => {
           if (!v && state.anim) {
