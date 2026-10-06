@@ -727,7 +727,8 @@
           <option value="stress">12 层 · 压力（上限断言）</option>
         </select>
         <span class="chip" id="levelChip">—</span>
-        <button class="mini" id="resetSel">↓ 最深</button>
+       <button class="mini" id="resetSel">↓ 最深</button>
+        <button class="mini" id="walkUp">↑ 往上走 3 层（看内层环）</button>
       </div>
     </header>
 
@@ -824,10 +825,10 @@
                 type="range"
                 id="innerAlpha"
                 min="0"
-                max="60"
-                value="28"
+                max="90"
+                value="45"
               />
-              <output id="innerAlphaOut">28%</output></span
+              <output id="innerAlphaOut">45%</output></span
             ></label
           >
           <label class="row"
@@ -835,6 +836,19 @@
             ><span
               ><input type="range" id="collapse" min="0" max="24" value="8" />
               <output id="collapseOut">8 px</output></span
+            ></label
+          >
+          <label class="row"
+            ><span class="k">选中层洗色浓度</span
+            ><span
+              ><input
+                type="range"
+                id="selFill"
+                min="0"
+                max="30"
+                value="18"
+              />
+              <output id="selFillOut">18%</output></span
             ></label
           >
           <label class="row"
@@ -874,7 +888,7 @@
           </div>
           <div class="lg">
             <span class="sw" id="swInner"></span>内层（③ 新增）· 1 px ·
-            <b id="lgInner">28%</b>
+            <b id="lgInner">45%</b>
           </div>
           <div class="lg">
             <span class="sw swWin"></span>整窗：中性色 · 1× · 标签「窗口」
@@ -882,6 +896,14 @@
           <p class="fine">
             链上的环不标 k/N
             小牌——画面上只有一个标签（选中层的）。层号看左栏图层栈。
+          </p>
+          <p class="fine">
+            <b>画序：外侧环在选中层洗色<u>之下</u>，内层环在洗色<u>之上</u>。</b>
+            内层环本来就在选中层内部，画在下面会被那层洗色盖掉（accent 叠 accent），
+            看上去就像"没画内层"——v2 第一版就是这个症状。
+            实测同一个环在 28% 时与背景差 Δ124，45% 时 Δ176，外侧环 Δ322；
+            所以内层默认与外侧同浓度（45%），靠<b>位置</b>而不是靠浓度区分内外，
+            浓度留给参数栏按眼睛调。
           </p>
         </details>
       </aside>
@@ -1083,8 +1105,9 @@
         selected: 0,
         cursor: { x: 940, y: 600 },
         outerAlpha: 0.45,
-        innerAlpha: 0.28,
+        innerAlpha: 0.45,
         collapse: 8,
+        selFill: 0.18,
         selWidth: 2,
         keepAnswer: true,
         dim: true,
@@ -1255,6 +1278,8 @@
 
         const rows = [],
           kept = [];
+        // 与选中层的四边最小间距：用来判断"这一环是不是其实就是选中层那条边"。
+        const gapToSelected = (i) => edgeGap(levels[i].rect, levels[selected].rect);
         for (let i = 0; i < n; i++) {
           const role =
             i === selected ? "selected" : i < selected ? "outer" : "inner";
@@ -1276,6 +1301,23 @@
             continue;
           }
           if (anchors.has(i)) {
+            // 锚点优先，但**与选中层重合的锚点不画**：真机上这种 1 px 内缩的包装层很常见
+            // （`cm-scroller` 贴着 `code-block-viewer`），画出来只会把选中层 2× 边框加粗成 3 px，
+            // 看起来像描边毛了，而不像"里面还有一层"。
+            const toSelected = gapToSelected(i);
+            if (toSelected < 2) {
+              rows.push({
+                index: i,
+                role,
+                keep: false,
+                anchor: true,
+                merged: true,
+                gap,
+                why:
+                  "与选中层只差 " + fmtGap(toSelected) + " —— 画出来就是把选中边框加粗，合并掉",
+              });
+              continue;
+            }
             kept.push(i);
             let why;
             if (i === 0) why = "窗口：最外参照";
@@ -1412,33 +1454,32 @@
         const ringA = (role) =>
           role === "outer" ? state.outerAlpha : state.innerAlpha;
 
-        // 1) 链上的环（静态几何，不参加 101 ms 过渡）
-        const seen = new Set();
-        for (const row of rows) {
-          if (!row.keep || row.index === sel) continue;
-          const fx = ringFx.get(row.index);
-          const a = ringA(row.role) * cv * (fx ? fx.a : 1);
+        // 链上的环（静态几何，不参加 101 ms 过渡）分两趟画，分界就是选中层：
+        //   外侧环（index < sel）画在选中层洗色**之下**——它们是"外面那圈上下文"；
+        //   内层环（index > sel）画在洗色**之上**——它们本来就在选中层内部，
+        //   画在下面会被那层 18% 洗色盖掉（accent 叠 accent），看上去像"没画内层"。
+        //   这是 v2 第一版的实际 bug：内层环一直都在画，只是看不见。
+        const drawRing = (i, alpha) => {
+          const fx = ringFx.get(i);
+          const a = alpha * cv * (fx ? fx.a : 1);
           if (fx && fx.fill > 0.004) {
-            ctx.fillStyle = "rgba(" + C + "," + fx.fill + ")";
-            ctx.fillRect.apply(ctx, levels[row.index].rect);
-          }
-          line(levels[row.index].rect, a, 1);
-          seen.add(row.index);
-        }
-        // 反面演示：正在淡出的环（已不在当前集合里，但 180 ms 还没走完）
-        for (const entry of ringFx) {
-          const i = entry[0],
-            fx = entry[1];
-          if (seen.has(i) || i === sel || fx.a <= 0.004) continue;
-          if (fx.fill > 0.004) {
             ctx.fillStyle = "rgba(" + C + "," + fx.fill + ")";
             ctx.fillRect.apply(ctx, levels[i].rect);
           }
-          line(
-            levels[i].rect,
-            ringA(i < sel ? "outer" : "inner") * cv * fx.a,
-            1,
-          );
+          line(levels[i].rect, a, 1);
+        };
+        const seen = new Set();
+        for (const row of rows) {
+          if (!row.keep || row.index === sel || row.role !== "outer") continue;
+          drawRing(row.index, ringA("outer"));
+          seen.add(row.index);
+        }
+        // 反面演示：正在淡出的外侧环（已不在当前集合里，但 180 ms 还没走完）
+        for (const entry of ringFx) {
+          const i = entry[0],
+            fx = entry[1];
+          if (seen.has(i) || i === sel || i > sel || fx.a <= 0.004) continue;
+          drawRing(i, ringA("outer"));
         }
         // 2) 图层栈悬停定位：画着的给亮框，被吃掉的给幽灵底色
         if (state.hoverIndex >= 0 && state.hoverIndex !== sel) {
@@ -1453,9 +1494,23 @@
           }
         }
         // 3) 选中层：唯一参加 101 ms 过渡的几何
-        ctx.fillStyle = "rgba(" + C + "," + (whole ? 0.1 : 0.18) + ")";
+        // 洗色浓度是内层环能不能读出来的直接因素：内层环压在洗色之上，洗色越浓、环越糊。
+        ctx.fillStyle = "rgba(" + C + "," + (whole ? state.selFill * 0.55 : state.selFill) + ")";
         ctx.fillRect(rect[0], rect[1], rect[2], rect[3]);
         line(rect, 1, whole ? 1 : state.selWidth);
+        // 3b) 内层环：必须画在洗色之上（见上面那条注释）。这也是 ③ 相对当前实现的全部增量：
+        //     走动之后，你走出来的那几层（含原答案）仍然是可见的回程点。
+        for (const row of rows) {
+          if (!row.keep || row.index === sel || row.role !== "inner") continue;
+          drawRing(row.index, ringA("inner"));
+          seen.add(row.index);
+        }
+        for (const entry of ringFx) {
+          const i = entry[0],
+            fx = entry[1];
+          if (seen.has(i) || i === sel || i < sel || fx.a <= 0.004) continue;
+          drawRing(i, ringA("inner"));
+        }
         // 4) 光标
         ctx.strokeStyle = "rgba(255,255,255,.6)";
         ctx.lineWidth = 1;
@@ -1755,12 +1810,24 @@
         const rows = selectRings(levels, state.selected, optsNow());
         const drawn = rows.filter((r) => r.keep).length;
         const dropped = rows.filter((r) => r.dropped).length;
-        const collapsed = rows.filter((r) => !r.keep && !r.dropped).length;
-        let stats = n + " 层 → 画 <b>" + drawn + "</b>（含选中层）";
+        const merged = rows.filter((r) => r.merged).length;
+        const collapsed = rows.filter((r) => !r.keep && !r.dropped && !r.merged).length;
+        const outerDrawn = rows.filter((r) => r.keep && r.role === "outer").length;
+        const innerDrawn = rows.filter((r) => r.keep && r.role === "inner").length;
+        let stats =
+          n +
+          " 层 → 画 <b>" +
+          drawn +
+          "</b>（含选中层：外 " +
+          outerDrawn +
+          " · <b>内 " +
+          innerDrawn +
+          "</b>）";
         if (drawn > MAX_RINGS && eff === "current")
           stats += "（当前实现不封顶）";
         stats += " · 塌缩 " + collapsed;
         if (dropped) stats += ' · 丢弃 <b class="warn">' + dropped + "</b>";
+        if (merged) stats += ' · 与选中层合并 <b class="warn">' + merged + "</b>";
         stats += " · 上限 " + MAX_RINGS;
         q("#stackStats").innerHTML = stats;
         q("#levelChip").textContent =
@@ -1786,13 +1853,17 @@
                 ? "rsel"
                 : r.keep
                   ? "keep"
-                  : r.dropped
+                  : r.merged
+                    ? "drop"
+                    : r.dropped
                     ? "drop"
                     : "skip";
             const tag =
               i === state.selected
                 ? "你在这"
-                : r.dropped
+                : r.merged
+                  ? "合并"
+                  : r.dropped
                   ? "丢弃"
                   : r.keep
                     ? "画"
@@ -1802,7 +1873,9 @@
             const tc =
               i === state.selected
                 ? "t-sel"
-                : r.dropped
+                : r.merged
+                  ? "t-drop"
+                  : r.dropped
                   ? "t-drop"
                   : r.keep
                     ? "t-keep"
@@ -1952,16 +2025,18 @@
           renderStack();
           requestDraw();
         });
-        q("#resetSel").addEventListener("click", () => setSelected(deepest()));
+       q("#resetSel").addEventListener("click", () => setSelected(deepest()));
+       // 演示用：一次往上走三层，让"内层环"立刻出现在画面上（产品里这件事只有滚轮做）。
+       q("#walkUp").addEventListener("click", () => setSelected(state.selected - 3));
         q("#mReset").addEventListener("click", resetMetrics);
       }
-      function bindRange(id, key, fmt) {
+      // `percent` 明确传，而不是靠键名以 "Alpha" 结尾来猜——`selFill` 就是被这个猜测坑过一次：
+      // 它拿到 18 而不是 0.18，rgba(...,18) 被钳成不透明，选中层变成实心块，内层环直接消失。
+      function bindRange(id, key, fmt, percent) {
         const input = q(id),
           out = q(id + "Out");
         const sync = () => {
-          state[key] = key.endsWith("Alpha")
-            ? Number(input.value) / 100
-            : Number(input.value);
+          state[key] = percent ? Number(input.value) / 100 : Number(input.value);
           out.textContent = fmt(Number(input.value));
           renderStack();
           updateLegend();
@@ -1993,8 +2068,9 @@
         updateLegend();
         paintSeg();
 
-        bindRange("outerAlpha", "outerAlpha", (v) => v + "%");
-        bindRange("innerAlpha", "innerAlpha", (v) => v + "%");
+        bindRange("outerAlpha", "outerAlpha", (v) => v + "%", true);
+        bindRange("innerAlpha", "innerAlpha", (v) => v + "%", true);
+        bindRange("selFill", "selFill", (v) => v + "%", true);
         bindRange("collapse", "collapse", (v) => v + " px");
         bindRange("selWidth", "selWidth", (v) => v + " px");
         bindCheck("keepAnswer", "keepAnswer", () => renderStack());
