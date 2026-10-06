@@ -723,7 +723,8 @@
         <select id="scenario">
           <option value="deep">9 层 · 真机形态（1px 密排）</option>
           <option value="wide">4 层 · 间距全 ≥ 8px</option>
-          <option value="flat">2 层 · 窗口 + 答案</option>
+          <option value="flat">2 层 · 满屏窗口（标签走框内右上）</option>
+          <option value="flat_inset">2 层 · 窗口 + 答案</option>
           <option value="stress">12 层 · 压力（上限断言）</option>
         </select>
         <span class="chip" id="levelChip">—</span>
@@ -808,6 +809,10 @@
           </div>
           <div class="kv">
             <span class="k">循环状态</span><b id="mState">—</b>
+          </div>
+          <div class="kv">
+            <span class="k">预览标签位置（三级阶梯）</span
+            ><b id="labelWhere">框外上方</b>
           </div>
           <canvas id="strip" width="220" height="22"></canvas>
           <div class="fine">
@@ -1111,6 +1116,28 @@
           ],
         },
         flat: {
+          /* 2 层：满屏窗口 + 唯一答案 —— 真实里就是"最大化的窗口"：
+             框贴顶又占满高度，标签框外上/下都没地方，只能走阶梯第②级（框内右上）。*/
+          levels: [
+            { k: "window", id: "窗口 · 最大化", rect: [0, 0, 1280, 720] },
+            {
+              k: "answer",
+              id: "text span · 唯一元素",
+              rect: [460, 300, 360, 28],
+              cls: "ans-pill",
+              text: "我是这个页面上唯一的吸附目标",
+            },
+          ],
+          decor: [
+            {
+              cls: "dec-card",
+              rect: [420, 200, 440, 260],
+              under: true,
+              html: "<h3>满屏窗口</h3><p>框贴顶、占满高度：标签在框外上/下都没有位置。走第②级之后它落在框内右上角——旧实现在这里会把标签整块丢掉，连「窗口」两个字都看不到。</p>",
+            },
+          ],
+        },
+        flat_inset: {
           /* 2 层：窗口 + 唯一答案 */
           levels: [
             { k: "window", id: "窗口 · Chromium", rect: [40, 24, 1200, 660] },
@@ -1476,6 +1503,30 @@
       }
 
       /* ---------------------------------------------------------------- 文案 */
+      // 预览标签的摆放，三级阶梯（返回坐标 + 用的是哪一级，后者打在侧栏上）：
+      //   ① 框外：上边优先、其次下边 —— 首选，绝不盖住框里的内容；
+      //   ② **框内右上角**：框外上下都没地方时才用（"最大化的窗口"就是这个情形，
+      //      旧实现在这里会整块丢掉标签，连"窗口"两个字都看不到）。要求框本身装得下标签；
+      //   ③ 光标旁：沿用一次性提示那套（右下 → 贴边翻到另一侧）。框小到装不下标签时，
+      //      它是唯一还能读到数字的地方——细长条（真机实测过 `5x648`）就属于这一类。
+      // 注意：标签永远画在 overlay 上，不会进产物（`render_export` 会清掉），所以"盖住框内"只是暂时遮挡。
+      function placeLabel(rect, tw, th, g) {
+        const clampX = (x) => Math.max(2, Math.min(x, 1280 - tw - 2));
+        if (rect[1] - g - th >= 0)
+          return { x: clampX(rect[0]), y: rect[1] - g - th, where: "框外上方" };
+        if (rect[1] + rect[3] + g + th <= 720)
+          return { x: clampX(rect[0]), y: rect[1] + rect[3] + g, where: "框外下方" };
+        if (tw <= rect[2] - 2 * g && th <= rect[3] - 2 * g)
+          return { x: clampX(rect[0] + rect[2] - g - tw), y: rect[1] + g, where: "框内右上" };
+        const right = state.cursor.x + 14,
+          down = state.cursor.y + 14;
+        return {
+          x: right + tw <= 1280 ? right : Math.max(2, state.cursor.x - 14 - tw),
+          y: down + th <= 720 ? down : Math.max(2, state.cursor.y - 14 - th),
+          where: "光标旁",
+        };
+      }
+
       function labelFor(i) {
         const n = chainOf().length,
           lv = chainOf()[i];
@@ -1624,19 +1675,16 @@
         ctx.moveTo(state.cursor.x + 0.5, state.cursor.y - 9);
         ctx.lineTo(state.cursor.x + 0.5, state.cursor.y + 9);
         ctx.stroke();
-        // 5) 预览标签：锚在缓动矩形、文字用目标尺寸（上面放不下翻下面）
+        // 5) 预览标签：锚在缓动矩形、文字用目标尺寸；摆放走三级阶梯（见 placeLabel）
         const text = labelFor(sel);
         ctx.font = '12px "Segoe UI","Microsoft YaHei UI",sans-serif';
         const tw = Math.ceil(ctx.measureText(text).width) + 20,
           th = 22,
           g = 6;
-        const above = rect[1] - g - th,
-          below = rect[1] + rect[3] + g;
-        let pl = null;
-        if (above >= 0) pl = [Math.max(0, Math.min(rect[0], 1280 - tw)), above];
-        else if (below + th <= 720)
-          pl = [Math.max(0, Math.min(rect[0], 1280 - tw)), below];
-        if (pl) {
+        const placed = placeLabel(rect, tw, th, g);
+        q("#labelWhere").textContent = placed.where;
+        if (placed) {
+          const pl = [placed.x, placed.y];
           ctx.fillStyle = "rgba(18,24,32,.93)";
           ctx.strokeStyle = "rgba(255,255,255,.14)";
           ctx.lineWidth = 1;
