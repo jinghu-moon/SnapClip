@@ -393,9 +393,24 @@ dwell，但预览等待上限是 320 ms，所以不会闪整窗）。成本项�
    "置位 → 还原"。
 
 即使两层都失效，规则本身也挡住了：overlay 的框永远比走查答案**更大**，不可能通过"严格更小"的门槛，
-最坏结果只是这一次查询少了精度补足（不会发布错误的框）。另外 §6 第 9 行实测"自建全屏 topmost 弹窗
-三种样式状态下都返回桌面元素"，所以这一层是保险而非必需；那次测量来自已回退分支 `53c5acd` 上的
-`overlay_hit_through_probe`，**`main` 上没有这个探针**，不要去找。
+最坏结果只是这一次查询少了精度补足（不会发布错误的框）。
+
+**overlay 到底挡不挡命中测试（已在本分支复现）**：§6 第 9 行那条测量原本来自已回退分支
+`53c5acd` 的 `overlay_hit_through_probe`（`main` 上曾一度没有这个探针）。现在它作为
+`browser_element_probe` 的 `[overlay]` 阶段存在：在**另一个线程**上造一个带 overlay 同样标志
+（`WS_EX_TOPMOST|TOOLWINDOW|NOREDIRECTIONBITMAP`、全屏、`WS_POPUP`）的替身窗口盖在活的夹具页面上，
+四种状态下问 `ElementFromPoint`：
+
+```text
+[overlay] no overlay: Button(72,131)-(240,187) type=50000 class="fixture cap"
+[overlay] overlay topmost: Button(72,131)-(240,187) type=50000 class="fixture cap"
+[overlay] overlay +WS_EX_TRANSPARENT: Button(72,131)-(240,187) type=50000 class="fixture cap"
+[overlay] overlay +WS_EX_LAYERED|TRANSPARENT: Button(72,131)-(240,187) type=50000 class="fixture cap"
+```
+
+结论：**我们的置顶全屏窗口根本不被命中测试看见**（四种状态答案逐字相同，`type=50000` 是页面的
+`Button`，"最内层"就是页面元素）。所以 hit-through 只是保险，不是精度补足的必要条件——实机里
+"补足没生效"一定是别的原因（见 §5.8）。
 
 **门禁（补足后，本机连续一次）**：
 
@@ -405,6 +420,49 @@ dwell，但预览等待上限是 320 ms，所以不会闪整窗）。成本项�
 | `cargo test --lib` | **361 passed / 0 failed / 2 ignored** |
 | `browser_element_probe` | 断言 **23/23**，`provider_hit_available=43`、`provider_hit_is_finer_on=3`（补足前 4） |
 | `explorer_rule_probe` | `control_level_points=12/25`、`median_area_pct=65.8`、`provider_hit_is_finer_on=0`——**与补足前逐位一致** |
+
+### 5.8 实机未解现象与下一轮取证（2026-10-06，用户报告）
+
+**报告**：某个 SPA 页面上，`div.group/side-pane-shell-host … flex-1 has-[[data-side-pane-shell-transition]]:overflow-x-clip`
+这个盒子**内部的元素识别不到**。
+
+**当时手里的全部证据**（用户日志，verbose 关闭）：
+
+```text
+refinement_submitted=47 refinement_published=44 refinement_empty=0 refinement_downgrades_staged=3
+last deep target hwnd=34734272 kind=UiElement bounds=(63,159)->(3834,2082) depth=4 reason=Complete
+```
+
+也就是：走查**走了 4 层、以整窗边界结束**（`reason=Complete`），`(63,159)->(3834,2082)` 是窗口框而不是
+页面 web area。这正是 §5.4 记录的"同边界结构包装 Pane 排在内容分支之后"形态；而在这种形态下，
+**本该由精度补足救回来**。
+
+**为什么这份日志读不出原因（已修）**：补足的判定过去只在 `SNAPCLIP_WIN_DETECT_VERBOSE` 下打印，
+于是"跑了但什么都没做"和"根本没跑"在日志里一模一样，用户看到的现象没有任何一行能对上。
+`91e6b08` 起改为**每次会话强制**输出（与 `last deep target` 同级）：
+
+```text
+[snapclip][win-detect] last precision adopted|not-finer|unavailable provider=WxH at (x,y) type=N class="…" walk=WxH at (x,y)
+… refinement_precision_adopted=N refinement_precision_not_finer=N refinement_precision_unavailable=N
+```
+
+`class` 是 Chromium 给出的 **DOM class**（夹具实测 `class="fixture cap"`），所以这一行会直接点名
+provider 认为"最内层"的那个盒子是哪一个。
+
+**两个候选解释（下一次实机运行即可区分，二者修法完全不同）**：
+
+1. **`not-finer`，且 provider 的盒子 ≈ 整窗/整页**：那个点在 Chromium 的无障碍树里**确实没有更细的
+   可捕获节点**。Tailwind 这类 SPA 大量 `<div>` 既无 role 也无文本，会被无障碍树剪掉（夹具里
+   `checkbox`/`radio`/`para`/`table-cell-1`/`code-box` 五个点就是这种情形：走查和 `ElementFromPoint`
+   都答整页 `1784x1125`，所以它们在夹具里是 `optional`，从不参与断言）。若实机是这一类，则 UIA 路线
+   到此为止——要按 DOM 盒子捕获就必须换数据源（用户自己 `docs/20` 里设计的那条路）。
+2. **`unavailable …`（原因会被原样打印）**：命中框不属于该窗口、或它不覆盖光标、或
+   `ElementFromPoint` 本身失败。这一类的第一嫌疑仍是"本机某个置顶窗口答了那次命中测试"，
+   尽管 §5.7 的替身实验说明我们的 overlay 不会。
+
+补充：同一次运行若带上 `SNAPCLIP_WIN_DETECT_VERBOSE=1`，`refinement level #N node=… parent=… raw=…
+empty=… offscreen=… containing=…` 会逐层说明走查是在哪一层、因为什么（子节点数为 0 / 没有子节点含光标）
+停下来的。
 
 ---
 
@@ -420,7 +478,7 @@ dwell，但预览等待上限是 320 ms，所以不会闪整窗）。成本项�
 | 6 | 链接/group 被选成"文字那一条" | Chromium 把 `<a>`/`role=group` 的**文字作为 `Text` 子节点**暴露（实测 `Hyperlink(168×56)` + `Text(56×20)`）。产品规则待定（§8 第 3 条） |
 | 7 | 同一坐标连续两次查询结果不同（一次整页、一次元素） | 跨查询的 per-epoch 层级缓存是**陈旧快照**：空批次不能缓存；批次解释不了当前点时应重读；或每次查询重读（实测 2–7 ms/查询 vs 1500 ms 预算） |
 | 8 | `EnumChildWindows` 拿不到 DOM 盒子 | 浏览器只暴露一个巨大的 render-host 子窗口；**不要**把它当元素 |
-| 9 | 自建全屏 topmost 弹窗从不被 `ElementFromPoint` 返回 | 三种样式状态下都返回桌面元素（`hwnd=0x0`）。即"无子窗口的 DComp 弹窗"可能本来就不参与 UIA 命中——穿透只是保险，§5.7 仍保留了两层 |
+| 9 | 自建全屏 topmost 弹窗从不被 `ElementFromPoint` 返回 | 四种状态下答案逐字相同、都是页面元素（`browser_element_probe` 的 `[overlay]` 阶段，见 §5.7）。即"无子窗口的 DComp 弹窗"本来就不参与 UIA 命中——穿透只是保险 |
 | 10 | Chrome 标题带 `" - Google Chrome"` | 从窗口标题读 JSON 时要按标记定位并截到匹配的 `}`，不能假设整串是 payload |
 | 11 | 复用 profile 导致忽略 `--window-size` 并弹"恢复页面" | 每次用**全新/删除后的** temp profile；否则窗口小于页面，点位全落空 |
 | 12 | 探针自身命令 | 构建输出被占用会 `LNK1104`（上一次测试进程没退）；跑探针前确保没有残留进程 |
