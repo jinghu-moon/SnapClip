@@ -1548,10 +1548,17 @@ mod tests {
         // smaller than itself — which showed up as every probe point missing.
         let profile = dir.join("profile");
         let _ = std::fs::remove_dir_all(&profile);
-        let url = format!(
-            "file:///{}?truth=1",
-            fixture_path.display().to_string().replace('\\', "/")
-        );
+        // The cross-origin frame's URL comes from a loopback server this test runs (docs/21 §5.20).
+        let url = match serve_cross_origin_fixture() {
+            Some(port) => format!(
+                "file:///{}?truth=1&cross=127.0.0.1:{port}",
+                fixture_path.display().to_string().replace('\\', "/")
+            ),
+            None => format!(
+                "file:///{}?truth=1",
+                fixture_path.display().to_string().replace('\\', "/")
+            ),
+        };
         let spilled = std::process::Command::new(&browser)
             .args([
                 "--new-window",
@@ -3208,5 +3215,39 @@ mod tests {
             0 => "Unknown",
             _ => "Other",
         }
+    }
+
+    /// The page the cross-origin fixture frame loads (docs/21 §5.20).
+    ///
+    /// One button at a fixed place with `margin: 0`, so the parent — which cannot read a cross-origin
+    /// frame — can still predict the button's box from the frame's own box.
+    const CROSS_ORIGIN_FIXTURE: &str = "<!doctype html><body style=\"margin:0\">\
+<button id=\"cross-button\" style=\"position:absolute;left:40px;top:40px;width:160px;\
+height:48px\">Cross Button</button></body>";
+
+    /// Serve [`CROSS_ORIGIN_FIXTURE`] on a loopback port and keep serving until the process ends.
+    ///
+    /// The fixture page is loaded over `file://`, so `http://127.0.0.1:<port>` is a real second
+    /// origin: the parent cannot reach into the frame through `contentDocument`, which is what makes
+    /// this the cross-origin case rather than the same-origin one `iframe-box` covers.
+    fn serve_cross_origin_fixture() -> Option<u16> {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).ok()?;
+        let port = listener.local_addr().ok()?.port();
+        std::thread::spawn(move || {
+            use std::io::Write;
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let body = CROSS_ORIGIN_FIXTURE.as_bytes();
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(body);
+                let _ = stream.flush();
+            }
+        });
+        Some(port)
     }
 }

@@ -173,7 +173,12 @@
    "probe":[250,70],"expect":"self"},
 
   {"id":"code-block","rect":[720,920,320,96],"kind":"code-block","role":"","name":"Code Block",
-   "probe":[40,30],"expect":"inside_self","finer_than_self":true}
+   "probe":[40,30],"expect":"inside_self","finer_than_self":true},
+
+  {"id":"cross-frame","rect":[1060,920,360,96],"kind":"cross-frame","role":"","name":"Cross Frame",
+   "probe":[120,64],"expect":"self"},
+  {"id":"cross-button","rect":[0,0,0,0],"kind":"generated","role":"Button","name":"Cross Button",
+   "expect":"cross-frame"}
 ]
 </script>
 
@@ -315,6 +320,9 @@ const builders = {
   // and assigning `.srcdoc` to a `div` is just an expando property — which left the frame blank and
   // made "we cannot reach inside an iframe" look true for the wrong reason.
   iframe: (el) => { el.className = 'fixture frame'; return 'iframe'; },
+  // A frame from `http://127.0.0.1:<port>` while this page is `file://`: a *real* second origin, so
+  // the parent cannot read into it (docs/21 §5.20). The URL comes from the probe's query string.
+  'cross-frame': (el) => { el.className = 'fixture frame'; return 'iframe'; },
   canvas: (el, entry) => { el.className = 'fixture frame';
                            el.setAttribute('aria-label', entry.name);
                            el.width = 176; el.height = 200;
@@ -369,6 +377,16 @@ const after = {
     // A `srcdoc` frame fires `load` for its initial blank document too, so the truth is published
     // again on the frame's own load *and* after short delays: the probe reads the title later, and
     // the row that points inside the frame is what asserts "we reach the host element".
+    node.addEventListener('load', () => publishTruth());
+    setTimeout(() => publishTruth(), 300);
+    setTimeout(() => publishTruth(), 1200);
+  },
+  // The cross-origin frame is pointed at the probe's little HTTP server; the parent can never read
+  // into it, so its button's box is *predicted* from the frame's own box plus the layout the server
+  // fixes (see `CROSS_ORIGIN_FIXTURE` in the probe).
+  'cross-frame': (node) => {
+    const target = new URLSearchParams(location.search).get('cross');
+    if (target) node.src = 'http://' + target + '/cross.html';
     node.addEventListener('load', () => publishTruth());
     setTimeout(() => publishTruth(), 300);
     setTimeout(() => publishTruth(), 1200);
@@ -454,6 +472,13 @@ function publishTruth() {
     const box = inner.getBoundingClientRect();
     truth['iframe-button'] = [Math.round(outer.left + box.left), Math.round(outer.top + box.top),
                               Math.round(box.width), Math.round(box.height)];
+  }
+  // Cross-origin: the parent cannot read the frame at all, so the button's box is predicted from the
+  // frame's box plus the `.frame` border (1 px) and the inner page's fixed layout (40,40,160,48).
+  const cross = document.getElementById('cross-frame');
+  if (cross && cross.src) {
+    const box = cross.getBoundingClientRect();
+    truth['cross-button'] = [Math.round(box.left + 1 + 40), Math.round(box.top + 1 + 40), 160, 48];
   }
   if (location.search.includes('truth')) {
     // The probe reads this back with GetWindowTextW: the only channel out of the page.
