@@ -729,6 +729,7 @@
         <span class="chip" id="levelChip">—</span>
        <button class="mini" id="resetSel">↓ 最深</button>
         <button class="mini" id="walkUp">↑ 往上走 3 层（看内层环）</button>
+        <button class="mini" id="rollBurst">⟳ 连续滚 6 格（看绿跟不跟得住）</button>
       </div>
     </header>
 
@@ -1893,15 +1894,19 @@
         const collapsed = rows.filter((r) => !r.keep && !r.dropped && !r.merged).length;
         const outerDrawn = rows.filter((r) => r.keep && r.role === "outer").length;
         const innerDrawn = rows.filter((r) => r.keep && r.role === "inner").length;
+        // 把"绿恒一个、蓝可以有多个"这条不变量打在脸上：滚轮连滚时最该确认的就是它。
+        const capture = eff === "current" || state.selected !== 0 ? 1 : 0;
         let stats =
           n +
-          " 层 → 画 <b>" +
-          drawn +
-          "</b>（含选中层：外 " +
+          " 层 → <b style='color:#1bb15f'>捕获 " +
+          capture +
+          "</b> + 环 " +
+          (drawn - 1) +
+          "（外 " +
           outerDrawn +
-          " · <b>内 " +
+          " · 内 " +
           innerDrawn +
-          "</b>）";
+          "）";
         if (drawn > MAX_RINGS && eff === "current")
           stats += "（当前实现不封顶）";
         stats += " · 塌缩 " + collapsed;
@@ -2107,6 +2112,15 @@
        q("#resetSel").addEventListener("click", () => setSelected(deepest()));
        // 演示用：一次往上走三层，让"内层环"立刻出现在画面上（产品里这件事只有滚轮做）。
        q("#walkUp").addEventListener("click", () => setSelected(state.selected - 3));
+       // 模拟"滚轮连滚"：每 140 ms 一格，用来检查"很多候选盒子同时在场"时
+       // 绿色那个（= 当前会被截的）还跟不跟得住、会不会变成两个。
+       q("#rollBurst").addEventListener("click", () => {
+         let step = 0;
+         const timer = setInterval(() => {
+           setSelected(state.selected - 1);
+           if (++step >= 6) clearInterval(timer);
+         }, 140);
+       });
         q("#mReset").addEventListener("click", resetMetrics);
       }
       // `percent` 明确传，而不是靠键名以 "Alpha" 结尾来猜——`selFill` 就是被这个猜测坑过一次：
