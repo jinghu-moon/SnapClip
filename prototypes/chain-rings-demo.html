@@ -1,0 +1,663 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>SnapClip 智能吸附 · 整条链轮廓（③）设计预览</title>
+<style>
+  :root {
+    --bg: #10141a;
+    --panel: #171d26;
+    --line: #2a323d;
+    --text: #d8dee7;
+    --dim: #8b95a3;
+    --accent: #3d8bfd;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 18px 22px 40px;
+    background: var(--bg); color: var(--text);
+    font: 13px/1.55 "Segoe UI", "Microsoft YaHei UI", sans-serif;
+  }
+  h1 { font-size: 15px; margin: 0 0 4px; font-weight: 600; }
+  .note { color: var(--dim); margin: 0 0 14px; max-width: 1180px; }
+  .note code { background: #1d242e; padding: 1px 4px; border-radius: 3px; }
+  .wrap { display: flex; gap: 18px; align-items: flex-start; flex-wrap: wrap; }
+  /* stage 按"显示器坐标"是固定 1280x720；窗口不够大时整体等比缩放，
+     缩放系数同时用于把鼠标位置换算回显示器坐标。 */
+  #holder { position: relative; flex: 0 0 auto; }
+  #stage {
+    position: relative; width: 1280px; height: 720px;
+    background: #0b0e13; border: 1px solid var(--line);
+    overflow: hidden; cursor: none;
+    transform-origin: top left;
+  }
+  #page { position: absolute; inset: 0; }
+  #overlay { position: absolute; inset: 0; }
+  aside {
+    width: 330px; flex: 1 1 300px; min-width: 300px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+    padding: 12px 14px 16px;
+  }
+  aside h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em;
+             color: var(--dim); margin: 14px 0 8px; font-weight: 600; }
+  aside h2:first-child { margin-top: 0; }
+  label.row { display: flex; align-items: center; justify-content: space-between;
+              gap: 10px; margin: 7px 0; }
+  label.row span.k { color: var(--dim); }
+  label.row output { color: var(--text); font-variant-numeric: tabular-nums; }
+  input[type=range] { width: 150px; }
+  select, input[type=number] { background: #0f141b; color: var(--text);
+    border: 1px solid var(--line); border-radius: 4px; padding: 3px 6px; }
+  .seg { display: flex; gap: 6px; margin: 4px 0 2px; }
+  .seg button {
+    flex: 1; background: #0f141b; color: var(--text); border: 1px solid var(--line);
+    border-radius: 5px; padding: 6px 8px; cursor: pointer; font: inherit;
+  }
+  .seg button.on { border-color: var(--accent); color: #fff;
+    background: rgba(61,139,253,.16); }
+  table.rings { width: 100%; border-collapse: collapse; font-size: 12px; }
+  table.rings th, table.rings td { text-align: left; padding: 3px 4px;
+    border-bottom: 1px solid #1f2731; vertical-align: top; }
+  table.rings th { color: var(--dim); font-weight: 500; }
+  table.rings td.i { width: 34px; color: var(--dim); font-variant-numeric: tabular-nums; }
+  table.rings tr.sel td { background: rgba(61,139,253,.12); color: #fff; }
+  table.rings tr.skip td.id { color: #6d7783; }
+  .yes { color: #63d29b; }
+  .no { color: #7d8794; }
+  .why { color: var(--dim); font-size: 11px; }
+  .kv { display: flex; justify-content: space-between; gap: 10px; margin: 4px 0; }
+  .kv b { font-weight: 600; }
+  .labelchip {
+    display: inline-block; background: #1b2330; border: 1px solid var(--line);
+    border-radius: 3px; padding: 2px 6px; font-variant-numeric: tabular-nums;
+  }
+  .legend { margin-top: 10px; font-size: 12px; color: var(--dim); }
+  .legend div { display: flex; align-items: center; gap: 8px; margin: 3px 0; }
+  .swatch { width: 26px; height: 12px; border: 1px solid; display: inline-block; }
+  .hint { color: #ffd479; }
+</style>
+</head>
+<body>
+
+<h1>智能吸附 · 整条链轮廓（③）设计预览</h1>
+<p class="note">
+  这是<b>设计预览</b>，不是产品实现：几何取自你真机日志里的形态（窗口 → 页面 → 侧栏壳 → 列表 → 消息 → 代码块 → 滚动器 → 内容 → 一行文字），
+  绘制规则按 <code>docs/21 §5.22</code> 草案实现（锚点 + 塌缩 + 内层低透明度），参数可调。
+  <b>鼠标移到画面上，滚轮 / ↑↓ 换层级</b>——和真机一样，最深层是 default，往下走会看到内层的环。
+  右上角可以切换「当前实现」与「③a」，直接对照。
+</p>
+
+<div class="wrap">
+  <div id="holder">
+    <div id="stage">
+      <!-- 页面内容由 JS 按当前场景的层级数据生成，保证"环"和"盒子"是同一份几何 -->
+      <div id="page"></div>
+      <canvas id="overlay"></canvas>
+    </div>
+  </div>
+
+  <aside>
+    <h2>对照</h2>
+    <div class="seg" id="implSeg">
+      <button data-impl="current">当前实现（只画外侧，不塌缩）</button>
+      <button data-impl="chain">③a（锚点 + 塌缩 + 内层）</button>
+    </div>
+
+    <h2>场景</h2>
+    <label class="row">
+      <span class="k">层级结构</span>
+      <select id="scenario">
+        <option value="deep">9 层（含 3 层 1px 密排，真机形态）</option>
+        <option value="wide">4 层（间距都 ≥ 8px）</option>
+        <option value="flat">2 层（窗口 + 答案）</option>
+      </select>
+    </label>
+    <label class="row">
+      <span class="k">当前选中</span>
+      <span><span class="labelchip" id="levelChip">—</span></span>
+    </label>
+    <div class="row" style="display:flex;align-items:center;justify-content:space-between;margin:7px 0">
+      <span class="k" style="color:var(--dim)">重新回到最深</span>
+      <button id="resetSel" style="background:#0f141b;color:var(--text);
+        border:1px solid var(--line);border-radius:5px;padding:4px 10px;cursor:pointer">
+        ↓ 最深
+      </button>
+    </div>
+
+    <h2>参数（③a 生效）</h2>
+    <label class="row"><span class="k">外侧透明度</span>
+      <input type="range" id="outerAlpha" min="10" max="90" value="45">
+      <output id="outerAlphaOut">45%</output></label>
+    <label class="row"><span class="k">内层透明度</span>
+      <input type="range" id="innerAlpha" min="0" max="60" value="28">
+      <output id="innerAlphaOut">28%</output></label>
+    <label class="row"><span class="k">塌缩阈值</span>
+      <input type="range" id="collapse" min="0" max="24" value="8">
+      <output id="collapseOut">8 px</output></label>
+    <label class="row"><span class="k">选中线宽</span>
+      <input type="range" id="selWidth" min="2" max="5" step="1" value="2">
+      <output id="selWidthOut">2 px</output></label>
+    <label class="row"><span class="k">保留最深答案的环</span>
+      <input type="checkbox" id="keepAnswer" checked></label>
+    <label class="row"><span class="k">遮罩（截图变暗）</span>
+      <input type="checkbox" id="dim" checked></label>
+    <label class="row"><span class="k">101 ms 缓动</span>
+      <input type="checkbox" id="ease" checked></label>
+
+    <h2>标签 / 提示（② 已上线）</h2>
+    <div class="kv"><span class="k">预览标签</span><span class="labelchip" id="labelText">—</span></div>
+    <div class="kv"><span class="k">一次性提示</span><span class="hint" id="hintText">（还没换层）</span></div>
+    <div class="kv"><span class="k">整窗画法</span><span id="windowFlag">—</span></div>
+
+    <h2>规则明细</h2>
+    <table class="rings" id="ringTable"></table>
+
+    <h2>统计</h2>
+    <div class="kv"><span class="k">路径层数</span><b id="statPath">—</b></div>
+    <div class="kv"><span class="k">实际画出的环</span><b id="statDrawn">—</b></div>
+    <div class="kv"><span class="k">被塌缩吃掉</span><b id="statCollapsed">—</b></div>
+
+    <div class="legend">
+      <div><span class="swatch" style="border-color:rgba(61,139,253,.45)"></span>外侧祖先（1px，45%）</div>
+      <div><span class="swatch" style="border-color:#3d8bfd;background:rgba(61,139,253,.18)"></span>选中层（洗色 + 2×）</div>
+      <div><span class="swatch" style="border-color:rgba(61,139,253,.28)"></span>内层（1px，28%）：③ 新增</div>
+    </div>
+  </aside>
+</div>
+
+<script>
+"use strict";
+
+/* ------------------------------------------------------------------ 场景
+   坐标是"屏幕"坐标（这里是 1280x720 的 stage，代表一块 4K 显示器被缩放）。
+   path[0] 永远是窗口框，最后一项永远是 refinement 给出的答案 —— 和产品的
+   DeepTarget.path 同一个约定。 */
+const SCENARIOS = {
+  deep: {
+    tag: "9 层（真机形态）",
+    levels: [
+      { id: "窗口 · Chromium", rect: [40, 24, 1200, 660], kind: "window" },
+      { id: "Document（页面区）", rect: [41, 106, 1198, 576] },
+      { id: "side-pane-shell-host", rect: [52, 112, 1000, 560] },
+      { id: "message-list", rect: [55, 115, 900, 500] },
+      { id: "text-message", rect: [58, 118, 880, 300] },
+      { id: "code-block-viewer", rect: [59, 119, 878, 298] },   // ← 与上一层差 1px
+      { id: "cm-scroller", rect: [60, 120, 876, 296] },          // ← 再差 1px
+      { id: "pre.cm-content", rect: [76, 150, 700, 240] },
+      { id: "code span（答案）", rect: [80, 154, 320, 30] },
+    ],
+    decor: [
+      { rect: [66, 420, 880, 220], html: "同一条链之外的其它内容（不在 path 上，所以不会被划进轮廓）" },
+    ],
+  },
+  wide: {
+    tag: "4 层",
+    levels: [
+      { id: "窗口 · Chromium", rect: [40, 24, 1200, 660], kind: "window" },
+      { id: "side-pane-shell-host", rect: [52, 112, 1000, 560] },
+      { id: "text-message", rect: [58, 118, 880, 300] },
+      { id: "code span（答案）", rect: [80, 154, 320, 30] },
+    ],
+    decor: [
+      { rect: [66, 430, 880, 210], html: "同一条链之外的其它内容" },
+    ],
+  },
+  flat: {
+    tag: "2 层",
+    levels: [
+      { id: "窗口 · Chromium", rect: [40, 24, 1200, 660], kind: "window" },
+      { id: "code span（答案）", rect: [80, 154, 320, 30] },
+    ],
+    decor: [],
+  },
+};
+
+const state = {
+  impl: "chain",
+  scenario: "deep",
+  selected: 0,            // 每次切场景后重置为最深
+  cursor: { x: 900, y: 600 },
+  outerAlpha: 0.45,
+  innerAlpha: 0.28,
+  collapse: 8,
+  selWidth: 2,
+  keepAnswer: true,
+  dim: true,
+  ease: true,
+  // 一条"当前在屏幕上"的矩形 + 目标矩形（真机里就是 RectTransition）
+  shown: null,
+  anim: null,
+  hintUntil: 0,
+  hintText: "",
+  taught: false,
+};
+
+const ACCENT = "61,139,253";
+const NEUTRAL = "200,208,219";
+
+const stage = document.getElementById("stage");
+const holder = document.getElementById("holder");
+const canvas = document.getElementById("overlay");
+const ctx = canvas.getContext("2d");
+const page = document.getElementById("page");
+/* 显示器坐标 → CSS 像素的缩放系数（窗口不够大时 < 1）。 */
+let stageScale = 1;
+
+/* ------------------------------------------------------------------ 尺寸
+   devicePixelRatio 缩放 + 半像素对齐：1px 线在真机 D2D 里是物理像素，这里要对齐才能看出线宽差别。 */
+function fitCanvas() {
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.round(stage.clientWidth * dpr);
+  canvas.height = Math.round(stage.clientHeight * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  draw();
+}
+
+/* 让整块"显示器"在窗口里放得下：等比缩放 stage，holder 跟着占位，
+   鼠标坐标除以同一个系数换算回显示器坐标。 */
+function fitStage() {
+  const panel = 360;
+  const byWidth = (window.innerWidth - panel) / 1280;
+  const byHeight = (window.innerHeight - 150) / 720;
+  stageScale = Math.max(0.4, Math.min(1, byWidth, byHeight));
+  stage.style.transform = `scale(${stageScale})`;
+  holder.style.width = `${1280 * stageScale}px`;
+  holder.style.height = `${720 * stageScale}px`;
+  fitCanvas();
+}
+
+const levelsOf = () => SCENARIOS[state.scenario].levels;
+const deepest = () => levelsOf().length - 1;
+
+/* ------------------------------------------------------------------ 页面
+   按当前场景的层级数据画"页面内容"：每一层都是一个盒子，最后一层是答案（一行文字）。
+   这样环和内容用的是同一份几何 —— 不会出现"轮廓和盒子对不上"的假象。 */
+const SURFACES = ["#1b1f27", "#f4f6f9", "#eef1f6", "#e9edf4", "#e4e9f1",
+                  "#eef2f8", "#e7ecf3", "#f7f8fb", "#f7f8fb"];
+function renderPage() {
+  const levels = levelsOf();
+  const scenario = SCENARIOS[state.scenario];
+  // 只给"规则决定要画的环"标名字（塌缩掉的层不标，否则 1px 密排的层名字会叠在一起）；
+  // 名字竖着错开，保证可读。哪些层被塌缩，看侧栏的规则明细。
+  const kept = new Set(selectRings(levels, state.selected, state)
+    .filter((row) => row.keep).map((row) => row.index));
+  let captionBottom = -Infinity;
+  page.innerHTML = "";
+  levels.forEach((level, i) => {
+    const [x, y, w, h] = level.rect;
+    const div = document.createElement("div");
+    const isWindow = i === 0;
+    const isAnswer = i === levels.length - 1;
+    const background = isWindow ? "transparent" : SURFACES[Math.min(i, SURFACES.length - 1)];
+    div.style.cssText =
+      `position:absolute;left:${x}px;top:${y}px;width:${w}px;height:${h}px;` +
+      `background:${background};` +
+      (isWindow
+        ? "border-radius:8px;box-shadow:0 20px 60px rgba(0,0,0,.6);"
+        : "border:1px solid rgba(120,132,150,.35);") +
+      `color:#7d8794;font-size:11px;overflow:hidden`;
+    if (isWindow) {
+      div.innerHTML =
+        '<div style="height:34px;background:#242a33;border-radius:8px 8px 0 0;' +
+        'color:#8b95a3;font-size:12px;padding:9px 14px">Chromium · 智能吸附正在选一个盒子</div>';
+    } else if (isAnswer) {
+      div.style.font = "12px/20px Consolas, monospace";
+      div.style.color = "#4a5563";
+      div.style.padding = "5px 8px";
+      div.innerHTML =
+        "复制路径<span style='float:right;color:#a9b3c1'>← 这一层就是 refinement 的答案</span>";
+    } else if (kept.has(i)) {
+      const top = Math.max(4, captionBottom + 4 - y);
+      captionBottom = y + top + 14;
+      div.innerHTML =
+        `<span style="position:absolute;left:6px;top:${top}px">` +
+        `${i + 1}/${levels.length} ${level.id}</span>`;
+    }
+    page.appendChild(div);
+  });
+  for (const extra of scenario.decor) {
+    const [x, y, w, h] = extra.rect;
+    const div = document.createElement("div");
+    div.style.cssText =
+      `position:absolute;left:${x}px;top:${y}px;width:${w}px;height:${h}px;` +
+      "background:#e7ebf2;border:1px solid rgba(120,132,150,.3);" +
+      "color:#7d8794;font-size:11px;padding:6px";
+    div.textContent = extra.html;
+    page.appendChild(div);
+  }
+}
+
+/* ------------------------------------------------------------ 环的选取规则
+   ③a：
+   1) 锚点：窗口框、选中层外侧那个、选中层、选中层内侧那个、以及（可选）最深答案；这些不考虑阈值。
+   2) 其余层从外到内走一遍，只有当它与"上一条已画的环"的四条边距离都 >= 阈值时才画。
+   父返回 [{ index, role, keep, why }]，role ∈ outer | selected | inner。 */
+function selectRings(levels, selected, opts) {
+  const n = levels.length;
+  const last = n - 1;
+  if (opts.impl === "current") {
+    // 当前实现：只画"选中层之外"的所有祖先，最深层默认全画，没有塌缩。
+    return levels.map((_, i) => {
+      if (i === selected) return { index: i, role: "selected", keep: true, why: "选中层" };
+      if (i < selected) return { index: i, role: "outer", keep: true, why: "选中层之外" };
+      return { index: i, role: "inner", keep: false, why: "当前实现不画内侧" };
+    });
+  }
+  const anchors = new Set([selected]);
+  if (selected > 0) anchors.add(0);
+  if (selected - 1 >= 0) anchors.add(selected - 1);
+  if (selected + 1 <= last) anchors.add(selected + 1);
+  if (opts.keepAnswer && last !== selected && last !== selected + 1) anchors.add(last);
+
+  const rows = [];
+  const kept = [];
+  const edgeGap = (a, b) => Math.min(
+    Math.abs(a[0] - b[0]), Math.abs(a[1] - b[1]),
+    Math.abs((a[0] + a[2]) - (b[0] + b[2])),
+    Math.abs((a[1] + a[3]) - (b[1] + b[3])),
+  );
+  for (let i = 0; i < n; i++) {
+    const role = i === selected ? "selected" : (i < selected ? "outer" : "inner");
+    if (i === selected) {
+      kept.push(i);
+      rows.push({ index: i, role, keep: true, why: "选中层（永远画）" });
+      continue;
+    }
+    const previous = kept[kept.length - 1];
+    const gap = previous === undefined ? Infinity : edgeGap(levels[i].rect, levels[previous].rect);
+    if (anchors.has(i)) {
+      kept.push(i);
+      rows.push({
+        index: i, role, keep: true,
+        why: gap < opts.collapse
+          ? `锚点（与 ${previous + 1}/${n} 仅差 ${gap}px，会贴在一起）`
+          : "锚点",
+      });
+      continue;
+    }
+    if (gap >= opts.collapse) {
+      kept.push(i);
+      rows.push({ index: i, role, keep: true, why: `与上一条差 ${gap}px ≥ 阈值` });
+    } else {
+      rows.push({
+        index: i, role, keep: false,
+        why: `与 ${previous + 1}/${n} 只差 ${gap}px < 阈值 → 塌缩`,
+      });
+    }
+  }
+  return rows;
+}
+
+/* 标签文案：与已上线的 preview_label 同一套格式（元素 / 容器 n/N / 窗口 / ?） */
+function labelFor(rect, index, isWindow, degraded) {
+  const n = levelsOf().length;
+  const kind = isWindow ? "窗口" : (index === deepest() ? "元素" : "容器");
+  let text = `${rect[2]}×${rect[3]} px  ${kind}`;
+  // 最深层不计数（和确认行的 deepest 一致）；走到第 1 层时会读作「窗口 1/N」。
+  if (n > 1 && index !== deepest()) text += ` ${index + 1}/${n}`;
+  if (degraded) text += "?";
+  return text;
+}
+
+/* ------------------------------------------------------ 标签面板的摆放
+   和 size_label_placement 同一个规则：优先放在盒子上面，放不下翻到下面，两个方向都放不下就不画。 */
+function placeLabel(rect, size) {
+  const [w, h] = size;
+  const gap = 6;
+  const stageRect = { l: 0, t: 0, r: stage.clientWidth, b: stage.clientHeight };
+  const aboveTop = rect[1] - gap - h;
+  const belowTop = rect[1] + rect[3] + gap;
+  const aboveFits = aboveTop >= stageRect.t;
+  const belowFits = belowTop + h <= stageRect.b;
+  if (!aboveFits && !belowFits) return null;
+  const top = aboveFits ? aboveTop : belowTop;
+  const left = Math.max(stageRect.l, Math.min(rect[0], stageRect.r - w));
+  return [left, top, w, h];
+}
+
+/* ------------------------------------------------------------------ 绘制 */
+function draw() {
+  const levels = levelsOf();
+  const selected = state.selected;
+  const target = levels[selected].rect;
+  const wholeWindow = selected === 0;
+  const rect = state.shown || target;
+  const rows = selectRings(levels, selected, state);
+  const accent = wholeWindow ? NEUTRAL : ACCENT;
+
+  ctx.clearRect(0, 0, stage.clientWidth, stage.clientHeight);
+
+  if (state.dim) {
+    ctx.fillStyle = "rgba(0,0,0,.34)";
+    ctx.fillRect(0, 0, stage.clientWidth, stage.clientHeight);
+  }
+
+  // 1) 链上的环：从外到内，选中层跳过（它最后用填充 + 粗边画）。
+  const line = (r, alpha, width, color) => {
+    ctx.strokeStyle = `rgba(${color},${alpha})`;
+    ctx.lineWidth = width;
+    const half = width % 2 === 1 ? 0.5 : 0;
+    ctx.strokeRect(Math.round(r[0]) + half, Math.round(r[1]) + half,
+                   Math.round(r[2]) - 2 * half, Math.round(r[3]) - 2 * half);
+  };
+  for (const row of rows) {
+    if (!row.keep || row.role === "selected") continue;
+    const alpha = row.role === "outer" ? state.outerAlpha : state.innerAlpha;
+    line(levels[row.index].rect, alpha, 1, accent);
+  }
+
+  // 2) 选中层：整窗用中性色 + 单倍细边，元素用 accent + 2×（docs/21 §5.21）。
+  const fillAlpha = wholeWindow ? 0.10 : 0.18;
+  ctx.fillStyle = `rgba(${accent},${fillAlpha})`;
+  ctx.fillRect(rect[0], rect[1], rect[2], rect[3]);
+  line(rect, 1, wholeWindow ? 1 : state.selWidth, accent);
+
+  // 3) 光标（真机里 overlay 自己画十字光标）
+  ctx.strokeStyle = "rgba(255,255,255,.55)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(state.cursor.x - 9, state.cursor.y + 0.5);
+  ctx.lineTo(state.cursor.x + 9, state.cursor.y + 0.5);
+  ctx.moveTo(state.cursor.x + 0.5, state.cursor.y - 9);
+  ctx.lineTo(state.cursor.x + 0.5, state.cursor.y + 9);
+  ctx.stroke();
+
+  // 4) 预览标签（最后画，压在环之上）。
+  //    锚点是*缓动中*的矩形、文字用*目标*盒子的尺寸 —— 和真机一致（docs/21 §5.21）。
+  const text = labelFor(target, selected, wholeWindow, false);
+  ctx.font = '12px "Segoe UI", "Microsoft YaHei UI", sans-serif';
+  const padX = 10, padY = 5;
+  const tw = Math.ceil(ctx.measureText(text).width) + padX * 2;
+  const th = 12 + padY * 2;
+  const placed = placeLabel(rect, [tw, th]);
+  if (placed) {
+    ctx.fillStyle = "rgba(20,26,34,.92)";
+    ctx.strokeStyle = "rgba(255,255,255,.12)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.roundRect(placed[0] + 0.5, placed[1] + 0.5, placed[2] - 1, placed[3] - 1, 3);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = "#e8edf4";
+    ctx.textBaseline = "top";
+    ctx.fillText(text, placed[0] + padX, placed[1] + padY);
+  }
+
+  // 5) 一次性提示（锚在光标处，到点自己消失）
+  if (performance.now() < state.hintUntil && state.hintText) {
+    ctx.font = '12px "Segoe UI", "Microsoft YaHei UI", sans-serif';
+    const ht = state.hintText;
+    const hw = Math.ceil(ctx.measureText(ht).width) + padX * 2;
+    const hh = 12 + padY * 2;
+    let hx = Math.max(2, Math.min(state.cursor.x + 14, stage.clientWidth - hw - 2));
+    let hy = state.cursor.y + 14;
+    if (hy + hh > stage.clientHeight - 2) hy = state.cursor.y - hh - 14;
+    ctx.fillStyle = "rgba(20,26,34,.95)";
+    ctx.strokeStyle = "rgba(255,212,121,.5)";
+    ctx.beginPath();
+    ctx.roundRect(hx + 0.5, hy + 0.5, hw - 1, hh - 1, 3);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = "#ffd479";
+    ctx.fillText(ht, hx + padX, hy + padY);
+  }
+
+  renderReadout(rows, selected, text, wholeWindow);
+}
+
+/* ------------------------------------------------------------------ 侧栏 */
+function renderReadout(rows, selected, labelText, wholeWindow) {
+  const n = levelsOf().length;
+  document.getElementById("levelChip").textContent =
+    selected === deepest() ? `${n}/${n} 最深` : `${selected + 1}/${n}`;
+  document.getElementById("labelText").textContent = labelText;
+  document.getElementById("windowFlag").textContent =
+    wholeWindow ? "中性洗色 + 单倍细边 + 「窗口」" : "accent 洗色 + 2× 描边";
+  document.getElementById("hintText").textContent = state.hintText || "（还没换层）";
+
+  const drawn = rows.filter((r) => r.keep).length;
+  document.getElementById("statPath").textContent = `${n} 层`;
+  document.getElementById("statDrawn").textContent =
+    `${drawn} 条（含选中层）${drawn > 7 ? " ⚠ 超过设计上限 7" : ""}`;
+  document.getElementById("statCollapsed").textContent =
+    `${rows.filter((r) => !r.keep).length} 层`;
+
+  const body = rows.map((row) => {
+    const lv = levelsOf()[row.index];
+    const cls = row.index === selected ? "sel" : (row.keep ? "" : "skip");
+    const role = row.role === "selected" ? "选中" : (row.role === "outer" ? "外侧" : "内层");
+    return `<tr class="${cls}">
+      <td class="i">${row.index + 1}/${n}</td>
+      <td class="id">${lv.id}<div class="why">${role}</div></td>
+      <td><span class="${row.keep ? "yes" : "no"}">${row.keep ? "画" : "跳过"}</span>
+          <div class="why">${row.why}</div></td>
+    </tr>`;
+  }).join("");
+  document.getElementById("ringTable").innerHTML =
+    `<tr><th>层</th><th>盒子</th><th>结果</th></tr>${body}`;
+}
+
+/* -------------------------------------------------------------- 走动 / 动画 */
+function setSelected(next) {
+  const n = levelsOf().length;
+  const clamped = Math.max(0, Math.min(n - 1, next));
+  if (clamped === state.selected) return false;
+  const from = state.shown ? [...state.shown] : [...levelsOf()[state.selected].rect];
+  state.selected = clamped;
+  const to = levelsOf()[clamped].rect;
+  if (state.ease) {
+    state.anim = { from, to, start: performance.now(), dur: 101 };
+  } else {
+    state.anim = null;
+    state.shown = [...to];
+  }
+  // 第一次真正换层：给那句解释。**并且在这句还挂在屏幕上的这段时间里，继续换层会让它跟着走**——
+  // 一句话说 `8/9` 而标签已经写着 `3/7`，比没有这句话更糟。提示消失之后不再复活（每会话只教一次）。
+  const showing = performance.now() < state.hintUntil && state.hintText !== "";
+  if (!state.taught || showing) {
+    state.taught = true;
+    state.hintText = `吸附层级 ${clamped + 1}/${n}（1=窗口）· 滚轮 / ↑↓ 切换`;
+    state.hintUntil = performance.now() + 2600;
+  }
+  renderPage();
+  return true;
+}
+
+function tick() {
+  // 提示到点自己消失（真机里是 on_hover_tick 保活一次重绘让它按时消失）
+  if (state.hintText && performance.now() >= state.hintUntil) state.hintText = "";
+  if (state.anim) {
+    const t = Math.min(1, (performance.now() - state.anim.start) / state.anim.dur);
+    const e = 1 - (1 - t) * (1 - t);           // OutQuad，和 RectTransition 一致
+    const { from, to } = state.anim;
+    state.shown = from.map((v, i) => Math.round(v + (to[i] - v) * e));
+    if (t >= 1) { state.anim = null; state.shown = [...to]; }
+  }
+  draw();
+  requestAnimationFrame(tick);
+}
+
+/* ------------------------------------------------------------------ 交互 */
+stage.addEventListener("mousemove", (event) => {
+  const box = stage.getBoundingClientRect();
+  state.cursor = {
+    x: (event.clientX - box.left) / stageScale,
+    y: (event.clientY - box.top) / stageScale,
+  };
+});
+stage.addEventListener("wheel", (event) => {
+  event.preventDefault();
+  setSelected(state.selected + (event.deltaY > 0 ? 1 : -1));
+}, { passive: false });
+window.addEventListener("keydown", (event) => {
+  if (event.key === "ArrowUp") { event.preventDefault(); setSelected(state.selected - 1); }
+  if (event.key === "ArrowDown") { event.preventDefault(); setSelected(state.selected + 1); }
+});
+
+document.getElementById("scenario").addEventListener("change", (event) => {
+  state.scenario = event.target.value;
+  state.selected = deepest();
+  state.shown = [...levelsOf()[state.selected].rect];
+  state.taught = false;
+  state.hintText = "滚轮 / ↑↓ 换吸附层级";
+  state.hintUntil = performance.now() + 2600;
+  renderPage();
+  draw();
+});
+document.getElementById("resetSel").addEventListener("click", () => {
+  state.selected = deepest();
+  state.shown = [...levelsOf()[state.selected].rect];
+  state.anim = null;
+  draw();
+});
+document.getElementById("implSeg").addEventListener("click", (event) => {
+  const button = event.target.closest("button");
+  if (!button) return;
+  state.impl = button.dataset.impl;
+  paintSeg();
+  renderPage();
+  draw();
+});
+function paintSeg() {
+  for (const button of document.querySelectorAll("#implSeg button")) {
+    button.classList.toggle("on", button.dataset.impl === state.impl);
+  }
+}
+
+const bindRange = (id, key, format) => {
+  const input = document.getElementById(id);
+  const out = document.getElementById(id + "Out");
+  const sync = () => {
+    // 透明度滑杆给人看的是 0–100，画笔要的是 0–1。
+    state[key] = key.endsWith("Alpha") ? Number(input.value) / 100 : Number(input.value);
+    out.textContent = format(Number(input.value));
+    draw();
+  };
+  input.addEventListener("input", sync);
+  sync();
+};
+bindRange("outerAlpha", "outerAlpha", (v) => `${v}%`);
+bindRange("innerAlpha", "innerAlpha", (v) => `${v}%`);
+bindRange("collapse", "collapse", (v) => `${v} px`);
+bindRange("selWidth", "selWidth", (v) => `${v} px`);
+
+for (const [id, key] of [["keepAnswer", "keepAnswer"], ["dim", "dim"], ["ease", "ease"]]) {
+  const input = document.getElementById(id);
+  input.addEventListener("change", () => { state[key] = input.checked; draw(); });
+}
+
+/* 初始状态：和真机一样，会话开始时先给"发现"那句话，然后落在最深（答案）上 */
+(function init() {
+  state.selected = deepest();
+  state.shown = [...levelsOf()[state.selected].rect];
+  state.hintText = "滚轮 / ↑↓ 换吸附层级";
+  state.hintUntil = performance.now() + 2600;
+  paintSeg();
+  renderPage();
+  fitStage();
+  window.addEventListener("resize", fitStage);
+  requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>
