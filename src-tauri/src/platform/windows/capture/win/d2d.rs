@@ -2735,12 +2735,27 @@ mod tests {
                 assert!(
                     covered.contains(&(character as u32)),
                     "the embedded subset has no glyph for {character:?} (U+{:04X}), drawn by \
-                     {text:?}: add that string to subfont/drawn-glyphs.txt and rebuild with \
-                     subfont/subset.ps1",
+                     {text:?}: rebuild it with subfont/subset.ps1 — the script scans the Rust \
+                     literals, so there is nothing else to update",
                     character as u32,
                 );
             }
         }
+    }
+
+    /// Glyph count from the font's `maxp` table — the ceiling a `cmap` reader can be held to.
+    fn font_glyph_count(bytes: &[u8]) -> usize {
+        let u16_at = |at: usize| u16::from_be_bytes([bytes[at], bytes[at + 1]]) as usize;
+        let u32_at = |at: usize| {
+            u32::from_be_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]) as usize
+        };
+        for record in 0..u16_at(4) {
+            let at = 12 + record * 16;
+            if &bytes[at..at + 4] == b"maxp" {
+                return u16_at(u32_at(at + 8) + 4);
+            }
+        }
+        0
     }
 
     /// The gate is only as good as its instrument, so the reader above is checked too: it has to
@@ -2754,14 +2769,20 @@ mod tests {
                 "{character:?} is in the subset and the reader missed it"
             );
         }
+        // A `cmap` answers codepoints with *glyphs*, and the font only has so many: a reader that
+        // mis-reads an offset and walks a whole plane reports far more codepoints than that, which
+        // is the failure mode that would make the gate above pass on a deficient font.
+        let glyphs = font_glyph_count(super::INFO_EMBEDDED_FONT);
+        assert!(glyphs > 50, "the subset should carry the chrome's glyphs ({glyphs})");
         assert!(
-            !covered.contains(&('龘' as u32)),
-            "a CJK ideograph the subset deliberately does not carry must not be reported"
-        );
-        assert!(
-            covered.len() < 200,
-            "a chrome-only subset cannot answer for {} codepoints",
+            covered.len() <= glyphs,
+            "the reader reports {} codepoints for a font with {glyphs} glyphs",
             covered.len()
+        );
+        // The noncharacters are the one range a font is guaranteed never to map.
+        assert!(
+            !covered.contains(&0xFDD0),
+            "U+FDD0 is a noncharacter and cannot be in the font"
         );
     }
 }
