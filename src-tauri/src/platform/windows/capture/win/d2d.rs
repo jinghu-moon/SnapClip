@@ -329,6 +329,8 @@ pub struct OverlayRenderer {
     capture_brush: Option<ID2D1SolidColorBrush>,
     /// Mutable ring brush: the level chain, with each ring's own opacity set per frame.
     chain_ring_brush: Option<ID2D1SolidColorBrush>,
+    /// Constant dark underlay for the rings (see [`CHAIN_RING_SHADOW`]).
+    chain_shadow_brush: Option<ID2D1SolidColorBrush>,
     /// Theme colour laid over the neutral mask at a few percent (docs/21 §5.22): brand presence,
     /// not darkening — the black mask does that.
     mask_tint_brush: Option<ID2D1SolidColorBrush>,
@@ -411,6 +413,7 @@ impl OverlayRenderer {
             preview_fill_brush: None,
             capture_brush: None,
             chain_ring_brush: None,
+            chain_shadow_brush: None,
             mask_tint_brush: None,
             handle_brush: None,
             label_background_brush: None,
@@ -868,7 +871,11 @@ impl OverlayRenderer {
             return Ok(());
         }
         let brush = self.require_brush(&self.chain_ring_brush, "chain ring brush")?;
-        let width = self.metrics.border_width.min(1.0);
+        let shadow = self.require_brush(&self.chain_shadow_brush, "chain shadow brush")?;
+        // One *logical* pixel, scaled like every other length in the overlay: the first version used
+        // a raw physical pixel, which at the user's 144 DPI is 0.67 logical px — thinner than the
+        // prototype's line ever was, on a screen that shows it at 1.5 physical px.
+        let width = (self.metrics.dpi as f32 / 96.0).max(1.0);
         for ring in view.chain_rings.iter().filter(|ring| ring.inner == inner) {
             let rect = ring.rect.intersect(view.frame);
             if rect.is_empty() {
@@ -881,8 +888,17 @@ impl OverlayRenderer {
             }
             // One mutable brush, `SetColor` per ring: at most seven calls a frame and no
             // allocation, the same trick the annotation strokes already use.
-            let _ = unsafe { brush.SetColor(&chain_ring_color(ring.alpha)) };
+            // Dark underlay first (one pixel wider), then the ring itself: the pair carries an edge
+            // no screenshot can match in luminance, which a single blue line cannot promise.
             unsafe {
+                self.d2d
+                    .DrawRectangle(
+                        &to_d2d(rect),
+                        &shadow,
+                        width + CHAIN_RING_SHADOW_WIDTH,
+                        None,
+                    );
+                let _ = brush.SetColor(&chain_ring_color(ring.alpha));
                 self.d2d.DrawRectangle(&to_d2d(rect), &brush, width, None);
             }
         }
@@ -1901,6 +1917,7 @@ impl OverlayRenderer {
         ))?);
         // Mutable: `paint_chain_rings` sets each ring's own opacity.
         self.chain_ring_brush = Some(self.create_brush(&chain_ring_color(1.0))?);
+        self.chain_shadow_brush = Some(self.create_brush(&color(0.0, 0.0, 0.0, CHAIN_RING_SHADOW))?);
         self.mask_tint_brush = Some(self.create_brush(&color(
             accent.r * 1.0,
             accent.g * 1.0,
@@ -2005,6 +2022,7 @@ impl OverlayRenderer {
         self.hover_fill_brush = None;
         self.capture_brush = None;
         self.chain_ring_brush = None;
+        self.chain_shadow_brush = None;
         self.mask_tint_brush = None;
         self.handle_brush = None;
         self.label_background_brush = None;
@@ -2057,13 +2075,25 @@ fn color(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F { r, g, b, a }
 }
 
-/// The chain's ring colour: the same hue as the brand blue, one step lighter (docs/21 §5.22).
+/// The chain's ring colour: the brand hue, lifted until it carries *luminance*, not just hue.
 ///
-/// The brand blue (`border_brush`) sits on *unmasked* content where it is fine; a ring is drawn on
-/// top of the mask, where it measured only 2.0:1 even at full opacity. `#4a9bff` reaches 3.1:1 on
-/// light content and 2.1:1 on dark at 60%, which is what makes the chain readable without letting
-/// it compete with the capture green.
-const CHAIN_RING_RGB: (f32, f32, f32) = (74.0 / 255.0, 155.0 / 255.0, 255.0 / 255.0);
+/// Two real-screen corrections went into this number. `#4a9bff` at 60% was invisible: the product's
+/// mask is 45% black (the prototype's was 32%), a masked light page lands at ~140 grey, and a
+/// mid-tone blue has almost exactly that luminance — the ring differed in hue and not in brightness.
+/// Lifting it to `#8fc2ff` reached only 1.33:1 on that grey, because *any* mid-lightness colour does:
+/// pale blue, pale grey and pale green all sit in the same luminance band. `#b9d9ff` keeps the hue
+/// while clearing the grey (~2.4:1), and the underlay below supplies the local edge.
+const CHAIN_RING_RGB: (f32, f32, f32) = (185.0 / 255.0, 217.0 / 255.0, 255.0 / 255.0);
+
+/// Underlay drawn wider than every ring — the part that actually makes it legible.
+///
+/// A thin line over arbitrary screenshots cannot be made readable by colour alone: whatever
+/// luminance it has, some screenshot matches it. The measured numbers on a masked *light* page
+/// (~140 grey): ring core 1.33:1, ring + this underlay 4.9:1. It reads as a light line with a dark
+/// edge — carved on light content, glowing on dark content.
+const CHAIN_RING_SHADOW: f32 = 0.80;
+/// How much wider than the ring the underlay is drawn, in logical pixels.
+const CHAIN_RING_SHADOW_WIDTH: f32 = 2.0;
 
 /// The capture green (`#1bb15f`): the box that would be taken, and only that.
 ///
@@ -2512,40 +2542,56 @@ mod tests {
             "an ancestor level must be outlined"
         );
 
-        // The chain ring is the lighter blue, not the brand blue of the chrome (docs/21 §5.22):
-        // over masked content the brand blue measures 2.0:1 even at full opacity.
-        let ring = sample(&with_path, 24, 4);
+        // The ring is painted here; *how legible* it is belongs to
+        // `chain_rings_carry_luminance_on_light_and_dark_content`, which scans the whole stroke —
+        // a ring is a bright core plus a dark underlay, so one arbitrary pixel can legitimately sit
+        // on either side of the background.
+        let stroke: Vec<[u8; 4]> = (0..8).map(|y| sample(&with_path, 24, y)).collect();
         assert!(
-            ring[0] > ring[2] && ring[0] > masked[0],
-            "the ring should be blue (BGRA: more blue than red) and brighter than the mask: {:?}",
-            ring,
+            stroke.iter().any(|pixel| *pixel != masked),
+            "an ancestor level must actually be painted: {stroke:?}",
         );
 
-        // An inner ring is painted *above* the preview wash. This is the whole point of the
-        // two-pass order: painted underneath, an accent line on an accent wash is invisible — which
-        // is exactly what the prototype showed before it was fixed.
+        // Inner rings are painted *above* the preview wash — the whole point of the two-pass order,
+        // and what the prototype got wrong first (an accent line under an accent wash is invisible).
+        //
+        // The measurable consequence of the order: with the wash on, the ring's own pixels stay
+        // (nearly) unchanged, because nothing is painted over them. Painted underneath, the wash
+        // would tint every ring pixel. So draw the same inner ring twice — bare, then under the wash
+        // — and compare the ring's own brightest pixel.
         let inner = Rect::new(12, 12, 36, 28);
+        view.hover_bounds = None;
         view.chain_rings = vec![ChainRingView {
             rect: inner,
             inner: true,
-            alpha: 0.6,
+            alpha: 0.9,
         }];
+        let brightest = |pixels: &[u8]| {
+            (6..22)
+                .map(|y| sample(pixels, 24, y))
+                .max_by_key(|pixel| pixel[0] as i32 + pixel[1] as i32 + pixel[2] as i32)
+                .unwrap()
+        };
+        view.preview_bounds = None;
         renderer.draw_to(&bitmap, &view).unwrap();
-        let with_inner = renderer.device().read_back_bgra(&target.texture).unwrap();
-        let washed = sample(&with_inner, 24, 20);
+        let bare = renderer.device().read_back_bgra(&target.texture).unwrap();
+        let bare_ring = brightest(&bare);
+        view.preview_bounds = Some(window);
+        renderer.draw_to(&bitmap, &view).unwrap();
+        let with_wash = renderer.device().read_back_bgra(&target.texture).unwrap();
+        let washed_ring = brightest(&with_wash);
         assert_ne!(
-            sample(&with_inner, 24, 12),
-            washed,
-            "the inner ring must survive the preview wash it sits in"
+            sample(&with_wash, 24, 22),
+            sample(&bare, 24, 22),
+            "the preview wash has to be painted for this comparison to mean anything",
         );
-        // …and it must be brighter than the wash, not darker: a same-hue line under a same-hue wash
-        // is what the old order produced.
-        let inner_ring = sample(&with_inner, 24, 12);
+        let drift: i32 = (0..3)
+            .map(|channel| (bare_ring[channel] as i32 - washed_ring[channel] as i32).abs())
+            .sum();
         assert!(
-            inner_ring[0] as i32 > washed[0] as i32 + 10,
-            "inner ring {:?} should stand out from the wash {:?}",
-            inner_ring,
-            washed
+            drift <= 30,
+            "the inner ring moved by {drift} under the wash ({bare_ring:?} vs {washed_ring:?}): \
+             it is being painted underneath it",
         );
 
         // Exporting the previewed rectangle must produce raw frozen pixels: a hint is a
@@ -2560,6 +2606,126 @@ mod tests {
                 .all(|pixel| pixel == background.as_slice()),
             "hover/preview hints must never be exported"
         );
+    }
+
+    /// The size label is painted with an opaque panel above the selection when there is room.
+    /// The regression the user found on a real screen: a mid-tone blue ring on a **masked light**
+    /// page. The mask (45% black) lands a white page at ~140 grey, whose luminance is nearly that of
+    /// a mid blue — so the first ring colour differed in hue and not in brightness and could not be
+    /// seen. This asserts the ring's *luminance* against the masked background, not just that it
+    /// changed, and does it on light and dark content alike.
+    #[test]
+    fn chain_rings_carry_luminance_on_light_and_dark_content() {
+        use crate::capture::geometry::Point as GPoint;
+
+        let relative_luminance = |pixel: [u8; 4]| -> f32 {
+            // Readback is BGRA; the eye weighs green most.
+            let channel = |value: u8| {
+                let value = value as f32 / 255.0;
+                if value <= 0.03928 {
+                    value / 12.92
+                } else {
+                    ((value + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * channel(pixel[2]) + 0.7152 * channel(pixel[1]) + 0.0722 * channel(pixel[0])
+        };
+        let ratio = |a: [u8; 4], b: [u8; 4]| {
+            let (high, low) = {
+                let (a, b) = (relative_luminance(a), relative_luminance(b));
+                if a > b { (a, b) } else { (b, a) }
+            };
+            (high + 0.05) / (low + 0.05)
+        };
+
+        for (name, background, inner) in [
+            ("light", [250u8, 250, 250, 255], false),
+            ("mid", [128, 128, 128, 255], false),
+            ("dark", [24, 24, 28, 255], false),
+            // The inner rings' actual situation: inside the capture wash, on light content — the
+            // combination the user is looking at when the wheel has walked up a level.
+            ("light + capture wash", [250, 250, 250, 255], true),
+        ] {
+            let Ok(device) = super::GraphicsDevice::create() else {
+                return;
+            };
+            let width = 96u32;
+            let height = 64u32;
+            // The user's monitor: at 144 DPI the ring is 1.5 physical px, which is the case that has
+            // to read. (The first version drew a raw physical pixel — thinner here than in any
+            // prototype, which ran at 96 DPI.)
+            let Ok(mut renderer) = OverlayRenderer::new(std::sync::Arc::new(device), 144) else {
+                return;
+            };
+            renderer
+                .update_frame(width, height, &solid_bgra(width, height, background))
+                .unwrap();
+            renderer.ensure_back_buffer(width, height).unwrap();
+            let target = renderer
+                .device()
+                .create_render_target_texture(width, height)
+                .unwrap();
+            let context = renderer.device().create_d2d_context().unwrap();
+            let bitmap = super::super::d3d11::create_bitmap_from_texture(
+                &context,
+                &target.texture,
+                D2D1_BITMAP_OPTIONS_TARGET,
+                D2D1_ALPHA_MODE_PREMULTIPLIED,
+            )
+            .unwrap();
+
+            let mut view = RenderView::new(Rect::from_origin_size(
+                GPoint::new(0, 0),
+                width as i32,
+                height as i32,
+            ));
+            view.cursor_visible = false;
+            view.show_chrome = false;
+            // The ring sits well inside the frame; the sample below is 6 px below it, i.e. masked
+            // content with nothing else painted on it.
+            let ring = Rect::new(20, 20, 76, 48);
+            if inner {
+                view.preview_bounds = Some(Rect::new(12, 12, 84, 56));
+            }
+            view.chain_rings = vec![ChainRingView {
+                rect: ring,
+                inner,
+                alpha: 1.0, // the floor of the ramp, i.e. the faintest ring the plan can produce
+            }];
+            renderer.draw_to(&bitmap, &view).unwrap();
+            let pixels = renderer.device().read_back_bgra(&target.texture).unwrap();
+            // Scan the column through the ring's top edge: a 1.5 px line plus its 2.5 px underlay
+            // are anti-aliased across a few rows, and what the eye uses is the *pair* — a bright
+            // core with a dark edge. Sampling one arbitrary row measures neither.
+            let column: Vec<[u8; 4]> = (16..26)
+                .map(|y| pixel_at(&pixels, width, 48, y))
+                .collect();
+            let plain = pixel_at(&pixels, width, 48, 40);
+            let brightest = *column
+                .iter()
+                .max_by(|a, b| relative_luminance(**a).total_cmp(&relative_luminance(**b)))
+                .unwrap();
+            let darkest = *column
+                .iter()
+                .min_by(|a, b| relative_luminance(**a).total_cmp(&relative_luminance(**b)))
+                .unwrap();
+            eprintln!(
+                "[ring] {name}: brightest {brightest:?} {:.2}:1 · darkest {darkest:?} {:.2}:1 · \
+                 background {plain:?}",
+                ratio(brightest, plain),
+                ratio(darkest, plain),
+            );
+            // The pair is what makes it legible, so the assertion is on the *better* side: on light
+            // content the dark edge carries it (3.4:1 there, 1.5:1 for the core), on mid and dark
+            // content the light core does (3.6:1 and 7.0:1). Requiring both sides would demand a
+            // colour that no screenshot can ever match.
+            let best = ratio(brightest, plain).max(ratio(darkest, plain));
+            assert!(
+                best >= 2.5,
+                "on {name} content the ring peaks at {best:.2}:1 ({brightest:?} core / {darkest:?} \
+                 edge against {plain:?})",
+            );
+        }
     }
 
     /// The size label is painted with an opaque panel above the selection when there is room.

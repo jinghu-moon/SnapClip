@@ -224,8 +224,12 @@ impl Default for RingOptions {
             collapse_gap_px: 8,
             merge_gap_px: 2,
             max_rings: 7,
-            outer_alpha: 0.60,
-            inner_alpha: 0.60,
+            // Raised after the first real-machine look: at 0.60 the chain was visible in the
+            // prototype (32% mask) and invisible in the product (45% mask), because a mid-tone blue
+            // carries almost no *luminance* against a masked light page. 0.85 with a compressed ramp
+            // keeps every ring in one readable band.
+            outer_alpha: 0.85,
+            inner_alpha: 0.85,
             ramp: true,
             keep_answer: true,
         }
@@ -297,10 +301,12 @@ pub fn chain_rings(path: &[Rect], selected: usize, options: RingOptions) -> Chai
         if !options.ramp {
             return base;
         }
-        // Distance 1 (the selection's neighbours) keeps the base; each further step costs 12%,
-        // floored at 65% so the outermost ring — the "where am I" reference — stays visible.
+        // Distance 1 (the selection's neighbours) keeps the base; each further step costs 6%,
+        // floored at 80% so the outermost ring — the "where am I" reference — stays visible. The
+        // ramp is deliberately gentle: with a 45% mask the eye needs *all* the rings to read, and
+        // the distance cue is carried by position far more than by opacity.
         let distance = index.abs_diff(selected).saturating_sub(1).min(6) as f32;
-        base * (1.0 - 0.12 * distance).max(0.65)
+        base * (1.0 - 0.06 * distance).max(0.80)
     };
 
     let mut kept: Vec<usize> = Vec::new();
@@ -1559,15 +1565,18 @@ mod tests {
                 .map(|ring| ring.alpha)
                 .unwrap_or_default()
         };
-        // One step away is 88% of the base (the 12% ramp), and the two rings *adjacent* to the
+        // Read the base from the options rather than restating it: the numbers are a tuning knob and
+        // the assertions below are about the *shape* of the ramp.
+        let base = RingOptions::default().outer_alpha;
+        // One step away is 94% of the base (the 6% ramp), and the two rings *adjacent* to the
         // selection in this fixture are exactly the ones the merge rule removes — which is why the
         // ramp starts biting at distance two.
-        assert!((alpha(3) - 0.60 * 0.88).abs() < 1e-5, "one step out: {}", alpha(3));
-        assert!((alpha(7) - 0.60 * 0.88).abs() < 1e-5, "one step in: {}", alpha(7));
+        assert!((alpha(3) - base * 0.94).abs() < 1e-5, "one step out: {}", alpha(3));
+        assert!((alpha(7) - base * 0.94).abs() < 1e-5, "one step in: {}", alpha(7));
         assert!(alpha(2) < alpha(3), "two steps out is fainter than one: {} vs {}", alpha(2), alpha(3));
         assert!(
-            (alpha(0) - 0.60 * 0.65).abs() < 1e-5,
-            "the window frame is floored at 65% of the base: {}",
+            (alpha(0) - base * 0.80).abs() < 1e-5,
+            "the window frame is floored at 80% of the base: {}",
             alpha(0)
         );
 
@@ -1583,7 +1592,7 @@ mod tests {
         assert!(flat
             .rings
             .iter()
-            .all(|ring| ring.role == RingRole::Selected || (ring.alpha - 0.60).abs() < 1e-6));
+            .all(|ring| ring.role == RingRole::Selected || (ring.alpha - base).abs() < 1e-6));
     }
 
     /// Twelve evenly spaced wrappers: the cap has to bite, and it must bite the *non-anchors*
