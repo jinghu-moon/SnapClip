@@ -72,6 +72,8 @@ pub(crate) struct MsaaHitBox {
 /// Why a hit test produced no box.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MsaaHitFailure {
+    /// The window is isolated for this snapshot generation (an earlier call wedged).
+    Quarantined,
     /// A call is already in flight; the caller should retry on the next dwell.
     Busy,
     /// The provider wedged and is quarantined for this generation.
@@ -123,6 +125,14 @@ impl MsaaDeepSelectionProvider {
         point: Point,
         window_bounds: Rect,
     ) -> Result<MsaaHitBox, MsaaHitFailure> {
+        // Isolation first, and here rather than only in `resolve`: the composite asks this window for
+        // a second opinion on *every* query, so a window that wedged once must not be called again
+        // (measured before this check: 13 of 21 queries burned the full 168 ms deadline after the
+        // window had already been quarantined).
+        if self.quarantined.contains(&hwnd) {
+            self.metrics.record_refinement_quarantine_hit();
+            return Err(MsaaHitFailure::Quarantined);
+        }
         // Cheapest possible guard: never call into a window the system already considers hung.
         let window = HWND(hwnd as *mut core::ffi::c_void);
         if unsafe { IsHungAppWindow(window) }.as_bool() {
@@ -168,15 +178,14 @@ impl DeepSelectionProvider for MsaaDeepSelectionProvider {
         control: &QueryControl<'_>,
     ) -> RefinementOutcome {
         let hwnd = job.window.hwnd;
-        if self.quarantined.contains(&hwnd) {
-            self.metrics.record_refinement_quarantine_hit();
-            return RefinementOutcome::Empty(StopReason::Unsupported);
-        }
         if control.is_cancelled() {
             return RefinementOutcome::Empty(StopReason::Cancelled);
         }
-        // Cheapest possible guard: never call into a window the system already considers hung.
         match self.hit(hwnd, job.point, window_bounds) {
+            // Isolation and the hung-window guard live in `hit`, so both callers share them.
+            Err(MsaaHitFailure::Quarantined) => {
+                RefinementOutcome::Empty(StopReason::Unsupported)
+            }
             Err(MsaaHitFailure::Busy) => RefinementOutcome::Empty(StopReason::ProviderTimeout),
             Err(MsaaHitFailure::TimedOut) => RefinementOutcome::Empty(StopReason::ProviderTimeout),
             Err(MsaaHitFailure::Unavailable) => {
@@ -459,6 +468,13 @@ mod tests {
             ),
             RefinementOutcome::Empty(StopReason::Unsupported)
         );
+        // …and the second-opinion path (`hit`) is isolated too: the composite asks every window on
+        // every query, so without this the quarantined one kept burning its 168 ms deadline
+        // (measured: 13 timeouts out of 21 queries in one real session, docs/21 §5.21).
+        assert!(matches!(
+            provider.hit(0x1234, Point::new(10, 10), Rect::new(0, 0, 100, 100)),
+            Err(MsaaHitFailure::Quarantined)
+        ));
     }
 
     #[test]

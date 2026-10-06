@@ -200,6 +200,7 @@ fn describe_box(raw: Rect, visible: Rect) -> String {
 /// Why MSAA had no box, spelled the way the forced line does.
 fn failure_name(failure: MsaaHitFailure) -> &'static str {
     match failure {
+        MsaaHitFailure::Quarantined => "quarantined",
         MsaaHitFailure::Busy => "busy",
         MsaaHitFailure::TimedOut => "timeout",
         MsaaHitFailure::Unavailable => "unavailable",
