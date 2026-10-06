@@ -2895,7 +2895,15 @@ where
             hint,
         };
         // Live borrow of annotation document avoids cloning items every tick.
-        match renderer.render(&state, Some(&self.annotation_doc)) {
+        //
+        // The present is timed here because this is the only place that knows a full repaint
+        // happened: the overlay's cost model is frames, and `present=`/`present_us` in the session
+        // summary are what let "four more rings cost nothing" be checked on a real machine
+        // (docs/21 §5.22).
+        let presented_at = Instant::now();
+        let outcome = renderer.render(&state, Some(&self.annotation_doc));
+        self.metrics.record_present(presented_at.elapsed());
+        match outcome {
             Ok(()) => {
                 // The presented frame now carries the sampler's current value;
                 // clear the flag so a settled colour stops scheduling repaints.

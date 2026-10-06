@@ -33,6 +33,14 @@ fn micros(elapsed: Duration) -> u64 {
 
 #[derive(Debug, Default)]
 struct Counters {
+    /// Overlay presents (full-surface repaints) and how long each took.
+    ///
+    /// The overlay's cost model is *frames*, not rectangles: drawing four more rings is free, and
+    /// scheduling four more full-screen repaints is not (docs/21 §5.22). These counters are what
+    /// turns that claim into a number on a real machine.
+    present_count: AtomicU64,
+    present_last_us: AtomicU64,
+    present_max_us: AtomicU64,
     snapshot_refresh_count: AtomicU64,
     snapshot_refresh_last_us: AtomicU64,
     snapshot_refresh_max_us: AtomicU64,
@@ -95,6 +103,9 @@ struct Counters {
 /// A copyable reading of every counter, for assertions and one-line reports.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WindowDetectionReading {
+    pub present_count: u64,
+    pub present_last_us: u64,
+    pub present_max_us: u64,
     pub snapshot_refresh_count: u64,
     pub snapshot_refresh_last_us: u64,
     pub snapshot_refresh_max_us: u64,
@@ -206,6 +217,19 @@ impl WindowDetectionMetrics {
     }
 
     /// A worker completed a snapshot refresh and produced `candidates` windows.
+    /// Record one overlay present (a full-surface repaint) and how long it took.
+    ///
+    /// Called by the overlay around `renderer.render(...)`, so the number covers the paint *and* the
+    /// present — the one to look at when wondering whether drawing more rings costs anything.
+    pub fn record_present(&self, elapsed: Duration) {
+        record_timing(
+            &self.counters.present_count,
+            &self.counters.present_last_us,
+            &self.counters.present_max_us,
+            elapsed,
+        );
+    }
+
     pub fn record_snapshot_refresh(&self, elapsed: Duration, candidates: usize) {
         record_timing(
             &self.counters.snapshot_refresh_count,
@@ -450,6 +474,9 @@ impl WindowDetectionMetrics {
         let counters = &self.counters;
         let load = |value: &AtomicU64| value.load(Ordering::Relaxed);
         WindowDetectionReading {
+            present_count: load(&counters.present_count),
+            present_last_us: load(&counters.present_last_us),
+            present_max_us: load(&counters.present_max_us),
             snapshot_refresh_count: load(&counters.snapshot_refresh_count),
             snapshot_refresh_last_us: load(&counters.snapshot_refresh_last_us),
             snapshot_refresh_max_us: load(&counters.snapshot_refresh_max_us),
@@ -506,7 +533,8 @@ impl WindowDetectionMetrics {
     pub fn summary_line(&self) -> String {
         let reading = self.reading();
         format!(
-            "window_snapshot_refresh_us last={} max={} n={} \
+            "present={} present_us last={} max={} \
+             window_snapshot_refresh_us last={} max={} n={} \
              window_snapshot_release_us last={} max={} n={} \
              window_hit_test_us last={} max={} n={} \
              window_nearest_target_us last={} max={} n={} \
@@ -527,6 +555,9 @@ impl WindowDetectionMetrics {
              refinement_follow_ups={} \
              refinement_precision_adopted={} refinement_precision_not_finer={} \
              refinement_precision_unavailable={}",
+            reading.present_count,
+            reading.present_last_us,
+            reading.present_max_us,
             reading.snapshot_refresh_last_us,
             reading.snapshot_refresh_max_us,
             reading.snapshot_refresh_count,
@@ -629,6 +660,9 @@ impl WindowDetectionMetrics {
         }
         self.last_precision_outcome.store(0, Ordering::Relaxed);
         for counter in [
+            &counters.present_count,
+            &counters.present_last_us,
+            &counters.present_max_us,
             &counters.snapshot_refresh_count,
             &counters.snapshot_refresh_last_us,
             &counters.snapshot_refresh_max_us,
@@ -752,6 +786,10 @@ mod tests {
     #[test]
     fn the_summary_line_names_every_documented_metric() {
         let metrics = WindowDetectionMetrics::new();
+        // The overlay's present counter: the number that says whether a repaint is cheap, and the
+        // one the ring work is judged by (docs/21 §5.22).
+        metrics.record_present(Duration::from_micros(3100));
+        metrics.record_present(Duration::from_micros(1900));
         metrics.record_snapshot_refresh(Duration::from_micros(500), 42);
         metrics.record_snapshot_release(Duration::from_micros(4));
         metrics.record_hit_test(Duration::from_micros(1));
@@ -765,6 +803,8 @@ mod tests {
 
         let line = metrics.summary_line();
         for expected in [
+            "present=2",
+            "present_us last=1900 max=3100",
             "window_snapshot_refresh_us",
             "window_snapshot_release_us",
             "window_hit_test_us",
