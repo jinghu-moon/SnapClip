@@ -639,6 +639,50 @@ last precision not-finer provider=1153x22623 at (1567,-9870) type=50026
 补足，并把现成的 6 个 `optional` 夹具行（`plain-div`/`checkbox`/`radio`/`para`/`code-box`/
 `table-cell-1`）**从"打印"改成"断言 `self`"** 作为门禁。Explorer 12/25 与延迟需要同时回归。
 
+### 5.12 浏览器扩展路线：`refer/smart-screenshot-main` 的实现（2026-10-06，源码调研）
+
+用户提供的第二个参照物是 Chrome 扩展"精准截图"（MV3，`host_permissions: <all_urls>` +
+全站 content script）。它的"智能识别页面元素边界"核心只有三行（`content/content.js`）：
+
+```js
+// handleInspectorMouseMove (content.js:4209)
+this.eventBlocker.style.setProperty('pointer-events', 'none', 'important');   // ① 临时让遮罩对命中测试透明
+const element = document.elementFromPoint(e.clientX, e.clientY);              // ② 浏览器自己的 DOM 命中测试
+this.eventBlocker.style.setProperty('pointer-events', 'all', 'important');    // ③ 立刻恢复
+if (element) { this.updateHighlight(element); this.currentElement = element; }
+
+// updateHighlight (content.js:4233)
+const rect = element.getBoundingClientRect();                                  // ④ 框就是元素的 border box
+this.highlightElement.style.top = `${rect.top + scrollY}px`;                   //    + 滚动量换算成绝对坐标
+```
+
+**它为什么天生精确**：`document.elementFromPoint` 就是浏览器的命中测试，返回**最内层的 DOM 元素**
+——包括 UIA 看不到的裸 `<div>`（§5.11 里我们用 MSAA 换来的那个能力，在页面内是一行 JS）。
+没有树遍历、没有回溯、没有"最内层"猜谜：一次调用就是答案。这从产品侧再次印证了 §5.10/§5.11 的结论：
+**精度差的是"在不在页面内"，不是算法。**
+
+**交互/工程细节（值得借鉴的部分）**：
+
+| 事项 | 它的做法 | 对我们的意义 |
+| --- | --- | --- |
+| 遮罩与命中测试 | 全屏 `eventBlocker`（`z-index:9998`, `pointer-events:all`）拦截页面交互；**只在查询那一瞬间**改为 `none`，随后立刻恢复 | 与我们的 `HitTestPassThrough`（只包一次 `ElementFromPoint`）是同一个纪律；它也证明了"查询瞬间穿透"不会打断页面状态 |
+| 高亮与尺寸 | 高亮 div（0.2s ease、2px 边框 + 半透明填充）+ 尺寸标签 `W × H`，靠顶部时标签翻到下方 | 纯 UX，可直接抄 |
+| 连续模式 | `isInspectMode` 跨多次截图保持；`Enter` 确认、`Esc` 退出、滚动时按 `currentElement` 重新定位 | 我们已有类似状态（hover/preview），可对齐交互 |
+| 磁性吸附 | `getElementsNearPoint`：`querySelectorAll('*')` 扫全部元素，过滤 `display:none/visibility:hidden/opacity:0` 与 <10px 的，收集 left/right/centerX 与 top/bottom/centerY，**每轴只留最近 3 条**，阈值 8px、强度 0.5，边缘缓存 200ms | 只有"在页面内"才做得到（原生工具枚举不了页面元素）；可抄的是"可见性与最小尺寸过滤 + 每轴取最近 3 条"这个降噪策略 |
+| 长截图滚动容器 | `findScrollableContainer`：用 `document.elementsFromPoint`（**复数**，返回整条元素链）从中心点向上找第一个 `overflow-y: auto/scroll/overlay` 且 `scrollHeight > clientHeight + 10` 的元素 | 我们做滚动捕获时需要同样的"内层滚动容器"判定（见 docs/19） |
+| 截图本身 | `chrome.tabs.captureVisibleTab`（**只有可见视口**）+ 后台按 `dpr` 裁剪；超视口靠滚动拼图 | 这是扩展路线的硬约束：要么只能截视口，要么自己做拼图（它的 `.specstory` 里 "截图保存区域偏差"、"长截图滚动问题" 两份记录合计 10 万字符，全是坐标/滚动踩坑） |
+
+**它的局限（源码里查不到处理）**：整个仓库没有任何 `shadowRoot` / `contentWindow` / `composedPath`，
+也就是说 `elementFromPoint` 只会给出 `<iframe>` 或 shadow **宿主**本身，进不去里面；跨域 iframe 更是
+只能选到那一块。另外它必须装扩展、要 `<all_urls>` 权限，浏览器商店审核/用户信任都是成本。
+
+**对 SnapClip 的结论**：扩展路线能拿到的"元素边界"，**MSAA 已经能在不装任何东西的前提下拿到**
+（§5.11：8/8 逐像素命中、1 ms）。两者的差别在于**扩展能拿到 DOM 语义**（
+`getBoundingClientRect` 之外的属性、跨 iframe、整页盒表、`elementsFromPoint` 的完整链），而 MSAA 只能
+拿到"盒子 + 角色 + 名字"。所以：**先做 MSAA（零安装、零权限、覆盖所有 Chromium 浏览器）；
+只有当产品真的需要 DOM 语义时，才考虑扩展**——那时 §5.12 的这些实现细节（遮罩瞬间穿透、尺寸标签、
+连续模式、可见性过滤）可以直接复用。
+
 ---
 
 ## 6. 实测踩坑清单（每条都花了时间，务必先读）
