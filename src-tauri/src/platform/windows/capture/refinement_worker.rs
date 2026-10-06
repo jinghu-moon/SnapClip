@@ -52,9 +52,9 @@ struct FallbackDeepSelection {
 }
 
 impl FallbackDeepSelection {
-    fn new(metrics: WindowDetectionMetrics) -> Self {
+    fn new(metrics: WindowDetectionMetrics, overlay: Option<isize>) -> Self {
         Self {
-            uia: UiaDeepSelectionProvider::new(metrics.clone()),
+            uia: UiaDeepSelectionProvider::new(metrics.clone()).with_excluded_window(overlay),
             msaa: MsaaDeepSelectionProvider::new(metrics),
         }
     }
@@ -141,7 +141,9 @@ impl RefinementWorker {
     ///
     /// If UI Automation is unavailable the provider reports `Unsupported` per query and the
     /// overlay keeps the v1 whole-window frame.
-    pub fn new(notify_thread: u32, metrics: WindowDetectionMetrics) -> Self {
+    /// `overlay` is the capture overlay window: the UIA point hit test has to be taken with it hidden
+    /// (docs/21 §5.7), and `None` is correct in tests, where nothing of ours covers the desktop.
+    pub fn new(notify_thread: u32, overlay: Option<isize>, metrics: WindowDetectionMetrics) -> Self {
         let provider_metrics = metrics.clone();
         Self::with_provider(
             notify_thread,
@@ -149,7 +151,7 @@ impl RefinementWorker {
             // The provider logs its per-level forensics through the same verbose gate as the
             // rest of window detection, so it is built on the refinement thread with the
             // shared metrics handle (docs/18 §12.7).
-            Box::new(move || Box::new(FallbackDeepSelection::new(provider_metrics))),
+            Box::new(move || Box::new(FallbackDeepSelection::new(provider_metrics, overlay))),
         )
     }
 
@@ -571,7 +573,7 @@ mod tests {
 
     #[test]
     fn a_window_neither_provider_can_resolve_never_invents_geometry() {
-        let worker = RefinementWorker::new(candidate_thread(), WindowDetectionMetrics::new());
+        let worker = RefinementWorker::new(candidate_thread(), None, WindowDetectionMetrics::new());
         // A fabricated handle: no accessibility tree can be attributed to it. UIA reports
         // `Unsupported`, the MSAA fallback is asked next and reports a provider failure; the
         // point is that neither ever invents a rectangle, so the overlay keeps the v1 frame.
@@ -652,7 +654,7 @@ mod tests {
 
     #[test]
     fn shutdown_is_idempotent_and_leaves_no_thread() {
-        let mut worker = RefinementWorker::new(candidate_thread(), WindowDetectionMetrics::new());
+        let mut worker = RefinementWorker::new(candidate_thread(), None, WindowDetectionMetrics::new());
         worker.shutdown();
         worker.shutdown();
         // A request after shutdown is never executed and never blocks.

@@ -24,8 +24,8 @@ use ::windows::Win32::Graphics::Gdi::ScreenToClient;
 use ::windows::Win32::UI::WindowsAndMessaging::{
     CWP_SKIPINVISIBLE, ChildWindowFromPointEx, EnumChildWindows, EnumWindows,
     GA_PARENT, GWL_EXSTYLE, GetAncestor, GetClassNameW, GetDesktopWindow, GetWindowLongPtrW, GetWindowRect,
-    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, WINDOW_EX_STYLE, WS_EX_LAYERED,
-    WS_EX_TRANSPARENT,
+    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, SetWindowLongPtrW,
+    WINDOW_EX_STYLE, WS_EX_LAYERED, WS_EX_TRANSPARENT,
 };
 
 use crate::capture::geometry::{Point, Rect};
@@ -44,6 +44,52 @@ const CLASS_NAME_CAPACITY: usize = 256;
 /// (`0x0a08_00a8`), which is both bits plus more.
 pub fn is_click_through_layered(extended_style: u32) -> bool {
     WINDOW_EX_STYLE(extended_style).contains(WS_EX_LAYERED | WS_EX_TRANSPARENT)
+}
+
+/// Temporarily makes `window` transparent to hit testing, restoring the style on drop.
+///
+/// UIA's point hit test has no notion of Z order: with the capture overlay covering the desktop it
+/// would answer "the overlay" for every point, never the application underneath. The reference
+/// selector (`ScreenSnap-master/core/window_uia.py`, `set_click_through`) solves it the same way and
+/// restores the style immediately afterwards. Safe here because a refinement query only runs once the
+/// cursor has been still for 80 ms, and the overlay hides itself for the duration of that query.
+pub struct ClickThroughGuard {
+    window: isize,
+    previous: isize,
+    active: bool,
+}
+
+impl ClickThroughGuard {
+    /// `window` is the overlay to hide from hit testing; `None` when there is nothing to hide.
+    pub fn new(window: Option<isize>) -> Self {
+        let Some(window) = window.filter(|window| is_window(*window)) else {
+            return Self {
+                window: 0,
+                previous: 0,
+                active: false,
+            };
+        };
+        let previous = unsafe { GetWindowLongPtrW(HWND(window as *mut _), GWL_EXSTYLE) };
+        let transparent = previous | WS_EX_TRANSPARENT.0 as isize;
+        // Applied on the thread that owns the window when possible (the overlay does that before it
+        // submits a job); this is the safety net for callers that do not manage an overlay.
+        unsafe { SetWindowLongPtrW(HWND(window as *mut _), GWL_EXSTYLE, transparent) };
+        Self {
+            window,
+            previous,
+            active: true,
+        }
+    }
+}
+
+impl Drop for ClickThroughGuard {
+    fn drop(&mut self) {
+        if self.active {
+            unsafe {
+                SetWindowLongPtrW(HWND(self.window as *mut _), GWL_EXSTYLE, self.previous);
+            }
+        }
+    }
 }
 
 /// `IsWindow`.
@@ -465,6 +511,43 @@ mod tests {
         assert!(is_click_through_layered(0x0a08_00a8));
         // Tool window / no-activate are not click-through.
         assert!(!is_click_through_layered((WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE).0));
+    }
+
+    /// The hit-through guard must be invisible to everything but the query it wraps: it sets
+    /// `WS_EX_TRANSPARENT` for one point hit test and puts the style back on drop, whatever it
+    /// found. A leaked style would leave the capture overlay out of the hit test for the rest of
+    /// the session, so the restore is the part worth asserting.
+    #[test]
+    fn the_click_through_guard_restores_the_style_it_found() {
+        if !desktop_available() {
+            eprintln!("skipping: no interactive window station available");
+            return;
+        }
+        let Some(fixture) = TestWindow::create(WINDOW_EX_STYLE(0), WS_POPUP | WS_VISIBLE) else {
+            eprintln!("skipping: the fixture window could not be created");
+            return;
+        };
+        let handle = fixture.handle();
+        let style = |handle: isize| unsafe { GetWindowLongPtrW(HWND(handle as *mut _), GWL_EXSTYLE) };
+        let before = style(handle);
+        assert_eq!(
+            before & WS_EX_TRANSPARENT.0 as isize,
+            0,
+            "the fixture must start out interactive"
+        );
+        {
+            let _guard = ClickThroughGuard::new(Some(handle));
+            assert_ne!(
+                style(handle) & WS_EX_TRANSPARENT.0 as isize,
+                0,
+                "the guard hides the window from the hit test while it is alive"
+            );
+        }
+        assert_eq!(style(handle), before, "the guard puts the style back on drop");
+        // Nothing to hide, and a handle that is not a window: no-ops rather than panics.
+        let _ = ClickThroughGuard::new(None);
+        let _ = ClickThroughGuard::new(Some(0xDEAD_BEEF));
+        assert_eq!(style(handle), before);
     }
 
     #[test]

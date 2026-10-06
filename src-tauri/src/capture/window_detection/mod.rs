@@ -69,7 +69,7 @@ pub use transition::{
 };
 pub use uia::{
     MAX_DEPTH, MAX_NODES, MAX_PATH_LEN, WalkBudget, WalkNode, WalkOutcome, is_descendable,
-    is_text_run_inside_element,
+    is_text_run_inside_element, should_adopt_provider_box,
 };
 
 /// Cursor rest time before an automatic-snap preview may appear (docs/14 §4.1).

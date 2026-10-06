@@ -164,6 +164,29 @@ pub fn is_text_run_inside_element(parent: WalkNode, child: WalkNode) -> bool {
         && matches!(parent.control_type, PANE_CONTROL_TYPE | GROUP_CONTROL_TYPE)
 }
 
+/// Whether the provider's own point hit test should replace the walk's answer (docs/21 §5.7).
+///
+/// The accessibility provider answers a point query with the **innermost** element there by
+/// construction, which makes it the yardstick for "did our walk stop above the innermost capturable
+/// box?". Adopting it is a strict refinement — the caller only passes a hit that belongs to the same
+/// window and still contains the point — so the rule is simply "adopt it when it is finer".
+///
+/// A bare `Text` run is not adopted: publishing the glyphs inside a control instead of the control is
+/// a product decision (docs/21 §5.6 A), not a precision win. An equal or larger box is not adopted
+/// either: the walk's answer already reflects stacking order and the backtracking rules, which a raw
+/// hit box knows nothing about.
+pub fn should_adopt_provider_box(
+    walk: Rect,
+    hit: Rect,
+    hit_control_type: i32,
+    point: Point,
+) -> bool {
+    !hit.is_empty()
+        && hit.contains(point)
+        && hit_control_type != TEXT_CONTROL_TYPE
+        && hit.area() < walk.area()
+}
+
 /// Result of a bounded walk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalkOutcome {
@@ -389,6 +412,31 @@ mod tests {
         assert!(!is_text_run_inside_element(
             with(50005),
             WalkNode::new(text, 50006, false, true)
+        ));
+    }
+
+    #[test]
+    fn the_providers_finer_box_is_adopted_unless_it_is_a_text_run() {
+        let point = Point::new(150, 150);
+        let walk = rect(100, 100, 400, 300);
+        let finer = rect(120, 120, 260, 200);
+        // A strictly finer box that still covers the cursor is a precision win.
+        assert!(should_adopt_provider_box(walk, finer, 50033, point));
+        // …unless it is the glyph run inside the element (a product decision, not precision).
+        assert!(!should_adopt_provider_box(walk, finer, TEXT_CONTROL_TYPE, point));
+        // An equal, larger or off-point answer must never replace the walk's own answer.
+        assert!(!should_adopt_provider_box(walk, walk, 50033, point));
+        assert!(!should_adopt_provider_box(
+            walk,
+            rect(50, 50, 900, 900),
+            50033,
+            point
+        ));
+        assert!(!should_adopt_provider_box(
+            walk,
+            rect(500, 500, 900, 900),
+            50033,
+            point
         ));
     }
 

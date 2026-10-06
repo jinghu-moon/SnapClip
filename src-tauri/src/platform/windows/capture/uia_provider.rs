@@ -17,9 +17,9 @@ use ::windows::Win32::System::Com::{
 };
 use ::windows::core::Interface;
 use ::windows::Win32::UI::Accessibility::{
-    CUIAutomation, IUIAutomation, IUIAutomationCacheRequest, IUIAutomationElement, TreeScope_Children,
-    UIA_BoundingRectanglePropertyId, UIA_ControlTypePropertyId, UIA_IsOffscreenPropertyId,
-    UIA_NativeWindowHandlePropertyId,
+    CUIAutomation, IUIAutomation, IUIAutomationCacheRequest, IUIAutomationElement, TreeScope,
+    TreeScope_Children, TreeScope_Element, UIA_BoundingRectanglePropertyId,
+    UIA_ControlTypePropertyId, UIA_IsOffscreenPropertyId, UIA_NativeWindowHandlePropertyId,
 };
 
 use crate::capture::geometry::{Point, Rect};
@@ -31,7 +31,7 @@ use crate::capture::window_detection::deep::{
 use crate::capture::window_detection::model::{SnapshotEpoch, TargetKind};
 use crate::capture::window_detection::uia::{
     WalkBudget, WalkNode, WalkOutcome, fallback_hit_path, is_descendable, is_structural_wrapper,
-    is_text_run_inside_element, merge_hit_paths,
+    is_text_run_inside_element, merge_hit_paths, should_adopt_provider_box,
 };
 
 use super::win::window as win32;
@@ -61,6 +61,9 @@ pub struct UiaDeepSelectionProvider {
     /// Level counter for one query, so the forensics can tell a same-bounds *chain* apart from
     /// a walk that is spinning on one node (docs/18 §12.7).
     level: u32,
+    /// The capture overlay, hidden from hit testing while a point hit test runs (docs/21 §5.7).
+    /// `None` in tests and probes, where nothing of ours covers the desktop.
+    excluded_window: Option<isize>,
 }
 
 /// How many children a level offered and why the others were dropped.
@@ -119,6 +122,7 @@ impl UiaDeepSelectionProvider {
             quarantined: HashSet::new(),
             metrics,
             level: 0,
+            excluded_window: None,
         }
     }
 
@@ -151,7 +155,12 @@ impl UiaDeepSelectionProvider {
                     .and_then(|()| request.AddProperty(UIA_ControlTypePropertyId))
                     .and_then(|()| request.AddProperty(UIA_IsOffscreenPropertyId))
                     .and_then(|()| request.AddProperty(UIA_NativeWindowHandlePropertyId))
-                    .and_then(|()| request.SetTreeScope(TreeScope_Children))
+                    // `Element` **and** `Children`, as the reference selector does: with `Children`
+                    // alone the element a request is applied to has no cached properties of its own,
+                    // so the point hit test (docs/21 §5.7) would read no rectangle for it.
+                    .and_then(|()| {
+                        request.SetTreeScope(TreeScope(TreeScope_Element.0 | TreeScope_Children.0))
+                    })
             };
             if configured.is_err() {
                 return None;
@@ -358,6 +367,57 @@ impl UiaDeepSelectionProvider {
         );
     }
 
+    /// What the provider's own point hit test answers for `point`, when it belongs to `hwnd`.
+    ///
+    /// The accessibility provider answers a point query with the **innermost** element there, which
+    /// is exactly the "最内层可捕获区域" the product defines as the target — so this is both the
+    /// yardstick and, when our walk stopped above it, a strictly finer answer we can adopt
+    /// (docs/21 §5.7). Ownership is proved by walking up to the window's root element
+    /// (`CompareElements`): a point hit test asks the desktop, so it could otherwise answer for
+    /// whatever window happens to be on top. `NativeWindowHandle` alone is not enough — Chromium
+    /// exposes it only on its outermost nodes (measured: 69 of 69 hits rejected when it was required).
+    ///
+    /// The capture overlay covers the desktop and would answer every query itself, so it is hidden
+    /// from hit testing for the duration of the call.
+    fn provider_hit(&mut self, hwnd: isize, point: Point) -> Option<(Rect, i32)> {
+        let automation = self.automation()?.clone();
+        let root =
+            unsafe { automation.ElementFromHandle(HWND(hwnd as *mut core::ffi::c_void)) }.ok()?;
+        let _guard = win32::ClickThroughGuard::new(self.excluded_window);
+        let hit = unsafe {
+            automation.ElementFromPoint(::windows::Win32::Foundation::POINT {
+                x: point.x,
+                y: point.y,
+            })
+        }
+        .ok()?;
+        let bounds = to_rect(unsafe { hit.CurrentBoundingRectangle() }.ok()?);
+        if bounds.is_empty() || !bounds.contains(point) {
+            return None;
+        }
+        let walker = unsafe { automation.ControlViewWalker() }.ok()?;
+        let mut current = hit.clone();
+        for _ in 0..32 {
+            if unsafe { automation.CompareElements(&current, &root) }
+                .map(|equal| equal.as_bool())
+                .unwrap_or(false)
+            {
+                let kind = unsafe { hit.CurrentControlType() }
+                    .map(|kind| kind.0)
+                    .unwrap_or(0);
+                return Some((bounds, kind));
+            }
+            current = unsafe { walker.GetParentElement(&current) }.ok()?;
+        }
+        None
+    }
+
+    /// Whether the overlay must be hidden from hit testing while a query runs (docs/21 §5.7).
+    pub fn with_excluded_window(mut self, overlay: Option<isize>) -> Self {
+        self.excluded_window = overlay;
+        self
+    }
+
     /// Number of expanded levels held for the current generation (diagnostics and tests).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn cached_levels(&self) -> usize {
@@ -554,6 +614,28 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
         let merged = merge_hit_paths(&outcome.path, &fallback, window_bounds, job.point);
         outcome.path = merged;
         outcome.target = outcome.path.last().copied().unwrap_or(window_bounds);
+
+        // **Precision top-up** (docs/21 §5.7). The provider answers a point query with the innermost
+        // element there by construction; when our walk stopped above it, adopt that box. The rule is
+        // a strict refinement — the hit must belong to this window (checked inside `provider_hit`) and
+        // still contain the cursor — so it can only make the answer finer. Measured before it: the
+        // browser fixtures had 4 of 43 sampling points where the provider was finer, File Explorer
+        // none out of 25 (so Explorer is provably unaffected).
+        if let Some((hit, hit_kind)) = self.provider_hit(job.window.hwnd, job.point)
+            && should_adopt_provider_box(outcome.target, hit, hit_kind, job.point)
+        {
+            if outcome.push(hit) {
+                outcome.target = hit;
+                self.metrics.log_line(
+                    &format!(
+                        "refinement adopted provider box=({},{})->({},{}) type={hit_kind} \
+                         (walk was coarser)",
+                        hit.left, hit.top, hit.right, hit.bottom
+                    ),
+                    false,
+                );
+            }
+        }
         RefinementOutcome::Target(Box::new(finish(outcome, job)))
     }
 
@@ -773,7 +855,7 @@ mod tests {
                 "the fixture must be resolvable before the pipeline is exercised, got {outcome:?}"
             );
         }
-        let worker = RefinementWorker::new(0, metrics);
+        let worker = RefinementWorker::new(0, None, metrics);
         let mut scheduler = RefinementScheduler::new();
 
         for (session, epoch) in [(1u32, 1u64), (2, 2)] {
@@ -1102,6 +1184,7 @@ mod tests {
         metrics.set_verbose(true);
         let mut provider = UiaDeepSelectionProvider::new(metrics);
         let walk = provider.automation().cloned().and_then(|auto| RawWalk::new(&auto));
+        let hit_owner = provider.automation().cloned();
         // Fixture coordinates are viewport-relative, so the page origin — not the browser's
         // client origin — is what they are relative to. Retried, because the tree can still be
         // filling in while the window has already settled.
@@ -1128,6 +1211,11 @@ mod tests {
         // Per-query latency of the **product** walk (backtracking, hollow look-through and the
         // child-window check all run here). The refinement budget is 1500 ms per query.
         let mut latencies: Vec<f64> = Vec::new();
+        // Precision yardstick: how often the provider's own point hit test answers with a strictly
+        // smaller box that still contains the point — a place our walk stopped above the innermost
+        // capturable element.
+        let mut provider_available = 0_usize;
+        let mut provider_finer = 0_usize;
         let mut failures = Vec::new();
         let mut layout_drift = Vec::new();
         for fixture in &manifest {
@@ -1211,6 +1299,30 @@ mod tests {
                 }
             }
             retries += attempts.saturating_sub(1);
+            if let Some((hit_bounds, hit_kind)) =
+                hit_owner.as_ref().and_then(|automation| provider_hit_box(automation, hwnd, point))
+            {
+                provider_available += 1;
+                let published_area = published
+                    .map(|rect| i64::from(rect.width()) * i64::from(rect.height()))
+                    .unwrap_or(i64::MAX);
+                let hit_area = i64::from(hit_bounds.width()) * i64::from(hit_bounds.height());
+                if hit_area < published_area {
+                    provider_finer += 1;
+                    println!(
+                        "[probe]   provider is finer on {}: {}x{} at ({},{}) type={hit_kind} \
+                         (walk {})",
+                        fixture.id,
+                        hit_bounds.width(),
+                        hit_bounds.height(),
+                        hit_bounds.left,
+                        hit_bounds.top,
+                        published
+                            .map(|rect| format!("{}x{}", rect.width(), rect.height()))
+                            .unwrap_or_else(|| "none".into())
+                    );
+                }
+            }
             let expected = match fixture.expect.as_str() {
                 "none" => None,
                 "self" | "inside_self" | "covers_self" => Some((fixture.id.as_str(), own)),
@@ -1309,6 +1421,10 @@ mod tests {
         println!(
             "[probe] asserted={asserted} passed={passed} failed={} slow_fixtures={retries}",
             asserted - passed,
+        );
+        println!(
+            "[probe] precision: provider_hit_available={provider_available} \
+             provider_hit_is_finer_on={provider_finer}"
         );
         print_latency_summary("probe", &mut latencies);
         for failure in &failures {
@@ -1418,7 +1534,49 @@ mod tests {
     }
 
     /// n / p50 / p95 / max of the product walk's per-query latency, in milliseconds.
-    ///
+    /// What the **provider itself** says is under `point`, when the answer belongs to `hwnd`.
+   ///
+    /// This is the yardstick for "how precise is our walk?": the accessibility provider's own point
+    /// hit test answers with the innermost element at that point by construction, and it is what the
+    /// reference selector (`ScreenSnap-master/core/window_uia.py`) uses as its starting candidate.
+    /// Ownership is proved by walking up to the window's root element, exactly as `docs/21 §5.3`
+    /// describes — a point hit test asks the desktop, so it must be verified.
+    fn provider_hit_box(
+        automation: &IUIAutomation,
+        hwnd: isize,
+        point: Point,
+    ) -> Option<(Rect, i32)> {
+        let root =
+            unsafe { automation.ElementFromHandle(HWND(hwnd as *mut core::ffi::c_void)) }.ok()?;
+        let hit = unsafe {
+            automation.ElementFromPoint(::windows::Win32::Foundation::POINT {
+                x: point.x,
+                y: point.y,
+            })
+        }
+        .ok()?;
+        let bounds = to_rect(unsafe { hit.CurrentBoundingRectangle() }.ok()?);
+        if bounds.is_empty() || !bounds.contains(point) {
+            return None;
+        }
+        let walker = unsafe { automation.ControlViewWalker() }.ok()?;
+        let mut current = hit.clone();
+        for _ in 0..32 {
+            if unsafe { automation.CompareElements(&current, &root) }
+                .map(|equal| equal.as_bool())
+                .unwrap_or(false)
+            {
+                let kind = unsafe { hit.CurrentControlType() }
+                    .map(|kind| kind.0)
+                    .unwrap_or(0);
+                return Some((bounds, kind));
+            }
+            current = unsafe { walker.GetParentElement(&current) }.ok()?;
+        }
+        None
+    }
+
+    /// n / p50 / p95 / max of the product walk's per-query latency, in milliseconds.
     /// The correctness gates say nothing about cost, and the walk grew (backtracking, look-through,
     /// a `ChildWindowFromPointEx` per window-backed candidate), so every probe reports it: the
     /// refinement budget is 1500 ms per query, and a regression here is as real as a wrong box.
@@ -1518,11 +1676,31 @@ mod tests {
             return;
         };
         println!("[explorer] hwnd={hwnd} frame={frame:?} client={client:?}");
+        // Raised so the provider's hit test can see this window at all: a covered window is never
+        // answered by `ElementFromPoint`, which would make the precision comparison below vacuous.
+        unsafe {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowPos,
+            };
+            SetWindowPos(
+                hwnd as *mut core::ffi::c_void,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_SHOWWINDOW | SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+        pump(400);
 
         let mut provider = UiaDeepSelectionProvider::new(WindowDetectionMetrics::new());
         let window_area = i64::from(client.width()) * i64::from(client.height());
         let mut areas = Vec::new();
         let mut latencies: Vec<f64> = Vec::new();
+        let automation = provider.automation().cloned();
+        let mut provider_finer = 0_usize;
+        let mut provider_available = 0_usize;
         for fy in [30_i32, 40, 50, 60, 70] {
             for fx in [45_i32, 55, 65, 75, 85] {
                 let point = Point::new(
@@ -1546,6 +1724,27 @@ mod tests {
                 };
                 let area = i64::from(rect.width()) * i64::from(rect.height());
                 areas.push(area);
+                // Precision yardstick: what the provider's own hit test answers. A hit box that is
+                // strictly smaller but still contains the point is a place our walk stopped above
+                // the innermost capturable box.
+                let hit = automation.as_ref().and_then(|automation| {
+                    provider_hit_box(automation, hwnd, point)
+                });
+                if hit.is_some() {
+                    provider_available += 1;
+                }
+                if let Some((hit_bounds, hit_kind)) = hit
+                    && i64::from(hit_bounds.width()) * i64::from(hit_bounds.height()) < area
+                {
+                    provider_finer += 1;
+                    println!(
+                        "[explorer]   provider is finer: {}x{} at ({},{}) type={hit_kind}",
+                        hit_bounds.width(),
+                        hit_bounds.height(),
+                        hit_bounds.left,
+                        hit_bounds.top
+                    );
+                }
                 println!(
                     "[explorer] point=({:>5},{:>5}) depth={:>2} box={}x{} at ({},{}) area_pct={:.1} \
                      reason={reason:?}",
@@ -1571,6 +1770,11 @@ mod tests {
              (a coarser rule raises the median and lowers the count)",
             (median as f64) * 100.0 / (window_area.max(1) as f64),
             control_level,
+            areas.len()
+        );
+        println!(
+            "[explorer] precision: provider_hit_available={provider_available}/{} \
+             provider_hit_is_finer_on={provider_finer}",
             areas.len()
         );
         print_latency_summary("explorer", &mut latencies);
