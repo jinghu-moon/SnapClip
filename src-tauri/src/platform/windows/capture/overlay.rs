@@ -165,6 +165,17 @@ impl OverlayCommand {
     }
 }
 
+/// A one-shot hint that has been armed and is waiting for its deadline (docs/21 §5.21).
+///
+/// The **text is stored, not recomputed**: what gets painted has to be the sentence that was
+/// armed. Recomputing it from live state would let a hint change under the user's eyes (a counter
+/// that keeps ticking while the user has stopped walking), and the reading would no longer match
+/// the moment it was shown for.
+struct ArmedHint {
+    until: Instant,
+    text: String,
+}
+
 /// Cross-thread state shared between [`WindowsOverlay`] and the overlay thread.
 #[derive(Debug)]
 struct OverlayShared {
@@ -439,9 +450,17 @@ where
     /// Which level of `deep_target`'s chain the user walked to (docs/21 §5.17). `None` means the
     /// published box itself, which is what every session starts with.
     deep_levels: Option<LevelChain>,
-    /// Until when the one-shot hint ("the wheel walks the levels") is worth drawing (docs/21 §5.21).
-    /// Armed when a session starts and dropped the moment the user uses it or clicks.
-    hint_until: Option<Instant>,
+    /// The one-shot hint currently armed, if any (docs/21 §5.21).
+    ///
+    /// Two different sentences use this slot: the affordance ("the wheel walks the levels"),
+    /// armed when the session starts, and the explanation of the counter, armed the first time
+    /// the user actually walks a level. Either way it is dropped on a press.
+    hint: Option<ArmedHint>,
+    /// Whether this session has already explained the level counter (docs/21 §5.21).
+    ///
+    /// Once per session: the sentence belongs to the moment the number appears, and a user who
+    /// keeps walking does not need it again — the label carries the numbers from then on.
+    hint_taught: bool,
     /// A shallower target waiting for its confirming dwell (docs/18 §13.3).
     ///
     /// A cursor merely passing through a parent container produces one such result; displaying
@@ -566,7 +585,8 @@ where
             refinement,
             deep_target: None,
             deep_levels: None,
-            hint_until: None,
+            hint: None,
+            hint_taught: false,
             pending_downgrade: None,
             refinement_pending: None,
             hit_test_pass_through,
@@ -994,7 +1014,8 @@ where
         self.refine.reset();
         self.deep_target = None;
         self.deep_levels = None;
-        self.hint_until = None;
+        self.hint = None;
+        self.hint_taught = false;
         self.pending_downgrade = None;
         self.refinement_pending = None;
         self.disarm_refinement();
@@ -1333,10 +1354,10 @@ where
         self.refinement.retire();
         self.snapshot.release();
         self.request_snapshot_refresh();
-        // Arm the one-shot hint for this session: the first few seconds are when a user who does
-        // not know about the level walk is most likely to be looking at the highlight and
-        // wondering whether it can be changed (docs/21 §5.21).
-        self.hint_until = Some(Instant::now() + Duration::from_millis(LEVEL_HINT_MS));
+        // Arm the *affordance* hint for this session (docs/21 §5.21). The explanation of the
+        // counter is a different sentence, and it is armed later, by the first level walk.
+        self.hint_taught = false;
+        self.arm_hint(LEVEL_HINT.to_owned(), LEVEL_HINT_MS);
     }
 
     /// Ask the detection worker for a new snapshot. Only the newest request is kept.
@@ -1419,11 +1440,36 @@ where
 
     /// The one-shot hint, while it is still worth drawing (docs/21 §5.21).
     fn hint_text(&self) -> Option<(Point, String)> {
-        let until = self.hint_until?;
-        if Instant::now() >= until || self.session.state() != CaptureState::Selecting {
+        let hint = self.hint.as_ref()?;
+        if Instant::now() >= hint.until || self.session.state() != CaptureState::Selecting {
             return None;
         }
-        Some((self.cursor, LEVEL_HINT.to_owned()))
+        Some((self.cursor, hint.text.clone()))
+    }
+
+    /// Arm a one-shot hint, replacing whatever was showing (docs/21 §5.21).
+    fn arm_hint(&mut self, text: String, millis: u64) {
+        self.hint = Some(ArmedHint {
+            until: Instant::now() + Duration::from_millis(millis),
+            text,
+        });
+    }
+
+    /// Explain the level counter the first time it appears (docs/21 §5.21).
+    ///
+    /// The number is meaningless on its own — `8/9` could be a zoom, a page, a colour channel —
+    /// and the one fact nobody can guess is which end is the window. So the sentence arrives with
+    /// the counter, at the moment the user's own wheel made it appear, instead of three seconds
+    /// earlier when it would have been about something that had not happened yet.
+    fn arm_level_hint(&mut self) {
+        if self.hint_taught {
+            return;
+        }
+        let Some(chain) = self.deep_levels.filter(|chain| !chain.is_empty()) else {
+            return;
+        };
+        self.hint_taught = true;
+        self.arm_hint(level_hint(chain.index() + 1, chain.len()), LEVEL_HINT_MS);
     }
 
     /// Step the deep-selection level: `-1` toward the window frame, `+1` toward the published box.
@@ -1447,9 +1493,9 @@ where
             chain.deeper()
         };
         if moved {
-            // The user has found the walk; the hint has done its job and would only be noise
-            // over the rectangle it is explaining (docs/21 §5.21).
-            self.hint_until = None;
+            // The first successful walk is where the counter appears, so that is where it gets
+            // explained (docs/21 §5.21).
+            self.arm_level_hint();
             self.refresh_preview_for_cursor();
             self.invalidate();
         }
@@ -2294,7 +2340,7 @@ where
             return;
         }
         // A press is the user taking over; the hint must not sit next to the result (docs/21 §5.21).
-        self.hint_until = None;
+        self.hint = None;
         let point = Point::new(client.x, client.y);
         // Ask what the press *would* do, then record the gesture. Neither step changes the
         // selection (docs/14 §4.2).
@@ -3083,34 +3129,49 @@ fn describe_rect(rect: Rect) -> String {
 /// indistinguishable from a wheel that does nothing.
 const LEVEL_HINT: &str = "滚轮 / ↑↓ 换吸附层级";
 
-/// How long the one-shot hint stays on screen.
+/// How long a one-shot hint stays on screen.
 const LEVEL_HINT_MS: u64 = 2600;
+
+/// The sentence that explains the level counter, shown the first time it appears (docs/21 §5.21).
+///
+/// It has to answer two things a bare `8/9` cannot: what the numbers count, and which end is
+/// which. `1=窗口` is the part nobody can guess, and it is what makes "the box is a container"
+/// legible the next time the wheel is used.
+fn level_hint(level: usize, total: usize) -> String {
+    format!("吸附层级 {level}/{total}（1=窗口）· 滚轮 / ↑↓ 切换")
+}
 
 /// The text the automatic-snap preview's label shows (docs/21 §5.21).
 ///
 /// Pure so the format is testable. Beyond the size it carries the three things a user cannot infer
-/// from the rectangle: which level of the ancestor chain is selected (only when there is a chain to
-/// walk), that the box is the whole window rather than an element, and that nothing answered for this
-/// position — the last one as `~`, because a fallback must not look like a confident answer.
+/// from the rectangle: **what the box is** (窗口 / 容器 / 元素), which level of the ancestor chain
+/// is selected (only when there is a chain to walk, and never as a bare count), and that nothing
+/// answered for this position — the last one as `?`, because a fallback must not look like a
+/// confident answer.
 ///
-/// The counter appears only once the user has actually moved. The deepest level is the answer the
-/// refinement produced, which is the state every preview starts in, so it stays a plain size — the
-/// same reason the confirm line calls it `deepest` instead of `7/7` ([`describe_level`]).
+/// The kind word comes first because it is the question the user is actually asking ("did it snap
+/// to the thing, or to the shell around it?"), and it is the only one of the three facts that needs
+/// no explanation. `容器` is what makes a walked-up-to box self-explanatory without reading a
+/// fraction; the fraction then says how much of the chain is left.
 fn preview_label(
     rect: Rect,
     is_window: bool,
     levels: Option<LevelChain>,
     degraded: bool,
 ) -> String {
-    let mut text = format!("{}×{} px", rect.width(), rect.height());
+    let kind = if is_window {
+        "窗口"
+    } else if levels.is_some_and(|chain| !chain.is_deepest()) {
+        "容器"
+    } else {
+        "元素"
+    };
+    let mut text = format!("{}×{} px  {kind}", rect.width(), rect.height());
     if let Some(chain) = levels.filter(|chain| chain.len() > 1 && !chain.is_deepest()) {
-        text.push_str(&format!("  {}/{}", chain.index() + 1, chain.len()));
-    }
-    if is_window {
-        text.push_str("  窗口");
+        text.push_str(&format!(" {}/{}", chain.index() + 1, chain.len()));
     }
     if degraded {
-        text.push_str("  ~");
+        text.push('?');
     }
     text
 }
@@ -3395,7 +3456,7 @@ unsafe extern "system" {
 
 #[cfg(test)]
 mod tests {
-    use super::{point_from_lparam, preview_label, OverlayCommand};
+    use super::{level_hint, point_from_lparam, preview_label, OverlayCommand};
     use crate::capture::geometry::Rect;
     use crate::capture::window_detection::LevelChain;
 
@@ -3467,61 +3528,88 @@ mod tests {
         assert_eq!(OverlayCommand::from_wparam(9999), None);
     }
 
-    /// A box with no chain, no window kind and no degradation carries only its size.
+    /// The deepest answer — what every preview starts as — is named, not counted.
     #[test]
-    fn the_preview_label_is_the_size_when_there_is_nothing_else_to_say() {
+    fn the_preview_label_names_the_element_it_snapped_to() {
         let rect = Rect::new(10, 10, 410, 810);
-        assert_eq!(preview_label(rect, false, None, false), "400×800 px");
+        assert_eq!(preview_label(rect, false, None, false), "400×800 px  元素");
+        // A chain of one is not a walk: the only level is the answer itself.
+        assert_eq!(
+            preview_label(rect, false, Some(LevelChain::new(1)), false),
+            "400×800 px  元素"
+        );
     }
 
-    /// Walking the chain has to be visible: the user changed what will be captured, and the
-    /// only feedback is this label (docs/21 §5.17/§5.21).
+    /// Walking the chain has to be visible, and it has to say *what* the user walked to: the
+    /// size alone cannot distinguish "a wide element" from "the container around the element".
     #[test]
-    fn the_preview_label_counts_the_chain_level_the_user_walked_to() {
+    fn the_preview_label_calls_a_walked_to_box_a_container_and_counts_the_level() {
         let rect = Rect::new(0, 0, 100, 50);
         let mut chain = LevelChain::new(7);
         // A fresh chain is the deepest level, and "deepest" is the state the answer arrived in,
         // so it carries no counter: the counter means "you moved".
-        assert_eq!(preview_label(rect, false, Some(chain), false), "100×50 px");
+        assert_eq!(
+            preview_label(rect, false, Some(chain), false),
+            "100×50 px  元素"
+        );
         for _ in 0..4 {
             assert!(chain.shallower());
         }
         assert_eq!(chain.index(), 2);
         assert_eq!(
             preview_label(rect, false, Some(chain), false),
-            "100×50 px  3/7"
+            "100×50 px  容器 3/7"
         );
-        // …and the outermost level is the window frame itself.
+        // …and the outermost level is the window frame itself, which the overlay reports through
+        // `is_window` (it is the same box as the v1 fallback).
         assert!(chain.shallower());
         assert!(chain.shallower());
         assert!(!chain.shallower(), "index 0 is the end of the walk");
         assert_eq!(
-            preview_label(rect, false, Some(chain), false),
-            "100×50 px  1/7"
-        );
-        // A chain of one is not a walk at all.
-        assert_eq!(
-            preview_label(rect, false, Some(LevelChain::new(1)), false),
-            "100×50 px"
+            preview_label(rect, true, Some(chain), false),
+            "100×50 px  窗口 1/7"
         );
     }
 
-    /// The three extra words are independent, so "the whole window, and nothing answered for it"
-    /// is a state the label can say.
+    /// The window name and the fallback mark are independent of the counter, so "the whole
+    /// window, and nothing answered for it" is a state the label can say.
     #[test]
     fn the_preview_label_names_the_window_and_the_unsupported_fallback() {
         let rect = Rect::new(0, 0, 3840, 2088);
         assert_eq!(preview_label(rect, true, None, false), "3840×2088 px  窗口");
         assert_eq!(
             preview_label(rect, false, None, true),
-            "3840×2088 px  ~",
+            "3840×2088 px  元素?",
             "a fallback must not look like a confident answer"
         );
+        assert_eq!(preview_label(rect, true, None, true), "3840×2088 px  窗口?");
         let mut chain = LevelChain::new(4);
         assert!(chain.shallower());
         assert_eq!(
-            preview_label(rect, true, Some(chain), true),
-            "3840×2088 px  3/4  窗口  ~"
+            preview_label(rect, false, Some(chain), true),
+            "3840×2088 px  容器 3/4?"
+        );
+    }
+
+    /// The sentence that teaches the counter, the label, and the `level=` the confirm line prints
+    /// all have to agree on one numbering — that is the whole point of showing three of them.
+    #[test]
+    fn the_level_hint_counts_the_way_the_confirm_line_does() {
+        // The state a real session reaches by rolling up one level out of nine (a real log line
+        // reads `depth=9 reason=Complete level=8/9`).
+        let mut chain = LevelChain::new(9);
+        assert!(chain.shallower());
+        assert_eq!(chain.index() + 1, 8);
+        assert_eq!(chain.len(), 9);
+        // Confirm line (after a confirmation) and label (live) and hint (once) agree.
+        assert_eq!(super::describe_level(Some(chain)), "8/9");
+        assert_eq!(
+            preview_label(Rect::new(0, 0, 100, 50), false, Some(chain), false),
+            "100×50 px  容器 8/9"
+        );
+        assert_eq!(
+            level_hint(chain.index() + 1, chain.len()),
+            "吸附层级 8/9（1=窗口）· 滚轮 / ↑↓ 切换"
         );
     }
 }
