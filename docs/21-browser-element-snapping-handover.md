@@ -1231,6 +1231,39 @@ CSS transform 旋转盒 ✓、canvas/svg/表格/表单控件 ✓。真正剩下�
 
 **状态**：草案。等真机看完原型再决定是否实现，以及 ③b（淡出）要不要做。
 
+### 5.23 内嵌 UI 字体：文案是白名单（2026-10-06，已修 + 已设门禁）
+
+overlay 的 DirectWrite 文本（尺寸标签、放大镜信息条、层级提示）用的是**内嵌的 HarmonyOS Sans SC 子集**
+（`src-tauri/fonts/harmonyos-sans-sc-subset.ttf`，`include_bytes!` 进二进制）：8.5 MB 的系统字体裁到
+app 自己画的那几十个字形，换来"任何机器都不需要装字体"。
+
+**这个子集是硬白名单**：缺字形不会报错、不会打日志、不会抛异常——DirectWrite 会**逐字形回退**到系统字体，
+于是字符串一半是 HarmonyOS、一半是雅黑（回退被拒时才是豆腐块）。只有眼睛看得出来。
+
+它已经**同时漂移了三处**（都由 §5.21 的新文案暴露）：
+
+| 问题 | 证据 |
+| --- | --- |
+| `include_bytes!` 读的那份是**旧的** | `src-tauri/fonts/…ttf` 7044 B / 57 码位 / 10 个汉字，而脚本写出的 `subfont/…ttf` 是 7992 B / 59 / 13——脚本里的安装步骤是**注释掉的** `Copy-Item`，"重做字体"实际上是个两步手工仪式 |
+| 两份都**不含新文案的字形** | 元素 容器 窗口 吸附层级 换 （） · ? ↑ ↓ 一个都没有；连 `滚轮缩放` 在安装份里也缺 |
+| 字形表是 `.ps1` 里手写的 `U+xxxx` | 也正因为如此对编码脆弱：PowerShell 5.1 用 ANSI 读无 BOM 的 `.ps1`（旧脚本注释里记着这件事） |
+
+**现在的流程**（`subfont/subset.ps1` 仍是入口，但只剩转发）：
+
+1. 字形集合来自 `subfont/drawn-glyphs.txt`——**文案本身，UTF-8**，改 UI 文本就改这个文件；
+   可打印 ASCII（U+0020–U+007E）整段收下，因为面板画的是**计算出来的**文本（色值、坐标、尺寸），
+   任何"举例式"清单都必然差一个字形——第一版清单就是这样被 `cargo test` 抓到的：缺 `3`（`hsl(359,100%,100%)`）。
+2. `subfont/build_subset.py` 用 fontTools 裁表、**校验产物覆盖全部必需码位**（不覆盖就硬失败）、
+   并把它安装到 `include_bytes!` 真正读的路径。用户输入的标注文字**故意不在清单里**——它可以是任何字符，
+   本来就该回退到系统字体。
+3. 门禁在 Rust 里：`win::d2d::tests::the_embedded_subset_covers_the_strings_the_overlay_draws`
+   直接从 `INFO_EMBEDDED_FONT` 的 cmap 里读覆盖率，要求的字符串**取自带生产者**
+   （`preview_label` 四种状态、`level_hint`、`LEVEL_HINT`、以及改成 `const` 的 `INFO_HINTS`），
+   所以门禁和"真正画出来的东西"不会互相漂移；另一个测试检查这个 cmap 读取器本身（不虚构覆盖范围）。
+
+产物：两份 `harmonyos-sans-sc-subset.ttf` 均为 14.3 KB / 126 码位（原 7.0 KB / 57）。
+顺手删掉了 `subfont/*.ttf.br`：crate 里没有任何东西读压缩块，它是个没有消费者的提交产物。
+
 ---
 
 ## 6. 实测踩坑清单（每条都花了时间，务必先读）
