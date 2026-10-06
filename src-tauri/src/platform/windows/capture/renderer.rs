@@ -49,6 +49,17 @@ pub struct OverlayFrameState {
     pub preview_bounds: Option<Rect>,
     /// Deep-selection ancestor levels (frame → deepest), monitor-local.
     pub path_bounds: Vec<Rect>,
+    /// Text drawn beside the automatic-snap preview (docs/21 §5.21); `None` = no label.
+    ///
+    /// Built by the overlay, which is the side that knows the level chain, the target kind and
+    /// whether the last query was answered at all; the renderer only places and draws it.
+    pub preview_label: Option<String>,
+    /// Whether the previewed box is the whole window rather than an element (docs/21 §5.21) — the
+    /// renderer then uses a neutral wash and a thin outline instead of the accent preview.
+    pub preview_is_window: bool,
+    /// A one-shot hint in monitor-local coordinates (docs/21 §5.21): the level walk has to be
+    /// explained once, or nobody finds it.
+    pub hint: Option<(Point, String)>,
 }
 
 impl OverlayFrameState {
@@ -68,6 +79,9 @@ impl OverlayFrameState {
             hover_bounds: None,
             preview_bounds: None,
             path_bounds: Vec::new(),
+            preview_label: None,
+            preview_is_window: false,
+            hint: None,
         }
     }
 }
@@ -199,6 +213,9 @@ impl Win32Renderer {
             hover_bounds: state.hover_bounds,
             preview_bounds: state.preview_bounds,
             path_bounds: state.path_bounds.clone(),
+            preview_label: state.preview_label.clone(),
+            preview_is_window: state.preview_is_window,
+            hint: state.hint.clone(),
         };
         self.d2d.render(&view)?;
         self.d2d.present()?;
@@ -240,6 +257,10 @@ impl Win32Renderer {
             preview_bounds: state.preview_bounds,
             // Hover/preview/path hints are stripped by `OverlayRenderer::render_export`.
             path_bounds: state.path_bounds.clone(),
+            // …and so are the labels and the one-shot hint: an artifact never carries UI.
+            preview_label: None,
+            preview_is_window: false,
+            hint: None,
         };
         self.d2d.render_export(&view)
     }

@@ -439,6 +439,9 @@ where
     /// Which level of `deep_target`'s chain the user walked to (docs/21 §5.17). `None` means the
     /// published box itself, which is what every session starts with.
     deep_levels: Option<LevelChain>,
+    /// Until when the one-shot hint ("the wheel walks the levels") is worth drawing (docs/21 §5.21).
+    /// Armed when a session starts and dropped the moment the user uses it or clicks.
+    hint_until: Option<Instant>,
     /// A shallower target waiting for its confirming dwell (docs/18 §13.3).
     ///
     /// A cursor merely passing through a parent container produces one such result; displaying
@@ -563,6 +566,7 @@ where
             refinement,
             deep_target: None,
             deep_levels: None,
+            hint_until: None,
             pending_downgrade: None,
             refinement_pending: None,
             hit_test_pass_through,
@@ -989,6 +993,8 @@ where
         self.disarm_hover_timer();
         self.refine.reset();
         self.deep_target = None;
+        self.deep_levels = None;
+        self.hint_until = None;
         self.pending_downgrade = None;
         self.refinement_pending = None;
         self.disarm_refinement();
@@ -1076,14 +1082,18 @@ where
                 magnifier_color_text: None,
                 magnifier_relative: false,
                 magnifier_zoom: self.magnifier_zoom,
-            annotation_items: self.annotation_doc.items().to_vec(),
-            annotation_selected_id: None,
-            annotation_draft: None,
-            // The exported pixels must never contain a hover or preview hint.
-            hover_bounds: None,
-            preview_bounds: None,
-            path_bounds: Vec::new(),
-        };
+                annotation_items: self.annotation_doc.items().to_vec(),
+                annotation_selected_id: None,
+                annotation_draft: None,
+                // The exported pixels must never contain a hover or preview hint.
+                hover_bounds: None,
+                preview_bounds: None,
+                path_bounds: Vec::new(),
+                // …and neither a preview label nor the one-shot hint.
+                preview_label: None,
+                preview_is_window: false,
+                hint: None,
+            };
             let Some(renderer) = self.renderer.as_mut() else {
                 self.cancel("annotation-export-without-renderer");
                 return;
@@ -1316,12 +1326,17 @@ where
         // v2 state is per-session too: no cached deep path, no in-flight query.
         self.refine.reset();
         self.deep_target = None;
+        self.deep_levels = None;
         self.pending_downgrade = None;
         self.refinement_pending = None;
         self.disarm_refinement();
         self.refinement.retire();
         self.snapshot.release();
         self.request_snapshot_refresh();
+        // Arm the one-shot hint for this session: the first few seconds are when a user who does
+        // not know about the level walk is most likely to be looking at the highlight and
+        // wondering whether it can be changed (docs/21 §5.21).
+        self.hint_until = Some(Instant::now() + Duration::from_millis(LEVEL_HINT_MS));
     }
 
     /// Ask the detection worker for a new snapshot. Only the newest request is kept.
@@ -1346,12 +1361,6 @@ where
         (!rect.is_empty()).then_some(rect)
     }
 
-    /// The deep-selection ancestor levels in monitor-local coordinates (frame → deepest).
-    ///
-    /// Empty unless the published deep target belongs to the window currently under the
-    /// cursor: a path for another window would draw outlines over unrelated pixels. The
-    /// deepest entry is left out because it is painted as the emphasised hover/preview
-    /// rectangle (docs/18 §12.2 的层级可视化).
     /// The ancestor level the user walked to, if any (docs/21 §5.17).
     ///
     /// `None` means "the published box", which is what the refinement produced and what the preview
@@ -1362,6 +1371,59 @@ where
         (!chain.is_deepest())
             .then(|| chain.current(&deep.path))
             .flatten()
+    }
+
+    /// The label the automatic-snap preview carries (docs/21 §5.21).
+    ///
+    /// `None` when there is no preview to describe. The text is built here rather than in the
+    /// renderer because this is the side that knows the three things the label needs beyond the
+    /// size: the level the user walked to, whether the box is the whole window, and whether anything
+    /// answered for this position at all.
+    ///
+    /// It describes the *target* rather than the rectangle currently being eased into place: a size
+    /// that counted through intermediate values for the 101 ms of a transition would be noise, and
+    /// the numbers are what the user is making a decision with (docs/21 §5.21).
+    fn preview_label_text(&self) -> Option<String> {
+        let rect = self.preview_target?;
+        if rect.is_empty() || self.session.state() != CaptureState::Selecting {
+            return None;
+        }
+        Some(preview_label(
+            rect,
+            self.preview_is_window(),
+            self.deep_levels,
+            matches!(
+                self.metrics.last_precision_outcome(),
+                Some(crate::capture::diagnostics::PrecisionOutcome::Unavailable)
+            ),
+        ))
+    }
+
+    /// Whether the previewed box is the whole window rather than an element (docs/21 §5.21).
+    ///
+    /// A whole-window answer is the v1 fallback, so the paint layer draws it with the neutral wash
+    /// and a thin outline instead of the accent preview: "we could not get below the window" should
+    /// not look like a confident element pick.
+    fn preview_is_window(&self) -> bool {
+        if self.deep_target.as_ref().is_some_and(|deep| {
+            deep.kind == crate::capture::window_detection::model::TargetKind::TopLevelWindowFrame
+        }) {
+            return true;
+        }
+        // The wheel can walk the preview all the way up to the frame itself (docs/21 §5.17), and
+        // `path[0]` is always that frame: the box *is* the window then, even though the answer
+        // underneath it was an element.
+        self.deep_levels
+            .is_some_and(|chain| chain.len() > 1 && chain.index() == 0)
+    }
+
+    /// The one-shot hint, while it is still worth drawing (docs/21 §5.21).
+    fn hint_text(&self) -> Option<(Point, String)> {
+        let until = self.hint_until?;
+        if Instant::now() >= until || self.session.state() != CaptureState::Selecting {
+            return None;
+        }
+        Some((self.cursor, LEVEL_HINT.to_owned()))
     }
 
     /// Step the deep-selection level: `-1` toward the window frame, `+1` toward the published box.
@@ -1385,12 +1447,21 @@ where
             chain.deeper()
         };
         if moved {
+            // The user has found the walk; the hint has done its job and would only be noise
+            // over the rectangle it is explaining (docs/21 §5.21).
+            self.hint_until = None;
             self.refresh_preview_for_cursor();
             self.invalidate();
         }
         moved
     }
 
+    /// The deep-selection ancestor levels in monitor-local coordinates (frame → deepest).
+    ///
+    /// Empty unless the published deep target belongs to the window currently under the
+    /// cursor: a path for another window would draw outlines over unrelated pixels. The
+    /// deepest entry is left out because it is painted as the emphasised hover/preview
+    /// rectangle (docs/18 §12.2 的层级可视化).
     fn deep_path_local(&self) -> Vec<Rect> {
         let Some(layout) = self.layout() else {
             return Vec::new();
@@ -1827,6 +1898,12 @@ where
         if self.session.state() != CaptureState::Selecting {
             return;
         }
+        // The one-shot hint expires on the wall clock, and a resting cursor produces no other
+        // repaint: while it is still showing, keep one tick of life so it can go away on time
+        // (docs/21 §5.21).
+        if self.hint_text().is_some() {
+            self.invalidate();
+        }
         self.poll_refinement_timeout();
         let Some(hover) = self.hover_target else {
             return;
@@ -2216,6 +2293,8 @@ where
         ) {
             return;
         }
+        // A press is the user taking over; the hint must not sit next to the result (docs/21 §5.21).
+        self.hint_until = None;
         let point = Point::new(client.x, client.y);
         // Ask what the press *would* do, then record the gesture. Neither step changes the
         // selection (docs/14 §4.2).
@@ -2686,6 +2765,11 @@ where
         // for confirmation, so the animation can never change what gets committed.
         let preview_bounds = self.preview_rect;
         let path_bounds = self.deep_path_local();
+        // …and the two label texts, for the same reason: they read the level chain and the
+        // last precision decision, which are `self` reads.
+        let preview_label = self.preview_label_text();
+        let preview_is_window = self.preview_is_window();
+        let hint = self.hint_text();
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
@@ -2718,6 +2802,9 @@ where
             hover_bounds,
             preview_bounds,
             path_bounds,
+            preview_label,
+            preview_is_window,
+            hint,
         };
         // Live borrow of annotation document avoids cloning items every tick.
         match renderer.render(&state, Some(&self.annotation_doc)) {
@@ -2990,6 +3077,44 @@ fn describe_rect(rect: Rect) -> String {
     format!("({},{})->({},{})", rect.left, rect.top, rect.right, rect.bottom)
 }
 
+/// The one-shot hint that explains the level walk (docs/21 §5.21).
+///
+/// Without it the feature is invisible: a wheel that silently changes what will be captured is
+/// indistinguishable from a wheel that does nothing.
+const LEVEL_HINT: &str = "滚轮 / ↑↓ 换吸附层级";
+
+/// How long the one-shot hint stays on screen.
+const LEVEL_HINT_MS: u64 = 2600;
+
+/// The text the automatic-snap preview's label shows (docs/21 §5.21).
+///
+/// Pure so the format is testable. Beyond the size it carries the three things a user cannot infer
+/// from the rectangle: which level of the ancestor chain is selected (only when there is a chain to
+/// walk), that the box is the whole window rather than an element, and that nothing answered for this
+/// position — the last one as `~`, because a fallback must not look like a confident answer.
+///
+/// The counter appears only once the user has actually moved. The deepest level is the answer the
+/// refinement produced, which is the state every preview starts in, so it stays a plain size — the
+/// same reason the confirm line calls it `deepest` instead of `7/7` ([`describe_level`]).
+fn preview_label(
+    rect: Rect,
+    is_window: bool,
+    levels: Option<LevelChain>,
+    degraded: bool,
+) -> String {
+    let mut text = format!("{}×{} px", rect.width(), rect.height());
+    if let Some(chain) = levels.filter(|chain| chain.len() > 1 && !chain.is_deepest()) {
+        text.push_str(&format!("  {}/{}", chain.index() + 1, chain.len()));
+    }
+    if is_window {
+        text.push_str("  窗口");
+    }
+    if degraded {
+        text.push_str("  ~");
+    }
+    text
+}
+
 /// `2/6` for the confirm line: which level of the chain the ancestor walk selected (docs/21 §5.17).
 fn describe_level(chain: Option<LevelChain>) -> String {
     match chain {
@@ -2998,7 +3123,6 @@ fn describe_level(chain: Option<LevelChain>) -> String {
     }
 }
 
-/// One-line account of a deep target for the default (non-verbose) session log.
 /// Whether any mouse button is physically held down.
 ///
 /// Used to veto the hit-test pass-through: the flag exists so that one accessibility point hit test
@@ -3011,6 +3135,7 @@ fn any_mouse_button_down() -> bool {
         .any(|key| unsafe { GetAsyncKeyState(key as i32) } & DOWN != 0)
 }
 
+/// One-line account of a deep target for the default (non-verbose) session log.
 fn describe_deep(deep: Option<&DeepTarget>) -> String {
     match deep {
         None => "none".to_owned(),
@@ -3025,11 +3150,6 @@ fn describe_deep(deep: Option<&DeepTarget>) -> String {
     }
 }
 
-/// System drag threshold (`SM_CXDRAG`) in physical pixels for a monitor DPI.
-///
-/// The value is a logical distance, so it is scaled the same way the reference selector
-/// scales `QApplication::startDragDistance()`. Below the threshold a press stays a click;
-/// above it the gesture becomes a free drag (docs/14 §4.2).
 /// Whether two cursor positions count as "the cursor has not moved" for the downgrade
 /// confirmation. The dwell already guarantees stillness; a couple of pixels of jitter must not
 /// cancel a legitimate confirmation.
@@ -3037,6 +3157,11 @@ fn points_close(left: Point, right: Point) -> bool {
     (left.x - right.x).abs() <= 3 && (left.y - right.y).abs() <= 3
 }
 
+/// System drag threshold (`SM_CXDRAG`) in physical pixels for a monitor DPI.
+///
+/// The value is a logical distance, so it is scaled the same way the reference selector
+/// scales `QApplication::startDragDistance()`. Below the threshold a press stays a click;
+/// above it the gesture becomes a free drag (docs/14 §4.2).
 fn system_drag_threshold(dpi: u32) -> i32 {
     let base = unsafe { GetSystemMetrics(SM_CXDRAG) }.max(1);
     let scaled = (base as f32) * (dpi.max(96) as f32 / 96.0);
@@ -3270,7 +3395,9 @@ unsafe extern "system" {
 
 #[cfg(test)]
 mod tests {
-    use super::{point_from_lparam, OverlayCommand};
+    use super::{point_from_lparam, preview_label, OverlayCommand};
+    use crate::capture::geometry::Rect;
+    use crate::capture::window_detection::LevelChain;
 
     /// `WS_EX_NOACTIVATE`.
     ///
@@ -3338,5 +3465,63 @@ mod tests {
             assert_eq!(OverlayCommand::from_wparam(command as usize), Some(command));
         }
         assert_eq!(OverlayCommand::from_wparam(9999), None);
+    }
+
+    /// A box with no chain, no window kind and no degradation carries only its size.
+    #[test]
+    fn the_preview_label_is_the_size_when_there_is_nothing_else_to_say() {
+        let rect = Rect::new(10, 10, 410, 810);
+        assert_eq!(preview_label(rect, false, None, false), "400×800 px");
+    }
+
+    /// Walking the chain has to be visible: the user changed what will be captured, and the
+    /// only feedback is this label (docs/21 §5.17/§5.21).
+    #[test]
+    fn the_preview_label_counts_the_chain_level_the_user_walked_to() {
+        let rect = Rect::new(0, 0, 100, 50);
+        let mut chain = LevelChain::new(7);
+        // A fresh chain is the deepest level, and "deepest" is the state the answer arrived in,
+        // so it carries no counter: the counter means "you moved".
+        assert_eq!(preview_label(rect, false, Some(chain), false), "100×50 px");
+        for _ in 0..4 {
+            assert!(chain.shallower());
+        }
+        assert_eq!(chain.index(), 2);
+        assert_eq!(
+            preview_label(rect, false, Some(chain), false),
+            "100×50 px  3/7"
+        );
+        // …and the outermost level is the window frame itself.
+        assert!(chain.shallower());
+        assert!(chain.shallower());
+        assert!(!chain.shallower(), "index 0 is the end of the walk");
+        assert_eq!(
+            preview_label(rect, false, Some(chain), false),
+            "100×50 px  1/7"
+        );
+        // A chain of one is not a walk at all.
+        assert_eq!(
+            preview_label(rect, false, Some(LevelChain::new(1)), false),
+            "100×50 px"
+        );
+    }
+
+    /// The three extra words are independent, so "the whole window, and nothing answered for it"
+    /// is a state the label can say.
+    #[test]
+    fn the_preview_label_names_the_window_and_the_unsupported_fallback() {
+        let rect = Rect::new(0, 0, 3840, 2088);
+        assert_eq!(preview_label(rect, true, None, false), "3840×2088 px  窗口");
+        assert_eq!(
+            preview_label(rect, false, None, true),
+            "3840×2088 px  ~",
+            "a fallback must not look like a confident answer"
+        );
+        let mut chain = LevelChain::new(4);
+        assert!(chain.shallower());
+        assert_eq!(
+            preview_label(rect, true, Some(chain), true),
+            "3840×2088 px  3/4  窗口  ~"
+        );
     }
 }

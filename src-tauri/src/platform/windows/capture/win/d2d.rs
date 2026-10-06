@@ -220,6 +220,12 @@ pub struct RenderView {
     /// Only the *levels* are painted here; the deepest entry is drawn by
     /// `hover_bounds`/`preview_bounds` so the emphasised rectangle is never duplicated.
     pub path_bounds: Vec<Rect>,
+    /// Text beside the automatic-snap preview (docs/21 §5.21); `None` = no label.
+    pub preview_label: Option<String>,
+    /// The previewed box is the whole window rather than an element: neutral wash, thin outline.
+    pub preview_is_window: bool,
+    /// One-shot hint in back-buffer coordinates (docs/21 §5.21).
+    pub hint: Option<(Point, String)>,
 }
 
 impl RenderView {
@@ -247,6 +253,9 @@ impl RenderView {
             hover_bounds: None,
             preview_bounds: None,
             path_bounds: Vec::new(),
+            preview_label: None,
+            preview_is_window: false,
+            hint: None,
         }
     }
 }
@@ -532,6 +541,9 @@ impl OverlayRenderer {
             hover_bounds: None,
             preview_bounds: None,
             path_bounds: Vec::new(),
+            preview_label: None,
+            preview_is_window: false,
+            hint: None,
             ..view.clone()
         };
         let (frame_w, frame_h) = self.size;
@@ -703,6 +715,7 @@ impl OverlayRenderer {
         if view.hover_bounds.is_none()
             && view.preview_bounds.is_none()
             && view.path_bounds.is_empty()
+            && view.hint.is_none()
         {
             return Ok(());
         }
@@ -738,13 +751,80 @@ impl OverlayRenderer {
         if let Some(preview) = view.preview_bounds {
             let rect = preview.intersect(view.frame);
             if !rect.is_empty() {
-                let fill = self.require_brush(&self.preview_fill_brush, "preview fill brush")?;
+                // A whole-window answer is the v1 fallback, not an element pick: it reads as the
+                // neutral hover wash with a thin outline, so "we could not get below the window" is
+                // visible instead of looking like a confident element preview (docs/21 §5.21).
+                let (fill, width) = if view.preview_is_window {
+                    (self.require_brush(&self.hover_fill_brush, "hover fill brush")?, width)
+                } else {
+                    (
+                        self.require_brush(&self.preview_fill_brush, "preview fill brush")?,
+                        width * 2.0,
+                    )
+                };
                 unsafe {
                     self.d2d.FillRectangle(&to_d2d(rect), &fill);
                     self.d2d
-                        .DrawRectangle(&to_d2d(rect), &border, width * 2.0, None);
+                        .DrawRectangle(&to_d2d(rect), &border, width, None);
                 }
             }
+        }
+        // The preview's own label: size, kind, level and whether anything answered for this
+        // position. Drawn last so it sits above every outline it describes.
+        if let (Some(preview), Some(text)) = (view.preview_bounds, view.preview_label.as_deref()) {
+            let rect = preview.intersect(view.frame);
+            if !rect.is_empty() {
+                self.draw_hint_at(rect, text, view, self.metrics)?;
+            }
+        }
+        if let Some((at, text)) = view.hint.as_ref() {
+            self.draw_hint_at(Rect::new(at.x, at.y, at.x, at.y), text, view, self.metrics)?;
+        }
+        Ok(())
+    }
+
+    /// A small panel with `text` anchored to `anchor` (docs/21 §5.21).
+    ///
+    /// `anchor` is a rectangle for the preview label (placed beside it, above or below, whichever
+    /// fits the work area) or a degenerate point for the one-shot hint. Same brushes, padding and
+    /// glyph format as the selection's size label, so the overlay reads as one UI.
+    fn draw_hint_at(
+        &mut self,
+        anchor: Rect,
+        text: &str,
+        view: &RenderView,
+        metrics: RenderMetrics,
+    ) -> Result<(), String> {
+        let background =
+            self.require_brush(&self.label_background_brush, "label background brush")?;
+        let foreground = self.require_brush(&self.label_text_brush, "label text brush")?;
+        let (measured, format) = self.measure_label(text)?;
+        let Some(placement) = self.place_label(anchor, view, measured, metrics) else {
+            // No room beside the box: dropping the label beats covering the pixels being chosen.
+            return Ok(());
+        };
+        unsafe {
+            let panel = D2D1_ROUNDED_RECT {
+                rect: to_d2d(placement.rect),
+                radiusX: 3.0,
+                radiusY: 3.0,
+            };
+            self.d2d.FillRoundedRectangle(&panel, &background);
+            let wide = text.encode_utf16().collect::<Vec<u16>>();
+            let text_rect = D2D_RECT_F {
+                left: placement.rect.left as f32 + metrics.label_padding_x,
+                top: placement.rect.top as f32 + metrics.label_padding_y,
+                right: placement.rect.right as f32 - metrics.label_padding_x,
+                bottom: placement.rect.bottom as f32 - metrics.label_padding_y,
+            };
+            self.d2d.DrawText(
+                &wide,
+                &format,
+                &text_rect,
+                &foreground,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
         }
         Ok(())
     }

@@ -153,6 +153,9 @@ pub struct WindowDetectionMetrics {
     /// skips cost a diagnosis round: the state that matters is "the top-up ran and did
     /// nothing", and with verbose off there was nothing in the log to say so.
     last_precision: Arc<std::sync::Mutex<Option<String>>>,
+    /// The same decision as a value, so the paint layer does not have to parse the note above
+    /// (`0` = no query yet; otherwise the [`PrecisionOutcome`] discriminant).
+    last_precision_outcome: Arc<AtomicU64>,
 }
 
 /// What the precision top-up did with the provider's own point hit test (docs/21 §5.7).
@@ -593,6 +596,12 @@ impl WindowDetectionMetrics {
         if let Ok(mut last) = self.last_precision.lock() {
             *last = Some(format!("{verb} {note}"));
         }
+        self.last_precision_outcome
+            .store(match outcome {
+                PrecisionOutcome::Adopted => 1,
+                PrecisionOutcome::NotFiner => 2,
+                PrecisionOutcome::Unavailable => 3,
+            }, Ordering::Relaxed);
     }
 
     /// The most recent precision decision, verbatim, for the per-session forensics line.
@@ -600,11 +609,25 @@ impl WindowDetectionMetrics {
         self.last_precision.lock().ok().and_then(|last| last.clone())
     }
 
+    /// The most recent precision decision as a value, for the paint layer (docs/21 §5.21).
+    ///
+    /// `None` until a query has run; `Unavailable` is what tells the preview that nothing could
+    /// answer for this position, so the box it is showing is a fallback.
+    pub fn last_precision_outcome(&self) -> Option<PrecisionOutcome> {
+        match self.last_precision_outcome.load(Ordering::Relaxed) {
+            1 => Some(PrecisionOutcome::Adopted),
+            2 => Some(PrecisionOutcome::NotFiner),
+            3 => Some(PrecisionOutcome::Unavailable),
+            _ => None,
+        }
+    }
+
     pub fn reset(&self) {
         let counters = &self.counters;
         if let Ok(mut last) = self.last_precision.lock() {
             *last = None;
         }
+        self.last_precision_outcome.store(0, Ordering::Relaxed);
         for counter in [
             &counters.snapshot_refresh_count,
             &counters.snapshot_refresh_last_us,
