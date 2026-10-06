@@ -1640,6 +1640,15 @@ mod tests {
             eprintln!("skipping: the demo page never reported its geometry");
             return;
         };
+        println!(
+            "[probe] page published {} boxes; frame/shadow ones: {:?}; iframe-diag={:?}",
+            truth.len(),
+            truth
+                .keys()
+                .filter(|id| id.contains("iframe") || id.contains("shadow"))
+                .collect::<Vec<_>>(),
+            truth.get("iframe-diag")
+        );
         if client.width() < 1600 || client.height() < 1020 {
             let _ = child.kill();
             eprintln!(

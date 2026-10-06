@@ -128,18 +128,18 @@
   {"id":"scroll-item-2","rect":[0,0,0,0],"kind":"generated","role":"ListItem",
    "name":"Scroll Item 2","expect":"self"},
   {"id":"iframe-box","rect":[1016,352,360,200],"kind":"iframe","role":"","name":"Iframe Host",
-   "expect":"iframe-button","optional":true},
+   "expect":"self"},
   {"id":"iframe-button","rect":[0,0,0,0],"kind":"generated","role":"Button",
-   "name":"Iframe Button","expect":"self","optional":true},
+   "name":"Iframe Button","expect":"self"},
   {"id":"canvas-box","rect":[1400,352,176,200],"kind":"canvas","role":"","name":"Canvas Area",
    "expect":"self","optional":true},
 
   {"id":"svg-box","rect":[24,576,176,200],"kind":"svg","role":"","name":"Vector Box",
    "expect":"self","optional":true},
   {"id":"shadow-box","rect":[224,576,280,200],"kind":"shadow","role":"","name":"Shadow Host",
-   "expect":"shadow-button","optional":true},
+   "expect":"shadow-button"},
   {"id":"shadow-button","rect":[0,0,0,0],"kind":"generated","role":"Button",
-   "name":"Shadow Button","expect":"self","optional":true},
+   "name":"Shadow Button","expect":"self"},
   {"id":"details-box","rect":[528,576,280,200],"kind":"details","role":"","name":"Details Node",
    "expect":"details-summary","optional":true},
   {"id":"details-summary","rect":[0,0,0,0],"kind":"generated","role":"","name":"Details Node",
@@ -311,11 +311,10 @@ const builders = {
                     el.innerHTML = '<div id="deep-item" role="group" aria-label="Deep Item" ' +
                       'style="height:20000px;background:#eef2ff">Deep Item</div>';
                     return 'div'; },
-  iframe: (el) => { el.className = 'fixture frame';
-                    el.srcdoc = '<!doctype html><body style="margin:0;font:14px sans-serif">' +
-                      '<button id="iframe-button" style="position:absolute;left:40px;top:40px;' +
-                      'width:160px;height:48px">Iframe Button</button></body>';
-                    return 'iframe'; },
+  // `srcdoc` is set in `after`, not here: this builder runs on a detached holder element (a `div`),
+  // and assigning `.srcdoc` to a `div` is just an expando property — which left the frame blank and
+  // made "we cannot reach inside an iframe" look true for the wrong reason.
+  iframe: (el) => { el.className = 'fixture frame'; return 'iframe'; },
   canvas: (el, entry) => { el.className = 'fixture frame';
                            el.setAttribute('aria-label', entry.name);
                            el.width = 176; el.height = 200;
@@ -359,6 +358,21 @@ const builders = {
 
 /// Post-creation work that needs the real element (a canvas context, a shadow root).
 const after = {
+  // The frame's inner document loads after the fixture was built, so the page publishes its truth
+  // again once it is up: the row that points *inside* the frame asserts the boundary "we reach the
+  // host element, not what is inside it" (docs/21 §5.20).
+  iframe: (node) => {
+    // The real element exists here, so the `srcdoc` actually applies (see the builder's note).
+    node.srcdoc = '<!doctype html><body style="margin:0;font:14px sans-serif">' +
+      '<button id="iframe-button" style="position:absolute;left:40px;top:40px;' +
+      'width:160px;height:48px">Iframe Button</button></body>';
+    // A `srcdoc` frame fires `load` for its initial blank document too, so the truth is published
+    // again on the frame's own load *and* after short delays: the probe reads the title later, and
+    // the row that points inside the frame is what asserts "we reach the host element".
+    node.addEventListener('load', () => publishTruth());
+    setTimeout(() => publishTruth(), 300);
+    setTimeout(() => publishTruth(), 1200);
+  },
   // Scroll the deep item's layout box far above the scrollport: its top ends up thousands of pixels
   // off-screen, which is exactly what the product met on a chat page.
   'deep-scroll': (node) => { node.scrollTop = 5000; },
