@@ -1647,14 +1647,33 @@ mod tests {
             eprintln!("skipping: the demo page never reported its geometry");
             return;
         };
+        // The cross-origin frame measures itself and reports over `postMessage` — its parent cannot
+        // read it. That report is also the only proof the frame's content ever loaded, so the probe
+        // refuses to measure without it: a still-blank frame answers the frame node for every point
+        // inside it, which is indistinguishable from "cross-origin content is unreachable". That is
+        // the wrong conclusion this fixture produced before the report existed (docs/21 §5.20).
+        let mut truth = truth;
+        if url.contains("cross=") {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !truth.contains_key("cross-ready") && std::time::Instant::now() < deadline {
+                pump(250);
+                if let Some(refreshed) = truth_of(&probe_title(hwnd)) {
+                    truth = refreshed;
+                }
+            }
+            if !truth.contains_key("cross-ready") {
+                let _ = child.kill();
+                panic!("the cross-origin frame never reported that its content loaded");
+            }
+        }
         println!(
-            "[probe] page published {} boxes; frame/shadow ones: {:?}; iframe-diag={:?}",
+            "[probe] page published {} boxes; frame/shadow ones: {:?}; cross-ready={:?}",
             truth.len(),
             truth
                 .keys()
                 .filter(|id| id.contains("iframe") || id.contains("shadow"))
                 .collect::<Vec<_>>(),
-            truth.get("iframe-diag")
+            truth.get("cross-ready")
         );
         if client.width() < 1600 || client.height() < 1020 {
             let _ = child.kill();
@@ -1861,6 +1880,17 @@ mod tests {
             let expected = match fixture.expect.as_str() {
                 "none" => None,
                 "self" | "inside_self" | "covers_self" => Some((fixture.id.as_str(), own)),
+                // `within:<id>`: the answer must sit inside the referenced fixture's box. Used where
+                // the accessibility tree's own granularity is not stable from run to run — the
+                // cross-origin frame answers either its own node or the button inside it, and both
+                // are correct (docs/21 §5.20).
+                other if other.starts_with("within:") => {
+                    let target = &other["within:".len()..];
+                    truth
+                        .get(target)
+                        .copied()
+                        .map(|measured| (target, measured))
+                }
                 other => truth
                     .get(other)
                     .copied()
@@ -2280,6 +2310,21 @@ mod tests {
     /// Compare what we published against what the page measured.
     fn judge(expect: &str, expected: Option<Rect>, published: Option<Rect>) -> (bool, &'static str) {
         const TOLERANCE: i32 = 3;
+        // `within:<id>` (see the expectation lookup): containment instead of equality, because the
+        // accessibility tree's granularity inside a cross-origin frame is not stable run to run.
+        if expect.starts_with("within:") {
+            return match (expected, published) {
+                (Some(expected), Some(published)) => {
+                    let inside = published.left >= expected.left - TOLERANCE
+                        && published.top >= expected.top - TOLERANCE
+                        && published.right <= expected.right + TOLERANCE
+                        && published.bottom <= expected.bottom + TOLERANCE;
+                    (inside, "the answer must sit inside the referenced box")
+                }
+                (_, None) => (false, "nothing was published"),
+                (None, _) => (false, "no expectation to compare"),
+            };
+        }
         match (expect, expected, published) {
             // `none` means the fixture is not in the tree at all, so the answer must be coarser
             // than its box — anything else proves we captured a hidden element.
@@ -3219,11 +3264,20 @@ mod tests {
 
     /// The page the cross-origin fixture frame loads (docs/21 §5.20).
     ///
-    /// One button at a fixed place with `margin: 0`, so the parent — which cannot read a cross-origin
-    /// frame — can still predict the button's box from the frame's own box.
+    /// One button at a fixed place with `margin: 0`. The frame measures itself and reports over
+    /// `postMessage`, which is both the box its parent cannot read *and* the only proof that its
+    /// content ever loaded: without that report a blank frame answers "the frame node" for every
+    /// point inside it, which reads exactly like "cross-origin content is unreachable" — the wrong
+    /// conclusion this fixture produced before the report existed.
     const CROSS_ORIGIN_FIXTURE: &str = "<!doctype html><body style=\"margin:0\">\
 <button id=\"cross-button\" style=\"position:absolute;left:40px;top:40px;width:160px;\
-height:48px\">Cross Button</button></body>";
+height:48px\">Cross Button</button>\
+<script>\
+fetch('/cross-ping');\
+const box = document.getElementById('cross-button').getBoundingClientRect();\
+parent.postMessage({snapclip: 'cross-ready', html: document.body.innerHTML.length,\
+ button: [box.left, box.top, box.width, box.height]}, '*');\
+</script></body>";
 
     /// Serve [`CROSS_ORIGIN_FIXTURE`] on a loopback port and keep serving until the process ends.
     ///
@@ -3234,9 +3288,31 @@ height:48px\">Cross Button</button></body>";
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).ok()?;
         let port = listener.local_addr().ok()?.port();
         std::thread::spawn(move || {
-            use std::io::Write;
+            use std::io::{Read, Write};
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
+                // Every request is logged by path: the probe refuses to measure without the child's
+                // report, and this says whether "no report" means the frame never asked for the page,
+                // the page was served but its script never ran, or the message was lost on the way
+                // back (docs/21 §5.20).
+                let mut buffer = [0_u8; 1024];
+                let read = stream.read(&mut buffer).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                let path = request
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/")
+                    .to_owned();
+                eprintln!("[probe] cross-origin server: {path}");
+                if path != "/cross.html" {
+                    // The child's own liveness ping: proof its script ran, independent of whether
+                    // the message back to the parent arrives.
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                    let _ = stream.flush();
+                    continue;
+                }
                 let body = CROSS_ORIGIN_FIXTURE.as_bytes();
                 let head = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\

@@ -176,9 +176,9 @@
    "probe":[40,30],"expect":"inside_self","finer_than_self":true},
 
   {"id":"cross-frame","rect":[1060,920,360,96],"kind":"cross-frame","role":"","name":"Cross Frame",
-   "probe":[120,64],"expect":"self"},
+   "probe":[300,20],"expect":"self"},
   {"id":"cross-button","rect":[0,0,0,0],"kind":"generated","role":"Button","name":"Cross Button",
-   "expect":"cross-frame"}
+   "expect":"within:cross-frame"}
 ]
 </script>
 
@@ -382,8 +382,8 @@ const after = {
     setTimeout(() => publishTruth(), 1200);
   },
   // The cross-origin frame is pointed at the probe's little HTTP server; the parent can never read
-  // into it, so its button's box is *predicted* from the frame's own box plus the layout the server
-  // fixes (see `CROSS_ORIGIN_FIXTURE` in the probe).
+  // into it, so the button's box comes from the frame's own report (see `crossReport`); the frame's
+  // `load` event is published here as well, but it fires for the initial blank document too.
   'cross-frame': (node) => {
     const target = new URLSearchParams(location.search).get('cross');
     if (target) node.src = 'http://' + target + '/cross.html';
@@ -444,6 +444,35 @@ function buildFixtures() {
   }
 }
 
+/* The cross-origin frame is the one fixture the parent cannot measure: it cannot read into another
+   origin. So the child measures itself and posts the result, and that report is also the *only*
+   proof that its content loaded at all. Without such proof a run where the frame is still blank is
+   indistinguishable from "cross-origin content cannot be reached" — which is exactly the wrong
+   conclusion this fixture produced before the report existed (docs/21 §5.20). */
+const crossReport = { ready: false, html: 0, button: null };
+window.addEventListener('message', (event) => {
+  const report = event.data;
+  if (!report || report.snapclip !== 'cross-ready') return;
+  crossReport.ready = true;
+  crossReport.html = report.html;
+  const cross = document.getElementById('cross-frame');
+  if (cross && report.button) {
+    // The child measures inside its own viewport, so the frame's border is still ours to add —
+    // measured rather than assumed, so a fixture style change cannot quietly shift every box.
+    const outer = cross.getBoundingClientRect();
+    const style = getComputedStyle(cross);
+    const borderX = parseFloat(style.borderLeftWidth) || 0;
+    const borderY = parseFloat(style.borderTopWidth) || 0;
+    crossReport.button = [
+      Math.round(outer.left + borderX + report.button[0]),
+      Math.round(outer.top + borderY + report.button[1]),
+      Math.round(report.button[2]),
+      Math.round(report.button[3]),
+    ];
+  }
+  publishTruth();
+});
+
 /// Publish every fixture's measured box, so the probe never has to guess a box model.
 ///
 /// `[id]` also picks up the ids generated inside the fixtures (list rows, table cells, scroll
@@ -473,12 +502,14 @@ function publishTruth() {
     truth['iframe-button'] = [Math.round(outer.left + box.left), Math.round(outer.top + box.top),
                               Math.round(box.width), Math.round(box.height)];
   }
-  // Cross-origin: the parent cannot read the frame at all, so the button's box is predicted from the
-  // frame's box plus the `.frame` border (1 px) and the inner page's fixed layout (40,40,160,48).
-  const cross = document.getElementById('cross-frame');
-  if (cross && cross.src) {
-    const box = cross.getBoundingClientRect();
-    truth['cross-button'] = [Math.round(box.left + 1 + 40), Math.round(box.top + 1 + 40), 160, 48];
+  // Cross-origin: whatever the child reported about itself. `cross-ready` is published only once
+  // that report arrives, and the probe refuses to measure the cross rows without it — the geometry
+  // in it is the child's own, not a prediction from the layout the server happens to serve.
+  if (crossReport.ready) {
+    truth['cross-ready'] = [crossReport.html, 0, 0, 0];
+    if (crossReport.button) {
+      truth['cross-button'] = crossReport.button;
+    }
   }
   if (location.search.includes('truth')) {
     // The probe reads this back with GetWindowTextW: the only channel out of the page.
