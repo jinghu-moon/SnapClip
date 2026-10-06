@@ -111,8 +111,12 @@
 
   {"id":"nested-outer","rect":[24,352,320,200],"kind":"nested-outer","role":"","name":"Nested Outer",
    "expect":"nested-inner","probe":[160,100]},
+  {"id":"nested-outer","rect":[24,352,320,200],"kind":"nested-outer","role":"","name":"Outer Shell",
+   "expect":"self","probe":[30,20]},
   {"id":"nested-mid","rect":[56,384,256,136],"kind":"nested-mid","role":"","name":"Nested Mid",
    "expect":"nested-inner","probe":[128,68],"optional":true},
+  {"id":"nested-mid","rect":[56,384,256,136],"kind":"nested-mid","role":"","name":"Mid Shell",
+   "expect":"self","probe":[14,11]},
   {"id":"nested-inner","rect":[88,416,192,72],"kind":"nested-inner","role":"","name":"Deep Span",
    "expect":"self","text":"Deep Span"},
   {"id":"stack-back","rect":[368,352,240,120],"kind":"stack-back","role":"Button",

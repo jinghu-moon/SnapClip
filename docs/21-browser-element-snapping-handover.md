@@ -746,6 +746,53 @@ Page.captureScreenshot{ format, clip, fromSurface: true, captureBeyondViewport: 
    的浏览器——与 §5.11 的结论一致（Chrome 136 起默认 profile 禁用远程调试）。所以 SnapClip 若走 CDP，
    定位应是"在 SnapClip 启动的浏览器里做精准截图"，而不是"吸附你正在浏览的页面"。
 
+### 5.15 "最内层"的准确定义（2026-10-06，用户提出的边界问题）
+
+用户提出的场景：`A ⊃ B ⊃ C` 三层嵌套，光标在 **C 内** → 取 C 没问题；那光标在 **C 外、B 内** 时，
+"最内层"该怎么定义？
+
+**定义**：目标是**光标所在处命中的、DOM 层级最深的那个元素**。"盒子里没有盒子"只是它在叶节点时的
+**特例**，不能当定义用——否则 B\C 这种区域无法回答。
+
+| 光标位置 | 被该点包围的元素 | 层级最深者 | 目标 |
+| --- | --- | --- | --- |
+| C 内 | A、B、C | C | **C** |
+| C 外、B 内 | A、B | B | **B** |
+| B 外、A 内 | A | A | **A** |
+
+**为什么不能靠"矩形包含 + 面积最小"自己算**：同一层级里可能有更小的**兄弟**盒子也覆盖该点（面积最小会
+选错）；`position`/`transform`/`overflow` 会让"布局盒包含"与"视觉上在该点"不一致；还有
+`pointer-events: none`、被完全裁掉的元素、零尺寸包装层。这些正是浏览器命中测试（堆叠顺序 + 裁剪 +
+变换）在做的事，所以**目标必须来自命中测试，而不是几何猜测**。
+
+**门禁**：夹具新增两条边界点，把上表变成断言（`nested-outer` 的第二个采样点落在 A\B → 期望 A；
+`nested-mid` 的第二个采样点落在 B\C → 期望 B），当前实现 **27/27 全过**：
+
+```text
+[probe] assert nested-outer  expect=self  expected=320x200 @(72,458)   published=320x200 @(72,459)   OK  name=Outer Shell
+[probe] assert nested-mid    expect=self  expected=256x136 @(104,490)  published=256x136 @(104,491)  OK  name=Mid Shell
+[probe] assert nested-inner  expect=self  expected=192x72  @(136,522)  published=192x72  @(136,523)  OK  name=Deep Span
+```
+
+**产品规则（把"精确吸附到每一个元素盒子"变成可实现的东西）**：
+
+1. **目标 = 命中测试的最深元素**；**发布的盒子 = 它的可见部分**（祖先链 ∩ 窗口，§5.9 已实现）。
+2. **可见部分为空时向上退**：被 `overflow:hidden` 完全裁掉、或可见交集为空的节点不能发布；当前实现
+   在走查里跳过这类节点，等价于自动上退到最近一个可见祖先。命中测试侧要用同一条规则。
+3. **需要"上移一层"的交互**：只按定义走，"指着 C 却想截 A"就无解。DevTools 的做法是 **↑/↓ 沿祖先链
+   移动选中层**（`elementFromPoint` 只给最深者，父层靠遍历）。要做到"每一个元素盒子"，建议对齐这个
+   交互（滚轮或 ↑/↓ 切换层级），否则用户只能靠"把光标挪到空白处"来选择父盒子。
+4. **三种命中测试的"口味"不同，需要选一种**：
+   · 页面内 `document.elementFromPoint`：遵守 `pointer-events`（§5.12 的扩展用它）；
+   · CDP `DOM.getNodeForLocation(..., ignorePointerEventsNone)`：DevTools 的 Inspect 用它，**可以越过**
+     `pointer-events: none` 的装饰层；
+   · MSAA `accHitTest`（§5.11）：走渲染进程真正的命中测试，**完全不看 `pointer-events`**——对"抓元素
+     盒子"反而更合适。
+5. **"不可见的包装层"要不要跳过，是产品政策**：Tailwind 类页面里大量无绘制内容的布局 `<div>` 会成为
+   命中者（§5.11 实测的 `plain-div` 就是），选它"正确但可能没用"。可选过滤是"可见部分有实际绘制
+   面积/尺寸 ≥ N px 才作为终点"（`smart-screenshot` 的磁性吸附就是这么过滤的：`display`/`visibility`/
+   `opacity` + 最小 10px）。**这条需要你定**：默认选中最深元素（忠实），还是跳过无绘制包装（好用）。
+
 ---
 
 ## 6. 实测踩坑清单（每条都花了时间，务必先读）
