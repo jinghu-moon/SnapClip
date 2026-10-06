@@ -84,6 +84,12 @@ struct Counters {
     refinement_downgrades_staged: AtomicU64,
     /// Queries issued for a position whose dwell expired while another query ran.
     refinement_follow_ups: AtomicU64,
+    /// The provider's own point hit test replaced the walk's answer because it was finer.
+    refinement_precision_adopted: AtomicU64,
+    /// The provider answered, but not with a strictly finer box: the walk's answer stands.
+    refinement_precision_not_finer: AtomicU64,
+    /// The provider's hit test could not be used at all (see the last-precision line).
+    refinement_precision_unavailable: AtomicU64,
 }
 
 /// A copyable reading of every counter, for assertions and one-line reports.
@@ -132,6 +138,9 @@ pub struct WindowDetectionReading {
     pub refinement_superseded: u64,
     pub refinement_downgrades_staged: u64,
     pub refinement_follow_ups: u64,
+    pub refinement_precision_adopted: u64,
+    pub refinement_precision_not_finer: u64,
+    pub refinement_precision_unavailable: u64,
 }
 
 /// Shared diagnostics handle for the window-detection pipeline.
@@ -139,6 +148,23 @@ pub struct WindowDetectionReading {
 pub struct WindowDetectionMetrics {
     counters: Arc<Counters>,
     verbose: Arc<AtomicBool>,
+    /// The most recent precision decision in words, so the one forced line per session
+    /// (docs/21 §5.7) can say *why* the provider's finer box was or was not taken. Silent
+    /// skips cost a diagnosis round: the state that matters is "the top-up ran and did
+    /// nothing", and with verbose off there was nothing in the log to say so.
+    last_precision: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+/// What the precision top-up did with the provider's own point hit test (docs/21 §5.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrecisionOutcome {
+    /// The walk stopped above the innermost capturable box and the hit test's box became
+    /// the answer.
+    Adopted,
+    /// The provider answered, but not with a strictly finer box: the walk's answer stands.
+    NotFiner,
+    /// The provider's hit test could not be used for this window (reason in the note).
+    Unavailable,
 }
 
 impl WindowDetectionMetrics {
@@ -467,6 +493,9 @@ impl WindowDetectionMetrics {
             refinement_superseded: load(&counters.refinement_superseded),
             refinement_downgrades_staged: load(&counters.refinement_downgrades_staged),
             refinement_follow_ups: load(&counters.refinement_follow_ups),
+            refinement_precision_adopted: load(&counters.refinement_precision_adopted),
+            refinement_precision_not_finer: load(&counters.refinement_precision_not_finer),
+            refinement_precision_unavailable: load(&counters.refinement_precision_unavailable),
         }
     }
 
@@ -492,7 +521,9 @@ impl WindowDetectionMetrics {
              refinement_quarantine_added={} refinement_quarantine_hit={} \
              refinement_inflight_timeouts={} \
              refinement_superseded={} refinement_downgrades_staged={} \
-             refinement_follow_ups={}",
+             refinement_follow_ups={} \
+             refinement_precision_adopted={} refinement_precision_not_finer={} \
+             refinement_precision_unavailable={}",
             reading.snapshot_refresh_last_us,
             reading.snapshot_refresh_max_us,
             reading.snapshot_refresh_count,
@@ -536,13 +567,44 @@ impl WindowDetectionMetrics {
             reading.refinement_superseded,
             reading.refinement_downgrades_staged,
             reading.refinement_follow_ups,
+            reading.refinement_precision_adopted,
+            reading.refinement_precision_not_finer,
+            reading.refinement_precision_unavailable,
         )
     }
 
     /// Forget every counter. Called when a capture session ends so the next session's
     /// report is not polluted by the previous one.
+    /// Record what the precision top-up decided for one query, and between which boxes.
+    ///
+    /// The note is the whole point: "the top-up ran and did nothing" is the state that is
+    /// invisible in a non-verbose log, and it is the state a user reporting "elements inside
+    /// this box are not recognized" is looking at.
+    pub fn record_precision(&self, outcome: PrecisionOutcome, note: &str) {
+        let (counter, verb) = match outcome {
+            PrecisionOutcome::Adopted => (&self.counters.refinement_precision_adopted, "adopted"),
+            PrecisionOutcome::NotFiner => (&self.counters.refinement_precision_not_finer, "not-finer"),
+            PrecisionOutcome::Unavailable => (
+                &self.counters.refinement_precision_unavailable,
+                "unavailable",
+            ),
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut last) = self.last_precision.lock() {
+            *last = Some(format!("{verb} {note}"));
+        }
+    }
+
+    /// The most recent precision decision, verbatim, for the per-session forensics line.
+    pub fn last_precision(&self) -> Option<String> {
+        self.last_precision.lock().ok().and_then(|last| last.clone())
+    }
+
     pub fn reset(&self) {
         let counters = &self.counters;
+        if let Ok(mut last) = self.last_precision.lock() {
+            *last = None;
+        }
         for counter in [
             &counters.snapshot_refresh_count,
             &counters.snapshot_refresh_last_us,
@@ -588,6 +650,9 @@ impl WindowDetectionMetrics {
             &counters.refinement_superseded,
             &counters.refinement_downgrades_staged,
             &counters.refinement_follow_ups,
+            &counters.refinement_precision_adopted,
+            &counters.refinement_precision_not_finer,
+            &counters.refinement_precision_unavailable,
         ] {
             counter.store(0, Ordering::Relaxed);
         }

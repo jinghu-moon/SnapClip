@@ -956,6 +956,12 @@ where
             &format!("last deep target {}", describe_deep(self.deep_target.as_ref())),
             true,
         );
+        // Forced, like the line above: "the precision top-up ran and decided nothing" is the
+        // state a user reporting "elements inside this box are not recognized" is looking at,
+        // and it used to be invisible unless the per-operation log was switched on.
+        if let Some(precision) = self.metrics.last_precision() {
+            self.metrics.log_line(&format!("last precision {precision}"), true);
+        }
         self.metrics.reset();
         self.session.cancel();
         self.frozen = None;

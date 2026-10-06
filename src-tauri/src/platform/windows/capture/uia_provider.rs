@@ -23,7 +23,7 @@ use ::windows::Win32::UI::Accessibility::{
 };
 
 use crate::capture::geometry::{Point, Rect};
-use crate::capture::diagnostics::WindowDetectionMetrics;
+use crate::capture::diagnostics::{PrecisionOutcome, WindowDetectionMetrics};
 use crate::capture::window_detection::deep::{
     DeepSelectionProvider, DeepTarget, QueryControl, RefinementJob, RefinementOutcome,
     StopReason,
@@ -64,6 +64,23 @@ pub struct UiaDeepSelectionProvider {
     /// The capture overlay, hidden from hit testing while a point hit test runs (docs/21 §5.7).
     /// `None` in tests and probes, where nothing of ours covers the desktop.
     excluded_window: Option<isize>,
+}
+
+/// What the provider's own point hit test said about one query's position.
+///
+/// The "unusable" arm exists so the precision top-up can never fail silently: when verbose
+/// logging is off (the normal case) a top-up that quietly did nothing looked exactly like a
+/// top-up that worked, which is a diagnosis round spent on the wrong hypothesis. Every arm ends
+/// up in the per-session forensics line.
+enum ProviderHit {
+    /// A box that belongs to the queried window.
+    Box {
+        bounds: Rect,
+        control_type: i32,
+        class: String,
+    },
+    /// Nothing usable came back, and why.
+    Unusable(String),
 }
 
 /// How many children a level offered and why the others were dropped.
@@ -367,7 +384,7 @@ impl UiaDeepSelectionProvider {
         );
     }
 
-    /// What the provider's own point hit test answers for `point`, when it belongs to `hwnd`.
+    /// What the provider's own point hit test answers for `point`.
     ///
     /// The accessibility provider answers a point query with the **innermost** element there, which
     /// is exactly the "最内层可捕获区域" the product defines as the target — so this is both the
@@ -379,37 +396,69 @@ impl UiaDeepSelectionProvider {
     ///
     /// The capture overlay covers the desktop and would answer every query itself, so it is hidden
     /// from hit testing for the duration of the call.
-    fn provider_hit(&mut self, hwnd: isize, point: Point) -> Option<(Rect, i32)> {
-        let automation = self.automation()?.clone();
-        let root =
-            unsafe { automation.ElementFromHandle(HWND(hwnd as *mut core::ffi::c_void)) }.ok()?;
+    fn provider_hit(&mut self, hwnd: isize, point: Point) -> ProviderHit {
+        let Some(automation) = self.automation().cloned() else {
+            return ProviderHit::Unusable("UI Automation unavailable".into());
+        };
+        let root = match unsafe {
+            automation.ElementFromHandle(HWND(hwnd as *mut core::ffi::c_void))
+        } {
+            Ok(root) => root,
+            Err(error) => {
+                return ProviderHit::Unusable(format!("ElementFromHandle failed: {error}"));
+            }
+        };
         let _guard = win32::ClickThroughGuard::new(self.excluded_window);
-        let hit = unsafe {
+        let hit = match unsafe {
             automation.ElementFromPoint(::windows::Win32::Foundation::POINT {
                 x: point.x,
                 y: point.y,
             })
-        }
-        .ok()?;
-        let bounds = to_rect(unsafe { hit.CurrentBoundingRectangle() }.ok()?);
+        } {
+            Ok(hit) => hit,
+            Err(error) => return ProviderHit::Unusable(format!("ElementFromPoint failed: {error}")),
+        };
+        let bounds = to_rect(unsafe { hit.CurrentBoundingRectangle() }.unwrap_or_default());
+        let class = unsafe { hit.CurrentClassName() }
+            .map(|name| name.to_string())
+            .unwrap_or_default();
+        let control_type = unsafe { hit.CurrentControlType() }
+            .map(|kind| kind.0)
+            .unwrap_or(0);
         if bounds.is_empty() || !bounds.contains(point) {
-            return None;
+            return ProviderHit::Unusable(format!(
+                "answer {class:?} {}x{} at ({},{}) does not cover the point",
+                bounds.width(),
+                bounds.height(),
+                bounds.left,
+                bounds.top
+            ));
         }
-        let walker = unsafe { automation.ControlViewWalker() }.ok()?;
+        let Ok(walker) = (unsafe { automation.ControlViewWalker() }) else {
+            return ProviderHit::Unusable("ControlViewWalker unavailable".into());
+        };
         let mut current = hit.clone();
         for _ in 0..32 {
             if unsafe { automation.CompareElements(&current, &root) }
                 .map(|equal| equal.as_bool())
                 .unwrap_or(false)
             {
-                let kind = unsafe { hit.CurrentControlType() }
-                    .map(|kind| kind.0)
-                    .unwrap_or(0);
-                return Some((bounds, kind));
+                return ProviderHit::Box {
+                    bounds,
+                    control_type,
+                    class,
+                };
             }
-            current = unsafe { walker.GetParentElement(&current) }.ok()?;
+            match unsafe { walker.GetParentElement(&current) } {
+                Ok(parent) => current = parent,
+                Err(_) => break,
+            }
         }
-        None
+        ProviderHit::Unusable(format!(
+            "answer {class:?} {}x{} is not a descendant of hwnd={hwnd}",
+            bounds.width(),
+            bounds.height()
+        ))
     }
 
     /// Whether the overlay must be hidden from hit testing while a query runs (docs/21 §5.7).
@@ -621,19 +670,52 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
         // still contain the cursor — so it can only make the answer finer. Measured before it: the
         // browser fixtures had 4 of 43 sampling points where the provider was finer, File Explorer
         // none out of 25 (so Explorer is provably unaffected).
-        if let Some((hit, hit_kind)) = self.provider_hit(job.window.hwnd, job.point)
-            && should_adopt_provider_box(outcome.target, hit, hit_kind, job.point)
-        {
-            if outcome.push(hit) {
-                outcome.target = hit;
-                self.metrics.log_line(
-                    &format!(
-                        "refinement adopted provider box=({},{})->({},{}) type={hit_kind} \
-                         (walk was coarser)",
-                        hit.left, hit.top, hit.right, hit.bottom
-                    ),
-                    false,
+        //
+        // Every arm is recorded, not just the successful one: "the top-up ran and did nothing" is
+        // indistinguishable from "the top-up did not run" in a non-verbose log, and that ambiguity
+        // is what a user reporting "the elements inside this box are not recognized" runs into.
+        let walk = outcome.target;
+        match self.provider_hit(job.window.hwnd, job.point) {
+            ProviderHit::Box {
+                bounds: hit,
+                control_type,
+                class,
+            } => {
+                let finer = should_adopt_provider_box(walk, hit, control_type, job.point);
+                let adopted = finer && outcome.push(hit);
+                let note = format!(
+                    "provider={}x{} at ({},{}) type={control_type} class={class:?} walk={}x{} at \
+                     ({},{})",
+                    hit.width(),
+                    hit.height(),
+                    hit.left,
+                    hit.top,
+                    walk.width(),
+                    walk.height(),
+                    walk.left,
+                    walk.top
                 );
+                if adopted {
+                    self.metrics
+                        .record_precision(PrecisionOutcome::Adopted, &note);
+                    self.metrics.log_line(
+                        &format!("refinement adopted provider box={hit:?} (walk was coarser)"),
+                        false,
+                    );
+                } else if finer {
+                    // Finer, but the path is full: the answer stays as the walk left it.
+                    self.metrics.record_precision(
+                        PrecisionOutcome::Unavailable,
+                        &format!("{note}: the hit could not be appended to the path"),
+                    );
+                } else {
+                    self.metrics
+                        .record_precision(PrecisionOutcome::NotFiner, &note);
+                }
+            }
+            ProviderHit::Unusable(why) => {
+                self.metrics
+                    .record_precision(PrecisionOutcome::Unavailable, &why);
             }
         }
         RefinementOutcome::Target(Box::new(finish(outcome, job)))
@@ -686,6 +768,9 @@ mod tests {
     use ::windows::Win32::UI::WindowsAndMessaging::{
         DestroyWindow, DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, SW_SHOWNA, ShowWindow,
         TranslateMessage, WS_POPUP, WS_VISIBLE, CreateWindowExW, WINDOW_EX_STYLE,
+        GWL_EXSTYLE, GetSystemMetrics, HWND_TOPMOST, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE,
+        SWP_SHOWWINDOW, SetWindowLongPtrW, SetWindowPos, WS_EX_LAYERED, WS_EX_NOREDIRECTIONBITMAP,
+        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
     };
     use ::windows::core::w;
     use std::time::Duration;
@@ -779,6 +864,144 @@ mod tests {
         fn drop(&mut self) {
             let _ = unsafe { DestroyWindow(self.0) };
             pump(20);
+        }
+    }
+
+    /// What the stand-in's owning thread applies to its window.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum OverlayStyle {
+        /// Exactly the flags the capture overlay is created with (docs/14 §7).
+        Visible,
+        /// Plus `WS_EX_TRANSPARENT`: what the product sets for the duration of a hit test
+        /// (docs/21 §5.7).
+        Transparent,
+        /// Plus `WS_EX_LAYERED` as well — the combination that is click-through for real, and
+        /// therefore the fallback if the transparent flag alone is not enough.
+        LayeredTransparent,
+    }
+
+    /// The capture overlay's window shape on its own thread, without a renderer.
+    ///
+    /// A point hit test has no notion of Z order, so "who answers while our overlay covers the
+    /// desktop?" is a question about style, visibility and stacking, not about pixels: a window
+    /// with the overlay's own flags models it faithfully. Created and re-styled by its own thread,
+    /// as the product does.
+    struct OverlayStandIn {
+        mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl OverlayStandIn {
+        /// `None` when the window or its thread could not be created.
+        fn create() -> Option<Self> {
+            use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+            let mode = std::sync::Arc::new(AtomicU8::new(OverlayStyle::Visible as u8));
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel::<bool>();
+            let thread = {
+                let mode = std::sync::Arc::clone(&mode);
+                let stop = std::sync::Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let width = unsafe { GetSystemMetrics(SM_CXSCREEN) }.max(1);
+                    let height = unsafe { GetSystemMetrics(SM_CYSCREEN) }.max(1);
+                    let created = unsafe {
+                        CreateWindowExW(
+                            WINDOW_EX_STYLE(
+                                (WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP).0,
+                            ),
+                            w!("STATIC"),
+                            w!("SnapClip overlay hit-test stand-in"),
+                            WS_POPUP | WS_VISIBLE,
+                            0,
+                            0,
+                            width,
+                            height,
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
+                    };
+                    let Ok(window) = created else {
+                        let _ = ready_tx.send(false);
+                        return;
+                    };
+                    unsafe {
+                        let _ = SetWindowPos(
+                            window,
+                            Some(HWND_TOPMOST),
+                            0,
+                            0,
+                            width,
+                            height,
+                            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                        );
+                    }
+                    let _ = ready_tx.send(true);
+                    let base = (WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP).0
+                        as isize;
+                    let mut applied = OverlayStyle::Visible;
+                    let mut message = MSG::default();
+                    while !stop.load(Ordering::Relaxed) {
+                        while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+                            let _ = unsafe { TranslateMessage(&message) };
+                            unsafe { DispatchMessageW(&message) };
+                        }
+                        let wanted = match mode.load(Ordering::Relaxed) {
+                            value if value == OverlayStyle::Transparent as u8 => {
+                                OverlayStyle::Transparent
+                            }
+                            value if value == OverlayStyle::LayeredTransparent as u8 => {
+                                OverlayStyle::LayeredTransparent
+                            }
+                            _ => OverlayStyle::Visible,
+                        };
+                        if wanted != applied {
+                            let style = match wanted {
+                                OverlayStyle::Visible => base,
+                                OverlayStyle::Transparent => base | WS_EX_TRANSPARENT.0 as isize,
+                                OverlayStyle::LayeredTransparent => {
+                                    base | WS_EX_TRANSPARENT.0 as isize | WS_EX_LAYERED.0 as isize
+                                }
+                            };
+                            unsafe { SetWindowLongPtrW(window, GWL_EXSTYLE, style) };
+                            applied = wanted;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    let _ = unsafe { DestroyWindow(window) };
+                })
+            };
+            match ready_rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(true) => Some(Self {
+                    mode,
+                    stop,
+                    thread: Some(thread),
+                }),
+                _ => {
+                    stop.store(true, Ordering::Relaxed);
+                    let _ = thread.join();
+                    None
+                }
+            }
+        }
+
+        /// Hand the owning thread a new style and let it commit before the next hit test.
+        fn set_style(&self, style: OverlayStyle) {
+            self.mode
+                .store(style as u8, std::sync::atomic::Ordering::Relaxed);
+            pump(150);
+        }
+    }
+
+    impl Drop for OverlayStandIn {
+        fn drop(&mut self) {
+            self.stop
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
         }
     }
 
@@ -1216,6 +1439,11 @@ mod tests {
         // capturable element.
         let mut provider_available = 0_usize;
         let mut provider_finer = 0_usize;
+        // A finer box that was *not* adopted, and hit tests that answered nothing usable: both
+        // mean the precision top-up is not doing its job, and both were invisible while the probe
+        // only counted.
+        let mut finer_not_adopted: Vec<String> = Vec::new();
+        let mut provider_unusable: Vec<String> = Vec::new();
         let mut failures = Vec::new();
         let mut layout_drift = Vec::new();
         for fixture in &manifest {
@@ -1299,29 +1527,40 @@ mod tests {
                 }
             }
             retries += attempts.saturating_sub(1);
-            if let Some((hit_bounds, hit_kind)) =
-                hit_owner.as_ref().and_then(|automation| provider_hit_box(automation, hwnd, point))
-            {
-                provider_available += 1;
-                let published_area = published
-                    .map(|rect| i64::from(rect.width()) * i64::from(rect.height()))
-                    .unwrap_or(i64::MAX);
-                let hit_area = i64::from(hit_bounds.width()) * i64::from(hit_bounds.height());
-                if hit_area < published_area {
-                    provider_finer += 1;
-                    println!(
-                        "[probe]   provider is finer on {}: {}x{} at ({},{}) type={hit_kind} \
-                         (walk {})",
-                        fixture.id,
-                        hit_bounds.width(),
-                        hit_bounds.height(),
-                        hit_bounds.left,
-                        hit_bounds.top,
-                        published
-                            .map(|rect| format!("{}x{}", rect.width(), rect.height()))
-                            .unwrap_or_else(|| "none".into())
-                    );
+            // The provider's own hit test, through the **production** code path, so the gate below
+            // covers the mechanism the product actually runs (`provider_hit` + the adoption rule)
+            // rather than a probe-local copy of it.
+            match provider.provider_hit(hwnd, point) {
+                ProviderHit::Box {
+                    bounds: hit_bounds,
+                    control_type: hit_kind,
+                    ..
+                } => {
+                    provider_available += 1;
+                    let published_area = published
+                        .map(|rect| i64::from(rect.width()) * i64::from(rect.height()))
+                        .unwrap_or(i64::MAX);
+                    let hit_area = i64::from(hit_bounds.width()) * i64::from(hit_bounds.height());
+                    if hit_area < published_area {
+                        provider_finer += 1;
+                        println!(
+                            "[probe]   provider is finer on {}: {}x{} at ({},{}) type={hit_kind} \
+                             (walk {})",
+                            fixture.id,
+                            hit_bounds.width(),
+                            hit_bounds.height(),
+                            hit_bounds.left,
+                            hit_bounds.top,
+                            published
+                                .map(|rect| format!("{}x{}", rect.width(), rect.height()))
+                                .unwrap_or_else(|| "none".into())
+                        );
+                        if hit_kind != crate::capture::window_detection::uia::TEXT_CONTROL_TYPE {
+                            finer_not_adopted.push(fixture.id.clone());
+                        }
+                    }
                 }
+                ProviderHit::Unusable(why) => provider_unusable.push(format!("{}: {why}", fixture.id)),
             }
             let expected = match fixture.expect.as_str() {
                 "none" => None,
@@ -1417,6 +1656,92 @@ mod tests {
             }
         }
 
+        // --- Does our own overlay hide the page from the provider's hit test? ---
+        //
+        // The precision top-up (docs/21 §5.7) asks `ElementFromPoint` what is under the cursor,
+        // and the product asks that with the capture overlay covering the desktop. This phase
+        // builds the same shape over the live fixture — a topmost, full-screen, tool-window overlay
+        // owned by another thread — and reports who answers in four states. It is the measurement
+        // §6 row 9 made from a branch that was rolled back, which is why the product-side failure it
+        // would explain ("the top-up works here and does nothing there") went unseen for a round.
+        if let Some(automation) = hit_owner.as_ref() {
+            let sample = manifest
+                .iter()
+                .filter_map(|fixture| {
+                    let measured = *truth.get(&fixture.id)?;
+                    (measured[2] > 0 && measured[3] > 0).then(|| {
+                        let [dx, dy] = fixture.probe.unwrap_or([measured[2] / 2, measured[3] / 2]);
+                        (
+                            fixture.id.clone(),
+                            Point::new(
+                                viewport.left + measured[0] + dx,
+                                viewport.top + measured[1] + dy,
+                            ),
+                            Rect::new(
+                                viewport.left + measured[0],
+                                viewport.top + measured[1],
+                                viewport.left + measured[0] + measured[2],
+                                viewport.top + measured[1] + measured[3],
+                            ),
+                        )
+                    })
+                })
+                .next();
+            if let Some((id, point, expected)) = sample {
+                let answer = |label: &str| {
+                    let hit = unsafe {
+                        automation.ElementFromPoint(::windows::Win32::Foundation::POINT {
+                            x: point.x,
+                            y: point.y,
+                        })
+                    };
+                    let Ok(element) = hit else {
+                        println!("[overlay] {label}: ElementFromPoint failed");
+                        return;
+                    };
+                    let class = unsafe { element.CurrentClassName() }
+                        .map(|name| name.to_string())
+                        .unwrap_or_default();
+                    let kind = unsafe { element.CurrentControlType() }
+                        .map(|kind| kind.0)
+                        .unwrap_or(0);
+                    let bounds =
+                        to_rect(unsafe { element.CurrentBoundingRectangle() }.unwrap_or_default());
+                    println!(
+                        "[overlay] {label}: {}({},{})-({},{}) type={kind} class={class:?}",
+                        control_type_name(kind),
+                        bounds.left,
+                        bounds.top,
+                        bounds.right,
+                        bounds.bottom
+                    );
+                };
+                println!(
+                    "[overlay] sample fixture={id} point=({},{}) fixture_box={}x{} at ({},{})",
+                    point.x,
+                    point.y,
+                    expected.width(),
+                    expected.height(),
+                    expected.left,
+                    expected.top
+                );
+                answer("no overlay");
+                match OverlayStandIn::create() {
+                    Some(overlay) => {
+                        pump(300);
+                        answer("overlay topmost");
+                        overlay.set_style(OverlayStyle::Transparent);
+                        answer("overlay +WS_EX_TRANSPARENT");
+                        overlay.set_style(OverlayStyle::LayeredTransparent);
+                        answer("overlay +WS_EX_LAYERED|TRANSPARENT");
+                        overlay.set_style(OverlayStyle::Visible);
+                        answer("overlay visible again");
+                    }
+                    None => println!("[overlay] the stand-in window could not be created"),
+                }
+            }
+        }
+
         let _ = child.kill();
         println!(
             "[probe] asserted={asserted} passed={passed} failed={} slow_fixtures={retries}",
@@ -1426,6 +1751,14 @@ mod tests {
             "[probe] precision: provider_hit_available={provider_available} \
              provider_hit_is_finer_on={provider_finer}"
         );
+        for (label, offenders) in [
+            ("NOT ADOPTED (the provider was finer and we published the coarser box)", &finer_not_adopted),
+            ("UNUSABLE HIT TEST", &provider_unusable),
+        ] {
+            for offender in offenders {
+                println!("[probe] {label}: {offender}");
+            }
+        }
         print_latency_summary("probe", &mut latencies);
         for failure in &failures {
             println!("[probe] FAIL {failure}");
@@ -1531,49 +1864,6 @@ mod tests {
     /// Everything after `marker` in `title`, or `None` when the marker is absent.
     fn marker_payload<'a>(title: &'a str, marker: &str) -> Option<&'a str> {
         title.find(marker).map(|at| &title[at + marker.len()..])
-    }
-
-    /// n / p50 / p95 / max of the product walk's per-query latency, in milliseconds.
-    /// What the **provider itself** says is under `point`, when the answer belongs to `hwnd`.
-   ///
-    /// This is the yardstick for "how precise is our walk?": the accessibility provider's own point
-    /// hit test answers with the innermost element at that point by construction, and it is what the
-    /// reference selector (`ScreenSnap-master/core/window_uia.py`) uses as its starting candidate.
-    /// Ownership is proved by walking up to the window's root element, exactly as `docs/21 §5.3`
-    /// describes — a point hit test asks the desktop, so it must be verified.
-    fn provider_hit_box(
-        automation: &IUIAutomation,
-        hwnd: isize,
-        point: Point,
-    ) -> Option<(Rect, i32)> {
-        let root =
-            unsafe { automation.ElementFromHandle(HWND(hwnd as *mut core::ffi::c_void)) }.ok()?;
-        let hit = unsafe {
-            automation.ElementFromPoint(::windows::Win32::Foundation::POINT {
-                x: point.x,
-                y: point.y,
-            })
-        }
-        .ok()?;
-        let bounds = to_rect(unsafe { hit.CurrentBoundingRectangle() }.ok()?);
-        if bounds.is_empty() || !bounds.contains(point) {
-            return None;
-        }
-        let walker = unsafe { automation.ControlViewWalker() }.ok()?;
-        let mut current = hit.clone();
-        for _ in 0..32 {
-            if unsafe { automation.CompareElements(&current, &root) }
-                .map(|equal| equal.as_bool())
-                .unwrap_or(false)
-            {
-                let kind = unsafe { hit.CurrentControlType() }
-                    .map(|kind| kind.0)
-                    .unwrap_or(0);
-                return Some((bounds, kind));
-            }
-            current = unsafe { walker.GetParentElement(&current) }.ok()?;
-        }
-        None
     }
 
     /// n / p50 / p95 / max of the product walk's per-query latency, in milliseconds.
@@ -1698,7 +1988,6 @@ mod tests {
         let window_area = i64::from(client.width()) * i64::from(client.height());
         let mut areas = Vec::new();
         let mut latencies: Vec<f64> = Vec::new();
-        let automation = provider.automation().cloned();
         let mut provider_finer = 0_usize;
         let mut provider_available = 0_usize;
         for fy in [30_i32, 40, 50, 60, 70] {
@@ -1724,12 +2013,18 @@ mod tests {
                 };
                 let area = i64::from(rect.width()) * i64::from(rect.height());
                 areas.push(area);
-                // Precision yardstick: what the provider's own hit test answers. A hit box that is
-                // strictly smaller but still contains the point is a place our walk stopped above
-                // the innermost capturable box.
-                let hit = automation.as_ref().and_then(|automation| {
-                    provider_hit_box(automation, hwnd, point)
-                });
+                // Precision yardstick: what the provider's own hit test answers, through the
+                // production path. A hit box that is strictly smaller but still contains the point
+                // is a place our walk stopped above the innermost capturable box — and the
+                // adoption rule is supposed to remove exactly those.
+                let hit = match provider.provider_hit(hwnd, point) {
+                    ProviderHit::Box {
+                        bounds,
+                        control_type,
+                        ..
+                    } => Some((bounds, control_type)),
+                    ProviderHit::Unusable(_) => None,
+                };
                 if hit.is_some() {
                     provider_available += 1;
                 }
