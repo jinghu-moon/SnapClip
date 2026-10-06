@@ -1114,6 +1114,7 @@ where
                 // …and neither a preview label nor the one-shot hint.
                 preview_label: None,
                 preview_is_window: false,
+                level_badge: None,
                 hint: None,
             };
             let Some(renderer) = self.renderer.as_mut() else {
@@ -1413,12 +1414,28 @@ where
         Some(preview_label(
             rect,
             self.preview_is_window(),
-            self.deep_levels,
+            self.walked_up(),
             matches!(
                 self.metrics.last_precision_outcome(),
                 Some(crate::capture::diagnostics::PrecisionOutcome::Unavailable)
             ),
         ))
+    }
+
+    /// Whether the user has walked off the deepest level — which is what makes the label say `容器`
+    /// and what makes the level badge appear at all (docs/21 §5.22).
+    fn walked_up(&self) -> bool {
+        self.deep_levels.is_some_and(|chain| !chain.is_deepest())
+    }
+
+    /// The level badge's content: `(current, total)` in 1-based levels, or `None` while the answer
+    /// itself is selected (docs/21 §5.22).
+    ///
+    /// The deepest level *is* the answer, and it is where every preview starts, so a badge there
+    /// would read `9/9` for the state that means "nothing has been walked": the counter means "you
+    /// moved". A single-level chain has nothing to count either.
+    fn level_badge(&self) -> Option<(usize, usize)> {
+        level_badge_labels(self.deep_levels)
     }
 
     /// Whether the previewed box is the whole window rather than an element (docs/21 §5.21).
@@ -2838,6 +2855,7 @@ where
         // last precision decision, which are `self` reads.
         let preview_label = self.preview_label_text();
         let preview_is_window = self.preview_is_window();
+        let level_badge = self.level_badge();
         let hint = self.hint_text();
         let Some(renderer) = self.renderer.as_mut() else {
             return;
@@ -2873,6 +2891,7 @@ where
             chain_rings,
             preview_label,
             preview_is_window,
+            level_badge,
             hint,
         };
         // Live borrow of annotation document avoids cloning items every tick.
@@ -3181,39 +3200,45 @@ fn should_teach(taught: bool, showing: bool) -> bool {
 /// The text the automatic-snap preview's label shows (docs/21 §5.21).
 ///
 /// Pure so the format is testable. Beyond the size it carries the three things a user cannot infer
-/// from the rectangle: **what the box is** (窗口 / 容器 / 元素), which level of the ancestor chain
-/// is selected (only when there is a chain to walk, and never as a bare count), and that nothing
-/// answered for this position — the last one as `?`, because a fallback must not look like a
-/// confident answer.
+/// from the rectangle: **what the box is** (窗口 / 容器 / 元素) and that nothing answered for this
+/// position — the last one as `?`, because a fallback must not look like a confident answer.
 ///
 /// The kind word comes first because it is the question the user is actually asking ("did it snap
-/// to the thing, or to the shell around it?"), and it is the only one of the three facts that needs
-/// no explanation. `容器` is what makes a walked-up-to box self-explanatory without reading a
-/// fraction; the fraction then says how much of the chain is left.
+/// to the thing, or to the shell around it?"), and it is the only one of the two facts that needs no
+/// explanation. `容器` is what makes a walked-up-to box self-explanatory without reading a number.
+///
+/// **The level counter is not here** (docs/21 §5.22): it moved to its own dot-strip badge, because
+/// the two say different things — the label says "what this box is", the badge says "where it sits on
+/// the chain" — and because leaving it in made the label change width on every notch of the wheel.
 ///
 /// `pub(crate)` so the embedded-font coverage gate can require its characters
 /// (`win::d2d::tests::the_embedded_subset_covers_the_strings_the_overlay_draws`).
-pub(crate) fn preview_label(
-    rect: Rect,
-    is_window: bool,
-    levels: Option<LevelChain>,
-    degraded: bool,
-) -> String {
+pub(crate) fn preview_label(rect: Rect, is_window: bool, walked: bool, degraded: bool) -> String {
     let kind = if is_window {
         "窗口"
-    } else if levels.is_some_and(|chain| !chain.is_deepest()) {
+    } else if walked {
         "容器"
     } else {
         "元素"
     };
     let mut text = format!("{}×{} px  {kind}", rect.width(), rect.height());
-    if let Some(chain) = levels.filter(|chain| chain.len() > 1 && !chain.is_deepest()) {
-        text.push_str(&format!(" {}/{}", chain.index() + 1, chain.len()));
-    }
     if degraded {
         text.push('?');
     }
     text
+}
+
+/// The level badge's content: `(current, total)` in 1-based levels (docs/21 §5.22).
+///
+/// `None` while the answer itself is selected: the deepest level *is* the answer and is where every
+/// preview starts, so a badge there would read `9/9` for the state that means "nothing has been
+/// walked" — the counter means "you moved". A single-level chain has nothing to count either.
+///
+/// Pure, so the badge, the teaching hint and the confirm line can be asserted to agree on one
+/// numbering rather than three separate ones.
+pub(crate) fn level_badge_labels(chain: Option<LevelChain>) -> Option<(usize, usize)> {
+    let chain = chain.filter(|chain| chain.len() > 1 && !chain.is_deepest())?;
+    Some((chain.index() + 1, chain.len()))
 }
 
 /// `2/6` for the confirm line: which level of the chain the ancestor walk selected (docs/21 §5.17).
@@ -3572,43 +3597,20 @@ mod tests {
     #[test]
     fn the_preview_label_names_the_element_it_snapped_to() {
         let rect = Rect::new(10, 10, 410, 810);
-        assert_eq!(preview_label(rect, false, None, false), "400×800 px  元素");
-        // A chain of one is not a walk: the only level is the answer itself.
-        assert_eq!(
-            preview_label(rect, false, Some(LevelChain::new(1)), false),
-            "400×800 px  元素"
-        );
+        assert_eq!(preview_label(rect, false, false, false), "400×800 px  元素");
     }
 
-    /// Walking the chain has to be visible, and it has to say *what* the user walked to: the
-    /// size alone cannot distinguish "a wide element" from "the container around the element".
+    /// The label says *what* the box is — the size alone cannot tell "a wide element" from "the
+    /// container around the element" — and it says nothing about *where* on the chain, which is the
+    /// badge's job (docs/21 §5.22).
     #[test]
-    fn the_preview_label_calls_a_walked_to_box_a_container_and_counts_the_level() {
+    fn the_preview_label_calls_a_walked_to_box_a_container_without_counting_levels() {
         let rect = Rect::new(0, 0, 100, 50);
-        let mut chain = LevelChain::new(7);
-        // A fresh chain is the deepest level, and "deepest" is the state the answer arrived in,
-        // so it carries no counter: the counter means "you moved".
-        assert_eq!(
-            preview_label(rect, false, Some(chain), false),
-            "100×50 px  元素"
-        );
-        for _ in 0..4 {
-            assert!(chain.shallower());
-        }
-        assert_eq!(chain.index(), 2);
-        assert_eq!(
-            preview_label(rect, false, Some(chain), false),
-            "100×50 px  容器 3/7"
-        );
-        // …and the outermost level is the window frame itself, which the overlay reports through
-        // `is_window` (it is the same box as the v1 fallback).
-        assert!(chain.shallower());
-        assert!(chain.shallower());
-        assert!(!chain.shallower(), "index 0 is the end of the walk");
-        assert_eq!(
-            preview_label(rect, true, Some(chain), false),
-            "100×50 px  窗口 1/7"
-        );
+        assert_eq!(preview_label(rect, false, false, false), "100×50 px  元素");
+        assert_eq!(preview_label(rect, false, true, false), "100×50 px  容器");
+        // The window frame is reported through `is_window` (walking to it is the same box as the
+        // v1 fallback), and it wins over the walked-up noun.
+        assert_eq!(preview_label(rect, true, true, false), "100×50 px  窗口");
     }
 
     /// The window name and the fallback mark are independent of the counter, so "the whole
@@ -3616,19 +3618,14 @@ mod tests {
     #[test]
     fn the_preview_label_names_the_window_and_the_unsupported_fallback() {
         let rect = Rect::new(0, 0, 3840, 2088);
-        assert_eq!(preview_label(rect, true, None, false), "3840×2088 px  窗口");
+        assert_eq!(preview_label(rect, true, false, false), "3840×2088 px  窗口");
         assert_eq!(
-            preview_label(rect, false, None, true),
+            preview_label(rect, false, false, true),
             "3840×2088 px  元素?",
             "a fallback must not look like a confident answer"
         );
-        assert_eq!(preview_label(rect, true, None, true), "3840×2088 px  窗口?");
-        let mut chain = LevelChain::new(4);
-        assert!(chain.shallower());
-        assert_eq!(
-            preview_label(rect, false, Some(chain), true),
-            "3840×2088 px  容器 3/4?"
-        );
+        assert_eq!(preview_label(rect, true, false, true), "3840×2088 px  窗口?");
+        assert_eq!(preview_label(rect, false, true, true), "3840×2088 px  容器?");
     }
 
     /// The teaching sentence's two rules, as a truth table: once per session, but it follows a
@@ -3643,8 +3640,8 @@ mod tests {
         assert!(!should_teach(true, false));
     }
 
-    /// The sentence that teaches the counter, the label, and the `level=` the confirm line prints
-    /// all have to agree on one numbering — that is the whole point of showing three of them.
+    /// The badge, the sentence that teaches it, and the `level=` the confirm line prints all have to
+    /// agree on one numbering — that is the whole point of showing three of them.
     #[test]
     fn the_level_hint_counts_the_way_the_confirm_line_does() {
         // The state a real session reaches by rolling up one level out of nine (a real log line
@@ -3653,15 +3650,21 @@ mod tests {
         assert!(chain.shallower());
         assert_eq!(chain.index() + 1, 8);
         assert_eq!(chain.len(), 9);
-        // Confirm line (after a confirmation) and label (live) and hint (once) agree.
+        // Confirm line (after a confirmation), badge (live) and hint (once) agree.
         assert_eq!(super::describe_level(Some(chain)), "8/9");
-        assert_eq!(
-            preview_label(Rect::new(0, 0, 100, 50), false, Some(chain), false),
-            "100×50 px  容器 8/9"
-        );
+        assert_eq!(super::level_badge_labels(Some(chain)), Some((8, 9)));
         assert_eq!(
             level_hint(chain.index() + 1, chain.len()),
             "吸附层级 8/9（1=窗口）· 滚轮 / ↑↓ 切换"
         );
+        // The label says nothing about the level any more, so its text cannot drift from the badge.
+        assert_eq!(
+            preview_label(Rect::new(0, 0, 100, 50), false, true, false),
+            "100×50 px  容器"
+        );
+        // …and the deepest level has no badge: it is the state "nothing has been walked".
+        assert_eq!(super::level_badge_labels(Some(LevelChain::new(9))), None);
+        assert_eq!(super::level_badge_labels(Some(LevelChain::new(1))), None);
+        assert_eq!(super::level_badge_labels(None), None);
     }
 }

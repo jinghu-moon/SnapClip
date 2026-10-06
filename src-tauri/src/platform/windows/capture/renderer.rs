@@ -61,6 +61,8 @@ pub struct OverlayFrameState {
     /// Whether the previewed box is the whole window rather than an element (docs/21 §5.21) — the
     /// renderer then uses a neutral wash and a thin outline instead of the accent preview.
     pub preview_is_window: bool,
+    /// The level badge's (current, total), 1-based, while the walk is above the answer (docs/21 §5.22).
+    pub level_badge: Option<(usize, usize)>,
     /// A one-shot hint in monitor-local coordinates (docs/21 §5.21): the level walk has to be
     /// explained once, or nobody finds it.
     pub hint: Option<(Point, String)>,
@@ -85,6 +87,7 @@ impl OverlayFrameState {
             chain_rings: Vec::new(),
             preview_label: None,
             preview_is_window: false,
+            level_badge: None,
             hint: None,
         }
     }
@@ -219,6 +222,7 @@ impl Win32Renderer {
             chain_rings: state.chain_rings.clone(),
             preview_label: state.preview_label.clone(),
             preview_is_window: state.preview_is_window,
+            level_badge: state.level_badge,
             hint: state.hint.clone(),
         };
         self.d2d.render(&view)?;
@@ -264,6 +268,7 @@ impl Win32Renderer {
             // …and so are the labels and the one-shot hint: an artifact never carries UI.
             preview_label: None,
             preview_is_window: false,
+            level_badge: None,
             hint: None,
         };
         self.d2d.render_export(&view)

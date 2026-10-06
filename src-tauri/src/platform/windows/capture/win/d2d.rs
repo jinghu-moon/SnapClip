@@ -255,6 +255,9 @@ pub struct RenderView {
     pub preview_label: Option<String>,
     /// The previewed box is the whole window rather than an element: neutral wash, thin outline.
     pub preview_is_window: bool,
+    /// The level badge's (current, total), 1-based (docs/21 §5.22); None while the answer
+    /// itself is selected. Drawn as a dot strip, so it costs no text layout and no font glyphs.
+    pub level_badge: Option<(usize, usize)>,
     /// One-shot hint in back-buffer coordinates (docs/21 §5.21).
     pub hint: Option<(Point, String)>,
 }
@@ -286,6 +289,7 @@ impl RenderView {
             chain_rings: Vec::new(),
             preview_label: None,
             preview_is_window: false,
+            level_badge: None,
             hint: None,
         }
     }
@@ -587,6 +591,7 @@ impl OverlayRenderer {
             chain_rings: Vec::new(),
             preview_label: None,
             preview_is_window: false,
+            level_badge: None,
             hint: None,
             ..view.clone()
         };
@@ -850,6 +855,170 @@ impl OverlayRenderer {
         if let Some((at, text)) = view.hint.as_ref() {
             self.draw_hint_at(Rect::new(at.x, at.y, at.x, at.y), text, view, self.metrics)?;
         }
+        // The level badge, last: it sits inside the box, over everything else there (docs/21 §5.22).
+        if let (Some((current, total)), Some(preview)) = (view.level_badge, view.preview_bounds) {
+            let rect = preview.intersect(view.frame);
+            if !rect.is_empty() {
+                self.draw_level_badge(rect, current, total, view, self.metrics)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The level badge: one mark per level, filled up to `current`, the current one in the capture
+    /// colour (docs/21 §5.22).
+    ///
+    /// A **dot strip** rather than text, for three reasons the prototype established: position is
+    /// the ordinal, so nothing has to be learned; it mirrors the rings on screen, in the same colours
+    /// (blue = chain, green = you); and it needs no glyphs at all, so it cannot join the embedded
+    /// font's allowlist problem. The marks are rounded *squares*, not circles: at 5 logical pixels a
+    /// circle is almost entirely anti-aliasing while a rounded square lands on the pixel grid.
+    fn draw_level_badge(
+        &mut self,
+        anchor: Rect,
+        current: usize,
+        total: usize,
+        view: &RenderView,
+        metrics: RenderMetrics,
+    ) -> Result<(), String> {
+        use crate::capture::geometry::{level_badge_placement, level_badge_size};
+
+        const PITCH: f32 = 7.0;
+        const PADDING: f32 = 6.0;
+        const MARK: f32 = 5.0;
+        const CURRENT: f32 = 6.0;
+        /// Past twelve levels the strip shows a window around the current one; the ends get a tick.
+        const WINDOW: usize = 9;
+
+        if current == 0 || current > total {
+            return Ok(());
+        }
+        let scale = (metrics.dpi as f32 / 96.0).max(1.0);
+        let (logical_width, logical_height) = level_badge_size(total);
+        let size = (
+            (logical_width as f32 * scale).round() as i32,
+            (logical_height as f32 * scale).round() as i32,
+        );
+        let work_area = if view.work_area.is_empty() {
+            view.frame
+        } else {
+            view.work_area
+        };
+        let Some((panel, _where)) = level_badge_placement(
+            anchor,
+            size,
+            work_area,
+            (metrics.label_gap * scale).round() as i32,
+            Some(view.cursor),
+        ) else {
+            return Ok(());
+        };
+
+        let background =
+            self.require_brush(&self.label_background_brush, "label background brush")?;
+        let ring = self.require_brush(&self.chain_ring_brush, "chain ring brush")?;
+        let shadow = self.require_brush(&self.chain_shadow_brush, "chain shadow brush")?;
+        let capture = self.require_brush(&self.capture_brush, "capture brush")?;
+        let pitch = PITCH * scale;
+        let padding = PADDING * scale;
+        let windowed = total > WINDOW;
+        let slots = if windowed { WINDOW } else { total };
+        let start = if windowed {
+            current.saturating_sub(1).min(total.saturating_sub(slots))
+        } else {
+            0
+        };
+        unsafe {
+            self.d2d.FillRoundedRectangle(
+                &D2D1_ROUNDED_RECT {
+                    rect: to_d2d(panel),
+                    radiusX: 3.0 * scale,
+                    radiusY: 3.0 * scale,
+                },
+                &background,
+            );
+            let centre_y = panel.top as f32 + panel.height() as f32 / 2.0;
+            for slot in 0..slots {
+                let level = start + slot + 1;
+                let centre_x = panel.left as f32
+                    + padding
+                    + (if windowed { pitch } else { 0.0 })
+                    + slot as f32 * pitch
+                    + pitch / 2.0;
+                // Three states, three channels: solid vs hollow, brightness, and size (only the
+                // current mark grows). Any single one is not enough at 5 px — the prototype measured
+                // that a lone brightening reads as "a few rings and one dot".
+                let is_current = level == current;
+                let is_past = level < current;
+                let (size, fill, stroke) = if is_current {
+                    (
+                        CURRENT * scale,
+                        Some(capture_color(1.0)),
+                        Some(color(0.0, 0.0, 0.0, 0.95)),
+                    )
+                } else if is_past {
+                    (MARK * scale, Some(chain_ring_color(0.95)), None)
+                } else {
+                    // The marks ahead are drawn at the *current* size: a 5 px rounded square with a
+                    // 1 px stroke has a hole of barely one pixel, so it renders as a solid mark and
+                    // the past/ahead distinction disappears (measured: the scan read five solid
+                    // marks instead of `●●●◉○○○`).
+                    (CURRENT * scale, None, Some(chain_ring_color(0.5)))
+                };
+                let left = (centre_x - size / 2.0).round();
+                let top = (centre_y - size / 2.0).round();
+                let mark = D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: left + 0.5,
+                        top: top + 0.5,
+                        right: left + size - 0.5,
+                        bottom: top + size - 0.5,
+                    },
+                    radiusX: (size / 3.0).max(1.0),
+                    radiusY: (size / 3.0).max(1.0),
+                };
+                // Every draw sets the colour on the brush it actually uses. Sharing one mutable ring
+                // brush across the three states is only safe that way: the first version left it
+                // green after the current mark, so the hollow marks that followed were stroked green
+                // as well (the strip read as three green dots).
+                if let Some(kind) = fill {
+                    if is_current {
+                        self.d2d.FillRoundedRectangle(&mark, &capture);
+                    } else {
+                        let _ = ring.SetColor(&kind);
+                        self.d2d.FillRoundedRectangle(&mark, &ring);
+                    }
+                }
+                if let Some(kind) = stroke {
+                    if is_current {
+                        let _ = shadow.SetColor(&kind);
+                        self.d2d
+                            .DrawRoundedRectangle(&mark, &shadow, 1.0 * scale, None);
+                    } else {
+                        let _ = ring.SetColor(&kind);
+                        self.d2d
+                            .DrawRoundedRectangle(&mark, &ring, 1.0 * scale, None);
+                    }
+                }
+            }
+            // Windowed strips get a tick at each end: "there are more levels this way".
+            if windowed {
+                for at in [panel.left as f32 + padding, panel.right as f32 - padding] {
+                    let tick = D2D1_ROUNDED_RECT {
+                        rect: D2D_RECT_F {
+                            left: at - 0.5 * scale,
+                            top: centre_y - 2.0 * scale,
+                            right: at + 0.5 * scale,
+                            bottom: centre_y + 2.0 * scale,
+                        },
+                        radiusX: 0.5 * scale,
+                        radiusY: 0.5 * scale,
+                    };
+                    let _ = ring.SetColor(&chain_ring_color(0.5));
+                    self.d2d.FillRoundedRectangle(&tick, &ring);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1064,6 +1233,7 @@ impl OverlayRenderer {
             size,
             work_area,
             metrics.label_gap.round() as i32,
+            Some(view.cursor),
         )
     }
 
@@ -2112,6 +2282,16 @@ fn chain_ring_color(alpha: f32) -> D2D1_COLOR_F {
     )
 }
 
+/// The capture green at `alpha` (see [`CAPTURE_RGB`]).
+fn capture_color(alpha: f32) -> D2D1_COLOR_F {
+    color(
+        CAPTURE_RGB.0,
+        CAPTURE_RGB.1,
+        CAPTURE_RGB.2,
+        alpha.clamp(0.0, 1.0),
+    )
+}
+
 /// Build the point type Direct2D expects.
 fn vector2(x: f32, y: f32) -> Vector2 {
     Vector2 { X: x, Y: y }
@@ -2142,7 +2322,7 @@ mod tests {
     use ::windows::Win32::Graphics::Direct2D::Common::D2D1_ALPHA_MODE_PREMULTIPLIED;
     use ::windows::Win32::Graphics::Direct2D::D2D1_BITMAP_OPTIONS_TARGET;
     use crate::capture::geometry::{
-        Handle, Point, Rect, SizeLabelPlacement, size_label_placement,
+        Handle, LabelWhere, Point, Rect, SizeLabelPlacement, size_label_placement,
     };
 
     /// A flat-coloured BGRA frame.
@@ -2609,6 +2789,93 @@ mod tests {
     }
 
     /// The size label is painted with an opaque panel above the selection when there is room.
+    /// The level badge is a dot strip, and this is the check that caught every version of it that
+    /// read wrong in the prototype: scan the strip's centre row and count the marks — five solid
+    /// (the levels behind you), one green (the one you are on), three hollow (the ones still
+    /// inside). A single brightening would pass a "did it change" test; only counting the marks
+    /// shows `●●●●●◉○○○`.
+    #[test]
+    fn the_level_badge_reads_as_five_solid_one_green_and_three_hollow() {
+        let Ok(device) = super::GraphicsDevice::create() else {
+            return;
+        };
+        let width = 240u32;
+        let height = 120u32;
+        let background = [40u8, 44, 52, 255];
+        let Ok(mut renderer) = OverlayRenderer::new(std::sync::Arc::new(device), 96) else {
+            return;
+        };
+        renderer
+            .update_frame(width, height, &solid_bgra(width, height, background))
+            .unwrap();
+        renderer.ensure_back_buffer(width, height).unwrap();
+        let target = renderer
+            .device()
+            .create_render_target_texture(width, height)
+            .unwrap();
+        let context = renderer.device().create_d2d_context().unwrap();
+        let bitmap = super::super::d3d11::create_bitmap_from_texture(
+            &context,
+            &target.texture,
+            D2D1_BITMAP_OPTIONS_TARGET,
+            D2D1_ALPHA_MODE_PREMULTIPLIED,
+        )
+        .unwrap();
+
+        let mut view = RenderView::new(Rect::from_origin_size(
+            Point::new(0, 0),
+            width as i32,
+            height as i32,
+        ));
+        view.cursor_visible = false;
+        view.show_chrome = false;
+        // A box big enough for the badge to sit inside it, selected at level 6 of 9.
+        view.preview_bounds = Some(Rect::new(20, 20, 220, 100));
+        view.level_badge = Some((6, 9));
+        renderer.draw_to(&bitmap, &view).unwrap();
+        let pixels = renderer.device().read_back_bgra(&target.texture).unwrap();
+
+        // The badge sits in the box's top-right corner, 6 px in.
+        let (badge_w, badge_h) = crate::capture::geometry::level_badge_size(9);
+        let badge = Rect::new(220 - 6 - badge_w, 20 + 6, 220 - 6, 20 + 6 + badge_h);
+        let y = (badge.top + badge.height() / 2) as u32;
+        // Classify each pixel of the strip's centre row: a mark is anything brighter than the panel
+        // it is drawn on, and green is the capture colour.
+        let mut signature = String::new();
+        let mut run = (char::from(b' '), 0);
+        for x in badge.left..badge.right {
+            let pixel = pixel_at(&pixels, width, x as u32, y);
+            let bright = pixel[0] as i32 + pixel[1] as i32 + pixel[2] as i32 > 120;
+            let green = pixel[1] as i32 > pixel[0] as i32 + 20 && pixel[1] > pixel[2];
+            let kind = if green {
+                'G'
+            } else if bright {
+                'M'
+            } else {
+                '.'
+            };
+            if kind == run.0 {
+                run.1 += 1;
+            } else {
+                if run.1 > 0 {
+                    signature.push_str(&format!("{}{}", run.0, run.1));
+                }
+                run = (kind, 1);
+            }
+        }
+        if run.1 > 0 {
+            signature.push_str(&format!("{}{}", run.0, run.1));
+        }
+        // Decoded: 6 px of padding, then five solid marks (`M3`, the rest of each 5 px mark being
+        // anti-aliased), the green current mark (`G4 .2`), then three hollow marks — each one two
+        // `M2` edges with a hole between them — and the trailing padding. That is `●●●●●◉○○○`.
+        assert_eq!(
+            signature, ".6M3.4M3.4M3.4M3.4M3.4G4.2M2.2M2.1M2.2M2.1M2.2M2.6M2",
+            "five solid marks, the green current one, then the three hollow marks' edges",
+        );
+    }
+
+    /// The size label is painted with an opaque panel above the selection when there is room.
     /// The regression the user found on a real screen: a mid-tone blue ring on a **masked light**
     /// page. The mask (45% black) lands a white page at ~140 grey, whose luminance is nearly that of
     /// a mid blue — so the first ring colour differed in hue and not in brightness and could not be
@@ -2906,12 +3173,13 @@ mod tests {
             (80, 24),
             Rect::new(0, 0, 400, 400),
             8,
+            None,
         );
         assert_eq!(
             placement,
             Some(SizeLabelPlacement {
                 rect: Rect::new(0, 58, 80, 82),
-                above: false
+                where_: LabelWhere::Below,
             })
         );
         for handle in Handle::ALL {
@@ -3084,7 +3352,6 @@ mod tests {
     /// inline in this file without being listed here is caught by the builder's guard, which scans
     /// the text-drawing files and fails on any character this list does not account for.
     fn overlay_drawn_strings() -> Vec<String> {
-        use crate::capture::window_detection::LevelChain;
         use crate::platform::windows::capture::overlay::{LEVEL_HINT, level_hint, preview_label};
 
         let mut drawn = vec![
@@ -3099,15 +3366,12 @@ mod tests {
             drawn.push(key.to_owned());
             drawn.push(description.to_owned());
         }
-        let walked = {
-            let mut chain = LevelChain::new(9);
-            chain.shallower();
-            chain
-        };
         // Every state the preview label has: element, walked-to container, whole window, degraded.
-        drawn.push(preview_label(Rect::new(0, 0, 341, 55), false, None, false));
-        drawn.push(preview_label(Rect::new(0, 0, 689, 55), false, Some(walked), true));
-        drawn.push(preview_label(Rect::new(0, 0, 3840, 2088), true, None, false));
+        // The level badge is *not* here on purpose: it is drawn as a dot strip, so it needs no
+        // glyphs at all — one of the reasons that form was chosen (docs/21 §5.22).
+        drawn.push(preview_label(Rect::new(0, 0, 341, 55), false, false, false));
+        drawn.push(preview_label(Rect::new(0, 0, 689, 55), false, true, true));
+        drawn.push(preview_label(Rect::new(0, 0, 3840, 2088), true, false, false));
         // …and the two one-shot hints.
         drawn.push(LEVEL_HINT.to_owned());
         drawn.push(level_hint(8, 9));

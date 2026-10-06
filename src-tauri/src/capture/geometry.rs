@@ -886,17 +886,38 @@ pub fn crosshair_geometry(cursor: Point, radius: i32, frame: Rect) -> CrosshairG
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SizeLabelPlacement {
     pub rect: Rect,
-    /// True when the label had to be moved above the selection.
-    pub above: bool,
+    /// Which step of the ladder produced it (docs/21 §5.22).
+    pub where_: LabelWhere,
 }
 
-/// Place the size label at the selection's top-left edge, preferring above the
-/// selection and falling below it when the monitor top edge leaves no room.
+/// Where a label ended up, for the ladder's own diagnostics and tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LabelWhere {
+    /// Outside, above the box — the normal case.
+    Above,
+    /// Outside, below the box — the box is against the top edge.
+    Below,
+    /// **Inside** the box, top-left: the box spans the work area, so there is nowhere outside.
+    /// A maximised window is exactly this, and it used to mean the label was dropped entirely.
+    Inside,
+    /// Beside the cursor, when the box can hold neither the label nor a place outside.
+    AtCursor,
+}
+
+/// Place the size label near `selection`'s top-left, ladder-style (docs/21 §5.22).
+///
+/// 1. outside, above; 2. outside, below; 3. **inside** the box when the box is as large as the work
+/// area (a maximised window has no room outside, and dropping the label there loses the only words
+/// that say "窗口"); 4. beside the cursor, for a box that is both full-height and too narrow.
+///
+/// `cursor` is only consulted for step 4; pass `None` and the label is dropped instead, which is
+/// what callers that have no cursor (exports, tests) want.
 pub fn size_label_placement(
     selection: Rect,
     label_size: (i32, i32),
     work_area: Rect,
     gap: i32,
+    cursor: Option<Point>,
 ) -> Option<SizeLabelPlacement> {
     let (label_width, label_height) = (label_size.0.max(1), label_size.1.max(1));
     let above_top = selection.top - gap - label_height;
@@ -904,28 +925,146 @@ pub fn size_label_placement(
     let below_top = selection.bottom + gap;
     let below_fits = below_top + label_height <= work_area.bottom;
 
-    // A label that fits neither below nor above the selection would have to overlap
-    // it, covering the very pixels the user is choosing. The label is preview-only, so
-    // it is dropped instead: the selection stays truthful.
-    if !below_fits && !above_fits {
-        return None;
-    }
-
-    let (mut top, above) = if above_fits {
-        (above_top, true)
+    let (mut left, mut top, where_) = if above_fits {
+        (selection.left, above_top, LabelWhere::Above)
+    } else if below_fits {
+        (selection.left, below_top, LabelWhere::Below)
+    } else if label_width + 2 * gap <= selection.width()
+        && label_height + 2 * gap <= selection.height()
+    {
+        // Inside the box: it covers a corner of the content for as long as the preview lasts, and
+        // never reaches the artifact (`render_export` clears the preview layers).
+        (
+            selection.left + gap,
+            selection.top + gap,
+            LabelWhere::Inside,
+        )
     } else {
-        (below_top, false)
+        // Step 4 only counts if the label actually *fits* beside the cursor. Clamping it into a
+        // frame it does not fit in paints the panel over the whole selection instead of dropping it,
+        // which is worse than having no label at all — so no fit, no label.
+        let cursor = cursor?;
+        let right = cursor.x + gap + 4;
+        let left_to_the_right = right + label_width <= work_area.right;
+        let left_to_the_left = cursor.x - gap - 4 - label_width >= work_area.left;
+        let below = cursor.y + gap + 4;
+        let below_fits = below + label_height <= work_area.bottom;
+        let above_fits = cursor.y - gap - 4 - label_height >= work_area.top;
+        let left = if left_to_the_right {
+            right
+        } else if left_to_the_left {
+            cursor.x - gap - 4 - label_width
+        } else {
+            return None;
+        };
+        let top = if below_fits {
+            below
+        } else if above_fits {
+            cursor.y - gap - 4 - label_height
+        } else {
+            return None;
+        };
+        (left, top, LabelWhere::AtCursor)
     };
 
     let max_left = (work_area.right - label_width).max(work_area.left);
-    let left = selection.left.clamp(work_area.left, max_left);
+    left = left.clamp(work_area.left, max_left);
     let max_top = (work_area.bottom - label_height).max(work_area.top);
     top = top.clamp(work_area.top, max_top);
 
     Some(SizeLabelPlacement {
         rect: Rect::from_origin_size(Point::new(left, top), label_width, label_height),
-        above,
+        where_,
     })
+}
+
+/// Where the level badge sits relative to the box (docs/21 §5.22).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChipWhere {
+    /// Inside the box's top-right corner — its home: the badge *is* the box's place on the chain.
+    Inside,
+    /// Outside, top-right, when the box is too small to hold it.
+    OutsideAbove,
+    /// Outside, bottom-right, when the box is also against the top edge.
+    OutsideBelow,
+    /// Beside the cursor, for a box with no room on any side.
+    AtCursor,
+}
+
+/// Place the level badge near the box's top-right corner, ladder-style (docs/21 §5.22).
+///
+/// The badge is much smaller than the size label (a dot strip, ~75×18 for nine levels), which is why
+/// "the box is too small" almost never comes up: a box 87 px wide and 30 px tall holds it, and
+/// everything smaller still has room outside for something that size.
+pub fn level_badge_placement(
+    selection: Rect,
+    badge_size: (i32, i32),
+    work_area: Rect,
+    gap: i32,
+    cursor: Option<Point>,
+) -> Option<(Rect, ChipWhere)> {
+    let (width, height) = (badge_size.0.max(1), badge_size.1.max(1));
+    let right_edge = selection.left + selection.width();
+    let place = |left: i32, top: i32| {
+        let max_left = (work_area.right - width).max(work_area.left);
+        let max_top = (work_area.bottom - height).max(work_area.top);
+        Rect::from_origin_size(
+            Point::new(
+                left.clamp(work_area.left, max_left),
+                top.clamp(work_area.top, max_top),
+            ),
+            width,
+            height,
+        )
+    };
+    if width + 2 * gap <= selection.width() && height + 2 * gap <= selection.height() {
+        return Some((
+            place(right_edge - gap - width, selection.top + gap),
+            ChipWhere::Inside,
+        ));
+    }
+    if selection.top - gap - height >= work_area.top {
+        return Some((
+            place(right_edge - width, selection.top - gap - height),
+            ChipWhere::OutsideAbove,
+        ));
+    }
+    if selection.bottom + gap + height <= work_area.bottom {
+        return Some((
+            place(right_edge - width, selection.bottom + gap),
+            ChipWhere::OutsideBelow,
+        ));
+    }
+    let cursor = cursor?;
+    let below = cursor.y + gap + 4;
+    let below_fits = below + height <= work_area.bottom;
+    let above_fits = cursor.y - gap - 4 - height >= work_area.top;
+    let top = if below_fits {
+        below
+    } else if above_fits {
+        cursor.y - gap - 4 - height
+    } else {
+        return None;
+    };
+    let right = cursor.x + gap + 4;
+    let left = if right + width <= work_area.right {
+        right
+    } else if cursor.x - gap - 4 - width >= work_area.left {
+        cursor.x - gap - 4 - width
+    } else {
+        return None;
+    };
+    Some((place(left, top), ChipWhere::AtCursor))
+}
+
+/// The level badge as a dot strip: `(width, height)` for a chain of `levels` and a 7 px pitch
+/// (docs/21 §5.22). Past 12 levels the strip windows itself, so the width has a ceiling.
+pub fn level_badge_size(levels: usize) -> (i32, i32) {
+    const PITCH: i32 = 7;
+    const PADDING: i32 = 6;
+    let slots = if levels > 12 { 9 } else { levels.max(1) } as i32;
+    let windowed = if levels > 12 { 14 } else { 0 };
+    (slots * PITCH + windowed + 2 * PADDING, 18)
 }
 
 /// Clip a virtual-desktop window rectangle to one monitor and return it in that
@@ -1139,41 +1278,86 @@ mod tests {
     fn size_label_prefers_above_and_aligns_to_left_edge() {
         let work_area = Rect::new(0, 0, 1000, 800);
         let selection = Rect::new(400, 400, 600, 500);
-        let above = size_label_placement(selection, (120, 28), work_area, 8).unwrap();
-        assert!(above.above);
+        let above = size_label_placement(selection, (120, 28), work_area, 8, None).unwrap();
+        assert_eq!(above.where_, LabelWhere::Above);
         assert_eq!(above.rect.top, 364);
         assert_eq!(above.rect.left, 400);
 
         // Nothing fits above at the monitor's top edge: place it below.
         let top_selection = Rect::new(400, 5, 600, 50);
-        let below = size_label_placement(top_selection, (120, 28), work_area, 8).unwrap();
-        assert!(!below.above);
+        let below = size_label_placement(top_selection, (120, 28), work_area, 8, None).unwrap();
+        assert_eq!(below.where_, LabelWhere::Below);
         assert_eq!(below.rect.top, 58);
         assert_eq!(below.rect.left, 400);
     }
 
     #[test]
-    fn size_label_is_dropped_when_it_would_cover_the_selection() {
+    fn the_size_label_ladder_keeps_the_words_the_fallback_needs() {
         let work_area = Rect::new(0, 0, 1000, 800);
-        // A selection taller than the work area leaves no room on either side.
+        // A selection taller than the work area: outside is impossible, so the label moves *inside*
+        // — for a maximised window this is the only place `窗口` can be read (docs/21 §5.22).
         let tall_selection = Rect::new(400, 0, 600, 800);
-        assert_eq!(
-            size_label_placement(tall_selection, (120, 28), work_area, 8),
-            None
-        );
+        let inside = size_label_placement(tall_selection, (120, 28), work_area, 8, None).unwrap();
+        assert_eq!(inside.where_, LabelWhere::Inside);
+        assert_eq!(inside.rect.left, 408);
+        assert_eq!(inside.rect.top, 8);
 
-        // A selection that fills the whole work area likewise has no room.
+        // A selection that fills the whole work area: same story.
+        let filling = size_label_placement(work_area, (120, 28), work_area, 8, None).unwrap();
+        assert_eq!(filling.where_, LabelWhere::Inside);
+
+        // Full height *and* too narrow for the label: only the cursor has room left — and with no
+        // cursor the label is dropped rather than painted over the selection.
+        let sliver = Rect::new(0, 0, 30, 800);
         assert_eq!(
-            size_label_placement(work_area, (120, 28), work_area, 8),
+            size_label_placement(sliver, (120, 28), work_area, 8, None),
             None
         );
+        let at_cursor =
+            size_label_placement(sliver, (120, 28), work_area, 8, Some(Point::new(600, 400)))
+                .unwrap();
+        assert_eq!(at_cursor.where_, LabelWhere::AtCursor);
+        assert!(
+            at_cursor.rect.left > sliver.right,
+            "beside the cursor, not over the box"
+        );
+    }
+
+    #[test]
+    fn the_level_badge_prefers_the_boxs_own_corner() {
+        let work_area = Rect::new(0, 0, 1000, 800);
+        // A normal box: the badge sits inside its top-right corner.
+        let roomy = Rect::new(100, 100, 500, 400);
+        let (rect, where_) = level_badge_placement(roomy, (75, 18), work_area, 6, None).unwrap();
+        assert_eq!(where_, ChipWhere::Inside);
+        assert_eq!(rect.right, roomy.right - 6);
+        assert_eq!(rect.top, roomy.top + 6);
+
+        // A single-line text run (20 px tall) cannot hold an 18 px badge plus padding: it goes
+        // outside, still right-aligned to the box.
+        let line = Rect::new(100, 300, 460, 320);
+        let (rect, where_) = level_badge_placement(line, (75, 18), work_area, 6, None).unwrap();
+        assert_eq!(where_, ChipWhere::OutsideAbove);
+        assert_eq!(rect.right, line.right);
+        assert_eq!(rect.bottom, line.top - 6);
+
+        // …and against the top edge, below it instead.
+        let line_at_top = Rect::new(100, 2, 460, 22);
+        let (_, where_) =
+            level_badge_placement(line_at_top, (75, 18), work_area, 6, None).unwrap();
+        assert_eq!(where_, ChipWhere::OutsideBelow);
+
+        // The dot strip windows itself past twelve levels, so its width has a ceiling.
+        assert_eq!(level_badge_size(9), (75, 18));
+        assert_eq!(level_badge_size(12), (96, 18));
+        assert_eq!(level_badge_size(40), level_badge_size(13));
     }
 
     #[test]
     fn size_label_stays_inside_horizontal_work_area_bounds() {
         let work_area = Rect::new(0, 0, 1000, 800);
         let selection = Rect::new(0, 100, 40, 200);
-        let placement = size_label_placement(selection, (200, 28), work_area, 8).unwrap();
+        let placement = size_label_placement(selection, (200, 28), work_area, 8, None).unwrap();
         assert!(placement.rect.left >= work_area.left);
         assert!(placement.rect.right <= work_area.right);
     }
