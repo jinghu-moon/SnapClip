@@ -795,6 +795,17 @@
               尺寸标签 `846×272 px 容器` 在框外左上，层级徽标 `6/9` 在框内右上。</span
             ></label
           >
+          <label class="row"
+            ><span class="k">层级徽标形态</span
+            ><span
+              ><select id="chipStyle">
+                <option value="dots">点列 ●●●◉○○（推荐）</option>
+                <option value="emphasis">数字分层 6 / 9</option>
+                <option value="stack">分段条 ▮▮▮▯▯</option>
+                <option value="fraction">6/9（现状）</option>
+              </select></span
+            ></label
+          >
           <p class="fine">
             ③b（工具栏第三档）：走动结束 1.2 s 后整条链按 8 步量化淡出（≈ 8
             帧额外满屏）；任何换层或移动光标立刻复现——对应 ArmedHint /
@@ -1207,6 +1218,7 @@
         forceWindow: false,
         degraded: false,
         counterInLabel: false,
+        chipStyle: "dots",
         selWidth: 2,
         keepAnswer: true,
         dim: true,
@@ -1734,16 +1746,43 @@
           ctx.textBaseline = "top";
           ctx.fillText(text, pl[0] + 10, pl[1] + 5);
         }
-        // 5b) 层级徽标：**独立于尺寸标签**的一小块 `6/9`（用户校正）。
-        //     它贴在框内右上角（自己是"这个框在链上的位置"，贴在框上最自然），
-        //     装不下才退到框外——徽标小，所以这一步几乎总能成功。
+        // 5b) 层级徽标：**独立于尺寸标签**（用户校正：两件事别挤在一起），位置在框内右上。
+        //     形态有四种，都在选择器里（用户问"6/9 能不能更直观地表达 6 是当前、9 是总数"）：
+        //       · fraction  `6/9`      —— 现状。斜杠是书写约定，不解释就不知道哪边是"我"。
+        //       · emphasis  `6` 大亮 + `/9` 小灰 —— 字号/颜色分层：大的亮的那个就是你。
+        //       · dots      ●●●●●◉○○○ —— 点列：N 个点 = N 层，填实=已走过、空心=还在里面、
+        //                                当前那个是捕获绿且更大。没有要学的记号，位置即序号；
+        //                                而且它就是画面上那些环的缩略图，颜色分工和环一致。
+        //       · stack     ▮▮▮▮▮▮▯▯▯ —— 分段条：更紧凑的点列（每格 4 px），读法同上。
         const chipText = levelChipText(sel);
         if (chipText) {
-          ctx.font = '11px "Segoe UI","Microsoft YaHei UI",sans-serif';
-          const cw = Math.ceil(ctx.measureText(chipText).width) + 12,
-            ch = 18;
+          const n = chainOf().length,
+            style = state.chipStyle;
+          const ch = 18,
+            pad = 6,
+            // 点列/分段条超过 12 层就开窗（两侧画省略号），免得徽标无限变宽。
+            windowed = (style === "dots" || style === "stack") && n > 12,
+            slots = windowed ? 9 : n,
+            // 点距要留出可见的空隙：半径 2.0 / 间距 6 → 填充点之间还有 2 px，
+            // 否则一连串填充点会连成一条杠（第一版就是 4.4 px 直径 + 0.6 px 间距，实测糊成一根）。
+            cell = style === "stack" ? 4 : 6;
+          let cw;
+          if (style === "fraction") {
+            ctx.font = '11px "Segoe UI","Microsoft YaHei UI",sans-serif';
+            cw = Math.ceil(ctx.measureText(chipText).width) + 12;
+          } else if (style === "emphasis") {
+            ctx.font = '600 12px "Segoe UI","Microsoft YaHei UI",sans-serif';
+            cw = Math.ceil(ctx.measureText(String(sel + 1)).width) + 12;
+            ctx.font = '10px "Segoe UI","Microsoft YaHei UI",sans-serif';
+            cw += Math.ceil(ctx.measureText("/" + n).width) + 2;
+          } else {
+            cw = slots * cell + (windowed ? 14 : 0) + 2 * pad;
+          }
           const at = placeChip(rect, cw, ch, g);
-          q("#chipWhere").textContent = at.where;
+          // 调试用：把徽标矩形暴露出来，好让自检脚本扫描它的像素（不影响画面）。
+          window.__chipRect = { x: at.x, y: at.y, w: cw, h: ch };
+          q("#chipWhere").textContent =
+            at.where + "（" + ({ fraction: "6/9", emphasis: "数字分层", dots: "点列", stack: "分段条" })[style] + " · " + cw + "×" + ch + "）";
           ctx.fillStyle = "rgba(18,24,32,.93)";
           ctx.strokeStyle = "rgba(255,255,255,.14)";
           ctx.lineWidth = 1;
@@ -1751,9 +1790,66 @@
           ctx.roundRect(at.x + 0.5, at.y + 0.5, cw - 1, ch - 1, 3);
           ctx.fill();
           ctx.stroke();
-          ctx.fillStyle = "#e8edf4";
-          ctx.textBaseline = "top";
-          ctx.fillText(chipText, at.x + 6, at.y + 3);
+          if (style === "fraction") {
+            ctx.font = '11px "Segoe UI","Microsoft YaHei UI",sans-serif';
+            ctx.fillStyle = "#e8edf4";
+            ctx.textBaseline = "top";
+            ctx.fillText(chipText, at.x + pad, at.y + 3);
+          } else if (style === "emphasis") {
+            // 当前层级：大、亮、捕获绿；总数：小、灰、退成脚注。
+            ctx.textBaseline = "top";
+            ctx.font = '600 12px "Segoe UI","Microsoft YaHei UI",sans-serif';
+            ctx.fillStyle = "rgb(" + CAPTURE + ")";
+            const cur = String(sel + 1);
+            ctx.fillText(cur, at.x + pad, at.y + 2);
+            ctx.font = '10px "Segoe UI","Microsoft YaHei UI",sans-serif';
+            ctx.fillStyle = "rgba(200,208,219,.75)";
+            ctx.fillText(
+              "/" + n,
+              at.x + pad + Math.ceil(ctx.measureText(cur).width) + 2,
+              at.y + 4 + 1,
+            );
+          } else {
+            const start = windowed ? Math.max(0, Math.min(n - slots, sel - 4)) : 0;
+            const cy = at.y + ch / 2;
+            if (windowed) {
+              ctx.fillStyle = "rgba(200,208,219,.6)";
+              ctx.font = '9px "Segoe UI",sans-serif';
+              ctx.textBaseline = "middle";
+              ctx.fillText("…", at.x + pad - 2, cy);
+            }
+            for (let k = 0; k < slots; k++) {
+              const level = start + k,
+                cx = at.x + pad + (windowed ? 10 : 0) + k * cell + cell / 2;
+              if (level === sel) {
+                ctx.fillStyle = "rgb(" + CAPTURE + ")";
+                ctx.beginPath();
+                ctx.arc(cx, cy, 3, 0, Math.PI * 2);
+                ctx.fill();
+              } else if (style === "stack") {
+                ctx.fillStyle =
+                  level < sel ? "rgba(" + RING + ",.55)" : "rgba(" + RING + ",.22)";
+                ctx.fillRect(cx - 1.5, cy - 4, 3, 8);
+              } else {
+                ctx.beginPath();
+                ctx.arc(cx, cy, 2.2, 0, Math.PI * 2);
+                if (level < sel) {
+                  ctx.fillStyle = "rgba(" + RING + ",.6)";
+                  ctx.fill();
+                } else {
+                  ctx.strokeStyle = "rgba(" + RING + ",.6)";
+                  ctx.lineWidth = 1;
+                  ctx.stroke();
+                }
+              }
+            }
+            if (windowed) {
+              ctx.fillStyle = "rgba(200,208,219,.6)";
+              ctx.font = '9px "Segoe UI",sans-serif';
+              ctx.textBaseline = "middle";
+              ctx.fillText("…", at.x + cw - pad - 4, cy);
+            }
+          }
         } else {
           q("#chipWhere").textContent = "（未换层，不显示）";
         }
@@ -2313,6 +2409,10 @@
         });
         bindCheck("degraded", "degraded", () => renderStack());
         bindCheck("counterInLabel", "counterInLabel", () => renderStack());
+        q("#chipStyle").addEventListener("change", (e) => {
+          state.chipStyle = e.target.value;
+          requestDraw();
+        });
         bindCheck("dim", "dim");
         bindCheck("ease", "ease", (v) => {
           if (!v && state.anim) {
