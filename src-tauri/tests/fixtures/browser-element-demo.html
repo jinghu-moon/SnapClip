@@ -170,7 +170,10 @@
    "probe":[180,5050],"expect":"inside_self"},
 
   {"id":"plain-div","rect":[400,920,300,96],"kind":"plain-div","role":"","name":"Plain Wrapper",
-   "probe":[250,70],"expect":"self"}
+   "probe":[250,70],"expect":"self"},
+
+  {"id":"code-block","rect":[720,920,320,96],"kind":"code-block","role":"","name":"Code Block",
+   "probe":[160,48],"expect":"code-block"}
 ]
 </script>
 
@@ -280,6 +283,16 @@ const builders = {
                          el.innerHTML = '<span style="position:absolute;left:20px;top:20px;' +
                            'width:60px;height:20px">Inner</span>';
                          return 'div'; },
+  // The shape a chat UI's code block has: CodeMirror renders the whole block as one `pre.cm-content`
+  // holding a `code` and a single `span` with all the text. Whether the text run itself can be a
+  // target is the question (docs/21 §5.18).
+  'code-block': (el) => { el.className = 'fixture frame'; el.style.overflow = 'hidden';
+                    el.innerHTML =
+                      '<pre id="code-pane" style="margin:0;padding:4px 8px;height:100%;' +
+                      'box-sizing:border-box;font:11px/16px Consolas,monospace;white-space:pre-wrap">' +
+                      '<code><span id="code-run">项目 A\n  ↓\n打开资源管理器\n  ↓\n找到项目目录</span></code>' +
+                      '</pre>';
+                    return 'div'; },
   scroll: (el) => { el.className = 'fixture frame'; el.style.overflow = 'auto';
                     el.setAttribute('aria-label', 'Scroll Container');
                     el.setAttribute('role', 'list');

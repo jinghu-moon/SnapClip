@@ -911,6 +911,36 @@ max 162.7 ms；`cargo test --lib` **368 passed**（新增 6 个）、`cargo chec
 - 不做跨 iframe / shadow DOM 的层级（那需要 §5.13 的 CDP 或 §5.12 的扩展通道）。
 - 不改 `Z`+滚轮 的放大镜行为；不做层级动画（层级切换是离散选择，不需要补间）。
 
+### 5.18 "纯文本能不能捕获"：文字跑条 vs 装它的盒子（2026-10-06，实测）
+
+用户给了一段真实 DOM：CodeMirror 6 只读代码块（`div.cm-editor > div.cm-scroller > pre.cm-content >
+code > span`），**所有文字在那一个 `<span>` 里**，问"这个 div 里面的纯文本就不能捕获了吗"。
+
+夹具里加了同构的 `code-block`（`pre#code-pane` + `code` + 含多行文字的 `span#code-run`），实测两条通道在
+这个点上的答案：
+
+```text
+[sources] code-run (文字内部) point=(815,1070)
+  control hit : Text(777,1034)-(854,1109)                        ← UIA：文字跑条 77x75
+  msaa hit    : role=0x29 name="项目 A ↓ 打开资源管理器…" 77x75   ← MSAA：STATICTEXT
+
+[probe] assert code-block  expected=320x96 @(768,1026)  published=318x94 @(769,1028)  OK
+```
+
+**结论：能捕获——捕到的是"装着这段文字的盒子"（这里就是代码块 318x94），而不是文字跑条本身。** 文字跑条
+（UIA `Text` 50020 / MSAA `ROLE_SYSTEM_TEXT(0x2a)`、`STATICTEXT(0x29)`）被现有规则明确排除，这是
+§5.6 A / §5.16 定下的产品决策，而且有据：夹具里 `nested-*` 三行如果在文字跑条上采纳，答案会变成盒子里
+那条字（70x20），而产品要的是那个盒子（192x72）。
+
+**这条规则要不要开开关，由产品定**（与"跳过无绘制包装层"是两个独立的开关）：
+
+- **忠实（现状）**：文字跑条不选，选它所属的盒子 → "指着一行字"得到代码块/段落。
+- **可选**：允许文字跑条作为目标 → CodeMirror 这类**每行一个 `span`** 的编辑器里能精确吸附到**单独一行**
+  （点"复制路径"那一行就得到那一行）；代价是 `nested-*` 的期望要跟着改成"取文字"。
+
+落点在 `should_adopt_provider_box` / `should_adopt_msaa_box` 里排除文本类型的那两个条件——开关加上去是
+一行判断，不动流程。
+
 ---
 
 ## 6. 实测踩坑清单（每条都花了时间，务必先读）

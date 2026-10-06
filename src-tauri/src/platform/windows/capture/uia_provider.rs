@@ -2099,17 +2099,22 @@ mod tests {
                 "para",
                 "code-box",
                 "table-cell-1",
+                "code-run",
+                "code-pane",
             ] {
-                let Some(fixture) = manifest.iter().find(|fixture| fixture.id == id) else {
-                    continue;
-                };
                 let Some(measured) = truth.get(id).copied() else {
                     continue;
                 };
                 if measured[2] <= 0 || measured[3] <= 0 {
                     continue;
                 }
-                let [dx, dy] = fixture.probe.unwrap_or([measured[2] / 2, measured[3] / 2]);
+                // Manifest entries carry their probe offset; ids that only exist inside a fixture
+                // (a `pre` or a text run, for instance) are sampled at their centre.
+                let [dx, dy] = manifest
+                    .iter()
+                    .find(|fixture| fixture.id == id)
+                    .and_then(|fixture| fixture.probe)
+                    .unwrap_or([measured[2] / 2, measured[3] / 2]);
                 let point = Point::new(
                     viewport.left + measured[0] + dx,
                     viewport.top + measured[1] + dy,
