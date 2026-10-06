@@ -2798,6 +2798,115 @@ mod tests {
     }
 
     /// The gate is only as good as its instrument, so the reader above is checked too: it has to
+    /// Measurement, not a gate: what the embedded subset costs at runtime (docs/21 §5.23).
+    ///
+    /// The file is 14 KB, which is a *binary size* item. The runtime items are the one-time
+    /// registration and the per-draw text layout, and neither depends on how many glyphs the file
+    /// carries — only on the glyphs actually shaped. This prints both, next to two stock families
+    /// (one of them a ~10 MB installed CJK font) so the comparison is visible rather than argued.
+    #[test]
+    #[ignore = "measurement probe; run with --ignored --nocapture"]
+    fn font_cost_probe() {
+        use ::windows::Win32::Graphics::DirectWrite::{
+            DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_TEXT_METRICS,
+        };
+        use ::windows::Win32::Graphics::Gdi::RemoveFontMemResourceEx;
+        use ::windows::core::PCWSTR;
+        use std::time::Instant;
+
+        let bytes = super::INFO_EMBEDDED_FONT;
+        let samples = 200;
+        let strings = ["3840×2088 px  容器 8/9", "#A1B2C3", "hsl(359,100%,100%)"];
+
+        println!(
+            "embedded subset: {} B, {} codepoints, {} glyphs",
+            bytes.len(),
+            cmap_codepoints(bytes).len(),
+            font_glyph_count(bytes)
+        );
+
+        // 1) The one-time cost, measured on the same bytes the process registers at start-up.
+        let mut installed = 0u32;
+        let started = Instant::now();
+        let handle = unsafe {
+            ::windows::Win32::Graphics::Gdi::AddFontMemResourceEx(
+                bytes.as_ptr().cast(),
+                bytes.len() as u32,
+                None,
+                &mut installed,
+            )
+        };
+        println!(
+            "AddFontMemResourceEx      : {:.0} µs (once per process; {installed} face(s))",
+            started.elapsed().as_secs_f64() * 1e6
+        );
+        if !handle.0.is_null() {
+            let _ = unsafe { RemoveFontMemResourceEx(handle) };
+        }
+
+        // 2) Per-draw layout: the overlay builds a text layout for the size label and the preview
+        //    label on every present (`measure_label`), so this is the number that shows up in a
+        //    frame — and it is about shaping, not about the size of the font file.
+        let Ok(device) = super::GraphicsDevice::create() else {
+            eprintln!("no D3D11 device; skipping the layout half of the probe");
+            return;
+        };
+        let Ok(renderer) = OverlayRenderer::new(std::sync::Arc::new(device), 96) else {
+            eprintln!("no renderer; skipping the layout half of the probe");
+            return;
+        };
+        for family in ["HarmonyOS Sans SC", "Microsoft YaHei UI", "Segoe UI"] {
+            let wide = super::to_wide(family);
+            let locale = super::to_wide("en-us");
+            let format = unsafe {
+                renderer.dwrite.CreateTextFormat(
+                    PCWSTR(wide.as_ptr()),
+                    None,
+                    DWRITE_FONT_WEIGHT_NORMAL,
+                    DWRITE_FONT_STYLE_NORMAL,
+                    DWRITE_FONT_STRETCH_NORMAL,
+                    12.0,
+                    PCWSTR(locale.as_ptr()),
+                )
+            };
+            let Ok(format) = format else {
+                println!("{family:26}: unavailable");
+                continue;
+            };
+            let mut worst = 0.0_f64;
+            let mut total = 0.0_f64;
+            for _ in 0..samples {
+                for text in strings {
+                    let wide = super::to_wide(text);
+                    let started = Instant::now();
+                    let Ok(layout) = (unsafe {
+                        renderer.dwrite.CreateTextLayout(
+                            &wide,
+                            &format,
+                            f32::INFINITY,
+                            f32::INFINITY,
+                        )
+                    }) else {
+                        continue;
+                    };
+                    let mut metrics = DWRITE_TEXT_METRICS::default();
+                    let _ = unsafe { layout.GetMetrics(&mut metrics) };
+                    let elapsed = started.elapsed().as_secs_f64() * 1e6;
+                    worst = worst.max(elapsed);
+                    total += elapsed;
+                }
+            }
+            println!(
+                "{family:26}: layout+metrics avg {:.1} µs, worst {:.1} µs  ({} samples)",
+                total / (samples * strings.len()) as f64,
+                worst,
+                samples * strings.len()
+            );
+        }
+    }
+
+    /// The gate is only as good as its instrument, so the reader above is checked too: it has to
     /// find the glyphs the subset does carry and not invent ranges it never read.
     #[test]
     fn the_cmap_reader_finds_glyphs_and_does_not_invent_them() {
