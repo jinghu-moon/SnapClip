@@ -382,35 +382,34 @@ dwell，但预览等待上限是 320 ms，所以不会闪整窗）。成本项�
 
 **遮挡问题（`ElementFromPoint` 没有 Z 序概念）**：overlay 全屏置顶时会自己答自己。两层处理：
 
-1. **拥有窗口的线程改样式**：提交查询前把 overlay 的 `WS_EX_TRANSPARENT` 打开，答案落地
-   （`on_refinement_ready`）或查询被**放弃**（`abandon_refinement`：在飞超时 / 光标换点 /
-   session 结束）时还原。参考实现就是这么做的
-   （`ScreenSnap-master/core/window_uia.py::set_click_through`，用完必须还原，否则遮罩收不到鼠标事件）。
-   **所有"退掉在飞查询"的路径都收敛到 `abandon_refinement`**：worker 一定会把被退掉的任务回报一次，
-   而那次的答案会被当陈旧丢弃，没有别的代码会去清样式。
-2. refinement 线程里的 `ClickThroughGuard`：包住那次命中测试，`Drop` 时还原；它同时是"没有 overlay 的
-   调用方"（测试/探针）的兜底，单测 `the_click_through_guard_restores_the_style_it_found` 断言
-   "置位 → 还原"。
+只有**一个**杠杆有效：overlay 自己的窗口过程在 `WM_NCHITTEST` 里返回 `HTTRANSPARENT`。
+实现见 `HitTestPassThrough`（`win/window.rs`）：refinement 线程在**那一次** `ElementFromPoint`
+调用前后取/放一个 guard，overlay 线程的窗口过程读它——跨线程的只有这一个原子布尔。
 
-即使两层都失效，规则本身也挡住了：overlay 的框永远比走查答案**更大**，不可能通过"严格更小"的门槛，
-最坏结果只是这一次查询少了精度补足（不会发布错误的框）。
+为什么是它、而不是样式：把替身做到和真 overlay 一样（自注册窗口类 + `HTCLIENT`）之后，各杠杆的
+实测答案（`browser_element_probe` 的 `[overlay]` 阶段，本分支可复跑）：
 
-**overlay 到底挡不挡命中测试（已在本分支复现）**：§6 第 9 行那条测量原本来自已回退分支
-`53c5acd` 的 `overlay_hit_through_probe`（`main` 上曾一度没有这个探针）。现在它作为
-`browser_element_probe` 的 `[overlay]` 阶段存在：在**另一个线程**上造一个带 overlay 同样标志
-（`WS_EX_TOPMOST|TOOLWINDOW|NOREDIRECTIONBITMAP`、全屏、`WS_POPUP`）的替身窗口盖在活的夹具页面上，
-四种状态下问 `ElementFromPoint`：
+| 杠杆 | `ElementFromPoint` 的答案 |
+| --- | --- |
+| 什么都不做（overlay 压在上面） | **overlay 自己** |
+| `WS_EX_TRANSPARENT` | overlay 自己——**无效**（本项目曾据此实现过一版，等于没做） |
+| `WS_EX_LAYERED \| WS_EX_TRANSPARENT` | 页面元素（但 DirectComposition 窗口不能开 LAYERED） |
+| `WM_NCHITTEST → HTTRANSPARENT` | **页面元素（采用）** |
+| 在窗口区域上挖一个洞 | overlay 自己——无效 |
 
-```text
-[overlay] no overlay: Button(72,131)-(240,187) type=50000 class="fixture cap"
-[overlay] overlay topmost: Button(72,131)-(240,187) type=50000 class="fixture cap"
-[overlay] overlay +WS_EX_TRANSPARENT: Button(72,131)-(240,187) type=50000 class="fixture cap"
-[overlay] overlay +WS_EX_LAYERED|TRANSPARENT: Button(72,131)-(240,187) type=50000 class="fixture cap"
-```
+两个细节是必须的，不是修饰：
 
-结论：**我们的置顶全屏窗口根本不被命中测试看见**（四种状态答案逐字相同，`type=50000` 是页面的
-`Button`，"最内层"就是页面元素）。所以 hit-through 只是保险，不是精度补足的必要条件——实机里
-"补足没生效"一定是别的原因（见 §5.8）。
+- **guard 只包那一次 `ElementFromPoint`**，不是整段查询。`HTTRANSPARENT` 对真实鼠标输入同样生效，
+  所以暴露窗口越短越好：整段查询实测 20–50 ms，足够吞掉"停下鼠标后紧接着的那一次点击"。
+- **按住鼠标键时否决穿透**（`GetAsyncKeyState` 读物理按键，不看本线程处理到哪条消息）：查询完全可以在
+  框选拖拽停顿的瞬间发起，此时一次按下/抬起绝不能漏给下层窗口。
+
+即使这些都失效，规则本身也挡住最坏情况：overlay 的框永远比走查答案**更大**，过不了"严格更小"的门槛，
+只是这一次少了补足，不会发布错误的框。
+
+> **订正**：本节曾根据一个**用系统 `STATIC` 类**做的替身窗口断言"我们的置顶全屏窗口根本不被命中测试
+> 看见"。那个结论是错的——UIA 会跳过系统类的替身，却会老老实实返回自注册类的窗口（真 overlay 就是
+> 这一类）。实测见 §5.8 与 §6 第 9 行。这个错误的代价是一整轮诊断：探针与实机据此不一致。
 
 **门禁（补足后，本机连续一次）**：
 
@@ -421,25 +420,56 @@ dwell，但预览等待上限是 320 ms，所以不会闪整窗）。成本项�
 | `browser_element_probe` | 断言 **23/23**，`provider_hit_available=43`、`provider_hit_is_finer_on=3`（补足前 4） |
 | `explorer_rule_probe` | `control_level_points=12/25`、`median_area_pct=65.8`、`provider_hit_is_finer_on=0`——**与补足前逐位一致** |
 
-### 5.8 实机未解现象与下一轮取证（2026-10-06，用户报告）
+### 5.8 实机现象：遮罩答了每一次命中测试（2026-10-06，已定位并修复）
 
 **报告**：某个 SPA 页面上，`div.group/side-pane-shell-host … flex-1 has-[[data-side-pane-shell-transition]]:overflow-x-clip`
 这个盒子**内部的元素识别不到**。
 
-**当时手里的全部证据**（用户日志，verbose 关闭）：
+**决定性证据**（`91e6b08` 加的强制行，用户下一次运行就拿到了）：
+
+```text
+refinement_precision_unavailable=14
+last precision unavailable answer "SnapClipCaptureOverlay" 3840x2160 is not a descendant of hwnd=34734272
+```
+
+**14 次查询、14 次都由我们自己的 overlay 回答**（`class="SnapClipCaptureOverlay"`、整屏
+`3840x2160`）。也就是说：精度补足在实机里一次都没生效过；而探针里因为**没有 overlay**，同一份代码
+一切正常——这正是 §5.2/§8 一直没定位的"实机与探针不一致"。
+
+**为什么之前会误判**：先前的替身窗口建在系统 `STATIC` 类上，UIA 会**跳过**它（哪怕它是置顶窗口、
+是前台窗口、还是 `WindowFromPoint` 的答案）；而 capture overlay 用的是**自己注册的窗口类**。把替身
+改成自注册类 + `HTCLIENT` 之后，故障逐字复现（§5.7 的杠杆表就是在那之后测的）。教训：
+**替身必须复制被测对象的类，不只是它的样式**——样式相同、类不同，UIA 的行为完全不一样。
+
+**修复**：`fc9abb3`。overlay 的窗口过程在 `WM_NCHITTEST` 里按 `HitTestPassThrough` 返回
+`HTTRANSPARENT`，refinement 线程只在一次 `ElementFromPoint` 期间置位（并在按住鼠标键时否决）——
+细节与理由见 §5.7。原先那套 `WS_EX_TRANSPARENT` 状态机连同它的三条复位路径一起删掉了。
+
+**剩下的一半（仍需实机确认）**：遮罩不再挡住命中测试之后，用户那页会落到两种结果之一——
+
+1. `adopted …`：走查虽然停在整窗（`depth=4, Complete`），provider 的更细盒子成了答案 → 现象消失。
+2. `not-finer provider=… walk=…`：那个点在 Chromium 的无障碍树里确实没有更细的可捕获节点
+   （Tailwind 这类 SPA 大量无 role 无文本的 `<div>` 会被无障碍树剪掉；夹具里
+   `checkbox`/`radio`/`para`/`table-cell-1`/`code-box` 五个 `optional` 行就是这个形状：走查与
+   `ElementFromPoint` 都答整页 `1784x1125`）。若实机是这一类，则 UIA 路线到此为止——要按 DOM 盒子
+   捕获就必须换数据源（用户自己 `docs/20` 里设计的那条路）。
+
+两种都会在**每次会话强制输出**的 `last precision …` 行里明确写出来，不再需要 verbose。
+
+**这一轮之前的日志（保留作对照）**：
 
 ```text
 refinement_submitted=47 refinement_published=44 refinement_empty=0 refinement_downgrades_staged=3
 last deep target hwnd=34734272 kind=UiElement bounds=(63,159)->(3834,2082) depth=4 reason=Complete
 ```
 
-也就是：走查**走了 4 层、以整窗边界结束**（`reason=Complete`），`(63,159)->(3834,2082)` 是窗口框而不是
-页面 web area。这正是 §5.4 记录的"同边界结构包装 Pane 排在内容分支之后"形态；而在这种形态下，
-**本该由精度补足救回来**。
+走查**走了 4 层、以整窗边界结束**（`reason=Complete`），`(63,159)->(3834,2082)` 是窗口框而不是页面
+web area——正是 §5.4 记录的"同边界结构包装 Pane 排在内容分支之后"形态；在这种形态下本该由精度补足
+救回来，而它当时一次也没能运行（`unavailable=14`）。
 
-**为什么这份日志读不出原因（已修）**：补足的判定过去只在 `SNAPCLIP_WIN_DETECT_VERBOSE` 下打印，
-于是"跑了但什么都没做"和"根本没跑"在日志里一模一样，用户看到的现象没有任何一行能对上。
-`91e6b08` 起改为**每次会话强制**输出（与 `last deep target` 同级）：
+**为什么这份旧日志读不出原因（已修）**：补足的判定过去只在 `SNAPCLIP_WIN_DETECT_VERBOSE` 下打印，
+于是"跑了但什么都没做"和"根本没跑"在日志里一模一样。`91e6b08` 起改为**每次会话强制**输出
+（与 `last deep target` 同级），也就是本节开头那两行：
 
 ```text
 [snapclip][win-detect] last precision adopted|not-finer|unavailable provider=WxH at (x,y) type=N class="…" walk=WxH at (x,y)
@@ -448,17 +478,6 @@ last deep target hwnd=34734272 kind=UiElement bounds=(63,159)->(3834,2082) depth
 
 `class` 是 Chromium 给出的 **DOM class**（夹具实测 `class="fixture cap"`），所以这一行会直接点名
 provider 认为"最内层"的那个盒子是哪一个。
-
-**两个候选解释（下一次实机运行即可区分，二者修法完全不同）**：
-
-1. **`not-finer`，且 provider 的盒子 ≈ 整窗/整页**：那个点在 Chromium 的无障碍树里**确实没有更细的
-   可捕获节点**。Tailwind 这类 SPA 大量 `<div>` 既无 role 也无文本，会被无障碍树剪掉（夹具里
-   `checkbox`/`radio`/`para`/`table-cell-1`/`code-box` 五个点就是这种情形：走查和 `ElementFromPoint`
-   都答整页 `1784x1125`，所以它们在夹具里是 `optional`，从不参与断言）。若实机是这一类，则 UIA 路线
-   到此为止——要按 DOM 盒子捕获就必须换数据源（用户自己 `docs/20` 里设计的那条路）。
-2. **`unavailable …`（原因会被原样打印）**：命中框不属于该窗口、或它不覆盖光标、或
-   `ElementFromPoint` 本身失败。这一类的第一嫌疑仍是"本机某个置顶窗口答了那次命中测试"，
-   尽管 §5.7 的替身实验说明我们的 overlay 不会。
 
 补充：同一次运行若带上 `SNAPCLIP_WIN_DETECT_VERBOSE=1`，`refinement level #N node=… parent=… raw=…
 empty=… offscreen=… containing=…` 会逐层说明走查是在哪一层、因为什么（子节点数为 0 / 没有子节点含光标）
@@ -478,7 +497,7 @@ empty=… offscreen=… containing=…` 会逐层说明走查是在哪一层、�
 | 6 | 链接/group 被选成"文字那一条" | Chromium 把 `<a>`/`role=group` 的**文字作为 `Text` 子节点**暴露（实测 `Hyperlink(168×56)` + `Text(56×20)`）。产品规则待定（§8 第 3 条） |
 | 7 | 同一坐标连续两次查询结果不同（一次整页、一次元素） | 跨查询的 per-epoch 层级缓存是**陈旧快照**：空批次不能缓存；批次解释不了当前点时应重读；或每次查询重读（实测 2–7 ms/查询 vs 1500 ms 预算） |
 | 8 | `EnumChildWindows` 拿不到 DOM 盒子 | 浏览器只暴露一个巨大的 render-host 子窗口；**不要**把它当元素 |
-| 9 | 自建全屏 topmost 弹窗从不被 `ElementFromPoint` 返回 | 四种状态下答案逐字相同、都是页面元素（`browser_element_probe` 的 `[overlay]` 阶段，见 §5.7）。即"无子窗口的 DComp 弹窗"本来就不参与 UIA 命中——穿透只是保险 |
+| 9 | 自建全屏 topmost 弹窗"从不被 `ElementFromPoint` 返回" | **订正**：那只在替身用系统 `STATIC` 类时成立——UIA 会跳过系统类的替身窗口；换成 overlay 那样的**自注册类**之后，UIA 每次都返回它（实测见 §5.7/§5.8）。这个误判直接导致精度补足在实机里一次都没跑过 |
 | 10 | Chrome 标题带 `" - Google Chrome"` | 从窗口标题读 JSON 时要按标记定位并截到匹配的 `}`，不能假设整串是 payload |
 | 11 | 复用 profile 导致忽略 `--window-size` 并弹"恢复页面" | 每次用**全新/删除后的** temp profile；否则窗口小于页面，点位全落空 |
 | 12 | 探针自身命令 | 构建输出被占用会 `LNK1104`（上一次测试进程没退）；跑探针前确保没有残留进程 |
