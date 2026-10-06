@@ -1923,6 +1923,9 @@ mod tests {
                         describe_window(window_at.0 as isize),
                         describe_window(foreground.0 as isize)
                     );
+                    // MSAA is a separate transport with its own hit test, so it needs its own
+                    // answer to "does the overlay hide this one too?".
+                    println!("[overlay] {label}: MSAA={}", report_msaa_hit(point));
                     ours
                 };
                 println!(
@@ -2001,7 +2004,16 @@ mod tests {
         // the product uses; a layout-only `<div>` is the case that decides whether the raw view or
         // the document's TextPattern is worth more (docs/21 §10).
         if let Some(automation) = hit_owner.as_ref() {
-            for id in ["plain-div", "meter-shell", "deep-item"] {
+            for id in [
+                "plain-div",
+                "meter-shell",
+                "deep-item",
+                "checkbox",
+                "radio",
+                "para",
+                "code-box",
+                "table-cell-1",
+            ] {
                 let Some(fixture) = manifest.iter().find(|fixture| fixture.id == id) else {
                     continue;
                 };
@@ -2189,6 +2201,145 @@ mod tests {
         )
     }
 
+    /// The integer inside a `VT_I4` variant, if that is what it holds.
+    fn variant_i4(variant: &::windows::Win32::System::Variant::VARIANT) -> Option<i32> {
+        use ::windows::Win32::System::Variant::VT_I4;
+        let vt = unsafe { variant.Anonymous.Anonymous.vt };
+        (vt == VT_I4).then(|| unsafe { variant.Anonymous.Anonymous.Anonymous.lVal })
+    }
+
+    /// The `vt` field of a variant.
+    fn variant_vt(
+        variant: &::windows::Win32::System::Variant::VARIANT,
+    ) -> ::windows::Win32::System::Variant::VARENUM {
+        unsafe { variant.Anonymous.Anonymous.vt }
+    }
+
+    /// MSAA's own hit test, the way PixPin asks for it on Chrome (its `UiSpy` carries
+    /// `AccessibleObjectFromWindow`, `accLocation` and the literal string `chrome.exe`).
+    ///
+    /// `AccessibleObjectFromPoint` runs `accHitTest` recursively until an object answers
+    /// `CHILDID_SELF`; in Chromium that ends in `BrowserAccessibilityWin::accHitTest` ->
+    /// `CachingAsyncHitTest`, i.e. the **renderer's** hit test, where `ElementFromPoint` is answered
+    /// by rectangle comparison. If the two disagree, the finer answer is the renderer's.
+    fn report_msaa_hit(point: Point) -> String {
+        use ::windows::Win32::UI::Accessibility::{AccessibleObjectFromPoint, IAccessible};
+        let mut accessible: Option<IAccessible> = None;
+        let mut child: ::windows::Win32::System::Variant::VARIANT =
+            unsafe { std::mem::zeroed() };
+        let called = unsafe {
+            AccessibleObjectFromPoint(
+                ::windows::Win32::Foundation::POINT {
+                    x: point.x,
+                    y: point.y,
+                },
+                &mut accessible,
+                &mut child,
+            )
+        };
+        let Some(accessible) = called.ok().and(accessible) else {
+            return "failed".into();
+        };
+        let role = unsafe { accessible.get_accRole(&child) }
+            .ok()
+            .and_then(|variant| variant_i4(&variant))
+            .unwrap_or(-1);
+        let name = unsafe { accessible.get_accName(&child) }
+            .ok()
+            .map(|name| name.to_string())
+            .unwrap_or_default();
+        let (mut left, mut top, mut width, mut height) = (0, 0, 0, 0);
+        let located = unsafe {
+            accessible.accLocation(&mut left, &mut top, &mut width, &mut height, &child)
+        }
+        .is_ok();
+        format!(
+            "role=0x{role:x} name={:?} {}{width}x{height} at ({left},{top})",
+            name.chars().take(24).collect::<String>(),
+            if located { "" } else { "NO-RECT " }
+        )
+    }
+
+    /// The window's **own** accessible object answering `accHitTest`, the way `UiSpy.dll` does it for
+    /// Chrome (`AccessibleObjectFromWindow` + `accLocation`, plus a literal `chrome.exe` branch).
+    ///
+    /// This is the same renderer hit test as `AccessibleObjectFromPoint`, minus the part that decides
+    /// *whose* window the point belongs to: no global hit test is taken, so the capture overlay —
+    /// which MSAA answers for every point (measured: `HTTRANSPARENT` fixes UIA but not MSAA) — never
+    /// enters the picture.
+    fn report_msaa_window_hit(hwnd: isize, point: Point) -> String {
+        use ::windows::Win32::System::Variant::{
+            VARIANT, VARIANT_0, VARIANT_0_0, VT_DISPATCH, VT_I4,
+        };
+        use ::windows::Win32::UI::Accessibility::{AccessibleObjectFromWindow, IAccessible};
+        use ::windows::Win32::UI::WindowsAndMessaging::OBJID_CLIENT;
+        let started = std::time::Instant::now();
+        let mut raw: *mut core::ffi::c_void = std::ptr::null_mut();
+        let called = unsafe {
+            AccessibleObjectFromWindow(
+                HWND(hwnd as *mut core::ffi::c_void),
+                OBJID_CLIENT.0 as u32,
+                &IAccessible::IID,
+                &mut raw,
+            )
+        };
+        if called.is_err() || raw.is_null() {
+            return "AccessibleObjectFromWindow failed".into();
+        }
+        let mut current: IAccessible = unsafe { IAccessible::from_raw(raw) };
+        let mut depth = 0;
+        loop {
+            let Ok(hit) = (unsafe { current.accHitTest(point.x, point.y) }) else {
+                break;
+            };
+            let vt = variant_vt(&hit);
+            if vt == VT_I4 {
+                break; // CHILDID_SELF: this object is the answer.
+            }
+            if vt != VT_DISPATCH {
+                break;
+            }
+            let dispatch = unsafe { (*hit.Anonymous.Anonymous.Anonymous.pdispVal).clone() };
+            let Some(dispatch) = dispatch else { break };
+            let Ok(next) = dispatch.cast::<IAccessible>() else {
+                break;
+            };
+            current = next;
+            depth += 1;
+            if depth > 32 {
+                break;
+            }
+        }
+        // CHILDID_SELF: ask this object about itself rather than one of its children.
+        let child = VARIANT {
+            Anonymous: VARIANT_0 {
+                Anonymous: std::mem::ManuallyDrop::new(VARIANT_0_0 {
+                    vt: VT_I4,
+                    ..Default::default()
+                }),
+            },
+        };
+        let role = unsafe { current.get_accRole(&child) }
+            .ok()
+            .and_then(|variant| variant_i4(&variant))
+            .unwrap_or(-1);
+        let name = unsafe { current.get_accName(&child) }
+            .ok()
+            .map(|name| name.to_string())
+            .unwrap_or_default();
+        let (mut left, mut top, mut width, mut height) = (0, 0, 0, 0);
+        let located = unsafe {
+            current.accLocation(&mut left, &mut top, &mut width, &mut height, &child)
+        }
+        .is_ok();
+        format!(
+            "role=0x{role:x} name={:?} depth={depth} {}{width}x{height} at ({left},{top}) {} ms",
+            name.chars().take(24).collect::<String>(),
+            if located { "" } else { "NO-RECT " },
+            started.elapsed().as_millis()
+        )
+    }
+
     /// What every candidate source says is under `point` (docs/21 §10).
     ///
     /// Three sources are compared, because the product's ceiling is set by which one it can use:
@@ -2210,6 +2361,11 @@ mod tests {
             Some(element) => println!("[sources]   control hit : {}", describe_element(element)),
             None => println!("[sources]   control hit : failed"),
         }
+        println!("[sources]   msaa hit    : {}", report_msaa_hit(point));
+        println!(
+            "[sources]   msaa window : {}",
+            report_msaa_window_hit(hwnd, point)
+        );
 
         // The raw view. Read every property straight off the node: batching the request returned
         // empty rectangles for every node (a `FindAllBuildCache` + `TreeScope_Descendants` combination
