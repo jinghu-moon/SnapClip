@@ -106,6 +106,22 @@ def literals_in(path: Path) -> Iterator[str]:
     yield from rust_literals(path.read_text(encoding="utf-8"))
 
 
+def literals_with_lines(source: str) -> Iterator[tuple[int, str]]:
+    """(`1-based line`, literal) for every string / char literal, for error messages."""
+    line = 1
+    consumed = 0
+    # `rust_literals` loses position, so walk the source in slices: each literal's line is the
+    # number of newlines before its first character.
+    for literal in rust_literals(source):
+        at = source.find(literal, consumed) if literal else -1
+        if at < 0:
+            yield (line, literal)
+            continue
+        line += source.count("\n", consumed, at)
+        consumed = at + len(literal)
+        yield (line, literal)
+
+
 def main() -> int:
     """Diagnostic: what would the subset pick up, and from where."""
     import sys
