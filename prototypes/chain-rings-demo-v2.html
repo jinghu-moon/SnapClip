@@ -1765,7 +1765,10 @@
             slots = windowed ? 9 : n,
             // 点距要留出可见的空隙：半径 2.0 / 间距 6 → 填充点之间还有 2 px，
             // 否则一连串填充点会连成一条杠（第一版就是 4.4 px 直径 + 0.6 px 间距，实测糊成一根）。
-            cell = style === "stack" ? 4 : 6;
+            // 间距要按"最大的那个点"留：当前层半径 3.2 + 已走过 2.3，再留 1.5 px 空隙 → 7。
+            // 放大 8 倍看过：半径 2.2 / 间距 6 时，实心点是软边一团、空心点是清晰的环，
+            // 结果**空心比实心更抢眼**，读出来是"几个圈 + 一个亮点"。
+            cell = style === "stack" ? 4 : 7;
           let cw;
           if (style === "fraction") {
             ctx.font = '11px "Segoe UI","Microsoft YaHei UI",sans-serif';
@@ -1818,29 +1821,39 @@
               ctx.textBaseline = "middle";
               ctx.fillText("…", at.x + pad - 2, cy);
             }
+            // 小尺寸下圆在像素网格上是糊的（半径 2–3 px 全靠抗锯齿），所以三种记号都用
+            // **圆角方块**画：同样的"点"观感，但边缘落在整像素上，1× 下是干净的形。
+            const mark = (cx, cy, size, fill, stroke) => {
+              const half = size / 2,
+                left = Math.round(cx - half),
+                top = Math.round(cy - half);
+              ctx.beginPath();
+              ctx.roundRect(left + 0.5, top + 0.5, size - 1, size - 1, size <= 5 ? 1.5 : 2);
+              if (fill) {
+                ctx.fillStyle = fill;
+                ctx.fill();
+              }
+              if (stroke) {
+                ctx.strokeStyle = stroke;
+                ctx.lineWidth = 1;
+                ctx.stroke();
+              }
+            };
             for (let k = 0; k < slots; k++) {
               const level = start + k,
                 cx = at.x + pad + (windowed ? 10 : 0) + k * cell + cell / 2;
               if (level === sel) {
-                ctx.fillStyle = "rgb(" + CAPTURE + ")";
-                ctx.beginPath();
-                ctx.arc(cx, cy, 3, 0, Math.PI * 2);
-                ctx.fill();
+                // 当前层：最大（6）、纯捕获绿，外面套一圈深色把邻居切开。
+                mark(cx, cy, 6, "rgb(" + CAPTURE + ")", "rgba(18,24,32,.95)");
               } else if (style === "stack") {
                 ctx.fillStyle =
                   level < sel ? "rgba(" + RING + ",.55)" : "rgba(" + RING + ",.22)";
                 ctx.fillRect(cx - 1.5, cy - 4, 3, 8);
               } else {
-                ctx.beginPath();
-                ctx.arc(cx, cy, 2.2, 0, Math.PI * 2);
-                if (level < sel) {
-                  ctx.fillStyle = "rgba(" + RING + ",.6)";
-                  ctx.fill();
-                } else {
-                  ctx.strokeStyle = "rgba(" + RING + ",.6)";
-                  ctx.lineWidth = 1;
-                  ctx.stroke();
-                }
+                // 已走过 = 实心且亮（0.95）；还在里面 = 空心（描边 0.5）。两者都是 5 px，
+                // 差别靠"实/空 + 亮度"，大小只留给当前层——这样"● ● ● ● ● ◉ ○ ○ ○"一眼成串。
+                if (level < sel) mark(cx, cy, 5, "rgba(" + RING + ",.95)", null);
+                else mark(cx, cy, 5, null, "rgba(" + RING + ",.5)");
               }
             }
             if (windowed) {
