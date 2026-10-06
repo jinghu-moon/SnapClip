@@ -21,9 +21,13 @@
 >   虚拟化列表暴露成一个 `DataItem`，认领会让答案变成容器（docs/21 §5.6 A）。
 >
 > **尚未实现**（不要按"已实现"调用）：`StopReason::AccessibilityPending`（惰性树由"空层重读 +
-> 下一次 dwell"与探针的"等树就绪、否则 skip"处理，因此当前**不需要**该变体）；以
-> `ElementFromPoint` 作为候选来源 + `CompareElements` 归属校验属于**可选增强**，实测与方案见
-> docs/21 §2.3/§3/§5.3，当前实现仍从 `ElementFromHandle` 根下钻。
+> 下一次 dwell"与探针的"等树就绪、否则 skip"处理，因此当前**不需要**该变体）。
+>
+> **已实现：`ElementFromPoint` 作为精度补足，而不是候选来源**（2026-10-06，docs/21 §5.7）。走查仍然
+> 从 `ElementFromHandle` 根下钻（§11）；相邻区域差异只在**走查停得比最内层更粗**时补：provider 自己的
+> 点命中框（含光标、控制类型 ≠ `Text`、面积严格更小）直接作为最终答案。归属校验按 §5.3 用
+> `CompareElements` 沿父链回到窗口根（`NativeWindowHandle` 在 Chromium 只暴露在外层节点，实测
+> 69/69 全被拒）。查询期间 overlay 对命中测试"穿透"，见 docs/21 §5.7。
 > 本文历史取证章节保留旧行为仅用于解释缺陷，不是当前实现规范。
 
 ## 1. 范围与不变量

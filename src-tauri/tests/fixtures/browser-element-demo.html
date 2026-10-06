@@ -30,8 +30,9 @@
   `optional: true` marks cases whose exact answer is implementation-defined (rotated boxes,
   canvas, svg, iframe, shadow DOM, layout-only wrappers) and the one measured *limitation*
   (`input-disabled`: Chromium paints a nameless `Pane` over the input — the system's own hit test
-  returns that pane — and the walk follows the overlay branch, answering a 298x101 container
-  instead of the 240x56 control beneath it). Those are measured and printed, never asserted.
+  returns that pane — so the page's declared 240x56 control and the system's 284x40 box are two
+  different questions about the same point, and the precision top-up in docs/21 §5.7 adopts the
+  latter). Those are measured and printed, never asserted.
 -->
 <style>
   html, body { margin: 0; padding: 0; width: 1600px; height: 1020px; overflow: hidden;

@@ -334,6 +334,78 @@ dwell"完成，探针侧由"等树就绪、否则 skip"完成。
 dwell，但预览等待上限是 320 ms，所以不会闪整窗）。成本项是"每个自带窗口的候选 3 次 user32 调用
 （`is_shown_child_at`）+ 回溯 + 无矩形透视"；当前没有 profiling 依据，不建议先优化。
 
+### 5.7 精度补足：走查停得偏高时采用 provider 的命中框（2026-10-06）
+
+**问题（用户原话）**："能不能更精确？识别鼠标指针所在的最内层可捕获区域——盒子里没有盒子，就是最
+内层。"
+
+**客观基准**：`IUIAutomation::ElementFromPoint`（参考实现里的 `ControlFromPoint`）按构造返回**该点
+最内层元素**，正是产品要的那个定义。所以把它当尺子：每个采样点同时问
+
+- 我们的走查答案（`refinement published`），
+- provider 自己的命中框（`[probe] precision:` 行的 `provider_hit_available` / `provider_hit_is_finer_on`）。
+
+"provider 命中框**更小、且仍含光标**" = 走查停在比最内层更粗的一层。归属校验照 §5.3：命中框必须能用
+`CompareElements` 沿父链回到该窗口根元素（浏览器 43/43 点都能校验成功）。
+
+**实测（同一构建，4K 3840×2160 @DPI144）**：
+
+| 采样点 | provider 命中可用 | provider 比我们更细（补足前） | 补足后仍更细 |
+| --- | --- | --- | --- |
+| 浏览器夹具（43 点） | 43/43 | **4** | **3** |
+| Explorer 确定性夹具（25 点） | 25/25 | **0** | **0** |
+
+补足前那 4 个点：
+
+1. `nested-outer` / `nested-mid` / `nested-inner`：provider 答内部的 `Text(70×20)`，我们答
+   `192×72` 的容器——**有意不采用**，这是 §5.6 A 的产品决策（盒子 vs 盒子里那条字），不是精度缺口。
+2. `input-disabled`：provider 答 `284×40` 的 `Pane(50033)`（Chromium 给这个只读输入框画了一层无名
+   Pane），我们答 `298×101` 的容器——**真的精度缺口**，且**系统的命中测试也说那层 Pane**
+   （`system hit test: Pane(1295,148)-(1579,188) ""`）。补足后日志出现
+   `refinement adopted provider box=(1295,148)->(1579,188) type=50033 (walk was coarser)`，该点不再
+   计入 `provider_hit_is_finer_on`。注意这一行仍不满足夹具"等于页面自报 240×56"的期望（`optional`，
+   从不参与断言）：我们现在的答案是"OS 认为该点最内层的那个盒子"，而夹具注释记的是**页面**几何，
+   两者在 Chromium 这层无名 Pane 上本来就不一致。
+
+**规则**（`should_adopt_provider_box`，纯函数，单测
+`the_providers_finer_box_is_adopted_unless_it_is_a_text_run`）：
+
+```text
+采用 provider 命中框 ⟺ 命中框含光标 ∧ 控制类型 ≠ Text ∧ 面积严格小于走查答案
+```
+
+- **只可能更细**：等于或更大的框一律不采用——走查答案已经表达了层叠顺序与回溯规则，原始命中框
+  对这些一无所知。
+- 代价：每次查询多一次 `ElementFromPoint` + 上行 `CompareElements`。补足后的延迟：浏览器
+  n=70 p50 **16.8** / p95 26.3 / max 27.3 ms（补足前 13.3 / 26.4 / 30.0）；Explorer n=25 p50
+  **58.6** / p95 67.3 / max 159 ms（补足前 51.2 / 176.6 / 221.0）。都在 1500 ms 预算内。
+
+**遮挡问题（`ElementFromPoint` 没有 Z 序概念）**：overlay 全屏置顶时会自己答自己。两层处理：
+
+1. **拥有窗口的线程改样式**：提交查询前把 overlay 的 `WS_EX_TRANSPARENT` 打开，答案落地
+   （`on_refinement_ready`）或查询被**放弃**（`abandon_refinement`：在飞超时 / 光标换点 /
+   session 结束）时还原。参考实现就是这么做的
+   （`ScreenSnap-master/core/window_uia.py::set_click_through`，用完必须还原，否则遮罩收不到鼠标事件）。
+   **所有"退掉在飞查询"的路径都收敛到 `abandon_refinement`**：worker 一定会把被退掉的任务回报一次，
+   而那次的答案会被当陈旧丢弃，没有别的代码会去清样式。
+2. refinement 线程里的 `ClickThroughGuard`：包住那次命中测试，`Drop` 时还原；它同时是"没有 overlay 的
+   调用方"（测试/探针）的兜底，单测 `the_click_through_guard_restores_the_style_it_found` 断言
+   "置位 → 还原"。
+
+即使两层都失效，规则本身也挡住了：overlay 的框永远比走查答案**更大**，不可能通过"严格更小"的门槛，
+最坏结果只是这一次查询少了精度补足（不会发布错误的框）。另外 §6 第 9 行实测"自建全屏 topmost 弹窗
+三种样式状态下都返回桌面元素"，所以这一层是保险而非必需；那次测量来自已回退分支 `53c5acd` 上的
+`overlay_hit_through_probe`，**`main` 上没有这个探针**，不要去找。
+
+**门禁（补足后，本机连续一次）**：
+
+| 门禁 | 结果 |
+| --- | --- |
+| `cargo check --all-targets` | **0 warnings** |
+| `cargo test --lib` | **361 passed / 0 failed / 2 ignored** |
+| `browser_element_probe` | 断言 **23/23**，`provider_hit_available=43`、`provider_hit_is_finer_on=3`（补足前 4） |
+| `explorer_rule_probe` | `control_level_points=12/25`、`median_area_pct=65.8`、`provider_hit_is_finer_on=0`——**与补足前逐位一致** |
+
 ---
 
 ## 6. 实测踩坑清单（每条都花了时间，务必先读）
@@ -348,7 +420,7 @@ dwell，但预览等待上限是 320 ms，所以不会闪整窗）。成本项�
 | 6 | 链接/group 被选成"文字那一条" | Chromium 把 `<a>`/`role=group` 的**文字作为 `Text` 子节点**暴露（实测 `Hyperlink(168×56)` + `Text(56×20)`）。产品规则待定（§8 第 3 条） |
 | 7 | 同一坐标连续两次查询结果不同（一次整页、一次元素） | 跨查询的 per-epoch 层级缓存是**陈旧快照**：空批次不能缓存；批次解释不了当前点时应重读；或每次查询重读（实测 2–7 ms/查询 vs 1500 ms 预算） |
 | 8 | `EnumChildWindows` 拿不到 DOM 盒子 | 浏览器只暴露一个巨大的 render-host 子窗口；**不要**把它当元素 |
-| 9 | 自建全屏 topmost 弹窗从不被 `ElementFromPoint` 返回 | 三种样式状态下都返回桌面元素（`hwnd=0x0`）。即"无子窗口的 DComp 弹窗"可能本来就不参与 UIA 命中——穿透只是保险 |
+| 9 | 自建全屏 topmost 弹窗从不被 `ElementFromPoint` 返回 | 三种样式状态下都返回桌面元素（`hwnd=0x0`）。即"无子窗口的 DComp 弹窗"可能本来就不参与 UIA 命中——穿透只是保险，§5.7 仍保留了两层 |
 | 10 | Chrome 标题带 `" - Google Chrome"` | 从窗口标题读 JSON 时要按标记定位并截到匹配的 `}`，不能假设整串是 payload |
 | 11 | 复用 profile 导致忽略 `--window-size` 并弹"恢复页面" | 每次用**全新/删除后的** temp profile；否则窗口小于页面，点位全落空 |
 | 12 | 探针自身命令 | 构建输出被占用会 `LNK1104`（上一次测试进程没退）；跑探针前确保没有残留进程 |
