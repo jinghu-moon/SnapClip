@@ -1461,15 +1461,30 @@ where
     /// and the one fact nobody can guess is which end is the window. So the sentence arrives with
     /// the counter, at the moment the user's own wheel made it appear, instead of three seconds
     /// earlier when it would have been about something that had not happened yet.
+    ///
+    /// While that one sentence is still on screen, another walk rewrites its numbers
+    /// ([`should_teach`]): a sentence frozen at `8/9` next to a label already reading `3/7` is worse
+    /// than not explaining at all. After it has gone it does not come back — the lesson is once per
+    /// session, and the label carries the numbers from then on.
     fn arm_level_hint(&mut self) {
-        if self.hint_taught {
-            return;
-        }
         let Some(chain) = self.deep_levels.filter(|chain| !chain.is_empty()) else {
             return;
         };
+        if !should_teach(self.hint_taught, self.hint_showing()) {
+            return;
+        }
         self.hint_taught = true;
         self.arm_hint(level_hint(chain.index() + 1, chain.len()), LEVEL_HINT_MS);
+    }
+
+    /// Whether the one-shot hint is on screen right now (docs/21 §5.21).
+    ///
+    /// An expired hint stays armed until something replaces it, so the deadline — not the presence
+    /// of the value — is what decides.
+    fn hint_showing(&self) -> bool {
+        self.hint
+            .as_ref()
+            .is_some_and(|hint| Instant::now() < hint.until)
     }
 
     /// Step the deep-selection level: `-1` toward the window frame, `+1` toward the published box.
@@ -3141,6 +3156,17 @@ fn level_hint(level: usize, total: usize) -> String {
     format!("吸附层级 {level}/{total}（1=窗口）· 滚轮 / ↑↓ 切换")
 }
 
+/// Whether a successful level walk should (re)arm the teaching sentence (docs/21 §5.21).
+///
+/// Two rules about two different things:
+/// * the lesson is **once per session** — the sentence belongs to the moment the number appears,
+///   and a user who already knows does not need it over every later rectangle;
+/// * but while that same sentence is still on screen, another walk **rewrites its numbers**, so
+///   the sentence and the label never disagree about which level the user is on.
+fn should_teach(taught: bool, showing: bool) -> bool {
+    !taught || showing
+}
+
 /// The text the automatic-snap preview's label shows (docs/21 §5.21).
 ///
 /// Pure so the format is testable. Beyond the size it carries the three things a user cannot infer
@@ -3456,7 +3482,7 @@ unsafe extern "system" {
 
 #[cfg(test)]
 mod tests {
-    use super::{level_hint, point_from_lparam, preview_label, OverlayCommand};
+    use super::{level_hint, point_from_lparam, preview_label, should_teach, OverlayCommand};
     use crate::capture::geometry::Rect;
     use crate::capture::window_detection::LevelChain;
 
@@ -3589,6 +3615,18 @@ mod tests {
             preview_label(rect, false, Some(chain), true),
             "3840×2088 px  容器 3/4?"
         );
+    }
+
+    /// The teaching sentence's two rules, as a truth table: once per session, but it follows a
+    /// walk while it is still on screen.
+    #[test]
+    fn the_hint_is_taught_once_and_follows_a_walk_only_while_it_shows() {
+        // The first walk of the session: teach.
+        assert!(should_teach(false, false));
+        // Walking again inside the same showing: the numbers have to move with the label.
+        assert!(should_teach(true, true));
+        // After it has gone it does not come back — the label carries the numbers by then.
+        assert!(!should_teach(true, false));
     }
 
     /// The sentence that teaches the counter, the label, and the `level=` the confirm line prints
