@@ -789,6 +789,12 @@
               >（真机里是"这个位置什么都没答上来"）——只影响标签文案。</span
             ></label
           >
+          <label class="chk"
+            ><input type="checkbox" id="counterInLabel" /><span
+              ><b>把层级计数写回尺寸标签</b>（对比用）—— 默认是<b>拆开</b>：
+              尺寸标签 `846×272 px 容器` 在框外左上，层级徽标 `6/9` 在框内右上。</span
+            ></label
+          >
           <p class="fine">
             ③b（工具栏第三档）：走动结束 1.2 s 后整条链按 8 步量化淡出（≈ 8
             帧额外满屏）；任何换层或移动光标立刻复现——对应 ArmedHint /
@@ -811,8 +817,10 @@
             <span class="k">循环状态</span><b id="mState">—</b>
           </div>
           <div class="kv">
-            <span class="k">预览标签位置（三级阶梯）</span
-            ><b id="labelWhere">框外上方</b>
+            <span class="k">尺寸标签位置</span><b id="labelWhere">框外左上</b>
+          </div>
+          <div class="kv">
+            <span class="k">层级徽标位置</span><b id="chipWhere">框内右上</b>
           </div>
           <canvas id="strip" width="220" height="22"></canvas>
           <div class="fine">
@@ -1198,6 +1206,7 @@
         selFill: 0.18,
         forceWindow: false,
         degraded: false,
+        counterInLabel: false,
         selWidth: 2,
         keepAnswer: true,
         dim: true,
@@ -1503,30 +1512,46 @@
       }
 
       /* ---------------------------------------------------------------- 文案 */
-      // 预览标签的摆放：**锚点永远是框的右上角**（用户提出——眼睛只需盯同一个角，
-      // 换层时标签不会跳到屏幕另一头）。落在框外还是框内，由"框外放得下吗"决定，
-      // 而不是拍一个"大/小"尺寸阈值——几何上的等价说法正是"小元素在外、大元素在内"：
-      //   ① 框外右上（上边）—— 常态。小框的框外一定有地方，所以小元素都走这一级，且不盖内容；
-      //   ② 框外右下 —— 框贴顶（上方 6+22 px 放不下）时翻到下面，仍与右边缘对齐；
-      //   ③ **框内右上**（内缩 g）—— 框外上下都没位置时用；"最大化的窗口"就是这个情形
-      //      （框贴顶又占满高度），旧实现在这里会把标签整块丢掉，连"窗口"两个字都看不到。
-      //      要求框本身装得下标签；代价是暂时盖住框内一角，但它**不会进产物**（render_export 清理）；
-      //   ④ 光标旁 —— 框又满高又太窄（真机实测过 `5x648`，满高时就是 `30x720` 这类），
-      //      四边都没地方；沿用一次性提示那套摆放，保证数字永远读得到。
+      // ---- 两个不同的东西，两个位置（用户校正：层级计数不该和尺寸标签挤在一起）----
+      //
+      // ① 尺寸标签（`846×272 px 容器`）：**锚在框的左上角**。
+      //    常态在框外（上方 → 下方）；**只有满屏框才翻进框内左上角**——框贴顶又占满高度时
+      //    框外上下都没有 6+22 px 的位置，旧实现在这里会把标签整块丢掉，连"窗口"两个字都看不到。
+      //    最末一级仍是光标旁，给"又满高又太窄"的条状框兜底（真机实测过 `5x648`）。
       function placeLabel(rect, tw, th, g) {
         const clampX = (x) => Math.max(2, Math.min(x, 1280 - tw - 2));
-        const rightEdge = rect[0] + rect[2];
         if (rect[1] - g - th >= 0)
-          return { x: clampX(rightEdge - tw), y: rect[1] - g - th, where: "框外右上" };
+          return { x: clampX(rect[0]), y: rect[1] - g - th, where: "框外左上" };
         if (rect[1] + rect[3] + g + th <= 720)
-          return { x: clampX(rightEdge - tw), y: rect[1] + rect[3] + g, where: "框外右下" };
+          return { x: clampX(rect[0]), y: rect[1] + rect[3] + g, where: "框外左下" };
         if (tw <= rect[2] - 2 * g && th <= rect[3] - 2 * g)
-          return { x: clampX(rightEdge - g - tw), y: rect[1] + g, where: "框内右上" };
+          return { x: clampX(rect[0] + g), y: rect[1] + g, where: "框内左上（满屏框）" };
         const right = state.cursor.x + 14,
           down = state.cursor.y + 14;
         return {
           x: right + tw <= 1280 ? right : Math.max(2, state.cursor.x - 14 - tw),
           y: down + th <= 720 ? down : Math.max(2, state.cursor.y - 14 - th),
+          where: "光标旁",
+        };
+      }
+
+      // ② 层级徽标（只有 `6/9` 这么点大）：**框内右上角**是它的家——它就是"这个框在链上的位置"，
+      //    贴在自己身上最自然，也不会和左上角的尺寸标签抢地方。装不下时退到框外右上（徽标小，
+      //    框外几乎总有地方），最后才是光标旁。
+      function placeChip(rect, cw, ch, g) {
+        const clampX = (x) => Math.max(2, Math.min(x, 1280 - cw - 2));
+        const rightEdge = rect[0] + rect[2];
+        if (cw <= rect[2] - 2 * g && ch <= rect[3] - 2 * g)
+          return { x: clampX(rightEdge - g - cw), y: rect[1] + g, where: "框内右上" };
+        if (rect[1] - g - ch >= 0)
+          return { x: clampX(rightEdge - cw), y: rect[1] - g - ch, where: "框外右上" };
+        if (rect[1] + rect[3] + g + ch <= 720)
+          return { x: clampX(rightEdge - cw), y: rect[1] + rect[3] + g, where: "框外右下" };
+        const right = state.cursor.x + 14,
+          down = state.cursor.y + 14;
+        return {
+          x: right + cw <= 1280 ? right : Math.max(2, state.cursor.x - 14 - cw),
+          y: down + ch <= 720 ? down : Math.max(2, state.cursor.y - 14 - ch),
           where: "光标旁",
         };
       }
@@ -1541,10 +1566,19 @@
           Math.round(lv.rect[3]) +
           " px  " +
           kind;
-        if (n > 1 && i !== n - 1) t += " " + (i + 1) + "/" + n;
+        // 层级计数默认**不进**尺寸标签（用户校正：两者是两件事，别挤在一起）。
+        // 勾上开关可以对比"计数写在标签里"的旧形态。
+        if (state.counterInLabel && n > 1 && i !== n - 1) t += " " + (i + 1) + "/" + n;
         // 整窗兜底 + 什么都没答上来（真机里 PrecisionOutcome::Unavailable）时标签带 `?`。
         if (state.degraded) t += "?";
         return t;
+      }
+
+      /// 层级徽标的文字：只在"换过层"时才有意义（最深那层就是答案本身，和确认行的 `deepest` 一致）。
+      function levelChipText(i) {
+        const n = chainOf().length;
+        if (state.counterInLabel || n <= 1 || i === n - 1) return "";
+        return i + 1 + "/" + n;
       }
       function chip(x, y, text, border, color) {
         ctx.font = '12px "Segoe UI","Microsoft YaHei UI",sans-serif';
@@ -1699,6 +1733,29 @@
           ctx.fillStyle = "#e8edf4";
           ctx.textBaseline = "top";
           ctx.fillText(text, pl[0] + 10, pl[1] + 5);
+        }
+        // 5b) 层级徽标：**独立于尺寸标签**的一小块 `6/9`（用户校正）。
+        //     它贴在框内右上角（自己是"这个框在链上的位置"，贴在框上最自然），
+        //     装不下才退到框外——徽标小，所以这一步几乎总能成功。
+        const chipText = levelChipText(sel);
+        if (chipText) {
+          ctx.font = '11px "Segoe UI","Microsoft YaHei UI",sans-serif';
+          const cw = Math.ceil(ctx.measureText(chipText).width) + 12,
+            ch = 18;
+          const at = placeChip(rect, cw, ch, g);
+          q("#chipWhere").textContent = at.where;
+          ctx.fillStyle = "rgba(18,24,32,.93)";
+          ctx.strokeStyle = "rgba(255,255,255,.14)";
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.roundRect(at.x + 0.5, at.y + 0.5, cw - 1, ch - 1, 3);
+          ctx.fill();
+          ctx.stroke();
+          ctx.fillStyle = "#e8edf4";
+          ctx.textBaseline = "top";
+          ctx.fillText(chipText, at.x + 6, at.y + 3);
+        } else {
+          q("#chipWhere").textContent = "（未换层，不显示）";
         }
         // 6) 悬停名称浮签 / 一次性提示 / 对照徽标
         if (state.hoverIndex >= 0) {
@@ -2255,6 +2312,7 @@
           renderStack();
         });
         bindCheck("degraded", "degraded", () => renderStack());
+        bindCheck("counterInLabel", "counterInLabel", () => renderStack());
         bindCheck("dim", "dim");
         bindCheck("ease", "ease", (v) => {
           if (!v && state.anim) {
