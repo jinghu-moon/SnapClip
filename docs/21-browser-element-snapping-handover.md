@@ -523,6 +523,56 @@ last precision not-finer provider=1153x22623 at (1567,-9870) type=50026
 > **订正**：`91e6b08` 的提交信息声称探针已经"断言"了前两条，实际当时只打印、没有断言（这个提交
 > 补上了，并新增第三条）。以代码为准。
 
+### 5.10 无障碍树的天花板，以及其它通道（2026-10-06，调研 + 实测）
+
+**问题（用户）**："除了 Chromium 的无障碍树，还有更好的方案吗？"
+
+**先把天花板钉死：Blink 在把树交给平台之前就把"不感兴趣"的节点丢掉了。**
+
+- Blink 自己的文档（`third_party/blink/renderer/modules/accessibility/readme.md`）："An 'ignored'
+  accessibility object is one that **will not be exposed in platform accessibility APIs** to
+  assistive technologies."——常见的被忽略原因里明确列着 **"Uninteresting Content"：没有额外 ARIA
+  信息的 `<span>`/`<div>` 这类布局包装**。
+- Chromium 的 UIA 文档（`docs/accessibility/browser/uiautomation.md`）讲的是 `IsControlElement` /
+  `IsContentElement` 决定的 **control view / content view / raw view**，其中 **raw view 是 control view
+  的超集**——所以"换 raw view 就能多看到东西"曾经是最有希望的一条路。
+- 于是 `browser_element_probe` 新增 `[sources]` 阶段，用夹具里专门加的一个"裸 div"（`plain-div`：无
+  role、无 label、无自身文本，只有内部一个带文本的 span）实测三条通道：
+
+```text
+[sources] plain-div point=(698,1096)          # 点在裸 div 内部、远离那个 span
+[sources]   control hit : Document(48,107)-(1832,1232)
+[sources]   raw view    : 158 nodes, 154 with a rectangle, 0 raw-only, 8 contain the point, 45 ms
+[sources]   raw smallest: Pane(48,107)-(1832,1232) class="Chrome_WidgetWin_1"
+[sources]   text range  : enclosing=Text(469,1047)-(501,1066)   # 229 px 外的那条文本
+```
+
+**结论**：
+
+1. **raw view 一点忙也帮不上**：Chromium 的 raw view 里 `raw-only` 节点数是 **0**（158 个节点全都在
+   control view 里），这个裸 div 在两棵树里都不存在。因为它不是"`IsControlElement=false`"，而是
+   **根本没进平台树**。
+2. **`TextPattern.RangeFromPoint` 不是命中测试**：光标下没有文本时它返回**最近的**文本跑条
+   （上面那条离光标 229 px），所以它不能用来回答"这是哪个盒子"；而且粒度是文本，产品本来就决定不选
+   文本。
+3. **MSAA 与 UIA 是同一棵树**：`AXPlatformNodeWin::accHitTest` 只是用 Blink 的 `HitTestSync` 拿到
+   *无障碍节点*（z-index/overflow 更准），节点集合与 UIA 相同；`BrowserAccessibility::accLocation`
+   同样返回**未裁切**矩形（`GetUnclippedScreenBoundsRect`）。
+
+**那么还剩哪些通道**（按"能不能拿到真正的 DOM 盒子"排序）：
+
+| 通道 | 能拿到什么 | 代价 / 风险 | 结论 |
+| --- | --- | --- | --- |
+| **CDP**（`DOM.getNodeForLocation` + `DOM.getBoxModel`） | 真正的 DOM 命中测试 + content/padding/border/margin 四组 quad；`DOMSnapshot.captureSnapshot{includeDOMRects:true}` 还能一次拿到整页盒表 | 需要浏览器带 `--remote-debugging-port` 启动；**Chrome 136 起默认 profile 上该开关被拒**（必须配 `--user-data-dir`，企业策略 `RemoteDebuggingAllowed` 可放行）；自己拉起的 profile **没有用户的登录态** | 精度最高；适合"应用自己托管/自己启动浏览器"的场景 |
+| **伙伴扩展**（content script：`document.elementFromPoint` + `getBoundingClientRect`，经 native messaging 回传） | 同样的 DOM 盒子，且跑在**用户自己的浏览器会话**里 | 要用户装扩展 + 注册 native host；`chrome.debugger` 版本还要 `"debugger"` 权限并会弹"正在调试此浏览器"警告条；MV3 service worker | 唯一能覆盖"用户已登录页面"的路 |
+| **自己托管 WebView2** | 完整 DOM/CDP | 只覆盖 SnapClip 自己开的窗口，用户不用它浏览 | 只对产品自己的窗口有意义 |
+| **UIA / MSAA（现状）** | Chromium 认为"有趣"的节点 + 其祖先；几何未裁切（本仓库已修成取可见部分） | 零安装、零权限、跨浏览器 | **继续作为默认**：本轮之后它已经能用（遮罩穿透 + 可见部分 + 精度补足） |
+| **视觉分割（像素/OCR）** | 视觉上的框（边框、色块、文本行） | 与 DOM 无关，纯启发式；已有 OCR 管线可复用 | 只作兜底/辅助，不做主路径 |
+
+**给下一轮的建议**：`plain-div` 这类"裸 div"是 UIA 的**硬边界**，不值得再在无障碍树上投资。要真正跨过
+它只有两条路——**应用自己启动浏览器（CDP）**或**伙伴扩展**。两者都改变产品形态（登录态 / 安装步骤），
+所以这是产品决策，不是实现细节：先决定"要不要为 DOM 精度引入一条需要用户配合的通道"，再动手。
+
 ---
 
 ## 6. 实测踩坑清单（每条都花了时间，务必先读）
