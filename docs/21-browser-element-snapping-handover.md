@@ -573,6 +573,68 @@ last precision not-finer provider=1153x22623 at (1567,-9870) type=50026
 它只有两条路——**应用自己启动浏览器（CDP）**或**伙伴扩展**。两者都改变产品形态（登录态 / 安装步骤），
 所以这是产品决策，不是实现细节：先决定"要不要为 DOM 精度引入一条需要用户配合的通道"，再动手。
 
+### 5.11 PixPin 为什么做得到：MSAA，而不是 UIA（2026-10-06，实测）
+
+**背景**：用户指出 PixPin 在同一页面上能做到元素吸附。安装目录 `C:\A_Softwares\PixPin` 的取证结果：
+
+- 进程只加载 `UIAutomationCore.dll`、**`OLEACC.dll`**、`UiSpy.dll`、`UiRegionDetector.dll`、
+  `PixWindowNotify.dll`、Qt、以及 `PixVision.dll`（OpenCV 4.13 全量构建）——**没有** WebView2、
+  没有浏览器扩展、没有任何 CDP/DOM 通道的痕迹。
+- `UiSpy.dll` 的符号与字符串：`CarpUIElement{UIA,HWND}`、`WinGetWinRectByPointUIA`、
+  `DirectGetRect`、`AccessibleObjectFromWindow`、`WindowFromPoint`、`ChildWindowFromPoint`、
+  `IsHungAppWindow`，以及字面量 **`chrome.exe`** 和
+  **`Failed to get IAccessible for Chrome window:`**；它的日志里刷屏的是
+  `[UiSpy::DirectGetRect] accLocation failed or returned invalid rect` 与
+  `get_CurrentBoundingRectangle failed ... use WindowFromPoint rect instead`。
+  → **它就是"UIA 取矩形 / MSAA 取矩形 / WindowFromPoint 兜底"三级阶梯，并且给 Chrome 单独走了
+  `IAccessible` 分支。**
+- `UiRegionDetector.dll` 的导入表与 UiSpy 相同（**不导入** PixVision/OpenCV），所以区域检测器同样是
+  UIA/MSAA 通道，视觉库只服务于 PixPin 的其它功能（OCR、自动马赛克等）。
+
+**为什么 MSAA 能看到 UIA 看不到的盒子**（源码依据）：
+
+| 通道 | Chromium 侧实现 | 结果是 |
+| --- | --- | --- |
+| UIA `ElementFromPoint` | 由平台树（Blink 交给平台的节点）按矩形比较回答；`IsControlElement/IsContentElement` 决定 control/content/raw view，而 raw view 仍是它的超集 | 只能看到"有趣的"节点；裸 `<div>`/`<span>` 被 `AXObject::ComputeIsIgnored` 判为 ignored，**根本不进平台树** |
+| MSAA `accHitTest` | `BrowserAccessibilityWin::accHitTest` → `CachingAsyncHitTest` → **渲染进程真正的命中测试**（`HitTestSync`） | 返回 DOM 命中节点对应的**"ignored but included in tree"** 无障碍对象：**带几何、能被 MSAA 看到** |
+
+**实测（夹具 8 个点，页面自报的盒子做基准）**：
+
+```text
+[sources] plain-div    control hit=Document         msaa window=300x96  at (448,1027)  ← (448,1027) 300x96 ✓
+[sources] checkbox     control hit=Document         msaa window=168x56  at (72,211)    ← (72,211)  168x56  ✓
+[sources] radio        control hit=Document         msaa window=168x56  at (256,211)   ← (256,211) 168x56  ✓
+[sources] para         control hit=Document         msaa window=392x88  at (480,315)   ← (480,315) 392x88  ✓
+[sources] code-box     control hit=Document         msaa window=300x120 at (864,907)   ← (864,907) 300x120 ✓
+[sources] table-cell-1 control hit=Document         msaa window=165x35  at (1187,344)  ← (1187,344) 165x35 ✓
+```
+
+8/8 逐像素命中，其中 `plain-div` 是**任何无障碍树里都不存在的布局容器**。代价：`accHitTest` 只要
+**1 ms**（两次调用即到底）。
+
+**两个把它接到产品里的关键细节（都已实测）**：
+
+1. **不要用全局命中测试**。`AccessibleObjectFromPoint` 会被截图遮罩挡住，而且——
+   **`WM_NCHITTEST → HTTRANSPARENT` 对 MSAA 无效**（它只让 UIA 穿透）：
+
+   ```text
+   [overlay] overlay +HTTRANSPARENT:  UIA=Button(页面)  |  MSAA=role=0xa 遮罩 3840x2160   ← 只有 UIA 过了
+   [overlay] overlay +LAYERED|TRANS:  UIA=Button(页面)  |  MSAA=role=0x29 "Button One" 74x16
+   ```
+
+   只有 `WS_EX_LAYERED|TRANSPARENT` 能让 MSAA 穿透，而 DirectComposition 窗口不能用。
+   正确做法是 PixPin 的做法：**拿目标窗口自己的 `IAccessible`**
+   （`AccessibleObjectFromWindow(hwnd, OBJID_CLIENT)`）再调 `accHitTest`——没有全局命中测试，
+   遮罩自然不参与（探针里 `msaa window` 那一行就是这么来的，1 ms、`depth=1`）。
+2. `accLocation` 返回**未裁切**矩形（夹具里那个 20000 px 高的元素回 `358x20000`），
+   所以 §5.9 的"可见部分"规则仍要在 MSAA 结果上再跑一遍。
+
+**实施计划（下一步，尚未动手）**：在 refinement worker 里加一个 MSAA 命中源
+（`OBJID_CLIENT` → `accHitTest` → `accLocation`，含 `OBJID_WINDOW` 兜底与 Chrome 分支），
+按"严格更细才采纳、跳过裸文本角色（`ROLE_SYSTEM_TEXT/STATICTEXT`）、按祖先链裁可见部分"接入现有精度
+补足，并把现成的 6 个 `optional` 夹具行（`plain-div`/`checkbox`/`radio`/`para`/`code-box`/
+`table-cell-1`）**从"打印"改成"断言 `self`"** 作为门禁。Explorer 12/25 与延迟需要同时回归。
+
 ---
 
 ## 6. 实测踩坑清单（每条都花了时间，务必先读）
