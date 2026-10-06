@@ -31,7 +31,7 @@ use crate::capture::window_detection::deep::{
 use crate::capture::window_detection::model::{SnapshotEpoch, TargetKind};
 use crate::capture::window_detection::uia::{
     WalkBudget, WalkNode, WalkOutcome, fallback_hit_path, is_descendable, is_structural_wrapper,
-    is_text_run_inside_element, merge_hit_paths, push_box_keeping_containment,
+    is_text_run_inside_element, is_unspecific_hit, merge_hit_paths, push_box_keeping_containment,
     should_adopt_provider_box,
 };
 
@@ -71,6 +71,8 @@ pub struct UiaDeepSelectionProvider {
     /// that can ask the MSAA transport; this field is how that side learns what the UIA hit saw
     /// without computing it twice.
     last_hit: Option<HitDecision>,
+    /// Whether a bare text run may become the answer (docs/21 §5.19).
+    adopt_text_runs: bool,
 }
 
 /// One transport's verdict on the point hit test, for the per-query forensics line.
@@ -78,6 +80,10 @@ pub struct UiaDeepSelectionProvider {
 pub(crate) struct HitDecision {
     pub outcome: PrecisionOutcome,
     pub note: String,
+    /// Whether the hit test named a *specific* element rather than the document or a window-sized
+    /// container. `false` means UIA could not get below the page, which is the signal for the
+    /// composite to ask MSAA for its own hit (docs/21 §5.19).
+    pub answered_specifically: bool,
 }
 
 /// What the provider's own point hit test said about one query's position.
@@ -171,6 +177,7 @@ impl UiaDeepSelectionProvider {
             level: 0,
             hit_test_pass_through: win32::HitTestPassThrough::default(),
             last_hit: None,
+            adopt_text_runs: crate::capture::window_detection::DEFAULT_ADOPT_TEXT_RUNS,
         }
     }
 
@@ -540,6 +547,12 @@ impl UiaDeepSelectionProvider {
         self.last_hit.take()
     }
 
+    /// Whether a bare text run may become the answer (docs/21 §5.19).
+    pub(crate) fn with_adopt_text_runs(mut self, adopt_text_runs: bool) -> Self {
+        self.adopt_text_runs = adopt_text_runs;
+        self
+    }
+
     /// Number of expanded levels held for the current generation (diagnostics and tests).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn cached_levels(&self) -> usize {
@@ -764,8 +777,18 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
                 control_type,
                 class,
             } => {
-                let finer = should_adopt_provider_box(walk, hit, control_type, job.point);
+                let finer = should_adopt_provider_box(
+                    walk,
+                    hit,
+                    control_type,
+                    job.point,
+                    self.adopt_text_runs,
+                );
                 let adopted = finer && push_hit_box(&mut outcome, hit);
+                // Did this transport get below the page? A document or window-sized answer says no,
+                // and that is what tells the composite to ask MSAA (docs/21 §5.19).
+                let answered_specifically =
+                    !is_unspecific_hit(hit, control_type, window_bounds);
                 let mut note = format!(
                     "provider={}x{} at ({},{})",
                     raw.width(),
@@ -795,6 +818,7 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
                     self.last_hit = Some(HitDecision {
                         outcome: PrecisionOutcome::Adopted,
                         note,
+                        answered_specifically,
                     });
                     self.metrics.log_line(
                         &format!("refinement adopted provider box={hit:?} (walk was coarser)"),
@@ -805,11 +829,13 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
                     self.last_hit = Some(HitDecision {
                         outcome: PrecisionOutcome::Unavailable,
                         note: format!("{note}: the hit could not be appended to the path"),
+                        answered_specifically,
                     });
                 } else {
                     self.last_hit = Some(HitDecision {
                         outcome: PrecisionOutcome::NotFiner,
                         note,
+                        answered_specifically,
                     });
                 }
             }
@@ -817,6 +843,8 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
                 self.last_hit = Some(HitDecision {
                     outcome: PrecisionOutcome::Unavailable,
                     note: why,
+                    // Nothing was answered at all, so there is nothing specific to prefer.
+                    answered_specifically: false,
                 });
             }
         }
@@ -1291,7 +1319,12 @@ mod tests {
                 "the fixture must be resolvable before the pipeline is exercised, got {outcome:?}"
             );
         }
-        let worker = RefinementWorker::new(0, win32::HitTestPassThrough::default(), metrics);
+        let worker = RefinementWorker::new(
+            0,
+            win32::HitTestPassThrough::default(),
+            crate::capture::window_detection::DEFAULT_ADOPT_TEXT_RUNS,
+            metrics,
+        );
         let mut scheduler = RefinementScheduler::new();
 
         for (session, epoch) in [(1u32, 1u64), (2, 2)] {
@@ -1464,6 +1497,10 @@ mod tests {
         probe: Option<[i32; 2]>,
         #[serde(default)]
         optional: bool,
+        /// The answer must be **strictly inside** this fixture's own box, not the box itself: the
+        /// assertion for "the text run under the cursor was adopted" (docs/21 §5.19).
+        #[serde(default)]
+        finer_than_self: bool,
     }
 
     /// What a correct deep selection must publish in a real web page.
@@ -1623,8 +1660,9 @@ mod tests {
         // alone: the MSAA second opinion lives in the composite (docs/21 §5.16), and a gate that
         // skipped it would report the old behaviour no matter what the product does.
         let mut pipeline = super::super::refinement_worker::FallbackDeepSelection::new(
-            metrics,
+            metrics.clone(),
             win32::HitTestPassThrough::default(),
+            crate::capture::window_detection::DEFAULT_ADOPT_TEXT_RUNS,
         );
         let walk = provider.automation().cloned().and_then(|auto| RawWalk::new(&auto));
         let hit_owner = provider.automation().cloned();
@@ -1672,6 +1710,8 @@ mod tests {
         // through `path`, so a level that does not contain the next one would make "one level up"
         // jump to a box that does not contain the answer.
         let mut broken_chains: Vec<String> = Vec::new();
+        // Rows that must resolve *below* their own box: the text-run adoption (docs/21 §5.19).
+        let mut finer_than_self_failures: Vec<String> = Vec::new();
         let mut failures = Vec::new();
         let mut layout_drift = Vec::new();
         for fixture in &manifest {
@@ -1758,6 +1798,11 @@ mod tests {
                 }
             }
             retries += attempts.saturating_sub(1);
+            if let Some(note) = metrics.last_precision() {
+                // The composite's own decision for this query, uia/msaa both: the counters say
+                // *whether* a finer answer was taken, this says what the transports answered.
+                println!("[probe]   decision {}: {note}", fixture.id);
+            }
             // The provider's own hit test, through the **production** code path, so the gate below
             // covers the mechanism the product actually runs (`provider_hit` + the adoption rule)
             // rather than a probe-local copy of it.
@@ -1786,7 +1831,11 @@ mod tests {
                                 .map(|rect| format!("{}x{}", rect.width(), rect.height()))
                                 .unwrap_or_else(|| "none".into())
                         );
-                        if hit_kind != crate::capture::window_detection::uia::TEXT_CONTROL_TYPE {
+                        // With the text-run preference on (docs/21 §5.19) the old exemption is gone:
+                        // any strictly finer hit, text run included, has to have become the answer.
+                        let exempt = !crate::capture::window_detection::DEFAULT_ADOPT_TEXT_RUNS
+                            && crate::capture::window_detection::is_bare_text_control_type(hit_kind);
+                        if !exempt {
                             finer_not_adopted.push(fixture.id.clone());
                         }
                     }
@@ -1856,6 +1905,22 @@ mod tests {
                         fixture.id,
                         path.last(),
                         published
+                    ));
+                }
+            }
+            if fixture.finer_than_self {
+                let own_box = Rect::new(
+                    viewport.left + own[0],
+                    viewport.top + own[1],
+                    viewport.left + own[0] + own[2],
+                    viewport.top + own[1] + own[3],
+                );
+                let ok = published
+                    .is_some_and(|rect| own_box.contains_rect(rect) && rect.area() < own_box.area());
+                if !ok {
+                    finer_than_self_failures.push(format!(
+                        "{}: published {:?} is not strictly inside its own box {own_box:?}",
+                        fixture.id, published
                     ));
                 }
             }
@@ -2187,6 +2252,12 @@ mod tests {
             "{} published paths are not containment chains ending at the published box: \
              {broken_chains:#?}",
             broken_chains.len()
+        );
+        assert!(
+            finer_than_self_failures.is_empty(),
+            "{} rows did not resolve to something strictly inside their own box, so the text run \
+             under the cursor was not adopted: {finer_than_self_failures:#?}",
+            finer_than_self_failures.len()
         );
     }
 
@@ -2718,6 +2789,7 @@ mod tests {
         let mut pipeline = super::super::refinement_worker::FallbackDeepSelection::new(
             explorer_metrics,
             win32::HitTestPassThrough::default(),
+            crate::capture::window_detection::DEFAULT_ADOPT_TEXT_RUNS,
         );
         let window_area = i64::from(client.width()) * i64::from(client.height());
         let mut areas = Vec::new();

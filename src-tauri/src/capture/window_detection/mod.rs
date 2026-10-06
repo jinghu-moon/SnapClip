@@ -68,13 +68,23 @@ pub use transition::{
     PREVIEW_TRANSITION_MS, RectTransition, lerp_rect, out_quad,
 };
 pub use uia::{
-    MAX_DEPTH, MAX_NODES, MAX_PATH_LEN, WalkBudget, WalkNode, WalkOutcome, is_descendable,
-    is_finer_refinement, is_text_run_inside_element, push_box_keeping_containment,
+    DOCUMENT_CONTROL_TYPE, MAX_DEPTH, MAX_NODES, MAX_PATH_LEN, WalkBudget, WalkNode, WalkOutcome,
+    is_bare_text_control_type, is_bare_text_role, is_descendable, is_finer_refinement,
+    is_text_run_inside_element, is_unspecific_hit, push_box_keeping_containment,
     should_adopt_msaa_box, should_adopt_provider_box,
 };
 
 /// Cursor rest time before an automatic-snap preview may appear (docs/14 §4.1).
 pub const DEFAULT_DWELL_MS: u32 = 120;
+
+/// Whether a bare text run may be published as the target (docs/21 §5.19).
+///
+/// `true` is the product's current answer: the point query may land on the glyph run itself, which
+/// is what makes "snap to this one line" work in editors that expose a run per line. It is only safe
+/// because the ancestor walk exists — pointing at a line and stepping up once gives the box back —
+/// so this is a product preference a settings key can override later
+/// (`capture/deep_select_text_runs`), not a structural decision.
+pub const DEFAULT_ADOPT_TEXT_RUNS: bool = true;
 
 /// Radius, in physical pixels, inside which a window may be snapped to.
 pub const DEFAULT_SNAP_RADIUS_PX: u32 = 24;

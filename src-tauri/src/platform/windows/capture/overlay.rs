@@ -73,8 +73,8 @@ use crate::capture::sampler::{ColorFormat, ColorSampler};
 use crate::capture::session::{CaptureSession, ExportOutcome};
 use crate::capture::window_detection::model::RequestId;
 use crate::capture::window_detection::{
-    DEFAULT_DWELL_MS, DEFAULT_HOVER_REVALIDATE_MS, DEFAULT_SNAP_RADIUS_PX, DeepTarget, Exclusions,
-    LevelChain,
+    DEFAULT_ADOPT_TEXT_RUNS, DEFAULT_DWELL_MS, DEFAULT_HOVER_REVALIDATE_MS, DEFAULT_SNAP_RADIUS_PX,
+    DeepTarget, Exclusions, LevelChain,
     GestureState, HoverValidity, MoveOutcome, PressOutcome, RefinementJob, RefinementOutcome,
     RefinementScheduler,
     ReleaseOutcome, Replacement, WindowSnapshot, WindowTarget, classify_replacement,
@@ -524,6 +524,7 @@ where
         let refinement = RefinementWorker::new(
             thread_id,
             hit_test_pass_through.clone(),
+            DEFAULT_ADOPT_TEXT_RUNS,
             metrics.clone(),
         );
         // The overlay must never be offered as its own snap target: it is full-screen and

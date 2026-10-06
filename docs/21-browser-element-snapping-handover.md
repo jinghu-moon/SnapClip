@@ -941,6 +941,68 @@ code > span`），**所有文字在那一个 `<span>` 里**，问"这个 div 里
 落点在 `should_adopt_provider_box` / `should_adopt_msaa_box` 里排除文本类型的那两个条件——开关加上去是
 一行判断，不动流程。
 
+### 5.19 采纳文字跑条（产品已定：要这个行为）（2026-10-06）
+
+**决定**：把"文字跑条"也允许作为目标——在 CodeMirror 这类**每行一个 `span`** 的编辑器里，指着一行字就
+得到**那一行的盒子**；接受 `nested-*` 那几行期望从"盒子"变成"盒子里那条字"的代价。
+
+**为什么现在开是安全的（这是关键）**：§5.6 A 当年排除文字跑条，是因为那时**没有别的办法回到容器**——一旦
+取了文字，用户就没法拿到那个盒子。现在 §5.17 的**层级上移**已经存在：指着文字得到那一行，**滚轮往上一格**
+就回到它所在的盒子。也就是说这条规则从"单向取舍"变成了"默认更细、可一步退回"，两边的能力都不丢。
+
+**规则改动（最小面）**：
+
+- `should_adopt_provider_box` / `should_adopt_msaa_box` 增加 `adopt_text_runs: bool`：为真时不再因
+  `TEXT_CONTROL_TYPE` / `ROLE_SYSTEM_TEXT|STATICTEXT` 拒绝，其余条件（非空、含光标、**严格更小**）不变。
+- **走查自己的规则不动**：带边框的 `Pane`/`Group` 仍然"认领"自己的文字块（`is_text_run_inside_element`），
+  因为走查在树里拿到的是容器；**更细的那一层由命中测试给出**（UIA `ElementFromPoint` / MSAA `accHitTest`
+  都能直接答出文字跑条，§5.18 已实测）。
+- 策略值从 overlay → `RefinementWorker` → 组合 provider → 两个 provider 逐层传下去；本轮用常量
+  `DEFAULT_ADOPT_TEXT_RUNS = true`，将来接设置时它就是 `capture/deep_select_text_runs` 的默认值。
+- **"跳过无绘制包装层"仍是独立开关**，本轮不动（用户已定"先忠实"）。
+
+**门禁要跟着改（这正是这次的行为变化）**：
+
+| 行 | 之前 | 现在 |
+| --- | --- | --- |
+| `nested-outer` / `nested-mid` / `nested-inner` | 期望**盒子**（320x200 / 256x136 / 192x72） | 期望**盒子里面**（`inside_self`）+ 新断言 `finer_than_self`：答案必须严格小于该盒子 |
+| `code-block` | 期望**代码块**（320x96） | 同上：答案是块里那一段文字，必须严格小于块 |
+| 精度计数器 `provider_hit_is_finer_on` | 3（三条文字跑条被**有意放过**） | **0**：更细的命中一律采纳，"更细却没采纳"的断言不再有例外 |
+
+`finer_than_self` 是新加的夹具断言（`published ⊆ 自身盒子` 且**面积严格更小**）——只判 `inside_self` 太弱，
+它会同时接受"盒子本身"和"盒子里那条字"，而这次要验证的恰恰是**真的取到了更细的那一层**。
+
+**已实现（2026-10-06，最终规则 + 一个被门禁挖出来的底层事实）**
+
+第一版按"最细者通吃"实现后，门禁立刻指出代价比预期大：**按钮也变成它的标签**（`btn-plain` 期望
+168x56，拿到 74x16）。查下去发现两件事：
+
+1. **UIA 的 `ElementFromPoint` 是"近似命中"，不稳定**。同一个点连续三次查询，它分别答出**文字跑条
+   70x20 → 外层盒子 320x200 → 中层盒子 256x136**（探针现在把每条查询的判定都打出来了：
+   `[probe] decision nested-mid: … uia=[not-finer provider=320x200 …]`）。这正是 Chromium 那条
+   "approximate hit test" 的注释所指：浏览器侧用缓存树按矩形近似，而 MSAA 的 `accHitTest` 走渲染进程
+   **真实命中**。所以"UIA 具体就听 UIA"是错的前提——**MSAA 永远要问**（UIA 的候选仍然先试，但只可能
+   用来细化，永远不会因为它的不稳定而发布一个更粗的框）。
+2. **按钮的标签需要一个产品分界**：文字跑条只在"**父不是交互控件**"时才算独立目标
+   （`is_interactive_control_role`：Link / PushButton / CheckButton / RadioButton / ComboBox /
+   DropList / MenuItem / ListItem / PageTab / Slider / SpinButton）。父角色来自我们本来就在走的
+   `accParent` 链（`MsaaHitBox::parent_role`，多一次 `get_accRole`）。
+
+于是最终行为：**按钮是按钮（168x56），编辑器里的一行字是那一行（70x20 / 77x75）**——
+夹具里两边都是断言。
+
+| 门禁 | 结果 |
+| --- | --- |
+| 浏览器夹具 | **35/35** 断言通过：`nested-*` 三条发布 **70x20**（文字跑条，`finer_than_self`），
+`btn-plain`/`btn-disabled`/`role-button` 仍发布 **168x56**（按钮），`code-block` 发布 **77x75**（块内那段文字） |
+| 精度计数器 | `provider_hit_is_finer_on=0`——"更细必被采纳"的断言**再无任何例外**（文字跑条不再是豁免项） |
+| 延迟 | 浏览器 n=49 p50 29.4 / p95 42.7 / max 66.6 ms；Explorer p50 64.4 / p95 106.2 / max 174.2 ms
+（MSAA 每次都问 + 一次 `accParent` 取父角色，仍在 1500 ms 预算内） |
+| Explorer | `control_level_points=12/25`、中位 65.8% **不变** |
+| 其它 | `cargo test --lib` 369 passed、`cargo check --all-targets` 0 warning |
+
+唯一还没做的开关仍是"跳过无绘制包装层"（用户已定"先忠实、以后再加"）。
+
 ---
 
 ## 6. 实测踩坑清单（每条都花了时间，务必先读）

@@ -58,18 +58,23 @@ pub(crate) struct FallbackDeepSelection {
     uia: UiaDeepSelectionProvider,
     msaa: MsaaDeepSelectionProvider,
     metrics: WindowDetectionMetrics,
+    /// Whether a bare text run may become the answer (docs/21 §5.19); both transports share it.
+    adopt_text_runs: bool,
 }
 
 impl FallbackDeepSelection {
     pub(crate) fn new(
         metrics: WindowDetectionMetrics,
         pass_through: win32::HitTestPassThrough,
+        adopt_text_runs: bool,
     ) -> Self {
         Self {
             uia: UiaDeepSelectionProvider::new(metrics.clone())
-                .with_hit_test_pass_through(pass_through),
+                .with_hit_test_pass_through(pass_through)
+                .with_adopt_text_runs(adopt_text_runs),
             msaa: MsaaDeepSelectionProvider::new(metrics.clone()),
             metrics,
+            adopt_text_runs,
         }
     }
 
@@ -82,7 +87,7 @@ impl FallbackDeepSelection {
     fn adopt_msaa_hit(
         &self,
         target: &mut DeepTarget,
-        hit: &Result<MsaaHitBox, MsaaHitFailure>,
+        hit: Option<&Result<MsaaHitBox, MsaaHitFailure>>,
         uia: Option<&super::uia_provider::HitDecision>,
         job: &RefinementJob,
     ) -> (crate::capture::diagnostics::PrecisionOutcome, String) {
@@ -98,8 +103,13 @@ impl FallbackDeepSelection {
         let uia_adopted = match uia {
             Some(decision) => {
                 note.push_str(&format!(
-                    " uia=[{} {}]",
+                    " uia=[{}{} {}]",
                     decision_name(decision.outcome),
+                    if decision.answered_specifically {
+                        ""
+                    } else {
+                        " unspecific"
+                    },
                     decision.note
                 ));
                 decision.outcome == PrecisionOutcome::Adopted
@@ -107,8 +117,24 @@ impl FallbackDeepSelection {
             None => false,
         };
         let (msaa_usable, msaa_adopted) = match hit {
-            Ok(hit) => {
-                let finer = should_adopt_msaa_box(walk, hit.visible, hit.role, job.point);
+            // **When is a second opinion wanted?** Not whenever MSAA happens to be finer — that would
+            // let a button's *label* outrank the button, because the label is always smaller. MSAA is
+            // asked when UIA did not get below the page (a document or window-sized answer, or no
+            // answer at all); a transport that named a real element is the platform's own notion of
+            // the control and outranks a smaller box inside it (docs/21 §5.19).
+            None => {
+                note.push_str(" msaa=[not consulted: uia answered a specific element]");
+                (false, false)
+            }
+            Some(Ok(hit)) => {
+                let finer = should_adopt_msaa_box(
+                    walk,
+                    hit.visible,
+                    hit.role,
+                    hit.parent_role,
+                    job.point,
+                    self.adopt_text_runs,
+                );
                 let adopted = finer && push_box(target, hit.visible, &hit.ancestors);
                 note.push_str(&format!(
                     " msaa=[role=0x{:x} name={:?} depth={} {}{}]",
@@ -126,7 +152,7 @@ impl FallbackDeepSelection {
                 ));
                 (true, adopted)
             }
-            Err(failure) => {
+            Some(Err(failure)) => {
                 note.push_str(&format!(" msaa=[{}]", failure_name(*failure)));
                 (false, false)
             }
@@ -229,8 +255,14 @@ impl DeepSelectionProvider for FallbackDeepSelection {
                 other => other,
             };
         };
-        let hit = self.msaa.hit(job.window.hwnd, job.point, window_bounds);
-        let (decision, note) = self.adopt_msaa_hit(&mut target, &hit, uia.as_ref(), job);
+        // MSAA is always asked, because it is the authoritative hit test: measured on the fixture,
+        // UIA's `ElementFromPoint` answered the *same point* with three different elements across
+        // three queries (the text run, then the outer box, then the middle one) — it is Chromium's
+        // browser-side approximation, while `accHitTest` runs the renderer's own hit test (docs/21
+        // §5.19). UIA's own candidate is still adopted first when it happens to be finer, and by the
+        // same rule it can never publish something coarser.
+        let hit = Some(self.msaa.hit(job.window.hwnd, job.point, window_bounds));
+        let (decision, note) = self.adopt_msaa_hit(&mut target, hit.as_ref(), uia.as_ref(), job);
         self.metrics.record_precision(decision, &note);
         RefinementOutcome::Target(target)
     }
@@ -304,9 +336,13 @@ impl RefinementWorker {
     /// `pass_through` is the capture overlay's hit-test flag: the UIA point hit test has to fall
     /// through the overlay to see the application underneath (docs/21 §5.7). `default()` is correct
     /// in tests and probes, where nothing of ours covers the desktop.
+    ///
+    /// `adopt_text_runs` is the product's answer to "may a bare text run be the target?" (docs/21
+    /// §5.19) and applies to both transports, so the two do not disagree about it.
     pub fn new(
         notify_thread: u32,
         pass_through: win32::HitTestPassThrough,
+        adopt_text_runs: bool,
         metrics: WindowDetectionMetrics,
     ) -> Self {
         let provider_metrics = metrics.clone();
@@ -316,7 +352,13 @@ impl RefinementWorker {
             // The provider logs its per-level forensics through the same verbose gate as the
             // rest of window detection, so it is built on the refinement thread with the
             // shared metrics handle (docs/18 §12.7).
-            Box::new(move || Box::new(FallbackDeepSelection::new(provider_metrics, pass_through))),
+            Box::new(move || {
+                Box::new(FallbackDeepSelection::new(
+                    provider_metrics,
+                    pass_through,
+                    adopt_text_runs,
+                ))
+            }),
         )
     }
 
@@ -741,6 +783,7 @@ mod tests {
         let worker = RefinementWorker::new(
             candidate_thread(),
             win32::HitTestPassThrough::default(),
+            crate::capture::window_detection::DEFAULT_ADOPT_TEXT_RUNS,
             WindowDetectionMetrics::new(),
         );
         // A fabricated handle: no accessibility tree can be attributed to it. UIA reports
@@ -826,6 +869,7 @@ mod tests {
         let mut worker = RefinementWorker::new(
             candidate_thread(),
             win32::HitTestPassThrough::default(),
+            crate::capture::window_detection::DEFAULT_ADOPT_TEXT_RUNS,
             WindowDetectionMetrics::new(),
         );
         worker.shutdown();

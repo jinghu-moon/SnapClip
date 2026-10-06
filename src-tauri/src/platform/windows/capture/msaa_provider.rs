@@ -62,6 +62,11 @@ pub(crate) struct MsaaHitBox {
     /// window frame. This is what the ancestor walk (docs/21 §5.17) steps through, so it is built
     /// from the same `accParent` walk that computes `visible`.
     pub ancestors: Vec<Rect>,
+    /// Role of the box this hit sits in (`ROLE_SYSTEM_*`), or 0 when the provider could not say.
+    ///
+    /// The product rule needs it: a text run is a target only when it is not the label of a control
+    /// (docs/21 §5.19).
+    pub parent_role: i32,
 }
 
 /// Why a hit test produced no box.
@@ -250,6 +255,12 @@ fn msaa_hit_test(window: HWND, point: Point, window_bounds: Rect) -> Option<Msaa
         return None;
     }
     let (visible, ancestors) = visible_part_and_ancestors(&current, raw, point, window_bounds);
+    // Who owns this box? Only the immediate parent matters for the control-label rule.
+    let parent_role = unsafe { current.accParent() }
+        .ok()
+        .and_then(|parent| parent.cast::<IAccessible>().ok())
+        .and_then(|parent| role_of(&parent))
+        .unwrap_or(0);
     Some(MsaaHitBox {
         raw,
         visible,
@@ -257,6 +268,7 @@ fn msaa_hit_test(window: HWND, point: Point, window_bounds: Rect) -> Option<Msaa
         name: name_of(&current).unwrap_or_default(),
         depth,
         ancestors,
+        parent_role,
     })
 }
 

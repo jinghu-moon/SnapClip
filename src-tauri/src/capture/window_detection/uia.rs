@@ -145,6 +145,43 @@ pub fn is_structural_wrapper(parent: Rect, node: WalkNode) -> bool {
 /// `UIA_TextControlTypeId`: a run of glyphs, not a control.
 pub const TEXT_CONTROL_TYPE: i32 = 50020;
 
+/// UIA's `Document` control type: the page/web area. It is what the provider answers when it cannot
+/// get below the document, so it is an *unspecific* answer rather than a target (docs/21 §5.19).
+pub const DOCUMENT_CONTROL_TYPE: i32 = 50030;
+
+/// Whether an answer is too coarse to count as "the element under the cursor".
+///
+/// Two shapes qualify: the document/web area itself, and a box that covers essentially the whole
+/// window. Both mean the transport did not get below the page — which is exactly when the second
+/// opinion (MSAA's renderer hit test) is worth asking, and exactly when it is *not*: a button whose
+/// own box came back is a real answer, so its label must not outrank it just for being smaller.
+pub fn is_unspecific_hit(bounds: Rect, control_type: i32, window_bounds: Rect) -> bool {
+    control_type == DOCUMENT_CONTROL_TYPE
+        || (window_bounds.area() > 0 && bounds.area() * 10 >= window_bounds.area() * 9)
+}
+
+/// MSAA roles of controls whose label is *part of the control* rather than a target of its own.
+///
+/// Pointing at a button must give the button, not the word on it — a 74x16 crop of a label is not a
+/// screenshot anyone wants — while a line of text inside a container or an editor is its own box.
+/// That is the line this list draws (docs/21 §5.19).
+pub fn is_interactive_control_role(role: i32) -> bool {
+    matches!(
+        role,
+        0x1E // ROLE_SYSTEM_LINK
+            | 0x2B // ROLE_SYSTEM_PUSHBUTTON
+            | 0x2C // ROLE_SYSTEM_CHECKBUTTON
+            | 0x2D // ROLE_SYSTEM_RADIOBUTTON
+            | 0x2E // ROLE_SYSTEM_COMBOBOX
+            | 0x2F // ROLE_SYSTEM_DROPLIST
+            | 0x0C // ROLE_SYSTEM_MENUITEM
+            | 0x22 // ROLE_SYSTEM_LISTITEM
+            | 0x25 // ROLE_SYSTEM_PAGETAB
+            | 0x33 // ROLE_SYSTEM_SLIDER
+            | 0x34 // ROLE_SYSTEM_SPINBUTTON
+    )
+}
+
 /// MSAA roles that describe a bare text run rather than a box (docs/21 §5.15).
 ///
 /// `ROLE_SYSTEM_STATICTEXT` / `ROLE_SYSTEM_TEXT` are the MSAA equivalents of the UIA `Text`
@@ -194,17 +231,46 @@ pub fn should_adopt_provider_box(
     hit: Rect,
     hit_control_type: i32,
     point: Point,
+    adopt_text_runs: bool,
 ) -> bool {
-    is_finer_refinement(walk, hit, point) && hit_control_type != TEXT_CONTROL_TYPE
+    is_finer_refinement(walk, hit, point)
+        && (adopt_text_runs || hit_control_type != TEXT_CONTROL_TYPE)
 }
 
 /// The same rule for a box whose "is it a bare text run?" answer comes from an MSAA role.
 ///
 /// MSAA and UIA are separate transports over the same page, and the candidate they offer is
 /// compared against the walk's answer with the same rule (docs/21 §5.16).
-pub fn should_adopt_msaa_box(walk: Rect, hit: Rect, hit_role: i32, point: Point) -> bool {
-    is_finer_refinement(walk, hit, point)
-        && !matches!(hit_role, MSAA_TEXT_ROLE | MSAA_STATIC_TEXT_ROLE)
+pub fn should_adopt_msaa_box(
+    walk: Rect,
+    hit: Rect,
+    hit_role: i32,
+    parent_role: i32,
+    point: Point,
+    adopt_text_runs: bool,
+) -> bool {
+    if !is_finer_refinement(walk, hit, point) {
+        return false;
+    }
+    if !is_bare_text_role(hit_role) {
+        return true;
+    }
+    // A text run is a target only when the preference is on *and* it is not a control's label
+    // (docs/21 §5.19): `parent_role` is the role of the box it sits in.
+    adopt_text_runs && !is_interactive_control_role(parent_role)
+}
+
+/// Whether a control type / role describes a bare text run rather than a box.
+///
+/// Used by the probes to know whether a finer answer that was not adopted is a defect or the
+/// deliberate exemption (docs/21 §5.18/§5.19).
+pub fn is_bare_text_control_type(control_type: i32) -> bool {
+    control_type == TEXT_CONTROL_TYPE
+}
+
+/// The MSAA spelling of [`is_bare_text_control_type`].
+pub fn is_bare_text_role(role: i32) -> bool {
+    matches!(role, MSAA_TEXT_ROLE | MSAA_STATIC_TEXT_ROLE)
 }
 
 /// Append `bounds` to a level chain, dropping the levels that do not contain it (docs/21 §5.17).
@@ -466,35 +532,99 @@ mod tests {
         let walk = rect(100, 100, 400, 300);
         let finer = rect(120, 120, 260, 200);
         // A strictly finer box that still covers the cursor is a precision win.
-        assert!(should_adopt_provider_box(walk, finer, 50033, point));
+        assert!(should_adopt_provider_box(walk, finer, 50033, point, false));
         // …unless it is the glyph run inside the element (a product decision, not precision).
-        assert!(!should_adopt_provider_box(walk, finer, TEXT_CONTROL_TYPE, point));
+        assert!(!should_adopt_provider_box(
+            walk,
+            finer,
+            TEXT_CONTROL_TYPE,
+            point,
+            false
+        ));
+        // …and with the text-run preference on (docs/21 §5.19) the run is adopted like any other
+        // finer box, which is what makes per-line snapping work.
+        assert!(should_adopt_provider_box(
+            walk,
+            finer,
+            TEXT_CONTROL_TYPE,
+            point,
+            true
+        ));
         // An equal, larger or off-point answer must never replace the walk's own answer.
-        assert!(!should_adopt_provider_box(walk, walk, 50033, point));
+        assert!(!should_adopt_provider_box(walk, walk, 50033, point, true));
         assert!(!should_adopt_provider_box(
             walk,
             rect(50, 50, 900, 900),
             50033,
-            point
+            point,
+            true
         ));
         assert!(!should_adopt_provider_box(
             walk,
             rect(500, 500, 900, 900),
             50033,
-            point
+            point,
+            true
         ));
         // The MSAA transport answers the same question with a role instead of a control type.
-        assert!(should_adopt_msaa_box(walk, finer, 0x14, point), "a grouping");
         assert!(
-            !should_adopt_msaa_box(walk, finer, MSAA_STATIC_TEXT_ROLE, point),
+            should_adopt_msaa_box(walk, finer, 0x14, 0x14, point, false),
+            "a grouping"
+        );
+        assert!(
+            !should_adopt_msaa_box(walk, finer, MSAA_STATIC_TEXT_ROLE, 0x14, point, false),
             "ROLE_SYSTEM_STATICTEXT is the text run inside the box"
         );
-        assert!(!should_adopt_msaa_box(walk, finer, MSAA_TEXT_ROLE, point));
-        assert!(!should_adopt_msaa_box(walk, walk, 0x14, point), "equal is not finer");
+        assert!(!should_adopt_msaa_box(
+            walk,
+            finer,
+            MSAA_TEXT_ROLE,
+            0x14,
+            point,
+            false
+        ));
+        assert!(should_adopt_msaa_box(
+            walk,
+            finer,
+            MSAA_STATIC_TEXT_ROLE,
+            0x14,
+            point,
+            true
+        ));
+        // The label of a control is not a target of its own (docs/21 §5.19): pointing at a button
+        // gives the button, while the same text run inside a plain container is adopted.
         assert!(
-            !should_adopt_msaa_box(walk, rect(500, 500, 900, 900), 0x14, point),
+            !should_adopt_msaa_box(walk, finer, MSAA_STATIC_TEXT_ROLE, 0x2B, point, true),
+            "ROLE_SYSTEM_PUSHBUTTON owns its label"
+        );
+        assert!(!should_adopt_msaa_box(
+            walk,
+            finer,
+            MSAA_STATIC_TEXT_ROLE,
+            0x22,
+            point,
+            true
+        ));
+        assert!(
+            !should_adopt_msaa_box(walk, walk, 0x14, 0x14, point, true),
+            "equal is not finer"
+        );
+        assert!(
+            !should_adopt_msaa_box(walk, rect(500, 500, 900, 900), 0x14, 0x14, point, true),
             "off the cursor is not an answer for it"
         );
+    }
+
+    #[test]
+    fn an_answer_that_covers_the_page_is_not_an_answer() {
+        let window = rect(46, 20, 1834, 1234);
+        // The page/web area: UIA's word for "I could not get below the document".
+        assert!(is_unspecific_hit(rect(48, 107, 1832, 1232), DOCUMENT_CONTROL_TYPE, window));
+        // A window-sized pane is the same statement in a different control type.
+        assert!(is_unspecific_hit(rect(46, 20, 1834, 1234), 50033, window));
+        // Anything meaningfully smaller is a real target, even if it is still a container.
+        assert!(!is_unspecific_hit(rect(72, 211, 240, 267), 50000, window));
+        assert!(!is_unspecific_hit(rect(1412, 907, 1624, 1027), 50026, window));
     }
 
     #[test]
