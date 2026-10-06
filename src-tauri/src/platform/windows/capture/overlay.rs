@@ -3142,7 +3142,10 @@ fn describe_rect(rect: Rect) -> String {
 ///
 /// Without it the feature is invisible: a wheel that silently changes what will be captured is
 /// indistinguishable from a wheel that does nothing.
-const LEVEL_HINT: &str = "滚轮 / ↑↓ 换吸附层级";
+///
+/// `pub(crate)` so the embedded-font coverage gate can require its characters
+/// (`win::d2d::tests::the_embedded_subset_covers_the_strings_the_overlay_draws`).
+pub(crate) const LEVEL_HINT: &str = "滚轮 / ↑↓ 换吸附层级";
 
 /// How long a one-shot hint stays on screen.
 const LEVEL_HINT_MS: u64 = 2600;
@@ -3152,7 +3155,7 @@ const LEVEL_HINT_MS: u64 = 2600;
 /// It has to answer two things a bare `8/9` cannot: what the numbers count, and which end is
 /// which. `1=窗口` is the part nobody can guess, and it is what makes "the box is a container"
 /// legible the next time the wheel is used.
-fn level_hint(level: usize, total: usize) -> String {
+pub(crate) fn level_hint(level: usize, total: usize) -> String {
     format!("吸附层级 {level}/{total}（1=窗口）· 滚轮 / ↑↓ 切换")
 }
 
@@ -3179,7 +3182,10 @@ fn should_teach(taught: bool, showing: bool) -> bool {
 /// to the thing, or to the shell around it?"), and it is the only one of the three facts that needs
 /// no explanation. `容器` is what makes a walked-up-to box self-explanatory without reading a
 /// fraction; the fraction then says how much of the chain is left.
-fn preview_label(
+///
+/// `pub(crate)` so the embedded-font coverage gate can require its characters
+/// (`win::d2d::tests::the_embedded_subset_covers_the_strings_the_overlay_draws`).
+pub(crate) fn preview_label(
     rect: Rect,
     is_window: bool,
     levels: Option<LevelChain>,

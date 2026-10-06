@@ -96,6 +96,18 @@ const INFO_COORD_BLOCK_GAP_DIP: f32 = 14.0;
 /// Rows 2–3: four `<kbd>` hint items in a 2×2 grid (key text inside the box +
 /// CJK description beside it). One point smaller than the colour/coordinate line.
 const INFO_HINT_FONT_DIP: f32 = 12.0;
+/// The four `<kbd>` rows, as (key, description).
+///
+/// A `const` rather than a local array because the font-coverage gate
+/// (`the_embedded_subset_covers_the_strings_the_overlay_draws`) has to see exactly what is drawn:
+/// the embedded subset is a hard allowlist, and a description that drifts away from it renders in
+/// a fallback font with nothing failing anywhere visible.
+const INFO_HINTS: [(&str, &str); 4] = [
+    ("S", "色值格式"),
+    ("C", "复制色值"),
+    ("P", "坐标模式"),
+    ("Z", "滚轮缩放"),
+];
 const INFO_KBD_PADDING_DIP: f32 = 3.0;
 const INFO_KBD_RADIUS_DIP: f32 = 4.0;
 const INFO_KBD_TEXT_GAP_DIP: f32 = 6.0;
@@ -1363,12 +1375,7 @@ impl OverlayRenderer {
             // vertical-centre paragraph alignment baked into `info_text_format_mut`.
             let hint_format = self.info_text_format_mut(false, INFO_HINT_FONT_DIP, DWRITE_FONT_WEIGHT_NORMAL, false)?;
             let hint_centered = self.info_text_format_mut(false, INFO_HINT_FONT_DIP, DWRITE_FONT_WEIGHT_NORMAL, true)?;
-            let hints: [(&str, &str); 4] = [
-                ("S", "色值格式"),
-                ("C", "复制色值"),
-                ("P", "坐标模式"),
-                ("Z", "滚轮缩放"),
-            ];
+            let hints = INFO_HINTS;
             // Measure every item (box + gap + description); the two columns
             // share the widest item width so the grid lines up, and the whole
             // 2×2 block is centred inside the strip.
@@ -2591,6 +2598,170 @@ mod tests {
              not share row 1 (available {available}px = content {content} - swatch \
              {swatch_block} - gap {})",
             super::INFO_COORD_BLOCK_GAP_DIP
+        );
+    }
+
+    /// Codepoints a TrueType font answers with a real glyph (`cmap` subtable formats 0/4/6/12).
+    ///
+    /// Deliberately small: this exists to check one subsetted font from a test, not to become a
+    /// font library. Unknown subtable formats are skipped rather than guessed at.
+    fn cmap_codepoints(bytes: &[u8]) -> std::collections::HashSet<u32> {
+        use std::collections::HashSet;
+
+        let u16_at = |at: usize| u16::from_be_bytes([bytes[at], bytes[at + 1]]) as usize;
+        let u32_at = |at: usize| {
+            u32::from_be_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]) as usize
+        };
+        let mut covered = HashSet::new();
+        let mut cmap = None;
+        for record in 0..u16_at(4) {
+            let at = 12 + record * 16;
+            if &bytes[at..at + 4] == b"cmap" {
+                cmap = Some(u32_at(at + 8));
+            }
+        }
+        let Some(cmap) = cmap else {
+            return covered;
+        };
+        for subtable in 0..u16_at(cmap + 2) {
+            let record = cmap + 4 + subtable * 8;
+            let offset = cmap + u32_at(record + 4);
+            match u16_at(offset) {
+                // Byte encoding: a 256-entry glyph index array.
+                0 => {
+                    for code in 0..256 {
+                        if bytes[offset + 6 + code] != 0 {
+                            covered.insert(code as u32);
+                        }
+                    }
+                }
+                // Segment mapping: the one Windows uses for BMP text.
+                4 => {
+                    let segments = u16_at(offset + 6) / 2;
+                    let ends = offset + 14;
+                    let starts = ends + segments * 2 + 2;
+                    let deltas = starts + segments * 2;
+                    let ranges = deltas + segments * 2;
+                    for segment in 0..segments {
+                        let end = u16_at(ends + segment * 2);
+                        let start = u16_at(starts + segment * 2);
+                        let delta = u16_at(deltas + segment * 2);
+                        let range = u16_at(ranges + segment * 2);
+                        for code in start..=end {
+                            if code == 0xFFFF {
+                                continue;
+                            }
+                            let glyph = if range == 0 {
+                                (code + delta) & 0xFFFF
+                            } else {
+                                // idRangeOffset is relative to its own slot.
+                                let at = ranges + segment * 2 + range + (code - start) * 2;
+                                if at + 2 > bytes.len() {
+                                    continue;
+                                }
+                                let glyph = u16_at(at);
+                                if glyph == 0 { 0 } else { (glyph + delta) & 0xFFFF }
+                            };
+                            if glyph != 0 {
+                                covered.insert(code as u32);
+                            }
+                        }
+                    }
+                }
+                // Trimmed mapping: first code + glyph index array.
+                6 => {
+                    let first = u16_at(offset + 6);
+                    for i in 0..u16_at(offset + 8) {
+                        if u16_at(offset + 10 + i * 2) != 0 {
+                            covered.insert((first + i) as u32);
+                        }
+                    }
+                }
+                // Segmented coverage: (start, end, start glyph) triples, full Unicode range.
+                12 => {
+                    for group in 0..u32_at(offset + 12) {
+                        let at = offset + 16 + group * 12;
+                        for code in u32_at(at)..=u32_at(at + 4) {
+                            covered.insert(code as u32);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        covered
+    }
+
+    /// The gate the hand-written `--unicodes` list kept failing to be (docs/21 §5.21).
+    ///
+    /// The embedded subset is a hard allowlist: a drawn string with a character that is not in it
+    /// does not fail, log, or throw — DirectWrite falls back per glyph, so the text quietly renders
+    /// half in another font (or as tofu where no fallback exists). The strings come from their
+    /// **producers** rather than from a copy of their text, which is what keeps this honest when
+    /// the labels change.
+    #[test]
+    fn the_embedded_subset_covers_the_strings_the_overlay_draws() {
+        use crate::capture::window_detection::LevelChain;
+        use crate::platform::windows::capture::overlay::{LEVEL_HINT, level_hint, preview_label};
+
+        let covered = cmap_codepoints(super::INFO_EMBEDDED_FONT);
+        let mut drawn = vec![
+            // Size label, zoom badge, hex colour, and the two other colour formats.
+            "-1910,210 1×1 px".to_owned(),
+            "1.5×".to_owned(),
+            "#ABCDEF".to_owned(),
+            "rgb(255,0,0)".to_owned(),
+            "hsl(359,100%,100%)".to_owned(),
+        ];
+        for (key, description) in super::INFO_HINTS {
+            drawn.push(key.to_owned());
+            drawn.push(description.to_owned());
+        }
+        let walked = {
+            let mut chain = LevelChain::new(9);
+            chain.shallower();
+            chain
+        };
+        // Every state the preview label has: element, walked-to container, whole window, degraded.
+        drawn.push(preview_label(Rect::new(0, 0, 341, 55), false, None, false));
+        drawn.push(preview_label(Rect::new(0, 0, 689, 55), false, Some(walked), true));
+        drawn.push(preview_label(Rect::new(0, 0, 3840, 2088), true, None, false));
+        // …and the two one-shot hints.
+        drawn.push(LEVEL_HINT.to_owned());
+        drawn.push(level_hint(8, 9));
+
+        for text in &drawn {
+            for character in text.chars() {
+                assert!(
+                    covered.contains(&(character as u32)),
+                    "the embedded subset has no glyph for {character:?} (U+{:04X}), drawn by \
+                     {text:?}: add that string to subfont/drawn-glyphs.txt and rebuild with \
+                     subfont/subset.ps1",
+                    character as u32,
+                );
+            }
+        }
+    }
+
+    /// The gate is only as good as its instrument, so the reader above is checked too: it has to
+    /// find the glyphs the subset does carry and not invent ranges it never read.
+    #[test]
+    fn the_cmap_reader_finds_glyphs_and_does_not_invent_them() {
+        let covered = cmap_codepoints(super::INFO_EMBEDDED_FONT);
+        for character in ['×', '0', 'p', 'x', '色'] {
+            assert!(
+                covered.contains(&(character as u32)),
+                "{character:?} is in the subset and the reader missed it"
+            );
+        }
+        assert!(
+            !covered.contains(&('龘' as u32)),
+            "a CJK ideograph the subset deliberately does not carry must not be reported"
+        );
+        assert!(
+            covered.len() < 200,
+            "a chrome-only subset cannot answer for {} codepoints",
+            covered.len()
         );
     }
 }
