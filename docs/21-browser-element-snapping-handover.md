@@ -177,10 +177,15 @@ cargo test --lib browser_element_probe -- --ignored --nocapture
    client 包含标签栏与工具栏，页面从这里往下 87 px 开始），并要求它内部至少 8 个节点。
    **10 s 内始终没就绪 → skip（不是 fail）**，否则环境问题会被误报成产品缺陷。
 5. 逐用例：点位 = 视口原点 + 该用例自报盒子（+可选的 `probe` 偏移）；调用**产品走查**；
-   打印 `expected / published / stop_reason / depth`；失败时再打印 raw 链与
+  打印 `expected / published / stop_reason / depth`；失败时再打印 raw 链与
    **系统自己的 `ElementFromPoint`** 结果。
 6. 允许**有界重试**（Chromium 的树是惰性物化的，首次查询可能读到占位），并把
    `slow_fixtures` 计数打出来当观测数据。
+7. **要求跨域帧自报就绪**：夹具页 `file://`、跨域帧来自本机 HTTP 服务，父页面读不到那一帧，所以
+   子帧自己 `postMessage` 报告（`cross-ready` / `cross-button`），探针 10 s 内拿不到就**直接失败**
+   （不是 skip）：没有它，一个还没物化的帧和"进不去跨域帧"在测量上完全一样（§5.20 那次订正）。
+   服务端按路径记录请求（`/cross.html`、子帧的 `/cross-ping`），用来区分"帧没要页面 / 脚本没跑 /
+   消息没回来"。
 
 ### 4.3 Explorer 回归探针 `explorer_rule_probe`（`#[ignore]`）
 
@@ -689,8 +694,9 @@ this.highlightElement.style.top = `${rect.top + scrollY}px`;                   /
 | 截图本身 | `chrome.tabs.captureVisibleTab`（**只有可见视口**）+ 后台按 `dpr` 裁剪；超视口靠滚动拼图 | 这是扩展路线的硬约束：要么只能截视口，要么自己做拼图（它的 `.specstory` 里 "截图保存区域偏差"、"长截图滚动问题" 两份记录合计 10 万字符，全是坐标/滚动踩坑） |
 
 **它的局限（源码里查不到处理）**：整个仓库没有任何 `shadowRoot` / `contentWindow` / `composedPath`，
-也就是说 `elementFromPoint` 只会给出 `<iframe>` 或 shadow **宿主**本身，进不去里面；跨域 iframe 更是
-只能选到那一块。另外它必须装扩展、要 `<all_urls>` 权限，浏览器商店审核/用户信任都是成本。
+也就是说 `elementFromPoint` 只会给出 `<iframe>` 或 shadow **宿主**本身，进不去里面（这是**扩展**路线的局限；
+反过来看我们的 MSAA 通道，shadow DOM 与同源/跨域 iframe 内部都能进去，见 §5.20——所以"扩展才能进 iframe"
+这个判断只对扩展自己成立）。另外它必须装扩展、要 `<all_urls>` 权限，浏览器商店审核/用户信任都是成本。
 
 **对 SnapClip 的结论**：扩展路线能拿到的"元素边界"，**MSAA 已经能在不装任何东西的前提下拿到**
 （§5.11：8/8 逐像素命中、1 ms）。两者的差别在于**扩展能拿到 DOM 语义**（
@@ -1028,30 +1034,46 @@ code > span`），**所有文字在那一个 `<span>` 里**，问"这个 div 里
 | --- | --- | --- |
 | Shadow DOM 内部 | **可达** ✓ | `shadow-button` 发布 `192x56`（shadow root 里的按钮本身） |
 | 同源 iframe 内部 | **可达** ✓ | `iframe-button` 发布 `160x48`；系统命中测试同样答 `Button(1105,500)-(1265,548) "Iframe Button"` |
-| **跨域 iframe 内部** | **不可达** ✓（已测） | 夹具页是 `file://`，另一帧来自本机 `http://127.0.0.1:<port>`（探针自己起的单页服务）→ 真跨域。指向里面的按钮，走查/UIA/MSAA 都只答到**那个 frame 自身**（`358x94`，MSAA 给 `role=0xf` = 该 frame 的文档节点），不是里面的按钮 |
+| **跨域 iframe 内部** | **可达 ✓（但要在那一帧的子树物化之后）** —— 本条 2026-10-06 已订正，见下 | 夹具页是 `file://`，另一帧来自本机 `http://127.0.0.1:<port>`（探针自己起的单页服务）→ 真跨域。**带上"子帧已就绪"的哨兵并等它之后**，4/4 次运行都答到 frame **内部那个按钮**（`160x48`，MSAA `role=0x29 "Cross Button"`）；不带哨兵、页面刚发布几何就测的那一批里，4 次有 3 次只答到 frame 自身（`358x94`，`role=0xf` = 该 frame 的文档节点） |
 | `display:none` / `aria-hidden` | 正确拒绝 ✓ | 三行 `expect: "none"` 断言"答案必须比它更粗" |
 | 没有盒子的节点（未渲染的虚拟化项） | 拿不到（**它本来就没有盒子**，CDP 也只能告诉你这个事实） | — |
 
-**那次夹具 bug（值得记）**：`builders` 里的构造函数跑在一个**游离的 holder 元素（`div`）**上，真正的
-`<iframe>` 之后才创建；我在 builder 里写 `el.srcdoc = '…'`，而 `div` 没有 `srcdoc` 这个 IDL 属性——
-只是加了个 JS 字段，**srcdoc 从未成为 HTML 属性**，iframe 一直是空白页。于是"指着 iframe 只拿到宿主元素"
-看起来成立，我还据此给出了"iframe 进不去"的结论。探针里加了一个哨兵
-（`iframe-diag` = 内部 body 的 HTML 长度）后，值是 **0** —— 空 body —— 才暴露出来。
-修法是把 `srcdoc` 挪到 `after`（那里拿到的才是真实元素）。教训与 §5.12 的一条同源：
-**夹具是产品结论的地基，哨兵要能区分"没命中"与"里面本来就没东西"。**
+**同一个坑踩了两次——两次都是"没有哨兵"**：
 
-**订正后的答法**：对 DevTools Elements 面板里那些 HTML 元素——只要它在光标下有**盒子**，我们现在基本都能
-拿到：裸 `<div>` ✓、文字行 ✓、Shadow DOM 内部 ✓、同源 iframe 内部 ✓、CSS transform 旋转盒 ✓、
-canvas/svg/表格/表单控件 ✓。真正剩下的只有"**没有布局盒的节点**"（`display:none`、未渲染的虚拟化项），
-以及**跨域 iframe 内部**（上面已测，明确不可达）。也就是说：日常吸附根本不需要 CDP；CDP/扩展的价值主要在"整页盒表、DOM 属性、
-跨域 iframe、以及我们自带浏览器的精准截图"这些**独立功能**上（§8 待办 2）。
+1. **同源那次**：`builders` 里的构造函数跑在一个**游离的 holder 元素（`div`）**上，真正的 `<iframe>` 之后
+   才创建；我在 builder 里写 `el.srcdoc = '…'`，而 `div` 没有 `srcdoc` 这个 IDL 属性——只是加了个 JS 字段，
+   **srcdoc 从未成为 HTML 属性**，iframe 一直是空白页。于是"指着 iframe 只拿到宿主元素"看起来成立，
+   我还据此给出了"iframe 进不去"的结论。修法是把 `srcdoc` 挪到 `after`（那里拿到的才是真实元素）。
+2. **跨域那次（2026-10-06 订正）**：父页面读不到跨域帧，于是我把"指向里面的按钮只答到 frame 自身"当成
+   结论记进了这份文档——**但那一刻帧的子树还没物化**（Chromium 的跨进程无障碍树是惰性的，§5.20 上一节
+   与 §6 的坑 3 是同一件事）。没有"子帧说自己已经就绪"的哨兵，这两种状态在探针里长得一模一样。
+   现在的做法：子帧测量自己并 `postMessage` 报告（`cross-ready` = 内部 body 的 HTML 长度，`cross-button`
+   = 它自己量到的按钮盒子），**探针拿不到这份报告就拒绝测量并直接失败**（10 s 上限），另外子帧还会
+   请求一次 `/cross-ping`——服务端按路径记录请求，用来区分"帧没要页面 / 页面被返回了但脚本没跑 /
+   脚本跑了但消息没回来"三种情况（这三种情况在日志里分别是：没有 `/cross.html`、没有 `/cross-ping`、
+   两者都有但没有 `cross-ready`）。
 
-**跨域夹具怎么搭的**：探针在 `127.0.0.1` 上起一个只回一页 HTML 的极简 HTTP 服务（固定布局：
-`margin:0` + 一个 `left:40 top:40 160x48` 的按钮），把端口写进夹具页的查询串
-（`…?truth=1&cross=127.0.0.1:<port>`），页面用它做 iframe 的 `src`。父页面**读不到**这个 frame，
-所以它的期望盒子是**推导**出来的：frame 自身的矩形 + `.frame` 的 1px 边框 + 内部固定布局
-（`truth['cross-button'] = host + (41,41,160,48)`）。断言行写的是"指向内部 → 得到 `cross-frame`"，
-即把"只到 frame 自身"这个边界固定成数字。
+教训与 §5.12 的一条同源：**夹具是产品结论的地基，哨兵要能区分"没命中"与"里面本来就没东西 / 还没长出来"。**
+
+**订正后的答法**：对 DevTools Elements 面板里那些 HTML 元素——只要它在光标下有**盒子**并且已经物化，
+我们现在基本都能拿到：裸 `<div>` ✓、文字行 ✓、Shadow DOM 内部 ✓、同源 iframe 内部 ✓、
+**跨域 iframe 内部 ✓（等它物化；第一次查询可能只答到 frame 节点，dwell 的重复查询会接着细化）**、
+CSS transform 旋转盒 ✓、canvas/svg/表格/表单控件 ✓。真正剩下的只有"**没有布局盒的节点**"
+（`display:none`、未渲染的虚拟化项）。也就是说：日常吸附根本不需要 CDP；CDP/扩展的价值主要在
+"整页盒表、DOM 属性、以及我们自带浏览器的精准截图"这些**独立功能**上（§8 待办 2）。
+
+**跨域夹具怎么搭的**：探针在 `127.0.0.1` 上起一个极简 HTTP 服务（固定布局：`margin:0` + 一个
+`left:40 top:40 160x48` 的按钮 + 几行报告脚本），把端口写进夹具页的查询串
+（`…?truth=1&cross=127.0.0.1:<port>`），页面用它做 iframe 的 `src`。父页面读不到这个 frame，所以
+**盒子由子帧自己量、自己报**（`postMessage` → `crossReport` → `truth['cross-button']`，父页面只补上
+用 `getComputedStyle` 量出来的边框宽度，不再假设 1 px）。
+
+两条断言行，写法与理由：
+
+| 行 | 点位 | 期望 | 为什么这样写 |
+| --- | --- | --- | --- |
+| `cross-frame` | frame 内、**不在按钮上** | `self`（frame 自己的盒子 `360x96`） | 无论子树物化与否，这一点的答案都只可能是 frame 节点或它的文档根，两者都是 frame 的盒子——所以这条是**稳定**的，而且能抓住"答成别的东西 / 答成整页" |
+| `cross-button` | 按钮上 | `within:cross-frame`（必须落在 frame 盒**之内**） | 这一点的答案在实测里是内部按钮 `160x48`（4/4），但跨进程树合并的粒度不该由我们钉死；`within:` 这条规则表达的是真正的不变量：**不能掉到 frame 外面去，更不能退化成整页**。实测的盒子仍然照打在 assert 行上（`published=`），所以粒度变了在日志里看得见 |
 
 ### 5.21 智能吸附的 UI / 动画规格（2026-10-06，已实现）
 
@@ -1251,7 +1273,8 @@ canvas/svg/表格/表单控件 ✓。真正剩下的只有"**没有布局盒的�
   Explorer 12/25 与延迟不退化；两个默认值同时写进文档与设置页文案。
 
 **待办 2（低优先）**：Firefox 未验证（若它不暴露元素级矩形，验收写明"整窗降级即合格"）；
-CDP / 扩展通道按 §5.13 / §5.12 作为**独立功能**再做。
+CDP / 扩展通道按 §5.13 / §5.12 作为**独立功能**再做（跨域 iframe 已从"CDP 才能做"里划掉：
+MSAA 通道在 §5.20 订正后 4/4 能进到帧内部，CDP 现在只剩"整页盒表 + DOM 属性"这些语义能力）。
 
 ---
 
@@ -1282,12 +1305,12 @@ CDP / 扩展通道按 §5.13 / §5.12 作为**独立功能**再做。
 
 ```powershell
 cd D:\100_Projects\110_Daily\SnapClip\src-tauri
-cargo test --lib                       # 基线 fbcfd8d：354 passed / 0 failed / 1 ignored
+cargo test --lib                       # 基线 fbcfd8d：354 passed / 0 failed / 1 ignored；当前 373 passed / 2 ignored
 cargo check --all-targets              # 0 warnings
 
 # 需要浏览器与（可选的）资源管理器窗口；都是 #[ignore] 的人工探针
-cargo test --lib browser_element_probe   -- --ignored --nocapture   # 期望 asserted=22 passed=22（D 组）
-cargo test --lib explorer_rule_probe     -- --ignored --nocapture   # 期望 control_level_points=12/25（C 组起）
+cargo test --lib browser_element_probe   -- --ignored --nocapture   # 期望 asserted=41 passed=41、cross-ready=Some(…)、available=52、finer=0
+cargo test --lib explorer_rule_probe     -- --ignored --nocapture   # 期望 control_level_points=12/25、median_area_pct=65.8、available=25/25
 cargo test --lib overlay_hit_through_probe -- --ignored --nocapture # 穿透/命中测试的环境实验
 ```
 
