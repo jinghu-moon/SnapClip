@@ -639,6 +639,22 @@ last precision not-finer provider=1153x22623 at (1567,-9870) type=50026
 补足，并把现成的 6 个 `optional` 夹具行（`plain-div`/`checkbox`/`radio`/`para`/`code-box`/
 `table-cell-1`）**从"打印"改成"断言 `self`"** 作为门禁。Explorer 12/25 与延迟需要同时回归。
 
+**订正（2026-10-06，`aa6acdc`）：隔离必须落在命中测试本身，而不是它的调用方。**
+
+实机日志里出现了 `refinement_msaa_attempts=21 refinement_msaa_timeouts=13
+refinement_quarantine_added=1`：隔离名单只加了一个窗口，超时却有 13 次——**隔离没起作用**。
+根因是位置放错了：隔离检查写在 `MsaaHit::resolve()` 里，而"这个窗口是不是已经被隔离"要到
+`hit()`（真正调用 `AccessibleObjectFromWindow` + `accHitTest` 的那一层）才算数。于是每次精度补足
+都会**再问一次**那个已经卡死过的窗口，`TimedCallRunner` 每次都等到 168 ms 截止才放弃——一小时里
+13 次超时、每次 168 ms 的机会成本，全部花在同一个已知卡死的窗口上（日志里 `refinement_elapsed_us
+last=217950 max=246968` 也是同一条路径）。
+
+修法：`MsaaHitFailure::Quarantined` 成为 `hit()` 自己的失败态，在一个查询内**一次**命中就短路，
+`resolve()` 把它映射成 `Empty(Unsupported)`（与"这个窗口答不了"同义）。单测
+`an_already_quarantined_window_is_answered_without_touching_the_provider` 现在同时断言 `hit()`
+本身返回 `Quarantined`，即"不碰 provider"。**验收判据**：同一个窗口在一场会话里最多超时一次，
+`refinement_msaa_attempts` 与 `refinement_msaa_timeouts` 不再同步增长。
+
 ### 5.12 浏览器扩展路线：`refer/smart-screenshot-main` 的实现（2026-10-06，源码调研）
 
 用户提供的第二个参照物是 Chrome 扩展"精准截图"（MV3，`host_permissions: <all_urls>` +
@@ -1036,6 +1052,86 @@ canvas/svg/表格/表单控件 ✓。真正剩下的只有"**没有布局盒的�
 所以它的期望盒子是**推导**出来的：frame 自身的矩形 + `.frame` 的 1px 边框 + 内部固定布局
 （`truth['cross-button'] = host + (41,41,160,48)`）。断言行写的是"指向内部 → 得到 `cross-frame`"，
 即把"只到 frame 自身"这个边界固定成数字。
+
+### 5.21 智能吸附的 UI / 动画规格（2026-10-06，已实现）
+
+用户问"对智能吸附的 UI、动画有什么建议"。有一条**底线**先立住：**动画不许用来掩盖检测误差**。
+矩形永远只是"最后一个被确认的答案"的缓动插值，而**确认（Enter / 点击）用的是真实目标**
+（`GestureState::snap_preview()`），动画与提交是两条互不相干的值：所以缓动不可能改变被截下的像素，
+也不会让一个还没确认的答案看起来像已经确认。
+
+**1. 插值本身是纯函数，不是计时器**
+
+`capture/window_detection/transition.rs`：
+
+| 项 | 值 |
+| --- | --- |
+| 时长 | `PREVIEW_TRANSITION_MS = 101`（对齐参照选择器的 OutQuad） |
+| 曲线 | `out_quad(t) = 1-(1-t)²`（快起、稳落） |
+| 几何 | `lerp_rect(from, to, amount)`：四条边各自独立插值（位置与尺寸同时过渡） |
+| 状态 | `RectTransition { settled / start(from, to, now) / present(rect, now) / value_at(now) / is_running(now) / target() }` |
+
+它**不拥有 timer、不拥有窗口**：由 overlay 既有的 15 ms 合并渲染 tick（`on_render_tick` →
+`advance_preview_animation`）驱动，动画和其他所有重绘共用同一个时钟。好处是可测试：任意时间点求值，
+6 条单测覆盖两端点、50 %、超时、打断、`present()` 取消。
+
+**2. 四个时机的表现**
+
+| 时机 | 表现 |
+| --- | --- |
+| 会话的第一个预览 | **直接呈现**（`present()`）：不从"空的框"里长出来，没有出处的东西不该有入场动画 |
+| 同链层级切换（滚轮 / ↑↓） | 从**当前屏幕上那个矩形**缓动到新层级；再滚一次从当前显示值接着走（`start(displayed, to)`），所以连滚看起来是一条连续的轨迹，而不是跳回上一格 |
+| 跨目标位移（鼠标移到另一个元素） | 与上一条同一条代码路径，行为相同 |
+| 等待答案（dwell 已确认、refinement 未回） | 不显示"半成品"：预览停在 v1 整窗框（或上一个答案）直到答案到达，再走同一段 101 ms |
+| 消失（取消 / 换窗口） | **直接消失**，从不向 0 收缩 |
+
+**3. 标签（preview label）——这一层才是"看得懂的反馈"**
+
+标签文本由 overlay 的纯函数 `preview_label(rect, is_window, levels, degraded)` 生成，渲染层只负责排版与绘制
+（复用选择框尺寸标签的 panel、字体、内边距；放不下就整体丢弃——**宁可没有标签，也不盖住正在选的像素**）：
+
+```text
+216×382 px            只有尺寸（最深层、元素、有答案）
+216×382 px  3/7       用户走过层级（最深层不显示计数，和确认行的 `deepest` 一致）
+3840×2088 px  窗口     整窗兜底 / 走到了 path[0]
+216×382 px  ~         这个位置什么都没有答上来（降级），`~` 是"这不算确信的答案"的记号
+```
+
+**4. 一次性提示（one-shot hint）：不可见的交互等于不存在**
+
+`滚轮 / ↑↓ 换吸附层级`，2600 ms，锚在光标处。**会话开始时武装**，用户**第一次真正移动层级或按下鼠标**
+就撤销（`hint_until = None`）。它挂在墙上时钟上，而静止的光标本身不产生重绘，所以 `on_hover_tick`
+（250 ms）在提示还在时保持一次重绘，让它准时消失（`hint_text()` 一旦为 `None` 就自然停）。
+
+**5. 整窗 vs 元素的视觉区分**
+
+| 答案 | 画法 |
+| --- | --- |
+| 元素（refinement 的答案，或走到 chain 中间某层） | accent 洗色 + **双倍**描边（"这是预览"） |
+| 整窗（v1 兜底，或用户一路走到 `path[0]`） | **中性 hover 洗色 + 单倍细边** |
+
+后者的意义：`deep_target.kind == TopLevelWindowFrame` 是"我们没能钻到窗口以下"，它不该看起来像一个确信的元素
+预览。柱状之外的层级（`deep_path_local`）仍然只画细轮廓，不洗色。
+
+**6. 导出不含 UI**
+
+`OverlayRenderer::render_export` 在**渲染器这一层**把 `hover_bounds` / `preview_bounds` / `path_bounds` /
+`preview_label` / `preview_is_window` / `hint` 全部清零（调用方忘了也安全），overlay 的导出路径同时也清零。
+标注可以进产物，交互提示永远不进。
+
+**7. 刻意不做的**
+
+- 不给遮罩（mask）做淡入淡出：遮罩是"当前画面之外的全部"，它是一个**事实**，不是一个可以渐变的观点。
+- 不在确认时做动画：确认要的就是"立刻"。
+- 不用动画"填"等待：答案没到就不动（停在已知的矩形），动了反而是在说谎。
+
+**8. 门禁与单测**
+
+- 纯函数单测：`preview_label` 3 条（只有尺寸 / 走层级计 `n/N` 且最深层不计数 / `窗口` + `~` 组合），
+  `transition` 6 条。`cargo test --lib` 372 passed。
+- 两个实机探针必须同时过（这一步只碰 paint 层，但没有例外）：`browser_element_probe`
+  `asserted=41 passed=41 provider_hit_available=52 finer=0`、`explorer_rule_probe`
+  `12/25 median_area_pct=65.8 available=25/25 finer=0`。
 
 ---
 
