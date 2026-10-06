@@ -89,6 +89,79 @@ impl DeepTarget {
     }
 }
 
+/// Which level of a published [`DeepTarget::path`] the user has selected (docs/21 §5.17).
+///
+/// The chain is outermost-first (`path[0]` is the window frame, the last entry is the published box),
+/// so "deeper" moves toward the box and "shallower" toward the frame. A fresh chain selects the
+/// deepest level — exactly what the refinement produced — which is what makes the level walk a pure
+/// addition: until the user asks for another level, nothing about the answer changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LevelChain {
+    levels: usize,
+    index: usize,
+}
+
+impl LevelChain {
+    /// A chain over `levels` entries, selecting the deepest.
+    pub fn new(levels: usize) -> Self {
+        Self {
+            levels,
+            index: levels.saturating_sub(1),
+        }
+    }
+
+    /// How many levels the chain was built for.
+    pub fn len(&self) -> usize {
+        self.levels
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.levels == 0
+    }
+
+    /// Index of the selected level; `0` is the window frame.
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    /// Whether the selection is the deepest level (the refinement's own answer).
+    pub fn is_deepest(&self) -> bool {
+        self.levels == 0 || self.index + 1 == self.levels
+    }
+
+    /// Move one level toward the window frame. `false` when already there.
+    pub fn shallower(&mut self) -> bool {
+        if self.index == 0 {
+            return false;
+        }
+        self.index -= 1;
+        true
+    }
+
+    /// Move one level toward the published box. `false` when already there.
+    pub fn deeper(&mut self) -> bool {
+        if self.index + 1 >= self.levels {
+            return false;
+        }
+        self.index += 1;
+        true
+    }
+
+    /// Back to the deepest level.
+    pub fn reset(&mut self) {
+        self.index = self.levels.saturating_sub(1);
+    }
+
+    /// The selected level out of `path`, clamped to what `path` actually holds.
+    ///
+    /// Clamping rather than trusting the index: a chain built for one target can outlive it by a
+    /// frame, and the worst thing a level walk can do is publish a box that is not in the chain.
+    pub fn current(&self, path: &[Rect]) -> Option<Rect> {
+        let index = self.index.min(path.len().checked_sub(1)?);
+        path.get(index).copied()
+    }
+}
+
 /// How a newly resolved target relates to the one currently displayed (docs/18 §13.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Replacement {
@@ -172,16 +245,20 @@ pub struct SchedulerActions {
 ///   honest floor and is shown.
 ///
 /// `None` means "paint no preview at all".
+///
+/// `level` is the ancestor level the user walked to (docs/21 §5.17); it replaces the published box
+/// while the target still applies, and `None` means "the published box itself".
 pub fn preview_bounds(
     deep: Option<&DeepTarget>,
+    level: Option<Rect>,
     window: WindowIdentity,
     point: Point,
     window_bounds: Rect,
     waiting: bool,
 ) -> Option<Rect> {
     match deep.filter(|deep| deep.window == window) {
-        Some(deep) if deep.covers(point) => Some(deep.screen_bounds),
-        Some(deep) if waiting => Some(deep.screen_bounds),
+        Some(deep) if deep.covers(point) => level.or(Some(deep.screen_bounds)),
+        Some(deep) if waiting => level.or(Some(deep.screen_bounds)),
         _ if waiting => None,
         _ => Some(window_bounds),
     }
@@ -563,6 +640,120 @@ mod tests {
         WindowIdentity::new(hwnd, 4242, 0xC0FFEE)
     }
 
+    #[test]
+    fn a_fresh_chain_selects_the_deepest_level() {
+        let path = vec![
+            rect(0, 0, 800, 600),
+            rect(100, 100, 500, 400),
+            rect(200, 200, 300, 300),
+        ];
+        let chain = LevelChain::new(path.len());
+        assert_eq!(chain.index(), 2);
+        assert!(chain.is_deepest());
+        assert_eq!(chain.current(&path), Some(rect(200, 200, 300, 300)));
+    }
+
+    #[test]
+    fn stepping_up_stops_at_the_window_frame_and_down_at_the_box() {
+        let path = vec![rect(0, 0, 800, 600), rect(100, 100, 500, 400)];
+        let mut chain = LevelChain::new(path.len());
+        assert!(chain.shallower(), "from the box to its parent");
+        assert_eq!(chain.current(&path), Some(rect(0, 0, 800, 600)));
+        assert!(!chain.shallower(), "the frame is the outermost level");
+        assert_eq!(chain.index(), 0);
+        assert!(chain.deeper());
+        assert!(!chain.deeper(), "the published box is the innermost level");
+        assert!(chain.is_deepest());
+    }
+
+    #[test]
+    fn a_window_only_answer_has_nowhere_to_walk() {
+        let path = vec![rect(0, 0, 800, 600)];
+        let mut chain = LevelChain::new(path.len());
+        assert!(chain.is_deepest());
+        assert!(!chain.shallower());
+        assert!(!chain.deeper());
+        assert_eq!(chain.current(&path), Some(rect(0, 0, 800, 600)));
+    }
+
+    #[test]
+    fn reset_goes_back_to_what_the_refinement_published() {
+        let path = vec![rect(0, 0, 800, 600), rect(100, 100, 500, 400)];
+        let mut chain = LevelChain::new(path.len());
+        chain.shallower();
+        assert!(!chain.is_deepest());
+        chain.reset();
+        assert!(chain.is_deepest());
+        assert_eq!(chain.current(&path), Some(rect(100, 100, 500, 400)));
+    }
+
+    #[test]
+    fn a_walked_level_overrides_the_published_box_in_the_preview() {
+        let frame = rect(0, 0, 1000, 800);
+        let control = deep_target(
+            TargetKind::UiElement,
+            rect(300, 300, 500, 400),
+            StopReason::Complete,
+        );
+        // A level the user walked to wins over the published box while the target still answers…
+        assert_eq!(
+            preview_bounds(
+                Some(&control),
+                Some(rect(100, 100, 900, 700)),
+                window(0x100),
+                Point::new(350, 350),
+                frame,
+                false
+            ),
+            Some(rect(100, 100, 900, 700))
+        );
+        // …and with no level walked to, the published box is what shows.
+        assert_eq!(
+            preview_bounds(
+                Some(&control),
+                None,
+                window(0x100),
+                Point::new(350, 350),
+                frame,
+                false
+            ),
+            Some(rect(300, 300, 500, 400))
+        );
+        // A level never resurrects a target that belongs to another window.
+        assert_eq!(
+            preview_bounds(
+                Some(&control),
+                Some(rect(100, 100, 900, 700)),
+                window(0x200),
+                Point::new(350, 350),
+                frame,
+                false
+            ),
+            Some(frame)
+        );
+    }
+
+    #[test]
+    fn a_stale_chain_cannot_publish_a_box_outside_the_path() {
+        // A chain built for a four-level answer, then a shorter path arrives first.
+        let short = vec![rect(0, 0, 800, 600), rect(10, 10, 20, 20)];
+        let mut chain = LevelChain::new(4);
+        assert_eq!(chain.index(), 3);
+        assert_eq!(
+            chain.current(&short),
+            Some(rect(10, 10, 20, 20)),
+            "the index is clamped to the path it is asked about"
+        );
+        // An empty path has nothing to select at all.
+        assert_eq!(chain.current(&[]), None);
+        // Stepping up from an index that is still above the short path keeps answering with the
+        // path's deepest level; only when the index itself reaches zero does the frame come back.
+        assert!(chain.shallower(), "walking up from the clamped index still moves");
+        assert_eq!(chain.current(&short), Some(rect(10, 10, 20, 20)));
+        while chain.shallower() {}
+        assert_eq!(chain.current(&short), Some(rect(0, 0, 800, 600)));
+    }
+
     fn deep_target(kind: TargetKind, bounds: Rect, stop_reason: StopReason) -> DeepTarget {
         DeepTarget {
             window: window(0x100),
@@ -928,6 +1119,7 @@ mod tests {
         assert_eq!(
             preview_bounds(
                 Some(&control),
+                None,
                 window(0x100),
                 Point::new(600, 600),
                 frame,
@@ -940,6 +1132,7 @@ mod tests {
         assert_eq!(
             preview_bounds(
                 Some(&control),
+                None,
                 window(0x100),
                 Point::new(600, 600),
                 frame,
@@ -953,12 +1146,12 @@ mod tests {
     fn the_first_hover_of_a_window_withholds_the_preview_until_it_answers() {
         let frame = rect(0, 0, 1000, 800);
         assert_eq!(
-            preview_bounds(None, window(0x100), Point::new(10, 10), frame, true),
+            preview_bounds(None, None, window(0x100), Point::new(10, 10), frame, true),
             None,
             "the first thing shown must be the control, not the whole frame"
         );
         assert_eq!(
-            preview_bounds(None, window(0x100), Point::new(10, 10), frame, false),
+            preview_bounds(None, None, window(0x100), Point::new(10, 10), frame, false),
             Some(frame),
             "an unsupported or failed provider still degrades to the v1 frame"
         );
@@ -969,12 +1162,12 @@ mod tests {
         let frame = rect(0, 0, 1000, 800);
         let elsewhere = deep_target(TargetKind::UiElement, rect(100, 100, 200, 200), StopReason::Complete);
         assert_eq!(
-            preview_bounds(Some(&elsewhere), window(0x200), Point::new(150, 150), frame, true),
+            preview_bounds(Some(&elsewhere), None, window(0x200), Point::new(150, 150), frame, true),
             None,
             "another window's path is not an answer for this one"
         );
         assert_eq!(
-            preview_bounds(Some(&elsewhere), window(0x200), Point::new(150, 150), frame, false),
+            preview_bounds(Some(&elsewhere), None, window(0x200), Point::new(150, 150), frame, false),
             Some(frame)
         );
     }
@@ -985,6 +1178,7 @@ mod tests {
         assert_eq!(
             preview_bounds(
                 Some(&control),
+                None,
                 window(0x100),
                 Point::new(350, 350),
                 rect(0, 0, 1000, 800),

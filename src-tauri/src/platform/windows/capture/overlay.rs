@@ -74,6 +74,7 @@ use crate::capture::session::{CaptureSession, ExportOutcome};
 use crate::capture::window_detection::model::RequestId;
 use crate::capture::window_detection::{
     DEFAULT_DWELL_MS, DEFAULT_HOVER_REVALIDATE_MS, DEFAULT_SNAP_RADIUS_PX, DeepTarget, Exclusions,
+    LevelChain,
     GestureState, HoverValidity, MoveOutcome, PressOutcome, RefinementJob, RefinementOutcome,
     RefinementScheduler,
     ReleaseOutcome, Replacement, WindowSnapshot, WindowTarget, classify_replacement,
@@ -435,6 +436,9 @@ where
     refinement: RefinementWorker,
     /// The published deep path, if the refinement worker produced one this session.
     deep_target: Option<DeepTarget>,
+    /// Which level of `deep_target`'s chain the user walked to (docs/21 §5.17). `None` means the
+    /// published box itself, which is what every session starts with.
+    deep_levels: Option<LevelChain>,
     /// A shallower target waiting for its confirming dwell (docs/18 §13.3).
     ///
     /// A cursor merely passing through a parent container produces one such result; displaying
@@ -557,6 +561,7 @@ where
             refine: RefinementScheduler::new(),
             refinement,
             deep_target: None,
+            deep_levels: None,
             pending_downgrade: None,
             refinement_pending: None,
             hit_test_pass_through,
@@ -1346,6 +1351,45 @@ where
     /// cursor: a path for another window would draw outlines over unrelated pixels. The
     /// deepest entry is left out because it is painted as the emphasised hover/preview
     /// rectangle (docs/18 §12.2 的层级可视化).
+    /// The ancestor level the user walked to, if any (docs/21 §5.17).
+    ///
+    /// `None` means "the published box", which is what the refinement produced and what the preview
+    /// shows until the wheel or an arrow key asks for another level.
+    fn selected_deep_level(&self) -> Option<Rect> {
+        let deep = self.deep_target.as_ref()?;
+        let chain = self.deep_levels?;
+        (!chain.is_deepest())
+            .then(|| chain.current(&deep.path))
+            .flatten()
+    }
+
+    /// Step the deep-selection level: `-1` toward the window frame, `+1` toward the published box.
+    ///
+    /// Returns whether anything moved, so the wheel can decide whether to consume the event.
+    fn step_deep_level(&mut self, delta: i32) -> bool {
+        if self.session.state() != CaptureState::Selecting {
+            return false;
+        }
+        let Some(deep) = self.deep_target.as_ref() else {
+            return false;
+        };
+        // A level walk starts from what is on screen right now, so the chain is built on first use
+        // for whatever answer is currently published.
+        let chain = self
+            .deep_levels
+            .get_or_insert_with(|| LevelChain::new(deep.path.len()));
+        let moved = if delta < 0 {
+            chain.shallower()
+        } else {
+            chain.deeper()
+        };
+        if moved {
+            self.refresh_preview_for_cursor();
+            self.invalidate();
+        }
+        moved
+    }
+
     fn deep_path_local(&self) -> Vec<Rect> {
         let Some(layout) = self.layout() else {
             return Vec::new();
@@ -1356,9 +1400,15 @@ where
         if self.hover_target.map(|target| target.identity()) != Some(deep.window) {
             return Vec::new();
         }
+        // Outlines only above the selected level: the selected one is painted as the emphasised
+        // preview rectangle, and the levels *below* it are not part of what the user chose.
+        let selected = self
+            .deep_levels
+            .map(|chain| chain.index())
+            .unwrap_or(deep.path.len().saturating_sub(1));
         deep.path
             .iter()
-            .take(deep.path.len().saturating_sub(1))
+            .take(selected)
             .map(|level| window_rect_to_local(*level, &layout))
             .filter(|level| !level.is_empty())
             .collect()
@@ -1458,6 +1508,22 @@ where
         };
         if changed {
             self.deep_target = published.cloned();
+            // A new answer for the pointer resets the level walk to the published box (docs/21
+            // §5.17): a chain belongs to the answer it was walked on, and carrying an index over to a
+            // different element is how a walk ends up publishing a box nobody asked for.
+            self.deep_levels = self
+                .deep_target
+                .as_ref()
+                .map(|deep| LevelChain::new(deep.path.len()));
+        }
+        // …and the walk only lasts while the cursor stays on what it selected: moving off the chosen
+        // level hands the choice back to the pointer.
+        if let (Some(chain), Some(deep)) = (self.deep_levels, self.deep_target.as_ref())
+            && chain
+                .current(&deep.path)
+                .is_some_and(|level| !level.contains(screen))
+        {
+            self.deep_levels = None;
         }
     }
 
@@ -1611,6 +1677,7 @@ where
         });
         let bounds = preview_bounds(
             self.deep_target.as_ref(),
+            self.selected_deep_level(),
             target.identity(),
             screen,
             target.screen_bounds(),
@@ -1992,12 +2059,16 @@ where
         // the app confirms the window" gap (docs/21 §8), and this line tells which side of that
         // gap a session fell on.
         let deep_local = self.layout().zip(self.deep_target.as_ref()).map(|(layout, deep)| {
-            window_rect_to_local(deep.screen_bounds, &layout)
+            // What the walk selected, not necessarily what the refinement published (docs/21 §5.17).
+            window_rect_to_local(
+                self.selected_deep_level().unwrap_or(deep.screen_bounds),
+                &layout,
+            )
         });
         self.metrics.log_line(
             &format!(
                 "confirm requested hwnd={} epoch={} confirmation={} preview_local={} \
-                 deep_local={} pending={} deep={}",
+                 deep_local={} pending={} deep={} level={}",
                 preview.target.identity().hwnd,
                 preview.target.candidate.snapshot_epoch,
                 request.get(),
@@ -2005,6 +2076,7 @@ where
                 deep_local.map_or_else(|| "none".to_owned(), describe_rect),
                 self.refinement_pending.is_some(),
                 describe_deep(self.deep_target.as_ref()),
+                describe_level(self.deep_levels),
             ),
             true,
         );
@@ -2211,6 +2283,14 @@ where
             .log_line(&format!("key down vk=0x{key:02X} state={state:?}"), false);
         match key {
             hotkey::ESCAPE_VIRTUAL_KEY => self.cancel("escape"),
+            // Up/Down: step the deep-selection level (docs/21 §5.17). Up walks toward the window
+            // frame, down back toward the box the refinement published.
+            k if k == 0x26 => {
+                self.step_deep_level(-1);
+            }
+            k if k == 0x28 => {
+                self.step_deep_level(1);
+            }
             hotkey::RETURN_VIRTUAL_KEY => {
                 // A snap preview is confirmed through the detection worker — never
                 // validated synchronously on the overlay thread. A settled selection goes
@@ -2773,11 +2853,16 @@ where
                 None
             }
             WM_MOUSEWHEEL => {
+                let delta = ((wparam >> 16) & 0xFFFF) as u16 as i16;
                 if self.z_held && self.session.state().is_active() {
-                    let delta = ((wparam >> 16) & 0xFFFF) as u16 as i16;
                     let direction = if delta > 0 { 1 } else { -1 };
                     self.magnifier_zoom = MagnifierConfig::zoom_step(self.magnifier_zoom, direction);
                     self.invalidate();
+                    Some(0)
+                } else if self.step_deep_level(if delta > 0 { -1 } else { 1 }) {
+                    // Plain wheel walks the deep-selection levels (docs/21 §5.17): up toward the
+                    // window frame, down toward the element under the cursor. Consumed, so the page
+                    // underneath never sees a scroll it did not ask for.
                     Some(0)
                 } else {
                     None
@@ -2902,6 +2987,14 @@ fn exclude_overlay_from_capture(window: HWND) -> Result<(), u32> {
 
 fn describe_rect(rect: Rect) -> String {
     format!("({},{})->({},{})", rect.left, rect.top, rect.right, rect.bottom)
+}
+
+/// `2/6` for the confirm line: which level of the chain the ancestor walk selected (docs/21 §5.17).
+fn describe_level(chain: Option<LevelChain>) -> String {
+    match chain {
+        Some(chain) if !chain.is_empty() => format!("{}/{}", chain.index() + 1, chain.len()),
+        _ => "deepest".to_owned(),
+    }
 }
 
 /// One-line account of a deep target for the default (non-verbose) session log.
