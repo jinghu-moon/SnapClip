@@ -41,6 +41,17 @@ struct Counters {
     present_count: AtomicU64,
     present_last_us: AtomicU64,
     present_max_us: AtomicU64,
+    /// The **first** present of a session, timed on its own.
+    ///
+    /// Real sessions reported max present times of 29 ms, 74 ms and 93 ms on a 4K surface while
+    /// `last` stayed under 1.4 ms. Most of that is the first frame — effect creation, font upload,
+    /// swap-chain warm-up — and separating it says whether the tail is one-off or recurring.
+    present_first_us: AtomicU64,
+    /// Presents slower than one 60 Hz frame (16 ms): the count that says "recurring".
+    present_over_16ms: AtomicU64,
+    /// Repaints the ③b chain fade produced (docs/21 §5.22). Bounded by design at eight per fade;
+    /// this is the number that checks it.
+    chain_fade_frames: AtomicU64,
     snapshot_refresh_count: AtomicU64,
     snapshot_refresh_last_us: AtomicU64,
     snapshot_refresh_max_us: AtomicU64,
@@ -106,6 +117,9 @@ pub struct WindowDetectionReading {
     pub present_count: u64,
     pub present_last_us: u64,
     pub present_max_us: u64,
+    pub present_first_us: u64,
+    pub present_over_16ms: u64,
+    pub chain_fade_frames: u64,
     pub snapshot_refresh_count: u64,
     pub snapshot_refresh_last_us: u64,
     pub snapshot_refresh_max_us: u64,
@@ -220,14 +234,34 @@ impl WindowDetectionMetrics {
     /// Record one overlay present (a full-surface repaint) and how long it took.
     ///
     /// Called by the overlay around `renderer.render(...)`, so the number covers the paint *and* the
-    /// present — the one to look at when wondering whether drawing more rings costs anything.
+    /// present. The first one of the session is recorded separately, and slow ones are counted: a
+    /// 4K surface reported 29/74/93 ms tails while every other present stayed under 1.4 ms, and the
+    /// two numbers together say whether that is warm-up or something that happens during use.
     pub fn record_present(&self, elapsed: Duration) {
+        let micros = elapsed.as_micros() as u64;
+        if self.counters.present_count.load(Ordering::Relaxed) == 0 {
+            self.counters
+                .present_first_us
+                .store(micros, Ordering::Relaxed);
+        }
+        if micros > 16_000 {
+            self.counters
+                .present_over_16ms
+                .fetch_add(1, Ordering::Relaxed);
+        }
         record_timing(
             &self.counters.present_count,
             &self.counters.present_last_us,
             &self.counters.present_max_us,
             elapsed,
         );
+    }
+
+    /// One repaint produced by the ③b chain fade (docs/21 §5.22).
+    pub fn record_chain_fade_frame(&self) {
+        self.counters
+            .chain_fade_frames
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_snapshot_refresh(&self, elapsed: Duration, candidates: usize) {
@@ -477,6 +511,9 @@ impl WindowDetectionMetrics {
             present_count: load(&counters.present_count),
             present_last_us: load(&counters.present_last_us),
             present_max_us: load(&counters.present_max_us),
+            present_first_us: load(&counters.present_first_us),
+            present_over_16ms: load(&counters.present_over_16ms),
+            chain_fade_frames: load(&counters.chain_fade_frames),
             snapshot_refresh_count: load(&counters.snapshot_refresh_count),
             snapshot_refresh_last_us: load(&counters.snapshot_refresh_last_us),
             snapshot_refresh_max_us: load(&counters.snapshot_refresh_max_us),
@@ -533,7 +570,7 @@ impl WindowDetectionMetrics {
     pub fn summary_line(&self) -> String {
         let reading = self.reading();
         format!(
-            "present={} present_us last={} max={} \
+            "present={} present_us last={} max={} first={} over16ms={} chain_fade_frames={} \
              window_snapshot_refresh_us last={} max={} n={} \
              window_snapshot_release_us last={} max={} n={} \
              window_hit_test_us last={} max={} n={} \
@@ -558,6 +595,9 @@ impl WindowDetectionMetrics {
             reading.present_count,
             reading.present_last_us,
             reading.present_max_us,
+            reading.present_first_us,
+            reading.present_over_16ms,
+            reading.chain_fade_frames,
             reading.snapshot_refresh_last_us,
             reading.snapshot_refresh_max_us,
             reading.snapshot_refresh_count,
@@ -663,6 +703,9 @@ impl WindowDetectionMetrics {
             &counters.present_count,
             &counters.present_last_us,
             &counters.present_max_us,
+            &counters.present_first_us,
+            &counters.present_over_16ms,
+            &counters.chain_fade_frames,
             &counters.snapshot_refresh_count,
             &counters.snapshot_refresh_last_us,
             &counters.snapshot_refresh_max_us,
@@ -790,6 +833,10 @@ mod tests {
         // one the ring work is judged by (docs/21 §5.22).
         metrics.record_present(Duration::from_micros(3100));
         metrics.record_present(Duration::from_micros(1900));
+        // A slow one is counted separately: the tail on a real 4K session was 93 ms, and the count
+        // is what says whether that is warm-up or something recurring.
+        metrics.record_present(Duration::from_micros(29_400));
+        metrics.record_chain_fade_frame();
         metrics.record_snapshot_refresh(Duration::from_micros(500), 42);
         metrics.record_snapshot_release(Duration::from_micros(4));
         metrics.record_hit_test(Duration::from_micros(1));
@@ -803,8 +850,9 @@ mod tests {
 
         let line = metrics.summary_line();
         for expected in [
-            "present=2",
-            "present_us last=1900 max=3100",
+            "present=3",
+            "present_us last=29400 max=29400 first=3100 over16ms=1",
+            "chain_fade_frames=1",
             "window_snapshot_refresh_us",
             "window_snapshot_release_us",
             "window_hit_test_us",

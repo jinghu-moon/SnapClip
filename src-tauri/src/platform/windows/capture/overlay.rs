@@ -1540,6 +1540,9 @@ where
             return false;
         }
         self.chain_visibility = visibility;
+        // One repaint per step, and that is the whole cost model — so it gets its own counter
+        // instead of hiding inside `present=` (docs/21 §5.22).
+        self.metrics.record_chain_fade_frame();
         true
     }
 
