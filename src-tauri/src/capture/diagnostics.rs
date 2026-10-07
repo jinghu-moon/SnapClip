@@ -52,6 +52,9 @@ struct Counters {
     /// Repaints the ③b chain fade produced (docs/21 §5.22). Bounded by design at eight per fade;
     /// this is the number that checks it.
     chain_fade_frames: AtomicU64,
+    /// Repaints the capture box's walk colour produced (docs/21 §5.24, A3). Bounded by design at
+    /// about six for the rise plus eight for the fall; this is the number that checks it.
+    walk_frames: AtomicU64,
     snapshot_refresh_count: AtomicU64,
     snapshot_refresh_last_us: AtomicU64,
     snapshot_refresh_max_us: AtomicU64,
@@ -120,6 +123,7 @@ pub struct WindowDetectionReading {
     pub present_first_us: u64,
     pub present_over_16ms: u64,
     pub chain_fade_frames: u64,
+    pub walk_frames: u64,
     pub snapshot_refresh_count: u64,
     pub snapshot_refresh_last_us: u64,
     pub snapshot_refresh_max_us: u64,
@@ -262,6 +266,11 @@ impl WindowDetectionMetrics {
         self.counters
             .chain_fade_frames
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One repaint produced by the capture box's walk colour (docs/21 §5.24, A3).
+    pub fn record_walk_frame(&self) {
+        self.counters.walk_frames.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_snapshot_refresh(&self, elapsed: Duration, candidates: usize) {
@@ -514,6 +523,7 @@ impl WindowDetectionMetrics {
             present_first_us: load(&counters.present_first_us),
             present_over_16ms: load(&counters.present_over_16ms),
             chain_fade_frames: load(&counters.chain_fade_frames),
+            walk_frames: load(&counters.walk_frames),
             snapshot_refresh_count: load(&counters.snapshot_refresh_count),
             snapshot_refresh_last_us: load(&counters.snapshot_refresh_last_us),
             snapshot_refresh_max_us: load(&counters.snapshot_refresh_max_us),
@@ -571,6 +581,7 @@ impl WindowDetectionMetrics {
         let reading = self.reading();
         format!(
             "present={} present_us last={} max={} first={} over16ms={} chain_fade_frames={} \
+             walk_frames={} \
              window_snapshot_refresh_us last={} max={} n={} \
              window_snapshot_release_us last={} max={} n={} \
              window_hit_test_us last={} max={} n={} \
@@ -598,6 +609,7 @@ impl WindowDetectionMetrics {
             reading.present_first_us,
             reading.present_over_16ms,
             reading.chain_fade_frames,
+            reading.walk_frames,
             reading.snapshot_refresh_last_us,
             reading.snapshot_refresh_max_us,
             reading.snapshot_refresh_count,
@@ -706,6 +718,7 @@ impl WindowDetectionMetrics {
             &counters.present_first_us,
             &counters.present_over_16ms,
             &counters.chain_fade_frames,
+            &counters.walk_frames,
             &counters.snapshot_refresh_count,
             &counters.snapshot_refresh_last_us,
             &counters.snapshot_refresh_max_us,

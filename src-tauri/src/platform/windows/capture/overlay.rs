@@ -1680,6 +1680,9 @@ where
             return false;
         }
         self.walk_activity = activity;
+        // Counted like the chain fade: one bounded ramp, and this is the number that proves the
+        // bound on a real machine (docs/21 §5.24).
+        self.metrics.record_walk_frame();
         true
     }
 
@@ -2222,7 +2225,9 @@ where
         if self.chain_fade_pending() {
             self.invalidate();
         }
-        // …and the same for the capture box's walk colour: its 1.2 s hold is on the wall clock too.
+        // …and the same for the capture box's walk colour. A walk also touches the chain, so this is
+        // normally the *same* repaint the line above already asked for; it is here because the walk
+        // envelope's deadline is its own, and a line is cheaper than a coupling nobody can see.
         if self.walk_activity_pending() {
             self.invalidate();
         }
