@@ -186,6 +186,31 @@ impl HistoryState {
         ))
     }
 
+    /// The inline spans of `item`, when it carries rich text.
+    ///
+    /// RTF wins over plain text, because a source that offers both is offering the richer one
+    /// on purpose — that is why the clipboard keeps both formats at all.
+    ///
+    /// Markdown is deliberately **not** handled here yet: it is not a payload kind, so it needs
+    /// the detection rule (and the setting that lets a user turn it off) which the card
+    /// redesign has not settled. Until then a Markdown document is text, and the card shows it
+    /// as text — which is honest, and exactly what the user pasted.
+    ///
+    /// The bytes are read per call and the caller caches the result: parsing is ~8 ms for a
+    /// 50 KiB document (`history::rich`'s bench), which is a one-off per row, not a per-frame
+    /// cost.
+    pub fn rich_spans(&self, item: &ClipSummary) -> Option<Vec<super::rich::Span>> {
+        let payload = item
+            .payloads
+            .iter()
+            .find(|payload| payload.kind == PayloadKind::Rtf)?;
+        let bytes = self
+            .store
+            .read_payload_bytes(payload.content_hash.clone(), PayloadKind::Rtf)
+            .ok()?;
+        super::rich::rtf_spans(&bytes)
+    }
+
     /// Select the first row when nothing is selected, or when the selection vanished
     /// (the entry was deleted, or the filter no longer matches it).
     fn keep_selection_valid(&mut self) {
@@ -321,6 +346,31 @@ mod tests {
                 vec![PayloadData::new(payload, bytes)],
             )
             .expect("save image publication");
+    }
+
+    fn save_rtf(store: &Store, id: &str, rtf: &[u8]) {
+        let bytes = rtf.to_vec();
+        let payload = PayloadRef {
+            payload_id: format!("{id}-rtf"),
+            content_hash: blake3::hash(&bytes).to_hex().to_string(),
+            kind: PayloadKind::Rtf,
+            size_bytes: bytes.len() as u64,
+            mime_type: Some(PayloadKind::Rtf.default_mime_type().to_string()),
+            image_dimensions: None,
+        };
+        store
+            .save_publication(
+                Publication {
+                    publication_id: id.to_string(),
+                    origin: PublicationOrigin::Clipboard,
+                    captured_at_unix_ms: 1_700_000_000_000,
+                    source_app: Some("Word".to_string()),
+                    source_exe_path: None,
+                    payloads: vec![payload.clone()],
+                },
+                vec![PayloadData::new(payload, bytes)],
+            )
+            .expect("save rtf publication");
     }
 
     #[test]
@@ -545,6 +595,50 @@ mod tests {
             .find(|item| item.id == "clip-text")
             .unwrap();
         assert!(state.image_bytes(text).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The rich-text path, end to end from the store: an RTF row comes back as styled spans,
+    /// and a plain row honestly reports that it has none.
+    #[test]
+    fn an_rtf_row_offers_styled_spans_and_a_text_row_offers_none() {
+        let dir = root("rich-spans");
+        {
+            let store = Store::open(&dir).unwrap();
+            save(&store, "clip-text", "just a note");
+            // Bold "粗体" and a reset, with a Chinese decimal escape so this also covers the
+            // path that used to decode to mojibake.
+            save_rtf(
+                &store,
+                "clip-rtf",
+                br"{\rtf1\ansi\ansicpg936\deff0{\fonttbl{\f0\fnil Arial;}}\b bold\b0  \u26085?\u26412?}",
+            );
+        }
+        let state = HistoryState::open(&dir).unwrap();
+
+        let rtf = state
+            .items()
+            .iter()
+            .find(|item| item.id == "clip-rtf")
+            .unwrap();
+        let spans = state.rich_spans(rtf).expect("the RTF row has spans");
+        assert!(
+            spans.iter().any(|span| span.bold && span.text.contains("bold")),
+            "expected a bold span, got {spans:?}"
+        );
+        assert!(
+            super::super::rich::spans_to_text(&spans).contains("日本"),
+            "the escape should have decoded: {spans:?}"
+        );
+
+        // A plain row is not rich text, and saying otherwise would make the card try to render
+        // styles that do not exist.
+        let text = state
+            .items()
+            .iter()
+            .find(|item| item.id == "clip-text")
+            .unwrap();
+        assert!(state.rich_spans(text).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
