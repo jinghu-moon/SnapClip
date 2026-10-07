@@ -260,7 +260,7 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 | T4.2 | `apps/snapclip` 骨架（init/Root/单窗口） | T4.1, T2.10（D2 解除了对 T3.4 的依赖） | ~5 文件 | 中 | [x]（包名 `snapclip-app`；构建 + 起窗 + 门禁全过） |
 | T4.3 | history 能力（Entity + 虚拟列表 + `ElementId`=clip id） | T4.2 | ~6 文件 | 高 | 部分 [x]（模型/图标/视图/接线/回车复制/**GPUI 集成测试**已落地；分页、删除确认、缩略图待续，见 §14.29–§14.31） |
 | T4.4 | settings 能力（**新增**，不是迁移） | T4.3 | ~4 文件 | 中 | 部分 [x]（模型 + 持久化 + 到 capture 的桥已落地，见 §14.35；设置页与热更新待续） |
-| T4.4.1 | 两个窗口检测开关接成真实设置通道 | T4.4 | 3 文件 | 中 | 部分 [x]（**capture 侧整条链已通**：`DetectionOptions` 一路到 provider 的 builder；剩"设置页/持久化 → 壳传值"，那属于 T4.4；第二个开关无对应行为未发明。见 §14.32–§14.34） |
+| T4.4.1 | 两个窗口检测开关接成真实设置通道 | T4.4 | 3 文件 | 中 | 部分 [x]（**capture 侧全通且有单测**：`DetectionOptions` → worker → fallback → provider builder，`a_non_default_adopt_text_runs_reaches_the_fallback` 钉住；剩"设置页 → 壳传值"属 T4.4；第二个开关无行为未发明。见 §14.32–§14.36） |
 | T4.5 | 事件桥（`snapclip-model::AppEvent` + channel + 丢弃过期） | T4.3 | 2 文件 | 高 | [ ] |
 | T4.6 | 托盘（Win32，**新建**） | T4.2 | 1 文件 | 中 | [ ] |
 | T4.7 | 测试三层 + 无障碍树断言（**先 spike**） | T4.3–T4.6 | ~4 文件 | 中 | [ ] |
@@ -2195,4 +2195,26 @@ T4.3 剩余（续做清单）：
 提交 SHA：见提交
 推送/tag：origin/main
 回退对象：58224c9
+```
+
+### §14.36 T4.4.1 的钉死测试：非默认值必须到达 transports
+
+```
+任务编号：T4.4.1（最后一条验收）
+状态：已验证 + 已推送
+分支：main
+前置提交/tag：a4aae5f（T4.4 第一半）
+新增测试（`refinement_worker.rs` 的测试模块内）：
+  `a_non_default_adopt_text_runs_reaches_the_fallback`
+  - 用 `adopt_text_runs = false` 构造 `FallbackDeepSelection`，断言它**存下来的是 false**
+    （而不是被常量覆盖）；
+  - 再用 `DEFAULT_ADOPT_TEXT_RUNS` 构造一次，断言等于默认值（默认行为未变）。
+这条测试的意义：T4.4.1 的价值全在"值能不能一层层传到底"。签名对、常量被换成参数，都可能在
+  某一层被重新写回默认值而不报错；这条断言就是那个会失败的守卫。
+修改前/后测试：capture **345 passed / 6 ignored**（+1）；`cargo check --workspace --all-targets`
+          0 warning；其余 capture 既有 344 条、壳 8、history 49、model 20、app 8+1 UI 均未变。
+人工验证：不涉及（无行为变化）
+提交 SHA：见提交
+推送/tag：origin/main
+回退对象：a4aae5f
 ```

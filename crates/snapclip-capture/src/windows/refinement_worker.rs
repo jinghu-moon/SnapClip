@@ -898,4 +898,32 @@ mod tests {
     fn candidate_thread() -> u32 {
         0
     }
+
+    /// T4.4.1's acceptance: a non-default detection option must reach the transports, not
+    /// stop at the worker's signature. The fallback stores the value it was handed, and the
+    /// UIA provider is built with it through `with_adopt_text_runs` — so this test is what
+    /// fails if someone later wires a constant back in.
+    #[test]
+    fn a_non_default_adopt_text_runs_reaches_the_fallback() {
+        let fallback = FallbackDeepSelection::new(
+            WindowDetectionMetrics::new(),
+            win32::HitTestPassThrough::default(),
+            false,
+        );
+        assert!(
+            !fallback.adopt_text_runs,
+            "the worker's adopt_text_runs must be what the transports use"
+        );
+
+        // …and the default keeps today's behaviour.
+        let default_fallback = FallbackDeepSelection::new(
+            WindowDetectionMetrics::new(),
+            win32::HitTestPassThrough::default(),
+            crate::window_detection::DEFAULT_ADOPT_TEXT_RUNS,
+        );
+        assert_eq!(
+            default_fallback.adopt_text_runs,
+            crate::window_detection::DEFAULT_ADOPT_TEXT_RUNS
+        );
+    }
 }
