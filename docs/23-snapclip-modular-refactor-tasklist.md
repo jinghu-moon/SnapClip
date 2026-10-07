@@ -1336,3 +1336,22 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 推送/tag：origin/main 已推送；tag `refactor-p05` 见 §14.12 的回退演练记录
 回退对象：smart-snapping-v1-2026-10-07（整个重构的最终回退基准）
 ```
+
+### §14.12 P0.5 阶段收尾：tag `refactor-p05` 与回退演练
+
+```
+阶段：P0.5（低风险边界收敛）
+状态：已验证 + 已推送（含 tag）
+tag：refactor-p05（annotated，指向 0686a6f），已推 origin
+阶段 G0（tag 前复跑，见 §14.11）：405 passed / 0 failed / 6 ignored；check 0 warning；
+      浏览器探针 41/41·52·finer=0；Explorer 探针 12/25·65.8·25/25；A4 passed；字体子集 passed
+回退演练（§0.6 硬性要求）：
+  git switch --detach refactor-p05
+  cargo test --lib --manifest-path src-tauri/Cargo.toml → 405 passed / 0 failed / 6 ignored
+  git switch main
+  → **回退点自身可编译可测**，这个 tag 是真的
+P0.5 累计产出：T0.5.1（删转发层 + 清死代码链）、T0.5.2（OCR 事件接缝）、
+      T0.5.3（OCR 惰性启动）、T0.5.4（资源 after + tag）
+P0.5 期间的决策：D2（OCR/recognize 本轮暂缓，P4/P6 不再依赖 P3）
+下一阶段：P1（抽离 `snapclip-capture`，10 686 + 18 256 行，整次重构最大的单点）
+```
