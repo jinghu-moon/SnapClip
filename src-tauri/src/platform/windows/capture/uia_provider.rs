@@ -2440,6 +2440,11 @@ mod tests {
         let class = unsafe { element.CurrentClassName() }
             .map(|name| name.to_string())
             .unwrap_or_default();
+        // The accessible name is the property the product's label would show (docs/21 §5.24 B6), so
+        // every dump that already describes an element says what the page calls it.
+        let name = unsafe { element.CurrentName() }
+            .map(|name| name.to_string())
+            .unwrap_or_default();
         let control = unsafe { element.CurrentIsControlElement() }
             .map(|value| value.as_bool())
             .unwrap_or(false);
@@ -2447,12 +2452,13 @@ mod tests {
             .map(|value| value.as_bool())
             .unwrap_or(false);
         format!(
-            "{}({},{})-({},{}) class={class:?} control={control} content={content}",
+            "{}({},{})-({},{}) class={class:?} name={:?} control={control} content={content}",
             control_type_name(kind),
             rect.left,
             rect.top,
             rect.right,
-            rect.bottom
+            rect.bottom,
+            name.chars().take(60).collect::<String>()
         )
     }
 
@@ -2730,6 +2736,100 @@ mod tests {
                 .and_then(|walker| unsafe { walker.GetParentElement(&element) }.ok());
         }
         println!("[sources]   text range  : no TextPattern on the hit or its ancestors");
+    }
+
+    /// Every name UIA offers at the cursor (docs/21 §5.24, B6).
+    ///
+    /// The label's *noun* comes from the control type; the *name* — if one is ever shown — comes from
+    /// whichever of four places the page used: `aria-label`, a `title` on an icon-only control, an
+    /// `alt`, or the text inside a link/button/heading/cell. A layout-only `<div>` has none, which is
+    /// exactly where the label says `容器`.
+    ///
+    /// Put the cursor on the box you are curious about, then run:
+    ///
+    /// ```text
+    /// cargo test --lib dump_uia_names_under_the_cursor -- --ignored --nocapture
+    /// ```
+    ///
+    /// It prints the window, the ancestor chain with each level's type / name / class / rectangle,
+    /// what the label would call the thing under the cursor, and then the source-comparison dump
+    /// (control hit, MSAA hit, raw view, text range) for that same point.
+    #[test]
+    #[ignore = "probe: needs a window under the cursor; prints the names UIA exposes there"]
+    fn dump_uia_names_under_the_cursor() {
+        use ::windows::Win32::Foundation::POINT;
+        use ::windows::Win32::UI::WindowsAndMessaging::{
+            GA_ROOT, GetAncestor, GetCursorPos, WindowFromPoint,
+        };
+
+        let mut cursor = POINT::default();
+        if unsafe { GetCursorPos(&mut cursor) }.is_err() {
+            eprintln!("GetCursorPos failed; there is nothing to look at");
+            return;
+        }
+        let at = POINT {
+            x: cursor.x,
+            y: cursor.y,
+        };
+        let root = unsafe { GetAncestor(WindowFromPoint(at), GA_ROOT) };
+        if root.0.is_null() {
+            eprintln!("no top-level window under the cursor");
+            return;
+        }
+        let hwnd = root.0 as isize;
+        let point = Point::new(cursor.x, cursor.y);
+        let frame = win32::frame_bounds(hwnd).unwrap_or_default();
+        println!(
+            "[names] cursor=({},{}) window={} frame={}x{} at ({},{})",
+            cursor.x,
+            cursor.y,
+            describe_window(hwnd),
+            frame.width(),
+            frame.height(),
+            frame.left,
+            frame.top
+        );
+
+        let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        let automation: Option<IUIAutomation> =
+            unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }.ok();
+        let Some(automation) = automation else {
+            eprintln!("UI Automation is unavailable");
+            return;
+        };
+
+        match unsafe { automation.ElementFromPoint(at) } {
+            Ok(element) => {
+                // What the label would show for this very box: the noun its control type maps to, and
+                // the name the page gave it (empty when nobody gave it one).
+                let kind = unsafe { element.CurrentControlType() }
+                    .map(|kind| kind.0)
+                    .unwrap_or(0);
+                let level = level_kind_of_control_type(kind);
+                let name = unsafe { element.CurrentName() }
+                    .map(|name| name.to_string())
+                    .unwrap_or_default();
+                println!(
+                    "[names] label would say: {} ({}) + name {:?}",
+                    level.noun_zh().unwrap_or("容器/元素"),
+                    level.debug_name(),
+                    name.chars().take(60).collect::<String>()
+                );
+                // …and the chain it sits in: every level the ancestor walk could publish, innermost
+                // first. A level whose `name` is empty is one the label can only call a container.
+                let walker = unsafe { automation.ControlViewWalker() }.ok();
+                let mut current = Some(element);
+                for depth in 0..24 {
+                    let Some(node) = current else { break };
+                    println!("[names]   {depth:>2} {}", describe_element(&node));
+                    current = walker
+                        .as_ref()
+                        .and_then(|walker| unsafe { walker.GetParentElement(&node) }.ok());
+                }
+            }
+            Err(error) => eprintln!("ElementFromPoint failed: {error}"),
+        }
+        report_sources(&automation, hwnd, "cursor", point);
     }
 
     /// `class="…" WxH at (x,y) visible=…` for a window handle, or `none` for "no window".

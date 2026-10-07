@@ -2036,6 +2036,7 @@ cargo check --all-targets              # 0 warnings
 cargo test --lib browser_element_probe   -- --ignored --nocapture   # 期望 asserted=41 passed=41、cross-ready=Some(…)、available=52、finer=0
 cargo test --lib explorer_rule_probe     -- --ignored --nocapture   # 期望 control_level_points=12/25、median_area_pct=65.8、available=25/25
 cargo test --lib overlay_hit_through_probe -- --ignored --nocapture # 穿透/命中测试的环境实验
+cargo test --lib dump_uia_names_under_the_cursor -- --ignored --nocapture # 光标下那一点，UIA 给出哪些类型/名称（docs/21 §5.24.9）
 ```
 
 关键产物（都在分支 `browser-capture-attempt` = `53c5acd`）：
