@@ -237,4 +237,21 @@ mod tests {
         assert!(!state.set_query("clip").unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn a_matching_query_keeps_only_that_row() {
+        let dir = root("matching");
+        {
+            let store = Store::open(&dir).unwrap();
+            save(&store, "clip-1", "alpha note");
+            save(&store, "clip-2", "beta note");
+        }
+        let mut state = HistoryState::open(&dir).unwrap();
+        state.reload().unwrap();
+        assert_eq!(state.items().len(), 2);
+        assert!(state.set_query("alpha").unwrap());
+        assert_eq!(state.items().len(), 1);
+        assert_eq!(state.items()[0].id, "clip-1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

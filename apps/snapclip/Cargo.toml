@@ -27,6 +27,14 @@ win-icon-extractor = { version = "0.3", default-features = false, features = ["p
 # snapclip-history) is what keeps our own copy out of the history.
 arboard = "3.6"
 
+[features]
+# Test-only: `.test_support()` comes from gpui-kit's test-support feature. Forwarding it
+# through this crate's own feature is what keeps the production build free of test support
+# while `cargo test -p snapclip-app --features test-support` can find UI nodes by id.
+test-support = ["gpui-kit/test-support"]
+
 [dev-dependencies]
 # Test-only: the model tests build payload references, which are keyed by a blake3 hash.
 blake3 = "1.5"
+# Same version and source as the normal dependency, with the helpers the guides require.
+gpui-kit = { version = "0.7", features = ["test-support"] }

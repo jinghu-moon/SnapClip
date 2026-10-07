@@ -258,7 +258,7 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 | T3.4 | 资源对比 + 阶段验收 + tag `refactor-p3` | T3.3 | — | 低 | **暂缓（D2）** |
 | T4.1 + T4.1.1 | 开工前研读 + **前端功能迁移矩阵** | — | 1 表格 | 低 | [x]（guides 通读 + 矩阵填实；gpui-kit 0.7.1） |
 | T4.2 | `apps/snapclip` 骨架（init/Root/单窗口） | T4.1, T2.10（D2 解除了对 T3.4 的依赖） | ~5 文件 | 中 | [x]（包名 `snapclip-app`；构建 + 起窗 + 门禁全过） |
-| T4.3 | history 能力（Entity + 虚拟列表 + `ElementId`=clip id） | T4.2 | ~5 文件 | 高 | 部分 [x]（模型/图标/视图/接线/**回车复制**已落地；分页、删除确认、GPUI 级测试待续，见 §14.29/§14.30） |
+| T4.3 | history 能力（Entity + 虚拟列表 + `ElementId`=clip id） | T4.2 | ~6 文件 | 高 | 部分 [x]（模型/图标/视图/接线/回车复制/**GPUI 集成测试**已落地；分页、删除确认、缩略图待续，见 §14.29–§14.31） |
 | T4.4 | settings 能力（**新增**，不是迁移） | T4.3 | ~3 文件 | 中 | [ ] |
 | T4.4.1 | 两个窗口检测开关接成真实设置通道 | T4.4 | 3 文件 | 中 | [ ] |
 | T4.5 | 事件桥（`snapclip-model::AppEvent` + channel + 丢弃过期） | T4.3 | 2 文件 | 高 | [ ] |
@@ -2009,4 +2009,39 @@ T4.3 剩余（续做清单）：
 提交 SHA：见提交
 推送/tag：origin/main
 回退对象：f92ad9f
+```
+
+### §14.31 T4.3 第三片：GPUI 集成测试层（含一条被测试抓出来的真 bug）
+
+```
+任务编号：T4.3（第三片，§14.29 的第 4 条）
+状态：已验证 + 已推送
+分支：main
+前置提交/tag：52e6745（lib/bin 拆分）
+三条前置的落地方式（与 §14.29 记录一致，含一处与指南不同的取舍）：
+  1. lib target：`src/lib.rs` 暴露 `pub mod {clipboard, history}` + `pub fn run()`；`main.rs` 一行；
+  2. feature 转发：`[features] test-support = ["gpui-kit/test-support"]` +
+     `[dev-dependencies] gpui-kit = { version = "0.7", features = ["test-support"] }`。
+     **取舍**：指南要求把 `test-support` 放在 dev-dependency，但生产视图里也要调 `.test_support()`；
+     直接常开会让生产构建带上测试支持。所以用应用自己的 feature 转发，**测试时显式开**：
+     `cargo test -p snapclip-app --features test-support`。生产构建零测试支持。
+  3. 节点注册：组件 `Input` 只需 `.id("history-query")`（它自己注册，指南的示例也是这样）；
+     自绘节点 `div` 需要 `.id("history-status") + .role(Status) + .aria_label(...) + .test_support()`。
+新增测试 `apps/snapclip/tests/ui.rs`（`#[gpui_kit::test]` + `TestAppContext` + 真实 headless 窗口）：
+  覆盖**点击聚焦 → 输入 "alpha" → 列表过滤到 1 行且选中 clip-1 → 输入不匹配查询 → 列表空且无选中
+  （负例）→ Esc 清过滤 → 两行恢复**。
+**测试抓出的真 bug（这就是测试层的价值）**：第一次跑，输入框的值断言通过、但过滤断言失败
+  （0 vs 1）。分离实验：模型层同样查询**通过**（4/4，新增 `a_matching_query_keeps_only_that_row`），
+  所以问题不在搜索语义，而在视图——这个版本的 `InputState` 文本变化**不是**可通过
+  `cx.subscribe` 订阅的事件（指南自己的示例也是"在按钮回调里主动 `read` 值"的拉取风格）。
+  修法：改成**拉取式**——在视图已有的 `on_key_down` 里，对未处理的按键重读输入框并应用查询
+  （`set_query` 无变化时是空操作，所以导航键零成本）。改完测试通过。
+  **没有**为了让测试变绿而放宽断言：断言先被细分成"输入框的值"与"过滤结果"两段，前者用于定位根因。
+修改前测试：app 3（lib）；其余 capture 344 / history 49 / 壳 8 / model 20
+修改后测试：app **4 lib + 1 UI**（`cargo test -p snapclip-app --features test-support`）；
+           其余不变；`cargo check --workspace --all-targets` 0 warning
+人工验证：仍待用户（窗口内容、回车复制的真机效果）
+提交 SHA：见提交
+推送/tag：origin/main
+回退对象：52e6745
 ```

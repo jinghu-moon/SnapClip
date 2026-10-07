@@ -17,6 +17,9 @@ use gpui_kit::base::{StyledExt as _, v_virtual_list};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::*;
+// Only with the `test-support` feature: it registers nodes for `window.find("id")`.
+#[cfg(feature = "test-support")]
+use gpui_kit::test::TestSupportExt;
 use snapclip_history::image::decode_to_rgba8;
 use snapclip_model::{ClipSummary, PayloadKind};
 
@@ -51,10 +54,11 @@ impl HistoryView {
         // One unchanged size per row: the list virtualizes by offset, so it needs the
         // sizes up front rather than a measurement pass.
         let row_sizes = Rc::new(vec![size(px(0.0), px(ROW_HEIGHT_PX)); state.items().len()]);
-        cx.subscribe(&query, |this, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
-                this.apply_query(cx);
-            }
+        // Re-read the field on any input event rather than matching one variant: the query
+        // is whatever the field holds now, and `set_query` is a no-op when it did not change,
+        // so this cannot loop.
+        cx.subscribe(&query, |this, _, _event: &InputEvent, cx| {
+            this.apply_query(cx);
         })
         .detach();
         Self {
@@ -64,6 +68,20 @@ impl HistoryView {
             row_sizes,
             status: None,
         }
+    }
+
+    /// Read-only accessors for the rows the view is showing. Public because the UI
+    /// integration tests assert against them (`tests/ui.rs`).
+    pub fn items(&self) -> &[ClipSummary] {
+        self.state.items()
+    }
+
+    pub fn selected_id(&self) -> Option<&str> {
+        self.state.selected_id()
+    }
+
+    pub fn query(&self) -> &str {
+        self.state.query()
     }
 
     /// Re-run the current query and rebuild the row sizes.
@@ -174,7 +192,12 @@ impl Render for HistoryView {
                     "down" => this.move_selection(1, cx),
                     "escape" => this.clear_query(window, cx),
                     "enter" => this.copy_selected(cx),
-                    _ => {}
+                    // Pull, do not push: this InputState's text changes are not delivered as
+                    // a subscribe-able event in this version (the guides' own example reads
+                    // the field inside a handler for the same reason), so the view re-reads
+                    // the field on the keystrokes it types. `set_query` is a no-op when
+                    // nothing changed, so navigation keys cost nothing.
+                    _ => this.apply_query(cx),
                 }
             }))
             .child(
@@ -184,7 +207,11 @@ impl Render for HistoryView {
                     .p_3()
                     .border_b_1()
                     .border_color(theme.border)
-                    .child(Input::new(&self.query))
+                    .child({
+                        // Component inputs register themselves by id; only custom native
+                        // nodes need `.test_support()` (see the guides' example).
+                        Input::new(&self.query).id("history-query")
+                    })
                     .child(
                         div()
                             .text_xs()
@@ -196,10 +223,17 @@ impl Render for HistoryView {
                             }),
                     )
                     .children(self.status.clone().map(|status| {
-                        div()
+                        let node = div()
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .child(status)
+                            .child(status.clone());
+                        #[cfg(feature = "test-support")]
+                        let node = node
+                            .id("history-status")
+                            .role(gpui_kit::Role::Status)
+                            .aria_label(status)
+                            .test_support();
+                        node
                     })),
             )
             .child(if has_rows {
