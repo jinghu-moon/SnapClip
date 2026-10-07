@@ -17,6 +17,7 @@ use gpui_kit::*;
 
 pub mod clipboard;
 pub mod history;
+pub mod settings;
 
 use history::icons::SourceIcons;
 use history::model::HistoryState;

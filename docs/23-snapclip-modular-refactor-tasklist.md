@@ -259,7 +259,7 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 | T4.1 + T4.1.1 | 开工前研读 + **前端功能迁移矩阵** | — | 1 表格 | 低 | [x]（guides 通读 + 矩阵填实；gpui-kit 0.7.1） |
 | T4.2 | `apps/snapclip` 骨架（init/Root/单窗口） | T4.1, T2.10（D2 解除了对 T3.4 的依赖） | ~5 文件 | 中 | [x]（包名 `snapclip-app`；构建 + 起窗 + 门禁全过） |
 | T4.3 | history 能力（Entity + 虚拟列表 + `ElementId`=clip id） | T4.2 | ~6 文件 | 高 | 部分 [x]（模型/图标/视图/接线/回车复制/**GPUI 集成测试**已落地；分页、删除确认、缩略图待续，见 §14.29–§14.31） |
-| T4.4 | settings 能力（**新增**，不是迁移） | T4.3 | ~3 文件 | 中 | [ ] |
+| T4.4 | settings 能力（**新增**，不是迁移） | T4.3 | ~4 文件 | 中 | 部分 [x]（模型 + 持久化 + 到 capture 的桥已落地，见 §14.35；设置页与热更新待续） |
 | T4.4.1 | 两个窗口检测开关接成真实设置通道 | T4.4 | 3 文件 | 中 | 部分 [x]（**capture 侧整条链已通**：`DetectionOptions` 一路到 provider 的 builder；剩"设置页/持久化 → 壳传值"，那属于 T4.4；第二个开关无对应行为未发明。见 §14.32–§14.34） |
 | T4.5 | 事件桥（`snapclip-model::AppEvent` + channel + 丢弃过期） | T4.3 | 2 文件 | 高 | [ ] |
 | T4.6 | 托盘（Win32，**新建**） | T4.2 | 1 文件 | 中 | [ ] |
@@ -2154,4 +2154,45 @@ T4.3 剩余（续做清单）：
 提交 SHA：见提交（文档更正）
 推送/tag：origin/main
 回退对象：d9c4cdf
+```
+
+### §14.35 T4.4 第一半：设置模型 + 持久化 + 到 capture 的桥
+
+```
+任务编号：T4.4（第一半）
+状态：已验证 + 已推送
+分支：main
+前置提交/tag：58224c9（T4.4.1 收尾核对）
+新增：
+  apps/snapclip/src/settings/mod.rs    能力入口
+  apps/snapclip/src/settings/model.rs  `Settings`（`#[serde(default, rename_all)]`）+
+                                       `SettingsStore`（`<app data>/settings.json`，原子写）+
+                                       `Settings::detection_options()` → `DetectionOptions`（T4.4.1 的桥）
+  apps/snapclip/Cargo.toml             + `snapclip-capture`、`serde`、`serde_json`
+只建模**有真实消费方**的设置：`deep_select_text_runs`（默认 = `DEFAULT_ADOPT_TEXT_RUNS`，
+即产品当前行为）。计划里的 `deep_select_visible_wrappers` **仍然不建**——walk 里没有对应行为，
+一个改了没反应的开关比没有开关更糟，这条在模块注释里写明。
+加载策略（Design Guides 的"设置要能进得去"）：文件缺失 = 首次运行 → 默认值；
+文件损坏 → 打印一行并退回默认值（**不让一个偏好文件挡住应用启动**）；
+多字段/少字段都能加载（`serde(default)` + 忽略未知字段），所以新旧版本不会互相锁死。
+写盘用临时文件 + rename，崩了也不会留下半个文件。
+**一个必须记下的设计事实**：T4.4 的验收写着"改设置 → 立即生效（热更新到 overlay / recognize）"，
+但**P4 期间 overlay 仍然属于 Tauri 宿主**（GPUI 壳只拥有历史屏）。所以"热更新到 overlay"
+在 P6 之前**无法端到端达成**。可选的两条路，留待决策：
+  a. 让 Tauri 宿主也读同一个 `settings.json`（过渡期的临时接线，P6 时整段删除）；
+  b. 接受"设置先落盘、overlay 下次启动生效"，把端到端留到 P6。
+  我倾向 (b)：它是"不做临时兼容层"的直接推论，也避免在 P4 引入一条注定要删的跨壳通道。
+测试（4 条）：缺失文件＝首次运行且默认值＝今天的行为；保存/读取往返且**没有 .tmp 残留**；
+  损坏文件退回默认值；带未知字段的"别的版本写的"文件仍能加载。
+修改前测试：app 4 lib + 1 UI；其余 capture 344 / history 49 / 壳 8 / model 20
+修改后测试：app **8 lib** + 1 UI（+4 settings）；其余不变；
+          `cargo check --workspace --all-targets` 0 warning；依赖门禁三 crate 干净
+人工验证：不涉及（尚无界面）
+剩余（T4.4 第二半）：设置页（Design Guides 的 *Forms and settings* + `component/{setting,switch}.md`）、
+  把 `SettingsStore` 接到 `Shell`、把 `Settings::detection_options()` 传给 capture 的调用点
+  （替换现在的 `DetectionOptions::default()`），以及 §14.34 列的那条"非默认值传到
+  `FallbackDeepSelection`"的单测。
+提交 SHA：见提交
+推送/tag：origin/main
+回退对象：58224c9
 ```
