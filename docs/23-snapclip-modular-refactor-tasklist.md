@@ -244,7 +244,7 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 | T2.1 | `ArtifactRef`/`CaptureOutput` 在 `snapclip-model` 定死（**不建 crate**） | T1.10 | 2 文件 | 低 | [x]（`artifact.rs`，含 2 个测试） |
 | T2.2 | `snapclip-history` 骨架 | T2.1 | 3 文件 + 门禁扩展 | 低 | [x]（crate 建立、成员加入、依赖门禁覆盖三个 crate） |
 | T2.3 | 两个独立存储：`CaptureArtifactStore` + `ClipboardBlobStore` | T2.2 | 2 文件 + 错误类型 | 中 | [x]（含 5 个测试；cleanup/LRU 如实记为未实现） |
-| T2.4 | 切换 capture 导出链（搬 PNG 编码，改 `finish_artifact`） | T2.3 | ~4 文件 | 中 | [ ] |
+| T2.4 | 切换 capture 导出链（搬 PNG 编码，改 `finish_artifact`） | T2.3 | ~4 文件 | 中 | 部分 [x]（编码器已归位 history；**导出链签名切换未做**，见 §14.22） |
 | T2.5 | 拆 `store/mod.rs`（连接/仓库/迁移） | T2.4 | 1 595 行 | 高 | [ ] |
 | T2.6 | 迁移剪贴板 Windows 适配（6 文件） | T2.5 | 1 210 行 | 中 | [ ] |
 | T2.7 | 迁移 `clipboard_ingest`（去重/格式/publication） | T2.6 | 694 行 | 中 | [ ] |
@@ -1618,4 +1618,40 @@ tag 消息明确写了两件事：(1) 捕获已独立成 crate、接缝真实、
 提交 SHA：见提交
 推送/tag：origin/main
 回退对象：adc2c8d
+```
+
+### §14.22 T2.4 前半：图像编解码归位 `snapclip-history`
+
+```
+任务编号：T2.4（前半；导出链切换留待续做）
+状态：已验证 + 已推送
+分支：main
+前置提交/tag：fb54987（T2.3 + 误提交修正）
+为什么先做这半：T2.4 的后半（改 `finish_artifact` 的交付形态、删 capture 侧端口）动的是
+          **用户产物的导出链**（overlay → export worker → 落盘），需要一整段专注的编译-修正循环。
+          我把零风险、且是后半前提的那一步先落地，不在这时候起那个手术。
+修改范围：`src-tauri/src/infrastructure/image/encode.rs` → `crates/snapclip-history/src/image.rs`
+          （git mv；202 行 + 3 个测试；只加模块头注释，代码一字未改）；
+          history `lib.rs` 加 `pub mod image;`；
+          壳的 `infrastructure/image/mod.rs` 改成名字转发。
+为什么整模块搬：它的两个使用者**都属于 history**——artifact 编码器（T2.4 后半）与
+          clipboard 图片归一化（T2.6）。留在壳里只会让 T2.6 再搬一次。
+修改前测试：capture 345 / 壳 57 / history 5 / model 16
+修改后测试：history **8 passed**（5 + 3 个搬来的编解码测试）；壳 **54 passed**（57 − 3）；
+          capture 345、model 16 不变；`cargo check --workspace --all-targets` 0 warning；
+          依赖门禁三 crate 干净
+性能指标：不涉及（纯搬移）
+人工验证：不涉及
+失败与根因：无。搬移后模块头与原文首行重复了一行，已清理。
+剩余（T2.4 后半，续做时的确切清单）：
+  1. `CaptureService` 去掉 `finish_artifact`/`encode_selection`/`write_artifact`
+     （只留 `prepare_selection`：GPU 侧裁切）；接口改成交付 `CaptureOutput { bytes, metadata }`。
+  2. 删 capture 侧的 `ArtifactDir`/`ArtifactEncoder` 与它们的测试替身（`FixedDir`/`CountingEncoder`）。
+  3. overlay 的 export executor（现在是注入的闭包 `Fn(&ExportJob) -> CaptureResult<CaptureArtifact>`，
+     overlay.rs 约 1158 行）改由壳提供：壳的 `ArtifactWriter` 实现 = history 编码 + `CaptureArtifactStore::write`
+     → 返回 `ArtifactRef` → 组成 `CaptureArtifact`。
+  4. 护栏：导出后立即校验字节数与指纹；真机截图 → 导出 → 历史可见 → 磁盘文件可打开。
+提交 SHA：见提交
+推送/tag：origin/main
+回退对象：fb54987
 ```

@@ -1,4 +1,10 @@
-//! PNG/BGRA codec helpers shared by clipboard normalisation and capture artifacts.
+//! Image encoding and decoding helpers (docs/23 T2.4).
+//!
+//! Moved from `src-tauri/src/infrastructure/image/encode.rs`: both of its users belong to
+//! this crate — the artifact store encodes capture pixels to PNG, and the clipboard
+//! adapter normalises clipboard images. Capture no longer knows how bytes become a PNG.
+//!
+//! Pure functions over byte buffers: no Win32, no GPU, no filesystem.
 
 use std::io::Cursor;
 
