@@ -242,6 +242,57 @@ fn the_filter_the_next_page_and_the_delete_flow_all_reach_the_screen(cx: &mut Te
     let _ = std::fs::remove_dir_all(&data);
 }
 
+/// T4.7's keyboard layer, plus the negative case that the focus fix exists for: the arrows
+/// belong to whichever of the two things owns them, and the wrong one must not react.
+#[gpui_kit::test]
+fn the_arrows_belong_to_the_list_and_the_field_keeps_them_while_it_types(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+
+    let data = temp_root("keyboard-ownership");
+    {
+        let store = Store::open(&data).expect("open store");
+        save_text(&store, "clip-1", "first entry");
+        save_text(&store, "clip-2", "second entry");
+    }
+    let state = HistoryState::open(&data).expect("open history");
+    let icons = SourceIcons::new(data.join("icons")).expect("icons");
+
+    let mut view: Option<Entity<HistoryView>> = None;
+    let handle = cx.open_window(size(px(640.), px(480.)), |window, cx| {
+        let view_entity =
+            cx.new(|cx| HistoryView::new(state, icons, EventBus::new(), window, cx));
+        view = Some(view_entity.clone());
+        Root::new(view_entity, window, cx)
+    });
+    let view = view.expect("view constructed");
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        // The list owns the keyboard when the screen opens, so navigation works immediately.
+        assert_eq!(view.read(cx).selected_id(), Some("clip-2"));
+        window.press("down", cx);
+        assert_eq!(view.read(cx).selected_id(), Some("clip-1"));
+        window.press("up", cx);
+        assert_eq!(view.read(cx).selected_id(), Some("clip-2"));
+
+        // Now the search field takes it: typing must filter, and the arrows must move the
+        // caret instead of the selection. Without the focus handle this moved the selection.
+        window.click("history-query", cx);
+        window.input("entry", cx);
+        assert_eq!(window.find("history-query").value(), Some("entry"));
+        let before = view.read(cx).selected_id().map(str::to_string);
+        window.press("down", cx);
+        assert_eq!(
+            view.read(cx).selected_id().map(str::to_string),
+            before,
+            "the field was typing: the list must not steal the arrow keys"
+        );
+    })
+    .unwrap();
+
+    let _ = std::fs::remove_dir_all(&data);
+}
+
 /// The settings page's acceptance is "change it, and the change is real": a switch that
 /// only looks toggled is the failure mode this catches.
 #[gpui_kit::test]

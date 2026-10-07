@@ -2374,6 +2374,47 @@ API 又一次"不凭记忆"救场：`Switch::new(...).checked(...).label(...).on
 回退对象：43dc2e7
 ```
 
+### §14.43 T4.7 测试三层 + 无障碍尖刺（**尖刺结论：可用，门禁不降级**）
+
+```
+任务编号：T4.7
+状态：已完成（可自动化部分）；无障碍断言经实测**保留为硬门禁**
+分支：main
+前置提交/tag：096b2b2
+尖刺（先做的那件事）：把"无障碍断言"写成门禁之前，先验证当前版本真的能读到窗口的无障碍树。
+结论：**能**，而且不用另建一套测试状态。`gpui-base::test_support::ElementSnapshot` 直接从
+  **native accessibility 属性**取 `role / label / value / selected / checked / expanded /
+  disabled / bounds / visible / focused`；应用侧只要给自绘节点加 `.id(..)` + `.test_support()`
+  即可被 `window.find(id)` 命中。证据（不是推测）：
+    - `window.find("history-filter-all").selected() == Some(true)`，
+      点"图片"后翻转为 `Some(false)/Some(true)`（筛选条的语义状态来自 a11y 树，不是本地开关）
+    - `window.find("history-load-more").label() == Some("加载更多")`
+    - 既有用例里的 `window.find("history-query").focused() == Some(true)`（组件自带焦点绑定）
+  因此 docs/22 §10.2 的"降级为人工走查"预案**没有触发**，这条门禁保持为硬门禁。
+三层现状：
+  1. **纯函数层**（无窗口）：`snapclip-model` 23；`snapclip-history` 51；`snapclip-app` 30
+     —— 含事件总线的 generation 门、适配器把端口事件翻成 `AppEvent`、模型的分页/去重/筛选/删除、
+     托盘的菜单 id→命令映射与缓冲区边界。
+  2. **`#[gpui_kit::test]` + 真实窗口层**：`snapclip-app` 集成测试 **5 条**，全部驱动真实的
+     按键/点击/滚动目标，断言"用户看得见的结果"：
+       - 打字筛选 + Escape 清空（含"输入框真的拿到了文本"这条前置断言）
+       - 类型筛选 / 下一页 / 删除确认（取消与确认两条路径，确认走 dialog 作用域里的 `ok`）
+       - 键盘归属：列表持焦时 ↑/↓ 移动选中，**输入框持焦时 ↓ 不得移动选中**（焦点根因的护栏）
+       - 事件桥：另一个线程写库 + 发 `AppEvent::Clipboard` → 屏幕出现新行
+       - 设置开关：真的写进 `settings.json`（不是只看起来切换了）
+  3. **真实窗口/真机层**：托盘图标创建与移除（`--ignored`，本机桌面会话实跑通过）；
+     截图 overlay 的 UIA/MSAA 探针仍是原门禁，未变更。
+T4.7 验收对照：
+  - "历史列表键盘操作" ✅（新增键盘归属用例，含负例）
+  - "设置热更新" ⚠️ 只到"写入落盘 + 启动读取"；**热更新到 overlay 仍受 D 决策阻塞**
+    （overlay 归 Tauri 宿主，P6 后接线；已记账，不是遗漏）
+  - "托盘退出" ⚠️ 图标创建/移除与线程 join 已实测；"系统菜单点一下"无法脚本化（菜单由系统绘制），
+    请真机点一次
+提交 SHA：见提交
+推送/tag：origin/main
+回退对象：096b2b2
+```
+
 ### §14.39 T4.8 第一半：GPUI 壳 vs Tauri 宿主 + WebView2（debug 实测）
 
 ```
