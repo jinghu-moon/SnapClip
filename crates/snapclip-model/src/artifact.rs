@@ -9,8 +9,10 @@
 //!   file is, what it is, how big, and a `blake3` fingerprint computed **at write time**
 //!   so readers never have to re-read a file to identify it.
 //!
-//! Until T2.4 the write path is still `CaptureArtifact` + `ArtifactDir` (see
-//! `snapclip-capture::artifact`); these types are defined first so the switch has a target.
+//! Since T2.4 the write path is the shell's `ArtifactWriter` port over
+//! `snapclip-history`'s `CaptureArtifactStore`: capture hands over pixels, history encodes
+//! and writes, and `CaptureArtifact` (the domain result the rest of the app reads) is
+//! built from the `ArtifactRef` that comes back.
 
 use std::path::PathBuf;
 

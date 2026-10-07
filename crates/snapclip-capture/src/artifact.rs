@@ -1,60 +1,39 @@
-//! Capture artifact production.
+//! The GPU-side half of artifact production (docs/23 T2.4).
 //!
-//! Takes the frozen frame the overlay was showing, crops the confirmed selection
-//! out of it and turns it into a durable [`CaptureArtifact`] — without ever
-//! touching the clipboard, the store or OCR.
+//! Takes the frozen frame the overlay is showing, validates the confirmed selection,
+//! crops that region out and hands back [`SelectionPixels`]. That is where capture's job
+//! ends: turning pixels into a PNG and putting that file somewhere belongs to storage, so
+//! the composition root supplies a [`crate::ports::ArtifactWriter`] and this crate never
+//! learns what a PNG is.
 //!
-//! The overlay owns the GPU texture, so it supplies pixels through
-//! [`PixelSliceSource`]; the service owns everything after that (validation,
-//! encoding, atomic file write). The two halves are deliberately separate methods
-//! — [`CaptureService::prepare_selection`] is the only one that may touch the GPU,
-//! so it runs on the overlay thread, while [`CaptureService::finish_artifact`] is
-//! GPU-free and runs on the export worker.
-
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+//! The two halves used to be two methods on one service (`prepare_selection` on the
+//! overlay thread, `finish_artifact` on the export worker). Only the first survives here;
+//! the second is the writer port, implemented by the shell over `snapclip-history`'s
+//! encoder and [`CaptureArtifactStore`]. The split is why the overlay thread still owns
+//! the readback: the frozen texture lives on the single-threaded D3D11 immediate context.
+//!
+//! [`CaptureArtifactStore`]: https://docs.rs/snapclip-history
 
 use crate::geometry::Rect;
 use crate::session::CapturedFrame;
 use crate::{CaptureError, CaptureResult};
-use snapclip_model::{CaptureArtifact, CapturePayload};
 
 /// Supplies the pixels of the frozen frame that the overlay is displaying.
 ///
-/// Implementations borrow their frame, so consumers take `&impl PixelSliceSource`
-/// rather than a trait object: the capture path never needs to store one.
+/// Implementations borrow their frame, so consumers take `&dyn PixelSliceSource` rather
+/// than a stored trait object: the capture path never needs to keep one.
 pub trait PixelSliceSource {
     /// Read BGRA8 pixels of `region` (monitor-local physical pixels, top-down,
     /// tightly packed) from the frozen frame.
     fn read_bgra(&self, region: Rect) -> CaptureResult<Vec<u8>>;
 }
 
-/// Encodes pixels into an artifact payload.
-pub trait ArtifactEncoder: Send + Sync + 'static {
-    fn encode_png(&self, width: u32, height: u32, bgra: &[u8]) -> CaptureResult<Vec<u8>>;
-}
-
-/// Directory where capture artifacts may be written. Supplied by the application
-/// root so platform code never invents paths.
-pub trait ArtifactDir: Send + Sync + 'static {
-    fn artifact_dir(&self) -> PathBuf;
-}
-
-static ARTIFACT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-/// Produces capture artifacts.
-pub struct CaptureService<D, E> {
-    artifacts: D,
-    encoder: E,
-}
-
-/// The pixels of one validated selection, ready to be encoded.
+/// The pixels of one validated selection, ready to be handed over.
 ///
-/// Reading them is the only step that touches the frozen frame, and on the WGC path
-/// that means the D3D11 immediate context — which the overlay's Direct2D rendering
-/// uses too and which is single-threaded. So this is produced on the overlay thread
-/// and handed to the export worker, which owns everything slower (encode, write).
+/// Reading them is the only step that touches the frozen frame, and on the WGC path that
+/// means the D3D11 immediate context — which the overlay's Direct2D rendering uses too
+/// and which is single-threaded. So this is produced on the overlay thread and handed to
+/// the export worker, which owns everything slower (encode, write).
 #[derive(Debug, Clone)]
 pub struct SelectionPixels {
     pub frame: CapturedFrame,
@@ -64,22 +43,20 @@ pub struct SelectionPixels {
     pub bgra: Vec<u8>,
 }
 
-impl<D, E> CaptureService<D, E>
-where
-    D: ArtifactDir,
-    E: ArtifactEncoder,
-{
-    pub fn new(artifacts: D, encoder: E) -> Self {
-        Self {
-            artifacts,
-            encoder,
-        }
+/// Validates a selection and reads it back from the frozen frame.
+///
+/// Stateless: it holds no encoder and no directory, because neither is capture's to own.
+pub struct CaptureService;
+
+impl CaptureService {
+    pub fn new() -> Self {
+        Self
     }
 
     /// Validate `selection` and read exactly that region back from the frame.
     ///
-    /// The readback is region-sized by construction: a 300x200 selection on a 4K
-    /// monitor transfers 300·200·4 bytes, not the monitor (docs/11 §Phase 3).
+    /// The readback is region-sized by construction: a 300x200 selection on a 4K monitor
+    /// transfers 300·200·4 bytes, not the monitor (docs/11 §Phase 3).
     pub fn prepare_selection(
         &self,
         frame: &CapturedFrame,
@@ -101,55 +78,11 @@ where
             bgra,
         })
     }
+}
 
-    /// Encode prepared pixels and write them atomically.
-    ///
-    /// Deliberately free of any GPU or frame reference so it can run on the export
-    /// worker while the overlay keeps pumping messages.
-    pub fn finish_artifact(
-        &self,
-        session_id: &str,
-        prepared: &SelectionPixels,
-        dpi: u32,
-        monitor_device_name: Option<String>,
-    ) -> CaptureResult<CaptureArtifact> {
-        let width = prepared.region.width() as u32;
-        let height = prepared.region.height() as u32;
-        let png = self.encoder.encode_png(width, height, &prepared.bgra)?;
-        let path = self.write_artifact(session_id, &png)?;
-        Ok(CaptureArtifact {
-            session_id: session_id.to_string(),
-            width,
-            height,
-            dpi,
-            pixel_format: prepared.frame.pixel_format,
-            captured_at_unix_ms: prepared.frame.captured_at_unix_ms,
-            monitor_device_name,
-            payload: CapturePayload::PngFile { path },
-        })
-    }
-
-    /// Encode a prepared selection into PNG bytes without touching the filesystem.
-    pub fn encode_selection(&self, prepared: &SelectionPixels) -> CaptureResult<Vec<u8>> {
-        self.encoder.encode_png(
-            prepared.region.width() as u32,
-            prepared.region.height() as u32,
-            &prepared.bgra,
-        )
-    }
-
-    /// Write the PNG atomically into the artifact directory.
-    pub fn write_artifact(&self, session_id: &str, png: &[u8]) -> CaptureResult<PathBuf> {
-        let directory = self.artifacts.artifact_dir();
-        fs::create_dir_all(&directory).map_err(|error| {
-            CaptureError::EncodeFailed(format!("create artifact directory failed: {error}"))
-        })?;
-        let sequence = ARTIFACT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path = directory.join(format!("{session_id}-{sequence}.png"));
-        write_atomically(&path, png).map_err(|error| {
-            CaptureError::EncodeFailed(format!("write artifact failed: {error}"))
-        })?;
-        Ok(path)
+impl Default for CaptureService {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -169,50 +102,16 @@ pub fn validate(frame: &CapturedFrame, selection: Rect) -> CaptureResult<Rect> {
     Ok(clipped)
 }
 
-fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let temporary = path.with_extension("png.tmp");
-    fs::write(&temporary, bytes)?;
-    match fs::rename(&temporary, path) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = fs::remove_file(&temporary);
-            Err(error)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{CaptureService, PixelSliceSource, SelectionPixels, validate};
     use crate::geometry::Rect;
+    use crate::session::CapturedFrame;
+    use crate::{CaptureError, CaptureResult};
     use snapclip_model::PixelFormat;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    struct FixedDir(PathBuf);
-
-    impl ArtifactDir for FixedDir {
-        fn artifact_dir(&self) -> PathBuf {
-            self.0.clone()
-        }
-    }
-
-    struct CountingEncoder {
-        calls: AtomicU64,
-    }
-
-    impl ArtifactEncoder for CountingEncoder {
-        fn encode_png(&self, width: u32, height: u32, bgra: &[u8]) -> CaptureResult<Vec<u8>> {
-            self.calls.fetch_add(1, Ordering::Relaxed);
-            // Deterministic fake PNG: header + dimensions + first pixel.
-            let mut png = vec![0x89, b'P', b'N', b'G'];
-            png.extend_from_slice(&width.to_le_bytes());
-            png.extend_from_slice(&height.to_le_bytes());
-            png.extend_from_slice(&bgra[..4.min(bgra.len())]);
-            Ok(png)
-        }
-    }
-
-    /// Frame source whose pixels encode their own coordinates, so cropping is
-    /// verifiable.
+    /// Frame source whose pixels encode their own coordinates, so cropping is verifiable.
     struct GridPixels {
         width: i32,
         height: i32,
@@ -253,109 +152,53 @@ mod tests {
         }
     }
 
-    /// The two pipeline halves run back to back, as the export worker does.
-    fn produce<D: ArtifactDir, E: ArtifactEncoder>(
-        service: &CaptureService<D, E>,
-        session_id: &str,
-        frame: &CapturedFrame,
-        selection: Rect,
-        dpi: u32,
-        device_name: Option<String>,
-        pixels: &dyn PixelSliceSource,
-    ) -> CaptureResult<CaptureArtifact> {
-        let prepared = service.prepare_selection(frame, selection, pixels)?;
-        service.finish_artifact(session_id, &prepared, dpi, device_name)
-    }
-
-    fn test_dir(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "snapclip-capture-service-{}-{name}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).unwrap();
-        path
+    fn prepared(frame: &CapturedFrame, selection: Rect, pixels: &dyn PixelSliceSource) -> SelectionPixels {
+        CaptureService::new()
+            .prepare_selection(frame, selection, pixels)
+            .unwrap()
     }
 
     #[test]
     fn crops_the_selection_out_of_the_frozen_frame() {
-        let dir = test_dir("crop");
-        let service = CaptureService::new(
-            FixedDir(dir.clone()),
-            CountingEncoder {
-                calls: AtomicU64::new(0),
-            },
-        );
         let pixels = GridPixels::new(100, 50);
-        let prepared = service
-            .prepare_selection(&frame(100, 50), Rect::new(10, 5, 13, 8), &pixels)
-            .unwrap();
+        let prepared = prepared(&frame(100, 50), Rect::new(10, 5, 13, 8), &pixels);
         assert_eq!(prepared.region, Rect::new(10, 5, 13, 8));
-        let png = service.encode_selection(&prepared).unwrap();
-        // 3x3 pixels, first pixel is (10, 5).
-        assert_eq!(&png[..4], &[0x89, b'P', b'N', b'G']);
-        assert_eq!(u32::from_le_bytes(png[4..8].try_into().unwrap()), 3);
-        assert_eq!(u32::from_le_bytes(png[8..12].try_into().unwrap()), 3);
-        assert_eq!(&png[12..16], &[10, 5, 0, 255]);
+        // 3x3 pixels, tightly packed, top-down, first pixel is (10, 5).
+        assert_eq!(prepared.bgra.len(), 3 * 3 * 4);
+        assert_eq!(&prepared.bgra[..4], &[10, 5, 0, 255]);
+        assert_eq!(&prepared.bgra[prepared.bgra.len() - 4..], &[12, 7, 0, 255]);
         assert_eq!(
             pixels.reads.load(Ordering::Relaxed),
             1,
             "one selection must cost exactly one region readback"
         );
-        let _ = fs::remove_dir_all(dir);
     }
 
-    /// The Phase 3 contract in service form: the bytes handed to the encoder are the
-    /// selection's, never the frame's.
+    /// The Phase 3 contract in service form: the bytes read are the selection's, never the
+    /// frame's.
     #[test]
     fn prepare_reads_only_the_selection_bytes() {
-        let dir = test_dir("region-bytes");
-        let service = CaptureService::new(
-            FixedDir(dir.clone()),
-            CountingEncoder {
-                calls: AtomicU64::new(0),
-            },
-        );
         let pixels = GridPixels::new(3840, 2160);
-        let prepared = service
-            .prepare_selection(&frame(3840, 2160), Rect::new(100, 100, 400, 300), &pixels)
-            .unwrap();
+        let prepared = prepared(&frame(3840, 2160), Rect::new(100, 100, 400, 300), &pixels);
         assert_eq!(prepared.bgra.len(), 300 * 200 * 4);
         assert_eq!(prepared.region.width(), 300);
         assert_eq!(prepared.region.height(), 200);
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
     fn selection_is_clipped_to_the_frame_before_readback() {
-        let dir = test_dir("clip");
-        let service = CaptureService::new(
-            FixedDir(dir.clone()),
-            CountingEncoder {
-                calls: AtomicU64::new(0),
-            },
-        );
         let pixels = GridPixels::new(100, 50);
-        let prepared = service
-            .prepare_selection(&frame(100, 50), Rect::new(95, 45, 200, 200), &pixels)
-            .unwrap();
+        let prepared = prepared(&frame(100, 50), Rect::new(95, 45, 200, 200), &pixels);
         assert_eq!(prepared.region, Rect::new(95, 45, 100, 50));
-        let _ = fs::remove_dir_all(dir);
+        assert_eq!(prepared.bgra.len(), 5 * 5 * 4);
     }
 
     #[test]
     fn empty_or_offscreen_selections_are_rejected() {
-        let dir = test_dir("reject");
-        let service = CaptureService::new(
-            FixedDir(dir.clone()),
-            CountingEncoder {
-                calls: AtomicU64::new(0),
-            },
-        );
         let pixels = GridPixels::new(100, 50);
         for selection in [Rect::default(), Rect::new(500, 500, 600, 600)] {
             assert!(matches!(
-                service.prepare_selection(&frame(100, 50), selection, &pixels),
+                CaptureService::new().prepare_selection(&frame(100, 50), selection, &pixels),
                 Err(CaptureError::InvalidState(_))
             ));
         }
@@ -364,7 +207,6 @@ mod tests {
             0,
             "no readback must happen for a rejected selection"
         );
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -375,77 +217,15 @@ mod tests {
                 Ok(vec![0; 4])
             }
         }
-        let dir = test_dir("wrong-size");
-        let service = CaptureService::new(
-            FixedDir(dir.clone()),
-            CountingEncoder {
-                calls: AtomicU64::new(0),
-            },
-        );
-        let error = service
+        let error = CaptureService::new()
             .prepare_selection(&frame(100, 50), Rect::new(0, 0, 10, 10), &WrongPixels)
             .unwrap_err();
         assert!(matches!(error, CaptureError::EncodeFailed(_)));
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn artifact_is_written_to_the_artifact_directory() {
-        let dir = test_dir("artifact");
-        let service = CaptureService::new(
-            FixedDir(dir.clone()),
-            CountingEncoder {
-                calls: AtomicU64::new(0),
-            },
-        );
-        let pixels = GridPixels::new(100, 50);
-        let artifact = produce(
-            &service,
-            "session-1",
-            &frame(100, 50),
-            Rect::new(1, 2, 6, 7),
-            144,
-            Some(r"\\.\DISPLAY2".into()),
-            &pixels,
-        )
-        .unwrap();
-        assert_eq!(artifact.session_id, "session-1");
-        assert_eq!((artifact.width, artifact.height), (5, 5));
-        assert_eq!(artifact.dpi, 144);
-        assert_eq!(artifact.monitor_device_name.as_deref(), Some(r"\\.\DISPLAY2"));
-        let path = artifact.png_path().unwrap().to_path_buf();
-        assert!(path.starts_with(&dir));
-        assert!(path.exists());
-        assert_eq!(fs::read(&path).unwrap().len(), 12 + 4);
-        // No temporary files may be left behind.
-        let leftovers = fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
-            .count();
-        assert_eq!(leftovers, 0);
-        let _ = fs::remove_dir_all(dir);
+    fn validate_clips_rather_than_rejecting_a_partly_offscreen_selection() {
+        let clipped = validate(&frame(100, 50), Rect::new(-10, -10, 10, 10)).unwrap();
+        assert_eq!(clipped, Rect::new(0, 0, 10, 10));
     }
-
-    #[test]
-    fn artifacts_get_unique_paths_within_a_session() {
-        let dir = test_dir("unique");
-        let service = CaptureService::new(
-            FixedDir(dir.clone()),
-            CountingEncoder {
-                calls: AtomicU64::new(0),
-            },
-        );
-        let first = service.write_artifact("session-1", b"a").unwrap();
-        let second = service.write_artifact("session-1", b"b").unwrap();
-        assert_ne!(first, second);
-        assert_eq!(fs::read(&first).unwrap(), b"a");
-        assert_eq!(fs::read(&second).unwrap(), b"b");
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    // The real-PNG half of the pipeline (`PngArtifactEncoder`, `image::decode_to_bgra8`)
-    // is tested in the shell, where that encoder lives for all of P1 — see
-    // `src-tauri/src/application/capture_service.rs`. The tests here use a fake encoder
-    // on purpose: this crate must not know how bytes become PNG.
 }

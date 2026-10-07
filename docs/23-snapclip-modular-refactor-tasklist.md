@@ -244,7 +244,7 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 | T2.1 | `ArtifactRef`/`CaptureOutput` 在 `snapclip-model` 定死（**不建 crate**） | T1.10 | 2 文件 | 低 | [x]（`artifact.rs`，含 2 个测试） |
 | T2.2 | `snapclip-history` 骨架 | T2.1 | 3 文件 + 门禁扩展 | 低 | [x]（crate 建立、成员加入、依赖门禁覆盖三个 crate） |
 | T2.3 | 两个独立存储：`CaptureArtifactStore` + `ClipboardBlobStore` | T2.2 | 2 文件 + 错误类型 | 中 | [x]（含 5 个测试；cleanup/LRU 如实记为未实现） |
-| T2.4 | 切换 capture 导出链（搬 PNG 编码，改 `finish_artifact`） | T2.3 | ~4 文件 | 中 | 部分 [x]（编码器已归位 history；**导出链签名切换未做**，见 §14.22） |
+| T2.4 | 切换 capture 导出链（搬 PNG 编码，改 `finish_artifact`） | T2.3 | ~6 文件 | 中 | [x]（两半都完成：编码器归位 + 导出链切到 `ArtifactWriter` 端口，见 §14.22/§14.23） |
 | T2.5 | 拆 `store/mod.rs`（连接/仓库/迁移） | T2.4 | 1 595 行 | 高 | [ ] |
 | T2.6 | 迁移剪贴板 Windows 适配（6 文件） | T2.5 | 1 210 行 | 中 | [ ] |
 | T2.7 | 迁移 `clipboard_ingest`（去重/格式/publication） | T2.6 | 694 行 | 中 | [ ] |
@@ -1654,4 +1654,49 @@ tag 消息明确写了两件事：(1) 捕获已独立成 crate、接缝真实、
 提交 SHA：见提交
 推送/tag：origin/main
 回退对象：fb54987
+```
+
+### §14.23 T2.4 后半：导出链切到 `ArtifactWriter` 端口
+
+```
+任务编号：T2.4（后半，完成）
+状态：已验证 + 已推送
+分支：main
+前置提交/tag：8bdf44b（T2.4 前半）
+契约变化（按 P1 交付协议，这个签名只改这一次）：
+  - `CaptureService<D, E>` → **`CaptureService`（无泛型）**，只留 `prepare_selection`
+    （GPU 侧：校验 + 裁切 + 区域回读）。`finish_artifact`/`encode_selection`/`write_artifact`
+    与 `ArtifactDir`/`ArtifactEncoder` 两个端口、以及它们的测试替身（`FixedDir`/`CountingEncoder`）
+    **全部删除**。
+  - 新增端口
+    `ports::ArtifactWriter { write(session_id, prepared, dpi, monitor_device_name) -> CaptureResult<CaptureArtifact> }`
+    ——签名刻意与旧 `finish_artifact` 一致，所以 overlay 里那个注入的 export executor 闭包
+    只换了被调方；导出线程模型、damage 合并、present 计量一概未动。
+  - 壳侧新增 `app/artifact_writer.rs`：`HistoryArtifactWriter` = `snapclip-history::image::encode_png`
+    + `CaptureArtifactStore::write` → `ArtifactRef` → 组成 `CaptureArtifact`（域类型仍是
+    `CapturePayload::PngFile { path }`；`ArtifactRef` 更丰富的描述留在存储层，将来要不要带进领域是独立一步）。
+  - 壳的 `AppArtifactDir` 与 `application/capture_service.rs` 删除（组合根不再自己编码）。
+覆盖校验：
+  `ArtifactDir`/`ArtifactEncoder`/`PngArtifactEncoder`/`FixedDir`/`CountingEncoder`/`finish_artifact`/
+  `write_artifact`/`encode_selection` 在代码中**归零**（仅剩两处文档注释提到旧名，其中一处已改写）；
+  `cargo tree -p snapclip-capture -e normal` 中**没有** `snapclip-history`（方向要求达成）。
+修改前测试：capture 345 / 壳 54 / history 8 / model 16
+修改后测试：capture **344**（artifact 的 7 个测试重写为 6 个：保留裁切/区域字节/越界裁切/拒绝/
+          尺寸不符，新增 validate 的越界裁剪；"写盘"类测试由 history 的 `CaptureArtifactStore` 承担）；
+          壳 **53**（原 `capture_service.rs` 3 个测试 → `artifact_writer.rs` 2 个：真 PNG 往返 +
+          "无剪贴板/无库/无 OCR 也能产出可读产物"）；history 8、model 16 不变；
+          `cargo check --workspace --all-targets` 0 warning；依赖门禁三 crate 干净
+护栏（§5/§14.22 要求）：
+  - "导出后校验可读 + 指纹"：writer 单测把写出的文件**再解码回 BGRA** 并逐像素比对；
+    指纹在 `CaptureArtifactStore::write` 写入时算出，其测试用独立 blake3 复核、`read()` 也会复核。
+  - 真机：构建后启动正常（`overlay ready 46ms`、`clipboard pipeline ready 54ms`）；
+    **按 F5 走一次"截图 → 导出 → 历史可见 → 磁盘文件可打开"仍待用户**（脚本无法在用户屏幕上按键）。
+性能指标：不涉及（导出线程模型未变，编码仍在导出工作线程上）
+人工验证：待用户 F5（同上）
+失败与根因：3 处编译红，全是"删端口后的连锁"：`ports.rs` 仍在 re-export 已删的两个 trait；
+          `window_host.rs` 的 `overlay_thread<D,E>` 还有泛型与 trait 约束；
+          `OverlayController::new(...)` 少传一个 `writer` 实参。按编译器提示逐个修完。
+提交 SHA：见提交
+推送/tag：origin/main
+回退对象：8bdf44b
 ```

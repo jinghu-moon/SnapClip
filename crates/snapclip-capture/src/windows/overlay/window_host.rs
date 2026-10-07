@@ -7,11 +7,7 @@
 
 use super::*;
 
-impl<D, E> OverlayMessageHandler for OverlayController<D, E>
-where
-    D: ArtifactDir,
-    E: ArtifactEncoder,
-{
+impl OverlayMessageHandler for OverlayController {
     unsafe fn handle(&mut self, message: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
         match message {
             WM_OVERLAY_COMMAND => {
@@ -477,17 +473,15 @@ pub(super) fn point_from_lparam(lparam: LPARAM) -> POINT {
     }
 }
 
-pub(super) fn overlay_thread<D, E>(
-    service: Arc<CaptureService<D, E>>,
+pub(super) fn overlay_thread(
+    service: Arc<CaptureService>,
     sink: Arc<dyn CaptureEventSink>,
     clipboard: Arc<dyn ClipboardWriter>,
+    writer: Arc<dyn ArtifactWriter>,
     shared: Arc<Mutex<OverlayShared>>,
     annotation_rx: mpsc::Receiver<AnnotationCommand>,
     ready: mpsc::SyncSender<SystemResult>,
-) where
-    D: ArtifactDir,
-    E: ArtifactEncoder,
-{
+) {
     // Force the thread message queue into existence before the thread id is
     // published, so `PostThreadMessageW` cannot race with queue creation.
     let mut message: MSG = unsafe { zeroed() };
@@ -587,6 +581,7 @@ pub(super) fn overlay_thread<D, E>(
             service,
             sink,
             clipboard,
+            writer,
             shared,
             annotation_rx,
             window,

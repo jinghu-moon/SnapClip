@@ -40,10 +40,10 @@ pub mod window_detection;
 pub mod windows;
 
 pub use artifact::{
-    ArtifactDir, ArtifactEncoder, CaptureService, PixelSliceSource, SelectionPixels,
+    CaptureService, PixelSliceSource, SelectionPixels,
 };
 pub use error::{CaptureError, CaptureResult};
-pub use ports::{CaptureEventSink, ClipboardWriter, OverlayPlatform};
+pub use ports::{ArtifactWriter, CaptureEventSink, ClipboardWriter, OverlayPlatform};
 pub use runtime::CaptureRuntime;
 
 pub use snapclip_model::capture::{CaptureArtifact, CapturePayload, CaptureState, PixelFormat};

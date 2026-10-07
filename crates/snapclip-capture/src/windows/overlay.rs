@@ -56,14 +56,12 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::artifact::{
-    ArtifactEncoder, ArtifactDir, CaptureService, SelectionPixels,
-};
+use crate::artifact::{CaptureService, SelectionPixels};
 use crate::annotation::{
     AnnotationCommand, AnnotationDocument, AnnotationGeometry, AnnotationHandle, AnnotationId,
     AnnotationItem, AnnotationKind, DocumentSnapshot,
 };
-use crate::ports::{CaptureEventSink, ClipboardWriter, OverlayPlatform};
+use crate::ports::{ArtifactWriter, CaptureEventSink, ClipboardWriter, OverlayPlatform};
 use crate::diagnostics::WindowDetectionMetrics;
 use crate::geometry::{
     Handle, LevelReach, MagnifierConfig, MonitorLayout, Point, Rect, ResizeMode, SelectionGeometry,
@@ -199,14 +197,12 @@ impl WindowsOverlay {
     ///
     /// Fails — rather than silently degrading — when `F5` cannot be registered, so
     /// the user learns about the conflict.
-    pub fn spawn_overlay<D, E>(
-        service: Arc<CaptureService<D, E>>,
+    pub fn spawn_overlay(
+        service: Arc<CaptureService>,
         sink: Arc<dyn CaptureEventSink>,
         clipboard: Arc<dyn ClipboardWriter>,
+        writer: Arc<dyn ArtifactWriter>,
     ) -> Result<Self, String>
-    where
-        D: ArtifactDir,
-        E: ArtifactEncoder,
     {
         let shared = Arc::new(Mutex::new(OverlayShared {
             state: CaptureState::Idle,
@@ -224,6 +220,7 @@ impl WindowsOverlay {
                     service,
                     sink,
                     clipboard,
+                    writer,
                     thread_shared,
                     annotation_rx,
                     ready_tx,
@@ -377,12 +374,10 @@ enum AnnotationGesture {
 }
 
 /// Owns every session-scoped resource. Lives only on the overlay thread.
-struct OverlayController<D, E>
-where
-    D: ArtifactDir,
-    E: ArtifactEncoder,
-{
-    service: Arc<CaptureService<D, E>>,
+struct OverlayController {
+    service: Arc<CaptureService>,
+    /// Encoding and writing, owned by the composition root (docs/23 T2.4).
+    writer: Arc<dyn ArtifactWriter>,
     sink: Arc<dyn CaptureEventSink>,
     /// Clipboard writes the overlay itself performs (the `C` colour copy).
     clipboard: Arc<dyn ClipboardWriter>,
@@ -515,15 +510,12 @@ where
     previous_foreground: HWND,
 }
 
-impl<D, E> OverlayController<D, E>
-where
-    D: ArtifactDir,
-    E: ArtifactEncoder,
-{
+impl OverlayController {
     fn new(
-        service: Arc<CaptureService<D, E>>,
+        service: Arc<CaptureService>,
         sink: Arc<dyn CaptureEventSink>,
         clipboard: Arc<dyn ClipboardWriter>,
+        writer: Arc<dyn ArtifactWriter>,
         shared: Arc<Mutex<OverlayShared>>,
         annotation_rx: mpsc::Receiver<AnnotationCommand>,
         window: HWND,
@@ -550,6 +542,7 @@ where
         exclusions.exclude_process(std::process::id());
         Self {
             service,
+            writer,
             sink,
             clipboard,
             shared,
@@ -1155,7 +1148,7 @@ where
         // The overlay is frozen at the confirmed selection until the export lands, so
         // cursor-follow repaints can neither race nor waste the hand-off.
         self.graphics_released = true;
-        let service = self.service.clone();
+        let writer = self.writer.clone();
         let job = ExportJob {
             generation: 0,
             session_id: session_id.clone(),
@@ -1164,7 +1157,7 @@ where
             monitor_device_name: None,
             notify_thread: unsafe { GetCurrentThreadId() },
             executor: Box::new(move |job: &ExportJob| {
-                service.finish_artifact(
+                writer.write(
                     &job.session_id,
                     &job.prepared,
                     job.dpi,

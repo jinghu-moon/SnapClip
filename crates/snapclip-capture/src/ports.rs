@@ -11,7 +11,7 @@ use super::geometry::MonitorLayout;
 use super::{CaptureError, CaptureResult};
 
 pub use crate::artifact::{
-    ArtifactDir, ArtifactEncoder, CaptureService, PixelSliceSource, SelectionPixels,
+    CaptureService, PixelSliceSource, SelectionPixels,
 };
 
 /// Receives low-frequency lifecycle events. Deliberately a trait so the capture
@@ -73,4 +73,22 @@ pub trait OverlayPlatform: Send + Sync + 'static {
 pub trait ClipboardWriter: Send + Sync + 'static {
     /// Copy `text`. Failures are the implementation's to log; they are never fatal.
     fn copy_text(&self, text: &str);
+}
+
+/// Turns a prepared selection into a durable artifact.
+///
+/// Owned by the composition root, because this is where encoding and writing meet: the
+/// store that writes PNGs lives in `snapclip-history`, and capture must not depend on it
+/// (docs/23 T2.4, and the dependency gate enforces exactly that). Capture's job ends at
+/// "here are the pixels the user selected, and the frame they came from".
+///
+/// Implementations run on the export worker thread, never on the overlay thread.
+pub trait ArtifactWriter: Send + Sync + 'static {
+    fn write(
+        &self,
+        session_id: &str,
+        prepared: &crate::artifact::SelectionPixels,
+        dpi: u32,
+        monitor_device_name: Option<String>,
+    ) -> crate::CaptureResult<snapclip_model::CaptureArtifact>;
 }

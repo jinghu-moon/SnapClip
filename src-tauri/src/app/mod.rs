@@ -18,6 +18,7 @@ pub mod clipboard;
 pub mod ocr_queue;
 pub mod ocr_events;
 pub mod clipboard_writer;
+pub mod artifact_writer;
 
 use crate::domain::{IpcError, OcrErrorCode, OcrStatus};
 

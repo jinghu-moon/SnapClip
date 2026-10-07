@@ -1,37 +1,19 @@
 //! Capture feature composition: builds the overlay controller, the frame providers,
-//! the artifact service and the Tauri event sink.
+//! the artifact writer and the Tauri event sink.
 //!
-//! The event sink is the only place where capture meets Tauri. Everything below it
-//! works with domain types.
+//! This is the composition root the capture crate talks to through its ports: events go
+//! out through the Tauri sink, clipboard writes through the system writer, and finished
+//! selections through `HistoryArtifactWriter` (encode + store, both in
+//! `snapclip-history`).
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::application::capture_service::PngArtifactEncoder;
-use snapclip_capture::artifact::{ArtifactDir, CaptureService};
-use snapclip_capture::ports::{CaptureEventSink, ClipboardWriter};
+use crate::app::artifact_writer::HistoryArtifactWriter;
+use snapclip_capture::artifact::CaptureService;
+use snapclip_capture::ports::{ArtifactWriter, CaptureEventSink, ClipboardWriter};
 use snapclip_capture::runtime::CaptureRuntime;
 use crate::domain::{CaptureArtifact, CaptureState};
 use crate::events;
-
-/// Artifact directory: `<app local data>/artifacts/capture`.
-pub struct AppArtifactDir {
-    root: PathBuf,
-}
-
-impl AppArtifactDir {
-    pub fn new(app_local_data: impl Into<PathBuf>) -> Self {
-        Self {
-            root: app_local_data.into(),
-        }
-    }
-}
-
-impl ArtifactDir for AppArtifactDir {
-    fn artifact_dir(&self) -> PathBuf {
-        self.root.join("artifacts").join("capture")
-    }
-}
 
 /// Publishes capture lifecycle events to the front-end.
 pub struct TauriCaptureEventSink {
@@ -138,16 +120,21 @@ pub fn start(
     snapclip_capture::windows::monitor::set_per_monitor_v2_awareness()
         .map_err(|message| format!("DPI awareness: {message}"))?;
 
-    let artifacts = AppArtifactDir::new(app_local_data);
-    let service = Arc::new(CaptureService::new(artifacts, PngArtifactEncoder));
+    let service = Arc::new(CaptureService::new());
     let sink: Arc<dyn CaptureEventSink> = Arc::new(TauriCaptureEventSink::new(app.clone()));
     let clipboard: Arc<dyn ClipboardWriter> =
         Arc::new(crate::app::clipboard_writer::SystemClipboardWriter);
+    // Artifacts land in `<app local data>/artifacts/capture` (docs/11 §8.2); the writer
+    // is the only thing that knows how to turn pixels into a file.
+    let writer: Arc<dyn ArtifactWriter> = Arc::new(HistoryArtifactWriter::new(
+        app_local_data.join("artifacts").join("capture"),
+    ));
 
     let runtime = snapclip_capture::windows::overlay::WindowsOverlay::spawn_overlay(
         service,
         sink,
         clipboard,
+        writer,
     )
     .map_err(|message| format!("capture overlay: {message}"))?;
     app.manage(Arc::new(CaptureRuntime::from_platform(Box::new(runtime))));
