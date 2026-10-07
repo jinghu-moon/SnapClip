@@ -27,7 +27,7 @@
 
 | 阶段 | 门禁组 | 命令（在仓库根执行，除非另注） |
 | --- | --- | --- |
-| G0 · 旧 Tauri 阶段（P0–P0.5，以及 P1 迁移期间） | 完整 | `cargo test --lib --manifest-path src-tauri/Cargo.toml`<br>`cargo check --workspace --all-targets`<br>探针（见下） |
+| G0 · 旧 Tauri 阶段（P0–P0.5，以及 P1 迁移期间） | 完整 | `cargo test --lib --manifest-path src-tauri/Cargo.toml`<br>`cargo check --all-targets --manifest-path src-tauri/Cargo.toml`（**T0.3 之前没有 workspace 根**，此时 `--workspace` 会直接报 "could not find Cargo.toml"；T0.3 之后改用 `cargo check --workspace --all-targets`）<br>探针（见下，同样带 `--manifest-path`） |
 | G1 · workspace / capture / history / recognize 阶段（P1 之后） | 完整 | `cargo test --workspace --all-targets`<br>`cargo check --workspace --all-targets`<br>探针改为按包跑：`cargo test -p snapclip-capture --lib browser_element_probe -- --ignored --nocapture`（Explorer 同理） |
 | G2 · GPUI 阶段（P4 之后） | 完整 | `cargo test --workspace --all-targets`<br>`cargo test -p snapclip`（壳的 `#[gpui_kit::test]` / `VisualTestContext`）<br>G1 的探针仍然要跑 |
 
@@ -145,29 +145,34 @@ git switch <默认分支>
 > **历史参考**：V1 封版 tag `smart-snapping-v1-2026-10-07` 当时是 `398 passed / 5 ignored`；当前 HEAD 是 `403 / 6`（ring_contrast 那 5 个测试 + 1 个探针是 tag 之后加的）。两者不要混用。
 > **已知陷阱**：`docs/21 §10` 里有一行 `373 passed / 2 ignored`，那是 V1 之前的旧基线，**已经过期**；引用它会导致 T0.1 一开始就误判"基线不对"。
 
-| 门禁 | 生成命令 | 当前 HEAD 实测（2026-10-07） | 本阶段结果 |
+| 门禁 | 生成命令 | 当前 HEAD 实测（2026-10-07） | P0 · T0.1 复跑（2026-10-07，HEAD 0bd9191） |
 | --- | --- | --- | --- |
-| 单元测试 | `cargo test --lib --manifest-path src-tauri/Cargo.toml` | **403 passed / 0 failed / 6 ignored** | [ ] |
-| 静态检查 | `cargo check --workspace --all-targets` | 0 warnings | [ ] |
-| 浏览器探针 | `cargo test --lib browser_element_probe -- --ignored --nocapture` | `asserted=41 passed=41 failed=0` / `available=52` / `finer=0` | [ ] |
-| Explorer 探针 | `cargo test --lib explorer_rule_probe -- --ignored --nocapture` | `control_level_points=12/25` / `median_area_pct=65.8` / `available=25/25` / `finer=0` | [ ] |
-| A4 底色表 | `cargo test --lib ring_contrast_probe -- --ignored --nocapture` | 与 docs/21 §5.26 表格一致 | [ ] |
-| 真机会话汇总 | 真机 F5 → 看日志 | `over16ms=0`；`present_us` 量级 500–2000 µs | [ ] |
-| 字体子集门禁 | `cargo test --lib the_embedded_subset_covers_the_strings_the_overlay_draws` | 通过（子集 20.3 KB） | [ ] |
-| 事件契约 | `cargo test --lib` 里的 `ALL_EVENT_NAMES` 契约测试 | 通过（与 `src/shared/contracts.ts` 同步） | [ ] |
+| 单元测试 | `cargo test --lib --manifest-path src-tauri/Cargo.toml` | **403 passed / 0 failed / 6 ignored** | [x] `403 passed / 0 failed / 6 ignored`（一致） |
+| 静态检查 | `cargo check --workspace --all-targets` | 0 warnings | [x] 0 warnings（一致） |
+| 浏览器探针 | `cargo test --lib browser_element_probe -- --ignored --nocapture` | `asserted=41 passed=41 failed=0` / `available=52` / `finer=0` | [x] `asserted=41 passed=41 failed=0` / `available=52` / `finer=0`（一致） |
+| Explorer 探针 | `cargo test --lib explorer_rule_probe -- --ignored --nocapture` | `control_level_points=12/25` / `median_area_pct=65.8` / `available=25/25` / `finer=0` | [x] `control_level_points=12/25` / `median_area_pct=65.8` / `available=25/25` / `finer=0`（一致，本机有可见 Explorer 窗口） |
+| A4 底色表 | `cargo test --lib ring_contrast_probe -- --ignored --nocapture` | 与 docs/21 §5.26 表格一致 | [x] passed，底色表与 docs/21 §5.26 一致 |
+| 真机会话汇总 | 真机 F5 → 看日志 | `over16ms=0`；`present_us` 量级 500–2000 µs | [ ] **待人工**：agent 无法在你的机器上按 F5 观测 overlay，需你本地跑一次并把 `present_us`/`over16ms` 反馈回来 |
+| 字体子集门禁 | `cargo test --lib the_embedded_subset_covers_the_strings_the_overlay_draws` | 通过（子集 20.3 KB） | [x] 通过（随 403 一起跑绿） |
+| 事件契约 | `cargo test --lib` 里的 `ALL_EVENT_NAMES` 契约测试 | 通过（与 `src/shared/contracts.ts` 同步） | [x] 通过（随 403 一起跑绿） |
 
 > 迁移到 G1 之后，探针与字体门禁按 §0.2 换成 `-p snapclip-capture` 形式，**数字预期不变**；变了就是回归。
 
 ### 1.2 资源基线（P0 新测，before / after 两栏）
 
-| 指标 | 怎么测 | before | after（P0.5 之后） |
+| 指标 | 怎么测 | before（T0.2 实测，2026-10-07，HEAD 0bd9191，debug 构建） | after（P0.5 之后） |
 | --- | --- | --- | --- |
-| 进程数 / 线程数 | 任务管理器（详细信息），或下面的 PowerShell（表格里不能直接写竖线，命令放在表下方） | | |
-| 常驻内存 / GPU 内存 | 任务管理器对应列 | | |
-| 空闲 CPU（30 s 平均） | 任务管理器，静止不操作 | | |
-| 冷启动到可交互 | 启动日志 `setup begin` → `webview page_load Finished` 的 elapsed_ms | | |
-| 包体积 | 产物目录大小 + 主 exe 大小 | | |
-| 改一行共享 crate 的增量编译 | 改 `snapclip-model` 里一行注释后 `cargo check --workspace` 计时 | | |
+| 进程数 / 线程数 | 任务管理器（详细信息），或下面的 PowerShell（表格里不能直接写竖线，命令放在表下方） | **1 进程 / 18 线程**（`snapclip.exe`，debug） | |
+| WebView2 附加进程 | 同一时刻的 `msedgewebview2` 进程数，**减去应用关闭时的对照值** | **+6 进程**（运行 21 / 空闲 15） | |
+| 常驻内存（应用自身） | 上面的 PowerShell 的 `WorkingSet64` / `PrivateMemorySize64` | **37.7 MB WS / 6.8 MB 私有** | |
+| 常驻内存（含 WebView2） | 同上的 WebView2 差值 | **+342.2 MB WS**（运行 843.3 / 空闲 501.1） | |
+| GPU 内存 | 任务管理器"GPU 内存"列 | **未测**（需按 pid 归因的 GPU 计数器，本轮未采集） | |
+| 空闲 CPU（30 s 平均） | 应用启动静置后用 `TotalProcessorTime` 差值 ÷ 30 s ÷ 逻辑核数（20 核） | **~0.00 %**（30 s 内无可见增长，分辨率不足，只作量级参考） | |
+| 冷启动到可交互 | 启动日志 `setup begin` → `clipboard pipeline ready` 的 elapsed_ms | **68 ms**（`capture overlay ready` 58 ms；debug 构建） | |
+| 包体积 | 产物目录大小 + 主 exe 大小 | **exe 19.34 MB**（debug）；`dist/` 131.5 KB / 5 文件 | |
+| 改一行 → 增量检查 | T0.3 之前没有共享 crate：改 `src-tauri/src/lib.rs`（只动 mtime）后 `cargo check --manifest-path src-tauri/Cargo.toml` 计时。T0.3 之后改为"改 `snapclip-model` 一行后 `cargo check --workspace`" | **1.36 s**（只重编 `snapclip` 一个 crate） | |
+
+> **测量口径（可复现）**：`Start-Process src-tauri\target\debug\snapclip.exe -RedirectStandardOutput/-RedirectStandardError` + `-WindowStyle Hidden`，静置 10 s 后取进程快照，再采样 30 s CPU，最后 `Stop-Process` 并等 8 s 取对照。**`webview page_load Finished` 不能当"可交互"**：直接跑 debug exe 时前端走 `devUrl`（`http://localhost:1420`），没有 dev server 会反复重载（日志里会出现 500/1478/6488/36500 ms 多条 "Finished"），所以冷启动口径改用 `clipboard pipeline ready`（那之后 F5 已经可用）。
 
 进程/线程/内存的取数命令（在仓库根跑）：
 
@@ -207,7 +212,7 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 
 | 编号 | 任务 | 依赖 | 规模 | 风险 | 状态 |
 | --- | --- | --- | --- | --- | --- |
-| T0.1 | 复跑并记录正确性基线 | — | — | 低 | [ ] |
+| T0.1 | 复跑并记录正确性基线 | — | — | 低 | [x]（自动门禁全绿；真机 F5 待人工） |
 | T0.2 | 记录资源基线（before） | T0.1 | — | 低 | [ ] |
 | T0.3 | 建 workspace 骨架 | T0.1 | 2 文件 | 中（Tauri 构建） | [ ] |
 | T0.4 | 建 `snapclip-model` 骨架 | T0.3 | 3 文件 | 低 | [ ] |
@@ -286,15 +291,21 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 ### T0.3 建 workspace 骨架
 
 - 前置：T0.1
+- **开工前先修一个会静默毁掉整个重构的坑（T0.2 实测发现）**：`.gitignore` 里有一条 `crates/`，把整个 `crates/` 目录都忽略了。而 `crates/rapid-ocr-rs` 是**带自己 `.git` 的外部仓库**（`src-tauri/Cargo.toml` 用 `path = "../crates/rapid-ocr-rs"` 依赖它）。后果：T0.4/T1.1 之后新建的 `crates/snapclip-model`、`crates/snapclip-capture`… 全部**不会被 git 跟踪**——本地编译一切正常、提交里什么都没有、别人克隆下来直接崩。必须在 T0.3 一起改掉：
+  - `.gitignore`：`crates/` → `/crates/rapid-ocr-rs/`（只忽略外部仓库，自己的 crate 要跟踪）。
+  - 生成后立刻验证：`git check-ignore -v crates/snapclip-model/Cargo.toml` **必须无输出**（有输出就是还被忽略）。
 - 动作：
-  1. 根目录新增虚拟 workspace `Cargo.toml`：`[workspace] members = ["src-tauri", "crates/*", "apps/*"]`、`resolver = "2"`，需要时补 `[workspace.package]`/`[profile.release]`。
+  1. 根目录新增虚拟 workspace `Cargo.toml`：`[workspace] members = ["src-tauri", "crates/snapclip-*", "apps/*"]`、`resolver = "2"`、**`exclude = ["crates/rapid-ocr-rs"]`**，需要时补 `[workspace.package]`/`[profile.release]`。
+     - **不要用 `crates/*` 通配**：那会把外部仓库 `crates/rapid-ocr-rs` 卷进我们的 workspace（它有自己的 `Cargo.toml` 与 `Cargo.lock`，会报 "believes it's in a workspace when it's not" 或锁文件冲突）。用 `crates/snapclip-*` + `exclude` 双保险。
   2. 让现有 `src-tauri/Cargo.toml` 继承 workspace（保持 `[package]` 与 Tauri 配置不变）。
-  3. 确认 Cargo.lock 位置变化后，`cargo test --lib --manifest-path src-tauri/Cargo.toml` 与 `cargo check --workspace --all-targets` 都通过。
-  4. 真机跑一次 `npm run tauri dev`（或现有启动方式）+ F5，确认 Tauri 构建与 overlay 不受影响。
+  3. `crates/rapid-ocr-rs` 是 `optional = true` 的路径依赖，workspace 化后要确认 `cargo check --workspace --all-targets`（不带 `--features ocr-rapid`）与 `cargo check --workspace --all-targets --features ocr-rapid`（在 `src-tauri` 内）都仍然解析成功。
+  4. 确认 Cargo.lock 位置变化后，`cargo test --lib --manifest-path src-tauri/Cargo.toml` 与 `cargo check --workspace --all-targets` 都通过。
+  5. `git status --porcelain` 必须能看到根 `Cargo.toml`/`Cargo.lock`（如果看不到，说明第 0 步没做对）。
+  6. 真机跑一次 `npm run tauri dev`（或现有启动方式）+ F5，确认 Tauri 构建与 overlay 不受影响。
 - 必须保持：Tauri 构建可用；`tauri.conf.json`、前端构建脚本不变。
-- 验收：§0.2 的门禁全过；真机 F5 一次成功。
-- 回退：删除根 `Cargo.toml`，恢复 lock 位置。
-- 风险：中（Tauri CLI 与 workspace 的交互是唯一不确定点，用真机构建兜住）。
+- 验收：§0.2 的 G0 门禁全过；`git check-ignore` 对 `crates/snapclip-*` 无输出；真机 F5 一次成功。
+- 回退：删除根 `Cargo.toml`，恢复 `.gitignore` 与 lock 位置。
+- 风险：中（Tauri CLI 与 workspace 的交互是唯一不确定点，用真机构建兜住；其次是外部 crate 的 workspace 归属）。
 
 ### T0.4 建 `snapclip-model` 骨架
 
@@ -966,3 +977,30 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 - **数字必须来自实际命令输出**，不手写、不从旧文档抄（§1.1 已经踩过一次：`docs/21 §10` 的 `373/2` 是过期基线）。
 - 探针结果要写明是"第几次跑"（§0.3 的假红复跑规则）。
 - 出现"没做/没测"的部分，**明确写"未完成"**，不要用含糊表述掩盖（本项目禁止伪完成）。
+
+---
+
+## 14. 执行记录（按 §13.2 模板，逐任务追加）
+
+### T0.1 复跑并记录正确性基线
+
+```
+任务编号：T0.1
+状态：已推送（自动门禁部分）；真机 F5 一项待人工
+分支：main
+前置提交/tag：HEAD 0bd9191（回退基准 smart-snapping-v1-2026-10-07）
+修改范围：docs/23 §1.1 / §2 / §14（只读基线记录，无代码改动）
+修改前测试：—（本任务即建立基线）
+修改后测试：
+  cargo test --lib --manifest-path src-tauri/Cargo.toml → 403 passed / 0 failed / 6 ignored
+  cargo check --workspace --all-targets → 0 warnings
+  browser_element_probe（--ignored）→ asserted=41 passed=41 failed=0 / available=52 / finer=0（第 1 次跑，绿）
+  explorer_rule_probe（--ignored）→ control_level_points=12/25 / median_area_pct=65.8 / available=25/25 / finer=0（第 1 次跑，绿）
+  ring_contrast_probe（--ignored）→ passed，底色表与 docs/21 §5.26 一致
+性能指标：未测（真机 F5 会话汇总需人工，见 §1.1 真机行）
+人工验证：未做——agent 无法在用户机器上按 F5 观测 overlay
+失败与根因：无
+提交 SHA：<见本次提交>
+推送/tag：origin/main 已推送
+回退对象：0bd9191
+```
