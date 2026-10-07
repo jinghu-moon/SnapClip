@@ -8401,6 +8401,7 @@ dependencies = [
 name = "snapclip-app"
 version = "0.1.0"
 dependencies = [
+ "arboard",
  "blake3",
  "gpui-kit",
  "snapclip-history",

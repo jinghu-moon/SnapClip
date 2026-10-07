@@ -17,8 +17,10 @@ use gpui_kit::base::{StyledExt as _, v_virtual_list};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::*;
-use snapclip_model::ClipSummary;
+use snapclip_history::image::decode_to_rgba8;
+use snapclip_model::{ClipSummary, PayloadKind};
 
+use crate::clipboard::SystemClipboard;
 use super::icons::SourceIcons;
 use super::model::HistoryState;
 
@@ -31,6 +33,9 @@ pub struct HistoryView {
     query: Entity<InputState>,
     icons: SourceIcons,
     row_sizes: Rc<Vec<Size<Pixels>>>,
+    /// Result of the last command, shown as a status line: the Design Guides require the
+    /// result of an action to be visible, and a status line does not depend on hover.
+    status: Option<String>,
 }
 
 impl HistoryView {
@@ -57,6 +62,7 @@ impl HistoryView {
             query,
             icons,
             row_sizes,
+            status: None,
         }
     }
 
@@ -83,6 +89,41 @@ impl HistoryView {
             input.set_value("", window, cx);
         });
         self.apply_query(cx);
+    }
+
+    /// `Enter`: copy the selected entry back to the clipboard.
+    ///
+    /// The write goes through the shell's adapter, which also marks it as ours so the
+    /// clipboard monitor does not record our own copy as a new history entry.
+    fn copy_selected(&mut self, cx: &mut Context<Self>) {
+        let clipboard = SystemClipboard;
+        self.status = Some(match self.state.selected_payload_bytes() {
+            None => "Nothing selected".to_string(),
+            Some(Err(error)) => format!("Could not read the entry: {error}"),
+            Some(Ok((_payload, kind, bytes))) => {
+                let outcome = match kind {
+                    PayloadKind::Image => match decode_to_rgba8(&bytes) {
+                        Ok(decoded) => {
+                            let (width, height) = (decoded.width(), decoded.height());
+                            clipboard.copy_image(width, height, decoded.into_raw())
+                        }
+                        Err(error) => Err(format!("decode image failed: {error}")),
+                    },
+                    _ => match String::from_utf8(bytes) {
+                        Ok(text) => clipboard.copy_text(&text),
+                        Err(_) => Err("the entry is not text".to_string()),
+                    },
+                };
+                match outcome {
+                    Ok(()) => match kind {
+                        PayloadKind::Image => "Copied image".to_string(),
+                        _ => "Copied text".to_string(),
+                    },
+                    Err(error) => format!("Copy failed: {error}"),
+                }
+            }
+        });
+        cx.notify();
     }
 
     fn render_empty(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -132,6 +173,7 @@ impl Render for HistoryView {
                     "up" => this.move_selection(-1, cx),
                     "down" => this.move_selection(1, cx),
                     "escape" => this.clear_query(window, cx),
+                    "enter" => this.copy_selected(cx),
                     _ => {}
                 }
             }))
@@ -152,7 +194,13 @@ impl Render for HistoryView {
                                 1 => "1 entry".to_string(),
                                 n => format!("{n} entries"),
                             }),
-                    ),
+                    )
+                    .children(self.status.clone().map(|status| {
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(status)
+                    })),
             )
             .child(if has_rows {
                 v_virtual_list(

@@ -23,6 +23,10 @@ snapclip-history = { path = "../../crates/snapclip-history" }
 # (`src-tauri/src/icon.rs`): 32px renders crisply in a 16px row.
 win-icon-extractor = { version = "0.3", default-features = false, features = ["png", "cache"] }
 
+# Clipboard writes belong to the shell; `mark_clipboard_excluded` (below, through
+# snapclip-history) is what keeps our own copy out of the history.
+arboard = "3.6"
+
 [dev-dependencies]
 # Test-only: the model tests build payload references, which are keyed by a blake3 hash.
 blake3 = "1.5"

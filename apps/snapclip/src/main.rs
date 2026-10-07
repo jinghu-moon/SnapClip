@@ -16,6 +16,8 @@ use gpui_kit::component::{ActiveTheme, Root};
 use gpui_kit::*;
 
 mod history;
+// Clipboard writes belong to the shell (see the module docs for why).
+mod clipboard;
 
 use history::icons::SourceIcons;
 use history::model::HistoryState;

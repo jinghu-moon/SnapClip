@@ -258,7 +258,7 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 | T3.4 | 资源对比 + 阶段验收 + tag `refactor-p3` | T3.3 | — | 低 | **暂缓（D2）** |
 | T4.1 + T4.1.1 | 开工前研读 + **前端功能迁移矩阵** | — | 1 表格 | 低 | [x]（guides 通读 + 矩阵填实；gpui-kit 0.7.1） |
 | T4.2 | `apps/snapclip` 骨架（init/Root/单窗口） | T4.1, T2.10（D2 解除了对 T3.4 的依赖） | ~5 文件 | 中 | [x]（包名 `snapclip-app`；构建 + 起窗 + 门禁全过） |
-| T4.3 | history 能力（Entity + 虚拟列表 + `ElementId`=clip id） | T4.2 | ~4 文件 | 高 | 部分 [x]（模型/图标/视图/接线已落地；分页、回车复制、删除确认、GPUI 级测试待续，见 §14.29） |
+| T4.3 | history 能力（Entity + 虚拟列表 + `ElementId`=clip id） | T4.2 | ~5 文件 | 高 | 部分 [x]（模型/图标/视图/接线/**回车复制**已落地；分页、删除确认、GPUI 级测试待续，见 §14.29/§14.30） |
 | T4.4 | settings 能力（**新增**，不是迁移） | T4.3 | ~3 文件 | 中 | [ ] |
 | T4.4.1 | 两个窗口检测开关接成真实设置通道 | T4.4 | 3 文件 | 中 | [ ] |
 | T4.5 | 事件桥（`snapclip-model::AppEvent` + channel + 丢弃过期） | T4.3 | 2 文件 | 高 | [ ] |
@@ -1964,4 +1964,38 @@ T4.3 剩余（续做清单）：
 提交 SHA：见提交
 推送/tag：origin/main
 回退对象：d00057d
+```
+
+### §14.30 T4.3 第二片：Enter 复制（壳侧剪贴板适配器）
+
+```
+任务编号：T4.3（第二片）
+状态：已验证 + 已推送
+分支：main
+前置提交/tag：f92ad9f（T4.3 第一片）
+新增/改动：
+  apps/snapclip/src/clipboard.rs   `SystemClipboard`：`copy_text` / `copy_image`（arboard），
+                                   写完调用 `snapclip_history::windows::mark_clipboard_excluded()`
+  apps/snapclip/src/history/model.rs  `selected_payload_bytes()`：按 primary_kind 选中该行的
+                                   主载荷并读回字节；模型**不碰剪贴板**，只交出 (ref, kind, bytes)
+  apps/snapclip/src/history/view.rs   `Enter` → 复制选中项；文本按 UTF-8、图片经
+                                   `snapclip_history::image::decode_to_rgba8` 解成 RGBA 再写；
+                                   结果用**可见状态行**反馈（Design Guides 要求动作结果可见，
+                                   且不依赖悬停）
+为什么复制属于壳：谁写剪贴板谁就要**标记这次写入是自己的**，否则剪贴板监听会把我们的复制
+  当成新条目、历史会越复制越长。这个标记在 `snapclip-history` 的 Win32 适配器里，所以壳这层
+  很薄——和 Tauri 宿主 `app/clipboard_writer.rs` 是同一个形状。
+修改前后测试：app 3 passed（本片未新增单测：复制路径需要真实剪贴板，属 GPUI/真机层，
+            与 §14.29 的测试待办合并）；capture 344 / history 49 / 壳 8 / model 20 不变；
+            `cargo check --workspace --all-targets` 0 warning；依赖门禁干净
+人工验证：`snapclip-app.exe` 启动存活、无 stderr、退出无残留
+失败与根因：5 个编译错误，全是真实 API 差异：新模块忘了在 `main.rs` 声明；`when_some` 在
+          `Div` 上不存在（改用 `children(Option)`）；`decode_to_rgba8` 返回的是 image crate 的
+          `ImageBuffer`（用 `into_raw()` 取像素，不是自定义包装类型）；`PayloadKind` 没有 `Copy`
+          （一次 `clone()` 解决，别让枚举被移动）。
+仍未做（§14.29 同步更新）：分页（滚动到底 `load_more`）、删除（需先定后端语义 + 确认对话框）、
+          GPUI 级测试（`#[gpui_kit::test]` / `VisualTestContext`）、缩略图与 OCR 徽标、可达性（T4.6）。
+提交 SHA：见提交
+推送/tag：origin/main
+回退对象：f92ad9f
 ```

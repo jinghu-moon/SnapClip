@@ -8,7 +8,7 @@ use std::path::Path;
 
 use snapclip_history::store::Store;
 use snapclip_history::StoreError;
-use snapclip_model::ClipSummary;
+use snapclip_model::{ClipSummary, PayloadKind, PayloadRef};
 
 /// Rows fetched per page. The list is virtualized, so this is a paging decision only.
 /// `None` would let the store pick its own default; the shell asks for an explicit page.
@@ -92,6 +92,33 @@ impl HistoryState {
         if self.items.iter().any(|item| item.id == id) {
             self.selected = Some(id.to_string());
         }
+    }
+
+    /// The payload `Enter` would copy: the primary payload of the selected row.
+    ///
+    /// Returns the reference *and* its bytes, because the caller (the shell) is what turns
+    /// them into a clipboard write; the model never touches the clipboard.
+    pub fn selected_payload_bytes(
+        &self,
+    ) -> Option<Result<(PayloadRef, PayloadKind, Vec<u8>), StoreError>> {
+        let id = self.selected.as_deref()?;
+        let item = self.items.iter().find(|item| item.id == id)?;
+        let payload = item
+            .payloads
+            .iter()
+            .find(|payload| payload.kind == item.primary_kind)
+            .or_else(|| item.payloads.first())?
+            .clone();
+        // `PayloadKind` is a plain enum without `Copy`, so take the value once and reuse it.
+        let kind = payload.kind.clone();
+        let bytes = match self
+            .store
+            .read_payload_bytes(payload.content_hash.clone(), kind.clone())
+        {
+            Ok(bytes) => bytes,
+            Err(error) => return Some(Err(error)),
+        };
+        Some(Ok((payload, kind, bytes)))
     }
 
     /// Move the selection by `delta` rows, clamped to the loaded window.
