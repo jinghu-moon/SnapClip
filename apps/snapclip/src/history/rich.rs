@@ -11,6 +11,8 @@
 //! already turns `\par` / `\line` into newlines, which is exactly what the card's three-line
 //! preview consumes.
 
+use gpui_kit::{FontStyle, FontWeight, HighlightStyle, UnderlineStyle};
+
 /// One inline span of a clip, in our own vocabulary.
 ///
 /// `rclip_rtf`'s types stop at this module's edge: the view must not have to know what an RTF
@@ -167,6 +169,34 @@ pub fn spans_to_text(spans: &[Span]) -> String {
     spans.iter().map(|span| span.text.as_str()).collect()
 }
 
+/// One card line as GPUI wants it: the text, plus a highlight range per styled span.
+///
+/// The ranges are **UTF-8 byte offsets**, because that is what `StyledText::with_default_highlights`
+/// takes. Getting that wrong is invisible in English and wrong the moment the text is Chinese
+/// (three bytes per character), which is why this is a function with a test rather than five
+/// lines inlined at the call site.
+pub fn styled_line(spans: &[Span]) -> (String, Vec<(std::ops::Range<usize>, HighlightStyle)>) {
+    let mut text = String::new();
+    let mut highlights = Vec::new();
+    for span in spans {
+        let start = text.len();
+        text.push_str(&span.text);
+        if span.is_plain() {
+            continue;
+        }
+        highlights.push((
+            start..text.len(),
+            HighlightStyle {
+                font_weight: span.bold.then_some(FontWeight::BOLD),
+                font_style: span.italic.then_some(FontStyle::Italic),
+                underline: span.underline.then(UnderlineStyle::default),
+                ..Default::default()
+            },
+        ));
+    }
+    (text, highlights)
+}
+
 /// Cut spans down to the card's lines, keeping each span's style where it lands.
 ///
 /// This is the join between the two halves of the redesign: `card::preview_lines` decides how
@@ -277,7 +307,8 @@ pub fn spans_to_lines(spans: &[Span], max_lines: usize, max_chars: usize) -> Vec
 
 #[cfg(test)]
 mod tests {
-    use super::{Span, is_rtf, rtf_spans, spans_to_lines, spans_to_text};
+    use super::{Span, is_rtf, rtf_spans, spans_to_lines, spans_to_text, styled_line};
+    use gpui_kit::FontWeight;
 
     fn plain(text: &str) -> Span {
         Span {
@@ -356,6 +387,29 @@ mod tests {
         let lines = spans_to_lines(&[plain("a\nb")], 3, 40);
         assert_eq!(lines.len(), 2);
         assert!(!lines[1][0].text.contains('…'));
+    }
+
+    /// The highlight ranges must be byte offsets, not character offsets.
+    ///
+    /// English hides this bug; Chinese exposes it: 加粗 is 6 bytes for 2 characters, so a
+    /// character-based range would highlight the wrong slice — or panic on a range past the end.
+    #[test]
+    fn highlight_ranges_are_byte_offsets_so_chinese_is_not_mis_highlighted() {
+        let spans = vec![plain("前"), bold("加粗"), plain("后")];
+        let (text, highlights) = styled_line(&spans);
+        assert_eq!(text, "前加粗后");
+        assert_eq!(highlights.len(), 1);
+        let (range, style) = &highlights[0];
+        assert_eq!(range.start, "前".len(), "the range starts after 前, in bytes");
+        assert_eq!(range.end, "前".len() + "加粗".len());
+        // The slice the range names really is the bold text.
+        assert_eq!(&text[range.clone()], "加粗");
+        assert_eq!(style.font_weight, Some(FontWeight::BOLD));
+
+        // Plain spans contribute no highlight at all, and the text still comes back whole.
+        let (text, highlights) = styled_line(&[plain("a"), plain("b")]);
+        assert_eq!(text, "ab");
+        assert!(highlights.is_empty());
     }
 
     /// Word's usual shape: a Unicode escape for the Chinese characters.
