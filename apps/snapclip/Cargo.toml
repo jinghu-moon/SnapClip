@@ -1,0 +1,16 @@
+[package]
+name = "snapclip-app"
+version = "0.1.0"
+description = "SnapClip's GPUI shell"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+# The shell's name is `snapclip-app`, not `snapclip`: the Tauri host (src-tauri) already
+# owns the package name `snapclip`, and a workspace cannot hold two packages with the same
+# name. The directory stays `apps/snapclip` as the plan specifies.
+
+[dependencies]
+# One dependency for the UI, as the Coding Guides require: GPUI itself is
+# `use gpui_kit::*;`, and the layers are gpui_kit::{component, base, assets, platform}.
+gpui-kit = "0.7"

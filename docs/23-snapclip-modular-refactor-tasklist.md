@@ -256,8 +256,8 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 | T3.2 | 惰性 + 取消 + 超时 + 缓存 + 熔断 | T3.1 | ~4 文件 | 中 | **暂缓（D2）** |
 | T3.3 | 壳接线（history 只发 `ArtifactRef`，结果由壳写回） | T3.2 | 2 文件 | 中 | **暂缓（D2）** |
 | T3.4 | 资源对比 + 阶段验收 + tag `refactor-p3` | T3.3 | — | 低 | **暂缓（D2）** |
-| T4.1 + T4.1.1 | 开工前研读 + **前端功能迁移矩阵** | — | 1 表格 | 低 | [ ] |
-| T4.2 | `apps/snapclip` 骨架（init/Root/单窗口） | T4.1, T2.10（D2 解除了对 T3.4 的依赖） | ~5 文件 | 中 | [ ] |
+| T4.1 + T4.1.1 | 开工前研读 + **前端功能迁移矩阵** | — | 1 表格 | 低 | [x]（guides 通读 + 矩阵填实；gpui-kit 0.7.1） |
+| T4.2 | `apps/snapclip` 骨架（init/Root/单窗口） | T4.1, T2.10（D2 解除了对 T3.4 的依赖） | ~5 文件 | 中 | [x]（包名 `snapclip-app`；构建 + 起窗 + 门禁全过） |
 | T4.3 | history 能力（Entity + 虚拟列表 + `ElementId`=clip id） | T4.2 | ~4 文件 | 高 | [ ] |
 | T4.4 | settings 能力（**新增**，不是迁移） | T4.3 | ~3 文件 | 中 | [ ] |
 | T4.4.1 | 两个窗口检测开关接成真实设置通道 | T4.4 | 3 文件 | 中 | [ ] |
@@ -813,17 +813,31 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 | 托盘 | 无 | **不存在**（`Cargo.toml` 无 tray 插件；除 F5 外没有其它全局热键） | `rg -n "tauri-plugin" src-tauri/Cargo.toml` |
 | 设置 | 无 | **不存在**（全仓库无 settings 页面、无设置存储） | `rg -ni "settings" src-tauri/src src` |
 
-据此填出迁移矩阵（**这是本任务的交付物，写进提交消息**）：
+据此填出迁移矩阵（**这是本任务的交付物**；2026-10-07 核对过代码后填实）：
 
 | 现有功能 | GPUI 目标模块 | 是否保留行为 | 验证方式 |
 | --- | --- | --- | --- |
-| 历史面板 | `apps/snapclip/src/history/` | 保留；**并补上"可达性"**（托盘/热键/窗口显示，现状没有） | `#[gpui_kit::test]` + 真机 |
-| 剪贴板动作与来源图标 | 随 history 能力（`clipboard` 子模块） | 保留 | UI test + 真机 |
-| OCR 行内状态 | 随 history 行渲染（typed event） | 保留（不新增 OCR 页面） | typed event 单测 + 真机 |
-| 截图命令/事件 | capture crate + overlay（**不进 GPUI 高频路径**） | 保留 | 真机 F5 |
-| 标注工具条 | **本轮不做 GPUI 界面**（见下方决策 D1） | **本轮不保留 UI 行为**（Rust 侧模型保留） | P6 前只核对"模型未丢"，UI 留待 V2 |
-| 托盘 | `apps/snapclip/src/tray.rs` | **新增能力**（不是迁移） | 真机 |
-| 设置 | `apps/snapclip/src/settings/` | **新增能力**（不是迁移） | 热更新测试 |
+| 历史面板（列表/搜索/分页/复制回写/删除？） | `apps/snapclip/src/history/` | 保留；**并补上"可达性"**（托盘/热键/窗口显示，现状没有） | `#[gpui_kit::test]` + `VisualTestContext` + 真机 |
+| 剪贴板动作（复制回写、来源程序图标） | 随 history 能力（`clipboard` 子模块） | 保留 | UI test + 真机 |
+| OCR 行内状态（`ocr-status-v1`） | 随 history 行渲染（typed event） | 保留（不新增 OCR 页面） | typed event 单测 + 真机 |
+| 截图命令/事件（`capture-*-v1`） | capture crate + overlay（**不进 GPUI 高频路径**） | 保留 | 真机 F5 |
+| 标注工具条 | **本轮不做 GPUI 界面**（决策 D1） | **本轮不保留 UI 行为**（`snapclip-capture` 侧模型保留） | P6 前只核对"模型未丢"，UI 留待 V2 |
+| 托盘 | `apps/snapclip/src/tray.rs` | **新增能力**（当前仓库没有托盘） | 真机 |
+| 设置 | `apps/snapclip/src/settings/` | **新增能力**（当前仓库没有设置页/设置存储） | 热更新测试 |
+
+T4.1 已读并遵循的规范（gpui-kit skill，版本 **0.7.1**，`cargo search` 实测为最新）：
+
+- Coding Guides 的 Architecture at a glance / Bootstrap and root ownership / Understand GPUI's
+  phases / Choose the right unit / State ownership / Stable identity / Testing strategy /
+  Common failure modes / Rules for coding agents / Implementation checklist 均已通读；
+- 该指南要求的两条底线已落进骨架：`gpui_kit::init(cx)` 在任何组件视图之前调用一次；
+  每个窗口第一层是 `Root`；UI 只来自 `gpui-kit`（不直接依赖 `gpui` 或 `gpui-component`）；
+- 设计相关（组件选择/间距/层次/颜色/密度/交互态/覆盖层/动效/文案）在写界面前读 **Design Guides**
+  （`gpui-kit-design-guides`），组件 API 按需取 `https://gpui-kit.com/component/{name}.md`——
+  这条在 T4.3 开始画界面前执行。
+
+**应用名偏离（记录）**：目录按计划是 `apps/snapclip`，但包名必须是 `snapclip-app`——
+`src-tauri` 已经占用包名 `snapclip`，workspace 里不允许重名。
 
 **硬规则**：这张矩阵没有填完（每行都有目标模块与验证方式）之前，**不允许删除 Vue/Tauri**（P6 前置）。
 
@@ -1852,3 +1866,47 @@ model **20** 全绿（壳的 8 个同样通过）；切回 `main` 后工作区�
 
 三个 tag 的回退链：`refactor-p05` (0686a6f) → `refactor-p1` (c1334bf) → `refactor-p2` (5d72c2e)，
 最终基准 `smart-snapping-v1-2026-10-07`。任一阶段都能独立恢复并跑绿。
+
+### §14.28 T4.1 + T4.1.1 + T4.2：GPUI 壳起手
+
+```
+任务编号：T4.1（含 T4.1.1）+ T4.2
+状态：已验证 + 已推送
+分支：main
+前置提交/tag：refactor-p2（5d72c2e；D2 已把 P4 的前置从 T3.4 改成 T2.10）
+规范研读（T4.1，**先读后写**）：
+  - gpui-kit SKILL.md + `references/usage.md` 通读；
+  - `references/coding-guides.md`（893 行）按要求读了 Architecture at a glance、Bootstrap and
+    root ownership、Understand GPUI's phases and contexts、Choose the right unit、State ownership、
+    Stable identity、Testing strategy、Performance rules、Common failure modes、Rules for coding
+    agents、Implementation checklist；
+  - 版本：`cargo search gpui-kit` → **0.7.1**（用户要求用最新版），已写入 `Cargo.toml`。
+  - **绝不凭记忆写 API 这条立刻见效两次**：`cx.theme()` 的 `ActiveTheme` 与 `.v_flex()` 的 `StyledExt`
+    都不是 `use gpui_kit::*` 带来的，编译器先给了一个不存在的路径建议（`gpui_kit::gpui_component`），
+    最后是去 cargo registry 里读 gpui-component-0.7.1 / gpui-base-0.7.1 的 lib.rs 才拿到真实导出：
+    `gpui_kit::component::ActiveTheme`、`gpui_kit::base::StyledExt`。
+T4.1.1（前端功能迁移矩阵）：已按代码核对填实（历史面板/剪贴板动作/OCR 行内状态/截图命令与事件/
+  标注（D1 不做）/托盘（新增）/设置（新增）），并记录了"当前主窗口不可达"这个现状缺口。
+T4.2（`apps/snapclip` 骨架）：
+  - `apps/snapclip/Cargo.toml`：**只依赖 `gpui-kit = "0.7"`**（Coding Guides 的 one-dependency 规则）；
+  - `src/main.rs`：`gpui_kit::application().with_assets(assets::Assets).run(|cx| { gpui_kit::init(cx);
+    cx.open_window(WindowOptions::default(), |window, cx| { let shell = cx.new(|_| Shell);
+    cx.new(|cx| Root::new(shell, window, cx)) }) })` —— `init` 在最前、`Root` 是窗口第一层，
+    两条都按指南要求；视图目前是一个占位（`Shell`），T4.3 才给它历史列表；
+  - **包名偏离**：目录是 `apps/snapclip`，包名必须是 `snapclip-app`（`src-tauri` 已占用 `snapclip`）。
+验收（T4.2 的三条）：
+  1. 能打开空壳窗口：构建后启动 `snapclip-app.exe`，进程存活 8 s 无输出报错，退出后无残留 ✓
+  2. 门禁不受影响：`cargo check --workspace --all-targets` 0 warning；
+     `cargo test --workspace --all-targets` → capture 344 / history 49 / 壳 8 / model 20 / **app 0**（新成员无测试）
+  3. 截图 overlay 仍独立可用：Tauri 宿主照常构建 ✓（overlay 是独立 HWND，与 GPUI 壳无关）
+性能指标：GPUI 首次全量构建 ~2 min（一次性；后续增量 4 s）
+人工验证：窗口是否真的画出来需要用户确认（agent 看不到屏幕）；进程存活 + 无报错是自动化代理
+失败与根因：2 次编译红，都是"凭记忆写 API"的典型表现（缺 trait 导入），根因解决方式是
+          按规范去源码里找真实路径，而不是按建议的路径试。
+          **另有一次测试假红**：`the_real_pipeline_still_answers_in_the_second_capture_session`
+          在 GPUI 冷构建后的全量测试里失败一次；单独复跑两次都通过（该测试自述在冷启动后偶发）。
+          按 §0.3 记为环境假红，非回归。
+提交 SHA：见提交
+推送/tag：origin/main
+回退对象：refactor-p2（5d72c2e）
+```
