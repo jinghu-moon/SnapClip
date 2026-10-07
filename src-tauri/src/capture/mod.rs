@@ -1,26 +1,17 @@
-//! Native screenshot capture: hotkey, overlay window, capture providers and the
-//! selection state machine.
+//! 过渡期转发（docs/23 T1.2/T1.4/T1.5）：唯一实现已搬到 `snapclip-capture`。
 //!
-//! This module is intentionally independent from the clipboard, the store, OCR and
-//! Tauri. It produces one domain result — [`CaptureArtifact`] — and nothing else.
-//!
-//! Consumers outside the feature reach it through the narrow surface below:
-//! `capture::application` (the overlay contract and runtime),
-//! `capture::geometry` / `capture::session` (pure types used by the artifact
-//! service), and the error type on the IPC boundary.
+//! 这个模块现在**只做名字转发**，让壳侧仍在写的 `crate::capture::…` 路径可以编译。
+//! 删除条件：P1 结束时（T1.10）转发必须为零——那时调用方直接 `use snapclip_capture::…`，
+//! 本文件与这个目录一起删除。
 
-mod error;
-pub mod annotation;
-pub mod diagnostics;
-pub mod geometry;
-pub mod monitor_cache;
-pub mod ring_contrast;
-pub mod sampler;
-pub mod session;
-pub mod window_detection;
+pub use snapclip_capture::*;
 
-pub mod application;
+/// 过渡期转发：新 crate 用 `ports`（端口）与 `runtime`（`CaptureRuntime`）取代了旧的
+/// `capture::application` 子模块，这里把旧路径映射过去。
+pub mod application {
+    pub use snapclip_capture::ports::*;
 
-pub use error::{CaptureError, CaptureResult};
-
-pub use crate::domain::{CaptureArtifact, CapturePayload, CaptureState, PixelFormat};
+    pub mod runtime {
+        pub use snapclip_capture::runtime::*;
+    }
+}

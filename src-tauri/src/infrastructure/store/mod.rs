@@ -1148,13 +1148,9 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
     }
 }
 
-fn unix_time_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(i64::MAX as u128) as i64
-}
+// 过渡期转发（docs/23 T1.4）：这里原先还有一份私有实现，和 `clipboard_ingest` 的
+// 那份重复。现在只有 `snapclip-model` 一份定义。
+use snapclip_model::time::unix_time_ms;
 
 #[cfg(test)]
 mod tests {

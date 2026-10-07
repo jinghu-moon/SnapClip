@@ -140,10 +140,13 @@ pub fn start(
     let artifacts = AppArtifactDir::new(app_local_data);
     let service = Arc::new(CaptureService::new(artifacts, PngArtifactEncoder));
     let sink: Arc<dyn CaptureEventSink> = Arc::new(TauriCaptureEventSink::new(app.clone()));
+    let clipboard: Arc<dyn crate::capture::application::ClipboardWriter> =
+        Arc::new(crate::app::clipboard_writer::SystemClipboardWriter);
 
     let runtime = crate::platform::windows::capture::overlay::WindowsOverlay::spawn_overlay(
         service,
         sink,
+        clipboard,
     )
     .map_err(|message| format!("capture overlay: {message}"))?;
     app.manage(Arc::new(CaptureRuntime::from_platform(Box::new(runtime))));

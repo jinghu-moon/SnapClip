@@ -38,12 +38,14 @@ from fontTools.subset import main as subset_main
 from rust_literals import literals_with_lines
 
 ROOT = Path(__file__).resolve().parent.parent
-SCAN_ROOT = ROOT / "src-tauri" / "src"
+# The overlay is the only thing that draws text, and since docs/23 T1.5 it lives in the
+# capture crate. Widen this if another crate ever starts drawing.
+SCAN_ROOT = ROOT / "crates" / "snapclip-capture" / "src"
 DRAWN = ROOT / "subfont" / "drawn-text.txt"
 SOURCE = ROOT / "refer" / "HarmonyOS_SansSC_Regular.ttf"
 BUILT = ROOT / "subfont" / "harmonyos-sans-sc-subset.ttf"
-# The exact path `src-tauri/src/platform/windows/capture/win/d2d.rs` embeds with include_bytes!.
-INSTALLED = ROOT / "src-tauri" / "fonts" / "harmonyos-sans-sc-subset.ttf"
+# The exact path `crates/snapclip-capture/src/windows/win/d2d.rs` embeds with include_bytes!.
+INSTALLED = ROOT / "crates" / "snapclip-capture" / "assets" / "harmonyos-sans-sc-subset.ttf"
 
 # Tables the renderer never reads; dropping them keeps the blob small (see the original script).
 DROP_TABLES = (

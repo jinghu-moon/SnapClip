@@ -18,7 +18,9 @@ pub mod events;
 pub mod geometry;
 pub mod ids;
 pub mod recognition;
+pub mod time;
 
 pub use geometry::{ImageDimensions, Point, Rect};
 pub use capture::{CaptureArtifact, CapturePayload, CaptureState, PixelFormat};
 pub use error::ErrorCode;
+pub use time::unix_time_ms;

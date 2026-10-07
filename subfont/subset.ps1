@@ -6,8 +6,9 @@
 # below writes to `subfont/drawn-text.txt`. `build_subset.py` then builds the font from it, fails
 # if the artifact cannot cover it, guards against a string drawn inline but never listed, and
 # installs the result where `include_bytes!` reads it
-# (`src-tauri/fonts/harmonyos-sans-sc-subset.ttf`) — the old script only wrote `subfont/`, which
-# is why the shipped copy had quietly gone stale.
+# (`crates/snapclip-capture/assets/harmonyos-sans-sc-subset.ttf`, which moved there with the
+# overlay in docs/23 T1.5) — the old script only wrote `subfont/`, which is why the shipped
+# copy had quietly gone stale.
 #
 # Requires: python3 with fontTools (pip install fonttools) and the source font at
 # `refer/HarmonyOS_SansSC_Regular.ttf` (that directory is gitignored).
@@ -17,7 +18,7 @@ Set-Location (Split-Path -Parent $PSScriptRoot)
 # system codepage, so UTF-8 prose in an error message arrives as mojibake otherwise).
 $env:PYTHONIOENCODING = "utf-8"
 
-cargo test --manifest-path src-tauri/Cargo.toml --lib write_drawn_text_for_the_font_subset `
+cargo test -p snapclip-capture --lib write_drawn_text_for_the_font_subset `
     -- --ignored --nocapture --quiet
 if ($LASTEXITCODE -ne 0) { throw "generating subfont/drawn-text.txt failed ($LASTEXITCODE)" }
 

@@ -4975,6 +4975,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "snapclip-capture",
  "snapclip-model",
  "tauri",
  "tauri-build",
@@ -4990,7 +4991,9 @@ dependencies = [
 name = "snapclip-capture"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "serde",
+ "serde_json",
  "snapclip-model",
  "thiserror 2.0.21",
  "windows 0.61.3",

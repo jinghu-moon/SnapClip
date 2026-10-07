@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use crate::domain::{PayloadData, PayloadKind, Publication, PublicationOrigin};
 use crate::infrastructure::store::{QueueDecision, Store, StoreError};
@@ -374,12 +374,9 @@ impl ClipboardStore for Store {
     }
 }
 
-pub fn unix_time_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_millis() as i64
-}
+// 过渡期转发（docs/23 T1.4）：实现已搬到 `snapclip-model`，这里保留同名入口，
+// 因为本模块内部与测试都按这个名字调用。P2 迁移 `clipboard_ingest` 时一并收敛。
+pub use snapclip_model::time::unix_time_ms;
 
 #[cfg(test)]
 mod tests {
@@ -761,4 +758,3 @@ mod tests {
         assert_eq!(sink.saved.lock().unwrap().len(), 2);
     }
 }
-

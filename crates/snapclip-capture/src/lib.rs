@@ -23,8 +23,29 @@
 //! type that crosses the seam has to be justified, and `pub` fields are not allowed on
 //! seam types (docs/22 §10.1).
 //!
-//! **Status (T1.1)**: the crate exists so the workspace, the dependency direction and
-//! the target gating are settled before any code moves. The modules below arrive with
-//! T1.4 (platform-independent capture) and T1.5 (the Windows implementation).
-
 #![cfg(windows)]
+
+pub mod annotation;
+pub mod artifact;
+pub mod diagnostics;
+pub mod error;
+pub mod geometry;
+pub mod monitor_cache;
+pub mod ports;
+pub mod ring_contrast;
+pub mod runtime;
+pub mod sampler;
+pub mod session;
+pub mod window_detection;
+pub mod windows;
+
+pub use artifact::{
+    ArtifactDir, ArtifactEncoder, CaptureService, PixelSliceSource, SelectionPixels,
+};
+pub use error::{CaptureError, CaptureResult};
+pub use ports::{CaptureEventSink, ClipboardWriter, OverlayPlatform};
+pub use runtime::CaptureRuntime;
+
+pub use snapclip_model::capture::{CaptureArtifact, CapturePayload, CaptureState, PixelFormat};
+pub use snapclip_model::error::ErrorCode;
+pub use snapclip_model::geometry::{ImageDimensions, Point, Rect};
