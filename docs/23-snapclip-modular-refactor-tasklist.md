@@ -1845,3 +1845,10 @@ P2 累计产出：T2.1（ArtifactRef/CaptureOutput）→ T2.2（history 骨架 +
 下一阶段：P3（`snapclip-recognize`）——**已按决策 D2 顺延**，不满足触发条件不做。
       因此下一步实际是 **P4（GPUI 壳）**，其前置已由 D2 改为 T2.10（即本 tag）。
 ```
+
+回退演练结果（2026-10-07 实跑）：`refactor-p2` = `5d72c2e`；detach 后跑
+`cargo test --workspace --all-targets`，capture **344 passed / 6 ignored**、history **49**、
+model **20** 全绿（壳的 8 个同样通过）；切回 `main` 后工作区干净。**这个 tag 是真的。**
+
+三个 tag 的回退链：`refactor-p05` (0686a6f) → `refactor-p1` (c1334bf) → `refactor-p2` (5d72c2e)，
+最终基准 `smart-snapping-v1-2026-10-07`。任一阶段都能独立恢复并跑绿。
