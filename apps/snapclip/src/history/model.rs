@@ -32,8 +32,17 @@ impl HistoryState {
     /// screen that opens onto an empty list and only fills in once the user types is broken,
     /// and "open" failing to read is an error the caller has to see anyway.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, StoreError> {
+        Self::with_store(Store::open(root)?)
+    }
+
+    /// The same, over a store the caller already opened.
+    ///
+    /// `Store` is cheap to clone, and the composition root opens exactly one so the clipboard
+    /// pipeline and the screen read and write through the same writer thread rather than
+    /// through two competing ones.
+    pub fn with_store(store: Store) -> Result<Self, StoreError> {
         let mut state = Self {
-            store: Store::open(root)?,
+            store,
             items: Vec::new(),
             next_cursor: None,
             selected: None,

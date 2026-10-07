@@ -2608,6 +2608,45 @@ P6 开工前的现状核对（**关键发现，先纠正文档的想当然**）�
 回退对象：5e34b44
 ```
 
+### §14.49 P6 第三片：剪贴板 ingest 由壳托管（历史从此实时刷新）
+
+```
+任务编号：P6（组合根搬迁，第 3/5 片 = 收尾片）
+状态：已完成并验证（真机监听器启停实测）
+分支：main
+前置提交/tag：57a5076
+改了什么：
+  1. `apps/snapclip/src/clipboard_ingest.rs`（新，搬自 `src-tauri/src/app/clipboard.rs`）：
+     `Win32EventBridge`（WM_CLIPBOARDUPDATE → channel，带 stop signal）+ `Win32ClipboardSource`
+     （`snapclip_history::windows::reader`）+ `Win32SourceResolver`（来源程序名/exe）+
+     `ClipboardEvents`（P4 已有的事件适配器）→ **`AppEvent::Clipboard` 进壳的 bus**。
+     这就是 T4.5 一直挂账的"发布者接线"：它一通，历史屏就自己长出新行。
+  2. `NoOcrQueue`：按决策 D2，识别本轮不接。**"空队列"不是"假装在跑"**——`try_enqueue` 返回
+     false，ingest 会立刻 `release_queued`，行的状态干净回到 `none`，而不是永远停在 `queued`
+     等一个不会来的 worker。P3 回来后，这个文件唯一要改的就是把 `NoOcrQueue` 换成真队列。
+  3. `HistoryState::with_store(store)`：组合根只开**一个** `Store`，历史屏与剪贴板管线共用同一个
+     写入线程，而不是两个线程抢同一个 SQLite 文件（`Store` 的 Clone 本来就是为这件事准备的）。
+  4. `Shell` 持有 `Option<ClipboardIngestHandle>`（`is_collecting_clips()` 可读）：句柄即生命期，
+     丢掉就停监听并 join worker；启动失败只记日志降级。
+验证：
+  - **真机**：`cargo test -p snapclip-app --lib -- --ignored` → **3 passed**，其中
+    `clipboard_ingest::tests::the_pipeline_starts_and_stops ... ok`（真的开了监听窗口、真的读了一次
+    真实剪贴板、`shutdown()` 能解开 worker 的阻塞 `recv()`——这条如果坏掉会**挂住**而不是报错，
+    所以它值得单独跑）
+  - `cargo test -p snapclip-app --features test-support` → **31 lib + 5 UI**（新增 D2 的
+    `the_recognition_queue_says_no_so_the_row_is_released`）
+  - `cargo check --workspace --all-targets` → **0 warning**
+现在 GPUI 壳已经拥有：history（读+删+筛选+分页+预览）、设置、托盘、**F5 截图 overlay**、
+  **剪贴板 ingest**、artifact 写出、DPI 声明。旧壳剩下的唯一独占物是 OCR 与 Vue 界面。
+下一步（第 5/5 片，**破坏性**）：删 `src-tauri/` 与 Vue/`package.json` 的 tauri 脚本、从 workspace
+  移除旧成员、`cargo tree -i tauri`/`-i wry` 为空、全仓 `rg -n tauri` 只命中文档、跑 §0.2 门禁与
+  真机全链路，然后打 tag `refactor-p6`。**执行前会再核对一次**：壳里 F5 与剪贴板这两条链路已由
+  本片与 §14.48 的真机用例证明可用。
+提交 SHA：见提交
+推送/tag：origin/main
+回退对象：57a5076
+```
+
 ### §14.47 P6 第一片：`ArtifactWriter` 端口实现搬进 GPUI 壳
 
 ```

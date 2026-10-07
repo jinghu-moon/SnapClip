@@ -19,6 +19,7 @@ use gpui_kit::*;
 pub mod adapters;
 pub mod capture;
 pub mod clipboard;
+pub mod clipboard_ingest;
 pub mod events;
 pub mod history;
 pub mod settings;
@@ -101,6 +102,9 @@ pub struct Shell {
     /// The hosted capture overlay. `None` when the overlay or its hotkey could not start,
     /// which is reported and survived: the rest of the shell still works.
     capture: Option<snapclip_capture::CaptureRuntime>,
+    /// The clipboard pipeline. Holding this is what keeps it running; dropping it stops the
+    /// listener and joins the worker, so it must live as long as the shell.
+    clipboard: Option<snapclip_history::ingest::ClipboardIngestHandle>,
 }
 
 /// Which capability the window is showing. A desktop shell keeps navigation persistent, so
@@ -115,14 +119,22 @@ impl Shell {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let data = app_data_dir();
         let events = EventBus::new();
-        let history = match HistoryState::open(&data) {
-            Ok(state) => match SourceIcons::new(data.join("icons")) {
-                Ok(icons) => Ok(cx.new(|cx| {
-                    HistoryView::new(state, icons, events.clone(), window, cx)
-                })),
-                Err(error) => Err(format!("icons: {error}")),
+        // One store for the whole shell: the clipboard pipeline and the history screen then
+        // share a writer thread instead of racing two of them on the same SQLite file.
+        let (history, store) = match snapclip_history::store::Store::open(&data) {
+            Ok(store) => match HistoryState::with_store(store.clone()) {
+                Ok(state) => match SourceIcons::new(data.join("icons")) {
+                    Ok(icons) => (
+                        Ok(cx.new(|cx| {
+                            HistoryView::new(state, icons, events.clone(), window, cx)
+                        })),
+                        Some(store),
+                    ),
+                    Err(error) => (Err(format!("icons: {error}")), Some(store)),
+                },
+                Err(error) => (Err(format!("history store: {error}")), Some(store)),
             },
-            Err(error) => Err(format!("history store: {error}")),
+            Err(error) => (Err(format!("history store: {error}")), None),
         };
         // The settings page is independent of the store, so it exists even when history
         // cannot open — that is also how the user can see *why* something is wrong.
@@ -139,6 +151,18 @@ impl Shell {
                 eprintln!("[snapclip-app] capture unavailable: {error}");
                 None
             }
+        };
+        // The clipboard pipeline publishes `AppEvent::Clipboard` on the bus above, which is
+        // what makes the history screen refresh by itself while it is open.
+        let clipboard = match store.clone() {
+            Some(store) => match clipboard_ingest::start(store, events.clone()) {
+                Ok(handle) => Some(handle),
+                Err(error) => {
+                    eprintln!("[snapclip-app] clipboard pipeline unavailable: {error}");
+                    None
+                }
+            },
+            None => None,
         };
         // The shell's windows are reachable from here on: the tray is the entry point that
         // T4.1.1 recorded as missing, and its commands arrive on their own thread.
@@ -159,6 +183,7 @@ impl Shell {
             events,
             tray,
             capture,
+            clipboard,
         }
     }
 
@@ -180,6 +205,12 @@ impl Shell {
     /// The hosted capture overlay, when the shell could start one.
     pub fn capture(&self) -> Option<&snapclip_capture::CaptureRuntime> {
         self.capture.as_ref()
+    }
+
+    /// Whether the clipboard pipeline is running. Holding it is what keeps it alive, so this
+    /// is also how anything outside can tell the shell is collecting clips at all.
+    pub fn is_collecting_clips(&self) -> bool {
+        self.clipboard.is_some()
     }
 }
 impl Render for Shell {
