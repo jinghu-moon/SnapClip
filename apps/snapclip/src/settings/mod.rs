@@ -6,5 +6,7 @@
 //! this module about why "hot-update the overlay" cannot be end-to-end yet.
 
 pub mod model;
+pub mod settings_view;
 
 pub use model::{Settings, SettingsStore};
+pub use settings_view::SettingsView;

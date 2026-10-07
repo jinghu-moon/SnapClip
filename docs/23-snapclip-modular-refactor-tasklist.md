@@ -259,7 +259,7 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 | T4.1 + T4.1.1 | 开工前研读 + **前端功能迁移矩阵** | — | 1 表格 | 低 | [x]（guides 通读 + 矩阵填实；gpui-kit 0.7.1） |
 | T4.2 | `apps/snapclip` 骨架（init/Root/单窗口） | T4.1, T2.10（D2 解除了对 T3.4 的依赖） | ~5 文件 | 中 | [x]（包名 `snapclip-app`；构建 + 起窗 + 门禁全过） |
 | T4.3 | history 能力（Entity + 虚拟列表 + `ElementId`=clip id） | T4.2 | ~6 文件 | 高 | 部分 [x]（模型/图标/视图/接线/回车复制/**GPUI 集成测试**已落地；分页、删除确认、缩略图待续，见 §14.29–§14.31） |
-| T4.4 | settings 能力（**新增**，不是迁移） | T4.3 | ~4 文件 | 中 | 部分 [x]（模型 + 持久化 + 到 capture 的桥已落地，见 §14.35；设置页与热更新待续） |
+| T4.4 | settings 能力（**新增**，不是迁移） | T4.3 | ~5 文件 | 中 | 部分 [x]（模型/持久化/桥/**设置页 + 页内导航**已落地，见 §14.35–§14.37；跨壳热更新待 P6 或另定） |
 | T4.4.1 | 两个窗口检测开关接成真实设置通道 | T4.4 | 3 文件 | 中 | 部分 [x]（**capture 侧全通且有单测**：`DetectionOptions` → worker → fallback → provider builder，`a_non_default_adopt_text_runs_reaches_the_fallback` 钉住；剩"设置页 → 壳传值"属 T4.4；第二个开关无行为未发明。见 §14.32–§14.36） |
 | T4.5 | 事件桥（`snapclip-model::AppEvent` + channel + 丢弃过期） | T4.3 | 2 文件 | 高 | [ ] |
 | T4.6 | 托盘（Win32，**新建**） | T4.2 | 1 文件 | 中 | [ ] |
@@ -2217,4 +2217,39 @@ T4.3 剩余（续做清单）：
 提交 SHA：见提交
 推送/tag：origin/main
 回退对象：a4aae5f
+```
+
+### §14.37 T4.4 第二半：设置页 + 页内导航
+
+```
+任务编号：T4.4（第二半）
+状态：已验证 + 已推送
+分支：main
+前置提交/tag：be54264（T4.4.1 守卫测试）
+规范研读：Design Guides 的 *Forms and settings*（每个字段要可见标签、帮助文字贴着字段、
+  **立即生效的设置用 `Switch`**、结果靠近操作显示）与 *Layout patterns*（桌面壳保持持久导航）。
+新增：
+  apps/snapclip/src/settings/settings_view.rs  `SettingsView`：`Switch` + 标签 + 帮助行 + 结果行 +
+                                              设置文件路径（便于定位）；1 个单测（视图从文件起手）
+  apps/snapclip/src/lib.rs                      `Shell` 加"剪贴板历史 / 设置"两个页内入口与页状态；
+                                               设置页独立于历史库，所以历史开不了时**仍能进去看**
+文案（按指南的语言规则）：标签点名对象（「吸附到文字行」），帮助行说清关闭后的后果
+  （「关闭后只吸附到盒子，不会单独选中一行文字」），结果行只说状态（已开启/已关闭/保存失败：…），
+  没有多余的"管理/模块/功能"类包装词。
+API 又一次"不凭记忆"救场：`Switch::new(...).checked(...).label(...).on_click(...)` 在源码里核对过；
+  而 `Button::primary()` 与 `when()` **不在** `Button` 上（`primary` 属于某个 trait，`gpui-kit` 的
+  base 层那个同名 trait 不是它）。为了不再猜，改用**只依赖已验证 API** 的做法：激活页用一条
+  `theme.primary` 底边标示（状态依旧可见），`when` 换成普通控制流，另抽了一个 `nav_item(...)` 小组件。
+修改前测试：app 8 lib + 1 UI；其余 capture 345 / history 49 / 壳 8 / model 20
+修改后测试：app **9 lib + 1 UI**（+1）；其余不变；`cargo check --workspace --all-targets` 0 warning
+人工验证：窗口的视觉与交互（切换页面、拨动开关后文件里确实写入）需用户确认；
+          自动化只覆盖到"编译通过 + 模型/视图起手 + 门禁全绿"
+剩余：
+  1. 跨壳热更新（§14.35 的两条路待你选：让 Tauri 宿主读同一设置文件，或等 P6）；
+  2. 把 `Settings::detection_options()` 接到 capture 的调用点（现在是刻意的 `default()`）；
+  3. 设置页的 GPUI 交互测试（沿用 `--features test-support` 路径，加 `.id(...).test_support()`）；
+  4. 若将来 `deep_select_visible_wrappers` 真有了行为，再给它加开关。
+提交 SHA：见提交
+推送/tag：origin/main
+回退对象：be54264
 ```
