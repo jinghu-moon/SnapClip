@@ -2647,6 +2647,52 @@ P6 开工前的现状核对（**关键发现，先纠正文档的想当然**）�
 回退对象：57a5076
 ```
 
+### §14.50 P6 第五片：删除 Tauri 与旧目录（**P6 收尾 = 重构完成点**）
+
+```
+任务编号：P6（第 5/5 片）
+状态：已完成并验证
+分支：main
+前置提交/tag：adfd2e0
+前置核对（删之前逐条确认，不是"删了再说"）：
+  - 壳里 F5（§14.48 真机日志：overlay 在壳进程里 ready）+ 剪贴板 ingest（§14.49 真机用例）已可用；
+  - `win-icon-extractor` 来源图标（壳自带）、复制回写（壳自带 `SystemClipboard`）都已落地；
+  - `snapclip-capture` 的标注模型随 crate 保留（决策 D1），不受删除影响。
+删了什么：
+  - `git rm -r`：`src-tauri/`（含 96 个跟踪文件）、`src/`（Vue）、`public/`、`index.html`、
+    `vite.config.ts`、`tsconfig*.json`、`package-lock.json`；
+  - workspace `members` 去掉 `"src-tauri"`；
+  - `package.json` 剥到只剩用户自己的两个脚本（`ocr:serve`、`audit:tokens`），保留它只是为了不夺走
+    你已有的工具入口（`scripts/ocr-serve.ps1` 是**未跟踪**文件，原样留着）；
+  - 磁盘清理（**未跟踪**的旧壳残留，`git rm` 管不到）：`src-tauri/`（26.9 GB，主要是它自己的
+    `target/`、`target-probe/`、`gen/schemas`、探针日志）、`src/`（49.3 MB 残留）、`dist/`。
+    全部是构建产物/生成物，删掉可复现；`node_modules/`（160.9 MB，Vue/Vite/Tauri CLI 的依赖）
+    按"未跟踪、且可能是你自己要用"处理，**保留未删**。
+验证（§0.2 G2 门禁全跑，实测）：
+  | 门禁 | 命令 | 结果 |
+  | --- | --- | --- |
+  | 全 workspace 编译 | `cargo check --workspace --all-targets` | **0 warning** |
+  | capture | `cargo test -p snapclip-capture --lib` | **345 passed / 6 ignored** |
+  | history | `cargo test -p snapclip-history` | **51 passed** |
+  | model | `cargo test -p snapclip-model` | **23 passed** |
+  | GPUI 壳 | `cargo test -p snapclip-app --features test-support` | **31 lib + 5 UI** |
+  | 依赖方向 | `tools/check-dependency-direction.ps1` | **clean** |
+  | Tauri 是否消失 | `cargo tree -i tauri` | **`did not match any packages`** |
+  | wry 是否消失 | `cargo tree -i wry` | **`did not match any packages`** |
+  | 残留引用 | 全仓搜 `tauri`（排除文档/参考/原型） | 只剩 `snapclip-capture` 里的**文字注释**
+    （"不依赖 Tauri"这类边界说明）与 `crates/rapid-ocr-rs`（外部仓库、未跟踪），**无依赖、无代码路径** |
+既定损失（决策已记录，不是意外）：`src-tauri/src/ocr/`（约 1050 行）随旧壳删除，图片内文字不再自动
+  识别；P3（`snapclip-recognize`）按 D2 暂缓，回来后接在壳现有的 `NoOcrQueue` 位置即可（§14.49 写明
+  那是唯一要改的地方）。
+tag：`refactor-p6`（= 本次重构的完成点）。回退：`git reset --hard refactor-p4`（保留 GPUI 壳与能力
+  crate，只把旧壳找回来）。
+真机全链路仍待你走一遍（**删壳之后**：F5 截图 → overlay → 导出 PNG 到
+  `<app data>/artifacts/capture`；复制文本 → 历史屏自动出现新行；托盘显示/隐藏与退出；设置开关）。
+提交 SHA：见提交（含 tag）
+推送/tag：origin/main + `refactor-p6`
+回退对象：adfd2e0
+```
+
 ### §14.47 P6 第一片：`ArtifactWriter` 端口实现搬进 GPUI 壳
 
 ```

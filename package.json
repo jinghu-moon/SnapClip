@@ -2,31 +2,9 @@
   "name": "snapclip",
   "private": true,
   "version": "0.1.0",
-  "type": "module",
   "license": "AGPL-3.0-only",
   "scripts": {
-    "dev": "vite",
-    "typecheck": "vue-tsc --noEmit",
-    "build": "vue-tsc --noEmit && vite build",
-    "preview": "vite preview",
-    "tauri": "tauri",
     "ocr:serve": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ocr-serve.ps1",
     "audit:tokens": "node tools/audit-design-tokens.mjs"
-  },
-  "dependencies": {
-    "@tabler/icons-vue": "^3.34.1",
-    "@tanstack/vue-virtual": "^3.13.39",
-    "@tauri-apps/api": "^2",
-    "@tauri-apps/plugin-opener": "^2",
-    "pinia": "^4.0.3",
-    "vue": "^3.5.13"
-  },
-  "devDependencies": {
-    "@tauri-apps/cli": "^2",
-    "@vitejs/plugin-vue": "^6.0.7",
-    "playwright": "^1.63.0",
-    "typescript": "~6.0.3",
-    "vite": "^8.0.16",
-    "vue-tsc": "^3.3.5"
   }
 }
