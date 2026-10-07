@@ -29,7 +29,6 @@ const PREVIEW_CHAR_LIMIT: usize = 500;
 #[derive(Clone)]
 pub struct Store {
     database_path: PathBuf,
-    blob_store: BlobStore,
     writer: SyncSender<WriterRequest>,
 }
 
@@ -116,15 +115,10 @@ impl Store {
         match ready_rx.recv().map_err(|_| StoreError::WriterUnavailable)? {
             Ok(()) => Ok(Self {
                 database_path,
-                blob_store,
                 writer: writer_tx,
             }),
             Err(message) => Err(StoreError::Initialization(message)),
         }
-    }
-
-    pub fn blob_store(&self) -> &BlobStore {
-        &self.blob_store
     }
 
     pub fn save_publication(

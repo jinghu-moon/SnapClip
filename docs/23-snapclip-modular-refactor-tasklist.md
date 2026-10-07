@@ -246,11 +246,11 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 | T2.3 | 两个独立存储：`CaptureArtifactStore` + `ClipboardBlobStore` | T2.2 | 2 文件 + 错误类型 | 中 | [x]（含 5 个测试；cleanup/LRU 如实记为未实现） |
 | T2.4 | 切换 capture 导出链（搬 PNG 编码，改 `finish_artifact`） | T2.3 | ~6 文件 | 中 | [x]（两半都完成：编码器归位 + 导出链切到 `ArtifactWriter` 端口，见 §14.22/§14.23） |
 | T2.5 | 拆 `store/mod.rs`（连接/仓库/迁移） | T2.4 | 1 687 行 | 高 | [x]（前半域类型见 §14.24；后半搬入 crate 并拆成 5 个文件，见 §14.25） |
-| T2.6 | 迁移剪贴板 Windows 适配（6 文件） | T2.5 | 1 210 行 | 中 | [ ] |
-| T2.7 | 迁移 `clipboard_ingest`（去重/格式/publication） | T2.6 | 694 行 | 中 | [ ] |
-| T2.8 | `ClipboardService`/`HistoryService` 公共 API | T2.7 | 3 文件 | 中 | [ ] |
-| T2.9 | `commands/history.rs`、`commands/ocr.rs` 改走服务 | T2.8 | 2 文件 | 低 | [ ] |
-| T2.10 | 阶段验收 + tag `refactor-p2` | T2.9 | — | 低 | [ ] |
+| T2.6 | 迁移剪贴板 Windows 适配（6 文件） | T2.5 | 1 333 行 | 中 | [x]（提交 458d971） |
+| T2.7 | 迁移 `clipboard_ingest`（去重/格式/publication） | T2.6 | 760 行 | 中 | [x]（整体搬入，子拆分记为偏离；提交 16e203f） |
+| T2.8 | `ClipboardService`/`HistoryService` 公共 API | T2.7 | 3 文件 | 中 | [x]（**实质已满足**：`Store` 就是服务，仓库私有、`blob_store()` 死访问器已删；见 §14.26） |
+| T2.9 | `commands/history.rs`、`commands/ocr.rs` 改走服务 | T2.8 | 2 文件 | 低 | [x]（**无需改动**：命令层已在调用门面方法 + `OcrQueue` 端口；见 §14.26） |
+| T2.10 | 阶段验收 + tag `refactor-p2` | T2.9 | — | 低 | [x]（见 §14.27） |
 | T3.0 | recognize 接缝设计（`ArtifactReader`/`RecognitionJobStore`/`RecognitionEventSink`） | T2.10 | 1 文件 | 中 | **暂缓（D2）** |
 | T3.1 | `snapclip-recognize` 骨架（迁 `ocr/`） | T3.0 | 829 行 | 低 | **暂缓（D2）** |
 | T3.2 | 惰性 + 取消 + 超时 + 缓存 + 熔断 | T3.1 | ~4 文件 | 中 | **暂缓（D2）** |
@@ -1776,4 +1776,72 @@ tag 消息明确写了两件事：(1) 捕获已独立成 crate、接缝真实、
 提交 SHA：见提交
 推送/tag：origin/main
 回退对象：18d847f
+```
+
+### §14.26 T2.6 / T2.7 / T2.8 / T2.9：剪贴板适配器与 ingest 归位，接缝核查
+
+```
+任务编号：T2.6 + T2.7 + T2.8 + T2.9
+状态：已验证 + 已推送
+分支：main
+前置提交/tag：6218eee（T2.5）
+T2.6（458d971）：`platform/windows/clipboard/`（6 文件 1 333 行）→ `snapclip-history/src/windows/`。
+  这次搬移几乎不用改代码：适配器只用 `windows-sys`（无 Tauri、无 arboard、无 store），
+  对外引用只有域类型（已在 model）与图像编解码（已在本 crate）。crate 的 windows 模块按 `cfg(windows)` 门控
+  ——store 是纯数据代码，只有这个适配器是 Win32。壳里留名字转发（T2.10 删）。
+T2.7（16e203f）：`application/clipboard_ingest.rs`（760 行）→ `snapclip-history/src/ingest.rs`。
+  它本来就是传输无关的（`ClipboardSource`/`ClipboardEventBridge`/`ClipboardStore`/`OcrQueue`/
+  `ClipboardEventSink`/`SourceAppResolver`/`StopSignal` 全是端口），所以只改了域类型与 store 的路径；
+  `impl ClipboardStore for Store` 随之入 crate——history 现在拥有"剪贴板通知 → publication → OCR 任务 →
+  UI 事件"整条路径。**偏离**：docs/23 原计划把它拆成 `{service,reader,history}.rs` 三个文件，
+  我这次只做了整体搬移（拆分留作后续卫生项，与 D3 同类）。
+T2.8/T2.9（**实质已满足，逐条取证**）：
+  1. 命令层只调用门面方法：`store.{history_page,search_history_page,read_payload_bytes,
+     list_ocr_candidates,enqueue_ocr,release_queued,ocr_status_of}`——正是"查询分页 / 按内容取字节 /
+     识别入队与状态"这套服务面。
+  2. 仓库模块**对外不可达**：`rg "clip_repository|migration::|connection::|artifact_repository" src-tauri/src`
+     为 0（模块是私有的，编译器保证）。
+  3. 发现并删掉一处内层泄漏：`Store::blob_store()` 无人使用（`rg "blob_store\(\)"` 命中 0），
+     连同它唯一读取的 `blob_store` 字段一起删除——留着就是"把内部的 blob 存储递给外面"。
+  4. **命名偏离**：docs/23 想要 `ClipboardService`/`HistoryService` 两个类型；实际上 `Store` 就是那个
+     服务门面（仓库已经私有、字段私有、方法即服务面）。重命名会动 10 个调用点却没有任何边界收益，
+     所以保留 `Store`，并在此说明。文档里"删除一个 clip"这项在代码中**不存在**，与 LRU 同类——没有发明。
+修改前后测试（逐次守恒）：capture 344 / 壳 36→17→8 / history 21→40→49 / model 20（合计 421 不变）
+性能指标：不涉及
+人工验证：构建后启动正常（`clipboard pipeline ready 67ms`）
+失败与根因：无编译失败。**探针一次假红**：T2.10 前的完整门禁里 Explorer 探针报
+          `median_area_pct=0.0 control_level_points=24/25`；按 §0.3 单独复跑两次都回到基线
+          `65.8 / 12-25 / 25-25`（刚跑完会自起 Chromium 的浏览器探针，机器繁忙），
+          判定为环境假红，非回归。此现象与 §0.3 记录的既有假红同类，已写进提交消息。
+提交 SHA：458d971 / 16e203f / <本条提交>
+推送/tag：origin/main
+回退对象：6218eee
+```
+
+### §14.27 T2.10：P2 阶段验收 + tag `refactor-p2`
+
+```
+阶段：P2（抽离 snapclip-history）
+状态：已验证 + 已推送
+tag：refactor-p2（annotated），已推 origin
+阶段门禁（tag 前复跑）：
+  cargo test --workspace --all-targets → capture 344 passed / 6 ignored；history 49；壳 8；model 20
+                                        （合计 421，与 P2 开始时一致）
+  cargo check --workspace --all-targets → 0 warning
+  浏览器探针 41/41（真实运行）；Explorer 探针 65.8 / 12-25 / 25-25（第 2、3 次跑，首跑为环境假红）
+  依赖方向门禁 → 三 crate 干净（capture 30 包 / history 43+ 包 / model 8 包）
+  A4 底色表与字体子集门禁 → passed
+  真机代理：构建后启动 → `store ready` / `overlay ready` / `clipboard pipeline ready` 正常，无残留进程
+P2 累计产出：T2.1（ArtifactRef/CaptureOutput）→ T2.2（history 骨架 + 门禁扩展）→ T2.3（两个存储）→
+      T2.4（PNG 编码归位 + 导出链切到 ArtifactWriter 端口，两半）→ T2.5（域类型 + store 搬入并拆五个文件，两半）→
+      T2.6（剪贴板适配器）→ T2.7（ingest 流水线）→ T2.8/T2.9（接缝核查 + 删死访问器）→ T2.10（本 tag）
+仍然待人工：真机 F5 走一次"截图 → 导出 → 历史可见 → 磁盘文件可打开"（T2.4 已把链路切到
+      ArtifactWriter + CaptureArtifactStore，自动测试覆盖像素与指纹）
+已知偏离（都记录在案，不会被当成已完成）：
+  1. D3：`overlay.rs` 的方法级拆分与 `d2d.rs` 剩余 pass（P1 遗留）；
+  2. `ingest.rs` 未按 docs/23 拆成 service/reader/history 三个文件（T2.7 偏离）；
+  3. `ClipboardService`/`HistoryService` 未另行命名（T2.8 命名偏离，理由见 §14.26）；
+  4. `CaptureArtifactStore` 的 cleanup/LRU 未实现（仓库本无淘汰策略）。
+下一阶段：P3（`snapclip-recognize`）——**已按决策 D2 顺延**，不满足触发条件不做。
+      因此下一步实际是 **P4（GPUI 壳）**，其前置已由 D2 改为 T2.10（即本 tag）。
 ```
