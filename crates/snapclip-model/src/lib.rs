@@ -12,6 +12,7 @@
 //!   state-machine internals stay inside their own crate.
 
 pub mod artifact;
+pub mod capture;
 pub mod error;
 pub mod events;
 pub mod geometry;
@@ -19,3 +20,5 @@ pub mod ids;
 pub mod recognition;
 
 pub use geometry::{ImageDimensions, Point, Rect};
+pub use capture::{CaptureArtifact, CapturePayload, CaptureState, PixelFormat};
+pub use error::ErrorCode;

@@ -69,17 +69,9 @@ impl OcrErrorCode {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ErrorCode {
-    InvalidArgument,
-    NotFound,
-    Conflict,
-    Unsupported,
-    Cancelled,
-    Storage,
-    Internal,
-}
+// 过渡期转发（docs/23 T1.3）：定义已搬到 `snapclip-model`，这里是唯一实现的转出口。
+// 删除条件：P1 结束时（T1.10）转发必须为零。
+pub use snapclip_model::error::ErrorCode;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
