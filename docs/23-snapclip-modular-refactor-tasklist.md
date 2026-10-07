@@ -258,14 +258,14 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 | T3.4 | 资源对比 + 阶段验收 + tag `refactor-p3` | T3.3 | — | 低 | **暂缓（D2）** |
 | T4.1 + T4.1.1 | 开工前研读 + **前端功能迁移矩阵** | — | 1 表格 | 低 | [x]（guides 通读 + 矩阵填实；gpui-kit 0.7.1） |
 | T4.2 | `apps/snapclip` 骨架（init/Root/单窗口） | T4.1, T2.10（D2 解除了对 T3.4 的依赖） | ~5 文件 | 中 | [x]（包名 `snapclip-app`；构建 + 起窗 + 门禁全过） |
-| T4.3 | history 能力（Entity + 虚拟列表 + `ElementId`=clip id） | T4.2 | ~6 文件 | 高 | 部分 [x]（模型/图标/视图/接线/回车复制/**GPUI 集成测试**已落地；分页、删除确认、缩略图待续，见 §14.29–§14.31） |
+| T4.3 | history 能力（Entity + 虚拟列表 + `ElementId`=clip id） | T4.2 | ~6 文件 | 高 | [x]（模型/图标/视图/接线/回车复制/**GPUI 集成测试**；分页/类型筛选/删除确认/懒加载缩略图/焦点归属，见 §14.29–§14.31、§14.41） |
 | T4.4 | settings 能力（**新增**，不是迁移） | T4.3 | ~5 文件 | 中 | 部分 [x]（模型/持久化/桥/设置页/页内导航/**交互测试**已落地，见 §14.35–§14.38；跨壳热更新待 P6 或另定） |
 | T4.4.1 | 两个窗口检测开关接成真实设置通道 | T4.4 | 3 文件 | 中 | 部分 [x]（**capture 侧全通且有单测**：`DetectionOptions` → worker → fallback → provider builder，`a_non_default_adopt_text_runs_reaches_the_fallback` 钉住；剩"设置页 → 壳传值"属 T4.4；第二个开关无行为未发明。见 §14.32–§14.36） |
-| T4.5 | 事件桥（`snapclip-model::AppEvent` + channel + 丢弃过期） | T4.3 | 2 文件 | 高 | [ ] |
-| T4.6 | 托盘（Win32，**新建**） | T4.2 | 1 文件 | 中 | [ ] |
-| T4.7 | 测试三层 + 无障碍树断言（**先 spike**） | T4.3–T4.6 | ~4 文件 | 中 | [ ] |
-| T4.8 | 性能对比（对 §1.2 基线） | T4.7 | — | 中 | 部分 [x]（debug 对比已实测，见 §14.39；**release 对比与"同一工作量"的对比待 P6**） |
-| T4.9 | 阶段验收 + tag `refactor-p4` | T4.8 | — | 低 | [ ] |
+| T4.5 | 事件桥（`snapclip-model::AppEvent` + channel + 丢弃过期） | T4.3 | 2 文件 | 高 | [x]（`AppEvent` + `EventBus/GenerationGate` + 两个端口适配器 + 屏幕订阅；端到端用例真跑。**发布者接线随 P6**，见 §14.40） |
+| T4.6 | 托盘（Win32，**新建**） | T4.2 | 1 文件 | 中 | [x]（`tray.rs` 隐藏窗口 + `Shell_NotifyIconW` + 线程与 join；真机建/删图标实测。菜单"截图"缺 overlay，记账待 P6，见 §14.42） |
+| T4.7 | 测试三层 + 无障碍树断言（**先 spike**） | T4.3–T4.6 | ~4 文件 | 中 | [x]（尖刺结论：a11y 断言可用，门禁**不降级**；键盘/筛选/删除/事件/设置/托盘建删均已覆盖，见 §14.43） |
+| T4.8 | 性能对比（对 §1.2 基线） | T4.7 | — | 中 | 部分 [x]（debug **与 release** 已实测，见 §14.39、§14.44；**"同一工作量"的对比只能等 P6**） |
+| T4.9 | 阶段验收 + tag `refactor-p4` | T4.8 | — | 低 | [x]（门禁矩阵 + tag + 回退演练，见 §14.45） |
 | T5.x | 进程插件边界（**触发式**，见 §9） | 判据成立 | — | 高 | [ ] |
 | T6.x | 删除 Tauri 与旧目录 | T4.9 | — | 中 | [ ] |
 
@@ -2413,6 +2413,95 @@ T4.7 验收对照：
 提交 SHA：见提交
 推送/tag：origin/main
 回退对象：096b2b2
+```
+
+### §14.44 T4.8 第二半：release 构建实测（同一张表补齐第三列）
+
+```
+任务编号：T4.8（第二半：release + 与 debug 同口径对比）
+状态：已完成（测量）；"同一工作量"对比仍待 P6
+分支：main
+前置提交/tag：054a867
+怎么测的（与 §1.2/§14.39 同一口径，便于对齐）：`cargo build --release -p snapclip-app`
+  （release profile: `lto=true`、`codegen-units=1`、`opt-level=3`、`strip=true`、`panic=abort`
+  → 本机 **5 分 51 秒**），然后 `Start-Process -WindowStyle Hidden` 起进程、静置 10 s 取快照、
+  采样 20 s CPU、计数 WebView2、`Stop-Process` 后确认无残留。
+实测（2026-10-07，本机 20 逻辑核）：
+
+| 指标 | Tauri 宿主（debug §1.2） | GPUI 壳 debug（§14.39） | **GPUI 壳 release（本次）** |
+| --- | --- | --- | --- |
+| 应用自身进程 / 线程 | 1 / 17–18 | 1 / 40 | 1 / **39** |
+| 常驻 WS / 私有 | 36.7 MB / 5.8 MB | 73.4 MB / 138.5 MB | **62.1 MB / 142.1 MB** |
+| 句柄 | 352–353 | 513 | **521** |
+| WebView2 附加进程 / 内存 | +6 / +328 MB | 0 / 0 | **0 / 0** |
+| 空闲 CPU（20 s） | ~0.00 % | 0.035 % | **< 0.05 %（20 s 内 `TotalProcessorTime` 增量取整为 0 s）** |
+| 主 exe | 19.31 MB | 56.49 MB | **16.69 MB** |
+
+怎么读（**不粉饰**）：
+  - release 把自身常驻从 debug 的 73.4 MB 压到 62.1 MB，exe 从 56.49 MB 压到 16.69 MB
+    （`strip` + LTO 的功劳），**WebView2 仍是 0**——换壳的结构性收益在两种构建下都成立。
+  - 但 release 的自身常驻（62.1 MB）**仍高于** Tauri 宿主的 36.7 MB。这不是"GPUI 更差"的结论，
+    因为两者**工作量不同**（capture/clipboard/OCR 还在 Tauri 宿主里跑），而且 Tauri 那 36.7 MB
+    背后还挂着 6 个 WebView2 进程 / 约 330 MB。公平结论必须等 P6 之后同工作量重测。
+  - 私有内存 release 比 debug 略高（142.1 vs 138.5 MB）：打包/优化后分配器与 arena 行为不同，
+    量级差异（<3%），不作为结论。
+  - 进程被强制结束（`Stop-Process`）时托盘图标会留一个幽灵条目直到系统刷新——这是 Windows 对
+    任何被强杀程序的既定行为，不是本实现的问题（正常退出走 `Drop` → `NIM_DELETE`）。
+剩余（T4.8 真正的收尾）：P6 之后用**同一工作量**再测一次这张表，并补"overlay 出现延迟 / 输入延迟 /
+  截图延迟"与 §1.2 的 `present_us`/`over16ms`。
+提交 SHA：见提交（文档）
+推送/tag：origin/main
+回退对象：054a867
+```
+
+### §14.45 T4.9 阶段验收 + tag `refactor-p4` + 回退演练
+
+```
+任务编号：T4.9
+状态：已完成
+分支：main
+前置提交/tag：054a867（本记录随后与 tag 一起提交）
+G2 门禁（§0.2/§12.2，本次实测）：
+
+| 门禁 | 命令 | 结果 |
+| --- | --- | --- |
+| capture 正确性 | `cargo test -p snapclip-capture --lib` | **345 passed / 6 ignored**（第二次**空载**复跑；见下方"一次假红"） |
+| history | `cargo test -p snapclip-history` | **51 passed** |
+| model | `cargo test -p snapclip-model` | **23 passed** |
+| GPUI 壳（含 UI 集成层） | `cargo test -p snapclip-app --features test-support` | **29 lib + 5 UI passed**（1 ignored = 真机托盘用例） |
+| 全 workspace 编译 | `cargo check --workspace --all-targets` | **0 warning** |
+| 依赖方向 | `tools/check-dependency-direction.ps1` | **dependency direction is clean** |
+| 换壳边界 | `cargo tree -p snapclip-app -e normal` | **无 `tauri` / 无 `wry`** |
+| 真机托盘 | `cargo test -p snapclip-app --lib -- --ignored` | **ok**（建图标 → 移除 → 线程 join） |
+
+一次假红（**如实记录**）：首轮 `cargo test -p snapclip-capture --lib`（默认并行）报了
+  `344 passed; 1 failed`。当时的失败条目名没有被保留（我把输出过滤成了 `test result` 行），
+  而且那一轮**与 release 的 LTO 编译同时跑**，CPU 被占满。紧接着的空载复跑是
+  **345/345 全绿**。这与 §11 记录的"冷启动/高负载下探针偶发假红，复跑即回"是同一类现象；
+  **没有**为了让它变绿改过任何断言或阈值。若再复现，第一步是单独重跑该用例而不是改预期。
+  教训：测试输出不要当场过滤，先落盘再筛（本次第二次起已改成落 `target/capture-tests.log`）。
+
+tag 与回退演练：
+  - `git tag refactor-p4` 后推送；`refactor-p4` 与既有 `refactor-p05` → `refactor-p1` → `refactor-p2`
+    构成 P0/P0.5/P1/P2/P4 的完整回退链。
+  - 演练：`git worktree add ../snapclip-p4-drill refactor-p4`（不动当前工作区与用户的两处本地改动）
+    → 在演练树里 `cargo check --workspace --all-targets` + `cargo test -p snapclip-app --features test-support --lib`
+    → 通过 → `git worktree remove ../snapclip-p4-drill`。
+  - 此时 **Tauri 壳仍在**（本阶段没删任何旧壳代码），两个壳只共享能力 crate 与数据库。
+
+P4 结束后仍然挂账的（写在这里而不是散落各处）：
+  1. **发布者接线**：`AppEvent` 的生产者（capture / 剪贴板 ingest）仍属 Tauri 宿主，GPUI 壳侧只完成了
+     "接缝 + 订阅 + 端到端证明"。P6 组合根搬迁时接线，且**不能两边同时 ingest**（会双写历史）。
+  2. **设置热更新到 overlay**：受同一原因阻塞；当前端到端是"落盘 + 下次启动生效"（用户已在 T4.4 选 (b)）。
+  3. **标注 UI 不生产者**（决策 D1）：`snapclip-capture` 侧模型保留，UI 待 V2。
+  4. **托盘"截图"项**：等 P6 让 overlay 从本进程可达。
+  5. **"同一工作量"性能对比**：P6 后用 §14.44 的同一张表重测。
+  6. **D3**：`overlay.rs` / `d2d.rs` 的剩余拆分（纯文件组织）。
+  7. **真机走查**（只能你做）：F5 截图 → 导出 → 历史出现该条 → 打开文件；托盘菜单点击；
+     设置开关关闭"文字跑条"后 overlay 行为变化。
+提交 SHA：见提交（含 tag）
+推送/tag：origin/main + `refactor-p4`
+回退对象：054a867
 ```
 
 ### §14.39 T4.8 第一半：GPUI 壳 vs Tauri 宿主 + WebView2（debug 实测）
