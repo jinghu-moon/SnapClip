@@ -28,11 +28,11 @@ use crate::capture::window_detection::deep::{
     DeepSelectionProvider, DeepTarget, QueryControl, RefinementJob, RefinementOutcome,
     StopReason,
 };
-use crate::capture::window_detection::model::{SnapshotEpoch, TargetKind};
+use crate::capture::window_detection::model::{PathLevel, SnapshotEpoch, TargetKind};
 use crate::capture::window_detection::uia::{
     WalkBudget, WalkNode, WalkOutcome, fallback_hit_path, is_descendable, is_structural_wrapper,
-    is_text_run_inside_element, is_unspecific_hit, merge_hit_paths, push_box_keeping_containment,
-    should_adopt_provider_box,
+    is_text_run_inside_element, is_unspecific_hit, level_kind_of_control_type, merge_hit_paths,
+    push_box_keeping_containment, should_adopt_provider_box,
 };
 
 use super::win::window as win32;
@@ -110,8 +110,9 @@ enum ProviderHit {
 /// The hit comes from the provider's own point query, which is a different view of the page than the
 /// walk that built the path; the levels that do not contain it are dropped (docs/21 §5.17) so that
 /// "one level up" always lands on a box that contains the current answer.
-fn push_hit_box(outcome: &mut WalkOutcome, bounds: Rect) -> bool {
-    if !push_box_keeping_containment(&mut outcome.path, bounds) {
+fn push_hit_box(outcome: &mut WalkOutcome, level: PathLevel) -> bool {
+    let bounds = level.rect;
+    if !push_box_keeping_containment(&mut outcome.path, level) {
         outcome.stop_reason = StopReason::TraversalLimit;
         return false;
     }
@@ -741,7 +742,12 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
             if visible.is_empty() {
                 continue;
             }
-            if !outcome.push(visible) {
+            // The level carries what the node *is* (docs/21 §5.24, B6): the walk read the control
+            // type anyway, and dropping it here is what used to leave every ancestor a "container".
+            if !outcome.push(PathLevel::new(
+                visible,
+                level_kind_of_control_type(level.node.control_type),
+            )) {
                 break;
             }
             visible_parent = visible;
@@ -757,7 +763,11 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
         );
         let merged = merge_hit_paths(&outcome.path, &fallback, window_bounds, job.point);
         outcome.path = merged;
-        outcome.target = outcome.path.last().copied().unwrap_or(window_bounds);
+        outcome.target = outcome
+            .path
+            .last()
+            .map(|level| level.rect)
+            .unwrap_or(window_bounds);
 
         // **Precision top-up** (docs/21 §5.7). The provider answers a point query with the innermost
         // element there by construction; when our walk stopped above it, adopt that box. The rule is
@@ -784,7 +794,11 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
                     job.point,
                     self.adopt_text_runs,
                 );
-                let adopted = finer && push_hit_box(&mut outcome, hit);
+                let adopted = finer
+                    && push_hit_box(
+                        &mut outcome,
+                        PathLevel::new(hit, level_kind_of_control_type(control_type)),
+                    );
                 // Did this transport get below the page? A document or window-sized answer says no,
                 // and that is what tells the composite to ask MSAA (docs/21 §5.19).
                 let answered_specifically =
@@ -808,7 +822,8 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
                     ));
                 }
                 note.push_str(&format!(
-                    " type={control_type} class={class:?} walk={}x{} at ({},{})",
+                    " type={control_type} {} class={class:?} walk={}x{} at ({},{})",
+                    level_kind_of_control_type(control_type).debug_name(),
                     walk.width(),
                     walk.height(),
                     walk.left,
@@ -1386,8 +1401,14 @@ mod tests {
             panic!("a live window must produce a target, got {outcome:?}");
         };
         assert_eq!(target.window.hwnd, fixture.handle());
-        assert_eq!(target.path[0], bounds, "the path always starts at the window frame");
-        assert_eq!(target.path.last(), Some(&target.screen_bounds));
+        assert_eq!(
+            target.path[0].rect, bounds,
+            "the path always starts at the window frame"
+        );
+        assert_eq!(
+            target.path.last().map(|level| level.rect),
+            Some(target.screen_bounds)
+        );
         assert!(!target.screen_bounds.is_empty());
         // The published rectangle must be inside the window's visible area.
         assert!(!target.screen_bounds.intersect(bounds).is_empty());
@@ -1797,7 +1818,7 @@ mod tests {
             let mut published = None;
             let mut last_stop = None;
             let mut last_depth = 0_usize;
-            let mut last_path: Option<Vec<Rect>> = None;
+            let mut last_path: Option<Vec<PathLevel>> = None;
             for attempt in 0..4 {
                 if attempt > 0 {
                     pump(250);
@@ -1939,13 +1960,16 @@ mod tests {
                 if path.is_empty() {
                     broken_chains.push(format!("{}: empty path", fixture.id));
                 }
-                if let Some(pair) = path.windows(2).find(|pair| !slack(pair[0], pair[1])) {
+                if let Some(pair) = path
+                    .windows(2)
+                    .find(|pair| !slack(pair[0].rect, pair[1].rect))
+                {
                     broken_chains.push(format!(
                         "{}: {:?} does not contain {:?} (path: {path:?})",
                         fixture.id, pair[0], pair[1]
                     ));
                 }
-                if path.last() != published.as_ref() {
+                if path.last().map(|level| level.rect) != published {
                     broken_chains.push(format!(
                         "{}: path ends at {:?}, published {:?}",
                         fixture.id,
@@ -2891,14 +2915,14 @@ mod tests {
                     if let Some(pair) = target
                         .path
                         .windows(2)
-                        .find(|pair| !slack(pair[0], pair[1]))
+                        .find(|pair| !slack(pair[0].rect, pair[1].rect))
                     {
                         broken_chains.push(format!(
                             "point=({},{}): {:?} does not contain {:?}",
                             point.x, point.y, pair[0], pair[1]
                         ));
                     }
-                    if target.path.last() != Some(&target.screen_bounds) {
+                    if target.path.last().map(|level| level.rect) != Some(target.screen_bounds) {
                         broken_chains.push(format!(
                             "point=({},{}): path ends at {:?}, published {:?}",
                             point.x,
@@ -3240,26 +3264,13 @@ mod tests {
     }
 
     /// The control types that matter when reading the probe output.
+    /// The log's spelling of a control type.
+    ///
+    /// The ids live in one place now (`level_kind_of_control_type`, which the walk uses to publish
+    /// what each level *is*); this is that vocabulary's English view, so a log line and the label can
+    /// never disagree about what the provider said.
     fn control_type_name(kind: i32) -> &'static str {
-        match kind {
-            50000 => "Button",
-            50003 => "ComboBox",
-            50004 => "Edit",
-            50005 => "Hyperlink",
-            50006 => "Image",
-            50007 => "ListItem",
-            50008 => "List",
-            50020 => "Text",
-            50025 => "Custom",
-            50026 => "Group",
-            50029 => "DataItem",
-            50030 => "Document",
-            50032 => "Window",
-            50033 => "Pane",
-            50034 => "Header",
-            0 => "Unknown",
-            _ => "Other",
-        }
+        level_kind_of_control_type(kind).debug_name()
     }
 
     /// The page the cross-origin fixture frame loads (docs/21 §5.20).

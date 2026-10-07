@@ -58,8 +58,8 @@ pub use deep::{
 };
 pub use hit_test::{point_distance_squared, rect_distance_squared};
 pub use model::{
-    EpochCounter, HoverValidity, RequestGate, RequestId, SnapshotEpoch, TargetKind, WindowCandidate,
-    WindowIdentity, WindowSnapshot, WindowTarget,
+    EpochCounter, HoverValidity, LevelKind, PathLevel, RequestGate, RequestId, SnapshotEpoch,
+    TargetKind, WindowCandidate, WindowIdentity, WindowSnapshot, WindowTarget,
 };
 pub use provider::{Exclusions, WindowDetectionError, WindowTargetProvider, is_shell_surface_class};
 pub use snapshot::{
@@ -72,8 +72,8 @@ pub use transition::{
 pub use uia::{
     DOCUMENT_CONTROL_TYPE, MAX_DEPTH, MAX_NODES, MAX_PATH_LEN, WalkBudget, WalkNode, WalkOutcome,
     is_bare_text_control_type, is_bare_text_role, is_descendable, is_finer_refinement,
-    is_text_run_inside_element, is_unspecific_hit, push_box_keeping_containment,
-    should_adopt_msaa_box, should_adopt_provider_box,
+    is_text_run_inside_element, is_unspecific_hit, level_kind_of_control_type, level_kind_of_msaa_role,
+    push_box_keeping_containment, should_adopt_msaa_box, should_adopt_provider_box,
 };
 
 /// Cursor rest time before an automatic-snap preview may appear (docs/14 §4.1).

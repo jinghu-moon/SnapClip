@@ -8,6 +8,7 @@
 //! is exactly the failure mode the design budgets for.
 
 use super::deep::StopReason;
+use super::model::{LevelKind, PathLevel};
 use crate::capture::geometry::{Point, Rect};
 
 /// Bound on how deep the walk may descend before it gives up.
@@ -190,6 +191,78 @@ pub fn is_interactive_control_role(role: i32) -> bool {
 pub const MSAA_STATIC_TEXT_ROLE: i32 = 0x29;
 pub const MSAA_TEXT_ROLE: i32 = 0x2a;
 
+/// The label vocabulary for a UIA control type (docs/21 §5.24, B6).
+///
+/// One mapping, at the boundary: the walk reads this for every node it accepts, so each published
+/// level carries what it is. Anything unrecognised — including the structural `Pane`/`Group`/`Custom`
+/// wrappers that dominate a browser's tree — maps to [`LevelKind::Unknown`], which the label reads as
+/// "keep saying 容器/元素".
+pub fn level_kind_of_control_type(control_type: i32) -> LevelKind {
+    match control_type {
+        50000 => LevelKind::Button,
+        50002 => LevelKind::CheckBox,
+        50003 => LevelKind::ComboBox,
+        50004 => LevelKind::Edit,
+        50005 => LevelKind::Hyperlink,
+        50006 => LevelKind::Image,
+        50007 => LevelKind::ListItem,
+        50008 => LevelKind::List,
+        50009 => LevelKind::Menu,
+        50012 => LevelKind::ProgressBar,
+        50013 => LevelKind::RadioButton,
+        50014 => LevelKind::ScrollBar,
+        50015 => LevelKind::Slider,
+        50018 => LevelKind::Tab,
+        50020 => LevelKind::Text,
+        50021 => LevelKind::ToolBar,
+        50023 => LevelKind::Tree,
+        50025 => LevelKind::Custom,
+        50026 => LevelKind::Group,
+        50028 => LevelKind::DataGrid,
+        50029 => LevelKind::DataItem,
+        50030 => LevelKind::Document,
+        50032 => LevelKind::Window,
+        50033 => LevelKind::Pane,
+        50034 => LevelKind::Header,
+        50036 => LevelKind::Table,
+        50037 => LevelKind::TitleBar,
+        _ => LevelKind::Unknown,
+    }
+}
+
+/// The same vocabulary for an MSAA role — the transport that answers when UIA stops above the box
+/// (docs/21 §5.16). Roles are `ROLE_SYSTEM_*`; only the ones a label has something to say about are
+/// listed, and everything else stays [`LevelKind::Unknown`].
+pub fn level_kind_of_msaa_role(role: i32) -> LevelKind {
+    match role {
+        0x02 => LevelKind::Menu,        // ROLE_SYSTEM_MENUBAR
+        0x03 => LevelKind::ScrollBar,   // ROLE_SYSTEM_SCROLLBAR
+        0x0c => LevelKind::Menu,        // ROLE_SYSTEM_MENUITEM
+        0x0f => LevelKind::Document,    // ROLE_SYSTEM_DOCUMENT
+        0x10 => LevelKind::Pane,        // ROLE_SYSTEM_PANE
+        0x14 => LevelKind::Group,       // ROLE_SYSTEM_GROUPING
+        0x16 => LevelKind::ToolBar,     // ROLE_SYSTEM_TOOLBAR
+        0x18 => LevelKind::Table,       // ROLE_SYSTEM_TABLE
+        0x1d => LevelKind::DataItem,    // ROLE_SYSTEM_CELL
+        0x1e => LevelKind::Hyperlink,   // ROLE_SYSTEM_LINK
+        0x21 => LevelKind::List,        // ROLE_SYSTEM_LIST
+        0x22 => LevelKind::ListItem,    // ROLE_SYSTEM_LISTITEM
+        0x23 => LevelKind::Tree,        // ROLE_SYSTEM_OUTLINE
+        0x24 => LevelKind::Tree,        // ROLE_SYSTEM_OUTLINEITEM
+        0x25 => LevelKind::Tab,         // ROLE_SYSTEM_PAGETAB
+        0x28 => LevelKind::Image,       // ROLE_SYSTEM_GRAPHIC
+        0x29 => LevelKind::Text,        // ROLE_SYSTEM_STATICTEXT
+        0x2a => LevelKind::Text,        // ROLE_SYSTEM_TEXT
+        0x2b => LevelKind::Button,      // ROLE_SYSTEM_PUSHBUTTON
+        0x2c => LevelKind::CheckBox,    // ROLE_SYSTEM_CHECKBUTTON
+        0x2d => LevelKind::RadioButton, // ROLE_SYSTEM_RADIOBUTTON
+        0x2e | 0x2f => LevelKind::ComboBox, // ROLE_SYSTEM_COMBOBOX / DROPLIST
+        0x30 => LevelKind::ProgressBar, // ROLE_SYSTEM_PROGRESSBAR
+        0x33 => LevelKind::Slider,      // ROLE_SYSTEM_SLIDER
+        _ => LevelKind::Unknown,
+    }
+}
+
 /// The core of every refinement rule: the provider's box is used only when it is a strict
 /// refinement of the walk's answer (non-empty, still under the cursor, strictly smaller).
 pub fn is_finer_refinement(walk: Rect, hit: Rect, point: Point) -> bool {
@@ -280,12 +353,13 @@ pub fn is_bare_text_role(role: i32) -> bool {
 /// ancestors, and leaving them in would break the containment invariant the ancestor walk depends on
 /// (each level must contain the next, and the last one is the published box). Returns `false` when
 /// the chain is already at [`MAX_PATH_LEN`].
-pub fn push_box_keeping_containment(path: &mut Vec<Rect>, bounds: Rect) -> bool {
-    if path.last() == Some(&bounds) {
+pub fn push_box_keeping_containment(path: &mut Vec<PathLevel>, level: PathLevel) -> bool {
+    let bounds = level.rect;
+    if path.last().map(|last| last.rect) == Some(bounds) {
         return true;
     }
     while path.len() > 1 {
-        let last = path.last().copied().expect("the loop keeps one level");
+        let last = path.last().copied().expect("the loop keeps one level").rect;
         if last.contains_rect(bounds) {
             break;
         }
@@ -294,7 +368,7 @@ pub fn push_box_keeping_containment(path: &mut Vec<Rect>, bounds: Rect) -> bool 
     if path.len() >= MAX_PATH_LEN {
         return false;
     }
-    path.push(bounds);
+    path.push(level);
     true
 }
 
@@ -302,7 +376,7 @@ pub fn push_box_keeping_containment(path: &mut Vec<Rect>, bounds: Rect) -> bool 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalkOutcome {
     /// Top-down path; `[0]` is the window frame.
-    pub path: Vec<Rect>,
+    pub path: Vec<PathLevel>,
     /// The deepest element the walk accepted.
     pub target: Rect,
     pub stop_reason: StopReason,
@@ -312,27 +386,26 @@ impl WalkOutcome {
     /// A walk that could not get past the window frame.
     pub fn window_only(window_bounds: Rect, stop_reason: StopReason) -> Self {
         Self {
-            path: vec![window_bounds],
+            path: vec![PathLevel::new(window_bounds, LevelKind::Window)],
             target: window_bounds,
             stop_reason,
         }
     }
 
-    /// Push a deeper rectangle, keeping the path bounded.
+    /// Push a deeper level, keeping the path bounded.
     ///
-    /// Duplicate rectangles are not appended: a container that reports the same bounds as
-    /// its parent would otherwise pad the path with entries the overlay draws on top of
-    /// each other.
-    pub fn push(&mut self, bounds: Rect) -> bool {
+    /// Duplicate rectangles are not appended: a container that reports the same bounds as its parent
+    /// would otherwise pad the path with entries the overlay draws on top of each other.
+    pub fn push(&mut self, level: PathLevel) -> bool {
         if self.path.len() >= MAX_PATH_LEN {
             self.stop_reason = StopReason::TraversalLimit;
             return false;
         }
-        if self.path.last() == Some(&bounds) {
+        if self.path.last().map(|last| last.rect) == Some(level.rect) {
             return true;
         }
-        self.path.push(bounds);
-        self.target = bounds;
+        self.path.push(level);
+        self.target = level.rect;
         true
     }
 }
@@ -372,27 +445,36 @@ fn rect_sort_key(rect: Rect) -> (i64, i32, i32, i32, i32) {
 ///
 /// A path entry must contain the point (otherwise it does not describe what the cursor is
 /// on) and must differ from the current tail (otherwise the path would repeat a node).
-fn push_if_useful(path: &mut Vec<Rect>, rect: Rect, point: Point) -> bool {
-    if rect.is_empty() || !rect.contains(point) {
+fn push_if_useful(path: &mut Vec<PathLevel>, level: PathLevel, point: Point) -> bool {
+    if level.rect.is_empty() || !level.rect.contains(point) {
         return false;
     }
-    if path.last() == Some(&rect) {
+    if path.last().map(|last| last.rect) == Some(level.rect) {
         return false;
     }
-    path.push(rect);
+    path.push(level);
     true
 }
 
 /// The provider-free hit path: every visible child window under the point, plus the frame.
 ///
 /// Returned in the order they were collected; [`merge_hit_paths`] imposes the order.
-pub fn fallback_hit_path(child_rects: &[Rect], window_bounds: Rect, point: Point) -> Vec<Rect> {
-    let mut containing: Vec<Rect> = child_rects
+///
+/// The levels carry no kind: they are rectangles read off child **windows**, which say nothing about
+/// what is inside them. `Unknown` is what keeps the label from calling a Chromium widget host a
+/// `窗口` — the fallback is a geometric guess, and the words stay the generic ones.
+pub fn fallback_hit_path(child_rects: &[Rect], window_bounds: Rect, point: Point) -> Vec<PathLevel> {
+    let mut containing: Vec<PathLevel> = child_rects
         .iter()
         .copied()
         .filter(|rect| rect.contains(point))
+        .map(PathLevel::unknown)
         .collect();
-    push_if_useful(&mut containing, window_bounds, point);
+    push_if_useful(
+        &mut containing,
+        PathLevel::new(window_bounds, LevelKind::Window),
+        point,
+    );
     containing
 }
 
@@ -410,34 +492,34 @@ pub fn fallback_hit_path(child_rects: &[Rect], window_bounds: Rect, point: Point
 /// window frame and the last entry is the most specific one, so `target = path.last()` is the
 /// control under the cursor.
 pub fn merge_hit_paths(
-    primary: &[Rect],
-    fallback: &[Rect],
+    primary: &[PathLevel],
+    fallback: &[PathLevel],
     window_bounds: Rect,
     point: Point,
-) -> Vec<Rect> {
+) -> Vec<PathLevel> {
     // 1. The primary path, cleaned: usable entries only, frame first.
-    let mut path: Vec<Rect> = primary
+    let mut path: Vec<PathLevel> = primary
         .iter()
         .copied()
-        .filter(|rect| !rect.is_empty() && rect.contains(point))
+        .filter(|level| !level.rect.is_empty() && level.rect.contains(point))
         .collect();
     if path.is_empty() {
-        path.push(window_bounds);
+        path.push(PathLevel::new(window_bounds, LevelKind::Window));
     }
-    if path.first() != Some(&window_bounds) && window_bounds.contains(point) {
-        path.insert(0, window_bounds);
+    if path.first().map(|first| first.rect) != Some(window_bounds) && window_bounds.contains(point) {
+        path.insert(0, PathLevel::new(window_bounds, LevelKind::Window));
     }
 
     // 2. Extend downward with fallback rectangles that are strictly inside the current tail.
-    let mut deeper: Vec<Rect> = fallback
+    let mut deeper: Vec<PathLevel> = fallback
         .iter()
         .copied()
-        .filter(|rect| !rect.is_empty() && rect.contains(point))
+        .filter(|level| !level.rect.is_empty() && level.rect.contains(point))
         .collect();
-    deeper.sort_unstable_by_key(|rect| rect_sort_key(*rect));
+    deeper.sort_unstable_by_key(|level| rect_sort_key(level.rect));
     for candidate in deeper {
-        let tail = *path.last().expect("the path is never empty");
-        if !same_rect(candidate, tail) && contains_rect(tail, candidate) {
+        let tail = path.last().expect("the path is never empty").rect;
+        if !same_rect(candidate.rect, tail) && contains_rect(tail, candidate.rect) {
             path.push(candidate);
         }
     }
@@ -450,6 +532,13 @@ mod tests {
 
     fn rect(left: i32, top: i32, right: i32, bottom: i32) -> Rect {
         Rect::new(left, top, right, bottom)
+    }
+
+    /// A path level with no kind. These tests are about the walk's *policy* — descend, adopt,
+    /// contain, merge, order — so plain rectangles dominate and the level wrapper is the rare form;
+    /// the kind a provider attaches is tested where it is produced.
+    fn lvl(left: i32, top: i32, right: i32, bottom: i32) -> PathLevel {
+        PathLevel::unknown(rect(left, top, right, bottom))
     }
 
     fn node(left: i32, top: i32, right: i32, bottom: i32) -> WalkNode {
@@ -629,36 +718,36 @@ mod tests {
 
     #[test]
     fn adopting_a_hit_keeps_the_chain_a_containment_chain() {
-        let frame = rect(0, 0, 1000, 800);
+        let frame = lvl(0, 0, 1000, 800);
         // A walk that went in through a sibling branch: 400x300 does not contain the hit.
-        let mut path = vec![frame, rect(100, 100, 500, 400), rect(300, 200, 420, 260)];
+        let mut path = vec![frame, lvl(100, 100, 500, 400), lvl(300, 200, 420, 260)];
         assert!(push_box_keeping_containment(
             &mut path,
-            rect(600, 300, 700, 360)
+            lvl(600, 300, 700, 360)
         ));
         assert_eq!(
             path,
-            vec![frame, rect(600, 300, 700, 360)],
+            vec![frame, lvl(600, 300, 700, 360)],
             "only the levels that contain the hit survive; the frame always does"
         );
         // A hit that the whole walk already contains keeps every level.
-        let mut nested = vec![frame, rect(100, 100, 500, 400)];
+        let mut nested = vec![frame, lvl(100, 100, 500, 400)];
         assert!(push_box_keeping_containment(
             &mut nested,
-            rect(150, 150, 200, 200)
+            lvl(150, 150, 200, 200)
         ));
         assert_eq!(nested.len(), 3);
         // The same box twice is not a second level.
         assert!(push_box_keeping_containment(
             &mut nested,
-            rect(150, 150, 200, 200)
+            lvl(150, 150, 200, 200)
         ));
         assert_eq!(nested.len(), 3);
         // A full chain refuses rather than truncating.
-        let mut full: Vec<Rect> = (0..MAX_PATH_LEN)
-            .map(|step| rect(0, 0, 1000 - step as i32, 800 - step as i32))
+        let mut full: Vec<PathLevel> = (0..MAX_PATH_LEN)
+            .map(|step| lvl(0, 0, 1000 - step as i32, 800 - step as i32))
             .collect();
-        assert!(!push_box_keeping_containment(&mut full, rect(1, 1, 2, 2)));
+        assert!(!push_box_keeping_containment(&mut full, lvl(1, 1, 2, 2)));
         assert_eq!(full.len(), MAX_PATH_LEN);
     }
 
@@ -695,14 +784,15 @@ mod tests {
     fn the_published_path_stays_ordered_and_bounded() {
         let window = rect(0, 0, 1000, 800);
         let mut outcome = WalkOutcome::window_only(window, StopReason::Complete);
-        assert_eq!(outcome.path, vec![window]);
-        assert!(outcome.push(rect(100, 100, 900, 700)));
-        assert!(outcome.push(rect(300, 300, 500, 500)));
+        // The frame's level carries the one kind a walk can state without asking anyone (§5.24 B6).
+        assert_eq!(outcome.path, vec![PathLevel::new(window, LevelKind::Window)]);
+        assert!(outcome.push(lvl(100, 100, 900, 700)));
+        assert!(outcome.push(lvl(300, 300, 500, 500)));
         assert_eq!(outcome.target, rect(300, 300, 500, 500));
         assert_eq!(outcome.path.len(), 3);
 
         // A container repeating its parent's bounds does not pad the path...
-        assert!(outcome.push(rect(300, 300, 500, 500)));
+        assert!(outcome.push(lvl(300, 300, 500, 500)));
         assert_eq!(outcome.path.len(), 3);
         // ...and a window-only walk is still a usable answer.
         let only = WalkOutcome::window_only(window, StopReason::Unsupported);
@@ -717,12 +807,12 @@ mod tests {
         // The window frame already occupies one slot, so MAX_PATH_LEN - 1 more fit.
         for index in 0..MAX_PATH_LEN - 1 {
             let offset = index as i32;
-            assert!(outcome.push(rect(offset, offset, 900 + offset, 900 + offset)));
+            assert!(outcome.push(lvl(offset, offset, 900 + offset, 900 + offset)));
         }
         assert_eq!(outcome.path.len(), MAX_PATH_LEN);
-        assert!(!outcome.push(rect(-1, -1, 899, 899)), "the path is full");
+        assert!(!outcome.push(lvl(-1, -1, 899, 899)), "the path is full");
         assert_eq!(outcome.stop_reason, StopReason::TraversalLimit);
-        assert!(!outcome.push(rect(5000, 5000, 5100, 5100)));
+        assert!(!outcome.push(lvl(5000, 5000, 5100, 5100)));
         assert_eq!(outcome.path.len(), MAX_PATH_LEN);
     }
 
@@ -735,46 +825,60 @@ mod tests {
             rect(0, 800, 100, 900), // outside the window entirely
         ];
         let path = fallback_hit_path(&children, window, Point::new(600, 400));
-        assert!(path.contains(&rect(200, 100, 1000, 700)));
-        assert!(path.contains(&window), "the frame closes the path");
-        assert!(!path.contains(&rect(0, 800, 100, 900)), "off-window children stay out");
+        assert!(path.iter().any(|level| level.rect == rect(200, 100, 1000, 700)));
+        assert!(
+            path.iter().any(|level| level.rect == window),
+            "the frame closes the path"
+        );
+        assert!(
+            !path.iter().any(|level| level.rect == rect(0, 800, 100, 900)),
+            "off-window children stay out"
+        );
+        // A child *window* is a rectangle, not a kind: the fallback may only refine geometry, so its
+        // levels publish as unknown and the label keeps its generic words (§5.24 B6).
+        assert!(
+            path.iter().all(|level| level.kind == LevelKind::Unknown
+                || level.kind == LevelKind::Window)
+        );
         // A point on no child still yields the frame.
         let bare = fallback_hit_path(&children, window, Point::new(900, 750));
-        assert_eq!(bare, vec![window]);
+        assert_eq!(bare, vec![PathLevel::new(window, LevelKind::Window)]);
     }
 
     #[test]
     fn merging_extends_the_primary_path_downwards_and_never_coarsens() {
         let window = rect(0, 0, 1000, 800);
-        let pane = rect(100, 100, 900, 700);
-        let control = rect(300, 300, 500, 400);
-        let finer = rect(320, 320, 480, 380);
+        let pane = lvl(100, 100, 900, 700);
+        let control = lvl(300, 300, 500, 400);
+        let finer = lvl(320, 320, 480, 380);
         let point = Point::new(400, 350);
+        let frame = PathLevel::new(window, LevelKind::Window);
 
         // The accessibility path runs frame → pane → control; the fallback knows something
         // deeper, so it is appended and the published rectangle gets finer.
-        let merged = merge_hit_paths(&[window, pane, control], &[finer], window, point);
-        assert_eq!(merged, vec![window, pane, control, finer]);
+        let merged = merge_hit_paths(&[frame, pane, control], &[finer], window, point);
+        assert_eq!(merged, vec![frame, pane, control, finer]);
         assert_eq!(merged.last(), Some(&finer), "the deepest entry is published");
 
         // A *coarser* fallback rectangle must never replace the fine control — that was the
         // regression that made every publish the whole window.
-        let unchanged = merge_hit_paths(&[window, pane, control], &[window], window, point);
-        assert_eq!(unchanged, vec![window, pane, control]);
+        let unchanged = merge_hit_paths(&[frame, pane, control], &[frame], window, point);
+        assert_eq!(unchanged, vec![frame, pane, control]);
         assert_eq!(unchanged.last(), Some(&control));
 
         // With neither, the path is just the frame.
         let bare = merge_hit_paths(&[], &[], window, point);
-        assert_eq!(bare, vec![window]);
+        assert_eq!(bare, vec![frame]);
     }
 
     #[test]
     fn merging_deduplicates_and_keeps_a_nested_order() {
         let window = rect(0, 0, 1000, 800);
-        let outer = rect(100, 100, 900, 700);
-        let inner = rect(300, 300, 500, 400);
-        let deepest = rect(350, 330, 450, 370);
+        let outer = lvl(100, 100, 900, 700);
+        let inner = lvl(300, 300, 500, 400);
+        let deepest = lvl(350, 330, 450, 370);
         let point = Point::new(400, 350);
+        let frame = PathLevel::new(window, LevelKind::Window);
         // Same rectangles from both sources, in different orders.
         let merged = merge_hit_paths(
             &[outer, inner],
@@ -782,7 +886,7 @@ mod tests {
             window,
             point,
         );
-        let unique: Vec<Rect> = {
+        let unique: Vec<PathLevel> = {
             let mut seen = Vec::new();
             for entry in &merged {
                 if !seen.contains(entry) {
@@ -794,7 +898,7 @@ mod tests {
         assert_eq!(unique.len(), merged.len(), "no duplicates: {merged:?}");
         assert_eq!(
             merged.first(),
-            Some(&window),
+            Some(&frame),
             "the path is published frame-first"
         );
         assert_eq!(
@@ -804,15 +908,16 @@ mod tests {
         );
         // Each level is contained by the one before it: a nested, outermost-first path.
         for pair in merged.windows(2) {
+            let (outer, inner) = (pair[0].rect, pair[1].rect);
             assert!(
-                !pair[0].is_empty() && pair[0] != pair[1],
+                !outer.is_empty() && outer != inner,
                 "levels must differ: {merged:?}"
             );
             assert!(
-                pair[0].left <= pair[1].left
-                    && pair[0].top <= pair[1].top
-                    && pair[0].right >= pair[1].right
-                    && pair[0].bottom >= pair[1].bottom,
+                outer.left <= inner.left
+                    && outer.top <= inner.top
+                    && outer.right >= inner.right
+                    && outer.bottom >= inner.bottom,
                 "each level must contain the next: {merged:?}"
             );
         }
@@ -824,11 +929,14 @@ mod tests {
         // The seed is the caller's trusted first entry (the providers filter by containment
         // before calling in); a sibling that contains the point but *not* the seed is not a
         // level of this path and must not be spliced in.
-        let seed = rect(300, 300, 500, 400);
-        let sibling = rect(700, 600, 900, 780);
+        let seed = lvl(300, 300, 500, 400);
+        let sibling = lvl(700, 600, 900, 780);
         let merged = merge_hit_paths(&[seed], &[sibling], window, Point::new(400, 350));
         // Frame first (the documented order), then the deepest entry that was published.
-        assert_eq!(merged, vec![window, seed]);
+        assert_eq!(
+            merged,
+            vec![PathLevel::new(window, LevelKind::Window), seed]
+        );
         assert_eq!(merged.last(), Some(&seed), "the sibling never becomes a level");
     }
 

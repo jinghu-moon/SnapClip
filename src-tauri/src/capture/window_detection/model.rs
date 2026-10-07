@@ -186,6 +186,199 @@ impl TargetKind {
     }
 }
 
+/// One level of a deep path: where it is, and what kind of thing it is (docs/21 §5.24, B6).
+///
+/// The walk always knew both — `WalkNode.control_type` is read for every node — but the published
+/// path kept only the rectangles, so every ancestor could be described as no more than "a container"
+/// and the size label had nothing better to say than `容器`. Carrying the kind per level is what
+/// lets the label name the thing the user is looking at (`846×272 px 代码块`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathLevel {
+    /// Screen bounds in virtual-desktop physical pixels, the same space as
+    /// [`WindowCandidate::screen_bounds`].
+    pub rect: Rect,
+    pub kind: LevelKind,
+}
+
+impl PathLevel {
+    pub const fn new(rect: Rect, kind: LevelKind) -> Self {
+        Self { rect, kind }
+    }
+
+    /// A level whose kind the transport could not say — an MSAA ancestor chain, or a provider that
+    /// answered with a box but no control type.
+    pub const fn unknown(rect: Rect) -> Self {
+        Self {
+            rect,
+            kind: LevelKind::Unknown,
+        }
+    }
+}
+
+/// What a level is, normalised across the providers (docs/21 §5.24, B6).
+///
+/// UIA reports a `ControlTypeId` and MSAA a `Role`, and the two numberings share nothing — so each
+/// provider maps its own magic numbers into this one vocabulary at its own boundary, and the walk,
+/// the label, the log and the tests speak one language from there on.
+///
+/// Two views, two readers: [`Self::debug_name`] is what a session log prints (the UIA spelling) and
+/// [`Self::noun_zh`] is what the size label prints. A kind may have one and not the other — `Pane`
+/// is worth naming in a log and worth *not* naming on screen, where `容器` already says it better.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LevelKind {
+    #[default]
+    Unknown,
+    Button,
+    CheckBox,
+    ComboBox,
+    Edit,
+    Hyperlink,
+    Image,
+    ListItem,
+    List,
+    Menu,
+    ProgressBar,
+    RadioButton,
+    ScrollBar,
+    Slider,
+    Tab,
+    Text,
+    ToolBar,
+    Tree,
+    Table,
+    DataGrid,
+    DataItem,
+    Document,
+    Window,
+    TitleBar,
+    Header,
+    Custom,
+    Group,
+    Pane,
+}
+
+impl LevelKind {
+    /// Every kind, for the exhaustive tests and for the font-subset list (docs/21 §5.23).
+    ///
+    /// A list rather than a derive: the two views below are `match`es, and a match cannot be
+    /// enumerated at runtime — so this is the one place that has to be kept in step, and a test
+    /// asserts it covers exactly the variants the matches do.
+    pub const ALL: [LevelKind; 28] = [
+        Self::Unknown,
+        Self::Button,
+        Self::CheckBox,
+        Self::ComboBox,
+        Self::Edit,
+        Self::Hyperlink,
+        Self::Image,
+        Self::ListItem,
+        Self::List,
+        Self::Menu,
+        Self::ProgressBar,
+        Self::RadioButton,
+        Self::ScrollBar,
+        Self::Slider,
+        Self::Tab,
+        Self::Text,
+        Self::ToolBar,
+        Self::Tree,
+        Self::Table,
+        Self::DataGrid,
+        Self::DataItem,
+        Self::Document,
+        Self::Window,
+        Self::TitleBar,
+        Self::Header,
+        Self::Custom,
+        Self::Group,
+        Self::Pane,
+    ];
+
+    /// The nouns a label can show, for the font subset and its coverage gate (docs/21 §5.23).
+    ///
+    /// Derived from [`Self::noun_zh`], so a noun added there cannot be forgotten here — which is
+    /// exactly the failure the gate exists to catch: a label that draws a glyph the embedded font
+    /// does not have.
+    pub fn label_nouns() -> impl Iterator<Item = &'static str> {
+        Self::ALL.iter().filter_map(|kind| kind.noun_zh())
+    }
+
+    /// The name a session log prints: the UIA spelling, so a log line reads like the tree it came
+    /// from. The kinds without a noun still have one — the log is exactly where "it was a `Group`"
+    /// is worth saying.
+    pub fn debug_name(self) -> &'static str {
+        match self {
+            Self::Unknown => "Unknown",
+            Self::Button => "Button",
+            Self::CheckBox => "CheckBox",
+            Self::ComboBox => "ComboBox",
+            Self::Edit => "Edit",
+            Self::Hyperlink => "Hyperlink",
+            Self::Image => "Image",
+            Self::ListItem => "ListItem",
+            Self::List => "List",
+            Self::Menu => "Menu",
+            Self::ProgressBar => "ProgressBar",
+            Self::RadioButton => "RadioButton",
+            Self::ScrollBar => "ScrollBar",
+            Self::Slider => "Slider",
+            Self::Tab => "Tab",
+            Self::Text => "Text",
+            Self::ToolBar => "ToolBar",
+            Self::Tree => "Tree",
+            Self::Table => "Table",
+            Self::DataGrid => "DataGrid",
+            Self::DataItem => "DataItem",
+            Self::Document => "Document",
+            Self::Window => "Window",
+            Self::TitleBar => "TitleBar",
+            Self::Header => "Header",
+            Self::Custom => "Custom",
+            Self::Group => "Group",
+            Self::Pane => "Pane",
+        }
+    }
+
+    /// The word the size label shows, or `None` where the label's own vocabulary already says it
+    /// better (docs/21 §5.24, B6).
+    ///
+    /// Conservative on purpose: generic boxes — `Pane`, `Group`, `Custom` — get no noun, so the
+    /// label keeps `容器`/`元素` and only becomes more specific where the transport actually knows
+    /// more. Every noun is a new glyph in the embedded font subset (§5.23), which is why the list is
+    /// short and the long tail (日历/状态栏/分割按钮…) is deliberately absent.
+    pub fn noun_zh(self) -> Option<&'static str> {
+        Some(match self {
+            Self::Button => "按钮",
+            Self::CheckBox => "复选框",
+            Self::ComboBox => "下拉框",
+            Self::Edit => "输入框",
+            Self::Hyperlink => "链接",
+            Self::Image => "图像",
+            Self::ListItem => "列表项",
+            Self::List => "列表",
+            Self::Menu => "菜单",
+            Self::ProgressBar => "进度条",
+            Self::RadioButton => "单选框",
+            Self::ScrollBar => "滚动条",
+            Self::Slider => "滑块",
+            Self::Tab => "选项卡",
+            Self::Text => "文本",
+            Self::ToolBar => "工具栏",
+            Self::Tree => "树",
+            Self::Table | Self::DataGrid => "表格",
+            Self::Document => "文档",
+            Self::Window => "窗口",
+            Self::Unknown
+            | Self::Custom
+            | Self::Group
+            | Self::Pane
+            | Self::DataItem
+            | Self::Header
+            | Self::TitleBar => return None,
+        })
+    }
+}
+
 /// One window observation inside a snapshot (docs/14 §5.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowCandidate {
@@ -401,6 +594,42 @@ impl WindowSnapshot {
 mod tests {
     use super::*;
     use crate::capture::geometry::Point;
+
+    /// The vocabulary's two views, and the one list that has to stay in step with them
+    /// (docs/21 §5.24, B6).
+    #[test]
+    fn every_level_kind_has_one_debug_name_and_at_most_one_noun() {
+        // The list covers every variant: a kind added to the enum without being added here would
+        // slip past both the font list and these checks.
+        assert_eq!(LevelKind::ALL.len(), 28);
+        let mut names: Vec<&str> = LevelKind::ALL.iter().map(|kind| kind.debug_name()).collect();
+        names.sort_unstable();
+        let unique = names.len();
+        names.dedup();
+        assert_eq!(names.len(), unique, "two kinds share a debug name");
+        assert!(
+            LevelKind::ALL.iter().any(|kind| kind.noun_zh().is_none()),
+            "the generic kinds must stay un-named, or every box would get a noun"
+        );
+        // The nouns are the label's whole vocabulary: what the font subset is built from.
+        let nouns: Vec<&str> = LevelKind::label_nouns().collect();
+        assert!(nouns.contains(&"按钮") && nouns.contains(&"文本") && nouns.contains(&"窗口"));
+        assert_eq!(
+            nouns.len(),
+            LevelKind::ALL
+                .iter()
+                .filter(|kind| kind.noun_zh().is_some())
+                .count(),
+            "one noun per kind that has one"
+        );
+        // A generic wrapper and an unknown box keep the label's own words.
+        assert_eq!(LevelKind::Pane.noun_zh(), None);
+        assert_eq!(LevelKind::Group.noun_zh(), None);
+        assert_eq!(LevelKind::Unknown.noun_zh(), None);
+        assert_eq!(LevelKind::Button.noun_zh(), Some("按钮"));
+        // The same kind under either name of a table.
+        assert_eq!(LevelKind::DataGrid.noun_zh(), LevelKind::Table.noun_zh());
+    }
 
     fn rect(left: i32, top: i32, right: i32, bottom: i32) -> Rect {
         Rect::new(left, top, right, bottom)

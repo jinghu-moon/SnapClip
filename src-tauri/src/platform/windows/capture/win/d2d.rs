@@ -2937,7 +2937,7 @@ mod tests {
         assert_ne!(
             pixel_at(&previewed, width, 40, 30),
             masked,
-            "…which is the whole point: the box you are choosing is not a darkened picture of itself"
+            "which is the whole point: the box being chosen is not a darkened picture of itself"
         );
 
         // …and a box inside a hovered window keeps its own pixels too: the hover wash is cut around
@@ -2955,7 +2955,7 @@ mod tests {
         assert_ne!(
             pixel_at(&hovered, width, 8, 8),
             masked_corner,
-            "…while the rest of the hovered window is still washed"
+            "while the rest of the hovered window is still washed"
         );
 
         // The whole-window fallback is the neutral answer: same rectangle, no hole, and it reads as
@@ -3313,7 +3313,7 @@ mod tests {
         );
         assert!(
             arrows[0] > half,
-            "…and it is the right-hand direction: {kinds:?}"
+            "and it is the right-hand direction: {kinds:?}"
         );
         assert!(
             pixels_of(&kinds, 'W', true) == 0,
@@ -3802,6 +3802,7 @@ mod tests {
     /// the text-drawing files and fails on any character this list does not account for.
     fn overlay_drawn_strings() -> Vec<String> {
         use crate::platform::windows::capture::overlay::{LEVEL_HINT, level_hint, preview_label};
+        use crate::capture::window_detection::LevelKind;
 
         let mut drawn = vec![
             // Size label, zoom badge, hex colour, and the two other colour formats.
@@ -3816,9 +3817,18 @@ mod tests {
             drawn.push(description.to_owned());
         }
         // Every state the preview label has: element, walked-to container, whole window, degraded.
-        drawn.push(preview_label(Rect::new(0, 0, 341, 55), false, false, false));
-        drawn.push(preview_label(Rect::new(0, 0, 689, 55), false, true, true));
-        drawn.push(preview_label(Rect::new(0, 0, 3840, 2088), true, false, false));
+        drawn.push(preview_label(Rect::new(0, 0, 341, 55), false, None, false, false));
+        drawn.push(preview_label(Rect::new(0, 0, 689, 55), false, None, true, true));
+        drawn.push(preview_label(
+            Rect::new(0, 0, 3840, 2088),
+            true,
+            None,
+            false,
+            false,
+        ));
+        // …and the nouns of B6 (docs/21 §5.24): the label prints whatever the transport named the
+        // box, so the font subset needs the vocabulary itself, not a sample sentence.
+        drawn.extend(LevelKind::label_nouns().map(str::to_owned));
         // …and the two one-shot hints. The level badge now draws `↑` `↓` and digits (docs/21 §5.24,
         // A1), so it is covered through the sentence below rather than by a string of its own: the
         // chip's characters are a subset of these.
@@ -3928,7 +3938,7 @@ mod tests {
             )
         };
         println!(
-            "AddFontMemResourceEx      : {:.0} µs (once per process; {installed} face(s))",
+            "AddFontMemResourceEx      : {:.0} us (once per process; {installed} face(s))",
             started.elapsed().as_secs_f64() * 1e6
         );
         if !handle.0.is_null() {
@@ -3988,7 +3998,7 @@ mod tests {
                 }
             }
             println!(
-                "{family:26}: layout+metrics avg {:.1} µs, worst {:.1} µs  ({} samples)",
+                "{family:26}: layout+metrics avg {:.1} us, worst {:.1} us  ({} samples)",
                 total / (samples * strings.len()) as f64,
                 worst,
                 samples * strings.len()

@@ -7,7 +7,7 @@
 //! lets every branch — 80 ms dwell, single-flight, latest-point coalescing, epoch
 //! invalidation, cached-path reuse — be unit tested without an accessibility stack.
 
-use super::model::{RequestGate, RequestId, SnapshotEpoch, WindowIdentity};
+use super::model::{PathLevel, RequestGate, RequestId, SnapshotEpoch, WindowIdentity};
 use crate::capture::geometry::{Point, Rect};
 use std::time::Duration;
 
@@ -76,9 +76,10 @@ pub struct DeepTarget {
     pub kind: super::model::TargetKind,
     /// Virtual-desktop physical pixels — the same space as [`super::model::WindowTarget`].
     pub screen_bounds: Rect,
-    /// Top-down path; `path[0]` is the window frame and the last entry equals
-    /// `screen_bounds`. Empty only when nothing was resolved.
-    pub path: Vec<Rect>,
+    /// Top-down path; `path[0]` is the window frame and the last entry's rectangle equals
+    /// `screen_bounds`. Empty only when nothing was resolved. Each level carries what kind of thing
+    /// it is (docs/21 §5.24, B6), which is what lets the size label name the box.
+    pub path: Vec<PathLevel>,
     pub stop_reason: StopReason,
 }
 
@@ -166,7 +167,7 @@ impl LevelChain {
     ///
     /// Clamping rather than trusting the index: a chain built for one target can outlive it by a
     /// frame, and the worst thing a level walk can do is publish a box that is not in the chain.
-    pub fn current(&self, path: &[Rect]) -> Option<Rect> {
+    pub fn current(&self, path: &[PathLevel]) -> Option<PathLevel> {
         let index = self.index.min(path.len().checked_sub(1)?);
         path.get(index).copied()
     }
@@ -278,7 +279,12 @@ fn edge_shift(a: Rect, b: Rect) -> i32 {
 /// With collapse and the cap of seven, some levels have no ring of their own: walking onto one
 /// changes nothing on screen, so a notch of the wheel appears to be dead. `direction` is `-1`
 /// toward the window frame or `+1` toward the published box; the ends always stop.
-pub fn next_visible_stop(path: &[Rect], current: usize, direction: i32, threshold_px: i32) -> usize {
+pub fn next_visible_stop(
+    path: &[PathLevel],
+    current: usize,
+    direction: i32,
+    threshold_px: i32,
+) -> usize {
     if path.is_empty() || direction == 0 {
         return current.min(path.len().saturating_sub(1));
     }
@@ -293,7 +299,7 @@ pub fn next_visible_stop(path: &[Rect], current: usize, direction: i32, threshol
             return next.clamp(0, path.len() as i32 - 1) as usize;
         }
         candidate = next as usize;
-        if edge_shift(path[candidate], path[current]) >= threshold_px {
+        if edge_shift(path[candidate].rect, path[current].rect) >= threshold_px {
             return candidate;
         }
     }
@@ -305,7 +311,7 @@ pub fn next_visible_stop(path: &[Rect], current: usize, direction: i32, threshol
 /// have no ring of their own and B1 skips them — but how many more notches of the wheel land
 /// somewhere that looks different before the end. Zero means "already against the end", which the
 /// badge draws dimmed.
-pub fn stops_from(path: &[Rect], current: usize, direction: i32, threshold_px: i32) -> usize {
+pub fn stops_from(path: &[PathLevel], current: usize, direction: i32, threshold_px: i32) -> usize {
     if path.is_empty() {
         return 0;
     }
@@ -338,7 +344,7 @@ pub fn stops_from(path: &[Rect], current: usize, direction: i32, threshold_px: i
 /// 4. **Cap**: at most `max_rings` are drawn. Non-anchors are dropped first, the ones closest to
 ///    the selection kept. Anchors are at most five, so the cap is always reachable without
 ///    breaking the outermost/innermost references.
-pub fn chain_rings(path: &[Rect], selected: usize, options: RingOptions) -> ChainPlan {
+pub fn chain_rings(path: &[PathLevel], selected: usize, options: RingOptions) -> ChainPlan {
     let mut plan = ChainPlan {
         rings: Vec::new(),
         collapsed: Vec::new(),
@@ -396,9 +402,11 @@ pub fn chain_rings(path: &[Rect], selected: usize, options: RingOptions) -> Chai
             continue;
         }
         let previous = kept.last().copied();
-        let gap = previous.map_or(i32::MAX, |previous| edge_gap(path[index], path[previous]));
+        let gap = previous.map_or(i32::MAX, |previous| {
+            edge_gap(path[index].rect, path[previous].rect)
+        });
         if anchor(index) {
-            if edge_gap(path[index], path[selected]) < options.merge_gap_px {
+            if edge_gap(path[index].rect, path[selected].rect) < options.merge_gap_px {
                 plan.merged.push(index);
                 continue;
             }
@@ -434,8 +442,8 @@ pub fn chain_rings(path: &[Rect], selected: usize, options: RingOptions) -> Chai
                 (
                     ring.index.abs_diff(selected),
                     -(edge_gap(
-                        path[ring.index],
-                        path[plan.rings[position.saturating_sub(1)].index],
+                        path[ring.index].rect,
+                        path[plan.rings[position.saturating_sub(1)].index].rect,
                     )),
                 )
             })
@@ -925,7 +933,15 @@ mod tests {
     use super::*;
     use super::super::model::TargetKind;
 
-    fn rect(left: i32, top: i32, right: i32, bottom: i32) -> Rect {
+    /// A path level with no kind: these tests are about geometry — collapse, merge, the cap, the
+    /// walk — and `Unknown` is what keeps them from having to name a control they do not have.
+    /// The kinds themselves are tested where they are produced and where they are printed.
+    fn rect(left: i32, top: i32, right: i32, bottom: i32) -> PathLevel {
+        PathLevel::unknown(Rect::new(left, top, right, bottom))
+    }
+
+    /// The same rectangle where a plain [`Rect`] is wanted (sizes, points, expectations).
+    fn boxed(left: i32, top: i32, right: i32, bottom: i32) -> Rect {
         Rect::new(left, top, right, bottom)
     }
 
@@ -1060,7 +1076,8 @@ mod tests {
 
     #[test]
     fn a_walked_level_overrides_the_published_box_in_the_preview() {
-        let frame = rect(0, 0, 1000, 800);
+        // A plain rectangle here: `preview_bounds` speaks in rectangles, not levels.
+        let frame = boxed(0, 0, 1000, 800);
         let control = deep_target(
             TargetKind::UiElement,
             rect(300, 300, 500, 400),
@@ -1070,13 +1087,13 @@ mod tests {
         assert_eq!(
             preview_bounds(
                 Some(&control),
-                Some(rect(100, 100, 900, 700)),
+                Some(boxed(100, 100, 900, 700)),
                 window(0x100),
                 Point::new(350, 350),
                 frame,
                 false
             ),
-            Some(rect(100, 100, 900, 700))
+            Some(boxed(100, 100, 900, 700))
         );
         // …and with no level walked to, the published box is what shows.
         assert_eq!(
@@ -1088,13 +1105,13 @@ mod tests {
                 frame,
                 false
             ),
-            Some(rect(300, 300, 500, 400))
+            Some(boxed(300, 300, 500, 400))
         );
         // A level never resurrects a target that belongs to another window.
         assert_eq!(
             preview_bounds(
                 Some(&control),
-                Some(rect(100, 100, 900, 700)),
+                Some(boxed(100, 100, 900, 700)),
                 window(0x200),
                 Point::new(350, 350),
                 frame,
@@ -1125,12 +1142,14 @@ mod tests {
         assert_eq!(chain.current(&short), Some(rect(0, 0, 800, 600)));
     }
 
-    fn deep_target(kind: TargetKind, bounds: Rect, stop_reason: StopReason) -> DeepTarget {
+    /// A target whose published box is `deepest` (a level, so its kind travels with it) under a
+    /// 1000×800 frame.
+    fn deep_target(kind: TargetKind, deepest: PathLevel, stop_reason: StopReason) -> DeepTarget {
         DeepTarget {
             window: window(0x100),
             kind,
-            screen_bounds: bounds,
-            path: vec![rect(0, 0, 1000, 800), bounds],
+            screen_bounds: deepest.rect,
+            path: vec![rect(0, 0, 1000, 800), deepest],
             stop_reason,
         }
     }
@@ -1467,7 +1486,7 @@ mod tests {
         };
         let control = QueryControl::refinement(&|| false);
         assert_eq!(
-            provider.resolve(&job, rect(0, 0, 100, 100), &control),
+            provider.resolve(&job, boxed(0, 0, 100, 100), &control),
             RefinementOutcome::Empty(StopReason::Unsupported)
         );
         assert!(!control.is_cancelled());
@@ -1484,7 +1503,7 @@ mod tests {
     #[test]
     fn a_pending_answer_keeps_the_last_verified_rectangle_of_the_window() {
         let control = deep_target(TargetKind::UiElement, rect(300, 300, 500, 400), StopReason::Complete);
-        let frame = rect(0, 0, 1000, 800);
+        let frame = boxed(0, 0, 1000, 800);
         // The cursor left the control for its parent container: the frame must not flash while
         // the refinement answers, even though the control no longer covers the point.
         assert_eq!(
@@ -1496,7 +1515,7 @@ mod tests {
                 frame,
                 true
             ),
-            Some(rect(300, 300, 500, 400)),
+            Some(boxed(300, 300, 500, 400)),
             "the last verified rectangle covers the wait, not the window frame"
         );
         // The wait is bounded: once nothing is pending, the frame is the honest floor.
@@ -1515,7 +1534,7 @@ mod tests {
 
     #[test]
     fn the_first_hover_of_a_window_withholds_the_preview_until_it_answers() {
-        let frame = rect(0, 0, 1000, 800);
+        let frame = boxed(0, 0, 1000, 800);
         assert_eq!(
             preview_bounds(None, None, window(0x100), Point::new(10, 10), frame, true),
             None,
@@ -1530,7 +1549,7 @@ mod tests {
 
     #[test]
     fn a_verified_target_for_another_window_never_leaks_into_this_one() {
-        let frame = rect(0, 0, 1000, 800);
+        let frame = boxed(0, 0, 1000, 800);
         let elsewhere = deep_target(TargetKind::UiElement, rect(100, 100, 200, 200), StopReason::Complete);
         assert_eq!(
             preview_bounds(Some(&elsewhere), None, window(0x200), Point::new(150, 150), frame, true),
@@ -1552,10 +1571,10 @@ mod tests {
                 None,
                 window(0x100),
                 Point::new(350, 350),
-                rect(0, 0, 1000, 800),
+                boxed(0, 0, 1000, 800),
                 false
             ),
-            Some(rect(300, 300, 500, 400))
+            Some(boxed(300, 300, 500, 400))
         );
     }
 
@@ -1568,7 +1587,10 @@ mod tests {
         );
         // Contract the overlay relies on when it draws the path outline.
         assert_eq!(target.path.first(), Some(&rect(0, 0, 1000, 800)));
-        assert_eq!(target.path.last(), Some(&target.screen_bounds));
+        assert_eq!(
+            target.path.last().map(|level| level.rect),
+            Some(target.screen_bounds)
+        );
         assert!(target.kind.is_refined());
         assert!(!TargetKind::TopLevelWindowFrame.is_refined());
         assert!(StopReason::Complete.is_complete());
@@ -1584,16 +1606,16 @@ mod tests {
         }
     }
 
-    fn deep_with_depth(bounds: Rect, depth: usize) -> DeepTarget {
+    fn deep_with_depth(deepest: PathLevel, depth: usize) -> DeepTarget {
         let mut path = vec![rect(0, 0, 1000, 800)];
         for _ in 1..depth.saturating_sub(1) {
             path.push(rect(50, 50, 950, 750));
         }
-        path.push(bounds);
+        path.push(deepest);
         DeepTarget {
             window: window(0x100),
             kind: TargetKind::UiElement,
-            screen_bounds: *path.last().expect("path"),
+            screen_bounds: path.last().expect("path").rect,
             path,
             stop_reason: StopReason::Complete,
         }
@@ -1662,7 +1684,7 @@ mod tests {
     /// The nine-level shape a real chat page produced (docs/21 §5.22), with the 1 px nesting the
     /// prototype's fixture mirrors: `cm-scroller` sits 1 px inside `code-block-viewer`, and
     /// `text-message` 1 px outside it.
-    fn nine_level_page() -> Vec<Rect> {
+    fn nine_level_page() -> Vec<PathLevel> {
         vec![
             rect(40, 24, 1240, 684),      // 1/9 window frame
             rect(41, 58, 1239, 684),      // 2/9 document
@@ -1753,7 +1775,7 @@ mod tests {
     /// `{0, 3, 4, 5, 6, 7, 11}`.
     #[test]
     fn the_cap_drops_the_furthest_non_anchors() {
-        let path: Vec<Rect> = (0..11)
+        let path: Vec<PathLevel> = (0..11)
             .map(|step| {
                 let inset = step * 16;
                 rect(24 + inset, 16 + inset, 1256 - inset, 704 - inset)

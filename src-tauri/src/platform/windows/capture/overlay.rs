@@ -74,8 +74,8 @@ use crate::capture::session::{CaptureSession, ExportOutcome};
 use crate::capture::window_detection::model::RequestId;
 use crate::capture::window_detection::{
     DEFAULT_ADOPT_TEXT_RUNS, DEFAULT_DWELL_MS, DEFAULT_HOVER_REVALIDATE_MS, DEFAULT_SNAP_RADIUS_PX,
-    DeepTarget, Exclusions, LevelChain, RingOptions, RingRole, chain_rings, next_visible_stop,
-    stops_from,
+    DeepTarget, Exclusions, LevelChain, LevelKind, PathLevel, RingOptions, RingRole, chain_rings,
+    next_visible_stop, stops_from,
     GestureState, HoverValidity, MoveOutcome, PressOutcome, RefinementJob, RefinementOutcome,
     RefinementScheduler,
     ReleaseOutcome, Replacement, WindowSnapshot, WindowTarget, classify_replacement,
@@ -1556,8 +1556,9 @@ where
     /// The ancestor level the user walked to, if any (docs/21 §5.17).
     ///
     /// `None` means "the published box", which is what the refinement produced and what the preview
-    /// shows until the wheel or an arrow key asks for another level.
-    fn selected_deep_level(&self) -> Option<Rect> {
+    /// shows until the wheel or an arrow key asks for another level. The level carries its own kind,
+    /// which is what the size label names it by (docs/21 §5.24, B6).
+    fn selected_deep_level(&self) -> Option<PathLevel> {
         let deep = self.deep_target.as_ref()?;
         let chain = self.deep_levels?;
         (!chain.is_deepest())
@@ -1583,12 +1584,25 @@ where
         Some(preview_label(
             rect,
             self.preview_is_window(),
+            self.preview_kind(),
             self.walked_up(),
             matches!(
                 self.metrics.last_precision_outcome(),
                 Some(crate::capture::diagnostics::PrecisionOutcome::Unavailable)
             ),
         ))
+    }
+
+    /// What kind of thing the previewed box is, when a transport said (docs/21 §5.24, B6).
+    ///
+    /// The walked-to level if there is one, otherwise the published box — the same pair the preview
+    /// rectangle comes from, so the noun and the box cannot describe different levels.
+    fn preview_kind(&self) -> Option<LevelKind> {
+        let deep = self.deep_target.as_ref()?;
+        let level = self
+            .selected_deep_level()
+            .or_else(|| deep.path.last().copied())?;
+        Some(level.kind)
     }
 
     /// Whether the user has walked off the deepest level — which is what makes the label say `容器`
@@ -1847,7 +1861,7 @@ where
             .iter()
             .filter(|ring| ring.role != RingRole::Selected)
             .filter_map(|ring| {
-                let rect = window_rect_to_local(deep.path[ring.index], &layout);
+                let rect = window_rect_to_local(deep.path[ring.index].rect, &layout);
                 (!rect.is_empty()).then_some(ChainRingView {
                     rect,
                     inner: ring.role == RingRole::Inner,
@@ -1969,7 +1983,7 @@ where
         if let (Some(chain), Some(deep)) = (self.deep_levels, self.deep_target.as_ref())
             && chain
                 .current(&deep.path)
-                .is_some_and(|level| !level.contains(screen))
+                .is_some_and(|level| !level.rect.contains(screen))
         {
             self.deep_levels = None;
         }
@@ -2125,7 +2139,7 @@ where
         });
         let bounds = preview_bounds(
             self.deep_target.as_ref(),
-            self.selected_deep_level(),
+            self.selected_deep_level().map(|level| level.rect),
             target.identity(),
             screen,
             target.screen_bounds(),
@@ -2527,7 +2541,9 @@ where
         let deep_local = self.layout().zip(self.deep_target.as_ref()).map(|(layout, deep)| {
             // What the walk selected, not necessarily what the refinement published (docs/21 §5.17).
             window_rect_to_local(
-                self.selected_deep_level().unwrap_or(deep.screen_bounds),
+                self.selected_deep_level()
+                    .map(|level| level.rect)
+                    .unwrap_or(deep.screen_bounds),
                 &layout,
             )
         });
@@ -3609,9 +3625,20 @@ fn should_teach(taught: bool, showing: bool) -> bool {
 ///
 /// `pub(crate)` so the embedded-font coverage gate can require its characters
 /// (`win::d2d::tests::the_embedded_subset_covers_the_strings_the_overlay_draws`).
-pub(crate) fn preview_label(rect: Rect, is_window: bool, walked: bool, degraded: bool) -> String {
+pub(crate) fn preview_label(
+    rect: Rect,
+    is_window: bool,
+    kind: Option<LevelKind>,
+    walked: bool,
+    degraded: bool,
+) -> String {
+    // The noun comes from the transport when it has one (docs/21 §5.24, B6), and from the label's own
+    // two words when it does not: a box nobody could name is still "the element" or "the container
+    // around it", and saying `面板` for every anonymous `Pane` would be worse than saying nothing.
     let kind = if is_window {
         "窗口"
+    } else if let Some(noun) = kind.and_then(LevelKind::noun_zh) {
+        noun
     } else if walked {
         "容器"
     } else {
@@ -3633,7 +3660,7 @@ pub(crate) fn preview_label(rect: Rect, is_window: bool, walked: bool, degraded:
 /// The counts come from the same `next_visible_stop` the wheel uses, so the chip cannot promise
 /// notches the walk would not take — the failure mode that made the old `6/9` misleading once B1
 /// started skipping levels that look identical.
-pub(crate) fn level_badge_reach(chain: Option<LevelChain>, path: &[Rect]) -> Option<LevelReach> {
+pub(crate) fn level_badge_reach(chain: Option<LevelChain>, path: &[PathLevel]) -> Option<LevelReach> {
     let chain = chain.filter(|chain| chain.len() > 1 && !chain.is_deepest())?;
     let threshold = RingOptions::default().collapse_gap_px;
     Some(LevelReach {
@@ -3666,14 +3693,25 @@ fn any_mouse_button_down() -> bool {
 fn describe_deep(deep: Option<&DeepTarget>) -> String {
     match deep {
         None => "none".to_owned(),
-        Some(deep) => format!(
-            "hwnd={} kind={:?} bounds={} depth={} reason={:?}",
-            deep.window.hwnd,
-            deep.kind,
-            describe_rect(deep.screen_bounds),
-            deep.path.len(),
-            deep.stop_reason
-        ),
+        Some(deep) => {
+            // The deepest level's *kind* is what the size label prints as a noun (docs/21 §5.24 B6),
+            // so it belongs in the line that says what the session answered with: "the label says
+            // 容器" and "the walk called it Pane" are the same fact from two sides.
+            let deepest = deep
+                .path
+                .last()
+                .map(|level| level.kind.debug_name())
+                .unwrap_or("none");
+            format!(
+                "hwnd={} kind={:?} bounds={} depth={} reason={:?} deepest={}",
+                deep.window.hwnd,
+                deep.kind,
+                describe_rect(deep.screen_bounds),
+                deep.path.len(),
+                deep.stop_reason,
+                deepest
+            )
+        }
     }
 }
 
@@ -3929,7 +3967,7 @@ mod tests {
         walk_activity_step,
     };
     use crate::capture::geometry::Rect;
-    use crate::capture::window_detection::LevelChain;
+    use crate::capture::window_detection::{LevelChain, LevelKind};
 
     /// `WS_EX_NOACTIVATE`.
     ///
@@ -4003,7 +4041,10 @@ mod tests {
     #[test]
     fn the_preview_label_names_the_element_it_snapped_to() {
         let rect = Rect::new(10, 10, 410, 810);
-        assert_eq!(preview_label(rect, false, false, false), "400×800 px  元素");
+        assert_eq!(
+            preview_label(rect, false, None, false, false),
+            "400×800 px  元素"
+        );
     }
 
     /// The label says *what* the box is — the size alone cannot tell "a wide element" from "the
@@ -4012,11 +4053,52 @@ mod tests {
     #[test]
     fn the_preview_label_calls_a_walked_to_box_a_container_without_counting_levels() {
         let rect = Rect::new(0, 0, 100, 50);
-        assert_eq!(preview_label(rect, false, false, false), "100×50 px  元素");
-        assert_eq!(preview_label(rect, false, true, false), "100×50 px  容器");
+        assert_eq!(
+            preview_label(rect, false, None, false, false),
+            "100×50 px  元素"
+        );
+        assert_eq!(
+            preview_label(rect, false, None, true, false),
+            "100×50 px  容器"
+        );
         // The window frame is reported through `is_window` (walking to it is the same box as the
         // v1 fallback), and it wins over the walked-up noun.
-        assert_eq!(preview_label(rect, true, true, false), "100×50 px  窗口");
+        assert_eq!(
+            preview_label(rect, true, None, true, false),
+            "100×50 px  窗口"
+        );
+    }
+
+    /// B6 (docs/21 §5.24): when the transport said what the box *is*, that noun replaces the label's
+    /// own words — and only then. A `Pane` is a container and stays `容器`.
+    #[test]
+    fn the_preview_label_names_the_control_when_the_transport_knows_it() {
+        let rect = Rect::new(0, 0, 846, 272);
+        // The case the prototype's `846×272 px 代码块` stands for: the walk named the level.
+        assert_eq!(
+            preview_label(rect, false, Some(LevelKind::Button), false, false),
+            "846×272 px  按钮"
+        );
+        // …including a level the user walked up to, which is the whole point: `容器` was all the
+        // label could say about an ancestor before the kind travelled with it.
+        assert_eq!(
+            preview_label(rect, false, Some(LevelKind::ListItem), true, false),
+            "846×272 px  列表项"
+        );
+        // A generic wrapper and an unknown answer keep the label's own vocabulary.
+        assert_eq!(
+            preview_label(rect, false, Some(LevelKind::Pane), true, false),
+            "846×272 px  容器"
+        );
+        assert_eq!(
+            preview_label(rect, false, Some(LevelKind::Unknown), false, false),
+            "846×272 px  元素"
+        );
+        // The whole-window fallback outranks any kind, and the degraded mark still applies.
+        assert_eq!(
+            preview_label(rect, true, Some(LevelKind::Button), false, true),
+            "846×272 px  窗口?"
+        );
     }
 
     /// The window name and the fallback mark are independent of the counter, so "the whole
@@ -4024,14 +4106,23 @@ mod tests {
     #[test]
     fn the_preview_label_names_the_window_and_the_unsupported_fallback() {
         let rect = Rect::new(0, 0, 3840, 2088);
-        assert_eq!(preview_label(rect, true, false, false), "3840×2088 px  窗口");
         assert_eq!(
-            preview_label(rect, false, false, true),
+            preview_label(rect, true, None, false, false),
+            "3840×2088 px  窗口"
+        );
+        assert_eq!(
+            preview_label(rect, false, None, false, true),
             "3840×2088 px  元素?",
             "a fallback must not look like a confident answer"
         );
-        assert_eq!(preview_label(rect, true, false, true), "3840×2088 px  窗口?");
-        assert_eq!(preview_label(rect, false, true, true), "3840×2088 px  容器?");
+        assert_eq!(
+            preview_label(rect, true, None, false, true),
+            "3840×2088 px  窗口?"
+        );
+        assert_eq!(
+            preview_label(rect, false, None, true, true),
+            "3840×2088 px  容器?"
+        );
     }
 
     /// The teaching sentence's two rules, as a truth table: once per session, but it follows a
@@ -4102,8 +4193,15 @@ mod tests {
         assert_eq!(super::describe_level(Some(chain)), "8/9");
         // …while the badge speaks in *stops* (docs/21 §5.24, A1): nine evenly spaced levels, walked
         // up to the 8th, leaves seven notches toward the frame and one back toward the answer.
-        let path: Vec<Rect> = (0..9)
-            .map(|i| Rect::new(i * 10, i * 10, 400 - i * 10, 300 - i * 10))
+        let path: Vec<crate::capture::window_detection::PathLevel> = (0..9)
+            .map(|i| {
+                crate::capture::window_detection::PathLevel::unknown(Rect::new(
+                    i * 10,
+                    i * 10,
+                    400 - i * 10,
+                    300 - i * 10,
+                ))
+            })
             .collect();
         let reach = super::level_badge_reach(Some(chain), &path).expect("a walked chain has stops");
         assert_eq!(reach, crate::capture::geometry::LevelReach { up: 7, down: 1 });
@@ -4111,7 +4209,7 @@ mod tests {
         assert_eq!(level_hint(reach), "↑7 ↓1 · ↑ = 窗口 · 滚轮 / ↑↓ 切换");
         // The label says nothing about the level any more, so its text cannot drift from the badge.
         assert_eq!(
-            preview_label(Rect::new(0, 0, 100, 50), false, true, false),
+            preview_label(Rect::new(0, 0, 100, 50), false, None, true, false),
             "100×50 px  容器"
         );
         // …and the deepest level has no badge: it is the state "nothing has been walked".

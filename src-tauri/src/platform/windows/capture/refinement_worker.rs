@@ -36,9 +36,11 @@ use crate::capture::window_detection::deep::{
     DeepSelectionProvider, DeepTarget, QueryControl, RefinementJob, RefinementOutcome, StopReason,
 };
 use crate::capture::window_detection::model::{
-    RequestGate, RequestId, SnapshotEpoch, TargetKind, WindowIdentity,
+    PathLevel, RequestGate, RequestId, SnapshotEpoch, TargetKind, WindowIdentity,
 };
-use crate::capture::window_detection::uia::{MAX_PATH_LEN, should_adopt_msaa_box};
+use crate::capture::window_detection::uia::{
+    MAX_PATH_LEN, level_kind_of_msaa_role, should_adopt_msaa_box,
+};
 
 use super::msaa_provider::{MsaaDeepSelectionProvider, MsaaHitBox, MsaaHitFailure};
 use super::uia_provider::UiaDeepSelectionProvider;
@@ -135,7 +137,12 @@ impl FallbackDeepSelection {
                     job.point,
                     self.adopt_text_runs,
                 );
-                let adopted = finer && push_box(target, hit.visible, &hit.ancestors);
+                let adopted = finer
+                    && push_box(
+                        target,
+                        PathLevel::new(hit.visible, level_kind_of_msaa_role(hit.role)),
+                        &hit.ancestors,
+                    );
                 note.push_str(&format!(
                     " msaa=[role=0x{:x} name={:?} depth={} {}{}]",
                     hit.role,
@@ -213,11 +220,15 @@ fn failure_name(failure: MsaaHitFailure) -> &'static str {
 /// transport reported — the walk's levels are another view of the page and are not necessarily above
 /// this box. Only levels that actually contain the box survive, which is what makes the published
 /// path a containment chain the ancestor walk can step through.
-fn push_box(target: &mut DeepTarget, bounds: Rect, ancestors: &[Rect]) -> bool {
-    let mut path: Vec<Rect> = ancestors
+fn push_box(target: &mut DeepTarget, box_level: PathLevel, ancestors: &[Rect]) -> bool {
+    let bounds = box_level.rect;
+    // The ancestors are rectangles off MSAA's own chain: they say where the box sits, not what it
+    // sits in, so they publish as `Unknown` and the label keeps its generic words for them.
+    let mut path: Vec<PathLevel> = ancestors
         .iter()
         .copied()
         .filter(|level| level.contains_rect(bounds))
+        .map(PathLevel::unknown)
         .collect();
     if path.is_empty() {
         // The chain always starts at the window frame; keep it if a caller ever gets here without one.
@@ -228,8 +239,8 @@ fn push_box(target: &mut DeepTarget, bounds: Rect, ancestors: &[Rect]) -> bool {
     if path.len() >= MAX_PATH_LEN {
         return false;
     }
-    if path.last() != Some(&bounds) {
-        path.push(bounds);
+    if path.last().map(|level| level.rect) != Some(bounds) {
+        path.push(box_level);
     }
     target.path = path;
     target.screen_bounds = bounds;
@@ -591,7 +602,10 @@ mod tests {
             window: window(),
             kind: TargetKind::UiElement,
             screen_bounds: bounds,
-            path: vec![Rect::new(0, 0, 1000, 800), bounds],
+            path: vec![
+                PathLevel::new(Rect::new(0, 0, 1000, 800), crate::capture::window_detection::LevelKind::Window),
+                PathLevel::unknown(bounds),
+            ],
             stop_reason: reason,
         }
     }
