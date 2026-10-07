@@ -11,12 +11,11 @@ pub enum PayloadKind {
     Other,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct ImageDimensions {
-    pub width: u32,
-    pub height: u32,
-}
+// 过渡期转发（docs/23 T0.4）：定义已搬到 `snapclip-model`，这里是唯一实现的转出口。
+// 删除条件：P1 结束时（T1.10）。线上格式（`imageDimensions: { width, height }`）
+// 由 `snapclip_model::geometry::ImageDimensions` 上的 `serde(rename_all = "camelCase")`
+// 保证，与前端 `src/shared/contracts.ts` 一致。
+pub use snapclip_model::geometry::ImageDimensions;
 
 /// A semantic payload inside a [`crate::domain::Publication`].
 ///

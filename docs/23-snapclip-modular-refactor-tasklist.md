@@ -215,7 +215,7 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 | T0.1 | 复跑并记录正确性基线 | — | — | 低 | [x]（自动门禁全绿；真机 F5 待人工） |
 | T0.2 | 记录资源基线（before） | T0.1 | — | 低 | [ ] |
 | T0.3 | 建 workspace 骨架（+ 修 `.gitignore`） | T0.1 | 4 文件 + lock | 中（Tauri 构建） | [x]（自动门禁全绿；`npm run tauri dev` + F5 待人工） |
-| T0.4 | 建 `snapclip-model` 骨架 | T0.3 | 3 文件 | 低 | [ ] |
+| T0.4 | 建 `snapclip-model` 骨架（+ 搬 `Rect`/`Point`/`ImageDimensions`） | T0.3 | 10 文件 | 低 | [x]（自动门禁全绿） |
 | T0.5.1 | 删除 `capture/platform` 转发层 | T0.4 | 11 行 | 低 | [ ] |
 | T0.5.2 | OCR 事件出口改框架无关 trait | T0.5.1 | 2 文件 | 中（IPC 契约） | [ ] |
 | T0.5.3 | OCR 惰性启动 | T0.5.2 | 2 文件 | 中 | [ ] |
@@ -327,6 +327,12 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
   2. 建 `ids.rs`、`geometry.rs`、`artifact.rs`、`events.rs`、`error.rs`、`recognition.rs` 六个空模块，并在 `lib.rs` 里 `pub use`。
   3. 先只把**值对象**搬进来：`Rect`/`Point`/`ImageDimensions`（从 `capture/geometry.rs` 复制定义，原位置改为 `pub use snapclip_model::…` 的**过渡 re-export**，P1 结束前删除）。
   4. 为值对象写单测（边界、负坐标、包含关系），保证与旧行为逐位一致。
+- **实测结果（2026-10-07，本任务已完成）**：
+  - `crates/snapclip-model/`：`Cargo.toml` 运行期**只依赖 `serde`**（`serde_json` 只在 `[dev-dependencies]`，用于钉住 `ImageDimensions` 的线上 JSON 格式）；`lib.rs` 导出 `geometry` 及 `Point`/`Rect`/`ImageDimensions`；`ids.rs`/`artifact.rs`/`events.rs`/`error.rs`/`recognition.rs` 是带职责说明的空模块（各自写明由哪个 T 编号填充）。
+  - **唯一实现已在新 crate**：`Point`/`Rect`/`ImageDimensions` 的定义只存在于 `crates/snapclip-model/src/geometry.rs`；`src-tauri/src/capture/geometry.rs`（1590 → 1421 行）与 `src-tauri/src/domain/payload.rs` 各留一处 `pub use` 转发，并写明"T1.10 前删除"。
+  - 单测 **11 passed / 0 failed**：3 条从旧 `geometry.rs` **逐字搬来**的回归（拖拽归一化、挖洞四块、无洞退化），外加负坐标、包含关系边界、`inflate`/`translate`、`clamped_into`（含超宽矩形钉边）、`intersect`/`union`、线上 JSON 格式。
+  - **搬移途中发现一个真实语义（必须记住，否则会被"顺手修"）**：`Rect::width()/height()` 用的是 `saturating_sub`，它**只防 i32 溢出、不钳到 0**——倒置矩形（`right < left`）的宽度是**负数**，唯一拦住它的是 `is_empty()`（`width <= 0`）。更坑的是 `area()` 对倒置矩形会得到**正数**（两个负数相乘）。行为**原样保留**（T0.4 只搬不改），但把它写成了显式测试 `width_is_signed_and_is_empty_is_the_guard_against_inverted_rects`：将来谁想"顺手把 width 钳到 0"，测试会先红。
+  - 门禁：`cargo test -p snapclip-model` 11/11；`cargo test --lib --manifest-path src-tauri/Cargo.toml` **403 passed / 0 failed / 6 ignored**（与搬移前一致）；`cargo check --workspace --all-targets` 0 warning；浏览器探针复跑 41/41·available=52·finer=0。
 - 必须保持：`capture::geometry::Rect` 的语义与测试不变（过渡期靠 re-export 保证）。
 - 验收：`cargo test -p snapclip-model` 通过；`src-tauri` 的 403 测试仍全过。
 - 回退：删除 crate + 撤销 re-export。
@@ -1111,3 +1117,31 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 - `git check-ignore -v crates/snapclip-model` → 无输出（B1 已修）；`git check-ignore -v crates/rapid-ocr-rs` → `.gitignore:55:/crates/rapid-ocr-rs/`。
 - 两个 lock 的包数：旧 `src-tauri/Cargo.lock` 680 包、新根 `Cargo.lock` 690 包，**两者都含 `rapid-ocr-rs`/`ort`/`imageproc`**。
 - `cargo tree -p snapclip --features ocr-rapid` 含 `rapid-ocr-rs v0.7.0 (path)`，无解析错误；**未做** `--features ocr-rapid` 的实际编译（会拉 ONNX Runtime，代价与本步无关），记为未完成。
+
+### §14.6 T0.4 建 `snapclip-model` 骨架
+
+```
+任务编号：T0.4
+状态：已验证（自动门禁全绿）
+分支：main
+前置提交/tag：51cca9e（T0.3）；回退基准 smart-snapping-v1-2026-10-07
+修改范围：新增 crates/snapclip-model/{Cargo.toml, src/lib.rs, src/geometry.rs 及 5 个空模块}；
+          src-tauri/src/capture/geometry.rs（移除 Point/Rect 定义 → pub use）；
+          src-tauri/src/domain/payload.rs（移除 ImageDimensions 定义 → pub use）；
+          src-tauri/Cargo.toml（+snapclip-model 路径依赖）；根 Cargo.toml（members +1）；docs/23
+修改前测试：403 passed / 0 failed / 6 ignored（HEAD 51cca9e）
+修改后测试：cargo test -p snapclip-model → 11 passed / 0 failed
+            cargo test --lib --manifest-path src-tauri/Cargo.toml → 403 passed / 0 failed / 6 ignored
+            cargo check --workspace --all-targets → 0 warning
+            浏览器探针 → asserted=41 passed=41 failed=0 / available=52 / finer=0
+性能指标：不涉及（纯类型搬移）
+人工验证：不涉及
+失败与根因：1 次失败，属于**我的测试断言写错**，不是实现错误——
+            我按 `saturating_sub` 的字面印象断言"宽度不会为负"，实测倒置矩形 width=-300。
+            根因：`saturating_sub` 只防溢出，不钳 0；而 `area()` 对倒置矩形是**正数**。
+            处置：不改实现（T0.4 只搬不改），改断言并把它写成显式的行为钉死测试。
+            这是"测试红了要判断是实现错还是预期错"的一个正例。
+提交 SHA：待提交
+推送/tag：待推送
+回退对象：51cca9e
+```

@@ -1,0 +1,15 @@
+[package]
+name = "snapclip-model"
+version = "0.1.0"
+description = "Framework-free value types and event summaries shared by SnapClip's capability crates"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# Test-only: the wire-format test for `ImageDimensions` pins the JSON the front end
+# reads. The crate itself still depends on nothing but `serde`.
+serde_json = "1"
