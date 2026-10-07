@@ -160,17 +160,22 @@ git switch <默认分支>
 
 ### 1.2 资源基线（P0 新测，before / after 两栏）
 
-| 指标 | 怎么测 | before（T0.2 实测，2026-10-07，HEAD 0bd9191，debug 构建） | after（P0.5 之后） |
+| 指标 | 怎么测 | before（T0.2 实测，2026-10-07，HEAD 0bd9191，debug 构建） | after（T0.5.4 实测，HEAD 5e1d1df，debug 构建） |
 | --- | --- | --- | --- |
-| 进程数 / 线程数 | 任务管理器（详细信息），或下面的 PowerShell（表格里不能直接写竖线，命令放在表下方） | **1 进程 / 18 线程**（`snapclip.exe`，debug） | |
-| WebView2 附加进程 | 同一时刻的 `msedgewebview2` 进程数，**减去应用关闭时的对照值** | **+6 进程**（运行 21 / 空闲 15） | |
-| 常驻内存（应用自身） | 上面的 PowerShell 的 `WorkingSet64` / `PrivateMemorySize64` | **37.7 MB WS / 6.8 MB 私有** | |
-| 常驻内存（含 WebView2） | 同上的 WebView2 差值 | **+342.2 MB WS**（运行 843.3 / 空闲 501.1） | |
-| GPU 内存 | 任务管理器"GPU 内存"列 | **未测**（需按 pid 归因的 GPU 计数器，本轮未采集） | |
-| 空闲 CPU（30 s 平均） | 应用启动静置后用 `TotalProcessorTime` 差值 ÷ 30 s ÷ 逻辑核数（20 核） | **~0.00 %**（30 s 内无可见增长，分辨率不足，只作量级参考） | |
-| 冷启动到可交互 | 启动日志 `setup begin` → `clipboard pipeline ready` 的 elapsed_ms | **68 ms**（`capture overlay ready` 58 ms；debug 构建） | |
-| 包体积 | 产物目录大小 + 主 exe 大小 | **exe 19.34 MB**（debug）；`dist/` 131.5 KB / 5 文件 | |
-| 改一行 → 增量检查 | T0.3 之前没有共享 crate：改 `src-tauri/src/lib.rs`（只动 mtime）后 `cargo check --manifest-path src-tauri/Cargo.toml` 计时。T0.3 之后改为"改 `snapclip-model` 一行后 `cargo check --workspace`" | **1.36 s**（只重编 `snapclip` 一个 crate） | |
+| 进程数 / 线程数 | 任务管理器（详细信息），或下面的 PowerShell（表格里不能直接写竖线，命令放在表下方） | **1 进程 / 18 线程**（`snapclip.exe`，debug） | **1 进程 / 17 线程**（−1 = 不再无条件启动的 OCR worker，**这是本阶段唯一结构性变化**） |
+| WebView2 附加进程 | 同一时刻的 `msedgewebview2` 进程数，**减去应用关闭时的对照值** | **+6 进程**（运行 21 / 空闲 15） | **+6 进程**（运行 22 / 空闲 16）——无变化 |
+| 常驻内存（应用自身） | 上面的 PowerShell 的 `WorkingSet64` / `PrivateMemorySize64` | **37.7 MB WS / 6.8 MB 私有** | **36.7 MB WS / 5.8 MB 私有**（−1 MB，噪声级；**不当作收益**） |
+| 常驻内存（含 WebView2） | 同上的 WebView2 差值 | **+342.2 MB WS**（运行 843.3 / 空闲 501.1） | **+328.3 MB WS**（运行 833.1 / 空闲 504.8）——差值 −14 MB 属机器噪声（WebView2 计数是全机口径），**不当作收益** |
+| GPU 内存 | 任务管理器"GPU 内存"列 | **未测**（需按 pid 归因的 GPU 计数器） | **仍未测**（同上；不假装测过） |
+| 空闲 CPU（30 s 平均） | 应用启动静置后用 `TotalProcessorTime` 差值 ÷ 30 s ÷ 逻辑核数（20 核） | **~0.00 %**（30 s 内无可见增长，分辨率不足，只作量级参考） | **0.003 %**（与 before 同量级 → 噪声；此项分辨率不足以支撑结论） |
+| 冷启动到可交互 | 启动日志 `setup begin` → `clipboard pipeline ready` 的 elapsed_ms | **68 ms**（`capture overlay ready` 58 ms） | **73 ms**（overlay 64 ms；`target-probe` 那次是 52 ms）→ **run-to-run 噪声内，无明显变化**；结构性差异看日志内容：`ocr worker started` 一行消失 |
+| 包体积 | 产物目录大小 + 主 exe 大小 | **exe 19.34 MB**（debug）；`dist/` 131.5 KB / 5 文件 | **exe 19.31 MB**（debug）；`dist/` 未变 |
+| 改一行 → 增量检查 | T0.3 之前改 `src-tauri/src/lib.rs` 后 `cargo check --manifest-path src-tauri/Cargo.toml`；T0.3 之后改一行后 `cargo check --workspace --all-targets` | **1.36 s**（只重编 `snapclip` 一个 crate） | **1.32 s**（workspace 形态，见 §14.5）——同量级，迭代速度未退化 |
+
+> **怎么读这张表（重要）**：P0.5 的实测结论是**"基本没变，只少了 1 个线程"**——不要把它读成"资源大幅下降"。
+> 真正的资源账在本表之外：整个 WebView2 附加进程与那 ~330 MB 常驻内存是**换壳（P4）**才会消失的；
+> P0.5 的收益是"未触发识别时不常驻 worker 线程 + WinRT/COM apartment"，以及一条更诚实的启动日志。
+> 本表的 after 栏会在 P0.5 之后逐阶段更新（P1 → P4），**每一步都要求"不出现不可接受的退化"**，而不是要求数字变好。
 
 > **测量口径（可复现）**：`Start-Process src-tauri\target\debug\snapclip.exe -RedirectStandardOutput/-RedirectStandardError` + `-WindowStyle Hidden`，静置 10 s 后取进程快照，再采样 30 s CPU，最后 `Stop-Process` 并等 8 s 取对照。**`webview page_load Finished` 不能当"可交互"**：直接跑 debug exe 时前端走 `devUrl`（`http://localhost:1420`），没有 dev server 会反复重载（日志里会出现 500/1478/6488/36500 ms 多条 "Finished"），所以冷启动口径改用 `clipboard pipeline ready`（那之后 F5 已经可用）。
 
@@ -219,7 +224,7 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 | T0.5.1 | 删除 `capture/platform` 转发层（+ 顺带清掉它续命的死代码） | T0.4 | 2 文件 + 1 处死代码链 | 低 | [x]（自动门禁全绿） |
 | T0.5.2 | OCR 事件出口改框架无关 trait | T0.5.1 | 4 文件 | 中（IPC 契约） | [x]（自动门禁全绿；真机 OCR 待人工） |
 | T0.5.3 | OCR 惰性启动 | T0.5.2 | 3 文件 | 中 | [x]（自动门禁 + 启动日志证据齐全） |
-| T0.5.4 | 记录资源基线（after）并对比 | T0.5.3 | — | 低 | [ ] |
+| T0.5.4 | 记录资源基线（after）并对比 + tag `refactor-p05` | T0.5.3 | — | 低 | [x]（G0 全绿，tag 已推） |
 | T1.1 | `snapclip-capture` 骨架与依赖 | T0.5.4 | 2 文件 | 低 | [ ] |
 | T1.2 | 定义 capture 公共接缝（端口 + 无 pub 字段审查） | T1.1 | 3 文件 | 中 | [ ] |
 | T1.3 | 值对象迁入 `snapclip-model` | T1.2 | ~10 文件 | 中 | [ ] |
@@ -1302,3 +1307,32 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 > **范围说明（决策 D2）**：按用户 2026-10-07 的决定，OCR / `snapclip-recognize` 本轮暂不考虑
 > （`crates/rapid-ocr-rs` 正在快速迭代）。T0.5.2 与 T0.5.3 是**在此之前已完成并验证**的工作，
 > 按 D2 的约定保留、不回退；T3.0–T3.4 挂起，P4/P6 的前置已改为不依赖 P3。
+
+### §14.11 T0.5.4 资源 after + 阶段收尾（tag `refactor-p05`）
+
+```
+任务编号：T0.5.4
+状态：已验证 + 已推送（tag 待推送后补记）
+分支：main
+前置提交/tag：5e1d1df（T0.5.3）；回退基准 smart-snapping-v1-2026-10-07
+修改范围：docs/23 §1.2（after 栏 + 读表说明）、§2；无代码改动
+修改前测试：405 passed / 0 failed / 6 ignored（HEAD 5e1d1df）
+修改后测试（完整 G0，tag 前复跑）：
+  cargo test --lib --manifest-path src-tauri/Cargo.toml → 405 passed / 0 failed / 6 ignored
+  cargo check --workspace --all-targets → 0 warning
+  browser_element_probe → asserted=41 passed=41 failed=0 / available=52 / finer=0
+  explorer_rule_probe   → control_level_points=12/25 / median_area_pct=65.8 / available=25/25 / finer=0
+  ring_contrast_probe   → passed
+  字体子集门禁           → passed
+性能指标：见 §1.2 的 after 栏。**结论是"基本没变，只少了 1 个线程"**：
+          线程 18 → 17；WS 37.7 → 36.7 MB；WebView2 差值 +342.2 → +328.3 MB（机器噪声）；
+          空闲 CPU ~0.00% → 0.003%（噪声）；冷启动 68 → 73 ms（噪声内）；
+          exe 19.34 → 19.31 MB；增量检查 1.36 → 1.32 s。
+          真正会消失的 ~330 MB / 6 个 WebView2 进程属于 **P4 换壳**，不是本阶段。
+人工验证：真机证据 = T0.5.3 的启动日志（`ocr worker started` 消失）；用户此前做过一次
+          `npm run tauri dev` + F5（见 §1.1 真机行）。**本任务未新做真人 F5**。
+失败与根因：无失败。
+提交 SHA：<见本任务提交>
+推送/tag：origin/main 已推送；tag `refactor-p05` 见 §14.12 的回退演练记录
+回退对象：smart-snapping-v1-2026-10-07（整个重构的最终回退基准）
+```
