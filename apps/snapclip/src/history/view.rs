@@ -548,10 +548,21 @@ fn one_line_preview(text: &str, max_chars: usize) -> String {
 /// interface speaks nouns a person uses ("Write each language, do not translate its shape").
 fn row_meta(item: &ClipSummary) -> String {
     let mut parts = Vec::new();
+    parts.push(kind_label(&item.primary_kind).to_string());
+    // The size of the content the row stands for, in the reference card's wording. The
+    // primary payload is the same one `primary_kind` names, so the two never disagree.
+    if let Some(size) = item
+        .payloads
+        .iter()
+        .find(|payload| payload.kind == item.primary_kind)
+        .or_else(|| item.payloads.first())
+        .map(|payload| payload.size_bytes)
+    {
+        parts.push(crate::history::card::format_bytes(size));
+    }
     if let Some(app) = item.source_app.as_deref().filter(|app| !app.is_empty()) {
         parts.push(app.to_string());
     }
-    parts.push(kind_label(&item.primary_kind).to_string());
     if let Some(ocr) = ocr_label(item.ocr_status) {
         parts.push(ocr.to_string());
     }
@@ -900,7 +911,7 @@ fn unseen_ids(items: &[ClipSummary], seen: &HashSet<String>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{kind_label, ocr_label, one_line_preview};
+    use super::{kind_label, ocr_label, one_line_preview, row_meta};
     use snapclip_model::{OcrStatus, PayloadKind};
 
     /// The row is one line tall, so the text has to be one line before layout sees it.
@@ -959,5 +970,55 @@ mod tests {
         assert_eq!(ocr_label(OcrStatus::Done), Some("OCR 完成"));
         assert_eq!(ocr_label(OcrStatus::Failed), Some("OCR 失败"));
         assert_eq!(ocr_label(OcrStatus::Skipped), Some("OCR 跳过"));
+    }
+
+    /// The meta line speaks the card's vocabulary: a kind word, a readable size, the source
+    /// app — and a recognition state only when there is one worth reporting.
+    #[test]
+    fn the_meta_line_reads_like_the_card_spec() {
+        use snapclip_model::{ClipSummary, PayloadKind, PayloadRef, PublicationOrigin};
+
+        let mut item = ClipSummary {
+            id: "clip-1".into(),
+            created_at_unix_ms: 1_700_000_000_000,
+            origin: PublicationOrigin::Clipboard,
+            primary_kind: PayloadKind::Text,
+            preview_text: Some("hello".into()),
+            source_app: Some("Windows Terminal".into()),
+            source_exe_path: None,
+            thumbnail: None,
+            payloads: vec![PayloadRef {
+                payload_id: "payload-1".into(),
+                content_hash: "hash-1".into(),
+                kind: PayloadKind::Text,
+                size_bytes: 76_595,
+                mime_type: None,
+                image_dimensions: None,
+            }],
+            ocr_status: OcrStatus::None,
+            ocr_text: None,
+            ocr_layout: None,
+            ocr_engine: None,
+            ocr_updated_at: None,
+            ocr_error_code: None,
+        };
+        assert_eq!(row_meta(&item), "文本 · 74.8 KB · Windows Terminal");
+
+        // No payload to measure: the size segment simply does not exist.
+        item.payloads.clear();
+        assert_eq!(row_meta(&item), "文本 · Windows Terminal");
+
+        // A running recognition job explains itself at the end of the line.
+        item.ocr_status = OcrStatus::Running;
+        item.payloads = vec![PayloadRef {
+            payload_id: "payload-2".into(),
+            content_hash: "hash-2".into(),
+            kind: PayloadKind::Image,
+            size_bytes: 1_024,
+            mime_type: None,
+            image_dimensions: None,
+        }];
+        item.primary_kind = PayloadKind::Image;
+        assert_eq!(row_meta(&item), "图片 · 1.0 KB · Windows Terminal · 识别中");
     }
 }
