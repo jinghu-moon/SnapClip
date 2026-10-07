@@ -1,77 +1,12 @@
+// 过渡期转发（docs/23 T2.5）：ErrorCode/OcrStatus/OcrErrorCode 已搬到 `snapclip-model`，
+// 这里只做名字转发。`IpcError` 留在壳里——它是**传输信封**（带 traceId 与一组 From 映射），
+// 不是能力 crate 需要的值。删除条件：P2 结束时（T2.10）转发必须为零。
+
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum OcrStatus {
-    None,
-    Queued,
-    Running,
-    Done,
-    Failed,
-    Skipped,
-}
-
-impl OcrStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Queued => "queued",
-            Self::Running => "running",
-            Self::Done => "done",
-            Self::Failed => "failed",
-            Self::Skipped => "skipped",
-        }
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "none" => Some(Self::None),
-            "queued" => Some(Self::Queued),
-            "running" => Some(Self::Running),
-            "done" => Some(Self::Done),
-            "failed" => Some(Self::Failed),
-            "skipped" => Some(Self::Skipped),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum OcrErrorCode {
-    LanguageUnavailable,
-    DecodeFailed,
-    Timeout,
-    Cancelled,
-    EngineFailed,
-}
-
-impl OcrErrorCode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::LanguageUnavailable => "language_unavailable",
-            Self::DecodeFailed => "decode_failed",
-            Self::Timeout => "timeout",
-            Self::Cancelled => "cancelled",
-            Self::EngineFailed => "engine_failed",
-        }
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "language_unavailable" => Some(Self::LanguageUnavailable),
-            "decode_failed" => Some(Self::DecodeFailed),
-            "timeout" => Some(Self::Timeout),
-            "cancelled" => Some(Self::Cancelled),
-            "engine_failed" => Some(Self::EngineFailed),
-            _ => None,
-        }
-    }
-}
-
-// 过渡期转发（docs/23 T1.3）：定义已搬到 `snapclip-model`，这里是唯一实现的转出口。
-// 删除条件：P1 结束时（T1.10）转发必须为零。
 pub use snapclip_model::error::ErrorCode;
+pub use snapclip_model::recognition::{OcrErrorCode, OcrStatus};
+
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -107,35 +42,9 @@ impl From<snapclip_capture::CaptureError> for IpcError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ErrorCode, IpcError, OcrErrorCode, OcrStatus};
+    use super::{ErrorCode, IpcError};
 
-    #[test]
-    fn ocr_status_round_trips_through_storage_strings() {
-        for status in [
-            OcrStatus::None,
-            OcrStatus::Queued,
-            OcrStatus::Running,
-            OcrStatus::Done,
-            OcrStatus::Failed,
-            OcrStatus::Skipped,
-        ] {
-            assert_eq!(OcrStatus::parse(status.as_str()), Some(status));
-        }
-    }
-
-    #[test]
-    fn ocr_error_code_round_trips_through_storage_strings() {
-        for code in [
-            OcrErrorCode::LanguageUnavailable,
-            OcrErrorCode::DecodeFailed,
-            OcrErrorCode::Timeout,
-            OcrErrorCode::Cancelled,
-            OcrErrorCode::EngineFailed,
-        ] {
-            assert_eq!(OcrErrorCode::parse(code.as_str()), Some(code));
-        }
-    }
-
+    // OcrStatus/OcrErrorCode 的往返测试随类型搬到 `snapclip-model::recognition`。
     #[test]
     fn ipc_error_serializes_error_code_as_snake_case() {
         let error = IpcError::new(ErrorCode::Cancelled, "cancelled");

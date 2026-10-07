@@ -245,7 +245,7 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 | T2.2 | `snapclip-history` 骨架 | T2.1 | 3 文件 + 门禁扩展 | 低 | [x]（crate 建立、成员加入、依赖门禁覆盖三个 crate） |
 | T2.3 | 两个独立存储：`CaptureArtifactStore` + `ClipboardBlobStore` | T2.2 | 2 文件 + 错误类型 | 中 | [x]（含 5 个测试；cleanup/LRU 如实记为未实现） |
 | T2.4 | 切换 capture 导出链（搬 PNG 编码，改 `finish_artifact`） | T2.3 | ~6 文件 | 中 | [x]（两半都完成：编码器归位 + 导出链切到 `ArtifactWriter` 端口，见 §14.22/§14.23） |
-| T2.5 | 拆 `store/mod.rs`（连接/仓库/迁移） | T2.4 | 1 595 行 | 高 | [ ] |
+| T2.5 | 拆 `store/mod.rs`（连接/仓库/迁移） | T2.4 | 1 595 行 | 高 | 部分 [x]（域类型前置已搬进 `snapclip-model`，见 §14.24；**store 文件本身还没搬/拆**） |
 | T2.6 | 迁移剪贴板 Windows 适配（6 文件） | T2.5 | 1 210 行 | 中 | [ ] |
 | T2.7 | 迁移 `clipboard_ingest`（去重/格式/publication） | T2.6 | 694 行 | 中 | [ ] |
 | T2.8 | `ClipboardService`/`HistoryService` 公共 API | T2.7 | 3 文件 | 中 | [ ] |
@@ -1699,4 +1699,42 @@ tag 消息明确写了两件事：(1) 捕获已独立成 crate、接缝真实、
 提交 SHA：见提交
 推送/tag：origin/main
 回退对象：8bdf44b
+```
+
+### §14.24 T2.5 前半：store 依赖的域类型进 `snapclip-model`
+
+```
+任务编号：T2.5（前半）
+状态：已验证 + 已推送
+分支：main
+前置提交/tag：2a2611a（T2.4）
+为什么先做这半：`store/mod.rs` 必须搬进 `snapclip-history`（docs/22 §7.1：store 的 clip/artifact/
+          recognition repository 都归 history），但它依赖的一整套域类型还在壳里——
+          history **不能**依赖壳。所以"把域类型搬进 model"是搬 store 的前置。
+修改范围：
+  snapclip-model 新增 payload.rs（PayloadKind/PayloadRef/PayloadData + MIME_* 常量 +
+          `PayloadKind::default_mime_type`）、publication.rs（PublicationOrigin/Publication + 2 个测试）、
+          history.rs（ClipSummary/HistoryPage）；recognition.rs 从占位变成
+          OcrStatus/OcrErrorCode（含从壳搬来的 2 个往返测试）；lib.rs 补 re-export。
+  壳的 domain/{payload,history,publication}.rs 改成转发；domain/error.rs 只留 `IpcError`
+          （传输信封：带 traceId 与 `From<CaptureError>` 映射，不属于能力 crate）+ 三个转发。
+修改前测试：capture 344 / 壳 53 / history 8 / model 16
+修改后测试：model **20**（+2 publication、+2 OCR 往返）；壳 **49**（53 − 4 个搬走的测试）；
+          capture 344、history 8 不变；`cargo check --workspace --all-targets` 0 warning；
+          依赖门禁三 crate 干净；构建后启动正常（`store ready 29ms`、`overlay ready`）
+性能指标：不涉及（纯类型搬移）
+人工验证：不涉及
+失败与根因：无。线上格式（camelCase/snake_case 重命名、字段名）逐字保留，序列化契约测试随类型一起搬。
+剩余（T2.5 后半，续做的确切清单）：
+  1. `src-tauri/src/infrastructure/store/mod.rs` 搬进 `crates/snapclip-history`（`Store` + writer 线程
+     + SQLite 连接 + 迁移 + 查询 + 13 个测试），路径改 `crate::domain::` → `snapclip_model::`，
+     `blob_store` 直接用 crate 内的实现（壳里那两行 `BlobStore`/`StoreError` 转发随之删除）。
+  2. 按职责拆：`db/connection.rs`、`db/migration.rs`、`clip_repository.rs`、`artifact_repository.rs`、
+     `recognition_repository.rs`；`Store` 要么留成组合门面，要么消失（由调用方持有仓库）。
+  3. 壳侧调用方（`commands/*`、`application/clipboard_ingest`、`ocr/worker`）改走新路径；
+     `From<StoreError> for IpcError` 留在壳里（传输胶水）。
+  4. 护栏：`migration_upgrades_existing_v1_database` 等测试逐条通过；用一份已有数据库跑一次真实读取。
+提交 SHA：见提交
+推送/tag：origin/main
+回退对象：2a2611a
 ```
