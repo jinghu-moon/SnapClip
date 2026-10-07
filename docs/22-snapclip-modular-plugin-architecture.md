@@ -313,7 +313,7 @@ GPUI 应用壳负责窗口组合、用户操作、设置和 Win32 托盘；能�
 | `app/clipboard.rs` | UI adapter 或组合根，不再拥有剪贴板业务逻辑 |
 | `commands/*` | 删除 Tauri command；改为 UI action 调用 service API |
 | `events/*` | 低频事件摘要进 `snapclip-model`；Tauri/GPUI channel 适配留各自壳 |
-| `icon.rs` | `apps/snapclip/src/tray.rs` 的 Win32 托盘适配 |
+| `icon.rs` | **注意：它是"按 exe 路径提取来源程序图标"的缓存（供历史行显示），不是托盘**。图标能力随 history 行迁移到 `apps/snapclip/src/history/`；托盘在 `apps/snapclip/src/tray.rs`，是**新建**能力（当前仓库没有任何托盘实现，`Cargo.toml` 只有 `tauri-plugin-opener`） |
 
 ### 7.2 必须拆分的大文件
 

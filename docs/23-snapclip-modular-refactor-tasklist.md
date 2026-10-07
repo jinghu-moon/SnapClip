@@ -15,31 +15,39 @@
 ### 0.1 勾选与完成规则
 
 - [ ] 只有"门禁命令全部通过 + 数字与基线一致（或按预期变化并写明原因）"才允许勾选。
+- [ ] 勾选框只表示"我准备做/我已做完动作"；**完成状态必须用 §13 的状态词表 + 执行记录**，不能仅凭勾选框声称完成。
 - [ ] 每个任务独立提交、独立推送；提交消息里带上门禁数字（现有习惯）。
 - [ ] 不得通过删除测试、放宽断言、跳过 `#[ignore]` 探针、关闭功能来制造通过。
 - [ ] 任务里的"必须保持"条目是回归清单：任何一条被破坏，即使测试是绿的，也视为失败。
 - [ ] 发现问题先定根因（实现 / 接口 / 数据结构 / 模块边界 / 调用流程 / 抽象），再决定改哪里；不要用临时分支绕过。
 
-### 0.2 每一步的通用门禁（复制执行）
+### 0.2 阶段门禁矩阵（**P1 之后 `src-tauri` 不再是全部门禁的所在地**）
 
-在 `D:\100_Projects\110_Daily\SnapClip\src-tauri` 下：
+各阶段用的命令不同，必须按阶段选。**每个任务跑该阶段"受影响"的快门禁；每个阶段结束跑完整门禁。**
+
+| 阶段 | 门禁组 | 命令（在仓库根执行，除非另注） |
+| --- | --- | --- |
+| G0 · 旧 Tauri 阶段（P0–P0.5，以及 P1 迁移期间） | 完整 | `cargo test --lib --manifest-path src-tauri/Cargo.toml`<br>`cargo check --workspace --all-targets`<br>探针（见下） |
+| G1 · workspace / capture / history / recognize 阶段（P1 之后） | 完整 | `cargo test --workspace --all-targets`<br>`cargo check --workspace --all-targets`<br>探针改为按包跑：`cargo test -p snapclip-capture --lib browser_element_probe -- --ignored --nocapture`（Explorer 同理） |
+| G2 · GPUI 阶段（P4 之后） | 完整 | `cargo test --workspace --all-targets`<br>`cargo test -p snapclip`（壳的 `#[gpui_kit::test]` / `VisualTestContext`）<br>G1 的探针仍然要跑 |
+
+探针命令（**必须串行**，之间停 3 秒，避免互相抢焦点）：
 
 ```powershell
-cargo test --lib
-cargo check --all-targets
-cargo test --lib ring_contrast_probe -- --ignored --nocapture      # A4 底色表，对照 docs/21 §5.26
-# 探针必须串行，之间停 3 秒，避免互相抢焦点
+# G0 阶段
 cargo test --lib browser_element_probe -- --ignored --nocapture; Start-Sleep -Seconds 3
-cargo test --lib explorer_rule_probe -- --ignored --nocapture
+cargo test --lib explorer_rule_probe   -- --ignored --nocapture
+cargo test --lib ring_contrast_probe   -- --ignored --nocapture   # A4 底色表，对照 docs/21 §5.26
+# G1/G2 阶段：把 `--lib` 换成 `-p snapclip-capture --lib`（探针随 capture crate 迁移）
 ```
 
-然后再做一次**真机链路**：`npm run tauri dev`（或现有启动方式）→ F5 → 悬停/滚轮/确认或 Esc → 看会话汇总里 `present_us` 与 `over16ms`。
+真机链路（每个阶段至少一次）：现有启动方式 → F5 → 悬停/滚轮/确认或 Esc → 看会话汇总的 `present_us` / `over16ms`。
 
 改了 UI 文案或新增中文字串时追加：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File subfont/subset.ps1
-cargo test --lib the_embedded_subset_covers_the_strings_the_overlay_draws
+cargo test -p snapclip-capture --lib the_embedded_subset_covers_the_strings_the_overlay_draws
 ```
 
 ### 0.3 环境纪律（探针）
@@ -51,9 +59,10 @@ cargo test --lib the_embedded_subset_covers_the_strings_the_overlay_draws
 
 ### 0.4 提交、tag 与回退
 
-- 每个阶段结束打一个 tag（`refactor-p0`、`refactor-p05`、`refactor-p1`…），作为回退点。
-- 任何一步失败的回退：`git reset --hard <上一个阶段 tag>`（只动本次工作区，不 push 破坏远端历史）。
-- 最终回退基准：`smart-snapping-v1-2026-10-07`（V1 功能封版）。
+- **任务完成**：本地一个提交（消息含任务号与门禁数字）。推送节奏 = **至少每阶段一次，推荐每任务都推**——远端就是备份。
+- **阶段完成**：合并（高风险阶段用 `--no-ff`）→ 复跑完整门禁 → annotated tag（`refactor-p0`、`refactor-p05`、`refactor-p1`…）→ 推送 tag。
+- **回退默认用 `git revert <sha>`**。`git reset --hard` **不是常规回退手段**：只在用户明确批准、并且已经先建 `backup/*` 分支或 tag 的情况下使用（见 §0.6）。
+- 最终回退基准：`smart-snapping-v1-2026-10-07`（V1 功能封版，已推远端）。
 
 ### 0.5 允许的破坏性改动清单（本次明确批准）
 
@@ -72,7 +81,12 @@ cargo test --lib the_embedded_subset_covers_the_strings_the_overlay_draws
 **提交粒度与前置条件**
 
 - 每个任务 = **一个提交**，提交消息第一行写清任务号（例如 `refactor(T1.6): split overlay.rs into input/state/render`），正文带上门禁数字。
-- 任务开始前工作区必须**干净**：`git status --porcelain` 为空。存在别人的手稿（例如 `prototypes/` 下的实验文件）时**先确认归属**，不要顺手提交或丢弃；不相关改动先单独提交或 `git stash push -m "…"`。
+- 开工前先探明环境，**不要假设分支名和远端名**：
+  ```powershell
+  git branch --show-current; git remote -v; git status --porcelain; git log --oneline -3
+  ```
+  下文用 `<默认分支>` / `<远端>` 指代实际值。
+- 任务开始前工作区必须**干净**（`git status --porcelain` 为空）。**有未知改动时停止并报告**——不自动 `git stash`、不自动提交、不丢弃：`prototypes/` 下有用户手稿，动了就是事故。确认归属后由用户决定怎么处置。
 - **禁止把红的树留在 main 上**。门禁没过就不要提交；确实需要中途保存进度时，提交为显式的 `wip(T1.6): …（门禁红，未完成）` 并留在**分支**上，不要推到 main。
 
 **分支与 tag：回退点必须存在且可达**
@@ -86,20 +100,20 @@ cargo test --lib the_embedded_subset_covers_the_strings_the_overlay_draws
 
 | 场景 | 命令 | 说明 |
 | --- | --- | --- |
-| 任务做到一半发现方向不对，还没提交 | `git stash push -m "T1.6 wip"` 然后 `git switch main`（或 `git reset --hard refactor-p1`） | 先保命再重做；`git stash list` 能找回 |
+| 任务做到一半发现方向不对，还没提交 | 先 `git branch backup/T1.6-wip` 再 `git switch <默认分支>`；需要留进度才 `git stash push -m "T1.6 wip"` | 先建可找回的分支（stash 只是补充）；`git stash list` 能找回 |
 | 想在动手前留一份保险 | `git branch backup/pre-T1.6` | 比 reflog 好找；确认成功后 `git branch -D` |
 | 已提交但发现坏了，历史已推送 | `git revert <sha>` | **优先用 revert**，保留可追溯性 |
-| 已提交但坏得彻底，且确认没人基于它工作 | `git reset --hard refactor-p1` + `git push --force-with-lease` | 单人开发可用；**必须 `--force-with-lease`**，不要裸 `--force` |
+| 已提交但坏得彻底，且**用户明确批准**回退 | 先 `git branch backup/pre-reset`，再 `git reset --hard refactor-p1` + `git push --force-with-lease <远端> <默认分支>` | 只有用户批准才允许；**必须 `--force-with-lease`**，不要裸 `--force` |
 | 误删/误 reset，找不到提交 | `git reflog`（默认保留 90 天）→ `git branch rescue/<sha> <sha>` | reflog 是最后一道保险，但它不是备份 |
-| 需要把 tag 指到新提交 | `git tag -d <tag> && git tag -a <tag> -m …` + `git push --force-with-lease origin <tag>` | 本项目做过一次（V1 tag 挪到收尾提交） |
+| 需要把 tag 指到新提交 | `git tag -d <tag> && git tag -a <tag> -m …` + `git push --force-with-lease <远端> <tag>` | 本项目做过一次（V1 tag 挪到收尾提交）；先确认没有别人依赖它 |
 | 只想看某个文件的旧版本 | `git show refactor-p1:src-tauri/src/.../overlay.rs` | 不用切换工作区 |
 
 **阶段收尾必做一次"回退演练"**（这是本节存在的意义）：
 
 ```powershell
 git switch --detach refactor-p1
-cd src-tauri; cargo test --lib; cargo check --all-targets   # 回退点必须自身可编译、可测
-cd ..; git switch main
+cargo test --workspace --all-targets        # 回退点必须自身可编译、可测（G0 阶段用 src-tauri 的那条）
+git switch <默认分支>
 ```
 
 回退点编译不过 = 这个阶段的 tag 是假的，必须修好再往前走。
@@ -110,35 +124,58 @@ cd ..; git switch main
 - 不在没有备份分支/tag 的情况下执行 `git reset --hard`。
 - 不为了让门禁变绿而改历史（例如把失败提交 reset 掉再重写）：`revert` 优先，历史留痕。
 
+### 0.7 并行执行规则（多人/多 agent 时）
+
+文档允许并行，但并行只在满足下面全部条件时才允许：
+
+- 每个并行任务使用**独立 worktree**（`git worktree add ../.zcf/SnapClip/<任务号> -b refactor/<任务号>`），不共用同一个工作区。
+- **不同时修改同一个模块入口**：`mod.rs`、`Cargo.toml`、`snapclip-model` 里的公共类型、`lib.rs` 的导出表，同一时间只能有一个任务在改。
+- 每个 worktree 在合并前各自跑**完整**门禁（按 §0.2 的阶段矩阵）。
+- 主分支只接收"已验证 + 已跑完整门禁"的合并提交；合并后主分支再跑一次完整门禁。
+
+首批可并行的候选（互不重叠）：**T1.7**（UIA 测试搬家）与 **T1.8**（D2D 拆分）——它们都在 P1 之后、且不碰同一入口。除此之外默认串行。
+
 ---
 
 ## 1. 基线（动手前记录；每个阶段对照）
 
-### 1.1 正确性基线（已有，复跑确认即可）
+### 1.1 正确性基线（**当前 HEAD 实测，命令生成**）
 
-| 门禁 | 期望值（V1 封版实测） | 本阶段结果 |
-| --- | --- | --- |
-| `cargo test --lib` | 403 passed / 0 failed / 6 ignored | [ ] |
-| `cargo check --all-targets` | 0 warnings | [ ] |
-| `browser_element_probe` | `asserted=41 passed=41 failed=0` / `available=52` / `finer=0` | [ ] |
-| `explorer_rule_probe` | `control_level_points=12/25` / `median_area_pct=65.8` / `available=25/25` / `finer=0` | [ ] |
-| A4 底色表（`ring_contrast_probe`） | 与 docs/21 §5.26 表格一致 | [ ] |
-| 真机会话汇总 | `over16ms=0`；`present_us` 量级 500–2000 µs | [ ] |
-| 字体子集门禁 | 通过（子集 20.3 KB） | [ ] |
-| 事件契约（`events::ALL_EVENT_NAMES` 与 `src/shared/contracts.ts` 同步） | 通过 | [ ] |
+> 规则：本表的数字必须由下面的命令在**当前 HEAD** 现场产生，不手写、不从 tag 或旧文档抄。
+> **历史参考**：V1 封版 tag `smart-snapping-v1-2026-10-07` 当时是 `398 passed / 5 ignored`；当前 HEAD 是 `403 / 6`（ring_contrast 那 5 个测试 + 1 个探针是 tag 之后加的）。两者不要混用。
+> **已知陷阱**：`docs/21 §10` 里有一行 `373 passed / 2 ignored`，那是 V1 之前的旧基线，**已经过期**；引用它会导致 T0.1 一开始就误判"基线不对"。
+
+| 门禁 | 生成命令 | 当前 HEAD 实测（2026-10-07） | 本阶段结果 |
+| --- | --- | --- | --- |
+| 单元测试 | `cargo test --lib --manifest-path src-tauri/Cargo.toml` | **403 passed / 0 failed / 6 ignored** | [ ] |
+| 静态检查 | `cargo check --workspace --all-targets` | 0 warnings | [ ] |
+| 浏览器探针 | `cargo test --lib browser_element_probe -- --ignored --nocapture` | `asserted=41 passed=41 failed=0` / `available=52` / `finer=0` | [ ] |
+| Explorer 探针 | `cargo test --lib explorer_rule_probe -- --ignored --nocapture` | `control_level_points=12/25` / `median_area_pct=65.8` / `available=25/25` / `finer=0` | [ ] |
+| A4 底色表 | `cargo test --lib ring_contrast_probe -- --ignored --nocapture` | 与 docs/21 §5.26 表格一致 | [ ] |
+| 真机会话汇总 | 真机 F5 → 看日志 | `over16ms=0`；`present_us` 量级 500–2000 µs | [ ] |
+| 字体子集门禁 | `cargo test --lib the_embedded_subset_covers_the_strings_the_overlay_draws` | 通过（子集 20.3 KB） | [ ] |
+| 事件契约 | `cargo test --lib` 里的 `ALL_EVENT_NAMES` 契约测试 | 通过（与 `src/shared/contracts.ts` 同步） | [ ] |
+
+> 迁移到 G1 之后，探针与字体门禁按 §0.2 换成 `-p snapclip-capture` 形式，**数字预期不变**；变了就是回归。
 
 ### 1.2 资源基线（P0 新测，before / after 两栏）
 
 | 指标 | 怎么测 | before | after（P0.5 之后） |
 | --- | --- | --- | --- |
-| 进程数 / 线程数 | 任务管理器（详细信息），或 `Get-Process | Where-Object { $_.ProcessName -like '*snapclip*' } | Select-Object Name,Id,Threads.Count,WorkingSet64` | | |
+| 进程数 / 线程数 | 任务管理器（详细信息），或下面的 PowerShell（表格里不能直接写竖线，命令放在表下方） | | |
 | 常驻内存 / GPU 内存 | 任务管理器对应列 | | |
 | 空闲 CPU（30 s 平均） | 任务管理器，静止不操作 | | |
 | 冷启动到可交互 | 启动日志 `setup begin` → `webview page_load Finished` 的 elapsed_ms | | |
 | 包体积 | 产物目录大小 + 主 exe 大小 | | |
 | 改一行共享 crate 的增量编译 | 改 `snapclip-model` 里一行注释后 `cargo check --workspace` 计时 | | |
 
-> **必须 before 先测**：P0.5 的 OCR 惰性化唯一能量化的收益就是这张表的两栏之差。
+进程/线程/内存的取数命令（在仓库根跑）：
+
+```powershell
+Get-Process | Where-Object { $_.ProcessName -like '*snapclip*' } | Select-Object Name, Id, @{n='Threads';e={$_.Threads.Count}}, WorkingSet64
+```
+
+> **必须 before 先测**：P0.5 的 OCR 惰性化唯一能量化的收益就是这张表的两栏之差；但**收益是实测结果，不是预期结论**（见 T0.5.3/T0.5.4）。
 
 ### 1.3 规模基线（要搬的代码量，来自实测）
 
@@ -152,6 +189,17 @@ cd ..; git switch main
 | `infrastructure/store/` | 1 785 / 2 | `snapclip-history`（拆 repository） |
 | `ocr/` | 829 / 6 | `snapclip-recognize` |
 | `events/`、`commands/`、`app/` | 920 / 10 | 事件摘要去 `snapclip-model`；其余留壳（P6 删） |
+
+生成命令（**数字由命令产生，不手写**；下表是 2026-10-07 的实测值，若与现场不符以命令输出为准）：
+
+```powershell
+# 单文件行数
+Get-Content src-tauri/src/<路径> | Measure-Object -Line
+# 目录总行数 + 文件数
+$f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Content $_.FullName } | Measure-Object -Line).Lines; $f.Count
+```
+
+对报告里出现过的三个数字做一次校正（都以本命令为准）：`infrastructure/store/mod.rs` = **1595** 行、`application/clipboard_ingest.rs` = **694** 行、`platform/windows/clipboard/` = **6** 个文件（含 `mod.rs`）。
 
 ---
 
@@ -172,30 +220,38 @@ cd ..; git switch main
 | T1.3 | 值对象迁入 `snapclip-model` | T1.2 | ~10 文件 | 中 | [ ] |
 | T1.4 | 迁移平台无关 capture（20 文件） | T1.3 | 10 686 行 | 中 | [ ] |
 | T1.5 | 迁移 Windows 实现（20 文件） | T1.4 | 18 256 行 | 高 | [ ] |
-| T1.6 | 拆 `overlay.rs`（5 职责） | T1.5 | 4 423 行 | 高 | [ ] |
+| T1.6.1 | 拆出 `overlay/window.rs` | T1.5 | — | 高 | [ ] |
+| T1.6.2 | 拆出 `overlay/input.rs` | T1.6.1 | — | 高 | [ ] |
+| T1.6.3 | 拆出 `overlay/state.rs` | T1.6.2 | — | 高 | [ ] |
+| T1.6.4 | 拆出 `overlay/render_submit.rs` | T1.6.3 | — | 高 | [ ] |
+| T1.6.5 | 拆出 `overlay/window_restore.rs` + 组收尾 | T1.6.4 | 4 423 行（整组） | 高 | [ ] |
 | T1.7 | `uia_provider.rs` 测试搬家 | T1.5 | 3 338 行（测试 72%） | 中 | [ ] |
 | T1.8 | 拆 `d2d.rs`（4 pass + 文本） | T1.5 | 3 805 行 | 中 | [ ] |
 | T1.9 | 依赖方向与接缝门禁落地 | T1.5 | 1 脚本 | 低 | [ ] |
-| T1.10 | 阶段验收 + tag `refactor-p1` | T1.6–T1.9 | — | 低 | [ ] |
-| T2.1 | `ArtifactStore`/`ArtifactRef` 定死 | T1.10 | 2 文件 | 中 | [ ] |
+| T1.10 | 阶段验收 + tag `refactor-p1` | T1.6.1–T1.9 | — | 低 | [ ] |
+| T2.1 | `ArtifactRef`/`CaptureOutput` 在 `snapclip-model` 定死（**不建 crate**） | T1.10 | 2 文件 | 低 | [ ] |
 | T2.2 | `snapclip-history` 骨架 | T2.1 | 2 文件 | 低 | [ ] |
-| T2.3 | 拆 `store/mod.rs`（连接/仓库/迁移） | T2.2 | 1 785 行 | 高 | [ ] |
-| T2.4 | 迁移剪贴板 Windows 适配（6 文件） | T2.3 | 1 210 行 | 中 | [ ] |
-| T2.5 | 迁移 `clipboard_ingest`（去重/格式/publication） | T2.4 | 694 行 | 中 | [ ] |
-| T2.6 | `ClipboardService`/`HistoryService` 公共 API | T2.5 | 3 文件 | 中 | [ ] |
-| T2.7 | `commands/history.rs`、`commands/ocr.rs` 改走服务 | T2.6 | 2 文件 | 低 | [ ] |
-| T2.8 | 阶段验收 + tag `refactor-p2` | T2.7 | — | 低 | [ ] |
-| T3.1 | `snapclip-recognize` 骨架（迁 `ocr/`） | T2.8 | 829 行 | 低 | [ ] |
+| T2.3 | 两个独立存储：`CaptureArtifactStore` + `ClipboardBlobStore` | T2.2 | 2 文件 | 中 | [ ] |
+| T2.4 | 切换 capture 导出链（搬 PNG 编码，改 `finish_artifact`） | T2.3 | ~4 文件 | 中 | [ ] |
+| T2.5 | 拆 `store/mod.rs`（连接/仓库/迁移） | T2.4 | 1 595 行 | 高 | [ ] |
+| T2.6 | 迁移剪贴板 Windows 适配（6 文件） | T2.5 | 1 210 行 | 中 | [ ] |
+| T2.7 | 迁移 `clipboard_ingest`（去重/格式/publication） | T2.6 | 694 行 | 中 | [ ] |
+| T2.8 | `ClipboardService`/`HistoryService` 公共 API | T2.7 | 3 文件 | 中 | [ ] |
+| T2.9 | `commands/history.rs`、`commands/ocr.rs` 改走服务 | T2.8 | 2 文件 | 低 | [ ] |
+| T2.10 | 阶段验收 + tag `refactor-p2` | T2.9 | — | 低 | [ ] |
+| T3.0 | recognize 接缝设计（`ArtifactReader`/`RecognitionJobStore`/`RecognitionEventSink`） | T2.10 | 1 文件 | 中 | [ ] |
+| T3.1 | `snapclip-recognize` 骨架（迁 `ocr/`） | T3.0 | 829 行 | 低 | [ ] |
 | T3.2 | 惰性 + 取消 + 超时 + 缓存 + 熔断 | T3.1 | ~4 文件 | 中 | [ ] |
-| T3.3 | 壳接线（history 只发 `ArtifactRef`） | T3.2 | 2 文件 | 中 | [ ] |
+| T3.3 | 壳接线（history 只发 `ArtifactRef`，结果由壳写回） | T3.2 | 2 文件 | 中 | [ ] |
 | T3.4 | 资源对比 + 阶段验收 + tag `refactor-p3` | T3.3 | — | 低 | [ ] |
-| T4.1 | 开工前研读 GPUI 规范与组件文档 | — | — | 低 | [ ] |
+| T4.1 + T4.1.1 | 开工前研读 + **前端功能迁移矩阵** | — | 1 表格 | 低 | [ ] |
 | T4.2 | `apps/snapclip` 骨架（init/Root/单窗口） | T4.1, T3.4 | ~5 文件 | 中 | [ ] |
 | T4.3 | history 能力（Entity + 虚拟列表 + `ElementId`=clip id） | T4.2 | ~4 文件 | 高 | [ ] |
-| T4.4 | settings 能力 | T4.3 | ~3 文件 | 中 | [ ] |
-| T4.5 | 事件桥（channel + `cx.spawn` + 丢弃过期） | T4.3 | 2 文件 | 高 | [ ] |
-| T4.6 | 托盘（Win32） | T4.2 | 1 文件 | 中 | [ ] |
-| T4.7 | 测试三层 + 无障碍树断言 | T4.3–T4.6 | ~4 文件 | 中 | [ ] |
+| T4.4 | settings 能力（**新增**，不是迁移） | T4.3 | ~3 文件 | 中 | [ ] |
+| T4.4.1 | 两个窗口检测开关接成真实设置通道 | T4.4 | 3 文件 | 中 | [ ] |
+| T4.5 | 事件桥（`snapclip-model::AppEvent` + channel + 丢弃过期） | T4.3 | 2 文件 | 高 | [ ] |
+| T4.6 | 托盘（Win32，**新建**） | T4.2 | 1 文件 | 中 | [ ] |
+| T4.7 | 测试三层 + 无障碍树断言（**先 spike**） | T4.3–T4.6 | ~4 文件 | 中 | [ ] |
 | T4.8 | 性能对比（对 §1.2 基线） | T4.7 | — | 中 | [ ] |
 | T4.9 | 阶段验收 + tag `refactor-p4` | T4.8 | — | 低 | [ ] |
 | T5.x | 进程插件边界（**触发式**，见 §9） | 判据成立 | — | 高 | [ ] |
@@ -294,7 +350,8 @@ cd ..; git switch main
   2. `OcrService::start(...)` 改成 `OcrService::new(...)`（不起线程/进程），内部加 `ensure_started()`；`try_enqueue` 首次调用时启动。
   3. 启动日志：未触发 OCR 时**不再**打印 `ocr worker started`；首次任务启动时打印一次，并带上 `trigger=first-task`。
 - 必须保持：OCR 结果的正确性、重试、取消、历史关联不变；队列上限/去重行为不变。
-- 验收：§0.2 门禁全过；启动日志中"未触发 OCR 的会话"没有 `ocr worker started`；触发一次 OCR 后出现一次；T0.2 的资源表 `after` 栏填写并对比（线程数与常驻内存应下降）。
+- 验收：§0.2 门禁全过；启动日志中"未触发 OCR 的会话"没有 `ocr worker started`；触发一次 OCR 后出现一次；T0.2 的资源表 `after` 栏填写。
+- 注意：**不要预设"线程数与常驻内存必然下降"**。`OcrManager::new()` 是否在构造时就加载语言/模型，需要实测确认（`rg -n "fn new" src-tauri/src/ocr/manager.rs` 看它做了什么）。惰性化只保证"不触发 OCR 就不启动 worker"；资源数字如实记录，差异写清解释。
 - 回退：`git revert`。
 - 风险：中（低风险改动，但要小心"首次任务"路径的竞态：两个任务同时首次入队只允许启动一次 worker）。
 
@@ -305,7 +362,7 @@ cd ..; git switch main
   1. 按 §1.2 填 `after` 栏，与 before 并列写进提交消息。
   2. 打 tag `refactor-p05`。
 - 必须保持：§1.1 全部门禁仍绿。
-- 验收：资源表两栏齐全；before/after 的差异能解释（线程数减少、常驻内存减少）。
+- 验收：资源表两栏齐全，且**每一条差异都有解释**。数字没变化或变差时，如实写"无显著变化/变差"并给出原因，不要为了让表格好看而改口径。
 - 风险：低。
 
 ---
@@ -313,6 +370,18 @@ cd ..; git switch main
 ## 5. P1：抽离 `snapclip-capture`
 
 > 本阶段是整次重构最大的单点。纪律：**一次只做一件事，每做完一个文件/一个职责就跑一次 §0.2 门禁**。
+>
+> **迁移接线策略（先读这一节，否则会在 T1.4 卡住）**：旧 crate 的代码不是"搬过去就完了"——`src-tauri` 必须始终可编译。规则是：
+>
+> 1. **唯一实现只在新 crate**：新 crate 里的实现是唯一版本，不接受"两边各一份"；
+> 2. **旧模块变薄转发**：`src-tauri/src/...` 下的旧文件在迁移期只保留 `pub use` 转发（每搬一个文件，旧文件立刻变成一行 `pub use`），阶段末整目录删除；
+> 3. **每一步都可编译**：每搬一个文件/一个责任就跑一次该阶段门禁（G0/G1 见 §0.2）；
+> 4. **不新增兼容层**：转发只允许存在于迁移进行中的那一阶段，**T1.10 结束时必须为零**。
+>
+> 两条必须在 P1 就定好的交付协议（否则 P2 会推翻 P1）：
+>
+> - **`infrastructure/image`（PNG 编码）**：P1 期间留在 `src-tauri`（`PngArtifactEncoder` 属于组合根），capture 只通过已有的 `ArtifactEncoder`/`ArtifactDir` **端口**使用它，端口签名不变；**P2 的 T2.4 才把编码与写盘一起搬到 `snapclip-history`**，capture 那时改成交付字节 + 元数据。
+> - **`CaptureService::finish_artifact`（导出落盘）**：P1 不动它的签名与调用链（overlay/export worker 继续用 `ArtifactDir`）；P2 的 T2.4 一次性切到 `CaptureOutput { bytes, metadata }` + `CaptureArtifactStore`。**两个阶段各改一次不行**——只允许在 T2.4 改一次。
 
 ### T1.1 `snapclip-capture` 骨架与依赖
 
@@ -374,26 +443,55 @@ cd ..; git switch main
 
 ### T1.6 拆 `overlay.rs`（第一优先，4 423 行）
 
-- 前置：T1.5
-- 动作（按职责拆，**先搬生产代码，再搬测试**；每拆一个文件跑一次门禁）：
-  1. `overlay/window.rs`：窗口类注册、HWND、消息循环、焦点、生命周期。
-  2. `overlay/input.rs`：鼠标/键盘/`WheelAccumulator`/`PointerGesture` 绑定。
-  3. `overlay/state.rs`：会话绑定、预览/层级/提示/动画状态机（`WalkColour`、`ChainVisibility`、`RingAppear`、`AbandonedHint`）。
-  4. `overlay/render_submit.rs`：渲染提交、damage/coalescing tick、present 计量。
-  5. `overlay/window_restore.rs`：窗口恢复/取消/清理路径。
-- 必须保持：滚轮/↑↓ 切层、链环与徽标、A2 挖洞、A3 绿跟滚轮、动画（docs/21 §5.24.10）、导出路径不带 UI。
-- 验收：§0.2 门禁全过 + 真机一条完整链路（悬停 → 滚轮换层 → 确认 → PNG 导出）+ 汇总 `over16ms=0`。
-- 回退：`git revert`（建议每个子文件一个提交）。
-- 风险：高。**不要一次性搬完再测**：这个文件同时持 HWND、会话、输入、渲染和吸附，一次只动一块。
+> **任务粒度规则**：T1.6 是**任务组**，由 T1.6.1–T1.6.5 五个**子任务**组成。**每个子任务 = 一个提交 + 一次该阶段门禁**（子任务之间不允许把两个职责合并进同一个提交，也不允许"先全拆完再跑门禁"）。§0.4 的"每个任务一个提交"在这里展开为"每个子任务一个提交"。
+>
+> 每个子任务的公共约束：
+>
+> - 前置：T1.5（子任务之间串行，按编号顺序做）。
+> - 顺序规则：**先搬生产代码，再搬该职责的测试**；只搬移与可见性收敛，**不改行为、不改断言**（要改断言说明搬错了）。
+> - 回退：`git revert` 对应子任务的提交。
+> - 风险：高。这个文件同时持 HWND、会话、输入、渲染与吸附状态，**一次只动一块**。
+
+#### T1.6.1 拆出 `overlay/window.rs`
+
+- 动作：窗口类注册与 WNDCLASS、HWND/窗口创建与销毁、窗口消息循环、焦点获取与生命周期（含 `WM_*` 分发骨架）。
+- 必须保持：overlay 仍是**独立原生 HWND + 独立线程**；F5 热键仍注册在 overlay 线程；窗口类名不变（`SnapClipCaptureOverlay`，它是精度探测与捕获排除逻辑的依赖）。
+- 验收：§0.2 门禁全过 + 真机 F5 起 overlay / Esc 取消一次。
+
+#### T1.6.2 拆出 `overlay/input.rs`
+
+- 动作：鼠标与键盘事件路由、`WheelAccumulator`、`PointerGesture`、光标形状管理。
+- 必须保持：滚轮与 ↑↓ 切层语义、按点切换目标的节流/合并行为、光标形状反馈（`mouse_move_coalesced_count` 量级不恶化）。
+- 验收：§0.2 门禁全过 + 真机滚轮向上/向下各换层一次。
+
+#### T1.6.3 拆出 `overlay/state.rs`
+
+- 动作：会话绑定与预览状态机、层级游走与提示/动画状态（`WalkColour`、`ChainVisibility`、`RingAppear`、`ArmedHint`）。
+- 必须保持：**A2 挖洞**、**A3 绿跟滚轮**、动画与 `chain_fade_frames`/`walk_frames` 的现有语义；层级计数/徽标数值与 `level=` 日志一致。
+- 验收：§0.2 门禁全过 + 真机"滚动时绿框出现、停止后回蓝"一次。
+
+#### T1.6.4 拆出 `overlay/render_submit.rs`
+
+- 动作：渲染提交、damage 回合与合并 tick、`present_us`/`over16ms` 计量。
+- 必须保持：**截图高频路径零 IPC**（F5 → overlay 不经过壳）；`over16ms=0`、`present_us` 与基线同量级；导出 PNG 不带任何 overlay UI。
+- 验收：§0.2 门禁全过 + 真机会话汇总里 `over16ms=0`。
+
+#### T1.6.5 拆出 `overlay/window_restore.rs` + 子任务组收尾
+
+- 动作：窗口恢复/取消/异常清理路径（取消、失败、设备丢失、资源释放），然后做一次**子任务组收尾**：`overlay.rs` 只留组合入口（`mod.rs` 级别的装配），确认无残留死代码。
+- 必须保持：取消/失败路径不泄漏 GPU 与 HWND 资源（`session graphics released` 仍出现一次）。
+- 验收：§0.2 门禁全过 + **真机全链路**（悬停 → 滚轮换层 → 确认 → PNG 导出）+ 一次 Esc 取消；汇总 `over16ms=0`。
+- 风险：高（这一步是整组唯一的"整体验收"，前四个子任务各自的真机验证不能替代它）。
 
 ### T1.7 `uia_provider.rs` 测试搬家（3 338 行，测试 72%）
 
 - 前置：T1.5
 - 动作：
-  1. 先把 `#[cfg(test)] mod tests`（2 416 行）按主题拆到 `windows/accessibility/tests/`（或 crate 的 `tests/`）下：浏览器夹具探针、Explorer 探针、sources 对照、超时/隔离用例。
+  1. 先把 `#[cfg(test)] mod tests`（2 416 行）按主题拆成 crate **内部**的子模块 `windows/accessibility/tests/{mod,browser,explorer,sources,timeout}.rs`，用 `mod` 嵌套（必要时 `#[path]`）挂回 `uia_provider`。
   2. 再把生产代码（约 916 行）按 COM 初始化、UIA 查询、树缓存、元素身份校验、超时调用拆文件。
+- **不要搬去 `tests/` 集成测试目录**：现有测试大量依赖 provider 的**私有函数**与测试辅助类型（夹具、构造器），搬到 `tests/` 会强迫把私有项改成 `pub`，等于把内部实现泄进公共 API（违反 T1.2 与 §10.1 的接缝门禁）。确实需要跨文件共享的辅助类型，放进 `#[cfg(test)] mod tests_support`。
 - 必须保持：**两个实机探针的可运行性与期望值**（浏览器 41/41、Explorer 12/25·65.8）；探针的启动方式（自带临时 profile 起浏览器）不变。
-- 验收：§0.2 门禁全过（探针仍从同一命令跑）。
+- 验收：§0.2 门禁全过（探针仍从同一命令跑 `--ignored --nocapture`）；`rg -n "pub fn" src/windows/accessibility` 命中数**不比搬之前多**（多了说明为了搬测试泄了私有项）。
 - 回退：按提交回退。
 - 风险：中（搬测试最容易"顺手改断言"，禁止；只改路径与模块结构）。
 
@@ -420,55 +518,97 @@ cd ..; git switch main
 ### T1.10 阶段验收 + tag
 
 - 前置：T1.6–T1.9
-- 动作：跑完整 §0.2 门禁 + 真机全链路 + 删掉所有过渡 re-export（T0.4/T1.3 留下的），打 tag `refactor-p1`。
-- 验收：`src-tauri` 里 `capture/`、`platform/windows/capture/` 目录已空或只剩壳的引用；`rg -n "snapclip_model" src-tauri` 说明壳仍能编译。
+- 动作：跑完整 §0.2 门禁 + 真机全链路 + 删掉所有过渡 re-export（T0.4/T1.3 留下的转发模块），打 tag `refactor-p1`。
+- 验收（四条，逐条给证据；**不要用 `rg snapclip_model` 当"壳还能编译"的证明**——壳引用 `snapclip_capture`/`snapclip_model` 本来就应该存在，这条既能命中也能落空，证明不了任何事）：
+  1. **旧路径引用为零**：`rg -n "crate::capture::" src-tauri/src` 与 `rg -n "platform::windows::capture" src-tauri/src` 都不再命中**实现**（只剩壳对 `snapclip_capture` 的调用）。
+  2. **新 crate 自测通过**：`cargo test -p snapclip-capture`（G1 门禁，见 §0.2）。
+  3. **壳仍可构建并可用**：`cargo check --workspace --all-targets` 通过 + 真机 F5 → 截图 → Esc 一次。
+  4. **依赖方向门禁绿**：T1.9 的检查脚本通过。
+- 说明：迁移期允许转发模块存在，**T1.10 结束时必须为零**；被禁的是"引用旧路径实现"与"留下转发模块"，不是"引用新 crate"。
 - 风险：低。
 
 ---
 
 ## 6. P2：抽离 `snapclip-history`
 
-> 关键前提：**artifact 的写盘权先收敛成一条**，再拆 crate。现在 `CaptureService` 通过 `ArtifactDir` 写、`store/blob.rs` 也在动磁盘，两边都写是最难查的一类 bug。
+> 关键前提：**artifact 的写盘权先收敛成一条**，再拆 crate。现在 `CaptureService` 通过 `ArtifactDir` 写（截图 PNG），`store/blob.rs` 也在动磁盘（剪贴板内容的 content-addressed blob），两边都写是最难查的一类 bug。
+>
+> **两套存储不是同一种东西，不许合并**：
+>
+> | 现有 | 内容 | 语义 |
+> | --- | --- | --- |
+> | `application/capture_service::ArtifactDir` | 截图 PNG | 目录约定 + 命名 |
+> | `infrastructure/store/blob.rs` | 剪贴板内容 blob | `blake3` 内容寻址（`{hash[..2]}/{hash}.blob`）+ 读取校验 + 去重/GC |
+>
+> 合并会破坏剪贴板去重与 blob GC：blob 的哈希身份是它存在的理由，PNG 文件名是人看的东西。两者可以都属于 `snapclip-history`，但**必须各自独立目录、独立测试**。
+>
+> **顺序不能颠倒**：类型先定（T2.1）→ crate 再建（T2.2）→ 存储再实现（T2.3）→ 最后才切 capture 的导出调用链（T2.4）。把"在 `snapclip-history` 里定义存储"写在"创建 `snapclip-history`"之前是**不可执行**的，照做会在 T2.1 就卡住。
 
-### T2.1 `ArtifactStore` / `ArtifactRef` 定死
+### T2.1 `snapclip-model` 侧类型定死（**只定义类型，不建 crate**）
 
 - 前置：T1.10
 - 动作：
-  1. 在 `snapclip-model` 定义 `ArtifactRef { absolute_path, mime, dimensions, byte_len, content_fingerprint }`（指纹 = `blake3`，**写入时算好**，见 docs/22 §4）。
-  2. 在 `snapclip-history` 定义 `ArtifactStore`：布局/命名/原子写/清理/LRU 的**唯一所有者**；`blob.rs` 的原子写与 `ArtifactDir` 的目录约定合并进来。
-  3. 让截图导出改为"交付字节 + 元数据"，由壳调用 `ArtifactStore` 落盘；`ArtifactStore` 返回 `ArtifactRef`。
-- 必须保持：导出 PNG 的像素与文件名行为（`docs/11 §8.2` 的导出契约）；历史里已有 artifact 仍能被读取（迁移期允许一次性重写索引，但要在提交消息里说明）。
-- 验收：§0.2 门禁全过 + 真机截图 → 导出 → 历史可见 → 磁盘文件可打开。
+  1. 在 `snapclip-model` 定义 `ArtifactRef { absolute_path, mime, dimensions, byte_len, content_fingerprint }`（`content_fingerprint` = `blake3`，**写入时算好**，读取方不再重算，见 docs/22 §4）。
+  2. 定义 `CaptureOutput { bytes, metadata }`：截图产出的**交付形态**。
+  3. 此时**不改任何调用方**：`CaptureService::finish_artifact`、`ArtifactDir`、`ArtifactEncoder` 保持原样（签名与调用链在 P1 期间已被冻结，见 §5 顶部的交付协议）。
+- 必须保持：只新增类型，不改行为；`cargo test --lib` 仍是基线数字。
+- 验收：§0.2 门禁全过（G1，因为 P1 之后代码已在 `snapclip-capture`）。
 - 回退：`git revert`。
-- 风险：中（写盘路径切换是数据面风险，先加一条"导出后立即校验字节数/指纹"的测试）。
+- 风险：低。
 
 ### T2.2 `snapclip-history` 骨架
 
 - 前置：T2.1
-- 动作：新增 crate（依赖 `snapclip-model` + SQLite/图像编码 + Windows SDK），先放空模块与 `ArtifactStore`。
+- 动作：新增 `crates/snapclip-history/`（依赖 `snapclip-model` + SQLite + 图像编码 + Windows SDK），先只放空模块与 crate 文档注释里的"接缝清单"。
+- 必须保持：`src-tauri` 仍可编译（新 crate 暂时没人引用）。
 - 验收：`cargo check --workspace --all-targets` 0 warning。
+- 回退：删除 crate。
 - 风险：低。
 
-### T2.3 拆 `store/mod.rs`（1 595 行）
+### T2.3 两个独立存储：`CaptureArtifactStore` + `ClipboardBlobStore`
 
 - 前置：T2.2
+- 动作：
+  1. `capture_artifact.rs`：从 `ArtifactDir` 迁目录约定、命名、原子写、清理/LRU；接口收 `CaptureOutput`，返回 `ArtifactRef`（指纹写入时算出）。这是截图 artifact 的**唯一所有者**。
+  2. `clipboard_blob.rs`：从 `store/blob.rs` 原样迁入 content-addressed blob（`{hash[..2]}/{hash}.blob`、写入后校验、读取再校验、去重）。这是剪贴板 blob 的**唯一所有者**。
+  3. 两者各自独立目录、独立测试文件；**不要抽出共同基类/共同 trait 再实现**——它们的共同点只有"都用文件系统"，抽象化会把两套语义耦死。
+- 必须保持：`blob.rs` 的既有测试（`content_is_deduplicated_and_verified_on_read` 等）逐条通过；截图导出的像素与文件名契约（`docs/11 §8.2`）。
+- 验收：§0.2 门禁全过 + 两个存储各自的单测通过（含"写入后立即校验字节数/指纹"）。
+- 回退：`git revert`。
+- 风险：中。
+
+### T2.4 切换 capture 导出链（**P1 冻结的那个签名在这里改一次**）
+
+- 前置：T2.3
+- 动作：
+  1. 把 `PngArtifactEncoder` 与 `infrastructure/image` 的 PNG 编码一起搬到 `snapclip-history`。
+  2. `CaptureService::finish_artifact`（或等价出口）改为交付 `CaptureOutput { bytes, metadata }`；落盘改由壳调用 `CaptureArtifactStore`，返回 `ArtifactRef`。
+  3. 删除 `capture` 侧的 `ArtifactDir`/`ArtifactEncoder` 端口与其测试替身；确认 `cargo tree -p snapclip-capture -e normal` 里没有 `snapclip-history`（方向必须是壳调用 history，不是 capture 调用 history）。
+- 必须保持：overlay/export worker 的调用链仍然只经过**一个**落盘出口；导出 PNG 与历史可见性不变；`docs/21 §5.26` 的 ring 调色板仍只有一处定义（搬动时别复制）。
+- 验收：§0.2 门禁全过 + 真机截图 → 导出 → 历史可见 → 磁盘文件可打开；`ArtifactRef.content_fingerprint` 与实际文件 `blake3` 一致。
+- 回退：`git revert`。
+- 风险：中（数据面切换；护栏是"导出后立即校验字节数与指纹"的测试）。
+
+### T2.5 拆 `store/mod.rs`（1 595 行）
+
+- 前置：T2.4
 - 动作：拆为 `db/connection.rs`、`db/migration.rs`、`clip_repository.rs`、`artifact_repository.rs`、`recognition_repository.rs`；`Store` 保留为组合门面或直接消失（由调用方持有仓库）。
 - 必须保持：迁移顺序与 schema 版本；现有 `migration_upgrades_existing_v1_database` 等测试逐条通过；分页/去重语义不变。
 - 验收：§0.2 门禁全过；用一份已有数据库文件跑一次真实读取（复制一份到测试临时目录，不要销毁用户数据）。
 - 回退：`git revert`。
 - 风险：高（`migration_upgrades_existing_v1_database` 是这条路径的护栏，先读它再动）。
 
-### T2.4 迁移剪贴板 Windows 适配（6 文件 / 1 210 行）
+### T2.6 迁移剪贴板 Windows 适配（6 文件 / 1 210 行）
 
-- 前置：T2.3
+- 前置：T2.5
 - 动作：迁 `platform/windows/clipboard/{formats,image_norm,listener,reader,source_app,mod}.rs` 到 `snapclip-history/src/windows/`。
 - 必须保持：文本/HTML/图片格式读取、延迟渲染格式、来源程序识别行为不变。
 - 验收：§0.2 门禁全过 + 真机复制文本/图片各一次，历史里正确入库。
 - 风险：中。
 
-### T2.5 迁 `application/clipboard_ingest.rs`
+### T2.7 迁 `application/clipboard_ingest.rs`
 
-- 前置：T2.4
+- 前置：T2.6
 - 动作：
   1. 迁为 `snapclip-history/src/{service,reader,history}.rs`；按 docs/22 §7.2 拆"事件接收 / 去重窗口 / 格式读取 / publication / 识别入队"。
   2. **保留 `OcrQueue` 端口**（现在 `application/clipboard_ingest::OcrQueue` 由 `app/ocr_queue.rs` 实现，这是已经存在的正确模式）：端口留 history，实现由壳绑定到 `snapclip-recognize`。
@@ -476,26 +616,26 @@ cd ..; git switch main
 - 验收：§0.2 门禁全过 + 真机连续复制去重行为与之前一致。
 - 风险：中。
 
-### T2.6 `ClipboardService` / `HistoryService` 公共 API
+### T2.8 `ClipboardService` / `HistoryService` 公共 API
 
-- 前置：T2.5
+- 前置：T2.7
 - 动作：定义接缝（查询分页、按 id 取详情、复制回写、删除、订阅低频事件）；公共类型用 builder + reader，**不暴露 pub 字段**；内部 repository 类型不 re-export。
 - 必须保持：`commands/*` 里现有行为逐条对齐（改命令前先把旧行为列成清单）。
 - 验收：§0.2 门禁全过。
 - 风险：中。
 
-### T2.7 `commands/history.rs`、`commands/ocr.rs` 改走服务
+### T2.9 `commands/history.rs`、`commands/ocr.rs` 改走服务
 
-- 前置：T2.6
+- 前置：T2.8
 - 动作：把直接 `State<'_, Store>` 改成调用 `HistoryService`/`ClipboardService`（识别相关的入队/重试/状态查询改走 recognize 的服务或 `OcrQueue` 端口）。`commands/capture.rs` 已经走 `CaptureRuntime`，不动。
 - 必须保持：前端命令名/返回 JSON 结构不变（前端契约）。
 - 验收：§0.2 门禁全过 + 前端历史页/OCR 操作各点一次无报错。
 - 回退：`git revert`。
 - 风险：低。
 
-### T2.8 阶段验收 + tag
+### T2.10 阶段验收 + tag
 
-- 前置：T2.7
+- 前置：T2.9
 - 动作：完整 §0.2 门禁 + 真机"复制 → 历史 → 复制回写 → 删除"全链路 + 回退演练（§0.6）+ tag `refactor-p2`。
 - 风险：低。
 
@@ -503,10 +643,39 @@ cd ..; git switch main
 
 ## 7. P3：抽离 `snapclip-recognize`
 
+### T3.0 接缝设计（**先定接口，再搬代码**）
+
+- 前置：T2.10
+- 背景事实（已核实的当前实现，正是它让"只搬文件"行不通）：
+  - `ocr/engine.rs`：`OcrInput::Png(Arc<[u8]>)` —— 输入是**内存字节**，不是文件引用。
+  - `ocr/worker.rs`：`OcrService` 直接持有 `Store`（`tauri::AppHandle` 也一并持有），worker 线程**直接读写 OCR 数据库**（`list_ocr_candidates`/`enqueue_ocr`/`claim_ocr_job`/finish）。
+  - `OcrQueue` 端口已存在且模式正确（定义在 `application/clipboard_ingest.rs`，由 `app/ocr_queue.rs` 实现）——新设计沿用它，不要另起一套。
+- 动作：定义三个 trait（放进 `snapclip-recognize`，由壳/history 实现）：
+
+  | trait | 职责 | 谁实现 |
+  | --- | --- | --- |
+  | `ArtifactReader` | 按 `ArtifactRef` 交出字节（或内存映射） | 壳 / history（`CaptureArtifactStore`） |
+  | `RecognitionJobStore` | 领取/认领任务、写回结果与状态 | history（`recognition_repository`） |
+  | `RecognitionEventSink` | 状态事件出口（P0.5 已产出的 `OcrEventSink` 是它的基础版，事件名仍 `ocr-status-v1`） | 壳（Tauri 适配器 / GPUI 适配器） |
+
+- 目标调用链（**方向单向，`recognize` 不依赖 `history`，也不依赖 `Store`**）：
+
+  ```
+  壳 / history 创建任务（clip_id + ArtifactRef）
+    → recognize worker 经 ArtifactReader 取字节，跑引擎
+    → recognize 返回 RecognitionResult
+    → 壳 / history 经 RecognitionJobStore 持久化结果
+  ```
+
+- 必须保持：现有 OCR 结果的字段与语义、`ocr-status-v1` 事件契约。
+- 验收：接口定义提交里只有 trait + 类型，**没有搬运实现**；`cargo check --workspace --all-targets` 0 warning。
+- 回退：`git revert`。
+- 风险：中（接口定错，T3.1 会返工；所以这一步单独提交、单独评审）。
+
 ### T3.1 crate 骨架（迁 `ocr/` 829 行 / 6 文件）
 
-- 前置：T2.8
-- 动作：新增 `crates/snapclip-recognize`，迁 `engine.rs`（`OcrEngine`/`OcrCancel`，**保留契约**）、`manager.rs`、`worker.rs`、`win_ocr.rs`、`rapid.rs`（`ocr-rapid` feature 默认关）、`mod.rs`；输入类型改为接受 `ArtifactRef`（不再接受 `Arc<[u8]>`，或同时保留内存入口给内部使用，但**接缝**用 `ArtifactRef`）。
+- 前置：T3.0
+- 动作：新增 `crates/snapclip-recognize`，迁 `engine.rs`（`OcrEngine`/`OcrCancel`，**保留契约**）、`manager.rs`、`worker.rs`、`win_ocr.rs`、`rapid.rs`（`ocr-rapid` feature 默认关）、`mod.rs`；接缝输入改为 `ArtifactRef`（经 `ArtifactReader` 取字节）；`OcrService` 不再持有 `Store` 与 `tauri::AppHandle`，改为按 T3.0 的三个 trait 注入（内部仍可用 `Arc<[u8]>` 处理已读入的字节，那只是实现细节，不再跨越接缝）。
 - 必须保持：引擎选择策略（rapid 可用则用，否则 Windows OCR）、`OcrError` 变体语义、取消语义。
 - 验收：§0.2 门禁全过。
 - 风险：低。
@@ -526,15 +695,19 @@ cd ..; git switch main
 ### T3.3 壳接线（history 只发 `ArtifactRef`）
 
 - 前置：T3.2
-- 动作：`snapclip-history` 只发布 `ArtifactRef` 与低频事件；由 `app`（或未来的 GPUI 壳适配层）实现 `OcrQueue` 并提交给 `snapclip-recognize`。识别结果写库经 `recognize → history` 的 service 调用（方向单向，不允许 recognize 依赖 history）。
+- 动作：接线严格按 T3.0 的链路，**持久化发生在壳/history 一侧**：
+  1. `snapclip-history` 在入库时只发布 `ArtifactRef` 与低频事件（不发内存字节、不发数据库句柄）。
+  2. 由 `app`（或未来的 GPUI 壳适配层）实现 `OcrQueue` + `RecognitionJobStore` + `RecognitionEventSink`，把任务提交给 `snapclip-recognize`，拿到 `RecognitionResult` 后**自己**调用 history 写回。
+  3. `snapclip-recognize` 不依赖 `snapclip-history`、不依赖 `Store`（T3.0 已把这两条依赖删掉，这里只是把实现接上）。
 - 必须保持：`ocr-status-v1` 事件契约；历史里 OCR 文本/状态字段不变。
-- 验收：§0.2 门禁全过 + 真机截图含文字 → 历史里出现文本。
+- 验收：§0.2 门禁全过 + 真机截图含文字 → 历史里出现文本；`cargo tree -p snapclip-recognize -e normal` 中不含 `snapclip-history`、`rusqlite`、`tauri`。
 - 风险：中。
 
 ### T3.4 资源对比 + 阶段验收 + tag
 
 - 前置：T3.3
-- 动作：重测 §1.2（此时 `after` 应稳定好于 `before`）+ 回退演练 + tag `refactor-p3`。
+- 动作：重测 §1.2 并**如实记录**，然后回退演练 + tag `refactor-p3`。
+- 验收：**不出现不可接受的退化**（拆 crate 本身不保证降低运行时资源，所以不写"必须更好"）；任何"更好"的结论都必须有 §1.2 的数字支撑，没有数字就只写"无显著变化"。
 - 风险：低。
 
 ---
@@ -546,13 +719,43 @@ cd ..; git switch main
 ### T4.1 开工前研读（不许跳）
 
 - 动作：读 `gpui-kit` 的 SKILL 与 **Coding Guides**（分层、`RenderOnce` vs `Entity<T>`、状态归属、`ElementId`、事件/焦点、异步、公共 API、测试分层），设计可见界面时读 **Design Guides**；查组件用 `https://gpui-kit.com/llms.txt` + `component/{name}.md`。
-- 必须记住的四条硬约束：应用**只依赖 `gpui-kit`**；`gpui_kit::init(cx)` 在建组件视图前调用一次；每个窗口第一层是 `Root`；**绝不凭记忆写 API**（先查签名）。
-- 验收：把本阶段要用的组件（`List`/`VirtualList`、`Input`、`Button`、`Settings`、`WindowExt` 覆盖层）逐个查过文档并在提交消息里列出确认过的路径。
+- 必须记住的四条硬约束：**GPUI 只通过 `gpui-kit` 使用**（不要把 `gpui` 直接加进 `Cargo.toml`）；`gpui_kit::init(cx)` 在建组件视图前调用一次；每个窗口第一层是 `Root`；**绝不凭记忆写 API**（先查签名）。
+
+#### T4.1.1 前端功能迁移矩阵（**做完这张表才有资格动 P6**）
+
+先把现状盘出来（2026-10-07 实测；执行前用右边两列的命令复核一遍）：
+
+| 现有前端功能 | 位置 | 当前真实状态 | 复核命令 |
+| --- | --- | --- | --- |
+| 历史面板（列表/搜索/分页/复制回写/删除） | `src/features/history/*` + `HistoryPanel.vue`，由 `App.vue` 装配 | 代码完整，但主窗口 `visible: false`，且**没有任何显示入口**（无托盘、无第二个热键）→ 运行时不可达 | `rg -n "visible" src-tauri/tauri.conf.json`；`rg -n "RegisterHotKey" src-tauri/src` |
+| 剪贴板动作（复制回写、来源程序图标） | `src/features/clipboard/api.ts`、`commands/clipboard.rs`、`icon.rs` | 可用；历史面板依赖它渲染每行的来源图标（`icon.rs` 是**图标提取缓存**，不是托盘） | `rg -n "pub fn" src-tauri/src/icon.rs` |
+| OCR 状态与事件 | `src/features/ocr/{api,events}.ts`、`commands/ocr.rs` | 命令与 `ocr-status-v1` 事件可用；**没有独立 OCR 页面**，UI 只是行内状态 | `rg -n "ocr-status-v1" src-tauri/src src` |
+| 截图命令与事件 | `src/features/capture/*`、`commands/capture.rs` | 可用（F5 → overlay → 导出/剪贴板） | 真机 F5 |
+| 标注工具条 | `src/features/annotation/AnnotationToolbar.vue` + `capture/annotation.rs`(1 123 行) + `capture_annotation` 命令 | Rust 侧文档模型与命令都在；Vue 工具条**没有被 `App.vue` 装配**（只有组件文件与 API） | `rg -n "AnnotationToolbar" src` |
+| 托盘 | 无 | **不存在**（`Cargo.toml` 无 tray 插件；除 F5 外没有其它全局热键） | `rg -n "tauri-plugin" src-tauri/Cargo.toml` |
+| 设置 | 无 | **不存在**（全仓库无 settings 页面、无设置存储） | `rg -ni "settings" src-tauri/src src` |
+
+据此填出迁移矩阵（**这是本任务的交付物，写进提交消息**）：
+
+| 现有功能 | GPUI 目标模块 | 是否保留行为 | 验证方式 |
+| --- | --- | --- | --- |
+| 历史面板 | `apps/snapclip/src/history/` | 保留；**并补上"可达性"**（托盘/热键/窗口显示，现状没有） | `#[gpui_kit::test]` + 真机 |
+| 剪贴板动作与来源图标 | 随 history 能力（`clipboard` 子模块） | 保留 | UI test + 真机 |
+| OCR 行内状态 | 随 history 行渲染（typed event） | 保留（不新增 OCR 页面） | typed event 单测 + 真机 |
+| 截图命令/事件 | capture crate + overlay（**不进 GPUI 高频路径**） | 保留 | 真机 F5 |
+| 标注工具条 | **未定义** | **未定义** | **先定归属，否则不能进 P6** |
+| 托盘 | `apps/snapclip/src/tray.rs` | **新增能力**（不是迁移） | 真机 |
+| 设置 | `apps/snapclip/src/settings/` | **新增能力**（不是迁移） | 热更新测试 |
+
+**硬规则**：这张矩阵没有填完（每行都有目标模块与验证方式）之前，**不允许删除 Vue/Tauri**（P6 前置）。特别是"标注工具条"——它是唯一在当前代码里存在、却没有 GPUI 目标的真实功能，必须由用户决定归属（画进 overlay / 放进 GPUI 壳 / 暂时不做）后才能继续。
+
+- 验收：矩阵填完 + 把本阶段要用的组件（`List`/`VirtualList`、`Input`、`Button`、`WindowExt` 覆盖层等）逐个查过文档，并在提交消息里列出确认过的文档路径。
 
 ### T4.2 `apps/snapclip` 骨架
 
 - 前置：T4.1、T3.4
 - 动作：`gpui_kit::application().with_assets(...).run(|cx| { gpui_kit::init(cx); … })` + `open_window` + `Root`；窗口标题/尺寸/DPI 行为对齐现有 Tauri 主窗口；**不接**截图 overlay（仍是 capture crate 的原生 HWND）。
+- 依赖边界（说清以免误解）：**GPUI 只能通过 `gpui-kit` 使用**（不要把 `gpui` 直接写进 `Cargo.toml`）；但**应用本身仍然依赖能力 crate**——`snapclip-model`、`snapclip-capture`、`snapclip-history`、`snapclip-recognize` 都是壳的正常依赖。"只依赖 gpui-kit"说的是 UI 层，不是整个 app。
 - 验收：能打开一个空壳窗口；§0.2 门禁不受影响；截图 overlay 仍可独立 F5 起来。
 - 风险：中。
 
@@ -564,32 +767,54 @@ cd ..; git switch main
 - 验收：`#[gpui_kit::test]` + `VisualTestContext` 覆盖：加载、搜索过滤、键盘上下移动、回车复制、删除确认。
 - 风险：高（第一个真正的 GPUI 功能）。
 
-### T4.4 settings 能力
+### T4.4 settings 能力（**新增能力，不是迁移**）
 
 - 前置：T4.3
-- 动作：`apps/snapclip/src/settings/`；先落现有设置项（如剪贴板历史开关、OCR 开关），并把 docs/21 §8 待办里的 `deep_select_text_runs`/`deep_select_visible_wrappers` 及动画参数一起接成真实设置通道（这一步同时消灭那条挂了两轮的待办）。
+- 事实校正：当前仓库**没有任何设置功能**——没有设置页、没有设置存储、没有配置读写通道（`rg -ni "settings" src-tauri/src src` 只命中一条文档注释）。所以 T4.4 是**从零建通道**，不要写成"先落现有设置项"。
+- 动作：
+  1. `apps/snapclip/src/settings/`：定义设置模型（serde + 默认值）、持久化位置（与现有 store 的数据目录同族，不要新开一处）、读写与校验。
+  2. 只接**当前真实存在**的行为开关；新增开关必须先有消费方，不造空开关。
 - 验收：改设置 → 立即生效（热更新到 overlay / recognize），重启后保持。
+- 风险：中（设置是"所有模块都要读的东西"，模型定错会牵动多个 crate：设置类型应放在 `snapclip-model` 或独立的 `snapclip-settings`，**不要**让每个 crate 各自定义一份）。
+
+#### T4.4.1 把两个窗口检测开关接成真实设置通道（**独立子任务，不要和 T4.4 混做**）
+
+- 前置：T4.4
+- 背景事实（实测）：`capture/window_detection/mod.rs` 里只有 `DEFAULT_ADOPT_TEXT_RUNS: bool = true` 这一个真实的布尔开关；`deep_select_text_runs` / `deep_select_visible_wrappers` 这两个名字**只存在于文档注释**里，代码里没有对应常量。所以这不是"给现有常量加通道"，而是"把注释里承诺的开关真正建出来"。
+- 动作：
+  1. 在 `window_detection` 里把文字跑条行为与"跳过无绘制包装层"策略显式化成可注入的配置（默认值保持现状：`ADOPT_TEXT_RUNS = true`，包装层跳过行为不变），替换硬编码常量。
+  2. 把这两个开关 + 动画参数接进 T4.4 的设置通道，并热更新到 overlay（overlay 读的是快照，不是每次绘制都查设置）。
+  3. 补测试：默认值下行为与今天逐位一致（这是"忠实于现状"的护栏，见 docs/21 §5.19）。
+- 必须保持：默认行为完全不变（文字跑条仍会被捕为目标；`nested-*` 相关探针期望值不变）。
+- 验收：§0.2 门禁全过 + 探针 `browser_element_probe` 仍 41/41；改开关 → overlay 行为立即变化 → 重启后保持。
 - 风险：中。
 
 ### T4.5 事件桥
 
 - 前置：T4.3
-- 动作：`apps/snapclip/src/adapters.rs` 用 channel 接 capture/history/recognize 的低频事件；用 `cx.spawn`/`background_spawn` 做 I/O，**只在 `Entity::update` 里改状态**；复用现有 `EventEnvelope` 的 `schemaVersion` + `generation` 语义丢弃过期事件（不要发明第二套 revision）。
+- 事实校正：**GPUI 不能复用现有 `EventEnvelope`**——它定义在 Tauri 的 `events` 模块里并且依赖 `tauri::Emitter`（`src-tauri/src/events/mod.rs`）。让 GPUI 壳去依赖 Tauri 等于换壳失败。
+- 动作：
+  1. 在 `snapclip-model` 定义框架无关的 `AppEvent`（只带：id、状态、尺寸、`ArtifactRef`、错误码、generation/revision），**它是共享事件的唯一形态**。
+  2. `apps/snapclip/src/adapters.rs`：Cargo 侧走 typed channel；**Tauri 侧适配器**才把 `AppEvent` 序列化成 `EventEnvelope`（保持 `schemaVersion` 字段与 IPC 事件名不变，前端契约不动）。
+  3. 用 `cx.spawn`/`background_spawn` 做 I/O，**只在 `Entity::update` 里改状态**；丢弃过期事件沿用现有纪律（`generation`/revision 语义），复用 `SnapshotEpoch`/`RequestId`/`RequestGate` 这类已有机制，**不要发明第二套 revision 体系**。
 - 必须保持：高频路径零 IPC（F5 → overlay 不经过 GPUI）。
-- 验收：事件到达顺序/丢弃语义有单测；真机 F5 → 历史自动刷新。
+- 验收：事件到达顺序/丢弃语义有单测；`cargo tree -p snapclip -e normal` 中不含 `tauri`/`wry`；真机 F5 → 历史自动刷新。
 - 风险：高。
 
 ### T4.6 托盘（Win32）
 
 - 前置：T4.2
-- 动作：`apps/snapclip/src/tray.rs`，沿用现有 `icon.rs` 的 Win32 实现；菜单项（显示/隐藏/退出/截图）向壳发低频事件。
-- 验收：托盘菜单全部可用；退出干净（无残留进程/线程）。
+- 事实校正：**当前没有托盘**（`Cargo.toml` 只有 `tauri-plugin-opener`；`src-tauri/src` 里 "tray" 只命中窗口类名 `Shell_TrayWnd`）。`icon.rs` 是"按 exe 路径提取来源程序图标"的缓存（供历史行显示），**不是托盘实现**，不能"沿用"。
+- 动作：`apps/snapclip/src/tray.rs` **新建** Win32 托盘（`Shell_NotifyIcon` + 消息窗口，或 gpui-kit 若已提供等价组件——先用 `https://gpui-kit.com/llms.txt` 确认）；菜单项（显示/隐藏/退出/截图）向壳发低频事件。**显示窗口这一条同时补上 T4.1.1 里记录的"现状不可达"缺口**。
+- 必须保持：截图高频路径不经过托盘消息循环。
+- 验收：托盘菜单全部可用；退出干净（无残留进程/线程）；窗口可显示/隐藏（当前 `visible: false` 且无入口，必须变成可达）。
 - 风险：中。
 
 ### T4.7 测试三层
 
 - 前置：T4.3–T4.6
 - 动作：纯函数 → `#[gpui_kit::test]` → `VisualTestContext`（焦点/键盘/指针/布局）→ 真实窗口按**无障碍树**断言（role/label/value/enabled/focus）。
+- **无障碍断言先做 spike**：在把它写成硬门禁之前，先用一个最小用例验证当前 gpui-kit 版本确实能读到窗口的无障碍树（查文档 + 跑通一次）。验证不通过时：门禁降级为"`VisualTestContext` + 真机人工走查"，并把结论写进 docs/22 §10.2，**不要**因为做不到就把这条悄悄删掉。
 - 必须保持：截图 overlay 的 UIA/MSAA 探针仍是同一套门禁。
 - 验收：至少覆盖"历史列表键盘操作 + 设置热更新 + 托盘退出"三条端到端。
 - 风险：中。
@@ -624,9 +849,12 @@ cd ..; git switch main
 
 ## 10. P6：删除 Tauri 与旧目录
 
-- 前置：T4.9（GPUI 壳完成托盘、隐藏/显示、焦点、退出、DPI、多显示器回归）
+- 前置：
+  1. T4.9（GPUI 壳完成托盘、隐藏/显示、焦点、退出、DPI、多显示器回归）。
+  2. **T4.1.1 的前端功能迁移矩阵每行都已填完**（有目标模块、有验证方式）；其中"标注工具条"的归属必须已经由用户定下来——它是唯一"当前存在但没有 GPUI 目标"的功能。
+- 能力搬迁前置：`icon.rs`（**来源程序图标提取，不是托盘**）与 `commands/clipboard.rs` 的复制回写，必须先作为能力落到 GPUI 壳（T4.3 的来源图标列依赖它），再删旧实现。
 - 清单：
-  1. 删 `src-tauri/src/commands/*`、Tauri `events` 适配、`app/`（组合根）与 `icon.rs` 的旧实现。
+  1. 删 `src-tauri/src/commands/*`、Tauri `events` 适配、`app/`（组合根）与 `icon.rs` 的旧实现（都在上面的能力搬迁完成之后）。
   2. 删前端（Vue adapter、`src/shared/contracts.ts` 与 package.json 的 Tauri 相关脚本）与 `src-tauri/` 目录本身。
   3. 从 workspace 移除旧成员，跑 `cargo tree -i tauri`、`cargo tree -i wry` 确认为空；全仓库 `rg -n "tauri"` 只应命中文档。
   4. 全量依赖检查 + `cargo check --workspace --all-targets` + §0.2 门禁 + 真机全链路（截图 → 历史 → OCR → 设置 → 托盘退出）。
@@ -643,13 +871,16 @@ cd ..; git switch main
 | 1 | 探针假红（环境相关） | §0.3：串行 + 复跑 2 次；假红与真红都要写进提交消息 |
 | 2 | 字体子集门禁（改 UI 文案/新图标） | 跑 `subfont/subset.ps1`；新增中文字串必须先加进 `overlay_drawn_strings()` |
 | 3 | 双壳冲突（Tauri 与 GPUI 共用一个 ui crate） | 两个独立 app，只共享能力 crate（docs/22 §3） |
-| 4 | artifact 写盘权分裂 | T2.1 先收敛成 `ArtifactStore` 一处 |
+| 4 | 写盘权分裂（截图 PNG 与剪贴板 blob 两套） | T2.3：各自收敛成**一个**所有者（`CaptureArtifactStore` / `ClipboardBlobStore`），**不许合并成一套**，否则破坏 blob 去重与 GC |
 | 5 | 共享 crate 变胖 | `snapclip-model` 只放稳定值对象/事件摘要；内部类型不 re-export（T1.2 + §10.1 门禁） |
 | 6 | 测试搬迁窗口期 | 搬测试只改路径不改断言；这期间不加新功能 |
 | 7 | 增量编译时间恶化 | §1.2 记录"改 model 一行"的耗时；明显恶化再决定拆 crate 粒度 |
 | 8 | `overlay.rs` 是唯一真单点 | T1.6：一次只搬一块 + 每块跑门禁 |
 | 9 | 用户手稿（`prototypes/`）与无关改动 | §0.6：先确认归属，不顺手提交/丢弃 |
 | 10 | `reset --hard` 丢工作 | §0.6：先建 `backup/*` 分支或 tag；`reflog` 只是保险不是备份 |
+| 11 | **迁移中途加兼容层**（"先两边各留一份，回头再删"） | §5 顶部的迁移接线策略：唯一实现在新 crate，旧模块只做 `pub use` 转发，T1.10 结束时转发必须为零；这是本项目最容易被违反的一条 |
+| 12 | **把"文档里写过"当成"代码里有"** | 例：`deep_select_text_runs` 只存在于注释、托盘从未实现、设置通道从未存在。动手前先用 `rg` 核实，写进 §13 记录 |
+| 13 | 无障碍树断言做不到却被当硬门禁 | T4.7：先 spike；做不到就降级并写回 docs/22 §10.2，不要静默删门禁 |
 
 ---
 
@@ -661,6 +892,7 @@ cd ..; git switch main
 - [ ] §0.2 门禁全过（含两个实机探针），数字与基线一致或变化有解释。
 - [ ] 任务条目里的"必须保持"逐条核对过。
 - [ ] 回退点明确（上一个 tag 或本任务前一个提交）。
+- [ ] §13 的状态词已更新（**勾选框不是完成状态**；见 §0.1）。
 
 ### 12.2 单个阶段
 
@@ -677,3 +909,45 @@ cd ..; git switch main
 - [ ] `cargo tree -i tauri` 与 `cargo tree -i wry` 为空，旧目录删除。
 - [ ] 门禁全绿：单元测试（≥ 现 403 + 新增）、两个实机探针、字体子集门禁、事件契约测试。
 - [ ] `docs/21`/`docs/22`/本文状态更新，并把"哪些结论是实测、哪些仍是设计"写清。
+
+---
+
+## 13. 执行记录模板与状态词表
+
+### 13.1 状态词表（**唯一允许用来声明"完成"的说法**）
+
+| 状态 | 含义 | 允许宣称的事 |
+| --- | --- | --- |
+| 未开始 | 还没动 | 无 |
+| 进行中 | 改了代码，门禁没跑完 | "在做"，**不能说完成** |
+| 门禁失败 | 跑了门禁，红了 | 只能说"卡在哪条门禁、红在哪一行" |
+| 已验证 | 门禁全过，还没提交 | "本地验证通过" |
+| 已提交 | 本地提交完成 | "提交好了"（**还没备份**） |
+| 已推送 | 提交到了远端 / tag 也推了 | "有回退点了" |
+| 已回退 | 用 `git revert`（或经批准的回退）撤销 | "已恢复到 <sha / tag>" |
+
+规则：**勾选框 ≠ 完成**。§2 的 `[ ]` 只表示"动作做了没有"；声明完成必须同时具备"已验证 + 已推送 + §13 记录填全"。
+
+### 13.2 执行记录模板（每个任务复制一份）
+
+```
+任务编号：T1.6.3
+状态：未开始 / 进行中 / 门禁失败 / 已验证 / 已提交 / 已推送 / 已回退
+分支：refactor/p1-capture（或 <默认分支>）
+前置提交/tag：refactor-p05（sha: …）
+修改范围：<文件清单 + 大概行数>
+修改前测试：cargo test --workspace --all-targets → 403 passed / 6 ignored
+修改后测试：<同上格式，写出真实数字>
+性能指标：<只写与本任务相关的；没测就写"未测"，不要留空>
+人工验证：<真机步骤 + 观察到的日志/现象>
+失败与根因：<红了什么、根因属于实现/接口/数据结构/边界/流程/抽象 哪一类>
+提交 SHA：<sha>
+推送/tag：<origin/<分支> 已推送 / tag refactor-p1 已推送>
+回退对象：<上一个 tag 或本任务前一个提交的 sha>
+```
+
+填写纪律：
+
+- **数字必须来自实际命令输出**，不手写、不从旧文档抄（§1.1 已经踩过一次：`docs/21 §10` 的 `373/2` 是过期基线）。
+- 探针结果要写明是"第几次跑"（§0.3 的假红复跑规则）。
+- 出现"没做/没测"的部分，**明确写"未完成"**，不要用含糊表述掩盖（本项目禁止伪完成）。
