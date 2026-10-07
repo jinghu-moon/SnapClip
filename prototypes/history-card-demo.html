@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>SnapClip 历史卡片 · 设计稿</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --panel: #fafafa;
+    --card: #ffffff;
+    --card-selected: #eef4ff;
+    --accent: #1f75db;
+    --border: #e6e6e6;
+    --fg: #18181b;
+    --muted: #71717a;
+    --line-height: 20px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px;
+    background: #f1f1f3;
+    font-family: "Segoe UI", "Microsoft YaHei UI", "HarmonyOS Sans SC", system-ui, sans-serif;
+    color: var(--fg);
+    display: flex; gap: 32px; align-items: flex-start;
+  }
+  /* 应用窗口：360 x 640，与 GPUI 壳的目标尺寸一致 */
+  .window {
+    width: 360px; height: 640px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+    display: flex; flex-direction: column;
+    box-shadow: 0 12px 32px rgba(0,0,0,.10);
+  }
+  .nav { display: flex; gap: 8px; padding: 8px; border-bottom: 1px solid var(--border); }
+  .nav button {
+    font: inherit; font-size: 13px; color: var(--muted);
+    background: none; border: 0; border-bottom: 2px solid transparent;
+    padding: 4px 6px; cursor: pointer;
+  }
+  .nav button.active { color: var(--fg); border-bottom-color: var(--accent); }
+  .search { margin: 12px; padding: 7px 10px; border: 1px solid var(--border); border-radius: 6px; font-size: 13px; color: var(--muted); }
+  .statline { display: flex; align-items: center; gap: 8px; padding: 0 12px 8px; font-size: 12px; color: var(--muted); }
+  .statline .spacer { flex: 1; }
+  .ghost-btn { font: inherit; font-size: 12px; color: var(--fg); background: none; border: 1px solid var(--border); border-radius: 5px; padding: 3px 8px; }
+  .filters { display: flex; gap: 6px; padding: 0 12px 10px; }
+  .chip { font-size: 12px; color: var(--muted); border: 1px solid var(--border); border-radius: 5px; padding: 2px 8px; }
+  .chip.active { color: var(--accent); border-color: var(--accent); }
+  .list { flex: 1; overflow: auto; padding: 0 8px 8px; display: flex; flex-direction: column; gap: 8px; background: var(--panel); }
+
+  /* ---- 卡片 ---- */
+  .card {
+    position: relative;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .card.selected { background: var(--card-selected); border-color: #cfdffb; }
+  .card.selected::before {
+    content: ""; position: absolute; left: -1px; top: 6px; bottom: 6px;
+    width: 3px; border-radius: 2px; background: var(--accent);
+  }
+  /* 主体：最多 3 行，保留换行；超出的行由 -webkit-line-clamp 收尾 */
+  .content {
+    font-size: 13px; line-height: var(--line-height);
+    white-space: pre-wrap; word-break: break-word;
+    display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3;
+    overflow: hidden;
+  }
+  .meta {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 11px; color: var(--muted);
+  }
+  .meta .facts { display: flex; align-items: center; gap: 6px; min-width: 0; }
+  .meta .facts span { white-space: nowrap; }
+  .meta .sep { color: #d4d4d8; }
+  .meta .spacer { flex: 1; min-width: 4px; }
+  .source { display: flex; align-items: center; gap: 5px; min-width: 0; }
+  .source .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 96px; }
+  .icon { width: 14px; height: 14px; border-radius: 3px; flex: none; display: block; }
+
+  /* 图片卡：缩略图在左，主体是尺寸说明 */
+  .card.image { flex-direction: row; align-items: center; gap: 10px; }
+  .card.image .thumb { width: 44px; height: 44px; border-radius: 6px; flex: none;
+    background: linear-gradient(135deg, #cfe0f7, #9ec3ee); border: 1px solid var(--border); }
+  .card.image .body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+  .card.image .lead { font-size: 13px; }
+
+  /* ---- 右侧说明 ---- */
+  .notes { max-width: 420px; font-size: 13px; line-height: 1.7; }
+  .notes h1 { font-size: 15px; margin: 0 0 12px; }
+  .notes h2 { font-size: 13px; margin: 18px 0 6px; color: var(--accent); }
+  .notes code { background: #ececf0; border-radius: 4px; padding: 1px 5px; font-size: 12px; }
+  .notes ul { margin: 0; padding-left: 18px; }
+  .notes li { margin: 3px 0; }
+</style>
+</head>
+<body>
+
+<div class="window">
+  <div class="nav">
+    <button class="active">剪贴板历史</button>
+    <button>设置</button>
+  </div>
+  <div class="search">搜索剪贴板历史</div>
+  <div class="statline">共 50 条 <span class="spacer"></span> <button class="ghost-btn">删除所选</button></div>
+  <div class="filters">
+    <span class="chip active">全部</span><span class="chip">文本</span>
+    <span class="chip">图片</span><span class="chip">文件</span>
+  </div>
+
+  <div class="list">
+
+    <!-- 1) 三行代码：主体最多三行，保留换行 -->
+    <div class="card selected">
+      <div class="content">&lt;!doctype html&gt;
+&lt;html lang="zh-CN"&gt;
+&lt;head&gt;&lt;meta charset="utf-8"&gt;&lt;title&gt;SnapClip&lt;/title&gt;</div>
+      <div class="meta">
+        <div class="facts"><span>09-30 19:46</span><span class="sep">·</span><span>6.9万 字符</span><span class="sep">·</span><span>74.8 KB</span></div>
+        <div class="spacer"></div>
+        <div class="source"><img class="icon" alt="" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%231f75db'/%3E%3C/svg%3E"><span class="name">EverEdit</span></div>
+      </div>
+    </div>
+
+    <!-- 2) 两行中文：行数随内容变化，行高跟着变 -->
+    <div class="card">
+      <div class="content">项目 A
+  ↓ 打开资源管理器 → 找到项目目录 → 复制路径 → 打开 Windows Terminal → cd 项目目录 → 运行 codex</div>
+      <div class="meta">
+        <div class="facts"><span>22:29</span><span class="sep">·</span><span>68 字符</span><span class="sep">·</span><span>214 B</span></div>
+        <div class="spacer"></div>
+        <div class="source"><img class="icon" alt="" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%234a4a52'/%3E%3C/svg%3E"><span class="name">Windows Terminal</span></div>
+      </div>
+    </div>
+
+    <!-- 3) 单行短文本 -->
+    <div class="card">
+      <div class="content">C:\A_Softwares\PixPin</div>
+      <div class="meta">
+        <div class="facts"><span>22:14</span><span class="sep">·</span><span>24 字符</span><span class="sep">·</span><span>48 B</span></div>
+        <div class="spacer"></div>
+        <div class="source"><img class="icon" alt="" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%23107c41'/%3E%3C/svg%3E"><span class="name">文件资源管理器</span></div>
+      </div>
+    </div>
+
+    <!-- 4) 图片：缩略图 + 尺寸 -->
+    <div class="card image">
+      <div class="thumb"></div>
+      <div class="body">
+        <div class="lead">图片 1920 × 1080</div>
+        <div class="meta">
+          <div class="facts"><span>21:58</span><span class="sep">·</span><span>2.4 MB</span></div>
+          <div class="spacer"></div>
+          <div class="source"><img class="icon" alt="" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%23c2410c'/%3E%3C/svg%3E"><span class="name">PixPin</span></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 5) 文件：第一个文件名 + 其余数量 -->
+    <div class="card">
+      <div class="content">SnapClip-v0.1.0-setup.exe
+等 3 个文件</div>
+      <div class="meta">
+        <div class="facts"><span>昨天 18:02</span><span class="sep">·</span><span>1.1 MB</span></div>
+        <div class="spacer"></div>
+        <div class="source"><img class="icon" alt="" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%237c3aed'/%3E%3C/svg%3E"><span class="name">文件资源管理器</span></div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<div class="notes">
+  <h1>历史卡片 · 信息与布局规格</h1>
+
+  <h2>主体（决定"这是哪一条"）</h2>
+  <ul>
+    <li>文本 / HTML / 富文本：<b>保留换行，最多 3 行</b>，超出在第三行末尾收尾。</li>
+    <li>图片：左侧 44px 缩略图，主体给"图片 1920 × 1080"。</li>
+    <li>文件：第一个文件名 + "等 N 个文件"。</li>
+  </ul>
+
+  <h2>辅助行（决定"要不要用它"）</h2>
+  <ul>
+    <li>左：<code>时间 · 字符数 · 体积</code> —— 客观属性，窄屏下先让来源名省略。</li>
+    <li>右：来源程序图标 + 名称（过长省略）。</li>
+    <li>时间：今天 <code>22:29</code>；今年 <code>09-30 19:46</code>；跨年补年份。</li>
+    <li>字符数：<code>1.2万 字符</code>（≥1 万用"万"），否则 <code>1,234 字符</code>。</li>
+    <li>体积：<code>48 B / 74.8 KB / 2.4 MB</code>；图片行不显示字符数。</li>
+  </ul>
+
+  <h2>行高</h2>
+  <ul>
+    <li><b>按内容变化</b>：1 / 2 / 3 行三档 + 图片档；不是固定 60px。</li>
+    <li>卡片间距 8px、圆角 8px、内边距 10×12px；用留白分隔，不用分割线。</li>
+    <li>选中态：左侧 3px 竖条（在 padding 之外，文字不位移）+ 淡蓝底。</li>
+  </ul>
+
+  <h2>不做</h2>
+  <ul>
+    <li>序号徽标（按你的决定去掉）。</li>
+    <li>固定/收藏、标签：模型里没有这些字段。</li>
+  </ul>
+</div>
+
+</body>
+</html>
