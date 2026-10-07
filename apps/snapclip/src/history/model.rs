@@ -23,19 +23,31 @@ pub struct HistoryState {
 }
 
 impl HistoryState {
-    /// Open the same database the Tauri host writes (`<app local data>`).
+    /// Open the same database the Tauri host writes (`<app local data>`) and read the first
+    /// page.
+    ///
+    /// The first page is loaded here rather than by whoever renders the screen: a history
+    /// screen that opens onto an empty list and only fills in once the user types is broken,
+    /// and "open" failing to read is an error the caller has to see anyway.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, StoreError> {
-        Ok(Self {
+        let mut state = Self {
             store: Store::open(root)?,
             items: Vec::new(),
             next_cursor: None,
             selected: None,
             query: String::new(),
-        })
+        };
+        state.reload()?;
+        Ok(state)
     }
 
     pub fn items(&self) -> &[ClipSummary] {
         &self.items
+    }
+
+    /// Whether the store has more rows behind the current window.
+    pub fn has_more(&self) -> bool {
+        self.next_cursor.is_some()
     }
 
     pub fn query(&self) -> &str {
@@ -65,8 +77,43 @@ impl HistoryState {
         Ok(())
     }
 
-    // Paging (`next_cursor` → a `load_more` that appends) lands with the scroll wiring:
-    // the store already returns the cursor, and the model keeps it for that step.
+    /// Append the next page. Returns how many rows were actually added.
+    ///
+    /// A row can be added to the store between two pages, which shifts the cursor window and
+    /// makes the boundary row appear twice; the id check is what keeps the list a set of
+    /// distinct entries rather than a set of distinct fetches.
+    pub fn load_more(&mut self) -> Result<usize, StoreError> {
+        let Some(cursor) = self.next_cursor.clone() else {
+            return Ok(0);
+        };
+        let page = self.fetch(Some(cursor))?;
+        let mut added = 0;
+        for item in page.items {
+            if self.items.iter().any(|existing| existing.id == item.id) {
+                continue;
+            }
+            self.items.push(item);
+            added += 1;
+        }
+        self.next_cursor = page.next_cursor;
+        Ok(added)
+    }
+
+    /// Re-read the current query without losing how deep the user has scrolled.
+    ///
+    /// This is the "a clip arrived while the window was open" path: a plain reload would
+    /// collapse a list the user had loaded five pages of back to one page.
+    pub fn refresh(&mut self) -> Result<(), StoreError> {
+        let wanted = self.items.len();
+        self.reload()?;
+        while self.items.len() < wanted && self.next_cursor.is_some() {
+            if self.load_more()? == 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     fn fetch(&self, cursor: Option<String>) -> Result<snapclip_model::HistoryPage, StoreError> {
         if self.query.trim().is_empty() {
             self.store.history_page(cursor, PAGE_SIZE)
@@ -238,6 +285,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The screen shows rows the moment it opens; this is the guard for the bug the UI test
+    /// caught, where opening produced an empty list until the user typed something.
+    #[test]
+    fn opening_reads_the_first_page() {
+        let dir = root("opens-loaded");
+        {
+            let store = Store::open(&dir).unwrap();
+            save(&store, "clip-1", "already stored");
+        }
+        let state = HistoryState::open(&dir).unwrap();
+        assert_eq!(state.items().len(), 1);
+        assert_eq!(state.selected_id(), Some("clip-1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_matching_query_keeps_only_that_row() {
         let dir = root("matching");
@@ -252,6 +314,70 @@ mod tests {
         assert!(state.set_query("alpha").unwrap());
         assert_eq!(state.items().len(), 1);
         assert_eq!(state.items()[0].id, "clip-1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// More rows than one page exist only if the store's page size is smaller than the
+    /// fixture; `PAGE_SIZE` is 50, so the fixture is built from the store's own cursor
+    /// instead of assuming a number.
+    #[test]
+    fn load_more_appends_the_next_page_and_then_stops() {
+        let dir = root("paging");
+        {
+            let store = Store::open(&dir).unwrap();
+            for index in 0..120 {
+                save(&store, &format!("clip-{index:03}"), &format!("entry {index}"));
+            }
+        }
+        let mut state = HistoryState::open(&dir).unwrap();
+        state.reload().unwrap();
+        let first_page = state.items().len();
+        assert_eq!(first_page, 50, "the shell asks for 50 rows per page");
+        assert!(state.has_more());
+
+        assert_eq!(state.load_more().unwrap(), 50);
+        assert_eq!(state.items().len(), 100);
+        assert_eq!(state.load_more().unwrap(), 20);
+        assert_eq!(state.items().len(), 120);
+        assert!(!state.has_more());
+        // Past the end there is nothing more to add, and asking again is not an error.
+        assert_eq!(state.load_more().unwrap(), 0);
+        // No row was shown twice, which is what the id check in `load_more` is for.
+        let unique: std::collections::HashSet<_> =
+            state.items().iter().map(|item| item.id.clone()).collect();
+        assert_eq!(unique.len(), state.items().len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refresh_keeps_the_rows_the_user_had_loaded_and_picks_up_a_new_one() {
+        let dir = root("refresh");
+        {
+            let store = Store::open(&dir).unwrap();
+            for index in 0..60 {
+                save(&store, &format!("clip-{index:03}"), &format!("entry {index}"));
+            }
+        }
+        let mut state = HistoryState::open(&dir).unwrap();
+        state.reload().unwrap();
+        state.load_more().unwrap();
+        assert_eq!(state.items().len(), 60);
+
+        // A clip arrives while the window is open.
+        {
+            let store = Store::open(&dir).unwrap();
+            save(&store, "clip-new", "the newest entry");
+        }
+        state.refresh().unwrap();
+
+        // The new row is first, and the user's depth survived: the old page-1 rows are
+        // still there rather than the list collapsing to 50.
+        assert_eq!(state.items()[0].id, "clip-new");
+        assert_eq!(state.items().len(), 61);
+        assert!(state.items().iter().any(|item| item.id == "clip-059"));
+        // The selection does not jump under the user: it is still the row they had chosen,
+        // and only falls back to the top when that row is gone.
+        assert_eq!(state.selected_id(), Some("clip-059"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

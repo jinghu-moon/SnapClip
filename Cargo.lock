@@ -8473,6 +8473,7 @@ name = "snapclip-app"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "async-channel",
  "blake3",
  "gpui-kit",
  "serde",

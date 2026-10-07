@@ -16,13 +16,17 @@ use gpui_kit::component::button::Button;
 use gpui_kit::component::{ActiveTheme, Root};
 use gpui_kit::*;
 
+pub mod adapters;
 pub mod clipboard;
+pub mod events;
 pub mod history;
 pub mod settings;
 
 use history::icons::SourceIcons;
 use history::model::HistoryState;
 use history::view::HistoryView;
+
+use events::EventBus;
 
 /// The same database and cache directories the Tauri host writes while both shells exist
 /// (docs/23 T4.9: they share only the capability crates and the data).
@@ -51,6 +55,9 @@ pub struct Shell {
     history: Result<Entity<HistoryView>, String>,
     settings: Entity<settings::SettingsView>,
     page: Page,
+    /// The shell's event channel. It is created here, at the composition root, and handed to
+    /// whatever publishes (the capability adapters) and whatever listens (the screens).
+    events: EventBus,
 }
 
 /// Which capability the window is showing. A desktop shell keeps navigation persistent, so
@@ -64,9 +71,12 @@ enum Page {
 impl Shell {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let data = app_data_dir();
+        let events = EventBus::new();
         let history = match HistoryState::open(&data) {
             Ok(state) => match SourceIcons::new(data.join("icons")) {
-                Ok(icons) => Ok(cx.new(|cx| HistoryView::new(state, icons, window, cx))),
+                Ok(icons) => Ok(cx.new(|cx| {
+                    HistoryView::new(state, icons, events.clone(), window, cx)
+                })),
                 Err(error) => Err(format!("icons: {error}")),
             },
             Err(error) => Err(format!("history store: {error}")),
@@ -78,7 +88,14 @@ impl Shell {
             history,
             settings,
             page: Page::History,
+            events,
         }
+    }
+
+    /// The shell's event channel. The composition root is the only place that creates it,
+    /// and everything that publishes or listens on it gets it from here.
+    pub fn events(&self) -> EventBus {
+        self.events.clone()
     }
 }
 impl Render for Shell {

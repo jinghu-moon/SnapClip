@@ -21,9 +21,10 @@ use gpui_kit::*;
 #[cfg(feature = "test-support")]
 use gpui_kit::test::TestSupportExt;
 use snapclip_history::image::decode_to_rgba8;
-use snapclip_model::{ClipSummary, PayloadKind};
+use snapclip_model::{AppEvent, ClipSummary, PayloadKind};
 
 use crate::clipboard::SystemClipboard;
+use crate::events::EventBus;
 use super::icons::SourceIcons;
 use super::model::HistoryState;
 
@@ -39,12 +40,19 @@ pub struct HistoryView {
     /// Result of the last command, shown as a status line: the Design Guides require the
     /// result of an action to be visible, and a status line does not depend on hover.
     status: Option<String>,
+    /// The task that drains the shell's event channel. Dropping it cancels the subscription
+    /// with the view, which is why it is held rather than detached.
+    _events: Task<()>,
+    /// Re-reads the list when the window regains focus (the other shell writes the same
+    /// database, and focus is the one moment we know the user is looking at it).
+    _activation: Subscription,
 }
 
 impl HistoryView {
     pub fn new(
         state: HistoryState,
         icons: SourceIcons,
+        bus: EventBus,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -61,12 +69,37 @@ impl HistoryView {
             this.apply_query(cx);
         })
         .detach();
+        // A new clip is stored by whoever owns the clipboard monitor, which is another
+        // process while the Tauri host is still alive — so the row list cannot be re-read
+        // from a local callback. It is re-read from the event channel, and a window that
+        // regains focus re-reads too, because the two shells share only the database.
+        let mut stream = bus.subscribe();
+        let _events = cx.spawn(async move |this, cx| {
+            while let Some(event) = stream.next().await {
+                if !matches!(event, AppEvent::Clipboard(_)) {
+                    continue;
+                }
+                // The store read happens here and the state change happens inside
+                // `Entity::update`, which is the rule that keeps rendering single-threaded.
+                if this.update(cx, |view, cx| view.refresh(cx)).is_err() {
+                    // The view is gone; stop draining rather than spinning on a closed bus.
+                    break;
+                }
+            }
+        });
+        let _activation = cx.observe_window_activation(window, move |this, window, cx| {
+            if window.is_window_active() {
+                this.refresh(cx);
+            }
+        });
         Self {
             state,
             query,
             icons,
             row_sizes,
             status: None,
+            _events,
+            _activation,
         }
     }
 
@@ -95,6 +128,19 @@ impl HistoryView {
             Ok(false) => {}
             Err(error) => eprintln!("[snapclip-app] history query failed: {error}"),
         }
+    }
+
+    /// Re-read the list, keeping the rows the user had already loaded.
+    fn refresh(&mut self, cx: &mut Context<Self>) {
+        // An empty query still needs the field's text: the user may have typed while a clip
+        // arrived, and the refresh must stay on the same filter the list is showing.
+        if let Err(error) = self.state.refresh() {
+            eprintln!("[snapclip-app] history refresh failed: {error}");
+            return;
+        }
+        self.row_sizes =
+            Rc::new(vec![size(px(0.0), px(ROW_HEIGHT_PX)); self.state.items().len()]);
+        cx.notify();
     }
 
     fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {

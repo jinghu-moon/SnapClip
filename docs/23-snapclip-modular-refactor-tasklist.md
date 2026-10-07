@@ -2317,3 +2317,61 @@ API 又一次"不凭记忆"救场：`Switch::new(...).checked(...).label(...).on
 推送/tag：origin/main
 回退对象：8e58000
 ```
+
+### §14.40 T4.5 第二半：事件桥落地（bus + 适配器 + 屏幕订阅）
+
+```
+任务编号：T4.5（第二半；第一半是 §14.? 的 `snapclip-model::AppEvent`）
+状态：已完成并验证
+分支：main
+前置提交/tag：0d3ac32
+改了什么（4 处，全部按"唯一形态 + 唯一 generation 纪律"）：
+  1. `crates/snapclip-model/src/events.rs`：新增 `AppEvent::with_generation`。
+     生产者不知道进程级计数器，所以它们填占位值，由壳的 bus 在发布时统一盖戳——
+     "丢弃比已见更旧的"这条规则因此属于传输层，而不是每个生产者各自记得的规矩。
+  2. `crates/snapclip-model/src/publication.rs`：新增 `Publication::primary_payload()`，
+     把"第一个 payload 就是这一行的代表"这条**原本只存在于 store 里**的规则提出来。
+     理由：事件里的 kind 必须与列表显示的 kind 是同一个判断，否则会出现"事件说图片、
+     列表说文本"。测试 `a_saved_publication_becomes_a_clipboard_event_about_its_primary_payload`
+     就是钉这个的（第二个 payload 才是图片时仍报文本）。
+  3. `apps/snapclip/src/events/mod.rs`（新）：`EventBus` / `EventStream` / `GenerationGate`。
+     - 每个订阅者一条独立队列（`async_channel` 无界），互不偷消息；订阅者消失时在下一次
+       发布时剪掉，不留悬空引用。
+     - `GenerationGate` 是**唯一**的过期判定：只接受严格更大的 generation，重复与迟到一律丢。
+     - 无 GPUI 依赖，纯 std + async_channel：它是"没有窗口也能单测"的那一层，也是 P6 之后
+       唯一留下的那一层。
+  4. `apps/snapclip/src/adapters.rs`（新）：把两个端口实现成事件源。
+     - `ClipboardEvents` 实现 `snapclip_history::ingest::ClipboardEventSink`：只在**已经落库**
+       之后发事件，所以事件描述的必然是一行真实存在的记录；kind/尺寸取自 primary payload。
+     - `CaptureEvents` 实现 `snapclip_capture::ports::CaptureEventSink`：只翻译会话边界
+       （Preparing/Selecting/Idle/失败码），不带鼠标、不带帧；失败只带 `ErrorCode`，
+       面向用户的话由 UI 写。`on_completed` 刻意**不编造** `ArtifactRef`（`CaptureArtifact`
+       里没有写时指纹）：带指纹的引用归壳自己的 `ArtifactWriter` 端口，P6 把组合根搬过来时
+       由它发布完成事件。这条偏离在测试里也是显式断言（`artifact.is_none()`）。
+  5. `apps/snapclip/src/history/view.rs`：历史屏订阅 bus，收到 `Clipboard` 事件就
+     `state.refresh()`（保持用户已加载的深度，不塌回第一页）；另加"窗口重新获得焦点即重读"，
+     因为两个壳共用的只有数据库，焦点是唯一确定"用户正在看它"的时刻。
+顺带修掉的**真 bug**（UI 测试抓出来的，不是计划里的条目）：
+  - 历史屏打开时**根本没有加载第一页**——`HistoryState::open` 只建了空状态，列表要等用户
+    敲键才出现内容。根因修在 `open` 里（打开历史就读第一页），并补了模型测试
+    `opening_reads_the_first_page` 作为回归护栏。
+验证（逐条命令、实际输出）：
+  - `cargo test -p snapclip-app --features test-support` → **23 lib + 3 UI 全过**
+    （新增：events 5 条、adapters 4 条、model 3 条、UI 端到端 1 条）
+  - `cargo test -p snapclip-model` → **23 passed**（新增 `restamping_replaces_the_placeholder_on_every_kind`）
+  - `cargo check --workspace --all-targets` → **0 warning**
+  - `powershell -File tools/check-dependency-direction.ps1` → `dependency direction is clean`
+  - `cargo tree -p snapclip-app -e normal` → 无 `tauri` / 无 `wry`（T4.5 的验收项）
+端到端那条测试做什么：先只放 1 条 clip 并渲染断言 1 行；再由"另一个线程/进程"写库并发
+  `AppEvent::Clipboard`；`cx.run_until_parked()` 让订阅任务跑；再渲染断言 **2 行且第一行是新
+  clip**。也就是说"事件到达 → 状态刷新 → 屏幕变化"整条链是被真实执行过的，而不是只测 bus。
+未做/记账：
+  - **发布者还没有接上**：P4 期间 capture 与剪贴板监听仍属 Tauri 宿主进程，GPUI 壳若也起一份
+    ingest 会**双写**历史（两条 publication 无法去重）。所以本片交付的是"完整的接缝 + 屏幕订阅 +
+    端到端证明"，真正的生产者接线随 P6 组合根搬迁完成；今天用户在 GPUI 壳上看到的实时性来自
+    "窗口激活即重读"。
+  - 托盘（T4.6）会复用同一个 bus（`Shell::events()` 已经是公开访问点）。
+提交 SHA：见提交
+推送/tag：origin/main
+回退对象：0d3ac32
+```

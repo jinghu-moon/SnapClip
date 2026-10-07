@@ -42,6 +42,17 @@ pub struct Publication {
     pub payloads: Vec<PayloadRef>,
 }
 
+impl Publication {
+    /// The payload that stands for this publication in a one-line summary.
+    ///
+    /// "First payload wins" is a single shared rule, not a storage detail: the store writes
+    /// it into `clips.primary_kind` and the event bridge reports it as the clip's kind, and
+    /// a UI that said "image" for a row the store called "text" would be lying to the user.
+    pub fn primary_payload(&self) -> Option<&PayloadRef> {
+        self.payloads.first()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Publication, PublicationOrigin};

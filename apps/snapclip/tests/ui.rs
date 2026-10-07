@@ -13,12 +13,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use gpui_kit::component::Root;
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{AppContext, Entity, TestAppContext, px, size};
+use snapclip_app::events::EventBus;
 use snapclip_app::history::icons::SourceIcons;
 use snapclip_app::history::model::HistoryState;
 use snapclip_app::history::view::HistoryView;
 use snapclip_app::settings::{Settings, SettingsStore, SettingsView};
 use snapclip_history::store::Store;
-use snapclip_model::{PayloadData, PayloadKind, PayloadRef, Publication, PublicationOrigin};
+use snapclip_model::{
+    AppEvent, ClipboardEvent, PayloadData, PayloadKind, PayloadRef, Publication, PublicationOrigin,
+};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -72,7 +75,7 @@ fn typing_filters_the_list_and_escape_clears_it(cx: &mut TestAppContext) {
 
     let mut view: Option<Entity<HistoryView>> = None;
     let handle = cx.open_window(size(px(640.), px(480.)), |window, cx| {
-        let view_entity = cx.new(|cx| HistoryView::new(state, icons, window, cx));
+        let view_entity = cx.new(|cx| HistoryView::new(state, icons, EventBus::new(), window, cx));
         view = Some(view_entity.clone());
         Root::new(view_entity, window, cx)
     });
@@ -141,5 +144,66 @@ fn toggling_the_setting_writes_it_to_disk(cx: &mut TestAppContext) {
 
     // The assertion that matters: the file changed, not just the rendered state.
     assert!(!SettingsStore::new(&data).load().deep_select_text_runs);
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+/// T4.5's acceptance, end to end: a clip stored elsewhere in the process (while the Tauri
+/// host still owns the clipboard monitor, it is an entirely different process) reaches the
+/// screen through the typed channel, and the screen re-reads the database when it does.
+#[gpui_kit::test]
+fn a_clipboard_event_refreshes_the_history_screen(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+
+    let data = temp_root("event-bridge");
+    {
+        let store = Store::open(&data).expect("open store");
+        save_text(&store, "clip-1", "first entry");
+    }
+    let state = HistoryState::open(&data).expect("open history");
+    let icons = SourceIcons::new(data.join("icons")).expect("icons");
+    let bus = EventBus::new();
+
+    let mut view: Option<Entity<HistoryView>> = None;
+    let handle = cx.open_window(size(px(640.), px(480.)), |window, cx| {
+        let bus = bus.clone();
+        let view_entity = cx.new(|cx| HistoryView::new(state, icons, bus, window, cx));
+        view = Some(view_entity.clone());
+        Root::new(view_entity, window, cx)
+    });
+    let view = view.expect("view constructed");
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).items().len(), 1);
+    })
+    .unwrap();
+
+    // Another thread (in production, another process) stores a clip and announces it.
+    {
+        let store = Store::open(&data).expect("open store");
+        save_text(&store, "clip-2", "second entry");
+    }
+    bus.publish(AppEvent::Clipboard(ClipboardEvent {
+        clip_id: "clip-2".into(),
+        kind: PayloadKind::Text,
+        dimensions: None,
+        pixel_format: None,
+        generation: 0,
+    }));
+    // The subscriber is an async task, so the publish only becomes a render after the
+    // executor runs it.
+    cx.run_until_parked();
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            view.read(cx).items().len(),
+            2,
+            "the screen must show the clip the event announced"
+        );
+        assert_eq!(view.read(cx).items()[0].id, "clip-2");
+    })
+    .unwrap();
+
     let _ = std::fs::remove_dir_all(&data);
 }
