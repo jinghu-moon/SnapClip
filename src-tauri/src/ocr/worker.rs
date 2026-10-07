@@ -14,6 +14,7 @@ use std::{
 
 
 use super::engine::{OcrCancel, OcrEngine, OcrInput, OcrText};
+use super::events::OcrEventSink;
 use crate::domain::OcrErrorCode;
 use crate::infrastructure::store::{OcrCandidateFilter, OcrFinishOutcome, QueueDecision, Store};
 
@@ -100,7 +101,7 @@ pub struct OcrService;
 impl OcrService {
     pub fn start(
         store: Store,
-        app: tauri::AppHandle,
+        sink: Arc<dyn OcrEventSink>,
         engine: Arc<dyn OcrEngine>,
     ) -> OcrServiceHandle {
         let (tx, rx) = sync_channel::<OcrJob>(QUEUE_CAP);
@@ -115,7 +116,7 @@ impl OcrService {
             .spawn(move || {
                 worker_loop(
                     store,
-                    app,
+                    sink,
                     engine,
                     rx,
                     worker_seen,
@@ -135,7 +136,7 @@ impl OcrService {
 
 fn worker_loop(
     store: Store,
-    app: tauri::AppHandle,
+    sink: Arc<dyn OcrEventSink>,
     engine: Arc<dyn OcrEngine>,
     rx: Receiver<OcrJob>,
     seen: Arc<Mutex<HashSet<String>>>,
@@ -175,7 +176,7 @@ fn worker_loop(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if backfill_due {
                     last_compensate = Instant::now();
-                    compensate(&store, &app, engine.as_ref(), &seen, &shutdown_cancel);
+                    compensate(&store, sink.as_ref(), engine.as_ref(), &seen, &shutdown_cancel);
                 }
                 continue;
             }
@@ -185,12 +186,12 @@ fn worker_loop(
         if job.clip_id.is_empty() {
             if backfill_due {
                 last_compensate = Instant::now();
-                compensate(&store, &app, engine.as_ref(), &seen, &shutdown_cancel);
+                compensate(&store, sink.as_ref(), engine.as_ref(), &seen, &shutdown_cancel);
             }
             continue;
         }
 
-        process_job(&store, &app, engine.as_ref(), &job, &shutdown_cancel);
+        process_job(&store, sink.as_ref(), engine.as_ref(), &job, &shutdown_cancel);
         {
             let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
             seen.remove(&job.clip_id);
@@ -199,7 +200,7 @@ fn worker_loop(
         if completed >= COMPENSATE_EVERY && backfill_due {
             completed = 0;
             last_compensate = Instant::now();
-            compensate(&store, &app, engine.as_ref(), &seen, &shutdown_cancel);
+            compensate(&store, sink.as_ref(), engine.as_ref(), &seen, &shutdown_cancel);
         }
     }
 
@@ -208,7 +209,7 @@ fn worker_loop(
 
 fn compensate(
     store: &Store,
-    app: &tauri::AppHandle,
+    sink: &dyn OcrEventSink,
     engine: &dyn OcrEngine,
     seen: &Arc<Mutex<HashSet<String>>>,
     shutdown_cancel: &OcrCancel,
@@ -226,7 +227,7 @@ fn compensate(
                 Ok(QueueDecision::Enqueued { .. }) | Ok(QueueDecision::AlreadyPending) => {
                     process_job(
                         store,
-                        app,
+                        sink,
                         engine,
                         &OcrJob {
                             clip_id: candidate.clip_id.clone(),
@@ -245,7 +246,7 @@ fn compensate(
 
 fn process_job(
     store: &Store,
-    app: &tauri::AppHandle,
+    sink: &dyn OcrEventSink,
     engine: &dyn OcrEngine,
     job: &OcrJob,
     cancel: &OcrCancel,
@@ -266,7 +267,7 @@ fn process_job(
                 .unwrap_or(false);
             if committed {
                 emit_status(
-                    app,
+                    sink,
                     &job.clip_id,
                     "skipped",
                     engine.name(),
@@ -300,7 +301,7 @@ fn process_job(
                 .unwrap_or(false);
             if committed {
                 emit_status(
-                    app,
+                    sink,
                     &job.clip_id,
                     "failed",
                     engine.name(),
@@ -331,7 +332,7 @@ fn process_job(
                 )
                 .unwrap_or(false);
             if committed {
-                emit_status(app, &job.clip_id, "done", name, None);
+                emit_status(sink, &job.clip_id, "done", name, None);
             }
         }
         Err(error) => {
@@ -364,36 +365,66 @@ fn process_job(
                 .finish_ocr_job(job.clip_id.clone(), attempt, outcome)
                 .unwrap_or(false);
             if committed {
-                emit_status(app, &job.clip_id, status, engine.name(), Some(code_str));
+                emit_status(sink, &job.clip_id, status, engine.name(), Some(code_str));
             }
         }
     }
 }
 
 fn emit_status(
-    app: &tauri::AppHandle,
+    sink: &dyn OcrEventSink,
     clip_id: &str,
     status: &str,
     engine: &str,
     error: Option<&str>,
 ) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    // Routed through the shared emitter so the name and the versioned envelope stay in
-    // one place; a literal name here would silently drop when Tauri rejects it.
-    crate::events::emit(
-        app,
-        crate::events::OCR_STATUS_EVENT,
-        crate::events::OcrStatusChanged {
-            clip_id: clip_id.to_string(),
-            status: status.to_string(),
-            engine: engine.to_string(),
-            error_code: error.map(str::to_string),
-            updated_at: now,
-        },
-    );
+    // The envelope, the event name and the timestamp belong to the adapter
+    // (`app::ocr_events`), so the worker stays free of both Tauri and the wire format.
+    sink.on_status(clip_id, status, engine, error);
 }
 
+#[cfg(test)]
+mod tests {
+    use super::emit_status;
+    use crate::ocr::OcrEventSink;
+    use std::sync::Mutex;
 
+    /// Records what the worker published, so the seam added in T0.5.2 is pinned.
+    #[derive(Default)]
+    struct RecordingSink(Mutex<Vec<(String, String, String, Option<String>)>>);
+
+    impl OcrEventSink for RecordingSink {
+        fn on_status(&self, clip_id: &str, status: &str, engine: &str, error_code: Option<&str>) {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((
+                    clip_id.to_string(),
+                    status.to_string(),
+                    engine.to_string(),
+                    error_code.map(str::to_string),
+                ));
+        }
+    }
+
+    #[test]
+    fn emit_status_forwards_every_field_to_the_sink_unchanged() {
+        let sink = RecordingSink::default();
+        emit_status(&sink, "clip-1", "failed", "windows", Some("decode_failed"));
+        emit_status(&sink, "clip-2", "done", "windows", None);
+
+        let recorded = sink.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(
+            recorded,
+            vec![
+                (
+                    "clip-1".to_string(),
+                    "failed".to_string(),
+                    "windows".to_string(),
+                    Some("decode_failed".to_string())
+                ),
+                ("clip-2".to_string(), "done".to_string(), "windows".to_string(), None),
+            ]
+        );
+    }
+}

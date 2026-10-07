@@ -1,6 +1,7 @@
 //! Clipboard image OCR: pluggable engines, single worker, cancel-aware.
 
 mod engine;
+mod events;
 mod manager;
 // ONNX / PP-OCR engine adapter. Compiled only with the `ocr-rapid` feature, which
 // is OFF by default because `rapid-ocr-rs` is mid-refactor with an unstable API.
@@ -11,6 +12,7 @@ mod win_ocr;
 mod worker;
 
 pub use engine::OcrEngine;
+pub use events::OcrEventSink;
 pub use manager::OcrManager;
 pub use win_ocr::{WindowsOcrEngine, init_apartment};
 pub use worker::{OcrEnqueuer, OcrService};

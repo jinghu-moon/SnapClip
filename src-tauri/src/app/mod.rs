@@ -16,6 +16,7 @@ pub mod capture;
 #[cfg(windows)]
 pub mod clipboard;
 pub mod ocr_queue;
+pub mod ocr_events;
 
 use crate::domain::{IpcError, OcrErrorCode, OcrStatus};
 
@@ -83,7 +84,12 @@ pub fn run() {
             let engine = std::sync::Arc::new(crate::ocr::OcrManager::new(
                 root.join("models/ocr/ppocrv6-medium"),
             )) as std::sync::Arc<dyn crate::ocr::OcrEngine>;
-            let ocr = crate::ocr::OcrService::start(store.clone(), app.handle().clone(), engine);
+            // The worker publishes status through a framework-free trait; wiring it to
+            // the versioned Tauri event is this adapter's job (app/ocr_events.rs).
+            let sink: std::sync::Arc<dyn crate::ocr::OcrEventSink> = std::sync::Arc::new(
+                crate::app::ocr_events::TauriOcrEventSink::new(app.handle().clone()),
+            );
+            let ocr = crate::ocr::OcrService::start(store.clone(), sink, engine);
             let enqueuer = ocr.enqueuer();
             eprintln!(
                 "[snapclip][startup] ocr worker started elapsed_ms={}",

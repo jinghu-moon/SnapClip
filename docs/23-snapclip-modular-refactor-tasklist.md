@@ -217,7 +217,7 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 | T0.3 | 建 workspace 骨架（+ 修 `.gitignore`） | T0.1 | 4 文件 + lock | 中（Tauri 构建） | [x]（自动门禁全绿；`npm run tauri dev` + F5 待人工） |
 | T0.4 | 建 `snapclip-model` 骨架（+ 搬 `Rect`/`Point`/`ImageDimensions`） | T0.3 | 10 文件 | 低 | [x]（自动门禁全绿） |
 | T0.5.1 | 删除 `capture/platform` 转发层（+ 顺带清掉它续命的死代码） | T0.4 | 2 文件 + 1 处死代码链 | 低 | [x]（自动门禁全绿） |
-| T0.5.2 | OCR 事件出口改框架无关 trait | T0.5.1 | 2 文件 | 中（IPC 契约） | [ ] |
+| T0.5.2 | OCR 事件出口改框架无关 trait | T0.5.1 | 4 文件 | 中（IPC 契约） | [x]（自动门禁全绿；真机 OCR 待人工） |
 | T0.5.3 | OCR 惰性启动 | T0.5.2 | 2 文件 | 中 | [ ] |
 | T0.5.4 | 记录资源基线（after）并对比 | T0.5.3 | — | 低 | [ ] |
 | T1.1 | `snapclip-capture` 骨架与依赖 | T0.5.4 | 2 文件 | 低 | [ ] |
@@ -369,6 +369,14 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
   1. 新增 `src/ocr/events.rs`：`pub trait OcrEventSink: Send + Sync + 'static`，方法签名照 `CaptureEventSink`（`on_status(&self, clip_id: &str, status: &str, engine: &str, code: Option<&str>)`）。
   2. `ocr/worker.rs`：把 `app: tauri::AppHandle` 换成 `sink: Arc<dyn OcrEventSink>`，`emit_status` 改为调 sink；**事件名、载荷字段与语义完全不变**。
   3. 壳（`app/mod.rs`）新增 `TauriOcrEventSink`，把原先的 `events::emit(...)` 逻辑搬进去实现 trait。
+- **实测结果（2026-10-07，代码与自动门禁已完成；真机 OCR 一项待人工）**：
+  - 新增 `src-tauri/src/ocr/events.rs`：`pub trait OcrEventSink: Send + Sync + 'static { fn on_status(&self, clip_id, status, engine, error_code: Option<&str>); }`，签名与 `CaptureEventSink` 同风格；**时间戳不进接缝**——`updated_at` 属于线上格式，交给适配器算。
+  - `ocr/worker.rs`：`OcrService::start` 的 `app: tauri::AppHandle` 换成 `sink: Arc<dyn OcrEventSink>`；`worker_loop`/`compensate`/`process_job`/`emit_status` 一路改为 `&dyn OcrEventSink`（全文件已无 `tauri` 字样）。
+  - 新增 `src-tauri/src/app/ocr_events.rs`：`TauriOcrEventSink` 实现该 trait，把原来的 `crate::events::emit(OCR_STATUS_EVENT, OcrStatusChanged{...})` 原样搬进去（事件名、字段、`updated_at` 计算方式一字未改）。
+  - **新增 1 个测试**（`ocr/worker.rs` 内部，按 T1.7 的原则不往 `tests/` 放）：`emit_status_forwards_every_field_to_the_sink_unchanged` —— 用记录型 sink 断言四个字段逐字转发，钉住本次新增的接缝。
+  - 事件契约未动：`ALL_EVENT_NAMES` 与 `src/shared/contracts.ts` 都不需要改（契约测试仍绿）。
+  - 门禁：`cargo test --lib --manifest-path src-tauri/Cargo.toml` → **404 passed / 0 failed / 6 ignored**（403 + 新增 1 个）；`cargo check --workspace --all-targets` → **0 warning**。
+  - **未完成（阻塞原因已定位）**：真机"含文字截图 → 历史里看到 OCR 文本 + 前端控制台无未知事件报错"**没做**——用户的 `npm run tauri dev` 会话仍在运行（`snapclip.exe` PID 49004 占着 `target/debug/snapclip.exe` 与 F5 热键），此时 `cargo build` 报 `拒绝访问 (os error 5)`，另起的实例会在注册 F5 时因热键冲突按设计退出。等用户停掉 dev 会话后补跑。
 - 必须保持：IPC 事件名 `ocr-status-v1`、载荷字段、`schemaVersion`/`generation` 语义不变；`src/shared/contracts.ts` 无需改动（若改了，说明契约被破坏，改回来）。
 - 验收：§0.2 门禁全过；真机做一次"含文字的截图 → 历史里能看到 OCR 文本"，前端控制台无未知事件报错。
 - 回退：`git revert`。
@@ -1211,4 +1219,33 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 提交 SHA：待提交
 推送/tag：待推送
 回退对象：b0459a5
+```
+
+### §14.9 T0.5.2 OCR 事件出口改框架无关 trait
+
+```
+任务编号：T0.5.2
+状态：已验证（代码 + 自动门禁）；真机 OCR 一项卡在用户 dev 会话占用，未完成
+分支：main
+前置提交/tag：03855de（T0.3 依赖版本修正）；回退基准 smart-snapping-v1-2026-10-07
+修改范围：新增 src-tauri/src/ocr/events.rs、src-tauri/src/app/ocr_events.rs；
+          src-tauri/src/ocr/mod.rs（导出 trait）、src-tauri/src/ocr/worker.rs（去 Tauri）、
+          src-tauri/src/app/mod.rs（接线）；docs/23
+修改前测试：403 passed / 0 failed / 6 ignored；check 0 warning
+修改后测试：404 passed / 0 failed / 6 ignored（+1 新测试）；check 0 warning
+性能指标：不涉及
+人工验证：未做 —— 用户的 `npm run tauri dev` 会话仍在跑，占着 exe 与 F5；
+          自动化代理也因此失败（见下）。等会话停掉后补：含文字截图 → 历史出现文本。
+失败与根因：门禁红过 3 次，都是我自己漏改/残留：
+          (1) `cannot find value app in this scope`：`compensate` 里还有一处 `process_job(store, app, ...)` 漏改；
+          (2) `unused import: NullOcrEventSink` 与 `struct NullOcrEventSink is never constructed`：
+              我顺手加的 Null sink 没有消费者。按本项目"不留无效实现"的规则直接删掉，
+              并在 `events.rs` 留一行注释说明它随 T3.1 的第一个消费者一起回来——
+              **没有**用 `#[allow(dead_code)]` 把警告压掉。
+          (3) 自动化冒烟的替代路径也失败：`cargo build` 报 `拒绝访问 (os error 5)`
+              （用户的 dev 实例锁着 `target/debug/snapclip.exe`），
+              另起实例则按设计在 F5 热键冲突时退出。这是环境阻塞，不是回归。
+提交 SHA：待提交
+推送/tag：待推送
+回退对象：03855de
 ```
