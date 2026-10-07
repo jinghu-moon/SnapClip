@@ -33,7 +33,7 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::domain::{ImageDimensions, PayloadData, PayloadKind, PayloadRef};
+use snapclip_model::{ImageDimensions, PayloadData, PayloadKind, PayloadRef};
 
 use super::{
     formats::{self, MAX_CLIPBOARD_BYTES},
@@ -426,7 +426,7 @@ pub fn last_error(operation: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{bytes_to_utf16, dib_dimensions};
-    use crate::domain::{PayloadData, PayloadKind};
+    use snapclip_model::{PayloadData, PayloadKind};
 
     #[test]
     fn decodes_null_terminated_utf16_clipboard_data() {
@@ -446,7 +446,7 @@ mod tests {
 
     fn payload(kind: PayloadKind, bytes: &[u8]) -> PayloadData {
         PayloadData::new(
-            crate::domain::PayloadRef {
+            snapclip_model::PayloadRef {
                 payload_id: "p".into(),
                 content_hash: "h".into(),
                 kind,

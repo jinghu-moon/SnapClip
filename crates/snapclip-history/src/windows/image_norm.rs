@@ -3,9 +3,9 @@
 //! Windows publishes bitmaps as CF_DIB / CF_DIBV5 / CF_BITMAP. Only this module
 //! understands those raw layouts; it converts them to PNG so the store, history and
 //! OCR never see a Windows bitmap format. The generic codec work is delegated to
-//! [`crate::infrastructure::image`].
+//! [`crate::image`].
 
-use crate::infrastructure::image;
+use crate::image;
 
 /// Max long side after optional downscale. Bounds what OCR has to chew on.
 pub const MAX_OCR_SIDE: u32 = 1920;
@@ -259,7 +259,7 @@ mod tests {
         let (png, width, height) = dib_to_png(&dib).unwrap();
         assert_eq!((width, height), (2, 1));
         assert_eq!(png_dimensions(&png), Some((2, 1)));
-        let decoded = crate::infrastructure::image::decode_to_bgra8(&png).unwrap();
+        let decoded = crate::image::decode_to_bgra8(&png).unwrap();
         assert_eq!(decoded.bytes(), &[0x10, 0x20, 0x30, 0xFF, 0x40, 0x50, 0x60, 0xFF]);
     }
 }

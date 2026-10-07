@@ -1,19 +1,7 @@
-//! Win32 clipboard adapter.
+//! 过渡期转发（docs/23 T2.6）：Win32 剪贴板适配器已搬到 `snapclip-history::windows`。
 //!
-//! Responsibilities are intentionally narrow:
-//! * own the `WM_CLIPBOARDUPDATE` listener window and its message loop,
-//! * read the clipboard into platform-neutral payload bytes,
-//! * resolve the source application from the clipboard owner / foreground window.
-//!
-//! Deduplication, retry policy, persistence, OCR enqueueing and Tauri event
-//! publication live in [`crate::application::clipboard_ingest`]. This module must
-//! never touch the store, OCR or Tauri.
+//! 只做名字转发，让壳侧仍在写的 `crate::platform::windows::clipboard::…` 路径可以编译
+//! （组合根要 `ClipboardUpdateListener`/`ClipboardEvent`/`read_clipboard` 与
+//! `mark_clipboard_excluded`）。删除条件：P2 结束时（T2.10）。
 
-pub mod formats;
-pub mod image_norm;
-pub mod reader;
-pub mod source_app;
-
-mod listener;
-
-pub use listener::{ClipboardEvent, ClipboardUpdateListener, mark_clipboard_excluded};
+pub use snapclip_history::windows::*;

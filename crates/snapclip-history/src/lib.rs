@@ -28,4 +28,9 @@ pub mod error;
 pub mod image;
 pub mod store;
 
+// The clipboard adapter is Win32; the stores above are plain data code, which is why the
+// crate as a whole is not Windows-gated.
+#[cfg(windows)]
+pub mod windows;
+
 pub use error::StoreError;
