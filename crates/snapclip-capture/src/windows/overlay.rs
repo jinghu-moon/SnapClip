@@ -71,7 +71,7 @@ use crate::sampler::{ColorFormat, ColorSampler};
 use crate::session::{CaptureSession, ExportOutcome};
 use crate::window_detection::model::RequestId;
 use crate::window_detection::{
-    DEFAULT_ADOPT_TEXT_RUNS, DEFAULT_DWELL_MS, DEFAULT_HOVER_REVALIDATE_MS, DEFAULT_SNAP_RADIUS_PX,
+    DEFAULT_DWELL_MS, DEFAULT_HOVER_REVALIDATE_MS, DEFAULT_SNAP_RADIUS_PX,
     DeepTarget, Exclusions, LevelChain, LevelKind, PathLevel, RingOptions, RingRole, chain_rings,
     next_visible_stop, out_quad, stops_from,
     GestureState, HoverValidity, MoveOutcome, PressOutcome, RefinementJob, RefinementOutcome,
@@ -202,6 +202,7 @@ impl WindowsOverlay {
         sink: Arc<dyn CaptureEventSink>,
         clipboard: Arc<dyn ClipboardWriter>,
         writer: Arc<dyn ArtifactWriter>,
+        options: crate::window_detection::DetectionOptions,
     ) -> Result<Self, String>
     {
         let shared = Arc::new(Mutex::new(OverlayShared {
@@ -221,6 +222,7 @@ impl WindowsOverlay {
                     sink,
                     clipboard,
                     writer,
+                    options,
                     thread_shared,
                     annotation_rx,
                     ready_tx,
@@ -516,6 +518,7 @@ impl OverlayController {
         sink: Arc<dyn CaptureEventSink>,
         clipboard: Arc<dyn ClipboardWriter>,
         writer: Arc<dyn ArtifactWriter>,
+        options: crate::window_detection::DetectionOptions,
         shared: Arc<Mutex<OverlayShared>>,
         annotation_rx: mpsc::Receiver<AnnotationCommand>,
         window: HWND,
@@ -530,7 +533,9 @@ impl OverlayController {
         let refinement = RefinementWorker::new(
             thread_id,
             hit_test_pass_through.clone(),
-            DEFAULT_ADOPT_TEXT_RUNS,
+            // The caller's detection preference (docs/23 T4.4.1); `Default` is exactly what
+            // this argument used to be.
+            options.adopt_text_runs,
             metrics.clone(),
         );
         // The overlay must never be offered as its own snap target: it is full-screen and

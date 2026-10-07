@@ -2072,7 +2072,11 @@ T4.3 剩余（续做清单）：
   1. `overlay.rs`：`spawn_overlay` 增加 `options: DetectionOptions` 参数 → 交给 `overlay_thread`
      → 交给 `OverlayController::new`（新增 `options` 字段）→ 把构造 refinement worker 处的
      `DEFAULT_ADOPT_TEXT_RUNS` 换成 `options.adopt_text_runs`；
-  2. `uia_provider.rs:183`：`adopt_text_runs: ...` 的来源改为传入的 options；
+  2. `uia_provider.rs:183`：`adopt_text_runs: ...` 的来源改为传入的 options。
+     **更正（实测）**：我原先写"管道本来就在"只对 `RefinementWorker` 成立；
+     `UiaDeepSelectionProvider` 的那个字段是在**它自己的构造里**从常量赋值的，所以这一处要先把
+     options 传进 provider 的构造（再往上是 detection worker 的创建点）。§14.33 记了本步实际做到的
+     范围：refinement worker 那一条链已通，provider 这条还没；
   3. 壳侧 `src-tauri/src/app/capture.rs`：先传 `DetectionOptions::default()`（行为不变），
      等 T4.4 的设置通道就绪后改传设置值；
   4. 测试：默认值下 `browser_element_probe` 41/41 与 Explorer 探针 12/25·65.8 必须逐位不变；
@@ -2083,4 +2087,37 @@ T4.3 剩余（续做清单）：
 提交 SHA：见提交
 推送/tag：origin/main
 回退对象：557dad6
+```
+
+### §14.33 T4.4.1 第二半：把 options 真正传到 refinement worker
+
+```
+任务编号：T4.4.1（第二半）
+状态：已验证 + 已推送
+分支：main
+前置提交/tag：f0822d3（第一半：`DetectionOptions` 类型）
+本步做到的范围（实测，不是计划）：
+  - `WindowsOverlay::spawn_overlay(..., options: DetectionOptions)` 新增参数；
+  - `overlay_thread(...)` 与 `OverlayController::new(...)` 各加同一参数并逐层传下去；
+  - **refinement worker 构造处**的 `DEFAULT_ADOPT_TEXT_RUNS` 换成 `options.adopt_text_runs`
+    （`overlay.rs:536`），`DEFAULT_ADOPT_TEXT_RUNS` 在该文件的 import 随之删除；
+  - 壳侧 `src-tauri/src/app/capture.rs` 先传 `DetectionOptions::default()`——**行为与本步之前完全一致**。
+本步**没**做到（更正 §14.32 里那句"管道本来就在"）：
+  `UiaDeepSelectionProvider` 的 `adopt_text_runs` 字段不是构造参数，而是在**它自己的构造里**从常量
+  赋值的（`uia_provider.rs:183`）。所以那条链还差两层：provider 的构造要收 options，
+  再往上是 detection worker 的创建点。这两处是"再改两个签名"，但会牵动 uia_provider 的测试构造
+  （`tests/unit.rs`、`tests/probes.rs` 共 3 处），所以留作下一步并如实记在这里。
+因此 §14.32 第 3 条（壳侧传值）与第 4 条（非默认值的单测）仍待续；本步只保证"值能到 refinement worker"。
+修改前/后测试：capture **344 passed / 6 ignored**、壳 **8 passed** 均不变；
+            `cargo check --workspace --all-targets` 0 warning（先删掉随之失效的 import）；
+            默认值下行为逐位不变，因此两个探针的期望不需要动。
+人工验证：不涉及（行为未变）
+失败与根因：2 个自查错误，都记下来当教训：
+  (1) 我用"只匹配一行"的补丁去替换参数，结果**没匹配到目标行**（先删掉了一处、又发现目标仍在），
+      说明对 4 000 行文件做单行替换必须带上下文；随后用带上下文的补丁正确替换；
+  (2) `options` 传进来后有一轮"unused variable"警告——因为使用点还没改；这也是"分步穿线"的正常中间
+      状态，但**必须同一轮内闭环**，否则就留下警告（本项目要求 0 warning）。
+提交 SHA：见提交
+推送/tag：origin/main
+回退对象：f0822d3
 ```

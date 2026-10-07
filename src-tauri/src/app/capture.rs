@@ -135,6 +135,9 @@ pub fn start(
         sink,
         clipboard,
         writer,
+        // Behaviour is unchanged: `Default` is today's `DEFAULT_ADOPT_TEXT_RUNS`. T4.4's
+        // settings channel supplies this value once it exists.
+        snapclip_capture::window_detection::DetectionOptions::default(),
     )
     .map_err(|message| format!("capture overlay: {message}"))?;
     app.manage(Arc::new(CaptureRuntime::from_platform(Box::new(runtime))));
