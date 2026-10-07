@@ -287,10 +287,13 @@ impl Render for HistoryView {
                                     .source_exe_path
                                     .as_deref()
                                     .and_then(|exe| view.icons.png_path(exe));
+                                // An entry with no text preview (an image, a file list) still
+                                // needs a first line, and it must be a word a person reads —
+                                // `format!("{:?}")` would put `Image` on screen.
                                 let preview = item
                                     .preview_text
                                     .clone()
-                                    .unwrap_or_else(|| format!("{:?}", item.primary_kind));
+                                    .unwrap_or_else(|| kind_label(&item.primary_kind).to_string());
                                 let meta = row_meta(&item);
                                 let id = item.id.clone();
                                 let row = div()
