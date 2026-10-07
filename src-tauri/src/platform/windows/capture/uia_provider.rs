@@ -100,6 +100,8 @@ enum ProviderHit {
         raw: Rect,
         control_type: i32,
         class: String,
+        /// The accessible name the page gave the box, for the forensics line (docs/21 §5.24, B6).
+        name: String,
     },
     /// Nothing usable came back, and why.
     Unusable(String),
@@ -469,6 +471,13 @@ impl UiaDeepSelectionProvider {
         let class = unsafe { hit.CurrentClassName() }
             .map(|name| name.to_string())
             .unwrap_or_default();
+        // The accessible name of the box the provider answered with (docs/21 §5.24, B6). One property
+        // read on one element — the walk's nodes are not asked, so this costs nothing per level — and
+        // it is the *other* half of "what does the page call this": the label shows the control type's
+        // noun, the log can now show both transports' names side by side.
+        let name = unsafe { hit.CurrentName() }
+            .map(|name| name.to_string())
+            .unwrap_or_default();
         let control_type = unsafe { hit.CurrentControlType() }
             .map(|kind| kind.0)
             .unwrap_or(0);
@@ -507,6 +516,7 @@ impl UiaDeepSelectionProvider {
                     raw: bounds,
                     control_type,
                     class,
+                    name,
                 };
             }
             match unsafe { walker.GetParentElement(&current) } {
@@ -786,6 +796,7 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
                 raw,
                 control_type,
                 class,
+                name,
             } => {
                 let finer = should_adopt_provider_box(
                     walk,
@@ -822,8 +833,9 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
                     ));
                 }
                 note.push_str(&format!(
-                    " type={control_type} {} class={class:?} walk={}x{} at ({},{})",
+                    " type={control_type} {} class={class:?} name={:?} walk={}x{} at ({},{})",
                     level_kind_of_control_type(control_type).debug_name(),
+                    name.chars().take(60).collect::<String>(),
                     walk.width(),
                     walk.height(),
                     walk.left,
