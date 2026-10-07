@@ -46,7 +46,7 @@ pub fn run() {
     // (docs/14 §3). Doing it here means the overlay thread's own call is a no-op that
     // simply reports the context already in effect.
     #[cfg(windows)]
-    match crate::platform::windows::capture::monitor::set_per_monitor_v2_awareness() {
+    match snapclip_capture::windows::monitor::set_per_monitor_v2_awareness() {
         Ok(mode) => eprintln!("[snapclip][startup] dpi awareness={mode}"),
         Err(message) => {
             eprintln!("[snapclip][startup] dpi awareness declaration failed: {message}")

@@ -6,8 +6,8 @@
 
 use tauri::State;
 
-use crate::capture::annotation::AnnotationCommand;
-use crate::capture::CaptureState;
+use snapclip_capture::annotation::AnnotationCommand;
+use snapclip_capture::CaptureState;
 use crate::domain::IpcError;
 
 #[cfg(not(windows))]
@@ -21,12 +21,12 @@ pub struct CaptureStateView {
 
 #[cfg(windows)]
 type RuntimeState<'a> =
-    State<'a, std::sync::Arc<crate::capture::application::runtime::CaptureRuntime>>;
+    State<'a, std::sync::Arc<snapclip_capture::runtime::CaptureRuntime>>;
 
 #[cfg(windows)]
 fn runtime(
     state: &RuntimeState<'_>,
-) -> std::sync::Arc<crate::capture::application::runtime::CaptureRuntime> {
+) -> std::sync::Arc<snapclip_capture::runtime::CaptureRuntime> {
     state.inner().clone()
 }
 

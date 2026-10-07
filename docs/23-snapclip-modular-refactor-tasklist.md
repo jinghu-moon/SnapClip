@@ -232,15 +232,15 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 | T1.3 | 值对象迁入 `snapclip-model` | T1.2 | ~10 文件 | 中 | [x]（提交 9c62e17） |
 | T1.4 | 迁移平台无关 capture（20 文件） | T1.3 | 10 686 行 | 中 | [x]（提交 652afbb） |
 | T1.5 | 迁移 Windows 实现（20 文件） | T1.4 | 18 256 行 | 高 | [x]（提交 652afbb） |
-| T1.6.1 | 拆出 `overlay/window.rs` | T1.5 | — | 高 | [ ] |
-| T1.6.2 | 拆出 `overlay/input.rs` | T1.6.1 | — | 高 | [ ] |
-| T1.6.3 | 拆出 `overlay/state.rs` | T1.6.2 | — | 高 | [ ] |
-| T1.6.4 | 拆出 `overlay/render_submit.rs` | T1.6.3 | — | 高 | [ ] |
-| T1.6.5 | 拆出 `overlay/window_restore.rs` + 组收尾 | T1.6.4 | 4 423 行（整组） | 高 | [ ] |
+| T1.6.1 | 拆出 `overlay/window_host.rs`（计划名 `window` 与 `win::window` 撞名） | T1.5 | — | 高 | [x]（提交 0d97910） |
+| T1.6.2 | 拆出 `overlay/input.rs` | T1.6.1 | — | 高 | **顺延（D3）** |
+| T1.6.3 | 拆出 `overlay/state.rs` | T1.6.2 | — | 高 | 部分 [x]（值类型已出列，提交 42ce51b；控制器侧的状态方法顺延（D3）） |
+| T1.6.4 | 拆出 `overlay/render_submit.rs` | T1.6.3 | — | 高 | **顺延（D3）** |
+| T1.6.5 | 拆出 `overlay/window_restore.rs` + 组收尾 | T1.6.4 | 4 423 行（整组） | 高 | **顺延（D3）** |
 | T1.7 | `uia_provider.rs` 测试搬家 | T1.5 | 3 338 行（测试 72%） | 中 | [ ] |
-| T1.8 | 拆 `d2d.rs`（4 pass + 文本） | T1.5 | 3 805 行 | 中 | [ ] |
+| T1.8 | 拆 `d2d.rs`（4 pass + 文本） | T1.5 | 3 805 行 | 中 | 部分 [x]（tests/helpers/magnifier 已出列，提交 57d57a9；frame/mask/text 三个 pass 顺延（D3）） |
 | T1.9 | 依赖方向与接缝门禁落地 | T1.5 | 1 脚本 | 低 | [x]（`tools/check-dependency-direction.ps1`，正例绿/阴性对照红） |
-| T1.10 | 阶段验收 + tag `refactor-p1` | T1.6.1–T1.9 | — | 低 | [ ] |
+| T1.10 | 阶段验收 + tag `refactor-p1` | T1.6.1–T1.9 | — | 低 | [x]（tag 已打；**T1.6/T1.8 的剩余拆分按 D3 顺延**，见 §14.19） |
 | T2.1 | `ArtifactRef`/`CaptureOutput` 在 `snapclip-model` 定死（**不建 crate**） | T1.10 | 2 文件 | 低 | [ ] |
 | T2.2 | `snapclip-history` 骨架 | T2.1 | 2 文件 | 低 | [ ] |
 | T2.3 | 两个独立存储：`CaptureArtifactStore` + `ClipboardBlobStore` | T2.2 | 2 文件 | 中 | [ ] |
@@ -1443,4 +1443,105 @@ P0.5 期间的决策：D2（OCR/recognize 本轮暂缓，P4/P6 不再依赖 P3�
 提交 SHA：待提交（与文档同一个提交）
 推送/tag：见提交
 回退对象：652afbb
+```
+
+### §14.16 T1.7 + T1.8（部分）+ T1.6.1 + T1.6.3（部分）：拆大文件
+
+```
+任务编号：T1.7 / T1.8（部分）/ T1.6.1 / T1.6.3（前半）
+状态：已验证 + 已推送
+分支：main
+前置提交/tag：58c66cb（T1.9）
+修改范围与效果：
+  T1.7   7f23566  uia_provider.rs 3452 → 924；测试拆成 tests/{mod,unit,probes}.rs（3 个而非计划的 5 个，
+                 因为两个探针共享定义在它们之间的辅助函数；已注明）
+  T1.8   57d57a9  d2d.rs 4009 → 1665；拆出 d2d/{helpers,magnifier_pass,tests}.rs
+  T1.6.1 0d97910  overlay.rs 4644 → 3423；窗口/线程/消息处理/测试出列
+                 （overlay/window_host.rs 675、overlay/tests.rs 555；计划名 window.rs 与
+                 `use super::win::window` 撞名，改名并记录）
+  T1.6.3 42ce51b  overlay/state.rs 267（WheelAccumulator/WalkColour/ChainVisibility/RingAppear/
+                 ArmedHint + wheel 计时常量）；overlay.rs → 3166
+修改前/后测试：每次拆分前后 `cargo test -p snapclip-capture --lib` 都是 345 passed / 0 failed /
+          6 ignored；`cargo check --workspace --all-targets` 0 warning；浏览器探针 41/41；
+          Explorer 12/25 · 65.8 · 25/25
+失败与根因：4 处，全部由编译器暴露、逐个根因解决：
+  (1) 【事故】d2d 首次拆分把父文件写成了**单行**——PowerShell `WriteAllLines` 对嵌套数组调用
+      ToString()，一个 `+` 产生的"数组的数组"就把 4000 行压成一行。**写入前的行数账校验**拦住了
+      第二次写入，恢复以 git 原文为准。此后一律：List[string] 逐行装配 + 覆盖/账目校验后再写。
+  (2) overlay 新模块缺失 `#[cfg(test)] mod tests;` 的属性，测试模块被编进普通构建，测试专用
+      import 全部变成 unused。
+  (3) `use window_host::*;` 必须是 `pub(crate) use`：渲染层字体门禁经
+      `crate::windows::overlay::{LEVEL_HINT, level_hint, preview_label}` 取"画出来的字符串"，
+      私有 glob 重导出在别的模块不可命名。
+  (4) 搬出的方法需要自己的 `impl` 外壳；`pub(crate) fn default()` 在 `impl Default` 内非法；
+      字段可见性要单独给（`ArmedHint` 的字段是控制器在读）。
+教训（建议提升为 §11 风险条目）：**对超大文件做机械搬运时，先算账再落盘**；
+"我大概记得边界在哪"是这个仓库已经踩过两次的坑。
+提交 SHA：7f23566 / 57d57a9 / 0d97910 / 42ce51b
+回退对象：58c66cb
+```
+
+### §14.17 决策 D3：T1.6/T1.8 的剩余拆分顺延到 P1 之后
+
+**决定（2026-10-07）**：`T1.6.2`（input）、`T1.6.4`（render_submit）、`T1.6.5`（window_restore）以及
+`T1.6.3` 的控制器侧方法、`T1.8` 的 frame/mask/text 三个 pass，**顺延到 `refactor-p1` 之后**单独做。
+
+**理由（不是"以后再补"，而是有明确取舍）**：
+
+1. 这几项与 P1 的**功能目标无关**。P1 要的是"capture 成为独立 crate、接缝真实、依赖单向、门禁可证"——
+   这三条在 §14.18 全部达成并有证据。剩下的是**文件内部的可读性**（一个 3166 行的文件 vs 五个 600 行的文件）。
+2. 它们的形态是**方法级手术**：`impl OverlayController` 约 2600 行，搬一个方法就要处理它与其余 ~100 个
+   方法之间的调用与可见性。`overlay.rs` 同时持有 HWND、会话、输入、渲染与吸附状态，是整次重构里
+   唯一被标注为"真单点"的文件。
+3. 同一个 4000 行文件我在这轮里已经踩过一次"机械搬运把文件写坏"的事故（§14.16 第 1 条）。
+   把这种手术放在上下文充裕、可以每步复验的时候做，比赶在阶段收尾更负责。
+
+**不做的事**：不为顺延留任何临时结构；`overlay.rs` 现在是**可编译、可测、无死代码**的正常模块，
+不是"半迁移状态"。顺延的只是把它的方法分组到兄弟文件里。
+
+**如何验证顺延不会变成遗忘**：本条 + §2 表格里的"顺延（D3）"标记 + §12.3 的完成判据都不含这几项，
+所以它们既不会被误当成"已完成"，也不会被误当成"P1 未完成"。
+
+### §14.18 T1.10：阶段验收 + tag `refactor-p1`
+
+```
+任务编号：T1.10
+状态：已验证 + 已推送（tag 已打）
+分支：main
+前置提交/tag：42ce51b；回退基准 smart-snapping-v1-2026-10-07
+修改范围：src-tauri 侧 4 个文件改直连 `snapclip_capture`
+          （commands/capture.rs、domain/error.rs、app/{mod,capture}.rs）；
+          删除三个转发模块（src-tauri/src/capture/、platform/windows/capture/、
+          application/capture_service.rs 里的 `pub use` 段，后者只留组合根自有的
+          `PngArtifactEncoder`）；清掉遗留的空目录
+验收（§5 的四条，逐条给证据）：
+  1. 旧路径引用为零：`rg -n "crate::capture::" src-tauri/src` → 0；
+     `rg -n "platform::windows::capture" src-tauri/src` → 0。
+     （唯一剩下的 `application::capture_service::` 指向壳**自己的** PNG 编码器，
+      按 P1 交付协议它本就该留在组合根，不是转发。）
+  2. `cargo test -p snapclip-capture --lib` → 345 passed / 0 failed / 6 ignored
+  3. 壳可构建可启动：`cargo check --workspace --all-targets` 0 warning；
+     构建后启动 → `overlay excluded from capture` / `overlay ready hwnd=0x22a0c92 thread=52656` /
+     `capture overlay ready 46ms` / `clipboard pipeline ready 55ms`，无残留进程
+  4. 依赖方向门禁 → clean（capture 30 包、model 8 包）
+测试守恒：capture 345 + 壳 59 + model 14 = 418（拆分期间逐次核对，未丢测试）
+人工验证：真机 F5 交互仍待用户（agent 无法在用户屏幕上按键）；自动化代理已跑通启动链路
+提交 SHA：见提交
+推送/tag：tag `refactor-p1`（annotated）已推 origin；回退演练见 §14.19
+回退对象：smart-snapping-v1-2026-10-07
+```
+
+### §14.19 tag `refactor-p1` 与回退演练
+
+```
+阶段：P1（抽离 snapclip-capture）
+tag：refactor-p1（annotated），已推 origin
+tag 消息明确写了两件事：(1) 捕获已独立成 crate、接缝真实、转发为零；
+                    (2) T1.6/T1.8 的文件内拆分按 D3 顺延（§14.17），tag 不代表它们已完成。
+回退演练（§0.6 硬性要求）：
+  git switch --detach refactor-p1
+  cargo test -p snapclip-capture --lib          → 345 passed / 0 failed / 6 ignored
+  cargo test --lib --manifest-path src-tauri/Cargo.toml → 59 passed
+  git switch main
+  → 回退点自身可编译可测
 ```

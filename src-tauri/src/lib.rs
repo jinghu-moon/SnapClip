@@ -12,7 +12,6 @@
 //! `lib.rs` only wires the layers together.
 
 pub mod application;
-pub mod capture;
 pub mod domain;
 pub mod infrastructure;
 

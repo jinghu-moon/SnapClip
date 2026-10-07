@@ -7,9 +7,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::application::capture_service::{ArtifactDir, CaptureService, PngArtifactEncoder};
-use crate::capture::application::runtime::CaptureRuntime;
-use crate::capture::application::CaptureEventSink;
+use crate::application::capture_service::PngArtifactEncoder;
+use snapclip_capture::artifact::{ArtifactDir, CaptureService};
+use snapclip_capture::ports::{CaptureEventSink, ClipboardWriter};
+use snapclip_capture::runtime::CaptureRuntime;
 use crate::domain::{CaptureArtifact, CaptureState};
 use crate::events;
 
@@ -44,7 +45,7 @@ impl TauriCaptureEventSink {
 }
 
 impl CaptureEventSink for TauriCaptureEventSink {
-    fn on_started(&self, session_id: &str, layout: &crate::capture::geometry::MonitorLayout) {
+    fn on_started(&self, session_id: &str, layout: &snapclip_capture::geometry::MonitorLayout) {
         events::emit(
             &self.app,
             events::CAPTURE_STARTED_EVENT,
@@ -65,7 +66,7 @@ impl CaptureEventSink for TauriCaptureEventSink {
         &self,
         session_id: &str,
         state: CaptureState,
-        layout: Option<&crate::capture::geometry::MonitorLayout>,
+        layout: Option<&snapclip_capture::geometry::MonitorLayout>,
     ) {
         events::emit(
             &self.app,
@@ -108,7 +109,7 @@ impl CaptureEventSink for TauriCaptureEventSink {
     fn on_failed(
         &self,
         session_id: Option<&str>,
-        error: &crate::capture::CaptureError,
+        error: &snapclip_capture::CaptureError,
         provider: &str,
     ) {
         events::emit(
@@ -134,16 +135,16 @@ pub fn start(
     // Per-Monitor V2 must be declared before the first window exists. The Tauri
     // window already exists at this point, but the overlay is created later and
     // inherits the process context.
-    crate::platform::windows::capture::monitor::set_per_monitor_v2_awareness()
+    snapclip_capture::windows::monitor::set_per_monitor_v2_awareness()
         .map_err(|message| format!("DPI awareness: {message}"))?;
 
     let artifacts = AppArtifactDir::new(app_local_data);
     let service = Arc::new(CaptureService::new(artifacts, PngArtifactEncoder));
     let sink: Arc<dyn CaptureEventSink> = Arc::new(TauriCaptureEventSink::new(app.clone()));
-    let clipboard: Arc<dyn crate::capture::application::ClipboardWriter> =
+    let clipboard: Arc<dyn ClipboardWriter> =
         Arc::new(crate::app::clipboard_writer::SystemClipboardWriter);
 
-    let runtime = crate::platform::windows::capture::overlay::WindowsOverlay::spawn_overlay(
+    let runtime = snapclip_capture::windows::overlay::WindowsOverlay::spawn_overlay(
         service,
         sink,
         clipboard,

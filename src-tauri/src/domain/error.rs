@@ -95,8 +95,8 @@ impl IpcError {
     }
 }
 
-impl From<crate::capture::CaptureError> for IpcError {
-    fn from(error: crate::capture::CaptureError) -> Self {
+impl From<snapclip_capture::CaptureError> for IpcError {
+    fn from(error: snapclip_capture::CaptureError) -> Self {
         Self {
             code: error.code(),
             message: Some(error.to_string()),

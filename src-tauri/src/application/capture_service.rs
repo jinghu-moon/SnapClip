@@ -6,16 +6,12 @@
 //! whole of P1 (see the delivery protocol in docs/23 §5). T2.4 moves encoding and
 //! writing into `snapclip-history` together, in one step.
 //!
-//! The `pub use` below is a transitional forwarder: callers that still write
-//! `crate::application::capture_service::…` keep compiling. Delete it at T1.10.
+//! Callers name the ports through `snapclip_capture::artifact` directly; this module is
+//! only the encoder (T1.10 deleted the forwarder that used to live here).
 
 use crate::infrastructure::image;
 use snapclip_capture::artifact::ArtifactEncoder;
 use snapclip_capture::{CaptureError, CaptureResult};
-
-pub use snapclip_capture::artifact::{
-    ArtifactDir, CaptureService, PixelSliceSource, SelectionPixels,
-};
 
 /// BGRA → PNG encoder backed by [`crate::infrastructure::image`].
 pub struct PngArtifactEncoder;
@@ -34,10 +30,11 @@ impl ArtifactEncoder for PngArtifactEncoder {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ArtifactDir, ArtifactEncoder, CaptureService, PixelSliceSource, PngArtifactEncoder,
-    };
+    use super::PngArtifactEncoder;
     use crate::infrastructure::image;
+    use snapclip_capture::artifact::{
+        ArtifactDir, ArtifactEncoder, CaptureService, PixelSliceSource,
+    };
     use snapclip_capture::geometry::Rect;
     use snapclip_capture::session::CapturedFrame;
     use snapclip_capture::{
