@@ -260,6 +260,46 @@ mod tests {
         );
     }
 
+    /// What a real clipboard document costs.
+    ///
+    /// The card re-renders the visible rows on every scroll frame, so this is a per-frame cost,
+    /// not a one-off: the assertion is deliberately generous (50 ms) so a loaded machine cannot
+    /// make it flaky, while the printed number is the one to watch. Run with `--nocapture` to
+    /// see it.
+    #[test]
+    fn a_fifty_kilobyte_document_parses_well_inside_a_frame() {
+        // Realistic shape: a Word-ish header, DBCS byte escapes (so our normaliser runs, which
+        // is the expensive half) and bold runs to give the run list some length.
+        let mut rtf = String::from(
+            r"{\rtf1\ansi\ansicpg936\deff0{\fonttbl{\f0\fnil Arial;}}\fs24 ",
+        );
+        while rtf.len() < 50 * 1024 {
+            rtf.push_str(r"\b 加粗文字\b0 \'c4\'e3\'ba\'c3 plain line here\par ");
+        }
+        rtf.push('}');
+        let bytes = rtf.as_bytes();
+
+        // Warm-up: the first call pages in the encoding tables, which a scroll does once.
+        let _ = rtf_spans(bytes);
+
+        let iterations = 20;
+        let started = std::time::Instant::now();
+        for _ in 0..iterations {
+            let spans = rtf_spans(bytes).expect("the sample parses");
+            assert!(!spans.is_empty());
+        }
+        let per_parse = started.elapsed() / iterations;
+        eprintln!(
+            "[bench] {} KiB RTF → parse+normalise in {:?}",
+            bytes.len() / 1024,
+            per_parse
+        );
+        assert!(
+            per_parse.as_millis() < 50,
+            "one card's rich text took {per_parse:?}; that is per scroll frame"
+        );
+    }
+
     #[test]
     fn junk_degrades_instead_of_panicking() {
         // Truncated mid-group, unbalanced braces, and not-RTF-at-all: all must come back as
