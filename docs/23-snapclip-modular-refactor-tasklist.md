@@ -245,7 +245,7 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 | T2.2 | `snapclip-history` 骨架 | T2.1 | 3 文件 + 门禁扩展 | 低 | [x]（crate 建立、成员加入、依赖门禁覆盖三个 crate） |
 | T2.3 | 两个独立存储：`CaptureArtifactStore` + `ClipboardBlobStore` | T2.2 | 2 文件 + 错误类型 | 中 | [x]（含 5 个测试；cleanup/LRU 如实记为未实现） |
 | T2.4 | 切换 capture 导出链（搬 PNG 编码，改 `finish_artifact`） | T2.3 | ~6 文件 | 中 | [x]（两半都完成：编码器归位 + 导出链切到 `ArtifactWriter` 端口，见 §14.22/§14.23） |
-| T2.5 | 拆 `store/mod.rs`（连接/仓库/迁移） | T2.4 | 1 595 行 | 高 | 部分 [x]（域类型前置已搬进 `snapclip-model`，见 §14.24；**store 文件本身还没搬/拆**） |
+| T2.5 | 拆 `store/mod.rs`（连接/仓库/迁移） | T2.4 | 1 687 行 | 高 | [x]（前半域类型见 §14.24；后半搬入 crate 并拆成 5 个文件，见 §14.25） |
 | T2.6 | 迁移剪贴板 Windows 适配（6 文件） | T2.5 | 1 210 行 | 中 | [ ] |
 | T2.7 | 迁移 `clipboard_ingest`（去重/格式/publication） | T2.6 | 694 行 | 中 | [ ] |
 | T2.8 | `ClipboardService`/`HistoryService` 公共 API | T2.7 | 3 文件 | 中 | [ ] |
@@ -1737,4 +1737,43 @@ tag 消息明确写了两件事：(1) 捕获已独立成 crate、接缝真实、
 提交 SHA：见提交
 推送/tag：origin/main
 回退对象：2a2611a
+```
+
+### §14.25 T2.5 后半：`store` 搬进 `snapclip-history` 并按职责拆开
+
+```
+任务编号：T2.5（后半，完成）
+状态：已验证 + 已推送
+分支：main
+前置提交/tag：18d847f（T2.5 前半）
+修改范围：
+  `src-tauri/src/infrastructure/store/mod.rs`（1 687 行）→ `crates/snapclip-history/src/store.rs`
+  **并拆成五个文件**：
+    store.rs                          1 093  `Store` 门面 + writer 线程 + `WriterRequest` + 测试
+    store/recognition_repository.rs     254  OCR 任务队列/结果 + 五个识别枚举（仍 `pub`）
+    store/clip_repository.rs            171  `HistoryCursor` + `insert_publication` + 文本辅助
+    store/migration.rs                  144  `migrate`
+    store/artifact_repository.rs         35  `read_payload_bytes` + `sweep_orphans`
+    store/connection.rs                  14  `open_writer`
+  壳的 `infrastructure/store/mod.rs` 只剩**转发 + `From<StoreError> for IpcError`**
+  （传输胶水；能力 crate 里没有 IPC）。
+  切割方式：以 HEAD 原文为唯一来源重建 pre-split 内容，再用**锚点定位**（不是数行）定切点，
+  落盘前做**逐行覆盖校验**（1672 行不重不漏）。
+修改前测试：capture 344 / 壳 36 / history 21 / model 20
+修改后测试：**全部不变**（13 个 store 测试随文件搬入 history，`cargo test -p snapclip-history` = 21 passed）；
+          `cargo check --workspace --all-targets` 0 warning；依赖门禁三 crate 干净
+护栏：`migration_upgrades_existing_v1_database` **逐条通过**（在 history 里实跑），
+          其余 12 个 store 测试（分页/去重/OCR 状态机/来源程序）同样全绿。
+性能指标：不涉及（纯搬移 + 拆分）
+人工验证：不涉及
+失败与根因：4 处，全是"重建式搬移"的边界/可见性问题，逐个根因解决：
+  (1) 切点差一行，把识别枚举的 `#[derive]` 留在了主文件（`derive may only be applied to…`）；
+  (2) 模块声明被插进了 `mod tests` 内部（定位到了文件最后一行而不是 `#[cfg(test)]` 之前）；
+  (3) `HistoryCursor` 的字段需要 `pub(super)` 才能被门面读（正则起初误伤函数参数，改成精准改 struct）；
+  (4) **重建头部时丢了 `#[derive(Clone)]`**：`Store` 不再 `Clone`，壳里三个 `State<'_, Store>` +
+      `spawn_blocking` 立刻报 E0521。这条最有价值——脚本重建文件时必须把**被替换区间的每一行**
+      都交代清楚，而不是只关心新代码。
+提交 SHA：见提交
+推送/tag：origin/main
+回退对象：18d847f
 ```

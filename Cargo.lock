@@ -5010,6 +5010,7 @@ dependencies = [
  "image",
  "rusqlite",
  "serde",
+ "serde_json",
  "snapclip-model",
  "thiserror 2.0.21",
  "windows-sys 0.59.0",

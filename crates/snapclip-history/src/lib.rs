@@ -26,5 +26,6 @@ pub mod blob_store;
 pub mod db;
 pub mod error;
 pub mod image;
+pub mod store;
 
 pub use error::StoreError;
