@@ -31,7 +31,7 @@ use crate::events::EventBus;
 use super::card::{PREVIEW_CHARS_PER_LINE, PREVIEW_LINES};
 use super::icons::SourceIcons;
 use super::model::HistoryState;
-use super::rich::{Span, spans_to_lines};
+use super::rich::{Span, spans_to_lines, spans_to_text, styled_line};
 
 /// Row height in pixels. Fixed so the virtual list can size the scroll range without
 /// measuring every row; the row content is one line of text plus one line of metadata.
@@ -762,6 +762,20 @@ impl Render for HistoryView {
                                     .map(|text| one_line_preview(text, PREVIEW_CHARS))
                                     .filter(|text| !text.is_empty())
                                     .unwrap_or_else(|| kind_label(&item.primary_kind).to_string());
+                                // Rich text when the row has it (RTF today, Markdown later), the
+                                // collapsed plain text otherwise. Parsed once per clip id and
+                                // cached, so after the first frame this is a lookup.
+                                let rich_lines = view.rich_lines(&item.id);
+                                let content_label = rich_lines
+                                    .as_ref()
+                                    .map(|lines| {
+                                        lines
+                                            .iter()
+                                            .map(|line| spans_to_text(line))
+                                            .collect::<Vec<_>>()
+                                            .join("\n")
+                                    })
+                                    .unwrap_or_else(|| preview.clone());
                                 let meta = row_meta(&item);
                                 let id = item.id.clone();
                                 let row = div()
@@ -845,18 +859,38 @@ impl Render for HistoryView {
                                                 .v_flex()
                                                 .gap_1()
                                                 .child({
+                                                    // Both paths converge on one node, so the UI
+                                                    // test's handle on a row's content does not
+                                                    // depend on which of them ran.
+                                                    let inner: AnyElement = match rich_lines.as_ref()
+                                                    {
+                                                        Some(lines) => div()
+                                                            .v_flex()
+                                                            .children(lines.iter().map(|line| {
+                                                                let (text, highlights) =
+                                                                    styled_line(line);
+                                                                StyledText::new(text)
+                                                                    .with_highlights(highlights)
+                                                            }))
+                                                            .into_any_element(),
+                                                        None => div()
+                                                            .truncate()
+                                                            .child(preview.clone())
+                                                            .into_any_element(),
+                                                    };
                                                     // Denser than body text: this is a list to
                                                     // scan, not a paragraph to read.
-                                                    let line =
-                                                        div().text_sm().truncate().child(preview);
-                                                    // Registered so the UI test can measure the
-                                                    // line: a multi-line preview is exactly what
-                                                    // made rows paint over each other.
+                                                    let node = div().text_sm().child(inner);
+                                                    // Registered so the UI test can measure and
+                                                    // read the content: a multi-line preview is
+                                                    // what made rows paint over each other, and a
+                                                    // rich row has to be readable as text too.
                                                     #[cfg(feature = "test-support")]
-                                                    let line = line
+                                                    let node = node
                                                         .id(("history-preview", index))
+                                                        .aria_label(content_label)
                                                         .test_support();
-                                                    line
+                                                    node
                                                 })
                                                 .child(
                                                     div()
