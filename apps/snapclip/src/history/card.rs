@@ -43,7 +43,10 @@ pub fn preview_lines(text: &str, max_lines: usize, max_chars: usize) -> Vec<Stri
 }
 
 /// One line's worth of text: whitespace runs and control characters become single spaces.
-fn collapse(line: &str) -> String {
+///
+/// Shared with the rich-text path (`history::rich`), because a tab must fold into a space the
+/// same way whether the span it sits in is bold or not.
+pub(crate) fn collapse(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut pending_space = false;
     for character in line.chars() {

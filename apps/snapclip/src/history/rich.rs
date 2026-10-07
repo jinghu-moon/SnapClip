@@ -167,9 +167,196 @@ pub fn spans_to_text(spans: &[Span]) -> String {
     spans.iter().map(|span| span.text.as_str()).collect()
 }
 
+/// Cut spans down to the card's lines, keeping each span's style where it lands.
+///
+/// This is the join between the two halves of the redesign: `card::preview_lines` decides how
+/// much *text* a card shows, and this decides how that text is *styled* once it has been cut.
+/// The awkward cases all live here:
+///
+///   * a styled run that contains a newline has to become **two** spans on two lines, each
+///     keeping the style — dropping the style at the break is the classic bug;
+///   * the character cap is **per line**, so a bold run that straddles the cap is cut, not the
+///     whole line's budget being spent by whichever span happened to come first;
+///   * running out of lines is different from running out of characters, and both have to end
+///     in the same visible ellipsis.
+pub fn spans_to_lines(spans: &[Span], max_lines: usize, max_chars: usize) -> Vec<Vec<Span>> {
+    let mut lines: Vec<Vec<Span>> = Vec::new();
+    let mut current: Vec<Span> = Vec::new();
+    let mut used = 0usize;
+    // Whitespace collapsing has to be *stateful across spans*: a trailing space in one run and a
+    // leading space in the next are one separator, and dropping both is how "hello **world**"
+    // turns into "helloworld".
+    let mut line_has_text = false;
+    let mut pending_space = false;
+    // Truncation that still owes the user an ellipsis, versus a cut that already carries one.
+    let mut unfinished = false;
+
+    'outer: for span in spans {
+        for (index, segment) in span.text.split('\n').enumerate() {
+            if index > 0 {
+                // A hard break. The line is full whether or not it has any text in it.
+                lines.push(std::mem::take(&mut current));
+                used = 0;
+                line_has_text = false;
+                pending_space = false;
+                if lines.len() >= max_lines {
+                    unfinished = true;
+                    break 'outer;
+                }
+            }
+            let leading_space = segment.starts_with(char::is_whitespace);
+            let trailing_space = segment.ends_with(char::is_whitespace);
+            let core = crate::history::card::collapse(segment);
+            if core.is_empty() {
+                // A run that is nothing but whitespace still separates what is around it.
+                if line_has_text {
+                    pending_space = true;
+                }
+                continue;
+            }
+            let room = max_chars.saturating_sub(used);
+            if room == 0 {
+                unfinished = true;
+                break 'outer;
+            }
+            let separator = (pending_space || leading_space) && line_has_text;
+            let budget = room.saturating_sub(usize::from(separator));
+            if budget == 0 {
+                unfinished = true;
+                break 'outer;
+            }
+            let length = core.chars().count();
+            // A cut spends one character of the budget on the ellipsis itself, or the line would
+            // end up one character wider than its cap.
+            let keep = if length <= budget { length } else { budget - 1 };
+            let mut text: String = core.chars().take(keep).collect();
+            let cut = keep < length;
+            if cut {
+                text.push('…');
+            }
+            used += keep + usize::from(separator) + usize::from(cut);
+            let mut text = text;
+            if separator {
+                text.insert(0, ' ');
+            }
+            current.push(Span {
+                text,
+                bold: span.bold,
+                italic: span.italic,
+                underline: span.underline,
+            });
+            line_has_text = true;
+            pending_space = trailing_space;
+            if cut {
+                break 'outer;
+            }
+        }
+    }
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(current);
+    }
+    lines.truncate(max_lines);
+
+    if unfinished {
+        // The ellipsis belongs to the last line, and it inherits that line's style so it does
+        // not look like a stray character.
+        if let Some(last) = lines.last_mut() {
+            match last.last_mut() {
+                Some(span) => span.text.push('…'),
+                None => last.push(Span {
+                    text: "…".to_string(),
+                    bold: false,
+                    italic: false,
+                    underline: false,
+                }),
+            }
+        }
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_rtf, rtf_spans, spans_to_text};
+    use super::{Span, is_rtf, rtf_spans, spans_to_lines, spans_to_text};
+
+    fn plain(text: &str) -> Span {
+        Span {
+            text: text.to_string(),
+            bold: false,
+            italic: false,
+            underline: false,
+        }
+    }
+
+    fn bold(text: &str) -> Span {
+        Span {
+            text: text.to_string(),
+            bold: true,
+            italic: false,
+            underline: false,
+        }
+    }
+
+    #[test]
+    fn a_styled_run_that_spans_lines_keeps_its_style_on_both() {
+        let lines = spans_to_lines(&[bold("加粗\n换行")], 3, 40);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0][0].text, "加粗");
+        assert_eq!(lines[1][0].text, "换行");
+        // The bug this test exists for: the second line losing the bold.
+        assert!(lines[0][0].bold && lines[1][0].bold);
+    }
+
+    #[test]
+    fn a_line_keeps_its_mixed_styles_in_order() {
+        let lines = spans_to_lines(&[plain("a "), bold("b"), plain(" c")], 3, 40);
+        assert_eq!(lines.len(), 1);
+        // The words must not glue together: which span ends up owning the separator is an
+        // implementation detail, so the assertion is about the text a reader sees.
+        assert_eq!(spans_to_text(&lines[0]), "a b c");
+        assert!(!lines[0][0].bold && lines[0][1].bold && !lines[0][2].bold);
+
+        // A run that is only whitespace still separates its neighbours.
+        let lines = spans_to_lines(&[plain("a"), plain("   "), bold("b")], 3, 40);
+        assert_eq!(spans_to_text(&lines[0]), "a b");
+    }
+
+    #[test]
+    fn a_separator_that_would_overflow_the_cap_is_not_added() {
+        // Four characters and a separator against a five-character budget: the separator fits,
+        // the next word does not, and the ellipsis takes the last slot.
+        let lines = spans_to_lines(&[plain("abcd"), bold("ef")], 3, 5);
+        assert_eq!(spans_to_text(&lines[0]), "abcd…");
+        assert_eq!(spans_to_text(&lines[0]).chars().count(), 5);
+    }
+
+    #[test]
+    fn running_out_of_lines_says_so_with_an_ellipsis() {
+        let lines = spans_to_lines(&[plain("one\ntwo\nthree\nfour")], 3, 40);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[2][0].text, "three…");
+    }
+
+    #[test]
+    fn the_character_cap_is_per_line_and_cuts_the_span_that_hits_it() {
+        // Ten characters of bold is more than the line has room for.
+        let lines = spans_to_lines(&[bold("0123456789")], 3, 5);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0][0].text, "0123…");
+        assert!(lines[0][0].bold, "the cut span keeps its style");
+
+        // A line whose budget is spent by an earlier span must not overflow with a later one.
+        let lines = spans_to_lines(&[plain("abcd"), bold("efgh")], 3, 5);
+        assert_eq!(lines[0][0].text, "abcd");
+        assert_eq!(lines[0][1].text, "…");
+    }
+
+    #[test]
+    fn a_short_document_is_not_announced_as_truncated() {
+        let lines = spans_to_lines(&[plain("a\nb")], 3, 40);
+        assert_eq!(lines.len(), 2);
+        assert!(!lines[1][0].text.contains('…'));
+    }
 
     /// Word's usual shape: a Unicode escape for the Chinese characters.
     ///
