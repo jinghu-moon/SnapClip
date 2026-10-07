@@ -1957,8 +1957,19 @@ T4.3 剩余（续做清单）：
      语义——参考 `src-tauri/src/app/clipboard_writer.rs`）；
   3. 删除：Design Guides 要求确认对话框"点名对象 + 动作"（`Delete "…"?` + `Delete` 按钮），
      用 `window.open_alert_dialog(...)`；仓库里目前**没有**删除用例，需要先定后端语义；
-  4. GPUI 级测试：`#[gpui_kit::test]` + `VisualTestContext`（焦点/键盘/指针/布局）——
-     需要先读 `references/gpui/test.md` 并确认测试依赖与 feature 的装配方式；
+  4. GPUI 级测试：已读 `references/gpui/test.md`，确认真实 API 与**三条前置**（下一片按此顺序做，不要再从零推导）：
+     a. `#[gpui_kit::test] fn t(cx: &mut TestAppContext)`；`cx.update(gpui_kit::init)`；
+        `cx.open_window(size(px, px), |window, cx| Root::new(view, window, cx))`；
+        断言在 `cx.update_window(handle.into(), |_, window, cx| { window.render_frame(cx);
+        window.click("id", cx); window.input("text", cx); window.press("backspace", cx);
+        window.find("id").label()/.value()/.focused()/.visible()/.bounds() })` 里做。
+     b. **应用要拆出 lib target**：集成测试只能引用库，而 `apps/snapclip` 现在只有 bin。
+        把能力与壳的构造放进 `src/lib.rs`，`src/main.rs` 只做入口——这也正是 Coding Guides 的
+        "外壳组合、能力在库里"的形状。
+     c. `gpui-kit` 的 **dev-dependency 开 `test-support`**（版本与正常依赖一致），
+        视图节点加 `.id("query")/.id("status")…` + `.test_support()`（必要时 `.role()`/`.aria_label()`），
+        否则 `window.find(...)` 找不到它们。
+     本片**没有**动这三处：它们各自会改变 crate 形状，值得单独一个提交；在上下文充裕时一次做完。
   5. 缩略图（图片型剪贴条目）懒加载 + OCR 状态徽标；
   6. 可达性：主窗口目前仍然只有"能开"这一步（托盘/热键在 T4.6）。
 提交 SHA：见提交
