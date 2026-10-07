@@ -26,20 +26,21 @@ param(
 $ErrorActionPreference = "Stop"
 Set-Location (Split-Path -Parent $PSScriptRoot)
 
-# Names that may never appear in a capability crate's normal dependency graph.
-$FORBIDDEN_IN_CAPABILITIES = @(
-    "tauri",            # UI shell
-    "wry",              # webview
-    "gpui",             # UI shell
-    "gpui-kit",
-    "rusqlite",         # storage
-    "arboard",          # clipboard
-    "snapclip-history", # capability-to-capability
-    "snapclip-recognize"
-)
+# Per crate: names that may never appear in its normal dependency graph.
+#
+# The list differs by crate on purpose. `rusqlite` is forbidden in capture (screenshots do
+# not touch the database) but is exactly what history is for; `arboard` is forbidden in
+# both because owning the clipboard belongs to the shell. Capability crates never depend
+# on each other: the shell wires them.
+$SHELL_ONLY = @("tauri", "wry", "gpui", "gpui-kit")
+$FORBIDDEN = @{
+    "snapclip-capture" = $SHELL_ONLY + @("rusqlite", "arboard", "snapclip-history", "snapclip-recognize")
+    "snapclip-history" = $SHELL_ONLY + @("arboard", "snapclip-capture", "snapclip-recognize")
+    "snapclip-model"   = $SHELL_ONLY + @("rusqlite", "arboard", "image", "windows", "windows-sys", "snapclip-capture", "snapclip-history", "snapclip-recognize")
+}
 
 # `snapclip-model` is the bottom of the graph: value types and `serde`, nothing else.
-$MODEL_ALLOWED = @("serde", "serde_core", "serde_derive", "serde_json", "proc-macro2", "quote", "syn", "unicode-ident")
+$MODEL_ALLOWED = @("serde", "serde_core", "serde_derive", "serde_json", "serde_derive_internals", "proc-macro2", "quote", "syn", "unicode-ident", "memchr", "itoa", "ryu")
 
 function Get-TreeLines([string]$target) {
     $output = & cargo tree -p $target -e normal 2>&1
@@ -62,13 +63,20 @@ function Get-PackageNames([string[]]$lines) {
 
 $failures = New-Object System.Collections.Generic.List[string]
 
-$targets = if ($Package) { @($Package) } else { @("snapclip-capture", "snapclip-model") }
+$targets = if ($Package) { @($Package) } else { @("snapclip-capture", "snapclip-history", "snapclip-model") }
 
 foreach ($target in $targets) {
     $lines = Get-TreeLines $target
     $names = Get-PackageNames $lines
 
-    foreach ($forbidden in $FORBIDDEN_IN_CAPABILITIES) {
+    $forbidden_for_target = $FORBIDDEN[$target]
+    if (-not $forbidden_for_target) {
+        # `-Package <other>` (the negative control): apply the strictest list.
+        $forbidden_for_target = $SHELL_ONLY + @("snapclip-capture", "snapclip-history", "snapclip-recognize")
+    }
+    foreach ($forbidden in $forbidden_for_target) {
+        # The first line of `cargo tree` is the package itself, not a dependency.
+        if ($forbidden -eq $target) { continue }
         if ($names.Contains($forbidden)) {
             $failures.Add("$target depends on $forbidden")
         }

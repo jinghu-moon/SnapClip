@@ -19,7 +19,12 @@
 
 [workspace]
 resolver = "2"
-members = ["src-tauri", "crates/snapclip-model", "crates/snapclip-capture"]
+members = [
+    "src-tauri",
+    "crates/snapclip-model",
+    "crates/snapclip-capture",
+    "crates/snapclip-history",
+]
 exclude = ["crates/rapid-ocr-rs"]
 
 # Tauri 的体积/优化配置原本在 `src-tauri/Cargo.toml`。workspace 化之后成员里的

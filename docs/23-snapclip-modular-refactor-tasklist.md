@@ -241,8 +241,8 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 | T1.8 | 拆 `d2d.rs`（4 pass + 文本） | T1.5 | 3 805 行 | 中 | 部分 [x]（tests/helpers/magnifier 已出列，提交 57d57a9；frame/mask/text 三个 pass 顺延（D3）） |
 | T1.9 | 依赖方向与接缝门禁落地 | T1.5 | 1 脚本 | 低 | [x]（`tools/check-dependency-direction.ps1`，正例绿/阴性对照红） |
 | T1.10 | 阶段验收 + tag `refactor-p1` | T1.6.1–T1.9 | — | 低 | [x]（tag 已打；**T1.6/T1.8 的剩余拆分按 D3 顺延**，见 §14.19） |
-| T2.1 | `ArtifactRef`/`CaptureOutput` 在 `snapclip-model` 定死（**不建 crate**） | T1.10 | 2 文件 | 低 | [ ] |
-| T2.2 | `snapclip-history` 骨架 | T2.1 | 2 文件 | 低 | [ ] |
+| T2.1 | `ArtifactRef`/`CaptureOutput` 在 `snapclip-model` 定死（**不建 crate**） | T1.10 | 2 文件 | 低 | [x]（`artifact.rs`，含 2 个测试） |
+| T2.2 | `snapclip-history` 骨架 | T2.1 | 3 文件 + 门禁扩展 | 低 | [x]（crate 建立、成员加入、依赖门禁覆盖三个 crate） |
 | T2.3 | 两个独立存储：`CaptureArtifactStore` + `ClipboardBlobStore` | T2.2 | 2 文件 | 中 | [ ] |
 | T2.4 | 切换 capture 导出链（搬 PNG 编码，改 `finish_artifact`） | T2.3 | ~4 文件 | 中 | [ ] |
 | T2.5 | 拆 `store/mod.rs`（连接/仓库/迁移） | T2.4 | 1 595 行 | 高 | [ ] |
@@ -1549,3 +1549,34 @@ tag 消息明确写了两件事：(1) 捕获已独立成 crate、接缝真实、
 演练结果（2026-10-07 实跑）：`refactor-p1` = `c1334bf`，detach 后两个套件分别是
 **345 passed / 0 failed / 6 ignored** 与 **59 passed**，与 tag 前的数字一致；切回 `main` 后工作区干净。
 **这个 tag 是真的**——它指向的提交自身可编译、可测。
+
+### §14.20 P2 起手：T2.1（ArtifactRef/CaptureOutput）+ T2.2（history 骨架）
+
+```
+任务编号：T2.1 + T2.2
+状态：已验证 + 已推送
+分支：main
+前置提交/tag：refactor-p1（c1334bf）
+修改范围：
+  T2.1  crates/snapclip-model/src/artifact.rs：
+        `CaptureMetadata`（session_id/width/height/dpi/pixel_format/captured_at_unix_ms/
+        monitor_device_name）、`CaptureOutput { bytes, metadata }`、
+        `ArtifactRef { absolute_path, mime, dimensions, byte_len, content_fingerprint }`。
+        **只加类型，不动任何调用方**（P1 交付协议：`CaptureService::finish_artifact` 的
+        签名只允许在 T2.4 改一次）。
+  T2.2  新增 crates/snapclip-history（Cargo.toml + lib.rs + artifact_store.rs/blob_store.rs/db.rs
+        三个带职责说明的空模块），加入 workspace members；
+        **依赖门禁扩展**：从"只查 capture + model"改为**每包一张禁用表**——
+        rusqlite 在 capture 里禁止、在 history 里正是它存在的理由；arboard 两边都禁（剪贴板归壳）；
+        能力 crate 之间互不依赖。
+修改前测试：capture 345 / 壳 59 / model 14
+修改后测试：model 16（+2：`CaptureOutput` 不含路径的编译期契约、`ArtifactRef` 的 JSON 往返）；
+          capture 345、壳 59 不变；`cargo check --workspace --all-targets` 0 warning
+性能指标：不涉及
+人工验证：不涉及
+失败与根因：门禁扩展时踩到一次**自我误报**（`snapclip-history depends on snapclip-history`）——
+          `cargo tree` 的第一行是包自身而不是依赖；模型那条分支早就排除了，通用分支漏了。已修。
+提交 SHA：见提交
+推送/tag：origin/main
+回退对象：refactor-p1（c1334bf）
+```

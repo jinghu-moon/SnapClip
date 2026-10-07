@@ -5002,6 +5002,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "snapclip-history"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "image",
+ "rusqlite",
+ "serde",
+ "snapclip-model",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "snapclip-model"
 version = "0.1.0"
 dependencies = [
