@@ -28,8 +28,10 @@ use snapclip_model::{AppEvent, ClipSummary, PayloadKind};
 
 use crate::clipboard::SystemClipboard;
 use crate::events::EventBus;
+use super::card::{PREVIEW_CHARS_PER_LINE, PREVIEW_LINES};
 use super::icons::SourceIcons;
 use super::model::HistoryState;
+use super::rich::{Span, spans_to_lines};
 
 /// Row height in pixels. Fixed so the virtual list can size the scroll range without
 /// measuring every row; the row content is one line of text plus one line of metadata.
@@ -43,6 +45,9 @@ const THUMBNAIL_PX: f32 = 32.0;
 
 /// How many decoded previews to keep before dropping the cache.
 const THUMBNAIL_CACHE_LIMIT: usize = 256;
+
+/// How many parsed rich documents to keep before dropping the cache.
+const RICH_CACHE_LIMIT: usize = 64;
 
 /// How close to the bottom counts as "load the next page" (the old front end used 3 rows).
 const LOAD_MORE_THRESHOLD_ROWS: f32 = 3.0;
@@ -66,6 +71,13 @@ pub struct HistoryView {
     /// Clip ids whose preview is being read right now, so a frame redraw cannot queue the
     /// same read twice.
     pending_thumbnails: HashSet<String>,
+    /// Parsed rich text per clip id, already cut to card lines. `None` records "this row is not
+    /// rich text", so a plain row is not re-parsed on every frame.
+    ///
+    /// Kept smaller than the thumbnail cache on purpose: a parse is ~8 ms for a 50 KiB document
+    /// (`rich.rs`'s bench) against a few hundred microseconds for an image read, so the two
+    /// budgets are not the same.
+    rich: HashMap<String, Option<Vec<Vec<Span>>>>,
     /// Whether a page request is in flight, so the scroll trigger and the button cannot both
     /// fire for the same page.
     loading_more: bool,
@@ -141,6 +153,7 @@ impl HistoryView {
             list_scroll: VirtualListScrollHandle::new(),
             thumbnails: HashMap::new(),
             pending_thumbnails: HashSet::new(),
+            rich: HashMap::new(),
             loading_more: false,
             status: None,
             _events,
@@ -171,6 +184,34 @@ impl HistoryView {
     /// How many row previews have been read and decoded (read by the UI tests).
     pub fn loaded_previews(&self) -> usize {
         self.thumbnails.len()
+    }
+
+    /// The card lines for `clip_id`, parsed and cut to three lines the first time it is asked
+    /// for.
+    ///
+    /// Read-side of the rich-text path: `None` means "this row is plain text", and that answer is
+    /// cached too — a plain row must not be re-parsed on every frame just because it has no
+    /// styles to show. Parsing happens on the UI thread and is a one-off per row; the alternative
+    /// (parsing in a background task) would need the store connection moved between threads for
+    /// no gain at this size.
+    pub fn rich_lines(&mut self, clip_id: &str) -> Option<Vec<Vec<Span>>> {
+        if let Some(cached) = self.rich.get(clip_id) {
+            return cached.clone();
+        }
+        // A cache that grows with the history is a leak; the visible rows are what matter, and
+        // re-parsing the few on screen is cheaper than carrying thousands of parsed documents.
+        if self.rich.len() > RICH_CACHE_LIMIT {
+            self.rich.clear();
+        }
+        let lines = self
+            .state
+            .items()
+            .iter()
+            .find(|item| item.id == clip_id)
+            .and_then(|item| self.state.rich_spans(item))
+            .map(|spans| spans_to_lines(&spans, PREVIEW_LINES, PREVIEW_CHARS_PER_LINE));
+        self.rich.insert(clip_id.to_string(), lines.clone());
+        lines
     }
 
     /// Re-run the current query and rebuild the row sizes.
