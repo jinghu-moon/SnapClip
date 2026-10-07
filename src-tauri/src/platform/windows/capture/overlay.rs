@@ -66,7 +66,7 @@ use crate::capture::annotation::{
 use crate::capture::application::{CaptureEventSink, OverlayPlatform};
 use crate::capture::diagnostics::WindowDetectionMetrics;
 use crate::capture::geometry::{
-    Handle, MagnifierConfig, MonitorLayout, Point, Rect, ResizeMode, SelectionGeometry,
+    Handle, LevelReach, MagnifierConfig, MonitorLayout, Point, Rect, ResizeMode, SelectionGeometry,
     magnifier_geometry, window_rect_to_local,
 };
 use crate::capture::sampler::{ColorFormat, ColorSampler};
@@ -75,6 +75,7 @@ use crate::capture::window_detection::model::RequestId;
 use crate::capture::window_detection::{
     DEFAULT_ADOPT_TEXT_RUNS, DEFAULT_DWELL_MS, DEFAULT_HOVER_REVALIDATE_MS, DEFAULT_SNAP_RADIUS_PX,
     DeepTarget, Exclusions, LevelChain, RingOptions, RingRole, chain_rings, next_visible_stop,
+    stops_from,
     GestureState, HoverValidity, MoveOutcome, PressOutcome, RefinementJob, RefinementOutcome,
     RefinementScheduler,
     ReleaseOutcome, Replacement, WindowSnapshot, WindowTarget, classify_replacement,
@@ -231,6 +232,82 @@ impl WheelAccumulator {
         self.residue -= steps * WHEEL_UNITS_PER_STEP;
         self.settled_until = Some(now + Duration::from_millis(WHEEL_SETTLE_MS));
         steps
+    }
+}
+
+/// The capture box's walk colour: how green it is, and the walk that put it there (docs/21 §5.24).
+///
+/// A type rather than three loose fields on the controller, and pure apart from the clock it is
+/// handed, for the same reason [`WheelAccumulator`] is: the state that is easy to get wrong here is
+/// "**no walk has happened yet**", which reads as zero but is not the same as "the colour has come
+/// back down". The first cut guarded the step on `activity > 0.0` — true of the *chain* fade, whose
+/// touch sets it to 1 immediately, and false at the bottom of a rise that starts from nothing, so
+/// the box never turned green at all.
+#[derive(Debug)]
+struct WalkColour {
+    activity: f32,
+    /// When the last walk was; `None` until the first one of the session, and again once the colour
+    /// has finished coming back down.
+    touched_at: Option<Instant>,
+    stepped_at: Instant,
+}
+
+impl Default for WalkColour {
+    fn default() -> Self {
+        Self {
+            activity: 0.0,
+            touched_at: None,
+            stepped_at: Instant::now(),
+        }
+    }
+}
+
+impl WalkColour {
+    /// A walk happened: the rise starts on the next tick.
+    fn touch(&mut self, now: Instant) {
+        self.touched_at = Some(now);
+        self.stepped_at = now;
+    }
+
+    /// How green the box is.
+    fn activity(&self) -> f32 {
+        self.activity
+    }
+
+    /// Advance one tick; `true` when the painted value changed.
+    fn advance(&mut self, now: Instant) -> bool {
+        let Some(touched) = self.touched_at else {
+            // Nothing has walked: a tick must never be what turns the box green.
+            return false;
+        };
+        let step = now.saturating_duration_since(self.stepped_at);
+        self.stepped_at = now;
+        let activity = walk_activity_step(self.activity, step, now.saturating_duration_since(touched));
+        if activity <= 0.0 {
+            // The envelope is over: forget the walk, so the tick stops asking and the next walk gets
+            // a fresh rise instead of inheriting a timestamp from the last one.
+            self.touched_at = None;
+        }
+        if (activity - self.activity).abs() < f32::EPSILON {
+            return false;
+        }
+        self.activity = activity;
+        true
+    }
+
+    /// Whether the value is still moving, so the render tick has to keep itself armed.
+    fn running(&self, now: Instant) -> bool {
+        let Some(touched) = self.touched_at else {
+            return false;
+        };
+        // From the instant of the touch: the first tick of a rise has nothing to compare against.
+        self.activity < 1.0
+            || now.saturating_duration_since(touched).as_millis() as u64 >= CHAIN_FADE_AFTER_MS
+    }
+
+    /// Whether the colour is on at all — what keeps *one* repaint alive to notice the hold expiring.
+    fn pending(&self) -> bool {
+        self.activity > 0.0
     }
 }
 
@@ -538,16 +615,8 @@ where
     /// Quantised, and that is the point: each step is one full-surface repaint, so the fade costs at
     /// most eight of them however long the fade lasts (the prototype measured seven).
     chain_visibility: f32,
-    /// How green the capture box is (docs/21 §5.24, A3): rises while a walk is fresh, then fades back
-    /// to the brand blue on the same quantised envelope the chain uses.
-    walk_activity: f32,
-    /// When the last walk happened, and when the activity was last stepped.
-    ///
-    /// Two clocks because the two halves ask different questions: the rise is per elapsed time since
-    /// the previous step, the fall is per idle time since the walk — and `Instant` cannot be
-    /// subtracted from "now" twice and still give the step the first time it is asked.
-    walk_touched_at: Instant,
-    walk_stepped_at: Instant,
+    /// The capture box's walk colour (docs/21 §5.24, A3): the green that says "you just moved this".
+    walk: WalkColour,
     /// Wheel deltas accumulating into level steps (v3 B2, docs/21 §5.24).
     wheel: WheelAccumulator,
     /// A shallower target waiting for its confirming dwell (docs/18 §13.3).
@@ -678,9 +747,7 @@ where
             hint_taught: false,
             chain_touched_at: Instant::now(),
             chain_visibility: 1.0,
-            walk_activity: 0.0,
-            walk_touched_at: Instant::now(),
-            walk_stepped_at: Instant::now(),
+            walk: WalkColour::default(),
             wheel: WheelAccumulator::default(),
             pending_downgrade: None,
             refinement_pending: None,
@@ -807,11 +874,9 @@ where
         self.session = CaptureSession::new(session_id);
         // Per-session paint state starts clean: the previous session's walk colour (and the chain's
         // visibility) must not be inherited by the next F5 (docs/21 §5.24, A3).
-        self.walk_activity = 0.0;
-        self.walk_touched_at = Instant::now();
-        self.walk_stepped_at = self.walk_touched_at;
+        self.walk = WalkColour::default();
         self.chain_visibility = 1.0;
-        self.chain_touched_at = self.walk_touched_at;
+        self.chain_touched_at = Instant::now();
         if let Err(error) = self.session.preparing() {
             eprintln!("[snapclip][capture] session preparing transition failed: {error}");
             self.fail(None, error, "none");
@@ -1532,14 +1597,14 @@ where
         self.deep_levels.is_some_and(|chain| !chain.is_deepest())
     }
 
-    /// The level badge's content: `(current, total)` in 1-based levels, or `None` while the answer
-    /// itself is selected (docs/21 §5.22).
-    ///
-    /// The deepest level *is* the answer, and it is where every preview starts, so a badge there
-    /// would read `9/9` for the state that means "nothing has been walked": the counter means "you
-    /// moved". A single-level chain has nothing to count either.
-    fn level_badge(&self) -> Option<(usize, usize)> {
-        level_badge_labels(self.deep_levels)
+    /// What the level badge shows: how many stops the wheel still has each way (docs/21 §5.24, A1).
+    fn level_badge(&self) -> Option<LevelReach> {
+        let path = self
+            .deep_target
+            .as_ref()
+            .map(|deep| deep.path.as_slice())
+            .unwrap_or(&[]);
+        level_badge_reach(self.deep_levels, path)
     }
 
     /// Whether the previewed box is the whole window rather than an element (docs/21 §5.21).
@@ -1589,14 +1654,21 @@ where
     /// than not explaining at all. After it has gone it does not come back — the lesson is once per
     /// session, and the label carries the numbers from then on.
     fn arm_level_hint(&mut self) {
-        let Some(chain) = self.deep_levels.filter(|chain| !chain.is_empty()) else {
+        if self.deep_levels.is_none_or(|chain| chain.is_empty()) {
             return;
-        };
+        }
         if !should_teach(self.hint_taught, self.hint_showing()) {
             return;
         }
         self.hint_taught = true;
-        self.arm_hint(level_hint(chain.index() + 1, chain.len()), LEVEL_HINT_MS);
+        // The sentence explains what is on screen, so it quotes the **badge's** numbers (v3 A1):
+        // stays in each direction, not the level ordinal the log prints. Walking back down to the
+        // answer leaves nothing to count, and the sentence falls back to the plain affordance.
+        let text = match self.level_badge() {
+            Some(reach) => level_hint(reach),
+            None => LEVEL_HINT.to_owned(),
+        };
+        self.arm_hint(text, LEVEL_HINT_MS);
     }
 
     /// Whether the one-shot hint is on screen right now (docs/21 §5.21).
@@ -1659,8 +1731,7 @@ where
     /// chain: the colour says "the wheel was used", and a notch that does nothing is exactly when
     /// that needs saying.
     fn touch_walk(&mut self) {
-        self.walk_touched_at = Instant::now();
-        self.walk_stepped_at = self.walk_touched_at;
+        self.walk.touch(Instant::now());
         self.invalidate();
     }
 
@@ -1669,17 +1740,9 @@ where
     /// Driven by the same coalescing render tick as the chain fade, for the same reason: the value
     /// only moves at ~60 Hz at most, so a timer of its own would only add ways to be late.
     fn advance_walk_activity(&mut self) -> bool {
-        if self.walk_activity <= 0.0 {
+        if !self.walk.advance(Instant::now()) {
             return false;
         }
-        let now = Instant::now();
-        let step = now.duration_since(self.walk_stepped_at);
-        self.walk_stepped_at = now;
-        let activity = walk_activity_step(self.walk_activity, step, now - self.walk_touched_at);
-        if (activity - self.walk_activity).abs() < f32::EPSILON {
-            return false;
-        }
-        self.walk_activity = activity;
         // Counted like the chain fade: one bounded ramp, and this is the number that proves the
         // bound on a real machine (docs/21 §5.24).
         self.metrics.record_walk_frame();
@@ -1692,13 +1755,11 @@ where
     /// tick alive while the value moves, and `pending` keeps *one* repaint alive so the 1.2 s hold
     /// can be noticed at all — a resting cursor produces no other repaint.
     fn walk_activity_running(&self) -> bool {
-        self.walk_activity > 0.0
-            && (self.walk_activity < 1.0
-                || self.walk_touched_at.elapsed().as_millis() as u64 >= CHAIN_FADE_AFTER_MS)
+        self.walk.running(Instant::now())
     }
 
     fn walk_activity_pending(&self) -> bool {
-        self.walk_activity > 0.0
+        self.walk.pending()
     }
 
     /// How green to paint the capture box.
@@ -1709,7 +1770,7 @@ where
         if self.preview_is_window() {
             0.0
         } else {
-            self.walk_activity
+            self.walk.activity()
         }
     }
 
@@ -3508,13 +3569,16 @@ pub(crate) const LEVEL_HINT: &str = "滚轮 / ↑↓ 换吸附层级";
 /// How long a one-shot hint stays on screen.
 const LEVEL_HINT_MS: u64 = 2600;
 
-/// The sentence that explains the level counter, shown the first time it appears (docs/21 §5.21).
+/// The sentence that explains the level badge, shown the first time the walk shows one (§5.24 A1).
 ///
-/// It has to answer two things a bare `8/9` cannot: what the numbers count, and which end is
-/// which. `1=窗口` is the part nobody can guess, and it is what makes "the box is a container"
-/// legible the next time the wheel is used.
-pub(crate) fn level_hint(level: usize, total: usize) -> String {
-    format!("吸附层级 {level}/{total}（1=窗口）· 滚轮 / ↑↓ 切换")
+/// It has to answer two things the chip cannot: what the two numbers count, and which end is which.
+/// `↑ = 窗口` is the part nobody can guess, and it is what makes the chip legible the next time the
+/// wheel is used. The numbers are the badge's own, so the sentence and the chip never disagree.
+pub(crate) fn level_hint(reach: LevelReach) -> String {
+    format!(
+        "↑{} ↓{} · ↑ = 窗口 · 滚轮 / ↑↓ 切换",
+        reach.up, reach.down
+    )
 }
 
 /// Whether a successful level walk should (re)arm the teaching sentence (docs/21 §5.21).
@@ -3559,17 +3623,22 @@ pub(crate) fn preview_label(rect: Rect, is_window: bool, walked: bool, degraded:
     text
 }
 
-/// The level badge's content: `(current, total)` in 1-based levels (docs/21 §5.22).
+/// What the level badge shows: how many stops the walk still has each way (docs/21 §5.24, A1).
 ///
 /// `None` while the answer itself is selected: the deepest level *is* the answer and is where every
-/// preview starts, so a badge there would read `9/9` for the state that means "nothing has been
-/// walked" — the counter means "you moved". A single-level chain has nothing to count either.
+/// preview starts, so a badge there would only report the state "nothing has been walked". A
+/// single-level chain has nothing to count either.
 ///
-/// Pure, so the badge, the teaching hint and the confirm line can be asserted to agree on one
-/// numbering rather than three separate ones.
-pub(crate) fn level_badge_labels(chain: Option<LevelChain>) -> Option<(usize, usize)> {
+/// The counts come from the same `next_visible_stop` the wheel uses, so the chip cannot promise
+/// notches the walk would not take — the failure mode that made the old `6/9` misleading once B1
+/// started skipping levels that look identical.
+pub(crate) fn level_badge_reach(chain: Option<LevelChain>, path: &[Rect]) -> Option<LevelReach> {
     let chain = chain.filter(|chain| chain.len() > 1 && !chain.is_deepest())?;
-    Some((chain.index() + 1, chain.len()))
+    let threshold = RingOptions::default().collapse_gap_px;
+    Some(LevelReach {
+        up: stops_from(path, chain.index(), -1, threshold),
+        down: stops_from(path, chain.index(), 1, threshold),
+    })
 }
 
 /// `2/6` for the confirm line: which level of the chain the ancestor walk selected (docs/21 §5.17).
@@ -3855,7 +3924,7 @@ mod tests {
     use super::{
         CHAIN_FADE_AFTER_MS, CHAIN_FADE_MS, CHAIN_FADE_STEPS, OverlayCommand, WHEEL_IDLE_RESET_MS,
         WALK_RISE_MS, WHEEL_NOTCH_UNITS, WHEEL_SETTLE_MS, WHEEL_UNITS_PER_STEP, WheelAccumulator,
-        chain_visibility_at, level_hint, point_from_lparam, preview_label, should_teach,
+        WalkColour, chain_visibility_at, level_hint, point_from_lparam, preview_label, should_teach,
         walk_activity_step,
     };
     use crate::capture::geometry::Rect;
@@ -4017,8 +4086,9 @@ mod tests {
         assert!(!should_teach(true, false));
     }
 
-    /// The badge, the sentence that teaches it, and the `level=` the confirm line prints all have to
-    /// agree on one numbering — that is the whole point of showing three of them.
+    /// The badge and the sentence that teaches it have to agree on one numbering, and that numbering
+    /// is **stops** (docs/21 §5.24, A1) — the `level=8/9` in the log is a different language, for a
+    /// different reader: it says where in the chain the session ended up, not how much wheel is left.
     #[test]
     fn the_level_hint_counts_the_way_the_confirm_line_does() {
         // The state a real session reaches by rolling up one level out of nine (a real log line
@@ -4027,22 +4097,32 @@ mod tests {
         assert!(chain.shallower());
         assert_eq!(chain.index() + 1, 8);
         assert_eq!(chain.len(), 9);
-        // Confirm line (after a confirmation), badge (live) and hint (once) agree.
+        // The confirm line (after a confirmation) speaks in levels, which is what a log needs…
         assert_eq!(super::describe_level(Some(chain)), "8/9");
-        assert_eq!(super::level_badge_labels(Some(chain)), Some((8, 9)));
-        assert_eq!(
-            level_hint(chain.index() + 1, chain.len()),
-            "吸附层级 8/9（1=窗口）· 滚轮 / ↑↓ 切换"
-        );
+        // …while the badge speaks in *stops* (docs/21 §5.24, A1): nine evenly spaced levels, walked
+        // up to the 8th, leaves seven notches toward the frame and one back toward the answer.
+        let path: Vec<Rect> = (0..9)
+            .map(|i| Rect::new(i * 10, i * 10, 400 - i * 10, 300 - i * 10))
+            .collect();
+        let reach = super::level_badge_reach(Some(chain), &path).expect("a walked chain has stops");
+        assert_eq!(reach, crate::capture::geometry::LevelReach { up: 7, down: 1 });
+        // …and the sentence that explains the chip quotes those same two numbers.
+        assert_eq!(level_hint(reach), "↑7 ↓1 · ↑ = 窗口 · 滚轮 / ↑↓ 切换");
         // The label says nothing about the level any more, so its text cannot drift from the badge.
         assert_eq!(
             preview_label(Rect::new(0, 0, 100, 50), false, true, false),
             "100×50 px  容器"
         );
         // …and the deepest level has no badge: it is the state "nothing has been walked".
-        assert_eq!(super::level_badge_labels(Some(LevelChain::new(9))), None);
-        assert_eq!(super::level_badge_labels(Some(LevelChain::new(1))), None);
-        assert_eq!(super::level_badge_labels(None), None);
+        assert_eq!(
+            super::level_badge_reach(Some(LevelChain::new(9)), &path),
+            None
+        );
+        assert_eq!(
+            super::level_badge_reach(Some(LevelChain::new(1)), &path),
+            None
+        );
+        assert_eq!(super::level_badge_reach(None, &path), None);
     }
 
     /// v3 B2 (docs/21 §5.24): wheel units become level steps at the rate the device that sent them
@@ -4169,5 +4249,62 @@ mod tests {
             "the walk colour took {} distinct values",
             sampled.len(),
         );
+    }
+
+    /// A3 (docs/21 §5.24): a tick is never what turns the box green — a **walk** is — and once a
+    /// walk has happened the first tick has to move the colour off zero.
+    ///
+    /// This is the bug the first cut shipped: the step was guarded on `activity > 0.0`, copied from
+    /// the chain fade whose touch sets its value to 1 immediately. For a rise that starts from
+    /// nothing, "the colour is zero" is the *starting* state, so the guard made the green
+    /// unreachable — the box stayed brand blue through every wheel notch.
+    #[test]
+    fn the_box_only_turns_green_after_a_walk_and_the_first_tick_moves_it() {
+        use std::time::{Duration, Instant};
+
+        let t0 = Instant::now();
+        let tick = Duration::from_millis(16);
+        let mut walk = WalkColour::default();
+
+        // Before any walk: ticks do nothing, and there is nothing to schedule or draw.
+        assert!(!walk.advance(t0 + tick));
+        assert_eq!(walk.activity(), 0.0);
+        assert!(!walk.pending());
+        assert!(!walk.running(t0 + tick));
+
+        // A walk, then the very next tick: the colour has to leave zero, and the tick has to stay
+        // armed while it climbs.
+        walk.touch(t0);
+        assert!(walk.running(t0), "the rise needs the tick before it can be seen");
+        assert!(walk.advance(t0 + tick), "the rise starts from nothing");
+        assert!(walk.activity() > 0.0);
+        assert!(walk.pending());
+
+        // …it arrives in about a tenth of a second…
+        let mut now = t0 + tick;
+        while walk.activity() < 1.0 {
+            now += tick;
+            walk.advance(now);
+            assert!(
+                now < t0 + Duration::from_millis(400),
+                "the rise has to finish"
+            );
+        }
+        // …holds still (nothing to paint, but the deadline is still being watched)…
+        assert!(!walk.running(t0 + Duration::from_millis(600)));
+        assert!(walk.pending());
+
+        // …comes back down, and then forgets the walk: the next tick has nothing to do, and the next
+        // walk gets a rise of its own rather than inheriting this one's clock.
+        while walk.activity() > 0.0 {
+            now += tick;
+            walk.advance(now);
+        }
+        assert!(!walk.pending());
+        assert!(!walk.running(now));
+        assert!(!walk.advance(now + Duration::from_millis(1000)));
+        assert_eq!(walk.activity(), 0.0);
+        walk.touch(now);
+        assert!(walk.advance(now + tick));
     }
 }

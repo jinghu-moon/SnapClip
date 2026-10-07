@@ -299,6 +299,30 @@ pub fn next_visible_stop(path: &[Rect], current: usize, direction: i32, threshol
     }
 }
 
+/// How many stops the walk still has from `current` in `direction` (v3 A1, docs/21 §5.24).
+///
+/// This is what the level badge's `↑3 ↓5` counts: **not** the number of levels left — some of those
+/// have no ring of their own and B1 skips them — but how many more notches of the wheel land
+/// somewhere that looks different before the end. Zero means "already against the end", which the
+/// badge draws dimmed.
+pub fn stops_from(path: &[Rect], current: usize, direction: i32, threshold_px: i32) -> usize {
+    if path.is_empty() {
+        return 0;
+    }
+    let mut cursor = current.min(path.len() - 1);
+    let mut stops = 0;
+    loop {
+        let next = next_visible_stop(path, cursor, direction, threshold_px);
+        // The walk is finite and every iteration either moves or ends, so `stops > path.len()` is
+        // only a guard against a future `next_visible_stop` that returns a cycle.
+        if next == cursor || stops > path.len() {
+            return stops;
+        }
+        cursor = next;
+        stops += 1;
+    }
+}
+
 /// Decide which rings the level walk paints (docs/21 §5.22).
 ///
 /// The rules, in the order they are applied — the first three are what keep a nine-level chain
@@ -987,6 +1011,40 @@ mod tests {
         assert!(!chain.jump_to(0));
         assert!(chain.jump_to(99), "clamped, not rejected");
         assert_eq!(chain.index(), 5);
+    }
+
+    /// v3 A1 (docs/21 §5.24): the badge counts *stops*, not levels — the wheel's remaining travel,
+    /// which is what makes `↑3 ↓5` honest when some levels have no ring of their own.
+    #[test]
+    fn the_remaining_stops_count_notches_that_land_somewhere_new() {
+        let path = vec![
+            rect(0, 0, 1000, 600),   // 0: the window frame
+            rect(1, 1, 999, 599),    // 1: 1 px in — no stop of its own
+            rect(2, 2, 998, 598),    // 2: 1 px more
+            rect(3, 3, 997, 597),    // 3: 1 px more
+            rect(80, 60, 900, 520),  // 4: a box the user can see
+            rect(81, 61, 899, 519),  // 5: the published answer
+        ];
+        let step = RingOptions::default().collapse_gap_px;
+
+        // From the answer: one notch up lands on the box (4), the next on the frame (0) — three
+        // 1 px levels in between are skipped, so two stops, not five levels.
+        assert_eq!(stops_from(&path, 5, -1, step), 2);
+        // From the answer there is nothing deeper to walk to.
+        assert_eq!(stops_from(&path, 5, 1, step), 0);
+        // Downward from the frame: the box, then the answer.
+        assert_eq!(stops_from(&path, 0, 1, step), 2);
+        assert_eq!(stops_from(&path, 0, -1, step), 0);
+        // Mid-chain: one notch to the answer, and up is two — the 1 px lip (3) *is* a stop from the
+        // box, because the box is 97 px inside it; the levels that collapse are the ones between the
+        // stop you are on and the next one.
+        assert_eq!(stops_from(&path, 4, 1, step), 1);
+        assert_eq!(stops_from(&path, 4, -1, step), 2);
+        // Standing on one of the collapsed levels is the same walk: the next stop is what matters.
+        assert_eq!(stops_from(&path, 2, -1, step), 1);
+        // Degenerate inputs answer rather than panic.
+        assert_eq!(stops_from(&[], 0, 1, step), 0);
+        assert_eq!(stops_from(&[rect(0, 0, 10, 10)], 0, 1, step), 0);
     }
 
     #[test]

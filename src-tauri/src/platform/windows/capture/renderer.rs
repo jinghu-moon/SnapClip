@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use crate::capture::annotation::{AnnotationDocument, AnnotationId, AnnotationItem};
-use crate::capture::geometry::{MonitorLayout, Point, Rect};
+use crate::capture::geometry::{LevelReach, MonitorLayout, Point, Rect};
 
 use super::providers::FrozenFrame;
 use super::win::d2d::{
@@ -67,8 +67,9 @@ pub struct OverlayFrameState {
     /// walk is live. The box itself is identified by the mask hole, which the renderer derives from
     /// `preview_bounds`/`selection`.
     pub capture_green: f32,
-    /// The level badge's (current, total), 1-based, while the walk is above the answer (docs/21 §5.22).
-    pub level_badge: Option<(usize, usize)>,
+    /// How many wheel stops the level walk still has in each direction, while it is above the answer
+    /// (docs/21 §5.24, A1).
+    pub level_badge: Option<LevelReach>,
     /// A one-shot hint in monitor-local coordinates (docs/21 §5.21): the level walk has to be
     /// explained once, or nobody finds it.
     pub hint: Option<(Point, String)>,

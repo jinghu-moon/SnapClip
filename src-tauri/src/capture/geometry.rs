@@ -1059,13 +1059,22 @@ pub fn level_badge_placement(
 
 /// The level badge as a dot strip: `(width, height)` for a chain of `levels` and a 7 px pitch
 /// (docs/21 §5.22). Past 12 levels the strip windows itself, so the width has a ceiling.
-pub fn level_badge_size(levels: usize) -> (i32, i32) {
-    const PITCH: i32 = 7;
-    const PADDING: i32 = 6;
-    let slots = if levels > 12 { 9 } else { levels.max(1) } as i32;
-    let windowed = if levels > 12 { 14 } else { 0 };
-    (slots * PITCH + windowed + 2 * PADDING, 18)
+/// What the level badge shows: how many wheel stops remain in each direction (v3 A1, docs/21 §5.24).
+///
+/// `up` walks toward the window frame, `down` toward the published answer. Counting *stops* rather
+/// than levels is the point: some levels have no ring of their own (they collapse), so the honest
+/// answer to "how much further can I scroll" is how many notches land somewhere new.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LevelReach {
+    pub up: usize,
+    pub down: usize,
 }
+
+/// The badge's size in logical pixels (v3's `reach` chip: two cells of `↑n` / `↓n`).
+///
+/// Fixed rather than derived from the level count: a chip that grows with the chain jumps around
+/// while the user is scrolling, and with counts instead of marks there is nothing to lay out.
+pub const LEVEL_BADGE_SIZE: (i32, i32) = (54, 18);
 
 /// Clip a virtual-desktop window rectangle to one monitor and return it in that
 /// monitor's local physical pixels.
@@ -1328,7 +1337,8 @@ mod tests {
         let work_area = Rect::new(0, 0, 1000, 800);
         // A normal box: the badge sits inside its top-right corner.
         let roomy = Rect::new(100, 100, 500, 400);
-        let (rect, where_) = level_badge_placement(roomy, (75, 18), work_area, 6, None).unwrap();
+        let (rect, where_) =
+            level_badge_placement(roomy, LEVEL_BADGE_SIZE, work_area, 6, None).unwrap();
         assert_eq!(where_, ChipWhere::Inside);
         assert_eq!(rect.right, roomy.right - 6);
         assert_eq!(rect.top, roomy.top + 6);
@@ -1336,7 +1346,8 @@ mod tests {
         // A single-line text run (20 px tall) cannot hold an 18 px badge plus padding: it goes
         // outside, still right-aligned to the box.
         let line = Rect::new(100, 300, 460, 320);
-        let (rect, where_) = level_badge_placement(line, (75, 18), work_area, 6, None).unwrap();
+        let (rect, where_) =
+            level_badge_placement(line, LEVEL_BADGE_SIZE, work_area, 6, None).unwrap();
         assert_eq!(where_, ChipWhere::OutsideAbove);
         assert_eq!(rect.right, line.right);
         assert_eq!(rect.bottom, line.top - 6);
@@ -1344,13 +1355,12 @@ mod tests {
         // …and against the top edge, below it instead.
         let line_at_top = Rect::new(100, 2, 460, 22);
         let (_, where_) =
-            level_badge_placement(line_at_top, (75, 18), work_area, 6, None).unwrap();
+            level_badge_placement(line_at_top, LEVEL_BADGE_SIZE, work_area, 6, None).unwrap();
         assert_eq!(where_, ChipWhere::OutsideBelow);
 
-        // The dot strip windows itself past twelve levels, so its width has a ceiling.
-        assert_eq!(level_badge_size(9), (75, 18));
-        assert_eq!(level_badge_size(12), (96, 18));
-        assert_eq!(level_badge_size(40), level_badge_size(13));
+        // The chip's size is fixed (v3 A1): `↑3 ↓5` needs two cells whatever the chain's length, and
+        // a badge that grew with the chain would jump under the cursor while the user scrolls.
+        assert_eq!(LEVEL_BADGE_SIZE, (54, 18));
     }
 
     #[test]
