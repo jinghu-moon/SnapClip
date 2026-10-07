@@ -433,8 +433,6 @@ struct ArmedHint {
 struct OverlayShared {
     state: CaptureState,
     session_id: Option<String>,
-    /// Snapshot of the overlay window, refreshed after creation.
-    window: Option<OverlayWindowState>,
 }
 
 /// The concrete `OverlayPlatform` used on Windows.
@@ -454,31 +452,6 @@ pub struct WindowsOverlay {
     shutting_down: AtomicBool,
 }
 
-/// Window state the overlay publishes for diagnostics and acceptance checks.
-///
-/// Handles are published as `isize` because raw pointers are not `Send`; the values
-/// are read-only snapshots of an existing window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OverlayWindowState {
-    pub window: isize,
-    /// `GWL_EXSTYLE` of the overlay window.
-    pub extended_style: isize,
-    /// Whether the overlay currently owns the foreground.
-    pub foreground: bool,
-}
-
-impl WindowsOverlay {
-    /// Snapshot of the overlay window for diagnostics and acceptance checks.
-    pub fn window_state(&self) -> Result<OverlayWindowState, String> {
-        let state = self
-            .shared
-            .lock()
-            .map_err(|_| "overlay state lock poisoned".to_string())?
-            .window;
-        state.ok_or_else(|| "overlay window is not created yet".to_string())
-    }
-}
-
 impl WindowsOverlay {
     /// Spawn the overlay thread and wait until the hotkey and window exist.
     ///
@@ -495,7 +468,6 @@ impl WindowsOverlay {
         let shared = Arc::new(Mutex::new(OverlayShared {
             state: CaptureState::Idle,
             session_id: None,
-            window: None,
         }));
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         // Bounded so a stuck/slow overlay cannot let toolbar clicks pile up without
@@ -4008,16 +3980,6 @@ fn overlay_thread<D, E>(
 
     eprintln!("[snapclip][capture] overlay ready hwnd={:?} thread={thread_id}", window);
 
-    // Publish the window snapshot so diagnostics and acceptance checks can inspect the
-    // real extended style instead of trusting the source.
-    if let Ok(mut state) = shared.lock() {
-        state.window = Some(OverlayWindowState {
-            window: window as isize,
-            extended_style: unsafe { GetWindowLongPtrW(window, GWL_EXSTYLE) },
-            foreground: unsafe { GetForegroundWindow() } == window,
-        });
-    }
-
     let mut controller: Box<dyn OverlayMessageHandler> =
         Box::new(OverlayController::new(
             service,
@@ -4108,14 +4070,6 @@ const OVERLAY_CLASS: &[u16] = &[
     97, 121, 0,
 ];
 const OVERLAY_TITLE: &[u16] = &[83, 110, 97, 112, 67, 108, 105, 112, 0];
-
-/// `GWL_EXSTYLE`.
-const GWL_EXSTYLE: i32 = -20;
-
-#[link(name = "user32")]
-unsafe extern "system" {
-    fn GetWindowLongPtrW(window: HWND, index: i32) -> isize;
-}
 
 #[cfg(test)]
 mod tests {

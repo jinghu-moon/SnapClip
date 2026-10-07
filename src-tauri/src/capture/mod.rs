@@ -20,8 +20,6 @@ pub mod session;
 pub mod window_detection;
 
 pub mod application;
-#[cfg(windows)]
-pub mod platform;
 
 pub use error::{CaptureError, CaptureResult};
 

@@ -216,7 +216,7 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 | T0.2 | 记录资源基线（before） | T0.1 | — | 低 | [ ] |
 | T0.3 | 建 workspace 骨架（+ 修 `.gitignore`） | T0.1 | 4 文件 + lock | 中（Tauri 构建） | [x]（自动门禁全绿；`npm run tauri dev` + F5 待人工） |
 | T0.4 | 建 `snapclip-model` 骨架（+ 搬 `Rect`/`Point`/`ImageDimensions`） | T0.3 | 10 文件 | 低 | [x]（自动门禁全绿） |
-| T0.5.1 | 删除 `capture/platform` 转发层 | T0.4 | 11 行 | 低 | [ ] |
+| T0.5.1 | 删除 `capture/platform` 转发层（+ 顺带清掉它续命的死代码） | T0.4 | 2 文件 + 1 处死代码链 | 低 | [x]（自动门禁全绿） |
 | T0.5.2 | OCR 事件出口改框架无关 trait | T0.5.1 | 2 文件 | 中（IPC 契约） | [ ] |
 | T0.5.3 | OCR 惰性启动 | T0.5.2 | 2 文件 | 中 | [ ] |
 | T0.5.4 | 记录资源基线（after）并对比 | T0.5.3 | — | 低 | [ ] |
@@ -351,6 +351,11 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
   2. 删除 `src-tauri/src/capture/platform/{mod.rs,windows.rs}`，并删掉 `capture/mod.rs` 中的 `pub mod platform;` 与其模块文档里的对应句子。
   3. 删除 `capture/application/runtime.rs` 里 `#[cfg(not(windows))]` 的 `UnsupportedOverlay` 分支与 `#[cfg(not(windows))] pub fn start()`；确认 `rg -n "UnsupportedOverlay"` 为空。
 - 必须保持：`CaptureEventSink`、`CaptureRuntime`、`OverlayPlatform` 三个端口的语义与调用方式不变。
+- **实测结果（2026-10-07，本任务已完成）**：
+  - 删除前先验证引用为 0：`rg -n "capture::platform" src-tauri/src` 无匹配（组合根直接写 `platform::windows::capture::overlay::WindowsOverlay`）。
+  - 删除 `src-tauri/src/capture/platform/{mod.rs,windows.rs}` 与 `capture/mod.rs` 的 `#[cfg(windows)] pub mod platform;`；`UnsupportedOverlay` 占位实现、它的 `#[cfg(not(windows))] use CaptureError` 与 `#[cfg(not(windows))] pub fn start()` 一并删除，`rg UnsupportedOverlay` 已清零。
+  - **删除暴露出一处真正的死代码（根因：它靠转发层"续命"）**：删掉 `capture::platform::windows` 这个 pub 转发后，`WindowsOverlay::window_state()` 立刻变成 `never used` —— 它唯一的引用面就是那条转发路径（`src-tauri/tests/` 是空的，docs/prototypes 里也没有引用）。顺着删掉整条快照链：`window_state()` 方法、`OverlayWindowState` 结构体、`OverlayShared.window` 字段与其两处赋值、只被它使用的 `GWL_EXSTYLE` 常量、测试模块里那个只为它存在的 `GetWindowLongPtrW` extern 声明（那个"样式必须可激活"的测试本身不调用它，只在自己的注释里提了一句）。
+  - 门禁：`cargo test --lib --manifest-path src-tauri/Cargo.toml` **403 passed / 0 failed / 6 ignored**；`cargo check --workspace --all-targets` **0 warning**；真机代理：`cargo build` 后启动 `target/debug/snapclip.exe`，`overlay excluded from capture` + `overlay ready hwnd=0x1510cfc thread=59840` + `capture overlay ready elapsed_ms=57` 正常。
 - 验收：§0.2 门禁全过（`cargo test --lib` 仍 403）。
 - 回退：`git revert`。
 - 风险：低。
@@ -1144,4 +1149,35 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 提交 SHA：待提交
 推送/tag：待推送
 回退对象：51cca9e
+```
+
+### §14.7 T0.5.1 删除 `capture/platform` 转发层
+
+```
+任务编号：T0.5.1
+状态：已验证（自动门禁全绿；真机 F5 仍待人工）
+分支：main
+前置提交/tag：533f307（T0.4）；回退基准 smart-snapping-v1-2026-10-07
+修改范围：删除 src-tauri/src/capture/platform/{mod.rs,windows.rs}；
+          src-tauri/src/capture/mod.rs（去掉 pub mod platform）；
+          src-tauri/src/capture/application/runtime.rs（去掉非 Windows 占位）；
+          src-tauri/src/platform/windows/capture/overlay.rs（删除 window_state 死代码链）；
+          docs/23
+修改前测试：403 passed / 0 failed / 6 ignored；cargo check 0 warning（HEAD 533f307）
+修改后测试：403 passed / 0 failed / 6 ignored；cargo check --workspace --all-targets 0 warning
+性能指标：不涉及
+人工验证：真机 F5 未做；自动化代理已做——启动 target/debug/snapclip.exe，
+          `overlay excluded from capture` / `overlay ready hwnd=0x1510cfc thread=59840` /
+          `capture overlay ready elapsed_ms=57` 全部正常
+失败与根因：2 次门禁红，都是**删除副作用**，不是设计错：
+          (1) `window_state()` 报 never used —— 根因是它此前只被刚删掉的 pub 转发路径"续命"；
+          (2) 删字段后又冒出 `GetWindowLongPtrW` never used —— 同一根因的下一层。
+          处置：顺着依赖链把死代码整条删掉（方法 / 结构体 / 字段 / 常量 / extern 声明），
+          而不是把 pub 转发加回来"消警告"（那是隐藏问题）。
+          **需要用户确认的判断**：我删的是"没有任何消费者"的诊断快照；
+          如果真机验收清单里将来要用它（比如断言 GWL_EXSTYLE），
+          应该在需要时连同**真实消费者**一起重新引入，而不是留着空壳。
+提交 SHA：待提交
+推送/tag：待推送
+回退对象：533f307
 ```
