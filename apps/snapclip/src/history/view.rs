@@ -161,17 +161,49 @@ impl HistoryView {
     }
 }
 
-/// `Source app · 14:32 · 图片 · OCR 完成` — the secondary line of a row.
+/// `来源程序 · 图片 · OCR 完成` — the secondary line of a row.
+///
+/// Written in the user's words, not the enum's: `PayloadKind::Text` and
+/// `OcrStatus::Done` are internal names, and the Design Guides are explicit that the
+/// interface speaks nouns a person uses ("Write each language, do not translate its shape").
 fn row_meta(item: &ClipSummary) -> String {
     let mut parts = Vec::new();
     if let Some(app) = item.source_app.as_deref().filter(|app| !app.is_empty()) {
         parts.push(app.to_string());
     }
-    parts.push(format!("{:?}", item.primary_kind));
-    if !matches!(item.ocr_status, snapclip_model::OcrStatus::None) {
-        parts.push(format!("OCR {:?}", item.ocr_status));
+    parts.push(kind_label(&item.primary_kind).to_string());
+    if let Some(ocr) = ocr_label(item.ocr_status) {
+        parts.push(ocr.to_string());
     }
     parts.join(" · ")
+}
+
+/// The word for a payload kind.
+fn kind_label(kind: &PayloadKind) -> &'static str {
+    match kind {
+        PayloadKind::Text => "文本",
+        PayloadKind::Html => "HTML",
+        PayloadKind::Rtf => "富文本",
+        PayloadKind::Image => "图片",
+        PayloadKind::Files => "文件",
+        PayloadKind::Other => "其他",
+    }
+}
+
+/// The word for a recognition state, or `None` when there is nothing worth saying.
+///
+/// `None` and `Queued` stay silent: a row whose text has simply not been read yet is not a
+/// state the user needs to see, and showing "未识别" on every fresh entry is noise. A
+/// running job *is* worth showing, because it explains why the text is missing.
+fn ocr_label(status: snapclip_model::OcrStatus) -> Option<&'static str> {
+    use snapclip_model::OcrStatus;
+    match status {
+        OcrStatus::None | OcrStatus::Queued => None,
+        OcrStatus::Running => Some("识别中"),
+        OcrStatus::Done => Some("OCR 完成"),
+        OcrStatus::Failed => Some("OCR 失败"),
+        OcrStatus::Skipped => Some("OCR 跳过"),
+    }
 }
 
 impl Render for HistoryView {
@@ -322,4 +354,38 @@ fn unseen_ids(items: &[ClipSummary], seen: &HashSet<String>) -> Vec<String> {
         .map(|item| item.id.clone())
         .filter(|id| !seen.contains(id))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{kind_label, ocr_label};
+    use snapclip_model::{OcrStatus, PayloadKind};
+
+    #[test]
+    fn the_row_speaks_the_users_words_not_the_enums() {
+        for (kind, expected) in [
+            (PayloadKind::Text, "文本"),
+            (PayloadKind::Html, "HTML"),
+            (PayloadKind::Rtf, "富文本"),
+            (PayloadKind::Image, "图片"),
+            (PayloadKind::Files, "文件"),
+            (PayloadKind::Other, "其他"),
+        ] {
+            assert_eq!(kind_label(&kind), expected);
+            // None of these may leak a Rust identifier into the interface.
+            assert!(!kind_label(&kind).contains("::"));
+        }
+    }
+
+    #[test]
+    fn a_quiet_recognition_state_says_nothing_and_a_busy_one_explains_itself() {
+        // Nothing to say: not recognised yet is the normal state of a fresh entry.
+        assert_eq!(ocr_label(OcrStatus::None), None);
+        assert_eq!(ocr_label(OcrStatus::Queued), None);
+        // Worth saying: these explain why text is missing, or that it arrived.
+        assert_eq!(ocr_label(OcrStatus::Running), Some("识别中"));
+        assert_eq!(ocr_label(OcrStatus::Done), Some("OCR 完成"));
+        assert_eq!(ocr_label(OcrStatus::Failed), Some("OCR 失败"));
+        assert_eq!(ocr_label(OcrStatus::Skipped), Some("OCR 跳过"));
+    }
 }
