@@ -259,7 +259,7 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 | T4.1 + T4.1.1 | 开工前研读 + **前端功能迁移矩阵** | — | 1 表格 | 低 | [x]（guides 通读 + 矩阵填实；gpui-kit 0.7.1） |
 | T4.2 | `apps/snapclip` 骨架（init/Root/单窗口） | T4.1, T2.10（D2 解除了对 T3.4 的依赖） | ~5 文件 | 中 | [x]（包名 `snapclip-app`；构建 + 起窗 + 门禁全过） |
 | T4.3 | history 能力（Entity + 虚拟列表 + `ElementId`=clip id） | T4.2 | ~6 文件 | 高 | 部分 [x]（模型/图标/视图/接线/回车复制/**GPUI 集成测试**已落地；分页、删除确认、缩略图待续，见 §14.29–§14.31） |
-| T4.4 | settings 能力（**新增**，不是迁移） | T4.3 | ~5 文件 | 中 | 部分 [x]（模型/持久化/桥/**设置页 + 页内导航**已落地，见 §14.35–§14.37；跨壳热更新待 P6 或另定） |
+| T4.4 | settings 能力（**新增**，不是迁移） | T4.3 | ~5 文件 | 中 | 部分 [x]（模型/持久化/桥/设置页/页内导航/**交互测试**已落地，见 §14.35–§14.38；跨壳热更新待 P6 或另定） |
 | T4.4.1 | 两个窗口检测开关接成真实设置通道 | T4.4 | 3 文件 | 中 | 部分 [x]（**capture 侧全通且有单测**：`DetectionOptions` → worker → fallback → provider builder，`a_non_default_adopt_text_runs_reaches_the_fallback` 钉住；剩"设置页 → 壳传值"属 T4.4；第二个开关无行为未发明。见 §14.32–§14.36） |
 | T4.5 | 事件桥（`snapclip-model::AppEvent` + channel + 丢弃过期） | T4.3 | 2 文件 | 高 | [ ] |
 | T4.6 | 托盘（Win32，**新建**） | T4.2 | 1 文件 | 中 | [ ] |
@@ -2252,4 +2252,27 @@ API 又一次"不凭记忆"救场：`Switch::new(...).checked(...).label(...).on
 提交 SHA：见提交
 推送/tag：origin/main
 回退对象：be54264
+```
+
+### §14.38 T4.4 收尾测试：开关必须真的写进文件
+
+```
+任务编号：T4.4（剩的第 3 条）
+状态：已验证 + 已推送
+分支：main
+前置提交/tag：0d3ac32（T4.5 第一步）
+新增测试（`apps/snapclip/tests/ui.rs`，`#[gpui_kit::test]` + 真实 headless 窗口）：
+  `toggling_the_setting_writes_it_to_disk`
+  - 先播下默认设置文件；打开 `SettingsView` 渲染一帧，断言**视图从文件起手**（开关是开的）；
+  - `window.click("deep-select-text-runs", cx)` 点击开关；
+  - 断言视图状态已变，**再断言 `SettingsStore::load()` 读回来的是新值**——
+    这一条才是验收：只"看起来拨过去了"而没落盘，正是这个测试要抓的失败模式。
+顺带确认：组件 `Switch` 只靠 `.id("deep-select-text-runs")`（构造参数）就能被 `window.find`/`click`
+  找到，和 `Input` 一样——不需要额外 `.test_support()`，这条经验与 §14.31 一致。
+修改前/后测试：app **9 lib + 2 UI**（UI +1）；其余 capture 345 / history 49 / 壳 8 / model 22 不变；
+          `cargo check --workspace --all-targets` 0 warning
+人工验证：视觉与交互手感仍需用户（自动化只证明"点击 → 状态 → 文件"这条链）
+提交 SHA：见提交
+推送/tag：origin/main
+回退对象：0d3ac32
 ```

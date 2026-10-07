@@ -16,6 +16,7 @@ use gpui_kit::{AppContext, Entity, TestAppContext, px, size};
 use snapclip_app::history::icons::SourceIcons;
 use snapclip_app::history::model::HistoryState;
 use snapclip_app::history::view::HistoryView;
+use snapclip_app::settings::{Settings, SettingsStore, SettingsView};
 use snapclip_history::store::Store;
 use snapclip_model::{PayloadData, PayloadKind, PayloadRef, Publication, PublicationOrigin};
 
@@ -104,5 +105,41 @@ fn typing_filters_the_list_and_escape_clears_it(cx: &mut TestAppContext) {
     })
     .unwrap();
 
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+/// The settings page's acceptance is "change it, and the change is real": a switch that
+/// only looks toggled is the failure mode this catches.
+#[gpui_kit::test]
+fn toggling_the_setting_writes_it_to_disk(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+
+    let data = temp_root("settings-switch");
+    let store = SettingsStore::new(&data);
+    store.save(&Settings::default()).expect("seed settings");
+
+    let mut view: Option<Entity<SettingsView>> = None;
+    let handle = cx.open_window(size(px(640.), px(480.)), |window, cx| {
+        let entity = cx.new(|_| SettingsView::new(SettingsStore::new(&data)));
+        view = Some(entity.clone());
+        Root::new(entity, window, cx)
+    });
+    let view = view.expect("view constructed");
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            view.read(cx).settings().deep_select_text_runs,
+            "the switch starts from the file, which holds the default"
+        );
+
+        window.click("deep-select-text-runs", cx);
+
+        assert!(!view.read(cx).settings().deep_select_text_runs);
+    })
+    .unwrap();
+
+    // The assertion that matters: the file changed, not just the rendered state.
+    assert!(!SettingsStore::new(&data).load().deep_select_text_runs);
     let _ = std::fs::remove_dir_all(&data);
 }
