@@ -3602,9 +3602,10 @@ fn should_teach(taught: bool, showing: bool) -> bool {
 /// to the thing, or to the shell around it?"), and it is the only one of the two facts that needs no
 /// explanation. `容器` is what makes a walked-up-to box self-explanatory without reading a number.
 ///
-/// **The level counter is not here** (docs/21 §5.22): it moved to its own dot-strip badge, because
-/// the two say different things — the label says "what this box is", the badge says "where it sits on
-/// the chain" — and because leaving it in made the label change width on every notch of the wheel.
+/// **The level counter is not here** (docs/21 §5.22): it moved to its own badge — now the `↑n ↓n`
+/// chip of §5.24 A1 — because the two say different things (the label says "what this box is", the
+/// badge says "how much chain is left") and because leaving it in made the label change width on
+/// every notch of the wheel.
 ///
 /// `pub(crate)` so the embedded-font coverage gate can require its characters
 /// (`win::d2d::tests::the_embedded_subset_covers_the_strings_the_overlay_draws`).
