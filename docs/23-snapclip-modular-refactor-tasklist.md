@@ -980,6 +980,76 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 
 ---
 
+## 14. 执行记录（实际填写）
+
+### T0.1 复跑并记录正确性基线
+
+```
+任务编号：T0.1
+状态：已验证（自动门禁全绿；真机会话汇总待人工）
+分支：main（HEAD 0bd9191）
+前置提交/tag：0bd9191（docs: record decision D1）
+修改范围：只改 docs/23 §1.1/§0.2/§2；无代码改动
+修改前测试：—
+修改后测试：cargo test --lib --manifest-path src-tauri/Cargo.toml
+             → 403 passed / 0 failed / 6 ignored
+             cargo check --all-targets --manifest-path src-tauri/Cargo.toml
+             → 0 warnings（0.39 s，缓存命中）
+             browser_element_probe → asserted=41 passed=41 failed=0
+                                     available=52 / finer=0
+                                     p50=31.9 p95=52.2 max=61.2 ms
+             explorer_rule_probe   → control_level_points=12/25
+                                     median_area_pct=65.8
+                                     available=25/25 / finer=0
+                                     p50=69.1 p95=93.1 max=116.8 ms
+             ring_contrast_probe   → passed（底色表与 docs/21 §5.26 一致）
+             the_embedded_subset_covers_the_strings_the_overlay_draws → passed
+性能指标：本任务不涉及
+人工验证：真机会话汇总（F5 悬停/滚轮/确认，看 present_us / over16ms）**未跑**：需要真人操作鼠标，留到 T0.5 或 P1 阶段补
+失败与根因：无失败。踩到一个文档问题：T0.3 之前没有 workspace 根，
+             `cargo check --workspace --all-targets` 会直接报 "could not find Cargo.toml"；
+             已在 §0.2 与 §1.1 里改成 `--manifest-path src-tauri/Cargo.toml`
+提交 SHA：待提交（本次改动与 T0.2 记录同一个提交）
+推送/tag：待推送
+回退对象：0bd9191
+```
+
+> **过程说明**：§1.1 的表格由另一个并行会话填写过一遍（同一工作区），本次按 §0.1 的要求**独立复跑**了一遍全部命令，数字逐项一致（403 / 41·52 / 12·65.8·25 / A4 / 字体 / 事件契约）。两个会话的结论一致，但**同一工作区并行执行违反 §0.7**（应各自独立 worktree）——见"待用户裁决"。
+
+### T0.2 记录资源基线（before）
+
+```
+任务编号：T0.2
+状态：已验证（数字见 §1.2；GPU 内存一项未测）
+分支：main（HEAD 0bd9191）
+前置提交/tag：0bd9191
+修改范围：只改 docs/23 §1.2；无代码改动（唯一一次"改文件"是 `lib.rs` 的 mtime 触碰，
+          触碰后 `git status --porcelain` 仍为空，已确认内容未变）
+修改前测试：—
+修改后测试：同上（T0.1 的 403 仍绿；`cargo check` 0 warning）
+性能指标：见 §1.2 的 before 栏（1 进程 / 18 线程、37.7 MB WS、
+          WebView2 +6 进程 / +342.2 MB、空闲 CPU ~0.00%、
+          冷启动到 clipboard pipeline ready 68 ms、exe 19.34 MB、
+          改一行 → cargo check 1.36 s）
+人工验证：无需；测量脚本与口径写在 §1.2 下方
+失败与根因：GPU 内存未测（需要按 pid 归因的 GPU 计数器，本轮未采集）——
+            **明确记为未完成**，不是"已测为 0"。
+            另外发现：直接跑 debug exe 时前端走 devUrl，没有 dev server 会反复重载，
+            所以 `webview page_load Finished` 不能作为"可交互"口径（已改口径）
+提交 SHA：待提交（与 T0.1 同一个提交）
+推送/tag：待推送
+回退对象：0bd9191
+```
+
+### T0.2 期间发现的阻塞项（必须在 T0.3 一起修）
+
+| # | 发现 | 证据 | 后果 | 处理 |
+| --- | --- | --- | --- | --- |
+| B1 | `.gitignore` 的 `crates/` 忽略整个目录，而 `crates/rapid-ocr-rs` 是外部仓库、新的 `crates/snapclip-*` 将要放进去 | `git check-ignore -v crates/rapid-ocr-rs` → `.gitignore:64:crates/`；`crates/rapid-ocr-rs/.git` 存在 | 重构新建的 4 个能力 crate **无法被提交**：本地全绿、远端什么都没有，属于典型的伪完成 | 已写进 T0.3 的动作第 0 步（`.gitignore` 改成 `/crates/rapid-ocr-rs/`，并用 `git check-ignore` 验证） |
+| B2 | 并行会话在同一工作区改同一份文档 | 本回合开始时 `git status` 为空，中途 §1.1/§2 出现另一会话的改动 | 两个 agent 同时改 `docs/23`、后面还要同时改根 `Cargo.toml`/`src-tauri/Cargo.toml`，冲突与互相覆盖风险高 | **待用户裁决**：指定唯一执行者，或让并行任务各自用独立 worktree（§0.7） |
+
+---
+
 ## 14. 执行记录（按 §13.2 模板，逐任务追加）
 
 ### T0.1 复跑并记录正确性基线
