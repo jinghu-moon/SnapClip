@@ -356,6 +356,11 @@ impl LevelKind {
             Self::Image => "图像",
             Self::ListItem => "列表项",
             Self::List => "列表",
+            // `DataItem` is "an item in a list, grid or tree" — the same row a forum's topic list or
+            // Explorer's file list reports. It shares `列表项` with `ListItem` rather than getting a
+            // noun of its own: the type cannot say whether the row is a list item or a grid cell, and
+            // a real-machine session pointed at a forum topic row is what asked for it.
+            Self::DataItem => "列表项",
             Self::Menu => "菜单",
             Self::ProgressBar => "进度条",
             Self::RadioButton => "单选框",
@@ -372,7 +377,6 @@ impl LevelKind {
             | Self::Custom
             | Self::Group
             | Self::Pane
-            | Self::DataItem
             | Self::Header
             | Self::TitleBar => return None,
         })
@@ -627,6 +631,9 @@ mod tests {
         assert_eq!(LevelKind::Group.noun_zh(), None);
         assert_eq!(LevelKind::Unknown.noun_zh(), None);
         assert_eq!(LevelKind::Button.noun_zh(), Some("按钮"));
+        // The row of a list/grid — a forum topic row is what put this on the list (docs/21 §5.24.9).
+        assert_eq!(LevelKind::DataItem.noun_zh(), Some("列表项"));
+        assert_eq!(LevelKind::ListItem.noun_zh(), LevelKind::DataItem.noun_zh());
         // The same kind under either name of a table.
         assert_eq!(LevelKind::DataGrid.noun_zh(), LevelKind::Table.noun_zh());
     }
