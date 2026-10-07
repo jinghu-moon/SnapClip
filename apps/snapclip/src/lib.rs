@@ -98,6 +98,9 @@ pub struct Shell {
     /// The notification-area icon. `None` when Windows refused it, which is a degraded shell
     /// (no tray) rather than a failed start — the window is still there.
     tray: Option<tray::Tray>,
+    /// The hosted capture overlay. `None` when the overlay or its hotkey could not start,
+    /// which is reported and survived: the rest of the shell still works.
+    capture: Option<snapclip_capture::CaptureRuntime>,
 }
 
 /// Which capability the window is showing. A desktop shell keeps navigation persistent, so
@@ -123,7 +126,20 @@ impl Shell {
         };
         // The settings page is independent of the store, so it exists even when history
         // cannot open — that is also how the user can see *why* something is wrong.
+        let settings_store = settings::SettingsStore::new(&data);
+        // Read once for the capture start below; the settings page keeps its own copy so a
+        // later edit is written to the same file.
+        let detection_options = settings_store.load().detection_options();
         let settings = cx.new(|_| settings::SettingsView::new(settings::SettingsStore::new(&data)));
+        // Capture is hosted here from P6 on: F5, the overlay and the export chain belong to
+        // this process, which is what lets the old Tauri shell be deleted.
+        let capture = match capture::start(&data, events.clone(), detection_options) {
+            Ok(runtime) => Some(runtime),
+            Err(error) => {
+                eprintln!("[snapclip-app] capture unavailable: {error}");
+                None
+            }
+        };
         // The shell's windows are reachable from here on: the tray is the entry point that
         // T4.1.1 recorded as missing, and its commands arrive on their own thread.
         let tray = match tray::Tray::start() {
@@ -142,6 +158,7 @@ impl Shell {
             page: Page::History,
             events,
             tray,
+            capture,
         }
     }
 
@@ -158,6 +175,11 @@ impl Shell {
     /// icon and joins the message loop.
     pub fn tray(&self) -> Option<&tray::Tray> {
         self.tray.as_ref()
+    }
+
+    /// The hosted capture overlay, when the shell could start one.
+    pub fn capture(&self) -> Option<&snapclip_capture::CaptureRuntime> {
+        self.capture.as_ref()
     }
 }
 impl Render for Shell {
@@ -234,6 +256,18 @@ impl Render for Shell {
 
 /// Start the shell. The binary entry point is a one-liner on purpose.
 pub fn run() {
+    // Per-Monitor V2 has to be declared before anything creates a window or reads a cursor
+    // position; once a window exists the declaration can no longer be changed and capture
+    // geometry would be reported in virtualised coordinates (docs/14 §3). This is why it is
+    // here and not in `Shell::new` — GPUI opens its window inside `run`, below.
+    #[cfg(windows)]
+    match snapclip_capture::windows::monitor::set_per_monitor_v2_awareness() {
+        Ok(mode) => eprintln!("[snapclip-app][startup] dpi awareness={mode}"),
+        Err(message) => {
+            eprintln!("[snapclip-app][startup] dpi awareness declaration failed: {message}")
+        }
+    }
+
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {

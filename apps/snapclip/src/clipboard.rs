@@ -52,3 +52,20 @@ fn mark_ours() {
     #[cfg(windows)]
     snapclip_history::windows::mark_clipboard_excluded();
 }
+
+/// The same writer, seen through capture's port.
+///
+/// The overlay has exactly one clipboard affordance (pressing `C` copies the colour under the
+/// magnifier). Capture declares the need; the shell owns the clipboard because whoever writes
+/// to it also has to mark the write as ours — which is what `SystemClipboard` already does.
+pub struct SystemClipboardWriter;
+
+impl snapclip_capture::ports::ClipboardWriter for SystemClipboardWriter {
+    fn copy_text(&self, text: &str) {
+        // Failures are logged, never fatal: a colour the user could not copy must not take
+        // the overlay down with it.
+        if let Err(error) = SystemClipboard.copy_text(text) {
+            eprintln!("[snapclip-app] overlay clipboard write failed: {error}");
+        }
+    }
+}

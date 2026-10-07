@@ -2563,6 +2563,51 @@ P6 开工前的现状核对（**关键发现，先纠正文档的想当然**）�
 回退对象：cb1b9a3
 ```
 
+### §14.48 P6 第二片：capture 由 GPUI 壳托管（F5 归壳）+ DPI 声明归位
+
+```
+任务编号：P6（组合根搬迁，第 2、4/5 片）
+状态：已完成并验证（真机 overlay 已在壳内跑起来）
+分支：main
+前置提交/tag：5e34b44
+改了什么：
+  1. `apps/snapclip/src/capture/mod.rs::start`：壳侧启动 overlay。`CaptureService` +
+     `CaptureEvents`（P4 已有的事件适配器）+ `SystemClipboardWriter` + `HistoryArtifactWriter`
+     （§14.47）+ `DetectionOptions`。F5 由 overlay 自己 `RegisterHotKey`，所以**托管 capture 就等于
+     把截图入口拿回壳里**。
+  2. `apps/snapclip/src/clipboard.rs::SystemClipboardWriter`：同一个 `SystemClipboard` 以
+     capture 的 `ClipboardWriter` 端口身份暴露（overlay 按 `C` 复制取色）。写失败只记日志，
+     绝不把 overlay 拖死。
+  3. `Shell` 持有 `Option<CaptureRuntime>`（`Shell::capture()` 可读）：启动失败只记日志、降级，
+     与托盘同一策略——窗口和历史仍然可用。
+  4. **DPI 声明归位**：`set_per_monitor_v2_awareness()` 移到 `run()` 的最开头，即
+     `gpui_kit::application()` **之前**。理由写进代码注释：窗口一旦存在，声明就无法再改变，
+     capture 的几何会变成虚拟化坐标（docs/14 §3）。这是 §14.46 清单里"不能漏"的第 4 项。
+  5. 设置喂值：`Shell::new` 读 `SettingsStore::load().detection_options()` 传给 overlay 启动，
+     补上 T4.4 一直挂着的"设置页的值 → 壳 → capture"这一段（改动即生效仍需重启壳；
+     与 T4.4 决策 (b) 一致）。
+验证（真机，本机桌面会话）：
+  - `cargo test -p snapclip-app --lib -- --ignored --nocapture` → **2 passed**，日志实录：
+      `[snapclip][capture] overlay excluded from capture`
+      `[snapclip][capture] overlay ready hwnd=0xa10070 thread=22148`
+      `[snapclip][capture] cancel session=idle reason=shutdown active=false`
+      `[snapclip][capture] session graphics released`
+    → overlay 是在**GPUI 壳进程**里创建的（hwnd + 自己的线程），F5 注册成功，`Drop` 干净收尾。
+  - `cargo test -p snapclip-app --features test-support` → **30 lib + 5 UI**（2 ignored = 托盘与
+    overlay 两条真机会话用例）
+  - `cargo check --workspace --all-targets` → **0 warning**
+记账（**纠正一处文档想当然**）：§10 的验收写着"截图 → **历史出现该条**"，但旧壳也**没有**把截图写进
+  clip 历史——`CaptureArtifactStore` 只把 PNG 落到 `<app data>/artifacts/capture`，历史表是剪贴板
+  记录表。所以本片保持的是**忠实于现状**的行为（F5 → overlay → 导出 PNG 到 artifacts），
+  "截图进历史"是新增功能而非迁移，不属于 P6；若要做，请在 V2 里当新需求立项。
+下一步（未做，第 3、5/5 片）：剪贴板 ingest 搬进壳（`Win32EventBridge` + reader + resolver +
+  `ClipboardEvents`，OCR 队列按 D2 传空队列）→ 历史实时刷新；然后删 `src-tauri/` 与 Vue，
+  `cargo tree -i tauri/wry` 为空，打 tag `refactor-p6`。
+提交 SHA：见提交
+推送/tag：origin/main
+回退对象：5e34b44
+```
+
 ### §14.47 P6 第一片：`ArtifactWriter` 端口实现搬进 GPUI 壳
 
 ```
