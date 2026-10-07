@@ -20,6 +20,8 @@ pub struct HistoryState {
     next_cursor: Option<String>,
     selected: Option<String>,
     query: String,
+    /// The type filter, mirroring the shape the old front end had (`all` = `None`).
+    kind: Option<PayloadKind>,
 }
 
 impl HistoryState {
@@ -36,6 +38,7 @@ impl HistoryState {
             next_cursor: None,
             selected: None,
             query: String::new(),
+            kind: None,
         };
         state.reload()?;
         Ok(state)
@@ -54,8 +57,22 @@ impl HistoryState {
         &self.query
     }
 
+    pub fn kind(&self) -> Option<&PayloadKind> {
+        self.kind.as_ref()
+    }
+
     pub fn selected_id(&self) -> Option<&str> {
         self.selected.as_deref()
+    }
+
+    /// Set the type filter and reload the first page. Returns whether anything changed.
+    pub fn set_kind(&mut self, kind: Option<PayloadKind>) -> Result<bool, StoreError> {
+        if self.kind == kind {
+            return Ok(false);
+        }
+        self.kind = kind;
+        self.reload()?;
+        Ok(true)
     }
 
     /// Set the search text and reload the first page. Returns whether anything changed.
@@ -115,12 +132,49 @@ impl HistoryState {
     }
 
     fn fetch(&self, cursor: Option<String>) -> Result<snapclip_model::HistoryPage, StoreError> {
-        if self.query.trim().is_empty() {
-            self.store.history_page(cursor, PAGE_SIZE)
-        } else {
-            self.store
-                .search_history_page(self.query.clone(), None, cursor, PAGE_SIZE)
+        // One call covers all four combinations: the store treats an empty query as "no text
+        // filter" and an absent kind as "every kind". Splitting them here (as the first slice
+        // did) is how `kind` would silently stop applying to an empty search box.
+        self.store.search_history_page(
+            self.query.clone(),
+            self.kind.clone(),
+            cursor,
+            PAGE_SIZE,
+        )
+    }
+
+    /// Delete the selected entry. Returns the id that was removed.
+    ///
+    /// The model owns this because the *policy* is the model's: what "selected" means, what
+    /// to do afterwards (refresh without collapsing the user's loaded pages), and what the
+    /// user is told. The store only knows rows.
+    pub fn delete_selected(&mut self) -> Result<Option<String>, StoreError> {
+        let Some(id) = self.selected.clone() else {
+            return Ok(None);
+        };
+        if !self.store.delete_publication(id.clone())? {
+            // Another shell already deleted it; the refresh below still fixes the list.
+            self.refresh()?;
+            return Ok(None);
         }
+        self.refresh()?;
+        Ok(Some(id))
+    }
+
+    /// The bytes of the first image payload of `item`, for a row preview.
+    ///
+    /// Mirrors what the old front end's `image_payload_data_url` did (the first image payload
+    /// of the row), minus the base64 step: a native shell can hand the bytes straight to the
+    /// renderer.
+    pub fn image_bytes(&self, item: &ClipSummary) -> Option<Result<Vec<u8>, StoreError>> {
+        let image = item
+            .payloads
+            .iter()
+            .find(|payload| payload.kind == PayloadKind::Image)?;
+        Some(self.store.read_payload_bytes(
+            image.content_hash.clone(),
+            PayloadKind::Image,
+        ))
     }
 
     /// Select the first row when nothing is selected, or when the selection vanished
@@ -233,6 +287,31 @@ mod tests {
                 vec![PayloadData::new(payload, bytes)],
             )
             .expect("save publication");
+    }
+
+    fn save_image(store: &Store, id: &str, bytes: &[u8]) {
+        let bytes = bytes.to_vec();
+        let payload = PayloadRef {
+            payload_id: format!("{id}-0"),
+            content_hash: blake3::hash(&bytes).to_hex().to_string(),
+            kind: PayloadKind::Image,
+            size_bytes: bytes.len() as u64,
+            mime_type: Some(PayloadKind::Image.default_mime_type().to_string()),
+            image_dimensions: None,
+        };
+        store
+            .save_publication(
+                Publication {
+                    publication_id: id.to_string(),
+                    origin: PublicationOrigin::Clipboard,
+                    captured_at_unix_ms: 1_700_000_000_000,
+                    source_app: Some("Test App".to_string()),
+                    source_exe_path: None,
+                    payloads: vec![payload.clone()],
+                },
+                vec![PayloadData::new(payload, bytes)],
+            )
+            .expect("save image publication");
     }
 
     #[test]
@@ -378,6 +457,85 @@ mod tests {
         // The selection does not jump under the user: it is still the row they had chosen,
         // and only falls back to the top when that row is gone.
         assert_eq!(state.selected_id(), Some("clip-059"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_kind_filter_applies_with_and_without_a_search_query() {
+        let dir = root("kind-filter");
+        {
+            let store = Store::open(&dir).unwrap();
+            save(&store, "clip-text", "a note");
+            save_image(&store, "clip-image", b"png bytes");
+        }
+        let mut state = HistoryState::open(&dir).unwrap();
+        assert_eq!(state.items().len(), 2, "no filter shows everything");
+
+        assert!(state.set_kind(Some(PayloadKind::Image)).unwrap());
+        assert_eq!(state.items().len(), 1);
+        assert_eq!(state.items()[0].id, "clip-image");
+        // Setting the same filter again is not a change (and must not re-query).
+        assert!(!state.set_kind(Some(PayloadKind::Image)).unwrap());
+
+        // The filter survives a search, which is the combination that used to lose it: the
+        // searched text belongs to the *text* row, so a matching query must still come back
+        // empty while the image filter is on.
+        state.set_query("a note").unwrap();
+        assert!(
+            state.items().is_empty(),
+            "a text row must not appear while the image filter is on"
+        );
+
+        assert!(state.set_kind(None).unwrap());
+        assert_eq!(state.items().len(), 1, "the text row is back once unfiltered");
+        assert_eq!(state.items()[0].id, "clip-text");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deleting_the_selection_removes_it_and_moves_the_selection_on() {
+        let dir = root("delete-selected");
+        {
+            let store = Store::open(&dir).unwrap();
+            save(&store, "clip-1", "first");
+            save(&store, "clip-2", "second");
+        }
+        let mut state = HistoryState::open(&dir).unwrap();
+        assert_eq!(state.selected_id(), Some("clip-2"));
+        assert_eq!(state.delete_selected().unwrap().as_deref(), Some("clip-2"));
+        assert_eq!(state.items().len(), 1);
+        assert_eq!(state.selected_id(), Some("clip-1"));
+
+        // With nothing left, deleting is a no-op rather than an error.
+        state.select("clip-1");
+        assert_eq!(state.delete_selected().unwrap().as_deref(), Some("clip-1"));
+        assert!(state.items().is_empty());
+        assert_eq!(state.delete_selected().unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_image_row_offers_its_png_bytes_and_a_text_row_offers_none() {
+        let dir = root("image-bytes");
+        {
+            let store = Store::open(&dir).unwrap();
+            save(&store, "clip-text", "a note");
+            save_image(&store, "clip-image", b"png bytes");
+        }
+        let state = HistoryState::open(&dir).unwrap();
+        let image = state
+            .items()
+            .iter()
+            .find(|item| item.id == "clip-image")
+            .unwrap();
+        let bytes = state.image_bytes(image).expect("image row has bytes").unwrap();
+        assert_eq!(bytes, b"png bytes");
+        let text = state
+            .items()
+            .iter()
+            .find(|item| item.id == "clip-text")
+            .unwrap();
+        assert!(state.image_bytes(text).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

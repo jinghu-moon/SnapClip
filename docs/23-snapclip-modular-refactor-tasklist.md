@@ -2277,6 +2277,58 @@ API 又一次"不凭记忆"救场：`Switch::new(...).checked(...).label(...).on
 回退对象：0d3ac32
 ```
 
+### §14.41 T4.3 剩余：分页、类型筛选、删除、缩略图，以及被测试逼出来的焦点根因
+
+```
+任务编号：T4.3（第四片，收尾）
+状态：已完成并验证
+分支：main
+前置提交/tag：1fb3fa2
+改了什么：
+  1. `snapclip-history`：新增 `Store::delete_publication`。语义不是"删一行"：先删 clips
+     （`clip_payloads`/`clip_search` 由外键与触发器级联，FTS 索引同步失效），再删**没有任何
+     clip 引用**的 payload 行，最后 `sweep_orphans` 回收 blob。payload 是内容寻址的，所以
+     "另一个 clip 还在用同一份字节"必须保留——这正是不能直接 unlink 的原因。
+  2. `HistoryState`：新增 `kind` 筛选（`set_kind`）、`load_more`（带 id 去重，避免新记录把
+     游标窗口顶偏后同一行出现两次）、`refresh`（**保留用户已加载的深度**，不塌回第一页）、
+     `delete_selected`、`image_bytes`（取该行第一个 image payload 的字节，与旧前端
+     `image_payload_data_url` 同口径，只是不做 base64）。
+     `fetch` 收敛为**一次** `search_history_page`：原先"空查询走 history_page、非空才带 kind"
+     的分支会让类型筛选在搜索框为空时静默失效（测试 `the_kind_filter_applies_with_and_without_a_search_query`
+     钉住了这条）。
+  3. `HistoryView`：
+     - 类型筛选条（全部/文本/图片/文件，与旧面板一致），带 `role=Button` + `aria_selected`；
+     - 分页两条路径：滚动到距底部 3 行以内自动取下一页（旧前端口径），以及显式"加载更多"
+       按钮（键盘可达，且没有更多时**不渲染**，不做假按钮）；
+     - 删除：`Delete`/`Backspace` 与"删除所选"按钮都先弹 `AlertDialog` 确认，标题里写的是
+       记录的**预览文字**而不是 clip id（用户在删除他看到的东西，不是在删除主键）；
+     - 行内缩略图：只对虚拟列表**正在渲染**的行取图，且读取被 `defer_in` 推到帧末，
+       渲染永不阻塞在数据库上；缓存有上限（256），超限整体丢弃而不是无限增长。
+  4. **根因修复（测试逼出来的）**：列表原先没有自己的焦点句柄，于是
+     (a) 输入框里的 ↑/↓ 会被列表抢去移动选中行（在搜索框里根本没法按光标），
+     (b) 键盘删除在输入框有焦点时被守卫挡住，用户很难触达。
+     现在 `HistoryView` 持有 `list_focus`：打开时列表持有键盘，点搜索框把键盘交给输入框，
+     点任意一行交回列表。输入框持焦时按键保留编辑语义，只有 Escape（清筛选）/Enter（复制）
+     仍按屏幕的含义处理。
+验证（实际命令与结果）：
+  - `cargo test -p snapclip-history` → **51 passed**（新增删除 2 条：删干净 + 共享字节不被误删）
+  - `cargo test -p snapclip-app --features test-support` → **26 lib + 4 UI**
+  - UI 用例 `the_filter_the_next_page_and_the_delete_flow_all_reach_the_screen` 全链路真跑：
+    第一页 50 行 → 点"图片"筛选只剩 1 行且 `aria_selected` 翻转 → 回到全部 → 点"加载更多"
+    → 61 行且按钮消失 → 点/按删除弹确认（取消后仍是 61 行）→ 在 dialog 作用域里点 `ok`
+    → 60 行且被删的那条确实不在 → 最后回到 store 复读确认落库生效。
+  - 缩略图懒加载由 `loaded_previews() >= 1` 断言（跑完 `run_until_parked` 之后）。
+  - `cargo check --workspace --all-targets` → 0 warning；依赖方向门禁 → clean。
+未做/记账：
+  - 分页的**滚动触发**无法在无头测试里断言"滚动后自动加载"（需要真实布局+wheel 事件序列，
+    且虚拟列表的可视范围判定依赖真实滚动偏移）；自动化覆盖的是显式按钮这条路径，滚动触发
+    与按钮共用 `load_more()`，属于同一实现。真机复核留给你。
+  - 缩略图只做"取字节 → 交给渲染器解码"，未做尺寸归一（旧前端也没有）。
+提交 SHA：见提交
+推送/tag：origin/main
+回退对象：1fb3fa2
+```
+
 ### §14.39 T4.8 第一半：GPUI 壳 vs Tauri 宿主 + WebView2（debug 实测）
 
 ```

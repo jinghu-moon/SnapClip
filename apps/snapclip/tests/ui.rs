@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use gpui_kit::component::Root;
+use gpui_kit::component::{Root, WindowExt as _};
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{AppContext, Entity, TestAppContext, px, size};
 use snapclip_app::events::EventBus;
@@ -58,6 +58,31 @@ fn save_text(store: &Store, id: &str, text: &str) {
             vec![PayloadData::new(payload, bytes)],
         )
         .expect("save publication");
+}
+
+fn save_image(store: &Store, id: &str, bytes: &[u8]) {
+    let bytes = bytes.to_vec();
+    let payload = PayloadRef {
+        payload_id: format!("{id}-image"),
+        content_hash: blake3::hash(&bytes).to_hex().to_string(),
+        kind: PayloadKind::Image,
+        size_bytes: bytes.len() as u64,
+        mime_type: Some(PayloadKind::Image.default_mime_type().to_string()),
+        image_dimensions: None,
+    };
+    store
+        .save_publication(
+            Publication {
+                publication_id: id.to_string(),
+                origin: PublicationOrigin::Clipboard,
+                captured_at_unix_ms: 1_700_000_000_000,
+                source_app: Some("Test App".to_string()),
+                source_exe_path: None,
+                payloads: vec![payload.clone()],
+            },
+            vec![PayloadData::new(payload, bytes)],
+        )
+        .expect("save image publication");
 }
 
 #[gpui_kit::test]
@@ -108,6 +133,112 @@ fn typing_filters_the_list_and_escape_clears_it(cx: &mut TestAppContext) {
     })
     .unwrap();
 
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+/// T4.3's remaining acceptance: the type filter, paging, and a delete that asks first.
+#[gpui_kit::test]
+fn the_filter_the_next_page_and_the_delete_flow_all_reach_the_screen(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+
+    let data = temp_root("filter-page-delete");
+    {
+        let store = Store::open(&data).expect("open store");
+        // 60 text rows (more than one page of 50) and one image row.
+        for index in 0..60 {
+            save_text(&store, &format!("clip-{index:03}"), &format!("entry {index}"));
+        }
+        save_image(&store, "clip-image", b"not really a png");
+    }
+    let state = HistoryState::open(&data).expect("open history");
+    let icons = SourceIcons::new(data.join("icons")).expect("icons");
+
+    let mut view: Option<Entity<HistoryView>> = None;
+    let handle = cx.open_window(size(px(640.), px(480.)), |window, cx| {
+        let view_entity =
+            cx.new(|cx| HistoryView::new(state, icons, EventBus::new(), window, cx));
+        view = Some(view_entity.clone());
+        Root::new(view_entity, window, cx)
+    });
+    let view = view.expect("view constructed");
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).items().len(), 50, "first page only");
+        assert!(view.read(cx).has_more());
+
+        // The type filter is reachable, and the accessibility tree agrees about which chip
+        // is the active one.
+        assert_eq!(window.find("history-filter-all").selected(), Some(true));
+        window.click("history-filter-image", cx);
+        assert_eq!(view.read(cx).items().len(), 1);
+        assert_eq!(view.read(cx).items()[0].id, "clip-image");
+        assert_eq!(window.find("history-filter-image").selected(), Some(true));
+        assert_eq!(window.find("history-filter-all").selected(), Some(false));
+
+        window.click("history-filter-all", cx);
+        assert_eq!(view.read(cx).items().len(), 50);
+
+        // Paging: the explicit control does what the scroll trigger does.
+        assert_eq!(window.find("history-load-more").label(), Some("加载更多"));
+        window.click("history-load-more", cx);
+        assert_eq!(view.read(cx).items().len(), 61);
+        assert!(!view.read(cx).has_more());
+        // With nothing left to fetch, the control is gone rather than lying.
+        assert!(window.try_find("history-load-more").is_none());
+    })
+    .unwrap();
+
+    // The row preview is lazy: it appears because the image row is on screen, and it is read
+    // after the frame, not during it (`defer_in`).
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            view.read(cx).loaded_previews() >= 1,
+            "the visible image row should have asked for its preview"
+        );
+    })
+    .unwrap();
+
+    // Cancel first: a dismissed confirmation must leave the row alone.
+    cx.update_window(handle.into(), |_, window, cx| {
+        let doomed = view.read(cx).selected_id().map(str::to_string);
+        assert_eq!(doomed.as_deref(), Some("clip-image"), "newest row is selected");
+        window.press("delete", cx);
+        assert!(window.has_active_dialog(cx), "deleting asks first");
+        assert_eq!(view.read(cx).items().len(), 61, "nothing deleted yet");
+        window.close_dialog(cx);
+        window.render_frame(cx);
+        assert!(!window.has_active_dialog(cx));
+        assert_eq!(view.read(cx).items().len(), 61);
+    })
+    .unwrap();
+
+    // Then confirm: the row and its payload are gone.
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.press("delete", cx);
+        assert!(window.has_active_dialog(cx));
+        window.within("dialog").click("ok", cx);
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).items().len(), 60);
+        assert!(
+            !view
+                .read(cx)
+                .items()
+                .iter()
+                .any(|item| item.id == "clip-image"),
+            "the confirmed delete must remove that specific row"
+        );
+        assert_eq!(window.find("history-status").label(), Some("已删除"));
+    })
+    .unwrap();
+
+    // The store agrees: nothing can read the deleted clip's bytes any more.
+    let store = Store::open(&data).expect("open store");
+    let page = store.history_page(None, None).expect("re-read history");
+    assert_eq!(page.items.len(), 50);
+    assert!(!page.items.iter().any(|item| item.id == "clip-image"));
     let _ = std::fs::remove_dir_all(&data);
 }
 

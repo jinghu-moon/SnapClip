@@ -10,12 +10,15 @@
 //! hands the selection to the owner, `Esc` clears the filter. Critical actions are not
 //! hover-only, so nothing here depends on a pointer being present.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 
-use gpui_kit::base::{StyledExt as _, v_virtual_list};
+use gpui_kit::base::{ScrollbarHandle as _, StyledExt as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::ActiveTheme;
+use gpui_kit::component::{
+    ActiveTheme, Theme, VirtualListScrollHandle, WindowExt as _, v_virtual_list,
+};
 use gpui_kit::*;
 // Only with the `test-support` feature: it registers nodes for `window.find("id")`.
 #[cfg(feature = "test-support")]
@@ -32,11 +35,32 @@ use super::model::HistoryState;
 /// measuring every row; the row content is one line of text plus one line of metadata.
 const ROW_HEIGHT_PX: f32 = 56.0;
 
+/// Row preview size. Matches the height the row already reserves for an icon column.
+const THUMBNAIL_PX: f32 = 32.0;
+
+/// How many decoded previews to keep before dropping the cache.
+const THUMBNAIL_CACHE_LIMIT: usize = 256;
+
+/// How close to the bottom counts as "load the next page" (the old front end used 3 rows).
+const LOAD_MORE_THRESHOLD_ROWS: f32 = 3.0;
+
 pub struct HistoryView {
     state: HistoryState,
     query: Entity<InputState>,
     icons: SourceIcons,
     row_sizes: Rc<Vec<Size<Pixels>>>,
+    /// The list's scroll position, so "near the end" can page in the next batch the same way
+    /// the old front end did (it triggered within three rows of the bottom).
+    list_scroll: VirtualListScrollHandle,
+    /// Decoded row previews, keyed by clip id. `None` records "there is nothing to show" so
+    /// a row that cannot be decoded is not retried on every frame.
+    thumbnails: HashMap<String, Option<Arc<Image>>>,
+    /// Clip ids whose preview is being read right now, so a frame redraw cannot queue the
+    /// same read twice.
+    pending_thumbnails: HashSet<String>,
+    /// Whether a page request is in flight, so the scroll trigger and the button cannot both
+    /// fire for the same page.
+    loading_more: bool,
     /// Result of the last command, shown as a status line: the Design Guides require the
     /// result of an action to be visible, and a status line does not depend on hover.
     status: Option<String>,
@@ -46,6 +70,10 @@ pub struct HistoryView {
     /// Re-reads the list when the window regains focus (the other shell writes the same
     /// database, and focus is the one moment we know the user is looking at it).
     _activation: Subscription,
+    /// Keyboard ownership. The list and the search field are two different things that both
+    /// want the arrow keys, so the screen has to say which one is typing: this handle is the
+    /// list's, and the handler only navigates or deletes while it holds focus.
+    list_focus: FocusHandle,
 }
 
 impl HistoryView {
@@ -59,6 +87,11 @@ impl HistoryView {
         let query = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Search clipboard history")
         });
+        let list_focus = cx.focus_handle();
+        // The list is what the arrow keys and Delete are for, so it starts focused; clicking
+        // the search field moves that ownership to the field, and clicking any row brings it
+        // back.
+        list_focus.focus(window, cx);
         // One unchanged size per row: the list virtualizes by offset, so it needs the
         // sizes up front rather than a measurement pass.
         let row_sizes = Rc::new(vec![size(px(0.0), px(ROW_HEIGHT_PX)); state.items().len()]);
@@ -97,9 +130,14 @@ impl HistoryView {
             query,
             icons,
             row_sizes,
+            list_scroll: VirtualListScrollHandle::new(),
+            thumbnails: HashMap::new(),
+            pending_thumbnails: HashSet::new(),
+            loading_more: false,
             status: None,
             _events,
             _activation,
+            list_focus,
         }
     }
 
@@ -115,6 +153,16 @@ impl HistoryView {
 
     pub fn query(&self) -> &str {
         self.state.query()
+    }
+
+    /// Whether the store has more rows behind what is loaded (read by the UI tests).
+    pub fn has_more(&self) -> bool {
+        self.state.has_more()
+    }
+
+    /// How many row previews have been read and decoded (read by the UI tests).
+    pub fn loaded_previews(&self) -> usize {
+        self.thumbnails.len()
     }
 
     /// Re-run the current query and rebuild the row sizes.
@@ -140,6 +188,156 @@ impl HistoryView {
         }
         self.row_sizes =
             Rc::new(vec![size(px(0.0), px(ROW_HEIGHT_PX)); self.state.items().len()]);
+        cx.notify();
+    }
+
+    /// Switch the type filter (`None` = every kind).
+    fn apply_kind(&mut self, kind: Option<PayloadKind>, cx: &mut Context<Self>) {
+        match self.state.set_kind(kind) {
+            Ok(true) => {
+                self.resize_rows();
+                cx.notify();
+            }
+            Ok(false) => {}
+            Err(error) => eprintln!("[snapclip-app] history filter failed: {error}"),
+        }
+    }
+
+    fn resize_rows(&mut self) {
+        self.row_sizes =
+            Rc::new(vec![size(px(0.0), px(ROW_HEIGHT_PX)); self.state.items().len()]);
+    }
+
+    /// Append the next page, if there is one.
+    fn load_more(&mut self, cx: &mut Context<Self>) {
+        if self.loading_more || !self.state.has_more() {
+            return;
+        }
+        self.loading_more = true;
+        match self.state.load_more() {
+            Ok(0) => {
+                // The cursor ran out without producing rows; stop asking on every frame.
+                self.status = Some("没有更多记录了".to_string());
+            }
+            Ok(added) => {
+                self.status = Some(format!("又加载了 {added} 条"));
+            }
+            Err(error) => {
+                self.status = Some(format!("加载更多失败：{error}"));
+            }
+        }
+        self.loading_more = false;
+        self.resize_rows();
+        cx.notify();
+    }
+
+    /// Ask before deleting: destruction is not a hover action, and the Design Guides want the
+    /// object named in the confirmation.
+    fn request_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.state.selected_id().map(str::to_string) else {
+            self.status = Some("没有选中的记录".to_string());
+            cx.notify();
+            return;
+        };
+        let label = self
+            .state
+            .items()
+            .iter()
+            .find(|item| item.id == id)
+            .map(entry_label)
+            .unwrap_or_else(|| id.clone());
+        let view = cx.entity().downgrade();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let view = view.clone();
+            alert
+                .title("删除这条记录？")
+                .description(format!("将从历史记录中永久删除：{label}"))
+                .confirm()
+                .ok_text("删除")
+                .cancel_text("取消")
+                .on_ok(move |_, _, cx| {
+                    // `update` on the view is fine here: this callback is owned by the dialog,
+                    // not by the view, so nothing is locked while it runs.
+                    let _ = view.update(cx, |view, cx| view.delete_selected(cx));
+                    true
+                })
+        });
+    }
+
+    fn delete_selected(&mut self, cx: &mut Context<Self>) {
+        match self.state.delete_selected() {
+            Ok(Some(_)) => {
+                self.thumbnails.clear();
+                self.pending_thumbnails.clear();
+                self.status = Some("已删除".to_string());
+            }
+            Ok(None) => self.status = Some("没有可删除的记录".to_string()),
+            Err(error) => self.status = Some(format!("删除失败：{error}")),
+        }
+        self.resize_rows();
+        cx.notify();
+    }
+
+    /// The preview for a row, if the row has an image payload.
+    ///
+    /// Loading is *lazy* by construction: this is only called for rows the virtual list is
+    /// actually rendering, and the read is deferred to the end of the frame so rendering
+    /// never blocks on the database.
+    fn thumbnail(
+        &mut self,
+        item: &ClipSummary,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let has_image = item
+            .payloads
+            .iter()
+            .any(|payload| payload.kind == PayloadKind::Image);
+        if !has_image {
+            return None;
+        }
+        if !self.thumbnails.contains_key(&item.id) && !self.pending_thumbnails.contains(&item.id) {
+            self.pending_thumbnails.insert(item.id.clone());
+            let id = item.id.clone();
+            cx.defer_in(window, move |this, _window, cx| this.load_thumbnail(&id, cx));
+            // Reserve the space while it loads, so the row does not jump.
+            return Some(div().size(px(THUMBNAIL_PX)).into_any_element());
+        }
+        self.thumbnails.get(&item.id).and_then(|loaded| {
+            loaded.as_ref().map(|image| {
+                img(Arc::clone(image))
+                    .size(px(THUMBNAIL_PX))
+                    .object_fit(ObjectFit::Contain)
+                    .into_any_element()
+            })
+        })
+    }
+
+    fn load_thumbnail(&mut self, clip_id: &str, cx: &mut Context<Self>) {
+        self.pending_thumbnails.remove(clip_id);
+        // A preview cache that grows with the history is a leak, and the visible set is what
+        // matters; dropping everything re-reads only the rows on screen.
+        if self.thumbnails.len() > THUMBNAIL_CACHE_LIMIT {
+            self.thumbnails.clear();
+        }
+        let Some(item) = self
+            .state
+            .items()
+            .iter()
+            .find(|item| item.id == clip_id)
+            .cloned()
+        else {
+            return;
+        };
+        let decoded = match self.state.image_bytes(&item) {
+            Some(Ok(bytes)) => Some(Arc::new(Image::from_bytes(ImageFormat::Png, bytes))),
+            Some(Err(error)) => {
+                eprintln!("[snapclip-app] history preview failed for {clip_id}: {error}");
+                None
+            }
+            None => None,
+        };
+        self.thumbnails.insert(clip_id.to_string(), decoded);
         cx.notify();
     }
 
@@ -205,6 +403,101 @@ impl HistoryView {
             .text_color(cx.theme().muted_foreground)
             .child(message)
     }
+
+    /// Whether the search field currently owns typing.
+    fn query_focused(&self, window: &Window, cx: &Context<Self>) -> bool {
+        self.query.read(cx).focus_handle(cx).is_focused(window)
+    }
+
+    /// The type filter, mirroring the options the old panel offered (all/text/image/files).
+    fn filter_bar(&self, theme: &Theme, cx: &Context<Self>) -> AnyElement {
+        const OPTIONS: [(&str, &str, Option<PayloadKind>); 4] = [
+            ("history-filter-all", "全部", None),
+            ("history-filter-text", "文本", Some(PayloadKind::Text)),
+            ("history-filter-image", "图片", Some(PayloadKind::Image)),
+            ("history-filter-files", "文件", Some(PayloadKind::Files)),
+        ];
+        let mut bar = div().h_flex().gap_1();
+        for (id, label, value) in OPTIONS {
+            let active = self.state.kind() == value.as_ref();
+            let chip = div()
+                .id(id)
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .text_xs()
+                .border_1()
+                .border_color(if active { theme.primary } else { theme.border })
+                .text_color(if active {
+                    theme.primary
+                } else {
+                    theme.muted_foreground
+                })
+                .on_click(cx.listener(move |this, _, _, cx| this.apply_kind(value.clone(), cx)))
+                .child(label);
+            #[cfg(feature = "test-support")]
+            let chip = chip
+                .role(gpui_kit::Role::Button)
+                .aria_label(label)
+                .aria_selected(active)
+                .test_support();
+            bar = bar.child(chip);
+        }
+        bar.into_any_element()
+    }
+
+    fn delete_button(&self, theme: &Theme, cx: &Context<Self>) -> AnyElement {
+        let enabled = self.state.selected_id().is_some();
+        let button = div()
+            .id("history-delete")
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .text_xs()
+            .border_1()
+            .border_color(if enabled { theme.border } else { theme.border })
+            .text_color(if enabled {
+                theme.foreground
+            } else {
+                theme.muted_foreground
+            })
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if enabled {
+                    this.request_delete(window, cx);
+                }
+            }))
+            .child("删除所选");
+        #[cfg(feature = "test-support")]
+        let button = button
+            .role(gpui_kit::Role::Button)
+            .aria_label("删除所选")
+            .test_support();
+        button.into_any_element()
+    }
+}
+
+/// The words used to name one entry in a confirmation.
+///
+/// A dialog that says "delete clip-1791288801200-1?" names the database, not the entry; the
+/// user recognises the preview.
+fn entry_label(item: &ClipSummary) -> String {
+    let preview = item
+        .preview_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    match preview {
+        Some(text) => {
+            let mut chars = text.chars();
+            let head: String = chars.by_ref().take(24).collect();
+            if chars.next().is_some() {
+                format!("{head}…")
+            } else {
+                head
+            }
+        }
+        None => kind_label(&item.primary_kind).to_string(),
+    }
 }
 
 /// `来源程序 · 图片 · OCR 完成` — the secondary line of a row.
@@ -254,28 +547,41 @@ fn ocr_label(status: snapclip_model::OcrStatus) -> Option<&'static str> {
 
 impl Render for HistoryView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let _ = window;
         let theme = cx.theme();
         let count = self.state.items().len();
         let has_rows = count > 0;
-        div()
+        let root = div()
             .v_flex()
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)
             .key_context("HistoryView")
+            .track_focus(&self.list_focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                match event.keystroke.key.as_str() {
+                let key = event.keystroke.key.as_str();
+                if this.query_focused(window, cx) {
+                    // While the field is typing, the keys keep their editing meaning. Two
+                    // exceptions, because the screen gave them a meaning the field does not
+                    // own: Escape clears the filter, Enter copies the selected row.
+                    match key {
+                        "escape" => this.clear_query(window, cx),
+                        "enter" => this.copy_selected(cx),
+                        // Pull, do not push: this InputState's text changes are not delivered
+                        // as a subscribe-able event in this version (the guides' own example
+                        // reads the field inside a handler for the same reason), so the view
+                        // re-reads the field on the keystrokes it types.
+                        _ => this.apply_query(cx),
+                    }
+                    return;
+                }
+                match key {
                     "up" => this.move_selection(-1, cx),
                     "down" => this.move_selection(1, cx),
                     "escape" => this.clear_query(window, cx),
                     "enter" => this.copy_selected(cx),
-                    // Pull, do not push: this InputState's text changes are not delivered as
-                    // a subscribe-able event in this version (the guides' own example reads
-                    // the field inside a handler for the same reason), so the view re-reads
-                    // the field on the keystrokes it types. `set_query` is a no-op when
-                    // nothing changed, so navigation keys cost nothing.
-                    _ => this.apply_query(cx),
+                    // The list owns this key: the search field never deletes a stored clip.
+                    "delete" | "backspace" => this.request_delete(window, cx),
+                    _ => {}
                 }
             }))
             .child(
@@ -292,13 +598,21 @@ impl Render for HistoryView {
                     })
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(match count {
-                                0 => "No entries".to_string(),
-                                1 => "1 entry".to_string(),
-                                n => format!("{n} entries"),
-                            }),
+                            .h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(match count {
+                                        0 => "No entries".to_string(),
+                                        1 => "1 entry".to_string(),
+                                        n => format!("{n} entries"),
+                                    }),
+                            )
+                            .child(div().flex_1())
+                            .child(self.delete_button(theme, cx)),
                     )
                     .children(self.status.clone().map(|status| {
                         let node = div()
@@ -312,18 +626,25 @@ impl Render for HistoryView {
                             .aria_label(status)
                             .test_support();
                         node
-                    })),
+                    }))
+                    .child(self.filter_bar(theme, cx)),
             )
             .child(if has_rows {
-                v_virtual_list(
+                let list = v_virtual_list(
                     cx.entity(),
                     "history-rows",
                     self.row_sizes.clone(),
-                    |view, range, _window, cx| {
+                    |view, range, window, cx| {
                         // Rows are built here rather than in a helper: a `-> impl IntoElement`
                         // helper would capture `&self` and `&item` under Rust 2024's capture
                         // rules, so the returned element would outlive what it borrows.
+                        // Copy the colours out before the row loop: the loop needs `&mut cx`
+                        // (to queue a deferred preview read), and a live `&Theme` borrowed
+                        // from `cx` would forbid that.
                         let theme = cx.theme();
+                        let row_border = theme.border;
+                        let selected_bg = theme.accent;
+                        let muted = theme.muted_foreground;
                         let selected_id = view.state.selected_id().map(str::to_string);
                         range
                             .filter_map(|index| {
@@ -351,14 +672,20 @@ impl Render for HistoryView {
                                     .h_flex()
                                     .items_center()
                                     .border_b_1()
-                                    .border_color(theme.border)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                    .border_color(row_border)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        // Clicking a row hands the keyboard back to the list, so
+                                        // ↑/↓/Delete keep working after a mouse click.
+                                        this.list_focus.focus(window, cx);
                                         this.state.select(&id);
                                         cx.notify();
                                     }));
                                 // Selected rows get a distinct, stable treatment; ordinary
                                 // control flow keeps that readable.
-                                let row = if selected { row.bg(theme.accent) } else { row };
+                                let row = if selected { row.bg(selected_bg) } else { row };
+                                // Only rows the list is actually rendering ask for a preview,
+                                // which is what makes the load lazy rather than eager.
+                                let thumbnail = view.thumbnail(&item, window, cx);
                                 Some(
                                     row.child(match icon {
                                         Some(path) => img(path).size(px(16.0)).into_any_element(),
@@ -366,6 +693,7 @@ impl Render for HistoryView {
                                         // column stays aligned (a normal state, not an error).
                                         None => div().size(px(16.0)).into_any_element(),
                                     })
+                                    .children(thumbnail)
                                     .child(
                                         div()
                                             .flex_1()
@@ -375,7 +703,7 @@ impl Render for HistoryView {
                                             .child(
                                                 div()
                                                     .text_xs()
-                                                    .text_color(theme.muted_foreground)
+                                                    .text_color(muted)
                                                     .truncate()
                                                     .child(meta),
                                             ),
@@ -385,11 +713,65 @@ impl Render for HistoryView {
                             .collect::<Vec<_>>()
                     },
                 )
-                .flex_1()
-                .into_any_element()
+                // Paging follows the user's scroll, like the old panel did, and the explicit
+                // button below stays for keyboards and for when the trigger has nothing left
+                // to fetch.
+                .track_scroll(&self.list_scroll)
+                .flex_1();
+
+                div()
+                    .v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(list)
+                    .children(self.state.has_more().then(|| self.load_more_button(theme, cx)))
+                    .into_any_element()
             } else {
                 self.render_empty(cx).into_any_element()
-            })
+            });
+
+        // Reading the scroll handle is the previous frame's layout, which is exactly what
+        // "the last rows are on screen" needs; the fetch itself is deferred so it cannot run
+        // inside this render (and no theme borrow is alive here).
+        if self.state.has_more() && !self.loading_more && self.near_the_end() {
+            cx.defer_in(window, |this, _window, cx| this.load_more(cx));
+        }
+        root
+    }
+}
+
+impl HistoryView {
+    /// Whether the list is within a few rows of the bottom.
+    fn near_the_end(&self) -> bool {
+        let content = self.list_scroll.content_size().height;
+        if content <= px(0.0) {
+            // Nothing has been laid out yet; the next frame can decide.
+            return false;
+        }
+        let viewport = self.list_scroll.bounds().size.height;
+        let offset = self.list_scroll.offset().y;
+        offset + viewport >= content - px(ROW_HEIGHT_PX * LOAD_MORE_THRESHOLD_ROWS)
+    }
+
+    fn load_more_button(&self, theme: &Theme, cx: &Context<Self>) -> AnyElement {
+        let button = div()
+            .id("history-load-more")
+            .w_full()
+            .py_2()
+            .h_flex()
+            .justify_center()
+            .border_t_1()
+            .border_color(theme.border)
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .on_click(cx.listener(|this, _, _, cx| this.load_more(cx)))
+            .child("加载更多");
+        #[cfg(feature = "test-support")]
+        let button = button
+            .role(gpui_kit::Role::Button)
+            .aria_label("加载更多")
+            .test_support();
+        button.into_any_element()
     }
 }
 

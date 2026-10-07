@@ -72,6 +72,10 @@ enum WriterRequest {
         kind: PayloadKind,
         response: mpsc::Sender<Result<Vec<u8>, StoreError>>,
     },
+    DeletePublication {
+        clip_id: String,
+        response: mpsc::Sender<Result<bool, StoreError>>,
+    },
 }
 
 
@@ -212,6 +216,16 @@ impl Store {
             kind,
             response,
         })
+    }
+
+    /// Remove one clip and everything only it was keeping alive.
+    ///
+    /// Returns whether a row was there to delete. The payload rows and their blobs are
+    /// pruned afterwards, because a payload is content-addressed: the same bytes may still
+    /// be referenced by another clip, and the store must not delete a file another row still
+    /// needs. (This is why the delete is not "just a row delete".)
+    pub fn delete_publication(&self, clip_id: String) -> Result<bool, StoreError> {
+        self.send_request(|response| WriterRequest::DeletePublication { clip_id, response })
     }
 
     /// Read-only OCR status (separate connection is fine for SELECT).
@@ -510,6 +524,9 @@ fn writer_loop(connection: Connection, blob_store: BlobStore, receiver: Receiver
                     kind,
                 ));
             }
+            WriterRequest::DeletePublication { clip_id, response } => {
+                let _ = response.send(delete_publication(&connection, &blob_store, &clip_id));
+            }
         }
     }
 }
@@ -746,6 +763,80 @@ mod tests {
         let dir = TestDir::new();
         let store = Store::open(&dir.0).unwrap();
         assert!(store.history_page(Some("bad cursor".into()), None).is_err());
+    }
+
+    #[test]
+    fn deleting_a_clip_removes_its_row_its_search_entry_and_its_unshared_blob() {
+        let dir = TestDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        let doomed = payload(PayloadKind::Text, b"doomed text", "doomed-text");
+        let kept = payload(PayloadKind::Text, b"kept text", "kept-text");
+        store
+            .save_publication(publication("doomed", 2, &[doomed]), vec![payload(PayloadKind::Text, b"doomed text", "doomed-text")])
+            .unwrap();
+        store
+            .save_publication(publication("kept", 1, &[kept]), vec![payload(PayloadKind::Text, b"kept text", "kept-text")])
+            .unwrap();
+
+        assert!(store.delete_publication("doomed".into()).unwrap());
+        // Deleting something that is already gone reports "nothing was there" rather than
+        // failing: the caller may be racing the other shell's delete.
+        assert!(!store.delete_publication("doomed".into()).unwrap());
+
+        let page = store.history_page(None, None).unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].id, "kept");
+        // The search index dropped the deleted row too, not just the table.
+        let search = store
+            .search_history_page("doomed".into(), None, None, None)
+            .unwrap();
+        assert!(search.items.is_empty());
+        let search = store
+            .search_history_page("kept".into(), None, None, None)
+            .unwrap();
+        assert_eq!(search.items.len(), 1);
+
+        let connection = Connection::open(dir.0.join("data/snapclip.db")).unwrap();
+        let payload_rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM payloads", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(payload_rows, 1, "the deleted clip's payload row is gone");
+        let blob_files = std::fs::read_dir(dir.0.join("payloads"))
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .flat_map(|entry| std::fs::read_dir(entry.path()).unwrap().flatten())
+            .count();
+        assert_eq!(blob_files, 1, "the deleted clip's bytes are gone");
+    }
+
+    #[test]
+    fn deleting_one_clip_keeps_bytes_another_clip_still_references() {
+        let dir = TestDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        // Two clips sharing the same image bytes (the store keys payloads by content hash).
+        for (id, time) in [("first", 2), ("second", 1)] {
+            let image = payload(PayloadKind::Image, b"shared image bytes", "shared-image");
+            store
+                .save_publication(
+                    publication(id, time, std::slice::from_ref(&image)),
+                    vec![image],
+                )
+                .unwrap();
+        }
+        assert!(store.delete_publication("first".into()).unwrap());
+
+        // The surviving row can still read its bytes: the payload row and the blob are
+        // content-addressed, so "delete" must prune, not blindly unlink.
+        let page = store.history_page(None, None).unwrap();
+        assert_eq!(page.items.len(), 1);
+        let hash = blake3::hash(b"shared image bytes").to_hex().to_string();
+        assert_eq!(
+            store
+                .read_payload_bytes(hash, PayloadKind::Image)
+                .unwrap(),
+            b"shared image bytes"
+        );
     }
 
     #[test]
