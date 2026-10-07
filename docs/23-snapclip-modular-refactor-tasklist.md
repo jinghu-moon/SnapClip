@@ -258,7 +258,7 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 | T3.4 | 资源对比 + 阶段验收 + tag `refactor-p3` | T3.3 | — | 低 | **暂缓（D2）** |
 | T4.1 + T4.1.1 | 开工前研读 + **前端功能迁移矩阵** | — | 1 表格 | 低 | [x]（guides 通读 + 矩阵填实；gpui-kit 0.7.1） |
 | T4.2 | `apps/snapclip` 骨架（init/Root/单窗口） | T4.1, T2.10（D2 解除了对 T3.4 的依赖） | ~5 文件 | 中 | [x]（包名 `snapclip-app`；构建 + 起窗 + 门禁全过） |
-| T4.3 | history 能力（Entity + 虚拟列表 + `ElementId`=clip id） | T4.2 | ~4 文件 | 高 | [ ] |
+| T4.3 | history 能力（Entity + 虚拟列表 + `ElementId`=clip id） | T4.2 | ~4 文件 | 高 | 部分 [x]（模型/图标/视图/接线已落地；分页、回车复制、删除确认、GPUI 级测试待续，见 §14.29） |
 | T4.4 | settings 能力（**新增**，不是迁移） | T4.3 | ~3 文件 | 中 | [ ] |
 | T4.4.1 | 两个窗口检测开关接成真实设置通道 | T4.4 | 3 文件 | 中 | [ ] |
 | T4.5 | 事件桥（`snapclip-model::AppEvent` + channel + 丢弃过期） | T4.3 | 2 文件 | 高 | [ ] |
@@ -1909,4 +1909,59 @@ T4.2（`apps/snapclip` 骨架）：
 提交 SHA：见提交
 推送/tag：origin/main
 回退对象：refactor-p2（5d72c2e）
+```
+
+### §14.29 T4.3 第一片：历史能力（模型 + 图标 + 视图 + 接线）
+
+```
+任务编号：T4.3（部分）
+状态：已验证 + 已推送
+分支：main
+前置提交/tag：d00057d（T4.2）
+规范研读（写界面前的硬要求）：读了 gpui-kit Design Guides 的 Design thesis、Start from the task、
+  Visual language、Components and composition、Interaction states、**Designing data-heavy
+  interfaces**、Interface language（含 Buttons and confirmation dialogs）、Accessibility checklist。
+  落实到的具体规则：行身份稳定、焦点/悬停/选中态可区分、**按域身份（clip id）而非行号做选中**、
+  集合虚拟化、空状态要说明下一步、颜色一律 `cx.theme()` 令牌、命令用 `Button`、不把关键操作做成
+  悬停才出现。
+新增文件（按能力组织，符合 Coding Guides 的目录规则）：
+  apps/snapclip/src/history/mod.rs     能力入口（model/view/icons 同处一个能力下）
+  apps/snapclip/src/history/model.rs   `HistoryState`：查询/选中/分页游标，纯逻辑
+  apps/snapclip/src/history/icons.rs   来源程序图标，**用 `win-icon-extractor`**
+  apps/snapclip/src/history/view.rs    `HistoryView`：搜索框 + `v_virtual_list` 虚拟列表 + 键盘路径
+  apps/snapclip/src/main.rs            接线：开真实历史库（`%LOCALAPPDATA%\com.seeyuer.snapclip`，
+                                        与 Tauri 宿主同一个库），失败时**优雅降级**成一句说明
+图标实现细节（按要求）：`IconCache::builder(dir).format(ImageFormat::Png).build()` +
+  `extract_to_file_sized(exe, 32)`，与 `src-tauri/src/icon.rs` 同一个 crate、同一个 32px 源尺寸
+  （16px 行里清晰）；差别只在交付形态——GPUI 的 `img()` 吃路径，所以给**缓存 PNG 的路径**，
+  不再走 webview 时代的 base64 data URL。来源未知/可执行文件已消失的行只保留占位宽度，
+  文本列不会错位（这是正常状态，不是错误）。
+真实 API（都从源码核对，不凭记忆）：`v_virtual_list(view, id, item_sizes, f)`（gpui-base）、
+  `Input::new(&Entity<InputState>)`、`gpui_kit::component::ActiveTheme`、`gpui_kit::base::StyledExt`。
+修改前测试：capture 344 / history 49 / 壳 8 / model 20 / app 0
+修改后测试：app **3 passed**（模型层：首行选中 + ↑↓ 按 id 移动；搜索无结果时无选中、清空后恢复；
+            同一查询不算变化）；capture 344 / history 49 / 壳 8 / model 20 不变；
+            `cargo check --workspace --all-targets` 0 warning；依赖方向门禁干净
+人工验证：`snapclip-app.exe` 启动后进程存活、无 stderr 输出、退出无残留（窗口内容需用户确认）
+失败与根因：一轮里 8 个编译错误，两类根因：
+  (1) 我把尚未接线的分页/访问器先写进了模型 → 触发 dead_code 警告（项目要求 0 warning）：
+      改为随滚动接入时再加，并把测试改用 `items().is_empty()`；
+  (2) **Rust 2024 的 `impl Trait` 捕获规则**：`render_row(&self, &item) -> impl IntoElement`
+      会把 `&self` 与 `&item` 一起捕获进返回类型，列表闭包立刻报 "captured variable cannot escape"。
+      根因解决：行构建**内联进 `v_virtual_list` 闭包**（那里有 `cx`，元素只拥有自己的数据），
+      而不是让一个借用 `self` 的辅助函数返回元素。
+T4.3 剩余（续做清单）：
+  1. 滚动到底时用 `next_cursor` 调 `load_more()`（模型的游标已经留着）；列表需要滚动句柄或
+     `List`/`ListState` 的加载回调；
+  2. `Enter` = 复制选中项到剪贴板（需要壳侧的剪贴板写入适配器，继承 `mark_clipboard_excluded`
+     语义——参考 `src-tauri/src/app/clipboard_writer.rs`）；
+  3. 删除：Design Guides 要求确认对话框"点名对象 + 动作"（`Delete "…"?` + `Delete` 按钮），
+     用 `window.open_alert_dialog(...)`；仓库里目前**没有**删除用例，需要先定后端语义；
+  4. GPUI 级测试：`#[gpui_kit::test]` + `VisualTestContext`（焦点/键盘/指针/布局）——
+     需要先读 `references/gpui/test.md` 并确认测试依赖与 feature 的装配方式；
+  5. 缩略图（图片型剪贴条目）懒加载 + OCR 状态徽标；
+  6. 可达性：主窗口目前仍然只有"能开"这一步（托盘/热键在 T4.6）。
+提交 SHA：见提交
+推送/tag：origin/main
+回退对象：d00057d
 ```

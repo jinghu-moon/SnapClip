@@ -15,26 +15,64 @@ use gpui_kit::base::StyledExt as _;
 use gpui_kit::component::{ActiveTheme, Root};
 use gpui_kit::*;
 
-/// The shell's root view. A placeholder until T4.3 gives it the history list.
-struct Shell;
+mod history;
+
+use history::icons::SourceIcons;
+use history::model::HistoryState;
+use history::view::HistoryView;
+
+/// The same database and cache directories the Tauri host writes while both shells exist
+/// (docs/23 T4.9: they share only the capability crates and the data).
+fn app_data_dir() -> std::path::PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("com.seeyuer.snapclip")
+}
+
+/// The shell's root view: the history screen, or the reason it could not open.
+///
+/// A shell that panics because a database file is busy is worse than one that says so, and
+/// the Tauri host may be holding the same file until P6 removes it.
+struct Shell {
+    history: Result<Entity<HistoryView>, String>,
+}
+
+impl Shell {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let data = app_data_dir();
+        let history = match HistoryState::open(&data) {
+            Ok(state) => match SourceIcons::new(data.join("icons")) {
+                Ok(icons) => Ok(cx.new(|cx| HistoryView::new(state, icons, window, cx))),
+                Err(error) => Err(format!("icons: {error}")),
+            },
+            Err(error) => Err(format!("history store: {error}")),
+        };
+        Self { history }
+    }
+}
 
 impl Render for Shell {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .v_flex()
-            .size_full()
-            .items_center()
-            .justify_center()
-            .gap_2()
-            .bg(cx.theme().background)
-            .text_color(cx.theme().foreground)
-            .child("SnapClip")
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("GPUI shell — the history list lands here (docs/23 T4.3)"),
-            )
+        match &self.history {
+            Ok(view) => view.clone().into_any_element(),
+            Err(reason) => div()
+                .v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .bg(cx.theme().background)
+                .text_color(cx.theme().foreground)
+                .child("Clipboard history is unavailable")
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(reason.clone()),
+                )
+                .into_any_element(),
+        }
     }
 }
 
@@ -47,7 +85,7 @@ fn main() {
 
             cx.spawn(async move |cx| {
                 cx.open_window(WindowOptions::default(), |window, cx| {
-                    let shell = cx.new(|_| Shell);
+                    let shell = cx.new(|cx| Shell::new(window, cx));
                     // `Root` is the window's first-level child; it owns overlays,
                     // notifications and modal focus restoration.
                     cx.new(|cx| Root::new(shell, window, cx))

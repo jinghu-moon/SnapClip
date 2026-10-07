@@ -14,3 +14,15 @@ publish = false
 # One dependency for the UI, as the Coding Guides require: GPUI itself is
 # `use gpui_kit::*;`, and the layers are gpui_kit::{component, base, assets, platform}.
 gpui-kit = "0.7"
+
+# Capability crates, not UI: the shell composes them and owns no feature logic of its own.
+snapclip-model = { path = "../../crates/snapclip-model" }
+snapclip-history = { path = "../../crates/snapclip-history" }
+
+# Source-app icons for history rows. Same crate, same 32px source size the Tauri host used
+# (`src-tauri/src/icon.rs`): 32px renders crisply in a 16px row.
+win-icon-extractor = { version = "0.3", default-features = false, features = ["png", "cache"] }
+
+[dev-dependencies]
+# Test-only: the model tests build payload references, which are keyed by a blake3 hash.
+blake3 = "1.5"

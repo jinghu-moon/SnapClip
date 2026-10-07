@@ -8401,7 +8401,11 @@ dependencies = [
 name = "snapclip-app"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "gpui-kit",
+ "snapclip-history",
+ "snapclip-model",
+ "win-icon-extractor",
 ]
 
 [[package]]
