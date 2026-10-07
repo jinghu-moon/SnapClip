@@ -28,8 +28,10 @@
 | 阶段 | 门禁组 | 命令（在仓库根执行，除非另注） |
 | --- | --- | --- |
 | G0 · 旧 Tauri 阶段（P0–P0.5，以及 P1 迁移期间） | 完整 | `cargo test --lib --manifest-path src-tauri/Cargo.toml`<br>`cargo check --all-targets --manifest-path src-tauri/Cargo.toml`（**T0.3 之前没有 workspace 根**，此时 `--workspace` 会直接报 "could not find Cargo.toml"；T0.3 之后改用 `cargo check --workspace --all-targets`）<br>探针（见下，同样带 `--manifest-path`） |
-| G1 · workspace / capture / history / recognize 阶段（P1 之后） | 完整 | `cargo test --workspace --all-targets`<br>`cargo check --workspace --all-targets`<br>探针改为按包跑：`cargo test -p snapclip-capture --lib browser_element_probe -- --ignored --nocapture`（Explorer 同理） |
-| G2 · GPUI 阶段（P4 之后） | 完整 | `cargo test --workspace --all-targets`<br>`cargo test -p snapclip`（壳的 `#[gpui_kit::test]` / `VisualTestContext`）<br>G1 的探针仍然要跑 |
+| G1 · workspace / capture / history / recognize 阶段（P1 之后） | 完整 | `cargo test --workspace --all-targets`<br>`cargo check --workspace --all-targets`<br>探针改为按包跑：`cargo test -p snapclip-capture --lib browser_element_probe -- --ignored --nocapture`（Explorer 同理）<br>**依赖方向门禁**：`powershell -NoProfile -ExecutionPolicy Bypass -File tools/check-dependency-direction.ps1`（T1.9 落地） |
+| G2 · GPUI 阶段（P4 之后） | 完整 | `cargo test --workspace --all-targets`<br>`cargo test -p snapclip`（壳的 `#[gpui_kit::test]` / `VisualTestContext`）<br>G1 的探针与依赖方向门禁仍然要跑 |
+
+依赖方向门禁的阴性对照（证明它会红，而不是永远绿）：`… -File tools/check-dependency-direction.ps1 -Package snapclip` 必须失败——壳确实依赖 `tauri`/`wry`/`rusqlite`/`arboard`。
 
 探针命令（**必须串行**，之间停 3 秒，避免互相抢焦点）：
 
@@ -225,11 +227,11 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 | T0.5.2 | OCR 事件出口改框架无关 trait | T0.5.1 | 4 文件 | 中（IPC 契约） | [x]（自动门禁全绿；真机 OCR 待人工） |
 | T0.5.3 | OCR 惰性启动 | T0.5.2 | 3 文件 | 中 | [x]（自动门禁 + 启动日志证据齐全） |
 | T0.5.4 | 记录资源基线（after）并对比 + tag `refactor-p05` | T0.5.3 | — | 低 | [x]（G0 全绿，tag 已推） |
-| T1.1 | `snapclip-capture` 骨架与依赖 | T0.5.4 | 2 文件 | 低 | [ ] |
-| T1.2 | 定义 capture 公共接缝（端口 + 无 pub 字段审查） | T1.1 | 3 文件 | 中 | [ ] |
-| T1.3 | 值对象迁入 `snapclip-model` | T1.2 | ~10 文件 | 中 | [ ] |
-| T1.4 | 迁移平台无关 capture（20 文件） | T1.3 | 10 686 行 | 中 | [ ] |
-| T1.5 | 迁移 Windows 实现（20 文件） | T1.4 | 18 256 行 | 高 | [ ] |
+| T1.1 | `snapclip-capture` 骨架与依赖 | T0.5.4 | 2 文件 | 低 | [x]（提交 9c62e17） |
+| T1.2 | 定义 capture 公共接缝（端口 + 无 pub 字段审查） | T1.1 | 3 文件 | 中 | [x]（`ports.rs`/`runtime.rs`，见 652afbb） |
+| T1.3 | 值对象迁入 `snapclip-model` | T1.2 | ~10 文件 | 中 | [x]（提交 9c62e17） |
+| T1.4 | 迁移平台无关 capture（20 文件） | T1.3 | 10 686 行 | 中 | [x]（提交 652afbb） |
+| T1.5 | 迁移 Windows 实现（20 文件） | T1.4 | 18 256 行 | 高 | [x]（提交 652afbb） |
 | T1.6.1 | 拆出 `overlay/window.rs` | T1.5 | — | 高 | [ ] |
 | T1.6.2 | 拆出 `overlay/input.rs` | T1.6.1 | — | 高 | [ ] |
 | T1.6.3 | 拆出 `overlay/state.rs` | T1.6.2 | — | 高 | [ ] |
@@ -237,7 +239,7 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 | T1.6.5 | 拆出 `overlay/window_restore.rs` + 组收尾 | T1.6.4 | 4 423 行（整组） | 高 | [ ] |
 | T1.7 | `uia_provider.rs` 测试搬家 | T1.5 | 3 338 行（测试 72%） | 中 | [ ] |
 | T1.8 | 拆 `d2d.rs`（4 pass + 文本） | T1.5 | 3 805 行 | 中 | [ ] |
-| T1.9 | 依赖方向与接缝门禁落地 | T1.5 | 1 脚本 | 低 | [ ] |
+| T1.9 | 依赖方向与接缝门禁落地 | T1.5 | 1 脚本 | 低 | [x]（`tools/check-dependency-direction.ps1`，正例绿/阴性对照红） |
 | T1.10 | 阶段验收 + tag `refactor-p1` | T1.6.1–T1.9 | — | 低 | [ ] |
 | T2.1 | `ArtifactRef`/`CaptureOutput` 在 `snapclip-model` 定死（**不建 crate**） | T1.10 | 2 文件 | 低 | [ ] |
 | T2.2 | `snapclip-history` 骨架 | T2.1 | 2 文件 | 低 | [ ] |
@@ -566,6 +568,11 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 - 动作：
   1. 加一个可执行检查（脚本或测试）：`cargo tree -p snapclip-capture -e normal | Select-String -Pattern "tauri|wry|gpui"` 必须为空；`snapclip-capture` 不得依赖 `snapclip-history`。
   2. 把该检查写进 §0.2 通用门禁（成为每步都要跑的门禁）。
+- **实测结果（2026-10-07，已完成）**：新增 `tools/check-dependency-direction.ps1`（与已有的 `tools/audit-design-tokens.mjs` 同族）。它做两件事：
+  - 对 `snapclip-capture`：`cargo tree -e normal` 里不得出现 `tauri` / `wry` / `gpui` / `gpui-kit` / `rusqlite` / `arboard` / `snapclip-history` / `snapclip-recognize`（当前 **30 个包**，干净）；
+  - 对 `snapclip-model`：只允许 serde 系（`serde`/`serde_core`/`serde_derive`/`serde_json` 及其 proc-macro 依赖），当前 **8 个包**，干净。
+  - **阴性对照**（证明门禁不是永远绿）：`-Package snapclip` 对壳跑，必须失败——实测报出 `snapclip depends on tauri / wry / rusqlite / arboard` 并 `exit 1` ✓。
+  - 已写进 §0.2 的 G1/G2 门禁行。
 - 必须保持：现有 403 测试全绿。
 - 验收：故意造一次违规（临时给 capture 加 tauri 依赖）→ 检查必须红；撤销后绿。
 - 回退：删除脚本。
@@ -1354,4 +1361,86 @@ P0.5 累计产出：T0.5.1（删转发层 + 清死代码链）、T0.5.2（OCR �
       T0.5.3（OCR 惰性启动）、T0.5.4（资源 after + tag）
 P0.5 期间的决策：D2（OCR/recognize 本轮暂缓，P4/P6 不再依赖 P3）
 下一阶段：P1（抽离 `snapclip-capture`，10 686 + 18 256 行，整次重构最大的单点）
+```
+
+### §14.13 T1.1 / T1.3：crate 骨架与捕获域值
+
+```
+任务编号：T1.1 + T1.3
+状态：已验证 + 已推送
+分支：main
+前置提交/tag：f61b5b2（P0.5 收尾）；回退基准 smart-snapping-v1-2026-10-07
+修改范围：新增 crates/snapclip-capture/{Cargo.toml,src/lib.rs}；
+          snapclip-model 新增 capture.rs、time.rs（后者属 T1.4）；domain/{capture,error}.rs 改转发
+修改前测试：405 passed / 0 failed / 6 ignored（壳）+ 14（model）
+修改后测试：403 passed / 0 failed / 6 ignored（壳；两个域测试随类型搬到 model）+ 14（model）
+性能指标：不涉及
+人工验证：不涉及
+失败与根因：1 次编译红——`snapclip-model/src/capture.rs` 用了裸 `Serialize, Deserialize` 派生但没
+          import。按本 crate 既有风格改成全限定 `serde::Serialize` 路径（与 geometry.rs 一致）。
+计划修正：docs/23 T1.3 说要迁 "ClipId/ArtifactId/SessionId/RecognitionTaskId" —— **这些类型不存在**，
+          本仓库的 id 一律是 `String`。如实记录，没有为了对上文档而发明类型。
+提交 SHA：9c62e17
+推送/tag：origin/main 已推送
+回退对象：f61b5b2
+```
+
+### §14.14 T1.2 / T1.4 / T1.5：整棵 capture 树搬进 `snapclip-capture`
+
+```
+任务编号：T1.2 + T1.4 + T1.5
+状态：已验证 + 已推送
+分支：main
+前置提交/tag：9c62e17；回退基准 smart-snapping-v1-2026-10-07
+修改范围：40 个文件 / ~29 000 行 `git mv`（保留历史）+ 路径机械重写；
+          src-tauri 侧留 3 个转发模块；新增 app/clipboard_writer.rs；
+          字体与探针 fixture 随代码迁移；subfont 两个脚本更新
+修改前测试：403（壳）+ 14（model）
+修改后测试（G1）：capture 345 passed / 0 failed / 6 ignored；壳 59 passed；model 14 passed
+                   cargo check --workspace --all-targets → 0 warning
+                   浏览器探针 41/41 · available=52 · finer=0（**真实运行**，见下）
+                   Explorer 探针 12/25 · 65.8 · 25/25 · finer=0
+                   A4 与字体子集门禁 → passed
+性能指标：不涉及（纯搬移；冷构建 ~1.5 min 一次性）
+人工验证：构建后在 target/debug 启动：`overlay ready hwnd=0x2f0684 thread=52364`、
+          `capture overlay ready 75ms`、`clipboard pipeline ready 84ms`、无残留进程
+失败与根因：5 类问题，全部是"搬移暴露出来的真实耦合/路径"，逐个根因解决：
+          (1) **探针假绿**：浏览器探针 fixture 仍相对 `CARGO_MANIFEST_DIR` 找 `src-tauri/tests/...`，
+              搬走后打印 "skipping" 却仍报 `test result: ok` —— 这是最危险的一种红。把
+              `tests/fixtures/` 一起搬进 crate 后真实运行（41/41，7.6s）。
+          (2) **capture 反向依赖 clipboard**：overlay 调 `clipboard_ingest::unix_time_ms`、
+              `mark_clipboard_excluded`，还直接用 `arboard`。前者收敛成 `snapclip-model::time`
+              的唯一实现（壳里 store 的第二份私有实现也删了），后者立成 `ports::ClipboardWriter`
+              端口，由壳的 `app/clipboard_writer.rs` 实现。
+          (3) **windows feature 靠别人顺带开**：`windows::Win32::System::LibraryLoader` 以前由别的
+              依赖间接启用；crate 现在显式声明它。
+          (4) **字体与 drawn-text 路径**：字体 include_bytes! 与 `write_drawn_text_for_the_font_subset`
+              的输出路径都随文件位置变化，已同步（并把字体移到 crate 的 `assets/`）。
+          (5) 测试模块需要 `serde_json`：按"仅测试需要"放进 `[dev-dependencies]`，没有污染运行期依赖。
+测试守恒核对：按静态 `#[test]` 计数逐文件对账——353 个搬入 crate，其中 2 个（需要真 PNG 编码器）
+          搬回壳，壳新增 1 个；结果 crate 351 静态（345 run + 6 ignored）、壳 60（59 run + 1 被
+          feature 关掉）、model 14。**没有任何测试在搬移中丢失**。
+提交 SHA：652afbb
+推送/tag：origin/main 已推送
+回退对象：9c62e17
+```
+
+### §14.15 T1.9 依赖方向门禁
+
+```
+任务编号：T1.9
+状态：已验证 + 已推送
+分支：main
+前置提交/tag：652afbb
+修改范围：新增 tools/check-dependency-direction.ps1；docs/23 §0.2 门禁行
+修改前测试：见 §14.14
+修改后测试：脚本正例 exit 0（capture 30 包 / model 8 包干净）；
+          阴性对照 `-Package snapclip` exit 1 并列出 tauri/wry/rusqlite/arboard
+性能指标：脚本 <2 s
+人工验证：不涉及
+失败与根因：首次正例误报 `snapclip-model depends on snapclip-model` —— `cargo tree` 第一行是包
+          自身而不是依赖，解析时漏排除了根包。修掉后正例通过。
+提交 SHA：待提交（与文档同一个提交）
+推送/tag：见提交
+回退对象：652afbb
 ```
