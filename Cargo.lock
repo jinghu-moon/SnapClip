@@ -8482,6 +8482,7 @@ dependencies = [
  "snapclip-history",
  "snapclip-model",
  "win-icon-extractor",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

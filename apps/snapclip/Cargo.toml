@@ -26,6 +26,18 @@ serde_json = "1"
 # implementation GPUI already links, so this adds a direct edge, not a second runtime.
 async-channel = "2.5"
 
+# The tray icon is Win32 (docs/23 T4.6): `gpui-kit` has no tray component, so the shell owns
+# a hidden window and `Shell_NotifyIconW` itself. Same major as `snapclip-capture` already
+# uses, so this adds no second copy of the bindings to the graph.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Threading",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
 # Source-app icons for history rows. Same crate, same 32px source size the Tauri host used
 # (`src-tauri/src/icon.rs`): 32px renders crisply in a 16px row.
 win-icon-extractor = { version = "0.3", default-features = false, features = ["png", "cache"] }

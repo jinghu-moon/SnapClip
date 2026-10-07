@@ -2329,6 +2329,51 @@ API 又一次"不凭记忆"救场：`Switch::new(...).checked(...).label(...).on
 回退对象：1fb3fa2
 ```
 
+### §14.42 T4.6 托盘（Win32 新建，并补上"窗口可达"缺口）
+
+```
+任务编号：T4.6
+状态：已完成并验证（真机图标创建/移除已在本机跑过一次）
+分支：main
+前置提交/tag：43dc2e7
+事实校正（先查再写）：`gpui-kit` 0.7.1 **没有托盘组件**（在 gpui-component/gpui-base/gpui-pre
+  三个源码树里 grep `tray|Shell_NotifyIcon` 只命中一处无关的触摸选择注释），所以这一片是
+  真写 Win32，不是"沿用"。
+改了什么：
+  1. `apps/snapclip/src/tray.rs`（新，约 320 行）：隐藏窗口（`WS_POPUP`，从不 Show）+ 独立
+     线程消息循环 + `Shell_NotifyIconW`。
+     - 菜单：`显示 / 隐藏窗口`、`退出 SnapClip`。**没有"截图"**：P4 期间 capture/overlay 仍属
+       Tauri 宿主进程，GPUI 壳里没有 overlay 可调；放一个按不出结果的菜单项是假功能，按
+       §11 的记账规则记在这里，等 P6 组合根搬迁后再加（连带"托盘热键"一起）。
+     - 线程只输出 `TrayCommand`（`ToggleWindow` / `Quit`）到 channel；**它不认识 GPUI**。
+     - 图标优先取本 exe 自己的图标（`ExtractIconExW`），失败退回系统默认图标。
+     - `Drop`/`shutdown()` 走 `PostThreadMessageW(WM_STOP_TRAY)` → `NIM_DELETE` → `DestroyWindow`
+       → join；可重复调用（第二次是空操作，不会二次 join 或二次删图标）。
+     - 上下文（channel sender）用 `GWLP_USERDATA` 挂在窗口上，`WM_DESTROY` 里唯一一次释放，
+       所以没有泄漏也没有 use-after-free 的双重所有权。
+  2. `apps/snapclip/src/lib.rs`：`Shell` 持有 `Option<Tray>`，`new` 里启动失败只记日志
+     （**降级，不是启动失败**：窗口本身还在）；`spawn_tray_commands` 用 `spawn_in` 把命令变成
+     窗口动作：窗口在前 → `minimize_window()`（Windows 语义下的"收起"），否则 `activate_window()`；
+     `Quit` → `cx.quit()`。
+  3. 依赖：`windows-sys 0.59`（与 `snapclip-capture` 同主版本，图里不新增第二份绑定）。
+验证：
+  - `cargo check -p snapclip-app --all-targets` → **0 warning**
+  - `cargo test -p snapclip-app --features test-support` → **29 lib + 4 UI**
+  - **真机**：`cargo test -p snapclip-app --lib -- --ignored` →
+    `tray::tests::the_icon_can_be_created_and_taken_away ... ok`（真的在通知区建了图标，
+    再移除，线程 join 返回；本机桌面会话实测，不是模拟）
+  - 纯逻辑单测：菜单 id → 命令映射（含"取消菜单 = 0 = 不是命令"）、提示字符串缓冲区始终
+    NUL 结尾且超长截断、宽字符串编码。
+未做/记账：
+  - 托盘菜单的**点击行为**只有真机可验（菜单是系统画的，测试栈点不到系统菜单）；
+    菜单 id → 命令 → 窗口动作这条链的每一段都有测试或真机证据，缺的是"系统菜单画出来"
+    这一步。请你真机点一次确认。
+  - 退出干净（无残留进程/线程）：`Drop` 会 join；真机上跑一次"托盘退出"即可确认。
+提交 SHA：见提交
+推送/tag：origin/main
+回退对象：43dc2e7
+```
+
 ### §14.39 T4.8 第一半：GPUI 壳 vs Tauri 宿主 + WebView2（debug 实测）
 
 ```

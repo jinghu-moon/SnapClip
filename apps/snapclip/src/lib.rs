@@ -21,6 +21,7 @@ pub mod clipboard;
 pub mod events;
 pub mod history;
 pub mod settings;
+pub mod tray;
 
 use history::icons::SourceIcons;
 use history::model::HistoryState;
@@ -47,6 +48,41 @@ fn nav_item(active: bool, accent: Hsla, border: Hsla, content: AnyElement) -> An
         .into_any_element()
 }
 
+/// Drain the tray's commands on the UI thread.
+///
+/// The tray thread never touches a window; this task is the only place a [`tray::TrayCommand`]
+/// becomes a window action. `spawn_in` is what makes that possible: the task can reach the
+/// window it was created from.
+fn spawn_tray_commands(
+    tray: &tray::Tray,
+    window: &mut Window,
+    cx: &mut Context<Shell>,
+) {
+    let commands = tray.commands();
+    cx.spawn_in(window, async move |shell, cx| {
+        while let Some(command) = commands.recv().await.ok() {
+            let acted = shell.update_in(cx, |_shell, window, cx| match command {
+                // Windows has no "hide a window" in GPUI's portable surface, and minimising is
+                // what a tray user means by "put it away": the taskbar button goes with it.
+                tray::TrayCommand::ToggleWindow => {
+                    if window.is_window_active() {
+                        window.minimize_window();
+                    } else {
+                        window.activate_window();
+                    }
+                    cx.notify();
+                }
+                tray::TrayCommand::Quit => cx.quit(),
+            });
+            if acted.is_err() {
+                // The shell is gone; there is nothing left to command.
+                break;
+            }
+        }
+    })
+    .detach();
+}
+
 /// The shell's root view: the history screen, or the reason it could not open.
 ///
 /// A shell that panics because a database file is busy is worse than one that says so, and
@@ -58,6 +94,9 @@ pub struct Shell {
     /// The shell's event channel. It is created here, at the composition root, and handed to
     /// whatever publishes (the capability adapters) and whatever listens (the screens).
     events: EventBus,
+    /// The notification-area icon. `None` when Windows refused it, which is a degraded shell
+    /// (no tray) rather than a failed start — the window is still there.
+    tray: Option<tray::Tray>,
 }
 
 /// Which capability the window is showing. A desktop shell keeps navigation persistent, so
@@ -84,11 +123,24 @@ impl Shell {
         // The settings page is independent of the store, so it exists even when history
         // cannot open — that is also how the user can see *why* something is wrong.
         let settings = cx.new(|_| settings::SettingsView::new(settings::SettingsStore::new(&data)));
+        // The shell's windows are reachable from here on: the tray is the entry point that
+        // T4.1.1 recorded as missing, and its commands arrive on their own thread.
+        let tray = match tray::Tray::start() {
+            Ok(tray) => {
+                spawn_tray_commands(&tray, window, cx);
+                Some(tray)
+            }
+            Err(error) => {
+                eprintln!("[snapclip-app] tray unavailable: {error}");
+                None
+            }
+        };
         Self {
             history,
             settings,
             page: Page::History,
             events,
+            tray,
         }
     }
 
@@ -96,6 +148,15 @@ impl Shell {
     /// and everything that publishes or listens on it gets it from here.
     pub fn events(&self) -> EventBus {
         self.events.clone()
+    }
+
+    /// The notification-area icon, when Windows accepted one.
+    ///
+    /// Read by whoever needs to know the shell has an entry point that is not the window
+    /// itself; holding the value is what keeps the icon alive, since dropping it removes the
+    /// icon and joins the message loop.
+    pub fn tray(&self) -> Option<&tray::Tray> {
+        self.tray.as_ref()
     }
 }
 impl Render for Shell {
