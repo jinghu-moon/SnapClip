@@ -972,6 +972,7 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 | 13 | 无障碍树断言做不到却被当硬门禁 | T4.7：先 spike；做不到就降级并写回 docs/22 §10.2，不要静默删门禁 |
 | 14 | **标注功能被静默丢弃**（决策 D1 的已接受让步） | T4.1.1 的 D1 写清了"不迁移 UI、保留 Rust 模型"；P6 删前端前必须核对 `snapclip-capture` 侧 `annotation.rs` 仍在，并**明确写进 P6 的提交消息** |
 | 15 | **把成员 lock 删掉让 cargo 重新解析 = 静默升级整棵依赖树**（T0.3 实测：40+ 个包被抬高，Tauri 自己的插件-版本检查当场报 Error） | 搬 workspace 时**要搬 lock，不要重新解析**：改完 `members` 后用 `cargo update -p <name> --precise <旧版本>` 逐个收复；同名多版本要用 `name@version` 精确 spec（见 §14.8）。收完后用"旧 lock vs 新 lock 的 `name@version` 集合差集"验证：差集里**只允许出现预期新增的 crate** |
+| 16 | **`git add -A` 把别人正在进行的工作一起提交**（T2.3 实测：`scripts/ocr-serve.ps1` 于 18:55 出现在工作区，被 `add -A` 扫进提交并推送） | 提交前先看 `git status --porcelain`：出现**不属于本任务**的 `??` / `M` 时**逐个文件 `git add <path>`**，不要用 `-A`/`-u`。已经误提交的用 `git rm --cached <path>` 恢复成未跟踪（文件保留在磁盘上），并在提交消息里说明 |
 
 ---
 
