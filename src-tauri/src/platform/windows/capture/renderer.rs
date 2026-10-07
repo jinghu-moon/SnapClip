@@ -61,6 +61,12 @@ pub struct OverlayFrameState {
     /// Whether the previewed box is the whole window rather than an element (docs/21 §5.21) — the
     /// renderer then uses a neutral wash and a thin outline instead of the accent preview.
     pub preview_is_window: bool,
+    /// How "walking" the level chain is right now, `0.0..=1.0` (docs/21 §5.24, A3).
+    ///
+    /// Drives the capture box's colour and wash: brand blue at rest, the capture green while the
+    /// walk is live. The box itself is identified by the mask hole, which the renderer derives from
+    /// `preview_bounds`/`selection`.
+    pub capture_green: f32,
     /// The level badge's (current, total), 1-based, while the walk is above the answer (docs/21 §5.22).
     pub level_badge: Option<(usize, usize)>,
     /// A one-shot hint in monitor-local coordinates (docs/21 §5.21): the level walk has to be
@@ -87,6 +93,7 @@ impl OverlayFrameState {
             chain_rings: Vec::new(),
             preview_label: None,
             preview_is_window: false,
+            capture_green: 0.0,
             level_badge: None,
             hint: None,
         }
@@ -222,6 +229,7 @@ impl Win32Renderer {
             chain_rings: state.chain_rings.clone(),
             preview_label: state.preview_label.clone(),
             preview_is_window: state.preview_is_window,
+            capture_green: state.capture_green,
             level_badge: state.level_badge,
             hint: state.hint.clone(),
         };
@@ -268,6 +276,9 @@ impl Win32Renderer {
             // …and so are the labels and the one-shot hint: an artifact never carries UI.
             preview_label: None,
             preview_is_window: false,
+            // An artifact carries no UI, so nothing may walk its colour either; the view built here
+            // has no preview anyway, and the mask hole is the exported selection.
+            capture_green: 0.0,
             level_badge: None,
             hint: None,
         };

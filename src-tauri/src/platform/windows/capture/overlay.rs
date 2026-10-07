@@ -538,6 +538,16 @@ where
     /// Quantised, and that is the point: each step is one full-surface repaint, so the fade costs at
     /// most eight of them however long the fade lasts (the prototype measured seven).
     chain_visibility: f32,
+    /// How green the capture box is (docs/21 §5.24, A3): rises while a walk is fresh, then fades back
+    /// to the brand blue on the same quantised envelope the chain uses.
+    walk_activity: f32,
+    /// When the last walk happened, and when the activity was last stepped.
+    ///
+    /// Two clocks because the two halves ask different questions: the rise is per elapsed time since
+    /// the previous step, the fall is per idle time since the walk — and `Instant` cannot be
+    /// subtracted from "now" twice and still give the step the first time it is asked.
+    walk_touched_at: Instant,
+    walk_stepped_at: Instant,
     /// Wheel deltas accumulating into level steps (v3 B2, docs/21 §5.24).
     wheel: WheelAccumulator,
     /// A shallower target waiting for its confirming dwell (docs/18 §13.3).
@@ -668,6 +678,9 @@ where
             hint_taught: false,
             chain_touched_at: Instant::now(),
             chain_visibility: 1.0,
+            walk_activity: 0.0,
+            walk_touched_at: Instant::now(),
+            walk_stepped_at: Instant::now(),
             wheel: WheelAccumulator::default(),
             pending_downgrade: None,
             refinement_pending: None,
@@ -792,6 +805,13 @@ where
             self.session_counter
         );
         self.session = CaptureSession::new(session_id);
+        // Per-session paint state starts clean: the previous session's walk colour (and the chain's
+        // visibility) must not be inherited by the next F5 (docs/21 §5.24, A3).
+        self.walk_activity = 0.0;
+        self.walk_touched_at = Instant::now();
+        self.walk_stepped_at = self.walk_touched_at;
+        self.chain_visibility = 1.0;
+        self.chain_touched_at = self.walk_touched_at;
         if let Err(error) = self.session.preparing() {
             eprintln!("[snapclip][capture] session preparing transition failed: {error}");
             self.fail(None, error, "none");
@@ -1195,6 +1215,7 @@ where
                 // …and neither a preview label nor the one-shot hint.
                 preview_label: None,
                 preview_is_window: false,
+                capture_green: 0.0,
                 level_badge: None,
                 hint: None,
             };
@@ -1632,6 +1653,63 @@ where
         self.chain_visibility > 0.0 && self.chain_visibility < 1.0
     }
 
+    /// A walk just happened: the capture box turns green (docs/21 §5.24, A3).
+    ///
+    /// Called for every walk attempt, including one that ends up pinned against the end of the
+    /// chain: the colour says "the wheel was used", and a notch that does nothing is exactly when
+    /// that needs saying.
+    fn touch_walk(&mut self) {
+        self.walk_touched_at = Instant::now();
+        self.walk_stepped_at = self.walk_touched_at;
+        self.invalidate();
+    }
+
+    /// Step the walk envelope; returns whether the painted value changed.
+    ///
+    /// Driven by the same coalescing render tick as the chain fade, for the same reason: the value
+    /// only moves at ~60 Hz at most, so a timer of its own would only add ways to be late.
+    fn advance_walk_activity(&mut self) -> bool {
+        if self.walk_activity <= 0.0 {
+            return false;
+        }
+        let now = Instant::now();
+        let step = now.duration_since(self.walk_stepped_at);
+        self.walk_stepped_at = now;
+        let activity = walk_activity_step(self.walk_activity, step, now - self.walk_touched_at);
+        if (activity - self.walk_activity).abs() < f32::EPSILON {
+            return false;
+        }
+        self.walk_activity = activity;
+        true
+    }
+
+    /// Whether the walk envelope has anything left to do (docs/21 §5.24).
+    ///
+    /// The two-part rule the chain fade uses (docs/21 §5.22): `running` is what keeps the render
+    /// tick alive while the value moves, and `pending` keeps *one* repaint alive so the 1.2 s hold
+    /// can be noticed at all — a resting cursor produces no other repaint.
+    fn walk_activity_running(&self) -> bool {
+        self.walk_activity > 0.0
+            && (self.walk_activity < 1.0
+                || self.walk_touched_at.elapsed().as_millis() as u64 >= CHAIN_FADE_AFTER_MS)
+    }
+
+    fn walk_activity_pending(&self) -> bool {
+        self.walk_activity > 0.0
+    }
+
+    /// How green to paint the capture box.
+    ///
+    /// The whole-window fallback gets none: it is the neutral answer, it has no capture colour to
+    /// lift, and the prototype keeps it grey. Everything else follows the walk (docs/21 §5.24, A3).
+    fn capture_box_green(&self) -> f32 {
+        if self.preview_is_window() {
+            0.0
+        } else {
+            self.walk_activity
+        }
+    }
+
     /// Step the deep-selection level: `-1` toward the window frame, `+1` toward the published box.
     ///
     /// Returns whether anything moved, so the wheel can decide whether to consume the event.
@@ -1639,6 +1717,15 @@ where
         if self.session.state() != CaptureState::Selecting {
             return false;
         }
+        // No answer, no box: nothing would show the colour, and arming the walk envelope for it
+        // would keep the render tick alive for a second of empty repaints.
+        if self.deep_target.is_none() {
+            return false;
+        }
+        // The walk is what the capture box's colour reports, so it is touched before the step is
+        // resolved: a notch against either end of the chain still says "the wheel was used"
+        // (docs/21 §5.24, A3).
+        self.touch_walk();
         let Some(deep) = self.deep_target.as_ref() else {
             return false;
         };
@@ -2133,6 +2220,10 @@ where
         // cursor produces no other repaint. One tick is enough to notice the deadline; from there
         // the render tick drives the fade itself (docs/21 §5.22).
         if self.chain_fade_pending() {
+            self.invalidate();
+        }
+        // …and the same for the capture box's walk colour: its 1.2 s hold is on the wall clock too.
+        if self.walk_activity_pending() {
             self.invalidate();
         }
         self.poll_refinement_timeout();
@@ -2979,12 +3070,19 @@ where
         if self.advance_chain_fade() {
             self.dirty = true;
         }
+        // …and the walk colour, which is the same kind of bounded ramp (docs/21 §5.24, A3).
+        if self.advance_walk_activity() {
+            self.dirty = true;
+        }
         if !self.dirty {
             return;
         }
         self.dirty = false;
         self.render();
-        if self.preview_transition.is_running(Instant::now()) || self.chain_fade_running() {
+        if self.preview_transition.is_running(Instant::now())
+            || self.chain_fade_running()
+            || self.walk_activity_running()
+        {
             // Schedule the next frame: the animation or the fade is still moving.
             self.invalidate();
         }
@@ -3008,6 +3106,7 @@ where
         // last precision decision, which are `self` reads.
         let preview_label = self.preview_label_text();
         let preview_is_window = self.preview_is_window();
+        let capture_green = self.capture_box_green();
         let level_badge = self.level_badge();
         let hint = self.hint_text();
         let Some(renderer) = self.renderer.as_mut() else {
@@ -3044,6 +3143,7 @@ where
             chain_rings,
             preview_label,
             preview_is_window,
+            capture_green,
             level_badge,
             hint,
         };
@@ -3334,7 +3434,6 @@ fn describe_rect(rect: Rect) -> String {
     format!("({},{})->({},{})", rect.left, rect.top, rect.right, rect.bottom)
 }
 
-/// The one-shot hint that explains the level walk (docs/21 §5.21).
 /// How long the chain stays fully visible after the last touch (docs/21 §5.22).
 ///
 /// Long enough to read the chain after a wheel notch, short enough that it does not sit over the
@@ -3346,19 +3445,50 @@ const CHAIN_FADE_MS: u64 = 240;
 /// Steps the fade is quantised into. Each step is a full-surface present, so this *is* the cost.
 const CHAIN_FADE_STEPS: u32 = 8;
 
-/// How visible the chain is, `idle` after the last touch (docs/21 §5.22).
+/// How long the capture box takes to turn green after a walk (docs/21 §5.24, A3).
 ///
-/// Pure so the shape is testable: flat at 1.0 while the chain has been touched recently, then a
-/// quantised ramp to 0. The quantisation is what bounds the fade's cost — the alternative, a
-/// per-frame alpha, would repaint ~15 times as often for a difference nobody can see.
-pub(crate) fn chain_visibility_at(idle: Duration) -> f32 {
+/// The prototype's 100 ms, which is about how long the preview box takes to ease onto a new level:
+/// a colour that jumped on the same frame as the notch would read as a glitch, and it has to have
+/// arrived by the time the box has.
+const WALK_RISE_MS: u64 = 100;
+
+/// The shared "flat, then a bounded ramp to nothing" envelope (docs/21 §5.22, §5.24).
+///
+/// Pure so the shape is testable: 1.0 while the event is recent, then a quantised ramp to 0. The
+/// quantisation is what bounds the cost — each distinct value is a full-surface present, so the
+/// number of steps *is* the price; a per-frame alpha would repaint ~15 times as often for a
+/// difference nobody can see.
+fn recent_activity_at(idle: Duration, hold_ms: u64, fade_ms: u64, steps: u32) -> f32 {
     let idle_ms = idle.as_millis() as u64;
-    if idle_ms < CHAIN_FADE_AFTER_MS {
+    if idle_ms < hold_ms {
         return 1.0;
     }
-    let through = (idle_ms - CHAIN_FADE_AFTER_MS) as f32 / CHAIN_FADE_MS as f32;
-    let remaining = (1.0 - through.clamp(0.0, 1.0)) * CHAIN_FADE_STEPS as f32;
-    (remaining.round() / CHAIN_FADE_STEPS as f32).clamp(0.0, 1.0)
+    let through = (idle_ms - hold_ms) as f32 / fade_ms as f32;
+    let remaining = (1.0 - through.clamp(0.0, 1.0)) * steps as f32;
+    (remaining.round() / steps as f32).clamp(0.0, 1.0)
+}
+
+/// How visible the chain is, `idle` after the last touch (docs/21 §5.22).
+pub(crate) fn chain_visibility_at(idle: Duration) -> f32 {
+    recent_activity_at(idle, CHAIN_FADE_AFTER_MS, CHAIN_FADE_MS, CHAIN_FADE_STEPS)
+}
+
+/// How green the capture box is, one `step` further along, `idle` after the last walk (§5.24, A3).
+///
+/// The same envelope as the chain fade — green means the same thing to the eye as the rings do,
+/// "you just moved this" — plus an attack: the rings are simply there at full strength when a walk
+/// lands, while the colour has to *arrive*, so it rises over [`WALK_RISE_MS`] instead of jumping.
+///
+/// Pure apart from the two durations it is handed, so the whole envelope — rise, hold, bounded
+/// fall — is testable without a window or a clock.
+fn walk_activity_step(current: f32, step: Duration, idle: Duration) -> f32 {
+    let envelope = recent_activity_at(idle, CHAIN_FADE_AFTER_MS, CHAIN_FADE_MS, CHAIN_FADE_STEPS);
+    if idle.as_millis() as u64 >= CHAIN_FADE_AFTER_MS {
+        // Past the hold: follow the quantised fall down, never back up.
+        return current.min(envelope).clamp(0.0, 1.0);
+    }
+    let risen = current + step.as_secs_f32() * 1000.0 / WALK_RISE_MS as f32;
+    risen.min(envelope).clamp(0.0, 1.0)
 }
 
 /// The one-shot hint that explains the level walk (docs/21 §5.21).
@@ -3719,8 +3849,9 @@ unsafe extern "system" {
 mod tests {
     use super::{
         CHAIN_FADE_AFTER_MS, CHAIN_FADE_MS, CHAIN_FADE_STEPS, OverlayCommand, WHEEL_IDLE_RESET_MS,
-        WHEEL_NOTCH_UNITS, WHEEL_SETTLE_MS, WHEEL_UNITS_PER_STEP, WheelAccumulator,
+        WALK_RISE_MS, WHEEL_NOTCH_UNITS, WHEEL_SETTLE_MS, WHEEL_UNITS_PER_STEP, WheelAccumulator,
         chain_visibility_at, level_hint, point_from_lparam, preview_label, should_teach,
+        walk_activity_step,
     };
     use crate::capture::geometry::Rect;
     use crate::capture::window_detection::LevelChain;
@@ -3963,5 +4094,75 @@ mod tests {
         let mut wheel = WheelAccumulator::default();
         assert_eq!(wheel.steps(WHEEL_UNITS_PER_STEP * 2 + 80, at(0)), 2);
         assert_eq!(wheel.steps(30, at(100)), 1, "the 80 left over were kept");
+    }
+
+    /// A3 (docs/21 §5.24): the capture box's colour rises in about a tenth of a second, holds for
+    /// the same 1.2 s the chain does, and then comes down on the same bounded ramp — never back up.
+    #[test]
+    fn the_walk_colour_rises_in_a_tenth_of_a_second_and_holds_for_one_point_two() {
+        use std::time::Duration;
+
+        // Rising: from nothing, 16 ms of ticks take about `WALK_RISE_MS` to arrive.
+        let mut activity = 0.0;
+        let mut elapsed = 0u64;
+        while activity < 1.0 && elapsed <= 200 {
+            activity =
+                walk_activity_step(activity, Duration::from_millis(16), Duration::from_millis(elapsed));
+            elapsed += 16;
+        }
+        assert_eq!(activity, 1.0, "the rise has to finish");
+        assert!(
+            (elapsed as i64 - WALK_RISE_MS as i64).abs() <= 32,
+            "the rise took {elapsed} ms, not {WALK_RISE_MS}"
+        );
+
+        // Holding: any idle inside the hold stays at full, including the deadline itself.
+        for ms in [0, 600, CHAIN_FADE_AFTER_MS] {
+            assert_eq!(
+                walk_activity_step(1.0, Duration::from_millis(16), Duration::from_millis(ms)),
+                1.0,
+                "the hold must not start before {CHAIN_FADE_AFTER_MS} ms"
+            );
+        }
+
+        // Falling: monotone, and it ends at the brand blue.
+        let mut previous = 1.0;
+        for ms in (CHAIN_FADE_AFTER_MS..=CHAIN_FADE_AFTER_MS + CHAIN_FADE_MS + 100).step_by(16) {
+            let next = walk_activity_step(
+                previous,
+                Duration::from_millis(16),
+                Duration::from_millis(ms),
+            );
+            assert!(
+                next <= previous,
+                "the colour rose during the fade: {previous} -> {next}"
+            );
+            previous = next;
+        }
+        assert_eq!(previous, 0.0);
+        // …and a value that lags behind the envelope is pulled down to it rather than left behind.
+        assert_eq!(
+            walk_activity_step(
+                1.0,
+                Duration::from_millis(16),
+                Duration::from_millis(CHAIN_FADE_AFTER_MS + CHAIN_FADE_MS)
+            ),
+            0.0
+        );
+
+        // The cost bound is the chain fade's: at most one distinct value per step, i.e. at most
+        // eight full-surface repaints for the walk colour coming down (docs/21 §5.22).
+        let sampled: std::collections::BTreeSet<u32> =
+            (0..=CHAIN_FADE_AFTER_MS + CHAIN_FADE_MS + 100)
+                .map(|ms| {
+                    (walk_activity_step(1.0, Duration::ZERO, Duration::from_millis(ms)) * 1000.0)
+                        as u32
+                })
+                .collect();
+        assert!(
+            sampled.len() as u32 <= CHAIN_FADE_STEPS + 1,
+            "the walk colour took {} distinct values",
+            sampled.len(),
+        );
     }
 }

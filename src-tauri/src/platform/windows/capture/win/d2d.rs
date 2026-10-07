@@ -255,6 +255,13 @@ pub struct RenderView {
     pub preview_label: Option<String>,
     /// The previewed box is the whole window rather than an element: neutral wash, thin outline.
     pub preview_is_window: bool,
+    /// How "walking" the level chain is right now, `0.0..=1.0` (docs/21 §5.24, A3).
+    ///
+    /// The capture green is a **walk signal**: at rest the box that would be taken is brand blue,
+    /// and it lifts towards the capture colour while the level walk is live. What identifies the box
+    /// itself is the mask hole ([`Self::mask_hole`]), so the colour is free to say "you moved"
+    /// instead of "this is the one".
+    pub capture_green: f32,
     /// The level badge's (current, total), 1-based (docs/21 §5.22); None while the answer
     /// itself is selected. Drawn as a dot strip, so it costs no text layout and no font glyphs.
     pub level_badge: Option<(usize, usize)>,
@@ -289,8 +296,31 @@ impl RenderView {
             chain_rings: Vec::new(),
             preview_label: None,
             preview_is_window: false,
+            capture_green: 0.0,
             level_badge: None,
             hint: None,
+        }
+    }
+
+    /// The region that stays at original brightness — the hole in the mask (docs/21 §5.24, A2).
+    ///
+    /// It is the box that would be **captured**, and only that: choosing a box means looking at its
+    /// content, and content seen through a 45% mask is not the content. Three cases, in order:
+    ///
+    /// * an element preview punches **its own** hole — the content of the box you are choosing must
+    ///   look like itself;
+    /// * the whole-window fallback punches nothing: its "box" is the screen, so a hole that size
+    ///   would erase the mask and the capture-mode reading with it (only the neutral wash and the
+    ///   thin outline mark it, docs/21 §5.21);
+    /// * with no preview at all the hole is the settled selection — exactly what it was before.
+    ///
+    /// Deriving it here rather than storing a second field keeps two invariants free: a preview
+    /// confirmed by a click turns into the selection and the hole follows it without a seam, and the
+    /// export path — which already clears `preview_bounds` — can never hand an artifact a hole.
+    pub fn mask_hole(&self) -> Rect {
+        match self.preview_bounds {
+            Some(preview) if !self.preview_is_window => preview,
+            _ => self.selection,
         }
     }
 }
@@ -329,6 +359,8 @@ pub struct OverlayRenderer {
     hover_fill_brush: Option<ID2D1SolidColorBrush>,
     /// Accent wash at low alpha — marks the automatic-snap preview.
     preview_fill_brush: Option<ID2D1SolidColorBrush>,
+    /// The preview's outline, mutable: it carries the walk signal (docs/21 §5.24, A3).
+    preview_stroke_brush: Option<ID2D1SolidColorBrush>,
     /// Capture green at full opacity — the outline of the box that will be captured (docs/21 §5.22).
     capture_brush: Option<ID2D1SolidColorBrush>,
     /// Mutable ring brush: the level chain, with each ring's own opacity set per frame.
@@ -415,6 +447,7 @@ impl OverlayRenderer {
             mask_brush: None,
             hover_fill_brush: None,
             preview_fill_brush: None,
+            preview_stroke_brush: None,
             capture_brush: None,
             chain_ring_brush: None,
             chain_shadow_brush: None,
@@ -675,29 +708,6 @@ impl OverlayRenderer {
     }
 
     fn draw_layers(&mut self, view: &RenderView) -> Result<(), String> {
-        // Fill the mask geometry — the frame, minus the selection hole — with `brush`. Four bands
-        // instead of re-drawing the frame inside the hole keeps the selected pixels at their
-        // original brightness; the same geometry is reused for the theme tint below.
-        fn fill_mask(
-            context: &ID2D1DeviceContext,
-            frame: Rect,
-            selection: Rect,
-            brush: &ID2D1SolidColorBrush,
-        ) {
-            unsafe {
-                if selection.is_empty() {
-                    context.FillRectangle(&to_d2d(frame), brush);
-                } else {
-                    let hole = selection.intersect(frame);
-                    for band in frame.surround(hole) {
-                        if band.is_empty() {
-                            continue;
-                        }
-                        context.FillRectangle(&to_d2d(band), brush);
-                    }
-                }
-            }
-        }
         let frame_bitmap = self.frame_bitmap.clone();
         let mask = self.require_brush(&self.mask_brush, "mask brush")?;
 
@@ -719,16 +729,20 @@ impl OverlayRenderer {
             }
         }
 
-        // L1: mask everything outside the selection. Using four bands (instead of
+        // L1: mask everything outside the hole. Using four bands (instead of
         // re-drawing the frame inside the hole) keeps the selected pixels at their
         // original brightness and lets a drag touch only the changed bands.
-        fill_mask(&self.d2d, view.frame, view.selection, &mask);
+        //
+        // The hole is the box that would be *taken* (docs/21 §5.24, A2), which during a hover is
+        // the previewed element rather than the settled selection — see `RenderView::mask_hole`.
+        let hole = view.mask_hole();
+        fill_outside(&self.d2d, view.frame, hole, &mask);
         // …and a trace of the theme colour on top of it (docs/21 §5.22). Black does the darkening;
         // the tint is only brand presence. The prototype measured why it stays small: at 30% the
         // screen shifts towards the rings' hue and a blue ring drops from 3.1:1 to 1.2–1.8:1,
         // while 10% costs almost nothing.
         if let Some(tint) = self.mask_tint_brush.clone() {
-            fill_mask(&self.d2d, view.frame, view.selection, &tint);
+            fill_outside(&self.d2d, view.frame, hole, &tint);
         }
 
         // L2: annotations (inside selection only, after mask, before chrome).
@@ -787,7 +801,6 @@ impl OverlayRenderer {
             return Ok(());
         }
         let border = self.require_brush(&self.border_brush, "border brush")?;
-        let capture = self.require_brush(&self.capture_brush, "capture brush")?;
         let width = self.metrics.border_width;
 
         // ── The level chain, in two passes around the washes (docs/21 §5.22) ──
@@ -807,7 +820,10 @@ impl OverlayRenderer {
             if !rect.is_empty() {
                 let fill = self.require_brush(&self.hover_fill_brush, "hover fill brush")?;
                 unsafe {
-                    self.d2d.FillRectangle(&to_d2d(rect), &fill);
+                    // The wash lifts the hovered window out of the mask — but not out of the *hole*:
+                    // the box that would be captured shows its own pixels, and a 10% white veil over
+                    // them would be exactly the veil that A2 exists to remove (docs/21 §5.24).
+                    fill_outside(&self.d2d, rect, view.mask_hole(), &fill);
                     self.d2d
                         .DrawRectangle(&to_d2d(rect), &border, width, None);
                 }
@@ -820,8 +836,11 @@ impl OverlayRenderer {
                 // A whole-window answer is the v1 fallback, not an element pick: it reads as the
                 // neutral hover wash with a thin outline, so "we could not get below the window" is
                 // visible instead of looking like a confident element preview (docs/21 §5.21).
-                // An element answer is the *capture*: the green that says "this is what you get",
-                // distinct from the blue that means "a level on the chain" (docs/21 §5.22).
+                //
+                // An element answer is the *capture*, and its colour is the walk signal (docs/21
+                // §5.24, A3): brand blue while the chain is at rest, lifting towards the capture
+                // green while the level walk is live, with a wash to match (none at rest — the mask
+                // hole already shows the content at its own brightness).
                 let (fill, stroke, stroke_width) = if view.preview_is_window {
                     (
                         self.require_brush(&self.hover_fill_brush, "hover fill brush")?,
@@ -829,9 +848,16 @@ impl OverlayRenderer {
                         width,
                     )
                 } else {
+                    let walking = view.capture_green.clamp(0.0, 1.0);
+                    let mix = self.require_brush(&self.preview_stroke_brush, "preview stroke brush")?;
+                    let fill = self.require_brush(&self.preview_fill_brush, "preview fill brush")?;
+                    unsafe {
+                        let _ = mix.SetColor(&capture_mix_color(walking));
+                        let _ = fill.SetColor(&capture_wash_color(walking));
+                    }
                     (
-                        self.require_brush(&self.preview_fill_brush, "preview fill brush")?,
-                        capture.clone(),
+                        fill,
+                        mix,
                         width * 2.0,
                     )
                 };
@@ -2054,8 +2080,8 @@ impl OverlayRenderer {
             MASK_RGB.2 * MASK_ALPHA,
             MASK_ALPHA,
         );
-        // Selection border and handle outline: #1f75db.
-        let accent = color(31.0 / 255.0, 117.0 / 255.0, 219.0 / 255.0, 1.0);
+        // Selection border and handle outline: `ACCENT_RGB`.
+        let accent = color(ACCENT_RGB.0, ACCENT_RGB.1, ACCENT_RGB.2, 1.0);
         let white = color(1.0, 1.0, 1.0, 1.0);
         let panel = color(0.09, 0.09, 0.11, 0.92);
         let crosshair = color(1.0, 0.75, 0.0, 0.95);
@@ -2070,15 +2096,18 @@ impl OverlayRenderer {
         // introduced (docs/14 §8).
         let hover_fill = color(1.0, 1.0, 1.0, 0.10);
         self.hover_fill_brush = Some(self.create_brush(&hover_fill)?);
-        // The preview is the *capture* (docs/21 §5.22): green wash + green outline, so the box that
-        // would be taken is one colour and the blue chain around it is another.
+        // The preview's wash and outline are *mutable*: at rest the box is brand blue with no wash,
+        // and both lift towards the capture green while the level walk is live (docs/21 §5.24, A3).
+        // The starting colours are the walking ones, so a frame drawn before anything sets them is
+        // never an invisible box.
         let preview_fill = color(
             CAPTURE_RGB.0,
             CAPTURE_RGB.1,
             CAPTURE_RGB.2,
-            0.18,
+            PREVIEW_WASH_ALPHA * PREVIEW_WASH_WALK_SCALE,
         );
         self.preview_fill_brush = Some(self.create_brush(&preview_fill)?);
+        self.preview_stroke_brush = Some(self.create_brush(&capture_mix_color(1.0))?);
         self.capture_brush = Some(self.create_brush(&color(
             CAPTURE_RGB.0,
             CAPTURE_RGB.1,
@@ -2189,6 +2218,7 @@ impl OverlayRenderer {
         self.border_brush = None;
         self.mask_brush = None;
         self.preview_fill_brush = None;
+        self.preview_stroke_brush = None;
         self.hover_fill_brush = None;
         self.capture_brush = None;
         self.chain_ring_brush = None;
@@ -2292,6 +2322,41 @@ fn capture_color(alpha: f32) -> D2D1_COLOR_F {
     )
 }
 
+/// The brand blue (`#1f75db`): selection chrome, the hovered window's outline, and the capture box
+/// while the level chain is at rest (docs/21 §5.24, A3).
+const ACCENT_RGB: (f32, f32, f32) = (31.0 / 255.0, 117.0 / 255.0, 219.0 / 255.0);
+
+/// The capture wash at **full walking**, before [`PREVIEW_WASH_WALK_SCALE`].
+///
+/// 18% is the alpha the palette was measured at (docs/21 §5.22): enough to identify the box without
+/// hiding the content it is about to take. A3 spends it on the walk instead — at rest the mask hole
+/// already shows the content at its own brightness, so the wash would only be a green cast on the
+/// pixels the user is trying to judge.
+const PREVIEW_WASH_ALPHA: f32 = 0.18;
+/// Walks get half the wash: a live box, not a filter over the content being chosen.
+const PREVIEW_WASH_WALK_SCALE: f32 = 0.5;
+
+/// The capture box's outline colour: brand blue at rest, the capture green while walking (A3).
+fn capture_mix_color(walking: f32) -> D2D1_COLOR_F {
+    let t = walking.clamp(0.0, 1.0);
+    color(
+        ACCENT_RGB.0 + (CAPTURE_RGB.0 - ACCENT_RGB.0) * t,
+        ACCENT_RGB.1 + (CAPTURE_RGB.1 - ACCENT_RGB.1) * t,
+        ACCENT_RGB.2 + (CAPTURE_RGB.2 - ACCENT_RGB.2) * t,
+        1.0,
+    )
+}
+
+/// The capture box's wash: nothing at rest, the capture green at half strength while walking.
+fn capture_wash_color(walking: f32) -> D2D1_COLOR_F {
+    color(
+        CAPTURE_RGB.0,
+        CAPTURE_RGB.1,
+        CAPTURE_RGB.2,
+        PREVIEW_WASH_ALPHA * PREVIEW_WASH_WALK_SCALE * walking.clamp(0.0, 1.0),
+    )
+}
+
 /// Build the point type Direct2D expects.
 fn vector2(x: f32, y: f32) -> Vector2 {
     Vector2 { X: x, Y: y }
@@ -2306,6 +2371,37 @@ fn to_d2d(rect: Rect) -> D2D_RECT_F {
     }
 }
 
+/// Fill `frame` with `brush`, leaving `hole` at whatever was underneath it.
+///
+/// Four bands instead of re-drawing the frame inside the hole: the pixels inside the hole keep their
+/// original brightness, and a drag only touches the bands that actually changed. The hole is what
+/// would be **captured** (docs/21 §5.24, A2), which is why the mask, the theme tint *and* the hover
+/// wash all go through here — a veil painted over the box would undo the point of the hole.
+fn fill_outside(
+    context: &ID2D1DeviceContext,
+    frame: Rect,
+    hole: Rect,
+    brush: &ID2D1SolidColorBrush,
+) {
+    unsafe {
+        if hole.is_empty() {
+            context.FillRectangle(&to_d2d(frame), brush);
+            return;
+        }
+        let hole = hole.intersect(frame);
+        if hole.is_empty() {
+            context.FillRectangle(&to_d2d(frame), brush);
+            return;
+        }
+        for band in frame.surround(hole) {
+            if band.is_empty() {
+                continue;
+            }
+            context.FillRectangle(&to_d2d(band), brush);
+        }
+    }
+}
+
 fn to_wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -2313,8 +2409,9 @@ fn to_wide(value: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChainRingView, MASK_ALPHA, MASK_TINT_ALPHA, OverlayRenderer, RenderMetrics, RenderView,
-        to_d2d,
+        ACCENT_RGB, CAPTURE_RGB, ChainRingView, MASK_ALPHA, MASK_TINT_ALPHA, OverlayRenderer,
+        PREVIEW_WASH_ALPHA, PREVIEW_WASH_WALK_SCALE, RenderMetrics, RenderView, capture_mix_color,
+        capture_wash_color, to_d2d,
     };
     use crate::capture::annotation::{
         AnnotationGeometry, AnnotationItem, AnnotationKind, AnnotationStyle,
@@ -2737,8 +2834,10 @@ mod tests {
         //
         // The measurable consequence of the order: with the wash on, the ring's own pixels stay
         // (nearly) unchanged, because nothing is painted over them. Painted underneath, the wash
-        // would tint every ring pixel. So draw the same inner ring twice — bare, then under the wash
-        // — and compare the ring's own brightest pixel.
+        // would tint every ring pixel. So draw the same inner ring twice — wash off, wash on — and
+        // compare the ring's own brightest pixel. Everything else is held constant, so the wash is
+        // the only difference between the two frames (docs/21 §5.24, A3: it exists only while the
+        // walk is live, which is exactly what `capture_green` carries).
         let inner = Rect::new(12, 12, 36, 28);
         view.hover_bounds = None;
         view.chain_rings = vec![ChainRingView {
@@ -2752,11 +2851,12 @@ mod tests {
                 .max_by_key(|pixel| pixel[0] as i32 + pixel[1] as i32 + pixel[2] as i32)
                 .unwrap()
         };
-        view.preview_bounds = None;
+        view.preview_bounds = Some(window);
+        view.capture_green = 0.0;
         renderer.draw_to(&bitmap, &view).unwrap();
         let bare = renderer.device().read_back_bgra(&target.texture).unwrap();
         let bare_ring = brightest(&bare);
-        view.preview_bounds = Some(window);
+        view.capture_green = 1.0;
         renderer.draw_to(&bitmap, &view).unwrap();
         let with_wash = renderer.device().read_back_bgra(&target.texture).unwrap();
         let washed_ring = brightest(&with_wash);
@@ -2775,8 +2875,12 @@ mod tests {
         );
 
         // Exporting the previewed rectangle must produce raw frozen pixels: a hint is a
-        // hint, and it must never reach the artifact.
+        // hint, and it must never reach the artifact. The preview here is deliberately *not* the
+        // exported rectangle, so the mask hole (docs/21 §5.24, A2) cannot be what saves it — the
+        // export path has to clear the hint, and with it the hole.
         view.hover_bounds = Some(window);
+        view.preview_bounds = Some(Rect::new(4, 4, 44, 36));
+        view.capture_green = 1.0;
         view.selection = window;
         let exported = renderer.render_export(&view).unwrap();
         assert_eq!(exported.len(), (window.width() * window.height() * 4) as usize);
@@ -2788,7 +2892,318 @@ mod tests {
         );
     }
 
-    /// The size label is painted with an opaque panel above the selection when there is room.
+    /// A2 (docs/21 §5.24): the box that would be taken shows its own pixels — no mask, no tint —
+    /// and the whole-window fallback does not, because its "box" is the screen.
+    #[test]
+    fn an_element_preview_keeps_its_own_pixels_and_the_window_fallback_does_not() {
+        let Ok(device) = super::GraphicsDevice::create() else {
+            return;
+        };
+        let width = 96u32;
+        let height = 64u32;
+        let background = [210u8, 200, 190, 255];
+        let Ok(mut renderer) = OverlayRenderer::new(std::sync::Arc::new(device), 96) else {
+            return;
+        };
+        renderer
+            .update_frame(width, height, &solid_bgra(width, height, background))
+            .unwrap();
+        renderer.ensure_back_buffer(width, height).unwrap();
+        let target = renderer
+            .device()
+            .create_render_target_texture(width, height)
+            .unwrap();
+        let d2d_context = renderer.device().create_d2d_context().unwrap();
+        let bitmap = super::super::d3d11::create_bitmap_from_texture(
+            &d2d_context,
+            &target.texture,
+            D2D1_BITMAP_OPTIONS_TARGET,
+            D2D1_ALPHA_MODE_PREMULTIPLIED,
+        )
+        .unwrap();
+
+        let mut view = RenderView::new(Rect::from_origin_size(
+            Point::new(0, 0),
+            width as i32,
+            height as i32,
+        ));
+        view.cursor_visible = false;
+        let element = Rect::new(20, 16, 70, 48);
+
+        // Baseline: no hint at all, so the whole frame is masked down.
+        renderer.draw_to(&bitmap, &view).unwrap();
+        let bare = renderer.device().read_back_bgra(&target.texture).unwrap();
+        let masked = pixel_at(&bare, width, 40, 30);
+        let masked_corner = pixel_at(&bare, width, 8, 8);
+
+        // An element preview: the content inside it is the frozen frame's own pixel, and the pixels
+        // outside it are exactly the ones the bare frame had — the hole moves nothing else.
+        view.preview_bounds = Some(element);
+        renderer.draw_to(&bitmap, &view).unwrap();
+        let previewed = renderer.device().read_back_bgra(&target.texture).unwrap();
+        assert_eq!(
+            pixel_at(&previewed, width, 40, 30),
+            background,
+            "an element preview must show its own pixels"
+        );
+        assert_eq!(
+            pixel_at(&previewed, width, 8, 8),
+            masked_corner,
+            "the mask outside the box must be untouched"
+        );
+        assert_ne!(
+            pixel_at(&previewed, width, 40, 30),
+            masked,
+            "…which is the whole point: the box you are choosing is not a darkened picture of itself"
+        );
+
+        // …and a box inside a hovered window keeps its own pixels too: the hover wash is cut around
+        // the same hole. It lifts the hovered window out of the mask; it must not veil the pixels
+        // that are about to be taken, which is the whole reason the hole exists.
+        let hover = Rect::new(4, 4, 88, 60);
+        view.hover_bounds = Some(hover);
+        renderer.draw_to(&bitmap, &view).unwrap();
+        let hovered = renderer.device().read_back_bgra(&target.texture).unwrap();
+        assert_eq!(
+            pixel_at(&hovered, width, 40, 30),
+            background,
+            "the hole has to survive the hover wash"
+        );
+        assert_ne!(
+            pixel_at(&hovered, width, 8, 8),
+            masked_corner,
+            "…while the rest of the hovered window is still washed"
+        );
+
+        // The whole-window fallback is the neutral answer: same rectangle, no hole, and it reads as
+        // the hover wash with a thin outline. A hole the size of the window would erase the mask,
+        // and with it the reading that capture mode is on.
+        view.preview_is_window = true;
+        renderer.draw_to(&bitmap, &view).unwrap();
+        let fallback = renderer.device().read_back_bgra(&target.texture).unwrap();
+        let fallback_pixel = pixel_at(&fallback, width, 40, 30);
+        assert_ne!(
+            fallback_pixel, background,
+            "the whole-window fallback must not punch a hole in the mask"
+        );
+        // …and it is a *wash over the mask* rather than the raw pixels — the neutral answer lights
+        // the box the way the hovered window is lit (one wash stronger, since the hover fills the
+        // same rectangle).
+        assert!(
+            (0..3).all(|c| fallback_pixel[c] > masked[c]),
+            "the fallback has to read as a wash over the mask: {fallback_pixel:?} vs {masked:?}"
+        );
+
+        // …and with no preview at all the hole is the settled selection, exactly as before.
+        view.preview_is_window = false;
+        view.hover_bounds = None;
+        view.preview_bounds = None;
+        view.selection = element;
+        renderer.draw_to(&bitmap, &view).unwrap();
+        let selected = renderer.device().read_back_bgra(&target.texture).unwrap();
+        assert_eq!(pixel_at(&selected, width, 40, 30), background);
+    }
+
+    /// A3 (docs/21 §5.24): the capture box is brand blue with no wash at rest, and the capture green
+    /// with a wash while the level walk is live — the colour says "you moved", not "this is the one".
+    #[test]
+    fn the_capture_box_is_blue_at_rest_and_green_while_walking() {
+        // The two ends are the palette entries themselves, so the box's colour cannot drift away
+        // from the brushes the rest of the overlay uses.
+        let rest = capture_mix_color(0.0);
+        let walking = capture_mix_color(1.0);
+        assert!(
+            (rest.r - ACCENT_RGB.0).abs() < 1e-6 && (rest.b - ACCENT_RGB.2).abs() < 1e-6,
+            "at rest the box is the brand blue"
+        );
+        assert!(
+            (walking.r - CAPTURE_RGB.0).abs() < 1e-6
+                && (walking.g - CAPTURE_RGB.1).abs() < 1e-6,
+            "walking the box is the capture green"
+        );
+        // Nothing is washed at rest: the hole already shows the content at its own brightness, and a
+        // wash on top of it would only tint the pixels the user is trying to judge.
+        assert_eq!(capture_wash_color(0.0).a, 0.0);
+        assert!(
+            (capture_wash_color(1.0).a - PREVIEW_WASH_ALPHA * PREVIEW_WASH_WALK_SCALE).abs() < 1e-6
+        );
+
+        let Ok(device) = super::GraphicsDevice::create() else {
+            return;
+        };
+        let width = 96u32;
+        let height = 64u32;
+        let background = [128u8, 128, 128, 255];
+        let Ok(mut renderer) = OverlayRenderer::new(std::sync::Arc::new(device), 96) else {
+            return;
+        };
+        renderer
+            .update_frame(width, height, &solid_bgra(width, height, background))
+            .unwrap();
+        renderer.ensure_back_buffer(width, height).unwrap();
+        let target = renderer
+            .device()
+            .create_render_target_texture(width, height)
+            .unwrap();
+        let d2d_context = renderer.device().create_d2d_context().unwrap();
+        let bitmap = super::super::d3d11::create_bitmap_from_texture(
+            &d2d_context,
+            &target.texture,
+            D2D1_BITMAP_OPTIONS_TARGET,
+            D2D1_ALPHA_MODE_PREMULTIPLIED,
+        )
+        .unwrap();
+
+        let mut view = RenderView::new(Rect::from_origin_size(
+            Point::new(0, 0),
+            width as i32,
+            height as i32,
+        ));
+        view.cursor_visible = false;
+        view.hover_bounds = None;
+        view.preview_bounds = Some(Rect::new(20, 16, 70, 48));
+
+        // The stroke's own pixel: the column crosses the box's top edge, and the most covered pixel
+        // is the one furthest from the content behind it. Anti-aliasing means no pixel is exactly
+        // the brush colour, so the assertion is which of the two ends it is nearer to.
+        let stroke_sample = |pixels: &[u8]| {
+            (14..24)
+                .map(|y| pixel_at(pixels, width, 48, y))
+                .max_by_key(|pixel| {
+                    (0..3)
+                        .map(|c| (pixel[c] as i32 - background[c] as i32).abs())
+                        .sum::<i32>()
+                })
+                .unwrap()
+        };
+        let distance_to = |pixel: [u8; 4], rgb: (f32, f32, f32)| {
+            // Readback is BGRA; the palette is RGB.
+            let want = [
+                (rgb.2 * 255.0).round() as i32,
+                (rgb.1 * 255.0).round() as i32,
+                (rgb.0 * 255.0).round() as i32,
+            ];
+            (0..3)
+                .map(|c| (pixel[c] as i32 - want[c]).abs())
+                .sum::<i32>()
+        };
+
+        view.capture_green = 0.0;
+        renderer.draw_to(&bitmap, &view).unwrap();
+        let at_rest = renderer.device().read_back_bgra(&target.texture).unwrap();
+        let rest_stroke = stroke_sample(&at_rest);
+        view.capture_green = 1.0;
+        renderer.draw_to(&bitmap, &view).unwrap();
+        let walking_frame = renderer.device().read_back_bgra(&target.texture).unwrap();
+        let walking_stroke = stroke_sample(&walking_frame);
+
+        assert_ne!(rest_stroke, walking_stroke, "the walk must change the box");
+        assert!(
+            distance_to(rest_stroke, ACCENT_RGB) < distance_to(rest_stroke, CAPTURE_RGB),
+            "at rest the box is the brand blue: {rest_stroke:?}"
+        );
+        assert!(
+            distance_to(walking_stroke, CAPTURE_RGB) < distance_to(walking_stroke, ACCENT_RGB),
+            "walking the box is the capture green: {walking_stroke:?}"
+        );
+    }
+
+    /// A3's cost, measured rather than argued (docs/21 §5.24): at rest the capture box is the brand
+    /// blue, so on light and dark content the box reads by *luminance* and on a mid grey only by hue.
+    ///
+    /// The hole is the primary cue either way — the whole box is 45% brighter than the mask around it
+    /// — but the stroke has to be a line, not a rumour. Light and dark are gated; the mid case is
+    /// printed, because no single blue can be a luminance step against a background of its own
+    /// brightness and pretending otherwise would just move the failure somewhere else.
+    #[test]
+    fn the_resting_capture_box_is_a_luminance_step_on_light_and_dark_content() {
+        let relative_luminance = |pixel: [u8; 4]| -> f32 {
+            // Readback is BGRA.
+            let channel = |value: u8| {
+                let value = value as f32 / 255.0;
+                if value <= 0.04045 {
+                    value / 12.92
+                } else {
+                    ((value + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * channel(pixel[2]) + 0.7152 * channel(pixel[1]) + 0.0722 * channel(pixel[0])
+        };
+        let ratio = |a: [u8; 4], b: [u8; 4]| {
+            let (high, low) = {
+                let (a, b) = (relative_luminance(a), relative_luminance(b));
+                if a > b { (a, b) } else { (b, a) }
+            };
+            (high + 0.05) / (low + 0.05)
+        };
+
+        for (name, background, gated) in [
+            ("light", [250u8, 250, 250, 255], true),
+            ("mid", [128, 128, 128, 255], false),
+            ("dark", [24, 24, 28, 255], true),
+        ] {
+            let Ok(device) = super::GraphicsDevice::create() else {
+                return;
+            };
+            let width = 96u32;
+            let height = 64u32;
+            let Ok(mut renderer) = OverlayRenderer::new(std::sync::Arc::new(device), 96) else {
+                return;
+            };
+            renderer
+                .update_frame(width, height, &solid_bgra(width, height, background))
+                .unwrap();
+            renderer.ensure_back_buffer(width, height).unwrap();
+            let target = renderer
+                .device()
+                .create_render_target_texture(width, height)
+                .unwrap();
+            let d2d_context = renderer.device().create_d2d_context().unwrap();
+            let bitmap = super::super::d3d11::create_bitmap_from_texture(
+                &d2d_context,
+                &target.texture,
+                D2D1_BITMAP_OPTIONS_TARGET,
+                D2D1_ALPHA_MODE_PREMULTIPLIED,
+            )
+            .unwrap();
+
+            let mut view = RenderView::new(Rect::from_origin_size(
+                Point::new(0, 0),
+                width as i32,
+                height as i32,
+            ));
+            view.cursor_visible = false;
+            // The real situation: the box is inside a hovered window, so the pixels *outside* the
+            // hole are masked and washed while the pixels inside it are the frame's own.
+            view.hover_bounds = Some(Rect::new(4, 4, 88, 60));
+            view.preview_bounds = Some(Rect::new(20, 16, 70, 48));
+            view.capture_green = 0.0;
+            renderer.draw_to(&bitmap, &view).unwrap();
+            let pixels = renderer.device().read_back_bgra(&target.texture).unwrap();
+
+            let inside = pixel_at(&pixels, width, 48, 30);
+            let outside = pixel_at(&pixels, width, 48, 8);
+            // The column crosses the box's top edge; the stroke is anti-aliased across a couple of
+            // rows, and what the eye uses is whichever side of it is stronger.
+            let best = (12..24)
+                .map(|y| {
+                    let pixel = pixel_at(&pixels, width, 48, y);
+                    ratio(pixel, inside).max(ratio(pixel, outside))
+                })
+                .fold(0.0, f32::max);
+            eprintln!(
+                "[capture box] {name}: stroke peaks at {best:.2}:1 (content {inside:?} / mask \
+                 {outside:?})"
+            );
+            if gated {
+                assert!(
+                    best >= 2.5,
+                    "at rest the capture box peaks at {best:.2}:1 on {name} content",
+                );
+            }
+        }
+    }
+
     /// The level badge is a dot strip, and this is the check that caught every version of it that
     /// read wrong in the prototype: scan the strip's centre row and count the marks — five solid
     /// (the levels behind you), one green (the one you are on), three hollow (the ones still
@@ -2875,7 +3290,6 @@ mod tests {
         );
     }
 
-    /// The size label is painted with an opaque panel above the selection when there is room.
     /// The regression the user found on a real screen: a mid-tone blue ring on a **masked light**
     /// page. The mask (45% black) lands a white page at ~140 grey, whose luminance is nearly that of
     /// a mid blue — so the first ring colour differed in hue and not in brightness and could not be
