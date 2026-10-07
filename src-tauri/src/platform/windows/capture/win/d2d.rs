@@ -50,6 +50,13 @@ use ::windows::core::{Interface, PCWSTR};
 
 use super::d3d11::GraphicsDevice;
 use crate::capture::annotation::{AnnotationGeometry, AnnotationItem, AnnotationKind};
+// The palette and the light-math live in one place: the paint layer and the A4 ring decision read
+// the same constants, so a re-measured mask or wash cannot leave the table describing a world that
+// is no longer painted (docs/21 §5.24.11).
+use crate::capture::ring_contrast::{
+    ACCENT_RGB, CAPTURE_RGB, CHAIN_RING_RGB, CHAIN_RING_SHADOW, HOVER_WASH_ALPHA, MASK_ALPHA,
+    MASK_RGB, MASK_TINT_ALPHA, PREVIEW_WASH_ALPHA, PREVIEW_WASH_WALK_SCALE, Rgb, mix,
+};
 use crate::capture::geometry::{
     Handle, LevelReach, MagnifierConfig, Point, Rect, SizeLabelPlacement,
 };
@@ -122,16 +129,6 @@ const INFO_HINT_ITEM_GAP_DIP: f32 = 16.0;
 const INFO_KBD_ROW_GAP_DIP: f32 = 8.0;
 /// Gap between the colour/coordinate line and the kbd grid below it.
 const INFO_KBD_BLOCK_GAP_DIP: f32 = 12.0;
-
-/// Mask colour (opaque black at 45% opacity). Configurable in one place so the
-/// light/dark-background acceptance can be re-run with a different value.
-pub const MASK_ALPHA: f32 = 0.45;
-/// How much of the theme colour is laid over the neutral mask (docs/21 §5.22).
-///
-/// Deliberately small: the prototype measured a 30% blue tint pushing the background towards the
-/// rings' hue and dropping a blue ring from 3.1:1 to 1.2–1.8:1, while 10% costs almost nothing.
-pub const MASK_TINT_ALPHA: f32 = 0.10;
-pub const MASK_RGB: (f32, f32, f32) = (0.0, 0.0, 0.0);
 
 /// Sizes the renderer needs, all in physical pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2060,14 +2057,16 @@ impl OverlayRenderer {
     }
 
     fn recreate_resources(&mut self) -> Result<(), String> {
+        // Premultiplied like a D2D brush wants it: the mask is black at 45 %.
+        let (mask_r, mask_g, mask_b) = MASK_RGB.channels_f32();
         let mask = color(
-            MASK_RGB.0 * MASK_ALPHA,
-            MASK_RGB.1 * MASK_ALPHA,
-            MASK_RGB.2 * MASK_ALPHA,
+            mask_r * MASK_ALPHA,
+            mask_g * MASK_ALPHA,
+            mask_b * MASK_ALPHA,
             MASK_ALPHA,
         );
         // Selection border and handle outline: `ACCENT_RGB`.
-        let accent = color(ACCENT_RGB.0, ACCENT_RGB.1, ACCENT_RGB.2, 1.0);
+        let accent = color_of(ACCENT_RGB, 1.0);
         let white = color(1.0, 1.0, 1.0, 1.0);
         let panel = color(0.09, 0.09, 0.11, 0.92);
         let crosshair = color(1.0, 0.75, 0.0, 0.95);
@@ -2080,16 +2079,16 @@ impl OverlayRenderer {
         // Window-snap hints reuse the existing palette: a neutral wash for the hovered
         // window and a low-alpha accent wash for the preview, so no new colour is
         // introduced (docs/14 §8).
-        let hover_fill = color(1.0, 1.0, 1.0, 0.10);
+        // The hover veil's alpha is part of the A4 stack (it is what the outer rings sit under), so
+        // it comes from the shared palette too.
+        let hover_fill = color_of(Rgb::new(255, 255, 255), HOVER_WASH_ALPHA);
         self.hover_fill_brush = Some(self.create_brush(&hover_fill)?);
         // The preview's wash and outline are *mutable*: at rest the box is brand blue with no wash,
         // and both lift towards the capture green while the level walk is live (docs/21 §5.24, A3).
         // The starting colours are the walking ones, so a frame drawn before anything sets them is
         // never an invisible box.
-        let preview_fill = color(
-            CAPTURE_RGB.0,
-            CAPTURE_RGB.1,
-            CAPTURE_RGB.2,
+        let preview_fill = color_of(
+            CAPTURE_RGB,
             PREVIEW_WASH_ALPHA * PREVIEW_WASH_WALK_SCALE,
         );
         self.preview_fill_brush = Some(self.create_brush(&preview_fill)?);
@@ -2104,12 +2103,7 @@ impl OverlayRenderer {
             219.0 / 255.0,
             0.28,
         ))?);
-        self.capture_brush = Some(self.create_brush(&color(
-            CAPTURE_RGB.0,
-            CAPTURE_RGB.1,
-            CAPTURE_RGB.2,
-            1.0,
-        ))?);
+        self.capture_brush = Some(self.create_brush(&color_of(CAPTURE_RGB, 1.0))?);
         // Mutable: `paint_chain_rings` sets each ring's own opacity.
         self.chain_ring_brush = Some(self.create_brush(&chain_ring_color(1.0))?);
         self.chain_shadow_brush = Some(self.create_brush(&color(0.0, 0.0, 0.0, CHAIN_RING_SHADOW))?);
@@ -2273,56 +2267,13 @@ fn color(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F { r, g, b, a }
 }
 
-/// The chain's ring colour: the brand hue, lifted until it carries *luminance*, not just hue.
-///
-/// Two real-screen corrections went into this number. `#4a9bff` at 60% was invisible: the product's
-/// mask is 45% black (the prototype's was 32%), a masked light page lands at ~140 grey, and a
-/// mid-tone blue has almost exactly that luminance — the ring differed in hue and not in brightness.
-/// Lifting it to `#8fc2ff` reached only 1.33:1 on that grey, because *any* mid-lightness colour does:
-/// pale blue, pale grey and pale green all sit in the same luminance band. `#b9d9ff` keeps the hue
-/// while clearing the grey (~2.4:1), and the underlay below supplies the local edge.
-const CHAIN_RING_RGB: (f32, f32, f32) = (185.0 / 255.0, 217.0 / 255.0, 255.0 / 255.0);
-
-/// Underlay drawn wider than every ring — the part that actually makes it legible.
-///
-/// A thin line over arbitrary screenshots cannot be made readable by colour alone: whatever
-/// luminance it has, some screenshot matches it. The measured numbers on a masked *light* page
-/// (~140 grey): ring core 1.33:1, ring + this underlay 4.9:1. It reads as a light line with a dark
-/// edge — carved on light content, glowing on dark content.
-const CHAIN_RING_SHADOW: f32 = 0.80;
 /// How much wider than the ring the underlay is drawn, in logical pixels.
 const CHAIN_RING_SHADOW_WIDTH: f32 = 2.0;
 
-/// The capture green (`#1bb15f`): the box that would be taken, and only that.
-///
-/// Measured on the masked content: 3.2:1 on dark, 7.5:1 on light, and 3.2:1 even over a
-/// blue-tinted mask — which is why the decisive element can carry the colour while the chain stays
-/// blue (docs/21 §5.22).
-const CAPTURE_RGB: (f32, f32, f32) = (27.0 / 255.0, 177.0 / 255.0, 95.0 / 255.0);
-
 /// The ring brush is mutable (`SetColor` per ring) because each level carries its own opacity.
 fn chain_ring_color(alpha: f32) -> D2D1_COLOR_F {
-    color(
-        CHAIN_RING_RGB.0,
-        CHAIN_RING_RGB.1,
-        CHAIN_RING_RGB.2,
-        alpha.clamp(0.0, 1.0),
-    )
+    color_of(CHAIN_RING_RGB, alpha.clamp(0.0, 1.0))
 }
-
-/// The brand blue (`#1f75db`): selection chrome, the hovered window's outline, and the capture box
-/// while the level chain is at rest (docs/21 §5.24, A3).
-const ACCENT_RGB: (f32, f32, f32) = (31.0 / 255.0, 117.0 / 255.0, 219.0 / 255.0);
-
-/// The capture wash at **full walking**, before [`PREVIEW_WASH_WALK_SCALE`].
-///
-/// 18% is the alpha the palette was measured at (docs/21 §5.22): enough to identify the box without
-/// hiding the content it is about to take. A3 spends it on the walk instead — at rest the mask hole
-/// already shows the content at its own brightness, so the wash would only be a green cast on the
-/// pixels the user is trying to judge.
-const PREVIEW_WASH_ALPHA: f32 = 0.18;
-/// Walks get half the wash: a live box, not a filter over the content being chosen.
-const PREVIEW_WASH_WALK_SCALE: f32 = 0.5;
 
 /// The capture box's outline colour: brand blue at rest, the capture green while walking (A3).
 ///
@@ -2330,23 +2281,24 @@ const PREVIEW_WASH_WALK_SCALE: f32 = 0.5;
 /// ②). It rides on the same brush because the two are the same statement: how strongly this outline
 /// is on screen.
 fn capture_mix_color(walking: f32, appear: f32) -> D2D1_COLOR_F {
-    let t = walking.clamp(0.0, 1.0);
-    color(
-        ACCENT_RGB.0 + (CAPTURE_RGB.0 - ACCENT_RGB.0) * t,
-        ACCENT_RGB.1 + (CAPTURE_RGB.1 - ACCENT_RGB.1) * t,
-        ACCENT_RGB.2 + (CAPTURE_RGB.2 - ACCENT_RGB.2) * t,
+    color_of(
+        mix(ACCENT_RGB, CAPTURE_RGB, walking.clamp(0.0, 1.0)),
         appear.clamp(0.0, 1.0),
     )
 }
 
 /// The capture box's wash: nothing at rest, the capture green at half strength while walking.
 fn capture_wash_color(walking: f32, appear: f32) -> D2D1_COLOR_F {
-    color(
-        CAPTURE_RGB.0,
-        CAPTURE_RGB.1,
-        CAPTURE_RGB.2,
+    color_of(
+        CAPTURE_RGB,
         PREVIEW_WASH_ALPHA * PREVIEW_WASH_WALK_SCALE * walking.clamp(0.0, 1.0) * appear.clamp(0.0, 1.0),
     )
+}
+
+/// A `D2D1_COLOR_F` from the shared palette (docs/21 §5.24.11).
+fn color_of(rgb: Rgb, alpha: f32) -> D2D1_COLOR_F {
+    let (r, g, b) = rgb.channels_f32();
+    color(r, g, b, alpha)
 }
 
 /// Build the point type Direct2D expects.
@@ -2401,11 +2353,12 @@ fn to_wide(value: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACCENT_RGB, CAPTURE_RGB, ChainRingView, MASK_ALPHA, MASK_TINT_ALPHA, OverlayRenderer,
-        PREVIEW_WASH_ALPHA, PREVIEW_WASH_WALK_SCALE, RenderMetrics, RenderView, capture_mix_color,
-        capture_wash_color, to_d2d,
+        ChainRingView, MASK_ALPHA, MASK_TINT_ALPHA, OverlayRenderer, PREVIEW_WASH_ALPHA,
+        PREVIEW_WASH_WALK_SCALE, RenderMetrics, RenderView, capture_mix_color, capture_wash_color,
+        to_d2d,
     };
     use crate::capture::geometry::LevelReach;
+    use crate::capture::ring_contrast::{ACCENT_RGB, CAPTURE_RGB, Rgb};
     use crate::capture::annotation::{
         AnnotationGeometry, AnnotationItem, AnnotationKind, AnnotationStyle,
     };
@@ -3005,13 +2958,14 @@ mod tests {
         // from the brushes the rest of the overlay uses.
         let rest = capture_mix_color(0.0, 1.0);
         let walking = capture_mix_color(1.0, 1.0);
+        let (accent_r, _, accent_b) = ACCENT_RGB.channels_f32();
+        let (capture_r, capture_g, _) = CAPTURE_RGB.channels_f32();
         assert!(
-            (rest.r - ACCENT_RGB.0).abs() < 1e-6 && (rest.b - ACCENT_RGB.2).abs() < 1e-6,
+            (rest.r - accent_r).abs() < 1e-6 && (rest.b - accent_b).abs() < 1e-6,
             "at rest the box is the brand blue"
         );
         assert!(
-            (walking.r - CAPTURE_RGB.0).abs() < 1e-6
-                && (walking.g - CAPTURE_RGB.1).abs() < 1e-6,
+            (walking.r - capture_r).abs() < 1e-6 && (walking.g - capture_g).abs() < 1e-6,
             "walking the box is the capture green"
         );
         // Nothing is washed at rest: the hole already shows the content at its own brightness, and a
@@ -3079,13 +3033,9 @@ mod tests {
                 })
                 .unwrap()
         };
-        let distance_to = |pixel: [u8; 4], rgb: (f32, f32, f32)| {
+        let distance_to = |pixel: [u8; 4], rgb: Rgb| {
             // Readback is BGRA; the palette is RGB.
-            let want = [
-                (rgb.2 * 255.0).round() as i32,
-                (rgb.1 * 255.0).round() as i32,
-                (rgb.0 * 255.0).round() as i32,
-            ];
+            let want = [rgb.b as i32, rgb.g as i32, rgb.r as i32];
             (0..3)
                 .map(|c| (pixel[c] as i32 - want[c]).abs())
                 .sum::<i32>()
