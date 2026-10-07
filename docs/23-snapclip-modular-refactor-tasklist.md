@@ -1545,3 +1545,7 @@ tag 消息明确写了两件事：(1) 捕获已独立成 crate、接缝真实、
   git switch main
   → 回退点自身可编译可测
 ```
+
+演练结果（2026-10-07 实跑）：`refactor-p1` = `c1334bf`，detach 后两个套件分别是
+**345 passed / 0 failed / 6 ignored** 与 **59 passed**，与 tag 前的数字一致；切回 `main` 后工作区干净。
+**这个 tag 是真的**——它指向的提交自身可编译、可测。
