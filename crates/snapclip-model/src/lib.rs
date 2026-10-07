@@ -31,4 +31,5 @@ pub use history::{ClipSummary, HistoryPage};
 pub use payload::{PayloadData, PayloadKind, PayloadRef};
 pub use publication::{Publication, PublicationOrigin};
 pub use recognition::{OcrErrorCode, OcrStatus};
+pub use events::{AppEvent, CaptureEvent, ClipboardEvent, RecognitionEvent};
 pub use time::unix_time_ms;
