@@ -260,7 +260,7 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 | T4.2 | `apps/snapclip` 骨架（init/Root/单窗口） | T4.1, T2.10（D2 解除了对 T3.4 的依赖） | ~5 文件 | 中 | [x]（包名 `snapclip-app`；构建 + 起窗 + 门禁全过） |
 | T4.3 | history 能力（Entity + 虚拟列表 + `ElementId`=clip id） | T4.2 | ~6 文件 | 高 | 部分 [x]（模型/图标/视图/接线/回车复制/**GPUI 集成测试**已落地；分页、删除确认、缩略图待续，见 §14.29–§14.31） |
 | T4.4 | settings 能力（**新增**，不是迁移） | T4.3 | ~3 文件 | 中 | [ ] |
-| T4.4.1 | 两个窗口检测开关接成真实设置通道 | T4.4 | 3 文件 | 中 | 部分 [x]（capture 侧的可注入类型已落地 `DetectionOptions`，见 §14.32；穿线与设置页待续） |
+| T4.4.1 | 两个窗口检测开关接成真实设置通道 | T4.4 | 3 文件 | 中 | 部分 [x]（**capture 侧整条链已通**：`DetectionOptions` 一路到 provider 的 builder；剩"设置页/持久化 → 壳传值"，那属于 T4.4；第二个开关无对应行为未发明。见 §14.32–§14.34） |
 | T4.5 | 事件桥（`snapclip-model::AppEvent` + channel + 丢弃过期） | T4.3 | 2 文件 | 高 | [ ] |
 | T4.6 | 托盘（Win32，**新建**） | T4.2 | 1 文件 | 中 | [ ] |
 | T4.7 | 测试三层 + 无障碍树断言（**先 spike**） | T4.3–T4.6 | ~4 文件 | 中 | [ ] |
@@ -2120,4 +2120,38 @@ T4.3 剩余（续做清单）：
 提交 SHA：见提交
 推送/tag：origin/main
 回退对象：f0822d3
+```
+
+### §14.34 T4.4.1 收尾核对：capture 侧的链其实已经通到 provider
+
+```
+任务编号：T4.4.1（收尾核对）
+状态：已验证（本步只更正文档 + 确认链路；无代码改动）
+前置提交/tag：d9c4cdf
+核对过程与结论（**这是对我前两次记录的两处更正**）：准备给 `UiaDeepSelectionProvider` 也加参数时，
+  先查了它的构造与调用点，发现：
+  1. `UiaDeepSelectionProvider` 已有 builder：`with_adopt_text_runs(mut self, bool)`（`uia_provider.rs:562`），
+     `uia_provider.rs:183` 里的常量只是 builder 覆盖**之前**的默认值——这是正确形状，不是缺口；
+  2. `refinement_worker.rs:74-76` **已经**在构造 provider 时链上
+     `.with_hit_test_pass_through(pass_through).with_adopt_text_runs(adopt_text_runs)`，
+     而 `adopt_text_runs` 正是 `RefinementWorker::new(..., adopt_text_runs, ...)` 的参数
+     （`refinement_worker.rs:354-358`）。
+所以 capture 侧的完整链路是：
+  `spawn_overlay(options)` → `overlay_thread` → `OverlayController::new(options)`
+  → `RefinementWorker::new(..., options.adopt_text_runs, ...)` → `FallbackDeepSelection::new`
+  → `UiaDeepSelectionProvider::with_adopt_text_runs(...)` ✓ **已通**（§14.33 里"provider 那条还没"的说法作废）。
+两处更正记录在此，避免下一轮再按错的结论去改签名：
+  - §14.32 的第 2 条更正（provider 是构造里赋值、要改签名）——**不成立**，它有 builder，且已被调用；
+  - §14.33 里"还差两层"——**不成立**，两层都已存在。
+**T4.4.1 真正剩下的**：
+  1. 设置侧（属于 T4.4）：设置模型 + 持久化 + 设置页，把 `adopt_text_runs` 做成用户可见开关；
+  2. 壳侧把 `DetectionOptions::default()` 换成设置值（现在是刻意的默认值，行为不变）；
+  3. 一条单测：非默认值确实传到 `FallbackDeepSelection.adopt_text_runs`（该字段已存着这个值，
+     同一 crate 内的测试可直接构造并断言）；
+  4. 第二个开关（"跳过无绘制包装层"）仍**没有对应行为**——不发明。
+教训（第三次同类）：**先查调用点再写结论**。我连续两轮把"需要改签名"写进文档，实际都已有现成机制；
+  这三次都是"先读代码、再下判断"这条规则的价值证明。
+提交 SHA：见提交（文档更正）
+推送/tag：origin/main
+回退对象：d9c4cdf
 ```
