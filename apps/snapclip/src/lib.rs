@@ -40,6 +40,15 @@ pub fn app_data_dir() -> std::path::PathBuf {
     base.join("com.seeyuer.snapclip")
 }
 
+/// The shell window's size in logical pixels.
+///
+/// The old Tauri window was 320×600; the product moved to 360×640 when the shell became
+/// native, because a narrower window forced the history rows to spend too much of their width
+/// on chrome. The size is a product decision, not a rendering default, so it lives here.
+const WINDOW_WIDTH: f32 = 360.0;
+const WINDOW_HEIGHT: f32 = 640.0;
+const WINDOW_TITLE: &str = "SnapClip";
+
 /// One navigation entry: a button plus the rule that marks it active.
 fn nav_item(active: bool, accent: Hsla, border: Hsla, content: AnyElement) -> AnyElement {
     div()
@@ -306,7 +315,20 @@ pub fn run() {
             gpui_kit::init(cx);
 
             cx.spawn(async move |cx| {
-                cx.open_window(WindowOptions::default(), |window, cx| {
+                // A fixed 360×640 window with a real title: the title is what the taskbar and
+                // Alt-Tab show, and `WindowOptions::default()` leaves it unnamed.
+                let options = WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        point(px(0.0), px(0.0)),
+                        size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)),
+                    ))),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some(WINDOW_TITLE.into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                cx.open_window(options, |window, cx| {
                     let shell = cx.new(|cx| Shell::new(window, cx));
                     // `Root` is the window's first-level child; it owns overlays,
                     // notifications and modal focus restoration.

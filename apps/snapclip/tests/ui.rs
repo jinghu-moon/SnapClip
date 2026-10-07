@@ -161,13 +161,16 @@ fn rows_do_not_paint_over_each_other(cx: &mut TestAppContext) {
     let state = HistoryState::open(&data).expect("open history");
     let icons = SourceIcons::new(data.join("icons")).expect("icons");
 
-    let handle = cx.open_window(size(px(640.), px(480.)), |window, cx| {
+    // The real product size. A narrow window is where a row layout breaks first, so the
+    // geometry test runs at the size the shell actually opens with.
+    let handle = cx.open_window(size(px(360.), px(640.)), |window, cx| {
         let view = cx.new(|cx| HistoryView::new(state, icons, EventBus::new(), window, cx));
         Root::new(view, window, cx)
     });
 
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
+        let window_width = px(360.);
         let row = |index: usize| window.find(("history-row", index));
         let first = row(0);
         let second = row(1);
@@ -179,6 +182,13 @@ fn rows_do_not_paint_over_each_other(cx: &mut TestAppContext) {
                 snapshot.bounds().size.height >= px(40.) && snapshot.bounds().size.height <= px(80.),
                 "row {index} measured {:?}; a row must stay one row tall",
                 snapshot.bounds().size.height
+            );
+            // And nothing is pushed past the window's right edge: at 360px wide a row that
+            // refuses to shrink would be cut off instead of ellipsised.
+            assert!(
+                snapshot.bounds().right() <= window_width + px(1.),
+                "row {index} extends to {:?}, past the {window_width:?} window",
+                snapshot.bounds().right()
             );
         }
         // And they are stacked, not overlapping.
