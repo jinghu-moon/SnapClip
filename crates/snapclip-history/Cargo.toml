@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 snapclip-model = { path = "../snapclip-model" }
 serde = { version = "1", features = ["derive"] }
+thiserror = "2"
 blake3 = "1.5"
 rusqlite = { version = "0.32", features = ["bundled"] }
 # The PNG encoder moves here at T2.4 (see the delivery protocol in docs/23 §5): capture

@@ -10,6 +10,7 @@
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
+    "ocr:serve": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ocr-serve.ps1",
     "audit:tokens": "node tools/audit-design-tokens.mjs"
   },
   "dependencies": {

@@ -1,5 +1,3 @@
-mod blob;
-
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -10,37 +8,21 @@ use std::{
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 
 use crate::domain::{
     ClipSummary, ErrorCode, HistoryPage, IpcError, OcrErrorCode, OcrStatus, PayloadData,
     PayloadKind, PayloadRef, Publication,
 };
 
-pub use blob::{BlobRef, BlobStore};
+// 过渡期转发（docs/23 T2.3）：两个存储已搬到 `snapclip-history`。
+// `BlobStore` 这个名字是壳侧的旧名，T2.5 拆 `store/mod.rs` 时一并收敛成 `ClipboardBlobStore`。
+pub use snapclip_history::blob_store::{BlobRef, ClipboardBlobStore as BlobStore};
+pub use snapclip_history::StoreError;
 
 const WRITE_QUEUE_CAPACITY: usize = 128;
 const DEFAULT_PAGE_SIZE: u32 = 50;
 const MAX_PAGE_SIZE: u32 = 100;
 const PREVIEW_CHAR_LIMIT: usize = 500;
-
-#[derive(Debug, Error)]
-pub enum StoreError {
-    #[error("storage I/O failed: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("database operation failed: {0}")]
-    Database(#[from] rusqlite::Error),
-    #[error("invalid history cursor")]
-    InvalidCursor,
-    #[error("invalid publication: {0}")]
-    InvalidPublication(String),
-    #[error("writer thread is unavailable")]
-    WriterUnavailable,
-    #[error("store initialization failed: {0}")]
-    Initialization(String),
-    #[error("store operation failed: {0}")]
-    Internal(String),
-}
 
 impl From<StoreError> for IpcError {
     fn from(error: StoreError) -> Self {

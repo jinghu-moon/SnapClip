@@ -243,7 +243,7 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 | T1.10 | 阶段验收 + tag `refactor-p1` | T1.6.1–T1.9 | — | 低 | [x]（tag 已打；**T1.6/T1.8 的剩余拆分按 D3 顺延**，见 §14.19） |
 | T2.1 | `ArtifactRef`/`CaptureOutput` 在 `snapclip-model` 定死（**不建 crate**） | T1.10 | 2 文件 | 低 | [x]（`artifact.rs`，含 2 个测试） |
 | T2.2 | `snapclip-history` 骨架 | T2.1 | 3 文件 + 门禁扩展 | 低 | [x]（crate 建立、成员加入、依赖门禁覆盖三个 crate） |
-| T2.3 | 两个独立存储：`CaptureArtifactStore` + `ClipboardBlobStore` | T2.2 | 2 文件 | 中 | [ ] |
+| T2.3 | 两个独立存储：`CaptureArtifactStore` + `ClipboardBlobStore` | T2.2 | 2 文件 + 错误类型 | 中 | [x]（含 5 个测试；cleanup/LRU 如实记为未实现） |
 | T2.4 | 切换 capture 导出链（搬 PNG 编码，改 `finish_artifact`） | T2.3 | ~4 文件 | 中 | [ ] |
 | T2.5 | 拆 `store/mod.rs`（连接/仓库/迁移） | T2.4 | 1 595 行 | 高 | [ ] |
 | T2.6 | 迁移剪贴板 Windows 适配（6 文件） | T2.5 | 1 210 行 | 中 | [ ] |
@@ -1579,4 +1579,42 @@ tag 消息明确写了两件事：(1) 捕获已独立成 crate、接缝真实、
 提交 SHA：见提交
 推送/tag：origin/main
 回退对象：refactor-p1（c1334bf）
+```
+
+### §14.21 T2.3：两个独立存储落地
+
+```
+任务编号：T2.3
+状态：已验证 + 已推送
+分支：main
+前置提交/tag：adc2c8d（T2.1+T2.2）
+修改范围：
+  crates/snapclip-history/src/error.rs        新增 `StoreError`（从壳的 store 模块搬来）
+  crates/snapclip-history/src/blob_store.rs   `blob.rs` 原样搬入，类型改名 `ClipboardBlobStore`
+  crates/snapclip-history/src/artifact_store.rs  新写 `CaptureArtifactStore`
+  crates/snapclip-model/src/lib.rs            补 `pub use artifact::{ArtifactRef, CaptureMetadata, CaptureOutput}`
+  src-tauri：加 history 依赖；`infrastructure/store/mod.rs` 删掉 `mod blob;` 与 `StoreError` 定义，
+            改成两行转发（`ClipboardBlobStore as BlobStore`、`StoreError`）
+两个存储的边界（**刻意不共享基类/trait**）：
+  - `CaptureArtifactStore`：root + `<session-id>-<sequence>.png` 命名（docs/11 §8.2 契约）、
+    临时文件 + rename 原子写、写入时算 blake3 指纹、返回 `ArtifactRef`；`read()` 会复核指纹，
+    文件被换掉/截断会被抓到。
+  - `ClipboardBlobStore`：内容寻址 `{hash[..2]}/{hash}.blob`、写入后校验、读取再校验、
+    `remove_orphans()` 做 GC——语义一字未改。
+修改前测试：capture 345 / 壳 59 / model 16 / history 0
+修改后测试：history **5 passed**（3 个 artifact + 2 个 blob，后者随代码搬来）
+           壳 **57 passed**（59 − 2 个搬走的 blob 测试）
+           capture 345、model 16 不变；`cargo check --workspace --all-targets` 0 warning
+           依赖门禁：capture 30 包 / history 43 包 / model 8 包，clean
+           Explorer 探针 12/25 · 65.8 不变；构建后启动正常（`store ready 15ms`）
+性能指标：不涉及（纯搬移 + 新类型）
+人工验证：不涉及
+失败与根因：1 次编译红——`snapclip_model::{ArtifactRef, CaptureOutput}` 在 crate 根没有 re-export
+          （T2.1 只加了 `pub mod artifact;`）。补上根 re-export；这是"类型有了但入口没开"，
+          属于 T2.1 的收尾遗漏，已修。
+诚实记录：`CaptureArtifactStore` 的 **cleanup/LRU 未实现**——仓库里现在根本没有淘汰策略，
+          本任务只搬"已存在的行为"，没有顺手发明策略。将来定保留规则时，这个 store 就是它的归属地。
+提交 SHA：见提交
+推送/tag：origin/main
+回退对象：adc2c8d
 ```

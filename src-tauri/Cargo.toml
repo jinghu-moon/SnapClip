@@ -26,6 +26,7 @@ serde_json = "1"
 blake3 = "1.5"
 snapclip-model = { path = "../crates/snapclip-model" }
 snapclip-capture = { path = "../crates/snapclip-capture" }
+snapclip-history = { path = "../crates/snapclip-history" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 thiserror = "2"
 base64 = "0.22"
