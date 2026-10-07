@@ -22,6 +22,12 @@ snapclip-capture = { path = "../../crates/snapclip-capture" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# RTF 1.9.1, clipboard-grade (docs/23 rich card). Chosen over `rtf-parser` because it is the
+# one that models what breaks on Chinese content: `\ucN` fallback skipping and surrogate
+# pairs. `std` for owned runs, `codepage` because `\'xx` byte escapes under `\ansicpg936`
+# (GBK) are common in Chinese documents and would otherwise be mojibake.
+rclip-rtf = { version = "0.1", features = ["std", "codepage"] }
+
 # The shell's typed event channel (docs/23 T4.5). `async_channel` is the same channel
 # implementation GPUI already links, so this adds a direct edge, not a second runtime.
 async-channel = "2.5"
