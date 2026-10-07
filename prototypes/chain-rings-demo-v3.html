@@ -1,0 +1,2948 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>SnapClip 智能吸附 · 整条链轮廓（③）v3 —— 动画 / UI / 布局预览</title>
+    <style>
+      :root {
+        --bg: #0e1218;
+        --panel: #161c25;
+        --panel2: #0f141b;
+        --line: #27303c;
+        --text: #d8dee7;
+        --dim: #8b95a3;
+        --accent: #3d8bfd;
+        --amber: #ffd479;
+        --green: #63d29b;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        height: 100%;
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font:
+          13px/1.55 "Segoe UI",
+          "Microsoft YaHei UI",
+          sans-serif;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
+      header {
+        padding: 12px 18px 10px;
+        border-bottom: 1px solid var(--line);
+        flex: 0 0 auto;
+      }
+      h1 {
+        font-size: 15px;
+        margin: 0 0 4px;
+        font-weight: 600;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+      .tag {
+        font-size: 10.5px;
+        color: var(--amber);
+        border: 1px solid rgba(255, 212, 121, 0.4);
+        border-radius: 3px;
+        padding: 1px 6px;
+        font-weight: 400;
+      }
+      .note {
+        color: var(--dim);
+        margin: 0 0 10px;
+        max-width: 1240px;
+        font-size: 12.5px;
+      }
+      .note code {
+        background: #1c2330;
+        padding: 1px 4px;
+        border-radius: 3px;
+      }
+      .bar {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      .seg {
+        display: flex;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        overflow: hidden;
+      }
+      .seg button {
+        background: var(--panel2);
+        color: var(--text);
+        border: 0;
+        border-right: 1px solid var(--line);
+        padding: 6px 12px;
+        cursor: pointer;
+        font: inherit;
+      }
+      .seg button:last-child {
+        border-right: 0;
+      }
+      .seg button.on {
+        background: rgba(31, 117, 219, 0.18);
+        color: #fff;
+        box-shadow: inset 0 0 0 1px var(--accent);
+      }
+      select,
+      button.mini {
+        background: var(--panel2);
+        color: var(--text);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 6px 8px;
+        font: inherit;
+        cursor: pointer;
+      }
+      .chip {
+        background: #1b2330;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        padding: 4px 8px;
+        font-variant-numeric: tabular-nums;
+        font-size: 12px;
+      }
+      main.app {
+        flex: 1 1 auto;
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 358px;
+        gap: 14px;
+        padding: 14px 18px;
+        min-height: 0;
+      }
+      .stagecell {
+        min-width: 0;
+        min-height: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      #holder {
+        position: relative;
+        flex: 0 0 auto;
+      }
+      #stage {
+        position: relative;
+        width: 1280px;
+        height: 720px;
+        background: #0a0d12;
+        border: 1px solid var(--line);
+        overflow: hidden;
+        cursor: none;
+        transform-origin: top left;
+        user-select: none;
+      }
+      #page {
+        position: absolute;
+        inset: 0;
+      }
+      #overlay {
+        position: absolute;
+        inset: 0;
+        width: 1280px;
+        height: 720px;
+      }
+      aside {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 10px 12px;
+        overflow-y: auto;
+        min-height: 0;
+      }
+      aside details {
+        border-bottom: 1px solid #1f2731;
+        padding: 2px 0 10px;
+        margin-bottom: 8px;
+      }
+      aside details:last-child {
+        border-bottom: 0;
+        margin-bottom: 0;
+      }
+      summary {
+        cursor: pointer;
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--text);
+        outline: none;
+        user-select: none;
+        list-style: none;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      summary::-webkit-details-marker {
+        display: none;
+      }
+      summary::before {
+        content: "▸";
+        color: var(--dim);
+        font-size: 10px;
+        transition: transform 0.12s;
+      }
+      details[open] > summary::before {
+        transform: rotate(90deg);
+      }
+      .shead {
+        font-weight: 400;
+        color: var(--dim);
+        font-size: 11px;
+        margin-left: auto;
+      }
+      .shead b {
+        color: var(--text);
+        font-weight: 600;
+      }
+      .shead .warn {
+        color: var(--amber);
+      }
+      .fine {
+        color: var(--dim);
+        font-size: 11.5px;
+        margin: 6px 0;
+        line-height: 1.5;
+      }
+      .kv {
+        display: flex;
+        justify-content: space-between;
+        gap: 10px;
+        margin: 4px 0;
+        font-size: 12px;
+      }
+      .kv .k {
+        color: var(--dim);
+      }
+      .kv b {
+        font-variant-numeric: tabular-nums;
+        font-weight: 600;
+      }
+      label.row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        margin: 7px 0;
+        font-size: 12px;
+      }
+      label.row .k {
+        color: var(--dim);
+      }
+      label.row > span:last-child {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+      }
+      label.row output {
+        font-variant-numeric: tabular-nums;
+      }
+      input[type="range"] {
+        width: 150px;
+      }
+      input[type="range"],
+      input[type="checkbox"] {
+        accent-color: var(--accent);
+      }
+      label.chk {
+        display: flex;
+        gap: 8px;
+        align-items: flex-start;
+        margin: 9px 0;
+        font-size: 12px;
+        cursor: pointer;
+        line-height: 1.5;
+      }
+      label.chk input {
+        margin-top: 3px;
+      }
+      #strip {
+        display: block;
+        background: var(--panel2);
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        margin: 8px 0 2px;
+      }
+      /* ---------- 图层栈 ---------- */
+      #stack {
+        position: relative;
+        max-height: 262px;
+        overflow: auto;
+        margin-top: 4px;
+        border: 1px solid #1f2731;
+        border-radius: 6px;
+        background: var(--panel2);
+        user-select: none;
+      }
+      #stack::before {
+        content: "";
+        position: absolute;
+        left: 15px;
+        top: 10px;
+        bottom: 10px;
+        width: 1px;
+        background: #2a323d;
+      }
+      .lrow {
+        display: grid;
+        grid-template-columns: 32px minmax(0, 1fr);
+        gap: 2px 4px;
+        align-items: center;
+        padding: 3px 8px 3px 0;
+        cursor: pointer;
+      }
+      .lrow:hover {
+        background: #1a212c;
+      }
+      .lrow.rsel {
+        background: rgba(31, 117, 219, 0.13);
+      }
+      .dot {
+        width: 32px;
+        display: flex;
+        justify-content: center;
+        position: relative;
+        z-index: 1;
+      }
+      .dot i {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+      }
+      .lrow.keep .dot i {
+        background: rgba(31, 117, 219, 0.85);
+        box-shadow: 0 0 0 1px rgba(31, 117, 219, 0.45);
+      }
+      .lrow.rsel .dot i {
+        background: var(--accent);
+        box-shadow: 0 0 6px rgba(31, 117, 219, 0.9);
+      }
+      .lrow.skip .dot i {
+        background: var(--panel2);
+        box-shadow: inset 0 0 0 1px #4a5563;
+      }
+      .lrow.drop .dot i {
+        background: var(--panel2);
+        box-shadow: inset 0 0 0 1px var(--amber);
+      }
+      .lbody {
+        min-width: 0;
+      }
+      .ltop {
+        display: flex;
+        gap: 6px;
+        align-items: baseline;
+      }
+      .lk {
+        color: var(--dim);
+        font-variant-numeric: tabular-nums;
+        font-size: 11px;
+        flex: 0 0 auto;
+      }
+      .lname {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 12px;
+      }
+      .lname.r-inner {
+        color: #9fb6dd;
+      }
+      .ltag {
+        margin-left: auto;
+        flex: 0 0 auto;
+        font-size: 10.5px;
+      }
+      .t-keep {
+        color: var(--green);
+      }
+      .t-skip {
+        color: #7d8794;
+      }
+      .t-drop {
+        color: var(--amber);
+      }
+      .t-sel {
+        color: #fff;
+        background: var(--accent);
+        border-radius: 3px;
+        padding: 0 5px;
+      }
+      .lwhy {
+        color: var(--dim);
+        font-size: 10.5px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      /* ---------- 舞台里的"页面" ---------- */
+      .lv {
+        position: absolute;
+        font-size: 11px;
+        color: #5b6675;
+      }
+      .lv-window {
+        background: #eef1f6;
+        border-radius: 9px;
+        box-shadow: 0 24px 70px rgba(0, 0, 0, 0.55);
+      }
+      .chrome {
+        position: absolute;
+        left: 0;
+        top: 0;
+        right: 0;
+        height: 34px;
+        background: #242a34;
+        border-radius: 9px 9px 0 0;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 0 14px;
+        color: #aeb8c6;
+        font-size: 12px;
+      }
+      .dots {
+        display: flex;
+        gap: 6px;
+      }
+      .dots i {
+        width: 11px;
+        height: 11px;
+        border-radius: 50%;
+        background: #3a4350;
+      }
+      .wsub {
+        margin-left: auto;
+        color: #6d7783;
+        font-size: 11px;
+      }
+      .lv-viewport {
+        background: #f4f6f9;
+        border-radius: 0 0 8px 8px;
+      }
+      .lv-shell {
+        background: #e9edf4;
+        box-shadow: inset 0 0 0 1px rgba(120, 132, 150, 0.22);
+      }
+      .appbar {
+        position: absolute;
+        left: 0;
+        top: 0;
+        right: 0;
+        height: 28px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 0 14px;
+        background: rgba(255, 255, 255, 0.55);
+        border-bottom: 1px solid rgba(120, 132, 150, 0.18);
+      }
+      .appbar b {
+        font-size: 12px;
+        color: #4a5563;
+      }
+      .appbar span {
+        color: #8b95a3;
+        font-size: 11px;
+        margin-left: auto;
+      }
+      .lv-list {
+        background: #fff;
+        box-shadow: inset 0 0 0 1px rgba(120, 132, 150, 0.18);
+      }
+      .lv-message {
+        background: #f0f3f8;
+        border-radius: 10px;
+      }
+      .avatar {
+        position: absolute;
+        left: 12px;
+        top: 12px;
+        width: 26px;
+        height: 26px;
+        border-radius: 50%;
+        background: linear-gradient(135deg, #3d8bfd, #7a5cff);
+        color: #fff;
+        font-weight: 600;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 12px;
+      }
+      .mhead {
+        position: absolute;
+        left: 48px;
+        top: 13px;
+        font-size: 11px;
+        color: #8b95a3;
+      }
+      .mtext {
+        position: absolute;
+        left: 48px;
+        top: 28px;
+        right: 14px;
+        font-size: 12px;
+        color: #4a5563;
+      }
+      .lv-codecard {
+        background: #0f141b;
+        border-radius: 8px;
+      }
+      .lv-scroller {
+        background: #0c1118;
+        border-radius: 0 0 7px 7px;
+      }
+      .lv-pre {
+        font:
+          12px/22px Consolas,
+          "Cascadia Mono",
+          Menlo,
+          monospace;
+        color: #d4d4d4;
+      }
+      .cl {
+        position: absolute;
+        left: 8px;
+        white-space: pre;
+      }
+      .kw {
+        color: #c586c0;
+      }
+      .ty {
+        color: #4ec9b0;
+      }
+      .cmt {
+        color: #6a9955;
+      }
+      .tok {
+        color: #dcdcaa;
+      }
+      .tok[data-answer] {
+        display: inline-block;
+        height: 22px;
+        line-height: 22px;
+      }
+      .lv-wrap.we {
+        background: #f4f6f9;
+        box-shadow: inset 0 0 0 1px rgba(120, 132, 150, 0.35);
+      }
+      .lv-wrap.wo {
+        background: #e9eef6;
+        box-shadow: inset 0 0 0 1px rgba(120, 132, 150, 0.35);
+      }
+      .wrapidx {
+        position: absolute;
+        left: 5px;
+        top: 3px;
+        font-size: 9.5px;
+        color: #9aa4b2;
+      }
+      .ans {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .ans-chip {
+        background: #1b2330;
+        color: #9ecbff;
+        box-shadow: inset 0 0 0 1px #2c3a52;
+        border-radius: 6px;
+        font:
+          12px Consolas,
+          "Cascadia Mono",
+          Menlo,
+          monospace;
+      }
+      .ans-pill {
+        background: #1b2330;
+        color: #cfe0ff;
+        box-shadow: inset 0 0 0 1px #33405a;
+        border-radius: 14px;
+        font-size: 12px;
+      }
+      .ans-target {
+        background: #fff;
+        box-shadow: inset 0 0 0 1px #c6d0de;
+        border-radius: 6px;
+        color: #4a5563;
+        font-weight: 600;
+      }
+      .dec {
+        position: absolute;
+        font-size: 11px;
+        color: #7d8794;
+      }
+      .dec-user {
+        background: #dbe7ff;
+        border-radius: 10px;
+        padding: 10px 14px;
+        color: #33507e;
+      }
+      .dec-msg {
+        background: #f0f3f8;
+        border-radius: 10px;
+        padding: 10px 14px;
+        color: #5b6675;
+      }
+      .dec-input {
+        background: #eef1f6;
+        box-shadow: inset 0 0 0 1px #dbe1ec;
+        border-radius: 13px;
+        color: #9aa4b2;
+        display: flex;
+        align-items: center;
+        padding: 0 12px;
+      }
+      .dec-thumb {
+        background: #e2e7f0;
+        border-radius: 3px;
+      }
+      .dec-inspector {
+        background: #e4e9f1;
+        border-radius: 8px;
+        padding: 12px;
+        overflow: hidden;
+      }
+      .ins-title {
+        font-weight: 600;
+        color: #4a5563;
+        margin-bottom: 8px;
+        font-size: 11.5px;
+      }
+      .ins-row {
+        display: flex;
+        justify-content: space-between;
+        background: rgba(255, 255, 255, 0.7);
+        border-radius: 5px;
+        padding: 6px 8px;
+        margin: 5px 0;
+        font-size: 10.5px;
+        color: #7d8794;
+      }
+      .ins-note {
+        margin-top: 10px;
+        font-size: 10.5px;
+        color: #98a2b0;
+        line-height: 1.55;
+      }
+      .dec-card {
+        background: #f0f3f8;
+        border-radius: 10px;
+        padding: 16px 18px;
+      }
+      .dec-card h3 {
+        margin: 0 0 6px;
+        font-size: 13px;
+        color: #4a5563;
+      }
+      .dec-card p {
+        margin: 0;
+        font-size: 11.5px;
+        color: #7d8794;
+        line-height: 1.6;
+      }
+      /* 图例 */
+      .lg {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin: 4px 0;
+        font-size: 12px;
+      }
+      .sw {
+        width: 26px;
+        height: 12px;
+        border: 1px solid;
+        border-radius: 2px;
+        flex: 0 0 auto;
+      }
+      .swSel {
+        border-width: 2px;
+        border-color: var(--accent);
+        background: rgba(31, 117, 219, 0.18);
+        height: 14px;
+      }
+      .swWin {
+        border-color: rgba(200, 208, 219, 0.5);
+      }
+      footer {
+        flex: 0 0 auto;
+        padding: 8px 18px;
+        border-top: 1px solid var(--line);
+        color: var(--dim);
+        font-size: 11.5px;
+      }
+      footer b {
+        color: var(--text);
+      }
+      @media (max-width: 1120px) {
+        body {
+          overflow: auto;
+          height: auto;
+        }
+        main.app {
+          grid-template-columns: 1fr;
+        }
+        .stagecell {
+          min-height: 480px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>
+        智能吸附 · 整条链轮廓（③）— v2 交互预览
+        <span class="tag">设计预览 · 非产品实现</span>
+      </h1>
+      <p class="note">
+        规则照 <code>docs/21 §5.22</code>：锚点（窗口 / 相邻两层 / 最深答案）+
+        间距塌缩（8 px）+ <b>强制上限 7</b> + 内层低透明度。
+        这一版把方案的口头保证换成可看的数字：右栏的 present
+        计数、耗时和帧活动条来自<b>本页真实渲染循环</b>（脏标记驱动，稳定期真的不重绘）；
+        「环参与渐隐」是故意留的反面演示，用来对照「环不参加 101 ms
+        过渡」这条取舍。 几何与真机同构：9 层里有一段 1 px
+        密排，走动时看它怎么被吃掉。
+      </p>
+      <div class="bar">
+        <div class="seg" id="implSeg">
+          <button data-impl="current">当前实现</button>
+          <button data-impl="a" class="on">③a 常显</button>
+          <button data-impl="b">③b 停止后淡出</button>
+        </div>
+        <select id="scenario">
+          <option value="deep">9 层 · 真机形态（1px 密排）</option>
+          <option value="wide">4 层 · 间距全 ≥ 8px</option>
+          <option value="flat">2 层 · 满屏窗口（标签走框内右上）</option>
+          <option value="flat_inset">2 层 · 窗口 + 答案</option>
+          <option value="stress">12 层 · 压力（上限断言）</option>
+        </select>
+        <span class="chip" id="levelChip">—</span>
+       <button class="mini" id="resetSel">↓ 最深</button>
+        <button class="mini" id="walkUp">↑ 往上走 3 层（看内层环）</button>
+        <button class="mini" id="rollBurst">⟳ 连续滚 6 格（看绿跟不跟得住）</button>
+      </div>
+    </header>
+
+    <main class="app">
+      <section class="stagecell" id="stagecell">
+        <div id="holder">
+          <div id="stage">
+            <div id="page"></div>
+            <canvas id="overlay"></canvas>
+          </div>
+        </div>
+      </section>
+
+      <aside>
+        <details open>
+          <summary>图层栈<span class="shead" id="stackStats"></span></summary>
+          <div class="fine">
+            悬停行 = 在画面上定位该层（被塌缩 / 丢弃的给幽灵底色）；点击行 =
+            跳到该层。走一遍滚轮，看 1 px 密排怎么被吃、上限怎么兜底。
+          </div>
+          <div id="stack"></div>
+        </details>
+
+        <details open>
+          <summary>动画与呈现</summary>
+          <label class="chk"
+            ><input type="checkbox" id="ease" checked /><span
+              ><b>选中层 101 ms 缓动</b>（OutQuad，RectTransition
+              同款）。标签锚在缓动中的矩形、文字用目标尺寸。</span
+            ></label
+          >
+          <label class="chk"
+            ><input type="checkbox" id="ringAnim" /><span
+              ><b>环参与渐隐 180 ms —— 反面演示</b
+              >。默认关：环是静态几何，换层即时到位、静止期 0 额外
+              present。勾上后新环淡入、旧环淡出，节奏与 101 ms
+              的选中层对不齐——正是方案里「几何在撒谎」的那幅画面，present
+              计数会立刻变贵。</span
+            ></label
+          >
+          <label class="chk"
+            ><input type="checkbox" id="dim" checked /><span
+              ><b>截图变暗遮罩</b>（整屏 0.34）。</span
+            ></label
+          >
+          <label class="chk"
+            ><input type="checkbox" id="holeMask" checked /><span
+              ><b>选中层挖洞</b>（建议）—— 遮罩从选中框里挖掉：框内是原亮度、原色，框外才压暗；
+              选中框的描边改画在<b>框外一圈</b>，不盖住会被截下的像素；内层环加一圈极细深色晕边（它们现在落在没压暗的内容上）。
+              关掉＝旧画法：整屏压暗，再在框上叠洗色。</span
+            ></label
+          >
+          <label class="row"
+            ><span class="k">内层环色（挖洞时）</span
+            ><span
+              ><select id="innerRingColor">
+                <option value="auto">自适应（推荐 · 按每条边的底色选深浅）</option>
+                <option value="109,176,255">固定 #6db0ff</option>
+                <option value="74,155,255">固定 #4a9bff（同外侧环）</option>
+                <option value="140,196,255">固定 #8cc4ff</option>
+              </select></span
+            ></label
+          >
+          <label class="chk"
+            ><input type="checkbox" id="haloAuto" checked /><span
+              ><b>晕边按底色自适应</b>（产品做法）—— 每条边在截图上采样底色：
+              能直接读出来（对比 ≥ 3:1）就<b>不加晕边</b>，只换环色深浅（浅底用品牌蓝、深底用环蓝）；
+              只有落在中间调、换色也不够时才垫晕边，且只垫到刚好 3:1。<b>每一层都是干净的 1 px</b>。
+              关掉＝常驻晕边（上一版的画法）。demo 里「采样」读的是页面元素的实际背景色。</span
+            ></label
+          >
+          <label class="row"
+            ><span class="k">内层环晕边 · 上限</span
+            ><span
+              ><input type="range" id="halo" min="0" max="80" value="60" />
+              <output id="haloOut">60%</output></span
+            ></label
+          >
+          <label class="chk"
+            ><input type="checkbox" id="greenOnWalk" checked /><span
+              ><b>绿色只在滚轮时出现</b>（建议）—— 基础态：品牌蓝描边、无洗色、不画链上的环；
+              滚轮一动，描边蓝→绿渐变、洗色减半（selFill×0.5）、环和徽标一起浮现；
+              停下 1.2 s 后一起淡出，描边回蓝，徽标留成淡淡的「你换过层」标记。
+              <b>遮罩两态完全相同</b>。整窗兜底仍是中性灰。关掉＝旧画法：选中层一直是绿。</span
+            ></label
+          >
+          <label class="chk"
+            ><input type="checkbox" id="forceWindow" /><span
+              ><b>模拟整窗兜底</b>（只答到窗口）—— 它是"没钻到元素"那种结果：
+              链被截成 1 层、没有任何环、选中层走中性灰。<b>对比绿色：没有绿，就说明
+              这一下拿到的只是窗口外壳</b>。</span
+            ></label
+          >
+          <label class="chk"
+            ><input type="checkbox" id="degraded" /><span
+              ><b>加降级标记 <code>?</code></b
+              >（真机里是"这个位置什么都没答上来"）——只影响标签文案。</span
+            ></label
+          >
+          <label class="chk"
+            ><input type="checkbox" id="counterInLabel" /><span
+              ><b>把层级计数写回尺寸标签</b>（对比用）—— 默认是<b>拆开</b>：
+              尺寸标签 `846×272 px 容器` 在框外左上，层级徽标 `6/9` 在框内右上。</span
+            ></label
+          >
+          <label class="row"
+            ><span class="k">层级徽标形态</span
+            ><span
+              ><select id="chipStyle">
+                <option value="reach">滚轮余量 ↑3 ↓5（推荐）</option>
+                <option value="track">迷你滑轨 ──◆───</option>
+                <option value="dots">点列 ●●●◉○○</option>
+                <option value="emphasis">数字分层 6 / 9</option>
+                <option value="stack">分段条 ▮▮▮▯▯</option>
+                <option value="fraction">6/9（现状）</option>
+              </select></span
+            ></label
+          >
+          <p class="fine">
+            ③b（工具栏第三档）：走动结束 1.2 s 后整条链按 8 步量化淡出（≈ 8
+            帧额外满屏）；任何换层或移动光标立刻复现——对应 ArmedHint /
+            on_hover_tick 的保活语义。
+          </p>
+        </details>
+
+        <details open>
+          <summary>交互建议（各自可开关，对比用）</summary>
+          <label class="chk"><input type="checkbox" id="skipNear" checked /><span><b>① 滚轮跳过近似层</b>——四条边都和当前框差不到「塌缩阈值」的层直接跳过，每一格都落在视觉上不同的框上；↑↓ 键也一样。徽标的余量按「还能停几站」算。</span></label>
+          <label class="chk"><input type="checkbox" id="wheelAccum" checked /><span><b>② 触控板累积</b>——滚动量累积到 100 才算一步，一步后 80 ms 冷却，吃掉惯性尾巴。鼠标滚轮一格照常一步。</span></label>
+          <label class="chk"><input type="checkbox" id="cursorRule" checked /><span><b>③ 光标规则</b>——光标还在选中框内（含微抖）层级保持；移出去才对新位置重新吸附到最深层。试：滚到外层，在框里晃一晃，再移出去。</span></label>
+          <label class="chk"><input type="checkbox" id="carryOn" /><span><b>③b 沿用「往外 N 层」</b>（实验）——刚滚过后 2 s 内移到别处，新目标沿用同样的往外层数，连续截一排列表项更省力。</span></label>
+          <label class="chk"><input type="checkbox" id="upHint" checked /><span><b>④ 「↑ 还能滚」暗示</b>——基础态停留 600 ms 后，框角淡出一个 ↑；滚动或点击即消失，每会话最多 3 次。</span></label>
+          <label class="chk"><input type="checkbox" id="lockFx" checked /><span><b>⑤ 点击确认反馈</b>——点选中框<b>内部</b>：绿→蓝「定住」，脉冲一下，长出 8 个把手；滚轮或移出框解除。点框外仍是「点哪层选哪层」。</span></label>
+          <label class="chk"><input type="checkbox" id="kindName" checked /><span><b>⑥ 尺寸标签带类型名</b>——<code>846×272 px 代码块</code>，不再全是「容器」。（真机取决于能不能拿到控件类型。）</span></label>
+          <label class="chk"><input type="checkbox" id="nearBright" checked /><span><b>⑦ 邻层环高亮</b>——下一步会到的上下两层亮一档（×1.3），其余退一档（×0.75）。开着时它取代「环浓度随层级递减」。</span></label>
+        </details>
+
+        <details open>
+          <summary>验证 · present 计数（真实渲染循环）</summary>
+          <div class="kv">
+            <span class="k">present（舞台满屏重绘）</span><b id="mPresent">0</b>
+          </div>
+          <div class="kv">
+            <span class="k">其中环动画帧（缓动之外的）</span><b id="mRing">0</b>
+          </div>
+          <div class="kv">
+            <span class="k">绘制耗时 last / max</span><b id="mUs">— / —</b>
+          </div>
+          <div class="kv">
+            <span class="k">循环状态</span><b id="mState">—</b>
+          </div>
+          <div class="kv">
+            <span class="k">尺寸标签位置</span><b id="labelWhere">框外左上</b>
+          </div>
+          <div class="kv">
+            <span class="k">层级徽标位置</span><b id="chipWhere">框内右上</b>
+          </div>
+          <canvas id="strip" width="220" height="22"></canvas>
+          <div class="fine">
+            每格 = 一个 rAF 帧，亮起 = 该帧发生了一次舞台重绘。③a
+            静止期应当完全安静。
+          </div>
+          <button class="mini" id="mReset">清零计数</button>
+        </details>
+
+        <details>
+          <summary>参数（③ 生效）</summary>
+          <label class="row"
+            ><span class="k">外侧透明度</span
+            ><span
+              ><input
+                type="range"
+                id="outerAlpha"
+                min="10"
+                max="90"
+                value="60"
+              />
+              <output id="outerAlphaOut">60%</output></span
+            ></label
+          >
+          <label class="row"
+            ><span class="k">内层透明度</span
+            ><span
+              ><input
+                type="range"
+                id="innerAlpha"
+                min="0"
+                max="90"
+                value="90"
+              />
+              <output id="innerAlphaOut">90%</output></span
+            ></label
+          >
+          <label class="row"
+            ><span class="k">塌缩阈值</span
+            ><span
+              ><input type="range" id="collapse" min="0" max="24" value="8" />
+              <output id="collapseOut">8 px</output></span
+            ></label
+          >
+          <label class="row"
+            ><span class="k">选中层洗色浓度</span
+            ><span
+              ><input
+                type="range"
+                id="selFill"
+                min="0"
+                max="30"
+                value="18"
+              />
+              <output id="selFillOut">18%</output></span
+            ></label
+          >
+          <label class="row"
+            ><span class="k">选中线宽</span
+            ><span
+              ><input
+                type="range"
+                id="selWidth"
+                min="2"
+                max="5"
+                step="1"
+                value="2"
+              />
+              <output id="selWidthOut">2 px</output></span
+            ></label
+          >
+          <label class="chk"
+            ><input type="checkbox" id="keepAnswer" checked /><span
+              ><b>保留最深答案的环</b>（回程点——按 ↓ 能回去的地方）。</span
+            ></label
+          >
+          <label class="chk"
+            ><input type="checkbox" id="ramp" checked /><span
+              ><b>环浓度随层级递减</b>（离选中层越远越淡，下限 45%）——
+              外圈是背景，近处才是与你有关的上下文。</span
+            ></label
+          >
+          <label class="row"
+            ><span class="k">遮罩 · 主题色</span
+            ><span
+              ><input type="range" id="maskAlpha" min="0" max="30" value="10" />
+              <output id="maskAlphaOut">10%</output></span
+            ></label
+          >
+          <label class="row"
+            ><span class="k">遮罩 · 中性黑</span
+            ><span
+              ><input type="range" id="maskBlack" min="10" max="60" value="32" />
+              <output id="maskBlackOut">32%</output></span
+            ></label
+          >
+          <p class="fine">
+            三色分工（实测对比度见下）：<br />
+            · <b>品牌蓝 #1f75db</b>（= 产品 `border_brush`）—— 未遮罩内容上的 chrome（确认选区、把手）、
+            hover 幽灵、遮罩的品牌染（≤10%）；
+            <br />
+            · <b>环蓝 #4a9bff</b>（同色相浅一档）—— 画在遮罩之上的链环：外侧 3.07–3.85:1。
+            产品那个 #1f75db 在深色内容上满浓度也只有 2.02:1，压上遮罩就没法看；
+            <br />
+            · <b>捕获绿 #1bb15f</b> —— 只管"将被截下的那一层"：边框 3.16:1、浅底 7.5:1、
+            连在被蓝染过的底上也有 3.15:1。
+            <br />
+            <b>遮罩别用主题色去染</b>：30% 蓝染把环压到 1.2–1.8:1（连绿边框也掉到 3.15）；
+            中性黑负责压暗，主题色最多 10% 当品牌感。整窗兜底仍是中性灰——它表示"没钻到元素"，
+            所以不该用捕获绿。
+          </p>
+        </details>
+
+        <details>
+          <summary>图例</summary>
+          <div class="lg">
+            <span class="sw" id="swOuter"></span>外侧祖先 · 1 px ·
+            <b id="lgOuter">45%</b>
+          </div>
+          <div class="lg">
+            <span class="sw swSel"></span>选中层 · 洗色 +
+            <b id="lgSel">2×</b> 描边
+          </div>
+          <div class="lg">
+            <span class="sw" id="swInner"></span>内层（③ 新增）· 1 px ·
+            <b id="lgInner">45%</b>
+          </div>
+          <div class="lg">
+            <span class="sw swWin"></span>整窗：中性色 · 1× · 标签「窗口」
+          </div>
+          <p class="fine">
+            链上的环不标 k/N
+            小牌——画面上只有一个标签（选中层的）。层号看左栏图层栈。
+          </p>
+          <p class="fine">
+            <b>画序：外侧环在选中层洗色<u>之下</u>，内层环在洗色<u>之上</u>。</b>
+            内层环本来就在选中层内部，画在下面会被那层洗色盖掉（accent 叠 accent），
+            看上去就像"没画内层"——v2 第一版就是这个症状。
+            实测同一个环在 28% 时与背景差 Δ124，45% 时 Δ176，外侧环 Δ322；
+            所以内层默认与外侧同浓度（45%），靠<b>位置</b>而不是靠浓度区分内外，
+            浓度留给参数栏按眼睛调。
+          </p>
+        </details>
+      </aside>
+    </main>
+
+    <footer>
+      滚轮 / <b>↑ ↓</b> 换层 · 点击画面或图层栈行 = 跳到该层 · 悬停图层栈行 =
+      定位 · 按住 <b>C</b> 对照当前实现 · <b>R</b> 回最深
+    </footer>
+
+    <script>
+      "use strict";
+      // `getElementById` wants the bare id: passing "#mPresent" returns null, and because
+      // `renderStack()` runs early in `init()`, one such throw took the rest of `init()` with it
+      // (no canvas paint, no bindings, no render loop). Accept either form so a call site that
+      // writes "#id" cannot do that again.
+      const q = (s) => document.getElementById(s.replace(/^#/, ""));
+      const stage = q("stage"),
+        holder = q("holder"),
+        page = q("page"),
+        canvas = q("overlay"),
+        ctx = canvas.getContext("2d"),
+        stackEl = q("stack"),
+        strip = q("strip"),
+        sctx = strip.getContext("2d");
+
+      // 品牌蓝 = 产品 `border_brush` 的 #1f75db：用于遮罩的品牌染、hover 幽灵，
+      // 以及产品侧未遮罩区域上的 chrome（确认选区边框、把手）。
+      const THEME = "31,117,219",
+        // 环蓝：**画在遮罩之上**的链环用它。同色相浅一档，因为 #1f75db 在深色内容上
+        // 满浓度也只有 2.02:1（遮罩再一压就没法看）；#4a9bff @60% 在浅底 3.13:1、深底 2.06:1。
+        // 这不是第二个品牌色，是同一条蓝色刻度上的两档（600 / 400）。
+        RING = "74,155,255",
+        // 捕获绿：**当前会被截下来的那一层**用它，与"上下文"（蓝）分开。
+        // 蓝色说"这是一条链上的层"，绿色说"这是你要的东西"。
+        // #1bb15f 满浓度：浅底 7.5:1、深代码区 3.27:1、连在被蓝染过的底上也有 3.15:1。
+        CAPTURE = "27,177,95",
+        // 整窗兜底仍是中性灰：它表示"没能钻到元素"，
+        // 所以它不该用捕获绿（那会在视觉上说"捕获到了一个元素"）。
+        NEUTRAL = "200,208,219";
+      const ACCENT = THEME;
+      const MAX_RINGS = 7;
+      let stageScale = 1;
+
+      /* ---------------------------------------------------------------- 场景
+   坐标 = 1280×720 舞台上的"显示器"坐标；path[0] 永远是窗口框，
+   最后一项永远是答案 —— 与产品 DeepTarget.path 同一个约定。 */
+      const CODE_HTML = [
+        '<span class="cmt">//! docs/21 §5.22 —— ③ 整条链轮廓：锚点 + 塌缩 + 上限</span>',
+        '<span class="kw">fn</span> <span class="tok" data-answer>deep_path_local</span>(path: <span class="ty">&amp;[Rect]</span>, k: <span class="ty">usize</span>) -&gt; <span class="ty">Vec&lt;ChainRing&gt;</span> {',
+        '    <span class="kw">let mut</span> rings = Vec::new();',
+        '    <span class="kw">for</span> (i, rect) <span class="kw">in</span> path.iter().enumerate() {',
+        "        rings.push(ChainRing::classify(i, rect, k));",
+        "    }",
+        "    rings.collapse(GAP_MIN).cap(MAX_RINGS)",
+        "}",
+      ]
+        .map(
+          (h, i) =>
+            '<div class="cl" style="top:' +
+            (8 + 22 * i) +
+            'px">' +
+            h +
+            "</div>",
+        )
+        .join("");
+
+      const SCENARIOS = {
+        deep: {
+          /* 9 层：真机形态，5/6/7 三层 1px 密排 */ answerInCode: true,
+          msgText: "这个函数决定 ③ 要画哪些环 —— 滚轮往外走，看链怎么塌缩：",
+          levels: [
+            { k: "window", id: "窗口 · Chromium", rect: [40, 24, 1200, 660] },
+            {
+              k: "viewport",
+              id: "#document · 视口",
+              rect: [41, 58, 1198, 626],
+            },
+            {
+              k: "shell",
+              id: "side-pane-shell-host",
+              rect: [53, 70, 1174, 602],
+            },
+            { k: "list", id: "message-list", rect: [65, 82, 880, 566] },
+            { k: "message", id: "text-message", rect: [69, 148, 848, 330] },
+            {
+              k: "codecard",
+              id: "code-block-viewer",
+              rect: [70, 196, 846, 272],
+            },
+            { k: "scroller", id: "cm-scroller", rect: [71, 197, 844, 270] },
+            { k: "pre", id: "pre.cm-content", rect: [87, 213, 812, 222] },
+            {
+              k: "answer",
+              id: "code span · deep_path_local",
+              rect: [117, 243, 105, 22],
+            },
+          ],
+          decor: [
+            {
+              cls: "dec-user",
+              rect: [85, 96, 760, 44],
+              html: "帮我把「选区能沿祖先链走」做出来 —— 得能看出我现在在第几层。",
+            },
+            {
+              cls: "dec-msg",
+              rect: [85, 492, 760, 110],
+              html: "链上 9 层里，1 px 密排的那几层会被塌缩吃掉；走到外面之后，内层换成更淡的线保持在场。这条回复本身不在链上。",
+            },
+            {
+              cls: "dec-input",
+              rect: [73, 614, 864, 26],
+              html: "给 assistant 发消息…（装饰）",
+            },
+            { cls: "dec-thumb", rect: [933, 110, 6, 140], html: "" },
+            {
+              cls: "dec-inspector",
+              rect: [961, 82, 250, 540],
+              html:
+                '<div class="ins-title">详情面板 · 不在链上</div>' +
+                '<div class="ins-row"><span>window_hit_test</span><span>0.8 ms</span></div>' +
+                '<div class="ins-row"><span>refresh</span><span>16.6 ms</span></div>' +
+                '<div class="ins-row"><span>path 缓存</span><span>命中</span></div>' +
+                '<div class="ins-row"><span>refinement</span><span>deep</span></div>' +
+                '<div class="ins-note">这些盒子不在 path 里，永远不会被划进轮廓 —— 轮廓只画检测器验证过的祖先链。</div>',
+            },
+          ],
+        },
+        wide: {
+          /* 4 层：每层间距 ≥ 8，塌缩永远吃不掉 */
+          msgText:
+            "这一页只有 4 层，彼此都隔着 ≥ 32 px —— 塌缩永远吃不掉任何一层：",
+          levels: [
+            { k: "window", id: "窗口 · Chromium", rect: [40, 24, 1200, 660] },
+            {
+              k: "shell",
+              id: "side-pane-shell-host",
+              rect: [72, 80, 1136, 552],
+            },
+            { k: "message", id: "text-message", rect: [104, 128, 1000, 400] },
+            {
+              k: "answer",
+              id: "code chip · Vec&lt;ChainRing&gt;",
+              rect: [136, 176, 336, 26],
+              cls: "ans-chip",
+              text: "Vec<ChainRing>",
+            },
+          ],
+          decor: [
+            {
+              cls: "dec-msg",
+              rect: [104, 544, 800, 44],
+              html: "（另一条消息，装饰 —— 不在链上。）",
+            },
+            {
+              cls: "dec-input",
+              rect: [120, 598, 940, 24],
+              html: "给 assistant 发消息…（装饰）",
+            },
+          ],
+        },
+        flat: {
+          /* 2 层：满屏窗口 + 唯一答案 —— 真实里就是"最大化的窗口"：
+             框贴顶又占满高度，标签框外上/下都没地方，只能走阶梯第②级（框内右上）。*/
+          levels: [
+            { k: "window", id: "窗口 · 最大化", rect: [0, 0, 1280, 720] },
+            {
+              k: "answer",
+              id: "text span · 唯一元素",
+              rect: [460, 300, 360, 28],
+              cls: "ans-pill",
+              text: "我是这个页面上唯一的吸附目标",
+            },
+          ],
+          decor: [
+            {
+              cls: "dec-card",
+              rect: [420, 200, 440, 260],
+              under: true,
+              html: "<h3>满屏窗口</h3><p>框贴顶、占满高度：标签在框外上/下都没有位置。走第②级之后它落在框内右上角——旧实现在这里会把标签整块丢掉，连「窗口」两个字都看不到。</p>",
+            },
+          ],
+        },
+        flat_inset: {
+          /* 2 层：窗口 + 唯一答案 */
+          levels: [
+            { k: "window", id: "窗口 · Chromium", rect: [40, 24, 1200, 660] },
+            {
+              k: "answer",
+              id: "text span · 唯一元素",
+              rect: [460, 300, 360, 28],
+              cls: "ans-pill",
+              text: "我是这个页面上唯一的吸附目标",
+            },
+          ],
+          decor: [
+            {
+              cls: "dec-card",
+              rect: [420, 200, 440, 260],
+              under: true,
+              html: "<h3>独立页面</h3><p>这个页面只有一个可吸附目标：下面那个胶囊。链上就只有窗口和它 —— 最深一层同时也是答案，按 ↓ 一步就到头。</p>",
+            },
+          ],
+        },
+        stress: {
+          /* 12 层：间距全 16px —— 「12 层 → ≤7」上限断言的可见版本 */
+          levels: [
+            { k: "window", id: "窗口", rect: [24, 16, 1232, 688] },
+            { k: "wrap", id: "wrap-1", rect: [40, 56, 1200, 632] },
+            { k: "wrap", id: "wrap-2", rect: [56, 72, 1168, 600] },
+            { k: "wrap", id: "wrap-3", rect: [72, 88, 1136, 568] },
+            { k: "wrap", id: "wrap-4", rect: [88, 104, 1104, 536] },
+            { k: "wrap", id: "wrap-5", rect: [104, 120, 1072, 504] },
+            { k: "wrap", id: "wrap-6", rect: [120, 136, 1040, 472] },
+            { k: "wrap", id: "wrap-7", rect: [136, 152, 1008, 440] },
+            { k: "wrap", id: "wrap-8", rect: [152, 168, 976, 408] },
+            { k: "wrap", id: "wrap-9", rect: [168, 184, 944, 376] },
+            { k: "wrap", id: "wrap-10", rect: [184, 200, 912, 344] },
+            {
+              k: "answer",
+              id: "目标元素",
+              rect: [200, 216, 880, 40],
+              cls: "ans-target",
+              text: "目标元素 · 12/12",
+            },
+          ],
+          decor: [],
+        },
+      };
+
+      const state = {
+        impl: "a",
+        scenario: "deep",
+        selected: 0,
+        cursor: { x: 940, y: 600 },
+        outerAlpha: 0.6,
+        innerAlpha: 0.9,
+        innerRingRGB: "auto", // 内层环色："auto" = 按每条边的底色在 4 档蓝里选；否则固定
+        haloAuto: true,
+        halo: 0.6, // 内层环两侧的深色晕边浓度
+        maskAlpha: 0.10,
+        maskBlack: 0.32,
+        ramp: true,
+        collapse: 8,
+        selFill: 0.18,
+        forceWindow: false,
+        degraded: false,
+        counterInLabel: false,
+        chipStyle: "reach",
+        selWidth: 2,
+        keepAnswer: true,
+        dim: true,
+        ease: true,
+        ringAnim: false,
+        hoverIndex: -1,
+        peek: false,
+        shown: null,
+        anim: null,
+        hintText: "",
+        hintUntil: 0,
+        taught: false,
+        chainVis: 1,
+        lastWalk: 0,
+        holeMask: true,
+        greenOnWalk: true,
+        lastWheel: -1e9, // 只在"换层/滚轮"时刷新（光标移动不算），绿色与环的生灭都挂在它上面
+        walkVis: 0, // 0 = 基础态（蓝），1 = 滚轮态（绿）
+        base: 0, // 当前悬停目标的默认答案层：光标重新吸附时更新，「换过层」的参照
+        skipNear: true,
+        wheelAccum: true,
+        cursorRule: true,
+        carryOn: false,
+        upHint: true,
+        lockFx: true,
+        kindName: true,
+        nearBright: true,
+        carryUntil: 0,
+        carryOff: 0,
+        dwellStart: 0,
+        upShowing: false,
+        upT0: 0,
+        upCount: 0,
+        lock: null,
+      };
+
+      const levelsOf = () => SCENARIOS[state.scenario].levels;
+      // 「链」与「页面」是两张不同的表：`levelsOf()` 描述**页面**（一直完整），
+      // `chainOf()` 描述**检测结果**。整窗兜底开关只截断后者——
+      // 真机里那是 `deep_target.kind == TopLevelWindowFrame`、`path.len() == 1` 的状态，
+      // 页面内容当然还在（只是没人能钻到窗口以下）。
+      const chainOf = () => (state.forceWindow ? levelsOf().slice(0, 1) : levelsOf());
+      const deepest = () => chainOf().length - 1;
+      const effImpl = () => (state.peek ? "current" : state.impl);
+      const optsNow = () => ({
+        impl: effImpl(),
+        collapse: state.collapse,
+        keepAnswer: state.keepAnswer,
+      });
+
+      let dirty = true;
+      function requestDraw() {
+        dirty = true;
+      }
+
+      /* ---------------------------------------------------------------- 舞台缩放 */
+      function fitStage() {
+        const cell = q("stagecell").getBoundingClientRect();
+        const s = Math.min(1, (cell.width - 4) / 1280, (cell.height - 4) / 720);
+        stageScale = Math.max(0.3, s || 0.3);
+        stage.style.transform = "scale(" + stageScale + ")";
+        holder.style.width = 1280 * stageScale + "px";
+        holder.style.height = 720 * stageScale + "px";
+        const k = (window.devicePixelRatio || 1) * stageScale;
+        canvas.width = Math.max(2, Math.round(1280 * k));
+        canvas.height = Math.max(2, Math.round(720 * k));
+        ctx.setTransform(k, 0, 0, k, 0, 0);
+        requestDraw();
+      }
+
+      /* ---------------------------------------------------------------- 页面内容
+   环和盒子用同一份几何；答案盒子的宽度渲染后从真实 DOM 量回来。 */
+      function setPos(d, r) {
+        d.style.left = r[0] + "px";
+        d.style.top = r[1] + "px";
+        d.style.width = r[2] + "px";
+        d.style.height = r[3] + "px";
+      }
+      function renderPage() {
+        bgCache.clear();
+        page.innerHTML = "";
+        const sc = SCENARIOS[state.scenario],
+          n = sc.levels.length;
+        const decorDivs = sc.decor.map((dec) => {
+          const d = document.createElement("div");
+          d.className = "dec " + dec.cls;
+          setPos(d, dec.rect);
+          d.innerHTML = dec.html || "";
+          return d;
+        });
+        for (let i = 0; i < decorDivs.length; i++)
+          if (sc.decor[i].under) page.appendChild(decorDivs[i]);
+        sc.levels.forEach((lv, i) => {
+          if (lv.k === "answer" && sc.answerInCode) return; // 答案已在代码行里
+          const d = document.createElement("div");
+          if (lv.k === "answer") {
+            d.className = "lv ans " + (lv.cls || "ans-chip");
+            d.dataset.answer = "1";
+            d.textContent = lv.text;
+          } else {
+            d.className =
+              "lv lv-" +
+              lv.k +
+              (lv.k === "wrap" ? (i % 2 ? " wo" : " we") : "");
+            if (lv.k === "window")
+              d.innerHTML =
+                '<div class="chrome"><span class="dots"><i></i><i></i><i></i></span><span>SnapClip — 智能吸附演示</span><span class="wsub">chromium</span></div>';
+            else if (lv.k === "shell")
+              d.innerHTML =
+                '<div class="appbar"><b>智能吸附 · 对话</b><span>side-pane</span></div>';
+            else if (lv.k === "message")
+              d.innerHTML =
+                '<div class="avatar">A</div><div class="mhead">assistant</div><div class="mtext">' +
+                sc.msgText +
+                "</div>";
+            else if (lv.k === "pre") d.innerHTML = CODE_HTML;
+            else if (lv.k === "wrap")
+              d.innerHTML =
+                '<span class="wrapidx">' + (i + 1) + "/" + n + "</span>";
+          }
+          setPos(d, lv.rect);
+          page.appendChild(d);
+        });
+        for (let i = 0; i < decorDivs.length; i++)
+          if (!sc.decor[i].under) page.appendChild(decorDivs[i]);
+      }
+      function syncAnswer() {
+        const el = page.querySelector("[data-answer]");
+        if (!el) return;
+        const pr = page.getBoundingClientRect(),
+          er = el.getBoundingClientRect();
+        const s = stageScale || 1;
+        // 写回**页面**里那一层的位置（与"链"是否被整窗兜底截断无关）。
+        const pageLevels = levelsOf();
+        pageLevels[pageLevels.length - 1].rect = [
+          (er.left - pr.left) / s,
+          (er.top - pr.top) / s,
+          er.width / s,
+          er.height / s,
+        ];
+      }
+
+      /* ------------------------------------------------------------ 环的选取规则
+   ① 锚点：窗口 / 相邻两层 / 最深答案，不考虑阈值；
+   ② 其余层与"上一条已画环"四边间距 ≥ 阈值才画；
+   ③ 强制上限：含选中层共 ≤ 7 条，先丢非锚点里间距最小、离选中层最远的。 */
+      function edgeGap(a, b) {
+        return Math.min(
+          Math.abs(a[0] - b[0]),
+          Math.abs(a[1] - b[1]),
+          Math.abs(a[0] + a[2] - b[0] - b[2]),
+          Math.abs(a[1] + a[3] - b[1] - b[3]),
+        );
+      }
+      const fmtGap = (g) =>
+        g === Infinity ? "∞" : Math.round(g * 10) / 10 + " px";
+
+      function selectRings(levels, selected, opts) {
+        // 一环的有效浓度（主题蓝 alpha）：外侧 / 内层各一个基准，再按"离选中层多远"递减。
+        // 递减给链一个方向感：外圈是背景，越靠近选中层的层越是"与你有关"的上下文。
+        // 下限是基准的 45%——窗口框是"我在哪"的参照，不能淡到看不见。
+        const ringAlpha = (i, role) => {
+          const base = role === "outer" ? state.outerAlpha : state.innerAlpha;
+          // 邻层高亮：下一步会到的上下两层亮一档，其余退一档——「下一步会到哪」直接看得见。
+          if (state.nearBright && opts.impl !== "current")
+            return i === nextStop(selected, -1) || i === nextStop(selected, 1) ? Math.min(1, base * 1.3) : base * 0.75;
+          if (!state.ramp) return base;
+          const step = Math.max(0, Math.min(6, Math.abs(i - selected)) - 1);
+          // 下限 65%：主题蓝 #1f75db 比 demo 原来那个浅蓝暗，压得太低在深色内容上就看不见了
+          // （实测：基准 45% + 下限 45% 时，最深那圈与背景只差 Δ51，外侧环 Δ74；下限提到 65%、
+          //  基准 60% 之后同样两处是 Δ~70 / Δ~105）。
+          return base * Math.max(0.65, 1 - 0.12 * step);
+        };
+        const n = levels.length,
+          last = n - 1;
+        if (opts.impl === "current") {
+          return levels.map((_, i) => {
+            if (i === selected)
+              return {
+                index: i,
+                role: "selected",
+                keep: true,
+                anchor: true,
+                gap: Infinity,
+                why: "选中层（你在这）",
+              };
+            if (i < selected)
+              return {
+                index: i,
+                role: "outer",
+                keep: true,
+                anchor: false,
+                gap: Infinity,
+                why: "当前实现：祖先全画，不塌缩",
+              };
+            return {
+              index: i,
+              role: "inner",
+              keep: false,
+              anchor: false,
+              gap: Infinity,
+              why: "当前实现：选中层之内不画",
+            };
+          });
+        }
+        const anchors = new Set([selected]);
+        if (selected > 0) anchors.add(0);
+        if (selected - 1 >= 0) anchors.add(selected - 1);
+        if (selected + 1 <= last) anchors.add(selected + 1);
+        if (opts.keepAnswer && last > selected + 1) anchors.add(last);
+
+        const rows = [],
+          kept = [];
+        // 与选中层的四边最小间距：用来判断"这一环是不是其实就是选中层那条边"。
+        const gapToSelected = (i) => edgeGap(levels[i].rect, levels[selected].rect);
+        for (let i = 0; i < n; i++) {
+          const role =
+            i === selected ? "selected" : i < selected ? "outer" : "inner";
+          const prev = kept[kept.length - 1];
+          const gap =
+            prev === undefined
+              ? Infinity
+              : edgeGap(levels[i].rect, levels[prev].rect);
+          if (i === selected) {
+            kept.push(i);
+            rows.push({
+              index: i,
+              role,
+              keep: true,
+              anchor: true,
+              gap,
+              why: "选中层 —— 只保留一个最强信号",
+            });
+            continue;
+          }
+          if (anchors.has(i)) {
+            // 锚点优先，但**与选中层重合的锚点不画**：真机上这种 1 px 内缩的包装层很常见
+            // （`cm-scroller` 贴着 `code-block-viewer`），画出来只会把选中层 2× 边框加粗成 3 px，
+            // 看起来像描边毛了，而不像"里面还有一层"。
+            const toSelected = gapToSelected(i);
+            if (toSelected < 2) {
+              rows.push({
+                index: i,
+                role,
+                keep: false,
+                anchor: true,
+                merged: true,
+                gap,
+                why:
+                  "与选中层只差 " + fmtGap(toSelected) + " —— 画出来就是把选中边框加粗，合并掉",
+              });
+              continue;
+            }
+            kept.push(i);
+            let why;
+            if (i === 0) why = "窗口：最外参照";
+            else if (i === last) why = "最深答案：按 ↓ 能回去的地方";
+            else
+              why =
+                gap === Infinity || gap >= opts.collapse
+                  ? "锚点"
+                  : "锚点（与 " +
+                    (prev + 1) +
+                    "/" +
+                    n +
+                    " 差 " +
+                    fmtGap(gap) +
+                    "，贴着也画）";
+            rows.push({
+              index: i, role, keep: true, anchor: true, gap, why,
+              alpha: ringAlpha(i, role),
+            });
+            continue;
+          }
+          if (gap >= opts.collapse) {
+            kept.push(i);
+            rows.push({
+              index: i,
+              role,
+              keep: true,
+              anchor: false,
+              gap,
+              why: "差 " + fmtGap(gap) + " ≥ " + opts.collapse + " px → 画",
+              alpha: ringAlpha(i, role),
+            });
+          } else {
+            rows.push({
+              index: i,
+              role,
+              keep: false,
+              anchor: false,
+              gap,
+              why:
+                "与 " +
+                (prev + 1) +
+                "/" +
+                n +
+                " 差 " +
+                fmtGap(gap) +
+                " < " +
+                opts.collapse +
+                " px → 塌缩",
+            });
+          }
+        }
+        let drawn = rows.filter((r) => r.keep);
+        if (drawn.length > MAX_RINGS) {
+          const droppable = rows
+            .filter((r) => r.keep && !r.anchor && r.index !== selected)
+            .sort(
+              (a, b) =>
+                a.gap - b.gap ||
+                Math.abs(b.index - selected) - Math.abs(a.index - selected) ||
+                b.index - a.index,
+            );
+          for (const r of droppable) {
+            if (rows.filter((x) => x.keep).length <= MAX_RINGS) break;
+            r.keep = false;
+            r.dropped = true;
+            r.why =
+              "超上限 " +
+              MAX_RINGS +
+              " → 丢弃（先丢离选中层最远 / 间距最小的非锚点）";
+          }
+        }
+        return rows;
+      }
+
+      /* ---------------------------------------------------------------- 文案 */
+      // ---- 两个不同的东西，两个位置（用户校正：层级计数不该和尺寸标签挤在一起）----
+      //
+      // ① 尺寸标签（`846×272 px 容器`）：**锚在框的左上角**。
+      //    常态在框外（上方 → 下方）；**只有满屏框才翻进框内左上角**——框贴顶又占满高度时
+      //    框外上下都没有 6+22 px 的位置，旧实现在这里会把标签整块丢掉，连"窗口"两个字都看不到。
+      //    最末一级仍是光标旁，给"又满高又太窄"的条状框兜底（真机实测过 `5x648`）。
+      function placeLabel(rect, tw, th, g) {
+        const clampX = (x) => Math.max(2, Math.min(x, 1280 - tw - 2));
+        if (rect[1] - g - th >= 0)
+          return { x: clampX(rect[0]), y: rect[1] - g - th, where: "框外左上" };
+        if (rect[1] + rect[3] + g + th <= 720)
+          return { x: clampX(rect[0]), y: rect[1] + rect[3] + g, where: "框外左下" };
+        if (tw <= rect[2] - 2 * g && th <= rect[3] - 2 * g)
+          return { x: clampX(rect[0] + g), y: rect[1] + g, where: "框内左上（满屏框）" };
+        const right = state.cursor.x + 14,
+          down = state.cursor.y + 14;
+        return {
+          x: right + tw <= 1280 ? right : Math.max(2, state.cursor.x - 14 - tw),
+          y: down + th <= 720 ? down : Math.max(2, state.cursor.y - 14 - th),
+          where: "光标旁",
+        };
+      }
+
+      // ② 层级徽标（只有 `6/9` 这么点大）：**框内右上角**是它的家——它就是"这个框在链上的位置"，
+      //    贴在自己身上最自然，也不会和左上角的尺寸标签抢地方。装不下时退到框外右上（徽标小，
+      //    框外几乎总有地方），最后才是光标旁。
+      function placeChip(rect, cw, ch, g) {
+        const clampX = (x) => Math.max(2, Math.min(x, 1280 - cw - 2));
+        const rightEdge = rect[0] + rect[2];
+        if (cw <= rect[2] - 2 * g && ch <= rect[3] - 2 * g)
+          return { x: clampX(rightEdge - g - cw), y: rect[1] + g, where: "框内右上" };
+        if (rect[1] - g - ch >= 0)
+          return { x: clampX(rightEdge - cw), y: rect[1] - g - ch, where: "框外右上" };
+        if (rect[1] + rect[3] + g + ch <= 720)
+          return { x: clampX(rightEdge - cw), y: rect[1] + rect[3] + g, where: "框外右下" };
+        const right = state.cursor.x + 14,
+          down = state.cursor.y + 14;
+        return {
+          x: right + cw <= 1280 ? right : Math.max(2, state.cursor.x - 14 - cw),
+          y: down + ch <= 720 ? down : Math.max(2, state.cursor.y - 14 - ch),
+          where: "光标旁",
+        };
+      }
+
+      function labelFor(i) {
+        const n = chainOf().length,
+          lv = chainOf()[i];
+        const kind = state.kindName ? KIND_ZH[lv.k] || (i === n - 1 ? "元素" : "容器") : i === 0 ? "窗口" : i === n - 1 ? "元素" : "容器";
+        let t =
+          Math.round(lv.rect[2]) +
+          "×" +
+          Math.round(lv.rect[3]) +
+          " px  " +
+          kind;
+        // 层级计数默认**不进**尺寸标签（用户校正：两者是两件事，别挤在一起）。
+        // 勾上开关可以对比"计数写在标签里"的旧形态。
+        if (state.counterInLabel && n > 1 && i !== n - 1) t += " " + (i + 1) + "/" + n;
+        // 整窗兜底 + 什么都没答上来（真机里 PrecisionOutcome::Unavailable）时标签带 `?`。
+        if (state.degraded) t += "?";
+        return t;
+      }
+
+      /// 层级徽标的文字：只在"换过层"时才有意义（最深那层就是答案本身，和确认行的 `deepest` 一致）。
+      function levelChipText(i) {
+        const n = chainOf().length;
+        if (state.counterInLabel || n <= 1 || i === Math.min(state.base, n - 1)) return "";
+        return i + 1 + "/" + n;
+      }
+      function chip(x, y, text, border, color) {
+        ctx.font = '12px "Segoe UI","Microsoft YaHei UI",sans-serif';
+        const w = Math.ceil(ctx.measureText(text).width) + 20,
+          h = 22;
+        const cx = Math.max(2, Math.min(x, 1280 - w - 2)),
+          cy = Math.max(2, Math.min(y, 720 - h - 2));
+        ctx.fillStyle = "rgba(18,24,32,.93)";
+        ctx.strokeStyle = border;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.roundRect(cx + 0.5, cy + 0.5, w - 1, h - 1, 4);
+        ctx.fill();
+        ctx.stroke();
+        ctx.fillStyle = color;
+        ctx.textBaseline = "top";
+        ctx.fillText(text, cx + 10, cy + 5);
+      }
+
+      /* ---------------------------------------------------------------- 绘制 */
+      function draw() {
+        const levels = chainOf(),
+          n = levels.length,
+          sel = state.selected;
+        const eff = effImpl();
+        const rows = selectRings(levels, sel, optsNow());
+        const target = levels[sel].rect;
+        const whole = sel === 0;
+        const walkOn = state.greenOnWalk && eff !== "current";
+        const holeOn = state.holeMask && eff !== "current";
+        const mixRGB = (a, b, t) => {
+          const A = a.split(",").map(Number),
+            B = b.split(",").map(Number);
+          return A.map((v, k) => Math.round(v + (B[k] - v) * t)).join(",");
+        };
+        // 选中层颜色：旧画法一直是捕获绿；新画法基础态是品牌蓝，滚轮时渐变到绿。整窗兜底永远中性灰。
+        const lockedNow = !!(state.lock && state.lockFx && eff !== "current");
+        const C = whole
+          ? NEUTRAL
+          : lockedNow
+            ? THEME // 确认后：定住，回到品牌蓝
+            : walkOn
+              ? mixRGB(THEME, CAPTURE, state.walkVis)
+              : CAPTURE;
+        const R = RING;                        // 链上的环一律环蓝（画在遮罩之上，要浅一档）
+        const rect = state.shown || target;
+        ctx.clearRect(0, 0, 1280, 720);
+        if (state.dim) {
+          // 遮罩 = 主题色一层 + 中性黑一层：主题色负责"这是 overlay 的界面"，
+          // 黑负责把内容压暗（只靠主题色的半透明会把深色内容洗成蓝，浅色内容又压不下去）。
+          // 顺序也重要：先中性黑压暗，再叠主题色的品牌感。反过来先铺主题色再压黑，
+          // 等于给整屏加一层灰，冰蓝会变成脏蓝。
+          // 挖洞：整屏矩形 + 选中框矩形，用 evenodd 填充，框内就是原内容。
+          const maskFill = () => {
+            if (!holeOn) {
+              ctx.fillRect(0, 0, 1280, 720);
+              return;
+            }
+            ctx.beginPath();
+            ctx.rect(0, 0, 1280, 720);
+            ctx.rect(
+              Math.round(rect[0]),
+              Math.round(rect[1]),
+              Math.round(rect[2]),
+              Math.round(rect[3]),
+            );
+            ctx.fill("evenodd");
+          };
+          if (state.maskBlack > 0) {
+            ctx.fillStyle = "rgba(0,0,0," + state.maskBlack + ")";
+            maskFill();
+          }
+          if (state.maskAlpha > 0) {
+            ctx.fillStyle = "rgba(" + THEME + "," + state.maskAlpha + ")";
+            maskFill();
+          }
+        }
+
+        const cv = walkOn ? state.walkVis : eff === "b" ? state.chainVis : 1; // 整链可见度：新画法跟着滚轮，③b 跟着空闲计时
+        const line = (r, a, w, c) => {
+          if (a <= 0.004) return;
+          ctx.strokeStyle = "rgba(" + (c || C) + "," + a + ")";
+          ctx.lineWidth = w;
+          const h = w % 2 ? 0.5 : 0;
+          ctx.strokeRect(
+            Math.round(r[0]) + h,
+            Math.round(r[1]) + h,
+            Math.round(r[2]) - 2 * h,
+            Math.round(r[3]) - 2 * h,
+          );
+        };
+        // 每一环各自的有效透明度：`selectRings` 已经算好（外侧 / 内层各一个基准 + 距离递减），
+        // 这里只是按索引取；不在当前集合里的（反面演示里正在淡出的）退回基准值。
+        const ringA = (i, role) => {
+          const row = rows.find((r) => r.index === i);
+          if (row && row.alpha !== undefined) return row.alpha;
+          return role === "outer" ? state.outerAlpha : state.innerAlpha;
+        };
+
+        // 链上的环（静态几何，不参加 101 ms 过渡）分两趟画，分界就是选中层：
+        //   外侧环（index < sel）画在选中层洗色**之下**——它们是"外面那圈上下文"；
+        //   内层环（index > sel）画在洗色**之上**——它们本来就在选中层内部，
+        //   画在下面会被那层 18% 洗色盖掉（accent 叠 accent），看上去像"没画内层"。
+        //   这是 v2 第一版的实际 bug：内层环一直都在画，只是看不见。
+        const drawRing = (i, alpha) => {
+          const fx = ringFx.get(i);
+          const a = alpha * cv * (fx ? fx.a : 1);
+          if (fx && fx.fill > 0.004) {
+            ctx.fillStyle = "rgba(" + CAPTURE + "," + fx.fill + ")";
+            ctx.fillRect.apply(ctx, levels[i].rect);
+          }
+          // 挖洞后内层环落在没压暗的原始内容上：先垫一圈极细的深色晕边，浅底上也读得出来。
+          if (holeOn && i > sel) drawHoleRing(i, levels[i].rect, a);
+          else line(levels[i].rect, a, 1, R);
+        };
+        const seen = new Set();
+        for (const row of rows) {
+          if (!row.keep || row.index === sel || row.role !== "outer") continue;
+          drawRing(row.index, ringA(row.index, "outer"));
+          seen.add(row.index);
+        }
+        // 反面演示：正在淡出的外侧环（已不在当前集合里，但 180 ms 还没走完）
+        for (const entry of ringFx) {
+          const i = entry[0],
+            fx = entry[1];
+          if (seen.has(i) || i === sel || i > sel || fx.a <= 0.004) continue;
+          drawRing(i, ringA(i, "outer"));
+        }
+        // 2) 图层栈悬停定位：画着的给亮框，被吃掉的给幽灵底色
+        if (state.hoverIndex >= 0 && state.hoverIndex !== sel) {
+          const hr = levels[state.hoverIndex].rect;
+          const row = rows.find((r) => r.index === state.hoverIndex);
+          if (row && row.keep) {
+            line(hr, 0.95, 1.5, R);
+          } else {
+            ctx.fillStyle = "rgba(" + R + ",.06)";
+            ctx.fillRect.apply(ctx, hr);
+            line(hr, 0.5, 1, R);
+          }
+        }
+        // 3) 选中层：唯一参加 101 ms 过渡的几何
+        // 洗色浓度是内层环能不能读出来的直接因素：内层环压在洗色之上，洗色越浓、环越糊。
+        // 洗色：旧画法恒定 selFill；新画法基础态为 0（挖洞已经负责突出），滚轮态是 selFill 的一半。
+        const washBase = whole ? state.selFill * 0.55 : state.selFill;
+        const wash = walkOn ? washBase * (whole ? 1 : 0.5) * state.walkVis : washBase;
+        if (wash > 0.004) {
+          ctx.fillStyle = "rgba(" + C + "," + wash + ")";
+          ctx.fillRect(rect[0], rect[1], rect[2], rect[3]);
+        }
+        const bw = whole ? 1 : state.selWidth;
+        if (holeOn) {
+          // 描边整圈画在洞外：不盖住会被截下的像素。
+          const pd = Math.ceil(bw / 2);
+          line([rect[0] - pd, rect[1] - pd, rect[2] + 2 * pd, rect[3] + 2 * pd], 1, bw);
+        } else {
+          line(rect, 1, bw);
+        }
+        // 3b) 内层环：必须画在洗色之上（见上面那条注释）。这也是 ③ 相对当前实现的全部增量：
+        //     走动之后，你走出来的那几层（含原答案）仍然是可见的回程点。
+        for (const row of rows) {
+          if (!row.keep || row.index === sel || row.role !== "inner") continue;
+          drawRing(row.index, ringA(row.index, "inner"));
+          seen.add(row.index);
+        }
+        for (const entry of ringFx) {
+          const i = entry[0],
+            fx = entry[1];
+          if (seen.has(i) || i === sel || i < sel || fx.a <= 0.004) continue;
+          drawRing(i, ringA(i, "inner"));
+        }
+        // 3c) 确认瞬间：脉冲 + 把手（点击选中框内部 = 把当前选中层定住）
+        if (lockedNow) {
+          const t = performance.now() - state.lock.t0,
+            k = Math.min(1, t / 140),
+            X0 = Math.round(rect[0]),
+            Y0 = Math.round(rect[1]),
+            W0 = Math.round(rect[2]),
+            H0 = Math.round(rect[3]);
+          if (t < 260) {
+            const e = 1 - t / 260,
+              inf = 3 + Math.round(9 * e);
+            ctx.strokeStyle = "rgba(" + THEME + "," + 0.6 * e + ")";
+            ctx.lineWidth = 1;
+            ctx.strokeRect(X0 - inf + 0.5, Y0 - inf + 0.5, W0 + 2 * inf - 1, H0 + 2 * inf - 1);
+          }
+          ctx.globalAlpha = k;
+          [[0, 0], [0.5, 0], [1, 0], [0, 0.5], [1, 0.5], [0, 1], [0.5, 1], [1, 1]].forEach((f) => {
+            const px = Math.round(X0 + W0 * f[0]),
+              py = Math.round(Y0 + H0 * f[1]);
+            ctx.fillStyle = "#fff";
+            ctx.fillRect(px - 3, py - 3, 7, 7);
+            ctx.strokeStyle = "rgb(" + THEME + ")";
+            ctx.lineWidth = 1;
+            ctx.strokeRect(px - 2.5, py - 2.5, 6, 6);
+          });
+          ctx.globalAlpha = 1;
+        }
+        // 3d) 基础态「这里还能滚」：框角淡出一个 ↑
+        if (state.upShowing && state.upHint && eff !== "current") {
+          const t = performance.now() - state.upT0;
+          const al = Math.min(1, t / 200) * (t > 2200 ? Math.max(0, (2600 - t) / 400) : 1);
+          const at = placeChip(rect, 20, 18, 6);
+          ctx.globalAlpha = al * 0.95;
+          ctx.fillStyle = "rgba(18,24,32,.93)";
+          ctx.strokeStyle = "rgba(255,255,255,.14)";
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.roundRect(at.x + 0.5, at.y + 0.5, 19, 17, 3);
+          ctx.fill();
+          ctx.stroke();
+          ctx.font = '600 12px "Segoe UI","Microsoft YaHei UI",sans-serif';
+          ctx.fillStyle = "rgb(" + RING + ")";
+          ctx.textBaseline = "middle";
+          ctx.textAlign = "center";
+          ctx.fillText("↑", at.x + 10, at.y + 9.5);
+          ctx.textAlign = "left";
+          ctx.globalAlpha = 1;
+        }
+        // 4) 光标
+        ctx.strokeStyle = "rgba(255,255,255,.6)";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(state.cursor.x - 9, state.cursor.y + 0.5);
+        ctx.lineTo(state.cursor.x + 9, state.cursor.y + 0.5);
+        ctx.moveTo(state.cursor.x + 0.5, state.cursor.y - 9);
+        ctx.lineTo(state.cursor.x + 0.5, state.cursor.y + 9);
+        ctx.stroke();
+        // 5) 预览标签：锚在缓动矩形、文字用目标尺寸；摆放走三级阶梯（见 placeLabel）
+        const text = labelFor(sel);
+        ctx.font = '12px "Segoe UI","Microsoft YaHei UI",sans-serif';
+        const tw = Math.ceil(ctx.measureText(text).width) + 20,
+          th = 22,
+          g = 6;
+        const placed = placeLabel(rect, tw, th, g);
+        q("#labelWhere").textContent = placed.where;
+        if (placed) {
+          const pl = [placed.x, placed.y];
+          ctx.fillStyle = "rgba(18,24,32,.93)";
+          ctx.strokeStyle = "rgba(255,255,255,.14)";
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.roundRect(pl[0] + 0.5, pl[1] + 0.5, tw - 1, th - 1, 4);
+          ctx.fill();
+          ctx.stroke();
+          ctx.fillStyle = "#e8edf4";
+          ctx.textBaseline = "top";
+          ctx.fillText(text, pl[0] + 10, pl[1] + 5);
+        }
+        // 5b) 层级徽标：**独立于尺寸标签**（用户校正：两件事别挤在一起），位置在框内右上。
+        //     形态有四种，都在选择器里（用户问"6/9 能不能更直观地表达 6 是当前、9 是总数"）：
+        //       · fraction  `6/9`      —— 现状。斜杠是书写约定，不解释就不知道哪边是"我"。
+        //       · emphasis  `6` 大亮 + `/9` 小灰 —— 字号/颜色分层：大的亮的那个就是你。
+        //       · dots      ●●●●●◉○○○ —— 点列：N 个点 = N 层，填实=已走过、空心=还在里面、
+        //                                当前那个是捕获绿且更大。没有要学的记号，位置即序号；
+        //                                而且它就是画面上那些环的缩略图，颜色分工和环一致。
+        //       · stack     ▮▮▮▮▮▮▯▯▯ —— 分段条：更紧凑的点列（每格 4 px），读法同上。
+        const chipText = levelChipText(sel);
+        // 新画法：徽标随滚轮浮现，静止后留成淡淡的「你换过层」标记（不是唯一的颜色信息）。
+        ctx.globalAlpha = walkOn ? 0.45 + 0.55 * state.walkVis : 1;
+        if (chipText) {
+          const n = chainOf().length,
+            style = state.chipStyle;
+          const ch = 18,
+            pad = 6,
+            // 点列/分段条超过 12 层就开窗（两侧画省略号），免得徽标无限变宽。
+            windowed = (style === "dots" || style === "stack") && n > 12,
+            slots = windowed ? 9 : n,
+            // 点距要留出可见的空隙：半径 2.0 / 间距 6 → 填充点之间还有 2 px，
+            // 否则一连串填充点会连成一条杠（第一版就是 4.4 px 直径 + 0.6 px 间距，实测糊成一根）。
+            // 间距要按"最大的那个点"留：当前层半径 3.2 + 已走过 2.3，再留 1.5 px 空隙 → 7。
+            // 放大 8 倍看过：半径 2.2 / 间距 6 时，实心点是软边一团、空心点是清晰的环，
+            // 结果**空心比实心更抢眼**，读出来是"几个圈 + 一个亮点"。
+            cell = style === "stack" ? 4 : 7;
+          let cw;
+          if (style === "fraction") {
+            ctx.font = '11px "Segoe UI","Microsoft YaHei UI",sans-serif';
+            cw = Math.ceil(ctx.measureText(chipText).width) + 12;
+          } else if (style === "emphasis") {
+            ctx.font = '600 12px "Segoe UI","Microsoft YaHei UI",sans-serif';
+            cw = Math.ceil(ctx.measureText(String(sel + 1)).width) + 12;
+            ctx.font = '10px "Segoe UI","Microsoft YaHei UI",sans-serif';
+            cw += Math.ceil(ctx.measureText("/" + n).width) + 2;
+          } else if (style === "reach") {
+            cw = 54; // 固定宽度：两格各 ~21 px，不随层数跳
+          } else if (style === "track") {
+            cw = 46; // 固定宽度滑轨
+          } else {
+            cw = slots * cell + (windowed ? 14 : 0) + 2 * pad;
+          }
+          const at = placeChip(rect, cw, ch, g);
+          // 调试用：把徽标矩形暴露出来，好让自检脚本扫描它的像素（不影响画面）。
+          window.__chipRect = { x: at.x, y: at.y, w: cw, h: ch };
+          q("#chipWhere").textContent =
+            at.where + "（" + ({ fraction: "6/9", emphasis: "数字分层", dots: "点列", stack: "分段条", reach: "滚轮余量", track: "迷你滑轨" })[style] + " · " + cw + "×" + ch + "）";
+          ctx.fillStyle = "rgba(18,24,32,.93)";
+          ctx.strokeStyle = "rgba(255,255,255,.14)";
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.roundRect(at.x + 0.5, at.y + 0.5, cw - 1, ch - 1, 3);
+          ctx.fill();
+          ctx.stroke();
+          if (style === "fraction") {
+            ctx.font = '11px "Segoe UI","Microsoft YaHei UI",sans-serif';
+            ctx.fillStyle = "#e8edf4";
+            ctx.textBaseline = "top";
+            ctx.fillText(chipText, at.x + pad, at.y + 3);
+          } else if (style === "reach") {
+            // 滚轮余量：↑ = 往外（滚轮上）还能走几格，↓ = 往里（滚轮下）还能走几格。
+            // 到头的那一侧整体变暗——给滚轮一个"撞墙"的反馈。当前层身份由环的洗色表达，这里不重复。
+            const up = stopsFrom(sel, -1),
+              down = stopsFrom(sel, 1),
+              half = cw / 2,
+              cy = at.y + ch / 2;
+            ctx.textBaseline = "middle";
+            [[up, "↑", at.x + pad], [down, "↓", at.x + half + 2]].forEach(([k, arrow, x0]) => {
+              const live = k > 0;
+              ctx.font = '11px "Segoe UI","Microsoft YaHei UI",sans-serif';
+              ctx.fillStyle = live ? "rgb(" + CAPTURE + ")" : "rgba(200,208,219,.28)";
+              ctx.fillText(arrow, x0, cy + 0.5);
+              ctx.font = '600 11px "Segoe UI","Microsoft YaHei UI",sans-serif';
+              ctx.fillStyle = live ? "#e8edf4" : "rgba(200,208,219,.28)";
+              ctx.fillText(String(k), x0 + 10, cy + 0.5);
+            });
+            ctx.fillStyle = "rgba(255,255,255,.1)";
+            ctx.fillRect(Math.round(at.x + half), at.y + 4, 1, ch - 8);
+          } else if (style === "track") {
+            // 迷你滑轨：滚动条隐喻——滑块位置 = 当前层在链上的位置（左=窗口，右=最深）。
+            const x0 = at.x + pad + 4,
+              x1 = at.x + cw - pad - 4,
+              cy = Math.round(at.y + ch / 2),
+              t = n > 1 ? sel / (n - 1) : 0,
+              tx = Math.round(x0 + (x1 - x0) * t);
+            ctx.fillStyle = "rgba(" + RING + ",.4)";
+            ctx.fillRect(x0 - 4, cy, x1 - x0 + 8, 1);
+            ctx.fillRect(x0 - 4, cy - 3, 1, 7); // 左端：窗口
+            ctx.fillRect(x1 + 3, cy - 3, 1, 7); // 右端：最深
+            ctx.beginPath();
+            ctx.roundRect(tx - 4 + 0.5, cy - 3 + 0.5, 7, 6, 2);
+            ctx.fillStyle = "rgb(" + CAPTURE + ")";
+            ctx.strokeStyle = "rgba(18,24,32,.95)";
+            ctx.lineWidth = 1;
+            ctx.fill();
+            ctx.stroke();
+          } else if (style === "emphasis") {
+            // 当前层级：大、亮、捕获绿；总数：小、灰、退成脚注。
+            ctx.textBaseline = "top";
+            ctx.font = '600 12px "Segoe UI","Microsoft YaHei UI",sans-serif';
+            ctx.fillStyle = "rgb(" + CAPTURE + ")";
+            const cur = String(sel + 1);
+            ctx.fillText(cur, at.x + pad, at.y + 2);
+            ctx.font = '10px "Segoe UI","Microsoft YaHei UI",sans-serif';
+            ctx.fillStyle = "rgba(200,208,219,.75)";
+            ctx.fillText(
+              "/" + n,
+              at.x + pad + Math.ceil(ctx.measureText(cur).width) + 2,
+              at.y + 4 + 1,
+            );
+          } else {
+            const start = windowed ? Math.max(0, Math.min(n - slots, sel - 4)) : 0;
+            const cy = at.y + ch / 2;
+            if (windowed) {
+              ctx.fillStyle = "rgba(200,208,219,.6)";
+              ctx.font = '9px "Segoe UI",sans-serif';
+              ctx.textBaseline = "middle";
+              ctx.fillText("…", at.x + pad - 2, cy);
+            }
+            // 小尺寸下圆在像素网格上是糊的（半径 2–3 px 全靠抗锯齿），所以三种记号都用
+            // **圆角方块**画：同样的"点"观感，但边缘落在整像素上，1× 下是干净的形。
+            const mark = (cx, cy, size, fill, stroke) => {
+              const half = size / 2,
+                left = Math.round(cx - half),
+                top = Math.round(cy - half);
+              ctx.beginPath();
+              ctx.roundRect(left + 0.5, top + 0.5, size - 1, size - 1, size <= 5 ? 1.5 : 2);
+              if (fill) {
+                ctx.fillStyle = fill;
+                ctx.fill();
+              }
+              if (stroke) {
+                ctx.strokeStyle = stroke;
+                ctx.lineWidth = 1;
+                ctx.stroke();
+              }
+            };
+            for (let k = 0; k < slots; k++) {
+              const level = start + k,
+                cx = at.x + pad + (windowed ? 10 : 0) + k * cell + cell / 2;
+              if (level === sel) {
+                // 当前层：最大（6）、纯捕获绿，外面套一圈深色把邻居切开。
+                mark(cx, cy, 6, "rgb(" + CAPTURE + ")", "rgba(18,24,32,.95)");
+              } else if (style === "stack") {
+                ctx.fillStyle =
+                  level < sel ? "rgba(" + RING + ",.55)" : "rgba(" + RING + ",.22)";
+                ctx.fillRect(cx - 1.5, cy - 4, 3, 8);
+              } else {
+                // 已走过 = 实心且亮（0.95）；还在里面 = 空心（描边 0.5）。两者都是 5 px，
+                // 差别靠"实/空 + 亮度"，大小只留给当前层——这样"● ● ● ● ● ◉ ○ ○ ○"一眼成串。
+                if (level < sel) mark(cx, cy, 5, "rgba(" + RING + ",.95)", null);
+                else mark(cx, cy, 5, null, "rgba(" + RING + ",.5)");
+              }
+            }
+            if (windowed) {
+              ctx.fillStyle = "rgba(200,208,219,.6)";
+              ctx.font = '9px "Segoe UI",sans-serif';
+              ctx.textBaseline = "middle";
+              ctx.fillText("…", at.x + cw - pad - 4, cy);
+            }
+          }
+        } else {
+          q("#chipWhere").textContent = "（未换层，不显示）";
+        }
+        ctx.globalAlpha = 1;
+        // 6) 悬停名称浮签 / 一次性提示 / 对照徽标
+        if (state.hoverIndex >= 0) {
+          const hi = state.hoverIndex,
+            hv = levels[hi];
+          const role =
+            hi === 0
+              ? "窗口"
+              : hi === n - 1
+                ? "最深答案"
+                : hi < sel
+                  ? "外侧祖先"
+                  : "内层";
+          chip(
+            hv.rect[0],
+            hv.rect[1] - 26,
+            hi + 1 + "/" + n + " · " + hv.id + " · " + role,
+            "rgba(31,117,219,.75)",
+            "#cfe0ff",
+          );
+        }
+        if (state.hintText)
+          chip(
+            state.cursor.x + 14,
+            state.cursor.y + 16,
+            state.hintText,
+            "rgba(255,212,121,.55)",
+            "#ffd479",
+          );
+        if (state.peek)
+          chip(
+            10,
+            10,
+            "对照中：当前实现（松开 C 返回 ③）",
+            "rgba(255,212,121,.5)",
+            "#ffd479",
+          );
+      }
+
+      /* ------------------------------------------------- 环的渐隐（反面演示）+ ③b 淡出 */
+      const ringFx = new Map();
+      let fxActive = false,
+        chainFading = false,
+        easingNow = false;
+
+      function recomputeRingFx(prevSel, prevRows, newRows) {
+        ringFx.clear();
+        if (!state.ringAnim || effImpl() === "current") return;
+        const prev = new Set(
+          prevRows
+            .filter((r) => r.keep && r.index !== prevSel)
+            .map((r) => r.index),
+        );
+        const cur = new Set(
+          newRows
+            .filter((r) => r.keep && r.index !== state.selected)
+            .map((r) => r.index),
+        );
+        const now = performance.now();
+        for (const i of cur) {
+          if (i === prevSel)
+            ringFx.set(i, {
+              from: 1,
+              to: 1,
+              a: 1,
+              t0: now,
+              dur: 180,
+              fillFrom: 0.18,
+              fillTo: 0,
+              fill: 0.18,
+            }); // 旧选中层：洗色淡出
+          else if (!prev.has(i))
+            ringFx.set(i, { from: 0, to: 1, a: 0, t0: now, dur: 180 }); // 新环淡入
+        }
+        for (const i of prev) {
+          if (i !== state.selected && !cur.has(i))
+            ringFx.set(i, { from: 1, to: 0, a: 1, t0: now, dur: 180 }); // 旧环淡出
+        }
+      }
+      function stepRingFx(now) {
+        if (!state.ringAnim || effImpl() === "current") {
+          ringFx.clear();
+          fxActive = false;
+          return;
+        }
+        if (!ringFx.size) {
+          fxActive = false;
+          return;
+        }
+        let active = false;
+        for (const entry of ringFx) {
+          const i = entry[0],
+            fx = entry[1];
+          const t = Math.min(1, (now - fx.t0) / fx.dur),
+            e = t * (2 - t);
+          fx.a = fx.from + (fx.to - fx.from) * e;
+          if (fx.fillFrom !== undefined)
+            fx.fill = fx.fillFrom + (fx.fillTo - fx.fillFrom) * e;
+          if (t >= 1 && fx.to === 0) ringFx.delete(i);
+          else if (t < 1) active = true;
+        }
+        fxActive = active;
+      }
+      function stepChain(now) {
+        // ③b：空闲 1.2 s 后，整链按 8 步量化淡出（≈8 帧额外满屏）
+        chainFading = false;
+        if (effImpl() !== "b") return;
+        const idle = now - state.lastWalk;
+        if (idle < 1200) {
+          if (state.chainVis !== 1) {
+            state.chainVis = 1;
+            requestDraw();
+          }
+          return;
+        }
+        const t = Math.min(1, (idle - 1200) / 240);
+        const v = Math.round((1 - t) * 8) / 8;
+        chainFading = v > 0;
+        if (v !== state.chainVis) {
+          state.chainVis = v;
+          requestDraw();
+        }
+      }
+
+      /* ---- 交互建议项 ---- */
+      const rectDiff = (a, b) =>
+        Math.max(Math.abs(a[0] - b[0]), Math.abs(a[1] - b[1]), Math.abs(a[0] + a[2] - b[0] - b[2]), Math.abs(a[1] + a[3] - b[1] - b[3]));
+      const inRect = (r, x, y) => x >= r[0] && x <= r[0] + r[2] && y >= r[1] && y <= r[1] + r[3];
+      // ① 滚轮一格 = 走到「视觉上不同」的下一层：四条边都和当前框差不到塌缩阈值的层直接跳过。
+      function nextStop(cur, dir) {
+        const lv = chainOf(),
+          n = lv.length;
+        if (!state.skipNear || effImpl() === "current") {
+          const j = cur + dir;
+          return j >= 0 && j < n ? j : cur;
+        }
+        for (let j = cur + dir; j >= 0 && j < n; j += dir)
+          if (rectDiff(lv[j].rect, lv[cur].rect) >= state.collapse) return j;
+        return cur;
+      }
+      function stopsFrom(sel, dir) {
+        let c = sel,
+          k = 0;
+        for (;;) {
+          const j = nextStop(c, dir);
+          if (j === c) break;
+          c = j;
+          k++;
+        }
+        return k;
+      }
+      // ② 触控板：累积到 100 才算一步，一步之后 80 ms 冷却（吃掉惯性尾巴）
+      let wheelAcc = 0,
+        wheelLast = 0,
+        wheelLock = 0;
+      // ③ 光标移出选中框 → 对新位置重新吸附；还在框内（含微抖）→ 层级保持
+      function maybeResnap() {
+        const lv = chainOf();
+        if (lv.length < 2 || !lv[state.selected]) return;
+        const x = state.cursor.x,
+          y = state.cursor.y;
+        if (inRect(lv[state.selected].rect, x, y)) return;
+        let hit = -1;
+        lv.forEach((l, i) => {
+          if (inRect(l.rect, x, y)) hit = i;
+        });
+        if (hit < 0) return;
+        const now = performance.now();
+        state.base = hit;
+        let target = hit;
+        if (state.carryOn && now < state.carryUntil && state.carryOff > 0) {
+          target = Math.max(0, hit - state.carryOff);
+          state.carryUntil = now + 2000;
+          state.hintText = "沿用「往外 " + state.carryOff + " 层」";
+          state.hintUntil = now + 1400;
+        }
+        setSelected(target, "snap");
+      }
+      // ④ 基础态「这里还能滚」的暗示：停留 600 ms 后在框角淡出一个 ↑，滚动或点击即消失，每会话最多 3 次
+      function stepUpHint(now) {
+        if (!state.upHint || state.peek) {
+          if (state.upShowing) {
+            state.upShowing = false;
+            requestDraw();
+          }
+          return;
+        }
+        if (state.upShowing) {
+          if (now - state.upT0 > 2600) state.upShowing = false;
+          requestDraw();
+          return;
+        }
+        if (
+          state.upCount < 3 && !state.lock && state.walkVis === 0 && state.selected === state.base &&
+          now - state.dwellStart > 600 && now - state.lastWheel > 1500 &&
+          chainOf().length > 1 && nextStop(state.selected, -1) !== state.selected
+        ) {
+          state.upShowing = true;
+          state.upT0 = now;
+          state.upCount++;
+          requestDraw();
+        }
+      }
+      // ⑤ 点击选中框内部 = 确认：绿→蓝「定住」，脉冲一下，长出把手
+      function lockSelection() {
+        state.lock = { t0: performance.now() };
+        state.lastWheel = -1e9;
+        state.walkVis = 0;
+        state.upShowing = false;
+        requestDraw();
+      }
+      function stepLock(now) {
+        if (state.lock && now - state.lock.t0 < 300) requestDraw();
+      }
+      // ⑥ 尺寸标签的类型名
+      const KIND_ZH = { window: "窗口", viewport: "视口", shell: "侧栏", list: "列表", message: "消息", codecard: "代码块", scroller: "滚动区", pre: "代码区", answer: "元素" };
+
+      /* ---- 内层环自适应（产品做法的 demo 近似）----
+         产品里：换层时在截图位图上沿环的四条边各采样一排像素，取中位亮度。
+         demo 里没有位图，改读页面元素的实际背景色（等价于「文字以外的底色」）。
+         每条边独立决定：①环色在 4 档蓝里挑第一个对比 ≥ 3:1 的；②都不够才垫晕边，垫到刚好 3:1。 */
+      const bgCache = new Map();
+      const relLum = (c) => {
+        const f = (v) => ((v /= 255) <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4));
+        return 0.2126 * f(c[0]) + 0.7152 * f(c[1]) + 0.0722 * f(c[2]);
+      };
+      const contrastOf = (a, b) => {
+        const la = relLum(a),
+          lb = relLum(b);
+        return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
+      };
+      const mixC = (f, b, t) => [t * f[0] + (1 - t) * b[0], t * f[1] + (1 - t) * b[1], t * f[2] + (1 - t) * b[2]];
+      function pageBgAt(x, y) {
+        const bb = stage.getBoundingClientRect();
+        const els = document.elementsFromPoint(bb.left + x * stageScale, bb.top + y * stageScale);
+        const el = els.find((e) => e !== page && page.contains(e)) || page;
+        const layers = [];
+        for (let e = el; e; e = e.parentElement) {
+          const m = getComputedStyle(e).backgroundColor.match(/[\d.]+/g);
+          if (m) {
+            const al = m.length > 3 ? +m[3] : 1;
+            if (al > 0) layers.push([+m[0], +m[1], +m[2], al]);
+            if (al >= 0.999) break;
+          }
+          if (e === stage) break;
+        }
+        let c = [10, 13, 18];
+        for (let k = layers.length - 1; k >= 0; k--) c = mixC(layers[k], c, layers[k][3]);
+        return c;
+      }
+      function ringBgSides(i) {
+        const key = state.scenario + "|" + i;
+        let v = bgCache.get(key);
+        if (v) return v;
+        const r = levelsOf()[i].rect,
+          x = r[0],
+          y = r[1],
+          w = r[2],
+          h = r[3];
+        const ts = [0.1, 0.25, 0.4, 0.5, 0.6, 0.75, 0.9];
+        const pick = (pts) => {
+          const cs = pts.map((p) => pageBgAt(p[0], p[1]));
+          cs.sort((a, b) => relLum(a) - relLum(b));
+          return cs[cs.length >> 1]; // 中位亮度
+        };
+        v = [
+          pick(ts.map((t) => [x + w * t, y + 1.5])),
+          pick(ts.map((t) => [x + w - 1.5, y + h * t])),
+          pick(ts.map((t) => [x + w * t, y + h - 1.5])),
+          pick(ts.map((t) => [x + 1.5, y + h * t])),
+        ];
+        bgCache.set(key, v);
+        return v;
+      }
+      const TONE_PREF = [[74, 155, 255], [109, 176, 255], [31, 117, 219], [140, 196, 255]]; // 环蓝 → 浅一档 → 品牌蓝 → 最浅
+      function ringStyleFor(B, alpha, fixed, maxHalo, auto, constHalo) {
+        const tones = fixed ? [fixed] : TONE_PREF;
+        const cAt = (t, h) => {
+          const fl = h > 0 ? mixC([0, 0, 0], B, h) : B;
+          return contrastOf(mixC(t, fl, alpha), fl);
+        };
+        const first = (h) => tones.find((t) => cAt(t, h) >= 3);
+        const best = (h) => tones.reduce((m, t) => (cAt(t, h) > cAt(m, h) ? t : m), tones[0]);
+        if (!auto) return { t: first(0) || best(0), h: constHalo };
+        const t0 = first(0);
+        if (t0) return { t: t0, h: 0 };
+        for (let h = 0.05; h <= maxHalo + 1e-6; h += 0.05) {
+          const t = first(h);
+          if (t) return { t, h };
+        }
+        return { t: best(maxHalo), h: maxHalo };
+      }
+      function drawHoleRing(i, r, a) {
+        if (a <= 0.004) return;
+        const B = ringBgSides(i);
+        const fixed = state.innerRingRGB === "auto" ? null : state.innerRingRGB.split(",").map(Number);
+        const X = Math.round(r[0]),
+          Y = Math.round(r[1]),
+          W = Math.round(r[2]),
+          H = Math.round(r[3]);
+        // 四条边各自一个矩形：角上的像素归上、下两条边，左右边不含角，晕边同理，不会重叠加深。
+        const sides = [
+          { ring: [X, Y, W, 1], halo: [X - 1, Y - 1, W + 2, 3] },
+          { ring: [X + W - 1, Y + 1, 1, Math.max(0, H - 2)], halo: [X + W - 2, Y + 2, 3, Math.max(0, H - 4)] },
+          { ring: [X, Y + H - 1, W, 1], halo: [X - 1, Y + H - 2, W + 2, 3] },
+          { ring: [X, Y + 1, 1, Math.max(0, H - 2)], halo: [X - 1, Y + 2, 3, Math.max(0, H - 4)] },
+        ];
+        const st = sides.map((_, k) =>
+          ringStyleFor(B[k], state.innerAlpha, fixed, state.halo, state.haloAuto, state.halo),
+        );
+        const fade = Math.min(1, a / Math.max(0.01, state.innerAlpha));
+        sides.forEach((sd, k) => {
+          const ha = st[k].h * fade;
+          if (ha > 0.004) {
+            ctx.fillStyle = "rgba(0,0,0," + ha + ")";
+            ctx.fillRect.apply(ctx, sd.halo);
+          }
+        });
+        sides.forEach((sd, k) => {
+          ctx.fillStyle = "rgba(" + st[k].t.map(Math.round).join(",") + "," + a + ")";
+          ctx.fillRect.apply(ctx, sd.ring);
+        });
+      }
+
+      // 绿色 / 环 / 徽标的生灭：滚轮一动 100 ms 内升到 1；停下 1.2 s 后 8 步量化降到 0（同 ③b 的节奏）。
+      let walkPrev = 0;
+      function stepWalk(now) {
+        const dt = Math.min(64, now - walkPrev || 16);
+        walkPrev = now;
+        if (!(state.greenOnWalk && effImpl() !== "current")) return;
+        const idle = now - state.lastWheel;
+        let v = state.walkVis;
+        if (idle < 1200) v = Math.min(1, v + dt / 100);
+        else v = Math.min(v, Math.round((1 - Math.min(1, (idle - 1200) / 240)) * 8) / 8);
+        if (v > 0 && v < 1) chainFading = true; // 计入「环动画帧」
+        if (v !== state.walkVis) {
+          state.walkVis = v;
+          requestDraw();
+        }
+      }
+
+      /* ---------------------------------------------------------------- 渲染循环
+   脏标记驱动：没变化就不 present —— 计数是本页真实数字，不是装饰。 */
+      let presents = 0,
+        ringFrames = 0,
+        lastUs = 0,
+        maxUs = 0;
+      const HIST = 220,
+        hist = new Uint8Array(HIST);
+      let histHead = 0;
+
+      function present() {
+        const t0 = performance.now();
+        draw();
+        const us = Math.round((performance.now() - t0) * 1000);
+        if (us > 0) lastUs = us;
+        if (us > maxUs) maxUs = us;
+        presents++;
+        if ((fxActive || chainFading) && !easingNow) ringFrames++;
+        dirty = false;
+        q("#mPresent").textContent = presents;
+        q("#mRing").textContent = ringFrames;
+        q("#mUs").textContent = lastUs + " / " + maxUs + " µs";
+      }
+      function drawStrip() {
+        sctx.clearRect(0, 0, strip.width, strip.height);
+        sctx.fillStyle = "#2a323d";
+        sctx.fillRect(0, strip.height - 3, strip.width, 3);
+        sctx.fillStyle = "rgba(31,117,219,.85)";
+        for (let k = 0; k < HIST; k++) {
+          if (!hist[(histHead + k) % HIST]) continue;
+          sctx.fillRect(k, strip.height - 3 - 11, 1, 11);
+        }
+      }
+      function updateStatus(now) {
+        let s;
+        if (easingNow) s = "选中层缓动中（101 ms）";
+        else if (fxActive) s = "环渐隐中（180 ms · 反面演示）";
+        else if (chainFading) s = "③b：链淡出中";
+        else if (effImpl() === "b") {
+          const idle = now - state.lastWalk;
+          s =
+            idle < 1200
+              ? "稳定 · " + ((1200 - idle) / 1000).toFixed(1) + " s 后淡出"
+              : "稳定 · 链已淡出（换层或动光标复现）";
+        } else s = "稳定（0 重绘）";
+        q("#mState").textContent = s;
+      }
+      function frame(now) {
+        if (state.hintText && now >= state.hintUntil) {
+          state.hintText = "";
+          requestDraw();
+        }
+        easingNow = false;
+        if (state.anim) {
+          const t = Math.min(1, (now - state.anim.start) / state.anim.dur);
+          const e = 1 - (1 - t) * (1 - t); // OutQuad
+          state.shown = state.anim.from.map(
+            (v, i) => v + (state.anim.to[i] - v) * e,
+          );
+          if (t >= 1) {
+            state.anim = null;
+            state.shown = chainOf()[state.selected].rect.slice();
+          }
+          easingNow = true;
+          requestDraw();
+        }
+        stepRingFx(now);
+        if (fxActive) requestDraw();
+        stepChain(now);
+        stepWalk(now);
+        stepUpHint(now);
+        stepLock(now);
+        let presented = false;
+        if (dirty) {
+          present();
+          presented = true;
+        }
+        hist[histHead] = presented ? 1 : 0;
+        histHead = (histHead + 1) % HIST;
+        drawStrip();
+        updateStatus(now);
+        requestAnimationFrame(frame);
+      }
+      function resetMetrics() {
+        presents = 0;
+        ringFrames = 0;
+        lastUs = 0;
+        maxUs = 0;
+        hist.fill(0);
+        drawStrip();
+        q("#mPresent").textContent = "0";
+        q("#mRing").textContent = "0";
+        q("#mUs").textContent = "— / —";
+      }
+
+      /* ---------------------------------------------------------------- 走动 */
+      function setSelected(next, src) {
+        const levels = chainOf(),
+          n = levels.length;
+        const c = Math.max(0, Math.min(n - 1, next));
+        const user = src !== "snap"; // "snap" = 光标重新吸附，不算「在滚」
+        if (user) {
+          const now0 = performance.now();
+          state.lastWheel = now0; // 滚轮撞到头也算「在滚」：绿色和环继续亮着
+          state.carryUntil = now0 + 2000;
+          state.carryOff = Math.max(0, state.base - c);
+        }
+        state.lock = null;
+        state.upShowing = false;
+        state.dwellStart = performance.now();
+        if (c === state.selected) {
+          requestDraw();
+          return;
+        }
+        const prevSel = state.selected;
+        const prevRows = selectRings(levels, prevSel, optsNow());
+        const from = state.shown
+          ? state.shown.slice()
+          : levels[prevSel].rect.slice();
+        state.selected = c;
+        const to = levels[c].rect;
+        state.lastWalk = performance.now();
+        state.chainVis = 1;
+        if (state.ease)
+          state.anim = { from, to, start: performance.now(), dur: 101 };
+        else {
+          state.anim = null;
+          state.shown = to.slice();
+        }
+        recomputeRingFx(prevSel, prevRows, selectRings(levels, c, optsNow()));
+        // 一次性提示：挂着的时候继续换层会跟着走；消失后不再复活（每会话只教一次）
+        const showing =
+          performance.now() < state.hintUntil && state.hintText !== "";
+        if (user && (!state.taught || showing)) {
+          state.taught = true;
+          state.hintText =
+            "吸附层级 " + (c + 1) + "/" + n + "（1=窗口）· 滚轮 / ↑↓ 切换";
+          state.hintUntil = performance.now() + 2600;
+        }
+        renderStack();
+        requestDraw();
+      }
+      function setPeek(v) {
+        if (state.peek === v) return;
+        state.peek = v;
+        ringFx.clear();
+        if (!v) state.lastWalk = performance.now();
+        renderStack();
+        requestDraw();
+      }
+
+      /* ---------------------------------------------------------------- 侧栏 */
+      function renderStack() {
+        const levels = chainOf(),
+          n = levels.length,
+          eff = effImpl();
+        const rows = selectRings(levels, state.selected, optsNow());
+        const drawn = rows.filter((r) => r.keep).length;
+        const dropped = rows.filter((r) => r.dropped).length;
+        const merged = rows.filter((r) => r.merged).length;
+        const collapsed = rows.filter((r) => !r.keep && !r.dropped && !r.merged).length;
+        const outerDrawn = rows.filter((r) => r.keep && r.role === "outer").length;
+        const innerDrawn = rows.filter((r) => r.keep && r.role === "inner").length;
+        // 把"绿恒一个、蓝可以有多个"这条不变量打在脸上：滚轮连滚时最该确认的就是它。
+        const capture = eff === "current" || state.selected !== 0 ? 1 : 0;
+        let stats =
+          n +
+          " 层 → <b style='color:#1bb15f'>捕获 " +
+          capture +
+          "</b> + 环 " +
+          (drawn - 1) +
+          "（外 " +
+          outerDrawn +
+          " · 内 " +
+          innerDrawn +
+          "）";
+        if (drawn > MAX_RINGS && eff === "current")
+          stats += "（当前实现不封顶）";
+        stats += " · 塌缩 " + collapsed;
+        if (dropped) stats += ' · 丢弃 <b class="warn">' + dropped + "</b>";
+        if (merged) stats += ' · 与选中层合并 <b class="warn">' + merged + "</b>";
+        stats += " · 上限 " + MAX_RINGS;
+        q("#stackStats").innerHTML = stats;
+        q("#levelChip").textContent =
+          state.selected === n - 1
+            ? n + "/" + n + " · 最深"
+            : state.selected + 1 + "/" + n;
+        q("#stack").innerHTML = rows
+          .map((r) => {
+            const i = r.index,
+              lv = levels[i];
+            const role =
+              i === state.selected
+                ? "你在这"
+                : i === 0
+                  ? "窗口"
+                  : i === n - 1
+                    ? "最深答案"
+                    : i < state.selected
+                      ? "外侧祖先"
+                      : "内层";
+            const st =
+              i === state.selected
+                ? "rsel"
+                : r.keep
+                  ? "keep"
+                  : r.merged
+                    ? "drop"
+                    : r.dropped
+                    ? "drop"
+                    : "skip";
+            const tag =
+              i === state.selected
+                ? "你在这"
+                : r.merged
+                  ? "合并"
+                  : r.dropped
+                  ? "丢弃"
+                  : r.keep
+                    ? "画"
+                    : eff === "current"
+                      ? "不画"
+                      : "塌缩";
+            const tc =
+              i === state.selected
+                ? "t-sel"
+                : r.merged
+                  ? "t-drop"
+                  : r.dropped
+                  ? "t-drop"
+                  : r.keep
+                    ? "t-keep"
+                    : "t-skip";
+            return (
+              '<div class="lrow ' +
+              st +
+              '" data-i="' +
+              i +
+              '">' +
+              '<span class="dot"><i></i></span>' +
+              '<span class="lbody"><span class="ltop">' +
+              '<span class="lk">' +
+              (i + 1) +
+              "/" +
+              n +
+              "</span>" +
+              '<span class="lname' +
+              (r.role === "inner" ? " r-inner" : "") +
+              '">' +
+              lv.id +
+              "</span>" +
+              '<span class="ltag ' +
+              tc +
+              '">' +
+              tag +
+              "</span></span>" +
+              '<span class="lwhy">' +
+              role +
+              " · " +
+              r.why +
+              "</span></span></div>"
+            );
+          })
+          .join("");
+      }
+      function updateLegend() {
+        q("#lgOuter").textContent = Math.round(state.outerAlpha * 100) + "%";
+        q("#lgInner").textContent = Math.round(state.innerAlpha * 100) + "%";
+        q("#lgSel").textContent = state.selWidth + "×";
+        q("#swOuter").style.borderColor =
+          "rgba(" + THEME + "," + state.outerAlpha + ")";
+        q("#swInner").style.borderColor =
+          "rgba(" + (state.holeMask ? (state.innerRingRGB === "auto" ? RING : state.innerRingRGB) : THEME) + "," + state.innerAlpha + ")";
+      }
+      function paintSeg() {
+        document
+          .querySelectorAll("#implSeg button")
+          .forEach((b) =>
+            b.classList.toggle("on", b.dataset.impl === state.impl),
+          );
+      }
+
+      /* ---------------------------------------------------------------- 交互 */
+      function bindEvents() {
+        stage.addEventListener("mousemove", (e) => {
+          const b = stage.getBoundingClientRect();
+          state.cursor = {
+            x: (e.clientX - b.left) / stageScale,
+            y: (e.clientY - b.top) / stageScale,
+          };
+          if (state.impl === "b") state.lastWalk = performance.now(); // 光标保活（on_hover_tick 语义）
+          if (state.cursorRule && !state.peek) maybeResnap();
+          requestDraw();
+        });
+        stage.addEventListener(
+          "wheel",
+          (e) => {
+            e.preventDefault();
+            let dir;
+            if (state.wheelAccum) {
+              const nowW = performance.now();
+              if (nowW < wheelLock) return;
+              if (nowW - wheelLast > 220) wheelAcc = 0;
+              wheelLast = nowW;
+              const dy = e.deltaY * (e.deltaMode === 1 ? 40 : e.deltaMode === 2 ? 400 : 1);
+              if (dy * wheelAcc < 0) wheelAcc = 0;
+              wheelAcc += dy;
+              if (Math.abs(wheelAcc) < 100) return;
+              dir = wheelAcc > 0 ? 1 : -1;
+              wheelAcc = 0;
+              wheelLock = nowW + 80;
+            } else dir = e.deltaY > 0 ? 1 : -1;
+            setSelected(nextStop(state.selected, dir));
+          },
+          { passive: false },
+        );
+        stage.addEventListener("click", (e) => {
+          const b = stage.getBoundingClientRect();
+          const x = (e.clientX - b.left) / stageScale,
+            y = (e.clientY - b.top) / stageScale;
+          const curL = chainOf()[state.selected];
+          if (state.lockFx && effImpl() !== "current" && curL && inRect(curL.rect, x, y)) {
+            lockSelection();
+            return;
+          }
+          let hit = -1;
+          levelsOf().forEach((lv, i) => {
+            const r = lv.rect;
+            if (x >= r[0] && x <= r[0] + r[2] && y >= r[1] && y <= r[1] + r[3])
+              hit = i;
+          });
+          if (hit >= 0) setSelected(hit);
+        });
+        window.addEventListener("keydown", (e) => {
+          if (e.code === "KeyC" && !e.repeat) setPeek(true);
+          else if (e.code === "KeyR") setSelected(state.base);
+          else if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+            if (
+              e.target.closest &&
+              e.target.closest("input,select,button,summary")
+            )
+              return;
+            e.preventDefault();
+            setSelected(state.selected + (e.key === "ArrowDown" ? 1 : -1));
+          }
+        });
+        window.addEventListener("keyup", (e) => {
+          if (e.code === "KeyC") setPeek(false);
+        });
+        window.addEventListener("blur", () => setPeek(false));
+
+        stackEl.addEventListener("click", (e) => {
+          const r = e.target.closest(".lrow");
+          if (r) setSelected(+r.dataset.i);
+        });
+        stackEl.addEventListener("mousemove", (e) => {
+          const r = e.target.closest(".lrow");
+          const i = r ? +r.dataset.i : -1;
+          if (i !== state.hoverIndex) {
+            state.hoverIndex = i;
+            requestDraw();
+          }
+        });
+        stackEl.addEventListener("mouseleave", () => {
+          state.hoverIndex = -1;
+          requestDraw();
+        });
+
+        q("#implSeg").addEventListener("click", (e) => {
+          const b = e.target.closest("button");
+          if (!b) return;
+          state.impl = b.dataset.impl;
+          paintSeg();
+          state.chainVis = 1;
+          state.lastWalk = performance.now();
+          ringFx.clear();
+          resetMetrics();
+          renderStack();
+          requestDraw();
+        });
+        q("#scenario").addEventListener("change", (e) => {
+          state.scenario = e.target.value;
+          state.selected = deepest();
+          state.anim = null;
+          state.taught = false;
+          state.base = deepest();
+          state.dwellStart = performance.now();
+          state.lock = null;
+          state.upShowing = false;
+          state.hoverIndex = -1;
+          state.hintText = "滚轮 / ↑↓ 换吸附层级";
+          state.hintUntil = performance.now() + 2600;
+          state.chainVis = 1;
+          state.lastWalk = performance.now();
+          ringFx.clear();
+          resetMetrics();
+          renderPage();
+          syncAnswer();
+          state.shown = chainOf()[state.selected].rect.slice();
+          renderStack();
+          requestDraw();
+        });
+       q("#resetSel").addEventListener("click", () => setSelected(state.base));
+       // 演示用：一次往上走三层，让"内层环"立刻出现在画面上（产品里这件事只有滚轮做）。
+       q("#walkUp").addEventListener("click", () => setSelected(state.selected - 3));
+       // 模拟"滚轮连滚"：每 140 ms 一格，用来检查"很多候选盒子同时在场"时
+       // 绿色那个（= 当前会被截的）还跟不跟得住、会不会变成两个。
+       q("#rollBurst").addEventListener("click", () => {
+         let step = 0;
+         const timer = setInterval(() => {
+           setSelected(state.selected - 1);
+           if (++step >= 6) clearInterval(timer);
+         }, 140);
+       });
+        q("#mReset").addEventListener("click", resetMetrics);
+      }
+      // `percent` 明确传，而不是靠键名以 "Alpha" 结尾来猜——`selFill` 就是被这个猜测坑过一次：
+      // 它拿到 18 而不是 0.18，rgba(...,18) 被钳成不透明，选中层变成实心块，内层环直接消失。
+      function bindRange(id, key, fmt, percent) {
+        const input = q(id),
+          out = q(id + "Out");
+        const sync = () => {
+          state[key] = percent ? Number(input.value) / 100 : Number(input.value);
+          out.textContent = fmt(Number(input.value));
+          renderStack();
+          updateLegend();
+          requestDraw();
+        };
+        input.addEventListener("input", sync);
+        sync();
+      }
+      function bindCheck(id, key, after) {
+        const el = q(id);
+        el.checked = !!state[key];
+        el.addEventListener("change", () => {
+          state[key] = el.checked;
+          if (after) after(el.checked);
+          requestDraw();
+        });
+      }
+
+      /* ---------------------------------------------------------------- 启动 */
+      (function init() {
+        state.selected = deepest();
+        state.base = state.selected;
+        state.dwellStart = performance.now();
+        state.lastWalk = performance.now();
+        renderPage();
+        syncAnswer();
+        state.shown = chainOf()[state.selected].rect.slice();
+        state.hintText = "滚轮 / ↑↓ 换吸附层级";
+        state.hintUntil = performance.now() + 2600;
+        renderStack();
+        updateLegend();
+        paintSeg();
+
+        bindRange("outerAlpha", "outerAlpha", (v) => v + "%", true);
+        bindRange("innerAlpha", "innerAlpha", (v) => v + "%", true);
+        bindRange("selFill", "selFill", (v) => v + "%", true);
+        bindRange("maskAlpha", "maskAlpha", (v) => v + "%", true);
+        bindRange("maskBlack", "maskBlack", (v) => v + "%", true);
+        bindRange("collapse", "collapse", (v) => v + " px");
+        bindRange("selWidth", "selWidth", (v) => v + " px");
+        bindCheck("keepAnswer", "keepAnswer", () => renderStack());
+        bindCheck("ramp", "ramp", () => renderStack());
+        // 整窗兜底只截断"链"：页面照旧，选中层落到窗口那层，环全空。
+        bindCheck("forceWindow", "forceWindow", () => {
+          state.selected = state.forceWindow ? 0 : deepest();
+          state.anim = null;
+          state.shown = chainOf()[state.selected].rect.slice();
+          ringFx.clear();
+          renderStack();
+        });
+        bindCheck("degraded", "degraded", () => renderStack());
+        bindCheck("counterInLabel", "counterInLabel", () => renderStack());
+        q("#chipStyle").addEventListener("change", (e) => {
+          state.chipStyle = e.target.value;
+          requestDraw();
+        });
+        bindCheck("dim", "dim");
+        bindCheck("holeMask", "holeMask", () => updateLegend());
+        bindCheck("haloAuto", "haloAuto");
+        ["skipNear", "wheelAccum", "cursorRule", "carryOn", "upHint", "lockFx", "kindName", "nearBright"].forEach((k) =>
+          bindCheck(k, k, () => renderStack()),
+        );
+        bindRange("halo", "halo", (v) => v + "%", true);
+        q("#innerRingColor").addEventListener("change", (e) => {
+          state.innerRingRGB = e.target.value;
+          updateLegend();
+          requestDraw();
+        });
+        bindCheck("greenOnWalk", "greenOnWalk", () => {
+          state.lastWheel = -1e9;
+          state.walkVis = 0;
+        });
+        bindCheck("ease", "ease", (v) => {
+          if (!v && state.anim) {
+            state.anim = null;
+            state.shown = chainOf()[state.selected].rect.slice();
+          }
+        });
+        bindCheck("ringAnim", "ringAnim", (v) => {
+          if (!v) ringFx.clear();
+        });
+        bindEvents();
+
+        fitStage();
+        window.addEventListener("resize", fitStage);
+        requestAnimationFrame(frame);
+        if (document.fonts && document.fonts.ready)
+          document.fonts.ready.then(() => {
+            syncAnswer();
+            if (state.selected === deepest() && !state.anim)
+              state.shown = chainOf()[state.selected].rect.slice();
+            renderStack();
+            requestDraw();
+          });
+      })();
+    </script>
+  </body>
+</html>

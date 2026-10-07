@@ -144,6 +144,12 @@
     <label class="row"><span class="k">101 ms 缓动</span>
       <input type="checkbox" id="ease" checked></label>
 
+    <h2>标签样式</h2>
+    <div class="seg" id="labelSeg">
+      <button data-label="current">A · 浮动居中（现状）</button>
+      <button data-label="anchored">B · 左上角锚定 + 层级条</button>
+    </div>
+
     <h2>标签 / 提示（② 已上线）</h2>
     <div class="kv"><span class="k">预览标签</span><span class="labelchip" id="labelText">—</span></div>
     <div class="kv"><span class="k">一次性提示</span><span class="hint" id="hintText">（还没换层）</span></div>
@@ -214,6 +220,7 @@ const SCENARIOS = {
 
 const state = {
   impl: "chain",
+  labelStyle: "anchored",   // "current" = 浮动居中文本，"anchored" = 贴边角标 + 几何层级条
   scenario: "deep",
   selected: 0,            // 每次切场景后重置为最深
   cursor: { x: 900, y: 600 },
@@ -415,6 +422,54 @@ function placeLabel(rect, size) {
   return [left, top, w, h];
 }
 
+function chip(x, y, w, h, border) {
+  ctx.fillStyle = "rgba(20,26,34,.92)";
+  ctx.strokeStyle = border;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.roundRect(x + 0.5, y + 0.5, w - 1, h - 1, 3);
+  ctx.fill();
+  ctx.stroke();
+}
+
+/* B 方案：标签作为选区边框的左上角锚定角标（Figma / DevTools 习惯），
+   文字拆成「类别 + 尺寸」两段，n/N 分数换成纯几何的层级条：
+   一格 = 一层，左端 = 窗口（1 层），从浅到深填充到当前层。
+   层级条是画出来的矩形，不引入新字形 —— 不受内嵌子集字体白名单约束。 */
+function drawAnchoredLabel(rect, target, selected, wholeWindow, th, padX) {
+  const padY = 5;
+  const n = levelsOf().length;
+  const kind = wholeWindow ? "窗口" : (selected === deepest() ? "元素" : "容器");
+  const sizeText = `${target[2]}×${target[3]} px`;
+  const kindW = Math.ceil(ctx.measureText(kind).width);
+  const sizeW = Math.ceil(ctx.measureText(sizeText).width);
+  const SEG = 9, GAP = 2, BAR_H = 4;
+  const gapKS = 8, gapSB = n > 1 ? 12 : 0;
+  const barW = n > 1 ? n * SEG + (n - 1) * GAP : 0;
+  const w = padX + kindW + gapKS + sizeW + gapSB + barW + padX;
+  const x = Math.max(1, Math.min(rect[0], stage.clientWidth - w - 1));
+  // 角标下沿贴选区上边框；选区贴到屏幕顶时翻进盒子内部
+  let y = rect[1] - th - 1;
+  if (y < 1) y = Math.min(rect[1] + 3, stage.clientHeight - th - 1);
+  const base = wholeWindow ? NEUTRAL : ACCENT;
+  chip(x, y, w, th, "rgba(255,255,255,.12)");
+  ctx.textBaseline = "top";
+  ctx.fillStyle = `rgba(${base},1)`;
+  ctx.fillText(kind, x + padX, y + padY);
+  ctx.fillStyle = "#e8edf4";
+  ctx.fillText(sizeText, x + padX + kindW + gapKS, y + padY);
+  if (barW) {
+    const bx = x + padX + kindW + gapKS + sizeW + gapSB;
+    const by = y + Math.round((th - BAR_H) / 2);
+    for (let i = 0; i < n; i++) {
+      ctx.fillStyle = i === selected ? `rgba(${base},.95)`
+        : i < selected ? `rgba(${base},.38)`
+        : "rgba(200,208,219,.20)";
+      ctx.fillRect(bx + i * (SEG + GAP), by, SEG, BAR_H);
+    }
+  }
+}
+
 /* ------------------------------------------------------------------ 绘制 */
 function draw() {
   const levels = levelsOf();
@@ -467,20 +522,18 @@ function draw() {
   const text = labelFor(target, selected, wholeWindow, false);
   ctx.font = '12px "Segoe UI", "Microsoft YaHei UI", sans-serif';
   const padX = 10, padY = 5;
-  const tw = Math.ceil(ctx.measureText(text).width) + padX * 2;
   const th = 12 + padY * 2;
-  const placed = placeLabel(rect, [tw, th]);
-  if (placed) {
-    ctx.fillStyle = "rgba(20,26,34,.92)";
-    ctx.strokeStyle = "rgba(255,255,255,.12)";
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.roundRect(placed[0] + 0.5, placed[1] + 0.5, placed[2] - 1, placed[3] - 1, 3);
-    ctx.fill();
-    ctx.stroke();
-    ctx.fillStyle = "#e8edf4";
-    ctx.textBaseline = "top";
-    ctx.fillText(text, placed[0] + padX, placed[1] + padY);
+  if (state.labelStyle === "current") {
+    const tw = Math.ceil(ctx.measureText(text).width) + padX * 2;
+    const placed = placeLabel(rect, [tw, th]);
+    if (placed) {
+      chip(placed[0], placed[1], placed[2], placed[3], "rgba(255,255,255,.12)");
+      ctx.fillStyle = "#e8edf4";
+      ctx.textBaseline = "top";
+      ctx.fillText(text, placed[0] + padX, placed[1] + padY);
+    }
+  } else {
+    drawAnchoredLabel(rect, target, selected, wholeWindow, th, padX);
   }
 
   // 5) 一次性提示（锚在光标处，到点自己消失）
@@ -618,6 +671,18 @@ document.getElementById("implSeg").addEventListener("click", (event) => {
   renderPage();
   draw();
 });
+document.getElementById("labelSeg").addEventListener("click", (event) => {
+  const button = event.target.closest("button");
+  if (!button) return;
+  state.labelStyle = button.dataset.label;
+  paintLabelSeg();
+  draw();
+});
+function paintLabelSeg() {
+  for (const button of document.querySelectorAll("#labelSeg button")) {
+    button.classList.toggle("on", button.dataset.label === state.labelStyle);
+  }
+}
 function paintSeg() {
   for (const button of document.querySelectorAll("#implSeg button")) {
     button.classList.toggle("on", button.dataset.impl === state.impl);
@@ -653,6 +718,7 @@ for (const [id, key] of [["keepAnswer", "keepAnswer"], ["dim", "dim"], ["ease", 
   state.hintText = "滚轮 / ↑↓ 换吸附层级";
   state.hintUntil = performance.now() + 2600;
   paintSeg();
+  paintLabelSeg();
   renderPage();
   fitStage();
   window.addEventListener("resize", fitStage);

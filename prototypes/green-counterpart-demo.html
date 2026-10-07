@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>rgb(31,117,219) 的对等绿色</title>
+<style>
+  body { font-family: "Segoe UI", sans-serif; background: #f5f6f8; margin: 40px; color: #222; }
+  h1 { font-size: 20px; }
+  .row { display: flex; gap: 24px; flex-wrap: wrap; margin-top: 24px; }
+  .card { background: #fff; border-radius: 10px; padding: 16px; box-shadow: 0 1px 4px rgba(0,0,0,.08); width: 260px; }
+  .swatch { height: 88px; border-radius: 8px; margin-bottom: 12px; }
+  .base { background: rgb(31, 117, 219); }
+  .mirror { background: rgb(31, 219, 117); }
+  .pure { background: rgb(31, 219, 31); }
+  .visual { background: rgb(27, 177, 95); }
+  .name { font-weight: 600; margin-bottom: 4px; }
+  code { display: block; font-size: 12px; color: #555; background: #f0f1f3; border-radius: 4px; padding: 2px 6px; margin-top: 4px; }
+  .note { font-size: 13px; color: #666; margin-top: 4px; }
+  .demo { margin-top: 36px; }
+  .box { width: 220px; height: 120px; border: 3px solid rgb(31, 219, 117); border-radius: 6px; background: #fff; display: flex; align-items: center; justify-content: center; color: rgb(31, 219, 117); font-weight: 600; }
+</style>
+</head>
+<body>
+<h1>基准蓝 <code style="display:inline">rgb(31, 117, 219)</code> = <code style="display:inline">#1F75DB</code>（HSL 212.6°, 75%, 49%）的对等绿色</h1>
+<div class="row">
+  <div class="card">
+    <div class="swatch base"></div>
+    <div class="name">基准蓝（现状）</div>
+    <code>rgb(31, 117, 219)</code>
+    <code>#1F75DB · hsl(212.6, 75%, 49%)</code>
+  </div>
+  <div class="card">
+    <div class="swatch mirror"></div>
+    <div class="name">推荐 · 色相镜像绿 #1FDB75</div>
+    <code>rgb(31, 219, 117)</code>
+    <code>#1FDB75 · hsl(147.4, 75%, 49%)</code>
+    <div class="note">色相绕 180° 镜像，饱和度/亮度与蓝完全同值，通道只是对调（R31 G117 B219 → R31 G219 B117），冷暖对等感最强。</div>
+  </div>
+  <div class="card">
+    <div class="swatch pure"></div>
+    <div class="name">纯绿对等 #1FDB1F</div>
+    <code>rgb(31, 219, 31)</code>
+    <code>#1FDB1F · hsl(120, 75%, 49%)</code>
+    <div class="note">hue 取标准绿 120°，饱和度/亮度不变；比镜像绿更"正绿"但偏刺眼。</div>
+  </div>
+  <div class="card">
+    <div class="swatch visual"></div>
+    <div class="name">视觉重量对等 #1BB15F</div>
+    <code>rgb(27, 177, 95)</code>
+    <code>#1BB15F · hsl(147.4, 75%, 40%)</code>
+    <div class="note">绿色在人眼感知上天生更亮（相对亮度 0.53 vs 蓝 0.18），此版本压低亮度到 40%，做描边时视觉分量和蓝色一致。</div>
+  </div>
+</div>
+<div class="demo">
+  <h1>截图框描边效果模拟（镜像绿）</h1>
+  <div class="box">选区边框 #1FDB75</div>
+</div>
+</body>
+</html>
