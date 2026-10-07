@@ -260,7 +260,7 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 | T4.2 | `apps/snapclip` 骨架（init/Root/单窗口） | T4.1, T2.10（D2 解除了对 T3.4 的依赖） | ~5 文件 | 中 | [x]（包名 `snapclip-app`；构建 + 起窗 + 门禁全过） |
 | T4.3 | history 能力（Entity + 虚拟列表 + `ElementId`=clip id） | T4.2 | ~6 文件 | 高 | 部分 [x]（模型/图标/视图/接线/回车复制/**GPUI 集成测试**已落地；分页、删除确认、缩略图待续，见 §14.29–§14.31） |
 | T4.4 | settings 能力（**新增**，不是迁移） | T4.3 | ~3 文件 | 中 | [ ] |
-| T4.4.1 | 两个窗口检测开关接成真实设置通道 | T4.4 | 3 文件 | 中 | [ ] |
+| T4.4.1 | 两个窗口检测开关接成真实设置通道 | T4.4 | 3 文件 | 中 | 部分 [x]（capture 侧的可注入类型已落地 `DetectionOptions`，见 §14.32；穿线与设置页待续） |
 | T4.5 | 事件桥（`snapclip-model::AppEvent` + channel + 丢弃过期） | T4.3 | 2 文件 | 高 | [ ] |
 | T4.6 | 托盘（Win32，**新建**） | T4.2 | 1 文件 | 中 | [ ] |
 | T4.7 | 测试三层 + 无障碍树断言（**先 spike**） | T4.3–T4.6 | ~4 文件 | 中 | [ ] |
@@ -2044,4 +2044,43 @@ T4.3 剩余（续做清单）：
 提交 SHA：见提交
 推送/tag：origin/main
 回退对象：52e6745
+```
+
+### §14.32 T4.4.1 第一半：检测开关从常量变成可注入类型
+
+```
+任务编号：T4.4.1（第一半）
+状态：已验证 + 已推送
+分支：main
+前置提交/tag：557dad6（T4.3 测试层）
+事实核对（先查代码，再动手）：
+  - 计划里的两个开关，代码里**只有一个真实存在**：`DEFAULT_ADOPT_TEXT_RUNS: bool = true`；
+    `deep_select_visible_wrappers`（"跳过无绘制包装层"）**只有名字，没有对应行为**——
+    包装层的处理是 `chain_rings` 的 collapse/merge 规则，不是可开关的东西。
+    所以本步**没有发明**第二个开关，只在类型注释里写明这件事。
+  - 好消息：**管道本来就存在**——`RefinementWorker::new(..., adopt_text_runs, ...)` 与
+    `UiaDeepSelectionProvider { adopt_text_runs }` 都已经是参数/字段，唯一的问题是这个值的
+    来源是常量。所以"接成设置通道"实际是"换掉来源"。
+本步落地：`snapclip_capture::window_detection::DetectionOptions { adopt_text_runs }`，
+  `Default` 就是今天的行为（`DEFAULT_ADOPT_TEXT_RUNS`）。常量保留为默认值来源，
+  现有测试与探针的期望因此逐位不变。
+为什么只做类型：完整穿线要动 `WindowsOverlay::spawn_overlay` → `overlay_thread` →
+  `OverlayController::new`（新增字段）→ 两处读取点（overlay.rs 里构造 refinement worker 的地方、
+  `uia_provider` 的构造），再加壳侧调用点。这是"改签名 + 加字段"的一串编辑，值得一次性做完，
+  不该在余量不足时做一半。
+下一步的确切穿线点（按此顺序，别重新推导）：
+  1. `overlay.rs`：`spawn_overlay` 增加 `options: DetectionOptions` 参数 → 交给 `overlay_thread`
+     → 交给 `OverlayController::new`（新增 `options` 字段）→ 把构造 refinement worker 处的
+     `DEFAULT_ADOPT_TEXT_RUNS` 换成 `options.adopt_text_runs`；
+  2. `uia_provider.rs:183`：`adopt_text_runs: ...` 的来源改为传入的 options；
+  3. 壳侧 `src-tauri/src/app/capture.rs`：先传 `DetectionOptions::default()`（行为不变），
+     等 T4.4 的设置通道就绪后改传设置值；
+  4. 测试：默认值下 `browser_element_probe` 41/41 与 Explorer 探针 12/25·65.8 必须逐位不变；
+     再加一条"非默认值会传到 provider"的单测（构造带 `adopt_text_runs: false` 的 options）。
+修改前/后测试：capture **344 passed / 6 ignored** 不变（本步只加类型，默认行为不变）；
+          `cargo check -p snapclip-capture` 0 warning
+人工验证：不涉及（行为未变）
+提交 SHA：见提交
+推送/tag：origin/main
+回退对象：557dad6
 ```

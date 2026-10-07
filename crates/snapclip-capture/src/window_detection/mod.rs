@@ -88,6 +88,31 @@ pub const DEFAULT_DWELL_MS: u32 = 120;
 /// (`capture/deep_select_text_runs`), not a structural decision.
 pub const DEFAULT_ADOPT_TEXT_RUNS: bool = true;
 
+/// The detection preferences a caller may override.
+///
+/// The one switch that exists today is [`DEFAULT_ADOPT_TEXT_RUNS`]; `Default` for this struct
+/// is exactly today's behaviour, so passing `DetectionOptions::default()` is what the code
+/// did before this type existed. The point of the type is that the *source* of the value
+/// becomes a caller (a settings channel) instead of a constant — the plumbing below it
+/// (`RefinementWorker::new`, `UiaDeepSelectionProvider::adopt_text_runs`) already took a
+/// parameter.
+///
+/// Note on scope: the plan also names "skip non-painting wrapper levels" as a switch, but no
+/// such behaviour exists in the walker yet, so there is nothing to switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DetectionOptions {
+    /// Whether a bare text run may be published as the target (docs/21 §5.19).
+    pub adopt_text_runs: bool,
+}
+
+impl Default for DetectionOptions {
+    fn default() -> Self {
+        Self {
+            adopt_text_runs: DEFAULT_ADOPT_TEXT_RUNS,
+        }
+    }
+}
+
 /// Radius, in physical pixels, inside which a window may be snapped to.
 pub const DEFAULT_SNAP_RADIUS_PX: u32 = 24;
 
