@@ -1045,7 +1045,7 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 
 | # | 发现 | 证据 | 后果 | 处理 |
 | --- | --- | --- | --- | --- |
-| B1 | `.gitignore` 的 `crates/` 忽略整个目录，而 `crates/rapid-ocr-rs` 是外部仓库、新的 `crates/snapclip-*` 将要放进去 | `git check-ignore -v crates/rapid-ocr-rs` → `.gitignore:64:crates/`；`crates/rapid-ocr-rs/.git` 存在 | 重构新建的 4 个能力 crate **无法被提交**：本地全绿、远端什么都没有，属于典型的伪完成 | 已写进 T0.3 的动作第 0 步（`.gitignore` 改成 `/crates/rapid-ocr-rs/`，并用 `git check-ignore` 验证） |
+| B1 | `.gitignore` 的 `crates/` 忽略整个目录，而 `crates/rapid-ocr-rs` 是外部仓库、新的 `crates/snapclip-*` 将要放进去 | `git check-ignore -v crates/snapclip-model` → `.gitignore:53:crates/`（该目录此时还不存在，就已经被规则命中）；`crates/rapid-ocr-rs/.git` 存在；`git status --ignored` 显示 `!! crates/` | 重构新建的 4 个能力 crate **无法被提交**：本地全绿、远端什么都没有，属于典型的伪完成 | 已写进 T0.3 的动作第 0 步（`.gitignore` 改成 `/crates/rapid-ocr-rs/`，并用 `git check-ignore` 验证） |
 | B2 | 并行会话在同一工作区改同一份文档 | 本回合开始时 `git status` 为空，中途 §1.1/§2 出现另一会话的改动 | 两个 agent 同时改 `docs/23`、后面还要同时改根 `Cargo.toml`/`src-tauri/Cargo.toml`，冲突与互相覆盖风险高 | **待用户裁决**：指定唯一执行者，或让并行任务各自用独立 worktree（§0.7） |
 
 ---
