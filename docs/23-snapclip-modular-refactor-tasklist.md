@@ -152,7 +152,7 @@ git switch <默认分支>
 | 浏览器探针 | `cargo test --lib browser_element_probe -- --ignored --nocapture` | `asserted=41 passed=41 failed=0` / `available=52` / `finer=0` | [x] `asserted=41 passed=41 failed=0` / `available=52` / `finer=0`（一致） |
 | Explorer 探针 | `cargo test --lib explorer_rule_probe -- --ignored --nocapture` | `control_level_points=12/25` / `median_area_pct=65.8` / `available=25/25` / `finer=0` | [x] `control_level_points=12/25` / `median_area_pct=65.8` / `available=25/25` / `finer=0`（一致，本机有可见 Explorer 窗口） |
 | A4 底色表 | `cargo test --lib ring_contrast_probe -- --ignored --nocapture` | 与 docs/21 §5.26 表格一致 | [x] passed，底色表与 docs/21 §5.26 一致 |
-| 真机会话汇总 | 真机 F5 → 看日志 | `over16ms=0`；`present_us` 量级 500–2000 µs | [ ] **待人工**：agent 无法在你的机器上按 F5 观测 overlay，需你本地跑一次并把 `present_us`/`over16ms` 反馈回来 |
+| 真机会话汇总 | 真机 F5 → 看日志 | `over16ms=0`；`present_us` 量级 500–2000 µs | ✅ **已采到样本（2026-10-07，用户真机 `npm run tauri dev`，3840×2160）**：`present=470`、`present_us` last=1833 / first=6105 / **max=16672**、**over16ms=1**、`chain_fade_frames=42`、`walk_frames=26`、`refinement_msaa_failures=0`；会话是"F5 出现后立刻右击取消"，样本偏短，**还不能判定稳态**（唯一超 16 ms 的一帧是 16.7 ms，出现在会话开头） |
 | 字体子集门禁 | `cargo test --lib the_embedded_subset_covers_the_strings_the_overlay_draws` | 通过（子集 20.3 KB） | [x] 通过（随 403 一起跑绿） |
 | 事件契约 | `cargo test --lib` 里的 `ALL_EVENT_NAMES` 契约测试 | 通过（与 `src/shared/contracts.ts` 同步） | [x] 通过（随 403 一起跑绿） |
 
@@ -930,6 +930,7 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 | 12 | **把"文档里写过"当成"代码里有"** | 例：`deep_select_text_runs` 只存在于注释、托盘从未实现、设置通道从未存在。动手前先用 `rg` 核实，写进 §13 记录 |
 | 13 | 无障碍树断言做不到却被当硬门禁 | T4.7：先 spike；做不到就降级并写回 docs/22 §10.2，不要静默删门禁 |
 | 14 | **标注功能被静默丢弃**（决策 D1 的已接受让步） | T4.1.1 的 D1 写清了"不迁移 UI、保留 Rust 模型"；P6 删前端前必须核对 `snapclip-capture` 侧 `annotation.rs` 仍在，并**明确写进 P6 的提交消息** |
+| 15 | **把成员 lock 删掉让 cargo 重新解析 = 静默升级整棵依赖树**（T0.3 实测：40+ 个包被抬高，Tauri 自己的插件-版本检查当场报 Error） | 搬 workspace 时**要搬 lock，不要重新解析**：改完 `members` 后用 `cargo update -p <name> --precise <旧版本>` 逐个收复；同名多版本要用 `name@version` 精确 spec（见 §14.8）。收完后用"旧 lock vs 新 lock 的 `name@version` 集合差集"验证：差集里**只允许出现预期新增的 crate** |
 
 ---
 
@@ -1180,4 +1181,34 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 提交 SHA：待提交
 推送/tag：待推送
 回退对象：533f307
+```
+
+### §14.8 T0.3 后续修正：把误升级的依赖版本收回来
+
+```
+任务编号：T0.3-fix（T0.3 的补救，不新开任务号）
+状态：已验证（自动门禁全绿）；真机由用户跑过 `npm run tauri dev`（见下）
+分支：main
+前置提交/tag：b0459a5（T0.5.1）；回退基准 0bd9191 的 `src-tauri/Cargo.lock`
+修改范围：仅 Cargo.lock（+ docs/23）
+修改前测试：403 passed / 0 failed / 6 ignored；check 0 warning（但依赖图已被抬高）
+修改后测试：403 passed / 0 failed / 6 ignored；cargo check --workspace --all-targets → 0 warning
+性能指标：首次为降级后的依赖重建 ~30 s（一次性）
+人工验证：用户跑 `npm run tauri dev` 时日志第一行报
+          "Error Found version mismatched Tauri packages: tauri-plugin-opener (v2.7.0) :
+           @tauri-apps/plugin-opener (v2.6.0)"，dev 仍继续启动；
+          修复后 `cargo tree` 显示 tauri-plugin-opener v2.6.0，与 npm 侧 2.6.0 一致。
+失败与根因：**根因是我在 T0.3 的做法**——为了把 lock 挪到 workspace 根，我删掉了
+          `src-tauri/Cargo.lock` 让 cargo 重新解析。cargo 于是把所有 `^` 依赖升到当时最新：
+          tauri 2.12.0→2.12.1、tauri-plugin-opener 2.6.0→2.7.0、windows-targets 0.52.6→0.53.5、
+          tokio、libc、uuid、winreg…共 40+ 个包（新 lock 比旧 lock 多 10 个包）。
+          这既破坏了"重构只改结构"的可二分性，也直接造成上面那条插件版本不匹配。
+          正确做法：**搬 workspace 时要搬 lock（保留版本），不要重新解析**。
+处置：用 `cargo update -p <name> --precise <旧版本>` 逐包收复（41 个里 30 个一次成功，
+          11 个是顺序依赖/同名多版本歧义，用 `tauri-*` 先降、`windows-targets@0.53.5`
+          这类精确 spec 再降，全部收敛）；验证方式 = 新旧 lock 的 `name@version` 集合差集，
+          结果只剩 `snapclip-model@0.1.0`（本次重构预期新增的那一个）。
+提交 SHA：待提交
+推送/tag：待推送
+回退对象：b0459a5
 ```
