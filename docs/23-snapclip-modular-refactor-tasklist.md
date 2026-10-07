@@ -2484,9 +2484,20 @@ G2 门禁（§0.2/§12.2，本次实测）：
 tag 与回退演练：
   - `git tag refactor-p4` 后推送；`refactor-p4` 与既有 `refactor-p05` → `refactor-p1` → `refactor-p2`
     构成 P0/P0.5/P1/P2/P4 的完整回退链。
-  - 演练：`git worktree add ../snapclip-p4-drill refactor-p4`（不动当前工作区与用户的两处本地改动）
-    → 在演练树里 `cargo check --workspace --all-targets` + `cargo test -p snapclip-app --features test-support --lib`
-    → 通过 → `git worktree remove ../snapclip-p4-drill`。
+  - 演练（**第一次尝试失败，且失败本身是有价值的信息**）：
+    `git worktree add ../snapclip-p4-drill refactor-p4` → 演练树里 `cargo check` **红**：
+    `failed to read ...\snapclip-p4-drill\crates\rapid-ocr-rs\Cargo.toml`。根因：`crates/rapid-ocr-rs`
+    是**未纳入本仓库**的本地 path 依赖（用户正在快速迭代的 OCR 工程，决策 D2 已把它排除在本次
+    重构之外），所以任何"干净 checkout + 构建"的演练都注定失败——不是 tag 坏，而是仓库无法自洽地
+    独立构建 Tauri 宿主。**这条限制要写进 §9/P6 的前置**：真正的可重建性只有在 P6 把 Tauri 宿主
+    删掉、或把 `rapid-ocr-rs` 变成可获取的依赖之后才成立。
+  - 演练（改在主工作区就地做，因为就地才有那份 path 依赖）：
+    `git checkout refactor-p4`（detached，用户的 `scripts/` 未跟踪文件不受影响）→
+    `cargo check --workspace --all-targets` 绿 → `cargo test -p snapclip-app --features test-support` 绿
+    （29 lib + 5 UI）→ `cargo test -p snapclip-history` 51 绿 → 依赖方向门禁 clean →
+    `git checkout main` 回到主线（HEAD=70ed6c6，工作区只剩用户的 `scripts/`）。
+  - 演练树 `D:\100_Projects\110_Daily\snapclip-p4-drill` 已删除（`git worktree list` 只剩主树与
+    用户自己的 `SnapClip-probe`）。
   - 此时 **Tauri 壳仍在**（本阶段没删任何旧壳代码），两个壳只共享能力 crate 与数据库。
 
 P4 结束后仍然挂账的（写在这里而不是散落各处）：
