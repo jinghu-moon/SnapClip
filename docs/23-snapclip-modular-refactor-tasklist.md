@@ -2515,6 +2515,78 @@ P4 结束后仍然挂账的（写在这里而不是散落各处）：
 回退对象：054a867
 ```
 
+### §14.46 P5 判据判定（**不执行**）+ P6 开工前的现状核对
+
+```
+任务编号：T5（判据判定）/ P6 前置审计
+状态：P5 = 不触发，按判据停在这里；P6 = 已开工（第一片见 §14.47）
+分支：main
+前置提交/tag：cb1b9a3
+P5 判据（docs/22 §5.3）逐条对照：
+  ① "出现第二个真实实现且资源模型明显不同" —— **不满足**。当前没有任何能力需要第二个实现：
+     capture（WGC/D3D11/D2D，进程内 HWND overlay）、剪贴板（Win32 监听）、history（SQLite +
+     blob）都在同一进程内工作良好；唯一"资源模型不同"的候选是 OCR（`crates/rapid-ocr-rs`），
+     但它已被**决策 D2** 明确排除在本轮之外（该工程正在快速迭代，不稳定），不能拿一个暂停中的
+     东西当触发依据。
+  ② "profiling / 崩溃数据证明必须进程隔离" —— **不满足**。P4 期间拿到的数据（overlay 出现
+     ~20-30 ms、`refinement_elapsed_us` 中位 20-30 ms、空闲 CPU < 0.05%、无崩溃）没有任何一条
+     指向"必须另一个进程"。
+  结论：**P5 不执行**（§9 的原文就是"两个都不满足就停在这里"）。触发条件一旦出现（例如 OCR 真要
+     常驻数百 MB 的 ONNX 进程），§9 的 4 步清单原样可用。
+
+P6 开工前的现状核对（**关键发现，先纠正文档的想当然**）：
+  - §10 的清单读起来像"删就完了"，但它的验收写着"真机全链路（截图 → 历史 → OCR → 设置 → 托盘退出）"。
+    而今天 **GPUI 壳还没有任何截图能力**：F5 热键、overlay、导出、剪贴板 ingest 全在旧壳进程里
+    （`src-tauri/src/app/`，约 670 行）。**先删后搬会直接毁掉 F5 截图与历史自动增长**，违反
+    AGENTS.md 的"可以破坏旧实现，但不能无意破坏当前已有功能"。
+  - 所以 P6 的真实顺序是：**先把组合根搬进 GPUI 壳并验证通过，再删旧壳**。搬迁清单（按依赖排序）：
+    1. `app/artifact_writer.rs`（175 行）→ 壳侧 `ArtifactWriter` 端口实现 ✅ **本片已搬**（§14.47）
+    2. `app/capture.rs`（132 行）→ 壳侧启动 overlay：`CaptureService` + `CaptureEvents`（已有）+
+       `SystemClipboardWriter` + `HistoryArtifactWriter` + `DetectionOptions`（改用**设置通道**的值，
+       顺带把 T4.4 的"设置 → 壳传值"补上）
+    3. `app/clipboard.rs`（159 行）→ 壳侧启动剪贴板 ingest：`Win32EventBridge` + `Win32ClipboardSource`
+       + `Win32SourceResolver` + `ClipboardEvents`（已有）= `AppEvent::Clipboard` → 历史屏实时刷新，
+       即 T4.5 挂账的"发布者接线"；OCR 队列按 D2 传**空队列**（`try_enqueue=false` → 立刻
+       `release_queued`，状态干净回到 none，不假装识别）
+    4. DPI 声明：`set_per_monitor_v2_awareness()` 必须在**任何窗口出现之前**调用 → 必须在
+       `gpui_kit::application()` 之前（旧壳是在 `run()` 开头做的，这一条不能漏）
+    5. 删除旧壳：`src-tauri/`、Vue 前端、`package.json` 的 tauri 脚本、workspace 成员；`cargo tree -i
+       tauri/wry` 为空；全仓 `rg -n tauri` 只应命中文档
+  - 另外两条必须在 P6 之前写清的**既定损失**（都不是意外）：
+    a. **OCR 会消失**：`src-tauri/src/ocr/`（约 1050 行）随旧壳一起删，`snapclip-recognize`（P3）
+       按决策 D2 暂缓。后果：图片里的文字**不再自动识别**，历史里图片行的 OCR 状态列会长期为空。
+       这是 D2 已经接受的取舍，P6 之后重建在 `snapclip-recognize` 上。
+    b. **`crates/rapid-ocr-rs` 不在仓库里**（P4 回退演练时发现）：它是 path 依赖但未纳入 git，所以
+       "干净 checkout 就能构建"这条只有在 P6 删掉 `src-tauri` 之后才成立。
+提交 SHA：见提交
+推送/tag：origin/main
+回退对象：cb1b9a3
+```
+
+### §14.47 P6 第一片：`ArtifactWriter` 端口实现搬进 GPUI 壳
+
+```
+任务编号：P6（组合根搬迁，第 1/5 片）
+状态：已完成并验证
+分支：main
+前置提交/tag：cb1b9a3
+改了什么：`src-tauri/src/app/artifact_writer.rs` → `apps/snapclip/src/capture/artifact_writer.rs`，
+  逐字搬迁（含两条测试，测试临时目录前缀改成壳的名字以免与旧壳的测试互相踩）。旧壳那份**暂时保留**
+  ——本次搬迁的原则是"一次一片、每片都能独立编译与测试"，两边的实现此刻是同一份代码；旧壳那份
+  随 §10 清单一起删除。
+  为什么这一片排第一：它是 capture 的出口（像素 → PNG → 落盘 → `CaptureArtifact`），
+  `capture.rs` 启动 overlay 时必须先有这个端口实现，否则搬到一半没有可用的写出端。
+验证：
+  - `cargo test -p snapclip-app --features test-support --lib` → **30 passed**（新增 1 条：搬过来的
+    `the_writer_hands_the_store_decodable_png_bytes`）
+  - `cargo check --workspace --all-targets` → **0 warning**
+下一步（未做）：§14.46 清单的第 2、3、5 项（capture 启动 → 剪贴板 ingest → 删旧壳），
+  以及第 4 项 DPI 声明位置。
+提交 SHA：见提交
+推送/tag：origin/main
+回退对象：cb1b9a3
+```
+
 ### §14.39 T4.8 第一半：GPUI 壳 vs Tauri 宿主 + WebView2（debug 实测）
 
 ```

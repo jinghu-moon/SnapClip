@@ -17,6 +17,7 @@ use gpui_kit::component::{ActiveTheme, Root};
 use gpui_kit::*;
 
 pub mod adapters;
+pub mod capture;
 pub mod clipboard;
 pub mod events;
 pub mod history;
