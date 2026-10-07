@@ -98,12 +98,3 @@ windows = { version = "0.61", features = [
 windows-numerics = "0.2"
 win-icon-extractor = { version = "0.3", default-features = false, features = ["png", "cache"] }
 arboard = "3.6"
-
-
-# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
-[profile.release]
-codegen-units = 1
-lto = true
-opt-level = 3
-panic = "abort"
-strip = true

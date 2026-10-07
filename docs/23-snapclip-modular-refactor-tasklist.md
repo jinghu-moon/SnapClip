@@ -214,7 +214,7 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 | --- | --- | --- | --- | --- | --- |
 | T0.1 | 复跑并记录正确性基线 | — | — | 低 | [x]（自动门禁全绿；真机 F5 待人工） |
 | T0.2 | 记录资源基线（before） | T0.1 | — | 低 | [ ] |
-| T0.3 | 建 workspace 骨架 | T0.1 | 2 文件 | 中（Tauri 构建） | [ ] |
+| T0.3 | 建 workspace 骨架（+ 修 `.gitignore`） | T0.1 | 4 文件 + lock | 中（Tauri 构建） | [x]（自动门禁全绿；`npm run tauri dev` + F5 待人工） |
 | T0.4 | 建 `snapclip-model` 骨架 | T0.3 | 3 文件 | 低 | [ ] |
 | T0.5.1 | 删除 `capture/platform` 转发层 | T0.4 | 11 行 | 低 | [ ] |
 | T0.5.2 | OCR 事件出口改框架无关 trait | T0.5.1 | 2 文件 | 中（IPC 契约） | [ ] |
@@ -295,13 +295,25 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
   - `.gitignore`：`crates/` → `/crates/rapid-ocr-rs/`（只忽略外部仓库，自己的 crate 要跟踪）。
   - 生成后立刻验证：`git check-ignore -v crates/snapclip-model/Cargo.toml` **必须无输出**（有输出就是还被忽略）。
 - 动作：
-  1. 根目录新增虚拟 workspace `Cargo.toml`：`[workspace] members = ["src-tauri", "crates/snapclip-*", "apps/*"]`、`resolver = "2"`、**`exclude = ["crates/rapid-ocr-rs"]`**，需要时补 `[workspace.package]`/`[profile.release]`。
-     - **不要用 `crates/*` 通配**：那会把外部仓库 `crates/rapid-ocr-rs` 卷进我们的 workspace（它有自己的 `Cargo.toml` 与 `Cargo.lock`，会报 "believes it's in a workspace when it's not" 或锁文件冲突）。用 `crates/snapclip-*` + `exclude` 双保险。
+  1. 根目录新增虚拟 workspace `Cargo.toml`：`[workspace]`、`resolver = "2"`、**`members = ["src-tauri"]`（逐个显式列，每建一个 crate 加一行）**、**`exclude = ["crates/rapid-ocr-rs"]`**；同时把 `src-tauri/Cargo.toml` 的 `[profile.release]` 整体搬到根上（成员里的 profile 会被 cargo 忽略并告警，语义不变）。
+     - **不要用 `crates/*` 通配**：那会把外部仓库 `crates/rapid-ocr-rs` 卷进我们的 workspace（它有自己的 `.git`/`Cargo.toml`/`Cargo.lock`，会报 "believes it's in a workspace when it's not" 或锁文件冲突）。
+     - **也不要改成 `crates/snapclip-*` 之类"范围更窄的 glob"**——这是 T0.3 实测踩到的坑：cargo 的成员 glob 只有在**匹配到 ≥1 个目录**时才展开；一个都匹配不到时它按字面路径处理，直接失败：
+       `error: failed to load manifest for workspace member ...\crates/snapclip-* / failed to read ...\crates\snapclip-*\Cargo.toml (os error 123)`。
+       第一个 `snapclip-*` crate 落地之前（T0.4 之前），任何 `crates/snapclip-*` 写法都会让 workspace 起不来。`apps/*` 同理——P4 建出 `apps/snapclip` 之前不要写。
   2. 让现有 `src-tauri/Cargo.toml` 继承 workspace（保持 `[package]` 与 Tauri 配置不变）。
   3. `crates/rapid-ocr-rs` 是 `optional = true` 的路径依赖，workspace 化后要确认 `cargo check --workspace --all-targets`（不带 `--features ocr-rapid`）与 `cargo check --workspace --all-targets --features ocr-rapid`（在 `src-tauri` 内）都仍然解析成功。
   4. 确认 Cargo.lock 位置变化后，`cargo test --lib --manifest-path src-tauri/Cargo.toml` 与 `cargo check --workspace --all-targets` 都通过。
   5. `git status --porcelain` 必须能看到根 `Cargo.toml`/`Cargo.lock`（如果看不到，说明第 0 步没做对）。
   6. 真机跑一次 `npm run tauri dev`（或现有启动方式）+ F5，确认 Tauri 构建与 overlay 不受影响。
+- **实测结果（2026-10-07，本任务已完成）**：
+  - `.gitignore`：`crates/` → `/crates/rapid-ocr-rs/`；`git check-ignore -v crates/snapclip-model` **无输出**（exit 1），`crates/rapid-ocr-rs` 仍被忽略（`.gitignore:55`）。
+  - 根 `Cargo.toml`：`members = ["src-tauri"]`、`exclude = ["crates/rapid-ocr-rs"]`、`resolver = "2"`；`[profile.release]`（codegen-units/lto/opt-level/panic/strip）从 `src-tauri` 搬到根上，源码不变。
+  - `src-tauri/Cargo.lock`（7164 行，680 包）删除，改由根 `Cargo.lock`（690 包）统一管理；**两个 lock 都包含 `rapid-ocr-rs`/`ort` 子树**，可选路径依赖没有被 workspace 化丢掉。
+  - 冷构建 `cargo check --workspace --all-targets` = **1m35s**（根 `target/` 首次全量），**0 warning**；重编译 `snapclip` 一个 crate = **1.19s**（改一行后跑整条门禁 1.32s，与 T0.3 之前的 1.36s 同量级，**迭代速度没有退化**）。
+  - G0 门禁：`cargo test --lib --manifest-path src-tauri/Cargo.toml` → **403 passed / 0 failed / 6 ignored**；三个探针复跑一致（浏览器 41/41·52·finer=0，Explorer 12/25·65.8·25/25，A4 passed）。
+  - `cargo tree -p snapclip --features ocr-rapid` 解析成功且含 `rapid-ocr-rs v0.7.0 (path)` → 可选 feature 的解析没被破坏（**未做** `--features ocr-rapid` 的实际编译：那要拉 ONNX Runtime，代价大且与本步目标无关）。
+  - 真机代理验证（自动可跑的部分）：`cargo build` 后在 `target/debug/snapclip.exe` 启动 10 s，日志依次出现 `capture overlay ready elapsed_ms=72`、`clipboard pipeline ready elapsed_ms=83`、`webview page_load Finished`，退出后无残留进程。
+  - **仍需人工**：`npm run tauri dev` + 按 F5 的交互验证（agent 无法在你的屏幕按 F5）。
 - 必须保持：Tauri 构建可用；`tauri.conf.json`、前端构建脚本不变。
 - 验收：§0.2 的 G0 门禁全过；`git check-ignore` 对 `crates/snapclip-*` 无输出；真机 F5 一次成功。
 - 回退：删除根 `Cargo.toml`，恢复 `.gitignore` 与 lock 位置。
@@ -1063,3 +1075,39 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 清理动作（本会话执行）：删除后一份 `## 14. 执行记录（按 §13.2 模板，逐任务追加）`（内容与本会话 §14.1 记录重复；其中唯一独有的信息是会话 B 的口径说明，已并入本记录表），保留单一 §14。
 
 **教训（写进 §0.7 的执行面）**：这次的代价不是代码，是"同一份文档被两个执行者各写一遍"。所以 §0.7 的"独立 worktree"不是可选项——如果再有并行需求，先 `git worktree add`，再动手。
+
+### §14.5 T0.3 建 workspace 骨架
+
+```
+任务编号：T0.3
+状态：已验证 + 待提交（自动门禁全绿；`npm run tauri dev` + F5 属人工，未做）
+分支：main
+前置提交/tag：223cd7d（§14 去重）；回退基准 smart-snapping-v1-2026-10-07
+修改范围：.gitignore、新增根 Cargo.toml、src-tauri/Cargo.toml（移除 [profile.release]）、
+          删除 src-tauri/Cargo.lock、新增根 Cargo.lock、docs/23（T0.3 章节 + §2 + §14.5）
+修改前测试：403 passed / 0 failed / 6 ignored（HEAD 223cd7d 的 G0）
+修改后测试：403 passed / 0 failed / 6 ignored（workspace 化之后，命令同上）
+            cargo check --workspace --all-targets → 0 warning（冷构建 1m35s）
+            浏览器探针 41/41·available=52·finer=0（p50=28.2 p95=33.9 max=44.8）
+            Explorer 探针 12/25·65.8·available=25/25·finer=0
+            A4 ring_contrast → passed
+性能指标：改一行后 `cargo check --workspace --all-targets` = 1.32 s（T0.3 之前 1.36 s，
+          同量级 → 迭代速度无退化）；冷构建 1m35s（一次性）
+人工验证：未做（`npm run tauri dev` + F5）。已做其自动化代理：
+          `cargo build` → 启动 target/debug/snapclip.exe 10 s →
+          `capture overlay ready`=72ms / `clipboard pipeline ready`=83ms / webview Finished → 无残留进程
+失败与根因：一次失败，属于**工具语义误用**，不是设计问题——
+          `members = ["src-tauri", "crates/snapclip-*", "apps/*"]` 直接让 cargo 报
+          "failed to read ...\crates\snapclip-*\Cargo.toml (os error 123)"：
+          cargo 的成员 glob 在匹配到 0 个目录时按字面路径处理。
+          根因解决：成员逐个显式列（`members = ["src-tauri"]`），每建一个 crate 加一行。
+提交 SHA：待提交
+推送/tag：待推送
+回退对象：223cd7d
+```
+
+补充取证（可复核）：
+
+- `git check-ignore -v crates/snapclip-model` → 无输出（B1 已修）；`git check-ignore -v crates/rapid-ocr-rs` → `.gitignore:55:/crates/rapid-ocr-rs/`。
+- 两个 lock 的包数：旧 `src-tauri/Cargo.lock` 680 包、新根 `Cargo.lock` 690 包，**两者都含 `rapid-ocr-rs`/`ort`/`imageproc`**。
+- `cargo tree -p snapclip --features ocr-rapid` 含 `rapid-ocr-rs v0.7.0 (path)`，无解析错误；**未做** `--features ocr-rapid` 的实际编译（会拉 ONNX Runtime，代价与本步无关），记为未完成。

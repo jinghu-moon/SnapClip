@@ -1,0 +1,32 @@
+# SnapClip workspace root.
+#
+# 成员**逐个显式列**，两件事都要注意：
+#
+# 1. 不写 `crates/*`：`crates/rapid-ocr-rs` 是**另一个仓库**（有自己的 `.git`、
+#    `Cargo.lock` 和 remote），`src-tauri` 只是用 path 依赖它。用 `crates/*` 会把它
+#    卷进本 workspace——轻则两边锁文件互相干扰，重则报
+#    "believes it's in a workspace when it's not"。
+# 2. **也不要指望 glob 兜底**：cargo 的成员 glob 在"匹配到 0 个目录"时不会展开，
+#    而是按字面路径处理，直接报 `failed to read ...\crates\snapclip-*\Cargo.toml`。
+#    所以在第一个 `crates/snapclip-*` 落地之前，任何 `crates/snapclip-*` 写法都会
+#    让整个 workspace 起不来（本项目 T0.3 实测踩到）。
+#
+# 因此：每新建一个 crate，就在 `members` 里加一行它的路径。`exclude` 保留，
+# 用来把外部仓库按名排除在外。
+#
+# 同一条规则的另一半在 `.gitignore`：那里只忽略 `/crates/rapid-ocr-rs/`，
+# 不能忽略整个 `crates/`，否则新建的能力 crate 会静默地进不了提交。
+
+[workspace]
+resolver = "2"
+members = ["src-tauri"]
+exclude = ["crates/rapid-ocr-rs"]
+
+# Tauri 的体积/优化配置原本在 `src-tauri/Cargo.toml`。workspace 化之后成员里的
+# `[profile.*]` 会被 cargo 忽略（并打印警告），所以搬到根上，语义不变。
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
