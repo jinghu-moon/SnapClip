@@ -136,6 +136,84 @@ fn typing_filters_the_list_and_escape_clears_it(cx: &mut TestAppContext) {
     let _ = std::fs::remove_dir_all(&data);
 }
 
+/// The rows must not overlap.
+///
+/// This is the regression test for the layout the user photographed: a clip whose text is a
+/// multi-line code block made its row paint over the next one, because the row's height is
+/// fixed while a GPUI div does not clip its children. The fix is two-fold (collapse the text
+/// to one line, and clip the row), and this asserts the *outcome* rather than either half.
+#[gpui_kit::test]
+fn rows_do_not_paint_over_each_other(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+
+    let data = temp_root("row-geometry");
+    {
+        let store = Store::open(&data).expect("open store");
+        // The exact shape that broke it: a long, multi-line, whitespace-heavy code block.
+        save_text(
+            &store,
+            "clip-code",
+            "项目 A\n  ↓\n打开资源管理器\n  ↓\n找到项目目录\n  ↓\n复制路径\n  ↓\n打开 Windows Terminal\n",
+        );
+        save_text(&store, "clip-2", "a second entry");
+        save_text(&store, "clip-3", "a third entry");
+    }
+    let state = HistoryState::open(&data).expect("open history");
+    let icons = SourceIcons::new(data.join("icons")).expect("icons");
+
+    let handle = cx.open_window(size(px(640.), px(480.)), |window, cx| {
+        let view = cx.new(|cx| HistoryView::new(state, icons, EventBus::new(), window, cx));
+        Root::new(view, window, cx)
+    });
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let row = |index: usize| window.find(("history-row", index));
+        let first = row(0);
+        let second = row(1);
+        let third = row(2);
+
+        // Each row is one row tall, no matter what its text contains.
+        for (index, snapshot) in [first.clone(), second.clone(), third.clone()].into_iter().enumerate() {
+            assert!(
+                snapshot.bounds().size.height >= px(40.) && snapshot.bounds().size.height <= px(80.),
+                "row {index} measured {:?}; a row must stay one row tall",
+                snapshot.bounds().size.height
+            );
+        }
+        // And they are stacked, not overlapping.
+        assert!(
+            second.bounds().top() >= first.bounds().bottom(),
+            "row 1 starts before row 0 ends: {:?} vs {:?}",
+            second.bounds(),
+            first.bounds()
+        );
+        assert!(
+            third.bounds().top() >= second.bounds().bottom(),
+            "row 2 starts before row 1 ends: {:?} vs {:?}",
+            third.bounds(),
+            second.bounds()
+        );
+
+        // The strongest half of the assertion: the code block's text itself renders as ONE
+        // line. The threshold is deliberately loose (36px against a 60px row) because it only
+        // has to distinguish "one line" from "wrapped": the six-line code block in this fixture
+        // measured ~78px while it was still wrapping, which is what the row's fixed height could
+        // not absorb and how the text ended up drawn over the row below it.
+        for index in 0..3usize {
+            let preview = window.find(("history-preview", index));
+            assert!(
+                preview.bounds().size.height <= px(36.),
+                "preview {index} measured {:?}; a row's text must be a single line",
+                preview.bounds().size.height
+            );
+        }
+    })
+    .unwrap();
+
+    let _ = std::fs::remove_dir_all(&data);
+}
+
 /// T4.3's remaining acceptance: the type filter, paging, and a delete that asks first.
 #[gpui_kit::test]
 fn the_filter_the_next_page_and_the_delete_flow_all_reach_the_screen(cx: &mut TestAppContext) {

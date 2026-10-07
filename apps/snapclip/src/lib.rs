@@ -263,7 +263,7 @@ impl Render for Shell {
                     .gap_2()
                     .bg(cx.theme().background)
                     .text_color(cx.theme().foreground)
-                    .child("Clipboard history is unavailable")
+                    .child("剪贴板历史不可用")
                     .child(
                         div()
                             .text_sm()

@@ -33,7 +33,10 @@ use super::model::HistoryState;
 
 /// Row height in pixels. Fixed so the virtual list can size the scroll range without
 /// measuring every row; the row content is one line of text plus one line of metadata.
-const ROW_HEIGHT_PX: f32 = 56.0;
+const ROW_HEIGHT_PX: f32 = 60.0;
+
+/// The selected row's marker: a bar at the leading edge, not a colour wash alone.
+const SELECTION_BAR_PX: f32 = 3.0;
 
 /// Row preview size. Matches the height the row already reserves for an icon column.
 const THUMBNAIL_PX: f32 = 32.0;
@@ -43,6 +46,11 @@ const THUMBNAIL_CACHE_LIMIT: usize = 256;
 
 /// How close to the bottom counts as "load the next page" (the old front end used 3 rows).
 const LOAD_MORE_THRESHOLD_ROWS: f32 = 3.0;
+
+/// How many characters of a clip's text a row shows.
+///
+/// The store keeps 500 for search and the dialog; a row is one line, so it needs far less.
+const PREVIEW_CHARS: usize = 160;
 
 pub struct HistoryView {
     state: HistoryState,
@@ -85,7 +93,7 @@ impl HistoryView {
         cx: &mut Context<Self>,
     ) -> Self {
         let query = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Search clipboard history")
+            InputState::new(window, cx).placeholder("搜索剪贴板历史")
         });
         let list_focus = cx.focus_handle();
         // The list is what the arrow keys and Delete are for, so it starts focused; clicking
@@ -360,8 +368,8 @@ impl HistoryView {
     fn copy_selected(&mut self, cx: &mut Context<Self>) {
         let clipboard = SystemClipboard;
         self.status = Some(match self.state.selected_payload_bytes() {
-            None => "Nothing selected".to_string(),
-            Some(Err(error)) => format!("Could not read the entry: {error}"),
+            None => "没有选中的记录".to_string(),
+            Some(Err(error)) => format!("读取失败：{error}"),
             Some(Ok((_payload, kind, bytes))) => {
                 let outcome = match kind {
                     PayloadKind::Image => match decode_to_rgba8(&bytes) {
@@ -369,19 +377,19 @@ impl HistoryView {
                             let (width, height) = (decoded.width(), decoded.height());
                             clipboard.copy_image(width, height, decoded.into_raw())
                         }
-                        Err(error) => Err(format!("decode image failed: {error}")),
+                        Err(error) => Err(format!("图片解码失败：{error}")),
                     },
                     _ => match String::from_utf8(bytes) {
                         Ok(text) => clipboard.copy_text(&text),
-                        Err(_) => Err("the entry is not text".to_string()),
+                        Err(_) => Err("这条记录不是文本".to_string()),
                     },
                 };
                 match outcome {
                     Ok(()) => match kind {
-                        PayloadKind::Image => "Copied image".to_string(),
-                        _ => "Copied text".to_string(),
+                        PayloadKind::Image => "已复制图片".to_string(),
+                        _ => "已复制文本".to_string(),
                     },
-                    Err(error) => format!("Copy failed: {error}"),
+                    Err(error) => format!("复制失败：{error}"),
                 }
             }
         });
@@ -390,10 +398,10 @@ impl HistoryView {
 
     fn render_empty(&self, cx: &Context<Self>) -> impl IntoElement {
         let message = if self.state.items().is_empty() && !self.state.query().trim().is_empty() {
-            "No entries match this search".to_string()
+            "没有匹配的记录".to_string()
         } else {
             // First-run state: say what fills the list rather than leaving it blank.
-            "Copied text and images appear here".to_string()
+            "复制的文字和图片会出现在这里".to_string()
         };
         div()
             .size_full()
@@ -481,23 +489,56 @@ impl HistoryView {
 /// A dialog that says "delete clip-1791288801200-1?" names the database, not the entry; the
 /// user recognises the preview.
 fn entry_label(item: &ClipSummary) -> String {
-    let preview = item
-        .preview_text
+    item.preview_text
         .as_deref()
-        .map(str::trim)
-        .filter(|text| !text.is_empty());
-    match preview {
-        Some(text) => {
-            let mut chars = text.chars();
-            let head: String = chars.by_ref().take(24).collect();
-            if chars.next().is_some() {
-                format!("{head}…")
-            } else {
-                head
-            }
+        .map(|text| one_line_preview(text, 48))
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| kind_label(&item.primary_kind).to_string())
+}
+
+/// Collapse any text into one displayable line of at most `max_chars` characters.
+///
+/// Clipboard content is frequently a code block: newlines, tabs and long runs of spaces. A
+/// row is exactly one line tall, and a GPUI div does not clip its children, so the row is
+/// kept honest by making the text one line *before* it reaches the layout rather than by
+/// hoping the layout truncates it. Control characters are folded in with the whitespace:
+/// they have no width and would otherwise silently eat part of the visible character budget.
+fn one_line_preview(text: &str, max_chars: usize) -> String {
+    let mut collapsed = String::with_capacity(text.len().min(max_chars * 4));
+    let mut pending_space = false;
+    let mut chars = text.chars();
+    let mut truncated = false;
+    loop {
+        let Some(character) = chars.next() else { break };
+        let is_space = character.is_whitespace() || character.is_control();
+        if is_space {
+            // A leading space is dropped, and a run of whitespace becomes one separator.
+            pending_space = !collapsed.is_empty();
+            continue;
         }
-        None => kind_label(&item.primary_kind).to_string(),
+        if pending_space {
+            if collapsed.chars().count() >= max_chars {
+                truncated = true;
+                break;
+            }
+            collapsed.push(' ');
+            pending_space = false;
+        }
+        if collapsed.chars().count() >= max_chars {
+            truncated = true;
+            break;
+        }
+        collapsed.push(character);
     }
+    if truncated || chars.next().is_some() {
+        if collapsed.chars().count() >= max_chars {
+            // Make room for the ellipsis so the result still fits the row.
+            let keep = max_chars.saturating_sub(1).max(1);
+            collapsed = collapsed.chars().take(keep).collect();
+        }
+        collapsed.push('…');
+    }
+    collapsed
 }
 
 /// `来源程序 · 图片 · OCR 完成` — the secondary line of a row.
@@ -606,9 +647,9 @@ impl Render for HistoryView {
                                     .text_xs()
                                     .text_color(theme.muted_foreground)
                                     .child(match count {
-                                        0 => "No entries".to_string(),
-                                        1 => "1 entry".to_string(),
-                                        n => format!("{n} entries"),
+                                        0 => "暂无记录".to_string(),
+                                        1 => "共 1 条".to_string(),
+                                        n => format!("共 {n} 条"),
                                     }),
                             )
                             .child(div().flex_1())
@@ -644,6 +685,7 @@ impl Render for HistoryView {
                         let theme = cx.theme();
                         let row_border = theme.border;
                         let selected_bg = theme.accent;
+                        let selection = theme.primary;
                         let muted = theme.muted_foreground;
                         let selected_id = view.state.selected_id().map(str::to_string);
                         range
@@ -659,14 +701,28 @@ impl Render for HistoryView {
                                 // `format!("{:?}")` would put `Image` on screen.
                                 let preview = item
                                     .preview_text
-                                    .clone()
+                                    .as_deref()
+                                    // Clipboard previews are usually source code: a raw
+                                    // multi-line string in a fixed-height row paints over the
+                                    // row below it, because a GPUI div does not clip by
+                                    // default. Collapsing it to one line is the root fix; the
+                                    // row's own `overflow_hidden` below is the belt.
+                                    .map(|text| one_line_preview(text, PREVIEW_CHARS))
+                                    .filter(|text| !text.is_empty())
                                     .unwrap_or_else(|| kind_label(&item.primary_kind).to_string());
                                 let meta = row_meta(&item);
                                 let id = item.id.clone();
                                 let row = div()
                                     .id(("history-row", index))
                                     .h(px(ROW_HEIGHT_PX))
-                                    .w_full()
+                                    // Inside the marker wrapper: take the rest of the width and
+                                    // be allowed to shrink, so long previews ellipse instead of
+                                    // pushing the row wider than the list.
+                                    .flex_1()
+                                    .min_w_0()
+                                    // Nothing may paint outside the row, whatever the text
+                                    // metrics turn out to be.
+                                    .overflow_hidden()
                                     .px_3()
                                     .gap_3()
                                     .h_flex()
@@ -680,34 +736,89 @@ impl Render for HistoryView {
                                         this.state.select(&id);
                                         cx.notify();
                                     }));
+                                // Registered for the UI tests, which assert geometry: the bug
+                                // this guards against was a row's text painting over the row
+                                // below it, and only a bounds comparison catches that.
+                                #[cfg(feature = "test-support")]
+                                let row = row.test_support();
                                 // Selected rows get a distinct, stable treatment; ordinary
                                 // control flow keeps that readable.
                                 let row = if selected { row.bg(selected_bg) } else { row };
+                                // The marker sits *outside* the row's padding, so a selected
+                                // row's text does not shift right and the eye can find the
+                                // selection while scanning the left edge of the column.
+                                let marker = if selected {
+                                    div()
+                                        .w(px(SELECTION_BAR_PX))
+                                        .h_full()
+                                        .flex_none()
+                                        .bg(selection)
+                                } else {
+                                    div().w(px(SELECTION_BAR_PX)).h_full().flex_none()
+                                };
                                 // Only rows the list is actually rendering ask for a preview,
                                 // which is what makes the load lazy rather than eager.
                                 let thumbnail = view.thumbnail(&item, window, cx);
                                 Some(
-                                    row.child(match icon {
-                                        Some(path) => img(path).size(px(16.0)).into_any_element(),
-                                        // Unknown source: reserve the space so the text
-                                        // column stays aligned (a normal state, not an error).
-                                        None => div().size(px(16.0)).into_any_element(),
-                                    })
-                                    .children(thumbnail)
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .v_flex()
-                                            .child(div().truncate().child(preview))
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(muted)
-                                                    .truncate()
-                                                    .child(meta),
-                                            ),
-                                    ),
+                                    div()
+                                        .h_flex()
+                                        .w_full()
+                                        .items_center()
+                                        .child(marker)
+                                        .child(row
+                                        // A fixed leading column, so every row's text starts at
+                                        // the same x whether or not the source app is known.
+                                        .child(
+                                            div()
+                                                .w(px(16.0))
+                                                .flex_none()
+                                                .h_flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .child(match icon {
+                                                    Some(path) => {
+                                                        img(path).size(px(16.0)).into_any_element()
+                                                    }
+                                                    // Unknown source is a normal state, not an
+                                                    // error: the space is reserved, not filled.
+                                                    None => div()
+                                                        .size(px(16.0))
+                                                        .into_any_element(),
+                                                }),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .v_flex()
+                                                .gap_1()
+                                                .child({
+                                                    // Denser than body text: this is a list to
+                                                    // scan, not a paragraph to read.
+                                                    let line =
+                                                        div().text_sm().truncate().child(preview);
+                                                    // Registered so the UI test can measure the
+                                                    // line: a multi-line preview is exactly what
+                                                    // made rows paint over each other.
+                                                    #[cfg(feature = "test-support")]
+                                                    let line = line
+                                                        .id(("history-preview", index))
+                                                        .test_support();
+                                                    line
+                                                })
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(muted)
+                                                        .truncate()
+                                                        .child(meta),
+                                                ),
+                                        )
+                                        // The preview is a fixed-size column on the right; a row
+                                        // with no image simply does not have one.
+                                        .children(thumbnail.map(|element| {
+                                            div().flex_none().child(element)
+                                        }))),
                                 )
                             })
                             .collect::<Vec<_>>()
@@ -789,8 +900,38 @@ fn unseen_ids(items: &[ClipSummary], seen: &HashSet<String>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{kind_label, ocr_label};
+    use super::{kind_label, ocr_label, one_line_preview};
     use snapclip_model::{OcrStatus, PayloadKind};
+
+    /// The row is one line tall, so the text has to be one line before layout sees it.
+    #[test]
+    fn a_multi_line_clip_becomes_one_readable_line() {
+        // A code block is the common case, and the one that broke the layout: newlines in a
+        // `truncate()`d div still painted over the row below.
+        let collapsed = one_line_preview("项目 A\n  ↓\n打开资源管理器\n", 160);
+        assert_eq!(collapsed, "项目 A ↓ 打开资源管理器");
+        assert!(!collapsed.contains('\n'));
+
+        // Tabs, carriage returns and other control characters fold in with the whitespace.
+        assert_eq!(one_line_preview("a\t\tb\r\nc", 160), "a b c");
+        // Leading and trailing whitespace do not become visible characters.
+        assert_eq!(one_line_preview("   spaced   out   ", 160), "spaced out");
+        // Text that is only whitespace has nothing to show.
+        assert_eq!(one_line_preview("\n \t\n", 160), "");
+    }
+
+    #[test]
+    fn a_long_clip_is_cut_to_the_row_budget_and_says_so() {
+        let text = "x".repeat(500);
+        let preview = one_line_preview(&text, 20);
+        assert_eq!(preview.chars().count(), 20);
+        assert!(preview.ends_with('…'));
+
+        // Exactly at the budget: nothing is lost, so nothing is announced.
+        let exact = one_line_preview(&"y".repeat(20), 20);
+        assert_eq!(exact, "y".repeat(20));
+        assert!(!exact.ends_with('…'));
+    }
 
     #[test]
     fn the_row_speaks_the_users_words_not_the_enums() {
