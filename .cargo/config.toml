@@ -1,0 +1,14 @@
+# Development shortcuts for the GPUI shell.
+#
+# The old shell had `npm run tauri dev`. A GPUI application has no dev server, no bundler and
+# no hot reload: the development loop *is* "rebuild and run", so the honest equivalent is a
+# cargo alias. Builds of the shell crate alone are incremental (a few seconds); the GPUI
+# dependency tree is only rebuilt when its versions change.
+#
+# Rebuild-and-restart on every edit, without installing anything extra:
+#   cargo watch -x "run -p snapclip-app"        (needs: cargo install cargo-watch)
+[alias]
+# `cargo dev` — debug build, starts the shell (F5 capture, tray, history, settings).
+dev = "run -p snapclip-app"
+# `cargo dev-release` — the optimised build; the first one runs full LTO (~6 min here).
+dev-release = "run -p snapclip-app --release"
