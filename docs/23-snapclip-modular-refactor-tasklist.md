@@ -218,7 +218,7 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 | T0.4 | 建 `snapclip-model` 骨架（+ 搬 `Rect`/`Point`/`ImageDimensions`） | T0.3 | 10 文件 | 低 | [x]（自动门禁全绿） |
 | T0.5.1 | 删除 `capture/platform` 转发层（+ 顺带清掉它续命的死代码） | T0.4 | 2 文件 + 1 处死代码链 | 低 | [x]（自动门禁全绿） |
 | T0.5.2 | OCR 事件出口改框架无关 trait | T0.5.1 | 4 文件 | 中（IPC 契约） | [x]（自动门禁全绿；真机 OCR 待人工） |
-| T0.5.3 | OCR 惰性启动 | T0.5.2 | 2 文件 | 中 | [ ] |
+| T0.5.3 | OCR 惰性启动 | T0.5.2 | 3 文件 | 中 | [x]（自动门禁 + 启动日志证据齐全） |
 | T0.5.4 | 记录资源基线（after）并对比 | T0.5.3 | — | 低 | [ ] |
 | T1.1 | `snapclip-capture` 骨架与依赖 | T0.5.4 | 2 文件 | 低 | [ ] |
 | T1.2 | 定义 capture 公共接缝（端口 + 无 pub 字段审查） | T1.1 | 3 文件 | 中 | [ ] |
@@ -244,13 +244,13 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 | T2.8 | `ClipboardService`/`HistoryService` 公共 API | T2.7 | 3 文件 | 中 | [ ] |
 | T2.9 | `commands/history.rs`、`commands/ocr.rs` 改走服务 | T2.8 | 2 文件 | 低 | [ ] |
 | T2.10 | 阶段验收 + tag `refactor-p2` | T2.9 | — | 低 | [ ] |
-| T3.0 | recognize 接缝设计（`ArtifactReader`/`RecognitionJobStore`/`RecognitionEventSink`） | T2.10 | 1 文件 | 中 | [ ] |
-| T3.1 | `snapclip-recognize` 骨架（迁 `ocr/`） | T3.0 | 829 行 | 低 | [ ] |
-| T3.2 | 惰性 + 取消 + 超时 + 缓存 + 熔断 | T3.1 | ~4 文件 | 中 | [ ] |
-| T3.3 | 壳接线（history 只发 `ArtifactRef`，结果由壳写回） | T3.2 | 2 文件 | 中 | [ ] |
-| T3.4 | 资源对比 + 阶段验收 + tag `refactor-p3` | T3.3 | — | 低 | [ ] |
+| T3.0 | recognize 接缝设计（`ArtifactReader`/`RecognitionJobStore`/`RecognitionEventSink`） | T2.10 | 1 文件 | 中 | **暂缓（D2）** |
+| T3.1 | `snapclip-recognize` 骨架（迁 `ocr/`） | T3.0 | 829 行 | 低 | **暂缓（D2）** |
+| T3.2 | 惰性 + 取消 + 超时 + 缓存 + 熔断 | T3.1 | ~4 文件 | 中 | **暂缓（D2）** |
+| T3.3 | 壳接线（history 只发 `ArtifactRef`，结果由壳写回） | T3.2 | 2 文件 | 中 | **暂缓（D2）** |
+| T3.4 | 资源对比 + 阶段验收 + tag `refactor-p3` | T3.3 | — | 低 | **暂缓（D2）** |
 | T4.1 + T4.1.1 | 开工前研读 + **前端功能迁移矩阵** | — | 1 表格 | 低 | [ ] |
-| T4.2 | `apps/snapclip` 骨架（init/Root/单窗口） | T4.1, T3.4 | ~5 文件 | 中 | [ ] |
+| T4.2 | `apps/snapclip` 骨架（init/Root/单窗口） | T4.1, T2.10（D2 解除了对 T3.4 的依赖） | ~5 文件 | 中 | [ ] |
 | T4.3 | history 能力（Entity + 虚拟列表 + `ElementId`=clip id） | T4.2 | ~4 文件 | 高 | [ ] |
 | T4.4 | settings 能力（**新增**，不是迁移） | T4.3 | ~3 文件 | 中 | [ ] |
 | T4.4.1 | 两个窗口检测开关接成真实设置通道 | T4.4 | 3 文件 | 中 | [ ] |
@@ -391,6 +391,15 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
   1. 先读 `src/ocr/win_ocr.rs`、`manager.rs`：确认构造是否已经加载语言/模型；若构造即加载，把初始化推迟到首次 `recognize`。
   2. `OcrService::start(...)` 改成 `OcrService::new(...)`（不起线程/进程），内部加 `ensure_started()`；`try_enqueue` 首次调用时启动。
   3. 启动日志：未触发 OCR 时**不再**打印 `ocr worker started`；首次任务启动时打印一次，并带上 `trigger=first-task`。
+- **实测结果（2026-10-07，已完成；范围随后被 D2 封存）**：
+  - `OcrService::start` → **`OcrService::new`**：只建队列/`seen`/stop 标志/cancel，**不起线程**。worker 的启动参数装进 `WorkerSlot { spawn_args: Mutex<Option<SpawnArgs>>, worker: Mutex<Option<JoinHandle>>, created_at }`；`OcrEnqueuer::try_enqueue` 第一步调 `slot.ensure_started()`。
+  - **幂等**：`ensure_started` 用 `spawn_args.take()` 抢占——并发首次入队只有一个线程会被拉起（这是 T0.5.3 里唯一真正的竞态点）。
+  - 日志从壳搬到 worker：首次真正启动时打印 `[snapclip][startup] ocr worker started elapsed_ms=<距 OcrService::new> trigger=first-task`；`app/mod.rs` 里那句无条件日志删除。
+  - **新增 1 个测试**（`ocr/worker.rs` 内部）：`the_worker_starts_on_the_first_enqueue_and_not_before` —— 用真实 `Store`（临时目录）+ 计数型 `OcrEngine`，先断言 `OcrService::new` 之后引擎**一次都没被触碰**（= 没起 worker），再入队一个不存在的 clip，等 worker 真正跑到 `is_available()`。这条测试同时钉住"惰性"和"首次入队会启动"。
+  - **真机证据（启动日志）**：用 `CARGO_TARGET_DIR=src-tauri/target-probe` 构建并启动，日志变成
+    `store ready 16` → `icon state ready 22` → `overlay excluded from capture` → `overlay ready hwnd=0xfe082e` → `capture overlay ready 44` → `clipboard pipeline ready 52`，
+    **`ocr worker started` 一行都没有**（此前它固定在 `icon state ready` 与 overlay 之间，见 §1.2 的 before 日志）。冷启动 `clipboard pipeline ready` 从 66–83 ms 降到 52 ms——量级很小，**不夸大**：真正的收益是不再为一次可能不发生的识别常驻一个线程 + WinRT/COM apartment。
+  - 门禁：`cargo test --lib --manifest-path src-tauri/Cargo.toml` → **405 passed / 0 failed / 6 ignored**（403 + T0.5.2 的 1 + 本次 1）；`cargo check --workspace --all-targets` → **0 warning**。
 - 必须保持：OCR 结果的正确性、重试、取消、历史关联不变；队列上限/去重行为不变。
 - 验收：§0.2 门禁全过；启动日志中"未触发 OCR 的会话"没有 `ocr worker started`；触发一次 OCR 后出现一次；T0.2 的资源表 `after` 栏填写。
 - 注意：**不要预设"线程数与常驻内存必然下降"**。`OcrManager::new()` 是否在构造时就加载语言/模型，需要实测确认（`rg -n "fn new" src-tauri/src/ocr/manager.rs` 看它做了什么）。惰性化只保证"不触发 OCR 就不启动 worker"；资源数字如实记录，差异写清解释。
@@ -685,6 +694,18 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 
 ## 7. P3：抽离 `snapclip-recognize`
 
+> **决策 D2（2026-10-07，用户决定）：OCR / `snapclip-recognize` 范围本轮暂不考虑。**
+>
+> 理由（用户原话）：项目依赖 `crates/rapid-ocr-rs`，**而这个项目正在快速迭代**，因此 OCR 相关的代码、文件暂时不碰。
+>
+> 落地含义：
+>
+> - **不执行** T3.0–T3.4（`snapclip-recognize` crate、识别生命周期、壳接线、P3 验收）。它们在 §2 表里标为"暂缓（D2）"。
+> - **已落地的 T0.5.2 / T0.5.3 保留**：它们在 `src-tauri/src/ocr/` 与 `src-tauri/src/app/{ocr_queue,ocr_events}.rs` 里，已提交、已过门禁。若将来 P3 真的要按"重写 recognize"的方式做，这两块会被替换掉——**接受这个代价**，不为此回退（回退只会换来一次无意义的重写）。
+> - **P4 不再被 P3 阻塞**：T4.2 的前置从 `T3.4` 改为 `T2.10`（P2 结束）。GPUI 壳先接上 history/剪贴板/托盘/设置；OCR 状态在 GPUI 侧暂时只读现有 `ocr-status-v1`（若那时 OCR 已重做，就按那时的接口接）。
+> - **P6 的前置**同理：只需要 P4 完成，不需要 P3。
+> - **不受影响的部分**：`crates/rapid-ocr-rs` 作为外部仓库仍然被 `exclude` 在 workspace 之外（T0.3 已做），它的快速迭代不会影响 capture/history 两条主线。
+
 ### T3.0 接缝设计（**先定接口，再搬代码**）
 
 - 前置：T2.10
@@ -808,7 +829,7 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 
 ### T4.2 `apps/snapclip` 骨架
 
-- 前置：T4.1、T3.4
+- 前置：T4.1、T2.10（**决策 D2 解除了对 `T3.4` 的依赖**：P3 暂缓，GPUI 壳先接 history/剪贴板/托盘/设置）
 - 动作：`gpui_kit::application().with_assets(...).run(|cx| { gpui_kit::init(cx); … })` + `open_window` + `Root`；窗口标题/尺寸/DPI 行为对齐现有 Tauri 主窗口；**不接**截图 overlay（仍是 capture crate 的原生 HWND）。
 - 依赖边界（说清以免误解）：**GPUI 只能通过 `gpui-kit` 使用**（不要把 `gpui` 直接写进 `Cargo.toml`）；但**应用本身仍然依赖能力 crate**——`snapclip-model`、`snapclip-capture`、`snapclip-history`、`snapclip-recognize` 都是壳的正常依赖。"只依赖 gpui-kit"说的是 UI 层，不是整个 app。
 - 验收：能打开一个空壳窗口；§0.2 门禁不受影响；截图 overlay 仍可独立 F5 起来。
@@ -1249,3 +1270,35 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 推送/tag：待推送
 回退对象：03855de
 ```
+
+### §14.10 T0.5.3 OCR 惰性启动（范围随后被 D2 封存）
+
+```
+任务编号：T0.5.3
+状态：已验证（自动门禁 + 启动日志证据齐全）
+分支：main
+前置提交/tag：dff62e0（T0.5.2）；回退基准 smart-snapping-v1-2026-10-07
+修改范围：src-tauri/src/ocr/worker.rs（WorkerSlot + ensure_started + OcrService::new）、
+          src-tauri/src/app/mod.rs（去掉无条件启动日志、改用 new）；docs/23
+修改前测试：404 passed / 0 failed / 6 ignored；check 0 warning
+修改后测试：405 passed / 0 failed / 6 ignored（+1）；check 0 warning
+性能指标：true cold start 的 `clipboard pipeline ready` 66–83 ms → **52 ms**（量级很小，不夸大）；
+          结构性收益 = 未触发识别时不再常驻「worker 线程 + WinRT/COM apartment」
+人工验证：**有**（本任务把"能不能自动取证"解决了）——
+          用户的 dev 会话占着默认 target 与 F5，于是我改用 `CARGO_TARGET_DIR=src-tauri/target-probe`
+          （该目录已被 src-tauri/.gitignore 忽略）单独构建并启动，
+          日志中 `ocr worker started` 完全消失（此前它固定在 icon ready 与 overlay 之间）
+失败与根因：2 次编译红，都是路径/可见性问题，不是设计问题：
+          (1) `unresolved imports crate::ocr::{OcrCancel, OcrError, ...}`：这些类型只在
+              `ocr::engine`（私有子模块）里，`ocr/mod.rs` 只 re-export 了 `OcrEngine`/`OcrEventSink`；
+          (2) 改成 `super::engine::…` 也不对——tests 的 `super` 是 `worker`，不是 `ocr`。
+              最终用 `crate::ocr::engine::…` / `crate::ocr::events::…`（同 crate 内私有模块对后代可见）。
+          **没有**为了图省事把 engine 的类型再 re-export 一层（那会把内部类型推进公共接缝，违反 T1.2/§10.1）。
+提交 SHA：待提交
+推送/tag：待推送
+回退对象：dff62e0
+```
+
+> **范围说明（决策 D2）**：按用户 2026-10-07 的决定，OCR / `snapclip-recognize` 本轮暂不考虑
+> （`crates/rapid-ocr-rs` 正在快速迭代）。T0.5.2 与 T0.5.3 是**在此之前已完成并验证**的工作，
+> 按 D2 的约定保留、不回退；T3.0–T3.4 挂起，P4/P6 的前置已改为不依赖 P3。

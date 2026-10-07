@@ -37,11 +37,15 @@ pub struct OcrJob {
 pub struct OcrEnqueuer {
     tx: SyncSender<OcrJob>,
     seen: Arc<Mutex<HashSet<String>>>,
+    slot: Arc<WorkerSlot>,
 }
 
 impl OcrEnqueuer {
-    /// Non-blocking enqueue. Queue full → false (status stays `none`).
+    /// Non-blocking enqueue, starting the worker on first use.
+    ///
+    /// Queue full → false (status stays `none`).
     pub fn try_enqueue(&self, clip_id: &str, content_hash: &str) -> bool {
+        self.slot.ensure_started();
         {
             let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
             if !seen.insert(clip_id.to_string()) {
@@ -75,7 +79,7 @@ pub struct OcrServiceHandle {
     stop: Arc<AtomicBool>,
     /// Shared with in-flight jobs; cancelled on drop so shutdown is prompt.
     shutdown_cancel: OcrCancel,
-    worker: Option<JoinHandle<()>>,
+    slot: Arc<WorkerSlot>,
 }
 
 impl OcrServiceHandle {
@@ -90,7 +94,67 @@ impl Drop for OcrServiceHandle {
         // Cancel any recognize() in flight so worker join does not wait for timeout.
         self.shutdown_cancel.cancel();
         let _ = self.enqueuer.wake();
-        if let Some(worker) = self.worker.take() {
+        self.slot.join();
+    }
+}
+
+/// Everything the worker thread needs, plus the thread itself.
+///
+/// The worker is **not** started by [`OcrService::new`]: most sessions never recognise
+/// anything, and an unconditional thread plus a WinRT/COM apartment is exactly the kind
+/// of idle cost this refactor is removing. The first enqueue starts it; concurrent first
+/// enqueues race on the mutex, so exactly one thread is ever spawned.
+struct WorkerSlot {
+    spawn_args: Mutex<Option<SpawnArgs>>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+    /// When the service was created — the reference point for the first-task log.
+    created_at: Instant,
+}
+
+struct SpawnArgs {
+    store: Store,
+    sink: Arc<dyn OcrEventSink>,
+    engine: Arc<dyn OcrEngine>,
+    rx: Receiver<OcrJob>,
+    seen: Arc<Mutex<HashSet<String>>>,
+    stop: Arc<AtomicBool>,
+    shutdown_cancel: OcrCancel,
+}
+
+impl WorkerSlot {
+    /// Idempotent: the first caller spawns, everyone else returns immediately.
+    fn ensure_started(&self) {
+        let args = {
+            let mut guard = self.spawn_args.lock().unwrap_or_else(|e| e.into_inner());
+            match guard.take() {
+                Some(args) => args,
+                // Already started (or already shut down).
+                None => return,
+            }
+        };
+        let handle = thread::Builder::new()
+            .name("snapclip-ocr-worker".into())
+            .spawn(move || {
+                worker_loop(
+                    args.store,
+                    args.sink,
+                    args.engine,
+                    args.rx,
+                    args.seen,
+                    args.stop,
+                    args.shutdown_cancel,
+                )
+            })
+            .expect("spawn ocr worker");
+        eprintln!(
+            "[snapclip][startup] ocr worker started elapsed_ms={} trigger=first-task",
+            self.created_at.elapsed().as_millis()
+        );
+        *self.worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+    }
+
+    fn join(&self) {
+        if let Some(worker) = self.worker.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = worker.join();
         }
     }
@@ -99,7 +163,11 @@ impl Drop for OcrServiceHandle {
 pub struct OcrService;
 
 impl OcrService {
-    pub fn start(
+    /// Build the service **without** starting its worker.
+    ///
+    /// The worker thread (and the COM apartment it owns) starts on the first enqueue;
+    /// see [`WorkerSlot::ensure_started`].
+    pub fn new(
         store: Store,
         sink: Arc<dyn OcrEventSink>,
         engine: Arc<dyn OcrEngine>,
@@ -108,28 +176,28 @@ impl OcrService {
         let seen = Arc::new(Mutex::new(HashSet::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let shutdown_cancel = OcrCancel::new();
-        let worker_seen = seen.clone();
-        let worker_stop = stop.clone();
-        let worker_cancel = shutdown_cancel.clone();
-        let handle = thread::Builder::new()
-            .name("snapclip-ocr-worker".into())
-            .spawn(move || {
-                worker_loop(
-                    store,
-                    sink,
-                    engine,
-                    rx,
-                    worker_seen,
-                    worker_stop,
-                    worker_cancel,
-                )
-            })
-            .expect("spawn ocr worker");
+        let slot = Arc::new(WorkerSlot {
+            spawn_args: Mutex::new(Some(SpawnArgs {
+                store,
+                sink,
+                engine,
+                rx,
+                seen: seen.clone(),
+                stop: stop.clone(),
+                shutdown_cancel: shutdown_cancel.clone(),
+            })),
+            worker: Mutex::new(None),
+            created_at: Instant::now(),
+        });
         OcrServiceHandle {
-            enqueuer: OcrEnqueuer { tx, seen },
+            enqueuer: OcrEnqueuer {
+                tx,
+                seen,
+                slot: slot.clone(),
+            },
             stop,
             shutdown_cancel,
-            worker: Some(handle),
+            slot,
         }
     }
 }
@@ -385,9 +453,16 @@ fn emit_status(
 
 #[cfg(test)]
 mod tests {
-    use super::emit_status;
-    use crate::ocr::OcrEventSink;
-    use std::sync::Mutex;
+    use super::{OcrService, emit_status};
+    use crate::infrastructure::store::Store;
+    use crate::ocr::engine::{OcrCancel, OcrError, OcrInput, OcrText};
+    use crate::ocr::events::OcrEventSink;
+    use crate::ocr::OcrEngine;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::{Duration, Instant};
 
     /// Records what the worker published, so the seam added in T0.5.2 is pinned.
     #[derive(Default)]
@@ -425,6 +500,84 @@ mod tests {
                 ),
                 ("clip-2".to_string(), "done".to_string(), "windows".to_string(), None),
             ]
+        );
+    }
+
+    /// Counts the times the worker asked the engine anything.
+    ///
+    /// `is_available()` is the first thing `process_job` calls, so a non-zero count is
+    /// the cheapest observable proof that the worker thread is really running.
+    struct CountingEngine(AtomicUsize);
+
+    impl OcrEngine for CountingEngine {
+        fn name(&self) -> &'static str {
+            "counting"
+        }
+
+        fn is_available(&self) -> bool {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+
+        fn recognize(&self, _input: &OcrInput, _cancel: &OcrCancel) -> Result<OcrText, OcrError> {
+            unreachable!("the job in this test is never claimable, so no recognition runs")
+        }
+    }
+
+    /// A throw-away directory for a real `Store` (SQLite file + blob dir).
+    struct TempRoot(std::path::PathBuf);
+
+    impl TempRoot {
+        fn new(tag: &str) -> Self {
+            static SEQ: AtomicUsize = AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "snapclip-{tag}-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::SeqCst)
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("create temp root");
+            Self(path)
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// T0.5.3: building the service must not start a thread, and the first enqueue must.
+    #[test]
+    fn the_worker_starts_on_the_first_enqueue_and_not_before() {
+        let root = TempRoot::new("ocr-lazy");
+        let store = Store::open(&root.0).expect("open store");
+        let engine = Arc::new(CountingEngine(AtomicUsize::new(0)));
+        let service = OcrService::new(
+            store,
+            Arc::new(RecordingSink::default()),
+            engine.clone() as Arc<dyn OcrEngine>,
+        );
+
+        // Merely constructing the service touches nothing: no thread, no engine call.
+        assert_eq!(
+            engine.0.load(Ordering::SeqCst),
+            0,
+            "OcrService::new must not start the worker"
+        );
+
+        let enqueuer = service.enqueuer();
+        // The clip does not exist, so the job is claimed by nobody — but reaching the
+        // claim means the worker thread ran.
+        assert!(enqueuer.try_enqueue("clip-that-does-not-exist", "hash-1"));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while engine.0.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            engine.0.load(Ordering::SeqCst) > 0,
+            "the first enqueue did not start the worker"
         );
     }
 }

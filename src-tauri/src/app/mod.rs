@@ -89,12 +89,10 @@ pub fn run() {
             let sink: std::sync::Arc<dyn crate::ocr::OcrEventSink> = std::sync::Arc::new(
                 crate::app::ocr_events::TauriOcrEventSink::new(app.handle().clone()),
             );
-            let ocr = crate::ocr::OcrService::start(store.clone(), sink, engine);
+            // Lazy: no worker thread (and no COM apartment) until the first job
+            // arrives. The log therefore comes from the worker itself, on demand.
+            let ocr = crate::ocr::OcrService::new(store.clone(), sink, engine);
             let enqueuer = ocr.enqueuer();
-            eprintln!(
-                "[snapclip][startup] ocr worker started elapsed_ms={}",
-                startup.elapsed().as_millis()
-            );
 
             app.manage(store.clone());
             app.manage(enqueuer.clone());
