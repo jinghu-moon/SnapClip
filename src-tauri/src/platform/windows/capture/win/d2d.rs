@@ -257,6 +257,8 @@ pub struct RenderView {
     pub preview_label: Option<String>,
     /// The previewed box is the whole window rather than an element: neutral wash, thin outline.
     pub preview_is_window: bool,
+    /// How visible the preview box is, `0.0..=1.0` (docs/21 §5.24, ②): it eases in when it appears.
+    pub preview_alpha: f32,
     /// How "walking" the level chain is right now, `0.0..=1.0` (docs/21 §5.24, A3).
     ///
     /// The capture green is a **walk signal**: at rest the box that would be taken is brand blue,
@@ -298,6 +300,7 @@ impl RenderView {
             chain_rings: Vec::new(),
             preview_label: None,
             preview_is_window: false,
+            preview_alpha: 1.0,
             capture_green: 0.0,
             level_badge: None,
             hint: None,
@@ -857,11 +860,14 @@ impl OverlayRenderer {
                     )
                 } else {
                     let walking = view.capture_green.clamp(0.0, 1.0);
+                    // ②: the box eases in when it appears; the hole in the mask is already open, so
+                    // the content is at its own brightness while the outline is still arriving.
+                    let appear = view.preview_alpha.clamp(0.0, 1.0);
                     let mix = self.require_brush(&self.preview_stroke_brush, "preview stroke brush")?;
                     let fill = self.require_brush(&self.preview_fill_brush, "preview fill brush")?;
                     unsafe {
-                        let _ = mix.SetColor(&capture_mix_color(walking));
-                        let _ = fill.SetColor(&capture_wash_color(walking));
+                        let _ = mix.SetColor(&capture_mix_color(walking, appear));
+                        let _ = fill.SetColor(&capture_wash_color(walking, appear));
                     }
                     (
                         fill,
@@ -2087,7 +2093,7 @@ impl OverlayRenderer {
             PREVIEW_WASH_ALPHA * PREVIEW_WASH_WALK_SCALE,
         );
         self.preview_fill_brush = Some(self.create_brush(&preview_fill)?);
-        self.preview_stroke_brush = Some(self.create_brush(&capture_mix_color(1.0))?);
+        self.preview_stroke_brush = Some(self.create_brush(&capture_mix_color(1.0, 1.0))?);
         // The badge's hairline and its dimmed half (v3: rgba(255,255,255,.1–.14) and
         // rgba(200,208,219,.28); folded into one line brush, since the two hairlines differ by four
         // percent of alpha and no one can see it).
@@ -2319,23 +2325,27 @@ const PREVIEW_WASH_ALPHA: f32 = 0.18;
 const PREVIEW_WASH_WALK_SCALE: f32 = 0.5;
 
 /// The capture box's outline colour: brand blue at rest, the capture green while walking (A3).
-fn capture_mix_color(walking: f32) -> D2D1_COLOR_F {
+///
+/// `appear` is the box's own fade-in — 0 the frame it appears, 1 from 140 ms later (docs/21 §5.24,
+/// ②). It rides on the same brush because the two are the same statement: how strongly this outline
+/// is on screen.
+fn capture_mix_color(walking: f32, appear: f32) -> D2D1_COLOR_F {
     let t = walking.clamp(0.0, 1.0);
     color(
         ACCENT_RGB.0 + (CAPTURE_RGB.0 - ACCENT_RGB.0) * t,
         ACCENT_RGB.1 + (CAPTURE_RGB.1 - ACCENT_RGB.1) * t,
         ACCENT_RGB.2 + (CAPTURE_RGB.2 - ACCENT_RGB.2) * t,
-        1.0,
+        appear.clamp(0.0, 1.0),
     )
 }
 
 /// The capture box's wash: nothing at rest, the capture green at half strength while walking.
-fn capture_wash_color(walking: f32) -> D2D1_COLOR_F {
+fn capture_wash_color(walking: f32, appear: f32) -> D2D1_COLOR_F {
     color(
         CAPTURE_RGB.0,
         CAPTURE_RGB.1,
         CAPTURE_RGB.2,
-        PREVIEW_WASH_ALPHA * PREVIEW_WASH_WALK_SCALE * walking.clamp(0.0, 1.0),
+        PREVIEW_WASH_ALPHA * PREVIEW_WASH_WALK_SCALE * walking.clamp(0.0, 1.0) * appear.clamp(0.0, 1.0),
     )
 }
 
@@ -2993,8 +3003,8 @@ mod tests {
     fn the_capture_box_is_blue_at_rest_and_green_while_walking() {
         // The two ends are the palette entries themselves, so the box's colour cannot drift away
         // from the brushes the rest of the overlay uses.
-        let rest = capture_mix_color(0.0);
-        let walking = capture_mix_color(1.0);
+        let rest = capture_mix_color(0.0, 1.0);
+        let walking = capture_mix_color(1.0, 1.0);
         assert!(
             (rest.r - ACCENT_RGB.0).abs() < 1e-6 && (rest.b - ACCENT_RGB.2).abs() < 1e-6,
             "at rest the box is the brand blue"
@@ -3006,9 +3016,19 @@ mod tests {
         );
         // Nothing is washed at rest: the hole already shows the content at its own brightness, and a
         // wash on top of it would only tint the pixels the user is trying to judge.
-        assert_eq!(capture_wash_color(0.0).a, 0.0);
+        assert_eq!(capture_wash_color(0.0, 1.0).a, 0.0);
         assert!(
-            (capture_wash_color(1.0).a - PREVIEW_WASH_ALPHA * PREVIEW_WASH_WALK_SCALE).abs() < 1e-6
+            (capture_wash_color(1.0, 1.0).a - PREVIEW_WASH_ALPHA * PREVIEW_WASH_WALK_SCALE).abs()
+                < 1e-6
+        );
+        // ②: the box's own fade-in rides on the same two colours, so "how strongly is this outline
+        // on screen" is one number rather than a second brush.
+        assert!((capture_mix_color(1.0, 0.0).a).abs() < 1e-6);
+        assert!(
+            (capture_wash_color(1.0, 0.5).a
+                - PREVIEW_WASH_ALPHA * PREVIEW_WASH_WALK_SCALE * 0.5)
+                .abs()
+                < 1e-6
         );
 
         let Ok(device) = super::GraphicsDevice::create() else {

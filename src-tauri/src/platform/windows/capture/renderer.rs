@@ -67,6 +67,10 @@ pub struct OverlayFrameState {
     /// walk is live. The box itself is identified by the mask hole, which the renderer derives from
     /// `preview_bounds`/`selection`.
     pub capture_green: f32,
+    /// How visible the preview box is, `0.0..=1.0` (docs/21 §5.24, ②): the box eases in when it
+    /// appears, and is 1 from then on. The mask hole is not part of it — the content is already at
+    /// its own brightness while the outline is still arriving.
+    pub preview_alpha: f32,
     /// How many wheel stops the level walk still has in each direction, while it is above the answer
     /// (docs/21 §5.24, A1).
     pub level_badge: Option<LevelReach>,
@@ -95,6 +99,7 @@ impl OverlayFrameState {
             preview_label: None,
             preview_is_window: false,
             capture_green: 0.0,
+            preview_alpha: 1.0,
             level_badge: None,
             hint: None,
         }
@@ -231,6 +236,7 @@ impl Win32Renderer {
             preview_label: state.preview_label.clone(),
             preview_is_window: state.preview_is_window,
             capture_green: state.capture_green,
+            preview_alpha: state.preview_alpha,
             level_badge: state.level_badge,
             hint: state.hint.clone(),
         };
@@ -277,6 +283,9 @@ impl Win32Renderer {
             // …and so are the labels and the one-shot hint: an artifact never carries UI.
             preview_label: None,
             preview_is_window: false,
+            // An artifact carries no UI, so nothing may fade in either; the view built here has no
+            // preview at all.
+            preview_alpha: 1.0,
             // An artifact carries no UI, so nothing may walk its colour either; the view built here
             // has no preview anyway, and the mask hole is the exported selection.
             capture_green: 0.0,

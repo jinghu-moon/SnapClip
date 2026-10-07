@@ -75,7 +75,7 @@ use crate::capture::window_detection::model::RequestId;
 use crate::capture::window_detection::{
     DEFAULT_ADOPT_TEXT_RUNS, DEFAULT_DWELL_MS, DEFAULT_HOVER_REVALIDATE_MS, DEFAULT_SNAP_RADIUS_PX,
     DeepTarget, Exclusions, LevelChain, LevelKind, PathLevel, RingOptions, RingRole, chain_rings,
-    next_visible_stop, stops_from,
+    next_visible_stop, out_quad, stops_from,
     GestureState, HoverValidity, MoveOutcome, PressOutcome, RefinementJob, RefinementOutcome,
     RefinementScheduler,
     ReleaseOutcome, Replacement, WindowSnapshot, WindowTarget, classify_replacement,
@@ -245,19 +245,22 @@ impl WheelAccumulator {
 /// the box never turned green at all.
 #[derive(Debug)]
 struct WalkColour {
+    /// The painted share of the capture green, `0.0..=1.0`.
     activity: f32,
+    /// The value the current rise started from, so a walk that arrives mid-fade continues from what
+    /// is on screen instead of flashing back to blue.
+    from: f32,
     /// When the last walk was; `None` until the first one of the session, and again once the colour
     /// has finished coming back down.
     touched_at: Option<Instant>,
-    stepped_at: Instant,
 }
 
 impl Default for WalkColour {
     fn default() -> Self {
         Self {
             activity: 0.0,
+            from: 0.0,
             touched_at: None,
-            stepped_at: Instant::now(),
         }
     }
 }
@@ -265,8 +268,8 @@ impl Default for WalkColour {
 impl WalkColour {
     /// A walk happened: the rise starts on the next tick.
     fn touch(&mut self, now: Instant) {
+        self.from = self.activity;
         self.touched_at = Some(now);
-        self.stepped_at = now;
     }
 
     /// How green the box is.
@@ -275,14 +278,20 @@ impl WalkColour {
     }
 
     /// Advance one tick; `true` when the painted value changed.
+    ///
+    /// Both halves are functions of the time since the walk, not accumulated steps: the rise is eased
+    /// from where this walk started and arrives at [`WALK_RISE_MS`], and the fall is the shared eased
+    /// envelope. That is what makes the colour continuous (docs/21 §5.24, ①) while the rings' alpha
+    /// stays quantised.
     fn advance(&mut self, now: Instant) -> bool {
         let Some(touched) = self.touched_at else {
             // Nothing has walked: a tick must never be what turns the box green.
             return false;
         };
-        let step = now.saturating_duration_since(self.stepped_at);
-        self.stepped_at = now;
-        let activity = walk_activity_step(self.activity, step, now.saturating_duration_since(touched));
+        let idle = now.saturating_duration_since(touched);
+        let rise = self.from + (1.0 - self.from) * appear_share(idle, WALK_RISE_MS);
+        let visible = 1.0 - fade_at(idle, CHAIN_FADE_AFTER_MS, CHAIN_FADE_MS);
+        let activity = rise.min(visible).clamp(0.0, 1.0);
         if activity <= 0.0 {
             // The envelope is over: forget the walk, so the tick stops asking and the next walk gets
             // a fresh rise instead of inheriting a timestamp from the last one.
@@ -308,6 +317,103 @@ impl WalkColour {
     /// Whether the colour is on at all — what keeps *one* repaint alive to notice the hold expiring.
     fn pending(&self) -> bool {
         self.activity > 0.0
+    }
+}
+
+/// How visible the chain of rings is: eased in when it is used, quantised away when it goes quiet
+/// (docs/21 §5.22, §5.24 ②③).
+///
+/// The **rise** is new: the chain used to appear at full strength in the same frame as the answer
+/// that created it, while its disappearance had been animated for two rounds — which is exactly the
+/// asymmetry the user noticed. The **fall** stays quantised: eight steps of alpha are invisible and
+/// each distinct value is a full-surface repaint, so the coarse ramp is the cost model (①).
+#[derive(Debug, Default)]
+struct ChainVisibility {
+    visibility: f32,
+    /// The value the current rise started from — a chain re-used mid-fade continues from what is on
+    /// screen rather than jumping back to full.
+    from: f32,
+    /// When the chain was last used; `None` until the first walk or answer of the session.
+    ///
+    /// Explicit for the same reason [`WalkColour`]'s is: "not used yet" reads as zero and is not the
+    /// same state as "faded away", and a tick must never be what makes the chain appear.
+    touched_at: Option<Instant>,
+}
+
+impl ChainVisibility {
+    /// The chain was just used; the rise starts on the next tick.
+    fn touch(&mut self, now: Instant) {
+        self.from = self.visibility;
+        self.touched_at = Some(now);
+    }
+
+    fn value(&self) -> f32 {
+        self.visibility
+    }
+
+    /// Advance one tick; `true` when the painted value changed.
+    fn advance(&mut self, now: Instant) -> bool {
+        let Some(touched) = self.touched_at else {
+            return false;
+        };
+        let idle = now.saturating_duration_since(touched);
+        let rise = self.from + (1.0 - self.from) * appear_share(idle, CHAIN_RISE_MS);
+        let visible = chain_visibility_at(idle);
+        let next = rise.min(visible).clamp(0.0, 1.0);
+        if (next - self.visibility).abs() < f32::EPSILON {
+            return false;
+        }
+        self.visibility = next;
+        true
+    }
+
+    /// Whether the value is still moving, so the render tick has to keep itself armed.
+    fn running(&self, now: Instant) -> bool {
+        let Some(touched) = self.touched_at else {
+            return false;
+        };
+        self.visibility < 1.0
+            || now.saturating_duration_since(touched).as_millis() as u64 >= CHAIN_FADE_AFTER_MS
+    }
+
+    /// Whether there is still a fade to come or to finish — what keeps *one* repaint alive to notice
+    /// the 1.2 s deadline while nothing else is happening (docs/21 §5.22).
+    fn pending(&self) -> bool {
+        self.visibility > 0.0
+    }
+}
+
+/// Which ring rectangles are on screen, and since when (docs/21 §5.24, ②).
+///
+/// Keyed by the rectangle rather than by the level index: walking up a level drops the outermost
+/// ring and adds one inside, and an index cannot tell "the same ring, still here" from "a different
+/// ring" — while the rectangle can, which is what keeps the rings that survived a walk from
+/// re-animating.
+#[derive(Debug, Default)]
+struct RingAppear {
+    seen: Vec<(Rect, Instant)>,
+}
+
+impl RingAppear {
+    /// How far in `rect` is, starting its clock the first time it is drawn.
+    fn share(&mut self, rect: Rect, now: Instant) -> f32 {
+        let since = match self.seen.iter_mut().find(|(seen, _)| *seen == rect) {
+            Some((_, since)) => *since,
+            None => {
+                self.seen.push((rect, now));
+                now
+            }
+        };
+        appear_share(now.saturating_duration_since(since), RING_APPEAR_MS)
+    }
+
+    /// Forget the rings that are gone, so the next time one of them appears it fades in again.
+    fn retain(&mut self, live: &[Rect]) {
+        self.seen.retain(|(rect, _)| live.contains(rect));
+    }
+
+    fn clear(&mut self) {
+        self.seen.clear();
     }
 }
 
@@ -607,14 +713,15 @@ where
     /// Once per session: the sentence belongs to the moment the number appears, and a user who
     /// keeps walking does not need it again — the label carries the numbers from then on.
     hint_taught: bool,
-    /// When the chain was last *touched*: a level walk, a new answer, or a cursor move (docs/21
-    /// §5.22). Idle time is measured from here for the ③b fade.
-    chain_touched_at: Instant,
-    /// How visible the chain rings are right now, `1.0` down to `0.0` in steps of `1/8`.
-    ///
-    /// Quantised, and that is the point: each step is one full-surface repaint, so the fade costs at
-    /// most eight of them however long the fade lasts (the prototype measured seven).
-    chain_visibility: f32,
+    /// How visible the chain of rings is (docs/21 §5.22): eased in when it is used, quantised away
+    /// when the walk goes quiet.
+    chain: ChainVisibility,
+    /// Which rings are on screen and since when, so a level a walk just added fades in while the
+    /// rings that survived it do not re-animate (docs/21 §5.24, ②).
+    ring_appear: RingAppear,
+    /// When the current preview box appeared, so it fades in — and only when it *appears*: a walk
+    /// re-targets the box on every notch, and re-fading there would make it blink (docs/21 §5.24, ②).
+    preview_appeared_at: Option<Instant>,
     /// The capture box's walk colour (docs/21 §5.24, A3): the green that says "you just moved this".
     walk: WalkColour,
     /// Wheel deltas accumulating into level steps (v3 B2, docs/21 §5.24).
@@ -745,8 +852,9 @@ where
             deep_levels: None,
             hint: None,
             hint_taught: false,
-            chain_touched_at: Instant::now(),
-            chain_visibility: 1.0,
+            chain: ChainVisibility::default(),
+            ring_appear: RingAppear::default(),
+            preview_appeared_at: None,
             walk: WalkColour::default(),
             wheel: WheelAccumulator::default(),
             pending_downgrade: None,
@@ -872,11 +980,12 @@ where
             self.session_counter
         );
         self.session = CaptureSession::new(session_id);
-        // Per-session paint state starts clean: the previous session's walk colour (and the chain's
-        // visibility) must not be inherited by the next F5 (docs/21 §5.24, A3).
+        // Per-session paint state starts clean: the previous session's walk colour, chain visibility
+        // and appear clocks must not be inherited by the next F5 (docs/21 §5.24).
         self.walk = WalkColour::default();
-        self.chain_visibility = 1.0;
-        self.chain_touched_at = Instant::now();
+        self.chain = ChainVisibility::default();
+        self.ring_appear.clear();
+        self.preview_appeared_at = None;
         if let Err(error) = self.session.preparing() {
             eprintln!("[snapclip][capture] session preparing transition failed: {error}");
             self.fail(None, error, "none");
@@ -1281,6 +1390,7 @@ where
                 preview_label: None,
                 preview_is_window: false,
                 capture_green: 0.0,
+                preview_alpha: 1.0,
                 level_badge: None,
                 hint: None,
             };
@@ -1695,29 +1805,27 @@ where
             .is_some_and(|hint| Instant::now() < hint.until)
     }
 
-    /// The chain was just used: walk, new answer, or a cursor move (docs/21 §5.22).
+    /// The chain was just used: a walk or a new answer (docs/21 §5.22, §5.24 ④).
     ///
-    /// Brings it straight back to full visibility — a fade in progress must never make the user wait
-    /// to see what they are pointing at.
+    /// The rise starts from whatever is on screen, so a chain re-used mid-fade comes back smoothly
+    /// rather than jumping — and a *cursor move* deliberately no longer counts. It used to, so that
+    /// "the hand is on its way to inspect it" would not lose the rings; the effect was that a user
+    /// who kept moving the mouse never saw them fade at all, which is the disappearance the user
+    /// asked for (docs/21 §5.24).
     fn touch_chain(&mut self) {
-        self.chain_touched_at = Instant::now();
-        self.chain_visibility = 1.0;
+        self.chain.touch(Instant::now());
     }
 
-    /// Advance the ③b fade; returns whether anything changed and therefore needs a repaint.
+    /// Advance the ③b fade and the ② rise; returns whether anything changed and therefore needs a
+    /// repaint.
     ///
     /// Called from the coalescing render tick, which also keeps itself alive while the fade is still
     /// moving (`chain_fade_running`), so the fade is driven by the same 15 ms clock as everything
     /// else rather than by a timer of its own.
     fn advance_chain_fade(&mut self) -> bool {
-        if self.chain_visibility <= 0.0 {
+        if !self.chain.advance(Instant::now()) {
             return false;
         }
-        let visibility = chain_visibility_at(self.chain_touched_at.elapsed());
-        if (visibility - self.chain_visibility).abs() < f32::EPSILON {
-            return false;
-        }
-        self.chain_visibility = visibility;
         // One repaint per step, and that is the whole cost model — so it gets its own counter
         // instead of hiding inside `present=` (docs/21 §5.22).
         self.metrics.record_chain_fade_frame();
@@ -1730,13 +1838,13 @@ where
     /// *one* repaint alive to notice the 1.2 s deadline. It is deliberately not what keeps the
     /// render tick armed — see `chain_fade_running`.
     fn chain_fade_pending(&self) -> bool {
-        self.chain_visibility > 0.0
+        self.chain.pending()
     }
 
     /// Whether the fade is *moving* right now: only then does the render tick re-arm itself, so the
     /// 1.2 s of waiting costs nothing (docs/21 §5.22).
     fn chain_fade_running(&self) -> bool {
-        self.chain_visibility > 0.0 && self.chain_visibility < 1.0
+        self.chain.running(Instant::now())
     }
 
     /// A walk just happened: the capture box turns green (docs/21 §5.24, A3).
@@ -1842,7 +1950,7 @@ where
     ///
     /// Empty unless the published deep target belongs to the window currently under the cursor: a
     /// path for another window would draw outlines over unrelated pixels.
-    fn chain_rings_local(&self) -> Vec<ChainRingView> {
+    fn chain_rings_local(&mut self) -> Vec<ChainRingView> {
         let Some(layout) = self.layout() else {
             return Vec::new();
         };
@@ -1856,21 +1964,43 @@ where
             .deep_levels
             .map(|chain| chain.index())
             .unwrap_or(deep.path.len().saturating_sub(1));
-        chain_rings(&deep.path, selected, RingOptions::default())
-            .rings
-            .iter()
-            .filter(|ring| ring.role != RingRole::Selected)
-            .filter_map(|ring| {
-                let rect = window_rect_to_local(deep.path[ring.index].rect, &layout);
-                (!rect.is_empty()).then_some(ChainRingView {
-                    rect,
-                    inner: ring.role == RingRole::Inner,
-                    // ③b: the whole chain fades as one after the walk goes quiet (docs/21 §5.22).
-                    // The badge and the capture box do not — they are the answer, not the context.
-                    alpha: ring.alpha * self.chain_visibility,
+        // In monitor-local pixels, with everything the paint layer needs, so the borrow of
+        // `self.deep_target` ends before the appear clocks below need `&mut self`.
+        let planned: Vec<(Rect, bool, f32)> =
+            chain_rings(&deep.path, selected, RingOptions::default())
+                .rings
+                .iter()
+                .filter(|ring| ring.role != RingRole::Selected)
+                .map(|ring| {
+                    (
+                        window_rect_to_local(deep.path[ring.index].rect, &layout),
+                        ring.role == RingRole::Inner,
+                        ring.alpha,
+                    )
                 })
+                .collect();
+        let now = Instant::now();
+        // ③b: the whole chain fades as one after the walk goes quiet (docs/21 §5.22). The badge and
+        // the capture box do not — they are the answer, not the context.
+        let visibility = self.chain.value();
+        let views: Vec<ChainRingView> = planned
+            .into_iter()
+            .filter(|(rect, _, _)| !rect.is_empty())
+            .map(|(rect, inner, alpha)| {
+                // ②: a ring that is already on screen keeps its clock; one a walk just added starts
+                // at zero and eases in, so stepping up a level shows *which* ring arrived.
+                let appear = self.ring_appear.share(rect, now);
+                ChainRingView {
+                    rect,
+                    inner,
+                    alpha: alpha * visibility * appear,
+                }
             })
-            .collect()
+            .collect();
+        // Forget the rings that are gone, so the next time one of them appears it fades in again.
+        let live: Vec<Rect> = views.iter().map(|view| view.rect).collect();
+        self.ring_appear.retain(&live);
+        views
     }
 
     /// Re-resolve the hovered window from the cached snapshot. **Pure cache read.**
@@ -2018,13 +2148,27 @@ where
             (Some(to), None) => {
                 self.preview_transition.present(to, now);
                 self.preview_rect = Some(to);
+                // ②: the box *appeared* — ease it in. A re-target only moves it (the transition),
+                // because re-fading on every notch would make it blink.
+                self.preview_appeared_at = Some(now);
             }
             (Some(to), Some(from)) => self.preview_transition.start(from, to, now),
             (None, _) => {
                 self.preview_transition.present(Rect::default(), now);
                 self.preview_rect = None;
+                self.preview_appeared_at = None;
             }
         }
+    }
+
+    /// How visible the preview box is: eased in when it appears, 1 later (docs/21 §5.24, ②).
+    ///
+    /// The *hole* in the mask is not part of this: it is punched by the mask, which is painted in one
+    /// pass, so the content is already at its own brightness when the outline is still arriving.
+    fn preview_appear(&self) -> f32 {
+        self.preview_appeared_at
+            .map(|since| appear_share(since.elapsed(), PREVIEW_APPEAR_MS))
+            .unwrap_or(1.0)
     }
 
     /// Advance the preview animation and report whether the painted rectangle changed.
@@ -2613,9 +2757,11 @@ where
         let point = Point::new(client.x, client.y);
         self.cursor = point;
         self.cursor_visible = true;
-        // Moving the cursor is the user still *looking*, so it counts as chain activity (docs/21
-        // §5.22): without this the chain fades out while the hand is on its way to inspect it.
-        self.touch_chain();
+        // A cursor move deliberately does **not** touch the chain (docs/21 §5.24, ④): it used to, so
+        // that "the hand is on its way to inspect it" would not lose the rings — but the effect was
+        // that a user who kept moving the mouse never saw them fade, which is the disappearance this
+        // exists for. Walks and new answers are the triggers now, so "scrolling stopped" really does
+        // mean the chain goes away.
 
         if self.session.state() == CaptureState::Annotating {
             // The pointer drives the annotation document, not the selection.
@@ -3164,6 +3310,8 @@ where
         if self.preview_transition.is_running(Instant::now())
             || self.chain_fade_running()
             || self.walk_activity_running()
+            // …and the box's own appear ramp, which is a plain ramp on the same clock.
+            || self.preview_appear() < 1.0
         {
             // Schedule the next frame: the animation or the fade is still moving.
             self.invalidate();
@@ -3189,6 +3337,7 @@ where
         let preview_label = self.preview_label_text();
         let preview_is_window = self.preview_is_window();
         let capture_green = self.capture_box_green();
+        let preview_alpha = self.preview_appear();
         let level_badge = self.level_badge();
         let hint = self.hint_text();
         let Some(renderer) = self.renderer.as_mut() else {
@@ -3226,6 +3375,7 @@ where
             preview_label,
             preview_is_window,
             capture_green,
+            preview_alpha,
             level_badge,
             hint,
         };
@@ -3524,8 +3674,26 @@ const CHAIN_FADE_AFTER_MS: u64 = 1200;
 /// How long the fade itself takes. Eight steps over 240 ms is one repaint every 30 ms — bounded,
 /// and fast enough to read as a fade rather than as a sequence of pictures.
 const CHAIN_FADE_MS: u64 = 240;
-/// Steps the fade is quantised into. Each step is a full-surface present, so this *is* the cost.
+/// Steps an **alpha** fade is quantised into. Each step is a full-surface present, so this *is* the
+/// cost — and a step of `1/8` of an alpha is below the eye's threshold, which is why the rings keep
+/// this coarse ramp while the capture box's *colour* does not (docs/21 §5.24, ①).
 const CHAIN_FADE_STEPS: u32 = 8;
+
+/// How long the chain takes to come back when it is used (docs/21 §5.24, ②).
+///
+/// The counterpart to the fade: a chain that appeared out of nowhere reads as a glitch next to a
+/// preview box that eases onto its target, so the rings ease in over the same kind of window.
+const CHAIN_RISE_MS: u64 = 120;
+/// How long one ring takes to appear when a walk adds it to the chain (docs/21 §5.24, ②).
+///
+/// Per ring, not per chain: walking up a level drops the outermost ring and adds one inside, and
+/// only the one that appeared should animate — the rings that survived are already on screen.
+const RING_APPEAR_MS: u64 = 140;
+/// How long the capture box takes to fade in when a preview appears (docs/21 §5.24, ②).
+///
+/// Only on appearance, never on a re-target: a walk changes the box on every notch, and re-fading
+/// there would make the box blink while the user is stepping through levels.
+const PREVIEW_APPEAR_MS: u64 = 120;
 
 /// How long the capture box takes to turn green after a walk (docs/21 §5.24, A3).
 ///
@@ -3534,43 +3702,34 @@ const CHAIN_FADE_STEPS: u32 = 8;
 /// arrived by the time the box has.
 const WALK_RISE_MS: u64 = 100;
 
-/// The shared "flat, then a bounded ramp to nothing" envelope (docs/21 §5.22, §5.24).
+/// How much of a fade has run, `idle` after the event: 0 while it is recent, 1 when it is gone.
 ///
-/// Pure so the shape is testable: 1.0 while the event is recent, then a quantised ramp to 0. The
-/// quantisation is what bounds the cost — each distinct value is a full-surface present, so the
-/// number of steps *is* the price; a per-frame alpha would repaint ~15 times as often for a
-/// difference nobody can see.
-fn recent_activity_at(idle: Duration, hold_ms: u64, fade_ms: u64, steps: u32) -> f32 {
+/// Continuous and **eased** (`out_quad` — the same curve the preview rectangle uses, docs/21 §5.24
+/// ③), because this is the share a *colour* interpolates: quantising it is invisible on an alpha and
+/// visible banding on a hue (①). The rings still quantise, on top of this, through [`fade_at_steps`].
+fn fade_at(idle: Duration, hold_ms: u64, fade_ms: u64) -> f32 {
     let idle_ms = idle.as_millis() as u64;
-    if idle_ms < hold_ms {
-        return 1.0;
+    if idle_ms <= hold_ms {
+        return 0.0;
     }
-    let through = (idle_ms - hold_ms) as f32 / fade_ms as f32;
-    let remaining = (1.0 - through.clamp(0.0, 1.0)) * steps as f32;
-    (remaining.round() / steps as f32).clamp(0.0, 1.0)
+    out_quad((idle_ms - hold_ms) as f32 / fade_ms as f32)
+}
+
+/// The same fade, quantised into `steps` values — for an alpha, where the steps are invisible.
+fn fade_at_steps(idle: Duration, hold_ms: u64, fade_ms: u64, steps: u32) -> f32 {
+    (fade_at(idle, hold_ms, fade_ms) * steps as f32).round() / steps as f32
+}
+
+/// How far an element that appeared `elapsed` ago has come in, over `over_ms` (docs/21 §5.24, ②).
+///
+/// Pure and shared by the rings and the capture box, so "appear" means one thing in this file.
+fn appear_share(elapsed: Duration, over_ms: u64) -> f32 {
+    out_quad((elapsed.as_secs_f32() * 1000.0 / over_ms as f32).clamp(0.0, 1.0))
 }
 
 /// How visible the chain is, `idle` after the last touch (docs/21 §5.22).
 pub(crate) fn chain_visibility_at(idle: Duration) -> f32 {
-    recent_activity_at(idle, CHAIN_FADE_AFTER_MS, CHAIN_FADE_MS, CHAIN_FADE_STEPS)
-}
-
-/// How green the capture box is, one `step` further along, `idle` after the last walk (§5.24, A3).
-///
-/// The same envelope as the chain fade — green means the same thing to the eye as the rings do,
-/// "you just moved this" — plus an attack: the rings are simply there at full strength when a walk
-/// lands, while the colour has to *arrive*, so it rises over [`WALK_RISE_MS`] instead of jumping.
-///
-/// Pure apart from the two durations it is handed, so the whole envelope — rise, hold, bounded
-/// fall — is testable without a window or a clock.
-fn walk_activity_step(current: f32, step: Duration, idle: Duration) -> f32 {
-    let envelope = recent_activity_at(idle, CHAIN_FADE_AFTER_MS, CHAIN_FADE_MS, CHAIN_FADE_STEPS);
-    if idle.as_millis() as u64 >= CHAIN_FADE_AFTER_MS {
-        // Past the hold: follow the quantised fall down, never back up.
-        return current.min(envelope).clamp(0.0, 1.0);
-    }
-    let risen = current + step.as_secs_f32() * 1000.0 / WALK_RISE_MS as f32;
-    risen.min(envelope).clamp(0.0, 1.0)
+    1.0 - fade_at_steps(idle, CHAIN_FADE_AFTER_MS, CHAIN_FADE_MS, CHAIN_FADE_STEPS)
 }
 
 /// The one-shot hint that explains the level walk (docs/21 §5.21).
@@ -3961,10 +4120,11 @@ unsafe extern "system" {
 #[cfg(test)]
 mod tests {
     use super::{
-        CHAIN_FADE_AFTER_MS, CHAIN_FADE_MS, CHAIN_FADE_STEPS, OverlayCommand, WHEEL_IDLE_RESET_MS,
-        WALK_RISE_MS, WHEEL_NOTCH_UNITS, WHEEL_SETTLE_MS, WHEEL_UNITS_PER_STEP, WheelAccumulator,
-        WalkColour, chain_visibility_at, level_hint, point_from_lparam, preview_label, should_teach,
-        walk_activity_step,
+        CHAIN_FADE_AFTER_MS, CHAIN_FADE_MS, CHAIN_FADE_STEPS, CHAIN_RISE_MS, OverlayCommand,
+        PREVIEW_APPEAR_MS, RING_APPEAR_MS, WALK_RISE_MS, WHEEL_IDLE_RESET_MS, WHEEL_NOTCH_UNITS,
+        WHEEL_SETTLE_MS, WHEEL_UNITS_PER_STEP, ChainVisibility, RingAppear, WalkColour,
+        WheelAccumulator, appear_share, chain_visibility_at, level_hint, point_from_lparam,
+        preview_label, should_teach,
     };
     use crate::capture::geometry::Rect;
     use crate::capture::window_detection::{LevelChain, LevelKind};
@@ -4125,9 +4285,9 @@ mod tests {
         );
     }
 
-    /// The teaching sentence's two rules, as a truth table: once per session, but it follows a
-    /// ③b's shape: flat while the chain is being used, then a ramp to nothing — and the number of
-    /// distinct values in that ramp *is* its cost, because each one is a full-surface repaint.
+    /// ③b's shape: flat while the chain is being used, then a ramp to nothing — quantised, because
+    /// the number of distinct values in that ramp *is* its cost (each one is a full-surface repaint)
+    /// and an alpha step of `1/8` is below the eye's threshold (docs/21 §5.22, §5.24 ①).
     #[test]
     fn the_chain_fade_is_flat_then_quantised_into_a_bounded_number_of_steps() {
         use std::time::Duration;
@@ -4135,13 +4295,23 @@ mod tests {
         // Flat for the whole idle window, including the instant before the deadline.
         assert_eq!(chain_visibility_at(Duration::ZERO), 1.0);
         assert_eq!(chain_visibility_at(Duration::from_millis(1199)), 1.0);
-        // Then it starts coming down, in steps of 1/8.
+        // Then it starts coming down, in steps of 1/8 — and it starts *moving*: the ramp is eased
+        // (docs/21 §5.24 ③), so it has already taken a step within the first eighth of the fade
+        // rather than creeping at a constant rate.
         let first = chain_visibility_at(Duration::from_millis(CHAIN_FADE_AFTER_MS));
         assert_eq!(first, 1.0, "the fade begins at the deadline, not before it");
         let a_step_down = chain_visibility_at(Duration::from_millis(CHAIN_FADE_AFTER_MS + 30));
         assert!(
-            a_step_down < 1.0 && a_step_down >= 1.0 - 1.0 / CHAIN_FADE_STEPS as f32,
-            "one step down: {a_step_down}",
+            a_step_down < 1.0,
+            "the fade has to have moved 30 ms in: {a_step_down}",
+        );
+        // Eased, not linear: half way through the 240 ms it is more than half way down.
+        let halfway = chain_visibility_at(Duration::from_millis(
+            CHAIN_FADE_AFTER_MS + CHAIN_FADE_MS / 2,
+        ));
+        assert!(
+            halfway <= 0.5 + 1.0 / CHAIN_FADE_STEPS as f32,
+            "an eased fade is ahead of a linear one at the half way point: {halfway}",
         );
         // Gone at the end of the fade, and it stays gone.
         assert_eq!(
@@ -4281,73 +4451,175 @@ mod tests {
     }
 
     /// A3 (docs/21 §5.24): the capture box's colour rises in about a tenth of a second, holds for
-    /// the same 1.2 s the chain does, and then comes down on the same bounded ramp — never back up.
+    /// the same 1.2 s the chain does, and then comes down — **continuously**, which is the point of
+    /// ①: a hue quantised into eight steps shows as eight visible jumps, so the colour is the one
+    /// thing here that is *not* allowed to be cheap.
     #[test]
     fn the_walk_colour_rises_in_a_tenth_of_a_second_and_holds_for_one_point_two() {
-        use std::time::Duration;
+        use std::time::{Duration, Instant};
 
-        // Rising: from nothing, 16 ms of ticks take about `WALK_RISE_MS` to arrive.
-        let mut activity = 0.0;
-        let mut elapsed = 0u64;
-        while activity < 1.0 && elapsed <= 200 {
-            activity =
-                walk_activity_step(activity, Duration::from_millis(16), Duration::from_millis(elapsed));
-            elapsed += 16;
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let tick = Duration::from_millis(16);
+
+        // Rising: from nothing, the eased ramp arrives *exactly* at `WALK_RISE_MS` (not 16 ms late,
+        // which is what an accumulating step would do).
+        let mut walk = WalkColour::default();
+        walk.touch(t0);
+        let mut now = t0;
+        while now < at(WALK_RISE_MS) {
+            now += tick;
+            walk.advance(now);
         }
-        assert_eq!(activity, 1.0, "the rise has to finish");
+        assert_eq!(walk.activity(), 1.0, "the rise has to finish by {WALK_RISE_MS} ms");
+        // Eased, not linear: half way through the rise it is already past half the distance.
+        let mut half = WalkColour::default();
+        half.touch(t0);
+        half.advance(at(WALK_RISE_MS / 2));
         assert!(
-            (elapsed as i64 - WALK_RISE_MS as i64).abs() <= 32,
-            "the rise took {elapsed} ms, not {WALK_RISE_MS}"
+            half.activity() > 0.5,
+            "an eased rise is ahead of a linear one: {}",
+            half.activity()
         );
 
-        // Holding: any idle inside the hold stays at full, including the deadline itself.
-        for ms in [0, 600, CHAIN_FADE_AFTER_MS] {
+        // Holding: flat at full for the whole 1.2 s, including the deadline itself.
+        for ms in [WALK_RISE_MS, 600, CHAIN_FADE_AFTER_MS] {
+            let mut walk = WalkColour::default();
+            walk.touch(t0);
+            walk.advance(at(ms));
             assert_eq!(
-                walk_activity_step(1.0, Duration::from_millis(16), Duration::from_millis(ms)),
+                walk.activity(),
                 1.0,
                 "the hold must not start before {CHAIN_FADE_AFTER_MS} ms"
             );
         }
 
-        // Falling: monotone, and it ends at the brand blue.
-        let mut previous = 1.0;
+        // Falling: monotone, continuous, and it ends at the brand blue.
+        let mut walk = WalkColour::default();
+        walk.touch(t0);
+        walk.advance(at(CHAIN_FADE_AFTER_MS));
+        let mut sampled: Vec<f32> = Vec::new();
+        let mut previous = walk.activity();
         for ms in (CHAIN_FADE_AFTER_MS..=CHAIN_FADE_AFTER_MS + CHAIN_FADE_MS + 100).step_by(16) {
-            let next = walk_activity_step(
-                previous,
-                Duration::from_millis(16),
-                Duration::from_millis(ms),
-            );
+            walk.advance(at(ms));
+            let next = walk.activity();
             assert!(
-                next <= previous,
+                next <= previous + 1e-6,
                 "the colour rose during the fade: {previous} -> {next}"
             );
             previous = next;
+            sampled.push(next);
         }
-        assert_eq!(previous, 0.0);
-        // …and a value that lags behind the envelope is pulled down to it rather than left behind.
-        assert_eq!(
-            walk_activity_step(
-                1.0,
-                Duration::from_millis(16),
-                Duration::from_millis(CHAIN_FADE_AFTER_MS + CHAIN_FADE_MS)
-            ),
-            0.0
-        );
-
-        // The cost bound is the chain fade's: at most one distinct value per step, i.e. at most
-        // eight full-surface repaints for the walk colour coming down (docs/21 §5.22).
-        let sampled: std::collections::BTreeSet<u32> =
-            (0..=CHAIN_FADE_AFTER_MS + CHAIN_FADE_MS + 100)
-                .map(|ms| {
-                    (walk_activity_step(1.0, Duration::ZERO, Duration::from_millis(ms)) * 1000.0)
-                        as u32
-                })
-                .collect();
+        assert_eq!(previous, 0.0, "it has to arrive at the brand blue");
+        // ①: more distinct values than the rings' eight steps — the colour is interpolated, not
+        // snapped, and the frames it costs are bounded by the 240 ms fade (≈15 at a 16 ms tick).
+        let distinct: std::collections::BTreeSet<u32> = sampled
+            .iter()
+            .map(|value| (value * 1000.0) as u32)
+            .collect();
         assert!(
-            sampled.len() as u32 <= CHAIN_FADE_STEPS + 1,
-            "the walk colour took {} distinct values",
-            sampled.len(),
+            distinct.len() > CHAIN_FADE_STEPS as usize,
+            "the colour took {} distinct values — that is a staircase, not a fade",
+            distinct.len()
         );
+        assert!(distinct.len() <= 20, "the fade may not cost more than ~20 frames");
+
+        // A walk that arrives mid-fade continues from what is on screen: it must not flash back to
+        // blue, which is what restarting the rise from zero would do.
+        let mut walk = WalkColour::default();
+        walk.touch(t0);
+        walk.advance(at(CHAIN_FADE_AFTER_MS));
+        walk.advance(at(CHAIN_FADE_AFTER_MS + CHAIN_FADE_MS / 2));
+        let mid_fade = walk.activity();
+        assert!(mid_fade > 0.0 && mid_fade < 1.0, "mid-fade: {mid_fade}");
+        walk.touch(at(CHAIN_FADE_AFTER_MS + CHAIN_FADE_MS / 2));
+        walk.advance(at(CHAIN_FADE_AFTER_MS + CHAIN_FADE_MS / 2 + 16));
+        assert!(
+            walk.activity() >= mid_fade,
+            "a re-touch must continue from {mid_fade}, not from zero: {}",
+            walk.activity()
+        );
+    }
+
+    /// ② (docs/21 §5.24): the chain eases in instead of appearing at full strength, and a chain
+    /// re-used mid-fade comes back from where it is rather than jumping.
+    #[test]
+    fn the_chain_eases_in_and_re_using_it_continues_from_what_is_on_screen() {
+        use std::time::{Duration, Instant};
+
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+
+        // Nothing has touched it yet: a tick must not make the chain appear by itself.
+        let mut chain = ChainVisibility::default();
+        assert!(!chain.advance(at(16)));
+        assert_eq!(chain.value(), 0.0);
+        assert!(!chain.pending());
+
+        // Touched: it rises over `CHAIN_RISE_MS`, arriving exactly.
+        chain.touch(t0);
+        assert!(chain.running(t0), "the rise needs the tick to be seen");
+        chain.advance(at(CHAIN_RISE_MS));
+        assert_eq!(chain.value(), 1.0);
+        // Eased: half way through the rise it is past half way up.
+        let mut half = ChainVisibility::default();
+        half.touch(t0);
+        half.advance(at(CHAIN_RISE_MS / 2));
+        assert!(half.value() > 0.5, "an eased rise leads a linear one");
+
+        // Hold, then the quantised fall (①: alpha may stay coarse, the colour may not).
+        chain.advance(at(CHAIN_FADE_AFTER_MS));
+        assert_eq!(chain.value(), 1.0, "the hold lasts the full 1.2 s");
+        chain.advance(at(CHAIN_FADE_AFTER_MS + CHAIN_FADE_MS));
+        assert_eq!(chain.value(), 0.0);
+        assert!(!chain.pending(), "and it stops asking for repaints");
+
+        // A chain re-used while it is fading comes back from the value on screen: the rise starts at
+        // `from`, so the first frame after the touch cannot jump past what the eye was looking at.
+        let mut chain = ChainVisibility::default();
+        chain.touch(t0);
+        chain.advance(at(CHAIN_FADE_AFTER_MS + CHAIN_FADE_MS / 2));
+        let mid_fade = chain.value();
+        assert!(mid_fade > 0.0 && mid_fade < 1.0, "mid-fade: {mid_fade}");
+        chain.touch(at(CHAIN_FADE_AFTER_MS + CHAIN_FADE_MS / 2));
+        chain.advance(at(CHAIN_FADE_AFTER_MS + CHAIN_FADE_MS / 2 + 16));
+        assert!(
+            chain.value() >= mid_fade,
+            "the rise must continue from {mid_fade} rather than restarting at zero"
+        );
+    }
+
+    /// ② (docs/21 §5.24): a ring that is new fades in, one that was already on screen does not, and
+    /// one that left and came back starts over.
+    #[test]
+    fn only_a_ring_that_is_new_fades_in() {
+        use std::time::{Duration, Instant};
+
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let inner = Rect::new(100, 100, 200, 200);
+        let outer = Rect::new(0, 0, 300, 300);
+
+        // First sighting: starts at nothing and arrives over `RING_APPEAR_MS`.
+        let mut appear = RingAppear::default();
+        assert_eq!(appear.share(inner, t0), 0.0);
+        assert_eq!(appear.share(inner, at(RING_APPEAR_MS)), 1.0);
+        // A second ring appears while the first is already there: only the new one starts at 0.
+        assert_eq!(appear.share(inner, at(500)), 1.0, "the old ring stays put");
+        assert_eq!(appear.share(outer, at(500)), 0.0, "the new ring fades in");
+
+        // A ring that is gone is forgotten, so if it comes back it fades in again rather than
+        // inheriting the clock of its previous life.
+        appear.retain(&[outer]);
+        assert_eq!(appear.share(inner, at(1000)), 0.0);
+
+        // The shared appear curve is the one the preview box uses too: same shape, one definition.
+        assert_eq!(appear_share(Duration::ZERO, RING_APPEAR_MS), 0.0);
+        assert_eq!(
+            appear_share(Duration::from_millis(RING_APPEAR_MS), RING_APPEAR_MS),
+            1.0
+        );
+        assert_eq!(appear_share(Duration::from_millis(RING_APPEAR_MS), PREVIEW_APPEAR_MS), 1.0);
     }
 
     /// A3 (docs/21 §5.24): a tick is never what turns the box green — a **walk** is — and once a
