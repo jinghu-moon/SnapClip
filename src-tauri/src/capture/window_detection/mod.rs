@@ -50,7 +50,7 @@ pub use gesture::{
 pub use deep::{
     DeepSelectionProvider, DeepTarget, QueryControl, RefinementJob, RefinementOutcome,
     LevelChain, RefinementScheduler, Replacement, SchedulerActions, StopReason,
-    UnsupportedDeepSelection, ChainPlan, ChainRing, RingOptions, RingRole, chain_rings,
+    UnsupportedDeepSelection, ChainPlan, ChainRing, RingOptions, RingRole, chain_rings, next_visible_stop,
     classify_replacement, preview_bounds,
     REFINEMENT_BUDGET_MS, REFINEMENT_CALL_LIMIT_MS, REFINEMENT_DWELL_MS,
     REFINEMENT_PUBLISH_INTERVAL_MS,

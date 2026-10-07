@@ -74,7 +74,7 @@ use crate::capture::session::{CaptureSession, ExportOutcome};
 use crate::capture::window_detection::model::RequestId;
 use crate::capture::window_detection::{
     DEFAULT_ADOPT_TEXT_RUNS, DEFAULT_DWELL_MS, DEFAULT_HOVER_REVALIDATE_MS, DEFAULT_SNAP_RADIUS_PX,
-    DeepTarget, Exclusions, LevelChain, RingOptions, RingRole, chain_rings,
+    DeepTarget, Exclusions, LevelChain, RingOptions, RingRole, chain_rings, next_visible_stop,
     GestureState, HoverValidity, MoveOutcome, PressOutcome, RefinementJob, RefinementOutcome,
     RefinementScheduler,
     ReleaseOutcome, Replacement, WindowSnapshot, WindowTarget, classify_replacement,
@@ -163,6 +163,74 @@ impl OverlayCommand {
             value if value == Self::Shutdown as i32 => Some(Self::Shutdown),
             _ => None,
         }
+    }
+}
+
+/// The units one clicky-wheel notch is reported in — Windows' `WHEEL_DELTA`.
+const WHEEL_NOTCH_UNITS: i32 = 120;
+/// Sub-notch wheel units that add up to one level step (v3 B2, docs/21 §5.24).
+///
+/// A notch is 120 units, so one notch is one level — exactly what the wheel did before. A touchpad
+/// sends a long tail of small deltas instead, and without an accumulator one flick walks five
+/// levels, which is the difference between "the wheel is precise" and "the wheel is possessed".
+const WHEEL_UNITS_PER_STEP: i32 = 100;
+/// A gap this long with no wheel input drops the accumulated remainder: separate gestures must not
+/// add up.
+const WHEEL_IDLE_RESET_MS: u64 = 220;
+/// After a step, ignore *sub-notch* input for this long: a flick's inertia tail arrives as more of
+/// those and must not walk another level.
+const WHEEL_SETTLE_MS: u64 = 80;
+
+/// Turns a stream of wheel deltas into level steps (v3 B2, docs/21 §5.24).
+///
+/// Pure apart from the clock it is handed, so the mouse and touchpad behaviours are testable rather
+/// than a matter of feel.
+#[derive(Debug, Default)]
+struct WheelAccumulator {
+    residue: i32,
+    last_input: Option<Instant>,
+    settled_until: Option<Instant>,
+}
+
+impl WheelAccumulator {
+    /// Feed one wheel event; the result is how many levels to walk, signed, and `0` means none.
+    ///
+    /// A whole notch always steps, however fast the wheel is spun: the settle window exists for the
+    /// touchpad's inertia tail, which never arrives as a notch, and letting it swallow notches would
+    /// make a free-spinning wheel crawl. The window therefore gates only non-notch deltas.
+    fn steps(&mut self, delta: i32, now: Instant) -> i32 {
+        if delta == 0 {
+            return 0;
+        }
+        // A clicky wheel reports whole multiples of `WHEEL_DELTA` — one per detent, so one message
+        // can carry several notches (a coalesced fast spin) and each of them is a level. Dropping
+        // the extra would make a fast wheel slower than a slow one.
+        if delta % WHEEL_NOTCH_UNITS == 0 {
+            self.residue = 0;
+            self.last_input = Some(now);
+            self.settled_until = Some(now + Duration::from_millis(WHEEL_SETTLE_MS));
+            return delta / WHEEL_NOTCH_UNITS;
+        }
+        if self.settled_until.is_some_and(|until| now < until) {
+            return 0;
+        }
+        if self
+            .last_input
+            .is_some_and(|last| now.duration_since(last).as_millis() as u64 > WHEEL_IDLE_RESET_MS)
+        {
+            self.residue = 0;
+        }
+        self.last_input = Some(now);
+        self.residue += delta;
+        // Exact division, so a hard flick that arrives as one large delta walks the levels it covers
+        // instead of silently losing them.
+        let steps = self.residue / WHEEL_UNITS_PER_STEP;
+        if steps == 0 {
+            return 0;
+        }
+        self.residue -= steps * WHEEL_UNITS_PER_STEP;
+        self.settled_until = Some(now + Duration::from_millis(WHEEL_SETTLE_MS));
+        steps
     }
 }
 
@@ -470,6 +538,8 @@ where
     /// Quantised, and that is the point: each step is one full-surface repaint, so the fade costs at
     /// most eight of them however long the fade lasts (the prototype measured seven).
     chain_visibility: f32,
+    /// Wheel deltas accumulating into level steps (v3 B2, docs/21 §5.24).
+    wheel: WheelAccumulator,
     /// A shallower target waiting for its confirming dwell (docs/18 §13.3).
     ///
     /// A cursor merely passing through a parent container produces one such result; displaying
@@ -598,6 +668,7 @@ where
             hint_taught: false,
             chain_touched_at: Instant::now(),
             chain_visibility: 1.0,
+            wheel: WheelAccumulator::default(),
             pending_downgrade: None,
             refinement_pending: None,
             hit_test_pass_through,
@@ -1576,15 +1647,20 @@ where
         let chain = self
             .deep_levels
             .get_or_insert_with(|| LevelChain::new(deep.path.len()));
-        let moved = if delta < 0 {
-            chain.shallower()
-        } else {
-            chain.deeper()
-        };
+        // Skip the levels that would look identical (v3 B1, docs/21 §5.24): with collapse and the cap
+        // of seven, some levels have no ring, and a notch that changes nothing on screen reads as a
+        // dead wheel.
+        let target = next_visible_stop(
+            &deep.path,
+            chain.index(),
+            delta,
+            RingOptions::default().collapse_gap_px,
+        );
+        let moved = chain.jump_to(target);
         if moved {
-        // The first successful walk is where the counter appears, so that is where it gets
-        // explained (docs/21 §5.21).
-        self.arm_level_hint();
+            // The first successful walk is where the counter appears, so that is where it gets
+            // explained (docs/21 §5.21).
+            self.arm_level_hint();
             // A walk is the clearest "I am looking at the chain" there is (docs/21 §5.22).
             self.touch_chain();
             self.refresh_preview_for_cursor();
@@ -3120,13 +3196,21 @@ where
                     self.magnifier_zoom = MagnifierConfig::zoom_step(self.magnifier_zoom, direction);
                     self.invalidate();
                     Some(0)
-                } else if self.step_deep_level(if delta > 0 { -1 } else { 1 }) {
+                } else {
                     // Plain wheel walks the deep-selection levels (docs/21 §5.17): up toward the
                     // window frame, down toward the element under the cursor. Consumed, so the page
                     // underneath never sees a scroll it did not ask for.
-                    Some(0)
-                } else {
-                    None
+                    //
+                    // The message is translated into level steps first, so a touchpad's small deltas
+                    // add up to one walk instead of five (v3 B2, docs/21 §5.24).
+                    let steps = self.wheel.steps(delta as i32, Instant::now());
+                    let mut walked = false;
+                    for _ in 0..steps.abs() {
+                        // A stop that does not move — the end of the chain — must not end the count:
+                        // the walk is also where the level hint gets taught.
+                        walked |= self.step_deep_level(-steps.signum());
+                    }
+                    walked.then_some(0)
                 }
             }
             WM_SETFOCUS => {
@@ -3634,8 +3718,9 @@ unsafe extern "system" {
 #[cfg(test)]
 mod tests {
     use super::{
-        CHAIN_FADE_AFTER_MS, CHAIN_FADE_MS, CHAIN_FADE_STEPS, chain_visibility_at, level_hint,
-        point_from_lparam, preview_label, should_teach, OverlayCommand,
+        CHAIN_FADE_AFTER_MS, CHAIN_FADE_MS, CHAIN_FADE_STEPS, OverlayCommand, WHEEL_IDLE_RESET_MS,
+        WHEEL_NOTCH_UNITS, WHEEL_SETTLE_MS, WHEEL_UNITS_PER_STEP, WheelAccumulator,
+        chain_visibility_at, level_hint, point_from_lparam, preview_label, should_teach,
     };
     use crate::capture::geometry::Rect;
     use crate::capture::window_detection::LevelChain;
@@ -3822,5 +3907,61 @@ mod tests {
         assert_eq!(super::level_badge_labels(Some(LevelChain::new(9))), None);
         assert_eq!(super::level_badge_labels(Some(LevelChain::new(1))), None);
         assert_eq!(super::level_badge_labels(None), None);
+    }
+
+    /// v3 B2 (docs/21 §5.24): wheel units become level steps at the rate the device that sent them
+    /// deserves.
+    ///
+    /// Three behaviours have to hold at once, and each of them is something the prototype showed:
+    /// a notch is one level (a mouse), small deltas add up to one (a touchpad), and the inertia tail
+    /// that follows a step is swallowed instead of walking four more levels.
+    #[test]
+    fn wheel_units_become_one_level_per_notch_and_add_up_for_a_touchpad() {
+        use std::time::{Duration, Instant};
+
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+
+        // A notch, either way, is one level.
+        let notch = WHEEL_NOTCH_UNITS;
+        assert_eq!(notch, 120, "Windows' WHEEL_DELTA");
+        let mut wheel = WheelAccumulator::default();
+        assert_eq!(wheel.steps(notch, at(0)), 1);
+        assert_eq!(wheel.steps(-notch, at(100)), -1);
+        // A coalesced spin carries several notches in one message; every one of them walks.
+        assert_eq!(wheel.steps(notch * 3, at(200)), 3);
+
+        // Notches closer together than the settle window still step: the window is for inertia,
+        // which never arrives as a notch, and a free-spinning wheel must not crawl because of it.
+        let mut wheel = WheelAccumulator::default();
+        for ms in [0, 30, 60, 90] {
+            assert_eq!(wheel.steps(notch, at(ms)), 1, "notch at {ms} ms");
+        }
+
+        // A touchpad: small deltas add up, and the step lands on the delta that crosses the
+        // threshold rather than on the first one.
+        let small = 30;
+        let mut wheel = WheelAccumulator::default();
+        assert_eq!(wheel.steps(small, at(0)), 0);
+        assert_eq!(wheel.steps(small, at(16)), 0);
+        assert_eq!(wheel.steps(small, at(32)), 0);
+        assert_eq!(wheel.steps(small, at(48)), 1);
+        // …and the inertia tail of that same gesture is swallowed, not banked.
+        assert!(WHEEL_SETTLE_MS < 120, "the tail of a flick, not the next flick");
+        assert_eq!(wheel.steps(small, at(64)), 0);
+        assert_eq!(wheel.steps(small, at(120)), 0);
+
+        // A separate gesture does not inherit the remainder: the idle gap drops it. (60 + 60 would
+        // have been a step if the two added up.)
+        let mut wheel = WheelAccumulator::default();
+        assert_eq!(wheel.steps(60, at(0)), 0);
+        assert_eq!(wheel.steps(60, at(WHEEL_IDLE_RESET_MS + 1)), 0);
+        assert_eq!(wheel.steps(60, at(WHEEL_IDLE_RESET_MS + 17)), 1);
+
+        // A hard flick that arrives as one large delta walks the levels it covers, and the remainder
+        // is carried into the next event instead of being lost.
+        let mut wheel = WheelAccumulator::default();
+        assert_eq!(wheel.steps(WHEEL_UNITS_PER_STEP * 2 + 80, at(0)), 2);
+        assert_eq!(wheel.steps(30, at(100)), 1, "the 80 left over were kept");
     }
 }

@@ -152,6 +152,16 @@ impl LevelChain {
         self.index = self.levels.saturating_sub(1);
     }
 
+    /// Move to `index`, clamped to the chain. `false` when that is where it already was.
+    pub fn jump_to(&mut self, index: usize) -> bool {
+        let index = index.min(self.levels.saturating_sub(1));
+        if index == self.index {
+            return false;
+        }
+        self.index = index;
+        true
+    }
+
     /// The selected level out of `path`, clamped to what `path` actually holds.
     ///
     /// Clamping rather than trusting the index: a chain built for one target can outlive it by a
@@ -246,6 +256,47 @@ fn edge_gap(a: Rect, b: Rect) -> i32 {
     let right = ((a.left + a.width()) - (b.left + b.width())).abs();
     let bottom = ((a.top + a.height()) - (b.top + b.height())).abs();
     left.min(top).min(right).min(bottom)
+}
+
+/// Largest displacement between the corresponding edges of two rectangles.
+///
+/// The *maximum*, where [`edge_gap`] takes the minimum: they answer different questions. Collapse
+/// asks "would these two lines be one line?" (any edge close ⇒ yes), while a level walk asks "would
+/// moving here visibly change the box?" (any edge far ⇒ yes). Using one for the other is how the
+/// wheel ends up with notches that appear to do nothing.
+fn edge_shift(a: Rect, b: Rect) -> i32 {
+    let left = (a.left - b.left).abs();
+    let top = (a.top - b.top).abs();
+    let right = ((a.left + a.width()) - (b.left + b.width())).abs();
+    let bottom = ((a.top + a.height()) - (b.top + b.height())).abs();
+    left.max(top).max(right).max(bottom)
+}
+
+/// The next level a walk stops on, skipping levels that would look identical to this one
+/// (v3 B1, docs/21 §5.24).
+///
+/// With collapse and the cap of seven, some levels have no ring of their own: walking onto one
+/// changes nothing on screen, so a notch of the wheel appears to be dead. `direction` is `-1`
+/// toward the window frame or `+1` toward the published box; the ends always stop.
+pub fn next_visible_stop(path: &[Rect], current: usize, direction: i32, threshold_px: i32) -> usize {
+    if path.is_empty() || direction == 0 {
+        return current.min(path.len().saturating_sub(1));
+    }
+    let current = current.min(path.len() - 1);
+    let step: i32 = if direction < 0 { -1 } else { 1 };
+    let mut candidate = current;
+    loop {
+        let next = candidate as i32 + step;
+        // The ends stop even if the last level is visually nested inside its neighbour: reaching the
+        // frame (or the answer) is a state the user asked for, not a level to be skipped.
+        if next <= 0 || next as usize >= path.len() - 1 {
+            return next.clamp(0, path.len() as i32 - 1) as usize;
+        }
+        candidate = next as usize;
+        if edge_shift(path[candidate], path[current]) >= threshold_px {
+            return candidate;
+        }
+    }
 }
 
 /// Decide which rings the level walk paints (docs/21 §5.22).
@@ -892,6 +943,50 @@ mod tests {
         assert!(!chain.shallower());
         assert!(!chain.deeper());
         assert_eq!(chain.current(&path), Some(rect(0, 0, 800, 600)));
+    }
+
+    /// v3 B1 (docs/21 §5.24): a wheel notch has to land somewhere that *looks* different.
+    ///
+    /// Collapse and the cap of seven mean some levels have no ring of their own, and walking onto
+    /// one of those repaints pixels that are already on screen — a notch that appears to do nothing.
+    /// The walk therefore compares rectangles by their **largest** edge displacement, the opposite
+    /// extreme of the collapse rule's smallest, and the two ends always stop.
+    #[test]
+    fn a_level_walk_skips_the_levels_that_look_identical() {
+        let path = vec![
+            rect(0, 0, 1000, 600),  // 0: the window frame
+            rect(1, 1, 999, 599),   // 1: a 1 px lip — no ring of its own
+            rect(2, 2, 998, 598),   // 2: 1 px more
+            rect(3, 3, 997, 597),   // 3: 1 px more
+            rect(80, 60, 900, 520), // 4: a box the user can actually see
+            rect(81, 61, 899, 519), // 5: 1 px inside it — the published answer
+        ];
+        // Read the threshold from the options: it is a tuning knob, and this test is about the rule.
+        let step = RingOptions::default().collapse_gap_px;
+
+        // Three notches of 1 px each are one stop: from the frame, the walk lands on the box.
+        assert_eq!(next_visible_stop(&path, 0, 1, step), 4);
+        // …and the answer is always a stop, even one pixel inside the ring before it.
+        assert_eq!(next_visible_stop(&path, 4, 1, step), 5);
+        // Upward from the answer, level 4 looks the same, so the stop is 3.
+        assert_eq!(next_visible_stop(&path, 5, -1, step), 3);
+        // A further notch at an end absorbs rather than wraps.
+        assert_eq!(next_visible_stop(&path, 0, -1, step), 0);
+        assert_eq!(next_visible_stop(&path, 5, 1, step), 5);
+        // Degenerate inputs are the no-op they look like, not a panic.
+        assert_eq!(next_visible_stop(&[], 0, 1, step), 0);
+        assert_eq!(next_visible_stop(&[rect(0, 0, 10, 10)], 0, 1, step), 0);
+        assert_eq!(next_visible_stop(&path, 3, 0, step), 3);
+
+        // The chain the walk moves, and what "nothing moved" means to the caller: an event that
+        // lands back on the current level is not consumed by the wheel (docs/21 §5.17).
+        let mut chain = LevelChain::new(path.len());
+        assert_eq!(chain.index(), 5, "a fresh chain starts on the answer");
+        assert!(chain.jump_to(0));
+        assert_eq!(chain.index(), 0);
+        assert!(!chain.jump_to(0));
+        assert!(chain.jump_to(99), "clamped, not rejected");
+        assert_eq!(chain.index(), 5);
     }
 
     #[test]
