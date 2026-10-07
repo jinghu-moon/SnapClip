@@ -714,12 +714,15 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 
 ## 8. P4：GPUI 壳（**独立立项**）
 
-> 纪律：这一阶段与 P1–P3 分开提交、分开验收。换壳会让"设置页/历史/标注工具条"出现真实功能回退，**不能和 crate 拆分混在一批**，否则回归无法归因。
+> 纪律：这一阶段与 P1–P3 分开提交、分开验收。换壳会让"历史面板、来源图标、复制回写"这类真实功能出现回退（其中历史面板当前甚至不可达，见 T4.1.1），**不能和 crate 拆分混在一批**，否则回归无法归因。
+>
+> 本阶段的范围（按 T4.1.1 的矩阵与决策 D1）：历史 + 剪贴板动作 + 托盘 + 设置（新增）+ 事件桥。**标注 UI 本轮不做**（D1）；OCR 只保留行内状态，不建独立页面。
 
 ### T4.1 开工前研读（不许跳）
 
 - 动作：读 `gpui-kit` 的 SKILL 与 **Coding Guides**（分层、`RenderOnce` vs `Entity<T>`、状态归属、`ElementId`、事件/焦点、异步、公共 API、测试分层），设计可见界面时读 **Design Guides**；查组件用 `https://gpui-kit.com/llms.txt` + `component/{name}.md`。
 - 必须记住的四条硬约束：**GPUI 只通过 `gpui-kit` 使用**（不要把 `gpui` 直接加进 `Cargo.toml`）；`gpui_kit::init(cx)` 在建组件视图前调用一次；每个窗口第一层是 `Root`；**绝不凭记忆写 API**（先查签名）。
+- 验收：本阶段要用的组件（`List`/`VirtualList`、`Input`、`Button`、`WindowExt` 覆盖层等）逐个查过文档，并在提交消息里列出确认过的文档路径。
 
 #### T4.1.1 前端功能迁移矩阵（**做完这张表才有资格动 P6**）
 
@@ -743,13 +746,23 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 | 剪贴板动作与来源图标 | 随 history 能力（`clipboard` 子模块） | 保留 | UI test + 真机 |
 | OCR 行内状态 | 随 history 行渲染（typed event） | 保留（不新增 OCR 页面） | typed event 单测 + 真机 |
 | 截图命令/事件 | capture crate + overlay（**不进 GPUI 高频路径**） | 保留 | 真机 F5 |
-| 标注工具条 | **未定义** | **未定义** | **先定归属，否则不能进 P6** |
+| 标注工具条 | **本轮不做 GPUI 界面**（见下方决策 D1） | **本轮不保留 UI 行为**（Rust 侧模型保留） | P6 前只核对"模型未丢"，UI 留待 V2 |
 | 托盘 | `apps/snapclip/src/tray.rs` | **新增能力**（不是迁移） | 真机 |
 | 设置 | `apps/snapclip/src/settings/` | **新增能力**（不是迁移） | 热更新测试 |
 
-**硬规则**：这张矩阵没有填完（每行都有目标模块与验证方式）之前，**不允许删除 Vue/Tauri**（P6 前置）。特别是"标注工具条"——它是唯一在当前代码里存在、却没有 GPUI 目标的真实功能，必须由用户决定归属（画进 overlay / 放进 GPUI 壳 / 暂时不做）后才能继续。
+**硬规则**：这张矩阵没有填完（每行都有目标模块与验证方式）之前，**不允许删除 Vue/Tauri**（P6 前置）。
 
-- 验收：矩阵填完 + 把本阶段要用的组件（`List`/`VirtualList`、`Input`、`Button`、`WindowExt` 覆盖层等）逐个查过文档，并在提交消息里列出确认过的文档路径。
+**决策 D1（2026-10-07，用户决定）：标注功能本轮暂不做。**
+
+这是本轮唯一的功能性让步，必须写清后果，不许含糊：
+
+- **不做**：P4 不为标注建任何 GPUI 界面（不写 `apps/snapclip/src/annotation/`），也不把 `AnnotationToolbar.vue` 搬到 GPUI。
+- **保留**：`snapclip-capture` 侧的标注文档模型（`annotation.rs`，1 123 行纯状态，无 Win32/GPU）与 overlay 内已有的标注接线**原样保留**，随 T1.4 迁移，**不要**为了"统一风格"删掉或加 `#[allow(dead_code)]`。
+- **已知损失**：P4 之后标注**没有 UI 生产者**——没有界面能发出 `AnnotationCommand`。这是被接受的取舍，不是 bug，也不要在 P6 之前为了"保住它"临时加兼容层或保留 Vue 壳。
+- **P6 的处置**：删除 Vue/Tauri 时，`src/features/annotation/*`、`src/infrastructure/tauri/commands/annotation.ts` 与 `commands/capture.rs::capture_annotation` 一并删除；`snapclip-capture` 侧不动。
+- **重新接线的时机**：留到 V2 独立立项（界面归属届时再定：画进 overlay / 放进 GPUI 壳）。V1 的隔离靠 `snapclip-capture` 保留模型，不靠留着旧壳。
+
+- 验收：矩阵的每一行都有目标模块与验证方式；决策 D1 已记录在本文（不另开文件）；矩阵内容随提交消息一起提交。
 
 ### T4.2 `apps/snapclip` 骨架
 
@@ -851,11 +864,12 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 
 - 前置：
   1. T4.9（GPUI 壳完成托盘、隐藏/显示、焦点、退出、DPI、多显示器回归）。
-  2. **T4.1.1 的前端功能迁移矩阵每行都已填完**（有目标模块、有验证方式）；其中"标注工具条"的归属必须已经由用户定下来——它是唯一"当前存在但没有 GPUI 目标"的功能。
+  2. **T4.1.1 的前端功能迁移矩阵每行都已填完**（有目标模块、有验证方式）。标注工具条的归属已由 T4.1.1 的**决策 D1** 定为"本轮暂不做"（模型保留在 `snapclip-capture`，UI 不迁移），因此它**不再阻塞 P6**。
 - 能力搬迁前置：`icon.rs`（**来源程序图标提取，不是托盘**）与 `commands/clipboard.rs` 的复制回写，必须先作为能力落到 GPUI 壳（T4.3 的来源图标列依赖它），再删旧实现。
+- 删除前的最后核对（对应决策 D1）：`snapclip-capture` 里的标注模型**已随 crate 保留**，确认这一点后，标注相关的 Vue/命令代码与其它前端代码一起删除。
 - 清单：
   1. 删 `src-tauri/src/commands/*`、Tauri `events` 适配、`app/`（组合根）与 `icon.rs` 的旧实现（都在上面的能力搬迁完成之后）。
-  2. 删前端（Vue adapter、`src/shared/contracts.ts` 与 package.json 的 Tauri 相关脚本）与 `src-tauri/` 目录本身。
+  2. 删前端（Vue adapter、`src/shared/contracts.ts` 与 package.json 的 Tauri 相关脚本）与 `src-tauri/` 目录本身；**`src/features/annotation/*` 与 `AnnotationToolbar.vue` 一并删除**（决策 D1：本轮不做标注 UI，`snapclip-capture` 侧模型保留）。
   3. 从 workspace 移除旧成员，跑 `cargo tree -i tauri`、`cargo tree -i wry` 确认为空；全仓库 `rg -n "tauri"` 只应命中文档。
   4. 全量依赖检查 + `cargo check --workspace --all-targets` + §0.2 门禁 + 真机全链路（截图 → 历史 → OCR → 设置 → 托盘退出）。
 - 验收：以上全部通过；打 tag `refactor-p6`（= 重构完成点）。
@@ -881,6 +895,7 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 | 11 | **迁移中途加兼容层**（"先两边各留一份，回头再删"） | §5 顶部的迁移接线策略：唯一实现在新 crate，旧模块只做 `pub use` 转发，T1.10 结束时转发必须为零；这是本项目最容易被违反的一条 |
 | 12 | **把"文档里写过"当成"代码里有"** | 例：`deep_select_text_runs` 只存在于注释、托盘从未实现、设置通道从未存在。动手前先用 `rg` 核实，写进 §13 记录 |
 | 13 | 无障碍树断言做不到却被当硬门禁 | T4.7：先 spike；做不到就降级并写回 docs/22 §10.2，不要静默删门禁 |
+| 14 | **标注功能被静默丢弃**（决策 D1 的已接受让步） | T4.1.1 的 D1 写清了"不迁移 UI、保留 Rust 模型"；P6 删前端前必须核对 `snapclip-capture` 侧 `annotation.rs` 仍在，并**明确写进 P6 的提交消息** |
 
 ---
 

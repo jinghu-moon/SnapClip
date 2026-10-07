@@ -297,7 +297,7 @@ GPUI 应用壳负责窗口组合、用户操作、设置和 Win32 托盘；能�
 | 当前路径 | 新位置 |
 |---|---|
 | `domain/*` | `snapclip-model/src/`，按 ids/artifact/events/error/recognition 拆分 |
-| `capture/annotation.rs` | `snapclip-capture/src/annotation.rs` |
+| `capture/annotation.rs` | `snapclip-capture/src/annotation.rs`（标注文档模型是 capture 领域的一部分，**原样保留**）。**标注 UI 本轮不迁移**（docs/23 §8 决策 D1，2026-10-07）：`AnnotationToolbar.vue` 与 `capture_annotation` 命令随旧壳在 P6 删除，重新接线留待 V2 独立立项 |
 | `capture/session.rs` | `snapclip-capture/src/session.rs` |
 | `capture/geometry.rs` | `snapclip-capture/src/geometry.rs`，纯值对象部分；平台转换留 Windows |
 | `capture/window_detection/*` | `snapclip-capture/src/window_detection/*` |
