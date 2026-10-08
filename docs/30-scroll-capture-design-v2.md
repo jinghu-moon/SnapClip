@@ -2720,6 +2720,30 @@ fn context(&self) -> &ID3D11DeviceContext {
 
 **新增的消息 id**：`WM_APP + 45`（§5 已确证 `+1/+2/+17/+18/+19/+43/+44` 被占用；`export_worker.rs:670` 有断言 18 ≠ 19 的先例，V2 同样加一条"45 未与既有 id 冲突"的断言）。
 
+### 21.5 COM/WinRT 公寓：本 crate **不声明**公寓，靠 combase 的隐式 MTA（R-21 的实测结论，2026-10-08）
+
+§21.3 管的是"谁拥有 `ID3D11DeviceContext`"；这一节管的是同一批线程的另一半所有权问题：**谁声明 COM/WinRT 公寓**。它本可以写成一句"每个线程先 `RoInitialize(MTA)`"的常规做法（`docs/31` §14.3 的 `R-21` 最初就是这么被推导的），**实测把它否掉了**：在这台机器上，显式声明公寓会让 WGC 的激活路径崩。
+
+**测量（本机，2026-10-08；探针 = `crates/snapclip-capture/src/windows/win/wgc.rs` 测试里的 `CoGetApartmentType`）**：
+
+| 线程状态 | `CoGetApartmentType` | 含义 |
+|---|---|---|
+| 全新线程（Rust 测试线程） | `Err(0x800401F0 CO_E_NOTINITIALIZED)` | **没有任何公寓** |
+| 由**已在隐式 MTA 的线程**创建的线程 | `APTTYPE=1 qualifier=1`（**继承**） | 线程**继承**父线程的隐式 MTA ⇒ "新线程 = 没有公寓"只在父线程也没有公寓时成立（2026-10-08 追加实测：`host after activation: kind=1 qualifier=1` → `child of MTA parent: before=kind=1 qualifier=1`） |
+| **隐式路径**：不声明，直接激活 WinRT（`GraphicsCaptureSession::IsSupported()`） | `APTTYPE=1 qualifier=1` | MTA + **`APTTYPEQUALIFIER_IMPLICIT_MTA`** |
+| **显式路径**：先 `RoInitialize(RO_INIT_MULTITHREADED)` 或 `CoInitializeEx(None, COINIT_MULTITHREADED)` | `APTTYPE=1 qualifier=0` | MTA + **`APTTYPEQUALIFIER_NONE`** |
+| 隐式之后再 `CoInitializeEx(MTA)` | `S_FALSE (0x00000001)`，限定符**不变** | 同模式重复初始化 = 无操作（`uia_provider.rs:194` 今天就是这样） |
+
+**结论：类型相同，限定符不同。**"显式声明公寓"不是"把同一件事提前做"，而是把 combase 给该线程的公寓身份从 `IMPLICIT_MTA` 换成 `MTA`；**而这一步会让 Windows Graphics Capture 的激活崩**。证据是把 `ensure_multithreaded()`（`RoInitialize(RO_INIT_MULTITHREADED)`）落到 5 个调用点后的**交错 A/B**：`cargo test --workspace --lib -- --test-threads=1` 崩在 `windows::providers::tests::providers_probe_and_capture_a_real_monitor_when_available`（`crates/snapclip-capture/src/windows/providers.rs:684`，真实捕获**光标所在显示器**）**3/3**（`0xC0000005`），同一时间窗内**同一棵树把那 5 个文件 stash 掉后 3/3 全绿**（`docs/Temp/p107-r21-fullsuite-ab.log`）；把 `RoInitialize` 换成 `CoInitializeEx(MTA)` 仍旧 3/3 崩（`docs/Temp/p107-r21-cominit-variant.log`）；只跑那一条用例时两个臂都绿（`docs/Temp/p107-r21-interleave.log`）⇒ 崩溃需要"整轮套件 + 显式公寓"。gdb 回溯（`docs/Temp/p107-r21-serial-gdb.log`）的 `#0–#13` **全部 `?? ()`**、地址**不在 `info sharedlibrary` 里**；另一个更早的崩溃点（`docs/Temp/p107-r21-gdb-1.log:984-1011`）栈里是 `combase!CoUnmarshalInterface` → `combase!ObjectStublessClient32` → `GraphicsCapture!DllGetActivationFactory`。
+
+**设计规则（三句话）**：
+
+1. **本 crate 的任何线程都不调用 `RoInitialize` / `CoInitializeEx`**。唯一例外是 `crates/snapclip-capture/src/windows/msaa_provider.rs:239` 的 `CoInitializeEx(COINIT_APARTMENTTHREADED)`：MSAA 命中测试要 STA 且不碰 WinRT 激活，实测它也不是触发者。
+2. **`wgc.rs::is_supported` / `capture_monitor`、`uia_provider::automation`、以及将来的 `windows/scroll_source.rs` 一律依赖隐式公寓**。`uia_provider.rs:194` 那句现存调用可以留着（实测 `S_FALSE`、无操作），但**不得**被当成"本 crate 声明过公寓"的先例。
+3. **用一条测试钉住它**：`crates/snapclip-capture/src/windows/win/wgc.rs` 的 `winrt_activation_keeps_the_implicit_apartment`，形状 = **父进程 + 子进程两段**。父进程（未设置 `SNAPCLIP_APARTMENT_CHILD` 时）用 `std::process::Command::new(std::env::current_exe())` 以 `--exact windows::win::wgc::tests::winrt_activation_keeps_the_implicit_apartment --test-threads=1` **重跑自己**，并把退出码当断言（`the isolated apartment check failed: exit code: 101`）；子进程里才做那条链：断言线程无公寓 → 激活 → 断言 `APTTYPE_MTA` 且 `qualifier == APTTYPEQUALIFIER_IMPLICIT_MTA`。**为什么必须换进程**（2026-10-08 执行 `bc0344b` 时踩到并修正的设计）：线程会**继承**隐式 MTA，而 `CoInitializeEx(MTA)` 在已继承的线程上返回 `S_FALSE`、不改限定符 ⇒ 在继承来的线程上**看不见**"有人声明过公寓"；同时 `cargo test` 的装置工作线程会被**同一二进制里更早的用例**拉进 MTA（实测：`support_probe_never_panics` 先跑，接着断言"新线程无公寓"的旧写法在整套里假红、单跑却绿）。自证已两层实测：单跑与"有兄弟用例"两种情况下，临时在 `is_supported()` 顶部加一句 `CoInitializeEx(MTA)` 都会红（`left: APTTYPEQUALIFIER(0) / right: APTTYPEQUALIFIER(1)`）。
+
+**这条规则的代价与边界**：它违反"显式优于隐式"的直觉（COM 教科书会建议显式声明），所以必须留下为什么。**仍然开放**：限定符**为什么**会改变激活路径（假设 = 真实公寓让 combase 走代理/列集路径，而隐式 MTA 下 agile 对象被直接使用——崩溃栈正是代理路径）；以及这是 Windows/驱动缺陷还是与 **Windhawk 注入**（`docs/Temp/p107-r21-hang64-gdb.log` 显示 `windhawk.dll` 被注入本进程）+ NVIDIA 驱动的交互。**被否决的实验保存在侧分支 `spike/apartment-mta`（`58bd99b`），不要在 `main` 上重做**；`R-21` 因此仍留在 `docs/31` §14.3 的开放表里（它还会偶发地挡住 `pre-push`，见该行的处置）。
+
 ## 22. 内存策略
 
 ### 22.1 起点：今天的内存事实（全部来自 §5 的代码核对）

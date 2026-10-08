@@ -277,6 +277,82 @@ mod tests {
         // The answer is machine dependent; the probe itself must always return.
         let _ = is_supported();
     }
+
+    /// WinRT activation must leave the thread in *combase's implicit* apartment.
+    ///
+    /// `R-21` (`docs/31` §14.3): measured on this machine (2026-10-08), the WinRT
+    /// path used by Windows Graphics Capture faults (`0xC0000005`) when the calling
+    /// thread holds an apartment the application declared itself
+    /// (`APTTYPE=1, qualifier=0`), and works when the apartment is the one combase
+    /// created on its own (`APTTYPE=1, qualifier=1` = `IMPLICIT_MTA`). Declaring an
+    /// apartment "because COM says so" therefore reintroduces a deterministic crash
+    /// (interleaved A/B: 3/3 crash with the declarations, 3/3 green without).
+    ///
+    /// The check runs in a **fresh process** on purpose. A thread created by a
+    /// thread that is already in the implicit MTA *starts* in that MTA (measured on
+    /// this machine: `before = kind=1 qualifier=1`), and `CoInitializeEx(MTA)` on
+    /// such a thread returns `S_FALSE` without touching the qualifier — so a
+    /// declaration added to the activation path is invisible from a thread that
+    /// inherited the apartment. Only a COM-free start makes the declaration
+    /// observable, and only a fresh process guarantees that the harness thread has
+    /// not already been pulled into the MTA by an earlier test in the same binary.
+    #[test]
+    fn winrt_activation_keeps_the_implicit_apartment() {
+        use ::windows::Win32::System::Com::{
+            APTTYPE, APTTYPEQUALIFIER, APTTYPEQUALIFIER_IMPLICIT_MTA, APTTYPE_MTA,
+            CoGetApartmentType,
+        };
+
+        fn apartment() -> Result<(APTTYPE, APTTYPEQUALIFIER), String> {
+            let mut kind = APTTYPE(0);
+            let mut qualifier = APTTYPEQUALIFIER(0);
+            unsafe { CoGetApartmentType(&mut kind, &mut qualifier) }
+                .map(|()| (kind, qualifier))
+                .map_err(|error| error.to_string())
+        }
+
+        const CHILD: &str = "SNAPCLIP_APARTMENT_CHILD";
+
+        if std::env::var_os(CHILD).is_none() {
+            // Parent: hand the check to a process whose threads are all COM-free.
+            let exe = std::env::current_exe().expect("the test binary must be locatable");
+            let status = std::process::Command::new(exe)
+                .args([
+                    "--exact",
+                    "windows::win::wgc::tests::winrt_activation_keeps_the_implicit_apartment",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .expect("the test binary must be runnable");
+            assert!(
+                status.success(),
+                "the isolated apartment check failed: {status}"
+            );
+            return;
+        }
+
+        let checked = std::thread::spawn(|| {
+            assert!(
+                apartment().is_err(),
+                "the isolated process must start without an apartment; if this fails the check \
+                 can no longer see a declared one (docs/31 §14.3)"
+            );
+
+            let _ = is_supported();
+
+            let (kind, qualifier) =
+                apartment().expect("WinRT activation left the thread without an apartment");
+            assert_eq!(kind, APTTYPE_MTA, "WinRT activation must land in the MTA");
+            assert_eq!(
+                qualifier, APTTYPEQUALIFIER_IMPLICIT_MTA,
+                "the apartment is no longer combase's implicit one: something in this process \
+                 declared it, which reintroduces the R-21 crash (docs/31 §14.3)"
+            );
+        });
+
+        checked.join().expect("the probe thread must not panic");
+    }
 }
 
 
