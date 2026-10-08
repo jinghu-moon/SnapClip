@@ -712,11 +712,11 @@ impl Scratch {
         self.builds += 1;
     }
 
-    /// How many images had to be built. `#[cfg(test)]` because its only consumer is the test that
-    /// turns "the buffers are reused across steps" from a claim about the code's shape into an
-    /// assertion.
+    /// How many images had to be built. `#[cfg(test)]` because its only consumers are the tests that
+    /// turn "the buffers are reused across steps" and "the `Skip` path costs nothing" from claims
+    /// about the code's shape into assertions.
     #[cfg(test)]
-    fn builds(&self) -> u32 {
+    pub(crate) fn builds(&self) -> u32 {
         self.builds
     }
 }

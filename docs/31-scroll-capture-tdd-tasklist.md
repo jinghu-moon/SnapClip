@@ -94,9 +94,9 @@
 | 新增文件 | 一律先建 `#[cfg(test)]` 测试骨架再建实现（§2.1） |
 | 文档引用 | 一律写 `docs/30 §x.y` 或 `docs/30:<行号>`，**不允许只写"见设计文档"** |
 
-### 0.6 本文对 V2 的补充（**二十六处 deviation，全部已按用户授权回填 `docs/30`**）
+### 0.6 本文对 V2 的补充（**二十七处 deviation，全部已按用户授权回填 `docs/30`**）
 
-> **回填状态**：二十六处（DEV-1…DEV-26）已写入 `docs/30-scroll-capture-design-v2.md`（**未覆盖原文，只做定点增补**）——
+> **回填状态**：二十七处（DEV-1…DEV-27）已写入 `docs/30-scroll-capture-design-v2.md`（**未覆盖原文，只做定点增补**）——
 > DEV-1 → `§28.2` 新增 test-only 文件块（`scroll/testkit.rs`）与"10 生产 + 1 test-only"口径、`§33.3` 文件清单由 9 补为 11（**顺带修正了原文漏列 `orb.rs` 的内部矛盾**）；
 > DEV-2 → `§35 P4` 的 `P4.1` 拆为 `P4.1a`（trait，capture）/ `P4.1b`（实现，shell）并附理由；
 > DEV-3 → `§33.1` 的 `D-10` 拆为 `D-10a`（硬失败）/ `D-10b`（静默降级）、`§24.3` 修正 `wgc.rs:107` 的表述并说明"两种相反失败模式的共同落点"、`§24.8` 的探测用例扩为两条；
@@ -124,6 +124,7 @@
 > **DEV-25** → `§18.2` 之后新增 `#### 18.2.1 落地的形状（P1.16）`（形状块 + 六处裁决 + 两张实测表 + 两条推论 + "权重尚未接入决定"）、`§16.11` 参数总表把"模型衰减率 / 乘法权重 clamp / 歧义不学习门"三行改写为落地口径并增补区域模型五行、`§30.5` 的 L3 表增两行"已可度量"的 L1 行（2026-10-08 执行时新增，见下）。
 > **DEV-26** → `§17.1` 之后新增 `#### 17.1.1 落地的形状（P1.17）`（形状块 + 三处落地裁决：`CoverageMap` 改存"一行一位"、区间端点派生（否则不变量 3 与 4 无法分开）、不变量用真 `assert!` 而非 `debug_assert!`、`RecoveredImage` 记住创建线程（不变量 8 的画布形式））、`§20.3` 的不变量表后补"落地（P1.17）"段（2026-10-08 执行时新增，见下）。
 > 下表保留**原始登记内容**（作为"当时看到了什么"的记录）。
+> **DEV-27** → `§17.2` 的"与参考实现的关系"之后新增"落地（P1.18）"段（band 不做上限截断的两条理由 + 与 §15.6 的 `shift` 口径分歧）、`§17.3` 之后新增 `#### 17.3.1 落地的形状（P1.18）`（写入区间与帧行的对应、三个写入点断言、`rows()` 读接口、代价、退出条件 ③ 的两半）、`§30.4` 的"旧像素优先"与"`band_height` 推导"两行标注"已可执行"、`§36.1` OQ 表新增 `OQ-17`（2026-10-08 执行时新增，见下）。
 
 | # | 补充 | 为什么必须补 | 回填位置 |
 |---|---|---|---|
@@ -155,6 +156,7 @@
 
 | **DEV-26**（执行时新增） | `P1.17` 的 GREEN 写 `CoverageMap{span_start, span_end, stale_steps}`，而 §20.3 的不变量 3（区间到末尾）与不变量 4（区间内无洞）**在这个表示下无法分开**：先写 `0..500` 再写 `501..1000`，两个端点都正确、中间少一行；此外 §17.1 写 `debug_assert` 而 §20.3 给不变量 4 的动作是"`InternalError` 且**禁止导出**"，"发布构建里不检查"正是它要消灭的失败模式 | 2026-10-08 执行时做了三处落地裁决：① **`CoverageMap` 改存"一行一位"**（`covered: Vec<u64>` + `mark_range` 按字整块设置并 `count_ones` 计数），区间端点与 `rows_covered` 全部**派生** ⇒ 不变量 4 变成 `rows_covered == span_end − span_start`（O(1)，100,000 行 = 12.5 KiB，且这个结构里没有任何像素）；② **八条不变量用真 `assert!` 而非 `debug_assert!`**（代价 = 每步一次 O(1) 检查加一次条带排序）；③ **`RecoveredImage` 记住创建它的线程**（`owner: ThreadId`）——不变量 8 在 §20.3 写作 `ID3D11DeviceContext` 的调用线程，而画布是同一类对象（滚动驱动线程独占、预览只拿行的副本），因此以画布自己的形式落地且**不需要平台 FFI**（§28.4 门禁不用开口子）。`assert_invariants(&self, viewport_cross, tally)` 的预算从 `self.bands.budget` 读（避免两个真相源）；`BandStore::insert` 拒绝"非整行"与"与已有条带重叠"，**不强制预算**（换出属 `P1.20`，此前超预算只有断言拒绝）。八条负向用例的判定除"该条必须 panic"外还要求**八条消息互不相同**（否则"八条用例"其实不足八条）。**未完成项**：写路径（`commit`/`discard`）属 `P1.18`，LRU 与换出属 `P1.20`；退出条件 ③（`ScrollSession` 字段与八条一一对应）要等 `P3.04`。回填位置 = `docs/30 §17.1.1`（新增）+ `§20.3` 不变量表后"落地（P1.17）"段；本文 §6 `P1.17` 的执行块（2026-10-08 执行时新增，见下） |
 
+| **DEV-27**（执行时新增） | `P1.18` 的 GREEN 只给 `band(extent, shift) = max(extent/2, extent/4 + shift)` 与"只写 `[旧 span_end, 新 span_end)`"，而 V2 没说清三件事：**band 有没有上限**（`shift = extent` 时 `1.25·extent > extent`，看着越界）、**"写入 band"与"实际写入的行数"是什么关系**（§17.2 说匹配带与写入带**同高**，而 §17.3 说只写新增区间，高度是 `d`）、**§15.6 的 `H_match` 与 §17.2 的 `band` 在大步长下不一致**（前者不含 `shift`，后者含） | 2026-10-08 执行时做了三处裁决：① **band 不截断**——截到 `extent` 会让 `band − shift = 0`，正好破坏"重叠区至少 `extent/4`"这条性质；正确读法是"这是**想要的**高度，不是**能得到**的高度"（能得到多少由几何决定，`match_band` 取 `min(wanted, overlap)`，`\|d\| == extent` 是 §16.5 的 `Lost`），于是三条不变量写成 `band ≥ extent/2`、`band − shift ≥ extent/4`、`band ≥ shift.max(0)`（第三条 = "band 装得下这一步新增的行"，也是写入点的断言）；② **写入带 = 帧的最后 `H_match` 行，其中新增的是它的最后 `d` 行** ⇒ 实现上就是尾部切片 `frame_first = extent − step`，不需要坐标变换；③ **`band_height` 落为纯函数、不接入估计器**——改 `match_rows` 会改动 `P1.05`–`P1.16` **全部**已实测数字（那些数字都在固定 band 上测得），接线归会话组装 `P3.09` 或一个带 `E-ACC-1` 对照的独立任务，已挂 **`OQ-17`**。顺带把 `Scratch::builds` 由模块私有放宽为 `pub(crate)`（`#[cfg(test)]`），让画布侧能证明"重复检测不花估计器的钱"（退出条件 ③ 的第二半）。**未完成项**：`Prepend`/`Contained` 属 `P1.19`；LRU 与换出属 `P1.20`；"重复检测排在估计器之前"的接线属 `P3.09`。回填位置 = `docs/30 §17.2` 落地段 + `§17.3.1`（新增）+ `§30.4` 两行标注 + `§36.1` 的 `OQ-17`；本文 §6 `P1.18` 的执行块（2026-10-08 执行时新增，见下） |
 ---
 
 ## 1. 总览
@@ -1315,6 +1317,17 @@ git config core.hooksPath .githooks
 - **退出条件**：① 逐字节用例通过；② §30.4 的"旧像素优先"与"`band_height` 推导"两行通过；③ `Skip` 路径不进估计器（可用计数器证明）
 - **提交标题**：`[P1-18] the older pixels win, on purpose`
 
+
+- **状态**：`[x] 完成`（2026-10-08）
+
+- **执行块（2026-10-08）**
+  - **RED 证据**：先在 `crates/snapclip-capture/src/scroll/canvas.rs` 的测试模块落两条用例并把 import 改为含 `StepWrite`/`band_height`，`cargo test -p snapclip-capture --lib only_the_new_rows_are_written -- --nocapture` 失败：`error[E0432]: unresolved imports super::StepWrite, super::band_height`（`canvas.rs:349:63`）、`error[E0599]: no method named start/append_confirmed/rows found for struct RecoveredImage`（5 处）＋ `could not compile snapclip-capture (lib test) due to 7 previous errors`（exit 1）。
+  - **GREEN 落盘**：`crates/snapclip-capture/src/scroll/canvas.rs` = `band_height(extent, shift)`（§17.2 的两项取最大，**不截断**）、`StepWrite{Skipped, Appended{first_row, rows}}`、`RecoveredImage::start(frame)`（第一帧：整屏即新内容）、`RecoveredImage::append_confirmed(frame, step) -> StepWrite`（尾部切片 `frame_first = extent − step`；`step == 0` ⇒ `Skipped`；`step < 0` **断言拒绝**，那是 `P1.19` 的 `Prepend`）、`RecoveredImage::rows(first_row, rows) -> Vec<u8>`（跨条带重组；画布没有整块缓冲）。写入点三个断言：cross 轴一致（不变量 1）、`step ≤ extent`、`step ≤ band_height(extent, step)`。
+  - **三条用例（全部通过）**：① `only_the_new_rows_are_written`（先证 `Skipped` 不动画布，再证新行 = 第二帧的最后 120 行；**并且先断言"保留旧像素"与"行覆盖"在这里的字节不同**，否则用例证明不了任何事——`frame_rows(first, 120, 900) != frame_rows(second, 0, 780)`）；② `band_height_never_drops_below_a_quarter_of_the_extent`（`extent ∈ {16, 32, 100, 300, 900, 2160}` × `shift ∈ [−extent, extent]` 上验三条不变量 + 两档交界 `450/450/451/1125/450`）；③ `a_duplicate_frame_is_answered_without_touching_the_estimator`（`repeat()` 帧 ⇒ `zero_shift_status == Confirmed{d:0}` 且 `Scratch::builds() == 0`，反事实地再走一次估计器入口使计数 > 0）。
+  - **退出条件**：① 逐字节用例通过 ✓；② §30.4 的"旧像素优先"与"`band_height` 推导"两行 ✓（已在该表标注"已可执行"）；③ `Skip` 路径不进估计器 ✓ **可执行形式分两半**：画布侧 `Skipped` 且字节不变（本任务）＋ 重复检测不花估计器的钱（`Scratch::builds` 计数）；把重复检测排到估计器之前的接线属 `P3.09`。
+  - **偏差**：一处 = **DEV-27**（band 不截断及其三条不变量；写入带与新增行的关系；`band_height` 不接入估计器并挂 `OQ-17`）。
+  - **门禁（2026-10-08）**：`cargo check --workspace --all-targets` = 0 error / 1 warning（既有 `unused variable: content_label`）；`cargo test -p snapclip-capture --lib -- --test-threads=1` = **414 passed / 0 failed / 12 ignored**（P1.17 之后 411，+3）；`cargo test --workspace --lib -- --test-threads=1` = 全绿；`tools/check-dependency-direction.ps1` = clean。
+  - **未完成项**：`Prepend`/`Contained` 属 `P1.19`；LRU 与换出属 `P1.20`；`fnv` 字段仍为 0（`P1.20` 填并校验）；`band_height` 接入估计器属 `OQ-17`/`P3.09`。
 ### P1.19 双向扩展与 `Contained`
 
 **上游**：V2 §17.1、§17.4；参考实现 `state.rs:19-84` ｜ **第一性原理**：**F-02**（`next_pos = current_pos + signed_delta`：负位移是**合法**事实，不是错误）+ **N3**（不引入 `Synthetic` 参照系 → 参照系**永远是已确认的画布内容**）｜ **前置**：P1.18 ｜ **可并行**：无 ｜ **批次**：`[P1-C]` ｜ **层级/分类**：L1 / B + D ｜ **复杂度**：L ｜ **阻塞**：无
