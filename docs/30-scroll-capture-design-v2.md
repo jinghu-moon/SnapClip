@@ -3896,6 +3896,54 @@ struct CaptureCapabilities {
 
 **为什么"记下来"而不是"静默降级"**：§6 已确证 Snow Shot 把这两个错误**直接丢弃**（`let _ = ...`，`wgc.rs:636-637`），而 PixPin 有明确的降级日志（"capture border remains enabled"/"cursor capture remains enabled"）。**V2 站在 PixPin 一侧**：降级可以，但必须留下痕迹。
 
+#### 24.3.1 落地的形状（P2.04，2026-10-09）
+
+```rust
+/// 三态，而不是 bool：`None` = 承载该选项的接口在本机不存在；`Some(false)` = 已应用
+/// （好情形）；`Some(true)` = 接口在但调用被拒，**东西还是开着的**（黄框、光标）。
+pub struct CaptureOptions {
+    pub cursor_control: Option<bool>,
+    pub border_control: Option<bool>,
+    pub dirty_regions: bool,      // 记录但从不启用（§11.4：我们需要整帧）
+}
+
+/// 平台接缝：`None` = 接口不存在。存在的理由是**有意思的行为不是"调 setter"**，
+/// 而是"够不到 setter 时我们做什么"，那条路径只有把"够不到"变成可编排才可测。
+pub(crate) trait CaptureOptionTarget {
+    fn set_cursor_capture_enabled(&mut self, enabled: bool) -> Option<Result<(), String>>;
+    fn set_border_required(&mut self, required: bool) -> Option<Result<(), String>>;
+}
+
+/// 先探接口、再调用（§24.3）。**返回类型就是保证**：没有 `Result` ⇒ 没有 `?` 可写，
+/// 也就没有"缺一个选项让整次捕获失败"的写法（DEV-3 的机械形式）。
+pub(crate) fn probe_capture_options(
+    target: &mut dyn CaptureOptionTarget,
+) -> (CaptureOptions, Vec<String>);
+
+// 能力表在捕获层（`providers.rs`），一次组装，会话语义归 §26.3。
+pub struct CaptureCapabilities {
+    pub border_control: Option<bool>,
+    pub cursor_control: Option<bool>,
+    pub dirty_regions: bool,
+    pub backend: ProviderKind,
+    pub window_target: bool,
+}
+impl CaptureCapabilities {
+    pub fn from_options(options: wgc::CaptureOptions, backend: ProviderKind, window_target: bool) -> Self;
+    pub fn degradations(&self) -> Vec<&'static str>;   // G12 的机械形式
+    pub fn describe(&self) -> String;                  // 会话开始时打印一次
+}
+```
+
+**四处落地裁决**：
+
+1. **`Option<bool>` 的三态是"东西还开着吗"，不是"我们调过吗"。** `Some(true)` 读作"边框/光标仍然在画面里"——这正是 UI 需要的那句话，而"调用失败"不是。两个选项的失败方向相反（§24.3 的 DEV-3 表），三态一次覆盖两种，所以 `CaptureCapabilities` 是这两条修正的共同落点。
+2. **返回类型承载不变式。** `probe_capture_options` 返回 `(CaptureOptions, Vec<String>)` 而不是 `Result`，所以"选项不可用"在类型上无法传播成捕获失败。测试里有一条**编译期钉子**（`let (options, diagnostics): (CaptureOptions, Vec<String>) = probe_capture_options(...)`）：将来若有人把它改成 `Result`，那条测试会编译失败，而不是悄悄把 `?` 请回来。
+3. **探测接口，但调用的是会话。** windows-rs 把 `SetIsCursorCaptureEnabled`/`SetIsBorderRequired` 投影在 `GraphicsCaptureSession` 上，而接口 `IGraphicsCaptureSession2`/`3` 只用来判存在性：`session.cast::<IGraphicsCaptureSession2>()` 决定 `None` 还是 `Some(_)`，随后仍调 `session` 上的 setter。这是本机编译期实测出来的形状（把 setter 写到接口上会报 `E0599: no method named SetIsCursorCaptureEnabled found for struct IGraphicsCaptureSession2`）。
+4. **`dirty_regions` 由同一次探测推导**：两个选项与 dirty-region 报告都住在 `IGraphicsCaptureSession2`/`3` 上，所以"光标接口在不在"就是"这一代接口在不在"。它只被记录，从不启用。
+
+**范围说明（归 P3/P4 的组装）**：§26.3 的 `ScrollDiagnosticCode::CaptureOptionUnavailable` 是**会话层**类型，捕获层交出的是能力表 + 诊断字符串；两者的映射属于会话组装。**降级列表就是 G12 的机械形式**：`degradations()` 里没有的降级，对用户而言不存在，所以每个 `None`/`Some(true)` 都必须有一句话。
+
 ### 24.4 显示拓扑变化：从"取消会话"改成"可预期的中断"
 
 **今天**：任何 `WM_DPICHANGED`/`WM_DISPLAYCHANGE`/`WM_DEVICECHANGE` 都直接取消会话（`window_host.rs:199-209`）。对普通截图这是正确的（一次截图不需要跨越显示器变更）。
@@ -4581,7 +4629,8 @@ fn rows_match(actual, expected, sigma) -> bool
 | 窗口级 WGC 捕获 Chrome | 真实 Chrome 窗口 | 非黑帧；**覆盖层不在帧里** | L3 | Capture Latency |
 | 窗口级 WGC 捕获 Edge / Electron / WebView2 / 记事本 | 5 类目标 | 每类都成功 | L3 | Capture Latency |
 | 会话内 pool 复用 | 100 步 | pool 重建次数 **0**（除尺寸变化） | L3 | — |
-| 断选项不可用 | mock 让 `IsBorderRequired` 失败 | 记 `CaptureOptionUnavailable`，**不 panic、不静默** | L2 | — |
+| 断选项不可用 | mock 让 `IsBorderRequired` 失败 | 记 `CaptureOptionUnavailable`，**不 panic、不静默**（§24.3.1） | L2 | — |
+| 选项接口不存在 | mock 让 `IGraphicsCaptureSession2` 缺席 | `None` + 一句话；**捕获不失败**（DEV-3，§24.3.1） | L2 | — |
 | 目标被完全遮挡 | 用另一个窗口盖住目标 | 每步仍 `Confirmed` | L3 | Scroll Response |
 | 目标最小化 | 最小化 | `Ended(TargetLost)` + `Partial` | L3 | — |
 | 目标尺寸变化 | 拖边框 | 停止 + `TargetLost` + `Partial` | L3 | — |

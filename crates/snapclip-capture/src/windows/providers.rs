@@ -39,6 +39,81 @@ impl ProviderKind {
     }
 }
 
+/// What the capture stack can actually control, assembled once per session (`docs/30` §24.3).
+///
+/// It is a **value, not a log line**: the session prints it once at the start and the UI reads
+/// it to decide whether to warn the user ("this long image will carry the capture border").
+/// `None` means the platform does not offer the option at all; `Some(true)` means it was
+/// offered and the call was refused — in both cases the pixels show it, and the difference is
+/// only what the user can do about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CaptureCapabilities {
+    /// `Some(true)` = the capture border will be drawn into the image.
+    pub border_control: Option<bool>,
+    /// `Some(true)` = the cursor will be captured into the image.
+    pub cursor_control: Option<bool>,
+    /// Recorded but never enabled (`docs/30` §11.4): we need full frames.
+    pub dirty_regions: bool,
+    /// Which provider this session ended up on.
+    pub backend: ProviderKind,
+    /// Whether the target is captured as a window (no occluders) rather than as a monitor.
+    pub window_target: bool,
+}
+
+impl CaptureCapabilities {
+    /// Assemble the table from a probed session (`P2.06` supplies `backend`/`window_target`).
+    pub fn from_options(
+        options: wgc::CaptureOptions,
+        backend: ProviderKind,
+        window_target: bool,
+    ) -> Self {
+        Self {
+            border_control: options.border_control,
+            cursor_control: options.cursor_control,
+            dirty_regions: options.dirty_regions,
+            backend,
+            window_target,
+        }
+    }
+
+    /// Every degradation, in the words the UI would use. Empty means nothing was lost.
+    ///
+    /// This is what makes G12 mechanical: a degradation that is not in this list does not
+    /// exist as far as the user is concerned, so every `None`/`Some(true)` has a sentence.
+    pub fn degradations(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        match self.border_control {
+            Some(false) => {}
+            Some(true) => out.push("the capture border could not be suppressed"),
+            None => out.push("this system cannot suppress the capture border"),
+        }
+        match self.cursor_control {
+            Some(false) => {}
+            Some(true) => out.push("the cursor could not be excluded from the capture"),
+            None => out.push("this system cannot exclude the cursor; it is masked out instead"),
+        }
+        out
+    }
+
+    /// One line for the session log (`docs/30` §24.3: printed once, then published).
+    pub fn describe(&self) -> String {
+        let degradations = self.degradations();
+        format!(
+            "capture backend={} window_target={} border={:?} cursor={:?} dirty_regions={} degraded={}",
+            self.backend.name(),
+            self.window_target,
+            self.border_control,
+            self.cursor_control,
+            self.dirty_regions,
+            if degradations.is_empty() {
+                "none".to_string()
+            } else {
+                degradations.join("; ")
+            }
+        )
+    }
+}
+
 /// The frozen back buffer of one session.
 ///
 /// The GPU texture is the primary representation: the overlay renders L0 straight from
@@ -708,6 +783,86 @@ mod tests {
     /// worker can build an `Arc<FrozenFrame>` with no GPU either.
     fn frozen(width: u32, height: u32) -> FrozenFrame {
         super::test_frozen_frame(width, height)
+    }
+
+    /// `docs/30 §24.3`'s exit condition ③ in executable form: **every** degradation has a
+    /// sentence, so "the long image has a border" is something the user is told rather than
+    /// something they notice. The table is the single place a degradation can hide.
+    #[test]
+    fn every_degradation_reaches_the_capability_table() {
+        use super::CaptureCapabilities;
+        use crate::windows::win::wgc::CaptureOptions;
+
+        let healthy = CaptureCapabilities::from_options(
+            CaptureOptions {
+                cursor_control: Some(false),
+                border_control: Some(false),
+                dirty_regions: true,
+            },
+            ProviderKind::WgcWindow,
+            true,
+        );
+        assert!(
+            healthy.degradations().is_empty(),
+            "a session where both options applied has nothing to report"
+        );
+        let line = healthy.describe();
+        assert!(line.contains("backend=wgc-window"), "{line}");
+        assert!(line.contains("window_target=true"), "{line}");
+        assert!(line.contains("degraded=none"), "{line}");
+
+        // Both failure modes, for both options: absent interface and refused call.
+        for (options, expect_border, expect_cursor) in [
+            (
+                CaptureOptions {
+                    cursor_control: None,
+                    border_control: None,
+                    dirty_regions: false,
+                },
+                true,
+                true,
+            ),
+            (
+                CaptureOptions {
+                    cursor_control: Some(true),
+                    border_control: Some(true),
+                    dirty_regions: true,
+                },
+                true,
+                true,
+            ),
+            (
+                CaptureOptions {
+                    cursor_control: Some(false),
+                    border_control: None,
+                    dirty_regions: true,
+                },
+                true,
+                false,
+            ),
+        ] {
+            let degraded =
+                CaptureCapabilities::from_options(options, ProviderKind::WgcWindow, true);
+            let listed = degraded.degradations();
+            assert_eq!(
+                listed.iter().any(|line| line.contains("border")),
+                expect_border,
+                "border degradation missing from {listed:?} for {options:?}"
+            );
+            assert_eq!(
+                listed.iter().any(|line| line.contains("cursor")),
+                expect_cursor,
+                "cursor degradation missing from {listed:?} for {options:?}"
+            );
+            // The log line must carry the same words, not a bare `None`.
+            let line = degraded.describe();
+            for sentence in &listed {
+                assert!(
+                    line.contains(sentence),
+                    "the log line dropped {sentence:?}: {line}"
+                );
+            }
+        }
     }
 
     #[test]

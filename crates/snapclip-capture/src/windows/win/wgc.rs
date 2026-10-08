@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use ::windows::Graphics::Capture::{
     Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem,
-    GraphicsCaptureSession,
+    GraphicsCaptureSession, IGraphicsCaptureSession2, IGraphicsCaptureSession3,
 };
 use ::windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use ::windows::Graphics::DirectX::DirectXPixelFormat;
@@ -119,12 +119,17 @@ pub fn capture_monitor(
     let session = pool
         .CreateCaptureSession(&item)
         .map_err(|error| super::hresult("CreateCaptureSession", &error))?;
-    session
-        .SetIsCursorCaptureEnabled(false)
-        .map_err(|error| super::hresult("SetIsCursorCaptureEnabled", &error))?;
-    // The yellow capture border is cosmetic: report but never fail on it.
-    if let Err(error) = session.SetIsBorderRequired(false) {
-        eprintln!("[snapclip][capture] WGC border suppression unavailable: {error}");
+    // `DEV-3`: this used to be `.map_err(...)?` on the cursor option, so a system without
+    // `IGraphicsCaptureSession2` failed the whole capture — including the ordinary screenshot
+    // path. Probing first turns that into a recorded degradation (`P2.04`, §24.3).
+    let (options, option_diagnostics) = probe_capture_options(&mut WinRtSession(&session));
+    if options.is_degraded() {
+        eprintln!(
+            "[snapclip][capture] WGC capture options degraded: cursor={:?} border={:?} ({})",
+            options.cursor_control,
+            options.border_control,
+            option_diagnostics.join("; ")
+        );
     }
     session
         .StartCapture()
@@ -475,6 +480,132 @@ impl WgcFrame {
     }
 }
 
+/// What the platform let us control about a capture session (`docs/30` §24.3).
+///
+/// Each field is a **fact about the system**, not a record of an attempt:
+///
+/// - `None` — the interface that carries the option is absent here, so the option cannot be
+///   controlled at all.
+/// - `Some(false)` — the option was applied, and the thing is off. This is the good case.
+/// - `Some(true)` — the interface exists but the call failed, so the thing is still **on**
+///   and the pixels will show it (a yellow border, a cursor in every frame).
+///
+/// Three states rather than a `bool` because the two failure modes need opposite responses:
+/// an absent `IGraphicsCaptureSession2` must not fail the capture at all (`DEV-3`), while an
+/// absent `IGraphicsCaptureSession3` must be visible enough for the UI to say "the long image
+/// will have a border" (§24.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CaptureOptions {
+    /// `Some(true)` = the cursor will be captured despite the request.
+    pub cursor_control: Option<bool>,
+    /// `Some(true)` = the capture border will be drawn despite the request.
+    pub border_control: Option<bool>,
+    /// Whether the platform *offers* dirty-region reporting. We never enable it — dirty
+    /// regions would make "every step is a full frame" untrue and the estimator is written
+    /// against full frames (§11.4) — but it is recorded, because its presence is what makes
+    /// "full frames" a platform guarantee rather than our own restraint.
+    pub dirty_regions: bool,
+}
+
+impl CaptureOptions {
+    /// Whether anything about this session is degraded, for a one-line capability log.
+    pub fn is_degraded(&self) -> bool {
+        self.cursor_control != Some(false) || self.border_control != Some(false)
+    }
+}
+
+/// The two session options, behind a seam so their three states can be exercised without a
+/// display (`P2.04`). `None` from either method means the interface is absent.
+///
+/// The seam exists because the interesting behaviour is *not* "call the setter": it is what we
+/// do when the setter cannot be reached, and that path is only testable if reaching it can be
+/// scripted.
+pub(crate) trait CaptureOptionTarget {
+    fn set_cursor_capture_enabled(&mut self, enabled: bool) -> Option<Result<(), String>>;
+    fn set_border_required(&mut self, required: bool) -> Option<Result<(), String>>;
+}
+
+/// Probe the interface first, then call it (`docs/30` §24.3).
+///
+/// **The return type is the guarantee**: `(CaptureOptions, Vec<String>)` has no failure to
+/// propagate, so there is no `?` to write and no way for a missing option to fail a capture.
+/// A degraded option leaves a line in the returned diagnostics (G12) and a fact in the
+/// returned table.
+pub(crate) fn probe_capture_options(
+    target: &mut dyn CaptureOptionTarget,
+) -> (CaptureOptions, Vec<String>) {
+    let mut diagnostics = Vec::new();
+
+    let cursor_control = match target.set_cursor_capture_enabled(false) {
+        None => {
+            diagnostics.push(
+                "IGraphicsCaptureSession2 is not available; cursor capture cannot be turned \
+                 off, so the scroll path must exclude the cursor block by mask (§11.4)"
+                    .into(),
+            );
+            None
+        }
+        Some(Ok(())) => Some(false),
+        Some(Err(detail)) => {
+            diagnostics.push(format!("SetIsCursorCaptureEnabled failed ({detail})"));
+            Some(true)
+        }
+    };
+
+    let border_control = match target.set_border_required(false) {
+        None => {
+            diagnostics.push(
+                "IGraphicsCaptureSession3 is not available; the capture border cannot be \
+                 suppressed, so a long image may contain a border band (§24.3)"
+                    .into(),
+            );
+            None
+        }
+        Some(Ok(())) => Some(false),
+        Some(Err(detail)) => {
+            diagnostics.push(format!(
+                "SetIsBorderRequired failed ({detail}) — the capture border remains enabled"
+            ));
+            Some(true)
+        }
+    };
+
+    let options = CaptureOptions {
+        cursor_control,
+        border_control,
+        // Both options live on `IGraphicsCaptureSession2`/`3`, which are the interfaces that
+        // also carry dirty-region reporting; the cursor probe above is what tells us whether
+        // the generation is present.
+        dirty_regions: cursor_control.is_some(),
+    };
+    (options, diagnostics)
+}
+
+/// The production [`CaptureOptionTarget`]: the real WinRT session, probed by `cast`.
+struct WinRtSession<'a>(&'a GraphicsCaptureSession);
+
+impl CaptureOptionTarget for WinRtSession<'_> {
+    fn set_cursor_capture_enabled(&mut self, enabled: bool) -> Option<Result<(), String>> {
+        // The interface's presence **is** the probe; the setter itself is projected onto the
+        // session by windows-rs, so the session is what gets called.
+        self.0.cast::<IGraphicsCaptureSession2>().ok()?;
+        Some(
+            self.0
+                .SetIsCursorCaptureEnabled(enabled)
+                .map_err(|error| format!("{error}")),
+        )
+    }
+
+    fn set_border_required(&mut self, required: bool) -> Option<Result<(), String>> {
+        self.0.cast::<IGraphicsCaptureSession3>().ok()?;
+        Some(
+            self.0
+                .SetIsBorderRequired(required)
+                .map_err(|error| format!("{error}")),
+        )
+    }
+}
+
 /// A window-level capture that stays open across many frames.
 ///
 /// This is the shape the scrolling feature needs (`docs/30 §24.2`): one item, one
@@ -495,6 +626,7 @@ pub struct WgcSession {
     sizing: PoolSizing,
     diagnostics: Vec<String>,
     device: IDirect3DDevice,
+    options: CaptureOptions,
 }
 
 impl WgcSession {
@@ -558,12 +690,8 @@ impl WgcSession {
                 detail: super::hresult("CreateCaptureSession", &error),
             })?;
         // Both options are best effort here; P2.04 owns the capability model.
-        if let Err(error) = session.SetIsCursorCaptureEnabled(false) {
-            diagnostics.push(super::hresult("SetIsCursorCaptureEnabled", &error));
-        }
-        if let Err(error) = session.SetIsBorderRequired(false) {
-            diagnostics.push(super::hresult("SetIsBorderRequired", &error));
-        }
+        let (options, option_diagnostics) = probe_capture_options(&mut WinRtSession(&session));
+        diagnostics.extend(option_diagnostics);
         session.StartCapture().map_err(|error| WgcError::Failed {
             context: "GraphicsCaptureSession::StartCapture",
             detail: super::hresult("GraphicsCaptureSession::StartCapture", &error),
@@ -578,7 +706,13 @@ impl WgcSession {
             sizing: PoolSizing::new(content.Width, content.Height),
             diagnostics,
             device: direct3d_device,
+            options,
         })
+    }
+
+    /// What the platform let us control, as probed when the session was opened (§24.3).
+    pub fn options(&self) -> CaptureOptions {
+        self.options
     }
 
     /// The content size the session was opened at.
@@ -687,7 +821,8 @@ impl Drop for WgcSession {
 #[cfg(test)]
 mod tests {
     use super::{
-        PoolSizing, Sizing, WgcError, WgcSession, create_item_for_window, is_supported,
+        CaptureOptionTarget, CaptureOptions, PoolSizing, Sizing, WgcError, WgcSession,
+        create_item_for_window, is_supported, probe_capture_options,
     };
     use crate::windows::scroll_probe::{
         WindowMatch, pump_for, visible_windows, wait_for_new_window,
@@ -887,6 +1022,126 @@ mod tests {
             sizing.recreations(),
             1,
             "the new size becomes the baseline; a resize is a step, not a per-frame cost"
+        );
+    }
+
+    // --- capture options: three states, probed before they are used (§24.3; task P2.04) ---
+
+    /// The seam: what a session can be asked to change, or `None` when the interface that
+    /// carries the option does not exist on this system.
+    struct ScriptedOptions {
+        cursor: Option<Result<(), String>>,
+        border: Option<Result<(), String>>,
+        calls: Vec<String>,
+    }
+
+    impl ScriptedOptions {
+        fn absent() -> Self {
+            Self {
+                cursor: None,
+                border: None,
+                calls: Vec::new(),
+            }
+        }
+
+        fn all_applied() -> Self {
+            Self {
+                cursor: Some(Ok(())),
+                border: Some(Ok(())),
+                calls: Vec::new(),
+            }
+        }
+
+        fn border_fails(detail: &str) -> Self {
+            Self {
+                cursor: Some(Ok(())),
+                border: Some(Err(detail.to_string())),
+                calls: Vec::new(),
+            }
+        }
+    }
+
+    impl CaptureOptionTarget for ScriptedOptions {
+        fn set_cursor_capture_enabled(&mut self, enabled: bool) -> Option<Result<(), String>> {
+            self.calls.push(format!("cursor={enabled}"));
+            self.cursor.clone()
+        }
+
+        fn set_border_required(&mut self, required: bool) -> Option<Result<(), String>> {
+            self.calls.push(format!("border={required}"));
+            self.border.clone()
+        }
+    }
+
+    /// `docs/30 §24.3`: the border option failing used to be swallowed by an `eprintln!`,
+    /// so "does the long image have a yellow band" became a matter of luck. A failure is
+    /// now a **fact in the capability table**, and the table is the thing the session
+    /// prints and the UI reads.
+    #[test]
+    fn an_unavailable_capture_option_is_recorded_and_asserted_not_swallowed() {
+        let mut absent = ScriptedOptions::absent();
+        let (options, diagnostics) = probe_capture_options(&mut absent);
+        assert_eq!(
+            options.border_control, None,
+            "an absent interface must read as `None`, not as a silent success"
+        );
+        assert_eq!(options.cursor_control, None);
+        assert!(
+            diagnostics.iter().any(|line| line.contains("IGraphicsCaptureSession3")),
+            "the absent interface must be named in the diagnostics, got {diagnostics:?}"
+        );
+
+        let mut failing = ScriptedOptions::border_fails("0x80004005");
+        let (options, diagnostics) = probe_capture_options(&mut failing);
+        assert_eq!(
+            options.border_control,
+            Some(true),
+            "the call failed, so the border is still required — that is the fact the UI needs"
+        );
+        assert!(
+            diagnostics.iter().any(|line| line.contains("0x80004005")),
+            "a failing call must keep its own error text, got {diagnostics:?}"
+        );
+        assert_eq!(
+            failing.calls,
+            vec!["cursor=false".to_string(), "border=false".to_string()],
+            "the probe must ask for the option, not just ask whether the interface exists"
+        );
+    }
+
+    /// `DEV-3`: the cursor option used to be propagated with `?` on the monitor path, so a
+    /// system without `IGraphicsCaptureSession2` failed the **whole capture**. A missing
+    /// option changes what the pixels contain, not whether there are pixels.
+    #[test]
+    fn an_unavailable_cursor_option_does_not_fail_the_capture() {
+        let mut target = ScriptedOptions::absent();
+        // The type is the guarantee: a function that returns `(CaptureOptions, Vec<String>)`
+        // has no failure to propagate. If someone later makes it a `Result`, this stops
+        // compiling rather than silently reintroducing the `?`.
+        let (options, diagnostics): (CaptureOptions, Vec<String>) =
+            probe_capture_options(&mut target);
+        assert_eq!(options.cursor_control, None);
+        assert!(
+            diagnostics.iter().any(|line| line.contains("IGraphicsCaptureSession2")),
+            "the degradation must be recorded, not swallowed, got {diagnostics:?}"
+        );
+
+        let mut applied = ScriptedOptions::all_applied();
+        let (options, diagnostics) = probe_capture_options(&mut applied);
+        assert_eq!(
+            options.cursor_control,
+            Some(false),
+            "`Some(false)` is the good case: cursor capture is off"
+        );
+        assert_eq!(options.border_control, Some(false));
+        assert!(
+            diagnostics.is_empty(),
+            "a system where everything works must produce no diagnostics, got {diagnostics:?}"
+        );
+        assert!(
+            options.dirty_regions,
+            "`IGraphicsCaptureSession2` being present is what makes dirty regions available; \
+             we record it but never enable it (§11.4)"
         );
     }
 }
