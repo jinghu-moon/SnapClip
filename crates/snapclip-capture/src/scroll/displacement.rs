@@ -23,8 +23,7 @@
 //! but keep the session" is one match arm instead of a rule every consumer re-derives.
 //!
 //! Not here yet: `scene_cut` (`P1.12` puts it in `Evidence`, so that it never becomes a
-//! `StopReason`), the `ĝ` prior (`P1.14`) and the gates after the second (`P1.10`–`P1.11`); all of
-//! them feed the `score` this file's formulas name.
+//! `StopReason`) and the `ĝ` prior (`P1.14`); both feed the `score` this file's formulas name.
 //!
 //! `P1.06` adds §15.4's second layer: the first thing in the funnel allowed to *argue*, because it
 //! is the first that compares two-dimensional structure (F-02 — a periodic carrier satisfies any
@@ -49,6 +48,17 @@
 //! and a gate would treat as an ordinary measurement. That is why the module's "no sentinel" rule
 //! (`P1.04`) has a second instance here: the type carries the distinction, and
 //! [`zero_shift_status`] is the §16.3 fingerprint path the undefined case is routed to instead.
+//!
+//! `P1.10` adds §16.1's third gate ([`gate_support`]) and, more importantly, what "independent"
+//! means in it: [`independent_support`] counts agreeing tiles only when they are **two apart**, so a
+//! single wide patch cannot masquerade as four witnesses. That is also what §16.7's `coverage` is
+//! defined on, so the number the score reads and the number the gate reads are the same number.
+//!
+//! `P1.11` adds §16.1's fourth and last gate ([`gate_margin`]). It is the only gate that reports
+//! `Uncertain` instead of `None`, because the thing it rejects is a *measurement* — the winner and a
+//! rival both scored, they just did not separate — and §16.10 gives those two answers different
+//! actions. §16.6's manual-mode peak-family rule is the same threshold seen from the other side
+//! (`1 − 0.85 == MIN_MARGIN`), so no second detector is built for it.
 
 // The first consumer of everything in this file is `P1.05` (layer 1) / `P1.06` (ZNCC) / `P1.12`
 // (the session loop). Until then the module is exercised only by its own tests, and the crate's
@@ -1053,27 +1063,33 @@ pub(crate) enum GateRejection {
     /// shift — but it is corroborated in one place only, and one place is what a periodic page also
     /// produces.
     TooFewSupporters,
+    /// §16.5: `margin < MIN_MARGIN`. A rival came within 15% of the winner, so "the best candidate"
+    /// is not a choice the evidence makes — the classic case being a periodic page, where the rival is
+    /// the same content a period away. Carries the winner because this is the one rejection that
+    /// reports a *measured* shift (`Status::Uncertain`), not an absent measurement.
+    MarginTooSmall { best: i32 },
 }
 
 impl GateRejection {
     /// What §16.10 says a rejection means for the session.
     ///
-    /// All of them are `None` rather than `Uncertain`. `Uncertain` means "a shift was measured and
-    /// the evidence does not carry a decision"; these mean the measurement is not a measurement —
+    /// The first four are `None` rather than `Uncertain`. `Uncertain` means "a shift was measured and
+    /// the evidence does not carry a decision"; those mean the measurement is not a measurement —
     /// there was nothing to compare, the estimator left its defined domain, the best candidate gained
     /// nothing over not moving, or nothing independent corroborates it. §16.9 wants that distinction
     /// visible, so it is a method instead of a sentence each call site would spell differently.
     ///
-    /// Each rejection carries its own status rather than sharing one: gate four's ambiguity
-    /// (`P1.11`) is a measured shift whose evidence does not pick *which* shift, and that is the
-    /// `Uncertain` §16.10 describes. Adding that variant means adding an arm here, not rewriting a
-    /// call site.
+    /// [`Self::MarginTooSmall`] is the exception, and the reason the method exists rather than a
+    /// constant: the winner *was* measured, twice, and the two measurements disagree about which
+    /// shift they describe. §16.10's row for that is `Uncertain` — the session continues and the
+    /// canvas does not move — which is exactly why the variant carries its `best`.
     pub(crate) const fn status(self) -> Status {
         match self {
             Self::OutsideViewport
             | Self::BannedHalf
             | Self::ResidualGainTooSmall
             | Self::TooFewSupporters => Status::None,
+            Self::MarginTooSmall { best } => Status::Uncertain { d: best },
         }
     }
 }
@@ -1183,6 +1199,62 @@ pub(crate) fn gate_support(supporters: u32) -> GateOutcome {
     }
 }
 
+/// The smallest separation between the winner and its runner-up that counts as a decision
+/// (`docs/30` §16.5).
+///
+/// F-03 is the reason there is a number at all: on a periodic page every alias of the true shift
+/// scores the same, so "the best candidate" is an artefact of `minMaxLoc` rather than a measurement.
+/// The magnitude is a startup value taken from the reference implementation (§6 N5, R16); §16.11
+/// marks it calibratable and `E-ACC-1` owns it. What is not calibratable is that the gate exists —
+/// N2 asks for "不确定 rather than a confident period multiple", and this is the only gate that can
+/// say it.
+pub(crate) const MIN_MARGIN: f32 = 0.15;
+
+/// The score scale below which §16.5's ratio has no meaning: `0 / 0` is not a margin.
+///
+/// It is deliberately *not* `0.0`. Two candidates with no evidence at all score exactly zero
+/// everywhere, and `(0 − 0) / 0` would be `NaN` — a value that poisons every comparison it reaches
+/// (§2.1 F-02's `0/0 → NaN` failure, in its smallest form). The floor turns that into the answer the
+/// type already has: no ratio.
+const MARGIN_SCORE_FLOOR: f32 = 1e-3;
+
+/// §16.5's ratio, in one place: `(score(best) − score(second)) / score(best)`.
+///
+/// Both arguments are §16.7's **composed** score, never a bare `zncc2d`: §16.5 says so explicitly,
+/// because "one candidate leads by 0.02 in ZNCC but by 0.4 in residual gain" would otherwise be
+/// reported as ambiguous.
+///
+/// `None` means there is no ratio to compute, and both causes are the same absence:
+/// [`second`] missing (a lone candidate has nothing to be confused with) or the winner's own score
+/// having no scale to divide by. The second cause cannot arise through the pipeline — passing gate
+/// two means `score >= SCORE_GAIN · MIN_RESIDUAL_GAIN = 0.0375`, an order of magnitude above
+/// [`MARGIN_SCORE_FLOOR`] — and [`gate_margin`] says what the answer is when it appears anyway.
+fn margin_of(best: f32, second: Option<f32>) -> Option<f32> {
+    if best <= MARGIN_SCORE_FLOOR {
+        return None;
+    }
+    second.map(|second| (best - second) / best)
+}
+
+/// §16.5's gate four: `margin >= MIN_MARGIN`, closed at the floor, plus what to do without a margin.
+///
+/// It takes the winner's shift as well as the margin because this rejection has to report *which*
+/// shift the evidence could not choose: §16.10's `Uncertain` carries a `d`, and the only place that
+/// knows it is the candidate the ranking picked.
+///
+/// A missing margin ([`None`]) passes. That is not a loophole: gate four exists to reject a winner
+/// that has a *rival*, and with a single candidate there is nothing to reject it in favour of.
+/// Inventing `margin = 1.0` for that case — the other way to write it — would feed a fabricated
+/// confidence term to §16.7, and every session's candidate set is the whole search window, so the
+/// case is degenerate rather than common.
+pub(crate) fn gate_margin(best: i32, margin: Option<f32>) -> GateOutcome {
+    match margin {
+        Some(margin) if margin >= MIN_MARGIN => GateOutcome::Pass,
+        Some(_) => GateOutcome::Reject(GateRejection::MarginTooSmall { best }),
+        None => GateOutcome::Pass,
+    }
+}
+
 /// §16.3's ratio measured on two frames at a given shift, in one place.
 ///
 /// `shift` arrives in full-resolution primary-axis pixels and the measurement is taken on layer 2's
@@ -1240,11 +1312,11 @@ pub(crate) fn zero_shift_status(
 mod tests {
     use super::{
         CANDIDATE_LIMIT, Candidate, Displacement, Evidence, GateOutcome, GateRejection, Gray,
-        MIN_RESIDUAL_GAIN, MIN_TILES, RHO_MIN, RHO_MIN_PERMILLE, ScoredCandidate, ScoredSet, Status,
-        StepEffect, TILE_INDEPENDENCE_GAP, band_zncc, candidates_1d, gate_geometry,
-        gate_residual_gain, gate_support, independent_support, is_verifiable, match_band, match_rows,
-        primary_digests, residual_gain, residual_gain_at, score_candidates_2d, support_at,
-        zero_shift_status,
+        MARGIN_SCORE_FLOOR, MIN_MARGIN, MIN_RESIDUAL_GAIN, MIN_TILES, RHO_MIN, RHO_MIN_PERMILLE,
+        SCORE_GAIN, ScoredCandidate, ScoredSet, Status, StepEffect, TILE_INDEPENDENCE_GAP, band_zncc,
+        candidates_1d, gate_geometry, gate_margin, gate_residual_gain, gate_support,
+        independent_support, is_verifiable, margin_of, match_band, match_rows, primary_digests,
+        residual_gain, residual_gain_at, score_candidates_2d, support_at, zero_shift_status,
     };
     use crate::scroll::observation::{Axis, Observation, ObservationView};
     use crate::scroll::displacement::{
@@ -2514,5 +2586,168 @@ mod tests {
                 best.score
             );
         }
+    }
+
+    /// `docs/30` §30.3's 二维周期 row: a board whose period is far shorter than the search window, so
+    /// a whole family of aliases lands inside it. `cell = 8` gives a period of 16 px, while the search
+    /// half-width below is 40 px — the aliases at `120 ± 16` and `120 ± 32` are all candidates.
+    fn periodic_board_document() -> TestImage {
+        TestImage::from_structures(640, 60 * 19, 9, 19, &[Structure::Checker { cell: 8 }])
+    }
+
+    #[test]
+    fn equal_scoring_modes_report_uncertain() {
+        // `docs/31` §6 `P1.11`; `docs/30` §16.5 and §30.3's 二维周期（棋盘）row. A two-dimensional
+        // board of period `p` makes `d` and `d ± p` the *same* observation, so the scored set holds a
+        // family of equally good modes and no amount of correlation separates them. Gate four is the
+        // only place that fact can be reported, and reporting it is the point: `D`'s answer for this
+        // page is `Uncertain`, not `None` — a shift was measured, the evidence just does not pick one.
+        let image = periodic_board_document();
+        let mut script = ScrollScript::new(&image, 900, vec![StepSpec::move_by(120)]);
+        let previous = script.take(0);
+        let current = script.take(1);
+
+        let candidates = candidates_1d(&previous.view(), &current.view(), 120, 40);
+        let scored = score_candidates_2d(&previous.view(), &current.view(), &candidates);
+        let best = *scored.iter().next().expect("the true shift is a candidate");
+        let second = *scored
+            .iter()
+            .nth(1)
+            .expect("a periodic page has a second mode");
+
+        // The measurement, as measured (2026-10-08): `best = 120` at `score = 0.9375` and
+        // `second = 139` at `score = 0.8373216`. The runner-up is not the alias the arithmetic
+        // predicts (`120 + 16 = 136`) but another member of the same family, 19 px away — and that is
+        // the useful part: on this page the second mode is **89.3%** of the winner, i.e. above §16.6's
+        // `0.85 · score(best)` family threshold, so "peak family" and "margin below `MIN_MARGIN`" are
+        // two sentences about one measurement.
+        assert_eq!(best.d, 120, "the true shift must win on a periodic page");
+        assert!(
+            second.score > 0.85 * best.score,
+            "the runner-up at {} is only {} — this is no longer the family §16.5 and §16.6 describe",
+            second.d,
+            second.score
+        );
+        let margin = margin_of(best.score, Some(second.score)).expect("both scores are positive");
+        assert!(
+            margin < MIN_MARGIN,
+            "the period separated {} ({}) from {} ({}) by {margin}, which gate four would accept as a decision",
+            best.d,
+            best.score,
+            second.d,
+            second.score
+        );
+        assert_eq!(
+            gate_margin(best.d, Some(margin)),
+            GateOutcome::Reject(GateRejection::MarginTooSmall { best: best.d })
+        );
+        assert_eq!(
+            GateRejection::MarginTooSmall { best: best.d }.status(),
+            Status::Uncertain { d: best.d },
+            "an ambiguous winner is still a measurement, so gate four's rejection is `Uncertain`"
+        );
+    }
+
+    #[test]
+    fn a_two_pixel_margin_is_not_enough() {
+        // `docs/31` §6 `P1.11`. Layer two measures a shift at the grid point of a 4 px cell, so the
+        // candidates inside one cell carry *the same* measurement — identical `zncc2d`, `gain`,
+        // `tiles` and `score` — and each of them sits at most 2 px from the shift that was measured.
+        // Gate four sees a margin of zero and must not confirm any of them; a rival in the next cell
+        // is a real rival.
+        let image = mixed_document();
+        let mut script = ScrollScript::new(&image, 900, vec![StepSpec::move_by(120)]);
+        let previous = script.take(0);
+        let current = script.take(1);
+
+        let candidates = candidates_1d(&previous.view(), &current.view(), 120, 40);
+        let scored = score_candidates_2d(&previous.view(), &current.view(), &candidates);
+        let best = *scored.iter().next().expect("the true shift is a candidate");
+        let second = *scored
+            .iter()
+            .nth(1)
+            .expect("a candidate set has a runner-up");
+        assert!(
+            best.d.abs_diff(second.d) <= 2,
+            "the runner-up is {} px from {} — this fixture no longer puts both in one cell",
+            best.d.abs_diff(second.d),
+            best.d
+        );
+
+        let tied = margin_of(best.score, Some(second.score)).expect("both scores are positive");
+        // The measurement, as measured (2026-10-08): `best = 120` at `0.9375`, `second = 119` at
+        // `0.9375` — one pixel apart, so the two scores are *bitwise* equal and the tie is total.
+        assert_eq!(best.d, 120);
+        assert_eq!(second.d, 119);
+        assert_eq!(
+            tied, 0.0,
+            "{} ({}) and {} ({}) are in one cell and must share one measurement",
+            best.d, best.score, second.d, second.score
+        );
+        assert_eq!(
+            gate_margin(best.d, Some(tied)),
+            GateOutcome::Reject(GateRejection::MarginTooSmall { best: best.d })
+        );
+
+        // The other side of the same gate, from the same measurement: a candidate one cell away is a
+        // real rival. As measured (2026-10-08): `117` scores `0.53167087`, so the margin is
+        // `0.4328844` — nearly three times the threshold — and gate four passes it.
+        let rival = *scored
+            .iter()
+            .find(|candidate| candidate.d == 117)
+            .expect("117 is inside the search window");
+        let decided = margin_of(best.score, Some(rival.score)).expect("both scores are positive");
+        assert!(
+            decided >= MIN_MARGIN,
+            "{} is a whole cell from {} but only scored {decided} better",
+            rival.d,
+            best.d
+        );
+        assert!((decided - 0.432_884_4).abs() < 1e-6, "{decided}");
+        assert_eq!(gate_margin(best.d, Some(decided)), GateOutcome::Pass);
+
+        // §16.5's floor is closed, the same way §16.3's and §16.4's are — asserted on the gate, not
+        // by rebuilding the rival's score from the threshold. The reconstruction does not survive
+        // `f32`: `1.0 - MIN_MARGIN` is the **exact** midpoint between `0.84999996` and `0.85000002`
+        // (ulp 5.96e-8 at that exponent), ties-to-even rounds it *up* to `0.85000002`, and the ratio
+        // it produces is `0.14999998` — below the floor it was built from. That is a fact about
+        // binary floats rather than about gate four, so the boundary is pinned where the comparison
+        // actually happens.
+        assert_eq!(gate_margin(best.d, Some(MIN_MARGIN)), GateOutcome::Pass);
+        assert_eq!(
+            gate_margin(best.d, Some(MIN_MARGIN - 1e-6)),
+            GateOutcome::Reject(GateRejection::MarginTooSmall { best: best.d })
+        );
+    }
+
+    #[test]
+    fn no_rival_and_no_scale_are_both_not_an_ambiguity() {
+        // `docs/31` §6 `P1.11`'s REFACTOR: the D-class pair §30.3 lists — the boundary value and the
+        // 2D periodic page — land in *different* states, and neither depends on gate one's window.
+        // The boundary value is gate one's rejection and reports `None`; the ambiguity is gate four's
+        // and reports `Uncertain`.
+        assert_eq!(GateRejection::BannedHalf.status(), Status::None);
+        assert_eq!(
+            GateRejection::MarginTooSmall { best: 7 }.status(),
+            Status::Uncertain { d: 7 }
+        );
+
+        // A lone candidate has no rival to be confused with. `None` here is not a measurement of
+        // uniqueness — it is the absence of a comparison, and gate four is about a *rival*.
+        assert_eq!(margin_of(1.0, None), None);
+        assert_eq!(gate_margin(120, None), GateOutcome::Pass);
+
+        // `0 / 0` is not a margin either. The second `None` is unreachable through the pipeline, and
+        // the arithmetic is why: a candidate that passed gate two scores at least
+        // `SCORE_GAIN · MIN_RESIDUAL_GAIN = 0.25 · 0.15 = 0.0375`, well above the floor at which the
+        // ratio stops being computable. This assertion is the whole of that argument.
+        assert_eq!(margin_of(0.0, Some(0.0)), None);
+        assert_eq!(gate_margin(120, margin_of(0.0, Some(0.0))), GateOutcome::Pass);
+        assert!(SCORE_GAIN * MIN_RESIDUAL_GAIN > MARGIN_SCORE_FLOOR);
+
+        // §16.6's manual-mode peak-family rule — "a second mode above `0.85 · score(best)` is a
+        // family" — is the same number as this gate: `1 − 0.85 == MIN_MARGIN`. So there is one rule
+        // with two spellings of its threshold, not two rules, and no second detector is built.
+        assert!((1.0 - 0.85_f32 - MIN_MARGIN).abs() < 1e-6);
     }
 }

@@ -1950,6 +1950,49 @@ pub(crate) fn gate_support(supporters: u32) -> GateOutcome  // 闭区间：4 通
 - **初始值 `MIN_MARGIN = 0.15`**，量级与残差增益门一致；**由 `E-ACC-1` 校准**。**`score` 不能只用 ZNCC**——它必须是 §16.7 的组合分数，否则"一个候选在 ZNCC 上领先 0.02 但在残差增益上领先 0.4"会被误判为不唯一。
 - **与 P1 的交互**：当 `d_best` 与 `d_second` 满足 `|d_best| ≡ |d_second| (mod 周期)` 时（即疑似周期性等高解），**把 P1 先验计入 `score`**（见 §16.6）；先验只能改变二者的排序，**不能把 margin 抬到门限之上**——否则先验就变成了判决。
 
+#### 16.5.1 落地的形状（`P1.11`，2026-10-08）
+
+```rust
+pub(crate) const MIN_MARGIN: f32 = 0.15;
+const MARGIN_SCORE_FLOOR: f32 = 1e-3;
+
+fn margin_of(best: f32, second: Option<f32>) -> Option<f32> {
+    if best <= MARGIN_SCORE_FLOOR {
+        return None; // there is no scale to divide by
+    }
+    second.map(|second| (best - second) / best)
+}
+
+pub(crate) fn gate_margin(best: i32, margin: Option<f32>) -> GateOutcome {
+    match margin {
+        Some(margin) if margin >= MIN_MARGIN => GateOutcome::Pass,
+        Some(_) => GateOutcome::Reject(GateRejection::MarginTooSmall { best }),
+        None => GateOutcome::Pass, // no rival is not an ambiguity
+    }
+}
+```
+
+**四处裁决（每一条都有一个可执行的钉子）：**
+
+1. **拒绝的变体自带 `best`**：`GateRejection::MarginTooSmall { best: i32 }`。这不是装饰——`GateRejection::status()` 是 `const fn`，而门四的拒绝必须携带那个"测到了但没有唯一赢家"的位移。把 `best` 放进变体是让 `status()` 保持无参数、且让**五种拒绝里只有这一种**映射到 `Status::Uncertain { d: best }`（其余四种仍是 `None`）的唯一办法。§16 开头的门表里"全丢候选 = `None`"与这里的分工是：**`None` 表示四门拒绝，`Uncertain` 表示有一个可测的赢家但没有唯一的赢家。**
+2. **`margin_of` 的 `None` 有两种成因**（没有次优候选；或 `best` 小到没有可除的尺度），它们都是"不存在这个比值"，因此 `None ⇒ Pass`：**门四拒绝的是一个有对手的赢家**，它不负责回答"有没有证据"——那是门二和门三的判决。伪造一个 `margin = 1.0` 会把这名赢家写进 §16.7 的 `confidence`，即把"没测到"变成"完全确定"。
+3. **`MARGIN_SCORE_FLOOR = 1e-3` 而不是 `0.0`**：两个都没有证据的候选处处得 `score = 0`，`(0 − 0) / 0` 会是 `NaN`，而 `NaN` 与任何门限的比较都是 `false` ⇒ 会**静默通过**门四。第二个成因在实际数据里不可达：过了门二就保证 `score ≥ SCORE_GAIN · MIN_RESIDUAL_GAIN = 0.25 · 0.15 = 0.0375`，比 floor 高一个数量级。用例把它写成算术（`assert!(SCORE_GAIN * MIN_RESIDUAL_GAIN > MARGIN_SCORE_FLOOR)`）而不是注释。
+4. **闭区间必须钉在比较真正发生的地方**。第一版用例断言 `gate_margin(best, Some(1.0 - MIN_MARGIN))` 通过（"刚好在门限上"），**实测不通过**：`1.0f32 − 0.15f32` 的精确值落在 `0.84999996` 与 `0.85000002` 的正中间（该指数下 `ulp = 5.96e-8`），ties-to-even 把它**进位**到 `0.85000002`，于是比值是 `0.14999998 < 0.15`。这不是门四的缺陷，而是"用另一个表达式重建门限"这件事本身的缺陷；用例改为直接传 `MIN_MARGIN`（`Pass`）与 `MIN_MARGIN - 1e-6`（拒绝）。
+
+**§16.6 的峰族检测就是同一道门，不是第二道门。** §16.6 手动模式的规则是"多个等间距峰超过 `0.85·score(d_best)` 就判 `Uncertain`"，而 `1 − 0.85 == MIN_MARGIN`——**同一个数、同一句话**（"次优离赢家不到 15% 就不可信"）。因此 `P1.11` **不新增第二个检测器**：直方图只有在"峰彼此等间距"时才等价于这里逐候选的行为，而逐候选的 `margin` 对**任意**第二峰（等间距或否）都成立，是更宽的判据。实测让它可执行：周期棋盘上 `second.score = 0.8373216` 是 `best.score = 0.9375` 的 **89.3% > 85%**，`margin = 0.10685698 < 0.15` ⇒ 两个判据在这页上给出同一个答案。
+
+**实测（`docs/Temp/p111-measurements.log`，2026-10-08；数字已写进用例注释）**
+
+| 页面 | `best` | `second` | `margin` | 门四 |
+|---|---|---|---|---|
+| 二维周期棋盘（`Checker{cell:8}`，周期 16 px），viewport 900，`move_by(120)` | `120`，score `0.9375` | `139`，score `0.8373216`（赢家的 89.3%） | `0.10685698` | `Reject(→Uncertain{120})` |
+| 混合文档，viewport 900，`move_by(120)` | `120`，score `0.9375` | `119`，score `0.9375`（同一 4 px cell，测量逐位相同） | `0.0` | `Reject(→Uncertain{120})` |
+| 同上，隔一个 cell 的对手 `117` | `120`，score `0.9375` | `117`，score `0.53167087` | `0.4328844`（≈ 门限的 2.9 倍） | `Pass` |
+
+两个细节：① 周期棋盘的第二峰**不是**算术预测的别名 `120 + 16 = 136`，而是同族里 19 px 外的另一个成员——"周期倍数"是内容的性质，"哪一族成员排第二"还取决于 `gain`/`coverage`；② 混合文档上前两名**同处一个 cell**（`119` 与 `120`，层二在栅格点上测量，两者测量逐位相同），所以门四的 `margin = 0` 是 `P1.07` 的 4 px 栅格与 `P1.11` 的判决之间的接缝：**层二分不开的候选，门四也不假装分得开**（真值最终由层三的全分辨率精修给出）。
+
+**尚未落地**：门四今天与门一/二/三一样只是被用例直接调用的纯函数；把它接进会话（`refine_winner` 的赢家 → 取 `margin_of(best.score, Some(second.score))` → `gate_margin` → 决定 `Confirmed`/`Uncertain`）是 `P1.12` 的组装职责。`MIN_MARGIN = 0.15` 与 `MARGIN_SCORE_FLOOR` 都归 `E-ACC-1`（前者可校准，后者只是防 `NaN` 的固定值）。**§16.6 的 P1 先验计入 `score` 的加权规则（§16.5 第三条）仍未实现**，它属于 `P1.14`。
+
 ### 16.6 机制 P1：注入量先验（V2 相对 V1 与参考实现的净增量）
 
 **这是 V2 唯一的方法论创新点，也是唯一能结构性对抗周期歧义的独立证据源。**
@@ -2078,7 +2121,8 @@ pub(crate) struct Displacement { status: Status, confidence: f32, evidence: Evid
 | `MIN_RESIDUAL_GAIN` | 0.15 | **硬门** | `E-ACC-1`；`P1.09` 落地为闭区间比较，比值本身是 `Option`（`GAIN_RMSE_FLOOR = 1e-3` 以下返回 `None`，不返回 `0.0`；§16.3.1 裁决 1） |
 | `MIN_TILES` | 4 | **硬门** | `E-ACC-1`；`P1.10` 落地为独立支持者的闭区间比较（`independent_support` + `gate_support`，§16.4.1），并因此给视口主轴设下 **≥ 448 px** 的下限 |
 | `GAIN_RMSE_FLOOR`（零位移残差的可除下限） | 1e-3 | 固定 | `P1.09`：低于它的分母是量化尘埃而不是比值，`residual_gain` 因此返回 `None`（§16.3.1 裁决 1） |
-| `MIN_MARGIN` | 0.15 | **硬门** | `E-ACC-1` |
+| `MIN_MARGIN` | 0.15 | **硬门** | `E-ACC-1`；`P1.11` 落地为闭区间比较，比值本身是 `Option`（`MARGIN_SCORE_FLOOR = 1e-3` 以下或没有次优 ⇒ `None` ⇒ `Pass`；§16.5.1 裁决 2–3）。**与 §16.6 的峰族门限是同一个数**：`1 − 0.85`（§16.5.1） |
+| `MARGIN_SCORE_FLOOR`（margin 的可除下限） | 1e-3 | 固定 | `P1.11`：低于它的分母是量化尘埃；写成 `1e-3` 而不是 `0.0` 是为了让 `(0 − 0) / 0` 的 `NaN` 不可能**静默通过**门四（§16.5.1 裁决 3） |
 | `RHO_MIN`（可验证性下限 = §14.2 的 `ρ*`） | 0.35（区间 0.30–0.40） | **可校准** | `E-ACC-1`；`P1.08` 把它与门一分开暴露，比较用整数 `RHO_MIN_PERMILLE = 350`（§16.2.1 裁决 3） |
 | `tile`（证据独立性粒度） | 32 px | 固定 | 与参考实现一致；`P1.10` 明确它是**匹配证据**的 tile，与 §18.2 时间模型的 tile 分开命名（§16.4.1 裁决 4） |
 | `TILE_INDEPENDENCE_GAP`（"独立"的最小下标距离） | 2 | 固定 | `P1.10`：§16.4 的 `|i − j| ≥ 2` 落地为常量而非参数（能设成 1 的调用方可以让一整块 wide patch 通过门三） |
@@ -3808,10 +3852,12 @@ if ($hits) { Write-Error "scroll/ must stay platform-free: $($hits -join '; ')";
 | 纯色帧 | 全白观测 | `None` 或 `Uncertain`；**绝不 `Confirmed`** | L1 | — |
 | 周期纹理（`P == |d|`） | 单周期条纹 | 无 P1 时 `Uncertain`；有 P1 时 `Confirmed` 且正确 | L1 | — |
 | 周期纹理（`P ≠ |d|`） | 同上 | 有/无 P1 都正确 | L1 | — |
-| 二维周期 | 棋盘 | `Uncertain`（峰族检测） | L1 | — |
+| 二维周期 | 棋盘 | `Uncertain`（门四 margin；§16.6 的峰族门限 `0.85` 就是 `1 − MIN_MARGIN`，所以"峰族检测"与"margin 不足"是同一个测量，见 §16.5.1） | L1 | — |
 | 低纹理 | 平滑渐变 | 估计器一半分两种机制（§16.4.1 推论 3）：**平坦**页 ⇒ 门三（独立支持者 0）⇒ `None`；**斜坡**页 ⇒ 门二仍 Pass（`gain ≈ 0.54–0.57`）而歧义 ⇒ 门四 ⇒ `Uncertain`。tile 跳过更新是时间层那一半 | L1 | `E-ACC-1` |
 | 逐行完全相等 | 同一帧重复 | `Confirmed, d == 0`（**不进估计器**） | L1 | Stitch Latency |
 | 边界值 `±N/2` | 构造触发未定义分支 | `None`（**绝不返回该值**） | L1 | — |
+
+**两条 D 类用例的分工**（`P1.11` 的 REFACTOR 义务，已可执行）："边界值 `±N/2`"与"二维周期"都是**门四**这一层能看到的失败，且**都不经过门一**——`gate_geometry`（门一）在这两条用例里从未被调用。它们落在**不同的 `Status`**：`GateRejection::BannedHalf.status() == Status::None`（"测到的位移不可用"）而 `GateRejection::MarginTooSmall { best }.status() == Status::Uncertain { d: best }`（"测到了，但赢家不唯一"）。把这两者混成一个 `None` 就等于把"没有证据"与"证据不足"混为一谈，而 §16.9 的边界值禁令与 §16.5 的唯一性门恰好是这条界线两侧的代表。
 | 门限校准 | `E-ACC-1` 全扫描 | ROC 曲线 + 选定工作点 | L1 | — |
 | 逐门 ablation | 顺序关闭四门 | 每门关闭都使错误确定率上升 | L1 | — |
 | P1 自锁 | `ĝ` 初值错 2×，跑 100 步 | 20 步内收敛回真值 | L1 | — |
