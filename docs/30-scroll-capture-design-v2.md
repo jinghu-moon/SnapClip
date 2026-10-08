@@ -1679,6 +1679,47 @@ t4  更新 ĝ → 决定下一步
 
 **为什么不用"等到位移不再变化"**：那需要先估计位移、再判断它是否稳定，把"稳定"变成"对位移的稳定性依赖"，而位移估计本身需要稳定帧作为输入——循环依赖。**行指纹是位移无关的**，因此可以放在前面。
 
+#### 13.3.1 落地的形状（`P3.04`，2026-10-09）
+
+```rust
+// crates/snapclip-capture/src/scroll/loop_control.rs
+pub(crate) const RENDER_TICK_MS: u32 = 15;          // overlay.rs:100
+pub(crate) const STILL_WINDOW: Duration = Duration::from_millis(40);
+pub(crate) const STEP_TIMEOUT: Duration = Duration::from_millis(400);
+
+pub(crate) enum SettleVerdict { Waiting, Still, TimedOut }
+
+pub(crate) struct Settle { started: Option<Instant>, reference: Option<(u64, Instant)> }
+impl Settle {
+    pub(crate) fn begin(&mut self, now: Instant);
+    pub(crate) fn sample(&mut self, digest: u64, now: Instant) -> SettleVerdict;
+    pub(crate) fn timed_out(&self, now: Instant) -> bool;
+}
+
+/// What the loop needs from the platform, so `scroll/` stays platform-free (§28.4).
+pub(crate) trait StepHost {
+    fn inject(&mut self, notches: i32) -> Result<(), String>;
+    fn digest(&mut self) -> Option<u64>;   // `None` == `Poll::Idle`
+    fn now(&self) -> Instant;
+}
+
+pub(crate) enum StepError { Injection(String), NoFrame }
+pub(crate) struct Settled { verdict: SettleVerdict, digest: u64 }
+
+pub(crate) fn inject_and_settle<H: StepHost>(
+    host: &mut H, settle: &mut Settle, notches: i32,
+) -> Result<Settled, StepError>;
+```
+
+**四处落地裁决**
+
+1. **时间从 `StepHost` 注入，不在循环里调 `Instant::now()`**。这个循环的**全部主题就是时间流逝**：时钟可注入之后，40 ms 与 400 ms 两条规则可以用微秒级用例穷举（含"同一合成周期内的两次一致不算证据"这条最容易被写错的规则），而**不需要任何 `sleep`**。这也让 §30.2 的"平滑滚动等待"行成为 L2 用例而不是 L3。
+2. **`inject_and_settle` 只注入一次**。重试、切传输、判定"这一步白费了"都是 `P3.03` 的看门狗与调用方的事，不是这个函数的事——一个**自己会重试的等待**会让"到底发出去了几格"变成不可回答的问题，而 §13.2 的控制律要的正是这个数。用例 `the_loop_injects_once_and_waits_for_the_picture_to_stop_moving` 把这条钉住（`host.injections == vec![3]`）。
+3. **`NoFrame` 与 `TimedOut` 是两个答案**。`TimedOut` = "我们**有**一帧，只是不能证明它静止"；`NoFrame` = "一帧都没有，没有东西可估"。§11.1 已经把 `Poll::Idle` 与"没有帧"分开，这里必须同样分开，否则"到底了"会被报成"等待超时"。
+4. **`StepHost` 只暴露三件事**：注入、取指纹、读时钟。它不是"帧源 + 执行器"的合并接口，而是循环**实际用到**的最小面——这样 §28.4 的边界（`scroll/` 不得引用 `windows`）不需要例外，Windows 侧的实现由 `P3.09` 的装配把 `FrameSource` 与 `scroll_actuator` 接起来。
+
+**未落地（留给后续任务）**：`inject_and_settle` 之后的"取第二帧 → `estimate()` → `commit`/`continue`"三段需要**参照视口**（§17.4：参照是画布materialize出来的视口，不是上一帧）与四门组装，两者都是 `P3.09` 的交付物；`n` 的计算（§13.2 的控制律）是 `P3.05`。本节交付的是**等待**这一半——它是唯一必须帧驱动、唯一有 40 ms/400 ms 两条硬规则、且唯一无法靠固定 `sleep` 替代的部分。
+
 ### 13.4 手动模式只是 `n = 0` 的闭环
 
 **设计要点**：手动模式**不是另一个代码路径**，它就是"不注入、只观测"的同一个循环：读帧 → 估计 `d` → 提交画布 → 投递预览 → 继续等。唯一的差别是 `loop_control` 里 `n = 0`，因此：
@@ -3304,6 +3345,36 @@ fn phase(s: &ScrollSession) -> Phase { /* 纯函数：stop.is_some() → Stopped
 
 **规模对比**：`docs/19` §3.3 的状态转移表 21 行 + 4 项校验；V2 = 3 个 `Phase` + 1 个纯函数。**状态数减少 86%，而表达能力不下降**——因为"在做什么"这件事本来就完全由数据决定。
 
+#### 20.1.1 落地的形状（`P3.04`，2026-10-09）
+
+```rust
+// crates/snapclip-capture/src/scroll/session.rs
+pub(crate) enum StopReason { UserStopped, UserCancelled, EndReached, TargetLost, CaptureFailed,
+                             DeviceLost, ActuatorFailed, MemoryLimit, ExportBudget, Timeout,
+                             InternalError }
+impl StopReason { pub(crate) fn yields_partial(self) -> bool; }   // 除 UserCancelled/InternalError
+
+pub(crate) struct Streak { pub(crate) no_progress: u8, pub(crate) scene_cut: u8 }
+pub(crate) enum Phase { Preparing, Running, Stopped }
+
+pub(crate) struct ScrollSession {
+    axis: Axis, canvas: RecoveredImage,
+    step: u32, committed: u32, discarded: u32,
+    streak: Streak, last_step_at: Instant,
+    stop: Option<StopReason>, undo: Vec<u64>,
+}
+pub(crate) fn phase(session: &ScrollSession) -> Phase;
+```
+
+**四处落地裁决**
+
+1. **`target` 字段不存在**，而上面的草图里有。原因与 `P3.02` 的 DEV-46 同源：`ScrollTarget` 是**身份**，属 `App`（§9.2），而帧源（`P2.03`）已经持有"读哪个窗口"这件事。会话层再存一份身份，只会产生第二个可以与之不一致的真相。草图里那一行是"聚合根拥有它需要的一切"的**意图**，不是字段清单。
+2. **`Preparing` 的谓词落地为 `canvas.primary_len() == 0`，不是 `bands.is_empty()`**。两者今天等价，但 `primary_len` 是 `RecoveredImage` 对外承诺的量，`bands` 是它的内部结构（`P1.20` 之后条带会在常驻与落盘之间移动，`bands()` 的语义随之变得微妙）。**用承诺而不是用结构**。
+3. **`stop()` 的第一个原因赢**（`if self.stop.is_none()`）。这是 §20.2 说的"终态必须粘住"的可执行形式：一个已经在 `ActuatorFailed` 上停下的会话，不应该因为随后的一次帧读取失败被改写成 `CaptureFailed`——那会让"用户看到的失败原因"取决于**停止之后**发生了什么。
+4. **`record_discarded` 是可见的**（`G12`）：被丢弃的步数进 `discarded` 计数器而不是被静默吞掉，§20.3 的不变量 5（`committed + discarded == step`）正是靠它才可断言。
+
+**退出条件 ③ 的机械形式**：`the_session_has_one_phase_and_no_state_machine` 用 `include_str!` 扫描 `session.rs` 与 `loop_control.rs` 的**生产半区**（`split("#[cfg(test)]").next()`），断言 `enum Phase` 恰好 1 次、`enum ScrollState` 恰好 0 次、`fn phase` 恰好 1 次。**注意扫描必须只取生产半区**——用例自己的源码里就含这几个字符串，扫全文会把它们数第二遍（`P3.02` 的 `the_decision_table_is_in_one_place` 踩过同一个坑）。
+
 ### 20.2 为什么这个抽象不会退化
 
 **批评**："用纯函数派生 `Phase`，以后需求变了就会被迫加上状态。"
@@ -4694,7 +4765,9 @@ if ($hits) { Write-Error "scroll/ must stay platform-free: $($hits -join '; ')";
 2. **`-Package` 下跳过第二遍扫描。** `-Package` 是依赖方向那半的负对照开关；若第二遍扫描在负对照里也跑，负对照的失败原因就变成"两种之一"，对照失效。
 3. **打印被扫描的文件数**（`checked crates/snapclip-capture/src/scroll: 8 files scanned for platform references`）。一个"扫了 0 个文件所以干净"的门禁与"真干净"无法区分——这是 §29.2 的"不许静默通过"在门禁自身上的应用。
 
-**落地时的文件数**：`scroll/` 共 **8** 个 `.rs`（`acceptance.rs` 628 行、`canvas.rs` 2659、`displacement.rs` 4928、`mod.rs` 37、`observation.rs` 495、`orb.rs` 683、`perf_probe.rs` 556、`testkit.rs` 759）。§28.2 的"10 个生产文件"是**目标终态**（`P2`+ 会继续加 `bands.rs`/`session.rs` 等），不是今天的数量。
+**落地时的文件数**：`scroll/` 共 **8** 个 `.rs`（`acceptance.rs` 628 行、`canvas.rs` 2659、`displacement.rs` 4928、`mod.rs` 37、`observation.rs` 495、`orb.rs` 683、`perf_probe.rs` 556、`testkit.rs` 759）。§28.2 的"10 个生产文件"是**目标终态**（`P2`+ 会继续加 `bands.rs`/`session.rs` 等），不是今天的数量。**`P3.04` 时该计数为 10**（新增 `loop_control.rs` 与 `session.rs`）。
+
+**这条门禁扫的是文本，注释也算（`P3.04` 实测）**：`loop_control.rs` 里 `RENDER_TICK_MS` 的 doc 原本写着"import 它就意味着 `scroll/` 命名 `crate::windows`"，而判据是正则文本匹配 ⇒ 门禁报 `loop_control.rs:37 references crate::windows (scroll/ must stay platform-free)`。**这不是误报**：一个在 `scroll/` 里写"我们不能引用 `crate::windows`"的注释，与一个真的引用之间，门禁无法区分，而放宽判据（排除注释）会让它可被绕过。**规则因此是：在 `scroll/` 里解释边界时，不要写出那个模块的字面路径**（写"平台模块"即可）。
 
 **门禁自身被证明能失败（`P6.07` 的 RED，与 §29.2 的 `E-ACC-1` 同一个道理）**：往 `crates/snapclip-capture/src/scroll/canvas.rs` 末尾追加一行 `use crate::windows::win;` 后运行门禁，实测
 
@@ -4926,7 +4999,7 @@ fn rows_match(actual, expected, sigma) -> bool
 | 条件选择 | 前台/非前台 × 提权/非提权 4 组 | 与 §24.6 一致 | L2 | **已可执行（`P3.02`）**：`the_four_combinations_match_the_table` + `a_non_foreground_target_never_uses_send_input`（16 组全扫）+ `the_transport_is_decided_not_retried` + `the_aim_follows_the_routing_setting`，见 §24.6.4 |
 | 注入失败后切路径 | mock 连续 3 次 `Posted` 但 `d==0` | 切换路径 + `InjectPathSwitched` | L2 | **已可执行（`P3.03`）**：`three_posted_steps_without_a_confirmed_step_switch_the_path` + `a_moved_step_resets_the_streak` + `the_watchdog_does_not_assume_there_are_exactly_two_transports`，见 §24.7.1 |
 | 两条路径都失败 | mock 双方各 3 次无效 | `ActuatorFailed` + `Partial` | L2 | **已可执行（`P3.03`）**：`both_paths_failing_three_times_ends_the_session`（`WatchVerdict::Failed`；`StopReason::ActuatorFailed` 与 `Partial` 的映射属会话层 `P3.04`/`P3.09`），见 §24.7.1 |
-| 平滑滚动等待 | 内容持续移动 3 帧 | 等到静止才估计 | L2 | Scroll Response |
+| 平滑滚动等待 | 内容持续移动 3 帧 | 等到静止才估计 | L2 | **已可执行（`P3.04`）**：`smooth_scrolling_is_waited_out_instead_of_being_estimated`（四个互不相同的帧各 45 ms ⇒ 全部 `Waiting`，到 `STEP_TIMEOUT` ⇒ `TimedOut`）+ `the_loop_waits_until_two_consecutive_frames_agree_before_estimating` + `the_loop_injects_once_and_waits_for_the_picture_to_stop_moving` + `a_step_with_no_frames_at_all_is_not_a_timeout`，见 §13.3.1 |
 | 取消延迟 | 注入后最坏时刻取消 | `Phase == Stopped` | L1 | **Cancel latency（Max）** |
 | 停止延迟 | 停止 | 导出任务已提交 | L1 | **Stop latency** |
 
