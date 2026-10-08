@@ -980,6 +980,20 @@ pub(crate) struct ScoredCandidate {
     /// instead of a grid heuristic, which is what keeps the winner inside layer 3's ±1
     /// neighbourhood (`P1.07`'s sweep: without it every shift ≡ 2 (mod 4) came back 1 px off).
     pub(crate) support: u32,
+    /// §16.6's P1 weight for this candidate: `1.0` unless mechanism P1 predicted something else
+    /// (§16.5's clause). It is stored rather than folded into `score` because the two numbers answer
+    /// different questions — `score` is what the image says, `prior` is what the controller says —
+    /// and the ranking is the only place they are allowed to meet.
+    pub(crate) prior: f32,
+}
+
+impl ScoredCandidate {
+    /// §16.5's ranking key: the composed score, reordered by the prior. Rule 1 in one line — the
+    /// prior multiplies, so a downweighted candidate is still in the set and still first if the
+    /// image likes it enough.
+    pub(crate) fn ranked(&self) -> f32 {
+        self.score * self.prior
+    }
 }
 
 /// Up to [`CANDIDATE_LIMIT`] scored candidates, best first.
@@ -1003,6 +1017,7 @@ impl ScoredSet {
                 curvature: 0.0,
                 score: 0.0,
                 support: 0,
+                prior: 1.0,
             }; CANDIDATE_LIMIT],
             len: 0,
         }
@@ -1040,6 +1055,24 @@ impl ScoredSet {
             self.len += 1;
         }
     }
+
+    /// §16.5's clause: apply mechanism P1 by **reordering**, and by nothing else.
+    ///
+    /// Every candidate keeps its place in the set — [`CANDIDATE_LIMIT`] bounds how many, not which —
+    /// and only its `prior` weight changes, so a caller that disagrees with the prior still has the
+    /// image-only answer in hand (that is what the session does when it reports `Uncertain`).
+    ///
+    /// The set is rebuilt through `insert` rather than re-sorted in place so the ranking rule stays
+    /// in exactly one place ([`scored_ranks_before`]).
+    pub(crate) fn apply_prior(&mut self, prior: &Prior, notches: i32) {
+        let unweighted = *self;
+        *self = Self::new();
+        for candidate in unweighted.items[..unweighted.len].iter() {
+            let mut weighted = *candidate;
+            weighted.prior = prior.weight(notches, candidate.d);
+            self.insert(weighted);
+        }
+    }
 }
 
 /// §16.7 says `score` is what ranks candidates; §15.4 ② says the three-point difference is what
@@ -1053,8 +1086,12 @@ impl ScoredSet {
 /// `round_to_grid(d)·4` is the honest thing to report when nothing else speaks), and the shift
 /// tie-break last makes the order total and deterministic — the same requirement `P1.05`'s
 /// [`CandidateSet`] answers for layer 1.
+///
+/// The key is [`ScoredCandidate::ranked`] and not `score`: §16.5 says the prior may reorder the two
+/// leading candidates, which is only true if the comparison that picks the leader looks at the
+/// weighted number.
 fn scored_ranks_before(candidate: ScoredCandidate, existing: ScoredCandidate) -> bool {
-    match candidate.score.total_cmp(&existing.score) {
+    match candidate.ranked().total_cmp(&existing.ranked()) {
         core::cmp::Ordering::Greater => true,
         core::cmp::Ordering::Less => false,
         core::cmp::Ordering::Equal => match candidate.curvature.total_cmp(&existing.curvature) {
@@ -1121,6 +1158,7 @@ pub(crate) fn score_candidates_2d(
             curvature,
             score: score_of(zncc2d, gain, coverage_of(tiles)),
             support: candidate.support,
+            prior: 1.0,
         });
     }
     scored
@@ -1418,6 +1456,107 @@ pub(crate) fn gate_margin(best: i32, margin: Option<f32>) -> GateOutcome {
     }
 }
 
+// --- mechanism P1 (§16.6): the amount we injected is evidence ----------------------------------
+
+/// §16.6's `κ`: the expected displacement is accepted over `[n·ĝ·(1−κ), n·ĝ·(1+κ)]`.
+///
+/// The interval is **multiplicative**, so `κ = 0.5` is asymmetric in the estimate: `ĝ` may be up to
+/// 2× too large (the true shift lands exactly on the edge) but only 1.5× too small before the truth
+/// falls outside. That is the property rule 3 has to survive, and it is why the self-lock case in
+/// `P1.14` starts on the permissive side with `ĝ` 5× too large: on the other side a "wrong" prior is
+/// only a factor of 1.5 away from being right.
+pub(crate) const PRIOR_KAPPA: f32 = 0.5;
+
+/// The weight an out-of-interval candidate keeps (rule 3). **Not** zero, and the number carries the
+/// argument: `1 − PRIOR_DOWNWEIGHT < MIN_MARGIN`, so the largest margin the prior can manufacture
+/// between two candidates the image cannot separate is 0.1 — below gate four's 0.15. §16.5's clause
+/// ("the prior may only reorder, it must not lift the margin over the threshold") is therefore an
+/// arithmetic fact rather than a promise, and the test asserts it as such.
+pub(crate) const PRIOR_DOWNWEIGHT: f32 = 0.9;
+
+/// Rule 2's floor: below this much *expected* motion the prior switches off entirely.
+///
+/// The switch is on `|n·ĝ|`, not on the candidate: below four pixels of expected movement every
+/// candidate's `|d|` is at noise scale, so a control-loop estimate would be deciding an image
+/// question with no evidence behind it.
+pub(crate) const PRIOR_MIN_EXPECTED_PX: f32 = 4.0;
+
+/// Rule 4's learning rate: `ĝ ← 0.7·ĝ + 0.3·(d/n)`.
+pub(crate) const PRIOR_LEARNING_RATE: f32 = 0.3;
+
+/// §16.6's P1: the one piece of evidence in the funnel that does not come from the image.
+///
+/// In automatic mode *we* chose how many notches to inject (`n_k`), so the step's displacement has
+/// an expectation nobody had to measure: `E[d_k] = n_k · ĝ`, where `ĝ` is the running estimate of
+/// pixels per notch. That is the only structurally independent answer to periodic ambiguity: a
+/// periodic pattern's aliases sit at multiples of the period, and a multiple of the period
+/// coinciding with `n·ĝ` is unlikely because `ĝ` is a continuous quantity while the period is a
+/// property of the content.
+///
+/// It is a **weight, never a verdict** (rule 1): it scales a candidate's score so the ranking can
+/// prefer the expected shift, and it cannot remove a candidate. Rule 3's reason is the failure mode
+/// this type exists to avoid — if P1 could discard candidates, a wrong `ĝ` would veto the right
+/// answer forever (**self-lock**) and hand the next step the same error.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Prior {
+    px_per_notch: f32,
+}
+
+impl Prior {
+    /// The initial estimate is calibrated by the first confirmable step (§16.6: "初始由首个可确认步
+    /// 标定"), so it arrives from the session, not from here.
+    pub(crate) fn new(px_per_notch: f32) -> Self {
+        Self { px_per_notch }
+    }
+
+    pub(crate) fn px_per_notch(&self) -> f32 {
+        self.px_per_notch
+    }
+
+    /// `E[d] = n · ĝ`, or `None` when rule 2 switches the prior off.
+    ///
+    /// `None` is not "expect zero" — it means this step's prior carries no information, and
+    /// [`Prior::weight`] answers `1.0` for every candidate so that a session with the prior disabled
+    /// and a session whose prior is merely switched off behave identically (exit condition ③ of
+    /// `P1.14`).
+    pub(crate) fn expectation(&self, notches: i32) -> Option<f32> {
+        let expected = notches as f32 * self.px_per_notch;
+        (expected.abs() >= PRIOR_MIN_EXPECTED_PX).then_some(expected)
+    }
+
+    /// §16.6's weight for one candidate: `1.0` inside `I_k`, [`PRIOR_DOWNWEIGHT`] outside, and
+    /// always `1.0` when the prior is off. Out of interval never means zero (rule 3).
+    ///
+    /// The comparison is on `|d − E[d]|` against `|E[d]|·κ`, so it is direction-agnostic: a page
+    /// scrolling up is as well predicted as one scrolling down.
+    pub(crate) fn weight(&self, notches: i32, d: i32) -> f32 {
+        let Some(expected) = self.expectation(notches) else {
+            return 1.0;
+        };
+        if (d as f32 - expected).abs() <= expected.abs() * PRIOR_KAPPA {
+            1.0
+        } else {
+            PRIOR_DOWNWEIGHT
+        }
+    }
+
+    /// Rule 4: learn from a step the four gates confirmed, from the **observed** displacement.
+    ///
+    /// Only `Confirmed` steps call this, and which steps those were is the session's knowledge, not
+    /// this type's: an `Uncertain` or `None` step established no `d`, and the prior's own
+    /// expectation is not an observation. Returns whether anything was learned — zero notches says
+    /// nothing about a per-notch estimate.
+    pub(crate) fn confirm(&mut self, notches: i32, d: i32) -> bool {
+        if notches == 0 {
+            return false;
+        }
+        let observed = d as f32 / notches as f32;
+        self.px_per_notch =
+            (1.0 - PRIOR_LEARNING_RATE) * self.px_per_notch + PRIOR_LEARNING_RATE * observed;
+        true
+    }
+}
+
 /// §16.3's ratio measured on two frames at a given shift, in one place.
 ///
 /// `shift` arrives in full-resolution primary-axis pixels and the measurement is taken on layer 2's
@@ -1695,7 +1834,9 @@ mod tests {
     use super::{
         CANDIDATE_LIMIT, Candidate, CandidateSet, Displacement, Evidence, GateOutcome, GateRejection,
         Gray,
-        MARGIN_SCORE_FLOOR, MIN_MARGIN, MIN_RESIDUAL_GAIN, MIN_TILES, RHO_MIN, RHO_MIN_PERMILLE,
+        MARGIN_SCORE_FLOOR, MIN_MARGIN, MIN_RESIDUAL_GAIN, MIN_TILES, PRIOR_DOWNWEIGHT, PRIOR_KAPPA,
+        Prior,
+        RHO_MIN, RHO_MIN_PERMILLE,
         SCENE_CUT_ALIGNMENT_ERROR, SCENE_CUT_DECAY_STREAK, SCENE_CUT_SIMILARITY, SCORE_GAIN, Scratch,
         SceneCut, SceneCutAction, ScoredCandidate, ScoredSet, Status, StepEffect,
         TILE_INDEPENDENCE_GAP, alignment_error, band_zncc, candidates_1d, gate_geometry, gate_margin,
@@ -2171,8 +2312,10 @@ mod tests {
                 curvature,
                 score,
                 support,
+                prior,
             } = *candidate;
             let _ = support;
+            let _ = prior;
             assert!(
                 zncc2d.is_finite()
                     && gain.is_finite()
@@ -3516,8 +3659,15 @@ mod tests {
             // exactly and reading one of them as a rival reports the grid's resolution as ambiguity.
             // Which member of the cell wins is the first layer's `support`, which `P1.07` made the
             // ranking's tie-break; the ambiguity gate asks about the *page*, not about the grid.
-            let rival = outside_cell_second(&scored, best.d).map(|second| second.score);
-            if let GateOutcome::Reject(rejection) = gate_margin(best.d, margin_of(best.score, rival)) {
+            let rival = outside_cell_second(&scored, best.d).map(|second| second.ranked());
+            // The margin is taken on the **ranked** numbers, because that is the key the winner was
+            // picked by (§16.5: the prior may reorder the two leaders, which is only meaningful if
+            // the comparison that follows looks at the same two numbers). Rule 3's bound is what
+            // keeps that from becoming a verdict: the prior can move a pair by at most
+            // `1 − PRIOR_DOWNWEIGHT = 0.1`, and gate four needs 0.15.
+            if let GateOutcome::Reject(rejection) =
+                gate_margin(best.d, margin_of(best.ranked(), rival))
+            {
                 // A rejection carries the status of the gate that produced it (`P1.11`), and its
                 // ambiguity arm names the candidate the gate judged — the ranking's winner. What the
                 // funnel would *report* is the third layer's answer, and §16.10's `Uncertain` is "the
@@ -3942,5 +4092,239 @@ mod tests {
             "the reused buffer still holds the previous step's pixels"
         );
         assert_eq!(scratch.builds(), 8);
+    }
+
+    /// §16.6's mechanism P1 is the only evidence in the funnel that does not come from the image, so
+    /// the first thing it has to prove is that it is **soft**: it may reorder candidates and it may
+    /// never remove one.
+    #[test]
+    fn the_prior_is_soft_and_cannot_reject_on_its_own() {
+        let prior = Prior::new(20.0);
+        // Six notches at 20 px per notch: `E[d] = 120` and `I = [60, 180]` with `κ = 0.5`.
+        assert_eq!(prior.expectation(6), Some(120.0));
+        assert_eq!(
+            prior.weight(6, 120),
+            1.0,
+            "the expectation is inside its own interval"
+        );
+        assert_eq!(prior.weight(6, 61), 1.0, "the interval is closed at its lower end");
+        assert_eq!(prior.weight(6, 179), 1.0, "…and at its upper end");
+        assert_eq!(
+            prior.weight(6, 300),
+            PRIOR_DOWNWEIGHT,
+            "an out-of-interval candidate is downweighted, not dropped (rule 3)"
+        );
+        assert_eq!(prior.weight(6, 0), PRIOR_DOWNWEIGHT);
+        assert_eq!(
+            prior.weight(6, -300),
+            PRIOR_DOWNWEIGHT,
+            "the interval is symmetric about the expectation"
+        );
+
+        // Rule 2: below four pixels of expected motion the prior switches off entirely, so a page
+        // that is barely moving never has its candidates reordered by a control-loop estimate.
+        let barely_moving = Prior::new(0.5);
+        assert_eq!(
+            barely_moving.expectation(4),
+            None,
+            "2 px of expected motion is noise, not evidence"
+        );
+        assert_eq!(
+            barely_moving.weight(4, 999),
+            1.0,
+            "a switched-off prior cannot downweight anything"
+        );
+
+        // Rule 3's reason, as arithmetic rather than as prose: the largest margin the prior can
+        // create between two candidates the image cannot separate is `1 − PRIOR_DOWNWEIGHT`, and
+        // that is **below** gate four's threshold — so P1 alone can never turn a tie into a
+        // `Confirmed` (docs/30 §16.5 "先验不能把 margin 抬到门限之上"). If someone raises
+        // `PRIOR_DOWNWEIGHT` past `1 − MIN_MARGIN`, the prior becomes a verdict and this test says so.
+        assert_eq!(PRIOR_KAPPA, 0.5);
+        assert_eq!(PRIOR_DOWNWEIGHT, 0.9);
+        assert!(
+            1.0 - PRIOR_DOWNWEIGHT < MIN_MARGIN,
+            "the prior's own weight can satisfy gate four, which makes it a verdict"
+        );
+
+        // And applying it changes no set's membership: a downweighted candidate is still a candidate.
+        let image = mixed_document();
+        let mut script = ScrollScript::new(&image, 900, vec![StepSpec::move_by(120)]);
+        let previous = script.take(0);
+        let current = script.take(1);
+        let candidates = candidates_1d(&previous.view(), &current.view(), 120, 8);
+        let mut scored = scored_once(&previous, &current, &candidates);
+        let unweighted = scored;
+        let unweighted_order: Vec<i32> = unweighted.iter().map(|candidate| candidate.d).collect();
+        let before = scored.len();
+        scored.apply_prior(&prior, 6);
+        assert_eq!(
+            scored.len(),
+            before,
+            "the prior removed a candidate from the set"
+        );
+        assert!(
+            scored
+                .iter()
+                .all(|candidate| candidate.prior == 1.0 || candidate.prior == PRIOR_DOWNWEIGHT)
+        );
+
+        // Exit condition ③, at the level the session sees it: with rule 2 in force the prior is
+        // **indistinguishable from no prior** — same order, same unit weights. That equivalence is
+        // what lets the control loop stay wired up while it is switched off for slow pages, instead
+        // of the session having to know which mode it is in.
+        let mut switched_off = unweighted;
+        switched_off.apply_prior(&barely_moving, 6);
+        assert_eq!(
+            switched_off
+                .iter()
+                .map(|candidate| candidate.d)
+                .collect::<Vec<i32>>(),
+            unweighted_order,
+            "a switched-off prior reordered the set"
+        );
+        assert!(
+            switched_off
+                .iter()
+                .all(|candidate| candidate.prior == 1.0),
+            "a switched-off prior weighted something"
+        );
+    }
+
+    /// The failure mode P1 must not have: a wrong `ĝ` that keeps vetoing the right answer.
+    ///
+    /// The answer has two halves. Rule 3 only *downweights*, so a wrong estimate can never remove
+    /// the truth; and rule 4 trains `ĝ` on the **observed** shift, never on its own expectation — a
+    /// prior that learned from itself would be a closed loop with no input, and the last check below
+    /// runs exactly that counterfactual to show it cannot move at all.
+    #[test]
+    fn a_wrong_prior_converges_instead_of_locking() {
+        const PX_PER_NOTCH: f32 = 20.0;
+        const NOTCHES: i32 = 1;
+        const OBSERVED: i32 = 20; // = NOTCHES · PX_PER_NOTCH
+
+        // The interval is multiplicative, so its tolerance is **asymmetric**: with `κ = 0.5` the
+        // estimate may be up to 2× too large (the edge is exact) but only 1.5× too small before the
+        // truth falls out of it. Both sides are checked, because "κ = 0.5 covers a 2× error" is only
+        // half the story and the self-lock case below starts on the permissive side.
+        assert_eq!(Prior::new(PX_PER_NOTCH * 2.0).weight(NOTCHES, OBSERVED), 1.0);
+        assert_eq!(Prior::new(PX_PER_NOTCH * 0.7).weight(NOTCHES, OBSERVED), 1.0);
+        assert_eq!(
+            Prior::new(PX_PER_NOTCH * 0.6).weight(NOTCHES, OBSERVED),
+            PRIOR_DOWNWEIGHT,
+            "1.67× too small is outside the interval"
+        );
+
+        // Five times off is genuinely outside the interval — and still only a downweight.
+        let mut prior = Prior::new(PX_PER_NOTCH * 5.0);
+        assert_eq!(prior.weight(NOTCHES, OBSERVED), PRIOR_DOWNWEIGHT);
+
+        // 100 steps of a page that keeps moving `PX_PER_NOTCH` px per notch. Every step is a
+        // `Confirmed` step, so `ĝ` learns on every one of them while it is still wrong.
+        let mut converged_at = None;
+        for step in 0..100 {
+            if converged_at.is_none()
+                && (prior.px_per_notch() - PX_PER_NOTCH).abs() <= PX_PER_NOTCH * 0.01
+            {
+                converged_at = Some(step);
+            }
+            prior.confirm(NOTCHES, OBSERVED);
+        }
+        let converged_at = converged_at.expect("ĝ did not converge within 100 steps (self-lock)");
+        assert!(
+            converged_at < 100,
+            "ĝ converged only after 100 steps: {converged_at}"
+        );
+        assert!((prior.px_per_notch() - PX_PER_NOTCH).abs() < 1e-3);
+
+        // The counterfactual that makes rule 4 load-bearing: training on the expectation instead of
+        // the observation cannot move the estimate at all, so a wrong `ĝ` would stay wrong forever.
+        let mut self_referential = Prior::new(PX_PER_NOTCH * 5.0);
+        for _ in 0..100 {
+            let expectation = self_referential.px_per_notch();
+            self_referential.confirm(NOTCHES, (NOTCHES as f32 * expectation) as i32);
+        }
+        assert!(
+            (self_referential.px_per_notch() - PX_PER_NOTCH * 5.0).abs() < 1e-3,
+            "a prior trained on its own expectation moved: that is the self-lock it must not have"
+        );
+
+        // Zero notches carries no information about a per-notch estimate, so it must not divide by
+        // zero nor pretend to have learned.
+        let mut untouched = Prior::new(PX_PER_NOTCH);
+        assert!(!untouched.confirm(0, OBSERVED));
+        assert_eq!(untouched.px_per_notch(), PX_PER_NOTCH);
+    }
+
+    /// §16.6's whole point, measured on the page it was written for: the period equals the step.
+    ///
+    /// Exit condition ② of `P1.14` asked for §30.3's "periodic texture `P == |d|` with P1 →
+    /// `Confirmed` and correct". What the design actually does, on a 640×1900 page of 19 px
+    /// `HorizontalBars` with the viewport at 900 and `move_by(19)`:
+    ///
+    /// - the prior **does** reorder the ranking — unweighted the winner is the alias `d = 0`
+    ///   (score 0.687500, `zncc2d = 1.000000`), weighted at `ĝ = 19` the winner is the truth
+    ///   `d = 19` (ranked 0.644539 against 0.618750) — so `ĝ` is doing the one job rule 1 gives it;
+    /// - the step is **still not `Confirmed`**, for two independent reasons, and neither is a
+    ///   tuning mistake: gate two has no residual gain to pass (shifting a periodic page by one
+    ///   period reproduces it, so `RMSE(d) == RMSE(0)` and the ratio is undefined ⇒ `0.0`), and gate
+    ///   four's margin is 0.040011313 against `MIN_MARGIN = 0.15`. A prior that could manufacture
+    ///   the missing 0.11 would be deciding, and rule 3 exists to make that impossible
+    ///   (`1 − PRIOR_DOWNWEIGHT = 0.1 < 0.15`, asserted in the test above).
+    ///
+    /// So §30.3's row is unreachable as written. It is not a bug in P1 — it is the funnel refusing
+    /// to answer a question the page cannot answer, which is what §16.1's "all four gates or nothing"
+    /// means. The deviation is recorded in `docs/31` §0.6 and the parameter question (relax
+    /// `MIN_MARGIN`, or accept `Uncertain` here) is handed to `E-ACC-1` rather than decided by
+    /// nudging a constant to make a table row green.
+    #[test]
+    fn the_prior_reorders_a_periodic_page_without_confirming_it() {
+        let image = TestImage::from_structures(
+            640,
+            100 * 19,
+            11,
+            19,
+            &[Structure::HorizontalBars { period: 19 }],
+        );
+        let mut script = ScrollScript::new(&image, 900, vec![StepSpec::move_by(19)]);
+        let previous = script.take(0);
+        let current = script.take(1);
+        let candidates = candidates_1d(&previous.view(), &current.view(), 19, 40);
+        let mut scored = scored_once(&previous, &current, &candidates);
+
+        let unweighted = *scored.iter().next().expect("the second layer scored nothing");
+        assert_eq!(
+            unweighted.d, 0,
+            "without P1 the periodic alias wins: 0.687500 against the truth's 0.644539"
+        );
+
+        scored.apply_prior(&Prior::new(19.0), 1);
+        let winner = *scored.iter().next().expect("P1 removed candidates (rule 1)");
+        assert_eq!(winner.d, 19, "the prior did not move the winner to the truth");
+        assert_eq!(scored.len(), CANDIDATE_LIMIT, "P1 must reorder, never discard");
+
+        assert_eq!(
+            winner.prior, 1.0,
+            "the prediction is `n · ĝ = 19`, so the truth is inside the interval"
+        );
+        assert_eq!(unweighted.prior, 1.0, "the set arrives unweighted");
+
+        let truth = scored
+            .iter()
+            .find(|candidate| candidate.d == 19)
+            .expect("the truth is still in the set");
+        assert_ne!(
+            gate_residual_gain(truth.gain),
+            GateOutcome::Pass,
+            "a page shifted by exactly its own period has no residual to reduce"
+        );
+
+        let rival = outside_cell_second(&scored, 19).map(|second| second.ranked());
+        let margin = margin_of(winner.ranked(), rival).expect("both scores are positive");
+        assert!(margin < MIN_MARGIN, "margin {margin} cleared gate four");
+        assert!(
+            matches!(gate_margin(19, Some(margin)), GateOutcome::Reject(_)),
+            "gate four accepted an ambiguous periodic page"
+        );
     }
 }
