@@ -1789,6 +1789,39 @@ impl Gray { fn scaled(view: &ObservationView<'_>, scale: u32) -> Self }        /
 
 **尚未落地**：全分辨率亮度图（每帧 ≈ `W·H` 字节，4K 视口下 8.3 MB）在第 2、3 层各建一次 ⇒ `P1.13` 的 `Scratch` 对第 3 层比第 2 层更值钱（`H_match ≈ H/2` 的条带相关是本漏斗最贵的一件事）。**第 3 层的绝对耗时至今未测**，`E-PERF-1` 的四组合重跑仍是欠账（§23.3.1）。
 
+#### 15.4.4 第 4 层（第二意见）落地的形状（`P1.23`，2026-10-08）
+
+```rust
+pub(crate) const DESCRIPTOR_BYTES: usize = 32;                     // 256 位 rBRIEF
+pub(crate) const FEATURE_LIMIT: usize = 512;
+pub(crate) const ORB_TRIGGER_MARGIN: f32 = 0.25;                   // §15.4 ④ 的三条件之一
+pub(crate) const ORB_TRIGGER_UNCERTAIN: u32 = 3;                   // 同上
+
+pub(crate) struct Keypoint { cross: i32, primary: i32, angle: f32, response: f32 }
+pub(crate) struct Descriptor { bytes: [u8; DESCRIPTOR_BYTES] }
+pub(crate) struct Match { previous: usize, current: usize, distance: u32 }
+pub(crate) enum Vote { Agree { d: i32 }, Disagree { d: i32 }, NoEvidence }
+
+pub(crate) fn should_run(margin: f32, inside_prior: bool, uncertain: u32) -> bool
+pub(crate) fn detect(view: &ObservationView<'_>, limit: usize) -> Vec<Keypoint>
+pub(crate) fn describe(view: &ObservationView<'_>, keypoints: &[Keypoint]) -> Vec<Descriptor>
+pub(crate) fn match_descriptors(previous: &[Descriptor], current: &[Descriptor]) -> Vec<Match>
+pub(crate) fn vote(previous: &ObservationView<'_>, current: &ObservationView<'_>, main: i32) -> Vote
+```
+
+流程：`detect` 按主轴每 **32 px** 一个 tile（整宽）取 FAST-9/16 角点，tile 内按 Harris 响应排序取前 `MAX_FEATURES_PER_TILE = 8` 个；`describe` 按强度质心方向旋转自生成模式做 256 次比较；`match_descriptors` 先 ratio test（`0.8`）再互为最近邻；`vote` 取**位移直方图的众数**（只计 `|d| <= extent`，门一的正确性约束），若众数不足 `CONSENSUS_SHARE = 0.5` 的匹配数 ⇒ `NoEvidence`，否则与 `main` 相差 ≤ `AGREEMENT_TOLERANCE = 1` ⇒ `Agree`，否则 `Disagree`。`NoEvidence` 是**唯一没有数字的变体**，测试用 `let Vote::NoEvidence = … else` 把它钉住：这一层永远不产生会话上报的位移（推论 2.1）。
+
+四处落地决定（`docs/31` §0.6 的 **DEV-32**）：
+
+1. **三处刻意削减，都是"纯平移 + 已知界"的推论**：①**无金字塔**（参考实现的 `LEVELS 8` 买的是尺度不变性，对本问题是无用功且会把成本乘 8；它附带的抗模糊也不需要，因为两帧是同一内容在同一应用里同一缩放下渲染的）②**无预模糊**（参考实现复刻 OpenCV 的 7-tap；投票要的是比较稳定，不是与 OpenCV 逐位相同）③**描述子模式由固定种子生成，不抄 `ORB_PATTERN_BASE64`**（`D-1` 已经决定重写；抄一张没有推导过的表等于引入一段无法解释的数据。BRIEF 原论文本身就是随机采样，这里重要的是模式**固定**——投票是布尔值而不是距离）。**不削减**：FAST-9/16、Harris 响应、强度质心方向、256 位 rBRIEF、每 tile 上限、ratio test、互为最近邻。
+2. **每 tile 的上限是平的，不按几何递减**（对 §15.4 ④ 所引 `docs/29` §3.7 的 `feature_quota` 的有意偏离）。参考实现的配额沿采样计划按 `1/1.2` 递减；配额存在的目的是 `F-03` 的"一个密集区域不能供给整张票"，而**每个 tile 同等封顶**已经做到这件事，递减则额外把选择偏向帧的一端——纯平移问题里没有任何东西说明该偏向哪一端。**实测**（320×900 的混合文档、步进 120）：带递减时 **53 个特征、2 条存活匹配**（投票必然是 `NoEvidence`）；改为平配额后 **224 个特征、157 条匹配**（见第 4 条）。
+3. **投票的平局判据是 `(count desc, |d| asc, d asc)`，直方图用 `BTreeMap`** ⇒ 答案不依赖迭代顺序。同一步里"哪个位移是众数"必须由数据唯一决定，否则 `E-ACC-1` 记录的"投票与主候选是否一致"就不是一个可复现的量。
+4. **`docs/30` 的夹具不能用来判这一层**：`TestImage::from_structures` 用 `y % band_height` 求值（`testkit.rs:179`），所以**每个 band 都是同一段像素**，混合夹具（5 个结构 × 19 行）在 900 px 视口里把同样的 95 行重复 9 次。这种自相似正是 §16.5 的 margin 与 §16.6 的峰族检测要处理的对象，而描述子匹配器**应当**拒绝它。**实测**：混合夹具上 224 个特征、其中 **120 个有真实对应关系、描述子距离为 0**（描述子本身是平移不变的），但 ratio test 只放过 **1** 条匹配 ⇒ `NoEvidence`；换成单 band（`ctx.y` 即绝对行、不重复）的 `NoiseBlocks { cell: 8 }` 文档后 **157 条匹配、直方图 `[(120, 157)]` 全票**。**结论：ORB 的夹具要求与相关性三层的夹具要求不同，`E-ACC-1` 的语料必须包含"有区分度的文档"，否则它会测出一个永远沉默的第二意见。**
+
+**实测（2026-10-08，`docs/Temp/p123-cost.log`）**：一次投票在 **320×900** 上 = **1.53 s（debug）/ 120 ms（release）**。这一层的成本与帧面积成正比，**4K 视口按同一比例约为秒级**（`320×900 = 0.29 Mpx`，`3840×2160 = 8.3 Mpx`，约 29×）。触发率（§16.11：平均每步 < 0.2 次）约束的是**平均**成本，不是**最坏**成本：一个多秒的卡顿发生在会话本就不确定的时刻，用户会感觉到。这是新增的开放项 **`OQ-18`**：要么投票跑在降采样帧上（模式需要改成尺度感知），要么接受这个卡顿，要么把投票限制在重叠区的一个条带上——三条路都要 `E-ACC-1` 的数据才能选。
+
+**尚未落地**：`orb.rs` 的消费者（触发路径与 `uncertain` 计数）属会话组装 `P3.09`；`E-ACC-1` 覆盖"投票与主候选是否一致"这一维度属 `P1.24` 的语料扩展。
+
 ### 15.5 为什么不选相位相关（对子代理推荐路线的独立判断）
 
 本轮外部调研子代理（`a9dd549e`）给出的第一推荐是**相位相关 + 多峰自检**，理由是"代价与位移无关，适合大位移"。**本设计不采纳这条第一推荐**，理由如下（这是需要显式论证的地方，不能无条件采纳）：
@@ -1815,7 +1848,7 @@ impl Gray { fn scaled(view: &ObservationView<'_>, scale: u32) -> Self }        /
 | `H_match` | **`max(16, H_viewport/2)`** | **动态** | 与 §17.2 的 `band` 一致；下限 16 行保证一维序列有足够样本 |
 | 梯度域证据的启用 | **仅当灰度 ZNCC 的 `margin < 0.35`** | 动态 | 梯度图多一次 Sobel；只在主判据不果断时才付这份成本 |
 | 全分辨率精修邻域 | **±1（主轴 3 点）** | 固定 | N3：整数位移，不做亚像素；原表写"共 9 点"，`P1.07` 落地时按"位移只有一个主轴分量"改为 3 点（§15.4.3 决定 3） |
-| 每步 ORB 触发条件 | 见 §15.4 第 4 条 | 动态 | 平均每步 < 0.2 次，把 1739 行量级的代码路径从热路径上挪开 |
+| 每步 ORB 触发条件 | 见 §15.4 第 4 条 | 动态 | 平均每步 < 0.2 次，把 1739 行量级的代码路径从热路径上挪开。**已落地（`P1.23`）**：`should_run(margin, inside_prior, uncertain)` 把三个条件写死在一处，且它**只吃数字不吃帧**（触发判断不读像素）。成本是这一层唯一的悬念：320×900 一次投票 120 ms（release），与面积成正比 ⇒ 4K 约秒级（`OQ-18`） |
 
 **为什么参数这么少**：§3.9 的 Occam 检查。V1 §7.2 有 6 个魔法数（profile 大小、粗搜步长、consensus 带数、候选检查阈值、精修窗口 ±4..8、"边写边算"），**没有一个给出推导**。V2 的每个动态参数都由**闭环已知量**（`n`、`ĝ`）或**前一级输出**（`margin`）决定——它们是同一台机器的信号，不是拍出来的常数。
 
@@ -4334,6 +4367,8 @@ if ($hits) { Write-Error "scroll/ must stay platform-free: $($hits -join '; ')";
 | 低纹理 | 平滑渐变 | 估计器一半分两种机制（§16.4.1 推论 3）：**平坦**页 ⇒ 门三（独立支持者 0）⇒ `None`；**斜坡**页 ⇒ 门二仍 Pass（`gain ≈ 0.54–0.57`）而歧义 ⇒ 门四 ⇒ `Uncertain`。tile 跳过更新是时间层那一半 | L1 | `E-ACC-1` |
 | 逐行完全相等 | 同一帧重复 | `Confirmed, d == 0`（**不进估计器**） | L1 | Stitch Latency |
 | 边界值 `±N/2` | 构造触发未定义分支 | `None`（**绝不返回该值**） | L1 | — |
+| 第二意见投票（`P1.23`） | 有区分度的文档（单 band `NoiseBlocks{8}`）+ `move_by(120)` | 主候选 120 ⇒ `Agree { d: 120 }`；主候选 60 ⇒ `Disagree { d: 120 }`（**证明它不是永远 `NoEvidence`**）；无特征/无匹配 ⇒ `NoEvidence`（**降级不是错误**） | L1 | 一次投票 120 ms @320×900（release；与面积成正比 ⇒ `OQ-18`） |
+| 第二意见拒绝自相似文档（`P1.23`） | `docs/30` 的混合夹具（5 结构 × 19 行 band） | **`NoEvidence`**：224 个特征里 120 个有真实对应且描述子距离为 0，但 ratio 0.8 只放过 1 条匹配（自相似是 §16.5/§16.6 的对象，描述子匹配器**应当**拒绝它） | L1 | — |
 
 **两条 D 类用例的分工**（`P1.11` 的 REFACTOR 义务，已可执行）："边界值 `±N/2`"与"二维周期"都是**门四**这一层能看到的失败，且**都不经过门一**——`gate_geometry`（门一）在这两条用例里从未被调用。它们落在**不同的 `Status`**：`GateRejection::BannedHalf.status() == Status::None`（"测到的位移不可用"）而 `GateRejection::MarginTooSmall { best }.status() == Status::Uncertain { d: best }`（"测到了，但赢家不唯一"）。把这两者混成一个 `None` 就等于把"没有证据"与"证据不足"混为一谈，而 §16.9 的边界值禁令与 §16.5 的唯一性门恰好是这条界线两侧的代表。
 | 门限校准 | `E-ACC-1` 全扫描 | ROC 曲线 + 选定工作点 | L1 | — |
@@ -4923,6 +4958,7 @@ if ($hits) { Write-Error "scroll/ must stay platform-free: $($hits -join '; ')";
 | **OQ-16** | 周期页面上 `|d| == P` 的情形，应该接受"赢家正确但仍 `Uncertain`"，还是放宽 `MIN_MARGIN` / `PRIOR_DOWNWEIGHT` 让它变成 `Confirmed`？ | `P1.14` 实测（§16.6.1 实测 3）：先验把赢家从别名 `d = 0`（score 0.687500）换到真值 `d = 19`，但**门二无残差增益可过**（平移一个周期就是原图，`RMSE(d) == RMSE(0)`）且**门四 margin = 0.040011313**。放宽的唯一途径是让 `1 − PRIOR_DOWNWEIGHT ≥ MIN_MARGIN`，而那会让先验成为判决（§16.6 规则 1），并由用例 `the_prior_is_soft_and_cannot_reject_on_its_own` 断言禁止 | `E-ACC-1` 在**真实长页面语料**（不是合成条纹）上重跑该格：若"赢家正确但 `Uncertain`"在真实页面上的代价只是用户需要重滚一步，就保留现设计并把 §30.3 的期望行固定在今天实测的形态；若代价显著，则改的是 `MIN_MARGIN` 与四门的分工，而不是先验的权重 | §30.3 的"周期纹理（`P == \|d\|`）"行与 §16.6 规则 3；**在定下来之前，不得为了让表格行变绿而调 `PRIOR_DOWNWEIGHT`** |
 
 | **OQ-17** | 估计器的匹配条带应该用 §17.2 的**逐步** `band_height(extent, d)`（含 `shift` 项），还是继续用 §15.6 的 `H_match = max(16, H_viewport/2)`（不含）？ | `P1.18` 落地时发现两处口径不一致：§15.6 的公式没有 `shift`，§17.2 的有，且 §17.2 给出了含 `shift` 的理由（大步长下重叠区会退化成薄条）。今天生产代码实现 §15.6 的形式，因此 `match_band` 把重叠截到 `E − \|d\|`——`P1.13` 的 `mixed-600`（重叠 1/3）与 `P1.01` 的 `move_by(600)`（重叠不足一半）都是这条截断的直接后果 | `E-ACC-1` 的对照实验：把 `match_rows` 换成 `band_height`，在同一语料上比较错误确定率与拒绝率；改动的风险是 `P1.05`–`P1.16` 的**全部实测数字**都是在固定 band 上取得的，重测成本由这个任务承担 | §15.6 与 §17.2 的公式；`DEV-27`；**在定下来之前，`band_height` 只是已落地的纯函数，不接入估计器** |
+| **OQ-18** | 第二意见（ORB）的**最坏**成本可以接受吗？ | `P1.23` 实测（`docs/Temp/p123-cost.log`）：一次投票在 320×900 上 **120 ms（release）**，成本与帧面积成正比 ⇒ 4K（8.3 Mpx，约 29×）**约为秒级**。而 §16.11 的触发率约束的是**平均**每步 < 0.2 次，不是最坏值——一个"连续 3 步 `uncertain`"的周期页面可以让它每步都触发。三条出路：①降采样帧 + 尺度感知的采样模式 ②接受偶尔的秒级卡顿（触发率低，用户感知为"这一步慢了"）③只对重叠区条带投票（面积与 `band` 同阶） | `E-ACC-1` 的语料（`P1.24`）需要同时记录**每次触发的耗时**与**触发率**，才能判定最坏情况是否落在可接受范围内；在此之前不引入金字塔，也不预先降采样（两者都会改变描述子的判别力，属于同一个实验的变量） | §15.4.4 的实测；§16.11 的触发率行；`DEV-32` |
 ### 36.3 明确**不是**开放问题的（已经确定，记录以防反复）
 
 | 已定结论 | 依据 |

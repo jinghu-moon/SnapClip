@@ -606,12 +606,7 @@ impl Gray {
                 let mut sum = 0;
                 for cell_y in 0..scale {
                     for cell_x in 0..scale {
-                        sum += luma_at(
-                            view,
-                            column * scale + cell_x,
-                            row * scale + cell_y,
-                            vertical,
-                        );
+                        sum += luma_at(view, column * scale + cell_x, row * scale + cell_y);
                     }
                 }
                 let cells = scale * scale;
@@ -730,9 +725,14 @@ impl Scratch {
 }
 
 /// One pixel's luma, addressed in the frame's cross/primary terms.
+///
+/// `pub(crate)` since `P1.23`: the ORB second opinion reads the same frame and must read it the same
+/// way. The axis is resolved **here** rather than passed in, so that "cross is x when the axis is
+/// vertical" has exactly one implementation in the crate — a caller cannot get it wrong by passing
+/// the wrong bool.
 #[inline]
-fn luma_at(view: &ObservationView<'_>, cross: u32, primary: u32, vertical: bool) -> u32 {
-    let (x, y) = if vertical {
+pub(crate) fn luma_at(view: &ObservationView<'_>, cross: u32, primary: u32) -> u32 {
+    let (x, y) = if view.axis().is_vertical() {
         (cross, primary)
     } else {
         (primary, cross)
