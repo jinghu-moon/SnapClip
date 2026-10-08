@@ -650,6 +650,66 @@ impl BandStore {
         }
     }
 
+    /// Moves every band back up by `rows` — the inverse of [`Self::shift_rows`], used when a prepend
+    /// is undone (`P1.22`). Like the forward direction it has to move the spilled keys too, or a band
+    /// that was evicted before the undo would come back at the wrong place.
+    pub(crate) fn unshift_rows(&mut self, rows: u64) {
+        if rows == 0 {
+            return;
+        }
+        for entry in &mut self.resident {
+            entry.band.first_row = entry
+                .band
+                .first_row
+                .checked_sub(rows)
+                .expect("a band that starts before the rows being removed cannot be shifted back");
+        }
+        self.resident
+            .sort_unstable_by_key(|entry| entry.band.first_row);
+        let moved: Vec<SpillRef> = std::mem::take(&mut self.spilled)
+            .into_values()
+            .map(|mut spilled| {
+                spilled.first_row = spilled
+                    .first_row
+                    .checked_sub(rows)
+                    .expect("a spilled band that starts before the rows being removed cannot be shifted back");
+                spilled
+            })
+            .collect();
+        for spilled in moved {
+            self.spilled.insert(spilled.first_row, spilled);
+        }
+    }
+
+    /// Drops the band that covers `[0, rows)`. A prepend always inserts exactly one such band
+    /// (`P1.19`), and undoing it removes exactly that band — resident or spilled, because where a band
+    /// happens to live is not part of what a band *is*.
+    pub(crate) fn remove_leading(&mut self, rows: u64) {
+        if let Some(first) = self.resident.first() {
+            if first.band.first_row == 0 {
+                assert_eq!(
+                    first.band.row_count(self.cross_len),
+                    rows,
+                    "the leading band is {} rows, not the {rows} rows this undo removes",
+                    first.band.row_count(self.cross_len)
+                );
+                self.resident.remove(0);
+                self.sync_accounting();
+                return;
+            }
+        }
+        if let Some(spilled) = self.spilled.remove(&0) {
+            assert_eq!(
+                spilled.row_count, rows,
+                "the leading spilled band is {} rows, not the {rows} rows this undo removes",
+                spilled.row_count
+            );
+            self.sync_accounting();
+            return;
+        }
+        panic!("no band starts at row 0: a prepend inserts one, and only an undo of that prepend removes it");
+    }
+
     /// Invariant 7's left-hand side: what is resident **now**.
     pub(crate) fn resident_bytes(&self) -> u64 {
         self.resident
@@ -932,6 +992,53 @@ impl CoverageMap {
         }
         self.last_exclusive += rows;
         self.mark_range(0, rows);
+    }
+
+    /// The inverse of [`Self::insert_rows_at_front`]: drops the first `rows` rows and shifts every
+    /// remaining bit down. Undoing a prepend (`P1.22`) is the only caller.
+    ///
+    /// Both counters are **recounted** rather than decremented, for the same reason [`Self::truncate`]
+    /// recounts: this runs once per user undo, not once per step, and a recount is the version that
+    /// cannot drift. A prepend marks its front covered, so the bits being dropped here are always set
+    /// — but the general shift is written out anyway, because "the caller only ever asks for covered
+    /// rows" is exactly the kind of assumption that stops being true quietly.
+    pub(crate) fn remove_rows_at_front(&mut self, rows: u64) {
+        if rows == 0 {
+            return;
+        }
+        let shift_words = (rows / 64) as usize;
+        let shift_bits = (rows % 64) as u32;
+        let old_words = self.covered.len();
+        let new_words = old_words.saturating_sub(words_for(rows));
+        // From the bottom up, so every source word is read before it is overwritten.
+        for index in 0..new_words {
+            let high = if index + shift_words < old_words {
+                self.covered[index + shift_words]
+            } else {
+                0
+            };
+            let low = if index + shift_words + 1 < old_words {
+                self.covered[index + shift_words + 1]
+            } else {
+                0
+            };
+            self.covered[index] = if shift_bits == 0 {
+                high
+            } else {
+                (high >> shift_bits) | (low << (64 - shift_bits))
+            };
+        }
+        self.covered.truncate(new_words);
+        self.rows_covered = self.covered.iter().map(|word| word.count_ones() as u64).sum();
+        self.last_exclusive = self.last_exclusive.saturating_sub(rows);
+        self.first = if self.rows_covered == 0 {
+            None
+        } else {
+            self.covered
+                .iter()
+                .position(|word| *word != 0)
+                .map(|index| index as u64 * 64 + self.covered[index].trailing_zeros() as u64)
+        };
     }
 
     /// Keeps only the first `rows` rows — §17.6 layer 1's "contiguous prefix". The dropped tail is
@@ -1219,6 +1326,33 @@ impl RecoveredImage {
         Ok(dropped)
     }
 
+    /// The other direction of [`Self::trim_to`]: drops the first `rows` rows and shifts the rest up,
+    /// for undoing a prepend (`P1.22`). Returns the rows removed.
+    ///
+    /// `trim_to` cannot serve here even though both shrink the canvas: a prepend adds rows at the
+    /// **front**, so the rows an undo has to delete are the front ones, and trimming the tail would
+    /// keep the wrong content. Because the undo history is LIFO, a prepend that could not be undone
+    /// would block every earlier undo behind it.
+    ///
+    /// The failure type is `BandError` only so that `undo_last` has a single error type; nothing here
+    /// can fail today.
+    pub(crate) fn remove_prefix(&mut self, rows: u64) -> Result<u64, BandError> {
+        assert!(
+            rows > 0,
+            "removing zero rows is not an undo; the caller's mark says how many the prepend added"
+        );
+        assert!(
+            rows < self.primary_len,
+            "removing {rows} of {} rows would leave no canvas at all",
+            self.primary_len
+        );
+        self.bands.remove_leading(rows);
+        self.bands.unshift_rows(rows);
+        self.primary_len -= rows;
+        self.coverage.remove_rows_at_front(rows);
+        Ok(rows)
+    }
+
     fn protected_rows(&self, reference: Option<(i64, u64)>) -> Vec<u64> {
         let mut protected = Vec::new();
         if let Some((position, extent)) = reference {
@@ -1323,9 +1457,24 @@ impl RecoveredImage {
 /// Nothing here decides *whether* a step is confirmed — that is the four gates' business (§16.1).
 /// This type decides what a confirmed step **does**, which is why `Contained` is a first-class
 /// answer rather than an append that happens to write nothing.
+///
+/// It also owns the undo history (§19.6; `P1.22`), because it is the only thing that knows both the
+/// viewport position and the canvas. The history is not a log of pixels: it records the canvas length
+/// each write started from, and the canvas is append-only, so undoing is arithmetic — no copy, no
+/// re-encode, nothing to keep in sync. That is what makes the feature free, and it is why the marks
+/// are only pushed when a step actually **wrote** something.
 pub(crate) struct ViewportState {
     position: i64,
     extent: u32,
+    history: Vec<StepMark>,
+}
+
+/// What one write has to be undone with: the canvas length before it, and how many rows it put in
+/// front of the rest (`0` for an append, which is the common case).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StepMark {
+    primary_len: u64,
+    prepended: u64,
 }
 
 impl ViewportState {
@@ -1334,6 +1483,7 @@ impl ViewportState {
         Self {
             position: 0,
             extent,
+            history: Vec::new(),
         }
     }
 
@@ -1383,13 +1533,24 @@ impl ViewportState {
         let max_position = canvas.max_position(self.extent as u64);
         let write = if candidate < 0 {
             let rows = (-candidate) as u64;
+            let before = canvas.primary_len();
             let write = canvas.prepend_confirmed(frame, rows);
             self.position = 0;
+            self.history.push(StepMark {
+                primary_len: before,
+                prepended: rows,
+            });
             write
         } else if candidate > max_position {
             let rows = (candidate - max_position) as u64;
             let write = canvas.append_confirmed(frame, rows);
             self.position = candidate;
+            if let StepWrite::Appended { first_row, .. } = write {
+                self.history.push(StepMark {
+                    primary_len: first_row,
+                    prepended: 0,
+                });
+            }
             write
         } else {
             let bottom = candidate + self.extent as i64;
@@ -1404,6 +1565,31 @@ impl ViewportState {
         canvas.relieve(Some((self.position, self.extent as u64)))?;
         Ok(write)
     }
+
+    /// Undoes the most recent write: `true` if there was one, `false` if the history is empty.
+    ///
+    /// The viewport **position does not move back** (§19.6 lists what an undo restores, and the
+    /// position is not on the list). The position is a fact about the screen, not a bookmark into the
+    /// canvas: rewinding it while the screen stayed where it is would make the next step append the
+    /// rows it can see *after* a canvas that no longer reaches them — a hole. Left alone, the next
+    /// step's arithmetic is still correct, because a step is only ever confirmed when the frame
+    /// overlaps the canvas, and an overlapping frame's new rows are always `<= extent`.
+    ///
+    /// It also does not touch `ĝ` (§19.6 constraint 2), and it cannot: `ĝ` lives in `Prior`, which is
+    /// not reachable from here. The estimate is a property of the machine; an undo is an intention of
+    /// the user, and letting the second write back into the first would poison the P1 prior with
+    /// something that is not an observation.
+    pub(crate) fn undo_last(&mut self, canvas: &mut RecoveredImage) -> Result<bool, BandError> {
+        let Some(mark) = self.history.pop() else {
+            return Ok(false);
+        };
+        if mark.prepended == 0 {
+            canvas.trim_to(mark.primary_len)?;
+        } else {
+            canvas.remove_prefix(mark.prepended)?;
+        }
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
@@ -1414,7 +1600,7 @@ mod tests {
     };
     use crate::geometry::Rect;
     use crate::scroll::displacement::{
-        Scratch, Status, candidates_1d, refine_winner, score_candidates_2d, zero_shift_status,
+        Prior, Scratch, Status, candidates_1d, refine_winner, score_candidates_2d, zero_shift_status,
     };
     use crate::scroll::observation::{Axis, Observation};
     use crate::scroll::testkit::{ScrollScript, StepSpec, Structure, TestImage};
@@ -2422,6 +2608,254 @@ mod tests {
         assert_eq!(
             base_bytes, chatty_bytes,
             "the warn threshold changed the pixels, so it is not a UI parameter"
+        );
+    }
+
+    // --- undo: the append-only write order makes it free (§19.6; task P1.22) ---
+
+    /// Ten confirmed appends, then one undo. The canvas has to go back to the ninth step's state —
+    /// not "approximately": `primary_len`, the bands, the coverage and the bytes are all checked.
+    #[test]
+    fn undo_returns_to_the_previous_step_and_deletes_later_bands() {
+        const STEPS: u64 = 10;
+        let image = TestImage::from_structures(
+            CROSS_PX,
+            DOC_ROWS + (STEPS * STEP as u64) as u32,
+            11,
+            19,
+            &mixed(),
+        );
+        let mut script = ScrollScript::new(
+            &image,
+            VIEWPORT,
+            (0..STEPS).map(|_| StepSpec::move_by(STEP)).collect(),
+        );
+        let mut canvas = RecoveredImage::new(
+            Axis::Vertical,
+            CROSS_PX as u64,
+            MemoryBudget::with_total(VIEWPORT_BUDGET),
+        );
+        let mut viewport = ViewportState::new(VIEWPORT);
+        let first = script.take(0);
+        canvas.start(&first);
+        for k in 0..STEPS {
+            let frame = script.take(k as usize + 1);
+            viewport
+                .apply(&mut canvas, &frame, STEP)
+                .expect("inside budget");
+        }
+        let full = VIEWPORT as u64 + STEPS * STEP as u64;
+        assert_eq!(canvas.primary_len(), full);
+        assert_eq!(canvas.rows(0, full).expect("resident"), document_rows(&image, 0, full as u32));
+
+        assert!(
+            viewport.undo_last(&mut canvas).expect("resident bands"),
+            "ten committed steps leave nine things to undo"
+        );
+
+        let ninth = VIEWPORT as u64 + (STEPS - 1) * STEP as u64;
+        assert_eq!(
+            canvas.primary_len(),
+            ninth,
+            "undo steps the canvas back by the last step's rows"
+        );
+        assert_eq!(
+            canvas.rows(0, ninth).expect("resident"),
+            document_rows(&image, 0, ninth as u32),
+            "the remaining canvas is still the document, row for row"
+        );
+        assert!(
+            canvas
+                .bands()
+                .bands()
+                .all(|band| band.end_row(CROSS_PX as u64) <= ninth),
+            "a band past the new end survived the undo: {:?}",
+            canvas
+                .bands()
+                .bands()
+                .map(|band| (band.first_row, band.end_row(CROSS_PX as u64)))
+                .collect::<Vec<_>>()
+        );
+        canvas.assert_invariants(
+            CROSS_PX as u64,
+            StepTally {
+                step: STEPS,
+                committed: STEPS,
+                discarded: 0,
+            },
+        );
+    }
+
+    /// Undo is a **user** action about the canvas; `ĝ` is a **physical** property of the machine
+    /// (§19.6 constraint 2). Neither direction of influence is allowed: undo must not learn from the
+    /// step it removed, and it must not rewind the estimate to the value the step replaced.
+    ///
+    /// The structural half of this is that `undo_last` has no `Prior` parameter — there is nothing to
+    /// pass it to. This test is the other half: the value has to still be there afterwards.
+    #[test]
+    fn undo_does_not_touch_the_learned_estimate() {
+        let image = TestImage::from_structures(CROSS_PX, DOC_ROWS, 11, 19, &mixed());
+        let mut script = ScrollScript::new(
+            &image,
+            VIEWPORT,
+            vec![StepSpec::move_by(STEP), StepSpec::move_by(STEP)],
+        );
+        let mut canvas = RecoveredImage::new(
+            Axis::Vertical,
+            CROSS_PX as u64,
+            MemoryBudget::with_total(VIEWPORT_BUDGET),
+        );
+        let mut viewport = ViewportState::new(VIEWPORT);
+        let mut prior = Prior::new(100.0);
+        canvas.start(&script.take(0));
+
+        viewport
+            .apply(&mut canvas, &script.take(1), STEP)
+            .expect("inside budget");
+        assert!(prior.confirm(1, STEP), "one notch is an observation");
+        let after_first = prior.px_per_notch();
+
+        viewport
+            .apply(&mut canvas, &script.take(2), STEP)
+            .expect("inside budget");
+        assert!(prior.confirm(1, STEP));
+        let after_second = prior.px_per_notch();
+        assert_ne!(
+            after_first, after_second,
+            "the fixture has to move the estimate, or this test proves nothing"
+        );
+
+        assert!(viewport.undo_last(&mut canvas).expect("resident bands"));
+        assert_eq!(
+            prior.px_per_notch(),
+            after_second,
+            "undo changed the learned estimate: user intent must not write back into the physical model"
+        );
+        assert_ne!(
+            prior.px_per_notch(),
+            after_first,
+            "undo rewound the estimate to the value the removed step replaced, which is the same pollution in the other direction"
+        );
+    }
+
+    /// Exit condition ③: undoing every step has to leave the canvas exactly as `start` left it — and
+    /// then say so, rather than reporting a successful undo that removed nothing.
+    #[test]
+    fn undoing_every_step_returns_the_canvas_to_its_initial_state() {
+        const STEPS: u64 = 10;
+        let image = TestImage::from_structures(
+            CROSS_PX,
+            DOC_ROWS + (STEPS * STEP as u64) as u32,
+            11,
+            19,
+            &mixed(),
+        );
+        let mut script = ScrollScript::new(
+            &image,
+            VIEWPORT,
+            (0..STEPS).map(|_| StepSpec::move_by(STEP)).collect(),
+        );
+        let mut canvas = RecoveredImage::new(
+            Axis::Vertical,
+            CROSS_PX as u64,
+            MemoryBudget::with_total(VIEWPORT_BUDGET),
+        );
+        let mut viewport = ViewportState::new(VIEWPORT);
+        let first = script.take(0);
+        canvas.start(&first);
+        let initial = canvas.rows(0, VIEWPORT as u64).expect("resident");
+        for k in 0..STEPS {
+            let frame = script.take(k as usize + 1);
+            viewport
+                .apply(&mut canvas, &frame, STEP)
+                .expect("inside budget");
+        }
+
+        for remaining in (0..STEPS).rev() {
+            assert!(viewport.undo_last(&mut canvas).expect("resident bands"));
+            assert_eq!(
+                canvas.primary_len(),
+                VIEWPORT as u64 + remaining * STEP as u64
+            );
+        }
+
+        assert_eq!(canvas.primary_len(), VIEWPORT as u64, "the canvas is one viewport again");
+        assert_eq!(canvas.bands().bands().count(), 1, "the initial canvas is one band");
+        assert_eq!(canvas.rows(0, VIEWPORT as u64).expect("resident"), initial);
+        assert_eq!(canvas.coverage.span_start(), 0);
+        assert_eq!(canvas.coverage.span_end(), VIEWPORT as u64);
+        assert_eq!(canvas.coverage.rows_covered(), VIEWPORT as u64);
+        canvas.assert_invariants(
+            CROSS_PX as u64,
+            StepTally {
+                step: STEPS,
+                committed: STEPS,
+                discarded: 0,
+            },
+        );
+        assert!(
+            !viewport.undo_last(&mut canvas).expect("resident bands"),
+            "there is nothing left to undo, and saying otherwise would let the UI report an undo that did nothing"
+        );
+        assert_eq!(canvas.primary_len(), VIEWPORT as u64, "a refused undo changes nothing");
+    }
+
+    /// A **prepend** is not a rollback of `span_end`, so it needs its own direction: the rows it added
+    /// are at the front. Without this, an upward scroll would block every earlier undo, because the
+    /// history is LIFO.
+    #[test]
+    fn undoing_a_prepend_removes_the_rows_it_added() {
+        const DOC: u32 = 2400;
+        const START: u32 = 400;
+        let image = TestImage::from_structures(CROSS_PX, DOC, 11, 19, &mixed());
+        let mut script = ScrollScript::starting_at(
+            &image,
+            VIEWPORT,
+            START,
+            vec![StepSpec::move_by(300), StepSpec::move_by(-600)],
+        );
+        let mut canvas = RecoveredImage::new(
+            Axis::Vertical,
+            CROSS_PX as u64,
+            MemoryBudget::with_total(VIEWPORT_BUDGET),
+        );
+        let mut viewport = ViewportState::new(VIEWPORT);
+        canvas.start(&script.take(0));
+        let second = script.take(1);
+        viewport
+            .apply(&mut canvas, &second, 300)
+            .expect("inside budget");
+        let appended = canvas.rows(0, 1200).expect("resident");
+        let third = script.take(2);
+        assert_eq!(
+            viewport
+                .apply(&mut canvas, &third, -600)
+                .expect("inside budget"),
+            StepWrite::Prepended { rows: 300 }
+        );
+        assert_eq!(canvas.primary_len(), 1500);
+
+        assert!(viewport.undo_last(&mut canvas).expect("resident bands"));
+        assert_eq!(
+            canvas.primary_len(),
+            1200,
+            "undoing a prepend removes the rows at the front, not the rows at the back"
+        );
+        assert_eq!(
+            canvas.rows(0, 1200).expect("resident"),
+            appended,
+            "the canvas before the prepend has to come back byte for byte"
+        );
+        assert_eq!(canvas.coverage.span_start(), 0);
+        assert_eq!(canvas.coverage.span_end(), 1200);
+        assert_eq!(canvas.coverage.rows_covered(), 1200);
+        canvas.assert_invariants(
+            CROSS_PX as u64,
+            StepTally {
+                step: 2,
+                committed: 2,
+                discarded: 0,
+            },
         );
     }
 }

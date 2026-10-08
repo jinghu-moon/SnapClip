@@ -2387,6 +2387,8 @@ impl RecoveredImage { fn assert_invariants(&self, viewport_cross: u64, tally: St
 
 **`P1.19` 补充：prepend 是这套结构唯一会动锚点的操作。** 覆盖区间锚在 0（不变量 2），所以"在顶部插入 `rows` 行"必须是一次**真位图位移**（`CoverageMap::insert_rows_at_front`：`shift_words` 整字搬、`shift_bits` 逐位搬，`shift_bits == 0` 单独分支避免 `>> 64`），随后 `mark_range(0, rows)`；`BandStore::shift_rows` 同步把所有条带的 `first_row += rows`。**刻意不引入"前置了多少行"的偏差字段**——那会让锚点同时出现在位图与偏差里，而不变量 2 只能钉住其中一个。代价是每次 prepend 一次 O(rows/64 + bands) 的搬移，而 prepend 是回滚到画布顶部才发生的事（不是每步）。
 
+**`P1.22` 补充：撤销 prepend 是同一套搬移的逆运算。** `CoverageMap::remove_rows_at_front` 把每个位向下移 `rows`（从低位往高位搬，与前者的方向相反），`BandStore::unshift_rows` 把所有 `first_row -= rows`（**含 `spilled` 的键**，否则一条在撤销前被换出的条带会回到错误的位置），`BandStore::remove_leading` 删掉恰好覆盖 `[0, rows)` 的那一条。这两个方向都用"重算 `rows_covered`"而不是增量减法：它们每次**用户撤销**才跑一次（不是每步），而重算是不会漂移的版本——O(1) 的规则属于每步都跑的 `mark_range`。两个方向都成对存在，所以"prepend 之后画布与 prepend 之前逐字节相同"是可测的（`undoing_a_prepend_removes_the_rows_it_added`）。
+
 ### 17.2 条带（band）与 overlap
 
 **术语对齐**：§15.1 的 `match_region` 是**匹配用**的条带；本节的 `band` 是**写入用**的条带。两者高度取值相同（`H_match`），因为匹配的正是即将被写入的那块内容——**这不是巧合，而是设计选择**：让匹配区域与写入区域一致，可以避免"匹配算的是一块、写的是另一块"这类错位。
@@ -3003,6 +3005,42 @@ enum PreviewUpdate {
 4. **用户可以撤销到"任意已确认的步"**，但 **UI 只暴露"撤销上一步"**（重复按可连撤）。理由：§19.2 的面板是缩略视图，让用户在缩略图上精确点到第 37 步是糟糕的交互；连按是最小且足够的操作。
 
 **为什么这是净增量**：§6 F-16 的对照里，**PixPin / Snow Shot / ShareX / Snagit 都不提供滚动过程中撤销已拼接内容**（PixPin 的"长截图自动裁剪"是**滚动方向改变时自动裁剪**，且是会员功能——它裁的是"多滚的部分"，不是"用户主动撤销已确认内容"）。而"旧像素优先"让 V2 **几乎免费地**获得它。这是我拒绝行覆盖（§17.3）的一个额外正收益，须在此记录。
+
+#### 19.6.1 落地的形状（P1.22，2026-10-08）
+
+撤销栈落在 **`ViewportState`** 而不是 `ScrollSession`：`session.rs` 属 P3 的会话组装（§35），而 `ViewportState` 是今天唯一同时知道"视口在哪"与"画布多长"的对象。`ScrollSession` 落地时把栈搬过去是一次纯搬运。
+
+```rust
+pub(crate) struct ViewportState {
+    position: i64,
+    extent: u32,
+    history: Vec<StepMark>,      // 每步一个 u64 + 一个 u64，§19.6 的"成本可忽略"是可执行的
+}
+
+/// 一次写入要用什么来撤销：写之前的画布长度，以及它在其余行**前面**插入了几行（append 为 0）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StepMark { primary_len: u64, prepended: u64 }
+
+impl ViewportState {
+    pub(crate) fn undo_last(&mut self, canvas: &mut RecoveredImage) -> Result<bool, BandError>;
+}
+
+impl RecoveredImage {
+    /// `trim_to` 的反方向：删掉前 `rows` 行并把其余行上移（撤 prepend）。
+    pub(crate) fn remove_prefix(&mut self, rows: u64) -> Result<u64, BandError>;
+}
+```
+
+四处落地裁决：
+
+1. **只记录真的写了东西的步**（`Appended` / `Prepended`）。`Contained` 与 `Skipped` 不压栈：它们没有改变任何像素，而撤销**不移动 `position`**，所以撤一个 `Contained` 是一次空操作——记录它只会让"按了撤销但什么都没变"变成正常输出。
+2. **`position` 不回退**（§19.6 ③ 列的是 `span_end`、`primary_len` 与预览长度，没有它）。`position` 是**屏幕的事实**，不是画布里的书签：屏幕还在文档第 1200 行处而画布已缩回 900 行时，若把 `position` 也回退，下一步就会把 1020..1140 的内容接到 900 行之后——**制造一个空洞**。保持 `position` 则 `candidate = position + d` 依然正确，因为一步只有在帧与画布**有重叠**时才会被确认（无重叠 ⇒ `None`），而重叠帧新增的行数恒 `≤ extent`（`append_confirmed` 的断言已兜住这一条）。
+3. **撤销 prepend 需要自己的方向**。撤销栈是 LIFO，所以"撤不了 prepend"会**堵住它之前的所有撤销**。`trim_to` 删的是尾部，prepend 加的是头部 ⇒ 新增 `remove_prefix` + `CoverageMap::remove_rows_at_front`（`insert_rows_at_front` 的逆位图位移）+ `BandStore::unshift_rows`（`shift_rows` 的逆，resident 与 spilled 键一起回移）+ `BandStore::remove_leading`（删掉恰好覆盖 `[0, rows)` 的那一条，常驻或落盘都算——条带在哪里驻留不是"条带是什么"的一部分）。
+4. **`undo_last` 没有 `Prior` 参数**，这是约束 2 的**编译期**形式：`ĝ` 在 `Prior` 里，从这里够不着，所以"撤销既不学习、也不回卷"不是纪律而是类型。测试 `undo_does_not_touch_the_learned_estimate` 断言两个方向（撤销后 `px_per_notch()` 仍等于撤销前的值，**且不等于**被撤那一步替换掉的值）。
+
+退出条件 ③（连续撤销到第 0 步后与初始状态一致）的可执行形式 = `undoing_every_step_returns_the_canvas_to_its_initial_state`：10 步全撤后 `primary_len == viewport`、只剩一条条带、`rows(0, viewport)` 与初始帧逐字节相等、coverage 恰为 `0..viewport`、八条不变量成立，**再撤一次返回 `false` 且什么都不改**（UI 不会报告一次什么都没撤的撤销）。"撤销是真的"另由 `undoing_a_prepend_removes_the_rows_it_added` 证明：撤 prepend 后画布与 prepend **之前**逐字节相同（而不是"行数对了"）。
+
+**尚未落地**：预览长度（§19.3 的 `PreviewStream`，`P2.06`+）随撤销一起回退——今天没有预览，所以约束 3 只有两项可执行；UI 的"撤销上一步"按钮与连按去抖属 §19.7 的覆盖层。
 
 ### 19.7 UI 的布局与"不做什么"
 
@@ -4314,7 +4352,7 @@ if ($hits) { Write-Error "scroll/ must stay platform-free: $($hits -join '; ')";
 | `band_height` 推导 | `shift` 从 0 到 `extent` | `overlap ≥ extent/4` 恒成立 | L1 | 已可执行（`P1.18`，`shift ∈ [−extent, extent]`） |
 | 双向扩展 | 先下滚再上滚 | 正确 `Prepend`；不产生 gap/重复 | L1 | 已可执行（`P1.19`） |
 | `Contained` | 小幅回滚完全落在已覆盖区 | 识别为 `Contained`；不写重复内容 | L1 | 已可执行（`P1.19`，用例先证明两帧字节不同） |
-| 撤销一步 | 提交 10 步后 `undo` | 回退到第 9 步状态；`primary_len` 回退 | L1 | — |
+| 撤销一步 | 提交 10 步后 `undo` | 回退到第 9 步状态；`primary_len` 回退 | L1 | 已可执行（`P1.22`） |
 | 条带换出 | 预算注入成 1 个条带 | 峰值不随长度增长；恢复后逐字节正确 | L1 | **Memory**；已可执行（`P1.20`，10 条条带 + 1 条预算：9 条落盘、读完仍逐字节相等） |
 | 上限三层 | `MAX_LONG_IMAGE_PIXELS` 注入 1/10 | `Partial` 且**是合法 PNG** | L1+L2 | **Memory**；前两层已可执行（`P1.21`：注入 1000 行 ⇒ 裁到 1000、丢 20 行、前缀逐字节等于文档、阈值改变不影响任何像素）；**PNG 解码回读属 `P4.02`/`P4.05`** |
 | 流式导出 | 30,000 px 高 | 严格递增校验；乱序返回错误 | L2 | **Stitch Latency** |
