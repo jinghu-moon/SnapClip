@@ -4283,6 +4283,35 @@ test result: FAILED. 0 passed; 1 failed; 496 filtered out; finished in 0.00s
 
 `GetCursorPos` 失败（`scroll_probe.rs:479`，**改动前就有的代码**）与 §24.5.1 的 `GetForegroundWindow() == NULL` 是同一个条件：运行时会话不是可交互桌面（锁定或断开）。⇒ **产品臂的四行矩阵本次没有测到**，记录为"未取得"而不是"通过"。解除条件 = 在未锁定的桌面上跑一次 `cargo test -p snapclip-capture --lib inject_matrix_probe -- --ignored --nocapture --test-threads=1`。设计不依赖它：`scroll_actuator` 的 **11 条 L1 用例**在无桌面下全绿（`cargo test -p snapclip-capture --lib scroll_actuator -- --test-threads=1` = 11 passed / 0 failed）——它们全部经 `InjectionTarget` 的脚本化实现运行，不触平台。
 
+#### 24.6.4 条件选择的落地（`P3.02`，2026-10-09）
+
+本节把 §24.6 的两条判定规则落成**一处可遍历的表**，并回答一个 §24.6 没有写、但实现必须回答的问题：**谁放光标**。
+
+```rust
+pub(crate) enum WheelRouting { Focus, Hybrid, MousePosition, Unknown }
+impl WheelRouting { pub(crate) const ALL: [Self; 4]; }   // 让判定表能被遍历，而不是抽点
+
+pub(crate) struct TargetProbe {
+    pub(crate) target_is_elevated: bool,
+    pub(crate) self_is_elevated: bool,
+    pub(crate) target_is_foreground: bool,
+    pub(crate) routing: WheelRouting,   // SPI_GETMOUSEWHEELROUTING，会话开始时读一次
+}
+
+pub(crate) struct Choice { path: InjectPath, aim: Aim }   // 私有字段 + 访问器
+pub(crate) fn choose(probe: &TargetProbe) -> Choice;
+```
+
+**三处落地裁决**：
+
+1. **`choose` 返回 `Choice { path, aim }`，而不是裸 `InjectPath`**。`SPI_GETMOUSEWHEELROUTING` 是 `P0.07` 要求读的运行期输入（`F-15`：用户可改），如果它不影响任何决策，那它就是一条没有读者的探测——而 §24.6 只说"`SendInput` 会打到光标所在的窗口"，没说"所以要不要先把光标放过去取决于路由值"。落地形状是：`PostMessageW` ⇒ 恒 `AssumePlaced`（它指名窗口，指针无关）；`SendInput` + `MousePosition` ⇒ `PlaceCursor`（**瞄准就是注入本身**）；`SendInput` + `Focus` ⇒ `AssumePlaced`（目标已拥有前台 ⇒ 聚焦窗口就是目标，移动指针是未被请求的副作用）；`SendInput` + `Hybrid` ⇒ `PlaceCursor`（混合投递里有一半需要瞄准）；`SendInput` + `Unknown` ⇒ `PlaceCursor`（**读不到的设置不是跳过瞄准的许可**）。
+2. **类型叫 `TargetProbe`，不叫 `ScrollTarget`/`Probe`**。§24.6 的伪代码写的是 `target: &ScrollTarget, probe: &Probe`，但仓库里两个类型都不存在，而且它们描述的**不是同一件事**：`ScrollTarget` 是"我们要滚谁"（身份，属 `App`，§9.2），`TargetProbe` 是"平台刚刚告诉我们什么"（四个布尔/枚举的事实）。判定表的输入是后者，所以类型名必须说后者。把身份混进来会让这张表需要窗口句柄才能测。
+3. **判定表"只有一处"是一个可核对的机械事实**，不是纪律。`the_decision_table_is_in_one_place` 用 `include_str!("scroll_actuator.rs")` 取 `#[cfg(test)]` 之前的**生产半区**，断言 `fn choose` 出现 **1** 次、`target_is_elevated` 与 `self_is_elevated` 各出现 **2** 次（一次是字段声明、一次是判定）。这两个字段名**就是**判定表的输入，所以将来谁在别处重新推导路径，就必须先命名它们——而命名就会让这条测试变红。
+
+**"不是 fallback"被写成了一条测试**（REFACTOR 义务）：`the_transport_is_decided_not_retried` 断言"前台且非提权的目标在**任何**路由值下都必须是 `SendInput`"。这条与四组表是**互补**的：如果将来有人把 `PostMessageW` 改成 `SendInput` 失败后的重试，四组表仍然会全绿（那条路径上 `SendInput` 本来就是首选），只有这条会红。
+
+**为什么这不是"先试 A 再退 B"**（§24.6 约束 ① 的可执行读法）：`SendInput` 的落点由系统路由规则决定，不由我们决定。在 `MousePosition` 下它落到**光标所在窗口**——而光标是用户的。所以"先试一下"的代价不是一次无效调用，而是**滚了别人的窗口**（2026-10-08 实测：非前台目标滚了 400 px，当时真正拥有前台的我们自己的夹具消费 0 px）。重试在这里没有可观测的失败信号，只有已经发生的副作用。
+
 ### 24.7 遮挡、前后台与"注入是否真的生效"
 
 **遮挡**（分两种，行为完全不同）：
@@ -4866,7 +4895,7 @@ fn rows_match(actual, expected, sigma) -> bool
 | `PostMessageW` 生效 | 目标非前台 | 位移 ≥ 40 px | L3 | Scroll Response |
 | Chromium 子窗口下沉 | Chrome 页面 | 生效（`E-INJECT-1`） | L3 | — |
 | UIPI 目标 | 提权记事本 | 选 `PostMessageW`；生效 | L3 | — |
-| 条件选择 | 前台/非前台 × 提权/非提权 4 组 | 与 §24.6 一致 | L2 | — |
+| 条件选择 | 前台/非前台 × 提权/非提权 4 组 | 与 §24.6 一致 | L2 | **已可执行（`P3.02`）**：`the_four_combinations_match_the_table` + `a_non_foreground_target_never_uses_send_input`（16 组全扫）+ `the_transport_is_decided_not_retried` + `the_aim_follows_the_routing_setting`，见 §24.6.4 |
 | 注入失败后切路径 | mock 连续 3 次 `Posted` 但 `d==0` | 切换路径 + `InjectPathSwitched` | L2 | — |
 | 两条路径都失败 | mock 双方各 3 次无效 | `ActuatorFailed` + `Partial` | L2 | — |
 | 平滑滚动等待 | 内容持续移动 3 帧 | 等到静止才估计 | L2 | Scroll Response |

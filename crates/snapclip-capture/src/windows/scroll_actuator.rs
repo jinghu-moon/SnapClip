@@ -106,6 +106,111 @@ pub(crate) enum InjectPath {
     PostMessageW,
 }
 
+/// Where a `SendInput` wheel event lands, as far as the system is concerned.
+///
+/// `SPI_GETMOUSEWHEELROUTING` (`winuser.h:5319`). It is a **user-changeable**
+/// setting (`F-15`), so it is a run-time input and never a compile-time constant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WheelRouting {
+    /// `0`: the wheel goes to the **focused** window.
+    Focus,
+    /// `1`: the wheel goes to the window under the cursor *and* to the focused
+    /// window — the documented "hybrid" case.
+    Hybrid,
+    /// `2`: the wheel goes to the window **under the cursor**. Measured on this
+    /// machine on 2026-10-08 (`docs/30` §24.6 rule 1).
+    MousePosition,
+    /// The setting could not be read, or is a value we do not recognise.
+    Unknown,
+}
+
+impl WheelRouting {
+    /// Every routing value, so the decision table can be swept instead of
+    /// spot-checked.
+    pub(crate) const ALL: [Self; 4] = [Self::Focus, Self::Hybrid, Self::MousePosition, Self::Unknown];
+}
+
+/// What the session knows about the target before it injects anything.
+///
+/// Deliberately plain data: the *producer* (integrity levels, the foreground
+/// window, `SPI_GETMOUSEWHEELROUTING`) is platform code, and keeping it on the
+/// other side of this struct is what makes the table testable without a desktop
+/// (`docs/30` §29.2, G9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TargetProbe {
+    /// The target runs at a higher integrity level than this process.
+    pub(crate) target_is_elevated: bool,
+    /// This process is elevated.
+    pub(crate) self_is_elevated: bool,
+    /// The target currently owns the foreground.
+    pub(crate) target_is_foreground: bool,
+    /// `SPI_GETMOUSEWHEELROUTING`, read at session start.
+    pub(crate) routing: WheelRouting,
+}
+
+/// The decision: which transport, and who aims.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Choice {
+    path: InjectPath,
+    aim: Aim,
+}
+
+impl Choice {
+    pub(crate) fn path(self) -> InjectPath {
+        self.path
+    }
+
+    pub(crate) fn aim(self) -> Aim {
+        self.aim
+    }
+}
+
+/// Decide the transport **once**, before anything is injected.
+///
+/// This is not a fallback chain. `SendInput` lands wherever the routing rule
+/// says — under `MOUSE_POS` that is the window under the cursor, which the user
+/// owns — so "try it and see" is not available: by the time the content fails to
+/// move, we have already scrolled somebody else's window (`docs/30` §24.6).
+///
+/// Two rules, in order:
+///
+/// 1. **Integrity**: a lower-integrity sender cannot drive a higher-integrity
+///    window by either path (measured, `docs/30` §24.6.2 conclusion 6 — `UIPI`
+///    rejects the post with `ERROR_ACCESS_DENIED` and swallows the input), so the
+///    choice between them is about which failure is more legible, and a refused
+///    post is legible while a swallowed `SendInput` is not.
+/// 2. **Foreground**: a target that does not own the foreground cannot be
+///    reached deterministically through the input queue, under any routing value
+///    — so it gets the path that names its window.
+///
+/// The aim is not a second decision table: it follows from the routing setting,
+/// and it only exists for `SendInput`.
+pub(crate) fn choose(probe: &TargetProbe) -> Choice {
+    let path = if probe.target_is_elevated && !probe.self_is_elevated {
+        InjectPath::PostMessageW
+    } else if !probe.target_is_foreground {
+        InjectPath::PostMessageW
+    } else {
+        InjectPath::SendInput
+    };
+
+    let aim = match (path, probe.routing) {
+        (InjectPath::PostMessageW, _) => Aim::AssumePlaced,
+        // The wheel follows the cursor, so the aim *is* the injection.
+        (InjectPath::SendInput, WheelRouting::MousePosition) => Aim::PlaceCursor,
+        // The target owns the foreground, so the focused window is the target;
+        // moving the pointer would be an unrequested side effect.
+        (InjectPath::SendInput, WheelRouting::Focus) => Aim::AssumePlaced,
+        // Hybrid delivers to the cursor's window as well as the focused one, so
+        // aiming covers the half that needs it.
+        (InjectPath::SendInput, WheelRouting::Hybrid) => Aim::PlaceCursor,
+        // An unreadable setting is not a licence to skip the aim.
+        (InjectPath::SendInput, WheelRouting::Unknown) => Aim::PlaceCursor,
+    };
+
+    Choice { path, aim }
+}
+
 /// Who places the cursor before a `SendInput` notch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Aim {
@@ -380,7 +485,6 @@ mod tests {
     use super::*;
     use crate::geometry::Rect;
     use std::cell::RefCell;
-
     const ROOT: isize = 0x10;
     const FRAME: isize = 0x20;
     const RENDERER: isize = 0x30;
@@ -755,6 +859,149 @@ mod tests {
             "posting to the frame when the child chain cannot be walked is the exact \
              mistake that makes browsers ignore the message (§24.6 rule 2); refusing is \
              the honest answer"
+        );
+    }
+
+    // --- the decision table (§24.6; task P3.02) ---
+
+    fn probe(
+        target_is_elevated: bool,
+        self_is_elevated: bool,
+        target_is_foreground: bool,
+        routing: WheelRouting,
+    ) -> TargetProbe {
+        TargetProbe {
+            target_is_elevated,
+            self_is_elevated,
+            target_is_foreground,
+            routing,
+        }
+    }
+
+    #[test]
+    fn the_four_combinations_match_the_table() {
+        let routing = WheelRouting::MousePosition;
+        let foreground = |target_is_elevated, self_is_elevated| {
+            choose(&probe(target_is_elevated, self_is_elevated, true, routing)).path()
+        };
+        let background = |target_is_elevated, self_is_elevated| {
+            choose(&probe(target_is_elevated, self_is_elevated, false, routing)).path()
+        };
+
+        assert_eq!(foreground(false, false), InjectPath::SendInput);
+        assert_eq!(
+            foreground(true, true),
+            InjectPath::SendInput,
+            "an elevated sender can drive an elevated window: the barrier is the \
+             difference in integrity, not the level itself"
+        );
+        assert_eq!(foreground(true, false), InjectPath::PostMessageW);
+        assert_eq!(background(false, false), InjectPath::PostMessageW);
+        assert_eq!(background(true, false), InjectPath::PostMessageW);
+        assert_eq!(background(true, true), InjectPath::PostMessageW);
+    }
+
+    #[test]
+    fn a_non_foreground_target_never_uses_send_input() {
+        // The measured reason (§24.6 rule 1, 2026-10-08): under `MOUSE_POS` routing a
+        // `SendInput` wheel goes to the window **under the cursor**, which is not
+        // necessarily the window we mean. Whether that is survivable depends on the
+        // routing setting and on where the user left the pointer — both outside our
+        // control — so the transport is decided, not attempted.
+        for target_is_elevated in [false, true] {
+            for self_is_elevated in [false, true] {
+                for routing in WheelRouting::ALL {
+                    let choice = choose(&probe(
+                        target_is_elevated,
+                        self_is_elevated,
+                        false,
+                        routing,
+                    ));
+                    assert_eq!(
+                        choice.path(),
+                        InjectPath::PostMessageW,
+                        "a non-foreground target was given SendInput under {routing:?} \
+                         (elevated: target={target_is_elevated} self={self_is_elevated})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_aim_follows_the_routing_setting() {
+        let send_input = |routing| choose(&probe(false, false, true, routing));
+
+        assert_eq!(
+            send_input(WheelRouting::MousePosition).aim(),
+            Aim::PlaceCursor,
+            "the wheel follows the cursor, so the aim is part of the injection"
+        );
+        assert_eq!(
+            send_input(WheelRouting::Focus).aim(),
+            Aim::AssumePlaced,
+            "the wheel follows the focused window and the target is focused, so moving \
+             the pointer would be an unrequested side effect"
+        );
+        assert_eq!(
+            send_input(WheelRouting::Hybrid).aim(),
+            Aim::PlaceCursor,
+            "hybrid delivers to the window under the cursor as well; aiming covers that half"
+        );
+        assert_eq!(
+            send_input(WheelRouting::Unknown).aim(),
+            Aim::PlaceCursor,
+            "an unreadable setting is not a licence to skip the aim"
+        );
+        // A post addresses a window, so the pointer is irrelevant to it.
+        assert_eq!(
+            choose(&probe(false, false, false, WheelRouting::MousePosition)).aim(),
+            Aim::AssumePlaced
+        );
+    }
+
+    #[test]
+    fn the_transport_is_decided_not_retried() {
+        // The REFACTOR obligation, as a property rather than a comment: a plain
+        // foreground window never gets `PostMessageW` as its *first* choice, under any
+        // routing setting. If a future edit makes `PostMessageW` a retry of `SendInput`,
+        // this fails while the four-group table above would still pass.
+        for routing in WheelRouting::ALL {
+            assert_eq!(
+                choose(&probe(false, false, true, routing)).path(),
+                InjectPath::SendInput,
+                "a foreground, non-elevated target must be driven through the input \
+                 queue: `PostMessageW` is not a fallback, it is a different answer"
+            );
+        }
+    }
+
+    #[test]
+    fn the_decision_table_is_in_one_place() {
+        // Exit condition 3 of `P3.02`: the table has exactly one home. `TargetProbe`'s
+        // two elevation fields *are* the table's inputs, so if someone re-derives the
+        // path elsewhere they have to name them — which is what this scan notices.
+        let source = include_str!("scroll_actuator.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("the test module is at the end of this file")
+            .0;
+
+        assert_eq!(
+            production.matches("fn choose").count(),
+            1,
+            "the decision table must appear exactly once"
+        );
+        assert_eq!(
+            production.matches("target_is_elevated").count(),
+            2,
+            "`target_is_elevated` is read by the table and declared by the probe struct; \
+             a third mention means the decision is being re-derived somewhere else"
+        );
+        assert_eq!(
+            production.matches("self_is_elevated").count(),
+            2,
+            "`self_is_elevated` is read by the table and declared by the probe struct"
         );
     }
 }
