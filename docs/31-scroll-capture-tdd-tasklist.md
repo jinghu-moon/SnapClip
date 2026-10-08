@@ -94,9 +94,9 @@
 | 新增文件 | 一律先建 `#[cfg(test)]` 测试骨架再建实现（§2.1） |
 | 文档引用 | 一律写 `docs/30 §x.y` 或 `docs/30:<行号>`，**不允许只写"见设计文档"** |
 
-### 0.6 本文对 V2 的补充（**三十四处 deviation，全部已按用户授权回填 `docs/30`**）
+### 0.6 本文对 V2 的补充（**三十五处 deviation，全部已按用户授权回填 `docs/30`**）
 
-> **回填状态**：三十四处（DEV-1…DEV-34）已写入 `docs/30-scroll-capture-design-v2.md`（**未覆盖原文，只做定点增补**）——
+> **回填状态**：三十五处（DEV-1…DEV-35）已写入 `docs/30-scroll-capture-design-v2.md`（**未覆盖原文，只做定点增补**）——
 > DEV-1 → `§28.2` 新增 test-only 文件块（`scroll/testkit.rs`）与"10 生产 + 1 test-only"口径、`§33.3` 文件清单由 9 补为 11（**顺带修正了原文漏列 `orb.rs` 的内部矛盾**）；
 > DEV-2 → `§35 P4` 的 `P4.1` 拆为 `P4.1a`（trait，capture）/ `P4.1b`（实现，shell）并附理由；
 > DEV-3 → `§33.1` 的 `D-10` 拆为 `D-10a`（硬失败）/ `D-10b`（静默降级）、`§24.3` 修正 `wgc.rs:107` 的表述并说明"两种相反失败模式的共同落点"、`§24.8` 的探测用例扩为两条；
@@ -133,6 +133,8 @@
 > **DEV-33** → `§29.3` 的"验收判据"块之后新增 `#### 29.3.1 落地的形状（P1.24）`（装置与五处落地裁决：判据 = 逐行相等 **+ 夹具噪声作为容差**、`wrong` 与 `bytes_wrong` 是两个都要断言的指标、语料不对"向上滚"的步画动态叠加层而把被排除的组合钉成断言、`decide` 是第二处组装且两处共用规则提升到生产半区、对照组 = 第 1 层 + `is_verifiable`；含三行实测表与"覆盖率记录不优化"的说明）（2026-10-08 执行时新增，见下）。
 
 > **DEV-34** → 三处定点改写：`§15.4.1` 的排序裁决由 `(support desc, |d| asc, d asc)` 改为 **`(support desc, |d − expected| asc, |d| asc, d asc)`** 并新增"噪声帧上支持恒为 0 是事实而非缺陷"；`§15.4.3` 新增"**`P1.24` 的修订：半径从 ±1 放宽到 ±2（一个测量 cell）**"整块（含 `grid_point` 的提取与两条 `P1.07` 断言的同步改动）；`§16.11` 的"全分辨率精修邻域"行由"±1（主轴 3 点）"改为"**±2（一个测量 cell，主轴 5 点）**"；`§29.3.1` 的裁决 5 重写（对照换成"去掉第 3 层"与"死先验"）、新增裁决 6、实测表换成七行（含全量网格与四条对照）（2026-10-08 执行时新增，见下）。
+
+> **DEV-35** → `docs/30 §28.4` 之后新增 `#### 28.4.1 落地（P6.07）`：`scroll/` 平台纯度扫描并进既有的 `$failures` 列表（一个门禁一个退出码）、`-Package` 下跳过（保住负对照的单一失败原因）、打印被扫描文件数（"扫了 0 个文件"与"真干净"必须可区分）、今天的文件数（8 个 `.rs`，§28.2 的"10 个生产文件"是目标终态）、门禁自身被证明能失败的原始输出、依赖面无变化（30 包）（2026-10-08 执行时新增，见下）。
 
 | # | 补充 | 为什么必须补 | 回填位置 |
 |---|---|---|---|
@@ -174,6 +176,7 @@
 | **DEV-32**（执行时新增） | `P1.23` 的 GREEN 只说"FAST-9/16 + Harris + 方向 + rBRIEF 256 位 + 每 tile 上限 + 几何递减配额"，而上游 §15.4 ④ 只给了触发条件与"布尔投票"这个产物形状；§16.11 只有一行触发率。四件事没说清：**参考实现的 8 层金字塔要不要**（§15.4 的成本列写了"金字塔"）、**预模糊要不要**（参考实现复刻 OpenCV 的 7-tap）、**采样模式从哪来**（参考实现抄 OpenCV 的 base64 表）、**配额是平还是按几何递减**（`docs/29` §3.7 写 `1/1.2`） | 2026-10-08 执行时做了四处裁决：① **三处刻意削减**——无金字塔（尺度不变性对**已知是纯平移**的问题是无用功，且会把成本乘 8；它附带的抗模糊也不需要，两帧是同一内容在同一应用里同一缩放下渲染的）、无预模糊（投票要的是比较**稳定**，不是与 OpenCV 逐位相同）、模式由**固定种子的 LCG**生成（`ORB_PATTERN_BASE64` 是数据不是代码，但没推导过的表无法解释；BRIEF 论文本身就是随机采样，这里重要的是**固定**——投票是布尔值不是距离）。**不削减**：FAST-9/16、Harris、灰度质心方向、256 位 rBRIEF、每 tile 上限（`F-03` 的失败模式正是"一个密集区域供给整张票"）、ratio test、互为最近邻；② **配额改成每 tile 平 8**（实测否决了 1/1.2 递减：混合夹具上递减给 **53 个特征、2 条存活匹配**（必然 `NoEvidence`），平配额给 **224 个特征**）——配额的目的只是"每 tile 同等封顶"，递减额外把选择偏向帧的一端，而纯平移里没有东西说明该偏向哪一端；③ **众数平局判据 `(count desc, |d| asc, d asc)` + `BTreeMap`** ⇒ 答案不依赖迭代顺序（`E-ACC-1` 要记录"投票与主候选是否一致"，答案必须由数据唯一决定）；④ **`docs/30` 的混合夹具不能用来判这一层**：`TestImage::from_structures` 用 `y % band_height` 求值（`testkit.rs:179`），所以每个 band 是同一段像素，混合夹具（5 结构 × 19 行）在 900 px 视口里重复 9 次 ⇒ 224 个特征里 **120 个有真实对应且描述子距离为 0**（描述子本身平移不变），而 ratio 0.8 只放过 **1** 条匹配 ⇒ `NoEvidence`；判这一层要用**单 band** 的 `NoiseBlocks{8}` 文档（⇒ 157 条匹配、直方图全票 `[(120, 157)]`）。这种自相似正是 §16.5/§16.6 要处理的对象，**描述子匹配器应当拒绝它**。顺带一处小重构：`luma_at` 从"接收 `vertical: bool`"改为"自己解析 `view.axis()`"并放开为 `pub(crate)`（方向规则只有一处）。**未完成项**：`orb.rs` 的消费者（触发路径与 `uncertain` 计数）属会话组装 `P3.09`；成本与面积成正比（320×900 一次投票 120 ms release ⇒ 4K 约秒级）已开 **`OQ-18`**；`E-ACC-1` 覆盖"投票与主候选是否一致"属 `P1.24` 的语料扩展。回填位置 = `docs/30 §15.4.4`（新增）+ `§16.11` 的 ORB 行 + `§30.3` 新增两行 + `§36.1` 的 `OQ-18` + `scroll/mod.rs` 的模块文档头；本文 §6 `P1.23` 的执行块（2026-10-08 执行时新增，见下） |
 | **DEV-33**（执行时新增） | `P1.24` 的 GREEN 写"判据 = 与生成器真值逐行相等"（§29.3），并把 `σ ∈ {0, 2, 5, 10}` 列为扫描维度之一。这两件事**直接冲突**：`testkit.rs:560` 的 `add_noise` 给被步进的那一帧的每个像素加噪声，因此 `σ > 0` 的行上画布**按构造**不可能与干净文档逐行相等。此外三件事没说清：扫描装置放哪、语料怎么构造（§29.3 只给了维度）、以及**第 4 层（ORB）的投票要不要进这个门禁** | 2026-10-08 执行时做了五处裁决：① **判据 = 逐行相等 + 夹具噪声作为容差**（每个颜色通道差 `≤ σ`，alpha 精确相等；`σ = 0` 时即字节相等）。不放宽的话 `σ > 0` 的行永远不可能通过——写路径得凭空造出干净版本。容差不会掩盖错位移（错位移的差远大于 `σ`）；② **`wrong` 与 `bytes_wrong` 是两个都要断言的指标**：周期整除步长的页上别名会写出**完全相同的像素**（实测对照组 8 个 `wrong` 里只有 6 个 `bytes_wrong`）⇒ 只看字节会漏掉错的位移，只看位移会漏掉坏掉的画布；③ **语料不对"向上滚"的步画动态叠加层，且被排除的那一种组合有可执行钉子**：§18.2 的动态区锚在帧的**顶部**（有意的：区域模型测重叠区**底部**的匹配带），而 prepend 写的正是帧的前几行 ⇒ 带动态叠加层的 prepend 不可能逐行相等；挡住那些行被写的是 §18.2 时间模型的 tile 跳过（`P2`/`P3`），今天不存在 ⇒ 语料不画，而 `a_moving_region_over_the_revealed_rows_is_written_verbatim` 把今天的行为钉成断言（位移对、`bytes_wrong == 1`），时间模型落地后它必须失败并被重写；④ **`decide` 是 `P1.13` ablation 之外的第二处组装**，两处共用的 §16.5 规则（`margin_of` 与 `outside_cell_second`——"第二个候选"必须**不在赢家的 4 px cell 内**，否则层二的栅格分辨率会被读成歧义）**提升到 `displacement.rs` 的生产半区**而不是复制（真正的会话组装是 `P3.09`，在那之前两份 test-only 副本一定会漂移）；⑤ **装置是新的 test-only 文件 `scroll/acceptance.rs`**（§28.2 的"10 生产 + 1 test-only"变成 **10 + 2**），扫描跨 `canvas`/`displacement`/`orb`，放进任何一个模块的 `mod tests` 都会让那个模块的测试文件变成两个职责。**ORB 投票暂不进本门禁**（`OQ-18` 的语料扩展留待后续维度），本任务只做 §16.1 的漏斗。回填位置 = `docs/30 §29.3.1`（新增）+ `§29.3` 的验收判据块末补指针；本文 §6 `P1.24` 的执行块（2026-10-08 执行时新增，见下） |
 | **DEV-34**（执行时新增） | `P1.24` 的 RED 在冒烟语料上通过、全量网格（5376 例）却报 **1135 例错误确定**（错误确定率 0.2111）。规格没有预见这件事：任务块的退出条件只写"冒烟子集通过"，而 `E-ACC-1` 的全量扫描才是真门禁。两处根因都不在 `P1.24` 的新代码里，而在 `P1.05`/`P1.07` 的交付物里——**这正是全量扫描存在的理由** | 2026-10-08 执行时做了六处定点改写 + 两条根因：① **`§15.4.1` 的候选集排序键**：`(support desc, |d| asc, d asc)` → `(support desc, |d − expected| asc, |d| asc, d asc)`（`CandidateSet::insert` 多收一个 `expected`）。根因 = 噪声帧上第 1 层的逐行摘要支持**恒为 0**（`add_noise` 扰动被步进帧的每个像素 ⇒ 不存在精确逐行匹配），平局键接管后候选集退化成"窗口里最小的 8 个 `d`"，**真值可能根本不是候选**（实测 `expected=26, window=8`：σ=0 时集合正确且真值支持严格最大；σ>0 时是 `18..25` 全 0，真值 26 缺席）。修完全量 **1135 → 12 wrong**。同时新增裁决 7 写明"支持在噪声帧上恒为 0 是事实而非缺陷"，并把"候选集不能因为排序而丢掉真值"写成前提；② **`§15.4.3` 的精修半径**：`REFINE_NEIGHBOURHOOD` 由 `[-1, 0, 1]` 改为 `[-2, -1, 0, 1, 2]`，并**绕 `grid_point(winner)` 展开**而不是绕赢家。根因 = 第 2 层在 4 px 栅格上测量、报出的是 cell 的栅格点，真值可以离它 `DOWNSAMPLE / 2 = 2 px`；支持消失后赢家就是栅格点，`±1` 够不到 ⇒ 落 1 px 短并被 `Confirmed`。剩下 12 例**全是这一个形状**（`|d| = 14`、`P/|d| = 0.5`、σ ∈ {2,5,10}、4 seed），修完全量 **`wrong 0` / `bytes_wrong 0`**；③ **`§16.11` 的行**由"±1（主轴 3 点）"改为"±2（一个测量 cell，主轴 5 点）"；④ **两条 `P1.07` 的既有断言被同步改动**（它们是 `P1.07` 的交付物，所以记在这里而不是静默改掉）：`the_final_value_is_an_integer` 钉的常量、`refinement_only_moves_the_winner_by_one_pixel` 的"移动不超过 1 px"（改为 `DOWNSAMPLE / 2`，其独立重算 argmax 的一段同步改用 `grid_point(winner) + step`）；⑤ **`round_to_grid` 返回的是 cell 下标**（栅格点 = `round_to_grid(d) * DOWNSAMPLE`，原先只有 `grid_distance` 内联了这次乘法）⇒ 提成 `fn grid_point(shift) -> i32`，一处定义三处使用（`grid_distance`、`refine_winner`、测试）；把两种读法混起来正是这次差点写错的地方——第一版 `centre = round_to_grid(winner)` 让精修围绕 cell 下标 30 展开，`the_final_value_is_an_integer` 立刻报 `left: 28 / right: 120`；⑥ **`§29.3.1` 的裁决 5 重写 + 新增裁决 6**：`Funnel::FIRST_ONLY` 在排序修复后不再失败（实测 0 wrong），对照换成"**去掉第 3 层**"（实测 4 wrong / 0.1250）与"**死先验**"（实测 7 wrong / 0.2188），并把"失败得不够"的两条也钉住（`FIRST_ONLY` 单独与四门全关都是 0 wrong ⇒ 第 1 层不是弱点、**门只拒绝不纠正**）；实测表由三行换成七行（含全量网格 `steps 5376 confirmed 3523 (65.5%) refused 1853 wrong 0 bytes_wrong 0`，release 82.80s）。回填位置 = `docs/30 §15.4.1`（排序键 + 裁决 7）、`§15.4.3`（修订整块）、`§16.11`（行）、`§29.3.1`（裁决 5/6 + 实测表）；本文 §6 `P1.24` 的执行块（2026-10-08 执行时新增，见下） |
+| **DEV-35**（执行时新增） | `P6.07`（门禁第二遍扫描）在任务表里归属 P6 阶段，但 `P1` 的**阶段级退出条件 ①** 要求"第二遍扫描通过"——一个尚未写下的门禁不可能"通过"，而 P1 全部 24 个任务的"测试不需要真实桌面"这个声称正建立在它之上（G9）。等到 P6 才落地，等于让 P1 的整阶段结论在 P6 之前一直是**声称**而不是**机械保证** | 2026-10-08 执行时**提前落地** `P6.07` 的扫描（加进 `tools/check-dependency-direction.ps1`），三处实现决定：① **并进既有的 `$failures` 列表**，而不是片段原样的 `Write-Error` + `exit 1`——一个门禁一个退出码，一次运行把依赖方向与平台纯度的违规**一次报全**；② **`-Package` 下跳过第二遍扫描**——`-Package` 是依赖方向那半的负对照开关，若两种失败原因都可能出现，对照就失效；③ **打印被扫描的文件数**（`checked crates/snapclip-capture/src/scroll: 8 files scanned for platform references`）——"扫了 0 个文件所以干净"与"真干净"必须可区分（§29.2 的"不许静默通过"用在门禁自身）。**RED 自证（`P6.07` 的交付物之一）**：往 `crates/snapclip-capture/src/scroll/canvas.rs` 追加一行 `use crate::windows::win;` 后运行门禁 → `- .\crates\snapclip-capture\src\scroll\canvas.rs:2870 references crate::windows (scroll/ must stay platform-free)`、`exit=1`；撤销后 `dependency direction is clean`、`exit=0`。**依赖面无变化**（`cargo tree -p snapclip-capture -e normal` 仍 30 个包，N7）。落地时 `scroll/` 共 **8** 个 `.rs`（`§28.2` 的"10 个生产文件"是目标终态，不是今天的数量）。回填位置 = `docs/30 §28.4.1`（新增）；`P6.07` 的剩余部分 = 确认扫描仍通过 + 把它扩展到 P2 之后新增的 `windows/scroll_source.rs`/`windows/scroll_actuator.rs`（`§28.4` 的目标是把平台细节关在 `scroll/` 之外，新增的 `windows/` 文件不受这条规则约束） |
 ---
 
 ## 1. 总览
@@ -529,7 +532,7 @@ cargo check --workspace --all-targets
 # 全量单测（Debug，不需要桌面）
 cargo test --workspace --lib
 
-# 依赖方向（含 P6.04 新增的 scroll/ 平台纯度扫描）
+# 依赖方向（含 P6.07 的 scroll/ 平台纯度扫描；该扫描已于 2026-10-08 提前落地，见 §0.6 的 DEV-35）
 pwsh tools/check-dependency-direction.ps1
 ```
 
@@ -1478,7 +1481,7 @@ git config core.hooksPath .githooks
 - **未完成项（留给后续任务）**：① §18.2 时间模型的 tile 跳过（`P2`/`P3`）落地后，`a_moving_region_over_the_revealed_rows_is_written_verbatim` 必须失败并被重写（它钉的是今天的行为）；② **ORB 投票未进本门禁**（`OQ-18`：语料与维度扩展留待后续）；③ 全量扫描仍是 `#[ignore]` + release 的分钟级门禁，CI 只跑冒烟子集（规格的 REFACTOR 决定）。
 - **门禁**（`docs/Temp/p124-gates.log`）：`cargo check --workspace --all-targets` = 0 error / 1 warning（仅既有的 `unused variable: content_label`，`apps/snapclip/src/history/view.rs`）；`cargo test -p snapclip-capture --lib -- --test-threads=1` = **437 passed / 0 failed / 14 ignored（75.85s）**；`cargo test --workspace --lib -- --test-threads=1` 串行全绿（app 56+3 / capture 437+14（84.80s）/ history 51 / model 23）；`tools/check-dependency-direction.ps1` = clean（capture 30 / history 47 / model 8）。
 
-**P1 退出条件（阶段级）**：① `tools/check-dependency-direction.ps1` 的第二遍扫描（`scroll/` 内不得出现 `crate::windows|crate::sampler|winapi|windows_sys|windows::`）通过；② `E-ACC-1` 冒烟子集在 CI 通过、错误确定率为 0；③ `E-PERF-1` 的结论已回填（`Stitch Latency` 与 CPU 两行不再是"待测"）；④ `scroll-p1` 标签已打。
+**P1 退出条件（阶段级）**：① `tools/check-dependency-direction.ps1` 的第二遍扫描（`scroll/` 内不得出现 `crate::windows|crate::sampler|winapi|windows_sys|windows::`）通过 —— **✅ 已完成（2026-10-08）**：扫描作为 `P6.07` 的一部分**提前落地**（见 §0.6 的 **DEV-35**），一次被拒绝的证据（注入 `use crate::windows::win;` → `canvas.rs:2870 references crate::windows`、`exit=1`）+ 一次通过（`clean`、`exit=0`）都已取得；② `E-ACC-1` 冒烟子集在 CI 通过、错误确定率为 0；③ `E-PERF-1` 的结论已回填（`Stitch Latency` 与 CPU 两行不再是"待测"）；④ `scroll-p1` 标签已打。
 
 ---
 
@@ -1893,6 +1896,27 @@ git config core.hooksPath .githooks
 - **退出条件**：① 一次**被拒绝**的证据 + 一次通过；② 钩子里包含该门禁；③ `cargo tree -p snapclip-capture -e normal` 的包数与其历史一致（**无新增依赖**，N7）
 - **提交标题**：`[P6-07] the platform-free rule is enforced, and the gate is proven to fail`
 
+**状态**：`[x] 完成（提前落地于 P1 阶段退出条件 ①，2026-10-08）`——见 §0.6 的 **DEV-35** 与 `docs/30 §28.4.1`。
+
+**执行记录（2026-10-08）**
+
+- **为什么提前**：`P1` 的阶段级退出条件 ① 要求"第二遍扫描通过"，而 P1 全部 24 个任务的"测试不需要真实桌面"（G9）正建立在这条门禁之上。等到 P6 才落地，等于让 P1 的整阶段结论在 P6 之前一直是**声称**而不是**机械保证**。
+- **RED（实测，一次被拒绝的证据）**：往 `crates/snapclip-capture/src/scroll/canvas.rs` 末尾追加一行 `use crate::windows::win;` → `powershell -NoProfile -File tools/check-dependency-direction.ps1` 输出
+
+  ```
+  checked crates/snapclip-capture/src/scroll: 8 files scanned for platform references
+
+  dependency direction violated:
+    - .\crates\snapclip-capture\src\scroll\canvas.rs:2870 references crate::windows (scroll/ must stay platform-free)
+  exit=1
+  ```
+
+  撤销该行后 → `dependency direction is clean`、`exit=0`。**一个从未被观察到失败的门禁等于没有门禁**（与 `E-ACC-1` 的"故意先开一层让错误确定率 > 0"是同一个道理）。
+- **GREEN**：扫描保留，试探代码删除；`cargo tree -p snapclip-capture -e normal` 仍 **30** 个包（退出条件 ③：无新增依赖，N7）。
+- **三处实现决定**（与 `§28.4` 片段的三处偏离，见 DEV-35）：① 并进既有的 `$failures` 列表（一个门禁一个退出码，一次报全所有违规）而不是片段原样的 `Write-Error` + `exit 1`；② `-Package` 下跳过（保住负对照的单一失败原因：实测 `-Package snapclip` 仍 `exit=1`）；③ 打印被扫描的文件数（"扫了 0 个文件所以干净"与"真干净"必须可区分）。
+- **落地时的文件数**：`scroll/` 共 8 个 `.rs`（`acceptance.rs`/`canvas.rs`/`displacement.rs`/`mod.rs`/`observation.rs`/`orb.rs`/`perf_probe.rs`/`testkit.rs`）；`§28.2` 的"10 个生产文件"是**目标终态**。
+- **剩余部分（留给 P6 阶段）**：确认扫描仍通过；把它扩展到 P2 之后新增的 `windows/scroll_source.rs`/`windows/scroll_actuator.rs`（`§28.4` 的规则是"平台细节不得进 `scroll/`"，新增的 `windows/` 文件本来就在规则之外，这里要核对的是它们**没有把 `scroll/` 拉进平台侧**）。
+
 ### P6.08 `E-PERF-1..4` 回填 §23.3 + 九实体命名一致性检查
 
 **上游**：V2 §23.3、§2.2、§35 P6.5/P6.6 ｜ **第一性原理**：**G7**（性能目标必须可测量可复现）+ **Occam**（实体名是**接口**的一部分；两个名字会各自长逻辑，D-6）｜ **前置**：P4.07、P5.06 ｜ **可并行**：无 ｜ **批次**：`[P6-B]` ｜ **层级/分类**：L1（脚本）+ L4 / A + E ｜ **复杂度**：M ｜ **阻塞**：无
@@ -2189,7 +2213,7 @@ git config core.hooksPath .githooks
 | `apps/snapclip/src/capture/`（新增 `row_band_png.rs` 之类的实现文件） | `P4.02` | `PngRowBandSink`（**这是 shell 侧唯一的新文件**） |
 | `crates/snapclip-capture/src/ports.rs` | `P6.06` | `:19,41,55` 的失效注释（Tauri/Vue） |
 | `crates/snapclip-capture/src/windows/win/d2d/tests.rs` | `P5.05` | 同型新增"覆盖层 + 预览面板"回读用例 |
-| `tools/check-dependency-direction.ps1` | `P6.07` | 第二遍扫描：`scroll/` 平台纯度 |
+| `tools/check-dependency-direction.ps1` | `P6.07` | 第二遍扫描：`scroll/` 平台纯度（**已于 2026-10-08 提前落地于 P1 阶段退出条件 ①**，见 §0.6 的 DEV-35） |
 | `.githooks/pre-push` | `P0.08` | 新建并通过 `core.hooksPath` 生效 |
 | `docs/30-scroll-capture-design-v2.md` | `P6.08`/`P6.09` | 回填性能数字与 OQ 结论（**只改数据与结论，不改设计**） |
 

@@ -96,6 +96,25 @@ foreach ($target in $targets) {
     Write-Host ("checked {0}: {1} packages in its normal graph" -f $target, $count)
 }
 
+# Second pass (docs/30 section 28.4): the scroll/ module is the platform-free core. The whole
+# "tests need no desktop" story (docs/30 section 29) rests on it, and no dependency scan can see
+# this edge because it is a `use` inside the crate rather than a package. So it is a source scan,
+# in the same script and with the same exit code, so that there is one gate and not two.
+#
+# Skipped under -Package: that switch is the negative control for the dependency pass, and running
+# the source scan there would make the control's failure ambiguous.
+if (-not $Package) {
+    $scrollRoot = "crates/snapclip-capture/src/scroll"
+    $scrollFiles = @(Get-ChildItem -Path $scrollRoot -Filter *.rs -Recurse)
+    $hits = @($scrollFiles | Select-String -Pattern "crate::windows|crate::sampler|winapi|windows_sys|windows::")
+    foreach ($hit in $hits) {
+        $relative = Resolve-Path -Relative $hit.Path
+        $reference = $hit.Matches[0].Value
+        $failures.Add("$relative" + ":" + "$($hit.LineNumber) references " + "$reference (scroll/ must stay platform-free)")
+    }
+    Write-Host ("checked {0}: {1} files scanned for platform references" -f $scrollRoot, $scrollFiles.Count)
+}
+
 if ($failures.Count -gt 0) {
     Write-Host ""
     Write-Host "dependency direction violated:" -ForegroundColor Red

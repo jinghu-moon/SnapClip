@@ -4215,6 +4215,28 @@ if ($hits) { Write-Error "scroll/ must stay platform-free: $($hits -join '; ')";
 
 **为什么复用既有脚本而不是新建工具**：§5 已确证 `tools/` 下已有 3 个脚本，其中只有 `check-dependency-direction.ps1` 是 Rust 门禁。**加 8 行到一个已有的门禁**比新建一个"模块边界检查器"更符合"最小实体集合"。**这条门禁是 G9（核心可测且测试不依赖真实桌面）的机械保证**——没有它，§30 的"不需要真实桌面"就只是文档里的一句话。
 
+#### 28.4.1 落地（`P6.07`，2026-10-08）
+
+上面那 8 行已加进 `tools/check-dependency-direction.ps1`，但**不是**照抄片段，而是并进该脚本既有的 `$failures` 列表。三处实现决定：
+
+1. **并入 `$failures`，不另用 `Write-Error` + `exit 1`。** 理由是"一个门禁，一个退出码"：片段原样落地会让依赖方向与平台纯度成为两条独立路径，而它们的失败语义完全相同（都是"这棵树违反了分层"）。并进去之后，一次运行会把**所有**违规一次报全，而不是先撞上依赖方向就先退出。
+2. **`-Package` 下跳过第二遍扫描。** `-Package` 是依赖方向那半的负对照开关；若第二遍扫描在负对照里也跑，负对照的失败原因就变成"两种之一"，对照失效。
+3. **打印被扫描的文件数**（`checked crates/snapclip-capture/src/scroll: 8 files scanned for platform references`）。一个"扫了 0 个文件所以干净"的门禁与"真干净"无法区分——这是 §29.2 的"不许静默通过"在门禁自身上的应用。
+
+**落地时的文件数**：`scroll/` 共 **8** 个 `.rs`（`acceptance.rs` 628 行、`canvas.rs` 2659、`displacement.rs` 4928、`mod.rs` 37、`observation.rs` 495、`orb.rs` 683、`perf_probe.rs` 556、`testkit.rs` 759）。§28.2 的"10 个生产文件"是**目标终态**（`P2`+ 会继续加 `bands.rs`/`session.rs` 等），不是今天的数量。
+
+**门禁自身被证明能失败（`P6.07` 的 RED，与 §29.2 的 `E-ACC-1` 同一个道理）**：往 `crates/snapclip-capture/src/scroll/canvas.rs` 末尾追加一行 `use crate::windows::win;` 后运行门禁，实测
+
+```
+dependency direction violated:
+  - .\crates\snapclip-capture\src\scroll\canvas.rs:2870 references crate::windows (scroll/ must stay platform-free)
+exit=1
+```
+
+撤销该行后 `dependency direction is clean`、`exit=0`。**一个从未被观察到失败的门禁等于没有门禁**——这条规则从 `P6.07` 起适用于所有门禁：新门禁的交付物包含一次"它拒绝了什么"的原始输出。
+
+**依赖面没有变化**：`cargo tree -p snapclip-capture -e normal` 仍是 30 个包（N7：这条门禁不引入任何新依赖，它只是一次源码扫描）。
+
 ## 29. 测试策略
 
 ### 29.1 五类测试（用户第 31 条的 A–E）
