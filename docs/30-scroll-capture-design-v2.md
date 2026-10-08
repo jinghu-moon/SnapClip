@@ -890,7 +890,7 @@ F5 / 托盘 / 热键                      （windows/hotkey.rs、apps/snapclip/s
 **F-10【已核实】PNG 的尺寸边界。**
 PNG 规范的 IHDR 宽高是 4 字节无符号整数；libpng 出于安全**默认拒绝超过 100 万行或 100 万列**（android.googlesource 上的 libpng.3："For safety, libpng imposes a default limit of 1 million rows and columns"），可用 `png_set_user_limits()` 提高。
 **Rust `png` crate 另有独立的解码资源上限**：`png::Limits { bytes }` 的文档原文是 "maximum number of bytes the decoder is allowed to allocate, **default is 64Mib**"（`png` 0.18.1）。
-→ **影响**：这是 §17.6 的上限推导输入之一；同时是一条**测试基础设施要求**：任何"导出后再解码回来比对"的测试，在输出超过 64 MiB 时**必须显式提高解码上限**，否则会以"解码失败"的形式假失败（§29.5）。
+→ **影响**：这是 §17.6 的上限推导输入之一；同时是一条**测试基础设施要求**。**但 `P0.04` 的实测修正了它的推论**：`Limits::bytes` 是解码器**内部**分配的预算（`reserve_bytes()` 逐次递减；解出的帧写进调用方缓冲区），**不是产物大小、也不是解码后图像大小的上限**——101.7 MiB 的产物与 3840×30000（解码后 460 MB）都在 `Limits::default()` 下解码成功（§17.7.1）。所以"产物 > 64 MiB **必须**提高上限、否则假失败"的写法**已被否定**；保留的动作只是"显式提高"这一零代价防御，见 §29.5 与 `docs/31` `DEV-7`。
 
 **F-11【已核实】JPEG 的尺寸边界是 `65500`，不是 `65535`，而且 PixPin 用的正是它。**
 `libjpeg-turbo` 的 `JPEG_MAX_DIMENSION`：jpegli-rs 的文档原文 "Maximum dimension for JPEG images (**matches libjpeg-turbo's JPEG_MAX_DIMENSION**). Slightly under 64K to prevent overflow in 16-bit calculations" —— 值 `65500 = 0xffdc`。
@@ -898,6 +898,7 @@ PNG 规范的 IHDR 宽高是 4 字节无符号整数；libpng 出于安全**默�
 
 **F-12【已核实】Rust `png` crate 支持真正的流式写出，但**高度必须在编码前已知**。**
 `png::Encoder::new(w, width, height)` 接收宽高；`write_header()` 返回 `png::Writer`；crate 中存在 `png::StreamWriter`（含 `finish()`）用于增量写行；`validate_sequence()` 默认关闭。
+**`P0.04` 实测确认（2026-10-08）**：`Writer::stream_writer()` 逐行写入 1024×4096（16 MiB）时 `peak - live < 1 MiB`，即**确实不 materialize**；`into_stream_writer()` 另有 `W: 'static` 约束（对 `&mut Vec<u8>` 报 `E0310`），因此实现必须用借用形态的 `stream_writer()`；`StreamWriter::finish()` 只收尾 zlib，**IEND 由 `Writer::finish()`（或 `Writer` 的 `Drop`）补写**（§17.7.1）。
 → **影响**：`RowBandSink`（§4.3.4）的接口形状由这条事实确认可行：**不需要 materialize，也不需要把图像缓冲在内存里**。同时它给出一个必须写进接口的约束：**导出开始前必须已经确定最终高度**——这与 §17.6 的"超限时裁成连续前缀"是一致的（裁剪决定发生在 `begin` 之前，不在写行过程中）。
 
 **F-13【已核实】`PostMessage(WM_MOUSEWHEEL)` 绕过 UIPI，`SendInput` 不绕过。**
@@ -2062,6 +2063,43 @@ pub struct ImageMeta { pub width: u32, pub height: u32, pub stride: usize, pub f
 - **不需要 materialize 整幅图**。这是 `docs/25` R3（50 万 px 下 ~3 GB BGRA 过端口）被消除的机制。
 - **必须显式设置压缩/滤波参数**，不能依赖默认值——当前仓库的 PNG 路径**从不设置**它们（§5：`image` 0.25.10 默认 `Compression::Balanced + Filter::Adaptive`，且是**整图一次性**编码）。选择哪一组参数是 `E-PERF-2`（§23）的实验任务，**不在此处拍数字**。
 - **`png` crate 会成为 `snapclip-capture` 的直接依赖吗？不**。`RowBandSink` 是 capture 自己的 trait；实现它的 `PngRowBandSink` 落在 **shell 组合根**（`apps/snapclip/src/capture/`），由 `snapclip-history` 提供底层编码。这与今天的分工完全一致（§5：`artifact_writer.rs` 实现 `ArtifactWriter`，内部才调 `snapclip_history::image::encode_png`），**依赖方向门禁不需要改**。
+
+#### 17.7.1 `E-PERF-2` 的实测结果：选定 `Balanced + Up`（2026-10-08）
+
+**装置**：`apps/snapclip/tests/png_params_probe.rs` + `tools/p0-04-png-params.ps1`（**每组合一个独立进程**、`--release`、串行、`CountingAllocator` 量 `peak`）。合成图 = `SyntheticImage`（确定性、无 RNG；卡片/文本带/强调条/滚动条轨道，见文件头）。原始行数据 = 1280×30000 = **146.5 MiB**、3840×30000 = **439.5 MiB**。工具链 `rustc 1.98.1 (48a229cea 2026-09-01)`、`Cargo.lock` SHA256 `55F9BD802050DFA4ED11140CD87EF56755830870C747116C577B53C453965EFE`（§23.5 要求）。产物：`docs/Temp/perf2-2026-10-08.jsonl`（12 组 × 3 run + `baseline/image`）、`docs/Temp/perf2-4k.jsonl`（4K 宽的三行补充）。**`CHOSEN` 的取值就是下表推出来的，不是猜的**。
+
+**1280×30000（3 run，p50/max；`peak` = `CountingAllocator` 单次编码的净峰值）**：
+
+| 组合 | p50 (ms) | max (ms) | MiB/s | 产物 (MiB) | peak (MiB) |
+|---|---|---|---|---|---|
+| Fast/NoFilter | 283 | 336 | 519 | 147.5 | 258.6 |
+| Fast/Sub | 313 | 332 | 468 | 61.7 | 64.7 |
+| **Fast/Up** | **247** | **259** | **594** | 56.1 | 64.7 |
+| Fast/Adaptive | 259 | 275 | 567 | 34.1 | 64.7 |
+| Balanced/NoFilter | 4231 | 4416 | 34.6 | 18.8 | 32.7 |
+| Balanced/Sub | 4469 | 4926 | 32.8 | 20.4 | 32.7 |
+| **Balanced/Up ← 选定** | **2344** | **2351** | **62.5** | **14.4** | **16.5** |
+| Balanced/Adaptive | 3339 | 3354 | 43.9 | 19.8 | 32.7 |
+| High/NoFilter | 3748 | 3766 | 39.1 | 18.8 | 32.7 |
+| High/Sub | 8956 | 8990 | 16.4 | 20.2 | 32.7 |
+| High/Up | 5369 | 6247 | 27.3 | 14.3 | 16.5 |
+| High/Adaptive | 7652 | 8443 | 19.1 | 19.5 | 32.7 |
+| `baseline/image`（今天的整图路径） | 311 | 327 | 471 | 34.0 | **413.9** |
+
+**3840×30000（1 run，补充行）**：`Fast/Up` 801 ms / 168.8 MiB / peak 258.6 MiB；**`Balanced/Up` 7749 ms / 40.1 MiB / peak 65.1 MiB**；`baseline/image` 924 ms / 101.7 MiB / **peak 1188.3 MiB**。
+
+**决策：`Compression::Balanced` + `Filter::Up`。两条依据（`docs/31` P0.04 退出条件 ②）**：
+
+1. **速度**：最坏情况（1280×30000 = 38.4 Mpx）p50 **2.34 s** / max 2.35 s，即 **62.5 MiB/s** 原始行数据；4K 宽（439.5 MiB 原始行）**7.75 s**。导出每次会话只发生一次、在 worker 线程上、且行循环**逐行可中止**（`StreamWriter` 每行独立），因此它不进入任何交互延迟预算（§23 的导出目标是 `⏳ 待测`，由 `P0.03` 填）。`High` 档把时间换到 5.4 s（+129%）只买到 **0.7%** 的体积（14.3 vs 14.4 MiB）——**不选它是"收益与代价不成比例"，不是"更快更好"**。
+2. **体积**：14.4 MiB，比同速度档的 `Fast/Adaptive`（34.1 MiB）小 **2.4×**，比 `Fast/Up`（56.1 MiB）小 **3.9×**。历史库把整张长图落盘，体积是每次截图都付的成本；而 2.34 s 是一次性的。
+
+**三条与决策同等重要的实测结论**：
+
+1. **在 `Balanced` 档内 `Filter::Up` 同时最快与最小**（时间 Up 2344 < Adaptive 3339 < NoFilter 4231 < Sub 4469 ms；体积 Up 14.4 < NoFilter 18.8 < Adaptive 19.8 < Sub 20.4 MiB）。但**不能把它推广成"`Up` 总是最优"**：`High` 档里 `NoFilter` 比 `Up` 快 30%（3748 vs 5369 ms）却大 31%（18.8 vs 14.3 MiB）。这正是这张表存在的意义——**十二组里有两组的相对次序与直觉相反，而这些次序只能测出来**。
+2. **流式把峰值内存降到 1/25**：`Balanced/Up` 的 peak **16.5 MiB** vs 今天整图路径的 **413.9 MiB**（同一张图、同一进程壳、同一计量器）；4K 宽下是 **65.1 vs 1188.3 MiB**。这正是 D-11/§17.7 要消除的那 4 份拷贝，现在有了数字。
+3. **不要指望"更快"**：今天 `image` 0.25.10 的整图路径 **311 ms / 34.0 MiB / peak 413.9 MiB**，与 `Fast/Adaptive`（259 ms / 34.1 MiB）几乎同一行为——说明它内部已经用了快速档 + Adaptive 滤波。因此这次改写的收益**是内存与参数可控**（外加可逐行中止），**不是编码速度**；把这条写下来是为了防止后续有人把"流式"当成性能优化的理由。
+
+**F-10 的修正（`P0.04` 退出条件 ③ 的实测答案）**：13 行 + 4K 三行**全部** `decode_ok = true`，**且全部在 `png::Limits::default()`（64 MiB）下解码成功**——包括 **101.7 MiB 的产物**与 **3840×30000（解码后 460 MB）** 的图像。读 `png` 0.18.1 源码可知原因：`Limits::bytes` 由 `reserve_bytes()` 逐次**递减**，它是**解码器内部**分配（行缓冲、zlib/fdeflate 工作区）的预算，**不是产物大小、也不是解码后图像大小的上限**（解出的帧写进调用方提供的缓冲区；`read_info()` 里的 `LimitsExceeded` 来自 `checked_raw_row_length()`/`output_buffer_size()` 的**溢出检查**，与字节预算无关）。⇒ §29.5 的"产物 > 64 MiB **必须**提高解码上限，否则会假失败"**被实测否定**；正确的表述是"显式提高解码上限是**零代价的防御**（我们确实会产出 >64 MiB 的产物），但**不要依赖它会失败**，也不要把它写成测试的前置条件"。此偏离记在 `docs/31` 的 `DEV-7`。
 
 ### 17.8 水平轴
 
@@ -3422,7 +3460,7 @@ if ($hits) { Write-Error "scroll/ must stay platform-free: $($hits -join '; ')";
 
 | 要求 | 内容 | 依据 |
 |---|---|---|
-| **解码上限** | 任何"导出后解码比对"的测试，若产物 > 64 MiB，**必须显式提高解码上限**（`png::Limits { bytes }`），否则会**假失败** | F-10：Rust `png` crate 的默认解码上限是 **64 MiB**（文档原文 "maximum number of bytes the decoder is allowed to allocate, default is 64Mib"）；libpng 另有默认 100 万行列的限制 |
+| **解码上限** | 显式提高解码上限（`png::Limits { bytes }`）是**零代价的防御**，但不是测试的前置条件：**`P0.04` 实测否定了"产物 > 64 MiB 就会假失败"**（101.7 MiB 的产物与 3840×30000 的图像都在 `Limits::default()` 下解码成功） | F-10 的事实部分成立（默认预算 64 MiB），但**推论被实测推翻**：该预算约束的是解码器**内部**分配（`reserve_bytes()` 逐次递减），不是产物或解码后图像的大小。详见 §17.7.1 与 `docs/31` `DEV-7`；libpng 另有默认 100 万行列的限制 |
 | **内存计量的诚实性** | 内存测试必须**同时**记录 `allocated` 与 `peak`，并**单独记录换出文件大小** | §6 的基准方法论原文："**堆流量不能证明空间下降（存储搬到 OS 映射时）**" |
 | **禁止把性能断言写成无依据的常数** | 性能断言只能建立在 `E-PERF-*` 的实测上，且必须记录 lockfile 与二进制哈希 | §23.4；AGENTS.md 第 6 条 |
 

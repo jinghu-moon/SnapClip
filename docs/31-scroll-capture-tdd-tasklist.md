@@ -94,14 +94,16 @@
 | 新增文件 | 一律先建 `#[cfg(test)]` 测试骨架再建实现（§2.1） |
 | 文档引用 | 一律写 `docs/30 §x.y` 或 `docs/30:<行号>`，**不允许只写"见设计文档"** |
 
-### 0.6 本文对 V2 的补充（**五处 deviation，全部已按用户授权回填 `docs/30`**）
+### 0.6 本文对 V2 的补充（**七处 deviation，全部已按用户授权回填 `docs/30`**）
 
-> **回填状态**：五处均已写入 `docs/30-scroll-capture-design-v2.md`（**未覆盖原文，只做定点增补**）——
+> **回填状态**：七处均已写入 `docs/30-scroll-capture-design-v2.md`（**未覆盖原文，只做定点增补**）——
 > DEV-1 → `§28.2` 新增 test-only 文件块（`scroll/testkit.rs`）与"10 生产 + 1 test-only"口径、`§33.3` 文件清单由 9 补为 11（**顺带修正了原文漏列 `orb.rs` 的内部矛盾**）；
 > DEV-2 → `§35 P4` 的 `P4.1` 拆为 `P4.1a`（trait，capture）/ `P4.1b`（实现，shell）并附理由；
 > DEV-3 → `§33.1` 的 `D-10` 拆为 `D-10a`（硬失败）/ `D-10b`（静默降级）、`§24.3` 修正 `wgc.rs:107` 的表述并说明"两种相反失败模式的共同落点"、`§24.8` 的探测用例扩为两条；
 > **DEV-4** → `§21.3` 新增"第 1 步的实测结果（`P0.02` / `T-THREAD-1`）"整块（2026-10-08 执行时新增，见下）；
-> **DEV-5** → `§24.5`（UIPI 事实与矩阵首行**按实测改写**）、`§24.6` 判定规则 1（**前台窗口 → 光标所在窗口**）、`§24.6.1` 结论 2（判别性用例已跑）、`§24.6.2`（整节改写为五目标矩阵）、`§24.8`、`§30.5`、`§36.2`（`OQ-3` 关闭、`OQ-5` 答一半、**新增 `OQ-15`**）（2026-10-08 执行时新增，见下）。
+> **DEV-5** → `§24.5`（UIPI 事实与矩阵首行**按实测改写**）、`§24.6` 判定规则 1（**前台窗口 → 光标所在窗口**）、`§24.6.1` 结论 2（判别性用例已跑）、`§24.6.2`（整节改写为五目标矩阵）、`§24.8`、`§30.5`、`§36.2`（`OQ-3` 关闭、`OQ-5` 答一半、**新增 `OQ-15`**）（2026-10-08 执行时新增，见下）；
+> **DEV-6** → 无 `docs/30` 回填（**装置替换**，只改本文与仓库：`apps/snapclip/tests/png_params_probe.rs` + `tools/p0-04-png-params.ps1` + shell 的 dev-dependency `png = "0.18"`）（2026-10-08 执行时新增，见下）；
+> **DEV-7** → `§17.7.1`（新增整块实测与 `CHOSEN`）、**`F-10` 事实条目**（`§7`，推论按实测改写）、`§29.5` 的"解码上限"行（"必须"降级为"零代价防御"）（2026-10-08 执行时新增，见下）。
 > 下表保留**原始登记内容**（作为"当时看到了什么"的记录）。
 
 | # | 补充 | 为什么必须补 | 回填位置 |
@@ -111,6 +113,8 @@
 | **DEV-3** | V2 §33.1 的 **D-10** 把 `crates/snapclip-capture/src/windows/win/wgc.rs:107` 与 `:110` **都**写成"吞错误"，与代码不符 | 逐行核实：`:106-108` 的 `SetIsCursorCaptureEnabled(false).map_err(...)?` **用 `?` 传播** → 它的失败模式是"**`IGraphicsCaptureSession2` 不可用 ⇒ 整体捕获失败**"；`:110-112` 的 `SetIsBorderRequired(false)` 才是"**只 `eprintln`、静默降级**"。**两种相反的失败模式**（一个太严、一个太松）都必须由 `P2.04` 的能力探测统一处理，否则执行者会按 V2 的措辞只修一处 | `docs/30 §33.1 D-10` 改为两个独立条目：D-10a"`SetIsCursorCaptureEnabled` 的**硬失败**改为探测 + 记录 + 退回掩码排除"、D-10b"`SetIsBorderRequired` 的**静默降级**改为产出 `CaptureOptionUnavailable` 诊断"；`§24.3` 的 `CaptureCapabilities` 表同步说明它同时解决这两种失败模式 |
 | **DEV-4**（执行时新增） | V2 §21.3 把 `T-THREAD-1` 的判据写成"**若 `cargo test --workspace --lib` 今天就 panic**"，并预期它能回答这个问题 | 2026-10-08 实测：**全量 lib 测试不会 panic**（每个测试都在同一线程创建设备并使用它）→ **该门禁对这条不变式不敏感**；但生产路径**真的会 panic**（设备在 capture worker 创建，overlay 线程放大镜取色时 `submit`），已用 `the_production_hand_off_trips_the_context_guard` 固定为可执行证据。若照原文把"全绿"当作通过，`P0.02` 会被误判为完成，`P2.02` 的回读路径会带着一个**假的**不变式进实现 | `docs/30 §21.3` 新增"第 1 步的实测结果（`P0.02` / `T-THREAD-1`）"整块（四条事实 + 调用点清单修正 + 问题域扩大 + 发布期如何保证）；§6 `P0.02` 的状态行改 `[!]`；§3.4/§14.2 的 `[!]` 表与 R-2 同步 |
 | **DEV-5**（执行时新增） | ① V2 §24.5 写"`PostMessageW` **bypasses UIPI**"、矩阵首行写"提权目标上 `PostMessageW` 可用"，§24.6 判定规则 1 写"`SendInput` 会打到**前台窗口**"；② V2 §24.6.2 把四项列为"仍开放"；③ `P0.09` 的退出条件 ③ 要求"路由设置两种取值各一次" | 2026-10-08 实测：① **`PostMessageW` 对更高完整性窗口直接 `ERROR_ACCESS_DENIED`**（F-13 的旁路设想被否证），而 `MOUSE_POS` 路由下 `SendInput` 跟随的是**光标**而非前台窗口（非前台目标滚 400 px、前台窗口 0 px）；② 四项里**三项已实测关闭**（Edge/Electron/WinUI3 两条传输、非前台、小窗口坐标空间）、一项**不可测**（WebView2 无宿主）；③ **退出条件 ③ 在本机做不到**（没有第二台可改路由设置的机器）。若按原文执行，`P3.02`/`P3.03` 会把一条**不存在的旁路**写进实现，并把 `MOUSE_POS` 的"跟随光标"当成"跟随前台"来处理 | `docs/30 §24.5`（事实与矩阵首行）、`§24.6`（判定规则 1）、`§24.6.1`（结论 1/2/5 的实测更新）、`§24.6.2`（整节改写：21 行矩阵 + 七条结论 + 修订后的开放表）、`§24.8`（五行实测）、`§30.5`（浏览器行加"注入传输因浏览器而异"）、`§36.2`（`OQ-3` 关闭 / `OQ-5` 答一半 / **新增 `OQ-15`**）；本文 §3.4/§14.2 的 `[!]` 表、`OQ-3`/`OQ-5`/`OQ-15` 行、R-18/R-19 与 §6 `P0.09` 的状态块同步 |
+| **DEV-6**（执行时新增） | `P0.04` 的"前置"一栏写：P4.01/P4.02 未完成时"先在 `docs/Temp/` 用**一次性脚本**对同一张合成图做等价测量并标明'非端口路径'"；本文 §16 的"唯一可能的例外"一栏写：若既有 `image` 版本不可表达显式参数，则把 `png` 提升为 shell 的**直接依赖** | 2026-10-08 执行时实际做法与两处措辞都不同：① 装置 = **提交进仓库的集成测试** `apps/snapclip/tests/png_params_probe.rs` + 驱动脚本 `tools/p0-04-png-params.ps1`（**每组合一个独立进程**），而不是 `docs/Temp/` 里的一次性脚本——前者可复跑、可被 `P4.02` 复用、且测量过程本身进了版本史；② `png` 只加进 `apps/snapclip/Cargo.toml` 的 **`[dev-dependencies]`**（`png = "0.18"`），**没有**提升为普通依赖 ⇒ `snapclip-capture` 依然看不到 `png`，依赖方向门禁也无需改动（dev-dependency 不进 `-e normal` 图）。若照原文执行，`P0.04` 会产出一份**无法复跑**的测量，且 `P4.02` 会反复重测 | 无 `docs/30` 回填（装置不在设计文档里）；本文 `§6 P0.04` 的"装置净增"、`§16` 的例外栏、`RES-3` 行按实际改写 |
+| **DEV-7**（执行时新增） | V2 **F-10**（`§7`）与 **§29.5** 的"解码上限"行写：任何"导出后解码比对"的测试，**产物 > 64 MiB 时必须显式提高 `png::Limits { bytes }`，否则会假失败** | 2026-10-08 实测**否定**了这个推论：13 组（1280×30000）+ 3 行（3840×30000）的产物**全部**在 `Limits::default()`（64 MiB）下解码成功，其中包括 **101.7 MiB 的产物**与**解码后 460 MB 的图像**。读 `png` 0.18.1 源码可见机制：`Limits::bytes` 由 `reserve_bytes()` **逐次递减**，约束的是解码器**内部**分配（行缓冲、zlib/fdeflate 工作区），**与产物大小、解码后图像大小都无关**（解出的帧写进调用方缓冲区；`read_info()` 的 `LimitsExceeded` 来自 `checked_raw_row_length()`/`output_buffer_size()` 的**溢出**检查）。若照原文执行，`P4.02`/`P4.05`/`P1.21` 会把"提高上限"当成解码成功的**必要条件**去写断言，而真正会失败的情形（行长度算术溢出）反而没人测 | `docs/30 §17.7.1`（新增实测整块，含本节表格与 `CHOSEN`）、`§7` 的 **F-10** 条目（保留 64 MiB 事实、改写推论）、`§29.5` 的"解码上限"行（"必须"→"零代价的防御，但不是测试前置条件"）；本文 §13.5 的同类措辞与 `P4.02` 的 GREEN 同步 |
 
 ---
 
@@ -415,7 +419,7 @@ P6.07 门禁扫描 ═╝
 | `P3.09` 的"非前台 `SendInput`"分支判据 | **OQ-5** 只剩一半：`MOUSE_POS` 下已实测（非前台目标滚 400 px、前台窗口 0 px），但 `CURSOR`/`FOCUS` 两个取值**本机取不到**（该设置是用户可改的系统设置） | 在两种设置下各跑一次；在此之前按本机读数 + 保守分支实现（**只会更保守**） |
 | `P3.02` 的"非浏览器目标负答案"分支（**新开**） | **OQ-15**：Electron/WinUI3 在四条臂上全 0 且**没有第二通道**，"没有可滚内容"与"注入没到达"无法区分 | 需要非像素滚动见证（首选 UI Automation `ScrollPattern` 只作见证、不作驱动）；在此之前该分支只能输出"未取得"，不能报"注入失败" |
 
-**不在侧分支上、但允许"先按推导实现"的任务**：`P4.02`（`E-PERF-2` 未定时允许先选 `Compression::Fast` + `Filter::Sub` 并标"启动值，待校准"）。
+**不在侧分支上、但允许"先按推导实现"的任务**：`P4.02`（**`P0.04` 已于 2026-10-08 实测选定 `Compression::Balanced` + `Filter::Up`**（`docs/30 §17.7.1`），因此原文的"允许先选 `Compression::Fast` + `Filter::Sub` 并标'启动值，待校准'"**不再适用**——实现必须直接用实测组，并在 `P4.02` 里对这两个参数写断言）。
 
 ### 3.5 提交信息模板（**唯一模板，任务里不再重复正文**）
 
@@ -559,7 +563,7 @@ git config core.hooksPath .githooks
 |---|---|---|---|---|---|
 | `RES-1` | `WM_MOUSEWHEEL` 的 `lParam` 到底是屏幕坐标还是客户区坐标？多显示器下 `LOWORD/HIWORD` 为何不能用？ | MS Learn `mouseinput`/`wm-mousewheel`；`windows-rs` 的 `WM_MOUSEWHEEL` 文档 | `docs/Temp/research-wm-wheel-coords.md` | **P3.02**（两条路径共用 `make_lparam`）；**已有一轮结果**（V2 §6.4 A1/A2），本任务只补齐"多显示器"一格 | 无 |
 | `RES-2` | Chromium 忽略跨进程投递的滚轮吗？`GetMessageTime()` 的横向误判如何触发？ | Chromium 源码（`hwnd_message_handler.cc` 等，只读 web 上的官方仓库文件） | 同上格式 | **P3.02** 的子窗口下沉与时间戳策略；**本机已实测"不忽略"**（V2 §24.6.1），本任务只需把"为什么"落到源码行 | 无 |
-| `RES-3` | PNG 编码器的轴长/像素上限与流式能力（`png` crate 的 `Limits`）？ | `png` crate 官方 docs/源码；libpng 的限制 | `docs/Temp/research-png-limits.md` | **P4.02**（选参数）与 **P1.22**（导出后解码比对的 `Limits{bytes}` 收紧规则） | 无 |
+| `RES-3` | PNG 编码器的轴长/像素上限与流式能力（`png` crate 的 `Limits`）？ | `png` crate 官方 docs/源码；libpng 的限制 | `docs/30 §17.7.1`（本次按执行事实改为"读注册表源码 + `P0.04` 实测"，**不再单开 `docs/Temp` 笔记**：数字与机制都进了 V2） | **P4.02**（选参数）与 **P1.22**（导出后解码比对的 `Limits{bytes}` 收紧规则） | 无 |
 | `RES-4` | 图像配准的原始方法（ZNCC、相位相关、ORB）的**失效条件**是什么？ | 原始论文 + 官方实现（OpenCV `matchTemplate`/`phaseCorrelate`/`ORB` 文档） | `docs/Temp/research-matching-failure-modes.md` | **P1.04/P1.06–P1.09/P1.20**；V2 §15.5 已否决"相位相关优先"，本任务只为**四门与 P1 的门限**提供外部依据 | 无 |
 | `RES-5` | 125%/150% 缩放下 Chromium 的滚动偏移语义（是否物理整数）？ | Chromium 官方渲染/滚动文档、`devicePixelRatio` 语义、W3C CSSOM View | `docs/Temp/research-fractional-scroll.md` | **P1.22** 的 DPI 扫描行、**OQ-4** 的收敛；若结论是"可能非整数"，则触发 V2 §16.1 门一的重新评估 | 无 |
 
@@ -594,7 +598,7 @@ git config core.hooksPath .githooks
 |---|---|---|---|---|
 | `RES-1` | （待填） | | §24.6 | P3.02 |
 | `RES-2` | 本机实测：两条传输都驱动 Chromium（800 px/8 notch） | **不改变**（两条并列路径保留） | §24.6/§24.6.1 | P3.01/P3.02 形状不变 |
-| `RES-3` | （待填） | | §17.7 | P4.02 |
+| `RES-3` | `png` 0.18.1 **支持流式写出**（`Writer::stream_writer()` 逐行过滤+deflate，只保 3 个行缓冲；`StreamWriter::finish()` 收尾 zlib、IEND 由 `Writer::finish()`/`Drop` 写），**高度必须在 `write_header()` 前给出**；`Compression` 5 值 / `Filter` 7 值均可显式设置；`Limits::bytes`（默认 64 MiB）是**解码器内部**分配预算，**不是产物或解码后图像的上限** | **不改变设计**（F-12 成立、§17.7 的接口形状不变）；**但修正了 F-10 的推论**（见 `DEV-7`），并给 `P4.02` 定了参数（`Balanced`+`Up`） | §17.7 / §17.7.1 / §7 F-10 / §29.5 | P4.02、P1.21、P1.22 |
 | `RES-4` | （待填） | | §15.3/§16 | P1.04/P1.06–P1.09 |
 | `RES-5` | 待取得（需 125%/150% 显示器） | （可能改变门一） | §16.1 | P1.22 的 DPI 行 |
 | `RES-6` | （待填） | | §16.3/§16.4/§16.7 | P1.06–P1.12 |
@@ -711,7 +715,19 @@ git config core.hooksPath .githooks
 | 退出条件 | ① 12 组数据齐全；② 选定的一组有**两条**依据（速度 + 体积）；③ 回读验证通过（**这一条同时验证了 F-10 的 `Limits` 陷阱**） |
 | 提交信息标题 | `[P0-04] the png parameters are chosen from twelve measurements` |
 | 复杂度 / 阻塞 | M / 无 |
+| **状态** | **[x] 已完成**（2026-10-08）：12 组 + `baseline/image` 对照行全部测完（1280×30000、3 run、`--release`、**每组合独立进程**），并补 3840×30000 三行；选定 **`Compression::Balanced` + `Filter::Up`**（p50 2344 ms / 14.4 MiB / peak 16.5 MiB），两条依据 = **速度**（62.5 MiB/s 原始行、行循环逐行可中止，不进任何交互延迟预算）与**体积**（比同速度档的 `Fast/Adaptive` 小 **2.4×**；`High/Up` 多花 129% 只省 0.7%）。装置 = **新增** `apps/snapclip/tests/png_params_probe.rs` + **新增** `tools/p0-04-png-params.ps1`（替代原文的 `docs/Temp/` 一次性脚本，见 `DEV-6`）；结论已回填 `docs/30 §17.7.1`（新增整块）与 §29.5 的"解码上限"行、**F-10** 条目；**F-10 的"产物 >64 MiB 必须提高 `Limits` 否则假失败"被实测否定**（101.7 MiB 产物在默认 64 MiB 上限下解码成功，见 `DEV-7`） |
 | **对后续阶段的影响** | `P4.02` 的默认参数；`docs/30 §17.7` 的参数表；导出时间的量级 |
+
+**`P0.04` 的实测结论与一处偏离（2026-10-08）**
+
+- **装置与命令**：装置 = `apps/snapclip/tests/png_params_probe.rs`（3 个用例：`the_encoder_streams_rows_without_materializing_the_image`、`the_artifact_decodes_back_to_the_expected_pixels`、`#[ignore] perf2_measures_one_parameter_combination`）+ 驱动 `tools/p0-04-png-params.ps1`（写 `kind:"env"` 头记录，再为每组起一个进程，最后打印按 p50 排序的表）。命令 = `pwsh -File tools/p0-04-png-params.ps1`（默认 1280×30000/3 run）。工具链 `rustc 1.98.1`、`Cargo.lock` SHA256 `55F9BD80…C453965EFE`（§23.5 要求的两个哈希之一；二进制哈希是 `--release` 的 `png_params_probe-addf87d20a851ae4.exe`）。产物 = `docs/Temp/perf2-2026-10-08.jsonl`、`docs/Temp/perf2-4k.jsonl`、每组一份日志在 `docs/Temp/perf2-logs/`（均 gitignore）。
+- **RED 证据**：`cargo test -p snapclip-app --test png_params_probe` → `error[E0425]: cannot find function `chosen` in this scope`、同 `encode_streaming`（×2）、`default_decode_limits`、`decode_rgba` = **6 previous errors**，exit 1。
+- **GREEN**：同命令 → **2 passed / 0 failed / 1 ignored**（1.77 s）。两个编译错误是 `png` 0.18 的接口事实（已回填 V2 **F-12**）：① `StreamWriter` 需要 `use std::io::Write as _;` 才能调 `write_all`；② **`into_stream_writer()` 要求 `W: 'static`**，对 `&mut Vec<u8>` 报 `E0310` ⇒ 实现必须用借用形态 `writer.stream_writer()`，再 `stream.finish()` + `writer.finish()`（IEND 只在后者写）。
+- **退出条件逐条**：① **12 组数据齐全**——是，另加 `baseline/image` 对照行（今天 `snapclip_history::image::encode_png` 的整图路径）与 4K 宽三行；② **选定组有速度 + 体积两条依据**——是（见上，`docs/30 §17.7.1` 记了两条理由与"不是更快更好"的反例 `High/NoFilter`）；③ **回读验证通过**——是，**16 行全部 `decode_ok = true`**（逐行逐字节与 `row_bgra` 的期望值比对），并顺带**否证了 F-10 的推论**（见 `DEV-7`）。
+- **装置净增**：`apps/snapclip/tests/png_params_probe.rs`（新，测试专用）、`apps/snapclip/Cargo.toml`（`[dev-dependencies]` 加 `png = "0.18"`，**不是**普通依赖 ⇒ `snapclip-capture` 仍看不到 `png`）；**仓库 lib 测试计数不变**（集成测试不计入 `--lib`）。
+- **一处偏离（`DEV-6`）**：原文的"前置未完成则用 `docs/Temp/` 一次性脚本"与"必要时把 `png` 提升为 shell 直接依赖"两处措辞都未采用，实际做法与理由见 §0.6 的 `DEV-6` 行。
+- **留给 `P4.02` 的三条**：① 默认参数 = `Balanced + Up`（不是原文 §16 暂定的"`Fast` + `Sub` 启动值"）；② 解码验证**仍应显式提高** `png::Limits{bytes}`（零代价防御），但**不得**把"提高上限"写成解码成功的必要条件；③ `StreamWriter` 的借用形态与"`finish()` 只收尾 zlib、IEND 归 `Writer`"必须照抄，否则会写出一条不能编译或产出无 IEND 文件的实现。
+- **门禁（2026-10-08）**：`cargo check --workspace --all-targets` = **0 error / 1 warning**（仅既有 `unused variable: content_label`，`apps/snapclip/src/history/view.rs`）；`cargo test --workspace --lib` = **483 passed / 14 ignored / 0 failed**（app 56+3、capture 353+11、history 51、model 23——与 `P0.09` 之后一致，因为本任务是集成测试）；`tools/check-dependency-direction.ps1` = **clean**（capture 30 / history 47 / model 8 包，`png` 未进入任何一个的 normal 图）。
 
 ### P0.05 `E-CAP-1`（最小版）：窗口级 WGC 对五类目标各取 10 帧
 
@@ -1295,7 +1311,7 @@ git config core.hooksPath .githooks
 **上游**：V2 §17.7、§27.5、P0.04 ｜ **第一性原理**：**依赖方向**（编码器是**输出格式**的选择，不是捕获的事实 → 它属于 shell）｜ **前置**：P4.01 ｜ **可并行**：与 P4.03（G12）｜ **批次**：`[P4-A]` ｜ **层级/分类**：L2 + L4 / B + E ｜ **复杂度**：M ｜ **阻塞**：无
 
 - **RED**：`the_sink_streams_without_materializing_the_image()`（编码期间 `peak − live` 不超过"一份条带"量级）+ `the_artifact_decodes_back_to_the_expected_pixels()`。**预期失败原因**：实现不存在
-- **GREEN**：`apps/snapclip/src/capture/` 内实现 `PngRowBandSink`，用 `png::Encoder::stream_writer()`；**显式设置压缩/滤波参数**（取 `P0.04` 选定的一组）；解码验证时**显式提高 `png::Limits{bytes}`**（F-10 的陷阱：默认限制会让 >64 MiB 的产物"假失败"）
+- **GREEN**：`apps/snapclip/src/capture/` 内实现 `PngRowBandSink`，用 `png::Encoder::stream_writer()`（**借用形态**：`into_stream_writer()` 要求 `W: 'static`，对 `&mut Vec<u8>` 报 `E0310`）；**显式设置压缩/滤波参数 = `Compression::Balanced` + `Filter::Up`**（`P0.04` 已实测选定，`docs/30 §17.7.1`）；收尾必须是 `stream.finish()` **再** `writer.finish()`（IEND 只在后者写）；解码验证时**显式提高 `png::Limits{bytes}`**——这是**零代价防御**，但**不得**把"默认 64 MiB 会假失败"写成断言条件（`DEV-7`：实测 101.7 MiB 的产物在默认上限下解码成功）
 - **REFACTOR**：把 `png` 出现在**哪个 crate** 写成注释（shell 可以，capture 不可以），并让 §28.4 的门禁**同时覆盖**这一条
 - **退出条件**：① 两个用例通过；② `tools/check-dependency-direction.ps1` 干净；③ `P0.04` 的选定参数生效（可用一个参数断言）
 - **提交标题**：`[P4-02] the encoder belongs to the shell, the rows belong to the capture`
@@ -1653,7 +1669,7 @@ git config core.hooksPath .githooks
 
 ### 13.9 三个硬要求（写测试时的**前置知识**，漏了会造成假红/假绿）
 
-1. **导出后解码比对的测试，在产物 > 64 MiB 时必须显式提高 `png::Limits{bytes}`**，否则会**假失败**（F-10）。受影响：`P1.21`、`P4.02`、`P4.05`、`P1.24` 的大长度档。
+1. **导出后解码比对的测试，显式提高 `png::Limits{bytes}` 是零代价的防御**——但**不是"否则会假失败"的必要条件**：`P0.04` 实测（2026-10-08）在 `Limits::default()`（64 MiB）下解码成功了一个 **101.7 MiB 的产物**与 3840×30000（解码后 460 MB）的图像，因为该预算是**解码器内部**分配的上限（`reserve_bytes()` 逐次递减），与产物/图像大小无关（F-10 的事实部分成立，推论被推翻，见 `DEV-7`）。受影响：`P1.21`、`P4.02`、`P4.05`、`P1.24` 的大长度档。
 2. **内存测试必须同时记 `allocated` 与 `peak`，并单独记换出文件大小**（参考项目 `benchmark-support/README.md` 的教训："堆流量不能证明空间下降（存储搬到 OS 映射时）"）。受影响：`P4.07`、`P5.02`、`P1.20`。
 3. **性能断言只能建立在 `E-PERF-*` 的产物上**（AGENTS.md 第 6 条：性能优化必须有依据）。在 `P0.03`/`P0.04`/`E-PERF-3` 完成前，**任何 `⏳` 格子不得填数字**（用户 §44-9/§44-10）。
 
@@ -1807,6 +1823,7 @@ git config core.hooksPath .githooks
 | workspace | 无 | `cargo check --workspace --all-targets` |
 
 **唯一可能的例外**：`P0.04` 若发现 V2 §17.7 的"必须显式设置压缩/滤波参数"在既有 `image` 版本上不可表达，则需要把 `png` 提升为 shell 的直接依赖 —— **这属于 shell，不违反 N7**，但必须在 `P0.04` 的产物里**写明并说明为什么**。
+> **实测结果（2026-10-08，`DEV-6`）**：`png` 0.18.1 的 `Encoder::set_compression()`/`set_filter()` 完全可表达，且它**已在** shell 的依赖图里（`baseline/image` 路径 → `image` 0.25.10 → `png` 0.18.1）；因此本任务**没有**把它提升为普通依赖，只加进 `apps/snapclip/Cargo.toml` 的 **`[dev-dependencies]`**（`png = "0.18"`，数值必须写 `0.18` 而非 `"0.18.1"`/不写——`cargo tree -p snapclip-app -i png` 会因 `0.17.16` 与 `0.18.1` 同时在图里而报 **`error: specification png is ambiguous`**）。`P4.02` 才需要把它提升为 shell 的普通依赖（那时 `snapclip-capture` 依然看不到它）。
 
 ### 15.3 消息 ID 与常量分配
 

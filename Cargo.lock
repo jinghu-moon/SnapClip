@@ -6489,6 +6489,7 @@ dependencies = [
  "blake3",
  "encoding_rs",
  "gpui-kit",
+ "png 0.18.1",
  "rclip-rtf",
  "serde",
  "serde_json",

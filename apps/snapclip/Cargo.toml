@@ -70,3 +70,10 @@ test-support = ["gpui-kit/test-support"]
 blake3 = "1.5"
 # Same version and source as the normal dependency, with the helpers the guides require.
 gpui-kit = { version = "0.7", features = ["test-support"] }
+
+# Test-only *for now*: `tests/png_params_probe.rs` (docs/31 P0.04) has to drive the encoder
+# that P4.02 will put in this crate, so it measures the real thing rather than a lookalike.
+# P4.02 promotes this line to `[dependencies]` when `PngRowBandSink` lands; `snapclip-capture`
+# must never see it (docs/30 §17.7, docs/31 P4.01). 0.18 is the version `image` 0.25 already
+# puts in this graph, so this adds an edge, not a second copy.
+png = "0.18"
