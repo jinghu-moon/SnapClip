@@ -23,15 +23,54 @@
 
 ### 0.2 阶段门禁矩阵（**P1 之后 `src-tauri` 不再是全部门禁的所在地**）
 
+> **⚠ 当前状态（2026-10-08 复核，P6 已落地，tag `refactor-p6` = 提交 `d7b5708`）**：
+> `src-tauri/` **已删除**，Tauri 与 Vue 前端均不存在，workspace 只剩 `crates/snapclip-model`、`crates/snapclip-capture`、`crates/snapclip-history`、`apps/snapclip` 四个成员。
+> 因此下表里 **G0 那一行是历史记录，命令今天已不可执行**；G2 的壳包名是 **`snapclip-app`**（不是 `snapclip`）。
+> **今天唯一需要跑的门禁**是 G1 + G2 合并后的这一组（仓库根执行）：
+>
+> ```powershell
+> cargo check --workspace --all-targets
+> cargo test --workspace --all-targets
+> cargo test -p snapclip-app          # 壳的 #[gpui_kit::test] / VisualTestContext
+> powershell -NoProfile -ExecutionPolicy Bypass -File tools/check-dependency-direction.ps1
+> ```
+
 各阶段用的命令不同，必须按阶段选。**每个任务跑该阶段"受影响"的快门禁；每个阶段结束跑完整门禁。**
 
 | 阶段 | 门禁组 | 命令（在仓库根执行，除非另注） |
 | --- | --- | --- |
-| G0 · 旧 Tauri 阶段（P0–P0.5，以及 P1 迁移期间） | 完整 | `cargo test --lib --manifest-path src-tauri/Cargo.toml`<br>`cargo check --all-targets --manifest-path src-tauri/Cargo.toml`（**T0.3 之前没有 workspace 根**，此时 `--workspace` 会直接报 "could not find Cargo.toml"；T0.3 之后改用 `cargo check --workspace --all-targets`）<br>探针（见下，同样带 `--manifest-path`） |
+| G0 · 旧 Tauri 阶段（P0–P0.5，以及 P1 迁移期间） | 完整 | **历史（`src-tauri/` 已删，不可复现）**：`cargo test --lib --manifest-path src-tauri/Cargo.toml`<br>`cargo check --all-targets --manifest-path src-tauri/Cargo.toml`（**T0.3 之前没有 workspace 根**，此时 `--workspace` 会直接报 "could not find Cargo.toml"；T0.3 之后改用 `cargo check --workspace --all-targets`）<br>探针（见下，同样带 `--manifest-path`） |
 | G1 · workspace / capture / history / recognize 阶段（P1 之后） | 完整 | `cargo test --workspace --all-targets`<br>`cargo check --workspace --all-targets`<br>探针改为按包跑：`cargo test -p snapclip-capture --lib browser_element_probe -- --ignored --nocapture`（Explorer 同理）<br>**依赖方向门禁**：`powershell -NoProfile -ExecutionPolicy Bypass -File tools/check-dependency-direction.ps1`（T1.9 落地） |
-| G2 · GPUI 阶段（P4 之后） | 完整 | `cargo test --workspace --all-targets`<br>`cargo test -p snapclip`（壳的 `#[gpui_kit::test]` / `VisualTestContext`）<br>G1 的探针与依赖方向门禁仍然要跑 |
+| G2 · GPUI 阶段（P4 之后） | 完整 | `cargo test --workspace --all-targets`<br>`cargo test -p snapclip-app`（壳的 `#[gpui_kit::test]` / `VisualTestContext`）<br>G1 的探针与依赖方向门禁仍然要跑 |
 
-依赖方向门禁的阴性对照（证明它会红，而不是永远绿）：`… -File tools/check-dependency-direction.ps1 -Package snapclip` 必须失败——壳确实依赖 `tauri`/`wry`/`rusqlite`/`arboard`。
+> **包名更正（2026-10-08）**：本表原写 `cargo test -p snapclip`，该包名**从不存在**——壳的包名是 `snapclip-app`（`apps/snapclip/Cargo.toml:2`），目录名才是 `apps/snapclip`。
+
+**依赖方向门禁的阴性对照（修订，2026-10-08）**：
+
+原写法是 `… -File tools/check-dependency-direction.ps1 -Package snapclip` "必须失败——壳确实依赖 `tauri`/`wry`/`rusqlite`/`arboard`"。**这条今天有三重错误**：
+
+1. `snapclip` 包名不存在 → 命令以 `error: package ID specification 'snapclip' did not match any packages` 退出 1，**红在了"包不存在"上，不是红在"检测到违规依赖"上**。
+2. 换成本壳的正确包名 `-Package snapclip-app` **同样必红**：脚本对不在 `$FORBIDDEN` 表里的目标套用**最严清单**（`tools/check-dependency-direction.ps1:73-76`：`$SHELL_ONLY + @("snapclip-capture","snapclip-history","snapclip-recognize")`），而壳**按设计**必须依赖 `gpui-kit` 与两个能力 crate。实测输出恰为三条、**没有** `tauri`/`wry`/`rusqlite`/`arboard`：
+   ```
+   checked snapclip-app: 397 packages in its normal graph
+   dependency direction violated:
+     - snapclip-app depends on gpui-kit
+     - snapclip-app depends on snapclip-capture
+     - snapclip-app depends on snapclip-history
+   ```
+   即：**壳不能再当阴性对照**——它今天红的原因是"脚本把 `$SHELL_ONLY` 当成陌生包的禁用清单"，与门禁要防的方向性违规无关。
+3. P6 之后壳已无 `tauri`/`wry`/`rusqlite`/`arboard`（实测都不在 `snapclip-app` 的 397 包 normal 图里），所以原文的判据连事实前提也不成立了。
+
+**正确的阴性对照**是"注入一条真实违规，断言门禁为红"。可用的注入形式（任选其一，跑完恢复）：
+
+```powershell
+# 在 crates/snapclip-capture/Cargo.toml 的 [dependencies] 里临时加一行 rusqlite = "0.37"，然后：
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/check-dependency-direction.ps1
+# 期望：snapclip-capture depends on rusqlite -> exit 1；删除该行后恢复 "dependency direction is clean" -> exit 0
+```
+
+> 正例基线（2026-10-08 实测）：`snapclip-capture` 30 包 / `snapclip-history` 47 包 / `snapclip-model` 8 包，`dependency direction is clean`，exit 0。
+> **门禁脚本本身的一处待修**：`-Package <未知包>` 的兜底（`:73-76`）把 `$SHELL_ONLY`（语义是"只允许出现在壳里"）当作"该包不得依赖"的禁用清单，对壳正好说反了。修法是在该分支显式要求调用方给出真正想验证的方向，或把兜底改成"仅当目标是能力 crate 时才用最严清单"。这属于代码改动，**不在本轮文档修正范围内**，先记在此处。
 
 探针命令（**必须串行**，之间停 3 秒，避免互相抢焦点）：
 
@@ -233,14 +272,14 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 | T1.4 | 迁移平台无关 capture（20 文件） | T1.3 | 10 686 行 | 中 | [x]（提交 652afbb） |
 | T1.5 | 迁移 Windows 实现（20 文件） | T1.4 | 18 256 行 | 高 | [x]（提交 652afbb） |
 | T1.6.1 | 拆出 `overlay/window_host.rs`（计划名 `window` 与 `win::window` 撞名） | T1.5 | — | 高 | [x]（提交 0d97910） |
-| T1.6.2 | 拆出 `overlay/input.rs` | T1.6.1 | — | 高 | **顺延（D3）** |
-| T1.6.3 | 拆出 `overlay/state.rs` | T1.6.2 | — | 高 | 部分 [x]（值类型已出列，提交 42ce51b；控制器侧的状态方法顺延（D3）） |
-| T1.6.4 | 拆出 `overlay/render_submit.rs` | T1.6.3 | — | 高 | **顺延（D3）** |
-| T1.6.5 | 拆出 `overlay/window_restore.rs` + 组收尾 | T1.6.4 | 4 423 行（整组） | 高 | **顺延（D3）** |
+| T1.6.2 | 拆出 `overlay/input.rs` | T1.6.1 | — | 高 | [x]（**2026-10-08 更正：已完成**，提交 `80bd318` `refactor(capture): overlay.rs, third slice - input moves to input.rs`；原文"顺延（D3）"已过期） |
+| T1.6.3 | 拆出 `overlay/state.rs` | T1.6.2 | — | 高 | [x]（值类型已出列，提交 `42ce51b`；**控制器侧的状态方法也已完成**——`overlay/state.rs` 现存 11 737 B，与 `session.rs` 并列，原文"顺延（D3）"已过期） |
+| T1.6.4 | 拆出 `overlay/render_submit.rs` | T1.6.3 | — | 高 | [x]（**2026-10-08 更正：已完成**，提交 `bae01d3` `refactor(capture): overlay.rs, first slice - the presentation half moves to render_submit`；原文"顺延（D3）"已过期） |
+| T1.6.5 | 拆出 `overlay/window_restore.rs` + 组收尾 | T1.6.4 | 4 423 行（整组） | 高 | [x]（**2026-10-08 更正：已完成**，`window_restore.rs` 提交 `d257fda`、`session.rs` 提交 `8b1839b`、`hover.rs` 提交 `ed19d15`；`overlay/` 今天共 8 个文件，原文"顺延（D3）"已过期） |
 | T1.7 | `uia_provider.rs` 测试搬家 | T1.5 | 3 338 行（测试 72%） | 中 | [ ] |
-| T1.8 | 拆 `d2d.rs`（4 pass + 文本） | T1.5 | 3 805 行 | 中 | 部分 [x]（tests/helpers/magnifier 已出列，提交 57d57a9；frame/mask/text 三个 pass 顺延（D3）） |
-| T1.9 | 依赖方向与接缝门禁落地 | T1.5 | 1 脚本 | 低 | [x]（`tools/check-dependency-direction.ps1`，正例绿/阴性对照红） |
-| T1.10 | 阶段验收 + tag `refactor-p1` | T1.6.1–T1.9 | — | 低 | [x]（tag 已打；**T1.6/T1.8 的剩余拆分按 D3 顺延**，见 §14.19） |
+| T1.8 | 拆 `d2d.rs`（4 pass + 文本） | T1.5 | 3 805 行 | 中 | 部分 [x]（tests/helpers/magnifier 已出列，提交 `57d57a9`；**frame/mask/text 三个 pass 确实仍未拆**——`windows/win/d2d.rs` 现存 1 589 行，`windows/win/d2d/` 下只有 `helpers.rs`/`magnifier_pass.rs`/`tests.rs`。**这条"顺延（D3）"是准确的，保留**） |
+| T1.9 | 依赖方向与接缝门禁落地 | T1.5 | 1 脚本 | 低 | [x]（`tools/check-dependency-direction.ps1`；**阴性对照已于 2026-10-08 修订**——原文用 `-Package snapclip` 已失效，见 §0.2） |
+| T1.10 | 阶段验收 + tag `refactor-p1` | T1.6.1–T1.9 | — | 低 | [x]（tag 已打；**2026-10-08 更正：T1.6 整组已完成**（`input.rs`/`render_submit.rs`/`window_restore.rs`/`session.rs`/`hover.rs`），仅 **T1.8 的 frame/mask/text 三个 pass** 真正顺延，见 §14.19） |
 | T2.1 | `ArtifactRef`/`CaptureOutput` 在 `snapclip-model` 定死（**不建 crate**） | T1.10 | 2 文件 | 低 | [x]（`artifact.rs`，含 2 个测试） |
 | T2.2 | `snapclip-history` 骨架 | T2.1 | 3 文件 + 门禁扩展 | 低 | [x]（crate 建立、成员加入、依赖门禁覆盖三个 crate） |
 | T2.3 | 两个独立存储：`CaptureArtifactStore` + `ClipboardBlobStore` | T2.2 | 2 文件 + 错误类型 | 中 | [x]（含 5 个测试；cleanup/LRU 如实记为未实现） |
@@ -266,8 +305,8 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 | T4.7 | 测试三层 + 无障碍树断言（**先 spike**） | T4.3–T4.6 | ~4 文件 | 中 | [x]（尖刺结论：a11y 断言可用，门禁**不降级**；键盘/筛选/删除/事件/设置/托盘建删均已覆盖，见 §14.43） |
 | T4.8 | 性能对比（对 §1.2 基线） | T4.7 | — | 中 | 部分 [x]（debug **与 release** 已实测，见 §14.39、§14.44；**"同一工作量"的对比只能等 P6**） |
 | T4.9 | 阶段验收 + tag `refactor-p4` | T4.8 | — | 低 | [x]（门禁矩阵 + tag + 回退演练，见 §14.45） |
-| T5.x | 进程插件边界（**触发式**，见 §9） | 判据成立 | — | 高 | [ ] |
-| T6.x | 删除 Tauri 与旧目录 | T4.9 | — | 中 | [ ] |
+| T5.x | 进程插件边界（**触发式**，见 §9） | 判据成立 | — | 高 | [ ]（**判据今天仍不成立，保持未开工**：§9 要求"出现第二个真实实现且资源模型明显不同"或"profiling/崩溃数据证明必须进程隔离"，两者都没有证据） |
+| T6.x | 删除 Tauri 与旧目录 | T4.9 | — | 中 | **部分 [x]（2026-10-08 复核）**——主体已完成：提交 `d7b5708` `refactor(P6): the Tauri shell and the Vue front-end are gone`，tag `refactor-p6` 已打；`cargo tree -i tauri` 与 `-i wry` 实测均报 `did not match any packages`；`.vue`/`src/shared/contracts.ts`/`src/` 实测零命中；`package.json` 只剩 `ocr:serve` + `audit:tokens` 两个脚本。**但验收清单第 3 条未满足**：`rg -n tauri` 非文档部分仍命中 **37 个文件 / 62 行**，其中不只是注释——`README.md:5,15,24,27`（仍写"Tauri 2 + Vue 3 + `npm run tauri dev`"、依赖在 `src-tauri/`）、`.vscode/extensions.json:4`（仍推荐 `tauri-apps.tauri-vscode`）、`subfont/rust_literals.py:129`（仍指向已删除的 `src-tauri/src`）、`tools/check-dependency-direction.ps1:35`（`$SHELL_ONLY` 仍列 `tauri`/`wry`）。其余 55 行为 `.rs`/`.toml` 里的**历史性注释**（如 `apps/snapclip/Cargo.toml:9-11` 用已删除的 Tauri 宿主解释包名由来）。**清理归 `docs/30` §33.1 的 D-15（6 处失效架构注释）与 §35 的 `P6.3`**，不在此处展开） |
 
 ---
 
@@ -571,7 +610,7 @@ $f = Get-ChildItem src-tauri/src/<目录> -File; ($f | ForEach-Object { Get-Cont
 - **实测结果（2026-10-07，已完成）**：新增 `tools/check-dependency-direction.ps1`（与已有的 `tools/audit-design-tokens.mjs` 同族）。它做两件事：
   - 对 `snapclip-capture`：`cargo tree -e normal` 里不得出现 `tauri` / `wry` / `gpui` / `gpui-kit` / `rusqlite` / `arboard` / `snapclip-history` / `snapclip-recognize`（当前 **30 个包**，干净）；
   - 对 `snapclip-model`：只允许 serde 系（`serde`/`serde_core`/`serde_derive`/`serde_json` 及其 proc-macro 依赖），当前 **8 个包**，干净。
-  - **阴性对照**（证明门禁不是永远绿）：`-Package snapclip` 对壳跑，必须失败——实测报出 `snapclip depends on tauri / wry / rusqlite / arboard` 并 `exit 1` ✓。
+  - **阴性对照**（证明门禁不是永远绿）：`-Package snapclip` 对壳跑，必须失败——实测报出 `snapclip depends on tauri / wry / rusqlite / arboard` 并 `exit 1` ✓。**（记录保持原样：这是 2026-10-07 P1 当时的真实输出，当时壳确实是 Tauri 宿主、包名确实是 `snapclip`。P6 之后两者都不成立，该对照作废，替代写法见 §0.2。）**
   - 已写进 §0.2 的 G1/G2 门禁行。
 - 必须保持：现有 403 测试全绿。
 - 验收：故意造一次违规（临时给 capture 加 tauri 依赖）→ 检查必须红；撤销后绿。
@@ -1451,6 +1490,8 @@ P0.5 期间的决策：D2（OCR/recognize 本轮暂缓，P4/P6 不再依赖 P3�
 修改前测试：见 §14.14
 修改后测试：脚本正例 exit 0（capture 30 包 / model 8 包干净）；
           阴性对照 `-Package snapclip` exit 1 并列出 tauri/wry/rusqlite/arboard
+          （**2026-10-08 注：这是 P1 当时的真实输出。P6 删掉 Tauri 后该对照已作废——包名不存在、
+           且壳按设计必须依赖 gpui-kit 与两个能力 crate；替代写法见 §0.2。正例仍然有效且已复测。**）
 性能指标：脚本 <2 s
 人工验证：不涉及
 失败与根因：首次正例误报 `snapclip-model depends on snapclip-model` —— `cargo tree` 第一行是包
