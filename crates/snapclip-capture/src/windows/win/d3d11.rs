@@ -34,6 +34,33 @@ use ::windows::Win32::Graphics::Dxgi::Common::{
 };
 use ::windows::core::{Interface, Result as WinResult};
 
+/// Assert that the caller may use an immediate context owned by `owner`.
+///
+/// D3D11 serialises the commands *inside* a context, not the calls made from outside:
+/// two threads issuing commands to one immediate context is a race the compiler cannot
+/// see, and the only thing that used to stand between it and a corrupted frame was a
+/// comment ("Must be called from the overlay thread"). The comment is now an assertion
+/// (docs/30 §21.3, R-6, G10), so a violation fails loudly instead of silently reading a
+/// frame the GPU is still writing.
+///
+/// Debug builds only: in release the guard would turn a latent race into an application
+/// crash, and the release-time protection is the hand-off protocol itself
+/// (`OverlayController::graphics_released`, docs/30 §21.3) rather than this assertion.
+/// The debug build is where the invariant is *proved* — see
+/// `using_the_immediate_context_from_a_second_thread_panics`.
+#[cfg(debug_assertions)]
+fn assert_context_owner(owner: std::thread::ThreadId, what: &str) {
+    assert_eq!(
+        std::thread::current().id(),
+        owner,
+        "{what} ran on a thread that does not own the immediate context; \
+         one ID3D11DeviceContext has exactly one user thread (docs/30 §21.3)"
+    );
+}
+
+#[cfg(not(debug_assertions))]
+fn assert_context_owner(_owner: std::thread::ThreadId, _what: &str) {}
+
 /// A BGRA frame together with the texture that holds it.
 #[derive(Debug)]
 pub struct GpuFrame {
@@ -53,6 +80,11 @@ pub struct GpuFrame {
 pub struct GraphicsDevice {
     d3d: ID3D11Device,
     context: ID3D11DeviceContext,
+    /// The thread allowed to use `context`.
+    ///
+    /// Cloning shares the context, so a clone shares the owner too. Recorded instead of
+    /// assumed so `context()` can check it (docs/30 §21.3).
+    context_owner: std::thread::ThreadId,
     d2d: ID2D1Device,
     dxgi_factory: IDXGIFactory2,
 }
@@ -90,6 +122,7 @@ impl GraphicsDevice {
 
         Ok(Self {
             d3d,
+            context_owner: std::thread::current().id(),
             context,
             d2d,
             dxgi_factory,
@@ -100,9 +133,21 @@ impl GraphicsDevice {
         &self.d3d
     }
 
-    /// Access the immediate device context (same thread usage constraint as D2D).
-    pub fn context(&self) -> &ID3D11DeviceContext {
+    /// The immediate context, for a call site that owns it.
+    ///
+    /// Every internal use of `self.context` goes through here so the guard cannot be
+    /// bypassed by calling a helper instead of the accessor (docs/30 §21.3).
+    fn owned_context(&self, what: &str) -> &ID3D11DeviceContext {
+        assert_context_owner(self.context_owner, what);
         &self.context
+    }
+
+    /// Access the immediate device context (same thread usage constraint as D2D).
+    ///
+    /// The owner thread is the one that created the device; a call from any other
+    /// thread panics in debug builds (docs/30 §21.3). A clone shares that owner.
+    pub fn context(&self) -> &ID3D11DeviceContext {
+        self.owned_context("GraphicsDevice::context")
     }
 
 
@@ -275,10 +320,11 @@ impl GraphicsDevice {
         let staging_texture = staging_texture
             .ok_or_else(|| "staging CreateTexture2D returned nothing".to_string())?;
 
+        let context = self.owned_context("GraphicsDevice::read_back_bgra");
         unsafe {
-            self.context.CopyResource(&staging_texture, texture);
+            context.CopyResource(&staging_texture, texture);
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            self.context
+            context
                 .Map(&staging_texture, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
                 .map_err(|error| super::hresult("ID3D11DeviceContext::Map", &error))?;
 
@@ -288,7 +334,7 @@ impl GraphicsDevice {
                 let source = (mapped.pData as *const u8).add(row * mapped.RowPitch as usize);
                 pixels.extend_from_slice(std::slice::from_raw_parts(source, row_bytes));
             }
-            self.context.Unmap(&staging_texture, 0);
+            context.Unmap(&staging_texture, 0);
             Ok(pixels)
         }
     }
@@ -352,11 +398,12 @@ impl GraphicsDevice {
             bottom: y.saturating_add(height),
             back: 1,
         };
+        let context = self.owned_context("GraphicsDevice::read_back_region_bgra");
         unsafe {
-            self.context
+            context
                 .CopySubresourceRegion(&staging_texture, 0, 0, 0, 0, texture, 0, Some(&src_box));
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            self.context
+            context
                 .Map(&staging_texture, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
                 .map_err(|error| super::hresult("Map(region staging)", &error))?;
 
@@ -366,7 +413,7 @@ impl GraphicsDevice {
                 let source = (mapped.pData as *const u8).add(row * mapped.RowPitch as usize);
                 pixels.extend_from_slice(std::slice::from_raw_parts(source, row_bytes));
             }
-            self.context.Unmap(&staging_texture, 0);
+            context.Unmap(&staging_texture, 0);
             Ok(pixels)
         }
     }
@@ -453,6 +500,12 @@ impl Drop for CompositionTarget {
 /// `poll` uses `Map(DO_NOT_WAIT)` to check if the GPU finished without blocking.
 pub struct AsyncSampleBuffer {
     context: ID3D11DeviceContext,
+    /// Owner thread of `context`, inherited from the device the slots were built on.
+    ///
+    /// The buffer holds a *clone* of the immediate context, and a clone is still the
+    /// same single-threaded context, so the guard has to travel with it or the
+    /// accessor check could be bypassed simply by cloning (docs/30 §21.3).
+    owner: std::thread::ThreadId,
     slots: [ID3D11Texture2D; 3],
     next_slot: usize,
     pending: [bool; 3],
@@ -463,7 +516,11 @@ const SLOT_COUNT: usize = 3;
 
 impl AsyncSampleBuffer {
     /// Allocate staging textures. Call once per overlay session.
-    pub fn new(device: &ID3D11Device, context: &ID3D11DeviceContext) -> Result<Self, String> {
+    ///
+    /// Takes the device rather than a bare `(device, context)` pair so the owner comes
+    /// from the context's own record instead of whichever thread happens to call this
+    /// (docs/30 §21.3).
+    pub fn new(device: &GraphicsDevice) -> Result<Self, String> {
         let staging_desc = D3D11_TEXTURE2D_DESC {
             Width: SAMPLE_TILE,
             Height: SAMPLE_TILE,
@@ -479,7 +536,7 @@ impl AsyncSampleBuffer {
         let mut slot_vec: Vec<ID3D11Texture2D> = Vec::with_capacity(SLOT_COUNT);
         for _ in 0..SLOT_COUNT {
             let mut tex: Option<ID3D11Texture2D> = None;
-            unsafe { device.CreateTexture2D(&staging_desc, None, Some(&mut tex)) }
+            unsafe { device.device().CreateTexture2D(&staging_desc, None, Some(&mut tex)) }
                 .map_err(|e| super::hresult("CreateTexture2D(sample staging)", &e))?;
             slot_vec.push(tex.ok_or_else(|| "CreateTexture2D returned null".to_string())?);
         }
@@ -487,7 +544,8 @@ impl AsyncSampleBuffer {
             .try_into()
             .map_err(|_| "slot count mismatch".to_string())?;
         Ok(Self {
-            context: context.clone(),
+            context: device.context.clone(),
+            owner: device.context_owner,
             slots: arr,
             next_slot: 0,
             pending: [false; SLOT_COUNT],
@@ -498,7 +556,7 @@ impl AsyncSampleBuffer {
     /// into the next free staging slot. Returns the slot index.
     ///
     /// Non-blocking: the GPU operation is queued to the immediate context.
-    /// Must be called from the overlay thread.
+    /// Panics in debug builds when called from a thread other than the context owner.
     pub fn submit(
         &mut self,
         source: &ID3D11Texture2D,
@@ -506,6 +564,7 @@ impl AsyncSampleBuffer {
         y: u32,
         tile_size: u32,
     ) -> Result<usize, String> {
+        assert_context_owner(self.owner, "AsyncSampleBuffer::submit");
         let slot = self.next_slot;
         self.next_slot = (self.next_slot + 1) % SLOT_COUNT;
         let src_box = D3D11_BOX {
@@ -534,6 +593,7 @@ impl AsyncSampleBuffer {
     /// Returns the full `tile_size × tile_size` BGRA data (tightly packed) on success.
     /// Returns `None` if still in flight, `Some(Err(...))` on failure.
     pub fn poll(&mut self, slot: usize) -> Option<Result<Vec<u8>, String>> {
+        assert_context_owner(self.owner, "AsyncSampleBuffer::poll");
         if slot >= SLOT_COUNT || !self.pending[slot] {
             return None;
         }
@@ -782,7 +842,7 @@ mod tests {
         use super::{AsyncSampleBuffer, SAMPLE_TILE};
         use std::time::{Duration, Instant};
 
-        let mut buffer = AsyncSampleBuffer::new(device.device(), device.context()).unwrap();
+        let mut buffer = AsyncSampleBuffer::new(device).unwrap();
         let slot = buffer.submit(source, 64, 64, SAMPLE_TILE).unwrap();
         let deadline = Instant::now() + Duration::from_millis(1_000);
         loop {
@@ -824,6 +884,77 @@ mod tests {
         let monitor = monitor::captured_monitor_at_cursor().unwrap();
         let frame = super::super::wgc::capture_monitor(&device, &monitor).unwrap();
         probe_async_sample(&device, &frame.texture);
+    }
+
+    /// The immediate context has exactly one *user* at a time (docs/30 §21.3, R-6).
+    ///
+    /// D3D11 does not serialise two threads issuing commands to one immediate context,
+    /// and the compiler cannot see the race: today the only thing standing between a
+    /// second thread and a corrupted frame is a comment. The guard turns that comment
+    /// into a panic, so this test proves a violation fails *loudly* rather than
+    /// silently reading a frame the GPU is still writing.
+    ///
+    /// Without a D3D11 device there is nothing to guard, and a silent skip would
+    /// report "the invariant holds" for a check that never ran (docs/31 §2.4).
+    #[test]
+    fn using_the_immediate_context_from_a_second_thread_panics() {
+        let device = GraphicsDevice::create().expect(
+            "this test needs a D3D11 device; without one the context guard cannot be checked",
+        );
+        // The creating thread owns the context, so one use here is legal.
+        let _ = device.context();
+
+        let handed_over = device.clone();
+        let second_thread = std::thread::spawn(move || {
+            let _ = handed_over.context();
+        })
+        .join();
+
+        assert!(
+            second_thread.is_err(),
+            "a second thread used the immediate context without panicking: the guard is not wired to the accessor"
+        );
+    }
+
+    /// `T-THREAD-1`: **the shape production uses today** (docs/30 §21.3 step 1).
+    ///
+    /// The capture worker creates the process's only `GraphicsDevice`
+    /// (`capture_worker.rs:373` → `providers.rs:295`) and hands an `Arc` of it to the
+    /// overlay thread through `FrozenFrame::device()`; that thread builds `Win32Renderer`
+    /// from it (`overlay/window_restore.rs:22-27`) and submits magnifier tiles
+    /// (`overlay/session.rs:565` → `renderer.rs:311`). The environment assertion below
+    /// is that hand-off, so the guard firing here is the measurement, not a bug in the
+    /// test: it says the invariant "one owner thread" is false in production, and that
+    /// no library test can see it because every test creates and uses a device on one
+    /// thread.
+    ///
+    /// Delete this test when docs/30 §21.3 step 2 (deferred context, or an explicit
+    /// hand-off) makes the shape legal and the guard therefore stays silent.
+    #[test]
+    #[ignore = "records today's cross-thread use; delete when docs/30 §21.3 step 2 lands"]
+    fn the_production_hand_off_trips_the_context_guard() {
+        use super::{AsyncSampleBuffer, SAMPLE_TILE};
+
+        let device = std::thread::spawn(|| {
+            GraphicsDevice::create().expect("the capture worker creates the only device")
+        })
+        .join()
+        .expect("the worker thread creates the device");
+        let frame = device
+            .create_bgra_texture(64, 64, &vec![0u8; 64 * 64 * 4])
+            .expect("the device allocates textures from any thread");
+
+        let mut buffer =
+            AsyncSampleBuffer::new(&device).expect("the sample buffer allocates staging slots");
+        let tripped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = buffer.submit(&frame.texture, 0, 0, SAMPLE_TILE);
+        }))
+        .is_err();
+
+        assert!(
+            tripped,
+            "the overlay thread used the capture worker's immediate context without tripping the guard"
+        );
     }
 }
 

@@ -131,8 +131,7 @@ impl Win32Renderer {
         layout: &MonitorLayout,
         device: Arc<GraphicsDevice>,
     ) -> Result<Self, String> {
-        let sample_buffer =
-            AsyncSampleBuffer::new(device.device(), device.context())?;
+        let sample_buffer = AsyncSampleBuffer::new(&device)?;
         let d2d = D2dRenderer::new(device, layout.dpi)?;
         let composition = d2d.composition_target(window)?;
         let mut renderer = Self {
