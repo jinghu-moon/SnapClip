@@ -821,7 +821,15 @@ mod tests {
         let Ok(device) = GraphicsDevice::create() else {
             return;
         };
-        let monitor = monitor::captured_monitor_at_cursor().unwrap();
+        // The monitor under the cursor is the cheapest way to get a real one, but it is not the
+        // subject of this test: `GetCursorPos` fails with `ERROR_ACCESS_DENIED` whenever the
+        // process is not on the input desktop (`docs/31` R-20), and every neighbouring probe
+        // already treats that as "no desktop to measure on" rather than as a failure
+        // (`monitor.rs:345`, `providers.rs:689`, `providers.rs:726`, `bitblt.rs:155`).
+        let Ok(monitor) = monitor::captured_monitor_at_cursor() else {
+            eprintln!("no readable cursor position; skipping the WGC sample probe");
+            return;
+        };
         let frame = super::super::wgc::capture_monitor(&device, &monitor).unwrap();
         probe_async_sample(&device, &frame.texture);
     }
