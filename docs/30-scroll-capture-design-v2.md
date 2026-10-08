@@ -1241,7 +1241,7 @@ V2 的全部新增代码落在 `crates/snapclip-capture/src/scroll/` 之下；**
 
 ```
 [用户] 触发滚动截图（热键 / 托盘 / 覆盖层按钮 / 目标右键菜单）
-   │  实时，UI 线程
+   │  实时（**覆盖层线程**；热键由覆盖层自己 `RegisterHotKey`）
    ▼
 [目标选择]  TopLevelWindowFrame + 滚动能力探测 + 当前位置探测      ── §12
    │  异步（探测可能含同步 COM/UIA 调用，见 §12.4）；结果 = ScrollTarget
@@ -2227,9 +2227,17 @@ enum PreviewUpdate {
 
 1. **容量 1、最新覆盖旧的**（与仓库既有的 4 套信箱协议同构，§5）。理由：预览是**幂等的状态**，不是事件流；丢掉中间态不损失任何信息。`dropped` 计数保证"丢了多少次"可见（G12）。
 2. **`PreviewUpdate` 不携带像素**，只携带"哪一段可读了"。像素通过 `BandStore` 的只读句柄取得。理由：避免在 `Mutex` 里搬大块内存；也避免 §17.5 的条带被复制。
-3. **UI 线程只做一件事**：`try_recv` → 若拿到 `Bands` 则**取一次只读句柄**→ 交给 GPUI 绘制。**不允许在 UI 线程做降采样、PNG 解码、磁盘 I/O**（§21.2 的禁止清单）。
+3. **覆盖层线程只做一件事**：`try_recv` → 若拿到 `Bands` 则**取一次只读句柄** → 交给覆盖层的 D2D 绘制。**不允许在覆盖层线程做降采样、PNG 解码、磁盘 I/O**（§21.2 的禁止清单）。
 4. **更新频率上限 10 Hz（初始值，`E-PERF-4` 校准）**，而不是每步都更新。理由："预览是给人看的"；且缩略降采样本身有成本（`O(新增面积)`）。**10 Hz 的来源是"人眼在滚动过程中不需要比这更细的更新"，这是一个可从需求推出的上界，不是实测出来的常数**——因此它被标为可校准。
 5. **它绝不阻塞生产者**：`send` 用 `try_lock` + 覆盖，失败则累加 `dropped` 并继续。理由：预览慢不得影响采集（G1 的正确性优先级高于 G7 的性能）。
+
+**这个面板由谁绘制：覆盖层窗口，不是 GPUI。** 本节与 §21 里滚动语境下的"UI 线程"**一律指覆盖层线程**（`snapclip-capture-overlay`，§9.4）。三条理由：
+
+1. **它今天已经是这样**。拍摄期的全部界面（选区、工具条、放大镜、颜色读数）都是 `snapclip-capture` 自己的 Win32 + D2D 覆盖层窗口在画，预览也不例外（§9.4 的"预览呈现"就在覆盖层线程的职责清单里，`d2d.rs:681-687` 是今天的实现）。面板加在同一张窗口上**不需要新窗口、新线程或新的输入通道**。
+2. **门禁不允许另一种写法**。`tools/check-dependency-direction.ps1:35,37` 把 `gpui`/`gpui-kit` 列进 `$SHELL_ONLY` 并禁止 `snapclip-capture` 依赖它。若面板由 GPUI 绘制，就必须在捕获期把像素或"哪段可读"的句柄送到 shell——那是一条**跨 crate 的实时通道**加一个**捕获期新增的 shell 窗口**，两者都是新实体（§3.9 的 Occam 检查）。
+3. **shell 的角色不变**。shell（GPUI）仍然只做历史/设置，并通过 `CaptureRuntime` 的事件接口收到会话结果（§9.2 的 `AppEvent::Scroll(ScrollProgress)`）；它**不参与**捕获期的任何绘制。
+
+因此 `PreviewStream` 是 `snapclip-capture` **内部**的端口（同 crate，保留 trait 只为可测性，§27.2），不跨 crate。
 
 ### 19.4 视口框与三种状态外观
 
@@ -2273,7 +2281,7 @@ enum PreviewUpdate {
 
 ### 19.7 UI 的布局与"不做什么"
 
-**布局**（右侧面板，宽度由 `gpui-kit` 的设计令牌给定，不在此硬编码）：
+**布局**（右侧面板，由覆盖层的 D2D 绘制；宽度取 `gpui-kit` 设计令牌的**同一数值**，但**不引入该依赖**——`snapclip-capture` 禁止依赖 `gpui`/`gpui-kit`，见 §19.3）：
 
 ```
 ┌──────────────────────────────┐
@@ -2418,8 +2426,7 @@ impl StopReason { fn yields_partial(&self) -> bool { /* 除 UserCancelled 与 In
 
 | 线程 | 已有/新增 | 职责 | 所有者 |
 |---|---|---|---|
-| GPUI 主线程（UI） | 已有 | 窗口消息、绘制、输入、`ScrollSession` 的**命令入口** | — |
-| `snapclip-capture-overlay` | 已有 | 覆盖层窗口消息、定时器、D2D 绘制 | — |
+| 覆盖层线程（`snapclip-capture-overlay`） | 已有 | 窗口消息、覆盖层绘制、**预览面板绘制**、用户输入、`ScrollSession` 的**命令入口**（§19.3） | — |
 | `snapclip-capture-worker` | 已有 | WGC/BitBlt 捕获、持有 `GraphicsDevice` | — |
 | **`snapclip-scroll-driver`** | **新增（唯一）** | 注入、等待、位移估计、画布写入、预览投递 | `ScrollSession` |
 | `snapclip-export-worker` | 已有 | 导出执行体（`RowBandSink` 的调用方） | — |
@@ -2427,8 +2434,8 @@ impl StopReason { fn yields_partial(&self) -> bool { /* 除 UserCancelled 与 In
 
 **为什么只需要一个**（三条理由，逐条可验证）：
 
-1. **注入 + 等待稳定在语义上是阻塞的**。`ScrollActuator::inject` 之后必须等"内容稳定"（§11.3 的行指纹判据），这是**主动等待**，不是忙等——它必须离开 UI 线程。既然建立了这条线程，把紧随其后的"匹配 + 画布写入"也放在同一条线程上，**没有引入新的阻塞点**，因为这一步天然串行依赖于上一步的结果。
-2. **匹配 + 画布写入不得与整面重绘抢 16.7 ms 预算**。§5 已确证覆盖层是**每帧整面重绘**（`d2d.rs:681-687`）且唯一的绘制节流点是 `RENDER_TICK_MS = 15`（`overlay.rs:100`）。把滚动的匹配放在 UI 线程会直接吃掉这个预算。
+1. **注入 + 等待稳定在语义上是阻塞的**。`ScrollActuator::inject` 之后必须等"内容稳定"（§11.3 的行指纹判据），这是**主动等待**，不是忙等——它必须离开覆盖层线程（那条线程还要按 `RENDER_TICK_MS = 15` 继续绘制预览面板）。既然建立了这条线程，把紧随其后的"匹配 + 画布写入"也放在同一条线程上，**没有引入新的阻塞点**，因为这一步天然串行依赖于上一步的结果。
+2. **匹配 + 画布写入不得与整面重绘抢 16.7 ms 预算**。§5 已确证覆盖层是**每帧整面重绘**（`d2d.rs:681-687`）且唯一的绘制节流点是 `RENDER_TICK_MS = 15`（`overlay.rs:100`）。把滚动的匹配放在覆盖层线程会直接吃掉这个预算，而预览面板的更新时间上限（10 Hz，§19.3）就靠这条线程兑现。
 3. **`ID3D11DeviceContext` 的所有权不变式**（§21.3）要求"谁用 context，谁就是它的所有者线程"。滚动管线**不**需要自己用 context（§11.2 复用 capture worker 的 `ReadRegion` 请求），因此它可以用任何线程——**选择独立线程是为了理由 1、2，而不是为了并发性能**（AGENTS.md 第 6 条：不为臆测性能引入并发机制）。
 
 **明确不加的线程**（每条都要写理由，这是用户第 33 条的"不要为了并发而增加线程"）：
@@ -2445,13 +2452,12 @@ impl StopReason { fn yields_partial(&self) -> bool { /* 除 UserCancelled 与 In
 
 | 线程 | 允许 | **禁止** |
 |---|---|---|
-| UI（GPUI） | 绘制预览、处理输入、投递命令、读 `PreviewStream` 的只读句柄 | 阻塞等待捕获、降采样大图、PNG 编解码、磁盘 I/O、调用 `ReadRegion`、等待注入 |
-| overlay | 窗口消息、`SetTimer`、D2D 绘制、`AsyncSampleBuffer`（放大镜取色，已有） | 采集循环、匹配、注入 |
+| 覆盖层线程（滚动会话的"UI 线程"） | 窗口消息、`SetTimer`、D2D 绘制、**预览面板绘制、读取 `PreviewStream` 的只读句柄、投递命令**、`AsyncSampleBuffer`（放大镜取色，已有） | 采集循环、匹配、注入、阻塞等待捕获、降采样大图、PNG 编解码、磁盘 I/O、调用 `ReadRegion`、等待注入 |
 | capture-worker | 持有 `GraphicsDevice`、捕获、回读（**唯一允许用 context 做回读的地方之一**，见 §21.3） | 绘制、注入、编码 |
 | **scroll-driver** | 注入、等待稳定、跑 §15/§16 的估计、写 `BandStore`、投递 `PreviewStream`、发 `ReadRegion` 请求 | 直接触碰 `ID3D11DeviceContext`、绘制、访问 GPUI、做 PNG 编码 |
 | export-worker | 执行 `RowBandSink`、写临时文件、结束语 | 触碰 GPU、访问 GPUI |
 
-**"什么必须实时"**：UI 的输入响应与预览绘制（≤ 一个渲染 tick）。**"什么可以后台"**：注入、等待、匹配、画布写入、导出。**"什么可以并行"**：捕获（worker）与滚动逻辑（driver）与导出（export-worker）三者的**代价中心不同**，天然可以并行；但**单步之内它们是严格串行的**。**"什么必须串行"**：同一时刻对同一 `GraphicsDevice` 的 context 访问（§21.3）；同一会话内的"读帧 → 估计 → 写画布"序列。**"什么不能阻塞 UI"**：全部四项后台工作。
+**"什么必须实时"**：覆盖层线程的输入响应与预览绘制（≤ 一个渲染 tick）。**"什么可以后台"**：注入、等待、匹配、画布写入、导出。**"什么可以并行"**：捕获（worker）与滚动逻辑（driver）与导出（export-worker）三者的**代价中心不同**，天然可以并行；但**单步之内它们是严格串行的**。**"什么必须串行"**：同一时刻对同一 `GraphicsDevice` 的 context 访问（§21.3）；同一会话内的"读帧 → 估计 → 写画布"序列。**"什么不能阻塞覆盖层线程"**：全部四项后台工作。**GPUI（shell 主线程）不在滚动会话里**：它只持有 `CaptureRuntime` 并在会话结束后收到结果事件，捕获期不让它接任何实时工作（§19.3）。
 
 ### 21.3 `ID3D11DeviceContext` 的所有权不变式（C3）
 
@@ -2633,7 +2639,7 @@ struct MemoryBudget {
 | **`E-PERF-1`** | 在目标硬件上一次位移估计到底多少毫秒？四种层组合各多少？ | 用 §7 的合成序列（已知真值）跑 1000 步，分别测 ①仅第 1 层 ②第 1+2 层 ③第 1+2+3 层 ④+ORB；每场景独立进程；记录 P50/P95/Max | 每个组合的毫秒分布；**决定是否需要任何优化** |
 | **`E-PERF-2`** | PNG 流式编码在 `png` crate 的哪组压缩/滤波参数下最快且可接受？ | 对同一 30,000 px 高合成图，跑 `Compression::{Fast,Balanced,High} × Filter::{NoFilter,Sub,Up,Adaptive}` 共 12 组；`E-MEM-1` 同时测内存 | 一组参数与它的 MB/s、峰值内存 |
 | **`E-PERF-3`** | 水平轴比垂直轴慢多少？是否值得为它做转置存储？ | 同一条合成序列按两轴跑 `E-PERF-1` 与导出，对比 | 分轴 P50/P95；**决定是否保持"两轴同码"** |
-| **`E-PERF-4`** | 预览生成的真实成本？10 Hz 是否是合适的更新上限？ | 测 `O(新增面积)` 降采样在 1500×540 新增条带上的耗时；测 5/10/20/30 Hz 下 UI 主线程的最大同步工作时间 | 更新频率的最终取值 |
+| **`E-PERF-4`** | 预览生成的真实成本？10 Hz 是否是合适的更新上限？ | 测 `O(新增面积)` 降采样在 1500×540 新增条带上的耗时；测 5/10/20/30 Hz 下**覆盖层线程**的最大同步工作时间 | 更新频率的最终取值 |
 
 **这四个实验都只需合成数据**（§30 的夹具），**不需要真实浏览器**——这是刻意的，因为否则它们无法进入 CI。
 
@@ -2644,7 +2650,7 @@ struct MemoryBudget {
 | **Capture Latency** | 用户按下热键 | 第一帧**有效**捕获（`Poll::Frame` 首次返回） | `[snapclip][bench]` 阶段计时（今天已有 `session.rs:91/171/192/225` 的先例）；跨线程用 `Instant` 差值 | 4K 显示器整屏 + 一个 Chrome 窗口 |
 | **Scroll Response** | `ScrollActuator::inject` 返回 | 该步的 `Displacement` 可用 | `Instant` 差值（同线程，无跨线程） | 合成序列 + 真实 Chrome |
 | **Stitch Latency** | `Displacement` 可用 | 新条带可被 `RowBandSink` 读到 | `Instant` 差值 | 同上 |
-| **UI 主线程最大同步工作** | 收到 `PreviewUpdate` | 绘制完成 | 在 UI 线程内插桩累加**同步**耗时；同时用 §5 已确证的 `[snapclip][bench] stage=` 机制 | 100,000 px 高画布 |
+| **UI 主线程最大同步工作**（滚动会话期 = 覆盖层线程，§19.3） | 收到 `PreviewUpdate` | 绘制完成 | 在该线程内插桩累加**同步**耗时；同时用 §5 已确证的 `[snapclip][bench] stage=` 机制 | 100,000 px 高画布 |
 | **Preview 更新延迟** | 条带可读 | 像素出现在屏上 | 时间戳对比（`PreviewUpdate.tick`） | 同上 |
 | **Mouse interaction latency** | `WM_MOUSEMOVE` | 该移动被绘制 | 今天已有先例：`metrics.record_mouse_move_coalesced`（§5） | 真实覆盖层 |
 | **Cancel latency** | 用户触发取消 | `Phase == Stopped` 且驱动线程确认 | `Instant` 差值；**下界是"一次注入 + 一次稳定性等待"**（§21.4） | 在注入后的最坏时刻触发 |
@@ -2672,7 +2678,7 @@ struct MemoryBudget {
 | Capture Latency | P50 ≤ 150 ms，P95 ≤ 400 ms | **推导 + 竞品对照** | P95 ≤ 500 ms | 竞品实测：PixPin 的 `RobinLog` 给出 4K 全屏抓取 36–47 ms、单次截图总计 87/99/168/188 ms（F-16）。V2 **允许比它慢**，因为 WGC 首帧有 1500 ms 超时窗口（§5 确证 `FIRST_FRAME_TIMEOUT`），且我们不与"点一下即刻截图"竞争 |
 | Scroll Response | P50 ≤ 30 ms，P95 ≤ 60 ms | **推导** | P95 ≤ 80 ms | 推导：绘制节流是 `RENDER_TICK_MS = 15`（§5 确证）；一次注入 + 一次稳定性等待至少 2 个 tick。**这是"用户不会觉得卡"的下界**，须由 `E-PERF-1` 确认可达成 |
 | Stitch Latency | P50 ≤ 8 ms，P95 ≤ 20 ms | **待测**（`E-PERF-1`） | P95 ≤ 30 ms | 尚无数据；阈值取"不超过 2 个渲染 tick"，保证预览不会成为瓶颈 |
-| UI 主线程最大同步工作 | ≤ 4 ms | **推导** | ≤ 8 ms | 推导：16.7 ms 帧预算的一半；§5 已确证今天 overlay 是**每帧整面重绘**，滚动会话不得把它推过预算 |
+| UI 主线程最大同步工作（覆盖层线程） | ≤ 4 ms | **推导** | ≤ 8 ms | 推导：16.7 ms 帧预算的一半；§5 已确证今天 overlay 是**每帧整面重绘**，滚动会话不得把它推过预算 |
 | Preview 更新延迟 | P50 ≤ 40 ms | **待测**（`E-PERF-4`） | P95 ≤ 100 ms | 与 10 Hz 更新上限一致（§19.3）：100 ms 是更新的周期本身 |
 | Cancel latency | P50 ≤ 60 ms，**Max ≤ 400 ms** | **推导** | Max ≤ 500 ms | 下界 = 一次注入 + 一次稳定性等待；**Max 必须单独给**，因为它是用户感知"卡住了"的唯一来源 |
 | Stop latency | P50 ≤ 20 ms | **推导** | P95 ≤ 60 ms | 停止只是提交导出任务（§5 确证 `export_worker.submit` 覆盖式信箱），不需要等待编码 |
@@ -3012,7 +3018,7 @@ enum ScrollDiagnosticCode {
 
 | 可见性 | 内容 |
 |---|---|
-| `pub`（跨 crate 可用） | `ScrollConfig`、`ScrollOutcome`、`StopReason`、`ScrollDiagnosticCode`、`ScrollController`（UI 侧句柄）、`scroll::ports::{FrameSource, ScrollActuator, RowBandSink, RowBandWriter, PreviewSink}` |
+| `pub`（跨 crate 可用） | `ScrollConfig`、`ScrollOutcome`、`StopReason`、`ScrollDiagnosticCode`、`ScrollController`（覆盖层线程侧的命令句柄）、`scroll::ports::{FrameSource, ScrollActuator, RowBandSink, RowBandWriter, PreviewSink}` |
 | `pub(crate)` | `ScrollSession`、`ScrollDriver`、`Displacement`、`Observation`、`RecoveredImage`、`BandStore` |
 | **私有** | 匹配与估计的内部（`zncc`、`prefix sums`、`tile weighting`、`scene cut` 判据）、`Band` 的内部布局 |
 
@@ -3021,7 +3027,7 @@ enum ScrollDiagnosticCode {
 ### 27.2 两个跨线程端口（方向相反）
 
 ```rust
-// UI → driver：命令。容量 1，覆盖式；用已有协议形态（Mutex + Condvar + PostThreadMessageW）
+// 覆盖层线程 → driver：命令。容量 1，覆盖式；用已有协议形态（Mutex + Condvar + PostThreadMessageW）
 pub struct ScrollController { /* Send + Sync */ }
 impl ScrollController {
     pub fn stop(&self);        // = StopReason::UserStopped
@@ -3032,11 +3038,11 @@ impl ScrollController {
 }
 pub(crate) enum ScrollCommand { Stop, Cancel, Undo, SetFollow(bool), Shutdown }
 
-// driver → UI：状态 + 可读句柄。容量 1，latest-only（§19.3）
+// driver → 覆盖层线程：状态 + 可读句柄。容量 1，latest-only（§19.3）
 pub struct PreviewStream { /* Send + Sync */ }
 impl PreviewStream {
     pub(crate) fn publish(&self, update: PreviewUpdate);   // 生产者：driver
-    pub fn take(&self) -> Option<PreviewUpdate>;           // 消费者：UI（唤醒后读一次）
+    pub fn take(&self) -> Option<PreviewUpdate>;           // 消费者：覆盖层线程（唤醒后读一次）
     pub fn dropped(&self) -> u64;                          // 诊断（G12）
 }
 ```
@@ -3101,7 +3107,7 @@ pub trait RowBandWriter {
 | `RecoveredImage::commit` | `Observation` + `Displacement` | `Commit`（新增的行区间） | 会话 | `CanvasError`（预算/不变量） | 不适用（一次提交是原子的） | driver 线程独占 |
 | `materialize_reference` | `band` + 输出缓冲 | 写入 `out` | 每步 | `CanvasError`（换出读失败/校验失败） | 不适用 | driver 线程；`out` 是复用的 scratch |
 | `RowBandSink::begin` | `ImageMeta`（**含最终 height**） | `Box<dyn RowBandWriter>` | 一次导出 | `ExportError` | `AbortReason` 只能**在 begin 之前**决定 → 见 §17.7 约束 1 | export-worker；**不接触 GPU** |
-| `PreviewStream::publish` | `PreviewUpdate` | — | 会话 | 无（覆盖式，用 `dropped` 计数） | 不适用 | driver → UI；**绝不阻塞生产者** |
+| `PreviewStream::publish` | `PreviewUpdate` | — | 会话 | 无（覆盖式，用 `dropped` 计数） | 不适用 | driver → 覆盖层线程（§19.3）；**绝不阻塞生产者** |
 
 ### 27.4 三处刻意的"不用 `Result`"
 
@@ -3118,7 +3124,7 @@ pub trait RowBandWriter {
 | 既有 trait | 是否改动 | 理由 |
 |---|---|---|
 | `CaptureEventSink`（`ports.rs:19-25`） | **不改** | 滚动会话发的是自己的 `PreviewStream`/`Diagnostics`；不往 `on_state(CaptureState)` 里塞滚动状态（否则会污染 `CaptureSession` 的 6 态穷举测试，§20.6） |
-| `OverlayPlatform`（`ports.rs:43-63`） | **不改** | 滚动会话的 UI 是 GPUI 侧的预览面板，不是 overlay 的命令集 |
+| `OverlayPlatform`（`ports.rs:43-63`） | **不改** | 它是**壳 → 覆盖层**的会话级控制端口（`state`/`request_start`/`request_cancel`/`request_confirm`/`request_annotation`/`shutdown`），形状是对的。滚动会话的 UI **就在覆盖层线程里**（§19.3），其命令入口是 §27.2 的 `ScrollController`（同 crate、由覆盖层线程直接调用）。壳侧若需要从托盘/热键取消，走既有的 `request_cancel` 由覆盖层转发给 `ScrollController::cancel`，**端口不必长出新方法**。它的 `request_annotation` 是普通截图工具条的语义，滚动会话没有工具条 |
 | `ArtifactWriter`（`ports.rs:86-94`） | **不改** | 它服务普通截图的"一次性 PNG 写入"；滚动用 `RowBandSink`（流式）。**两者形状不同是因为一个是一次性、一个是流式**，不应强行合并 |
 | `ClipboardWriter` | 不改 | N12（不与剪贴板耦合） |
 | `WindowTargetProvider`（`provider.rs:189-210`） | **不改** | 目标选择复用。滚动只需要 `ScrollTarget` 增加"滚动能力/当前位置"（C7a），那是在**模型层**加字段，不是改 provider |
@@ -3407,7 +3413,7 @@ if ($hits) { Write-Error "scroll/ must stay platform-free: $($hits -join '; ')";
 | 拖动后停止跟随 | 拖动 | 进入手动模式；"回到最新"可用 | L1 | — |
 | 预览不阻塞采集 | mock 让 UI 消费极慢 | 采集步数不受影响；`dropped > 0` | L2 | — |
 | 更新频率 | 100 步 | 更新次数 ≤ 10 Hz × 时长 | L2 | **Preview 更新延迟** |
-| 主线程同步工作 | 100 步 | ≤ 8 ms 阈值 | L2 | **UI 主线程最大同步工作** |
+| 主线程同步工作 | 100 步 | ≤ 8 ms 阈值 | L2 | **UI 主线程最大同步工作**（覆盖层线程） |
 | 布局不遮挡操作 | 真实渲染 + 回读 | 面板不覆盖必要操作区域 | L3 | — |
 
 ### 30.7 Memory / Regression（内存与回归）
@@ -3536,7 +3542,7 @@ if ($hits) { Write-Error "scroll/ must stay platform-free: $($hits -join '; ')";
 - **Context**：`docs/19` §5.6 有独立的 `PreviewPatch` + `PreviewState`（`replace`/`append`/`prepend` + viewport 高亮 + stale revision 丢弃）。
 - **Decision**：**删除**独立的预览层；缩略条带是 `BandStore` 的**另一种条目**（宽度不同），共享 LRU 与预算。
 - **Alternatives**：① 独立预览通道与状态（`docs/19`）；② 预览直接在 UI 侧从全分辨率条带降采样。
-- **Reasoning**：① 会引入第二套"什么可丢、什么时候丢、多少预算"的策略，且两套策略会不一致；② 会让 UI 线程做降采样（§21.2 明确禁止）。
+- **Reasoning**：① 会引入第二套"什么可丢、什么时候丢、多少预算"的策略，且两套策略会不一致；② 会让覆盖层线程做降采样（§21.2 明确禁止）。
 - **Trade-offs**：预览与画布争预算 → 预算耗尽时**先换出预览**（§22.3 步骤 1），因为它是可重建的。
 - **Validation**：§30.6 的"预览窗口化"（不生成整图缩略）。
 - **推导自**：Occam——**预览不是一种新数据，只是同一种数据的不同尺度**。
