@@ -2066,6 +2066,54 @@ scene_cut := (zncc2d(d_0=0) < 0.50) && (∀ i: alignment_error(d_i) > 0.60)
 
 **为什么 ≥3 才降级模型**：一次性的重排不应改变我们对"哪块区域在滚动"的判断。**为什么永不因 scene cut 终止会话**：与 §16.9 的单帧容忍规则一致（这是 C2 的直接后果）。
 
+#### 16.8.1 落地的形状（P1.12，2026-10-08）
+
+`crates/snapclip-capture/src/scroll/displacement.rs`：
+
+```rust
+pub(crate) const SCENE_CUT_SIMILARITY: f32 = 0.50;       // §16.8 第一条
+pub(crate) const SCENE_CUT_ALIGNMENT_ERROR: f32 = 0.60;  // §16.8 第二条
+const ALIGNMENT_RETAINED: f32 = 0.75;                    // 参考实现 estimator.rs:559 的 trimmed 比例
+pub(crate) const SCENE_CUT_DECAY_STREAK: u8 = 3;
+
+fn band_variance(gray: &Gray, first: u32, first_row: u32, rows: u32) -> f64;
+fn tile_carries_evidence(prev: &Gray, cur: &Gray, band: MatchBand, first_row: u32, rows: u32) -> bool;
+fn alignment_error_of(samples: &mut Vec<f32>, retained: f32) -> Option<f32>;
+pub(crate) fn alignment_error(prev: &ObservationView, cur: &ObservationView, shift: i32) -> Option<f32>;
+pub(crate) fn zero_shift_similarity(prev: &ObservationView, cur: &ObservationView) -> f32;
+pub(crate) fn is_scene_cut(prev: &ObservationView, cur: &ObservationView, scored: &ScoredSet) -> bool;
+
+pub(crate) struct SceneCut { consecutive: u8 }           // Debug + Clone + Copy + PartialEq + Eq + Default
+impl SceneCut {
+    pub(crate) const fn none() -> Self;
+    pub(crate) const fn consecutive(&self) -> u8;
+    pub(crate) const fn observe(self, detected: bool) -> Self;   // 饱和 +1，或清零
+    pub(crate) const fn action(&self) -> SceneCutAction;
+}
+pub(crate) enum SceneCutAction { Tolerate, DecayModel }  // 没有第三个变体
+
+// Evidence 新增字段（§16.7 的注要求它在这里，不在 Status 里）：
+pub(crate) struct Evidence { zncc2d: f32, gain: f32, margin: f32, tiles: u32, scene_cut: SceneCut }
+```
+
+**四处裁决**：
+
+1. **`alignment_error` 是 `1 − ZNCC` 的 trimmed 均值，返回 `Option`。** trimmed 取自参考实现（按误差升序、只保留最小的 75%；参考实现按权重加权，这里**不加权**——权重公式 `(0.1+0.9·pair_evidence)·(0.1+0.9·texture)·regional` 需要 texture/region 两个我们还没有的量，见 DEV-21）。**`None` = 没有可平均的样本**：参考实现在无样本时返回 `(1.0, 1.0)`（`estimator.rs:570`），那是"最坏的对齐误差"，于是**纯色页会被判成 scene cut**（平坦页 `band_zncc == 0.0 < 0.50` 先成立，再 `1.0 > 0.60`）。本实现返回 `None`，且 `is_scene_cut` 把 `None` 当作**否决**——"测不出来"不等于"换页了"。
+2. **无结构的 tile 不进样本。** `band_zncc` 对零方差带返回 `0.0`，而 `1 − 0.0` 是**最坏**的误差，所以纯色 tile 若被计入，其证据方向恰好相反。判据用"方差是否恰为零"而不是参考实现的 texture 门限 `0.05`——后者需要一个新的校准常量，前者是"这块 tile 有没有结构"这个可用一句话说完的问题，且与 §16.3 的 `gain` 用同一个"未定义 vs 测出来是零"的区分。列与列的规则是"**任一侧**有结构就算数"：一侧平坦一侧有结构 = 真的对不上。
+3. **两条判据的次序与代价**：先算零位移相似度（一次池化带的相关），再逐候选算误差（每个候选一遍 tile 扫描）。参考实现只在"赢家已被拒"的分支里求值（`estimator.rs:1285`）；本实现不需要那个耦合——第一条已足够排除内容真的对上的帧。**`is_scene_cut` 自己池化一次**并把 `&Gray` 传给内部形式（`alignment_error_at`/`zero_shift_similarity_at`），否则第二个条件会为每个候选重复一遍 `O(W·H/16)` 的池化（8 个候选 = 9 遍），比它所询问的第二层本身还贵。`P1.13` 的 `Scratch` 会把这一次也上移到步一级。
+4. **`SceneCut` 只出现在 `Evidence` 里**（REFACTOR 的硬要求）：`Status` 的三个变体一个都没变，`StopReason` 更不可能拿到它。`observe` 是**饱和**加一，`action()` 是"≥3 ⇒ `DecayModel`"，`DecayModel` 是**请求**而不是数值：`0.05` 的衰减率与 `reset()` 属于 §18.2 的 tile 模型（它才知道"一块 tile 的历史该被信任多少"），本模块只负责"该不该衰减"。
+
+**实测（2026-10-08，`docs/Temp/p112-measurements.log`；夹具 = §30.3 的混合文档 640×1140、视口 900、步进 120、搜索半宽 40）**：
+
+| 帧对 | `zero_shift_similarity` | `alignment_error` | `is_scene_cut` |
+|---|---|---|---|
+| 无关内容（`mixed_document` vs `unrelated_document`，8 个候选） | **0.09400253** | 全部候选 **0.8133493 … 0.8563761**（赢家 `d = −19`，0.8133493） | **true** |
+| 真的滚了 120 px | **−0.014104286** | `d=120` ⇒ **0.0**；`d=116` ⇒ 0.40313148；`d=124` ⇒ 0.3820177；`d=0` ⇒ 0.9353355；`d=60` ⇒ **1.0045342** | false |
+| 完全没动（`move_by(0)`） | ≥ 0.50（第一条否决） | 未求值 | false |
+| 纯色页（单带 `Flat`） | 0.0 | **`None`**（无有效 tile） | false |
+
+**两条可执行的推论**：① **`alignment_error` 的值域是 `[0, 2]`**（实测出现 `1.0045342`，对应 `zncc` 略小于 0），所以 `0.60` 是这条刻度上的一个位置，不是"带的比例"；② **对任何真的移动过的页面，第一条判据必然成立**（实测 −0.0141 ≪ 0.50），因此**拦住真实滚动的是第二条**，第一条的作用是给"完全没变"的页面（`zncc(0) ≈ 1`）一个便宜的一票否决——把 0.50 读成"区分滚动与换页的门限"是错的读法。
+
 ### 16.9 边界值禁令
 
 **硬规则**：**拒绝任何恰好等于 `±N/2` 或 `±M/2` 的返回值**（`N`/`M` 为搜索区域的宽/高），无论它通过了几道门。
@@ -2096,7 +2144,7 @@ pub(crate) struct Displacement { status: Status, confidence: f32, evidence: Evid
 3. `confidence` 由 `Evidence` 在构造器内推导，不由调用方传入 ⇒ 单一真源；`Evidence.coverage` 同理由 `tiles` 推导（`min(1, tiles/12)`）而**不与它并列存储**（两个字段会各自漂移）。
 4. 整个类型是 `pub(crate)`：`confidence` 及其权重都是**可校准**的（§16.11），一旦成为公开 API 就变成兼容性承诺（§27.1）。
 
-`Evidence` 的字段 = §16.7 两条公式的项（`zncc2d` / `gain` / `margin` / `tiles`），`score()` 与 `confidence()` 的 7 个权重提为**具名常量**，`E-ACC-1` 校准时只改这一处。**`scene_cut` 不在这里**：它属于 `Evidence`（`P1.12` 落地），这样它永远不会变成 `StopReason`（与 §20.4"`MatchFailed` 不是 `StopReason`"同源）。
+`Evidence` 的字段 = §16.7 两条公式的项（`zncc2d` / `gain` / `margin` / `tiles`），`score()` 与 `confidence()` 的 7 个权重提为**具名常量**，`E-ACC-1` 校准时只改这一处。**`scene_cut` 不在这里**：它属于 `Evidence`（`P1.12` 落地为第五个字段 `scene_cut: SceneCut` + `scene_cut()` 访问器，§16.8.1），这样它永远不会变成 `StopReason`（与 §20.4"`MatchFailed` 不是 `StopReason`"同源）。
 
 ### 16.10 `status` → 行为的完整映射
 
@@ -2132,10 +2180,10 @@ pub(crate) struct Displacement { status: Status, confidence: f32, evidence: Evid
 | `ĝ` 滑动系数 | 0.7 / 0.3 | **可校准** | `E-CTRL-1` |
 | P1 启用下限 | `n·ĝ ≥ 4 px` | 固定 | 噪声量级（§16.3） |
 | P1 区间外降权 | ×0.9 | 固定 | 保守取值；**不可设为 0**（§16.6 规则 3） |
-| scene cut 相似度门 | 0.50 | **可校准** | `E-ACC-1` |
-| scene cut 误差门 | 0.60 | **可校准** | `E-ACC-1` |
-| `scene_cut_streak` 阈值 | 3 | 固定 | 参考实现 |
-| 模型衰减率 | 0.05 | 固定 | 参考实现 |
+| scene cut 相似度门 | 0.50 | **可校准** | `E-ACC-1`；`P1.12` 落地为**便宜的第一票否决**（`zero_shift_similarity`，只算一条带），实测对"真的滚了"的页面恒为负值（§16.8.1），所以它排除的是"完全没变"的帧 |
+| scene cut 误差门 | 0.60 | **可校准** | `E-ACC-1`；`P1.12` 落地的量是 `1 − ZNCC` 的 trimmed 均值（保留最小的 75%，`ALIGNMENT_RETAINED = 0.75`），值域 **`[0, 2]`** 而不是 `[0, 1]`（§16.8.1）；无结构 tile 不进样本，**无样本 ⇒ `None` ⇒ 否决 scene cut** |
+| `scene_cut_streak` 阈值 | 3 | 固定 | 参考实现；`P1.12` 落地为 `SceneCut::observe` 的**饱和**计数 + `SCENE_CUT_DECAY_STREAK`（`action() == DecayModel`），任何非 scene cut 帧**无条件清零** |
+| 模型衰减率 | 0.05 | 固定 | 参考实现；**不由 `P1.12` 持有**——`SceneCutAction::DecayModel` 只是"请求衰减"，率与 `reset()` 是 §18.2 tile 模型的事（§16.8.1 裁决 4） |
 | 乘法权重 clamp | [0.1, 2.0] | 固定 | 参考实现 |
 | "歧义不学习"门 | `direct·compensated ≥ 0.5` | 固定 | 参考实现 |
 | score 权重 | 0.60 / 0.25 / 0.15 | **可校准** | `E-ACC-1` |
@@ -3861,8 +3909,8 @@ if ($hits) { Write-Error "scroll/ must stay platform-free: $($hits -join '; ')";
 | 门限校准 | `E-ACC-1` 全扫描 | ROC 曲线 + 选定工作点 | L1 | — |
 | 逐门 ablation | 顺序关闭四门 | 每门关闭都使错误确定率上升 | L1 | — |
 | P1 自锁 | `ĝ` 初值错 2×，跑 100 步 | 20 步内收敛回真值 | L1 | — |
-| scene cut ×1–2 | 注入重排帧 | `Uncertain`，继续 | L1 | — |
-| scene cut ×≥3 | 注入换页帧 | 模型降级 + 提示，继续 | L1 | — |
+| scene cut ×1–2 | 注入重排帧 | `Uncertain`，继续（`P1.12`：`Evidence.scene_cut.consecutive() ≤ 2` ⇒ `SceneCutAction::Tolerate`；状态由 §16.10 的 `effect()` 给出） | L1 | — |
+| scene cut ×≥3 | 注入换页帧 | 模型降级 + 提示，继续（`P1.12`：`action() == DecayModel`，`SceneCutAction` **没有**停止变体） | L1 | — |
 
 ### 30.4 Stitching（拼接与画布）
 

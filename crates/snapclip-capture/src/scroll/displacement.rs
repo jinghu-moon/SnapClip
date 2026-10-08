@@ -59,6 +59,12 @@
 //! rival both scored, they just did not separate — and §16.10 gives those two answers different
 //! actions. §16.6's manual-mode peak-family rule is the same threshold seen from the other side
 //! (`1 − 0.85 == MIN_MARGIN`), so no second detector is built for it.
+//!
+//! `P1.12` adds §16.8's scene cut ([`is_scene_cut`], [`SceneCut`]), which is the estimator's only
+//! statement about *the page* rather than about the frames: no candidate aligns, so the content was
+//! rearranged and waiting is the right answer. The fact is carried on [`Evidence`], never in
+//! [`Status`] — a changed page is not a failed session (C2), and the type is what guarantees the
+//! session cannot end on one.
 
 // The first consumer of everything in this file is `P1.05` (layer 1) / `P1.06` (ZNCC) / `P1.12`
 // (the session loop). Until then the module is exercised only by its own tests, and the crate's
@@ -87,6 +93,33 @@ const CONFIDENCE_MARGIN: f32 = 0.15;
 /// Without the saturation a long band set would systematically outscore a short one.
 const COVERAGE_SATURATION_TILES: f32 = 12.0;
 
+/// §16.8's first condition: the zero-shift similarity below which the frames differ *at rest*.
+///
+/// `E-ACC-1` calibrates the number; what is fixed is that it is a *similarity* floor applied before
+/// any candidate is examined, which is why it can be measured on one band instead of on all of them.
+pub(crate) const SCENE_CUT_SIMILARITY: f32 = 0.50;
+
+/// §16.8's second condition: the alignment error above which a candidate counts as "did not align".
+///
+/// Also `E-ACC-1`'s. Both conditions must hold, and this one is asked of *every* candidate: one
+/// candidate that aligns means the frames do belong to the same page.
+pub(crate) const SCENE_CUT_ALIGNMENT_ERROR: f32 = 0.60;
+
+/// The share of a band's tiles whose alignment error is averaged (§16.8's `alignment_error`).
+///
+/// Taken from the reference implementation's trimmed mean (`estimator.rs:559`: it keeps the lowest
+/// 75% of the weight and drops the rest). The reason to trim at all is asymmetry: a page that
+/// scrolled *and* had a popup open has most of its tiles aligning, and one region that legitimately
+/// disagrees should not decide whether the page changed. The share is fixed rather than calibrated
+/// because it is a robustness choice, not a threshold — `E-ACC-1` has nothing to tune here.
+const ALIGNMENT_RETAINED: f32 = 0.75;
+
+/// How many consecutive scene cuts make §16.8 decay the tile model instead of tolerating the frame.
+///
+/// Fixed at 3 (the reference implementation's `:984` resets on the third). One rearrangement should
+/// not change what we believe about which region scrolls; three in a row is a different page.
+pub(crate) const SCENE_CUT_DECAY_STREAK: u8 = 3;
+
 /// What the estimator measured, with no decision of its own.
 ///
 /// Every field is one of the terms §16.7's two formulas name. `coverage` is *derived* from `tiles`
@@ -106,6 +139,13 @@ pub(crate) struct Evidence {
     /// `|i − j| ≥ 2` rule landed in `P1.10`, so this is the count gate three compares against
     /// [`MIN_TILES`] and the one §16.7's `coverage` is defined on).
     pub(crate) tiles: u32,
+    /// How many consecutive frames have looked like a different page (`docs/30` §16.8; `P1.12`).
+    ///
+    /// It lives here rather than beside the `status` for the reason §16.7 gives: a frame that shows
+    /// a different page is a fact about *the page*, so it must not be a member of the enum the
+    /// session uses to end itself. `Evidence` is the widest type every frame carries, which is
+    /// exactly where "here is something the consumer should know but not act on by stopping" belongs.
+    pub(crate) scene_cut: SceneCut,
 }
 
 impl Evidence {
@@ -127,6 +167,12 @@ impl Evidence {
             + CONFIDENCE_COVERAGE * self.coverage()
             + CONFIDENCE_GAIN * self.gain
             + CONFIDENCE_MARGIN * self.margin
+    }
+
+    /// `docs/30` §16.8's consecutiveness, for the consumer that reacts to it (the tile model's
+    /// decay, `§18.2`). The `P1.12` REFACTOR keeps it out of `Status` on purpose.
+    pub(crate) fn scene_cut(&self) -> SceneCut {
+        self.scene_cut
     }
 }
 
@@ -1308,15 +1354,239 @@ pub(crate) fn zero_shift_status(
     }
 }
 
+/// The variance of one side of a tile, in the same units [`band_zncc`] uses before it takes a square
+/// root: `count·Σx² − (Σx)²`. Positive iff the side has structure.
+fn band_variance(gray: &Gray, first: u32, first_row: u32, rows: u32) -> f64 {
+    let count = (gray.width * rows) as f64;
+    let (mut sum, mut sum_sq) = (0.0f64, 0.0f64);
+    for row in 0..rows {
+        for column in 0..gray.width {
+            let value = gray.at(column, first + first_row + row) as f64;
+            sum += value;
+            sum_sq += value * value;
+        }
+    }
+    count * sum_sq - sum * sum
+}
+
+/// Whether a tile says anything about alignment — that is, whether either side of it has structure.
+///
+/// This is not an optimisation. [`band_zncc`] reports `0.0` for a band whose variance is zero, and
+/// `1 − 0.0` is the *worst possible* alignment error, so a tile of a solid white page would
+/// otherwise be the strongest evidence that the page changed. The reference implementation draws the
+/// same line with a calibrated texture floor (`estimator.rs:543`: `texture < 0.05`); ours asks the
+/// sharper, threshold-free question "is the variance exactly zero", which is the same distinction
+/// §16.3's `gain` makes between "undefined" and "measured as no gain".
+///
+/// The test is "either side" rather than "both": a tile that is flat in one frame and structured in
+/// the other has genuinely failed to align, and that is worth counting.
+fn tile_carries_evidence(
+    previous: &Gray,
+    current: &Gray,
+    band: MatchBand,
+    first_row: u32,
+    rows: u32,
+) -> bool {
+    band_variance(previous, band.previous_first, first_row, rows) > 0.0
+        || band_variance(current, band.current_first, first_row, rows) > 0.0
+}
+
+/// §16.8's trimmed mean: the average of the lowest `retained` share of the tile errors, `None` when
+/// there is nothing to average.
+///
+/// `None` is the load-bearing part. The reference implementation returns `(1.0, 1.0)` when it
+/// collected no samples (`estimator.rs:570`) — the worst possible error — and on a page with no
+/// structure at all that answer is read as "the page changed". Absence of evidence is not a scene
+/// cut here: unmeasurable tiles produce no samples, and the caller treats "nothing to average" as a
+/// veto rather than as a maximum (DEV-21).
+fn alignment_error_of(samples: &mut Vec<f32>, retained: f32) -> Option<f32> {
+    if samples.is_empty() {
+        return None;
+    }
+    samples.sort_by(f32::total_cmp);
+    let keep = ((samples.len() as f32 * retained).ceil() as usize).clamp(1, samples.len());
+    Some(samples[..keep].iter().sum::<f32>() / keep as f32)
+}
+
+/// §16.8's `alignment_error(d)`: how badly the frames fail to align at `shift`, on layer 2's grid.
+///
+/// Layer 2's resolution is the right one for the question — this is a *binary* decision ("does any
+/// candidate align anywhere"), not the number that reaches a `displacement`, which §15.4 ③ reserves
+/// for layer 3 — and it is the same grid the candidates were scored on, so a candidate that looked
+/// good to the ranking is judged in the units it won with.
+///
+/// This entry point pools the two frames itself; [`alignment_error_at`] is the form that takes the
+/// images, which is what [`is_scene_cut`] uses so that asking about *every* candidate pools once.
+pub(crate) fn alignment_error(
+    previous: &ObservationView<'_>,
+    current: &ObservationView<'_>,
+    shift: i32,
+) -> Option<f32> {
+    alignment_error_at(
+        &Gray::pooled(previous),
+        &Gray::pooled(current),
+        shift,
+    )
+}
+
+/// [`alignment_error`] on two already-pooled images.
+fn alignment_error_at(previous: &Gray, current: &Gray, shift: i32) -> Option<f32> {
+    let wanted = match_rows(previous.height, current.height, DOWNSAMPLE);
+    let band = match_band(
+        previous.height,
+        current.height,
+        round_to_grid(shift),
+        wanted,
+    )?;
+    let tile = TILE_ROWS / DOWNSAMPLE;
+    let mut samples = Vec::new();
+    let mut first = 0;
+    while first + tile <= band.rows {
+        if tile_carries_evidence(previous, current, band, first, tile) {
+            samples.push(1.0 - band_zncc(previous, current, band, first, tile));
+        }
+        first += tile;
+    }
+    alignment_error_of(&mut samples, ALIGNMENT_RETAINED)
+}
+
+/// §16.8's first condition: `zncc2d(d_0 = 0)`, measured directly rather than looked up.
+///
+/// It is computed here instead of being read off the candidate set because the zero shift is not
+/// guaranteed to be a candidate: the search window is built around the prior's expectation
+/// (`P1.14`), and "did the frames change at rest" is a question about the frames, not about what the
+/// prior happened to propose. `0.0` for frames with no overlap and for a structureless band is the
+/// same answer `band_zncc` gives — "nothing correlates" — and §16.8's floor turns both into "they
+/// differ", which the second condition then gets to refute.
+pub(crate) fn zero_shift_similarity(
+    previous: &ObservationView<'_>,
+    current: &ObservationView<'_>,
+) -> f32 {
+    zero_shift_similarity_at(&Gray::pooled(previous), &Gray::pooled(current))
+}
+
+/// [`zero_shift_similarity`] on two already-pooled images.
+fn zero_shift_similarity_at(previous: &Gray, current: &Gray) -> f32 {
+    let wanted = match_rows(previous.height, current.height, DOWNSAMPLE);
+    match match_band(previous.height, current.height, 0, wanted) {
+        Some(band) => band_zncc(previous, current, band, 0, band.rows),
+        None => 0.0,
+    }
+}
+
+/// §16.8's scene cut: the frames differ at zero shift **and** no candidate aligns.
+///
+/// The two conditions answer different questions and are asked cheapest-first — one band at zero
+/// shift, then one tile sweep per candidate — which is also why the reference implementation only
+/// evaluates it in the branch where the winner was already rejected (`estimator.rs:1285`). We do not
+/// need that coupling: the first condition alone is enough to rule out a frame whose content matched.
+///
+/// The two frames are pooled **once** here rather than by each condition: pooling is `O(W·H/16)` and
+/// the second condition runs it per candidate otherwise, which would make the question cost more
+/// than the whole second layer it is asking about. `P1.13`'s `Scratch` moves that single pass up to
+/// the step, at which point this function stops pooling at all.
+///
+/// Two ways to be true by accident are closed here explicitly:
+///
+/// - **An empty candidate set.** `∀ i` over no candidates is vacuously true, and a frame whose
+///   candidates were all dropped is the *absence* of evidence — §16.10 spells that `None`.
+/// - **An unmeasurable candidate.** A candidate whose band has no structure at all yields no
+///   samples, and "cannot be measured" must not be read as "misaligned", because that is how a blank
+///   page or a page with one flat band would be declared a scene cut.
+pub(crate) fn is_scene_cut(
+    previous: &ObservationView<'_>,
+    current: &ObservationView<'_>,
+    scored: &ScoredSet,
+) -> bool {
+    if scored.iter().next().is_none() {
+        return false;
+    }
+    let previous_gray = Gray::pooled(previous);
+    let current_gray = Gray::pooled(current);
+    if zero_shift_similarity_at(&previous_gray, &current_gray) >= SCENE_CUT_SIMILARITY {
+        return false;
+    }
+    scored.iter().all(|candidate| {
+        match alignment_error_at(&previous_gray, &current_gray, candidate.d) {
+            Some(error) => error > SCENE_CUT_ALIGNMENT_ERROR,
+            None => false,
+        }
+    })
+}
+
+/// §16.8's `scene_cut_streak`: how many consecutive frames failed to align anywhere.
+///
+/// Deliberately not a field of [`Status`]. A changed page is a fact about the page, and the session's
+/// own question ("did anything move?") has already been answered — `Uncertain`, since a winner was
+/// scored — so this type exists to tell the *model* whether to keep trusting its tiles, not to give
+/// the session a reason to end. `docs/30` §16.7 puts it on [`Evidence`] for the same reason, and
+/// §20.4's rule that `MatchFailed` is not a `StopReason` is the same decision on a different type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct SceneCut {
+    consecutive: u8,
+}
+
+impl SceneCut {
+    /// No scene cut has been seen yet — the state a session starts in.
+    pub(crate) const fn none() -> Self {
+        Self { consecutive: 0 }
+    }
+
+    pub(crate) const fn consecutive(&self) -> u8 {
+        self.consecutive
+    }
+
+    /// The streak's whole transition rule: a scene cut extends it, and any other frame ends it.
+    ///
+    /// Saturating rather than wrapping: the count is compared against a small threshold, so a page
+    /// that never comes back must be a large number and not (after 256 frames) a fresh streak. The
+    /// reset is unconditional — "consecutive" is what §16.8 asks about, so one aligned frame is
+    /// enough, however long the run was.
+    pub(crate) const fn observe(self, detected: bool) -> Self {
+        if detected {
+            Self {
+                consecutive: self.consecutive.saturating_add(1),
+            }
+        } else {
+            Self::none()
+        }
+    }
+
+    /// What to do about it, in the only two shapes this fact has (§16.8's table).
+    pub(crate) const fn action(&self) -> SceneCutAction {
+        if self.consecutive >= SCENE_CUT_DECAY_STREAK {
+            SceneCutAction::DecayModel
+        } else {
+            SceneCutAction::Tolerate
+        }
+    }
+}
+
+/// The two responses §16.8 allows to a scene cut. There is no third.
+///
+/// `DecayModel` is a request, not a number: §16.8's `decay_toward_neutral(0.05)` and the model reset
+/// are the tile model's own business (§18.2), because the rate is a property of how much a tile's
+/// history is trusted — this module does not own the model and so does not own its decay constant.
+/// What this module owns is the *decision to decay*, which is what the streak is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SceneCutAction {
+    /// The frame was not used and the session carries on as if it had not happened (1–2 in a row).
+    Tolerate,
+    /// Three in a row: the tiles we are matching against describe a page that is gone.
+    DecayModel,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         CANDIDATE_LIMIT, Candidate, Displacement, Evidence, GateOutcome, GateRejection, Gray,
         MARGIN_SCORE_FLOOR, MIN_MARGIN, MIN_RESIDUAL_GAIN, MIN_TILES, RHO_MIN, RHO_MIN_PERMILLE,
-        SCORE_GAIN, ScoredCandidate, ScoredSet, Status, StepEffect, TILE_INDEPENDENCE_GAP, band_zncc,
-        candidates_1d, gate_geometry, gate_margin, gate_residual_gain, gate_support,
-        independent_support, is_verifiable, margin_of, match_band, match_rows, primary_digests,
-        residual_gain, residual_gain_at, score_candidates_2d, support_at, zero_shift_status,
+        SCENE_CUT_ALIGNMENT_ERROR, SCENE_CUT_DECAY_STREAK, SCENE_CUT_SIMILARITY, SCORE_GAIN,
+        SceneCut, SceneCutAction, ScoredCandidate, ScoredSet, Status, StepEffect,
+        TILE_INDEPENDENCE_GAP, alignment_error, band_zncc, candidates_1d, gate_geometry, gate_margin,
+        gate_residual_gain, gate_support, independent_support, is_scene_cut, is_verifiable, margin_of,
+        match_band, match_rows, primary_digests, residual_gain, residual_gain_at, score_candidates_2d,
+        support_at, zero_shift_similarity, zero_shift_status,
     };
     use crate::scroll::observation::{Axis, Observation, ObservationView};
     use crate::scroll::displacement::{
@@ -1331,6 +1601,7 @@ mod tests {
             gain: 0.40,
             margin: 0.30,
             tiles: 6,
+            scene_cut: SceneCut::none(),
         }
     }
 
@@ -1420,6 +1691,7 @@ mod tests {
             gain: 0.40,
             margin: 0.30,
             tiles: 6,
+            scene_cut: SceneCut::none(),
         };
         assert_eq!(evidence.coverage(), 0.5); // 6 of 12 bands: not saturated yet
         // 0.60·0.90 + 0.25·0.40 + 0.15·0.50
@@ -1438,6 +1710,7 @@ mod tests {
             gain: 1.0,
             margin: 1.0,
             tiles: 12,
+            scene_cut: SceneCut::none(),
         };
         assert!((perfect.score() - 1.0).abs() < 1e-6);
         assert!((perfect.confidence() - 1.0).abs() < 1e-6);
@@ -2749,5 +3022,227 @@ mod tests {
         // family" — is the same number as this gate: `1 − 0.85 == MIN_MARGIN`. So there is one rule
         // with two spellings of its threshold, not two rules, and no second detector is built.
         assert!((1.0 - 0.85_f32 - MIN_MARGIN).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_single_rearranged_frame_stays_uncertain_and_the_session_continues() {
+        // `docs/31` §6 `P1.12`; `docs/30` §16.8, §16.10, §30.3 (`scene cut ×1–2`). Two frames with
+        // the same geometry and unrelated content are what the viewport shows after a navigation.
+        // §16.8 asks two independent questions about them, and the cheap one is asked first: the page
+        // differs *at zero shift*, and then *no candidate aligns* — not "the best one is not good
+        // enough", which is gate four's question and a different fact (F-10's whole point).
+        let image = mixed_document();
+        let other = unrelated_document();
+        let mut first = ScrollScript::new(&image, 900, vec![StepSpec::move_by(120)]);
+        let mut second = ScrollScript::new(&other, 900, vec![StepSpec::move_by(120)]);
+        let previous = first.take(0);
+        let current = second.take(0);
+
+        let similarity = zero_shift_similarity(&previous.view(), &current.view());
+        assert!(
+            similarity < SCENE_CUT_SIMILARITY,
+            "two unrelated frames looked alike at zero shift ({similarity}); the fixture is wrong"
+        );
+        // Measured 2026-10-08 (`docs/Temp/p112-measurements.log`): similarity `0.09400253`; the
+        // winner is `d = −19` with `alignment_error = 0.8133493`, and all eight candidates land in
+        // `0.8133…0.8564` against a threshold of `0.60`. Nothing aligns anywhere, which is what
+        // §16.8's second condition is asking — not "the winner is weak" (that is gate four's
+        // question, and gate four would have answered it on this frame too).
+
+        let candidates = candidates_1d(&previous.view(), &current.view(), 0, 40);
+        let scored = score_candidates_2d(&previous.view(), &current.view(), &candidates);
+        assert!(scored.len() > 1, "the fixture produced too few candidates to test");
+        assert!(
+            is_scene_cut(&previous.view(), &current.view(), &scored),
+            "unrelated frames were not recognised as a scene cut"
+        );
+
+        // The second condition really is about *every* candidate, winner included: on a scene cut
+        // there is nothing to align to, which is why the answer is "the page changed" and not
+        // "the winner is doubtful".
+        for candidate in scored.iter() {
+            let error = alignment_error(&previous.view(), &current.view(), candidate.d)
+                .expect("unrelated frames have structure on both sides");
+            assert!(
+                error > SCENE_CUT_ALIGNMENT_ERROR,
+                "candidate {} aligned at error {error}",
+                candidate.d
+            );
+        }
+
+        // 1–2 consecutive scene cuts are tolerated: the streak counts them, and asks for nothing.
+        let once = SceneCut::none().observe(true);
+        let twice = once.observe(true);
+        assert_eq!(SceneCut::none().consecutive(), 0);
+        assert_eq!(once.consecutive(), 1);
+        assert_eq!(twice.consecutive(), 2);
+        assert_eq!(once.action(), SceneCutAction::Tolerate);
+        assert_eq!(twice.action(), SceneCutAction::Tolerate);
+
+        // §30.3's row for ×1–2: `Uncertain`, and the session continues. `Uncertain` and not `None`
+        // for the same reason gate four's ambiguity is not `None`: a shift *was* measured, the frame
+        // is just not trusted. `effect()` is §16.10's canvas column in one place, so "the canvas is
+        // not written and the session goes on" is asserted rather than re-derived.
+        let winner = scored.iter().next().expect("checked above").d;
+        let evidence = Evidence {
+            scene_cut: twice,
+            ..evidence()
+        };
+        let displacement = Displacement::uncertain(winner, evidence);
+        assert!(matches!(displacement.status(), Status::Uncertain { .. }));
+        assert_eq!(displacement.effect(), StepEffect::Continue);
+        assert_eq!(displacement.evidence().scene_cut().consecutive(), 2);
+    }
+
+    #[test]
+    fn three_consecutive_scene_cuts_decay_the_model_but_do_not_stop() {
+        // `docs/31` §6 `P1.12`; `docs/30` §16.8's streak table and §30.3 (`scene cut ×≥3`). The
+        // third consecutive cut is where the *model* reacts (`decay_toward_neutral(0.05)` + reset,
+        // §18.2) — and that is all that happens: a changed page is a fact about the page, so there is
+        // no shape here for stopping the session.
+        let tolerated = SceneCut::none().observe(true).observe(true);
+        assert_eq!(tolerated.consecutive(), 2);
+        assert_eq!(tolerated.action(), SceneCutAction::Tolerate);
+
+        let decaying = tolerated.observe(true);
+        assert_eq!(decaying.consecutive(), SCENE_CUT_DECAY_STREAK);
+        assert_eq!(decaying.action(), SceneCutAction::DecayModel);
+
+        // "Consecutive" is the load-bearing word: one frame that aligns resets the streak, and a
+        // frame that is *not* a scene cut while already at zero leaves it at zero.
+        assert_eq!(decaying.observe(false), SceneCut::none());
+        assert_eq!(decaying.observe(false).consecutive(), 0);
+        assert_eq!(SceneCut::none().observe(false), SceneCut::none());
+
+        // The counter saturates rather than wrapping: a page that never comes back is one number,
+        // and `u8::MAX` scene cuts decay the model exactly as three do.
+        let mut stuck = SceneCut::none();
+        for _ in 0..600 {
+            stuck = stuck.observe(true);
+        }
+        assert_eq!(stuck.consecutive(), u8::MAX);
+        assert_eq!(stuck.action(), SceneCutAction::DecayModel);
+
+        // §16.8's "永不因 scene cut 终止会话" is a property of the type, so its executable form is an
+        // exhaustive `match`: every action the streak can ask for continues the session, and adding a
+        // stop would mean adding an arm here — which is the review this REFACTOR asks for.
+        let continues = match decaying.action() {
+            SceneCutAction::Tolerate => StepEffect::Continue,
+            SceneCutAction::DecayModel => StepEffect::Continue,
+        };
+        assert_eq!(continues, StepEffect::Continue);
+
+        // Exit condition ③ (`StopReason` has 11 variants) is not checkable in this file today: the
+        // scroll `StopReason` does not exist yet — it lands with `P3.07`/`P3.09` (DEV-21). What is
+        // checkable now is the claim it stands for, which the `match` above states.
+    }
+
+    #[test]
+    fn a_candidate_that_cannot_be_measured_and_a_blank_page_are_both_not_scene_cuts() {
+        // The two ways to make `is_scene_cut` true by accident, both of which would turn "I cannot
+        // tell" into "the page changed" — the one direction §16.8 must never err in, because
+        // `scene_cut ×≥3` decays the model.
+        let image = mixed_document();
+        let other = unrelated_document();
+        let mut first = ScrollScript::new(&image, 900, vec![StepSpec::move_by(120)]);
+        let mut second = ScrollScript::new(&other, 900, vec![StepSpec::move_by(120)]);
+        let previous = first.take(0);
+        let current = second.take(0);
+
+        // 1. `∀ i` over an empty set is vacuously true. A frame whose candidates were all dropped is
+        //    not evidence that the page changed; it is the absence of evidence, and §16.10 has a
+        //    state for that (`None`).
+        assert!(
+            !is_scene_cut(&previous.view(), &current.view(), &ScoredSet::new()),
+            "an empty candidate set was read as a scene cut"
+        );
+
+        // 2. A blank page. `band_zncc` returns `0.0` when a band has no variance, which is below
+        //    §16.8's 0.50 similarity floor — so the first condition holds on a solid colour — and the
+        //    reference implementation's `(1.0, 1.0)` fallback for "no samples" (`estimator.rs:570`)
+        //    would then report the *worst possible* alignment error for a page with nothing in it.
+        //    Ours cannot: a tile with no variance carries no alignment evidence, so `alignment_error`
+        //    is `None`, and an unmeasurable candidate blocks the claim (DEV-21).
+        let flat = TestImage::from_structures(320, 80 * 19, 3, 80 * 19, &[Structure::Flat]);
+        let mut script = ScrollScript::new(&flat, 300, vec![StepSpec::move_by(10)]);
+        let flat_previous = script.take(0);
+        let flat_current = script.take(1);
+        assert_eq!(
+            zero_shift_similarity(&flat_previous.view(), &flat_current.view()),
+            0.0,
+            "a solid page was expected to have no corr in either direction"
+        );
+        for shift in [0, 10, 20, -10] {
+            assert_eq!(
+                alignment_error(&flat_previous.view(), &flat_current.view(), shift),
+                None,
+                "a blank page produced an alignment error at {shift}"
+            );
+        }
+        let candidates = candidates_1d(&flat_previous.view(), &flat_current.view(), 10, 8);
+        let scored = score_candidates_2d(&flat_previous.view(), &flat_current.view(), &candidates);
+        assert!(
+            !is_scene_cut(&flat_previous.view(), &flat_current.view(), &scored),
+            "a blank page was read as a scene cut"
+        );
+    }
+
+    #[test]
+    fn a_page_that_did_move_is_not_a_scene_cut() {
+        // The other side of the same boundary: a real step is not "the page changed". The alignment
+        // error at the true shift is ~0, which is what makes `alignment_error` a measurement of this
+        // step rather than a fixed number.
+        let image = mixed_document();
+        let mut script = ScrollScript::new(&image, 900, vec![StepSpec::move_by(120)]);
+        let previous = script.take(0);
+        let current = script.take(1);
+
+        let aligned = alignment_error(&previous.view(), &current.view(), 120)
+            .expect("both frames have structure");
+        assert!(
+            aligned <= SCENE_CUT_ALIGNMENT_ERROR,
+            "the true shift aligned at error {aligned}"
+        );
+
+        // Measured 2026-10-08: the true shift gives `0.0`, a 4 px miss gives `0.40313148` (116) and
+        // `0.3820177` (124), and unrelated shifts give `0.9353355` (0) and `1.0045342` (60). Two
+        // things follow. First, the number is `1 − ZNCC` and therefore lives in `[0, 2]`, not in
+        // `[0, 1]` — a threshold like §16.8's `0.60` is a *position on that scale*, not a fraction
+        // of the band. Second, `zero_shift_similarity` on this frame is `−0.014104286`: **below**
+        // §16.8's similarity floor. So for any page that actually moved, the first condition holds
+        // and the second is what keeps a real step out of the scene cut — the first is a cheap veto
+        // for a page that did *not* change (the next test), not the discriminating one.
+        assert!(aligned.abs() < 1e-6, "the true shift should align exactly: {aligned}");
+
+        let candidates = candidates_1d(&previous.view(), &current.view(), 120, 40);
+        let scored = score_candidates_2d(&previous.view(), &current.view(), &candidates);
+        assert!(
+            !is_scene_cut(&previous.view(), &current.view(), &scored),
+            "a document that scrolled 120 px was read as a scene cut"
+        );
+    }
+
+    #[test]
+    fn a_frame_that_did_not_change_is_not_a_scene_cut() {
+        // What §16.8's first condition is for. A viewport that was re-rendered without scrolling is
+        // identical at zero shift, so the frame is not "a different page" and the expensive second
+        // condition never runs — which is the whole reason the cheap question is asked first.
+        let image = mixed_document();
+        let mut script = ScrollScript::new(&image, 900, vec![StepSpec::move_by(0)]);
+        let previous = script.take(0);
+        let current = script.take(1);
+
+        let similarity = zero_shift_similarity(&previous.view(), &current.view());
+        assert!(
+            similarity >= SCENE_CUT_SIMILARITY,
+            "two identical frames measured {similarity} at zero shift"
+        );
+
+        let candidates = candidates_1d(&previous.view(), &current.view(), 0, 40);
+        let scored = score_candidates_2d(&previous.view(), &current.view(), &candidates);
+        assert!(
+            !is_scene_cut(&previous.view(), &current.view(), &scored),
+            "a page that did not change was read as a scene cut"
+        );
     }
 }
