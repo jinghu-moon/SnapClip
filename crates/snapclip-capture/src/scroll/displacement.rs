@@ -23,12 +23,19 @@
 //! but keep the session" is one match arm instead of a rule every consumer re-derives.
 //!
 //! Not here yet: `scene_cut` (`P1.12` puts it in `Evidence`, so that it never becomes a
-//! `StopReason`), the `ĝ` prior (`P1.08`), the full-resolution third layer (`P1.07`) and the gates
-//! themselves (`P1.08`–`P1.11`); all of them feed the `score` this file's formulas name.
+//! `StopReason`), the `ĝ` prior (`P1.08`) and the gates themselves (`P1.08`–`P1.11`); all of them
+//! feed the `score` this file's formulas name.
 //!
 //! `P1.06` adds §15.4's second layer: the first thing in the funnel allowed to *argue*, because it
 //! is the first that compares two-dimensional structure (F-02 — a periodic carrier satisfies any
 //! one-dimensional measure at several shifts at once).
+//!
+//! `P1.07` adds §15.4 ③'s third and last layer. It is the first thing allowed to *decide a number*:
+//! everything below it produces sets or measurements, and everything above it decides what to do
+//! with one. It reads full resolution, its whole freedom is `±1` integer pixel ([`REFINE_NEIGHBOURHOOD`]),
+//! and it answers with [`Refined`] — an `i32` and one correlation, with no field for a subpixel
+//! offset. N3 says why: the observation is an integer pixel grid, so a fractional shift would be an
+//! interpolation believed as a measurement.
 
 // The first consumer of everything in this file is `P1.05` (layer 1) / `P1.06` (ZNCC) / `P1.12`
 // (the session loop). Until then the module is exercised only by its own tests, and the crate's
@@ -398,9 +405,22 @@ pub(crate) const DOWNSAMPLE: u32 = 4;
 /// §16.4's band width along the primary axis: 32 px. Layer 2 counts how many of these agree.
 pub(crate) const TILE_ROWS: u32 = 32;
 
-/// The shortest band layer 2 will score, in downsampled rows: §15.6's `H_match = max(16, H/2)` with
-/// the decimation already applied to the 16.
-const MATCH_MIN_ROWS: u32 = 16 / DOWNSAMPLE;
+/// §15.6's `H_match` floor in **full-resolution** primary rows: 16, because a one-dimensional
+/// sequence needs enough samples before "half the extent" means anything.
+///
+/// The floor is quoted in full-resolution units because two layers read it at two resolutions; each
+/// divides by its own scale ([`match_rows`]) rather than keeping a second copy of the 16 that could
+/// drift away from this one.
+const MATCH_MIN_ROWS: u32 = 16;
+
+/// §15.6's `H_match = max(16, H/2)` expressed in the units of the images about to be compared:
+/// `scale` is how many pixels one cell covers ([`DOWNSAMPLE`] for layer 2, `1` for layer 3).
+///
+/// The `max(1)` is not decoration: a frame shorter than `2·scale` would otherwise ask for a band of
+/// zero rows, and "no band" is spelled `None` by [`match_band`], not by an empty one.
+fn match_rows(previous_height: u32, current_height: u32, scale: u32) -> u32 {
+    (previous_height.min(current_height) / 2).max((MATCH_MIN_ROWS / scale).max(1))
+}
 
 /// A tile's own ZNCC has to reach this before the tile counts as supporting the shift.
 ///
@@ -420,18 +440,19 @@ fn luma(blue: u8, green: u8, red: u8) -> u32 {
     (77 * red as u32 + 150 * green as u32 + 29 * blue as u32) >> 8
 }
 
-/// A 4× area-averaged luma image, **oriented so that rows are primary lines**.
+/// An area-averaged luma image at some integral scale, **oriented so that rows are primary lines**.
 ///
-/// Layer 2 is a two-dimensional measure of a one-dimensional shift, so it needs the primary axis to
-/// be the row axis wherever it came from: a horizontal observation is pooled transposed. This keeps
-/// the axis branch in one function (`P1.02`'s lesson: a second branch is a second place to be
-/// wrong), and it costs a transposed read only on the horizontal path, whose performance is already
-/// deferred to `E-PERF-3`.
+/// The two layers above layer 1 both measure a one-dimensional shift two-dimensionally, so they
+/// need the primary axis to be the row axis wherever it came from: a horizontal observation is
+/// pooled transposed. This keeps the axis branch in one function (`P1.02`'s lesson: a second branch
+/// is a second place to be wrong), and it costs a transposed read only on the horizontal path,
+/// whose performance is already deferred to `E-PERF-3`.
 ///
 /// Pooling happens once per frame and every candidate is then scored against the same two images:
-/// §15.4 ② prices the layer at `O(H_match·W/16)` **per candidate**, which only holds if the
-/// decimation is not repeated inside the candidate loop. When `P1.13` introduces `Scratch`, these
-/// two buffers become its fields so that a step needing both layer 2 and layer 3 pools only once.
+/// §15.4 ② prices layer 2 at `O(H_match·W/16)` **per candidate**, which only holds if the
+/// decimation is not repeated inside the candidate loop. Layer 3 reads the same images at scale 1,
+/// so a step that needs both layers builds four images today. When `P1.13` introduces `Scratch`,
+/// they become its fields and one pass produces both scales.
 struct Gray {
     /// Cross-axis extent in cells.
     width: u32,
@@ -441,30 +462,39 @@ struct Gray {
 }
 
 impl Gray {
+    /// Layer 2's image: §15.6's 4× decimation.
     fn pooled(view: &ObservationView<'_>) -> Self {
+        Self::scaled(view, DOWNSAMPLE)
+    }
+
+    /// The same image at any integral scale, `1` included: an area average over `scale × scale`
+    /// cells, which for `scale == 1` is simply that pixel's luma. Layer 2 reads it at
+    /// [`DOWNSAMPLE`] and layer 3 at full resolution, and both go through this one loop, so the
+    /// orientation rule ("rows are primary lines") and the rounding rule exist exactly once.
+    fn scaled(view: &ObservationView<'_>, scale: u32) -> Self {
         let vertical = view.axis().is_vertical();
         let (cross, primary) = if vertical {
             (view.width(), view.height())
         } else {
             (view.height(), view.width())
         };
-        let width = cross / DOWNSAMPLE;
-        let height = primary / DOWNSAMPLE;
+        let width = cross / scale;
+        let height = primary / scale;
         let mut data = Vec::with_capacity((width * height) as usize);
         for row in 0..height {
             for column in 0..width {
                 let mut sum = 0;
-                for cell_y in 0..DOWNSAMPLE {
-                    for cell_x in 0..DOWNSAMPLE {
+                for cell_y in 0..scale {
+                    for cell_x in 0..scale {
                         sum += luma_at(
                             view,
-                            column * DOWNSAMPLE + cell_x,
-                            row * DOWNSAMPLE + cell_y,
+                            column * scale + cell_x,
+                            row * scale + cell_y,
                             vertical,
                         );
                     }
                 }
-                let cells = DOWNSAMPLE * DOWNSAMPLE;
+                let cells = scale * scale;
                 data.push(((sum + cells / 2) / cells) as u8);
             }
         }
@@ -697,12 +727,21 @@ pub(crate) struct ScoredCandidate {
     pub(crate) curvature: f32,
     /// §16.7's combination, the key this set is ranked by.
     pub(crate) score: f32,
+    /// Layer 1's support for this shift, carried unchanged from [`Candidate`].
+    ///
+    /// Every candidate inside one 4 px cell is measured at the cell's own grid point, so their
+    /// `zncc2d`, `gain`, `tiles` and `curvature` are identical — this layer *cannot* separate them
+    /// and must not pretend to. Layer 1 can: its row-digest support is computed per shift, so the
+    /// member that actually aligns the page has more of it. The tie-break below uses that evidence
+    /// instead of a grid heuristic, which is what keeps the winner inside layer 3's ±1
+    /// neighbourhood (`P1.07`'s sweep: without it every shift ≡ 2 (mod 4) came back 1 px off).
+    pub(crate) support: u32,
 }
 
 /// Up to [`CANDIDATE_LIMIT`] scored candidates, best first.
 ///
 /// Same fixed-array shape and same reason as [`CandidateSet`], and the same determinism
-/// requirement: ranked by `(score desc, curvature asc, |d| asc, d asc)`.
+/// requirement: ranked by `(score desc, curvature asc, support desc, |d| asc, d asc)`.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ScoredSet {
     items: [ScoredCandidate; CANDIDATE_LIMIT],
@@ -719,6 +758,7 @@ impl ScoredSet {
                 tiles: 0,
                 curvature: 0.0,
                 score: 0.0,
+                support: 0,
             }; CANDIDATE_LIMIT],
             len: 0,
         }
@@ -759,11 +799,16 @@ impl ScoredSet {
 }
 
 /// §16.7 says `score` is what ranks candidates; §15.4 ② says the three-point difference is what
-/// tells a peak from a plateau, so it breaks an exact tie in `score` (sharper first). Then comes the
-/// distance to the grid point this layer actually measured at: two candidates inside one 4 px cell
-/// are one measurement, and the one that *is* that measurement is the honest thing to report (the
-/// candidate closest to `round_to_grid(d)·4`). The shift tie-break last makes the order total and
-/// deterministic — the same requirement `P1.05`'s [`CandidateSet`] answers for layer 1.
+/// tells a peak from a plateau, so it breaks an exact tie in `score` (sharper first).
+///
+/// Then comes layer 1's own support: an exact `score` tie between two candidates means this layer
+/// measured them identically — which is the normal case **inside one 4 px cell**, where every member
+/// is measured at the same grid point — and the only evidence that still separates them is the
+/// one-dimensional support layer 1 computed per shift. Only then, if even that ties, does the
+/// distance to the grid point this layer measured at break the tie (the candidate closest to
+/// `round_to_grid(d)·4` is the honest thing to report when nothing else speaks), and the shift
+/// tie-break last makes the order total and deterministic — the same requirement `P1.05`'s
+/// [`CandidateSet`] answers for layer 1.
 fn scored_ranks_before(candidate: ScoredCandidate, existing: ScoredCandidate) -> bool {
     match candidate.score.total_cmp(&existing.score) {
         core::cmp::Ordering::Greater => true,
@@ -771,10 +816,14 @@ fn scored_ranks_before(candidate: ScoredCandidate, existing: ScoredCandidate) ->
         core::cmp::Ordering::Equal => match candidate.curvature.total_cmp(&existing.curvature) {
             core::cmp::Ordering::Less => true,
             core::cmp::Ordering::Greater => false,
-            core::cmp::Ordering::Equal => {
-                (grid_distance(candidate.d), candidate.d.unsigned_abs(), candidate.d)
-                    < (grid_distance(existing.d), existing.d.unsigned_abs(), existing.d)
-            }
+            core::cmp::Ordering::Equal => match candidate.support.cmp(&existing.support) {
+                core::cmp::Ordering::Greater => true,
+                core::cmp::Ordering::Less => false,
+                core::cmp::Ordering::Equal => {
+                    (grid_distance(candidate.d), candidate.d.unsigned_abs(), candidate.d)
+                        < (grid_distance(existing.d), existing.d.unsigned_abs(), existing.d)
+                }
+            },
         },
     }
 }
@@ -799,7 +848,7 @@ pub(crate) fn score_candidates_2d(
 ) -> ScoredSet {
     let previous_gray = Gray::pooled(previous);
     let current_gray = Gray::pooled(current);
-    let wanted = (previous_gray.height.min(current_gray.height) / 2).max(MATCH_MIN_ROWS);
+    let wanted = match_rows(previous_gray.height, current_gray.height, DOWNSAMPLE);
     let mut scored = ScoredSet::new();
     for candidate in candidates.iter() {
         let shift = round_to_grid(candidate.d);
@@ -835,19 +884,98 @@ pub(crate) fn score_candidates_2d(
             tiles,
             curvature,
             score: score_of(zncc2d, gain, coverage_of(tiles)),
+            support: candidate.support,
         });
     }
     scored
 }
 
+// --- layer 3 (`P1.07`) --------------------------------------------------------------------------
+
+/// §15.4 ③'s refinement neighbourhood: the winner and its two integer neighbours, in the order the
+/// tie-break prefers them. N3 is why there is no fourth entry and no fraction: the evidence is a
+/// pixel grid, so a subpixel offset would be interpolation wearing the clothes of a measurement.
+pub(crate) const REFINE_NEIGHBOURHOOD: [i32; 3] = [-1, 0, 1];
+
+/// What the funnel's last layer hands on: one integer shift and the full-resolution correlation
+/// that won it.
+///
+/// There is deliberately no field for a score, a status, a curvature or a subpixel offset.
+/// Assembling evidence (`P1.10`) and deciding (`P1.11`) happen *above* this layer, and the single
+/// number the canvas will act on is `d`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Refined {
+    /// The shift, in whole pixels of the frame's primary axis.
+    pub(crate) d: i32,
+    /// §16.7's `zncc2d` of that shift at full resolution — §15.4 ③'s "the only number that reaches
+    /// the gates".
+    pub(crate) zncc2d: f32,
+}
+
+/// Does `shift` with `zncc2d` displace the incumbent? Ties go to the shift nearer the winner, and
+/// an exact tie keeps the one already held, so the three-element iteration order above is the
+/// complete tie-break (`P1.05`'s lesson: an order that is not total is not deterministic).
+fn refine_ranks_before(shift: i32, zncc2d: f32, winner: i32, incumbent: Refined) -> bool {
+    match zncc2d.total_cmp(&incumbent.zncc2d) {
+        core::cmp::Ordering::Greater => true,
+        core::cmp::Ordering::Less => false,
+        core::cmp::Ordering::Equal => shift.abs_diff(winner) < incumbent.d.abs_diff(winner),
+    }
+}
+
+/// §15.4 ③'s third layer: full resolution, integer, and only `±1` around layer 2's winner.
+///
+/// Layer 2 measures on a [`DOWNSAMPLE`]-pixel grid, so every candidate inside one cell is *one*
+/// measurement and the layer reports the grid point it measured at. This layer re-measures that
+/// winner's own neighbourhood at full resolution and keeps whichever shift correlates best, which
+/// is how a 119 px step stops being reported as the 120 px grid point it was rounded to, and what
+/// `P1.06`'s `shifts_inside_one_cell_share_one_measurement` said was deliberately left to here.
+///
+/// It is also the last layer: above it, evidence is assembled and gates decide, but no further
+/// measurement is possible.
+///
+/// `None` when layer 2 scored nothing: there is no winner to refine, and that is a state rather
+/// than a zero shift (`P1.04`).
+pub(crate) fn refine_winner(
+    previous: &ObservationView<'_>,
+    current: &ObservationView<'_>,
+    scored: &ScoredSet,
+) -> Option<Refined> {
+    let winner = scored.iter().next()?.d;
+    let previous_gray = Gray::scaled(previous, 1);
+    let current_gray = Gray::scaled(current, 1);
+    let wanted = match_rows(previous_gray.height, current_gray.height, 1);
+    let mut refined: Option<Refined> = None;
+    for step in REFINE_NEIGHBOURHOOD {
+        let shift = winner + step;
+        // A neighbour can leave the frame entirely (a shift equal to the extent does not hit this
+        // layer, but a one-row frame can): the other two still get their say.
+        let Some(band) = match_band(previous_gray.height, current_gray.height, shift, wanted) else {
+            continue;
+        };
+        let zncc2d = band_zncc(&previous_gray, &current_gray, band, 0, band.rows);
+        let better = match refined {
+            None => true,
+            Some(incumbent) => refine_ranks_before(shift, zncc2d, winner, incumbent),
+        };
+        if better {
+            refined = Some(Refined { d: shift, zncc2d });
+        }
+    }
+    refined
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        CANDIDATE_LIMIT, Candidate, Displacement, Evidence, ScoredCandidate, ScoredSet, Status,
-        StepEffect, candidates_1d, primary_digests, score_candidates_2d, support_at,
+        CANDIDATE_LIMIT, Candidate, Displacement, Evidence, Gray, ScoredCandidate, ScoredSet,
+        Status, StepEffect, band_zncc, candidates_1d, match_band, match_rows, primary_digests,
+        score_candidates_2d, support_at,
     };
-    use crate::scroll::observation::{Axis, Observation};
-    use crate::scroll::displacement::{grid_distance, round_to_grid, DOWNSAMPLE};
+    use crate::scroll::observation::{Axis, Observation, ObservationView};
+    use crate::scroll::displacement::{
+        DOWNSAMPLE, REFINE_NEIGHBOURHOOD, Refined, grid_distance, refine_winner, round_to_grid,
+    };
     use crate::scroll::testkit::{ScrollScript, StepSpec, Structure, TestImage};
 
     fn evidence() -> Evidence {
@@ -1271,7 +1399,9 @@ mod tests {
                 tiles,
                 curvature,
                 score,
+                support,
             } = *candidate;
+            let _ = support;
             assert!(
                 zncc2d.is_finite()
                     && gain.is_finite()
@@ -1350,9 +1480,11 @@ mod tests {
     /// REFACTOR (`P1.06`): one measurement per 4 px cell of this layer's own grid.
     ///
     /// `round_to_grid` means two candidates inside one cell are the *same* measurement — equal
-    /// correlations, equal gain, equal tiles — and the one that *is* that measurement (the cell's
-    /// own shift) is the one layer 2 reports. Separating them is §15.4 ③'s job at full resolution
-    /// (`P1.07`), which is why this layer must not pretend it already has.
+    /// correlations, equal gain, equal tiles — so this layer cannot rank them and must not pretend
+    /// it can. Separating them is §15.4 ③'s job at full resolution (`P1.07`), which refines ±1
+    /// around the winner; the winner therefore has to be the member the page aligns with, and that
+    /// is decided by layer 1's support (`P1.07` measured why: on the grid heuristic every shift
+    /// ≡ 2 (mod 4) came back 1 px off).
     #[test]
     fn shifts_inside_one_cell_share_one_measurement() {
         let image = mixed_document();
@@ -1385,6 +1517,18 @@ mod tests {
                 member.d
             );
         }
+        // Support is *not* part of that shared measurement: it is layer 1's, computed per shift, and
+        // it is the only thing in this set that can tell one member of the cell from another. That
+        // is what `P1.07` needs — a ±1 refinement around the winner can only reach the truth if the
+        // winner is already the member the page actually aligns with.
+        assert!(
+            members.iter().any(|member| member.support != members[0].support),
+            "the fixture no longer gives layer 1 anything to separate the cell with: {:?}",
+            members
+                .iter()
+                .map(|member| (member.d, member.support))
+                .collect::<Vec<_>>()
+        );
         assert!(
             members.iter().any(|member| member.d == cell),
             "the cell's own shift {cell} was not among the candidates, so this case says nothing"
@@ -1426,5 +1570,236 @@ mod tests {
                 .map(|candidate| (candidate.d, candidate.score))
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// Full-resolution correlation of the band at `shift`, recomputed here instead of read off
+    /// [`Refined`], so the third layer is checked against §15.4 ③'s definition rather than against
+    /// itself. Shares only the module's primitives ([`Gray`], [`match_band`], [`band_zncc`]).
+    fn full_resolution_zncc(
+        previous: &ObservationView<'_>,
+        current: &ObservationView<'_>,
+        shift: i32,
+    ) -> f32 {
+        let previous_gray = Gray::scaled(previous, 1);
+        let current_gray = Gray::scaled(current, 1);
+        let wanted = match_rows(previous_gray.height, current_gray.height, 1);
+        let Some(band) = match_band(
+            previous_gray.height,
+            current_gray.height,
+            shift,
+            wanted,
+        ) else {
+            return f32::NEG_INFINITY;
+        };
+        band_zncc(&previous_gray, &current_gray, band, 0, band.rows)
+    }
+
+    /// `docs/31` §6 `P1.07`'s first RED case.
+    #[test]
+    fn refinement_only_moves_the_winner_by_one_pixel() {
+        // Layer 2 measures on its own 4 px grid, so a shift of 119 and a shift of 120 are the *same*
+        // measurement and it reports the grid point it actually measured at (`P1.06`'s
+        // `shifts_inside_one_cell_share_one_measurement`). §15.4 ③'s third layer is what hands the
+        // truth back: full resolution, integer, and never further than ±1 from what layer 2
+        // proposed. That neighbourhood is the whole of its authority — F-04/N3: the observation is
+        // an integer pixel grid, so anything finer would be invented rather than observed.
+        let image = mixed_document();
+        for truth in [119, 37] {
+            let mut script = ScrollScript::new(&image, 900, vec![StepSpec::move_by(truth)]);
+            let previous = script.take(0);
+            let current = script.take(1);
+            let candidates = candidates_1d(&previous.view(), &current.view(), truth, 8);
+            let scored = score_candidates_2d(&previous.view(), &current.view(), &candidates);
+            let winner = scored
+                .iter()
+                .next()
+                .expect("the second layer scored nothing on the mixed document")
+                .d;
+            let refined = refine_winner(&previous.view(), &current.view(), &scored)
+                .expect("layer 2 proposed a shift, so layer 3 has something to refine");
+
+            assert!(
+                refined.d.abs_diff(winner) <= 1,
+                "truth {truth}: the third layer moved the winner from {winner} to {}, but its \
+                 neighbourhood is ±1 — a wider move is a second search, not a refinement",
+                refined.d
+            );
+
+            // The point of the layer: it separates what the grid could not. 119 and 37 both round
+            // to a cell whose grid point is 1 px away from them, so layer 2 can only say 120 and
+            // 36 — the third layer is the first thing in the funnel allowed to say the truth.
+            assert_eq!(
+                refined.d, truth,
+                "truth {truth}: layer 2 said {winner} and layer 3 said {}, so the ±1 neighbourhood \
+                 did not recover the shift the grid flattened",
+                refined.d
+            );
+
+            // And the shift it reports really is the best full-resolution correlation inside that
+            // neighbourhood — recomputed independently, then read off `Refined`.
+            let best_inside = REFINE_NEIGHBOURHOOD
+                .iter()
+                .map(|step| winner + step)
+                .max_by(|left, right| {
+                    full_resolution_zncc(&previous.view(), &current.view(), *left)
+                        .total_cmp(&full_resolution_zncc(&previous.view(), &current.view(), *right))
+                })
+                .expect("the neighbourhood is not empty");
+            assert_eq!(
+                refined.d, best_inside,
+                "truth {truth}: the third layer did not take the argmax of the full-resolution \
+                 neighbourhood"
+            );
+            assert!(
+                (refined.zncc2d - full_resolution_zncc(&previous.view(), &current.view(), truth))
+                    .abs()
+                    < 1e-6,
+                "truth {truth}: the reported correlation {} is not the one this shift has",
+                refined.zncc2d
+            );
+        }
+    }
+
+    /// `docs/31` §6 `P1.07`'s second RED case.
+    #[test]
+    fn the_final_value_is_an_integer() {
+        // F-04's claim is a *type-level* one, so its executable form is a destructuring without
+        // `..`: the funnel's last word has exactly two fields today, and a future `subpixel: f32`
+        // next to `d` would break this build instead of quietly re-introducing an interpolation
+        // that the evidence cannot support (N3).
+        assert_eq!(
+            REFINE_NEIGHBOURHOOD,
+            [-1, 0, 1],
+            "the third layer's freedom is ±1 integer pixel and nothing else"
+        );
+
+        let image = mixed_document();
+        let mut script = ScrollScript::new(&image, 900, vec![StepSpec::move_by(120)]);
+        let previous = script.take(0);
+        let current = script.take(1);
+        let candidates = candidates_1d(&previous.view(), &current.view(), 120, 8);
+        let scored = score_candidates_2d(&previous.view(), &current.view(), &candidates);
+        let refined = refine_winner(&previous.view(), &current.view(), &scored)
+            .expect("layer 2 proposed a shift, so layer 3 has something to refine");
+
+        let Refined { d, zncc2d } = refined;
+        let _: i32 = d;
+        assert_eq!(d, 120, "a grid-aligned step must survive the refinement untouched");
+        assert!(
+            zncc2d.is_finite() && (-1.0..=1.0).contains(&zncc2d),
+            "a correlation outside [-1, 1] is not a correlation: {zncc2d}"
+        );
+
+        // No scored candidate means nothing was measured, and the third layer says so with `None`
+        // rather than with a zero shift (`P1.04`'s rule: `None` is a state, not a value).
+        assert!(
+            refine_winner(&previous.view(), &current.view(), &ScoredSet::new()).is_none(),
+            "an empty scored set has no winner to refine"
+        );
+    }
+
+    /// `docs/31` §6 `P1.07`'s exit condition ③: `docs/30` §30.3's "integer shifts (both signs,
+    /// 1..40)" row, in the part of it that exists at this layer.
+    ///
+    /// The gates (§16.1–§16.5) are `P1.08`–`P1.11`, so what can be asked today is narrower and
+    /// sharper: for every integer shift the funnel can *measure*, the number that comes out of the
+    /// third layer is the truth. A ±1 neighbourhood can only do that if the winner it refines
+    /// around is already within one pixel of the truth — which is what makes this the test that
+    /// decides whether layer 2's cell tie-break and layer 3's authority fit together.
+    #[test]
+    fn every_integer_shift_from_one_to_forty_comes_back_exactly() {
+        let image = mixed_document();
+        let mut failures: Vec<(i32, Option<i32>)> = Vec::new();
+        for magnitude in 1..=40 {
+            for direction in [1i32, -1] {
+                let truth = magnitude * direction;
+                // The script starts at the top of the document, so a backward step needs room to
+                // come back up: one 40 px step first, and the pair is the second and third frames.
+                let steps = if direction > 0 {
+                    vec![StepSpec::move_by(truth)]
+                } else {
+                    vec![StepSpec::move_by(40), StepSpec::move_by(truth)]
+                };
+                let mut script = ScrollScript::new(&image, 900, steps);
+                // `take` is sequential (`docs/31` §0.6 `DEV-9` note 3): the fixture hands out the
+                // stream in order, so the third frame is only reachable through the second.
+                let first = script.take(0);
+                let second = script.take(1);
+                let (previous, current) = if direction > 0 {
+                    (first, second)
+                } else {
+                    let third = script.take(2);
+                    (second, third)
+                };
+                let candidates = candidates_1d(&previous.view(), &current.view(), truth, 8);
+                let scored = score_candidates_2d(&previous.view(), &current.view(), &candidates);
+                let measured = refine_winner(&previous.view(), &current.view(), &scored);
+                match measured {
+                    Some(refined) if refined.d == truth => {}
+                    other => failures.push((truth, other.map(|refined| refined.d))),
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "shifts that did not come back: {failures:?}"
+        );
+    }
+
+    /// REFACTOR (`P1.07`): the tie the second layer cannot break is broken by the first layer's
+    /// evidence, not by a grid heuristic.
+    ///
+    /// A shift of 2 (or 6, or −2) sits two pixels from the grid point its cell is measured at, so
+    /// ranking the cell's members by distance to that grid point hands layer 3 a winner its ±1
+    /// neighbourhood cannot reach. Measured before the fix (`P1.07`'s sweep): `[(2, Some(1)),
+    /// (-2, Some(-3)), (6, Some(5)), …]` — every |d| ≡ 2 (mod 4), each exactly 1 px off. Layer 1's
+    /// support is computed per shift and does see the difference, so it is the one that decides,
+    /// and what layer 3 then needs from layer 2 is only that its winner is within one pixel.
+    #[test]
+    fn the_cell_tie_is_broken_by_the_first_layers_evidence() {
+        let image = mixed_document();
+        for truth in [2, 6, -2, -6] {
+            let steps = if truth > 0 {
+                vec![StepSpec::move_by(truth)]
+            } else {
+                vec![StepSpec::move_by(40), StepSpec::move_by(truth)]
+            };
+            let mut script = ScrollScript::new(&image, 900, steps);
+            let first = script.take(0);
+            let second = script.take(1);
+            let (previous, current) = if truth > 0 {
+                (first, second)
+            } else {
+                let third = script.take(2);
+                (second, third)
+            };
+            let candidates = candidates_1d(&previous.view(), &current.view(), truth, 8);
+            let scored = score_candidates_2d(&previous.view(), &current.view(), &candidates);
+            let winner = scored
+                .iter()
+                .next()
+                .expect("the second layer scored nothing")
+                .d;
+            let grid_point = round_to_grid(winner) * DOWNSAMPLE as i32;
+
+            // The counterfactual, as an assertion: the cell's grid point — what a distance-to-grid
+            // rule would have reported — is out of the third layer's reach for this shift.
+            assert_eq!(
+                (grid_point - truth).abs(),
+                2,
+                "shift {truth}: this case only means something while its cell's grid point \
+                 ({grid_point}) sits two pixels away"
+            );
+            // The fix: the winner layer 2 actually reports is inside the ±1 neighbourhood.
+            assert!(
+                winner.abs_diff(truth) <= 1,
+                "shift {truth}: layer 2 picked {winner}, which is out of layer 3's ±1 reach"
+            );
+            assert_eq!(
+                refine_winner(&previous.view(), &current.view(), &scored).map(|refined| refined.d),
+                Some(truth),
+                "shift {truth}: the third layer did not recover the truth from {winner}"
+            );
+        }
     }
 }
