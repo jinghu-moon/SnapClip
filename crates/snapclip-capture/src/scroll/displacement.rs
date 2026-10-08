@@ -1456,6 +1456,98 @@ pub(crate) fn gate_margin(best: i32, margin: Option<f32>) -> GateOutcome {
     }
 }
 
+// --- manual mode (§16.6): ambiguity has to be recognised, not predicted -------------------------
+
+/// §16.6's manual search half-width: `max(8, ceil(0.15 · H_match))`.
+///
+/// In manual mode the user owns the step, so no expectation can bound the search (`n` is unknown to
+/// us) and the window has to come from the match region instead. The floor keeps a degenerate band
+/// from collapsing the search onto the single candidate at zero, where "no ambiguity" would be true
+/// by construction.
+pub(crate) fn manual_window(match_rows: u32) -> i32 {
+    let scaled = (match_rows as f32) * MANUAL_WINDOW_FRACTION;
+    scaled.ceil().max(MANUAL_WINDOW_MIN) as i32
+}
+
+/// §16.6's fraction of `H_match` the manual search reaches in each direction.
+const MANUAL_WINDOW_FRACTION: f32 = 0.15;
+
+/// §16.6's floor on the manual window, in pixels.
+const MANUAL_WINDOW_MIN: f32 = 8.0;
+
+/// §16.6's family threshold: a rival peak above `0.85 · score(best)` is part of the ambiguity, not a
+/// tail below it.
+pub(crate) const PEAK_FAMILY_RATIO: f32 = 0.85;
+
+/// How many equally spaced peaks make a *family*.
+///
+/// Two would be a coincidence, and one rival is exactly what gate four (§16.5) already handles;
+/// three peaks at one spacing is a period, which is a statement about the page.
+const PEAK_FAMILY_MIN_POINTS: usize = 3;
+
+/// §16.6's peak-family test: is the winner one of several equally good, equally spaced shifts?
+///
+/// Manual mode has no prior — `n` is the user's, so `P1` is off — and that leaves this as the only
+/// defence against a periodic page: notice that the page itself offers no choice, and answer
+/// `Uncertain` rather than picking the one the grid happens to order first.
+///
+/// It is made of the **candidate set alone**: no scrollbar position, no UIA provider, no mouse hook.
+/// That is V2's explicit refusal (§16.6 notes the reference implementation's low-level hook), and the
+/// type is what enforces it — this function has nowhere to receive such a reading, and the test that
+/// pins its signature breaks if anyone adds one.
+///
+/// Two details come from earlier measurements rather than from §16.6's prose:
+///
+/// 1. Peaks are counted **one per 4 px cell**. Layer 2 measures one value per cell, so one cell
+///    contributes several candidates with identical measurements (`P1.06`); reading those as a family
+///    would report the grid's resolution as ambiguity, while which member of a cell wins is layer 1's
+///    `support` (`P1.07`). Spacing is therefore compared in cell units, which is the same spacing in
+///    pixels up to the constant `DOWNSAMPLE`.
+/// 2. The threshold applies to `ranked()`, not `score`. In manual mode the two are equal (rule 2
+///    switches the prior off), and reading the ranked number keeps this test meaning the same thing
+///    if a caller ever runs it with a prior installed.
+pub(crate) fn has_peak_family(scored: &ScoredSet) -> bool {
+    let Some(best) = scored.iter().next() else {
+        return false;
+    };
+    let best = best.ranked();
+    if best <= 0.0 {
+        return false;
+    }
+    let threshold = best * PEAK_FAMILY_RATIO;
+
+    let mut cells: Vec<i32> = Vec::with_capacity(CANDIDATE_LIMIT);
+    for candidate in scored.iter() {
+        if candidate.ranked() < threshold {
+            continue;
+        }
+        let cell = round_to_grid(candidate.d);
+        if !cells.contains(&cell) {
+            cells.push(cell);
+        }
+    }
+    if cells.len() < PEAK_FAMILY_MIN_POINTS {
+        return false;
+    }
+    cells.sort_unstable();
+
+    // Three peaks at one spacing is a period. Any pair fixes a candidate spacing; the family is real
+    // if that many peaks lie on one of its multiples (`cells` is sorted and unique, so `spacing > 0`).
+    for (index, base) in cells.iter().enumerate() {
+        for other in cells.iter().skip(index + 1) {
+            let spacing = other - base;
+            let family = cells
+                .iter()
+                .filter(|cell| (*cell - base) % spacing == 0)
+                .count();
+            if family >= PEAK_FAMILY_MIN_POINTS {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 // --- mechanism P1 (§16.6): the amount we injected is evidence ----------------------------------
 
 /// §16.6's `κ`: the expected displacement is accepted over `[n·ĝ·(1−κ), n·ĝ·(1+κ)]`.
@@ -1834,13 +1926,15 @@ mod tests {
     use super::{
         CANDIDATE_LIMIT, Candidate, CandidateSet, Displacement, Evidence, GateOutcome, GateRejection,
         Gray,
-        MARGIN_SCORE_FLOOR, MIN_MARGIN, MIN_RESIDUAL_GAIN, MIN_TILES, PRIOR_DOWNWEIGHT, PRIOR_KAPPA,
+        MARGIN_SCORE_FLOOR, MIN_MARGIN, MIN_RESIDUAL_GAIN, MIN_TILES, PEAK_FAMILY_RATIO,
+        PRIOR_DOWNWEIGHT, PRIOR_KAPPA,
         Prior,
         RHO_MIN, RHO_MIN_PERMILLE,
         SCENE_CUT_ALIGNMENT_ERROR, SCENE_CUT_DECAY_STREAK, SCENE_CUT_SIMILARITY, SCORE_GAIN, Scratch,
         SceneCut, SceneCutAction, ScoredCandidate, ScoredSet, Status, StepEffect,
         TILE_INDEPENDENCE_GAP, alignment_error, band_zncc, candidates_1d, gate_geometry, gate_margin,
-        gate_residual_gain, gate_support, independent_support, is_scene_cut, is_verifiable, margin_of,
+        gate_residual_gain, gate_support, has_peak_family, independent_support, is_scene_cut,
+        is_verifiable, manual_window, margin_of,
         match_band, match_rows, primary_digests, residual_gain, residual_gain_at, score_candidates_2d,
         support_at, zero_shift_similarity, zero_shift_status,
     };
@@ -3599,8 +3693,13 @@ mod tests {
         }
     }
 
-    /// The search half-width the ablation runs with: the manual-mode degradation of §16.6, which is
-    /// the wider of the two, so a gate is never let off by a narrow window.
+    /// The search half-width the ablation runs with, fixed at 40 px for every case.
+    ///
+    /// It is deliberately **not** §16.6's manual window: that one is `0.15 · H_match` = 68 px at a
+    /// 900 px viewport (`P1.15`), and it is a coverage limit as much as a search bound — a step
+    /// beyond it comes back `Uncertain` rather than wrong. Using it here would make each gate's row
+    /// depend on which mode the corpus was read in. What the corpus needs is a window wide enough
+    /// that no gate is let off by a narrow search, and fixed so the four rows stay comparable.
     const ABLATION_WINDOW: i32 = 40;
 
     /// §16.1's funnel with the gates switched, so one of them can be removed and the answer watched.
@@ -3633,13 +3732,26 @@ mod tests {
             let views = scratch.pool(previous, current);
             score_candidates_2d(views.previous(), views.current(), &candidates)
         };
+        decide_scored(scratch, previous, current, &scored, mask)
+    }
+
+    /// The funnel from the scored candidate set onwards, so a caller that has already paid for the
+    /// second layer — manual mode, which has to inspect the set for a peak family — can hand it in
+    /// instead of measuring the same step twice.
+    fn decide_scored(
+        scratch: &mut Scratch,
+        previous: &ObservationView<'_>,
+        current: &ObservationView<'_>,
+        scored: &ScoredSet,
+        mask: GateMask,
+    ) -> Status {
         let Some(best) = scored.iter().next().copied() else {
             return Status::None;
         };
         let extent = previous.primary_extent();
         let answer = {
             let views = scratch.full_resolution(previous, current);
-            refine_winner(views.previous(), views.current(), &scored)
+            refine_winner(views.previous(), views.current(), scored)
         }
         .map(|refined| refined.d)
         .unwrap_or(best.d);
@@ -3659,7 +3771,7 @@ mod tests {
             // exactly and reading one of them as a rival reports the grid's resolution as ambiguity.
             // Which member of the cell wins is the first layer's `support`, which `P1.07` made the
             // ranking's tie-break; the ambiguity gate asks about the *page*, not about the grid.
-            let rival = outside_cell_second(&scored, best.d).map(|second| second.ranked());
+            let rival = outside_cell_second(scored, best.d).map(|second| second.ranked());
             // The margin is taken on the **ranked** numbers, because that is the key the winner was
             // picked by (§16.5: the prior may reorder the two leaders, which is only meaningful if
             // the comparison that follows looks at the same two numbers). Rule 3's bound is what
@@ -3686,6 +3798,49 @@ mod tests {
             Status::Confirmed { d: answer }
         } else {
             Status::Uncertain { d: answer }
+        }
+    }
+
+    /// §16.6's manual mode: the search is centred on zero with the manual half-width, and a peak
+    /// family is answered `Uncertain` before the gates get a say.
+    ///
+    /// The family outranks gates two, three and four on purpose. Those gates ask whether *this*
+    /// candidate is good enough; the family says the page cannot single one out, which is a different
+    /// question and the one §16.6 answers directly. Gate one is not outranked — geometry is a
+    /// correctness constraint on the number itself (§16.2), and an ambiguity is no reason to report a
+    /// shift the canvas must not act on.
+    ///
+    /// Test-only for the same reason [`decide`] is: the production entry point belongs to the session
+    /// assembly.
+    fn manual_status(
+        scratch: &mut Scratch,
+        previous: &ObservationView<'_>,
+        current: &ObservationView<'_>,
+    ) -> Status {
+        let extent = previous.primary_extent();
+        // Manual mode has no expectation, so the search is centred on zero (§16.6).
+        let window = manual_window(match_rows(extent, extent, 1));
+        let candidates = candidates_1d(previous, current, 0, window);
+        if candidates.is_empty() {
+            return Status::None;
+        }
+        let scored = {
+            let views = scratch.pool(previous, current);
+            score_candidates_2d(views.previous(), views.current(), &candidates)
+        };
+        if !has_peak_family(&scored) {
+            return decide_scored(scratch, previous, current, &scored, GateMask::ALL);
+        }
+        let answer = {
+            let views = scratch.full_resolution(previous, current);
+            refine_winner(views.previous(), views.current(), &scored)
+        }
+        .map(|refined| refined.d)
+        .unwrap_or_else(|| scored.iter().next().expect("a family needs candidates").d);
+        if gate_geometry(answer, extent) == GateOutcome::Pass {
+            Status::Uncertain { d: answer }
+        } else {
+            Status::None
         }
     }
 
@@ -4325,6 +4480,179 @@ mod tests {
         assert!(
             matches!(gate_margin(19, Some(margin)), GateOutcome::Reject(_)),
             "gate four accepted an ambiguous periodic page"
+        );
+    }
+
+    /// §16.6's manual mode: `n` is the user's, not ours, so P1 is off and the candidate set is
+    /// centred on zero. On a periodic page the aliases are equally good and the honest answer is
+    /// `Uncertain` — §30.3's verdict for that row, reached without asking anything but the frames.
+    #[test]
+    fn manual_mode_without_a_prior_reports_uncertain_on_a_periodic_page() {
+        let image = TestImage::from_structures(
+            640,
+            100 * 19,
+            11,
+            19,
+            &[Structure::HorizontalBars { period: 19 }],
+        );
+        let mut script = ScrollScript::new(&image, 900, vec![StepSpec::move_by(19)]);
+        let previous = script.take(0);
+        let current = script.take(1);
+
+        // We injected nothing, so there is no expectation to weight against (rule 2), and a prior
+        // with no expectation must not weight anything (rule 3's degenerate case).
+        let prior = Prior::new(19.0);
+        assert_eq!(
+            prior.expectation(0),
+            None,
+            "n = 0 must close the prior, not predict zero pixels"
+        );
+        assert_eq!(
+            prior.weight(0, 12_345),
+            1.0,
+            "a closed prior weights nothing"
+        );
+
+        let window = manual_window(match_rows(900, 900, 1));
+        assert_eq!(
+            window, 68,
+            "§16.6: max(8, ceil(0.15 · H_match)) with H_match = 450"
+        );
+
+        let mut scratch = Scratch::new();
+        let candidates = candidates_1d(&previous.view(), &current.view(), 0, window);
+        let scored = {
+            let views = scratch.pool(&previous.view(), &current.view());
+            score_candidates_2d(views.previous(), views.current(), &candidates)
+        };
+        let best = *scored.iter().next().expect("the second layer scored nothing");
+        let strong = scored
+            .iter()
+            .filter(|candidate| candidate.ranked() >= PEAK_FAMILY_RATIO * best.ranked())
+            .count();
+        assert!(
+            strong >= 3,
+            "a page moved by its own period has no single winner: {strong} candidates are within {} of the best",
+            PEAK_FAMILY_RATIO
+        );
+        assert!(
+            has_peak_family(&scored),
+            "the aliases sit at multiples of one period: a family, not a winner"
+        );
+
+        let status = manual_status(&mut scratch, &previous.view(), &current.view());
+        assert!(
+            matches!(status, Status::Uncertain { .. }),
+            "manual mode answered a periodic page with {status:?}"
+        );
+
+        // The counterfactual, pinned: without the family branch this page is not `Uncertain` at all.
+        // Gate two refuses it first — a page moved by exactly its own period has no residual to
+        // reduce (`gain = 0`) — and a rejection with no ambiguity arm maps to `None`, i.e. "no
+        // evidence", when the honest answer is "evidence that does not choose". §16.5.1 says the
+        // family test is the same *measurement* as gate four (`1 − 0.85 == MIN_MARGIN`); what the
+        // branch adds is the *verdict* when an earlier gate refuses, and this is that page.
+        let funnel = decide_scored(
+            &mut scratch,
+            &previous.view(),
+            &current.view(),
+            &scored,
+            GateMask::ALL,
+        );
+        assert!(
+            matches!(funnel, Status::None),
+            "the four gates alone already answered this page with {funnel:?}, so the family branch \
+             is not what makes manual mode honest here"
+        );
+    }
+
+    /// §16.6's other half: the manual answer comes from the candidate set and **nothing else**. V2
+    /// deliberately refuses to read the scrollbar, a UIA provider or a mouse hook for "how far the
+    /// user scrolled" (the reference implementation uses a low-level hook; we do not), and the way
+    /// that refusal stays true is the **type**: there is no parameter to pass such a reading through.
+    /// The coercions below are the nail — a future change that acquired one would stop compiling.
+    #[test]
+    fn manual_mode_never_guesses_from_the_scrollbar() {
+        let _: fn(&ScoredSet) -> bool = has_peak_family;
+        let _: fn(u32) -> i32 = manual_window;
+        let _: fn(&mut Scratch, &ObservationView<'_>, &ObservationView<'_>) -> Status = manual_status;
+
+        assert_eq!(PEAK_FAMILY_RATIO, 0.85, "§16.6's family threshold");
+        assert_eq!(manual_window(450), 68);
+        assert_eq!(
+            manual_window(0),
+            8,
+            "§16.6's floor, so a degenerate band still searches"
+        );
+        assert!(
+            !has_peak_family(&ScoredSet::new()),
+            "an empty candidate set has no family"
+        );
+    }
+
+    /// P1.15's exit condition ②: manual mode must not *confirm* a wrong shift. `E-ACC-1`'s fixture
+    /// (§30.2) does not exist yet, so this runs on the corpus `P1.13` built; the fixture check stays
+    /// open in `docs/31` §14.3.
+    ///
+    /// What it shows (2026-10-08): **0 wrong, 13 refused of 17 cases**. Manual mode answers the steps
+    /// it can see — `mixed-7` comes back `Confirmed { d: 7 }` — and refuses the rest, because the
+    /// manual window is centred on zero and reaches only `0.15 · H_match = 68` px at a 900 px
+    /// viewport. A 120 px step is therefore *outside the search*, and the answer is `Uncertain`,
+    /// never a wrong `Confirmed`. That is the trade §16.6's degradation makes, and its failure mode
+    /// is a refusal rather than an error.
+    #[test]
+    fn manual_mode_never_confirms_a_wrong_shift() {
+        let mut scratch = Scratch::new();
+        let mut rows: Vec<(&'static str, i32, u32, Status)> = Vec::new();
+        for case in ablation_cases() {
+            let steps = vec![StepSpec::move_by(case.step)];
+            let mut script = if case.horizontal {
+                ScrollScript::horizontal(&case.image, case.viewport, steps)
+            } else {
+                ScrollScript::new(&case.image, case.viewport, steps)
+            };
+            let previous = script.take(0);
+            let current = script.take(1);
+            let status = manual_status(&mut scratch, &previous.view(), &current.view());
+            rows.push((case.name, case.step, case.viewport, status));
+        }
+
+        let mut table = String::from("case         step  extent  entitled  status\n");
+        let mut wrong: Vec<String> = Vec::new();
+        for (name, step, viewport, status) in &rows {
+            let entitled = answerable(*step, *viewport);
+            table.push_str(&format!(
+                "{name:<12} {step:<5} {viewport:<7} {entitled:<9} {status:?}\n"
+            ));
+            if let Status::Confirmed { d } = status
+                && !(entitled && d.abs_diff(*step) <= 1)
+            {
+                wrong.push(format!("{name}: step {step}, confirmed {d}"));
+            }
+        }
+        println!("{table}\nwrong confirmations: {}", wrong.len());
+        assert!(
+            wrong.is_empty(),
+            "manual mode confirmed a shift the page does not support: {wrong:?}"
+        );
+
+        let answered = rows
+            .iter()
+            .find(|(name, ..)| *name == "mixed-7")
+            .expect("mixed-7 is in the corpus");
+        assert!(
+            matches!(answered.3, Status::Confirmed { d: 7 }),
+            "manual mode did not answer a step inside its own window: {:?}",
+            answered.3
+        );
+        let outside = rows
+            .iter()
+            .find(|(name, ..)| *name == "mixed-120")
+            .expect("mixed-120 is in the corpus");
+        assert!(
+            !matches!(outside.3, Status::Confirmed { .. }),
+            "a step beyond the manual window was confirmed: {:?}",
+            outside.3
         );
     }
 }
