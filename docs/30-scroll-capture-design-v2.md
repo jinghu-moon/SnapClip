@@ -2760,8 +2760,10 @@ struct MemoryBudget {
 | 选项 | 今天 | V2 | 理由 |
 |---|---|---|---|
 | `IGraphicsCaptureSession3::IsBorderRequired(false)` | 直接调用、**吞错误**（`wgc.rs:110`） | **先探测接口可用性**，不可用则记 `CaptureOptionUnavailable` 诊断 **并断言"长图里不存在边框色带"**（§4 R12 的建议） | 该接口需 Win10 2004+/11；调用失败在今天是静默的 |
-| `IGraphicsCaptureSession2::IsCursorCaptureEnabled(false)` | 直接调用、**吞错误**（`wgc.rs:107`） | 同上；**不可用时退回 §16 的掩码排除** | F-15；PixPin 正常路径两者都调 |
+| `IGraphicsCaptureSession2::IsCursorCaptureEnabled(false)` | 直接调用、**硬失败**（`wgc.rs:106-108` 的 `?` 传播：接口不可用则**整个捕获失败**） | 同上；**不可用时退回 §16 的掩码排除** | F-15；PixPin 正常路径两者都调 |
 | `IGraphicsCaptureSession::IsSupported()` | 已有（`wgc.rs:41-43`） | 保留 | — |
+
+**一处必须分开看的事实（DEV-3）**：上表前两行的失败方向**相反**。`wgc.rs:110-112` 的 `IsBorderRequired` 失败被 `eprintln!` 吞掉 → **静默降级**；`wgc.rs:106-108` 的 `IsCursorCaptureEnabled` 用 `.map_err(...)?` 传播 → **硬失败**（Win10 1903–1904 上 `IGraphicsCaptureSession2` 不存在，今天会让**普通截图**直接失败）。这不是"程度不同"，而是需要**相反**的修法：前者"从静默改为可见"，后者"从失败改为可降级"。运行期探测（`Option<bool>` 的 `None`）一次覆盖两种，所以 `CaptureCapabilities` 是这两条修正的**共同落点**，而 `P2.04` 是它们的共同任务。
 
 **"失败可见"的具体形式**（G12）：探测结果进入**能力表**，在会话开始时打印一次，并在 `Diagnostics` 上发布：
 
@@ -2894,7 +2896,7 @@ fn choose(target: &ScrollTarget, probe: &ProbeResult) -> InjectPath {
 |---|---|---|
 | 窗口级捕获可用 | `E-CAP-1`：对 Chrome / Edge / Electron / WinUI3 / 记事本 各创建一次窗口级捕获项 | 每目标都能拿到非黑帧，且**覆盖层不在帧里** |
 | 跨帧复用正确 | 在 100 步会话中统计 pool 重建次数 | 0 次（除尺寸变化） |
-| 断选项探测 | 在 `IsBorderRequired` 不可用的系统上跑（或注入 mock） | 记 `CaptureOptionUnavailable`，**不 panic、不静默** |
+| 捕获选项探测（**两种相反的失败模式各一条**） | 在 `IsBorderRequired` 不可用的系统上跑（或注入 mock）；在 `IsCursorCaptureEnabled` 不可用的系统上跑 | 前者记 `CaptureOptionUnavailable`**且不静默**；后者**捕获照常成功**并退回掩码排除（`wgc.rs:106-108` 的 `?` 必须去掉） |
 | 遮挡 | 目标窗口被完全遮挡时继续跑 10 步 | 每步仍能 `Confirmed` |
 | 拓扑变化三档 | 用 `ChangeDisplaySettingsEx` 或 mock 触发 | 三档行为与 §24.4 表一致；`Partial` 可用 |
 | 注入条件选择 | 目标前台/非前台 × 提权/非提权 4 组 | 选择结果与 §24.6 一致 |
@@ -3155,7 +3157,15 @@ crates/snapclip-capture/src/scroll/
 └── preview.rs          # PreviewStream + PreviewUpdate + 缩略派生（§19.3）
 ```
 
-**全部 10 个文件都是"新增"**，因为今天滚动截图是 **0 行**（§5 已确证：全仓无 `Scroll`/`ScrollAxis`/`ScrollTarget`/`TileStore`/`ScrollSink` 类型）。`orb.rs` 之所以独立成文件而非并入 `displacement.rs`：它是**唯一的第二意见路径**，调用频率低（平均每步 < 0.2 次）但代码量最大（约 300–400 行），且它**可以被单文件删除**——若 `E-ACC-1` 显示第二意见从不改变结论，删掉 `orb.rs` 与其调用点即可，不必动 `displacement.rs`。
+**新增（test-only，不进生产二进制）**：
+
+```
+crates/snapclip-capture/src/scroll/testkit.rs   # 合成夹具生成器 + 夹具自证（§29.3）；`#[cfg(test)]`，只在本 crate 的测试里编译
+```
+
+§29.3 要求"**夹具必须自证**"：先用最简单的行指纹直通估计器、断言每步 `d` 与脚本给定的一致，再让真实漏斗跑同一批帧。这个自证必须构造 `Observation` 并读取 `pub(crate)` 的 `Displacement`，所以它与 `estimate`（§16）必须同 crate；放在 `scroll/` 下还使 §28.4 的门禁对它同样生效——**`testkit.rs` 也不得引用 `crate::windows`**。它不是生产代码：`#[cfg(test)]` 保证不进二进制，`cargo tree` 与依赖门禁不受影响。
+
+**上述 10 个生产文件与 1 个 test-only 文件（共 11 个）全部是"新增"**，因为今天滚动截图是 **0 行**（§5 已确证：全仓无 `Scroll`/`ScrollAxis`/`ScrollTarget`/`TileStore`/`ScrollSink` 类型）。`orb.rs` 之所以独立成文件而非并入 `displacement.rs`：它是**唯一的第二意见路径**，调用频率低（平均每步 < 0.2 次）但代码量最大（约 300–400 行），且它**可以被单文件删除**——若 `E-ACC-1` 显示第二意见从不改变结论，删掉 `orb.rs` 与其调用点即可，不必动 `displacement.rs`。
 
 **平台侧新增（必须放在 `windows/` 下）**：
 
@@ -3164,7 +3174,7 @@ crates/snapclip-capture/src/windows/scroll_source.rs     # FrameSource 的 Windo
 crates/snapclip-capture/src/windows/scroll_actuator.rs   # SendInput / PostMessageW / ChildWindowFromPointEx（§24.6）
 ```
 
-**为什么这两条平台实现与 `scroll/` 纯逻辑分开**：`scroll/` 的其他 9 个文件**不得引用 `crate::windows`**——这条约束使 §30 的绝大部分测试**不需要真实桌面**（G9）。它必须由门禁保证（§28.4）。
+**为什么这两条平台实现与 `scroll/` 纯逻辑分开**：`scroll/` 的**全部 10 个生产文件与 test-only 的 `testkit.rs`** 都**不得引用 `crate::windows`**——这条约束使 §30 的绝大部分测试**不需要真实桌面**（G9）。它必须由门禁保证（§28.4）。
 
 **改动（不新增文件）**：
 
@@ -3697,12 +3707,15 @@ if ($hits) { Write-Error "scroll/ must stay platform-free: $($hits -join '; ')";
 | D-7 | `Synthetic` 参照系 | 设计（V1 隐含）+ 参考实现 `stitcher.rs` | 用**自己上一步的结论**当作下一步的前提 → 累计漂移无界（参考实现 S2） | "参照系"被当成性能优化而非一致性来源 | 删除；参照系**永远是已确认的画布内容**（§17.4，ADR-4） |
 | D-8 | `ScrollStopReason` 的 16 个变体 | `docs/24` §S0.2（设计） | 词表冻结得比实现更早，`MatchFailed` 这类**不是停止原因**的东西混进来 | 词表被当成"要在实现前冻结的清单"而不是"实现暴露出来的事实" | 收敛为 **11** 个（§20.4）；**`MatchFailed` 明确不是 `StopReason`** |
 | D-9 | 每帧重建 WGC item/pool/session | `crates/snapclip-capture/src/windows/win/wgc.rs:104,142-146` | 每帧约 1.5 s 的首帧超时窗口；无法支撑连续多帧 | 捕获被建模为"**一次取一张图**"（`FrozenFrame`）而不是"**一条流**" | 删除；会话内复用同一 pool+session，尺寸变化只 `Recreate`（§24.2） |
-| D-10 | `let _ = session.SetIsBorderRequired(false)` 式吞错误 | `crates/snapclip-capture/src/windows/win/wgc.rs:107,110` | 降级不可见；"长图里有没有黄框"变成运气 | 错误处理被当成"**恢复流程**"而能力缺失是"**降级事实**" | 删除；改为探测 + `CaptureOptionUnavailable` 诊断（§24.3、ADR-16） |
+| D-10a | `SetIsCursorCaptureEnabled(false)` **用 `?` 传播**——能力缺失 = **整个捕获失败** | `crates/snapclip-capture/src/windows/win/wgc.rs:106-108` | Win10 1903–1904 上 `IGraphicsCaptureSession2` 不存在 → 普通截图**整体失败**，而不是降级 | "会话选项一定可用"被当成事实；能力缺失被当成异常而不是这台机器的固有属性 | 改为**先探测** `IGraphicsCaptureSession2`，不可用则跳过该项并记 `CaptureOptionUnavailable`，捕获照常（§24.3） |
+| D-10b | `let _ = session.SetIsBorderRequired(false)` 式吞错误 | `crates/snapclip-capture/src/windows/win/wgc.rs:110-112` | 降级不可见；"长图里有没有黄框"变成运气 | 错误处理被当成"**恢复流程**"而能力缺失是"**降级事实**" | 删除；改为探测 + `CaptureOptionUnavailable` 诊断（§24.3、ADR-16） |
 | D-11 | 导出路径的 4 份完整像素拷贝 | `artifact_writer.rs:44` → `image.rs:153` → `image.rs:66` → 编码器内部 | 1920×300000 需 ≈ 8.6 GiB，**必然失败** | 导出被建模为"**把一张完整图像交给编码器**"而不是"**把行交给编码器**" | 删除；改为流式行带（§17.7、§22.4）——峰值降到 ≤2 份 |
 | D-12 | `as u32` 无检查截断 | `apps/snapclip/src/capture/artifact_writer.rs:42-43` | 超限尺寸静默截断 → 产出**尺寸错误的图**而不是报错 | 尺寸域假设"不会超"；`image.rs:26-35` 已经用 `u64` 做对了，**这里没有对齐** | 删除；超限在 `begin` **之前**拒绝（§26.1） |
 | D-13 | 缩略图死分支与"读全量原图当缩略图" | `store.rs:434-437`（`role == "thumbnail"` 无人写入）+ `history/model.rs:178-187` | 一条 30 万像素高的截图让历史列表**单行加载约 2 GiB** | 存储层预留了缩略图角色但**没有任何生产者**，而消费者假设它存在 | 删除该分支；长图缩略必须走**窗口化**路径（§19.2、ADR-5） |
 | D-14 | 3 处静默跳过的真实桌面测试 | `bitblt.rs:128-145`、`providers.rs:684-747`、`window_detection.rs:121-325` | 无桌面 session 上 `cargo test` **静默通过**，门禁是假的 | 把"环境不具备"与"用例通过"混为一谈 | 删除静默 `return`；只允许 `#[ignore]` 或显式环境断言（§29.2、ADR-16） |
 | D-15 | 6 处失效架构注释 | `windows/mod.rs:13`、`window_detection/mod.rs:5,33`、`win/d3d11.rs:250-253`、`apps/snapclip/Cargo.toml:9-11`、`windows/mod.rs:7`、`ports.rs:19,41,55` | 新读者按注释找到**不存在的模块**或**错误的职责** | 重构时只改代码不改注释 → 注释变成**负资产** | 删除/改写（§28.2） |
+
+**D-10 为什么必须拆成两条**：`crates/snapclip-capture/src/windows/win/wgc.rs:106-108` 与 `:110-112` 的失败模式**方向相反**。前者 `.map_err(...)?` 传播 → 接口不可用时**整个捕获失败**（Win10 1903–1904 上 `IGraphicsCaptureSession2` 确实不存在）；后者只 `eprintln!` → **静默降级**。把两者写成同一条"吞错误"，会同时掩盖"该降级的地方在硬失败"与"该报出来的地方在静默"，而这两者需要**相反**的修法。
 
 ### 33.2 重构清单
 
@@ -3720,7 +3733,7 @@ if ($hits) { Write-Error "scroll/ must stay platform-free: $($hits -join '; ')";
 
 | 类别 | 内容 |
 |---|---|
-| 纯逻辑模块（9 文件） | `crates/snapclip-capture/src/scroll/{mod,session,target,observation,displacement,canvas,bands,loop_control,preview}.rs`（§28.2） |
+| 纯逻辑模块（**11 文件 = 10 生产 + 1 test-only**） | `crates/snapclip-capture/src/scroll/{mod,session,target,observation,displacement,orb,canvas,bands,loop_control,preview}.rs` + `testkit.rs`（`#[cfg(test)]`，只进测试；§28.2） |
 | 平台实现（2 文件） | `windows/scroll_source.rs`（窗口级 WGC 多帧帧源）、`windows/scroll_actuator.rs`（两条注入路径 + 探测） |
 | trait（5 个，改 0 个既有） | `FrameSource`、`ScrollActuator`、`RowBandSink`、`RowBandWriter`、`PreviewSink`（§27.5，ADR-11） |
 | 诊断 | `ScrollDiagnostic` + **13 个** `ScrollDiagnosticCode`（§26.3） |
@@ -3879,9 +3892,12 @@ if ($hits) { Write-Error "scroll/ must stay platform-free: $($hits -join '; ')";
 
 | # | 任务 | 交付物 | 退出条件 |
 |---|---|---|---|
-| P4.1 | `RowBandSink`/`RowBandWriter` + `PngRowBandSink` 落在 **shell 组合根** | shell 侧 | 依赖门禁干净（`png` 不在 capture 的 `cargo tree`） |
+| P4.1a | `RowBandSink`/`RowBandWriter` **trait 定义**（含 `ImageMeta`/`Artifact`/`AbortReason`） | capture 侧 `scroll/`（§27.3、§17.7） | trait 无实现、无 `png` 依赖；`begin(meta)` 的签名让"height 未定就写"**不可编译** |
+| P4.1b | `PngRowBandSink`/`PngRowBandWriter` **实现** | **shell 组合根**（`apps/snapclip/`） | 依赖门禁干净（`png` 不在 capture 的 `cargo tree`）；30,000 px 产物能被解码回读 |
 | P4.2 | 消除 4 份拷贝（D-11）+ 拒绝 `u32` 越界（D-12） | 导出路径 | `E-MEM-1` 三档 peak 差异 ≤10%；`E-PERF-2` 参数就位 |
 | P4.3 | `BandStore` 换出文件 `Drop` 清理 | `bands.rs` | 会话结束无残留文件 |
+
+**P4.1 为什么必须拆成两条**：端口与实现落在**不同的 crate**，而它们各自的退出条件是**互相排斥的两件事**——"capture 里可以定义这个 trait"与"`png` 不许进 capture 的依赖图"。写进一行时，后一个退出条件在任务表里**没有对应的可执行任务**；拆开后 `P4.1a` 交给 `scroll/`（可用假实现做 L1 测试），`P4.1b` 交给 shell（`png` 只在这里出现，见 §28.4 的门禁）。
 
 ### P5 预览 UI
 
@@ -3896,7 +3912,7 @@ if ($hits) { Write-Error "scroll/ must stay platform-free: $($hits -join '; ')";
 
 | # | 任务 | 退出条件 |
 |---|---|---|
-| P6.1 | 执行 §33.1 的 D-1…D-15、§33.2 的 R-1…R-7、§33.4 的改名 | 全部完成且 §30 的 A 类回归全过 |
+| P6.1 | 执行 §33.1 的 D-1…D-15（其中 **D-10 已拆为 D-10a/D-10b**，共 16 项）、§33.2 的 R-1…R-7、§33.4 的改名 | 全部完成且 §30 的 A 类回归全过 |
 | P6.2 | 修复 3 处静默跳过（D-14） | 写一个统计脚本：非 `#[ignore]` 的真实桌面用例数 == 0 |
 | P6.3 | 6 处失效注释（D-15） | 逐个 `grep` 验证被引用的模块确实存在 |
 | P6.4 | 门禁加第二遍扫描（§28.4） | `tools/check-dependency-direction.ps1` 通过 |

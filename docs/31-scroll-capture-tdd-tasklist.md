@@ -94,7 +94,13 @@
 | 新增文件 | 一律先建 `#[cfg(test)]` 测试骨架再建实现（§2.1） |
 | 文档引用 | 一律写 `docs/30 §x.y` 或 `docs/30:<行号>`，**不允许只写"见设计文档"** |
 
-### 0.6 本文对 V2 的补充（**三处 deviation，需回填 `docs/30`**）
+### 0.6 本文对 V2 的补充（**三处 deviation，已按用户授权回填 `docs/30`**）
+
+> **回填状态**：三处均已写入 `docs/30-scroll-capture-design-v2.md`（**未覆盖原文，只做定点增补**）——
+> DEV-1 → `§28.2` 新增 test-only 文件块（`scroll/testkit.rs`）与"10 生产 + 1 test-only"口径、`§33.3` 文件清单由 9 补为 11（**顺带修正了原文漏列 `orb.rs` 的内部矛盾**）；
+> DEV-2 → `§35 P4` 的 `P4.1` 拆为 `P4.1a`（trait，capture）/ `P4.1b`（实现，shell）并附理由；
+> DEV-3 → `§33.1` 的 `D-10` 拆为 `D-10a`（硬失败）/ `D-10b`（静默降级）、`§24.3` 修正 `wgc.rs:107` 的表述并说明"两种相反失败模式的共同落点"、`§24.8` 的探测用例扩为两条。
+> 下表保留**原始登记内容**（作为"当时看到了什么"的记录）。
 
 | # | 补充 | 为什么必须补 | 回填位置 |
 |---|---|---|---|
@@ -1681,7 +1687,7 @@ git config core.hooksPath .githooks
 | `crates/snapclip-capture/src/windows/scroll_source.rs` | `P2.03` | 窗口级 WGC 多帧 + 初始几何/分辨率/monitor rect |
 | `crates/snapclip-capture/src/windows/scroll_actuator.rs` | `P3.01` | 两条注入路径 + 子窗口下沉 |
 
-> **注**：上表 13 行中 `scroll/` 占 11 个文件。**V2 §28.2 只列了 10 个 `scroll/*.rs`**（`testkit.rs` 是 DEV-1 的追加）。`P6.08` 的文档回填会把这一处补齐。
+> **注**：上表 13 行中 `scroll/` 占 11 个文件。**V2 §28.2 已按 DEV-1 回填为"10 个生产文件 + 1 个 test-only 文件（`testkit.rs`）"**，`§33.3` 的文件清单同步由 9 补为 11（原清单漏列了 `orb.rs`）。`P6.08` 只做**校验**，不再需要新增内容。
 
 **修改（不新增文件，全部在既有文件内）**
 
@@ -1786,7 +1792,7 @@ git config core.hooksPath .githooks
 | `P2.3` | 能力探测 + 选项失败可见 | `P2.04` |
 | `P2.4` | 显示拓扑三档 | `P2.05` |
 | `P3.1`–`P3.5` | 注入两路径 / `choose()` / 闭环 / 手动 / 停取消 | `P3.01`–`P3.07` |
-| `P4.1` | `RowBandSink` + `PngRowBandSink` | `P4.01` + `P4.02`（**DEV-2 拆分**） |
+| `P4.1a` + `P4.1b` | `RowBandSink`（端口）/ `PngRowBandSink`（实现） | `P4.01` + `P4.02`（**DEV-2 拆分，已回填 V2 `§35 P4`**） |
 | `P4.2` | 消除 4 拷贝 + 拒绝越界 | `P4.03`/`P4.04` |
 | `P4.3` | 换出文件 `Drop` 清理 | `P4.06` |
 | `P5.1` | `PreviewStream` + 窗口化缩略 | `P5.01`/`P5.02` |
