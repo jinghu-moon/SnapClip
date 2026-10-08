@@ -92,8 +92,9 @@ pub(crate) struct Evidence {
     pub(crate) gain: f32,
     /// `(score(best) − score(second)) / score(best)` (`docs/30` §16.5, gate four; `P1.11`).
     pub(crate) margin: f32,
-    /// How many bands support the winner (`docs/30` §16.4, gate three; `P1.10` adds §16.4's
-    /// independence rule, which is why the second layer counts adjacent tiles separately).
+    /// How many **independent** bands support the winner (`docs/30` §16.4, gate three; the
+    /// `|i − j| ≥ 2` rule landed in `P1.10`, so this is the count gate three compares against
+    /// [`MIN_TILES`] and the one §16.7's `coverage` is defined on).
     pub(crate) tiles: u32,
 }
 
@@ -416,6 +417,11 @@ pub(crate) fn candidates_1d(
 pub(crate) const DOWNSAMPLE: u32 = 4;
 
 /// §16.4's band width along the primary axis: 32 px. Layer 2 counts how many of these agree.
+///
+/// This is the **matching evidence** tile, i.e. the unit §16.4 counts supporters in. It is not the
+/// temporal model's tile (§18.2's texture/update unit, which decides what to rewrite). Both are
+/// 32 px because both came from the same reference estimator; they are separate identifiers so that
+/// moving one does not silently move the other, and [`TILE_INDEPENDENCE_GAP`] carries the same note.
 pub(crate) const TILE_ROWS: u32 = 32;
 
 /// §15.6's `H_match` floor in **full-resolution** primary rows: 16, because a one-dimensional
@@ -443,6 +449,20 @@ fn match_rows(previous_height: u32, current_height: u32, scale: u32) -> u32 {
 /// residuals, not correlations), so the half is kept on the layer's own measure. `E-ACC-1` owns the
 /// value — §16.11 lists every number in this family as a startup value.
 const TILE_SUPPORT_ZNCC: f32 = 0.5;
+
+/// §16.4's independence distance, in tiles: two supporters are independent evidence of the same shift
+/// only when their indices differ by at least this much (`|i − j| ≥ 2`).
+///
+/// Adjacent tiles share a border of pixels and, more importantly, share the *content* that produced
+/// the correlation — a run of `m` agreeing tiles is `ceil(m/2)` pieces of evidence, not `m`. The gap
+/// is a property of the rule, not a tunable, so it is a constant and not a parameter: a caller that
+/// could set it to `1` could make gate three accept a single wide patch.
+///
+/// This grid is the **matching evidence** grid, and it is deliberately a different name from the
+/// temporal model's tile grid (§18.2's `region.rs`-style texture/update tiles). Both are `32` px
+/// today because both were taken from the same reference estimator, and that coincidence is exactly
+/// why they must not share an identifier: changing one must not silently change the other.
+const TILE_INDEPENDENCE_GAP: u32 = 2;
 
 /// Below this residual at zero shift there is nothing for `gain` to divide by.
 const GAIN_RMSE_FLOOR: f32 = 1e-3;
@@ -679,24 +699,42 @@ fn residual_gain(rmse_at_shift: f32, rmse_at_zero: f32) -> Option<f32> {
 /// definition above stays `Option` and gate two never sees the substitution.
 const GAIN_UNDEFINED_FOR_RANKING: f32 = 0.0;
 
-/// How many 32 px tiles of the band agree with the shift (§16.4's band count, which replaces "at
-/// least 8 inlier matches"; §16.7's `coverage` saturates the number at 12).
+/// How many of the band's 32 px tiles are **independent** evidence for the shift (§16.4's band count,
+/// which replaces "at least 8 inlier matches"; §16.7's `coverage` saturates the number at 12).
 ///
-/// Only whole tiles count: a partially filled tile correlates over fewer cells, and comparing it to
-/// the same threshold would make the tail of every band systematically weaker evidence. Adjacent
-/// tiles count separately here — §16.4's independence rule (`|i − j| ≥ 2`) is gate three's, and
-/// `P1.10` is where it lands.
-fn supporting_tiles(previous: &Gray, current: &Gray, band: MatchBand) -> u32 {
-    let tile = TILE_ROWS / DOWNSAMPLE;
+/// Takes the indices of the tiles that cleared [`TILE_SUPPORT_ZNCC`], in increasing order, and returns
+/// the size of the largest subset whose members are pairwise at least [`TILE_INDEPENDENCE_GAP`] apart.
+///
+/// Greedy from the first supporter is exact for pairwise- separated points on a line: taking the
+/// earliest tile that is still allowed never costs a later one — any solution that skips an available
+/// tile can be rewritten to start at it without moving the rest closer together. Hence no
+/// combinatorics, no allocation, one pass.
+fn independent_support(tiles: impl Iterator<Item = u32>) -> u32 {
     let mut count = 0;
-    let mut first = 0;
-    while first + tile <= band.rows {
-        if band_zncc(previous, current, band, first, tile) >= TILE_SUPPORT_ZNCC {
+    let mut next_allowed = 0;
+    for index in tiles {
+        if index >= next_allowed {
             count += 1;
+            next_allowed = index + TILE_INDEPENDENCE_GAP;
         }
-        first += tile;
     }
     count
+}
+
+/// How many independent 32 px tiles of the band agree with the shift.
+///
+/// Only whole tiles count: a partially filled tile correlates over fewer cells, and comparing it to
+/// the same threshold would make the tail of every band systematically weaker evidence. The
+/// independence rule (§16.4's `|i − j| ≥ 2`) is applied here rather than reported separately, because
+/// every consumer — the ranking's `tiles`, `Evidence`'s `coverage`, gate three — needs the same
+/// number, and §16.7 defines `coverage` on independent supporters.
+fn supporting_tiles(previous: &Gray, current: &Gray, band: MatchBand) -> u32 {
+    let tile = TILE_ROWS / DOWNSAMPLE;
+    let tile_count = band.rows / tile;
+    independent_support((0..tile_count).filter(|start| {
+        let first = start * tile;
+        band_zncc(previous, current, band, first, tile) >= TILE_SUPPORT_ZNCC
+    }))
 }
 
 /// §15.4 ②'s three-point difference: `ZNCC(d−1) + ZNCC(d+1) − 2·ZNCC(d)`, sampled by moving the
@@ -748,7 +786,9 @@ pub(crate) struct ScoredCandidate {
     pub(crate) zncc2d: f32,
     /// §16.3's residual gain over the zero shift.
     pub(crate) gain: f32,
-    /// How many whole 32 px tiles agree (§16.4's band count; independence is `P1.10`'s).
+    /// How many **independent** 32 px tiles agree (§16.4's band count, after that section's
+    /// `|i − j| ≥ 2` rule). §16.7's `coverage` is defined on this number, so it is the independent
+    /// count here and not the raw tile count.
     pub(crate) tiles: u32,
     /// The three-point difference of `zncc2d` around the candidate (§15.4 ②).
     pub(crate) curvature: f32,
@@ -1009,6 +1049,10 @@ pub(crate) enum GateRejection {
     /// §16.3: `gain < MIN_RESIDUAL_GAIN`. The shift explains no more of the residual than standing
     /// still did, so the peak is a coincidence of the content rather than a movement.
     ResidualGainTooSmall,
+    /// §16.4: fewer than [`MIN_TILES`] independent tiles support the shift. It may still be the true
+    /// shift — but it is corroborated in one place only, and one place is what a periodic page also
+    /// produces.
+    TooFewSupporters,
 }
 
 impl GateRejection {
@@ -1016,12 +1060,20 @@ impl GateRejection {
     ///
     /// All of them are `None` rather than `Uncertain`. `Uncertain` means "a shift was measured and
     /// the evidence does not carry a decision"; these mean the measurement is not a measurement —
-    /// there was nothing to compare, the estimator left its defined domain, or the best candidate
-    /// gained nothing over not moving. §16.9 wants that distinction visible, so it is a method
-    /// instead of a sentence each call site would spell differently.
+    /// there was nothing to compare, the estimator left its defined domain, the best candidate gained
+    /// nothing over not moving, or nothing independent corroborates it. §16.9 wants that distinction
+    /// visible, so it is a method instead of a sentence each call site would spell differently.
+    ///
+    /// Each rejection carries its own status rather than sharing one: gate four's ambiguity
+    /// (`P1.11`) is a measured shift whose evidence does not pick *which* shift, and that is the
+    /// `Uncertain` §16.10 describes. Adding that variant means adding an arm here, not rewriting a
+    /// call site.
     pub(crate) const fn status(self) -> Status {
         match self {
-            Self::OutsideViewport | Self::BannedHalf | Self::ResidualGainTooSmall => Status::None,
+            Self::OutsideViewport
+            | Self::BannedHalf
+            | Self::ResidualGainTooSmall
+            | Self::TooFewSupporters => Status::None,
         }
     }
 }
@@ -1106,6 +1158,31 @@ pub(crate) fn gate_residual_gain(gain: f32) -> GateOutcome {
     }
 }
 
+/// How many **independent** tiles must support a shift before it counts as spatially corroborated
+/// (`docs/30` §16.4).
+///
+/// F-02 is the reason the number is not `1`: a single patch agreeing is what a periodic page, a
+/// repeated row, or one high-contrast widget produces — the shift is right there and wrong
+/// everywhere else. Four is a startup value from the reference implementation (§6 N5) and §16.11
+/// marks it calibratable; `E-ACC-1` owns the number, and the ablation matrix (`P1.13`) is what
+/// decides whether the gate earns its place at all.
+pub(crate) const MIN_TILES: u32 = 4;
+
+/// §16.4's gate three: `supporters >= MIN_TILES`, closed at the floor.
+///
+/// It takes the count that [`supporting_tiles`] produced, so "how many tiles agree" and "how much
+/// spatial corroboration is enough" are separable. A page with no structure yields `0` for every
+/// candidate, which is §30.3's 低纹理 row in its estimator half: the shift is not corroborated
+/// anywhere, so the candidate is dropped (§16.1) and a session that drops all of them reports `None`
+/// rather than a confident zero.
+pub(crate) fn gate_support(supporters: u32) -> GateOutcome {
+    if supporters >= MIN_TILES {
+        GateOutcome::Pass
+    } else {
+        GateOutcome::Reject(GateRejection::TooFewSupporters)
+    }
+}
+
 /// §16.3's ratio measured on two frames at a given shift, in one place.
 ///
 /// `shift` arrives in full-resolution primary-axis pixels and the measurement is taken on layer 2's
@@ -1163,14 +1240,16 @@ pub(crate) fn zero_shift_status(
 mod tests {
     use super::{
         CANDIDATE_LIMIT, Candidate, Displacement, Evidence, GateOutcome, GateRejection, Gray,
-        MIN_RESIDUAL_GAIN, RHO_MIN, RHO_MIN_PERMILLE, ScoredCandidate, ScoredSet, Status,
-        StepEffect, band_zncc, candidates_1d, gate_geometry, gate_residual_gain, is_verifiable,
-        match_band, match_rows, primary_digests, residual_gain, residual_gain_at,
-        score_candidates_2d, support_at, zero_shift_status,
+        MIN_RESIDUAL_GAIN, MIN_TILES, RHO_MIN, RHO_MIN_PERMILLE, ScoredCandidate, ScoredSet, Status,
+        StepEffect, TILE_INDEPENDENCE_GAP, band_zncc, candidates_1d, gate_geometry,
+        gate_residual_gain, gate_support, independent_support, is_verifiable, match_band, match_rows,
+        primary_digests, residual_gain, residual_gain_at, score_candidates_2d, support_at,
+        zero_shift_status,
     };
     use crate::scroll::observation::{Axis, Observation, ObservationView};
     use crate::scroll::displacement::{
-        DOWNSAMPLE, REFINE_NEIGHBOURHOOD, Refined, grid_distance, refine_winner, round_to_grid,
+        DOWNSAMPLE, REFINE_NEIGHBOURHOOD, Refined, TILE_ROWS, TILE_SUPPORT_ZNCC, coverage_of,
+        grid_distance, refine_winner, round_to_grid,
     };
     use crate::scroll::testkit::{ScrollScript, StepSpec, Structure, TestImage};
 
@@ -2227,6 +2306,212 @@ mod tests {
                 Some(candidate.gain),
                 "gate two and the ranking disagree about shift {}",
                 candidate.d
+            );
+        }
+    }
+
+    #[test]
+    fn four_tiles_that_touch_each_other_count_as_two() {
+        // `docs/31` §6 `P1.10`; `docs/30` §16.4. The task book's name says "count as one"; the rule
+        // the same section writes is pairwise — two tiles are independent only if `|i − j| ≥ 2` —
+        // and for four consecutive tiles the largest pairwise-separated subset is `{0, 2}`, i.e.
+        // **two**. The cluster reading ("a run is one supporter") would make the gate unreachable:
+        // a single contiguous matching region of twenty tiles would count 1 < 4 and every correct
+        // match on a real page would be rejected. The name's claim survives in the part that
+        // matters: four touching tiles must not carry four supports, and four is the gate.
+        assert_eq!(independent_support([0, 1, 2, 3].into_iter()), 2);
+        // Spaced two apart, the same four tiles *are* four pieces of evidence.
+        assert_eq!(independent_support([0, 2, 4, 6].into_iter()), 4);
+        assert_eq!(independent_support([1, 3, 5, 7].into_iter()), 4);
+        // Six touching tiles are three: the greedy count is the size of the largest independent set,
+        // not the number of runs and not the number of tiles.
+        assert_eq!(independent_support([0, 1, 2, 3, 4, 5].into_iter()), 3);
+        // A non-supporting tile does not break the spacing: what is excluded is *adjacency to an
+        // accepted supporter*, not proximity to a gap.
+        assert_eq!(independent_support([0, 3, 4, 5, 6].into_iter()), 3);
+        assert_eq!(independent_support([0, 1].into_iter()), 1);
+        assert_eq!(independent_support([7].into_iter()), 1);
+        assert_eq!(independent_support([].into_iter()), 0);
+        // The floor and the gap together imply a minimum band: `MIN_TILES` pairwise-separated tiles
+        // need `2·MIN_TILES − 1 = 7` whole tiles, i.e. 224 full-resolution band rows, i.e. a viewport
+        // of about 448 primary rows (`H_match = H/2`, §15.6). Below that no page can satisfy gate
+        // three — a design consequence for `E-ACC-1` to weigh, not an accident to discover later.
+        assert_eq!(independent_support(0..7), MIN_TILES);
+        assert_eq!(independent_support(0..6), MIN_TILES - 1);
+    }
+
+    #[test]
+    fn a_single_patch_supporter_is_rejected() {
+        // `docs/31` §6 `P1.10`; `docs/30` §16.4 (F-02). One patch agreeing is what a periodic or a
+        // single-feature page produces: the shift is right there and wrong everywhere else, so the
+        // count of *independent* supporters is the difference between "measured" and "measured in
+        // one place". The floor is `MIN_TILES = 4`, closed: exactly four independent supporters pass.
+        assert_eq!(MIN_TILES, 4);
+        assert_eq!(gate_support(0), GateOutcome::Reject(GateRejection::TooFewSupporters));
+        assert_eq!(gate_support(1), GateOutcome::Reject(GateRejection::TooFewSupporters));
+        assert_eq!(
+            gate_support(MIN_TILES - 1),
+            GateOutcome::Reject(GateRejection::TooFewSupporters)
+        );
+        assert_eq!(gate_support(MIN_TILES), GateOutcome::Pass);
+        assert_eq!(gate_support(MIN_TILES + 1), GateOutcome::Pass);
+        assert_eq!(GateRejection::TooFewSupporters.status(), Status::None);
+        // §16.4's gap is part of the rule, not a tunable: one tile apart is adjacency, and the
+        // reference implementation's tile size is 32 px in both places only because the same
+        // estimator carries it (`P1.10` REFACTOR: this grid is the *matching evidence* grid).
+        assert_eq!(TILE_INDEPENDENCE_GAP, 2);
+    }
+
+    #[test]
+    fn a_low_texture_page_has_no_independent_supporters() {
+        // `docs/31` §6 `P1.10` exit condition ②; `docs/30` §30.3's "低纹理" row (L1 part: the
+        // estimator's answer). A page with no structure has no tile that clears §16.4's threshold,
+        // so the count is zero for every candidate and gate three rejects all of them — the session
+        // ends up with `None` (§16.1: every candidate dropped), not with a confident zero.
+        let image = TestImage::from_structures(320, 80 * 19, 3, 80 * 19, &[Structure::Flat]);
+        let mut script = ScrollScript::new(&image, 300, vec![StepSpec::move_by(10)]);
+        let previous = script.take(0);
+        let current = script.take(1);
+        let candidates = candidates_1d(&previous.view(), &current.view(), 10, 8);
+        let scored = score_candidates_2d(&previous.view(), &current.view(), &candidates);
+        assert!(!scored.is_empty(), "the second layer scored nothing");
+        for candidate in scored.iter() {
+            assert_eq!(
+                candidate.tiles, 0,
+                "a flat band supported shift {} with {} tiles",
+                candidate.d, candidate.tiles
+            );
+            assert_eq!(
+                gate_support(candidate.tiles),
+                GateOutcome::Reject(GateRejection::TooFewSupporters),
+                "shift {} passed gate three on a page with no structure",
+                candidate.d
+            );
+        }
+    }
+
+    /// How many whole tiles agree with a shift, **without** §16.4's independence rule.
+    ///
+    /// The rule's whole point is that this number is not the evidence count, so the tests that make
+    /// the claim have to be able to see both. Deliberately a local copy of the old loop: if
+    /// [`supporting_tiles`] ever stops applying [`independent_support`], the tests below keep
+    /// comparing 14 against 7 instead of comparing a number against itself.
+    fn raw_supporting_tiles(previous: &Gray, current: &Gray, shift: i32) -> u32 {
+        let wanted = match_rows(previous.height, current.height, DOWNSAMPLE);
+        let band = match_band(previous.height, current.height, shift, wanted).expect("overlaps");
+        let tile = TILE_ROWS / DOWNSAMPLE;
+        let mut count = 0;
+        let mut first = 0;
+        while first + tile <= band.rows {
+            if band_zncc(previous, current, band, first, tile) >= TILE_SUPPORT_ZNCC {
+                count += 1;
+            }
+            first += tile;
+        }
+        count
+    }
+
+    #[test]
+    fn a_fully_supporting_band_keeps_only_its_independent_tiles() {
+        // `docs/31` §6 `P1.10`; the measurement the design section quotes. On the mixed document at
+        // the true shift every whole tile of the band agrees — the raw count is the whole band (14
+        // tiles of 8 cells for a 900 px viewport) — and the independent count is exactly half of it:
+        // `ceil(14/2) = 7`. A run of agreeing tiles is `ceil(m/2)` pieces of evidence, so the gate
+        // at `MIN_TILES = 4` is met only because the band is 14 tiles wide and not 6.
+        let image = mixed_document();
+        let mut script = ScrollScript::new(&image, 900, vec![StepSpec::move_by(120)]);
+        let previous = script.take(0);
+        let current = script.take(1);
+
+        let previous_gray = Gray::pooled(&previous.view());
+        let current_gray = Gray::pooled(&current.view());
+        assert_eq!(
+            raw_supporting_tiles(&previous_gray, &current_gray, round_to_grid(120)),
+            14,
+            "the fixture no longer fills the whole band at the true shift"
+        );
+
+        let candidates = candidates_1d(&previous.view(), &current.view(), 120, 8);
+        let scored = score_candidates_2d(&previous.view(), &current.view(), &candidates);
+        let winner = scored.iter().next().expect("the true shift is a candidate");
+        assert_eq!(winner.d, 120);
+        assert_eq!(
+            winner.tiles, 7,
+            "the ranking is still counting adjacent tiles as separate evidence"
+        );
+        // §16.7's `coverage` is defined on the independent count, and it is *not* saturated here:
+        // `7/12`. A 900 px viewport cannot reach 12 independent supporters at all — that needs a
+        // band of 23 tiles, i.e. ~1400 px of viewport — so `coverage` stays partial on ordinary
+        // windows and the term is a soft weight rather than a switch.
+        assert!((coverage_of(winner.tiles) - 7.0 / 12.0).abs() < 1e-6);
+        assert!(coverage_of(winner.tiles) < 1.0);
+    }
+
+    #[test]
+    fn a_gradient_page_ties_on_correlation_and_leaves_ambiguity_to_gate_four() {
+        // `docs/31` §6 `P1.10`; `docs/30` §30.3's 低纹理 row. The row has two halves and they are
+        // different gates: a page with *no* structure is gate three's (the test above), while a
+        // smooth ramp correlates perfectly at **every** shift — zero-mean correlation is blind to the
+        // constant offset a ramp shift produces — so it passes gate two with a real gain and is
+        // ambiguous rather than unsupported. That ambiguity is §16.5's margin, i.e. `P1.11`.
+        //
+        // Gate three rejects it here for a *second* reason, and the test says so instead of leaving
+        // it implied: this fixture's viewport is 300 px, so its band is 4 whole tiles and even a
+        // perfectly supported shift yields `ceil(4/2) = 2` independent supporters.
+        let gradient = TestImage::from_structures(320, 80 * 19, 5, 80 * 19, &[Structure::Gradient]);
+        let mut script = ScrollScript::new(&gradient, 300, vec![StepSpec::move_by(10)]);
+        let previous = script.take(0);
+        let current = script.take(1);
+
+        let previous_gray = Gray::pooled(&previous.view());
+        let current_gray = Gray::pooled(&current.view());
+        assert_eq!(
+            raw_supporting_tiles(&previous_gray, &current_gray, round_to_grid(10)),
+            4,
+            "a ramp should fill every whole tile of this band"
+        );
+
+        let candidates = candidates_1d(&previous.view(), &current.view(), 10, 8);
+        let scored = score_candidates_2d(&previous.view(), &current.view(), &candidates);
+        assert!(!scored.is_empty());
+        // The measurement, as measured (2026-10-08): eight candidates in two families —
+        // `d = 6..9` at `zncc2d = 0.999986231` with `gain = 0.573598564`, and `d = 10..13` at
+        // `zncc2d = 0.999984145` with `gain = 0.539433837` (the true shift 10 is in the second one).
+        // The ramp is a *tie*, not a ranking: the residual-correlation difference between the
+        // families is 2.1e-6 and comes from integer rounding of the ramp rather than from
+        // displacement evidence. What separates them at all is the gain term — `0.25 · 0.0342`, i.e.
+        // ~8.7e-3 of score, or a `margin` of ~8.7e-3 against §16.5's `MIN_MARGIN = 0.15`.
+        // So this page is `Uncertain` through gate four (`P1.11`), and gate three cannot say so:
+        // it counts supporters, and every candidate has the same count.
+        assert_eq!(scored.len(), 8);
+        let best = *scored.iter().next().expect("eight candidates");
+        assert!((best.zncc2d - 0.999_986_231).abs() < 1e-6, "{}", best.zncc2d);
+        for candidate in scored.iter() {
+            assert!(
+                candidate.zncc2d > 0.9999,
+                "a ramp stopped correlating at shift {} ({})",
+                candidate.d,
+                candidate.zncc2d
+            );
+            assert_eq!(
+                gate_residual_gain(candidate.gain),
+                GateOutcome::Pass,
+                "the ramp shift {} should still gain over standing still",
+                candidate.d
+            );
+            assert_eq!(candidate.tiles, 2);
+            assert_eq!(
+                gate_support(candidate.tiles),
+                GateOutcome::Reject(GateRejection::TooFewSupporters)
+            );
+            // An order of magnitude inside `MIN_MARGIN = 0.15`: on this page no shift can clear
+            // gate four, which is the answer the design wants.
+            assert!(
+                (candidate.score - best.score).abs() / best.score < 0.02,
+                "shift {} is not inside the tie: {} against {}",
+                candidate.d,
+                candidate.score,
+                best.score
             );
         }
     }

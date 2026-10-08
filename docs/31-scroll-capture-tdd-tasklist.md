@@ -94,9 +94,9 @@
 | 新增文件 | 一律先建 `#[cfg(test)]` 测试骨架再建实现（§2.1） |
 | 文档引用 | 一律写 `docs/30 §x.y` 或 `docs/30:<行号>`，**不允许只写"见设计文档"** |
 
-### 0.6 本文对 V2 的补充（**十八处 deviation，全部已按用户授权回填 `docs/30`**）
+### 0.6 本文对 V2 的补充（**十九处 deviation，全部已按用户授权回填 `docs/30`**）
 
-> **回填状态**：十八处（DEV-1…DEV-18）已写入 `docs/30-scroll-capture-design-v2.md`（**未覆盖原文，只做定点增补**）——
+> **回填状态**：十九处（DEV-1…DEV-19）已写入 `docs/30-scroll-capture-design-v2.md`（**未覆盖原文，只做定点增补**）——
 > DEV-1 → `§28.2` 新增 test-only 文件块（`scroll/testkit.rs`）与"10 生产 + 1 test-only"口径、`§33.3` 文件清单由 9 补为 11（**顺带修正了原文漏列 `orb.rs` 的内部矛盾**）；
 > DEV-2 → `§35 P4` 的 `P4.1` 拆为 `P4.1a`（trait，capture）/ `P4.1b`（实现，shell）并附理由；
 > DEV-3 → `§33.1` 的 `D-10` 拆为 `D-10a`（硬失败）/ `D-10b`（静默降级）、`§24.3` 修正 `wgc.rs:107` 的表述并说明"两种相反失败模式的共同落点"、`§24.8` 的探测用例扩为两条；
@@ -115,6 +115,7 @@
 > **DEV-16** → `§21.4` 之后新增 `### 21.5 COM/WinRT 公寓：本 crate 不声明公寓，靠 combase 的隐式 MTA`（测量表 + 三句话设计规则 + 开放项）、`crates/snapclip-capture/src/windows/win/wgc.rs` 新增定点测试 `winrt_activation_keeps_the_implicit_apartment`（2026-10-08 定位 `R-21` 时新增，见下）。
 > **DEV-17** → `§16.2` 之后新增 `#### 16.2.1 落地的形状（P1.08）`（三处落地决定）、`§16.9` 补"落点"段（禁令是门一内部的第二条分支，不是第五道门）、`§16.11` 参数总表增补 `RHO_MIN` 行（2026-10-08 执行时新增，见下）。
 > **DEV-18** → `§16.3` 之后新增 `#### 16.3.1 落地的形状（P1.09）`（四处落地决定 + 尚未落地）、`§16.11` 参数总表补 `MIN_RESIDUAL_GAIN` 行的落地口径并增补 `GAIN_RMSE_FLOOR` 行（2026-10-08 执行时新增，见下）。
+> **DEV-19** → `§16.4` 之后新增 `#### 16.4.1 落地的形状（P1.10）`（四处落地决定 + 三条实测推论）、`§16.11` 参数总表补 `MIN_TILES`/`tile` 两行的落地口径并增补 `TILE_INDEPENDENCE_GAP` 行、`§30.3` 的"低纹理"行按实测改写（平坦页 ⇒ 门三；斜坡页 ⇒ 门四）（2026-10-08 执行时新增，见下）。
 > 下表保留**原始登记内容**（作为"当时看到了什么"的记录）。
 
 | # | 补充 | 为什么必须补 | 回填位置 |
@@ -137,6 +138,7 @@
 | **DEV-16**（执行时新增） | V2 §21.3 只写"`ID3D11DeviceContext` 的线程所有权"，**没有一条关于 COM/WinRT 公寓的规则**；而 `docs/31` `P0.02` 的升级条款与"合规直觉"都指向"每个触及 WinRT 的线程应先 `RoInitialize(MTA)`" | 2026-10-08 实测**否掉了那个直觉**：`CoGetApartmentType` 显示隐式路径给 **`APTTYPE=1 qualifier=1`（`IMPLICIT_MTA`）**、显式 `RoInitialize`/`CoInitializeEx(MTA)` 给 **`APTTYPE=1 qualifier=0`**（**类型相同、限定符不同**），而**显式那一边让 WGC 激活崩**（交错 A/B：整轮串行套件 3/3 崩在 `providers.rs:684` 的真实捕获用例，对照臂 3/3 全绿；换成 `CoInitializeEx(MTA)` 一样 3/3 崩）；不写明这条，下一个人会照着"COM 教科书"把公寓声明加回来，从而把一个偶发崩溃变成确定性崩溃 | `docs/30` 在 §21.4 之后、`## 22. 内存策略` 之前新增 **`### 21.5 COM/WinRT 公寓：本 crate 不声明公寓，靠 combase 的隐式 MTA`**（测量表 + 三句话设计规则 + 开放项）；代码侧新增定点测试 `crates/snapclip-capture/src/windows/win/wgc.rs` 的 `winrt_activation_keeps_the_implicit_apartment`（自证 = 在 `is_supported()` 顶部临时加一句 `CoInitializeEx(MTA)` 即红，实测 `left: APTTYPEQUALIFIER(0) / right: APTTYPEQUALIFIER(1)`；该测试**必须跑在全新进程里**（线程继承隐式 MTA，同进程内看不见声明，理由见 `docs/30 §21.5` 规则 3））；被否决的实现保存在侧分支 `spike/apartment-mta`（`58bd99b`）；本文 §14.3 `R-21` 行同步改写 |
 | **DEV-17**（执行时新增） | `P1.08` 的 GREEN 把"`GateOutcome::{Pass, Reject(reason)}`"与"**与可验证性约束分开表达**"并置，REFACTOR 又要求把 `ρ_min` 作为独立常量暴露，但**没有说 §16.9 的边界值禁令落在哪一步**（§16.1 的门清单里它不占一席，§16.9 只说"无论它通过了几道门"）；也没说 `ρ_min` 的比较用什么数域 | 2026-10-08 执行时做了三处裁决并把它们写成可执行形式：① **禁令放进门一内部**（`gate_geometry` 先判 `|d| > extent` 再判 `|d| == extent / 2`）——它是"越界/未定义路径的共同落点"，必须**早于**其余门生效，否则"落在 `±N/2` 但被后面某道门拒绝"与普通的坏候选在下游无法区分；② **`extent <= 1` 时不禁 `d == 0`**——否则"页面确实没动"（唯一可由行指纹确认的答案）会变得无法表达，且测试把 `gate_geometry(0, 0/1) == Pass` 钉住；③ **`ρ_min` 的比较用整数**（`RHO_MIN_PERMILLE = 350`，`overlap·1000 ≥ 350·extent`），因为 `extent = 100, |d| = 65` 恰为 350‰、必须通过，而浮点 `>=` 会让校准顺带移动这个边界；同一测试还证明了 §16.1 的论点：`gate_geometry(66, 100) == Pass` 而 `is_verifiable(66, 100) == false`（**硬门与可信度是两个数字**） | `docs/30` 在 §16.2 之后新增 `#### 16.2.1 落地的形状（P1.08）`（形状块 + 三处裁决）；§16.9 在硬规则两条之后补"**落点（P1.08）**"段（禁令 = 门一内部的第二条分支、可执行形式）；§16.11 参数总表在 `MIN_MARGIN` 行之后增补 `RHO_MIN`（0.35，区间 0.30–0.40，可校准，`E-ACC-1`，整数比较）；本文 §6 `P1.08` 执行块 |
 | **DEV-18**（执行时新增） | `P1.09` 的 GREEN 写"`gain = 1 − RMSE(d_best)/RMSE(d_0)`，`MIN_RESIDUAL_GAIN = 0.15`；`d_best == 0` 走行指纹分支"，但**没说"无定义"用什么表达**，也没说"行指纹分支"由谁提供；仓库里已有的 `gain_of` 把 `0/0` 折成 **`0.0`**、且 `score_candidates_2d` 在候选循环里**重复构造零位移带** | 2026-10-08 执行时做了四处裁决并把其中两处写成可执行形式：① **比值返回 `Option<f32>`**（分母 `<= GAIN_RMSE_FLOOR = 1e-3` ⇒ `None`），`0.0` 只在排名的**唯一调用点**以 `GAIN_UNDEFINED_FOR_RANKING` 代入——原实现让"未定义"与"没有增益"是同一个数，于是零位移会作为普通测量参与 §16.7 的 `score` 排名、也会被门二当成"增益不足"拒绝，两件不同的事共用一个结果（这是 `P1.04`"缺失的答案要有类型、不要哨兵"的第二次实例）；② **`residual_gain_at` 与排名必须测同一块区域、同一个单位**——第一版把**全分辨率**像素传进 `DOWNSAMPLE = 4` 的池化栅格，真实位移 120 px 的增益回报为 **0.019**（远低于 0.15），即"肉眼可见的移动被判成没有动"；修法 = 内部 `round_to_grid(shift)`，并新增 `the_gate_and_the_ranking_measure_the_same_region()` 断言排名里每个候选的 `gain` 与 `residual_gain_at` 的返回值**逐位相等**（同时满足 REFACTOR"RMSE 的定义被两处共用"：零位移带移出循环、两处都经 `match_band` + `band_rmse`）；③ **`zero_shift_status` 是 §16.3 重复检测的唯一入口**（`primary_digests` 逐行相等 ⇒ `Confirmed { d: 0 }`，否则 `None`；用字节级指纹而非相关性，宁可丢一帧也不多写一行）；④ **闭区间在 0.15 处是闭的**，用 `MIN_RESIDUAL_GAIN - 0.01` 与 `MIN_RESIDUAL_GAIN` 一正一反钉住 | `docs/30` 在 §16.3 之后新增 `#### 16.3.1 落地的形状（P1.09）`（形状块 + 四处裁决 + 尚未落地）；§16.11 参数总表的 `MIN_RESIDUAL_GAIN` 行补落地口径、并增补 `GAIN_RMSE_FLOOR` 行；本文 §6 `P1.09` 执行块 |
+| **DEV-19**（执行时新增） | `P1.10` 的 RED 用例名是 `four_tiles_that_touch_each_other_count_as_one()`，而 §16.4 的可测规则是**两两** `\|i − j\| ≥ 2`（四个连续 tile 的最大两两相隔子集是 `{0, 2}` = **2**）；规格也没说"独立支持者"是否就是 `coverage` 用的那个数、`TILE_INDEPENDENCE_GAP` 是常量还是参数、以及这个 tile 网格与 §18.2 时间模型的 tile 网格如何区分 | 2026-10-08 执行时做了四处裁决：① **"四个相邻"算 2 不算 1**——"一"是**簇**读法，而簇读法会让门三**不可达**（连续 20 个 tile 的完美匹配区域只算 1 < 4，真实页面上每个正确匹配都会被拒绝）；用例改名为 `four_tiles_that_touch_each_other_count_as_two()`，簇读法作为"被否决的替代方案"写进用例注释（否则执行者只能把门限降成 1 来变绿，而那正好是本门要禁止的事）；② **贪婪计数对该结构是精确最优**（排序后从第一个可用者开始取；任何"跳过可用 tile"的解都可改写成从它开始而不让其余成员更近）⇒ 单趟零分配，且 `tiles` 全系统只有一个数（`ScoredCandidate.tiles`/`Evidence.tiles`/`coverage`/门三共用，`coverage` 按 §16.7 本来就定义在独立带数上）；③ **`TILE_INDEPENDENCE_GAP = 2` 是不可调常量，`MIN_TILES = 4` 才是可校准的**（能设成 1 的调用方可以让一整块 wide patch 通过门三）；④ **网格分开命名**（`TILE_ROWS` = 匹配证据的 tile；§18.2 的 tile = 时间/texture 的单位。两者今天都是 32 px，正因为如此才不能共用标识符），两处 doc 互相指向 | `docs/30` 在 §16.4 之后新增 `#### 16.4.1 落地的形状（P1.10）`（形状块 + 四处裁决 + 实测表 + 三条推论：门三给视口主轴设下 **≥ 448 px** 下限、`coverage` 在常见窗口永不饱和（900 px 视口给 0.583）、§30.3 的"低纹理"行分成平坦页 ⇒ 门三与斜坡页 ⇒ 门四）；§16.11 参数总表补 `MIN_TILES`/`tile` 两行的落地口径并增补 `TILE_INDEPENDENCE_GAP` 行；§30.3 的"低纹理"行按实测改写；本文 §6 `P1.10` 执行块 |
 
 
 ---
@@ -1096,6 +1098,27 @@ git config core.hooksPath .githooks
 - **REFACTOR**：把 tile 网格与 §18.2 的 `region.rs` 风格**时间模型**用的网格**分开命名**（参考实现的 `region.rs:24-30` 是 32px、`tiled_canvas.rs` 是 256px，两者毫无关系 —— 命名混用会让下一个读者以为它们相关）
 - **退出条件**：① 两条用例通过；② §30.3 的"低纹理"行（tile 跳过更新）通过
 - **提交标题**：`[P1-10] support must be independent, not adjacent`
+
+**状态**：`[x] 完成`（2026-10-08）
+
+**RED（实测）**：`cargo test -p snapclip-capture --lib four_tiles_that_touch_each_other_count_as_two` → `error[E0425]: cannot find function `independent_support` in this scope`、`error[E0425]: cannot find function `gate_support` in this scope`（`:2300:17`）、`error[E0599]: no variant, associated function, or constant named `TooFewSupporters` found for enum `GateRejection` in the current scope`（`:2273:18` 与 `:2301:52`）+ `error: could not compile `snapclip-capture` (lib test) due to 24 previous errors`，exit 101（日志 `docs/Temp/p110-red.log`）。
+
+**GREEN（已落盘）**：`crates/snapclip-capture/src/scroll/displacement.rs`
+- **`const TILE_INDEPENDENCE_GAP: u32 = 2`**（§16.4 的 `|i − j| ≥ 2`，**不可调**；doc 写明"能设成 1 的调用方可以让一整块 wide patch 通过门三"）。
+- **`fn independent_support(tiles: impl Iterator<Item = u32>) -> u32`**：输入**支持该位移的 tile 下标（递增）**，贪婪取最早可用者 ⇒ 最大两两相隔子集的规模；单趟、零分配（裁决 2）。
+- **`fn supporting_tiles(previous, current, band) -> u32`** 改写为 `independent_support((0..band.rows / tile).filter(|start| band_zncc(...) >= TILE_SUPPORT_ZNCC))` ⇒ `ScoredCandidate.tiles` / `Evidence.tiles` / `coverage` **全部变成独立带数**（§16.7 的 `coverage` 本来就定义在独立带数上）。
+- **`pub(crate) const MIN_TILES: u32 = 4`** 与 **`pub(crate) fn gate_support(supporters: u32) -> GateOutcome`**（`supporters >= MIN_TILES` ⇒ `Pass`，闭区间）；**`GateRejection::TooFewSupporters`**（`status()` ⇒ `Status::None`，第四支，doc 新增"拒绝各自携带自己的状态 —— 门四的 `P1.11` 会为歧义加一条 `Uncertain` 臂，而不是改写调用点"）。
+- REFACTOR：`TILE_ROWS` 与 `TILE_INDEPENDENCE_GAP` 的 doc 互相指向"**匹配证据**的 tile ≠ §18.2 **时间模型**的 tile（两者今天都是 32 px，正因为如此才不能共用标识符）"。
+
+**执行期的两处修正（都来自实跑）**：
+1. **`a_gradient_page_ties_on_correlation_and_leaves_ambiguity_to_gate_four` 的第一版断言"每个候选的 `zncc2d == 1.0`（1e-6）"** ⇒ 失败：`a ramp stopped correlating at shift 9`（实测 `0.999986231`）。这不是夹具缺陷而是**斜坡页面的真实形状**：8 个候选分成两族（`d = 6..9` 的 `zncc2d = 0.999986231`/`gain = 0.573598564`，`d = 10..13` 的 `0.999984145`/`0.539433837`），真值 10 落在**较低**那一族。断言改为"每一族内 `zncc2d > 0.9999` + 全体 `score` 相对差 < 2%"（即 `margin ≈ 8.7e-3` 比 `MIN_MARGIN = 0.15` 低一个数量级），并把两族的精确数值写进用例注释作为实测记录。
+2. **测试辅助 `raw_supporting_tiles` 刻意保留"不应用独立性"的旧循环**：否则"14 vs 7"的对照会变成"拿一个数与它自己比较"，规则一旦被回退就再也看不见（与 `P1.05` 的 `perf_probe` 去重教训同一个方向：能让两处实现漂移的测试不算测试）。
+
+**退出条件**：① 三条用例通过（`four_tiles_that_touch_each_other_count_as_two` / `a_single_patch_supporter_is_rejected` / `a_low_texture_page_has_no_independent_supporters`，另加两条实测钉子 `a_fully_supporting_band_keeps_only_its_independent_tiles` 与 `a_gradient_page_ties_…`）；② §30.3 的"低纹理"行通过——**并按实测拆成两半**：平坦页 ⇒ 独立支持者 0 ⇒ 门三 ⇒ `None`（用例钉住）；斜坡页 ⇒ 门二仍 `Pass`（`gain 0.539–0.574`）而歧义 ⇒ 门四 ⇒ `Uncertain`（`P1.11` 的职责，本任务已把它写成可执行形式）；③ `cargo test -p snapclip-capture --lib scroll::displacement` = **26 passed / 0 failed（7.84s）**。
+
+**偏差**：**一处**，已登记为 §0.6 **DEV-19**（① 用例名由 `..._count_as_one()` 改为 `..._count_as_two()`——簇读法会让门三不可达；② 贪婪计数精确最优且 `tiles` 全系统一个数；③ `TILE_INDEPENDENCE_GAP` 是不可调常量而 `MIN_TILES` 可校准；④ 两个 tile 网格分开命名）。**未完成项**：门三尚未接进会话组装（`P1.12`）；`MIN_TILES = 4` 与 `COVERAGE_SATURATION_TILES = 12` 都归 `E-ACC-1`——本任务交付了两条给校准用的算术事实（**门三给视口主轴设下 ≥ 448 px 下限**；**`coverage` 在 900 px 视口只到 0.583**）。
+
+**门禁（2026-10-08，`docs/Temp/p110-gates.log`）**：`cargo check --workspace --all-targets` = **0 error / 1 warning**（仅既有 `unused variable: content_label`，`apps/snapclip/src/history/view.rs`）；`cargo test -p snapclip-capture --lib -- --test-threads=1` = **391 passed / 0 failed / 12 ignored（23.94s）**（P1.09 之后 386+12，+5 = 本任务五个用例）；`cargo test --workspace --lib -- --test-threads=1` = app 56+3 / capture 391+12（23.44s）/ history 51 / model 23，**0 failed、exit 0**；`tools/check-dependency-direction.ps1` = clean（capture 30 / history 47 / model 8）。
 
 ### P1.11 门四：候选不唯一 `margin ≥ 0.15`
 
