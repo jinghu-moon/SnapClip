@@ -54,15 +54,55 @@
 //! control is a real, keyboard-focus-driven Win32 scroller with its own
 //! independent ground truth (`EM_GETFIRSTVISIBLELINE`), so it validates both the
 //! injection *and* the measurement before Chrome is measured at all.
+//!
+//! ## Second experiment: window-level capture (`P0.05` / `E-CAP-1`)
+//!
+//! `docs/30` §24.2 commits the scroll frame source to **window-level** WGC
+//! (`IGraphicsCaptureItemInterop::CreateForWindow`) and to **one pool reused for
+//! the whole session**. Today's production path only ever calls
+//! `CreateForMonitor` and builds a pool per capture, so both claims are
+//! unmeasured. `capture_window_arm` measures them on the target classes
+//! `docs/30` `E-CAP-1` names — Chrome, Edge, Electron, WinUI3, Notepad — plus
+//! WebView2, which this machine reports as unreachable rather than untested:
+//! `CreateForWindow`, a three-buffer free-threaded pool, ten frame slots, the
+//! black-frame ratio, and how many `Recreate` calls the pool needed.
+//!
+//! ```text
+//! cargo test -p snapclip-capture --lib capture_probe -- --ignored --nocapture
+//! ```
+//!
+//! Three things about this arm are deliberate deviations from the production path,
+//! and all are recorded in `docs/30` §24.2 rather than hidden here: it **polls**
+//! `TryGetNextFrame` instead of registering `FrameArrived` (so that "waiting for a
+//! frame" and "getting the pixels out" stay separately measurable); it
+//! **collects** session-option failures instead of propagating them, because a
+//! missing `GraphicsCaptureSession2/3` interface is a finding, not a reason to
+//! lose the frames; and it **records a frame-less slot as idle instead of failing
+//! the arm**. The first run failed Chrome and Edge at 1500ms and looked like two
+//! unavailable targets; the failure was the probe's assumption that a window keeps
+//! producing frames whether or not its content changes.
 
 use std::path::{Path, PathBuf};
-use std::process::Child;
+use std::process::{Child, Command};
 use std::ptr;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::thread;
 use std::time::{Duration, Instant};
 
+use ::windows::Graphics::Capture::{Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem};
+use ::windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
+use ::windows::Graphics::DirectX::DirectXPixelFormat;
+use ::windows::Graphics::SizeInt32;
+use ::windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
+use ::windows::Win32::Graphics::Dxgi::IDXGIDevice;
+use ::windows::Win32::System::WinRT::Direct3D11::{
+    CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
+};
+use ::windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
+use ::windows::core::{Interface, factory};
+
 use windows_sys::Win32::Foundation::{
-    BOOL, FALSE, HWND, LPARAM, LRESULT, POINT, RECT, TRUE, WPARAM,
+    BOOL, CloseHandle, FALSE, HWND, LPARAM, LRESULT, POINT, RECT, TRUE, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, ClientToScreen, CreateSolidBrush, DeleteObject, EndPaint, FillRect, InvalidateRect,
@@ -75,7 +115,8 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CWP_SKIPINVISIBLE, ChildWindowFromPointEx, CreateWindowExW, DefWindowProcW, DestroyWindow,
     DispatchMessageW, ES_AUTOVSCROLL, ES_MULTILINE, EnumWindows, GetClassNameW, GetClientRect,
-    GetCursorPos, GetForegroundWindow, GetWindowTextW, HWND_TOPMOST, IsWindowVisible, MSG,
+    GetCursorPos, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId, HWND_TOPMOST,
+    IsWindowVisible, MSG,
     PM_REMOVE, PeekMessageW, PostMessageW, RegisterClassW, SB_LINEDOWN, SPI_GETMOUSEWHEELROUTING,
     SPI_GETWHEELSCROLLLINES, SW_RESTORE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SendMessageW,
     SetCursorPos, SetForegroundWindow, SetWindowPos, ShowWindow, SystemParametersInfoW,
@@ -85,7 +126,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use crate::geometry::{Point, Rect};
 use crate::windows::monitor;
-use crate::windows::win::bitblt;
+use crate::windows::win::{bitblt, d3d11, hresult};
+use windows_sys::Win32::System::Threading::{
+    OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+};
 
 /// Pixels trimmed from the right edge before measuring: the scrollbar.
 const SCROLLBAR_TRIM: u32 = 24;
@@ -895,7 +939,10 @@ impl Drop for EditFixture {
 // Fixture 2: Chromium
 // ---------------------------------------------------------------------------
 
-fn find_chromium() -> Option<PathBuf> {
+/// Chrome specifically. `find_chromium` only asked for "any Chromium", which was
+/// enough for the injection probe and is not enough for `P0.05`/`P0.09`: those
+/// compare Chrome against Edge, so the two have to be findable apart.
+fn find_chrome() -> Option<PathBuf> {
     if let Some(configured) = std::env::var_os("CHROME_PATH") {
         let path = PathBuf::from(configured);
         if path.is_file() {
@@ -905,6 +952,15 @@ fn find_chromium() -> Option<PathBuf> {
     [
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
         r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .find(|path| path.is_file())
+}
+
+/// Edge specifically (the capture probe needs it as a target of its own).
+fn find_edge() -> Option<PathBuf> {
+    [
         r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
         r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
     ]
@@ -913,7 +969,35 @@ fn find_chromium() -> Option<PathBuf> {
     .find(|path| path.is_file())
 }
 
-/// The Chromium fixture is a stack of randomly sized, randomly lit bars.
+fn find_chromium() -> Option<PathBuf> {
+    find_chrome().or_else(find_edge)
+}
+
+/// The placeholder in `tests/fixtures/scroll-demo.html` that each run replaces with
+/// its own title.
+const DEMO_TITLE_TOKEN: &str = "snapclip-scroll-demo-token";
+
+/// The demo's random-height texture region, used as the page's landing anchor.
+///
+/// The transport is measured *here* on purpose. The demo also contains a text region,
+/// and a text region is a 19 px carrier: its row signature has many near-equal peaks,
+/// so on it a "no movement" verdict says more about the estimator than about the
+/// injection. That case is real and it has to be measured — it is `E-ACC-1`'s job
+/// (`docs/30` §15.4: the row fingerprint produces candidates and never decides) — but
+/// it must not be the thing this probe calls "the wheel did not arrive".
+const DEMO_TEXTURE_ANCHOR: &str = "#rows-section";
+
+/// The Chromium fixture: the repository's demo page when it is present, otherwise a
+/// generated stack of randomly sized bars.
+///
+/// The demo (`crates/snapclip-capture/tests/fixtures/scroll-demo.html`) is preferred
+/// deliberately: a probe that only ever meets a fixture it generated itself measures
+/// the fixture, not the browser. The demo carries a sticky header, a text block, a
+/// period-free texture region, lazy images, a CSS animation and a finite
+/// infinite-scroll sentinel — the phenomena `docs/30` §18 and §25 have to survive.
+///
+/// The fallback keeps a stripped checkout working, and it encodes the one property
+/// the shift measurement depends on:
 ///
 /// Text would be more realistic and much worse to measure: a text line is
 /// ~13 px of glyphs followed by ~6 px of leading, so the row signal carries a
@@ -922,7 +1006,14 @@ fn find_chromium() -> Option<PathBuf> {
 /// Bars with random heights (4–40 px) remove the carrier: the row series is a
 /// random step function, and a shift of any size is either the truth or
 /// nothing.
-fn write_chromium_fixture(dir: &Path, token: &str) -> Result<PathBuf, String> {
+fn write_chromium_fixture(dir: &Path, title: &str) -> Result<PathBuf, String> {
+    let demo = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/scroll-demo.html");
+    if let Ok(html) = std::fs::read_to_string(&demo) {
+        let path = dir.join("fixture.html");
+        std::fs::write(&path, html.replace(DEMO_TITLE_TOKEN, title))
+            .map_err(|error| format!("writing {path:?} failed: {error}"))?;
+        return Ok(path);
+    }
     let mut state = XorShift32::new(0x51AB_1E5D);
     let mut bars = String::new();
     let mut total = 0;
@@ -940,7 +1031,7 @@ fn write_chromium_fixture(dir: &Path, token: &str) -> Result<PathBuf, String> {
     }
     let html = format!(
         "<!doctype html><html><head><meta charset=\"utf-8\">\
-         <title>snapclip-inject-{token}</title>\
+         <title>{title}</title>\
          <style>html,body{{margin:0;padding:0;background:#fff}}\
          div{{margin:0;padding:0}}</style>\
          </head><body>{bars}</body></html>"
@@ -948,6 +1039,44 @@ fn write_chromium_fixture(dir: &Path, token: &str) -> Result<PathBuf, String> {
     let path = dir.join("fixture.html");
     std::fs::write(&path, html).map_err(|error| format!("writing {path:?} failed: {error}"))?;
     Ok(path)
+}
+
+/// The document the Notepad arm opens.
+///
+/// An empty Notepad is a menu bar and a caret, so ten frames of it would measure the
+/// window frame rather than a document. The search order is: `P0.05_PROBE_TEXT`, then
+/// `docs/Temp/p0-05-notepad.txt` (the git-ignored scratch copy of the long document
+/// this probe is usually asked to use), then a generated filler — a tall document is
+/// the requirement, and failing over a particular file would be a probe that measures
+/// its own configuration instead of the capture path.
+fn notepad_document(scratch: &Path) -> (PathBuf, String) {
+    if let Some(explicit) = std::env::var_os("P0.05_PROBE_TEXT") {
+        let path = PathBuf::from(explicit);
+        if path.is_file() {
+            return (path.clone(), format!("{} (from P0.05_PROBE_TEXT)", path.display()));
+        }
+    }
+    let scratch_copy =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(r"..\..\docs\Temp\p0-05-notepad.txt");
+    if scratch_copy.is_file() {
+        return (
+            scratch_copy.clone(),
+            format!("{} (scratch document)", scratch_copy.display()),
+        );
+    }
+
+    let path = scratch.join("notepad-document.txt");
+    let mut text = String::new();
+    for line in 0..800 {
+        text.push_str(&format!(
+            "line {line:04} — the window-level capture path is measured on a document, \
+             not on an empty editor\n"
+        ));
+    }
+    match std::fs::write(&path, text) {
+        Ok(()) => (path, "generated filler, 800 lines".to_string()),
+        Err(error) => (path.clone(), format!("{} (filler could not be written: {error})", path.display())),
+    }
 }
 
 fn file_url(path: &Path) -> String {
@@ -1371,14 +1500,19 @@ fn inject_probe() {
     // --- Arm 2: Chromium, the target that decides the question.
     let chromium = find_chromium();
     let chromium_arm = chromium.as_ref().map(|executable| {
-        let html = write_chromium_fixture(&scratch, &token).expect("writing the fixture");
+        // The fixture's title *is* the handle this arm finds the window by, so it has
+        // to be the same string that is searched for below. The demo page carries a
+        // placeholder rather than a composed title, so passing the bare token would
+        // instead produce a title that never matches.
+        let title_token = format!("snapclip-inject-{token}");
+        let html = write_chromium_fixture(&scratch, &title_token).expect("writing the fixture");
         let profile = scratch.join("chromium-profile");
-        let child = launch_chromium(executable, &file_url(&html), &profile);
-        (child, html)
+        let url = format!("{}{DEMO_TEXTURE_ANCHOR}", file_url(&html));
+        let child = launch_chromium(executable, &url, &profile);
+        (child, html, title_token)
     });
     match chromium_arm {
-        Some((Ok(mut child), html)) => {
-            let title_token = format!("snapclip-inject-{token}");
+        Some((Ok(mut child), html, title_token)) => {
             match find_window_by_title(&title_token, Duration::from_secs(30)) {
                 Some(window) => {
                     bring_to_front(window.hwnd, false);
@@ -1422,7 +1556,7 @@ fn inject_probe() {
             }
             kill_process_tree(&mut child);
         }
-        Some((Err(error), _)) => panic!("Chromium could not be launched: {error}"),
+        Some((Err(error), _, _)) => panic!("Chromium could not be launched: {error}"),
         None => panic!(
             "no Chromium build found (looked for Chrome then Edge, and $CHROME_PATH). \
              The experiment is meaningless without it."
@@ -1754,4 +1888,1132 @@ fn a_zero_wheel_scroll_lines_setting_means_the_wheel_does_not_scroll() {
     assert_eq!(classify_wheel_lines(WHEEL_PAGESCROLL), WheelLines::Page);
     assert_eq!(classify_wheel_lines(3), WheelLines::Lines(3));
     assert_eq!(classify_wheel_lines(1), WheelLines::Lines(1));
+}
+
+// ---------------------------------------------------------------------------
+// Window-level WGC capture (`P0.05` / `E-CAP-1`)
+// ---------------------------------------------------------------------------
+
+/// `docs/31` `P0.05`: ten frames per target. Ten is enough to see a black-frame
+/// ratio and to catch the "first frame is fine, the rest go stale" failure that
+/// decides whether one pool may stay alive for the whole session.
+const CAPTURE_FRAMES: usize = 10;
+
+/// The experiment asks for three buffers; the production frame source asks for two
+/// (`windows/win/wgc.rs:74-80`). Which number survives ten frames is the question.
+const CAPTURE_BUFFER_COUNT: i32 = 3;
+
+/// Mirrors `wgc::FIRST_FRAME_TIMEOUT`: how long one frame slot waits before it is
+/// called idle. Measured 2026-10-08, this is a *cadence* timeout and not an
+/// availability test: a live target answered in 11–64ms, while a static one
+/// answered never, so the timeout separates `Idle` from failure with two orders of
+/// magnitude to spare.
+const CAPTURE_FRAME_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// Mirrors `wgc::FRAME_POLL_INTERVAL`. The probe polls `TryGetNextFrame` instead of
+/// registering `FrameArrived`, so that the two phases it reports — waiting for a
+/// frame, and getting its pixels into CPU memory — stay separately visible.
+const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+/// Consecutive idle slots that end an arm early. Ten idle slots would spend ten
+/// timeouts to learn what three already say; the first run showed a live target
+/// answering every ~520ms (a caret blink), so three consecutive idle slots still
+/// cannot mistake a slow-but-live target for a dead one.
+const CAPTURE_MAX_CONSECUTIVE_IDLE: usize = 3;
+
+/// A frame flatter than this never had content composed into it. This is a
+/// detection threshold, not a tuning knob: it is deliberately low because a real
+/// window is never flat, while an uncomposed texture is exactly flat.
+const BLACK_FRAME_VARIANCE: f64 = 1.0;
+
+/// Variance is estimated on every other row and column. A flat frame stays flat
+/// under any sampling; subsampling only makes a 1200x900 target four times cheaper
+/// to scan.
+const VARIANCE_STEP: usize = 2;
+
+/// How a single frame came out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameKind {
+    /// The frame carries an image.
+    Content,
+    /// The frame is flat: WGC handed out a texture that was never composed.
+    Black,
+    /// No frame arrived inside the slot: the target's content did not change.
+    ///
+    /// Measured 2026-10-08: `TryGetNextFrame` answers a null interface pointer —
+    /// which the projection surfaces as `Err` carrying `S_OK` (`#code=0`) — when
+    /// there is nothing new to show. That is the normal state of a window nobody
+    /// is scrolling, and `docs/30` §4.1 already models it as `FramePoll::Idle`.
+    Idle,
+}
+
+/// Luma variance of a packed BGRA8 buffer.
+///
+/// Variance rather than "is it all zero" on purpose: a target that paints a solid
+/// colour is as flat as a black one, and both mean the same thing to a stitcher.
+/// The luma weights are the integer approximation `docs/30` §15.6 fixes for the
+/// matcher (`Y = (77R + 150G + 29B) >> 8`), so the probe and the product agree on
+/// what "brightness" means.
+fn frame_luma_variance(bgra: &[u8], width: u32, height: u32) -> f64 {
+    if width == 0 || height == 0 {
+        return 0.0;
+    }
+    let (width, height) = (width as usize, height as usize);
+    let (mut sum, mut sum_sq, mut count) = (0.0f64, 0.0f64, 0u64);
+    let mut y = 0usize;
+    while y < height {
+        let mut x = 0usize;
+        while x < width {
+            let offset = (y * width + x) * 4;
+            let (Some(blue), Some(green), Some(red)) = (
+                bgra.get(offset).copied(),
+                bgra.get(offset + 1).copied(),
+                bgra.get(offset + 2).copied(),
+            ) else {
+                break;
+            };
+            let luma = (77.0 * f64::from(red) + 150.0 * f64::from(green) + 29.0 * f64::from(blue))
+                / 256.0;
+            sum += luma;
+            sum_sq += luma * luma;
+            count += 1;
+            x += VARIANCE_STEP;
+        }
+        y += VARIANCE_STEP;
+    }
+    if count == 0 {
+        return 0.0;
+    }
+    let mean = sum / count as f64;
+    (sum_sq / count as f64) - mean * mean
+}
+
+fn classify_frame(bgra: &[u8], width: u32, height: u32) -> FrameKind {
+    if frame_luma_variance(bgra, width, height) < BLACK_FRAME_VARIANCE {
+        FrameKind::Black
+    } else {
+        FrameKind::Content
+    }
+}
+
+/// One frame's measurement.
+#[derive(Debug, Clone, Copy)]
+struct CaptureFrameReport {
+    index: usize,
+    /// From asking for a frame to holding one.
+    wait_ms: f64,
+    /// From holding one to its pixels being in CPU memory.
+    readback_ms: f64,
+    variance: f64,
+    kind: FrameKind,
+    content_size: (i32, i32),
+}
+
+/// What one target produced, when it produced anything.
+#[derive(Debug, Default)]
+struct CaptureSummary {
+    item_size: (i32, i32),
+    /// `Direct3D11CaptureFramePool::Recreate` calls. The only legitimate trigger is
+    /// a size change; anything else means the pool cannot be reused.
+    recreates: u32,
+    frames: Vec<CaptureFrameReport>,
+    /// Session-option calls that failed. Collected rather than propagated: a missing
+    /// interface is a finding for `docs/30` §24.2, not a reason to lose the frames.
+    option_errors: Vec<String>,
+}
+
+impl CaptureSummary {
+    fn black_frames(&self) -> usize {
+        self.frames
+            .iter()
+            .filter(|frame| frame.kind == FrameKind::Black)
+            .count()
+    }
+
+    fn idle_frames(&self) -> usize {
+        self.frames
+            .iter()
+            .filter(|frame| frame.kind == FrameKind::Idle)
+            .count()
+    }
+
+    /// Frames that actually arrived. An arm that only ever saw idle slots never
+    /// proved that its target can be captured.
+    fn delivered_frames(&self) -> usize {
+        self.frames.len() - self.idle_frames()
+    }
+
+    /// The exit condition's "first frame cost": everything the session spent
+    /// before the first frame arrived, idle slots included.
+    fn first_frame_ms(&self) -> f64 {
+        self.frames
+            .iter()
+            .take_while(|frame| frame.kind == FrameKind::Idle)
+            .chain(self.frames.iter().find(|frame| frame.kind != FrameKind::Idle))
+            .map(|frame| frame.wait_ms + frame.readback_ms)
+            .sum()
+    }
+
+    fn worst_readback_ms(&self) -> f64 {
+        self.frames
+            .iter()
+            .map(|frame| frame.readback_ms)
+            .fold(0.0f64, f64::max)
+    }
+}
+
+/// One arm of the experiment: a target, or the reason there is no target.
+#[derive(Debug)]
+struct CaptureArmReport {
+    target: &'static str,
+    hwnd: HWND,
+    /// `Err` always carries a specific reason, and every reason produced by a
+    /// Windows API carries its `#code=` HRESULT (`win::hresult`).
+    outcome: Result<CaptureSummary, String>,
+}
+
+/// The targets `docs/31` `P0.05` names, in the order the report prints them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureTargetKind {
+    Chrome,
+    Edge,
+    Electron,
+    /// A WinUI3 desktop app: `docs/30` `E-CAP-1` names it as a target class, and
+    /// the machine inventory confirmed a launch recipe and its window class.
+    WinUi3,
+    WebView2,
+    Notepad,
+}
+
+impl CaptureTargetKind {
+    /// The five classes `docs/30` `E-CAP-1` names, plus WebView2. WebView2 is kept
+    /// in the list rather than dropped, because "no reachable WebView2 window on
+    /// this machine" is a measurement while an absent arm is an omission: the
+    /// inventory found the runtime installed (154.0.4258.53/.62) and no host with a
+    /// visible top-level window.
+    const ALL: [Self; 6] = [
+        Self::Chrome,
+        Self::Edge,
+        Self::Electron,
+        Self::WinUi3,
+        Self::WebView2,
+        Self::Notepad,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Chrome => "chrome",
+            Self::Edge => "edge",
+            Self::Electron => "electron",
+            Self::WinUi3 => "winui3",
+            Self::WebView2 => "webview2",
+            Self::Notepad => "notepad",
+        }
+    }
+}
+
+/// A launched or attached target: the window to capture, and what to clean up.
+///
+/// Cleanup is by process id rather than by the `Child` handle, because three of the
+/// launchers do not hand back the process that owns the window: `explorer.exe` exits
+/// immediately after starting a packaged app, Image File Execution Options redirect
+/// `notepad.exe` to Notepad3, and a browser window belongs to a renderer child.
+struct LaunchedTarget {
+    window: HWND,
+    class: String,
+    /// `None` when the window belongs to an application the probe did not start —
+    /// killing that would close a window the user is working in.
+    kill_pid: Option<u32>,
+    /// The spawned launcher, kept so it is reaped instead of leaking a handle.
+    process: Option<Child>,
+    /// What was actually launched or attached to, for the report.
+    note: String,
+}
+
+/// `docs/31` `P0.05` first self-check: the black-frame detector must be able to tell
+/// an uncomposed frame from a composed one, or the whole arm reports noise.
+///
+/// The detector is brightness-invariant, so a solid white frame is "black" too —
+/// that is the point: what a stitcher needs to know is whether there is *anything
+/// to match*, not whether the pixels are dark.
+#[test]
+fn the_capture_probe_detects_a_black_frame() {
+    let empty = [0u8; 0];
+    assert_eq!(
+        classify_frame(&empty, 0, 0),
+        FrameKind::Black,
+        "an empty buffer has no content to match"
+    );
+
+    let flat_black = vec![0u8; 64 * 64 * 4];
+    assert_eq!(classify_frame(&flat_black, 64, 64), FrameKind::Black);
+
+    let flat_white = vec![255u8; 64 * 64 * 4];
+    assert_eq!(
+        classify_frame(&flat_white, 64, 64),
+        FrameKind::Black,
+        "a solid colour is as flat as black — the detector measures structure, not darkness"
+    );
+
+    let flat_gray = vec![128u8; 64 * 64 * 4];
+    assert_eq!(classify_frame(&flat_gray, 64, 64), FrameKind::Black);
+
+    // Half black, half white: two solid halves are exactly the structure a stitcher
+    // can lock on to, so this must not be reported as an uncomposed frame.
+    let mut split = vec![0u8; 64 * 64 * 4];
+    for y in 0..64usize {
+        for x in 32..64usize {
+            let offset = (y * 64 + x) * 4;
+            split[offset] = 255;
+            split[offset + 1] = 255;
+            split[offset + 2] = 255;
+        }
+    }
+    assert_eq!(classify_frame(&split, 64, 64), FrameKind::Content);
+
+    // A gradient has structure everywhere, so it is content by this definition —
+    // whether the *matcher* can use it is a different question (`docs/30` §16).
+    let mut gradient = vec![0u8; 64 * 64 * 4];
+    for y in 0..64usize {
+        for x in 0..64usize {
+            let offset = (y * 64 + x) * 4;
+            let value = ((x + y) * 2) as u8;
+            gradient[offset] = value;
+            gradient[offset + 1] = value;
+            gradient[offset + 2] = value;
+        }
+    }
+    assert_eq!(classify_frame(&gradient, 64, 64), FrameKind::Content);
+}
+
+/// `docs/31` `P0.05` second self-check: a handle that is not a window must come back
+/// as "unavailable" with its error code, not as a panic and not as an empty success.
+///
+/// This is the path every missing target takes (no Electron installed, a WebView2
+/// host that is not running), so it has to be exercised by the suite rather than
+/// discovered on the one machine that happens to lack a target.
+#[test]
+fn an_unknown_window_handle_reports_unavailable() {
+    let error = create_item_for_window(ptr::null_mut())
+        .err()
+        .expect("CreateForWindow(null) must not produce a capture item");
+    assert!(
+        error.contains("#code="),
+        "the unavailability reason must keep the HRESULT for diagnostics, got {error:?}"
+    );
+}
+
+/// The window class every Chromium-based browser and Electron application uses for its
+/// top-level window. It is *not* unique on a desktop — four unrelated processes owned
+/// one on the machine this probe was written against — so it may only be used together
+/// with something else that identifies the window (a fresh title, or the executable
+/// that owns it).
+const CHROMIUM_WINDOW_CLASS: &str = "Chrome_WidgetWin_1";
+
+/// The window class a **packaged** WinUI3 / UWP application's window uses.
+///
+/// Measured, not assumed. Starting the Windows 11 Calculator and listing top-level
+/// windows shows the app's window as an `ApplicationFrameWindow` titled `计算器` — the
+/// shell hosts a packaged app's window inside its own frame, and the "WinUI3" class is
+/// what *desktop* WinUI3 apps (PowerToys, its command palette) report instead.
+///
+/// This class is shared with every packaged app that is not running (the shell keeps a
+/// hidden frame for each), so it is only meaningful together with "this window was not
+/// there before", and never with a title: the title is localised.
+const PACKAGED_APP_WINDOW_CLASS: &str = "ApplicationFrameWindow";
+
+fn window_handles() -> Vec<HWND> {
+    visible_windows()
+        .into_iter()
+        .map(|window| window.hwnd)
+        .collect()
+}
+
+/// How to recognise the window a launcher just brought up.
+enum WindowMatch<'a> {
+    /// Any new top-level window. Notepad, an Electron app and a WinUI3 app each
+    /// name their windows differently, so guessing a title reports "the target
+    /// never appeared" when in fact it appeared under another name.
+    Any,
+    /// The unique title the fixture asked for, known only to the launcher.
+    TitleContains(&'a str),
+    /// The window class, for launchers whose window title is localised.
+    Class(&'a str),
+}
+
+/// Wait for a top-level window that was not there before the target was launched.
+fn wait_for_new_window(
+    known: &[HWND],
+    wanted: WindowMatch<'_>,
+    timeout: Duration,
+) -> Option<WindowInfo> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        for window in visible_windows() {
+            if known.contains(&window.hwnd) {
+                continue;
+            }
+            let matched = match &wanted {
+                WindowMatch::Any => true,
+                WindowMatch::TitleContains(needle) => window.title.contains(needle),
+                WindowMatch::Class(class) => window.class == *class,
+            };
+            if matched {
+                return Some(window);
+            }
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        pump_for(Duration::from_millis(100));
+    }
+}
+
+/// The classes of the top-level windows that appeared since `known` was sampled.
+///
+/// "No window of class X appeared" is not a diagnosable sentence; the same sentence
+/// plus the classes that *did* appear is. A packaged app's window is hosted in the
+/// shell's own frame, and its class is not something to guess at.
+fn new_window_classes(known: &[HWND]) -> String {
+    let mut classes: Vec<String> = visible_windows()
+        .into_iter()
+        .filter(|window| !known.contains(&window.hwnd))
+        .map(|window| window.class)
+        .collect();
+    classes.sort();
+    classes.dedup();
+    if classes.is_empty() {
+        "no new top-level window appeared at all".to_string()
+    } else {
+        format!("the new top-level windows have classes {classes:?}")
+    }
+}
+
+/// The process id that owns `hwnd`.
+fn pid_of_window(hwnd: HWND) -> Option<u32> {
+    let mut pid = 0u32;
+    // SAFETY: `hwnd` comes from `EnumWindows`, and the out-parameter is a live
+    // local. A zero pid is reported as "unknown" to the caller.
+    unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+    (pid != 0).then_some(pid)
+}
+
+/// The full image path of the process that owns `hwnd`.
+///
+/// Used to attach to an Electron window that is already running: these apps are
+/// single-instance, so starting one again only raises the existing window, and a
+/// launch-and-wait arm would time out against an application that is right there.
+fn process_image_path(hwnd: HWND) -> Option<PathBuf> {
+    let pid = pid_of_window(hwnd)?;
+    // SAFETY: the handle is closed on every path below. `PROCESS_QUERY_LIMITED_
+    // INFORMATION` is the least privilege that answers the question and needs no
+    // elevation against a same-integrity process.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let mut buffer = [0u16; 512];
+    let mut length = buffer.len() as u32;
+    // SAFETY: `buffer` is `length` elements long and stays alive across the call.
+    let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut length) };
+    // SAFETY: `handle` came from `OpenProcess` and is closed exactly once.
+    unsafe { CloseHandle(handle) };
+    if ok == 0 {
+        return None;
+    }
+    Some(PathBuf::from(String::from_utf16_lossy(
+        &buffer[..length as usize],
+    )))
+}
+
+/// Kill a process tree by id.
+///
+/// `/T` is what makes the browser case work — the window is owned by a renderer
+/// child, not by the launcher we spawned — and it is also what makes the
+/// Image-File-Execution-Options redirect harmless: the redirected process is the
+/// one that owns the window, whatever started it.
+fn kill_pid(pid: u32) {
+    let _ = Command::new("taskkill")
+        .args(["/T", "/F", "/PID", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// End whatever this arm started, and reap the launcher handle.
+fn shutdown_target(target: &mut LaunchedTarget) {
+    if let Some(pid) = target.kill_pid {
+        kill_pid(pid);
+    }
+    if let Some(mut process) = target.process.take() {
+        let _ = process.wait();
+    }
+}
+
+fn create_item_for_window(hwnd: HWND) -> Result<GraphicsCaptureItem, String> {
+    let interop = factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
+        .map_err(|error| hresult("factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>", &error))?;
+    // SAFETY: `hwnd` is either a live top-level window or a handle that is not a
+    // window at all. `CreateForWindow` validates its argument and reports the
+    // failure; `an_unknown_window_handle_reports_unavailable` asserts that.
+    unsafe {
+        interop
+            .CreateForWindow::<GraphicsCaptureItem>(::windows::Win32::Foundation::HWND(hwnd))
+            .map_err(|error| hresult(&format!("CreateForWindow({})", format!("{hwnd:p}")), &error))
+    }
+}
+
+/// The WinRT view of the D3D11 device (`wgc.rs:64-73` does the same two steps).
+fn direct3d_device(device: &d3d11::GraphicsDevice) -> Result<IDirect3DDevice, String> {
+    let dxgi_device: IDXGIDevice = device
+        .device()
+        .cast()
+        .map_err(|error| hresult("IDXGIDevice::cast", &error))?;
+    // SAFETY: `dxgi_device` belongs to the D3D11 device this process created.
+    let inspectable = unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device) }
+        .map_err(|error| hresult("CreateDirect3D11DeviceFromDXGIDevice", &error))?;
+    inspectable
+        .cast::<IDirect3DDevice>()
+        .map_err(|error| hresult("IDirect3DDevice::cast", &error))
+}
+
+/// The texture behind a captured frame (`wgc.rs:132-139` does the same cast).
+fn texture_of(frame: &Direct3D11CaptureFrame) -> Result<ID3D11Texture2D, String> {
+    let surface = frame
+        .Surface()
+        .map_err(|error| hresult("Direct3D11CaptureFrame::Surface", &error))?;
+    let access: IDirect3DDxgiInterfaceAccess = surface
+        .cast()
+        .map_err(|error| hresult("IDirect3DDxgiInterfaceAccess::cast", &error))?;
+    // SAFETY: `access` wraps the surface the frame just handed out; the interface it
+    // returns is the `ID3D11Texture2D` that owns that surface's pixels.
+    unsafe { access.GetInterface::<ID3D11Texture2D>() }
+        .map_err(|error| hresult("IDirect3DDxgiInterfaceAccess::GetInterface", &error))
+}
+
+/// Wait for the next frame, or report that the target had nothing new to show.
+///
+/// `Ok(None)` is idle, not failure. A real failure is an `Err` carrying an HRESULT
+/// — a dead device, a closed item — and the caller must not answer it with "this
+/// target is static".
+fn next_capture_frame(
+    pool: &Direct3D11CaptureFramePool,
+    timeout: Duration,
+) -> Result<Option<Direct3D11CaptureFrame>, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match pool.TryGetNextFrame() {
+            Ok(frame) => return Ok(Some(frame)),
+            // `#code=0` is `S_OK` on a null interface pointer: "no frame is
+            // waiting", which is what WGC reports while the window content stays
+            // put. Any other code is a real failure and must not be retried.
+            Err(error) if error.code().0 == 0 => {
+                if Instant::now() >= deadline {
+                    return Ok(None);
+                }
+                thread::sleep(CAPTURE_POLL_INTERVAL);
+            }
+            Err(error) => return Err(hresult("TryGetNextFrame", &error)),
+        }
+    }
+}
+
+/// Capture ten frames of one window and measure them.
+///
+/// Every failure path returns a reason instead of panicking: "this target is
+/// unavailable, with this error code" is a *result* of `P0.05` (exit condition ③),
+/// and a panic would erase the other four targets' measurements with it.
+fn capture_window_arm(target: &'static str, hwnd: HWND) -> CaptureArmReport {
+    let failed = |message: String| CaptureArmReport {
+        target,
+        hwnd,
+        outcome: Err(message),
+    };
+
+    let device = match d3d11::GraphicsDevice::create() {
+        Ok(device) => device,
+        Err(message) => return failed(message),
+    };
+    let item = match create_item_for_window(hwnd) {
+        Ok(item) => item,
+        Err(message) => return failed(message),
+    };
+    let size = match item.Size() {
+        Ok(size) => size,
+        Err(error) => return failed(hresult("GraphicsCaptureItem::Size", &error)),
+    };
+    let dimensions = (size.Width, size.Height);
+    let direct3d = match direct3d_device(&device) {
+        Ok(direct3d) => direct3d,
+        Err(message) => return failed(message),
+    };
+    let pool = match Direct3D11CaptureFramePool::CreateFreeThreaded(
+        &direct3d,
+        DirectXPixelFormat::B8G8R8A8UIntNormalized,
+        CAPTURE_BUFFER_COUNT,
+        size,
+    ) {
+        Ok(pool) => pool,
+        Err(error) => {
+            return failed(hresult(
+                "Direct3D11CaptureFramePool::CreateFreeThreaded",
+                &error,
+            ));
+        }
+    };
+    let session = match pool.CreateCaptureSession(&item) {
+        Ok(session) => session,
+        Err(error) => {
+            return failed(hresult(
+                "Direct3D11CaptureFramePool::CreateCaptureSession",
+                &error,
+            ));
+        }
+    };
+
+    let mut summary = CaptureSummary {
+        item_size: dimensions,
+        ..CaptureSummary::default()
+    };
+    // Recorded, not propagated: see the module documentation.
+    if let Err(error) = session.SetIsCursorCaptureEnabled(false) {
+        summary
+            .option_errors
+            .push(hresult("GraphicsCaptureSession::SetIsCursorCaptureEnabled", &error));
+    }
+    if let Err(error) = session.SetIsBorderRequired(false) {
+        summary
+            .option_errors
+            .push(hresult("GraphicsCaptureSession::SetIsBorderRequired", &error));
+    }
+    if let Err(error) = session.StartCapture() {
+        return failed(hresult("GraphicsCaptureSession::StartCapture", &error));
+    }
+
+    let mut pool_size = dimensions;
+    let mut consecutive_idle = 0usize;
+    for index in 0..CAPTURE_FRAMES {
+        let wait_started = Instant::now();
+        let frame = match next_capture_frame(&pool, CAPTURE_FRAME_TIMEOUT) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => {
+                // Nothing changed inside the slot. `wgc.rs` calls this idle; in
+                // production the scroll loop is what ends it, by scrolling.
+                consecutive_idle += 1;
+                summary.frames.push(CaptureFrameReport {
+                    index,
+                    wait_ms: wait_started.elapsed().as_secs_f64() * 1000.0,
+                    readback_ms: 0.0,
+                    variance: 0.0,
+                    kind: FrameKind::Idle,
+                    content_size: pool_size,
+                });
+                if consecutive_idle >= CAPTURE_MAX_CONSECUTIVE_IDLE {
+                    break;
+                }
+                continue;
+            }
+            Err(message) => {
+                let _ = session.Close();
+                let _ = pool.Close();
+                return failed(format!("frame {index}: {message}"));
+            }
+        };
+        consecutive_idle = 0;
+        let wait_ms = wait_started.elapsed().as_secs_f64() * 1000.0;
+
+        // The pool only has to be rebuilt when the content size changes; counting the
+        // calls is how this arm answers "can one pool serve the whole session".
+        if let Ok(current) = frame.ContentSize() {
+            let current = (current.Width, current.Height);
+            if current != pool_size {
+                if let Err(error) = pool.Recreate(
+                    &direct3d,
+                    DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                    CAPTURE_BUFFER_COUNT,
+                    SizeInt32 {
+                        Width: current.0,
+                        Height: current.1,
+                    },
+                ) {
+                    summary
+                        .option_errors
+                        .push(hresult("Direct3D11CaptureFramePool::Recreate", &error));
+                }
+                summary.recreates += 1;
+                pool_size = current;
+            }
+        }
+
+        let readback_started = Instant::now();
+        let texture = match texture_of(&frame) {
+            Ok(texture) => texture,
+            Err(message) => {
+                let _ = session.Close();
+                let _ = pool.Close();
+                return failed(format!("frame {index}: {message}"));
+            }
+        };
+        let pixels = match device.read_back_bgra(&texture) {
+            Ok(pixels) => pixels,
+            Err(message) => {
+                let _ = session.Close();
+                let _ = pool.Close();
+                return failed(format!("frame {index}: {message}"));
+            }
+        };
+        let readback_ms = readback_started.elapsed().as_secs_f64() * 1000.0;
+
+        let variance = frame_luma_variance(&pixels, pool_size.0.max(0) as u32, pool_size.1.max(0) as u32);
+        summary.frames.push(CaptureFrameReport {
+            index,
+            wait_ms,
+            readback_ms,
+            variance,
+            kind: if variance < BLACK_FRAME_VARIANCE {
+                FrameKind::Black
+            } else {
+                FrameKind::Content
+            },
+            content_size: pool_size,
+        });
+    }
+
+    let _ = session.Close();
+    let _ = pool.Close();
+    CaptureArmReport {
+        target,
+        hwnd,
+        outcome: Ok(summary),
+    }
+}
+
+/// Candidate Electron executables. An Electron app shares Chromium's window class
+/// but not its host structure, which is exactly why `docs/30` §25.3 lists it as a
+/// target class of its own.
+/// Electron applications to try, in order.
+///
+/// `ELECTRON_PATH` comes first so a reviewer can measure a specific application
+/// without editing the probe. The rest is a machine-local list on purpose: the usual
+/// "apps every developer has" list was *wrong* here — none of VS Code, Slack, Discord,
+/// Notion, Obsidian or Postman is installed, so the old list reported "no Electron
+/// application found" while four Electron applications were running.
+fn electron_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(explicit) = std::env::var_os("ELECTRON_PATH") {
+        candidates.push(PathBuf::from(explicit));
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        let local = PathBuf::from(local);
+        for suffix in [
+            r"Programs\Microsoft VS Code\Code.exe",
+            r"Programs\cursor\Cursor.exe",
+            r"Programs\Notion\Notion.exe",
+            r"Obsidian\Obsidian.exe",
+            r"Programs\Postman\Postman.exe",
+            r"Programs\slack\slack.exe",
+            r"Discord\app-0.0.0\Discord.exe",
+        ] {
+            candidates.push(local.join(suffix));
+        }
+    }
+    for path in [
+        r"C:\A_Softwares\Typora\Typora.exe",
+        r"C:\A_Softwares\Qoder IDE\Qoder IDE.exe",
+        r"C:\A_Softwares\Xiaomi-MiMo-AI\Xiaomi MiMo AI\Xiaomi MiMo AI.exe",
+    ] {
+        candidates.push(PathBuf::from(path));
+    }
+    candidates
+}
+
+/// An already-running Electron window, matched by the executable that owns it.
+///
+/// Matching on the owning process rather than on the window title is what makes this
+/// correct: `Chrome_WidgetWin_1` is shared, and an Electron window's title is the
+/// document it happens to have open.
+fn find_running_electron(executable_name: &str) -> Option<(WindowInfo, PathBuf)> {
+    for window in visible_windows() {
+        if window.class != CHROMIUM_WINDOW_CLASS {
+            continue;
+        }
+        let Some(path) = process_image_path(window.hwnd) else {
+            continue;
+        };
+        let matches = path
+            .file_name()
+            .map(|name| name.to_string_lossy().eq_ignore_ascii_case(executable_name))
+            .unwrap_or(false);
+        if matches {
+            return Some((window, path));
+        }
+    }
+    None
+}
+
+/// Electron, played in the order this machine actually requires.
+///
+/// 1. Attach to a running instance. These applications are single-instance: starting
+///    one again only raises the window that is already open, so a launch-and-wait arm
+///    times out against an application that is sitting right there.
+/// 2. Otherwise launch an installed one and wait for its new window.
+/// 3. Otherwise report the specific reason, listing how many paths were probed.
+///
+/// An attached window is never killed: the user may be working in it.
+fn attach_or_launch_electron(known: &[HWND]) -> Result<LaunchedTarget, String> {
+    let candidates = electron_candidates();
+    for candidate in &candidates {
+        let Some(name) = candidate
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+        else {
+            continue;
+        };
+        if let Some((window, path)) = find_running_electron(&name) {
+            return Ok(LaunchedTarget {
+                window: window.hwnd,
+                class: window.class,
+                kill_pid: None,
+                process: None,
+                note: format!(
+                    "attached to running {} (owned by {})",
+                    candidate.display(),
+                    path.display()
+                ),
+            });
+        }
+    }
+
+    let installed: Vec<&PathBuf> = candidates.iter().filter(|path| path.is_file()).collect();
+    let Some(executable) = installed.first().copied() else {
+        return Err(format!(
+            "未取得：no Electron application is installed and none is running \
+             ({} candidate paths probed)",
+            candidates.len()
+        ));
+    };
+    let process = Command::new(executable)
+        .spawn()
+        .map_err(|error| format!("could not start {}: {error}", executable.display()))?;
+    let window = wait_for_new_window(known, WindowMatch::Any, Duration::from_secs(30)).ok_or_else(
+        || {
+            format!(
+                "{} started but no new top-level window appeared within 30s",
+                executable.display()
+            )
+        },
+    )?;
+    Ok(LaunchedTarget {
+        kill_pid: pid_of_window(window.hwnd),
+        window: window.hwnd,
+        class: window.class,
+        process: Some(process),
+        note: executable.display().to_string(),
+    })
+}
+
+/// Installed WebView2 runtime versions.
+///
+/// A WebView2 window can only be reached through a *host* application, so finding
+/// the runtime is not finding a target — but it separates "no WebView2 on this
+/// machine at all" from "runtime installed, no host to launch", and those two point
+/// at different follow-ups.
+fn webview2_runtime_versions() -> Vec<String> {
+    let root = Path::new(r"C:\Program Files (x86)\Microsoft\EdgeWebView\Application");
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut versions: Vec<String> = entries
+        .flatten()
+        .filter(|entry| entry.path().join("msedgewebview2.exe").is_file())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    versions.sort();
+    versions
+}
+
+fn launch_capture_target(
+    kind: CaptureTargetKind,
+    scratch: &Path,
+    token: &str,
+) -> Result<LaunchedTarget, String> {
+    let known = window_handles();
+    let label = kind.label();
+    match kind {
+        CaptureTargetKind::Chrome | CaptureTargetKind::Edge => {
+            let executable = match kind {
+                CaptureTargetKind::Chrome => find_chrome(),
+                _ => find_edge(),
+            }
+            .ok_or_else(|| {
+                format!("{label} is not installed: no executable at any known path")
+            })?;
+            let dir = scratch.join(label);
+            std::fs::create_dir_all(&dir)
+                .map_err(|error| format!("could not create scratch dir {dir:?}: {error}"))?;
+            let title = format!("snapclip-probe-{token}-{label}");
+            let html = write_chromium_fixture(&dir, &title)?;
+            let profile = dir.join("profile");
+            let process = launch_chromium(&executable, &file_url(&html), &profile)?;
+            let window = wait_for_new_window(
+                &known,
+                WindowMatch::TitleContains(&title),
+                Duration::from_secs(30),
+            )
+            .ok_or_else(|| {
+                format!("{label} started but no window titled {title:?} appeared within 30s")
+            })?;
+            Ok(LaunchedTarget {
+                kill_pid: pid_of_window(window.hwnd),
+                window: window.hwnd,
+                class: window.class,
+                process: Some(process),
+                note: executable.display().to_string(),
+            })
+        }
+        CaptureTargetKind::Notepad => {
+            // The absolute path is used on purpose: `notepad.exe` is subject to Image
+            // File Execution Options, and on this machine that key redirects it to
+            // Notepad3 — which is why the first run of this probe reported a window
+            // class of `Notepad3U`. Naming the path does not avoid the redirect (the
+            // key is keyed on the image name), but it does make the report say which
+            // binary was asked for.
+            let executable =
+                Path::new(&std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string()))
+                    .join(r"System32\notepad.exe");
+            let (document, document_note) = notepad_document(scratch);
+            let process = Command::new(&executable)
+                .arg(&document)
+                .spawn()
+                .map_err(|error| format!("could not start {}: {error}", executable.display()))?;
+            let window =
+                wait_for_new_window(&known, WindowMatch::Any, Duration::from_secs(20)).ok_or_else(
+                    || {
+                        format!(
+                            "{} started but no new top-level window appeared within 20s",
+                            executable.display()
+                        )
+                    },
+                )?;
+            Ok(LaunchedTarget {
+                kill_pid: pid_of_window(window.hwnd),
+                window: window.hwnd,
+                class: window.class,
+                process: Some(process),
+                note: format!("{} on {document_note}", executable.display()),
+            })
+        }
+        CaptureTargetKind::Electron => attach_or_launch_electron(&known),
+        CaptureTargetKind::WinUi3 => {
+            // A packaged app is started through the shell, which is also why the child
+            // handle cannot be used for cleanup: `explorer.exe` hands the request to a
+            // running instance and exits.
+            let app = r"shell:AppsFolder\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App";
+            let process = Command::new("explorer.exe")
+                .arg(app)
+                .spawn()
+                .map_err(|error| format!("could not ask explorer.exe to start {app}: {error}"))?;
+            let window = wait_for_new_window(
+                &known,
+                WindowMatch::Class(PACKAGED_APP_WINDOW_CLASS),
+                Duration::from_secs(30),
+            )
+            .ok_or_else(|| {
+                format!(
+                    "no window of class {PACKAGED_APP_WINDOW_CLASS} appeared within 30s: {}",
+                    new_window_classes(&known)
+                )
+            })?;
+            Ok(LaunchedTarget {
+                kill_pid: pid_of_window(window.hwnd),
+                window: window.hwnd,
+                class: window.class,
+                process: Some(process),
+                note: "Microsoft.WindowsCalculator via explorer.exe shell:AppsFolder".to_string(),
+            })
+        }
+        CaptureTargetKind::WebView2 => {
+            let versions = webview2_runtime_versions();
+            Err(if versions.is_empty() {
+                "未取得：no WebView2 runtime and no host application on this machine".to_string()
+            } else {
+                format!(
+                    "未取得：the WebView2 runtime is installed ({versions:?}) but a WebView2 window \
+                     can only be captured through a host application, and none could be launched. \
+                     There is no WebView2 window class: the content is composed into the host's \
+                     own top-level window, so \"capture WebView2\" is \"capture the host\". SnapClip \
+                     itself is no longer a host either — the Tauri shell was removed, and the \
+                     %LOCALAPPDATA% WebView2 data directory left behind is a remnant of it."
+                )
+            })
+        }
+    }
+}
+
+fn print_capture_table(reports: &[CaptureArmReport]) {
+    eprintln!();
+    eprintln!(
+        "{:<11} {:<12} {:>12} {:>6} {:>5} {:>5} {:>9} {:>9} {:>5}  verdict",
+        "target", "hwnd", "item", "frames", "black", "idle", "first_ms", "worst_rb", "recr"
+    );
+    for report in reports {
+        match &report.outcome {
+            Ok(summary) => {
+                eprintln!(
+                    "{:<11} {:<12} {:>5}x{:<6} {:>6} {:>5} {:>5} {:>9.1} {:>9.1} {:>5}  {}",
+                    report.target,
+                    format!("{:p}", report.hwnd),
+                    summary.item_size.0,
+                    summary.item_size.1,
+                    summary.frames.len(),
+                    summary.black_frames(),
+                    summary.idle_frames(),
+                    summary.first_frame_ms(),
+                    summary.worst_readback_ms(),
+                    summary.recreates,
+                    if summary.option_errors.is_empty() {
+                        "captured"
+                    } else {
+                        "captured (with option errors)"
+                    }
+                );
+                for error in &summary.option_errors {
+                    eprintln!("{:13}option error: {error}", "");
+                }
+                for frame in &summary.frames {
+                    // An idle slot is the pool saying "nothing changed", which is the
+                    // ordinary state of a still window: it gets one line, not a row of
+                    // zeros that would drown the delivered frames.
+                    if frame.kind == FrameKind::Idle {
+                        eprintln!(
+                            "{:13}slot {:>2}: idle after {:>7.2}ms",
+                            "", frame.index, frame.wait_ms
+                        );
+                        continue;
+                    }
+                    eprintln!(
+                        "{:13}slot {:>2}: wait {:>7.2}ms readback {:>7.2}ms variance {:>10.3} {:?} {}x{}",
+                        "",
+                        frame.index,
+                        frame.wait_ms,
+                        frame.readback_ms,
+                        frame.variance,
+                        frame.kind,
+                        frame.content_size.0,
+                        frame.content_size.1
+                    );
+                }
+            }
+            Err(reason) => eprintln!(
+                "{:<11} {:<12} {:>12} {:>6} {:>5} {:>5} {:>9} {:>9} {:>5}  UNAVAILABLE: {reason}",
+                report.target,
+                format!("{:p}", report.hwnd),
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-"
+            ),
+        }
+    }
+    eprintln!();
+}
+
+/// `docs/31` `P0.05`: is `CreateForWindow` plus one three-buffer free-threaded pool
+/// good enough for the window-level capture path `docs/30` §24.2 commits to?
+///
+/// Run it with a real interactive desktop — it opens six targets and closes the ones it
+/// opened (an Electron window it merely attached to is left alone):
+///
+/// ```text
+/// cargo test -p snapclip-capture --lib capture_probe -- --ignored --nocapture
+/// ```
+///
+/// Two environment variables change what it measures, and both exist because this
+/// machine's inventory is not the repository's business:
+///
+/// * `P0.05_PROBE_TEXT` — the document the Notepad arm opens (default:
+///   `docs/Temp/p0-05-notepad.txt`, otherwise generated filler).
+/// * `ELECTRON_PATH` — the Electron application to prefer.
+///
+/// A window that has stopped changing yields idle slots rather than frames, so the exit
+/// condition is "at least one delivered frame", not "ten frames": Web Graphics Capture
+/// produces a frame only when the content changes, and a still page is not a failure.
+#[test]
+#[ignore = "P0.05: needs a real interactive desktop and at least one installed target"]
+fn capture_probe() {
+    let _ = monitor::set_per_monitor_v2_awareness();
+
+    // Self-check first, on a handle that is not a window: if this does not come back
+    // as a recorded reason, every "unavailable" row below would be indistinguishable
+    // from a crash.
+    let invalid = capture_window_arm("invalid-handle", ptr::null_mut());
+    assert!(
+        invalid.outcome.is_err(),
+        "an invalid handle must be reported as unavailable, not captured"
+    );
+
+    let token = format!(
+        "{:08x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
+    );
+    let scratch = std::env::temp_dir().join(format!("snapclip-p005-{token}"));
+    std::fs::create_dir_all(&scratch).expect("creating the probe scratch dir");
+
+    let mut reports = vec![invalid];
+    for kind in CaptureTargetKind::ALL {
+        match launch_capture_target(kind, &scratch, &token) {
+            Ok(mut launched) => {
+                eprintln!(
+                    "[P0.05] {}: {} (window class {})",
+                    kind.label(),
+                    launched.note,
+                    launched.class
+                );
+                let report = capture_window_arm(kind.label(), launched.window);
+                reports.push(report);
+                shutdown_target(&mut launched);
+            }
+            Err(reason) => reports.push(CaptureArmReport {
+                target: kind.label(),
+                hwnd: ptr::null_mut(),
+                outcome: Err(reason),
+            }),
+        }
+    }
+    print_capture_table(&reports);
+    let _ = std::fs::remove_dir_all(&scratch);
+
+    // The exit conditions of `docs/31` P0.05: every target either produced content
+    // frames, or carries the specific reason it could not.
+    for report in &reports {
+        match &report.outcome {
+            Ok(summary) => {
+                assert!(
+                    summary.delivered_frames() > 0,
+                    "{} delivered no frame carrying content (all {} slots were idle)",
+                    report.target,
+                    summary.frames.len()
+                );
+                assert_eq!(
+                    summary.black_frames(),
+                    0,
+                    "{} returned {} flat frames out of {}: the pool handed out uncomposed textures",
+                    report.target,
+                    summary.black_frames(),
+                    summary.frames.len()
+                );
+            }
+            Err(reason) => assert!(
+                !reason.is_empty(),
+                "{} is unavailable without a reason",
+                report.target
+            ),
+        }
+    }
 }

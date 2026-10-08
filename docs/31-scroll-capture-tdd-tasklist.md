@@ -150,7 +150,7 @@ P0.01 基线 ✅ ─────────────────────
 P0.02 T-THREAD-1 ──[!]──┐                                   │
 P0.03 E-PERF-1 ══╗      │                                   │
 P0.04 E-PERF-2 ══╣ G1   │                                   │
-P0.05 E-CAP-1  ══╣      │                                   │
+P0.05 E-CAP-1  ✅╣  [!]      │                                   │
 P0.09 E-INJECT-1 补齐 ═╝│                                   │
 P0.06 E-INJECT-1 最小版 ✅                                  │
 P0.07 路由/行数读取 ══╗ G2                                  │
@@ -407,7 +407,7 @@ P6.07 门禁扫描 ═╝
 | 任务 | 阻塞原因 | 解除条件 |
 |---|---|---|
 | `P0.02`（`T-THREAD-1` 的断言） | 断言会在**合法的生产交接路径**上 panic（放大镜取色：`overlay/session.rs:565` → `renderer.rs:311`），而库测试全绿看不到它 | `docs/30 §21.3` 第 ② 步定下 deferred context / 显式交接后并入并重跑两个用例 |
-| `P0.05`（`E-CAP-1` 的 WebView2 一格） | OQ-2 / 需要真实 WebView2 宿主 | 装一个 WebView2 宿主或记为"未取得" |
+| `P0.05`（`E-CAP-1` 的 WebView2 一格） | **不是 OQ-2 的内容**：本机 WebView2 运行时已装（154.0.4258.53 / .62）但**没有可用宿主**（`SearchHost.exe` 没有普通顶层窗口，`GameViewer.exe` 是托盘型 `MainWindowHandle = 0`），而"WebView2 窗口类"根本不存在——内容被合成进宿主自己的顶层窗口，所以这一格测的是宿主，不是 WebView2 | ✅ **已记为"未取得"**（2026-10-08，`docs/30 §24.2.1`）：宿主不存在时无法测，且不影响结论（`CreateForWindow` 对宿主顶层窗口与对 Chrome 是同一条路径）。需要宿主时再补测，侧分支 `blocked/P0-05-webview2-capture` |
 | `P1.22` 的 125%/150% DPI 扫描行 | **OQ-4**：本机 `PixelRatio = 1`，取不到 | 接一台可改缩放的真实显示器 |
 | `P3.02` 的 UIPI 组 | **OQ-3**：官方两页互相矛盾 | 以管理员身份跑一次 `E-INJECT-1` |
 | `P3.09` 的"非前台 `SendInput`"分支判据 | **OQ-5**：`SPI_GETMOUSEWHEELROUTING` 是用户可改设置 | 在两种设置下各跑一次 |
@@ -730,6 +730,8 @@ git config core.hooksPath .githooks
 | 提交信息标题 | `[P0-05] the window-level capture path is measured on five targets` |
 | 复杂度 / 阻塞 | L / **[!]** WebView2 那一格受设备阻塞（§3.4）→ 侧分支 `blocked/P0-05-webview2-capture` |
 | **对后续阶段的影响** | `P2.01`（`ScrollTarget` 句柄语义）、`P2.02`、`P2.03`（pool 复用是否可行）、`P2.04`（能力探测要探什么） |
+| **状态** | **[x] 已完成**（2026-10-08）：`CreateForWindow` + `CreateFreeThreaded(..., bufferCount = 3)` 对 **Chrome / Edge / Electron（附着已运行的 Typora）/ WinUI3（打包版计算器）/ 记事本** 五臂**全部可用**——各 10 帧、**0 黑帧**、`Recreate` **0 次**、最慢回读 1.4–11.1 ms；**WebView2 一格记为"未取得"**（无可用宿主，见 §3.4 与 `docs/30 §24.2.1`）。装置 = `crates/snapclip-capture/src/windows/scroll_probe.rs` 的 `capture_probe`（`#[ignore]`）；夹具 = **新增** `crates/snapclip-capture/tests/fixtures/scroll-demo.html`；命令 = `cargo test -p snapclip-capture --lib capture_probe -- --ignored --nocapture`（21.63 s）。结论已回填 `docs/30 §24.2.1`（新增）与 §24.8，并新增 `docs/30 §36.2` 的 **OQ-14**。**基线漂移（§2.6）**：`capture` 从 `P0.07` 之后的 349 passed / 7 ignored 变为 **351 passed / 8 ignored**（`+2` = 两个装置自证用例，`+1 ignored` = `capture_probe`），全量 **481 passed / 11 ignored / 0 failed**；`cargo check --workspace --all-targets` = 0 error / 1 warning（位置不变：`apps/snapclip/src/history/view.rs`） |
+| **实测结论（改变后续任务的写法）** | ① **`TryGetNextFrame` 的"静止"是 `Err` + `#code = 0`**（windows-rs 对空帧指针的投影："操作成功完成"）→ `P2.02` 的 `FrameSource` 必须把它映射成 `Poll::Idle`，**不得**当作失败或 `TargetLost`；② **WGC 按内容变化产帧**，静止窗口会连续给 `Idle`（1500 ms 量级）→ `P2.03`/`P3.03` 的"等待稳定"不能以"没有新帧"为失败；③ **同一像素会被重复交付**（Chrome 的 slot 0/1/2/5 方差完全相同 `4586.522`）→ `P1.18` 的 `Skip` 路径是**必需**，不是优化；④ **光标闪烁是可重复的"非滚动动态内容"**（Notepad3 方差在 `3098.957`/`3101.674` 交替，差 0.09%）→ 实测支撑 `P1.10` 的 `MIN_RESIDUAL_GAIN = 0.15` 与"一帧动画不得终止会话"；⑤ **CSS 动画页面 0 个 `Idle`**（Edge 10 帧方差单调变化）→ 动态内容只能靠 `P1.09` 与 §18.2 的 tile 降权；⑥ **打包 WinUI3 的窗口类是 `ApplicationFrameWindow`**（被 shell 托管；**同类混有"未运行的打包应用"的隐藏框架**，只有 `DWMWA_CLOAKED` 能区分，标题会本地化）→ `P2.01` 的 `ScrollTarget` 身份判据必须是**"启动前后新增窗口"**，**不是类名、不是标题**；⑦ **`item.Size()` 是内容区**（`--window-size=1200,900` → 1188×894）→ `P2.02` 的帧池尺寸与坐标换算必须用它，用窗口矩形会引入固定偏移 |
 
 ### P0.06 `E-INJECT-1`（最小版）：两条传输 × Chrome ✅
 
@@ -1681,7 +1683,7 @@ git config core.hooksPath .githooks
 |---|---|---|---|---|
 | `P0.02` | `T-THREAD-1`：**库测试全绿但生产路径会 panic**（2026-10-08 实测，见 §6 `P0.02` 的结论块）——触发的是触发条款的实质而非字面（字面是"全量测试 panic"） | **`blocked/P0-02-context-owner`**（装被阻塞的断言代码，✅ 已建并推送）+ `spike/deferred-context`（留给第 ② 步实验，未开始） | 断言 + 两个用例；第 ② 步按 V2 §21.3 **优先用 deferred context**（"不改任何人线程"的方案），把"移线程"作为最后手段 | `P2.02` 的回读路径、`P2.01` 的放大镜采样 |
 | `P0.03` | `E-PERF-1` 的三层漏斗 P95 超过 §23.3 的阈值 | `spike/matcher-layer4` | 加第 4 层（多尺度 / 预降采样）或把 ORB 提到主路径（与 `P1.23` 互换主次） | `P1.05`–`P1.13` |
-| `P0.05` | 窗口级 WGC 在 Electron/WebView2 上不可用（或 `CreateForWindow` 不接受子窗口） | `spike/monitor-fallback` | 显示器级为主 + WDA/覆盖层隐藏 + "遮挡下取到遮挡者"的用户提示 | `P2.01`、C5、§24.2 |
+| `P0.05` | 窗口级 WGC 在 Electron/WebView2 上不可用（或 `CreateForWindow` 不接受子窗口）—— **风险未成立**（2026-10-08）：五臂全部可用，WebView2 是"无宿主可测"而不是"不可用"（§6 `P0.05` 的结论块） | **不建** `spike/monitor-fallback`（原定侧分支不需要）；WebView2 一格单列 `blocked/P0-05-webview2-capture` | 显示器级回退路径**仍然保留**，但理由从"窗口级不可用"改为"最小化 / 跨显示器 / 子窗口句柄三处依据缺口"（`docs/30 §36.2` OQ-14） | `P2.01`、C5、§24.2 |
 | `P1.24` | `E-ACC-1` 打完四门后"错误确定率"仍 > 0 | `spike/orb-primary` | ORB 从"第二意见"提为主候选（`P1.23` 的角色反转），保留四门为**验证**层 | `P1.05`–`P1.16`、§15.4 |
 
 **两处表的口径**：§3.4 列出的是"**因环境/设备/官方依据不足**而阻塞"的四项（`P0.05`、`P1.22` 的 DPI 行、`P3.02` 的 UIPI 组、`P3.09` 的非前台判据），本表列出的是"**因实验结论**而阻塞"的四项；两表并集即本阶段的全部 `[!]`，`P0.02` 由本次执行新增进 §3.4 的表。

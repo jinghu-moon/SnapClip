@@ -2775,6 +2775,40 @@ struct MemoryBudget {
 
 **回归风险**：窗口级捕获是**新增代码路径**，不改动 `capture_monitor`。因此普通截图（`providers.rs` 的 `attempt_order`，§5 确证 `[Wgc, BitBlt]`）**完全不受影响**。这是刻意的：§21.3 的教训是"不要为滚动改普通截图的路径"。
 
+#### 24.2.1 `E-CAP-1` 最小版实测（2026-10-08，本机 · 五臂已跑完）
+
+装置：`crates/snapclip-capture/src/windows/scroll_probe.rs` 的 `capture_probe`（`#[ignore]`，真实桌面）。每臂：`CreateForWindow` → `CreateFreeThreaded(B8G8R8A8UIntNormalized, 3, item.Size())` → `CreateCaptureSession` → `SetIsCursorCaptureEnabled(false)` / `SetIsBorderRequired(false)`（失败**收集**进 `option_errors` 而**不抛**，见下面的偏离 2）→ `StartCapture` → 取 10 帧（`TryGetNextFrame` 轮询，无帧记 `Idle` 槽）→ 每帧 `read_back_bgra` 后算亮度方差（**只判"有没有可匹配的结构"，所以纯白也算黑**）。
+
+| 目标 | `item.Size()` | 帧（Content / Idle） | 黑帧 | 首帧 | 最慢回读 | `Recreate` | 结论 |
+|---|---|---|---|---|---|---|---|
+| Chrome 154.0.8037.98 | 1188×894 | 4 / 5 | 0 | 13.2 ms | 2.5 ms | 0 | 可用 |
+| Edge 154.0.4258.53 | 1188×894 | 9 / 1 | 0 | 12.4 ms | 2.3 ms | 0 | 可用 |
+| Electron（**附着**已运行的 Typora，最大化） | 3840×2088 | 1 / 3 | 0 | 16.6 ms | 11.1 ms | 0 | 可用 |
+| WinUI3（打包版计算器） | 484×801 | 10 / 0 | 0 | 6.8 ms | 1.4 ms | 0 | 可用 |
+| 记事本（本机被 IFEO 重定向为 Notepad3） | 1280×960 | 10 / 0 | 0 | 13.1 ms | 2.3 ms | 0 | 可用 |
+| WebView2 | — | — | — | — | — | — | **未取得**（见下） |
+| 无效句柄 `HWND(0)` | — | — | — | — | — | — | `E_INVALIDARG`（`#code = -2147024809`） |
+
+**七条被实测出来的事实**（每条都改了一处设计或写法）：
+
+1. **`TryGetNextFrame` 在没有新内容时返回空，而 windows-rs 把它投影成 `Err` 且 `#code = 0`（"操作成功完成"）。** 这不是错误，是**静止**。产品侧 `windows/win/wgc.rs` 的 `next_frame` 必须把 `#code == 0` 与真失败分开，否则一个静止窗口会被当作捕获失败——§4.1 的 `Poll::Idle` 因此不是抽象，而是这条投影的**必然结果**。
+2. **WGC 按"合成内容变化"产帧，不按时间产帧。** 静止窗口给几帧后彻底沉默（本探针的 cadence 超时 1500 ms 量级全部落在 `Idle`）。因此**"等待超时"绝不能当作"目标不可用"**，更不能当作"滚动没有生效"。
+3. **同一像素内容会被重复交付。** Chrome 臂的 `slot 0/1/2` 与 `slot 5` 方差**完全相同**（4586.522）——WGC 在重绘但没有内容变化时也给帧。**§16.10 的"逐行完全相等 ⇒ `Skip`/`d = 0`"是必需路径，不是优化**；把它当优化会得到"静止被当成一次位移"。
+4. **光标闪烁是真实且可重复的"非滚动动态内容"。** Notepad3 的方差在 3098.957 与 3101.674 之间交替（差 2.7，占约 3100 的 **0.09%**）。这正是 `MIN_RESIDUAL_GAIN = 0.15` 的用处，也是 §18"一帧动画不得终止会话"的实测依据——那个变化连一帧的 1% 都不到，却足以让"帧不相等"成立。
+5. **CSS 动画让页面每一帧都变。** Edge 臂 10 槽里 0 个 `Idle`，方差单调变化——页面在动，但没有滚动。**"整帧相同"这条短路在动画页面上根本不会触发**，动态内容只能靠 §18.2 的 tile 三分类降权处理。
+6. **回读耗时与像素量成正比**：约 1 MP（1188×894 或 1280×960）为 **0.68–2.5 ms**，3840×2088（32.1 MB）为 **11.1 ms**（约 2.9 GB/s）。§23.3 的 Capture Latency 与 §22 的内存预算都按这个比例推导。
+7. **`item.Size()` 是内容区，不是窗口矩形。** `--window-size=1200,900` 的 Chrome/Edge 都得到 **1188×894**（差 12×6，正是"不可见 resize 边框"）。**帧池尺寸与坐标换算必须来自 `item.Size()`**，用窗口矩形会在每步引入固定偏移。
+
+**WinUI3 的一处纠正（推翻了本节原来的写法）**：打包（MSIX）应用的顶层窗口**不是** `WinUIDesktopWin32WindowClass`，而是 **`ApplicationFrameWindow`**——被 shell 托管在自己的窗口框架里；`WinUIDesktopWin32WindowClass` 是**桌面版（非打包）** WinUI3（PowerToys、命令面板）的类。实测细节：
+
+- 启动计算器后新出现的窗口是 `ApplicationFrameWindow`，`IsWindowVisible = true`、`DWMWA_CLOAKED = 0`、标题 `计算器`（**本地化**）。
+- **同一个类里还有"未运行的打包应用"的隐藏框架**（`IsWindowVisible = true`、`DWMWA_CLOAKED = 2`、标题空）→ **`IsWindowVisible` 不足以筛出可捕获窗口**，只有 `DWMWA_CLOAKED` 能区分，而**同一类里既有可捕获的也有不可捕获的**。
+- 因此定位目标窗口的唯一可靠判据是 **"相对启动前是新增窗口"**（探针用启动前后的顶层窗口集合差），**绝不能用"类名 + 标题"**。这条直接进 §24.4 与 `P2.01` 的 `ScrollTarget::validate`：**类名不是身份，标题不是身份**。
+
+**WebView2 一格：明确记为"未取得"，不是"失败"。** 本机 WebView2 运行时已装（154.0.4258.53 / .62），但**不存在"WebView2 窗口类"**——内容被合成进宿主自己的顶层窗口；而本机两个可能的宿主都不可用（`SearchHost.exe` 是 Low 完整性、没有普通顶层窗口；`GameViewer.exe` 是托盘型，`MainWindowHandle = 0`）。宿主不存在时这一格无法测，且**它不改变结论**：`CreateForWindow` 对宿主顶层窗口与对 Chrome 走的是同一条路径。侧分支 `blocked/P0-05-webview2-capture`。
+
+**探针的两处刻意偏离（记录以便复核装置）**：① 用**轮询**而不是 `FrameArrived` 回调取帧，让"等帧"与"取像素"两段时间可以分别测量；② **会话选项失败只收集不传播**——因为它要回答的正是"接口在哪些系统上不存在"，传播会把一条发现变成一次丢帧。
+
 ### 24.3 捕获会话选项必须**探测**且**失败可见**
 
 **F-15 与 §5 的对照给出的三处修正**：
@@ -2828,6 +2862,7 @@ struct CaptureCapabilities {
 - `PostMessage(WM_MOUSEWHEEL)` **bypasses UIPI**（Microsoft Learn winapp-cli 原文："is HWND-targeted and bypasses UIPI"）；`SendInput` "goes to whatever window is foreground and **is blocked by UIPI**"（F-13）。
 - PixPin **在 UIPI 场景下也没有第二条捕获通道**（`PixPinAuxiliary.exe` 的完整静态分析，F-16 / N10）。它只能提示用户以管理员运行。
 - `WDA_EXCLUDEFROMCAPTURE` **不影响** `EnumWindows`（`provider.rs:45-59` 注释明说），因此三层排除必须各自维护。
+- **本机无法构造"低 → 高"UIPI 场景**：`EnableLUA = 0`（另有 `ConsentPromptBehaviorAdmin = 0`、`PromptOnSecureDesktop = 0`），实测 harness、主进程、Typora、Qoder、msedge 宿主、explorer、PowerToys、Terminal、任务管理器**全部是 High 完整性**，只有 `SearchHost.exe` 是 Low。因此 `OQ-3` 在这台机器上不是"难做"而是**没有目标**；矩阵首行的行为仍只能靠官方文档 + 一台真实提权的机器来定。
 
 **V2 的立场（逐条）**：
 
@@ -2861,9 +2896,11 @@ fn choose(target: &ScrollTarget, probe: &ProbeResult) -> InjectPath {
 
 **原本的未验证项**：`PostMessage(WM_MOUSEWHEEL)` 在 Chrome / Edge / Electron / WinUI3 上是否真的生效。这是 §6.4 末尾"未找到官方依据"六项中的第 1 项，也是 `E-INJECT-1`（§35 的 P0 前置项）。**其中"Chrome + `PostMessageW`"是唯一可能推翻本节结论的一组，已在本机跑完。**
 
-**测量装置**（`crates/snapclip-capture/src/windows/scroll_probe.rs`，`#[cfg(test)]`，永不成为出货路径）：BitBlt 抓目标客户区（裁掉右侧 24 px 滚动条）→ 每行加权和成行签名 → 对 `before[τ..]` 与 `after[0..h-τ]` 做 ZNCC 取峰。**注入一 notch、等稳定、再抓、再估计，逐 notch 累加**（不是一次连发）。夹具三件：一张 20,000 px 高的随机高度横条页（`<div style="height:4..40px">`，颜色由 `XorShift32` 决定）、一个自注册窗口类 `SnapclipScrollProbeFixture`（窗口过程对 `WM_MOUSEWHEEL` **计数**并按 delta 滚动、每 3 px 画随机黑白条）、一个 `EDIT` 控件（对照）。
+**测量装置**（`crates/snapclip-capture/src/windows/scroll_probe.rs`，`#[cfg(test)]`，永不成为出货路径）：BitBlt 抓目标客户区（裁掉右侧 24 px 滚动条）→ 每行加权和成行签名 → 对 `before[τ..]` 与 `after[0..h-τ]` 做 ZNCC 取峰。**注入一 notch、等稳定、再抓、再估计，逐 notch 累加**（不是一次连发）。夹具四件：自建窗口类 `SnapclipScrollProbeFixture`（窗口过程对 `WM_MOUSEWHEEL` **计数**并按 delta 滚动、每 3 px 画随机黑白条 —— **唯一有独立到达计数**的夹具）、一个 `EDIT` 控件（对照）、`crates/snapclip-capture/tests/fixtures/scroll-demo.html`（真实网页：sticky header + 420 行等宽文本 + 900 行随机高度 4–40 px 的周期自由区 + 懒加载图 + CSS 动画 + **有限**的 infinite scroll，整体 32,276 px）、以及它的 `#rows-section` 锚点（把测量落点固定在周期自由区，理由见结论 5）。
 
-**结果（Chrome 154.0.8037.98、单屏 2560×1440、scale 1、Session 1）**：
+**结果（Chrome 154.0.8037.98、单屏 3840×2160、系统缩放 **150%**、Session 1）**：
+
+> **环境事实的一处修正**：本节初稿把本机写成"2560×1440、scale 1"。那是因为从 DPI 不感知的进程看虚拟桌面就是 2560×1440；`GetDpiForSystem` 与 `GetDpiForMonitor(MDT_EFFECTIVE_DPI)` 实测都是 **144**，物理分辨率是 **3840×2160**，本机所有 Chromium 进程都带 `--device-scale-factor=1.5`。**因此本机并非"无缩放"，但仍然是单一 DPI 的显示器**——`OQ-4` 需要的 125%/175% 混合 DPI 依旧取不到。
 
 | 目标 | 传输 | 发出 | 实测位移 | 峰值相关 | verdict |
 |---|---|---|---|---|---|
@@ -2881,6 +2918,7 @@ fn choose(target: &ScrollTarget, probe: &ProbeResult) -> InjectPath {
 2. **`lParam` 的坐标空间：两个空间在本例中都生效，但不能推出可互换。** 客户端坐标 (660,486) 被当作屏幕坐标后 `ScreenToClient` 仍落在 1184×892 的客户区内，所以两条都得到 800 px。**窗口较小时客户端坐标会落到窗外而被丢弃** → 实现必须用 MSDN 记录的**屏幕坐标**（`MAKELPARAM` 的低/高字为屏幕坐标），并**不要**用 `LOWORD`/`HIWORD`（官方在多显示器下会给出错误结果，§6.4 A1）。**新测试用例要求**：把目标窗口缩到 400×300 后重跑同一条 arm，客户端坐标版本必须失效——这是"坐标空间确实按文档实现"的判别性用例（`E-INJECT-1` 追加组）。
 3. **"一次连发 N notch"是不可用的测量方式，而且这条教训对产品同样成立。** 第一次运行时对同一夹具连发 8 notch 得到 `2 px`；`EDIT` 得到 `0 px` 且 `corr=1.000`。改成分步测量 + 把夹具从文本页换成横条页后立刻得到 800/120 px。**两个原因都是真实的**：(a) 连发 8 notch 的位移超过一个视口，任何行/区域估计器都看不到；(b) **文本行渲染的逐像素行信号带行高（19 px）的强载波**——非整数倍行高的平移仍会给出 `corr≈0.6–0.8` 的伪峰。这**实测支撑了 §15.4 把 1D 行指纹限制为"只产生候选、永不作为判据"**，也**实测支撑了 §15.2 的前提（搜索窗来自控制回路：因为是我们自己注入的，才知道该期待多大的位移）与 §16.10 的逐状态处理**——每一 notch 都必须有一次独立的估计与判定，把多 notch 合并成一次估计会让整条判据链失效。
 4. **`EDIT`/`notepad.exe` 不能用作滚动夹具。** 该控件类既不响应注入滚轮、也不响应 `WM_VSCROLL`（自检 0 px）。**用"记事本"当夹具会得到"注入无效"的假结论**——这正是 §35 P0.6 原表里"记事本"那一格的真实含义：它测的是控件类，不是注入。自建窗口才有独立可信的到达计数。
+5. **测量装置在文本区域会失效，而这是设计里已经预期的**（2026-10-08 追加实测）。同一组 arm 落在 `tests/fixtures/scroll-demo.html` 的**文本区**（420 行等宽文本、19 px 行距、每行墨量随机）时，8 notch 得到 `corr@0 = 0.79–0.88`、最佳位移只有 10–25 px、`corr ≈ 0.81–0.85`——**既没有可信的峰，也没有明确的"没动"**。把同一个 URL 换成 `#rows-section`（周期自由区）后立刻恢复为 **`SendInput` 800 px、`PostMessageW` 800 px**（`corr@0 = 0.085–0.106`、runner-up 0.52），与横条页完全一致。两点结论：(a) **传输结论在真实网页上复现**，不是横条夹具的产物；(b) **`corr@0` 高且 `corr` 也高**是"这一帧内容对位移不敏感"的特征——这正是 §15.4 把 1D 行指纹限制为"只产生候选"、以及 §16 要求 `margin`/`residual_gain` 门限的原因；把这种画面判成"位移 10 px"是典型的**错误确定**。探针因此把传输测量固定在 `#rows-section`，文本区域留给 `E-ACC-1`（P1）。
 
 **顺带排除的混杂因素**：首次运行时 PixPin（PID 14928）正在运行且装有 `SetWindowsHookEx` 低层鼠标钩子（§6 记它有过"Synthetic Ctrl+C event detected and filtered"的先例）——当时怀疑它吞掉了带 `LLMHF_INJECTED` 的注入滚轮。**实测排除**：自建窗口的 `SendInput` 到达计数 8/8、Chrome 也照常滚动。
 
@@ -2889,7 +2927,7 @@ fn choose(target: &ScrollTarget, probe: &ProbeResult) -> InjectPath {
 | 仍未验证 | 为什么不能被本机结果覆盖 | 归属 |
 |---|---|---|
 | Edge / Electron / WebView2 / WinUI3 | 本机只跑了 Chrome；同为 Chromium 派生不等于同一条消息路径（WebView2 有宿主窗口层、Electron 有自己的消息钩子） | `E-INJECT-1` 剩余 6 组 |
-| UIPI：以管理员身份运行的目标窗口 | 本机没有提权目标；§24.5 的判断（`PostMessageW` 是提权目标上唯一可行路径）**仍只有官方文档旁证** | `OQ-3` |
+| UIPI：以管理员身份运行的目标窗口 | 本机**取不到这样的目标**：`EnableLUA = 0`，实测所有相关进程（harness、msedge 宿主、explorer、Typora、Qoder、PowerToys…）都是 High 完整性，只有 `SearchHost.exe` 是 Low（§24.5）。§24.5 的判断（`PostMessageW` 是提权目标上唯一可行路径）**仍只有官方文档旁证** | `OQ-3`（需要一台真实提权的机器；本机这条不阻塞实现） |
 | `SPI_GETMOUSEWHEELROUTING == MOUSE_POS(2)` 时非前台窗口能否收到 `SendInput` 滚轮 | 本机是默认值；**这是用户可改的系统设置**，不能作为设计前提 | `OQ-5` |
 | `PostMessageW` 在**小窗口**下用客户端坐标必须失败 | 本例两者都成功只是几何巧合（结论 2） | `E-INJECT-1` 追加组 |
 
@@ -2916,7 +2954,8 @@ fn choose(target: &ScrollTarget, probe: &ProbeResult) -> InjectPath {
 
 | 目标 | 方法 | 判据 |
 |---|---|---|
-| 窗口级捕获可用 | `E-CAP-1`：对 Chrome / Edge / Electron / WinUI3 / 记事本 各创建一次窗口级捕获项 | 每目标都能拿到非黑帧，且**覆盖层不在帧里** |
+| 窗口级捕获可用 | **已实测（`E-CAP-1` 最小版，§24.2.1）**：`CreateForWindow` 对 Chrome / Edge / Electron（附着 Typora）/ WinUI3（打包版计算器）/ 记事本 各取 10 帧 | 五臂**全部非黑帧**、`Recreate` **0 次**；WebView2 记为"未取得"（无宿主）；**仍待**"覆盖层不在帧里"的像素断言 |
+| 子窗口 HWND / 最小化窗口 | 对 `Chrome_RenderWidgetHostHWND` 子窗口、对一个 `SW_MINIMIZE` 后的窗口各调一次 `CreateForWindow` | **官方依据缺口**（§6.4 B9）→ 结论进 §36.2；`ScrollTarget` 的句柄语义暂按"顶层窗口且未最小化"实现 |
 | 跨帧复用正确 | 在 100 步会话中统计 pool 重建次数 | 0 次（除尺寸变化） |
 | 捕获选项探测（**两种相反的失败模式各一条**） | 在 `IsBorderRequired` 不可用的系统上跑（或注入 mock）；在 `IsCursorCaptureEnabled` 不可用的系统上跑 | 前者记 `CaptureOptionUnavailable`**且不静默**；后者**捕获照常成功**并退回掩码排除（`wgc.rs:106-108` 的 `?` 必须去掉） |
 | 遮挡 | 目标窗口被完全遮挡时继续跑 10 步 | 每步仍能 `Confirmed` |
@@ -3976,6 +4015,7 @@ if ($hits) { Write-Error "scroll/ must stay platform-free: $($hits -join '; ')";
 | **OQ-11** | 29,000 px 的提示阈值是否合适？ | 它**刻意对齐 PixPin**，但 PixPin 是单块画布而我们有条带存储 → **我们不需要在这个长度上提示** | `E-MEM-1` + 一条"§19 预览在 29,000 px 处的可读性"评审 | §17.6 的 `LONG_IMAGE_WARN_LENGTH` 取值（**纯 UI 参数，可随时改**） |
 | **OQ-12** | `E-DYN-1`（稀疏光流）到底要不要保留？ | 它的**唯一用途**是定位动态内容，而 §18.2 的降权可能已经足够 | `E-DYN-1`：在 `E-ACC-1` 的"动态占比 30%/60%"维度上加一次对比（有/无光流） | §18.4 的实现；**判据是"是否改善错误确定率"，不改善就删除**（AGENTS.md 第 6 条） |
 | **OQ-13** | DXGI `GetFrameMoveRects` 是否应作为显示器级回退路径的位移来源？ | 它是系统唯一"直接给出内容移动了多少"的信号（对 Desktop Duplication 有效），但 **v1 主路径走 WGC 用不到**（R-20/N7） | 只有在 P2 之后仍需"显示器级高质量"时才评估 | 不阻塞任何阶段；**记录以免遗忘** |
+| **OQ-14** | `CreateForWindow` 接受**子窗口** HWND 吗？**最小化**的窗口呢？ | **官方依据缺口**（§6.4 B9：Learn 系列页对两者都没有说明）；本机 `E-CAP-1` 只测了顶层窗口、且目标都未最小化 | `E-CAP-1` 追加两格：对 `Chrome_RenderWidgetHostHWND` 子窗口句柄、对一个 `SW_MINIMIZE` 后的窗口各取 10 帧 | `P2.01` 的 `ScrollTarget::validate`（若子窗口可用，"句柄必须是顶层窗口"这条约束可以放松）；若最小化不可用，§24.4 的"最小化 → 停止 + `Partial`"保持不变 |
 
 ### 36.3 明确**不是**开放问题的（已经确定，记录以防反复）
 
