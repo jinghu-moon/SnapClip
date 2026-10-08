@@ -1843,6 +1843,29 @@ scene_cut := (zncc2d(d_0=0) < 0.50) && (∀ i: alignment_error(d_i) > 0.60)
 - **依据**：F-02 的已确证失败模式——相位相关在 `0/0 → NaN` 时**从越界兜底返回 `(−N/2, −M/2)`**；OpenCV PR #29871 的复现给出 `(-32,-32)`（64×64 输入）。虽然 V2 不用相位相关，但**这条禁令的价值超出相位相关**：`±N/2`/`±M/2` 是任何"越界/未定义/环绕"路径的共同落点。它是一条**成本近乎为零的防御性硬规则**。
 - 命中时的 `Displacement.status = None`（不是 `Uncertain`）——因为这不是"图像不果断"，而是**算法走到了未定义分支**，必须**可见**（G12）。
 
+#### 16.9.1 落地的类型形状：状态是枚举载荷，不是标志位 + 裸值（`P1.04`，2026-10-08）
+
+`P1.04` 的 GREEN 一行曾写作扁平结构（`struct Displacement { d: i32, confidence: f32, evidence: Evidence, status: Status }` + `enum Status { Confirmed, Uncertain, None }`）。执行时发现它与"三态穷举无冗余"及本节"`None` 是一个**可见的答案**"的要求**互相矛盾**：扁平 `d` 在 `None` 态必然留下一个悬空值，而占位 `0` 与 `i32::MIN` 都是"没有答案"的**第二种拼法**——第二种拼法恰恰是调用方会忘记检查的那种。落地的形状因此是**把载荷放进枚举**：
+
+```rust
+pub(crate) enum Status {
+    Confirmed { d: i32 },
+    Uncertain { d: i32 },
+    None,                 // no field: a `None` has nowhere to hide a value
+}
+
+pub(crate) struct Displacement { status: Status, confidence: f32, evidence: Evidence }
+```
+
+四条理由：
+
+1. `None` 变体**没有字段可写** ⇒ 本节"命中时 `status = None`"与 §16.10"`None` = 有候选但全部未过门"在**类型层面**成立，不依赖注释，也不会随实现漂移。
+2. **不提供 `d() -> Option<i32>` 访问器**：那等于把"没有答案"的第二种拼法放回 API（`Option::None` 是 `None` 态的同义写法）。消费者必须 `match status()`，于是**每一处**消费位移的地方都被编译器要求处理"没有位移"这一情形。
+3. `confidence` 由 `Evidence` 在构造器内推导，不由调用方传入 ⇒ 单一真源；`Evidence.coverage` 同理由 `tiles` 推导（`min(1, tiles/12)`）而**不与它并列存储**（两个字段会各自漂移）。
+4. 整个类型是 `pub(crate)`：`confidence` 及其权重都是**可校准**的（§16.11），一旦成为公开 API 就变成兼容性承诺（§27.1）。
+
+`Evidence` 的字段 = §16.7 两条公式的项（`zncc2d` / `gain` / `margin` / `tiles`），`score()` 与 `confidence()` 的 7 个权重提为**具名常量**，`E-ACC-1` 校准时只改这一处。**`scene_cut` 不在这里**：它属于 `Evidence`（`P1.12` 落地），这样它永远不会变成 `StopReason`（与 §20.4"`MatchFailed` 不是 `StopReason`"同源）。
+
 ### 16.10 `status` → 行为的完整映射
 
 | `status` | 含义 | 画布动作 | 会话动作 | 参照帧 | `ĝ` 更新 | UI |
@@ -1854,6 +1877,10 @@ scene_cut := (zncc2d(d_0=0) < 0.50) && (∀ i: alignment_error(d_i) > 0.60)
 | `Ended` | §11.1 的帧源给出 `Ended(reason)` | 不提交 | 进入终点处理 | — | — | 停止原因 + 导出 |
 
 **"参照帧推进"在三种失败状态下都发生**，这是 C2 的核心：参考实现用 `previous_raw = incoming; previous_raw_index = index` 并在 `NoMovement` 上**也执行**（测试名 `non_skip_advances_previous_raw_even_without_motion`）；PixPin 的官方文案也要求"回到上次成功匹配的帧继续"。**唯一不推进参照帧的情形是 `Skip`（行指纹逐行相等的精确重复）**——那时新观测与旧观测在内容上完全一样，推进没有意义。
+
+**这张表只有一处实现**：`Displacement::effect()`（`P1.04`）把"`status` → 画布动作"编译成 `StepEffect { Commit, Continue, Skip }` 的一个 `match`，因此"**不提交画布 + 继续会话**"是**一个分支**，而不是一条每个消费者都要重新推导的规则（`Uncertain` 与 `None` 落到同一支，正是上表那两行的合并）。任何"我在这里再判一次 `status`"的写法都是本表的第二份副本，应改为消费 `effect()`——两份副本迟早会在某一态上分叉，而分叉的那一态一定是"是否提交画布"。
+
+**`Skip` 不由 `effect()` 产出**：`Skip` 对应行指纹逐行相等的精确重复，它在**位移产生之前**就已判定（见上一段的注），此时不存在一个 `Displacement` 可供询问——所以 `effect()` 永不返回它（`P1.04` 的测试对三个状态都断言了这一点）。把 `Skip` 放进 `StepEffect` 的价值在于让"第三种结果"与 `Continue` **不可混淆**：两者的差别恰好是**是否推进参照帧**，而那正是 C2 的边界（`P1.12`/`P1.21` 消费这两个变体）。
 
 ### 16.11 参数总表（含校准状态）
 
