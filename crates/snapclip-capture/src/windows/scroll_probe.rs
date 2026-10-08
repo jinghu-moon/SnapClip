@@ -110,18 +110,19 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
-    MOUSEEVENTF_MOVE, MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput, SetFocus, VK_DOWN,
+    MOUSEEVENTF_MOVE, MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput, SetFocus, VK_DOWN, VK_MENU,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CWP_SKIPINVISIBLE, ChildWindowFromPointEx, CreateWindowExW, DefWindowProcW, DestroyWindow,
     DispatchMessageW, ES_AUTOVSCROLL, ES_MULTILINE, EnumWindows, GetClassNameW, GetClientRect,
-    GetCursorPos, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId, HWND_TOPMOST,
-    IsWindowVisible, MSG,
+    GetCursorPos, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId, HWND_TOP,
+    HWND_TOPMOST,
+    IsIconic, IsWindowVisible, MSG,
     PM_REMOVE, PeekMessageW, PostMessageW, RegisterClassW, SB_LINEDOWN, SPI_GETMOUSEWHEELROUTING,
     SPI_GETWHEELSCROLLLINES, SW_RESTORE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SendMessageW,
     SetCursorPos, SetForegroundWindow, SetWindowPos, ShowWindow, SystemParametersInfoW,
     TranslateMessage, WM_ERASEBKGND, WM_MOUSEWHEEL, WM_PAINT, WM_VSCROLL, WNDCLASSW,
-    WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL,
+    WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL, WindowFromPoint,
 };
 
 use crate::geometry::{Point, Rect};
@@ -437,6 +438,19 @@ fn bring_to_front(hwnd: HWND, require_focus: bool) {
         SetForegroundWindow(hwnd);
     }
     pump_for(Duration::from_millis(700));
+    if unsafe { GetForegroundWindow() } != hwnd {
+        // The foreground lock refuses a plain `SetForegroundWindow` while another process owns
+        // the foreground, and it refuses silently — which would turn this arm into a negative
+        // answer it never tested. Injecting a key press makes this process the source of the
+        // last input, one of the documented conditions that lifts the lock, so the retry after
+        // the tap is what the lock accepts. A bare Alt press opens no menu.
+        let _ = send_input_keys(VK_MENU, 1);
+        pump_for(Duration::from_millis(150));
+        unsafe {
+            SetForegroundWindow(hwnd);
+        }
+        pump_for(Duration::from_millis(400));
+    }
     if require_focus {
         unsafe {
             SetFocus(hwnd);
@@ -705,9 +719,117 @@ fn row_signature(bitmap: &bitblt::CapturedBitmap) -> Vec<f64> {
         .collect()
 }
 
+/// Below this, a captured client area has no row structure to track: a blank page, a page
+/// already scrolled to its end, an empty editor. Movement cannot be observed there at all,
+/// so a zero in that row says nothing about whether the wheel arrived.
+const FLAT_SIGNATURE_VARIANCE: f64 = 1e-5;
+
+/// The smallest client area an arm is allowed to aim at.
+///
+/// A window smaller than this is not a scrolling surface a user would point at: Windows
+/// parks minimized windows off-screen instead of resizing them, so a tiny client area is
+/// how a helper or a shadow window shows up in a window enumeration.
+const MIN_USABLE_CLIENT_AREA: i64 = 300 * 300;
+
+/// The client area of a window, or `None` if it has none.
+fn client_area(hwnd: HWND) -> Option<i64> {
+    let client = client_rect_of(hwnd)?;
+    Some(i64::from(client.width().max(0)) * i64::from(client.height().max(0)))
+}
+
+/// What the arm is about to aim at, printed before it runs.
+///
+/// Every zero in the matrix has two readings — the wheel never arrived, or there was
+/// nothing to scroll — and only the target's own state can separate them. This is the
+/// state: who the window is, where the wheel will land, and whether the captured area has
+/// any structure to move.
+fn describe_scroll_target(label: &'static str, root: HWND, client: Rect) -> Result<f64, String> {
+    let center = Point::new(
+        (client.left + client.right) / 2,
+        (client.top + client.bottom) / 2,
+    );
+    let deepest = deepest_child_at(root, center);
+    let variance = signature_variance(&capture_signature(client)?);
+    let flat = if variance < FLAT_SIGNATURE_VARIANCE {
+        " FLAT (nothing to scroll here)"
+    } else {
+        ""
+    };
+    let owner = process_image_path(root)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "<unknown process>".to_string());
+    eprintln!(
+        "[P0.09] {label}: title {:?} class {} owned by {owner} child {} variance {variance:.8}{flat} client {client:?}",
+        window_title(root),
+        window_class(root),
+        window_class(deepest),
+    );
+    let under_cursor = unsafe { WindowFromPoint(POINT { x: center.x, y: center.y }) };
+    eprintln!(
+        "[P0.09] {label}: WindowFromPoint({}, {}) is {under_cursor:?} class {}",
+        center.x,
+        center.y,
+        window_class(under_cursor),
+    );
+    Ok(variance)
+}
+
+/// Where the page itself says it is scrolled to, read from its window title.
+///
+/// The fixture keeps a ` y=<scrollY>` suffix on the title it is given, so the probes get a
+/// measurement channel that never touches pixels. It exists because a captured area can be
+/// flat — blank, at the end of the document — while the page is scrolling perfectly well,
+/// and because a client area can be smaller than the window's landing point. A zero in the
+/// capture column and a zero here mean different things.
+fn scroll_y_from_title(title: &str) -> Option<i32> {
+    let (_, value) = title.rsplit_once(" y=")?;
+    value.trim().parse().ok()
+}
+
+fn page_scroll_y(hwnd: HWND) -> Option<i32> {
+    scroll_y_from_title(&window_title(hwnd))
+}
+
+/// Print what the page says about its own position, before and after an arm.
+///
+/// Silent for windows that do not report one, so the log only grows for the targets whose
+/// answer can be cross-checked.
+fn report_page_delta(label: &str, transport: Transport, before: Option<i32>, after: Option<i32>) {
+    if before.is_none() && after.is_none() {
+        return;
+    }
+    match (before, after) {
+        (Some(before), Some(after)) => eprintln!(
+            "[P0.09] {label} {transport:?}: the page says y {before} -> {after} (moved {})",
+            after - before
+        ),
+        _ => eprintln!("[P0.09] {label} {transport:?}: the page reports y {before:?} -> {after:?}"),
+    }
+}
+
 fn capture_signature(client: Rect) -> Result<Vec<f64>, String> {
     let bitmap = bitblt::capture_rect(client)?;
     Ok(row_signature(&bitmap))
+}
+
+/// How much a signature varies between its rows.
+///
+/// A zero movement row in the matrix has two readings that the movement number alone cannot
+/// tell apart: the wheel never reached the scrolling surface, or the surface had nothing to
+/// scroll. A flat region — a blank page, a page scrolled to its end, an empty editor — is
+/// the second reading, and it is flat whatever the wheel does, so its variance is what
+/// decides whether a zero is evidence about injection at all.
+fn signature_variance(signature: &[f64]) -> f64 {
+    if signature.is_empty() {
+        return 0.0;
+    }
+    let count = signature.len() as f64;
+    let mean = signature.iter().sum::<f64>() / count;
+    signature
+        .iter()
+        .map(|value| (value - mean).powi(2))
+        .sum::<f64>()
+        / count
 }
 
 /// Capture until two consecutive frames agree, so that Chromium's smooth
@@ -1160,6 +1282,19 @@ impl Outcome {
     }
 }
 
+/// Whether this arm is responsible for placing the cursor before it injects a wheel.
+///
+/// Normally it is: under `MOUSE_POS` routing the wheel goes to whatever window is under the
+/// cursor, so an arm that means to measure one window has to put the cursor over it first. A
+/// lower-integrity sender cannot do that — `SetCursorPos` fails and leaves the last error at 0
+/// — so for the integrity arm the operator places the cursor with a higher-integrity helper
+/// and sets `SNAPCLIP_UIPI_NO_AIM`, which leaves only the injection step under test. Without
+/// that split the arm reports "the cursor could not be placed" and says nothing about whether
+/// the wheel itself would have been delivered.
+fn arm_places_the_cursor() -> bool {
+    std::env::var_os("SNAPCLIP_UIPI_NO_AIM").is_none()
+}
+
 /// Run one arm: settle, capture, inject, settle, measure.
 fn run_arm(
     target: &'static str,
@@ -1204,10 +1339,25 @@ fn run_arm(
                 (client.left + client.right) / 2,
                 (client.top + client.bottom) / 2,
             );
-            if unsafe { SetCursorPos(center.x, center.y) } == FALSE {
-                outcome.error = Some("SetCursorPos failed".into());
+            if arm_places_the_cursor() && unsafe { SetCursorPos(center.x, center.y) } == FALSE {
+                outcome.error = Some(format!(
+                    "SetCursorPos to ({}, {}) failed (Win32 error {})",
+                    center.x,
+                    center.y,
+                    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+                ));
                 return outcome;
             }
+            // Under `MOUSE_POS` routing the wheel goes wherever the cursor is, which is not
+            // necessarily the window this arm means to measure: a topmost fixture, another
+            // browser at the same coordinates, or a separate input window of the same
+            // application. Printing the aim is what separates "the target ignored the wheel"
+            // from "the wheel was never aimed at the target".
+            let aimed = unsafe { WindowFromPoint(POINT { x: center.x, y: center.y }) };
+            eprintln!(
+                "[P0.6] {target}: the wheel is aimed at {aimed:?} class {} (target {root:?})",
+                window_class(aimed)
+            );
             send_input_notches(notches)
         }
         Transport::PostMessage => {
@@ -1297,9 +1447,25 @@ fn run_arm_stepwise(
     for step in 0..steps {
         let delivery = match transport {
             Transport::SendInput => {
-                if unsafe { SetCursorPos(center.x, center.y) } == FALSE {
-                    outcome.error = Some("SetCursorPos failed".into());
+                if arm_places_the_cursor() && unsafe { SetCursorPos(center.x, center.y) } == FALSE {
+                    outcome.error = Some(format!(
+                    "SetCursorPos to ({}, {}) failed (Win32 error {})",
+                    center.x,
+                    center.y,
+                    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+                ));
                     return outcome;
+                }
+                if step == 0 {
+                    // Under `MOUSE_POS` routing the wheel goes wherever the cursor is, which
+                    // is not necessarily the window this arm means to measure. Printing the
+                    // aim separates "the target ignored the wheel" from "the wheel was never
+                    // aimed at the target".
+                    let aimed = unsafe { WindowFromPoint(POINT { x: center.x, y: center.y }) };
+                    eprintln!(
+                        "[P0.6] {target}: the wheel is aimed at {aimed:?} class {} (target {root:?})",
+                        window_class(aimed)
+                    );
                 }
                 send_input_notches(1)
             }
@@ -2632,7 +2798,15 @@ fn electron_candidates() -> Vec<PathBuf> {
 /// Matching on the owning process rather than on the window title is what makes this
 /// correct: `Chrome_WidgetWin_1` is shared, and an Electron window's title is the
 /// document it happens to have open.
+///
+/// A process usually owns several of these windows, and the first one found is often not
+/// the content window: `Qoder IDE` parked a `Quest Window` at `(-31989, -32000)`, which is
+/// where Windows puts a minimized window. `IsWindowVisible` is true for a minimized window
+/// and `BitBlt` of that rectangle returns a flat block, so the arm would have measured a
+/// piece of the desktop that no one can see. The largest non-minimized window that has a
+/// client area is the one a user would point at.
 fn find_running_electron(executable_name: &str) -> Option<(WindowInfo, PathBuf)> {
+    let mut best: Option<(WindowInfo, PathBuf, i64)> = None;
     for window in visible_windows() {
         if window.class != CHROMIUM_WINDOW_CLASS {
             continue;
@@ -2644,11 +2818,24 @@ fn find_running_electron(executable_name: &str) -> Option<(WindowInfo, PathBuf)>
             .file_name()
             .map(|name| name.to_string_lossy().eq_ignore_ascii_case(executable_name))
             .unwrap_or(false);
-        if matches {
-            return Some((window, path));
+        if !matches {
+            continue;
+        }
+        if unsafe { IsIconic(window.hwnd) } != FALSE {
+            continue;
+        }
+        let Some(area) = client_area(window.hwnd) else {
+            continue;
+        };
+        let better = match &best {
+            Some((_, _, best_area)) => area > *best_area,
+            None => true,
+        };
+        if better {
+            best = Some((window, path, area));
         }
     }
-    None
+    best.map(|(window, path, _)| (window, path))
 }
 
 /// Electron, played in the order this machine actually requires.
@@ -2732,44 +2919,60 @@ fn webview2_runtime_versions() -> Vec<String> {
     versions
 }
 
+/// Start a Chromium browser on the repository's demo page.
+///
+/// `anchor` is appended to the file URL. It exists because the demo's first screen is its
+/// text block, and a shift measured against text measures the 19 px line carrier rather
+/// than the page: P0.06 read 10–25 px there for a scroll that had really moved 800 px, and
+/// the same arms read 800 px once they were aimed at the texture region. The scroll probes
+/// jump to the texture; the capture probe asks for the page as delivered and passes `""`.
+fn launch_chromium_target(
+    kind: CaptureTargetKind,
+    scratch: &Path,
+    token: &str,
+    anchor: &str,
+) -> Result<LaunchedTarget, String> {
+    let known = window_handles();
+    let label = kind.label();
+    let executable = match kind {
+        CaptureTargetKind::Chrome => find_chrome(),
+        _ => find_edge(),
+    }
+    .ok_or_else(|| format!("{label} is not installed: no executable at any known path"))?;
+    let dir = scratch.join(label);
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("could not create scratch dir {dir:?}: {error}"))?;
+    let title = format!("snapclip-probe-{token}-{label}");
+    let html = write_chromium_fixture(&dir, &title)?;
+    let profile = dir.join("profile");
+    let url = format!("{}{anchor}", file_url(&html));
+    let process = launch_chromium(&executable, &url, &profile)?;
+    let window = wait_for_new_window(
+        &known,
+        WindowMatch::TitleContains(&title),
+        Duration::from_secs(30),
+    )
+    .ok_or_else(|| {
+        format!("{label} started but no window titled {title:?} appeared within 30s")
+    })?;
+    Ok(LaunchedTarget {
+        kill_pid: pid_of_window(window.hwnd),
+        window: window.hwnd,
+        class: window.class,
+        process: Some(process),
+        note: format!("{} on {url}", executable.display()),
+    })
+}
+
 fn launch_capture_target(
     kind: CaptureTargetKind,
     scratch: &Path,
     token: &str,
 ) -> Result<LaunchedTarget, String> {
     let known = window_handles();
-    let label = kind.label();
     match kind {
         CaptureTargetKind::Chrome | CaptureTargetKind::Edge => {
-            let executable = match kind {
-                CaptureTargetKind::Chrome => find_chrome(),
-                _ => find_edge(),
-            }
-            .ok_or_else(|| {
-                format!("{label} is not installed: no executable at any known path")
-            })?;
-            let dir = scratch.join(label);
-            std::fs::create_dir_all(&dir)
-                .map_err(|error| format!("could not create scratch dir {dir:?}: {error}"))?;
-            let title = format!("snapclip-probe-{token}-{label}");
-            let html = write_chromium_fixture(&dir, &title)?;
-            let profile = dir.join("profile");
-            let process = launch_chromium(&executable, &file_url(&html), &profile)?;
-            let window = wait_for_new_window(
-                &known,
-                WindowMatch::TitleContains(&title),
-                Duration::from_secs(30),
-            )
-            .ok_or_else(|| {
-                format!("{label} started but no window titled {title:?} appeared within 30s")
-            })?;
-            Ok(LaunchedTarget {
-                kill_pid: pid_of_window(window.hwnd),
-                window: window.hwnd,
-                class: window.class,
-                process: Some(process),
-                note: executable.display().to_string(),
-            })
+            launch_chromium_target(kind, scratch, token, "")
         }
         CaptureTargetKind::Notepad => {
             // The absolute path is used on purpose: `notepad.exe` is subject to Image
@@ -3016,4 +3219,717 @@ fn capture_probe() {
             ),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// P0.09 / E-INJECT-1 (completion): the third state of an injection
+// ---------------------------------------------------------------------------
+
+/// What an injected wheel turned out to be.
+///
+/// `PostMessageW` returning `TRUE` says one thing only: a thread queue accepted the
+/// message. `docs/30 §24.6.2` turns on the difference between "the target refused it",
+/// "the target ignored it" and "the target acted on it" — an arm that reports only
+/// "no movement" cannot distinguish a target limitation from a transport failure, and
+/// the two call for opposite design responses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Delivery {
+    /// The message reached a queue and the target acted on it.
+    Consumed,
+    /// The message reached a queue and the target's behaviour did not change.
+    EnqueuedButNotConsumed,
+    /// Nothing accepted the message: the post itself was refused.
+    Unreached,
+}
+
+fn classify_delivery(posted: bool, moved_px: i32) -> Delivery {
+    if !posted {
+        Delivery::Unreached
+    } else if moved_px != 0 {
+        Delivery::Consumed
+    } else {
+        Delivery::EnqueuedButNotConsumed
+    }
+}
+
+#[test]
+fn the_probe_distinguishes_rejected_from_unreached() {
+    // Three states, and the matrix is unreadable if any two are collapsed:
+    //   Consumed               - the target acted on the wheel
+    //   EnqueuedButNotConsumed - `PostMessageW` returned TRUE and the target ignored it
+    //   Unreached              - nothing accepted the post at all
+    //
+    // The live halves are produced by `the_probe_produces_all_three_delivery_states`
+    // on a real desktop; this test pins the classification itself.
+    assert_eq!(classify_delivery(true, 120), Delivery::Consumed);
+    assert_eq!(
+        classify_delivery(true, 0),
+        Delivery::EnqueuedButNotConsumed,
+        "a post that was accepted and changed nothing is not a delivery failure"
+    );
+    assert_eq!(
+        classify_delivery(false, 0),
+        Delivery::Unreached,
+        "a refused post is not evidence about the target's handling"
+    );
+    // A refused post cannot have moved anything, so this pair is unreachable by
+    // construction — the post is checked first on purpose, and the ordering is asserted
+    // rather than left to a reader's assumption.
+    assert_eq!(classify_delivery(false, 120), Delivery::Unreached);
+}
+
+#[test]
+fn a_flat_capture_area_reports_no_variance() {
+    // The matrix's zeros are only readable together with this number: an area with no row
+    // structure cannot show movement, so its zero is not evidence about injection.
+    assert_eq!(signature_variance(&[]), 0.0);
+    assert_eq!(signature_variance(&[0.5, 0.5, 0.5, 0.5]), 0.0);
+    assert!(
+        signature_variance(&[0.0, 1.0, 0.0, 1.0]) > FLAT_SIGNATURE_VARIANCE,
+        "alternating full-black and full-white rows are structure, not a flat area"
+    );
+    assert!(
+        signature_variance(&[0.5, 0.5, 0.5, 0.500001]) < FLAT_SIGNATURE_VARIANCE,
+        "a page whose rows differ by less than the flatness threshold has nothing to track"
+    );
+}
+
+/// Produce the three states on real windows.
+///
+/// `WheelFixture` counts what its own window procedure consumed, and the `EDIT` fixture is
+/// a real target that accepts a posted wheel and does not act on it — those two plus a
+/// handle that is not a window cover every state the injection matrix reports.
+#[test]
+#[ignore = "P0.09: needs a real interactive desktop"]
+fn the_probe_produces_all_three_delivery_states() {
+    let _ = monitor::set_per_monitor_v2_awareness();
+
+    // 1. Consumed: our own window procedure counted the wheel.
+    let wheel = WheelFixture::create(Rect::from_origin_size(Point::new(120, 100), 900, 700))
+        .expect("creating the wheel fixture");
+    bring_to_front(wheel.hwnd, true);
+    let client = wheel.client_rect().expect("wheel fixture client rect");
+    let center = Point::new(
+        (client.left + client.right) / 2,
+        (client.top + client.bottom) / 2,
+    );
+    let received_before = wheel.wheels_received();
+    let posted = post_message_notches(wheel.hwnd, center, CoordSpace::Client, 1).is_ok();
+    let consumed = wheel.wheels_received().saturating_sub(received_before);
+    assert_eq!(
+        classify_delivery(posted, i32::try_from(consumed).unwrap_or(i32::MAX)),
+        Delivery::Consumed,
+        "the fixture received {consumed} wheel messages and the post reported {posted}"
+    );
+
+    // 2. EnqueuedButNotConsumed: an `EDIT` control takes the post and ignores the wheel.
+    let lines = random_lines(1400, 0x0F09_1234);
+    let edit = EditFixture::create(&lines, Rect::from_origin_size(Point::new(80, 60), 900, 700))
+        .expect("creating the EDIT fixture");
+    bring_to_front(edit.hwnd, true);
+    let edit_client = edit.client_rect().expect("EDIT client rect");
+    let edit_center = Point::new(
+        (edit_client.left + edit_client.right) / 2,
+        (edit_client.top + edit_client.bottom) / 2,
+    );
+    let line_before = edit.first_visible_line();
+    let edit_posted = post_message_notches(edit.hwnd, edit_center, CoordSpace::Client, 4).is_ok();
+    let line_after = edit.first_visible_line();
+    assert_eq!(
+        classify_delivery(edit_posted, line_after - line_before),
+        Delivery::EnqueuedButNotConsumed,
+        "the EDIT control reported line {line_before} -> {line_after} and the post reported {edit_posted}"
+    );
+
+    // 3. Unreached: a handle that is not a window.
+    let bogus: HWND = 0xDEAD_BEEF_usize as *mut core::ffi::c_void;
+    let refused = post_message_notches(bogus, Point::new(10, 10), CoordSpace::Client, 1);
+    assert!(
+        refused.is_err(),
+        "posting to a handle that is not a window was accepted, so the matrix cannot tell \
+         a refused post from an ignored one"
+    );
+    assert_eq!(
+        classify_delivery(false, 0),
+        Delivery::Unreached,
+        "a post that was refused is Unreached"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P0.09 / E-INJECT-1: the injection matrix
+// ---------------------------------------------------------------------------
+
+/// The scrollable targets the injection matrix runs against.
+///
+/// Chrome is the reference the other browsers are compared with. Settings stands in for a
+/// packaged application because the calculator — P0.05's capture target — has nothing to
+/// scroll, and an arm aimed at it could not tell "injection failed" from "there was
+/// nothing to scroll".
+#[derive(Clone, Copy, Debug)]
+enum ScrollTargetKind {
+    Chrome,
+    Edge,
+    PackagedApp,
+}
+
+impl ScrollTargetKind {
+    const ALL: [Self; 3] = [Self::Chrome, Self::Edge, Self::PackagedApp];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Chrome => "chrome",
+            Self::Edge => "edge",
+            Self::PackagedApp => "winui3",
+        }
+    }
+
+    fn capture_kind(self) -> CaptureTargetKind {
+        match self {
+            Self::Chrome => CaptureTargetKind::Chrome,
+            Self::Edge => CaptureTargetKind::Edge,
+            Self::PackagedApp => CaptureTargetKind::WinUi3,
+        }
+    }
+}
+
+/// The page the packaged-application scroll arm asks for.
+///
+/// The home page of Settings is a short list that fits on a 1080p screen, so an arm aimed at
+/// it could not tell "injection failed" from "there was nothing to scroll" — the same
+/// objection that moved `P0.05`'s capture target off the calculator. The installed-apps list
+/// is thousands of pixels long, and a URI navigates the instance that is already running, so
+/// the second and later runs of the probe keep pointing at the long page.
+const PACKAGED_SETTINGS_PAGE: &str = "ms-settings:appsfeatures";
+
+/// A packaged application window that is already open, if there is one.
+///
+/// The class alone is not a window: the shell keeps a hidden `ApplicationFrameWindow` for
+/// every packaged application it knows about, and P0.05 measured one at `0,0,2560,1392`
+/// with `DWMWA_CLOAKED = 2` and an empty title. A frame with a title and a real client
+/// area is the application's own.
+///
+/// Attaching matters as much as finding: starting an application that is already running
+/// opens no new window, so a launch-and-wait arm times out against the very window it
+/// wants, and the second run of a probe would report "unavailable" for a target that is
+/// sitting right there.
+fn find_packaged_window() -> Option<WindowInfo> {
+    let mut best: Option<(WindowInfo, i64)> = None;
+    for window in visible_windows() {
+        if window.class != PACKAGED_APP_WINDOW_CLASS {
+            continue;
+        }
+        if unsafe { IsIconic(window.hwnd) } != FALSE || window.title.trim().is_empty() {
+            continue;
+        }
+        let Some(area) = client_area(window.hwnd) else {
+            continue;
+        };
+        if area < MIN_USABLE_CLIENT_AREA {
+            continue;
+        }
+        let better = match &best {
+            Some((_, best_area)) => area > *best_area,
+            None => true,
+        };
+        if better {
+            best = Some((window, area));
+        }
+    }
+    best.map(|(window, _)| window)
+}
+
+fn launch_packaged_scroll_target() -> Result<LaunchedTarget, String> {
+    let known = window_handles();
+    // The page matters as much as the application: the home page of Settings is a short list
+    // that fits on a 1080p screen, so an arm aimed at it could not tell "injection failed"
+    // from "there was nothing to scroll" — the same objection that moved P0.05's capture
+    // target off the calculator. The installed-apps list is thousands of pixels long, and a
+    // URI navigates the instance that is already running, so the second and later runs of
+    // this probe keep pointing at the long page instead of a fresh home screen.
+    let process = Command::new("explorer.exe")
+        .arg(PACKAGED_SETTINGS_PAGE)
+        .spawn()
+        .map_err(|error| {
+            format!("could not ask explorer.exe to open {PACKAGED_SETTINGS_PAGE}: {error}")
+        })?;
+    // A packaged application is single-instance, so a page request usually opens no new
+    // window: wait briefly, then attach to the frame that is already there.
+    if let Some(window) = wait_for_new_window(
+        &known,
+        WindowMatch::Class(PACKAGED_APP_WINDOW_CLASS),
+        Duration::from_secs(8),
+    ) {
+        return Ok(LaunchedTarget {
+            kill_pid: pid_of_window(window.hwnd),
+            window: window.hwnd,
+            class: window.class,
+            process: Some(process),
+            note: format!("{PACKAGED_SETTINGS_PAGE} in a new window"),
+        });
+    }
+    let window = find_packaged_window().ok_or_else(|| {
+        format!(
+            "no window of class {PACKAGED_APP_WINDOW_CLASS} appeared within 8s and none was open: {}",
+            new_window_classes(&known)
+        )
+    })?;
+    Ok(LaunchedTarget {
+        window: window.hwnd,
+        class: window.class,
+        // Never killed: this is an application the user may be using.
+        kill_pid: None,
+        process: None,
+        note: format!(
+            "{PACKAGED_SETTINGS_PAGE} navigated the running instance, title {:?}",
+            window.title
+        ),
+    })
+}
+
+/// A label that outlives the call.
+///
+/// `Outcome::target` is a `&'static str` because every arm in the table has a compile-time
+/// name, and widening the report type to `String` for the sake of one arm that is
+/// discovered at run time would cost every reader of the table. Leaking a handful of short
+/// strings inside an `#[ignore]` probe is cheaper than that.
+fn leak_label(text: &str) -> &'static str {
+    Box::leak(text.to_owned().into_boxed_str())
+}
+
+/// Attach to every Electron application that is running right now.
+///
+/// Nothing is opened in them on purpose: these are the user's applications, and handing
+/// one a document could replace an unsaved file or block on a save prompt. The arms
+/// scroll whatever the window already shows, so an application whose content is not
+/// scrollable reports zero movement *with its name attached* — a fact about that
+/// application, not a silent hole in the matrix.
+fn running_electrons() -> Vec<(&'static str, LaunchedTarget)> {
+    let mut targets = Vec::new();
+    for candidate in electron_candidates() {
+        let Some(name) = candidate
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+        else {
+            continue;
+        };
+        let Some((window, path)) = find_running_electron(&name) else {
+            continue;
+        };
+        let stem = candidate
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| name.clone());
+        targets.push((
+            leak_label(&format!("electron-{stem}")),
+            LaunchedTarget {
+                window: window.hwnd,
+                class: window.class,
+                kill_pid: None,
+                process: None,
+                note: format!(
+                    "attached to running {} (owned by {})",
+                    candidate.display(),
+                    path.display()
+                ),
+            },
+        ));
+    }
+    targets
+}
+
+fn launch_scroll_target(
+    kind: ScrollTargetKind,
+    scratch: &Path,
+    token: &str,
+) -> Result<LaunchedTarget, String> {
+    match kind {
+        ScrollTargetKind::Chrome | ScrollTargetKind::Edge => {
+            launch_chromium_target(kind.capture_kind(), scratch, token, DEMO_TEXTURE_ANCHOR)
+        }
+        ScrollTargetKind::PackagedApp => launch_packaged_scroll_target(),
+    }
+}
+
+/// P0.09's injection matrix.
+///
+/// Four questions, and each is a row of the report:
+///   1. every reachable target under both transports;
+///   2. the integrity-level pair — in `uipi_probe`, because it needs a sender this
+///      process cannot become;
+///   3. `SendInput` while the target is *not* the foreground window, which is what
+///      `SPI_GETMOUSEWHEELROUTING` decides;
+///   4. a client area smaller than the window's landing point: client vs screen `lParam`.
+///
+/// Electron arms scroll the windows of applications the operator already has open. Nothing
+/// is written to them and nothing is killed; the report names each one.
+#[test]
+#[ignore = "P0.09: needs a real interactive desktop and installed targets"]
+fn inject_matrix_probe() {
+    let _ = monitor::set_per_monitor_v2_awareness();
+
+    let token = format!(
+        "{:08x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
+    );
+    let scratch = std::env::temp_dir().join(format!("snapclip-p09-{token}"));
+    std::fs::create_dir_all(&scratch).expect("creating the probe scratch dir");
+
+    let steps = 8;
+    let mut outcomes: Vec<Outcome> = Vec::new();
+
+    // The routing setting decides what a `SendInput` wheel is aimed at, so it is part of
+    // the result rather than context around it (P0.07).
+    match read_mouse_wheel_routing() {
+        Ok(raw) => eprintln!(
+            "[P0.09] SPI_GETMOUSEWHEELROUTING = {raw} ({})",
+            ROUTING_NAMES.get(raw as usize).copied().unwrap_or("unknown")
+        ),
+        Err(error) => eprintln!("[P0.09] SPI_GETMOUSEWHEELROUTING could not be read: {error}"),
+    }
+    match read_wheel_scroll_lines() {
+        Ok(raw) => match classify_wheel_lines(raw) {
+            WheelLines::Lines(lines) => {
+                eprintln!("[P0.09] SPI_GETWHEELSCROLLLINES = {lines} lines per notch")
+            }
+            WheelLines::Page => eprintln!("[P0.09] SPI_GETWHEELSCROLLLINES = WHEEL_PAGESCROLL"),
+            WheelLines::None => eprintln!("[P0.09] SPI_GETWHEELSCROLLLINES = 0 (no scrolling)"),
+        },
+        Err(error) => eprintln!("[P0.09] SPI_GETWHEELSCROLLLINES could not be read: {error}"),
+    }
+    match send_input_liveness() {
+        Ok(delta) => eprintln!("[P0.09] SendInput liveness: a +40 px move moved {delta} px"),
+        Err(error) => panic!("P0.09 environment failure: {error}"),
+    }
+
+    // The positive control: a window of our own whose procedure counts what it consumed.
+    match WheelFixture::create(Rect::from_origin_size(Point::new(200, 140), 1000, 760)) {
+        Ok(fixture) => {
+            for transport in [Transport::SendInput, Transport::PostMessage] {
+                bring_to_front(fixture.hwnd, true);
+                let client = fixture.client_rect().expect("wheel fixture client rect");
+                outcomes.push(run_arm_stepwise(
+                    "win32-own",
+                    transport,
+                    CoordSpace::Client,
+                    fixture.hwnd,
+                    client,
+                    steps,
+                    None,
+                ));
+            }
+        }
+        Err(error) => panic!("the wheel fixture could not be created: {error}"),
+    }
+
+    let mut targets: Vec<(&'static str, LaunchedTarget)> = Vec::new();
+    for kind in ScrollTargetKind::ALL {
+        match launch_scroll_target(kind, &scratch, &token) {
+            Ok(launched) => {
+                eprintln!(
+                    "[P0.09] {}: {} (class {})",
+                    kind.label(),
+                    launched.note,
+                    launched.class
+                );
+                targets.push((kind.label(), launched));
+            }
+            Err(reason) => eprintln!("[P0.09] {}: UNAVAILABLE: {reason}", kind.label()),
+        }
+    }
+    for (label, launched) in running_electrons() {
+        eprintln!(
+            "[P0.09] {label}: {} (class {})",
+            launched.note, launched.class
+        );
+        targets.push((label, launched));
+    }
+
+    for (label, launched) in &targets {
+        let label: &'static str = label;
+        let root = launched.window;
+        let Some(client) = client_rect_of(root) else {
+            eprintln!("[P0.09] {label}: the window has no client rect; arm skipped");
+            continue;
+        };
+        bring_to_front(root, false);
+        if let Err(error) = describe_scroll_target(label, root, client) {
+            eprintln!("[P0.09] {label}: the pre-arm capture failed: {error}");
+            continue;
+        }
+        for transport in [Transport::SendInput, Transport::PostMessage] {
+            let before = page_scroll_y(root);
+            let outcome = run_arm_stepwise(
+                label,
+                transport,
+                CoordSpace::Client,
+                root,
+                client,
+                steps,
+                None,
+            );
+            report_page_delta(label, transport, before, page_scroll_y(root));
+            outcomes.push(outcome);
+        }
+        // The documented coordinate space, as a diagnostic: P0.06 found the two
+        // equivalent on Chromium, and `docs/30 §24.6.2` requires that equivalence.
+        {
+            let before = page_scroll_y(root);
+            let outcome = run_arm_stepwise(
+                label,
+                Transport::PostMessage,
+                CoordSpace::Screen,
+                root,
+                client,
+                4,
+                None,
+            );
+            report_page_delta(label, Transport::PostMessage, before, page_scroll_y(root));
+            outcomes.push(outcome);
+        }
+        // The control that separates the two readings of a zero: a window that never
+        // receives an injected key either is not receiving our input at all, or is
+        // receiving it and refusing the wheel.
+        {
+            let before = page_scroll_y(root);
+            let outcome = run_arm_stepwise(
+                label,
+                Transport::ArrowDown,
+                CoordSpace::Client,
+                root,
+                client,
+                8,
+                None,
+            );
+            report_page_delta(label, Transport::ArrowDown, before, page_scroll_y(root));
+            outcomes.push(outcome);
+        }
+    }
+
+    // 4. A client area smaller than the window's landing point: if the two coordinate
+    //    spaces stop agreeing here, the requirement is a hard constraint, not a detail.
+    if let Some(entry) = targets.iter().find(|entry| entry.0 == "chrome") {
+        let small = Rect::from_origin_size(Point::new(120, 120), 420, 320);
+        unsafe {
+            SetWindowPos(
+                entry.1.window,
+                HWND_TOP,
+                small.left,
+                small.top,
+                420,
+                320,
+                SWP_SHOWWINDOW,
+            );
+        }
+        pump_for(Duration::from_millis(1500));
+        match client_rect_of(entry.1.window) {
+            Some(client) => {
+                eprintln!(
+                    "[P0.09] small-window client rect = {client:?} (asked for 420x320 at 120,120)"
+                );
+                bring_to_front(entry.1.window, false);
+                if let Err(error) = describe_scroll_target("chrome-small", entry.1.window, client) {
+                    eprintln!("[P0.09] chrome-small: the pre-arm capture failed: {error}");
+                }
+                // The documented space first, then the one Chromium is handed by the
+                // reference implementation, then that one again: if only the first run of a
+                // space fails, what failed was the reflow after the resize, not the space.
+                for space in [
+                    CoordSpace::Screen,
+                    CoordSpace::Client,
+                    CoordSpace::Client,
+                ] {
+                    let before = page_scroll_y(entry.1.window);
+                    let outcome = run_arm_stepwise(
+                        "chrome-small",
+                        Transport::PostMessage,
+                        space,
+                        entry.1.window,
+                        client,
+                        4,
+                        None,
+                    );
+                    report_page_delta(
+                        "chrome-small",
+                        Transport::PostMessage,
+                        before,
+                        page_scroll_y(entry.1.window),
+                    );
+                    outcomes.push(outcome);
+                }
+            }
+            None => eprintln!("[P0.09] the resized window has no client rect"),
+        }
+    }
+
+    // 3. `SendInput` while the target is not the foreground window.
+    //
+    //    `SPI_GETMOUSEWHEELROUTING` decides where an injected wheel goes: `MOUSE_POS`
+    //    aims it at the window under the cursor, `FOCUS` at the foreground window. The
+    //    arm gives the foreground to a window of our own, parks the cursor over the
+    //    target, and reports which of the two moved — that pair is the whole question,
+    //    because a target SnapClip cannot focus is reachable only under `MOUSE_POS`.
+    if let Some(entry) = targets.iter().find(|entry| entry.0 == "chrome") {
+        match WheelFixture::create(Rect::from_origin_size(Point::new(1680, 140), 700, 500)) {
+            Ok(fixture) => match client_rect_of(entry.1.window) {
+                Some(client) => {
+                    bring_to_front(fixture.hwnd, true);
+                    let fixture_before = fixture.offset();
+                    let page_before = page_scroll_y(entry.1.window);
+                    outcomes.push(run_arm_stepwise(
+                        "chrome-unfocused",
+                        Transport::SendInput,
+                        CoordSpace::Client,
+                        entry.1.window,
+                        client,
+                        4,
+                        None,
+                    ));
+                    report_page_delta(
+                        "chrome-unfocused",
+                        Transport::SendInput,
+                        page_before,
+                        page_scroll_y(entry.1.window),
+                    );
+                    eprintln!(
+                        "[P0.09] the foreground window of our own consumed {} px while the target \
+                         was not focused",
+                        fixture.offset() - fixture_before
+                    );
+                }
+                None => eprintln!("[P0.09] the unfocused arm has no client rect to aim at"),
+            },
+            Err(error) => eprintln!("[P0.09] the unfocused arm needs a fixture: {error}"),
+        }
+    }
+
+    print_table(&outcomes);
+
+    // The matrix is only readable if the measurement works: an apparatus that cannot move
+    // a window of our own would make every zero above meaningless.
+    let control_moved = outcomes
+        .iter()
+        .filter(|outcome| outcome.target == "win32-own" && outcome.moved())
+        .count();
+    assert_eq!(
+        control_moved, 2,
+        "the own-window control did not scroll under both transports, so no zero in this \
+         table can be read as a statement about a target"
+    );
+    // And the headline `docs/30 §24.6` depends on, re-measured on the matrix's own targets.
+    for transport in ["SendInput", "PostMessageW"] {
+        let chromium = outcomes
+            .iter()
+            .find(|outcome| {
+                outcome.target == "chrome"
+                    && outcome.transport == transport
+                    && outcome.space == CoordSpace::Client.label()
+            })
+            .expect("a chrome arm exists for every transport");
+        assert!(
+            chromium.moved(),
+            "chrome measured {} px under {transport}: the two-path decision does not hold on \
+             this machine any more",
+            chromium.measured_px
+        );
+    }
+}
+
+/// P0.09's integrity-level arm.
+///
+/// The pair this needs is *low sender → high target*, and on this machine the sender is the
+/// side that has to change: `EnableLUA` is 0, so every interactive process here — this harness,
+/// the browsers, the editors — runs at High integrity, and there is no higher level for it to
+/// be blocked by. The documented route to a lower one, `runas /trustlevel:0x20000`, does not
+/// work: the restricted token inherits the parent's mandatory label, and the process reported
+/// `Mandatory Label\High Mandatory Level S-1-16-12288`. A genuinely low sender needs the token
+/// rewritten, which is what `tools/p009-low-integrity-launch.ps1` does — the child's own
+/// `whoami /groups` line reads `Mandatory Label\Low Mandatory Level S-1-16-4096`.
+///
+/// Three things the operator supplies, or the arm measures the environment instead of the
+/// barrier:
+///  * a scrollable high-integrity window, named by `SNAPCLIP_UIPI_TARGET` (title substring);
+///  * the sender started by that launcher with `SNAPCLIP_UIPI_LOW=1`, and with
+///    `CREATE_NO_WINDOW`, because a low-integrity child cannot attach to this console and the
+///    one Windows allocates lands on the target's centre — where the wheel is aimed;
+///  * `SNAPCLIP_UIPI_NO_AIM=1` once a higher-integrity helper has placed the cursor, because
+///    `SetCursorPos` itself fails from a low sender (`FALSE`, last error left at 0). Without
+///    that split the arm only learns "this process cannot place the cursor".
+///
+/// The arm never foregrounds the target, because a low-integrity process cannot raise a
+/// high-integrity window and the resulting assertion failure would look like a finding. What it
+/// reports is each transport's own outcome, which is the evidence: a `PostMessageW` refused
+/// with ERROR_ACCESS_DENIED and a `SendInput` that reports events without moving the target are
+/// the loud and silent halves of the same barrier.
+#[test]
+#[ignore = "P0.09: takes SNAPCLIP_UIPI_TARGET and a low-integrity sender from tools/p009-low-integrity-launch.ps1"]
+fn uipi_probe() {
+    let _ = monitor::set_per_monitor_v2_awareness();
+
+    let Ok(needle) = std::env::var("SNAPCLIP_UIPI_TARGET") else {
+        panic!(
+            "set SNAPCLIP_UIPI_TARGET to a substring of the title of a scrollable window, then \
+             run this test as the low-integrity sender: runas /trustlevel:0x20000 \
+             \"target\\debug\\deps\\snapclip_capture-<hash>.exe\" uipi_probe --ignored --nocapture \
+             --test-threads=1"
+        );
+    };
+    let window = find_window_by_title(&needle, Duration::from_secs(5))
+        .unwrap_or_else(|| panic!("no visible window whose title contains {needle:?}"));
+    let Some(client) = client_rect_of(window.hwnd) else {
+        panic!("the window whose title contains {needle:?} has no client rect");
+    };
+    eprintln!(
+        "[P0.09] UIPI arm: target {:?} class {} client {client:?}",
+        window_title(window.hwnd),
+        window_class(window.hwnd)
+    );
+    eprintln!(
+        "[P0.09] UIPI arm: sender marker SNAPCLIP_UIPI_LOW={:?} (present means the operator \
+         launched this process with a restricted token)",
+        std::env::var("SNAPCLIP_UIPI_LOW").ok()
+    );
+
+    let mut outcomes = Vec::new();
+    outcomes.push(run_arm_stepwise(
+        "uipi-target",
+        Transport::SendInput,
+        CoordSpace::Client,
+        window.hwnd,
+        client,
+        4,
+        None,
+    ));
+    outcomes.push(run_arm_stepwise(
+        "uipi-target",
+        Transport::PostMessage,
+        CoordSpace::Client,
+        window.hwnd,
+        client,
+        4,
+        None,
+    ));
+    print_table(&outcomes);
+
+    let send_input = outcomes
+        .iter()
+        .find(|outcome| outcome.transport == "SendInput")
+        .expect("the SendInput arm ran");
+    let post = outcomes
+        .iter()
+        .find(|outcome| outcome.transport == "PostMessageW")
+        .expect("the PostMessageW arm ran");
+    // The claim under test is asymmetry, so a run in which both work or both fail is a
+    // result about the environment, not confirmation of `docs/30 §24.6.2` — and it is
+    // reported as such instead of being asserted away.
+    eprintln!(
+        "[P0.09] UIPI arm: SendInput reported {:?} ({} px), PostMessageW reported {:?} ({} px)",
+        send_input.error.as_deref().unwrap_or("accepted"),
+        send_input.measured_px,
+        post.error.as_deref().unwrap_or("accepted"),
+        post.measured_px
+    );
 }

@@ -27,7 +27,9 @@
     ends cannot test an end.
 
   The `<title>` is replaced per run by `windows/scroll_probe.rs`, which is how the
-  probe finds *its* window among the several Chromium windows a desktop has.
+  probe finds *its* window among the several Chromium windows a desktop has. The
+  script then keeps a ` y=<scrollY>` suffix on whatever title it was handed, so the
+  page can report its own scroll position through a channel that is not pixels.
 -->
 <title>snapclip-scroll-demo-token</title>
 <style>
@@ -256,6 +258,23 @@ function paint() {
 window.addEventListener("scroll", paint, { passive: true });
 window.addEventListener("resize", paint);
 paint();
+
+// The page reports its own scroll position in the window title.
+//
+// Whether an injected wheel reached a renderer is measured by capturing pixels, and that
+// measurement has a blind spot: a page whose captured area is flat — blank, already at its
+// end, hidden behind a same-looking region — looks the same whether it moved or not. The
+// title is readable from outside the process, is not part of the client area, and therefore
+// gives the probes a second, independent answer that no capture can confound. Only the
+// relative `y=` value is parsed (`scroll_probe.rs`), so the readable half stays whatever the
+// launcher put there.
+const baseTitle = document.title;
+function paintTitle() {
+  document.title = baseTitle + " y=" + Math.round(window.scrollY);
+}
+window.addEventListener("scroll", function () { requestAnimationFrame(paintTitle); }, { passive: true });
+window.addEventListener("resize", paintTitle);
+paintTitle();
 </script>
 </body>
 </html>

@@ -94,13 +94,14 @@
 | 新增文件 | 一律先建 `#[cfg(test)]` 测试骨架再建实现（§2.1） |
 | 文档引用 | 一律写 `docs/30 §x.y` 或 `docs/30:<行号>`，**不允许只写"见设计文档"** |
 
-### 0.6 本文对 V2 的补充（**四处 deviation，前三处已按用户授权回填 `docs/30`**）
+### 0.6 本文对 V2 的补充（**五处 deviation，全部已按用户授权回填 `docs/30`**）
 
-> **回填状态**：前三处均已写入 `docs/30-scroll-capture-design-v2.md`（**未覆盖原文，只做定点增补**）——
+> **回填状态**：五处均已写入 `docs/30-scroll-capture-design-v2.md`（**未覆盖原文，只做定点增补**）——
 > DEV-1 → `§28.2` 新增 test-only 文件块（`scroll/testkit.rs`）与"10 生产 + 1 test-only"口径、`§33.3` 文件清单由 9 补为 11（**顺带修正了原文漏列 `orb.rs` 的内部矛盾**）；
 > DEV-2 → `§35 P4` 的 `P4.1` 拆为 `P4.1a`（trait，capture）/ `P4.1b`（实现，shell）并附理由；
 > DEV-3 → `§33.1` 的 `D-10` 拆为 `D-10a`（硬失败）/ `D-10b`（静默降级）、`§24.3` 修正 `wgc.rs:107` 的表述并说明"两种相反失败模式的共同落点"、`§24.8` 的探测用例扩为两条；
-> **DEV-4** → `§21.3` 新增"第 1 步的实测结果（`P0.02` / `T-THREAD-1`）"整块（2026-10-08 执行时新增，见下）。
+> **DEV-4** → `§21.3` 新增"第 1 步的实测结果（`P0.02` / `T-THREAD-1`）"整块（2026-10-08 执行时新增，见下）；
+> **DEV-5** → `§24.5`（UIPI 事实与矩阵首行**按实测改写**）、`§24.6` 判定规则 1（**前台窗口 → 光标所在窗口**）、`§24.6.1` 结论 2（判别性用例已跑）、`§24.6.2`（整节改写为五目标矩阵）、`§24.8`、`§30.5`、`§36.2`（`OQ-3` 关闭、`OQ-5` 答一半、**新增 `OQ-15`**）（2026-10-08 执行时新增，见下）。
 > 下表保留**原始登记内容**（作为"当时看到了什么"的记录）。
 
 | # | 补充 | 为什么必须补 | 回填位置 |
@@ -109,6 +110,7 @@
 | **DEV-2** | V2 §35 的 **P4.1** 一行写"`RowBandSink`/`RowBandWriter` + `PngRowBandSink` 落在 shell 组合根"，但 V2 §27.3/§33.3 把这两个 **trait** 定为 capture 侧新增（`png` 不得进 capture） | 一行把"端口"与"实现"混在一起。若不拆，执行者会把 trait 放进 shell → 滚动模块无法在自己的 crate 里被测试（破坏 §4.1 的 L1/L2 门禁），或会把 `png` 加进 capture（破坏 §28.4 的目标） | `docs/30 §35 P4.1` 拆为两句："trait 在 capture（`canvas.rs` 或 `bands.rs`）、`PngRowBandSink` 实现落 shell 组合根" |
 | **DEV-3** | V2 §33.1 的 **D-10** 把 `crates/snapclip-capture/src/windows/win/wgc.rs:107` 与 `:110` **都**写成"吞错误"，与代码不符 | 逐行核实：`:106-108` 的 `SetIsCursorCaptureEnabled(false).map_err(...)?` **用 `?` 传播** → 它的失败模式是"**`IGraphicsCaptureSession2` 不可用 ⇒ 整体捕获失败**"；`:110-112` 的 `SetIsBorderRequired(false)` 才是"**只 `eprintln`、静默降级**"。**两种相反的失败模式**（一个太严、一个太松）都必须由 `P2.04` 的能力探测统一处理，否则执行者会按 V2 的措辞只修一处 | `docs/30 §33.1 D-10` 改为两个独立条目：D-10a"`SetIsCursorCaptureEnabled` 的**硬失败**改为探测 + 记录 + 退回掩码排除"、D-10b"`SetIsBorderRequired` 的**静默降级**改为产出 `CaptureOptionUnavailable` 诊断"；`§24.3` 的 `CaptureCapabilities` 表同步说明它同时解决这两种失败模式 |
 | **DEV-4**（执行时新增） | V2 §21.3 把 `T-THREAD-1` 的判据写成"**若 `cargo test --workspace --lib` 今天就 panic**"，并预期它能回答这个问题 | 2026-10-08 实测：**全量 lib 测试不会 panic**（每个测试都在同一线程创建设备并使用它）→ **该门禁对这条不变式不敏感**；但生产路径**真的会 panic**（设备在 capture worker 创建，overlay 线程放大镜取色时 `submit`），已用 `the_production_hand_off_trips_the_context_guard` 固定为可执行证据。若照原文把"全绿"当作通过，`P0.02` 会被误判为完成，`P2.02` 的回读路径会带着一个**假的**不变式进实现 | `docs/30 §21.3` 新增"第 1 步的实测结果（`P0.02` / `T-THREAD-1`）"整块（四条事实 + 调用点清单修正 + 问题域扩大 + 发布期如何保证）；§6 `P0.02` 的状态行改 `[!]`；§3.4/§14.2 的 `[!]` 表与 R-2 同步 |
+| **DEV-5**（执行时新增） | ① V2 §24.5 写"`PostMessageW` **bypasses UIPI**"、矩阵首行写"提权目标上 `PostMessageW` 可用"，§24.6 判定规则 1 写"`SendInput` 会打到**前台窗口**"；② V2 §24.6.2 把四项列为"仍开放"；③ `P0.09` 的退出条件 ③ 要求"路由设置两种取值各一次" | 2026-10-08 实测：① **`PostMessageW` 对更高完整性窗口直接 `ERROR_ACCESS_DENIED`**（F-13 的旁路设想被否证），而 `MOUSE_POS` 路由下 `SendInput` 跟随的是**光标**而非前台窗口（非前台目标滚 400 px、前台窗口 0 px）；② 四项里**三项已实测关闭**（Edge/Electron/WinUI3 两条传输、非前台、小窗口坐标空间）、一项**不可测**（WebView2 无宿主）；③ **退出条件 ③ 在本机做不到**（没有第二台可改路由设置的机器）。若按原文执行，`P3.02`/`P3.03` 会把一条**不存在的旁路**写进实现，并把 `MOUSE_POS` 的"跟随光标"当成"跟随前台"来处理 | `docs/30 §24.5`（事实与矩阵首行）、`§24.6`（判定规则 1）、`§24.6.1`（结论 1/2/5 的实测更新）、`§24.6.2`（整节改写：21 行矩阵 + 七条结论 + 修订后的开放表）、`§24.8`（五行实测）、`§30.5`（浏览器行加"注入传输因浏览器而异"）、`§36.2`（`OQ-3` 关闭 / `OQ-5` 答一半 / **新增 `OQ-15`**）；本文 §3.4/§14.2 的 `[!]` 表、`OQ-3`/`OQ-5`/`OQ-15` 行、R-18/R-19 与 §6 `P0.09` 的状态块同步 |
 
 ---
 
@@ -409,8 +411,9 @@ P6.07 门禁扫描 ═╝
 | `P0.02`（`T-THREAD-1` 的断言） | 断言会在**合法的生产交接路径**上 panic（放大镜取色：`overlay/session.rs:565` → `renderer.rs:311`），而库测试全绿看不到它 | `docs/30 §21.3` 第 ② 步定下 deferred context / 显式交接后并入并重跑两个用例 |
 | `P0.05`（`E-CAP-1` 的 WebView2 一格） | **不是 OQ-2 的内容**：本机 WebView2 运行时已装（154.0.4258.53 / .62）但**没有可用宿主**（`SearchHost.exe` 没有普通顶层窗口，`GameViewer.exe` 是托盘型 `MainWindowHandle = 0`），而"WebView2 窗口类"根本不存在——内容被合成进宿主自己的顶层窗口，所以这一格测的是宿主，不是 WebView2 | ✅ **已记为"未取得"**（2026-10-08，`docs/30 §24.2.1`）：宿主不存在时无法测，且不影响结论（`CreateForWindow` 对宿主顶层窗口与对 Chrome 是同一条路径）。需要宿主时再补测，侧分支 `blocked/P0-05-webview2-capture` |
 | `P1.22` 的 125%/150% DPI 扫描行 | **OQ-4**：本机 `PixelRatio = 1`，取不到 | 接一台可改缩放的真实显示器 |
-| `P3.02` 的 UIPI 组 | **OQ-3**：官方两页互相矛盾 | 以管理员身份跑一次 `E-INJECT-1` |
-| `P3.09` 的"非前台 `SendInput`"分支判据 | **OQ-5**：`SPI_GETMOUSEWHEELROUTING` 是用户可改设置 | 在两种设置下各跑一次 |
+| `P3.02` 的 UIPI 组 | ~~**OQ-3**：官方两页互相矛盾~~ → ✅ **已解除**（2026-10-08，`docs/30 §24.6.2` 结论 6）：低完整性发送方已可构造（`tools/p009-low-integrity-launch.ps1`），实测两条路径都不通（`SendInput` 静默 0 px、`PostMessageW` `Win32 error 5`）⇒ `P3.02` 按"**开始时即拒绝 + 提示以管理员运行**"实现，**不需要侧分支** | — |
+| `P3.09` 的"非前台 `SendInput`"分支判据 | **OQ-5** 只剩一半：`MOUSE_POS` 下已实测（非前台目标滚 400 px、前台窗口 0 px），但 `CURSOR`/`FOCUS` 两个取值**本机取不到**（该设置是用户可改的系统设置） | 在两种设置下各跑一次；在此之前按本机读数 + 保守分支实现（**只会更保守**） |
+| `P3.02` 的"非浏览器目标负答案"分支（**新开**） | **OQ-15**：Electron/WinUI3 在四条臂上全 0 且**没有第二通道**，"没有可滚内容"与"注入没到达"无法区分 | 需要非像素滚动见证（首选 UI Automation `ScrollPattern` 只作见证、不作驱动）；在此之前该分支只能输出"未取得"，不能报"注入失败" |
 
 **不在侧分支上、但允许"先按推导实现"的任务**：`P4.02`（`E-PERF-2` 未定时允许先选 `Compression::Fast` + `Filter::Sub` 并标"启动值，待校准"）。
 
@@ -768,6 +771,18 @@ git config core.hooksPath .githooks
 | 提交信息标题 | `[P0-09] the injection matrix is closed on five targets and both integrity levels` |
 | 复杂度 / 阻塞 | L / **[!]** 部分受设备阻塞（WebView2 宿主、混合 DPI）→ 侧分支 |
 | **对后续阶段的影响** | `P3.01`/`P3.02`（传输实现）、`P3.03`（`choose()` 的四组判据）、`docs/30 §24.5` 的 UIPI 矩阵、`docs/30 §36.2` 的 OQ-2/OQ-3/OQ-5 收口 |
+| **状态** | **[!] 完成，但第 ③ 项退出条件未取得**（2026-10-08）：五目标矩阵实测跑完（run 5，76.27 s），UIPI 实测关闭，小窗口坐标空间判别成立；**`SPI_GETMOUSEWHEELROUTING` 的另外两个取值没测**（本机被钉在 `MOUSE_POS`，且该设置用户可改 ⇒ 只能保留为 `OQ-5` 残留）；WebView2 一格仍是"无宿主可测"（侧分支 `blocked/P0-05-webview2-capture`，与 `P0.05` 同一分支）；**新开 `OQ-15`**（非浏览器目标的负答案缺非像素见证） |
+
+**实测结论（2026-10-08）**：
+
+- **RED**：`the_probe_distinguishes_rejected_from_unreached` → `error[E0433]: cannot find type Delivery in this scope` + `error[E0425]: cannot find function classify_delivery in this scope`（另有 `HWND(...)` 的 `E0423`：本文件的 `HWND` 是裸指针别名）。
+- **GREEN（L1）**：上述用例 `ok. 1 passed`；三分态装置用例 `the_probe_produces_all_three_delivery_states` `ok. 1 passed`（2.26 s）；`cargo test -p snapclip-capture --lib` = **353 passed / 0 failed / 11 ignored**。
+- **L3 跑了 5 轮**（每轮都是 `--ignored --nocapture --test-threads=1`，日志 `docs/Temp/p009-matrix-run{1..5}.txt`）：run 1 66.36 s、run 2 **132.96 s 且 FAILED**、run 3 70.30 s、run 4 72.20 s、run 5 **76.27 s test ok**。run 2 的失败是 `scroll_probe.rs` 的前台断言（`could not bring the fixture window to the foreground (got 0x431054, wanted 0x17102ee)`）——**前台锁会静默拒绝 `SetForegroundWindow`**，已由"注入一次裸 Alt 后重试"修掉（见 R-17）。
+- **退出条件逐条**：① 五类目标 × 两条传输 = **有结果**（Chrome 4/4 成功；**Edge 的 `SendInput` 0 px 而其余三条成功**；Electron/WinUI3 **全 0**，记为"未取得"；WebView2 无宿主）；② UIPI 两条路径 = **决定性**（低完整性发送方 → 高完整性 Chrome：`SendInput` 投递成功但 0 px、`PostMessageW` `Win32 error 5`）；③ **路由设置两个取值 = 未取得**（本机只有 `MOUSE_POS`）；④ 小窗口坐标空间 = **判别成立**（`screen` 400 px、`client` **0 px 连跑两次**）。
+- **装置净增**（全部在 `crates/snapclip-capture/src/windows/scroll_probe.rs`）：`Delivery`/`classify_delivery`、三分态用例；夹具 `tests/fixtures/scroll-demo.html` 的**页内自报滚动位置**（把 `scrollY` 写进窗口标题 ⇒ 每条臂有像素与标题两条独立通道，且两条通道在 Chrome/Edge 上逐项一致）；`describe_scroll_target` 的进程镜像路径与 `WindowFromPoint` 类名；每条 `SendInput` 臂的瞄准打印；`arm_places_the_cursor()`/`SNAPCLIP_UIPI_NO_AIM`；`find_packaged_window()` + `PACKAGED_SETTINGS_PAGE`；`#[ignore] fn uipi_probe()`；`uipi_probe` 的三个环境变量（`SNAPCLIP_UIPI_TARGET`/`SNAPCLIP_UIPI_LOW`/`SNAPCLIP_UIPI_NO_AIM`）。**新入库的辅助脚本**：`tools/p009-low-integrity-launch.ps1`（令牌改写式降完整性启动器；`runas /trustlevel` 实测**不能**降完整性）。
+- **两处偏离**（都不改退出条件的字面，但结论的强度要按实际读）：**偏离 1** = 退出条件 ③ 在本机**做不到**（没有另一台机器能改路由设置），本次交付的是"读数是 `MOUSE_POS` 且该取值下非前台 `SendInput` 生效"这一半结论；**偏离 2** = WebView2 一格从"待测"变成"**不可测**"（本机无宿主），因此它与 `P0.05` 共用同一个侧分支，而不是新开分支。
+- **门禁**：`cargo check -p snapclip-capture --all-targets` 0 error / 0 warning；`cargo check --workspace --all-targets` 只有一条**既有**警告（`unused variable: content_label`，`apps/snapclip/src/history/view.rs`）；`cargo test --workspace --lib` = **483 passed / 0 failed / 14 ignored**（app 56+3、capture 353+11、history 51、model 23）。
+- **留给产品实现的三条硬约束**（写进 `P3` 的任务，不是本任务的实现）：① `make_lparam` **必须屏幕坐标且不得用 `LOWORD`/`HIWORD`**；② 会话开始时**必须读 `SPI_GETMOUSEWHEELROUTING`**，并把"先把光标放到目标客户区中心"当作不变式；③ **"零位移"必须触发路径切换**（Edge 使这条从补偿机制变成日常机制），且**不能只看错误码**（`SendInput` 的失败是静默的）。
 
 ### P0.07 `SPI_GETMOUSEWHEELROUTING` / `SPI_GETWHEELSCROLLLINES` 读取
 
@@ -1177,7 +1192,7 @@ git config core.hooksPath .githooks
 
 ### P3.02 条件选择 `choose()`
 
-**上游**：V2 §24.6（**条件选择，不是"先试 A 再退 B"**）、`OQ-5` ｜ **第一性原理**：**正确性**（`SendInput` 会打到**前台**窗口 → 非前台目标下用 `SendInput` 是**错误**，不是"效果差"）→ 必须在**事前**判定，不能靠重试 ｜ **前置**：P3.01、P0.07 ｜ **可并行**：与 P3.01（G10）｜ **批次**：`[P3-A]` ｜ **层级/分类**：L2 / B + D ｜ **复杂度**：M ｜ **阻塞**：`OQ-5`（路由设置）+ `OQ-3`（UIPI）—— **不阻塞实现**（判定表按 `P0.07`/`P0.09` 的读数写，读数缺失时走保守分支）
+**上游**：V2 §24.6（**条件选择，不是"先试 A 再退 B"**）、`OQ-5`、`OQ-3`（**已实测关闭**）｜ **第一性原理**：**注入点不由我们决定**（`MOUSE_POS` 路由下 `SendInput` 打到**光标所在窗口**；2026-10-08 实测：非前台目标滚 400 px、当时的前台窗口 0 px）→ 必须在**事前**判定，不能靠重试；`PostMessageW` 的价值是"**面向具体 HWND**"，不是"绕过 UIPI"（后者已被否证）｜ **前置**：P3.01、P0.07 ｜ **可并行**：与 P3.01（G10）｜ **批次**：`[P3-A]` ｜ **层级/分类**：L2 / B + D ｜ **复杂度**：M ｜ **阻塞**：无（`P0.07`/`P0.09` 的读数已到位；`OQ-5` 的另两个取值缺失时走保守分支）
 
 - **RED**：**四组**用例（前台/非前台 × 提权/非提权）断言选择结果与 §24.6 的表一致 + `a_non_foreground_target_never_uses_send_input()`。**预期失败原因**：`choose()` 未实现
 - **GREEN**：`fn choose(target: &ScrollTarget, probe: &Probe) -> Transport`：提权且自身未提权 → `PostMessageW`；**非前台 → `PostMessageW`**；否则 `SendInput`；输入含 `SPI_GETMOUSEWHEELROUTING`（P0.07）
@@ -1534,7 +1549,7 @@ git config core.hooksPath .githooks
 | 1 | `SendInput` 生效 | `P3.01` | B | L3 |
 | 2 | `PostMessageW` 生效 | `P3.01` | B | L3 |
 | 3 | Chromium 子窗口下沉 | `P3.01` | B | L3 |
-| 4 | UIPI 目标（提权记事本） | `P3.02` + `P0.09` | D | L3 |
+| 4 | UIPI 目标（**发送方降完整性**，`tools/p009-low-integrity-launch.ps1`，目标 = 高完整性 Chrome） | `P3.02` + `P0.09` ✅ | D | L3 |
 | 5 | 条件选择（前台/非前台 × 提权/非提权 = 4 组） | `P3.02` | B | L2 |
 | 6 | 注入失败后切路径（连续 3 次 `Posted` 但 `d == 0`） | `P3.03` | D | L2 |
 | 7 | 两条路径都失败 | `P3.03` | D | L2 |
@@ -1662,9 +1677,10 @@ git config core.hooksPath .githooks
 |---|---|---|---|---|
 | **OQ-1** | `PostMessageW(WM_MOUSEWHEEL)` 能否驱动 Chromium？ | ✅ **本机已答：能**（`E-INJECT-1` 最小版 800 px / 8 notch，§24.6.1） | `P0.06` ✅ | — |
 | **OQ-2** | `WDA_EXCLUDEFROMCAPTURE` 对 WGC 是否生效？ | 未定 | `P0.05`（扩一条） | 只影响**显示器级回退路径**的措辞，不影响窗口级主路径 |
-| **OQ-3** | `SendInput` 在 UIPI 场景下的方向性 | 未定（官方两页矛盾） | `P0.09` | 若两条路径都不通 → UIPI 目标在 v1 只能**提示用户以管理员运行**（与 PixPin 一致） |
+| **OQ-3** | `SendInput` 在 UIPI 场景下的方向性 | ✅ **已答**（2026-10-08，`docs/30 §24.6.2` 结论 6）：低完整性发送方（令牌改写，`tools/p009-low-integrity-launch.ps1`）→ 高完整性 Chrome，`SendInput` 静默 0 px、`PostMessageW` `Win32 error 5` | `P0.09` ✅ | UIPI 目标在 v1 **只能"开始时即拒绝 + 提示以管理员运行"**（与 PixPin 一致）；`docs/30` 的 F-13 旁路设想已否证 |
+| **OQ-15**（新） | **非浏览器目标**（Electron / WinUI3 / 自绘窗口）上如何把"没有可滚内容"与"注入没到达"分开？ | 四条臂（含 `VK_DOWN`）全 0 且**没有第二通道**；选窗缺陷/遮挡/黑帧已排除 | 需要非像素滚动见证（首选 UI Automation `ScrollPattern`，**只作见证不作驱动**，与 §8 N2 不矛盾） | `P3.02` 的负答案语义：在此之前只能输出"未取得" |
 | **OQ-4** | 125%/150%/175% 下"整数物理像素位移"是否成立？ | **本机取不到**（`PixelRatio: 1`） | `P0.04` 记"未取得"；`P1.08`/`P1.24` 保留"累计小数余量"的**接口空间**（不加实现） | 若位移非整数 → 门一与"整宽行带"模型需重评（**这是 V2 里最可能被推翻的一条**） |
-| **OQ-5** | `SPI_GETMOUSEWHEELROUTING = MOUSE_POS(2)` 时非前台窗口能否收到 `SendInput`？ | 本机实测 `2`，但**是用户可改的设置** | `P0.07` 读取 + `P0.09` 两种设置各跑一组 | §24.6 的"非前台 → 必须 `PostMessageW`"可能过严（只会**更保守**，不会更危险） |
+| **OQ-5** | `SPI_GETMOUSEWHEELROUTING = MOUSE_POS(2)` 时非前台窗口能否收到 `SendInput`？ | ⚠️ **已答一半**（2026-10-08）：`MOUSE_POS` 下**能**——非前台目标滚 400 px，而当时的前台窗口（自控夹具）0 px ⇒ **滚轮跟随光标而非前台窗口**。另两个取值（`CURSOR`/`FOCUS`）本机取不到 | `P0.07` 读取 ✅ + `P0.09`（另两取值仍缺） | `§24.6` 判定规则 1 **已按实测改写**（实现的不变式 = 先把光标放到目标上；`SPI_GETMOUSEWHEELROUTING` 列入会话开始时的必读设置） |
 | **OQ-6** | 水平轴到底慢多少？ | 无任何公开数据 | `E-PERF-3`（`P0.03` 的兄弟实验） | 若慢到不可接受 → 评估"列优先临时转置"（`spike/transposed-canvas`），**先不加实现** |
 | **OQ-8** | 三层漏斗会不会太慢？ | 未测 | `P0.03` `E-PERF-1` | 加第 4 层（多尺度）→ 侧分支 `spike/matcher-layer4` |
 | **OQ-9** | `MAX_DECODE_PIXELS = 24 MP` 是否放宽？ | 未定 | `P4.07` 的产物 + 一次评审 | 若长图必须可读回 → **新增**"分块解码"工作（本文不排，因为它是新范围） |
@@ -1686,7 +1702,7 @@ git config core.hooksPath .githooks
 | `P0.05` | 窗口级 WGC 在 Electron/WebView2 上不可用（或 `CreateForWindow` 不接受子窗口）—— **风险未成立**（2026-10-08）：五臂全部可用，WebView2 是"无宿主可测"而不是"不可用"（§6 `P0.05` 的结论块） | **不建** `spike/monitor-fallback`（原定侧分支不需要）；WebView2 一格单列 `blocked/P0-05-webview2-capture` | 显示器级回退路径**仍然保留**，但理由从"窗口级不可用"改为"最小化 / 跨显示器 / 子窗口句柄三处依据缺口"（`docs/30 §36.2` OQ-14） | `P2.01`、C5、§24.2 |
 | `P1.24` | `E-ACC-1` 打完四门后"错误确定率"仍 > 0 | `spike/orb-primary` | ORB 从"第二意见"提为主候选（`P1.23` 的角色反转），保留四门为**验证**层 | `P1.05`–`P1.16`、§15.4 |
 
-**两处表的口径**：§3.4 列出的是"**因环境/设备/官方依据不足**而阻塞"的四项（`P0.05`、`P1.22` 的 DPI 行、`P3.02` 的 UIPI 组、`P3.09` 的非前台判据），本表列出的是"**因实验结论**而阻塞"的四项；两表并集即本阶段的全部 `[!]`，`P0.02` 由本次执行新增进 §3.4 的表。
+**两处表的口径**：§3.4 列出的是"**因环境/设备/官方依据不足**而阻塞"的项（`P0.02`、`P0.05`、`P1.22` 的 DPI 行、`P3.09` 的非前台判据、`P3.02` 的"非浏览器负答案"分支，另有 `P3.02` 的 UIPI 组**已于 2026-10-08 解除**），本表列出的是"**因实验结论**而阻塞"的四项；两表并集即本阶段的全部 `[!]`，`P0.02` 由 `P0.02` 的执行、`OQ-15` 那条由 `P0.09` 的执行分别新增。
 
 ### 14.3 风险表
 
@@ -1709,6 +1725,8 @@ git config core.hooksPath .githooks
 | R-15 | **任务清单本身变成愿望清单** | 中 | 中 | §13 的逐行映射 + `P6.02` 的元测试"缺一行就红" | `P6.02` |
 | R-16 | **L3 门禁并行跑会假红**（7 个真实桌面用例抢前台，`scroll_probe.rs:404` 的前台断言先失败） | 已发生（2026-10-08） | 中（会把串行才能过的门禁误判为代码问题） | §4.2 的命令固定加 `--test-threads=1`；后续新增 L3 用例时**不要**用"抢前台"作为前置，改用 `PostMessageW` 或把自己的窗口设为前台后立即测量 | `P0.05`/`P0.09`/所有 L3 任务 |
 | R-17 | **`pre-push` 钩子测的是工作区，不是被推送的提交**（实测：钩子跑 `cargo test --workspace --lib`，读的是磁盘代码） | 已确认（2026-10-08，`P0.08`） | 低到中（"提交里有一个红提交、但工作区是绿的"这种情况钩子抓不到；只靠 `git bisect` 事后发现） | 人工纪律 = **先提交 → `git status` 干净 → 再推送**；阶段级门禁（§4.2）在标签前对**已提交状态**再跑一次 | 所有推送；`P6.02` 的统计脚本（它统计的是磁盘状态，与钩子口径一致） |
+| R-18 | **L3 探针启动的 Chromium 会留下残留进程**（`P0.09` 实测：run 5 结束后仍有 2 个探针 Chrome 存活，标题 `snapclip-scroll-demo-token y=11775` / `snapclip-probe-0d12ded4-chrome y=20757`） | 已发生（2026-10-08） | 低（不污染结果——探针用的是独立 `--user-data-dir` 与 `--app`；但会遮挡后续臂、并让"我们自己的窗口"跑到前台） | 探针的 `shutdown_target` 对 Chromium 不可靠（启动器进程已退出、不再持有浏览器进程）⇒ **每次 L3 之后手工 `taskkill /T /F` 清理**，并把"启动前后的窗口差集"作为选窗依据（探针已如此实现） | `P0.05`/`P0.09` 及所有启动浏览器的 L3 任务 |
+| R-19 | **前台锁会静默拒绝 `SetForegroundWindow`**，把一条臂变成"从未测试过的否定答案"（`P0.09` run 2 实测：`could not bring the fixture window to the foreground (got 0x431054, wanted 0x17102ee)`） | 已发生（2026-10-08） | 中（会产出**看起来像结论的假数据**，比直接失败更危险） | 探针在首次失败后**注入一次裸 Alt 再重试**（本进程成为最后输入源是前台锁的解除条件之一）并保留断言：**宁可红，也不报告没测过的否定答案** | `P0.05`/`P0.09` 及所有需要前台的 L3 任务 |
 
 ### 14.4 失败处置与回滚
 

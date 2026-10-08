@@ -2862,18 +2862,18 @@ struct CaptureCapabilities {
 - `PostMessage(WM_MOUSEWHEEL)` **bypasses UIPI**（Microsoft Learn winapp-cli 原文："is HWND-targeted and bypasses UIPI"）；`SendInput` "goes to whatever window is foreground and **is blocked by UIPI**"（F-13）。
 - PixPin **在 UIPI 场景下也没有第二条捕获通道**（`PixPinAuxiliary.exe` 的完整静态分析，F-16 / N10）。它只能提示用户以管理员运行。
 - `WDA_EXCLUDEFROMCAPTURE` **不影响** `EnumWindows`（`provider.rs:45-59` 注释明说），因此三层排除必须各自维护。
-- **本机无法构造"低 → 高"UIPI 场景**：`EnableLUA = 0`（另有 `ConsentPromptBehaviorAdmin = 0`、`PromptOnSecureDesktop = 0`），实测 harness、主进程、Typora、Qoder、msedge 宿主、explorer、PowerToys、Terminal、任务管理器**全部是 High 完整性**，只有 `SearchHost.exe` 是 Low。因此 `OQ-3` 在这台机器上不是"难做"而是**没有目标**；矩阵首行的行为仍只能靠官方文档 + 一台真实提权的机器来定。
+- **`EnableLUA = 0` 使"低 → 高"场景在默认条件下自然不可得**（另有 `ConsentPromptBehaviorAdmin = 0`、`PromptOnSecureDesktop = 0`），实测 harness、主进程、Typora、Qoder、msedge 宿主、explorer、PowerToys、Terminal、任务管理器**全部是 High 完整性**，只有 `SearchHost.exe` 是 Low。**但这一项已于 2026-10-08 被绕开并实测关闭**：UIPI 判定的是"发送方是否低于目标"，所以不必制造高完整性目标，只要把**发送方**降到 Low——`runas /trustlevel:0x20000` 做不到（受限令牌继承父进程强制标签，实测子进程仍是 `S-1-16-12288`），而**改写令牌本身**可以（`DuplicateTokenEx` + `SetTokenInformation(TokenIntegrityLevel, S-1-16-4096)` + `CreateProcessWithTokenW`，见 `tools/p009-low-integrity-launch.ps1`；子进程自报 `Mandatory Label\Low Mandatory Level S-1-16-4096`）。结论见 §24.6.2 结论 6。
 
 **V2 的立场（逐条）**：
 
 | 场景 | 处理 |
 |---|---|
 | 目标窗口属于**同/低完整性**进程 | 两条注入路径都可用（§24.6） |
-| 目标窗口属于**更高完整性**进程（提权窗口） | **捕获**：若 SnapClip 未提权，WGC 窗口捕获**仍然可用**（WGC 不是 `SendInput`，不受 UIPI 限制捕获）；**注入**：`PostMessageW` 可用（bypasses UIPI），`SendInput` 不可用 → **这是 F-13 的直接工程价值** |
+| 目标窗口属于**更高完整性**进程（提权窗口） | **捕获**：若 SnapClip 未提权，WGC 窗口捕获**仍然可用**（WGC 不是 `SendInput`，不受 UIPI 限制捕获）；**注入**：**两条路径都不可用**——2026-10-08 实测（§24.6.2 结论 6）：`SendInput` 被静默吞掉（投递成功、0 px、无错误码），`PostMessageW` 直接返回 `Win32 error 5`。⇒ **在开始滚动之前就拒绝**（`TargetUnreachable`），文案与判定点见 §24.7 |
 | 目标是 **SnapClip 自己** | 拒绝（无意义），`ScrollTarget::validate` 检查进程 id |
 | 覆盖层的 display affinity | 窗口级路径**不需要**；显示器级回退路径**需要**（且不可用时回退到"捕获前隐藏覆盖层"策略，§24.7） |
 
-**F-13 与 §6 的 R15 一起给出一个重要的结论**：`PostMessageW` 不是"降级方案"，它是**在提权目标上唯一可行的方案**。这直接把 C6 的"两条并列路径"从设计偏好变成了**能力事实**。
+**F-13 与 §6 的 R15 的前提已被本机实测否证**（2026-10-08）：`PostMessageW` **不是**"在提权目标上唯一可行的方案"——它对更高完整性的窗口直接失败（`ERROR_ACCESS_DENIED`，§24.6.2 结论 6）。**必须分开"消息投递"的两种价值**：(a) "bypasses UIPI"——**不成立**（投递同样被 UIPI 拦截，只是失败形式从静默变成响亮）；(b) "面向具体 HWND 而不是前台窗口"——**成立且有用**（`MOUSE_POS` 路由下 `SendInput` 的滚轮跟随的是**光标**，见 §24.6 判定规则 1）。所以两条并列路径的真正分工是"**注入点由谁决定**"（系统 vs 我们），不是"能否越过完整性壁垒"。**这对产品是可交付的结论**：提权目标上的正确行为是**尽早拒绝并说清原因**，与 PixPin 一致（`docs/26`），而不是保留一条只在文档里存在的旁路。
 
 ### 24.6 注入路径的条件选择（不是主/备）
 
@@ -2888,7 +2888,10 @@ fn choose(target: &ScrollTarget, probe: &ProbeResult) -> InjectPath {
 
 **判定规则与三条约束**：
 
-1. **不是"先试 A 再退 B"**，而是**按条件选**。理由：`SendInput` 会打到**前台窗口**——如果目标不是前台，`SendInput` 会污染别的窗口（这是**正确性**问题，不是性能问题）。因此"目标是否前台"必须在选择之前检查，不能事后发现。
+1. **不是"先试 A 再退 B"**，而是**按条件选**。理由：`SendInput` 的注入点**不由我们决定**——系统把它交给路由规则指向的窗口，所以"滚轮会不会打到别人身上"必须在选择之前检查，不能事后发现。**2026-10-08 的两处实测修正了这条规则的前提**（§24.6.2 结论 5）：
+   - 本机 `SPI_GETMOUSEWHEELROUTING == 2 (MOUSE_POS)`（用户可改的系统设置）。在该取值下，滚轮跟随的是**光标所在窗口**，而**不是**前台窗口：目标非前台、光标停在其客户区中心时 `SendInput` 把它滚了 400 px，而当时真正拥有前台的我们自己的夹具消费 **0 px**。⇒ 旧的措辞"`SendInput` 会打到前台窗口"是**错的**，正确的表述是"**`SendInput` 会打到光标所在的窗口**"。
+   - 因此实现的不变式是"**先把光标放到目标上**"（`SetCursorPos` 到客户区中心），而不是"先让目标成为前台"；`probe.target_is_foreground` 仍然是一个**成本更低、副作用更小**的选择依据（前台目标下 `SendInput` 与 `PostMessageW` 都不必动光标，而被覆盖/被遮挡的光标位置也不会影响 `PostMessageW`），但它的理由从"正确性"降级为"**更少的外部状态假设**"。
+   - `SPI_GETMOUSEWHEELROUTING` 必须在会话开始时读（§6.4 A1 的三取值：`FOCUS` / `MOUSE_POS` / `CURSOR`），且**另外两个取值下的行为仍未测**（`OQ-5` 剩余部分）。本机的 400 px 结果**只在 `MOUSE_POS` 下有效**。
 2. **`PostMessageW` 必须做子窗口下沉**：先 `ScreenToClient(hwnd, &pt)`，再 `ChildWindowFromPointEx` 逐层下沉到最深的子窗口，最后向**子窗口**发 `WM_MOUSEWHEEL`。依据：F-14（参考实现 `scrollinput.cpp:52-54` 就是这样做，浏览器里落点正是 Chromium 的 render widget host 子窗口）；**Crisp 得出"浏览器会忽略"的相反结论，原因是它没做子窗口下沉**（§6）。
 3. **两种路径的 `Outcome` 都用同一套 5 类状态**（F-14/§6 的 `InputRejection`）：`Posted`（**不代表目标处理了**）/ `InvalidRequest` / `TargetNotFound` / `CoordinateFailure` / `PostFailed` / `Unsupported`。**`Posted` 必须被显式标注为"未证明被处理"**——这是 §24.7 的自检机制的前提。
 
@@ -2914,22 +2917,67 @@ fn choose(target: &ScrollTarget, probe: &ProbeResult) -> InjectPath {
 
 **四条结论**：
 
-1. **本节成立，且"两条并列路径"是能力事实而不是设计偏好**：`PostMessageW(WM_MOUSEWHEEL)` 把 Chromium 滚了 **800 px / 8 notch（100 px/notch）**，与 `SendInput` **完全一致**；两者的接收端到达计数都是 8/8。**Crisp 的"Chromium 会忽略投递的滚轮"在本机不成立**，F-14 的链路（`ScreenToClient` + `ChildWindowFromPointEx` 逐层下沉到 `Chrome_RenderWidgetHostHWND`）实测有效——`deepest_child_at` 确实下沉到了 `class=Chrome_RenderWidgetHostHWND`。**注意这仍然不是官方依据**：它是在一台机器、一个 Chromium 版本上的实验，Edge/Electron/WebView2/WinUI3 与 UIPI 目标仍开放（§24.6.2）。
-2. **`lParam` 的坐标空间：两个空间在本例中都生效，但不能推出可互换。** 客户端坐标 (660,486) 被当作屏幕坐标后 `ScreenToClient` 仍落在 1184×892 的客户区内，所以两条都得到 800 px。**窗口较小时客户端坐标会落到窗外而被丢弃** → 实现必须用 MSDN 记录的**屏幕坐标**（`MAKELPARAM` 的低/高字为屏幕坐标），并**不要**用 `LOWORD`/`HIWORD`（官方在多显示器下会给出错误结果，§6.4 A1）。**新测试用例要求**：把目标窗口缩到 400×300 后重跑同一条 arm，客户端坐标版本必须失效——这是"坐标空间确实按文档实现"的判别性用例（`E-INJECT-1` 追加组）。
+1. **本节成立，且"两条并列路径"是能力事实而不是设计偏好**：`PostMessageW(WM_MOUSEWHEEL)` 把 Chromium 滚了 **800 px / 8 notch（100 px/notch）**，与 `SendInput` **完全一致**；两者的接收端到达计数都是 8/8。**Crisp 的"Chromium 会忽略投递的滚轮"在本机不成立**，F-14 的链路（`ScreenToClient` + `ChildWindowFromPointEx` 逐层下沉到 `Chrome_RenderWidgetHostHWND`）实测有效——`deepest_child_at` 确实下沉到了 `class=Chrome_RenderWidgetHostHWND`。**注意这仍然不是官方依据**：它是在一台机器、一个 Chromium 版本上的实验。**后续状态（2026-10-08）**：Edge/Electron/WinUI3、非前台与 UIPI 三组已在 §24.6.2 实测关闭（Edge 的 `SendInput` 静默无效、Electron/WinUI3 的负答案仍不可解释），WebView2 因本机没有可用宿主而未取得。
+2. **`lParam` 的坐标空间：两个空间在本例中都生效，但不能推出可互换。** 客户端坐标 (660,486) 被当作屏幕坐标后 `ScreenToClient` 仍落在 1184×892 的客户区内，所以两条都得到 800 px。**窗口较小时客户端坐标会落到窗外而被丢弃** → 实现必须用 MSDN 记录的**屏幕坐标**（`MAKELPARAM` 的低/高字为屏幕坐标），并**不要**用 `LOWORD`/`HIWORD`（官方在多显示器下会给出错误结果，§6.4 A1）。**新测试用例要求**：把目标窗口缩到 400×300 后重跑同一条 arm，客户端坐标版本必须失效——这是"坐标空间确实按文档实现"的判别性用例（`E-INJECT-1` 追加组）。**该判别性用例已于 2026-10-08 跑到**（§24.6.2 结论 3）：目标缩到 420×320 并等 1500 ms 稳定后，`screen` 400 px 成功、`client` **0 px 连跑两次**（页面自报 `y` 同为 0）⇒ **判别成立，实现的强制形式是"屏幕坐标，不得用 `LOWORD`/`HIWORD`"**。
 3. **"一次连发 N notch"是不可用的测量方式，而且这条教训对产品同样成立。** 第一次运行时对同一夹具连发 8 notch 得到 `2 px`；`EDIT` 得到 `0 px` 且 `corr=1.000`。改成分步测量 + 把夹具从文本页换成横条页后立刻得到 800/120 px。**两个原因都是真实的**：(a) 连发 8 notch 的位移超过一个视口，任何行/区域估计器都看不到；(b) **文本行渲染的逐像素行信号带行高（19 px）的强载波**——非整数倍行高的平移仍会给出 `corr≈0.6–0.8` 的伪峰。这**实测支撑了 §15.4 把 1D 行指纹限制为"只产生候选、永不作为判据"**，也**实测支撑了 §15.2 的前提（搜索窗来自控制回路：因为是我们自己注入的，才知道该期待多大的位移）与 §16.10 的逐状态处理**——每一 notch 都必须有一次独立的估计与判定，把多 notch 合并成一次估计会让整条判据链失效。
 4. **`EDIT`/`notepad.exe` 不能用作滚动夹具。** 该控件类既不响应注入滚轮、也不响应 `WM_VSCROLL`（自检 0 px）。**用"记事本"当夹具会得到"注入无效"的假结论**——这正是 §35 P0.6 原表里"记事本"那一格的真实含义：它测的是控件类，不是注入。自建窗口才有独立可信的到达计数。
 5. **测量装置在文本区域会失效，而这是设计里已经预期的**（2026-10-08 追加实测）。同一组 arm 落在 `tests/fixtures/scroll-demo.html` 的**文本区**（420 行等宽文本、19 px 行距、每行墨量随机）时，8 notch 得到 `corr@0 = 0.79–0.88`、最佳位移只有 10–25 px、`corr ≈ 0.81–0.85`——**既没有可信的峰，也没有明确的"没动"**。把同一个 URL 换成 `#rows-section`（周期自由区）后立刻恢复为 **`SendInput` 800 px、`PostMessageW` 800 px**（`corr@0 = 0.085–0.106`、runner-up 0.52），与横条页完全一致。两点结论：(a) **传输结论在真实网页上复现**，不是横条夹具的产物；(b) **`corr@0` 高且 `corr` 也高**是"这一帧内容对位移不敏感"的特征——这正是 §15.4 把 1D 行指纹限制为"只产生候选"、以及 §16 要求 `margin`/`residual_gain` 门限的原因；把这种画面判成"位移 10 px"是典型的**错误确定**。探针因此把传输测量固定在 `#rows-section`，文本区域留给 `E-ACC-1`（P1）。
 
 **顺带排除的混杂因素**：首次运行时 PixPin（PID 14928）正在运行且装有 `SetWindowsHookEx` 低层鼠标钩子（§6 记它有过"Synthetic Ctrl+C event detected and filtered"的先例）——当时怀疑它吞掉了带 `LLMHF_INJECTED` 的注入滚轮。**实测排除**：自建窗口的 `SendInput` 到达计数 8/8、Chrome 也照常滚动。
 
-#### 24.6.2 `E-INJECT-1` 仍然开放的部分（不得据本机一次实验推断）
+#### 24.6.2 `E-INJECT-1` 的五目标矩阵与完整性壁垒（2026-10-08 实测，本节该组已关闭）
+
+第一版此处的表列的是"仍未被本机结果覆盖"的四项。**其中三项已实测关闭**（Edge/Electron/WinUI3 两条传输、非前台 `SendInput`、小窗口两坐标空间），一项**环境不可构造**（WebView2 宿主），另有**两项新开**（非浏览器目标的负答案无法解释、低完整性发送方无法放置光标）。下表是 run 5（`cargo test -p snapclip-capture --lib inject_matrix_probe -- --ignored --nocapture --test-threads=1`，76.27 s，`docs/Temp/p009-matrix-run5.txt`）与两次 `uipi_probe` 的完整结果。
+
+**装置的新增部分**：夹具 `crates/snapclip-capture/tests/fixtures/scroll-demo.html` 现在把滚动位置写进**窗口标题**（`scroll` 事件经 `requestAnimationFrame` 更新 `document.title = base + " y=" + Math.round(scrollY)`），探针用 `page_scroll_y()` 读它，于是每条臂都有**两条独立通道**（像素位移 + 页面自报 `y`）。这不是装饰：像素通道区域平坦或内容被遮挡时，"移动了"与"没移动"看起来一样，而标题不属于客户区、跨进程可读。**两条通道在 Chrome / Edge 的每一次测量里都一致**（见下表 `y` 列）。
+
+| 目标 | 传输 | 坐标空间 | 发出 | 像素位移 | 页面自报 `y` | `corr` / `corr@0` | verdict |
+|---|---|---|---|---|---|---|---|
+| 自建窗口 | `SendInput` | client | 8 notch | 120 px | — | 1.000 / 0.022 | 到达计数 8/8 |
+| 自建窗口 | `PostMessageW` | client | 8 notch | 120 px | — | 1.000 / 0.059 | 到达计数 8/8 |
+| Chrome | `SendInput` | client | 8 notch | **800 px** | **+800** | 0.740 / 0.106 | SCROLLED |
+| Chrome | `PostMessageW` | client | 8 notch | **800 px** | +800 | 0.801 / 0.085 | SCROLLED |
+| Chrome | `PostMessageW` | screen | 4 notch | **400 px** | +400 | 0.812 / 0.132 | SCROLLED |
+| Chrome | `SendInput`（`VK_DOWN` 对照） | client | 16 次 | **320 px** | +320 | 0.648 / 0.266 | SCROLLED |
+| Edge | `SendInput` | client | 8 notch | **0 px** | **0** | 1.000 / 1.000 | **NO MOVEMENT** |
+| Edge | `PostMessageW` | client | 8 notch | 400 px | +400 | 0.159 / 1.000 | SCROLLED |
+| Edge | `PostMessageW` | screen | 4 notch | 400 px | +400 | 0.761 / 0.271 | SCROLLED |
+| Edge | `SendInput`（`VK_DOWN` 对照） | client | 16 次 | **320 px** | +320 | 0.688 / 0.181 | SCROLLED |
+| Electron（Qoder IDE，附着） | `SendInput` | client | 8 notch | 0 px | 无通道 | 0.834 / 0.834 | **未取得** |
+| Electron（Qoder IDE） | `PostMessageW` | client / screen | 8 / 4 | 0 px | 无通道 | 1.000 / 1.000 | **未取得** |
+| Electron（Qoder IDE） | `SendInput`（`VK_DOWN`） | client | 16 次 | 0 px | 无通道 | 1.000 / 1.000 | **未取得** |
+| WinUI3（打包版设置，附着） | `SendInput` | client | 8 notch | 0 px | 无通道 | 0.625 / 0.625 | **未取得** |
+| WinUI3（打包版设置） | `PostMessageW` | client / screen | 8 / 4 | 0 px | 无通道 | 1.000 / 1.000 | **未取得** |
+| WinUI3（打包版设置） | `SendInput`（`VK_DOWN`） | client | 16 次 | 0 px | 无通道 | 0.591 / 1.000 | **未取得** |
+| Chrome（缩到 420×320） | `PostMessageW` | **screen** | 4 notch | **400 px** | +400 | 0.436 / 0.294 | SCROLLED |
+| Chrome（缩到 420×320） | `PostMessageW` | **client**（第 1 次） | 4 notch | **0 px** | **0** | 1.000 / 1.000 | **NO MOVEMENT** |
+| Chrome（缩到 420×320） | `PostMessageW` | **client**（第 2 次） | 4 notch | **0 px** | 0 | 1.000 / 1.000 | **NO MOVEMENT** |
+| Chrome（非前台） | `SendInput` | client | 4 notch | **400 px** | +400 | 0.447 / 0.049 | SCROLLED，且**自控夹具 0 px** |
+
+**七条结论**：
+
+1. **`docs/30` 的"两条并列路径"在真实网页上于 Chrome 与 Edge 都被确认**，但**两者的失败方向不同**：Chrome 两条路径都成功（800/800），**Edge 的 `SendInput` 完全无效（0 px，`corr@0 = 1.000`，页面标题 `y` 也确认没动）而 `PostMessageW` 有效（400 px）**。同一条 Edge 窗口的**键盘对照臂（`VK_DOWN`）滚了 320 px**，所以这不是"窗口收不到我们的输入"，而是 **Edge 不响应合成的滚轮 `SendInput`**。**歧义已排除**：瞄准诊断（见结论 4）打印出 `the wheel is aimed at 0x38d115c class Chrome_RenderWidgetHostHWND (target 0x17201e2)`——光标确实在 Edge 的 render host 子窗口上。⇒ **产品侧不能"先试 `SendInput` 失败再退 `PostMessageW`"就完事；对 Edge 必须能从第一次的"零位移"里得出结论**，这正是 §24.7 自检机制（连续 3 步无位移就切路径）存在的理由，而现在它有了一条真实的、可复现的目标作为依据。
+2. **`SendInput` 与 `PostMessageW` 的"是否报错"完全不同，必须分别处理**：Edge 的 `SendInput` 是**静默的**（`SendInput` 返回已投递事件数 1，无错误码，目标不动）；低完整性发送方的 `PostMessageW` 是**响亮的**（`Win32 error 5`）。**只按错误码判断"注入是否生效"会漏掉一整类失败**（结论 6 的 UIPI 臂里 `SendInput` 同样是"accepted + 0 px"）。
+3. **小窗口下两个坐标空间**：`screen` 400 px / `client` **0 px，且连跑两次都是 0**。第二次失败排除了"改尺寸后 reflow 未稳定"的顺序解释（改尺寸后等待已从 700 ms 提到 1500 ms），页面标题通道同样报 `0`。⇒ **§24.6.1 结论 2 的判别性用例成立**：`WM_MOUSEWHEEL` 的 `lParam` 必须是**屏幕坐标**，客户端坐标在窗口小于"客户端坐标恰好仍落在客户区内"的几何条件时会被窗口丢弃。**实现必须用屏幕坐标，且不得用 `LOWORD`/`HIWORD`**（多显示器下的官方陷阱，§6.4 A1）。
+4. **瞄准是多显示器/多层窗口下不可或缺的诊断**：`describe_scroll_target` 打印所属进程镜像路径、最深层子窗口类、以及 `WindowFromPoint(客户区中心)` 的类名；每条 `SendInput` 臂在 `SetCursorPos` 之后打印 `the wheel is aimed at <hwnd> class <class> (target <hwnd>)`。**`MOUSE_POS` 路由下滚轮去的是"光标所在的窗口"**，所以没有这一行，"目标忽略了滚轮"与"滚轮根本没瞄准目标"无法区分——本次两轮里它一次抓到了真实混淆（低完整性子进程的**控制台窗口**落在了目标中心上，滚轮打给了控制台）。
+5. **非前台目标（`OQ-5` 的那一半）实测成立，但它同时**修正了 §24.6 判定规则 1 的前提**：目标不是前台、光标停在其客户区中心时，`SendInput` 把 Chrome 滚了 400 px，而**当时真正拥有前台的我们自己的夹具消费 0 px**。⇒ 在本机的 `MOUSE_POS` 路由下，**滚轮跟随光标而不是跟随前台窗口**；"`SendInput` 会打到前台窗口"这个正确性顾虑因此应当改写成"**必须先把光标放到目标上**"（这是实现已经在做的事，但理由不同）。`SPI_GETMOUSEWHEELROUTING` 是用户可改的系统设置，产品**必须在会话开始时读它**并据此选择路径（`OQ-5` 的剩余部分：另外两种取值下的行为仍未测）。
+6. **完整性壁垒（`OQ-3`）现在是实测而不是文档旁证**，并且**低完整性发送方是可以构造出来的**：
+   - `runas /trustlevel:0x20000` **不能**产生低完整性进程——受限令牌继承父进程的强制标签，实测子进程仍是 `Mandatory Label\High Mandatory Level S-1-16-12288`。真正需要的是**改写令牌本身**，见 `tools/p009-low-integrity-launch.ps1`（`DuplicateTokenEx` + `SetTokenInformation(TokenIntegrityLevel, S-1-16-4096)` + `CreateProcessWithTokenW`），子进程自报 `Mandatory Label\Low Mandatory Level S-1-16-4096`。
+   - **高完整性发送方**（同一会话、同一窗口）：`SendInput` 400 px、`PostMessageW` 400 px，标题 +800。
+   - **低完整性发送方 → 高完整性目标**（光标由高完整性辅助进程预先放好，`SNAPCLIP_UIPI_NO_AIM=1`）：`SendInput` **accepted（投递 4 个事件）但 0 px**（`corr = corr@0 = 1.000`，标题 `y` 也不动）；`PostMessageW` **被拒绝，`Win32 error 5`（ERROR_ACCESS_DENIED）**。
+   - ⇒ **两条路径都被 UIPI 挡住**，`§24.5` 的判断与 F-13 设想的"`PostMessageW` 是提权目标上的旁路"**在同一台机器上被否证**：`PostMessageW` 到更高完整性窗口的请求直接失败。**产品在提权目标上没有第二条通道**，与 PixPin 的行为一致（`docs/26`）。**必须写进用户可见文案**：会话开始时若目标的完整性高于自身，应在**开始滚动之前**说明"该窗口无法驱动"，而不是滚了 3 步再报 `ActuatorFailed`。
+   - **附带发现（新开项）**：低完整性发送方连 `SetCursorPos` 都失败（返回 `FALSE` 且 `GetLastError() == 0`，即**静默拒绝**）——所以 `MOUSE_POS` 路由下"把光标放到目标上"这个**前置条件本身就不可满足**。这使"提权目标"的失败点在实现上更早、更明确：不需要先注入再判断，**放置光标就是第一个判定点**。
+7. **非浏览器目标的负答案仍不可解释（新开项）**：Electron（附着运行中的 Qoder IDE）与打包版 WinUI3（`ms-settings:appsfeatures`）在**四条臂（含键盘对照）上全部 0 px**，而这两个目标**没有第二条通道**（页内自报 `y` 是夹具的能力，不是任意窗口的能力）。三条已排除的解释：① 选窗缺陷——按 `IsIconic` 过滤后附着的是最大化窗口（`electron` 的客户区 `(0,0)-(3840,2088)`，variance 0.0018）；② 遮挡——瞄准诊断确认光标在 `Chrome_RenderWidgetHostHWND` / `Windows.UI.Core.CoreWindow` 子窗口上；③ 黑帧——`describe_scroll_target` 的 variance 非零。**不能排除的解释**：目标确实没有可滚内容、XAML/Electron 内容不接受合成输入、打包应用的 `WM_MOUSEWHEEL` 落在 shell 宿主窗口（`ApplicationFrameWindow`）而不是其 `CoreWindow` 子窗口、以及**键盘对照臂的焦点前提**（探针从不点击一个不属于自己的窗口，所以 `VK_DOWN` 的 0 不能单独证明"没有可滚内容"）。⇒ **新开项（`OQ-15`）**：需要一个**非像素的滚动见证**（候选：UI Automation 的 `ScrollPattern.VerticallyScrollable` / `VerticalScrollPercent`）才能把"没有可滚内容"与"输入没到达"分开；在没有它之前，§4.1 的多证据仲裁在任何非浏览器目标上都只能给出"未取得"。
+
+**仍然开放的部分**（修订后）：
 
 | 仍未验证 | 为什么不能被本机结果覆盖 | 归属 |
 |---|---|---|
-| Edge / Electron / WebView2 / WinUI3 | 本机只跑了 Chrome；同为 Chromium 派生不等于同一条消息路径（WebView2 有宿主窗口层、Electron 有自己的消息钩子） | `E-INJECT-1` 剩余 6 组 |
-| UIPI：以管理员身份运行的目标窗口 | 本机**取不到这样的目标**：`EnableLUA = 0`，实测所有相关进程（harness、msedge 宿主、explorer、Typora、Qoder、PowerToys…）都是 High 完整性，只有 `SearchHost.exe` 是 Low（§24.5）。§24.5 的判断（`PostMessageW` 是提权目标上唯一可行路径）**仍只有官方文档旁证** | `OQ-3`（需要一台真实提权的机器；本机这条不阻塞实现） |
-| `SPI_GETMOUSEWHEELROUTING == MOUSE_POS(2)` 时非前台窗口能否收到 `SendInput` 滚轮 | 本机是默认值；**这是用户可改的系统设置**，不能作为设计前提 | `OQ-5` |
-| `PostMessageW` 在**小窗口**下用客户端坐标必须失败 | 本例两者都成功只是几何巧合（结论 2） | `E-INJECT-1` 追加组 |
+| WebView2 | 运行时已装（154.0.4258.53/.62），但**没有可用宿主**：本机唯一 WebView2 宿主 `SearchHost.exe` 无普通顶层窗口，"WebView2 窗口类"不存在（内容合成在宿主自己的 HWND 里） | 侧分支 `blocked/P0-05-webview2-capture`（`OQ-2`） |
+| 非浏览器目标的负答案 | 见结论 7：缺非像素滚动见证 | `OQ-15`（新） |
+| 混合 DPI（125% / 175%） | 本机是单显示器 3840×2160 @150%，取不到混合拓扑 | `OQ-4`（`P1.22` 的 DPI 扫描行） |
+| `SPI_GETMOUSEWHEELROUTING` 的另外两个取值（`CURSOR` / `FOCUS`） | 本机是 `MOUSE_POS`；该设置用户可改 | `OQ-5` 剩余部分 |
+| 低完整性发送方的 `SetCursorPos` 失败是"桌面强制标签不可写"还是别的机制 | 只测到"`FALSE` 且 `GetLastError() == 0`"这一现象，未确证机制；**但两个可能机制都指向同一结论（该前置条件不可满足）** | `OQ-3` 的注脚 |
 
 ### 24.7 遮挡、前后台与"注入是否真的生效"
 
@@ -2961,8 +3009,13 @@ fn choose(target: &ScrollTarget, probe: &ProbeResult) -> InjectPath {
 | 遮挡 | 目标窗口被完全遮挡时继续跑 10 步 | 每步仍能 `Confirmed` |
 | 拓扑变化三档 | 用 `ChangeDisplaySettingsEx` 或 mock 触发 | 三档行为与 §24.4 表一致；`Partial` 可用 |
 | 注入条件选择 | 目标前台/非前台 × 提权/非提权 4 组 | 选择结果与 §24.6 一致 |
-| UIPI | 对一个提权窗口（如管理员启动的记事本） | `PostMessageW` 生效；`SendInput` 被识别为不可用而**不被选用** |
-| 注入真的能驱动 Chromium | **已实测（`E-INJECT-1` 最小版，§24.6.1）**：`SendInput` 与 `PostMessageW` 各把 Chrome 滚了 800 px / 8 notch | 两传输都 ≥ 40 px；**仍待** Edge/Electron/WebView2/WinUI3 与小窗口坐标空间用例（§24.6.2） |
+| 非前台目标（`MOUSE_POS` 路由） | **已实测（§24.6.2 结论 5）**：目标非前台、光标停在其客户区中心，`SendInput` 4 notch | 目标滚 400 px（页面自报 `y` +400）、**当时的前台窗口（自控夹具）0 px** ⇒ 判定规则 1 已按实测改写 |
+| UIPI（低完整性发送方 → 高完整性目标） | **已实测（§24.6.2 结论 6）**：`tools/p009-low-integrity-launch.ps1` 把发送方降到 `S-1-16-4096`，目标 = 高完整性 Chrome | `SendInput` **投递成功但 0 px**（静默）；`PostMessageW` **`Win32 error 5`** ⇒ 两条路径都不可用，**开始时即拒绝**（`TargetUnreachable`）。**原表此行的"`PostMessageW` 生效"已被否证** |
+| 注入真的能驱动 Chromium | **已实测（`E-INJECT-1` 最小版，§24.6.1）**：`SendInput` 与 `PostMessageW` 各把 Chrome 滚了 800 px / 8 notch | 两传输都 ≥ 40 px |
+| 五目标注入矩阵（Edge / Electron / WinUI3 / 非浏览器） | **已实测（§24.6.2，run 5）**：每目标 4 条臂（`SendInput` / `PostMessageW` client / `PostMessageW` screen / `VK_DOWN` 对照） | Chrome 4/4 成功；**Edge `SendInput` = 0 但其余 3 条成功**（⇒ 只按错误码判断会漏）；Electron / WinUI3 **全 0 且无第二通道** ⇒ 记为"未取得"，见 `OQ-15`；WebView2 **未取得**（无宿主，侧分支 `blocked/P0-05-webview2-capture`） |
+| 小窗口两坐标空间 | **已实测（§24.6.2 结论 3）**：目标缩到 420×320、稳定 1500 ms 后各跑 4 notch | `screen` 400 px、`client` **0 px 两次** ⇒ 判别成立（§24.6.1 结论 2 的追加组已关闭） |
+| 页内自报滚动位置（第二通道） | 夹具把 `scrollY` 写进窗口标题，探针对每条臂前后各读一次 | Chrome/Edge 的像素位移与 `y` 增量**逐项一致**；非浏览器目标**没有**这条通道（`OQ-15` 的动机） |
+| 混合 DPI 注入 | 在 125% / 175% 显示器间拖窗口后重跑 | **未取得**（本机单显示器 150%，`OQ-4`） |
 
 ## 25. 浏览器兼容性
 
@@ -3472,6 +3525,7 @@ if ($hits) { Write-Error "scroll/ must stay platform-free: $($hits -join '; ')";
 | 中途切窗口再切回 | 同上 | **不终止** | L3 | — |
 | 页面缩放（Ctrl+滚轮） | 同上 | 大位移→门一拒绝；给提示 | L3 | — |
 | 滚动条在选区内 | 同上 | 写入画布；预览可见 | L3 | — |
+| 注入传输因浏览器而异 | 同一本地 HTML，Chrome 与 Edge 各跑 4 条臂 | **Edge 的 `SendInput` 实测无效（0 px，页面自报 `y` 也不动）而 `PostMessageW` 有效**；Chrome 两条都有效 ⇒ 两条路径都必须实现，且自检机制必须在"零位移"出现时切换（§24.6.2 结论 1–2） | L3 | — |
 
 ### 30.6 UI（预览与交互）
 
@@ -4003,11 +4057,11 @@ if ($hits) { Write-Error "scroll/ must stay platform-free: $($hits -join '; ')";
 
 | # | 问题 | 为什么现在不能定 | 如何定 | 阻塞什么 |
 |---|---|---|---|---|
-| **OQ-1** | `PostMessageW(WM_MOUSEWHEEL)` 到底能不能驱动 Chromium 的滚动？ | **F-14 只有源码链路旁证，没有任何官方依据**（Chromium 是否忽略跨进程投递的滚轮消息，既未证实也未证伪）；且 Chromium 的 `GetMessageTime()` 逻辑可能把连续同时间戳的滚轮误判为横向滚动 | ✅ **本机已答：能**——`E-INJECT-1` 最小版实测 `SendInput` 800 px、`PostMessageW` 800 px（各 8 notch，逐 notch 累加，§24.6.1）。**残留**：Edge/Electron/WebView2/WinUI3、小窗口坐标空间、`GetMessageTime` 同时间戳风险（本探针每次注入之间 `pump_for`，未专门构造同时间戳序列） | **不变**：`§24.6` 两条并列路径与 §13 的"不抢前台"目标都保留（原判据是"若失败则重评"，实测未失败） |
+| **OQ-1** | `PostMessageW(WM_MOUSEWHEEL)` 到底能不能驱动 Chromium 的滚动？ | **F-14 只有源码链路旁证，没有任何官方依据**（Chromium 是否忽略跨进程投递的滚轮消息，既未证实也未证伪）；且 Chromium 的 `GetMessageTime()` 逻辑可能把连续同时间戳的滚轮误判为横向滚动 | ✅ **本机已答：能**——`E-INJECT-1` 最小版实测 `SendInput` 800 px、`PostMessageW` 800 px（各 8 notch，逐 notch 累加，§24.6.1），五目标矩阵进一步确认（§24.6.2）。**残留**：Edge 的 `SendInput` 无效而 `PostMessageW` 有效；Electron/WinUI3 的负答案不可解释（`OQ-15`）；WebView2 无宿主未取得；`GetMessageTime` 同时间戳风险（本探针每次注入之间 `pump_for`，未专门构造同时间戳序列） | **不变**：`§24.6` 两条并列路径与 §13 的"不抢前台"目标都保留（原判据是"若失败则重评"，实测未失败）；**新增**：Edge 使"零位移后必须切换路径"从补偿机制变成日常机制 |
 | **OQ-2** | `WDA_EXCLUDEFROMCAPTURE` 对 WGC 窗口捕获/显示器捕获是否生效？ | **MS Learn 全系列页零处提及 WDA**（官方沉默）；且 <Win10 2004 会**静默降级为 `WDA_MONITOR`（黑块）** | `E-CAP-1` 扩一条：显示器级回退路径下开/关 WDA 各取 10 帧，逐像素比较覆盖层区域 | §24.5 的措辞与 §5.1 的"降级层"；**不影响窗口级主路径**（主路径不需要 WDA） |
-| **OQ-3** | `SendInput` 在 UIPI 场景下的方向性 | 官方两页**互相矛盾**（`SendInput` 页称可注入"同等或更低完整性"，winapp-cli 页称提权→AppContainer 会被挡） | `E-INJECT-1` 扩：以管理员身份运行的记事本为目标，比较两条路径 | §24.5 的矩阵首行；**若 `PostMessage` 也不通，则 UIPI 目标在 v1 只能"提示用户以管理员运行 SnapClip"**（与 PixPin 一致——它也**没有**第二条捕获通道） |
+| **OQ-3** | `SendInput` 在 UIPI 场景下的方向性 | 官方两页**互相矛盾**（`SendInput` 页称可注入"同等或更低完整性"，winapp-cli 页称提权→AppContainer 会被挡） | ✅ **本机已答（2026-10-08，§24.6.2 结论 6）**：把**发送方**降到 `S-1-16-4096`（`tools/p009-low-integrity-launch.ps1`，`runas /trustlevel` **不行**）、目标 = 高完整性 Chrome ⇒ `SendInput` **投递成功但 0 px**、`PostMessageW` **`Win32 error 5`** ⇒ **两条路径都不可用**。**残留注脚**：低完整性发送方连 `SetCursorPos` 都静默失败（`FALSE` 且 `GetLastError() == 0`），机制未确证（两个候选机制都指向同一结论） | ✅ **已决**：提权目标在 v1 **只能"提示用户以管理员运行 SnapClip"**（与 PixPin 一致），且必须在**开始滚动之前**提示；`§24.5` 的矩阵首行与 F-13 的旁路设想都已按实测改写 |
 | **OQ-4** | 125%/150%/175% 缩放下"整数物理像素位移"是否成立？ | **F-23**：Chromium 布局是 1/64 px 定点、滚动偏移只在暴露给 Web 时吸附物理像素 → 位移**可能是物理非整数**（如 1.25 px） | 需要 125%/150% 的真实显示器（**本机 `PixelRatio: 1`，取不到**） | §16.1 门一与 N3；若位移确实非整数，则"整宽行带 + 整数位移"模型会出现**周期性丢行** → 需要重新评估（可能引入"累计小数余量"） |
-| **OQ-5** | `SPI_GETMOUSEWHEELROUTING` 为 `MOUSE_POS(2)` 时，非前台窗口能否收到 `SendInput` 滚轮？ | 本机实测是 `2`，但**这是用户可改的系统设置**，不能作为设计前提；官方页只说明默认值 | 在两种设置下各跑一次 `E-INJECT-1` 第 1 组 | §24.6 的"非前台 → 必须 `PostMessageW`"是否过严 |
+| **OQ-5** | `SPI_GETMOUSEWHEELROUTING` 为 `MOUSE_POS(2)` 时，非前台窗口能否收到 `SendInput` 滚轮？ | 本机实测是 `2`，但**这是用户可改的系统设置**，不能作为设计前提；官方页只说明默认值 | ⚠️ **本机已答一半（§24.6.2 结论 5）**：`MOUSE_POS` 下**能**——目标非前台、光标停在其客户区中心时滚了 400 px，而当时的前台窗口消费 0 px ⇒ **滚轮跟随光标而非前台窗口**。**残留**：`CURSOR` / `FOCUS` 两个取值下的行为仍未测 | §24.6 判定规则 1 **已按实测改写**（从"`SendInput` 打到前台窗口"改为"打到光标所在窗口"，实现的不变式 = 先把光标放到目标上）；`SPI_GETMOUSEWHEELROUTING` 列入会话开始时的必读设置 |
 | **OQ-6** | 水平轴到底慢多少？值不值得转置存储？ | **无任何公开数据**（F-08），参考实现只承认 S7"水平轴明显更慢" | `E-PERF-3` | P1.2 的降采样实现（若慢到不可接受，考虑"列优先"的临时转置） |
 | **OQ-8** | `E-PERF-1` 会不会显示"三层漏斗太慢"？ | 纯理论无法判断（F-08 无数据） | `E-PERF-1` | §15.4 是否需要第四层（多尺度/预降采样） |
 | **OQ-9** | `24 MP` 的 `MAX_DECODE_PIXELS` 是否要放宽？ | 它是**读回侧的既有约束**；放松会影响历史库的内存上界；而长图导出后**无法被自己的读回路径解码**（§5） | 需要先明确"长图是否需要被读回"（历史列表/OCR/再编辑） | §17.6 的导出预算与 §19.2 的预览路径；**若长图必须可读回，则读回路径必须改为"分块解码"**——这是一项**新增**工作 |
@@ -4016,6 +4070,7 @@ if ($hits) { Write-Error "scroll/ must stay platform-free: $($hits -join '; ')";
 | **OQ-12** | `E-DYN-1`（稀疏光流）到底要不要保留？ | 它的**唯一用途**是定位动态内容，而 §18.2 的降权可能已经足够 | `E-DYN-1`：在 `E-ACC-1` 的"动态占比 30%/60%"维度上加一次对比（有/无光流） | §18.4 的实现；**判据是"是否改善错误确定率"，不改善就删除**（AGENTS.md 第 6 条） |
 | **OQ-13** | DXGI `GetFrameMoveRects` 是否应作为显示器级回退路径的位移来源？ | 它是系统唯一"直接给出内容移动了多少"的信号（对 Desktop Duplication 有效），但 **v1 主路径走 WGC 用不到**（R-20/N7） | 只有在 P2 之后仍需"显示器级高质量"时才评估 | 不阻塞任何阶段；**记录以免遗忘** |
 | **OQ-14** | `CreateForWindow` 接受**子窗口** HWND 吗？**最小化**的窗口呢？ | **官方依据缺口**（§6.4 B9：Learn 系列页对两者都没有说明）；本机 `E-CAP-1` 只测了顶层窗口、且目标都未最小化 | `E-CAP-1` 追加两格：对 `Chrome_RenderWidgetHostHWND` 子窗口句柄、对一个 `SW_MINIMIZE` 后的窗口各取 10 帧 | `P2.01` 的 `ScrollTarget::validate`（若子窗口可用，"句柄必须是顶层窗口"这条约束可以放松）；若最小化不可用，§24.4 的"最小化 → 停止 + `Partial`"保持不变 |
+| **OQ-15** | **非浏览器目标**（Electron / WinUI3 / 任意自绘窗口）上，如何把"没有可滚内容"与"注入没有到达"分开？ | §24.6.2 结论 7：这两个目标在**四条臂**（含 `VK_DOWN` 对照）上全 0 px，而它们**没有第二通道**——页内自报 `y` 是滚动夹具的能力（它改自己的窗口标题），不是任意窗口的能力。三条解释已排除（选窗缺陷 / 遮挡 / 黑帧），剩下三条无法区分（真的没有可滚内容、内容不接受合成输入、消息落在 shell 宿主窗口而不是内容子窗口）。**这条缺口对产品有直接影响**：§4.1 的多证据仲裁在非浏览器目标上只能给出"未取得"，而用户会把它读成"软件坏了" | **需要非像素的滚动见证**。候选（按代价排序）：① UI Automation 的 `ScrollPattern`（`VerticallyScrollable` / `VerticalScrollPercent`）——**注意这与 §8 N2"不把控制流建立在 UIA 上"不矛盾**：UIA 只作为**诊断/见证**，绝不作为驱动或位移来源；② 目标进程可读的自报量（仅对 Electron/WebView2 这类我们已知的自绘框架）；③ 一个"内容确实可滚"的**前置探测**（滚动前试 1 notch 并观察是否有任何像素变化，代价是可能多滚一步） | `P3.02` 的"注入失败的用户可见语义"与 §4.1 的 `Unverifiable` 状态在生产上是否足够；**在定下来之前，非浏览器目标的负答案必须标"未取得"而不是"失败"** |
 
 ### 36.3 明确**不是**开放问题的（已经确定，记录以防反复）
 
