@@ -3754,6 +3754,40 @@ impl Scratch {
 
 **探针的两处刻意偏离（记录以便复核装置）**：① 用**轮询**而不是 `FrameArrived` 回调取帧，让"等帧"与"取像素"两段时间可以分别测量；② **会话选项失败只收集不传播**——因为它要回答的正是"接口在哪些系统上不存在"，传播会把一条发现变成一次丢帧。
 
+#### 24.2.2 落地的形状与第二次实测（`P2.01`，2026-10-09）
+
+`windows/win/wgc.rs` 现在有**两条并列路径**，共用一套错误词汇：
+
+| 路径 | 用途 | 帧池 | 生命周期 |
+|---|---|---|---|
+| `capture_monitor(device, layout)` | 普通截图（**保护项**） | `2` | 每帧一开一关，本次改动**一行未动** |
+| `WgcSession::open(device, hwnd)` | 滚动帧源 | `SESSION_POOL_BUFFERS = 3` | 会话级：一个 item、一个 pool、一个 session |
+
+`WgcSession` 的形状：
+
+- `open` = `is_supported()` → `create_item_for_window(hwnd)` → `item.Size()` → `CreateFreeThreaded(..., 3, content)` → `FrameArrived`（失败**记诊断**）→ `CreateCaptureSession` → 两个会话选项**都记诊断、都不传播** → `StartCapture`。
+- `next_frame(timeout) -> Result<Option<WgcFrame>, WgcError>`：`TryGetNextFrame` 的 `Err` 在 `#code == 0` 时是**静止**（继续等到 deadline 后返回 `Ok(None)`），其它 code 才是失败；取到帧后按 `PoolSizing::observe(frame.ContentSize())` 决定是否 `pool.Recreate(...)`。**`Ok(None)` 与 `Err` 的分工就是 §24.2.1 事实 1 与 2 的代码形式**。
+- `WgcFrame` **持有 `Direct3D11CaptureFrame`**：纹理指向池拥有的缓冲，提前丢弃帧会让池回收它，而 `P2.02` 的回读发生在 `next_frame` 返回**之后**。
+- `WgcError { InvalidTarget { handle, detail }, Failed { context, detail } }`；`CreateForWindow` 的 `E_INVALIDARG` / `E_HANDLE` 分类为 `InvalidTarget`，其余为 `Failed`。**刻意不复用 crate 级 `CaptureError`**：滚动路径必须能区分"目标没了"（→ `EndReason::TargetLost` + `Partial`，`P2.07`）与"捕获坏了"，而 `CaptureError::WindowFailed` 把两者揉成一个变体。
+- `Drop` 移除 `FrameArrived` 令牌并关闭 session 与 pool；调用方不需要做任何事。
+- `create_item_for_monitor` 的错误类型一并收敛为 `WgcError`，在 `capture_monitor` 边界 `.map_err(|error| error.to_string())` 转回 `String`——**签名与行为不变**，只是模块内只有一套错误词汇。
+
+**探针改为驱动生产路径**（`crates/snapclip-capture/src/windows/scroll_probe.rs`）：`capture_window_arm` 不再自己拼 pool 与 session，而是 `WgcSession::open` + `session.next_frame`，`recreates` 直接取 `session.recreations()`。随之**删除四份重复实现**（`create_item_for_window`、`direct3d_device`、`texture_of`、`next_capture_frame`）与两个常量（`CAPTURE_BUFFER_COUNT`、`CAPTURE_POLL_INTERVAL`），`an_unknown_window_handle_reports_unavailable` 改为断言**生产函数**返回 `WgcError::InvalidTarget`，`WindowInfo`/`WindowMatch`/`visible_windows`/`wait_for_new_window`/`pump_for` 提升为 `pub(crate)` 供 `wgc.rs` 的真实桌面用例复用。**理由**：探针若继续维护一份私有副本，它测的就不再是产品要走的那条路（`P0.05` 的结论会随生产代码漂移而失效）。
+
+**第二次实测（2026-10-09，同一条探针，现在走生产路径）**：
+
+| 目标 | `item.Size()` | 槽（总 / `Idle`） | 黑帧 | 首帧 | 最慢回读 | `Recreate` | 结论 |
+|---|---|---|---|---|---|---|---|
+| Chrome | 1188×894 | 10 / 4 | 0 | 25.1 ms | 2.6 ms | 0 | 可用 |
+| Edge | 1188×894 | 10 / 0 | 0 | 8.9 ms | 2.6 ms | 0 | 可用 |
+| Electron（附着已运行的实例） | 3840×2088 | 10 / 0 | 0 | 17.7 ms | 10.9 ms | 0 | 可用 |
+| WinUI3（打包应用） | 484×801 | 10 / 0 | 0 | 6.6 ms | 1.1 ms | 0 | 可用 |
+| 记事本（Notepad3） | 1280×960 | 10 / 3 | 0 | 5.9 ms | 2.3 ms | 0 | 可用 |
+| WebView2 | — | — | — | — | — | — | **未取得**（原因同 §24.2.1） |
+| 无效句柄 `HWND(0)` | — | — | — | — | — | — | `WgcError::InvalidTarget`（`#code = -2147024809`） |
+
+**与 §24.2.1 的差异有解释，不是矛盾**：`Idle` 槽数变了（Chrome 5 → 4、Edge 1 → 0、记事本 0 → 3）。这次走的是**事件驱动**的等待（`FrameArrived` 注册成功），上一次是 5 ms 轮询——帧到达的时机相同，"这一次调用有没有拿到帧"因此不同。**`Recreate` 仍是 0（六臂共 60 个槽）**，这是 §24.2"跨帧复用"行的直接证据；`P2.01` 另有 100 次 `observe` 的机械用例把这条钉成回归。
+
 ### 24.3 捕获会话选项必须**探测**且**失败可见**
 
 **F-15 与 §5 的对照给出的三处修正**：

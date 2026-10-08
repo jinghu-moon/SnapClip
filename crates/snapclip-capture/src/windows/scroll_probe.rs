@@ -71,14 +71,14 @@
 //! cargo test -p snapclip-capture --lib capture_probe -- --ignored --nocapture
 //! ```
 //!
-//! Three things about this arm are deliberate deviations from the production path,
-//! and all are recorded in `docs/30` §24.2 rather than hidden here: it **polls**
-//! `TryGetNextFrame` instead of registering `FrameArrived` (so that "waiting for a
-//! frame" and "getting the pixels out" stay separately measurable); it
-//! **collects** session-option failures instead of propagating them, because a
-//! missing `GraphicsCaptureSession2/3` interface is a finding, not a reason to
-//! lose the frames; and it **records a frame-less slot as idle instead of failing
-//! the arm**. The first run failed Chrome and Edge at 1500ms and looked like two
+//! Since `P2.01` the arm drives the **production** session (`wgc::WgcSession`)
+//! rather than a private copy of it, so these numbers describe the code the scroll
+//! loop will use. Two behaviours are still the arm's own, and both are recorded in
+//! `docs/30` §24.2 rather than hidden here: it **collects** session-option failures
+//! (the session records them as diagnostics instead of propagating them, because a
+//! missing `GraphicsCaptureSession2/3` interface is a finding, not a reason to lose
+//! the frames); and it **records a frame-less slot as idle instead of failing the
+//! arm**. The first run failed Chrome and Edge at 1500ms and looked like two
 //! unavailable targets; the failure was the probe's assumption that a window keeps
 //! producing frames whether or not its content changes.
 
@@ -86,20 +86,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::ptr;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
-use std::thread;
 use std::time::{Duration, Instant};
-
-use ::windows::Graphics::Capture::{Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem};
-use ::windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
-use ::windows::Graphics::DirectX::DirectXPixelFormat;
-use ::windows::Graphics::SizeInt32;
-use ::windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
-use ::windows::Win32::Graphics::Dxgi::IDXGIDevice;
-use ::windows::Win32::System::WinRT::Direct3D11::{
-    CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
-};
-use ::windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
-use ::windows::core::{Interface, factory};
 
 use windows_sys::Win32::Foundation::{
     BOOL, CloseHandle, FALSE, HWND, LPARAM, LRESULT, POINT, RECT, TRUE, WPARAM,
@@ -127,7 +114,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use crate::geometry::{Point, Rect};
 use crate::windows::monitor;
-use crate::windows::win::{bitblt, d3d11, hresult};
+use crate::windows::win::{bitblt, d3d11, wgc};
 use windows_sys::Win32::System::Threading::{
     OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
@@ -292,10 +279,10 @@ fn from_wide(buffer: &[u16]) -> String {
 }
 
 #[derive(Clone, Debug)]
-struct WindowInfo {
-    hwnd: HWND,
-    title: String,
-    class: String,
+pub(crate) struct WindowInfo {
+    pub(crate) hwnd: HWND,
+    pub(crate) title: String,
+    pub(crate) class: String,
 }
 
 fn window_title(hwnd: HWND) -> String {
@@ -330,7 +317,7 @@ unsafe extern "system" fn collect_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
     TRUE
 }
 
-fn visible_windows() -> Vec<WindowInfo> {
+pub(crate) fn visible_windows() -> Vec<WindowInfo> {
     let mut out: Vec<WindowInfo> = Vec::new();
     unsafe {
         EnumWindows(Some(collect_window), &mut out as *mut _ as LPARAM);
@@ -403,7 +390,7 @@ fn deepest_child_at(root: HWND, screen: Point) -> HWND {
 /// Every wait in this file goes through here rather than `sleep`: the Win32
 /// fixture is a window owned by this thread, so if we stopped pumping it would
 /// stop scrolling — and then the experiment would measure our own neglect.
-fn pump_for(duration: Duration) {
+pub(crate) fn pump_for(duration: Duration) {
     let deadline = Instant::now() + duration;
     let mut message: MSG = unsafe { std::mem::zeroed() };
     while Instant::now() < deadline {
@@ -2065,21 +2052,15 @@ fn a_zero_wheel_scroll_lines_setting_means_the_wheel_does_not_scroll() {
 /// decides whether one pool may stay alive for the whole session.
 const CAPTURE_FRAMES: usize = 10;
 
-/// The experiment asks for three buffers; the production frame source asks for two
-/// (`windows/win/wgc.rs:74-80`). Which number survives ten frames is the question.
-const CAPTURE_BUFFER_COUNT: i32 = 3;
-
-/// Mirrors `wgc::FIRST_FRAME_TIMEOUT`: how long one frame slot waits before it is
-/// called idle. Measured 2026-10-08, this is a *cadence* timeout and not an
-/// availability test: a live target answered in 11–64ms, while a static one
-/// answered never, so the timeout separates `Idle` from failure with two orders of
-/// magnitude to spare.
+/// How long one frame slot waits before it is called idle. Measured 2026-10-08,
+/// this is a *cadence* timeout and not an availability test: a live target answered
+/// in 11–64ms, while a static one answered never, so the timeout separates `Idle`
+/// from failure with two orders of magnitude to spare.
+///
+/// The pool capacity this arm runs with is no longer a probe constant: since
+/// `P2.01` the arm drives `wgc::WgcSession`, so it measures the production value
+/// (`wgc::SESSION_POOL_BUFFERS`).
 const CAPTURE_FRAME_TIMEOUT: Duration = Duration::from_millis(1500);
-
-/// Mirrors `wgc::FRAME_POLL_INTERVAL`. The probe polls `TryGetNextFrame` instead of
-/// registering `FrameArrived`, so that the two phases it reports — waiting for a
-/// frame, and getting its pixels into CPU memory — stay separately visible.
-const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// Consecutive idle slots that end an arm early. Ten idle slots would spend ten
 /// timeouts to learn what three already say; the first run showed a live target
@@ -2357,15 +2338,21 @@ fn the_capture_probe_detects_a_black_frame() {
 ///
 /// This is the path every missing target takes (no Electron installed, a WebView2
 /// host that is not running), so it has to be exercised by the suite rather than
-/// discovered on the one machine that happens to lack a target.
+/// discovered on the one machine that happens to lack a target. Since `P2.01` it
+/// goes through the **production** item factory, so the probe and the scroll path
+/// cannot disagree about what "not a target" means.
 #[test]
 fn an_unknown_window_handle_reports_unavailable() {
-    let error = create_item_for_window(ptr::null_mut())
+    let error = wgc::create_item_for_window(0)
         .err()
         .expect("CreateForWindow(null) must not produce a capture item");
     assert!(
-        error.contains("#code="),
-        "the unavailability reason must keep the HRESULT for diagnostics, got {error:?}"
+        matches!(&error, wgc::WgcError::InvalidTarget { .. }),
+        "a null handle is not a target, and it is not a capture failure either: {error:?}"
+    );
+    assert!(
+        error.to_string().contains("#code="),
+        "the unavailability reason must keep the HRESULT for diagnostics, got {error}"
     );
 }
 
@@ -2396,7 +2383,7 @@ fn window_handles() -> Vec<HWND> {
 }
 
 /// How to recognise the window a launcher just brought up.
-enum WindowMatch<'a> {
+pub(crate) enum WindowMatch<'a> {
     /// Any new top-level window. Notepad, an Electron app and a WinUI3 app each
     /// name their windows differently, so guessing a title reports "the target
     /// never appeared" when in fact it appeared under another name.
@@ -2408,7 +2395,7 @@ enum WindowMatch<'a> {
 }
 
 /// Wait for a top-level window that was not there before the target was launched.
-fn wait_for_new_window(
+pub(crate) fn wait_for_new_window(
     known: &[HWND],
     wanted: WindowMatch<'_>,
     timeout: Duration,
@@ -2516,74 +2503,6 @@ fn shutdown_target(target: &mut LaunchedTarget) {
     }
 }
 
-fn create_item_for_window(hwnd: HWND) -> Result<GraphicsCaptureItem, String> {
-    let interop = factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
-        .map_err(|error| hresult("factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>", &error))?;
-    // SAFETY: `hwnd` is either a live top-level window or a handle that is not a
-    // window at all. `CreateForWindow` validates its argument and reports the
-    // failure; `an_unknown_window_handle_reports_unavailable` asserts that.
-    unsafe {
-        interop
-            .CreateForWindow::<GraphicsCaptureItem>(::windows::Win32::Foundation::HWND(hwnd))
-            .map_err(|error| hresult(&format!("CreateForWindow({})", format!("{hwnd:p}")), &error))
-    }
-}
-
-/// The WinRT view of the D3D11 device (`wgc.rs:64-73` does the same two steps).
-fn direct3d_device(device: &d3d11::GraphicsDevice) -> Result<IDirect3DDevice, String> {
-    let dxgi_device: IDXGIDevice = device
-        .device()
-        .cast()
-        .map_err(|error| hresult("IDXGIDevice::cast", &error))?;
-    // SAFETY: `dxgi_device` belongs to the D3D11 device this process created.
-    let inspectable = unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device) }
-        .map_err(|error| hresult("CreateDirect3D11DeviceFromDXGIDevice", &error))?;
-    inspectable
-        .cast::<IDirect3DDevice>()
-        .map_err(|error| hresult("IDirect3DDevice::cast", &error))
-}
-
-/// The texture behind a captured frame (`wgc.rs:132-139` does the same cast).
-fn texture_of(frame: &Direct3D11CaptureFrame) -> Result<ID3D11Texture2D, String> {
-    let surface = frame
-        .Surface()
-        .map_err(|error| hresult("Direct3D11CaptureFrame::Surface", &error))?;
-    let access: IDirect3DDxgiInterfaceAccess = surface
-        .cast()
-        .map_err(|error| hresult("IDirect3DDxgiInterfaceAccess::cast", &error))?;
-    // SAFETY: `access` wraps the surface the frame just handed out; the interface it
-    // returns is the `ID3D11Texture2D` that owns that surface's pixels.
-    unsafe { access.GetInterface::<ID3D11Texture2D>() }
-        .map_err(|error| hresult("IDirect3DDxgiInterfaceAccess::GetInterface", &error))
-}
-
-/// Wait for the next frame, or report that the target had nothing new to show.
-///
-/// `Ok(None)` is idle, not failure. A real failure is an `Err` carrying an HRESULT
-/// — a dead device, a closed item — and the caller must not answer it with "this
-/// target is static".
-fn next_capture_frame(
-    pool: &Direct3D11CaptureFramePool,
-    timeout: Duration,
-) -> Result<Option<Direct3D11CaptureFrame>, String> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match pool.TryGetNextFrame() {
-            Ok(frame) => return Ok(Some(frame)),
-            // `#code=0` is `S_OK` on a null interface pointer: "no frame is
-            // waiting", which is what WGC reports while the window content stays
-            // put. Any other code is a real failure and must not be retried.
-            Err(error) if error.code().0 == 0 => {
-                if Instant::now() >= deadline {
-                    return Ok(None);
-                }
-                thread::sleep(CAPTURE_POLL_INTERVAL);
-            }
-            Err(error) => return Err(hresult("TryGetNextFrame", &error)),
-        }
-    }
-}
-
 /// Capture ten frames of one window and measure them.
 ///
 /// Every failure path returns a reason instead of panicking: "this target is
@@ -2600,70 +2519,30 @@ fn capture_window_arm(target: &'static str, hwnd: HWND) -> CaptureArmReport {
         Ok(device) => device,
         Err(message) => return failed(message),
     };
-    let item = match create_item_for_window(hwnd) {
-        Ok(item) => item,
-        Err(message) => return failed(message),
-    };
-    let size = match item.Size() {
-        Ok(size) => size,
-        Err(error) => return failed(hresult("GraphicsCaptureItem::Size", &error)),
-    };
-    let dimensions = (size.Width, size.Height);
-    let direct3d = match direct3d_device(&device) {
-        Ok(direct3d) => direct3d,
-        Err(message) => return failed(message),
-    };
-    let pool = match Direct3D11CaptureFramePool::CreateFreeThreaded(
-        &direct3d,
-        DirectXPixelFormat::B8G8R8A8UIntNormalized,
-        CAPTURE_BUFFER_COUNT,
-        size,
-    ) {
-        Ok(pool) => pool,
-        Err(error) => {
-            return failed(hresult(
-                "Direct3D11CaptureFramePool::CreateFreeThreaded",
-                &error,
-            ));
-        }
-    };
-    let session = match pool.CreateCaptureSession(&item) {
+    // The production session, not a copy of it (`P2.01`): an arm that cannot open
+    // reports the session's own typed reason, so this probe measures the code the
+    // scroll loop will actually use.
+    let mut session = match wgc::WgcSession::open(&device, hwnd as isize) {
         Ok(session) => session,
-        Err(error) => {
-            return failed(hresult(
-                "Direct3D11CaptureFramePool::CreateCaptureSession",
-                &error,
-            ));
-        }
+        Err(error) => return failed(error.to_string()),
     };
 
     let mut summary = CaptureSummary {
-        item_size: dimensions,
+        item_size: session.size(),
         ..CaptureSummary::default()
     };
     // Recorded, not propagated: see the module documentation.
-    if let Err(error) = session.SetIsCursorCaptureEnabled(false) {
-        summary
-            .option_errors
-            .push(hresult("GraphicsCaptureSession::SetIsCursorCaptureEnabled", &error));
-    }
-    if let Err(error) = session.SetIsBorderRequired(false) {
-        summary
-            .option_errors
-            .push(hresult("GraphicsCaptureSession::SetIsBorderRequired", &error));
-    }
-    if let Err(error) = session.StartCapture() {
-        return failed(hresult("GraphicsCaptureSession::StartCapture", &error));
-    }
+    summary
+        .option_errors
+        .extend(session.diagnostics().iter().cloned());
 
-    let mut pool_size = dimensions;
     let mut consecutive_idle = 0usize;
     for index in 0..CAPTURE_FRAMES {
         let wait_started = Instant::now();
-        let frame = match next_capture_frame(&pool, CAPTURE_FRAME_TIMEOUT) {
+        let frame = match session.next_frame(CAPTURE_FRAME_TIMEOUT) {
             Ok(Some(frame)) => frame,
             Ok(None) => {
-                // Nothing changed inside the slot. `wgc.rs` calls this idle; in
+                // Nothing changed inside the slot. `WgcSession` calls this idle; in
                 // production the scroll loop is what ends it, by scrolling.
                 consecutive_idle += 1;
                 summary.frames.push(CaptureFrameReport {
@@ -2672,65 +2551,31 @@ fn capture_window_arm(target: &'static str, hwnd: HWND) -> CaptureArmReport {
                     readback_ms: 0.0,
                     variance: 0.0,
                     kind: FrameKind::Idle,
-                    content_size: pool_size,
+                    content_size: session.size(),
                 });
                 if consecutive_idle >= CAPTURE_MAX_CONSECUTIVE_IDLE {
                     break;
                 }
                 continue;
             }
-            Err(message) => {
-                let _ = session.Close();
-                let _ = pool.Close();
-                return failed(format!("frame {index}: {message}"));
-            }
+            Err(error) => return failed(format!("frame {index}: {error}")),
         };
         consecutive_idle = 0;
         let wait_ms = wait_started.elapsed().as_secs_f64() * 1000.0;
-
-        // The pool only has to be rebuilt when the content size changes; counting the
-        // calls is how this arm answers "can one pool serve the whole session".
-        if let Ok(current) = frame.ContentSize() {
-            let current = (current.Width, current.Height);
-            if current != pool_size {
-                if let Err(error) = pool.Recreate(
-                    &direct3d,
-                    DirectXPixelFormat::B8G8R8A8UIntNormalized,
-                    CAPTURE_BUFFER_COUNT,
-                    SizeInt32 {
-                        Width: current.0,
-                        Height: current.1,
-                    },
-                ) {
-                    summary
-                        .option_errors
-                        .push(hresult("Direct3D11CaptureFramePool::Recreate", &error));
-                }
-                summary.recreates += 1;
-                pool_size = current;
-            }
-        }
+        let content = frame.size();
 
         let readback_started = Instant::now();
-        let texture = match texture_of(&frame) {
-            Ok(texture) => texture,
-            Err(message) => {
-                let _ = session.Close();
-                let _ = pool.Close();
-                return failed(format!("frame {index}: {message}"));
-            }
-        };
-        let pixels = match device.read_back_bgra(&texture) {
+        let pixels = match device.read_back_bgra(frame.texture()) {
             Ok(pixels) => pixels,
-            Err(message) => {
-                let _ = session.Close();
-                let _ = pool.Close();
-                return failed(format!("frame {index}: {message}"));
-            }
+            Err(message) => return failed(format!("frame {index}: {message}")),
         };
         let readback_ms = readback_started.elapsed().as_secs_f64() * 1000.0;
 
-        let variance = frame_luma_variance(&pixels, pool_size.0.max(0) as u32, pool_size.1.max(0) as u32);
+        let variance = frame_luma_variance(
+            &pixels,
+            content.0.max(0) as u32,
+            content.1.max(0) as u32,
+        );
         summary.frames.push(CaptureFrameReport {
             index,
             wait_ms,
@@ -2741,12 +2586,13 @@ fn capture_window_arm(target: &'static str, hwnd: HWND) -> CaptureArmReport {
             } else {
                 FrameKind::Content
             },
-            content_size: pool_size,
+            content_size: content,
         });
     }
 
-    let _ = session.Close();
-    let _ = pool.Close();
+    // Counted by the session itself, so "one pool served the whole session" is
+    // answered by the same `PoolSizing` the production path uses.
+    summary.recreates = session.recreations();
     CaptureArmReport {
         target,
         hwnd,
