@@ -46,10 +46,64 @@ use crate::geometry::Rect;
 use crate::scroll::displacement::line_digest;
 use crate::scroll::observation::{Axis, Observation};
 
-use super::providers::ScrollFrame;
+use super::providers::{ProviderKind, ScrollFrame};
 use super::win::d3d11::GraphicsDevice;
 use super::win::wgc::{WgcError, WgcSession};
 use super::monitor::{self, CapturedMonitor};
+
+/// The scroll path's backend order (`docs/30` §11.5, task `P2.06`).
+///
+/// **Policy, not a retry.** The window backend is first because a window-level capture
+/// cannot contain the overlay or an occluder (§24.2) — that is a statement about what the
+/// pixels *are*, so it is decided before anything is attempted rather than after something
+/// fails. The monitor backend is the only alternative that still produces pixels when
+/// `CreateForWindow` is refused (§24.7), and it is the one path that needs `WDA` (§24.5).
+///
+/// `BitBlt` is deliberately absent. It is the *ordinary* screenshot path's final fallback
+/// (`providers::attempt_order`), and falling back to it here would silently hand back a
+/// frame of the desktop that is not the target window's.
+///
+/// The ordinary path's order is **not** touched by this: §33.5 protects it, and the lesson
+/// of §21.3 is that scroll work must not reshape the F5 path. Its behaviour is pinned by
+/// `providers::tests::wgc_is_tried_before_the_bitblt_fallback`.
+pub(crate) const SCROLL_BACKENDS: [ProviderKind; 2] =
+    [ProviderKind::WgcWindow, ProviderKind::Wgc];
+
+/// Why the scroll path moved on from one backend to the next (§11.5: a fallback that is not
+/// recorded is a fallback the user cannot see — G12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BackendFallback {
+    /// The backend that was being used.
+    pub from: ProviderKind,
+    /// The backend being moved to.
+    pub to: ProviderKind,
+    /// The failure that caused the move. Carried so the diagnostic can say *why*.
+    pub reason: String,
+}
+
+impl BackendFallback {
+    /// The line the session records. It names both ends **and** the reason, because "we fell
+    /// back" without "from what" or "why" is not a diagnostic — that is exactly the Snow
+    /// Shot counter-example §11.5 cites (`let _ = session.SetIsCursorCaptureEnabled(false)`).
+    pub(crate) fn diagnostic(&self) -> String {
+        format!(
+            "scroll backend fell back from {} to {}: {}",
+            self.from.name(),
+            self.to.name(),
+            self.reason
+        )
+    }
+}
+
+/// The backend to try after `current`, or `None` when the plan is exhausted.
+///
+/// Returning `None` for anything outside the plan is deliberate: a backend the scroll path
+/// does not own cannot be "advanced past", so asking is a wiring mistake and the answer must
+/// not be a plausible-looking next step.
+pub(crate) fn next_scroll_backend(current: ProviderKind) -> Option<ProviderKind> {
+    let index = SCROLL_BACKENDS.iter().position(|kind| *kind == current)?;
+    SCROLL_BACKENDS.get(index + 1).copied()
+}
 
 /// Why a stream ended. Every one of these is a **normal** outcome; none of them is an error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -425,8 +479,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        BackendPoll, EndReason, FrameBackend, FrameError, FrameSource, Poll, TargetGeometry,
-        TopologyOutcome, WgcFrameSource, topology_outcome,
+        BackendFallback, BackendPoll, EndReason, FrameBackend, FrameError, FrameSource, Poll,
+        ProviderKind, SCROLL_BACKENDS, TargetGeometry, TopologyOutcome, WgcFrameSource,
+        next_scroll_backend, topology_outcome,
     };
     use crate::geometry::Rect;
     use crate::scroll::observation::Axis;
@@ -785,6 +840,56 @@ mod tests {
         let _: u32 = dpi;
         let _: (u32, u32) = size;
         let _: bool = minimised;
+    }
+
+    // --- backend policy: window first, monitor as the fallback (§11.5; task P2.06) ---
+
+    #[test]
+    fn the_window_backend_is_preferred_and_the_monitor_backend_is_the_fallback() {
+        // The order *is* the policy, so this asserts the list rather than the mechanism.
+        assert_eq!(
+            SCROLL_BACKENDS,
+            [ProviderKind::WgcWindow, ProviderKind::Wgc],
+            "a window-level capture cannot contain the overlay or an occluder (§24.2), so \
+             the window backend is the first entry, not the one we retreat to"
+        );
+        assert_eq!(
+            next_scroll_backend(ProviderKind::WgcWindow),
+            Some(ProviderKind::Wgc)
+        );
+        assert_eq!(next_scroll_backend(ProviderKind::Wgc), None);
+        // BitBlt is the *ordinary* path's final fallback. It is deliberately absent here:
+        // reading the desktop when the target window refuses to be captured would hand back
+        // a frame that is not the target's, silently (`providers.rs` `attempt_order`).
+        assert!(
+            !SCROLL_BACKENDS.contains(&ProviderKind::BitBlt),
+            "the scroll path must not fall back to a frame that is not the target window's"
+        );
+        assert_eq!(next_scroll_backend(ProviderKind::BitBlt), None);
+    }
+
+    #[test]
+    fn a_fallback_records_a_diagnostic() {
+        let fallback = BackendFallback {
+            from: ProviderKind::WgcWindow,
+            to: ProviderKind::Wgc,
+            reason: "CreateForWindow was refused (0x80070057)".to_string(),
+        };
+        let line = fallback.diagnostic();
+        // Both ends and the reason, because "we fell back" without "from what" or "why" is
+        // not a diagnostic — that is the Snow Shot counter-example §11.5 cites.
+        assert!(line.contains("wgc-window"), "the line must name the backend it left: {line}");
+        assert!(line.contains("wgc"), "the line must name the backend it moved to: {line}");
+        assert!(line.contains("0x80070057"), "the line must carry the reason: {line}");
+        let other = BackendFallback {
+            reason: "the first frame timed out".to_string(),
+            ..fallback
+        };
+        assert_ne!(
+            line,
+            other.diagnostic(),
+            "the diagnostic must say why, not just that it happened"
+        );
     }
 }
 

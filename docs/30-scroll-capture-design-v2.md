@@ -1472,6 +1472,45 @@ impl ScrollFrame {
 
 **降级必须是可见的**（G12）：每一次后端回退都记一条 `CaptureBackendFallback` 诊断事件，并携带失败原因。反面教材是 Snow Shot 的 `capabilities.rs:37-59`（`let supported = cfg!(windows);`）与其 `let _ = session.SetIsCursorCaptureEnabled(false);`。
 
+#### 11.5.1 落地的形状（`P2.06`，2026-10-09）
+
+滚动路径**自带**后端顺序（`crates/snapclip-capture/src/windows/scroll_source.rs`）：
+
+```rust
+/// 策略，不是重试：窗口级在前，因为窗口级捕获在物理上不含覆盖层与遮挡者（§24.2）。
+/// `BitBlt` **刻意不在表里**——它是普通截图路径的最终回退，在这里退到它等于悄悄交出
+/// 一张不是目标窗口的帧。
+pub(crate) const SCROLL_BACKENDS: [ProviderKind; 2] =
+    [ProviderKind::WgcWindow, ProviderKind::Wgc];
+
+pub(crate) struct BackendFallback {
+    pub from: ProviderKind,
+    pub to: ProviderKind,
+    pub reason: String,          // 没有它就只是"退过"，不是诊断（§11.5 的反面教材）
+}
+
+impl BackendFallback {
+    pub(crate) fn diagnostic(&self) -> String {
+        format!("scroll backend fell back from {} to {}: {}",
+                self.from.name(), self.to.name(), self.reason)
+    }
+}
+
+/// 表外的一切都返回 `None`：不归滚动路径管的后端不能被"推进到下一个"，
+/// 那是一个接线错误，答案不能看起来像个合理的下一步。
+pub(crate) fn next_scroll_backend(current: ProviderKind) -> Option<ProviderKind>;
+```
+
+**三处落地裁决**：
+
+1. **顺序是策略，所以测的是表本身，不是机制。** 用例断言 `SCROLL_BACKENDS` 的字面值，而不是"先调 A 失败再调 B"——后者把策略写成了实现细节，改一次调用顺序就会把测试改成同义反复。
+2. **`BitBlt` 刻意缺席，并由用例钉住。** 它是普通截图路径的最终回退（`providers::attempt_order` 的末项）；滚动路径退到它会**悄悄**交出桌面的一块，而那既不是目标窗口的内容、也无法与"目标窗口真的没变"区分。这与 `P2.02`（DEV-38）把 `attempt_order(Some(WgcWindow))` 定成**单元素**列表是同一条原则的两个落点。
+3. **`diagnostic()` 必须同时说出两端与原因。** 只记"发生了一次回退"对用户与对排障都没有价值；§11.5 引的 Snow Shot 反例正是"记了但没记内容"。
+
+**范围说明（§33.5 的保护项，退出条件 ②）**：本任务**没有改** `providers::attempt_order`。普通截图的后端选择行为与改动前逐字一致，由既有用例 `providers::tests::wgc_is_tried_before_the_bitblt_fallback`（`crates/snapclip-capture/src/windows/providers.rs:965`）继续钉住；本次改动只碰 `scroll_source.rs` 一个文件。
+
+**未接线**：真正"试 `WgcWindow`、失败后记 `BackendFallback`、再开 `Wgc`"的驱动循环属会话组装（`P3.09`），本任务交付的是顺序、回退记录与推进函数。
+
 ### 11.6 与既有普通截图的关系
 
 - **共享**：GPU 设备、WGC 会话选项调用、回读函数、监控缓存、DPI awareness（`apps/snapclip/src/lib.rs:298-340` 的 `set_per_monitor_v2_awareness()` 在**任何窗口创建之前**设置，必须保留这个顺序）、诊断计数器。
@@ -4783,7 +4822,7 @@ fn rows_match(actual, expected, sigma) -> bool
 | `u32` 越界 | 构造 > `u32::MAX` 尺寸 | **拒绝**（不截断） | L2 | — |
 | 普通截图回归 | F5 全流程（A 类全套） | 全部通过 | L1+L3 | **Capture Latency** |
 | 普通截图延迟不受滚动影响 | 滚动会话进行中触发 F5 | P95 变化 ≤ 10% | L3 | **Capture Latency** |
-| 捕获路径不变 | `attempt_order` 行为 | 与改动前一致 | L2 | — |
+| 捕获路径不变 | `attempt_order` 行为 | 与改动前一致（`P2.06` 只加滚动路径自己的顺序，未改 `attempt_order`；`providers::tests::wgc_is_tried_before_the_bitblt_fallback` 继续钉住） | L2 | — |
 | 依赖门禁 | `tools/check-dependency-direction.ps1` | 干净（含 §28.4 的新扫描） | CI | — |
 | 无可达状态负债 | 枚举全部 `CaptureState` 变体 | 每个都有测试可达（删除 `Adjusting` 后） | L1 | — |
 | 无静默跳过 | 全部真实桌面用例 | 只有 `#[ignore]` 或被计数的跳过 | CI（脚本统计） | — |
