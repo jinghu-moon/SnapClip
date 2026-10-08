@@ -94,12 +94,13 @@
 | 新增文件 | 一律先建 `#[cfg(test)]` 测试骨架再建实现（§2.1） |
 | 文档引用 | 一律写 `docs/30 §x.y` 或 `docs/30:<行号>`，**不允许只写"见设计文档"** |
 
-### 0.6 本文对 V2 的补充（**三处 deviation，已按用户授权回填 `docs/30`**）
+### 0.6 本文对 V2 的补充（**四处 deviation，前三处已按用户授权回填 `docs/30`**）
 
-> **回填状态**：三处均已写入 `docs/30-scroll-capture-design-v2.md`（**未覆盖原文，只做定点增补**）——
+> **回填状态**：前三处均已写入 `docs/30-scroll-capture-design-v2.md`（**未覆盖原文，只做定点增补**）——
 > DEV-1 → `§28.2` 新增 test-only 文件块（`scroll/testkit.rs`）与"10 生产 + 1 test-only"口径、`§33.3` 文件清单由 9 补为 11（**顺带修正了原文漏列 `orb.rs` 的内部矛盾**）；
 > DEV-2 → `§35 P4` 的 `P4.1` 拆为 `P4.1a`（trait，capture）/ `P4.1b`（实现，shell）并附理由；
-> DEV-3 → `§33.1` 的 `D-10` 拆为 `D-10a`（硬失败）/ `D-10b`（静默降级）、`§24.3` 修正 `wgc.rs:107` 的表述并说明"两种相反失败模式的共同落点"、`§24.8` 的探测用例扩为两条。
+> DEV-3 → `§33.1` 的 `D-10` 拆为 `D-10a`（硬失败）/ `D-10b`（静默降级）、`§24.3` 修正 `wgc.rs:107` 的表述并说明"两种相反失败模式的共同落点"、`§24.8` 的探测用例扩为两条；
+> **DEV-4** → `§21.3` 新增"第 1 步的实测结果（`P0.02` / `T-THREAD-1`）"整块（2026-10-08 执行时新增，见下）。
 > 下表保留**原始登记内容**（作为"当时看到了什么"的记录）。
 
 | # | 补充 | 为什么必须补 | 回填位置 |
@@ -107,6 +108,7 @@
 | **DEV-1** | 新增 **test-only 文件** `crates/snapclip-capture/src/scroll/testkit.rs`（以 `#[cfg(test)] mod testkit;` 注册） | V2 §35 的 **P1.1** 要求"合成夹具生成器（多尺度结构 + 自证）"，而 V2 §28.2 只枚举了 `scroll/` 的 **10 个**文件、**没有给它位置**。把生成器塞进 `mod.rs`（自述"只有约 40 行"）会破坏该文件的定位；塞进 `displacement.rs` 会让"夹具"与"被测物"同文件（夹具自证的价值就是**独立于被测实现**）。**因此新增一个 test-only 文件是本清单对 V2 的最小补充** | `docs/30 §28.2` 的新增清单（10 → 11 个文件），并在 `§28.3` 的"不做"表里保留"不建 `scroll/tests/` 目录"（一个 test-only 文件 ≠ 一个测试目录） |
 | **DEV-2** | V2 §35 的 **P4.1** 一行写"`RowBandSink`/`RowBandWriter` + `PngRowBandSink` 落在 shell 组合根"，但 V2 §27.3/§33.3 把这两个 **trait** 定为 capture 侧新增（`png` 不得进 capture） | 一行把"端口"与"实现"混在一起。若不拆，执行者会把 trait 放进 shell → 滚动模块无法在自己的 crate 里被测试（破坏 §4.1 的 L1/L2 门禁），或会把 `png` 加进 capture（破坏 §28.4 的目标） | `docs/30 §35 P4.1` 拆为两句："trait 在 capture（`canvas.rs` 或 `bands.rs`）、`PngRowBandSink` 实现落 shell 组合根" |
 | **DEV-3** | V2 §33.1 的 **D-10** 把 `crates/snapclip-capture/src/windows/win/wgc.rs:107` 与 `:110` **都**写成"吞错误"，与代码不符 | 逐行核实：`:106-108` 的 `SetIsCursorCaptureEnabled(false).map_err(...)?` **用 `?` 传播** → 它的失败模式是"**`IGraphicsCaptureSession2` 不可用 ⇒ 整体捕获失败**"；`:110-112` 的 `SetIsBorderRequired(false)` 才是"**只 `eprintln`、静默降级**"。**两种相反的失败模式**（一个太严、一个太松）都必须由 `P2.04` 的能力探测统一处理，否则执行者会按 V2 的措辞只修一处 | `docs/30 §33.1 D-10` 改为两个独立条目：D-10a"`SetIsCursorCaptureEnabled` 的**硬失败**改为探测 + 记录 + 退回掩码排除"、D-10b"`SetIsBorderRequired` 的**静默降级**改为产出 `CaptureOptionUnavailable` 诊断"；`§24.3` 的 `CaptureCapabilities` 表同步说明它同时解决这两种失败模式 |
+| **DEV-4**（执行时新增） | V2 §21.3 把 `T-THREAD-1` 的判据写成"**若 `cargo test --workspace --lib` 今天就 panic**"，并预期它能回答这个问题 | 2026-10-08 实测：**全量 lib 测试不会 panic**（每个测试都在同一线程创建设备并使用它）→ **该门禁对这条不变式不敏感**；但生产路径**真的会 panic**（设备在 capture worker 创建，overlay 线程放大镜取色时 `submit`），已用 `the_production_hand_off_trips_the_context_guard` 固定为可执行证据。若照原文把"全绿"当作通过，`P0.02` 会被误判为完成，`P2.02` 的回读路径会带着一个**假的**不变式进实现 | `docs/30 §21.3` 新增"第 1 步的实测结果（`P0.02` / `T-THREAD-1`）"整块（四条事实 + 调用点清单修正 + 问题域扩大 + 发布期如何保证）；§6 `P0.02` 的状态行改 `[!]`；§3.4/§14.2 的 `[!]` 表与 R-2 同步 |
 
 ---
 
@@ -394,6 +396,7 @@ P6.07 门禁扫描 ═╝
 
 | 任务 | 阻塞原因 | 解除条件 |
 |---|---|---|
+| `P0.02`（`T-THREAD-1` 的断言） | 断言会在**合法的生产交接路径**上 panic（放大镜取色：`overlay/session.rs:565` → `renderer.rs:311`），而库测试全绿看不到它 | `docs/30 §21.3` 第 ② 步定下 deferred context / 显式交接后并入并重跑两个用例 |
 | `P0.05`（`E-CAP-1` 的 WebView2 一格） | OQ-2 / 需要真实 WebView2 宿主 | 装一个 WebView2 宿主或记为"未取得" |
 | `P1.22` 的 125%/150% DPI 扫描行 | **OQ-4**：本机 `PixelRatio = 1`，取不到 | 接一台可改缩放的真实显示器 |
 | `P3.02` 的 UIPI 组 | **OQ-3**：官方两页互相矛盾 | 以管理员身份跑一次 `E-INJECT-1` |
@@ -458,8 +461,10 @@ pwsh tools/check-dependency-direction.ps1
 ### 4.2 阶段级门禁（**打标签前手工跑**，规则 C8 第 1 步）
 
 ```bash
-# 真实桌面用例（L3）
-cargo test -p snapclip-capture --lib -- --ignored
+# 真实桌面用例（L3）。--test-threads=1 是必需的，不是偏好：
+# 这些用例会抢前台窗口（scroll_probe.rs:404 的 bring_to_front 断言），并行跑会互相打断。
+# 2026-10-08 实测：并行 → 6 passed / 1 FAILED（inject_probe，前台断言失败）；串行 → 全绿（29.18s）。
+cargo test -p snapclip-capture --lib -- --ignored --test-threads=1
 
 # 性能用例（L4：Release + 稳定机器 + 每场景独立进程）
 cargo test -p snapclip-capture --release --lib -- --ignored perf
@@ -625,6 +630,15 @@ git config core.hooksPath .githooks
 | 提交信息标题 | `[P0-02] the context owner is asserted instead of assumed` |
 | 复杂度 / 阻塞 | S / 无（**若全量测试今天 panic**，则升级为 `[!]` 并触发 §21.3 第 ② 步的 deferred context 评估） |
 | **风险** | 若断言在发布期为真但仍被触发，会变成**崩溃**而不是降级。缓解：断言只在 `debug_assertions` 下生效，发布期保留 `graphics_released` 语义，并把"发布期如何保证"作为 `P0.02` 的第二个交付物写进 `docs/30 §21.3` |
+| **状态** | **[!] 阻塞**（2026-10-08）：断言与两个用例已实现、已实测（RED → GREEN → 全量 `478 passed / 10 ignored / 0 failed`），但**不进 `main`**；代码在侧分支 `blocked/P0-02-context-owner`（提交 `d1098cb`，已推 origin）。结论已回填 `docs/30 §21.3`。 |
+
+**`P0.02` 的实测结论与两处偏离（2026-10-08）**
+
+1. **RED**：`using_the_immediate_context_from_a_second_thread_panics` 在加断言前是红的 —— `cargo test -p snapclip-capture --lib using_the_immediate_context_from_a_second_thread_panics -- --nocapture` → `panicked at crates\snapclip-capture\src\windows\win\d3d11.rs:853:9: a second thread used the immediate context without panicking: the guard is not wired to the accessor`（0 passed; 1 failed; 354 filtered out）。**GREEN**：同一命令 → 1 passed，子线程 panic 文案 `GraphicsDevice::context ran on a thread that does not own the immediate context; one ID3D11DeviceContext has exactly one user thread (docs/30 §21.3)`；全量 `cargo test --workspace --lib` → **478 passed / 10 ignored / 0 failed**（capture 348+7，`+1` 即本用例）。
+2. **`T-THREAD-1` 的答案是"两句话"**：**库测试回答不了**（每个测试都在同一线程创建设备并使用它，所以全绿）；**但生产路径真的会 panic** —— 设备在 capture worker 线程创建（`capture_worker.rs:373` → `providers.rs:292-297`），经 `FrozenFrame::device()`（`providers.rs:67-75`）交到 overlay 线程（`overlay/window_restore.rs:22-27`），overlay 线程在放大镜取色时 `submit`（`overlay/session.rs:565` → `renderer.rs:311`）。这条链已用第二个（`#[ignore]` 的）用例 `the_production_hand_off_trips_the_context_guard` 固定为可执行证据：设备在 A 线程创建、B 线程 `submit` 必然 panic。
+3. **偏离 1（触发条款）**：本节写的升级条件是"**若全量测试今天 panic**"。实测**没有**触发这一条（全量测试全绿），触发的是它的**实质**（"假的不变式"这个根因）。因此按 §2.7 的第一性原理自查升级为 `[!]`，并把"库测试全绿 ≠ 不变式成立"这一修正写进 `docs/30 §21.3`。
+4. **偏离 2（侧分支名）**：本节 §14.2 原定侧分支名是 `spike/deferred-context`，实际按 §3.4 的命名规范建的是 `blocked/P0-02-context-owner`。两者不冲突、各有用途：**`blocked/P0-02-context-owner` 装被阻塞的断言代码**（本次），**`spike/deferred-context` 留给第 ② 步的实验**（尚未开始）。
+5. **发布期如何保证（本任务要求的第二个交付物）**：断言只在 `debug_assertions` 下存在；发布期仍然只有 `overlay.rs:507 graphics_released` 这个布尔位。结论已写入 `docs/30 §21.3`：**第 ② 步要做的是"消除跨线程使用"，而不是"让布尔位更可靠"**。
 
 ### P0.03 `E-PERF-1`：位移估计四层组合的 P50/P95/Max
 
@@ -1622,23 +1636,25 @@ git config core.hooksPath .githooks
 
 **OQ-7 与 OQ-14 已由 `docs/30 §36.1` 的 D-1/D-2 裁决收口**（ORB 自写；`docs/23`/`docs/24` 修正），**不再是开放问题**。
 
-### 14.2 四个 `[!]` 阻塞任务与侧分支
+### 14.2 `[!]` 阻塞任务与侧分支（与 §3.4 的表是同一集合的两半）
 
 **规则（本文 §3.4 的落地）**：`[!]` 任务**不通过则不得进入依赖它的阶段**。**不允许**"先把后面做完、回头再修" —— 那正是 V1 的失败方式（`docs/19` 的 §7.2 与 §6.7 自相矛盾到 v5 才被发现）。
 
 | `[!]` | 触发条件 | 侧分支名 | 侧分支内容 | 影响面 |
 |---|---|---|---|---|
-| `P0.02` | `T-THREAD-1` 在今天**就 panic** | `spike/deferred-context` | 按 V2 §21.3 第 ② 步**优先用 deferred context**（"不改任何人线程"的方案），把"移线程"作为最后手段 | `P2.02` 的回读路径 |
+| `P0.02` | `T-THREAD-1`：**库测试全绿但生产路径会 panic**（2026-10-08 实测，见 §6 `P0.02` 的结论块）——触发的是触发条款的实质而非字面（字面是"全量测试 panic"） | **`blocked/P0-02-context-owner`**（装被阻塞的断言代码，✅ 已建并推送）+ `spike/deferred-context`（留给第 ② 步实验，未开始） | 断言 + 两个用例；第 ② 步按 V2 §21.3 **优先用 deferred context**（"不改任何人线程"的方案），把"移线程"作为最后手段 | `P2.02` 的回读路径、`P2.01` 的放大镜采样 |
 | `P0.03` | `E-PERF-1` 的三层漏斗 P95 超过 §23.3 的阈值 | `spike/matcher-layer4` | 加第 4 层（多尺度 / 预降采样）或把 ORB 提到主路径（与 `P1.23` 互换主次） | `P1.05`–`P1.13` |
 | `P0.05` | 窗口级 WGC 在 Electron/WebView2 上不可用（或 `CreateForWindow` 不接受子窗口） | `spike/monitor-fallback` | 显示器级为主 + WDA/覆盖层隐藏 + "遮挡下取到遮挡者"的用户提示 | `P2.01`、C5、§24.2 |
 | `P1.24` | `E-ACC-1` 打完四门后"错误确定率"仍 > 0 | `spike/orb-primary` | ORB 从"第二意见"提为主候选（`P1.23` 的角色反转），保留四门为**验证**层 | `P1.05`–`P1.16`、§15.4 |
+
+**两处表的口径**：§3.4 列出的是"**因环境/设备/官方依据不足**而阻塞"的四项（`P0.05`、`P1.22` 的 DPI 行、`P3.02` 的 UIPI 组、`P3.09` 的非前台判据），本表列出的是"**因实验结论**而阻塞"的四项；两表并集即本阶段的全部 `[!]`，`P0.02` 由本次执行新增进 §3.4 的表。
 
 ### 14.3 风险表
 
 | # | 风险 | 概率 | 影响 | 缓解 | 责任任务 |
 |---|---|---|---|---|---|
 | R-1 | **上限取值定错**（V2 用 `u32::MAX/2` 且**没有硬失败上限**） | 中 | 高（用户拿到一个"以为会一直拼"的会话） | `P1.21` 的三层 + `P4.05` 的"`Partial` 仍合法" + UI 可见计数器 | `P1.21`/`P5.03` |
-| R-2 | **改 `context` 使用者引入普通截图回归** | 中 | 高（A 类全绿是硬门槛） | **先加断言、再考虑 deferred context、最后才搬线程**（`P0.02` → `spike/deferred-context`）；`P6.01` 先冻结行为 | `P0.02`/`P2.02`/`P6.01` |
+| R-2 | **改 `context` 使用者引入普通截图回归** | 中 | 高（A 类全绿是硬门槛） | **先加断言、再考虑 deferred context、最后才搬线程**（`P0.02` → `spike/deferred-context`）；`P6.01` 先冻结行为。**2026-10-08 实测后收紧**：断言已证明有效，而且**今天就会在生产路径 panic**（放大镜取色），因此断言不进 `main`，代码在 `blocked/P0-02-context-owner`；**"库测试全绿"不再被当作不变式成立的证据**（见 §6 `P0.02` 的状态行） | `P0.02`/`P2.02`/`P6.01` |
 | R-3 | **端口/tile 形状冻结错误**（像 V1 §8.3 那样自相矛盾） | 低 | 高 | `P1.21`/`P4.01` 的签名由**类型**约束（height 先于行） | `P1.21`/`P4.01` |
 | R-4 | **一帧匹配失败即终止**（V1 §7.2 的错误） | 低 | 高 | `P1.12`/`P3.04` 的 `Uncertain → 继续`；`P6.02` 守住 §30.3 第 15/16 行 | `P1.12`/`P3.04` |
 | R-5 | **overlay 输入模型未验证**（覆盖层是否抢焦点/是否被捕获） | 中 | 中 | `P3.01`+`P5.03` 的实测；已知杠杆：`HTTRANSPARENT`、**覆盖层今天故意不用 `WS_EX_NOACTIVATE`** | `P3.01`/`P5.03` |
@@ -1652,6 +1668,7 @@ git config core.hooksPath .githooks
 | R-13 | **`.githooks` 从未启用**（今天 `core.hooksPath` unset） | 已确认 | 中 | `P0.08` 强制创建 + 安装 + **验证生效**（故意让一次提交失败） | `P0.08` |
 | R-14 | **整 crate `cargo fmt` 造成无关重排** | 已发生 | 中 | 本文 §2.1：**禁止整 crate fmt**，只格式化自己改动的区域；`C11` 规则 | 全局 |
 | R-15 | **任务清单本身变成愿望清单** | 中 | 中 | §13 的逐行映射 + `P6.02` 的元测试"缺一行就红" | `P6.02` |
+| R-16 | **L3 门禁并行跑会假红**（7 个真实桌面用例抢前台，`scroll_probe.rs:404` 的前台断言先失败） | 已发生（2026-10-08） | 中（会把串行才能过的门禁误判为代码问题） | §4.2 的命令固定加 `--test-threads=1`；后续新增 L3 用例时**不要**用"抢前台"作为前置，改用 `PostMessageW` 或把自己的窗口设为前台后立即测量 | `P0.05`/`P0.09`/所有 L3 任务 |
 
 ### 14.4 失败处置与回滚
 

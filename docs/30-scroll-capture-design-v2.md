@@ -2491,6 +2491,21 @@ fn context(&self) -> &ID3D11DeviceContext {
 
 前提是**先确认这个断言在今天的代码里能不能全部通过**。**如果它今天就 panic**（因为 4 个调用点分布在多个线程），那么"V1 的表述不成立"就从一个静态推断变成了一个**可执行的负面用例**——这是 §30 的 `T-THREAD-1`。
 
+**第 1 步的实测结果（`P0.02` / `T-THREAD-1`，2026-10-08 实测，2026-10-08 回填）。**
+
+上面那句"如果它今天就 panic"**已经测过了，答案是：库测试看不到，而生产路径真的会 panic**。四条事实：
+
+1. **断言本身是有效的**。`crates/snapclip-capture/src/windows/win/d3d11.rs` 的负面用例 `using_the_immediate_context_from_a_second_thread_panics` 在加断言之前是红的（`panicked at …d3d11.rs:853:9: a second thread used the immediate context without panicking: the guard is not wired to the accessor`），加断言之后通过，子线程 panic 原文是 `GraphicsDevice::context ran on a thread that does not own the immediate context; one ID3D11DeviceContext has exactly one user thread (docs/30 §21.3)`。断言落在 `owned_context()` 上，`GraphicsDevice` 内部所有 `self.context` 使用都改走它，`AsyncSampleBuffer::new` 改为接收 `&GraphicsDevice` 使调用方拿不到未断言的句柄。
+2. **`cargo test --workspace --lib` 回答不了这个问题**：加断言后仍是 **478 passed / 10 ignored / 0 failed**（app 56+3、capture 348+7、history 51、model 23）。原因是**每个测试都在同一个线程上创建设备并使用它**；`cargo test -p snapclip-app --features test-support --test ui`（6 passed）也不经过 worker→overlay 的异步交接。**"全量 lib 测试全绿"因此不是不变式成立的证据**——这是本次实测对本文的一个修正。
+3. **生产路径违反的是"创建线程 = 唯一所有者线程"这一形式**。设备在 capture worker 线程创建（`capture_worker.rs:373` → `providers.rs:292-297`，全进程唯一创建点），经 `FrozenFrame::device()`（`providers.rs:67-75`）交到 overlay 线程（`overlay/window_restore.rs:22-27` 构造 `Win32Renderer`），overlay 线程在放大镜取色时 `submit`（`overlay/session.rs:565` → `renderer.rs:311`）；export worker 在 `graphics_released` 期间做区域回读。这条链已用**可执行的负面用例** `the_production_hand_off_trips_the_context_guard` 固定下来：设备在 A 线程创建、B 线程 `submit`，必然 panic（`AsyncSampleBuffer::submit ran on a thread that does not own the immediate context`）。
+4. **因此断言不能进 `main`**：它会普通截图的放大镜路径上 panic（debug 构建）。第 1 步的产物（断言 + 两个用例）放在侧分支 `blocked/P0-02-context-owner`（提交 `d1098cb`），等第 2 步定下"如何让不变式为真"之后再并入。**"今天的不变式是假的"这件事本身已确证，且不再依赖静态推断。**
+
+**顺带修正上表的调用点清单**：今天 `.context()` 全仓只有 **2 个**调用点（`renderer.rs:134-135`、`win/d3d11.rs:785` 测试内），回读已改走 `read_back_bgra`（`win/d3d11.rs:323`）与 `read_back_region_bgra`（`win/d3d11.rs:401`）；上表的 `providers.rs:110/171`、`win/d2d.rs:667` 是更早版本的落点。
+
+**这次实测把第 2 步的问题域扩大了**：它不只是"导出回读归谁"，而是"**同一个设备被两个长命线程使用**"（capture worker 创建设备并回读，overlay 线程渲染 + 采样）。因此 deferred context 必须覆盖 `AsyncSampleBuffer::submit`/`poll`，或者把交接显式化到放大镜路径上——**`docs/31` 的 `P0.02` 因此标为 `[!]`，阻塞在"第 2 步的选择"上**。
+
+**发布期如何保证（`docs/31` P0.02 要求的第二个交付物）**：断言只在 `debug_assertions` 下存在；**发布期仍然只有 `overlay.rs:507 graphics_released` 这个布尔位在保护**。结论是明确的：**第 2 步要做的是"消除跨线程使用"，而不是"让布尔位更可靠"**——一个布尔位无法覆盖"两个线程都在用同一个 immediate context"这类竞态，它只覆盖了"导出期间 overlay 不画"这一种交错。
+
 **第 2 步：优先用 deferred context 消除跨线程使用，而不是搬线程。**
 
 `ID3D11Device::CreateDeferredContext` 的存在意义正是"让多个线程各自记录命令，再回到 immediate context 上执行"。用它可以做到：
