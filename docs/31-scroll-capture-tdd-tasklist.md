@@ -94,9 +94,9 @@
 | 新增文件 | 一律先建 `#[cfg(test)]` 测试骨架再建实现（§2.1） |
 | 文档引用 | 一律写 `docs/30 §x.y` 或 `docs/30:<行号>`，**不允许只写"见设计文档"** |
 
-### 0.6 本文对 V2 的补充（**八处 deviation，全部已按用户授权回填 `docs/30`**）
+### 0.6 本文对 V2 的补充（**九处 deviation，全部已按用户授权回填 `docs/30`**）
 
-> **回填状态**：八处均已写入 `docs/30-scroll-capture-design-v2.md`（**未覆盖原文，只做定点增补**）——
+> **回填状态**：九处均已写入 `docs/30-scroll-capture-design-v2.md`（**未覆盖原文，只做定点增补**）——
 > DEV-1 → `§28.2` 新增 test-only 文件块（`scroll/testkit.rs`）与"10 生产 + 1 test-only"口径、`§33.3` 文件清单由 9 补为 11（**顺带修正了原文漏列 `orb.rs` 的内部矛盾**）；
 > DEV-2 → `§35 P4` 的 `P4.1` 拆为 `P4.1a`（trait，capture）/ `P4.1b`（实现，shell）并附理由；
 > DEV-3 → `§33.1` 的 `D-10` 拆为 `D-10a`（硬失败）/ `D-10b`（静默降级）、`§24.3` 修正 `wgc.rs:107` 的表述并说明"两种相反失败模式的共同落点"、`§24.8` 的探测用例扩为两条；
@@ -104,7 +104,8 @@
 > **DEV-5** → `§24.5`（UIPI 事实与矩阵首行**按实测改写**）、`§24.6` 判定规则 1（**前台窗口 → 光标所在窗口**）、`§24.6.1` 结论 2（判别性用例已跑）、`§24.6.2`（整节改写为五目标矩阵）、`§24.8`、`§30.5`、`§36.2`（`OQ-3` 关闭、`OQ-5` 答一半、**新增 `OQ-15`**）（2026-10-08 执行时新增，见下）；
 > **DEV-6** → 无 `docs/30` 回填（**装置替换**，只改本文与仓库：`apps/snapclip/tests/png_params_probe.rs` + `tools/p0-04-png-params.ps1` + shell 的 dev-dependency `png = "0.18"`）（2026-10-08 执行时新增，见下）；
 > **DEV-7** → `§17.7.1`（新增整块实测与 `CHOSEN`）、**`F-10` 事实条目**（`§7`，推论按实测改写）、`§29.5` 的"解码上限"行（"必须"降级为"零代价防御"）（2026-10-08 执行时新增，见下）；
-> **DEV-8** → `§15.4` 第 1 层条目（新增"摘要必须能跨步复用"的接口义务）、`§23.3.1`（新增整块实测）、`§23.3` 的 Stitch Latency 与 CPU(Capturing+Matching) 两行（**部分实测**）、`§36.2` 的 `OQ-8`（结论 + `P1.02` 义务）（2026-10-08 执行时新增，见下）。
+> **DEV-8** → `§15.4` 第 1 层条目（新增"摘要必须能跨步复用"的接口义务）、`§23.3.1`（新增整块实测）、`§23.3` 的 Stitch Latency 与 CPU(Capturing+Matching) 两行（**部分实测**）、`§36.2` 的 `OQ-8`（结论 + `P1.02` 义务）（2026-10-08 执行时新增，见下）；
+> **DEV-9** → 无 `docs/30` 回填（`P1.01` 的两处偏差只改本文 §6 的执行块；`docs/30 §28.2` 的"第 11 个文件"口径已由 `DEV-1` 落地）（2026-10-08 执行时新增，见下）。
 > 下表保留**原始登记内容**（作为"当时看到了什么"的记录）。
 
 | # | 补充 | 为什么必须补 | 回填位置 |
@@ -117,6 +118,7 @@
 | **DEV-6**（执行时新增） | `P0.04` 的"前置"一栏写：P4.01/P4.02 未完成时"先在 `docs/Temp/` 用**一次性脚本**对同一张合成图做等价测量并标明'非端口路径'"；本文 §16 的"唯一可能的例外"一栏写：若既有 `image` 版本不可表达显式参数，则把 `png` 提升为 shell 的**直接依赖** | 2026-10-08 执行时实际做法与两处措辞都不同：① 装置 = **提交进仓库的集成测试** `apps/snapclip/tests/png_params_probe.rs` + 驱动脚本 `tools/p0-04-png-params.ps1`（**每组合一个独立进程**），而不是 `docs/Temp/` 里的一次性脚本——前者可复跑、可被 `P4.02` 复用、且测量过程本身进了版本史；② `png` 只加进 `apps/snapclip/Cargo.toml` 的 **`[dev-dependencies]`**（`png = "0.18"`），**没有**提升为普通依赖 ⇒ `snapclip-capture` 依然看不到 `png`，依赖方向门禁也无需改动（dev-dependency 不进 `-e normal` 图）。若照原文执行，`P0.04` 会产出一份**无法复跑**的测量，且 `P4.02` 会反复重测 | 无 `docs/30` 回填（装置不在设计文档里）；本文 `§6 P0.04` 的"装置净增"、`§16` 的例外栏、`RES-3` 行按实际改写 |
 | **DEV-7**（执行时新增） | V2 **F-10**（`§7`）与 **§29.5** 的"解码上限"行写：任何"导出后解码比对"的测试，**产物 > 64 MiB 时必须显式提高 `png::Limits { bytes }`，否则会假失败** | 2026-10-08 实测**否定**了这个推论：13 组（1280×30000）+ 3 行（3840×30000）的产物**全部**在 `Limits::default()`（64 MiB）下解码成功，其中包括 **101.7 MiB 的产物**与**解码后 460 MB 的图像**。读 `png` 0.18.1 源码可见机制：`Limits::bytes` 由 `reserve_bytes()` **逐次递减**，约束的是解码器**内部**分配（行缓冲、zlib/fdeflate 工作区），**与产物大小、解码后图像大小都无关**（解出的帧写进调用方缓冲区；`read_info()` 的 `LimitsExceeded` 来自 `checked_raw_row_length()`/`output_buffer_size()` 的**溢出**检查）。若照原文执行，`P4.02`/`P4.05`/`P1.21` 会把"提高上限"当成解码成功的**必要条件**去写断言，而真正会失败的情形（行长度算术溢出）反而没人测 | `docs/30 §17.7.1`（新增实测整块，含本节表格与 `CHOSEN`）、`§7` 的 **F-10** 条目（保留 64 MiB 事实、改写推论）、`§29.5` 的"解码上限"行（"必须"→"零代价的防御，但不是测试前置条件"）；本文 §13.5 的同类措辞与 `P4.02` 的 GREEN 同步 |
 | **DEV-8**（执行时新增） | `P0.03` 的"实验装置"一栏写：新写 `crates/snapclip-capture/src/scroll/perf_probe.rs`（`#[cfg(test)]`），**用 P1.01 的 testkit 合成序列**；V2 §23.1/§35 的 `E-PERF-1` 同义 | 2026-10-08 执行时三处与原文不同：① **`crates/snapclip-capture/src/scroll/` 此前不存在**，装置落点必须连带创建 `scroll/mod.rs` 并在 `crates/snapclip-capture/src/lib.rs` 加 **`#[cfg(test)] mod scroll;`**（`P1.01` 建正式模块时**必须**把它换成普通 `pub mod scroll;`，否则 `scroll/` 的生产代码不会被编译）；② **`P1.01` 的 testkit 未实现**，合成序列由装置自带（真值来自 36 px 卡片行 / 120 px 步进的脚本，不是 testkit）⇒ `P1.01` 落地后应换回 testkit 并用同一脚本重跑；③ 装置**多测了一种第 1 层形态** `layer1-revealed`（只摘要新露出的行），因为 `layer1-full` 显示**逐行摘要占单步耗时的 99.3%–99.6%**——这个形态不改变算法语义，却把 4K 单步 P50 从 6,778 µs 降到 **383 µs（17.7×）**，于是"第 1 层必须能复用上一帧的行摘要"从可选优化变成了 `P1.02` 的**接口义务**。若照原文执行，`P1.02` 会实现一个"每步重新摘要全帧"的第 1 层，把 4K 的 P50 预算吃掉 84.7% | `docs/30 §15.4` 第 1 层条目（新增义务句）、`§23.3.1`（新增整块实测：装置/6 行表/五条结论/未取得清单/复现字段）、`§23.3` 的 Stitch Latency 与 CPU(Capturing+Matching) 两行（`待测` → **部分实测**，并写明"整会话未取得"）、`§36.2` 的 `OQ-8`（由"未测"改为结论行：**不需要第 4 层**，瓶颈是直读摘要；收口方式 = `P1.02` 的接口义务 + 落地后重跑四组合）；本文 §6 `P0.03` 的**状态行**与"三处偏离"块、OQ 表的 `OQ-8` 行同步 |
+| **DEV-9**（执行时新增） | `P1.01` 的 GREEN 一栏写：对外只暴露 `fn take(&mut self, k: usize) -> Observation`；REFACTOR 一栏写：自证"恢复**每一个**脚本化位移并断言与真值一致" | 2026-10-08 执行时两处与原文不同：① **`Observation` 是 `P1.03` 的交付物**，`P1.01` 返回它就等于提前实现 `P1.03`（其 RED 是"构造/几何校验"，会因此失效）⇒ 夹具交付自己的 `TestFrame { pixels: Vec<u8>, region: Rect }`，`P1.03` 落地时把返回类型换成 `Observation` 并删除 `TestFrame`；② 自证必须把"每一步都能被还原"限制在 **`|d| ≤ H/2`**（`docs/30 §16.5` 的重叠门槛）：脚本里保留了 `move_by(600)`（视口 900）这种**重叠不足一半**的步进，自证对它的断言只能是"**不得**被还原"。若照原文断言全部步进，夹具会把一条**不可判定**的情形记成夹具缺陷，执行者唯一能让它变绿的办法是删掉该步进——那正是 §16.5 想让夹具产出的 `Lost` 用例。另：`take` 是**顺序**接口（内部游标前进），不是随机访问——会话看到的是流，能要第 7 帧再要第 6 帧的测试没有在测流 | 无 `docs/30` 回填（`§28.2` 的第 11 文件口径已由 `DEV-1` 落地）；本文 §6 `P1.01` 的状态行与执行块按实际改写 |
 
 ---
 
@@ -880,6 +882,17 @@ git config core.hooksPath .githooks
 - **REFACTOR**：**夹具自证**（V2 §29.3 的硬要求）：写 `the_simplest_estimator_recovers_every_scripted_step()` —— 先用**最简单的逐行指纹直通**（不做 ZNCC、不做门限）恢复每一个脚本化位移并断言与真值一致。**这一步是夹具自身可信的唯一证据**；若它失败，说明夹具或坐标约定有问题，**不得继续 P1 的其它任务**
 - **退出条件**：① 自证用例通过；② 夹具不依赖 `apps/snapclip`、不依赖真实桌面；③ `cargo test -p snapclip-capture --lib testkit` 在**干净 checkout** 上通过
 - **提交标题**：`[P1-01] the fixture proves itself before the algorithm exists`
+
+**状态（2026-10-08）**：`[x] 完成` —— 退出条件三条全部满足；两处偏差见 **DEV-9**。
+
+**实测与交付**：
+
+- **RED**：`cargo test -p snapclip-capture --lib testkit` → **`error: could not compile `snapclip-capture` (lib test) due to 21 previous errors; 1 warning emitted`**，全部是 `error[E0425]/[E0433]: cannot find type `TestImage`/`StepSpec`/`ScrollScript`/`Rect` in this scope` + `warning: unused import: super::*`。与预期一致：夹具不存在，测试引用不到任何东西。注册方式 = `scroll/mod.rs` 加 `#[cfg(test)] mod testkit;`。
+- **GREEN**：`cargo test -p snapclip-capture --lib testkit` → **3 passed / 0 failed**。交付 `TestImage::{synthetic, from_structures, width, height, pixels, row, structure_at}`（结构层 = `STRUCTURES` 七个：`Flat` / `HorizontalBars{period:37}` / `Checker{cell:24}` / `Gradient` / `NoiseBlocks{cell:8}` / `TextRows{line:19}` / `Hairlines{step:40}`，`BAND_HEIGHT = 240` 循环；唯一熵是 `seed`，`hash()` 是整数混淆）、`StepSpec::{move_by, repeat, jump_to, with_dynamic, with_noise}`（字段 `delta/dynamic/noise`）、`ScrollScript::{new, len, truth, viewport_rect, viewport_height, image, take}`、`TestFrame{pixels, region}`。**写入过程中被自己的用例抓到两个测试侧缺陷**（不是夹具缺陷）：① 忘记 `take(0)` 就先 `take(1)` → 被顺序断言拦住；② 把"装饰"放在 `steps[1]` 却比较 frame 1 → 装饰还没生效；改为比较 frame 2，并把它拆成两条独立断言（移动区域只改顶部、噪声必须到帧底）。
+- **REFACTOR（夹具自证）**：`the_simplest_estimator_recovers_every_scripted_step()` 通过。脚本 12 步 = `120, 120, repeat, -120, jump_to(360), 1, 19, 37, 40, 240, -7, 600`，含三个**载波周期**（19 = `TextRows` 行距、37 = `HorizontalBars` 周期、40 = `Hairlines` 步长）与一个**整带步进**（240 = `BAND_HEIGHT`）；估计器 = 逐行 FNV-1a 指纹 + 重叠 ≥ H/2 + 最大匹配数、`|d|` 最小为平局**唯一**判据。**首次运行失败并暴露了一个真实边界**：`frame 12: the row-fingerprint matcher found Some(448), the script says 600` —— 视口 900 而步进 600 时重叠只有 300 行（< H/2），`docs/30 §16.5` 的重叠门槛把真值整个排除在外，匹配器于是返回了一个重叠更多但完全错误的位移。因此自证改为**分段断言**：`|d| ≤ H/2` 的 11 步必须被还原，`move_by(600)` 这一步必须**不被**还原（`Lost` 情形的可执行定义）。若按原文"每一步都必须被还原"，唯一能让它变绿的办法是删掉该步进——那正好会删掉 `§16.5` 要夹具产出的用例（见 DEV-9）。
+- **门禁（2026-10-08）**：`cargo check --workspace --all-targets` = **0 error / 1 warning**（仅既有 `unused variable: content_label`，`apps/snapclip/src/history/view.rs`）；`cargo test --workspace --lib` = **489 passed / 15 ignored / 0 failed**（app 56+3、**capture 359+12**（`P0.03` 之后 356+12，+3 = 夹具三用例）、history 51、model 23）；`tools/check-dependency-direction.ps1` = **clean**（capture 30 / history 47 / model 8 包）。
+- **`lib.rs` 的模块口径同步（`DEV-8` 的义务）**：`#[cfg(test)] mod scroll;` → **`pub mod scroll;`**，`scroll/mod.rs` 的文档由"test-only shell"改写为"`testkit` 与 `perf_probe` 均为 `#[cfg(test)]`，生产文件自 `P1.02` 起"（`§28.4` 的第二遍扫描按计划留给 `P6.07`，本任务不加）。
+- **留给 `P1.03` 的接口义务**：`P1.03` 落地 `Observation` 时把 `ScrollScript::take` 的返回类型换成它并删除 `TestFrame`（**DEV-9** ①）；`P1.02` 重跑 `E-PERF-1` 时应改用 `TestImage::synthetic` 生成序列，而不是 `perf_probe.rs` 自带的 `VirtualDocument`（**DEV-8** ② 要它"落地后换回 testkit 重跑"）。
 
 ### P1.02 `Axis` 抽象与 `T-AXIS-1`
 

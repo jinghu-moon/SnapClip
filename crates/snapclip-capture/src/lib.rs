@@ -35,10 +35,10 @@ pub mod ports;
 pub mod ring_contrast;
 pub mod runtime;
 pub mod sampler;
-// Test-only for now: `P0.03` lands its measurement device here before `P1.01` creates the
-// real eleven-file layout (`docs/30` §28). Nothing under `scroll/` may reference `windows`.
-#[cfg(test)]
-mod scroll;
+// The scroll-capture subsystem (`docs/30` §28). `P1.01` created the directory, so the module is
+// a normal one from here on (`DEV-8`); its production items arrive with `P1.02`+. Nothing under
+// `scroll/` may reference `windows` (§28.4).
+pub mod scroll;
 pub mod session;
 pub mod window_detection;
 pub mod windows;
