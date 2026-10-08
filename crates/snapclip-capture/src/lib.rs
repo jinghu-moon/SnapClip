@@ -35,6 +35,10 @@ pub mod ports;
 pub mod ring_contrast;
 pub mod runtime;
 pub mod sampler;
+// Test-only for now: `P0.03` lands its measurement device here before `P1.01` creates the
+// real eleven-file layout (`docs/30` §28). Nothing under `scroll/` may reference `windows`.
+#[cfg(test)]
+mod scroll;
 pub mod session;
 pub mod window_detection;
 pub mod windows;
