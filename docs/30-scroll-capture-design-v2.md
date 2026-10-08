@@ -1378,6 +1378,38 @@ struct WgcFrameSource {          // 持有策略：去重、尺寸检查、结�
 
 **代价与边界**：`windows` crate 为 `QueryPerformanceCounter` 新增了一条 feature（`Win32_System_Performance`）——是 feature 边，不是新 crate。**七条用例全部不需要窗口**（脚本化后端），这是 `P2.08` 要的前提。
 
+#### 11.1.2 目标丢失：三种事实，一个词（P2.07，2026-10-09）
+
+§11.1.1 的 `FrameBackend` 少了**一个必须先问的问题**，这一节补上它并说明为什么它不是"再加一个错误分支"。
+
+**缺口**：`WgcSession::next_frame` 只查 `Direct3D11CaptureFramePool::TryGetNextFrame`。窗口被关闭或被最小化之后，帧池只是**不再有帧**，于是它返回 `Ok(None)`，被 `WgcFrameSource` 归一成 `Poll::Idle`——**与"页面静止不动"逐字节不可区分**。会话于是会永远等下去，而用户已经关掉了标签页。§14.4 与 §24.4 都写着"`IsWindow` 失败 / `IsIconic` 为真 → 终止"，但**今天的代码里没有任何地方调用过它们**：这是一条只写在文档里的规则。
+
+**形状**（`FrameBackend` 因此从 §11.1.1 的两方法变成三方法）：
+
+```rust
+enum TargetLiveness {
+    Alive,
+    Closed,      // IsWindow 说这个句柄已经不是一个窗口
+    Minimised,   // IsIconic 说窗口被最小化
+}
+
+trait FrameBackend {
+    fn poll_frame(&mut self, timeout: Duration) -> Result<BackendPoll, FrameError>;
+    fn size(&self) -> (u32, u32);
+    fn liveness(&mut self) -> TargetLiveness;   // 每次 poll 之前问，代价是一对 IsWindow/IsIconic
+}
+```
+
+**三处落地裁决**：
+
+1. **问窗口，不要从沉默里推断。** "池子没给我帧"不是关于**为什么**的证据。`Closed`/`Minimised` 与"页面没动"在帧池上完全同形，所以唯一能分开它们的办法是**问窗口**。这也决定了它必须放在 trait 上而不是塞进 `BackendPoll`：它不是某一次轮询的结果，是关于目标的前置事实。
+2. **liveness 在 poll 之前问，不是等超时之后。** 一个已经关掉的窗口是**现在就能知道**的事实；先等满 `timeout` 再报 `Idle`，等于把一个终局降级成一次"暂时没动静"，而调用方会据此再等一轮。用例因此断言 `polls == 0`——"没有问过帧池"这件事本身是被测对象，脚本化的后端给空脚本，好让"它还是轮询了"表现为计数器变化而不是"恰好拿到一帧"。
+3. **三种事实留在 `detail` 里，词汇表仍然只有一个词。** 关闭 / 最小化 / 尺寸变化都是 `EndReason::TargetLost`（§20.4 的十一个 `StopReason` 变体里没有一个叫 `Resized` 或 `DisplayChanged`，因为对用户和对代码路径它们行为完全相同——§24.4）。可区分性由三句不同的话承担，而"词汇表不许长大"由一条**穷尽 `match` 且没有 `_` 分支**的用例钉住：将来谁加一个变体，这个构建就红。尺寸变化那句 `detail` 在 `P2.03` 就已存在，本节只是让另外两种事实有同等的话语权。
+
+**`Partial` 义务落在类型上**：`Poll::Ended` 的文档现在写明——与 `Idle` 不同，它是终局，并且携带一条义务：调用方必须**先把已确认的行作为 `Partial` 交出去**再拆会话。一条跑了三分钟的会话不会因为用户关了标签页就变得没有价值（§24.4 末段）。
+
+**代价与边界**：`handle` 存在 `WgcFrameBackend` 上而不是 `WgcSession` 上——一个关掉的窗口让捕获 item 看上去依然完全有效，所以"这个句柄还在不在"是**流**的事实，不是捕获会话的事实。本节的两种新事实只在脚本化后端上测过（L2）；把它们接到真实窗口上的桌面验证与 `Partial` 导出一起归会话组装（§30.1 的 L3 行）。
+
 ### 11.2 帧的获取路径
 
 V2 复用既有 capture worker，但**新增一种请求**（不是新线程、不是新设备）：
@@ -1739,7 +1771,7 @@ pub enum InjectStatus {
 
 - **视口尺寸变化** → 终止。理由：画布的行跨距已定，尺寸变化意味着"恢复的图像"这个概念不再成立（Snow Shot 的 `validate_incoming` 也是硬失败，`docs/29` §3.16；PixPin 的做法同样是提示用户重新开始）。**不允许"自适应"**——那会引入重采样，违反 N3。
 - **`cross_delta` 持续非零** → 报诊断，**不补偿**（§13.1）。若累计 `|cross_delta| > cross_tolerance`（默认 8 px）→ 报 `Uncertain` 并提示用户（可能是窗口被拖动/页面横向滚动）。
-- **目标窗口消失/最小化**（`IsWindow` 失败 / `IsIconic` 为真）→ 终止（`TargetLost`）。
+- **目标窗口消失/最小化**（`IsWindow` 失败 / `IsIconic` 为真）→ 终止（`TargetLost`）。落地形状与"为什么必须主动问"见 §11.1.2（`P2.07`）；三种事实（关闭 / 最小化 / 尺寸变化）由 `detail` 区分，`EndReason` 仍是四个变体。
 - **视口内出现大面积 `Missing`**（见下）→ **不终止**，标记部分结果。
 
 **关于内部 gap 的定义（V1 没有定义过的东西）**：画布的前缀覆盖区间 `[0, H)` 中，若存在一个行区间从未被任何有效观测覆盖，则称存在 `Missing`。它只可能出现在两类情形：① 单步位移 > 观测高度（不可能，被 `capability` 与 `N_MAX` 挡住，且会被 §14.3 的硬门判为 `Uncertain`）；② **目标自己跳转**（锚点跳转、`scrollTo`、滚动条被拖动）。第 ② 类无法预防，因此 V2 的做法是**检测并标记**：一次位移若使 `|d| > viewport_extent − ρ_min × viewport_extent`（即无法保证 `ρ_min` 重叠），**该帧被拒绝**（`Uncertain`），画布上不会产生 gap——**用"拒绝"代替"接受后打补丁"**（这正是"正确性优先于覆盖率"G1 的执行）。
@@ -3054,7 +3086,7 @@ tile  class      weight   observations
 | `dynamic` 占比 >30% | §18.2 统计 | 中 | 继续 | 否 | 无 | 启用 §18.4 光流 |
 | 位移 > 视口（跳跃） | 门一 | — | 继续 | 否 | 无 | 无 |
 | 内容完全不变（到底） | 行指纹 | 高 | **停止** | 否 | 停止原因"已到达页面底部" | 无 |
-| 目标窗口消失/最小化 | 帧源 `Ended(TargetLost)` | — | **停止** | — | 停止原因 + **提供 `Partial` 导出** | 无 |
+| 目标窗口消失/最小化 | 帧源 `Ended(TargetLost)`（`TargetLiveness` 在 poll 之前问，§11.1.2；关闭/最小化/尺寸变化由 `detail` 区分） | — | **停止** | — | 停止原因 + **提供 `Partial` 导出** | 无 |
 | 设备丢失 | `is_device_lost` | — | **停止** | — | 错误 + `Partial` 导出 | 无 |
 | 内存/上限 | §17.6 | — | **停止** | — | 提示 + `Partial` 导出 | 无 |
 | 用户停止 | 输入 | — | **停止** | — | 立即 | 无 |

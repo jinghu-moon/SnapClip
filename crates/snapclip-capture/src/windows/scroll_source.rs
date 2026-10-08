@@ -50,6 +50,8 @@ use super::providers::{ProviderKind, ScrollFrame};
 use super::win::d3d11::GraphicsDevice;
 use super::win::wgc::{WgcError, WgcSession};
 use super::monitor::{self, CapturedMonitor};
+use ::windows::Win32::Foundation::HWND;
+use ::windows::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindow};
 
 /// The scroll path's backend order (`docs/30` §11.5, task `P2.06`).
 ///
@@ -186,6 +188,11 @@ pub(crate) enum Poll {
     /// Nothing new within the timeout. The caller keeps waiting or stops for its own reasons.
     Idle,
     /// The stream is over.
+    ///
+    /// Unlike [`Poll::Idle`], this is final, and it carries an obligation: the caller must hand
+    /// out the rows it has already confirmed as a `Partial` before tearing the session down
+    /// (`docs/30` §24.4). An ending is never a reason to throw the canvas away — the session may
+    /// have been running for minutes when the user closed the tab.
     Ended(EndReason),
 }
 
@@ -237,12 +244,31 @@ pub(crate) enum BackendPoll {
 
 /// The platform side of a [`FrameSource`].
 ///
+/// What the platform says about the target right now, asked before every poll.
+///
+/// This exists because "the pool had no frame for me" is not evidence about *why*. A closed
+/// window, a minimised window and a page that is simply not moving all produce no frames, so
+/// without asking, all three become `Idle` forever and the session cannot tell "the user is
+/// reading" from "the user closed the tab" (§11.1, §24.4 row 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TargetLiveness {
+    Alive,
+    /// `IsWindow` says the handle no longer names a window.
+    Closed,
+    /// `IsIconic` says the window is minimised.
+    Minimised,
+}
+
 /// Implemented once for real (WGC) and once by a scripted stand-in, which is what lets the
 /// stream rules be tested without a desktop.
 pub(crate) trait FrameBackend {
     fn poll_frame(&mut self, timeout: Duration) -> Result<BackendPoll, FrameError>;
     /// The viewport size this backend will deliver, known before the first frame.
     fn size(&self) -> (u32, u32);
+    /// Whether the target can still produce frames at all.
+    ///
+    /// Asked before `poll_frame`, and it must be cheap: it is one `IsWindow`/`IsIconic` pair.
+    fn liveness(&mut self) -> TargetLiveness;
 }
 
 /// A [`FrameSource`] over a [`FrameBackend`]: owns the deadline, the duplicate rule and the
@@ -294,6 +320,27 @@ impl FrameSource for WgcFrameSource {
         }
         let deadline = std::time::Instant::now() + timeout;
         loop {
+            // Asked before the poll, not after a timeout: a window that is gone or minimised is
+            // a fact we can have now, and waiting out the timeout first would report `Idle` for
+            // a target that is never coming back (§24.4 row 5).
+            match self.backend.liveness() {
+                TargetLiveness::Alive => {}
+                TargetLiveness::Closed => {
+                    return Ok(self.end(
+                        EndReason::TargetLost,
+                        "the target window is gone: IsWindow no longer names a window for this \
+                         handle",
+                    ));
+                }
+                TargetLiveness::Minimised => {
+                    return Ok(self.end(
+                        EndReason::TargetLost,
+                        "the target window is minimised: a minimised window produces no frames, \
+                         which would otherwise be indistinguishable from a page that is not \
+                         moving",
+                    ));
+                }
+            }
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             match self.backend.poll_frame(remaining)? {
                 BackendPoll::Idle => return Ok(Poll::Idle),
@@ -348,6 +395,10 @@ pub(crate) struct WgcFrameBackend {
     device: std::sync::Arc<GraphicsDevice>,
     session: WgcSession,
     size: (u32, u32),
+    /// Kept here rather than on `WgcSession` because it is the *stream's* business: the
+    /// session only knows about the capture item, and a closed window leaves the item looking
+    /// perfectly valid.
+    handle: isize,
 }
 
 impl WgcFrameBackend {
@@ -361,6 +412,7 @@ impl WgcFrameBackend {
             device,
             session,
             size: (width.max(0) as u32, height.max(0) as u32),
+            handle,
         })
     }
 }
@@ -401,6 +453,19 @@ impl FrameBackend for WgcFrameBackend {
 
     fn size(&self) -> (u32, u32) {
         self.size
+    }
+
+    fn liveness(&mut self) -> TargetLiveness {
+        let hwnd = HWND(self.handle as *mut core::ffi::c_void);
+        if unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+            if unsafe { IsIconic(hwnd) }.as_bool() {
+                TargetLiveness::Minimised
+            } else {
+                TargetLiveness::Alive
+            }
+        } else {
+            TargetLiveness::Closed
+        }
     }
 }
 
@@ -476,12 +541,14 @@ impl ScrollSourceRuntime {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
     use super::{
         BackendFallback, BackendPoll, EndReason, FrameBackend, FrameError, FrameSource, Poll,
-        ProviderKind, SCROLL_BACKENDS, TargetGeometry, TopologyOutcome, WgcFrameSource,
-        next_scroll_backend, topology_outcome,
+        ProviderKind, SCROLL_BACKENDS, TargetGeometry, TargetLiveness, TopologyOutcome,
+        WgcFrameSource, next_scroll_backend, topology_outcome,
     };
     use crate::geometry::Rect;
     use crate::scroll::observation::Axis;
@@ -492,8 +559,12 @@ mod tests {
         size: (u32, u32),
         steps: VecDeque<ScriptedStep>,
         last: Option<Vec<u8>>,
-        polls: u32,
+        /// Shared with the test so "was the platform asked at all?" is answerable — the
+        /// liveness rules are about *not* polling, so the count has to be observable from
+        /// outside the box.
+        polls: Arc<AtomicU32>,
         timeouts: Vec<Duration>,
+        liveness: TargetLiveness,
     }
 
     enum ScriptedStep {
@@ -510,12 +581,22 @@ mod tests {
 
     impl ScriptedBackend {
         fn new(size: (u32, u32), steps: Vec<ScriptedStep>) -> Self {
+            Self::with_liveness(size, TargetLiveness::Alive, steps, Arc::new(AtomicU32::new(0)))
+        }
+
+        fn with_liveness(
+            size: (u32, u32),
+            liveness: TargetLiveness,
+            steps: Vec<ScriptedStep>,
+            polls: Arc<AtomicU32>,
+        ) -> Self {
             Self {
                 size,
                 steps: steps.into(),
                 last: None,
-                polls: 0,
+                polls,
                 timeouts: Vec::new(),
+                liveness,
             }
         }
     }
@@ -542,7 +623,7 @@ mod tests {
 
     impl FrameBackend for ScriptedBackend {
         fn poll_frame(&mut self, timeout: Duration) -> Result<BackendPoll, FrameError> {
-            self.polls += 1;
+            let polls = self.polls.fetch_add(1, Ordering::SeqCst) + 1;
             self.timeouts.push(timeout);
             match self.steps.pop_front() {
                 Some(ScriptedStep::Frame { pixels, size }) => {
@@ -558,7 +639,7 @@ mod tests {
                     Ok(BackendPoll::Frame {
                         pixels,
                         size,
-                        qpc: self.polls as i64,
+                        qpc: polls as i64,
                     })
                 }
                 Some(ScriptedStep::Idle) | None => Ok(BackendPoll::Idle),
@@ -573,10 +654,31 @@ mod tests {
         fn size(&self) -> (u32, u32) {
             self.size
         }
+
+        fn liveness(&mut self) -> TargetLiveness {
+            self.liveness
+        }
     }
 
     fn source(size: (u32, u32), steps: Vec<ScriptedStep>) -> WgcFrameSource {
         WgcFrameSource::new(Box::new(ScriptedBackend::new(size, steps)), Axis::Vertical)
+    }
+
+    /// A source whose target is already gone or already minimised, plus the shared poll counter.
+    ///
+    /// The script is empty on purpose: if the source asks about liveness the way §24.4 requires,
+    /// it answers without ever polling, and an empty script makes "it polled anyway" visible as
+    /// a change in the counter rather than as a frame it happened to get.
+    fn gone_source(
+        size: (u32, u32),
+        liveness: TargetLiveness,
+    ) -> (WgcFrameSource, Arc<AtomicU32>) {
+        let polls = Arc::new(AtomicU32::new(0));
+        let backend = ScriptedBackend::with_liveness(size, liveness, Vec::new(), polls.clone());
+        (
+            WgcFrameSource::new(Box::new(backend), Axis::Vertical),
+            polls,
+        )
     }
 
     #[test]
@@ -723,6 +825,94 @@ mod tests {
             source.next(Duration::from_millis(50)),
             Ok(Poll::Ended(_))
         ));
+    }
+
+    // --- three ways a target ends, and one word for all of them (§11.1, §24.4; task P2.07) ---
+    //
+    // A closed window and a minimised window both stop producing frames. So does a page that
+    // is simply not moving — and today `WgcSession::next_frame` only asks the frame pool, so
+    // all three look like `Ok(None)` and become `Idle` forever. That is the gap: "no frames"
+    // is not evidence about *why*, so the source has to ask the window, not infer from silence.
+    //
+    // The three facts stay three facts in `detail`, and stay one `EndReason` in the vocabulary
+    // (§20.4 keeps eleven `StopReason` variants; none of them is `Resized` or `DisplayChanged`,
+    // because to the user and to the code path they behave identically — §24.4).
+
+    #[test]
+    fn closed_minimised_and_resized_are_three_distinct_endings() {
+        let size = (8, 4);
+
+        let (mut closed, closed_polls) = gone_source(size, TargetLiveness::Closed);
+        let closed_answer = closed.next(Duration::from_millis(50));
+        assert!(
+            matches!(closed_answer, Ok(Poll::Ended(EndReason::TargetLost))),
+            "a closed window must end the stream as TargetLost, not as an error: {closed_answer:?}"
+        );
+        assert_eq!(
+            closed_polls.load(Ordering::SeqCst),
+            0,
+            "a closed window is a fact about the window, not about the frame pool: asking the \
+             pool first would make a close wait out the timeout and then report Idle"
+        );
+        let closed_detail = closed.last_detail().expect("an ending carries its words");
+
+        let (mut minimised, minimised_polls) = gone_source(size, TargetLiveness::Minimised);
+        let minimised_answer = minimised.next(Duration::from_millis(50));
+        assert!(
+            matches!(minimised_answer, Ok(Poll::Ended(EndReason::TargetLost))),
+            "a minimised window must end the stream as TargetLost: {minimised_answer:?}"
+        );
+        assert_eq!(
+            minimised_polls.load(Ordering::SeqCst),
+            0,
+            "minimisation is asked about, not waited for (§24.4 row 5)"
+        );
+        let minimised_detail = minimised.last_detail().expect("an ending carries its words");
+
+        let mut resized_source = source(size, vec![resized((16, 4), 200)]);
+        let resized_answer = resized_source.next(Duration::from_millis(50));
+        assert!(
+            matches!(resized_answer, Ok(Poll::Ended(EndReason::TargetLost))),
+            "a resize must end the stream as TargetLost: {resized_answer:?}"
+        );
+        let resized_detail = resized_source
+            .last_detail()
+            .expect("an ending carries its words");
+
+        assert!(
+            closed_detail.contains("gone"),
+            "the closed detail must say the window is gone: {closed_detail}"
+        );
+        assert!(
+            minimised_detail.contains("minimis"),
+            "the minimised detail must say minimised: {minimised_detail}"
+        );
+        assert!(
+            resized_detail.contains("resiz"),
+            "the resized detail must say resized: {resized_detail}"
+        );
+        assert_ne!(closed_detail, minimised_detail);
+        assert_ne!(closed_detail, resized_detail);
+        assert_ne!(minimised_detail, resized_detail);
+    }
+
+    #[test]
+    fn the_ending_vocabulary_stays_four() {
+        // An exhaustive match with no `_` arm: adding an `EndReason` variant breaks this
+        // build, which is what keeps §20.4's word list from growing one "clearer name" at a
+        // time. The three endings above are distinguished by `detail`, not by a variant.
+        fn name(reason: EndReason) -> &'static str {
+            match reason {
+                EndReason::TargetLost => "target-lost",
+                EndReason::CaptureFailed => "capture-failed",
+                EndReason::DeviceLost => "device-lost",
+                EndReason::Timeout => "timeout",
+            }
+        }
+        assert_eq!(name(EndReason::TargetLost), "target-lost");
+        assert_eq!(name(EndReason::CaptureFailed), "capture-failed");
+        assert_eq!(name(EndReason::DeviceLost), "device-lost");
+        assert_eq!(name(EndReason::Timeout), "timeout");
     }
 
     // --- display topology and window changes (§24.4; task P2.05) ---
