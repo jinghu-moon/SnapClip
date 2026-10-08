@@ -23,8 +23,8 @@
 //! but keep the session" is one match arm instead of a rule every consumer re-derives.
 //!
 //! Not here yet: `scene_cut` (`P1.12` puts it in `Evidence`, so that it never becomes a
-//! `StopReason`), the `ĝ` prior (`P1.08`) and the gates themselves (`P1.08`–`P1.11`); all of them
-//! feed the `score` this file's formulas name.
+//! `StopReason`), the `ĝ` prior (`P1.14`) and the gates after the first (`P1.09`–`P1.11`); all of
+//! them feed the `score` this file's formulas name.
 //!
 //! `P1.06` adds §15.4's second layer: the first thing in the funnel allowed to *argue*, because it
 //! is the first that compares two-dimensional structure (F-02 — a periodic carrier satisfies any
@@ -36,6 +36,12 @@
 //! and it answers with [`Refined`] — an `i32` and one correlation, with no field for a subpixel
 //! offset. N3 says why: the observation is an integer pixel grid, so a fractional shift would be an
 //! interpolation believed as a measurement.
+//!
+//! `P1.08` adds the first of §16.1's gates ([`gate_geometry`]) together with §16.9's ban on the
+//! `±N/2` boundary, and keeps the verifiability floor ([`RHO_MIN`]) as a separate item: "how much
+//! shift is physically possible" is a fact about overlap with no parameters, "how much overlap is
+//! enough evidence" is a calibratable preference. V1 conflated them (`docs/30` §16.2), and the
+//! conflation is exactly what makes a hard gate drift when someone tunes confidence.
 
 // The first consumer of everything in this file is `P1.05` (layer 1) / `P1.06` (ZNCC) / `P1.12`
 // (the session loop). Until then the module is exercised only by its own tests, and the crate's
@@ -965,11 +971,107 @@ pub(crate) fn refine_winner(
     refined
 }
 
+// ── the gates (`P1.08`) ──────────────────────────────────────────────────────────────────────────
+//
+// §16.1 runs four gates over the candidate set and the candidates that survive all of them are what
+// `Confirmed` means. They answer uniformly — a gate decides, it does not measure — so the assembly
+// (`P1.12`) can hold them in one place and read one type.
+
+/// What a gate said (`docs/30` §16.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GateOutcome {
+    Pass,
+    Reject(GateRejection),
+}
+
+/// Why a gate refused. One variant per gate keeps a diagnosis from collapsing into `false`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GateRejection {
+    /// §16.2: `|d| > viewport_extent`. The two frames share no row, so there is nothing to measure.
+    OutsideViewport,
+    /// §16.9: `|d| == extent / 2`. The landing point of every undefined and every wraparound path.
+    BannedHalf,
+}
+
+impl GateRejection {
+    /// What §16.10 says a rejection means for the session.
+    ///
+    /// Both are `None` rather than `Uncertain`. `Uncertain` means "a shift was measured and the
+    /// evidence does not carry a decision"; these two mean the measurement itself is not a
+    /// measurement — either there was nothing to compare or the estimator left its defined domain.
+    /// §16.9 wants that distinction visible, so it is a method instead of a sentence each call site
+    /// would spell differently.
+    pub(crate) const fn status(self) -> Status {
+        match self {
+            Self::OutsideViewport | Self::BannedHalf => Status::None,
+        }
+    }
+}
+
+/// §16.2's geometry gate: the closed interval `|d| <= viewport_extent`, plus §16.9's ban on `±N/2`.
+///
+/// The interval is closed because it is a fact, not a preference: at `|d| == extent` exactly one row
+/// of the previous observation is still on screen (a measurable overlap), at `extent + 1` none is.
+/// It takes the viewport extent and nothing else — no search window, no prior, no content — because
+/// §16.2 wants it to hold even when §16.6's `ĝ` hands the search a nonsensical centre.
+///
+/// The ban is applied after the interval, and it is deliberately the *truncated* half (`11 / 2 == 5`)
+/// rather than "an odd extent has no half": the value being banned is a specific fallback landing
+/// point, and §16.9 requires it be named rather than silently skipped. A viewport with no half at
+/// all (`extent <= 1`) must still be able to report `d == 0`, which is the one answer §16.3's
+/// fingerprint path exists to confirm.
+pub(crate) fn gate_geometry(d: i32, viewport_extent: u32) -> GateOutcome {
+    // `i32::MIN` is the shift no session produces but a caller can pass; widening first makes the
+    // comparison total instead of a panic in a gate that is supposed to be the last line of defence.
+    let shift = i64::from(d);
+    let extent = i64::from(viewport_extent);
+
+    if shift.abs() > extent {
+        return GateOutcome::Reject(GateRejection::OutsideViewport);
+    }
+
+    let half = extent / 2;
+    if extent >= 2 && shift.abs() == half {
+        return GateOutcome::Reject(GateRejection::BannedHalf);
+    }
+
+    GateOutcome::Pass
+}
+
+/// The smallest remaining overlap that still counts as evidence (`docs/30` §16.1, §14.2's `ρ*`).
+///
+/// Deliberately **not** the same item as [`gate_geometry`]: the gate is a fact about overlap with no
+/// parameter, this is a preference about how much evidence suffices, and §16.11 marks it
+/// calibratable (`E-ACC-1`, range 0.30–0.40).
+pub(crate) const RHO_MIN: f32 = 0.35;
+
+/// [`RHO_MIN`] in permille, which is what [`is_verifiable`] actually compares.
+///
+/// The floor is an integer comparison on purpose: `extent = 100, |d| = 65` is exactly 350‰ and must
+/// pass, and a float `>=` on the rounded quotient is the kind of boundary a calibration run would
+/// move by accident.
+pub(crate) const RHO_MIN_PERMILLE: i64 = 350;
+
+/// §16.1's verifiability floor: `overlap_ratio >= RHO_MIN` with `overlap_ratio = (extent − |d|) / extent`.
+///
+/// This is the constraint §16.2's note calls "credibility", and it is the reason a `d` can pass the
+/// hard gate and still be reported as `Uncertain` (§16.10).
+pub(crate) fn is_verifiable(d: i32, viewport_extent: u32) -> bool {
+    let extent = i64::from(viewport_extent);
+    if extent <= 0 {
+        // No viewport, no evidence: refuse to call a degenerate observation verifiable.
+        return false;
+    }
+    let overlap = (extent - i64::from(d).abs()).max(0);
+    overlap * 1000 >= RHO_MIN_PERMILLE * extent
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        CANDIDATE_LIMIT, Candidate, Displacement, Evidence, Gray, ScoredCandidate, ScoredSet,
-        Status, StepEffect, band_zncc, candidates_1d, match_band, match_rows, primary_digests,
+        CANDIDATE_LIMIT, Candidate, Displacement, Evidence, GateOutcome, GateRejection, Gray,
+        RHO_MIN, RHO_MIN_PERMILLE, ScoredCandidate, ScoredSet, Status, StepEffect, band_zncc,
+        candidates_1d, gate_geometry, is_verifiable, match_band, match_rows, primary_digests,
         score_candidates_2d, support_at,
     };
     use crate::scroll::observation::{Axis, Observation, ObservationView};
@@ -1801,5 +1903,92 @@ mod tests {
                 "shift {truth}: the third layer did not recover the truth from {winner}"
             );
         }
+    }
+
+    #[test]
+    fn the_gate_accepts_exactly_viewport_extent_and_rejects_one_more() {
+        // `docs/31` §6 `P1.08`; `docs/30` §16.2. The interval is closed, and the reason is a fact
+        // about overlap rather than a preference about confidence: at `|d| == extent` exactly one
+        // pixel row of the previous frame is still on screen, at `extent + 1` none is, so no
+        // measurement can exist — that is what makes this a *correctness* constraint.
+        const EXTENT: u32 = 10;
+        for d in [EXTENT as i32, -(EXTENT as i32)] {
+            assert_eq!(gate_geometry(d, EXTENT), GateOutcome::Pass, "d = {d}");
+        }
+        for d in [EXTENT as i32 + 1, -(EXTENT as i32) - 1] {
+            assert_eq!(
+                gate_geometry(d, EXTENT),
+                GateOutcome::Reject(GateRejection::OutsideViewport),
+                "d = {d}"
+            );
+        }
+
+        // The gate reads the viewport extent and nothing else — no search window, no prior — so a
+        // broken search centre (§16.6's `ĝ`) can only waste candidates, never open a hole here.
+        assert_eq!(gate_geometry(0, 0), GateOutcome::Pass);
+    }
+
+    #[test]
+    fn the_gate_never_returns_half_the_dimension() {
+        // `docs/31` §6 `P1.08`; `docs/30` §16.9. `±N/2`/`±M/2` is where every undefined and every
+        // wraparound path lands (the phase-correlation fallback returned `(-N/2, -M/2)`), so it is
+        // refused even though it passes the geometry gate above.
+        assert_eq!(
+            gate_geometry(5, 10),
+            GateOutcome::Reject(GateRejection::BannedHalf)
+        );
+        assert_eq!(
+            gate_geometry(-5, 10),
+            GateOutcome::Reject(GateRejection::BannedHalf)
+        );
+
+        // The answer is `None`, not `Uncertain`: the estimator walked into a branch it must not
+        // trust, and §16.10 wants that visible (G12) instead of looking like a hesitant match.
+        assert_eq!(GateRejection::BannedHalf.status(), Status::None);
+        assert_eq!(GateRejection::OutsideViewport.status(), Status::None);
+
+        // An odd extent has no exact half, so the rule names the truncation instead of quietly
+        // skipping itself (`11 / 2 == 5`).
+        assert_eq!(
+            gate_geometry(5, 11),
+            GateOutcome::Reject(GateRejection::BannedHalf)
+        );
+
+        // A viewport with no half at all must not ban `d == 0`, which would make "the frame did not
+        // move" unreportable — the one answer §16.3's fingerprint path exists to confirm.
+        for extent in [0, 1] {
+            assert_eq!(gate_geometry(0, extent), GateOutcome::Pass, "extent {extent}");
+        }
+    }
+
+    #[test]
+    fn the_verifiability_floor_is_a_different_number_from_the_hard_gate() {
+        // `docs/31` §6 `P1.08` REFACTOR; `docs/30` §16.1. V1 (and the first draft of `docs/25` R17)
+        // spoke of "the cap" and "the credibility" as one thing. They are two quantities: §16.2 is a
+        // fact about overlap (`|d| <= extent`, zero parameters), `RHO_MIN` is how much overlap must
+        // remain to count as evidence (calibratable, §16.11).
+        const EXTENT: u32 = 100;
+
+        // A shift that passes the hard gate and is still not verifiable: 34% of the viewport left.
+        assert_eq!(gate_geometry(66, EXTENT), GateOutcome::Pass);
+        assert!(!is_verifiable(66, EXTENT));
+
+        // 35% is the documented target overlap (`docs/30` §14.2: `ρ* = 0.35`) and the floor.
+        assert!(is_verifiable(65, EXTENT));
+        assert!(!is_verifiable(66, EXTENT));
+        assert_eq!(RHO_MIN, 0.35);
+        assert_eq!(
+            (RHO_MIN * 1000.0).round() as i64,
+            RHO_MIN_PERMILLE,
+            "the exposed float and the integer the floor actually compares must be one number"
+        );
+
+        // And the hard gate's own edge is not verifiable at all: one row left.
+        assert_eq!(gate_geometry(100, EXTENT), GateOutcome::Pass);
+        assert!(!is_verifiable(100, EXTENT));
+        assert_eq!(
+            gate_geometry(101, EXTENT),
+            GateOutcome::Reject(GateRejection::OutsideViewport)
+        );
     }
 }

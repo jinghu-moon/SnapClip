@@ -1848,6 +1848,24 @@ impl Gray { fn scaled(view: &ObservationView<'_>, scale: u32) -> Self }        /
 - **闭区间**：`|d| == viewport_extent` 是"恰好只剩 1 px 重叠"，仍属可能，**接受**（这是 §6 参考实现 `max_motion_ratio = 0.6` 之外的额外硬门；参考实现允许到 0.6·extent，V2 允许到 1.0·extent 但只在其余门通过时）。边界用例必须写成测试：`extent = 10` 时 `d = 10` 接受、`d = 11` 拒绝。
 - **实现上它与搜索窗无关**：搜索窗由 P1 给出（窄），几何硬约束是**独立的最后一道**——即使 P1 失灵给出荒谬的搜索中心，门一仍然兜底。
 
+#### 16.2.1 落地的形状（`P1.08`，2026-10-08）
+
+门一只有一条规则，所以它落成一个**无参数纯函数**加一个带原因的返回值，而不是一个可配置的结构：
+
+```rust
+pub(crate) enum GateOutcome { Pass, Reject(GateRejection) }
+pub(crate) enum GateRejection { OutsideViewport, BannedHalf }
+impl GateRejection { pub(crate) const fn status(self) -> Status { /* 两支都是 Status::None */ } }
+
+pub(crate) fn gate_geometry(d: i32, viewport_extent: u32) -> GateOutcome
+```
+
+三处裁决（`docs/31` `DEV-17`）：
+
+1. **闭区间的两端各有可执行形式**：`extent = 10` 时 `±10 → Pass`、`±11 → Reject(OutsideViewport)`。测试同时钉住 `gate_geometry(0, 0) == Pass`，也就是这个函数**读不到搜索窗、先验与内容**——本节最后一条要求（"即使 P1 失灵仍然兜底"）只有这样才是结构性的，而不是一句注释。
+2. **§16.9 的禁令放在门一内部，不作为第五道门**：`extent >= 2 && |d| == extent / 2 → Reject(BannedHalf)`。理由：禁令的意义是"任何越界/未定义路径的共同落点都不得成为答案"，因此它必须**早于**其余门生效，否则"落在 `±N/2` 但被后面某道门拒绝"与"一个普通的坏候选"在下游无法区分；`extent <= 1` 时**不禁** `d = 0`，否则"页面确实没动"——唯一可由行指纹确认的答案——会变得无法表达。
+3. **可验证性下限是另一个常量，而且用整数比较**：`RHO_MIN = 0.35`（§14.2 的 `ρ*`）与 `RHO_MIN_PERMILLE = 350` 一起暴露；`is_verifiable(d, extent)` 比较 `overlap · 1000 ≥ 350 · extent`，让浮点不在边界上做决定（`extent = 100, |d| = 65` 恰为 350‰，必须通过）。同一个测试顺带证明了本节的论点：`gate_geometry(66, 100) == Pass` 而 `is_verifiable(66, 100) == false` —— **"上限"与"可信度"是两个数字**，V1 把它们混谈正是 `docs/25` R17 的初稿里那个共用数字的来源。
+
 ### 16.3 门二：残差增益 `gain = 1 − RMSE(d_best) / RMSE(d_0)`
 
 **这是唯一必须通过的硬门**（F-05）。
@@ -1948,6 +1966,8 @@ scene_cut := (zncc2d(d_0=0) < 0.50) && (∀ i: alignment_error(d_i) > 0.60)
 - **依据**：F-02 的已确证失败模式——相位相关在 `0/0 → NaN` 时**从越界兜底返回 `(−N/2, −M/2)`**；OpenCV PR #29871 的复现给出 `(-32,-32)`（64×64 输入）。虽然 V2 不用相位相关，但**这条禁令的价值超出相位相关**：`±N/2`/`±M/2` 是任何"越界/未定义/环绕"路径的共同落点。它是一条**成本近乎为零的防御性硬规则**。
 - 命中时的 `Displacement.status = None`（不是 `Uncertain`）——因为这不是"图像不果断"，而是**算法走到了未定义分支**，必须**可见**（G12）。
 
+**落点（`P1.08`）**：这条禁令**不是第五道门**，而是**门一内部的第二条分支**（`gate_geometry` 先判区间、再判 `|d| == extent / 2`）——理由与 `extent <= 1` 的例外见 §16.2.1 裁决 2。可执行形式：`gate_geometry(±5, 10) == GateOutcome::Reject(GateRejection::BannedHalf)`、`gate_geometry(5, 11) == Reject(BannedHalf)`（截断语义 `11 / 2 == 5`，禁令**命名**被禁的值而不是静默跳过）、`GateRejection::{BannedHalf, OutsideViewport}.status() == Status::None`。
+
 #### 16.9.1 落地的类型形状：状态是枚举载荷，不是标志位 + 裸值（`P1.04`，2026-10-08）
 
 `P1.04` 的 GREEN 一行曾写作扁平结构（`struct Displacement { d: i32, confidence: f32, evidence: Evidence, status: Status }` + `enum Status { Confirmed, Uncertain, None }`）。执行时发现它与"三态穷举无冗余"及本节"`None` 是一个**可见的答案**"的要求**互相矛盾**：扁平 `d` 在 `None` 态必然留下一个悬空值，而占位 `0` 与 `i32::MIN` 都是"没有答案"的**第二种拼法**——第二种拼法恰恰是调用方会忘记检查的那种。落地的形状因此是**把载荷放进枚举**：
@@ -1994,6 +2014,7 @@ pub(crate) struct Displacement { status: Status, confidence: f32, evidence: Evid
 | `MIN_RESIDUAL_GAIN` | 0.15 | **硬门** | `E-ACC-1` |
 | `MIN_TILES` | 4 | **硬门** | `E-ACC-1` |
 | `MIN_MARGIN` | 0.15 | **硬门** | `E-ACC-1` |
+| `RHO_MIN`（可验证性下限 = §14.2 的 `ρ*`） | 0.35（区间 0.30–0.40） | **可校准** | `E-ACC-1`；`P1.08` 把它与门一分开暴露，比较用整数 `RHO_MIN_PERMILLE = 350`（§16.2.1 裁决 3） |
 | `tile`（证据独立性粒度） | 32 px | 固定 | 与参考实现一致 |
 | `TILE_SUPPORT_ZNCC`（tile 计为"支持"的相关门限） | 0.5 | **可校准** | `E-ACC-1`；`P1.06` 用它替代 §16.4 的"内点像素**占比** ≥ 0.5"（§15.4.2 决定 3：像素级绝对容差会摧毁亮度不变性） |
 | `coverage` 饱和数 | 12 | 固定 | 同上 |
