@@ -61,8 +61,15 @@ pub(crate) fn band_height(extent: u32, shift: i32) -> u32 {
 pub(crate) enum StepWrite {
     /// Nothing: a duplicate frame (§16.3's `Skip` path). The canvas is byte-identical.
     Skipped,
+    /// Nothing: the viewport moved, but it moved **inside** the rows the canvas already has
+    /// (§17.4's `Contained`). Not the same as [`Self::Skipped`] — the content moved and the viewport
+    /// follows it; there is simply nothing new to write. Treating it as an append would write the
+    /// same content a second time, which is the one thing this branch exists to prevent.
+    Contained,
     /// `rows` new rows were appended at `first_row` (content coordinates).
     Appended { first_row: u64, rows: u64 },
+    /// `rows` new rows were prepended at row 0; every existing row moved down by `rows`.
+    Prepended { rows: u64 },
 }
 
 /// One whole-width row band (§17.5). `rows` is BGRA in canvas order, `first_row` is its position on
@@ -146,6 +153,18 @@ impl BandStore {
             .collect();
         ranges.sort_unstable();
         ranges.windows(2).all(|pair| pair[0].1 <= pair[1].0)
+    }
+
+    /// Moves every band down by `rows`. Used by a prepend (`P1.19`): the content did not move, the
+    /// canvas grew **above** it, so the coordinates of everything already stored shift by the number
+    /// of rows that were inserted in front of them.
+    pub(crate) fn shift_rows(&mut self, rows: u64) {
+        if rows == 0 {
+            return;
+        }
+        for band in &mut self.bands {
+            band.first_row += rows;
+        }
     }
 
     /// Invariant 7's left-hand side.
@@ -247,6 +266,45 @@ impl CoverageMap {
             self.covered.resize(words, 0);
         }
     }
+
+    /// Makes room for `rows` rows **in front** of the ones already marked, shifting every existing
+    /// bit up by `rows` and marking the new front as covered. A prepend (`P1.19`) is the only caller.
+    ///
+    /// The shift is a real bit shift over the whole map rather than a stored offset, because the
+    /// coverage interval is anchored at 0 (invariant 2) and a bias field would put the anchor in two
+    /// places at once. `last_exclusive` moves by `rows` and then [`Self::mark_range`] fills the front:
+    /// the count of covered rows has to keep answering invariant 4 in O(1), so the shifted bits are
+    /// never recounted — only the newly written front rows are.
+    pub(crate) fn insert_rows_at_front(&mut self, rows: u64) {
+        if rows == 0 {
+            return;
+        }
+        let shift_words = (rows / 64) as usize;
+        let shift_bits = (rows % 64) as u32;
+        let old_words = self.covered.len();
+        let new_words = old_words + words_for(rows);
+        self.covered.resize(new_words, 0);
+        // From the top down, so every source word is read before it is overwritten.
+        for index in (0..new_words).rev() {
+            let high = if index >= shift_words {
+                self.covered[index - shift_words]
+            } else {
+                0
+            };
+            let low = if index > shift_words {
+                self.covered[index - shift_words - 1]
+            } else {
+                0
+            };
+            self.covered[index] = if shift_bits == 0 {
+                high
+            } else {
+                (high << shift_bits) | (low >> (64 - shift_bits))
+            };
+        }
+        self.last_exclusive += rows;
+        self.mark_range(0, rows);
+    }
 }
 
 fn words_for(rows: u64) -> usize {
@@ -340,9 +398,9 @@ impl RecoveredImage {
         self.coverage.mark_range(0, rows);
     }
 
-    /// Writes the rows one confirmed step adds (§17.3): `[old end, old end + step)`, taken from the
-    /// **bottom** of the frame — the frame's viewport ends at the new content end, so the new
-    /// content is the frame's last `step` rows.
+    /// Writes the rows one confirmed step adds below the canvas (§17.3): `[old end, old end + rows)`,
+    /// taken from the **bottom** of the frame — the frame's viewport ends at the new content end, so
+    /// the new content is the frame's last `rows` rows.
     ///
     /// The overlap is never rewritten. Three reasons, and none of them is "it is safer" (§17.3):
     /// the overlap is not the same thing in the two frames (a `fixed` header or an animation would
@@ -357,15 +415,13 @@ impl RecoveredImage {
     /// (four gates plus the prior) against common and cumulative (§17.4's reference design is what
     /// keeps it from propagating).
     ///
-    /// `step` is the step's displacement `d`: positive means the content moved up and we append
-    /// below. A negative step is a prepend, which is `P1.19`'s; this path refuses it rather than
-    /// writing the rows somewhere else.
-    pub(crate) fn append_confirmed(&mut self, frame: &Observation, step: i32) -> StepWrite {
-        assert!(
-            step >= 0,
-            "a negative step ({step}) is a prepend, which P1.19 owns; this path only appends"
-        );
-        if step == 0 {
+    /// `rows` is how many rows are genuinely new. In the plain append it is the step's displacement
+    /// `d`; a viewport that jumped further than the canvas' end adds only what fits, and
+    /// [`ViewportState::apply`] is what computes that number. The direction is not this method's
+    /// business: a prepend is [`Self::prepend_confirmed`], and the caller decides which one a step
+    /// is (`ViewportState`).
+    pub(crate) fn append_confirmed(&mut self, frame: &Observation, rows: u64) -> StepWrite {
+        if rows == 0 {
             return StepWrite::Skipped;
         }
         let extent = frame.height() as u64;
@@ -375,21 +431,21 @@ impl RecoveredImage {
             "the frame's cross axis is not the canvas's (invariant 1)"
         );
         assert!(
-            step as u64 <= extent,
-            "a step of {step} px cannot come out of a viewport of {extent} rows"
+            rows <= extent,
+            "a step that adds {rows} rows cannot come out of a viewport of {extent} rows"
         );
         assert!(
-            step as u64 <= band_height(extent as u32, step) as u64,
-            "the band ({}) does not contain the {step} rows this step adds: §17.2's first term is what makes the write possible at all",
-            band_height(extent as u32, step)
+            rows <= band_height(extent as u32, rows as i32) as u64,
+            "the band ({}) does not contain the {rows} rows this step adds: §17.2's first term is what makes the write possible at all",
+            band_height(extent as u32, rows as i32)
         );
         let first_row = self.primary_len;
         let row_bytes = (self.cross_len * BYTES_PER_PIXEL) as usize;
-        let first_frame_row = (extent - step as u64) as usize * row_bytes;
+        let first_frame_row = (extent - rows) as usize * row_bytes;
         let new_rows = &frame.pixels()[first_frame_row..];
         assert_eq!(
             new_rows.len(),
-            row_bytes * step as usize,
+            row_bytes * rows as usize,
             "the frame is not strictly packed: the canvas stores whole rows"
         );
         self.bands.insert(Band {
@@ -397,12 +453,58 @@ impl RecoveredImage {
             rows: new_rows.to_vec(),
             fnv: 0,
         });
-        self.primary_len += step as u64;
+        self.primary_len += rows;
         self.coverage.mark_range(first_row, self.primary_len);
-        StepWrite::Appended {
-            first_row,
-            rows: step as u64,
+        StepWrite::Appended { first_row, rows }
+    }
+
+    /// Writes the rows a confirmed step adds **above** the canvas (§17.1's "both directions"): the
+    /// frame's first `rows` rows, at content row 0, with every existing row moved down by `rows`.
+    ///
+    /// This is what makes §17.4's "the reference is always the canvas" affordable in both directions
+    /// and what `F-02` is about: `next_pos = current_pos + signed_delta` — a negative displacement is
+    /// a fact about the page, not an error. `Contained` is the other side of the same coin and is
+    /// decided before this is called ([`ViewportState::apply`]).
+    ///
+    /// The half-viewport bound is §17.2's first term read in this direction: a prepend of more than
+    /// half the viewport would leave less than half the frame overlapping the canvas, which is the
+    /// geometry the design refuses on the append side too. It is an assertion rather than a silent
+    /// trim because a caller that hands us one has skipped the gate that says `|d| <= extent`.
+    pub(crate) fn prepend_confirmed(&mut self, frame: &Observation, rows: u64) -> StepWrite {
+        if rows == 0 {
+            return StepWrite::Contained;
         }
+        let extent = frame.height() as u64;
+        assert_eq!(
+            frame.width() as u64,
+            self.cross_len,
+            "the frame's cross axis is not the canvas's (invariant 1)"
+        );
+        assert!(
+            rows <= extent / 2,
+            "a prepend of {rows} rows leaves less than half of the {extent}-row viewport overlapping the canvas, which is the geometry §17.2's first term rules out"
+        );
+        let row_bytes = (self.cross_len * BYTES_PER_PIXEL) as usize;
+        let new_rows = &frame.pixels()[..rows as usize * row_bytes];
+        assert_eq!(
+            new_rows.len(),
+            row_bytes * rows as usize,
+            "the frame is not strictly packed: the canvas stores whole rows"
+        );
+        self.bands.shift_rows(rows);
+        self.bands.insert(Band {
+            first_row: 0,
+            rows: new_rows.to_vec(),
+            fnv: 0,
+        });
+        self.primary_len += rows;
+        self.coverage.insert_rows_at_front(rows);
+        StepWrite::Prepended { rows }
+    }
+
+    /// The largest position the viewport's top edge can take without leaving the canvas.
+    pub(crate) fn max_position(&self, extent: u64) -> i64 {
+        self.primary_len as i64 - extent as i64
     }
 
     /// A copy of `rows` primary-axis rows starting at `first_row`, reassembled across the bands.
@@ -497,11 +599,100 @@ impl RecoveredImage {
     }
 }
 
+/// Where the viewport's top edge sits in the canvas' content coordinates, and the three things a
+/// confirmed step can therefore be (§17.1, §17.4; `P1.19`).
+///
+/// This is the whole of `F-02`'s `next_pos = current_pos + signed_delta` made executable: a signed
+/// displacement moves the viewport, and where it lands decides which of the three writes a step is.
+/// The reference implementation's `offset` is the *viewport's* displacement, so its formula reads
+/// `position − offset`; this module keeps the estimator's convention throughout (`d > 0` means the
+/// content moved up, §15.1), which makes it `position + d` — one sign convention, one place to get
+/// it wrong instead of two.
+///
+/// Nothing here decides *whether* a step is confirmed — that is the four gates' business (§16.1).
+/// This type decides what a confirmed step **does**, which is why `Contained` is a first-class
+/// answer rather than an append that happens to write nothing.
+pub(crate) struct ViewportState {
+    position: i64,
+    extent: u32,
+}
+
+impl ViewportState {
+    /// The viewport starts at the canvas' origin: the first frame **is** the canvas (§17.1).
+    pub(crate) fn new(extent: u32) -> Self {
+        Self {
+            position: 0,
+            extent,
+        }
+    }
+
+    pub(crate) fn position(&self) -> i64 {
+        self.position
+    }
+
+    pub(crate) fn extent(&self) -> u32 {
+        self.extent
+    }
+
+    /// Applies one confirmed step: decides prepend / append / contained, writes through the canvas
+    /// and advances the viewport. Returns what the step did.
+    ///
+    /// A step larger than the viewport is refused rather than trimmed: `|d| <= extent` is gate one's
+    /// correctness constraint (§16.2), and a step that does not overlap at all has no evidence to
+    /// confirm it in the first place (§16.5's `Lost`).
+    pub(crate) fn apply(
+        &mut self,
+        canvas: &mut RecoveredImage,
+        frame: &Observation,
+        step: i32,
+    ) -> StepWrite {
+        assert_eq!(
+            frame.height(),
+            self.extent,
+            "the viewport's extent is fixed for the session: a resized frame is a new session, not a step"
+        );
+        if step == 0 {
+            return StepWrite::Skipped;
+        }
+        assert!(
+            step.unsigned_abs() <= self.extent,
+            "a step of {step} px does not overlap the {}-row viewport at all: §16.5's Lost case is not a write",
+            self.extent
+        );
+
+        let candidate = self.position + step as i64;
+        let max_position = canvas.max_position(self.extent as u64);
+        if candidate < 0 {
+            let rows = (-candidate) as u64;
+            let write = canvas.prepend_confirmed(frame, rows);
+            self.position = 0;
+            write
+        } else if candidate > max_position {
+            let rows = (candidate - max_position) as u64;
+            let write = canvas.append_confirmed(frame, rows);
+            self.position = candidate;
+            write
+        } else {
+            let bottom = candidate + self.extent as i64;
+            assert!(
+                bottom <= canvas.primary_len() as i64,
+                "the viewport at {candidate} ends at {bottom}, past the canvas' {} rows, so this is an append and not a contained step",
+                canvas.primary_len()
+            );
+            self.position = candidate;
+            StepWrite::Contained
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Band, CoverageMap, RecoveredImage, StepTally, StepWrite, band_height};
+    use super::{
+        Band, CoverageMap, RecoveredImage, StepTally, StepWrite, ViewportState, band_height,
+    };
+    use crate::geometry::Rect;
     use crate::scroll::displacement::{
-        Scratch, Status, candidates_1d, score_candidates_2d, zero_shift_status,
+        Scratch, Status, candidates_1d, refine_winner, score_candidates_2d, zero_shift_status,
     };
     use crate::scroll::observation::{Axis, Observation};
     use crate::scroll::testkit::{ScrollScript, StepSpec, Structure, TestImage};
@@ -698,7 +889,7 @@ mod tests {
         assert_eq!(canvas.bands().bands().len(), 1);
 
         assert_eq!(
-            canvas.append_confirmed(&second, STEP),
+            canvas.append_confirmed(&second, STEP as u64),
             StepWrite::Appended {
                 first_row: VIEWPORT as u64,
                 rows: STEP as u64,
@@ -810,6 +1001,211 @@ mod tests {
         assert!(
             scratch.builds() > 0,
             "the estimator did no work at all, so the counter proves nothing"
+        );
+    }
+
+    // --- both directions, and the reference frame (§17.1, §17.4; task P1.19) ---
+
+    /// The document's rows `[first, end)` as one packed buffer — what the canvas must equal when it
+    /// has recovered a stretch of the document.
+    fn document_rows(image: &TestImage, first: u32, end: u32) -> Vec<u8> {
+        let mut out = Vec::with_capacity((end - first) as usize * CROSS_PX as usize * 4);
+        for y in first..end {
+            out.extend_from_slice(image.row(y));
+        }
+        out
+    }
+
+    /// One full pass of the estimator over two observations: layer 1 (`candidates_1d`), layer 2
+    /// (`score_candidates_2d`) and layer 3 (`refine_winner`).
+    ///
+    /// The four gates are `P1.13`'s subject, and assembling them into a decision is the session's
+    /// (`P3.09`). What this helper exists for is the **composition**: it insists on the exact integer
+    /// so that the drift test fails when the canvas, not the estimator, is what moved.
+    fn estimate_once(previous: &Observation, current: &Observation, expected: i32) -> Option<i32> {
+        let mut scratch = Scratch::new();
+        let candidates = candidates_1d(&previous.view(), &current.view(), expected, 8);
+        if candidates.is_empty() {
+            return None;
+        }
+        let scored = {
+            let views = scratch.pool(&previous.view(), &current.view());
+            score_candidates_2d(views.previous(), views.current(), &candidates)
+        };
+        let refined = {
+            let views = scratch.full_resolution(&previous.view(), &current.view());
+            refine_winner(views.previous(), views.current(), &scored)
+        };
+        refined.map(|winner| winner.d)
+    }
+
+    #[test]
+    fn scrolling_up_produces_a_prepend_not_a_duplicate() {
+        const DOC: u32 = 2400;
+        const START: u32 = 400;
+        let image = TestImage::from_structures(CROSS_PX, DOC, 11, 19, &mixed());
+        // The capture starts **mid-document**. That is the only situation in which a canvas can be
+        // extended upward at all: a canvas whose first row is the document's first row has nothing
+        // above it, and a step that would go above it is refused by the document, not by us.
+        let mut script = ScrollScript::starting_at(
+            &image,
+            VIEWPORT,
+            START,
+            vec![StepSpec::move_by(300), StepSpec::move_by(-600)],
+        );
+        let mut canvas = RecoveredImage::new(Axis::Vertical, CROSS_PX as u64, VIEWPORT_BUDGET);
+        let mut viewport = ViewportState::new(VIEWPORT);
+        canvas.start(&script.take(0));
+        assert_eq!(viewport.position(), 0, "the first frame is the canvas' origin");
+
+        let second = script.take(1);
+        assert_eq!(
+            viewport.apply(&mut canvas, &second, 300),
+            StepWrite::Appended {
+                first_row: VIEWPORT as u64,
+                rows: 300
+            }
+        );
+        assert_eq!(canvas.primary_len(), 1200);
+        let before = canvas.rows(0, 1200);
+
+        let third = script.take(2);
+        assert_eq!(
+            viewport.apply(&mut canvas, &third, -600),
+            StepWrite::Prepended { rows: 300 }
+        );
+        assert_eq!(
+            canvas.primary_len(),
+            1500,
+            "the canvas grew by the rows that were actually new, not by the step"
+        );
+        assert_eq!(viewport.position(), 0, "the viewport's top is the canvas' new top");
+
+        // No duplicate: every row that used to be the canvas is still there, 300 rows further down.
+        assert_eq!(canvas.rows(300, 1200), before);
+        // The new content is the frame's **first** 300 rows: the frame's viewport now starts at the
+        // new top, so "above" is the front of the frame and not the back.
+        assert_eq!(canvas.rows(0, 300), frame_rows(&third, 0, 300));
+        // And the canvas is the document, row for row: document rows 100..1600.
+        assert_eq!(canvas.rows(0, 1500), document_rows(&image, 100, 1600));
+        canvas.assert_invariants(
+            CROSS_PX as u64,
+            StepTally {
+                step: 2,
+                committed: 2,
+                discarded: 0,
+            },
+        );
+    }
+
+    #[test]
+    fn a_small_rollback_that_is_fully_covered_is_contained() {
+        let image = TestImage::from_structures(CROSS_PX, DOC_ROWS, 11, 19, &mixed());
+        let mut script = ScrollScript::new(
+            &image,
+            VIEWPORT,
+            vec![StepSpec::move_by(120), StepSpec::move_by(-40)],
+        );
+        let mut canvas = RecoveredImage::new(Axis::Vertical, CROSS_PX as u64, VIEWPORT_BUDGET);
+        let mut viewport = ViewportState::new(VIEWPORT);
+        canvas.start(&script.take(0));
+
+        let second = script.take(1);
+        assert_eq!(
+            viewport.apply(&mut canvas, &second, 120),
+            StepWrite::Appended {
+                first_row: VIEWPORT as u64,
+                rows: 120
+            }
+        );
+        let before = canvas.rows(0, 1020);
+
+        let third = script.take(2);
+        assert_ne!(
+            frame_rows(&third, 0, VIEWPORT),
+            frame_rows(&second, 0, VIEWPORT),
+            "the fixture did not move the frame, so Contained would be vacuous"
+        );
+        assert_eq!(viewport.apply(&mut canvas, &third, -40), StepWrite::Contained);
+        assert_eq!(canvas.primary_len(), 1020, "a contained step writes nothing");
+        assert_eq!(canvas.rows(0, 1020), before);
+        assert_eq!(viewport.position(), 80, "the viewport moved even though the canvas did not");
+        canvas.assert_invariants(
+            CROSS_PX as u64,
+            StepTally {
+                step: 2,
+                committed: 2,
+                discarded: 0,
+            },
+        );
+    }
+
+    #[test]
+    fn one_hundred_confirmed_steps_leave_zero_drift() {
+        const STEPS: usize = 100;
+        const STEP_PX: u32 = 37;
+        const DOC: u32 = STEPS as u32 * STEP_PX + VIEWPORT;
+        let image = TestImage::from_structures(CROSS_PX, DOC, 11, 19, &mixed());
+        let specs: Vec<StepSpec> = (0..STEPS).map(|_| StepSpec::move_by(STEP_PX as i32)).collect();
+        let mut script = ScrollScript::new(&image, VIEWPORT, specs);
+        let mut canvas = RecoveredImage::new(Axis::Vertical, CROSS_PX as u64, VIEWPORT_BUDGET);
+        canvas.start(&script.take(0));
+        let mut viewport = ViewportState::new(VIEWPORT);
+        let mut expected = STEP_PX as i32;
+
+        for k in 1..=STEPS {
+            let current = script.take(k);
+            let position = u64::try_from(viewport.position()).expect("the viewport went negative");
+            // The reference is the **canvas**, never the previous frame (§17.4, N3). This is the
+            // whole point of the test: if the composition ever wrote the wrong rows, the next step's
+            // estimate would be made against them and the error would compound.
+            let reference = Observation::new(
+                canvas.rows(position, VIEWPORT as u64),
+                Rect::new(0, 0, CROSS_PX as i32, VIEWPORT as i32),
+                k as i64,
+                (CROSS_PX, VIEWPORT),
+                Axis::Vertical,
+            )
+            .expect("the reference viewport is packed and matches its region");
+            let document_first = (k as u32 - 1) * STEP_PX;
+            assert_eq!(
+                reference.pixels(),
+                document_rows(&image, document_first, document_first + VIEWPORT),
+                "the canvas stopped being the document at step {k}"
+            );
+
+            let d = estimate_once(&reference, &current, expected)
+                .unwrap_or_else(|| panic!("step {k}: the estimator had no answer at all"));
+            assert_eq!(
+                d, STEP_PX as i32,
+                "step {k}: the estimator did not recover the scripted step"
+            );
+            assert_eq!(
+                viewport.apply(&mut canvas, &current, d),
+                StepWrite::Appended {
+                    first_row: VIEWPORT as u64 + (k as u64 - 1) * STEP_PX as u64,
+                    rows: STEP_PX as u64,
+                }
+            );
+            expected = d;
+        }
+
+        assert_eq!(
+            canvas.primary_len(),
+            VIEWPORT as u64 + STEPS as u64 * STEP_PX as u64
+        );
+        assert_eq!(
+            canvas.rows(0, canvas.primary_len()),
+            document_rows(&image, 0, DOC),
+            "the recovered image drifted away from the document"
+        );
+        canvas.assert_invariants(
+            CROSS_PX as u64,
+            StepTally {
+                step: STEPS as u64,
+                committed: STEPS as u64,
+                discarded: 0,
+            },
         );
     }
 }

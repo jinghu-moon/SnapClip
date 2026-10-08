@@ -354,23 +354,55 @@ impl ScrollScript {
     /// once, and asserted to stay inside the document: a fixture that silently produced a
     /// partially out-of-document frame would report defeats that belong to nobody's algorithm.
     pub(crate) fn new(image: &TestImage, viewport_height: u32, steps: Vec<StepSpec>) -> Self {
-        Self::build(image.clone(), Axis::Vertical, viewport_height, steps)
+        Self::build(image.clone(), Axis::Vertical, viewport_height, 0, steps)
+    }
+
+    /// The same vertical script, but the viewport starts `start_offset` rows into the document.
+    ///
+    /// This exists because it is the only way a **prepend** can happen at all (`P1.19`): a canvas
+    /// whose first row is the document's first row has nothing above it, and a step that would go
+    /// above the document is refused by the fixture, not by the algorithm. A capture that starts
+    /// while the page is already scrolled is the real-world case, and it is the one the fixture has
+    /// to be able to express.
+    pub(crate) fn starting_at(
+        image: &TestImage,
+        viewport_height: u32,
+        start_offset: u32,
+        steps: Vec<StepSpec>,
+    ) -> Self {
+        Self::build(
+            image.clone(),
+            Axis::Vertical,
+            viewport_height,
+            start_offset,
+            steps,
+        )
     }
 
     /// The same script over the transposed document: the content moves along the viewport's width,
     /// the signal lines are columns, and `truth(k)` is the same displacement expressed on the other
     /// component (`docs/30` §17.8).
     pub(crate) fn horizontal(image: &TestImage, viewport_width: u32, steps: Vec<StepSpec>) -> Self {
-        Self::build(image.transposed(), Axis::Horizontal, viewport_width, steps)
+        Self::build(image.transposed(), Axis::Horizontal, viewport_width, 0, steps)
     }
 
-    fn build(image: TestImage, axis: Axis, viewport_extent: u32, steps: Vec<StepSpec>) -> Self {
+    fn build(
+        image: TestImage,
+        axis: Axis,
+        viewport_extent: u32,
+        start_offset: u32,
+        steps: Vec<StepSpec>,
+    ) -> Self {
         let document_extent = axis.primary_extent(image.width(), image.height());
         assert!(
             viewport_extent > 0 && viewport_extent <= document_extent,
             "the viewport must fit inside the document's primary extent"
         );
-        let mut offsets = vec![0i32];
+        assert!(
+            start_offset as u64 + viewport_extent as u64 <= document_extent as u64,
+            "the first frame starts at {start_offset} and is {viewport_extent} rows tall, past the document's {document_extent} rows"
+        );
+        let mut offsets = vec![start_offset as i32];
         for step in &steps {
             let next = offsets[offsets.len() - 1] + step.delta;
             assert!(

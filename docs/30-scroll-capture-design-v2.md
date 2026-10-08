@@ -2385,6 +2385,8 @@ impl RecoveredImage { fn assert_invariants(&self, viewport_cross: u64, tally: St
 
 **`BandStore::insert` 拒绝两件事**：条带字节数不是整行（调用方对画布宽度的理解是错的），以及与已有条带重叠（调用方以为它知道内容在哪，而画布不这么认为）。**预算不由 `insert` 强制**：§17.5 的换出是 `P1.20` 的事；在它落地之前，超预算的状态只有 `assert_invariants` 会拒绝。
 
+**`P1.19` 补充：prepend 是这套结构唯一会动锚点的操作。** 覆盖区间锚在 0（不变量 2），所以"在顶部插入 `rows` 行"必须是一次**真位图位移**（`CoverageMap::insert_rows_at_front`：`shift_words` 整字搬、`shift_bits` 逐位搬，`shift_bits == 0` 单独分支避免 `>> 64`），随后 `mark_range(0, rows)`；`BandStore::shift_rows` 同步把所有条带的 `first_row += rows`。**刻意不引入"前置了多少行"的偏差字段**——那会让锚点同时出现在位图与偏差里，而不变量 2 只能钉住其中一个。代价是每次 prepend 一次 O(rows/64 + bands) 的搬移，而 prepend 是回滚到画布顶部才发生的事（不是每步）。
+
 ### 17.2 条带（band）与 overlap
 
 **术语对齐**：§15.1 的 `match_region` 是**匹配用**的条带；本节的 `band` 是**写入用**的条带。两者高度取值相同（`H_match`），因为匹配的正是即将被写入的那块内容——**这不是巧合，而是设计选择**：让匹配区域与写入区域一致，可以避免"匹配算的是一块、写的是另一块"这类错位。
@@ -2477,6 +2479,33 @@ impl RecoveredImage {
 4. **代价与缓解**：materialize 参照视口需要从 `BandStore` 取条带（§17.5）。若条带已被换出到磁盘，需要一次读盘。**缓解**：`band` 的高度只有 `extent/2`，且**上一步刚写入的条带处在 LRU 最热端**，命中率天然很高；`stale_steps` 与 `bands.spilled` 计入 §23 的 CPU/内存指标。
 
 **保留参考实现的 `previous_raw` 与 `motion_reference` 分离**：V2 也需要两个概念——**"上一帧观测"**（用于行指纹去重，§16.2）与**"参照视口"**（用于位移估计）。它们不是同一个对象，把它们混为一谈正是 V1 §7.2 的问题之一（V1 只有"上一帧"）。**但 V2 的参照视口永远来自画布，不来自合成。**
+
+#### 17.4.1 落地的形状（P1.19，2026-10-08）
+
+单态参照系的可执行形式是 `ViewportState`：视口顶边在画布内容坐标里的位置，加一个把"已确认的位移"变成"画布上的哪一种写"的判决。
+
+```rust
+pub(crate) struct ViewportState { position: i64, extent: u32 }
+
+pub(crate) fn apply(&mut self, canvas: &mut RecoveredImage, frame: &Observation, step: i32) -> StepWrite {
+    // step == 0            -> Skipped（position 不变）
+    // candidate = position + step
+    // candidate <  0            -> prepend_confirmed(frame, -candidate); position = 0
+    // candidate >  max_position -> append_confirmed(frame, candidate - max_position); position = candidate
+    // 否则                       -> position = candidate; Contained
+}
+```
+
+四处落地裁决：
+
+1. **符号约定只有一套**：参考实现写 `position − offset`，因为它的 `offset` 是**视口**的位移；本模块全程用估计器的约定（`d > 0` = 内容向上走，§15.1），因此是 `position + step`。**一套约定，只有一处会错**；把两套约定留在同一个函数里是 V1 的坑。
+2. **`Contained` 是一等答案，不是"恰好没写什么的 `Append`"**：`apply` 不决定一步是否 `Confirmed`（那是 §16.1 四门的职责），它决定一个**已确认**的步**做什么**。把回滚判成 `Append` 会把同一段内容写第二遍——`StepWrite` 因此有四个变体：`Skipped`（重复帧）/ `Contained` / `Appended{first_row, rows}` / `Prepended{rows}`。`Skipped` 与 `Contained` **不是一回事**（前者连位置都没动）。
+3. **`append_confirmed` 的参数是 `rows` 而不是 `step`**：一次跳跃超过画布末端时，新增的行数是 `candidate − max_position`（可能小于 `|step|`），由 `ViewportState` 算；写入本身只管"从帧的**最后** `rows` 行取内容"。prepend 同理取帧的**前** `rows` 行（`prepend_confirmed`）。**"步进多少"与"写多少行"因此不再由同一个数承担。**
+4. **prepend 断言 `rows ≤ extent / 2`**：这是 §17.2 第一项在这个方向的读法——prepend 超过半个视口就只剩不到一半重叠，与 append 侧被拒绝的几何是同一个。**是断言而不是静默裁剪**，因为交进来的调用方已经跳过了门一（§16.2 的 `|d| ≤ extent`）。
+
+配套的两处实现细节：`BandStore::shift_rows`（prepend 时所有条带下移）与 `CoverageMap::insert_rows_at_front`（**真位图位移**，`shift_words`/`shift_bits` 两个分支）。后者刻意**不存"前置了多少行"的偏差字段**：覆盖区间锚在 0（不变量 2），一个偏差字段会让锚点出现在两个地方，而"每行一位"的位移是 100,000 行 12.5 KiB 的代价。
+
+**退出条件 ③ 的可执行形式（实测，2026-10-08）**：`ReferenceMode` / `reference_mode` / `previous_raw` / `motion_reference` 在 `crates/snapclip-capture/src/scroll/` 里的出现次数**都是 0**。字面 `grep -c Synthetic src/scroll` 得 **9**，全部是 `perf_probe.rs` 的 `SyntheticSequence`（`P0.03` 的**测试专用**帧发生器，与"参照系"无关的概念）——`docs/31` 的退出条件因此按**语义**判读，并把字面计数与理由一起记下，而不是靠改名去凑一个数。
 
 ### 17.5 `BandStore`：有界 LRU + 磁盘换出
 
@@ -2626,8 +2655,9 @@ impl Axis {
 |---|---|---|
 | 覆盖不变量 | 合成会话 + 每步之后 `assert_invariants()` | 任何一步存在未覆盖的内容像素即失败 |
 | 旧像素优先 | 构造"两步位移重叠"的合成输入，读回重叠区 | 重叠区像素 == 第 1 步写入的值（逐字节） |
-| 参照系无漂移 | 100 步合成滚动，全部 `Confirmed` | 最终画布与真值**逐行相等**（不是"相似"） |
-| `band_height` 推导 | 参数化 `shift` 从 0 到 `extent`，检查 `overlap ≥ extent/4` | 恒成立 |
+| 参照系无漂移 | 100 步合成滚动，全部 `Confirmed` | 最终画布与真值**逐行相等**（不是"相似"）。**已可执行（`P1.19`）**：100 步 × 37 px、每步的参照视口由 `canvas.rows(position, extent)` materialize 出来（这正是"参照系来自画布"本身），最终逐行相等 |
+| `band_height` 推导 | 参数化 `shift` 从 0 到 `extent`，检查 `overlap ≥ extent/4` | 恒成立。**已可执行（`P1.18`）**：`shift ∈ [−extent, extent]` 且含 `extent` 本身 |
+| 双向扩展 / `Contained` | 先下滚再上滚；小幅回滚完全落在已覆盖区 | **已可执行（`P1.19`）**：prepend 后画布 == 文档对应区间（无 gap、无重复），`Contained` 的 `primary_len` 不变且位置前移 |
 | `BandStore` 换出 | 把常驻预算注入成 1 个条带 | 内存峰值不随长度增长；`spilled` 计数 > 0；恢复后画布逐字节正确 |
 | 上限三层 | `MAX_LONG_IMAGE_PIXELS` 注入成 1/10 | 产出 `Partial` 且**是合法 PNG**（能被解码回读） |
 | `RowBandSink` | 用一个只接受严格递增 `first_row` 的实现 | 乱序写入返回错误，不静默重排 |
@@ -4186,10 +4216,10 @@ if ($hits) { Write-Error "scroll/ must stay platform-free: $($hits -join '; ')";
 |---|---|---|---|---|
 | 覆盖不变量 | 每步后 `assert_invariants` | 恒成立 | L1 | 已可执行（`P1.17`） |
 | 旧像素优先 | 两步重叠 | 重叠区 == 第 1 步的值（逐字节） | L1 | 已可执行（`P1.18`，且用例先证明两种写法的字节**不同**） |
-| 参照系无漂移 | 100 步全 `Confirmed` | 最终画布与真值**逐行相等** | L1 | — |
+| 参照系无漂移 | 100 步全 `Confirmed` | 最终画布与真值**逐行相等** | L1 | 已可执行（`P1.19`，100 步 × 37 px 逐行相等） |
 | `band_height` 推导 | `shift` 从 0 到 `extent` | `overlap ≥ extent/4` 恒成立 | L1 | 已可执行（`P1.18`，`shift ∈ [−extent, extent]`） |
-| 双向扩展 | 先下滚再上滚 | 正确 `Prepend`；不产生 gap/重复 | L1 | — |
-| `Contained` | 小幅回滚完全落在已覆盖区 | 识别为 `Contained`；不写重复内容 | L1 | — |
+| 双向扩展 | 先下滚再上滚 | 正确 `Prepend`；不产生 gap/重复 | L1 | 已可执行（`P1.19`） |
+| `Contained` | 小幅回滚完全落在已覆盖区 | 识别为 `Contained`；不写重复内容 | L1 | 已可执行（`P1.19`，用例先证明两帧字节不同） |
 | 撤销一步 | 提交 10 步后 `undo` | 回退到第 9 步状态；`primary_len` 回退 | L1 | — |
 | 条带换出 | 预算注入成 1 个条带 | 峰值不随长度增长；恢复后逐字节正确 | L1 | **Memory** |
 | 上限三层 | `MAX_LONG_IMAGE_PIXELS` 注入 1/10 | `Partial` 且**是合法 PNG** | L1+L2 | **Memory** |
