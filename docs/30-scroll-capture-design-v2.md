@@ -1373,7 +1373,14 @@ ScrollLoop                       CaptureWorker（既有线程，持有 GPU 设�
 | `IGraphicsCaptureSession3::IsBorderRequired(false)` | 关掉黄色捕获边框，否则长图会带边 | 记录诊断；被捕获窗口有边框时**在 UI 上提示**（G12） |
 | `IGraphicsCaptureSession2::IsCursorCaptureEnabled(false)` | 光标不入镜（否则长图里会留下多个光标残影） | 退到"用有效掩码排除光标所在块"（这是 V1 §7.2 第 5 步的方案；它是**降级**，不是主路径） |
 | `SPI_GETMOUSEWHEELROUTING` 的值 | 决定在"鼠标下方"路由模式下该往哪个 HWND 投递 | 默认按"焦点/前台"路由处理 |
+| `SPI_GETWHEELSCROLLLINES` 的值 | 一格滚轮滚多少行（Chromium 再换算成约 `lines × 100/3` px，F-24），是 `ĝ` 的初值来源；`0` = 不滚，`WHEEL_PAGESCROLL` = 整页 | **不滚时任何注入路径都无效**（必须告知用户，而不是反复重试）；整页时把步长夹到 1 格 |
 | 目标是否与 SnapClip 同进程 | 同进程捕获会包含 overlay 自身 | 必须隐藏 overlay 或用 `WDA_EXCLUDEFROMCAPTURE`（见 §12.5） |
+
+**本机实测值（2026-10-08，`P0.07`）**：`SPI_GETWHEELSCROLLLINES = 3`（`WheelLines::Lines(3)`）、`SPI_GETMOUSEWHEELROUTING = 2`（`MOUSEWHEEL_ROUTING_MOUSE_POS`）。**两条都是本机读数，不是设计前提**：
+
+- 这两个值**用户可改**（F-15），所以 `P3.03` 的 `choose()` 只把它们当**运行期输入**，编译期不留常量；启动时探测**一次**，结果进诊断流。
+- `WHEELSCROLLLINES = 0`（不滚）没有任何注入路径能绕过，因此它必须变成一个**能力事实**（`WheelLines::None`），而不是"重试更用力"；`WHEEL_PAGESCROLL` 只夹步长；`WHEELSCROLLLINES = n` 只作 `ĝ` 的**初值**——`ĝ` 仍按 px/notch 自适应（§16.6、F-24：Chromium 的换算还会乘系统设置）。
+- 测量装置在 `crates/snapclip-capture/src/windows/scroll_probe.rs`（test-only）：`system_parameter_reads_return_documented_defaults()` 断言两个值落在官方域内（`0`/`WHEEL_PAGESCROLL`/行数；`0..=2` 且 `winuser.h:5321-5325` 只定义了三个），`a_zero_wheel_scroll_lines_setting_means_the_wheel_does_not_scroll()` 固定 `0` 的语义。**`windows/scroll_actuator.rs` 的生产读取在 `P3.02` 落地**；P0 阶段刻意不产出该代码（P0 的性质是"没有一行产品代码"，实测值由 test-only 探针提供）。
 
 ### 11.5 后端选择与降级
 

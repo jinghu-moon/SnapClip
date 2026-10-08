@@ -757,6 +757,9 @@ git config core.hooksPath .githooks
 | 提交信息标题 | `[P0-07] the wheel routing is read at runtime, not assumed` |
 | 复杂度 / 阻塞 | S / 无 |
 | **对后续阶段的影响** | `P3.03` 的 `choose()` 判据（V2 §24.6 的"非前台 → 必须 `PostMessageW`"是否过严，见 OQ-5） |
+| **状态** | **[x] 已完成**（2026-10-08）：两个 `SystemParametersInfoW` 读取可用（RED = 13 个 `E0425/E0433` 编译错误 → GREEN = 2 passed）；本机实测 **`SPI_GETWHEELSCROLLLINES = 3`（`Lines(3)`）、`SPI_GETMOUSEWHEELROUTING = 2`（`mouse-position`）**，已回填 `docs/30 §11.4` 并注明"本机读数，不是设计前提"；`WHEELSCROLLLINES = 0` 的"不滚"语义由 `a_zero_wheel_scroll_lines_setting_means_the_wheel_does_not_scroll()` 固定；全量 `479 passed / 10 ignored / 0 failed`（capture 349+7，`+2` 即本任务两个用例） |
+
+> **实现位置的一处刻意选择**：探测函数与 `WheelLines` 分类落在 **test-only** 的 `crates/snapclip-capture/src/windows/scroll_probe.rs`，而不是 `windows/scroll_actuator.rs`。理由 = P0 阶段的性质是"**没有一行产品代码**"（§6 的阶段说明），而 `scroll_actuator.rs` 的生产读取要到 `P3.02` 才有消费者；现在建它会得到一个没有任何调用者的抽象（AGENTS.md 禁止为臆测增加抽象）。**代价**是 P3.02 要按本次实测的调用形状（`SystemParametersInfoW(action, 0, &mut u32, 0)`，`fwinini = 0`）重写一次生产版本，**收益**是本阶段没有留下死代码。
 
 ### P0.08 推送级门禁的前置：`.githooks/pre-push` 的创建、安装与**验证生效**
 

@@ -76,9 +76,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CWP_SKIPINVISIBLE, ChildWindowFromPointEx, CreateWindowExW, DefWindowProcW, DestroyWindow,
     DispatchMessageW, ES_AUTOVSCROLL, ES_MULTILINE, EnumWindows, GetClassNameW, GetClientRect,
     GetCursorPos, GetForegroundWindow, GetWindowTextW, HWND_TOPMOST, IsWindowVisible, MSG,
-    PM_REMOVE, PeekMessageW, PostMessageW, RegisterClassW, SB_LINEDOWN, SW_RESTORE, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_SHOWWINDOW, SendMessageW, SetCursorPos, SetForegroundWindow, SetWindowPos,
-    ShowWindow, TranslateMessage, WM_ERASEBKGND, WM_MOUSEWHEEL, WM_PAINT, WM_VSCROLL, WNDCLASSW,
+    PM_REMOVE, PeekMessageW, PostMessageW, RegisterClassW, SB_LINEDOWN, SPI_GETMOUSEWHEELROUTING,
+    SPI_GETWHEELSCROLLLINES, SW_RESTORE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SendMessageW,
+    SetCursorPos, SetForegroundWindow, SetWindowPos, ShowWindow, SystemParametersInfoW,
+    TranslateMessage, WM_ERASEBKGND, WM_MOUSEWHEEL, WM_PAINT, WM_VSCROLL, WNDCLASSW,
     WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL,
 };
 
@@ -1646,4 +1647,111 @@ fn the_shift_estimator_is_not_fooled_by_line_structure() {
             estimate.correlation
         );
     }
+}
+
+/// The names `winuser.h:5321-5325` gives the three routing values.
+const ROUTING_NAMES: [&str; 3] = ["focus", "hybrid", "mouse-position"];
+
+/// `#define WHEEL_PAGESCROLL (UINT_MAX)` (`winuser.h:1269`); `windows-sys` does not
+/// export it.
+const WHEEL_PAGESCROLL: u32 = u32::MAX;
+
+/// How far one wheel notch scrolls, as the *user* configured it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WheelLines {
+    /// `0`: the wheel does not scroll at all. No injection path can work around this,
+    /// so the actuator has to know it before it injects anything.
+    None,
+    /// `WHEEL_PAGESCROLL`: one notch scrolls a whole page, so the step is clamped
+    /// rather than treated as a pixel count.
+    Page,
+    /// A positive line count. It is only the initial guess for the step: the closed
+    /// loop still learns the real per-target gain (`docs/30` §16, mechanism P1).
+    Lines(u32),
+}
+
+fn classify_wheel_lines(raw: u32) -> WheelLines {
+    match raw {
+        0 => WheelLines::None,
+        WHEEL_PAGESCROLL => WheelLines::Page,
+        lines => WheelLines::Lines(lines),
+    }
+}
+
+/// Read the user's `SPI_GETWHEELSCROLLLINES` (`winuser.h:5162`, `0x0068`).
+///
+/// Read, never assumed: this is a user-changeable setting (`docs/30` F-15), so P3.03's
+/// `choose()` takes it as a value instead of freezing it into a constant.
+fn read_wheel_scroll_lines() -> Result<u32, String> {
+    read_system_parameter_u32(SPI_GETWHEELSCROLLLINES, "SPI_GETWHEELSCROLLLINES")
+}
+
+/// Read `SPI_GETMOUSEWHEELROUTING` (`winuser.h:5319`, `0x201C`): `0` focus, `1` hybrid,
+/// `2` mouse position. Only `2` lets a non-foreground window receive `SendInput`, which
+/// is what makes OQ-5 a measurement rather than an assumption (`docs/30` §24.6).
+fn read_mouse_wheel_routing() -> Result<u32, String> {
+    read_system_parameter_u32(SPI_GETMOUSEWHEELROUTING, "SPI_GETMOUSEWHEELROUTING")
+}
+
+fn read_system_parameter_u32(action: u32, name: &str) -> Result<u32, String> {
+    let mut value: u32 = 0;
+    // SAFETY: `pvparam` points at a live `u32`, which is the documented size for both
+    // SPI_GETWHEELSCROLLLINES and SPI_GETMOUSEWHEELROUTING.
+    let ok = unsafe {
+        SystemParametersInfoW(
+            action,
+            0,
+            std::ptr::from_mut(&mut value).cast::<core::ffi::c_void>(),
+            0,
+        )
+    };
+    if ok == 0 {
+        return Err(format!(
+            "SystemParametersInfoW({name}) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(value)
+}
+
+/// `docs/31` `P0.07`: the wheel settings are a **runtime** input, not a design premise.
+///
+/// `SPI_GETWHEELSCROLLLINES` (`winuser.h:5162`, `0x0068`) decides how far one notch
+/// scrolls and is user-changeable; `SPI_GETMOUSEWHEELROUTING` (`winuser.h:5319`,
+/// `0x201C`) decides *which* window receives the wheel at all. Both change what
+/// `ScrollActuator::choose()` may assume, so they are read once at startup and passed
+/// in as values (`docs/30` §11.4, §24.6; OQ-5) — never frozen into a compile-time
+/// constant. This probe measures the local machine; its output is the record for
+/// `docs/30 §11.4`, and it proves the raw values fit the documented domains.
+#[test]
+fn system_parameter_reads_return_documented_defaults() {
+    let lines = read_wheel_scroll_lines().expect("SPI_GETWHEELSCROLLLINES must be readable");
+    assert!(
+        lines == 0 || lines == WHEEL_PAGESCROLL || (1..=100).contains(&lines),
+        "SPI_GETWHEELSCROLLLINES returned {lines}, which is neither 0 (no scrolling), WHEEL_PAGESCROLL (u32::MAX) nor a plausible line count"
+    );
+
+    let routing = read_mouse_wheel_routing().expect("SPI_GETMOUSEWHEELROUTING must be readable");
+    assert!(
+        routing <= 2,
+        "SPI_GETMOUSEWHEELROUTING returned {routing}; winuser.h:5321-5325 documents only 0 (focus), 1 (hybrid), 2 (mouse position)"
+    );
+
+    eprintln!(
+        "[P0.07] local values: SPI_GETWHEELSCROLLLINES = {lines} ({:?}), SPI_GETMOUSEWHEELROUTING = {routing} ({})",
+        classify_wheel_lines(lines),
+        ROUTING_NAMES[routing as usize]
+    );
+}
+
+/// A `WHEELSCROLLLINES` of `0` means "do not scroll at all", and `WHEEL_PAGESCROLL`
+/// means one notch scrolls a whole page. Neither is an error: the second only clamps
+/// the step size, the first is a hard capability fact that no injection path can work
+/// around, so the actuator has to know the difference before it injects anything.
+#[test]
+fn a_zero_wheel_scroll_lines_setting_means_the_wheel_does_not_scroll() {
+    assert_eq!(classify_wheel_lines(0), WheelLines::None);
+    assert_eq!(classify_wheel_lines(WHEEL_PAGESCROLL), WheelLines::Page);
+    assert_eq!(classify_wheel_lines(3), WheelLines::Lines(3));
+    assert_eq!(classify_wheel_lines(1), WheelLines::Lines(1));
 }
