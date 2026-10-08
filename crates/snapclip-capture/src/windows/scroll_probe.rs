@@ -116,7 +116,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::geometry::{Point, Rect};
+use crate::scroll::observation::Axis;
 use crate::windows::monitor;
+use crate::windows::scroll_actuator::{self, Aim, InjectPath, InjectRequest, InjectStatus};
 use crate::windows::win::{bitblt, d3d11, wgc};
 use windows_sys::Win32::System::Threading::{
     OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
@@ -852,6 +854,30 @@ enum Transport {
     /// "Chromium ignores injected input" apart from "Chromium scrolled and we
     /// failed to measure it".
     ArrowDown,
+    /// The **product** path: `scroll_actuator::inject` with
+    /// [`InjectPath::SendInput`]. `P3.01` requires the matrix to be reproducible
+    /// through the shipped code, not only through the probe's own copy of it.
+    ProductSendInput,
+    /// The product path with [`InjectPath::PostMessageW`], including the child
+    /// sink that the probe's own `post_message_notches` also does.
+    ProductPost,
+}
+
+impl Transport {
+    /// Whether this arm drives the shipped actuator rather than the probe's own
+    /// copy of the wire format.
+    fn is_product(self) -> bool {
+        matches!(self, Transport::ProductSendInput | Transport::ProductPost)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Transport::SendInput => "SendInput",
+            Transport::PostMessage => "PostMessageW",
+            Transport::ArrowDown => "SendInput(down-key)",            Transport::ProductSendInput => "product/SendInput",
+            Transport::ProductPost => "product/PostMessageW",
+        }
+    }
 }
 
 /// Which coordinate space goes into the posted message's `lParam`.
@@ -1297,11 +1323,7 @@ fn run_arm(
 ) -> Outcome {
     let mut outcome = Outcome {
         target,
-        transport: match transport {
-            Transport::SendInput => "SendInput",
-            Transport::PostMessage => "PostMessageW",
-            Transport::ArrowDown => "SendInput(down-key)",
-        },
+        transport: transport.label(),
         space: space.label(),
         delivered: 0,
         line_delta: None,
@@ -1364,6 +1386,9 @@ fn run_arm(
             post_message_notches(root, center, space, notches)
         }
         Transport::ArrowDown => Err("the arrow-key control runs stepwise only".into()),
+        Transport::ProductSendInput | Transport::ProductPost => {
+            Err("the product path runs stepwise only".into())
+        }
     };
     match injection {
         Ok(delivered) => outcome.delivered = delivered,
@@ -1399,6 +1424,47 @@ fn run_arm(
 /// look exactly like "nothing happened". One observation per injected step is
 /// also what the product's per-frame displacement estimate does, so the sum is
 /// a measurement of the mechanism the design depends on, not of a shortcut.
+/// One notch through the **shipped** actuator (`P3.01` exit condition 2).
+///
+/// The probe's own `send_input_notches`/`post_message_notches` stay, because the
+/// numbers they produced are recorded in `docs/30` §24.6.1 and a measurement is
+/// not reproducible by swapping the instrument under it. This arm exists so the
+/// same matrix can *also* be produced by the code that ships — which is the only
+/// way to know the shipped code is the one that was measured.
+fn deliver_via_product(root: HWND, screen: Point, path: InjectPath) -> Result<u32, String> {
+    let request = InjectRequest {
+        target: root as isize,
+        screen,
+        notches: 1,
+        axis: Axis::Vertical,
+        path,
+        aim: if arm_places_the_cursor() {
+            Aim::PlaceCursor
+        } else {
+            // A low-integrity sender cannot `SetCursorPos`; the operator aims.
+            Aim::AssumePlaced
+        },
+    };
+    let outcome = scroll_actuator::inject(&scroll_actuator::Win32Injection, &request);
+    match outcome.status {
+        InjectStatus::Posted => {
+            if let Some(target_window) = outcome.target_window {
+                if target_window != root as isize {
+                    eprintln!(
+                        "[P3.01] the product path descended to {target_window:?} class={} (root {root:?})",
+                        window_class(target_window as HWND)
+                    );
+                }
+            }
+            Ok(outcome.delivered)
+        }
+        status => Err(format!(
+            "the product path refused the request: {status:?} (target_window {:?})",
+            outcome.target_window
+        )),
+    }
+}
+
 fn run_arm_stepwise(
     target: &'static str,
     transport: Transport,
@@ -1461,6 +1527,8 @@ fn run_arm_stepwise(
             }
             Transport::ArrowDown => send_input_keys(VK_DOWN, 1),
             Transport::PostMessage => post_message_notches(root, center, space, 1),
+            Transport::ProductSendInput => deliver_via_product(root, center, InjectPath::SendInput),
+            Transport::ProductPost => deliver_via_product(root, center, InjectPath::PostMessageW),
         };
         match delivery {
             Ok(sent) => outcome.delivered += sent,
@@ -1848,16 +1916,6 @@ fn inject_probe() {
          machine (SendInput {} px, PostMessageW {} px)",
         chrome_send_input.measured_px, chrome_post.measured_px
     );
-}
-
-impl Transport {
-    fn label(self) -> &'static str {
-        match self {
-            Transport::SendInput => "SendInput",
-            Transport::PostMessage => "PostMessageW",
-            Transport::ArrowDown => "SendInput(down-key)",
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3457,7 +3515,12 @@ fn inject_matrix_probe() {
     // The positive control: a window of our own whose procedure counts what it consumed.
     match WheelFixture::create(Rect::from_origin_size(Point::new(200, 140), 1000, 760)) {
         Ok(fixture) => {
-            for transport in [Transport::SendInput, Transport::PostMessage] {
+            for transport in [
+                Transport::SendInput,
+                Transport::PostMessage,
+                Transport::ProductSendInput,
+                Transport::ProductPost,
+            ] {
                 bring_to_front(fixture.hwnd, true);
                 let client = fixture.client_rect().expect("wheel fixture client rect");
                 outcomes.push(run_arm_stepwise(
@@ -3509,7 +3572,13 @@ fn inject_matrix_probe() {
             eprintln!("[P0.09] {label}: the pre-arm capture failed: {error}");
             continue;
         }
-        for transport in [Transport::SendInput, Transport::PostMessage] {
+        for transport in [
+            Transport::SendInput,
+            Transport::PostMessage,
+            // `P3.01` exit condition 2: the same matrix, through the shipped actuator.
+            Transport::ProductSendInput,
+            Transport::ProductPost,
+        ] {
             let before = page_scroll_y(root);
             let outcome = run_arm_stepwise(
                 label,
@@ -3664,9 +3733,9 @@ fn inject_matrix_probe() {
         .filter(|outcome| outcome.target == "win32-own" && outcome.moved())
         .count();
     assert_eq!(
-        control_moved, 2,
-        "the own-window control did not scroll under both transports, so no zero in this \
-         table can be read as a statement about a target"
+        control_moved, 4,
+        "the own-window control did not scroll under all four transports (two of them the \
+         shipped actuator), so no zero in this table can be read as a statement about a target"
     );
     // And the headline `docs/30 §24.6` depends on, re-measured on the matrix's own targets.
     for transport in ["SendInput", "PostMessageW"] {
@@ -3683,6 +3752,44 @@ fn inject_matrix_probe() {
             "chrome measured {} px under {transport}: the two-path decision does not hold on \
              this machine any more",
             chromium.measured_px
+        );
+    }
+
+    // `P3.01` exit condition 2, as an assertion rather than a table: the shipped actuator
+    // must reach the same two targets the probe's own wire format reaches. A product path
+    // that silently posts to the frame instead of the renderer child would pass every unit
+    // test in `scroll_actuator` and fail here.
+    for transport in [Transport::ProductSendInput, Transport::ProductPost] {
+        assert!(transport.is_product(), "the arm is the product path");
+        let own = outcomes
+            .iter()
+            .find(|outcome| outcome.target == "win32-own" && outcome.transport == transport.label())
+            .unwrap_or_else(|| {
+                panic!(
+                    "the product arm {} never ran against the control window",
+                    transport.label()
+                )
+            });
+        assert!(
+            own.moved(),
+            "the shipped actuator moved our own window {} px under {}: the product path is not \
+             wired to the code the probe measured",
+            own.measured_px,
+            transport.label()
+        );
+    }
+    for transport in [Transport::ProductSendInput, Transport::ProductPost] {
+        let Some(chromium) = outcomes.iter().find(|outcome| {
+            outcome.target == "chrome" && outcome.transport == transport.label()
+        }) else {
+            continue;
+        };
+        assert!(
+            chromium.moved(),
+            "chrome measured {} px under the product path {}: `docs/30 §24.6`'s two paths hold \
+             for the probe's copy of the wire format but not for the shipped one",
+            chromium.measured_px,
+            transport.label()
         );
     }
 }

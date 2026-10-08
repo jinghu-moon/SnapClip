@@ -4225,6 +4225,64 @@ fn choose(target: &ScrollTarget, probe: &ProbeResult) -> InjectPath {
 | `SPI_GETMOUSEWHEELROUTING` 的另外两个取值（`CURSOR` / `FOCUS`） | 本机是 `MOUSE_POS`；该设置用户可改 | `OQ-5` 剩余部分 |
 | 低完整性发送方的 `SetCursorPos` 失败是"桌面强制标签不可写"还是别的机制 | 只测到"`FALSE` 且 `GetLastError() == 0`"这一现象，未确证机制；**但两个可能机制都指向同一结论（该前置条件不可满足）** | `OQ-3` 的注脚 |
 
+#### 24.6.3 落地的形状（`P3.01`，2026-10-09）
+
+注入是**决策**（往哪条路径、什么坐标、多少个 notch）与**平台调用**（`SendInput` / `PostMessageW` / `SetCursorPos` / 子窗口下沉）两件事。只有前者能被无桌面地测试，所以两者之间有一条 `InjectionTarget`：
+
+```rust
+pub(crate) const WHEEL_DELTA: i32 = 120;
+pub(crate) const MAX_NOTCHES: i32 = i16::MAX as i32 / WHEEL_DELTA; // 273
+
+pub(crate) fn wheel_delta(axis: Axis, notches: i32) -> i32; // 两轴符号相反，见决定 2
+pub(crate) fn wheel_lparam(screen: Point) -> isize;         // 屏幕坐标，低字是 x
+pub(crate) fn wheel_wparam(delta: i32) -> usize;            // 有符号 delta 在高字
+pub(crate) fn wheel_message(axis: Axis) -> u32;             // WM_MOUSEWHEEL / WM_MOUSEHWHEEL
+
+pub(crate) enum InjectPath { SendInput, PostMessageW }
+pub(crate) enum Aim { PlaceCursor, AssumePlaced }
+pub(crate) enum InjectStatus {
+    Posted, InvalidRequest, TargetNotFound,
+    CoordinateFailure { code: i32 }, PostFailed { code: i32 },
+}
+pub(crate) struct InjectRequest { target: isize, screen: Point, notches: i32, axis: Axis, path: InjectPath, aim: Aim }
+pub(crate) struct InjectOutcome { status: InjectStatus, delivered: u32, target_window: Option<isize> }
+
+pub(crate) trait InjectionTarget {
+    fn is_window(&self, hwnd: isize) -> bool;
+    fn client_origin(&self, hwnd: isize) -> Option<Point>;
+    fn child_at(&self, hwnd: isize, local: Point) -> Option<isize>;
+    fn place_cursor(&self, screen: Point) -> Result<(), i32>;
+    fn send_wheel(&self, delta: i32) -> Result<u32, i32>;
+    fn post_wheel(&self, message: u32, hwnd: isize, wparam: usize, lparam: isize) -> Result<(), i32>;
+}
+
+pub(crate) fn inject(target: &dyn InjectionTarget, request: &InjectRequest) -> InjectOutcome;
+```
+
+流程：`notches == 0` 或 `|notches| > MAX_NOTCHES` ⇒ `InvalidRequest`；句柄为 0 或不是窗口 ⇒ `TargetNotFound`；`SendInput` 分支在 `Aim::PlaceCursor` 时先放光标（失败 ⇒ `CoordinateFailure`）再发滚轮；`PostMessageW` 分支先 `descend` 到最深子窗口（走不通 ⇒ `CoordinateFailure{code:0}`）再投递。
+
+**五处落地裁决**：
+
+1. **`InjectStatus` 只有五个变体，刻意没有 `Unsupported`**。§24.6 的判定规则 3 与本任务的 GREEN 行都列了它，但两个传输在**每一个受支持的 Windows 版本上都存在**——它没有生产者。一个没有生产者的变体是一条**没人能证伪的声称**（与 `P1.20` 退出条件 ③"三个字段都要有读取点"同源）。等真的出现"这个版本没有这个 API"时再加，那时它会有一个测试。
+2. **两个轴的符号相反，且只在一处表达**。`MOUSEEVENTF_WHEEL` 的正 `mouseData` 是"向远离用户的方向转"，滚的是文档**向上**——与本设计的 `d > 0`（推进文档，§15.1）相反；`MOUSEEVENTF_HWHEEL` 的正值则是"向右转"，正是推进水平文档。两者由 `wheel_delta` 一处承载，因为"符号写反"是这个模块唯一会静默出错的地方。
+3. **消息按轴选**：垂直 `WM_MOUSEWHEEL`（`0x020A`）、水平 `WM_MOUSEHWHEEL`（`0x020E`）。把水平滚动投成 `WM_MOUSEWHEEL` 就是一次垂直滚动。
+4. **子窗口下沉失败返回 `CoordinateFailure`，而不是退回向 frame 投递**。向 frame 投递正是 §24.6 约束 ② 记录的、让浏览器忽略消息的那个错误（Crisp 的相反结论由此而来）；"走不通"与"走错了"是两件事，前者必须被看见。
+5. **`Aim::AssumePlaced` 是唯一为探针保留的生产 API 分支**。低完整性发送方**不能** `SetCursorPos`（§24.6.2 结论 6 的附带发现：静默 `FALSE`），所以 `E-INJECT-1` 的 UIPI 臂必须由操作者用更高完整性的助手放光标。这个分支的存在理由写在 doc 里，它不是一个默认值。
+
+**`Posted` 的含义**：`PostMessageW` 返回成功只说明消息**入队**，`SendInput` 返回 `1` 只说明事件被**插入系统队列**。两者都不说明内容动了。证据是**内容位移**（§24.7 的自检），属 `P3.03`；本模块的 doc 里写明了这一条，`InjectOutcome` 也刻意没有一个叫 `succeeded` 的字段。
+
+**探针走产品路径（退出条件 ② 的装置）**：`scroll_probe.rs` 的 `Transport` 增加 `ProductSendInput` / `ProductPost` 两臂，经 `deliver_via_product` 调**生产 `inject()`**。探针原有的 `send_input_notches` / `post_message_notches` **保留**——它们产出的数字记在 §24.6.1/§24.6.2，**一次测量不能靠换掉它下面的仪器来复现**；产品臂存在的意义是让同一张矩阵**也能**由出货代码产出。`inject_matrix_probe` 末尾的断言从"两条传输"改为"**四条**（其中两条是出货的）"：自控窗口必须在全部四条下移动，Chrome 必须在产品臂下也移动。
+
+**本次未取得（L3）**：`inject_matrix_probe` 在本次运行中于环境检查处失败并**大声拒绝作答**——
+
+```
+thread 'windows::scroll_probe::inject_matrix_probe' panicked at crates\snapclip-capture\src\windows\scroll_probe.rs:3512:23:
+P0.09 environment failure: GetCursorPos failed before the liveness check
+test result: FAILED. 0 passed; 1 failed; 496 filtered out; finished in 0.00s
+```
+
+`GetCursorPos` 失败（`scroll_probe.rs:479`，**改动前就有的代码**）与 §24.5.1 的 `GetForegroundWindow() == NULL` 是同一个条件：运行时会话不是可交互桌面（锁定或断开）。⇒ **产品臂的四行矩阵本次没有测到**，记录为"未取得"而不是"通过"。解除条件 = 在未锁定的桌面上跑一次 `cargo test -p snapclip-capture --lib inject_matrix_probe -- --ignored --nocapture --test-threads=1`。设计不依赖它：`scroll_actuator` 的 **11 条 L1 用例**在无桌面下全绿（`cargo test -p snapclip-capture --lib scroll_actuator -- --test-threads=1` = 11 passed / 0 failed）——它们全部经 `InjectionTarget` 的脚本化实现运行，不触平台。
+
 ### 24.7 遮挡、前后台与"注入是否真的生效"
 
 **遮挡**（分两种，行为完全不同）：
