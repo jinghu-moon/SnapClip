@@ -323,6 +323,16 @@ P6.07 门禁扫描 ═╝
 
 **基线漂移的记账规则**：任何一次提交后，`passed` 比 §0.3 少，或 `ignored` 增加而**说不出是哪 1 个用例**，都视为回归。**这条规则今天已经用过一次**（477/10/0 的 +3 被逐条定位到 `scroll_probe.rs`）。
 
+**这条规则由脚本执行，不靠记性**（`P0.01` 的产物）：`scripts/record-baseline.ps1` 把四个 crate 的 `passed/failed/ignored` **以及每个 crate 的全部用例名**写进 `docs/Temp/baseline-<date>.json`；`-Compare <该文件>` 会重新测量并把漂移**指名到具体测试**，有漂移即 exit 1。实测（2026-10-08，故意插入一个空测试）：
+
+```
+[baseline] drift against the recorded baseline:
+  - snapclip-capture: passed 349 -> 350 (+1)
+  - snapclip-capture: test appeared: windows::scroll_probe::the_baseline_naming_is_being_verified_on_purpose
+```
+
+移除该测试后重跑 → `[baseline] no drift`（exit 0）。**"说不出是哪 1 个用例"从此不是一个纪律问题，而是一个脚本退出码问题。**
+
 ### 2.7 第一性原理检查清单（每个任务落地前自查）
 
 ```
@@ -628,6 +638,7 @@ git config core.hooksPath .githooks
 | 提交信息标题 | `[P0-01] the baseline is measured, and every delta has a name` |
 | 复杂度 / 阻塞 | S / 无 |
 | **状态** | **[x] 已完成**（2026-10-08）：477 passed / 10 ignored / 0 failed（app 56+3、capture 347+7、history 51、model 23）；`+3` 全部来自 `scroll_probe.rs`（提交 `c15e614`）；`cargo check` = 0 error / 1 warning（`unused variable: content_label`，`apps/snapclip/src/history/view.rs`） |
+| **状态（补齐，2026-10-08 晚）** | 首次执行到 `P0.08` 时发现本任务有**两处交付物缺失**，按"禁止伪完成"补齐（提交 `[P0-01]`）：① `scripts/record-baseline.ps1` 此前**从未创建**（RED 装置）；② `docs/Temp/baseline-<date>.json` 此前**不存在**（GREEN 产物）。补齐后实测：`-Compare <不存在的文件>` → exit 1（`nothing to compare against, so nothing is proven`）；记录 → `docs/Temp/baseline-2026-10-08.json`（42,706 B，四个 crate 的 `passed/failed/ignored` + **每个用例名** + `check` 的 warning 计数与位置）；`-Compare` 干净 → `no drift`（exit 0）；故意插一个测试 → 漂移被指名（`passed 349 -> 350`、`test appeared: windows::scroll_probe::…`，exit 1）。退出条件 ③ 也因此变成产品：**0 error / 1 warning**，位置精确到 `apps\snapclip\src\history\view.rs:769:37` |
 
 ### P0.02 `T-THREAD-1`：给 `context()` 加所有者线程断言，看今天会不会 panic
 
@@ -1740,6 +1751,7 @@ git config core.hooksPath .githooks
 | `.gitattributes` | **新建**。`/.githooks/* text eol=lf` —— 钩子的 LF 必须在版本控制里固定，否则 `core.autocrlf = true` 会让它在下次 checkout 后静默失效（§4.3，偏离 2） |
 | `.githooks/pre-push` | **新建**。推送级门禁全文（§4.3） |
 | `scripts/verify-hooks.ps1` | **新建**。"钩子存在且已挂载"的断言（RED 装置 + 第二道防线） |
+| `scripts/record-baseline.ps1` | **新建**（`P0.01` 补齐）。测量四个 crate 的 `passed/failed/ignored` + 全部用例名 + `cargo check` 的 warning 计数与位置；`-Compare` 把漂移指名到具体测试并按 §2.6 报红 |
 | `scripts/ocr-serve.ps1` | **此前未跟踪，`P0.08` 纳入版本控制**。`package.json` 的 `"ocr:serve"` 指向它，干净 clone 必须能跑（顺带修掉的仓库缺陷） |
 | `.gitignore` | **修改**。新增 `scripts/*.log`（`ocr-serve.ps1` 的运行时日志） |
 
