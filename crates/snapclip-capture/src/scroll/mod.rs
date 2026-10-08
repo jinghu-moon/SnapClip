@@ -19,6 +19,8 @@
 //! platform FFI. Everything here is pure arithmetic over byte buffers, and the second scan in
 //! `tools/check-dependency-direction.ps1` (`P6.07`) will make that mechanical.
 
+pub(crate) mod canvas;
+
 pub(crate) mod displacement;
 
 pub(crate) mod observation;

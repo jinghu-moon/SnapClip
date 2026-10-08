@@ -2359,6 +2359,32 @@ struct CoverageMap {          // 二维完整覆盖的判据，不是位图
 
 **与 V1 的差异**：V1 §8.1 的不变量由 `next_pos = current_pos + signed_delta` 的**单一位置变量**间接维护，因此任何一次"部分提交"都会静默破坏它。V2 把它变成**可断言的结构**：`stale_steps` 与 `span_start/span_end` 一起构成 §20.3 的不变量断言集合；`debug_assert` 在每一步之后验证。
 
+#### 17.1.1 落地的形状（P1.17，2026-10-08）
+
+```rust
+pub(crate) struct RecoveredImage {
+    axis: Axis, primary_len: u64, cross_len: u64,
+    coverage: CoverageMap, bands: BandStore,
+    owner: std::thread::ThreadId,     // 不变量 8 的落点
+}
+pub(crate) struct CoverageMap {       // 一行一位；这里没有像素
+    covered: Vec<u64>, first: Option<u64>, last_exclusive: u64, rows_covered: u64, stale_steps: u32,
+}
+pub(crate) struct BandStore { bands: Vec<Band>, budget: u64, cross_len: u64 }
+pub(crate) struct Band { first_row: u64, rows: Vec<u8>, fnv: u64 }
+pub(crate) struct StepTally { step: u64, committed: u64, discarded: u64 }
+
+impl RecoveredImage { fn assert_invariants(&self, viewport_cross: u64, tally: StepTally) }
+```
+
+**落地裁决 1：`CoverageMap` 存"一行一位"，区间端点改为派生量。** §17.1 的 `{span_start, span_end, stale_steps}` **无法**把不变量 3（区间到末尾）与不变量 4（区间内没有洞）分开：一次覆盖 `0..500` 加 `501..1000` 的写入让两个端点都看起来正确，而中间少了一行。本设计的第一条规则是"不写任何无法断言的不变量"，所以覆盖率必须是一个**集合**。端点是它的 `min`/`max`，`rows_covered` 是集合的势 ⇒ 不变量 4 变成 `rows_covered == span_end − span_start`，**O(1)**。100,000 行占 12.5 KiB，且这里没有任何像素——"画布位图"依然不存在（与 §17.5 的内存目标一致：这个结构的大小与图像**字节数**无关）。
+
+**落地裁决 2：八条不变量用真的 `assert!`，不是 `debug_assert!`。** §17.1 写的是 `debug_assert`。但不变量 4 的动作是"`InternalError`，且**禁止导出**"（§20.3）——一个带洞的画布是这套设计唯一绝不能出货的东西，而"发布构建里不检查"正是 §20.3 想消灭的失败模式。代价是每步一次 O(1) 检查加一次 `O(n log n)` 的条带排序（n = 条带数）。
+
+**落地裁决 3：`RecoveredImage` 记住创建它的线程。** 不变量 8 在 §20.3 里写作"每个 `ID3D11DeviceContext` 的调用线程 == 其所有者线程"，那是 Windows 侧的对象；而画布是**同一类对象**——滚动驱动线程独占它，预览只拿行的副本，别的线程不许进来（§22.5）。所以它在这里以画布自己的形式落地，且**不需要任何平台 FFI**（§28.4 的门禁因此不用开口子）。`P0.02` 已实测生产交接真的会跨线程使用即时上下文（§21.3）——这条断言就是那件事在画布层的对应物。
+
+**`BandStore::insert` 拒绝两件事**：条带字节数不是整行（调用方对画布宽度的理解是错的），以及与已有条带重叠（调用方以为它知道内容在哪，而画布不这么认为）。**预算不由 `insert` 强制**：§17.5 的换出是 `P1.20` 的事；在它落地之前，超预算的状态只有 `assert_invariants` 会拒绝。
+
 ### 17.2 条带（band）与 overlap
 
 **术语对齐**：§15.1 的 `match_region` 是**匹配用**的条带；本节的 `band` 是**写入用**的条带。两者高度取值相同（`H_match`），因为匹配的正是即将被写入的那块内容——**这不是巧合，而是设计选择**：让匹配区域与写入区域一致，可以避免"匹配算的是一块、写的是另一块"这类错位。
@@ -2924,6 +2950,8 @@ fn phase(s: &ScrollSession) -> Phase { /* 纯函数：stop.is_some() → Stopped
 | 8 | 每个 `ID3D11DeviceContext` 的调用线程 == 其所有者线程 | **panic**（§21.3） |
 
 **不变量 4 与 7 是"正确性"与"资源"两类硬承诺的可执行形式**：它们不是文档里的句子，是断言。**不允许存在"文档说有、代码不查"的不变量**——这正是 `Adjusting` 的教训。
+
+**落地（`P1.17`）**：八条不变量的可执行形式在 `crates/snapclip-capture/src/scroll/canvas.rs` 的 `assert_invariants`，负向用例 `assert_invariants_fires_on_each_of_the_eight_violations` 逐条构造违反，并断言**那一条**不变量的编号出现在 panic 消息里（八条消息互不相同，否则"八条用例"其实不足八条）。1–7 由 `RecoveredImage` 的字段与 `StepTally` 提供，8 由 `RecoveredImage::owner` 提供；`ScrollSession`（`P3.04`）的字段与这八条的对应关系届时可 `grep` 核对。形状与三处落地裁决见 §17.1.1。
 
 ### 20.4 失败分类与动作（用户要求必须覆盖的全部情形）
 
