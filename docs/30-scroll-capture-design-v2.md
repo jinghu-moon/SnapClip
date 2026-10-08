@@ -2531,6 +2531,53 @@ struct Band { rows: Vec<u8>, first_row: u64, fnv: u64 }  // 整宽，BGRA
 
 **与 V1 `TileStore` 的关系**：V1 的 `ScrollTile{bgra: Vec<u8>, checksum: u32}` 是**二维 tile**（默认 512×512）且**穿越端口**（§4.3.4 的 C4）。V2：① 形状改为**整宽行带**（理由：编码器与匹配器都要整宽行，二维 tile 会让两者都退化成"逐块处理"）；② **不穿越端口**——`BandStore` 完全在 `scroll` 模块内部，端口只出 `RowBandSink`（§17.7）。这让 `docs/19` §8.3 的三句互相排斥的话（§4.3.4）不再存在。
 
+#### 17.5.1 落地的形状（P1.20，2026-10-08）
+
+```rust
+struct BandStore {
+    budget:   MemoryBudget,                  // §22.3 的单一预算（不再是裸 u64）
+    cross_len: u64,
+    resident: Vec<ResidentBand>,             // 按 first_row 有序；recency 在条目内部的 written tick
+    spilled:  BTreeMap<u64, SpillRef>,       // 键 = first_row
+    spill:    Option<SpillFile>,             // 会话独占的一个文件；Drop 删文件
+    dir:      PathBuf,
+    owns_dir: bool,                          // 目录由本 store 建则 Drop 删目录
+    tick:     u64,
+}
+struct ResidentBand { band: Band, written: u64 }
+struct SpillRef { first_row: u64, row_count: u64, offset: u64, len: u64, fnv: u64 }
+struct SpillFile { file: std::fs::File, path: PathBuf, len: u64 }
+
+enum BandError {
+    CorruptBand { first_row: u64, expected: u64, found: u64 },
+    MemoryLimit { budget: u64, protected: u64 },
+    Spill       { first_row: u64, detail: String },
+}
+```
+
+**六处落地裁决**（`docs/31` §0.6 `DEV-29`）：
+
+1. **常驻侧是 `Vec<ResidentBand>` + 写入 tick，不是 `LruMap`。** 理由是 `shift_rows`：一次 prepend（`P1.19`）会重写**每一个** `first_row`，所以任何以位置为键的 LRU 都会在画布向上生长时被打乱顺序，而 tick 不动。位置序是 `is_disjoint` 与读取需要的，recency 序是换出需要的——**两个序，分开存**，这正是 §17.5 ③"最近 `k=2`"能被表达成 `most_recent(2)` 的原因。
+2. **条带是裸 `Vec<u8>`，不是 `Arc<Band>`。** 今天没有任何东西共享条带（参照视口是从 store 里**拷出去**的，§17.4），一个没人 clone 的 `Arc` 只是store 自己的所有权模型旁边多出来的第二套。
+3. **"LRU"在这里等于"最先写入的最先换出"（FIFO）。** 因为条带是不可变的、且换出后**不会被重新插入**：`read_rows` 从盘上读回一条落盘条带后**仍把它留在盘上**——把常驻性交给读模式，等于让"导出一次全图"就把整块画布变回常驻，`F-07` 会退化成一个与"怎么读"有关、而与"多长"无关的性质。这一条是 `P1.20` 执行期由实测钉住的（见下）。
+4. **预算是 store 的属性，不是调用方的纪律。** `insert` 记录并断言校验和、`relieve(protected)` 换出直到可达、`read_rows` 逐条校验；每次变更后 `sync_accounting()` 把 `resident_bytes()` 写进 `MemoryBudget::set_canvas`，因此 `resident_canvas` **永远等于这个 store 真正持有的字节**，而 `assert_invariants` 的不变量 7 会把这个数与 store 的实数**交叉核对**——记账漂移是不变量失败，不是静默超限（§22.3 对"三个死配置字段"的否决在这里有了可执行的形态）。
+5. **保护集由画布算，不由 store 猜。** `RecoveredImage::protected_rows(reference)` = 与参照窗口 `[position, position+extent)` 相交的全部条带 + `most_recent(2)`；`ViewportState::apply` 在**每一步**（含 `step == 0` 的重复帧路径）末尾调 `canvas.relieve(...)`。store 知道条带，只有视口知道下一步要读哪一块——§17.5 ③ 是关于后者的陈述。
+6. **`BandError` 而不是 `ErrorCode`。** `§17.5` 写的 `ErrorCode::CorruptBand` 在本仓库**不存在**（`ErrorCode` 全仓只出现在本文档这一行）；会话层的错误枚举是 §20.4 的 `StopReason`，属 `P3.04`。所以 store 有自己的小错误类型，**映射留给会话**：`MemoryLimit` → `StopReason::MemoryLimit` + `Partial`，`CorruptBand` → 会话失败但**不清空画布**（G12），`Spill` → 内部错误。
+
+**实测（2026-10-08，`cargo test -p snapclip-capture --lib canvas::` 12 passed）**：
+
+| 用例 | 装置 | 结果 |
+|---|---|---|
+| `a_one_band_budget_still_produces_a_correct_canvas` | 10 个 100 行条带，预算 = **1 个条带** | 峰值常驻 ≤ 预算；**9 条落盘**；`read_rows(0, 1000)` 与写入**逐字节相等**；读完**仍是 9 条落盘**（裁决 3 的可执行形式） |
+| `the_reference_band_and_the_last_two_confirmed_bands_are_never_evicted` | 4 条条带、预算 3 条，保护 `[0, 200, 300]` | 三者仍常驻、**只有 100 落盘**；再用预算 1 条 + 保护 2 条 ⇒ `Err(MemoryLimit { budget: 1 条, protected: 2 条 })`（§22.3 第三步） |
+| `a_corrupted_spill_file_is_detected` | 翻转落盘文件里的**一个字节** | `Err(CorruptBand { first_row: 0, expected, found })`；`spilled` **不丢条目**；另一条常驻条带照常读出 ⇒ 画布未被清空 |
+| `every_memory_budget_field_is_read` | 直接驱动 `MemoryBudget` | 恰好等于预算是"里面"；`resident_canvas` 与 `resident_preview` 各自单独触发 `over_budget`；`for_viewport(100,50) = 100·50·4·8` |
+| `a_spilling_canvas_survives_a_long_session` | 1780 行文档、300 行视口、40 步 × 37 px、预算 = 600 行 | 每步 `resident_bytes ≤ total`；**确实发生过换出**；整块画布与文档**逐字节相等**；八条不变量成立 |
+
+**一处执行期修订**：RED 阶段写的断言是"读完全部条带后 `spilled` 为空"（当时以为读回即常驻）；GREEN 期间定下裁决 3 后该断言与设计相反，改为"读完**仍是 9 条落盘**"。这不是放宽——它把一条设计决定变成了可执行的钉子。
+
+**尚未落地**：`SpillRef` 的治理（`P4.06`，与导出路径的文件清理同一处）；`MemoryBudget::set_preview` 今天**没有生产调用点**（预览属 `P2`，因此 `resident_preview` 恒为 0，§22.3 的第一步"先换出预览"由预览的所有者负责）；`checksum` 现在与 §15.4 第 1 层的行摘要**共用一份实现**（`displacement::checksum`，`line_digest` 委托它）。
+
 ### 17.6 上限：三层，且**没有硬失败上限**
 
 **V1 的问题**（R1/R5/D2）：`30,000 px / 150 MP` 两个数字**没有推导**，且是硬上限（超限即失败）。而竞品对照（F-16）给出的真实量级是：
@@ -3253,6 +3300,16 @@ struct MemoryBudget {
 2. 再按 LRU 换出画布条带（**但当前参照条带与最近 `k=2` 个已确认条带除外**——若因此无法满足预算，说明视口本身太大，进入第 3 步）；
 3. 仍不足 → `StopReason::MemoryLimit`，把画布裁成连续前缀并产出 `Partial`（§17.6 第 1 层）。
 
+**落地（`P1.20`，2026-10-08）**：三个字段**各自都有读取点**，不是死配置（参考实现有三个死配置字段，`docs/31` §0.6 的 `S3` 记了这一点，V2 不接受继承）：
+
+| 字段 | 写入点 | 读取点 |
+|---|---|---|
+| `total` | `for_viewport(cross_len, extent)`（`cross × extent × 4 × 8`）/ `with_total` | `over_budget()`、`headroom()` |
+| `resident_canvas` | `BandStore::sync_accounting()`（每次 `insert`/换出后 = `resident_bytes()`） | `over_budget()`、`headroom()`，并在 `assert_invariants` 里与 store 实持字节**交叉核对**（`assert_eq!`，记账漂移 = 不变量失败） |
+| `resident_preview` | `set_preview(bytes)`（**今天无生产调用点**——预览属 `P2`） | `over_budget()`、`headroom()`（因此第 1 步"先换出预览"今天不触发，`resident_preview` 恒为 0） |
+
+上面第 2 步的"LRU"在落地时被钉成**最先写入的最先换出**：条带不可变，且从盘上读回一条**不会**让它重新常驻（否则"导出一次全图"就把整块画布变回常驻，`F-07` 会退化成与"怎么读"有关的性质）。`§17.5.1` 记了六处裁决与五条用例的实测。
+
 ### 22.4 是否需要复制：逐条判定
 
 | 数据 | 能否零拷贝 | 判定 |
@@ -3260,7 +3317,7 @@ struct MemoryBudget {
 | WGC 纹理 → D2D 位图（覆盖层显示） | **能**（今天就是） | 保持 |
 | 单个 `Observation` 内多视图（灰度、降采样、梯度）的**缓冲区复用** | **能** | 三个视图都在同一个 `Observation` 生命周期内，用一块 scratch 复用（§22.5） |
 | GPU 纹理 → CPU 回读 | **不能**（架构限制） | 必须拷贝。**唯一可做的是减少次数**：§11.3 硬规则"每步一次" |
-| 画布条带 → 匹配的 `match_region` | **能**（只读句柄） | 用 `Arc<Band>` + 行偏移，不复制 |
+| 画布条带 → 匹配的 `match_region` | **能**（只读句柄） | 用 `Arc<Band>` + 行偏移，不复制。**`P1.20` 落地时未采纳**：今天 `RecoveredImage::rows` 把区间拷成 `Vec<u8>`（条带是裸 `Vec<u8>`，没有可共享的句柄）；零拷贝是接口演进，不是已实现的性质 |
 | 预览缩略 | **不能**（需要不同尺度） | 必须生成；但只生成**新增段** |
 | BGRA → PNG | **不能**（格式不同），但可**只重排一次** | 在行带边界重排（§17.7），不整幅重排 |
 | `BandStore` ↔ 换出文件 | **不能** | 必须 I/O |
@@ -4221,7 +4278,7 @@ if ($hits) { Write-Error "scroll/ must stay platform-free: $($hits -join '; ')";
 | 双向扩展 | 先下滚再上滚 | 正确 `Prepend`；不产生 gap/重复 | L1 | 已可执行（`P1.19`） |
 | `Contained` | 小幅回滚完全落在已覆盖区 | 识别为 `Contained`；不写重复内容 | L1 | 已可执行（`P1.19`，用例先证明两帧字节不同） |
 | 撤销一步 | 提交 10 步后 `undo` | 回退到第 9 步状态；`primary_len` 回退 | L1 | — |
-| 条带换出 | 预算注入成 1 个条带 | 峰值不随长度增长；恢复后逐字节正确 | L1 | **Memory** |
+| 条带换出 | 预算注入成 1 个条带 | 峰值不随长度增长；恢复后逐字节正确 | L1 | **Memory**；已可执行（`P1.20`，10 条条带 + 1 条预算：9 条落盘、读完仍逐字节相等） |
 | 上限三层 | `MAX_LONG_IMAGE_PIXELS` 注入 1/10 | `Partial` 且**是合法 PNG** | L1+L2 | **Memory** |
 | 流式导出 | 30,000 px 高 | 严格递增校验；乱序返回错误 | L2 | **Stitch Latency** |
 | 水平轴 | 同序列两轴 | 结果逐行相等 | L1 | **分轴 P50/P95** |

@@ -292,6 +292,14 @@ fn fold(state: u64, byte: u8) -> u64 {
 
 /// The fold of one contiguous primary line — a row, for a vertical observation.
 pub(crate) fn line_digest(bytes: &[u8]) -> u64 {
+    checksum(bytes)
+}
+
+/// The same fold over an arbitrary byte range. `line_digest` is the row-sized case of it, and the
+/// band store's spill verification (§17.5 ⑤, `P1.20`) is the whole-band case. One implementation,
+/// because a second copy of a hash is a second thing to get subtly wrong — and of the two callers,
+/// the spill check is the one where a wrong answer is silent data loss.
+pub(crate) fn checksum(bytes: &[u8]) -> u64 {
     let mut state = FNV_OFFSET;
     for &byte in bytes {
         state = fold(state, byte);

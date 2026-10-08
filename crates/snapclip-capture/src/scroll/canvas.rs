@@ -27,11 +27,23 @@
 //!   same kind of object — the scroll driver owns it, the preview gets copies of rows, nobody else
 //!   may call into it.
 //!
-//! Not here yet: the LRU and the disk spill (`P1.20`), the prepend/`Contained` cases (`P1.19`) and
-//! the export sink (`P4.01`). Until then the module is exercised by its own tests and the crate's
-//! warning budget stays at zero (`docs/31` §4.1).
+//! `P1.20` adds the fourth: the band store owns the budget. `docs/30` §17.5 asks for an
+//! `LruMap<BandIndex, Arc<Band>>` and §22.3 for a `MemoryBudget` whose three fields are all read.
+//! The resident side here is a `Vec<ResidentBand>` ordered by position, with a monotonic write tick
+//! **inside** each entry, and the bands are plain `Vec<u8>`. Both differences are about keeping one
+//! fact in one place — see [`BandStore`] — and the budget being *the store's* property rather than a
+//! caller's discipline is what makes `F-07` ("memory does not grow with the image") a property of the
+//! code instead of a promise in a document.
+//!
+//! Not here yet: the export sink (`P4.01`), and the `SpillRef` governance that `P4.06` folds into the
+//! export path's own file cleanup. Until then the module is exercised by its own tests and the
+//! crate's warning budget stays at zero (`docs/31` §4.1).
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+use crate::scroll::displacement::checksum;
 use crate::scroll::observation::{Axis, Observation};
 
 /// Bytes per pixel in a band: BGRA, the format every capture path produces (`docs/30` §17.5).
@@ -73,7 +85,7 @@ pub(crate) enum StepWrite {
 }
 
 /// One whole-width row band (§17.5). `rows` is BGRA in canvas order, `first_row` is its position on
-/// the primary axis, and `fnv` is the checksum that `P1.20` fills in and every load verifies.
+/// the primary axis, and `fnv` is the checksum every load verifies.
 #[derive(Debug, Clone)]
 pub(crate) struct Band {
     pub(crate) first_row: u64,
@@ -82,6 +94,19 @@ pub(crate) struct Band {
 }
 
 impl Band {
+    /// A band with its checksum computed. Every producer goes through here rather than filling `fnv`
+    /// in by hand: a band that carried a zero checksum would turn the spill verification into a check
+    /// that always fails, and one that carried a wrong checksum into a check that always passes —
+    /// both worse than having no check at all (§17.5 ⑤, G12).
+    pub(crate) fn new(first_row: u64, rows: Vec<u8>) -> Self {
+        let fnv = checksum(&rows);
+        Self {
+            first_row,
+            rows,
+            fnv,
+        }
+    }
+
     /// How many primary-axis rows this band covers, from its byte length and the canvas width.
     pub(crate) fn row_count(&self, cross_len: u64) -> u64 {
         let row_bytes = cross_len * BYTES_PER_PIXEL;
@@ -97,29 +122,223 @@ impl Band {
     }
 }
 
-/// The bands of one canvas: whole-width rows, plus the resident-byte budget they must fit in.
+/// What the band store can fail at (§17.5, §22.3).
 ///
-/// `P1.20` adds the LRU and the spill file. Until then every band stays resident, and invariant 7 is
-/// what keeps "resident bytes" honest: `insert` does not evict, so an over-budget store is a state
-/// that only [`RecoveredImage::assert_invariants`] refuses.
-pub(crate) struct BandStore {
-    pub(crate) bands: Vec<Band>,
-    pub(crate) budget: u64,
-    cross_len: u64,
+/// `docs/30` §17.5 names `ErrorCode::CorruptBand`, and this crate has no `ErrorCode`: the session's
+/// error enum is §20.4's `StopReason`, which belongs to the session layer (`P3.04`). The store
+/// therefore has its own small error type and the session maps it — `MemoryLimit` to
+/// `StopReason::MemoryLimit` plus a `Partial` export, `CorruptBand` to "the session fails **without**
+/// clearing the canvas" (G12), `Spill` to an internal error. Writing that mapping down here would be
+/// guessing at a type that does not exist yet, so it is left to the task that owns it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BandError {
+    /// A band read back from the spill file does not match the checksum it was written with.
+    CorruptBand {
+        first_row: u64,
+        expected: u64,
+        found: u64,
+    },
+    /// The budget is unreachable even with nothing but the protected bands resident (§22.3's third
+    /// step: the viewport itself is too large for the budget).
+    MemoryLimit { budget: u64, protected: u64 },
+    /// The spill file could not be created, written or read.
+    Spill { first_row: u64, detail: String },
 }
 
-impl BandStore {
-    pub(crate) fn new(cross_len: u64, budget: u64) -> Self {
+/// The memory the canvas is allowed to keep resident (§22.3).
+///
+/// All three fields are read, and that is the point: §22.3 notes that the reference implementation
+/// carries three budget fields nothing consults, and that V2 does not inherit that. `total` and the
+/// two resident counters are read by [`Self::over_budget`]/[`Self::headroom`], and `resident_canvas`
+/// is additionally cross-checked against the bytes the store actually holds in
+/// [`RecoveredImage::assert_invariants`] — so a bookkeeping drift is an invariant failure rather than
+/// a silent overrun.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MemoryBudget {
+    total: u64,
+    resident_canvas: u64,
+    resident_preview: u64,
+}
+
+impl MemoryBudget {
+    /// §22.3's default: 8 viewports of BGRA. The five consumers §22.3 lists (the reference viewport,
+    /// the two bands that cannot be evicted, the band being written, the observation read-back and a
+    /// thumbnail preview) come to ≈3.1 viewports, so this leaves 2.5× headroom — and, the part that
+    /// matters, it does not depend on how long the content is. A larger default would not buy
+    /// correctness: the `GraphicsDevice` is reused across sessions, so the budget is a resident cost.
+    pub(crate) const VIEWPORTS: u64 = 8;
+
+    pub(crate) fn for_viewport(cross_len: u64, extent: u64) -> Self {
+        Self::with_total(cross_len * extent * BYTES_PER_PIXEL * Self::VIEWPORTS)
+    }
+
+    pub(crate) fn with_total(total: u64) -> Self {
         Self {
-            bands: Vec::new(),
-            budget,
-            cross_len,
+            total,
+            resident_canvas: 0,
+            resident_preview: 0,
         }
     }
 
-    /// Adds a band. The band has to be a whole number of rows for this canvas and must not overlap
-    /// what is already there — writing an overlapping band means the caller believes it knows where
-    /// the content is and the canvas does not (invariant 6).
+    pub(crate) fn total(&self) -> u64 {
+        self.total
+    }
+
+    pub(crate) fn resident_canvas(&self) -> u64 {
+        self.resident_canvas
+    }
+
+    pub(crate) fn resident_preview(&self) -> u64 {
+        self.resident_preview
+    }
+
+    /// Everything that counts against `total`. §22.2: the canvas bands and the preview bands share
+    /// one budget, and nothing else does — the observation is a step-lifetime buffer.
+    pub(crate) fn used(&self) -> u64 {
+        self.resident_canvas + self.resident_preview
+    }
+
+    pub(crate) fn headroom(&self) -> u64 {
+        self.total.saturating_sub(self.used())
+    }
+
+    pub(crate) fn over_budget(&self) -> bool {
+        self.used() > self.total
+    }
+
+    /// Called by the band store, which is the only writer of this number.
+    pub(crate) fn set_canvas(&mut self, bytes: u64) {
+        self.resident_canvas = bytes;
+    }
+
+    /// Called by the preview owner (`P2`): §22.3's first eviction step is the preview's, because a
+    /// preview band is rebuildable and a canvas band is not.
+    pub(crate) fn set_preview(&mut self, bytes: u64) {
+        self.resident_preview = bytes;
+    }
+}
+
+/// Where a band went on disk, and what it hashed to when it was written (§17.5 ④).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SpillRef {
+    pub(crate) first_row: u64,
+    pub(crate) row_count: u64,
+    pub(crate) offset: u64,
+    pub(crate) len: u64,
+    pub(crate) fnv: u64,
+}
+
+/// The name of the session's spill file inside its directory.
+pub(crate) const SPILL_FILE_NAME: &str = "bands.spill";
+
+/// The session's spill file: one file per canvas, appended to in eviction order, removed when it
+/// drops. §17.5 ⑥ — the file lives and dies with the session, and nothing is cached across sessions.
+struct SpillFile {
+    file: std::fs::File,
+    path: PathBuf,
+    len: u64,
+}
+
+impl SpillFile {
+    fn create(path: PathBuf) -> std::io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)?;
+        Ok(Self { file, path, len: 0 })
+    }
+}
+
+impl Drop for SpillFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// A resident band plus when it was written. The tick is monotonic and lives **inside** the entry so
+/// that recency survives [`BandStore::shift_rows`].
+struct ResidentBand {
+    band: Band,
+    written: u64,
+}
+
+/// A directory nobody else is using: the process id plus a nanosecond stamp.
+fn unique_spill_dir() -> PathBuf {
+    let token = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("snapclip-bands-{}-{token}", std::process::id()))
+}
+
+/// The bands of one canvas: whole-width rows, the budget they must fit in, and the spill file for the
+/// ones that do not (§17.5, §22.3; `P1.20`).
+///
+/// Two shapes differ from §17.5's sketch, and each one keeps a fact in a single place:
+///
+/// * The resident side is a `Vec<ResidentBand>` ordered by `first_row`, not an `LruMap`, and recency
+///   is a write tick carried inside the entry. That matters because a prepend (`P1.19`) rewrites
+///   every `first_row` through [`Self::shift_rows`]: an LRU keyed by position would have its order
+///   scrambled by the canvas growing upwards, while a tick does not move. Position order is what
+///   `is_disjoint` and reads need; recency order is what eviction needs. Two orders, kept apart.
+/// * Bands are plain `Vec<u8>`, not `Arc<Band>`. Nothing shares a band today — the reference viewport
+///   is *copied out* of the store (§17.4) — and an `Arc` nobody clones is a second ownership model
+///   sitting next to the store's own.
+///
+/// The budget is enforced **here** and not by the callers: `insert` records, `relieve` evicts,
+/// `read_rows` verifies. `F-07` is a property of the store or it is nothing.
+pub(crate) struct BandStore {
+    budget: MemoryBudget,
+    cross_len: u64,
+    resident: Vec<ResidentBand>,
+    spilled: BTreeMap<u64, SpillRef>,
+    spill: Option<SpillFile>,
+    dir: PathBuf,
+    owns_dir: bool,
+    tick: u64,
+}
+
+impl BandStore {
+    /// A store that spills into a fresh directory under the system temp directory. The directory —
+    /// and with it the spill file — is removed when the store drops.
+    pub(crate) fn new(cross_len: u64, budget: MemoryBudget) -> Self {
+        Self::in_dir(cross_len, budget, unique_spill_dir())
+    }
+
+    /// A store that spills into `dir`. The directory is created if it is missing, and removed again
+    /// on drop **only if this store created it**: the tests hand in a directory of their own so that
+    /// they can tamper with the spill file (§30.4's corruption case) and still get the cleanup.
+    pub(crate) fn in_dir(cross_len: u64, budget: MemoryBudget, dir: PathBuf) -> Self {
+        let owns_dir = !dir.exists();
+        if owns_dir {
+            let _ = std::fs::create_dir_all(&dir);
+        }
+        Self {
+            budget,
+            cross_len,
+            resident: Vec::new(),
+            spilled: BTreeMap::new(),
+            spill: None,
+            dir,
+            owns_dir,
+            tick: 0,
+        }
+    }
+
+    pub(crate) fn budget(&self) -> MemoryBudget {
+        self.budget
+    }
+
+    /// Adds a band. The band has to be a whole number of rows for this canvas, must not overlap what
+    /// is already there — writing an overlapping band means the caller believes it knows where the
+    /// content is and the canvas does not (invariant 6) — and must carry the checksum of its own
+    /// bytes, because that checksum is the only thing that makes a later load verifiable.
+    ///
+    /// `insert` does not evict: [`Self::relieve`] does, once per step, after the caller has said what
+    /// the next step needs. Splitting them is what lets one step write a band and still keep the
+    /// reference viewport resident for the next one (§17.5 ③).
     pub(crate) fn insert(&mut self, band: Band) {
         let row_bytes = self.cross_len * BYTES_PER_PIXEL;
         assert!(
@@ -134,22 +353,196 @@ impl BandStore {
             band.first_row,
             band.end_row(self.cross_len)
         );
-        self.bands.push(band);
+        assert_eq!(
+            band.fnv,
+            checksum(&band.rows),
+            "band {} was stored with a checksum that does not match its own bytes, so a later load would verify nothing",
+            band.first_row
+        );
+        self.tick += 1;
+        self.resident.push(ResidentBand {
+            band,
+            written: self.tick,
+        });
+        self.resident
+            .sort_unstable_by_key(|entry| entry.band.first_row);
+        self.sync_accounting();
+    }
+
+    /// Evicts resident bands to disk, least recently written first, until the budget is reachable —
+    /// skipping every position in `protected`, which is the caller's answer to "what does the next
+    /// step need" (§17.5 ③). Returns how many bands went to disk.
+    ///
+    /// A budget that cannot be reached with nothing but the protected bands resident is
+    /// [`BandError::MemoryLimit`] — §22.3's third step, where the viewport itself is too large for the
+    /// budget. It is an error and not a silent overrun because an overrun would make the memory bound
+    /// hold only while the content is short, which is exactly the property `F-07` exists to provide.
+    pub(crate) fn relieve(&mut self, protected: &[u64]) -> Result<u64, BandError> {
+        let mut evicted = 0;
+        while self.budget.over_budget() {
+            let Some(index) = self.least_recently_written(protected) else {
+                return Err(BandError::MemoryLimit {
+                    budget: self.budget.total(),
+                    protected: self.resident_bytes(),
+                });
+            };
+            self.evict(index)?;
+            evicted += 1;
+        }
+        Ok(evicted)
+    }
+
+    /// Reads `rows` rows starting at `first_row`, from the resident bands and — for whatever was
+    /// evicted — from the spill file, verifying each spilled band's checksum on the way (§17.5 ⑤).
+    ///
+    /// Takes `&mut self` because a spilled band is fetched with a seek and a read, and because a read
+    /// that cannot verify what it got back has to be able to say so. A band read from disk stays on
+    /// disk: pulling it back would make residency follow the read pattern instead of the budget.
+    pub(crate) fn read_rows(&mut self, first_row: u64, rows: u64) -> Result<Vec<u8>, BandError> {
+        let row_bytes = (self.cross_len * BYTES_PER_PIXEL) as usize;
+        let end = first_row + rows;
+        let mut out = vec![0u8; row_bytes * rows as usize];
+
+        for entry in &self.resident {
+            copy_overlap(
+                &entry.band.rows,
+                entry.band.first_row,
+                entry.band.end_row(self.cross_len),
+                first_row,
+                end,
+                row_bytes,
+                &mut out,
+            );
+        }
+
+        let wanted: Vec<SpillRef> = self
+            .spilled
+            .values()
+            .filter(|spilled| spilled.first_row < end && first_row < spilled.first_row + spilled.row_count)
+            .copied()
+            .collect();
+        for spilled in wanted {
+            let bytes = self.read_spilled(&spilled)?;
+            copy_overlap(
+                &bytes,
+                spilled.first_row,
+                spilled.first_row + spilled.row_count,
+                first_row,
+                end,
+                row_bytes,
+                &mut out,
+            );
+        }
+        Ok(out)
+    }
+
+    /// The bytes of one spilled band, verified against the checksum it was written with.
+    fn read_spilled(&mut self, spilled: &SpillRef) -> Result<Vec<u8>, BandError> {
+        use std::io::{Read, Seek, SeekFrom};
+        let detail = |error: std::io::Error| BandError::Spill {
+            first_row: spilled.first_row,
+            detail: error.to_string(),
+        };
+        let spill = self.spill.as_mut().ok_or_else(|| BandError::Spill {
+            first_row: spilled.first_row,
+            detail: String::from("a band is recorded as spilled but the session has no spill file"),
+        })?;
+        spill.file.seek(SeekFrom::Start(spilled.offset)).map_err(detail)?;
+        let mut bytes = vec![0u8; spilled.len as usize];
+        spill.file.read_exact(&mut bytes).map_err(detail)?;
+        let found = checksum(&bytes);
+        if found != spilled.fnv {
+            return Err(BandError::CorruptBand {
+                first_row: spilled.first_row,
+                expected: spilled.fnv,
+                found,
+            });
+        }
+        Ok(bytes)
+    }
+
+    fn least_recently_written(&self, protected: &[u64]) -> Option<usize> {
+        self.resident
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| !protected.contains(&entry.band.first_row))
+            .min_by_key(|(_, entry)| entry.written)
+            .map(|(index, _)| index)
+    }
+
+    /// Moves one band to the spill file. A band that cannot be written stays resident and the error
+    /// comes back to the caller: an eviction that failed silently would be a leak with a checksum.
+    fn evict(&mut self, index: usize) -> Result<(), BandError> {
+        let entry = self.resident.remove(index);
+        match self.write_spill(&entry.band) {
+            Ok(spilled) => {
+                self.spilled.insert(entry.band.first_row, spilled);
+                self.sync_accounting();
+                Ok(())
+            }
+            Err(error) => {
+                self.resident.push(entry);
+                self.resident
+                    .sort_unstable_by_key(|entry| entry.band.first_row);
+                self.sync_accounting();
+                Err(error)
+            }
+        }
+    }
+
+    fn write_spill(&mut self, band: &Band) -> Result<SpillRef, BandError> {
+        use std::io::{Seek, SeekFrom, Write};
+        let first_row = band.first_row;
+        let detail = |error: std::io::Error| BandError::Spill {
+            first_row,
+            detail: error.to_string(),
+        };
+        if self.spill.is_none() {
+            let path = self.dir.join(SPILL_FILE_NAME);
+            self.spill = Some(SpillFile::create(path).map_err(detail)?);
+        }
+        let spill = self
+            .spill
+            .as_mut()
+            .expect("the spill file was just created if it was missing");
+        let offset = spill.len;
+        spill.file.seek(SeekFrom::Start(offset)).map_err(detail)?;
+        spill.file.write_all(&band.rows).map_err(detail)?;
+        spill.file.flush().map_err(detail)?;
+        spill.len = offset + band.rows.len() as u64;
+        Ok(SpillRef {
+            first_row,
+            row_count: band.row_count(self.cross_len),
+            offset,
+            len: band.rows.len() as u64,
+            fnv: band.fnv,
+        })
+    }
+
+    /// The store's own bookkeeping, written into the budget after every change so that
+    /// [`MemoryBudget::resident_canvas`] always means "what this store holds".
+    fn sync_accounting(&mut self) {
+        self.budget.set_canvas(self.resident_bytes());
     }
 
     fn is_disjoint_from(&self, candidate: &Band) -> bool {
-        self.bands.iter().all(|band| {
-            candidate.first_row >= band.end_row(self.cross_len)
-                || band.first_row >= candidate.end_row(self.cross_len)
+        self.resident.iter().all(|entry| {
+            candidate.first_row >= entry.band.end_row(self.cross_len)
+                || entry.band.first_row >= candidate.end_row(self.cross_len)
         })
     }
 
     /// Invariant 6: no two bands share a row.
     pub(crate) fn is_disjoint(&self) -> bool {
         let mut ranges: Vec<(u64, u64)> = self
-            .bands
+            .resident
             .iter()
-            .map(|band| (band.first_row, band.end_row(self.cross_len)))
+            .map(|entry| {
+                (
+                    entry.band.first_row,
+                    entry.band.end_row(self.cross_len),
+                )
+            })
             .collect();
         ranges.sort_unstable();
         ranges.windows(2).all(|pair| pair[0].1 <= pair[1].0)
@@ -157,24 +550,126 @@ impl BandStore {
 
     /// Moves every band down by `rows`. Used by a prepend (`P1.19`): the content did not move, the
     /// canvas grew **above** it, so the coordinates of everything already stored shift by the number
-    /// of rows that were inserted in front of them.
+    /// of rows that were inserted in front of them — on disk as well as in memory, or a spilled band
+    /// would come back at the wrong place after a prepend.
     pub(crate) fn shift_rows(&mut self, rows: u64) {
         if rows == 0 {
             return;
         }
-        for band in &mut self.bands {
-            band.first_row += rows;
+        for entry in &mut self.resident {
+            entry.band.first_row += rows;
+        }
+        self.resident
+            .sort_unstable_by_key(|entry| entry.band.first_row);
+        let moved: Vec<SpillRef> = std::mem::take(&mut self.spilled)
+            .into_values()
+            .map(|mut spilled| {
+                spilled.first_row += rows;
+                spilled
+            })
+            .collect();
+        for spilled in moved {
+            self.spilled.insert(spilled.first_row, spilled);
         }
     }
 
-    /// Invariant 7's left-hand side.
+    /// Invariant 7's left-hand side: what is resident **now**.
     pub(crate) fn resident_bytes(&self) -> u64 {
-        self.bands.iter().map(|band| band.rows.len() as u64).sum()
+        self.resident
+            .iter()
+            .map(|entry| entry.band.rows.len() as u64)
+            .sum()
     }
 
-    pub(crate) fn bands(&self) -> &[Band] {
-        &self.bands
+    pub(crate) fn is_resident(&self, first_row: u64) -> bool {
+        self.resident
+            .iter()
+            .any(|entry| entry.band.first_row == first_row)
     }
+
+    pub(crate) fn spilled(&self) -> &BTreeMap<u64, SpillRef> {
+        &self.spilled
+    }
+
+    /// The resident bands, in position order.
+    pub(crate) fn bands(&self) -> impl Iterator<Item = &Band> {
+        self.resident.iter().map(|entry| &entry.band)
+    }
+
+    /// The `count` most recently written bands, newest last. §17.5 ③ protects them from eviction:
+    /// they are what a small rollback reads (§17.4's `Contained`).
+    pub(crate) fn most_recent(&self, count: usize) -> Vec<&Band> {
+        let mut entries: Vec<&ResidentBand> = self.resident.iter().collect();
+        entries.sort_unstable_by_key(|entry| entry.written);
+        entries
+            .into_iter()
+            .rev()
+            .take(count)
+            .map(|entry| &entry.band)
+            .collect()
+    }
+
+    /// Test-only: the budget is the store's, and the invariant cases have to build a store that is
+    /// already over it (invariant 7) or already inconsistent (invariant 6).
+    #[cfg(test)]
+    pub(crate) fn set_budget(&mut self, budget: MemoryBudget) {
+        self.budget = budget;
+        self.sync_accounting();
+    }
+
+    /// Test-only: install resident bands directly, bypassing the checks `insert` makes. Invariant 6's
+    /// case is two bands that overlap, which the public API refuses to build — deliberately, since
+    /// that is what the invariant is there to catch.
+    #[cfg(test)]
+    pub(crate) fn set_resident(&mut self, bands: Vec<Band>) {
+        self.tick = 0;
+        self.resident = bands
+            .into_iter()
+            .map(|band| {
+                self.tick += 1;
+                ResidentBand {
+                    band,
+                    written: self.tick,
+                }
+            })
+            .collect();
+        self.resident
+            .sort_unstable_by_key(|entry| entry.band.first_row);
+        self.sync_accounting();
+    }
+}
+
+impl Drop for BandStore {
+    fn drop(&mut self) {
+        // The spill file first (its own `Drop`), then the directory — but only if we made it.
+        self.spill = None;
+        if self.owns_dir {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
+/// Copies the rows a stored band shares with `[first_row, end)` into `out`, which is laid out for
+/// that same range. One helper for the resident and the spilled path, so a band cannot be read one
+/// way from memory and another way from disk.
+fn copy_overlap(
+    band: &[u8],
+    band_first: u64,
+    band_end: u64,
+    first_row: u64,
+    end: u64,
+    row_bytes: usize,
+    out: &mut [u8],
+) {
+    let start = band_first.max(first_row);
+    let stop = band_end.min(end);
+    if start >= stop {
+        return;
+    }
+    let src = (start - band_first) as usize * row_bytes;
+    let dst = (start - first_row) as usize * row_bytes;
+    let len = (stop - start) as usize * row_bytes;
+    out[dst..dst + len].copy_from_slice(&band[src..src + len]);
 }
 
 /// Which rows of the canvas have been written at least once (§17.1's coverage invariant).
@@ -336,13 +831,24 @@ pub(crate) struct RecoveredImage {
 }
 
 impl RecoveredImage {
-    pub(crate) fn new(axis: Axis, cross_len: u64, budget: u64) -> Self {
+    /// A canvas whose bands spill into a fresh directory of their own.
+    pub(crate) fn new(axis: Axis, cross_len: u64, budget: MemoryBudget) -> Self {
+        Self::in_dir(axis, cross_len, budget, unique_spill_dir())
+    }
+
+    /// A canvas whose bands spill into `dir` (§17.5 ④: the session's own temporary file).
+    pub(crate) fn in_dir(
+        axis: Axis,
+        cross_len: u64,
+        budget: MemoryBudget,
+        dir: PathBuf,
+    ) -> Self {
         Self {
             axis,
             primary_len: 0,
             cross_len,
             coverage: CoverageMap::new(0),
-            bands: BandStore::new(cross_len, budget),
+            bands: BandStore::in_dir(cross_len, budget, dir),
             owner: std::thread::current().id(),
         }
     }
@@ -388,11 +894,8 @@ impl RecoveredImage {
             row_bytes * rows as usize,
             "the frame is not strictly packed: the canvas stores whole rows"
         );
-        self.bands.insert(Band {
-            first_row: 0,
-            rows: frame.pixels().to_vec(),
-            fnv: 0,
-        });
+        self.bands
+            .insert(Band::new(0, frame.pixels().to_vec()));
         self.primary_len = rows;
         self.coverage = CoverageMap::new(rows);
         self.coverage.mark_range(0, rows);
@@ -448,11 +951,7 @@ impl RecoveredImage {
             row_bytes * rows as usize,
             "the frame is not strictly packed: the canvas stores whole rows"
         );
-        self.bands.insert(Band {
-            first_row,
-            rows: new_rows.to_vec(),
-            fnv: 0,
-        });
+        self.bands.insert(Band::new(first_row, new_rows.to_vec()));
         self.primary_len += rows;
         self.coverage.mark_range(first_row, self.primary_len);
         StepWrite::Appended { first_row, rows }
@@ -492,11 +991,7 @@ impl RecoveredImage {
             "the frame is not strictly packed: the canvas stores whole rows"
         );
         self.bands.shift_rows(rows);
-        self.bands.insert(Band {
-            first_row: 0,
-            rows: new_rows.to_vec(),
-            fnv: 0,
-        });
+        self.bands.insert(Band::new(0, new_rows.to_vec()));
         self.primary_len += rows;
         self.coverage.insert_rows_at_front(rows);
         StepWrite::Prepended { rows }
@@ -512,28 +1007,51 @@ impl RecoveredImage {
     /// There is no single buffer to hand out (§17.1), so a reader asks for the range it needs: the
     /// export sink (`P4.01`), the preview and the tests all read through here. Rows the canvas does
     /// not have are a caller error, not a zero-filled range.
-    pub(crate) fn rows(&self, first_row: u64, rows: u64) -> Vec<u8> {
+    ///
+    /// This is fallible since `P1.20`: a band that is no longer resident has to be fetched from the
+    /// spill file, and a fetch that cannot verify its checksum is a failure the caller has to see
+    /// (§17.5 ⑤, G12) rather than a silently zero-filled range.
+    pub(crate) fn rows(&mut self, first_row: u64, rows: u64) -> Result<Vec<u8>, BandError> {
         assert!(
             first_row + rows <= self.primary_len,
             "asked for rows {first_row}..{} but the canvas ends at {}",
             first_row + rows,
             self.primary_len
         );
-        let row_bytes = (self.cross_len * BYTES_PER_PIXEL) as usize;
-        let mut out = vec![0u8; row_bytes * rows as usize];
-        let end = first_row + rows;
-        for band in self.bands.bands() {
-            let start = band.first_row.max(first_row);
-            let stop = band.end_row(self.cross_len).min(end);
-            if start >= stop {
-                continue;
+        self.bands.read_rows(first_row, rows)
+    }
+
+    /// Evicts what the next step does not need (§17.5 ③, §22.3). `reference` is the viewport the
+    /// caller is about to use — `(position, extent)` — and it is protected along with the two most
+    /// recently written bands, because those are what a small rollback reads.
+    ///
+    /// The set is computed **here** and not inside the store: the store knows about bands, the canvas
+    /// knows which rows the next step will ask for, and §17.5 ③ is a statement about the latter.
+    pub(crate) fn relieve(&mut self, reference: Option<(i64, u64)>) -> Result<u64, BandError> {
+        let protected = self.protected_rows(reference);
+        self.bands.relieve(&protected)
+    }
+
+    fn protected_rows(&self, reference: Option<(i64, u64)>) -> Vec<u64> {
+        let mut protected = Vec::new();
+        if let Some((position, extent)) = reference {
+            let start = position.max(0) as u64;
+            let end = start + extent;
+            for band in self.bands.bands() {
+                if band.first_row < end && start < band.end_row(self.cross_len) {
+                    protected.push(band.first_row);
+                }
             }
-            let src = (start - band.first_row) as usize * row_bytes;
-            let dst = (start - first_row) as usize * row_bytes;
-            let len = (stop - start) as usize * row_bytes;
-            out[dst..dst + len].copy_from_slice(&band.rows[src..src + len]);
         }
-        out
+        protected.extend(
+            self.bands
+                .most_recent(2)
+                .into_iter()
+                .map(|band| band.first_row),
+        );
+        protected.sort_unstable();
+        protected.dedup();
+        protected
     }
 
     /// §20.3's eight invariants, checked after every step. The messages name the invariant by number
@@ -580,15 +1098,21 @@ impl RecoveredImage {
             "invariant 6 (docs/30 §20.3): two bands share a row: {:?}",
             self.bands
                 .bands()
-                .iter()
                 .map(|band| (band.first_row, band.end_row(self.cross_len)))
                 .collect::<Vec<_>>()
         );
-        assert!(
-            self.bands.resident_bytes() <= self.bands.budget,
-            "invariant 7 (docs/30 §20.3): {} resident bytes over a budget of {}",
+        assert_eq!(
+            self.bands.budget().resident_canvas(),
             self.bands.resident_bytes(),
-            self.bands.budget
+            "invariant 7 (docs/30 §20.3, §22.3): the budget says {} canvas bytes are resident and the store holds {} — the memory bound is only real if the accounting is the store's own",
+            self.bands.budget().resident_canvas(),
+            self.bands.resident_bytes()
+        );
+        assert!(
+            !self.bands.budget().over_budget(),
+            "invariant 7 (docs/30 §20.3): {} resident bytes over a budget of {}",
+            self.bands.budget().used(),
+            self.bands.budget().total()
         );
         assert_eq!(
             std::thread::current().id(),
@@ -640,19 +1164,27 @@ impl ViewportState {
     /// A step larger than the viewport is refused rather than trimmed: `|d| <= extent` is gate one's
     /// correctness constraint (§16.2), and a step that does not overlap at all has no evidence to
     /// confirm it in the first place (§16.5's `Lost`).
+    ///
+    /// Every call ends with the budget enforced (§22.3): the canvas protects the reference viewport —
+    /// the position the viewport now has, which is what the next step will read (§17.4) — and lets the
+    /// store spill everything else. Doing it here rather than in the store is deliberate: the store
+    /// knows the bands, only the viewport knows which of them the next step needs.
     pub(crate) fn apply(
         &mut self,
         canvas: &mut RecoveredImage,
         frame: &Observation,
         step: i32,
-    ) -> StepWrite {
+    ) -> Result<StepWrite, BandError> {
         assert_eq!(
             frame.height(),
             self.extent,
             "the viewport's extent is fixed for the session: a resized frame is a new session, not a step"
         );
         if step == 0 {
-            return StepWrite::Skipped;
+            // A duplicate frame (§16.3): nothing is written and the position does not move. The
+            // budget is still enforced — this is the one path that can run with no write at all.
+            canvas.relieve(Some((self.position, self.extent as u64)))?;
+            return Ok(StepWrite::Skipped);
         }
         assert!(
             step.unsigned_abs() <= self.extent,
@@ -662,7 +1194,7 @@ impl ViewportState {
 
         let candidate = self.position + step as i64;
         let max_position = canvas.max_position(self.extent as u64);
-        if candidate < 0 {
+        let write = if candidate < 0 {
             let rows = (-candidate) as u64;
             let write = canvas.prepend_confirmed(frame, rows);
             self.position = 0;
@@ -681,14 +1213,17 @@ impl ViewportState {
             );
             self.position = candidate;
             StepWrite::Contained
-        }
+        };
+        canvas.relieve(Some((self.position, self.extent as u64)))?;
+        Ok(write)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Band, CoverageMap, RecoveredImage, StepTally, StepWrite, ViewportState, band_height,
+        BYTES_PER_PIXEL, Band, BandError, BandStore, CoverageMap, MemoryBudget, RecoveredImage,
+        SPILL_FILE_NAME, StepTally, StepWrite, ViewportState, band_height,
     };
     use crate::geometry::Rect;
     use crate::scroll::displacement::{
@@ -705,11 +1240,7 @@ mod tests {
     const BUDGET: u64 = 100_000;
 
     fn band(first_row: u64, rows: u64) -> Band {
-        Band {
-            first_row,
-            rows: vec![0u8; (CROSS * 4 * rows) as usize],
-            fnv: 0,
-        }
+        Band::new(first_row, vec![0u8; (CROSS * 4 * rows) as usize])
     }
 
     struct State {
@@ -721,10 +1252,10 @@ mod tests {
     /// A state that satisfies all eight invariants, so that every case below has exactly one thing
     /// wrong with it.
     fn valid() -> State {
-        let mut image = RecoveredImage::new(Axis::Vertical, CROSS, BUDGET);
+        let mut image = RecoveredImage::new(Axis::Vertical, CROSS, MemoryBudget::with_total(BUDGET));
         image.primary_len = ROWS;
         image.coverage.mark_range(0, ROWS);
-        image.bands.bands = vec![band(0, BAND_ROWS)];
+        image.bands.set_resident(vec![band(0, BAND_ROWS)]);
         State {
             image,
             viewport_cross: CROSS,
@@ -797,12 +1328,18 @@ mod tests {
 
         // 6 — bands do not overlap
         let mut state = valid();
-        state.image.bands.bands = vec![band(0, BAND_ROWS), band(5, BAND_ROWS)];
+        state
+            .image
+            .bands
+            .set_resident(vec![band(0, BAND_ROWS), band(5, BAND_ROWS)]);
         cases.push((6, check(&state)));
 
         // 7 — resident bytes stay inside the budget
         let mut state = valid();
-        state.image.bands.budget = (CROSS * 4 * BAND_ROWS) - 1;
+        state
+            .image
+            .bands
+            .set_budget(MemoryBudget::with_total((CROSS * 4 * BAND_ROWS) - 1));
         cases.push((7, check(&state)));
 
         // 8 — the canvas has exactly one user thread (§21.3, §22.5). This is the canvas-level form
@@ -880,13 +1417,13 @@ mod tests {
     #[test]
     fn only_the_new_rows_are_written() {
         let (first, second) = two_frames();
-        let mut canvas = RecoveredImage::new(Axis::Vertical, CROSS_PX as u64, VIEWPORT_BUDGET);
+        let mut canvas = RecoveredImage::new(Axis::Vertical, CROSS_PX as u64, MemoryBudget::with_total(VIEWPORT_BUDGET));
         canvas.start(&first);
 
         // The Skip path (§16.3's duplicate detection) writes nothing at all.
         assert_eq!(canvas.append_confirmed(&second, 0), StepWrite::Skipped);
         assert_eq!(canvas.primary_len(), VIEWPORT as u64);
-        assert_eq!(canvas.bands().bands().len(), 1);
+        assert_eq!(canvas.bands().bands().count(), 1);
 
         assert_eq!(
             canvas.append_confirmed(&second, STEP as u64),
@@ -906,13 +1443,13 @@ mod tests {
 
         // The rows above the step's reach are the first frame's, untouched.
         assert_eq!(
-            canvas.rows(0, STEP as u64),
+            canvas.rows(0, STEP as u64).expect("resident"),
             frame_rows(&first, 0, STEP as u32)
         );
         // The new rows are the *bottom* of the second frame: its viewport ends at the new content
         // end, so the content rows `[old_end, new_end)` are the frame's rows `[extent − step, extent)`.
         assert_eq!(
-            canvas.rows(VIEWPORT as u64, STEP as u64),
+            canvas.rows(VIEWPORT as u64, STEP as u64).expect("resident"),
             frame_rows(&second, VIEWPORT - STEP as u32, VIEWPORT)
         );
 
@@ -925,7 +1462,7 @@ mod tests {
             kept, overwritten,
             "the fixture produced identical bytes in the overlap, so this test cannot tell §17.3's rule from a row overwrite"
         );
-        assert_eq!(canvas.rows(STEP as u64, (VIEWPORT - STEP as u32) as u64), kept);
+        assert_eq!(canvas.rows(STEP as u64, (VIEWPORT - STEP as u32) as u64).expect("resident"), kept);
     }
 
     #[test]
@@ -1053,25 +1590,25 @@ mod tests {
             START,
             vec![StepSpec::move_by(300), StepSpec::move_by(-600)],
         );
-        let mut canvas = RecoveredImage::new(Axis::Vertical, CROSS_PX as u64, VIEWPORT_BUDGET);
+        let mut canvas = RecoveredImage::new(Axis::Vertical, CROSS_PX as u64, MemoryBudget::with_total(VIEWPORT_BUDGET));
         let mut viewport = ViewportState::new(VIEWPORT);
         canvas.start(&script.take(0));
         assert_eq!(viewport.position(), 0, "the first frame is the canvas' origin");
 
         let second = script.take(1);
         assert_eq!(
-            viewport.apply(&mut canvas, &second, 300),
+            viewport.apply(&mut canvas, &second, 300).expect("inside budget"),
             StepWrite::Appended {
                 first_row: VIEWPORT as u64,
                 rows: 300
             }
         );
         assert_eq!(canvas.primary_len(), 1200);
-        let before = canvas.rows(0, 1200);
+        let before = canvas.rows(0, 1200).expect("resident");
 
         let third = script.take(2);
         assert_eq!(
-            viewport.apply(&mut canvas, &third, -600),
+            viewport.apply(&mut canvas, &third, -600).expect("inside budget"),
             StepWrite::Prepended { rows: 300 }
         );
         assert_eq!(
@@ -1082,12 +1619,12 @@ mod tests {
         assert_eq!(viewport.position(), 0, "the viewport's top is the canvas' new top");
 
         // No duplicate: every row that used to be the canvas is still there, 300 rows further down.
-        assert_eq!(canvas.rows(300, 1200), before);
+        assert_eq!(canvas.rows(300, 1200).expect("resident"), before);
         // The new content is the frame's **first** 300 rows: the frame's viewport now starts at the
         // new top, so "above" is the front of the frame and not the back.
-        assert_eq!(canvas.rows(0, 300), frame_rows(&third, 0, 300));
+        assert_eq!(canvas.rows(0, 300).expect("resident"), frame_rows(&third, 0, 300));
         // And the canvas is the document, row for row: document rows 100..1600.
-        assert_eq!(canvas.rows(0, 1500), document_rows(&image, 100, 1600));
+        assert_eq!(canvas.rows(0, 1500).expect("resident"), document_rows(&image, 100, 1600));
         canvas.assert_invariants(
             CROSS_PX as u64,
             StepTally {
@@ -1106,19 +1643,19 @@ mod tests {
             VIEWPORT,
             vec![StepSpec::move_by(120), StepSpec::move_by(-40)],
         );
-        let mut canvas = RecoveredImage::new(Axis::Vertical, CROSS_PX as u64, VIEWPORT_BUDGET);
+        let mut canvas = RecoveredImage::new(Axis::Vertical, CROSS_PX as u64, MemoryBudget::with_total(VIEWPORT_BUDGET));
         let mut viewport = ViewportState::new(VIEWPORT);
         canvas.start(&script.take(0));
 
         let second = script.take(1);
         assert_eq!(
-            viewport.apply(&mut canvas, &second, 120),
+            viewport.apply(&mut canvas, &second, 120).expect("inside budget"),
             StepWrite::Appended {
                 first_row: VIEWPORT as u64,
                 rows: 120
             }
         );
-        let before = canvas.rows(0, 1020);
+        let before = canvas.rows(0, 1020).expect("resident");
 
         let third = script.take(2);
         assert_ne!(
@@ -1126,9 +1663,9 @@ mod tests {
             frame_rows(&second, 0, VIEWPORT),
             "the fixture did not move the frame, so Contained would be vacuous"
         );
-        assert_eq!(viewport.apply(&mut canvas, &third, -40), StepWrite::Contained);
+        assert_eq!(viewport.apply(&mut canvas, &third, -40).expect("inside budget"), StepWrite::Contained);
         assert_eq!(canvas.primary_len(), 1020, "a contained step writes nothing");
-        assert_eq!(canvas.rows(0, 1020), before);
+        assert_eq!(canvas.rows(0, 1020).expect("resident"), before);
         assert_eq!(viewport.position(), 80, "the viewport moved even though the canvas did not");
         canvas.assert_invariants(
             CROSS_PX as u64,
@@ -1148,7 +1685,7 @@ mod tests {
         let image = TestImage::from_structures(CROSS_PX, DOC, 11, 19, &mixed());
         let specs: Vec<StepSpec> = (0..STEPS).map(|_| StepSpec::move_by(STEP_PX as i32)).collect();
         let mut script = ScrollScript::new(&image, VIEWPORT, specs);
-        let mut canvas = RecoveredImage::new(Axis::Vertical, CROSS_PX as u64, VIEWPORT_BUDGET);
+        let mut canvas = RecoveredImage::new(Axis::Vertical, CROSS_PX as u64, MemoryBudget::with_total(VIEWPORT_BUDGET));
         canvas.start(&script.take(0));
         let mut viewport = ViewportState::new(VIEWPORT);
         let mut expected = STEP_PX as i32;
@@ -1160,7 +1697,7 @@ mod tests {
             // whole point of the test: if the composition ever wrote the wrong rows, the next step's
             // estimate would be made against them and the error would compound.
             let reference = Observation::new(
-                canvas.rows(position, VIEWPORT as u64),
+                canvas.rows(position, VIEWPORT as u64).expect("resident"),
                 Rect::new(0, 0, CROSS_PX as i32, VIEWPORT as i32),
                 k as i64,
                 (CROSS_PX, VIEWPORT),
@@ -1181,7 +1718,7 @@ mod tests {
                 "step {k}: the estimator did not recover the scripted step"
             );
             assert_eq!(
-                viewport.apply(&mut canvas, &current, d),
+                viewport.apply(&mut canvas, &current, d).expect("inside budget"),
                 StepWrite::Appended {
                     first_row: VIEWPORT as u64 + (k as u64 - 1) * STEP_PX as u64,
                     rows: STEP_PX as u64,
@@ -1195,9 +1732,316 @@ mod tests {
             VIEWPORT as u64 + STEPS as u64 * STEP_PX as u64
         );
         assert_eq!(
-            canvas.rows(0, canvas.primary_len()),
+            canvas.rows(0, canvas.primary_len()).expect("resident"),
             document_rows(&image, 0, DOC),
             "the recovered image drifted away from the document"
+        );
+        canvas.assert_invariants(
+            CROSS_PX as u64,
+            StepTally {
+                step: STEPS as u64,
+                committed: STEPS as u64,
+                discarded: 0,
+            },
+        );
+    }
+
+    // --- bounded residency: LRU, spill file, checksum (§17.5, §22.3; task P1.20) ---
+
+    const SPILL_CROSS: u64 = 64;
+    const SPILL_ROWS_PER_BAND: u64 = 100;
+
+    fn one_band_bytes() -> u64 {
+        SPILL_CROSS * SPILL_ROWS_PER_BAND * BYTES_PER_PIXEL
+    }
+
+    /// A band's worth of deterministic bytes: every row is a function of its content row, so a spill
+    /// or reload that loses, reorders or truncates a row is visible byte-for-byte.
+    fn band_bytes(cross_len: u64, first_row: u64, rows: u64) -> Vec<u8> {
+        let mut out = Vec::with_capacity((cross_len * rows * BYTES_PER_PIXEL) as usize);
+        for row in 0..rows {
+            let y = first_row + row;
+            for x in 0..cross_len {
+                out.push((y * 31 + x * 7) as u8);
+                out.push((y / 3 + x) as u8);
+                out.push((x * 13 + y * 5) as u8);
+                out.push(0xFF);
+            }
+        }
+        out
+    }
+
+    /// A directory no other test shares. `BandStore::in_dir` removes it again when the store drops,
+    /// so a failing test does not leave anything behind either.
+    fn spill_dir(name: &str) -> std::path::PathBuf {
+        let token = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "snapclip-bands-{name}-{}-{token}",
+            std::process::id()
+        ))
+    }
+
+    fn store_in(dir: &std::path::Path, total: u64) -> BandStore {
+        BandStore::in_dir(SPILL_CROSS, MemoryBudget::with_total(total), dir.to_path_buf())
+    }
+
+    /// The row band §17.5 calls "one band": the store's budget is expressed in resident bytes, and
+    /// one band of this canvas is what the tests below give it.
+    fn spill_band(first_row: u64, rows: u64) -> Band {
+        Band::new(first_row, band_bytes(SPILL_CROSS, first_row, rows))
+    }
+
+    #[test]
+    fn a_one_band_budget_still_produces_a_correct_canvas() {
+        const BANDS: u64 = 10;
+        let dir = spill_dir("one-band");
+        // One band of headroom and nothing protected: the store has to spill almost everything it
+        // is given and still answer every read correctly. That is §30.4's "the peak does not grow
+        // with the length; after recovery it is byte-exact".
+        let mut store = store_in(&dir, one_band_bytes());
+        let mut peak = 0;
+        for index in 0..BANDS {
+            let first_row = index * SPILL_ROWS_PER_BAND;
+            store.insert(spill_band(first_row, SPILL_ROWS_PER_BAND));
+            store
+                .relieve(&[])
+                .expect("with nothing protected the budget is always reachable");
+            peak = peak.max(store.resident_bytes());
+        }
+        assert!(
+            peak <= one_band_bytes(),
+            "resident bytes peaked at {peak}, over the one-band budget of {}",
+            one_band_bytes()
+        );
+        assert!(
+            store.spilled().len() as u64 >= BANDS - 1,
+            "a one-band budget with {BANDS} bands must spill at least {} of them, spilled {}",
+            BANDS - 1,
+            store.spilled().len()
+        );
+        let all = store
+            .read_rows(0, BANDS * SPILL_ROWS_PER_BAND)
+            .expect("every spilled band comes back");
+        assert_eq!(
+            all,
+            band_bytes(SPILL_CROSS, 0, BANDS * SPILL_ROWS_PER_BAND),
+            "the canvas read back differently from what was written"
+        );
+        // Reading does **not** pull a band back into memory. If it did, one full pass over the image
+        // (an export, a preview refresh) would make the whole canvas resident again and the bound
+        // would be a function of how the image is read instead of how long it is.
+        assert_eq!(
+            store.spilled().len() as u64,
+            BANDS - 1,
+            "reading the canvas changed what is resident"
+        );
+        assert!(store.resident_bytes() <= one_band_bytes());
+    }
+
+    #[test]
+    fn the_reference_band_and_the_last_two_confirmed_bands_are_never_evicted() {
+        let dir = spill_dir("protected");
+        // Four bands, three protected: the budget holds three, so exactly one has to go to disk.
+        let mut store = store_in(&dir, 3 * one_band_bytes());
+        for index in 0..4u64 {
+            store.insert(spill_band(index * SPILL_ROWS_PER_BAND, SPILL_ROWS_PER_BAND));
+        }
+        let protected = [0, 2 * SPILL_ROWS_PER_BAND, 3 * SPILL_ROWS_PER_BAND];
+        store
+            .relieve(&protected)
+            .expect("the protected set fits, so the budget is reachable");
+        for first_row in protected {
+            assert!(
+                store.is_resident(first_row),
+                "band {first_row} was evicted although it is the reference or one of the last two"
+            );
+        }
+        assert!(
+            !store.is_resident(SPILL_ROWS_PER_BAND),
+            "the one unprotected band should be the one that went to disk"
+        );
+        assert_eq!(store.spilled().len(), 1);
+
+        // The protected set alone over budget is §22.3's third step: the viewport is too big for the
+        // budget, which is a `MemoryLimit` and not a silent overrun.
+        let tiny_dir = spill_dir("protected-too-small");
+        let mut tiny = store_in(&tiny_dir, one_band_bytes());
+        tiny.insert(spill_band(0, SPILL_ROWS_PER_BAND));
+        tiny.insert(spill_band(SPILL_ROWS_PER_BAND, SPILL_ROWS_PER_BAND));
+        assert_eq!(
+            tiny.relieve(&[0, SPILL_ROWS_PER_BAND]),
+            Err(BandError::MemoryLimit {
+                budget: one_band_bytes(),
+                protected: 2 * one_band_bytes(),
+            }),
+            "a budget that cannot hold the protected bands must say so"
+        );
+    }
+
+    #[test]
+    fn a_corrupted_spill_file_is_detected() {
+        let dir = spill_dir("corrupt");
+        let mut store = store_in(&dir, one_band_bytes());
+        store.insert(spill_band(0, SPILL_ROWS_PER_BAND));
+        store.insert(spill_band(SPILL_ROWS_PER_BAND, SPILL_ROWS_PER_BAND));
+        store
+            .relieve(&[SPILL_ROWS_PER_BAND])
+            .expect("the second band is protected, so the first one spills");
+        assert_eq!(store.spilled().len(), 1, "band 0 should be on disk");
+
+        let offset = store
+            .spilled()
+            .get(&0)
+            .expect("band 0 is the one that spilled")
+            .offset;
+        {
+            use std::io::{Read, Seek, SeekFrom, Write};
+            let path = dir.join(SPILL_FILE_NAME);
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .expect("the spill file exists");
+            let mut byte = [0u8; 1];
+            file.seek(SeekFrom::Start(offset)).expect("seek into the spill");
+            file.read_exact(&mut byte).expect("read the byte to flip");
+            file.seek(SeekFrom::Start(offset)).expect("seek back");
+            file.write_all(&[byte[0] ^ 0xFF]).expect("flip one byte");
+        }
+
+        let error = store
+            .read_rows(0, SPILL_ROWS_PER_BAND)
+            .expect_err("a band whose bytes changed on disk must not be handed back");
+        assert_eq!(
+            error,
+            BandError::CorruptBand {
+                first_row: 0,
+                expected: store
+                    .spilled()
+                    .get(&0)
+                    .expect("the entry stays in the map")
+                    .fnv,
+                found: error_checksum(&error),
+            },
+            "the error has to name the band and both checksums"
+        );
+
+        // G12: the failure is visible, and the canvas is **not** cleared — the resident band still
+        // reads back, so a session that stops here can still export what it has.
+        assert_eq!(store.spilled().len(), 1, "a corrupt band is not silently dropped");
+        assert_eq!(
+            store
+                .read_rows(SPILL_ROWS_PER_BAND, SPILL_ROWS_PER_BAND)
+                .expect("the resident band is untouched"),
+            band_bytes(SPILL_CROSS, SPILL_ROWS_PER_BAND, SPILL_ROWS_PER_BAND)
+        );
+    }
+
+    /// The checksum a `CorruptBand` reports as `found`, read back out of the error itself. It is a
+    /// helper so the test can assert "the error carries *some* other checksum" without the test
+    /// having to recompute the corrupted bytes.
+    fn error_checksum(error: &BandError) -> u64 {
+        match error {
+            BandError::CorruptBand { found, .. } => *found,
+            other => panic!("expected a CorruptBand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_memory_budget_field_is_read() {
+        let mut budget = MemoryBudget::with_total(1_000);
+        assert_eq!(budget.total(), 1_000);
+        assert_eq!(budget.resident_canvas(), 0);
+        assert_eq!(budget.resident_preview(), 0);
+        assert!(!budget.over_budget(), "an empty budget is not over itself");
+        budget.set_canvas(1_000);
+        assert!(!budget.over_budget(), "exactly at the budget is still inside it");
+        assert_eq!(budget.headroom(), 0);
+        budget.set_canvas(1_001);
+        assert!(budget.over_budget(), "`total` and `resident_canvas` are both read");
+        budget.set_canvas(0);
+        assert!(!budget.over_budget());
+        budget.set_preview(1_001);
+        assert!(budget.over_budget(), "`resident_preview` is read too");
+        budget.set_preview(0);
+        assert_eq!(budget.used(), 0);
+
+        // §22.3's default: 8 viewports of BGRA, because ①–⑤ come to ≈3.1 and the rest is headroom.
+        assert_eq!(MemoryBudget::VIEWPORTS, 8);
+        assert_eq!(
+            MemoryBudget::for_viewport(100, 50).total(),
+            100 * 50 * BYTES_PER_PIXEL * 8
+        );
+    }
+
+    #[test]
+    fn a_spilling_canvas_survives_a_long_session() {
+        // The wiring test: a canvas whose budget cannot hold the whole session still reads back
+        // byte-exact, because the reference viewport and the last two writes stay resident (§17.5)
+        // and everything else goes to the spill file and comes back verified.
+        const STEPS: u32 = 40;
+        const STEP_PX: u32 = 37;
+        const VIEWPORT: u32 = 300;
+        const DOC: u32 = STEPS * STEP_PX + VIEWPORT;
+        let image = TestImage::from_structures(CROSS_PX, DOC, 11, 19, &mixed());
+        let mut script = ScrollScript::new(
+            &image,
+            VIEWPORT,
+            (0..STEPS).map(|_| StepSpec::move_by(STEP_PX as i32)).collect(),
+        );
+        let dir = spill_dir("long-session");
+        let budget = MemoryBudget::with_total(CROSS_PX as u64 * 600 * BYTES_PER_PIXEL);
+        let mut canvas = RecoveredImage::in_dir(
+            Axis::Vertical,
+            CROSS_PX as u64,
+            budget,
+            dir.clone(),
+        );
+        let mut viewport = ViewportState::new(VIEWPORT);
+        canvas.start(&script.take(0));
+
+        for k in 1..=STEPS {
+            let previous = canvas
+                .rows(viewport.position() as u64, VIEWPORT as u64)
+                .expect("the reference viewport materializes");
+            let current = script.take(k as usize);
+            let reference = Observation::new(
+                previous,
+                Rect::new(0, 0, CROSS_PX as i32, VIEWPORT as i32),
+                k as i64,
+                (CROSS_PX, VIEWPORT),
+                Axis::Vertical,
+            )
+            .expect("the reference viewport is packed and matches its region");
+            let d = estimate_once(&reference, &current, STEP_PX as i32)
+                .unwrap_or_else(|| panic!("step {k}: the estimator had no answer"));
+            assert_eq!(d, STEP_PX as i32, "step {k}: the estimator did not recover the step");
+            viewport
+                .apply(&mut canvas, &current, d)
+                .expect("the budget stays reachable: the reference and the last two stay resident");
+            assert!(
+                canvas.bands().resident_bytes() <= budget.total(),
+                "step {k}: {} resident bytes over a budget of {}",
+                canvas.bands().resident_bytes(),
+                budget.total()
+            );
+        }
+
+        assert!(
+            canvas.bands().spilled().len() > 0,
+            "a {}-row budget over {} rows never spilled, so this test proves nothing about spilling",
+            budget.total() / (CROSS_PX as u64 * BYTES_PER_PIXEL),
+            canvas.primary_len()
+        );
+        assert_eq!(
+            canvas
+                .rows(0, canvas.primary_len())
+                .expect("the whole canvas comes back"),
+            document_rows(&image, 0, DOC),
+            "the spilled canvas drifted away from the document"
         );
         canvas.assert_invariants(
             CROSS_PX as u64,
