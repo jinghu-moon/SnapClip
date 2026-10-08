@@ -30,6 +30,8 @@ pub(crate) mod canvas;
 
 pub(crate) mod displacement;
 
+pub(crate) mod loop_control;
+
 pub(crate) mod observation;
 
 pub(crate) mod orb;

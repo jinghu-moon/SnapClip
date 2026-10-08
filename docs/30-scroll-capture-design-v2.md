@@ -4331,6 +4331,34 @@ pub(crate) fn choose(probe: &TargetProbe) -> Choice;
 - 若两条路径各自连续 3 步都无效，则 `StopReason::ActuatorFailed`。
 - **依据**：§6 已确证的 `wheel_dispatch.status` 语义里 `0 = post 成功`**明确不证明目标已处理**；Snow Shot 的 `SCROLLING_DIAGNOSTICS.md` 反复标注"这条证据不证明什么"（§6）。V2 把"不证明"变成"用下一步的内容位移来证明"。
 
+#### 24.7.1 落地的形状（`P3.03`，2026-10-09）
+
+```rust
+pub(crate) const POSTED_STEPS_BEFORE_SWITCH: u32 = 3;
+pub(crate) const MAX_SWITCHES: u32 = 2;
+
+pub(crate) enum StepOutcome<Path> { Moved, Unmoved(Path) }
+pub(crate) enum WatchVerdict<Path> { Continue, Switched { from: Path, to: Path }, Failed }
+
+pub(crate) struct ActuatorWatch<Path> { current: Path, streak: u32, switches: u32 }
+
+impl<Path: Copy + PartialEq> ActuatorWatch<Path> {
+    pub(crate) fn observe<F>(&mut self, outcome: StepOutcome<Path>, next: F) -> WatchVerdict<Path>
+    where F: FnOnce(Path) -> Option<Path>;
+}
+```
+
+**四处落地裁决**：
+
+1. **看门狗是泛型的、不认识 `InjectPath`**。§28.4 的门禁禁止 `scroll/` 下出现平台引用，而 §24.7 要求"切换时重新跑 `choose()`"——`choose()` 住在 `windows/scroll_actuator.rs`，因为它调 `SendInput`。解法不是把 `choose()` 搬下来（那会把 `SendInput` 带进 `scroll/`），而是**把"下一个传输是谁"变成调用方给的闭包**：看门狗决定"现在这个不行了"，调用方回答"那就试试这个"。于是 §24.7 的那句话落在 `P3.04`/`P3.09` 的组装里，平台知识留在平台的边界一侧，而本模块**可以没有桌面就跑**。
+2. **看门狗不假设只有两个传输**。`next` 返回 `None`、返回当前传输、或切换预算（`MAX_SWITCHES = 2`）用尽，三者对它含义相同：无处可去。写死"两条"会把 `§24.6.1` 已实测的第三条通道（键盘 `VK_DOWN`，Chromium 上 320 px）挡在门外；完全不设上限则让"调用方在两个传输间来回换"变成无限振荡——**一次振荡的会话比一次停下来并说明白的会话更糟**（`G12`）。上限取 2 = 三个传输，与实测一致。
+3. **`Unmoved` 的载荷是权威的**。看门狗把 `current` 更新为 `Unmoved(path)` 里的 `path`，而不是相信自己记着的那个：一个经由**过期传输**注入的步必须记在**那个**传输头上。这正是"切换发生在半途"时容易出错的地方。
+4. **`InjectPathSwitched` 不由本模块产生**。`§26.3` 的 `ScrollDiagnostic` 是会话层类型；本模块返回 `Switched { from, to }`，由调用方落成诊断。这保持了"`scroll/` 不认识诊断类型"与"看门狗可以单独测"两件事。
+
+**`POSTED_STEPS_BEFORE_SWITCH = 3` 的依据**（REFACTOR 义务要求的具名常量）：`Posted` 是**弱**证据——消息入了队、事件进了系统队列。单个无效步有好几种与"传输错了"无关的正当解释（帧在注入落定前就到了、页面原地重排、估计器因为别的原因拒绝了这一步）。**在第一个无效步上就切换会让传输来回振荡，并把一个匹配问题变成一个注入问题。** 该值是**启动值不是标定值**：`E-CTRL-1`（`P3.07`）负责标定，`§30.2` 的"注入失败后切路径"行就是按它写的。
+
+**`d == 0` 算不算无效**：算（`Unmoved` 覆盖 §24.7 条件的两个半边：位移不是 `Confirmed`，以及 `Confirmed` 但 `d == 0`）。**但"到达底部"必须先于看门狗被判定**——§20.4 的收敛表把"内容不再变化"归 `EndReached` 而不是 `ActuatorFailed`。一个只是滚到底的页面若被喂给看门狗，会在 2×3 步之后被报成执行器故障。判定"到底"需要滚动位置通道，属 `P3.04`；本模块的 doc 写明了这条顺序，并且 `Moved` 会**清零**计数（所以任何被调用方判为"有进展"的步都不会触发切换）。
+
 ### 24.8 本节如何验证
 
 | 目标 | 方法 | 判据 |
@@ -4896,8 +4924,8 @@ fn rows_match(actual, expected, sigma) -> bool
 | Chromium 子窗口下沉 | Chrome 页面 | 生效（`E-INJECT-1`） | L3 | — |
 | UIPI 目标 | 提权记事本 | 选 `PostMessageW`；生效 | L3 | — |
 | 条件选择 | 前台/非前台 × 提权/非提权 4 组 | 与 §24.6 一致 | L2 | **已可执行（`P3.02`）**：`the_four_combinations_match_the_table` + `a_non_foreground_target_never_uses_send_input`（16 组全扫）+ `the_transport_is_decided_not_retried` + `the_aim_follows_the_routing_setting`，见 §24.6.4 |
-| 注入失败后切路径 | mock 连续 3 次 `Posted` 但 `d==0` | 切换路径 + `InjectPathSwitched` | L2 | — |
-| 两条路径都失败 | mock 双方各 3 次无效 | `ActuatorFailed` + `Partial` | L2 | — |
+| 注入失败后切路径 | mock 连续 3 次 `Posted` 但 `d==0` | 切换路径 + `InjectPathSwitched` | L2 | **已可执行（`P3.03`）**：`three_posted_steps_without_a_confirmed_step_switch_the_path` + `a_moved_step_resets_the_streak` + `the_watchdog_does_not_assume_there_are_exactly_two_transports`，见 §24.7.1 |
+| 两条路径都失败 | mock 双方各 3 次无效 | `ActuatorFailed` + `Partial` | L2 | **已可执行（`P3.03`）**：`both_paths_failing_three_times_ends_the_session`（`WatchVerdict::Failed`；`StopReason::ActuatorFailed` 与 `Partial` 的映射属会话层 `P3.04`/`P3.09`），见 §24.7.1 |
 | 平滑滚动等待 | 内容持续移动 3 帧 | 等到静止才估计 | L2 | Scroll Response |
 | 取消延迟 | 注入后最坏时刻取消 | `Phase == Stopped` | L1 | **Cancel latency（Max）** |
 | 停止延迟 | 停止 | 导出任务已提交 | L1 | **Stop latency** |
