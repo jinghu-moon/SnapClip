@@ -1,0 +1,14 @@
+#!/bin/sh
+# SnapClip: push-level gate. See docs/31-scroll-capture-tdd-tasklist.md §4.1/§4.3
+set -e
+
+echo "[pre-push] cargo check --workspace --all-targets"
+cargo check --workspace --all-targets
+
+echo "[pre-push] cargo test --workspace --lib"
+cargo test --workspace --lib
+
+echo "[pre-push] dependency direction"
+powershell -NoProfile -File tools/check-dependency-direction.ps1
+
+echo "[pre-push] OK"

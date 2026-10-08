@@ -499,7 +499,23 @@ echo "[pre-push] OK"
 git config core.hooksPath .githooks
 ```
 
+**换行符必须在 `.gitattributes` 里固定，不能只靠断言**（`P0.08` 实测得到的环境事实）：本仓库 `git config --get core.autocrlf` = **`true`**，所以钩子即使今天写成 LF，下一次 `git checkout`/`git switch` 也会把它变成 CRLF，`sh` 会报 `bad interpreter` 而**静默地不执行门禁**（钩子不执行时 `git push` 照常成功，这正是"不可见 == 不存在"的最坏形态）。因此 `.gitattributes`（本仓库先前没有这个文件）必须有：
+
+```gitattributes
+/.githooks/* text eol=lf
+```
+
 **验证生效**（P0.08 的退出条件，**必须真的做一次**）：故意让一个测试失败，`git push` 必须**被拒绝**；恢复后 `git push` 通过。**只配置不验证等于没有配置**（与 D-14 的教训同源：不可见 == 不存在）。
+
+**实测证据（2026-10-08，`P0.08`，三次真实 `git push`）**：
+
+| # | 工作区状态 | 钩子行为 | 结果 |
+|---|---|---|---|
+| 1 | `core.hooksPath` unset（钩子未挂载） | 无钩子运行 | `scripts/verify-hooks.ps1` → exit 1：`the push gate is not in place: - core.hooksPath is unset, so git runs no hook at all` |
+| 2 | 挂载后，工作区**故意**有一个红测试 | 运行，`cargo test --workspace --lib` 失败 | **`git push` 被拒**（exit 1）：`test result: FAILED. 349 passed; 1 failed; 7 ignored` → `error: failed to push some refs` |
+| 3 | 恢复后（工作区干净） | 运行，三条门禁全过 | **`git push` 通过**（exit 0）：`[pre-push] OK` → `a817804..d14d421 main -> main` |
+
+**钩子的已知口径**（实测得出，不是理论担忧）：`pre-push` 测的是**工作区**（它跑 `cargo test --workspace --lib`，即磁盘上的代码），不是"被推送的那几个提交"。因此"**先提交、确认工作区干净、再推送**"仍是人工纪律；钩子只能保证"推送时磁盘上的代码是绿的"。这作为风险 **R-17** 记录。
 
 ### 4.4 门禁分层总结
 
@@ -778,6 +794,13 @@ git config core.hooksPath .githooks
 | 提交信息标题 | `[P0-08] the push gate is a hook, not a habit` |
 | 复杂度 / 阻塞 | S / 无 |
 | **风险** | Windows 上钩子脚本的换行符（CRLF）会让 `sh` 报 `bad interpreter`。缓解：钩子文件**必须以 LF 结尾**，并在 `verify-hooks.ps1` 里断言其不含 `\r\n` |
+| **状态** | **[x] 已完成**（2026-10-08）：`.githooks/pre-push`（已实测 **0 CR / 14 LF**）+ `.gitattributes`（`/.githooks/* text eol=lf`，见下方偏离 2）+ `scripts/verify-hooks.ps1` 已落盘并挂载（`core.hooksPath = .githooks`）；§4.3 的三次真实 `git push` 证据（未挂载 → 被拒 → 通过）已回填。**两处偏离**见引用块 |
+
+> **偏离 1（顺序）**：本文原写"P0.08 必须在第一次推送**之前**完成，否则前几个批次的门禁只能靠人"。实际执行顺序是 `93d46e5 → a817804 → d14d421`，而钩子在 `d14d421` 的推送**之前**才挂载 —— 也就是 `a817804` 那次推送（以及 `93d46e5`）是**人工跑完全部三条门禁**后推送的，没有钩子兜底。这不改变"门禁被执行过"的事实（每次推送前都跑了 `check` / `test --lib` / 依赖门禁，数字记在提交信息里），但**确实违反了自己写下的顺序**，故按 §2.6 记账而不是悄悄改掉这句话。
+>
+> **偏离 2（根因修正）**：风险行原本只要求"钩子必须以 LF 结尾 + 断言不含 `\r\n`"。实测发现 `core.autocrlf = true`，所以**只断言不足以保护**：文件在磁盘上可以是 LF，而下一次 checkout 之后就不是了，届时钩子静默失效。因此真正修在根因上 = 新增 `.gitattributes` 固定 `eol=lf`（本仓库此前没有 `.gitattributes`），`verify-hooks.ps1` 的断言降级为第二道防线。
+>
+> **顺带修掉的一个仓库缺陷**：`scripts/` 目录此前整个未入库，而 `package.json` 的 `"ocr:serve"` 指向 `scripts/ocr-serve.ps1` —— 干净 clone 跑不了这个 npm script。P0.08 必须新增 `scripts/verify-hooks.ps1`，于是把 `scripts/ocr-serve.ps1` 一并纳入版本控制（同一个提交，因为它与本次改动同因：`scripts/` 要成为被跟踪的目录），并在 `.gitignore` 里忽略它的运行时日志 `scripts/*.log`（`serve-err.log` / `serve-out.log`）。
 
 **P0 退出条件（阶段级）**：① 七个实验（P0.01–P0.07、P0.09）都有产物，**未取得的项目逐条列明原因**；② `docs/30 §23.3` 中标"待测"的格子被替换为数字或"未取得"；③ `scroll-p0` 标签已打且 `git push origin main --tags` 成功；④ §3.6 的回滚演练做过一次。
 
@@ -1672,6 +1695,7 @@ git config core.hooksPath .githooks
 | R-14 | **整 crate `cargo fmt` 造成无关重排** | 已发生 | 中 | 本文 §2.1：**禁止整 crate fmt**，只格式化自己改动的区域；`C11` 规则 | 全局 |
 | R-15 | **任务清单本身变成愿望清单** | 中 | 中 | §13 的逐行映射 + `P6.02` 的元测试"缺一行就红" | `P6.02` |
 | R-16 | **L3 门禁并行跑会假红**（7 个真实桌面用例抢前台，`scroll_probe.rs:404` 的前台断言先失败） | 已发生（2026-10-08） | 中（会把串行才能过的门禁误判为代码问题） | §4.2 的命令固定加 `--test-threads=1`；后续新增 L3 用例时**不要**用"抢前台"作为前置，改用 `PostMessageW` 或把自己的窗口设为前台后立即测量 | `P0.05`/`P0.09`/所有 L3 任务 |
+| R-17 | **`pre-push` 钩子测的是工作区，不是被推送的提交**（实测：钩子跑 `cargo test --workspace --lib`，读的是磁盘代码） | 已确认（2026-10-08，`P0.08`） | 低到中（"提交里有一个红提交、但工作区是绿的"这种情况钩子抓不到；只靠 `git bisect` 事后发现） | 人工纪律 = **先提交 → `git status` 干净 → 再推送**；阶段级门禁（§4.2）在标签前对**已提交状态**再跑一次 | 所有推送；`P6.02` 的统计脚本（它统计的是磁盘状态，与钩子口径一致） |
 
 ### 14.4 失败处置与回滚
 
@@ -1708,6 +1732,16 @@ git config core.hooksPath .githooks
 | `crates/snapclip-capture/src/windows/scroll_actuator.rs` | `P3.01` | 两条注入路径 + 子窗口下沉 |
 
 > **注**：上表 13 行中 `scroll/` 占 11 个文件。**V2 §28.2 已按 DEV-1 回填为"10 个生产文件 + 1 个 test-only 文件（`testkit.rs`）"**，`§33.3` 的文件清单同步由 9 补为 11（原清单漏列了 `orb.rs`）。`P6.08` 只做**校验**，不再需要新增内容。
+
+**仓库级门禁工件的文件（`P0.08` 新建，不属于滚动功能本身）**
+
+| 文件 | 内容 |
+|---|---|
+| `.gitattributes` | **新建**。`/.githooks/* text eol=lf` —— 钩子的 LF 必须在版本控制里固定，否则 `core.autocrlf = true` 会让它在下次 checkout 后静默失效（§4.3，偏离 2） |
+| `.githooks/pre-push` | **新建**。推送级门禁全文（§4.3） |
+| `scripts/verify-hooks.ps1` | **新建**。"钩子存在且已挂载"的断言（RED 装置 + 第二道防线） |
+| `scripts/ocr-serve.ps1` | **此前未跟踪，`P0.08` 纳入版本控制**。`package.json` 的 `"ocr:serve"` 指向它，干净 clone 必须能跑（顺带修掉的仓库缺陷） |
+| `.gitignore` | **修改**。新增 `scripts/*.log`（`ocr-serve.ps1` 的运行时日志） |
 
 **修改（不新增文件，全部在既有文件内）**
 

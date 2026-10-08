@@ -1,0 +1,5 @@
+# The push gate is a POSIX shell script. A CRLF checkout makes `sh` fail with
+# "bad interpreter", and `core.autocrlf` is `true` in this repository, so the line
+# ending has to be pinned here rather than only asserted by scripts/verify-hooks.ps1.
+# See docs/31-scroll-capture-tdd-tasklist.md §4.3.
+/.githooks/* text eol=lf

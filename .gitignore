@@ -58,3 +58,7 @@ subfont/drawn-text.txt
 
 # Python bytecode from the subfont tooling
 subfont/__pycache__/
+
+# Output logs of scripts/ocr-serve.ps1. The script itself is tracked: package.json's
+# `ocr:serve` calls it, so a fresh clone has to have it (see docs/31 P0.08).
+scripts/*.log
