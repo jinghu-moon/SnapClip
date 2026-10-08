@@ -1909,16 +1909,295 @@ impl SceneCut {
 
 /// The two responses §16.8 allows to a scene cut. There is no third.
 ///
-/// `DecayModel` is a request, not a number: §16.8's `decay_toward_neutral(0.05)` and the model reset
-/// are the tile model's own business (§18.2), because the rate is a property of how much a tile's
-/// history is trusted — this module does not own the model and so does not own its decay constant.
-/// What this module owns is the *decision to decay*, which is what the streak is for.
+/// `DecayModel` is a request, not a number: §16.8's `decay_toward_neutral(0.05)` is the tile model's
+/// own business ([`RegionModel`], §18.2), because the rate is a property of how much a tile's
+/// history is trusted — this type only carries the *decision to decay*, which is what the streak is
+/// for. (Before `P1.16` the model lived outside this module and the constant with it; the split that
+/// survives is the one that matters: the streak decides, the model applies.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SceneCutAction {
     /// The frame was not used and the session carries on as if it had not happened (1–2 in a row).
     Tolerate,
     /// Three in a row: the tiles we are matching against describe a page that is gone.
     DecayModel,
+}
+
+// --- region model (§18.2, §16.7): what each tile *is*, learned across steps ----------------------
+
+/// The tile §18.2's time model works on.
+///
+/// Deliberately **not** [`TILE_ROWS`]. That one is the unit of *matching evidence* — §16.4 counts
+/// supporting tiles with it — and this one is the unit of *temporal evidence*: which rows are page,
+/// which are pinned to the viewport, which change on their own. Both are 32 px today, which is
+/// exactly why they must not share a name (`docs/30` §15.4.3 decision 4): a later change to one grid
+/// must not silently move the other.
+pub(crate) const REGION_TILE_ROWS: u32 = 32;
+
+/// Below this normalised standard deviation a tile has nothing to compare (§18.2's `texture < 0.05`).
+///
+/// The reason is the opposite of [`tile_carries_evidence`]'s: that one asks "did this tile fail to
+/// align" (either side with structure is enough to answer), while this one asks "can these two
+/// correlations be read as one of three classes at all" — and when one side is flat, `band_zncc`
+/// answers 0 for both, which is not a weak classification but a meaningless one.
+pub(crate) const REGION_TEXTURE_MIN: f32 = 0.05;
+
+/// §16.7's "ambiguity is not evidence": when both comparisons match, the tile is periodic at this
+/// step — or genuinely the same content twice — and neither class is supported.
+pub(crate) const REGION_AMBIGUITY_PRODUCT: f32 = 0.5;
+
+/// A uniform prior over the three classes: what a tile is before anything has been observed.
+pub(crate) const REGION_NEUTRAL: f32 = 1.0 / 3.0;
+
+/// How much better than neutral `scrolling` is, in §16.7's `learned` expression. The two negative
+/// terms are fixed at 1.0: a `fixed` or `dynamic` tile is simply not scrolling.
+pub(crate) const REGION_SCROLLING_GAIN: f32 = 1.5;
+
+/// §16.7's ramp: after this many observations a tile's weight is fully learned.
+pub(crate) const REGION_INFLUENCE_OBSERVATIONS: f32 = 3.0;
+
+/// §16.7's clamp. `MIN` is the floor that keeps §18.2's "down-weight, never exclude" promise: a
+/// `dynamic` tile still covers its rows, so a page that is half animation can still finish.
+pub(crate) const REGION_WEIGHT_MIN: f32 = 0.1;
+pub(crate) const REGION_WEIGHT_MAX: f32 = 2.0;
+
+/// How much of a new observation replaces the running estimate — §16.7's exponential moving average.
+/// A startup value: it is what the number was in the reference implementation, and `E-DYN-1` /
+/// `E-ACC-1` own any change to it.
+pub(crate) const REGION_LEARNING_RATE: f32 = 0.3;
+
+/// §16.8's `decay_toward_neutral(0.05)`: how far a tile falls back toward the uniform prior per
+/// scene cut. Slow on purpose — one changed page is not evidence about the next one.
+pub(crate) const REGION_DECAY: f32 = 0.05;
+
+/// What one tile's two comparisons said, before anything is concluded from it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct RegionEvidence {
+    /// §16.7's `direct`: the correlation at zero shift, i.e. "the same pixels are still here".
+    pub(crate) direct: f32,
+    /// §16.7's `compensated`: the correlation at the step the funnel committed to, i.e. "these are
+    /// the pixels that moved".
+    pub(crate) compensated: f32,
+    /// The smaller of the two sides' normalised standard deviations, in `[0, 0.5]`.
+    ///
+    /// `min` and not `max`, and this is the whole reason the field exists: one flat side makes both
+    /// correlations 0, and a class read off that 0 would call a flat region `dynamic`.
+    pub(crate) texture: f32,
+}
+
+/// §18.2's three classes, as the argmax of a tile's running estimate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RegionClass {
+    /// The content moves with the page: the strongest evidence, and the only class that is
+    /// up-weighted.
+    Scrolling,
+    /// Pinned to the viewport: a fixed header or footer, a sticky bar, the scrollbar track.
+    Fixed,
+    /// Changes on its own: video, animation, a lazy-loaded image arriving, a blinking caret.
+    Dynamic,
+}
+
+/// One tile's running estimate. Private: the numbers are only meaningful through [`RegionModel`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RegionTile {
+    scrolling: f32,
+    fixed: f32,
+    dynamic: f32,
+    observations: u32,
+}
+
+impl RegionTile {
+    const fn neutral() -> Self {
+        Self {
+            scrolling: REGION_NEUTRAL,
+            fixed: REGION_NEUTRAL,
+            dynamic: REGION_NEUTRAL,
+            observations: 0,
+        }
+    }
+}
+
+/// §18.2's tile model: what each tile of the match band *is*, learned across steps.
+///
+/// The three likelihoods are the reference implementation's (`region.rs:797-833`):
+/// `fixed = direct·(1 − compensated)`, `scrolling = compensated·(1 − direct)`,
+/// `dynamic = (1 − direct)·(1 − compensated)`.
+///
+/// They sum to `1 − direct·compensated`, which is why §16.7's ambiguity gate is not a second rule
+/// bolted onto the first: `direct·compensated < 0.5` is exactly the condition under which the
+/// normalisation has a denominator of at least `0.5`. One implementation, two consequences — and the
+/// gate is what makes the division below safe rather than merely lucky.
+///
+/// The weights are **multiplicative** (N4): a tile's weight scales the evidence it contributes,
+/// instead of being added to a score built from quantities of different units.
+#[derive(Debug, Clone)]
+pub(crate) struct RegionModel {
+    tiles: Vec<RegionTile>,
+}
+
+impl RegionModel {
+    /// A model for `tile_count` tiles, all neutral.
+    ///
+    /// The count comes from the band ([`region_evidence`]'s length), not from the frame: §18.2's
+    /// tiles are the rows that are actually being matched. A band that changes size — a resized
+    /// window, a different viewport — needs a new model, which is why [`Self::observe`] refuses an
+    /// index the model was not built for.
+    pub(crate) fn new(tile_count: usize) -> Self {
+        Self {
+            tiles: vec![RegionTile::neutral(); tile_count],
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.tiles.len()
+    }
+
+    fn tile(&self, index: usize) -> &RegionTile {
+        self.tiles.get(index).unwrap_or_else(|| {
+            panic!(
+                "the region model was built for {} tiles, so tile {index} does not exist: the band changed size and the model has to be rebuilt",
+                self.tiles.len()
+            )
+        })
+    }
+
+    /// How many observations this tile was actually learned from. Zero for a tile whose evidence was
+    /// ambiguous or textureless, which is the observable form of "we did not guess".
+    pub(crate) fn observations(&self, index: usize) -> u32 {
+        self.tile(index).observations
+    }
+
+    /// The class with the largest estimate. Ties go `Scrolling` → `Fixed` → `Dynamic`, the order the
+    /// neutral prior makes arbitrary but a report must not: an order that is not total is not
+    /// deterministic (`P1.05`'s lesson).
+    pub(crate) fn class(&self, index: usize) -> RegionClass {
+        let tile = self.tile(index);
+        if tile.scrolling >= tile.fixed && tile.scrolling >= tile.dynamic {
+            RegionClass::Scrolling
+        } else if tile.fixed >= tile.dynamic {
+            RegionClass::Fixed
+        } else {
+            RegionClass::Dynamic
+        }
+    }
+
+    /// §16.7's `weight`, in `[REGION_WEIGHT_MIN, REGION_WEIGHT_MAX]`.
+    ///
+    /// A neutral tile weighs exactly `1.0` — including a tile that has been observed and whose
+    /// evidence cancelled out — so "we know nothing" and "we know it is ordinary" are the same
+    /// number here, and the ramp is what keeps them apart in time.
+    pub(crate) fn weight(&self, index: usize) -> f32 {
+        let tile = self.tile(index);
+        let learned = 1.0 + REGION_SCROLLING_GAIN * (tile.scrolling - REGION_NEUTRAL)
+            - (tile.fixed - REGION_NEUTRAL)
+            - (tile.dynamic - REGION_NEUTRAL);
+        let influence = (tile.observations as f32 / REGION_INFLUENCE_OBSERVATIONS).clamp(0.0, 1.0);
+        (1.0 + influence * (learned - 1.0)).clamp(REGION_WEIGHT_MIN, REGION_WEIGHT_MAX)
+    }
+
+    /// Learn from one tile's evidence, and report whether it was learned from at all.
+    ///
+    /// The two refusals are §16.7's and §18.2's, and they are the reason this returns a `bool`: a
+    /// caller that wants to know whether the model moved has to be able to tell "observed and
+    /// unremarkable" from "not observed".
+    pub(crate) fn observe(&mut self, index: usize, evidence: RegionEvidence) -> bool {
+        assert!(
+            index < self.tiles.len(),
+            "the region model was built for {} tiles, so tile {index} cannot be observed: the band changed size and the model has to be rebuilt",
+            self.tiles.len()
+        );
+        if evidence.texture < REGION_TEXTURE_MIN {
+            return false;
+        }
+        if evidence.direct * evidence.compensated >= REGION_AMBIGUITY_PRODUCT {
+            return false;
+        }
+        let (fixed, scrolling, dynamic) = region_likelihoods(evidence);
+        let total = fixed + scrolling + dynamic;
+        let rate = REGION_LEARNING_RATE;
+        let tile = &mut self.tiles[index];
+        tile.fixed += rate * (fixed / total - tile.fixed);
+        tile.scrolling += rate * (scrolling / total - tile.scrolling);
+        tile.dynamic += rate * (dynamic / total - tile.dynamic);
+        tile.observations += 1;
+        true
+    }
+
+    /// §16.8's `decay_toward_neutral(0.05)`: fall back toward the uniform prior after a scene cut.
+    ///
+    /// The observation count is deliberately **not** decayed. It answers "how much evidence has this
+    /// tile ever produced", which is what §16.7's ramp is about; moving the distribution back toward
+    /// neutral already returns the weight to `1.0`, and that is the effect being asked for.
+    pub(crate) fn decay_toward_neutral(&mut self, rate: f32) {
+        let rate = rate.clamp(0.0, 1.0);
+        for tile in &mut self.tiles {
+            tile.scrolling += rate * (REGION_NEUTRAL - tile.scrolling);
+            tile.fixed += rate * (REGION_NEUTRAL - tile.fixed);
+            tile.dynamic += rate * (REGION_NEUTRAL - tile.dynamic);
+        }
+    }
+}
+
+/// §18.2's three likelihoods, before normalisation. They sum to `1 − direct·compensated`.
+fn region_likelihoods(evidence: RegionEvidence) -> (f32, f32, f32) {
+    let direct = evidence.direct.clamp(0.0, 1.0);
+    let compensated = evidence.compensated.clamp(0.0, 1.0);
+    (
+        direct * (1.0 - compensated),
+        compensated * (1.0 - direct),
+        (1.0 - direct) * (1.0 - compensated),
+    )
+}
+
+/// §18.2's two comparisons for every tile of the match band, on the pooled image layer 2 already
+/// measured on.
+///
+/// `shift` is in **full-resolution pixels** — the number the funnel committed to — and is rounded to
+/// layer 2's grid here, because a 4 px grid cannot express a finer step and the region model is
+/// defined on the same measurements the ranking was (`P1.16`'s REFACTOR obligation: one definition
+/// of `direct`/`compensated`/texture, shared with §16.7 rather than re-derived).
+///
+/// The direct comparison uses the zero-shift band, which is the same band §16.3's residual gain is
+/// measured against, so "did it move" has one denominator across the module.
+pub(crate) fn region_evidence(previous: &Gray, current: &Gray, shift: i32) -> Vec<RegionEvidence> {
+    let wanted = match_rows(previous.height, current.height, DOWNSAMPLE);
+    let Some(direct) = match_band(previous.height, current.height, 0, wanted) else {
+        return Vec::new();
+    };
+    let Some(compensated) =
+        match_band(previous.height, current.height, round_to_grid(shift), wanted)
+    else {
+        return Vec::new();
+    };
+    let tile = REGION_TILE_ROWS / DOWNSAMPLE;
+    let tiles = direct.rows.min(compensated.rows) / tile;
+    (0..tiles)
+        .map(|index| {
+            let first_row = index * tile;
+            RegionEvidence {
+                direct: band_zncc(previous, current, direct, first_row, tile),
+                compensated: band_zncc(previous, current, compensated, first_row, tile),
+                texture: region_texture(previous, current, direct, first_row, tile),
+            }
+        })
+        .collect()
+}
+
+/// The smaller of a tile's two normalised standard deviations, in `[0, 0.5]`.
+///
+/// Measured on the zero-shift band, i.e. on the same rows of both frames, because the question is
+/// about the two images and not about the alignment: if either side is flat, both comparisons are
+/// meaningless whatever the shift is.
+fn region_texture(previous: &Gray, current: &Gray, band: MatchBand, first_row: u32, rows: u32) -> f32 {
+    let count = (previous.width * rows) as f64;
+    if count <= 0.0 {
+        return 0.0;
+    }
+    let deviation = |gray: &Gray, first: u32| {
+        let variance = band_variance(gray, first, first_row, rows).max(0.0);
+        (variance.sqrt() / count) / 255.0
+    };
+    deviation(previous, band.previous_first)
+        .min(deviation(current, band.current_first)) as f32
 }
 
 #[cfg(test)]
@@ -1929,13 +2208,15 @@ mod tests {
         MARGIN_SCORE_FLOOR, MIN_MARGIN, MIN_RESIDUAL_GAIN, MIN_TILES, PEAK_FAMILY_RATIO,
         PRIOR_DOWNWEIGHT, PRIOR_KAPPA,
         Prior,
-        RHO_MIN, RHO_MIN_PERMILLE,
+        REGION_DECAY, REGION_WEIGHT_MAX, REGION_WEIGHT_MIN, RHO_MIN, RHO_MIN_PERMILLE, RegionClass,
+        RegionModel,
         SCENE_CUT_ALIGNMENT_ERROR, SCENE_CUT_DECAY_STREAK, SCENE_CUT_SIMILARITY, SCORE_GAIN, Scratch,
         SceneCut, SceneCutAction, ScoredCandidate, ScoredSet, Status, StepEffect,
         TILE_INDEPENDENCE_GAP, alignment_error, band_zncc, candidates_1d, gate_geometry, gate_margin,
         gate_residual_gain, gate_support, has_peak_family, independent_support, is_scene_cut,
         is_verifiable, manual_window, margin_of,
-        match_band, match_rows, primary_digests, residual_gain, residual_gain_at, score_candidates_2d,
+        match_band, match_rows, primary_digests, region_evidence, residual_gain, residual_gain_at,
+        score_candidates_2d,
         support_at, zero_shift_similarity, zero_shift_status,
     };
     use crate::scroll::observation::{Axis, Observation, ObservationView};
@@ -4654,5 +4935,252 @@ mod tests {
             "a step beyond the manual window was confirmed: {:?}",
             outside.3
         );
+    }
+
+    /// Run a script's steps through a fresh region model, one observation per step.
+    ///
+    /// The first pair is skipped. The fixture's frame 0 is the bare document — an overlay says what
+    /// a *step* adds — so a pinned bar is absent from frame 0 and its rows are still page content
+    /// there. That is a real transition (a bar appearing), but it is not the steady state this
+    /// measures, and it would be read as `scrolling`.
+    fn learn_regions(script: &mut ScrollScript, pairs: usize, shift: i32) -> RegionModel {
+        let _ = script.take(0);
+        let mut previous = script.take(1);
+        let mut model: Option<RegionModel> = None;
+        for k in 2..2 + pairs {
+            let current = script.take(k);
+            let evidence = {
+                let mut scratch = Scratch::new();
+                let views = scratch.pool(&previous.view(), &current.view());
+                region_evidence(views.previous(), views.current(), shift)
+            };
+            let model = model.get_or_insert_with(|| RegionModel::new(evidence.len()));
+            for (index, entry) in evidence.iter().enumerate() {
+                model.observe(index, *entry);
+            }
+            previous = current;
+        }
+        model.expect("a script with steps has at least one observation")
+    }
+
+    /// §18.2's `fixed` class: the region that does not move with the page, next to page that does.
+    ///
+    /// `docs/31` names this case after a sticky header. The fixture pins its bar at the **bottom**
+    /// because the region model only ever sees the match band — §15.4.2's last `H_match` rows of the
+    /// overlap — so a screen-fixed strip anywhere else could not be seen even in principle. The
+    /// class is the same one either way, and that gap is written down in `docs/30` §18.2.
+    #[test]
+    fn a_fixed_header_becomes_a_low_weight_region_without_being_excluded() {
+        let image = TestImage::from_structures(640, 100 * 19, 11, 19, &mixed_structures());
+        let pinned = || StepSpec::move_by(120).with_fixed(0.4);
+        let mut script = ScrollScript::new(&image, 900, vec![pinned(), pinned(), pinned(), pinned()]);
+
+        let model = learn_regions(&mut script, 3, 120);
+        let tiles = model.len();
+        assert!(tiles >= 8, "the band must cover several region tiles, got {tiles}");
+
+        let mut table = String::from("tile  class      weight   observations\n");
+        for index in 0..tiles {
+            table.push_str(&format!(
+                "{index:<5} {:<10?} {:<8.4} {}\n",
+                model.class(index),
+                model.weight(index),
+                model.observations(index)
+            ));
+        }
+        println!("{table}");
+
+        // Nothing is ever excluded. §18.2 is explicit about why: a page that is half title bar would
+        // otherwise have rows that can never be covered, and the session could never finish.
+        for index in 0..tiles {
+            assert!(
+                model.weight(index) >= REGION_WEIGHT_MIN,
+                "tile {index} was excluded rather than down-weighted: {}",
+                model.weight(index)
+            );
+        }
+
+        let last = tiles - 1;
+        assert_eq!(
+            model.class(last),
+            RegionClass::Fixed,
+            "the pinned bar was not recognised as fixed"
+        );
+        assert!(
+            model.weight(last) < 1.0,
+            "a fixed region must be down-weighted, got {}",
+            model.weight(last)
+        );
+        assert_eq!(model.observations(last), 3);
+
+        assert_eq!(
+            model.class(0),
+            RegionClass::Scrolling,
+            "the page above the bar still scrolls"
+        );
+        assert!(
+            model.weight(0) > 1.0,
+            "scrolling content must be up-weighted, got {}",
+            model.weight(0)
+        );
+        assert!(model.weight(0) <= REGION_WEIGHT_MAX);
+    }
+
+    /// §16.7's "ambiguity is not evidence", in both of the shapes it takes.
+    ///
+    /// A measurement that cannot tell the classes apart teaches nothing, and neither does a
+    /// measurement with nothing to compare. Both leave the model neutral instead of guessing.
+    #[test]
+    fn ambiguous_tiles_are_not_learned_from() {
+        // Period == step: the page matches itself at zero shift *and* at the step, so `direct` and
+        // `compensated` are both ~1 and their product is above §16.7's 0.5 gate.
+        let periodic = TestImage::from_structures(
+            640,
+            100 * 19,
+            7,
+            19,
+            &[Structure::HorizontalBars { period: 19 }],
+        );
+        let step = || StepSpec::move_by(19);
+        let mut script = ScrollScript::new(&periodic, 900, vec![step(), step(), step(), step()]);
+        let model = learn_regions(&mut script, 3, 19);
+        assert!(model.len() >= 8, "the band must cover several tiles");
+        for index in 0..model.len() {
+            assert_eq!(
+                model.observations(index),
+                0,
+                "tile {index} was learned from an ambiguous measurement"
+            );
+            assert_eq!(
+                model.weight(index),
+                1.0,
+                "tile {index} moved off neutral on no evidence"
+            );
+        }
+
+        // A uniform page has no texture at all: `band_zncc` answers 0 for both comparisons, so the
+        // product gate would happily let it through. The texture gate is the one that stops it, and
+        // this is the case that says so.
+        let flat = TestImage::from_structures(320, 80 * 19, 3, 80 * 19, &[Structure::Flat]);
+        let step = || StepSpec::move_by(10);
+        let mut script = ScrollScript::new(&flat, 300, vec![step(), step(), step(), step()]);
+        let model = learn_regions(&mut script, 3, 10);
+        assert!(model.len() >= 2, "the band must cover at least one tile");
+        for index in 0..model.len() {
+            assert_eq!(
+                model.observations(index),
+                0,
+                "tile {index} was learned from a textureless region"
+            );
+            assert_eq!(model.weight(index), 1.0);
+        }
+
+        // The contrast: on a document that really moves, the same code path does learn, so the two
+        // assertions above are about the evidence and not about a model that never learns anything.
+        let image = TestImage::from_structures(640, 100 * 19, 11, 19, &mixed_structures());
+        let step = || StepSpec::move_by(120);
+        let mut script = ScrollScript::new(&image, 900, vec![step(), step(), step(), step()]);
+        let model = learn_regions(&mut script, 3, 120);
+        let learned = (0..model.len())
+            .filter(|index| model.observations(*index) > 0)
+            .count();
+        assert!(learned > 0, "no tile was learned from a document that moved");
+        assert!(
+            (0..model.len()).any(|index| model.weight(index) > 1.0),
+            "a scrolling tile was never up-weighted"
+        );
+    }
+
+    /// §30.5's "CSS animation element" row, as far as it can be measured before the session exists:
+    /// the region that changes on its own is down-weighted, the page around it is not, and nothing is
+    /// ever excluded — which is the whole reason §18.2 prefers weights to a mask.
+    ///
+    /// The row's other half (`Confirmed` share ≥ 95% on a real page) needs the weights to reach the
+    /// decision, and that wiring is session assembly (`P3.09`); what this proves is that the
+    /// ingredients of the metric exist and are stable.
+    #[test]
+    fn a_region_that_changes_on_its_own_is_down_weighted_but_still_covers_its_rows() {
+        let image = TestImage::from_structures(640, 100 * 19, 11, 19, &mixed_structures());
+        // The fixture animates the top of the frame, and the match band is the last `H_match` rows
+        // of the overlap (§15.4.2) — so the part of the animation this model can see is its lower
+        // edge. That is a property of the band, not of the classifier, and it is written down in
+        // `docs/30` §18.2.
+        let animated = || StepSpec::move_by(120).with_dynamic(0.6);
+        let mut script =
+            ScrollScript::new(&image, 900, vec![animated(), animated(), animated(), animated()]);
+
+        let mut model = learn_regions(&mut script, 3, 120);
+        let tiles = model.len();
+        assert!(tiles >= 8, "the band must cover several region tiles, got {tiles}");
+
+        let mut table = String::from("tile  class      weight   observations\n");
+        for index in 0..tiles {
+            table.push_str(&format!(
+                "{index:<5} {:<10?} {:<8.4} {}\n",
+                model.class(index),
+                model.weight(index),
+                model.observations(index)
+            ));
+        }
+        let animated_tiles = (0..tiles)
+            .filter(|index| model.class(*index) == RegionClass::Dynamic)
+            .count();
+        let lowest = (0..tiles)
+            .map(|index| model.weight(index))
+            .fold(f32::INFINITY, f32::min);
+        println!(
+            "{table}\nanimated tiles: {animated_tiles}/{tiles}, lowest weight: {lowest:.4}"
+        );
+        assert!(animated_tiles > 0, "the animation was never classified");
+
+        // The tiles the animation covers directly, and the page far below it. Everything in between
+        // is a boundary: the compensated comparison of a tile looks `shift` pixels further into the
+        // current frame, so an animation poisons the tiles it overlaps **through the shift** as well,
+        // and those are not asserted on.
+        for index in 0..2 {
+            assert_eq!(
+                model.class(index),
+                RegionClass::Dynamic,
+                "tile {index} is inside the animation"
+            );
+            assert!(
+                model.weight(index) < 1.0,
+                "an animated region must be down-weighted, got {}",
+                model.weight(index)
+            );
+        }
+        assert_eq!(
+            model.class(tiles - 1),
+            RegionClass::Scrolling,
+            "the page below the animation must stay trusted"
+        );
+        assert!(
+            model.weight(tiles - 1) > 1.0,
+            "a scrolling tile was not up-weighted: {}",
+            model.weight(tiles - 1)
+        );
+
+        // §18.2's promise, on the whole model: down-weighted, never excluded.
+        for index in 0..tiles {
+            let weight = model.weight(index);
+            assert!(
+                (REGION_WEIGHT_MIN..=REGION_WEIGHT_MAX).contains(&weight),
+                "tile {index} left the clamp: {weight}"
+            );
+        }
+
+        // §16.8's decay: a scene cut pulls every tile back toward the uniform prior, so a page that
+        // stopped animating is believed again — and the observation count stays, because the ramp is
+        // about how much evidence ever arrived.
+        let before: Vec<f32> = (0..tiles).map(|index| model.weight(index)).collect();
+        model.decay_toward_neutral(REGION_DECAY);
+        for index in 0..tiles {
+            let (before, after) = (before[index], model.weight(index));
+            assert!(
+                (after - 1.0).abs() < (before - 1.0).abs() || after == before,
+                "tile {index} did not move toward neutral: {before} -> {after}"
+            );
+        }
+        assert_eq!(model.observations(0), 3, "decay is not a reset");
     }
 }

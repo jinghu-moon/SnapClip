@@ -268,8 +268,12 @@ pub(crate) struct StepSpec {
     /// value `ScrollScript::truth` reports.
     pub delta: i32,
     /// Fraction of the viewport height (measured from the top) replaced by content that changes
-    /// every frame — a sticky header, an animated banner, a video. `0.0` = a still page.
+    /// every frame — an animated banner, a video, a live region. `0.0` = a still page.
     pub dynamic: f32,
+    /// Fraction of the viewport height (measured from the **bottom**) replaced by content that is
+    /// identical in every frame — a fixed bottom bar, a sticky action strip, the scrollbar track.
+    /// `0.0` = nothing is pinned to the viewport.
+    pub fixed: f32,
     /// Per-pixel noise amplitude, applied to every channel. `0` = a lossless frame.
     pub noise: u8,
 }
@@ -279,6 +283,7 @@ impl StepSpec {
         Self {
             delta,
             dynamic: 0.0,
+            fixed: 0.0,
             noise: 0,
         }
     }
@@ -303,6 +308,18 @@ impl StepSpec {
             "the moving region is a fraction of the viewport"
         );
         self.dynamic = ratio;
+        self
+    }
+
+    /// A pinned region: it keeps its screen position and its pixels while the page moves under it.
+    /// §18.2's `fixed` class, and the one case a matcher cannot see — the two frames agree there at
+    /// zero shift and disagree at every other, which is the opposite of the page around it.
+    pub(crate) fn with_fixed(mut self, ratio: f32) -> Self {
+        assert!(
+            (0.0..=1.0).contains(&ratio),
+            "the pinned region is a fraction of the viewport"
+        );
+        self.fixed = ratio;
         self
     }
 
@@ -448,6 +465,12 @@ impl ScrollScript {
             if step.dynamic > 0.0 {
                 overlay_moving_region(&mut pixels, width, height, step.dynamic, k as u32);
             }
+            // The pinned region is keyed by screen position only, so frame `k` and frame `k + 1`
+            // hold the same bytes there — which is what a sticky bar does and what the region model
+            // has to recognise.
+            if step.fixed > 0.0 {
+                overlay_fixed_region(&mut pixels, width, height, step.fixed);
+            }
             if step.noise > 0 {
                 add_noise(&mut pixels, width, height, step.noise, k as u32);
             }
@@ -471,6 +494,28 @@ fn overlay_moving_region(pixels: &mut [u8], width: u32, height: u32, ratio: f32,
     for y in 0..band {
         for x in 0..width {
             let level = (hash(x / 3, y / 3, 0x5A17 ^ frame) & 0xFF) as u8;
+            let at = y as usize * stride + x as usize * 4;
+            pixels[at] = level;
+            pixels[at + 1] = level;
+            pixels[at + 2] = level;
+        }
+    }
+}
+
+/// Replace the bottom `ratio` of the frame with content that is a pure function of the screen
+/// position — a fixed bottom bar, a sticky action strip, the scrollbar track. §18.2's `fixed`
+/// class: identical at zero shift, unrelated at any other.
+///
+/// It is anchored at the **bottom** because the region model measures the match band, and the band
+/// is the last `H_match` rows of the overlap (§15.4.2). A screen-fixed strip anywhere else is never
+/// inside the band, so the model could not see it even in principle.
+fn overlay_fixed_region(pixels: &mut [u8], width: u32, height: u32, ratio: f32) {
+    let band = ((height as f32 * ratio).round() as u32).clamp(1, height);
+    let first = height - band;
+    let stride = width as usize * 4;
+    for y in first..height {
+        for x in 0..width {
+            let level = (hash(x / 3, y / 3, 0x1D2F) & 0xFF) as u8;
             let at = y as usize * stride + x as usize * 4;
             pixels[at] = level;
             pixels[at + 1] = level;

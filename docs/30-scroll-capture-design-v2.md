@@ -2276,9 +2276,14 @@ pub(crate) struct Displacement { status: Status, confidence: f32, evidence: Evid
 | scene cut 相似度门 | 0.50 | **可校准** | `E-ACC-1`；`P1.12` 落地为**便宜的第一票否决**（`zero_shift_similarity`，只算一条带），实测对"真的滚了"的页面恒为负值（§16.8.1），所以它排除的是"完全没变"的帧 |
 | scene cut 误差门 | 0.60 | **可校准** | `E-ACC-1`；`P1.12` 落地的量是 `1 − ZNCC` 的 trimmed 均值（保留最小的 75%，`ALIGNMENT_RETAINED = 0.75`），值域 **`[0, 2]`** 而不是 `[0, 1]`（§16.8.1）；无结构 tile 不进样本，**无样本 ⇒ `None` ⇒ 否决 scene cut** |
 | `scene_cut_streak` 阈值 | 3 | 固定 | 参考实现；`P1.12` 落地为 `SceneCut::observe` 的**饱和**计数 + `SCENE_CUT_DECAY_STREAK`（`action() == DecayModel`），任何非 scene cut 帧**无条件清零** |
-| 模型衰减率 | 0.05 | 固定 | 参考实现；**不由 `P1.12` 持有**——`SceneCutAction::DecayModel` 只是"请求衰减"，率与 `reset()` 是 §18.2 tile 模型的事（§16.8.1 裁决 4） |
-| 乘法权重 clamp | [0.1, 2.0] | 固定 | 参考实现 |
-| "歧义不学习"门 | `direct·compensated ≥ 0.5` | 固定 | 参考实现 |
+| 模型衰减率 | 0.05 | 固定 | 参考实现；**不由 `P1.12` 持有**——`SceneCutAction::DecayModel` 只是"请求衰减"，率与 `reset()` 是 §18.2 tile 模型的事（§16.8.1 裁决 4）。`P1.16` 落地为 `RegionModel::decay_toward_neutral(REGION_DECAY)`，且**不衰减 `observations`**（§18.2.1 裁决 5） |
+| 乘法权重 clamp | [0.1, 2.0] | 固定 | 参考实现；`P1.16` 落地为 `REGION_WEIGHT_MIN/MAX`，实测 3 次观测后还到不了下界（固定 tile 0.4525，§18.2.1 推论 B） |
+| "歧义不学习"门 | `direct·compensated ≥ 0.5` | 固定 | 参考实现；`P1.16` 落地为 `REGION_AMBIGUITY_PRODUCT`，同时是归一化可除的前提（三似然之和 = `1 − direct·compensated ≥ 0.5`，§18.2.1 裁决 3） |
+| `REGION_TILE_ROWS`（区域模型的 tile 高度） | 32 px | 固定 | `P1.16`：与 `TILE_ROWS` **分开命名**（§15.4.3 决定 4），因为两者的网格虽然今天同值、语义不同（§18.2.1 裁决 6） |
+| `REGION_TEXTURE_MIN`（区域模型的无纹理门） | 0.05 | **可校准** | 参考实现；`P1.16` 落地。texture 取**两侧标准差的较小者**（与 §16.4 的"任一侧有纹理即可"相反，§18.2.1 裁决 2），因此平坦页由它而非乘积门挡住 |
+| `REGION_SCROLLING_GAIN`（scrolling 类的增益） | 1.5 | 固定 | 参考实现；`P1.16` 落地（`learned = 1 + 1.5·scrolling − fixed − dynamic` 的加权形式） |
+| `REGION_INFLUENCE_OBSERVATIONS`（ramp 满量观测数） | 3 | 固定 | 参考实现；`P1.16` 落地为 `influence = (observations/3).clamp(0,1)`（§18.2.1 推论 B：与 EMA 合成后会话早期偏中性） |
+| `REGION_LEARNING_RATE`（似然 EMA 率） | 0.3 | **可校准** | 参考实现；`P1.16` 落地 |
 | score 权重 | 0.60 / 0.25 / 0.15 | **可校准** | `E-ACC-1` |
 | confidence 权重 | 0.40 / 0.25 / 0.20 / 0.15 | **可校准** | `E-ACC-1` |
 | 边界值禁令 | `±N/2`、`±M/2` | **固定、不可校准** | F-02 |
@@ -2606,6 +2611,74 @@ dynamic   = (1 − direct) · (1 − compensated)
 **乘法式权重**已写入 §16.7（`scrolling` 最高 `2.0×`、`fixed`/`dynamic` 最低 `0.1×`，前 3 次观测线性 ramp）。
 
 **为什么这是"分级降权"而不是"排除"**：`CoverageMap`（§17.1）要求二维完整覆盖。若把 `dynamic` tile 排除，那么"标题栏占一半面积的页面"会出现一条**永远无法覆盖的横带** → 会话无法完成。**降权保留了覆盖能力，同时把它对位移判断的影响压到最低。** 这是 V1 逐像素 mask 做不到的（mask 排除的像素在覆盖意义上就是缺失）。
+
+#### 18.2.1 落地的形状（P1.16，2026-10-08）
+
+`docs/31` 的 P1.16 只写了"三分类 + 乘法权重 + 歧义不学习"。落地时被实测逼出六处裁决，全部记在这里。
+
+```rust
+// 区域模型的 tile 与第 2 层的 tile 是两个不同的网格，所以两个名字（§15.4.3 决定 4）
+const REGION_TILE_ROWS: u32 = 32;           // 数值与 TILE_ROWS 相同，语义不同
+const REGION_TEXTURE_MIN: f32 = 0.05;       // 无纹理 ⇒ 相似度无信息量，跳过
+const REGION_AMBIGUITY_PRODUCT: f32 = 0.5;  // direct · compensated ≥ 0.5 ⇒ 不学习
+const REGION_NEUTRAL: f32 = 1.0 / 3.0;
+const REGION_SCROLLING_GAIN: f32 = 1.5;
+const REGION_INFLUENCE_OBSERVATIONS: f32 = 3.0; // 前 3 次观测线性 ramp
+const REGION_WEIGHT_MIN: f32 = 0.1;
+const REGION_WEIGHT_MAX: f32 = 2.0;
+const REGION_LEARNING_RATE: f32 = 0.3;
+const REGION_DECAY: f32 = 0.05;
+
+pub(crate) struct RegionEvidence { direct: f32, compensated: f32, texture: f32 }
+pub(crate) enum RegionClass { Scrolling, Fixed, Dynamic }
+
+pub(crate) struct RegionModel { tiles: Vec<RegionTile> } // 每 tile 三个似然 + observations
+
+fn region_evidence(previous: &Gray, current: &Gray, shift: i32) -> Vec<RegionEvidence>;
+impl RegionModel {
+    fn observe(&mut self, index: usize, evidence: &RegionEvidence) -> bool;
+    fn weight(&self, index: usize) -> f32;   // 1 + influence·(learned − 1)，clamp [0.1, 2.0]
+    fn class(&self, index: usize) -> RegionClass;
+    fn decay_toward_neutral(&mut self, rate: f32);
+}
+```
+
+**裁决 1：测量窗口就是 match band（§15.4.2），因此向下滚动时看不到视口的上半部分。** 这不是分类器的缺陷，而是 band 选择的继承结果：band 锚在**重叠区的末尾**，向下滚动时它落在上一帧的**下半部分**。后果有两条：(a) 视口顶部约半屏的内容（64 px sticky 头部、顶部广告条、顶部动画）**永远不会被分类**；(b) 这恰好无害——权重只乘在**进入 match 分数的 tile 证据**上，而 band 之外的内容本来也不参与打分；向上滚动时 band 的上边缘才随 `|d|` 上移，所以**向上的会话会看到视口顶部**。`E-DYN-1`/`E-ACC-1` 需要按"会话里既有向下也有向上"来设计夹具，否则区域模型的覆盖率会被系统性高估。
+
+**裁决 2：`texture` 取两侧标准差的较小者**，而 §16.4 的 `tile_carries_evidence` 用"任一侧有纹理即可"（§16.4.1）。两个判断问的问题不同：后者问"这个 tile 能不能作为证据"，前者问"这次比较有没有信息量"——一侧是平的，比较就不携带信息。
+
+**裁决 3：歧义门是归一化可除的前提。** 三条似然之和恒为 `1 − direct · compensated`，所以 `direct · compensated ≥ 0.5` 时和 ≥ 0.5，归一化永远可除；门槛同时表达了"这一步的相似度不足以区分三类"。实测里这道门与 texture 门**各挡一类页面**：周期页（`direct ≈ compensated ≈ 1`）被乘积门挡住，平坦页（`band_zncc` 对零方差返回 0，乘积为 0）被 texture 门挡住（§16.4.1 的平坦页结论在这里第二次出现）。
+
+**裁决 4：`observe` 返回 `bool`**（"这一步学到东西了吗"），而不是静默跳过。调用方因此能数"学到的步数"，这是 §18.4 的触发条件（`dynamic` 占比 > 30%）与将来的诊断面板都要用的量。
+
+**裁决 5：`decay_toward_neutral` 不衰减 `observations`。** `influence` ramp 是"这块区域被看过几次"的记录，一次衰减把它重置会让权重在 ramp 里来回跳（"decay is not a reset"，用例里断言）。
+
+**裁决 6：`tile(index)` 越界即 panic**，消息写明"the band changed size and the model has to be rebuilt"。band 高度随 `|d|` 变化（§17.2），所以模型与 band 的尺寸必须由调用方对齐——静默截断会把权重乘到错误的行上。
+
+**实测 1：`position: fixed` 头部（mixed 文档 640×1900、视口 900、四步 `move_by(120)`、底部 40% 固定、3 次观测）**
+
+```text
+tile  class      weight   observations
+0     Scrolling 2.0000   3
+1     Scrolling 2.0000   3
+2     Scrolling 1.7684   3        ← 跨在固定条边界上
+3..13 Fixed     0.4525   3
+```
+
+**实测 2：顶部 60% 每帧变化的动画（同一文档、四步 `move_by(120).with_dynamic(0.6)`）**
+
+```text
+tile  class      weight   observations
+0..5  Dynamic   0.4525…0.4754   3   ← 6 个 tile，不是 3 个
+6     Scrolling 1.3686   3          ← 边界
+7..13 Scrolling 2.0000   3
+```
+
+**推论 A（实测 2 逼出来的）：动画污染的 tile 数 = 动画覆盖的 tile 数 + `|shift|` 对应的行数。** 补偿比较的窗口比 direct 多伸进当前帧 `|d|` 像素，所以动画**通过位移**污染了它下边缘之外的 tile。60% 的动画 + 120 px 步进污染了 14 个 tile 里的 6 个。这条推论决定了 §18.4 的触发条件"`dynamic` 占比 > 30%"实际会比直觉更早触发——它是好事（更早去找光流），但要按这条推论解释，而不是当成分类器过敏。
+
+**推论 B：3 次观测后权重还到不了 clamp 边界。** 完全固定的 tile 实测 0.4525，而不是 `REGION_WEIGHT_MIN = 0.1`：EMA（0.3）从 `REGION_NEUTRAL` 出发、再乘 `influence` ramp（3 次观测），两者的合成让权重在会话早期偏中性。这不改变"降权而非排除"的结论，但**`E-ACC-1` 校准时必须按"会话第 N 步"读权重**，不能按稳态权重校准。
+
+**尚未落地：权重还没有接入决定。** `P1.16` 交付的是"测得出来、能随步学习"的模型；把 `RegionModel::weight` 乘进 tile 证据（§16.7 的乘法式权重）属于**会话组装**，与 §18.2 的"降权吸收"在同一步生效——那是 `P3.09` 的职责。在此之前，上表的两行只能证明"度量正确、方向正确"，不能证明"错误确定率下降"（后者要 `E-DYN-1` 的消融）。
 
 ### 18.3 逐类动态内容的处理
 
@@ -4076,6 +4149,8 @@ if ($hits) { Write-Error "scroll/ must stay platform-free: $($hits -join '; ')";
 | 30,000 px 合成页面 | 本地 HTML | 与真值逐行相等 | L3 | 全指标 |
 | `position: fixed` 头部 | 同上 | 头部只出现一次 | L3 | — |
 | CSS 动画元素 | 同上 | 降权；`Confirmed` ≥ 95% | L3 | — |
+| `position: fixed` 头部（区域模型层） | 1900 px 合成页 + 底部 40% 固定 | **已可度量**：固定 tile 被降权（0.4525）而不被排除，滚动 tile 升到 2.0（§18.2.1 实测 1） | L1 | — |
+| CSS 动画元素（区域模型层） | 1900 px 合成页 + 顶部 60% 每帧变化 | **已可度量**：动画 tile 降权到 0.45 一档，污染范围 = 动画高度 + `|shift|`（§18.2.1 实测 2/推论 A） | L1 | — |
 | `<video>` 播放中 | 同上 | 不终止 | L3 | — |
 | 懒加载图片序列 | 同上 | 不因懒加载终止 | L3 | — |
 | 无限滚动 | 同上 | 正常；上限时 `Partial` | L3 | Memory |
