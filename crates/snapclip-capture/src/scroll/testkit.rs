@@ -19,18 +19,31 @@
 //! * **Scriptable transitions**: positive/negative steps, repeats, jumps, a moving (sticky)
 //!   region and per-frame noise, so the failure modes of §18.2 can be produced on demand.
 //!
-//! # Why the frames are not `Observation` yet
+//! # The frames are `Observation` now
 //!
-//! The task's intended surface is `fn take(&mut self, k: usize) -> Observation`, and
-//! `Observation` is `P1.03`'s deliverable. `P1.01` therefore hands out its own frame type and
-//! `P1.03` turns it into the real one; inventing the real one here would make `P1.03`'s RED
-//! (its type-construction tests) pass before it is written.
+//! `P1.01` handed out a `TestFrame { pixels, region }` placeholder because `Observation` was
+//! `P1.03`'s deliverable and inventing it here would have made that task's RED pass early
+//! (`DEV-9`). `P1.03` has landed, so the placeholder is gone: `take` returns the real
+//! [`Observation`] and every test written against the fixture is written against the estimator's
+//! actual input type.
+//!
+//! The fixture has no clock: the `qpc` of frame `k` is the injected cadence
+//! (`QPC_PER_FRAME` per frame), not a reading, so latency code that subtracts two frames sees a
+//! plausible span. `ScrollScript::new` produces [`Axis::Vertical`] frames and
+//! [`ScrollScript::horizontal`] produces [`Axis::Horizontal`] ones from the transposed document.
 
 // The fixture is an API for the whole `P1` sweep (`P1.05`…`P1.24`); each task uses a subset, so
 // items that no test in *this* task touches are expected rather than forgotten.
 #![allow(dead_code)]
 
+use crate::scroll::observation::{Axis, Observation};
 use snapclip_model::geometry::Rect;
+
+/// Timestamp step between two consecutive frames, in QPC ticks (10 MHz × 50 ms).
+///
+/// The fixture has no clock — this is the cadence the script *represents*, so any code that
+/// subtracts timestamps gets a difference of the right order of magnitude.
+pub(crate) const QPC_PER_FRAME: i64 = 500_000;
 
 /// Rows per structure band in the default document. Small enough that a single viewport sees
 /// several structures, large enough that a step of a few hundred rows still lands inside one.
@@ -211,6 +224,30 @@ impl TestImage {
         self.structures[(y / self.band_height) as usize % self.structures.len()]
     }
 
+    /// The same pixels rotated 90°: the document a horizontal session scrolls over.
+    ///
+    /// The band list is carried over unchanged and no longer describes this image's rows — a
+    /// horizontal session only ever crops its document, and `structure_at` is documented as "the
+    /// bands as authored", so nothing downstream reads it as a property of the rotated image.
+    pub(crate) fn transposed(&self) -> Self {
+        let stride = self.width as usize * 4;
+        let mut pixels = vec![0u8; self.pixels.len()];
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let from = y as usize * stride + x as usize * 4;
+                let to = x as usize * self.height as usize * 4 + y as usize * 4;
+                pixels[to..to + 4].copy_from_slice(&self.pixels[from..from + 4]);
+            }
+        }
+        Self {
+            width: self.height,
+            height: self.width,
+            band_height: self.width,
+            structures: self.structures.clone(),
+            pixels,
+        }
+    }
+
     /// A packed BGRA copy of `region`, no stride padding (`P1.03` will assert `stride == w * 4`).
     fn crop(&self, region: Rect) -> Vec<u8> {
         let stride = self.width as usize * 4;
@@ -275,30 +312,21 @@ impl StepSpec {
     }
 }
 
-/// One frame of a script. Stands in for `Observation` until `P1.03` defines it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TestFrame {
-    pub pixels: Vec<u8>,
-    pub region: Rect,
-}
-
-impl TestFrame {
-    pub(crate) fn width(&self) -> u32 {
-        self.region.width() as u32
-    }
-
-    pub(crate) fn height(&self) -> u32 {
-        self.region.height() as u32
-    }
-}
-
 /// A scripted scroll over one [`TestImage`].
 ///
-/// The viewport is a full-width rectangle at `x = 0`, because the horizontal axis arrives with
-/// `P1.02`'s transposed input rather than with a second dimension here.
+/// `new` scrolls vertically over the document as authored. `horizontal` scrolls the **transposed**
+/// document, which is what makes the horizontal axis a real case rather than a relabelling: in the
+/// transposed frames the content genuinely moves along `x`, so the signal lines really are columns.
+///
+/// (`P1.02` shipped a `T-AXIS-1` that transposed the *frames* and still fingerprinted columns of
+/// the result — the same bytes were compared with themselves in both runs, so the axis branch was
+/// never exercised. `P1.03`'s move to `Observation` surfaced it; see `docs/31` §6 `P1.03`.)
 pub(crate) struct ScrollScript {
     image: TestImage,
-    viewport_height: u32,
+    axis: Axis,
+    /// The viewport's extent **along the primary axis** — height for a vertical script, width for
+    /// a horizontal one.
+    viewport_extent: u32,
     steps: Vec<StepSpec>,
     offsets: Vec<i32>,
     cursor: usize,
@@ -309,26 +337,39 @@ impl ScrollScript {
     /// once, and asserted to stay inside the document: a fixture that silently produced a
     /// partially out-of-document frame would report defeats that belong to nobody's algorithm.
     pub(crate) fn new(image: &TestImage, viewport_height: u32, steps: Vec<StepSpec>) -> Self {
+        Self::build(image.clone(), Axis::Vertical, viewport_height, steps)
+    }
+
+    /// The same script over the transposed document: the content moves along the viewport's width,
+    /// the signal lines are columns, and `truth(k)` is the same displacement expressed on the other
+    /// component (`docs/30` §17.8).
+    pub(crate) fn horizontal(image: &TestImage, viewport_width: u32, steps: Vec<StepSpec>) -> Self {
+        Self::build(image.transposed(), Axis::Horizontal, viewport_width, steps)
+    }
+
+    fn build(image: TestImage, axis: Axis, viewport_extent: u32, steps: Vec<StepSpec>) -> Self {
+        let document_extent = axis.primary_extent(image.width(), image.height());
         assert!(
-            viewport_height > 0 && viewport_height <= image.height(),
-            "the viewport must fit inside the document"
+            viewport_extent > 0 && viewport_extent <= document_extent,
+            "the viewport must fit inside the document's primary extent"
         );
         let mut offsets = vec![0i32];
         for step in &steps {
             let next = offsets[offsets.len() - 1] + step.delta;
             assert!(
-                next >= 0 && next as u32 + viewport_height <= image.height(),
-                "step {} leaves the document: offset {} + viewport {} > height {}",
+                next >= 0 && next as u32 + viewport_extent <= document_extent,
+                "step {} leaves the document: offset {} + viewport {} > extent {}",
                 step.delta,
                 next,
-                viewport_height,
-                image.height()
+                viewport_extent,
+                document_extent
             );
             offsets.push(next);
         }
         Self {
-            image: image.clone(),
-            viewport_height,
+            image,
+            axis,
+            viewport_extent,
             steps,
             offsets,
             cursor: 0,
@@ -346,17 +387,41 @@ impl ScrollScript {
     }
 
     pub(crate) fn viewport_rect(&self, k: usize) -> Rect {
-        let top = self.offsets[k];
-        Rect::new(
-            0,
-            top,
-            self.image.width() as i32,
-            top + self.viewport_height as i32,
-        )
+        let offset = self.offsets[k];
+        if self.axis.is_vertical() {
+            Rect::new(
+                0,
+                offset,
+                self.image.width() as i32,
+                offset + self.viewport_extent as i32,
+            )
+        } else {
+            Rect::new(
+                offset,
+                0,
+                offset + self.viewport_extent as i32,
+                self.image.height() as i32,
+            )
+        }
     }
 
-    pub(crate) fn viewport_height(&self) -> u32 {
-        self.viewport_height
+    /// The viewport's extent along the primary axis.
+    pub(crate) fn viewport_extent(&self) -> u32 {
+        self.viewport_extent
+    }
+
+    pub(crate) fn axis(&self) -> Axis {
+        self.axis
+    }
+
+    /// The pixel size of every frame this script produces: the primary axis is `viewport_extent`
+    /// long, the other one spans the document.
+    pub(crate) fn frame_size(&self) -> (u32, u32) {
+        if self.axis.is_vertical() {
+            (self.image.width(), self.viewport_extent)
+        } else {
+            (self.viewport_extent, self.image.height())
+        }
     }
 
     pub(crate) fn image(&self) -> &TestImage {
@@ -365,7 +430,7 @@ impl ScrollScript {
 
     /// Frames are handed out in order. That is the whole point: a session sees a stream, and a
     /// test that could ask for frame 7 before frame 6 would not be testing a stream.
-    pub(crate) fn take(&mut self, k: usize) -> TestFrame {
+    pub(crate) fn take(&mut self, k: usize) -> Observation {
         assert_eq!(
             k, self.cursor,
             "take() is sequential: the fixture hands out the stream, not a random access"
@@ -373,29 +438,28 @@ impl ScrollScript {
         self.cursor += 1;
 
         let region = self.viewport_rect(k);
+        let (width, height) = self.frame_size();
         let mut pixels = self.image.crop(region);
         if k > 0 {
             let step = self.steps[k - 1];
+            // For a horizontal script the moving region is the leading edge of the frame's rows,
+            // i.e. the leading columns of the document. What matters to the funnel is that some
+            // pixels change every frame without the page moving; which edge they sit on does not.
             if step.dynamic > 0.0 {
-                overlay_moving_region(
-                    &mut pixels,
-                    self.image.width(),
-                    self.viewport_height,
-                    step.dynamic,
-                    k as u32,
-                );
+                overlay_moving_region(&mut pixels, width, height, step.dynamic, k as u32);
             }
             if step.noise > 0 {
-                add_noise(
-                    &mut pixels,
-                    self.image.width(),
-                    self.viewport_height,
-                    step.noise,
-                    k as u32,
-                );
+                add_noise(&mut pixels, width, height, step.noise, k as u32);
             }
         }
-        TestFrame { pixels, region }
+        Observation::new(
+            pixels,
+            region,
+            k as i64 * QPC_PER_FRAME,
+            (width, height),
+            self.axis,
+        )
+        .expect("the fixture crops a strictly packed viewport whose region matches its size")
     }
 }
 
@@ -488,11 +552,11 @@ mod tests {
             assert_eq!(script.viewport_rect(k), expected_rect, "viewport_rect({k})");
 
             let frame = script.take(k);
-            assert_eq!(frame.region, expected_rect, "frame {k} region");
+            assert_eq!(frame.region(), expected_rect, "frame {k} region");
             assert_eq!(frame.width(), 640);
             assert_eq!(frame.height(), 900);
             assert_eq!(
-                frame.pixels.len(),
+                frame.pixels().len(),
                 640 * 900 * 4,
                 "frames are packed BGRA with no stride padding (ZNCC indexes rows by width * 4)"
             );
@@ -500,12 +564,12 @@ mod tests {
             // noisy and carries a moving region, so it is checked by its geometry only.
             if k < steps.len() {
                 assert_eq!(
-                    &frame.pixels[..640 * 4],
+                    &frame.pixels()[..640 * 4],
                     image.row(offsets[k] as u32),
                     "frame {k} row 0 must be the document row under it"
                 );
                 assert_eq!(
-                    &frame.pixels[640 * 4 * 899..],
+                    &frame.pixels()[640 * 4 * 899..],
                     image.row((offsets[k] + 899) as u32),
                     "frame {k} last row"
                 );
@@ -530,8 +594,8 @@ mod tests {
         let mut second = ScrollScript::new(&a, 400, steps);
         for k in 0..first.len() {
             assert_eq!(
-                first.take(k).pixels,
-                second.take(k).pixels,
+                first.take(k).pixels(),
+                second.take(k).pixels(),
                 "frame {k} must not depend on when it is produced"
             );
         }
@@ -546,9 +610,12 @@ mod tests {
             let _ = script.take(0);
             let _ = script.take(1);
         }
-        let plain = plain.take(2).pixels;
-        let moving = moving.take(2).pixels;
-        let noisy = noisy.take(2).pixels;
+        let plain_frame = plain.take(2);
+        let moving_frame = moving.take(2);
+        let noisy_frame = noisy.take(2);
+        let plain = plain_frame.pixels();
+        let moving = moving_frame.pixels();
+        let noisy = noisy_frame.pixels();
 
         let stride = 320 * 4;
         let at = |row: usize| row * stride;
@@ -598,7 +665,7 @@ mod tests {
             StepSpec::move_by(600),
         ];
         let mut script = ScrollScript::new(&image, 900, steps.clone());
-        let frames: Vec<TestFrame> = (0..script.len()).map(|k| script.take(k)).collect();
+        let frames: Vec<Observation> = (0..script.len()).map(|k| script.take(k)).collect();
 
         for k in 1..frames.len() {
             let delta = steps[k - 1].delta;
@@ -626,10 +693,10 @@ mod tests {
 
     /// FNV-1a over one row. Cheap, deterministic, and fine-grained enough that two rows are
     /// equal only if their bytes are.
-    fn row_fingerprints(frame: &TestFrame) -> Vec<u64> {
-        let stride = frame.width() as usize * 4;
+    fn row_fingerprints(frame: &Observation) -> Vec<u64> {
+        let stride = frame.row_stride();
         frame
-            .pixels
+            .pixels()
             .chunks_exact(stride)
             .map(|row| {
                 let mut h = 0xcbf2_9ce4_8422_2325u64;
@@ -645,7 +712,7 @@ mod tests {
     /// The simplest possible matcher: count rows that agree between the two frames for each
     /// candidate shift, require at least half the viewport to overlap (`docs/30` §16.5), and take
     /// the largest count with the smallest `|d|` as the tie-break.
-    fn simplest_estimator(previous: &TestFrame, current: &TestFrame, window: i32) -> Option<i32> {
+    fn simplest_estimator(previous: &Observation, current: &Observation, window: i32) -> Option<i32> {
         let a = row_fingerprints(previous);
         let b = row_fingerprints(current);
         assert_eq!(a.len(), b.len(), "both frames of a script have one viewport");
