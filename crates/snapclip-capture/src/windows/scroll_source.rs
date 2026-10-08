@@ -551,7 +551,7 @@ mod tests {
         WgcFrameSource, next_scroll_backend, topology_outcome,
     };
     use crate::geometry::Rect;
-    use crate::scroll::observation::Axis;
+    use crate::scroll::observation::{Axis, Observation};
 
     /// A backend that hands out a scripted sequence. Nothing here touches the platform, which
     /// is the point: every rule this module owns is testable without a desktop.
@@ -1080,6 +1080,219 @@ mod tests {
             other.diagnostic(),
             "the diagnostic must say why, not just that it happened"
         );
+    }
+
+    // --- the source is testable without a desktop, and stays off the context (§29.2, §21.3;
+    //     task P2.08) ---
+    //
+    // `ScriptedBackend` tests the *source*; this tests the *consumer*. The loop that will read
+    // from a `FrameSource` is `P3.09`'s, so what can be proven here is the seam: everything a
+    // consumer is allowed to rely on is reachable through the trait object, with no device and
+    // no window. That is G9, and it is what makes the P3 loop's decisions testable at all.
+
+    /// The shape a consumer is allowed to branch on, as a value.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Decision {
+        Frame,
+        Idle,
+        Ended,
+        Failed,
+    }
+
+    /// Runs a consumer-shaped loop over any `FrameSource`. Deliberately takes the trait object:
+    /// if a consumer needs something the trait does not have, this function cannot be written.
+    fn drain(source: &mut dyn FrameSource, budget: usize, timeout: Duration) -> Vec<Decision> {
+        let mut seen = Vec::new();
+        for _ in 0..budget {
+            seen.push(match source.next(timeout) {
+                Ok(Poll::Frame(_)) => Decision::Frame,
+                Ok(Poll::Idle) => Decision::Idle,
+                Ok(Poll::Ended(_)) => Decision::Ended,
+                Err(_) => Decision::Failed,
+            });
+        }
+        seen
+    }
+
+    /// A scripted [`FrameSource`] for consumer-side tests (`docs/30` §29.4's D class).
+    ///
+    /// It is the seam that makes the loop testable: `P3.09`'s loop will take a `FrameSource`,
+    /// and this is the one that answers without a device, a window or a desktop. It is *not*
+    /// `ScriptedBackend` renamed — that one tests the source's own rules, this one exists so a
+    /// consumer's rules can be tested at all.
+    struct MockFrameSource {
+        viewport: Rect,
+        script: VecDeque<MockStep>,
+        /// Once an ending is handed out it holds, matching the real source's finality.
+        ended: Option<EndReason>,
+        asked: u32,
+        axis: Axis,
+    }
+
+    enum MockStep {
+        /// A frame whose bytes are all `level`, so two frames are tellable apart.
+        Frame { size: (u32, u32), level: u8 },
+        Idle,
+        Ended(EndReason),
+        Failed(FrameError),
+    }
+
+    impl MockFrameSource {
+        fn new(viewport: Rect) -> Self {
+            Self {
+                viewport,
+                script: VecDeque::new(),
+                ended: None,
+                asked: 0,
+                axis: Axis::Vertical,
+            }
+        }
+
+        fn then(mut self, step: MockStep) -> Self {
+            self.script.push_back(step);
+            self
+        }
+    }
+
+    impl FrameSource for MockFrameSource {
+        fn next(&mut self, _timeout: Duration) -> Result<Poll, FrameError> {
+            self.asked += 1;
+            if let Some(reason) = self.ended {
+                return Ok(Poll::Ended(reason));
+            }
+            match self.script.pop_front() {
+                Some(MockStep::Frame { size, level }) => {
+                    let pixels = vec![level; size.0 as usize * size.1 as usize * 4];
+                    let region = Rect::new(0, 0, size.0 as i32, size.1 as i32);
+                    let observation =
+                        Observation::new(pixels, region, self.asked as i64, size, self.axis)
+                            .expect("the mock builds the region from its own size");
+                    Ok(Poll::Frame(observation))
+                }
+                Some(MockStep::Idle) => Ok(Poll::Idle),
+                Some(MockStep::Ended(reason)) => {
+                    self.ended = Some(reason);
+                    Ok(Poll::Ended(reason))
+                }
+                Some(MockStep::Failed(error)) => Err(error),
+                // A script that ran out is a source with nothing new, which is what a real
+                // source does when the page stops moving — not a panic and not an ending.
+                None => Ok(Poll::Idle),
+            }
+        }
+
+        fn viewport(&self) -> Rect {
+            self.viewport
+        }
+    }
+
+    /// Splits a file that scans itself into "what ships" and "what tests it".
+    ///
+    /// A self-scanning test has to say which half it reads: the first version of these two
+    /// tests scanned the whole file, and so matched the needles written *in their own bodies*
+    /// (`.context()` inside the list of needles, `env::var` inside the assertion that counts
+    /// it). Both failures were real — a scan that cannot tell code from the code that checks
+    /// it would report a violation the moment anyone wrote a test about one.
+    fn halves(source: &str) -> (&str, &str) {
+        let cut = source
+            .find("#[cfg(test)]")
+            .expect("this file has a test module; a scan without one is a scan of nothing");
+        (&source[..cut], &source[cut..])
+    }
+
+    #[test]
+    fn the_scroll_source_compiles_and_its_logic_tests_run_without_a_desktop() {
+        let viewport = Rect::new(0, 0, 8, 4);
+        let mut source = MockFrameSource::new(viewport)
+            .then(MockStep::Frame {
+                size: (8, 4),
+                level: 10,
+            })
+            .then(MockStep::Idle)
+            .then(MockStep::Frame {
+                size: (8, 4),
+                level: 20,
+            })
+            .then(MockStep::Ended(EndReason::TargetLost));
+
+        assert_eq!(source.viewport(), viewport);
+
+        let seen = drain(&mut source, 6, Duration::from_millis(20));
+        assert_eq!(
+            seen,
+            vec![
+                Decision::Frame,
+                Decision::Idle,
+                Decision::Frame,
+                Decision::Ended,
+                // An ending is final, and the mock must not pretend otherwise: a consumer that
+                // keeps asking after a stop must not see frames appear again.
+                Decision::Ended,
+                Decision::Ended,
+            ],
+            "a consumer must see exactly the script, with the ending holding"
+        );
+    }
+
+    #[test]
+    fn no_real_desktop_test_silently_skips_in_this_module() {
+        const SOURCE: &str = include_str!("scroll_source.rs");
+        let (production, tests) = halves(SOURCE);
+
+        // D-14: a test either runs everywhere or is `#[ignore]`d with a reason. The mechanical
+        // form of "does not decide whether to run by looking at the environment" is that this
+        // file never reads the environment at all.
+        assert_eq!(
+            production.matches("env::var").count(),
+            0,
+            "this module must not decide whether to run by reading the environment (D-14); the \
+             frame source needs no desktop, so nothing here needs a conditional"
+        );
+
+        // Line-anchored, not substring: the first version matched the phrase `#[ignore]`d with a
+        // reason` in the comment right above it. An attribute is a line; prose about one is not.
+        let ignores: Vec<&str> = tests
+            .lines()
+            .filter(|line| line.trim_start().starts_with("#[ignore"))
+            .collect();
+        for line in &ignores {
+            assert!(
+                line.trim_start().starts_with("#[ignore = "),
+                "an #[ignore] in this module must carry a reason (D-14): {line}"
+            );
+        }
+        assert!(
+            ignores.is_empty(),
+            "every test in this module runs everywhere — that is the whole claim of G9 — so a \
+             new #[ignore] here is a regression, not a convenience ({} found)",
+            ignores.len()
+        );
+    }
+
+    #[test]
+    fn this_module_never_becomes_a_context_user() {
+        const SOURCE: &str = include_str!("scroll_source.rs");
+        let (production, _) = halves(SOURCE);
+
+        // `T-THREAD-1` (P0.02, docs/30 §21.3) found that "the creating thread is the only user"
+        // is false in this codebase: the device is created on the capture worker and used by the
+        // overlay and the export path, and the real protocol is "one user at a time, handed
+        // over". The scroll driver is not a user at all — §11.2 routes reads through the capture
+        // worker — so this file must never reach the immediate context itself. It reaches
+        // `providers::ScrollFrame::read_region`, which is the boundary, and that is the point.
+        for needle in [
+            ".context()",
+            "GraphicsDevice::create",
+            "read_back_bgra",
+            "read_back_region_bgra",
+        ] {
+            assert!(
+                !production.contains(needle),
+                "scroll_source.rs must not reach the immediate context directly ({needle}): \
+                 T-THREAD-1 (docs/30 §21.3) says the scroll path is not a context user, and \
+                 §11.2 is what keeps it that way"
+            );
+        }
     }
 }
 

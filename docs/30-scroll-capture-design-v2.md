@@ -3483,6 +3483,17 @@ fn context(&self) -> &ID3D11DeviceContext {
 
 **第 3 步：只有在第 2 步被实测否决时，才考虑搬线程**，且必须带着 `E-THREAD-1` 的实测数据（普通截图捕获延迟在滚动会话进行中的 P50/P95 变化）。
 
+**第 ③ 步的前置结论：滚动路径根本不使用 context（`P2.08`，2026-10-09）**
+
+上面第 2 步要解决的是"同一个设备被两个长命线程使用"。**滚动路径不在这个问题的范围里**，而这件事必须被机械地钉住，否则它只是一句设计意图：
+
+- 滚动驱动线程**不持有** `ID3D11DeviceContext`，一次也不碰。它拿到的是**回读后的字节**（`FrameSource::next` 交出 `Observation`），而回读发生在 capture worker 上——§11.2 的 `ReadRegion` 请求就是这条边界的形状。
+- 因此 `windows/scroll_source.rs` **刻意没有** `.context()` / `GraphicsDevice::create` / `read_back_*` 的调用：设备是**从外面传进来的**（`WgcFrameBackend::open(device, handle)`），context 只在 `providers::ScrollFrame::read_region` 内部被触及，而那一层是 §11.2 的 capture-worker 边界。
+- 这条边界由 `this_module_never_becomes_a_context_user`（`crates/snapclip-capture/src/windows/scroll_source.rs` 的测试模块）**机械保证**：它用 `include_str!` 读自己的**生产半区**并断言四个针脚（`.context()`、`GraphicsDevice::create`、`read_back_bgra`、`read_back_region_bgra`）一个都不出现。将来谁想"顺手在滚动路径里读一下纹理"，构建就红。
+- 与 §21.5 的公寓规则同构：两条都是"不要在某处做看起来更直接的事"，所以都留下了一条可执行的钉子而不是一句注释。
+
+**为什么这条前置结论重要**：第 2 步的三个候选方案里，"把导出回读搬到 capture worker" 会改变 capture worker 的职责；而滚动路径的**新增**回读需求（§11.3 每步一次）**已经**在 capture worker 上，所以第 2 步不需要为滚动路径扩大范围——它只需要处理 overlay 的放大镜取样与导出回读这两处**既有**的跨线程使用。`E-THREAD-1` 的对照实验因此不必把滚动会话算进去。
+
 **为什么这个顺序写在文档里而不是留给实现者**：`docs/19` §4.2 把这个约束表述成"扩展 GPU 单写者不变量"，而 §4.3.3 的核对显示**它今天已被违反**。若照 V1 的表述直接实施，实现者会在迁移中发现"不变式本来就不成立"，然后各自发明兼容方式——**这正是 AGENTS.md 禁止的那类隐性补丁**。把它写成"先断言、再证明、最后才迁移"的三步，是把根因（今天有 4 个调用点）显式地放在最前面。
 
 ### 21.4 取消：与既有协议同构，**不引入线程中断**
@@ -4591,6 +4602,21 @@ exit=1
 > **V2 的规则**：真实桌面用例**只有两种合法形态**——(a) `#[ignore]`（必须显式 `--ignored` 运行），或 (b) **环境断言**：若 `desktop_available()` 为 false，测试**必须**要么 `#[ignore]` 语义地跳过**并打印可见的跳过原因**，要么**断言失败**。**不允许静默 `return`。**
 
 **理由**：静默跳过会让"我以为测过了"成为系统性风险。§6 已确证参考项目 `snow_shot` 的 CTest 列表里**看不见**三个滚动测试的 LABELS（落默认 unit），也是同一类问题（**测试存在但不在门禁里**）。**"存在但不可见"与"不存在"对工程质量是等价的。**
+
+#### 29.2.1 落地的形状（`P2.08`，2026-10-09）
+
+`P2.08` 把上表两行变成可执行的东西：**L2 的接缝**（`MockFrameSource`）与**D-14 的机械形式**。
+
+**`MockFrameSource`（`crates/snapclip-capture/src/windows/scroll_source.rs` 的测试模块）**：一个按脚本产出 `Poll` 的 `FrameSource` 实现（`MockStep::{Frame, Idle, Ended, Failed}` + `new(viewport)`/`then(step)`）。它与 `ScriptedBackend` **不是同一个东西**：后者测**帧源自己的规则**（去重、尺寸、终局），前者测**消费者**。今天还没有消费者——循环是 `P3.09` 的交付物——所以这里能证明的是**接缝本身**：`fn drain(source: &mut dyn FrameSource, budget, timeout) -> Vec<Decision>` 只通过 trait 对象工作，**若消费者需要 trait 之外的东西，这个函数就写不出来**。这就是 G9 在类型层面的意思。
+
+**D-14 的机械形式**（`no_real_desktop_test_silently_skips_in_this_module`）：本模块**不读环境**（生产半区 `env::var` 计数为 0），且**没有任何 `#[ignore]`**（G9 的主张正是"这个模块的测试到处都能跑"，所以在此新增一条 `#[ignore]` 是回归而不是方便）。若将来确有需要跳过的用例，它必须带理由（`#[ignore = "…"]`），这条也被断言。
+
+**两处执行期发现（都是自指扫描的真实缺陷，值得记下来）**：
+
+1. **自扫描的测试必须说明自己读的是哪一半。** 第一版直接扫整个文件，于是匹配到了**写在它自己体内的针脚**（`.context()` 出现在针脚清单里、`env::var` 出现在统计它的断言里）——两条断言都真的失败了。修法 = `fn halves(source) -> (生产半区, 测试半区)`，按 `#[cfg(test)]` 切开。**一个分不清"代码"与"检查代码的代码"的扫描，会在任何人写下一条关于它的测试时立刻误报。**
+2. **属性是行锚定的，散文不是。** 第二版仍按子串找 `#[ignore`，于是匹配到了注释里的那句 "`#[ignore]`d with a reason"。修法 = 逐行判断 `line.trim_start().starts_with("#[ignore")`。
+
+**未取得**：退出条件 ① 的字面形式是"mock 帧源可驱动 `ScrollLoop`"，而 `ScrollLoop` 是 `P3.09` 的交付物（§21.1 把唯一新增线程放在 P3）。今天满足的是**它的前置**：mock 存在、接缝是 trait 对象、且被证明能产出四种 `Poll` 形状（含"结局是终局"）。`P3.09` 接线时应当**直接使用这个 mock**，而不是另写一个。
 
 ### 29.3 核心正确性测试：合成扫描 `E-ACC-1`
 
