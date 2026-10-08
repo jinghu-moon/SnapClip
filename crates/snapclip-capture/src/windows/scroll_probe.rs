@@ -102,13 +102,16 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CWP_SKIPINVISIBLE, ChildWindowFromPointEx, CreateWindowExW, DefWindowProcW, DestroyWindow,
     DispatchMessageW, ES_AUTOVSCROLL, ES_MULTILINE, EnumWindows, GetClassNameW, GetClientRect,
-    GetCursorPos, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId, HWND_TOP,
+    GetCursorPos, GetForegroundWindow, GetWindowDisplayAffinity, GetWindowTextW,
+    GetWindowThreadProcessId, HWND_TOP,
     HWND_TOPMOST,
     IsIconic, IsWindowVisible, MSG,
     PM_REMOVE, PeekMessageW, PostMessageW, RegisterClassW, SB_LINEDOWN, SPI_GETMOUSEWHEELROUTING,
     SPI_GETWHEELSCROLLLINES, SW_RESTORE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SendMessageW,
-    SetCursorPos, SetForegroundWindow, SetWindowPos, ShowWindow, SystemParametersInfoW,
-    TranslateMessage, WM_ERASEBKGND, WM_MOUSEWHEEL, WM_PAINT, WM_VSCROLL, WNDCLASSW,
+    SetCursorPos, SetForegroundWindow, SetWindowDisplayAffinity, SetWindowPos, ShowWindow,
+    SystemParametersInfoW,
+    TranslateMessage, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WM_ERASEBKGND, WM_MOUSEWHEEL, WM_PAINT,
+    WM_VSCROLL, WNDCLASSW,
     WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL, WindowFromPoint,
 };
 
@@ -3777,5 +3780,397 @@ fn uipi_probe() {
         send_input.measured_px,
         post.error.as_deref().unwrap_or("accepted"),
         post.measured_px
+    );
+}
+
+// --- OQ-2: does `WDA_EXCLUDEFROMCAPTURE` affect display-level WGC? (P2 phase exit ②) ---
+//
+// `docs/30 §24.5` and `OQ-2` say the same thing from two sides: the overlay already calls
+// `SetWindowDisplayAffinity(window, WDA_EXCLUDEFROMCAPTURE)` (`overlay/window_host.rs:228`),
+// **MS Learn never mentions WDA in any of the capture pages** (F-22: official silence, not a
+// gap in the search), and V2 therefore refuses to treat WDA as a correctness guarantee. It
+// is "best effort on the monitor-level fallback path" until somebody measures it.
+//
+// The measurement needs a window whose presence in a captured frame is a *pixel value*, not
+// a judgement call — hence a fixture painted one flat colour that appears nowhere else on a
+// normal desktop.
+
+/// COLORREF is `0x00BBGGRR`. This green is chosen to be a colour a desktop does not contain.
+const WDA_FIXTURE_COLOUR: u32 = 0x0038_C46A;
+
+/// What one sampled pixel says about whether the fixture is in the captured frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WdaVerdict {
+    /// The fixture's own colour: the window is in the frame.
+    Visible,
+    /// Solid black where the fixture is. Per `F-22` this is what `WDA_MONITOR` does, and
+    /// what `WDA_EXCLUDEFROMCAPTURE` degrades to before Win10 2004.
+    Black,
+    /// Something else: neither the fixture nor black. Reported rather than folded into
+    /// either verdict, because "excluded" and "replaced by a different window" differ.
+    Other(u8, u8, u8),
+}
+
+impl WdaVerdict {
+    fn of(pixel: (u8, u8, u8)) -> Self {
+        let (blue, green, red) = pixel;
+        let expected = (
+            (WDA_FIXTURE_COLOUR & 0xFF) as u8,
+            ((WDA_FIXTURE_COLOUR >> 8) & 0xFF) as u8,
+            ((WDA_FIXTURE_COLOUR >> 16) & 0xFF) as u8,
+        );
+        // Tolerance for the compositor's colour handling; a flat fill should be exact, but
+        // "almost exactly our green" is still our green.
+        let near = |a: u8, b: u8| a.abs_diff(b) <= 2;
+        if near(red, expected.2) && near(green, expected.1) && near(blue, expected.0) {
+            Self::Visible
+        } else if red < 8 && green < 8 && blue < 8 {
+            Self::Black
+        } else {
+            Self::Other(red, green, blue)
+        }
+    }
+
+    fn name(self) -> String {
+        match self {
+            Self::Visible => "visible".to_string(),
+            Self::Black => "black".to_string(),
+            Self::Other(r, g, b) => format!("other({r},{g},{b})"),
+        }
+    }
+}
+
+/// A window painted one flat colour, so that "is it in the frame" is one pixel read.
+struct WdaFixture {
+    hwnd: HWND,
+}
+
+impl WdaFixture {
+    fn create(rect: Rect) -> Result<Self, String> {
+        let class = wide("SnapclipWdaProbeFixture");
+        let title = wide("snapclip WDA probe fixture");
+        // Leaked for the same reason as the wheel fixture: the class keeps the pointer.
+        let class = Box::leak(class.into_boxed_slice());
+        let brush = unsafe { CreateSolidBrush(WDA_FIXTURE_COLOUR) };
+        unsafe {
+            RegisterClassW(&WNDCLASSW {
+                style: 0,
+                lpfnWndProc: Some(DefWindowProcW),
+                cbClsExtra: 0,
+                cbWndExtra: 0,
+                hInstance: ptr::null_mut(),
+                hIcon: ptr::null_mut(),
+                hCursor: ptr::null_mut(),
+                hbrBackground: brush,
+                lpszMenuName: ptr::null(),
+                lpszClassName: class.as_ptr(),
+            });
+        }
+        let hwnd = unsafe {
+            CreateWindowExW(
+                0,
+                class.as_ptr(),
+                title.as_ptr(),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                rect.left,
+                rect.top,
+                rect.width(),
+                rect.height(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null(),
+            )
+        };
+        if hwnd.is_null() {
+            return Err("CreateWindowExW(WDA probe fixture) returned null".into());
+        }
+        Ok(Self { hwnd })
+    }
+
+    fn client_rect(&self) -> Result<Rect, String> {
+        client_rect_of(self.hwnd).ok_or_else(|| "the WDA fixture has no client rect".to_string())
+    }
+
+    /// Sets the affinity and returns what the system reports afterwards.
+    ///
+    /// The read-back matters: `SetWindowDisplayAffinity` can fail (it only accepts a
+    /// top-level window of the calling process, and it conflicts with
+    /// `UpdateLayeredWindow`), and a failed call would otherwise look exactly like
+    /// "WDA had no effect".
+    fn set_affinity(&self, affinity: u32) -> Result<u32, String> {
+        let accepted = unsafe { SetWindowDisplayAffinity(self.hwnd, affinity) };
+        if accepted == 0 {
+            return Err(format!(
+                "SetWindowDisplayAffinity(0x{affinity:x}) failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let mut current = 0u32;
+        let read = unsafe { GetWindowDisplayAffinity(self.hwnd, &mut current) };
+        if read == 0 {
+            return Err(format!(
+                "GetWindowDisplayAffinity failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(current)
+    }
+}
+
+impl Drop for WdaFixture {
+    fn drop(&mut self) {
+        unsafe {
+            DestroyWindow(self.hwnd);
+        }
+    }
+}
+
+/// Reads one pixel of a monitor capture.
+///
+/// The capture is display-level on purpose: that is the path WDA is supposed to protect
+/// (`docs/30 §24.5`). The window-level path does not need WDA at all — the overlay is a
+/// different top-level window and cannot appear in the target's own frames (§24.2 fact 1).
+fn monitor_pixel(
+    device: &d3d11::GraphicsDevice,
+    layout: &monitor::CapturedMonitor,
+    point: Point,
+) -> Result<(u8, u8, u8), String> {
+    let frame = wgc::capture_monitor(device, layout)?;
+    let origin = layout.origin();
+    let x = point.x - origin.x;
+    let y = point.y - origin.y;
+    if x < 0 || y < 0 || x as u32 >= frame.width || y as u32 >= frame.height {
+        return Err(format!(
+            "({}, {}) is outside the captured monitor {}x{} at ({}, {})",
+            point.x,
+            point.y,
+            frame.width,
+            frame.height,
+            origin.x,
+            origin.y
+        ));
+    }
+    let bgra = device.read_back_bgra(&frame.texture)?;
+    let index = ((y as u32 * frame.width + x as u32) * 4) as usize;
+    let pixel = bgra
+        .get(index..index + 4)
+        .ok_or_else(|| format!("the readback is shorter than the frame ({index} + 4)"))?;
+    Ok((pixel[0], pixel[1], pixel[2]))
+}
+
+/// Returns a description of why the screen cannot be measured right now, or `None`.
+///
+/// This exists because a locked or disconnected session is **indistinguishable from a working
+/// WDA** if you only look at the captured pixels: the desktop frame comes back black, and
+/// "the window is not in the frame" is exactly what WDA is supposed to achieve. Reporting
+/// that as a WDA result would be the worst kind of wrong answer — a negative one that was
+/// never tested. So the environment is checked first, and its absence is reported as an
+/// environment failure.
+fn interactive_desktop_problem() -> Option<String> {
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground.is_null() {
+        return Some(
+            "GetForegroundWindow() returned NULL, which is what a locked or disconnected \
+             session looks like"
+                .to_string(),
+        );
+    }
+    // BitBlt is the independent check: on a secure desktop it fails with access denied even
+    // though the process is running fine.
+    match bitblt::capture_rect(Rect::new(0, 0, 8, 8)) {
+        Ok(_) => None,
+        Err(error) => Some(format!("BitBlt of the screen failed: {error}")),
+    }
+}
+
+#[test]
+#[ignore = "E-CAP-1 extension for OQ-2: needs a real interactive desktop and paints a window on screen"]
+fn wda_probe() {
+    let _ = monitor::set_per_monitor_v2_awareness();
+
+    if let Some(problem) = interactive_desktop_problem() {
+        // Not a silent skip: this is an explicit, loud "the measurement was not obtained",
+        // with the evidence attached, because the alternative is a black frame that reads
+        // like a successful WDA exclusion.
+        panic!(
+            "OQ-2 was NOT measured: {problem}. WDA's effect cannot be told apart from a locked \
+             desktop, so this probe refuses to report either answer. Run it again with an \
+             unlocked, connected desktop."
+        );
+    }
+
+    // Put the fixture somewhere a desktop is unlikely to be busy, and make it big enough
+    // that the sampled centre is unambiguously inside it.
+    let fixture = match WdaFixture::create(Rect::new(240, 240, 240 + 420, 240 + 320)) {
+        Ok(fixture) => fixture,
+        Err(error) => {
+            eprintln!("[OQ-2] no fixture window: {error}");
+            return;
+        }
+    };
+    let client = match fixture.client_rect() {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!("[OQ-2] no client rect: {error}");
+            return;
+        }
+    };
+    let probe_point = Point::new(
+        client.left + client.width() / 2,
+        client.top + client.height() / 2,
+    );
+
+    // The fixture needs to be *unoccluded*, not focused: WDA is about whether the window
+    // appears in a captured frame, and focus has nothing to do with that. So this does not
+    // use `bring_to_front` — that one asserts on `GetForegroundWindow`, which the foreground
+    // lock refuses when another process owns the foreground (and this probe has no keyboard
+    // claim to make, so the Alt-tap escape would be theatre). The verification is instead
+    // "the window at the sampled point is the fixture", which is the property that matters.
+    unsafe {
+        SetWindowPos(
+            fixture.hwnd,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+        );
+    }
+    pump_for(Duration::from_millis(500));
+    let at_point = unsafe { WindowFromPoint(POINT { x: probe_point.x, y: probe_point.y }) };
+    if at_point != fixture.hwnd {
+        // Refuse rather than report: if something else is on top of the sampled point, "the
+        // fixture is not in the frame" would be true for a reason that has nothing to do
+        // with WDA.
+        panic!(
+            "the window at the sampled point is {at_point:?}, not the fixture {hwnd:?}: something \
+             is occluding it, so this probe would measure the occluder instead of WDA",
+            hwnd = fixture.hwnd
+        );
+    }
+
+    let layout = match monitor::captured_monitor_at(probe_point) {
+        Ok(layout) => layout,
+        Err(error) => {
+            eprintln!("[OQ-2] no monitor at the fixture: {error}");
+            return;
+        }
+    };
+    let device = match d3d11::GraphicsDevice::create() {
+        Ok(device) => device,
+        Err(error) => {
+            eprintln!("[OQ-2] no D3D11 device: {error}");
+            return;
+        }
+    };
+
+    /// Captures `FRAMES` times and reports how many of them showed the fixture.
+    fn sample(
+        device: &d3d11::GraphicsDevice,
+        layout: &monitor::CapturedMonitor,
+        point: Point,
+        frames: usize,
+    ) -> Vec<WdaVerdict> {
+        let mut verdicts = Vec::with_capacity(frames);
+        for _ in 0..frames {
+            match monitor_pixel(device, layout, point) {
+                Ok(pixel) => verdicts.push(WdaVerdict::of(pixel)),
+                Err(error) => {
+                    eprintln!("[OQ-2] capture failed: {error}");
+                    verdicts.push(WdaVerdict::Other(0, 0, 0));
+                }
+            }
+            pump_for(Duration::from_millis(60));
+        }
+        verdicts
+    }
+
+    fn count(verdicts: &[WdaVerdict], wanted: WdaVerdict) -> usize {
+        verdicts.iter().filter(|v| **v == wanted).count()
+    }
+
+    const FRAMES: usize = 10;
+
+    // Arm 1: control. WDA off — the fixture must be in the frame, or the probe is measuring
+    // nothing and every later number would be meaningless.
+    if let Err(error) = fixture.set_affinity(WDA_NONE) {
+        eprintln!("[OQ-2] WDA_NONE refused: {error}");
+        return;
+    }
+    pump_for(Duration::from_millis(200));
+    let control = sample(&device, &layout, probe_point, FRAMES);
+
+    // Arm 2: the question. `WDA_EXCLUDEFROMCAPTURE` needs Win10 2004; before that it
+    // degrades to `WDA_MONITOR`, which paints a black block rather than hiding the window
+    // (F-22). Both outcomes are distinguishable from `Visible` by construction.
+    let excluded = match fixture.set_affinity(WDA_EXCLUDEFROMCAPTURE) {
+        Ok(observed) => {
+            pump_for(Duration::from_millis(300));
+            let verdicts = sample(&device, &layout, probe_point, FRAMES);
+            eprintln!(
+                "[OQ-2] arm 2: SetWindowDisplayAffinity(0x11) accepted, GetWindowDisplayAffinity reads back 0x{observed:x}"
+            );
+            verdicts
+        }
+        Err(error) => {
+            eprintln!("[OQ-2] arm 2: {error}");
+            Vec::new()
+        }
+    };
+
+    // Arm 3: control again, after turning WDA back off. Without it, "the fixture vanished
+    // in arm 2" could just as well be "the desktop changed under us".
+    if let Err(error) = fixture.set_affinity(WDA_NONE) {
+        eprintln!("[OQ-2] WDA_NONE refused on the way back: {error}");
+        return;
+    }
+    pump_for(Duration::from_millis(300));
+    let restored = sample(&device, &layout, probe_point, FRAMES);
+
+    let describe = |verdicts: &[WdaVerdict]| {
+        if verdicts.is_empty() {
+            "not run".to_string()
+        } else {
+            format!(
+                "visible {} / black {} / other {}",
+                count(verdicts, WdaVerdict::Visible),
+                count(verdicts, WdaVerdict::Black),
+                verdicts.len() - count(verdicts, WdaVerdict::Visible) - count(verdicts, WdaVerdict::Black)
+            )
+        }
+    };
+
+    eprintln!("[OQ-2] display-level WGC, {} frames per arm, pixel at ({}, {}):", FRAMES, probe_point.x, probe_point.y);
+    eprintln!("  arm 1  WDA_NONE                 : {}", describe(&control));
+    eprintln!("  arm 2  WDA_EXCLUDEFROMCAPTURE   : {}", describe(&excluded));
+    eprintln!("  arm 3  WDA_NONE (restored)      : {}", describe(&restored));
+    eprintln!(
+        "[OQ-2] verdict: WDA {} the monitor-level capture path",
+        if count(&excluded, WdaVerdict::Visible) == 0 {
+            "affects"
+        } else {
+            "does NOT affect"
+        }
+    );
+
+    // The only assertion: the controls. Arm 2's outcome is the *finding* — OQ-2 exists
+    // because nobody knows it — so it is reported, not asserted into either answer.
+    assert!(
+        count(&control, WdaVerdict::Visible) >= FRAMES - 1,
+        "the fixture was not visible in the control arm ({} of {} frames), so this probe cannot \
+         tell WDA's effect from a broken fixture: {}",
+        count(&control, WdaVerdict::Visible),
+        FRAMES,
+        control.iter().map(|v| v.name()).collect::<Vec<_>>().join(", ")
+    );
+    assert!(
+        count(&restored, WdaVerdict::Visible) >= FRAMES - 1,
+        "the fixture did not come back after WDA_NONE ({} of {} frames), so arm 2's result \
+         cannot be attributed to the affinity: {}",
+        count(&restored, WdaVerdict::Visible),
+        FRAMES,
+        restored.iter().map(|v| v.name()).collect::<Vec<_>>().join(", ")
     );
 }

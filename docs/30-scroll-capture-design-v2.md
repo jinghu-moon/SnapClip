@@ -4101,6 +4101,24 @@ pub(crate) fn topology_outcome(before: &TargetGeometry, after: &TargetGeometry) 
 | 目标是 **SnapClip 自己** | 拒绝（无意义），`ScrollTarget::validate` 检查进程 id |
 | 覆盖层的 display affinity | 窗口级路径**不需要**；显示器级回退路径**需要**（且不可用时回退到"捕获前隐藏覆盖层"策略，§24.7） |
 
+#### 24.5.1 WDA 在显示器级路径上的效果：**未取得**（`E-CAP-1` 扩展，2026-10-09）
+
+`OQ-2` / `R-25` 要求"显示器级回退路径下开/关 WDA 各取 10 帧，逐像素比较覆盖层区域"。仪器已落盘（`crates/snapclip-capture/src/windows/scroll_probe.rs` 的 `#[ignore] fn wda_probe()`），**但本次没有测到**，如实记为**未取得**。
+
+**为什么未取得**：运行探针时的会话**不是可交互桌面**。三条独立证据同时成立：
+
+1. `GetForegroundWindow()` 返回 **`NULL`**（`[P0.6] foreground=0x0 focus=0x4250f56 wanted=0x4250f56`）——锁屏/断开的会话就是这个样子；
+2. `BitBlt` 整个屏幕返回 **`拒绝访问。 (0x80070005)`**（安全桌面上无法读取）；
+3. 显示器级 WGC 帧**尺寸与回读长度都正确**（3840×2160、33,177,600 字节 = `w×h×4`），但**窗口所在的矩形读出全黑**——即使 `WindowFromPoint(采样点)` 确认那个位置**就是**我们的探针窗口，而它的类画刷是一个纯色。
+
+**这三条合起来说明为什么"未取得"必须区别于"测出 WDA 生效"**：一个锁定桌面的黑帧与"WDA 成功排除了窗口"在像素上**完全同形**。若只看像素就下结论，会得到一条**从未被测试过的否定答案**——这正是 `bring_to_front` 那条断言（"the probe refuses to report a negative answer it did not actually test"）所防的同一类错误。因此探针先检查环境，环境不成立时**大声失败并附带证据**，而不是静默返回：
+
+> `OQ-2 was NOT measured: GetForegroundWindow() returned NULL, which is what a locked or disconnected session looks like. WDA's effect cannot be told apart from a locked desktop, so this probe refuses to report either answer. Run it again with an unlocked, connected desktop.`
+
+**探针的设计（供下一次在有桌面时直接运行）**：`WdaFixture` 是一个用 `CreateSolidBrush` 画成**单一纯色**的窗口（`WDA_FIXTURE_COLOUR = 0x0038_C46A`，一个正常桌面不会出现的绿色），于是"窗口在不在帧里"是**一次像素读取**而不是一个判断。三个臂各 10 帧：①`WDA_NONE`（对照，必须可见）②`WDA_EXCLUDEFROMCAPTURE`（**这是问题本身，只报告不断言**——`OQ-2` 存在正是因为没人知道）③`WDA_NONE`（恢复对照，必须重新可见）。判定分三态 `Visible` / `Black` / `Other(r,g,b)`，其中 `Black` 单独成一态是因为 `F-22` 说 **`WDA_MONITOR`（以及 Win10 2004 之前的 `0x11` 静默降级）给出的正是黑块**——把它和"窗口消失了"混为一谈会掩盖降级。`SetWindowDisplayAffinity` 的返回值还要经 `GetWindowDisplayAffinity` **回读确认**：该调用只接受本进程的顶层窗口，一次失败与"WDA 没效果"在表象上无法区分。
+
+**对设计的影响：没有影响，而这正是设计的一部分。** §24.5 已经把 WDA 定为"**不是**正确性依赖"（窗口级捕获使覆盖层在物理上不可能入镜，§24.2 事实 1），所以 `OQ-2` 的答案只影响**显示器级回退路径**上"要不要在捕获前隐藏覆盖层"这个取舍。在答案到来之前，回退路径按 §24.7 走"**不可用时就隐藏**"，即把 WDA 当优化而不是保证——这条策略不需要 `OQ-2` 就能成立。
+
 **F-13 与 §6 的 R15 的前提已被本机实测否证**（2026-10-08）：`PostMessageW` **不是**"在提权目标上唯一可行的方案"——它对更高完整性的窗口直接失败（`ERROR_ACCESS_DENIED`，§24.6.2 结论 6）。**必须分开"消息投递"的两种价值**：(a) "bypasses UIPI"——**不成立**（投递同样被 UIPI 拦截，只是失败形式从静默变成响亮）；(b) "面向具体 HWND 而不是前台窗口"——**成立且有用**（`MOUSE_POS` 路由下 `SendInput` 的滚轮跟随的是**光标**，见 §24.6 判定规则 1）。所以两条并列路径的真正分工是"**注入点由谁决定**"（系统 vs 我们），不是"能否越过完整性壁垒"。**这对产品是可交付的结论**：提权目标上的正确行为是**尽早拒绝并说清原因**，与 PixPin 一致（`docs/26`），而不是保留一条只在文档里存在的旁路。
 
 ### 24.6 注入路径的条件选择（不是主/备）
@@ -4780,6 +4798,7 @@ fn rows_match(actual, expected, sigma) -> bool
 | 帧源超时 | 后端在超时内不给帧 | `Idle`（不是错误、不是取消）（§11.1.1） | L1 | — |
 | 重复交付同一帧 | 后端逐字节重发上一帧 | `Idle`，不是第二个观测（§11.1.1） | L1 | — |
 | 目标尺寸变化 | 后端交付与视口不同的尺寸 | `Ended(TargetLost)` + 说明性 detail（§11.1.1） | L1 | — |
+| 显示器级回退 + WDA 下覆盖层不出现 | 纯色夹具窗口 × {`WDA_NONE`, `WDA_EXCLUDEFROMCAPTURE`, `WDA_NONE`} 各 10 帧 | **未取得**（2026-10-09：运行时会话非可交互桌面，黑帧与"WDA 生效"同形 ⇒ 探针拒绝作答）。仪器 = `scroll_probe::wda_probe`，见 §24.5.1 | L3 | — |
 
 ### 30.2 Scroll（滚动/注入）
 
@@ -5387,7 +5406,7 @@ fn rows_match(actual, expected, sigma) -> bool
 | # | 问题 | 为什么现在不能定 | 如何定 | 阻塞什么 |
 |---|---|---|---|---|
 | **OQ-1** | `PostMessageW(WM_MOUSEWHEEL)` 到底能不能驱动 Chromium 的滚动？ | **F-14 只有源码链路旁证，没有任何官方依据**（Chromium 是否忽略跨进程投递的滚轮消息，既未证实也未证伪）；且 Chromium 的 `GetMessageTime()` 逻辑可能把连续同时间戳的滚轮误判为横向滚动 | ✅ **本机已答：能**——`E-INJECT-1` 最小版实测 `SendInput` 800 px、`PostMessageW` 800 px（各 8 notch，逐 notch 累加，§24.6.1），五目标矩阵进一步确认（§24.6.2）。**残留**：Edge 的 `SendInput` 无效而 `PostMessageW` 有效；Electron/WinUI3 的负答案不可解释（`OQ-15`）；WebView2 无宿主未取得；`GetMessageTime` 同时间戳风险（本探针每次注入之间 `pump_for`，未专门构造同时间戳序列） | **不变**：`§24.6` 两条并列路径与 §13 的"不抢前台"目标都保留（原判据是"若失败则重评"，实测未失败）；**新增**：Edge 使"零位移后必须切换路径"从补偿机制变成日常机制 |
-| **OQ-2** | `WDA_EXCLUDEFROMCAPTURE` 对 WGC 窗口捕获/显示器捕获是否生效？ | **MS Learn 全系列页零处提及 WDA**（官方沉默）；且 <Win10 2004 会**静默降级为 `WDA_MONITOR`（黑块）** | `E-CAP-1` 扩一条：显示器级回退路径下开/关 WDA 各取 10 帧，逐像素比较覆盖层区域 | §24.5 的措辞与 §5.1 的"降级层"；**不影响窗口级主路径**（主路径不需要 WDA） |
+| **OQ-2** | `WDA_EXCLUDEFROMCAPTURE` 对 WGC 窗口捕获/显示器捕获是否生效？ | **MS Learn 全系列页零处提及 WDA**（官方沉默）；且 <Win10 2004 会**静默降级为 `WDA_MONITOR`（黑块）** | **仪器已落盘、本次未取得**（2026-10-09）：`scroll_probe.rs` 的 `#[ignore] fn wda_probe()` 可一条命令给出三态答案，但运行时会话**不是可交互桌面**（`GetForegroundWindow()` == NULL、`BitBlt` → `0x80070005`），此时黑帧与"WDA 生效"同形 ⇒ 探针拒绝给出任一答案。解除条件 = **在未锁定、已连接的桌面上跑一次 `wda_probe`**（§24.5.1） | §24.5 的措辞与 §5.1 的"降级层"；**不影响窗口级主路径**（主路径不需要 WDA） |
 | **OQ-3** | `SendInput` 在 UIPI 场景下的方向性 | 官方两页**互相矛盾**（`SendInput` 页称可注入"同等或更低完整性"，winapp-cli 页称提权→AppContainer 会被挡） | ✅ **本机已答（2026-10-08，§24.6.2 结论 6）**：把**发送方**降到 `S-1-16-4096`（`tools/p009-low-integrity-launch.ps1`，`runas /trustlevel` **不行**）、目标 = 高完整性 Chrome ⇒ `SendInput` **投递成功但 0 px**、`PostMessageW` **`Win32 error 5`** ⇒ **两条路径都不可用**。**残留注脚**：低完整性发送方连 `SetCursorPos` 都静默失败（`FALSE` 且 `GetLastError() == 0`），机制未确证（两个候选机制都指向同一结论） | ✅ **已决**：提权目标在 v1 **只能"提示用户以管理员运行 SnapClip"**（与 PixPin 一致），且必须在**开始滚动之前**提示；`§24.5` 的矩阵首行与 F-13 的旁路设想都已按实测改写 |
 | **OQ-4** | 125%/150%/175% 缩放下"整数物理像素位移"是否成立？ | **F-23**：Chromium 布局是 1/64 px 定点、滚动偏移只在暴露给 Web 时吸附物理像素 → 位移**可能是物理非整数**（如 1.25 px） | 需要 125%/150% 的真实显示器（**本机 `PixelRatio: 1`，取不到**） | §16.1 门一与 N3；若位移确实非整数，则"整宽行带 + 整数位移"模型会出现**周期性丢行** → 需要重新评估（可能引入"累计小数余量"） |
 | **OQ-5** | `SPI_GETMOUSEWHEELROUTING` 为 `MOUSE_POS(2)` 时，非前台窗口能否收到 `SendInput` 滚轮？ | 本机实测是 `2`，但**这是用户可改的系统设置**，不能作为设计前提；官方页只说明默认值 | ⚠️ **本机已答一半（§24.6.2 结论 5）**：`MOUSE_POS` 下**能**——目标非前台、光标停在其客户区中心时滚了 400 px，而当时的前台窗口消费 0 px ⇒ **滚轮跟随光标而非前台窗口**。**残留**：`CURSOR` / `FOCUS` 两个取值下的行为仍未测 | §24.6 判定规则 1 **已按实测改写**（从"`SendInput` 打到前台窗口"改为"打到光标所在窗口"，实现的不变式 = 先把光标放到目标上）；`SPI_GETMOUSEWHEELROUTING` 列入会话开始时的必读设置 |
