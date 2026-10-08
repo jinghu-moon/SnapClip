@@ -41,6 +41,15 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::geometry::Rect;
+use crate::scroll::displacement::{
+    self, GateOutcome, Scratch, Status, candidates_1d, gate_geometry, gate_margin,
+    gate_residual_gain, gate_support, is_verifiable, margin_of, outside_cell_second, refine_winner,
+    score_candidates_2d,
+};
+use crate::scroll::observation::{Axis, Observation};
+use crate::scroll::orb;
+
 /// Rows a single scripted step advances the document viewport by.
 ///
 /// 120 px is the measured Chromium response to eight wheel notches (`P0.09`, `docs/30`
@@ -447,6 +456,428 @@ fn elapsed_us(duration: Duration) -> u64 {
 }
 
 // ---------------------------------------------------------------------------------------
+// The production funnel (the four combinations `docs/31` P0.03 asks for)
+// ---------------------------------------------------------------------------------------
+//
+// The section above measures a **layer-1 prototype**; this one measures the shipped funnel
+// (`displacement.rs` layers 1–3 plus `orb.rs`), because P1.02–P1.07 and P1.23 have landed and
+// `docs/30` §36.2 (`OQ-8`) owes the four-combination rerun to exactly this device.
+//
+// Four deliberate decisions, each of which changes what the numbers mean:
+//
+// * **Frame production and `Observation` construction are outside the timed region.** The
+//   frame source is `P0.05`/`P0.06`'s subject, and an `Observation` must exist before the
+//   funnel can be called at all. The probe therefore pays one frame copy per step that the
+//   session does not pay in that shape (a capture readback *is* the copy), and it is not
+//   counted. What is counted is the estimate.
+// * **The prior is the truth.** `expected` is the scripted step, so the search window is
+//   centred correctly on every step. This measures *cost*, not accuracy — accuracy is
+//   `E-ACC-1`'s device. A real prior drifts, and a drifted prior widens the window (§16.6).
+// * **The search window is the production formula** (`docs/30` §15.6): `max(4, ceil(0.3·n·ĝ))`
+//   = 36 at a 120 px step, where the prototype above used a fixed 32. Two percent wider, and
+//   the prototype's rows stay reproducible as they were measured.
+// * **ORB runs only when §15.4 ④ says so**, and its cost is reported as *per-vote × trigger
+//   rate* rather than folded into every step. On a sequence where the vote never triggers, a
+//   forced sample is taken anyway (`SNAPCLIP_PERF1_ORB_VOTES`) so the fourth combination has a
+//   number instead of a blank, and forced samples are kept **out of** the step total because
+//   production would not have paid them.
+
+/// Which combination of the funnel a run measures. `DigestOnly` is not one of the four: it is
+/// the attribution device for the layer-1 result (digest vs 1D search), because `candidates_1d`
+/// digests both sides internally and one timing cannot be split after the fact.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Combo {
+    DigestOnly,
+    Layer1,
+    Layer12,
+    Layer123,
+    Layer123Orb,
+}
+
+impl Combo {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "digest" => Some(Self::DigestOnly),
+            "l1" => Some(Self::Layer1),
+            "l12" => Some(Self::Layer12),
+            "l123" => Some(Self::Layer123),
+            "l123-orb" => Some(Self::Layer123Orb),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::DigestOnly => "funnel-digest",
+            Self::Layer1 => "funnel-l1",
+            Self::Layer12 => "funnel-l12",
+            Self::Layer123 => "funnel-l123",
+            Self::Layer123Orb => "funnel-l123-orb",
+        }
+    }
+
+    /// How many of layers 1–3 this combination runs.
+    fn depth(self) -> u8 {
+        match self {
+            Self::DigestOnly | Self::Layer1 => 1,
+            Self::Layer12 => 2,
+            Self::Layer123 | Self::Layer123Orb => 3,
+        }
+    }
+
+    fn votes(self) -> bool {
+        matches!(self, Self::Layer123Orb)
+    }
+}
+
+/// `docs/30` §15.6: `W_search = max(4, ceil(0.3·n·ĝ))`.
+fn production_search_window(expected: i32) -> i32 {
+    let scaled = (expected.unsigned_abs() as f64 * 0.3).ceil() as i32;
+    scaled.max(4)
+}
+
+/// `docs/30` §16.6: the prior's interval is `[n·ĝ(1−κ), n·ĝ(1+κ)]` with `κ = 0.5`.
+fn inside_prior(shift: i32, expected: i32) -> bool {
+    let magnitude = expected.unsigned_abs() as f32;
+    let shift = shift.unsigned_abs() as f32;
+    shift >= magnitude * (1.0 - displacement::PRIOR_KAPPA) && shift <= magnitude * (1.0 + displacement::PRIOR_KAPPA)
+}
+
+/// What one step's funnel produced, for the report's tallies.
+#[derive(Default)]
+struct FunnelTally {
+    confirmed: u32,
+    uncertain: u32,
+    none: u32,
+    wrong: u32,
+    candidates_hit: u32,
+    refined_hit: u32,
+    orb_triggers: u32,
+    orb_forced: u32,
+}
+
+struct FunnelReport {
+    viewport: &'static str,
+    combo: Combo,
+    steps: usize,
+    tally: FunnelTally,
+    layer1: Distribution,
+    layer2: Distribution,
+    layer3: Distribution,
+    orb: Distribution,
+    total: Distribution,
+    live_bytes: usize,
+    peak_bytes: usize,
+}
+
+impl FunnelReport {
+    fn empty(viewport: &'static str, combo: Combo) -> Self {
+        Self {
+            viewport,
+            combo,
+            steps: 0,
+            tally: FunnelTally::default(),
+            layer1: Distribution::default(),
+            layer2: Distribution::default(),
+            layer3: Distribution::default(),
+            orb: Distribution::default(),
+            total: Distribution::default(),
+            live_bytes: live_bytes(),
+            peak_bytes: peak_bytes(),
+        }
+    }
+
+    fn candidate_rate(&self) -> f64 {
+        if self.steps == 0 {
+            return 0.0;
+        }
+        self.tally.candidates_hit as f64 / self.steps as f64
+    }
+
+    fn refined_rate(&self) -> f64 {
+        if self.steps == 0 {
+            return 0.0;
+        }
+        self.tally.refined_hit as f64 / self.steps as f64
+    }
+
+    fn confirmed_rate(&self) -> f64 {
+        if self.steps == 0 {
+            return 0.0;
+        }
+        self.tally.confirmed as f64 / self.steps as f64
+    }
+
+    fn orb_trigger_rate(&self) -> f64 {
+        if self.steps == 0 {
+            return 0.0;
+        }
+        self.tally.orb_triggers as f64 / self.steps as f64
+    }
+
+    fn json_line(&self) -> String {
+        let stage = |name: &str, value: Distribution, total: Distribution| {
+            format!(
+                "\"{name}\":{{\"p50_us\":{},\"p95_us\":{},\"max_us\":{},\"share\":{:.4}}}",
+                value.p50_us,
+                value.p95_us,
+                value.max_us,
+                if total.p50_us == 0 { 0.0 } else { value.p50_us as f64 / total.p50_us as f64 }
+            )
+        };
+        let layers = [
+            stage("layer1", self.layer1, self.total),
+            stage("layer2", self.layer2, self.total),
+            stage("layer3", self.layer3, self.total),
+            stage("orb", self.orb, self.total),
+        ]
+        .join(",");
+        format!(
+            concat!(
+                "{{\"kind\":\"combo\",\"combo\":\"{}\",\"viewport\":\"{}\",\"steps\":{},",
+                "\"candidates_hit_rate\":{:.4},\"refined_hit_rate\":{:.4},",
+                "\"confirmed_rate\":{:.4},\"wrong\":{},\"uncertain\":{},\"none\":{},",
+                "\"orb_triggers\":{},\"orb_trigger_rate\":{:.4},\"orb_forced\":{},",
+                "\"p50_us\":{},\"p95_us\":{},\"max_us\":{},",
+                "\"layers\":{{{}}},",
+                "\"alloc\":{{\"live_bytes\":{},\"peak_bytes\":{}}},\"profile\":\"release\"}}"
+            ),
+            self.combo.label(),
+            self.viewport,
+            self.steps,
+            self.candidate_rate(),
+            self.refined_rate(),
+            self.confirmed_rate(),
+            self.tally.wrong,
+            self.tally.uncertain,
+            self.tally.none,
+            self.tally.orb_triggers,
+            self.orb_trigger_rate(),
+            self.tally.orb_forced,
+            self.total.p50_us,
+            self.total.p95_us,
+            self.total.max_us,
+            layers,
+            self.live_bytes,
+            self.peak_bytes,
+        )
+    }
+}
+
+/// Runs the shipped funnel over `sequence` and reports where the step's time goes.
+///
+/// The verdict chain (`docs/30` §16.1's four gates, then `is_verifiable`) is executed but not
+/// optimised: it is a handful of comparisons next to a full-resolution correlation, and running
+/// it keeps the tallies honest about what the timed region actually did.
+fn measure_funnel(sequence: &SyntheticSequence, combo: Combo) -> FunnelReport {
+    let viewport = sequence.viewport;
+    if sequence.len() == 0 {
+        return FunnelReport::empty(viewport.label, combo);
+    }
+
+    let width = viewport.width as usize;
+    let height = viewport.height as usize;
+    let size = (viewport.width, viewport.height);
+    let region = Rect::new(0, 0, viewport.width as i32, viewport.height as i32);
+    let extent = viewport.height;
+    let expected = sequence.step_rows as i32;
+    let window = production_search_window(expected);
+    let truth = sequence.step_rows as i32;
+    let forced_budget = env_usize("SNAPCLIP_PERF1_ORB_VOTES", 8) as u32;
+
+    // The sequence produces one luma byte per pixel (it was written for the digest probe). The
+    // funnel wants a strictly packed BGRA observation, so the expansion happens here — outside the
+    // timed region, together with the frame production it belongs to. Replicating the byte into
+    // B/G/R makes §15.6's `(77R + 150G + 29B) >> 8` return exactly the document's value.
+    let mut previous_doc = vec![0u8; width * height];
+    let mut current_doc = vec![0u8; width * height];
+    let mut previous_pixels = vec![0u8; width * height * 4];
+    let mut current_pixels = vec![0u8; width * height * 4];
+    sequence.fill(0, &mut previous_doc);
+    expand_bgra(&previous_doc, &mut previous_pixels);
+    let mut previous = Observation::new(previous_pixels.clone(), region, 0, size, Axis::Vertical)
+        .expect("the probe's own frame is strictly packed");
+
+    let mut scratch = Scratch::new();
+    let mut tally = FunnelTally::default();
+    let mut layer1_samples = Vec::with_capacity(sequence.len());
+    let mut layer2_samples = Vec::new();
+    let mut layer3_samples = Vec::new();
+    let mut orb_samples = Vec::new();
+    let mut total_samples = Vec::with_capacity(sequence.len());
+
+    reset_peak();
+
+    for n in 1..=sequence.len() {
+        sequence.advance_frame(n, &previous_doc, &mut current_doc);
+        expand_bgra(&current_doc, &mut current_pixels);
+        // Outside the timed region: the frame source's stand-in and the observation the funnel
+        // needs as input. `previous` is moved forward, so exactly one copy per step is paid.
+        let current = Observation::new(current_pixels.clone(), region, n as i64, size, Axis::Vertical)
+            .expect("the probe's own frame is strictly packed");
+
+        let started = Instant::now();
+        // `DigestOnly` is layer 1's attribution, not a fifth combination: it stops after the two
+        // `primary_digests` calls that `candidates_1d` makes internally, because one timed call
+        // cannot be split afterwards. It must therefore *skip* the candidate search — timing both
+        // would report two digest passes plus the search as "the digest cost".
+        let candidates = if combo == Combo::DigestOnly {
+            let digests = displacement::primary_digests(&previous.view());
+            std::hint::black_box(digests.len());
+            let digests = displacement::primary_digests(&current.view());
+            std::hint::black_box(digests.len());
+            None
+        } else {
+            Some(candidates_1d(&previous.view(), &current.view(), expected, window))
+        };
+        let after_layer1 = Instant::now();
+        let scored = if combo.depth() >= 2 {
+            let candidates = candidates.as_ref().expect("layer 2 needs layer 1's candidates");
+            let views = scratch.pool(&previous.view(), &current.view());
+            Some(score_candidates_2d(views.previous(), views.current(), candidates))
+        } else {
+            None
+        };
+        let after_layer2 = Instant::now();
+        let refined = match (combo.depth() >= 3, scored.as_ref()) {
+            (true, Some(scored)) => {
+                let views = scratch.full_resolution(&previous.view(), &current.view());
+                refine_winner(views.previous(), views.current(), scored)
+            }
+            _ => None,
+        };
+        let after_layer3 = Instant::now();
+
+        // The verdict chain, so the tallies describe a real decision rather than a stub.
+        let (status, answer, margin) = match &scored {
+            None => (Status::None, 0, 1.0f32),
+            Some(scored) => match scored.iter().next().copied() {
+                None => (Status::None, 0, 1.0f32),
+                Some(best) => {
+                    let margin = margin_of(best.score, outside_cell_second(scored, best.d).map(|c| c.score));
+                    let answer = refined.map(|r| r.d).unwrap_or(best.d);
+                    let gates = [
+                        gate_geometry(best.d, extent),
+                        gate_residual_gain(best.gain),
+                        gate_support(best.tiles),
+                        gate_margin(best.d, margin),
+                    ];
+                    let rejection = gates.iter().find_map(|outcome| match outcome {
+                        GateOutcome::Reject(rejection) => Some(*rejection),
+                        GateOutcome::Pass => None,
+                    });
+                    let status = match rejection {
+                        Some(rejection) => rejection.status(),
+                        None if is_verifiable(best.d, extent) => Status::Confirmed { d: answer },
+                        None => Status::Uncertain { d: answer },
+                    };
+                    (status, answer, margin.unwrap_or(1.0))
+                }
+            },
+        };
+
+        // ORB: §15.4 ④'s trigger. A vote is quoted as per-vote × trigger rate, so a triggered vote
+        // is timed here and subtracted from the step total — the combination's deterministic cost
+        // is layers 1–3, and the second opinion is the thing that may or may not happen on top.
+        let mut orb_elapsed = Duration::ZERO;
+        if combo.votes() && combo.depth() >= 3 {
+            let triggered = orb::should_run(margin, inside_prior(answer, expected), tally.uncertain);
+            if triggered {
+                let vote_started = Instant::now();
+                let vote = orb::vote(&previous.view(), &current.view(), answer);
+                std::hint::black_box(vote);
+                orb_elapsed = vote_started.elapsed();
+                orb_samples.push(elapsed_us(orb_elapsed));
+                tally.orb_triggers += 1;
+            }
+        }
+        let finished = Instant::now();
+
+        if let Some(candidates) = candidates.as_ref() {
+            tally.candidates_hit += u32::from(candidates.iter().any(|candidate| candidate.d == truth));
+        }
+        if combo.depth() >= 3 {
+            tally.refined_hit += u32::from(refined.map(|r| r.d) == Some(truth));
+        }
+        match status {
+            Status::Confirmed { d } => {
+                tally.confirmed += 1;
+                if d != truth {
+                    tally.wrong += 1;
+                }
+            }
+            Status::Uncertain { .. } => tally.uncertain += 1,
+            Status::None => tally.none += 1,
+        }
+
+        layer1_samples.push(elapsed_us(after_layer1 - started));
+        if combo.depth() >= 2 {
+            layer2_samples.push(elapsed_us(after_layer2 - after_layer1));
+        }
+        if combo.depth() >= 3 {
+            layer3_samples.push(elapsed_us(after_layer3 - after_layer2));
+        }
+        total_samples.push(elapsed_us(finished - started) - elapsed_us(orb_elapsed));
+
+        std::mem::swap(&mut previous_doc, &mut current_doc);
+        std::mem::swap(&mut previous_pixels, &mut current_pixels);
+
+        // The trigger never fired, so there is no production vote to quote — but "ORB costs
+        // nothing because it never runs" is not a measurement. Force `SNAPCLIP_PERF1_ORB_VOTES`
+        // votes on this last frame pair, after every sample for this step has been taken: a vote is
+        // heavy enough (hundreds of milliseconds) that running them mid-sequence would depress the
+        // other layers' numbers through cache and clock effects, and the per-vote figure does not
+        // need to come from step `n` to be the per-vote figure. `orb_forced` says how many of the
+        // samples are these, not production, votes.
+        if n == sequence.len()
+            && combo.votes()
+            && combo.depth() >= 3
+            && orb_samples.is_empty()
+        {
+            for _ in 0..forced_budget {
+                let vote_started = Instant::now();
+                let vote = orb::vote(&previous.view(), &current.view(), expected);
+                std::hint::black_box(vote);
+                orb_samples.push(elapsed_us(vote_started.elapsed()));
+                tally.orb_forced += 1;
+            }
+        }
+
+        previous = current;
+    }
+
+    FunnelReport {
+        viewport: viewport.label,
+        combo,
+        steps: sequence.len(),
+        tally,
+        layer1: distribution(layer1_samples),
+        layer2: distribution(layer2_samples),
+        layer3: distribution(layer3_samples),
+        orb: distribution(orb_samples),
+        total: distribution(total_samples),
+        live_bytes: live_bytes(),
+        peak_bytes: peak_bytes(),
+    }
+}
+
+/// Expands the sequence's one-luma-byte-per-pixel frame into a strictly packed BGRA observation.
+///
+/// The sequence predates the funnel probe: it was written for the digest measurement, where one
+/// byte per pixel was the whole point (the digest reads bytes, not channels). The funnel needs the
+/// observation the shipped code takes, so the two forms have to meet somewhere; they meet here,
+/// outside every timed region, because the frame source — not the estimator — owns this cost.
+fn expand_bgra(luma: &[u8], bgra: &mut [u8]) {
+    assert_eq!(bgra.len(), luma.len() * 4, "one luma byte per pixel, four bytes per pixel out");
+    for (pixel, value) in bgra.chunks_exact_mut(4).zip(luma.iter().copied()) {
+        pixel[0] = value;
+        pixel[1] = value;
+        pixel[2] = value;
+        pixel[3] = 0xFF;
+    }
+}
+
+// ---------------------------------------------------------------------------------------
 // Allocator accounting
 // ---------------------------------------------------------------------------------------
 
@@ -602,6 +1033,123 @@ mod tests {
             report.top_k_hit_rate() > 0.99,
             "the scripted shift must land in the top-{CANDIDATES} candidates: hit rate {:.4}",
             report.top_k_hit_rate()
+        );
+    }
+
+    /// One funnel scenario per process, driven by `tools/p0-03-matching-cost.ps1` with
+    /// `SNAPCLIP_PERF1_COMBO` in `{digest, l1, l12, l123, l123-orb}`.
+    #[test]
+    #[ignore = "P0.03: one scenario per process in release; drive it with tools/p0-03-matching-cost.ps1"]
+    fn perf1_measures_one_funnel_combo() {
+        let label = std::env::var("SNAPCLIP_PERF1_VIEWPORT").unwrap_or_else(|_| "1080p".to_string());
+        let viewport = match label.as_str() {
+            "1080p" => VIEWPORT_1080P,
+            "1440p" => VIEWPORT_1440P,
+            "4k" => VIEWPORT_4K,
+            other => panic!("unknown SNAPCLIP_PERF1_VIEWPORT {other}"),
+        };
+        let combo_name = std::env::var("SNAPCLIP_PERF1_COMBO").unwrap_or_else(|_| "l1".to_string());
+        let combo = Combo::from_name(&combo_name)
+            .unwrap_or_else(|| panic!("unknown SNAPCLIP_PERF1_COMBO {combo_name}"));
+        let steps = env_usize("SNAPCLIP_PERF1_STEPS", 1000);
+        let step_rows = env_usize("SNAPCLIP_PERF1_STEP_ROWS", STEP_ROWS as usize) as i64;
+
+        let sequence = SyntheticSequence::scripted(viewport, steps, step_rows);
+        let report = measure_funnel(&sequence, combo);
+        let line = report.json_line();
+        println!("{line}");
+        if let Some(path) = std::env::var_os("SNAPCLIP_PERF1_OUT") {
+            append_json_line(Path::new(&path), &line);
+        }
+
+        assert_eq!(report.steps, steps, "the report must carry the scripted step count");
+        if combo == Combo::DigestOnly {
+            // The attribution combo stops before the candidate search, so it has no candidates and
+            // no rate to report. Pinning that here keeps the two meanings of "no candidates"
+            // (never searched vs searched and found nothing) from being confused in the output.
+            assert_eq!(
+                report.tally.candidates_hit, 0,
+                "the digest attribution must not search for candidates"
+            );
+            return;
+        }
+        assert_eq!(
+            report.candidate_rate(),
+            1.0,
+            "the scripted shift must reach the candidate set on every step, otherwise the \
+             combination is timing something other than a displacement estimate"
+        );
+        if combo.depth() >= 3 {
+            assert_eq!(
+                report.refined_rate(),
+                1.0,
+                "the third layer must land on the scripted shift on every step"
+            );
+            assert_eq!(
+                report.tally.wrong, 0,
+                "a confirmed step that disagrees with the script is a wrong answer, and this \
+                 sequence is designed to be answerable"
+            );
+        }
+    }
+
+    /// The device's own floor for the funnel: no steps, no cost. Not a special case for the
+    /// test's benefit — a run with no steps genuinely has no distribution.
+    #[test]
+    fn the_funnel_probe_reports_zero_for_an_empty_sequence() {
+        let sequence = SyntheticSequence::scripted(VIEWPORT_1080P, 0, STEP_ROWS);
+        let report = measure_funnel(&sequence, Combo::Layer123);
+
+        assert_eq!(report.steps, 0, "an empty sequence must report zero steps");
+        assert_eq!(report.total.max_us, 0, "an empty sequence must report a zero maximum");
+        assert_eq!(report.tally.confirmed, 0, "an empty sequence can confirm nothing");
+        assert_eq!(report.candidate_rate(), 0.0, "and it has no hit rate to report");
+    }
+
+    /// The funnel device must recover the scripted step before any of its timings are worth
+    /// quoting — a cheap funnel that loses the truth is not a cheap funnel.
+    #[test]
+    fn the_funnel_probe_recovers_the_scripted_step() {
+        let sequence = SyntheticSequence::scripted(VIEWPORT_1080P, 25, STEP_ROWS);
+        let report = measure_funnel(&sequence, Combo::Layer123);
+
+        assert_eq!(report.steps, 25, "the report must carry the scripted step count");
+        assert_eq!(
+            report.tally.candidates_hit, 25,
+            "the scripted shift must reach the candidate set on every step"
+        );
+        assert_eq!(
+            report.tally.refined_hit, 25,
+            "the third layer must land on the scripted shift on every step"
+        );
+        assert_eq!(report.tally.wrong, 0, "and no confirmed step may disagree with the script");
+    }
+
+    /// The attribution combo must measure layer 1's digest without also paying for the search it
+    /// is meant to attribute: the two numbers have to differ in exactly one thing.
+    #[test]
+    fn the_digest_attribution_is_layer_one_without_the_search() {
+        let sequence = SyntheticSequence::scripted(VIEWPORT_1080P, 5, STEP_ROWS);
+        let digest = measure_funnel(&sequence, Combo::DigestOnly);
+        let layer1 = measure_funnel(&sequence, Combo::Layer1);
+
+        assert_eq!(
+            digest.tally.candidates_hit, 0,
+            "the digest attribution must not search for candidates"
+        );
+        assert_eq!(
+            digest.tally.confirmed, 0,
+            "with no candidates there is nothing to confirm, and the report must say so rather \
+             than borrow layer 1's verdict"
+        );
+        assert_eq!(
+            layer1.tally.candidates_hit, 5,
+            "layer 1 itself must find the scripted shift on every step"
+        );
+        assert!(
+            digest.layer1.p50_us > 0,
+            "the digest attribution still has to be timed: a zero here means the combo measured \
+             nothing at all"
         );
     }
 
