@@ -2605,6 +2605,43 @@ enum BandError {
 2. **上限必须是可注入的策略值**，不是硬编码常量。理由：`docs/25` §7.2 第 1 项与 §6 的结论是**PixPin 的精确总上限判据未定位**（6 种静态手段 0 命中，扫描器已自校验）→ **不应反推竞品的数字**；而我们的架构上限由 `u32` 尺寸域与内存预算**推导**得出，与内容无关。
 3. **提示阈值与 PixPin 对齐是有意为之**：用户从 PixPin 迁移过来时，看到提示的位置应该一致。**这不影响架构**（是纯 UI 层参数）。
 
+#### 17.6.1 落地的形状（`P1.21`，2026-10-08）
+
+前两层今天是一个值对象，第三层仍是端口的（见下）：
+
+```rust
+pub(crate) struct LongImageLimits { max_pixels: u64, warn_length: u64 }
+
+impl LongImageLimits {
+    pub(crate) const DEFAULT_MAX_PIXELS: u64 = u32::MAX as u64 / 2;  // 2_147_483_647
+    pub(crate) const DEFAULT_WARN_LENGTH: u64 = 29_000;              // PixPin 的提示点
+
+    pub(crate) fn row_limit(&self, cross_len: u64) -> u64 { self.max_pixels / cross_len.max(1) }
+    pub(crate) fn reached(&self, primary_len: u64, cross_len: u64) -> bool;
+    pub(crate) fn warns_at(&self, primary_len: u64) -> bool;         // 不含 reached
+}
+
+// canvas.rs
+CoverageMap::truncate(&mut self, rows: u64);
+BandStore::truncate(&mut self, rows: u64) -> Result<(), BandError>;
+RecoveredImage::trim_to(&mut self, rows: u64) -> Result<u64, BandError>;  // 返回被丢掉的行数
+```
+
+三处裁决：
+
+1. **像素预算必须先变成行数**，所以 `row_limit(cross_len)` 是方法而不是字段：同一条策略在 320 px 宽的窗口和 3840 px 宽的窗口上是两个不同的行数，把行数存进策略对象就等于把画布宽度藏进第二个地方。
+2. **裁剪是"删掉尾巴"，不是"隐藏尾巴"**：`CoverageMap::truncate` 用 popcount **重算** `rows_covered`（本函数每会话只跑一次，重算是不会漂移的版本；O(1) 的规则属于每步都跑的 `mark_range`），`BandStore::truncate` 把**跨越**新末尾的条带截断而不是丢弃（丢掉它就在前缀里留下一个洞），跨越的**落盘**条带被读回、截断、重新常驻——因为 `SpillRef` 的校验和只覆盖它指向的那串字节（§17.5 ⑤），原地收窄会让之后每次载入都校验失败；重读有界（至多一个条带、每会话一次）。
+3. **`trim_to(0)` 是断言而不是静默**：零行的图像不是任何一种 `Partial`，它只在"视口本身就超出像素预算"时出现，而那是对**视口**的判断，属于调用方（§20.4）。同理 `trim_to` 只删尾部，不延长。
+
+**两条用例的实测**（`crates/snapclip-capture/src/scroll/canvas.rs`，`cargo test -p snapclip-capture --lib canvas:: -- --test-threads=1` = 14 passed）：
+
+| 用例 | 注入 | 结果 |
+|---|---|---|
+| `the_architecture_limit_is_injectable_and_trims_to_a_valid_partial` | `with_max_pixels(CROSS_PX × 1000)` ⇒ `row_limit == 1000` | 第 2 步把画布推到 1020 行 ⇒ 裁到 **1000**、`trim_to` 返回 **20**、剩余字节 == 文档 `[0, 1000)`、八条不变量成立、条带全部 `end_row ≤ 1000`、落盘键全 `< 1000`；前缀被 `PrefixSink` **流式**收下且重放被拒；`LongImageLimits::default().reached(1860, 320) == false`（上限是注入的，不是恒开的） |
+| `the_warn_length_is_a_pure_ui_parameter` | `with_warn_length(100)` 与默认 29,000 对照 | 两者 `row_limit` 相同、对 `[0, 99, 100, 1000, 29_000, 100_000]` 的 `reached` 答案逐一相同、两次驱动的 `len`/`trimmed`/字节**完全相同**（阈值不改变任何像素） |
+
+**尚未落地**：第 3 层（导出预算）与退出条件 ③ 的"`u32` 越界在 `begin` **之前**被拒绝"都在 `P4.05`——`RowBandSink`/`ImageMeta`/`estimate_bytes` 端口本身属 `P4.01`/`P4.02`，而 `png` 不是 `snapclip-capture` 的依赖，所以"PNG 解码回读"这条断言在 capture 里无法执行（`DEV-30`）。`warns_at` 今天也没有生产调用点（提示属 UI，`P2`/shell）。
+
 ### 17.7 导出：`RowBandSink` / `RowBandWriter`
 
 ```rust
@@ -2705,8 +2742,8 @@ impl Axis {
 | 参照系无漂移 | 100 步合成滚动，全部 `Confirmed` | 最终画布与真值**逐行相等**（不是"相似"）。**已可执行（`P1.19`）**：100 步 × 37 px、每步的参照视口由 `canvas.rows(position, extent)` materialize 出来（这正是"参照系来自画布"本身），最终逐行相等 |
 | `band_height` 推导 | 参数化 `shift` 从 0 到 `extent`，检查 `overlap ≥ extent/4` | 恒成立。**已可执行（`P1.18`）**：`shift ∈ [−extent, extent]` 且含 `extent` 本身 |
 | 双向扩展 / `Contained` | 先下滚再上滚；小幅回滚完全落在已覆盖区 | **已可执行（`P1.19`）**：prepend 后画布 == 文档对应区间（无 gap、无重复），`Contained` 的 `primary_len` 不变且位置前移 |
-| `BandStore` 换出 | 把常驻预算注入成 1 个条带 | 内存峰值不随长度增长；`spilled` 计数 > 0；恢复后画布逐字节正确 |
-| 上限三层 | `MAX_LONG_IMAGE_PIXELS` 注入成 1/10 | 产出 `Partial` 且**是合法 PNG**（能被解码回读） |
+| `BandStore` 换出 | 把常驻预算注入成 1 个条带 | 内存峰值不随长度增长；`spilled` 计数 > 0；恢复后画布逐字节正确。**已可执行（`P1.20`）**：10 条条带 + 1 条预算 ⇒ 9 条落盘、逐字节相等；另有一条 40 步的接线用例证明 `relieve` 真的挂在生产路径上 |
+| 上限三层 | `MAX_LONG_IMAGE_PIXELS` 注入成 1/10 | 产出 `Partial` 且**是合法 PNG**（能被解码回读）。**前两层已可执行（`P1.21`）**：注入 1000 行 ⇒ 裁到 1000、丢 20 行、前缀逐字节等于文档；**PNG 回读属 `P4.02`/`P4.05`** |
 | `RowBandSink` | 用一个只接受严格递增 `first_row` 的实现 | 乱序写入返回错误，不静默重排 |
 | 水平轴 | 同一条合成序列分别按两轴跑（**两个不同的文档**：垂直用原文档、水平用转置文档，`P1.03` 修正） | 结果逐行相等；前提断言"转置文档的列指纹 == 原文档的行指纹"成立；轴映射测试 `T-AXIS-1` 通过 |
 
@@ -4279,7 +4316,7 @@ if ($hits) { Write-Error "scroll/ must stay platform-free: $($hits -join '; ')";
 | `Contained` | 小幅回滚完全落在已覆盖区 | 识别为 `Contained`；不写重复内容 | L1 | 已可执行（`P1.19`，用例先证明两帧字节不同） |
 | 撤销一步 | 提交 10 步后 `undo` | 回退到第 9 步状态；`primary_len` 回退 | L1 | — |
 | 条带换出 | 预算注入成 1 个条带 | 峰值不随长度增长；恢复后逐字节正确 | L1 | **Memory**；已可执行（`P1.20`，10 条条带 + 1 条预算：9 条落盘、读完仍逐字节相等） |
-| 上限三层 | `MAX_LONG_IMAGE_PIXELS` 注入 1/10 | `Partial` 且**是合法 PNG** | L1+L2 | **Memory** |
+| 上限三层 | `MAX_LONG_IMAGE_PIXELS` 注入 1/10 | `Partial` 且**是合法 PNG** | L1+L2 | **Memory**；前两层已可执行（`P1.21`：注入 1000 行 ⇒ 裁到 1000、丢 20 行、前缀逐字节等于文档、阈值改变不影响任何像素）；**PNG 解码回读属 `P4.02`/`P4.05`** |
 | 流式导出 | 30,000 px 高 | 严格递增校验；乱序返回错误 | L2 | **Stitch Latency** |
 | 水平轴 | 同序列两轴 | 结果逐行相等 | L1 | **分轴 P50/P95** |
 | 轴映射 | `(dx,dy)` 全组合 | `T-AXIS-1` 通过 | L1 | — |

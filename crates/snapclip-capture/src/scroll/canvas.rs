@@ -218,6 +218,83 @@ impl MemoryBudget {
     }
 }
 
+/// §17.6's first two layers, as values rather than as constants.
+///
+/// The distinction the layers encode is not "how much" but "what happens when you cross it":
+///
+/// * **layer 1** (`max_pixels`) is an *architecture* limit. Crossing it stops the canvas at a
+///   contiguous prefix and produces a usable `Partial` — never a failure. The default is the `u32`
+///   size domain (`u32::MAX / 2` pixels), which is what keeps every `u64` logical interval
+///   representable in the final image's dimensions.
+/// * **layer 2** (`warn_length`) is a *UI* parameter. Crossing it changes no pixel: it is the point
+///   at which the user is told that some viewers cannot open very long images. It is deliberately
+///   aligned with PixPin's 29,000 px so that a migrating user sees the prompt in the same place.
+///
+/// Both are **injectable**, and that is a requirement rather than a convenience: `docs/25` could not
+/// locate PixPin's exact total limit, so the number must not be back-inferred from a competitor; our
+/// own limit is derived from the size domain and the memory budget, and a test has to be able to
+/// lower it (`docs/30` §17.6, property 2).
+///
+/// Layer 3 — the export budget given by `RowBandSink::begin`'s `estimate_bytes` — is the port's
+/// (`P4.05`), because the decision it forces ("trim *before* the first row, never during") can only
+/// be expressed where the height is fixed (F-12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LongImageLimits {
+    max_pixels: u64,
+    warn_length: u64,
+}
+
+impl LongImageLimits {
+    /// `u32::MAX / 2` pixels: the largest total that still leaves every row index inside `u32`.
+    pub(crate) const DEFAULT_MAX_PIXELS: u64 = u32::MAX as u64 / 2;
+    /// 29,000 px — deliberately the same number PixPin prompts at (§17.6 layer 2).
+    pub(crate) const DEFAULT_WARN_LENGTH: u64 = 29_000;
+
+    pub(crate) fn with_max_pixels(max_pixels: u64) -> Self {
+        Self {
+            max_pixels,
+            warn_length: Self::DEFAULT_WARN_LENGTH,
+        }
+    }
+
+    pub(crate) fn with_warn_length(mut self, warn_length: u64) -> Self {
+        self.warn_length = warn_length;
+        self
+    }
+
+    pub(crate) fn max_pixels(&self) -> u64 {
+        self.max_pixels
+    }
+
+    pub(crate) fn warn_length(&self) -> u64 {
+        self.warn_length
+    }
+
+    /// The longest canvas this policy allows, in rows. A pixel budget has to become rows through the
+    /// canvas width, which is why this is a method and not a field.
+    pub(crate) fn row_limit(&self, cross_len: u64) -> u64 {
+        self.max_pixels / cross_len.max(1)
+    }
+
+    /// Whether the canvas has reached the architecture limit. The caller trims to [`Self::row_limit`]
+    /// and reports `Partial`; it does not fail (§17.6's first non-negotiable property).
+    pub(crate) fn reached(&self, primary_len: u64, cross_len: u64) -> bool {
+        primary_len >= self.row_limit(cross_len)
+    }
+
+    /// Whether the user should be told. Inclusively, and about the *current* length, so that a
+    /// session that starts past the threshold still warns once.
+    pub(crate) fn warns_at(&self, primary_len: u64) -> bool {
+        primary_len >= self.warn_length
+    }
+}
+
+impl Default for LongImageLimits {
+    fn default() -> Self {
+        Self::with_max_pixels(Self::DEFAULT_MAX_PIXELS)
+    }
+}
+
 /// Where a band went on disk, and what it hashed to when it was written (§17.5 ④).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SpillRef {
@@ -581,6 +658,62 @@ impl BandStore {
             .sum()
     }
 
+    /// Keeps only the bands that cover rows `[0, rows)` — §17.6 layer 1's "contiguous prefix",
+    /// performed on the store. A band that straddles `rows` is **truncated**, not dropped: its first
+    /// `rows − first_row` rows belong to the prefix, and dropping them would leave a hole.
+    ///
+    /// A straddling *spilled* band is read back, truncated and re-inserted as resident, because a
+    /// `SpillRef`'s checksum covers exactly the bytes it points at (§17.5 ⑤): narrowing the reference
+    /// in place would make every later load fail the check. Re-reading is bounded (at most one band,
+    /// once per session) and the band may be spilled again by the next `relieve`.
+    ///
+    /// This is the only operation in this module that destroys content, and it is deliberately the
+    /// only one that cannot fail silently: every read goes through the checksum.
+    pub(crate) fn truncate(&mut self, rows: u64) -> Result<(), BandError> {
+        let row_bytes = (self.cross_len * BYTES_PER_PIXEL) as usize;
+        let mut kept: Vec<ResidentBand> = Vec::with_capacity(self.resident.len());
+        for entry in self.resident.drain(..) {
+            let first_row = entry.band.first_row;
+            if first_row >= rows {
+                continue;
+            }
+            if entry.band.end_row(self.cross_len) <= rows {
+                kept.push(entry);
+                continue;
+            }
+            let keep_rows = (rows - first_row) as usize;
+            let bytes = entry.band.rows[..keep_rows * row_bytes].to_vec();
+            kept.push(ResidentBand {
+                band: Band::new(first_row, bytes),
+                written: entry.written,
+            });
+        }
+        self.resident = kept;
+
+        let straddling: Vec<u64> = self
+            .spilled
+            .iter()
+            .filter(|(first_row, spilled)| {
+                **first_row < rows && **first_row + spilled.row_count > rows
+            })
+            .map(|(first_row, _)| *first_row)
+            .collect();
+        for first_row in straddling {
+            let spilled = *self
+                .spilled
+                .get(&first_row)
+                .expect("collected from this map a moment ago");
+            let bytes = self.read_spilled(&spilled)?;
+            self.spilled.remove(&first_row);
+            let keep_rows = (rows - first_row) as usize;
+            self.insert(Band::new(first_row, bytes[..keep_rows * row_bytes].to_vec()));
+        }
+        self.spilled.retain(|first_row, _| *first_row < rows);
+
+        self.sync_accounting();
+        Ok(())
+    }
+
     pub(crate) fn is_resident(&self, first_row: u64) -> bool {
         self.resident
             .iter()
@@ -799,6 +932,34 @@ impl CoverageMap {
         }
         self.last_exclusive += rows;
         self.mark_range(0, rows);
+    }
+
+    /// Keeps only the first `rows` rows — §17.6 layer 1's "contiguous prefix". The dropped tail is
+    /// gone rather than hidden, so a hole can never appear: whatever the caller does with the
+    /// remaining rows, invariant 4 still answers `rows_covered == span_end − span_start`.
+    ///
+    /// The count is recounted here instead of decremented. This runs **once** per session (at the
+    /// architecture limit) and a recount is the version that cannot drift; the O(1) rule belongs to
+    /// [`Self::mark_range`], which runs every step.
+    pub(crate) fn truncate(&mut self, rows: u64) {
+        let words = words_for(rows);
+        self.covered.truncate(words);
+        if let Some(last) = self.covered.last_mut() {
+            let keep = rows % 64;
+            if keep != 0 {
+                *last &= (1u64 << keep) - 1;
+            }
+        }
+        self.rows_covered = self.covered.iter().map(|word| word.count_ones() as u64).sum();
+        self.last_exclusive = self.last_exclusive.min(rows);
+        self.first = if self.rows_covered == 0 {
+            None
+        } else {
+            self.covered
+                .iter()
+                .position(|word| *word != 0)
+                .map(|index| index as u64 * 64 + self.covered[index].trailing_zeros() as u64)
+        };
     }
 }
 
@@ -1032,6 +1193,32 @@ impl RecoveredImage {
         self.bands.relieve(&protected)
     }
 
+    /// §17.6 layer 1's stop: keep the first `rows` rows and drop the tail, so that what remains is a
+    /// **contiguous prefix** — a usable `Partial`, not a failure. Returns how many rows were dropped.
+    ///
+    /// `rows == 0` is refused rather than served: an image with no rows is not a partial anything, and
+    /// the case only arises when the viewport alone exceeds the pixel budget — which is a statement
+    /// about the viewport, not about the content, and belongs to the caller (§20.4).
+    pub(crate) fn trim_to(&mut self, rows: u64) -> Result<u64, BandError> {
+        assert!(
+            rows > 0,
+            "a canvas trimmed to zero rows is not a Partial: a budget smaller than one row means the viewport does not fit"
+        );
+        assert!(
+            rows <= self.primary_len,
+            "trim_to({rows}) would extend a {}-row canvas: trimming only ever removes the tail",
+            self.primary_len
+        );
+        let dropped = self.primary_len - rows;
+        if dropped == 0 {
+            return Ok(0);
+        }
+        self.bands.truncate(rows)?;
+        self.primary_len = rows;
+        self.coverage.truncate(rows);
+        Ok(dropped)
+    }
+
     fn protected_rows(&self, reference: Option<(i64, u64)>) -> Vec<u64> {
         let mut protected = Vec::new();
         if let Some((position, extent)) = reference {
@@ -1222,8 +1409,8 @@ impl ViewportState {
 #[cfg(test)]
 mod tests {
     use super::{
-        BYTES_PER_PIXEL, Band, BandError, BandStore, CoverageMap, MemoryBudget, RecoveredImage,
-        SPILL_FILE_NAME, StepTally, StepWrite, ViewportState, band_height,
+        BYTES_PER_PIXEL, Band, BandError, BandStore, CoverageMap, LongImageLimits, MemoryBudget,
+        RecoveredImage, SPILL_FILE_NAME, StepTally, StepWrite, ViewportState, band_height,
     };
     use crate::geometry::Rect;
     use crate::scroll::displacement::{
@@ -2050,6 +2237,191 @@ mod tests {
                 committed: STEPS as u64,
                 discarded: 0,
             },
+        );
+    }
+
+    // --- the three layers of §17.6: an injectable limit, a warn threshold, a contiguous prefix
+    // (task P1.21) ---
+
+    /// A stand-in for `RowBandSink` (§17.7) whose only job is to prove the trimmed prefix can be
+    /// handed to a **streaming** consumer: strictly increasing rows, no reordering, no holes.
+    ///
+    /// The real sink (`P4.01`/`P4.02`) is what turns these rows into a PNG — and `png` is not a
+    /// dependency of this crate (§28.4), so "the artifact decodes back" is asserted there, not here.
+    /// What capture owes the encoder is a prefix it can stream without materialising the image.
+    struct PrefixSink {
+        next_row: u64,
+        bytes: Vec<u8>,
+    }
+
+    impl PrefixSink {
+        fn new() -> Self {
+            Self {
+                next_row: 0,
+                bytes: Vec::new(),
+            }
+        }
+
+        fn write_rows(&mut self, first_row: u64, rows: &[u8]) -> Result<(), String> {
+            if first_row != self.next_row {
+                return Err(format!(
+                    "write_rows({first_row}) is out of order: the sink is at {}",
+                    self.next_row
+                ));
+            }
+            self.bytes.extend_from_slice(rows);
+            self.next_row = first_row + (rows.len() / (CROSS_PX as usize * 4)) as u64;
+            Ok(())
+        }
+    }
+
+    /// Drives a canvas until the injected architecture limit stops it — exactly the way the session
+    /// will (§20.1: after every confirmed step, ask the limit; the limit is the canvas' policy, not
+    /// the estimator's business). Returns the partial, how many rows the trim dropped, and the canvas.
+    fn drive_to_the_limit(
+        image: &TestImage,
+        limits: &LongImageLimits,
+        steps: u32,
+    ) -> (u64, u64, Vec<u8>, RecoveredImage) {
+        let scripted: Vec<StepSpec> = (0..steps).map(|_| StepSpec::move_by(STEP)).collect();
+        let mut script = ScrollScript::new(image, VIEWPORT, scripted);
+        let mut canvas = RecoveredImage::new(
+            Axis::Vertical,
+            CROSS_PX as u64,
+            MemoryBudget::with_total(VIEWPORT_BUDGET),
+        );
+        let mut viewport = ViewportState::new(VIEWPORT);
+        canvas.start(&script.take(0));
+
+        let mut trimmed = 0;
+        for k in 1..=steps {
+            if limits.reached(canvas.primary_len(), CROSS_PX as u64) {
+                break;
+            }
+            let current = script.take(k as usize);
+            viewport
+                .apply(&mut canvas, &current, STEP)
+                .expect("the injected budget is a limit on length, not on residency");
+            if limits.reached(canvas.primary_len(), CROSS_PX as u64) {
+                trimmed = canvas
+                    .trim_to(limits.row_limit(CROSS_PX as u64))
+                    .expect("the prefix is readable, resident or spilled");
+                break;
+            }
+        }
+
+        let bytes = canvas
+            .rows(0, canvas.primary_len())
+            .expect("the partial is readable");
+        (canvas.primary_len(), trimmed, bytes, canvas)
+    }
+
+    #[test]
+    fn the_architecture_limit_is_injectable_and_trims_to_a_valid_partial() {
+        // §17.6 layer 1 is a **policy value**, not a constant: inject one tenth of a realistic
+        // budget and the canvas stops at a contiguous prefix instead of failing.
+        let image = TestImage::from_structures(CROSS_PX, DOC_ROWS, 11, 19, &mixed());
+        let limits = LongImageLimits::with_max_pixels(CROSS_PX as u64 * 1000);
+
+        assert_eq!(
+            limits.row_limit(CROSS_PX as u64),
+            1000,
+            "the pixel budget has to be converted to rows through the canvas width"
+        );
+        assert!(!limits.reached(999, CROSS_PX as u64));
+        assert!(limits.reached(1000, CROSS_PX as u64));
+        assert_eq!(
+            LongImageLimits::default().max_pixels(),
+            u32::MAX as u64 / 2,
+            "the default is the u32 size domain (docs/30 §17.6 layer 1)"
+        );
+        assert_eq!(
+            LongImageLimits::default().warn_length(),
+            29_000,
+            "the warn threshold is deliberately aligned with PixPin (docs/30 §17.6 layer 2)"
+        );
+
+        let (len, trimmed, bytes, canvas) = drive_to_the_limit(&image, &limits, 8);
+
+        assert_eq!(len, 1000, "the canvas must stop at the injected limit");
+        assert_eq!(
+            trimmed, 20,
+            "the step that crossed the limit wrote 120 rows onto 900: the trim gives back 20"
+        );
+        // The partial **is** the document's prefix. This is what makes the eventual PNG decodable:
+        // the rows are the content's own, in order, with no hole and no filler.
+        assert_eq!(
+            bytes,
+            document_rows(&image, 0, 1000),
+            "the partial is not the document's prefix"
+        );
+        canvas.assert_invariants(
+            CROSS_PX as u64,
+            StepTally {
+                step: 2,
+                committed: 2,
+                discarded: 0,
+            },
+        );
+
+        // The tail is gone, not merely hidden: no band and no spill entry reaches past the limit.
+        assert!(
+            canvas
+                .bands()
+                .bands()
+                .all(|band| band.end_row(CROSS_PX as u64) <= 1000),
+            "a band still reaches past the trimmed prefix"
+        );
+        assert!(
+            canvas.bands().spilled().keys().all(|first_row| *first_row < 1000),
+            "a spilled entry still reaches past the trimmed prefix"
+        );
+
+        // And it streams: §17.7's port only accepts strictly increasing rows, so a prefix that is
+        // contiguous and ordered is exactly the contract the encoder needs.
+        let mut sink = PrefixSink::new();
+        sink.write_rows(0, &bytes).expect("the prefix is in order");
+        assert_eq!(sink.next_row, 1000);
+        assert_eq!(sink.bytes, bytes);
+        assert!(
+            sink.write_rows(0, &bytes).is_err(),
+            "the sink accepted a replayed band, so this test cannot tell a prefix from a patchwork"
+        );
+
+        // The limit is injectable, not always on: the default would not have stopped this canvas.
+        assert!(!LongImageLimits::default().reached(1860, CROSS_PX as u64));
+    }
+
+    #[test]
+    fn the_warn_length_is_a_pure_ui_parameter() {
+        let image = TestImage::from_structures(CROSS_PX, DOC_ROWS, 11, 19, &mixed());
+        let base = LongImageLimits::with_max_pixels(CROSS_PX as u64 * 1000);
+        let chatty = base.with_warn_length(100);
+
+        assert_eq!(base.warn_length(), 29_000);
+        assert_eq!(chatty.warn_length(), 100);
+        // Same architecture limit, same answers: the threshold is not an input to the trim.
+        assert_eq!(base.row_limit(CROSS_PX as u64), chatty.row_limit(CROSS_PX as u64));
+        for length in [0, 99, 100, 1000, 29_000, 100_000] {
+            assert_eq!(
+                base.reached(length, CROSS_PX as u64),
+                chatty.reached(length, CROSS_PX as u64),
+                "the warn threshold changed the architecture verdict at {length} rows"
+            );
+        }
+        assert!(chatty.warns_at(100), "the threshold is inclusive");
+        assert!(!chatty.warns_at(99));
+        assert!(!base.warns_at(100), "29,000 px is not reached at 100 rows");
+        assert!(base.warns_at(29_000));
+
+        // Two identical sessions that differ **only** in the threshold produce identical pixels.
+        let (base_len, base_trimmed, base_bytes, _) = drive_to_the_limit(&image, &base, 8);
+        let (chatty_len, chatty_trimmed, chatty_bytes, _) = drive_to_the_limit(&image, &chatty, 8);
+        assert_eq!(base_len, chatty_len);
+        assert_eq!(base_trimmed, chatty_trimmed);
+        assert_eq!(
+            base_bytes, chatty_bytes,
+            "the warn threshold changed the pixels, so it is not a UI parameter"
         );
     }
 }
