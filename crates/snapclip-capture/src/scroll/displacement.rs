@@ -30,6 +30,8 @@
 // warning budget stays at zero (`docs/31` §4.1).
 #![allow(dead_code)]
 
+use crate::scroll::observation::ObservationView;
+
 /// The §16.7 weights, in one place because `E-ACC-1` calibrates them (`docs/30` §16.11 marks every
 /// one of these as a startup value, not a law).
 ///
@@ -183,9 +185,208 @@ impl Displacement {
     }
 }
 
+// --- layer 1 (`P1.05`) --------------------------------------------------------------------------
+
+/// How many candidates layer 1 may propose: `K = 8` (`docs/30` §15.6, from the reference
+/// implementation's `MAX_CANDIDATES`).
+pub(crate) const CANDIDATE_LIMIT: usize = 8;
+
+/// FNV-1a 64. `docs/30` §15.4 asks for a "64-bit fold" of a line without fixing the function; the
+/// first implementation of it was `scroll/perf_probe.rs`'s `row_digest`, and this is that function
+/// moved to the place layer 1 can share it. The `E-PERF-1` numbers in `docs/30` §23.3.1 were
+/// measured on *this* fold, so replacing it with a cheaper, more collision-prone one is a
+/// re-measurement, not a refactor.
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+#[inline]
+fn fold(state: u64, byte: u8) -> u64 {
+    (state ^ byte as u64).wrapping_mul(FNV_PRIME)
+}
+
+/// The fold of one contiguous primary line — a row, for a vertical observation.
+pub(crate) fn line_digest(bytes: &[u8]) -> u64 {
+    let mut state = FNV_OFFSET;
+    for &byte in bytes {
+        state = fold(state, byte);
+    }
+    state
+}
+
+/// The same fold over a column of the observation's pixels. `P1.02`'s `T-AXIS-1` requires that a
+/// transposed document's column digest to the original document's row, so the bytes are visited in
+/// the same order — `B, G, R, A` of one pixel after another, top to bottom.
+fn column_digest(pixels: &[u8], stride: usize, x: usize, height: u32) -> u64 {
+    let mut state = FNV_OFFSET;
+    for y in 0..height as usize {
+        let at = y * stride + x * 4;
+        for byte in &pixels[at..at + 4] {
+            state = fold(state, *byte);
+        }
+    }
+    state
+}
+
+/// The digest of every primary line of `view`, in order. `Axis` owns that branch (`P1.02`: a second
+/// `match` on the axis is a second place for it to be wrong).
+pub(crate) fn primary_digests(view: &ObservationView<'_>) -> Vec<u64> {
+    let extent = view.primary_extent();
+    let mut digests = Vec::with_capacity(extent as usize);
+    if view.axis().is_vertical() {
+        for index in 0..extent {
+            digests.push(line_digest(view.row(index)));
+        }
+    } else {
+        for index in 0..extent {
+            digests.push(column_digest(
+                view.pixels(),
+                view.row_stride(),
+                index as usize,
+                view.height(),
+            ));
+        }
+    }
+    digests
+}
+
+/// How many primary lines agree *exactly* when `current` is attributed `shift` (`docs/30` §15.4).
+///
+/// The count is deliberately not normalised by the overlap here: `support` is raw evidence, and the
+/// overlap it was measured over is what §16.2's gates normalise when (and only when) it becomes
+/// part of a score. Normalising early would hide exactly the carrier ambiguity `P1.05`'s refactor
+/// test is about.
+pub(crate) fn support_at(previous: &[u64], current: &[u64], shift: i32) -> u32 {
+    let overlap = current.len() as i64 - shift.unsigned_abs() as i64;
+    if overlap <= 0 {
+        return 0;
+    }
+    let previous_first = shift.max(0) as usize;
+    let current_first = (-(shift as i64)).max(0) as usize;
+    let mut support = 0;
+    for index in 0..overlap as usize {
+        if previous[previous_first + index] == current[current_first + index] {
+            support += 1;
+        }
+    }
+    support
+}
+
+/// One shift layer 1 proposes, with the number of primary lines that agree behind it.
+///
+/// It carries no score and no verdict: §16's gates are the first thing in the design allowed to
+/// compare anything at all, and they act on ratios over `Evidence`, not on a line count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Candidate {
+    pub(crate) d: i32,
+    pub(crate) support: u32,
+}
+
+/// Up to [`CANDIDATE_LIMIT`] candidates, best first.
+///
+/// A fixed array rather than `ArrayVec`: `arrayvec` is only a transitive dependency of this
+/// workspace, and N7/G11 forbid adding a crate dependency for it. Because the capacity is the
+/// §15.6 `K`, insertion is a shift-by-one inside eight elements and the hot path never allocates.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CandidateSet {
+    items: [Candidate; CANDIDATE_LIMIT],
+    len: usize,
+}
+
+impl CandidateSet {
+    pub(crate) fn new() -> Self {
+        Self {
+            items: [Candidate { d: 0, support: 0 }; CANDIDATE_LIMIT],
+            len: 0,
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Best first, so a caller that only looks at the first candidate still sees the ranking it is
+    /// trusting rather than an unspoken one.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &Candidate> {
+        self.items[..self.len].iter()
+    }
+
+    /// Keeps the ranking `(support desc, |d| asc, d asc)`. The tie-break is what makes the answer
+    /// deterministic on the carrier images where several shifts are equally supported (`P1.05`'s
+    /// exit condition ②).
+    fn insert(&mut self, candidate: Candidate) {
+        let mut at = self.len;
+        for (index, existing) in self.items[..self.len].iter().enumerate() {
+            if ranks_before(candidate, *existing) {
+                at = index;
+                break;
+            }
+        }
+        if at >= CANDIDATE_LIMIT {
+            return;
+        }
+        let last = self.len.min(CANDIDATE_LIMIT - 1);
+        for index in (at..last).rev() {
+            self.items[index + 1] = self.items[index];
+        }
+        self.items[at] = candidate;
+        if self.len < CANDIDATE_LIMIT {
+            self.len += 1;
+        }
+    }
+}
+
+fn ranks_before(candidate: Candidate, existing: Candidate) -> bool {
+    match candidate.support.cmp(&existing.support) {
+        core::cmp::Ordering::Greater => true,
+        core::cmp::Ordering::Less => false,
+        core::cmp::Ordering::Equal => {
+            (candidate.d.unsigned_abs(), candidate.d) < (existing.d.unsigned_abs(), existing.d)
+        }
+    }
+}
+
+/// `docs/30` §15.4's first layer: the cheap one-dimensional search that proposes where to look.
+///
+/// It takes `expected` (the controller's `n·ĝ`) and a half-width rather than a bare window: §15.6's
+/// `W_search` *is* a half-width, and a window without a centre cannot express the automatic mode at
+/// all — a 120 px step with `W_search = 36` would be outside its own search range.
+///
+/// The axis is read from the observations rather than passed in beside them: a second source for it
+/// could disagree with the frames, which is the mistake `P1.02`'s `T-AXIS-1` was rewritten to stop
+/// making. `d = 0` gets no exemption: §16.1's `d_0 = 0` is read here as "the zero-shift hypothesis
+/// is always evaluated", which happens whenever the window covers it, and it then competes under the
+/// same ranking rule as every other shift (hard-inserting it would both exceed the §15.6 `K` and
+/// grant it a privilege no other candidate has).
+pub(crate) fn candidates_1d(
+    previous: &ObservationView<'_>,
+    current: &ObservationView<'_>,
+    expected: i32,
+    window: i32,
+) -> CandidateSet {
+    let previous_digests = primary_digests(previous);
+    let current_digests = primary_digests(current);
+    let half = window.max(0);
+    let mut candidates = CandidateSet::new();
+    for shift in expected.saturating_sub(half)..=expected.saturating_add(half) {
+        candidates.insert(Candidate {
+            d: shift,
+            support: support_at(&previous_digests, &current_digests, shift),
+        });
+    }
+    candidates
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Displacement, Evidence, Status, StepEffect};
+    use super::{
+        CANDIDATE_LIMIT, Candidate, Displacement, Evidence, Status, StepEffect, candidates_1d,
+        primary_digests, support_at,
+    };
+    use crate::scroll::testkit::{ScrollScript, StepSpec, Structure, TestImage};
 
     fn evidence() -> Evidence {
         Evidence {
@@ -309,5 +510,143 @@ mod tests {
         assert_eq!(Evidence { tiles: 30, ..perfect }.coverage(), 1.0);
         assert_eq!(Evidence { tiles: 12, ..perfect }.coverage(), 1.0);
         assert_eq!(Evidence { tiles: 0, ..perfect }.coverage(), 0.0);
+    }
+
+    /// A document whose only structure is a 19-row carrier: every row is byte-identical to the row
+    /// 19 rows away from it, so a one-dimensional search cannot tell a shift from that shift plus a
+    /// multiple of 19. `band_height = 19` is what makes the period exact — `from_structures` hands
+    /// the structure `y % band_height`, so nothing seams at the band boundary.
+    fn periodic_document(structure: Structure) -> TestImage {
+        TestImage::from_structures(640, 60 * 19, 7, 19, &[structure])
+    }
+
+    #[test]
+    fn one_d_candidates_include_the_true_shift_on_a_periodic_image() {
+        // Layer 1 is allowed to be wrong; it is not allowed to be silent (`docs/31` §6 `P1.05`).
+        // On this document the true shift is the best-supported one, but it is not alone: the
+        // carrier makes a family of shifts match every row they can compare.
+        let image = periodic_document(Structure::HorizontalBars { period: 19 });
+        let mut script = ScrollScript::new(&image, 900, vec![StepSpec::move_by(7)]);
+        let previous = script.take(0);
+        let current = script.take(1);
+        let truth = script.truth(1);
+        assert_eq!(truth, 7);
+
+        let candidates = candidates_1d(&previous.view(), &current.view(), truth, 40);
+        assert!(!candidates.is_empty(), "layer 1 proposed nothing");
+        assert!(candidates.len() <= CANDIDATE_LIMIT);
+        assert!(
+            candidates.iter().any(|candidate| candidate.d == truth),
+            "layer 1 lost the true shift {truth}: {:?}",
+            candidates
+                .iter()
+                .map(|candidate| (candidate.d, candidate.support))
+                .collect::<Vec<_>>()
+        );
+
+        // The imposter is not an artifact of a threshold: one carrier period away, *every* row the
+        // shift can compare matches, exactly as it does at the true shift. That is what `support`
+        // counts, and it is why this layer hands back a set rather than an answer.
+        let previous_digests = primary_digests(&previous.view());
+        let current_digests = primary_digests(&current.view());
+        let extent = current.view().primary_extent() as i32;
+        let imposter = truth + 19;
+        assert!(
+            candidates.iter().any(|candidate| candidate.d == imposter),
+            "the carrier supports {imposter} perfectly and the layer dropped it"
+        );
+        assert_eq!(
+            support_at(&previous_digests, &current_digests, truth),
+            (extent - truth) as u32
+        );
+        assert_eq!(
+            support_at(&previous_digests, &current_digests, imposter),
+            (extent - imposter) as u32
+        );
+
+        // Exit condition ② also asks for determinism — including the order, which is where an
+        // unstable sort or a hash-ordered container would show up.
+        let again = candidates_1d(&previous.view(), &current.view(), truth, 40);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| (candidate.d, candidate.support))
+                .collect::<Vec<_>>(),
+            again
+                .iter()
+                .map(|candidate| (candidate.d, candidate.support))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn one_d_candidates_are_not_treated_as_a_verdict() {
+        // `docs/30` §15.4: "它的输出永远只是候选，不是结论". Two properties make that true of the
+        // *type* rather than of a convention, and both are pinned here:
+        //
+        //  * the destructuring below has no `..`, so the day `Candidate` grows a `confidence` or a
+        //    `status`, this test stops compiling;
+        //  * `support` is a *count of agreeing primary lines*, so there is nothing here a §16 gate
+        //    could compare against a threshold — those act on ratios over `Evidence`.
+        let image = periodic_document(Structure::HorizontalBars { period: 19 });
+        let mut script = ScrollScript::new(&image, 900, vec![StepSpec::move_by(7)]);
+        let previous = script.take(0);
+        let current = script.take(1);
+        let candidates = candidates_1d(&previous.view(), &current.view(), 7, 40);
+
+        let Candidate { d: _, support } = *candidates
+            .iter()
+            .next()
+            .expect("layer 1 proposed nothing to check");
+        let extent = current.view().primary_extent();
+        assert!(
+            support <= extent,
+            "support is a line count, not a score: {support} > {extent}"
+        );
+        for candidate in candidates.iter() {
+            let Candidate { d, support } = *candidate;
+            assert!(d.unsigned_abs() <= extent, "candidate {d} is out of range");
+            assert!(support <= extent);
+        }
+
+        // A set, not a point: evidence that cannot separate shifts is reported as several of them.
+        assert!(candidates.len() > 1, "one candidate is a verdict in disguise");
+    }
+
+    #[test]
+    fn a_periodic_line_carrier_does_not_decide_the_step() {
+        // Measured lesson from `scroll_probe.rs`: 19 px text rows produced correlation peaks
+        // (`corr ≈ 0.6–0.8`) at shifts that are not multiples of the row pitch. The 1D layer sees
+        // the same thing — a *family* of perfectly matching shifts — so normalising by the overlap
+        // ties them, which is exactly why §16's gates need two-dimensional evidence.
+        let image = periodic_document(Structure::TextRows { line: 19 });
+        let mut script = ScrollScript::new(&image, 900, vec![StepSpec::move_by(7)]);
+        let previous = script.take(0);
+        let current = script.take(1);
+        let candidates = candidates_1d(&previous.view(), &current.view(), 7, 40);
+        assert!(
+            candidates.iter().any(|candidate| candidate.d == 7),
+            "the carrier hid the true shift: {:?}",
+            candidates
+                .iter()
+                .map(|candidate| (candidate.d, candidate.support))
+                .collect::<Vec<_>>()
+        );
+
+        let previous_digests = primary_digests(&previous.view());
+        let current_digests = primary_digests(&current.view());
+        let extent = current.view().primary_extent() as i32;
+        let mut perfect_shifts = 0;
+        for shift in [7i32, 7 + 19, 7 + 38, 7 - 19] {
+            let overlap = (extent - shift.abs()) as u32;
+            assert!(overlap > 0);
+            assert_eq!(
+                support_at(&previous_digests, &current_digests, shift),
+                overlap,
+                "shift {shift} is not a perfect match over its own overlap"
+            );
+            perfect_shifts += 1;
+        }
+        assert!(perfect_shifts >= 3);
     }
 }

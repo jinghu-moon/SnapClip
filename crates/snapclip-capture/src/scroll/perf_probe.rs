@@ -188,35 +188,21 @@ impl SyntheticSequence {
 /// The layer-1 row digest: 64-bit FNV-1a over the row, `O(W)` and position sensitive.
 ///
 /// `docs/30` §15.4 specifies a "64-bit fold" without fixing the function. FNV-1a is this
-/// prototype's choice; a wider lane fold would be cheaper and collide more, and `P1.02` owns
-/// that decision. Every cost quoted from this probe is therefore the cost of *this* digest.
+/// prototype's choice, and `P1.05` promoted it to the shipped one (`displacement::line_digest`):
+/// the same bytes, the same constant, one implementation. Every cost quoted from this probe is
+/// therefore the cost of the function the session actually runs.
 fn row_digest(row: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &byte in row {
-        h ^= byte as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
+    crate::scroll::displacement::line_digest(row)
 }
 
 /// How many rows agree exactly when the observation is attributed a displacement of `shift`
-/// (`docs/30` §15.4 layer 1's "support").
+/// (`docs/30` §15.4 layer 1's "support"). Delegates to the shipped scan so the probe cannot drift
+/// from the funnel; a shift that is not a displacement at all supports nothing.
 fn support_at(previous: &[u64], current: &[u64], shift: i64) -> u32 {
-    let height = current.len() as i64;
-    let (previous_first, current_first) = if shift >= 0 { (shift, 0) } else { (0, -shift) };
-    let overlap = height - shift.abs();
-    if overlap <= 0 {
-        return 0;
+    match i32::try_from(shift) {
+        Ok(shift) => crate::scroll::displacement::support_at(previous, current, shift),
+        Err(_) => 0,
     }
-    let mut support = 0u32;
-    for index in 0..overlap {
-        let p = previous[(previous_first + index) as usize];
-        let c = current[(current_first + index) as usize];
-        if p == c {
-            support += 1;
-        }
-    }
-    support
 }
 
 /// The top-`k` shifts by support, searched in `[expected - search, expected + search]`.
