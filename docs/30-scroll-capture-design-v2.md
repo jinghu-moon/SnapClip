@@ -1331,6 +1331,53 @@ pub trait FrameSource {
 
 **V2 的 `FrameSource` 是拉取式（pull）而不是推送式（push）**：滚动循环的每一步都主动要一帧。理由：滚动的节奏由**注入**驱动（我们自己决定何时滚），所以"被动接收帧"没有意义；推送式还会带来一个额外的有界队列与背压问题（`docs/19` §4.1 的 `FramePoll` 与 Snow Shot 的 bounded(1) 信箱之争都属于自找的复杂度）。
 
+#### 11.1.1 落地的形状（P2.03，2026-10-09）
+
+上面那张签名图里的 `FrameSource` 是**会话层**看到的形状；`windows/scroll_source.rs` 把它拆成两层，因为"平台会不会给帧"与"给了帧算什么"是两个必须能分别验证的问题：
+
+```rust
+// 会话层（§27.3 的 trait，一字不改）
+trait FrameSource {
+    fn next(&mut self, timeout: Duration) -> Result<Poll, FrameError>;
+    fn viewport(&self) -> Rect;
+}
+
+// 平台层：本模块内部，触 WinRT。测试用脚本化的实现替换它，所以流规则不需要窗口。
+trait FrameBackend {
+    fn poll_frame(&mut self, timeout: Duration) -> Result<BackendPoll, FrameError>;
+    fn size(&self) -> (u32, u32);
+}
+
+enum BackendPoll {
+    Frame { pixels: Vec<u8>, size: (u32, u32), qpc: i64 },
+    Idle,
+    Ended { reason: EndReason, detail: String },
+}
+
+enum FrameError {
+    DeviceLost { id: String },                                  // 瞬态，不是结局
+    Transient { context: &'static str, detail: String },        // 瞬态，不是结局
+}
+
+struct WgcFrameSource {          // 持有策略：去重、尺寸检查、结局是否终局
+    backend: Box<dyn FrameBackend>,
+    axis: Axis,
+    size: (u32, u32),
+    last_rows: Option<Vec<u64>>, // 逐行摘要，不是第二份视口
+    detail: Option<String>,      // 结局为什么发生（P2.07 的 UI 要它）
+    ended: bool,
+}
+```
+
+**四条落地裁决**：
+
+1. **`Idle` 与"后端没有帧"是同一事实的两种到达方式，用逐行摘要判定。** `P0.05` 实测：WGC 只为"内容发生变化"产帧，静态窗口给几帧后彻底沉默（Chrome 3 帧、Edge 1 帧、记事本约 520 ms 一帧），而"没有新帧"在 `TryGetNextFrame` 上表现为 `null`（被 windows-rs 投影成 `#code=0` 的 `Err`）。因此"平台没给"与"给了但和上次一样"必须收敛到同一个答案，否则同一个静止画面会因平台心情不同而走两条控制路径。判据是**逐行 FNV 摘要**（`line_digest`，即 §11.3 的行指纹机制）：成本 `H × 8` 字节，而不是留一份视口大小的像素。
+2. **结局是终局，并且携带 detail。** `EndReason` 保持四个变体：窗口关闭 / 最小化 / 尺寸变化**都是 `TargetLost`**，由 `detail` 区分（`P2.07` 负责把它变成用户看得懂的话）。新增变体只会让下游的 `match` 增长而不携带信息。`ended` 之后不再轮询后端——一个已经结束的流再问一次不会得到新答案。
+3. **尺寸变化结束流，而不是移动视口。** 视口是会话不变量（§2.1 推论 2.6），所以"目标变成了另一个尺寸"不是"视口变了"而是"这个会话的前提没了"。`Observation::new` 会拒绝尺寸与 region 不一致的观测（`P1.03`），所以放行它也只会把 panic 推迟到下一层。
+4. **`FrameError` 永远是瞬态，永远不是结局。** 设备丢失也是瞬态：调用方重试或另开设备，而"目标没了"由 `Ended` 表达。这与 §29.4 的 D 类注入表一一对应（`mock 返回 Ended(TargetLost)` / `mock 返回 Err(FrameError::DeviceLost(id))` 是两行）。
+
+**代价与边界**：`windows` crate 为 `QueryPerformanceCounter` 新增了一条 feature（`Win32_System_Performance`）——是 feature 边，不是新 crate。**七条用例全部不需要窗口**（脚本化后端），这是 `P2.08` 要的前提。
+
 ### 11.2 帧的获取路径
 
 V2 复用既有 capture worker，但**新增一种请求**（不是新线程、不是新设备）：
@@ -4545,6 +4592,9 @@ fn rows_match(actual, expected, sigma) -> bool
 | 每步仅一次回读 | 100 步 + 回读计数 | 计数 == 100（§11.3） | L2 | — |
 | 同一帧读第二次 | 对一帧调两次 `read_region` | 第二次在**触到设备之前**被拒（§11.3.1） | L1 | — |
 | 区域落在帧内 | 视口/越界/全越界三种请求 | 越界被裁到帧、全越界在传输前被拒（§11.3.1） | L1 | — |
+| 帧源超时 | 后端在超时内不给帧 | `Idle`（不是错误、不是取消）（§11.1.1） | L1 | — |
+| 重复交付同一帧 | 后端逐字节重发上一帧 | `Idle`，不是第二个观测（§11.1.1） | L1 | — |
+| 目标尺寸变化 | 后端交付与视口不同的尺寸 | `Ended(TargetLost)` + 说明性 detail（§11.1.1） | L1 | — |
 
 ### 30.2 Scroll（滚动/注入）
 

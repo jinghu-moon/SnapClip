@@ -28,6 +28,7 @@ pub mod renderer;
 /// never to ship: it is test-only and nothing in the capture path calls it.
 #[cfg(test)]
 pub mod scroll_probe;
+pub mod scroll_source;
 pub mod timed_call;
 pub mod uia_provider;
 pub mod win;
