@@ -5,8 +5,12 @@ set -e
 echo "[pre-push] cargo check --workspace --all-targets"
 cargo check --workspace --all-targets
 
-echo "[pre-push] cargo test --workspace --lib"
-cargo test --workspace --lib
+echo "[pre-push] cargo test --workspace --lib -- --test-threads=1"
+# Serial on purpose: the default-parallel form of this command aborts the
+# snapclip-capture test binary with 0xc0000005 (STATUS_ACCESS_VIOLATION) in
+# unsigned driver / injected-DLL code, which turns the gate into a coin flip.
+# See docs/31-scroll-capture-tdd-tasklist.md §4.2 and the R-21 row (docs/31 §14.3).
+cargo test --workspace --lib -- --test-threads=1
 
 echo "[pre-push] dependency direction"
 powershell -NoProfile -File tools/check-dependency-direction.ps1
