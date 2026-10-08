@@ -31,6 +31,8 @@
 
 use std::time::{Duration, Instant};
 
+use crate::scroll::displacement::{Prior, Status, RHO_MIN};
+
 /// The compositor tick the overlay runs on (`crates/snapclip-capture/src/windows/overlay.rs:100`).
 ///
 /// Duplicated as a number rather than imported, because importing it would mean `scroll/` naming
@@ -332,6 +334,101 @@ impl<Path: Copy + PartialEq> ActuatorWatch<Path> {
                     _ => WatchVerdict::Failed,
                 }
             }
+        }
+    }
+}
+
+// --- §13.2's control law (task P3.05) ---
+
+/// The most notches one step may carry, which is the wire format's limit rather than ours.
+///
+/// `WM_MOUSEWHEEL`'s `mouseData` holds the delta in a signed 16-bit field, so 32767 / 120 = 273
+/// notches is the most a single message can express. Duplicated as a number for the same reason
+/// [`RENDER_TICK_MS`] is (naming the platform module here is forbidden by §28.4); a test on the
+/// actuator side asserts the two are equal, so the duplication cannot drift.
+pub(crate) const MAX_NOTCHES_PER_STEP: i32 = 273;
+
+/// The order-of-magnitude starting value for `ĝ`, in pixels per wheel notch.
+///
+/// `docs/30` §13.2: the initial `ĝ` is unknown, and the first step is taken with `n = 1` precisely
+/// because of that. This is not a measurement — it is a **starting value** built from the two things
+/// the platform tells us (`SPI_GETWHEELSCROLLLINES`, `P3.02`'s capability probe) and one thing we
+/// assume (a line of text is about twenty pixels tall). It only has to be the right order of
+/// magnitude: the loop converges from wherever it starts, and starting closer saves steps.
+///
+/// The line height is a parameter rather than a constant because the honest answer is "we do not
+/// know it until we have looked at a frame", and a caller that has looked should pass what it saw.
+pub(crate) fn starting_px_per_notch(lines_per_notch: u32, line_height_px: u32) -> f32 {
+    (lines_per_notch.max(1) * line_height_px.max(1)) as f32
+}
+
+/// `docs/30` §13.2's control law: decides how much to inject, then learns how much that moved.
+///
+/// Two facts are load-bearing, and both are properties of the type rather than of a caller's
+/// discipline:
+///
+/// * **`observe` takes a [`Status`], not a displacement.** A step the gates refused carries a
+///   measured `d` just like a confirmed one (`Status::Uncertain { d }`), so a control that took an
+///   `i32` could not tell them apart and would learn from noise. §13.5's "slow, and only on
+///   confirmed steps" is therefore a property of the signature.
+/// * **The bound is on the step, not on the count.** `N_MAX` is a correctness constraint (§13.2): a
+///   step that moves more than half a viewport cannot be verified. It is computed from `ĝ` and the
+///   viewport, so it moves as `ĝ` does — a fixed notch count would be a fixed *displacement* only
+///   for a target that behaves.
+pub(crate) struct Control {
+    prior: Prior,
+    target_advance_rows: f32,
+    viewport_extent: u32,
+}
+
+impl Control {
+    /// `px_per_notch` is a **starting value** — see [`starting_px_per_notch`].
+    ///
+    /// **Why the numerator is the advance and not the overlap** (`docs/30` §3.6 vs §13.2, erratum
+    /// recorded in §13.2.1): §3.6's formula is `n = clamp(round((1 − ρ*)·V / ĝ), 1, N_max)`, while
+    /// §13.2 writes the same law as `target_overlap_rows = ρ* × viewport_extent` in the numerator.
+    /// Those differ by whether the *result* is the overlap or the advance, and `E-CTRL-1`'s own
+    /// criterion (`docs/30:363`: the overlap ratio must land in `[0.30, 0.40]`) settles it: aiming
+    /// at `ρ*·V` of *advance* leaves an overlap of `V − ρ*·V`, i.e. 0.65 of the viewport, which is
+    /// nowhere near the band. The measured failure was 0.689 against a 0.30–0.40 requirement.
+    pub(crate) fn new(viewport_extent: u32, px_per_notch: f32) -> Self {
+        Self {
+            prior: Prior::new(px_per_notch),
+            target_advance_rows: (1.0 - RHO_MIN) * viewport_extent as f32,
+            viewport_extent,
+        }
+    }
+
+    /// The current estimate of pixels per notch — the number the P1 prior is built from (§16.6).
+    pub(crate) fn px_per_notch(&self) -> f32 {
+        self.prior.px_per_notch()
+    }
+
+    /// How many notches to inject for the next step.
+    pub(crate) fn notches(&self) -> i32 {
+        let ghat = self.prior.px_per_notch();
+        if !(ghat > 0.0) {
+            // ĝ is allowed to be negative (§12.3) and can be zero before the first observation.
+            // One notch is the conservative probe §13.2 starts every session with, and it is the
+            // only answer that is meaningful without a usable gain.
+            return 1;
+        }
+
+        let wanted = (self.target_advance_rows / ghat).round();
+        let verifiable = ((1.0 - RHO_MIN) * self.viewport_extent as f32 / ghat).floor();
+        let hard = verifiable.clamp(1.0, MAX_NOTCHES_PER_STEP as f32);
+        wanted.clamp(1.0, hard) as i32
+    }
+
+    /// Feeds one step's outcome back. Returns whether it taught the control anything.
+    ///
+    /// `docs/30` §13.5: only `Confirmed` steps update `ĝ`; an `Uncertain` step was measured but not
+    /// decided, and `None` was not even measured. `notches == 0` teaches nothing either — there is
+    /// no ratio to take, and inventing one would be the same mistake in a different place.
+    pub(crate) fn observe(&mut self, notches: i32, status: Status) -> bool {
+        match status {
+            Status::Confirmed { d } => self.prior.confirm(notches, d),
+            Status::Uncertain { .. } | Status::None => false,
         }
     }
 }
@@ -666,5 +763,198 @@ mod tests {
             SettleVerdict::Still,
             "§11.1: `Idle` means 'nothing changed', which is the very thing stillness is made of"
         );
+    }
+
+    // --- §13.2's control law and `E-CTRL-1` (task P3.05) ---
+
+    const CONTROL_VIEWPORT: u32 = 900;
+
+    /// Drives `Control` against a page whose true gain never changes, and returns the `ĝ` curve.
+    ///
+    /// This is `E-CTRL-1`'s synthetic target: it is the one configuration where "did the loop
+    /// learn?" has a single right answer, so every assertion below is arithmetic on this curve.
+    fn run_control(true_gain: f32, start_gain: f32, steps: u32) -> Vec<f32> {
+        let mut control = Control::new(CONTROL_VIEWPORT, start_gain);
+        let mut curve = vec![control.px_per_notch()];
+        for _ in 0..steps {
+            let notches = control.notches();
+            let observed = (notches as f32 * true_gain).round() as i32;
+            assert!(
+                control.observe(notches, Status::Confirmed { d: observed }),
+                "a confirmed step must teach the control something (n = {notches})"
+            );
+            curve.push(control.px_per_notch());
+        }
+        curve
+    }
+
+    fn steps_to_twenty_percent(true_gain: f32, start_gain: f32, limit: u32) -> Option<u32> {
+        run_control(true_gain, start_gain, limit)
+            .iter()
+            .position(|ghat| (ghat - true_gain).abs() / true_gain <= 0.20)
+            .map(|index| index as u32)
+    }
+
+    #[test]
+    fn ghat_converges_within_six_steps_to_within_twenty_percent() {
+        let start = starting_px_per_notch(3, 20);
+        assert_eq!(
+            start, 60.0,
+            "the starting value is the order-of-magnitude estimate: three lines of twenty pixels"
+        );
+
+        // Fast / medium / slow, all within a factor of two of the starting value. That is the
+        // regime `E-CTRL-1` describes; a five-fold error is measured by the curve test below and
+        // takes about nine steps, which is why the starting value is worth having at all.
+        for true_gain in [40.0f32, 60.0, 120.0] {
+            let reached = steps_to_twenty_percent(true_gain, start, 6);
+            assert!(
+                reached.is_some(),
+                "E-CTRL-1: from {start} px/notch the control did not reach {true_gain} ±20% within \
+                 six steps; after six it was {}",
+                run_control(true_gain, start, 6).last().copied().unwrap_or(f32::NAN)
+            );
+        }
+    }
+
+    #[test]
+    fn ghat_is_not_updated_on_uncertain_steps() {
+        let mut control = Control::new(CONTROL_VIEWPORT, 60.0);
+        let start = control.px_per_notch();
+
+        for status in [
+            Status::Uncertain { d: 400 },
+            Status::None,
+            Status::Uncertain { d: 0 },
+        ] {
+            assert!(
+                !control.observe(5, status),
+                "only a confirmed step is an observation (§13.5): {status:?} must teach nothing"
+            );
+        }
+
+        assert_eq!(
+            control.px_per_notch(),
+            start,
+            "a measurement the gates refused must not become a premise"
+        );
+    }
+
+    #[test]
+    fn every_step_the_law_asks_for_is_verifiable() {
+        // §13.2 item 2 calls `N_MAX` a correctness constraint and then says what it really is:
+        // "more precisely, the displacement that still guarantees `overlap ≥ ρ_min`". Those two
+        // bounds are not the same number — advancing 0.65·V to leave a 0.35·V overlap can never fit
+        // inside V/2 — and this test encodes the one that is a constraint, because the other one is
+        // unreachable by construction (§13.2.1).
+        for ghat in [1.0f32, 2.0, 4.0, 12.0, 40.0, 60.0, 120.0, 200.0, 449.0, 4000.0] {
+            let control = Control::new(CONTROL_VIEWPORT, ghat);
+            let notches = control.notches();
+            assert!(
+                notches >= 1,
+                "the loop always injects at least one notch (§13.2: n = clamp(..., 1, N_MAX)); ĝ = {ghat}"
+            );
+
+            let moved = notches as f32 * ghat;
+            let verifiable = (1.0 - crate::scroll::displacement::RHO_MIN) * CONTROL_VIEWPORT as f32;
+            assert!(
+                moved <= verifiable || notches == 1,
+                "a step that advances more than {verifiable} px of a {CONTROL_VIEWPORT} px viewport \
+                 drops the overlap below ρ_min and cannot be verified (ĝ = {ghat}, n = {notches}, \
+                 moved = {moved})"
+            );
+        }
+
+        // When even one notch overshoots, one notch is the answer and the bound cannot hold: there
+        // is no fraction of a notch to inject. Stated as a test so nobody "fixes" it into n = 0.
+        let overshooting = Control::new(CONTROL_VIEWPORT, 4000.0);
+        assert_eq!(overshooting.notches(), 1);
+    }
+
+    #[test]
+    fn the_notch_count_respects_the_wire_format() {
+        // A page that barely moves per notch would otherwise ask for more notches than one
+        // `WM_MOUSEWHEEL` can carry, and the actuator would reject the request (§24.6.3's
+        // `InvalidRequest`). Capping here means the step is merely *short*, which §13.2 item 1
+        // already accepts: "overlap larger than the target is slow, not wrong".
+        let tiny = Control::new(CONTROL_VIEWPORT, 0.5);
+        assert_eq!(tiny.notches(), MAX_NOTCHES_PER_STEP);
+    }
+
+    #[test]
+    fn a_negative_ghat_asks_for_one_notch() {
+        // §12.3: ĝ is allowed to be negative, and §13.2 says so explicitly. The direction is the
+        // estimator's business; the control's business is to not divide by it into nonsense.
+        let control = Control::new(CONTROL_VIEWPORT, -40.0);
+        assert_eq!(control.notches(), 1);
+    }
+
+    #[test]
+    fn the_resulting_overlap_ratio_lands_in_the_designed_band() {
+        // `E-CTRL-1`'s second half (`docs/30:363`): not just "ĝ converged", but "the steps it then
+        // asks for leave the overlap where §3.6 put it". Checked with `ĝ` exactly true, because
+        // that is what "after convergence" means — and because with an inexact `ĝ` the band is not
+        // the control's promise to make (the *floor* is, and `every_step_the_law_asks_for_is_verifiable`
+        // is where that lives).
+        for true_gain in [40.0f32, 60.0, 90.0] {
+            let control = Control::new(CONTROL_VIEWPORT, true_gain);
+            let notches = control.notches();
+            let overlap = (CONTROL_VIEWPORT as f32 - notches as f32 * true_gain)
+                / CONTROL_VIEWPORT as f32;
+
+            assert!(
+                (0.30..=0.40).contains(&overlap),
+                "ρ* is the *resulting* overlap (§3.6): true gain {true_gain}, n {notches} advanced \
+                 {} px of a {CONTROL_VIEWPORT} px viewport — overlap ratio {overlap}",
+                notches as f32 * true_gain
+            );
+        }
+
+        // And the case where the band is arithmetically unreachable: the overlap must be ≥ 0.35·V
+        // (else the step is not verifiable) and ≤ 0.40·V (the band's top), so the advance must land
+        // in [540, 585] px. With a 120 px notch the only multiple in that window is 4.5–4.875
+        // notches, and there is no such integer. 4 notches is the closest verifiable step and it
+        // leaves 0.467 — slow, which §13.2 item 1 accepts, rather than wrong.
+        let coarse = Control::new(CONTROL_VIEWPORT, 120.0);
+        assert_eq!(coarse.notches(), 4);
+    }
+
+    #[test]
+    #[ignore = "E-CTRL-1: writes a curve to SNAPCLIP_ECTRL1_OUT; run it by hand"]
+    fn e_ctrl_1_writes_the_convergence_curve() {
+        use crate::scroll::displacement::PRIOR_LEARNING_RATE;
+
+        let out = std::env::var("SNAPCLIP_ECTRL1_OUT").unwrap_or_else(|_| {
+            // Resolved from the crate, not from the cwd: `cargo test` runs in the crate directory,
+            // and a curve written to a path that depends on where it was invoked is not reproducible.
+            format!("{}/../../docs/Temp/ectrl1.jsonl", env!("CARGO_MANIFEST_DIR"))
+        });
+        let start = starting_px_per_notch(3, 20);
+        let mut lines = vec![format!(
+            "{{\"kind\":\"env\",\"viewport\":{CONTROL_VIEWPORT},\"start\":{start},\"learning_rate\":{PRIOR_LEARNING_RATE}}}"
+        )];
+
+        for true_gain in [8.0f32, 12.0, 20.0, 40.0, 60.0, 90.0, 120.0, 200.0] {
+            let curve = run_control(true_gain, start, 12);
+            for (step, ghat) in curve.iter().enumerate() {
+                lines.push(format!(
+                    "{{\"true\":{true_gain},\"step\":{step},\"ghat\":{ghat}}}"
+                ));
+            }
+            let reached = curve
+                .iter()
+                .position(|ghat| (ghat - true_gain).abs() / true_gain <= 0.20);
+            println!(
+                "true {true_gain:>7.1} px/notch   start {start:>6.1}   steps to ±20%: {}   final {}",
+                match reached {
+                    Some(index) => format!("{index}"),
+                    None => format!(">{}", curve.len() - 1),
+                },
+                curve.last().copied().unwrap_or(f32::NAN)
+            );
+        }
+
+        std::fs::write(&out, lines.join("\n") + "\n").expect("the curve file must be writable");
+        println!("wrote {out}");
     }
 }

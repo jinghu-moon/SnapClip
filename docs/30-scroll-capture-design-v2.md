@@ -1662,6 +1662,74 @@ impl Axis {
 2. **`N_MAX` 是正确性约束**，不是性能参数：单步位移若超过 `viewport_extent`（更严格地说，超过"保证 `overlap ≥ ρ_min` 的位移"），这一步**无法被验证**，而且会引入空洞（`Missing`）。见 §14.3 的"内部 gap 判定"。
 3. **`ĝ` 允许为负**（§12.3 的方向约定）。也允许在会话中**被慢速重估**（若连续 3 步的实测与预测偏差 > 50%，重设为最近一次实测）。
 
+#### 13.2.1 落地的形状与三处勘误（`P3.05`，2026-10-09）
+
+**形状**（`crates/snapclip-capture/src/scroll/loop_control.rs`）：
+
+```rust
+/// The order-of-magnitude starting value — not a measurement.
+pub(crate) fn starting_px_per_notch(lines_per_notch: u32, line_height_px: u32) -> f32 {
+    (lines_per_notch.max(1) * line_height_px.max(1)) as f32
+}
+
+/// §13.2's control law: decides how much to inject, then learns how much that moved.
+pub(crate) struct Control {
+    prior: Prior,                 // `P1.14`'s `Prior`, one implementation of §16.6's P1
+    target_advance_rows: f32,     // (1 − ρ*) · V, see erratum 1
+    viewport_extent: u32,
+}
+
+impl Control {
+    pub(crate) fn notches(&self) -> i32 {
+        let ghat = self.prior.px_per_notch();
+        if !(ghat > 0.0) { return 1; }              // §12.3 allows ĝ ≤ 0; one notch is the probe
+        let wanted = (self.target_advance_rows / ghat).round();
+        let verifiable = ((1.0 - RHO_MIN) * self.viewport_extent as f32 / ghat).floor();
+        let hard = verifiable.clamp(1.0, MAX_NOTCHES_PER_STEP as f32);
+        wanted.clamp(1.0, hard) as i32
+    }
+
+    /// §13.5: only a confirmed step is an observation.
+    pub(crate) fn observe(&mut self, notches: i32, status: Status) -> bool {
+        match status {
+            Status::Confirmed { d } => self.prior.confirm(notches, d),
+            Status::Uncertain { .. } | Status::None => false,
+        }
+    }
+}
+```
+
+**裁决 1：`observe` 收的是 `Status` 而不是位移。** `Uncertain { d }` 与 `Confirmed { d }` 携带**同一个** `d`，所以一个收 `i32` 的控制律**无法区分它们**，会把被门拒绝的测量当成前提。§13.5 的"缓慢且只在确证步上更新"因此是**签名的性质**，不是调用方的纪律。
+
+**裁决 2：`ĝ` 的初值是显式标注的启动值。** `starting_px_per_notch(3, 20) = 60`——`SPI_GETWHEELSCROLLLINES`（`P3.02` 的能力探测）× 一个**假设的**行高。行高是参数不是常量：诚实的答案是"没看过一帧之前不知道"，看过一帧的调用方应当把看到的值传进来。`P1.14` 的 `Prior` 是这个初值唯一的持有者，`Control` 不另存一份。
+
+**裁决 3：线格式的上限在控制律这一侧也要有。** 一页每格只走 0.5 px 时，目标前进量会要求 1170 格，而一条 `WM_MOUSEWHEEL` 的 `mouseData` 是 16 位（`MAX_NOTCHES_PER_STEP = 273`）⇒ 不在控制律里封顶就会变成执行器的 `InvalidRequest`（§24.6.3）。封顶的代价是这一步**变短**，而 §13.2 第 1 条已经接受"overlap 大于目标值只是慢，不是错"。`scroll/` 不能命名平台模块（§28.4），所以这个数字被**重复了一次**，并由 `scroll_actuator.rs` 的一条测试钉住两者相等。
+
+**勘误 1：分子是"前进量"不是"重叠量"。** §3.6（`:354-355`）写的是 `notches = clamp(round((1 - ρ*) · V / ĝ), 1, N_max)`，§13.2（`:1652`/`:1656`）写的是 `target_overlap_rows = ρ* × viewport_extent` 放在分子上。两者相差"结果算重叠还是算前进"，而 `E-CTRL-1` 自己的判据（`:363`：重叠比落在 `[0.30, 0.40]`）判定了它：按 `ρ*·V` 瞄准**前进量**会留下 `1 − 0.35 = 0.65` 个视口的重叠。**实测（`the_resulting_overlap_ratio_lands_in_the_designed_band` 的第一版）**：真值 40 px/格、`ĝ = 42.35` 时 `n = 7`、前进 280 px、**重叠比 0.689**。`§13.2` 的名字 `target_overlap_rows` 就是这个错误的来源，所以落地时字段叫 `target_advance_rows`。
+
+**勘误 2：`N_MAX` 的"半个视口"与它自己的括号矛盾。** 公式行写"单步位移不超过 `viewport_extent / 2`"，第 2 条又写"更严格地说，超过**保证 `overlap ≥ ρ_min` 的位移**"。这两个数不可能同时成立：要留下 `ρ* = 0.35` 的重叠就必须前进 `0.65·V`，而 `0.65·V > V/2`。**取第 2 条的读法**（`(1 − ρ_min)·V`），因为它是那个真正会失败的约束——门一（`is_verifiable`，§16.2）拒绝的是重叠不足，不是"走了半个视口"。落地为 `verifiable = floor((1 − RHO_MIN)·V / ĝ)`，由 `every_step_the_law_asks_for_is_verifiable` 扫 10 个 `ĝ` 值（1…4000）钉住。
+
+**勘误 3：`[0.30, 0.40]` 这个区间对粗粒度增益**算术上不可达**。** 重叠必须 `≥ 0.35·V`（否则这一步不可验证）且 `≤ 0.40·V`（区间上界），所以前进量必须落在 `[540, 585] px`（`V = 900`）。当每格位移是 **120 px** 时，这个窗口里唯一的倍数是 `4.5–4.875` 格，**没有整数**：最接近的可验证步是 `n = 4`（前进 480 px，重叠 **0.467**）。这不是控制的缺陷，是**格量化**的后果——`ĝ` 精确已知时也如此。所以 `the_resulting_overlap_ratio_lands_in_the_designed_band` 断言的是"**能落在区间里的增益必须落在区间里**"（40 / 60 / 90），并把 120 的算术写在同一用例的注释里；**控制的硬承诺是 `≥ ρ_min`（可验证），不是 `[0.30, 0.40]`（目标）**。
+
+**`E-CTRL-1` 实测：收敛速度与初值误差成对数关系（2026-10-09）**
+
+装置 = `#[ignore] fn e_ctrl_1_writes_the_convergence_curve()`（`loop_control.rs`），曲线 = `docs/Temp/ectrl1.jsonl`（JSON Lines：一行环境 + 每个增益每步一行 `{true, step, ghat}`）。合成目标 = 每格位移固定不变的一页，启动值 `starting_px_per_notch(3, 20) = 60`，学习率 0.3，每步注入 `n = notches()` 并按 `n × 真值` 得到观测。
+
+| 真值（px/格） | 初值误差 | 到 ±20% 的步数 | 12 步后的 `ĝ` |
+|---|---|---|---|
+| 8 | 7.5× | 10 | 8.72 |
+| 12 | 5× | 9 | 12.66 |
+| 20 | 3× | 7 | 20.55 |
+| 40 | 1.5× | **3** | 40.28 |
+| 60 | 1× | **0** | 60.00 |
+| 90 | 1.5× | **2** | 89.58 |
+| 120 | 2× | **3** | 119.17 |
+| 200 | 3.3× | 4 | 198.06 |
+
+**三条读数**：① **§23.1 的"6 步内 ±20%"成立的条件是启动值与真值在约 2× 以内**（40–120 三档 = 0/2/3 步）；② 误差按 `0.7^k` 衰减，所以步数 ≈ `ln(初值误差/0.2) / 0.357`——**7.5× 的误差要 10 步**，这正是"启动值值得有"的量化理由；③ 收敛**不依赖**分子（勘误 1 的错版本给出同一条 `ĝ` 曲线），因为每步的观测只由 `n × 真值` 决定——**这就是为什么那条错误只能被重叠比抓住，而不能被收敛曲线抓住**。
+
+**仍未落地**：`ĝ` 的"连续 3 步偏差 > 50% 则重设"（§13.2 第 3 条的后半）——今天只有指数滑动，没有重设分支；它的触发者是"目标换页后突然变快/变慢"（`:363` 的第二个判据，要求 3 步内重新收敛），归 `P3.07`。§13.5 的 UIA 标定路径（一次读取直接给出 `ĝ`，跳过收敛）也不在这里。
+
 ### 13.3 停步与稳定：等待什么
 
 一步的完整时序：
@@ -1743,6 +1811,8 @@ pub(crate) fn inject_and_settle<H: StepHost>(
   - 在开发期用它给 §16 的算法做**真实数据的真值**。
 
 **但它仍然不是依赖**（F-16 第 1 条）：`capability.absolute == false` 时必须完全可用。
+
+> **`P3.05` 的口径说明**：`docs/31` 的 `P3.05` 要求把"`ĝ` 的初值与收敛速度"记入本节，但本节讲的是 UIA 标定（一条**不走收敛**的捷径），不是控制律本身。两者都记在 §13.2.1：初值 = `starting_px_per_notch(3, 20) = 60`，收敛曲线 = `E-CTRL-1` 的八档实测表（本节的 UIA 路径若可用，作用是**跳过**那张表）。
 
 ## 14. 帧校验与注入
 
@@ -2505,7 +2575,7 @@ pub(crate) struct Displacement { status: Status, confidence: f32, evidence: Evid
 | `TILE_SUPPORT_ZNCC`（tile 计为"支持"的相关门限） | 0.5 | **可校准** | `E-ACC-1`；`P1.06` 用它替代 §16.4 的"内点像素**占比** ≥ 0.5"（§15.4.2 决定 3：像素级绝对容差会摧毁亮度不变性） |
 | `coverage` 饱和数 | 12 | 固定 | 同上 |
 | `κ`（P1 区间半宽系数） | 0.5 | **可校准** | `E-CTRL-1`；`P1.14` 落地为 `PRIOR_KAPPA`，并实测其容差是**乘法式因而不对称**的（`ĝ ∈ [真值/1.5, 真值·2]`，§16.6.1 实测 1） |
-| `ĝ` 滑动系数 | 0.7 / 0.3 | **可校准** | `E-CTRL-1`；`P1.14` 落地为 `PRIOR_LEARNING_RATE = 0.3` |
+| `ĝ` 滑动系数 | 0.7 / 0.3 | **可校准** | `E-CTRL-1`；`P1.14` 落地为 `PRIOR_LEARNING_RATE = 0.3`；`P3.05` 实测其收敛是**对数式**的（误差按 `0.7^k` 衰减：启动值 60 时，真值 40/60/90/120 分别在 3/0/2/3 步内到 ±20%，真值 8 需要 10 步，§13.2.1） |
 | P1 启用下限 | `n·ĝ ≥ 4 px` | 固定 | 噪声量级（§16.3）；`P1.14` 落地为 `PRIOR_MIN_EXPECTED_PX`，开关在**期望量**上而不是候选上（§16.6.1 裁决） |
 | P1 区间外降权 | ×0.9 | 固定 | 保守取值；**不可设为 0**（§16.6 规则 3）。`P1.14` 把它变成一条被断言的算术钉子：`1 − 0.9 = 0.1 < MIN_MARGIN`，抬过 `0.85` 就让先验成为判决（§16.6.1 裁决 4） |
 | 手动模式搜索半宽 | `max(8, ceil(0.15·H_match))` | 固定 | §15.6/§16.6；`P1.15` 落地为 `manual_window(match_rows)`（900 px 视口 ⇒ 68 px）。实测它**同时是覆盖上限**：窗外的步回来是 `Uncertain` 而不是错误的 `Confirmed`（§16.6.2） |
@@ -5000,6 +5070,8 @@ fn rows_match(actual, expected, sigma) -> bool
 | 注入失败后切路径 | mock 连续 3 次 `Posted` 但 `d==0` | 切换路径 + `InjectPathSwitched` | L2 | **已可执行（`P3.03`）**：`three_posted_steps_without_a_confirmed_step_switch_the_path` + `a_moved_step_resets_the_streak` + `the_watchdog_does_not_assume_there_are_exactly_two_transports`，见 §24.7.1 |
 | 两条路径都失败 | mock 双方各 3 次无效 | `ActuatorFailed` + `Partial` | L2 | **已可执行（`P3.03`）**：`both_paths_failing_three_times_ends_the_session`（`WatchVerdict::Failed`；`StopReason::ActuatorFailed` 与 `Partial` 的映射属会话层 `P3.04`/`P3.09`），见 §24.7.1 |
 | 平滑滚动等待 | 内容持续移动 3 帧 | 等到静止才估计 | L2 | **已可执行（`P3.04`）**：`smooth_scrolling_is_waited_out_instead_of_being_estimated`（四个互不相同的帧各 45 ms ⇒ 全部 `Waiting`，到 `STEP_TIMEOUT` ⇒ `TimedOut`）+ `the_loop_waits_until_two_consecutive_frames_agree_before_estimating` + `the_loop_injects_once_and_waits_for_the_picture_to_stop_moving` + `a_step_with_no_frames_at_all_is_not_a_timeout`，见 §13.3.1 |
+| 控制律收敛 | 快/中/慢三种增益的合成目标 | 6 步内 `ĝ` 到真值 ±20%；重叠比落 `[0.30, 0.40]` | L1 | **已可执行（`P3.05`）**：`ghat_converges_within_six_steps_to_within_twenty_percent`（40/60/120 三档）+ `the_resulting_overlap_ratio_lands_in_the_designed_band`（40/60/90 落区间；120 的格量化算术写在用例里）+ `every_step_the_law_asks_for_is_verifiable` + `the_notch_count_respects_the_wire_format`，见 §13.2.1。**`E-CTRL-1` 的实测表与三处勘误在 §13.2.1** |
+| 控制律只学确证步 | `Uncertain` / `None` 步 | `ĝ` 不变 | L1 | **已可执行（`P3.05`）**：`ghat_is_not_updated_on_uncertain_steps`（§13.5 的"缓慢且只在确证步上"是 `observe` 收 `Status` 的性质），见 §13.2.1 |
 | 取消延迟 | 注入后最坏时刻取消 | `Phase == Stopped` | L1 | **Cancel latency（Max）** |
 | 停止延迟 | 停止 | 导出任务已提交 | L1 | **Stop latency** |
 

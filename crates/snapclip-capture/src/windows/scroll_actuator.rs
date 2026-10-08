@@ -804,6 +804,13 @@ mod tests {
     fn a_path_the_wire_format_cannot_express_is_reported() {
         let scripted = Scripted::tree();
         assert_eq!(MAX_NOTCHES, 273);
+        assert_eq!(
+            crate::scroll::loop_control::MAX_NOTCHES_PER_STEP,
+            MAX_NOTCHES,
+            "the control's cap and this one are the same wire-format fact stated twice (§28.4 keeps \
+             `scroll/` from importing it), so a drift here would turn a legal step into \
+             `InvalidRequest` at runtime"
+        );
 
         let outcome = inject(&scripted, &request(InjectPath::PostMessageW, MAX_NOTCHES + 1));
         assert_eq!(
