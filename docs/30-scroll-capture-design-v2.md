@@ -2203,6 +2203,34 @@ pub(crate) struct Displacement { status: Status, confidence: f32, evidence: Evid
 | 边界值禁令 | 构造纯色帧使 ZNCC 未定义 | 返回 `None`，**绝不返回 `±N/2`** |
 | 门限校准 | `E-ACC-1`（§23.1） | 给出 ROC 曲线与选定工作点 |
 
+#### 16.12.1 实测：四门 ablation 的落地形状与结果（`P1.13`，2026-10-08）
+
+**装置**（`crates/snapclip-capture/src/scroll/displacement.rs` 的测试模块，**test-only 装配**——生产入口是会话组装，尚不存在）：`GateMask{geometry,gain,support,margin}` + `Gate::without()`、`fn decide(scratch, previous, current, expected, window, mask) -> Status`（`candidates_1d` → 层二 `score_candidates_2d` → 层三 `refine_winner` → 四门按 §16.1 次序 → `is_verifiable`）、**刻意不含 scene cut**（§16.8 另属）。语料 17 个 case：`mixed` 文档 640×1900（seed 11、`band_height` 19、五种结构各一）配视口 900 的 7 个位移 + 一个水平臂，`text`/`checker`/`noise`/`gradient`/`flat` 各一两类，以及一个**视口只有 300** 的 `small-120`。
+
+**指标**：`wrong` = 被 `Confirmed` 但其 `|d − step| > 1`，或本不该作答的 case 被 `Confirmed`；`refused` = 本可作答（`answerable`）而未被 `Confirmed`。`answerable` 由 §16.2/§16.3/§16.4 的算术容量定义。
+
+| 关闭的门 | wrong | refused | Δwrong | 关掉之后具体变了什么 |
+|---|---|---|---|---|
+| （基线） | 0 | 9 | — | 7 个 case `Confirmed`（位移全对）、6 个 `Uncertain`、4 个 `None` |
+| **geometry**（门一） | 0 | 9 | +0 | `mixed-450`：`None → Uncertain{d:450}`（450 = §16.9 禁用的半视口值） |
+| **gain**（门二） | 0 | 9 | +0 | `text-19`/`text-38`：`None → Uncertain{d:0}`（在移动了 19 px 的页面上报零位移） |
+| **support**（门三） | 0 | 8 | +0 | `mixed-890`：`None → Uncertain{d:890}`；`small-120`：`None → Confirmed{d:120}` |
+| **margin**（门四） | **1** | 4 | **+1** | `checker-24/120`、`noise-4/120`、`gradient-10` 全部 `Uncertain → Confirmed`；**唯一错的 = `gradient-10`（报 48，真值 10）** |
+| **gain + support** | **1** | — | **+1** | 两条同时关闭才放出那 1 个错误确认 |
+
+**三条裁决**
+
+1. **判据要改口径**。原文（上表）"关闭任一门都使错误确定率上升"在实测下只有门四成立：关闭任一门只能让漏斗**更宽松**（少一条拒绝路径），因此"更宽松"的表现形式是 `None → Uncertain`（不再丢弃候选，而是把一个支撑不住的数上交）或 `Uncertain → Confirmed`。**没有任何一门是惰性的**（关闭任何一门都改变了答案），所以四门全部保留，每条给出保留依据（测试断言"不抬高 `wrong` 的门必须写下理由"）：门一/门二/门三的依据是它们各自实现的那条约束（§16.2 几何正确性 / §16.3 残差增益 / §16.4 证据独立性），门四的依据就是指标本身。**唯一会被删除的是"关闭后什么都不变"的门，本语料里不存在。**
+2. **只有门四能被这个指标看见**，而且它一被看见就是致命的：`gradient-10` 的 `48` vs 真值 `10`——**线性斜坡沿主轴平移后仍是它自己**（ZNCC 恒为 1.0，实测两族 `0.999986`/`0.999984`），只有歧义门能拒绝它；因此 `gradient` 是**歧义夹具**，不是运动夹具（§30.3 的"低纹理"行要用平坦页测门三、用斜坡页测门四）。
+3. **门二与门三互相遮蔽（非加性）**：单独关门二 `0/+0`、单独关门三 `0/−1`，**成对关闭 `1/+1`**。机制 = `flat-10` 上门二本可拒绝（`gain` 无定义/为 0），而门三先把它拒了；`text-19` 上门三本可拒绝（tile 支持不足），而门二先把它拒了。**这解释了为什么"逐门 ablation 全部 0"不等于"门是冗余的"**。
+
+**两处装配期的发现（写给会话组装 `P3.09`，两处都已修正并留证据）**
+
+1. **门四的第二名必须来自赢家 cell 之外**。层二每个 4 px cell 只给出**一个**测量值，因此同 cell 成员的 `score` 逐位相同（`P1.06`/`P1.07` 已记）：拿 `ScoredSet` 的读序第二名算 `margin`，会把"栅格的分辨率"读成"页面的歧义"——实测基线因此**一个 `Confirmed` 都没有**（`mixed-120`：best 120 与 second 119 同为 `score 0.9375` ⇒ `margin = 0`）。正确做法 = 竞争者取**赢家 cell 之外**的最强者（`outside_cell_second`），cell 内谁胜出是层一 `support` 的职责（`P1.07` 已把它做成排序平局判据）。
+2. **"被判定/被上报的位移"与"被测量的候选"是两个对象**。门一必须判**层三精修后的答案**（`mixed-450` 的排名赢家是 449、精修答案是 **450** = §16.9 禁用值），`is_verifiable` 也必须判答案（否则精修走到帧边缘时，会被"它离开的那个栅格点"确认），门四拒绝时上报的数同样用答案（§16.10 的 `Uncertain{d}` 是"我们会用的那个位移"）。证据 = 关掉门一后 `mixed-450` 由 `None` 变成 `Uncertain{d:450}`——**门一正是那道"唯一看第三层真正要交付的数"的门**。其余三门判**层二测得的候选**（它们的门限是定义在测量上的）。
+
+**诚实边界**：`answerable` 里的 `enough_tiles_for_gate_three(extent)` 是**算术容量**（视口能切出多少独立 tile）的**上界**，不是内容真的支撑得住的保证——`small-120`（视口 300）算术上够 9 个独立 tile，实际内容只让少数 tile 过 `TILE_SUPPORT_ZNCC`，因此基线为 `None`（门三拒绝），关闭门三会把它变成 `Confirmed{d:120}`（碰巧是真值）。这正是 §16.4 的用意：**门三判的是"这份证据是关于页面还是关于一团"，不是"这个数对不对"**。语料中另有：`flat-10` 被门二与门三同时拒绝、`mixed-600`（重叠 0.333）与 `mixed-890`（`tiles == 0`）被 `is_verifiable`/门一挡下、`mixed-450` 被门一挡下、`text-19/38` 被门二挡下（`gain = 0`、排名赢家 `d = 0`）。
+
 ## 17. 拼接算法（画布、条带与导出）
 
 ### 17.1 画布模型：逻辑区间 + 覆盖不变量
@@ -3002,6 +3030,24 @@ struct MemoryBudget {
 | 梯度图（`i16`） | 同灰度 | **仅当 `margin < 0.35` 时**（§15.6），因此不常驻 |
 
 **一条硬规则**：**这些 scratch 由 scroll-driver 线程独占，不做跨线程池化**。理由：跨线程的 buffer pool 会引入锁，而 §21.1 已论证只有一条滚动线程；**把简单的东西做复杂是 §3.9 明确禁止的**。
+
+#### 22.5.1 落地形状（`P1.13`，2026-10-08）
+
+```rust
+pub(crate) struct Scratch { slots: [Gray; 4], builds: u32 }
+// slots: 池化(pre, cur) 与 全分辨率(pre, cur) —— 四个固定槽位，无键、无缓存
+impl Scratch {
+    pub(crate) fn new() -> Self;
+    pub(crate) fn pool(&mut self, previous: &ObservationView<'_>, current: &ObservationView<'_>) -> Views<'_>;
+    pub(crate) fn full_resolution(&mut self, previous: &ObservationView<'_>, current: &ObservationView<'_>) -> Views<'_>;
+}
+```
+
+1. **`&mut self` 就是独占机制**。§22.5 的硬规则由类型系统执行，不靠约定：拿不到 `&mut Scratch` 就建不出视图（§21.1 只有一条滚动线程）。
+2. **每步每尺度只建一次**（`builds` 是测试可观测的计数，`P1.13` 的用例断言 `pool` 一次后 `builds == 2`、`full_resolution` 后 `== 4`）。层二、门二、scene cut 共用同一次池化，层三另取一次全分辨率 ⇒ **每步 4 趟，而不是按调用点算的 8 趟**。
+3. **没有缓存、没有键**——这是执行期的实测结论，不是省事。首版用 `(缓冲区地址, 长度, qpc)` 当帧身份来命中缓存，结果：夹具每个脚本的 `qpc` 从 0 重开、分配器又会把刚释放的帧地址交给下一帧 ⇒ **跨步误命中**，表现为同一个 case 在不同 mask 下给出不同答案（`mixed-240` 基线 `Confirmed`、关掉门二后 `None`；`mixed-450` 的答案在 449/450 间漂移），而且"哪两个 case 撞键"还会随打印内容改变堆布局而变化。**身份是 step，不是地址。** 今天由调用方（会话的步）保证"每步每尺度建一次"；将来若真的需要跨步复用，键必须是会话给出的**单调 step 号**，且必须先有 `E-PERF-1` 的层占比证据。
+4. **前缀和与梯度图尚未落地**（上表里它们仍是设计项）：`band_zncc` 一趟累加即可给出 ZNCC，不需要前缀和；梯度图属 §36 的 `N3` 亚像素，今天没有消费者，而 `AGENTS.md` 禁止死代码。
+5. **内存**：全分辨率槽在 4K 视口约 8.3 MB（§15.4.3 已记这是第 3 层的成本），池化槽为其 1/16；四个槽的总量与 §22.6 的"≤8 个视口"一致。
 
 ### 22.6 内存目标（与图像长度的关系）
 

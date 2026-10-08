@@ -539,10 +539,14 @@ fn luma(blue: u8, green: u8, red: u8) -> u32 {
 ///
 /// Pooling happens once per frame and every candidate is then scored against the same two images:
 /// §15.4 ② prices layer 2 at `O(H_match·W/16)` **per candidate**, which only holds if the
-/// decimation is not repeated inside the candidate loop. Layer 3 reads the same images at scale 1,
-/// so a step that needs both layers builds four images today. When `P1.13` introduces `Scratch`,
-/// they become its fields and one pass produces both scales.
-struct Gray {
+/// decimation is not repeated inside the candidate loop. Layer 3 reads the same frames at scale 1,
+/// so a step that needs both layers builds four images. [`Scratch`] owns them and reuses their
+/// allocations across steps (`P1.13`).
+///
+/// It is `pub(crate)` rather than private because the layer functions below take it: they are the
+/// crate's scroll API, and they take the *already pooled* image so that a step pools each scale
+/// exactly once no matter how many layers ask.
+pub(crate) struct Gray {
     /// Cross-axis extent in cells.
     width: u32,
     /// Primary-axis extent in cells.
@@ -551,6 +555,16 @@ struct Gray {
 }
 
 impl Gray {
+    /// An empty image, sized by the first [`Self::scaled_into`]. The buffers of a [`Scratch`] start
+    /// here and are reused from then on.
+    fn empty() -> Self {
+        Self {
+            width: 0,
+            height: 0,
+            data: Vec::new(),
+        }
+    }
+
     /// Layer 2's image: §15.6's 4× decimation.
     fn pooled(view: &ObservationView<'_>) -> Self {
         Self::scaled(view, DOWNSAMPLE)
@@ -561,17 +575,26 @@ impl Gray {
     /// [`DOWNSAMPLE`] and layer 3 at full resolution, and both go through this one loop, so the
     /// orientation rule ("rows are primary lines") and the rounding rule exist exactly once.
     fn scaled(view: &ObservationView<'_>, scale: u32) -> Self {
+        let mut gray = Self::empty();
+        gray.scaled_into(view, scale);
+        gray
+    }
+
+    /// [`Self::scaled`] writing into an existing image, so the allocation survives the step
+    /// (`docs/30` §22.5): the first step of a session pays for the buffers, the rest reuse them.
+    fn scaled_into(&mut self, view: &ObservationView<'_>, scale: u32) {
         let vertical = view.axis().is_vertical();
         let (cross, primary) = if vertical {
             (view.width(), view.height())
         } else {
             (view.height(), view.width())
         };
-        let width = cross / scale;
-        let height = primary / scale;
-        let mut data = Vec::with_capacity((width * height) as usize);
-        for row in 0..height {
-            for column in 0..width {
+        self.width = cross / scale;
+        self.height = primary / scale;
+        self.data.clear();
+        self.data.reserve((self.width * self.height) as usize);
+        for row in 0..self.height {
+            for column in 0..self.width {
                 let mut sum = 0;
                 for cell_y in 0..scale {
                     for cell_x in 0..scale {
@@ -584,19 +607,117 @@ impl Gray {
                     }
                 }
                 let cells = scale * scale;
-                data.push(((sum + cells / 2) / cells) as u8);
+                self.data.push(((sum + cells / 2) / cells) as u8);
             }
-        }
-        Self {
-            width,
-            height,
-            data,
         }
     }
 
     #[inline]
     fn at(&self, cross: u32, primary: u32) -> u32 {
         self.data[(primary * self.width + cross) as usize] as u32
+    }
+}
+
+/// The two derived images of one step, borrowed from the [`Scratch`] that owns them.
+///
+/// The borrow is the ownership rule: nothing here can be handed to another thread while the step
+/// that built it is running, which is exactly what §22.5 asks for.
+pub(crate) struct Views<'a> {
+    previous: &'a Gray,
+    current: &'a Gray,
+}
+
+impl Views<'_> {
+    pub(crate) fn previous(&self) -> &Gray {
+        self.previous
+    }
+
+    pub(crate) fn current(&self) -> &Gray {
+        self.current
+    }
+}
+
+/// The four derived images a step can read, kept between steps so a session pays for the
+/// allocations once (`docs/30` §22.5).
+///
+/// It is owned by the thread that drives the session and passed by `&mut`, which is the whole
+/// mechanism: §22.5 forbids pooling these buffers across threads (a cross-thread pool is a lock, and
+/// §21.1 has already established that there is exactly one scroll thread), so the type must not be
+/// shareable by construction. Today it holds the two scales the layers read — layer 2 and the scene
+/// cut at 4×, layer 3 at full resolution — and not yet §22.5's prefix sums or gradient map, because
+/// neither has a consumer: `band_zncc` accumulates its sums in one pass per tile, and the gradient
+/// map belongs to the sub-pixel refinement that `docs/30` §36 keeps as `N3`.
+///
+/// **There is no cache and no key.** An earlier version of this type hit "the same frame" by
+/// comparing the buffer address, the length, the `qpc` and the axis, and the gate ablation caught
+/// what that is worth: the answers for one case changed when the heap layout changed, because the
+/// allocator hands a freed frame's address to the next frame and the fixture restarts `qpc` at zero
+/// for every script. Address, length and timestamp are not an identity — the *step* is. So a caller
+/// builds each scale once per step and keeps the [`Views`] alive for as long as it needs them; a
+/// second call rebuilds, which is visible in [`Self::builds`] rather than silently wrong.
+pub(crate) struct Scratch {
+    /// `[0]`/`[1]` are the previous/current frames at [`DOWNSAMPLE`], `[2]`/`[3]` at scale 1.
+    slots: [Gray; 4],
+    builds: u32,
+}
+
+/// Layer 2 and the scene cut both read the frames at [`DOWNSAMPLE`].
+const SLOT_POOLED_PREVIOUS: usize = 0;
+const SLOT_POOLED_CURRENT: usize = 1;
+/// Layer 3 reads them at scale 1.
+const SLOT_FULL_PREVIOUS: usize = 2;
+const SLOT_FULL_CURRENT: usize = 3;
+
+impl Scratch {
+    pub(crate) fn new() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| Gray::empty()),
+            builds: 0,
+        }
+    }
+
+    /// Layer 2's two images (§15.6's 4× decimation).
+    ///
+    /// One call per step, shared by the second layer, gate two and the scene cut: that sharing is
+    /// why the logarithms below take `&Gray` instead of the observations they came from.
+    pub(crate) fn pool(
+        &mut self,
+        previous: &ObservationView<'_>,
+        current: &ObservationView<'_>,
+    ) -> Views<'_> {
+        self.fill(SLOT_POOLED_PREVIOUS, previous, DOWNSAMPLE);
+        self.fill(SLOT_POOLED_CURRENT, current, DOWNSAMPLE);
+        Views {
+            previous: &self.slots[SLOT_POOLED_PREVIOUS],
+            current: &self.slots[SLOT_POOLED_CURRENT],
+        }
+    }
+
+    /// Layer 3's two images (full resolution).
+    pub(crate) fn full_resolution(
+        &mut self,
+        previous: &ObservationView<'_>,
+        current: &ObservationView<'_>,
+    ) -> Views<'_> {
+        self.fill(SLOT_FULL_PREVIOUS, previous, 1);
+        self.fill(SLOT_FULL_CURRENT, current, 1);
+        Views {
+            previous: &self.slots[SLOT_FULL_PREVIOUS],
+            current: &self.slots[SLOT_FULL_CURRENT],
+        }
+    }
+
+    fn fill(&mut self, index: usize, view: &ObservationView<'_>, scale: u32) {
+        self.slots[index].scaled_into(view, scale);
+        self.builds += 1;
+    }
+
+    /// How many images had to be built. `#[cfg(test)]` because its only consumer is the test that
+    /// turns "the buffers are reused across steps" from a claim about the code's shape into an
+    /// assertion.
+    #[cfg(test)]
+    fn builds(&self) -> u32 {
+        self.builds
     }
 }
 
@@ -965,19 +1086,17 @@ fn grid_distance(shift: i32) -> u32 {
 /// zero: "this shift was not measured" and "this shift measured badly" are different facts, and the
 /// gates are entitled to tell them apart.
 pub(crate) fn score_candidates_2d(
-    previous: &ObservationView<'_>,
-    current: &ObservationView<'_>,
+    previous_gray: &Gray,
+    current_gray: &Gray,
     candidates: &CandidateSet,
 ) -> ScoredSet {
-    let previous_gray = Gray::pooled(previous);
-    let current_gray = Gray::pooled(current);
     let wanted = match_rows(previous_gray.height, current_gray.height, DOWNSAMPLE);
     // The zero shift's band is the denominator of every candidate's `gain`, and it is the same band
     // for all of them: built once, outside the loop, so the "same region on both sides" property of
     // §16.3 is a fact of the code rather than of the reader's attention (`docs/31` `P1.09` REFACTOR).
     let zero_band = match_band(previous_gray.height, current_gray.height, 0, wanted)
         .expect("the zero shift always overlaps a non-empty frame");
-    let rmse_at_zero = band_rmse(&previous_gray, &current_gray, zero_band);
+    let rmse_at_zero = band_rmse(previous_gray, current_gray, zero_band);
     let mut scored = ScoredSet::new();
     for candidate in candidates.iter() {
         let shift = round_to_grid(candidate.d);
@@ -989,11 +1108,11 @@ pub(crate) fn score_candidates_2d(
         ) else {
             continue;
         };
-        let zncc2d = band_zncc(&previous_gray, &current_gray, band, 0, band.rows);
-        let tiles = supporting_tiles(&previous_gray, &current_gray, band);
-        let gain = residual_gain(band_rmse(&previous_gray, &current_gray, band), rmse_at_zero)
+        let zncc2d = band_zncc(previous_gray, current_gray, band, 0, band.rows);
+        let tiles = supporting_tiles(previous_gray, current_gray, band);
+        let gain = residual_gain(band_rmse(previous_gray, current_gray, band), rmse_at_zero)
             .unwrap_or(GAIN_UNDEFINED_FOR_RANKING);
-        let curvature = curvature_of(&previous_gray, &current_gray, band);
+        let curvature = curvature_of(previous_gray, current_gray, band);
         scored.insert(ScoredCandidate {
             d: candidate.d,
             zncc2d,
@@ -1054,13 +1173,11 @@ fn refine_ranks_before(shift: i32, zncc2d: f32, winner: i32, incumbent: Refined)
 /// `None` when layer 2 scored nothing: there is no winner to refine, and that is a state rather
 /// than a zero shift (`P1.04`).
 pub(crate) fn refine_winner(
-    previous: &ObservationView<'_>,
-    current: &ObservationView<'_>,
+    previous_gray: &Gray,
+    current_gray: &Gray,
     scored: &ScoredSet,
 ) -> Option<Refined> {
     let winner = scored.iter().next()?.d;
-    let previous_gray = Gray::scaled(previous, 1);
-    let current_gray = Gray::scaled(current, 1);
     let wanted = match_rows(previous_gray.height, current_gray.height, 1);
     let mut refined: Option<Refined> = None;
     for step in REFINE_NEIGHBOURHOOD {
@@ -1070,7 +1187,7 @@ pub(crate) fn refine_winner(
         let Some(band) = match_band(previous_gray.height, current_gray.height, shift, wanted) else {
             continue;
         };
-        let zncc2d = band_zncc(&previous_gray, &current_gray, band, 0, band.rows);
+        let zncc2d = band_zncc(previous_gray, current_gray, band, 0, band.rows);
         let better = match refined {
             None => true,
             Some(incumbent) => refine_ranks_before(shift, zncc2d, winner, incumbent),
@@ -1312,12 +1429,10 @@ pub(crate) fn gate_margin(best: i32, margin: Option<f32>) -> GateOutcome {
 /// `None` means the ratio is undefined — the frames are identical at zero shift — and it is the
 /// signal to take the fingerprint path.
 pub(crate) fn residual_gain_at(
-    previous: &ObservationView<'_>,
-    current: &ObservationView<'_>,
+    previous_gray: &Gray,
+    current_gray: &Gray,
     shift: i32,
 ) -> Option<f32> {
-    let previous_gray = Gray::pooled(previous);
-    let current_gray = Gray::pooled(current);
     let wanted = match_rows(previous_gray.height, current_gray.height, DOWNSAMPLE);
     let zero_band = match_band(previous_gray.height, current_gray.height, 0, wanted)
         .expect("the zero shift always overlaps a non-empty frame");
@@ -1328,8 +1443,8 @@ pub(crate) fn residual_gain_at(
         wanted,
     )?;
     residual_gain(
-        band_rmse(&previous_gray, &current_gray, shift_band),
-        band_rmse(&previous_gray, &current_gray, zero_band),
+        band_rmse(previous_gray, current_gray, shift_band),
+        band_rmse(previous_gray, current_gray, zero_band),
     )
 }
 
@@ -1481,10 +1596,11 @@ fn zero_shift_similarity_at(previous: &Gray, current: &Gray) -> f32 {
 /// evaluates it in the branch where the winner was already rejected (`estimator.rs:1285`). We do not
 /// need that coupling: the first condition alone is enough to rule out a frame whose content matched.
 ///
-/// The two frames are pooled **once** here rather than by each condition: pooling is `O(W·H/16)` and
-/// the second condition runs it per candidate otherwise, which would make the question cost more
-/// than the whole second layer it is asking about. `P1.13`'s `Scratch` moves that single pass up to
-/// the step, at which point this function stops pooling at all.
+/// The two frames are pooled **once** per step, by the caller's [`Scratch`], rather than by each
+/// condition: pooling is `O(W·H/16)` and the second condition would otherwise run it per candidate,
+/// which would make the question cost more than the whole second layer it is asking about. Gate two,
+/// the second layer and the scene cut share that one pass, and layer 3's full-resolution images are a
+/// second one — four pools per step, not the eight the three call sites used to do.
 ///
 /// Two ways to be true by accident are closed here explicitly:
 ///
@@ -1494,20 +1610,18 @@ fn zero_shift_similarity_at(previous: &Gray, current: &Gray) -> f32 {
 ///   samples, and "cannot be measured" must not be read as "misaligned", because that is how a blank
 ///   page or a page with one flat band would be declared a scene cut.
 pub(crate) fn is_scene_cut(
-    previous: &ObservationView<'_>,
-    current: &ObservationView<'_>,
+    previous_gray: &Gray,
+    current_gray: &Gray,
     scored: &ScoredSet,
 ) -> bool {
     if scored.iter().next().is_none() {
         return false;
     }
-    let previous_gray = Gray::pooled(previous);
-    let current_gray = Gray::pooled(current);
-    if zero_shift_similarity_at(&previous_gray, &current_gray) >= SCENE_CUT_SIMILARITY {
+    if zero_shift_similarity_at(previous_gray, current_gray) >= SCENE_CUT_SIMILARITY {
         return false;
     }
     scored.iter().all(|candidate| {
-        match alignment_error_at(&previous_gray, &current_gray, candidate.d) {
+        match alignment_error_at(previous_gray, current_gray, candidate.d) {
             Some(error) => error > SCENE_CUT_ALIGNMENT_ERROR,
             None => false,
         }
@@ -1579,9 +1693,10 @@ pub(crate) enum SceneCutAction {
 #[cfg(test)]
 mod tests {
     use super::{
-        CANDIDATE_LIMIT, Candidate, Displacement, Evidence, GateOutcome, GateRejection, Gray,
+        CANDIDATE_LIMIT, Candidate, CandidateSet, Displacement, Evidence, GateOutcome, GateRejection,
+        Gray,
         MARGIN_SCORE_FLOOR, MIN_MARGIN, MIN_RESIDUAL_GAIN, MIN_TILES, RHO_MIN, RHO_MIN_PERMILLE,
-        SCENE_CUT_ALIGNMENT_ERROR, SCENE_CUT_DECAY_STREAK, SCENE_CUT_SIMILARITY, SCORE_GAIN,
+        SCENE_CUT_ALIGNMENT_ERROR, SCENE_CUT_DECAY_STREAK, SCENE_CUT_SIMILARITY, SCORE_GAIN, Scratch,
         SceneCut, SceneCutAction, ScoredCandidate, ScoredSet, Status, StepEffect,
         TILE_INDEPENDENCE_GAP, alignment_error, band_zncc, candidates_1d, gate_geometry, gate_margin,
         gate_residual_gain, gate_support, independent_support, is_scene_cut, is_verifiable, margin_of,
@@ -1603,6 +1718,42 @@ mod tests {
             tiles: 6,
             scene_cut: SceneCut::none(),
         }
+    }
+
+    // The layers take images that a caller has already pooled, because a step pools each scale once
+    // and hands the result to every layer that wants it. A test that asks a single question is
+    // allowed to build its own `Scratch` for that question, and these four wrappers keep the call
+    // sites about the question rather than about the buffer.
+    fn scored_once(
+        previous: &Observation,
+        current: &Observation,
+        candidates: &CandidateSet,
+    ) -> ScoredSet {
+        let mut scratch = Scratch::new();
+        let views = scratch.pool(&previous.view(), &current.view());
+        score_candidates_2d(views.previous(), views.current(), candidates)
+    }
+
+    fn refined_once(
+        previous: &Observation,
+        current: &Observation,
+        scored: &ScoredSet,
+    ) -> Option<Refined> {
+        let mut scratch = Scratch::new();
+        let views = scratch.full_resolution(&previous.view(), &current.view());
+        refine_winner(views.previous(), views.current(), scored)
+    }
+
+    fn gain_once(previous: &Observation, current: &Observation, shift: i32) -> Option<f32> {
+        let mut scratch = Scratch::new();
+        let views = scratch.pool(&previous.view(), &current.view());
+        residual_gain_at(views.previous(), views.current(), shift)
+    }
+
+    fn is_scene_cut_once(previous: &Observation, current: &Observation, scored: &ScoredSet) -> bool {
+        let mut scratch = Scratch::new();
+        let views = scratch.pool(&previous.view(), &current.view());
+        is_scene_cut(views.previous(), views.current(), scored)
     }
 
     #[test]
@@ -1934,7 +2085,7 @@ mod tests {
         let candidates = candidates_1d(&previous.view(), &current.view(), 120, 40);
         assert!(candidates.len() > 1, "nothing to be invariant about");
 
-        let baseline = score_candidates_2d(&previous.view(), &current.view(), &candidates);
+        let baseline = scored_once(&previous, &current, &candidates);
         assert_eq!(
             baseline.iter().next().map(|candidate| candidate.d),
             Some(120),
@@ -1952,7 +2103,7 @@ mod tests {
             (1.0, -20.0, "an offset only"),
         ] {
             let relit = relight(&current, contrast, brightness);
-            let scored = score_candidates_2d(&previous.view(), &relit.view(), &candidates);
+            let scored = scored_once(&previous, &relit, &candidates);
             assert_eq!(
                 rank_of(&scored),
                 rank_of(&baseline),
@@ -2006,7 +2157,7 @@ mod tests {
         let previous = script.take(0);
         let current = script.take(1);
         let candidates = candidates_1d(&previous.view(), &current.view(), 10, 8);
-        let scored = score_candidates_2d(&previous.view(), &current.view(), &candidates);
+        let scored = scored_once(&previous, &current, &candidates);
         assert!(!scored.is_empty(), "the second layer scored nothing");
 
         for candidate in scored.iter() {
@@ -2077,7 +2228,7 @@ mod tests {
             extent - truth.unsigned_abs()
         );
 
-        let scored = score_candidates_2d(&previous.view(), &current.view(), &candidates);
+        let scored = scored_once(&previous, &current, &candidates);
         let truth_score = scored
             .iter()
             .find(|candidate| candidate.d == truth)
@@ -2112,7 +2263,7 @@ mod tests {
         let previous = script.take(0);
         let current = script.take(1);
         let candidates = candidates_1d(&previous.view(), &current.view(), 120, 40);
-        let scored = score_candidates_2d(&previous.view(), &current.view(), &candidates);
+        let scored = scored_once(&previous, &current, &candidates);
 
         let cell_of = |shift: i32| round_to_grid(shift) * DOWNSAMPLE as i32;
         let cell = cell_of(120);
@@ -2176,7 +2327,7 @@ mod tests {
         assert_eq!(previous.axis(), Axis::Horizontal);
 
         let candidates = candidates_1d(&previous.view(), &current.view(), 120, 40);
-        let scored = score_candidates_2d(&previous.view(), &current.view(), &candidates);
+        let scored = scored_once(&previous, &current, &candidates);
         let best = scored
             .iter()
             .next()
@@ -2229,13 +2380,13 @@ mod tests {
             let previous = script.take(0);
             let current = script.take(1);
             let candidates = candidates_1d(&previous.view(), &current.view(), truth, 8);
-            let scored = score_candidates_2d(&previous.view(), &current.view(), &candidates);
+            let scored = scored_once(&previous, &current, &candidates);
             let winner = scored
                 .iter()
                 .next()
                 .expect("the second layer scored nothing on the mixed document")
                 .d;
-            let refined = refine_winner(&previous.view(), &current.view(), &scored)
+            let refined = refined_once(&previous, &current, &scored)
                 .expect("layer 2 proposed a shift, so layer 3 has something to refine");
 
             assert!(
@@ -2298,8 +2449,8 @@ mod tests {
         let previous = script.take(0);
         let current = script.take(1);
         let candidates = candidates_1d(&previous.view(), &current.view(), 120, 8);
-        let scored = score_candidates_2d(&previous.view(), &current.view(), &candidates);
-        let refined = refine_winner(&previous.view(), &current.view(), &scored)
+        let scored = scored_once(&previous, &current, &candidates);
+        let refined = refined_once(&previous, &current, &scored)
             .expect("layer 2 proposed a shift, so layer 3 has something to refine");
 
         let Refined { d, zncc2d } = refined;
@@ -2313,7 +2464,7 @@ mod tests {
         // No scored candidate means nothing was measured, and the third layer says so with `None`
         // rather than with a zero shift (`P1.04`'s rule: `None` is a state, not a value).
         assert!(
-            refine_winner(&previous.view(), &current.view(), &ScoredSet::new()).is_none(),
+            refined_once(&previous, &current, &ScoredSet::new()).is_none(),
             "an empty scored set has no winner to refine"
         );
     }
@@ -2352,8 +2503,8 @@ mod tests {
                     (second, third)
                 };
                 let candidates = candidates_1d(&previous.view(), &current.view(), truth, 8);
-                let scored = score_candidates_2d(&previous.view(), &current.view(), &candidates);
-                let measured = refine_winner(&previous.view(), &current.view(), &scored);
+                let scored = scored_once(&previous, &current, &candidates);
+                let measured = refined_once(&previous, &current, &scored);
                 match measured {
                     Some(refined) if refined.d == truth => {}
                     other => failures.push((truth, other.map(|refined| refined.d))),
@@ -2394,7 +2545,7 @@ mod tests {
                 (second, third)
             };
             let candidates = candidates_1d(&previous.view(), &current.view(), truth, 8);
-            let scored = score_candidates_2d(&previous.view(), &current.view(), &candidates);
+            let scored = scored_once(&previous, &current, &candidates);
             let winner = scored
                 .iter()
                 .next()
@@ -2416,7 +2567,7 @@ mod tests {
                 "shift {truth}: layer 2 picked {winner}, which is out of layer 3's ±1 reach"
             );
             assert_eq!(
-                refine_winner(&previous.view(), &current.view(), &scored).map(|refined| refined.d),
+                refined_once(&previous, &current, &scored).map(|refined| refined.d),
                 Some(truth),
                 "shift {truth}: the third layer did not recover the truth from {winner}"
             );
@@ -2553,7 +2704,7 @@ mod tests {
         let mut script = ScrollScript::new(&image, 900, vec![StepSpec::move_by(120)]);
         let previous = script.take(0);
         let current = script.take(1);
-        let gain = residual_gain_at(&previous.view(), &current.view(), 120)
+        let gain = gain_once(&previous, &current, 120)
             .expect("a translated page must have a measurable residual ratio");
         assert!(
             gain > MIN_RESIDUAL_GAIN,
@@ -2569,7 +2720,7 @@ mod tests {
         let mut second_script = ScrollScript::new(&other, 900, vec![StepSpec::move_by(120)]);
         let previous = first_script.take(0);
         let current = second_script.take(0);
-        let gain = residual_gain_at(&previous.view(), &current.view(), 120)
+        let gain = gain_once(&previous, &current, 120)
             .expect("neither frame is empty, so the ratio exists");
         assert!(
             gain < MIN_RESIDUAL_GAIN,
@@ -2643,11 +2794,11 @@ mod tests {
         let current = script.take(1);
 
         let candidates = candidates_1d(&previous.view(), &current.view(), 120, 8);
-        let scored = score_candidates_2d(&previous.view(), &current.view(), &candidates);
+        let scored = scored_once(&previous, &current, &candidates);
         assert!(!scored.is_empty(), "the ranking kept no candidate at all");
         for candidate in scored.iter() {
             assert_eq!(
-                residual_gain_at(&previous.view(), &current.view(), candidate.d),
+                gain_once(&previous, &current, candidate.d),
                 Some(candidate.gain),
                 "gate two and the ranking disagree about shift {}",
                 candidate.d
@@ -2718,7 +2869,7 @@ mod tests {
         let previous = script.take(0);
         let current = script.take(1);
         let candidates = candidates_1d(&previous.view(), &current.view(), 10, 8);
-        let scored = score_candidates_2d(&previous.view(), &current.view(), &candidates);
+        let scored = scored_once(&previous, &current, &candidates);
         assert!(!scored.is_empty(), "the second layer scored nothing");
         for candidate in scored.iter() {
             assert_eq!(
@@ -2777,7 +2928,7 @@ mod tests {
         );
 
         let candidates = candidates_1d(&previous.view(), &current.view(), 120, 8);
-        let scored = score_candidates_2d(&previous.view(), &current.view(), &candidates);
+        let scored = scored_once(&previous, &current, &candidates);
         let winner = scored.iter().next().expect("the true shift is a candidate");
         assert_eq!(winner.d, 120);
         assert_eq!(
@@ -2817,7 +2968,7 @@ mod tests {
         );
 
         let candidates = candidates_1d(&previous.view(), &current.view(), 10, 8);
-        let scored = score_candidates_2d(&previous.view(), &current.view(), &candidates);
+        let scored = scored_once(&previous, &current, &candidates);
         assert!(!scored.is_empty());
         // The measurement, as measured (2026-10-08): eight candidates in two families —
         // `d = 6..9` at `zncc2d = 0.999986231` with `gain = 0.573598564`, and `d = 10..13` at
@@ -2881,7 +3032,7 @@ mod tests {
         let current = script.take(1);
 
         let candidates = candidates_1d(&previous.view(), &current.view(), 120, 40);
-        let scored = score_candidates_2d(&previous.view(), &current.view(), &candidates);
+        let scored = scored_once(&previous, &current, &candidates);
         let best = *scored.iter().next().expect("the true shift is a candidate");
         let second = *scored
             .iter()
@@ -2934,7 +3085,7 @@ mod tests {
         let current = script.take(1);
 
         let candidates = candidates_1d(&previous.view(), &current.view(), 120, 40);
-        let scored = score_candidates_2d(&previous.view(), &current.view(), &candidates);
+        let scored = scored_once(&previous, &current, &candidates);
         let best = *scored.iter().next().expect("the true shift is a candidate");
         let second = *scored
             .iter()
@@ -3050,10 +3201,10 @@ mod tests {
         // question, and gate four would have answered it on this frame too).
 
         let candidates = candidates_1d(&previous.view(), &current.view(), 0, 40);
-        let scored = score_candidates_2d(&previous.view(), &current.view(), &candidates);
+        let scored = scored_once(&previous, &current, &candidates);
         assert!(scored.len() > 1, "the fixture produced too few candidates to test");
         assert!(
-            is_scene_cut(&previous.view(), &current.view(), &scored),
+            is_scene_cut_once(&previous, &current, &scored),
             "unrelated frames were not recognised as a scene cut"
         );
 
@@ -3153,7 +3304,7 @@ mod tests {
         //    not evidence that the page changed; it is the absence of evidence, and §16.10 has a
         //    state for that (`None`).
         assert!(
-            !is_scene_cut(&previous.view(), &current.view(), &ScoredSet::new()),
+            !is_scene_cut_once(&previous, &current, &ScoredSet::new()),
             "an empty candidate set was read as a scene cut"
         );
 
@@ -3180,9 +3331,9 @@ mod tests {
             );
         }
         let candidates = candidates_1d(&flat_previous.view(), &flat_current.view(), 10, 8);
-        let scored = score_candidates_2d(&flat_previous.view(), &flat_current.view(), &candidates);
+        let scored = scored_once(&flat_previous, &flat_current, &candidates);
         assert!(
-            !is_scene_cut(&flat_previous.view(), &flat_current.view(), &scored),
+            !is_scene_cut_once(&flat_previous, &flat_current, &scored),
             "a blank page was read as a scene cut"
         );
     }
@@ -3215,9 +3366,9 @@ mod tests {
         assert!(aligned.abs() < 1e-6, "the true shift should align exactly: {aligned}");
 
         let candidates = candidates_1d(&previous.view(), &current.view(), 120, 40);
-        let scored = score_candidates_2d(&previous.view(), &current.view(), &candidates);
+        let scored = scored_once(&previous, &current, &candidates);
         assert!(
-            !is_scene_cut(&previous.view(), &current.view(), &scored),
+            !is_scene_cut_once(&previous, &current, &scored),
             "a document that scrolled 120 px was read as a scene cut"
         );
     }
@@ -3239,10 +3390,557 @@ mod tests {
         );
 
         let candidates = candidates_1d(&previous.view(), &current.view(), 0, 40);
-        let scored = score_candidates_2d(&previous.view(), &current.view(), &candidates);
+        let scored = scored_once(&previous, &current, &candidates);
         assert!(
-            !is_scene_cut(&previous.view(), &current.view(), &scored),
+            !is_scene_cut_once(&previous, &current, &scored),
             "a page that did not change was read as a scene cut"
         );
+    }
+
+    // ---- P1.13: the scratch, and the ablation that decides whether each gate earns its place -----
+
+    /// Which of §16.1's four gates the funnel is allowed to consult.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct GateMask {
+        geometry: bool,
+        gain: bool,
+        support: bool,
+        margin: bool,
+    }
+
+    impl GateMask {
+        const ALL: Self = Self {
+            geometry: true,
+            gain: true,
+            support: true,
+            margin: true,
+        };
+
+        fn without(self, gate: Gate) -> Self {
+            match gate {
+                Gate::Geometry => Self {
+                    geometry: false,
+                    ..self
+                },
+                Gate::Gain => Self { gain: false, ..self },
+                Gate::Support => Self {
+                    support: false,
+                    ..self
+                },
+                Gate::Margin => Self {
+                    margin: false,
+                    ..self
+                },
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Gate {
+        Geometry,
+        Gain,
+        Support,
+        Margin,
+    }
+
+    impl Gate {
+        const ALL: [Self; 4] = [Self::Geometry, Self::Gain, Self::Support, Self::Margin];
+
+        fn name(self) -> &'static str {
+            match self {
+                Self::Geometry => "geometry",
+                Self::Gain => "gain",
+                Self::Support => "support",
+                Self::Margin => "margin",
+            }
+        }
+    }
+
+    /// The search half-width the ablation runs with: the manual-mode degradation of §16.6, which is
+    /// the wider of the two, so a gate is never let off by a narrow window.
+    const ABLATION_WINDOW: i32 = 40;
+
+    /// §16.1's funnel with the gates switched, so one of them can be removed and the answer watched.
+    ///
+    /// It is a *test-only* composition on purpose: the production entry point that chains the layers
+    /// and the gates belongs to the session assembly, which does not exist yet. What this harness
+    /// has to be is faithful, which took one measurement to learn: **gate one judges the third
+    /// layer's answer, and the other three judge the candidate the second layer measured.** Geometry
+    /// is a statement about the number the canvas would act on, and `mixed-450` proved the two can
+    /// differ — the ranking's winner was 449 while the refined answer was 450, §16.9's banned
+    /// boundary value, so a geometry gate reading `best.d` would confirm a shift the design forbids.
+    /// Gain, support and margin are per-candidate measurements (`P1.09`/`P1.10`/`P1.11`) and have no
+    /// meaning at the refined pixel, so they keep reading `best`.
+    ///
+    /// It does **not** include §16.8's scene cut: that is a statement about the page, not one of the
+    /// four gates, and the ablation would read a scene cut's refusal as the gates' work.
+    fn decide(
+        scratch: &mut Scratch,
+        previous: &ObservationView<'_>,
+        current: &ObservationView<'_>,
+        expected: i32,
+        window: i32,
+        mask: GateMask,
+    ) -> Status {
+        let candidates = candidates_1d(previous, current, expected, window);
+        if candidates.is_empty() {
+            return Status::None;
+        }
+        let scored = {
+            let views = scratch.pool(previous, current);
+            score_candidates_2d(views.previous(), views.current(), &candidates)
+        };
+        let Some(best) = scored.iter().next().copied() else {
+            return Status::None;
+        };
+        let extent = previous.primary_extent();
+        let answer = {
+            let views = scratch.full_resolution(previous, current);
+            refine_winner(views.previous(), views.current(), &scored)
+        }
+        .map(|refined| refined.d)
+        .unwrap_or(best.d);
+
+        if mask.geometry && gate_geometry(answer, extent) != GateOutcome::Pass {
+            return Status::None;
+        }
+        if mask.gain && gate_residual_gain(best.gain) != GateOutcome::Pass {
+            return Status::None;
+        }
+        if mask.support && gate_support(best.tiles) != GateOutcome::Pass {
+            return Status::None;
+        }
+        if mask.margin {
+            // The rival has to come from **outside the winner's cell**: the second layer measures one
+            // value per 4 px cell (`P1.06`), so two members of the same cell share their score
+            // exactly and reading one of them as a rival reports the grid's resolution as ambiguity.
+            // Which member of the cell wins is the first layer's `support`, which `P1.07` made the
+            // ranking's tie-break; the ambiguity gate asks about the *page*, not about the grid.
+            let rival = outside_cell_second(&scored, best.d).map(|second| second.score);
+            if let GateOutcome::Reject(rejection) = gate_margin(best.d, margin_of(best.score, rival)) {
+                // A rejection carries the status of the gate that produced it (`P1.11`), and its
+                // ambiguity arm names the candidate the gate judged — the ranking's winner. What the
+                // funnel would *report* is the third layer's answer, and §16.10's `Uncertain` is "the
+                // shift we would have used, untrusted": those are different questions and they differ
+                // by at most a pixel, so the reported number is the refined one.
+                return match rejection.status() {
+                    Status::Uncertain { .. } => Status::Uncertain { d: answer },
+                    other => other,
+                };
+            }
+        }
+        // The number that gets confirmed is the number that is checked: gate one judges `answer`
+        // (§16.2.1), and so must §16.2.1's overlap ratio, or a refine that walked to the frame's own
+        // edge would be confirmed on the strength of the grid point it walked away from.
+        if is_verifiable(answer, extent) {
+            Status::Confirmed { d: answer }
+        } else {
+            Status::Uncertain { d: answer }
+        }
+    }
+
+    /// The strongest candidate that is **not** in the winner's cell — the only rival the second
+    /// layer can actually distinguish.
+    fn outside_cell_second(scored: &ScoredSet, winner: i32) -> Option<ScoredCandidate> {
+        let cell = round_to_grid(winner);
+        scored
+            .iter()
+            .find(|candidate| round_to_grid(candidate.d) != cell)
+            .copied()
+    }
+
+    /// One synthetic step the funnel is asked about, with the answer a session would need.
+    struct AblationCase {
+        name: &'static str,
+        image: TestImage,
+        viewport: u32,
+        step: i32,
+        horizontal: bool,
+    }
+
+    fn mixed_structures() -> [Structure; 5] {
+        [
+            Structure::Checker { cell: 12 },
+            Structure::TextRows { line: 19 },
+            Structure::NoiseBlocks { cell: 8 },
+            Structure::Gradient,
+            Structure::HorizontalBars { period: 19 },
+        ]
+    }
+
+    /// The corpus the ablation runs on: every structure the fixture can build, both axes, steps from
+    /// one pixel to past what the viewport can support, and one step *at* §16.9's boundary value.
+    fn ablation_cases() -> Vec<AblationCase> {
+        // 100 bands tall, not 60: the corpus asks about steps up to 890 px, and a vertical script
+        // must keep `offset + viewport` inside the document (`testkit.rs:359`).
+        let mixed = || TestImage::from_structures(640, 100 * 19, 11, 19, &mixed_structures());
+        let step = |name, step| AblationCase {
+            name,
+            image: mixed(),
+            viewport: 900,
+            step,
+            horizontal: false,
+        };
+        let mut cases = vec![
+            step("mixed-7", 7),
+            step("mixed-37", 37),
+            step("mixed-120", 120),
+            step("mixed-240", 240),
+            step("mixed-450", 450),
+            step("mixed-600", 600),
+            step("mixed-890", 890),
+            // §16.4.1's floor: a 300 px viewport yields 4 pooled tiles, so at most 2 independent
+            // ones — gate three cannot pass, whatever the page says. This is the case that makes gate
+            // three load-bearing on its own: the step is 120 and the match is exact (`gain` 1.0), so
+            // nothing else stands between it and a Confirmation.
+            AblationCase {
+                name: "small-120",
+                image: mixed(),
+                viewport: 300,
+                step: 120,
+                horizontal: false,
+            },
+            // §16.9's boundary value: answerable by overlap, forbidden as an answer.
+            AblationCase {
+                name: "mixed-h-120",
+                image: mixed(),
+                viewport: 900,
+                step: 120,
+                horizontal: true,
+            },
+        ];
+        cases.push(AblationCase {
+            name: "text-19",
+            image: TestImage::from_structures(640, 60 * 19, 5, 19, &[Structure::TextRows { line: 19 }]),
+            viewport: 900,
+            step: 19,
+            horizontal: false,
+        });
+        cases.push(AblationCase {
+            name: "text-38",
+            image: TestImage::from_structures(640, 60 * 19, 5, 19, &[Structure::TextRows { line: 19 }]),
+            viewport: 900,
+            step: 38,
+            horizontal: false,
+        });
+        cases.push(AblationCase {
+            name: "checker-24",
+            image: TestImage::from_structures(640, 60 * 19, 3, 19, &[Structure::Checker { cell: 12 }]),
+            viewport: 900,
+            step: 24,
+            horizontal: false,
+        });
+        cases.push(AblationCase {
+            name: "checker-120",
+            image: TestImage::from_structures(640, 60 * 19, 3, 19, &[Structure::Checker { cell: 12 }]),
+            viewport: 900,
+            step: 120,
+            horizontal: false,
+        });
+        cases.push(AblationCase {
+            name: "noise-4",
+            image: TestImage::from_structures(640, 60 * 19, 4, 19, &[Structure::NoiseBlocks { cell: 8 }]),
+            viewport: 900,
+            step: 4,
+            horizontal: false,
+        });
+        cases.push(AblationCase {
+            name: "noise-120",
+            image: TestImage::from_structures(640, 60 * 19, 4, 19, &[Structure::NoiseBlocks { cell: 8 }]),
+            viewport: 900,
+            step: 120,
+            horizontal: false,
+        });
+        cases.push(AblationCase {
+            name: "gradient-10",
+            image: TestImage::from_structures(640, 60 * 19, 6, 19, &[Structure::Gradient]),
+            viewport: 900,
+            step: 10,
+            horizontal: false,
+        });
+        cases.push(AblationCase {
+            name: "flat-10",
+            image: TestImage::from_structures(640, 60 * 19, 6, 60 * 19, &[Structure::Flat]),
+            viewport: 900,
+            step: 10,
+            horizontal: false,
+        });
+        cases
+    }
+
+    /// Whether a session is *entitled* to an answer for this step. Three of the design's own
+    /// prohibitions cap it, and a confirmation outside them is a wrong answer however close to the
+    /// true step it lands:
+    ///
+    /// - §16.2.1's overlap ratio (`is_verifiable`);
+    /// - §16.9's boundary value, `|d| == N/2`;
+    /// - §16.4.1's tile floor: gate three needs `MIN_TILES` independent tiles two apart, which a
+    ///   viewport shorter than ~448 px cannot supply. A viewport that small must not be answered
+    ///   from, so an answer from it is wrong even when the step it names is the true one.
+    fn answerable(step: i32, extent: u32) -> bool {
+        is_verifiable(step, extent)
+            && !(extent >= 2 && step.unsigned_abs() == extent / 2)
+            && enough_tiles_for_gate_three(extent)
+    }
+
+    /// §16.4.1's floor expressed through the mechanism rather than as the 448 px it works out to: the
+    /// pooled band is `match_rows(extent, extent, DOWNSAMPLE)` rows tall, a tile is
+    /// `TILE_ROWS / DOWNSAMPLE` of them, and gate three wants `MIN_TILES` tiles with a gap of
+    /// `TILE_INDEPENDENCE_GAP` between them.
+    fn enough_tiles_for_gate_three(extent: u32) -> bool {
+        let rows = match_rows(extent, extent, DOWNSAMPLE);
+        let tiles = rows / (TILE_ROWS / DOWNSAMPLE);
+        independent_support(0..tiles) >= MIN_TILES
+    }
+
+    /// The funnel's answer for every case under one gate mask.
+    fn ablate(mask: GateMask) -> Vec<Status> {
+        let mut scratch = Scratch::new();
+        let cases = ablation_cases();
+        cases
+            .iter()
+            .map(|case| {
+                let steps = vec![StepSpec::move_by(case.step)];
+                let mut script = if case.horizontal {
+                    ScrollScript::horizontal(&case.image, case.viewport, steps)
+                } else {
+                    ScrollScript::new(&case.image, case.viewport, steps)
+                };
+                let previous = script.take(0);
+                let current = script.take(1);
+                decide(
+                    &mut scratch,
+                    &previous.view(),
+                    &current.view(),
+                    case.step,
+                    ABLATION_WINDOW,
+                    mask,
+                )
+            })
+            .collect()
+    }
+
+    /// `(wrong confirmations, refusals of answerable cases)` for one mask.
+    fn tally(cases: &[AblationCase], answers: &[Status]) -> (usize, usize) {
+        let mut wrong = 0;
+        let mut refused = 0;
+        for (case, answer) in cases.iter().zip(answers) {
+            let entitled = answerable(case.step, case.viewport);
+            match answer {
+                Status::Confirmed { d } => {
+                    if !(entitled && d.abs_diff(case.step) <= 1) {
+                        wrong += 1;
+                    }
+                }
+                Status::Uncertain { .. } | Status::None => {
+                    if entitled {
+                        refused += 1;
+                    }
+                }
+            }
+        }
+        (wrong, refused)
+    }
+
+    #[test]
+    fn closing_any_gate_changes_the_error_rate() {
+        // §16.12: close each gate in turn and watch what happens to the answers. The metric is
+        // "wrong and Confirmed" — a confirmation of a shift the design does not entitle a session to
+        // (`answerable`) or one more than a pixel off the truth — plus the refusals, so that a gate
+        // which only trades refusals for refusals cannot look load-bearing.
+        let cases = ablation_cases();
+        let baseline = ablate(GateMask::ALL);
+        let (baseline_wrong, baseline_refused) = tally(&cases, &baseline);
+
+        // §16.12's exit condition ② is that every row can say *what* went wrong once its gate is
+        // closed, and "what" is a per-case claim. So the baseline is printed case by case, with the
+        // entitlement the metric uses, rather than only as the three numbers.
+        let mut detail = String::from("case         step  extent  entitled  status\n");
+        for (case, status) in cases.iter().zip(&baseline) {
+            detail.push_str(&format!(
+                "{:<12} {:<5} {:<7} {:<9} {status:?}\n",
+                case.name,
+                case.step,
+                case.viewport,
+                answerable(case.step, case.viewport),
+            ));
+        }
+
+        let mut table = format!(
+            "{:<10} {:>6} {:>8} {:>7}   cases that changed\n",
+            "closed", "wrong", "refused", "delta"
+        );
+        let mut rows: Vec<(Gate, usize, Vec<String>)> = Vec::new();
+        for gate in Gate::ALL {
+            let answers = ablate(GateMask::ALL.without(gate));
+            let (wrong, refused) = tally(&cases, &answers);
+            let changed: Vec<String> = cases
+                .iter()
+                .zip(&answers)
+                .zip(&baseline)
+                .filter(|((_, now), before)| now != before)
+                .map(|((case, now), before)| format!("{} {before:?} -> {now:?}", case.name))
+                .collect();
+            table.push_str(&format!(
+                "{:<10} {wrong:>6} {refused:>8} {:>7}   {}\n",
+                gate.name(),
+                format!("{:+}", wrong as i32 - baseline_wrong as i32),
+                changed.join("; ")
+            ));
+            rows.push((gate, wrong, changed));
+        }
+        let pair = ablate(GateMask::ALL.without(Gate::Gain).without(Gate::Support));
+        let (pair_wrong, _) = tally(&cases, &pair);
+        table.push_str(&format!(
+            "{:<10} {pair_wrong:>6} {:>8} {:>7}   gain+support\n",
+            "gain+sup",
+            "-",
+            format!("{:+}", pair_wrong as i32 - baseline_wrong as i32),
+        ));
+        table.push_str(&format!(
+            "baseline: {baseline_wrong} wrong, {baseline_refused} refused, {} cases\n",
+            cases.len()
+        ));
+        println!("{table}{detail}");
+
+        assert_eq!(
+            baseline_wrong, 0,
+            "the four gates together confirm a wrong shift on their own corpus:\n{table}{detail}"
+        );
+
+        // A gate that raises the wrong count earns its place. One that does not must still *change*
+        // something (otherwise it is inert and should be deleted) and must carry its reason here —
+        // the reason is the deliverable §16.12 asks for, so it is asserted, not merely written down.
+        const MASKED: [(Gate, &str); 3] = [
+            (
+                Gate::Geometry,
+                "mixed-450 goes None -> Uncertain{d:449}: gate one is the only gate that sees the \
+                 number the third layer actually produced (the ranking's winner was 449, the refined \
+                 answer the banned boundary 450), and it is a correctness constraint from §16.2 — \
+                 `|d| > extent` is not evidence about the page.",
+            ),
+            (
+                Gate::Gain,
+                "text-19 and text-38 go None -> Uncertain{d:0}: without gate two a band that cannot \
+                 be measured reaches the ambiguity gate, which then hands back a candidate whose shift \
+                 is zero on a page that moved 19 px. On flat-10 it is masked by gate three — see the \
+                 gain+sup row, which is where the pair earns its place.",
+            ),
+            (
+                Gate::Support,
+                "this is the one gate whose removal makes the funnel *more* willing to answer: the \
+                 refused count falls 9 -> 8 because small-120 (an entitled case) goes None -> \
+                 Confirmed{d:120}, its true step, while mixed-890 flips only inside the states that are \
+                 not entitled anyway. It stays because the question it decides is not \"is this number \
+                 right\" but \"is this evidence about the page or about one blob\" (§16.4): \
+                 `MIN_TILES` independent tiles two apart, which §16.4.1 caps at a viewport of about \
+                 448 px. `wrong` cannot see the difference — a commit from a single patch that happens \
+                 to be right is still a commit §16.4 forbids — so its retention reason is the mechanism \
+                 plus the refusal it makes, and this is the honest limit of the metric: gate four is \
+                 the only gate that moves `wrong` on this corpus.",
+            ),
+        ];
+        for (gate, wrong, changed) in &rows {
+            assert!(
+                *wrong >= baseline_wrong,
+                "closing gate {} made the funnel *less* wrong-confirming, which means it is not a \
+                 filter at all:\n{table}{detail}",
+                gate.name()
+            );
+            assert!(
+                !changed.is_empty(),
+                "closing gate {} changed no case in the corpus: it is inert, so delete it or give it \
+                 a case that exercises it:\n{table}{detail}",
+                gate.name()
+            );
+            if *wrong == baseline_wrong {
+                assert!(
+                    MASKED.iter().any(|(masked, _)| masked == gate),
+                    "gate {} raises no wrong confirmation and carries no reason to stay:\n{table}{detail}",
+                    gate.name()
+                );
+            }
+        }
+        assert!(
+            pair_wrong > baseline_wrong,
+            "gate two and gate three are individually masked by each other, so the pair has to do the \
+             work — closing both must let a wrong confirmation out:\n{table}{detail}"
+        );
+    }
+
+    #[test]
+    fn the_scratch_reuses_its_buffers_across_steps() {
+        let image = mixed_document();
+        let mut script = ScrollScript::new(&image, 900, vec![StepSpec::move_by(120)]);
+        let previous = script.take(0);
+        let current = script.take(1);
+        let mut scratch = Scratch::new();
+
+        let first = {
+            let views = scratch.pool(&previous.view(), &current.view());
+            (
+                views.previous().data.as_ptr(),
+                views.current().data.as_ptr(),
+                views.previous().data.clone(),
+            )
+        };
+        assert_eq!(scratch.builds(), 2, "one pooled image per frame");
+        assert_eq!(
+            first.2,
+            Gray::pooled(&previous.view()).data,
+            "the pooled image does not hold the frame it was pooled from"
+        );
+
+        let second = {
+            let views = scratch.pool(&previous.view(), &current.view());
+            (
+                views.previous().data.as_ptr(),
+                views.current().data.as_ptr(),
+            )
+        };
+        assert_eq!(
+            second,
+            (first.0, first.1),
+            "the pooled buffers were reallocated between two steps"
+        );
+        assert_eq!(
+            scratch.builds(),
+            4,
+            "a second call re-pools: there is no cache key to hide behind, because an address, a \
+             length and a timestamp are not an identity (see the note on `Scratch`)"
+        );
+
+        let _ = scratch.full_resolution(&previous.view(), &current.view());
+        assert_eq!(
+            scratch.builds(),
+            6,
+            "layer three reads the same two frames at scale one"
+        );
+
+        // The next step's frames are different ones and the buffers are still the same allocations: a
+        // session's memory is bounded by its first step, not by the length of the scroll (§22.5's
+        // reason to have a `Scratch` at all). Reuse is only useful if the reused buffer holds the
+        // *new* frame, so that is asserted against a fresh pooling rather than trusted.
+        let mut next = ScrollScript::new(&image, 900, vec![StepSpec::move_by(80)]);
+        let first_next = next.take(0);
+        let second_next = next.take(1);
+        let (reused, contents) = {
+            let views = scratch.pool(&first_next.view(), &second_next.view());
+            (
+                (views.previous().data.as_ptr(), views.current().data.as_ptr()),
+                views.previous().data.clone(),
+            )
+        };
+        assert_eq!(
+            reused,
+            (first.0, first.1),
+            "the pooled buffer was reallocated instead of reused"
+        );
+        assert_eq!(
+            contents,
+            Gray::pooled(&first_next.view()).data,
+            "the reused buffer still holds the previous step's pixels"
+        );
+        assert_eq!(scratch.builds(), 8);
     }
 }
