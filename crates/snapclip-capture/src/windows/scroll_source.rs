@@ -66,6 +66,64 @@ pub(crate) enum EndReason {
     Timeout,
 }
 
+/// What a display-topology or window change means for a running scroll session
+/// (`docs/30` §24.4, task `P2.05`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TopologyOutcome {
+    /// Nothing that can invalidate the canvas changed. The session keeps going.
+    Continue,
+    /// The target can no longer be a scroll target. The caller **must** make the rows it has
+    /// already confirmed available as a `Partial` export before it tears the session down:
+    /// that requirement is the whole reason this is not just "cancel" (§24.4, last
+    /// paragraph).
+    Stop(EndReason),
+}
+
+/// The target's own facts, as far as the canvas is concerned.
+///
+/// Deliberately **not** here: the window's position, and which monitor it is on. A
+/// window-level capture takes the window's *content*, so moving the window — including to
+/// another monitor with the same scaling — cannot invalidate the rows already written.
+/// Only the physical-pixel scale and the content's size are part of the canvas coordinate
+/// system, and minimising is the platform telling us there is nothing to capture.
+///
+/// This absence is load-bearing, so it is pinned by a test: adding a position or a monitor
+/// field would make rows 2 and 4 of §24.4's table stop the session, which is exactly the
+/// behaviour the table exists to remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TargetGeometry {
+    /// The effective DPI of the monitor the target is on. A change here changes the
+    /// physical-pixel scale, which is what the canvas is measured in.
+    pub dpi: u32,
+    /// The target's frame size in physical pixels.
+    pub size: (u32, u32),
+    /// Whether the target is minimised (`IsIconic`).
+    pub minimised: bool,
+}
+
+/// Decide what a change means by comparing the target with itself, not by classifying the
+/// message that arrived.
+///
+/// This is the whole point of the function: `WM_DISPLAYCHANGE`, `WM_DPICHANGED` and
+/// `WM_DEVICECHANGE` all reach the same call, because the same message can be either
+/// "the target's scaling changed" or "an unrelated monitor woke up". Asking the target is
+/// the only way to tell them apart (§24.4).
+pub(crate) fn topology_outcome(
+    before: &TargetGeometry,
+    after: &TargetGeometry,
+) -> TopologyOutcome {
+    if after.minimised {
+        return TopologyOutcome::Stop(EndReason::TargetLost);
+    }
+    if after.dpi != before.dpi {
+        return TopologyOutcome::Stop(EndReason::TargetLost);
+    }
+    if after.size != before.size {
+        return TopologyOutcome::Stop(EndReason::TargetLost);
+    }
+    TopologyOutcome::Continue
+}
+
 /// One attempt to get a new observation.
 #[derive(Debug)]
 pub(crate) enum Poll {
@@ -367,7 +425,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        BackendPoll, EndReason, FrameBackend, FrameError, FrameSource, Poll, WgcFrameSource,
+        BackendPoll, EndReason, FrameBackend, FrameError, FrameSource, Poll, TargetGeometry,
+        TopologyOutcome, WgcFrameSource, topology_outcome,
     };
     use crate::geometry::Rect;
     use crate::scroll::observation::Axis;
@@ -609,6 +668,123 @@ mod tests {
             source.next(Duration::from_millis(50)),
             Ok(Poll::Ended(_))
         ));
+    }
+
+    // --- display topology and window changes (§24.4; task P2.05) ---
+    //
+    // The five rows of §24.4's table, as five cases through one function. The function
+    // deliberately never sees *which message* arrived: it compares the target's own facts
+    // before and after. That is the whole design — "was this change about the target?" is
+    // answered by looking at the target, not by classifying the message, because the same
+    // `WM_DISPLAYCHANGE` can be either.
+    //
+    // Rows 2 and 4 collapse into the same computation: neither is representable as a change
+    // to the target's own facts. That collapse *is* the fix (§24.4: today's code cancels the
+    // session for both), so the last test below is a compile-time pin rather than a value.
+
+    fn geometry(dpi: u32, size: (u32, u32), minimised: bool) -> TargetGeometry {
+        TargetGeometry {
+            dpi,
+            size,
+            minimised,
+        }
+    }
+
+    #[test]
+    fn a_dpi_change_on_the_targets_monitor_stops_the_session() {
+        let before = geometry(144, (1280, 900), false);
+        let after = geometry(192, (1280, 900), false);
+        assert!(matches!(
+            topology_outcome(&before, &after),
+            TopologyOutcome::Stop(EndReason::TargetLost)
+        ));
+    }
+
+    #[test]
+    fn a_topology_change_on_another_monitor_leaves_the_session_running() {
+        // The caller re-reads the target after any `WM_DISPLAYCHANGE`/`WM_DEVICECHANGE`; when
+        // the change was on another monitor the facts come back identical, so there is
+        // nothing here to stop for. Another monitor is not represented in `TargetGeometry`
+        // because it cannot invalidate this canvas.
+        for before in [
+            geometry(96, (640, 480), false),
+            geometry(144, (1280, 900), false),
+            geometry(192, (2560, 1440), false),
+        ] {
+            let after = before;
+            assert!(
+                matches!(topology_outcome(&before, &after), TopologyOutcome::Continue),
+                "a change that leaves the target at {before:?} must not stop the session"
+            );
+        }
+    }
+
+    #[test]
+    fn a_target_resize_stops_the_session() {
+        let before = geometry(144, (1280, 900), false);
+        let after = geometry(144, (1280, 900), false);
+        // Resizing in either direction reflows the page, so the two canvases are not
+        // comparable and the rows already written are not extendable.
+        for size in [(1280, 901), (1279, 900), (1920, 1080)] {
+            let resized = TargetGeometry { size, ..after };
+            assert!(
+                matches!(
+                    topology_outcome(&before, &resized),
+                    TopologyOutcome::Stop(EndReason::TargetLost)
+                ),
+                "resizing to {size:?} must stop the session"
+            );
+        }
+    }
+
+    #[test]
+    fn the_target_moving_to_another_monitor_with_the_same_dpi_keeps_running() {
+        // A move changes the window's *position* and which monitor it is on. Neither is a
+        // field of `TargetGeometry`, and the same DPI means the physical-pixel scale — the
+        // thing the canvas coordinate system is made of — is unchanged. The pin below keeps
+        // it that way; this test states the consequence.
+        let before = geometry(144, (1280, 900), false);
+        let after = geometry(144, (1280, 900), false);
+        assert!(matches!(
+            topology_outcome(&before, &after),
+            TopologyOutcome::Continue
+        ));
+    }
+
+    #[test]
+    fn minimising_the_target_stops_the_session() {
+        let before = geometry(144, (1280, 900), false);
+        let after = geometry(144, (1280, 900), true);
+        assert!(matches!(
+            topology_outcome(&before, &after),
+            TopologyOutcome::Stop(EndReason::TargetLost)
+        ));
+        // Minimising also wins over a simultaneous resize: the answer is the same either
+        // way, and the caller's `Partial` export does not depend on which one it was.
+        let resized = TargetGeometry {
+            size: (1920, 1080),
+            ..after
+        };
+        assert!(matches!(
+            topology_outcome(&before, &resized),
+            TopologyOutcome::Stop(EndReason::TargetLost)
+        ));
+    }
+
+    #[test]
+    fn the_target_geometry_holds_only_what_can_invalidate_the_canvas() {
+        // Exactly three fields and no `..`: adding a position or a monitor identity makes
+        // this fail to compile, which is the point. Rows 2 and 4 of §24.4 are only "continue"
+        // because nothing that changed is carried here — a window-level capture takes the
+        // window's content, so where the window is cannot invalidate the canvas.
+        let TargetGeometry {
+            dpi,
+            size,
+            minimised,
+        } = geometry(144, (1280, 900), false);
+        let _: u32 = dpi;
+        let _: (u32, u32) = size;
+        let _: bool = minimised;
     }
 }
 

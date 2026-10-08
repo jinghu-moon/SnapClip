@@ -3964,6 +3964,43 @@ impl CaptureCapabilities {
 
 **必须补一条今天的代码没有的东西**：**`Partial` 必须在停止时立即可用**。今天 `WM_DISPLAYCHANGE` 的路径是 `cancel(...) + renderer = None + worker.invalidate_providers()`（§5），**没有任何"保住已完成部分"的机制**。
 
+#### 24.4.1 落地的形状（`P2.05`，2026-10-09）
+
+判定落成一个**纯函数**，五行用例全部走它（`crates/snapclip-capture/src/windows/scroll_source.rs`）：
+
+```rust
+pub(crate) enum TopologyOutcome {
+    Continue,
+    /// 调用方**必须**先把已确认的行作为 `Partial` 导出，再拆会话。
+    Stop(EndReason),
+}
+
+/// 目标自己的事实——**没有位置、没有显示器标识**。
+pub(crate) struct TargetGeometry {
+    pub dpi: u32,
+    pub size: (u32, u32),
+    pub minimised: bool,
+}
+
+pub(crate) fn topology_outcome(before: &TargetGeometry, after: &TargetGeometry) -> TopologyOutcome {
+    if after.minimised            { return TopologyOutcome::Stop(EndReason::TargetLost); }
+    if after.dpi  != before.dpi   { return TopologyOutcome::Stop(EndReason::TargetLost); }
+    if after.size != before.size  { return TopologyOutcome::Stop(EndReason::TargetLost); }
+    TopologyOutcome::Continue
+}
+```
+
+**四处落地裁决**：
+
+1. **函数不看消息，只看目标。** `WM_DISPLAYCHANGE` / `WM_DPICHANGED` / `WM_DEVICECHANGE` 走**同一次调用**——因为同一条消息既可能是"目标的缩放变了"也可能是"另一台显示器醒了"，分类消息本身做不到这件事（这正是 §24.4 要修的那个 bug）。调用方在任何拓扑消息之后**重新读一次目标**，把结果交给这个函数。
+2. **`TargetGeometry` 里没有位置、也没有显示器标识，而且这个"没有"是承重的。** 窗口级捕获拿的是窗口**内容**，所以移动窗口——包括移到另一台同缩放的显示器——不可能让已经写下的行失效。因此 §24.4 表的第 2 行与第 4 行**归约成同一个计算**：它们都不是"目标自己的事实发生了变化"。这条归约**就是修复本身**（今天两行都会被取消），所以它由一条测试钉住：用例对 `TargetGeometry` 做**不带 `..` 的解构**，将来有人加一个 `position`/`monitor` 字段，编译就会失败。
+3. **`Stop` 携带"必须先交出 `Partial`"的义务。** 类型上只有一个 `EndReason` 字段，但文档注释把 §24.4 最后一段的要求写在了变体上：停止与"取消"的区别就在于前者保住已完成的部分。`StopReason`（§20.4）的映射与 `Partial` 的产出是会话层的事。
+4. **三条条件按"先最小化、再 DPI、再尺寸"排序。** 三者都返回同一个 `TargetLost`，所以顺序不影响答案，只影响阅读：最小化是"平台说没有东西可捕"，DPI 是"画布坐标系不再可比"，尺寸是"内容重排"。同时最小化 + 尺寸变化仍然只报一次停止。
+
+**范围说明（归 P3/P4 的组装）**：本任务只交付判定函数与五行用例；把 `WM_*` 处理器接到它上面、在 `Stop` 时导出 `Partial`、以及 §24.4 开头"今天的 `window_host.rs:199-209` 全取消"这条**普通截图路径的行为不做任何改动**（退出条件 ③ 的 A 类回归：本次改动只碰 `scroll_source.rs` 一个文件）。
+
+**§30.1 的五行（L3）** 因此变成"判定已可执行（`P2.05`），桌面接线归会话组装"。
+
 ### 24.5 UIPI、display affinity 与三层排除
 
 **事实（全部已确证）**：
@@ -4637,6 +4674,8 @@ fn rows_match(actual, expected, sigma) -> bool
 | 目标跨显示器移动（尺寸不变） | 拖动窗口 | **继续**（窗口级捕获不受影响） | L3 | — |
 | 非目标显示器拓扑变化 | 触发 `WM_DISPLAYCHANGE` | **继续**（今天会取消，§24.4） | L3 | — |
 | 目标显示器 DPI 变化 | 改缩放 | 停止 + `Partial` | L3 | — |
+
+> 上面五行（`P2.05`）：判定函数与五行 L1 用例已落地（§24.4.1），桌面接线与 `Partial` 导出归会话组装。
 | 设备丢失 | mock `DeviceLost` | 停止 + `Partial` | L2 | — |
 | 每步仅一次回读 | 100 步 + 回读计数 | 计数 == 100（§11.3） | L2 | — |
 | 同一帧读第二次 | 对一帧调两次 `read_region` | 第二次在**触到设备之前**被拒（§11.3.1） | L1 | — |
