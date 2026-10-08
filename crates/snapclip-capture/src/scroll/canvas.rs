@@ -1233,10 +1233,17 @@ impl RecoveredImage {
     /// a fact about the page, not an error. `Contained` is the other side of the same coin and is
     /// decided before this is called ([`ViewportState::apply`]).
     ///
-    /// The half-viewport bound is §17.2's first term read in this direction: a prepend of more than
-    /// half the viewport would leave less than half the frame overlapping the canvas, which is the
-    /// geometry the design refuses on the append side too. It is an assertion rather than a silent
-    /// trim because a caller that hands us one has skipped the gate that says `|d| <= extent`.
+    /// The bound is gate one's (`|d| <= extent`, §16.2), read in this direction, and the acceptance
+    /// scan is what settled it (`P1.24`): the first version of this assertion said `extent / 2`, and
+    /// the `|d| = 500` rows of the scan then tripped it on a step the whole funnel had just
+    /// confirmed with all four gates. The estimator is right to confirm it — 500 of 900 rows still
+    /// leaves 400 rows of overlap, which is most of a match band — and refusing to write would leave
+    /// the canvas stale after a legitimate scroll-up. §17.2's band formula is satisfied for every
+    /// `rows <= extent` in this direction: the band is the frame's *leading* rows, so
+    /// `max(extent / 2, extent / 4 + rows) >= rows` holds trivially.
+    ///
+    /// It stays an assertion rather than a silent trim because a caller that hands us more than the
+    /// viewport has skipped the gate that says so.
     pub(crate) fn prepend_confirmed(&mut self, frame: &Observation, rows: u64) -> StepWrite {
         if rows == 0 {
             return StepWrite::Contained;
@@ -1248,8 +1255,9 @@ impl RecoveredImage {
             "the frame's cross axis is not the canvas's (invariant 1)"
         );
         assert!(
-            rows <= extent / 2,
-            "a prepend of {rows} rows leaves less than half of the {extent}-row viewport overlapping the canvas, which is the geometry §17.2's first term rules out"
+            rows <= extent,
+            "a prepend of {rows} rows is more than the {extent}-row viewport it came from, so it is \
+             not a displacement gate one would have passed (§16.2)"
         );
         let row_bytes = (self.cross_len * BYTES_PER_PIXEL) as usize;
         let new_rows = &frame.pixels()[..rows as usize * row_bytes];

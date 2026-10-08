@@ -12,6 +12,8 @@
 //! * `orb` (`P1.23`) — the conditionally triggered second opinion. It can only answer
 //!   `Agree`/`Disagree`/`NoEvidence`; it never produces a reported displacement.
 //! * `testkit` (`P1.01`) — the synthetic fixture every later `P1` task is judged against.
+//! * `acceptance` (`P1.24`) — `E-ACC-1` as a gate: the `§29.3` scan over the whole funnel, judged by
+//!   byte equality with the generator's truth. Test-only, but it is the reason G1 is checkable.
 //! * `perf_probe` (`P0.03`) — the measurement device for `E-PERF-1`, kept because its numbers are
 //!   the only matching-cost data this repository has and `P1.05`+ must re-run it on the real
 //!   layer 1 (see `docs/30` §23.3.1 and `DEV-8`).
@@ -31,6 +33,9 @@ pub(crate) mod displacement;
 pub(crate) mod observation;
 
 pub(crate) mod orb;
+
+#[cfg(test)]
+mod acceptance;
 
 #[cfg(test)]
 mod perf_probe;

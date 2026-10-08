@@ -31,7 +31,8 @@
 //!
 //! `P1.07` adds §15.4 ③'s third and last layer. It is the first thing allowed to *decide a number*:
 //! everything below it produces sets or measurements, and everything above it decides what to do
-//! with one. It reads full resolution, its whole freedom is `±1` integer pixel ([`REFINE_NEIGHBOURHOOD`]),
+//! with one. It reads full resolution, its whole freedom is one measurement cell of the layer below
+//! ([`REFINE_NEIGHBOURHOOD`]),
 //! and it answers with [`Refined`] — an `i32` and one correlation, with no field for a subpixel
 //! offset. N3 says why: the observation is an integer pixel grid, so a fractional shift would be an
 //! interpolation believed as a measurement.
@@ -408,13 +409,21 @@ impl CandidateSet {
         self.items[..self.len].iter()
     }
 
-    /// Keeps the ranking `(support desc, |d| asc, d asc)`. The tie-break is what makes the answer
-    /// deterministic on the carrier images where several shifts are equally supported (`P1.05`'s
-    /// exit condition ②).
-    fn insert(&mut self, candidate: Candidate) {
+    /// Keeps the ranking `(support desc, |d − expected| asc, |d| asc, d asc)`. The tie-break is what
+    /// makes the answer deterministic on the carrier images where several shifts are equally supported
+    /// (`P1.05`'s exit condition ②).
+    ///
+    /// **`expected` is the search centre, not zero, and that is the whole point of the first tie-break
+    /// key.** Ranking by `|d|` alone silently prefers shifts near *zero*, which is only harmless while
+    /// `support` is informative: `P1.24`'s full scan found that on a noisy frame (`σ > 0`, where no row
+    /// digest can match across frames and every `support` is therefore 0) the set degenerated to the
+    /// eight *lowest* shifts in the window — for `expected = 26, window = 8` that is `18..=25`, so the
+    /// truth was not a candidate at all and the funnel answered `25`. The prior is the only signal
+    /// left when the exactness evidence is gone, so it decides which eight shifts get measured.
+    fn insert(&mut self, candidate: Candidate, expected: i32) {
         let mut at = self.len;
         for (index, existing) in self.items[..self.len].iter().enumerate() {
-            if ranks_before(candidate, *existing) {
+            if ranks_before(candidate, *existing, expected) {
                 at = index;
                 break;
             }
@@ -433,12 +442,22 @@ impl CandidateSet {
     }
 }
 
-fn ranks_before(candidate: Candidate, existing: Candidate) -> bool {
+fn ranks_before(candidate: Candidate, existing: Candidate, expected: i32) -> bool {
     match candidate.support.cmp(&existing.support) {
         core::cmp::Ordering::Greater => true,
         core::cmp::Ordering::Less => false,
         core::cmp::Ordering::Equal => {
-            (candidate.d.unsigned_abs(), candidate.d) < (existing.d.unsigned_abs(), existing.d)
+            let candidate_key = (
+                candidate.d.abs_diff(expected),
+                candidate.d.unsigned_abs(),
+                candidate.d,
+            );
+            let existing_key = (
+                existing.d.abs_diff(expected),
+                existing.d.unsigned_abs(),
+                existing.d,
+            );
+            candidate_key < existing_key
         }
     }
 }
@@ -466,10 +485,13 @@ pub(crate) fn candidates_1d(
     let half = window.max(0);
     let mut candidates = CandidateSet::new();
     for shift in expected.saturating_sub(half)..=expected.saturating_add(half) {
-        candidates.insert(Candidate {
-            d: shift,
-            support: support_at(&previous_digests, &current_digests, shift),
-        });
+        candidates.insert(
+            Candidate {
+                d: shift,
+                support: support_at(&previous_digests, &current_digests, shift),
+            },
+            expected,
+        );
     }
     candidates
 }
@@ -1117,9 +1139,18 @@ fn scored_ranks_before(candidate: ScoredCandidate, existing: ScoredCandidate) ->
     }
 }
 
+/// The grid point of the cell a shift belongs to: [`round_to_grid`]'s cell index times the grid.
+///
+/// The two are one idea — which cell layer 2 measured a shift in — so they are one expression in one
+/// place. `round_to_grid` is named for what it is (an index), and every caller that wants a shift back
+/// goes through here.
+fn grid_point(shift: i32) -> i32 {
+    round_to_grid(shift) * DOWNSAMPLE as i32
+}
+
 /// How far a full-resolution shift is from the grid point layer 2 measured it at.
 fn grid_distance(shift: i32) -> u32 {
-    shift.abs_diff(round_to_grid(shift) * DOWNSAMPLE as i32)
+    shift.abs_diff(grid_point(shift))
 }
 
 /// `docs/30` §15.4's second layer: the first thing in the funnel allowed to *argue*, because it is
@@ -1174,10 +1205,20 @@ pub(crate) fn score_candidates_2d(
 
 // --- layer 3 (`P1.07`) --------------------------------------------------------------------------
 
-/// §15.4 ③'s refinement neighbourhood: the winner and its two integer neighbours, in the order the
-/// tie-break prefers them. N3 is why there is no fourth entry and no fraction: the evidence is a
-/// pixel grid, so a subpixel offset would be interpolation wearing the clothes of a measurement.
-pub(crate) const REFINE_NEIGHBOURHOOD: [i32; 3] = [-1, 0, 1];
+/// §15.4 ③'s refinement neighbourhood: **one measurement cell of layer 2**, in the order the tie-break
+/// prefers it, applied around the winner's [`grid_point`] rather than around the winner.
+///
+/// It was `[-1, 0, 1]` until `P1.24`. The radius is not a taste: layer 2 measures on a
+/// [`DOWNSAMPLE`]-pixel grid, so a cell's members share one measurement and the layer's winner is the
+/// cell's grid point, while the truth can be `DOWNSAMPLE / 2` px away from it. Layer 1's exact-digest
+/// support is what used to separate the members, and on any noisy frame it is identically zero (no row
+/// digest survives a per-pixel perturbation), so the cell is decided by grid distance and the truth
+/// ends up outside a ±1 neighbourhood. `P1.24`'s full scan caught 12 such cases out of 5,376; the
+/// radius that matches the grid is `±DOWNSAMPLE / 2` = 2, which is what this is.
+///
+/// N3 is still why there is no fraction in here: the evidence is a pixel grid, so a subpixel offset
+/// would be interpolation wearing the clothes of a measurement.
+pub(crate) const REFINE_NEIGHBOURHOOD: [i32; 5] = [-2, -1, 0, 1, 2];
 
 /// What the funnel's last layer hands on: one integer shift and the full-resolution correlation
 /// that won it.
@@ -1205,13 +1246,17 @@ fn refine_ranks_before(shift: i32, zncc2d: f32, winner: i32, incumbent: Refined)
     }
 }
 
-/// §15.4 ③'s third layer: full resolution, integer, and only `±1` around layer 2's winner.
+/// §15.4 ③'s third layer: full resolution, integer, and one measurement cell around layer 2's winner.
 ///
 /// Layer 2 measures on a [`DOWNSAMPLE`]-pixel grid, so every candidate inside one cell is *one*
 /// measurement and the layer reports the grid point it measured at. This layer re-measures that
-/// winner's own neighbourhood at full resolution and keeps whichever shift correlates best, which
-/// is how a 119 px step stops being reported as the 120 px grid point it was rounded to, and what
-/// `P1.06`'s `shifts_inside_one_cell_share_one_measurement` said was deliberately left to here.
+/// cell's neighbourhood at full resolution and keeps whichever shift correlates best, which is how a
+/// 119 px step stops being reported as the 120 px grid point it was rounded to, and what `P1.06`'s
+/// `shifts_inside_one_cell_share_one_measurement` said was deliberately left to here.
+///
+/// The search is centred on [`grid_point`]`(winner)` — the cell layer 2 actually measured — and spans
+/// [`REFINE_NEIGHBOURHOOD`], i.e. `±DOWNSAMPLE / 2`. Centring on the cell rather than on the winner
+/// matters when the winner is not the grid point, and the radius matters always: see the constant.
 ///
 /// It is also the last layer: above it, evidence is assembled and gates decide, but no further
 /// measurement is possible.
@@ -1224,10 +1269,11 @@ pub(crate) fn refine_winner(
     scored: &ScoredSet,
 ) -> Option<Refined> {
     let winner = scored.iter().next()?.d;
+    let centre = grid_point(winner);
     let wanted = match_rows(previous_gray.height, current_gray.height, 1);
     let mut refined: Option<Refined> = None;
     for step in REFINE_NEIGHBOURHOOD {
-        let shift = winner + step;
+        let shift = centre + step;
         // A neighbour can leave the frame entirely (a shift equal to the extent does not hit this
         // layer, but a one-row frame can): the other two still get their say.
         let Some(band) = match_band(previous_gray.height, current_gray.height, shift, wanted) else {
@@ -1438,7 +1484,7 @@ const MARGIN_SCORE_FLOOR: f32 = 1e-3;
 /// having no scale to divide by. The second cause cannot arise through the pipeline — passing gate
 /// two means `score >= SCORE_GAIN · MIN_RESIDUAL_GAIN = 0.0375`, an order of magnitude above
 /// [`MARGIN_SCORE_FLOOR`] — and [`gate_margin`] says what the answer is when it appears anyway.
-fn margin_of(best: f32, second: Option<f32>) -> Option<f32> {
+pub(crate) fn margin_of(best: f32, second: Option<f32>) -> Option<f32> {
     if best <= MARGIN_SCORE_FLOOR {
         return None;
     }
@@ -1462,6 +1508,26 @@ pub(crate) fn gate_margin(best: i32, margin: Option<f32>) -> GateOutcome {
         Some(_) => GateOutcome::Reject(GateRejection::MarginTooSmall { best }),
         None => GateOutcome::Pass,
     }
+}
+
+/// The strongest candidate that is **not** in the winner's cell — the only rival the second layer
+/// can actually distinguish.
+///
+/// The second layer measures one value per 4 px cell (`P1.06`), so two members of the same cell share
+/// their score exactly; reading one of them as a rival would report the grid's resolution as
+/// ambiguity. Which member of the cell wins is the first layer's `support`, which `P1.07` made the
+/// ranking's tie-break. §16.5's ambiguity question is about the **page**, not about the grid.
+///
+/// It lives in the production half of this module rather than in the tests because two callers need
+/// the same rule: `P1.13`'s ablation and `P1.24`'s acceptance scan. Neither is the real session
+/// assembly (`P3.09`), and a rule with two test-only copies is a rule that can drift before the
+/// production caller ever exists.
+pub(crate) fn outside_cell_second(scored: &ScoredSet, winner: i32) -> Option<ScoredCandidate> {
+    let cell = round_to_grid(winner);
+    scored
+        .iter()
+        .find(|candidate| round_to_grid(candidate.d) != cell)
+        .copied()
 }
 
 // --- manual mode (§16.6): ambiguity has to be recognised, not predicted -------------------------
@@ -2223,14 +2289,15 @@ mod tests {
         TILE_INDEPENDENCE_GAP, alignment_error, band_zncc, candidates_1d, gate_geometry, gate_margin,
         gate_residual_gain, gate_support, has_peak_family, independent_support, is_scene_cut,
         is_verifiable, manual_window, margin_of,
-        match_band, match_rows, primary_digests, region_evidence, residual_gain, residual_gain_at,
+        match_band, match_rows, outside_cell_second, primary_digests, region_evidence,
+        residual_gain, residual_gain_at,
         score_candidates_2d,
         support_at, zero_shift_similarity, zero_shift_status,
     };
     use crate::scroll::observation::{Axis, Observation, ObservationView};
     use crate::scroll::displacement::{
         DOWNSAMPLE, REFINE_NEIGHBOURHOOD, Refined, TILE_ROWS, TILE_SUPPORT_ZNCC, coverage_of,
-        grid_distance, refine_winner, round_to_grid,
+        grid_distance, grid_point, refine_winner, round_to_grid,
     };
     use crate::scroll::testkit::{ScrollScript, StepSpec, Structure, TestImage};
 
@@ -2916,9 +2983,10 @@ mod tests {
                 .expect("layer 2 proposed a shift, so layer 3 has something to refine");
 
             assert!(
-                refined.d.abs_diff(winner) <= 1,
+                refined.d.abs_diff(winner) <= DOWNSAMPLE / 2,
                 "truth {truth}: the third layer moved the winner from {winner} to {}, but its \
-                 neighbourhood is ±1 — a wider move is a second search, not a refinement",
+                 neighbourhood is one measurement cell — a wider move is a second search, not a \
+                 refinement",
                 refined.d
             );
 
@@ -2934,9 +3002,10 @@ mod tests {
 
             // And the shift it reports really is the best full-resolution correlation inside that
             // neighbourhood — recomputed independently, then read off `Refined`.
+            let centre = grid_point(winner);
             let best_inside = REFINE_NEIGHBOURHOOD
                 .iter()
-                .map(|step| winner + step)
+                .map(|step| centre + step)
                 .max_by(|left, right| {
                     full_resolution_zncc(&previous.view(), &current.view(), *left)
                         .total_cmp(&full_resolution_zncc(&previous.view(), &current.view(), *right))
@@ -2957,6 +3026,55 @@ mod tests {
         }
     }
 
+    /// `P1.24`'s finding, as its own case: **the refinement radius has to match the measurement grid.**
+    ///
+    /// Layer 2 measures on a [`DOWNSAMPLE`]-pixel grid, so every candidate inside one cell shares a
+    /// single measurement and the layer reports the cell's grid point. Layer 1's exact-digest support
+    /// is what used to separate them, and it is identically zero on a noisy frame: `add_noise`
+    /// (`testkit.rs:560`) perturbs every colour channel of every pixel of the stepped frame, so no
+    /// row digest can match across frames. That leaves the grid distance to decide the cell, and the
+    /// winner up to `DOWNSAMPLE / 2` = 2 px away from the truth — which a ±1 neighbourhood cannot
+    /// reach. It lands one pixel short and the funnel confirms it.
+    ///
+    /// `P1.24`'s full scan found exactly this: 12 of 5,376 cases, all at `|d| = 14` with `P/|d| = 0.5`.
+    /// This case is that mechanism with the scan taken away.
+    #[test]
+    fn a_noisy_frame_is_resolved_two_pixels_off_the_grid() {
+        let image = mixed_document();
+        let truth = 14;
+        let mut script = ScrollScript::new(
+            &image,
+            900,
+            vec![StepSpec::move_by(truth).with_noise(5)],
+        );
+        let previous = script.take(0);
+        let current = script.take(1);
+        let candidates = candidates_1d(&previous.view(), &current.view(), truth, 5);
+        let scored = scored_once(&previous, &current, &candidates);
+        let winner = scored
+            .iter()
+            .next()
+            .expect("the second layer scored nothing on the mixed document")
+            .d;
+
+        assert_eq!(
+            truth.abs_diff(winner),
+            DOWNSAMPLE / 2,
+            "the fixture put the truth {truth} and layer 2's winner {winner} {} px apart, not 2: this \
+             case only says something about the radius if the truth is exactly one grid step away",
+            truth.abs_diff(winner)
+        );
+
+        let refined = refined_once(&previous, &current, &scored)
+            .expect("layer 2 proposed a shift, so layer 3 has something to refine");
+        assert_eq!(
+            refined.d, truth,
+            "layer 2 said {winner} and layer 3 said {}: the neighbourhood cannot reach a truth that \
+             sits one grid step away from the cell's grid point",
+            refined.d
+        );
+    }
+
     /// `docs/31` §6 `P1.07`'s second RED case.
     #[test]
     fn the_final_value_is_an_integer() {
@@ -2966,8 +3084,10 @@ mod tests {
         // that the evidence cannot support (N3).
         assert_eq!(
             REFINE_NEIGHBOURHOOD,
-            [-1, 0, 1],
-            "the third layer's freedom is ±1 integer pixel and nothing else"
+            [-2, -1, 0, 1, 2],
+            "the third layer's freedom is one measurement cell of layer 2 (±2 integer pixels) and \
+             nothing else — the radius was ±1 until P1.24's full scan showed a truth one grid step \
+             outside it being confirmed a pixel short"
         );
 
         let image = mixed_document();
@@ -4131,16 +4251,6 @@ mod tests {
         } else {
             Status::None
         }
-    }
-
-    /// The strongest candidate that is **not** in the winner's cell — the only rival the second
-    /// layer can actually distinguish.
-    fn outside_cell_second(scored: &ScoredSet, winner: i32) -> Option<ScoredCandidate> {
-        let cell = round_to_grid(winner);
-        scored
-            .iter()
-            .find(|candidate| round_to_grid(candidate.d) != cell)
-            .copied()
     }
 
     /// One synthetic step the funnel is asked about, with the answer a session would need.
