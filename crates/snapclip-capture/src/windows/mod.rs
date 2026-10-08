@@ -23,6 +23,11 @@ pub mod overlay;
 pub mod providers;
 pub mod refinement_worker;
 pub mod renderer;
+/// Measure-only probe for the injection decision (`docs/30` §24.6, `E-INJECT-1`).
+/// It exists to answer "can we actually drive this window's scroll position",
+/// never to ship: it is test-only and nothing in the capture path calls it.
+#[cfg(test)]
+pub mod scroll_probe;
 pub mod timed_call;
 pub mod uia_provider;
 pub mod win;

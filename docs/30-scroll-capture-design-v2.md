@@ -995,7 +995,7 @@ Chromium 源码：`num_ticks = wheel_delta / WHEEL_DELTA`（120），再 `× SPI
 ShareX **自动滚到底**、**前两帧不匹配即中止**；PixPin **用户手动滚 + 程序被动拼接**，预览窗口**仅在开始态显示**；macshot 有"选区旁实时预览"；Firefox 只有 Save full page（超限裁 32,700 px）；CDP `Input.dispatchMouseEvent` 有像素语义（"delta in CSS pixels"）但**协议无 `deltaMode`**。
 → **影响**：① §19.2 的"**会话中持续可见**的预览"是相对 PixPin 的净增量；② §13 的**双向支持**是相对 ShareX/Snagit 的净增量；③ §13.3 否决"滚到底再回顶"获得**第二条独立理由**（第一条是 F3 的覆盖不变量，第二条是它与懒加载/虚拟列表/`position: fixed` 天然冲突）。
 
-**第二轮明确"未找到官方依据"的六项**（如实记录，均已在 §36 转为可执行实验）：`PostMessage` 滚轮能否驱动 Chromium（唯一决定性实验 `E-INJECT-1` 第 3/4 组）· WGC 会话接口 4/5/6/7 的引入 build（Learn 无 session2–7 页面，只有 windows-rs 元数据 ⇒ 只能运行期 QI）· WDA 对 WGC 的生效范围 · `SendInput` 的 UIPI 方向（官方两页互相矛盾）· `--force-renderer-accessibility` 与 UIA 的对应关系 · `captureBeyondViewport` 与懒加载/fixed 的已知冲突。
+**第二轮明确"未找到官方依据"的六项**（如实记录，均已在 §36 转为可执行实验）：`PostMessage` 滚轮能否驱动 Chromium（唯一决定性实验 `E-INJECT-1` 第 3/4 组 —— **已由本机实验回答"能"，§24.6.1；但"官方依据"仍然没有，所以它现在是实验事实而不是文档事实**）· WGC 会话接口 4/5/6/7 的引入 build（Learn 无 session2–7 页面，只有 windows-rs 元数据 ⇒ 只能运行期 QI）· WDA 对 WGC 的生效范围 · `SendInput` 的 UIPI 方向（官方两页互相矛盾）· `--force-renderer-accessibility` 与 UIA 的对应关系 · `captureBeyondViewport` 与懒加载/fixed 的已知冲突。
 
 ---
 
@@ -1663,7 +1663,7 @@ pub enum InjectStatus {
 | **稀疏光流 LK + 前后向一致性** | 大位移需金字塔；孔径问题在弱纹理处失效；**不是位移估计器**，是"局部是否保持一致运动"的检查器 | 中 | 金字塔 + 点集 | ⏳ | **最好**（本就是为动态场景设计） | 中高 | **只用于动态内容定位**（§18.4），不产生 `d` |
 | **边缘/梯度域匹配** | 对亮度/对比度变化不敏感；但梯度幅值图**丢失符号**，对"同向平移的相似边缘结构"更易给等高解 | 与灰度同阶（多一次 Sobel） | +1 张梯度图 | ⏳ | 中 | 低（~40 行） | **作为 ZNCC 的并列证据**（§16.3 的残差增益候选），不单独作判据 |
 | **多尺度金字塔 coarse-to-fine** | 粗层误配会传到细层；且**粗层做的正是"低通"，会抹掉判别性细节** | ×层数 | ×层数 | ⏳ | 中 | 中 | **仅在 `|d|` 可能较大时启用**（手动滚动、首步），自动模式不需要（搜索窗已窄） |
-| **行指纹/哈希精确匹配** | 只能判"完全相等"，对 1 px 位移无效 | `O(H_match)` | 摘要向量 `O(H) u64` | 最低 | 无意义（只做重复检测） | 很低（~20 行） | **用于 `d == 0` 快判与滚动稳定性检测**（§11.3、§16.2） |
+| **行指纹/哈希精确匹配** | 只能判"完全相等"，对 1 px 位移无效；**且逐像素行和会带上文本行高的强载波**——非整数倍行高的平移仍给出 `corr≈0.6–0.8` 的伪峰（**实测，§24.6.1 结论 3**） | `O(H_match)` | 摘要向量 `O(H) u64` | 最低 | 无意义（只做重复检测） | 很低（~20 行） | **只用于 `d == 0` 快判、滚动稳定性检测与"产生候选"**（§11.3、§16.2；**永不作为位移判据**——载波伪峰已被实测证明） |
 
 ### 15.4 逐项决策（① 原理 ② 适用条件 ③ 失败模式 ④ SnapClip 约束 ⑤/⑥ 取舍 ⑦ 验证）
 
@@ -2827,7 +2827,41 @@ fn choose(target: &ScrollTarget, probe: &ProbeResult) -> InjectPath {
 2. **`PostMessageW` 必须做子窗口下沉**：先 `ScreenToClient(hwnd, &pt)`，再 `ChildWindowFromPointEx` 逐层下沉到最深的子窗口，最后向**子窗口**发 `WM_MOUSEWHEEL`。依据：F-14（参考实现 `scrollinput.cpp:52-54` 就是这样做，浏览器里落点正是 Chromium 的 render widget host 子窗口）；**Crisp 得出"浏览器会忽略"的相反结论，原因是它没做子窗口下沉**（§6）。
 3. **两种路径的 `Outcome` 都用同一套 5 类状态**（F-14/§6 的 `InputRejection`）：`Posted`（**不代表目标处理了**）/ `InvalidRequest` / `TargetNotFound` / `CoordinateFailure` / `PostFailed` / `Unsupported`。**`Posted` 必须被显式标注为"未证明被处理"**——这是 §24.7 的自检机制的前提。
 
-**未验证项（必须实测，不得假设）**：`PostMessage(WM_MOUSEWHEEL)` 在 Chrome / Edge / Electron / WinUI3 上是否真的生效。这是 §6.4 末尾"未找到官方依据"六项中的第 1 项，也是 **`E-INJECT-1`（§35 的 P0 前置项）**：四个目标 × 两条传输，共 8 组，每组要求"内容确实位移 ≥ 40 px"。
+#### 24.6.1 `E-INJECT-1` 最小版实测（2026-10-08，本机 · 决定性的一组已跑完）
+
+**原本的未验证项**：`PostMessage(WM_MOUSEWHEEL)` 在 Chrome / Edge / Electron / WinUI3 上是否真的生效。这是 §6.4 末尾"未找到官方依据"六项中的第 1 项，也是 `E-INJECT-1`（§35 的 P0 前置项）。**其中"Chrome + `PostMessageW`"是唯一可能推翻本节结论的一组，已在本机跑完。**
+
+**测量装置**（`crates/snapclip-capture/src/windows/scroll_probe.rs`，`#[cfg(test)]`，永不成为出货路径）：BitBlt 抓目标客户区（裁掉右侧 24 px 滚动条）→ 每行加权和成行签名 → 对 `before[τ..]` 与 `after[0..h-τ]` 做 ZNCC 取峰。**注入一 notch、等稳定、再抓、再估计，逐 notch 累加**（不是一次连发）。夹具三件：一张 20,000 px 高的随机高度横条页（`<div style="height:4..40px">`，颜色由 `XorShift32` 决定）、一个自注册窗口类 `SnapclipScrollProbeFixture`（窗口过程对 `WM_MOUSEWHEEL` **计数**并按 delta 滚动、每 3 px 画随机黑白条）、一个 `EDIT` 控件（对照）。
+
+**结果（Chrome 154.0.8037.98、单屏 2560×1440、scale 1、Session 1）**：
+
+| 目标 | 传输 | 发出 | 实测位移 | 峰值相关 | verdict |
+|---|---|---|---|---|---|
+| 自建窗口 | `SendInput` | 8 notch | **120 px** | 1.000 | 到达计数 **8/8** |
+| 自建窗口 | `PostMessageW` | 8 notch | **120 px** | 1.000 | 到达计数 **8/8** |
+| Chromium | `SendInput` | 8 notch | **800 px** | 0.930 | SCROLLED |
+| **Chromium** | **`PostMessageW`** | 8 notch | **800 px** | 0.936 | **SCROLLED** |
+| Chromium | `PostMessageW`（`lParam` 用**屏幕**坐标） | 8 notch | **800 px** | 0.935 | SCROLLED |
+| Chromium | `SendInput`（`VK_DOWN` 键，对照） | 16 次 | **320 px** | 0.939 | SCROLLED |
+| `EDIT` 控件 | `SendInput` / `PostMessageW` | 8 notch | 0 px | 1.000 | 帧逐字节相同 |
+
+**四条结论**：
+
+1. **本节成立，且"两条并列路径"是能力事实而不是设计偏好**：`PostMessageW(WM_MOUSEWHEEL)` 把 Chromium 滚了 **800 px / 8 notch（100 px/notch）**，与 `SendInput` **完全一致**；两者的接收端到达计数都是 8/8。**Crisp 的"Chromium 会忽略投递的滚轮"在本机不成立**，F-14 的链路（`ScreenToClient` + `ChildWindowFromPointEx` 逐层下沉到 `Chrome_RenderWidgetHostHWND`）实测有效——`deepest_child_at` 确实下沉到了 `class=Chrome_RenderWidgetHostHWND`。**注意这仍然不是官方依据**：它是在一台机器、一个 Chromium 版本上的实验，Edge/Electron/WebView2/WinUI3 与 UIPI 目标仍开放（§24.6.2）。
+2. **`lParam` 的坐标空间：两个空间在本例中都生效，但不能推出可互换。** 客户端坐标 (660,486) 被当作屏幕坐标后 `ScreenToClient` 仍落在 1184×892 的客户区内，所以两条都得到 800 px。**窗口较小时客户端坐标会落到窗外而被丢弃** → 实现必须用 MSDN 记录的**屏幕坐标**（`MAKELPARAM` 的低/高字为屏幕坐标），并**不要**用 `LOWORD`/`HIWORD`（官方在多显示器下会给出错误结果，§6.4 A1）。**新测试用例要求**：把目标窗口缩到 400×300 后重跑同一条 arm，客户端坐标版本必须失效——这是"坐标空间确实按文档实现"的判别性用例（`E-INJECT-1` 追加组）。
+3. **"一次连发 N notch"是不可用的测量方式，而且这条教训对产品同样成立。** 第一次运行时对同一夹具连发 8 notch 得到 `2 px`；`EDIT` 得到 `0 px` 且 `corr=1.000`。改成分步测量 + 把夹具从文本页换成横条页后立刻得到 800/120 px。**两个原因都是真实的**：(a) 连发 8 notch 的位移超过一个视口，任何行/区域估计器都看不到；(b) **文本行渲染的逐像素行信号带行高（19 px）的强载波**——非整数倍行高的平移仍会给出 `corr≈0.6–0.8` 的伪峰。这**实测支撑了 §15.4 把 1D 行指纹限制为"只产生候选、永不作为判据"**，也**实测支撑了 §6.3/§15.5 的"必须逐步估计"**：产品每一 notch 都要有一次独立判定，不能把多 notch 合并成一次估计。
+4. **`EDIT`/`notepad.exe` 不能用作滚动夹具。** 该控件类既不响应注入滚轮、也不响应 `WM_VSCROLL`（自检 0 px）。**用"记事本"当夹具会得到"注入无效"的假结论**——这正是 §35 P0.6 原表里"记事本"那一格的真实含义：它测的是控件类，不是注入。自建窗口才有独立可信的到达计数。
+
+**顺带排除的混杂因素**：首次运行时 PixPin（PID 14928）正在运行且装有 `SetWindowsHookEx` 低层鼠标钩子（§6 记它有过"Synthetic Ctrl+C event detected and filtered"的先例）——当时怀疑它吞掉了带 `LLMHF_INJECTED` 的注入滚轮。**实测排除**：自建窗口的 `SendInput` 到达计数 8/8、Chrome 也照常滚动。
+
+#### 24.6.2 `E-INJECT-1` 仍然开放的部分（不得据本机一次实验推断）
+
+| 仍未验证 | 为什么不能被本机结果覆盖 | 归属 |
+|---|---|---|
+| Edge / Electron / WebView2 / WinUI3 | 本机只跑了 Chrome；同为 Chromium 派生不等于同一条消息路径（WebView2 有宿主窗口层、Electron 有自己的消息钩子） | `E-INJECT-1` 剩余 6 组 |
+| UIPI：以管理员身份运行的目标窗口 | 本机没有提权目标；§24.5 的判断（`PostMessageW` 是提权目标上唯一可行路径）**仍只有官方文档旁证** | `OQ-3` |
+| `SPI_GETMOUSEWHEELROUTING == MOUSE_POS(2)` 时非前台窗口能否收到 `SendInput` 滚轮 | 本机是默认值；**这是用户可改的系统设置**，不能作为设计前提 | `OQ-5` |
+| `PostMessageW` 在**小窗口**下用客户端坐标必须失败 | 本例两者都成功只是几何巧合（结论 2） | `E-INJECT-1` 追加组 |
 
 ### 24.7 遮挡、前后台与"注入是否真的生效"
 
@@ -2859,6 +2893,7 @@ fn choose(target: &ScrollTarget, probe: &ProbeResult) -> InjectPath {
 | 拓扑变化三档 | 用 `ChangeDisplaySettingsEx` 或 mock 触发 | 三档行为与 §24.4 表一致；`Partial` 可用 |
 | 注入条件选择 | 目标前台/非前台 × 提权/非提权 4 组 | 选择结果与 §24.6 一致 |
 | UIPI | 对一个提权窗口（如管理员启动的记事本） | `PostMessageW` 生效；`SendInput` 被识别为不可用而**不被选用** |
+| 注入真的能驱动 Chromium | **已实测（`E-INJECT-1` 最小版，§24.6.1）**：`SendInput` 与 `PostMessageW` 各把 Chrome 滚了 800 px / 8 notch | 两传输都 ≥ 40 px；**仍待** Edge/Electron/WebView2/WinUI3 与小窗口坐标空间用例（§24.6.2） |
 
 ## 25. 浏览器兼容性
 
@@ -2876,8 +2911,8 @@ fn choose(target: &ScrollTarget, probe: &ProbeResult) -> InjectPath {
 
 | 机制 | 现象 | 对策 | 依据 |
 |---|---|---|---|
-| **Chromium 的子窗口结构** | 页面的渲染表面在 `Chrome_RenderWidgetHostHWND` 子窗口上；向顶层窗口发滚轮可能无效 | `PostMessageW` 前 `ChildWindowFromPointEx` **逐层下沉** | F-14 |
-| **Chromium 的输入过滤** | 它可能**忽略未携带有效鼠标状态**的 `WM_MOUSEWHEEL` | 若下沉后仍无效 → §24.7 的路径切换；`E-INJECT-1` 必须实测 | §6 §7.2 第 2 项 |
+| **Chromium 的子窗口结构** | 页面的渲染表面在 `Chrome_RenderWidgetHostHWND` 子窗口上；向顶层窗口发滚轮可能无效 | `PostMessageW` 前 `ChildWindowFromPointEx` **逐层下沉** | F-14；**本机已实测下沉到 `Chrome_RenderWidgetHostHWND` 且滚轮生效（§24.6.1）** |
+| **Chromium 的输入过滤** | 它可能**忽略未携带有效鼠标状态**的 `WM_MOUSEWHEEL` | 若下沉后仍无效 → §24.7 的路径切换；`E-INJECT-1` 必须实测 | §6 §7.2 第 2 项；**本机实测：未忽略（`PostMessageW` 800 px）** |
 | **平滑滚动 / 惯性滚动** | 一次滚轮注入后内容**持续移动若干帧**（Chromium 有自己的动画） | §11.3 的"等待稳定"（行指纹）**必须等待到静止**，不能假设"注入完成即位移完成" | 推导；也是 §16.3 残差判据成立的前提 |
 | **CSS scroll anchoring** | 页面自己会因为内容加载而调整滚动位置（不改变用户意图） | 表现为 `scene_cut` 或小位移 → 被 §16.8 的 `streak` 吸收 | §16.8 |
 | **懒加载 / 无限滚动** | 新内容在视口下方填充；占位符变成图片 | `dynamic` tile 降权（§18.3）；"内容持续增长"与"用户一直滚"不可区分 → 正常处理，由上限层收口 | §18.3 |
@@ -2888,7 +2923,7 @@ fn choose(target: &ScrollTarget, probe: &ProbeResult) -> InjectPath {
 
 | 目标 | 窗口结构 | 注入可行性 | 特殊约束 |
 |---|---|---|---|
-| **Chrome / Edge（原生）** | 顶层窗口 + `Chrome_RenderWidgetHostHWND` 子窗口 + 可选的 GPU 进程合成窗口 | `E-INJECT-1` 必须实测（两条路径） | 若用户开启"使用硬件加速"（默认开），捕获走 DWM 重定向表面 → 无特殊影响 |
+| **Chrome / Edge（原生）** | 顶层窗口 + `Chrome_RenderWidgetHostHWND` 子窗口 + 可选的 GPU 进程合成窗口 | `E-INJECT-1` 必须实测（两条路径）→ **Chrome 已实测通过（§24.6.1）；Edge 仍待** | 若用户开启"使用硬件加速"（默认开），捕获走 DWM 重定向表面 → 无特殊影响 |
 | **Electron**（VS Code、Slack、Discord 等） | 顶层窗口 + Chromium 内部窗口层级 | 同 Chromium | 部分 Electron 应用自己处理滚轮并做"平滑滚动"，稳定等待更重要 |
 | **WebView2**（WinUI3 / WPF 内嵌） | 宿主窗口 + 子 HWND | 同 Chromium；**但宿主可能拦截滚轮做别的** | 宿主窗口尺寸变化更频繁（响应式布局）→ §24.4 的尺寸变化处理 |
 | **自绘窗口**（浏览器外的普通 Win32/WPF/Qt 应用） | 裸顶层窗口 | `SendInput` 通常有效；`PostMessageW` 视实现而定 | 不假设任何结构；**一律按 §24.6 的条件选择 + §24.7 的自检** |
@@ -2908,7 +2943,7 @@ fn choose(target: &ScrollTarget, probe: &ProbeResult) -> InjectPath {
 
 | 目标 | 方法 | 判据 |
 |---|---|---|
-| 四类目标都能滚动 | `E-INJECT-1`（§24.6） | 每类至少一条路径生效，位移 ≥ 40 px |
+| 四类目标都能滚动 | `E-INJECT-1`（§24.6） | 每类至少一条路径生效，位移 ≥ 40 px（**Chrome 已实测：两传输各 800 px；其余三类待跑**） |
 | 长页滚动 | Chrome 打开一个 30,000 px 以上的合成页面（本地 HTML），自动模式跑完 | 产物与真值（DOM 高度 × DPR）逐行相等 |
 | 动态内容 | 同一页面含一个 CSS 动画元素与一个 `<video>` | 动画区域被降权；`Confirmed` 比例 ≥ 95% |
 | `fixed` 头部 | 页面含 `position: fixed` 头部 | 头部在画布上只出现一次 |
@@ -3563,7 +3598,7 @@ if ($hits) { Write-Error "scroll/ must stay platform-free: $($hits -join '; ')";
 - **Alternatives**：① 只用 `SendInput`（提权目标不可用）；② 只用 `PostMessageW`（自绘窗口可能不处理）；③ 主/备降级关系。
 - **Reasoning**：③ 是错的，因为 `SendInput` 会**打到前台窗口**——目标不是前台时用它会污染别的窗口，这是**正确性**问题，必须事前判定（§24.6）。
 - **Trade-offs**：两条路径都要维护与实测（`E-INJECT-1`）。
-- **Validation**：`E-INJECT-1`（4 目标 × 2 传输）+ §30.2。
+- **Validation**：`E-INJECT-1`（4 目标 × 2 传输）+ §30.2。**已跑最小版（§24.6.1）：Chrome 上两条传输都生效（各 800 px/8 notch），决策不变**。
 - **推导自**：F-13（UIPI 的方向性）+ F-14（子窗口下沉）+ "`Posted` 不证明被处理"（§6）。
 
 ---
@@ -3620,7 +3655,7 @@ if ($hits) { Write-Error "scroll/ must stay platform-free: $($hits -join '; ')";
 | R-10 | 竞品与其它开源实现的滚动截图现状？ | PixPin 3.5.5.1（静态 + 运行期 + 官方文档）、Snow Shot、ShareX、Snagit、AOSP ScrollCapture、wayscrollshot | **F-16**：PixPin 长截图是**免费核心卖点**、实测 502,649 px、单块 `Format_RGB32`、自动裁剪是 VIP；Snow Shot 69,120 硬失败；ShareX 不支持双向；Snagit 明确不支持回滚；**AOSP 根本不估位移**（`requestNextTile(topPx)` 精确请求、`MAX_HEIGHT = 12000`）；wayscrollshot 用模板匹配 + "底部 20%" | ① **上限三层且无硬失败**（ADR-13）；② **双向是差异化机会**（R14）；③ AOSP 的"上游给精确偏移"映射到 UIA `ScrollPattern` 但**绝不作依赖**（N2）；④ 不照抄"忽略上下 15%"，改为按**梯度能量**选条带（§15） |
 | R-11 | 内容不连续能不能通过限速消除？ | 中国专利 CN110297681A | **F-17**：原文承认"若滚动速度过快…目标截屏图像不准确/内容缺失" | **N11**：不追求 100% 最优步长；限速只降低概率（ADR-2、§24.7 的自检） |
 | R-12 | `PostMessage` 与 `SendInput` 在 UIPI 下的差异？ | Microsoft Learn（winapp-cli UI Automation 文档） | **F-13**：`post-message` "is HWND-targeted and **bypasses UIPI**"；`send-input` "goes to whatever window is foreground and **is blocked by UIPI**" | **ADR-14**：两条**并列**路径 + 条件选择；UIPI 目标上 `PostMessageW` 是**唯一**可行路径 |
-| R-13 | 浏览器为什么不接受顶层窗口的滚轮消息？ | 参考项目 `scrollinput.cpp:52-54` vs Crisp `ScrollCapture.h:13-16` | **F-14**：参考实现先 `ScreenToClient` 再 `ChildWindowFromPointEx` **逐层下沉**；Crisp 的相反结论是因为**没下沉**（Chromium 的 render widget host 是子窗口） | **§24.6 约束 2**：必须子窗口下沉；`E-INJECT-1` 必须实测 |
+| R-13 | 浏览器为什么不接受顶层窗口的滚轮消息？ | 参考项目 `scrollinput.cpp:52-54` vs Crisp `ScrollCapture.h:13-16` | **F-14**：参考实现先 `ScreenToClient` 再 `ChildWindowFromPointEx` **逐层下沉**；Crisp 的相反结论是因为**没下沉**（Chromium 的 render widget host 是子窗口） | **§24.6 约束 2**：必须子窗口下沉；**本机实测确认**（下沉到 `Chrome_RenderWidgetHostHWND`，`PostMessageW` 驱动 800 px，§24.6.1） |
 | R-14 | 参考实现的失败容忍度是怎么做的？ | `snow-stitch-images/stitcher.rs` | **`NoMovement` 时** `previous_raw = incoming; previous_raw_index = index`（测试 `non_skip_advances_previous_raw_even_without_motion`）；**没有任何单帧失败终止会话的机制** | **C2**：删除 V1 §7.2 的"搜索无结果即停止"；§16.10 的参照帧推进规则 |
 | R-15 | 参考实现的参照系与 `Contained` 是怎样的？ | `stitcher.rs:289-306/438/469/472-474`、`compositor.rs` | 双帧分离（`previous_raw` vs `motion_reference`）+ 参照系二态；**`Synthetic` 有累积漂移**，唯一复位机制是 `Contained` | **ADR-4**：单态参照系（取消 `Synthetic`）+ 保留双帧分离（§17.4） |
 | R-16 | 参考实现的 tile 权重与判据门限？ | `region.rs:779-788/797-833`、`estimator.rs:12-20/640/1248-1252` | **乘法式权重**（`learned`/`influence` clamp [0.1,2.0]）；"歧义不学习"（`direct·compensated ≥ 0.5`）；`MIN_INLIER_TILES = 4`、`MIN_RESIDUAL_GAIN = 0.15`、`score`/`confidence` 权重 | **ADR-15** + §16.7/§16.4 的初始值与"可校准"标注 |
@@ -3798,10 +3833,10 @@ if ($hits) { Write-Error "scroll/ must stay platform-free: $($hits -join '; ')";
 | P0.3 | `E-PERF-1`：位移估计四层组合的 P50/P95/Max（合成数据） | §23.3 的 Stitch Latency 目标值 | 三档视口各 1000 步；同时产出"层耗时占比" |
 | P0.4 | `E-PERF-2`：PNG 流式 12 组参数（`Compression::{Fast,Balanced,High} × Filter::{NoFilter,Sub,Up,Adaptive}`） | 选定默认参数 | 每组的编码耗时 + 体积 + **能否被 `MAX_DECODE_PIXELS=24MP` 之外的路径读回** |
 | P0.5 | `E-CAP-1`（最小版）：窗口级 WGC 对记事本/Chrome/Edge/Electron/WebView2 各取 10 帧 | 五类目标是否都可用、pool 是否可复用 | 五类全部成功或明确记录哪类不可用 |
-| P0.6 | `E-INJECT-1`（最小版）：`{SendInput, PostMessageW}` × `{记事本, Chrome}` | 4 组是否都产生位移 | 每组位移 ≥40 px；**Chrome + PostMessageW 是决定性的那一组**（F-14 从未被独立验证） |
+| P0.6 | `E-INJECT-1`（最小版）：`{SendInput, PostMessageW}` × `{记事本, Chrome}` | 4 组是否都产生位移 | ✅ **已完成（2026-10-08，§24.6.1）** —— 结论：Chrome + 两条传输各 800 px/8 notch；`{SendInput, PostMessageW}` × `{Chrome}` 两组通过；**"记事本"那一格被替换为自建窗口**（`EDIT` 控件类对注入滚轮与 `WM_VSCROLL` **都不响应**，用它做夹具会得到"注入无效"的假结论）。装置 = `crates/snapclip-capture/src/windows/scroll_probe.rs`（`#[cfg(test)]`，`cargo test -p snapclip-capture --lib inject_probe -- --ignored --nocapture`）。**剩余**：Edge/Electron/WebView2/WinUI3、UIPI 提权目标、小窗口坐标空间用例（§24.6.2） |
 | P0.7 | `SPI_GETMOUSEWHEELROUTING` / `SPI_GETWHEELSCROLLLINES` 读取 | 本机实际值 | 完成 §11.4 探测表的实现 |
 
-**执行顺序（§36.1 D-4 裁决：`P0.6` 优先）**：**`P0.6` → `P0.5` → `P0.7` → `P0.1`/`P0.2` → `P0.3`/`P0.4`**。理由：`P0.6` 是这批实验里**唯一可能推翻现有方案**的一个——若 `Chrome + PostMessageW` 失败，§24.6 的"两条并列路径"与 §13 的"不抢前台"目标都要重评，而重评会改变 `P3.1`/`P3.2` 的接口形状；把它排在最后意味着可能白写一批注入代码。`P0.1`/`P0.2` 随时可插入（它们不产出设计输入，只产出"起点是否可信"）。
+**执行顺序（§36.1 D-4 裁决：`P0.6` 优先）**：**`P0.6` ✅ 已跑完（2026-10-08） → `P0.5` → `P0.7` → `P0.1`/`P0.2` → `P0.3`/`P0.4`**。理由：`P0.6` 是这批实验里**唯一可能推翻现有方案**的一个——若 `Chrome + PostMessageW` 失败，§24.6 的"两条并列路径"与 §13 的"不抢前台"目标都要重评，而重评会改变 `P3.1`/`P3.2` 的接口形状；把它排在最后意味着可能白写一批注入代码。**实测结果是"两条路径都成立"，所以 §24.6 与 `P3.1`/`P3.2` 的接口形状不变**（§24.6.1）。`P0.1`/`P0.2` 随时可插入（它们不产出设计输入，只产出"起点是否可信"）。
 
 ### P1 纯逻辑核心（**可完全在 CI 无桌面运行**）
 
@@ -3885,7 +3920,7 @@ if ($hits) { Write-Error "scroll/ must stay platform-free: $($hits -join '; ')";
 
 | # | 问题 | 为什么现在不能定 | 如何定 | 阻塞什么 |
 |---|---|---|---|---|
-| **OQ-1** | `PostMessageW(WM_MOUSEWHEEL)` 到底能不能驱动 Chromium 的滚动？ | **F-14 只有源码链路旁证，没有任何官方依据**（Chromium 是否忽略跨进程投递的滚轮消息，既未证实也未证伪）；且 Chromium 的 `GetMessageTime()` 逻辑可能把连续同时间戳的滚轮误判为横向滚动 | `E-INJECT-1` 的第 3、4 组（Chrome/Edge + `PostMessageW`），且必须**连续 10 次**都产生位移（单次成功可能是巧合） | P3.1；若失败则 `SendInput` + 强制前台成为唯一路径 → 需要重评 §24.6 与 §13 的"不抢前台"目标 |
+| **OQ-1** | `PostMessageW(WM_MOUSEWHEEL)` 到底能不能驱动 Chromium 的滚动？ | **F-14 只有源码链路旁证，没有任何官方依据**（Chromium 是否忽略跨进程投递的滚轮消息，既未证实也未证伪）；且 Chromium 的 `GetMessageTime()` 逻辑可能把连续同时间戳的滚轮误判为横向滚动 | ✅ **本机已答：能**——`E-INJECT-1` 最小版实测 `SendInput` 800 px、`PostMessageW` 800 px（各 8 notch，逐 notch 累加，§24.6.1）。**残留**：Edge/Electron/WebView2/WinUI3、小窗口坐标空间、`GetMessageTime` 同时间戳风险（本探针每次注入之间 `pump_for`，未专门构造同时间戳序列） | **不变**：`§24.6` 两条并列路径与 §13 的"不抢前台"目标都保留（原判据是"若失败则重评"，实测未失败） |
 | **OQ-2** | `WDA_EXCLUDEFROMCAPTURE` 对 WGC 窗口捕获/显示器捕获是否生效？ | **MS Learn 全系列页零处提及 WDA**（官方沉默）；且 <Win10 2004 会**静默降级为 `WDA_MONITOR`（黑块）** | `E-CAP-1` 扩一条：显示器级回退路径下开/关 WDA 各取 10 帧，逐像素比较覆盖层区域 | §24.5 的措辞与 §5.1 的"降级层"；**不影响窗口级主路径**（主路径不需要 WDA） |
 | **OQ-3** | `SendInput` 在 UIPI 场景下的方向性 | 官方两页**互相矛盾**（`SendInput` 页称可注入"同等或更低完整性"，winapp-cli 页称提权→AppContainer 会被挡） | `E-INJECT-1` 扩：以管理员身份运行的记事本为目标，比较两条路径 | §24.5 的矩阵首行；**若 `PostMessage` 也不通，则 UIPI 目标在 v1 只能"提示用户以管理员运行 SnapClip"**（与 PixPin 一致——它也**没有**第二条捕获通道） |
 | **OQ-4** | 125%/150%/175% 缩放下"整数物理像素位移"是否成立？ | **F-23**：Chromium 布局是 1/64 px 定点、滚动偏移只在暴露给 Web 时吸附物理像素 → 位移**可能是物理非整数**（如 1.25 px） | 需要 125%/150% 的真实显示器（**本机 `PixelRatio: 1`，取不到**） | §16.1 门一与 N3；若位移确实非整数，则"整宽行带 + 整数位移"模型会出现**周期性丢行** → 需要重新评估（可能引入"累计小数余量"） |

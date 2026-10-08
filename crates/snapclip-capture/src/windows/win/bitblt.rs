@@ -14,6 +14,7 @@ use ::windows::Win32::Graphics::Gdi::{
 };
 
 use super::super::monitor::CapturedMonitor;
+use crate::geometry::{Point, Rect};
 
 /// Desktop pixels captured through GDI.
 pub struct CapturedBitmap {
@@ -28,8 +29,23 @@ pub struct CapturedBitmap {
 
 /// Copy the monitor rectangle out of the desktop DC.
 pub fn capture_monitor(layout: &CapturedMonitor) -> Result<CapturedBitmap, String> {
-    if layout.width() == 0 || layout.height() == 0 {
-        return Err("monitor has zero size".into());
+    let origin = layout.origin();
+    capture_rect(Rect::new(
+        origin.x,
+        origin.y,
+        origin.x + layout.width() as i32,
+        origin.y + layout.height() as i32,
+    ))
+}
+
+/// Copy an arbitrary desktop rectangle out of the desktop DC.
+///
+/// The rectangle is in physical desktop pixels, so the caller is responsible
+/// for per-monitor DPI awareness (`monitor::set_per_monitor_v2_awareness`).
+/// A zero-sized rectangle is rejected rather than captured as an empty image.
+pub fn capture_rect(rect: Rect) -> Result<CapturedBitmap, String> {
+    if rect.width() == 0 || rect.height() == 0 {
+        return Err("capture rectangle has zero size".into());
     }
 
     unsafe {
@@ -37,13 +53,23 @@ pub fn capture_monitor(layout: &CapturedMonitor) -> Result<CapturedBitmap, Strin
         if screen_dc.is_invalid() {
             return Err(super::win32_error("GetDC"));
         }
-        let result = capture_with_dc(screen_dc, layout);
+        let result = capture_with_dc(
+            screen_dc,
+            Point::new(rect.left, rect.top),
+            rect.width() as u32,
+            rect.height() as u32,
+        );
         ::windows::Win32::Graphics::Gdi::ReleaseDC(None, screen_dc);
         result
     }
 }
 
-unsafe fn capture_with_dc(screen_dc: HDC, layout: &CapturedMonitor) -> Result<CapturedBitmap, String> {
+unsafe fn capture_with_dc(
+    screen_dc: HDC,
+    origin: Point,
+    width: u32,
+    height: u32,
+) -> Result<CapturedBitmap, String> {
     let bits_per_pixel = unsafe { GetDeviceCaps(Some(screen_dc), BITSPIXEL) };
     let planes = unsafe { GetDeviceCaps(Some(screen_dc), PLANES) };
 
@@ -55,13 +81,13 @@ unsafe fn capture_with_dc(screen_dc: HDC, layout: &CapturedMonitor) -> Result<Ca
     let mut info: BITMAPINFO = unsafe { std::mem::zeroed() };
     info.bmiHeader = BITMAPINFOHEADER {
         biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-        biWidth: layout.width() as i32,
+        biWidth: width as i32,
         // Negative height requests a top-down DIB, matching every other provider.
-        biHeight: -(layout.height() as i32),
+        biHeight: -(height as i32),
         biPlanes: 1,
         biBitCount: 32,
         biCompression: BI_RGB.0,
-        biSizeImage: layout.width() * layout.height() * 4,
+        biSizeImage: width * height * 4,
         biXPelsPerMeter: 0,
         biYPelsPerMeter: 0,
         biClrUsed: 0,
@@ -86,19 +112,18 @@ unsafe fn capture_with_dc(screen_dc: HDC, layout: &CapturedMonitor) -> Result<Ca
             memory_dc,
             0,
             0,
-            layout.width() as i32,
-            layout.height() as i32,
+            width as i32,
+            height as i32,
             Some(screen_dc),
-            layout.origin().x,
-            layout.origin().y,
+            origin.x,
+            origin.y,
             // CAPTUREBLT includes layered windows such as the mouse cursor
             // overlay; the cursor itself is excluded because the overlay draws it.
             SRCCOPY | CAPTUREBLT,
         )
     };
     let pixels = unsafe {
-        std::slice::from_raw_parts(bits as *const u8, (layout.width() * layout.height() * 4) as usize)
-            .to_vec()
+        std::slice::from_raw_parts(bits as *const u8, (width * height * 4) as usize).to_vec()
     };
 
     unsafe {
@@ -112,8 +137,8 @@ unsafe fn capture_with_dc(screen_dc: HDC, layout: &CapturedMonitor) -> Result<Ca
     copied.map_err(|error| super::hresult("BitBlt", &error))?;
 
     Ok(CapturedBitmap {
-        width: layout.width(),
-        height: layout.height(),
+        width,
+        height,
         pixels,
         bits_per_pixel: if planes > 0 { bits_per_pixel * planes } else { bits_per_pixel },
     })
