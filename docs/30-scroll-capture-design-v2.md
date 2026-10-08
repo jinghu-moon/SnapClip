@@ -1364,6 +1364,39 @@ ScrollLoop                       CaptureWorker（既有线程，持有 GPU 设�
 
 这篇比较的成本是 O(像素) 但常数极小（行内 XOR-fold），且**不需要额外的 GPU 操作**。
 
+#### 11.3.1 落地的形状（`P2.02`，2026-10-09）
+
+`windows/providers.rs` 新增 `ScrollFrame` —— 滚动路径的帧类型，替代"一次取一张图"的 `FrozenFrame`：
+
+```rust
+pub struct ScrollFrame {
+    delivered: Option<wgc::WgcFrame>,   // 生命周期锚点：池拥有纹理指向的缓冲
+    transfer: Box<dyn RegionTransfer>,  // 生产 = GpuTransfer；测试 = 记录器
+    reads: u32,                         // 每帧至多 1
+    read_bytes: u64,                    // 真正过总线的字节
+}
+
+impl ScrollFrame {
+    pub fn from_wgc(device: Arc<GraphicsDevice>, frame: wgc::WgcFrame) -> Self;
+    pub fn size(&self) -> (u32, u32);
+    pub fn provider(&self) -> ProviderKind;      // 恒为 WgcWindow
+    pub fn reads(&self) -> u32;
+    pub fn read_bytes(&self) -> u64;
+    pub fn read_region(&mut self, region: Rect) -> CaptureResult<Vec<u8>>;
+}
+```
+
+四处落地裁决：
+
+1. **"每步一次回读"由类型承载，不由注释承载**。`ScrollFrame` **没有**整帧回读方法：滚动路径能拿到的唯一入口是 `read_region`，所以"一次全额回读"在滚动路径上**不可达**（REFACTOR 的要求）。第二次 `read_region` 返回 `CaptureError::InvalidState`，并且**在触到设备之前**返回——测试断言的是"设备调用计数仍是 1"，而不是"第二次也返回了同样的字节"。
+2. **选择报错而不是缓存**。规格允许"错误或缓存命中"，这里选错误：缓存会把"同一帧被走了两步"藏起来，而它正是 §16.10 的 `Skip` 路径要处理的情形（逐行完全相等 ⇒ `d = 0`，仍然要读那一帧）。G12 的读法是"失败必须可见"，所以冗余必须响而不是被吸收。缓存还会带来一份与帧同大的常驻缓冲，与 §22 的预算纪律冲突。
+3. **裁剪与拒绝在传输之前**。区域先与帧求交：越界被裁到帧（请求给设备的就是裁剪后的矩形），全越界或空区域直接拒绝。所以"零字节缓冲区"永远不会以帧的身份到达估计器。
+4. **字节计数记实际值，次数计数记尝试值**。`reads` 在调用前自增（一次短读也发生过，不允许在同一帧上重试），`read_bytes` 累加真正返回的字节数；短读返回 `CaptureFailed` 而不是截断的缓冲。
+
+**传输本身是一个接缝**（`trait RegionTransfer`）：`GpuTransfer` 是生产实现（`read_back_region_bgra` = `CopySubresourceRegion` 到区域大小的暂存纹理），测试替换成记录器。这样"请求的是哪个矩形""一帧读几次""记了多少字节"三件事都能在没有 GPU 的情况下断言，而生产与测试走的是**同一个** `read_region`。
+
+`ProviderKind` 增 `WgcWindow`（`name()` = `"wgc-window"`）：它是滚动路径自己的后端名，**不是**显示器路径的备选。`capture_with(WgcWindow)` 返回 `ProviderUnavailable`，`attempt_order(Some(WgcWindow))` 返回**单元素**列表——一个接线错误必须响亮地失败，而不是悄悄走 BitBlt 回退、交出一张不是目标窗口的帧。
+
 ### 11.4 捕获能力探测（§12.2 的一部分，但属于捕获管线）
 
 会话开始时探测并记录（一次，结果进诊断）：
@@ -3788,6 +3821,8 @@ impl Scratch {
 
 **与 §24.2.1 的差异有解释，不是矛盾**：`Idle` 槽数变了（Chrome 5 → 4、Edge 1 → 0、记事本 0 → 3）。这次走的是**事件驱动**的等待（`FrameArrived` 注册成功），上一次是 5 ms 轮询——帧到达的时机相同，"这一次调用有没有拿到帧"因此不同。**`Recreate` 仍是 0（六臂共 60 个槽）**，这是 §24.2"跨帧复用"行的直接证据；`P2.01` 另有 100 次 `observe` 的机械用例把这条钉成回归。
 
+**帧的读取侧**（`P2.02`）见 §11.3.1：`ScrollFrame` 是滚动路径的帧类型（`ProviderKind::WgcWindow`），一帧只允许一次区域回读，且没有整帧回读入口。
+
 ### 24.3 捕获会话选项必须**探测**且**失败可见**
 
 **F-15 与 §5 的对照给出的三处修正**：
@@ -4508,6 +4543,8 @@ fn rows_match(actual, expected, sigma) -> bool
 | 目标显示器 DPI 变化 | 改缩放 | 停止 + `Partial` | L3 | — |
 | 设备丢失 | mock `DeviceLost` | 停止 + `Partial` | L2 | — |
 | 每步仅一次回读 | 100 步 + 回读计数 | 计数 == 100（§11.3） | L2 | — |
+| 同一帧读第二次 | 对一帧调两次 `read_region` | 第二次在**触到设备之前**被拒（§11.3.1） | L1 | — |
+| 区域落在帧内 | 视口/越界/全越界三种请求 | 越界被裁到帧、全越界在传输前被拒（§11.3.1） | L1 | — |
 
 ### 30.2 Scroll（滚动/注入）
 
