@@ -94,7 +94,7 @@
 | 新增文件 | 一律先建 `#[cfg(test)]` 测试骨架再建实现（§2.1） |
 | 文档引用 | 一律写 `docs/30 §x.y` 或 `docs/30:<行号>`，**不允许只写"见设计文档"** |
 
-### 0.6 本文对 V2 的补充（**九处 deviation，全部已按用户授权回填 `docs/30`**）
+### 0.6 本文对 V2 的补充（**十处 deviation，全部已按用户授权回填 `docs/30`**）
 
 > **回填状态**：九处均已写入 `docs/30-scroll-capture-design-v2.md`（**未覆盖原文，只做定点增补**）——
 > DEV-1 → `§28.2` 新增 test-only 文件块（`scroll/testkit.rs`）与"10 生产 + 1 test-only"口径、`§33.3` 文件清单由 9 补为 11（**顺带修正了原文漏列 `orb.rs` 的内部矛盾**）；
@@ -105,7 +105,8 @@
 > **DEV-6** → 无 `docs/30` 回填（**装置替换**，只改本文与仓库：`apps/snapclip/tests/png_params_probe.rs` + `tools/p0-04-png-params.ps1` + shell 的 dev-dependency `png = "0.18"`）（2026-10-08 执行时新增，见下）；
 > **DEV-7** → `§17.7.1`（新增整块实测与 `CHOSEN`）、**`F-10` 事实条目**（`§7`，推论按实测改写）、`§29.5` 的"解码上限"行（"必须"降级为"零代价防御"）（2026-10-08 执行时新增，见下）；
 > **DEV-8** → `§15.4` 第 1 层条目（新增"摘要必须能跨步复用"的接口义务）、`§23.3.1`（新增整块实测）、`§23.3` 的 Stitch Latency 与 CPU(Capturing+Matching) 两行（**部分实测**）、`§36.2` 的 `OQ-8`（结论 + `P1.02` 义务）（2026-10-08 执行时新增，见下）；
-> **DEV-9** → 无 `docs/30` 回填（`P1.01` 的两处偏差只改本文 §6 的执行块；`docs/30 §28.2` 的"第 11 个文件"口径已由 `DEV-1` 落地）（2026-10-08 执行时新增，见下）。
+> **DEV-9** → 无 `docs/30` 回填（`P1.01` 的两处偏差只改本文 §6 的执行块；`docs/30 §28.2` 的"第 11 个文件"口径已由 `DEV-1` 落地）（2026-10-08 执行时新增，见下）；
+> **DEV-10** → `§17.8` 的 `Axis` 代码块与紧随的注（**勘误**：`cross` 的分支写成 `Horizontal => dx`，与 `§13.1` 及其自身的注矛盾；函数名 `primary`/`cross` 统一为 `primary_delta`/`cross_delta`）（2026-10-08 执行时新增，见下）。
 > 下表保留**原始登记内容**（作为"当时看到了什么"的记录）。
 
 | # | 补充 | 为什么必须补 | 回填位置 |
@@ -118,7 +119,8 @@
 | **DEV-6**（执行时新增） | `P0.04` 的"前置"一栏写：P4.01/P4.02 未完成时"先在 `docs/Temp/` 用**一次性脚本**对同一张合成图做等价测量并标明'非端口路径'"；本文 §16 的"唯一可能的例外"一栏写：若既有 `image` 版本不可表达显式参数，则把 `png` 提升为 shell 的**直接依赖** | 2026-10-08 执行时实际做法与两处措辞都不同：① 装置 = **提交进仓库的集成测试** `apps/snapclip/tests/png_params_probe.rs` + 驱动脚本 `tools/p0-04-png-params.ps1`（**每组合一个独立进程**），而不是 `docs/Temp/` 里的一次性脚本——前者可复跑、可被 `P4.02` 复用、且测量过程本身进了版本史；② `png` 只加进 `apps/snapclip/Cargo.toml` 的 **`[dev-dependencies]`**（`png = "0.18"`），**没有**提升为普通依赖 ⇒ `snapclip-capture` 依然看不到 `png`，依赖方向门禁也无需改动（dev-dependency 不进 `-e normal` 图）。若照原文执行，`P0.04` 会产出一份**无法复跑**的测量，且 `P4.02` 会反复重测 | 无 `docs/30` 回填（装置不在设计文档里）；本文 `§6 P0.04` 的"装置净增"、`§16` 的例外栏、`RES-3` 行按实际改写 |
 | **DEV-7**（执行时新增） | V2 **F-10**（`§7`）与 **§29.5** 的"解码上限"行写：任何"导出后解码比对"的测试，**产物 > 64 MiB 时必须显式提高 `png::Limits { bytes }`，否则会假失败** | 2026-10-08 实测**否定**了这个推论：13 组（1280×30000）+ 3 行（3840×30000）的产物**全部**在 `Limits::default()`（64 MiB）下解码成功，其中包括 **101.7 MiB 的产物**与**解码后 460 MB 的图像**。读 `png` 0.18.1 源码可见机制：`Limits::bytes` 由 `reserve_bytes()` **逐次递减**，约束的是解码器**内部**分配（行缓冲、zlib/fdeflate 工作区），**与产物大小、解码后图像大小都无关**（解出的帧写进调用方缓冲区；`read_info()` 的 `LimitsExceeded` 来自 `checked_raw_row_length()`/`output_buffer_size()` 的**溢出**检查）。若照原文执行，`P4.02`/`P4.05`/`P1.21` 会把"提高上限"当成解码成功的**必要条件**去写断言，而真正会失败的情形（行长度算术溢出）反而没人测 | `docs/30 §17.7.1`（新增实测整块，含本节表格与 `CHOSEN`）、`§7` 的 **F-10** 条目（保留 64 MiB 事实、改写推论）、`§29.5` 的"解码上限"行（"必须"→"零代价的防御，但不是测试前置条件"）；本文 §13.5 的同类措辞与 `P4.02` 的 GREEN 同步 |
 | **DEV-8**（执行时新增） | `P0.03` 的"实验装置"一栏写：新写 `crates/snapclip-capture/src/scroll/perf_probe.rs`（`#[cfg(test)]`），**用 P1.01 的 testkit 合成序列**；V2 §23.1/§35 的 `E-PERF-1` 同义 | 2026-10-08 执行时三处与原文不同：① **`crates/snapclip-capture/src/scroll/` 此前不存在**，装置落点必须连带创建 `scroll/mod.rs` 并在 `crates/snapclip-capture/src/lib.rs` 加 **`#[cfg(test)] mod scroll;`**（`P1.01` 建正式模块时**必须**把它换成普通 `pub mod scroll;`，否则 `scroll/` 的生产代码不会被编译）；② **`P1.01` 的 testkit 未实现**，合成序列由装置自带（真值来自 36 px 卡片行 / 120 px 步进的脚本，不是 testkit）⇒ `P1.01` 落地后应换回 testkit 并用同一脚本重跑；③ 装置**多测了一种第 1 层形态** `layer1-revealed`（只摘要新露出的行），因为 `layer1-full` 显示**逐行摘要占单步耗时的 99.3%–99.6%**——这个形态不改变算法语义，却把 4K 单步 P50 从 6,778 µs 降到 **383 µs（17.7×）**，于是"第 1 层必须能复用上一帧的行摘要"从可选优化变成了 `P1.02` 的**接口义务**。若照原文执行，`P1.02` 会实现一个"每步重新摘要全帧"的第 1 层，把 4K 的 P50 预算吃掉 84.7% | `docs/30 §15.4` 第 1 层条目（新增义务句）、`§23.3.1`（新增整块实测：装置/6 行表/五条结论/未取得清单/复现字段）、`§23.3` 的 Stitch Latency 与 CPU(Capturing+Matching) 两行（`待测` → **部分实测**，并写明"整会话未取得"）、`§36.2` 的 `OQ-8`（由"未测"改为结论行：**不需要第 4 层**，瓶颈是直读摘要；收口方式 = `P1.02` 的接口义务 + 落地后重跑四组合）；本文 §6 `P0.03` 的**状态行**与"三处偏离"块、OQ 表的 `OQ-8` 行同步 |
-| **DEV-9**（执行时新增） | `P1.01` 的 GREEN 一栏写：对外只暴露 `fn take(&mut self, k: usize) -> Observation`；REFACTOR 一栏写：自证"恢复**每一个**脚本化位移并断言与真值一致" | 2026-10-08 执行时两处与原文不同：① **`Observation` 是 `P1.03` 的交付物**，`P1.01` 返回它就等于提前实现 `P1.03`（其 RED 是"构造/几何校验"，会因此失效）⇒ 夹具交付自己的 `TestFrame { pixels: Vec<u8>, region: Rect }`，`P1.03` 落地时把返回类型换成 `Observation` 并删除 `TestFrame`；② 自证必须把"每一步都能被还原"限制在 **`|d| ≤ H/2`**（`docs/30 §16.5` 的重叠门槛）：脚本里保留了 `move_by(600)`（视口 900）这种**重叠不足一半**的步进，自证对它的断言只能是"**不得**被还原"。若照原文断言全部步进，夹具会把一条**不可判定**的情形记成夹具缺陷，执行者唯一能让它变绿的办法是删掉该步进——那正是 §16.5 想让夹具产出的 `Lost` 用例。另：`take` 是**顺序**接口（内部游标前进），不是随机访问——会话看到的是流，能要第 7 帧再要第 6 帧的测试没有在测流 | 无 `docs/30` 回填（`§28.2` 的第 11 文件口径已由 `DEV-1` 落地）；本文 §6 `P1.01` 的状态行与执行块按实际改写 |
+| **DEV-10**（执行时新增） | `P1.02` 的上游写 **V2 §13.1、§17.8**；§17.8 的 `Axis` 代码块写 `const fn cross(&self, dx: i32, dy: i32) -> i32 { match self { Vertical => dx, Horizontal => dx } } // 见下注`，紧随其后的注写"`cross` 一栏在文档里必须逐字写对（垂直轴取 `dx`、水平轴取 `dy`）——这是唯一写错不会被类型系统抓住的地方" | 2026-10-08 执行时逐字核对发现：**§17.8 自己的代码块违反了它自己的注**——`cross` 的第二个分支是 `Horizontal => dx`，而 §13.1（同一份文档的另一个权威位置）写的是 `Horizontal => dy`，注里也写"水平取 `dy`"。另外该块把函数名写成 `primary`/`cross`，与 §13.1、`docs/31 P1.02`、以及 §6 参考实现 `types.rs` 的 `primary_delta`/`cross_delta` 不一致。**一份文档里同名函数有两种名字、同一个映射有两种写法**，而这段注恰好声明"这类错误类型系统抓不住"——如果执行者照 §17.8 抄，`T-AXIS-1` 会红，但红的会是"实现错了"而不是"文档错了"；如果照 §13.1 抄，`docs/30 §17.8` 就永久留下一段**会误导下一个读者**的代码。按 §13.1 为准修正，并在该块下新增"勘误"说明 | `docs/30 §17.8` 的 `Axis` 代码块（`cross` 的第二分支改回 `dy`、名字统一为 `primary_delta`/`cross_delta`、补 `is_vertical()` 作为**唯一分叉点**）+ 该块下的注（拆成"注"与"勘误（2026-10-08，`P1.02` 执行时发现）"两段）；本文 §6 `P1.02` 的执行块 |
+
 
 ---
 
@@ -903,6 +905,18 @@ git config core.hooksPath .githooks
 - **REFACTOR**：**`T-AXIS-1`**：对同一脚本，用垂直轴与"转置后的输入"各跑一次，断言结果**逐行相等**；这条测试同时锁死"`cross` 一栏垂直取 `dx`、水平取 `dy`"这个最容易写反的地方
 - **退出条件**：① `T-AXIS-1` 通过；② 全文件内 `Axis::Vertical` 的分支数 ≤ 1（可用 `grep` 计数）
 - **提交标题**：`[P1-02] one axis abstraction, one place to get it wrong`
+
+**状态（2026-10-08）**：`[x] 完成` —— 退出条件两条全部满足；一处偏差见 **DEV-10**（V2 §17.8 的代码块勘误）。
+
+**实测与交付**：
+
+- **RED**：`cargo test -p snapclip-capture --lib the_axis_mapping_is_exhaustive` → **`error[E0432]: unresolved import `super::Axis`` + `error: could not compile `snapclip-capture` (lib test) due to 1 previous error`**，exit 1。装置 = 新建 `crates/snapclip-capture/src/scroll/observation.rs`（模块 doc + `#[cfg(test)] mod tests`，无实现），并在 `scroll/mod.rs` 注册 **`pub(crate) mod observation;`**（`scroll/` 的第一个生产文件）。
+- **GREEN**：`cargo test -p snapclip-capture --lib the_axis_mapping_is_exhaustive` → **1 passed**。交付 `pub(crate) enum Axis { Vertical, Horizontal }` + **一个私有 `const fn is_vertical(self) -> bool`**（唯一的 `match self`，即唯一的分叉点）+ 三个 `pub(crate) const fn`：`primary_delta(dx, dy)`（垂直取 `dy`）、`cross_delta(dx, dy)`（垂直取 `dx`、水平取 `dy`）、`primary_extent(width, height)`（垂直取高、水平取宽）。**这三个函数体里没有一处 `match`**——它们都是 `if self.is_vertical() { … } else { … }`，这正是退出条件 ② 能成立的原因（见下）。`Axis` 与 `impl` 各挂一条 `#[allow(dead_code)]` 并注明理由（`P1.02` 定义它、`P1.05` 才是第一个消费者；没有这条会破坏"0 error / 1 warning"的门禁读数）。
+- **REFACTOR（`T-AXIS-1`）**：`cargo test -p snapclip-capture --lib scroll::observation` → **2 passed / 0 failed**。`the_same_script_answers_the_same_on_both_axes()` = 同一脚本（`[+120, -120, +37, repeat, +240]`，图像 640×4000、视口 900）跑两遍：第 1 遍用**行**指纹（`Axis::Vertical`），第 2 遍把每一帧**转置**（BGRA 4 字节组搬移）后用**列**指纹（`Axis::Horizontal`），估计器是**同一个函数**（`P1.01` 那个逐行指纹 + 重叠 ≥ 主尺寸一半 + 最大一致数、`|d|` 最小平局判据），两串 `Vec<Option<i32>>` 必须**逐元素相等**且都等于脚本真值。三条附带断言把它锁死：① 转置必须**逐字节可逆**（`transpose(transpose(frame)) == frame.pixels`，否则"两个轴一致"没有意义）；② 每条位移经 `axis.primary_delta` 折算回主轴分量都等于真值、`axis.cross_delta == 0`（脚本化滚动无横向漂移）；③ 两个轴给出的**主尺寸**相同（`Vertical.primary_extent(640,900) == Horizontal.primary_extent(900,640) == 900`），即重叠门槛作用在同一段物理长度上。
+- **测试强度的机械证明（变异检查，不留在提交里）**：把 `is_vertical()` 的两个分支**对调**后重跑 → `test result: FAILED. 0 passed; 2 failed`，两条用例分别停在 `observation.rs:74`（手工映射表）与 `observation.rs:236`（`vertical run, frame 1`）。⇒ 这条不变式**不是靠注释维持**的：映射写反会被两条独立用例同时抓住。改回后 `2 passed`。
+- **退出条件 ② 的实测**：`grep -n 'Axis::Vertical' crates/snapclip-capture/src/scroll/observation.rs` —— **非测试部分（`:57 mod tests` 之前）命中 1 次**（`is_vertical()` 的 match 臂，`:32`），即"全文件内轴分叉点 ≤ 1"成立；测试模块内另有 13 次（手工映射表 6 次 + 两个轴各跑一遍的调用与断言 7 次），那里出现的是**测量**而不是算法分叉——测试必须同时命名两个轴，否则无法比较它们。
+- **门禁（2026-10-08）**：`cargo check --workspace --all-targets` = **0 error / 1 warning**（仅既有 `unused variable: content_label`，`apps/snapclip/src/history/view.rs`）；`cargo test --workspace --lib` = **491 passed / 15 ignored / 0 failed**（app 56+3、**capture 361+12**（`P1.01` 之后 359+12，+2 = 本任务两用例）、history 51、model 23）；`tools/check-dependency-direction.ps1` = **clean**（capture 30 / history 47 / model 8 包）。**`scroll/` 未引用 `windows`/`sampler`**（第二遍扫描按计划留给 `P6.07`）。
+- **留给后续的口径**：`scroll/mod.rs` 的文档已把 `perf_probe` 的重跑对象写成 **`P1.05`**（而不是 `P1.02`）：`P1.02` 只交付轴抽象，`E-PERF-1` 的第 1 层真实实现与"跨步复用行摘要"落在 `P1.05`，届时用 `testkit` 合成序列重跑 `tools/p0-03-matching-cost.ps1`（`DEV-8` ② 的义务）。`observation.rs` 的 `mod` 目前是 `pub(crate) mod`，**尚未在 `mod.rs` 里 re-export `Axis`**（无人使用会触发 `unused_import`），`P1.05` 引入第一个消费者时再按 §28.2 的 re-export 惯例加上。
 
 ### P1.03 `Observation` 类型与"只读视图"
 

@@ -2106,15 +2106,20 @@ pub struct ImageMeta { pub width: u32, pub height: u32, pub stride: usize, pub f
 **不写第二套算法**（N6）。§6 的参考实现用**三个 `const fn`**（`primary_delta`/`cross_delta`/`primary_extent`，`types.rs:11-32`）把两轴参数化，全套算法按主轴写一遍，**只有像素搬运分叉**。V2 采用同样做法，并把 §3 的 `Axis` 定义为：
 
 ```rust
-enum Axis { Vertical, Horizontal }
+pub(crate) enum Axis { Vertical, Horizontal }
 impl Axis {
-    const fn primary(&self, dx: i32, dy: i32) -> i32 { match self { Vertical => dy, Horizontal => dx } }
-    const fn cross(&self, dx: i32, dy: i32) -> i32   { match self { Vertical => dx, Horizontal => dx } } // 见下注
-    const fn primary_extent(&self, w: u32, h: u32) -> u32 { match self { Vertical => h, Horizontal => w } }
+    /// 唯一的轴分叉点（`P1.02` 落地）：其余三个函数只是对这一个 bit 做算术，所以
+    /// `Axis::Vertical` 在 `observation.rs` 的非测试部分**只出现一次**，可以用 grep 审计。
+    const fn is_vertical(self) -> bool { match self { Axis::Vertical => true, Axis::Horizontal => false } }
+    pub(crate) const fn primary_delta (&self, dx: i32, dy: i32) -> i32 { if self.is_vertical() { dy } else { dx } }
+    pub(crate) const fn cross_delta   (&self, dx: i32, dy: i32) -> i32 { if self.is_vertical() { dx } else { dy } }
+    pub(crate) const fn primary_extent(&self, w: u32, h: u32) -> u32 { if self.is_vertical() { h } else { w } }
 }
 ```
 
-> **注**：上表的 `cross` 一栏在文档里必须逐字写对（垂直轴取 `dx`、水平轴取 `dy`）——这是**唯一的轴分叉点**，写错不会被类型系统抓住，必须有一条专门的单元测试用 `(dx,dy)` 组合覆盖两轴（§30 的 `T-AXIS-1`）。
+> **注**：`cross` 一栏是**唯一写错不会被类型系统抓住**的地方（垂直轴取 `dx`、水平轴取 `dy`），必须有专门单元测试用 `(dx,dy)` 组合覆盖两轴（§30 的 `T-AXIS-1`）。
+>
+> **勘误（2026-10-08，`P1.02` 执行时发现）**：本块在上面的改写之前有两处错误——① `cross` 的第二个分支写成 `Horizontal => dx`，与 **§13.1**（`Horizontal => dy`）和紧随其后的这段注**自相矛盾**；② 函数名写成 `primary`/`cross`，与 §13.1 和 `docs/31` `P1.02` 的 `primary_delta`/`cross_delta` 不一致。按 §13.1 为准修正，并统一为 `primary_delta`/`cross_delta`（`docs/31` `DEV-10`）。这正是这段注警告的那类错误，只不过它当时写在**文档里**而不是代码里。
 
 **性能差异是被承认的，不是被消除的**：§6 S7 指出参考实现里水平轴明显更慢（`from_column_ranges` 逐行、`copy_rows_strided` 逐行，只有垂直轴能整块 `memcpy`）。V2 的立场：
 
