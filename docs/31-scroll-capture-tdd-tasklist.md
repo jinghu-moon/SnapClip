@@ -94,9 +94,9 @@
 | 新增文件 | 一律先建 `#[cfg(test)]` 测试骨架再建实现（§2.1） |
 | 文档引用 | 一律写 `docs/30 §x.y` 或 `docs/30:<行号>`，**不允许只写"见设计文档"** |
 
-### 0.6 本文对 V2 的补充（**十七处 deviation，全部已按用户授权回填 `docs/30`**）
+### 0.6 本文对 V2 的补充（**十八处 deviation，全部已按用户授权回填 `docs/30`**）
 
-> **回填状态**：十七处（DEV-1…DEV-17）已写入 `docs/30-scroll-capture-design-v2.md`（**未覆盖原文，只做定点增补**）——
+> **回填状态**：十八处（DEV-1…DEV-18）已写入 `docs/30-scroll-capture-design-v2.md`（**未覆盖原文，只做定点增补**）——
 > DEV-1 → `§28.2` 新增 test-only 文件块（`scroll/testkit.rs`）与"10 生产 + 1 test-only"口径、`§33.3` 文件清单由 9 补为 11（**顺带修正了原文漏列 `orb.rs` 的内部矛盾**）；
 > DEV-2 → `§35 P4` 的 `P4.1` 拆为 `P4.1a`（trait，capture）/ `P4.1b`（实现，shell）并附理由；
 > DEV-3 → `§33.1` 的 `D-10` 拆为 `D-10a`（硬失败）/ `D-10b`（静默降级）、`§24.3` 修正 `wgc.rs:107` 的表述并说明"两种相反失败模式的共同落点"、`§24.8` 的探测用例扩为两条；
@@ -114,6 +114,7 @@
 > **DEV-15** → `§15.4.2` 之后新增 `#### 15.4.3 第 3 层落地的形状（P1.07）`（三处落地决定 + 尚未落地）、`§16.11` 的"全分辨率精修邻域"行由"**±1**（共 9 点）"就地勘误为"**±1（主轴 3 点）**"（2026-10-08 执行时新增，见下）。
 > **DEV-16** → `§21.4` 之后新增 `### 21.5 COM/WinRT 公寓：本 crate 不声明公寓，靠 combase 的隐式 MTA`（测量表 + 三句话设计规则 + 开放项）、`crates/snapclip-capture/src/windows/win/wgc.rs` 新增定点测试 `winrt_activation_keeps_the_implicit_apartment`（2026-10-08 定位 `R-21` 时新增，见下）。
 > **DEV-17** → `§16.2` 之后新增 `#### 16.2.1 落地的形状（P1.08）`（三处落地决定）、`§16.9` 补"落点"段（禁令是门一内部的第二条分支，不是第五道门）、`§16.11` 参数总表增补 `RHO_MIN` 行（2026-10-08 执行时新增，见下）。
+> **DEV-18** → `§16.3` 之后新增 `#### 16.3.1 落地的形状（P1.09）`（四处落地决定 + 尚未落地）、`§16.11` 参数总表补 `MIN_RESIDUAL_GAIN` 行的落地口径并增补 `GAIN_RMSE_FLOOR` 行（2026-10-08 执行时新增，见下）。
 > 下表保留**原始登记内容**（作为"当时看到了什么"的记录）。
 
 | # | 补充 | 为什么必须补 | 回填位置 |
@@ -135,6 +136,7 @@
 | **DEV-15**（执行时新增） | `P1.07` 的 GREEN 写"在全分辨率上对 `argmax(score)` 的 ±1 邻域重算 ZNCC"，而 `docs/30 §15.4` ③ 写"只在 `d_i` 的整数邻域（±1）上重算 ZNCC"（`d_i` 在 ② 里指**每个候选**）、`§16.11` 又把精修邻域写成"**±1**（共 9 点）" | 2026-10-08 执行时发现三处会把执行者推向错形状的地方：① **"每个候选的邻域"与"赢家的邻域"差 8 倍工作量**（8 候选 × 3 位移 = 24 次 vs 3 次全分辨率条带相关；绝对值仍待测——`E-PERF-1` 只测过第 1 层）⇒ 精修**第 2 层的赢家**，把 ② 的 `d_i` 读作"每个候选都是第 2 层的输入"；② 它的代价（**赢家必须落在真值 ±1 内**）在当时**并不成立**：4 px cell 内的候选在第 2 层是**同一次测量**，而平局判据"离 cell 栅格点最近"让赢家最多离真值 2 px ⇒ 双向 `1..40` 的扫描 **20/80 失败，且全部是 `|d| ≡ 2 (mod 4)` 偏 1 px**；修法 = **让第 1 层的 `support` 先于 `grid_distance` 参与排序**（对 `P1.06` 交付物的修订：`ScoredCandidate` 增 `support` 字段 + 排序键 `score desc → curvature asc → support desc → grid_distance asc → |d| asc → d asc`），修订后 **80/80 精确等于真值**；③ `±1` 是**主轴 3 点**，不是二维 9 点（`d` 只有 `primary_delta` 一个分量，交叉轴上没有被搜索的自由度；要支持横向抖动是新自由度，不是把邻域改成 3×3） | `docs/30 §15.4.2` 之后新增 `#### 15.4.3 第 3 层落地的形状（P1.07）`（形状块 + 三处落地决定 + 尚未落地）；`§16.11` 的"全分辨率精修邻域"行就地勘误为"`±1`（主轴 3 点）"；本文 §6 `P1.07` 的执行块 |
 | **DEV-16**（执行时新增） | V2 §21.3 只写"`ID3D11DeviceContext` 的线程所有权"，**没有一条关于 COM/WinRT 公寓的规则**；而 `docs/31` `P0.02` 的升级条款与"合规直觉"都指向"每个触及 WinRT 的线程应先 `RoInitialize(MTA)`" | 2026-10-08 实测**否掉了那个直觉**：`CoGetApartmentType` 显示隐式路径给 **`APTTYPE=1 qualifier=1`（`IMPLICIT_MTA`）**、显式 `RoInitialize`/`CoInitializeEx(MTA)` 给 **`APTTYPE=1 qualifier=0`**（**类型相同、限定符不同**），而**显式那一边让 WGC 激活崩**（交错 A/B：整轮串行套件 3/3 崩在 `providers.rs:684` 的真实捕获用例，对照臂 3/3 全绿；换成 `CoInitializeEx(MTA)` 一样 3/3 崩）；不写明这条，下一个人会照着"COM 教科书"把公寓声明加回来，从而把一个偶发崩溃变成确定性崩溃 | `docs/30` 在 §21.4 之后、`## 22. 内存策略` 之前新增 **`### 21.5 COM/WinRT 公寓：本 crate 不声明公寓，靠 combase 的隐式 MTA`**（测量表 + 三句话设计规则 + 开放项）；代码侧新增定点测试 `crates/snapclip-capture/src/windows/win/wgc.rs` 的 `winrt_activation_keeps_the_implicit_apartment`（自证 = 在 `is_supported()` 顶部临时加一句 `CoInitializeEx(MTA)` 即红，实测 `left: APTTYPEQUALIFIER(0) / right: APTTYPEQUALIFIER(1)`；该测试**必须跑在全新进程里**（线程继承隐式 MTA，同进程内看不见声明，理由见 `docs/30 §21.5` 规则 3））；被否决的实现保存在侧分支 `spike/apartment-mta`（`58bd99b`）；本文 §14.3 `R-21` 行同步改写 |
 | **DEV-17**（执行时新增） | `P1.08` 的 GREEN 把"`GateOutcome::{Pass, Reject(reason)}`"与"**与可验证性约束分开表达**"并置，REFACTOR 又要求把 `ρ_min` 作为独立常量暴露，但**没有说 §16.9 的边界值禁令落在哪一步**（§16.1 的门清单里它不占一席，§16.9 只说"无论它通过了几道门"）；也没说 `ρ_min` 的比较用什么数域 | 2026-10-08 执行时做了三处裁决并把它们写成可执行形式：① **禁令放进门一内部**（`gate_geometry` 先判 `|d| > extent` 再判 `|d| == extent / 2`）——它是"越界/未定义路径的共同落点"，必须**早于**其余门生效，否则"落在 `±N/2` 但被后面某道门拒绝"与普通的坏候选在下游无法区分；② **`extent <= 1` 时不禁 `d == 0`**——否则"页面确实没动"（唯一可由行指纹确认的答案）会变得无法表达，且测试把 `gate_geometry(0, 0/1) == Pass` 钉住；③ **`ρ_min` 的比较用整数**（`RHO_MIN_PERMILLE = 350`，`overlap·1000 ≥ 350·extent`），因为 `extent = 100, |d| = 65` 恰为 350‰、必须通过，而浮点 `>=` 会让校准顺带移动这个边界；同一测试还证明了 §16.1 的论点：`gate_geometry(66, 100) == Pass` 而 `is_verifiable(66, 100) == false`（**硬门与可信度是两个数字**） | `docs/30` 在 §16.2 之后新增 `#### 16.2.1 落地的形状（P1.08）`（形状块 + 三处裁决）；§16.9 在硬规则两条之后补"**落点（P1.08）**"段（禁令 = 门一内部的第二条分支、可执行形式）；§16.11 参数总表在 `MIN_MARGIN` 行之后增补 `RHO_MIN`（0.35，区间 0.30–0.40，可校准，`E-ACC-1`，整数比较）；本文 §6 `P1.08` 执行块 |
+| **DEV-18**（执行时新增） | `P1.09` 的 GREEN 写"`gain = 1 − RMSE(d_best)/RMSE(d_0)`，`MIN_RESIDUAL_GAIN = 0.15`；`d_best == 0` 走行指纹分支"，但**没说"无定义"用什么表达**，也没说"行指纹分支"由谁提供；仓库里已有的 `gain_of` 把 `0/0` 折成 **`0.0`**、且 `score_candidates_2d` 在候选循环里**重复构造零位移带** | 2026-10-08 执行时做了四处裁决并把其中两处写成可执行形式：① **比值返回 `Option<f32>`**（分母 `<= GAIN_RMSE_FLOOR = 1e-3` ⇒ `None`），`0.0` 只在排名的**唯一调用点**以 `GAIN_UNDEFINED_FOR_RANKING` 代入——原实现让"未定义"与"没有增益"是同一个数，于是零位移会作为普通测量参与 §16.7 的 `score` 排名、也会被门二当成"增益不足"拒绝，两件不同的事共用一个结果（这是 `P1.04`"缺失的答案要有类型、不要哨兵"的第二次实例）；② **`residual_gain_at` 与排名必须测同一块区域、同一个单位**——第一版把**全分辨率**像素传进 `DOWNSAMPLE = 4` 的池化栅格，真实位移 120 px 的增益回报为 **0.019**（远低于 0.15），即"肉眼可见的移动被判成没有动"；修法 = 内部 `round_to_grid(shift)`，并新增 `the_gate_and_the_ranking_measure_the_same_region()` 断言排名里每个候选的 `gain` 与 `residual_gain_at` 的返回值**逐位相等**（同时满足 REFACTOR"RMSE 的定义被两处共用"：零位移带移出循环、两处都经 `match_band` + `band_rmse`）；③ **`zero_shift_status` 是 §16.3 重复检测的唯一入口**（`primary_digests` 逐行相等 ⇒ `Confirmed { d: 0 }`，否则 `None`；用字节级指纹而非相关性，宁可丢一帧也不多写一行）；④ **闭区间在 0.15 处是闭的**，用 `MIN_RESIDUAL_GAIN - 0.01` 与 `MIN_RESIDUAL_GAIN` 一正一反钉住 | `docs/30` 在 §16.3 之后新增 `#### 16.3.1 落地的形状（P1.09）`（形状块 + 四处裁决 + 尚未落地）；§16.11 参数总表的 `MIN_RESIDUAL_GAIN` 行补落地口径、并增补 `GAIN_RMSE_FLOOR` 行；本文 §6 `P1.09` 执行块 |
 
 
 ---
@@ -1063,6 +1065,27 @@ git config core.hooksPath .githooks
 - **REFACTOR**：把 `RMSE` 的定义（哪一块区域、是否含边界带）写成一个函数并被两处共用（避免"分母用 A 区域、分子用 B 区域"的隐性错误）
 - **退出条件**：① 两条用例通过；② §30.3 的"逐行完全相等"行**不进估计器**（在 **P1.18** 的 `Skip` 路径上命中）
 - **提交标题**：`[P1-09] a peak must beat standing still`
+
+**状态**：`[x] 完成`（2026-10-08）
+
+**RED（实测）**：`cargo test -p snapclip-capture --lib a_peak_that_is_no_better_than_standing_still_is_rejected` → `error[E0432]: unresolved imports`（`super::MIN_RESIDUAL_GAIN`、`gate_residual_gain`、`residual_gain`、`residual_gain_at`、`zero_shift_status`，报在测试模块的 `use super::{…}` 行）+ `error[E0599]: no variant, associated function, or constant named `ResidualGainTooSmall` found for enum `GateRejection` in the current scope`（`:2031:35` 与 `:2063:48`）+ `error: could not compile `snapclip-capture` (lib test) due to 5 previous errors`，exit 1。
+
+**GREEN（已落盘）**：`crates/snapclip-capture/src/scroll/displacement.rs`
+- `fn gain_of(...) -> f32`（把 `0/0` 折成 `0.0`）被 **`fn residual_gain(rmse_at_shift, rmse_at_zero) -> Option<f32>`** 取代：`rmse_at_zero <= GAIN_RMSE_FLOOR`（`1e-3`）返回 `None`；新增 `const GAIN_UNDEFINED_FOR_RANKING: f32 = 0.0`，只在 `score_candidates_2d` 的唯一调用点用 `unwrap_or` 代入。
+- `const MIN_RESIDUAL_GAIN: f32 = 0.15`、`fn gate_residual_gain(gain: f32) -> GateOutcome`（`gain >= MIN_RESIDUAL_GAIN` ⇒ `Pass`）、`GateRejection::ResidualGainTooSmall`（`status()` ⇒ `Status::None`，与既有两支并列）。
+- `pub(crate) fn residual_gain_at(previous, current, shift: i32) -> Option<f32>`：内部 `Gray::pooled` 两侧 + `match_rows(..., DOWNSAMPLE)` + 零位移带**一次** + `match_band(..., round_to_grid(shift), wanted)`，两处残差都经 `match_band` + `band_rmse`。
+- `pub(crate) fn zero_shift_status(previous, current) -> Status`：尺寸/轴不一致 ⇒ `None`；`primary_digests` 逐行相等 ⇒ `Confirmed { d: 0 }`，否则 `None`。
+- 顺带修正三处**过期任务引用**（`Evidence.margin` 的"gate four; `P1.10`"⇒`P1.11`、`supporting_tiles` 与 `Candidate.support` 的"independence is `P1.09`'s"⇒`P1.10`，与 §6 的任务编号对齐）与模块 doc（"gates after the first (`P1.09`–`P1.11`)"⇒"after the second (`P1.10`–`P1.11`)"，并新增 `P1.09` 段落）。
+
+**执行期的两处修正（都来自实跑，已写进 `docs/30 §16.3.1`）**：
+1. **`residual_gain_at` 的第一版把全分辨率位移传进池化栅格** ⇒ 正控制失败：`crates\snapclip-capture\src\scroll\displacement.rs:2125: the true shift explained only 0.019075513 of the zero-shift residual`（真实位移 120 px、视口 900、`mixed_document`）。修法 = 内部 `round_to_grid(shift)`（第 2 层在 `DOWNSAMPLE = 4` 的栅格上测量，§16.7 的 `Evidence.gain` 就是这一层的数）。
+2. **REFACTOR 的第三件事实**：零位移带原先在候选循环里重复构造，`score_candidates_2d` 现在把它移出循环（`zero_band` + `rmse_at_zero` 各一次），新增用例 `the_gate_and_the_ranking_measure_the_same_region()` 断言排名里每个候选的 `gain` 与 `residual_gain_at` 的返回值**逐位相等**（`Some(candidate.gain)`）——REFACTOR 的"同一块区域"因此是断言而不是注释。
+
+**退出条件**：① 两条 RED 用例通过（`a_peak…` ok / `when_the_winner…` ok）；② §30.3 的"逐行完全相等"行**不进估计器**——`zero_shift_status` 已提供该分支，接入 `Skip` 路径归 **P1.18**，本任务只交付可调用形式；③ `cargo test -p snapclip-capture --lib scroll::displacement` = **21 passed / 0 failed（8.65s）**。
+
+**偏差**：**一处**，已登记为 §0.6 **DEV-18**（① 比值返回 `Option`、`0.0` 只用于排名；② 量与单位必须与排名同源——第一版 0.019 的实测；③ `zero_shift_status` 作为重复检测的唯一入口；④ 闭区间 0.15 用一正一反钉住）。**未完成项**：门二尚未接进会话组装（`P1.12` 的职责）；`MIN_RESIDUAL_GAIN` 的标定仍归 `E-ACC-1`。
+
+**门禁（2026-10-08，`docs/Temp/p109-gates.log`）**：`cargo check --workspace --all-targets` = **0 error / 1 warning**（仅既有 `unused variable: content_label`）；`cargo test -p snapclip-capture --lib -- --test-threads=1` = **386 passed / 0 failed / 12 ignored（25.26s）**（P1.08 之后 383+12，+3 = 本任务三个用例）；`cargo test --workspace --lib -- --test-threads=1` = app 56+3 / capture 386+12（25.82s）/ history 51 / model 23，**0 failed、exit 0**（日志里多出的一行 `1 passed / 397 filtered out` 是公寓定点测试自建子进程的输出，不是额外套件）；`tools/check-dependency-direction.ps1` = clean（capture 30 / history 47 / model 8）。
 
 ### P1.10 门三：空间独立支持 `supporter_tiles ≥ 4`
 

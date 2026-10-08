@@ -1874,6 +1874,28 @@ pub(crate) fn gate_geometry(d: i32, viewport_extent: u32) -> GateOutcome
 - **量级来自参考实现**：`MIN_RESIDUAL_GAIN = 0.15`（§6 N5、R16）。**采纳它的理由是结构性的**：它同时被 0.15 的置信度权重使用，且参考实现把它作为与 inlier 门并列的硬门。V2 保留数值，但**必须由 `E-ACC-1` 校准**（§16.11 表内标注为可校准项）。
 - **`d_best == 0` 的特例**：`gain` 无定义。此时不调用本门，改走 §16.2 的重复检测：若行指纹显示逐行相等 → `status = Confirmed, d = 0`（这是唯一可以"确定地说没动"的情形）；否则 `status = None`。
 
+#### 16.3.1 落地的形状（`P1.09`，2026-10-08）
+
+门二的落地暴露了本节最容易被忽略的一句：**"无定义"必须是一个类型，而不是一个数**。形状：
+
+```rust
+fn residual_gain(rmse_at_shift: f32, rmse_at_zero: f32) -> Option<f32>  // 分母 <= 1e-3 ⇒ None
+const GAIN_UNDEFINED_FOR_RANKING: f32 = 0.0;                            // 只在排名处代入
+pub(crate) const MIN_RESIDUAL_GAIN: f32 = 0.15;
+pub(crate) fn gate_residual_gain(gain: f32) -> GateOutcome               // 闭区间：0.15 通过
+pub(crate) fn residual_gain_at(previous, current, shift: i32) -> Option<f32>
+pub(crate) fn zero_shift_status(previous, current) -> Status             // 逐行指纹 ⇒ Confirmed{d:0} 或 None
+```
+
+四处裁决（`docs/31` `DEV-18`）：
+
+1. **`gain` 的定义返回 `Option`，`0.0` 只出现在排名处**。原实现把 `0/0` 折成 `0.0`，于是"未定义"与"这个位移没有增益"是同一个数：零位移会作为一个普通测量参与 §16.7 的 `score` 排名，也会被门二当成"增益不足"而拒绝——两件不同的事共用一个结果。现在比值本身是 `Option`，`score_candidates_2d` 在**唯一调用点**映射 `unwrap_or(GAIN_UNDEFINED_FOR_RANKING)`（排名需要一个数），门二则只接受已测出的 `f32`，因此**它不可能看到零位移的情形**。这是 `P1.04`"缺失的答案要有类型、不要哨兵"在本节的第二次实例。
+2. **`residual_gain_at` 与 `score_candidates_2d` 必须测同一块区域、同一个单位**。比例的两个输入各有一次出错机会：残差覆盖哪一块区域（两侧都必须经 `match_band`），以及位移的单位（第 2 层在 `DOWNSAMPLE = 4` 的栅格上测量，`Evidence.gain` 按 §16.7 就是这一层的数）。第一版 `residual_gain_at` 把**全分辨率**像素传进池化栅格，真实位移 120 px 的增益回报为 **0.019**（远低于 0.15）：一个肉眼可见的移动被判成"没有动"。这条不是注释而是测试——`the_gate_and_the_ranking_measure_the_same_region()` 断言排名里每个候选的 `gain` 与 `residual_gain_at` 的返回值**逐位相等**。
+3. **`zero_shift_status` 是 §16.3 重复检测的唯一入口**：逐行指纹（§15.4 的 `primary_digests`）完全相等 ⇒ `Confirmed { d: 0 }`，否则 `None`。它刻意用**字节级**指纹而不是相关性：同一页面被重新打光也会被报成"变了"，代价是丢一帧（不提交画布）而不是多写一行——与 §16.5 的 margin 同一个保守方向。
+4. **闭区间在 `MIN_RESIDUAL_GAIN` 处是闭的**：恰好 0.15 通过（§16.3 写的是 `≥`），测试用 `MIN_RESIDUAL_GAIN - 0.01` 与 `MIN_RESIDUAL_GAIN` 的一正一反两例钉住。
+
+**尚未落地**：门二今天只被当作**纯函数**调用；把它接进会话（读 `Refined` 的赢家 → 取该位移的 `gain` → 决定 `Confirmed`/`None`）是 `P1.12` 的组装职责。`E-ACC-1` 仍拥有 0.15 这个数。
+
 ### 16.4 门三：空间独立支持 `supporter_tiles ≥ MIN_TILES = 4`
 
 - **为什么必须有**：单一大块同质区域（一张大图、一个纯色面板）能在任意位移上给出高分。要求"**至少 4 个空间上相互独立的带**支持同一 `d`"是"这个位移是由多处独立证据共同支持的"的可操作形式。α 内的数字取自参考实现的 `MIN_INLIER_TILES = 4`（§6 N5）。
@@ -2011,8 +2033,9 @@ pub(crate) struct Displacement { status: Status, confidence: f32, evidence: Evid
 
 | 参数 | 初始值 | 性质 | 校准实验 |
 |---|---|---|---|
-| `MIN_RESIDUAL_GAIN` | 0.15 | **硬门** | `E-ACC-1` |
+| `MIN_RESIDUAL_GAIN` | 0.15 | **硬门** | `E-ACC-1`；`P1.09` 落地为闭区间比较，比值本身是 `Option`（`GAIN_RMSE_FLOOR = 1e-3` 以下返回 `None`，不返回 `0.0`；§16.3.1 裁决 1） |
 | `MIN_TILES` | 4 | **硬门** | `E-ACC-1` |
+| `GAIN_RMSE_FLOOR`（零位移残差的可除下限） | 1e-3 | 固定 | `P1.09`：低于它的分母是量化尘埃而不是比值，`residual_gain` 因此返回 `None`（§16.3.1 裁决 1） |
 | `MIN_MARGIN` | 0.15 | **硬门** | `E-ACC-1` |
 | `RHO_MIN`（可验证性下限 = §14.2 的 `ρ*`） | 0.35（区间 0.30–0.40） | **可校准** | `E-ACC-1`；`P1.08` 把它与门一分开暴露，比较用整数 `RHO_MIN_PERMILLE = 350`（§16.2.1 裁决 3） |
 | `tile`（证据独立性粒度） | 32 px | 固定 | 与参考实现一致 |

@@ -23,7 +23,7 @@
 //! but keep the session" is one match arm instead of a rule every consumer re-derives.
 //!
 //! Not here yet: `scene_cut` (`P1.12` puts it in `Evidence`, so that it never becomes a
-//! `StopReason`), the `ĝ` prior (`P1.14`) and the gates after the first (`P1.09`–`P1.11`); all of
+//! `StopReason`), the `ĝ` prior (`P1.14`) and the gates after the second (`P1.10`–`P1.11`); all of
 //! them feed the `score` this file's formulas name.
 //!
 //! `P1.06` adds §15.4's second layer: the first thing in the funnel allowed to *argue*, because it
@@ -42,6 +42,13 @@
 //! shift is physically possible" is a fact about overlap with no parameters, "how much overlap is
 //! enough evidence" is a calibratable preference. V1 conflated them (`docs/30` §16.2), and the
 //! conflation is exactly what makes a hard gate drift when someone tunes confidence.
+//!
+//! `P1.09` adds §16.1's second gate ([`gate_residual_gain`]) together with the thing that has to
+//! exist for it to be callable: [`residual_gain`] answers `Option<f32>`, because at a zero shift the
+//! §16.3 ratio is `0/0` and "undefined" would otherwise be flattened into `0.0` — a number a ranking
+//! and a gate would treat as an ordinary measurement. That is why the module's "no sentinel" rule
+//! (`P1.04`) has a second instance here: the type carries the distinction, and
+//! [`zero_shift_status`] is the §16.3 fingerprint path the undefined case is routed to instead.
 
 // The first consumer of everything in this file is `P1.05` (layer 1) / `P1.06` (ZNCC) / `P1.12`
 // (the session loop). Until then the module is exercised only by its own tests, and the crate's
@@ -83,9 +90,9 @@ pub(crate) struct Evidence {
     /// Residual gain over "nothing moved" (`docs/30` §16.3, gate two — the only gate that must
     /// pass; measured by `P1.06`'s second layer, at its own resolution).
     pub(crate) gain: f32,
-    /// `(score(best) − score(second)) / score(best)` (`docs/30` §16.5, gate four; `P1.10`).
+    /// `(score(best) − score(second)) / score(best)` (`docs/30` §16.5, gate four; `P1.11`).
     pub(crate) margin: f32,
-    /// How many bands support the winner (`docs/30` §16.4, gate three; `P1.09` adds §16.4's
+    /// How many bands support the winner (`docs/30` §16.4, gate three; `P1.10` adds §16.4's
     /// independence rule, which is why the second layer counts adjacent tiles separately).
     pub(crate) tiles: u32,
 }
@@ -646,17 +653,31 @@ fn band_rmse(previous: &Gray, current: &Gray, band: MatchBand) -> f32 {
 /// explains.
 ///
 /// It is the design's content-independent measure (an absolute similarity is near 1 on a blank
-/// page), and it is **invariant to a contrast scale** because both residuals carry it. When the two
-/// frames are already identical at zero shift the ratio is `0/0`: the answer is `0` ("nothing to
-/// gain") rather than NaN. The floor at `−1` is where the shift's residual is twice the zero
-/// shift's, past which the number only exists to sort candidates — §16's gates reject it long
-/// before.
-fn gain_of(rmse_at_shift: f32, rmse_at_zero: f32) -> f32 {
+/// page), and it is **invariant to a contrast scale** because both residuals carry it.
+///
+/// The answer is an `Option` because the denominator can be undefined: when the two frames are
+/// already identical at zero shift the ratio is `0/0`, and §16.3 routes that case to the fingerprint
+/// path instead of calling gate two. Returning `0.0` there — which this function used to do — made
+/// "undefined" indistinguishable from "this shift gains nothing", so a caller could rank the zero
+/// shift and gate it like a measurement. `None` is what keeps that case out of the funnel, and it is
+/// the second instance of `P1.04`'s rule that an absent answer gets a type rather than a sentinel.
+///
+/// The floor at `−1` is where the shift's residual is twice the zero shift's, past which the number
+/// only exists to sort candidates — §16's gates reject it long before.
+fn residual_gain(rmse_at_shift: f32, rmse_at_zero: f32) -> Option<f32> {
     if rmse_at_zero <= GAIN_RMSE_FLOOR {
-        return 0.0;
+        return None;
     }
-    (1.0 - rmse_at_shift / rmse_at_zero).clamp(-1.0, 1.0)
+    Some((1.0 - rmse_at_shift / rmse_at_zero).clamp(-1.0, 1.0))
 }
+
+/// What a candidate's `gain` becomes when the ratio is undefined, **for ranking only**.
+///
+/// §16.7's `score` needs a number for every candidate, and the zero shift is a candidate like any
+/// other. `0.0` is the honest standing: the shift gains nothing over "nothing moved" because there is
+/// nothing there to gain. The mapping lives here, at the one place a number is needed, so the
+/// definition above stays `Option` and gate two never sees the substitution.
+const GAIN_UNDEFINED_FOR_RANKING: f32 = 0.0;
 
 /// How many 32 px tiles of the band agree with the shift (§16.4's band count, which replaces "at
 /// least 8 inlier matches"; §16.7's `coverage` saturates the number at 12).
@@ -664,7 +685,7 @@ fn gain_of(rmse_at_shift: f32, rmse_at_zero: f32) -> f32 {
 /// Only whole tiles count: a partially filled tile correlates over fewer cells, and comparing it to
 /// the same threshold would make the tail of every band systematically weaker evidence. Adjacent
 /// tiles count separately here — §16.4's independence rule (`|i − j| ≥ 2`) is gate three's, and
-/// `P1.09` is where it lands.
+/// `P1.10` is where it lands.
 fn supporting_tiles(previous: &Gray, current: &Gray, band: MatchBand) -> u32 {
     let tile = TILE_ROWS / DOWNSAMPLE;
     let mut count = 0;
@@ -727,7 +748,7 @@ pub(crate) struct ScoredCandidate {
     pub(crate) zncc2d: f32,
     /// §16.3's residual gain over the zero shift.
     pub(crate) gain: f32,
-    /// How many whole 32 px tiles agree (§16.4's band count; independence is `P1.09`'s).
+    /// How many whole 32 px tiles agree (§16.4's band count; independence is `P1.10`'s).
     pub(crate) tiles: u32,
     /// The three-point difference of `zncc2d` around the candidate (§15.4 ②).
     pub(crate) curvature: f32,
@@ -855,6 +876,12 @@ pub(crate) fn score_candidates_2d(
     let previous_gray = Gray::pooled(previous);
     let current_gray = Gray::pooled(current);
     let wanted = match_rows(previous_gray.height, current_gray.height, DOWNSAMPLE);
+    // The zero shift's band is the denominator of every candidate's `gain`, and it is the same band
+    // for all of them: built once, outside the loop, so the "same region on both sides" property of
+    // §16.3 is a fact of the code rather than of the reader's attention (`docs/31` `P1.09` REFACTOR).
+    let zero_band = match_band(previous_gray.height, current_gray.height, 0, wanted)
+        .expect("the zero shift always overlaps a non-empty frame");
+    let rmse_at_zero = band_rmse(&previous_gray, &current_gray, zero_band);
     let mut scored = ScoredSet::new();
     for candidate in candidates.iter() {
         let shift = round_to_grid(candidate.d);
@@ -868,20 +895,8 @@ pub(crate) fn score_candidates_2d(
         };
         let zncc2d = band_zncc(&previous_gray, &current_gray, band, 0, band.rows);
         let tiles = supporting_tiles(&previous_gray, &current_gray, band);
-        let gain = gain_of(
-            band_rmse(&previous_gray, &current_gray, band),
-            band_rmse(
-                &previous_gray,
-                &current_gray,
-                match_band(
-                    previous_gray.height,
-                    current_gray.height,
-                    0,
-                    wanted,
-                )
-                .expect("the zero shift always overlaps a non-empty frame"),
-            ),
-        );
+        let gain = residual_gain(band_rmse(&previous_gray, &current_gray, band), rmse_at_zero)
+            .unwrap_or(GAIN_UNDEFINED_FOR_RANKING);
         let curvature = curvature_of(&previous_gray, &current_gray, band);
         scored.insert(ScoredCandidate {
             d: candidate.d,
@@ -991,19 +1006,22 @@ pub(crate) enum GateRejection {
     OutsideViewport,
     /// §16.9: `|d| == extent / 2`. The landing point of every undefined and every wraparound path.
     BannedHalf,
+    /// §16.3: `gain < MIN_RESIDUAL_GAIN`. The shift explains no more of the residual than standing
+    /// still did, so the peak is a coincidence of the content rather than a movement.
+    ResidualGainTooSmall,
 }
 
 impl GateRejection {
     /// What §16.10 says a rejection means for the session.
     ///
-    /// Both are `None` rather than `Uncertain`. `Uncertain` means "a shift was measured and the
-    /// evidence does not carry a decision"; these two mean the measurement itself is not a
-    /// measurement — either there was nothing to compare or the estimator left its defined domain.
-    /// §16.9 wants that distinction visible, so it is a method instead of a sentence each call site
-    /// would spell differently.
+    /// All of them are `None` rather than `Uncertain`. `Uncertain` means "a shift was measured and
+    /// the evidence does not carry a decision"; these mean the measurement is not a measurement —
+    /// there was nothing to compare, the estimator left its defined domain, or the best candidate
+    /// gained nothing over not moving. §16.9 wants that distinction visible, so it is a method
+    /// instead of a sentence each call site would spell differently.
     pub(crate) const fn status(self) -> Status {
         match self {
-            Self::OutsideViewport | Self::BannedHalf => Status::None,
+            Self::OutsideViewport | Self::BannedHalf | Self::ResidualGainTooSmall => Status::None,
         }
     }
 }
@@ -1066,13 +1084,89 @@ pub(crate) fn is_verifiable(d: i32, viewport_extent: u32) -> bool {
     overlap * 1000 >= RHO_MIN_PERMILLE * extent
 }
 
+/// The smallest residual gain that counts as movement (`docs/30` §16.3).
+///
+/// The magnitude comes from the reference implementation (§6 N5, R16) and is a startup value:
+/// §16.11 marks it calibratable and `E-ACC-1` owns the number. What is *not* calibratable is that
+/// this gate exists — F-03's whole point is that "a peak was found" and "the peak beats standing
+/// still" are different claims, and only the second one is about movement.
+pub(crate) const MIN_RESIDUAL_GAIN: f32 = 0.15;
+
+/// §16.3's gate two, the only gate that must pass: `gain >= 0.15`, closed at the floor.
+///
+/// It takes the measured `gain` rather than the frames, because [the measurement](residual_gain) and
+/// the decision are separate: `d_best == 0` produces **no** `gain` at all, and a gate that could be
+/// called with `None` would have to invent a policy for it here. §16.3's answer lives in
+/// [`zero_shift_status`] instead, so this function never sees that case.
+pub(crate) fn gate_residual_gain(gain: f32) -> GateOutcome {
+    if gain >= MIN_RESIDUAL_GAIN {
+        GateOutcome::Pass
+    } else {
+        GateOutcome::Reject(GateRejection::ResidualGainTooSmall)
+    }
+}
+
+/// §16.3's ratio measured on two frames at a given shift, in one place.
+///
+/// `shift` arrives in full-resolution primary-axis pixels and the measurement is taken on layer 2's
+/// grid, because that is where the ranking takes it: §16.7 documents `Evidence.gain` as the second
+/// layer's number, so gate two must not read a differently rounded region than the score did (that
+/// mismatch is exactly what this function exists to prevent). A caller asking about one shift gets
+/// the same *definition of the region* (`match_band` on both sides) as [`score_candidates_2d`].
+///
+/// `None` means the ratio is undefined — the frames are identical at zero shift — and it is the
+/// signal to take the fingerprint path.
+pub(crate) fn residual_gain_at(
+    previous: &ObservationView<'_>,
+    current: &ObservationView<'_>,
+    shift: i32,
+) -> Option<f32> {
+    let previous_gray = Gray::pooled(previous);
+    let current_gray = Gray::pooled(current);
+    let wanted = match_rows(previous_gray.height, current_gray.height, DOWNSAMPLE);
+    let zero_band = match_band(previous_gray.height, current_gray.height, 0, wanted)
+        .expect("the zero shift always overlaps a non-empty frame");
+    let shift_band = match_band(
+        previous_gray.height,
+        current_gray.height,
+        round_to_grid(shift),
+        wanted,
+    )?;
+    residual_gain(
+        band_rmse(&previous_gray, &current_gray, shift_band),
+        band_rmse(&previous_gray, &current_gray, zero_band),
+    )
+}
+
+/// §16.3's duplicate detection: what a zero shift means when gate two cannot be called.
+///
+/// `Confirmed { d: 0 }` only if every primary line of the two frames is byte-identical; otherwise
+/// `None`, because the frames differ and this path measured nothing. The comparison is deliberately
+/// the byte-level digest and not a correlation: a relit but unmoved page is reported as "changed",
+/// which costs a frame (no canvas row is committed) instead of risking a duplicated one — the same
+/// conservative direction §16.5's margin errs in.
+pub(crate) fn zero_shift_status(
+    previous: &ObservationView<'_>,
+    current: &ObservationView<'_>,
+) -> Status {
+    if previous.size() != current.size() || previous.axis() != current.axis() {
+        return Status::None;
+    }
+    if primary_digests(previous) == primary_digests(current) {
+        Status::Confirmed { d: 0 }
+    } else {
+        Status::None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         CANDIDATE_LIMIT, Candidate, Displacement, Evidence, GateOutcome, GateRejection, Gray,
-        RHO_MIN, RHO_MIN_PERMILLE, ScoredCandidate, ScoredSet, Status, StepEffect, band_zncc,
-        candidates_1d, gate_geometry, is_verifiable, match_band, match_rows, primary_digests,
-        score_candidates_2d, support_at,
+        MIN_RESIDUAL_GAIN, RHO_MIN, RHO_MIN_PERMILLE, ScoredCandidate, ScoredSet, Status,
+        StepEffect, band_zncc, candidates_1d, gate_geometry, gate_residual_gain, is_verifiable,
+        match_band, match_rows, primary_digests, residual_gain, residual_gain_at,
+        score_candidates_2d, support_at, zero_shift_status,
     };
     use crate::scroll::observation::{Axis, Observation, ObservationView};
     use crate::scroll::displacement::{
@@ -1990,5 +2084,150 @@ mod tests {
             gate_geometry(101, EXTENT),
             GateOutcome::Reject(GateRejection::OutsideViewport)
         );
+    }
+
+    /// The same geometry as [`mixed_document`], different content: what the viewport shows after a
+    /// navigation, and the fixture for "two frames that have nothing to do with each other".
+    fn unrelated_document() -> TestImage {
+        TestImage::from_structures(
+            640,
+            60 * 19,
+            13,
+            19,
+            &[
+                Structure::NoiseBlocks { cell: 8 },
+                Structure::Gradient,
+                Structure::Checker { cell: 12 },
+            ],
+        )
+    }
+
+    #[test]
+    fn a_peak_that_is_no_better_than_standing_still_is_rejected() {
+        // `docs/31` §6 `P1.09`; `docs/30` §16.3 (F-03). Gate two is the only gate that must pass, and
+        // what it refuses is the leap "a peak exists" ⇒ "the peak is a measurement": a candidate that
+        // explains no more of the zero-shift residual than standing still did is not a movement.
+        //
+        // The ratio is *relative* — an absolute similarity is near 1 on a blank page — so it can be
+        // pinned on numbers first, and the floor is closed (§16.3 says `gain ≥ 0.15`).
+        assert_eq!(residual_gain(0.20, 0.20), Some(0.0));
+        assert_eq!(residual_gain(0.14, 0.20), Some(0.30));
+        assert_eq!(
+            gate_residual_gain(0.0),
+            GateOutcome::Reject(GateRejection::ResidualGainTooSmall)
+        );
+        assert_eq!(
+            gate_residual_gain(MIN_RESIDUAL_GAIN - 0.01),
+            GateOutcome::Reject(GateRejection::ResidualGainTooSmall)
+        );
+        assert_eq!(gate_residual_gain(MIN_RESIDUAL_GAIN), GateOutcome::Pass);
+        assert_eq!(GateRejection::ResidualGainTooSmall.status(), Status::None);
+
+        // Positive control, so the gate is not a blanket "no": two frames of a real page, translated
+        // by a shift the estimator is given.
+        let image = mixed_document();
+        let mut script = ScrollScript::new(&image, 900, vec![StepSpec::move_by(120)]);
+        let previous = script.take(0);
+        let current = script.take(1);
+        let gain = residual_gain_at(&previous.view(), &current.view(), 120)
+            .expect("a translated page must have a measurable residual ratio");
+        assert!(
+            gain > MIN_RESIDUAL_GAIN,
+            "the true shift explained only {gain} of the zero-shift residual"
+        );
+        assert_eq!(gate_residual_gain(gain), GateOutcome::Pass);
+
+        // The physical form of the same claim: two frames of the same geometry and unrelated content.
+        // Every alignment is as bad as no alignment, so the strongest candidate explains nothing.
+        // §16.8's scene cut is how a session reaches this state without a fixture.
+        let other = unrelated_document();
+        let mut first_script = ScrollScript::new(&image, 900, vec![StepSpec::move_by(120)]);
+        let mut second_script = ScrollScript::new(&other, 900, vec![StepSpec::move_by(120)]);
+        let previous = first_script.take(0);
+        let current = second_script.take(0);
+        let gain = residual_gain_at(&previous.view(), &current.view(), 120)
+            .expect("neither frame is empty, so the ratio exists");
+        assert!(
+            gain < MIN_RESIDUAL_GAIN,
+            "unrelated frames claimed a gain of {gain}, which gate two must refuse"
+        );
+        assert_eq!(
+            gate_residual_gain(gain),
+            GateOutcome::Reject(GateRejection::ResidualGainTooSmall)
+        );
+    }
+
+    #[test]
+    fn when_the_winner_is_zero_the_gain_is_undefined_and_the_fingerprint_path_runs() {
+        // `docs/31` §6 `P1.09`; `docs/30` §16.3's `d_best == 0` case. The ratio is `0/0`, and
+        // "undefined" is a different answer from "no gain": a `0.0` would let the zero shift be
+        // ranked and gated like a measured movement. That is why `residual_gain` returns an
+        // `Option` and this case is routed to the fingerprints — byte-identical primary lines are the
+        // only way to say "the page really did not move".
+        assert_eq!(residual_gain(0.0, 0.0), None);
+        // The floor is `GAIN_RMSE_FLOOR` (1e-3): a residual that small is quantisation dust, not a
+        // denominator. Above it the ratio is ordinary and real.
+        assert_eq!(residual_gain(0.0, 1e-9), None);
+        assert_eq!(residual_gain(0.0, 1e-2), Some(1.0));
+
+        // The page did not move: §16.3's duplicate detection is the *only* way a zero shift can be
+        // confirmed, so it must confirm it.
+        let image = mixed_document();
+        let mut still = ScrollScript::new(&image, 900, vec![StepSpec::move_by(0)]);
+        let previous = still.take(0);
+        let current = still.take(1);
+        assert_eq!(
+            primary_digests(&previous.view()),
+            primary_digests(&current.view()),
+            "the fixture did not hand out an unchanged frame, so this case proves nothing"
+        );
+        assert_eq!(
+            zero_shift_status(&previous.view(), &current.view()),
+            Status::Confirmed { d: 0 }
+        );
+
+        // A frame that differs is *not* a confirmed zero: the fingerprints differ, so §16.3 says
+        // `None` and no canvas row is committed on this evidence. Note the second case — the same
+        // page, relit — which the byte-level fingerprint also reports as a change: that is the
+        // conservative direction (a missed zero costs a frame; a false zero costs a duplicated row).
+        let other = unrelated_document();
+        let mut other_script = ScrollScript::new(&other, 900, vec![StepSpec::move_by(0)]);
+        let different = other_script.take(0);
+        assert_eq!(
+            zero_shift_status(&previous.view(), &different.view()),
+            Status::None
+        );
+        let relit = relight(&current, 1.0, 6.0);
+        assert_eq!(
+            zero_shift_status(&previous.view(), &relit.view()),
+            Status::None
+        );
+    }
+
+    #[test]
+    fn the_gate_and_the_ranking_measure_the_same_region() {
+        // `docs/31` §6 `P1.09` REFACTOR, as an equality rather than a comment. The ratio has two
+        // inputs that are easy to get subtly wrong: which region each residual covers, and what unit
+        // the shift is in (layer 2 measures on `DOWNSAMPLE`-pixel cells). The first version of
+        // `residual_gain_at` passed full-resolution pixels into a pooled grid, and the true shift of
+        // a 120 px move came back with a gain of **0.019** — below the floor, on a page that had
+        // visibly moved. So: the gate's number for a shift and the ranking's number for that same
+        // shift are one number, for every candidate the ranking kept.
+        let image = mixed_document();
+        let mut script = ScrollScript::new(&image, 900, vec![StepSpec::move_by(120)]);
+        let previous = script.take(0);
+        let current = script.take(1);
+
+        let candidates = candidates_1d(&previous.view(), &current.view(), 120, 8);
+        let scored = score_candidates_2d(&previous.view(), &current.view(), &candidates);
+        assert!(!scored.is_empty(), "the ranking kept no candidate at all");
+        for candidate in scored.iter() {
+            assert_eq!(
+                residual_gain_at(&previous.view(), &current.view(), candidate.d),
+                Some(candidate.gain),
+                "gate two and the ranking disagree about shift {}",
+                candidate.d
+            );
+        }
     }
 }
