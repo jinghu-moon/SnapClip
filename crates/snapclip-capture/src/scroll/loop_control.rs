@@ -933,6 +933,12 @@ impl ScrollDriver {
     ) {
         if let Some(follow) = controller.take_follow() {
             self.session.set_follow(follow);
+            // §19.5's mode is a state the panel has to draw (whether "回到最新" has anything to do),
+            // and the panel cannot read the session — so the mode leaves through the same port as
+            // everything else it is told. Published on the change rather than with the step's state:
+            // a drag that happens right after a step would otherwise be invisible until the next one,
+            // and the button the user just spent would stay lit.
+            preview.publish(PreviewUpdate::Follow { follow });
         }
 
         let undos = controller.take_undo_requests();
@@ -2388,6 +2394,186 @@ mod tests {
                 Some(crate::scroll::session::Disposal::Discard)
             ),
             "cancelling means the pixels are thrown away, not exported"
+        );
+    }
+
+    // --- what the user can do to a running session (`P5.04`) ---
+
+    /// §19.5's two view gestures, through the real command port and the real loop: a drag on the
+    /// preview is the user taking over, and "back to the newest" is them handing the session back.
+    ///
+    /// §13.4 makes the difference real rather than cosmetic — a manual session asks the actuator for
+    /// nothing (`n = 0`) and learns nothing — and §30.6's row is the promise being checked here: the
+    /// flag flips, `phase()` does not, because a mode is not a phase.
+    ///
+    /// The commands go in at the **controller** and are applied by `apply_commands`, one step at a
+    /// time. That is where the ordering lives: a command is read once per step, so a mode the user set
+    /// during step *k* is in force for step *k+1*. Driving it that way rather than through a page that
+    /// fires the gesture mid-stream keeps this test about the protocol instead of about a fixture's
+    /// timing — and it is the same call the loop makes, not a re-implementation of it.
+    ///
+    /// What a pointer does with the strip's pixels is the overlay's (`P6`); what the gesture *means* is
+    /// the command. The panel cannot say it itself, which is why the command is the whole of the
+    /// session's side of §19.5.
+    #[test]
+    fn dragging_the_preview_leaves_follow_mode_and_returns_on_command() {
+        use crate::scroll::panel::ScrollPanel;
+        use crate::scroll::session::{phase, Phase};
+
+        let plan = ScrollPlan::new(Axis::Vertical, 320, 900, MemoryBudget::with_total(8 << 20));
+        let mut driver = ScrollDriver::new(&plan);
+        let controller = ScrollController::new();
+        let preview = PreviewStream::new();
+        let mut panel = ScrollPanel::new(320, 900);
+
+        assert!(
+            driver.session.follow(),
+            "a session drives the scroll until the user says otherwise"
+        );
+        assert!(!driver.session.manual());
+
+        // The drag.
+        controller.set_follow(false);
+        driver.apply_commands(&controller, &preview, Instant::now());
+
+        assert!(!driver.session.follow());
+        assert!(driver.session.manual(), "not following is what manual mode is (§13.4)");
+        assert_eq!(
+            phase(&driver.session),
+            Phase::Preparing,
+            "the mode is not a phase: nothing has been captured yet either way"
+        );
+
+        // And the panel is told in the same breath, which is what makes "back to the newest" a button
+        // rather than a decoration: the update leaves the session through the port the panel reads.
+        while let Some(update) = preview.take() {
+            panel.on_update(update);
+        }
+        assert!(!panel.follow(), "the panel learns the mode from the port, not from the session");
+        assert!(
+            panel.answers().can_return_to_latest,
+            "a session the user has taken over is one they can hand back"
+        );
+
+        // "Back to the newest": the same command with the other value.
+        controller.set_follow(true);
+        driver.apply_commands(&controller, &preview, Instant::now());
+
+        assert!(driver.session.follow(), "the automatic loop resumes");
+        assert!(!driver.session.manual());
+        let updates: Vec<_> = std::iter::from_fn(|| preview.take()).collect();
+        assert_eq!(
+            updates,
+            vec![PreviewUpdate::Follow { follow: true }],
+            "the mode change is what the panel is told, and it is the only thing this step told it"
+        );
+        for update in updates {
+            panel.on_update(update);
+        }
+        assert!(panel.follow());
+        assert!(
+            !panel.answers().can_return_to_latest,
+            "already following: there is nothing for the button to do"
+        );
+    }
+
+    /// §19.6 constraint 4: undo can be pressed as often as the user likes, and a press with nothing
+    /// behind it is a no-op rather than an underflow.
+    ///
+    /// Presses accumulate (`ScrollController::undo` is a `fetch_add`) and are consumed in one read, so
+    /// twenty presses on a three-step canvas mean three undos and seventeen presses that find nothing.
+    /// The loop `break`s on the first `false` that `ViewportState::undo_last` returns, which is what
+    /// makes "press it again" harmless instead of a second truncation.
+    ///
+    /// **This is a nail, not a red.** `apply_commands` broke on `false` when it was written for
+    /// `P3.04`, and `P1.22`'s `undoing_every_step_returns_the_canvas_to_its_initial_state` already
+    /// pins that `false` on the canvas side. What is new here is the whole path at once — press →
+    /// command → driver → canvas → **the length the preview is told** — and that last link is §19.6
+    /// constraint 3's third item, which `§19.6.1` recorded as not yet landed because there was no
+    /// preview to roll back.
+    #[test]
+    fn undo_can_be_pressed_repeatedly_and_never_underflows() {
+        use crate::scroll::panel::ScrollPanel;
+
+        let image = page(3000, 23);
+        let plan = ScrollPlan::new(Axis::Vertical, 320, 900, MemoryBudget::with_total(8 << 20));
+        let mut driver = ScrollDriver::new(&plan);
+        let controller = ScrollController::new();
+        let preview = PreviewStream::new();
+        let mut panel = ScrollPanel::new(320, 900);
+
+        // Three real steps, written the way the loop writes them.
+        let origin = viewport_at(&image, 0, 900);
+        driver.session.start(&origin);
+        for step in 1..=3u32 {
+            let frame = viewport_at(&image, step * 120, 900);
+            assert!(driver.commit(&frame, 120), "step {step} is written");
+        }
+        assert_eq!(
+            driver.session.canvas().primary_len(),
+            900 + 3 * 120,
+            "three steps of 120 rows on a 900-row origin"
+        );
+
+        // Nothing the start published is under test here.
+        while preview.take().is_some() {}
+
+        // Twenty presses on a three-step canvas.
+        for _ in 0..20 {
+            controller.undo();
+        }
+        driver.apply_commands(&controller, &preview, Instant::now());
+
+        assert_eq!(
+            driver.session.canvas().primary_len(),
+            900,
+            "three undos and seventeen presses that found nothing: the canvas is at the origin, \
+             not below it"
+        );
+        assert_eq!(
+            controller.take_undo_requests(),
+            0,
+            "the presses were consumed, not replayed"
+        );
+
+        // Constraint 3's third item: the length the panel is told rolls back with the rows, so the
+        // amount line and the box are not left describing a canvas that no longer exists.
+        let mut rolled_back = None;
+        while let Some(update) = preview.take() {
+            panel.on_update(update);
+            if let PreviewUpdate::Span { primary_len, .. } = update {
+                rolled_back = Some(primary_len);
+            }
+        }
+        assert_eq!(
+            rolled_back,
+            Some(900),
+            "the panel is told the new length, not the one the undo removed"
+        );
+        assert!(
+            panel.answers().amount.contains(" 900"),
+            "and the amount line is where it lands: {}",
+            panel.answers().amount
+        );
+
+        // More presses still change nothing, and — the part an underflow would break — the canvas is
+        // still a canvas: the next step is taken from the origin as if the undo had never happened.
+        for _ in 0..5 {
+            controller.undo();
+        }
+        driver.apply_commands(&controller, &preview, Instant::now());
+        assert_eq!(
+            driver.session.canvas().primary_len(),
+            900,
+            "a press with nothing behind it does not truncate anything"
+        );
+
+        let frame = viewport_at(&image, 120, 900);
+        assert!(driver.commit(&frame, 120), "the canvas still takes the next step");
+        assert!(
+            driver.session.canvas().primary_len() > 900,
+            "and it grew again: {}",
+            driver.session.canvas().primary_len()
         );
     }
 }

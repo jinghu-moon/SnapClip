@@ -20,20 +20,20 @@
 //!
 //! §19.3 constraint 1 says "capacity 1, newest overwrites oldest", justified by "the preview is
 //! **idempotent state**, not an event stream, so losing the intermediate states loses nothing". That
-//! justification holds for a stream of **one** kind and fails for four: `Span` (progress),
-//! `Viewport` (where the box is) and `Bands` (which rows just became readable) are three different
-//! states, and the driver produces all three on the same step. With a single slot, whichever was
-//! published last is the only one the consumer ever sees, so the panel's progress row would starve
-//! behind the box, or the box behind the pixels — a silent, permanent loss, not an intermediate
-//! state.
+//! justification holds for a stream of **one** kind and fails for five: `Span` (progress),
+//! `Viewport` (where the box is), `Follow` (whether the session is still driving) and `Bands` (which
+//! rows just became readable) are different states, and the driver produces several of them on the
+//! same step. With a single slot, whichever was published last is the only one the consumer ever sees,
+//! so the panel's progress row would starve behind the box, or the box behind the pixels — a silent,
+//! permanent loss, not an intermediate state.
 //!
-//! So the slot is per kind. The channel stays **bounded** (four slots, one per variant) and stays
+//! So the slot is per kind. The channel stays **bounded** (one slot per variant) and stays
 //! **lossy within a kind** — the newest `Span` replaces the previous unseen `Span`, which is what
 //! "latest wins" was for, and `dropped` still counts only updates a consumer never got to see.
 //!
 //! ## The one kind that is not a state
 //!
-//! `P5.01` found the limit of "latest wins": three of the four kinds are states, and `Bands` is not.
+//! `P5.01` found the limit of "latest wins": all but one of the kinds are states, and `Bands` is not.
 //! A state's newest value is the whole truth; a **delta**'s newest value is not, because the rows an
 //! earlier delta announced did not stop being readable. Replacing an unseen `Bands` therefore loses
 //! rows rather than information about rows — and it loses them for good, because the announcement is
@@ -113,12 +113,18 @@ pub(crate) enum PreviewUpdate {
     },
     /// Where the viewport box is and what the last step did (§19.4's three appearances).
     Viewport { band: u64, status: Status },
+    /// The session is following the scroll, or the user has taken it over (§19.5).
+    ///
+    /// A fourth kind rather than a field on `Viewport`, because the two change at different moments:
+    /// a drag stops the following *before* the next step moves the box, and "回到最新" resumes it
+    /// without moving the box at all. Folding it in would make each of those a change to the other.
+    Follow { follow: bool },
     /// The session is over; the box stops moving and the reason is shown (§19.4, §20.4).
     Ended { reason: StopReason },
 }
 
 impl PreviewUpdate {
-    /// Which slot this belongs in — one slot per kind, so publishing three kinds on one step cannot
+    /// Which slot this belongs in — one slot per kind, so publishing several kinds on one step cannot
     /// make them evict each other (see the module doc).
     ///
     /// A discriminant rather than a `match` at each use site: `Mailbox::push` needs "is there already
@@ -128,24 +134,26 @@ impl PreviewUpdate {
             Self::Bands { .. } => Kind::Bands,
             Self::Span { .. } => Kind::Span,
             Self::Viewport { .. } => Kind::Viewport,
+            Self::Follow { .. } => Kind::Follow,
             Self::Ended { .. } => Kind::Ended,
         }
     }
 }
 
-/// The four kinds, as a value that can be compared.
+/// The kinds, as a value that can be compared.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Bands,
     Span,
     Viewport,
+    Follow,
     Ended,
 }
 
 /// At most one unseen update per kind, oldest first.
 ///
-/// Bounded by construction: four kinds, so four entries. The `VecDeque` is not a queue that can grow
-/// — [`Self::push`] replaces rather than appends whenever its kind is already present.
+/// Bounded by construction: one entry per kind, so [`Self::push`] can never grow the `VecDeque` — it
+/// replaces rather than appends whenever its kind is already present.
 #[derive(Default)]
 struct Mailbox {
     slots: VecDeque<PreviewUpdate>,
@@ -174,7 +182,7 @@ impl Mailbox {
 
 /// What "the newest one wins" means for the one kind that is not a state.
 ///
-/// `Span`, `Viewport` and `Ended` are states: the newest one is the whole truth, which is the
+/// `Span`, `Viewport`, `Follow` and `Ended` are states: the newest one is the whole truth, which is the
 /// justification §19.3 constraint 1 gives for a single slot. `Bands` is a **delta** — it announces
 /// that rows became readable — and the newest delta is *not* the whole truth, because the rows an
 /// earlier delta announced do not stop being readable. Replacing it would tell the consumer about rows
@@ -531,12 +539,13 @@ mod tests {
         );
     }
 
-    /// The driver publishes all three of its states on the same step (`P3.09`), and the consumer has
-    /// to be able to see all three.
+    /// The driver publishes several of its states on the same step (`P3.09`, and `P5.04` added the
+    /// mode to what a drag can change between two steps), and the consumer has to be able to see all
+    /// of them.
     ///
     /// This is the test that makes the per-kind slot load-bearing rather than tidy: with one slot for
-    /// the whole channel, `dropped` would read `2` here and the panel would be missing whichever two
-    /// were published first — permanently, because a step publishes each kind once.
+    /// the whole channel, `dropped` would read high here and the panel would be missing whichever
+    /// kinds were published first — permanently, because a step publishes each kind once.
     #[test]
     fn one_step_can_publish_every_kind_without_them_evicting_each_other() {
         let stream = PreviewStream::new();
@@ -554,8 +563,12 @@ mod tests {
             rows: 10,
             scale: 1,
         });
+        stream.publish(PreviewUpdate::Follow { follow: false });
+        stream.publish(PreviewUpdate::Ended {
+            reason: StopReason::EndReached,
+        });
 
-        assert_eq!(stream.dropped(), 0, "three kinds, three slots");
+        assert_eq!(stream.dropped(), 0, "five kinds, five slots");
 
         let mut kinds = Vec::new();
         while let Some(update) = stream.take() {
@@ -563,12 +576,13 @@ mod tests {
                 PreviewUpdate::Bands { .. } => "bands",
                 PreviewUpdate::Span { .. } => "span",
                 PreviewUpdate::Viewport { .. } => "viewport",
+                PreviewUpdate::Follow { .. } => "follow",
                 PreviewUpdate::Ended { .. } => "ended",
             });
         }
         assert_eq!(
             kinds,
-            ["span", "viewport", "bands"],
+            ["span", "viewport", "bands", "follow", "ended"],
             "one of each, in the order the step produced them"
         );
     }

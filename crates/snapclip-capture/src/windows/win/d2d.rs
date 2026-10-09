@@ -64,7 +64,7 @@ use crate::geometry::{
 };
 use crate::scroll::panel::{
     CANCEL_TEXT, PANEL_LINE_HEIGHT_DIP, PANEL_MARGIN_DIP, PANEL_RADIUS_DIP, PanelLayout,
-    ScrollPanel, STOP_TEXT, UNADOPTED_RGB,
+    RETURN_TEXT, ScrollPanel, STOP_TEXT, UNADOPTED_RGB, UNDO_TEXT,
 };
 
 /// The font family used for the size label, per the tasklist (§6.3).
@@ -1393,17 +1393,41 @@ impl OverlayRenderer {
             }
         }
 
-        // Questions 6 and 7: two buttons with two different promises. They are drawn only while the
-        // session can still be stopped or cancelled — an "ended" panel offering a stop button would
-        // be answering a question nobody can ask any more.
+        // The four buttons, in reading order: the view's two actions and the session's two promises
+        // (§19.5, §20.5). They are drawn only while the session is running — an "ended" panel offering
+        // a stop button, or a "back to the newest" that nothing is following, would be answering a
+        // question nobody can ask any more.
+        //
+        // "回到最新" is dimmed while it has nothing to do. §19.5's mode is the session's and this is the
+        // state in which a press would be a no-op, so it is drawn in the grey §19.4 already uses for
+        // "there is nothing here for you" rather than hidden: a control that disappears makes the user
+        // wonder whether they are in manual mode, which is the one thing this button exists to answer.
+        //
+        // "撤销" has no such state, and that is deliberate: the panel cannot tell "the stack is empty"
+        // from "the last press was spent" (`steps` counts steps, not stack entries), and a press with
+        // nothing behind it is a defined no-op (§19.6 constraint 4, pinned by the loop's test) rather
+        // than a mistake worth warning about.
         if answers.continuing {
-            for (rect, label) in layout.buttons.iter().zip([STOP_TEXT, CANCEL_TEXT]) {
+            let spent = self.require_brush(&self.scroll_unadopted_brush, "scroll unadopted brush")?;
+            let following = panel.follow();
+            for (index, (rect, label)) in layout
+                .buttons
+                .iter()
+                .zip([RETURN_TEXT, UNDO_TEXT, STOP_TEXT, CANCEL_TEXT])
+                .enumerate()
+            {
+                let dimmed = index == 0 && following;
+                let (brush, color) = if dimmed {
+                    (&spent, &spent)
+                } else {
+                    (&outline, &text)
+                };
                 let rect = place(*rect);
                 unsafe {
                     self.d2d
-                        .DrawRectangle(&to_d2d(rect), &outline, metrics.border_width, None);
+                        .DrawRectangle(&to_d2d(rect), brush, metrics.border_width, None);
                 }
-                self.draw_panel_text(rect, label, true, &text)?;
+                self.draw_panel_text(rect, label, true, color)?;
             }
         }
 

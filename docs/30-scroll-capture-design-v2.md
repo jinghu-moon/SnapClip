@@ -3607,8 +3607,8 @@ pub(crate) struct Answers {
 | `RenderView.scroll_panel: Option<ScrollPanel>` | 模型而非预计算矩形；`render_export` 的清空列表里有 `scroll_panel: None`，所以面板**永远不进产物像素** | — |
 | `overlay/render_submit.rs` | `watch_scroll_preview(preview, cross_len, extent)` + `on_scroll_ready()`（`while let` 排空 `take()`，因为 §19.3.2 的 oldest-first 就是为"一次唤醒看全"选的） | 交接的调用者（装配根 `P6`） |
 | `overlay/window_host.rs` | `SCROLL_READY_MESSAGE => on_scroll_ready()` —— `P3.07` 定义的那个消息 id 至此才有真实消费者 | — |
-| 两个按钮（`STOP_TEXT`/`CANCEL_TEXT`） | 画出来了，且**只有 `continuous` 为真时才画**（一个已结束的会话提供"停止"是在回答没人能再问的问题） | **点击命中区 → `ScrollCommand`**：属装配根 `P6`；今天按钮会画、不可点 |
-| `回到最新` / `撤销` | — | `P5.04`（§19.5/§19.6） |
+| 四个按钮（`RETURN_TEXT`/`UNDO_TEXT`/`STOP_TEXT`/`CANCEL_TEXT`） | 画出来了，**两行两列**（上面一行是视图动作、下面一行是会话承诺，§19.5.1），且**只有 `continuous` 为真时才画**（一个已结束的会话提供"停止"是在回答没人能再问的问题）；`回到最新` 在已跟随时画成灰的（§19.4 已有的"没事可做"的灰，**不隐藏**） | **点击命中区 → `ScrollCommand`**：属装配根 `P6`；今天四个按钮都会画、都不可点 |
+| `撤回 / 撤销 / 拖动 / 两档缩放` | `P5.04`（§19.5.1，2026-10-09）：端口多了 `PreviewUpdate::Follow`（拖动与"回到最新"是会话模式且面板必须画它）、`ZoomLevel` 两档改变条带所映射的行、撤销按钮按的是 `P1.22` 的同一处 `undo_last` | 命中区（`P6`） |
 
 ### 19.5 交互能力（逐条回答用户要求明确的项）
 
@@ -3617,11 +3617,31 @@ pub(crate) struct Answers {
 | 显示实时拼接结果 | **是** | 缩略条带的增量更新（§19.3） |
 | 显示当前 viewport | **是** | 视口框（§19.4） |
 | 显示进度 | **是** | `primary_len` + 步数 + "累计未采用步数"；**不显示百分比**（总长未知，百分比无意义） |
-| 允许缩放 | **是，两档**：适配面板 / 2× 局部放大 | 不做连续缩放（那需要通用分块渲染，已在 §19.2 否决） |
-| 允许拖动/滚动查看 | **是** | 拖动预览条 → 窗口位置改变；**拖动后进入"手动查看"模式**，自动跟随停止；提供"回到最新"按钮 |
+| 允许缩放 | **是，两档**：适配面板 / 2× 局部放大 | 不做连续缩放（那需要通用分块渲染，已在 §19.2 否决）。**已落地（`P5.04`）**：`ZoomLevel::{Fit, Double}` + `ALL: [Self; 2]` + `next()`；两档改的是**条带所映射的行**（`visible_rows`）而不是一个画在绘制处的比例，理由是 §19.4 的框高是"视口对屏上的行数"的函数；见 §19.5.1 |
+| 允许拖动/滚动查看 | **是** | 拖动预览条 → 窗口位置改变；**拖动后进入"手动查看"模式**，自动跟随停止；提供"回到最新"按钮。**已落地（`P5.04`）**：拖动 ⇒ `ScrollController::set_follow(false)`，驱动在消费它时**把模式发到端口**（`PreviewUpdate::Follow`，因为面板读不到 `ScrollSession`）；"回到最新"是**唯一**的回程；见 §19.5.1 |
 | 允许撤销 | **是**，见 19.6 | |
 | 允许结束 | **是** | "停止"按钮 = `UserStopped`，保留结果并进入导出 |
 | 允许取消 | **是** | "取消"按钮 = `UserCancelled`，**丢弃结果**（不写文件）；两者在 UI 上分开且文案不同 |
+
+### 19.5.1 落地形状（P5.04，2026-10-09）
+
+这一任务把 §19.5 的三个手势变成模型里的东西：拖动（停止跟随）、"回到最新"（恢复跟随）、两档缩放，外加 §19.6 那个唯一暴露给 UI 的撤销动作。前三项都要能被**面板画出来**，这是本节最重要的约束——面板读的是 `PreviewStream`，读不到 `ScrollSession`。
+
+**会话模式走端口（`PreviewUpdate::Follow`）**。`PreviewUpdate` 因此有了第五种 kind。它**不是** `Viewport` 上的一个字段，因为两者在不同时刻变化：拖动在下一步移动方框**之前**就停止了跟随，而"回到最新"恢复跟随**完全不动方框**（§19.4 的框高下限那一节已经说明框是三态的，与模式无关）。发在**变化时**而不是随步发：否则一步之后立刻发生的拖动要等下一步才可见，而用户刚按下的按钮会一直亮着。这个变体与其余三种一样是**状态**（最新覆盖旧的，`merge` 的兜底分支天然覆盖它）⇒ §19.3 的"latest-only 无损"对它成立；`Bands` 是唯一的例外（§19.3.3）。
+
+**两档缩放改的是映射，不是一个画在绘制处的比例**。`ZoomLevel::{Fit, Double}`；`Fit` 下条带是整块画布（`visible_rows == primary_len`、`visible_origin == 0`），`Double` 下是其中一半（`primary_len.div_ceil(2)`，`div_ceil` 而不是除法——否则奇数长度的画布最后一行到不了），窗口以当前视口为中心并夹紧在画布内（`band - visible/2`，夹到 `[0, primary_len - visible]`，保证窗口总是满的）。这样 §19.4 的框高公式**一字不改**就跟着走：框是"视口对屏上的行数"，屏上的行数减半，框就翻倍——10,000 px 的画布上从 23 DIP 变 47 DIP，这是一条可机检的差异。`Fit` 时新旧公式逐字等价，所以 §19.4.1 已落的那四条框断言不受影响。
+
+**撤销按的是同一处 `undo_last`（退出条件 ③）**。`ScrollController::undo()` 是计数器（§27.2 的"`undo` 是计数器不是标志"：连按五次是五步），驱动在 `apply_commands` 里把它换成 `ViewportState::undo_last` 的连续调用，`Ok(false)`（栈空）即停。空按是**已定义的空操作**——面板分不清"栈空"与"上次按过了"，所以"撤销"按钮**没有**暗态，这是刻意的：一个会因为内部状态而变灰的按钮，在用户按下它的那一刻给出的反馈是"我按错了"，而真相是"没什么可撤的了"，两者对用户是同一件事。
+
+**四处按钮两行两列——对 §19.7 ASCII 图的有意偏离**。`PanelLayout.buttons` 是 `[Rect; 4]`，上面一行 `[回到最新] [撤销]`（视图动作）、下面一行 `[停止] [取消]`（会话的两个承诺，§20.5 说它们的语义不同）。偏离的理由是**几何**：面板宽 248 DIP、内边距 12 DIP ⇒ 一行四个按钮每个只有 52 DIP，"回到最新"四个汉字会被裁字。两行还顺手把两类东西分开了——上面一行是"看哪里"，下面一行是"要不要结果"。顺序沿用 §19.7 图里的 `回到最新 → 撤销 → 停止 → 取消`。
+
+**"回到最新"在已跟随时是灰的，不是隐藏的**。用它来表示"这里没你的事"是 §19.4 已有的灰（`UNADOPTED`），而隐藏一个控件会让用户怀疑自己是否处在手动模式——回答那个问题恰好是这个按钮存在的原因。
+
+**RED 与门禁红了两次**。RED 是 20 个编译错误（`error: could not compile snapclip-capture (lib test) due to 20 previous errors`：`no method named follow`、`no field can_return_to_latest`、`no variant named Follow`、`cannot find type ZoomLevel`）——编译失败必须排在运行时失败之前，否则其中一个会盖住其余（`P4.05` 的同一课）。第二次红是**真实的**：新文案 `回到最新` 的三个汉字不在内嵌 CJK 子集里，`the_embedded_subset_covers_the_strings_the_overlay_draws` 报 `the embedded subset has no glyph for '回' (U+56DE), drawn by "回到最新"`，重建后子集从 239 个 codepoint / 35.9 KB 涨到 **242 个 / 36.5 KB**。这条门禁的价值正在于此：新增文案把字体落下的方式不是屏幕上缺字，而是门禁变红。
+
+**实测**：`dragging_the_preview_leaves_follow_mode_and_returns_on_command`（拖动后 `session.manual()` 且 `phase()` 不变；"回到最新"后端口恰好收到一条 `Follow { follow: true }`）、`undo_can_be_pressed_repeatedly_and_never_underflows`（连按 20 次回到初始 `primary_len`、多按是空操作；**预览长度确实跟着回退**——撤销后最后一条 `Span.primary_len` 是 900，这正是 §19.6 约束 3 第三项从"尚未落地"变成可执行的那一环）、`zooming_has_exactly_two_levels`（`ALL` 恰好两个、`next()` 在两值间循环、框高 23 → 47）。门禁：`scroll::panel` 5 passed / `scroll::loop_control` 31 passed / d2d 20 passed，全绿。
+
+**仍然不在**：命中区（哪个矩形在光标下 ⇒ 哪个 `ScrollCommand`）属装配根 `P6`——与 `note_diagnostic` 的调用者同一归属，`ZoomLevel` 与它的三个访问器上的 `#[allow(dead_code)]` 说的就是这件事（`session.rs` 的模块级 allow 是同一形态的先例，这里取更窄的逐项 allow），路由到位时撤掉。
 
 ### 19.6 撤销：`旧像素优先`带来的一个真实净增量
 
@@ -3672,13 +3692,13 @@ impl RecoveredImage {
 
 退出条件 ③（连续撤销到第 0 步后与初始状态一致）的可执行形式 = `undoing_every_step_returns_the_canvas_to_its_initial_state`：10 步全撤后 `primary_len == viewport`、只剩一条条带、`rows(0, viewport)` 与初始帧逐字节相等、coverage 恰为 `0..viewport`、八条不变量成立，**再撤一次返回 `false` 且什么都不改**（UI 不会报告一次什么都没撤的撤销）。"撤销是真的"另由 `undoing_a_prepend_removes_the_rows_it_added` 证明：撤 prepend 后画布与 prepend **之前**逐字节相同（而不是"行数对了"）。
 
-**尚未落地**：预览长度（§19.3 的 `PreviewStream`，`P2.06`+）随撤销一起回退——今天没有预览，所以约束 3 只有两项可执行；UI 的"撤销上一步"按钮与连按去抖属 §19.7 的覆盖层。
+**尚未落地**：~~预览长度（§19.3 的 `PreviewStream`，`P2.06`+）随撤销一起回退~~ —— **已落地（`P5.04`，2026-10-09）**：约束 3 的三项（`CoverageMap.span_end`、`primary_len`、预览长度）今天都是可执行的，第三项由 `undo_can_be_pressed_repeatedly_and_never_underflows` 断言"撤销后最后一条 `Span.primary_len` 是回退后的长度"；UI 的"撤销上一步"按钮也已存在（§19.5.1），**连按去抖刻意不做**——`ScrollController::undo()` 是计数器而不是标志（§27.2），连按五次就是五步，去抖会把"按五次"变成"按一次"。
 
 ### 19.7 UI 的布局与"不做什么"
 
 **布局**（右侧面板，由覆盖层的 D2D 绘制；宽度取 `gpui-kit` 设计令牌的**同一数值**，但**不引入该依赖**——`snapclip-capture` 禁止依赖 `gpui`/`gpui-kit`，见 §19.3）：
 
-**已落地（`P5.03`，2026-10-09，见 §19.4.1）**：面板、状态行、尺寸行、缩略条带、视口框与**两个**按钮（`[停止] [取消]`）已经画得出来；上面 ASCII 图里的 `[回到最新] [撤销]` 两个按钮属 `P5.04`，两个按钮的**点击命中区**属装配根 `P6`。布局常数落在 `crates/snapclip-capture/src/scroll/panel.rs` 的 `PanelLayout`（面板宽 248 DIP、内边距 12 DIP、条带高 220 DIP、行高 22 DIP、圆角 8 DIP、外边距 16 DIP），DIP→px 的换算在绘制处（`scale = dpi / 96`），所以模型里的每个数字都是**布局意图**而不是某一台显示器的像素。
+**已落地（`P5.03`，2026-10-09，见 §19.4.1；`P5.04` 补上四个按钮，见 §19.5.1）**：面板、状态行、尺寸行、缩略条带、视口框与**四个**按钮（`[回到最新] [撤销]` / `[停止] [取消]`）已经画得出来；四个按钮的**点击命中区**属装配根 `P6`。布局常数落在 `crates/snapclip-capture/src/scroll/panel.rs` 的 `PanelLayout`（面板宽 248 DIP、内边距 12 DIP、条带高 220 DIP、行高 22 DIP、按钮行高 26 DIP、圆角 8 DIP、外边距 16 DIP），DIP→px 的换算在绘制处（`scale = dpi / 96`），所以模型里的每个数字都是**布局意图**而不是某一台显示器的像素。
 
 ```
 ┌──────────────────────────────┐
@@ -3689,10 +3709,13 @@ impl RecoveredImage {
 │ │  ┌────┐ ← 视口框          │ │
 │ │  └────┘                  │ │
 │ └──────────────────────────┘ │
-│ [回到最新] [撤销] [停止] [取消] │  ← 动作（问题 6、7）
+│ [回到最新] [撤销]             │  ← 视图动作（`P5.04` 落成两行两列，§19.5.1）
+│ [停止] [取消]                 │  ← 会话承诺（问题 6、7）
 │ ⓘ 页面内容正在变化             │  ← 非阻塞提示（问题 8）
 └──────────────────────────────┘
 ```
+
+上面这张图把按钮画成两组是 `P5.04` 的形态（§19.5.1 说了为什么一行四个会把"回到最新"裁字）；原来的图是一行 `[回到最新] [撤销] [停止] [取消]`。
 
 **不做什么**：
 
@@ -5786,7 +5809,7 @@ fn rows_match(actual, expected, sigma) -> bool
 | `band_height` 推导 | `shift` 从 0 到 `extent` | `overlap ≥ extent/4` 恒成立 | L1 | 已可执行（`P1.18`，`shift ∈ [−extent, extent]`） |
 | 双向扩展 | 先下滚再上滚 | 正确 `Prepend`；不产生 gap/重复 | L1 | 已可执行（`P1.19`） |
 | `Contained` | 小幅回滚完全落在已覆盖区 | 识别为 `Contained`；不写重复内容 | L1 | 已可执行（`P1.19`，用例先证明两帧字节不同） |
-| 撤销一步 | 提交 10 步后 `undo` | 回退到第 9 步状态；`primary_len` 回退 | L1 | 已可执行（`P1.22`） |
+| 撤销一步 | 提交 10 步后 `undo` | 回退到第 9 步状态；`primary_len` 回退 | L1 | 已可执行（`P1.22`）；**预览长度也已回退**（`P5.04`：连按 20 次后最后一条 `Span.primary_len` 是 900，这就是 §19.6 约束 3 的第三项；多按 5 次仍是 900，见 §19.5.1） |
 | 条带换出 | 预算注入成 1 个条带 | 峰值不随长度增长；恢复后逐字节正确 | L1 | **Memory**；已可执行（`P1.20`，10 条条带 + 1 条预算：9 条落盘、读完仍逐字节相等） |
 | 上限三层 | `MAX_LONG_IMAGE_PIXELS` 注入 1/10 | `Partial` 且**是合法 PNG** | L1+L2 | **Memory**；三层已可执行（`P1.21`：注入 1000 行 ⇒ 裁到 1000、丢 20 行、前缀逐字节等于文档、阈值改变不影响任何像素；**PNG 解码回读已由 `P4.02` 落地、`P4.05` 补上"被标注为中止的导出仍然关闭容器"**：`row_band_png::tests::finish_with_abort_writes_a_complete_iend_and_the_file_decodes` 对三种 `AbortReason` 断言 `png` 解码回读得到声明的尺寸与逐字节相同的像素） |
 | 流式导出 | 30,000 px 高 | 严格递增校验；乱序返回错误 | L2 | **Stitch Latency**；已可执行（`P4.02` 写入检查、`P4.05` 在真实编码器上钉住：`row_band_png::tests::a_skipped_row_range_is_an_error` 同时覆盖**跳过**（写 0-1 后要求写 4 ⇒ `OutOfOrder{first_row: 4, expected: 2}`）与**回退**（要求写 1 ⇒ `OutOfOrder{first_row: 1, expected: 2}`），并证明被拒的写入没有留下痕迹） |
@@ -5818,7 +5841,8 @@ fn rows_match(actual, expected, sigma) -> bool
 | 视口框三态 | 构造 `Confirmed`/`Uncertain`/`Ended` | 外观与 §19.4 一致 | L2 | — （`P5.03`：`ViewportAppearance`，虚线 + 灰 + 角标计数；"不是红"断言为 `r <= g && r <= b`；见 §19.4.1） |
 | 视口框下限 | 100,000 px 画布 | 框高 ≥ 4 DIP（始终可见） | L2 | — （`P5.03`：条带 220 DIP / 视口 1080 行时 `10_000` ⇒ 23 DIP、`100_000` ⇒ 比值 2 被抬到下限 **4**；另断言框两端始终落在条带内） |
 | 预览窗口化 | 100,000 px 画布 | **不生成整图缩略**；只生成可见窗口 | L1 | **Memory**（`P5.02` 实测：64 px 宽、`scale = 4`、窗口 640 行 ⇒ 10,000 行与 100,000 行两块画布的缩略内存**相等**，各 10,240 B；整图缩略会是 1,600,000 B，见 §19.2.1） |
-| 拖动后停止跟随 | 拖动 ⇒ `set_follow(false)`；"回到最新" ⇒ `set_follow(true)` | 进入手动模式（`n = 0`：不注入、不学习）；`follow()`/`manual()` 随之翻转，`phase()` 不变（模式不是相位） | L1 | — |
+| 拖动后停止跟随 | 拖动 ⇒ `set_follow(false)`；"回到最新" ⇒ `set_follow(true)` | 进入手动模式（`n = 0`：不注入、不学习）；`follow()`/`manual()` 随之翻转，`phase()` 不变（模式不是相位） | L1 | — （`P5.04`：`dragging_the_preview_leaves_follow_mode_and_returns_on_command` 走的是驱动自己的 `apply_commands`，并断言模式**已发到端口**（面板读不到 `ScrollSession`）；同一用例钉住 `phase(&session) == Phase::Preparing`。见 §19.5.1） |
+| 两档缩放 | 100,000 px 画布 + `toggle_zoom` | 恰好两档；`Double` 下条带只映射一半行 ⇒ 框高翻倍 | L1 | — （`P5.04`：`ZoomLevel::ALL` 恰两个、`next()` 在两值间循环；10,000 px 画布上框高 `Fit` **23** DIP → `Double` **47** DIP） |
 | 预览不阻塞采集 | mock 让 UI 消费极慢 | 采集步数不受影响；`dropped > 0` | L2 | — |
 | 预览不阻塞采集（**端口侧已可执行，`P3.08`**） | 消费者**持有锁**（比"消费慢"更强的形式：它根本不消费） | `publish` 立即返回、更新被丢弃而不是排队（`dropped == 1`、`take() == None`） | L1 | — |
 | 命令不可丢（**已可执行，`P3.08`**） | 10^5 次预览 `publish` 与 `stop`/`cancel`/`undo`×3/`set_follow` 并发 | 命令全部生效且**第一个停止承诺赢**；`dropped > 0` 与命令无关 | L1 | — |

@@ -77,7 +77,10 @@ pub(crate) const PANEL_RADIUS_DIP: i32 = 8;
 /// Height of a button.
 pub(crate) const BUTTON_HEIGHT_DIP: i32 = 26;
 
-/// Gap between the two buttons.
+/// The gap between two buttons — horizontally within a row, and vertically between the two rows.
+///
+/// One constant for both, because it is one spacing decision: the buttons are a 2×2 block and the
+/// block reads as a block only while the two gaps agree.
 pub(crate) const BUTTON_GAP_DIP: i32 = 8;
 
 /// Where the panel's pieces go, in DIP, relative to the panel's own top-left corner (docs/30 §19.7).
@@ -96,11 +99,19 @@ pub(crate) struct PanelLayout {
     pub(crate) amount: Rect,
     /// The thumbnail strip the viewport box is placed in — questions 2 and 4.
     pub(crate) strip: Rect,
-    /// The buttons, left to right: [`STOP_TEXT`] then [`CANCEL_TEXT`].
+    /// The buttons, in reading order: [`RETURN_TEXT`], [`UNDO_TEXT`], [`STOP_TEXT`],
+    /// [`CANCEL_TEXT`].
+    ///
+    /// Four buttons on **two rows of two** rather than §19.7's single row of four. The two rows are
+    /// the two kinds of thing a press can do — the first row acts on the view (which part of the
+    /// canvas the user is looking at), the second on the session's promise about the pixels (§20.5) —
+    /// and 248 DIP of width puts four labels in one row on top of each other: "回到最新" alone is four
+    /// characters, and the drawing layer would clip it rather than shrink it (`P5.04`'s `DEV` entry
+    /// records the deviation from the ASCII sketch; the order is the sketch's).
     ///
     /// Two buttons rather than one with a mode, because §20.5 makes two different promises and a
     /// control that changes meaning is how a user loses work.
-    pub(crate) buttons: [Rect; 2],
+    pub(crate) buttons: [Rect; 4],
     /// Question 8's line, below the buttons as §19.7 draws it.
     ///
     /// Reserved whether or not there is anything to say: a panel that grows when a diagnostic
@@ -119,16 +130,23 @@ impl PanelLayout {
         let strip = Rect::new(left, strip_top, right, strip_top + PANEL_STRIP_HEIGHT_DIP);
         let buttons_top = strip.bottom + PANEL_GAP_DIP;
         let button_width = (right - left - BUTTON_GAP_DIP) / 2;
-        let buttons = [
-            Rect::new(left, buttons_top, left + button_width, buttons_top + BUTTON_HEIGHT_DIP),
+        let second_row_top = buttons_top + BUTTON_HEIGHT_DIP + BUTTON_GAP_DIP;
+        let column = |row_top: i32, column: i32| {
+            let column_left = left + column * (button_width + BUTTON_GAP_DIP);
             Rect::new(
-                left + button_width + BUTTON_GAP_DIP,
-                buttons_top,
-                right,
-                buttons_top + BUTTON_HEIGHT_DIP,
-            ),
+                column_left,
+                row_top,
+                column_left + button_width,
+                row_top + BUTTON_HEIGHT_DIP,
+            )
+        };
+        let buttons = [
+            column(buttons_top, 0),
+            column(buttons_top, 1),
+            column(second_row_top, 0),
+            column(second_row_top, 1),
         ];
-        let trouble_top = buttons_top + BUTTON_HEIGHT_DIP + PANEL_GAP_DIP;
+        let trouble_top = second_row_top + BUTTON_HEIGHT_DIP + PANEL_GAP_DIP;
         let trouble = Rect::new(left, trouble_top, right, trouble_top + PANEL_LINE_HEIGHT_DIP);
         Self {
             panel: Rect::new(0, 0, PANEL_WIDTH_DIP, trouble.bottom + PANEL_PADDING_DIP),
@@ -167,6 +185,18 @@ pub(crate) const STOP_TEXT: &str = "停止";
 /// Question 7's button: throw the rows away. A different promise from [`STOP_TEXT`] (§20.5), so it
 /// gets a different word and its own hit region rather than one button with two meanings.
 pub(crate) const CANCEL_TEXT: &str = "取消";
+
+/// §19.5's gesture, as a button: hand the session back to the automatic loop.
+///
+/// It is the **inverse** of a drag, which is why it needs a word: a drag is the user taking over
+/// (§19.5: "自动跟随停止"), and this is the only way back — pressing it clears the manual mode and
+/// nothing else does. Both it and [`UNDO_TEXT`] act on the view rather than on the session's promise,
+/// which is why they are a row of their own (`PanelLayout::buttons`).
+pub(crate) const RETURN_TEXT: &str = "回到最新";
+
+/// §19.6's "undo one step", pressed once per step. §19.6 constraint 4 keeps the UI at "the last step"
+/// rather than a step picker, so one press is one undo and pressing it again is the next one.
+pub(crate) const UNDO_TEXT: &str = "撤销";
 
 // ── The panel's palette ──────────────────────────────────────────────────────────
 
@@ -225,14 +255,56 @@ pub(crate) struct ViewportAppearance {
     pub(crate) badge: Option<u32>,
 }
 
-// ── The eight answers ────────────────────────────────────────────────────────────
+// ── §19.5's two levels ───────────────────────────────────────────────────────────
 
-/// §19.1's eight questions, answered.
+/// How much of the canvas the strip shows.
 ///
-/// Eight named fields rather than a list, because a list would let a caller answer six of them and
-/// pass for complete. The questions are not interchangeable: 6 and 7 differ in what they promise
-/// about the pixels (§20.5), and 4 and 8 are a judgement about the last step versus a report about
-/// the session.
+/// §19.5 allows two levels and no more, and §19.2 is why: fitting the canvas and showing half of it at
+/// twice the scale are two mappings, while anything in between needs general tiled rendering of an
+/// arbitrarily long image — which is exactly what §19.2 refused.
+///
+/// The level is therefore **not** a scale factor applied to the drawing: it changes which canvas rows
+/// the strip is a picture of, and the viewport box's height follows from that (§19.4's box is the
+/// viewport against the rows on screen, so halving the rows doubles the box).
+///
+/// `P5.04` landed the level, its effect on the drawing and its two-value vocabulary. What it did **not**
+/// land is the press: which rectangle the cursor was in when the button was released is the overlay's
+/// (§19.7's hit regions, `P6`), the same way `ScrollPanel::note_diagnostic`'s caller is. The `allow`s
+/// below say exactly that and come off when the routing arrives.
+#[allow(dead_code)] // The zoom button's press routing is the overlay's (`P6`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ZoomLevel {
+    /// The whole canvas in the strip.
+    Fit,
+    /// Half of it, so twice the pixels per row.
+    Double,
+}
+
+#[allow(dead_code)] // The zoom button's press routing is the overlay's (`P6`).
+impl ZoomLevel {
+    /// Every level, in the order the button cycles them. A third level would have to appear here and
+    /// in `next` together — which is what makes "no more than two" checkable rather than a promise.
+    pub(crate) const ALL: [Self; 2] = [Self::Fit, Self::Double];
+
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::Fit => Self::Double,
+            Self::Double => Self::Fit,
+        }
+    }
+}
+
+// ── The answers the panel draws ──────────────────────────────────────────────────
+
+/// §19.1's eight questions, answered — plus the one §19.5's "back to the newest" needs.
+///
+/// Named fields rather than a list, because a list would let a caller answer six of them and pass for
+/// complete. The questions are not interchangeable: 6 and 7 differ in what they promise about the
+/// pixels (§20.5), and 4 and 8 are a judgement about the last step versus a report about the session.
+///
+/// The ninth field is not a ninth question: §19.5's return button is an inverse of a gesture, not
+/// something the session is asked, and it is here because the panel's controls and the panel's text
+/// have to come from one place to stay in step.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Answers {
     /// 1 — what the session is doing, in words the user can act on.
@@ -251,6 +323,11 @@ pub(crate) struct Answers {
     pub(crate) can_cancel: bool,
     /// 8 — the most recent anomaly, as a sentence. `None` while nothing has been reported.
     pub(crate) trouble: Option<String>,
+    /// Whether "back to the newest" would do anything (§19.5): true exactly while the user has taken
+    /// the session over. A control with nothing to do is one the user has to press to read, and this
+    /// one is the only way back from manual mode — so it has to be visibly available *and* visibly
+    /// spent.
+    pub(crate) can_return_to_latest: bool,
 }
 
 /// What the panel shows while a session runs.
@@ -271,6 +348,12 @@ pub(crate) struct ScrollPanel {
     status: Option<Status>,
     ended: Option<StopReason>,
     trouble: Option<ScrollDiagnosticCode>,
+    /// Which window of the canvas the strip shows (§19.5's two levels).
+    zoom: ZoomLevel,
+    /// Whether the session is still driving the scroll. The panel's own copy of §19.5's mode: it
+    /// arrives through the port like everything else, because the panel cannot read the session and a
+    /// second reader would be a second thing to keep in step.
+    follow: bool,
 }
 
 impl ScrollPanel {
@@ -295,6 +378,57 @@ impl ScrollPanel {
             status: None,
             ended: None,
             trouble: None,
+            zoom: ZoomLevel::Fit,
+            follow: true,
+        }
+    }
+
+    /// Which window of the canvas the strip shows (§19.5).
+    #[allow(dead_code)] // The zoom button's press routing is the overlay's (`P6`); see `ZoomLevel`.
+    pub(crate) fn zoom(&self) -> ZoomLevel {
+        self.zoom
+    }
+
+    #[allow(dead_code)] // The zoom button's press routing is the overlay's (`P6`); see `ZoomLevel`.
+    pub(crate) fn set_zoom(&mut self, zoom: ZoomLevel) {
+        self.zoom = zoom;
+    }
+
+    /// §19.5's zoom control: one button, two levels, pressed again to go back.
+    #[allow(dead_code)] // The zoom button's press routing is the overlay's (`P6`); see `ZoomLevel`.
+    pub(crate) fn toggle_zoom(&mut self) {
+        self.zoom = self.zoom.next();
+    }
+
+    /// Whether the session is still following the scroll, as last told by the port (§19.5's mode).
+    pub(crate) fn follow(&self) -> bool {
+        self.follow
+    }
+
+    /// How many canvas rows the strip is a picture of at the current level.
+    ///
+    /// `double` is `div_ceil`, not a division: the last row of an odd-length canvas has to be
+    /// reachable, and a window that stops short of it would leave the newest rows undrawable.
+    fn visible_rows(&self) -> u64 {
+        match self.zoom {
+            ZoomLevel::Fit => self.primary_len,
+            ZoomLevel::Double => self.primary_len.div_ceil(2),
+        }
+    }
+
+    /// The first canvas row the strip starts at.
+    ///
+    /// Fitted, that is row 0 — the whole canvas is on screen. At 2× the window follows the viewport
+    /// and is centred on it, clamped so the window is always full: a window hanging off either end
+    /// would draw blank rows that are not blank in the canvas, which is a worse lie than a box that
+    /// stops dead centre.
+    fn visible_origin(&self, visible: u64) -> u64 {
+        match self.zoom {
+            ZoomLevel::Fit => 0,
+            ZoomLevel::Double => {
+                let last = self.primary_len.saturating_sub(visible);
+                self.band.saturating_sub(visible / 2).min(last)
+            }
         }
     }
 
@@ -315,6 +449,10 @@ impl ScrollPanel {
                 self.status = Some(status);
             }
             PreviewUpdate::Ended { reason } => self.ended = Some(reason),
+            // §19.5's mode is not one of the eight questions either, but it *is* a state — the newest
+            // one wins, the way `Span` and `Viewport` do — and the panel cannot derive it: the flag
+            // lives in the session, which the panel is not allowed to read.
+            PreviewUpdate::Follow { follow } => self.follow = follow,
             // Where the pixels are readable is not one of the eight questions — §19.1's list is what
             // the *user* is being told. Who does care is the overlay wiring, which uses this update
             // to decide when to refresh the windowed thumbnail (`P5.02`).
@@ -348,6 +486,7 @@ impl ScrollPanel {
             can_stop: continuing,
             can_cancel: continuing,
             trouble: self.trouble.map(trouble_text).map(str::to_owned),
+            can_return_to_latest: !self.follow,
         }
     }
 
@@ -396,14 +535,22 @@ impl ScrollPanel {
     }
 
     /// Where the viewport box goes inside `strip`, in the same DIP space as `strip`.
+    ///
+    /// The box is the viewport placed inside **the window the strip is showing** (§19.5's level), so
+    /// both its height and its travel are relative to that window rather than to the whole canvas.
+    /// Fitted, the window is the whole canvas and this is the ratio it always was; at 2× the window is
+    /// half as long, so the same viewport is twice as tall on screen and travels twice as far through
+    /// a strip that covers half the canvas.
     pub(crate) fn viewport_box(&self, strip: Rect) -> Rect {
-        let height = viewport_box_height(self.primary_len, self.extent, strip.height());
+        let visible = self.visible_rows();
+        let origin = self.visible_origin(visible);
+        let height = viewport_box_height(visible, self.extent, strip.height());
         let travel = (strip.height() - height).max(0);
         // The denominators are the *last* band rather than the current extent, so the box reaches the
         // bottom exactly when the session has reached the end; `.max(1)` keeps a canvas that fits
         // from dividing by zero.
-        let last = self.primary_len.saturating_sub(self.extent).max(1);
-        let at = self.band.min(last);
+        let last = visible.saturating_sub(self.extent).max(1);
+        let at = self.band.saturating_sub(origin).min(last);
         let top = strip.top + (i64::from(travel) * at as i64 / last as i64) as i32;
         Rect::new(strip.left, top, strip.right, top + height)
     }
@@ -468,7 +615,7 @@ fn trouble_text(code: ScrollDiagnosticCode) -> &'static str {
 ///
 /// `win/d2d/tests.rs::overlay_drawn_strings()` extends its list with this, and that one list feeds
 /// both the coverage gate and `subfont/drawn-text.txt`. The producers are *called* rather than
-/// copied: the twelve literals below are the panel's own constants, the amount line is a computed
+/// copied: the label constants below are the panel's own, the amount line is a computed
 /// example, and the reason and diagnostic vocabularies are enumerated from the enums themselves, so
 /// a new [`StopReason`] or [`ScrollDiagnosticCode`] cannot leave the font behind.
 #[cfg(test)]
@@ -495,6 +642,8 @@ pub(crate) fn drawn_strings() -> Vec<String> {
         UNADOPTED_TEXT.to_owned(),
         STOP_TEXT.to_owned(),
         CANCEL_TEXT.to_owned(),
+        RETURN_TEXT.to_owned(),
+        UNDO_TEXT.to_owned(),
     ];
 
     // The amount line is `format!`ed, so it is asked for as it will be drawn: the digits are ASCII
@@ -746,6 +895,8 @@ mod tests {
             layout.strip,
             layout.buttons[0],
             layout.buttons[1],
+            layout.buttons[2],
+            layout.buttons[3],
             layout.trouble,
         ];
         for piece in pieces {
@@ -757,16 +908,99 @@ mod tests {
             assert!(!piece.is_empty(), "and none of them is empty: {piece:?}");
         }
 
-        // Read top to bottom, and then the two buttons in one row: adjacent pieces never overlap,
-        // which is what stops the amount line from being painted over by the strip.
+        // Read top to bottom, and then the buttons row by row: adjacent pieces never overlap, which is
+        // what stops the amount line from being painted over by the strip.
         let stacked = [layout.status, layout.amount, layout.strip];
         assert!(stacked.windows(2).all(|pair| pair[0].bottom < pair[1].top));
+        assert!(
+            (0..4).all(|button| layout.buttons[button].height() == layout.buttons[0].height()),
+            "one height for all four: they are one control block"
+        );
+        // Row-major, two per row: the view's two actions above the session's two promises (§19.5,
+        // §20.5), which is the order §19.7's single row lists them in.
         assert_eq!(layout.buttons[0].top, layout.buttons[1].top);
-        assert_eq!(layout.buttons[0].height(), layout.buttons[1].height());
+        assert_eq!(layout.buttons[2].top, layout.buttons[3].top);
         assert!(layout.buttons[0].right < layout.buttons[1].left);
+        assert!(layout.buttons[2].right < layout.buttons[3].left);
+        assert!(layout.buttons[1].bottom <= layout.buttons[2].top, "the rows do not overlap");
+        assert!(layout.buttons[0].left == layout.buttons[2].left, "the columns line up");
+        assert!(
+            layout.buttons[0].right == layout.buttons[2].right
+                && layout.buttons[1].left == layout.buttons[3].left,
+            "both rows are the same two columns"
+        );
+        assert!(
+            layout.strip.bottom < layout.buttons[0].top,
+            "and the button block starts below the strip"
+        );
+        assert!(
+            layout.buttons[2].bottom < layout.trouble.top,
+            "with the trouble line below it"
+        );
 
         // And the strip is the one that answers question 2, so it has to be the strip height.
         assert_eq!(layout.strip.width(), PANEL_WIDTH_DIP - 2 * PANEL_PADDING_DIP);
         assert_eq!(layout.strip.height(), PANEL_STRIP_HEIGHT_DIP);
+    }
+
+    /// §19.5 gives zoom **exactly two levels**, and the reason it is two rather than a slider is
+    /// §19.2's ruling against general tiled rendering: "the whole canvas fits the strip" and "half of
+    /// it at twice the scale" are two mappings, and a continuous zoom would be a third thing to
+    /// render.
+    ///
+    /// A level is not a label on a button: it changes the box, because the box's height is the
+    /// viewport against **what the strip shows**, and doubling the scale halves that.
+    #[test]
+    fn zooming_has_exactly_two_levels() {
+        // Two, mechanically: `ALL` is the set of variants, so a third level cannot be added without
+        // disagreeing with `next` and with this line.
+        assert_eq!(ZoomLevel::ALL.len(), 2);
+        assert_eq!(ZoomLevel::Fit.next(), ZoomLevel::Double);
+        assert_eq!(
+            ZoomLevel::Double.next(),
+            ZoomLevel::Fit,
+            "and then back: there is no third stop to get stuck on"
+        );
+
+        let mut panel = ScrollPanel::new(CROSS, EXTENT);
+        assert_eq!(
+            panel.zoom(),
+            ZoomLevel::Fit,
+            "a session starts by fitting the whole canvas into the strip"
+        );
+        panel.toggle_zoom();
+        assert_eq!(panel.zoom(), ZoomLevel::Double);
+        panel.toggle_zoom();
+        assert_eq!(panel.zoom(), ZoomLevel::Fit);
+
+        // The two levels are two mappings. At 10,000 rows the fitted box is the ratio (23 DIP) and the
+        // doubled one is 47: half the rows on screen, so twice the pixels per row.
+        panel.on_update(PreviewUpdate::Span {
+            primary_len: 10_000,
+            steps: 0,
+            discarded: 0,
+        });
+        panel.on_update(PreviewUpdate::Viewport {
+            band: 5_000,
+            status: Status::Confirmed { d: STEP as i32 },
+        });
+        let fitted = panel.viewport_box(strip());
+        panel.set_zoom(ZoomLevel::Double);
+        let doubled = panel.viewport_box(strip());
+
+        assert_eq!(
+            fitted.height(),
+            23,
+            "220 · 1080 / 10,000 — the fitted level shows every row, so the ratio is the height"
+        );
+        assert_eq!(
+            doubled.height(),
+            47,
+            "half the rows are shown, so the same viewport is twice as tall: 220 · 1080 / 5,000"
+        );
+        assert!(
+            strip().contains_rect(fitted) && strip().contains_rect(doubled),
+            "zooming moves the box and must not push it out of the strip: {fitted:?} {doubled:?}"
+        );
     }
 }
