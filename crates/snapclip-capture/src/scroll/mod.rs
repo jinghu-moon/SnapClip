@@ -1,5 +1,5 @@
-//! The scroll-capture subsystem (`docs/30` §28 lists its eleven files: ten production files and
-//! the test-only `testkit.rs`).
+//! The scroll-capture subsystem (`docs/30` §28 lists its files: eleven production files and the
+//! test-only `testkit.rs`).
 //!
 //! What is here today:
 //!
@@ -17,6 +17,9 @@
 //! * `session` (`P3.04`) — the aggregate root: the axis, the canvas, the step counter, the streak,
 //!   the stop promise, and the command port (§27.2).
 //! * `ports` (`P3.09`) — the two platform seams, `FrameSource` and `ScrollActuator` (§27.1).
+//! * `export` (`P4.01`) — the third seam, and the one the **shell** fills rather than the platform:
+//!   rows go to an encoder a band at a time, and the height is a precondition of the first row
+//!   rather than something discovered while writing (§17.7).
 //! * `testkit` (`P1.01`) — the synthetic fixture every later `P1` task is judged against.
 //! * `acceptance` (`P1.24`) — `E-ACC-1` as a gate: the `§29.3` scan over the whole funnel, judged by
 //!   byte equality with the generator's truth. Test-only, but it is the reason G1 is checkable.
@@ -35,6 +38,12 @@
 pub(crate) mod canvas;
 
 pub(crate) mod displacement;
+
+/// `export` (`P4.01`) — the seam the shell fills: rows go to an encoder one band at a time, and the
+/// height is a precondition of the first row rather than something discovered while writing
+/// (§17.7). It sits beside `ports` rather than inside it because `ports` is the **platform** seam
+/// (Windows implements it) while this one is the **output format** seam (`DEV-2`).
+pub(crate) mod export;
 
 pub(crate) mod loop_control;
 

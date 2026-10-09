@@ -42,7 +42,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::scroll::canvas::{MemoryBudget, RecoveredImage};
-use crate::scroll::loop_control::{ScrollDriver, RENDER_TICK_MS};
+use crate::scroll::loop_control::ScrollDriver;
 use crate::scroll::observation::{Axis, Observation};
 use crate::scroll::ports::{FrameSource, ScrollActuator};
 use crate::scroll::preview::PreviewStream;
@@ -666,6 +666,9 @@ impl Drop for ScrollRuntime {
 mod tests {
     use super::*;
     use crate::geometry::Rect;
+    // Only the latency test needs this, and it is a test-only constant, so it is imported here
+    // rather than at the top of the file where the non-test build would report it as unused.
+    use crate::scroll::loop_control::RENDER_TICK_MS;
     use crate::scroll::ports::{
         FrameError, InjectOutcome, InjectPath, InjectStatus, Poll,
     };

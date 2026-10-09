@@ -3062,6 +3062,44 @@ pub struct ImageMeta { pub width: u32, pub height: u32, pub stride: usize, pub f
 
 **F-10 的修正（`P0.04` 退出条件 ③ 的实测答案）**：13 行 + 4K 三行**全部** `decode_ok = true`，**且全部在 `png::Limits::default()`（64 MiB）下解码成功**——包括 **101.7 MiB 的产物**与 **3840×30000（解码后 460 MB）** 的图像。读 `png` 0.18.1 源码可知原因：`Limits::bytes` 由 `reserve_bytes()` 逐次**递减**，它是**解码器内部**分配（行缓冲、zlib/fdeflate 工作区）的预算，**不是产物大小、也不是解码后图像大小的上限**（解出的帧写进调用方提供的缓冲区；`read_info()` 里的 `LimitsExceeded` 来自 `checked_raw_row_length()`/`output_buffer_size()` 的**溢出检查**，与字节预算无关）。⇒ §29.5 的"产物 > 64 MiB **必须**提高解码上限，否则会假失败"**被实测否定**；正确的表述是"显式提高解码上限是**零代价的防御**（我们确实会产出 >64 MiB 的产物），但**不要依赖它会失败**，也不要把它写成测试的前置条件"。此偏离记在 `docs/31` 的 `DEV-7`。
 
+#### 17.7.2 落地的形状（`P4.01`，2026-10-09）
+
+**落点**：`crates/snapclip-capture/src/scroll/export.rs`（**新建**，`scroll/mod.rs` 注册为 `pub(crate) mod export;`）。它**刻意不放进 `§11` 的 `scroll/ports.rs`**：那个文件的职责是"**平台**接缝"（`FrameSource`/`ScrollActuator`，由 Windows 实现），而导出接缝由 **shell** 实现（`P4.02`）——混在一起就得改写它的模块 doc，并让"`ports` = 平台"这条可 `grep` 的界线消失。本文件是 `docs/31` §15.1 的 13 个新文件之外的**第 14 个**（`DEV-59`）。
+
+```rust
+// 形状（`crates/snapclip-capture/src/scroll/export.rs`）
+pub(crate) struct ImageMeta { width: u64, height: u64, length: u64, axis: Axis, dpr: u32 }
+pub(crate) enum AbortReason { Cancelled, MemoryLimit, ExportBudget }
+pub(crate) struct Artifact { bytes: Vec<u8>, rows: u64 }
+pub(crate) enum ExportError {
+    TooLarge { width: u64, height: u64 },
+    OutOfOrder { first_row: u64, expected: u64 },
+    BeyondHeight { first_row: u64, height: u64 },
+    RowLength { expected: u64, got: u64 },
+    Sink(String),
+}
+pub trait RowBandSink: Send {
+    fn begin(&mut self, meta: &ImageMeta) -> Result<Box<dyn RowBandWriter>, ExportError>;
+}
+pub trait RowBandWriter {
+    fn write_rows(&mut self, first_row: u64, rows: &[u8]) -> Result<(), ExportError>;
+    fn finish(self: Box<Self>, outcome: Option<AbortReason>) -> Result<Artifact, ExportError>;
+}
+```
+
+**四处落地裁决**：
+
+1. **尺寸是 `u64`，不是 `u32`**。`P4.04` 要求"构造一个 > `u32::MAX` 的尺寸并拒绝它"；若 `ImageMeta` 的字段是 `u32`，那条用例**只能测到一个编译错误**，而它要测的是运行期的拒绝路径。`u64` 同时与本仓库既有的尺寸域一致（`snapclip-history/src/image.rs:26-35` 已经这样做）。
+2. **`Artifact` 装 `{ bytes, rows }`**。`rows` 是**写入者自己的计数**（只有它知道），`bytes` 让 `P4.02` 能把产物解码回读。`rows < meta.height` 恰好发生在 `finish(Some(_))` 时，差值就是 UI 要说的"N / M 行"。
+3. **`ExportError` 的五个变体各对应一条要机械检查的规则**：`TooLarge` ← `P4.04`、`OutOfOrder`/`BeyondHeight`/`RowLength` ← `P4.05`、`Sink(String)` 是"实现失败"（满盘、句柄已关）的诚实形式。本文件与 `scroll/ports.rs` 同样带 `#![allow(dead_code)]` **并附理由**：`Sink` 的生产者是 shell 的 `P4.02`，三个几何检查要到 `P4.04`/`P4.05` 才从测试双实现搬进真实 sink——把词汇缩到今天被构造的那几个，会让后面每一步都变成破坏性改动（`DEV-60`）。
+4. **丢掉早先版本的 `stride`/`format` 字段**。画布按构造是**紧凑 BGRA8**（observation 层已经用 `ObservationError::NotPacked` 拒绝非紧凑帧），两个字段是同一件事的两种说法；行长按 `width * 4` 推导。这一点写在 trait 的模块 doc 里，因为它是"接口比初稿窄"的唯一原因。
+
+**`AbortReason` 不是 `session::StopReason`**（这条区分是本节最容易搞错的地方）：`UserStopped` 的会话会导出它**拥有的全部行**，产出的是**一张完整文件的部分画布**；`AbortReason` 的三个值说的是"**导出本身**被截断了"，它才需要 `finish(Some(_))` 仍然写 IEND。
+
+**为什么 `P4.01` 的三个用例是契约测试而不是 PNG 测试**：`png` 不是也不该是这个 crate 的依赖（本节第一段），所以"产物能解码回读"在本 crate 内**无法**对着真 PNG 断言（`DEV-30`）。本任务断言的是**契约**——形状在 `begin` 固定、乱序被拒绝、中止后容器仍然收尾——由一个 `#[cfg(test)]` 的自描述双实现（`SNCB` + 三个 `u64` + 像素行 + `DNEI`，自带 `decode`）承载；真正的 PNG 可解码性归 `P4.02`/`P4.05`。
+
+**`P4.01` 的实测（2026-10-09）**：RED = `error: could not compile `snapclip-capture` (lib test) due to 16 previous errors`（全部 `E0422`/`E0425`/`E0433`，即 trait、三个类型与双实现都不存在——正是"trait 未定义"）→ GREEN = **3 passed / 0 failed**；`cargo tree -p snapclip-capture -e normal` **无 `png` 行**；`cargo test -p snapclip-capture --lib -- --test-threads=1` = **546 passed / 0 failed / 19 ignored**（90.39s，`+3` 即本任务）。
+
 ### 17.8 水平轴
 
 **不写第二套算法**（N6）。§6 的参考实现用**三个 `const fn`**（`primary_delta`/`cross_delta`/`primary_extent`，`types.rs:11-32`）把两轴参数化，全套算法按主轴写一遍，**只有像素搬运分叉**。V2 采用同样做法，并把 §3 的 `Axis` 定义为：
@@ -5107,8 +5145,12 @@ crates/snapclip-capture/src/scroll/
 ├── canvas.rs           # RecoveredImage + CoverageMap + commit + 不变量（§17.1–17.4）
 ├── bands.rs            # BandStore + MemoryBudget + 换出文件（§17.5/§22.3）
 ├── loop_control.rs     # ScrollDriver：注入→等待→估计→提交→预览 的闭环（§3.6/§9.4）
+├── ports.rs            # 平台接缝：FrameSource / ScrollActuator（P3.09 落点，见 §27.1.1）
+├── export.rs           # 导出接缝：RowBandSink / RowBandWriter（P4.01 落点，见 §17.7.2）
 └── preview.rs          # PreviewStream + PreviewUpdate + 缩略派生（§19.3）
 ```
+
+**这份清单是计划，不是现状**（`P4.01` 回填时核对）：`bands.rs` 与 `target.rs` **从未成为独立文件**（`BandStore`/`MemoryBudget`/`SpillRef` 落在 `canvas.rs:158/301/370`，全仓不存在 `ScrollTarget` 类型），而 `ports.rs`/`export.rs` 是执行时新增的。**权威是门禁**：`pwsh tools/check-dependency-direction.ps1` 会打印 `checked crates/snapclip-capture/src/scroll: N files scanned for platform references`，`P4.01` 落地后该数字是 **13**（10 个生产文件 + test-only 的 `testkit.rs`/`acceptance.rs`/`perf_probe.rs`）。
 
 **新增（test-only，不进生产二进制）**：
 
@@ -5118,7 +5160,7 @@ crates/snapclip-capture/src/scroll/testkit.rs   # 合成夹具生成器 + 夹具
 
 §29.3 要求"**夹具必须自证**"：先用最简单的行指纹直通估计器、断言每步 `d` 与脚本给定的一致，再让真实漏斗跑同一批帧。这个自证必须构造 `Observation` 并读取 `pub(crate)` 的 `Displacement`，所以它与 `estimate`（§16）必须同 crate；放在 `scroll/` 下还使 §28.4 的门禁对它同样生效——**`testkit.rs` 也不得引用 `crate::windows`**。它不是生产代码：`#[cfg(test)]` 保证不进二进制，`cargo tree` 与依赖门禁不受影响。
 
-**上述 10 个生产文件与 1 个 test-only 文件（共 11 个）全部是"新增"**，因为今天滚动截图是 **0 行**（§5 已确证：全仓无 `Scroll`/`ScrollAxis`/`ScrollTarget`/`TileStore`/`ScrollSink` 类型）。`orb.rs` 之所以独立成文件而非并入 `displacement.rs`：它是**唯一的第二意见路径**，调用频率低（平均每步 < 0.2 次）但代码量最大（约 300–400 行），且它**可以被单文件删除**——若 `E-ACC-1` 显示第二意见从不改变结论，删掉 `orb.rs` 与其调用点即可，不必动 `displacement.rs`。
+**上述文件（本清单的原始版本数到 10 个生产文件 + `testkit.rs`）全部是"新增"**，因为今天滚动截图是 **0 行**（§5 已确证：全仓无 `Scroll`/`ScrollAxis`/`ScrollTarget`/`TileStore`/`ScrollSink` 类型）。`orb.rs` 之所以独立成文件而非并入 `displacement.rs`：它是**唯一的第二意见路径**，调用频率低（平均每步 < 0.2 次）但代码量最大（约 300–400 行），且它**可以被单文件删除**——若 `E-ACC-1` 显示第二意见从不改变结论，删掉 `orb.rs` 与其调用点即可，不必动 `displacement.rs`。
 
 **平台侧新增（必须放在 `windows/` 下）**：
 
@@ -5127,7 +5169,7 @@ crates/snapclip-capture/src/windows/scroll_source.rs     # FrameSource 的 Windo
 crates/snapclip-capture/src/windows/scroll_actuator.rs   # SendInput / PostMessageW / ChildWindowFromPointEx（§24.6）
 ```
 
-**为什么这两条平台实现与 `scroll/` 纯逻辑分开**：`scroll/` 的**全部 10 个生产文件与 test-only 的 `testkit.rs`** 都**不得引用 `crate::windows`**——这条约束使 §30 的绝大部分测试**不需要真实桌面**（G9）。它必须由门禁保证（§28.4）。
+**为什么这两条平台实现与 `scroll/` 纯逻辑分开**：`scroll/` 下的**全部文件**（生产与 test-only 没有例外，含 `testkit.rs`）都**不得引用 `crate::windows`**——这条约束使 §30 的绝大部分测试**不需要真实桌面**（G9）。它必须由门禁保证（§28.4）。
 
 **改动（不新增文件）**：
 
