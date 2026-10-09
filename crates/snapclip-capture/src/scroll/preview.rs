@@ -31,6 +31,26 @@
 //! **lossy within a kind** — the newest `Span` replaces the previous unseen `Span`, which is what
 //! "latest wins" was for, and `dropped` still counts only updates a consumer never got to see.
 //!
+//! ## The one kind that is not a state
+//!
+//! `P5.01` found the limit of "latest wins": three of the four kinds are states, and `Bands` is not.
+//! A state's newest value is the whole truth; a **delta**'s newest value is not, because the rows an
+//! earlier delta announced did not stop being readable. Replacing an unseen `Bands` therefore loses
+//! rows rather than information about rows — and it loses them for good, because the announcement is
+//! what a consumer derives a thumbnail from.
+//!
+//! So the unseen `Bands` is widened instead ([`merge`]), and only that kind is. This is a decision
+//! about what "latest" means for a delta, not a rate limit: the rate limit is still the producer's
+//! ([`PreviewCadence`]), and it is why the producer also has to coalesce its own suppressed window
+//! (`ScrollDriver::publish_bands`).
+//!
+//! | traffic | mechanism | may wait? | may be lost? |
+//! |---|---|---|---|
+//! | `stop`/`cancel`/`undo`/`shutdown` | sticky bit (`ScrollController`, `session.rs`) | no | **no** |
+//! | `set_follow` | capacity-1 slot behind a `Mutex` | yes (nanoseconds) | no |
+//! | preview updates | **one slot per kind** behind a `try_lock` | **no** | yes, and `dropped` says so |
+//! | ... of which `Bands` | one slot, **widened** while unseen | no | only across `scale` |
+//!
 //! ## What this port deliberately does not do
 //!
 //! * **It does not wake anyone.** The consumer is the overlay thread's Win32 message loop, and the
@@ -42,12 +62,16 @@
 //!   readable; the pixels are read through the band store's read-only handle. That keeps bulk memory
 //!   out of a `Mutex` and keeps §17.5's bands from being copied.
 //! * **It does not rate-limit.** §19.3's 10 Hz ceiling belongs to the producer (`P5.01`): a port
-//!   that dropped updates on a timer would be making a policy decision inside a data structure.
+//!   that dropped updates on a timer would be making a policy decision inside a data structure. The
+//!   limit is [`PreviewCadence`], and the producer consults it before it calls [`PreviewStream`].
 //!
 //! ## Not here yet
 //!
-//! * `PreviewSink` (§27.1 lists it as a seam trait). Its first consumer is the driver's preview
-//!   publishing in `P5.01`; a trait with no implementor and no test double is dead code today.
+//! * `PreviewSink` (§27.1 lists it as a seam trait). `P5.01` is where it would have been used and it
+//!   is still not here: the driver's only publisher is `PreviewStream`, and a real `PreviewStream` is
+//!   cheap to construct and drain in a test, so a trait over it would have one implementor and no
+//!   double. §27.1 lists it as a boundary type; the boundary it names is already crossed by
+//!   `PreviewUpdate`, which is the type that has to stay small and pixel-free.
 //! * The windowed thumbnail derivation (`scale`, §19.2/§19.3) — `P5.02`.
 
 #![allow(dead_code)] // First producer is the driver (`P5.01`); `P3.08` lands the port itself.
@@ -55,6 +79,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::scroll::displacement::Status;
 use crate::scroll::session::StopReason;
@@ -122,7 +147,7 @@ impl Mailbox {
         let kind = update.kind();
         match self.slots.iter_mut().find(|slot| slot.kind() == kind) {
             Some(slot) => {
-                *slot = update;
+                *slot = merge(*slot, update);
                 true
             }
             None => {
@@ -134,6 +159,50 @@ impl Mailbox {
 
     fn pop(&mut self) -> Option<PreviewUpdate> {
         self.slots.pop_front()
+    }
+}
+
+/// What "the newest one wins" means for the one kind that is not a state.
+///
+/// `Span`, `Viewport` and `Ended` are states: the newest one is the whole truth, which is the
+/// justification §19.3 constraint 1 gives for a single slot. `Bands` is a **delta** — it announces
+/// that rows became readable — and the newest delta is *not* the whole truth, because the rows an
+/// earlier delta announced do not stop being readable. Replacing it would tell the consumer about rows
+/// 1980..2520 and never about 0..1980, permanently: a thumbnail is derived from an announcement, and a
+/// lost announcement is a row nobody will ever derive.
+///
+/// So the unseen `Bands` is **widened** to cover both rather than replaced. Widening is the union
+/// because the announced set is a prefix of the canvas: the driver announces the origin viewport and
+/// from then on only extends the end (or resets it to the whole canvas after a prepend), so two
+/// announcements can only overlap or touch.
+///
+/// Two different `scale`s cannot be expressed as one announcement, so the newer one wins and the push
+/// is counted as a supersession — a loss that is visible in `dropped` rather than silent. Nothing
+/// publishes more than one scale today (`scale` is 1 everywhere until `P5.02` derives thumbnails); the
+/// case is handled rather than assumed away because assuming it away is how it would go unnoticed.
+fn merge(previous: PreviewUpdate, update: PreviewUpdate) -> PreviewUpdate {
+    match (previous, update) {
+        (
+            PreviewUpdate::Bands {
+                first_row: a,
+                rows: a_rows,
+                scale: a_scale,
+            },
+            PreviewUpdate::Bands {
+                first_row: b,
+                rows: b_rows,
+                scale: b_scale,
+            },
+        ) if a_scale == b_scale => {
+            let first_row = a.min(b);
+            let end = (a + u64::from(a_rows)).max(b + u64::from(b_rows));
+            PreviewUpdate::Bands {
+                first_row,
+                rows: (end - first_row).min(u32::MAX as u64) as u32,
+                scale: a_scale,
+            }
+        }
+        (_, update) => update,
     }
 }
 
@@ -197,11 +266,111 @@ impl PreviewStream {
     }
 }
 
+/// §19.3 constraint 4's ceiling, as a **starting value rather than a measurement**.
+///
+/// The number is derived from the requirement, not from a benchmark: the preview is for a human
+/// watching a page scroll, and §19.3 says the eye does not need a finer grain than this. It is marked
+/// calibratable on purpose — `E-PERF-4` (§23.1) is the experiment that decides between 5, 10, 20 and
+/// 30 Hz, and a constant that can be calibrated has to live where a calibration can reach it. So the
+/// thing a calibration changes is *this* line, which is why the rate is spelled in hertz the way the
+/// parameter table spells it rather than as a pre-divided millisecond count.
+pub(crate) const PREVIEW_HZ: u32 = 10;
+
+/// The same ceiling as the interval the cadence actually compares against.
+///
+/// Derived rather than written twice: two constants that have to agree is two constants that can
+/// disagree, and this pair would disagree silently — a `PREVIEW_HZ` of 20 with an interval of 100 ms
+/// looks like a 20 Hz limit and behaves like a 10 Hz one.
+pub(crate) const PREVIEW_INTERVAL: Duration = Duration::from_millis(1_000 / PREVIEW_HZ as u64);
+
+/// The producer's rate limit: at most one published update per `interval` (§19.3 constraint 4).
+///
+/// It lives here rather than inside the port because §19.3.1 裁决 4 puts the limit on the *producer*
+/// — "a port that dropped updates on a timer would be making a policy decision inside a data
+/// structure" — and the producer is the only thing that knows how much work it just created for the
+/// consumer.
+///
+/// The clock is a parameter for the same reason `Settle`'s is: a rate limit tested against the wall
+/// clock is a flaky test, and one that cannot be tested is a claim rather than a mechanism.
+pub(crate) struct PreviewCadence {
+    interval: Duration,
+    last: Option<Instant>,
+}
+
+impl PreviewCadence {
+    pub(crate) fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            last: None,
+        }
+    }
+
+    pub(crate) fn interval(&self) -> Duration {
+        self.interval
+    }
+
+    /// Whether an update may go out at `now`. Stamps the window when it answers yes.
+    ///
+    /// The first call is always allowed: before it there is nothing that could have been suppressed,
+    /// and the consumer has never been told anything. A clock that went backwards reads as "not yet"
+    /// rather than as a panic — `Instant::duration_since` saturates, and the settle rule above relies
+    /// on the same behaviour.
+    pub(crate) fn allow(&mut self, now: Instant) -> bool {
+        match self.last {
+            Some(last) if now.duration_since(last) < self.interval => false,
+            _ => {
+                self.last = Some(now);
+                true
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    /// §19.3 constraint 4: the ceiling is 10 Hz, and it is a ceiling on **updates published**, not on
+    /// steps taken (F-08 — the preview must not be the most expensive consumer).
+    ///
+    /// The clock is a parameter and the steps are synthetic, so this is arithmetic rather than a race:
+    /// a hundred steps 5 ms apart span 495 ms, and 10 Hz over 495 ms is four intervals plus the one
+    /// that opens the window. A cadence that let every step through would answer 100 here.
+    #[test]
+    fn updates_are_capped_at_ten_hertz() {
+        // §19.3 constraint 4 names the rate, and the parameter table names the constant. If either is
+        // recalibrated, this is the line that says the document has to be recalibrated with it.
+        assert_eq!(PREVIEW_HZ, 10, "§19.3 constraint 4's starting value");
+        assert_eq!(
+            PREVIEW_INTERVAL.as_millis(),
+            100,
+            "…and the interval it implies"
+        );
+
+        let mut cadence = PreviewCadence::new(PREVIEW_INTERVAL);
+        let start = Instant::now();
+        let mut allowed = 0u32;
+        for step in 0..100u64 {
+            let now = start + Duration::from_millis(step * 5);
+            if cadence.allow(now) {
+                allowed += 1;
+            }
+        }
+
+        let duration = Duration::from_millis(99 * 5);
+        let ceiling = 1 + duration.as_millis() / PREVIEW_INTERVAL.as_millis();
+        assert!(
+            u128::from(allowed) <= ceiling,
+            "the preview may not be updated more often than {PREVIEW_INTERVAL:?}: \
+             {allowed} updates over {duration:?}"
+        );
+        assert_eq!(
+            allowed, 5,
+            "the window opens at 0, 100, 200, 300 and 400 ms"
+        );
+    }
 
     /// The state channel is allowed to lose updates, but the loss has to be **visible** (G12).
     ///

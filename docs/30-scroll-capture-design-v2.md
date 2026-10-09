@@ -3442,7 +3442,7 @@ enum PreviewUpdate {
 3. **派生 `Debug, Clone, Copy, PartialEq`，没有 `Eq`**（`Status` 没有 `Eq`，这是传导的，不是选择）。`Copy` 是**承重**的：§19.3 约束 2 的"不携带像素"由 `an_update_cannot_be_carrying_pixels()` 断言 `size_of::<PreviewUpdate>() <= 32` 机械保证——任何一个变体加上缓冲（`Vec`、切片、装箱条带）都会破界，作者会被迫回来读本节。
 4. **`dropped` 只在"覆盖掉一个还没被取走的更新"时递增**，空槽位不算丢。G12 要的是"用户少看到了多少次"，不是"`publish` 被调了多少次"；用例把这个口径钉住：100 次 `publish` ⇒ `dropped() == 99`，然后取走、再 `publish` 一次 ⇒ `dropped` **不增**。
 
-**约束 4（10 Hz 上限）刻意不在这个端口里**：限流属于生产者（`P5.01` 的驱动投递）。一个按定时器丢更新的数据结构是在数据结构内部做策略决定，而 §19.3 已经把它标为**可校准**（`E-PERF-4`）——可校准的常数必须待在一个能被校准的地方。
+**约束 4（10 Hz 上限）刻意不在这个端口里**：限流属于生产者（`P5.01` 的驱动投递）。一个按定时器丢更新的数据结构是在数据结构内部做策略决定，而 §19.3 已经把它标为**可校准**（`E-PERF-4`）——可校准的常数必须待在一个能被校准的地方。**已落地（`P5.01`，2026-10-09）**：`preview.rs` 的 `PREVIEW_HZ`/`PREVIEW_INTERVAL` 与 `PreviewCadence`、`loop_control.rs` 的 `publish_step`。执行时发现约束 1 的"latest-only 无损"对 `Bands` **不成立**（`Bands` 是**增量**）⇒ 端口多了 `merge`，见 §19.3.3。
 
 **今天刻意不落地的三样**：`PreviewSink`（§27.1 的 seam trait；没有实现者也没有测试替身 ⇒ 死代码，首个消费者是 `P5.01`）、`wake: Condvar`（唤醒是 `SCROLL_READY_MESSAGE`，见 §27.2.1 裁决 5）、缩略派生本身（`scale` 字段先落地，派生属 `P5.02`）。
 
@@ -3475,6 +3475,40 @@ impl Mailbox {
 **新增两条用例把新性质钉住**：`one_step_can_publish_every_kind_without_them_evicting_each_other`（三种 kind 连发 ⇒ `dropped() == 0`，drain 顺序 `["span", "viewport", "bands"]`）与 `within_a_kind_the_newest_update_still_replaces_the_previous_one`。`P3.08` 的两条既有用例**未改**且仍然通过（100 次 `Span` ⇒ `dropped() == 99`、取走后 `None`、空槽位不算丢）——这正是"修掉跨 kind 丢失、不动 kind 内语义"的机械证明。
 
 **闭环集成测试的一条夹具结论（同批实测）**：合成页必须在**整个高度上非周期**。`TestImage::from_structures(w, h, seed, band_height, structures)` 的文档周期是 `band_height`；用 `band_height = 240` 会让位移 480 与 720 在搜索窗内**并列完美匹配**（两者 `zncc2d` 都是 `1.0`），而 `CANDIDATE_LIMIT = 8` 的候选集只会留一个 ⇒ 此时循环**拒绝这一步是正确的**，用例却会红。所以集成测试取 `band_height = height`（`Structure::NoiseBlocks { cell: 8 }` 的哈希按 `y / cell` 变化 ⇒ 整个高度上无重复）。
+
+#### 19.3.3 落地的形状：生产者侧的限流与增量的合并（`P5.01`，2026-10-09）
+
+§19.3.1 裁决 4 把限流判给生产者（"限流属于生产者（`P5.01` 的驱动投递）"），本节是那句裁决的执行记录。执行时发现 §19.3 的论证有一个**尚未被检验的前提**：约束 1 的"latest-only 无损"对三种**状态**成立，对 `Bands` 不成立。
+
+**两处真实缺陷（`P3.09` 起就潜伏，本任务才暴露）**：
+
+1. **`Bands` 是增量，而端口是 latest-wins**。`P3.09` 的"每类一个槽位"修掉了**跨 kind** 的永久丢失，但 kind 内仍是"新的取代旧的"——而"哪些行变成可读了"是**增量**：一段被覆盖的 `Bands` 是**永久没有被宣告的行**。`P5.02` 的消费者按 announcement 派生缩略图，会立刻撞上它。
+2. **没有任何速率上限**。驱动每步发布三条（`Span`/`Viewport`/`Bands`），三步的用例就产生九条；§19.3 约束 4 要的是 10 Hz。
+
+**两个机制、两个窗口，缺一不可**：端口的 `merge` 覆盖"**消费者还没取走**"的窗口；驱动的 `announced_rows` 游标覆盖"**生产者自己抑制掉**"的窗口。只做前者，被闸门抑制掉的那次 `Bands` 仍然丢失（`publish_step` 干脆不调用）；只做后者，消费者取走得比生产者慢时覆盖仍然会丢。
+
+**落地的形状**（`crates/snapclip-capture/src/scroll/preview.rs` 与 `loop_control.rs`）：
+
+| 位置 | 形状 | 理由 |
+|---|---|---|
+| `preview.rs` | `PREVIEW_HZ: u32 = 10` + `PREVIEW_INTERVAL: Duration = Duration::from_millis(1_000 / PREVIEW_HZ as u64)` | 参数表的名字是 `PREVIEW_HZ`，而 cadence 要的是间隔。**派生而不是写两遍**：两个必须一致的常数就是两个能不一致的常数，而这个不一致是静默的——`PREVIEW_HZ = 20` 配 `interval = 100 ms` 看起来像 20 Hz，行为是 10 Hz |
+| `preview.rs` | `PreviewCadence { interval, last: Option<Instant> }` + `allow(&mut self, now: Instant) -> bool` | 时钟是**参数**，与 `Settle` 同一理由（对着墙钟测的限流是 flaky 测试，而不可测的限流是声称不是机制）。首次调用必允许；时钟倒退靠 `duration_since` 饱和读作"还不到"而不是 panic |
+| `preview.rs` | `Mailbox::push` 的 `*slot = update` 改为 `*slot = merge(*slot, update)` | `Bands` 且 `scale` 相同 ⇒ 取**并集**区间；其余（含 `scale` 不同）⇒ 返回 `update`，旧的那条算被覆盖（`dropped` 可见，不是静默丢失） |
+| `loop_control.rs` | `ScrollDriver` 新增 `announced_rows: u64` + `cadence: PreviewCadence` | 前者是"预览还没被告知的第一个画布行"，后者是"生产者自己的，不是端口的" |
+| `loop_control.rs` | `publish_bands` 发布**未宣告的跨度** `[announced_rows, primary_len)`，不是这次的增量 | 这是合并规则的全部。prepend 把游标重置为 0（所有行都换了偏移）；画布缩小时**夹紧**而不是回绕 |
+| `loop_control.rs` | `publish_state` = `publish_bands` + `publish_span` + `publish_viewport`；`publish_step` = 过闸门的那一个；`commit` **不再发布**（去掉 `preview` 参数） | "哪些行可读了"是**画布**的性质而不是**这次写入**的性质——这正是旧代码在 `Contained`/`Skipped` 分支下什么都不发的原因，也是游标能取代它的原因 |
+
+**三处"绕过闸门"的裁决与理由**：① **首帧后的首次发布**——面板此前从未被告知任何事，没有可抑制的重复；② **`finish` 的收尾**——终止状态不是被限流的状态，否则面板的最终长度会陈旧至多一个间隔，而那正是用户停下来要读的数字；③ **刻意不重发 `Viewport`**——停止不会移动方框，用 `Status::None` 重发会把一个已确认的方框画成未确认的。
+
+**一个被测错的断言，值得逐字记录**：限流用例的第一版数的是"drain 看到的 `Span` 条数"并断言 2，实测 1。**`left: 1` 是端口对的**：初始 `Span` 被最终 `Span` 取代，而 `Span` 是状态 ⇒ 幸存的那条携带全部真相。**数 drain 到的更新无法区分"生产者被抑制"与"端口覆盖了未被取走的更新"——端口在两种情况都会做后一件事。** 限流真正移除的是**发布次数**，而 `dropped` 是端口对"消费者从未看到的更新"的计数。用例因此改为把 60 s 间隔与 `Duration::ZERO` 在这个数上对比：前者按构造抑制每一次循环内发布，后者一次都不抑制，两个数字都不依赖机器速度。
+
+**RED 三处（顺序 = 编译失败在前，否则它会盖住运行时的那个，`P4.05` 的同一课）**：① `error[E0425]: cannot find value PREVIEW_INTERVAL in this scope` ×3 + `error[E0433]: cannot find type PreviewCadence in this scope`；② `panicked at loop_control.rs:2076: assertion left == right failed: the announcements have to tile the canvas, and this one starts late: [(1980, 2520)]  left: 1980  right: 0`（三步发了三条 `Bands`，只有最后一条幸存）；③ `error[E0599]: no method named with_preview_interval found for struct ScrollDriver`。
+
+**两条钉子与两条新用例**：`a_rare_update_still_tells_the_panel_about_every_row`（断言 `Bands` 的并集**无缝无叠地铺满** `[0, primary_len)`——写成并集而不是条数，所以它会在第一个缺口处失败并点出那段区间）、`a_rate_limited_preview_publishes_less_and_still_ends_correctly`、以及 `publishing_never_blocks_on_a_consumer` 与 `an_update_cannot_be_carrying_pixels` 作为退出条件 ①/③ 的既有见证。**实测**：`preview::` 8 passed / 0 failed；`scroll::loop_control` 28 passed / 0 failed / 1 ignored；capture lib 串行 **555 passed / 0 failed / 20 ignored**。
+
+**并行陷阱（R-16/R-21 同类，本节登记为一次复现）**：`cargo test -p snapclip-capture --lib scroll::` **不带 `--test-threads=1`** 会假红三条——`mem_probe` 的全局分配器被并发分配污染，两条 `session` 拆解用例看到彼此在 `%TEMP%` 的换出目录（`the canvas' spill directory outlived the session`）。串行后全部消失。
+
+**偏离**：`PreviewSink`（§27.1 的 seam trait）**仍然不落地**。§19.3.1 末句写"首个消费者是 `P5.01`"，而 `P5.01` 到了：驱动的唯一发布者是 `PreviewStream`，而 `PreviewStream` 本身就能被测试廉价构造并 drain（既有七条用例就是这么做）⇒ 该 trait 会只有一个实现者、零测试替身 = 死抽象。§27.1 把它列为 `pub` 边界类型，但那个边界今天已经由 `PreviewUpdate` 跨过，而 `PreviewUpdate` 才是"必须保持小且不含像素"的那个类型。
 
 ### 19.4 视口框与三种状态外观
 
@@ -4225,7 +4259,7 @@ impl Scratch {
 | Scroll Response | P50 ≤ 30 ms，P95 ≤ 60 ms | **推导** | P95 ≤ 80 ms | 推导：绘制节流是 `RENDER_TICK_MS = 15`（§5 确证）；一次注入 + 一次稳定性等待至少 2 个 tick。**这是"用户不会觉得卡"的下界**，须由 `E-PERF-1` 确认可达成 |
 | Stitch Latency | P50 ≤ 8 ms，P95 ≤ 20 ms | **实测（2026-10-09，§23.3.2）：目标未达成**——`l123` 的 P50 = **67.1 / 113.0 / 254.7 ms**（1080p/1440p/4K，即目标的 **8.4× / 14.1× / 31.8×**），P95 = 75.2 / 128.5 / 285.0 ms（目标 3.8× / 6.4× / 14.3×，通过阈值 P95 ≤ 30 ms 亦未过）；连"只跑到第 2 层"的最便宜可决断组合（`l12`）也是 35.1 / 63.8 / 140.9 ms | P95 ≤ 30 ms | 瓶颈**分布在三层**（4K 占比：第 1 层 35.4%、第 2 层 19.8%、第 3 层 47.3%），不是单一热点；`§23.3.1` 的 6.78 ms 是**1 字节/像素、单帧**合成帧上的数，而今天的观测是 **BGRA 双帧**（1080p 每步 16.6 MB）⇒ **原型数字不可当作生产下界**（`§23.3.2` 结论 2/3） |
 | UI 主线程最大同步工作（覆盖层线程） | ≤ 4 ms | **推导** | ≤ 8 ms | 推导：16.7 ms 帧预算的一半；§5 已确证今天 overlay 是**每帧整面重绘**，滚动会话不得把它推过预算 |
-| Preview 更新延迟 | P50 ≤ 40 ms | **未取得（原因）**：`E-PERF-4` 未执行——预览流（`P2`）尚未落地，`E-PERF-1` 的装置里没有预览路径 | P95 ≤ 100 ms | 与 10 Hz 更新上限一致（§19.3）：100 ms 是更新的周期本身 |
+| Preview 更新延迟 | P50 ≤ 40 ms | **未取得（原因已更新）**：`E-PERF-4` 未执行。预览**流**本身已落地（`P3.08`/`P3.09` 的端口、`P5.01` 的生产者限流），但本行量的是"**发布 → 面板画完**"，它需要真实消费者（`P5.03` 的视口框 / `P5.05` 的绘制回读）；`E-PERF-1` 的装置里没有预览路径 | P95 ≤ 100 ms | 与 10 Hz 更新上限一致（§19.3）：100 ms 是更新的周期本身 |
 | Cancel latency | P50 ≤ 60 ms，**Max ≤ 400 ms** | **实测（2026-10-09，§23.3.3）：达标**——真桌面 4 次试验 **max = 44 ms**（400 ms 目标的 11.0%）、**p50 = 41 ms**（60 ms 目标的 68.3%）；两种触发形态分别 max = **0 ms**（`mid-flight`）与 **44 ms**（`parked`）。`P3.07` 的脚本时钟测量（7 个触发点，max 20 ms）是**循环自身**的贡献；本次是加上两个不可中断段之后的数 | Max ≤ 500 ms | 下界 = 一次注入 + 一次稳定性等待；**Max 必须单独给**，因为它是用户感知"卡住了"的唯一来源。**实测修正**：`parked` 的 41–44 ms 说明"一次稳定性等待"的代价主要是**一次回读**（1188×894 = 4.25 MB），不是一个 tick（15 ms） |
 | Stop latency | P50 ≤ 20 ms | **推导** | P95 ≤ 60 ms | 停止只是提交导出任务（§5 确证 `export_worker.submit` 覆盖式信箱），不需要等待编码 |
 | CPU（Capturing） | ≤ 1 个逻辑核的 15% | **未取得（原因已写明）**：合成序列装置没有捕获侧；真实桌面唯一的既有数据是 `P0.05` 的 WGC 回读**墙钟** 1.2–2.5 ms/帧 @1280×960（按 10 Hz 折合 ≤ 2.5% 单核），它是墙钟而**不是 CPU 时间**，也不含 WGC 采集与 D3D11 拷贝 ⇒ 不得当作本行的答案 | ≤ 25% | 需要 `E-PERF-1` 之外的装置（进程 CPU 时间 / 墙钟 + 真实 WGC 采集），见 `§23.3.2`"明确未取得" |
@@ -5697,7 +5731,7 @@ fn rows_match(actual, expected, sigma) -> bool
 | 预览不阻塞采集 | mock 让 UI 消费极慢 | 采集步数不受影响；`dropped > 0` | L2 | — |
 | 预览不阻塞采集（**端口侧已可执行，`P3.08`**） | 消费者**持有锁**（比"消费慢"更强的形式：它根本不消费） | `publish` 立即返回、更新被丢弃而不是排队（`dropped == 1`、`take() == None`） | L1 | — |
 | 命令不可丢（**已可执行，`P3.08`**） | 10^5 次预览 `publish` 与 `stop`/`cancel`/`undo`×3/`set_follow` 并发 | 命令全部生效且**第一个停止承诺赢**；`dropped > 0` 与命令无关 | L1 | — |
-| 更新频率 | 100 步 | 更新次数 ≤ 10 Hz × 时长 | L2 | **Preview 更新延迟** |
+| 更新频率 | 100 步 | 更新次数 ≤ 10 Hz × 时长 | L2 | **Preview 更新延迟**；**已可执行**（`P5.01`：`updates_are_capped_at_ten_hertz` 用虚拟时钟断言 100 步 / 495 ms ⇒ **5** 次，并钉住 `PREVIEW_HZ == 10`；驱动侧由 `a_rate_limited_preview_publishes_less_and_still_ends_correctly` 用 `Duration::ZERO` 作对照。**注意**：可观察量是 `dropped`（发布次数）而不是 drain 到的更新条数——后者分不清"被抑制"与"被覆盖"，见 §19.3.3） |
 | 主线程同步工作 | 100 步 | ≤ 8 ms 阈值 | L2 | **UI 主线程最大同步工作**（覆盖层线程） |
 | 布局不遮挡操作 | 真实渲染 + 回读 | 面板不覆盖必要操作区域 | L3 | — |
 

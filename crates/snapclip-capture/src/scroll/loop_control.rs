@@ -45,7 +45,7 @@ use crate::scroll::displacement::{
 };
 use crate::scroll::observation::Observation;
 use crate::scroll::ports::{EndReason, FrameSource, InjectStatus, Poll, ScrollActuator};
-use crate::scroll::preview::{PreviewStream, PreviewUpdate};
+use crate::scroll::preview::{PreviewCadence, PreviewStream, PreviewUpdate, PREVIEW_INTERVAL};
 use crate::scroll::session::{ScrollController, ScrollPlan, ScrollSession, StopReason};
 
 /// The compositor tick the overlay runs on (`crates/snapclip-capture/src/windows/overlay.rs:100`).
@@ -708,6 +708,25 @@ pub(crate) struct ScrollDriver {
     settle: Settle,
     /// The `qpc` of the frame the canvas last accepted, used to stamp the reference viewport (§17.4).
     last_qpc: i64,
+    /// The first canvas row the preview has not been told about yet.
+    ///
+    /// `Bands` is a **delta**, and the port replaces an unseen delta with the next one rather than
+    /// queueing it (one latest-wins slot per kind, `preview.rs`). A producer that published the rows
+    /// *this step* appended would therefore lose every announcement but the last one — the panel would
+    /// hold thumbnails for rows 1980..2520 and none for 0..1980, permanently. So the producer keeps the
+    /// cursor and announces the whole unannounced span each time it is allowed to speak: coalescing,
+    /// not dropping. The cursor is the reason the driver, and not the port, owns this rule.
+    ///
+    /// There are two windows in which an announcement can be lost and they need two mechanisms: the
+    /// port widens an unseen delta (`preview::merge`), and this cursor covers the window the producer
+    /// itself suppressed through [`Self::cadence`].
+    announced_rows: u64,
+    /// How often the preview may be told anything (§19.3 constraint 4).
+    ///
+    /// The producer's, not the port's: a port that dropped updates on a timer would be making a policy
+    /// decision inside a data structure, and the ceiling is a starting value that `E-PERF-4` is meant
+    /// to calibrate.
+    cadence: PreviewCadence,
 }
 
 impl ScrollDriver {
@@ -724,7 +743,26 @@ impl ScrollDriver {
             scene_cut: SceneCut::none(),
             settle: Settle::new(),
             last_qpc: 0,
+            announced_rows: 0,
+            cadence: PreviewCadence::new(PREVIEW_INTERVAL),
         }
+    }
+
+    /// A driver whose preview cadence is not the production one.
+    ///
+    /// The cadence is measured against `Host::now()`, which in production is the wall clock and in the
+    /// loop's own tests is also the wall clock — so a test that wants to be *deterministic* about what
+    /// was suppressed has to change the interval rather than the clock. `Duration::from_secs(60)` makes
+    /// "every in-loop update is suppressed" independent of how fast the machine is, and
+    /// `Duration::ZERO` makes "nothing is suppressed" equally independent.
+    ///
+    /// Test-only because the production interval is `PREVIEW_INTERVAL`, and a seam nothing but a test
+    /// uses is a test seam: keeping it out of the shipped build keeps the shipped build from having a
+    /// second way to configure the same thing.
+    #[cfg(test)]
+    pub(crate) fn with_preview_interval(mut self, interval: Duration) -> Self {
+        self.cadence = PreviewCadence::new(interval);
+        self
     }
 
     /// Runs until the session stops, then hands the session back **by value**.
@@ -754,16 +792,25 @@ impl ScrollDriver {
         };
         self.last_qpc = first.qpc();
         self.session.start(&first);
-        self.publish_progress(preview, Status::None);
+        // Ungated, and not because it is exempt from a rule: there is nothing here for a rate limit to
+        // suppress. The consumer has never been told anything, so "the newest state replaces an older
+        // one" has no older one to replace (§19.3 constraint 1).
+        self.publish_state(preview, Status::None);
 
         loop {
             if let Some(reason) = self.command(controller) {
                 return self.finish(reason, controller, preview);
             }
-            self.apply_commands(controller, preview);
+            // The host is built before the commands are applied, and the tick is read once, so that the
+            // cadence is measured between the same point in each step rather than between two publish
+            // sites whose distance apart depends on how long the settle took. Reading it later is not
+            // possible either: `Host` holds the actuator mutably, and the watchdog needs it after the
+            // settle — so the last read has to come before that hand-off.
+            let mut host = Host::new(&mut source, &mut actuator, controller);
+            let tick = host.now();
+            self.apply_commands(controller, preview, tick);
 
             let notches = step_notches(&self.session, &self.control);
-            let mut host = Host::new(&mut source, &mut actuator, controller);
             let settled = inject_and_settle(&mut host, &mut self.settle, notches);
             let frame = host.take_frame();
             let ended = host.ended();
@@ -813,7 +860,7 @@ impl ScrollDriver {
             // committed, continued past, or skipped.
             let committed = match displacement.effect() {
                 StepEffect::Commit => match status {
-                    Status::Confirmed { d } => self.commit(&frame, d, preview),
+                    Status::Confirmed { d } => self.commit(&frame, d),
                     _ => false,
                 },
                 StepEffect::Continue | StepEffect::Skip => false,
@@ -829,7 +876,7 @@ impl ScrollDriver {
             if let WatchVerdict::Failed = note(&mut watch, &mut actuator, moved) {
                 return self.finish(StopReason::ActuatorFailed, controller, preview);
             }
-            self.publish_progress(preview, status);
+            self.publish_step(preview, status, tick);
         }
     }
 
@@ -878,7 +925,12 @@ impl ScrollDriver {
     /// Reading *is* taking (`take_undo_requests`, `take_follow`), so this must run once per step and
     /// must not be skipped by an early `continue`: a command consumed and then dropped on the floor is
     /// a button that does nothing.
-    fn apply_commands(&mut self, controller: &ScrollController, preview: &PreviewStream) {
+    fn apply_commands(
+        &mut self,
+        controller: &ScrollController,
+        preview: &PreviewStream,
+        tick: Instant,
+    ) {
         if let Some(follow) = controller.take_follow() {
             self.session.set_follow(follow);
         }
@@ -896,7 +948,7 @@ impl ScrollDriver {
             }
         }
         if undos > 0 {
-            self.publish_progress(preview, Status::None);
+            self.publish_step(preview, Status::None, tick);
         }
     }
 
@@ -941,25 +993,20 @@ impl ScrollDriver {
     /// `false` means the write was refused — `MemoryLimit`, or a spill that failed. The session does
     /// **not** stop: §20.4's `MemoryLimit` row keeps the canvas trimmed to a contiguous prefix, and a
     /// session that ended on the first refusal would throw away a canvas that is still readable.
-    fn commit(&mut self, frame: &Observation, d: i32, preview: &PreviewStream) -> bool {
+    ///
+    /// It publishes nothing. What became readable is a property of the canvas, not of the write, and
+    /// the announcement has to be coalesced against the last one the preview actually received
+    /// ([`Self::publish_bands`]) — a decision this function cannot make because it does not know
+    /// whether the rate limit will let the announcement out.
+    fn commit(&mut self, frame: &Observation, d: i32) -> bool {
         match self.viewport.apply(self.session.canvas_mut(), frame, d) {
             Ok(write) => {
                 match write {
-                    StepWrite::Appended { first_row, rows } => {
-                        preview.publish(PreviewUpdate::Bands {
-                            first_row,
-                            rows: rows.min(u32::MAX as u64) as u32,
-                            scale: 1,
-                        });
-                    }
-                    // A prepend moves every existing row down, so *all* of the canvas is newly
-                    // readable at a new offset — the honest update is the whole span, not the rows
-                    // that arrived.
-                    StepWrite::Prepended { .. } => preview.publish(PreviewUpdate::Bands {
-                        first_row: 0,
-                        rows: self.session.canvas().primary_len().min(u32::MAX as u64) as u32,
-                        scale: 1,
-                    }),
+                    StepWrite::Appended { .. } => {}
+                    // A prepend moves every existing row down, so *all* of the canvas is newly readable
+                    // at a new offset — the honest announcement is the whole span, not the rows that
+                    // arrived, which is why the cursor goes back to the beginning.
+                    StepWrite::Prepended { .. } => self.announced_rows = 0,
                     StepWrite::Skipped | StepWrite::Contained => {}
                 }
                 true
@@ -968,17 +1015,72 @@ impl ScrollDriver {
         }
     }
 
-    /// Tell the preview where the box is and how far the session has come (§19.3, §19.4, §19.5).
-    fn publish_progress(&self, preview: &PreviewStream, status: Status) {
+    /// Announce the rows the preview has not been told about yet (§19.3 constraint 2).
+    ///
+    /// The span is `announced_rows..primary_len`, not the rows this step appended: the port keeps one
+    /// latest-wins slot per kind, so an announcement that is superseded before a consumer reads it is
+    /// gone. Publishing a *delta* through a latest-wins slot loses rows; publishing the **unannounced
+    /// span** through one loses nothing, because the next announcement starts where the lost one
+    /// ended. That is the whole of the coalescing rule.
+    ///
+    /// The cursor is clamped rather than rewound when the canvas shrank: an undo truncates the canvas
+    /// to a prefix, so rows below `primary_len` are still the rows they were. Rewinding would re-announce
+    /// pixels the consumer already has.
+    fn publish_bands(&mut self, preview: &PreviewStream) {
+        let primary_len = self.session.canvas().primary_len();
+        if self.announced_rows >= primary_len {
+            self.announced_rows = primary_len;
+            return;
+        }
+        preview.publish(PreviewUpdate::Bands {
+            first_row: self.announced_rows,
+            rows: (primary_len - self.announced_rows).min(u32::MAX as u64) as u32,
+            scale: 1,
+        });
+        self.announced_rows = primary_len;
+    }
+
+    /// Tell the preview how far the session has come (§19.3 constraint 2, §19.5's progress row).
+    ///
+    /// `primary_len` + step count + the count of steps that were not committed: all three are here
+    /// because the panel cannot read the session, which is the entire reason a port exists.
+    fn publish_span(&self, preview: &PreviewStream) {
         preview.publish(PreviewUpdate::Span {
             primary_len: self.session.canvas().primary_len(),
             steps: self.session.step(),
             discarded: self.session.discarded(),
         });
+    }
+
+    /// Tell the preview where the box is and what the last step did (§19.4's three appearances).
+    fn publish_viewport(&self, preview: &PreviewStream, status: Status) {
         preview.publish(PreviewUpdate::Viewport {
             band: self.viewport.position().max(0) as u64,
             status,
         });
+    }
+
+    /// Everything the panel is told about the current state, in one go.
+    ///
+    /// The three updates are three *kinds*, and the port holds one slot per kind precisely so that a
+    /// step producing all three cannot make them evict each other (`preview.rs`).
+    fn publish_state(&mut self, preview: &PreviewStream, status: Status) {
+        self.publish_bands(preview);
+        self.publish_span(preview);
+        self.publish_viewport(preview, status);
+    }
+
+    /// The same three updates, behind §19.3 constraint 4's ceiling.
+    ///
+    /// F-08 is the reason the limit exists: the preview is the only consumer that costs something per
+    /// update (a windowed thumbnail derivation, §19.2), so a page that scrolls faster than a human can
+    /// read must not make the capture path pay for it. The state that is suppressed here is not lost —
+    /// the next allowed tick republishes it, and the one kind whose loss would be permanent (`Bands`)
+    /// is coalesced rather than re-sent ([`Self::publish_bands`]).
+    fn publish_step(&mut self, preview: &PreviewStream, status: Status, tick: Instant) {
+        if self.cadence.allow(tick) {
+            self.publish_state(preview, status);
+        }
     }
 
     /// Record the stop reason, tell the preview, and hand the session over.
@@ -1002,6 +1104,15 @@ impl ScrollDriver {
             }
         }
         self.session.stop(reason);
+        // The terminal state is not a rate-limited state. A stop is the last thing that will ever be
+        // published, so suppressing it would leave the panel showing a length up to one interval out of
+        // date for good — and the length of the image is the number the user is looking at.
+        //
+        // `Viewport` is deliberately not re-published: stopping does not move the box, and re-sending
+        // it with `Status::None` would repaint a confirmed box as an unconfirmed one at the exact
+        // moment the user stops to look at it.
+        self.publish_bands(preview);
+        self.publish_span(preview);
         preview.publish(PreviewUpdate::Ended { reason });
         self.session
     }
@@ -2032,6 +2143,124 @@ mod tests {
                 .iter()
                 .any(|u| matches!(u, PreviewUpdate::Span { .. })),
             "the progress line is still there after the bands update landed: {updates:?}"
+        );
+    }
+
+    /// `Span` and `Viewport` are **states**: the newest one is the whole truth, so dropping the ones
+    /// in between costs nothing — that is exactly what the latest-wins slot in `preview.rs` is for.
+    /// `Bands` is a **delta** ("rows `first_row..first_row + rows` became readable"), and a dropped
+    /// delta is not a stale state, it is an announcement those rows never get again: a consumer that
+    /// derives a thumbnail per announced band would be missing rows permanently.
+    ///
+    /// So the producer has to coalesce rather than drop. This asserts the invariant that makes the two
+    /// behaviours distinguishable — the announced ranges **tile** `[0, primary_len)` with no gap and no
+    /// overlap — and it holds whatever the machine's timing is, because coalescing cannot lose a row no
+    /// matter how often it is allowed to speak.
+    #[test]
+    fn a_rare_update_still_tells_the_panel_about_every_row() {
+        use crate::scroll::preview::PreviewUpdate;
+
+        let image = page(3000, 21);
+        let (page, pending) = SimulatedPage::new(image, 900, 60, 3);
+        let plan = ScrollPlan::new(Axis::Vertical, 320, 900, MemoryBudget::with_total(8 << 20));
+        let controller = ScrollController::new();
+        let preview = PreviewStream::new();
+
+        let session = ScrollDriver::new(&plan).run(
+            page,
+            LinkedActuator::new(pending),
+            &controller,
+            &preview,
+        );
+
+        let mut announced = Vec::new();
+        while let Some(update) = preview.take() {
+            if let PreviewUpdate::Bands { first_row, rows, .. } = update {
+                announced.push((first_row, first_row + u64::from(rows)));
+            }
+        }
+
+        let primary_len = session.canvas().primary_len();
+        announced.sort_unstable();
+        let mut covered = 0u64;
+        for (start, end) in &announced {
+            assert_eq!(
+                *start, covered,
+                "the announcements have to tile the canvas, and this one starts late: {announced:?}"
+            );
+            assert!(*end > *start, "an empty announcement is not one: {announced:?}");
+            covered = *end;
+        }
+        assert_eq!(
+            covered, primary_len,
+            "every row of the canvas was announced exactly once: {announced:?}"
+        );
+    }
+
+    /// §19.3 constraint 4 at the only place that can enforce it: the producer.
+    ///
+    /// The observable is `dropped`, and finding it took a correction worth recording: counting the
+    /// updates a *drain* sees cannot tell "the producer was suppressed" from "the port superseded an
+    /// unseen update", because the port does the second thing either way. What a rate limit actually
+    /// removes is **publications**, and `dropped` is the port's count of updates no consumer ever saw.
+    ///
+    /// `Duration::ZERO` is the control: the same run with the limit removed. Without it, a test that
+    /// only checked the limited number would pass just as well if the driver had stopped publishing.
+    /// Neither number depends on how fast the machine is — one interval suppresses every in-loop update
+    /// by construction, the other permits every one.
+    #[test]
+    fn a_rate_limited_preview_publishes_less_and_still_ends_correctly() {
+        use crate::scroll::preview::PreviewUpdate;
+
+        fn drive(interval: Duration) -> (PreviewStream, ScrollSession) {
+            let image = page(3000, 22);
+            let (page, pending) = SimulatedPage::new(image, 900, 60, 3);
+            let plan = ScrollPlan::new(Axis::Vertical, 320, 900, MemoryBudget::with_total(8 << 20));
+            let controller = ScrollController::new();
+            let preview = PreviewStream::new();
+            let session = ScrollDriver::new(&plan)
+                .with_preview_interval(interval)
+                .run(page, LinkedActuator::new(pending), &controller, &preview);
+            (preview, session)
+        }
+
+        let (limited, limited_session) = drive(Duration::from_secs(60));
+        let (unlimited, unlimited_session) = drive(Duration::ZERO);
+
+        assert!(
+            limited.dropped() < unlimited.dropped(),
+            "the ceiling has to remove publications, not relabel them: {} dropped with a 60 s \
+             interval against {} with none",
+            limited.dropped(),
+            unlimited.dropped()
+        );
+
+        // The limit changes *when* the panel is told something, never what the session did.
+        assert_eq!(
+            limited_session.canvas().primary_len(),
+            unlimited_session.canvas().primary_len(),
+            "the canvas is the same in both runs"
+        );
+        assert_eq!(
+            limited_session.stop_reason(),
+            unlimited_session.stop_reason()
+        );
+
+        // And what survives is exactly what is not rate-limited: the terminal state, which is the one
+        // the user stops to read (and the length is the number they read).
+        let (mut ended, mut last_len) = (0, 0);
+        while let Some(update) = limited.take() {
+            match update {
+                PreviewUpdate::Span { primary_len, .. } => last_len = primary_len,
+                PreviewUpdate::Ended { .. } => ended += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(ended, 1, "the end of the session is not rate-limited");
+        assert_eq!(
+            last_len,
+            limited_session.canvas().primary_len(),
+            "the last thing the panel is told carries the final length"
         );
     }
 
