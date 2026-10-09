@@ -35,9 +35,14 @@
 //! caller's discipline is what makes `F-07` ("memory does not grow with the image") a property of the
 //! code instead of a promise in a document.
 //!
-//! Not here yet: the export sink (`P4.01`), and the `SpillRef` governance that `P4.06` folds into the
-//! export path's own file cleanup. Until then the module is exercised by its own tests and the
-//! crate's warning budget stays at zero (`docs/31` §4.1).
+//! `P4.06` closes the last open question §17.5 left: who deletes the spill file. The answer is a
+//! `Drop` impl and nothing else — §22.7 requires it there rather than on a shutdown path, because a
+//! shutdown path is exactly what a panic skips. Two `Drop` impls carry the whole rule and both are
+//! greppable: `impl Drop for SpillFile` removes the file, `impl Drop for BandStore` removes the
+//! directory it made. There is deliberately **no** `impl Drop for SpillRef` — see [`SpillRef`].
+//!
+//! Not here yet: the export sink (`P4.01`). Until then the module is exercised by its own tests and
+//! the crate's warning budget stays at zero (`docs/31` §4.1).
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
@@ -297,6 +302,12 @@ impl Default for LongImageLimits {
 }
 
 /// Where a band went on disk, and what it hashed to when it was written (§17.5 ④).
+///
+/// **There is no `impl Drop for SpillRef` here, and there must not be one.** §22.7's "the file is
+/// deleted when its owner drops" reads as if a band owned a file; it does not. One file holds every
+/// spilled band (§17.5 ⑥), so a `Drop` on a reference would delete the storage of every *other*
+/// band still pointing into it. The owner is [`SpillFile`], the file is released when the last
+/// reference leaves ([`BandStore::reclaim_spill_file`]) or when the session ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SpillRef {
     pub(crate) first_row: u64,
@@ -311,6 +322,10 @@ pub(crate) const SPILL_FILE_NAME: &str = "bands.spill";
 
 /// The session's spill file: one file per canvas, appended to in eviction order, removed when it
 /// drops. §17.5 ⑥ — the file lives and dies with the session, and nothing is cached across sessions.
+///
+/// **Rule (`P4.06`, §22.7): the spill file is deleted in `Drop`, never on a shutdown path.** A
+/// session can end by panicking, and a cleanup routine that runs after the session is the one thing
+/// a panic skips; `Drop` is the only place that runs either way. Grep for `impl Drop for SpillFile`.
 struct SpillFile {
     file: std::fs::File,
     path: PathBuf,
@@ -329,6 +344,8 @@ impl SpillFile {
     }
 }
 
+/// Rule (`P4.06`, §17.5 ⑥): the file is deleted here and nowhere else, so it is deleted on every
+/// path — including the one where the session panics. Grep for `impl Drop for SpillFile`.
 impl Drop for SpillFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
@@ -603,6 +620,30 @@ impl BandStore {
         self.budget.set_canvas(self.resident_bytes());
     }
 
+    /// The size of the session's spill file in bytes, or `0` if nothing has been evicted yet.
+    ///
+    /// `E-MEM-1` (§23.1) records this **separately** from `allocated`/`peak`, and §6's benchmark
+    /// discipline says why: *heap traffic cannot prove a space reduction when the storage moved to an
+    /// OS mapping*. A memory number that went down while these bytes went up is not a smaller
+    /// footprint, it is a footprint in a different place — so the bytes that moved to disk get their
+    /// own column instead of being inferred from the heap.
+    pub(crate) fn spill_file_bytes(&self) -> u64 {
+        self.spill.as_ref().map_or(0, |spill| spill.len)
+    }
+
+    /// Drops the spill file once nothing points into it.
+    ///
+    /// The file is one file for the whole session (§17.5 ⑥), so it cannot follow an individual band
+    /// out — but it must not outlive the **last** band that points into it either: from that moment
+    /// the bytes on disk are a cost with no reader, and §22.7's "no residue" is a claim about the
+    /// session, not about its happy path. `write_spill` recreates the file on demand, so the store
+    /// loses nothing by letting go early.
+    fn reclaim_spill_file(&mut self) {
+        if self.spilled.is_empty() {
+            self.spill = None;
+        }
+    }
+
     fn is_disjoint_from(&self, candidate: &Band) -> bool {
         self.resident.iter().all(|entry| {
             candidate.first_row >= entry.band.end_row(self.cross_len)
@@ -705,6 +746,7 @@ impl BandStore {
                 "the leading spilled band is {} rows, not the {rows} rows this undo removes",
                 spilled.row_count
             );
+            self.reclaim_spill_file();
             self.sync_accounting();
             return;
         }
@@ -770,6 +812,7 @@ impl BandStore {
             self.insert(Band::new(first_row, bytes[..keep_rows * row_bytes].to_vec()));
         }
         self.spilled.retain(|first_row, _| *first_row < rows);
+        self.reclaim_spill_file();
 
         self.sync_accounting();
         Ok(())
@@ -833,6 +876,8 @@ impl BandStore {
     }
 }
 
+/// Rule (`P4.06`, §22.7): the spill file is removed in `Drop`, and the directory goes with it when
+/// this store is the one that created it. Grep for `impl Drop for BandStore`.
 impl Drop for BandStore {
     fn drop(&mut self) {
         // The spill file first (its own `Drop`), then the directory — but only if we made it.
@@ -2370,6 +2415,140 @@ mod tests {
             BandError::CorruptBand { found, .. } => *found,
             other => panic!("expected a CorruptBand, got {other:?}"),
         }
+    }
+
+    /// `P4.06`'s RED. The spill file is a **session-scoped** object (§17.5 ⑥): one file, appended to,
+    /// deleted when the session ends. But a session can also end *early* — the last band that pointed
+    /// into the file comes back to memory when a straddling band is truncated (`truncate`, §17.6
+    /// layer 1) — and from that moment the bytes on disk are a cost nobody is paying for.
+    ///
+    /// The taskbook phrased this as "the file is removed when its band is evicted back to memory",
+    /// which is the per-band file model §22.7 does **not** use: the file holds every spilled band, so
+    /// it can only go when the last one leaves. That is what this case pins.
+    #[test]
+    fn a_spill_file_is_removed_when_its_band_is_evicted_back_to_memory() {
+        let dir = spill_dir("reclaim");
+        let mut store = store_in(&dir, one_band_bytes());
+        store.insert(spill_band(0, SPILL_ROWS_PER_BAND));
+        store.insert(spill_band(SPILL_ROWS_PER_BAND, SPILL_ROWS_PER_BAND));
+        store
+            .relieve(&[SPILL_ROWS_PER_BAND])
+            .expect("the second band is protected, so the first one spills");
+        let path = dir.join(SPILL_FILE_NAME);
+        assert_eq!(store.spilled().len(), 1, "band 0 should be on disk");
+        assert!(path.exists(), "a spilled band means the file is there");
+
+        // Half of the spilled band is inside the prefix, so `truncate` reads it back out of the file
+        // and re-inserts the kept half as resident (§17.5 ⑤ — a `SpillRef`'s checksum covers exactly
+        // the bytes it points at, so the reference cannot simply be narrowed).
+        store
+            .truncate(SPILL_ROWS_PER_BAND / 2)
+            .expect("the straddling band comes back through the checksum");
+        assert!(
+            store.spilled().is_empty(),
+            "the only band that pointed into the file came back to memory"
+        );
+        assert!(
+            !path.exists(),
+            "the spill file outlived the last band that pointed into it: {} is still on disk",
+            path.display()
+        );
+    }
+
+    /// `P4.06`'s second RED: the spill file's size has to be **readable**, not just tracked.
+    ///
+    /// `E-MEM-1` (§23.1) has a column for it, and §22.6's methodology discipline (§6's benchmark
+    /// wording) says it cannot be derived from the heap numbers: `allocated` is heap traffic and
+    /// `peak` is live heap, so bytes that went to a file show up as a *smaller* footprint while
+    /// nothing was actually reclaimed. A number the probe cannot ask for is a number the probe will
+    /// eventually invent, so the store answers for itself.
+    #[test]
+    fn the_spill_file_size_is_recorded_separately() {
+        let dir = spill_dir("size");
+        let mut store = store_in(&dir, one_band_bytes());
+        assert_eq!(
+            store.spill_file_bytes(),
+            0,
+            "a store that never evicted anything has no spill file"
+        );
+        store.insert(spill_band(0, SPILL_ROWS_PER_BAND));
+        store.insert(spill_band(SPILL_ROWS_PER_BAND, SPILL_ROWS_PER_BAND));
+        store
+            .relieve(&[SPILL_ROWS_PER_BAND])
+            .expect("the second band is protected, so the first one spills");
+
+        let spilled: u64 = store.spilled().values().map(|entry| entry.len).sum();
+        assert!(spilled > 0, "the case is vacuous unless something spilled");
+        assert_eq!(
+            store.spill_file_bytes(),
+            spilled,
+            "the reported size is the file's, and the file holds exactly the spilled bands"
+        );
+        assert_eq!(
+            store.spill_file_bytes(),
+            std::fs::metadata(dir.join(SPILL_FILE_NAME))
+                .expect("the spill file exists while a band points into it")
+                .len(),
+            "the store's number and the filesystem's number have to be the same number"
+        );
+    }
+
+    /// `P4.06`'s exit condition ③, as a **regression nail** rather than a RED: `BandStore`'s `Drop`
+    /// already existed (`P1.20`) and already removes the file and — when the store made it — the
+    /// directory. What was missing was the *proof* that the session path reaches it, which is what
+    /// this case is: a session that is abandoned rather than finished.
+    ///
+    /// "Cancelled" here means what it means in §20.5 — the user asked for no result — so nothing
+    /// runs a cleanup routine. The file has to be gone because a `Drop` ran, not because a shutdown
+    /// path remembered to call something.
+    #[test]
+    fn a_cancelled_session_leaves_no_spill_files() {
+        let dir = spill_dir("cancelled");
+        let mut image = RecoveredImage::in_dir(
+            Axis::Vertical,
+            SPILL_CROSS,
+            MemoryBudget::with_total(one_band_bytes()),
+            dir.clone(),
+        );
+        for index in 0..4u64 {
+            image
+                .bands
+                .insert(spill_band(index * SPILL_ROWS_PER_BAND, SPILL_ROWS_PER_BAND));
+        }
+        image
+            .bands
+            .relieve(&[])
+            .expect("with nothing protected the budget is always reachable");
+        assert!(
+            !image.bands.spilled().is_empty(),
+            "the case is vacuous unless the session actually spilled"
+        );
+        assert!(dir.join(SPILL_FILE_NAME).exists());
+
+        drop(image);
+
+        assert!(
+            !dir.exists(),
+            "an abandoned session left {} behind",
+            dir.display()
+        );
+
+        // The production constructor picks its own directory, so this half is the one a real session
+        // takes: it is not enough that `in_dir` cleans up when the caller chose the path.
+        let mut store = BandStore::new(SPILL_CROSS, MemoryBudget::with_total(one_band_bytes()));
+        store.insert(spill_band(0, SPILL_ROWS_PER_BAND));
+        store.insert(spill_band(SPILL_ROWS_PER_BAND, SPILL_ROWS_PER_BAND));
+        store
+            .relieve(&[SPILL_ROWS_PER_BAND])
+            .expect("the second band is protected, so the first one spills");
+        let production_dir = store.dir.clone();
+        assert!(production_dir.join(SPILL_FILE_NAME).exists());
+        drop(store);
+        assert!(
+            !production_dir.exists(),
+            "`BandStore::new` left {} behind",
+            production_dir.display()
+        );
     }
 
     #[test]

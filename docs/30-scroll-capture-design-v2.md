@@ -2933,7 +2933,9 @@ enum BandError {
 
 **一处执行期修订**：RED 阶段写的断言是"读完全部条带后 `spilled` 为空"（当时以为读回即常驻）；GREEN 期间定下裁决 3 后该断言与设计相反，改为"读完**仍是 9 条落盘**"。这不是放宽——它把一条设计决定变成了可执行的钉子。
 
-**尚未落地**：`SpillRef` 的治理（`P4.06`，与导出路径的文件清理同一处）；`MemoryBudget::set_preview` 今天**没有生产调用点**（预览属 `P2`，因此 `resident_preview` 恒为 0，§22.3 的第一步"先换出预览"由预览的所有者负责）；`checksum` 现在与 §15.4 第 1 层的行摘要**共用一份实现**（`displacement::checksum`，`line_digest` 委托它）。
+**尚未落地**：`MemoryBudget::set_preview` 今天**没有生产调用点**（预览属 `P2`，因此 `resident_preview` 恒为 0，§22.3 的第一步"先换出预览"由预览的所有者负责）；`checksum` 现在与 §15.4 第 1 层的行摘要**共用一份实现**（`displacement::checksum`，`line_digest` 委托它）。
+
+**已落地（`P4.06`，2026-10-09）**：`SpillRef` 的治理。两条可 `grep` 的 `Drop` 规则（`impl Drop for SpillFile` / `impl Drop for BandStore`）、`SpillRef` 上**刻意没有** `Drop` 的理由、以及"最后一条引用离开时提前释放文件"（`reclaim_spill_file`）——见 §22.7.1。
 
 ### 17.6 上限：三层，且**没有硬失败上限**
 
@@ -4114,6 +4116,28 @@ impl Scratch {
 
 **一条与今天不同的要求**：`BandStore` 的换出文件**必须**在 `ScrollSession` 析构时删除，且**必须在 `Drop` 里做而不是在正常路径里做**（否则 panic 路径会泄漏）。§5 已确证今天的 `artifact_store` 没有清理机制——**V2 不接受把这个问题继承下来**。
 
+#### 22.7.1 落地形状（`P4.06`，2026-10-09）
+
+**`Drop` 是两个，不是一个。** 表里的"换出文件"行读起来像"一条条带拥有一个文件"，实现不是这样：**一个文件装下所有已换出的条带**（§17.5 ⑥），所以删除的归属是文件而不是引用。
+
+| 规则 | 落点（`crates/snapclip-capture/src/scroll/canvas.rs`） | 为什么在这里 |
+|---|---|---|
+| 文件在 `Drop` 里删 | `impl Drop for SpillFile`（`canvas.rs:344`） | 会话可能以 panic 结束，而"会话之后跑一段清理"正是 panic 会跳过的东西；`Drop` 是两条路都会跑的唯一位置 |
+| 目录在 `Drop` 里删，**但只删自己创建的** | `impl Drop for BandStore`（`canvas.rs:855`） | 测试把自己的目录交给 `in_dir` 以便篡改换出文件（§30.4 的损坏用例）；那种目录不归 store 管 |
+| **`SpillRef` 上刻意没有 `Drop`** | `canvas.rs:306` 的 doc | 一条引用的 `Drop` 会删掉**其他**仍指向该文件的条带的存储 |
+| 最后一条引用离开时提前释放 | `BandStore::reclaim_spill_file`（`canvas.rs:611`），由 `truncate`（`§17.6` 第 1 层）与 `remove_leading`（撤销 prepend）调用 | 从那一刻起盘上那些字节没有读者；`write_spill` 按需重建文件，所以提前放手不丢任何东西 |
+
+**实测（RED → GREEN）**：
+
+| 用例 | RED 时的行为 | GREEN 后 |
+|---|---|---|
+| `a_spill_file_is_removed_when_its_band_is_evicted_back_to_memory` | 失败，逐字 = `the spill file outlived the last band that pointed into it: C:\Users\…\Temp\snapclip-bands-reclaim-1448-780013200\bands.spill is still on disk`（`canvas.rs:2406`） | 跨过 `rows` 的那条落盘条带经 `truncate` 读回常驻后，`spilled` 为空且文件消失 |
+| `the_spill_file_size_is_recorded_separately` | 编译失败，逐字 = `error[E0599]: no method named `spill_file_bytes` found for struct `BandStore` in the current scope`（3 处，`canvas.rs:2452`/`:2465`/`:2470`） | `spill_file_bytes()` 与 `std::fs::metadata(…).len()` 是同一个数字 |
+| `a_cancelled_session_leaves_no_spill_files` | **自 `P1.20` 起就为真 ⇒ 是回归钉子而不是 RED**（doc 里逐字标注） | `RecoveredImage` 与 `BandStore::new`（生产构造器）两条路都留下零残留 |
+
+**两处对任务书的偏离**：① 任务书的 REFACTOR 要求把规则写成"`impl Drop for SpillRef`"——那会删掉别人的存储，实际可 `grep` 的两条规则是 `impl Drop for SpillFile` 与 `impl Drop for BandStore`；② 退出条件 ③ 的"`docs/Temp/` 为空"**不可执行**——那是本文档自己的暂存区（`docs/31` 约定把探针日志写在那里），可执行的形式是"会话临时目录零残留"，即上面第三条用例。
+
+
 ## 23. 性能
 
 ### 23.1 前置实验（**在这些实验完成之前，本节的任何数字都不成立**）
@@ -4142,7 +4166,7 @@ impl Scratch {
 | **Cancel latency** | 用户触发取消 | `Phase == Stopped` 且驱动线程确认 | `Instant` 差值；**下界是"一次注入 + 一次稳定性等待"**（§21.4） | 在注入后的最坏时刻触发 |
 | **Stop latency** | 用户触发停止 | 导出任务已提交给 export-worker | `Instant` 差值 | 同上 |
 | **CPU（四档）** | — | — | OS 计数器（进程 CPU 时间 / 墙钟）+ `E-PERF-1` 的分阶段耗时 | Idle / Capturing / Capturing+Matching / Capturing+Matching+Flow（§18.4） |
-| **Memory** | — | — | `E-MEM-1`：`CountingAllocator` 的 live/peak/allocated + 换出文件大小 | 三档长度（§22.6） |
+| **Memory** | — | — | `E-MEM-1`：`CountingAllocator` 的 live/peak/allocated + 换出文件大小（**已有生产者**：`BandStore::spill_file_bytes()`，`P4.06`，见 §22.7.1） | 三档长度（§22.6） |
 
 **"跟手"的完整量化映射**（用户第 29 条要求"跟手必须量化"，且要覆盖鼠标命中测试与选择延迟）：滚动截图里"跟手"包含五项，逐项对应到上面的指标或§5 已确证的既有指标：
 
@@ -5644,7 +5668,7 @@ fn rows_match(actual, expected, sigma) -> bool
 | 场景 | 输入 | 预期结果 | 自动化 | 性能指标 |
 |---|---|---|---|---|
 | 三档长度内存 | 10k / 30k / 100k px，独立进程 | peak 差异 **≤ 10%** | L4 | **Memory** |
-| 换出文件已删除 | 会话结束后 | 无残留临时文件 | L1 | — |
+| 换出文件已删除 | 会话结束后 | 无残留临时文件 | L1 | — （`P4.06` 实测：`RecoveredImage` 与 `BandStore::new` 两条路都零残留；**取消路径**由 `Drop` 覆盖，见 `§22.7.1`） |
 | 导出拷贝数 | 30,000 px 高导出 | 峰值 **≤ 2 份**（今天 4 份） | L4 | **Memory**（`P4.03` 实测 **0 份**，1280×20,000，见 `§22.4.1`） |
 | `u32` 越界 | 构造 > `u32::MAX` 尺寸（sink 侧）／反向矩形（shell 侧） | **拒绝**（不截断） | L2 | — （`P4.04` 实测：sink 侧自 `P4.02` 起就拒绝，`row_band_png::tests::an_oversized_dimension_is_refused_before_the_header` 钉住；shell 侧曾报出编造的 `4294967291x2`，见 `§26.1.1`） |
 | 普通截图回归 | F5 全流程（A 类全套） | 全部通过 | L1+L3 | **Capture Latency** |
