@@ -32,11 +32,15 @@ impl PixelFormat {
 ///
 /// The value set is the frozen Phase 0 contract from
 /// `docs/11-screenshot-fullflow-ui-refactor-tasklist.md` §2.2:
-/// Idle → Preparing → Armed → Selecting → Selected → Adjusting → Annotating →
-/// Exporting → Idle. `Adjusting` and `Annotating` are emitted once their phases
-/// introduce them. `Exporting` is entered when a selection is confirmed and covers
-/// the region readback on the overlay thread plus the encode/write on the export
-/// worker.
+/// Idle → Preparing → Armed → Selecting → Selected → Annotating → Exporting → Idle.
+/// `Annotating` is emitted once its phase introduces it. `Exporting` is entered when a
+/// selection is confirmed and covers the region readback on the overlay thread plus the
+/// encode/write on the export worker.
+///
+/// `Adjusting` used to sit between `Selected` and `Annotating`. Nothing could reach it, so it
+/// was deleted (`docs/30` §33.1 `D-2`, task `P6.03`): a declared state with no producer is a
+/// liability, because every guard over this enum then has to be read as "and not the one that
+/// cannot happen anyway".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureState {
@@ -45,7 +49,6 @@ pub enum CaptureState {
     Armed,
     Selecting,
     Selected,
-    Adjusting,
     Annotating,
     Exporting,
 }
@@ -58,7 +61,6 @@ impl CaptureState {
             Self::Armed => "armed",
             Self::Selecting => "selecting",
             Self::Selected => "selected",
-            Self::Adjusting => "adjusting",
             Self::Annotating => "annotating",
             Self::Exporting => "exporting",
         }
@@ -120,7 +122,6 @@ mod tests {
             CaptureState::Armed,
             CaptureState::Selecting,
             CaptureState::Selected,
-            CaptureState::Adjusting,
             CaptureState::Annotating,
             CaptureState::Exporting,
         ] {
@@ -159,7 +160,6 @@ mod tests {
             (CaptureState::Armed, "armed"),
             (CaptureState::Selecting, "selecting"),
             (CaptureState::Selected, "selected"),
-            (CaptureState::Adjusting, "adjusting"),
             (CaptureState::Annotating, "annotating"),
             (CaptureState::Exporting, "exporting"),
         ];

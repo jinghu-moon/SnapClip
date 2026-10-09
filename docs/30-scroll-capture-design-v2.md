@@ -5621,6 +5621,31 @@ crates/snapclip-capture/src/windows/scroll_actuator.rs   # SendInput / PostMessa
 
 **不改动**：`annotation.rs`、`geometry.rs`、`ring_contrast.rs`、`sampler.rs`、`artifact.rs`、`diagnostics.rs`、`monitor_cache.rs`、`ports.rs`、`runtime.rs`、`window_detection/*`（纯契约与策略）。
 
+#### 28.2.1 落地（`P6.03`，2026-10-09）：不可达状态被删除，而不是被记录
+
+**这一段删除的三段式（§33.1 `D-2` 原文）**：当前抽象导致"契约里有 7 个状态、其中 1 个**不可达**；6 个活跃状态的穷举测试掩盖了它" → 根本原因是"状态机被当成**文档进度的载体**而不是**操作集合差异的建模**" → 因此删除该变体，并确立"**不写无法断言的不变量**"（ADR-16）。
+
+**RED**：新增 `crates/snapclip-capture/src/session.rs` 的 `every_capture_state_variant_is_reachable`。它**驱动**状态机（Idle→Preparing→Armed→Selecting→Selected→Annotating 一条会话，Exporting 第二条），把每一步之后的状态收进集合，再逐条对照**契约自己的清单**——不去问枚举"你有哪些变体"，因为那是另一个问题。首跑失败逐字（日志 `docs/Temp/p603-d2-red.txt`）：
+
+```
+the contract declares "adjusting" (Adjusting) but no transition produces it:
+a state nothing can reach has to be deleted rather than documented (§28.2, ADR-16)
+```
+
+**GREEN**（四处"这个名字还活着"的地方，全部随变体一起改）：
+
+| 文件 | 改动 |
+|---|---|
+| `crates/snapclip-model/src/capture.rs` | 变体本体；`as_str` 的一行；枚举 doc 的箭头链（`docs/11` §2.2 的八状态现在是七状态，并写明 `Adjusting` **为什么**被删）；两条冻结用例里的一行 |
+| `crates/snapclip-capture/src/session.rs` | 新增可达性用例；`esc_from_every_active_state_returns_to_idle` 里那个 `unreachable!("… not reachable until its phase lands")` 分支（它正是"掩盖"的来源）连同它一起删；`handoff_to_scroll` 的 doc 从"`Adjusting` 刻意不可达"改成点名两条用例 |
+| `crates/snapclip-capture/src/scroll/canvas.rs` | 模块 doc 的"`CaptureState::Adjusting` 是先例"改为"是**曾经的**先例，直到 `P6.03` 删掉它" |
+| `apps/snapclip/tests/regression_baseline.rs` | 那条注释原本断言"`CaptureState` 的每个变体都有测试可达"——**这句话在本任务之前是假的**（穷举用例只是列出变体，从不驱动它们），现在为真；并新增第三条 `capture_state_coverage` 冻结行指向新用例 |
+
+**`docs/11` §2.2 不动**：它是 Phase 0 契约的**历史**来源；删掉它会让"契约为什么是这七个状态"失去出处。权威在 §28.2 的表行与 ADR-16。
+
+**门禁**：`cargo test --workspace --lib -- --test-threads=1` → app **64/0/3**、capture **572/0/24**（新增 1 条）、history **51**、model **23**；`cargo check --workspace --all-targets` → 0 error；依赖门禁 clean。
+
+
 ### 28.3 明确**不**做的目录操作（以及理由）
 
 | 考虑过 | 不做的理由 |

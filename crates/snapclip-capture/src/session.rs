@@ -346,9 +346,9 @@ impl CaptureSession {
     /// It is a **handoff and not an extension**: the ordinary screenshot is over when this returns,
     /// and the scroll session is a different object with a different lifetime (§20.6). The alternative
     /// — teaching `CaptureSession` to also be a scroll session — was rejected for a structural reason,
-    /// not a stylistic one: `CaptureSession`'s state set is **exhaustively tested**
-    /// (`esc_from_every_active_state_returns_to_idle` walks all six active states, and `Adjusting` is
-    /// deliberately unreachable), so every state added here would have to be added to that test and to
+    /// not a stylistic one: `CaptureSession`'s state set is **exhaustively tested** (every variant is
+    /// driven to by `every_capture_state_variant_is_reachable`, and `esc_from_every_active_state_returns_to_idle`
+    /// walks all six active ones), so every state added here would have to be added to both tests and to
     /// every guard in the file. The scroll session's phases are *not* a state machine (§20.1) and must
     /// not be squeezed into one.
     ///
@@ -597,9 +597,6 @@ mod tests {
                     session.pointer_released();
                     session.begin_annotating().unwrap();
                 }
-                CaptureState::Adjusting => {
-                    unreachable!("{state:?} belongs to the docs/11 contract but is not reachable until its phase lands")
-                }
             }
             assert_eq!(session.state(), state);
 
@@ -608,6 +605,71 @@ mod tests {
             assert!(session.geometry().is_none());
             assert!(session.frame().is_none());
             assert_eq!(session.selection(), Rect::default());
+        }
+    }
+
+    /// Every variant the contract declares must be produced by a transition (`docs/30` §28.2,
+    /// ADR-16: no invariant without an assertion, and no state without a producer).
+    ///
+    /// The array below is the contract's own list, so it shrinks in the same commit as the enum:
+    /// removing a variant from one of the two alone is a half-deletion. The test drives the machine
+    /// instead of asking it what it could be, because "the enum has eight variants" and "the machine
+    /// has eight states" are different claims — the second one is the one that matters.
+    ///
+    /// Its first run failed with "the contract declares adjusting (Adjusting) but no transition
+    /// produces it", and the variant was deleted rather than documented (`docs/30` §33.1 `D-2`,
+    /// task `P6.03`).
+    #[test]
+    fn every_capture_state_variant_is_reachable() {
+        let declared = [
+            (CaptureState::Idle, "idle"),
+            (CaptureState::Preparing, "preparing"),
+            (CaptureState::Armed, "armed"),
+            (CaptureState::Selecting, "selecting"),
+            (CaptureState::Selected, "selected"),
+            (CaptureState::Annotating, "annotating"),
+            (CaptureState::Exporting, "exporting"),
+        ];
+
+        let mut observed = Vec::new();
+
+        // Idle → Preparing → Armed → Selecting → Selected → Annotating in one session, one step at a
+        // time; each observation is the state the machine is in *after* the call returns.
+        let mut session = CaptureSession::new("session-1");
+        observed.push(session.state());
+        session.preparing().unwrap();
+        observed.push(session.state());
+        session.arm(frame(), &layout()).unwrap();
+        observed.push(session.state());
+        session.overlay_ready().unwrap();
+        observed.push(session.state());
+        press(&mut session, Point::new(10, 10));
+        session.pointer_moved(Point::new(200, 200));
+        observed.push(session.state());
+        session.pointer_released();
+        observed.push(session.state());
+        session.begin_annotating().unwrap();
+        observed.push(session.state());
+
+        // `Exporting` needs a second session: one that has entered annotation has already left the
+        // selection path behind, so it cannot be the same run.
+        let mut exporting = CaptureSession::new("session-2");
+        exporting.preparing().unwrap();
+        exporting.arm(frame(), &layout()).unwrap();
+        exporting.overlay_ready().unwrap();
+        press(&mut exporting, Point::new(10, 10));
+        exporting.pointer_moved(Point::new(200, 200));
+        exporting.pointer_released();
+        exporting.begin_export().unwrap();
+        observed.push(exporting.state());
+
+        for (state, name) in declared {
+            assert!(
+                observed.contains(&state),
+                "the contract declares `{name}` ({state:?}) but no transition produces it: \
+                 a state nothing can reach has to be deleted rather than documented \
+                 (§28.2, ADR-16)"
+            );
         }
     }
 

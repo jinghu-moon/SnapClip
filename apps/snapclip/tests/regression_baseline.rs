@@ -204,7 +204,8 @@ const A_CLASS: &[Frozen] = &[
         file: "crates/snapclip-capture/src/windows/providers.rs",
         test: "wgc_is_tried_before_the_bitblt_fallback",
     },
-    // 无可达状态负债：`CaptureState` 的每个变体都有测试可达（`Adjusting` 的删除会先撞上这两条）
+    // 无可达状态负债：`CaptureState` 的每个变体都由驱动式用例走到（`P6.03` 删掉了不可达的
+    // `Adjusting`，`D-2`），而变体名与状态字符串由下面两条冻结
     Frozen {
         behaviour: "capture_state_coverage",
         file: "crates/snapclip-model/src/capture.rs",
@@ -214,6 +215,11 @@ const A_CLASS: &[Frozen] = &[
         behaviour: "capture_state_coverage",
         file: "crates/snapclip-model/src/capture.rs",
         test: "state_and_format_names_are_the_frozen_contract_strings",
+    },
+    Frozen {
+        behaviour: "capture_state_coverage",
+        file: "crates/snapclip-capture/src/session.rs",
+        test: "every_capture_state_variant_is_reachable",
     },
 ];
 

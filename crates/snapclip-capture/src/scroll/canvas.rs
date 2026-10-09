@@ -5,8 +5,8 @@
 //! least one `Confirmed` observation that wrote it. V2 keeps that constraint and makes it
 //! **assertable** — [`RecoveredImage::assert_invariants`] runs after every step (§20.3) — because V1
 //! maintained the same idea through a single `next_pos` variable, where any partial commit broke it
-//! silently. A rule that is only in the document is a liability; `CaptureState::Adjusting` is the
-//! precedent (§5).
+//! silently. A rule that is only in the document is a liability; `CaptureState::Adjusting` was the
+//! precedent until `P6.03` deleted it (`docs/30` §5, §33.1 `D-2`).
 //!
 //! Three things in here are deliberately **not** what §17.1's sketch says, and each one exists
 //! because the sketch cannot make an invariant assertable (`docs/31` §0.6 `DEV-26`):
