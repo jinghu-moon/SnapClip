@@ -36,6 +36,8 @@ pub(crate) mod observation;
 
 pub(crate) mod orb;
 
+pub(crate) mod preview;
+
 pub(crate) mod session;
 
 #[cfg(test)]

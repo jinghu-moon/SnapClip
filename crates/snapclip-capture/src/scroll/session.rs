@@ -26,10 +26,14 @@
 //! * `target: ScrollTarget` — `docs/30` §20.1's sketch has it, but `target.rs` is `P3.05`.
 //! * The invariants of §20.3 that involve the band budget are asserted by `RecoveredImage` itself
 //!   (`canvas.rs`, `P1.17`); this module adds the two that are about the *session's* counters.
-//! * `undo` — §19.6's span history is `P3.06`.
+//! * `undo`'s *effect* — §19.6's span history lives in `ViewportState` and moves onto the session in
+//!   `P3.09`. `P3.08` lands only the request side (`ScrollController::undo`), because the overlay
+//!   thread has to be able to *ask* before anything can answer.
 
 #![allow(dead_code)] // First consumer is the driver (`P3.04`), then the session assembly (`P3.09`).
 
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use crate::scroll::canvas::{MemoryBudget, RecoveredImage};
@@ -267,6 +271,120 @@ impl ScrollSession {
     }
 }
 
+/// The overlay thread's handle on a running session (`docs/30` §27.2; task `P3.08`).
+///
+/// ## Why commands are sticky bits and state is not
+///
+/// §27.2 calls this "一处刻意的非对称设计" and the asymmetry is the whole design: a **command** is an
+/// intent — dropping one loses something the user did — while a **state** update is the newest
+/// snapshot of a value, and dropping the older ones costs nothing. One channel cannot carry both,
+/// because a capacity-1 slot is right for exactly one of them. So the commands here are **sticky
+/// bits**: writing one is an atomic store, nothing can consume it by accident, and no amount of
+/// preview traffic can take its place (the two ports share no storage at all).
+///
+/// Three mechanisms, one per kind of traffic:
+///
+/// | traffic | mechanism | may wait? | may be lost? |
+/// |---|---|---|---|
+/// | `stop` / `cancel` / `undo` / `shutdown` | sticky bit, `compare_exchange` / `fetch_add` | no | **no** |
+/// | `set_follow` | capacity-1 slot behind a `Mutex` | yes (nanoseconds) | no |
+/// | preview updates | capacity-1 slot behind a `try_lock` (`preview.rs`) | **no** | yes, and `dropped` says so |
+///
+/// ## Why `stop` and `cancel` are one word
+///
+/// §27.2's sketch has two flags (`AtomicBool stopped` plus a cancel flag), which cannot express an
+/// **order** — and §20.5's "the first promise wins" *is* an order: pressing `Enter` and then `Esc`
+/// must export, not discard. One `AtomicU32` written with `compare_exchange` makes the first writer
+/// the winner without a lock, and makes the losing write a no-op rather than a silent overwrite.
+pub(crate) struct ScrollController {
+    /// 0 = nothing requested, 1 = `UserStopped`, 2 = `UserCancelled`. First write wins.
+    stop: AtomicU32,
+    /// How many `undo` presses the driver has not consumed yet (§19.6).
+    undo: AtomicU32,
+    /// §19.5's "back to the newest": the one command that is a *value* rather than a request, so it
+    /// lives in a slot and may be overwritten. `lock()`, not `try_lock()` — see the table above.
+    follow: Mutex<Option<bool>>,
+    /// Idempotent, and the driver's cue to unwind (§27.2).
+    shutdown: AtomicBool,
+}
+
+const STOP_NOTHING: u32 = 0;
+const STOP_USER_STOPPED: u32 = 1;
+const STOP_USER_CANCELLED: u32 = 2;
+
+impl ScrollController {
+    pub(crate) fn new() -> Self {
+        Self {
+            stop: AtomicU32::new(STOP_NOTHING),
+            undo: AtomicU32::new(0),
+            follow: Mutex::new(None),
+            shutdown: AtomicBool::new(false),
+        }
+    }
+
+    /// "I want the result now" (`Enter`, §20.5). The canvas may be partial.
+    pub(crate) fn stop(&self) {
+        let _ = self
+            .stop
+            .compare_exchange(STOP_NOTHING, STOP_USER_STOPPED, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    /// "I want no result" (`Esc`, §20.5). No file is written.
+    pub(crate) fn cancel(&self) {
+        let _ = self.stop.compare_exchange(
+            STOP_NOTHING,
+            STOP_USER_CANCELLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    /// Undo the last confirmed step (§19.6). Presses accumulate: the UI only exposes "undo one
+    /// step", but pressing it five times means five steps.
+    pub(crate) fn undo(&self) {
+        self.undo.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// §19.5: the user dragged the preview box, so automatic following stops — or they asked to
+    /// come back to the newest.
+    pub(crate) fn set_follow(&self, follow: bool) {
+        let mut slot = self.follow.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = Some(follow);
+    }
+
+    /// The driver is being torn down. Idempotent.
+    pub(crate) fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+    }
+
+    /// What the user asked for, if anything. The driver reads this at every interruptible point.
+    pub(crate) fn requested_stop(&self) -> Option<StopReason> {
+        match self.stop.load(Ordering::Acquire) {
+            STOP_USER_STOPPED => Some(StopReason::UserStopped),
+            STOP_USER_CANCELLED => Some(StopReason::UserCancelled),
+            _ => None,
+        }
+    }
+
+    /// Consume the pending undo presses. Reading is taking: the driver must not replay an undo it
+    /// has already applied.
+    pub(crate) fn take_undo_requests(&self) -> u32 {
+        self.undo.swap(0, Ordering::AcqRel)
+    }
+
+    /// Take the follow request, if one is waiting.
+    pub(crate) fn take_follow(&self) -> Option<bool> {
+        self.follow
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    pub(crate) fn is_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::Acquire)
+    }
+}
+
 /// Derive the phase. Pure; no side effects, no transitions to get out of step with the data.
 pub(crate) fn phase(session: &ScrollSession) -> Phase {
     if session.stop.is_some() {
@@ -499,5 +617,97 @@ mod tests {
         session.set_follow(true);
         assert!(session.follow(), "\"back to the newest\" resumes the automatic loop");
         assert!(!session.manual());
+    }
+
+    /// `P3.08`, §27.2: a command **cannot be lost**, no matter what the state channel is doing.
+    ///
+    /// The load is real (10^5 publishes through the real `publish` path, most of them dropped) and
+    /// so is the concurrency (a second thread pumps while this one issues commands). The assertion
+    /// holds under *every* interleaving, which is the property being bought: the two ports share no
+    /// storage, so no amount of preview traffic can consume a command slot.
+    #[test]
+    fn commands_are_sticky_and_cannot_be_lost_under_load() {
+        let controller = ScrollController::new();
+        let preview = crate::scroll::preview::PreviewStream::new();
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for row in 0..100_000u64 {
+                    preview.publish(crate::scroll::preview::PreviewUpdate::Span {
+                        primary_len: row,
+                        steps: row as u32,
+                        discarded: 0,
+                    });
+                }
+            });
+
+            controller.stop();
+            controller.cancel();
+            controller.undo();
+            controller.undo();
+            controller.undo();
+            controller.set_follow(false);
+        });
+
+        assert!(
+            preview.dropped() > 0,
+            "the state channel is supposed to drop under load: {} of 100000 got through",
+            100_000 - preview.dropped()
+        );
+        assert_eq!(
+            controller.requested_stop(),
+            Some(StopReason::UserStopped),
+            "§20.5: the first promise wins — `cancel` must not overwrite `stop` (and a queue \
+             would have had to be drained to see this at all)"
+        );
+        assert_eq!(controller.take_undo_requests(), 3, "three presses, three undos");
+        assert_eq!(
+            controller.take_undo_requests(),
+            0,
+            "reading a sticky counter is consuming it: the driver does not replay old undos"
+        );
+        assert_eq!(
+            controller.take_follow(),
+            Some(false),
+            "`set_follow` is the one command that is a value rather than a request (§27.2)"
+        );
+        assert_eq!(controller.take_follow(), None);
+        assert!(!controller.is_shutdown());
+        controller.shutdown();
+        assert!(controller.is_shutdown());
+        controller.shutdown();
+        assert!(controller.is_shutdown(), "`shutdown` is idempotent (§27.2)");
+    }
+
+    /// Exit condition ② of `P3.08`, mechanically: the command side is **sticky bits**, not queue
+    /// slots. A `Mutex<Option<ScrollCommand>>` would satisfy the two behavioural tests above for
+    /// every interleaving that happens to be tried — this is the one that cannot.
+    ///
+    /// Only the production half is scanned: the test's own source names these types (the same trap
+    /// `P3.02`'s `the_decision_table_is_in_one_place` and `P3.04`'s phase test both fell into).
+    #[test]
+    fn the_command_side_is_sticky_bits_not_a_queue() {
+        let production = include_str!("session.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the file has a production half");
+        let sticky =
+            production.matches("AtomicBool").count() + production.matches("AtomicU32").count();
+        assert!(
+            sticky >= 3,
+            "§27.2 asks for sticky bits on `Stop`/`Cancel`/`Undo`/`Shutdown`; found {sticky}"
+        );
+        assert!(
+            !production.contains("Mutex<Option<ScrollCommand>>"),
+            "a command queue is exactly what §27.2 rules out: a full slot can swallow a `stop`"
+        );
+    }
+
+    /// The overlay thread writes, the driver thread reads (§27.3's "覆盖层 → driver" direction for
+    /// commands), so this is a contract rather than a convenience.
+    #[test]
+    fn the_controller_crosses_threads() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ScrollController>();
     }
 }

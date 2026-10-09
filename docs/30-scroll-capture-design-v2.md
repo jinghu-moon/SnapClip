@@ -3313,6 +3313,21 @@ enum PreviewUpdate {
 
 因此 `PreviewStream` 是 `snapclip-capture` **内部**的端口（同 crate，保留 trait 只为可测性，§27.2），不跨 crate。
 
+#### 19.3.1 落地的形状（P3.08，2026-10-09）
+
+落点 `crates/snapclip-capture/src/scroll/preview.rs`（§28.2 已分配）。机制本身（为什么 `try_lock`、为什么没有队列）见 §27.2.1 的那张表；这里只记与本节草图**不同**的四处裁决：
+
+1. **`Span` 从 `{ primary_len }` 扩为 `{ primary_len, steps, discarded }`**。§19.5 的进度行要求"`primary_len` + 步数 + 累计未采用步数"三个量，而面板**读不到** `ScrollSession`（不同线程、无共享状态）——端口存在的全部理由就是让这三个量能过去。类型与 `ScrollSession::step()` / `discarded()` 同型（`u32`），不引入新的整数宽度。
+2. **`Viewport.status` 用 `displacement::Status`，不是草图里的 `StepStatus`**。全仓不存在 `StepStatus`（`grep` 零命中，本节草图是它唯一的出现处），而 §19.4 的外观判据恰恰是"本步已采用 / 未采用"——那正是 `Status` 的三态（`Confirmed` 实线框；`Uncertain` / `None` 虚线框 + 角标）。造一个平行类型会让"状态"有两个真值来源。
+3. **派生 `Debug, Clone, Copy, PartialEq`，没有 `Eq`**（`Status` 没有 `Eq`，这是传导的，不是选择）。`Copy` 是**承重**的：§19.3 约束 2 的"不携带像素"由 `an_update_cannot_be_carrying_pixels()` 断言 `size_of::<PreviewUpdate>() <= 32` 机械保证——任何一个变体加上缓冲（`Vec`、切片、装箱条带）都会破界，作者会被迫回来读本节。
+4. **`dropped` 只在"覆盖掉一个还没被取走的更新"时递增**，空槽位不算丢。G12 要的是"用户少看到了多少次"，不是"`publish` 被调了多少次"；用例把这个口径钉住：100 次 `publish` ⇒ `dropped() == 99`，然后取走、再 `publish` 一次 ⇒ `dropped` **不增**。
+
+**约束 4（10 Hz 上限）刻意不在这个端口里**：限流属于生产者（`P5.01` 的驱动投递）。一个按定时器丢更新的数据结构是在数据结构内部做策略决定，而 §19.3 已经把它标为**可校准**（`E-PERF-4`）——可校准的常数必须待在一个能被校准的地方。
+
+**今天刻意不落地的三样**：`PreviewSink`（§27.1 的 seam trait；没有实现者也没有测试替身 ⇒ 死代码，首个消费者是 `P5.01`）、`wake: Condvar`（唤醒是 `SCROLL_READY_MESSAGE`，见 §27.2.1 裁决 5）、缩略派生本身（`scale` 字段先落地，派生属 `P5.02`）。
+
+**锁中毒恢复而不 panic**（`unwrap_or_else(|poisoned| poisoned.into_inner())`）：临界区只是搬一个 `Copy` 值，不可能 panic；而 `take`/`publish` 跑在**覆盖层线程**上，在那里 panic 会带走用户正在进行的截图。
+
 ### 19.4 视口框与三种状态外观
 
 | 状态 | 外观 | 语义（必须与 §16.10 一一对应） |
@@ -4764,6 +4779,30 @@ impl PreviewStream {
 
 **命令"不能被丢"如何实现**：容量 1 覆盖式**只**用于 `SetFollow` 这类幂等命令；`Stop`/`Cancel`/`Undo` 用**粘性位**（`AtomicBool stopped` / `AtomicU32 undo_requested`）而不是队列槽位——**粘性位天然不可丢**。这是一处刻意的非对称设计，理由是"停止"是用户最高优先级的意图。
 
+#### 27.2.1 落地的形状（P3.08，2026-10-09）
+
+**家在哪**：`ScrollController` 落 `crates/snapclip-capture/src/scroll/session.rs`（与 `ScrollSession`、`StopReason`、`Disposal` 同文件）。§28.2 的 11 文件清单**没有给 `ScrollController` 分配文件**，而它的全部语义（"停止"是 `StopReason::UserStopped`、产物处置是 `Disposal`）都在 `session.rs`；`preview.rs` 留给 §19.3 的状态通道，两个方向相反的端口各占一个文件。`PreviewStream` / `PreviewUpdate` 落新建的 `crates/snapclip-capture/src/scroll/preview.rs`（§28.2 已分配）。
+
+**三种机制，一张表**（这张表就是 §27.2"刻意的非对称"的全部内容）：
+
+| 流量 | 机制 | 可以等吗 | 可以丢吗 |
+|---|---|---|---|
+| `stop` / `cancel` / `undo` / `shutdown` | 粘性位（`compare_exchange` / `fetch_add`） | 不等 | **不能** |
+| `set_follow` | 容量 1 槽位（`Mutex<Option<bool>>`） | 等（纳秒级临界区） | 不能 |
+| 预览更新 | 容量 1 槽位（`Mutex` + `try_lock`，`preview.rs`） | **不等** | 可以，且 `dropped` 计数说得出丢了多少 |
+
+**五条裁决**（每条都对着一个具体的失败方式）：
+
+1. **`stop` 与 `cancel` 合成一个 `AtomicU32`**（`0` = 无 / `1` = `UserStopped` / `2` = `UserCancelled`），用 `compare_exchange` 写入 ⇒ **第一个写者赢**。§27.2 草图里的两个 `AtomicBool` **无法表达顺序**，而 §20.5 的"先按 `Enter` 再按 `Esc` 必须导出而不是丢弃"就是一个顺序：两个布尔位会让后写的 `cancel` 静默覆盖 `stop`，把用户的第一个意图丢掉——正是这个端口存在的理由。
+2. **`undo` 是计数器不是标志**：`fetch_add` 写、`take_undo_requests()` 用 `swap(0)` 读。读即取——驱动不能重放一个已经应用过的撤销。§19.6 约束 4 的"连按可连撤"就是这个计数。
+3. **`set_follow` 用 `lock()` 而不是 `try_lock()`**：命令可以等（临界区只是搬一个 `Copy` 值），状态才必须可丢。这一行是上表的第 2 行，也是"非对称"在代码里唯一可见的地方。
+4. **`ScrollCommand` 枚举不落地**。粘性位设计里没有"命令值"这个东西可以存在——落一个没人构造、没人匹配的枚举就是死代码（`AGENTS.md` 禁止死代码），而 §27.2 要的性质（不可丢）已经由位本身给出。
+5. **不加 `Condvar`**。§19.3 的草图有 `wake: Condvar`，但消费者是覆盖层线程的 **Win32 消息循环**，唤醒已经由 `P3.07` 落地的 `SCROLL_READY_MESSAGE`（`WM_APP + 45`，`windows/overlay.rs`）承担；一个没人等的 `Condvar` 是**第二个**唤醒机制，它会与第一个静默地不一致。
+
+**两个刻意不做 `pub` 的类型**：`ScrollController` 与 `PreviewStream` 今天都是 `pub(crate)`。§27.1 的边界表把 `ScrollController` 列在"`pub`（跨 crate）"，但 §19.3 末句明确 `PreviewStream` **不跨 crate**，而覆盖层今天就在本 crate 的 `windows/overlay/` 里——没有跨 crate 的消费者，按 `crates/snapclip-capture/src/lib.rs:20-24` 的既有规则（`windows` 下除具体 overlay 外都不是公共 API）先 `pub(crate)`。提升为 `pub` 是 `P3.09` 装配时的决定，且必须与 §27.1 的表**一起**改，不允许只改一处。
+
+**端口方向**（`P3.08` 退出条件 ③，与 §27.3 的表一致）：命令 = 覆盖层线程 → driver（写粘性位，不阻塞、不排队）；预览 = driver → 覆盖层线程（`publish` 绝不阻塞生产者）。两个端口**不共享任何存储**，所以再多的预览流量也不可能吃掉一个命令槽位——这正是 `commands_are_sticky_and_cannot_be_lost_under_load()` 在 10^5 次 publish 下要证明的性质。
+
 ### 27.3 核心接口签名
 
 ```rust
@@ -5240,6 +5279,8 @@ fn rows_match(actual, expected, sigma) -> bool
 | 预览窗口化 | 100,000 px 画布 | **不生成整图缩略**；只生成可见窗口 | L1 | **Memory** |
 | 拖动后停止跟随 | 拖动 ⇒ `set_follow(false)`；"回到最新" ⇒ `set_follow(true)` | 进入手动模式（`n = 0`：不注入、不学习）；`follow()`/`manual()` 随之翻转，`phase()` 不变（模式不是相位） | L1 | — |
 | 预览不阻塞采集 | mock 让 UI 消费极慢 | 采集步数不受影响；`dropped > 0` | L2 | — |
+| 预览不阻塞采集（**端口侧已可执行，`P3.08`**） | 消费者**持有锁**（比"消费慢"更强的形式：它根本不消费） | `publish` 立即返回、更新被丢弃而不是排队（`dropped == 1`、`take() == None`） | L1 | — |
+| 命令不可丢（**已可执行，`P3.08`**） | 10^5 次预览 `publish` 与 `stop`/`cancel`/`undo`×3/`set_follow` 并发 | 命令全部生效且**第一个停止承诺赢**；`dropped > 0` 与命令无关 | L1 | — |
 | 更新频率 | 100 步 | 更新次数 ≤ 10 Hz × 时长 | L2 | **Preview 更新延迟** |
 | 主线程同步工作 | 100 步 | ≤ 8 ms 阈值 | L2 | **UI 主线程最大同步工作**（覆盖层线程） |
 | 布局不遮挡操作 | 真实渲染 + 回读 | 面板不覆盖必要操作区域 | L3 | — |
