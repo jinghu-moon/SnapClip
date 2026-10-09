@@ -31,6 +31,6 @@ pub mod scroll_actuator;
 pub mod scroll_probe;
 pub mod scroll_source;
 pub mod timed_call;
+pub mod top_level_provider;
 pub mod uia_provider;
 pub mod win;
-pub mod window_detection;

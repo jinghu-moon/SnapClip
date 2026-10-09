@@ -29,7 +29,7 @@ use crate::window_detection::provider::{
     Exclusions, WindowDetectionError, WindowTargetProvider,
 };
 
-use super::window_detection::TopLevelWindowProvider;
+use super::top_level_provider::TopLevelWindowProvider;
 
 /// Posted to the overlay thread when a worker result is waiting.
 pub const DETECTION_READY_MESSAGE: u32 = WM_APP + 43;
