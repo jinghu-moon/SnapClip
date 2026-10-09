@@ -114,6 +114,7 @@ pub(crate) struct ScrollSession {
     last_step_at: Instant,
     stop: Option<StopReason>,
     undo: Vec<u64>,
+    follow: bool,
 }
 
 impl ScrollSession {
@@ -128,7 +129,30 @@ impl ScrollSession {
             last_step_at: Instant::now(),
             stop: None,
             undo: Vec::new(),
+            follow: true,
         }
+    }
+
+    /// Whether the session is driving the scroll and the preview shows the newest content (§19.5).
+    ///
+    /// One flag, two visible consequences, because they are the same question: *is the session
+    /// following the page, or is the user looking at something else?* Dragging the preview strip
+    /// answers it `false` — and then continuing to inject would move the page under the user, so the
+    /// loop stops injecting too. "Back to the newest" answers it `true` again.
+    ///
+    /// It is **data, not a mode**: nothing branches on a session type, and `phase()` does not read it.
+    pub(crate) fn follow(&self) -> bool {
+        self.follow
+    }
+
+    /// Set the follow flag. `false` is manual mode: `n = 0` and no prior (`docs/30` §13.4).
+    pub(crate) fn set_follow(&mut self, follow: bool) {
+        self.follow = follow;
+    }
+
+    /// Manual mode: the user is the actuator, so we inject nothing and learn nothing (§16.6 rule 2).
+    pub(crate) fn manual(&self) -> bool {
+        !self.follow
     }
 
     pub(crate) fn axis(&self) -> Axis {
@@ -345,5 +369,33 @@ mod tests {
             1,
             "the phase must be derived in exactly one place"
         );
+    }
+
+    /// §19.5: dragging the preview strip stops the session following the newest content; the
+    /// "back to the newest" button resumes it.
+    ///
+    /// The flag is the whole mode. There is no second session type, no second loop and no second
+    /// phase: a manual session is this one with `n = 0` and no prior (§13.4).
+    #[test]
+    fn the_follow_flag_is_the_whole_mode() {
+        let mut session = ScrollSession::new(Axis::Vertical, 320, MemoryBudget::with_total(1 << 20));
+        assert!(
+            session.follow(),
+            "a session drives the scroll until the user says otherwise"
+        );
+        assert!(!session.manual());
+
+        session.set_follow(false);
+        assert!(!session.follow());
+        assert!(session.manual(), "not following is what manual mode is");
+        assert_eq!(
+            phase(&session),
+            Phase::Preparing,
+            "the mode is not a phase: the session is still just starting"
+        );
+
+        session.set_follow(true);
+        assert!(session.follow(), "\"back to the newest\" resumes the automatic loop");
+        assert!(!session.manual());
     }
 }

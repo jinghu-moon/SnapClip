@@ -32,6 +32,7 @@
 use std::time::{Duration, Instant};
 
 use crate::scroll::displacement::{Prior, Status, RHO_MIN};
+use crate::scroll::session::ScrollSession;
 
 /// The compositor tick the overlay runs on (`crates/snapclip-capture/src/windows/overlay.rs:100`).
 ///
@@ -194,7 +195,12 @@ pub(crate) fn inject_and_settle<H: StepHost>(
     settle: &mut Settle,
     notches: i32,
 ) -> Result<Settled, StepError> {
-    host.inject(notches).map_err(StepError::Injection)?;
+    // §13.4: in manual mode there is nothing to inject, and this is where that becomes mechanical.
+    // The actuator is not called with zero notches — that is an invalid request by its own contract
+    // (`scroll_actuator.rs`), and a manual step must not send one.
+    if notches != 0 {
+        host.inject(notches).map_err(StepError::Injection)?;
+    }
     settle.begin(host.now());
 
     loop {
@@ -209,6 +215,38 @@ pub(crate) fn inject_and_settle<H: StepHost>(
                 }
             }
         }
+    }
+}
+
+/// How many notches this step asks for, given who is driving the scroll (`docs/30` §13.4).
+///
+/// Manual mode is **not a second loop**: it is this loop with `n = 0`. The difference lives in two
+/// numbers rather than in a branch on a session type, and this is the first of them — the session's
+/// follow flag decides whether the control law's answer reaches the actuator at all.
+pub(crate) fn step_notches(session: &ScrollSession, control: &Control) -> i32 {
+    if session.manual() {
+        0
+    } else {
+        control.notches()
+    }
+}
+
+/// Feed a step's outcome back to the control law, and report whether it was used.
+///
+/// This is the second of manual mode's two differences. `ĝ` is *pixels per notch*, so learning it
+/// needs the number of notches we sent (`docs/30` §16.6 rule 2). In manual mode we sent none: the
+/// user scrolled, and `d` says what the content did — not what one notch does. Dividing by a number
+/// we chose ourselves would be inventing evidence, so the prior is left exactly as it was.
+pub(crate) fn learn(
+    session: &ScrollSession,
+    control: &mut Control,
+    notches: i32,
+    status: Status,
+) -> bool {
+    if session.manual() {
+        false
+    } else {
+        control.observe(notches, status)
     }
 }
 
@@ -436,6 +474,9 @@ impl Control {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scroll::canvas::MemoryBudget;
+    use crate::scroll::observation::Axis;
+    use crate::scroll::session::ScrollSession;
 
     /// A stand-in for `InjectPath` that lives entirely on this side of the boundary.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -956,5 +997,66 @@ mod tests {
 
         std::fs::write(&out, lines.join("\n") + "\n").expect("the curve file must be writable");
         println!("wrote {out}");
+    }
+
+    /// §13.4: manual mode is not a second loop. It is this loop with `n = 0`.
+    ///
+    /// The same [`inject_and_settle`], the same 40 ms / 400 ms rules, the same [`Settle`] — the only
+    /// difference is the number the session hands in, and the fact that zero means "do not reach the
+    /// actuator at all": `notches == 0` is an invalid request by contract (`scroll_actuator.rs`), so
+    /// a manual step must not send one.
+    #[test]
+    fn manual_mode_is_the_same_loop_with_a_different_number() {
+        let automatic = ScrollSession::new(Axis::Vertical, 320, MemoryBudget::for_viewport(320, 900));
+        let mut manual = ScrollSession::new(Axis::Vertical, 320, MemoryBudget::for_viewport(320, 900));
+        manual.set_follow(false);
+        let control = Control::new(900, 60.0);
+
+        let automatic_notches = step_notches(&automatic, &control);
+        assert!(automatic_notches > 0, "an automatic session asks for a step");
+        assert_eq!(
+            step_notches(&manual, &control),
+            0,
+            "a manual session asks for nothing: the user is the actuator"
+        );
+
+        let mut host = ScriptedHost::new(25, [Some(0xAA), Some(0xAA), Some(0xAA)]);
+        let mut settle = Settle::new();
+        inject_and_settle(&mut host, &mut settle, automatic_notches).expect("the wait completes");
+        assert_eq!(host.injections, vec![automatic_notches]);
+
+        let mut host = ScriptedHost::new(25, [Some(0xAA), Some(0xAA), Some(0xAA)]);
+        let mut settle = Settle::new();
+        let settled = inject_and_settle(&mut host, &mut settle, step_notches(&manual, &control))
+            .expect("the same wait, with nothing injected");
+        assert_eq!(settled.verdict, SettleVerdict::Still);
+        assert!(
+            host.injections.is_empty(),
+            "manual mode must not reach the actuator: a zero-notch request is invalid by contract"
+        );
+    }
+
+    /// §16.6 rule 2: manual mode has no `n_k`, so there is nothing to divide by and `ĝ` must not move.
+    ///
+    /// This is the whole of "P1 is off": not a flag the estimator reads, but the absence of the
+    /// observation the learning rule is defined on.
+    #[test]
+    fn a_manual_session_learns_nothing_from_what_it_did_not_inject() {
+        let mut manual = ScrollSession::new(Axis::Vertical, 320, MemoryBudget::for_viewport(320, 900));
+        manual.set_follow(false);
+        let mut control = Control::new(900, 60.0);
+        assert!(
+            !learn(&manual, &mut control, 1, Status::Confirmed { d: 37 }),
+            "a confirmed step with no injection behind it is not evidence about ĝ"
+        );
+        assert_eq!(control.px_per_notch(), 60.0, "ĝ is untouched");
+
+        let automatic = ScrollSession::new(Axis::Vertical, 320, MemoryBudget::for_viewport(320, 900));
+        let mut control = Control::new(900, 60.0);
+        assert!(learn(&automatic, &mut control, 1, Status::Confirmed { d: 37 }));
+        assert!(
+            control.px_per_notch() < 60.0,
+            "the same step in automatic mode does move ĝ: 37 px for one notch pulls it down"
+        );
     }
 }

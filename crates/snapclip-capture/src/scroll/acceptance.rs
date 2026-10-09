@@ -33,9 +33,11 @@
 use crate::scroll::canvas::{MemoryBudget, RecoveredImage, ViewportState};
 use crate::scroll::displacement::{
     GateOutcome, Scratch, Status, candidates_1d, gate_geometry, gate_margin, gate_residual_gain,
-    gate_support, is_verifiable, margin_of, outside_cell_second, refine_winner, score_candidates_2d,
+    gate_support, has_peak_family, is_verifiable, manual_window, margin_of, match_rows,
+    outside_cell_second, refine_winner, score_candidates_2d,
 };
-use crate::scroll::observation::{Axis, ObservationView};
+use crate::scroll::observation::{Axis, Observation, ObservationView};
+use crate::scroll::session::ScrollSession;
 use crate::scroll::testkit::{ScrollScript, StepSpec, Structure, TestImage};
 
 /// The synthetic page width. Narrow on purpose: every scan case costs a whole document, and the
@@ -199,6 +201,56 @@ fn decide(
     } else {
         Status::Uncertain { d: answer }
     }
+}
+
+/// §16.6's manual route: no prior, the search centred on zero, and a peak family answered
+/// `Uncertain` before the gates get a say.
+///
+/// The scan keeps its own copy of this for the same reason it keeps its own [`decide`]: a harness
+/// that calls the production entry point cannot be run against a deliberately wrong configuration,
+/// and the family check has to be *on the path* or it is never exercised. The production entry point
+/// is `estimate()` with `Prior::None` (§27.3), which `P3.09` assembles.
+///
+/// The family outranks gates two, three and four on purpose. Those gates ask whether *this* candidate
+/// is good enough; the family says the page cannot single one out, which is a different question and
+/// the one §16.6 answers directly. Gate one is not outranked — geometry is a correctness constraint
+/// on the number itself (§16.2), and an ambiguity is no reason to report a shift the canvas must not
+/// act on.
+fn manual_status(
+    scratch: &mut Scratch,
+    previous: &ObservationView<'_>,
+    current: &ObservationView<'_>,
+) -> Status {
+    let extent = previous.primary_extent();
+    let window = manual_window(match_rows(extent, extent, 1));
+    let candidates = candidates_1d(previous, current, 0, window);
+    if candidates.is_empty() {
+        return Status::None;
+    }
+    let scored = {
+        let views = scratch.pool(previous, current);
+        score_candidates_2d(views.previous(), views.current(), &candidates)
+    };
+    if has_peak_family(&scored) {
+        let answer = {
+            let views = scratch.full_resolution(previous, current);
+            refine_winner(views.previous(), views.current(), &scored)
+        }
+        .map(|refined| refined.d)
+        .unwrap_or_else(|| {
+            scored
+                .iter()
+                .next()
+                .expect("a family needs candidates")
+                .d
+        });
+        return if gate_geometry(answer, extent) == GateOutcome::Pass {
+            Status::Uncertain { d: answer }
+        } else {
+            Status::None
+        };
+    }
+    decide(scratch, previous, current, 0, window, Funnel::FULL)
 }
 
 /// One scan case: a page, a viewport, and one scripted step with known truth.
@@ -423,6 +475,31 @@ fn run_case_with(case: &Case, funnel: Funnel, expected: i32) -> Tally {
         funnel,
     );
 
+    finish_case(case, &first, &second, status)
+}
+
+/// §13.4's manual route over the same case: the same step, decided with no prior and the search
+/// centred on zero. This is the whole difference — the loop, the canvas and the write path are the
+/// ones [`run_case_with`] already exercises.
+fn run_manual_case(case: &Case) -> Tally {
+    let mut script = ScrollScript::starting_at(
+        &case.image,
+        case.viewport_extent(),
+        case.start,
+        vec![case.spec],
+    );
+    let first = script.take(0);
+    let second = script.take(1);
+
+    let mut scratch = Scratch::new();
+    let status = manual_status(&mut scratch, &first.view(), &second.view());
+    finish_case(case, &first, &second, status)
+}
+
+/// Turn a step's status into a tally, including the byte comparison of what was written.
+fn finish_case(case: &Case, first: &Observation, second: &Observation, status: Status) -> Tally {
+    let truth = case.truth();
+    let extent = case.viewport_extent();
     let mut canvas = RecoveredImage::new(
         Axis::Vertical,
         SCAN_WIDTH as u64,
@@ -476,6 +553,15 @@ fn scan(cases: &[Case], funnel: Funnel) -> Tally {
     let mut tally = Tally::default();
     for case in cases {
         tally.merge(run_case(case, funnel));
+    }
+    tally
+}
+
+/// As [`scan`], through §13.4's manual route instead of the prior-driven one.
+fn scan_manual(cases: &[Case]) -> Tally {
+    let mut tally = Tally::default();
+    for case in cases {
+        tally.merge(run_manual_case(case));
     }
     tally
 }
@@ -674,5 +760,173 @@ mod tests {
         assert_eq!(tally.steps as usize, cases.len());
         assert_eq!(tally.wrong, 0, "the full scan confirmed a wrong shift");
         assert_eq!(tally.bytes_wrong, 0, "the full scan wrote a wrong canvas");
+    }
+
+    /// §16.6: a page that repeats is exactly the case the prior exists for, and without one the
+    /// honest answer is `Uncertain`.
+    ///
+    /// The fixture is periodic by construction: one structure, and a band height equal to its period
+    /// (`HorizontalBars` reads `y % period` inside the band, `testkit.rs:92`), so the document repeats
+    /// every 37 rows. A 37 px step leaves the frame *pixel-identical*, so `−37`, `0` and `+37` explain
+    /// it equally well — all three inside the 68 px manual window, which is what makes the family
+    /// check reachable here rather than at the edge of the search.
+    #[test]
+    fn a_manual_route_refuses_a_periodic_page_instead_of_guessing() {
+        let image = TestImage::from_structures(
+            SCAN_WIDTH,
+            1900,
+            5,
+            37,
+            &[Structure::HorizontalBars { period: 37 }],
+        );
+        let mut script = ScrollScript::new(&image, SCAN_VIEWPORT, vec![StepSpec::move_by(37)]);
+        let first = script.take(0);
+        let second = script.take(1);
+
+        let mut scratch = Scratch::new();
+        let status = manual_status(&mut scratch, &first.view(), &second.view());
+        println!("periodic page, manual route: {status:?}");
+        assert!(
+            matches!(status, Status::Uncertain { .. }),
+            "a periodic page must be reported as an ambiguity, got {status:?}"
+        );
+    }
+
+    /// **This records a defect, not a contract.**
+    ///
+    /// `P3.06`'s exit condition ③ — "a manual sequence never confirms a wrong shift" — does **not**
+    /// hold yet, and this is the second of its two mechanisms. A row digest is an exact byte
+    /// comparison, so on a frame with noise *no* row matches across frames: every `support` is 0 and
+    /// the candidate ranking falls back to its first tie-break, `|d − expected|`. The manual route has
+    /// no `expected`, so the set degenerates to the eight shifts nearest **zero** — the failure
+    /// `P1.24` found and fixed for the prior-driven route by centring it on the prior. The truth is
+    /// then not even scored, and one of the eight wins.
+    ///
+    /// If this test starts failing because the answer became correct, or became a refusal, delete it
+    /// and update `docs/30` §16.6.2: the blocker has been fixed.
+    #[test]
+    fn the_prior_free_route_is_wrong_on_a_noisy_frame_today() {
+        // σ = 5, |d| = 7, period 28: the noisy half of the smoke corpus (seed 48).
+        let case = scan_case(-7, 4.0, 0.0, 5, 48);
+        let mut script =
+            ScrollScript::starting_at(&case.image, SCAN_VIEWPORT, case.start, vec![case.spec]);
+        let first = script.take(0);
+        let second = script.take(1);
+
+        let mut scratch = Scratch::new();
+        let status = manual_status(&mut scratch, &first.view(), &second.view());
+        assert_eq!(case.truth(), -7);
+        assert_eq!(
+            status,
+            Status::Confirmed { d: -6 },
+            "the measured defect: the truth (−7) is not in the degenerate candidate set"
+        );
+    }
+
+    /// `P3.06`'s exit condition ③ is **unmet**, and this is its record on the default path so that the
+    /// defect cannot go quiet.
+    ///
+    /// Measured over `E-ACC-1`'s smoke corpus (32 cases) with the design's manual window
+    /// (`manual_window(450) = 68` px). The two mechanisms behind the wrong answers are different, and
+    /// both are recorded in `docs/30` §16.6.2:
+    ///
+    /// * an alias of the page's own period landing **inside** the window — the rival that would have
+    ///   cost it the margin gate is outside the search, so gate four cannot see it;
+    /// * a frame with noise, where no row digest matches at all and the prior-free candidate ranking
+    ///   degenerates to the shifts nearest zero ([`the_prior_free_route_is_wrong_on_a_noisy_frame_today`]).
+    ///
+    /// | subset | confirmed | refused | wrong | bytes_wrong | error rate |
+    /// |---|---|---|---|---|---|
+    /// | σ = 0 (24 cases) | 17 (70.8%) | 7 | **2** | 0 | 0.0833 |
+    /// | σ = 5 (8 cases) | 2 (25.0%) | 6 | **2** | 1 | 0.2500 |
+    /// | all (32 cases) | 19 (59.4%) | 13 | **4** | 1 | 0.1250 |
+    ///
+    /// Widening the window to the whole verifiable range was measured as the obvious remedy and is
+    /// **not** one: it removes both σ = 0 errors (the rivals become visible, so the margin gate
+    /// refuses) but collapses coverage from 19 to 5 confirmations, because the candidate set — still
+    /// capped at `CANDIDATE_LIMIT = 8` — fills with aliases. See `docs/30` §36.2.
+    #[test]
+    fn the_manual_route_reports_its_coverage_and_its_defect_today() {
+        let cases = smoke_corpus();
+        let mut clean = Tally::default();
+        let mut noisy = Tally::default();
+        for case in &cases {
+            let tally = run_manual_case(case);
+            if case.noise() == 0 {
+                clean.merge(tally);
+            } else {
+                noisy.merge(tally);
+            }
+        }
+        report("manual route, sigma = 0", &clean);
+        report("manual route, sigma = 5", &noisy);
+        let tally = scan_manual(&cases);
+        report("manual route", &tally);
+
+        assert_eq!(tally.steps, 32);
+        assert_eq!(
+            tally.wrong, 4,
+            "the number `P3.06` is blocked on: if it changed, read §16.6.2 before updating this"
+        );
+        assert_eq!(tally.bytes_wrong, 1);
+        assert!(
+            tally.confirmed > 0,
+            "the manual route must still answer what it can: a route that refuses everything is not \
+             a degraded route, it is a missing one"
+        );
+    }
+
+    /// §13.4: manual mode is the same session, with `n = 0` and no prior.
+    ///
+    /// A step inside the manual window is confirmed and the canvas tracks it — the estimator is not
+    /// degraded, it simply has less to go on. This is the half of the manual route that works; the
+    /// half that does not is [`the_prior_free_route_is_wrong_on_a_noisy_frame_today`].
+    #[test]
+    fn a_manual_session_tracks_the_non_zero_steps() {
+        // 7 px is inside the manual window (`0.15 · 450 = 68` px).
+        let case = scan_case(7, 1.0, 0.0, 0, 11);
+        let mut session = ScrollSession::new(
+            Axis::Vertical,
+            SCAN_WIDTH as u64,
+            MemoryBudget::for_viewport(SCAN_WIDTH as u64, SCAN_VIEWPORT as u64),
+        );
+        assert!(
+            session.follow(),
+            "a session drives the scroll until the user says otherwise"
+        );
+        session.set_follow(false);
+        assert!(session.manual(), "not following is what manual mode is");
+
+        let mut script =
+            ScrollScript::starting_at(&case.image, SCAN_VIEWPORT, case.start, vec![case.spec]);
+        let first = script.take(0);
+        let second = script.take(1);
+        session.start(&first);
+
+        let mut scratch = Scratch::new();
+        let status = manual_status(&mut scratch, &first.view(), &second.view());
+        assert_eq!(
+            status,
+            Status::Confirmed { d: 7 },
+            "a step inside the manual window is answerable without a prior"
+        );
+
+        let mut viewport = ViewportState::new(SCAN_VIEWPORT);
+        viewport
+            .apply(session.canvas_mut(), &second, 7)
+            .expect("the budget is eight viewports");
+        session.record_step();
+        session.record_committed();
+        let committed = session.canvas().primary_len();
+        let actual = session
+            .canvas_mut()
+            .rows(0, committed)
+            .expect("resident");
+        let (doc_first, doc_len) = expected_span(case.start, SCAN_VIEWPORT, 7);
+        let expected = truth_rows(&case.image, doc_first, doc_first + doc_len);
+        assert!(
+            rows_match(&actual, &expected, case.noise()),
+            "the canvas must track the step the manual route confirmed"
+        );
     }
 }

@@ -523,7 +523,11 @@ const MATCH_MIN_ROWS: u32 = 16;
 ///
 /// The `max(1)` is not decoration: a frame shorter than `2·scale` would otherwise ask for a band of
 /// zero rows, and "no band" is spelled `None` by [`match_band`], not by an empty one.
-fn match_rows(previous_height: u32, current_height: u32, scale: u32) -> u32 {
+///
+/// `pub(crate)` since `P3.06`: the manual route's window is a function of `H_match` (§16.6), and the
+/// acceptance harness has to compute it with *this* rule rather than a second copy of the
+/// arithmetic.
+pub(crate) fn match_rows(previous_height: u32, current_height: u32, scale: u32) -> u32 {
     (previous_height.min(current_height) / 2).max((MATCH_MIN_ROWS / scale).max(1))
 }
 
