@@ -90,13 +90,35 @@ pub(crate) enum StepWrite {
     Prepended { rows: u64 },
 }
 
+/// The scale of a band that holds real canvas pixels. Every band the capture path produces is at
+/// this scale; the only other producer of bands is the preview's windowed thumbnail (§19.2).
+pub(crate) const FULL_SCALE: u32 = 1;
+
+/// How many bytes one *thumbnail* row of a band at `scale` occupies, or `None` if the scale leaves no
+/// room for a row at all.
+///
+/// A band at scale `s` stores one pixel per `s × s` canvas block, so its rows are `cross_len / s`
+/// pixels wide while each one stands for `s` canvas rows. Both facts live here rather than in
+/// [`Band::row_count`] so that "one thumbnail row" and "how many canvas rows it covers" cannot drift
+/// apart (§19.2: the thumbnail is the same data at a different scale, not a different kind of data).
+pub(crate) fn band_row_bytes(cross_len: u64, scale: u32) -> Option<u64> {
+    let row_bytes = cross_len / u64::from(scale.max(1)) * BYTES_PER_PIXEL;
+    (row_bytes > 0).then_some(row_bytes)
+}
+
 /// One whole-width row band (§17.5). `rows` is BGRA in canvas order, `first_row` is its position on
 /// the primary axis, and `fnv` is the checksum every load verifies.
+///
+/// `scale` is what makes a preview band a band: at [`FULL_SCALE`] one stored row is one canvas row,
+/// at scale `s` one stored row is `s` canvas rows of `s`-wide blocks (§19.2's windowed thumbnail).
+/// [`Self::row_count`] answers in **canvas** rows either way, so every position in the store — the
+/// disjointness invariant, the LRU order, `read_rows`, `truncate` — keeps meaning the same thing.
 #[derive(Debug, Clone)]
 pub(crate) struct Band {
     pub(crate) first_row: u64,
     pub(crate) rows: Vec<u8>,
     pub(crate) fnv: u64,
+    pub(crate) scale: u32,
 }
 
 impl Band {
@@ -105,21 +127,33 @@ impl Band {
     /// that always fails, and one that carried a wrong checksum into a check that always passes —
     /// both worse than having no check at all (§17.5 ⑤, G12).
     pub(crate) fn new(first_row: u64, rows: Vec<u8>) -> Self {
+        Self::at_scale(first_row, FULL_SCALE, rows)
+    }
+
+    /// A band at an explicit scale: [`Self::new`] for the canvas, and the preview's thumbnail
+    /// derivation (§19.2) for everything else.
+    pub(crate) fn at_scale(first_row: u64, scale: u32, rows: Vec<u8>) -> Self {
         let fnv = checksum(&rows);
         Self {
             first_row,
             rows,
             fnv,
+            scale: scale.max(1),
         }
     }
 
-    /// How many primary-axis rows this band covers, from its byte length and the canvas width.
+    /// How many **canvas** rows this band covers, from its byte length, the canvas width and its
+    /// scale.
+    ///
+    /// At `FULL_SCALE` this is the byte length over the row width. At scale `s` the band holds `k`
+    /// thumbnail rows of one pixel per `s × s` block, so it stands for `k · s` canvas rows — the same
+    /// unit the caller was already using, which is what keeps the fifteen call sites of this function
+    /// and of [`Self::end_row`] unchanged.
     pub(crate) fn row_count(&self, cross_len: u64) -> u64 {
-        let row_bytes = cross_len * BYTES_PER_PIXEL;
-        if row_bytes == 0 {
+        let Some(row_bytes) = band_row_bytes(cross_len, self.scale) else {
             return 0;
-        }
-        self.rows.len() as u64 / row_bytes
+        };
+        self.rows.len() as u64 / row_bytes * u64::from(self.scale)
     }
 
     /// The first row *past* this band.
@@ -426,27 +460,34 @@ impl BandStore {
         self.budget
     }
 
-    /// Adds a band. The band has to be a whole number of rows for this canvas, must not overlap what
-    /// is already there — writing an overlapping band means the caller believes it knows where the
-    /// content is and the canvas does not (invariant 6) — and must carry the checksum of its own
-    /// bytes, because that checksum is the only thing that makes a later load verifiable.
+    /// Adds a band. The band has to be a whole number of rows **at its own scale** for this canvas,
+    /// must not overlap what is already there — writing an overlapping band means the caller believes
+    /// it knows where the content is and the canvas does not (invariant 6) — and must carry the
+    /// checksum of its own bytes, because that checksum is the only thing that makes a later load
+    /// verifiable.
+    ///
+    /// Overlap is checked **within a scale**: a preview band at scale `s` covers exactly the canvas
+    /// rows that the full-resolution bands under it cover, and that is the design rather than a
+    /// conflict (§19.2 — the thumbnail *is* those rows, smaller).
     ///
     /// `insert` does not evict: [`Self::relieve`] does, once per step, after the caller has said what
     /// the next step needs. Splitting them is what lets one step write a band and still keep the
     /// reference viewport resident for the next one (§17.5 ③).
     pub(crate) fn insert(&mut self, band: Band) {
-        let row_bytes = self.cross_len * BYTES_PER_PIXEL;
+        let row_bytes = band_row_bytes(self.cross_len, band.scale).unwrap_or(0);
         assert!(
             row_bytes > 0 && band.rows.len() as u64 % row_bytes == 0,
-            "a band must be a whole number of rows: {} bytes for a canvas {} px wide",
+            "a band must be a whole number of rows: {} bytes for a canvas {} px wide at scale {}",
             band.rows.len(),
-            self.cross_len
+            self.cross_len,
+            band.scale
         );
         assert!(
             self.is_disjoint_from(&band),
-            "band {}..{} overlaps a band that is already in the store",
+            "band {}..{} at scale {} overlaps a band at the same scale that is already in the store",
             band.first_row,
-            band.end_row(self.cross_len)
+            band.end_row(self.cross_len),
+            band.scale
         );
         assert_eq!(
             band.fnv,
@@ -464,9 +505,15 @@ impl BandStore {
         self.sync_accounting();
     }
 
-    /// Evicts resident bands to disk, least recently written first, until the budget is reachable —
-    /// skipping every position in `protected`, which is the caller's answer to "what does the next
-    /// step need" (§17.5 ③). Returns how many bands went to disk.
+    /// Evicts resident bands, least recently written first, until the budget is reachable — skipping
+    /// every position in `protected`, which is the caller's answer to "what does the next step need"
+    /// (§17.5 ③). Returns how many bands left memory.
+    ///
+    /// Two fates, and §22.3's first eviction step is the order between them: a preview band
+    /// (`scale != FULL_SCALE`) is **dropped**, because the thumbnail is derived from the canvas and the
+    /// next window refresh rebuilds it; a canvas band is **spilled**, because it is not rebuildable
+    /// from anything. So the count is "left memory" and not "went to disk" — `spilled().len()` is the
+    /// answer to the narrower question, and `P4.06`'s `spill_file_bytes` is its cost.
     ///
     /// A budget that cannot be reached with nothing but the protected bands resident is
     /// [`BandError::MemoryLimit`] — §22.3's third step, where the viewport itself is too large for the
@@ -556,18 +603,39 @@ impl BandStore {
         Ok(bytes)
     }
 
+    /// The next band to evict: [`BandStore`]'s LRU rule, with §22.3's first step in front of it.
+    ///
+    /// §22.3 spends the preview's memory first because a preview band is rebuildable and a canvas band
+    /// is not, so the search runs twice: once over the preview bands, and only if that finds nothing
+    /// over the canvas bands. `protected` is a set of canvas positions and therefore filters only the
+    /// second pass — the reference viewport says nothing about a thumbnail, which is dropped and
+    /// rebuilt as a whole.
     fn least_recently_written(&self, protected: &[u64]) -> Option<usize> {
-        self.resident
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| !protected.contains(&entry.band.first_row))
-            .min_by_key(|(_, entry)| entry.written)
-            .map(|(index, _)| index)
+        let oldest = |preview: bool| {
+            self.resident
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| (entry.band.scale != FULL_SCALE) == preview)
+                .filter(|(_, entry)| preview || !protected.contains(&entry.band.first_row))
+                .min_by_key(|(_, entry)| entry.written)
+                .map(|(index, _)| index)
+        };
+        oldest(true).or_else(|| oldest(false))
     }
 
-    /// Moves one band to the spill file. A band that cannot be written stays resident and the error
+    /// Drops one band. A preview band is dropped rather than spilled (§22.3's first step): it is
+    /// derived from the canvas and the next window refresh rebuilds it, so writing it to disk would
+    /// buy a read of something that is already obsolete — and the spill index is keyed by the canvas
+    /// position, which the two scales share.
+    ///
+    /// A canvas band goes to the spill file. One that cannot be written stays resident and the error
     /// comes back to the caller: an eviction that failed silently would be a leak with a checksum.
     fn evict(&mut self, index: usize) -> Result<(), BandError> {
+        if self.resident[index].band.scale != FULL_SCALE {
+            self.resident.remove(index);
+            self.sync_accounting();
+            return Ok(());
+        }
         let entry = self.resident.remove(index);
         match self.write_spill(&entry.band) {
             Ok(spilled) => {
@@ -615,9 +683,15 @@ impl BandStore {
     }
 
     /// The store's own bookkeeping, written into the budget after every change so that
-    /// [`MemoryBudget::resident_canvas`] always means "what this store holds".
+    /// [`MemoryBudget::resident_canvas`] and [`MemoryBudget::resident_preview`] always mean "what this
+    /// store holds".
+    ///
+    /// Two setters and not one sum, because §22.3's eviction order is a decision about which half is
+    /// which: the preview half is spent first, so the budget has to know how much of it there is. A
+    /// single number would make that step unrepresentable.
     fn sync_accounting(&mut self) {
-        self.budget.set_canvas(self.resident_bytes());
+        self.budget.set_canvas(self.resident_canvas_bytes());
+        self.budget.set_preview(self.resident_preview_bytes());
     }
 
     /// The size of the session's spill file in bytes, or `0` if nothing has been evicted yet.
@@ -644,27 +718,80 @@ impl BandStore {
         }
     }
 
-    fn is_disjoint_from(&self, candidate: &Band) -> bool {
-        self.resident.iter().all(|entry| {
-            candidate.first_row >= entry.band.end_row(self.cross_len)
-                || entry.band.first_row >= candidate.end_row(self.cross_len)
-        })
+    /// The rows the canvas proper holds — every band at [`FULL_SCALE`].
+    ///
+    /// Invariant 7's canvas half compares this with [`MemoryBudget::resident_canvas`]; the sum of the
+    /// two halves is [`Self::resident_bytes`].
+    pub(crate) fn resident_canvas_bytes(&self) -> u64 {
+        self.resident
+            .iter()
+            .filter(|entry| entry.band.scale == FULL_SCALE)
+            .map(|entry| entry.band.rows.len() as u64)
+            .sum()
     }
 
-    /// Invariant 6: no two bands share a row.
+    /// The rows the preview holds — every band that is not at [`FULL_SCALE`], which today means the
+    /// windowed thumbnail of §19.2.
+    ///
+    /// This is the number `E-MEM-1`'s "thumbnail memory does not follow the content length" claim is
+    /// read off, and the number §22.3's first eviction step spends.
+    pub(crate) fn resident_preview_bytes(&self) -> u64 {
+        self.resident
+            .iter()
+            .filter(|entry| entry.band.scale != FULL_SCALE)
+            .map(|entry| entry.band.rows.len() as u64)
+            .sum()
+    }
+
+    /// Throws away every band that is not canvas content.
+    ///
+    /// The thumbnail is a function of the canvas **and of the canvas' origin**: its rows are aligned
+    /// to multiples of the scale, so a prepend, a truncation or a removed prefix can leave one that
+    /// starts mid-block. Rather than carry half-aligned bands, the store drops them — they are
+    /// rebuildable from the canvas, which is exactly the property that made them the first thing to
+    /// evict. Returns how many bands went.
+    pub(crate) fn drop_previews(&mut self) -> u64 {
+        let before = self.resident.len();
+        self.resident
+            .retain(|entry| entry.band.scale == FULL_SCALE);
+        let dropped = (before - self.resident.len()) as u64;
+        if dropped > 0 {
+            self.sync_accounting();
+        }
+        dropped
+    }
+
+    fn is_disjoint_from(&self, candidate: &Band) -> bool {
+        self.resident
+            .iter()
+            .filter(|entry| entry.band.scale == candidate.scale)
+            .all(|entry| {
+                candidate.first_row >= entry.band.end_row(self.cross_len)
+                    || entry.band.first_row >= candidate.end_row(self.cross_len)
+            })
+    }
+
+    /// Invariant 6: no two bands **at the same scale** share a row. Bands at different scales overlap
+    /// by construction — a thumbnail covers the canvas rows it was made from — so the comparison is
+    /// per scale and the invariant is still about each position having one owner.
     pub(crate) fn is_disjoint(&self) -> bool {
-        let mut ranges: Vec<(u64, u64)> = self
+        let mut scales: Vec<u32> = self
             .resident
             .iter()
-            .map(|entry| {
-                (
-                    entry.band.first_row,
-                    entry.band.end_row(self.cross_len),
-                )
-            })
+            .map(|entry| entry.band.scale)
             .collect();
-        ranges.sort_unstable();
-        ranges.windows(2).all(|pair| pair[0].1 <= pair[1].0)
+        scales.sort_unstable();
+        scales.dedup();
+        scales.into_iter().all(|scale| {
+            let mut ranges: Vec<(u64, u64)> = self
+                .resident
+                .iter()
+                .filter(|entry| entry.band.scale == scale)
+                .map(|entry| (entry.band.first_row, entry.band.end_row(self.cross_len)))
+                .collect();
+            ranges.sort_unstable();
+            ranges.windows(2).all(|pair| pair[0].1 <= pair[1].0)
+        })
     }
 
     /// Moves every band down by `rows`. Used by a prepend (`P1.19`): the content did not move, the
@@ -675,6 +802,7 @@ impl BandStore {
         if rows == 0 {
             return;
         }
+        self.drop_previews();
         for entry in &mut self.resident {
             entry.band.first_row += rows;
         }
@@ -699,6 +827,7 @@ impl BandStore {
         if rows == 0 {
             return;
         }
+        self.drop_previews();
         for entry in &mut self.resident {
             entry.band.first_row = entry
                 .band
@@ -727,6 +856,7 @@ impl BandStore {
     /// (`P1.19`), and undoing it removes exactly that band — resident or spilled, because where a band
     /// happens to live is not part of what a band *is*.
     pub(crate) fn remove_leading(&mut self, rows: u64) {
+        self.drop_previews();
         if let Some(first) = self.resident.first() {
             if first.band.first_row == 0 {
                 assert_eq!(
@@ -753,7 +883,11 @@ impl BandStore {
         panic!("no band starts at row 0: a prepend inserts one, and only an undo of that prepend removes it");
     }
 
-    /// Invariant 7's left-hand side: what is resident **now**.
+    /// Invariant 7's left-hand side: what is resident **now**, both halves together.
+    ///
+    /// The halves have their own readers ([`Self::resident_canvas_bytes`],
+    /// [`Self::resident_preview_bytes`]) because they answer different questions; this is the total,
+    /// which is what `relieve` compares against and what its `MemoryLimit` reports.
     pub(crate) fn resident_bytes(&self) -> u64 {
         self.resident
             .iter()
@@ -773,6 +907,7 @@ impl BandStore {
     /// This is the only operation in this module that destroys content, and it is deliberately the
     /// only one that cannot fail silently: every read goes through the checksum.
     pub(crate) fn truncate(&mut self, rows: u64) -> Result<(), BandError> {
+        self.drop_previews();
         let row_bytes = (self.cross_len * BYTES_PER_PIXEL) as usize;
         let mut kept: Vec<ResidentBand> = Vec::with_capacity(self.resident.len());
         for entry in self.resident.drain(..) {
@@ -836,7 +971,11 @@ impl BandStore {
     /// The `count` most recently written bands, newest last. §17.5 ③ protects them from eviction:
     /// they are what a small rollback reads (§17.4's `Contained`).
     pub(crate) fn most_recent(&self, count: usize) -> Vec<&Band> {
-        let mut entries: Vec<&ResidentBand> = self.resident.iter().collect();
+        let mut entries: Vec<&ResidentBand> = self
+            .resident
+            .iter()
+            .filter(|entry| entry.band.scale == FULL_SCALE)
+            .collect();
         entries.sort_unstable_by_key(|entry| entry.written);
         entries
             .into_iter()
@@ -844,6 +983,16 @@ impl BandStore {
             .take(count)
             .map(|entry| &entry.band)
             .collect()
+    }
+
+    /// The canvas bands, without the preview's. [`Self::bands`] is every resident band — the two
+    /// answers differ because a thumbnail covers canvas rows it is not a copy of, so anything asking
+    /// "which rows does the canvas hold" has to exclude it.
+    pub(crate) fn canvas_bands(&self) -> impl Iterator<Item = &Band> {
+        self.resident
+            .iter()
+            .filter(|entry| entry.band.scale == FULL_SCALE)
+            .map(|entry| &entry.band)
     }
 
     /// Test-only: the budget is the store's, and the invariant cases have to build a store that is
@@ -1187,6 +1336,16 @@ impl RecoveredImage {
         &self.bands
     }
 
+    /// The store, mutably: the preview's thumbnail derivation (§19.2) puts its band in through here.
+    ///
+    /// It is the same store the capture path writes to, which is the whole point of ADR-9 — the
+    /// thumbnail shares the budget, the LRU and the eviction order instead of bringing its own. A
+    /// second store would need a second budget, and two budgets cannot be spent in the order §22.3
+    /// describes.
+    pub(crate) fn bands_mut(&mut self) -> &mut BandStore {
+        &mut self.bands
+    }
+
     /// The first frame establishes the canvas: every row it shows is new content.
     ///
     /// This is the only call that writes a whole viewport at once, and §17.3's rule is vacuous here
@@ -1412,7 +1571,7 @@ impl RecoveredImage {
         if let Some((position, extent)) = reference {
             let start = position.max(0) as u64;
             let end = start + extent;
-            for band in self.bands.bands() {
+            for band in self.bands.canvas_bands() {
                 if band.first_row < end && start < band.end_row(self.cross_len) {
                     protected.push(band.first_row);
                 }
@@ -1478,10 +1637,17 @@ impl RecoveredImage {
         );
         assert_eq!(
             self.bands.budget().resident_canvas(),
-            self.bands.resident_bytes(),
+            self.bands.resident_canvas_bytes(),
             "invariant 7 (docs/30 §20.3, §22.3): the budget says {} canvas bytes are resident and the store holds {} — the memory bound is only real if the accounting is the store's own",
             self.bands.budget().resident_canvas(),
-            self.bands.resident_bytes()
+            self.bands.resident_canvas_bytes()
+        );
+        assert_eq!(
+            self.bands.budget().resident_preview(),
+            self.bands.resident_preview_bytes(),
+            "invariant 7 (docs/30 §20.3, §22.3): the budget says {} preview bytes are resident and the store holds {} — §22.3 spends the preview's memory first, so it has to be accounted for separately",
+            self.bands.budget().resident_preview(),
+            self.bands.resident_preview_bytes()
         );
         assert!(
             !self.bands.budget().over_budget(),
@@ -3085,5 +3251,56 @@ mod tests {
                 discarded: 0,
             },
         );
+    }
+
+    /// §22.3's first eviction step (`P5.02`, ADR-9): a preview band goes before any canvas band,
+    /// because it is rebuildable from the canvas and a canvas band is not.
+    ///
+    /// The budget here holds exactly the three canvas bands, so the only way back under it is to drop
+    /// both preview bands — and the reference band, which is not protected here, must survive anyway.
+    /// A store that had never learned the difference would spill the least recently written band it
+    /// could see (the preview at row 0, then the canvas band at row 10) and fail every assertion
+    /// below that is about a canvas band still being resident.
+    #[test]
+    fn evicting_preview_bands_never_evicts_the_reference_band() {
+        const SCALE: u32 = 4;
+        let canvas_bytes = 3 * CROSS * BYTES_PER_PIXEL * BAND_ROWS;
+        let mut store = BandStore::new(CROSS, MemoryBudget::with_total(canvas_bytes));
+        for index in 0..3u64 {
+            store.insert(band(index * BAND_ROWS, BAND_ROWS));
+        }
+        let preview_row_bytes = (CROSS * BYTES_PER_PIXEL / u64::from(SCALE)) as usize;
+        for index in [0u64, 2] {
+            store.insert(Band::at_scale(
+                index * BAND_ROWS,
+                SCALE,
+                vec![0u8; 5 * preview_row_bytes],
+            ));
+        }
+
+        assert!(
+            store.budget().over_budget(),
+            "the fixture has to start over budget or `relieve` has nothing to decide"
+        );
+        assert_eq!(
+            store.relieve(&[0]),
+            Ok(2),
+            "both preview bands are what has to go: they are the rebuildable ones"
+        );
+        for index in 0..3u64 {
+            assert!(
+                store.is_resident(index * BAND_ROWS),
+                "canvas band {} was evicted while a preview band was still resident",
+                index * BAND_ROWS
+            );
+        }
+        assert_eq!(store.resident_preview_bytes(), 0);
+        assert_eq!(store.resident_canvas_bytes(), canvas_bytes);
+        assert_eq!(
+            store.spilled().len(),
+            0,
+            "a dropped preview is not a spilled band: there is nothing on disk to read back"
+        );
+        assert_eq!(store.spill_file_bytes(), 0);
     }
 }

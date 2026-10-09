@@ -2935,7 +2935,9 @@ enum BandError {
 
 **一处执行期修订**：RED 阶段写的断言是"读完全部条带后 `spilled` 为空"（当时以为读回即常驻）；GREEN 期间定下裁决 3 后该断言与设计相反，改为"读完**仍是 9 条落盘**"。这不是放宽——它把一条设计决定变成了可执行的钉子。
 
-**尚未落地**：`MemoryBudget::set_preview` 今天**没有生产调用点**（预览属 `P2`，因此 `resident_preview` 恒为 0，§22.3 的第一步"先换出预览"由预览的所有者负责）；`checksum` 现在与 §15.4 第 1 层的行摘要**共用一份实现**（`displacement::checksum`，`line_digest` 委托它）。
+**尚未落地**：`checksum` 现在与 §15.4 第 1 层的行摘要**共用一份实现**（`displacement::checksum`，`line_digest` 委托它）。
+
+**已落地（`P5.02`，2026-10-09）**：`MemoryBudget::set_preview` 的**生产调用点**。此处原先记着"`resident_preview` 恒为 0、§22.3 的第一步由预览的所有者负责"——那个所有者就是 `BandStore::sync_accounting`，而 `P5.02` 之后它一次写两个半场（`set_canvas(resident_canvas_bytes())` + `set_preview(resident_preview_bytes())`），§22.3 的第一步是 `least_recently_written` 的两趟，不变量 7 也拆成两条 assert。见 §19.2.1。
 
 **已落地（`P4.06`，2026-10-09）**：`SpillRef` 的治理。两条可 `grep` 的 `Drop` 规则（`impl Drop for SpillFile` / `impl Drop for BandStore`）、`SpillRef` 上**刻意没有** `Drop` 的理由、以及"最后一条引用离开时提前释放文件"（`reclaim_spill_file`）——见 §22.7.1。
 
@@ -3400,6 +3402,42 @@ tile  class      weight   observations
 > 预览框显示的不是整图，而是一个**固定高度的窗口**（贴面板底/顶），窗口内的内容是按需生成的缩略条带；窗口之外**不生成任何像素**，只保留一个"进度边界"标记。
 
 **与 §17.5 `BandStore` 的复用关系（重要，避免新增存储层）**：缩略条带**不是另一套存储**，而是 `BandStore` 里的**另一种条带**——它共享同一个 `MemoryBudget`、同一个 LRU、同一个换出文件。区别只是"缩略段"的宽度是 `Pw` 而"全分辨率段"是 `canvas_width`，因此同样字节预算能容纳的缩略段多 12 倍。**这是 V2 相对 `docs/19` 的简化**：V1 的 `PreviewPatch`/`PreviewState` 是独立的预览通道与状态，V2 把它降级为"同一存储的另一种条目"。
+
+#### 19.2.1 落地形状（`P5.02`，2026-10-09）
+
+**落点**：`Band` 与 `BandStore` 在 `crates/snapclip-capture/src/scroll/canvas.rs`，窗口化派生在 `crates/snapclip-capture/src/scroll/preview.rs`（§28.5 的目录清单把它写在 `preview.rs` 的 `# PreviewStream + PreviewUpdate + 缩略派生`）。
+
+**`scale` 是 `Band` 的字段，不是第二种类型**（ADR-9 的落地）：
+
+| 形状 | 内容 |
+|---|---|
+| `canvas::FULL_SCALE = 1`、`Band::at_scale(first_row, scale, rows)` | `Band::new` 变成 `at_scale(_, FULL_SCALE, _)` ⇒ 画布路径的 7 个构造点**一字未改** |
+| `canvas::band_row_bytes(cross_len, scale) = cross_len / scale * 4` | 缩略行宽；**按像素除**而不是按字节除，否则与 `thumbnail_rows` 产出的行宽不一致，`insert` 的整除断言会红 |
+| `Band::row_count` 改为 `rows.len() / band_row_bytes(...) * scale` | 缩略条带仍以**画布行**计量 ⇒ `row_count`/`end_row` 的 **15 个调用点全部不用改**，位置空间（`is_disjoint`/`shift_rows`/`read_rows`/`truncate`）继续以画布行为单位 |
+| 不相交只对**同 scale**断言（`is_disjoint_from` / `is_disjoint` 按 scale 分组） | 跨 scale 的重叠是设计：缩略条带覆盖的正是它来自的那些画布行 |
+| `resident_canvas_bytes`（scale == 1）/ `resident_preview_bytes`（scale ≠ 1）/ `resident_bytes`（二者之和） | `sync_accounting` 改为**两个 setter** ⇒ §22.3 的"先换出预览"才有可表示的输入；不变量 7 也拆成两条 assert |
+| `least_recently_written` **两趟**：先只在缩略条带里找最久未写者，找不到才找画布条带 | §22.3 第一步的可执行形式；`protected` 是画布位置的集合，因此只过滤第二趟 |
+| `evict`：`scale != FULL_SCALE` ⇒ **直接丢弃**，不落盘 | 见下面的偏离 |
+| `drop_previews`，由 `shift_rows`/`unshift_rows`/`truncate`/`remove_leading` 调用 | 缩略行的对齐（`first_row % scale == 0` 且覆盖行数是 `scale` 的整数倍）是**画布原点上的事实**；prepend 会把每个 `first_row` 平移一个不是 `scale` 倍数的量，保留它们就得处理"半格"，而它们是可重建的 |
+| `RecoveredImage::bands_mut`（新增）+ `BandStore::canvas_bands`（新增） | 派生要往 store 里放条带；`protected_rows`/`most_recent` 改用 `canvas_bands`，`bands()` 仍是"全部常驻条带" |
+
+**窗口化派生**（`preview.rs`）：`PREVIEW_TARGET_PX = 128`（§3.8）、`preview_scale(cross_len) = ceil(cross_len / 128)`（**向上取整**，让缩略宽度不超过目标；128 ⇒ 1、129 ⇒ 2、1500 ⇒ 12（125 px）、3840 ⇒ 30（128 px））、`window_bounds(scale, first_row, rows)`（**向内**对齐到整缩略行，取不到一整行时 `None` 而不是错误）、`thumbnail_rows`（`scale × scale` 盒式滤波）、`refresh_window(canvas, scale, first_row, rows)`（先 `drop_previews`，读画布行，算出缩略带，`insert` 进同一个 store，返回写入的缩略行数）。`refresh_window` **刻意不调 `relieve`**：§17.5 ③ 的规则是"`insert` 不换出、`relieve` 每步一次"，而驱动那一步已经调过。
+
+**实测（2026-10-09）**：
+
+| 用例 | 装置 | 结果 |
+|---|---|---|
+| `the_preview_scale_lands_the_thumbnail_at_its_target_width` | 纯算术 | 五组 `cross_len` 的 `cross_len / scale <= 128` 全部成立（含恰好 128 与 129 两侧） |
+| `a_hundred_thousand_pixel_canvas_never_materialises_a_whole_thumbnail` | 64×64 视口、48 行/步、`scale = 4`、窗口 640 行；10,000 行与 100,000 行两块画布 | 两块画布的 `resident_preview_bytes` **相等**（各 `160 × 64 = 10,240 B`）；100,000 行那块若做整图缩略是 `25,000 × 64 = 1,600,000 B`（**156×**）；`budget().resident_preview()` 与该数一致 |
+| `evicting_preview_bands_never_evicts_the_reference_band` | 预算 24,000 B（恰好 3 条画布条带），3 条画布条带（各 8,000 B，`first_row` = 0/10/20，保护 `[0]`）+ 2 条 `scale = 4` 的缩略条带（各 1,000 B） | `relieve(&[0]) == Ok(2)`；**三条画布条带全部仍常驻**（旧规则会落盘 `first_row = 10` 与 `= 20` 那两条）；`resident_preview_bytes() == 0`；`resident_canvas_bytes() == 24,000`；`spilled().len() == 0` 且 `spill_file_bytes() == 0`（缩略条带没有进换出文件） |
+
+**两处 RED 都是编译错误**（装置不存在，诚实记录，与 `P4.05`/`P4.07` 同形）：`error[E0425]: cannot find value PREVIEW_TARGET_PX` / `cannot find function preview_scale` / `cannot find function refresh_window` / `cannot find method resident_preview_bytes` / `cannot find associated function at_scale`，共 **13 previous errors**。
+
+**一处对 §19.2 的偏离（须记住）**：§19.2 逐字写"共享同一个换出文件"，而落地是**缩略条带被丢弃、永不落盘**。两个理由：① 它按构造可重建（`refresh_window` 每次都先 `drop_previews`），把它写进盘是为一份下一次重绘就作废的数据付磁盘；② `spilled` 是以 `first_row` 为 key 的 `BTreeMap`，两种 scale 会**撞 key**（同一 `first_row` 的画布条带与缩略条带会互相覆盖），要支持就得把 key 改成 `(scale, first_row)` 并让 `SpillRef` 带 scale、`read_rows` 过滤 scale——**全是没有任何消费者的机器**（`AGENTS.md` 禁死代码）。后果是正面的：`spilled` 保持单 key，`SpillRef` 不加字段，`read_rows`/`read_spilled` 一字未改。
+
+**一处文档勘误**：`BandStore::relieve` 的 doc 原写"Returns how many bands went to disk"。本任务起它有**两种去向**（丢弃 / 落盘），因此改为"how many bands left memory"，并把"落盘了几条"指向 `spilled().len()`、把代价指向 `P4.06` 的 `spill_file_bytes()`。
+
+**REFACTOR 的 `grep -c PreviewPatch == 0`**：全仓（`crates/`、`apps/`、`docs/`）实测零命中。这一条**自 `docs/30` 成文起就成立**（`docs/19` 的旧类型从未进过代码），它是一条关于 `docs/19` 的声称，不是本任务删掉了什么——记录在案以免被读成"本任务做了什么"。
 
 ### 19.3 `PreviewStream`：有界 latest-only 增量通道
 
@@ -4045,7 +4083,7 @@ struct MemoryBudget {
 |---|---|---|
 | `total` | `for_viewport(cross_len, extent)`（`cross × extent × 4 × 8`）/ `with_total` | `over_budget()`、`headroom()` |
 | `resident_canvas` | `BandStore::sync_accounting()`（每次 `insert`/换出后 = `resident_bytes()`） | `over_budget()`、`headroom()`，并在 `assert_invariants` 里与 store 实持字节**交叉核对**（`assert_eq!`，记账漂移 = 不变量失败） |
-| `resident_preview` | `set_preview(bytes)`（**今天无生产调用点**——预览属 `P2`） | `over_budget()`、`headroom()`（因此第 1 步"先换出预览"今天不触发，`resident_preview` 恒为 0） |
+| `resident_preview` | `set_preview(bytes)` —— **已有生产调用点**（`BandStore::sync_accounting`，`P5.02`，见 §19.2.1） | `over_budget()`、`headroom()`（因此第 1 步"先换出预览"会触发，`resident_preview` 是缩略条带的实数） |
 
 上面第 2 步的"LRU"在落地时被钉成**最先写入的最先换出**：条带不可变，且从盘上读回一条**不会**让它重新常驻（否则"导出一次全图"就把整块画布变回常驻，`F-07` 会退化成与"怎么读"有关的性质）。`§17.5.1` 记了六处裁决与五条用例的实测。
 
@@ -4057,7 +4095,7 @@ struct MemoryBudget {
 | 单个 `Observation` 内多视图（灰度、降采样、梯度）的**缓冲区复用** | **能** | 三个视图都在同一个 `Observation` 生命周期内，用一块 scratch 复用（§22.5） |
 | GPU 纹理 → CPU 回读 | **不能**（架构限制） | 必须拷贝。**唯一可做的是减少次数**：§11.3 硬规则"每步一次" |
 | 画布条带 → 匹配的 `match_region` | **能**（只读句柄） | 用 `Arc<Band>` + 行偏移，不复制。**`P1.20` 落地时未采纳**：今天 `RecoveredImage::rows` 把区间拷成 `Vec<u8>`（条带是裸 `Vec<u8>`，没有可共享的句柄）；零拷贝是接口演进，不是已实现的性质 |
-| 预览缩略 | **不能**（需要不同尺度） | 必须生成；但只生成**新增段** |
+| 预览缩略 | **不能**（需要不同尺度） | 必须生成；但只生成**可见窗口**（`P5.02` 落地，§19.2.1）。此处原写"新增段"——落地的是"窗口"，因为缩略条带的对齐是画布原点上的事实，增量会留下半格 |
 | BGRA → PNG | **不能**（格式不同），但可**只重排一次** | 在行带边界重排（§17.7），不整幅重排 |
 | `BandStore` ↔ 换出文件 | **不能** | 必须 I/O |
 
@@ -5726,7 +5764,7 @@ fn rows_match(actual, expected, sigma) -> bool
 | 八问可答 | 会话进行 10 步 | §19.1 的八项都有确定值 | L2 | — |
 | 视口框三态 | 构造 `Confirmed`/`Uncertain`/`Ended` | 外观与 §19.4 一致 | L2 | — |
 | 视口框下限 | 100,000 px 画布 | 框高 ≥ 4 DIP（始终可见） | L2 | — |
-| 预览窗口化 | 100,000 px 画布 | **不生成整图缩略**；只生成可见窗口 | L1 | **Memory** |
+| 预览窗口化 | 100,000 px 画布 | **不生成整图缩略**；只生成可见窗口 | L1 | **Memory**（`P5.02` 实测：64 px 宽、`scale = 4`、窗口 640 行 ⇒ 10,000 行与 100,000 行两块画布的缩略内存**相等**，各 10,240 B；整图缩略会是 1,600,000 B，见 §19.2.1） |
 | 拖动后停止跟随 | 拖动 ⇒ `set_follow(false)`；"回到最新" ⇒ `set_follow(true)` | 进入手动模式（`n = 0`：不注入、不学习）；`follow()`/`manual()` 随之翻转，`phase()` 不变（模式不是相位） | L1 | — |
 | 预览不阻塞采集 | mock 让 UI 消费极慢 | 采集步数不受影响；`dropped > 0` | L2 | — |
 | 预览不阻塞采集（**端口侧已可执行，`P3.08`**） | 消费者**持有锁**（比"消费慢"更强的形式：它根本不消费） | `publish` 立即返回、更新被丢弃而不是排队（`dropped == 1`、`take() == None`） | L1 | — |

@@ -65,6 +65,14 @@
 //!   that dropped updates on a timer would be making a policy decision inside a data structure. The
 //!   limit is [`PreviewCadence`], and the producer consults it before it calls [`PreviewStream`].
 //!
+//! ## Where the thumbnail is
+//!
+//! [`refresh_window`] derives the windowed thumbnail (`P5.02`) and puts it in the **canvas' own**
+//! [`crate::scroll::canvas::BandStore`] as a band at a scale — not in a store of its own. ADR-9 and
+//! §19.2: the thumbnail is the same data at a different scale, so it shares the budget, the LRU and
+//! §22.3's eviction order, in which the rebuildable half is spent first. A separate store would need a
+//! separate budget, and two budgets cannot be spent in that order.
+//!
 //! ## Not here yet
 //!
 //! * `PreviewSink` (§27.1 lists it as a seam trait). `P5.01` is where it would have been used and it
@@ -72,7 +80,8 @@
 //!   cheap to construct and drain in a test, so a trait over it would have one implementor and no
 //!   double. §27.1 lists it as a boundary type; the boundary it names is already crossed by
 //!   `PreviewUpdate`, which is the type that has to stay small and pixel-free.
-//! * The windowed thumbnail derivation (`scale`, §19.2/§19.3) — `P5.02`.
+//! * The consumer that calls [`refresh_window`] — `P5.03`'s overlay, which asks for the window it is
+//!   about to draw.
 
 #![allow(dead_code)] // First producer is the driver (`P5.01`); `P3.08` lands the port itself.
 
@@ -81,6 +90,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use crate::scroll::canvas::{Band, BandError, RecoveredImage};
 use crate::scroll::displacement::Status;
 use crate::scroll::session::StopReason;
 
@@ -326,9 +336,114 @@ impl PreviewCadence {
     }
 }
 
+/// How wide a thumbnail is allowed to be, in physical pixels (§3.8: "跨轴固定 128 物理像素").
+pub(crate) const PREVIEW_TARGET_PX: u64 = 128;
+
+/// The downscaling factor that puts a `cross_len`-wide canvas at or under [`PREVIEW_TARGET_PX`].
+///
+/// Rounding **up** is the whole of it: a scale that rounded down would make the thumbnail wider than
+/// the number §3.8 names, and the point of the fixed width is that the preview's cost is a property
+/// of the display rather than of the window being captured.
+pub(crate) fn preview_scale(cross_len: u64) -> u32 {
+    cross_len.div_ceil(PREVIEW_TARGET_PX).max(1) as u32
+}
+
+/// The whole thumbnail rows inside `[first_row, first_row + rows)`, as `(start, end)` in canvas rows.
+///
+/// The bounds are pulled **inwards** to multiples of the scale, because a thumbnail row is made of a
+/// whole `scale × scale` block: a band that started mid-block could not be compared with, or dropped
+/// interchangeably with, the ones around it. `None` when the request is narrower than one thumbnail
+/// row, which is not an error — there is simply nothing at this scale to show.
+pub(crate) fn window_bounds(scale: u32, first_row: u64, rows: u64) -> Option<(u64, u64)> {
+    let scale = u64::from(scale.max(1));
+    let start = first_row.div_ceil(scale) * scale;
+    let end = (first_row + rows) / scale * scale;
+    (end > start).then_some((start, end))
+}
+
+/// One box filter: `canvas_rows` at full resolution in, the same content at `scale` out.
+///
+/// `canvas_rows` has to cover a whole number of thumbnail rows — `refresh_window` takes the bounds
+/// from [`window_bounds`], which is what guarantees it. The cross axis is divided by the same integer
+/// the rest of the derivation uses, so a canvas whose width is not a multiple of the scale loses its
+/// last few columns rather than producing a band whose row width disagrees with
+/// `canvas::band_row_bytes`.
+pub(crate) fn thumbnail_rows(canvas_rows: &[u8], cross_len: u64, scale: u32) -> Vec<u8> {
+    let step = scale.max(1) as usize;
+    let cross = cross_len as usize;
+    let canvas_row_bytes = cross * 4;
+    assert!(
+        step > 0
+            && canvas_row_bytes > 0
+            && canvas_rows.len() % (canvas_row_bytes * step) == 0,
+        "a thumbnail needs whole rows: {} bytes at {cross} px do not divide into {} thumbnail rows",
+        canvas_rows.len(),
+        step
+    );
+    let own_rows = canvas_rows.len() / (canvas_row_bytes * step);
+    let preview_px = cross / step;
+    let mut out = vec![0u8; own_rows * preview_px * 4];
+    for row in 0..own_rows {
+        for column in 0..preview_px {
+            let mut sums = [0u32; 4];
+            for dy in 0..step {
+                let canvas_row = row * step + dy;
+                for dx in 0..step {
+                    let offset = (canvas_row * cross + column * step + dx) * 4;
+                    for (channel, sum) in sums.iter_mut().enumerate() {
+                        *sum += u32::from(canvas_rows[offset + channel]);
+                    }
+                }
+            }
+            let count = (step * step) as u32;
+            let out_offset = (row * preview_px + column) * 4;
+            for (channel, sum) in sums.iter().enumerate() {
+                out[out_offset + channel] = (sum / count) as u8;
+            }
+        }
+    }
+    out
+}
+
+/// Rebuilds the preview's thumbnail for the window `[first_row, first_row + rows)`: §19.2's
+/// windowed virtual preview.
+///
+/// Only the window is ever derived — there is no path here that would produce a whole-canvas
+/// thumbnail — and the band it produces is an ordinary [`Band`] at `scale`, inserted into the very
+/// store that holds the canvas. That is ADR-9: one budget, one LRU, one eviction order, with §22.3
+/// spending the rebuildable half first.
+///
+/// The previous preview bands go first, always: the thumbnail follows the window, so the window that
+/// was there a moment ago is stale by definition, and a band that is not dropped would either overlap
+/// the new one (invariant 6) or hold rows nobody asked for. Returns how many thumbnail rows are
+/// resident for the window afterwards.
+///
+/// It deliberately does **not** call `relieve`: `insert` never evicts, and the step that drove this
+/// window already called it once (§17.5 ③).
+pub(crate) fn refresh_window(
+    canvas: &mut RecoveredImage,
+    scale: u32,
+    first_row: u64,
+    rows: u64,
+) -> Result<u64, BandError> {
+    canvas.bands_mut().drop_previews();
+    let Some((start, end)) = window_bounds(scale, first_row, rows) else {
+        return Ok(0);
+    };
+    let canvas_rows = canvas.rows(start, end - start)?;
+    let thumbnail = thumbnail_rows(&canvas_rows, canvas.cross_len(), scale);
+    canvas
+        .bands_mut()
+        .insert(Band::at_scale(start, scale, thumbnail));
+    Ok((end - start) / u64::from(scale.max(1)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geometry::Rect;
+    use crate::scroll::canvas::{MemoryBudget, RecoveredImage, StepTally};
+    use crate::scroll::observation::{Axis, Observation};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
@@ -562,5 +677,150 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<PreviewStream>();
         assert_send_sync::<PreviewUpdate>();
+    }
+
+    /// §3.8's fixed 128 physical pixels, as arithmetic. A pure function, so the panel's target width
+    /// is checked without building a canvas at all — and it is checked from **both** sides: a canvas
+    /// at the target needs no downscaling, and one just over it does (rounding up is what keeps the
+    /// thumbnail from being *wider* than the number §3.8 names).
+    #[test]
+    fn the_preview_scale_lands_the_thumbnail_at_its_target_width() {
+        assert_eq!(preview_scale(64), 1, "narrower than the target: no room to shrink");
+        assert_eq!(preview_scale(128), 1, "exactly the target");
+        assert_eq!(preview_scale(129), 2, "one pixel over, and the scale has to move");
+        assert_eq!(preview_scale(1_500), 12, "§19.2's worked example: 125 px wide");
+        assert_eq!(preview_scale(3_840), 30, "a 4K-wide viewport");
+        for cross_len in [64u64, 128, 129, 1_500, 3_840] {
+            let scale = preview_scale(cross_len);
+            let width = cross_len / u64::from(scale);
+            assert!(
+                width <= PREVIEW_TARGET_PX,
+                "a {cross_len} px canvas at scale {scale} makes a {width} px thumbnail, which is \
+                 wider than §3.8's {PREVIEW_TARGET_PX} px target"
+            );
+        }
+    }
+
+    /// §30.6's "预览窗口化（不生成整图缩略）" row (`P5.02`, `docs/30` §19.2 + ADR-5 + ADR-9): the
+    /// thumbnail is generated for **the visible window and nothing else**, so what a preview costs is
+    /// a function of the window and not of how long the capture has been running.
+    ///
+    /// The two canvases below differ 10× in length and the first assertion is that the longer one's
+    /// thumbnail is the *same size* as the shorter one's. The second says the same thing against the
+    /// alternative design: a whole-canvas thumbnail for the 100,000-row canvas is two orders of
+    /// magnitude bigger than what is actually held. An implementation that built the whole thumbnail
+    /// would fail the first comparison with a 10× gap and the second with a ratio of 1.
+    ///
+    /// The canvas is narrow (64 px) so the fixture is affordable at 100,000 rows; the scale is
+    /// written out rather than derived because [`preview_scale`]'s own test owns the target width.
+    /// The numbers are small, the *shape* is the assertion.
+    #[test]
+    fn a_hundred_thousand_pixel_canvas_never_materialises_a_whole_thumbnail() {
+        const CROSS: u64 = 64;
+        const EXTENT: u64 = 64;
+        const STEP: u64 = 48;
+        const SCALE: u32 = 4;
+        const WINDOW: u64 = 640;
+
+        let preview_px = CROSS / u64::from(SCALE);
+        let preview_row_bytes = preview_px * 4;
+        let window_rows = WINDOW / u64::from(SCALE);
+
+        let mut short = scroll_to(CROSS, EXTENT, STEP, 10_000);
+        let mut long = scroll_to(CROSS, EXTENT, STEP, 100_000);
+
+        let short_bytes = thumbnail_of(&mut short, SCALE, WINDOW);
+        let long_bytes = thumbnail_of(&mut long, SCALE, WINDOW);
+
+        assert_eq!(
+            long_bytes,
+            window_rows * preview_row_bytes,
+            "the thumbnail is one window of {WINDOW} canvas rows at scale {SCALE}: {window_rows} \
+             rows of {preview_px} px"
+        );
+        assert_eq!(
+            short_bytes, long_bytes,
+            "a 100,000-row canvas spent {long_bytes} B on its thumbnail and a 10,000-row one spent \
+             {short_bytes} B — the preview's memory is following the content length"
+        );
+        assert_eq!(
+            long.bands().budget().resident_preview(),
+            long_bytes,
+            "invariant 7's preview half: the budget has to say what the store holds"
+        );
+
+        let whole = (long.primary_len() / u64::from(SCALE)) * preview_row_bytes;
+        assert!(
+            long_bytes * 10 < whole,
+            "the windowed thumbnail is {long_bytes} B and a whole-canvas one would be {whole} B: \
+             that is not the two orders of magnitude §19.2 promises"
+        );
+    }
+
+    /// Scrolls a canvas to at least `target` rows and applies the production eviction rule after
+    /// every step, so the fixture is the real store under the real budget — the same shape
+    /// `scroll::mem_probe` drives at 1500 px and three lengths.
+    fn scroll_to(cross_len: u64, extent: u64, step: u64, target: u64) -> RecoveredImage {
+        let mut canvas = RecoveredImage::new(
+            Axis::Vertical,
+            cross_len,
+            MemoryBudget::for_viewport(cross_len, extent),
+        );
+        let frame = frame(cross_len, extent);
+        canvas.start(&frame);
+        let mut tally = StepTally {
+            step: 0,
+            committed: 0,
+            discarded: 0,
+        };
+        while canvas.primary_len() < target {
+            canvas.append_confirmed(&frame, step);
+            let position = (canvas.primary_len() as i64 - extent as i64).max(0);
+            canvas
+                .relieve(Some((position, extent)))
+                .expect("the budget holds exactly the viewport that is protected");
+            tally.step += 1;
+            tally.committed += 1;
+            canvas.assert_invariants(cross_len, tally);
+        }
+        canvas
+    }
+
+    /// Refreshes the window that ends at the canvas' end and answers what the store now holds for the
+    /// preview. Reads the store rather than the derivation's own return value: the claim under test is
+    /// about **memory**, and a number the caller was handed is not evidence of one.
+    fn thumbnail_of(canvas: &mut RecoveredImage, scale: u32, window: u64) -> u64 {
+        let first_row = canvas.primary_len().saturating_sub(window);
+        refresh_window(canvas, scale, first_row, window).expect("the canvas has every row the window asks for");
+        canvas.bands().resident_preview_bytes()
+    }
+
+    /// One reusable viewport of text-like rows. Only its size and its packedness matter here.
+    fn frame(cross_len: u64, extent: u64) -> Observation {
+        let cross = cross_len as usize;
+        let rows = extent as usize;
+        let mut pixels = vec![0u8; cross * rows * 4];
+        for row in 0..rows {
+            for column in 0..cross {
+                let offset = (row * cross + column) * 4;
+                let value = if (row / 7 + column / 5) % 2 == 0 {
+                    0x28u8
+                } else {
+                    0xE0u8
+                };
+                pixels[offset] = value;
+                pixels[offset + 1] = value;
+                pixels[offset + 2] = value;
+                pixels[offset + 3] = 0xFF;
+            }
+        }
+        Observation::new(
+            pixels,
+            Rect::new(0, 0, cross_len as i32, extent as i32),
+            0,
+            (cross_len as u32, extent as u32),
+            Axis::Vertical,
+        )
+        .expect("the viewport is strictly packed and its region agrees with its size")
     }
 }
