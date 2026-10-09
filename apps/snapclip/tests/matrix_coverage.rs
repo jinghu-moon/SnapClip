@@ -131,7 +131,10 @@ const MATRIX: &[Row] = &[
     Row { area: "13.7", number: 7, class: 'A', level: "L1", tests: &["crates/snapclip-capture/src/windows/providers.rs::wgc_is_tried_before_the_bitblt_fallback", "crates/snapclip-capture/src/windows/providers.rs::bitblt_is_the_only_provider_once_wgc_is_dropped"] },
     Row { area: "13.7", number: 8, class: 'A', level: "CI", tests: &["tools/check-dependency-direction.ps1"] },
     Row { area: "13.7", number: 9, class: 'D', level: "L1", tests: &["crates/snapclip-model/src/capture.rs::capture_state_reports_activity", "crates/snapclip-model/src/capture.rs::state_and_format_names_are_the_frozen_contract_strings"] },
-    Row { area: "13.7", number: 10, class: 'A', level: "CI", tests: &["crates/snapclip-capture/src/windows/scroll_source.rs::no_real_desktop_test_silently_skips_in_this_module"] },
+    // §13.7 #10 is carried by two things since P6.05: the per-module nail (a module that never
+    // skips) and the whole-tree counter, whose exit code is the assertion that no test anywhere
+    // decides at run time that it has nothing to check (`docs/30 §29.2.2`).
+    Row { area: "13.7", number: 10, class: 'A', level: "CI", tests: &["crates/snapclip-capture/src/windows/scroll_source.rs::no_real_desktop_test_silently_skips_in_this_module", "scripts/count-unignored-desktop-tests.ps1"] },
 ];
 
 /// Real-desktop tests cited by [`MATRIX`]. Every one of them must stay `#[ignore]`d.

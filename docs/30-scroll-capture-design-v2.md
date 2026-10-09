@@ -3807,7 +3807,7 @@ impl RecoveredImage {
 
 **机械保证（本节的布局意图原本只存在于图里）**：`crates/snapclip-capture/src/windows/win/d2d/tests.rs` 新增 `the_preview_panel_does_not_cover_the_toolbar_hit_regions`，它是**同一次合成渲染两遍**（`scroll_panel: None` 与 `Some(..)`）后逐像素比较。三个断言各堵一个漏洞：①面板**必须真的画了东西**（否则"没遮挡"是空真）②它**只在自己报告的矩形内**作画（否则"面板的矩形"不是真正能遮住东西的区域——笔触、阴影、越界绘制都会让它变成假话）③它画到的**每一个像素**都不是覆盖层判为握把或可抓边框的点，判据取自 **`SelectionSnapshot::hit_test`**（覆盖层指针路由用的同一个调用，所以这个用例不会与被保护的命中判定漂移）。选区取**整帧**（即 §19.7 锚定面板的那个几何：滚动截取一个铺满工作区的窗口），此时右握把正好压在面板悬挂的那条边上。
 
-**用例是 `#[ignore]` 的，并且不静默跳过**：既有 22 条渲染用例的写法是 `let Ok(device) = … else { return; }`（没有 GPU 的会话里它们**假装通过**），本用例按 D-14 走 `#[ignore]` + `expect("…")`——它的 L3 身份写在 `#[ignore]` 的理由里，设备缺失时**大声失败**而不是悄悄绿。
+**用例是 `#[ignore]` 的，并且不静默跳过**：既有 22 条渲染用例的写法是 `let Ok(device) = … else { return; }`（没有 GPU 的会话里它们**假装通过**），本用例按 D-14 走 `#[ignore]` + `expect("…")`——它的 L3 身份写在 `#[ignore]` 的理由里，设备缺失时**大声失败**而不是悄悄绿。（那 22 条同型用例由 `P6.05` 一并按同一规则改掉，见 §29.2.2。）
 
 **它抓到的第一件事是真缺陷，不是布局意图的复述**：DIP 外边距与握把命中半径**各自独立四舍五入**。`PANEL_MARGIN_DIP = 16` 与 `Handle::Right` 的 `hit_handle_size` 在 100%/150%/200% 下**恰好相等**（16/24/32 px），而在 **125% 与 175%** 下差 1 px（`round(20) = 20` vs `round(12.5 + round(7.5) = 8) = 21`；`round(28) = 28` vs `round(17.5 + round(10.5) = 11) = 29`）⇒ 面板最右一列落进 `Resize(Right)`。RED 逐字（`docs/Temp/p505-red.txt`）：
 
@@ -5822,6 +5822,8 @@ exit=1
 
 **必须修复今天的一个具体缺陷**：§5 已确证今天有一批真实桌面用例**不用 `#[ignore]`，而是静默跳过**（`bitblt.rs:128-145` 的 `return`/`eprintln!("BitBlt capture unavailable in this session: {error}")`、`providers.rs:684-747`、`window_detection.rs:121-325` 的 `desktop_available()`）——**默认 `cargo test` 在无桌面 session 上会静默通过这些用例**。
 
+> **这个计数是不完整的。** `P6.05` 用脚本全量扫过之后实测是 **41 处 / 10 个文件**，不是这里人工点名的 3 处（见 §29.2.2）。§29.2 的规则不变，变的是"有多少处依赖它"。
+
 > **V2 的规则**：真实桌面用例**只有两种合法形态**——(a) `#[ignore]`（必须显式 `--ignored` 运行），或 (b) **环境断言**：若 `desktop_available()` 为 false，测试**必须**要么 `#[ignore]` 语义地跳过**并打印可见的跳过原因**，要么**断言失败**。**不允许静默 `return`。**
 
 **理由**：静默跳过会让"我以为测过了"成为系统性风险。§6 已确证参考项目 `snow_shot` 的 CTest 列表里**看不见**三个滚动测试的 LABELS（落默认 unit），也是同一类问题（**测试存在但不在门禁里**）。**"存在但不可见"与"不存在"对工程质量是等价的。**
@@ -5840,6 +5842,24 @@ exit=1
 2. **属性是行锚定的，散文不是。** 第二版仍按子串找 `#[ignore`，于是匹配到了注释里的那句 "`#[ignore]`d with a reason"。修法 = 逐行判断 `line.trim_start().starts_with("#[ignore")`。
 
 **未取得**：退出条件 ① 的字面形式是"mock 帧源可驱动 `ScrollLoop`"，而 `ScrollLoop` 是 `P3.09` 的交付物（§21.1 把唯一新增线程放在 P3）。今天满足的是**它的前置**：mock 存在、接缝是 trait 对象、且被证明能产出四种 `Poll` 形状（含"结局是终局"）。`P3.09` 接线时应当**直接使用这个 mock**，而不是另写一个。
+
+#### 29.2.2 落地（`P6.05`，2026-10-10）
+
+§29.2 的"必须修复今天的一个具体缺陷"当时点名 3 处（`bitblt.rs`、`providers.rs`、`window_detection.rs`）——那是**一次人工审读的计数，不是全量**。`P6.05` 把这条规则变成脚本 `scripts/count-unignored-desktop-tests.ps1`（并挂进 `.githooks/pre-push`，理由见下）。第一次运行（块级规则）报 **42 处**，换成"断言在早退之前"的规则后报 **41 处**——`windows/win/d2d/tests.rs` 的 `the_capture_box_is_blue_at_rest_and_green_while_walking` 的 `return` 之前已有断言，它本来就合法。RED 日志 `docs/Temp/p605-red.txt` 留的是第一次运行的 42 处（`-Details` 可复现逐条清单）；最终 41 处的分布是：`windows/monitor.rs` 1、`windows/providers.rs` 2、`windows/top_level_provider.rs` 6（即旧 `window_detection.rs`，`P6.04` 改名）、`windows/uia_provider/tests/unit.rs` 4、`windows/win/bitblt.rs` 1、`windows/win/d2d/tests.rs` 11、`windows/win/d3d11.rs` 7、`windows/win/window.rs` 8、`crates/snapclip-history/src/windows/source_app.rs` 1。
+
+**规则**（脚本）：一个 `#[test]` 且非 `#[ignore]` 的函数体内，任何 `return;` 若**在它之前**函数体里没有出现过断言（`assert*!`/`debug_assert`/`panic!`/`unreachable!`/`todo!`/`expect(`/`unwrap(`/`unwrap_or_else`）⇒ 违规。规则是"**早退只有在断言之后才诚实**"，不是"不许早退"：`detection_worker.rs` 的轮询 `return` 跟在 `assert_eq!` 之后，那是提前退出而不是跳过；`uia_provider/tests/unit.rs` 的 `if expanded == 0 { /* UIA 没暴露任何层 */ return; }` 同理（它前一行的 `assert_eq!(provider.cached_epoch(), Some(1))` 已经断言过）。**块级版本**（"外层 `{}` 里要有断言"）会把这两处误报——这是它被换掉的唯一原因，也是这条规则应该以"什么时候断言过"而不是"断言在哪一层"为判据的理由。
+
+**41 处的两种改法**：40 处改 `#[ignore = "…"]` **+** 把守卫换成大声断言（`expect("…")` / `assert!(desktop_available(), "…")`），1 处——`crates/snapclip-history/src/windows/source_app.rs` 的 `C:\Windows\System32\notepad.exe` 存在性检查——**只加显式断言**：它是**文件**前提而不是设备能力，`#[ignore]` 会把它从一台本来能跑它的机器上拿掉。理由串统一为 `L3 (docs/31 D-14): <为什么需要环境>; run with --ignored --test-threads=1 on a live desktop`，GPU 侧为 `L4 (docs/31 D-14): …run with --ignored on a machine with a GPU`。这是 §29.2 合法性 (a) 与 (b) 的**分工**：默认门禁（`pre-push` 跑的 `cargo test --workspace --lib`）必须能在任何机器上跑通 ⇒ 需要环境能力的用例走 (a)；`--ignored` 那次运行就是 L3/L4 门禁，而**断言让那次运行保持诚实**（设备缺失时失败，而不是悄悄绿）。
+
+**`passed + ignored` 才是单调量**：`#[ignore]` 把用例从 passed 列搬到 ignored 列 ⇒ 默认门禁的 passed 从 573 掉到 533、ignored 从 24 涨到 64，而 `573 + 24 = 533 + 64 = 597`。`tools/check-test-baseline.ps1` 的判据正是 `passed + ignored` 只增（`P6.01`），所以这次搬运对基线中性——**这不是巧合，是 `P6.01` 当初选那个判据的理由**。
+
+**脚本看不见的第三类（已手工修，但故意不加规则）**："打印后继续执行"——`match` 分支里 `Err(error) => eprintln!("… unavailable …")` 之后测试继续往下跑。它没有 `return;`，脚本的规则抓不到；而"函数体里没有断言又打印过"这种启发式会误伤合法的冒烟测试（`crates/snapclip-history/src/windows/source_app.rs:232` 的 `snapshot_capture_does_not_panic` 只承诺不 panic），所以规则**不实现**，边界写在脚本头部注释里。三处实例（`bitblt.rs` 的 `Err(error) => eprintln!("BitBlt capture unavailable in this session: {error}")` 与 `providers.rs` 的两处 `Err(error) => eprintln!("capture unavailable in this session: {error}")`）已改成 `panic!`——`--ignored` 那次运行就是在要求一台活桌面，拒绝意味着环境不是这次运行声称的那个。
+
+**为什么必须挂进钩子**：这条规则的整条价值就是"缺陷不可见"，所以统计脚本本身也必须不可忽略——一个"记得跑一次"的脚本会在下一次提交时退化，而 §29.2 的失败模式（存在但不门禁）正是它要消灭的那个。钩子里的顺序是 `cargo check` → `cargo test` → 基线 → 依赖方向 → **本脚本**。
+
+**实测**：脚本输出 `[desktop-tests] scanned 133 .rs file(s): 751 #[test] function(s), 72 #[ignore]` / `0 unmarked desktop test(s), 0 #[ignore] without a reason`（exit 0）；默认门禁 `cargo test -p snapclip-capture --lib -- --test-threads=1` = **533 passed / 0 failed / 64 ignored（103.96 s）**；`--ignored` 那次运行里这 41 处所在模块**全部通过**（d2d 15 + d3d11 7 + monitor 1 + providers 2 + top_level_provider 6 + uia_provider 7 + bitblt 1 + window 8 = 47 条，另加 `snapclip-history` 1 条）。**在这台机器上这 41 处一处也没有触发过**：`cargo test … -- --nocapture` 全量跑完后 `Select-String 'skipping'` 命中 **0 行**（`docs/Temp/p605-skip-audit.txt`）。这正是 D-14 的形态——缺陷只在无桌面的会话上显形，在有桌面的开发机上完全不可见，所以它不能靠"开发时留意"发现。
+
+**未取得**：脚本只覆盖 `crates/` 与 `apps/` 的 `*.rs`（`-Root` 可扩展），且只认"`return;` 之前无断言"这一种形态；集成测试目录（`apps/snapclip/tests/`、`crates/*/tests/`）里的真实桌面用例与 §13 测试矩阵里仍标 `[!]` 的三行（§13.5 #5/#8、§13.7 #6）不在本次范围内。
 
 ### 29.3 核心正确性测试：合成扫描 `E-ACC-1`
 
@@ -5970,7 +5990,7 @@ fn rows_match(actual, expected, sigma) -> bool
 | 既有 | V2 的要求 |
 |---|---|
 | 9 个 `#[ignore]`（§5 逐条列出：`tray.rs:378`、`clipboard_ingest.rs:174`、`capture/mod.rs:73`、`ring_contrast.rs:433`、`uia_provider/tests/probes.rs:23/895/983`、`d2d/tests.rs:1466/1532`） | **保留**（它们确实需要桌面/GPU） |
-| 静默跳过的真实桌面用例（`bitblt.rs`、`providers.rs`、`window_detection.rs`） | **改成 §29.2 的两种合法形态**（这是对既有代码的修改，属 §33 的破坏性清单） |
+| 静默跳过的真实桌面用例（`bitblt.rs`、`providers.rs`、`window_detection.rs`，**实测共 41 处 / 10 文件**） | **改成 §29.2 的两种合法形态**（这是对既有代码的修改，属 §33 的破坏性清单）；`P6.05` 已落地 |
 | `hit_test.rs:435` 的 p95 < 0.1 ms 断言 | 保留（§23.2 明确"滚动不新增命中测试"） |
 | `apps/snapclip/tests/ui.rs`（GPUI 6 用例） | **保留**；滚动会话**不进**这个文件（它是历史列表/设置的 UI 测试） |
 | 真实 GPU 渲染 + CPU 回读的视觉回归（`win/d2d/tests.rs` 74,729 B） | **新增一个同型用例**：覆盖层 + 滚动预览面板一起渲染，回读断言**面板不覆盖必要的操作区域**（这是 §19.7 布局的机械保证）。**已落地（`P5.05`）**：`the_preview_panel_does_not_cover_the_toolbar_hit_regions` 渲染两遍（有/无面板）后逐像素比较，五档 DPI 上跑；它是 `#[ignore]` + 设备缺失时 `expect` 的（不像同文件既有 22 条那样静默跳过），第一跑就在 125%/175% 抓到 1 px 覆盖，见 §19.7.1 |
@@ -6387,7 +6407,7 @@ fn rows_match(actual, expected, sigma) -> bool
 | D-11 | 导出路径的 4 份完整像素拷贝 | `artifact_writer.rs:44` → `image.rs:153` → `image.rs:66` → 编码器内部 | 1920×300000 需 ≈ 8.6 GiB，**必然失败** | 导出被建模为"**把一张完整图像交给编码器**"而不是"**把行交给编码器**" | 删除；改为流式行带（§17.7、§22.4）——峰值降到 ≤2 份 |
 | D-12 | `as u32` 无检查截断 | `apps/snapclip/src/capture/artifact_writer.rs:42-43` | 超限尺寸静默截断 → 产出**尺寸错误的图**而不是报错 | 尺寸域假设"不会超"；`image.rs:26-35` 已经用 `u64` 做对了，**这里没有对齐** | 删除；超限在 `begin` **之前**拒绝（§26.1） |
 | D-13 | 缩略图死分支与"读全量原图当缩略图" | `store.rs:434-437`（`role == "thumbnail"` 无人写入）+ `history/model.rs:178-187` | 一条 30 万像素高的截图让历史列表**单行加载约 2 GiB** | 存储层预留了缩略图角色但**没有任何生产者**，而消费者假设它存在 | 删除该分支；长图缩略必须走**窗口化**路径（§19.2、ADR-5） |
-| D-14 | 3 处静默跳过的真实桌面测试 | `bitblt.rs:128-145`、`providers.rs:684-747`、`window_detection.rs:121-325` | 无桌面 session 上 `cargo test` **静默通过**，门禁是假的 | 把"环境不具备"与"用例通过"混为一谈 | 删除静默 `return`；只允许 `#[ignore]` 或显式环境断言（§29.2、ADR-16） |
+| D-14 | 静默跳过的真实桌面测试（**原判 3 处，`P6.05` 实测 41 处**） | `bitblt.rs:128-145`、`providers.rs:684-747`、`window_detection.rs:121-325`（即今 `top_level_provider.rs`） | 无桌面 session 上 `cargo test` **静默通过**，门禁是假的 | 把"环境不具备"与"用例通过"混为一谈 | 删除静默 `return`；只允许 `#[ignore]` 或显式环境断言（§29.2、§29.2.2、ADR-16）——**已由 `P6.05` 完成并门禁化（脚本进 `.githooks/pre-push`）** |
 | D-15 | 6 处失效架构注释 | `windows/mod.rs:13`、`window_detection/mod.rs:5,33`、`win/d3d11.rs:250-253`、`apps/snapclip/Cargo.toml:9-11`、`windows/mod.rs:7`、`ports.rs:19,41,55` | 新读者按注释找到**不存在的模块**或**错误的职责** | 重构时只改代码不改注释 → 注释变成**负资产** | 删除/改写（§28.2） |
 
 **D-10 为什么必须拆成两条**：`crates/snapclip-capture/src/windows/win/wgc.rs:106-108` 与 `:110-112` 的失败模式**方向相反**。前者 `.map_err(...)?` 传播 → 接口不可用时**整个捕获失败**（Win10 1903–1904 上 `IGraphicsCaptureSession2` 确实不存在）；后者只 `eprintln!` → **静默降级**。把两者写成同一条"吞错误"，会同时掩盖"该降级的地方在硬失败"与"该报出来的地方在静默"，而这两者需要**相反**的修法。
@@ -6626,7 +6646,7 @@ fn rows_match(actual, expected, sigma) -> bool
 | # | 任务 | 退出条件 |
 |---|---|---|
 | P6.1 | 执行 §33.1 的 D-1…D-15（其中 **D-10 已拆为 D-10a/D-10b**，共 16 项）、§33.2 的 R-1…R-7、§33.4 的改名 | 全部完成且 §30 的 A 类回归全过 |
-| P6.2 | 修复 3 处静默跳过（D-14） | 写一个统计脚本：非 `#[ignore]` 的真实桌面用例数 == 0 |
+| P6.2 | 修复静默跳过（D-14）**（`P6.05` 完成：实测 41 处而非 3 处）** | 写一个统计脚本：非 `#[ignore]` 的真实桌面用例数 == 0（已挂进 `.githooks/pre-push`） |
 | P6.3 | 6 处失效注释（D-15） | 逐个 `grep` 验证被引用的模块确实存在 |
 | P6.4 | 门禁加第二遍扫描（§28.4） | `tools/check-dependency-direction.ps1` 通过 |
 | P6.5 | `E-PERF-1..4` 回填 §23.3 的"待测"格子 | **§23.3 不再有 `待测`** |
