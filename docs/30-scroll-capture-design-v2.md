@@ -6533,7 +6533,7 @@ fn rows_match(actual, expected, sigma) -> bool
 
 | 类别 | 内容 |
 |---|---|
-| 纯逻辑模块（**11 文件 = 10 生产 + 1 test-only**） | `crates/snapclip-capture/src/scroll/{mod,session,target,observation,displacement,orb,canvas,bands,loop_control,preview}.rs` + `testkit.rs`（`#[cfg(test)]`，只进测试；§28.2） |
+| 纯逻辑模块（**17 文件 = 11 生产（含 `mod.rs`）+ 6 test-only**） | `crates/snapclip-capture/src/scroll/{mod,observation,displacement,orb,canvas,loop_control,preview,panel,session,ports,export}.rs` + `testkit`/`acceptance`/`perf_probe`/`alloc_probe`/`mem_probe`/`latency_probe`（六个 `#[cfg(test)]` 模块；`P6.09` 按依赖门禁实际打印的 17 校正，见 §28.2） |
 | 平台实现（2 文件） | `windows/scroll_source.rs`（窗口级 WGC 多帧帧源）、`windows/scroll_actuator.rs`（两条注入路径 + 探测） |
 | trait（5 个，改 0 个既有） | `FrameSource`、`ScrollActuator`、`RowBandSink`、`RowBandWriter`、`PreviewSink`（§27.5，ADR-11） |
 | 诊断 | `ScrollDiagnostic` + **13 个** `ScrollDiagnosticCode`（§26.3）。**`P4.05` 落地的是词汇表那一半**：`crates/snapclip-capture/src/scroll/session.rs` 的 `pub enum ScrollDiagnosticCode`（13 个变体 + `ALL` + `as_str()`，由 `scroll/mod.rs` re-export 以满足 §27.1 的公开边界），`session::tests::the_diagnostic_vocabulary_is_closed_at_thirteen_codes` 钉住数量与名字。**`ScrollDiagnostic` 事件结构体刻意未落地**：它没有生产者，一个没人能证伪的 struct 与 `InjectStatus` 拒绝加 `Unsupported` 是同一条理由（见 `§17.7.4`） |
@@ -6604,14 +6604,14 @@ fn rows_match(actual, expected, sigma) -> bool
 | 基本问题是什么？ | §2.1 的 F1–F10 与 §15.2 的重述：**从"时间连续但空间位移的局部观测"中恢复连续二维图像**；匹配在闭环下是**验证问题** |
 | 失败时怎么办？ | §16.10 的 `status` → 行为映射表（`Uncertain`/`None`/`scene_cut` 一律**不提交 + 继续 + 推进参照帧**）；**§20.4 的 11 个 `StopReason`，其中没有 `MatchFailed`** |
 | 动态内容怎么办？ | §18.2 的三分类 + 乘法式**降权**（不排除，因为覆盖必须二维完整）+ §18.5 的 13 行决策表 |
-| 错误匹配如何检测？ | **四道门 + 一条先验**（§16.2–§16.6）；**唯一零容忍判据**是 `E-ACC-1` 中"错误且 `Confirmed`"比率为 0（§29.3） |
+| 错误匹配如何检测？ | **四道门 + 一条先验**（§16.2–§16.6）；**唯一零容忍判据**是 `E-ACC-1` 中"错误且 `Confirmed`"比率为 0（§29.3）——**闭环语料上实测 0**（冒烟 32 例 0/0，全量 5376 例 `wrong 0 / bytes_wrong 0`）；**手动路线（`n = 0`）的 4/32 是已知例外**，登记在 §16.6.2 与 `OQ-20`/`OQ-21`，不在本判据的范围内 |
 
 ### 34.3 性能
 
 | 问题 | 答案 |
 |---|---|
 | 最大延迟 / P50 / P95 | §23.3 的**目标列**（设计意图）与**阈值列**（验收线）；**每一格都是实测或有原因的"未取得"，且由 `scripts/check-ledger-and-names.ps1` 挡住占位符**（ADR-17） |
-| 内存峰值 | §22.6：**与图像长度无关**（1080p/10k/30k/100k/500k px 是同一个上限），默认 `视口像素×4×8`；可证伪形式＝`E-MEM-1` 三档 peak 差异 ≤10% |
+| 内存峰值 | §22.6：**与图像长度无关**（1080p/10k/30k/100k/500k px 是同一个上限），默认 `视口像素×4×8`；**已实测（`E-MEM-1`，`P4.07`，§17.7.1/§23.3.4）**：三档的 `peak − 基线` 差 **0.16%**（52,569,820 / 52,587,068 / 52,654,236 B），而同一三档要求的单块画布是 57.7 / 171.7 / 572.7 MiB ⇒ "与长度无关"成立，且不是靠松阈值 |
 | CPU 目标 | §23.3（Idle ≤2% / Capturing ≤15% / +Matching ≤35%）：匹配侧已实测（`§23.3.2`，1080p 67.1% ⇒ 35% 目标未达成），捕获侧与整会话仍写明"未取得 + 原因" |
 | 如何实际测量？ | §23.5：沿用 `[snapclip][bench] stage=...` + 新增四个滚动 stage；`CountingAllocator` 在 `stage-timing` feature 下；**每场景独立进程**；纪律取自参考项目的 `benchmark-support/README.md` |
 
@@ -6656,6 +6656,43 @@ fn rows_match(actual, expected, sigma) -> bool
 **→ 上面 10 步的每一步都只由一个事实推出，没有任何一步依赖"以前就是这么做的"。因此这套架构就是"从零开始也只能得到"的架构；剩下的自由度只有"常数取多少"（§16.11）与"命名"（§2.2）。**
 
 **若某条设计无法追溯到这 10 步中的任何一步，它就应当被删除**——这正是 ADR 的 `推导自` 一栏要强制的东西（§31）。
+
+#### 34.6.1 这十步落在哪些符号上（`P6.09` 的核对，2026-10-10）
+
+**"答得出来"与"真的这么做了"是两件事**。验收这一步把上面十步逐条指到今天存在的符号上；指不到的那一步就是一句设计口号。
+
+| 步 | 推导出的东西 | 今天的落地符号 |
+|---|---|---|
+| 1 | 多次观测 | `Observation`（`crates/snapclip-capture/src/scroll/observation.rs:106`） |
+| 2 | 观测的单位 | `Observation{pixels,region,qpc,size,axis}` + `Axis`（`observation.rs:19`） |
+| 3 | 注入 + 验证 | `ScrollActuator`（`scroll/ports.rs:196`）、`InjectOutcome`（`ports.rs:151`）、`Displacement`（`scroll/displacement.rs:215`）与四道门（`displacement.rs:1368`/`:1428`/`:1453`/`:1509`） |
+| 4 | 闭环 + 先验 | `Control`（`scroll/loop_control.rs:475`）、`Prior`（`displacement.rs:1671`）、`estimate()`（`displacement.rs:2410`） |
+| 5 | 三态、不终止会话 | `Status{Confirmed,Uncertain,None}`（`displacement.rs:187`）与 `StopReason` 的 11 个变体——**其中没有 `MatchFailed`**（`scroll/session.rs:56`–`80`） |
+| 6 | 条带存储 + 有界预算 | `RecoveredImage`（`scroll/canvas.rs:1287`）、`BandStore`（`canvas.rs:421`）、`MemoryBudget`（`canvas.rs:197`） |
+| 7 | 行带编码 | `RowBandSink`/`RowBandWriter`（`scroll/export.rs:171`/`:181`/`:188`）+ shell 的 `apps/snapclip/src/capture/row_band_png.rs` |
+| 8 | 窗口化缩略 | `PreviewStream`（`scroll/preview.rs:232`）、`window_bounds`（`preview.rs:382`）、`thumbnail_rows`（`preview.rs:396`）、`refresh_window`（`preview.rs:448`） |
+| 9 | 三分类 + 乘法降权 | `RegionModel`（`displacement.rs:2111`）、`RegionModel::weight`（`displacement.rs:2166`）、`is_scene_cut`（`displacement.rs:1921`） |
+| 10 | 端口隔离 | `tools/check-dependency-direction.ps1` 的第二遍扫描（`P6.07`；`P6.09` 实测 `17 files scanned for platform references`） |
+
+**两处必须点名的"有类型、有测试，但还没有生产消费者"**（把它们读成"已生效"就是把设计当成实现）：
+
+- **第 8 步的 `refresh_window`**：`scroll/latency_probe.rs` 的模块 doc 逐字写着 "`refresh_window` has no production caller today"，`preview.rs` 把消费者指派给 `P5.03` 的 overlay，而 `P5.06` 的记录把这次接线登记为**未完成**。所以"窗口化缩略"今天是一条**已实现、已测量、尚未被窗口调用**的路径。
+- **第 9 步的 `RegionModel::weight`**：它是三分类降权的实现，但今天没有生产调用点（`OQ-23`/`DEV-54`）。动态内容因此**在类型上被表达、在闭环里还没有被降权**。
+
+### 34.7 六组验收的结论（`P6.09`，2026-10-10）
+
+**做法**：跑完 `docs/31 §4.2` 的阶段级门禁，再逐组回答"满足/未满足 + 证据"（用户第 42 条要求验收标准能回答问题；这一步要求**答案能被机器复核**）。
+
+| 组 | 判定 | 证据 | 未满足 / 未取得（都已在案，没有一项是"以后再说"） |
+|---|---|---|---|
+| §34.1 架构 | **满足** | §9.1 的逐行推导 + §10.3 的三条异步边界 + §21.2 的逐线程表；`P6.02` 的 78 行矩阵映射（`apps/snapclip/tests/matrix_coverage.rs`，实测 `78 rows mapped, 121 test(s) checked, 7 real-desktop probe(s) still ignored`）；`P6.04` 的 R-1…R-6 收口（`§21.3.1`、`§33.2.1`） | §13.1 第 5 行（目标被完全遮挡）的 L3 探针移入侧分支 `blocked/P6-02-occlusion-probe`（`f3c15a9`），主干由"后端选择"的两条测试承担 |
+| §34.2 算法 | **满足** | `E-ACC-1`：冒烟 32 例 0 错误确定 / 0 字节错，全量 5376 例 `wrong 0 / bytes_wrong 0`（§29.3）；四门 ablation（关掉任一门都改变错误率，`P1.13`） | **手动路线（`n = 0`）4/32 错误确定**（§16.6.2、`OQ-20`/`OQ-21`，侧分支 `blocked/P3-06-manual-alias`）；ORB 在自相似夹具上沉默（`OQ-18`）——两项都有数字、有机制、有出口，不是"未取得" |
+| §34.3 性能 | **部分满足** | Stitch Latency（1080p `l123` P50 112.9 ms）、`Cancel latency` Max **44 ms**（§23.3.3）、`E-MEM-1` 极差 **0.16%**（§23.3.4）、导出 p50 2.34 s（§17.7.1） | **CPU ≤35% 未达成**（匹配侧实测 67.1%，§23.3.2）；**捕获侧与整会话的 CPU 未取得**；**`Stop latency` 没有真机数字**（桌面非交互，§23.3.5）；**`Scroll Response` 没有毫秒实测**（`E-CTRL-1` 量的是收敛步数） |
+| §34.4 UI | **满足，有一处未接线** | §19.1 的八问全部落成 `scroll/panel.rs` 的数据（`P5.03`，`§19.4.1`）；`E-PERF-4` 的生产者与消费者两半都实测（`scroll/latency_probe.rs` 与 `windows/win/d2d/tests.rs` 的 8 ms 用例）；`Enter`/`Esc` 的语义与普通截图一致（`P3.07`） | 第 8 步的 `refresh_window` **尚无生产调用者**（§34.6.1）⇒ 预览是"已实现、已测量、未被窗口使用" |
+| §34.5 工程 | **满足** | D-1…D-15 与 R-1…R-7 在 `P6.01`–`P6.06` 逐条处置（`§33.1`/`§33.2`）；`P6.05` 的计数脚本、`P6.06` 的注释门禁、`P6.07` 的平台纯度门禁、`P6.08` 的台账门禁全部接进 `pre-push`，且每一道都有"能失败"的证明 | D-11 的 125%/150% DPI 扫描仍缺一台机器（`P1.22` 的 `[!]`），与代码无关 |
+| §34.6 第一性原理 | **满足** | 本节十步推导 + §34.6.1 的逐符号落地表 | 无设计缺口；但第 8、9 步的"未接线/无消费者"必须被读成"推导成立、接线未完成"，而不是"已经生效" |
+
+**阶段门禁的实际形态（`P6.09` 实测，明细在 `docs/31` 的执行记录）**：`cargo test -p snapclip-capture --release --lib -- --ignored perf` **3 passed / 0 failed（21.64 s）**；`cargo test -p snapclip-app --features test-support --test ui` **6 passed / 0 failed（0.64 s）**；`tools/check-dependency-direction.ps1` 干净；`cargo test -p snapclip-capture --lib -- --ignored --test-threads=1` 在本机 **52 passed / 13 failed**，其中 **12 个是环境失败**（会话被锁在屏保桌面上，`OpenInputDesktop` 的名字是 `Screen-saver`，`GetCursorPos` 全部 `Win32 error 5`），**第 13 个（`scroll::loop_control::tests::latency_measures_one_run`）是墙钟用例**：它在**同一台机器的 `scroll-p5` 树上也红**（p95 288.5 ms vs 今天的 286.6 ms），所以它不是 `P6` 引入的回归，而是"真实线程 + 真实时钟"的用例在锁屏/调度退化下必然越界。**L3 的真实桌面用例是按设计大声失败的**（`P6.05` 把 41 处静默跳过改成断言之后，这正是它应该有的形态）。
 
 ## 35. 实施计划
 
