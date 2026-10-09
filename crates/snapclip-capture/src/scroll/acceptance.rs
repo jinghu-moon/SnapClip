@@ -929,4 +929,31 @@ mod tests {
             "the canvas must track the step the manual route confirmed"
         );
     }
+
+    /// `P3.06`'s exit condition ③ stated as an assertion: a manual sequence over the `E-ACC-1`
+    /// corpus must never confirm a shift the page does not have.
+    ///
+    /// **This fails today** — 4 of the 32 smoke cases, by the two mechanisms recorded in
+    /// `the_manual_route_reports_its_coverage_and_its_defect_today` — so it lives on the side branch
+    /// `blocked/P3-06-manual-alias` instead of `main`. It is here rather than only in that table so
+    /// that closing `OQ-20` (the alias inside the manual window) or `OQ-21` (no centre on a noisy
+    /// frame) has something to turn green.
+    ///
+    /// `#[ignore]`d so that the side branch still passes the `pre-push` gate: it is a *blocked*
+    /// assertion, not a red build. Run it with `-- --ignored` to see the failure, which is
+    /// `left: 4, right: 0` on `tally.wrong` (measured 2026-10-09, `docs/Temp/p306-sidebranch.log`).
+    #[ignore = "P3.06 exit condition ③ fails today: 4/32 wrong confirmations, see OQ-20/OQ-21"]
+    #[test]
+    fn a_manual_sequence_never_confirms_a_wrong_shift() {
+        let tally = scan_manual(&smoke_corpus());
+        report("manual route", &tally);
+        assert_eq!(
+            tally.wrong, 0,
+            "a manual sequence confirmed a shift the page does not have"
+        );
+        assert_eq!(
+            tally.bytes_wrong, 0,
+            "a manual sequence wrote rows that are not the document"
+        );
+    }
 }
