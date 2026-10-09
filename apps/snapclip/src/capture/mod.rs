@@ -1,9 +1,9 @@
 //! Capture, hosted by the GPUI shell (docs/23 P6).
 //!
-//! While the Tauri host is still alive, capture runs there and this module is the shell's
-//! half of the move: the ports capture declares, implemented by the composition root that
-//! will own them after the old shell is deleted. Moving a piece at a time keeps the tree
-//! green; the duplicate is temporary and both copies are the same code.
+//! This module is the composition root for capture: it implements the ports
+//! (`snapclip_capture::ports`) that the capture crate declares — the event sink and the
+//! artifact writer — and starts the overlay. There is no second shell; the GPUI app in
+//! `apps/snapclip` is the only process that hosts capture.
 
 pub mod artifact_writer;
 
@@ -31,8 +31,7 @@ use crate::events::EventBus;
 /// Start the overlay and hand back the runtime the shell keeps for the session.
 ///
 /// F5 is registered by the overlay itself (`RegisterHotKey` on its own thread), so hosting
-/// capture is what gives the GPUI shell the screenshot entry point — until this existed the
-/// hotkey belonged to the Tauri host alone.
+/// capture is what gives the shell its screenshot entry point.
 ///
 /// `options` comes from the settings file, which is how a user preference reaches the window
 /// walker; the overlay snapshots it at startup rather than re-reading on every frame.

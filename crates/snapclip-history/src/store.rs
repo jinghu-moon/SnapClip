@@ -1,8 +1,8 @@
 //! Clipboard history storage: one SQLite database plus the blob store (docs/23 T2.5).
 //!
-//! Moved here from `src-tauri/src/infrastructure/store/mod.rs`. The one thing that stayed
-//! in the shell is the `From<StoreError> for IpcError` mapping, because turning a storage
-//! failure into an IPC code is transport glue and this crate has no IPC.
+//! Extracted out of the shell. Nothing about a storage failure is translated on the way
+//! out: the shell consumes [`crate::StoreError`] where it stands, because this crate has
+//! no IPC and no second error type to map into.
 
 use std::{
     collections::{HashMap, HashSet},

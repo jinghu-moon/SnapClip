@@ -1,6 +1,6 @@
 //! The clipboard pipeline, hosted by the GPUI shell (docs/23 P6).
 //!
-//! Moved from `src-tauri/src/app/clipboard.rs`. The policy — dedup by sequence number, the
+//! Extracted out of the previous shell. The policy — dedup by sequence number, the
 //! delayed-format read window, persistence, event publication — lives in
 //! `snapclip_history::ingest`; the platform half (listener, reader, source resolution) lives
 //! in `snapclip_history::windows`. What is *here* is the composition: bind the two, publish

@@ -4,8 +4,7 @@
 //! clipboard also has to mark the write as SnapClip's own, or the clipboard monitor would
 //! record our copy as a new entry and the history would grow on every copy. That marker
 //! lives in `snapclip-history`'s Win32 adapter (`mark_clipboard_excluded`), which is why
-//! this is a thin adapter over `arboard` plus that one call — the same shape the Tauri host
-//! used in `src-tauri/src/app/clipboard_writer.rs`.
+//! this is a thin adapter over `arboard` plus that one call.
 
 use std::borrow::Cow;
 

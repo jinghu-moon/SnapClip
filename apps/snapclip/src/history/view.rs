@@ -123,10 +123,10 @@ impl HistoryView {
             this.apply_query(cx);
         })
         .detach();
-        // A new clip is stored by whoever owns the clipboard monitor, which is another
-        // process while the Tauri host is still alive — so the row list cannot be re-read
-        // from a local callback. It is re-read from the event channel, and a window that
-        // regains focus re-reads too, because the two shells share only the database.
+        // A new clip is stored by the clipboard ingest thread (`clipboard_ingest::start`),
+        // which is not this one — so the row list cannot be re-read from a local callback.
+        // It is re-read from the event channel, and a window that regains focus re-reads
+        // too, because the list is only as fresh as the last event.
         let mut stream = bus.subscribe();
         let _events = cx.spawn(async move |this, cx| {
             while let Some(event) = stream.next().await {

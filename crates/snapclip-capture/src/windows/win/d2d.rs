@@ -7,9 +7,10 @@
 //! 3. **L2** rounded border, eight grips, the `width × height` label and the
 //!    magnifier.
 //!
-//! Everything here is preview-only: the exported artifact is produced by
-//! [`crate::application::capture_service`] from the captured frame, so no mask,
-//! label or magnifier can leak into the result.
+//! Everything here is preview-only: the pixels that become the artifact are read
+//! back from the frozen frame by [`crate::artifact::CaptureService::prepare_selection`]
+//! and encoded by the composition root, so no mask, label or magnifier can leak into
+//! the result.
 
 use windows_numerics::Vector2;
 use std::sync::Arc;

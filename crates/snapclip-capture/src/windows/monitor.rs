@@ -59,10 +59,10 @@ impl CapturedMonitor {
 ///
 /// The fallback order is the documented one — Per-Monitor V2, then Per-Monitor, then
 /// System — and the achieved mode is returned so callers can log it instead of
-/// guessing. A process that is already aware (the Tauri runtime declares its own
-/// context at startup) makes every `SetProcessDpiAwarenessContext` call fail with
-/// `ERROR_ACCESS_DENIED`, in which case the effective thread context is reported
-/// instead — that path never downgrades.
+/// guessing. A process that is already aware (the shell declares its own context at
+/// startup, `apps/snapclip/src/lib.rs`) makes every `SetProcessDpiAwarenessContext` call
+/// fail with `ERROR_ACCESS_DENIED`, in which case the effective thread context is
+/// reported instead — that path never downgrades.
 pub fn set_per_monitor_v2_awareness() -> Result<&'static str, String> {
     for context in [
         DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -278,7 +278,7 @@ mod tests {
 
     #[test]
     fn a_second_declaration_never_downgrades_an_aware_process() {
-        // The Tauri runtime declares its own context before capture starts; repeating
+        // The shell declares its own context before capture starts; repeating
         // the declaration from the overlay thread must report the existing context
         // rather than replacing it with a coarser one.
         let first = set_per_monitor_v2_awareness();

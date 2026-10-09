@@ -5,9 +5,9 @@
 //!
 //! - **Only** the standard library and `serde`. No Win32, no D3D11, no GPUI, no
 //!   SQLite, no Tauri — those belong to the shells and platform crates.
-//! - **One definition per type.** While the migration is in flight the old
-//!   `src-tauri` modules re-export these types; those forwarders must be gone by
-//!   the end of P1 (docs/23 T1.10).
+//! - **One definition per type.** A capability crate that needs one of these imports it
+//!   from here; nothing re-exports it under a second path, and nothing below the shells
+//!   depends on a shell (`tools/check-dependency-direction.ps1`, docs/31 §4.2).
 //! - Only types that genuinely cross a capability seam belong here. Painter and
 //!   state-machine internals stay inside their own crate.
 

@@ -898,9 +898,9 @@ struct Level {
 
 /// Turn a bounded walk into the published target.
 fn finish(outcome: WalkOutcome, job: &RefinementJob) -> DeepTarget {
-    // `ClientArea`/`UiElement` only when the walk actually got below the window frame; a
+    // `UiElement` only when the walk actually got below the window frame; a
     // window-only answer keeps saying "whole frame" so the overlay renders it exactly like a
-    // v1 target.
+    // window-snap target.
     let kind = if outcome.path.len() > 1 {
         TargetKind::UiElement
     } else {

@@ -275,8 +275,10 @@ impl GraphicsDevice {
 
     /// Copy `texture` into a CPU-readable staging texture and return its pixels.
     ///
-    /// This is the only GPU → CPU transfer on the capture path and it happens once,
-    /// when a session is armed.
+    /// The whole-frame readback. Production reaches it only through the CPU fallback in
+    /// [`crate::windows::renderer`] (taken when the frozen frame carries no texture);
+    /// everything a session actually reads back goes through
+    /// [`Self::read_back_region_bgra`], which copies just the region.
     pub fn read_back_bgra(&self, texture: &ID3D11Texture2D) -> Result<Vec<u8>, String> {
         let mut description = D3D11_TEXTURE2D_DESC::default();
         unsafe { texture.GetDesc(&mut description) };

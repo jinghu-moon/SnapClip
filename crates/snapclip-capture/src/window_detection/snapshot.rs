@@ -12,7 +12,7 @@
 //!
 //! Both policy passes are pure functions over plain data, so the whole filter matrix
 //! is unit-testable without a desktop; the platform passes are covered by real-window
-//! tests in `platform::windows::capture::win::window`.
+//! tests in `crate::windows::win::window`.
 
 use super::model::{SnapshotEpoch, WindowCandidate, WindowIdentity};
 use super::provider::{Exclusions, is_shell_surface_class};

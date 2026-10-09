@@ -11,7 +11,7 @@
 //! so a cancelled session cannot leave a stale display topology behind.
 //!
 //! Everything here is platform neutral: enumerating the displays is
-//! `platform::windows::capture::monitor`'s job, and this module only holds the result.
+//! `crate::windows::monitor`'s job, and this module only holds the result.
 
 use super::geometry::{MonitorLayout, Rect};
 

@@ -2,10 +2,10 @@
 //!
 //! These types are the **only** shape in which one capability's news reaches another. They
 //! carry identity, state, size and an [`ArtifactRef`] — never pixels, never a mouse move,
-//! never a database handle. A shell adapts them to whatever its transport is: the Tauri
-//! host wraps them in its versioned `EventEnvelope`, the GPUI shell passes them through a
-//! typed channel. That is why the envelope does **not** live here: it is transport, and
-//! `tauri::Emitter` must never be reachable from a capability crate.
+//! never a database handle. A shell adapts them to its own transport: the GPUI shell stamps
+//! a generation and fans them out over a typed channel (`apps/snapclip/src/events`). That is
+//! why the transport does **not** live here, and why a UI framework must never be reachable
+//! from a capability crate.
 //!
 //! `generation` is a per-process counter the caller stamps in; a consumer drops anything
 //! older than what it has already seen. It is deliberately a plain number rather than a

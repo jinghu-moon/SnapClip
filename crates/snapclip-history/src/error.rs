@@ -1,9 +1,8 @@
 //! The storage error every store in this crate speaks.
 //!
-//! Moved here from `src-tauri/src/infrastructure/store/mod.rs` (docs/23 T2.3) so the
-//! stores own their failure modes instead of borrowing the shell's. The shell keeps the
-//! `From<StoreError> for IpcError` mapping — that is transport glue and stays with the IPC
-//! boundary, which is exactly where a code like `InvalidCursor` becomes `invalid_argument`.
+//! Extracted (docs/23 T2.3) so the stores own their failure modes instead of borrowing the
+//! shell's. The shell consumes the variants as they are: there is no IPC envelope left to
+//! translate them into, so a `InvalidCursor` reaches the UI as itself.
 
 use thiserror::Error;
 

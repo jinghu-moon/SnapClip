@@ -1,12 +1,12 @@
 //! Source-app icons for history rows.
 //!
-//! Extraction goes through `win-icon-extractor` — the crate the Tauri host already used in
-//! `src-tauri/src/icon.rs` — so the shell does not grow a second way to read an executable's
-//! icon. The extractor caches PNGs on disk by executable path; this type adds the in-memory
-//! path cache, because a list row asks for the same handful of executables over and over.
+//! Extraction goes through `win-icon-extractor`, so the shell does not grow a second way to
+//! read an executable's icon. The extractor caches PNGs on disk by executable path; this type
+//! adds the in-memory path cache, because a list row asks for the same handful of executables
+//! over and over.
 //!
 //! GPUI loads images from a path, so the shell hands the cached PNG's *path* to `img()`
-//! instead of the base64 data URL the webview needed.
+//! rather than image bytes.
 
 use std::collections::HashMap;
 use std::path::PathBuf;

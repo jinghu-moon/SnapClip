@@ -1,6 +1,6 @@
 //! Image encoding and decoding helpers (docs/23 T2.4).
 //!
-//! Moved from `src-tauri/src/infrastructure/image/encode.rs`: both of its users belong to
+//! Extracted out of the previous shell's image module: both of its users belong to
 //! this crate — the artifact store encodes capture pixels to PNG, and the clipboard
 //! adapter normalises clipboard images. Capture no longer knows how bytes become a PNG.
 //!

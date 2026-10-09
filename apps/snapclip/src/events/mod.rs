@@ -12,7 +12,7 @@
 //! foreground task and touches entities only inside `Entity::update`.
 //!
 //! This module is deliberately framework-free: it is the piece that must be unit-testable
-//! without a window, and the piece that stays once the Tauri host is gone (P6).
+//! without a window, and the piece that outlives the GPUI screen that consumes it.
 
 use std::sync::{Arc, Mutex, atomic::AtomicU64, atomic::Ordering};
 

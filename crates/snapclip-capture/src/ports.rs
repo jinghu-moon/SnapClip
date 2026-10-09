@@ -15,7 +15,7 @@ pub use crate::artifact::{
 };
 
 /// Receives low-frequency lifecycle events. Deliberately a trait so the capture
-/// module never depends on Tauri's emitter.
+/// module never depends on the shell's event bus.
 pub trait CaptureEventSink: Send + Sync + 'static {
     fn on_started(&self, session_id: &str, layout: &MonitorLayout);
     fn on_state(&self, session_id: &str, state: CaptureState, layout: Option<&MonitorLayout>);
@@ -38,7 +38,7 @@ impl CaptureEventSink for NullEventSink {
 /// The overlay/presentation implementation for the current platform.
 ///
 /// `Send + Sync` is required because the rest of the process drives sessions from
-/// Tauri command threads; implementations are responsible for marshalling work onto
+/// ordinary threads of the shell; implementations are responsible for marshalling work onto
 /// their own UI thread.
 pub trait OverlayPlatform: Send + Sync + 'static {
     fn state(&self) -> CaptureState;
@@ -51,8 +51,8 @@ pub trait OverlayPlatform: Send + Sync + 'static {
     fn request_confirm(&self) -> CaptureResult<()>;
 
     /// Deliver one low-frequency toolbar instruction to the running session's
-    /// annotation document. The Vue toolbar emits at most one per click, never on
-    /// mouse-move or per pixel (docs/11 §7.1 "工具栏不进入像素管线"). The default
+    /// annotation document. The overlay's toolbar emits at most one per click, never
+    /// on mouse-move or per pixel (docs/11 §7.1 "工具栏不进入像素管线"). The default
     /// rejects the call so only platforms with a real overlay need to override it.
     fn request_annotation(&self, command: AnnotationCommand) -> CaptureResult<()> {
         let _ = command;

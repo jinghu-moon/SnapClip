@@ -25,8 +25,8 @@ pub struct HistoryState {
 }
 
 impl HistoryState {
-    /// Open the same database the Tauri host writes (`<app local data>`) and read the first
-    /// page.
+    /// Open the same database the clipboard ingest thread writes (`<app local data>`) and
+    /// read the first page.
     ///
     /// The first page is loaded here rather than by whoever renders the screen: a history
     /// screen that opens onto an empty list and only fills in once the user types is broken,

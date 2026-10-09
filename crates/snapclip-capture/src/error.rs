@@ -2,8 +2,9 @@ use thiserror::Error;
 
 use snapclip_model::ErrorCode;
 
-/// Structured capture error codes. These travel over the versioned Tauri event
-/// contract, so the string form is part of the public surface.
+/// Structured capture error codes. [`Self::as_str`] is the form that crosses the
+/// crate boundary, and [`CaptureError::code`] maps into `snapclip_model`'s shared
+/// [`ErrorCode`], so both the string and the mapping are public surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureErrorCode {
     Unsupported,

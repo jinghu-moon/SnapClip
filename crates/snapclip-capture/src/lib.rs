@@ -7,7 +7,8 @@
 //! no SQLite, no OCR, no Tauri, no GPUI. It produces exactly one domain result —
 //! [`CaptureArtifact`] — and talks to the rest of the process through the traits in
 //! [`ports`], which the composition root implements. `cargo tree -p snapclip-capture`
-//! must never show `tauri`, `wry` or `gpui-kit`; T1.9 turns that into a gate.
+//! must never show `tauri`, `wry` or `gpui-kit`; `tools/check-dependency-direction.ps1`
+//! is the gate that holds it (docs/31 §4.2).
 //!
 //! # Seam (what is public API)
 //!

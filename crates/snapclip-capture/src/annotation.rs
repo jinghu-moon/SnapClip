@@ -25,9 +25,9 @@ pub enum AnnotationKind {
     Highlight,
 }
 
-/// A low-frequency toolbar instruction issued by the Vue annotation toolbar, carried
-/// over a single Tauri command and applied to the [`AnnotationDocument`] on the
-/// overlay thread.
+/// A low-frequency toolbar instruction issued by the overlay's toolbar, carried over
+/// the annotation mailbox (`WindowsOverlay::request_annotation`) and applied to the
+/// [`AnnotationDocument`] on the overlay thread.
 ///
 /// Deliberately coarse: the toolbar never drives per-pixel or per-move work
 /// (docs/11 §7.1 "工具栏不进入像素管线"). Style setters apply to the selected object

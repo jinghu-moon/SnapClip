@@ -1,4 +1,5 @@
 //! SQLite connection, migrations and repositories (docs/23 T2.5).
 //!
-//! Filled in by T2.5, when `src-tauri/src/infrastructure/store/mod.rs` is split into
-//! connection / migration / clip / artifact / recognition repositories.
+//! The store used to be one module; it now lives in [`crate::store`], split into a
+//! connection, the migration runner and one repository per table family
+//! (`clip_repository`, `artifact_repository`, `recognition_repository`).

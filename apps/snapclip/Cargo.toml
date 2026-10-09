@@ -6,9 +6,9 @@ edition = "2024"
 license = "AGPL-3.0-only"
 publish = false
 
-# The shell's name is `snapclip-app`, not `snapclip`: the Tauri host (src-tauri) already
-# owns the package name `snapclip`, and a workspace cannot hold two packages with the same
-# name. The directory stays `apps/snapclip` as the plan specifies.
+# The package is `snapclip-app`: the shell names itself after its role, and the directory
+# stays `apps/snapclip` as the plan specifies. Nothing else in the workspace claims the bare
+# `snapclip` name.
 
 [dependencies]
 # One dependency for the UI, as the Coding Guides require: GPUI itself is
@@ -61,8 +61,7 @@ windows-sys = { version = "0.59", features = [
   "Win32_UI_WindowsAndMessaging",
 ] }
 
-# Source-app icons for history rows. Same crate, same 32px source size the Tauri host used
-# (`src-tauri/src/icon.rs`): 32px renders crisply in a 16px row.
+# Source-app icons for history rows: 32px renders crisply in a 16px row.
 win-icon-extractor = { version = "0.3", default-features = false, features = ["png", "cache"] }
 
 # Clipboard writes belong to the shell; `mark_clipboard_excluded` (below, through

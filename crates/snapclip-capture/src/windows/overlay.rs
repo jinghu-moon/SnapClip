@@ -186,15 +186,15 @@ struct OverlayShared {
 /// The concrete `OverlayPlatform` used on Windows.
 ///
 /// Holds only thread handles and atomics, so it is `Send + Sync` and every method is
-/// safe to call from a Tauri command thread.
+/// safe to call from any thread: each one posts to the overlay thread and returns.
 pub struct WindowsOverlay {
     /// Window-message thread id of the overlay thread, in the string form used by the
     /// readiness handshake.
     thread_id: String,
     thread: Mutex<Option<JoinHandle<()>>>,
     shared: Arc<Mutex<OverlayShared>>,
-    /// Producer end of the annotation mailbox. Tauri command threads push a toolbar
-    /// command here and post an [`OverlayCommand::Annotation`] wake-up; the overlay
+    /// Producer end of the annotation mailbox. The toolbar path pushes a command
+    /// here and posts an [`OverlayCommand::Annotation`] wake-up; the overlay
     /// thread owns the matching receiver and drains it on its own cadence.
     annotation_tx: mpsc::SyncSender<AnnotationCommand>,
     shutting_down: AtomicBool,
@@ -309,8 +309,8 @@ impl OverlayPlatform for WindowsOverlay {
     }
 
     fn request_annotation(&self, command: AnnotationCommand) -> CaptureResult<()> {
-        // `try_send`, not `send`: a wedged overlay must never block a Tauri command
-        // thread. The bounded mailbox only needs to absorb a burst of clicks; if it is
+        // `try_send`, not `send`: a wedged overlay must never block the caller.
+        // The bounded mailbox only needs to absorb a burst of clicks; if it is
         // full the toolbar is simply told the overlay is not draining.
         self.annotation_tx.try_send(command).map_err(|error| match error {
             mpsc::TrySendError::Full(_) => CaptureError::InvalidState(

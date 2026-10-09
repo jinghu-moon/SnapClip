@@ -1,8 +1,8 @@
 //! Error codes that cross a capability seam.
 //!
-//! Only the codes themselves live here. The IPC envelope (`IpcError`, with its
-//! `traceId` and its `From<CaptureError>` impl) stays in the shell — it is a transport
-//! type, not a value the capability crates need.
+//! Only the codes themselves live here. Nothing wraps them into an envelope on the way
+//! out: an error type that has to be understood by the UI exposes its own
+//! `code()` (see `snapclip_capture::CaptureError::code`).
 
 use serde::{Deserialize, Serialize};
 

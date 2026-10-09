@@ -2,8 +2,8 @@
 //!
 //! This module owns the *contract* between the overlay message thread, the window
 //! detection worker and the render path. It deliberately contains no Win32 calls:
-//! the platform layer (`platform::windows::capture::win::window`) performs the
-//! enumeration/DWM reads and hands plain data back.
+//! `crate::windows::win::window` performs the enumeration/DWM reads and hands plain
+//! data back.
 //!
 //! ## Ownership and threading (docs/14 §5.2)
 //!
@@ -28,11 +28,15 @@
 //! | [`DEFAULT_SNAP_RADIUS_PX`] | 24 px | nearest-window search radius, physical pixels |
 //! | [`DEFAULT_HOVER_REVALIDATE_MS`] | 250 ms | worker re-validation cadence for the hovered window |
 //!
-//! ## v1 scope
+//! ## Which target kinds exist
 //!
-//! Only [`TargetKind::TopLevelWindowFrame`] exists: the DWM top-level window frame
-//! including its title bar. Client-area and UIA/MSAA sub-element targets are v2 and
-//! must never enter this path (docs/14 §5.2, §11).
+//! Two are live today: [`TargetKind::TopLevelWindowFrame`], the DWM top-level window
+//! frame including its title bar, which is what the window snap produces; and
+//! [`TargetKind::UiElement`], the sub-element the refinement workers produce when the
+//! walk got below the frame ([`crate::windows::uia_provider`],
+//! [`crate::windows::msaa_provider`]). [`TargetKind::ClientArea`] is declared with no
+//! producer yet. Refinement never widens a whole-window answer — a failed walk falls
+//! back to the frame, never the other way round (docs/14 §5.2, docs/18 §4).
 
 pub mod gesture;
 pub mod hit_test;

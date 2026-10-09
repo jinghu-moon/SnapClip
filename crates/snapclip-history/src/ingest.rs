@@ -109,7 +109,8 @@ pub trait OcrQueue: Send + Sync + 'static {
     fn try_enqueue(&self, clip_id: &str, content_hash: &str) -> bool;
 }
 
-/// UI notifications. Kept as a trait so the service never depends on Tauri.
+/// UI notifications. Kept as a trait so the service never depends on the shell that
+/// renders them (today the GPUI app's event bus).
 pub trait ClipboardEventSink: Send + Sync + 'static {
     fn on_publication_saved(&self, publication: &Publication);
 }

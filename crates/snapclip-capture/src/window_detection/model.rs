@@ -160,26 +160,28 @@ impl WindowIdentity {
 
 /// What kind of region a [`WindowTarget`] describes.
 ///
-/// v1 uses [`Self::TopLevelWindowFrame`] only. `ClientArea` and `UiElement` belong to v2
-/// (docs/18): they are produced by the refinement worker and must never widen or alter
-/// the v1 whole-window path — a v2 failure falls back to the v1 frame, never the other
-/// way round.
+/// [`Self::TopLevelWindowFrame`] is the whole-window answer and the fallback the snap
+/// path always produces; [`Self::UiElement`] is what the refinement providers
+/// (`crate::windows::uia_provider`, `crate::windows::msaa_provider`) produce once a
+/// walk got below the frame. Refinement must never widen or alter the whole-window
+/// path — a failed refinement falls back to the frame, never the other way round.
+/// [`Self::ClientArea`] is declared and has no producer yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TargetKind {
     /// DWM top-level window frame: includes the title bar, excludes the invisible
     /// resize border.
     TopLevelWindowFrame,
-    /// v2: the window's client area (no title bar, no borders).
+    /// The window's client area (no title bar, no borders). No producer yet.
     ClientArea,
-    /// v2: the deepest interactive UI element under the cursor.
+    /// The deepest interactive UI element under the cursor, from a refinement walk.
     UiElement,
 }
 
 impl TargetKind {
-    /// Whether this target comes from the v2 refinement path.
+    /// Whether this target comes from a refinement walk.
     ///
-    /// Used by the overlay to keep the two layers apart: v2 targets may be refined
-    /// further or dropped back to the v1 frame, while a v1 frame is always the fallback
+    /// Used by the overlay to keep the two layers apart: a refined target may be walked
+    /// further or dropped back to the frame, while a frame is always the fallback
     /// and never needs a refinement query of its own.
     pub fn is_refined(self) -> bool {
         matches!(self, Self::ClientArea | Self::UiElement)
