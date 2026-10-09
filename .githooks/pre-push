@@ -37,4 +37,10 @@ echo "[pre-push] no comment points at a module that does not exist (docs/31 P6.0
 # stayed four tasks after the module it named was gone.
 powershell -NoProfile -File scripts/check-stale-comment-references.ps1
 
+echo "[pre-push] no performance cell is a placeholder and no design name is a ghost (docs/31 P6.08)"
+# Two claims that only prose can carry: §23.3's cells say what was measured, and §2.2.1's names are
+# symbols that exist. A place-holder cell reads exactly like a measured one, which is how four of
+# them outlived the tasks that filled them in.
+powershell -NoProfile -File scripts/check-ledger-and-names.ps1
+
 echo "[pre-push] OK"

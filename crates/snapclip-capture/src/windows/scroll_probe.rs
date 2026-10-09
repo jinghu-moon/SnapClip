@@ -120,7 +120,7 @@ use crate::geometry::{Point, Rect};
 use crate::scroll::canvas::MemoryBudget;
 use crate::scroll::observation::Axis;
 use crate::scroll::ports::{FrameError, FrameSource, InjectOutcome, Poll, ScrollActuator};
-use crate::scroll::session::{ScrollPlan, ScrollRuntime, StopReason};
+use crate::scroll::session::{Disposal, ScrollPlan, ScrollRuntime, StopReason};
 use crate::windows::monitor;
 use crate::windows::scroll_actuator::{
     self, Aim, InjectPath, InjectRequest, InjectStatus, TargetProbe, WheelRouting, Win32Injection,
@@ -4507,6 +4507,131 @@ fn routing_of(raw: u32) -> WheelRouting {
     }
 }
 
+/// The real desktop a latency probe needs, assembled once and torn down when it drops.
+///
+/// Two probes need the same preamble: a running Chrome on the demo page, the rectangles the plan and
+/// the capture must agree on, the point the wheel is aimed at, and the transport the routing implies.
+/// Assembling it twice would be two places for the geometry to drift, and that drift's failure mode
+/// is a driver-thread panic inside `canvas.rs`'s cross-axis invariant rather than a readable probe
+/// error — `P3.10` paid for that lesson once already.
+struct LatencyArena {
+    launched: LaunchedTarget,
+    scratch: PathBuf,
+    target: isize,
+    screen: Point,
+    choice: scroll_actuator::Choice,
+    frame_width: u32,
+    frame_height: u32,
+}
+
+impl LatencyArena {
+    fn open() -> Self {
+        let _ = monitor::set_per_monitor_v2_awareness();
+
+        let token = format!(
+            "{:08x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        );
+        let scratch = std::env::temp_dir().join(format!("snapclip-latency-{token}"));
+        std::fs::create_dir_all(&scratch).expect("creating the probe scratch dir");
+
+        let routing = read_mouse_wheel_routing()
+            .map(|raw| routing_of(raw))
+            .unwrap_or(WheelRouting::Unknown);
+        let lines = read_wheel_scroll_lines().unwrap_or(3);
+        eprintln!(
+            "[latency] SPI_GETMOUSEWHEELROUTING = {routing:?}, SPI_GETWHEELSCROLLLINES = {lines}"
+        );
+
+        let launched = launch_scroll_target(ScrollTargetKind::Chrome, &scratch, &token).expect(
+            "the latency probes need Chrome: the demo page is the only scrollable target whose \
+             pixel-per-notch gain is already measured (E-INJECT-1: 100 px)",
+        );
+        // `require_focus: false` — Chrome is another process's window, and `SetFocus` is refused for
+        // those. Focus is also not what these probes need: both latencies are about how long the
+        // driver takes to *notice* a command, and a step whose wheel lands nowhere still costs the
+        // same one injection plus one read-back. Demanding focus would refuse to measure the metric
+        // on a machine whose routing hands the wheel to the window under the cursor instead.
+        bring_to_front(launched.window, false);
+
+        let target = launched.window as isize;
+        let (origin, size) = client_geometry(launched.window);
+        let (frame_width, frame_height) = visible_geometry(launched.window).expect(
+            "DWM must report the window's visible bounds: they are the size a window-level WGC \
+             capture delivers, and the session's canvas is built from them (canvas.rs:1154)",
+        );
+        let (window_width, window_height) = window_geometry(launched.window);
+        let screen = Point::new(origin.x + size.0 as i32 / 2, origin.y + size.1 as i32 / 2);
+
+        // A self-launched target has the same integrity level as its launcher, so the two fields the
+        // choice table reads are equal by construction and the `target_is_elevated &&
+        // !self_is_elevated` arm is unreachable. This is not an assumption about the machine —
+        // `EnableLUA = 0` here, and the probe does not need to know.
+        let probe = TargetProbe {
+            target_is_elevated: false,
+            self_is_elevated: false,
+            target_is_foreground: unsafe { GetForegroundWindow() } == launched.window,
+            routing,
+        };
+        let choice = scroll_actuator::choose(&probe);
+        eprintln!(
+            "[latency] target 0x{target:x} class {} frame {frame_width}x{frame_height} \
+             window {window_width}x{window_height} client ({},{})-({},{}); choice {:?} + {:?} \
+             (foreground = {})",
+            launched.class,
+            origin.x,
+            origin.y,
+            origin.x + size.0 as i32,
+            origin.y + size.1 as i32,
+            choice.path(),
+            choice.aim(),
+            probe.target_is_foreground
+        );
+
+        Self {
+            launched,
+            scratch,
+            target,
+            screen,
+            choice,
+            frame_width,
+            frame_height,
+        }
+    }
+
+    /// The plan a session actually gets, and the one calibrated to `E-INJECT-1`'s measured
+    /// 100 px/notch for Chromium.
+    ///
+    /// The default starts at `ĝ₀ = 60 px/notch`, which is what a session actually gets; the
+    /// calibrated one matches the 100 px/notch this machine measured, which is what makes the steps
+    /// commit at all (R-25 / OQ-22). Built per trial rather than cloned: `ScrollPlan` is moved into
+    /// the runtime, and giving it a `Clone` only for a probe would be a production trait bound
+    /// earned by a test.
+    fn plan(&self, calibrated: bool) -> ScrollPlan {
+        let plan = ScrollPlan::new(
+            Axis::Vertical,
+            self.frame_width as u64,
+            self.frame_height,
+            MemoryBudget::for_viewport(self.frame_width as u64, self.frame_height as u64),
+        );
+        if calibrated {
+            plan.with_wheel(3, 33)
+        } else {
+            plan
+        }
+    }
+}
+
+impl Drop for LatencyArena {
+    fn drop(&mut self) {
+        shutdown_target(&mut self.launched);
+        let _ = std::fs::remove_dir_all(&self.scratch);
+    }
+}
+
 /// One trial's result, and the only shape the report is allowed to have.
 struct CancelTrial {
     shape: &'static str,
@@ -4541,93 +4666,12 @@ struct CancelTrial {
 #[test]
 #[ignore = "P3.10: needs a real interactive desktop and a scrollable target"]
 fn cancel_latency_probe() {
-    let _ = monitor::set_per_monitor_v2_awareness();
-
-    let token = format!(
-        "{:08x}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0)
-    );
-    let scratch = std::env::temp_dir().join(format!("snapclip-p310-{token}"));
-    std::fs::create_dir_all(&scratch).expect("creating the probe scratch dir");
-
-    let routing = read_mouse_wheel_routing()
-        .map(|raw| routing_of(raw))
-        .unwrap_or(WheelRouting::Unknown);
-    let lines = read_wheel_scroll_lines().unwrap_or(3);
-    eprintln!("[P3.10] SPI_GETMOUSEWHEELROUTING = {routing:?}, SPI_GETWHEELSCROLLLINES = {lines}");
-
-    let mut launched = launch_scroll_target(ScrollTargetKind::Chrome, &scratch, &token)
-        .expect("P3.10 needs Chrome: the demo page is the only scrollable target whose pixel-per-notch gain is already measured (E-INJECT-1: 100 px)");
-    // `require_focus: false` — Chrome is another process's window, and `SetFocus` is refused for
-    // those. Focus is also not what this probe needs: `Cancel latency` is about how long the driver
-    // takes to *notice* a cancel, and a step whose wheel lands nowhere still costs the same one
-    // injection plus one read-back. Demanding focus here would refuse to measure the metric on a
-    // machine where the routing hands the wheel to the window under the cursor instead.
-    bring_to_front(launched.window, false);
-
-    let target = launched.window as isize;
-    let (origin, size) = client_geometry(launched.window);
-    let (frame_width, frame_height) = visible_geometry(launched.window).expect(
-        "DWM must report the window's visible bounds: they are the size a window-level WGC capture \
-         delivers, and the session's canvas is built from them (canvas.rs:1154)",
-    );
-    let (window_width, window_height) = window_geometry(launched.window);
-    let screen = Point::new(origin.x + size.0 as i32 / 2, origin.y + size.1 as i32 / 2);
-
-    // A self-launched target has the same integrity level as its launcher, so the two fields the
-    // choice table reads are equal by construction and the `target_is_elevated && !self_is_elevated`
-    // arm is unreachable. This is not an assumption about the machine — `EnableLUA = 0` here, and
-    // the probe does not need to know.
-    let probe = TargetProbe {
-        target_is_elevated: false,
-        self_is_elevated: false,
-        target_is_foreground: unsafe { GetForegroundWindow() } == launched.window,
-        routing,
-    };
-    let choice = scroll_actuator::choose(&probe);
-    eprintln!(
-        "[P3.10] target 0x{target:x} class {} frame {frame_width}x{frame_height} \
-         window {window_width}x{window_height} client ({},{})-({},{}); choice {:?} + {:?} \
-         (foreground = {})",
-        launched.class,
-        origin.x,
-        origin.y,
-        origin.x + size.0 as i32,
-        origin.y + size.1 as i32,
-        choice.path(),
-        choice.aim(),
-        probe.target_is_foreground
-    );
-
-    // Two plans, because the loop's own convergence is a *different* claim from its cancel path and
-    // the probe must not conflate them. The default plan starts at `ĝ₀ = 60 px/notch`, which is what
-    // a session actually gets; the calibrated one matches the 100 px/notch `E-INJECT-1` measured for
-    // Chromium on this machine, which is what makes the steps commit at all (R-25 / OQ-22).
-    //
-    // The plan is rebuilt per trial rather than cloned: `ScrollPlan` is moved into the runtime, and
-    // giving it a `Clone` only for a probe would be a production trait bound earned by a test.
-    let build_plan = |calibrated: bool| {
-        let plan = ScrollPlan::new(
-            Axis::Vertical,
-            frame_width as u64,
-            frame_height,
-            MemoryBudget::for_viewport(frame_width as u64, frame_height as u64),
-        );
-        if calibrated {
-            plan.with_wheel(3, 33)
-        } else {
-            plan
-        }
-    };
+    let arena = LatencyArena::open();
 
     let mut trials: Vec<CancelTrial> = Vec::new();
     for (plan_label, calibrated) in [("default ĝ₀=60", false), ("calibrated ĝ₀=99", true)] {
         for shape in ["mid-flight", "parked"] {
-            let plan = build_plan(calibrated);
-            let trial = run_cancel_trial(plan_label, plan, shape, target, screen, choice);
+            let trial = run_cancel_trial(&arena, calibrated, shape);
             eprintln!(
                 "[P3.10] {plan_label:<16} {shape:<10} opened {} frames {:>2} injections {:>2} \
                  committed {:>2} stop {:?} latency {}",
@@ -4645,8 +4689,9 @@ fn cancel_latency_probe() {
         }
     }
 
-    shutdown_target(&mut launched);
-    let _ = std::fs::remove_dir_all(&scratch);
+    // Tearing the arena down here rather than at the end of the function keeps the numbers the
+    // assertions read independent of how long shutting Chrome down takes.
+    drop(arena);
 
     let mut measured: Vec<Duration> = trials.iter().filter_map(|trial| trial.latency).collect();
     let report = || {
@@ -4725,14 +4770,8 @@ fn cancel_latency_probe() {
 }
 
 /// One trial: open a session, wait for the trigger moment, cancel, collect the session.
-fn run_cancel_trial(
-    _plan_label: &'static str,
-    plan: ScrollPlan,
-    shape: &'static str,
-    target: isize,
-    screen: Point,
-    choice: scroll_actuator::Choice,
-) -> CancelTrial {
+fn run_cancel_trial(arena: &LatencyArena, calibrated: bool, shape: &'static str) -> CancelTrial {
+    let plan = arena.plan(calibrated);
     let cross = plan.cross_len();
     let extent = plan.viewport_extent();
     let viewport = Rect::new(0, 0, cross as i32, extent as i32);
@@ -4740,42 +4779,24 @@ fn run_cancel_trial(
     let state = Arc::new(AtomicU32::new(OPEN_PENDING));
     let source_frames = Arc::clone(&frames);
     let source_state = Arc::clone(&state);
+    let target = arena.target;
     let make_source =
         move || open_wgc_source(target, Axis::Vertical, viewport, source_state, source_frames);
 
     let injections = Arc::new(AtomicU32::new(0));
     let injected_at = Arc::new(Mutex::new(None));
     let actuator = Win32ScrollActuator {
-        target,
-        screen,
+        target: arena.target,
+        screen: arena.screen,
         axis: Axis::Vertical,
-        choice,
+        choice: arena.choice,
         injections: Arc::clone(&injections),
         injected_at: Arc::clone(&injected_at),
     };
 
     let mut runtime = ScrollRuntime::start(plan, make_source, actuator);
 
-    match shape {
-        "mid-flight" => {
-            // The trigger: the first injection has returned. Spinning rather than sleeping is what
-            // makes this the worst case — a sleep long enough to be reliable would also be long
-            // enough to let the settle finish, which is the thing being measured.
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while injections.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
-                std::hint::spin_loop();
-            }
-        }
-        _ => {
-            // Parked: wait for the session to finish opening, then cancel before any injection.
-            // Waiting on the flag rather than sleeping is what keeps the session-open cost out of
-            // the number: §23.2's trigger is a moment *after* the session is up.
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while state.load(Ordering::Acquire) == OPEN_PENDING && Instant::now() < deadline {
-                std::hint::spin_loop();
-            }
-        }
-    }
+    wait_for_trigger(&state, &injections, shape);
     runtime.controller().cancel();
 
     let session = runtime
@@ -4791,4 +4812,255 @@ fn run_cancel_trial(
         latency: session.cancel_latency(),
     }
 }
+
+/// Wait for the moment a latency probe wants to press its key at.
+///
+/// Both shapes spin rather than sleep, and for the same reason: a sleep long enough to be reliable
+/// is also long enough to let the thing being measured finish.
+///
+/// * **`mid-flight`** — the first injection has returned. This is the worst trigger the loop can be
+///   handed: the step is already out, so the latency includes finishing the settle that step began.
+/// * **`parked`** — the session is up and no injection has gone out. The only thing between the
+///   press and the confirmation is one tick. Waiting on the open flag rather than on a fixed sleep is
+///   what keeps the session-open cost out of the number: §23.2's trigger is a moment *after* the
+///   session is up, not during its assembly.
+///
+/// The deadline only exists so a broken fixture fails instead of hanging.
+fn wait_for_trigger(state: &AtomicU32, injections: &AtomicU32, shape: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    match shape {
+        "mid-flight" => {
+            while injections.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
+                std::hint::spin_loop();
+            }
+        }
+        _ => {
+            while state.load(Ordering::Acquire) == OPEN_PENDING && Instant::now() < deadline {
+                std::hint::spin_loop();
+            }
+        }
+    }
+}
+
+/// One stop trial's result.
+struct StopTrial {
+    shape: &'static str,
+    opened: bool,
+    frames: u32,
+    injections: u32,
+    committed: u32,
+    stop: Option<StopReason>,
+    /// `disposal()` was `Export` — the promise `stop` makes about the pixels (§20.5).
+    exported: bool,
+    latency: Option<Duration>,
+}
+
+/// `docs/31` `P6.08`: `Stop latency`'s real-desktop number, which §23.3's cell says it is owed.
+///
+/// ## What the synthetic number left out
+///
+/// §23.3.4 measured `3.5–52.0 ms` against a scripted page whose `SimulatedPage::next` returns
+/// immediately and never blocks for a tick, and the cell says so: that number is the loop's own
+/// contribution. A real session pays two more segments the fixture cannot have — one WGC poll and
+/// one read-back of the viewport. §23.3.3 measured the read-back alone at 41–44 ms, so the real
+/// number should be that much larger; this probe reports whether it is.
+///
+/// ## The endpoint, and why it is the caller's
+///
+/// `ScrollController::stop` deliberately does **not** stamp an instant, unlike `cancel`, whose
+/// instant exists because §21.4 needs it to detect staleness and §23.2 needs it as the *user's*
+/// moment. So this probe times its own press: `stop()` on the probe thread, then `teardown()`
+/// returning — the driver thread is gone and the session is back, which is the moment §23.2's
+/// "the export can be submitted" becomes true.
+///
+/// Two costs are inside that interval and are written down rather than smoothed over: the thread
+/// join (microseconds) and whatever remained of the step in flight at the moment of the press
+/// (usually its settle). The second one is the quantity itself — `stop` cannot recall an injection
+/// any more than `cancel` can — so it is not an artifact.
+///
+/// ## What is asserted
+///
+/// Only the structure: every trial opened a real WGC session, `mid-flight` pressed *after* an
+/// injection and got a frame back, `parked` pressed before any injection, every session reports
+/// `UserStopped` and would export, and every latency is present (`None` is the metric being absent,
+/// not a fast stop). The comparison against §23.3's `P50 ≤ 20 ms` / `P95 ≤ 60 ms` is **reported**,
+/// not asserted: four samples is not a distribution, and the same rule is why `cancel`'s `p50` is
+/// reported too. The one ceiling that is asserted is physical — a stop cannot cost more than the
+/// step in flight (`STEP_TIMEOUT = 400 ms`) plus the read-back that ends it (44 ms), so 500 ms is
+/// the number past which the loop is not merely unlucky but wrong.
+#[test]
+#[ignore = "P6.08: needs a real interactive desktop and a scrollable target"]
+fn stop_latency_probe() {
+    let arena = LatencyArena::open();
+
+    let mut trials: Vec<StopTrial> = Vec::new();
+    for (plan_label, calibrated) in [("default ĝ₀=60", false), ("calibrated ĝ₀=99", true)] {
+        for shape in ["mid-flight", "parked"] {
+            let trial = run_stop_trial(&arena, calibrated, shape);
+            eprintln!(
+                "[P6.08] {plan_label:<16} {shape:<10} opened {} frames {:>2} injections {:>2} \
+                 committed {:>2} stop {:?} exported {} latency {}",
+                trial.opened,
+                trial.frames,
+                trial.injections,
+                trial.committed,
+                trial.stop,
+                trial.exported,
+                match trial.latency {
+                    Some(latency) => format!("{} ms", latency.as_millis()),
+                    None => "NOT MEASURED".to_string(),
+                }
+            );
+            trials.push(trial);
+        }
+    }
+
+    drop(arena);
+
+    let mut measured: Vec<Duration> = trials.iter().filter_map(|trial| trial.latency).collect();
+    let report = || {
+        trials
+            .iter()
+            .map(|trial| {
+                format!(
+                    "{} opened={} frames={} injections={} stop={:?} exported={}",
+                    trial.shape,
+                    trial.opened,
+                    trial.frames,
+                    trial.injections,
+                    trial.stop,
+                    trial.exported
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+
+    assert!(
+        trials.iter().all(|trial| trial.opened),
+        "every trial must have opened a real WGC session, or the latency it reports belongs to a \
+         session that was never capturing: {}",
+        report()
+    );
+    assert!(
+        trials
+            .iter()
+            .filter(|trial| trial.shape == "mid-flight")
+            .all(|trial| trial.injections >= 1 && trial.frames >= 1),
+        "a `mid-flight` stop must land after a wheel went out and a frame came back, or its trigger \
+         point was never reached: {}",
+        report()
+    );
+    assert!(
+        trials
+            .iter()
+            .filter(|trial| trial.shape == "parked")
+            .all(|trial| trial.injections == 0),
+        "a `parked` stop must land before the first injection, or it is a `mid-flight` trial wearing \
+         the wrong label: {}",
+        report()
+    );
+    assert!(
+        trials
+            .iter()
+            .all(|trial| trial.stop == Some(StopReason::UserStopped)),
+        "every trial pressed `stop`, so every session must report `UserStopped`: {}",
+        report()
+    );
+    assert!(
+        trials.iter().all(|trial| trial.exported),
+        "`stop` promises the pixels go to the export path (§20.5), so `disposal()` must be `Export` \
+         and never `Discard`: {}",
+        report()
+    );
+    assert_eq!(
+        measured.len(),
+        trials.len(),
+        "every stopped session must carry its latency: {} of {} trials reported one — a `None` here \
+         is the metric being absent, not the latency being zero (§23.2)",
+        measured.len(),
+        trials.len()
+    );
+    measured.sort();
+    let max = *measured.last().expect("at least one trial ran");
+    let p50 = measured[measured.len() / 2];
+    let share = |limit: u128| (max.as_millis() * 100) / limit;
+
+    eprintln!(
+        "[P6.08] Stop latency over {} trials: max = {} ms, p50 = {} ms (targets: P50 ≤ 20 ms, \
+         P95 ≤ 60 ms; the synthesised loop-only number was 3.5–52.0 ms, §23.3.4)",
+        measured.len(),
+        max.as_millis(),
+        p50.as_millis()
+    );
+    if max > Duration::from_millis(60) {
+        eprintln!(
+            "[P6.08] note: max {} ms is {}% of the P95 ≤ 60 ms threshold — this is the segment the \
+             synthesized number could not contain",
+            max.as_millis(),
+            share(60)
+        );
+    }
+    eprintln!(
+        "[P6.08] note: {} samples is not a distribution, so p50 is reported and NOT asserted",
+        measured.len()
+    );
+
+    assert!(
+        max <= Duration::from_millis(500),
+        "a stop costs at most the step in flight (STEP_TIMEOUT = 400 ms) plus the read-back that \
+         ends it (44 ms, §23.3.3); measured {max:?}"
+    );
+}
+
+/// One stop trial: open a session, wait for the trigger moment, ask for the result, collect it.
+///
+/// The latency is timed here rather than read off the session because there is nothing to read:
+/// `stop` has no instant of its own (see the probe's doc for why that is deliberate).
+fn run_stop_trial(arena: &LatencyArena, calibrated: bool, shape: &'static str) -> StopTrial {
+    let plan = arena.plan(calibrated);
+    let cross = plan.cross_len();
+    let extent = plan.viewport_extent();
+    let viewport = Rect::new(0, 0, cross as i32, extent as i32);
+    let frames = Arc::new(AtomicU32::new(0));
+    let state = Arc::new(AtomicU32::new(OPEN_PENDING));
+    let source_frames = Arc::clone(&frames);
+    let source_state = Arc::clone(&state);
+    let target = arena.target;
+    let make_source =
+        move || open_wgc_source(target, Axis::Vertical, viewport, source_state, source_frames);
+
+    let injections = Arc::new(AtomicU32::new(0));
+    let injected_at = Arc::new(Mutex::new(None));
+    let actuator = Win32ScrollActuator {
+        target: arena.target,
+        screen: arena.screen,
+        axis: Axis::Vertical,
+        choice: arena.choice,
+        injections: Arc::clone(&injections),
+        injected_at: Arc::clone(&injected_at),
+    };
+
+    let mut runtime = ScrollRuntime::start(plan, make_source, actuator);
+
+    wait_for_trigger(&state, &injections, shape);
+    let pressed_at = Instant::now();
+    runtime.controller().stop();
+    let session = runtime
+        .teardown()
+        .expect("a stopped driver hands its session back");
+    let latency = Instant::now().saturating_duration_since(pressed_at);
+
+    StopTrial {
+        shape,
+        opened: state.load(Ordering::Acquire) == OPEN_OK,
+        frames: frames.load(Ordering::Acquire),
+        injections: injections.load(Ordering::Acquire),
+        committed: session.committed(),
+        stop: session.stop_reason(),
+        exported: matches!(session.disposal(), Some(Disposal::Export(_))),
+        latency: Some(latency),
+    }
+}
+
 
