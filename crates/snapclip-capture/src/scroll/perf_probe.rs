@@ -36,12 +36,11 @@
 //!   `SNAPCLIP_PERF1_VARIANT` and appends one JSON line, so `tools/p0-03-matching-cost.ps1`
 //!   can run each of the six scenarios in a fresh process.
 
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::geometry::Rect;
+use crate::scroll::alloc_probe::{live_bytes, peak_bytes, reset_peak};
 use crate::scroll::displacement::{
     self, GateOutcome, Scratch, Status, candidates_1d, gate_geometry, gate_margin,
     gate_residual_gain, gate_support, is_verifiable, margin_of, outside_cell_second, refine_winner,
@@ -880,76 +879,11 @@ fn expand_bgra(luma: &[u8], bgra: &mut [u8]) {
 // ---------------------------------------------------------------------------------------
 // Allocator accounting
 // ---------------------------------------------------------------------------------------
-
-static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
-static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
-
-fn live_bytes() -> usize {
-    LIVE_BYTES.load(Ordering::Relaxed)
-}
-
-fn peak_bytes() -> usize {
-    PEAK_BYTES.load(Ordering::Relaxed)
-}
-
-/// Moves the high-water mark to the current live total, so later `peak - live` measures what
-/// the timed region itself added.
-fn reset_peak() {
-    PEAK_BYTES.store(live_bytes(), Ordering::Relaxed);
-}
-
-struct CountingAllocator;
-
-impl CountingAllocator {
-    fn record_growth(bytes: usize) {
-        let live = LIVE_BYTES.fetch_add(bytes, Ordering::Relaxed) + bytes;
-        PEAK_BYTES.fetch_max(live, Ordering::Relaxed);
-    }
-
-    fn record_shrink(bytes: usize) {
-        LIVE_BYTES.fetch_sub(bytes, Ordering::Relaxed);
-    }
-}
-
-// SAFETY: every method forwards to `System` unchanged; the counters are the only added work
-// and they use relaxed atomics, which cannot allocate.
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let pointer = unsafe { System.alloc(layout) };
-        if !pointer.is_null() {
-            Self::record_growth(layout.size());
-        }
-        pointer
-    }
-
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let pointer = unsafe { System.alloc_zeroed(layout) };
-        if !pointer.is_null() {
-            Self::record_growth(layout.size());
-        }
-        pointer
-    }
-
-    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(pointer, layout) };
-        Self::record_shrink(layout.size());
-    }
-
-    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let new_pointer = unsafe { System.realloc(pointer, layout, new_size) };
-        if !new_pointer.is_null() {
-            if new_size >= layout.size() {
-                Self::record_growth(new_size - layout.size());
-            } else {
-                Self::record_shrink(layout.size() - new_size);
-            }
-        }
-        new_pointer
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: CountingAllocator = CountingAllocator;
+//
+// The allocator itself lives in `alloc_probe`, because a binary has exactly one
+// `#[global_allocator]` and `P4.07`'s `E-MEM-1` device needs the same one. `live_bytes`,
+// `peak_bytes` and `reset_peak` are imported above; the accounting below is unchanged from
+// `P0.03`, so the numbers already recorded for `E-PERF-1` stay comparable.
 
 // ---------------------------------------------------------------------------------------
 // Driver surface
@@ -962,7 +896,11 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-fn append_json_line(path: &Path, line: &str) {
+/// Appends one line to a JSONL file, creating it if needed.
+///
+/// Shared with `mem_probe` (`P4.07`): both probes hand their per-process results to a driver
+/// through a file rather than a pipe, and the format of that hand-off is one thing, not two.
+pub(crate) fn append_json_line(path: &Path, line: &str) {
     use std::io::Write as _;
     let mut file = std::fs::OpenOptions::new()
         .create(true)

@@ -80,6 +80,15 @@ pub use session::ScrollDiagnosticCode;
 #[cfg(test)]
 mod acceptance;
 
+/// The capture test binary's one `#[global_allocator]` and its four counters (`P4.07` moved it
+/// here from `perf_probe`: a binary has exactly one, and `E-MEM-1` needs a counter `E-PERF-1` did
+/// not have).
+#[cfg(test)]
+mod alloc_probe;
+
+#[cfg(test)]
+mod mem_probe;
+
 #[cfg(test)]
 mod perf_probe;
 
