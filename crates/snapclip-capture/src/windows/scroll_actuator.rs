@@ -97,15 +97,6 @@ pub(crate) fn wheel_wparam(delta: i32) -> usize {
 /// which is worse than a refusal.
 pub(crate) const MAX_NOTCHES: i32 = i16::MAX as i32 / WHEEL_DELTA;
 
-/// Which transport fires the wheel.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum InjectPath {
-    /// The system input queue. The routing rule decides where it lands.
-    SendInput,
-    /// A message addressed to a window we pick.
-    PostMessageW,
-}
-
 /// Where a `SendInput` wheel event lands, as far as the system is concerned.
 ///
 /// `SPI_GETMOUSEWHEELROUTING` (`winuser.h:5319`). It is a **user-changeable**
@@ -211,44 +202,6 @@ pub(crate) fn choose(probe: &TargetProbe) -> Choice {
     Choice { path, aim }
 }
 
-/// Who places the cursor before a `SendInput` notch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Aim {
-    /// This process places it. The normal case: under `MOUSE_POS` routing the
-    /// wheel follows the cursor, so the aim is part of the injection.
-    PlaceCursor,
-    /// The caller has already placed it.
-    ///
-    /// This exists because a sender at a **lower** integrity level than the
-    /// foreground window cannot call `SetCursorPos` — it fails and leaves the
-    /// last error at 0. The low-integrity arm of `E-INJECT-1` therefore has the
-    /// operator aim the cursor and sets this, which leaves only the delivery
-    /// step under test instead of reporting "the cursor could not be placed".
-    AssumePlaced,
-}
-
-/// The outcome of one injection, in the shared vocabulary of `docs/30` §24.6
-/// rule 3.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum InjectStatus {
-    /// The transport accepted it. **Not** evidence that the target acted —
-    /// `PostMessageW` returning `TRUE` only means the message was queued, and
-    /// `SendInput` returning `1` only means the event was inserted. The evidence
-    /// is a content displacement, which is `P3.03`'s job (§24.7).
-    Posted,
-    /// The request cannot be expressed on the wire.
-    InvalidRequest,
-    /// The handle is not a window any more.
-    TargetNotFound,
-    /// The point could not be resolved, or the cursor could not be placed.
-    /// `code == 0` means no Win32 call failed — the window tree could not be
-    /// walked, which is what a failed `ClientToScreen` looks like.
-    CoordinateFailure { code: i32 },
-    /// The transport refused. For a post that is access or validity, because a
-    /// post has no queue slot to fail on.
-    PostFailed { code: i32 },
-}
-
 /// One injection, expressed so that the platform is the only thing missing.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct InjectRequest {
@@ -265,36 +218,11 @@ pub(crate) struct InjectRequest {
 }
 
 /// What one injection produced.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct InjectOutcome {
-    pub status: InjectStatus,
-    /// Events accepted by the transport (1 for a post, `1` per notch for
-    /// `SendInput`). Meaningful only when `status == Posted`.
-    pub delivered: u32,
-    /// The window that actually received the message, when there was one. The
-    /// descended child is not the window we were handed, and saying which one it
-    /// was is the difference between "the target ignored it" and "we posted to
-    /// the wrong window".
-    pub target_window: Option<isize>,
-}
-
-impl InjectOutcome {
-    fn posted(delivered: u32, target_window: Option<isize>) -> Self {
-        Self {
-            status: InjectStatus::Posted,
-            delivered,
-            target_window,
-        }
-    }
-
-    fn failed(status: InjectStatus) -> Self {
-        Self {
-            status,
-            delivered: 0,
-            target_window: None,
-        }
-    }
-}
+///
+/// The vocabulary moved to `scroll/ports.rs` in `P3.09` (§28.4 forbids `scroll/` from referencing
+/// this module, and the driver that reads these outcomes lives there). The names are re-exported so
+/// that `P3.01`/`P3.02`'s code and tests are untouched.
+pub(crate) use crate::scroll::ports::{Aim, InjectOutcome, InjectPath, InjectStatus};
 
 /// The platform calls this module needs, separated so the decisions can be
 /// tested without a desktop (`docs/30` §29.2, G9).

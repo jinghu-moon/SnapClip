@@ -23,21 +23,29 @@
 //!
 //! ## Not here yet
 //!
-//! * `target: ScrollTarget` — `docs/30` §20.1's sketch has it, but `target.rs` is `P3.05`.
 //! * The invariants of §20.3 that involve the band budget are asserted by `RecoveredImage` itself
 //!   (`canvas.rs`, `P1.17`); this module adds the two that are about the *session's* counters.
-//! * `undo`'s *effect* — §19.6's span history lives in `ViewportState` and moves onto the session in
-//!   `P3.09`. `P3.08` lands only the request side (`ScrollController::undo`), because the overlay
-//!   thread has to be able to *ask* before anything can answer.
+//! * `undo`'s *effect*: §19.6's span history stays in `ViewportState` (`canvas.rs`), because that is
+//!   the only object that knows both the viewport position and the canvas. `P3.08` landed the request
+//!   side (`ScrollController::undo`, because the overlay thread has to be able to *ask*), and `P3.09`'s
+//!   driver is what answers — it drains the requests and calls `ViewportState::undo_last` per step.
+//!   The session itself owns only the request counters, not the history.
 
-#![allow(dead_code)] // First consumer is the driver (`P3.04`), then the session assembly (`P3.09`).
+// Everything here is `pub(crate)` and consumed by the assembly (`ScrollRuntime`, this file) plus the
+// driver (`loop_control.rs`). From the library target alone the chain is unreachable — `ScrollRuntime`
+// has no production caller until `P4`/`P5` wire it up — so the allow is the honest way to say "the
+// consumer is the binary, not the library" rather than deleting the vocabulary and re-adding it.
+#![allow(dead_code)]
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::scroll::canvas::{MemoryBudget, RecoveredImage};
+use crate::scroll::loop_control::ScrollDriver;
 use crate::scroll::observation::{Axis, Observation};
+use crate::scroll::ports::{FrameSource, ScrollActuator};
+use crate::scroll::preview::PreviewStream;
 
 /// Why a session stopped (`docs/30` §20.4, converged to eleven variants by C7).
 ///
@@ -139,6 +147,15 @@ pub(crate) struct ScrollSession {
     stop: Option<StopReason>,
     undo: Vec<u64>,
     follow: bool,
+    /// How long the driver took to confirm a cancel, once one was asked for (§23.2's
+    /// `Cancel latency`).
+    ///
+    /// It is measured by the loop, not derived from anything here, because only the loop knows when
+    /// it regained control: the check points are the loop's, and an injection that has already gone
+    /// out cannot be recalled (`docs/30` §21.4). Stored on the session rather than published as a
+    /// diagnostic because the number has to survive the session — `P3`'s exit condition is a
+    /// *measured* maximum, and a value that only existed while the driver ran could not be checked.
+    cancel_latency: Option<Duration>,
 }
 
 impl ScrollSession {
@@ -154,6 +171,7 @@ impl ScrollSession {
             stop: None,
             undo: Vec::new(),
             follow: true,
+            cancel_latency: None,
         }
     }
 
@@ -269,6 +287,25 @@ impl ScrollSession {
             Disposal::Discard
         })
     }
+
+    /// Record how long the driver took to confirm a cancel (`docs/30` §23.2's `Cancel latency`).
+    ///
+    /// The first measurement wins, for the same reason the first stop reason does: a session that has
+    /// been cancelled is over, and a second number would be measuring something else (the next loop
+    /// iteration noticing a flag that is already set).
+    pub(crate) fn record_cancel_latency(&mut self, latency: Duration) {
+        if self.cancel_latency.is_none() {
+            self.cancel_latency = Some(latency);
+        }
+    }
+
+    /// The measured `Cancel latency`, if a cancel was ever confirmed.
+    ///
+    /// `None` is not zero: it means no cancel was asked for, and reporting it as `0 ms` would make
+    /// §23.2's maximum look satisfied by sessions that were never cancelled at all.
+    pub(crate) fn cancel_latency(&self) -> Option<Duration> {
+        self.cancel_latency
+    }
 }
 
 /// The overlay thread's handle on a running session (`docs/30` §27.2; task `P3.08`).
@@ -306,6 +343,14 @@ pub(crate) struct ScrollController {
     follow: Mutex<Option<bool>>,
     /// Idempotent, and the driver's cue to unwind (§27.2).
     shutdown: AtomicBool,
+    /// When the user asked to cancel (§21.4), written by whichever `cancel()` wins the CAS.
+    ///
+    /// A separate slot from `stop` because the two answer different questions: `stop` is "what
+    /// should this session end with", which is sticky and read once; this is "when did the user
+    /// ask", which is what §23.2's `Cancel latency` is measured *from*. Deriving the instant from
+    /// the loop instead would measure how long the loop took to look, which is precisely the thing
+    /// the metric is supposed to expose rather than assume.
+    cancel_at: Mutex<Option<Instant>>,
 }
 
 const STOP_NOTHING: u32 = 0;
@@ -319,6 +364,7 @@ impl ScrollController {
             undo: AtomicU32::new(0),
             follow: Mutex::new(None),
             shutdown: AtomicBool::new(false),
+            cancel_at: Mutex::new(None),
         }
     }
 
@@ -330,13 +376,25 @@ impl ScrollController {
     }
 
     /// "I want no result" (`Esc`, §20.5). No file is written.
+    ///
+    /// The instant is stamped here, on the **caller's** thread — the overlay's key handler — because
+    /// that is the only moment that is the user's rather than the loop's. The CAS is what makes it
+    /// the *first* cancel: a second `Esc` on a session that is already cancelling must not move the
+    /// instant forward and make the latency look smaller.
     pub(crate) fn cancel(&self) {
-        let _ = self.stop.compare_exchange(
-            STOP_NOTHING,
-            STOP_USER_CANCELLED,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        if self
+            .stop
+            .compare_exchange(
+                STOP_NOTHING,
+                STOP_USER_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            let mut slot = self.cancel_at.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            *slot = Some(Instant::now());
+        }
     }
 
     /// Undo the last confirmed step (§19.6). Presses accumulate: the UI only exposes "undo one
@@ -372,6 +430,18 @@ impl ScrollController {
         self.undo.swap(0, Ordering::AcqRel)
     }
 
+    /// The instant the user asked to cancel, or `None` (`docs/30` §21.4).
+    ///
+    /// Polled by the loop at every interruptible point, and it is the *user's* instant rather than
+    /// the loop's on purpose: the difference between the two **is** §23.2's `Cancel latency`, and a
+    /// value the loop stamped itself could not measure it.
+    pub(crate) fn cancellation(&self) -> Option<Instant> {
+        *self
+            .cancel_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Take the follow request, if one is waiting.
     pub(crate) fn take_follow(&self) -> Option<bool> {
         self.follow
@@ -398,10 +468,176 @@ pub(crate) fn phase(session: &ScrollSession) -> Phase {
     Phase::Running
 }
 
+/// Everything a session needs before it has a thread (`docs/30` §20.1's session sketch; task `P3.09`).
+///
+/// It exists so that the driver's dependencies are all decided **once**, in one place, by the
+/// assembly — and so that a test can build a session without a desktop, a window handle or a DPI
+/// query. The two ports are *not* in here: they are per-session values that arrive at
+/// [`ScrollRuntime::start`], because they are the things a test substitutes.
+pub(crate) struct ScrollPlan {
+    axis: Axis,
+    cross_len: u64,
+    viewport_extent: u32,
+    budget: MemoryBudget,
+    /// The wheel calibration the control law starts from (§13.2): `ĝ₀ = lines_per_notch ×
+    /// line_height_px`.
+    lines_per_notch: u32,
+    line_height_px: u32,
+}
+
+impl ScrollPlan {
+    /// The defaults are the *measured* ones, not the plausible ones: `lines_per_notch = 3` is this
+    /// machine's `SPI_GETWHEELSCROLLLINES` and `line_height_px = 20` is the line height the control
+    /// law's worked example uses (§13.2) — `starting_px_per_notch(3, 20) = 60`.
+    ///
+    /// They are still only a starting point: `ĝ` is learned from confirmed steps, so a wrong default
+    /// costs a few steps rather than the session (`E-CTRL-1` measured convergence in ≤ 10 steps for
+    /// every starting value within about 2× of the truth). [`Self::with_wheel`] exists for the
+    /// assembly, which can do better than a constant by probing the target.
+    pub(crate) fn new(axis: Axis, cross_len: u64, viewport_extent: u32, budget: MemoryBudget) -> Self {
+        Self {
+            axis,
+            cross_len,
+            viewport_extent,
+            budget,
+            lines_per_notch: 3,
+            line_height_px: 20,
+        }
+    }
+
+    /// Set the wheel calibration from a probe rather than from a constant (§13.2, `P3.09`'s assembly).
+    pub(crate) fn with_wheel(mut self, lines_per_notch: u32, line_height_px: u32) -> Self {
+        self.lines_per_notch = lines_per_notch.max(1);
+        self.line_height_px = line_height_px.max(1);
+        self
+    }
+
+    pub(crate) fn axis(&self) -> Axis {
+        self.axis
+    }
+
+    pub(crate) fn cross_len(&self) -> u64 {
+        self.cross_len
+    }
+
+    pub(crate) fn viewport_extent(&self) -> u32 {
+        self.viewport_extent
+    }
+
+    pub(crate) fn budget(&self) -> MemoryBudget {
+        self.budget
+    }
+
+    pub(crate) fn lines_per_notch(&self) -> u32 {
+        self.lines_per_notch
+    }
+
+    pub(crate) fn line_height_px(&self) -> u32 {
+        self.line_height_px
+    }
+}
+
+/// A running session: the driver thread, the two ports, and the session it will hand back.
+///
+/// ## Why the thread is here and not in the driver
+///
+/// `ScrollDriver` is a pure loop over its two arguments (`scroll/loop_control.rs`), so a test can run
+/// it on the test's own thread with a scripted source and actuator. `ScrollRuntime` is the part that
+/// needs a real thread, a real desktop and a real teardown order — and keeping that split means the
+/// loop's tests do not need any of the three.
+///
+/// ## Why the session is built before the thread starts
+///
+/// The canvas owns a spill directory, and the directory is created eagerly (`BandStore::new`,
+/// `canvas.rs:383`). Building the session here — on the caller's thread, before `spawn` — is what
+/// makes "the session owns exactly one directory" a fact the caller can observe the instant `start`
+/// returns. Building it *inside* the thread would make the same statement a race, and every teardown
+/// test would be testing the scheduler.
+///
+/// ## Teardown
+///
+/// `teardown` sets the shutdown bit and joins. `Drop` calls it and throws the session away. Both are
+/// the same code path on purpose: §20.3's audit found the existing workers have no `Drop` at all and
+/// their join handles sit in a `Mutex<Option<..>>` that a controller can simply forget to take, which
+/// makes "the caller remembered" the resource policy. A session that holds a thread and a directory
+/// cannot afford that.
+pub(crate) struct ScrollRuntime {
+    controller: std::sync::Arc<ScrollController>,
+    preview: std::sync::Arc<PreviewStream>,
+    /// `None` only after a successful teardown — the handle is taken, not merely inspected, so the
+    /// join happens exactly once.
+    driver: Option<std::thread::JoinHandle<ScrollSession>>,
+}
+
+impl ScrollRuntime {
+    pub(crate) fn start<F, A>(plan: ScrollPlan, source: F, actuator: A) -> Self
+    where
+        F: FrameSource + Send + 'static,
+        A: ScrollActuator + Send + 'static,
+    {
+        let controller = std::sync::Arc::new(ScrollController::new());
+        let preview = std::sync::Arc::new(PreviewStream::new());
+        let driver = ScrollDriver::new(&plan);
+
+        let thread_controller = std::sync::Arc::clone(&controller);
+        let thread_preview = std::sync::Arc::clone(&preview);
+        let handle = std::thread::Builder::new()
+            // Named so that a hung session is identifiable in a stack dump rather than being one more
+            // anonymous thread in a process that already has four workers (§21.1).
+            .name("snapclip-scroll-driver".to_owned())
+            .spawn(move || {
+                driver.run(source, actuator, &thread_controller, &thread_preview)
+            })
+            .expect("the scroll driver thread is spawnable");
+
+        Self {
+            controller,
+            preview,
+            driver: Some(handle),
+        }
+    }
+
+    pub(crate) fn controller(&self) -> &std::sync::Arc<ScrollController> {
+        &self.controller
+    }
+
+    pub(crate) fn preview(&self) -> &std::sync::Arc<PreviewStream> {
+        &self.preview
+    }
+
+    /// Has the driver thread finished? `false` is "still working", and it is what the teardown test
+    /// asserts *before* tearing down: a runtime whose thread never started would satisfy "no threads
+    /// leak" trivially.
+    pub(crate) fn driver_exited(&self) -> bool {
+        self.driver.as_ref().is_none_or(std::thread::JoinHandle::is_finished)
+    }
+
+    /// Ask the driver to stop and wait for it, returning the session it produced.
+    ///
+    /// Returns `None` when called twice: the second call has no thread to join and no session to hand
+    /// back, and inventing an empty session would be a lie about what happened.
+    pub(crate) fn teardown(&mut self) -> Option<ScrollSession> {
+        self.controller.shutdown();
+        let handle = self.driver.take()?;
+        handle.join().ok()
+    }
+}
+
+impl Drop for ScrollRuntime {
+    fn drop(&mut self) {
+        // The result is discarded and that is not a leak: the session owns the spill directory, and
+        // dropping it here is what removes the directory (§20.3).
+        drop(self.teardown());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::geometry::Rect;
+    use crate::scroll::ports::{
+        FrameError, InjectOutcome, InjectPath, InjectStatus, Poll,
+    };
 
     #[test]
     fn phase_is_derived_from_the_data_not_from_a_mode() {
@@ -709,5 +945,178 @@ mod tests {
     fn the_controller_crosses_threads() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<ScrollController>();
+    }
+
+    /// Every spill directory this process owns right now.
+    ///
+    /// `BandStore`'s directory name is `snapclip-bands-{pid}-{nanos}` (`canvas.rs`'s
+    /// `unique_spill_dir`), so a snapshot of that set is the whole question "did this session clean
+    /// up after itself" — and it is asked of the *filesystem*, not of a flag the session sets. A
+    /// session that forgot to drop its store would pass any assertion written against its own
+    /// bookkeeping.
+    fn spill_dirs() -> std::collections::BTreeSet<std::path::PathBuf> {
+        let prefix = format!("snapclip-bands-{}-", std::process::id());
+        std::fs::read_dir(std::env::temp_dir())
+            .expect("the system temp directory is readable")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix))
+            })
+            .collect()
+    }
+
+    /// A source that never has anything new, and never ends.
+    ///
+    /// It is what makes the teardown test about teardown: the driver has no work to do, so the only
+    /// reason it ever leaves its loop is the command port — which is exactly the path under test.
+    struct IdleSource {
+        viewport: Rect,
+    }
+
+    impl FrameSource for IdleSource {
+        fn next(&mut self, _timeout: std::time::Duration) -> Result<Poll, FrameError> {
+            Ok(Poll::Idle)
+        }
+
+        fn viewport(&self) -> Rect {
+            self.viewport
+        }
+    }
+
+    /// An actuator that records what it was asked to do and never moves anything.
+    struct SilentActuator {
+        injections: u32,
+    }
+
+    impl ScrollActuator for SilentActuator {
+        type Path = InjectPath;
+
+        fn path(&self) -> InjectPath {
+            InjectPath::SendInput
+        }
+
+        fn switch(&mut self, _from: InjectPath) -> Option<InjectPath> {
+            None
+        }
+
+        fn inject(&mut self, _notches: i32) -> InjectOutcome {
+            self.injections += 1;
+            InjectOutcome::failed(InjectStatus::TargetNotFound)
+        }
+    }
+
+    fn plan() -> ScrollPlan {
+        ScrollPlan::new(
+            Axis::Vertical,
+            320,
+            200,
+            MemoryBudget::with_total(1 << 20),
+        )
+    }
+
+    /// `docs/30` §20.3's "析构即删临时文件" and §21.1's driver thread, asserted as one property:
+    /// **a torn-down session leaves nothing behind** — not a thread, not a directory.
+    ///
+    /// Three things are checked, and each one is a different failure:
+    ///
+    /// * the driver is *running* before the teardown (a runtime that never started a thread would
+    ///   satisfy "no threads leak" trivially);
+    /// * the session owns a spill directory while it lives (otherwise "it was removed" is vacuous);
+    /// * the directory is gone once the session is dropped, and the thread has been joined.
+    ///
+    /// The stop reason is `UserCancelled`, and that is a decision rather than a default: a session
+    /// torn down without a prior promise produces **no artifact** (§20.5), which is exactly what
+    /// `UserCancelled` promises. §4.3.7 froze the vocabulary at eleven reasons, so the honest move is
+    /// to reuse the one whose promise matches, not to add a twelfth that only one call site produces.
+    #[test]
+    fn a_scroll_session_tears_down_without_leaking_bands_or_threads() {
+        let before = spill_dirs();
+
+        let mut runtime = ScrollRuntime::start(
+            plan(),
+            IdleSource {
+                viewport: Rect::new(0, 0, 320, 200),
+            },
+            SilentActuator { injections: 0 },
+        );
+
+        assert!(
+            !runtime.driver_exited(),
+            "the driver thread is what makes this a session rather than a struct"
+        );
+        let during = spill_dirs();
+        assert_eq!(
+            during.len(),
+            before.len() + 1,
+            "a live session owns exactly one spill directory; before={before:?} during={during:?}"
+        );
+
+        let session = runtime
+            .teardown()
+            .expect("the driver hands its session back");
+        assert!(
+            runtime.driver_exited(),
+            "teardown joins the driver; a session whose thread is still running has not ended"
+        );
+        assert_eq!(
+            session.stop_reason(),
+            Some(StopReason::UserCancelled),
+            "a teardown promises no artifact (§20.5), which is `UserCancelled`'s promise"
+        );
+
+        drop(session);
+        assert_eq!(
+            spill_dirs(),
+            before,
+            "the canvas' spill directory outlived the session (§20.3: 析构即删临时文件)"
+        );
+    }
+
+    /// Teardown is reachable twice, and the second time is `Drop`'s.
+    ///
+    /// §20.3's audit found the existing workers have **no** `Drop` at all and their `JoinHandle`s
+    /// sit in a `Mutex<Option<..>>` that one controller can forget to take (§20.3 item 9). A scroll
+    /// session is long-lived and holds a thread and a directory, so "the caller remembered" is not a
+    /// resource policy — this is the case that says so.
+    #[test]
+    fn dropping_a_runtime_tears_the_session_down() {
+        let before = spill_dirs();
+        {
+            let runtime = ScrollRuntime::start(
+                plan(),
+                IdleSource {
+                    viewport: Rect::new(0, 0, 320, 200),
+                },
+                SilentActuator { injections: 0 },
+            );
+            assert!(!runtime.driver_exited());
+        }
+        assert_eq!(
+            spill_dirs(),
+            before,
+            "`Drop` must do what `teardown` does: no directory, no thread, no residue"
+        );
+    }
+
+    /// A command that arrives before the loop has anything to do is still honoured: `shutdown` is a
+    /// sticky bit, so it cannot be missed by a driver that is parked waiting for frames.
+    #[test]
+    fn shutdown_ends_a_parked_driver() {
+        let mut runtime = ScrollRuntime::start(
+            plan(),
+            IdleSource {
+                viewport: Rect::new(0, 0, 320, 200),
+            },
+            SilentActuator { injections: 0 },
+        );
+        runtime.controller().shutdown();
+        let session = runtime
+            .teardown()
+            .expect("a shutdown driver still returns its session");
+        assert_eq!(session.stop_reason(), Some(StopReason::UserCancelled));
+        assert!(runtime.driver_exited());
     }
 }

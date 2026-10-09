@@ -1730,6 +1730,14 @@ impl Control {
 
 **仍未落地**：`ĝ` 的"连续 3 步偏差 > 50% 则重设"（§13.2 第 3 条的后半）——今天只有指数滑动，没有重设分支；它的触发者是"目标换页后突然变快/变慢"（`:363` 的第二个判据，要求 3 步内重新收敛），归 `P3.07`。§13.5 的 UIA 标定路径（一次读取直接给出 `ĝ`，跳过收敛）也不在这里。
 
+**★ 边界：收敛只在欠冲方向成立（`P3.09` 实测，2026-10-09，`DEV-53`）**。上面三条读数的前提是**每一步都能被确认**（`Confirmed`）——只有确认过的步才会喂给 `Prior::confirm`（§16.6 规则 2）。当页面前进**多于** `ĝ` 预期时，这个前提被打破，闭环**无法纠正**：
+
+- 匹配本身是成功的（实测 `zncc2d = 1.0`），失败的是**门一** `is_verifiable`（§16.1）：`overlap_ratio = (V − |d|)/V` 低于 `RHO_MIN = 0.35`。对 `V = 900`、9 格而言，**真增益 > 65 px/格（`ĝ₀ = 60` 的 8%）** 即触发。
+- 步被丢弃 ⇒ 规则 2 禁止从非确认步学习 ⇒ `ĝ` 不动 ⇒ 下一步以**同样**的幅度越冲。实测真增益 72（1.2×）⇒ 每一步都回 `Uncertain { d: 648 }`、`committed()` **恒为 0**。
+- 反向（欠冲）**可恢复**：真增益 48（0.8×）⇒ 步一 432 确认 ⇒ `ĝ` 60 → 56.4；步二 10 格 → 480 确认 ⇒ 53.88 ⇒ 收敛（闭环集成测试 `the_loop_converges_on_a_page_whose_gain_it_does_not_start_with` 断言 `committed() >= 2`）。
+
+**这不是"闭环坏了"，而是"启动值 + 门一"共同设的一个硬边界**：`ĝ₀ = 60` 是启动值（不学习），所以一台滚轮步长较大、页面正常的机器就会撞上它。出口两条，都要新实验：① 更小的首步（`ĝ` 启动值或首步上限）；② §15.6 的**多尺度金字塔**（低分辨率层上 `|d|` 变小 ⇒ 门一不再拒绝）。**不要动 `RHO_MIN`**——它是 `P1.08` 的实测标定值。完整记录见 §36.2 的 `OQ-22`。
+
 ### 13.3 停步与稳定：等待什么
 
 一步的完整时序：
@@ -3328,6 +3336,34 @@ enum PreviewUpdate {
 
 **锁中毒恢复而不 panic**（`unwrap_or_else(|poisoned| poisoned.into_inner())`）：临界区只是搬一个 `Copy` 值，不可能 panic；而 `take`/`publish` 跑在**覆盖层线程**上，在那里 panic 会带走用户正在进行的截图。
 
+#### 19.3.2 落地的形状：**每类一个槽位**（`P3.09`，2026-10-09）
+
+**§19.3 的"容量 1 + latest-only"论证对一种更新成立，对四种不成立。** 约束 1 的理由逐字是"预览是**幂等状态**，丢掉中间态不损失信息"——这对**同一种**更新成立（新的进度值取代旧的），但 `Span`（进度）、`Viewport`（框位置）、`Bands`（新像素可读）是**三个不同的状态**，而 driver 在**同一步**里全都会产生。单一槽位下最后发布的那一个独占：面板的进度行会被框挤掉，或框会被像素挤掉。**这是永久性丢失，不是中间态**——被挤掉的那一类会一直不更新，直到它成为最后一个发布者。
+
+**形状**（`crates/snapclip-capture/src/scroll/preview.rs`）：
+
+```rust
+enum Kind { Bands, Span, Viewport, Ended }
+impl PreviewUpdate { fn kind(&self) -> Kind; }
+
+struct Mailbox { slots: VecDeque<PreviewUpdate> }
+impl Mailbox {
+    fn push(&mut self, update: PreviewUpdate) -> bool;  // 同 kind 就地替换 ⇒ true；否则 push_back ⇒ false
+    fn pop(&mut self) -> Option<PreviewUpdate>;         // pop_front
+}
+```
+
+**四条裁决**：
+
+1. **同 kind 就地替换，不同 kind 追加**。这保留了 §19.3 约束 1 的全部好处（同一种更新 latest-wins、无界队列不存在），同时修掉跨 kind 的永久丢失。`dropped` 的口径不变：同 kind 覆盖 ⇒ `dropped += 1`。
+2. **`take()` 改为 oldest-first（跨 kind 按产生顺序）**。跨 kind 没有"最新"可言——进度和框是两个不同的事实，比较它们的"新旧"没有定义。按产生顺序交出，才能让 drain 的消费者（`P5.01`）在一次唤醒里看全；**kind 内仍是 latest-wins**。
+3. **上限由构造保证 = 4 个条目**（一个 kind 一个槽位）。这是比"容量 1"**更强**的有界性：不需要在 `push` 里数长度、不可能因为忘记检查而上界失效。§19.3 约束 1 的"有界"与约束 2 的"绝不阻塞生产者"都仍然成立（`try_lock` 失败与同 kind 覆盖都进 `dropped` 计数）。
+4. **`dropped` 同时计"同 kind 覆盖"与"`try_lock` 失败"**，因为对用户而言两者是同一种损失（少看到一次更新）。区分它们需要第二个计数器，而今天没有任何消费者会用那个区分做决定。
+
+**新增两条用例把新性质钉住**：`one_step_can_publish_every_kind_without_them_evicting_each_other`（三种 kind 连发 ⇒ `dropped() == 0`，drain 顺序 `["span", "viewport", "bands"]`）与 `within_a_kind_the_newest_update_still_replaces_the_previous_one`。`P3.08` 的两条既有用例**未改**且仍然通过（100 次 `Span` ⇒ `dropped() == 99`、取走后 `None`、空槽位不算丢）——这正是"修掉跨 kind 丢失、不动 kind 内语义"的机械证明。
+
+**闭环集成测试的一条夹具结论（同批实测）**：合成页必须在**整个高度上非周期**。`TestImage::from_structures(w, h, seed, band_height, structures)` 的文档周期是 `band_height`；用 `band_height = 240` 会让位移 480 与 720 在搜索窗内**并列完美匹配**（两者 `zncc2d` 都是 `1.0`），而 `CANDIDATE_LIMIT = 8` 的候选集只会留一个 ⇒ 此时循环**拒绝这一步是正确的**，用例却会红。所以集成测试取 `band_height = height`（`Structure::NoiseBlocks { cell: 8 }` 的哈希按 `y / cell` 变化 ⇒ 整个高度上无重复）。
+
 ### 19.4 视口框与三种状态外观
 
 | 状态 | 外观 | 语义（必须与 §16.10 一一对应） |
@@ -3592,6 +3628,27 @@ impl ScrollSession { pub(crate) fn disposal(&self) -> Option<Disposal<'_>>; }
 
 - 普通截图在"选区已确定"之后可以选择进入滚动模式 → 该动作**结束** `CaptureSession`（走它既有的 `begin_export`/`complete` 路径），把**冻结帧 + 选区几何 + DPI** 交给 `ScrollSession`。
 - 理由：`CaptureSession` 的使命是"选出一个矩形"，使命完成后它不该继续持有资格。**这是一次干净的交接，而不是"扩展普通截图的功能"**——后者会让普通截图承担滚动会话的生命周期（包括可能几分钟的持续捕获），并把它拖进 §21 的线程与设备所有权问题。
+
+#### 20.6.1 落地的形状（`P3.09`，2026-10-09）
+
+**交接物是一个具名类型，不是一个三元组**（`crates/snapclip-capture/src/session.rs`）：
+
+```rust
+#[derive(Debug)]
+pub struct ScrollHandoff { frame: CapturedFrame, selection: Rect, dpi: u32 }
+impl ScrollHandoff { pub fn frame(&self) -> &CapturedFrame; pub fn selection(&self) -> Rect; pub fn dpi(&self) -> u32; }
+
+impl CaptureSession {
+    pub fn begin_scroll(&mut self) -> Result<ScrollHandoff, CaptureError>;
+}
+```
+
+**四条裁决**：
+
+1. **移交而不是复制**：`begin_scroll` 用 `self.frame.take()`，所以交接之后 `session.frame()` 是 `None`。这不是省一次拷贝（虽然也省了——`E-PERF-2` 实测 4K 整图峰值 1188.3 MiB，见 §17.7.1），而是**所有权事实**：一帧冻结的像素同时被两个会话持有，就会有两条"谁负责释放"的路径。用例断言 `frame().is_none()`，措辞是 "handed over, not copied"。
+2. **会话的结束复用既有的 `reset()`**（`CaptureSession` 的 Esc 清理路径），不新增迁移。§20.6 与 §5 的穷举测试（`esc_from_every_active_state_returns_to_idle`）都要求 `CaptureState` 的活跃集合不变；`begin_scroll` 之后 `state() == Idle`、`geometry()` 是 `None`、`!has_selection()` 三条一起断言，证明的是同一件事。
+3. **三种拒绝，都是 `InvalidState`**：状态不是 `Selected|Annotating` ⇒ `"cannot start a scroll session while {state}"`；`selection.intersect(bounds())` 为空 ⇒ `"a scroll session needs a non-empty selection"`；没有冻结帧 ⇒ 第三种 `InvalidState`。**不引入新的错误变体**：这三种都是"调用方在错误的时刻调用"，与 `begin_export` 的拒绝同型（§4.3.2 的 C3 已确证 `CaptureError::InvalidState` 的语义就是它）。
+4. **一次性**：`pointer_released()` 之后第一次 `Ok`，第二次 `Err`——因为第一次已经把状态推回 `Idle`。这让"忘记交接、又调用一次"在开发期就炸，而不是让两个滚动会话共享一个选区。
 
 ## 21. 线程与并发
 
@@ -4752,6 +4809,39 @@ enum ScrollDiagnosticCode {
 
 **`Displacement` 是 `pub(crate)` 而不是 `pub`**：它的字段（`confidence`、`evidence`、`status`）是**算法内部量**；对外只暴露 `StopReason` 与 `ScrollOutcome`（含最终尺寸与产物句柄）。理由：一旦 `confidence` 成为公共 API，它就会变成**兼容性承诺**，而 §16.11 明确它的权重是**可校准**的。
 
+#### 27.1.1 端口归属：一处必须裁决的矛盾（`P3.09`，2026-10-09）
+
+**矛盾是实测出来的，不是推断的**：§28.2 要求 `ScrollDriver` 住在 `crates/snapclip-capture/src/scroll/loop_control.rs`，§28.4 的依赖方向门禁又禁止 `scroll/` 引用平台模块（判据逐字见 §28.4），而 `FrameSource`/`Poll`/`EndReason`/`FrameError` 住在 `crates/snapclip-capture/src/windows/scroll_source.rs`、`InjectPath`/`Aim`/`InjectStatus`/`InjectOutcome` 住在 `crates/snapclip-capture/src/windows/scroll_actuator.rs`。**这三条不能同时成立**——要么 driver 拿不到帧源，要么 `scroll/` 破门禁。设计给出的唯一平台缝 `StepHost`（§13.3）只暴露"注入、取指纹、读时钟"三件事，**没有取帧的方法**，所以它不足以支撑一个完整闭环。
+
+**裁决：取 §27.1 表格里本来就写着的形状——端口归 `scroll/`**。新建 `crates/snapclip-capture/src/scroll/ports.rs` 承载**纯数据词汇**，平台侧用 `pub(crate) use` **re-export 名字**（不是 import）⇒ `windows/scroll_source.rs`、`windows/scroll_actuator.rs` 及其全部既有测试**一行不改**，`P2.03`/`P3.01`/`P3.02` 的证据继续有效。
+
+| 搬进 `scroll/ports.rs` | 留在平台侧 |
+|---|---|
+| `EndReason`、`Poll`、`FrameError`、`FrameSource`（+ 新增 `fn viewport(&self) -> Rect`）、`InjectPath`、`Aim`、`InjectStatus`、`InjectOutcome`，以及**新增的 `ScrollActuator`** | `InjectRequest`、`TargetProbe`、`WheelRouting`、`choose()`、`wheel_message()`、`descend()`、`Win32Injection`、`InjectionTarget`、`FrameBackend`、`WgcFrameSource` |
+
+**`ScrollActuator` 的签名与 §27.3 的草图不同，这是第二处裁决**：
+
+```rust
+pub(crate) trait ScrollActuator {
+    type Path: Copy + PartialEq + std::fmt::Debug;
+    fn path(&self) -> Self::Path;
+    fn switch(&mut self, from: Self::Path) -> Option<Self::Path>;
+    fn inject(&mut self, notches: i32) -> InjectOutcome;
+}
+```
+
+- **`inject` 只收 `notches`，不收 `&InjectRequest`**。`InjectRequest` 的 `target`/`screen`/`path`/`aim` 是 `choose()`（`P3.02` 的判定表）在**会话开始时一次性**决定的产物；让 driver 每步重建它们，就是把那张判定表抄第二遍，而**两份判定表必然漂移**（`P3.02` 的用例已经证明"判定表只有一处"是可机械核对的：`target_is_elevated`/`self_is_elevated` 各只出现 2 次）。执行器自己持有目标与 `Choice`，driver 只回答"走几格"。
+- **`switch` 返回 `Option<Self::Path>`**：看门狗（§13.3 的 `ActuatorWatch`）需要知道"下一个传输是谁"，而这件事**只有执行器知道**（它知道目标是否提权、路由是什么）。返回 `None` = 没有下一个可用传输，看门狗据此判定 `Failed`。
+- **`type Path` 而不是具体枚举**：`scroll/` 不能命名 `InjectPath` 的**平台语义**，但可以把它当**不透明标签**持有（只需 `Copy + PartialEq + Debug`）。这让看门狗可以泛型化，而 §28.4 的边界不需要例外。
+
+**被否决的候选**：新增一个 `DriverHost: StepHost`（多一个 `fn next_frame`）。它会与 `FrameSource`/`ScrollActuator` **并存成第二套缝**——同一个"平台边界"有两个名字，下一个人必须猜哪个是当前的。
+
+**`FrameSource` 新增 `fn viewport(&self) -> Rect`**：消费它是"帧源报告的视口几何 == 画布认为的视口几何"这条会话不变量（§2.1），归开流的装配（`P4`）。
+
+**与 §27.1 表格的一处诚实偏差**：表里把 `scroll::ports::*`、`ScrollController` 列在 `pub`（跨 crate）。**今天它们全部是 `pub(crate)`**——没有跨 crate 的消费者（覆盖层就在本 crate 的 `windows/overlay/` 里），按 `crates/snapclip-capture/src/lib.rs:20-24` 的既有规则先收窄。提升为 `pub` 必须与这张表**一起**改（`P3.08` 的 §27.2.1 已把这条写成约束），不允许只改一处。
+
+**易混路径警告**：`crates/snapclip-capture/src/scroll/ports.rs`（本文件，滚动端口）与 `crates/snapclip-capture/src/ports.rs`（**既有的应用侧** trait 宿主，`ArtifactWriter` 在那里，`P6.06` 要改它的失效注释）是**两个文件**。
+
 ### 27.2 两个跨线程端口（方向相反）
 
 ```rust
@@ -4860,6 +4950,49 @@ pub trait RowBandWriter {
 | `materialize_reference` | `band` + 输出缓冲 | 写入 `out` | 每步 | `CanvasError`（换出读失败/校验失败） | 不适用 | driver 线程；`out` 是复用的 scratch |
 | `RowBandSink::begin` | `ImageMeta`（**含最终 height**） | `Box<dyn RowBandWriter>` | 一次导出 | `ExportError` | `AbortReason` 只能**在 begin 之前**决定 → 见 §17.7 约束 1 | export-worker；**不接触 GPU** |
 | `PreviewStream::publish` | `PreviewUpdate` | — | 会话 | 无（覆盖式，用 `dropped` 计数） | 不适用 | driver → 覆盖层线程（§19.3）；**绝不阻塞生产者** |
+
+#### 27.3.1 落地的形状：`estimate` 与"参照"（`P3.09`，2026-10-09）
+
+**`estimate` 的真实签名**（`crates/snapclip-capture/src/scroll/displacement.rs:2410`，生产入口，`P3.09` 从 `#[cfg(test)] mod tests` 里提升出来）：
+
+```rust
+pub(crate) fn estimate(
+    previous: &ObservationView,   // 已确认的画布参照视口（§17.4）
+    current: &ObservationView,
+    prior: Option<&Prior>,        // None == 手动模式（§16.6.3）
+    notches: i32,                 // 这一步实际注入的格数
+    scene_cut: SceneCut,          // driver 持有的连续计数（§18.3）
+    scratch: &mut Scratch,
+) -> Displacement;
+```
+
+**与 §27.3 草图的四处偏差，每处都有理由**：
+
+1. **没有 `model: &mut RegionModel`**。§27.3 的草图按 §18.2 的 tile 三分类模型给 `estimate` 留了 `&mut RegionModel`，但 `score_candidates_2d`（`displacement.rs:1168`）**没有逐 tile 权重入口**——它内部用 `supporting_tiles(...)` 计数与 `score_of(zncc2d, gain, coverage_of(tiles))` 打分，`RegionModel::weight`（`:2166`）今天**没有任何生产消费者**。要落地就得给 `score_candidates_2d`/`supporting_tiles` 加参数，而那会改动 `P1.06` 校准过、被 `E-ACC-1` 覆盖的函数 ⇒ **必须配一次独立的 `E-ACC-1` 重跑**，不能顺手做。这是 `DEV-54`。
+2. **`prior: Option<&Prior>` 而不是 `&Prior` + `Prior::None`**。手动模式（§13.4）在**调用点**就知道自己是手动模式，而 `Option` 把这件事放在类型里、只在 `Some` 分支里算期望值；一个 `Prior::None` 变体会让热路径每一步都去匹配一个在调用点就已确定的事实。
+3. **`notches` 是独立参数**。`prior.weight(notches, d)` 与 `prior.expectation(notches)` 需要的是**实际注入的格数**，不是"估计器在找什么"。把它藏进 `Prior` 会让"注入了 9 格"与"期望 9 格的距离"两个不同的事实共用一个字段。
+4. **`axis` 不是参数**。两个视图各自携带自己的 `axis`（`Observation` 的字段），再传一份就有第三个副本可以与之不一致。
+
+**`scene_cut` 是入参也是出参**：`SceneCut` 的连续计数是**会话级状态**，只有 driver 能持有（它知道上一步发生了什么），所以由 driver 传入；而"这一步是否被判定为场景切换"是这一步的**证据**，所以它被写回 `Displacement::evidence().scene_cut()`（`:2539-2548`），driver 再据此更新自己的计数。
+
+**"参照"（§27.3 的 `materialize_reference`）落成 `ViewportState::reference`**（`crates/snapclip-capture/src/scroll/canvas.rs`）：
+
+```rust
+impl ViewportState {
+    pub(crate) fn reference(&self, canvas: &mut RecoveredImage, qpc: i64) -> Result<Observation, BandError>;
+}
+```
+
+- **为什么不是 `RecoveredImage` 的方法**：参照是**视口所在位置**的函数（§17.4：参照是画布、不是上一帧），而位置只有 `ViewportState` 知道（`canvas.rs:1469-1471` 的理由逐字是"it is the only thing that knows both the viewport position and the canvas"）。`RecoveredImage` 独自要拿位置就得由调用方传进来，那正好是 `ViewportState` 已经持有的东西。
+- **为什么返回 `Observation` 而不是写进 `out: &mut Vec<u8>`**：下一个调用是 `estimate`，它吃的是视图。返回 `Observation`（已打包、带 `region` 与 `qpc`）让每步**零包装**；`out` 缓冲会让每一步都要把缓冲重新包成一个视图，而包装时又会多一个"这次装的对不对"的问题。
+- **打包失败是 `expect` 而不是 `CorruptBand`**：`canvas.rows(position, extent)` 已经保证字节数，`size` 与 `region` 由同一对数字算出 ⇒ 不匹配是**不变量违反**，与 `ViewportState::apply` 对"帧尺寸变了"的处理同型（那里也是 `assert_eq!`）。往 `CorruptBand { expected, found }` 里填字节数会是一条**调试器会相信的谎**（`CorruptBand` 的语义是换出文件的校验和不符）。
+
+**另外两个 §27.3 草图与落地的偏差**（都由"谁持有状态"决定，`P1.19`/`P1.22` 已落地）：
+
+| §27.3 草图 | 落地 |
+|---|---|
+| `RecoveredImage::commit(&mut self, obs, d)` | `ViewportState::apply(&mut self, canvas: &mut RecoveredImage, frame: &Observation, step: i32) -> Result<StepWrite, BandError>`——画布不知道视口在哪，而"这一步该 append 还是 prepend"正是位置的问题 |
+| `RecoveredImage::undo_last(&mut self) -> bool` | `ViewportState::undo_last(&mut self, canvas: &mut RecoveredImage) -> Result<bool, BandError>`——撤销栈（`history: Vec<StepMark>`）**留在 `ViewportState`**，因为它是唯一同时知道位置与画布的东西。`P3.08` 的执行块写"撤销栈搬到 `ScrollSession`"，代码与那句话相反；诚实的表述是**driver 是调用者**，栈仍在 `ViewportState` |
 
 ### 27.4 三处刻意的"不用 `Result`"
 
@@ -5823,6 +5956,8 @@ fn rows_match(actual, expected, sigma) -> bool
 
 | **OQ-20** | 手动模式下**页周期别名落在搜索窗内**（`d = ±120`、`P/|d| = 0.5` ⇒ 答成 `∓8`，§16.6.3）怎么办？ | 显然的补救"加宽窗"**已实测否定**（确认数 19 → 5）：根因不在窗宽，而在 `CANDIDATE_LIMIT = 8` 的候选集被别名填满。§15.6 表里已有候选（**多尺度金字塔**，"仅在 `|d|` 可能较大时启用（手动滚动、首步）"），但它**未实现**，且它自己的反对理由（粗层误配会传到细层、粗层低通会抹掉判别性细节）需要专门实验才能裁决 | `E-ACC-1` 的 σ=0 别名子集上做**三臂对照**：①今天的 68 px 窗 ②`extent` 窗 ③多尺度（粗层搜 `H_match/4`、细层确认）。判据 = **错误确定 0 且确认数不下降**（≥19） | §16.6.3 的窗参数；`P3.09` 的 `estimate()` 是否需要尺度参数；§15.6 的"多尺度"行从"⏳"变成已决 |
 | **OQ-21** | 有噪帧上（每个 `support == 0`）无先验的候选排序退化为"离零最近"（`d = ±7`、`σ = 5` ⇒ 答成 `∓6`）：驱动侧能否提供一个**连续性中心**（用上一步的 `d` 当 `expected`）？ | 两个问题都没答：①`expected` 今天的唯一来源是 P1（我们自己注入了多少），手动模式下不存在；用上一步的 `d` 代替是"内容连续性"假设，但**周期页上上一步的 `d` 可能本身就是别名**，会把错误传播（与 §16.6 规则 3 的 `ĝ` 自锁是同一类风险）。②更要紧的是**这个失败可能一半是夹具的性质**：`E-ACC-1` 的 `with_noise(σ)` 给**每帧独立**加噪，而真实屏幕上同一内容的重叠区逐字节相同、摘要**应当**匹配 ⇒ 今天测出的"手动模式错误率"可能被高估 | 先回答"真实帧上 `σ > 0` 的 `support` 是否真的全为 0"——需要**真实帧序列回放**（§29.2 的合成回放装置今天没有真实录制帧序列）；再在语料上加一臂"以上一步 `d` 为搜索中心" | §16.6.3 的机制 2；`E-ACC-1` 的噪声维度对手动模式错误率的解释力；§29.2 的语料缺口 |
+| **OQ-22** | **闭环在越冲方向上不可恢复**（`P3.09` 实测，DEV-53）：页面每步前进多于 `ĝ` 预期时，匹配成功（`zncc2d = 1.0`）但门一 `is_verifiable` 拒绝（`overlap_ratio < RHO_MIN = 0.35`）⇒ 步被丢弃 ⇒ §16.6 规则 2 禁止从非确认步学习 ⇒ `ĝ` 不动 ⇒ 下一步同样越冲。真增益 72（`ĝ₀ = 60` 的 1.2×）⇒ `committed()` **恒为 0**；对 `V = 900`、9 格而言，真增益 > **65 px/格（8%）** 即触发 | 出口有两条，都要新实验：① **更小的首步**——`ĝ` 的启动值或首步上限（`Control::new` 的 `starting_px_per_notch(lines, height)` 是唯一入口，今天 `(3, 20) ⇒ 60`）；② **§15.6 的多尺度金字塔**（与 `OQ-20` 是同一个候选，但触发机制不同：`OQ-20` 是"别名在窗内"，这里是"真值在窗外"）。**不要**动 `RHO_MIN`——它是 `P1.08` 的实测标定值，改它会把 `P1` 的验收结论一起改掉 | 加一条**越冲用例**（真增益 ≥ 1.1×，`V = 900`），判据 = `committed() >= 1`（今天恒 0）；三臂对照：①今天的 `ĝ₀ = 60` ②首步上限（如 4 格）③多尺度金字塔。另需重跑 `P3.05` 的 `E-CTRL-1` 收敛性表——它是在"每步都能确认"的假设下量的，而这个假设在越冲方向上是假的 | `P3.05` 的 `E-CTRL-1` 收敛性声称（§13.2.1）；§15.6 的"多尺度"行；`Control::new` 的启动值 |
+| **OQ-23** | `RegionModel` 的**逐 tile 权重今天没有生产消费者**（`P3.09` 实测，DEV-54）：`score_candidates_2d`（`displacement.rs:1168`）内部用 `supporting_tiles(...)` 计数与 `score_of(zncc2d, gain, coverage_of(tiles))` 打分，**没有权重入口**，所以 `RegionModel::weight`（`:2166`）与 `region_evidence`（`:2239`）是"已实现但未接线"。§27.3 的 `estimate` 草图按 §18.2 给它留了 `&mut RegionModel` | 接线会改动 `P1.06` 校准过、被 `E-ACC-1` 覆盖的 `score_candidates_2d`/`supporting_tiles` ⇒ **必须配一次独立的 `E-ACC-1` 全量重跑**（今天全量网格是 `wrong 0`，接线后必须仍是 0），不能顺手做 | 三臂对照：①今天（无权重）②乘法式权重（`region.rs` 的 clamp[0.1, 2.0] 形状）③`snow-apps` 的 `MIN_INLIER_TILES` 式硬门限。判据 = 全量网格 `wrong == 0` 且 `bytes_wrong == 0` 不退化 | §18.2 的三分类模型；§27.3.1 的 `estimate` 签名；`RegionModel` 是否要保留 |
 
 ### 36.3 明确**不是**开放问题的（已经确定，记录以防反复）
 

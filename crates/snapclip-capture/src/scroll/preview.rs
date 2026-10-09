@@ -14,7 +14,22 @@
 //! |---|---|---|---|
 //! | `stop`/`cancel`/`undo`/`shutdown` | sticky bit (`ScrollController`, `session.rs`) | no | **no** |
 //! | `set_follow` | capacity-1 slot behind a `Mutex` | yes (nanoseconds) | no |
-//! | preview updates | capacity-1 slot behind a `try_lock` | **no** | yes, and `dropped` says so |
+//! | preview updates | **one slot per kind** behind a `try_lock` | **no** | yes, and `dropped` says so |
+//!
+//! ## Why one slot per kind and not one slot
+//!
+//! §19.3 constraint 1 says "capacity 1, newest overwrites oldest", justified by "the preview is
+//! **idempotent state**, not an event stream, so losing the intermediate states loses nothing". That
+//! justification holds for a stream of **one** kind and fails for four: `Span` (progress),
+//! `Viewport` (where the box is) and `Bands` (which rows just became readable) are three different
+//! states, and the driver produces all three on the same step. With a single slot, whichever was
+//! published last is the only one the consumer ever sees, so the panel's progress row would starve
+//! behind the box, or the box behind the pixels — a silent, permanent loss, not an intermediate
+//! state.
+//!
+//! So the slot is per kind. The channel stays **bounded** (four slots, one per variant) and stays
+//! **lossy within a kind** — the newest `Span` replaces the previous unseen `Span`, which is what
+//! "latest wins" was for, and `dropped` still counts only updates a consumer never got to see.
 //!
 //! ## What this port deliberately does not do
 //!
@@ -37,6 +52,7 @@
 
 #![allow(dead_code)] // First producer is the driver (`P5.01`); `P3.08` lands the port itself.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
@@ -66,19 +82,75 @@ pub(crate) enum PreviewUpdate {
     Ended { reason: StopReason },
 }
 
-/// The driver → overlay channel: capacity 1, latest wins, **never blocks the producer** (§19.3).
+impl PreviewUpdate {
+    /// Which slot this belongs in — one slot per kind, so publishing three kinds on one step cannot
+    /// make them evict each other (see the module doc).
+    ///
+    /// A discriminant rather than a `match` at each use site: `Mailbox::push` needs "is there already
+    /// one of these?", and a caller that forgot a variant would silently share a slot with another.
+    fn kind(&self) -> Kind {
+        match self {
+            Self::Bands { .. } => Kind::Bands,
+            Self::Span { .. } => Kind::Span,
+            Self::Viewport { .. } => Kind::Viewport,
+            Self::Ended { .. } => Kind::Ended,
+        }
+    }
+}
+
+/// The four kinds, as a value that can be compared.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Bands,
+    Span,
+    Viewport,
+    Ended,
+}
+
+/// At most one unseen update per kind, oldest first.
+///
+/// Bounded by construction: four kinds, so four entries. The `VecDeque` is not a queue that can grow
+/// — [`Self::push`] replaces rather than appends whenever its kind is already present.
+#[derive(Default)]
+struct Mailbox {
+    slots: VecDeque<PreviewUpdate>,
+}
+
+impl Mailbox {
+    /// Returns whether an update a consumer had not seen was superseded.
+    fn push(&mut self, update: PreviewUpdate) -> bool {
+        let kind = update.kind();
+        match self.slots.iter_mut().find(|slot| slot.kind() == kind) {
+            Some(slot) => {
+                *slot = update;
+                true
+            }
+            None => {
+                self.slots.push_back(update);
+                false
+            }
+        }
+    }
+
+    fn pop(&mut self) -> Option<PreviewUpdate> {
+        self.slots.pop_front()
+    }
+}
+
+/// The driver → overlay channel: one slot per kind, latest wins within a kind, **never blocks the
+/// producer** (§19.3, as amended in the module doc).
 ///
 /// `Send + Sync` because the two ends are on different threads; the tests assert it so that a future
 /// field that is neither cannot quietly turn this into a thread-affine type.
 pub(crate) struct PreviewStream {
-    mailbox: Mutex<Option<PreviewUpdate>>,
+    mailbox: Mutex<Mailbox>,
     dropped: AtomicU64,
 }
 
 impl PreviewStream {
     pub(crate) fn new() -> Self {
         Self {
-            mailbox: Mutex::new(None),
+            mailbox: Mutex::new(Mailbox::default()),
             dropped: AtomicU64::new(0),
         }
     }
@@ -91,11 +163,10 @@ impl PreviewStream {
     /// "dropped" is a normal outcome rather than an error.
     pub(crate) fn publish(&self, update: PreviewUpdate) {
         match self.mailbox.try_lock() {
-            Ok(mut slot) => {
-                if slot.is_some() {
+            Ok(mut mailbox) => {
+                if mailbox.push(update) {
                     self.dropped.fetch_add(1, Ordering::Relaxed);
                 }
-                *slot = Some(update);
             }
             Err(_) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -103,16 +174,21 @@ impl PreviewStream {
         }
     }
 
-    /// Read the newest update, if there is one. The consumer calls this once after being woken.
+    /// Read the oldest update a consumer has not seen, if there is one.
     ///
-    /// Poisoning is recovered rather than propagated: the critical section is a move of a `Copy`
-    /// value and cannot panic, so a poisoned lock still holds a valid update — and panicking on the
-    /// overlay thread would take the user's screenshot down with it.
+    /// Oldest first rather than newest: with a slot per kind there is no "newest" across kinds, and
+    /// handing back the kinds in the order they were produced is what lets a consumer that drains the
+    /// channel see all of them. Within a kind the slot holds the newest, which is where "latest wins"
+    /// lives.
+    ///
+    /// Poisoning is recovered rather than propagated: the critical section is a move of `Copy` values
+    /// and cannot panic, so a poisoned lock still holds valid updates — and panicking on the overlay
+    /// thread would take the user's screenshot down with it.
     pub(crate) fn take(&self) -> Option<PreviewUpdate> {
         self.mailbox
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
+            .pop()
     }
 
     /// How many updates were dropped (G12: a silent loss is not visible, a counted one is).
@@ -169,6 +245,72 @@ mod tests {
                 reason: StopReason::EndReached
             })
         );
+    }
+
+    /// The driver publishes all three of its states on the same step (`P3.09`), and the consumer has
+    /// to be able to see all three.
+    ///
+    /// This is the test that makes the per-kind slot load-bearing rather than tidy: with one slot for
+    /// the whole channel, `dropped` would read `2` here and the panel would be missing whichever two
+    /// were published first — permanently, because a step publishes each kind once.
+    #[test]
+    fn one_step_can_publish_every_kind_without_them_evicting_each_other() {
+        let stream = PreviewStream::new();
+        stream.publish(PreviewUpdate::Span {
+            primary_len: 10,
+            steps: 1,
+            discarded: 0,
+        });
+        stream.publish(PreviewUpdate::Viewport {
+            band: 0,
+            status: Status::None,
+        });
+        stream.publish(PreviewUpdate::Bands {
+            first_row: 0,
+            rows: 10,
+            scale: 1,
+        });
+
+        assert_eq!(stream.dropped(), 0, "three kinds, three slots");
+
+        let mut kinds = Vec::new();
+        while let Some(update) = stream.take() {
+            kinds.push(match update {
+                PreviewUpdate::Bands { .. } => "bands",
+                PreviewUpdate::Span { .. } => "span",
+                PreviewUpdate::Viewport { .. } => "viewport",
+                PreviewUpdate::Ended { .. } => "ended",
+            });
+        }
+        assert_eq!(
+            kinds,
+            ["span", "viewport", "bands"],
+            "one of each, in the order the step produced them"
+        );
+    }
+
+    /// Within a kind, "latest wins" still holds — the per-kind slot is a state, not a queue.
+    #[test]
+    fn within_a_kind_the_newest_update_still_replaces_the_previous_one() {
+        let stream = PreviewStream::new();
+        stream.publish(PreviewUpdate::Viewport {
+            band: 1,
+            status: Status::None,
+        });
+        stream.publish(PreviewUpdate::Viewport {
+            band: 2,
+            status: Status::None,
+        });
+
+        assert_eq!(stream.dropped(), 1, "the first box was never seen");
+        assert_eq!(
+            stream.take(),
+            Some(PreviewUpdate::Viewport {
+                band: 2,
+                status: Status::None
+            })
+        );
+        assert_eq!(stream.take(), None);
     }
 
     /// §27.3's `PreviewStream::publish` row: "**绝不阻塞生产者**".

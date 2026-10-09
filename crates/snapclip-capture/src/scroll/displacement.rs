@@ -2278,14 +2278,395 @@ fn region_texture(previous: &Gray, current: &Gray, band: MatchBand, first_row: u
         .min(deviation(current, band.current_first)) as f32
 }
 
+// --- §27.3's `estimate`: the production entry point (task P3.09) --------------------------------
+
+/// §15.6's automatic search half-width: `max(4, ceil(0.3 · |expected|))`.
+///
+/// The window comes from the control loop rather than from image statistics (`docs/30` §16.6): the
+/// expectation is `n · ĝ`, and the window has to cover the error in `ĝ`, which §13.5's learning law
+/// keeps inside a factor of about two. A window proportional to the expectation is the shape that
+/// survives that; a constant would be too wide for a one-notch step and too narrow for a 200 px one.
+pub(crate) const SEARCH_WINDOW_FRACTION: f32 = 0.3;
+
+/// §15.6's floor on the automatic window, in pixels.
+///
+/// Without it, the first step of every session — taken with `n = 1` before `ĝ` has been measured —
+/// would search a pixel either side of zero and report "no candidate" for a page that scrolled
+/// twenty rows.
+pub(crate) const SEARCH_WINDOW_MIN: i32 = 4;
+
+/// §15.6's automatic search half-width, derived from the expected advance alone.
+pub(crate) fn search_window(expected: i32) -> i32 {
+    let scaled = (expected.unsigned_abs() as f32) * SEARCH_WINDOW_FRACTION;
+    scaled.ceil().max(SEARCH_WINDOW_MIN as f32) as i32
+}
+
+/// Which of §16.1's four gates the funnel is allowed to consult.
+///
+/// The mask exists for `P1.13`'s ablation, which closes one gate at a time to show that each one
+/// changes the error rate. Production always passes [`GateMask::ALL`]; the type lives here rather
+/// than in the test module because the funnel that reads it is production code (`P3.09`), and a
+/// second copy of the funnel kept for tests is exactly the drift this promotion removes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GateMask {
+    pub(crate) geometry: bool,
+    pub(crate) gain: bool,
+    pub(crate) support: bool,
+    pub(crate) margin: bool,
+}
+
+impl GateMask {
+    /// Every gate on: what a real session runs with.
+    pub(crate) const ALL: Self = Self {
+        geometry: true,
+        gain: true,
+        support: true,
+        margin: true,
+    };
+
+    /// The mask with one gate closed — `P1.13`'s ablation, one row per gate.
+    pub(crate) fn without(self, gate: Gate) -> Self {
+        match gate {
+            Gate::Geometry => Self {
+                geometry: false,
+                ..self
+            },
+            Gate::Gain => Self { gain: false, ..self },
+            Gate::Support => Self {
+                support: false,
+                ..self
+            },
+            Gate::Margin => Self {
+                margin: false,
+                ..self
+            },
+        }
+    }
+}
+
+/// One of §16.1's four gates, named so that a diagnostic can say which one refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Gate {
+    Geometry,
+    Gain,
+    Support,
+    Margin,
+}
+
+impl Gate {
+    pub(crate) const ALL: [Self; 4] = [Self::Geometry, Self::Gain, Self::Support, Self::Margin];
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Geometry => "geometry",
+            Self::Gain => "gain",
+            Self::Support => "support",
+            Self::Margin => "margin",
+        }
+    }
+}
+
+/// What the funnel decided, together with the measurements it decided on.
+///
+/// The two travel together because §16.7's `confidence` is a function of the evidence rather than of
+/// the verdict: a caller handed only a [`Status`] would have to re-measure the step to say how much
+/// it trusted it, and re-measuring is the one thing this module must never do — the third layer costs
+/// 24 full-resolution correlations, and the second layer's pass is shared with the scene cut.
+pub(crate) struct Decision {
+    pub(crate) status: Status,
+    pub(crate) evidence: Evidence,
+}
+
+/// The evidence for a step where nothing was measured.
+///
+/// Zero is the honest value for every field: no candidate was scored, so there is no correlation, no
+/// residual gain, no rival and no supporting tile. §16.7's `confidence` then reports zero, which is
+/// what "we do not know" should look like.
+fn no_evidence(scene_cut: SceneCut) -> Evidence {
+    Evidence {
+        zncc2d: 0.0,
+        gain: 0.0,
+        margin: 0.0,
+        tiles: 0,
+        scene_cut,
+    }
+}
+
+/// §27.3's `estimate`: two frames in, one decision out.
+///
+/// **It does not return a `Result`**, and §27.4 says why: every way this can "fail" — no candidate, a
+/// gate refusing, a different page — is a meaningful outcome the session must survive (C2). A
+/// `Result` would invite `?`, and `?` here would mean ending a session because one frame was hard.
+///
+/// `prior` is an `Option` rather than §27.3's `&Prior`: `Prior` is a struct with no "unknown" variant
+/// (`P1.14`), and manual mode is precisely "there is no prior" (§16.6). The alternative is a `Prior`
+/// whose numbers are invented, which is the mistake §13.2's erratum already records once. §9.2's own
+/// contract table writes `Option<&InjectionPrior>`.
+///
+/// `scene_cut` is the streak *before* this step; the evidence carries the streak *after* it, so the
+/// caller's only job is to hand back what it was given. Detection needs the second layer's pooled
+/// views, which is why it happens here rather than in the caller: pooling twice would be a second
+/// `O(W·H/16)` pass per step, and `P1.13`'s ablation counts those passes.
+pub(crate) fn estimate(
+    previous: &ObservationView<'_>,
+    current: &ObservationView<'_>,
+    prior: Option<&Prior>,
+    notches: i32,
+    scene_cut: SceneCut,
+    scratch: &mut Scratch,
+) -> Displacement {
+    let decision = match prior {
+        Some(prior) => {
+            // §16.6: the search is centred on the prior's expectation for *this* step. A prior that
+            // cannot express one (`expectation` is `None` before any confirmation) falls back to
+            // zero, which is the same centre manual mode uses and still reaches `ĝ`'s error by way of
+            // the window's floor.
+            let expected = prior.expectation(notches).unwrap_or(0.0).round() as i32;
+            let window = search_window(expected);
+            let candidates = candidates_1d(previous, current, expected, window);
+            if candidates.is_empty() {
+                Decision {
+                    status: Status::None,
+                    evidence: no_evidence(scene_cut),
+                }
+            } else {
+                let (mut scored, detected) = {
+                    let views = scratch.pool(previous, current);
+                    let scored = score_candidates_2d(views.previous(), views.current(), &candidates);
+                    let detected = is_scene_cut(views.previous(), views.current(), &scored);
+                    (scored, detected)
+                };
+                scored.apply_prior(prior, notches);
+                decide_scored_evidence(
+                    scratch,
+                    previous,
+                    current,
+                    &scored,
+                    GateMask::ALL,
+                    scene_cut.observe(detected),
+                )
+            }
+        }
+        None => manual_decision(scratch, previous, current, scene_cut),
+    };
+
+    match decision.status {
+        Status::Confirmed { d } => Displacement::confirmed(d, decision.evidence),
+        Status::Uncertain { d } => Displacement::uncertain(d, decision.evidence),
+        Status::None => Displacement::none(decision.evidence),
+    }
+}
+
+/// The funnel from two frames: candidates, the second layer, then the gates.
+///
+/// `P1.13`'s `decide` promoted unchanged, plus the evidence it decided on.
+pub(crate) fn decide_evidence(
+    scratch: &mut Scratch,
+    previous: &ObservationView<'_>,
+    current: &ObservationView<'_>,
+    expected: i32,
+    window: i32,
+    mask: GateMask,
+    scene_cut: SceneCut,
+) -> Decision {
+    let candidates = candidates_1d(previous, current, expected, window);
+    if candidates.is_empty() {
+        return Decision {
+            status: Status::None,
+            evidence: no_evidence(scene_cut),
+        };
+    }
+    let (scored, detected) = {
+        let views = scratch.pool(previous, current);
+        let scored = score_candidates_2d(views.previous(), views.current(), &candidates);
+        let detected = is_scene_cut(views.previous(), views.current(), &scored);
+        (scored, detected)
+    };
+    decide_scored_evidence(
+        scratch,
+        previous,
+        current,
+        &scored,
+        mask,
+        scene_cut.observe(detected),
+    )
+}
+
+/// The funnel from the scored set onwards, so a caller that has already paid for the second layer —
+/// manual mode, which has to inspect the set for a peak family — can hand it in instead of measuring
+/// the same step twice.
+///
+/// `scene_cut` is the streak **after** this step's detection, because the caller is the one holding
+/// the pooled views it was detected on.
+pub(crate) fn decide_scored_evidence(
+    scratch: &mut Scratch,
+    previous: &ObservationView<'_>,
+    current: &ObservationView<'_>,
+    scored: &ScoredSet,
+    mask: GateMask,
+    scene_cut: SceneCut,
+) -> Decision {
+    let Some(best) = scored.iter().next().copied() else {
+        return Decision {
+            status: Status::None,
+            evidence: no_evidence(scene_cut),
+        };
+    };
+    let refined = {
+        let views = scratch.full_resolution(previous, current);
+        refine_winner(views.previous(), views.current(), scored)
+    };
+    let answer = refined.map(|refined| refined.d).unwrap_or(best.d);
+    // §16.7's `zncc2d` is the **full-resolution** one (§15.4 ③), and when the third layer could not
+    // refine, the grid-layer measurement is the only one there is. Reporting it alongside the grid
+    // point is consistent; reporting a full-resolution number for a displacement that was never
+    // measured at full resolution would not be.
+    let zncc2d = refined.map(|refined| refined.zncc2d).unwrap_or(best.zncc2d);
+
+    // The rival has to come from **outside the winner's cell**: the second layer measures one value
+    // per 4 px cell (`P1.06`), so two members of the same cell share their score exactly and reading
+    // one of them as a rival reports the grid's resolution as ambiguity. Which member of a cell wins
+    // is the first layer's `support`, which `P1.07` made the ranking's tie-break; the ambiguity gate
+    // asks about the *page*, not about the grid.
+    let rival = outside_cell_second(scored, best.d).map(|second| second.ranked());
+    // The margin is taken on the **ranked** numbers, because that is the key the winner was picked by
+    // (§16.5: the prior may reorder the two leaders, which is only meaningful if the comparison that
+    // follows looks at the same two numbers). Rule 3's bound is what keeps that from becoming a
+    // verdict: the prior can move a pair by at most `1 − PRIOR_DOWNWEIGHT = 0.1`, and gate four needs
+    // 0.15.
+    let margin = margin_of(best.ranked(), rival);
+
+    let evidence = Evidence {
+        zncc2d,
+        gain: best.gain,
+        // An unknown margin is **zero**, never one: `margin_of` returns `None` when there is no rival
+        // or when the winner is too weak to be worth comparing, and §16.7's confidence must not be
+        // handed a fabricated term for either. Zero is the term that says "this contributed nothing".
+        margin: margin.unwrap_or(0.0),
+        tiles: best.tiles,
+        scene_cut,
+    };
+
+    let status = decide_gates(previous, best, answer, margin, mask);
+    Decision { status, evidence }
+}
+
+/// The four gates, in order, over a winner the second and third layers have already agreed on.
+///
+/// Split out of [`decide_scored_evidence`] so that the evidence assembly above reads as measurement
+/// and this reads as judgement.
+fn decide_gates(
+    previous: &ObservationView<'_>,
+    best: ScoredCandidate,
+    answer: i32,
+    margin: Option<f32>,
+    mask: GateMask,
+) -> Status {
+    let extent = previous.primary_extent();
+    if mask.geometry && gate_geometry(answer, extent) != GateOutcome::Pass {
+        return Status::None;
+    }
+    if mask.gain && gate_residual_gain(best.gain) != GateOutcome::Pass {
+        return Status::None;
+    }
+    if mask.support && gate_support(best.tiles) != GateOutcome::Pass {
+        return Status::None;
+    }
+    if mask.margin {
+        if let GateOutcome::Reject(rejection) = gate_margin(best.d, margin) {
+            // A rejection carries the status of the gate that produced it (`P1.11`), and its
+            // ambiguity arm names the candidate the gate judged — the ranking's winner. What the
+            // funnel would *report* is the third layer's answer, and §16.10's `Uncertain` is "the
+            // shift we would have used, untrusted": those are different questions and they differ by
+            // at most a pixel, so the reported number is the refined one.
+            return match rejection.status() {
+                Status::Uncertain { .. } => Status::Uncertain { d: answer },
+                other => other,
+            };
+        }
+    }
+    // The number that gets confirmed is the number that is checked: gate one judges `answer`
+    // (§16.2.1), and so must §16.2.1's overlap ratio, or a refine that walked to the frame's own
+    // edge would be confirmed on the strength of the grid point it walked away from.
+    if is_verifiable(answer, extent) {
+        Status::Confirmed { d: answer }
+    } else {
+        Status::Uncertain { d: answer }
+    }
+}
+
+/// §16.6's manual mode: the search is centred on zero with the manual half-width, and a peak family
+/// is answered `Uncertain` before the gates get a say.
+///
+/// The family outranks gates two, three and four on purpose. Those gates ask whether *this*
+/// candidate is good enough; the family says the page cannot single one out, which is a different
+/// question and the one §16.6 answers directly. Gate one is not outranked — geometry is a
+/// correctness constraint on the number itself (§16.2), and an ambiguity is no reason to report a
+/// shift the canvas must not act on.
+pub(crate) fn manual_decision(
+    scratch: &mut Scratch,
+    previous: &ObservationView<'_>,
+    current: &ObservationView<'_>,
+    scene_cut: SceneCut,
+) -> Decision {
+    let extent = previous.primary_extent();
+    // Manual mode has no expectation, so the search is centred on zero (§16.6).
+    let window = manual_window(match_rows(extent, extent, 1));
+    let candidates = candidates_1d(previous, current, 0, window);
+    if candidates.is_empty() {
+        return Decision {
+            status: Status::None,
+            evidence: no_evidence(scene_cut),
+        };
+    }
+    let (scored, detected) = {
+        let views = scratch.pool(previous, current);
+        let scored = score_candidates_2d(views.previous(), views.current(), &candidates);
+        let detected = is_scene_cut(views.previous(), views.current(), &scored);
+        (scored, detected)
+    };
+    let scene_cut = scene_cut.observe(detected);
+
+    if !has_peak_family(&scored) {
+        return decide_scored_evidence(scratch, previous, current, &scored, GateMask::ALL, scene_cut);
+    }
+
+    let best = scored
+        .iter()
+        .next()
+        .copied()
+        .expect("a family needs candidates");
+    let refined = {
+        let views = scratch.full_resolution(previous, current);
+        refine_winner(views.previous(), views.current(), &scored)
+    };
+    let answer = refined.map(|refined| refined.d).unwrap_or(best.d);
+    let evidence = Evidence {
+        zncc2d: refined.map(|refined| refined.zncc2d).unwrap_or(best.zncc2d),
+        gain: best.gain,
+        margin: margin_of(best.ranked(), outside_cell_second(&scored, best.d).map(|s| s.ranked()))
+            .unwrap_or(0.0),
+        tiles: best.tiles,
+        scene_cut,
+    };
+    let status = if gate_geometry(answer, extent) == GateOutcome::Pass {
+        Status::Uncertain { d: answer }
+    } else {
+        Status::None
+    };
+    Decision { status, evidence }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        CANDIDATE_LIMIT, Candidate, CandidateSet, Displacement, Evidence, GateOutcome, GateRejection,
+        CANDIDATE_LIMIT, Candidate, CandidateSet, Displacement, Evidence, Gate, GateMask, GateOutcome,
+        GateRejection,
         Gray,
         MARGIN_SCORE_FLOOR, MIN_MARGIN, MIN_RESIDUAL_GAIN, MIN_TILES, PEAK_FAMILY_RATIO,
         PRIOR_DOWNWEIGHT, PRIOR_KAPPA,
         Prior,
+        decide_evidence, decide_scored_evidence, manual_decision,
         REGION_DECAY, REGION_WEIGHT_MAX, REGION_WEIGHT_MIN, RHO_MIN, RHO_MIN_PERMILLE, RegionClass,
         RegionModel,
         SCENE_CUT_ALIGNMENT_ERROR, SCENE_CUT_DECAY_STREAK, SCENE_CUT_SIMILARITY, SCORE_GAIN, Scratch,
@@ -4049,63 +4430,6 @@ mod tests {
 
     // ---- P1.13: the scratch, and the ablation that decides whether each gate earns its place -----
 
-    /// Which of §16.1's four gates the funnel is allowed to consult.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    struct GateMask {
-        geometry: bool,
-        gain: bool,
-        support: bool,
-        margin: bool,
-    }
-
-    impl GateMask {
-        const ALL: Self = Self {
-            geometry: true,
-            gain: true,
-            support: true,
-            margin: true,
-        };
-
-        fn without(self, gate: Gate) -> Self {
-            match gate {
-                Gate::Geometry => Self {
-                    geometry: false,
-                    ..self
-                },
-                Gate::Gain => Self { gain: false, ..self },
-                Gate::Support => Self {
-                    support: false,
-                    ..self
-                },
-                Gate::Margin => Self {
-                    margin: false,
-                    ..self
-                },
-            }
-        }
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum Gate {
-        Geometry,
-        Gain,
-        Support,
-        Margin,
-    }
-
-    impl Gate {
-        const ALL: [Self; 4] = [Self::Geometry, Self::Gain, Self::Support, Self::Margin];
-
-        fn name(self) -> &'static str {
-            match self {
-                Self::Geometry => "geometry",
-                Self::Gain => "gain",
-                Self::Support => "support",
-                Self::Margin => "margin",
-            }
-        }
-    }
-
     /// The search half-width the ablation runs with, fixed at 40 px for every case.
     ///
     /// It is deliberately **not** §16.6's manual window: that one is `0.15 · H_match` = 68 px at a
@@ -4117,18 +4441,15 @@ mod tests {
 
     /// §16.1's funnel with the gates switched, so one of them can be removed and the answer watched.
     ///
-    /// It is a *test-only* composition on purpose: the production entry point that chains the layers
-    /// and the gates belongs to the session assembly, which does not exist yet. What this harness
-    /// has to be is faithful, which took one measurement to learn: **gate one judges the third
-    /// layer's answer, and the other three judge the candidate the second layer measured.** Geometry
-    /// is a statement about the number the canvas would act on, and `mixed-450` proved the two can
-    /// differ — the ranking's winner was 449 while the refined answer was 450, §16.9's banned
-    /// boundary value, so a geometry gate reading `best.d` would confirm a shift the design forbids.
-    /// Gain, support and margin are per-candidate measurements (`P1.09`/`P1.10`/`P1.11`) and have no
-    /// meaning at the refined pixel, so they keep reading `best`.
+    /// The composition moved into production in `P3.09` ([`decide_evidence`]) — the session assembly
+    /// is its first real caller, and a second copy kept here for the ablation is exactly the drift the
+    /// promotion removes. What the harness still needs is the *status alone*: the ablation asks
+    /// "did closing this gate change the error rate", not "what was the evidence", so these three
+    /// wrappers drop the [`Decision`]'s evidence and keep the call sites about the question.
     ///
     /// It does **not** include §16.8's scene cut: that is a statement about the page, not one of the
-    /// four gates, and the ablation would read a scene cut's refusal as the gates' work.
+    /// four gates, and the ablation would read a scene cut's refusal as the gates' work. Passing
+    /// `SceneCut::none()` is what keeps the two questions apart.
     fn decide(
         scratch: &mut Scratch,
         previous: &ObservationView<'_>,
@@ -4137,15 +4458,16 @@ mod tests {
         window: i32,
         mask: GateMask,
     ) -> Status {
-        let candidates = candidates_1d(previous, current, expected, window);
-        if candidates.is_empty() {
-            return Status::None;
-        }
-        let scored = {
-            let views = scratch.pool(previous, current);
-            score_candidates_2d(views.previous(), views.current(), &candidates)
-        };
-        decide_scored(scratch, previous, current, &scored, mask)
+        decide_evidence(
+            scratch,
+            previous,
+            current,
+            expected,
+            window,
+            mask,
+            SceneCut::none(),
+        )
+        .status
     }
 
     /// The funnel from the scored candidate set onwards, so a caller that has already paid for the
@@ -4158,103 +4480,16 @@ mod tests {
         scored: &ScoredSet,
         mask: GateMask,
     ) -> Status {
-        let Some(best) = scored.iter().next().copied() else {
-            return Status::None;
-        };
-        let extent = previous.primary_extent();
-        let answer = {
-            let views = scratch.full_resolution(previous, current);
-            refine_winner(views.previous(), views.current(), scored)
-        }
-        .map(|refined| refined.d)
-        .unwrap_or(best.d);
-
-        if mask.geometry && gate_geometry(answer, extent) != GateOutcome::Pass {
-            return Status::None;
-        }
-        if mask.gain && gate_residual_gain(best.gain) != GateOutcome::Pass {
-            return Status::None;
-        }
-        if mask.support && gate_support(best.tiles) != GateOutcome::Pass {
-            return Status::None;
-        }
-        if mask.margin {
-            // The rival has to come from **outside the winner's cell**: the second layer measures one
-            // value per 4 px cell (`P1.06`), so two members of the same cell share their score
-            // exactly and reading one of them as a rival reports the grid's resolution as ambiguity.
-            // Which member of the cell wins is the first layer's `support`, which `P1.07` made the
-            // ranking's tie-break; the ambiguity gate asks about the *page*, not about the grid.
-            let rival = outside_cell_second(scored, best.d).map(|second| second.ranked());
-            // The margin is taken on the **ranked** numbers, because that is the key the winner was
-            // picked by (§16.5: the prior may reorder the two leaders, which is only meaningful if
-            // the comparison that follows looks at the same two numbers). Rule 3's bound is what
-            // keeps that from becoming a verdict: the prior can move a pair by at most
-            // `1 − PRIOR_DOWNWEIGHT = 0.1`, and gate four needs 0.15.
-            if let GateOutcome::Reject(rejection) =
-                gate_margin(best.d, margin_of(best.ranked(), rival))
-            {
-                // A rejection carries the status of the gate that produced it (`P1.11`), and its
-                // ambiguity arm names the candidate the gate judged — the ranking's winner. What the
-                // funnel would *report* is the third layer's answer, and §16.10's `Uncertain` is "the
-                // shift we would have used, untrusted": those are different questions and they differ
-                // by at most a pixel, so the reported number is the refined one.
-                return match rejection.status() {
-                    Status::Uncertain { .. } => Status::Uncertain { d: answer },
-                    other => other,
-                };
-            }
-        }
-        // The number that gets confirmed is the number that is checked: gate one judges `answer`
-        // (§16.2.1), and so must §16.2.1's overlap ratio, or a refine that walked to the frame's own
-        // edge would be confirmed on the strength of the grid point it walked away from.
-        if is_verifiable(answer, extent) {
-            Status::Confirmed { d: answer }
-        } else {
-            Status::Uncertain { d: answer }
-        }
+        decide_scored_evidence(scratch, previous, current, scored, mask, SceneCut::none()).status
     }
 
-    /// §16.6's manual mode: the search is centred on zero with the manual half-width, and a peak
-    /// family is answered `Uncertain` before the gates get a say.
-    ///
-    /// The family outranks gates two, three and four on purpose. Those gates ask whether *this*
-    /// candidate is good enough; the family says the page cannot single one out, which is a different
-    /// question and the one §16.6 answers directly. Gate one is not outranked — geometry is a
-    /// correctness constraint on the number itself (§16.2), and an ambiguity is no reason to report a
-    /// shift the canvas must not act on.
-    ///
-    /// Test-only for the same reason [`decide`] is: the production entry point belongs to the session
-    /// assembly.
+    /// §16.6's manual mode, status only.
     fn manual_status(
         scratch: &mut Scratch,
         previous: &ObservationView<'_>,
         current: &ObservationView<'_>,
     ) -> Status {
-        let extent = previous.primary_extent();
-        // Manual mode has no expectation, so the search is centred on zero (§16.6).
-        let window = manual_window(match_rows(extent, extent, 1));
-        let candidates = candidates_1d(previous, current, 0, window);
-        if candidates.is_empty() {
-            return Status::None;
-        }
-        let scored = {
-            let views = scratch.pool(previous, current);
-            score_candidates_2d(views.previous(), views.current(), &candidates)
-        };
-        if !has_peak_family(&scored) {
-            return decide_scored(scratch, previous, current, &scored, GateMask::ALL);
-        }
-        let answer = {
-            let views = scratch.full_resolution(previous, current);
-            refine_winner(views.previous(), views.current(), &scored)
-        }
-        .map(|refined| refined.d)
-        .unwrap_or_else(|| scored.iter().next().expect("a family needs candidates").d);
-        if gate_geometry(answer, extent) == GateOutcome::Pass {
-            Status::Uncertain { d: answer }
-        } else {
-            Status::None
-        }
+        manual_decision(scratch, previous, current, SceneCut::none()).status
     }
 
     /// One synthetic step the funnel is asked about, with the answer a session would need.

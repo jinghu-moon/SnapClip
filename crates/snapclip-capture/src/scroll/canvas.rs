@@ -43,6 +43,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use crate::geometry::{Point, Rect};
 use crate::scroll::displacement::checksum;
 use crate::scroll::observation::{Axis, Observation};
 
@@ -1572,6 +1573,46 @@ impl ViewportState {
         };
         canvas.relieve(Some((self.position, self.extent as u64)))?;
         Ok(write)
+    }
+
+    /// The frame the next step estimates against: the canvas window under the viewport (§27.3's
+    /// `materialize_reference`).
+    ///
+    /// `docs/30` §17.4 and `N3`: the reference is **the canvas**, never the previous frame. A frame
+    /// that was refused still shows what the screen showed, and estimating against it would measure
+    /// the step *after* the refused one against a picture the canvas never accepted — the same pixels
+    /// would be weighed twice and the second time as if they had been committed. Reading the canvas
+    /// back is also what makes a contained step work at all: the screen may have moved into rows that
+    /// were committed several steps ago (§17.3).
+    ///
+    /// The region's `top` is the viewport position and its `left` is zero: the canvas is the whole
+    /// cross-axis extent, so the reference viewport is always a full-width row band. `qpc` is the
+    /// caller's, because the canvas has no clock — it is carried so that two references built from the
+    /// same rows at different moments are not mistaken for one observation (§11.1's dedupe).
+    pub(crate) fn reference(
+        &self,
+        canvas: &mut RecoveredImage,
+        qpc: i64,
+    ) -> Result<Observation, BandError> {
+        let position = self.position as u64;
+        let pixels = canvas.rows(position, self.extent as u64)?;
+        let size = (canvas.cross_len() as u32, self.extent);
+        let region = Rect::from_origin_size(
+            Point::new(0, self.position as i32),
+            size.0 as i32,
+            size.1 as i32,
+        );
+        // The only fallible step is the read: `rows` can fail on a spill that cannot be read, and that
+        // is a real `BandError`. The packing check that follows is not a second failure mode — `rows`
+        // returns exactly `cross_len * 4 * extent` bytes and `size`/`region` are computed from those
+        // same two numbers — so a mismatch means the store and the observation disagree about the
+        // shape of what was just read. That is an invariant violation, and this file already asserts
+        // invariants rather than inventing error values for them (`apply` does the same for the
+        // extent). Mapping it onto `BandError::CorruptBand` would mean filling `expected`/`found` —
+        // documented as checksums — with byte counts, which is a lie a debugger would believe.
+        Ok(Observation::new(pixels, region, qpc, size, canvas.axis()).expect(
+            "the rows read back from the canvas pack exactly as the observation they describe",
+        ))
     }
 
     /// Undoes the most recent write: `true` if there was one, `false` if the history is empty.

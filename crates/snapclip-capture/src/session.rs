@@ -47,6 +47,38 @@ impl OverlayGeometry {
     }
 }
 
+/// What a finished capture session hands to a scroll session (`docs/30` §20.6; task `P3.09`).
+///
+/// Three things travel and nothing else. The **frame** is the session's origin — the scroll session
+/// estimates its first step against the pixels the user selected on, not against a fresh capture
+/// (§17.2). The **selection** is what the scroll session matches within. The **dpi** is here because
+/// the overlay's coordinates and the injected wheel are in different spaces and the conversion needs
+/// the DPI the selection was made at; a scroll session that re-queried the DPI could disagree with the
+/// overlay that produced the rectangle.
+///
+/// It is deliberately **not** a `Result`-carrying type and has no `state`: this is a value that exists
+/// after the capture session has already ended, so there is nothing left to transition.
+#[derive(Debug)]
+pub struct ScrollHandoff {
+    frame: CapturedFrame,
+    selection: Rect,
+    dpi: u32,
+}
+
+impl ScrollHandoff {
+    pub fn frame(&self) -> &CapturedFrame {
+        &self.frame
+    }
+
+    pub fn selection(&self) -> Rect {
+        self.selection
+    }
+
+    pub fn dpi(&self) -> u32 {
+        self.dpi
+    }
+}
+
 /// Outcome of [`CaptureSession::begin_export`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExportOutcome {
@@ -304,6 +336,59 @@ impl CaptureSession {
         }
         self.state = CaptureState::Exporting;
         Ok(ExportOutcome::Produce { selection })
+    }
+
+    /// `Selected | Annotating -> Idle`, handing the frozen frame and the selection to a scroll session
+    /// (`docs/30` §20.6; task `P3.09`).
+    ///
+    /// ## This ends the capture session
+    ///
+    /// It is a **handoff and not an extension**: the ordinary screenshot is over when this returns,
+    /// and the scroll session is a different object with a different lifetime (§20.6). The alternative
+    /// — teaching `CaptureSession` to also be a scroll session — was rejected for a structural reason,
+    /// not a stylistic one: `CaptureSession`'s state set is **exhaustively tested**
+    /// (`esc_from_every_active_state_returns_to_idle` walks all six active states, and `Adjusting` is
+    /// deliberately unreachable), so every state added here would have to be added to that test and to
+    /// every guard in the file. The scroll session's phases are *not* a state machine (§20.1) and must
+    /// not be squeezed into one.
+    ///
+    /// ## Why it returns the frame by value
+    ///
+    /// The scroll session's first estimate needs the frozen frame, and the capture session has no use
+    /// for it afterwards — it is going to `Idle`. Taking it out of the `Option` is therefore both the
+    /// cheapest and the honest encoding: a copy would leave two owners of a 4K buffer (§23.1 measured
+    /// a 4K canvas at 1188.3 MiB peak, so copies of frames are not free), and `frame()` returning
+    /// `None` afterwards is how the test states "handed over, not copied".
+    ///
+    /// The guard is the export path's guard on purpose: a scroll session with no committed rectangle
+    /// has nothing to scroll, and "selecting" is not "selected".
+    pub fn begin_scroll(&mut self) -> Result<ScrollHandoff, CaptureError> {
+        if !matches!(self.state, CaptureState::Selected | CaptureState::Annotating) {
+            return Err(CaptureError::InvalidState(format!(
+                "cannot start a scroll session while {}",
+                self.state.as_str()
+            )));
+        }
+        let selection = self.selection.intersect(self.bounds());
+        if selection.is_empty() {
+            return Err(CaptureError::InvalidState(
+                "a scroll session needs a non-empty selection".into(),
+            ));
+        }
+        let dpi = self.dpi();
+        let frame = self.frame.take().ok_or_else(|| {
+            CaptureError::InvalidState("session has no captured frame".into())
+        })?;
+
+        // Everything else goes back to `Idle` through the same routine Esc uses, so there is exactly
+        // one cleanup path and no way for the two to drift apart.
+        self.reset();
+
+        Ok(ScrollHandoff {
+            frame,
+            selection,
+            dpi,
+        })
     }
 
     /// Build the domain artifact for a finished session.
@@ -737,6 +822,69 @@ mod tests {
         assert!(session.begin_annotating().is_ok());
         // Cannot enter twice.
         assert!(session.begin_annotating().is_err());
+    }
+
+    /// `docs/30` §20.6 / `R-5`: "picking a rectangle" and "scrolling" are **two lifetimes**, and the
+    /// handoff between them is one-way.
+    ///
+    /// A scroll session may run for minutes and it owns a thread, a canvas and a spill directory
+    /// (§21.1). That is not something `CaptureSession` can carry: its six active states are
+    /// exhaustively tested (`esc_from_every_active_state_returns_to_idle`), and every scroll state
+    /// added here would both break that test and hide a legal-transition fact behind a state that
+    /// only one caller ever reaches. So the entry point does not extend the capture session — it
+    /// **ends** it, through the same `begin_export`/`complete` pair the ordinary screenshot path
+    /// uses, and hands over the three facts the scroll session cannot recover on its own: the frozen
+    /// frame, the selection, and the DPI.
+    ///
+    /// The last four assertions are the whole test. A version that merely *copied* the frame out
+    /// would satisfy every assertion about the handoff while leaving `CaptureSession` holding a
+    /// selection and a geometry — which is exactly the "two parallel states" §20.6 forbids, and it is
+    /// invisible in the handoff itself.
+    #[test]
+    fn the_capture_session_ends_before_the_scroll_session_starts() {
+        let mut session = armed_session();
+        press(&mut session, Point::new(100, 100));
+        session.pointer_moved(Point::new(500, 400));
+        assert_eq!(session.pointer_released(), CaptureState::Selected);
+
+        let handoff = session
+            .begin_scroll()
+            .expect("a committed selection can start a scroll session");
+
+        assert_eq!(handoff.selection(), Rect::new(100, 100, 500, 400));
+        assert_eq!(
+            handoff.dpi(),
+            96,
+            "the scroll session matches at the DPI the selection was made at"
+        );
+        assert_eq!(handoff.frame().width, 1920);
+        assert_eq!(handoff.frame().height, 1080);
+
+        // The mission is over: idle, and holding nothing.
+        assert_eq!(session.state(), CaptureState::Idle);
+        assert!(
+            session.frame().is_none(),
+            "the frozen frame was handed over, not copied"
+        );
+        assert!(session.geometry().is_none());
+        assert!(!session.has_selection());
+    }
+
+    /// The handoff has the same guard as the export path, and for the same reason: a scroll session
+    /// with no committed rectangle has nothing to scroll, and "selecting" is not "selected".
+    #[test]
+    fn a_scroll_session_needs_a_committed_selection() {
+        let mut session = armed_session();
+        assert!(session.begin_scroll().is_err(), "selecting is not selected");
+
+        press(&mut session, Point::new(10, 10));
+        session.pointer_moved(Point::new(200, 150));
+        assert!(session.begin_scroll().is_err(), "a drag in flight is not selected");
+
+        session.pointer_released();
+        assert!(session.begin_scroll().is_ok());
+        // And it is one-way: the second attempt has no selection to hand over.
+        assert!(session.begin_scroll().is_err());
     }
 }
 

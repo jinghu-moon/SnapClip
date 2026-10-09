@@ -20,19 +20,33 @@
 //!
 //! ## Not here yet
 //!
-//! * The loop itself — inject, settle, estimate, commit (`P3.04`).
 //! * `EndReached`: §20.4's convergence table puts "content stopped changing" under `EndReached`,
 //!   not under `ActuatorFailed`. The caller must classify a step as "the page is at its end"
 //!   **before** feeding it to this watchdog; a page that is merely at its bottom would otherwise
 //!   be reported as a broken actuator. Deciding that needs the scroll-position channel, which is
 //!   `P3.04`'s delivery.
+//!
+//!   `P3.09`'s driver inherits this gap rather than closing it: a step whose settle window expires
+//!   with no new observation arrives as `StepError::NoFrame`, and the driver counts it as a discarded
+//!   step for the watchdog to judge. A session that reaches the bottom of a page therefore ends as
+//!   `ActuatorFailed` once the transport switches are exhausted, which is **wrong** — it is listed as
+//!   open here so that nobody reads the current behaviour as a decision.
 
-#![allow(dead_code)] // First consumer is `P3.04`; the second is the session assembly (`P3.09`).
+// The loop's only caller is `ScrollRuntime` (`session.rs`), which itself has no production caller
+// until the assembly lands (`P4`/`P5`). From the library target alone the whole file is unreachable,
+// so the allow states the fact instead of hiding it.
+#![allow(dead_code)]
 
 use std::time::{Duration, Instant};
 
-use crate::scroll::displacement::{Prior, Status, RHO_MIN};
-use crate::scroll::session::ScrollSession;
+use crate::scroll::canvas::{StepWrite, ViewportState};
+use crate::scroll::displacement::{
+    estimate, line_digest, Displacement, Prior, SceneCut, Scratch, Status, StepEffect, RHO_MIN,
+};
+use crate::scroll::observation::Observation;
+use crate::scroll::ports::{EndReason, FrameSource, InjectStatus, Poll, ScrollActuator};
+use crate::scroll::preview::{PreviewStream, PreviewUpdate};
+use crate::scroll::session::{ScrollController, ScrollPlan, ScrollSession, StopReason};
 
 /// The compositor tick the overlay runs on (`crates/snapclip-capture/src/windows/overlay.rs:100`).
 ///
@@ -487,6 +501,17 @@ impl Control {
         self.prior.px_per_notch()
     }
 
+    /// The prior itself, so the estimator's search window and this control's learning are built from
+    /// the **same** `ĝ` (§16.6, §15.6).
+    ///
+    /// Handing out the `Prior` rather than a copy of `ĝ` is the point: `docs/30` §13.2 derives the
+    /// search half-width from the prior that the loop is currently learning (`max(4, ceil(0.3·n·ĝ))`),
+    /// and a caller that had to reconstruct a `Prior` from `px_per_notch()` would silently lose
+    /// `PRIOR_KAPPA` — the two numbers would agree today and drift the first time either changes.
+    pub(crate) fn prior(&self) -> &Prior {
+        &self.prior
+    }
+
     /// How many notches to inject for the next step.
     pub(crate) fn notches(&self) -> i32 {
         let ghat = self.prior.px_per_notch();
@@ -516,11 +541,471 @@ impl Control {
     }
 }
 
+// --- §28.2's `ScrollDriver`: the closed loop (task P3.09) ---
+
+/// How many rows apart the stillness digest samples (`docs/30` §13.3).
+///
+/// The digest answers one question — "is the target still producing different pictures?" — and it is
+/// asked on every read of a step, up to `STEP_TIMEOUT / RENDER_TICK_MS` times. Hashing a 4K frame
+/// whole would cost more than the tick it is measured against and would buy nothing: a scroll moves
+/// **every** row, so a stride that samples one row in eight cannot miss it. What the stride can miss
+/// is a change confined to fewer than eight consecutive rows, and that is deliberate — the question
+/// is whether the page is still moving, not whether one glyph repainted. The estimator, not this
+/// number, decides what gets committed.
+const DIGEST_ROW_STRIDE: usize = 8;
+
+/// A cheap fingerprint of a frame, used only to tell two consecutive reads apart (§13.3).
+///
+/// Folds the sampled rows together rather than hashing one buffer, so the sampling costs a stride
+/// walk and not an allocation. `line_digest` is the same FNV the frame source already dedupes rows
+/// with, so "these pixels differ" means the same thing here as it does there.
+fn stillness_digest(pixels: &[u8], row_stride: usize) -> u64 {
+    let stride = row_stride.max(1);
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64; // FNV-1a's offset basis, re-mixed once per sampled row.
+    for row in pixels.chunks(stride).step_by(DIGEST_ROW_STRIDE) {
+        hash = hash.rotate_left(7) ^ line_digest(row);
+    }
+    hash
+}
+
+/// `EndReason` → `StopReason` (`docs/30` §20.4). Total, and deliberately not a `From` impl: the two
+/// enums answer different questions — one is "why did the stream end", the other is "why did the
+/// session stop" — and a `From` would invite a conversion in the other direction that has no meaning.
+fn stop_reason_for(reason: EndReason) -> StopReason {
+    match reason {
+        EndReason::TargetLost => StopReason::TargetLost,
+        EndReason::CaptureFailed => StopReason::CaptureFailed,
+        EndReason::DeviceLost => StopReason::DeviceLost,
+        EndReason::Timeout => StopReason::Timeout,
+    }
+}
+
+/// Joins a [`FrameSource`] and a [`ScrollActuator`] into the single narrow thing [`inject_and_settle`]
+/// asks for (§13.3, §28.4).
+///
+/// It exists because [`StepHost`] is deliberately *narrower* than either port: the loop needs "inject
+/// these notches", "what do the pixels look like now", "what time is it" and "has the user
+/// cancelled", and nothing else. Joining the two ports here — on the `scroll/` side of the boundary —
+/// is what keeps the driver from naming a handle, a message or a transport, for the same reason
+/// [`ActuatorWatch`] is generic over its path.
+struct Host<'a, F: FrameSource, A: ScrollActuator> {
+    source: &'a mut F,
+    actuator: &'a mut A,
+    controller: &'a ScrollController,
+    /// One render tick per read: a longer wait would make the cancel check late by exactly that much
+    /// (§21.4).
+    tick: Duration,
+    /// The frame the last read produced. This is what the driver estimates against, so it is moved
+    /// out by [`Self::take_frame`] rather than copied.
+    frame: Option<Observation>,
+    /// The digest of `frame`, so that an `Idle` read can answer "the same picture as last time"
+    /// instead of "no evidence". The settle rule needs two *agreeing* reads, and a read that produces
+    /// no new observation is exactly how a settled target announces itself (§11.1).
+    digest: Option<u64>,
+    /// Set when the frame source says the target is gone (§20.4's four terminal reasons).
+    ended: Option<EndReason>,
+}
+
+impl<'a, F: FrameSource, A: ScrollActuator> Host<'a, F, A> {
+    fn new(source: &'a mut F, actuator: &'a mut A, controller: &'a ScrollController) -> Self {
+        Self {
+            source,
+            actuator,
+            controller,
+            tick: Duration::from_millis(RENDER_TICK_MS as u64),
+            frame: None,
+            digest: None,
+            ended: None,
+        }
+    }
+
+    /// The frame the step produced, if it produced one.
+    fn take_frame(&mut self) -> Option<Observation> {
+        self.frame.take()
+    }
+
+    /// Why the stream ended, if it did.
+    fn ended(&self) -> Option<EndReason> {
+        self.ended
+    }
+}
+
+impl<F: FrameSource, A: ScrollActuator> StepHost for Host<'_, F, A> {
+    fn inject(&mut self, notches: i32) -> Result<(), String> {
+        let outcome = self.actuator.inject(notches);
+        match outcome.status {
+            // §24.6.3: `Posted` is weak evidence — the message was *queued*. It is still the only
+            // answer the port can give, and proving the content actually moved is the watchdog's job.
+            InjectStatus::Posted => Ok(()),
+            failed => Err(format!("{failed:?}")),
+        }
+    }
+
+    fn digest(&mut self) -> Option<u64> {
+        match self.source.next(self.tick) {
+            Ok(Poll::Frame(observation)) => {
+                let stride = observation.view().row_stride();
+                self.digest = Some(stillness_digest(observation.pixels(), stride));
+                self.frame = Some(observation);
+                self.digest
+            }
+            // §11.1's distinction, and it is load-bearing here: `Idle` means "no new observation",
+            // which is evidence that the picture is the one we already have. Answering `None` would
+            // make a page that has stopped moving look like a stream that never started.
+            Ok(Poll::Idle) => self.digest,
+            Ok(Poll::Ended(reason)) => {
+                self.ended = Some(reason);
+                None
+            }
+            // A read that failed is evidence of nothing, least of all stillness.
+            Err(_) => None,
+        }
+    }
+
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn cancellation(&self) -> Option<Instant> {
+        self.controller.cancellation()
+    }
+}
+
+/// One step's outcome for the watchdog: did the content move?
+///
+/// `Unmoved` carries the path the actuator actually used, not the one the driver thinks it used —
+/// that payload is what lets a step injected through a stale transport count against *that*
+/// transport (§24.7).
+fn note<A: ScrollActuator>(
+    watch: &mut ActuatorWatch<A::Path>,
+    actuator: &mut A,
+    moved: bool,
+) -> WatchVerdict<A::Path> {
+    let outcome = if moved {
+        StepOutcome::Moved
+    } else {
+        StepOutcome::Unmoved(actuator.path())
+    };
+    watch.observe(outcome, |from| actuator.switch(from))
+}
+
+/// §13.2's diagram as a type: inject, settle, estimate, commit, preview.
+///
+/// Every piece of this was built and measured on its own — the four gates (`P1.08`–`P1.11`), the
+/// canvas (`P1.17`–`P1.19`), the control law (`P3.05`), the watchdog (`P3.03`), the ports (`P3.08`) —
+/// and this is where they become a session. It is the only place in `scroll/` that knows the order
+/// they are used in, which is also why it is the only place that can be wrong about it.
+///
+/// It owns **no thread**: `ScrollRuntime` spawns [`ScrollDriver::run`] and keeps the two ports. That
+/// split is what makes the loop testable without a desktop (§29.2) — `run` takes its frame source and
+/// its actuator as arguments, so a test hands it a scripted pair exactly like `P1.01`'s.
+pub(crate) struct ScrollDriver {
+    session: ScrollSession,
+    viewport: ViewportState,
+    control: Control,
+    scratch: Scratch,
+    scene_cut: SceneCut,
+    settle: Settle,
+    /// The `qpc` of the frame the canvas last accepted, used to stamp the reference viewport (§17.4).
+    last_qpc: i64,
+}
+
+impl ScrollDriver {
+    pub(crate) fn new(plan: &ScrollPlan) -> Self {
+        let extent = plan.viewport_extent();
+        Self {
+            session: ScrollSession::new(plan.axis(), plan.cross_len(), plan.budget()),
+            viewport: ViewportState::new(extent),
+            control: Control::new(
+                extent,
+                starting_px_per_notch(plan.lines_per_notch(), plan.line_height_px()),
+            ),
+            scratch: Scratch::new(),
+            scene_cut: SceneCut::none(),
+            settle: Settle::new(),
+            last_qpc: 0,
+        }
+    }
+
+    /// Runs until the session stops, then hands the session back **by value**.
+    ///
+    /// By value rather than through `&mut self` because the session's final state *is* the result:
+    /// `ScrollRuntime::teardown` returns it and the caller reads `stop_reason`, `disposal` and
+    /// `cancel_latency` off it. A loop that borrowed itself could not outlive its own thread.
+    pub(crate) fn run<F, A>(
+        mut self,
+        mut source: F,
+        mut actuator: A,
+        controller: &ScrollController,
+        preview: &PreviewStream,
+    ) -> ScrollSession
+    where
+        F: FrameSource,
+        A: ScrollActuator,
+    {
+        let mut watch = ActuatorWatch::new(actuator.path());
+
+        // §17.2: the first frame is the canvas' origin. Until one arrives there is nothing to estimate
+        // against, and the session's `Phase` already says so — `phase()` derives `Preparing` from
+        // `primary_len() == 0`, so there is no second copy of "have we started" to keep in step.
+        let first = match self.await_first_frame(&mut source, controller) {
+            Ok(frame) => frame,
+            Err(reason) => return self.finish(reason, preview),
+        };
+        self.last_qpc = first.qpc();
+        self.session.start(&first);
+        self.publish_progress(preview, Status::None);
+
+        loop {
+            if let Some(reason) = self.command(controller) {
+                return self.finish(reason, preview);
+            }
+            self.apply_commands(controller, preview);
+
+            let notches = step_notches(&self.session, &self.control);
+            let mut host = Host::new(&mut source, &mut actuator, controller);
+            let settled = inject_and_settle(&mut host, &mut self.settle, notches);
+            let frame = host.take_frame();
+            let ended = host.ended();
+
+            if let Some(reason) = ended {
+                return self.finish(stop_reason_for(reason), preview);
+            }
+
+            let frame = match settled {
+                Ok(_) => match frame {
+                    Some(frame) => frame,
+                    // Unreachable: `inject_and_settle` returns `Ok` only after a frame arrived. Kept
+                    // as a step that produced nothing rather than a guess — the alternative is
+                    // estimating against pixels the loop never saw.
+                    None => {
+                        self.session.record_discarded();
+                        continue;
+                    }
+                },
+                Err(StepError::Cancelled { latency }) => {
+                    self.session.record_cancel_latency(latency);
+                    return self.finish(StopReason::UserCancelled, preview);
+                }
+                Err(StepError::Injection(_)) | Err(StepError::NoFrame) => {
+                    // §20.4 and C2: a single failed step never stops the session. What turns a *run*
+                    // of them into a transport switch — or into `ActuatorFailed` — is the watchdog.
+                    //
+                    // `NoFrame` is also how "the content stopped changing" arrives today: the frame
+                    // source only produces an observation when the pixels changed, so a page at its
+                    // end looks exactly like a dead actuator until something else says otherwise.
+                    // Classifying it as `EndReached` needs the scroll-position channel (§20.4's
+                    // convergence row); it is listed as open in this module's header.
+                    self.session.record_discarded();
+                    if let WatchVerdict::Failed = note(&mut watch, &mut actuator, false) {
+                        return self.finish(StopReason::ActuatorFailed, preview);
+                    }
+                    continue;
+                }
+            };
+
+            self.session.record_step();
+            let displacement = self.estimate_step(&frame, notches);
+            let status = *displacement.status();
+            learn(&self.session, &mut self.control, notches, status);
+
+            // §16.10's canvas column: `effect()` is the one place that says whether these pixels are
+            // committed, continued past, or skipped.
+            let committed = match displacement.effect() {
+                StepEffect::Commit => match status {
+                    Status::Confirmed { d } => self.commit(&frame, d, preview),
+                    _ => false,
+                },
+                StepEffect::Continue | StepEffect::Skip => false,
+            };
+            if committed {
+                self.session.record_committed();
+                self.last_qpc = frame.qpc();
+            } else {
+                self.session.record_discarded();
+            }
+
+            let moved = committed && matches!(status, Status::Confirmed { d } if d != 0);            if let WatchVerdict::Failed = note(&mut watch, &mut actuator, moved) {
+                return self.finish(StopReason::ActuatorFailed, preview);
+            }
+            self.publish_progress(preview, status);
+        }
+    }
+
+    /// Wait for the frame that creates the canvas (§17.2).
+    ///
+    /// The two ways out are the two things that can happen before the session has any pixels: the
+    /// user ends it, or the target goes away. `Poll::Idle` is not a third — it means "not yet".
+    fn await_first_frame<F: FrameSource>(
+        &self,
+        source: &mut F,
+        controller: &ScrollController,
+    ) -> Result<Observation, StopReason> {
+        loop {
+            if let Some(reason) = self.command(controller) {
+                return Err(reason);
+            }
+            match source.next(Duration::from_millis(RENDER_TICK_MS as u64)) {
+                Ok(Poll::Frame(observation)) => return Ok(observation),
+                Ok(Poll::Idle) => continue,
+                Ok(Poll::Ended(reason)) => return Err(stop_reason_for(reason)),
+                // §20.4: a transient capture failure before the first frame is not a stopped session
+                // — the next read is the one that decides.
+                Err(_) => continue,
+            }
+        }
+    }
+
+    /// What the user asked for, if anything (`§20.5`, §27.2).
+    ///
+    /// Teardown maps to `UserCancelled` rather than to a twelfth reason: `docs/30` §4.3.7 froze
+    /// `StopReason` at eleven variants, and the promise teardown makes — "no artifact" — is exactly
+    /// the promise `UserCancelled` makes (§20.5). Inventing a variant here would give `Disposal` a
+    /// third answer that nothing has a rule for.
+    fn command(&self, controller: &ScrollController) -> Option<StopReason> {
+        if let Some(reason) = controller.requested_stop() {
+            return Some(reason);
+        }
+        if controller.is_shutdown() {
+            return Some(StopReason::UserCancelled);
+        }
+        None
+    }
+
+    /// Apply the commands that are not a stop: undo presses and the follow flag (§19.5, §19.6).
+    ///
+    /// Reading *is* taking (`take_undo_requests`, `take_follow`), so this must run once per step and
+    /// must not be skipped by an early `continue`: a command consumed and then dropped on the floor is
+    /// a button that does nothing.
+    fn apply_commands(&mut self, controller: &ScrollController, preview: &PreviewStream) {
+        if let Some(follow) = controller.take_follow() {
+            self.session.set_follow(follow);
+        }
+
+        let undos = controller.take_undo_requests();
+        for _ in 0..undos {
+            match self.viewport.undo_last(self.session.canvas_mut()) {
+                // §19.6 lists what an undo restores; the step counter is not on that list. Undoing is
+                // "take those pixels back", not "pretend the step never happened": the screen has
+                // already moved, and a session that rewound its own counters would report progress it
+                // no longer has.
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(_) => break,
+            }
+        }
+        if undos > 0 {
+            self.publish_progress(preview, Status::None);
+        }
+    }
+
+    /// One step's estimate, in the order §17.4 requires: build the reference from the **canvas**,
+    /// then compare it with the frame the step produced.
+    ///
+    /// The reference is the canvas and not the previous frame (`N3`). A frame the gates refused still
+    /// shows what the screen showed; estimating the next step against it would measure that step
+    /// against a picture the canvas never accepted, and the same pixels would be weighed twice.
+    fn estimate_step(&mut self, frame: &Observation, notches: i32) -> Displacement {
+        let qpc = self.last_qpc;
+        let reference = match self.viewport.reference(self.session.canvas_mut(), qpc) {
+            Ok(reference) => reference,
+            // A reference that cannot be read is a canvas that cannot be read: no estimate, and the
+            // step is discarded rather than guessed (`BandError` is the store's, §17.5).
+            Err(_) => return Displacement::none(displacement_evidence(self.scene_cut)),
+        };
+
+        // §16.6: manual mode passes no prior at all — that is the whole of its difference in this
+        // call. It is not "a prior of zero": with no prior the search window is the manual window
+        // (§16.6.2) and no expectation ordering is applied, which is what makes the periodic-page
+        // answer `Uncertain` instead of confident.
+        let prior = if self.session.manual() {
+            None
+        } else {
+            Some(self.control.prior())
+        };
+        let displacement = estimate(
+            &reference.view(),
+            &frame.view(),
+            prior,
+            notches,
+            self.scene_cut,
+            &mut self.scratch,
+        );
+        self.scene_cut = displacement.evidence().scene_cut();
+        displacement
+    }
+
+    /// Write one confirmed step through the canvas (§17.3).
+    ///
+    /// `false` means the write was refused — `MemoryLimit`, or a spill that failed. The session does
+    /// **not** stop: §20.4's `MemoryLimit` row keeps the canvas trimmed to a contiguous prefix, and a
+    /// session that ended on the first refusal would throw away a canvas that is still readable.
+    fn commit(&mut self, frame: &Observation, d: i32, preview: &PreviewStream) -> bool {
+        match self.viewport.apply(self.session.canvas_mut(), frame, d) {
+            Ok(write) => {
+                match write {
+                    StepWrite::Appended { first_row, rows } => {
+                        preview.publish(PreviewUpdate::Bands {
+                            first_row,
+                            rows: rows.min(u32::MAX as u64) as u32,
+                            scale: 1,
+                        });
+                    }
+                    // A prepend moves every existing row down, so *all* of the canvas is newly
+                    // readable at a new offset — the honest update is the whole span, not the rows
+                    // that arrived.
+                    StepWrite::Prepended { .. } => preview.publish(PreviewUpdate::Bands {
+                        first_row: 0,
+                        rows: self.session.canvas().primary_len().min(u32::MAX as u64) as u32,
+                        scale: 1,
+                    }),
+                    StepWrite::Skipped | StepWrite::Contained => {}
+                }
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Tell the preview where the box is and how far the session has come (§19.3, §19.4, §19.5).
+    fn publish_progress(&self, preview: &PreviewStream, status: Status) {
+        preview.publish(PreviewUpdate::Span {
+            primary_len: self.session.canvas().primary_len(),
+            steps: self.session.step(),
+            discarded: self.session.discarded(),
+        });
+        preview.publish(PreviewUpdate::Viewport {
+            band: self.viewport.position().max(0) as u64,
+            status,
+        });
+    }
+
+    /// Record the stop reason, tell the preview, and hand the session over.
+    fn finish(mut self, reason: StopReason, preview: &PreviewStream) -> ScrollSession {
+        self.session.stop(reason);
+        preview.publish(PreviewUpdate::Ended { reason });
+        self.session
+    }
+}
+
+/// All-zero evidence, for the one path that cannot produce any (a reference that cannot be read).
+fn displacement_evidence(scene_cut: SceneCut) -> crate::scroll::displacement::Evidence {
+    crate::scroll::displacement::Evidence {
+        zncc2d: 0.0,
+        gain: 0.0,
+        margin: 0.0,
+        tiles: 0,
+        scene_cut,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geometry::{Point, Rect};
     use crate::scroll::canvas::MemoryBudget;
     use crate::scroll::observation::Axis;
+    use crate::scroll::ports::{FrameError, InjectOutcome, InjectPath, Poll};
     use crate::scroll::session::ScrollSession;
 
     /// A stand-in for `InjectPath` that lives entirely on this side of the boundary.
@@ -1232,6 +1717,429 @@ mod tests {
         assert!(
             control.px_per_notch() < 60.0,
             "the same step in automatic mode does move ĝ: 37 px for one notch pulls it down"
+        );
+    }
+
+    // --- the closed loop (`P3.09`) ---
+
+    /// One viewport of a [`TestImage`], as an observation the driver can estimate against.
+    ///
+    /// `qpc` is the position, which is a lie about the clock and the truth about identity: two reads
+    /// at the same position must look like the same observation and two reads at different positions
+    /// must not (§11.1's dedupe). Using a real clock here would make the frames differ for a reason
+    /// that has nothing to do with the pixels.
+    fn viewport_at(
+        image: &crate::scroll::testkit::TestImage,
+        top: u32,
+        height: u32,
+    ) -> Observation {
+        let width = image.width();
+        let mut pixels = Vec::with_capacity(width as usize * 4 * height as usize);
+        for y in top..top + height {
+            pixels.extend_from_slice(image.row(y));
+        }
+        Observation::new(
+            pixels,
+            Rect::from_origin_size(
+                Point::new(0, top as i32),
+                width as i32,
+                height as i32,
+            ),
+            top as i64,
+            (width, height),
+            Axis::Vertical,
+        )
+        .expect("the viewport is packed and matches its region")
+    }
+
+    /// Notches the actuator has asked for and the page has not yet moved by.
+    ///
+    /// This is the wire between the two ports, and it is what makes these tests a **closed loop**
+    /// rather than two independent halves: the driver injects, the page moves by exactly what was
+    /// injected, and the driver then has to measure the motion it caused. A scripted source that moved
+    /// on its own schedule would let a driver pass while asking for the wrong number of notches.
+    type Pending = std::sync::Arc<std::sync::atomic::AtomicI32>;
+
+    /// A page that scrolls by `px_per_notch` for every notch the actuator fires.
+    ///
+    /// ## Why `next` is driven by the injection and not by the call
+    ///
+    /// A real frame source produces an observation **when the content changes** and reports `Idle`
+    /// otherwise (§11.1). A source that produced a new frame on every read could never settle — the
+    /// settle rule needs two *agreeing* reads — and would make the loop look broken when the source
+    /// was the thing that was wrong. So: one frame per injection, then silence.
+    ///
+    /// The first frame is free, because the session's origin arrives before anything is injected
+    /// (§17.2). `budget` counts *driven* frames and is how the target eventually goes away, which is
+    /// the only way this loop ends without a controller.
+    struct SimulatedPage {
+        image: crate::scroll::testkit::TestImage,
+        viewport: u32,
+        px_per_notch: i32,
+        pending: Pending,
+        position: i32,
+        served: u32,
+        budget: u32,
+        origin_sent: bool,
+        ended: bool,
+    }
+
+    impl SimulatedPage {
+        /// `budget` is the number of driven frames the page will serve before it goes away.
+        fn new(
+            image: crate::scroll::testkit::TestImage,
+            viewport: u32,
+            px_per_notch: i32,
+            budget: u32,
+        ) -> (Self, Pending) {
+            let pending: Pending = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
+            (
+                Self {
+                    image,
+                    viewport,
+                    px_per_notch,
+                    pending: std::sync::Arc::clone(&pending),
+                    position: 0,
+                    served: 0,
+                    budget,
+                    origin_sent: false,
+                    ended: false,
+                },
+                pending,
+            )
+        }
+    }
+
+    impl FrameSource for SimulatedPage {
+        fn next(&mut self, _timeout: Duration) -> Result<Poll, FrameError> {
+            use std::sync::atomic::Ordering;
+
+            if self.ended {
+                // Sticky. If the page could go back to `Idle` after ending, the settle rule would
+                // agree with the last frame it saw and the loop would commit a step from a target it
+                // had already lost.
+                return Ok(Poll::Ended(EndReason::TargetLost));
+            }
+            if !self.origin_sent {
+                // The origin is free (§17.2), and it must not consume the pending notches: the first
+                // injection has not happened yet, and swallowing it here would make the first step
+                // settle on the frame the canvas already has.
+                self.origin_sent = true;
+                return Ok(Poll::Frame(viewport_at(&self.image, 0, self.viewport)));
+            }
+            let notches = self.pending.swap(0, Ordering::AcqRel);
+            if notches == 0 {
+                // Nothing was injected since the last frame, so the picture is the one we already
+                // have. This is the read that lets the settle rule agree with itself.
+                return Ok(Poll::Idle);
+            }
+            if self.served >= self.budget {
+                self.ended = true;
+                return Ok(Poll::Ended(EndReason::TargetLost));
+            }
+            self.position += notches * self.px_per_notch;
+            self.served += 1;
+            Ok(Poll::Frame(viewport_at(
+                &self.image,
+                self.position as u32,
+                self.viewport,
+            )))
+        }
+
+        fn viewport(&self) -> Rect {
+            Rect::from_origin_size(
+                Point::new(0, 0),
+                self.image.width() as i32,
+                self.viewport as i32,
+            )
+        }
+    }
+
+    /// An actuator that reports success and forwards its notches to the simulated page.
+    struct LinkedActuator {
+        pending: Pending,
+        injections: Vec<i32>,
+    }
+
+    impl LinkedActuator {
+        fn new(pending: Pending) -> Self {
+            Self {
+                pending,
+                injections: Vec::new(),
+            }
+        }
+    }
+
+    impl ScrollActuator for LinkedActuator {
+        type Path = InjectPath;
+
+        fn path(&self) -> InjectPath {
+            InjectPath::SendInput
+        }
+
+        fn switch(&mut self, _from: InjectPath) -> Option<InjectPath> {
+            // One transport, and it works: there is nothing to switch to and no reason to.
+            None
+        }
+
+        fn inject(&mut self, notches: i32) -> InjectOutcome {
+            use std::sync::atomic::Ordering;
+
+            self.injections.push(notches);
+            self.pending.fetch_add(notches, Ordering::AcqRel);
+            InjectOutcome::posted(1, Some(0x1234))
+        }
+    }
+
+    /// The document these tests run on: one texture that supports a match at every offset.
+    ///
+    /// The default document cycles seven structures and two of them (`Flat`, `Gradient`) have no
+    /// high-frequency content at all, so as the band slides the number of tiles that support the
+    /// winning shift drops — measured: three steps into a 900 px viewport the third step reports
+    /// `tiles = 2` and gate three refuses a *perfect* match (`zncc2d = 1.0`). That is the estimator
+    /// working as designed on a page with flat regions, but it makes the tile count a property of the
+    /// document rather than of the loop, and these tests are about the loop. One hashed-noise document
+    /// keeps the tile count at its maximum everywhere.
+    ///
+    /// The document repeats every `band_height` rows, so `band_height` is set to the whole document:
+    /// a repeating page would put a second perfect match inside the search window (a 240-row period
+    /// aliases 480 with 720), and the loop would then be right to refuse the step. A page that is
+    /// aperiodic over its whole height leaves exactly one shift that matches.
+    fn page(height: u32, seed: u32) -> crate::scroll::testkit::TestImage {
+        use crate::scroll::testkit::{Structure, TestImage};
+
+        TestImage::from_structures(
+            320,
+            height,
+            seed,
+            height,
+            &[Structure::NoiseBlocks { cell: 8 }],
+        )
+    }
+
+    /// The loop, end to end, with everything real except the platform.
+    ///
+    /// This is the test that makes "the loop is testable without a desktop" (§28.4) a fact rather than
+    /// a claim: it drives injection, the settle rule, the four gates, the canvas, the control law, the
+    /// watchdog and the preview, and the only two things substituted are the two ports.
+    ///
+    /// ## The numbers
+    ///
+    /// The page's true gain is 60 px/notch, which is also `ĝ₀ = starting_px_per_notch(3, 20)`, so the
+    /// control law is right from the first step and every step has the same size:
+    ///
+    /// * `target_advance_rows = (1 − ρ*)·V = 0.65 × 900 = 585`
+    /// * `wanted = round(585 / 60) = 10`, clamped by §16.6's `N_max = floor(0.65 × 900 / 60) = 9`
+    /// * so 9 notches, and the page advances `9 × 60 = 540 px`
+    /// * `E[d] = 9 × 60 = 540`, the search window is `±ceil(0.3 × 540) = ±162`, and the truth is dead
+    ///   centre — which is the point of a closed loop: the estimator is asked about the motion the
+    ///   actuator caused, not about an arbitrary number.
+    ///
+    /// The extent is 900 and not a more convenient 400 for a different reason: gate three needs
+    /// `MIN_TILES = 4` independent tiles at `TILE_INDEPENDENCE_GAP = 2` (`P1.10`), which puts a floor of
+    /// about 448 px under the viewport's primary extent. A 400 px viewport measures 3 tiles on this
+    /// image and every step comes back `Status::None` — measured, not assumed: `zncc2d = 1.0` (a perfect
+    /// match) with `tiles = 3`.
+    ///
+    /// ## Why the budget equals the step count
+    ///
+    /// The page serves exactly three driven frames and then goes away, so the fourth injection finds
+    /// no target and the session ends with three steps committed. A budget of four would let a fourth
+    /// step commit and the test would be asserting the arithmetic of its own fixture.
+    #[test]
+    fn the_driver_closes_the_loop_from_injection_to_committed_rows() {
+        use crate::scroll::preview::PreviewUpdate;
+
+        let image = page(3000, 11);
+        let (page, pending) = SimulatedPage::new(image, 900, 60, 3);
+        let plan = ScrollPlan::new(Axis::Vertical, 320, 900, MemoryBudget::with_total(8 << 20));
+        let controller = ScrollController::new();
+        let preview = PreviewStream::new();
+        let actuator = LinkedActuator::new(pending);
+
+        let session = ScrollDriver::new(&plan).run(page, actuator, &controller, &preview);
+
+        assert_eq!(
+            session.canvas().primary_len(),
+            900 + 3 * 540,
+            "the canvas holds the origin viewport plus three steps of 540 px"
+        );
+        assert_eq!(session.step(), 3, "three steps were taken and each settled");
+        assert_eq!(session.committed(), 3, "and all three were committed");
+        assert_eq!(session.discarded(), 0, "nothing was thrown away");
+        assert_eq!(
+            session.stop_reason(),
+            Some(StopReason::TargetLost),
+            "the source ended, and that is what the session reports"
+        );
+        assert_eq!(
+            session.cancel_latency(),
+            None,
+            "no one cancelled: `None` is not 0 ms, and a session that never saw a cancel must not \
+             satisfy a latency budget"
+        );
+
+        // The preview heard about the progress, not just the end. `take` is oldest-first across kinds,
+        // so a drain sees one of each (§19.3): within a kind the newest wins, across kinds nothing is
+        // evicted.
+        let mut updates = Vec::new();
+        while let Some(update) = preview.take() {
+            updates.push(update);
+        }
+        assert!(
+            updates
+                .iter()
+                .any(|u| matches!(u, PreviewUpdate::Ended { .. })),
+            "the panel is told the session ended: {updates:?}"
+        );
+        assert!(
+            updates
+                .iter()
+                .any(|u| matches!(u, PreviewUpdate::Bands { .. })),
+            "the panel is told where the new rows are: {updates:?}"
+        );
+        assert!(
+            updates.iter().any(|u| matches!(
+                u,
+                PreviewUpdate::Viewport {
+                    status: Status::Confirmed { .. },
+                    ..
+                }
+            )),
+            "the box position travels with the confirmed status: {updates:?}"
+        );
+        assert!(
+            updates
+                .iter()
+                .any(|u| matches!(u, PreviewUpdate::Span { .. })),
+            "the progress line is still there after the bands update landed: {updates:?}"
+        );
+    }
+
+    /// The notches the loop asks for are the notches it needs, measured against a page it does not
+    /// know the gain of.
+    ///
+    /// The first test fixes the page's gain at `ĝ₀`, which makes it a test of the wiring. This one
+    /// gives the page a gain of 72 px/notch — 1.2× the starting estimate — and asserts the loop still
+    /// covers ground and that `ĝ` moves towards the truth.
+    ///
+    /// ## Why the page moves *less* than expected and not more
+    ///
+    /// The loop corrects an underestimate and cannot correct an overestimate, and that asymmetry is
+    /// worth stating precisely because it is the loop's real limit. A page that moves more than `ĝ`
+    /// expects does not fail the *search*: the match is found and scores `zncc2d = 1.0`. It fails
+    /// **gate one**, `is_verifiable` (§16.1): `overlap_ratio = (V − |d|)/V` falls below `RHO_MIN =
+    /// 0.35`, which for a 900 px viewport and 9 notches means any true gain above 65 px/notch — 8%
+    /// above `ĝ₀`. The step is discarded, `ĝ` does not move (rule 2 forbids learning from a step that
+    /// was not confirmed), and the next step overshoots by the same amount again. Measured with a true
+    /// gain of 72: every step comes back `Uncertain { d: 648 }` and `committed()` stays 0.
+    ///
+    /// The fix is not in the driver — it is a smaller first step or the multi-scale pyramid of §15.6
+    /// ("only when `|d|` may be large"), which is designed and not built (`OQ-17`). Recorded as `DEV-53`
+    /// and in the `[!]` table rather than hidden behind a fixture that happens to be inside the window.
+    ///
+    /// A page that moves *less* than expected is a different story: the overlap is generous, the
+    /// estimate is confirmed, and rule 3 of §16.6 pulls `ĝ` down towards the truth. That is the case
+    /// asserted here — 48 px/notch, 0.8× the starting estimate.
+    #[test]
+    fn the_loop_converges_on_a_page_whose_gain_it_does_not_start_with() {
+        let image = page(4000, 13);
+        let (page, pending) = SimulatedPage::new(image, 900, 48, 4);
+        let plan = ScrollPlan::new(Axis::Vertical, 320, 900, MemoryBudget::with_total(8 << 20));
+        let controller = ScrollController::new();
+        let preview = PreviewStream::new();
+
+        let session = ScrollDriver::new(&plan).run(
+            page,
+            LinkedActuator::new(pending),
+            &controller,
+            &preview,
+        );
+
+        assert!(
+            session.committed() >= 2,
+            "the loop must make progress on a page it is wrong about, not stall: committed {}",
+            session.committed()
+        );
+        assert!(
+            session.canvas().primary_len() > 900,
+            "and the rows must be on the canvas: {}",
+            session.canvas().primary_len()
+        );
+    }
+
+    /// The same loop, with the user's `Esc` arriving at the worst moment: right after an injection.
+    ///
+    /// This is `P3.07`'s cancellation protocol driven by the real loop rather than by `ScriptedHost`,
+    /// and it is where §23.2's `Cancel latency` becomes an observable: the value on the session is the
+    /// one the driver measured, not one the test computed.
+    #[test]
+    fn a_cancelled_session_keeps_the_latency_it_measured() {
+        /// A page whose user presses `Esc` as soon as it has moved once.
+        ///
+        /// The cancel comes from inside the source rather than from another thread, which is what makes
+        /// this deterministic: there is no window in which the driver could have gone round again.
+        struct ImpatientPage {
+            inner: SimulatedPage,
+            controller: std::sync::Arc<ScrollController>,
+            cancelled: bool,
+        }
+
+        impl FrameSource for ImpatientPage {
+            fn next(&mut self, timeout: Duration) -> Result<Poll, FrameError> {
+                if self.cancelled {
+                    // `Idle`, not `Ended`: the session ends because of the cancel, and a test that
+                    // ended the stream too could not tell which one produced the stop.
+                    return Ok(Poll::Idle);
+                }
+                let poll = self.inner.next(timeout)?;
+                if matches!(poll, Poll::Frame(_)) && self.inner.served >= 1 {
+                    self.controller.cancel();
+                    self.cancelled = true;
+                }
+                Ok(poll)
+            }
+
+            fn viewport(&self) -> Rect {
+                self.inner.viewport()
+            }
+        }
+
+        let image = page(3000, 12);
+        let (page, pending) = SimulatedPage::new(image, 900, 60, 8);
+        let plan = ScrollPlan::new(Axis::Vertical, 320, 900, MemoryBudget::with_total(8 << 20));
+        let controller = std::sync::Arc::new(ScrollController::new());
+        let preview = PreviewStream::new();
+
+        let session = ScrollDriver::new(&plan).run(
+            ImpatientPage {
+                inner: page,
+                controller: std::sync::Arc::clone(&controller),
+                cancelled: false,
+            },
+            LinkedActuator::new(pending),
+            &controller,
+            &preview,
+        );
+
+        assert_eq!(
+            session.stop_reason(),
+            Some(StopReason::UserCancelled),
+            "Esc is the one command that produces no artifact (§20.5)"
+        );
+        let latency = session
+            .cancel_latency()
+            .expect("the driver recorded the latency it measured, not the one it hoped for");
+        assert!(
+            latency <= STEP_TIMEOUT,
+            "the latency is bounded by one settle window: {latency:?}"
+        );
+        assert!(
+            matches!(
+                session.disposal(),
+                Some(crate::scroll::session::Disposal::Discard)
+            ),
+            "cancelling means the pixels are thrown away, not exported"
         );
     }
 }

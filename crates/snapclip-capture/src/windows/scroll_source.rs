@@ -46,6 +46,13 @@ use crate::geometry::Rect;
 use crate::scroll::displacement::line_digest;
 use crate::scroll::observation::{Axis, Observation};
 
+// The vocabulary moved to `scroll/ports.rs` in `P3.09`: §28.4 forbids `scroll/` from referencing
+// this module, so the driver (which is `scroll/`'s) cannot name a trait defined here. The names are
+// re-exported rather than imported so that this module's own code and its test module read exactly
+// as they did when the definitions lived here — `P2.03`'s evidence stays valid because not one line
+// of its behaviour changed.
+pub(crate) use crate::scroll::ports::{EndReason, FrameError, FrameSource, Poll};
+
 use super::providers::{ProviderKind, ScrollFrame};
 use super::win::d3d11::GraphicsDevice;
 use super::win::wgc::{WgcError, WgcSession};
@@ -107,21 +114,6 @@ pub(crate) fn next_scroll_backend(current: ProviderKind) -> Option<ProviderKind>
     SCROLL_BACKENDS.get(index + 1).copied()
 }
 
-/// Why a stream ended. Every one of these is a **normal** outcome; none of them is an error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EndReason {
-    /// The target stopped being capturable: closed, minimised, or resized away from the
-    /// viewport this session was built for. The three are distinguished by the detail the
-    /// source records, not by new variants (`docs/31` `P2.07`).
-    TargetLost,
-    /// The capture machinery failed on something that will not fix itself.
-    CaptureFailed,
-    /// The GPU device went away.
-    DeviceLost,
-    /// The session ran out of its own time budget.
-    Timeout,
-}
-
 /// What a display-topology or window change means for a running scroll session
 /// (`docs/30` §24.4, task `P2.05`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,52 +170,6 @@ pub(crate) fn topology_outcome(
         return TopologyOutcome::Stop(EndReason::TargetLost);
     }
     TopologyOutcome::Continue
-}
-
-/// One attempt to get a new observation.
-#[derive(Debug)]
-pub(crate) enum Poll {
-    /// A new observation. Its displacement may be zero — that is the estimator's business.
-    Frame(Observation),
-    /// Nothing new within the timeout. The caller keeps waiting or stops for its own reasons.
-    Idle,
-    /// The stream is over.
-    ///
-    /// Unlike [`Poll::Idle`], this is final, and it carries an obligation: the caller must hand
-    /// out the rows it has already confirmed as a `Partial` before tearing the session down
-    /// (`docs/30` §24.4). An ending is never a reason to throw the canvas away — the session may
-    /// have been running for minutes when the user closed the tab.
-    Ended(EndReason),
-}
-
-/// A failure that is **not** an ending: the stream may still be alive next time.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum FrameError {
-    /// The device was lost; `id` names which one so a restarted session can be told apart.
-    DeviceLost { id: String },
-    /// One attempt failed. Retrying is allowed and is the caller's decision.
-    Transient {
-        context: &'static str,
-        detail: String,
-    },
-}
-
-impl std::fmt::Display for FrameError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::DeviceLost { id } => write!(formatter, "the GPU device {id} was lost"),
-            Self::Transient { context, detail } => write!(formatter, "{context}: {detail}"),
-        }
-    }
-}
-
-/// The stream a scroll session reads from (`docs/30` §27.3).
-pub(crate) trait FrameSource {
-    /// Wait at most `timeout` for a new observation.
-    fn next(&mut self, timeout: Duration) -> Result<Poll, FrameError>;
-    /// The viewport this session was opened for. Invariant for the session's lifetime
-    /// (`docs/30` §2.1 推论 2.6): a target that changes size ends the stream instead.
-    fn viewport(&self) -> Rect;
 }
 
 /// What the platform seam can answer. Raw material only — no policy.

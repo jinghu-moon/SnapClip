@@ -11,6 +11,12 @@
 //!   (`P1.18`–`P1.22`) and `ViewportState`, which is where a confirmed step becomes a write.
 //! * `orb` (`P1.23`) — the conditionally triggered second opinion. It can only answer
 //!   `Agree`/`Disagree`/`NoEvidence`; it never produces a reported displacement.
+//! * `loop_control` (`P3.03`) — the closed loop's pieces: the watchdog that switches transports, the
+//!   settle window, the `ĝ` controller, and (from `P3.09`) the driver that runs them in order.
+//! * `preview` (`P3.08`) — the capacity-1 preview mailbox the overlay thread drains (§19.3).
+//! * `session` (`P3.04`) — the aggregate root: the axis, the canvas, the step counter, the streak,
+//!   the stop promise, and the command port (§27.2).
+//! * `ports` (`P3.09`) — the two platform seams, `FrameSource` and `ScrollActuator` (§27.1).
 //! * `testkit` (`P1.01`) — the synthetic fixture every later `P1` task is judged against.
 //! * `acceptance` (`P1.24`) — `E-ACC-1` as a gate: the `§29.3` scan over the whole funnel, judged by
 //!   byte equality with the generator's truth. Test-only, but it is the reason G1 is checkable.
@@ -35,6 +41,12 @@ pub(crate) mod loop_control;
 pub(crate) mod observation;
 
 pub(crate) mod orb;
+
+/// `ports` (`P3.09`) — the platform seams: what the driver reads frames from and injects through.
+/// The vocabulary lives here and the implementations live in `windows/`, which is the only shape
+/// that satisfies §28.4's "nothing under `scroll/` may reference the Windows module" while the driver
+/// itself stays in `scroll/loop_control.rs` (§28.2).
+pub(crate) mod ports;
 
 pub(crate) mod preview;
 
