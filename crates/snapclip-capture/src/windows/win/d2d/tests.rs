@@ -1455,6 +1455,11 @@
         // chip's characters are a subset of these.
         drawn.push(LEVEL_HINT.to_owned());
         drawn.push(level_hint(LevelReach { up: 8, down: 1 }));
+        // …and the scroll panel (docs/30 §19.7). Its list comes from the panel itself, which is the
+        // producer of every word it draws: the constants, a computed amount line, the eleven ended
+        // reasons and the thirteen diagnostic codes. Asking it here instead of copying the strings is
+        // what makes a new `StopReason` unable to leave the font behind.
+        drawn.extend(crate::scroll::panel::drawn_strings());
         drawn
     }
 
@@ -1504,6 +1509,37 @@
                 );
             }
         }
+    }
+
+    /// The panel's palette is a copy of the interface's, and this is where the copy is checked.
+    ///
+    /// `crate::scroll::panel` may not name `crate::windows` (docs/30 §28.4: the model side of the
+    /// crate is platform-free), so it cannot import `ACCENT_RGB` and has to restate the number. That
+    /// is the kind of restatement that silently drifts, so the one module that can see both compares
+    /// them — and, since the point of §19.4 is that the unadopted state is *not* a warning colour, it
+    /// checks the two colours a user could confuse it with.
+    #[test]
+    fn the_panel_palette_matches_the_interface_palette() {
+        use crate::scroll::panel::{ADOPTED_RGB, UNADOPTED_RGB};
+        use crate::ring_contrast::{ACCENT_RGB, CAPTURE_RGB};
+
+        assert_eq!(
+            (ADOPTED_RGB.r, ADOPTED_RGB.g, ADOPTED_RGB.b),
+            (ACCENT_RGB.r, ACCENT_RGB.g, ACCENT_RGB.b),
+            "the adopted viewport box is the interface accent; if that changed, change the panel too"
+        );
+
+        // Neither red nor the capture green, and neutral: this is what "the colour must match the
+        // action the user has to take" (docs/30 §19.4) comes down to when it is checked mechanically.
+        assert_ne!(
+            (UNADOPTED_RGB.r, UNADOPTED_RGB.g, UNADOPTED_RGB.b),
+            (CAPTURE_RGB.r, CAPTURE_RGB.g, CAPTURE_RGB.b),
+            "the unadopted box is not the capture green: nothing is being captured this step"
+        );
+        assert!(
+            UNADOPTED_RGB.r <= UNADOPTED_RGB.g && UNADOPTED_RGB.r <= UNADOPTED_RGB.b,
+            "the unadopted box is neutral, not red"
+        );
     }
 
     /// Glyph count from the font's `maxp` table — the ceiling a `cmap` reader can be held to.

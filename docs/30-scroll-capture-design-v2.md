@@ -3560,6 +3560,56 @@ impl Mailbox {
 
 **视口框的位置**：预览条上对应当前视口在内容坐标系中的区间。当内容长度超过"预览条能一比一显示"的程度时，框高按比例压缩，**但有下限 4 DIP**（否则在高倍内容上框会消失）。这条下限是**像素级需求**，不是审美：G8 的问题 2 要求它始终可见。
 
+**落地（`P5.03`，2026-10-09）**：见 §19.4.1。
+
+#### 19.4.1 落地形状（`P5.03`，2026-10-09）
+
+**落点**：模型在 `crates/snapclip-capture/src/scroll/panel.rs`（platform-free，§28.4 的第二遍扫描不允许它命名 `windows`），绘制在 `crates/snapclip-capture/src/windows/win/d2d.rs` 的 `draw_scroll_panel`/`draw_panel_text`。这个分工不是美学：**八问的答案里没有一个是像素**（问题 3 是"多少"，问题 4 是三态之一，问题 6/7 是两个布尔），把它们算成 `Rect` 就会让"答案对不对"只能靠看图回答。`panel.rs` 因此可以在没有 GPU、没有窗口、没有 `Observation` 的情况下被穷举测试（四条 L1 用例）；`d2d.rs` 只负责把 `Answers` 摆到画面上。
+
+**八问的落地形状 = 八个具名字段，不是一个数组**：
+
+```rust
+pub(crate) struct Answers {
+    doing: String,        // 1 正在做什么
+    capture_at: u64,      // 2 捕获到哪里了（= 视口框首行）
+    amount: String,       // 3 已捕获多少：`1505 × 2160   步 9 (弃 3)`
+    valid: ViewState,     // 4 结果是否有效
+    continuing: bool,     // 5 是否还在继续
+    can_stop: bool,       // 6 如何停止
+    can_cancel: bool,     // 7 如何取消
+    trouble: Option<String>, // 8 是否发生异常
+}
+```
+
+问题 8 是 `Option`、问题 6/7 是布尔、问题 2 是行号 —— 异质的东西塞进 `Vec<String>` 或 `[String; 8]` 之后，每个读者都要重新推断"第几格是哪一问"，而那正是八问存在的意义被抹掉的地方。
+
+**三态是三种，不是四种**：`Status`（§17.7）只有 `Confirmed`/`Uncertain`/`None` 三个变体，"`scene_cut`" 是 `Streak`（§16.8）的概念而不是 `Status` 的变体，所以 §19.4 表的三行落地为 `ViewState::{Confirmed, Unadopted, Ended}`：`Uncertain` 与 `None` 在**用户要做什么**上没有区别（什么都不做），而 §19.4 的外观规则正是按"要做什么"分的。
+
+**"不是红"的机械形式**：`panel.rs` 不能引用 `crate::ring_contrast`（那是 `windows` 之外、但仍是 UI 侧的调色板），所以它重述数字：
+
+| 名字 | 值 | 与谁一致 | 谁来保证 |
+|---|---|---|---|
+| `ADOPTED_RGB` | `(31, 117, 219)` | `ring_contrast::ACCENT_RGB` | `windows/win/d2d/tests.rs::the_panel_palette_matches_the_interface_palette` 断言通道逐个相等 |
+| `UNADOPTED_RGB` | `(0x9a, 0xa3, 0xad)` | 中性灰，**不与任何既有颜色相等** | 同一用例断言 `r <= g && r <= b`（"不是红"）且 `!= CAPTURE_RGB`（"不是捕获绿"） |
+
+重述一个数字是**会静默漂移**的那种重复，所以它必须由唯一能同时看见两份定义的地方比一次 —— 这就是那条 L2 用例的全部理由。
+
+**框高下限是算出来的**：`viewport_box_height(primary_len, extent, strip_height)` 在 `primary_len <= extent` 时返回整条（内容还没填满一屏时，"视口"就是全部内容），否则返回 `strip_height * extent / primary_len` 并夹进 `[min(4, strip_height), strip_height]`。实测（条带 220 DIP、视口 1080 行）：`primary_len = 10_000` ⇒ **23**；`100_000` ⇒ 比值 2 ⇒ 被下限抬到 **4**；`500_000` 与 `1_000_000` 同样是 4。⇒ §30.6 的"视口框下限"行要测的正是**比值小于 1 之后仍然可见**，而不是"某个具体像素数"。
+
+**面板的高度不随诊断变化**：`PanelLayout` 的 `trouble` 行**无论有没有内容都占位**。理由写在该结构的 doc 里 —— 一个随第八问出现而变高的面板，会把用户光标底下的所有东西挪走，而用户此刻正在滚动一个窗口；空一行比挪动整个面板便宜。
+
+**字体子集是这一节的硬约束（本任务的实际发现）**：覆盖层的 UI 文本用内嵌的 CJK 子集 `INFO_EMBEDDED_FONT`，`subfont/build_subset.py` 要求 `subfont/drawn-text.txt` 覆盖**每一个会上屏的字符**。面板的中文文案因此不能是绘制代码里的字面量，而必须由 `panel.rs` 的**生产者**枚举出来 —— `#[cfg(test)] pub(crate) fn drawn_strings()` 列全四条文案常量、一个计算出的 `amount` 行、`badge_text(3)`、**全部 11 个 `StopReason`** 与**全部 13 个 `ScrollDiagnosticCode`**，`d2d/tests.rs` 的 `overlay_drawn_strings()` 通过 `drawn.extend(crate::scroll::panel::drawn_strings())` 把它并进来。这样新增一个 `StopReason` 就**不可能**把字体落下：门禁会红在 `the_embedded_subset_covers_the_strings_the_overlay_draws` 上，而不是红在用户的屏幕上。这个门禁在本任务里真的红过一次：`the embedded subset has no glyph for '正' (U+6B63), drawn by "正在滚动截取"`，重建后子集从 20,752 B 涨到 **35.9 KB（239 个 codepoint，全部必需字符覆盖）**。
+
+**接线与刻意未接线**：
+
+| 位置 | 落地 | 未落地（归属） |
+|---|---|---|
+| `RenderView.scroll_panel: Option<ScrollPanel>` | 模型而非预计算矩形；`render_export` 的清空列表里有 `scroll_panel: None`，所以面板**永远不进产物像素** | — |
+| `overlay/render_submit.rs` | `watch_scroll_preview(preview, cross_len, extent)` + `on_scroll_ready()`（`while let` 排空 `take()`，因为 §19.3.2 的 oldest-first 就是为"一次唤醒看全"选的） | 交接的调用者（装配根 `P6`） |
+| `overlay/window_host.rs` | `SCROLL_READY_MESSAGE => on_scroll_ready()` —— `P3.07` 定义的那个消息 id 至此才有真实消费者 | — |
+| 两个按钮（`STOP_TEXT`/`CANCEL_TEXT`） | 画出来了，且**只有 `continuous` 为真时才画**（一个已结束的会话提供"停止"是在回答没人能再问的问题） | **点击命中区 → `ScrollCommand`**：属装配根 `P6`；今天按钮会画、不可点 |
+| `回到最新` / `撤销` | — | `P5.04`（§19.5/§19.6） |
+
 ### 19.5 交互能力（逐条回答用户要求明确的项）
 
 | 能力 | 是否提供 | 设计 |
@@ -3627,6 +3677,8 @@ impl RecoveredImage {
 ### 19.7 UI 的布局与"不做什么"
 
 **布局**（右侧面板，由覆盖层的 D2D 绘制；宽度取 `gpui-kit` 设计令牌的**同一数值**，但**不引入该依赖**——`snapclip-capture` 禁止依赖 `gpui`/`gpui-kit`，见 §19.3）：
+
+**已落地（`P5.03`，2026-10-09，见 §19.4.1）**：面板、状态行、尺寸行、缩略条带、视口框与**两个**按钮（`[停止] [取消]`）已经画得出来；上面 ASCII 图里的 `[回到最新] [撤销]` 两个按钮属 `P5.04`，两个按钮的**点击命中区**属装配根 `P6`。布局常数落在 `crates/snapclip-capture/src/scroll/panel.rs` 的 `PanelLayout`（面板宽 248 DIP、内边距 12 DIP、条带高 220 DIP、行高 22 DIP、圆角 8 DIP、外边距 16 DIP），DIP→px 的换算在绘制处（`scale = dpi / 96`），所以模型里的每个数字都是**布局意图**而不是某一台显示器的像素。
 
 ```
 ┌──────────────────────────────┐
@@ -4297,7 +4349,7 @@ impl Scratch {
 | Scroll Response | P50 ≤ 30 ms，P95 ≤ 60 ms | **推导** | P95 ≤ 80 ms | 推导：绘制节流是 `RENDER_TICK_MS = 15`（§5 确证）；一次注入 + 一次稳定性等待至少 2 个 tick。**这是"用户不会觉得卡"的下界**，须由 `E-PERF-1` 确认可达成 |
 | Stitch Latency | P50 ≤ 8 ms，P95 ≤ 20 ms | **实测（2026-10-09，§23.3.2）：目标未达成**——`l123` 的 P50 = **67.1 / 113.0 / 254.7 ms**（1080p/1440p/4K，即目标的 **8.4× / 14.1× / 31.8×**），P95 = 75.2 / 128.5 / 285.0 ms（目标 3.8× / 6.4× / 14.3×，通过阈值 P95 ≤ 30 ms 亦未过）；连"只跑到第 2 层"的最便宜可决断组合（`l12`）也是 35.1 / 63.8 / 140.9 ms | P95 ≤ 30 ms | 瓶颈**分布在三层**（4K 占比：第 1 层 35.4%、第 2 层 19.8%、第 3 层 47.3%），不是单一热点；`§23.3.1` 的 6.78 ms 是**1 字节/像素、单帧**合成帧上的数，而今天的观测是 **BGRA 双帧**（1080p 每步 16.6 MB）⇒ **原型数字不可当作生产下界**（`§23.3.2` 结论 2/3） |
 | UI 主线程最大同步工作（覆盖层线程） | ≤ 4 ms | **推导** | ≤ 8 ms | 推导：16.7 ms 帧预算的一半；§5 已确证今天 overlay 是**每帧整面重绘**，滚动会话不得把它推过预算 |
-| Preview 更新延迟 | P50 ≤ 40 ms | **未取得（原因已更新）**：`E-PERF-4` 未执行。预览**流**本身已落地（`P3.08`/`P3.09` 的端口、`P5.01` 的生产者限流），但本行量的是"**发布 → 面板画完**"，它需要真实消费者（`P5.03` 的视口框 / `P5.05` 的绘制回读）；`E-PERF-1` 的装置里没有预览路径 | P95 ≤ 100 ms | 与 10 Hz 更新上限一致（§19.3）：100 ms 是更新的周期本身 |
+| Preview 更新延迟 | P50 ≤ 40 ms | **未取得（原因已更新两次）**：`E-PERF-4` 未执行。预览的**端口**已落地（`P3.08`/`P3.09`）、**生产者**已限流（`P5.01`）、**消费者**已存在（`P5.03` 的视口框：`SCROLL_READY_MESSAGE` → `on_scroll_ready()` → `invalidate()`），但本行量的是"**发布 → 面板画完**"，而那需要一个跑在真实会话上的时序装置（`P5.06` 的 `E-PERF-4` 与主线程 8 ms 预算）；`E-PERF-1` 的装置里没有预览路径。**不得因为 `P5.03` 让面板"能画"就算作已测** | P95 ≤ 100 ms | 与 10 Hz 更新上限一致（§19.3）：100 ms 是更新的周期本身 |
 | Cancel latency | P50 ≤ 60 ms，**Max ≤ 400 ms** | **实测（2026-10-09，§23.3.3）：达标**——真桌面 4 次试验 **max = 44 ms**（400 ms 目标的 11.0%）、**p50 = 41 ms**（60 ms 目标的 68.3%）；两种触发形态分别 max = **0 ms**（`mid-flight`）与 **44 ms**（`parked`）。`P3.07` 的脚本时钟测量（7 个触发点，max 20 ms）是**循环自身**的贡献；本次是加上两个不可中断段之后的数 | Max ≤ 500 ms | 下界 = 一次注入 + 一次稳定性等待；**Max 必须单独给**，因为它是用户感知"卡住了"的唯一来源。**实测修正**：`parked` 的 41–44 ms 说明"一次稳定性等待"的代价主要是**一次回读**（1188×894 = 4.25 MB），不是一个 tick（15 ms） |
 | Stop latency | P50 ≤ 20 ms | **推导** | P95 ≤ 60 ms | 停止只是提交导出任务（§5 确证 `export_worker.submit` 覆盖式信箱），不需要等待编码 |
 | CPU（Capturing） | ≤ 1 个逻辑核的 15% | **未取得（原因已写明）**：合成序列装置没有捕获侧；真实桌面唯一的既有数据是 `P0.05` 的 WGC 回读**墙钟** 1.2–2.5 ms/帧 @1280×960（按 10 Hz 折合 ≤ 2.5% 单核），它是墙钟而**不是 CPU 时间**，也不含 WGC 采集与 D3D11 拷贝 ⇒ 不得当作本行的答案 | ≤ 25% | 需要 `E-PERF-1` 之外的装置（进程 CPU 时间 / 墙钟 + 真实 WGC 采集），见 `§23.3.2`"明确未取得" |
@@ -5390,10 +5442,11 @@ crates/snapclip-capture/src/scroll/
 ├── loop_control.rs     # ScrollDriver：注入→等待→估计→提交→预览 的闭环（§3.6/§9.4）
 ├── ports.rs            # 平台接缝：FrameSource / ScrollActuator（P3.09 落点，见 §27.1.1）
 ├── export.rs           # 导出接缝：RowBandSink / RowBandWriter（P4.01 落点，见 §17.7.2）
-└── preview.rs          # PreviewStream + PreviewUpdate + 缩略派生（§19.3）
+├── preview.rs          # PreviewStream + PreviewUpdate + 缩略派生（§19.3）
+└── panel.rs            # 预览面板的模型：八问的答案 + 视口框几何（P5.03 落点，见 §19.4.1）
 ```
 
-**这份清单是计划，不是现状**（`P4.01` 回填时核对）：`bands.rs` 与 `target.rs` **从未成为独立文件**（`BandStore`/`MemoryBudget`/`SpillRef` 落在 `canvas.rs:158/301/370`，全仓不存在 `ScrollTarget` 类型），而 `ports.rs`/`export.rs` 是执行时新增的。**权威是门禁**：`pwsh tools/check-dependency-direction.ps1` 会打印 `checked crates/snapclip-capture/src/scroll: N files scanned for platform references`，`P4.01` 落地后该数字是 **13**（10 个生产文件 + test-only 的 `testkit.rs`/`acceptance.rs`/`perf_probe.rs`）。
+**这份清单是计划，不是现状**（`P4.01` 回填时核对）：`bands.rs` 与 `target.rs` **从未成为独立文件**（`BandStore`/`MemoryBudget`/`SpillRef` 落在 `canvas.rs:158/301/370`，全仓不存在 `ScrollTarget` 类型），而 `ports.rs`/`export.rs`/`panel.rs` 是执行时新增的（`panel.rs` 见 §19.4.1：`P5.03` 才发现"八问的答案"需要一个没有位置的家）。**权威是门禁**：`pwsh tools/check-dependency-direction.ps1` 会打印 `checked crates/snapclip-capture/src/scroll: N files scanned for platform references`，`P4.01` 落地后该数字是 **13**、`P5.02` 是 **15**、`P5.03` 是 **16**（10 个生产文件 + test-only 的 `testkit.rs`/`acceptance.rs`/`perf_probe.rs`/`alloc_probe.rs`/`mem_probe.rs`）。
 
 **新增（test-only，不进生产二进制）**：
 
@@ -5761,9 +5814,9 @@ fn rows_match(actual, expected, sigma) -> bool
 
 | 场景 | 输入 | 预期结果 | 自动化 | 性能指标 |
 |---|---|---|---|---|
-| 八问可答 | 会话进行 10 步 | §19.1 的八项都有确定值 | L2 | — |
-| 视口框三态 | 构造 `Confirmed`/`Uncertain`/`Ended` | 外观与 §19.4 一致 | L2 | — |
-| 视口框下限 | 100,000 px 画布 | 框高 ≥ 4 DIP（始终可见） | L2 | — |
+| 八问可答 | 会话进行 10 步 | §19.1 的八项都有确定值 | L2 | — （`P5.03`：`Answers` 八个具名字段，10 步后逐项断言；见 §19.4.1） |
+| 视口框三态 | 构造 `Confirmed`/`Uncertain`/`Ended` | 外观与 §19.4 一致 | L2 | — （`P5.03`：`ViewportAppearance`，虚线 + 灰 + 角标计数；"不是红"断言为 `r <= g && r <= b`；见 §19.4.1） |
+| 视口框下限 | 100,000 px 画布 | 框高 ≥ 4 DIP（始终可见） | L2 | — （`P5.03`：条带 220 DIP / 视口 1080 行时 `10_000` ⇒ 23 DIP、`100_000` ⇒ 比值 2 被抬到下限 **4**；另断言框两端始终落在条带内） |
 | 预览窗口化 | 100,000 px 画布 | **不生成整图缩略**；只生成可见窗口 | L1 | **Memory**（`P5.02` 实测：64 px 宽、`scale = 4`、窗口 640 行 ⇒ 10,000 行与 100,000 行两块画布的缩略内存**相等**，各 10,240 B；整图缩略会是 1,600,000 B，见 §19.2.1） |
 | 拖动后停止跟随 | 拖动 ⇒ `set_follow(false)`；"回到最新" ⇒ `set_follow(true)` | 进入手动模式（`n = 0`：不注入、不学习）；`follow()`/`manual()` 随之翻转，`phase()` 不变（模式不是相位） | L1 | — |
 | 预览不阻塞采集 | mock 让 UI 消费极慢 | 采集步数不受影响；`dropped > 0` | L2 | — |

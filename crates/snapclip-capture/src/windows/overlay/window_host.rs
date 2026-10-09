@@ -50,6 +50,14 @@ impl OverlayMessageHandler for OverlayController {
                 self.on_refinement_ready();
                 Some(0)
             }
+            SCROLL_READY_MESSAGE => {
+                // The driver published into the preview port; fold it into the panel and let the
+                // render tick paint. The wake-up is the only one this port gets (docs/30 §19.3: the
+                // port deliberately carries no second one), so everything published since the last
+                // wake-up has to be drained here — which is what `on_scroll_ready` does.
+                self.on_scroll_ready();
+                Some(0)
+            }
             WM_HOTKEY => {
                 if (wparam as i32) == hotkey::CAPTURE_HOTKEY_ID {
                     eprintln!("[snapclip][capture] WM_HOTKEY F5 received");

@@ -391,6 +391,8 @@ impl OverlayController {
                 preview_alpha: 1.0,
                 level_badge: None,
                 hint: None,
+                // The panel is UI, so the export preview path gets none of it either.
+                scroll_panel: None,
             };
             let Some(renderer) = self.renderer.as_mut() else {
                 self.cancel("annotation-export-without-renderer");

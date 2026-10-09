@@ -15,6 +15,56 @@ impl OverlayController {
 
     // ---- rendering -------------------------------------------------------
 
+    /// Take over the preview port of a scroll session and start painting its panel (docs/30 §19.3).
+    ///
+    /// The overlay only holds the consumer side: the driver publishes into the same [`PreviewStream`]
+    /// and posts [`SCROLL_READY_MESSAGE`] when it has, which is what makes this a poll rather than a
+    /// callback (`docs/30` §21.4: the message is the only wake-up, and the port deliberately does not
+    /// carry a second one).
+    ///
+    /// Separate from the panel itself so the geometry of the session — the viewport extent, which
+    /// decides how tall the viewport box is — is stated once, when the session is handed over, rather
+    /// than inferred from updates that never carry it.
+    #[allow(dead_code)] // The hand-over is the assembly root's (P6); this end is what P5.03 owes.
+    pub(crate) fn watch_scroll_preview(
+        &mut self,
+        preview: std::sync::Arc<crate::scroll::preview::PreviewStream>,
+        cross_len: u64,
+        extent: u64,
+    ) {
+        self.scroll_preview = Some(preview);
+        self.scroll_panel = Some(crate::scroll::panel::ScrollPanel::new(cross_len, extent));
+        self.invalidate();
+    }
+
+    /// Fold everything the driver has published since the last call into the panel (docs/30 §19.3).
+    ///
+    /// `take` is oldest-first and returns one update at a time — §19.3.2 chose that so a consumer that
+    /// is woken *once* still sees everything, which is exactly this loop. Returns whether anything
+    /// changed, so the caller can decide to repaint instead of repainting blind.
+    pub(crate) fn on_scroll_ready(&mut self) -> bool {
+        let Some(preview) = self.scroll_preview.clone() else {
+            return false;
+        };
+        // The drain is scoped so the borrow of the panel ends before `invalidate`, which needs the
+        // whole controller.
+        let changed = {
+            let Some(panel) = self.scroll_panel.as_mut() else {
+                return false;
+            };
+            let mut changed = false;
+            while let Some(update) = preview.take() {
+                panel.on_update(update);
+                changed = true;
+            }
+            changed
+        };
+        if changed {
+            self.invalidate();
+        }
+        changed
+    }
+
     /// Paint immediately with a full repaint.
     ///
     /// Used only for the synchronous first frame that must land before the window is
@@ -153,6 +203,7 @@ impl OverlayController {
             preview_alpha,
             level_badge,
             hint,
+            scroll_panel: self.scroll_panel.clone(),
         };
         // Live borrow of annotation document avoids cloning items every tick.
         //

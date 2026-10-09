@@ -21,16 +21,18 @@ use ::windows::Win32::Graphics::Direct2D::{
     CLSID_D2D1GaussianBlur,
     D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_OPTIONS_NONE,
     D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1,
+    D2D1_CAP_STYLE_FLAT, D2D1_DASH_STYLE_DASH,
     D2D1_DRAW_TEXT_OPTIONS_NONE,
     D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED,
     D2D1_GAUSSIANBLUR_PROP_BORDER_MODE,
     D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION,
     D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION,
     D2D1_INTERPOLATION_MODE_LINEAR, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
-    D2D1_LAYER_PARAMETERS1, D2D1_PROPERTY_TYPE_UNKNOWN, D2D1_ROUNDED_RECT,
+    D2D1_LAYER_PARAMETERS1, D2D1_LINE_JOIN_MITER, D2D1_PROPERTY_TYPE_UNKNOWN, D2D1_ROUNDED_RECT,
+    D2D1_STROKE_STYLE_PROPERTIES,
     D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1_ELLIPSE,
-    ID2D1Bitmap1, ID2D1DeviceContext, ID2D1Effect, ID2D1Geometry, ID2D1Image,
-    ID2D1SolidColorBrush,
+    ID2D1Bitmap1, ID2D1DeviceContext, ID2D1Effect, ID2D1Factory, ID2D1Geometry, ID2D1Image,
+    ID2D1SolidColorBrush, ID2D1StrokeStyle,
 };
 use ::windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use ::windows::Win32::Graphics::DirectWrite::{
@@ -59,6 +61,10 @@ use crate::ring_contrast::{
 };
 use crate::geometry::{
     Handle, LevelReach, MagnifierConfig, Point, Rect, SizeLabelPlacement,
+};
+use crate::scroll::panel::{
+    CANCEL_TEXT, PANEL_LINE_HEIGHT_DIP, PANEL_MARGIN_DIP, PANEL_RADIUS_DIP, PanelLayout,
+    ScrollPanel, STOP_TEXT, UNADOPTED_RGB,
 };
 
 /// The font family used for the size label, per the tasklist (§6.3).
@@ -268,6 +274,18 @@ pub struct RenderView {
     pub level_badge: Option<LevelReach>,
     /// One-shot hint in back-buffer coordinates (docs/21 §5.21).
     pub hint: Option<(Point, String)>,
+    // ── Scroll capture (docs/30 §19.7) ────────────────────────────────────────
+    /// The scroll session's panel, when one is running (docs/30 §19.1/§19.4/§19.7).
+    ///
+    /// The model owns the eight answers and the box geometry; this layer paints what it says and
+    /// decides nothing. `None` for every other capture mode — and, importantly, on the export path:
+    /// the artifact is cut from the captured frame, so a panel drawn into it would be a panel burned
+    /// into the user's image.
+    ///
+    /// `pub(crate)` rather than `pub` on purpose: the type is crate-internal (`scroll::panel` is not
+    /// a boundary module), and widening it to satisfy a field of a `pub` struct would make it public
+    /// API for no reason.
+    pub(crate) scroll_panel: Option<crate::scroll::panel::ScrollPanel>,
 }
 
 impl RenderView {
@@ -301,6 +319,7 @@ impl RenderView {
             capture_green: 0.0,
             level_badge: None,
             hint: None,
+            scroll_panel: None,
         }
     }
 
@@ -425,6 +444,23 @@ pub struct OverlayRenderer {
     ann_stroke_brush: Option<ID2D1SolidColorBrush>,
     /// Mutable fill brush reused for filled annotation items.
     ann_fill_brush: Option<ID2D1SolidColorBrush>,
+    // ── Scroll panel (docs/30 §19.7) ──────────────────────────────────────────
+    /// The panel's backdrop: near-black at high alpha, so the frozen frame behind it cannot make
+    /// the status text unreadable.
+    scroll_panel_brush: Option<ID2D1SolidColorBrush>,
+    /// The thumbnail strip's well — darker than the panel so the strip reads as a window.
+    scroll_strip_brush: Option<ID2D1SolidColorBrush>,
+    /// The viewport box when the last step was adopted (docs/30 §19.4's `Confirmed` outline) and
+    /// the outline of the two buttons.
+    scroll_box_brush: Option<ID2D1SolidColorBrush>,
+    /// The viewport box when the last step was **not** adopted: §19.4 draws that state dashed, and
+    /// the colour has to match the action the user has to take — which is none, so it is a neutral
+    /// grey rather than the red PixPin uses for the same reading.
+    scroll_unadopted_brush: Option<ID2D1SolidColorBrush>,
+    /// Dash pattern for the unadopted viewport box. Built once; rebuilt only with the other
+    /// resources, because `CreateStrokeStyle` needs the factory and the factory cannot move between
+    /// threads (docs/30 §21.5).
+    scroll_dash_style: Option<ID2D1StrokeStyle>,
     metrics: RenderMetrics,
     size: (u32, u32),
 }
@@ -483,6 +519,11 @@ impl OverlayRenderer {
             info_formats: Vec::new(),
             ann_stroke_brush: None,
             ann_fill_brush: None,
+            scroll_panel_brush: None,
+            scroll_strip_brush: None,
+            scroll_box_brush: None,
+            scroll_unadopted_brush: None,
+            scroll_dash_style: None,
             metrics: RenderMetrics::for_dpi(dpi),
             size: (0, 0),
         })
@@ -634,6 +675,7 @@ impl OverlayRenderer {
             preview_is_window: false,
             level_badge: None,
             hint: None,
+            scroll_panel: None,
             ..view.clone()
         };
         let (frame_w, frame_h) = self.size;
@@ -790,6 +832,11 @@ impl OverlayRenderer {
             };
             self.draw_chrome(view, &resources)?;
         }
+
+        // L4: the scroll panel. Above the selection chrome because during a scroll capture the
+        // panel is the only thing the user is interacting with (docs/30 §19.7), and every mode
+        // that is not a scroll capture leaves `scroll_panel` at `None`.
+        self.draw_scroll_panel(view, self.metrics)?;
         Ok(())
     }
 
@@ -1246,6 +1293,171 @@ impl OverlayRenderer {
         )
     }
 
+    // ── Scroll capture panel (docs/30 §19.1/§19.4/§19.7) ────────────────────────────────────────
+
+    /// L4: the scroll session's panel.
+    ///
+    /// The model (`crate::scroll::panel`) owns every number and every word here; this draws what it
+    /// says and decides nothing. Three consequences worth naming:
+    ///
+    /// * the panel is anchored to the **work area**, not the frame, so it stays on screen whatever
+    ///   the capture geometry is;
+    /// * the pieces come from [`PanelLayout`] in DIP and are scaled once, here — the same layout is
+    ///   correct at 100% and at 150%, and nothing in the model has to know the DPI;
+    /// * the viewport box is placed by [`ScrollPanel::viewport_box`], which is proportional, so the
+    ///   strip's size in pixels is all it needs.
+    fn draw_scroll_panel(&mut self, view: &RenderView, metrics: RenderMetrics) -> Result<(), String> {
+        let Some(panel) = view.scroll_panel.clone() else {
+            return Ok(());
+        };
+        let scale = (metrics.dpi as f32 / 96.0).max(1.0);
+        let dip = |value: i32| (value as f32 * scale).round() as i32;
+        let layout = PanelLayout::new();
+        let work = if view.work_area.is_empty() {
+            view.frame
+        } else {
+            view.work_area
+        };
+        let width = dip(layout.panel.width());
+        let height = dip(layout.panel.height());
+        let margin = dip(PANEL_MARGIN_DIP);
+        let left = (work.right - margin - width).max(work.left);
+        let top = (work.top + (work.height() - height) / 2).max(work.top);
+        let place = |rect: Rect| {
+            Rect::new(
+                left + dip(rect.left),
+                top + dip(rect.top),
+                left + dip(rect.right),
+                top + dip(rect.bottom),
+            )
+        };
+
+        let answers = panel.answers();
+        let appearance = panel.appearance();
+        let backdrop = self.require_brush(&self.scroll_panel_brush, "scroll panel brush")?;
+        let well = self.require_brush(&self.scroll_strip_brush, "scroll strip brush")?;
+        let text = self.require_brush(&self.label_text_brush, "label text brush")?;
+
+        unsafe {
+            let radius = dip(PANEL_RADIUS_DIP) as f32;
+            let frame = D2D1_ROUNDED_RECT {
+                rect: to_d2d(place(layout.panel)),
+                radiusX: radius,
+                radiusY: radius,
+            };
+            self.d2d.FillRoundedRectangle(&frame, &backdrop);
+            self.d2d.FillRectangle(&to_d2d(place(layout.strip)), &well);
+        }
+
+        // Question 1 and question 3. Question 5 is read off the same status line: it says what the
+        // session is doing, and the buttons below say whether it can still be stopped.
+        self.draw_panel_text(place(layout.status), &answers.doing, false, &text)?;
+        self.draw_panel_text(place(layout.amount), &answers.amount, false, &text)?;
+
+        // Questions 2 and 4 share one mark: where the box is, and what its state is. §19.4's three
+        // states differ in dash and colour, never in position — a box that moved when a step was not
+        // adopted would say the reading changed when only the confidence did.
+        let strip = place(layout.strip);
+        let placed = panel.viewport_box(strip);
+        let outline = if appearance.dashed {
+            self.require_brush(&self.scroll_unadopted_brush, "scroll unadopted brush")?
+        } else {
+            self.require_brush(&self.scroll_box_brush, "scroll box brush")?
+        };
+        let dashes = if appearance.dashed {
+            self.scroll_dash_style.clone()
+        } else {
+            None
+        };
+        unsafe {
+            self.d2d.DrawRectangle(
+                &to_d2d(placed),
+                &outline,
+                metrics.border_width,
+                dashes.as_ref(),
+            );
+        }
+        if let Some(discarded) = appearance.badge {
+            // A dashed box says "this step was not adopted"; the number says how many, which is the
+            // part a user cannot reconstruct from the box (docs/30 §19.1, question 4 + G12).
+            let badge = ScrollPanel::badge_text(discarded);
+            let badge_top = placed.bottom + dip(2);
+            let anchor = Rect::new(
+                placed.left,
+                badge_top,
+                strip.right,
+                (badge_top + dip(PANEL_LINE_HEIGHT_DIP)).min(strip.bottom),
+            );
+            if !anchor.is_empty() {
+                self.draw_panel_text(anchor, &badge, true, &outline)?;
+            }
+        }
+
+        // Questions 6 and 7: two buttons with two different promises. They are drawn only while the
+        // session can still be stopped or cancelled — an "ended" panel offering a stop button would
+        // be answering a question nobody can ask any more.
+        if answers.continuing {
+            for (rect, label) in layout.buttons.iter().zip([STOP_TEXT, CANCEL_TEXT]) {
+                let rect = place(*rect);
+                unsafe {
+                    self.d2d
+                        .DrawRectangle(&to_d2d(rect), &outline, metrics.border_width, None);
+                }
+                self.draw_panel_text(rect, label, true, &text)?;
+            }
+        }
+
+        // Question 8. The line is reserved whether or not there is anything in it (see `PanelLayout`).
+        if let Some(trouble) = answers.trouble.as_deref() {
+            self.draw_panel_text(place(layout.trouble), trouble, false, &text)?;
+        }
+        Ok(())
+    }
+
+    /// One line of panel text, vertically centred in `rect`.
+    ///
+    /// The format comes from the same cache as the size label, whose first family is the embedded
+    /// subset — which is what makes the panel's Chinese characters resolve, and what the subset gate
+    /// in `tests.rs` is about.
+    fn draw_panel_text(
+        &mut self,
+        rect: Rect,
+        text: &str,
+        centered: bool,
+        brush: &ID2D1SolidColorBrush,
+    ) -> Result<(), String> {
+        if text.is_empty() || rect.is_empty() {
+            return Ok(());
+        }
+        let (measured, format) = self.measure_label(text)?;
+        let box_rect = if centered {
+            // `measure_label` already returns the text plus symmetric padding, so it is the width to
+            // centre on — no second measurement, and the two cannot disagree.
+            let left = rect.left + ((rect.width() - measured.0) / 2).max(0);
+            Rect::new(left, rect.top, left + measured.0, rect.bottom)
+        } else {
+            rect
+        };
+        let wide = text.encode_utf16().collect::<Vec<u16>>();
+        let target = D2D_RECT_F {
+            left: box_rect.left as f32,
+            top: box_rect.top as f32,
+            right: box_rect.right as f32,
+            bottom: box_rect.bottom as f32,
+        };
+        unsafe {
+            self.d2d.DrawText(
+                &wide,
+                &format,
+                &target,
+                brush,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+        }
+        Ok(())
+    }
+
     fn measure_label(&mut self, text: &str) -> Result<((i32, i32), IDWriteTextFormat), String> {
         let metrics = self.metrics;
         let format = self.label_text_format_mut()?;
@@ -1603,6 +1815,46 @@ impl OverlayRenderer {
         // Annotation brushes: initialised to accent blue; colour set per-item at draw time.
         self.ann_stroke_brush = Some(self.create_brush(&color(0.0, 0.47, 0.83, 1.0))?);
         self.ann_fill_brush = Some(self.create_brush(&color(0.0, 0.0, 0.0, 0.0))?);
+        // ── Scroll panel (docs/30 §19.7) ────────────────────────────────────────────────
+        // The backdrop is darker and more opaque than the label panel: the panel sits over a live
+        // capture and carries whole sentences, so legibility wins over letting the frame through.
+        //
+        // The two box colours are the model's (§19.4): the adopted box is the interface accent, and
+        // the unadopted box is a neutral grey. The grey is the point — PixPin paints this state red,
+        // which reads as "something is wrong, act"; §16.10 continues past the step and the user has
+        // nothing to do, so the colour must not ask for an action nobody needs to take.
+        self.scroll_panel_brush = Some(self.create_brush(&color(0.04, 0.04, 0.05, 0.96))?);
+        self.scroll_strip_brush = Some(self.create_brush(&color(0.0, 0.0, 0.0, 0.55))?);
+        self.scroll_box_brush = Some(self.create_brush(&accent)?);
+        self.scroll_unadopted_brush = Some(self.create_brush(&color(
+            f32::from(UNADOPTED_RGB.r) / 255.0,
+            f32::from(UNADOPTED_RGB.g) / 255.0,
+            f32::from(UNADOPTED_RGB.b) / 255.0,
+            1.0,
+        ))?);
+        // The dashes come from the factory rather than a hand-rolled pattern of short strokes: a
+        // `DrawRectangle` with a stroke style is one call, and the pattern then scales with the DPI
+        // the same way the geometry does.
+        unsafe {
+            let factory: ID2D1Factory = self
+                .d2d
+                .GetFactory()
+                .map_err(|error| super::hresult("ID2D1Resource::GetFactory", &error))?;
+            let properties = D2D1_STROKE_STYLE_PROPERTIES {
+                startCap: D2D1_CAP_STYLE_FLAT,
+                endCap: D2D1_CAP_STYLE_FLAT,
+                dashCap: D2D1_CAP_STYLE_FLAT,
+                lineJoin: D2D1_LINE_JOIN_MITER,
+                miterLimit: 10.0,
+                dashStyle: D2D1_DASH_STYLE_DASH,
+                dashOffset: 0.0,
+            };
+            self.scroll_dash_style = Some(
+                factory
+                    .CreateStrokeStyle(&properties, None)
+                    .map_err(|error| super::hresult("ID2D1Factory::CreateStrokeStyle", &error))?,
+            );
+        }
         Ok(())
     }
 
@@ -1653,6 +1905,11 @@ impl OverlayRenderer {
         self.info_badge_bg_brush = None;
         self.ann_stroke_brush = None;
         self.ann_fill_brush = None;
+        self.scroll_panel_brush = None;
+        self.scroll_strip_brush = None;
+        self.scroll_box_brush = None;
+        self.scroll_unadopted_brush = None;
+        self.scroll_dash_style = None;
     }
 }
 

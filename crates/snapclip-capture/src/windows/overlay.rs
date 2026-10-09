@@ -101,8 +101,6 @@ const WM_OVERLAY_COMMAND: u32 = WM_APP + 17;
 /// loop consumes it — so there is nothing to expose to the application. The offset is checked
 /// against every id that is already taken by
 /// `tests::the_scroll_message_id_collides_with_nothing_that_is_already_posted`.
-// The consumer is the preview wiring (`P5.01`); until it lands, the only user is that test.
-#[allow(dead_code)]
 pub(crate) const SCROLL_READY_MESSAGE: u32 = WM_APP + 45;
 /// Coalescing render cadence in milliseconds (~60 Hz, docs/11 §"约 16ms 渲染节奏").
 /// Mouse and drag input only marks state dirty and arms this one-shot timer; the
@@ -520,6 +518,15 @@ struct OverlayController {
     current_generation: u64,
     /// Window that owned the foreground before the overlay appeared.
     previous_foreground: HWND,
+    /// The scroll session's preview port, once a scroll capture has been handed to the overlay
+    /// (docs/30 §19.3).
+    ///
+    /// `Arc` because the driver thread publishes into it while this thread drains it, and the
+    /// controller only ever holds the consumer side. `None` until [`Self::watch_scroll_preview`].
+    scroll_preview: Option<std::sync::Arc<crate::scroll::preview::PreviewStream>>,
+    /// The panel model the overlay paints (docs/30 §19.1/§19.4/§19.7), folded forward from
+    /// `scroll_preview` on every [`SCROLL_READY_MESSAGE`].
+    scroll_panel: Option<crate::scroll::panel::ScrollPanel>,
 }
 
 impl OverlayController {
@@ -616,6 +623,8 @@ impl OverlayController {
             session_counter: 0,
             current_generation: 0,
             previous_foreground: null_mut(),
+            scroll_preview: None,
+            scroll_panel: None,
         }
     }
 

@@ -77,6 +77,11 @@ pub struct OverlayFrameState {
     /// A one-shot hint in monitor-local coordinates (docs/21 §5.21): the level walk has to be
     /// explained once, or nobody finds it.
     pub hint: Option<(Point, String)>,
+    /// The scroll session's panel, when one is running (docs/30 §19.7).
+    ///
+    /// Carried as the model rather than as pre-computed rectangles so the overlay can hand over a
+    /// panel it just updated without translating it, and so the drawing layer keeps having no opinion.
+    pub(crate) scroll_panel: Option<crate::scroll::panel::ScrollPanel>,
 }
 
 impl OverlayFrameState {
@@ -102,6 +107,7 @@ impl OverlayFrameState {
             preview_alpha: 1.0,
             level_badge: None,
             hint: None,
+            scroll_panel: None,
         }
     }
 }
@@ -239,6 +245,7 @@ impl Win32Renderer {
             preview_alpha: state.preview_alpha,
             level_badge: state.level_badge,
             hint: state.hint.clone(),
+            scroll_panel: state.scroll_panel.clone(),
         };
         self.d2d.render(&view)?;
         self.d2d.present()?;
@@ -291,6 +298,10 @@ impl Win32Renderer {
             capture_green: 0.0,
             level_badge: None,
             hint: None,
+            // The panel is UI, so the artifact gets none of it. `render_export` enforces the same
+            // thing one layer down; this line is the one that keeps the panel out of the pixels even
+            // if that invariant is ever loosened.
+            scroll_panel: None,
         };
         self.d2d.render_export(&view)
     }

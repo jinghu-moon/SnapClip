@@ -59,6 +59,11 @@ pub use observation::Axis;
 
 pub(crate) mod orb;
 
+/// `panel` (`P5.03`) — the eight answers of §19.1 and the viewport box of §19.4, as data. It lives
+/// here rather than beside the drawing code because §28.4 forbids this side of the seam from naming
+/// the platform, and `windows/win/d2d.rs` is a consumer of it rather than a second copy.
+pub(crate) mod panel;
+
 /// `ports` (`P3.09`) — the platform seams: what the driver reads frames from and injects through.
 /// The vocabulary lives here and the implementations live in `windows/`, which is the only shape
 /// that satisfies §28.4's "nothing under `scroll/` may reference the Windows module" while the driver
