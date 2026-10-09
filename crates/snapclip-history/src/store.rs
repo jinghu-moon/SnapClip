@@ -373,7 +373,6 @@ impl Store {
                 preview_text: row.get(3)?,
                 source_app: row.get(4)?,
                 source_exe_path: row.get(5)?,
-                thumbnail: None,
                 payloads: Vec::new(),
                 ocr_status: ocr_status_raw
                     .as_deref()
@@ -395,8 +394,11 @@ impl Store {
                 .collect::<Vec<_>>()
                 .join(",");
             let sql = format!(
+                // `cp.role` orders the payloads but is not selected: the only roles written are
+                // payload kinds (`clip_repository.rs::payload_kind_name`), and `P6.03` deleted the
+                // "thumbnail" role that this query used to look for (docs/30 §19.2, ADR-5).
                 "SELECT cp.clip_id, p.id, p.content_hash, p.kind, p.size_bytes, p.mime_type,
-                        p.width, p.height, cp.role
+                        p.width, p.height
                  FROM clip_payloads cp
                  JOIN payloads p ON p.id = cp.payload_id
                  WHERE cp.clip_id IN ({placeholders})
@@ -431,11 +433,7 @@ impl Store {
                         _ => None,
                     },
                 };
-                let role: String = row.get(8)?;
                 let summary = &mut summaries[indexes[&clip_id]];
-                if role == "thumbnail" {
-                    summary.thumbnail = Some(payload.clone());
-                }
                 summary.payloads.push(payload);
             }
         }

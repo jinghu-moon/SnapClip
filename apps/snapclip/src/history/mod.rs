@@ -6,5 +6,6 @@
 pub mod card;
 pub mod icons;
 pub mod model;
+pub mod preview;
 pub mod rich;
 pub mod view;

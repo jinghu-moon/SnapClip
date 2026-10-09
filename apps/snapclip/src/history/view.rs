@@ -31,6 +31,7 @@ use crate::events::EventBus;
 use super::card::{PREVIEW_CHARS_PER_LINE, PREVIEW_LINES};
 use super::icons::SourceIcons;
 use super::model::HistoryState;
+use super::preview;
 use super::rich::{Span, spans_to_lines, spans_to_text, styled_line};
 
 /// Row height in pixels. Fixed so the virtual list can size the scroll range without
@@ -379,7 +380,13 @@ impl HistoryView {
             return;
         };
         let decoded = match self.state.image_bytes(&item) {
-            Some(Ok(bytes)) => Some(Arc::new(Image::from_bytes(ImageFormat::Png, bytes))),
+            Some(Ok(bytes)) => match preview::row_preview_png(&bytes) {
+                Ok(preview) => Some(Arc::new(Image::from_bytes(ImageFormat::Png, preview))),
+                Err(error) => {
+                    eprintln!("[snapclip-app] history preview failed for {clip_id}: {error}");
+                    None
+                }
+            },
             Some(Err(error)) => {
                 eprintln!("[snapclip-app] history preview failed for {clip_id}: {error}");
                 None
@@ -1061,7 +1068,6 @@ mod tests {
             preview_text: Some("hello".into()),
             source_app: Some("Windows Terminal".into()),
             source_exe_path: None,
-            thumbnail: None,
             payloads: vec![PayloadRef {
                 payload_id: "payload-1".into(),
                 content_hash: "hash-1".into(),

@@ -3388,7 +3388,7 @@ tile  class      weight   observations
 
 **为什么必须比较**：用户明确要求"不能简单把完整 Bitmap 放入 UI"，并且要说明"为什么需要它"。
 
-**"为什么需要"的实证依据**（不是类比）：§5 已确证 SnapClip 今天的**历史缩略图路径把整张原图读进内存**（`store/clip_repository.rs:111-118` 从不写 `role == "thumbnail"`，`store.rs:434-437` 的缩略图分支是**死分支**，`history/model.rs:178-187` 的 `load_thumbnail` 读全量字节，`view.rs:44 THUMBNAIL_PX = 32.0`）——**一条 30 万像素高的截图会让列表行加载约 2 GiB**。同一条约束在滚动截图的预览上更严重，因为预览需要在**采集过程中**持续更新。
+**"为什么需要"的实证依据**（不是类比）：§5 已确证 SnapClip 今天的**历史缩略图路径把整张原图读进内存**（`store/clip_repository.rs:111-118` 从不写 `role == "thumbnail"`，`store.rs:434-437` 的缩略图分支是**死分支**，`history/model.rs:178-187` 的 `load_thumbnail` 读全量字节，`view.rs:44 THUMBNAIL_PX = 32.0`）——**一条 30 万像素高的截图会让列表行加载约 2 GiB**（**已由 `P6.03` 修复：死分支与死字段被删除，读取改成窗口化，见 §19.2.2**）。同一条约束在滚动截图的预览上更严重，因为预览需要在**采集过程中**持续更新。
 
 | 方案 | 内存（100,000 px 高、1500 px 宽的内容） | 更新成本 | 是否可交互 | 实现复杂度 | 判断 |
 |---|---|---|---|---|---|
@@ -3438,6 +3438,50 @@ tile  class      weight   observations
 **一处文档勘误**：`BandStore::relieve` 的 doc 原写"Returns how many bands went to disk"。本任务起它有**两种去向**（丢弃 / 落盘），因此改为"how many bands left memory"，并把"落盘了几条"指向 `spilled().len()`、把代价指向 `P4.06` 的 `spill_file_bytes()`。
 
 **REFACTOR 的 `grep -c PreviewPatch == 0`**：全仓（`crates/`、`apps/`、`docs/`）实测零命中。这一条**自 `docs/30` 成文起就成立**（`docs/19` 的旧类型从未进过代码），它是一条关于 `docs/19` 的声称，不是本任务删掉了什么——记录在案以免被读成"本任务做了什么"。
+
+#### 19.2.2 落地（`P6.03`，2026-10-09）：历史行的预览是窗口，不是那张原图
+
+**这一段删除的三段式（§33.1 `D-13` 原文）**：当前抽象导致"缩略图被当成一种**存储角色**（`role == "thumbnail"`），而没有任何人写这个角色，于是读者退化成'读全量原图当缩略图'——一条 30 万像素高的截图会让列表行解码约 2 GiB" → 根本原因是"**存储单位与展示单位混为一谈**：预览被建模成第二种资产，而不是同一份像素的一个窗口" → 因此删除"缩略图作为一种角色/字段"，长图缩略**必须**走窗口化路径。
+
+**删除的半场**（两处，都是"名字还活着但没有真身"的地方）：
+
+| 位置 | 事实 |
+|---|---|
+| `crates/snapclip-history/src/store.rs` 的 `if role == "thumbnail"` | 唯一的角色写入者是 `store/clip_repository.rs` 的 `INSERT OR IGNORE INTO clip_payloads(clip_id, payload_id, role)`，第三个参数是 `payload_kind_name(&input.payload.kind)`——`text`/`html`/`rtf`/`image`/`files`/`other`，**永远不是 `thumbnail`** ⇒ 分支不可达 |
+| `crates/snapclip-model/src/history.rs` 的 `pub thumbnail: Option<PayloadRef>` | 全仓除"写 `None`"（`store.rs` 与 `view.rs` 的构造点）之外**零读者** |
+
+查询里那一列 `cp.role` 同时被删掉（它只喂给那个分支），`ORDER BY cp.role, p.id` 保留——顺序是这条查询唯一还需要角色的地方。
+
+**替代的半场**：`apps/snapclip/src/history/preview.rs::row_preview_png(source) -> Result<Vec<u8>, PreviewError>`。历史行的预览从"把 payload 交给渲染器"变成"**流式解 PNG、只取窗口、重新编码**"：
+
+- `PREVIEW_MAX_PX = 128`（与 §19.2.1 的 `PREVIEW_TARGET_PX` 同一个数，"预览有多大"只有一个答案）；
+- `scale = ceil(width / 128)`（整数倍），窗口 = `min(height, 128 × scale)` **源行**⇒ 输出至多 `128 × 128`；比这短的图整张都在窗口里（普通截图就是这一支），比这长的图取**顶部**（列表行里认得出的是页首，居中会让它依赖一个行本身画不出的高度）；
+- `scale × scale` **盒式滤波**（最近邻会把一页文字在 128 px 上变成噪点；分数缩放会让块宽沿行漂移），逐行累积、一行走完就写进输出，**峰值只有一个输出行**；
+- 出口用与导出路径同一条编码决策（`png::Compression::Balanced` + `Filter::Up`，§22.4.1）。
+
+**RED 的形状（诚实记录）**：这个函数是被**抽出来时带着今天的行为**的——`Ok(source.to_vec())`，也就是 `view.rs::load_thumbnail` 把 `image_bytes` 直接交给 `Image::from_bytes` 的那条路。抽出来不是为了修，而是为了让"行交给渲染器的是预览"变成**一个函数的性质**而不是一个 `gpui` 渲染上下文的性质（没有渲染上下文，缺陷不可观测）。首跑失败逐字（`apps/snapclip/src/history/preview.rs`，日志 `docs/Temp/p603-d13-red.txt`）：
+
+```
+the row hands the renderer a 256x20000 image, and the row draws it in a 128 px box:
+the artifact is 256x20000 (19 MiB of RGBA once the renderer decodes it),
+and a scroll capture is 1058x502649 (2028 MiB)
+```
+
+**实测**（日志 `docs/Temp/p603-d13-memory.txt`，`cargo test --release -p snapclip-app --test history_preview_memory -- --ignored --nocapture`；256×20,000 的夹具，解码后 20,480,000 B）：
+
+| 量 | 值 |
+|---|---|
+| 源载荷（压缩的 PNG） | 60,710 B |
+| 产物（128×128） | 397 B |
+| **峰值常驻** | **829,702 B（810 KiB）**——预算 `PEAK_BUDGET = 4 MiB` 的 20%，整图解码的 **4%** |
+| **"至少一张整图那么大"的分配次数** | **0**（阈值 20,480,000 B） |
+| 测量结束后的常驻 | 126,102 B |
+
+两条断言是**两条不同的**声称（与 `P4.03` 的 `export_path_copies.rs` 同形）：峰值单条可以被"一次大分配但很早释放"满足，计数单条可以被"很多小分配"满足；§19.2 声称窗口就是全部，因此计数断言 **0**。
+
+**同一改动的另外两条 L1 断言**（`preview.rs` 的 `mod tests`）：`the_row_preview_is_a_window_not_the_artifact`（只读产物头部断言两个维度都 ≤ 128）、`the_preview_carries_the_pixels_of_the_window`（四象限颜色落在正确的位置——"尺寸对"本身可以被一张空白图满足）、`the_window_is_the_top_of_a_tall_page`（2,000 行里前 256 行是白、其余是黑 ⇒ 预览均值必须是 `0xFF`；整图平均会是暗灰）。
+
+**一处仍然存在的界（不许被读成已解决）**：`HistoryStore::read_payload_bytes` 仍然把**整份压缩载荷**交给调用者——这里的 60,710 B，真实超长产物则是整份文件。本任务证明的是**解码侧**有界（窗口），**读取侧**不变；把载荷读取也改成流式需要作家线程协议上的一个流式读取口，属另一条战线，记为 `OQ-25`。它比解码侧的代价小一到三个数量级（压缩载荷 vs 2 GiB RGBA），但"有界"这个词今天只对其中一半成立。
 
 ### 19.3 `PreviewStream`：有界 latest-only 增量通道
 
@@ -6555,6 +6599,8 @@ fn rows_match(actual, expected, sigma) -> bool
 | **OQ-22** | **闭环在越冲方向上不可恢复**（`P3.09` 实测，DEV-53）：页面每步前进多于 `ĝ` 预期时，匹配成功（`zncc2d = 1.0`）但门一 `is_verifiable` 拒绝（`overlap_ratio < RHO_MIN = 0.35`）⇒ 步被丢弃 ⇒ §16.6 规则 2 禁止从非确认步学习 ⇒ `ĝ` 不动 ⇒ 下一步同样越冲。真增益 72（`ĝ₀ = 60` 的 1.2×）⇒ `committed()` **恒为 0**；对 `V = 900`、9 格而言，真增益 > **65 px/格（8%）** 即触发 | 出口有两条，都要新实验：① **更小的首步**——`ĝ` 的启动值或首步上限（`Control::new` 的 `starting_px_per_notch(lines, height)` 是唯一入口，今天 `(3, 20) ⇒ 60`）；② **§15.6 的多尺度金字塔**（与 `OQ-20` 是同一个候选，但触发机制不同：`OQ-20` 是"别名在窗内"，这里是"真值在窗外"）。**不要**动 `RHO_MIN`——它是 `P1.08` 的实测标定值，改它会把 `P1` 的验收结论一起改掉 | 加一条**越冲用例**（真增益 ≥ 1.1×，`V = 900`），判据 = `committed() >= 1`（今天恒 0）；三臂对照：①今天的 `ĝ₀ = 60` ②首步上限（如 4 格）③多尺度金字塔。另需重跑 `P3.05` 的 `E-CTRL-1` 收敛性表——它是在"每步都能确认"的假设下量的，而这个假设在越冲方向上是假的 | `P3.05` 的 `E-CTRL-1` 收敛性声称（§13.2.1）；§15.6 的"多尺度"行；`Control::new` 的启动值 |
 | **OQ-23** | `RegionModel` 的**逐 tile 权重今天没有生产消费者**（`P3.09` 实测，DEV-54）：`score_candidates_2d`（`displacement.rs:1168`）内部用 `supporting_tiles(...)` 计数与 `score_of(zncc2d, gain, coverage_of(tiles))` 打分，**没有权重入口**，所以 `RegionModel::weight`（`:2166`）与 `region_evidence`（`:2239`）是"已实现但未接线"。§27.3 的 `estimate` 草图按 §18.2 给它留了 `&mut RegionModel` | 接线会改动 `P1.06` 校准过、被 `E-ACC-1` 覆盖的 `score_candidates_2d`/`supporting_tiles` ⇒ **必须配一次独立的 `E-ACC-1` 全量重跑**（今天全量网格是 `wrong 0`，接线后必须仍是 0），不能顺手做 | 三臂对照：①今天（无权重）②乘法式权重（`region.rs` 的 clamp[0.1, 2.0] 形状）③`snow-apps` 的 `MIN_INLIER_TILES` 式硬门限。判据 = 全量网格 `wrong == 0` 且 `bytes_wrong == 0` 不退化 | §18.2 的三分类模型；§27.3.1 的 `estimate` 签名；`RegionModel` 是否要保留 |
 | **OQ-24** | **`Scroll Response` 与 `Stop latency` 的目标值未达成，而两条的原因都是"阈值推导时少算了一项"**（`P5.06` 实测，`§23.3.4`）：① `Scroll Response`——§23.3 把"一次稳定性等待"记成 2 个 `RENDER_TICK_MS`（30 ms），实现出来的规则是 `STILL_WINDOW = 40 ms` **加**两个 tick ⇒ 地板 ~66–70 ms；32 次运行（27 份报告）实测 P50 = 69.9–78.9 ms（目标 30 ms 的约 **2.3×**）、P95 = 70.2–103.7 ms（80 ms 阈值的 **88–130%**，27 份里 2 份越界）。② `Stop latency`——推导只算了"提交导出任务"，漏了"当前这一步剩余的等待"（停止的发现粒度是 settle）⇒ 实测 3.5–52.0 ms（目标 P50 ≤ 20 ms 的 1.6–2.6×） | 三条出口，全都要**真机数据**才能裁决：① **降 `STILL_WINDOW`**（40 → 20 ms？）——它同时是"两次读一致"的判据，降它会把"页面还在动"误判成静止，必须先在真实页面上量"两次读之间内容真的没变"的持续时间分布；② **放宽目标值**（如 P50 ≤ 70 ms）——但要先给出"为什么 70 ms 对用户算跟手"的依据，今天没有任何依据能支持这个声称；③ **把稳定性判据从"等一个静止窗"改成"位移收敛即静止"**（`|d|` 连续两次近似相同就停止等待）——这会改动 `P3.03` 校准过的 `Settle`，而且要重跑 `E-CTRL-1` | `P6.08` 的真机复跑（多档窗口尺寸 + 真实页面）；`E-CTRL-1` 的收敛步数表（在"静止判定更快"的假设下要重跑）；§16.5 的稳定性判据行；`loop_control.rs` 的 `STILL_WINDOW` 与 `Settle`。**与 `OQ-22` 相邻**：更小的首步与更快的静止判定都会改变对方的输入。**附注**：32 次运行里另有 3 次快速失败（最可能是"会话先于停止结束"）未被解释，见 `§23.3.4` 的未取得清单 |
+
+| **OQ-25** | **历史行预览的"有界"只对解码侧成立**（`P6.03` 实测，`§19.2.2`）：`row_preview_png` 已经把解码侧关死在窗口里（256×20,000 的夹具：峰值 810 KiB、整图级分配 0），但它拿到的仍然是**整份压缩载荷**——`HistoryStore::read_payload_bytes` 发给作家线程的是一个"读完整个 payload 再回传"的请求（`store.rs` 的 `WriterRequest::ReadPayloadBytes`）。夹具的载荷是 60,710 B，真实超长产物是整份文件；"有界"这个词今天只对其中一半成立 | 证据缺口：今天没有"一份真实的超长产物在历史列表里的端到端代价"的测量（载荷字节数、读取耗时、行渲染耗时）。三条出口：① 给作家线程协议加一个流式/分片读取口（`ReadPayloadChunk` 或按范围读）；② 让载荷读取也走"窗口"——先读文件头得到尺寸，再按需要读若干 IDAT 段（PNG 是顺序的，这条比 ① 更贴近问题）；③ 接受并记录（压缩载荷比解码侧小 2–3 个数量级）| 判据 = 一次真实产物（≥100,000 px 高）进历史列表的测量：进程峰值常驻、读取耗时、行渲染耗时。先量再选；没有测量时**不许**把 ③ 写成结论 | `§19.2.2` 的实测表；`store.rs` 的 `read_payload_bytes` 与 `WriterRequest`；`crates/snapclip-history/src/store.rs` 的 `payloads/` 目录布局 |
 
 ### 36.3 明确**不是**开放问题的（已经确定，记录以防反复）
 

@@ -9,6 +9,10 @@ use crate::recognition::{OcrErrorCode, OcrStatus};
 /// It carries everything a row needs, so the front-end never has to compose payload, OCR
 /// and source metadata itself. Serialised to the front end and mirrored in
 /// `src/shared/contracts.ts`.
+///
+/// There is deliberately no `thumbnail` field. `P6.03` deleted it together with the payload role
+/// nothing ever wrote (`docs/30 §19.2`, `ADR-5`): a row's preview is **derived** from the image
+/// payload it already has, not a second stored artifact that has to be kept in step with it.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ClipSummary {
@@ -19,7 +23,6 @@ pub struct ClipSummary {
     pub preview_text: Option<String>,
     pub source_app: Option<String>,
     pub source_exe_path: Option<String>,
-    pub thumbnail: Option<PayloadRef>,
     pub payloads: Vec<PayloadRef>,
     pub ocr_status: OcrStatus,
     pub ocr_text: Option<String>,
