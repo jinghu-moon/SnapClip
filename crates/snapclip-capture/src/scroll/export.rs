@@ -38,6 +38,12 @@
 //! `ExportError::TooLarge`/`BeyondHeight`/`RowLength` by the checks `P4.04`/`P4.05` move into the
 //! real sink. Narrowing the vocabulary to what today's call sites construct would make each of
 //! those a breaking change later, for no gain now.
+//!
+//! Everything here is **`pub`**, and that is a `P4.02` correction rather than a preference. `P4.01`
+//! declared the port `pub(crate)` and the shell could then not implement it at all — a port the
+//! composition root cannot name is not a port. It is the same mistake `DEV-54` recorded for §27.1's
+//! public boundary types. The visibility widening lives here, at the seam, rather than in
+//! `lib.rs`: a re-export would have hidden which module actually owns the contract.
 #![allow(dead_code)]
 
 use super::observation::Axis;
@@ -47,18 +53,18 @@ use super::observation::Axis;
 /// Dimensions are `u64`, not `u32` (`P4.04`): the session's size domain is `u64` throughout, and a
 /// `u32` field would make "reject a size that does not fit `u32`" impossible to even construct.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ImageMeta {
+pub struct ImageMeta {
     /// Pixels across the scrolling direction — the artifact's width.
-    pub(crate) width: u64,
+    pub width: u64,
     /// Pixels along the scrolling direction — the artifact's height, fixed at `begin`.
-    pub(crate) height: u64,
+    pub height: u64,
     /// The session's total scroll length, which may exceed `height` when the canvas was capped
     /// (§17.6 layer 2). Carried for diagnostics, not for encoding.
-    pub(crate) length: u64,
+    pub length: u64,
     /// Which way the content was scrolled.
-    pub(crate) axis: Axis,
+    pub axis: Axis,
     /// Device pixel ratio, for the consumer that has to turn rows back into CSS pixels.
-    pub(crate) dpr: u32,
+    pub dpr: u32,
 }
 
 /// Why an export stopped before it wrote every row (`docs/30` §17.7 constraint 3, `P4.05`).
@@ -68,7 +74,7 @@ pub(crate) struct ImageMeta {
 /// three are the reasons an *export* itself was cut short, and they are the only three the writer
 /// has to be able to finish anyway.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AbortReason {
+pub enum AbortReason {
     /// The user cancelled while rows were still going out.
     Cancelled,
     /// The canvas hit its memory ceiling and the remaining rows do not exist.
@@ -83,16 +89,16 @@ pub(crate) enum AbortReason {
 /// can be smaller than [`ImageMeta::height`] exactly when `finish` was given an [`AbortReason`],
 /// and the difference is what a UI reports as "N of M rows".
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Artifact {
+pub struct Artifact {
     /// The encoded artifact, ready to be written to a store.
-    pub(crate) bytes: Vec<u8>,
+    pub bytes: Vec<u8>,
     /// Rows present in `bytes`.
-    pub(crate) rows: u64,
+    pub rows: u64,
 }
 
 /// Everything that can go wrong while exporting rows (`docs/30` §26.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ExportError {
+pub enum ExportError {
     /// A dimension does not fit the format's `u32` header field. Refused, **never truncated**
     /// (`P4.04`): a silently shortened image is worse than an error.
     TooLarge { width: u64, height: u64 },

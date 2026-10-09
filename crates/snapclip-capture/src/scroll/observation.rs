@@ -12,9 +12,11 @@ use crate::geometry::Rect;
 /// Every estimator in `scroll/` is written once and parameterised by this; only the pixel movement
 /// forks (§17.8, `N6`).
 // `P1.02` defines the axis before anything consumes it; `P1.05` (layer 1) is the first consumer.
-#[allow(dead_code)]
+//
+// `pub` since `P4.02`: it is the type of `export::ImageMeta::axis`, and a public struct field cannot
+// be of a type the caller cannot name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum Axis {
+pub enum Axis {
     /// The content moves along the viewport's height; the primary component is `dy`.
     Vertical,
     /// The content moves along the viewport's width; the primary component is `dx`.

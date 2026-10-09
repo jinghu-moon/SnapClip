@@ -3100,6 +3100,42 @@ pub trait RowBandWriter {
 
 **`P4.01` 的实测（2026-10-09）**：RED = `error: could not compile `snapclip-capture` (lib test) due to 16 previous errors`（全部 `E0422`/`E0425`/`E0433`，即 trait、三个类型与双实现都不存在——正是"trait 未定义"）→ GREEN = **3 passed / 0 failed**；`cargo tree -p snapclip-capture -e normal` **无 `png` 行**；`cargo test -p snapclip-capture --lib -- --test-threads=1` = **546 passed / 0 failed / 19 ignored**（90.39s，`+3` 即本任务）。
 
+#### 17.7.3 落地的形状（`P4.02`，2026-10-09）
+
+**落点**：`apps/snapclip/src/capture/row_band_png.rs`（**新建**，`apps/snapclip/src/capture/mod.rs` 注册为 `pub mod row_band_png;`）＋ `apps/snapclip/Cargo.toml` 把 `png = "0.18"` 从 `[dev-dependencies]` **提升为 `[dependencies]`**（这正是 `DEV-6`/`DEV-7` 预告的那一步）。`cargo tree -p snapclip-capture -e normal` **仍然无 `png` 行**，`tools/check-dependency-direction.ps1` 仍报 `checked snapclip-capture: 30 packages`（与 `P3` 时同一数字 ⇒ 提升没有把任何东西带进 capture 的图）。
+
+**第一处修正：端口必须是 `pub`，`P4.01` 的 `pub(crate)` 让 shell 根本无法实现它。** 这是 `DEV-62`。`crates/snapclip-capture/src/scroll/export.rs` 的 11 处 `pub(crate)` 全部改 `pub`（`ImageMeta`/`AbortReason`/`Artifact`/`ExportError` 与它们的字段、以及两个 trait），`scroll/mod.rs` 的 `pub(crate) mod export;` 改 `pub mod export;`，并新增 `pub use observation::Axis;`（`Axis` 自身由 `pub(crate) enum` 改 `pub enum` 并去掉 `#[allow(dead_code)]`）——因为 `ImageMeta::axis` 是公开字段，公开字段的类型不能是调用方叫不出名字的类型。可见性**落在这三个文件里而不是 `lib.rs` 的 re-export**：re-export 会掩盖"契约实际归谁所有"。这与 `DEV-54` 在 §27.1 记的是同一类错误。
+
+**第二处修正：`docs/31:2078` 要求的"`stream_writer()` 借用形态 + `stream.finish()` 再 `writer.finish()`"无法在 `Box<dyn RowBandWriter>` 后面写出来。** 这是 `DEV-61`，是 `png` 0.18.1 的事实而不是偏好：
+
+| 事实（`png-0.18.1/src/encoder.rs`） | 后果 |
+| --- | --- |
+| `Writer::stream_writer(&mut self) -> Result<StreamWriter<'_, W>>`（`:1066`） | `Writer` 与借它的 `StreamWriter` 必须**同存于一个被返回的 `'static` 对象**里 ⇒ 自引用结构；`self_cell`/`ouroboros` 是新依赖（`N7` 禁止） |
+| `Writer::into_stream_writer(self) -> Result<StreamWriter<'static, W>>`（`:1086`） | 需要 `W: 'static`，所以对 `&mut Vec<u8>` 是 `E0310`——**任务书这句是对的** |
+| `StreamWriter::finish(mut self) -> Result<()>`（`:1606`） | 返回 `()`，**把内层 `Writer` 丢掉** ⇒ 没有第二个值可以再调 `writer.finish()` |
+| `impl Drop for Writer<W>`（`:1115-1119`）里 `let _ = self.write_iend();` | **IEND 仍然会被写出** ⇒ 终态与任务书要的一致，代价只是错误被吞（本 sink 的 `W` 不可失败） |
+
+**采用的形状**：`W` 是一个 `'static` 的共享句柄 `SharedVec(Arc<Mutex<Vec<u8>>>)`（实现 `std::io::Write`，`flush` 恒 `Ok(())`）。`sink.begin()` 里 `encoder.write_header()?`（**IHDR 在此固定，即 `F-12`**）→ `writer.into_stream_writer()?`，sink 保留 `Arc` 的一份克隆；`finish()` 调 `stream.finish()`（刷出尾部 IDAT）之后，用 `Arc::try_unwrap` 把字节**搬出**而不是拷贝（`Err` 分支退回克隆，因此成功路径不会因为共享而被判失败）。用 `Arc<Mutex<_>>` 而不是 `Rc<RefCell<_>>`：`RowBandWriter` 没有 `Send` 约束，但锁只在**每 4 KiB 块**取一次，保留可跨线程的性质不花任何可测成本。`PngRowBandSink` 本体只持配置（`Compression::Balanced` + `Filter::Up`，§17.7.1 选定），因此它满足 `RowBandSink: Send`。
+
+**第三处裁决（`DEV-63`，交 `P4.05`）：短写在 PNG 里不可能是一个合法文件。** `StreamWriter::finish()` 在 `to_write > 0` 时先返回 `FormatErrorKind::MissingData`（连 flush 都不做），而 IHDR 的高度在 `begin` 时已经写死 ⇒ "声明 M 行只写 N 行"产出的不是一张更小的图，而是一个**损坏的文件**。`P4.01` 的契约双实现允许这种短写（`finish_after_abort_still_produces_a_decodable_artifact()`），真实 sink 不能。本任务的裁决 = `finish` 在 `next_row != meta.height` 时返回 `ExportError::Sink(...)`，**不吞错、不补行、不伪造**；合法的 `Partial` 来自 `P1.21` 在 `begin` **之前**就把画布裁到实际行数（那时 height 本来就等于实写行数）。`AbortReason` 因此退化为"这张画布是前缀"的**标注**，而不是一个 sink 要去满足的请求。
+
+**BGRA→RGBA 是 sink 的责任，且逐行做**：PNG 没有 BGRA，§17.7 规定端口上的行是紧凑 BGRA8，所以 `write_rows` 用**一行 scratch**（`width * 4` 字节）做 swizzle。既有路径 `crates/snapclip-history/src/image.rs:60/65`（`encode_png` → `bgra_to_rgba` → `encode_rgba_png`）做的是**整图**拷贝，那正是 `P4.03` 要删掉的四份拷贝之一。
+
+**尺寸的转换必须被检查**：`png::Encoder::new` 收 `u32` 而 `ImageMeta` 是 `u64`（`P4.01` 为 `P4.04` 刻意如此）⇒ `begin` 用 `u32::try_from(...).map_err(|_| ExportError::TooLarge { .. })?`，**不写 `as u32`**（`P4.04` 的退出条件 ③ 是 `grep -c "as u32" apps/snapclip/src/capture/` 为 0）。
+
+**`P4.02` 的实测（2026-10-09）**：
+
+| 项 | 值 |
+| --- | --- |
+| RED | `error: could not compile `snapclip-app` (lib test) due to 6 previous errors`（全部 `E0433`/`E0599`，即 `PngRowBandSink` 不存在；日志 `docs/Temp/p402-red.txt`） |
+| GREEN（L2） | `cargo test -p snapclip-app --lib row_band_png` = **2 passed / 0 failed**（`the_artifact_decodes_back_to_the_expected_pixels`、`the_selected_filter_is_the_one_p0_04_measured`） |
+| GREEN（L4） | `cargo test --release -p snapclip-app --test png_row_band_memory -- --ignored --nocapture` = **1 passed / 0 failed**，`[P4.02] 1280x30000 raw 153600000 B (146 MiB), artifact 325095 B (317 KiB), export path peak-live 906630 B (885 KiB)`（0.24s；日志 `docs/Temp/p402-l4.txt`） |
+| 依赖方向 | `tools/check-dependency-direction.ps1` = clean，capture **30** packages、`scroll/` **13** files；`cargo tree -p snapclip-capture -e normal` 无 `png` 行 |
+
+**L4 的判据形状**（写在这里，因为它是 `E-MEM-1`（`P4.07`）的前身）：调用方的条带缓冲在**测量之前**分配，所以 `peak − live` 量的是**导出路径自己加的**那一份；断言两条——① `extra ≤ 2 × artifact.len() + 16 × row_bytes + 256 KiB`（`Vec` 增长时会让产物瞬时存在两份，`2 ×` 就是这一步；编码器自己的开销是 `StreamWriter` 的三行缓冲 + 4 KiB 块缓冲）② `artifact.len() < raw_len / 4`（夹具必须真的像文档页；一个 materialize 整图的实现两条都会失败）。**与 `P0.04` 的差别**：`P0.04` 用一个不分配的 `CountingSink` 把产物排除在外，所以它能断言 `< 1 MiB` 的绝对上限；本任务测的是**端口**，产物必然在路径里， поэтому上限只能相对产物表达。
+
+**一条被本任务改掉的 `docs/31` 期望**：§15.1 的依赖表写「`git diff --stat apps/snapclip/Cargo.toml` 在 `P4.02` 期间**应为空**」，而 `DEV-6`/`DEV-7` 的正文又写「`P4.02` 才需要把它提升为 shell 的普通依赖」——两句不能同时成立。**实际做法是后者**（`png = "0.18"` 从 `[dev-dependencies]` 移到 `[dependencies]`，`--stat` 非空），§15.1 那格已按实际改写。
+
 ### 17.8 水平轴
 
 **不写第二套算法**（N6）。§6 的参考实现用**三个 `const fn`**（`primary_delta`/`cross_delta`/`primary_extent`，`types.rs:11-32`）把两轴参数化，全套算法按主轴写一遍，**只有像素搬运分叉**。V2 采用同样做法，并把 §3 的 `Axis` 定义为：

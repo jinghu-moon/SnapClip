@@ -43,11 +43,19 @@ pub(crate) mod displacement;
 /// height is a precondition of the first row rather than something discovered while writing
 /// (§17.7). It sits beside `ports` rather than inside it because `ports` is the **platform** seam
 /// (Windows implements it) while this one is the **output format** seam (`DEV-2`).
-pub(crate) mod export;
+///
+/// Unlike every other module here this one is `pub`, and `P4.02` is why: a port the composition root
+/// cannot name is not a port. `P4.01` declared it `pub(crate)` and `apps/snapclip` could not have
+/// implemented `RowBandSink` at all — the visibility widening is the fix, not a convenience.
+pub mod export;
 
 pub(crate) mod loop_control;
 
 pub(crate) mod observation;
+
+/// [`Axis`] is `pub` for the same reason `export` is: it is the type of `ImageMeta::axis`, so a
+/// caller outside this crate cannot build or read that field without naming it.
+pub use observation::Axis;
 
 pub(crate) mod orb;
 

@@ -39,6 +39,16 @@ encoding_rs = "0.8"
 # implementation GPUI already links, so this adds a direct edge, not a second runtime.
 async-channel = "2.5"
 
+# The scroll export encoder (docs/30 §17.7, docs/31 P4.02). It belongs here and not in
+# `snapclip-capture`: which encoder to use is a decision about the *output format*, not a fact about
+# capturing, and the port the capture crate declares must stay implementable without it.
+# `snapclip-capture` must never see this line — that is `P4.01`'s exit condition ② (`cargo tree -p
+# snapclip-capture -e normal` has no `png` row) and §28.4's direction. 0.18 is the version `image`
+# 0.25 already puts in this graph, so this adds an edge, not a second copy. Promoted from
+# `[dev-dependencies]`, where `tests/png_params_probe.rs` (P0.04) needed it to measure the real
+# encoder rather than a lookalike.
+png = "0.18"
+
 # The tray icon is Win32 (docs/23 T4.6): `gpui-kit` has no tray component, so the shell owns
 # a hidden window and `Shell_NotifyIconW` itself. Same major as `snapclip-capture` already
 # uses, so this adds no second copy of the bindings to the graph.
@@ -70,10 +80,3 @@ test-support = ["gpui-kit/test-support"]
 blake3 = "1.5"
 # Same version and source as the normal dependency, with the helpers the guides require.
 gpui-kit = { version = "0.7", features = ["test-support"] }
-
-# Test-only *for now*: `tests/png_params_probe.rs` (docs/31 P0.04) has to drive the encoder
-# that P4.02 will put in this crate, so it measures the real thing rather than a lookalike.
-# P4.02 promotes this line to `[dependencies]` when `PngRowBandSink` lands; `snapclip-capture`
-# must never see it (docs/30 §17.7, docs/31 P4.01). 0.18 is the version `image` 0.25 already
-# puts in this graph, so this adds an edge, not a second copy.
-png = "0.18"
