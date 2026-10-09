@@ -4055,6 +4055,8 @@ impl CaptureSession {
 - **4 个生产调用点**：`providers.rs:110`（全额回读）、`providers.rs:171`（区域回读）、`win/d2d.rs:667`（导出回读）、`renderer.rs:134-135`（`AsyncSampleBuffer::new(device.device(), device.context())`，`d3d11.rs:490` **克隆同一 context**）；
 - **唯一的互斥机制是一个布尔位**：`overlay.rs:507 graphics_released`，置位点 `session.rs:427`（提交导出任务前），复位点 `session.rs:204`/`:281`；`render_submit.rs:99-101` 置位时直接 return。
 
+> **行号已过期**：本节下面这份"4 个调用点"的名单是 `2026-10-08` 的静态核对结果，`P6.04` 实测的真实地图（3 活 + 1 潜伏 + 1 未接线）在 `§21.3.1`。上面两处 `overlay.rs:507`/`session.rs:427` 现为 `overlay.rs:515`/`session.rs:429`。
+
 **V1 §4.2 的表述是"GPU 线程（capture worker）是 immediate context 的唯一使用者"。§4.3.3 的核对结论是：这句话在今天就已不成立**（表中有 4 个调用点，其中 3 个不在 capture worker 上），而 V1 用它推出"必须把滚动管线的匹配搬到 capture worker 上"——**前提不成立，结论也就不成立**。
 
 **V2 采取三步，顺序不可颠倒**：
@@ -4087,9 +4089,13 @@ fn context(&self) -> &ID3D11DeviceContext {
 
 **顺带修正上表的调用点清单**：今天 `.context()` 全仓只有 **2 个**调用点（`renderer.rs:134-135`、`win/d3d11.rs:785` 测试内），回读已改走 `read_back_bgra`（`win/d3d11.rs:323`）与 `read_back_region_bgra`（`win/d3d11.rs:401`）；上表的 `providers.rs:110/171`、`win/d2d.rs:667` 是更早版本的落点。
 
+> **`P6.04` 更正**：`.context()` 的行号实为 `renderer.rs:141` 与 `win/d3d11.rs:820`（测试内）；两条回读函数的实为 `win/d3d11.rs:254` 与 `:315`；`P6.04` 落地后 `.context()` 的生产调用点是 **0 个**（访问器已删）。本句下面的"`P0.02` 的产物"**从未进 `main`**（侧分支 `d1098cb`），`main` 上的守卫是 `§21.3.1` 的形状。
+
 **这次实测把第 2 步的问题域扩大了**：它不只是"导出回读归谁"，而是"**同一个设备被两个长命线程使用**"（capture worker 创建设备并回读，overlay 线程渲染 + 采样）。因此 deferred context 必须覆盖 `AsyncSampleBuffer::submit`/`poll`，或者把交接显式化到放大镜路径上——**`docs/31` 的 `P0.02` 因此标为 `[!]`，阻塞在"第 2 步的选择"上**。
 
 **发布期如何保证（`docs/31` P0.02 要求的第二个交付物）**：断言只在 `debug_assertions` 下存在；**发布期仍然只有 `overlay.rs:507 graphics_released` 这个布尔位在保护**。结论是明确的：**第 2 步要做的是"消除跨线程使用"，而不是"让布尔位更可靠"**——一个布尔位无法覆盖"两个线程都在用同一个 immediate context"这类竞态，它只覆盖了"导出期间 overlay 不画"这一种交错。
+
+> **`P6.04` 修正（这条已被推翻）**："断言只在 `debug_assertions` 下存在"的**前提**是"创建者等式会在合法的生产路径上 panic"——`P6.04` 实测证明那个前提不成立（创建线程从不使用 context，生产里每一处使用都在同一条 overlay 线程上），因此落地的断言**两个 profile 都开**，见 `§21.3.1`。`graphics_released` 布尔位按 `§33.5` 原样保留、未动。
 
 **第 2 步：优先用 deferred context 消除跨线程使用，而不是搬线程。**
 
@@ -4111,9 +4117,64 @@ fn context(&self) -> &ID3D11DeviceContext {
 上面第 2 步要解决的是"同一个设备被两个长命线程使用"。**滚动路径不在这个问题的范围里**，而这件事必须被机械地钉住，否则它只是一句设计意图：
 
 - 滚动驱动线程**不持有** `ID3D11DeviceContext`，一次也不碰。它拿到的是**回读后的字节**（`FrameSource::next` 交出 `Observation`），而回读发生在 capture worker 上——§11.2 的 `ReadRegion` 请求就是这条边界的形状。
+
+> **`P6.04` 更正（这句话的第二个分句是错的）**：回读**不在 capture worker 上**。实测链是 `windows/scroll_source.rs:372`（`WgcFrameBackend::poll_frame`）→ `providers.rs:722 ScrollFrame::read_region` → `providers.rs:639 GpuTransfer::transfer` → `read_back_region_bgra`，而 `WgcFrameBackend::poll_frame` 运行在 `snapclip-scroll-driver` 线程上（`scroll/session.rs:701-709` 起线程，`:706 make_source()`）——**§11.2 的 `ReadRegion` 请求今天没有实现**。今天它不触发新增的断言，只因为整条滚动路径没有生产调用者（见 `§21.3.1` 的第二/第三个使用者行）；接线那一刻，共用设备的滚动驱动会被断言直接拒绝。上面那条"机械保证"（`this_module_never_becomes_a_context_user`）只禁止 `scroll_source.rs` **自己的文本**出现四个针脚，它保证不了"回读不在驱动线程上"。
 - 因此 `windows/scroll_source.rs` **刻意没有** `.context()` / `GraphicsDevice::create` / `read_back_*` 的调用：设备是**从外面传进来的**（`WgcFrameBackend::open(device, handle)`），context 只在 `providers::ScrollFrame::read_region` 内部被触及，而那一层是 §11.2 的 capture-worker 边界。
 - 这条边界由 `this_module_never_becomes_a_context_user`（`crates/snapclip-capture/src/windows/scroll_source.rs` 的测试模块）**机械保证**：它用 `include_str!` 读自己的**生产半区**并断言四个针脚（`.context()`、`GraphicsDevice::create`、`read_back_bgra`、`read_back_region_bgra`）一个都不出现。将来谁想"顺手在滚动路径里读一下纹理"，构建就红。
 - 与 §21.5 的公寓规则同构：两条都是"不要在某处做看起来更直接的事"，所以都留下了一条可执行的钉子而不是一句注释。
+
+#### 21.3.1 落地（`P6.04`，2026-10-09）：不变式的形式与上面的草图**不同**
+
+**落地的不变式**：**每个 `ID3D11DeviceContext` 恰好一个使用者线程，由第一个使用者认领**（而不是"创建该 context 的线程"）。
+
+```rust
+// crates/snapclip-capture/src/windows/win/d3d11.rs
+pub struct GraphicsDevice {
+    d3d: ID3D11Device,
+    context: ID3D11DeviceContext,
+    context_owner: Arc<OnceLock<ThreadId>>,   // Arc：GraphicsDevice 是 Clone，副本必须共享同一个认领
+    d2d: ID2D1Device,
+    dxgi_factory: IDXGIFactory2,
+}
+
+fn owned_context(&self, what: &str) -> &ID3D11DeviceContext {
+    let owner = *self.context_owner.get_or_init(|| std::thread::current().id());
+    assert_eq!(std::thread::current().id(), owner,
+        "{what} ran on a thread that does not own the immediate context; \
+         one ID3D11DeviceContext has exactly one user thread (docs/30 §21.3)");
+    &self.context
+}
+```
+
+`owned_context` **私有**：`pub fn context()` 已删除，理由是"发一个未经断言的句柄**正是**第二个线程能驱动同一个 context 的方式"。`AsyncSampleBuffer` 改为持有 `GraphicsDevice`（`AsyncSampleBuffer::new(&GraphicsDevice)`）并在 `submit`/`poll` 里走 `owned_context`，**`d3d11.rs` 里 `context: context.clone()` 那一行被删掉**——它就是"capture worker → overlay 线程"的使能缺陷。
+
+**三条与上面草图不同的裁决**：
+
+| # | §21.3 草图 | 本次落地 | 为什么 |
+|---|---|---|---|
+| 1 | `context_owner: ThreadId` = **创建该 context 的线程** | **第一个使用者**认领 | 创建线程从不使用 context（见下），@创建者等式在今天既假又不需要成立；D3D11 只要求"同一时刻一个线程" |
+| 2 | 断言只在 `debug_assertions` 下 | **两个 profile 都开** | 草图选 debug-only 的前提（创建者等式会 panic 在合法路径上）已被推翻；UB 防护的成本只是一次原子读，不该发布期缺席 |
+| 3 | 第 2 步先试 `CreateDeferredContext` | **本任务不做 deferred**，先把断言立起来 | `Map`/`Unmap` 是 immediate-context-only 操作，deferred 覆盖不了放大镜取样与两条回读（见下）；§21.3 自己给的第二个分支"把交接显式化"就是本次落地的那一支 |
+
+**为什么"创建者 = 所有者"这个形式是假的（`P6.04` 实测）**：唯一生产创建点是 capture worker（`capture_worker.rs:373` → `providers.rs:375-378 GraphicsDevice::create`），而**那条线程此后一次也不碰 context**——它只用 free-threaded 的 `ID3D11Device`（`CreateTexture2D`、WGC 帧池、帧拷贝）。生产里每一处 context 使用都在 `snapclip-capture-overlay` 线程上。
+
+**为什么 deferred context 覆盖不了放大镜**：`ID3D11DeviceContext::Map`/`Unmap` 是 immediate-context-only 操作，**不能记录进命令列表**；而放大镜取样（`AsyncSampleBuffer::poll`）与两条导出回读都要 `Map`。所以第 2 步的 deferred 路线在原理上只能覆盖"拷贝"，覆盖不了"把字节拿到 CPU"。把回读搬到 capture worker 则会改动 §33.5 明确保护的四条线程及其信箱协议——因此本次选的是"把交接显式化到放大镜路径上"。
+
+**落地后的生产使用者地图**（`P6.04` 实测；与本节上面的旧名单**不同**）：
+
+| 站点 | 所在函数 | 线程 | 状态 |
+|---|---|---|---|
+| `renderer.rs:141` + `d3d11.rs` 的 `submit`(`:520-527`)/`poll`(`:542-561`) | `Win32Renderer::new` / `AsyncSampleBuffer` | `snapclip-capture-overlay` | **活**（第一个使用者 = 认领者） |
+| `providers.rs:253`（`FrozenFrame::read_region`，`read_back_region_bgra`） | `overlay/session.rs:361-366` → `artifact.rs:67` | 同上 | **活**（导出前的同步回读；`session.rs:354-355` 有注释说明它为什么留在这里） |
+| `win/d2d.rs:750`（`render_export` 的回读） | `overlay/session.rs:397-408` → `renderer.rs:306` | 同上 | **活**（带标注的导出） |
+| `providers.rs:191`（`FrozenFrame::pixels`，`read_back_bgra`） | `renderer.rs:199`（`set_frame` 的 CPU 回退分支） | 同上 | **潜伏**：有纹理时 `:191` 先返回，无纹理时 `providers.rs:176-180` 先报错 ⇒ 今天不可达 |
+| `providers.rs:639`（`GpuTransfer::transfer`，`read_back_region_bgra`） | `windows/scroll_source.rs:372` → `scroll/session.rs:706 make_source()` | **`snapclip-scroll-driver`** | **已知的第二/第三个使用者，路径未接线** |
+
+**最后一行是本任务最重要的诚实说明**：滚动路径的回读落在 `snapclip-scroll-driver` 线程上，**只要它与 overlay 共用同一个 `GraphicsDevice`，它就是对"一个使用者"的违反**。今天它不触发断言，因为整条滚动路径没有生产调用者（`apps/` 对 `ScrollRuntime|WgcFrameBackend|WgcFrameSource|ScrollPlan` 零引用），而 L3 探针在自己的工厂里**为驱动线程新建了一个设备**（`scroll_probe.rs:4482`）。**接线那一刻断言就会报警**——这正是"先断言、再证明、最后才迁移"想要的时刻：`E-THREAD-1`/第 2 步的选择从"可选优化"变成一道必须跨过的门（`§36.2 OQ-26`）。
+
+**RED 证据**：`the_context_owner_assertion_is_the_invariant_we_actually_hold()`（`crates/snapclip-capture/src/windows/win/d3d11.rs` 的测试模块）先红后绿——加守卫前 `panicked at …d3d11.rs:878:9: a second thread used the immediate context without panicking: the guard is not wired to the accessor`（`0 passed; 1 failed; 596 filtered out; finished in 0.17s`）；加守卫后子线程 panic 原文为 `read_back_bgra ran on a thread that does not own the immediate context; one ID3D11DeviceContext has exactly one user thread (docs/30 §21.3)`（`left: ThreadId(4) / right: ThreadId(3)`），用例通过。它与 `P0.02` 的负面用例的区别是**它断言的是今天的形状**（创建线程 → 第一个使用者 = 合法交接；第二个使用者 = 违规），所以能在 `main` 上常驻；debug-only 的创建者等式只能在侧分支上。
+
+**文档漂移更正**：本节上文声称的 `d3d11.rs:853` 的守卫用例、`context_owner`/`owned_context` 字段、以及"4 个生产调用点 `providers.rs:110`/`:171`、`win/d2d.rs:667`、`renderer.rs:134-135`"在 `main` 上**都不存在**。`P0.02` 的产物（断言 + `using_the_immediate_context_from_a_second_thread_panics` + `the_production_hand_off_trips_the_context_guard`）在侧分支 `blocked/P0-02-context-owner`（`d1098cb`），按 `docs/31 §3.4` 从未并入；`d3d11.rs` 在本次改动前 847 行（测试模块止于 `:836`），`:104` 的访问器没有断言。
 
 **为什么这条前置结论重要**：第 2 步的三个候选方案里，"把导出回读搬到 capture worker" 会改变 capture worker 的职责；而滚动路径的**新增**回读需求（§11.3 每步一次）**已经**在 capture worker 上，所以第 2 步不需要为滚动路径扩大范围——它只需要处理 overlay 的放大镜取样与导出回读这两处**既有**的跨线程使用。`E-THREAD-1` 的对照实验因此不必把滚动会话算进去。
 
@@ -6343,6 +6404,26 @@ fn rows_match(actual, expected, sigma) -> bool
 | R-6 | context 不变式 | "GPU 线程是 immediate context 的唯一使用者"（**与代码不符**） | "**每个 `ID3D11DeviceContext` 恰好一个所有者线程**" + 断言（C3、§21.3） | 现在的不变式是**假的**（4 个调用点、唯一互斥是一个布尔位）；假的不变式比没有更危险 |
 | R-7 | 显示拓扑变化处置 | 任何 `WM_DISPLAYCHANGE`/`WM_DPICHANGED` → **取消会话并丢 renderer** | 三档可预期中断（目标相关→停止+`Partial`；其它→继续）（§24.4） | "全部取消"把不必要的破坏当成保守 |
 
+#### 33.2.1 落地（`P6.04`，2026-10-09）：R-1…R-5 的收口是"核对"，R-6 是本任务唯一新增的实现
+
+`P6.04` 的 GREEN 里"R-1…R-5 的主体已在 P1–P4 实现，本任务做的是收口：删除旧路径、删除死代码、确认只有一个实现"。逐条核对结果（**没有一条需要删除**，因此本任务没有对 R-1…R-5 产生代码改动）：
+
+| # | 落地位置 | 载体测试 | 收口结论 |
+|---|---|---|---|
+| R-1 | `crates/snapclip-capture/src/scroll/displacement.rs`（`estimate()` `:2410`；四门 `gate_geometry`/`gate_residual_gain`/`gate_support`/`gate_margin`） | `scroll::displacement` **48** 条（含 `closing_any_gate_changes_the_error_rate` 的四门消融） | 只有**一份**估计器实现；全仓 `grep` 无 `phaseCorrelate`/第二套 SAD 单点搜索、无旧的"单点输出"入口 |
+| R-2 | `crates/snapclip-capture/src/scroll/canvas.rs`（`ViewportState`/`StepWrite`/`covered`/`BandStore`/`MemoryBudget`；`band_height`/`relief`） | `scroll::canvas` **22** 条 | `docs/19` 的 union + tile 端口在代码里**从未存在**（`D-4`/`DEV-118` 的结论）；今天的覆盖不变量是二维且可断言的 |
+| R-3 | `crates/snapclip-capture/src/windows/scroll_source.rs`（`FrameSource::next() -> Poll{Frame,Idle,Ended}`、`EndReason`、去重按行摘要） | `windows::scroll_source` **20** 条；`scroll::observation` **5** 条 | `OnceLock` 形状的 `FrozenFrame` **仍存在**，但它是**普通截图**的帧（§33.5 保护项），滚动路径用的是 `WgcFrameSource`：两个用途没有混用 |
+| R-4 | `crates/snapclip-capture/src/scroll/export.rs`（`RowBandSink::begin` `:171` / `RowBandWriter::write_rows` `:181` / `finish` `:188`） | `scroll::export` **3** 条（+ `P4.02`/`P4.03` 的流式落盘与诊断） | `height` 在 `begin` 之前确定这件事由**签名**保证（`F-12`）；整图 `ArtifactWriter::write` 保留给普通截图，**不是**滚动的第二条实现 |
+| R-5 | `crates/snapclip-capture/src/scroll/session.rs`（独立 `ScrollSession`，`Phase` 是纯函数，11 个 `StopReason`） | `scroll::session` **16** 条；`crates/snapclip-capture/src/session.rs:550` 的 `esc_from_every_active_state_returns_to_idle`（6 态穷举）**未改动且仍绿** | `CaptureSession` 与滚动之间是**干净交接**（选区确定 → 冻结帧 + 几何 + DPI 交给 `ScrollSession`），没有"扩展普通截图"的痕迹 |
+| R-6 | `crates/snapclip-capture/src/windows/win/d3d11.rs`（`context_owner: Arc<OnceLock<ThreadId>>` + 私有 `owned_context`；删除 `pub fn context()` 与 `AsyncSampleBuffer` 里的 `context.clone()`） | `the_context_owner_assertion_is_the_invariant_we_actually_hold()`（先红后绿，逐字证据见 `§21.3.1`） | 本任务**唯一**的代码新增；不变式的形式与 `§21.3` 草图不同，三条裁决记录在 `§21.3.1` |
+| R-7 | `crates/snapclip-capture/src/windows/scroll_source.rs`（`TopologyOutcome` `:120`、`topology_outcome()` `:159`，三档：目标相关 / 目标无关 / 继续） | 同文件 `:864-900` 两条（`…another_monitor_leaves_the_session_running` 等） | `P2.05` 已落地；"全部取消"在代码里不存在 |
+
+**§33.4 移动清单的落地**：`crates/snapclip-capture/src/windows/window_detection.rs` → `crates/snapclip-capture/src/windows/top_level_provider.rs`（`git mv`，14,011 B 内容不变），`windows/mod.rs` 的模块声明按字母序移到 `timed_call` 与 `uia_provider` 之间，唯一引用 `windows/detection_worker.rs:32` 改为 `use super::top_level_provider::TopLevelWindowProvider;`。**指针未跟着改的是根模块**：全仓其余 `crate::window_detection::…` 指向 `crates/snapclip-capture/src/window_detection/`（同名双模块里**另一个**），不需要改——这正是 `§28.2` 要消除的"读哪个需要猜"。`tools/`、`scripts/`、`apps/` 对 `windows::window_detection` 零引用；`cargo check --workspace --all-targets` 干净。改名后 `windows::top_level_provider` 的 8 条用例仍在（测试名随模块重新归属）。
+
+**§33.5 保护清单的逐项核对（本任务的 REFACTOR，`git diff` 证据）**：本任务的工作树只动了 4 个文件 + 1 个改名 —— `windows/win/d3d11.rs`（守卫）、`windows/renderer.rs`（构造 `AsyncSampleBuffer` 的那一行）、`windows/mod.rs` 与 `windows/detection_worker.rs`（改名）、`windows/window_detection.rs`→`windows/top_level_provider.rs`。逐项：`CaptureSession` 与普通截图流程 **未触碰**；五个端口（`CaptureEventSink`/`OverlayPlatform`/`ArtifactWriter`/`ClipboardWriter`/`WindowTargetProvider`）**未触碰**；四条既有线程与其"容量 1 信箱 + `Condvar` + `PostThreadMessageW`"协议 **未触碰**（`capture_worker.rs`/`export_worker.rs`/`refinement_worker.rs` 零 diff，`detection_worker.rs` 只有那一行 `use`）；`graphics_released` 布尔位 **未触碰**（`overlay.rs:515` 的字段、`:622` 的初始化、`session.rs:204/:278/:429` 的置复位、`session.rs:541`/`render_submit.rs:149` 的早退全在）；五个 mailbox 的 generation 丢弃语义 **未触碰**；依赖方向门禁的**既有**规则 **未触碰**（`tools/check-dependency-direction.ps1` 原样，实测 `dependency direction is clean`：capture 30 / history 47 / model 8，`scroll/` **17** 文件）；`apps/snapclip/tests/ui.rs` **未触碰**；`hit_test.rs:435` 的 p95 断言 **未触碰**；9 个既有 `#[ignore]` 用例**一条未删**（capture lib 的 `ignored` 实测 **24**，与 `P6.03` 收口时同数）。
+
+**`P6.04` 的门禁数字**：`cargo check --workspace --all-targets` 干净（唯一的 warning 是**既有**的 `apps/snapclip/src/history/view.rs:776: unused variable: content_label`，本任务没碰 `apps/`）；`cargo test -p snapclip-capture --lib -- --test-threads=1` = **573 passed / 0 failed / 24 ignored**（`P6.03` 为 572+24，+1 = 本任务的守卫用例）。
+
 ### 33.3 新增清单
 
 | 类别 | 内容 |
@@ -6601,6 +6682,8 @@ fn rows_match(actual, expected, sigma) -> bool
 | **OQ-24** | **`Scroll Response` 与 `Stop latency` 的目标值未达成，而两条的原因都是"阈值推导时少算了一项"**（`P5.06` 实测，`§23.3.4`）：① `Scroll Response`——§23.3 把"一次稳定性等待"记成 2 个 `RENDER_TICK_MS`（30 ms），实现出来的规则是 `STILL_WINDOW = 40 ms` **加**两个 tick ⇒ 地板 ~66–70 ms；32 次运行（27 份报告）实测 P50 = 69.9–78.9 ms（目标 30 ms 的约 **2.3×**）、P95 = 70.2–103.7 ms（80 ms 阈值的 **88–130%**，27 份里 2 份越界）。② `Stop latency`——推导只算了"提交导出任务"，漏了"当前这一步剩余的等待"（停止的发现粒度是 settle）⇒ 实测 3.5–52.0 ms（目标 P50 ≤ 20 ms 的 1.6–2.6×） | 三条出口，全都要**真机数据**才能裁决：① **降 `STILL_WINDOW`**（40 → 20 ms？）——它同时是"两次读一致"的判据，降它会把"页面还在动"误判成静止，必须先在真实页面上量"两次读之间内容真的没变"的持续时间分布；② **放宽目标值**（如 P50 ≤ 70 ms）——但要先给出"为什么 70 ms 对用户算跟手"的依据，今天没有任何依据能支持这个声称；③ **把稳定性判据从"等一个静止窗"改成"位移收敛即静止"**（`|d|` 连续两次近似相同就停止等待）——这会改动 `P3.03` 校准过的 `Settle`，而且要重跑 `E-CTRL-1` | `P6.08` 的真机复跑（多档窗口尺寸 + 真实页面）；`E-CTRL-1` 的收敛步数表（在"静止判定更快"的假设下要重跑）；§16.5 的稳定性判据行；`loop_control.rs` 的 `STILL_WINDOW` 与 `Settle`。**与 `OQ-22` 相邻**：更小的首步与更快的静止判定都会改变对方的输入。**附注**：32 次运行里另有 3 次快速失败（最可能是"会话先于停止结束"）未被解释，见 `§23.3.4` 的未取得清单 |
 
 | **OQ-25** | **历史行预览的"有界"只对解码侧成立**（`P6.03` 实测，`§19.2.2`）：`row_preview_png` 已经把解码侧关死在窗口里（256×20,000 的夹具：峰值 810 KiB、整图级分配 0），但它拿到的仍然是**整份压缩载荷**——`HistoryStore::read_payload_bytes` 发给作家线程的是一个"读完整个 payload 再回传"的请求（`store.rs` 的 `WriterRequest::ReadPayloadBytes`）。夹具的载荷是 60,710 B，真实超长产物是整份文件；"有界"这个词今天只对其中一半成立 | 证据缺口：今天没有"一份真实的超长产物在历史列表里的端到端代价"的测量（载荷字节数、读取耗时、行渲染耗时）。三条出口：① 给作家线程协议加一个流式/分片读取口（`ReadPayloadChunk` 或按范围读）；② 让载荷读取也走"窗口"——先读文件头得到尺寸，再按需要读若干 IDAT 段（PNG 是顺序的，这条比 ① 更贴近问题）；③ 接受并记录（压缩载荷比解码侧小 2–3 个数量级）| 判据 = 一次真实产物（≥100,000 px 高）进历史列表的测量：进程峰值常驻、读取耗时、行渲染耗时。先量再选；没有测量时**不许**把 ③ 写成结论 | `§19.2.2` 的实测表；`store.rs` 的 `read_payload_bytes` 与 `WriterRequest`；`crates/snapclip-history/src/store.rs` 的 `payloads/` 目录布局 |
+
+| **OQ-26** | **滚动驱动与 overlay 是否共用同一个 `GraphicsDevice`**（`P6.04` 落地 R-6 后产生的**硬约束**，`§21.3.1`）：落地的不变式是"每个 `ID3D11DeviceContext` 恰好一个使用者线程，由第一个使用者认领"。滚动路径的回读（`windows/scroll_source.rs:372` → `providers.rs:722 ScrollFrame::read_region` → `providers.rs:639`）运行在 `snapclip-scroll-driver` 线程上，而 overlay 线程已经在用同一个 context ⇒ **一旦滚动路径接线并共用设备，断言会在第一个滚动步上 panic**。今天不触发：滚动路径无生产调用者，L3 探针在自己的工厂里为驱动线程新建设备（`scroll_probe.rs:4482`） | 三条出口，全都要**先测量再选**：① 让滚动驱动**自建设备**（`GraphicsDevice` 是自由创建的、无全局单例）——代价是第二份 D3D/D2D 设备与显存；② 把 `ScrollFrame` 的回读**搬回设备所有者线程**（`§21.3` 第 2 步的"把交接显式化"，需要一个"回读请求 → 字节回传"的边界，即 `§11.2` 名义上的 `ReadRegion`）；③ 走 `CreateDeferredContext`——**已知覆盖不了 `Map`/`Unmap`**（`§21.3.1`），只在"拷贝 + 由所有者线程 Map"的组合里才有意义 | 判据 = 一次真实滚动的 L3 运行（`E-THREAD-1` 的滚动半边 + 每步回读成本的 P50/P95）。**测量之前的默认答案不是"共用"**：共用会让断言成为接线时必然踩到的地雷，而自建设备的代价是可量的（`§22.3` 的 `MemoryBudget` 已按视口像素给出预算口径）。**这一条不改 §21.3 的结论，只是把"第 2 步"从可选优化变成滚动接线的前置条件** |
 
 ### 36.3 明确**不是**开放问题的（已经确定，记录以防反复）
 
