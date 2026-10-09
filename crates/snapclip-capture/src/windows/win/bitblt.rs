@@ -150,11 +150,11 @@ mod tests {
     use crate::windows::monitor;
 
     #[test]
+    #[ignore = "L3 (docs/31 D-14): captures the desktop at the cursor, so it needs an interactive desktop; run with --ignored --test-threads=1 on a live desktop"]
     fn bitblt_captures_a_real_monitor() {
         let _ = monitor::set_per_monitor_v2_awareness();
-        let Ok(target) = monitor::captured_monitor_at_cursor() else {
-            return;
-        };
+        let target = monitor::captured_monitor_at_cursor()
+            .expect("this test needs a monitor at the cursor (docs/31 D-14)");
         match capture_monitor(&target) {
             Ok(captured) => {
                 assert_eq!(captured.width, target.width());
@@ -166,8 +166,10 @@ mod tests {
                 // A real desktop is not uniformly transparent.
                 assert!(captured.pixels.chunks_exact(4).any(|pixel| pixel[3] != 0));
             }
-            // Locked or disconnected desktops may legitimately refuse BitBlt.
-            Err(error) => eprintln!("BitBlt capture unavailable in this session: {error}"),
+            // A locked or disconnected desktop refuses BitBlt (`0x80070005`, R-20). Running the
+            // test with `--ignored` is asking for a live desktop, so a refusal means the
+            // environment was not the one the run claimed - it is not a reason to pass silently.
+            Err(error) => panic!("BitBlt refused on the desktop this test asked for: {error}"),
         }
     }
 }

@@ -26,7 +26,7 @@ if (-not (Test-Path $hookPath -PathType Leaf)) {
     if (-not $text.StartsWith('#!/bin/sh')) {
         $failures.Add('the hook does not start with a #!/bin/sh shebang')
     }
-    foreach ($command in @('cargo check --workspace --all-targets', 'cargo test --workspace --lib', 'tools/check-dependency-direction.ps1')) {
+    foreach ($command in @('cargo check --workspace --all-targets', 'cargo test --workspace --lib', 'tools/check-dependency-direction.ps1', 'scripts/count-unignored-desktop-tests.ps1')) {
         if (-not $text.Contains($command)) {
             $failures.Add("the hook does not run '$command'")
         }

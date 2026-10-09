@@ -243,9 +243,11 @@ mod tests {
     fn display_name_prefers_file_description() {
         use super::display_name_for_exe;
         let path = r"C:\Windows\System32\notepad.exe";
-        if !std::path::Path::new(path).exists() {
-            return;
-        }
+        // A missing `notepad.exe` is a missing environment, not a reason to pass (docs/31 D-14).
+        assert!(
+            std::path::Path::new(path).exists(),
+            "this test reads {path}, which this Windows installation does not have"
+        );
         let name = display_name_for_exe(path);
         assert!(!name.is_empty());
         assert_ne!(name, "Unknown");

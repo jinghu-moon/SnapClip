@@ -420,6 +420,16 @@ mod tests {
         probe.is_some()
     }
 
+    /// These tests create real windows, so they are `#[ignore]`d rather than skipped (`docs/31`
+    /// D-14): `--ignored` is a request for a live desktop, and a run that does not have one must
+    /// fail loudly instead of passing having asserted nothing.
+    fn require_desktop() {
+        assert!(
+            desktop_available(),
+            "this test creates a real window; run it with --ignored on a live desktop (docs/31 D-14)"
+        );
+    }
+
     struct TestWindow {
         window: HWND,
     }
@@ -553,11 +563,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "L3 (docs/31 D-14): creates a real window; run with --ignored --test-threads=1 on a live desktop"]
     fn a_visible_tool_window_is_enumerated_and_a_hidden_one_is_not() {
-        if !desktop_available() {
-            eprintln!("skipping: no interactive window station available");
-            return;
-        }
+        require_desktop();
         let window = TestWindow::create(WINDOW_EX_STYLE(0), WS_POPUP | WS_VISIBLE)
             .expect("desktop is available");
         window.bring_to_front();
@@ -581,11 +589,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "L3 (docs/31 D-14): creates a real window; run with --ignored --test-threads=1 on a live desktop"]
     fn a_minimised_window_is_not_a_candidate() {
-        if !desktop_available() {
-            eprintln!("skipping: no interactive window station available");
-            return;
-        }
+        require_desktop();
         let window = TestWindow::create(WINDOW_EX_STYLE(0), WS_OVERLAPPEDWINDOW | WS_VISIBLE)
             .expect("desktop is available");
         window.bring_to_front();
@@ -613,11 +619,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "L3 (docs/31 D-14): creates a real window; run with --ignored --test-threads=1 on a live desktop"]
     fn a_click_through_layered_window_is_not_a_candidate() {
-        if !desktop_available() {
-            eprintln!("skipping: no interactive window station available");
-            return;
-        }
+        require_desktop();
         let overlay = TestWindow::create(WS_EX_LAYERED | WS_EX_TRANSPARENT, WS_POPUP | WS_VISIBLE)
             .expect("desktop is available");
         let ordinary = TestWindow::create(WINDOW_EX_STYLE(0), WS_POPUP | WS_VISIBLE)
@@ -637,11 +641,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "L3 (docs/31 D-14): creates a real window; run with --ignored --test-threads=1 on a live desktop"]
     fn frame_bounds_include_the_title_bar_and_exclude_the_invisible_border() {
-        if !desktop_available() {
-            eprintln!("skipping: no interactive window station available");
-            return;
-        }
+        require_desktop();
         let window = TestWindow::create(WINDOW_EX_STYLE(0), WS_OVERLAPPEDWINDOW | WS_VISIBLE)
             .expect("desktop is available");
         window.bring_to_front();
@@ -697,11 +699,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "L3 (docs/31 D-14): creates a real window; run with --ignored --test-threads=1 on a live desktop"]
     fn window_attributes_are_stable_for_a_live_window() {
-        if !desktop_available() {
-            eprintln!("skipping: no interactive window station available");
-            return;
-        }
+        require_desktop();
         let window = TestWindow::create(WINDOW_EX_STYLE(0), WS_POPUP | WS_VISIBLE)
             .expect("desktop is available");
         let handle = window.handle();
@@ -722,11 +722,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "L3 (docs/31 D-14): creates a real window; run with --ignored --test-threads=1 on a live desktop"]
     fn dwm_batch_returns_one_read_per_handle() {
-        if !desktop_available() {
-            eprintln!("skipping: no interactive window station available");
-            return;
-        }
+        require_desktop();
         let window = TestWindow::create(WINDOW_EX_STYLE(0), WS_POPUP | WS_VISIBLE)
             .expect("desktop is available");
         window.bring_to_front();
@@ -740,11 +738,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "L3 (docs/31 D-14): creates a real window; run with --ignored --test-threads=1 on a live desktop"]
     fn only_the_topmost_of_stacked_child_windows_is_shown_at_a_point() {
-        if !desktop_available() {
-            eprintln!("skipping: no interactive window station available");
-            return;
-        }
+        require_desktop();
         // File Explorer's tabs: same-size, all `WS_VISIBLE`, only the top one on screen.
         let parent = TestWindow::create(WINDOW_EX_STYLE(0), WS_OVERLAPPEDWINDOW | WS_VISIBLE)
             .expect("desktop is available");
@@ -798,11 +794,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "L3 (docs/31 D-14): creates a real window; run with --ignored --test-threads=1 on a live desktop"]
     fn visible_child_rects_reports_child_windows_inside_the_parent() {
-        if !desktop_available() {
-            eprintln!("skipping: no interactive window station available");
-            return;
-        }
+        require_desktop();
         // A classic child-HWND hierarchy: this is the case the provider-free fallback exists
         // for, because such controls never appear in the accessibility tree.
         let parent = TestWindow::create(WINDOW_EX_STYLE(0), WS_OVERLAPPEDWINDOW | WS_VISIBLE)

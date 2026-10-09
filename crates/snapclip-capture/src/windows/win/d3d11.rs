@@ -708,12 +708,11 @@ mod tests {
     /// The overlay's real presentation path: a DirectComposition target on a popup
     /// window, a monitor-sized flip-model swap chain and a drawn frame.
     #[test]
+    #[ignore = "L3 (docs/31 D-14): creates a popup window and presents through DirectComposition; run with --ignored --test-threads=1 on a live desktop"]
     fn composition_target_accepts_the_overlay_swap_chain_and_presents() {
-        let Some((window, class_name)) = hidden_overlay_window() else {
-            eprintln!("no window station in this session; skipping the composition check");
-            return;
-        };
-        let Ok(device) = GraphicsDevice::create() else {
+        let (window, class_name) = hidden_overlay_window()
+            .expect("this test needs an interactive window station to create a popup window (docs/31 D-14)");
+        let device = GraphicsDevice::create().unwrap_or_else(|error| {
             unsafe {
                 let _ = DestroyWindow(window);
                 let _ = UnregisterClassW(
@@ -721,8 +720,8 @@ mod tests {
                     Some(GetModuleHandleW(None).unwrap().into()),
                 );
             }
-            return;
-        };
+            panic!("this test needs a D3D11 device (docs/31 D-14): {error}")
+        });
 
         let composition = device.create_composition_target(window).unwrap();
         let swap_chain = device.create_composition_swap_chain(320, 200).unwrap();
@@ -754,11 +753,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "L4 (docs/31 D-14): needs a real D3D11 device; run with --ignored on a machine with a GPU"]
     fn device_creation_and_texture_round_trip() {
-        // Skip silently on machines without a D3D11 device (headless CI).
-        let Ok(device) = GraphicsDevice::create() else {
-            return;
-        };
+        let device = GraphicsDevice::create()
+            .expect("this test needs a D3D11 device (docs/31 D-14)");
         let pixels: Vec<u8> = (0..(4 * 3 * 4)).map(|index| index as u8).collect();
         let frame = device.create_bgra_texture(4, 3, &pixels).unwrap();
         assert_eq!((frame.width, frame.height), (4, 3));
@@ -773,10 +771,10 @@ mod tests {
     /// whatever selection `confirm()` later crops out. Records bytes and duration
     /// for the reference sizes so Phase 3 region readback can be judged against it.
     #[test]
+    #[ignore = "L4 (docs/31 D-14): needs a real D3D11 device; run with --ignored on a machine with a GPU"]
     fn readback_always_copies_the_whole_frame() {
-        let Ok(device) = GraphicsDevice::create() else {
-            return;
-        };
+        let device = GraphicsDevice::create()
+            .expect("this test needs a D3D11 device (docs/31 D-14)");
         for (width, height) in [(1920u32, 1080u32), (3840u32, 2160u32)] {
             let frame = device
                 .create_bgra_texture(width, height, &vec![0u8; (width * height * 4) as usize])
@@ -795,10 +793,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "L4 (docs/31 D-14): needs a real D3D11 device and a swap chain; run with --ignored on a machine with a GPU"]
     fn swap_chain_can_be_created_and_presented() {
-        let Ok(device) = GraphicsDevice::create() else {
-            return;
-        };
+        let device = GraphicsDevice::create()
+            .expect("this test needs a D3D11 device (docs/31 D-14)");
         let swap_chain = device.create_composition_swap_chain(64, 48).unwrap();
         let context = device.create_d2d_context().unwrap();
         let target = device.create_target_bitmap(&context, &swap_chain).unwrap();
@@ -835,10 +833,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "L4 (docs/31 D-14): needs a real D3D11 device; run with --ignored on a machine with a GPU"]
     fn async_sample_from_an_uploaded_texture_lands_within_a_few_ticks() {
-        let Ok(device) = GraphicsDevice::create() else {
-            return;
-        };
+        let device = GraphicsDevice::create()
+            .expect("this test needs a D3D11 device (docs/31 D-14)");
         let frame = device
             .create_bgra_texture(256, 256, &vec![7u8; 256 * 256 * 4])
             .unwrap();
@@ -846,25 +844,22 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "L3 (docs/31 D-14): needs a monitor at the cursor and a WGC-capturable desktop; run with --ignored --test-threads=1 on a live desktop"]
     fn async_sample_from_a_wgc_frame_lands_within_a_few_ticks() {
         use crate::windows::monitor;
 
-        if !super::super::wgc::is_supported() {
-            eprintln!("Windows Graphics Capture unavailable; skipping the WGC sample probe");
-            return;
-        }
-        let Ok(device) = GraphicsDevice::create() else {
-            return;
-        };
-        // The monitor under the cursor is the cheapest way to get a real one, but it is not the
-        // subject of this test: `GetCursorPos` fails with `ERROR_ACCESS_DENIED` whenever the
-        // process is not on the input desktop (`docs/31` R-20), and every neighbouring probe
-        // already treats that as "no desktop to measure on" rather than as a failure
-        // (`monitor.rs:345`, `providers.rs:689`, `providers.rs:726`, `bitblt.rs:155`).
-        let Ok(monitor) = monitor::captured_monitor_at_cursor() else {
-            eprintln!("no readable cursor position; skipping the WGC sample probe");
-            return;
-        };
+        assert!(
+            super::super::wgc::is_supported(),
+            "this test needs Windows Graphics Capture, which this system does not expose"
+        );
+        let device = GraphicsDevice::create()
+            .expect("this test needs a D3D11 device (docs/31 D-14)");
+        // The monitor under the cursor is the cheapest way to get a real one, which is why this
+        // test is `#[ignore]`d: `GetCursorPos` fails with `ERROR_ACCESS_DENIED` whenever the
+        // process is not on the input desktop (`docs/31` R-20), and `--ignored` on a live desktop
+        // is the only way to know the difference between that and a broken probe.
+        let monitor = monitor::captured_monitor_at_cursor()
+            .expect("this test needs a readable cursor position (docs/31 D-14)");
         let frame = super::super::wgc::capture_monitor(&device, &monitor).unwrap();
         probe_async_sample(&device, &frame.texture);
     }
@@ -880,10 +875,10 @@ mod tests {
     /// rejected it would reject the only production path there is), and a second thread
     /// must fail loudly instead of racing the GPU.
     #[test]
+    #[ignore = "L4 (docs/31 D-14): needs a real D3D11 device; run with --ignored on a machine with a GPU"]
     fn the_context_owner_assertion_is_the_invariant_we_actually_hold() {
-        let Ok(device) = GraphicsDevice::create() else {
-            return;
-        };
+        let device = GraphicsDevice::create()
+            .expect("this test needs a D3D11 device (docs/31 D-14)");
         let frame = device.create_bgra_texture(4, 3, &[0u8; 48]).unwrap();
 
         // Created here (the capture worker), first used over there (the overlay thread).

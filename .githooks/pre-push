@@ -27,4 +27,9 @@ powershell -NoProfile -File tools/check-test-baseline.ps1 -Log target/test-basel
 echo "[pre-push] dependency direction"
 powershell -NoProfile -File tools/check-dependency-direction.ps1
 
+echo "[pre-push] no test decides at run time that it has nothing to assert (docs/31 P6.05, D-14)"
+# The defect this catches is invisible in a normal run: a test that returns early because the
+# environment is absent still prints `ok`. It has to be a gate, not a script someone remembers.
+powershell -NoProfile -File scripts/count-unignored-desktop-tests.ps1
+
 echo "[pre-push] OK"

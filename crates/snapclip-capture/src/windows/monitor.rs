@@ -340,11 +340,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "L3 (docs/31 D-14): needs a monitor at the cursor, so it needs an interactive desktop; run with --ignored --test-threads=1 on a live desktop"]
     fn monitor_handle_is_available_for_providers() {
         let _ = set_per_monitor_v2_awareness();
-        let Ok(monitor) = captured_monitor_at_cursor() else {
-            return;
-        };
+        let monitor = captured_monitor_at_cursor()
+            .expect("this test needs a monitor at the cursor (docs/31 D-14)");
         assert_ne!(monitor.handle, 0);
         assert!(monitor.width() > 0 && monitor.height() > 0);
     }

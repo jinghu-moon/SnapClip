@@ -80,21 +80,18 @@
     /// reads it back, so the mask, the selection cut-out and the chrome are all
     /// verified against real GPU output rather than a mock.
     #[test]
+    #[ignore = "L4 (docs/31 D-14): renders through the real D3D11/D2D path; run with --ignored on a machine with a GPU"]
     fn composed_frame_masks_outside_the_selection_and_keeps_it_clear() {
-        let Ok(device) = super::GraphicsDevice::create() else {
-            eprintln!("no D3D11 device in this session; skipping the composition check");
-            return;
-        };
+        let device = super::GraphicsDevice::create()
+            .expect("this test needs a D3D11 device (docs/31 D-14)");
         let width = 64u32;
         let height = 48u32;
         let background = [64u8, 96, 128, 255];
-        let Ok(frame) = device.create_bgra_texture(width, height, &solid_bgra(width, height, background))
-        else {
-            return;
-        };
-        let Ok(mut renderer) = OverlayRenderer::new(std::sync::Arc::new(device), 96) else {
-            return;
-        };
+        let frame = device
+            .create_bgra_texture(width, height, &solid_bgra(width, height, background))
+            .expect("this test needs a D3D11 texture (docs/31 D-14)");
+        let mut renderer = OverlayRenderer::new(std::sync::Arc::new(device), 96)
+            .expect("this test needs a Direct2D overlay renderer (docs/31 D-14)");
         renderer
             .update_frame(width, height, &solid_bgra(width, height, background))
             .unwrap();
@@ -178,17 +175,15 @@
     /// pass. It then spot-checks that a red fill landed inside the artifact while a
     /// selected-but-unannotated pixel stayed at the raw frame brightness (no mask).
     #[test]
+    #[ignore = "L4 (docs/31 D-14): renders through the real D3D11/D2D path; run with --ignored on a machine with a GPU"]
     fn export_crop_matches_preview_and_bakes_annotations() {
-        let Ok(device) = super::GraphicsDevice::create() else {
-            eprintln!("no D3D11 device in this session; skipping the export check");
-            return;
-        };
+        let device = super::GraphicsDevice::create()
+            .expect("this test needs a D3D11 device (docs/31 D-14)");
         let width = 64u32;
         let height = 48u32;
         let background = [64u8, 96, 128, 255];
-        let Ok(mut renderer) = OverlayRenderer::new(std::sync::Arc::new(device), 96) else {
-            return;
-        };
+        let mut renderer = OverlayRenderer::new(std::sync::Arc::new(device), 96)
+            .expect("this test needs a Direct2D overlay renderer (docs/31 D-14)");
         renderer
             .update_frame(width, height, &solid_bgra(width, height, background))
             .unwrap();
@@ -280,16 +275,15 @@
     /// The chrome is preview-only and must not touch the L0 pixels inside the
     /// selection; the border itself is drawn on the selection edge.
     #[test]
+    #[ignore = "L4 (docs/31 D-14): renders through the real D3D11/D2D path; run with --ignored on a machine with a GPU"]
     fn chrome_stays_out_of_the_exported_pixels() {
-        let Ok(device) = super::GraphicsDevice::create() else {
-            return;
-        };
+        let device = super::GraphicsDevice::create()
+            .expect("this test needs a D3D11 device (docs/31 D-14)");
         let width = 64u32;
         let height = 48u32;
         let background = [200u8, 180, 160, 255];
-        let Ok(mut renderer) = OverlayRenderer::new(std::sync::Arc::new(device), 96) else {
-            return;
-        };
+        let mut renderer = OverlayRenderer::new(std::sync::Arc::new(device), 96)
+            .expect("this test needs a Direct2D overlay renderer (docs/31 D-14)");
         renderer
             .update_frame(width, height, &solid_bgra(width, height, background))
             .unwrap();
@@ -334,16 +328,15 @@
     /// Hover and preview are painted as their own layers, and neither is baked into the
     /// exported pixels (docs/14 §8).
     #[test]
+    #[ignore = "L4 (docs/31 D-14): renders through the real D3D11/D2D path; run with --ignored on a machine with a GPU"]
     fn window_snap_hints_are_painted_but_never_exported() {
-        let Ok(device) = super::GraphicsDevice::create() else {
-            return;
-        };
+        let device = super::GraphicsDevice::create()
+            .expect("this test needs a D3D11 device (docs/31 D-14)");
         let width = 64u32;
         let height = 48u32;
         let background = [200u8, 180, 160, 255];
-        let Ok(mut renderer) = OverlayRenderer::new(std::sync::Arc::new(device), 96) else {
-            return;
-        };
+        let mut renderer = OverlayRenderer::new(std::sync::Arc::new(device), 96)
+            .expect("this test needs a Direct2D overlay renderer (docs/31 D-14)");
         renderer
             .update_frame(width, height, &solid_bgra(width, height, background))
             .unwrap();
@@ -492,16 +485,15 @@
     /// A2 (docs/21 §5.24): the box that would be taken shows its own pixels — no mask, no tint —
     /// and the whole-window fallback does not, because its "box" is the screen.
     #[test]
+    #[ignore = "L4 (docs/31 D-14): renders through the real D3D11/D2D path; run with --ignored on a machine with a GPU"]
     fn an_element_preview_keeps_its_own_pixels_and_the_window_fallback_does_not() {
-        let Ok(device) = super::GraphicsDevice::create() else {
-            return;
-        };
+        let device = super::GraphicsDevice::create()
+            .expect("this test needs a D3D11 device (docs/31 D-14)");
         let width = 96u32;
         let height = 64u32;
         let background = [210u8, 200, 190, 255];
-        let Ok(mut renderer) = OverlayRenderer::new(std::sync::Arc::new(device), 96) else {
-            return;
-        };
+        let mut renderer = OverlayRenderer::new(std::sync::Arc::new(device), 96)
+            .expect("this test needs a Direct2D overlay renderer (docs/31 D-14)");
         renderer
             .update_frame(width, height, &solid_bgra(width, height, background))
             .unwrap();
@@ -636,15 +628,13 @@
                 < 1e-6
         );
 
-        let Ok(device) = super::GraphicsDevice::create() else {
-            return;
-        };
+        let device = super::GraphicsDevice::create()
+            .expect("this test needs a D3D11 device (docs/31 D-14)");
         let width = 96u32;
         let height = 64u32;
         let background = [128u8, 128, 128, 255];
-        let Ok(mut renderer) = OverlayRenderer::new(std::sync::Arc::new(device), 96) else {
-            return;
-        };
+        let mut renderer = OverlayRenderer::new(std::sync::Arc::new(device), 96)
+            .expect("this test needs a Direct2D overlay renderer (docs/31 D-14)");
         renderer
             .update_frame(width, height, &solid_bgra(width, height, background))
             .unwrap();
@@ -720,6 +710,7 @@
     /// printed, because no single blue can be a luminance step against a background of its own
     /// brightness and pretending otherwise would just move the failure somewhere else.
     #[test]
+    #[ignore = "L4 (docs/31 D-14): renders through the real D3D11/D2D path; run with --ignored on a machine with a GPU"]
     fn the_resting_capture_box_is_a_luminance_step_on_light_and_dark_content() {
         let relative_luminance = |pixel: [u8; 4]| -> f32 {
             // Readback is BGRA.
@@ -746,14 +737,12 @@
             ("mid", [128, 128, 128, 255], false),
             ("dark", [24, 24, 28, 255], true),
         ] {
-            let Ok(device) = super::GraphicsDevice::create() else {
-                return;
-            };
+            let device = super::GraphicsDevice::create()
+                .expect("this test needs a D3D11 device (docs/31 D-14)");
             let width = 96u32;
             let height = 64u32;
-            let Ok(mut renderer) = OverlayRenderer::new(std::sync::Arc::new(device), 96) else {
-                return;
-            };
+            let mut renderer = OverlayRenderer::new(std::sync::Arc::new(device), 96)
+                .expect("this test needs a Direct2D overlay renderer (docs/31 D-14)");
             renderer
                 .update_frame(width, height, &solid_bgra(width, height, background))
                 .unwrap();
@@ -816,16 +805,15 @@
     /// hairlines. What has to hold: each live direction contributes a green arrow and a white count,
     /// they sit on their own side of the divider, and a pinned direction contributes neither.
     #[test]
+    #[ignore = "L4 (docs/31 D-14): renders through the real D3D11/D2D path; run with --ignored on a machine with a GPU"]
     fn the_level_badge_reads_as_two_directions_with_the_pinned_one_dimmed() {
-        let Ok(device) = super::GraphicsDevice::create() else {
-            return;
-        };
+        let device = super::GraphicsDevice::create()
+            .expect("this test needs a D3D11 device (docs/31 D-14)");
         let width = 240u32;
         let height = 120u32;
         let background = [40u8, 44, 52, 255];
-        let Ok(mut renderer) = OverlayRenderer::new(std::sync::Arc::new(device), 96) else {
-            return;
-        };
+        let mut renderer = OverlayRenderer::new(std::sync::Arc::new(device), 96)
+            .expect("this test needs a Direct2D overlay renderer (docs/31 D-14)");
         renderer
             .update_frame(width, height, &solid_bgra(width, height, background))
             .unwrap();
@@ -952,6 +940,7 @@
     /// seen. This asserts the ring's *luminance* against the masked background, not just that it
     /// changed, and does it on light and dark content alike.
     #[test]
+    #[ignore = "L4 (docs/31 D-14): renders through the real D3D11/D2D path; run with --ignored on a machine with a GPU"]
     fn chain_rings_carry_luminance_on_light_and_dark_content() {
         use crate::geometry::Point as GPoint;
 
@@ -983,17 +972,15 @@
             // combination the user is looking at when the wheel has walked up a level.
             ("light + capture wash", [250, 250, 250, 255], true),
         ] {
-            let Ok(device) = super::GraphicsDevice::create() else {
-                return;
-            };
+            let device = super::GraphicsDevice::create()
+                .expect("this test needs a D3D11 device (docs/31 D-14)");
             let width = 96u32;
             let height = 64u32;
             // The user's monitor: at 144 DPI the ring is 1.5 physical px, which is the case that has
             // to read. (The first version drew a raw physical pixel — thinner here than in any
             // prototype, which ran at 96 DPI.)
-            let Ok(mut renderer) = OverlayRenderer::new(std::sync::Arc::new(device), 144) else {
-                return;
-            };
+            let mut renderer = OverlayRenderer::new(std::sync::Arc::new(device), 144)
+                .expect("this test needs a Direct2D overlay renderer (docs/31 D-14)");
             renderer
                 .update_frame(width, height, &solid_bgra(width, height, background))
                 .unwrap();
@@ -1067,16 +1054,15 @@
 
     /// The size label is painted with an opaque panel above the selection when there is room.
     #[test]
+    #[ignore = "L4 (docs/31 D-14): renders through the real D3D11/D2D path; run with --ignored on a machine with a GPU"]
     fn size_label_panel_is_painted_at_the_selection_top_left() {
-        let Ok(device) = super::GraphicsDevice::create() else {
-            return;
-        };
+        let device = super::GraphicsDevice::create()
+            .expect("this test needs a D3D11 device (docs/31 D-14)");
         let width = 640u32;
         let height = 480u32;
         let background = [200u8, 180, 160, 255];
-        let Ok(mut renderer) = OverlayRenderer::new(std::sync::Arc::new(device), 96) else {
-            return;
-        };
+        let mut renderer = OverlayRenderer::new(std::sync::Arc::new(device), 96)
+            .expect("this test needs a Direct2D overlay renderer (docs/31 D-14)");
         renderer
             .update_frame(width, height, &solid_bgra(width, height, background))
             .unwrap();
@@ -1130,16 +1116,15 @@
     /// that only covered the raw selection would strand the old label — the exact ghost
     /// this guards against.
     #[test]
+    #[ignore = "L4 (docs/31 D-14): renders through the real D3D11/D2D path; run with --ignored on a machine with a GPU"]
     fn moving_the_selection_erases_the_previous_chrome() {
-        let Ok(device) = super::GraphicsDevice::create() else {
-            return;
-        };
+        let device = super::GraphicsDevice::create()
+            .expect("this test needs a D3D11 device (docs/31 D-14)");
         let width = 640u32;
         let height = 480u32;
         let background = [200u8, 180, 160, 255];
-        let Ok(mut renderer) = OverlayRenderer::new(std::sync::Arc::new(device), 96) else {
-            return;
-        };
+        let mut renderer = OverlayRenderer::new(std::sync::Arc::new(device), 96)
+            .expect("this test needs a Direct2D overlay renderer (docs/31 D-14)");
         let frame = Rect::from_origin_size(Point::new(0, 0), width as i32, height as i32);
         renderer
             .update_frame(width, height, &solid_bgra(width, height, background))
@@ -1265,14 +1250,12 @@
     /// value can ever wrap or clip. Widths are measured with the real embedded
     /// font, not an estimate — this is the correct way to prove the layout.
     #[test]
+    #[ignore = "L4 (docs/31 D-14): renders through the real D3D11/D2D path; run with --ignored on a machine with a GPU"]
     fn widest_colour_value_fits_the_info_row() {
-        let Ok(device) = super::GraphicsDevice::create() else {
-            eprintln!("no D3D11 device; skipping the info-row width check");
-            return;
-        };
-        let Ok(mut renderer) = OverlayRenderer::new(std::sync::Arc::new(device), 96) else {
-            return;
-        };
+        let device = super::GraphicsDevice::create()
+            .expect("this test needs a D3D11 device (docs/31 D-14)");
+        let mut renderer = OverlayRenderer::new(std::sync::Arc::new(device), 96)
+            .expect("this test needs a Direct2D overlay renderer (docs/31 D-14)");
 
         let colour_fmt = renderer
             .info_text_format_mut(

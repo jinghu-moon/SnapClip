@@ -1013,15 +1013,17 @@ mod tests {
         assert!(FrozenFrame::is_device_lost(&classified));
     }
 
+    // The name says `when_available` because three ledgers quote it verbatim (`docs/09` line 121,
+    // `docs/30` section 21.5 and `docs/31` R-21); it is `#[ignore]`d rather than skipped, so the
+    // suffix is now only a name.
     #[test]
+    #[ignore = "L3 (docs/31 D-14): probes and captures the monitor at the cursor; run with --ignored --test-threads=1 on a live desktop"]
     fn providers_probe_and_capture_a_real_monitor_when_available() {
         let _ = super::super::monitor::set_per_monitor_v2_awareness();
-        let Ok(mut providers) = CaptureProviders::new() else {
-            return;
-        };
-        let Ok(monitor) = super::super::monitor::captured_monitor_at_cursor() else {
-            return;
-        };
+        let mut providers = CaptureProviders::new()
+            .expect("this test needs a D3D11 device (docs/31 D-14)");
+        let monitor = super::super::monitor::captured_monitor_at_cursor()
+            .expect("this test needs a monitor at the cursor (docs/31 D-14)");
         match providers.capture(&monitor) {
             Ok(frame) => {
                 assert_eq!(frame.frame.width, monitor.width());
@@ -1043,27 +1045,25 @@ mod tests {
                 );
                 assert!(frame.pixels_read(), "readback must be cached");
             }
-            Err(error) => eprintln!("capture unavailable in this session: {error}"),
+            // `--ignored` is a request for a live desktop; a capture that refuses there is a
+            // failure of the environment the run claimed, not a reason to pass (docs/31 D-14).
+            Err(error) => panic!("capture refused on the desktop this test asked for: {error}"),
         }
     }
 
     /// The hard Phase 3 gate: on real hardware a small selection must not pull the
     /// whole monitor across the bus.
     #[test]
+    #[ignore = "L3 (docs/31 D-14): reads a region back from the monitor at the cursor; run with --ignored --test-threads=1 on a live desktop"]
     fn a_300x200_selection_reads_back_only_its_own_bytes() {
         let _ = super::super::monitor::set_per_monitor_v2_awareness();
-        let Ok(mut providers) = CaptureProviders::new() else {
-            eprintln!("no D3D11 device in this session; skipping the region readback check");
-            return;
-        };
-        let Ok(monitor) = super::super::monitor::captured_monitor_at_cursor() else {
-            eprintln!("no monitor at the cursor; skipping the region readback check");
-            return;
-        };
-        let Ok(frozen) = providers.capture(&monitor) else {
-            eprintln!("capture unavailable in this session; skipping the region readback check");
-            return;
-        };
+        let mut providers = CaptureProviders::new()
+            .expect("this test needs a D3D11 device (docs/31 D-14)");
+        let monitor = super::super::monitor::captured_monitor_at_cursor()
+            .expect("this test needs a monitor at the cursor (docs/31 D-14)");
+        let frozen = providers
+            .capture(&monitor)
+            .unwrap_or_else(|error| panic!("capture refused on the desktop this test asked for: {error}"));
         // WGC frames have no CPU pixels, so this exercises `CopySubresourceRegion`.
         // A BitBlt frame is the CPU crop; both must return the selection's bytes.
         let selection = Rect::new(0, 0, 300.min(monitor.width() as i32), 200.min(monitor.height() as i32));

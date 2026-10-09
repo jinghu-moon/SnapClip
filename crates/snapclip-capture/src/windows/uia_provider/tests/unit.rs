@@ -46,6 +46,7 @@ use super::*;
     }
 
     #[test]
+    #[ignore = "L3 (docs/31 D-14): creates a real window and walks the UI Automation tree; run with --ignored --test-threads=1 on a live desktop"]
     fn the_real_pipeline_still_answers_in_the_second_capture_session() {
         // End-to-end over the real accessibility stack: scheduler → refinement worker → UIA.
         // Two sessions run back to back on **one** worker, exactly as two F5 presses do. The
@@ -56,10 +57,8 @@ use super::*;
         use crate::window_detection::model::WindowIdentity;
         use crate::windows::refinement_worker::RefinementWorker;
 
-        let Some(fixture) = FixtureWindow::create() else {
-            eprintln!("skipping: no interactive window station available");
-            return;
-        };
+        let fixture = FixtureWindow::create()
+            .expect("this test needs an interactive window station (docs/31 D-14)");
         let bounds = Rect::new(200, 200, 560, 460);
         let point = Point::new(300, 300);
         let identity = WindowIdentity::new(fixture.handle(), std::process::id(), 0x5E7);
@@ -126,16 +125,15 @@ use super::*;
     }
 
     #[test]
+    #[ignore = "L3 (docs/31 D-14): creates a real window and walks the UI Automation tree; run with --ignored --test-threads=1 on a live desktop"]
     fn a_real_window_yields_a_path_that_starts_at_the_window_frame() {
-        let Some(fixture) = FixtureWindow::create() else {
-            eprintln!("skipping: no interactive window station available");
-            return;
-        };
+        let fixture = FixtureWindow::create()
+            .expect("this test needs an interactive window station (docs/31 D-14)");
         let mut provider = UiaDeepSelectionProvider::new(WindowDetectionMetrics::new());
-        if provider.automation().is_none() {
-            eprintln!("skipping: UI Automation is unavailable in this environment");
-            return;
-        }
+        assert!(
+            provider.automation().is_some(),
+            "this test needs UI Automation, which this environment does not expose (docs/31 D-14)"
+        );
         let bounds = Rect::new(200, 200, 560, 460);
         let outcome = resolve_when_ready(&mut provider, fixture.handle(), Point::new(280, 280), bounds);
         let RefinementOutcome::Target(target) = outcome else {
@@ -163,16 +161,15 @@ use super::*;
     /// the coarse ancestor — one of the "sometimes stays on the parent box" causes. Reading it again
     /// on the next query is what makes the walk recover on its own.
     #[test]
+    #[ignore = "L3 (docs/31 D-14): creates a real window and walks the UI Automation tree; run with --ignored --test-threads=1 on a live desktop"]
     fn an_empty_uia_level_is_never_remembered() {
-        let Some(fixture) = FixtureWindow::create() else {
-            eprintln!("skipping: no interactive window station available");
-            return;
-        };
+        let fixture = FixtureWindow::create()
+            .expect("this test needs an interactive window station (docs/31 D-14)");
         let mut provider = UiaDeepSelectionProvider::new(WindowDetectionMetrics::new());
-        if provider.automation().is_none() {
-            eprintln!("skipping: UI Automation is unavailable in this environment");
-            return;
-        }
+        assert!(
+            provider.automation().is_some(),
+            "this test needs UI Automation, which this environment does not expose (docs/31 D-14)"
+        );
         let bounds = Rect::new(200, 200, 560, 460);
         let outcome = resolve_when_ready(&mut provider, fixture.handle(), Point::new(280, 280), bounds);
         assert!(
@@ -191,16 +188,15 @@ use super::*;
     }
 
     #[test]
+    #[ignore = "L3 (docs/31 D-14): creates a real window and walks the UI Automation tree; run with --ignored --test-threads=1 on a live desktop"]
     fn expanded_levels_are_reused_within_a_generation_and_dropped_across_them() {
-        let Some(fixture) = FixtureWindow::create() else {
-            eprintln!("skipping: no interactive window station available");
-            return;
-        };
+        let fixture = FixtureWindow::create()
+            .expect("this test needs an interactive window station (docs/31 D-14)");
         let mut provider = UiaDeepSelectionProvider::new(WindowDetectionMetrics::new());
-        if provider.automation().is_none() {
-            eprintln!("skipping: UI Automation is unavailable in this environment");
-            return;
-        }
+        assert!(
+            provider.automation().is_some(),
+            "this test needs UI Automation, which this environment does not expose (docs/31 D-14)"
+        );
         let bounds = Rect::new(200, 200, 560, 460);
         let control = QueryControl::refinement(&|| false);
 

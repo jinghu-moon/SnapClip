@@ -124,17 +124,26 @@ mod tests {
     use crate::geometry::Point;
     use crate::window_detection::snapshot::CheapProbe;
 
+    /// These tests read the real desktop, so they are `#[ignore]`d rather than skipped
+    /// (`docs/31` D-14): running them with `--ignored` is asking for a live desktop, and a run
+    /// that does not have one must fail loudly instead of passing having asserted nothing.
+    fn require_desktop() {
+        assert!(
+            desktop_available(),
+            "this test needs an interactive window station; run it with --ignored on a live \
+             desktop (docs/31 D-14)"
+        );
+    }
+
     fn desktop_available() -> bool {
         let _ = win32::enumerate_cheap_candidates();
         monitor::set_per_monitor_v2_awareness().is_ok()
     }
 
     #[test]
+    #[ignore = "L3 (docs/31 D-14): reads the real desktop topology; run with --ignored --test-threads=1 on a live desktop"]
     fn refresh_builds_a_labelled_snapshot_with_ordered_candidates() {
-        if !desktop_available() {
-            eprintln!("skipping: no interactive window station available");
-            return;
-        }
+        require_desktop();
         let mut provider = TopLevelWindowProvider::new();
         let snapshot = provider.refresh(&Exclusions::new()).expect("refresh succeeds");
         assert!(snapshot.epoch() >= 1, "a refresh always issues a new epoch");
@@ -158,11 +167,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "L3 (docs/31 D-14): reads the real desktop topology; run with --ignored --test-threads=1 on a live desktop"]
     fn each_refresh_advances_the_epoch_and_drops_the_previous_snapshot() {
-        if !desktop_available() {
-            eprintln!("skipping: no interactive window station available");
-            return;
-        }
+        require_desktop();
         let mut provider = TopLevelWindowProvider::new();
         let first = provider.refresh(&Exclusions::new()).expect("refresh succeeds");
         let second = provider.refresh(&Exclusions::new()).expect("refresh succeeds");
@@ -182,16 +189,16 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "L3 (docs/31 D-14): reads the real desktop topology; run with --ignored --test-threads=1 on a live desktop"]
     fn exclusions_remove_a_window_from_the_snapshot() {
-        if !desktop_available() {
-            eprintln!("skipping: no interactive window station available");
-            return;
-        }
+        require_desktop();
         let mut provider = TopLevelWindowProvider::new();
         let snapshot = provider.refresh(&Exclusions::new()).expect("refresh succeeds");
-        let Some(victim) = snapshot.candidates().first().copied() else {
-            return;
-        };
+        let victim = snapshot
+            .candidates()
+            .first()
+            .copied()
+            .expect("the desktop this test asked for must expose at least one top-level window");
 
         let mut exclusions = Exclusions::new();
         exclusions.exclude_hwnd(victim.identity.hwnd);
@@ -203,11 +210,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "L3 (docs/31 D-14): reads the real desktop topology; run with --ignored --test-threads=1 on a live desktop"]
     fn our_own_process_can_be_excluded_entirely() {
-        if !desktop_available() {
-            eprintln!("skipping: no interactive window station available");
-            return;
-        }
+        require_desktop();
         let own_pid = std::process::id();
         let mut exclusions = Exclusions::new();
         exclusions.exclude_process(own_pid);
@@ -253,11 +258,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "L3 (docs/31 D-14): reads the real desktop topology; run with --ignored --test-threads=1 on a live desktop"]
     fn reset_clears_the_epoch_and_the_cached_topology() {
-        if !desktop_available() {
-            eprintln!("skipping: no interactive window station available");
-            return;
-        }
+        require_desktop();
         let mut provider = TopLevelWindowProvider::new();
         let snapshot = provider.refresh(&Exclusions::new()).expect("refresh succeeds");
         assert!(snapshot.epoch() >= 1);
@@ -272,27 +275,22 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "L3 (docs/31 D-14): reads the real desktop topology; run with --ignored --test-threads=1 on a live desktop"]
     fn hover_revalidation_reports_bounds_changes_and_stale_targets() {
-        if !desktop_available() {
-            eprintln!("skipping: no interactive window station available");
-            return;
-        }
+        require_desktop();
         let mut provider = TopLevelWindowProvider::new();
         let snapshot = provider.refresh(&Exclusions::new()).expect("refresh succeeds");
         // The desktop is shared with everything else running on the machine, so a candidate
         // may legitimately disappear between the refresh and the validation below. Take the
-        // first candidate that is *still* valid, and only fail if validation is broken for a
-        // window that is genuinely present.
-        let Some(candidate) = snapshot
+        // first candidate that is *still* valid; a desktop where nothing at all is valid is not
+        // the desktop this probe asked for, so it fails rather than passing vacuously.
+        let candidate = snapshot
             .candidates()
             .iter()
             .filter(|candidate| candidate.is_usable())
             .map(|candidate| WindowTarget::top_level_window_frame(*candidate))
             .find(|target| provider.validate(target))
-        else {
-            eprintln!("skipping: every candidate from this refresh is already gone");
-            return;
-        };
+            .expect("no candidate from this refresh is still valid (docs/31 D-14)");
         let candidate = candidate.candidate;
         let target = WindowTarget::top_level_window_frame(candidate);
 
