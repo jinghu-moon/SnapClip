@@ -226,6 +226,7 @@
 > **DEV-125** → `docs/30 §21.3.1`（新增）+ `§36.2` 的 `OQ-26`（新增）：`§21.3` 的第 ② 步草图预设"创建者是所有者"这条不变式，而实测它是**假的**（唯一创建点 `capture_worker.rs:373` → `providers.rs:375-378` 之后创建者从不使用 context，只用 free-threaded 的 `ID3D11Device`）；`P0.02` 的 panic 来自断言本身而不是代码违反不变式 ⇒ §21.3 的两条判断（断言只在 debug、第 ② 步要消除跨线程使用）在 `P6.04` 落地时都被推翻，落地形式改为"**第一个使用者认领**"+"两 profile 都开"+"不做 deferred"，并新增 `OQ-26`（滚动驱动与 overlay 是否共用设备）（2026-10-09 执行时新增，见下）。
 > **DEV-126** → `docs/30 §29.2.2`（新增）的规则段与计数段：`P6.05` 的 `RED` 写"3 处"（人工计数）而实测 **41 处 / 10 文件**；规则的判据必须是"**断言在早退之前**"（`Test-ReturnFollowsAssertion`），块级版会把两处合法的提前退出误报成静默跳过（2026-10-10 执行时新增，见下）。
 > **DEV-127** → `docs/30 §29.2.2`（新增）的边界段："**打印后继续**"这一类同源缺陷没有 `return;`、脚本抓不到，而能抓它的启发式会误伤只承诺不 panic 的冒烟测试 ⇒ 规则不实现、边界写进脚本头部、三处实例手工 `panic!`（2026-10-10 执行时新增，见下）。
+> **DEV-128** → `docs/30 §28.2.2`（新增）+ §5.7 行（顺带修正该行自己的"`ClientArea` 已产出"错误）+ `§33.1` 的 D-15 行 + `§35` 的 P6.3 行：`P6.06` 的 RED 写"6 处"而新脚本只报出 **2 处**路径失效（其余是散文）⇒ 实测改动 **32 个源文件**（31 `.rs` + `apps/snapclip/Cargo.toml`）；清扫按三类形态裁决（指针⇒改写 / 否定式不变量⇒保留 / 历史陈述⇒保留语义去死路径），且脚本**同时扫 `Cargo.toml` 的 `#` 注释**（`130 = 126 .rs + 4 Cargo.toml`）（2026-10-10 执行时新增，见下）。
 | # | 补充 | 为什么必须补 | 回填位置 |
 |---|---|---|---|
 | **DEV-1** | 新增 **test-only 文件** `crates/snapclip-capture/src/scroll/testkit.rs`（以 `#[cfg(test)] mod testkit;` 注册） | V2 §35 的 **P1.1** 要求"合成夹具生成器（多尺度结构 + 自证）"，而 V2 §28.2 只枚举了 `scroll/` 的 **10 个**文件、**没有给它位置**。把生成器塞进 `mod.rs`（自述"只有约 40 行"）会破坏该文件的定位；塞进 `displacement.rs` 会让"夹具"与"被测物"同文件（夹具自证的价值就是**独立于被测实现**）。**因此新增一个 test-only 文件是本清单对 V2 的最小补充** | `docs/30 §28.2` 的新增清单（10 → 11 个文件），并在 `§28.3` 的"不做"表里保留"不建 `scroll/tests/` 目录"（一个 test-only 文件 ≠ 一个测试目录） |
@@ -319,6 +320,7 @@
 | **DEV-125**（执行时新增） | `docs/30 §21.3` 的第 ② 步草图把 R-6 的不变式预设成"**创建者是 immediate context 的唯一所有者**"，而 `P6.04` 落地时实测这条**在今天的代码里是假的、且不需要成立**：唯一生产创建点 `capture_worker.rs:373` → `providers.rs:375-378 GraphicsDevice::create()` 之后创建者**从不使用** context（它只用 free-threaded 的 `ID3D11Device`），生产里每一处使用都在 `snapclip-capture-overlay` 线程上；`P0.02` 曾经的 panic 因此来自**断言本身**（假的不变式），而不是来自"代码违反真不变式"。连带被推翻的还有草图的两条判断：断言只在 `debug_assertions` 下（今天不必）与"第 ② 步要消除跨线程使用"（要消除的是**未断言的句柄**，不是跨线程调用） | 2026-10-09 执行时裁决：不变式换成"**每个 `ID3D11DeviceContext` 恰好一个使用者线程、由第一个使用者认领**"；`pub fn context()` **删除**、`AsyncSampleBuffer` 改持设备、四个使用点走私有 `owned_context(what)`（两个 profile 都开断言）；**不做 deferred context**（`Map`/`Unmap` 是 immediate-context-only，覆盖不了放大镜取样与两条回读；§21.3 自己的第二分支"把交接显式化"才是落地的那一支）；`P0.02` 的 `[!]` 因此解除，`blocked/P0-02-context-owner` 不入 `main`，第 ② 步的出口转为 **`OQ-26`**（滚动驱动与 overlay 是否共用设备：`providers.rs:639` 的回读跑在 `snapclip-scroll-driver` 上，接线那一刻断言就会报警——这正是"先断言、再证明、最后才迁移"要的时刻） | `docs/30 §21.3.1`（新增）+ `§36.2` 的 `OQ-26`（新增）；本文 §14.1、§14.2 的 `P0.02` 行、§6 `P0.02` 的后续段、§10 `P6.04` 的执行块 |
 | **DEV-126**（执行时新增） | `P6.05` 的 `RED` 行写"先报出 **3 处**"（v2 §33.1 D-14 的人工计数），而脚本全量扫出 **42 处**；把规则从"块级"（早退的外层 `{}` 里要有断言）换成"**断言在早退之前**"（`Test-ReturnFollowsAssertion`）后是 **41 处**。两处被块级版误报的早退都是**合法的**：`windows/uia_provider/tests/unit.rs` 的 `if expanded == 0 { /* UIA 没暴露任何层 */ return; }`（前一行 `assert_eq!(provider.cached_epoch(), Some(1))`）与 `d2d::tests::the_capture_box_is_blue_at_rest_and_green_while_walking`（早退前已有断言） | 2026-10-10 执行时裁决：规则的判据是"**什么时候断言过**"而不是"断言在哪一层"。理由 = 块级判据把"块内只有注释的合法提前退出"与"环境守卫"混为一谈，而两者的区别正是这条规则存在的全部理由；同时任务书的"3 处"被实测改成 41 处（"一次人工审读的计数不是全量"） | `docs/30 §29.2.2`（新增）的规则段与计数段；本文 §10 `P6.05` 的执行块 |
 | **DEV-127**（执行时新增） | `P6.05` 的规则只覆盖"**早退**"，而同一批文件里还有一类同源缺陷："**打印后继续**"——`match` 分支里 `Err(error) => eprintln!("… unavailable …")` 之后测试继续往下跑。它没有 `return;`，脚本按定义抓不到；而补一条"函数体里没有断言又打印过"的启发式会**误伤**合法的冒烟测试（`crates/snapclip-history/src/windows/source_app.rs:232` 的 `snapshot_capture_does_not_panic` 只承诺不 panic） | 2026-10-10 执行时裁决：**不实现启发式**，把边界逐字写进 `scripts/count-unignored-desktop-tests.ps1` 的头部注释；三处真实实例（`windows/win/bitblt.rs` 的 `Err(error) => eprintln!("BitBlt capture unavailable in this session: {error}")`、`windows/providers.rs` 的两处 `Err(error) => eprintln!("capture unavailable in this session: {error}")`）手工改成 `panic!`。理由 = 一个会误报的规则会被关掉，而**一条被关掉的规则比没有规则更糟**（它会把"检查过了"变成假的） | `docs/30 §29.2.2`（新增）的边界段；本文 §10 `P6.05` 的执行块 |
+| **DEV-128**（执行时新增） | `P6.06` 的 RED 行写"今天 **6 处**失败"，而新脚本 `scripts/check-stale-comment-references.ps1` 只报出 **2 处**路径失效（`windows/mod.rs:13`、`windows/win/d2d.rs:11` 的 `crate::application::capture_service`）⇒ 任务书那 6 处里**只有 2 处是机械可判定的**，另 4 处是散文（"只有 `TargetKind::TopLevelWindowFrame`"、"唯一一次 GPU→CPU 传输"、"Tauri 占用 package 名"、"把 overlay 职责记在 `renderer` 上"）。最终实测改动 **32 个源文件**（31 `.rs` + `apps/snapclip/Cargo.toml`），与 `D-14` 的 3→41 完全同型：**一个人工清点的计数只是下限** | 2026-10-10 执行时做了三处裁决：① **清扫按形态分三类**（指针⇒改写；否定式不变量⇒保留，因为 `tools/check-dependency-direction.ps1:35` 的 `$SHELL_ONLY` 正是按这些名字检查的；历史陈述⇒保留语义去死路径）；② **脚本认路径不认英语**，散文级失效由人读——写识别它们的启发式就是开始猜语义（与 `DEV-127` 的裁决同型）；③ 脚本**同时扫 `Cargo.toml` 的 `#` 注释**（`D-15` 自己的清单里就有一个 `Cargo.toml` 站点）⇒ 实测 `130 = 126 .rs + 4 Cargo.toml`。顺带记录了脚本自身的缺陷：`foreach ($root in $Root)` 与 `param([string[]]$Root)` **是同一个变量**（PowerShell 大小写不敏感）⇒ 报头错印扫描范围，"干净"不可信 | `docs/30 §28.2.2`（新增）、§5.7 行（顺带修正该行自己的"`ClientArea` 已产出"错误）、§33.1 的 D-15 行、§35 的 P6.3 行；本文 §10 `P6.06` 的执行块、§15.1 的表体回正 |
 | **DEV-78**（执行时新增） | 退出条件 ③ 写"`docs/Temp/` 与会话临时目录在测试后都为空"，但 `docs/Temp/` **就是本文档自己的暂存区**（本文 §3 与各任务的探针日志按约定写在那里），把它清空与"留下证据"直接冲突。同时 `BandStore` 有两条构造路径，而只有一条自己挑目录：`RecoveredImage::in_dir` 由调用方给路径（测试用它篡改换出文件，`§30.4` 的损坏用例），生产走 `BandStore::new` → `unique_spill_dir()` | 2026-10-09 执行时做了两处裁决：① 退出条件 ③ 的**可执行形式 = 会话临时目录零残留**，并且必须**两条构造路径都覆盖**——`RecoveredImage::in_dir` 的清理不能代表生产，因为生产路径自己创建目录、`owns_dir` 的判据也由此而来；用例 `a_cancelled_session_leaves_no_spill_files` 两半都断言，并注明"取消"在 §20.5 的语义下**没有任何清理例程会跑**，文件消失只能是因为 `Drop` 跑了。② `reclaim_spill_file` 让文件可以在会话**中途**消失（最后一条引用离开时），因此 `spill_file_bytes()` 的语义是"**此刻盘上占用**"而不是"本次会话累计换出量"——`E-MEM-1` 要的是前者（"内存下降是不是搬到了磁盘"），把它读成后者会得到一个只增不减的数字 | 回填位置 = `docs/30 §22.7.1`（新增）；本文 §10 `P4.06` 的执行块 |
 | **DEV-77**（执行时新增） | 任务书给 `P4.06` 的两个 RED 名里，`a_cancelled_session_leaves_no_spill_files()` **自 `P1.20` 起就为真**（`impl Drop for BandStore` 当时就写了：先放掉换出文件、再删自己创建的目录）。真正的缺口有两处，且两处都不在任务书写的位置：① `truncate`（`§17.6` 第 1 层）与 `remove_leading`（撤销 prepend）都会**缩小 `spilled`**，但谁都不回收文件——最后一条指向文件的条带离开后，盘上那些字节就再没有读者了；② `E-MEM-1`（§23.1）的"换出文件大小"这一列**没有任何生产者**：`SpillFile::len` 一直在维护，却只能从模块内部看见 | 2026-10-09 执行时做了三处裁决：① 两个 RED 名**逐字保留**，其中第一个落成**回归钉子**（doc 里逐字写明它自 `P1.20` 就为真、不是 RED），第二个改成它今天真正能失败的东西——`a_spill_file_is_removed_when_its_band_is_evicted_back_to_memory` 用 `truncate` 把跨过 `rows` 的那条落盘条带读回常驻（`§17.5` ⑤ 的唯一"回内存"路径），实测失败消息逐字 = `the spill file outlived the last band that pointed into it: C:\Users\…\Temp\snapclip-bands-reclaim-1448-780013200\bands.spill is still on disk`（`canvas.rs:2406`）。② 新增 `the_spill_file_size_is_recorded_separately()`，它的 RED 是**编译失败**：`error[E0599]: no method named \`spill_file_bytes\` found for struct \`BandStore\` in the current scope`（3 处）。**工作顺序 = RED 1（运行时）→ GREEN 1 → RED 2（编译）→ GREEN 2**：同一棵树上两个 RED 并存时，编译错误会把运行时失败整个盖住（`P4.05` 的同一课）；RED 2 的证据是临时用 `#[cfg(any())]` 摘掉访问器取得的，取完立刻恢复。③ `spill_file_bytes()` 与 `std::fs::metadata(dir.join(SPILL_FILE_NAME)).len()` 断言为**同一个数字**——store 自己的账和文件系统的账必须一致，否则"单独记录"只是记了另一个猜测 | 回填位置 = `docs/30 §22.7.1`（新增）+ `§23.1` 的 `E-MEM-1` 行 + `§17.5` 的"尚未落地"段；本文 §10 `P4.06` 的执行块 |
 | **DEV-76**（执行时新增） | 任务书的 REFACTOR 要求把"换出文件必须在 `Drop` 里删"写成一条**可 `grep` 的规则**，并把那条规则指名成 `impl Drop for SpillRef`。这与实现**正相反**：§17.5 ⑥ 是**一个文件装下所有已换出的条带**，所以一条 `SpillRef` 的 `Drop` 会删掉**其他**仍指向该文件的条带的存储——那不是清理，是数据丢失 | 2026-10-09 执行时裁决：可 `grep` 的规则是**两条**——`impl Drop for SpillFile`（删文件，`canvas.rs:344`）与 `impl Drop for BandStore`（删自己创建的目录，`canvas.rs:855`），两条 doc 里都逐字写出规则与"为什么在 `Drop` 里"（会话可能以 panic 结束，而"会话之后跑一段清理"正是 panic 跳过的东西）。`SpillRef` 上**刻意没有** `Drop`，这条否定事实写进它的 doc（`canvas.rs:306`）——否则下一个人会照任务书补上它。`reclaim_spill_file` 负责"最后一条引用离开时提前放手"，由两个缩小 `spilled` 的地方调用 | 回填位置 = `docs/30 §22.7.1`（新增）+ `§17.5` 的"尚未落地"段；本文 §10 `P4.06` 的执行块 |
@@ -771,7 +773,7 @@ pwsh tools/check-dependency-direction.ps1
 
 ### 4.3 Pre-push 钩子（**全文**；P0.08 负责创建与安装）
 
-> **本块是活文档。** `P0.08` 写下的是四条命令的版本；`P6.01` 加了测试计数基线（并把 `cargo test` 的输出改成**保留而不是管道**，理由见下），`P6.05` 加了"不许静默跳过"的统计脚本。以 `.githooks/pre-push` 的实际内容为准，下列全文已同步到 **2026-10-10（`P6.05`）**。
+> **本块是活文档。** `P0.08` 写下的是四条命令的版本；`P6.01` 加了测试计数基线（并把 `cargo test` 的输出改成**保留而不是管道**，理由见下），`P6.05` 加了"不许静默跳过"的统计脚本（第五道门），`P6.06` 加了"注释不许指向不存在的模块"的检查（第六道门）。以 `.githooks/pre-push` 的实际内容为准，下列全文已同步到 **2026-10-10（`P6.06`）**。它是钩子的唯一逐字副本——一份与 `.githooks/pre-push` 漂移的文档正是 `D-15` 要清理的东西。
 
 `.githooks/pre-push`：
 
@@ -809,6 +811,12 @@ echo "[pre-push] no test decides at run time that it has nothing to assert (docs
 # The defect this catches is invisible in a normal run: a test that returns early because the
 # environment is absent still prints `ok`. It has to be a gate, not a script someone remembers.
 powershell -NoProfile -File scripts/count-unignored-desktop-tests.ps1
+
+echo "[pre-push] no comment points at a module that does not exist (docs/31 P6.06, D-15)"
+# Same argument one step further out: a comment that sends the next reader to a module that was
+# renamed or deleted is a defect that no compiler and no test can see. The gate is a script for
+# the same reason as the one above.
+powershell -NoProfile -File scripts/check-stale-comment-references.ps1
 
 echo "[pre-push] OK"
 ```
@@ -2621,14 +2629,28 @@ git config core.hooksPath .githooks
 - **旁支裁决（`DEV-127`）**："打印后继续执行"这一类（`match` 分支里 `Err(error) => eprintln!("… unavailable …")` 之后测试继续往下跑）**脚本抓不到**（没有 `return;`），而"体里没有断言又打印过"的启发式会误伤合法的冒烟测试（`crates/snapclip-history/src/windows/source_app.rs:232` 的 `snapshot_capture_does_not_panic` 只承诺不 panic）⇒ 规则**不实现**，边界写进脚本头部注释；三处实例（`bitblt.rs` 的 `Err(error) => eprintln!("BitBlt capture unavailable in this session: {error}")`、`providers.rs` 的两处 `Err(error) => eprintln!("capture unavailable in this session: {error}")`）手工改成 `panic!`——`--ignored` 那次运行就是在要求一台活桌面，拒绝意味着环境不是这次运行声称的那个。
 - **未取得**：① 脚本只覆盖 `crates/` 与 `apps/` 的 `*.rs`（`-Root` 可扩），且只认"早退之前无断言"这一种形态；② 集成测试目录（`apps/snapclip/tests/`、`crates/*/tests/`）与 §13 测试矩阵里仍标 `[!]` 的三行（§13.5 #5 懒加载图片序列 / §13.5 #8 页面缩放与 `devicePixelRatio` / §13.7 #6 普通截图延迟不受滚动影响）不在本次范围；③ **没有在无桌面的会话里验证过改造后的行为**（本机永远有桌面）：`--ignored` 的运行给出了"环境具备时断言通过"的半边，"环境缺失时大声失败"的半边只有在无桌面会话或 CI 上才能实测。**这一条是本任务最值得后来者注意的边界**：脚本证明的是"守卫的形状变了"，而不是"守卫在缺环境时真的会失败"。
 
-### P6.06 D-15：6 处失效架构注释
+### P6.06 D-15：失效架构注释（**实测 32 个源文件**，任务书原写 6 处）+ 文件映射表回正
 
 **上游**：V2 §33.1 D-15、§28.2 ｜ **第一性原理**：**注释是负资产**（重构只改代码不改注释 → 新读者按注释找到**不存在的模块**）｜ **前置**：P6.04（改名必须先完成）｜ **可并行**：与 P6.05（G14）｜ **批次**：`[P6-B]` ｜ **层级/分类**：L1 / A ｜ **复杂度**：S ｜ **阻塞**：无
 
-- **RED**：`no_comment_references_a_module_that_does_not_exist()`（脚本：对每条注释里出现的 `crate::...` 路径做存在性检查）。**预期失败原因**：今天 6 处失败
-- **GREEN**：逐条改写（`windows/mod.rs:13` 的 `crate::application::capture_service`、`window_detection/mod.rs:5` 的已删除转发层、`window_detection/mod.rs:33` 的"只有 `TargetKind::TopLevelWindowFrame`"（**已是假的**：`ClientArea`/`UiElement` 已在 `uia_provider.rs:905-907`、`msaa_provider.rs:202-204` 产出并被 `overlay/hover.rs:139` 消费）、`win/d3d11.rs:250-253` 的"唯一 GPU→CPU 传输、只发生一次"（**已是假的**：回读已改惰性 `providers.rs:91-122`）、`apps/snapclip/Cargo.toml:9-11`、`windows/mod.rs:7`、以及 `ports.rs:19,41,55`（"Tauri command threads"/"The Vue toolbar" —— **Tauri 与 Vue 已在本仓库删除**））
+- **RED**：`no_comment_references_a_module_that_does_not_exist()`——新脚本 `scripts/check-stale-comment-references.ps1` 解析每一条 `//`/`///`/`//!` 注释与每个 `Cargo.toml` 的 `#` 注释里的 `crate::…`、`platform::…`、`src-tauri/…`，验证被引用的模块真的存在。**实测失败原因**：2 处路径失效（`windows/mod.rs:13`、`windows/win/d2d.rs:11` 的 `crate::application::capture_service`）⇒ **任务书写的"6 处"是人工清点的下限**：另外 4 处是散文（"只有 `TargetKind::TopLevelWindowFrame`"、"唯一一次 GPU→CPU 传输"、"Tauri 占用 package 名"、"把 overlay 职责记在 `renderer` 上"），一个只认 `crate::` 的脚本看不见它们
+- **GREEN**：逐条改写（`windows/mod.rs` 整块 + `windows/win/d2d.rs` 的 `crate::artifact::CaptureService`、`window_detection/{mod.rs,snapshot.rs}` 的已删除 `platform::…` 转发层、`window_detection/{mod.rs,model.rs}` 的"只有 `TargetKind::TopLevelWindowFrame`"（**已是假的**：`TopLevelWindowFrame` 与 `UiElement` 都在用，`ClientArea` **无生产者**）、`windows/win/d3d11.rs` 的"唯一 GPU→CPU 传输、只发生一次"（**已是假的**：回读已改惰性 `providers.rs:91-122`）、`apps/snapclip/Cargo.toml`、`windows/mod.rs` 的模块清单、`ports.rs` 的"Tauri command threads"/"The Vue toolbar"、以及 `snapclip-history`/`snapclip-model` 里指向 `IpcError`/`EventEnvelope`/迁移期转发层的注释——那两个类型**全仓只存在于注释里**）
 - **退出条件**：① 脚本输出 0 处失效引用；② 每条改写后的注释都指向**真实存在**的模块/职责
 - **提交标题**：`[P6-06] the comments stop pointing at modules that no longer exist`
+
+**状态**：`[x] 完成（2026-10-10）`
+
+**执行记录（2026-10-10）**
+
+- **RED（实测）**：`pwsh -NoProfile -File scripts/check-stale-comment-references.ps1` → `[comments] scanned 126 .rs file(s) under crates, apps` + 逐条列出 `crates/snapclip-capture/src/windows/mod.rs:13 crate::application::capture_service` 与 `crates/snapclip-capture/src/windows/win/d2d.rs:11 crate::application::capture_service` + `[comments] 2 stale reference(s); each one sends the next reader to a name that is not there`，**exit=1**（日志 `docs/Temp/p606-red.txt`）。
+- **脚本自身的缺陷（写完就暴露）**：`foreach ($root in $Root)` 与 `param([string[]]$Root)` **是同一个变量**（PowerShell 变量名大小写不敏感）⇒ 循环把 `$Root` 覆盖成 `'apps'`，报头错印 "under apps"。改成 `$scanRoot` 后报头正确。**教训**：一个扫描器打印的范围与它实际扫的范围不一致时，"干净"就不可信——所以脚本必须打印文件数，且那个数字必须能被独立复算（`130 = 126 .rs + 4 Cargo.toml`）。
+- **GREEN（三条清扫规则，写进脚本头部）**：**指针**（主动语态断言"谁产出了它/谁驱动它"，指向已删模块或已删协作者）⇒ **改写**；**否定式不变量**（"no clipboard, no SQLite, no OCR, no Tauri, no GPUI"）⇒ **保留**（它们不与任何不存在的东西相连，而且 `tools/check-dependency-direction.ps1:35` 的 `$SHELL_ONLY = @("tauri","wry","gpui","gpui-kit")` 正是按这些名字检查的）；**历史陈述**（"extracted out of the previous shell"）⇒ **保留语义、去掉死路径**。**实测改动 32 个源文件**（31 `.rs` + `apps/snapclip/Cargo.toml`），逐类见 `docs/30 §28.2.2`。
+- **REFACTOR（门禁化）**：脚本挂进 `.githooks/pre-push`（第六道门，`P6.05` 的统计脚本是第五道）并加进 `scripts/verify-hooks.ps1` 的命令数组；同时把本文 §4.3 的钩子全文同步一遍（它是钩子的唯一逐字副本）。理由 = 与 `P6.05` 同构：**看不见的纪律不存在**。
+- **DoD（实测，日志 `docs/Temp/p606-gate.txt`）**：① `pwsh -NoProfile -File scripts/check-stale-comment-references.ps1 -Details` → `[comments] scanned 130 file(s): 0 stale reference(s)`、**exit=0**；② `cargo check --workspace --all-targets` → **exit=0**（唯一 warning 是既有的 `unused variable: content_label`，`apps/snapclip/src/history/view.rs:776`）；③ `cargo test -p snapclip-capture --lib -- --test-threads=1` → **533 passed / 0 failed / 64 ignored（105.48 s）**——与 `P6.05` 后的基线**逐字相同**，这正是"只改注释"必须留下的指纹；④ `pwsh -NoProfile -File scripts/verify-hooks.ps1` → `[verify-hooks] .githooks/pre-push exists, is LF-only, and core.hooksPath = .githooks`、exit=0。
+- **同时完成的第二项职责（`P6.03` 留给本任务的文件映射表回正）**：`docs/31 §15.1` 的表体改成磁盘上的真实名字——`bands.rs` 一行并入 `crates/snapclip-capture/src/scroll/canvas.rs`（`BandStore`/`MemoryBudget`/`SpillRef` 落在 `canvas.rs:158/301/370`）、`crates/snapclip-capture/src/scroll/target.rs` 标为**计划名（磁盘上不存在）**并写明实际落点（能力探测在 `windows/scroll_source.rs` 的 `topology_outcome`/`TopologyOutcome`，端点收敛在 `scroll/displacement.rs`）、补上此前漏列的 `scroll/perf_probe.rs`（`P0.03`）与 `scroll/acceptance.rs`（`P1.24`）；表头改为"**表体 20 行 = `scroll/` 17 个实际文件 + 1 行计划名 + `windows/` 2**"，与 `tools/check-dependency-direction.ps1` 实测打印的 `17 files scanned` 一致。
+- **来源**：V2 §33.1 D-15、§28.2、§5.7；`docs/30 §28.2.2`（新增）、§5.7 行（顺带修正该行自己的"`ClientArea` 已产出"错误）、§33.1 的 D-15 行、§35 的 P6.3 行。
+- **第一性原理**：注释是**负资产**——它没有类型检查、没有测试、没有门禁，所以它的失效速度等于事实的变化速度，而**误导性注释比没有注释更贵**（AGENTS.md 第 2 条：根因优先）。
+- **未取得**：① 脚本认路径不认英语，散文级失效只能靠人读（写启发式会开始猜语义，与 `P6.05` 对"打印后继续"的裁决同型）；② 它不扫 `docs/`——文档里的失效路径由各自的回填任务负责；③ 它看不见 `#[cfg]` 门后的模块与跨 crate 的名字。
 
 ### P6.07 门禁第二遍扫描（§28.4）：`scroll/` 必须保持平台无关
 
@@ -2827,6 +2849,7 @@ git config core.hooksPath .githooks
 |---|---|---|
 | 9 个既有 `#[ignore]` | **保留**（加注"需要真实交互桌面"与恢复条件） | §30.7 第 5 行；V2 §29.6 |
 | 静默跳过（D-14，**原判 3 处、实测 41 处 / 10 文件**） | **改成两种合法形态之一**（`#[ignore]` 或显式环境断言），由 `P6.05` + 脚本守住（**脚本已挂进 `.githooks/pre-push`**） | V2 §29.2（"存在但不可见"与"不存在"等价）、§29.2.2 |
+| 失效架构注释（D-15，**原判 6 处、实测 32 个源文件**） | **改写**：路径失效由脚本守住，散文级失效按三条形态规则人工清完（**脚本已挂进 `.githooks/pre-push`**） | V2 §33.1 D-15、§28.2、§28.2.2 |
 | `crates/snapclip-capture/src/windows/hit_test.rs:435` 的 `p95 < 0.1 ms` | **保留不动**（"跟手"的已有证据） | V2 §23.3 的六子项 |
 | `apps/snapclip/tests/ui.rs` | **保留**；滚动会话**不进**这个文件（它是 shell 的 GPUI 测试，滚动预览在覆盖层线程） | V2 §29.6 + `b45` 的所有权裁决 |
 | `crates/snapclip-capture/src/windows/win/d2d/tests.rs` | **同型新增一条**（覆盖层 + 预览面板一起渲染后回读）= `P5.05` | V2 §30.6 第 9 行 |
@@ -2940,7 +2963,7 @@ git config core.hooksPath .githooks
 
 ### 15.1 文件清单
 
-**新建（表体 15 行：`scroll/` 13 + `windows/` 2；表头原写"13 个"而当时表体已是 14 行，见下方账目修正）**
+**新建（表体 20 行 = `scroll/` 17 个实际文件 + 1 行计划名（`target.rs`，磁盘上不存在）+ `windows/` 2；`pwsh tools/check-dependency-direction.ps1` 实测打印 `checked crates/snapclip-capture/src/scroll: 17 files scanned for platform references`。表头原写"13 个"、表体一度是 14/15/17 行，见下方账目修正）**
 
 | 文件 | 任务 | 内容 |
 |---|---|---|
@@ -2948,9 +2971,10 @@ git config core.hooksPath .githooks
 | `crates/snapclip-capture/src/scroll/observation.rs` | `P1.03` | `Observation`、只读视图、几何 |
 | `crates/snapclip-capture/src/scroll/displacement.rs` | `P1.04`–`P1.14` | `Displacement`、四门、三层漏斗、P1 先验、三分类 |
 | `crates/snapclip-capture/src/scroll/orb.rs` | `P1.23` | 自写 ORB（约 300–400 行，第二意见） |
-| `crates/snapclip-capture/src/scroll/canvas.rs` | `P1.17`–`P1.19` | `RecoveredImage`、`CoverageMap`、八不变量 |
-| `crates/snapclip-capture/src/scroll/bands.rs` | `P1.20`/`P1.21`/`P1.22` | `BandStore`、换出、上限、撤销 |
-| `crates/snapclip-capture/src/scroll/target.rs` | `P2.07` | `ScrollTarget`（含滚动能力与当前位置） |
+| `crates/snapclip-capture/src/scroll/canvas.rs` | `P1.17`–`P1.22` | `RecoveredImage`、`CoverageMap`、八不变量；**`BandStore`/`MemoryBudget`/`SpillRef` 也在这个文件里**（计划里的 `bands.rs` 从未成为独立文件，`P1.20`–`P1.22`；`P6.06` 把这行改成磁盘上的真实名字） |
+| `crates/snapclip-capture/src/scroll/target.rs`（**计划名，磁盘上不存在**） | `P2.07` | 计划中的 `ScrollTarget` 类型全仓不存在：滚动能力的实际落点是 `windows/scroll_source.rs`（`topology_outcome`/`TopologyOutcome`），端点候选的收敛落点在 `scroll/displacement.rs`（`P6.06` 就地注明，不再让下一个人按表找文件） |
+| `crates/snapclip-capture/src/scroll/perf_probe.rs` | `P0.03` | test-only：`E-PERF-1` 的匹配成本测量（三层漏斗的逐层归因、`layer1` 的 `full`/`revealed` 两种形状、`l123-orb` 的按投票归因），驱动脚本 `tools/p0-03-matching-cost.ps1`（**一进程一场景**，结果逐行 JSON） |
+| `crates/snapclip-capture/src/scroll/acceptance.rs` | `P1.24` | `E-ACC-1` 验收门禁：把 `docs/30 §16` 的判据写成可跑的合成语料扫描（`rows_match` 的噪声容差、`wrong` 与 `bytes_wrong` 两个指标都要断言） |
 | `crates/snapclip-capture/src/scroll/loop_control.rs` | `P3.03`–`P3.10` | 闭环、`ĝ`、自检、手动模式、取消检查点与延迟测量（含 `finish` 的两条察觉路径）→ `ScrollDriver`/`Host`（唯一的生产闭环装配） |
 | `crates/snapclip-capture/src/scroll/ports.rs` | `P3.09` | **（DEV-54）** 平台无关的端口词汇（`FrameSource`/`Poll`/`EndReason`/`FrameError`/`ScrollActuator`/`InjectPath`/`Aim`/`InjectStatus`/`InjectOutcome`）；平台侧 `pub(crate) use` re-export 名字 ⇒ 不破 §28.4 |
 | `crates/snapclip-capture/src/scroll/export.rs` | `P4.01` | **（DEV-59）** 导出接缝的词汇（`ImageMeta`/`AbortReason`/`Artifact`/`ExportError`/`RowBandSink`/`RowBandWriter`）；**只有 trait 与类型，没有实现，也不依赖 `png`** |
@@ -2966,7 +2990,7 @@ git config core.hooksPath .githooks
 
 > **注**：上表 17 行中 `scroll/` 占 15 个文件、`windows/` 占 2 个。**V2 §28.2 已按 DEV-1 回填为"10 个生产文件 + 1 个 test-only 文件（`testkit.rs`）"**，`§33.3` 的文件清单同步由 9 补为 11（原清单漏列了 `orb.rs`）。`P6.08` 只做**校验**，不再需要新增内容。
 >
-> **执行期的五处账目修正**：① **`scroll/export.rs` 是本表的第 15 行**——`P4.01` 的落点在原表里**没有位置**（`docs/30:5957` 明说 `RowBandSink`/`RowBandWriter` 的 trait 定义落 capture 侧 `scroll/`，而"新建"与"修改"两张表都容不下它），理由与落点见 `DEV-59`；`scroll/` 目录因此由 12 个文件变 **13 个**（`pwsh tools/check-dependency-direction.ps1` 实测打印 `checked crates/snapclip-capture/src/scroll: 13 files scanned for platform references`）。② 表头原写"13 个"而当时表体已是 **14 行**（`scroll/` 12 + `windows/` 2），加上本次一行是 **15 行** —— **以表体与磁盘为准，不以表头为准**；同一张表里 `bands.rs`（`P1.20`–`P1.22`）与 `target.rs`（`P2.07`）**从未成为独立文件**（`BandStore`/`MemoryBudget`/`SpillRef` 落在 `canvas.rs:158/301/370`，全仓不存在 `ScrollTarget` 类型），这两处偏差不在本任务范围内，但记在这里以免下一个人按表去找文件。③ **`P4.07` 新增两个 test-only 文件**（`alloc_probe.rs`、`mem_probe.rs`），表体变 **17 行**、`scroll/` 变 **15 个文件**；`alloc_probe.rs` 的存在理由是"一个二进制只能有一个 `#[global_allocator]`"（`DEV-79`），不是设计上的偏好——`perf_probe`（`P0.03`）已经占用了那一个。④ **`P5.03` 新增 `scroll/panel.rs`**（生产文件，`DEV-91`），`scroll/` 由 15 变 **16 个文件**——§28.5 的目录清单里没有它的位置，因为设计时"八问的答案"没有被当作一个模块（它们不是像素）。⑤ **`P5.06` 新增 `scroll/latency_probe.rs`**（test-only，`E-PERF-4` 的生产者那一半；消费者那一半按 `DEV-103` 落在 `windows/win/d2d/tests.rs`，不新增文件），`scroll/` 由 16 变 **17 个文件**。**门禁打印的计数序列 = 13（`P4.01`）→ 15（`P4.07`）→ 16（`P5.03`）→ 17（`P5.06`）**。
+> **执行期的五处账目修正**：① **`scroll/export.rs` 是本表的第 15 行**——`P4.01` 的落点在原表里**没有位置**（`docs/30:5957` 明说 `RowBandSink`/`RowBandWriter` 的 trait 定义落 capture 侧 `scroll/`，而"新建"与"修改"两张表都容不下它），理由与落点见 `DEV-59`；`scroll/` 目录因此由 12 个文件变 **13 个**（`pwsh tools/check-dependency-direction.ps1` 实测打印 `checked crates/snapclip-capture/src/scroll: 13 files scanned for platform references`）。② 表头原写"13 个"而当时表体已是 **14 行**（`scroll/` 12 + `windows/` 2），加上本次一行是 **15 行** —— **以表体与磁盘为准，不以表头为准**；同一张表里 `bands.rs`（`P1.20`–`P1.22`）与 `target.rs`（`P2.07`）**从未成为独立文件**（`BandStore`/`MemoryBudget`/`SpillRef` 落在 `canvas.rs:158/301/370`，全仓不存在 `ScrollTarget` 类型）—— `P6.06` 已把表体改成磁盘上的真实名字（`canvas.rs` 一行合并 `bands.rs`，`target.rs` 标为计划名并写明落点），并补上此前漏列的两个真实文件（`perf_probe.rs`、`acceptance.rs`）。③ **`P4.07` 新增两个 test-only 文件**（`alloc_probe.rs`、`mem_probe.rs`），表体变 **17 行**、`scroll/` 变 **15 个文件**；`alloc_probe.rs` 的存在理由是"一个二进制只能有一个 `#[global_allocator]`"（`DEV-79`），不是设计上的偏好——`perf_probe`（`P0.03`）已经占用了那一个。④ **`P5.03` 新增 `scroll/panel.rs`**（生产文件，`DEV-91`），`scroll/` 由 15 变 **16 个文件**——§28.5 的目录清单里没有它的位置，因为设计时"八问的答案"没有被当作一个模块（它们不是像素）。⑤ **`P5.06` 新增 `scroll/latency_probe.rs`**（test-only，`E-PERF-4` 的生产者那一半；消费者那一半按 `DEV-103` 落在 `windows/win/d2d/tests.rs`，不新增文件），`scroll/` 由 16 变 **17 个文件**。**门禁打印的计数序列 = 13（`P4.01`）→ 15（`P4.07`）→ 16（`P5.03`）→ 17（`P5.06`）**。
 
 **仓库级门禁工件的文件（`P0.08` 新建，不属于滚动功能本身）**
 
@@ -2978,6 +3002,8 @@ git config core.hooksPath .githooks
 | `scripts/record-baseline.ps1` | **新建**（`P0.01` 补齐）。测量四个 crate 的 `passed/failed/ignored` + 全部用例名 + `cargo check` 的 warning 计数与位置；`-Compare` 把漂移指名到具体测试并按 §2.6 报红 |
 | `scripts/ocr-serve.ps1` | **此前未跟踪，`P0.08` 纳入版本控制**。`package.json` 的 `"ocr:serve"` 指向它，干净 clone 必须能跑（顺带修掉的仓库缺陷） |
 | `.gitignore` | **修改**。新增 `scripts/*.log`（`ocr-serve.ps1` 的运行时日志） |
+| `scripts/count-unignored-desktop-tests.ps1` | **新建**（`P6.05`）。扫描每个非 `#[ignore]` 的 `#[test]` 函数体：**早退之前必须出现过断言**，否则报 `file:line testname reaches a return without asserting`；另断言每条 `#[ignore]` 都带理由。挂进 `.githooks/pre-push`（第五道门）。头部注释写明它**刻意不实现**的启发式（"打印后继续"，见 `DEV-127`） |
+| `scripts/check-stale-comment-references.ps1` | **新建**（`P6.06`）。解析 `crates/*/src`、`apps/*/src` 的 `.rs` 与四个 `Cargo.toml` 里的注释，验证每个 `crate::…` 路径真实存在（除最后一段外每段都必须是模块）、`platform::…` 与 `src-tauri/` 一见即死。挂进 `.githooks/pre-push`（第六道门） |
 
 **修改（不新增文件，全部在既有文件内）**
 
@@ -2986,11 +3012,12 @@ git config core.hooksPath .githooks
 | `crates/snapclip-capture/src/windows/win/wgc.rs` | `P2.01`/`P2.04` | `CreateForWindow`、会话级 pool/session/bufferCount=3、`CaptureCapabilities`（**不拆文件**） |
 | `crates/snapclip-capture/src/windows/providers.rs` | `P2.02` | `ProviderKind::WgcWindow`、多次 `read_region`、每步一次回读的计数断言 |
 | `crates/snapclip-capture/src/session.rs` | `P6.03` | 删 `CaptureState::Adjusting` |
-| `crates/snapclip-capture/src/windows/mod.rs` | `P6.04`/`P6.06` | 改名 `window_detection` → `top_level_provider`；删失效注释 |
+| `crates/snapclip-capture/src/windows/mod.rs` | `P6.04`/`P6.06` | 改名 `window_detection` → `top_level_provider`；**整块重写模块清单**（补 `overlay`/两个 worker/三个 provider/两个 scroll 模块/`timed_call`，末段改为 `crate::artifact::CaptureService`） |
 | `crates/snapclip-capture/src/windows/win/bitblt.rs`、`providers.rs`、`window_detection.rs` | `P6.05` | **实测 41 处**（不止这三处）静默跳过改成两种合法形态（**注意 `window_detection.rs` 在 `P6.04` 改名后为新路径 `top_level_provider.rs`**）；另加 `scripts/count-unignored-desktop-tests.ps1` |
 | `apps/snapclip/src/capture/artifact_writer.rs` | `P4.03`/`P4.04` | 删 4 份拷贝中的 2 份中间整图、`u32` 越界改为拒绝 |
 | `apps/snapclip/src/capture/`（新增 `row_band_png.rs` 之类的实现文件） | `P4.02` | `PngRowBandSink`（**这是 shell 侧唯一的新文件**） |
-| `crates/snapclip-capture/src/ports.rs` | `P6.06` | `:19,41,55` 的失效注释（Tauri/Vue） |
+| `crates/snapclip-capture/src/ports.rs` | `P6.06` | 失效注释（Tauri/Vue）⇒ 改成今天真实的形状（"the shell's ordinary threads" / "The overlay's toolbar"） |
+| `crates/snapclip-capture/src/windows/win/d2d.rs`、`window_detection/{mod,model,snapshot}.rs`、`windows/win/d3d11.rs`、`windows/{overlay,monitor,uia_provider}.rs`、`lib.rs`、`annotation.rs`、`error.rs`、`monitor_cache.rs` + `crates/snapclip-history/src/{blob_store,db,error,image,ingest,store}.rs` + `crates/snapclip-model/src/{error,events,lib}.rs` + `apps/snapclip/{Cargo.toml,src/{capture/mod,clipboard,clipboard_ingest,events/mod,history/{icons,model,view}}.rs}` | `P6.06` | 其余 **30 个源文件**的失效注释（路径失效 / 被推翻的事实 / 错误的职责 / 已删的协作者，逐类见 `docs/30 §28.2.2`）；加 `scripts/check-stale-comment-references.ps1` |
 | `crates/snapclip-capture/src/windows/win/d2d/tests.rs` | `P5.05` | 同型新增"覆盖层 + 预览面板"回读用例 |
 | `tools/check-dependency-direction.ps1` | `P6.07` | 第二遍扫描：`scroll/` 平台纯度（**已于 2026-10-08 提前落地于 P1 阶段退出条件 ①**，见 §0.6 的 DEV-35） |
 | `.githooks/pre-push` | `P0.08` | 新建并通过 `core.hooksPath` 生效 |
@@ -3092,7 +3119,7 @@ git config core.hooksPath .githooks
 | `P5.4` | 渲染回读断言 | `P5.05` |
 | `P6.1` | 执行 D/R 与改名 | `P6.03`/`P6.04` |
 | `P6.2` | 修复静默跳过（**原写 3 处，实测 41 处**） | `P6.05`（完成：脚本 + 钩子） |
-| `P6.3` | 6 处失效注释 | `P6.06` |
+| `P6.3` | 失效注释（**原写 6 处，实测 32 个源文件**）+ 文件映射表回正 | `P6.06`（完成：脚本 + 钩子） |
 | `P6.4` | 门禁第二遍扫描 | `P6.07` |
 | `P6.5` | `E-PERF-*` 回填 §23.3 | `P6.08` |
 | `P6.6` | 命名一致性 | `P6.08` |

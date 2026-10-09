@@ -808,7 +808,7 @@ F5 / 托盘 / 热键                      （windows/hotkey.rs、apps/snapclip/s
 | "边写边算 blake3" | `artifact_store.rs` 头注释 `:4-5` 声称 "computes the blake3 fingerprint **while writing**" | `:56` 是 `blake3::hash(&output.bytes)`——**对内存 bytes**，不是流式 | 事实错误（E2）；且 `blob_store` 写完还要 `verify_existing` 把文件整份**再读一遍**（`blob_store.rs:71`、`:149-168`），外加每次写入一次 `fsync`（`:143-147`） |
 | `docs/23` 状态 | T6.x 标 `[ ]` | P6 已落地（`d7b5708`）；T1.6.2/4/5 标"顺延"但已完成（`overlay/input.rs` `80bd318`、`overlay/render_submit.rs` `bae01d3`、`overlay/window_restore.rs` `d257fda`、`overlay/session.rs` `8b1839b`、`overlay/hover.rs` `ed19d15`） | 过期；`docs/24 §S0.1` 要对齐的基准本身不可信 |
 | 门禁命令 | `docs/23:32` G2 用 `cargo test -p snapclip` | 该 package 名不存在（`apps/snapclip/Cargo.toml:2 name = "snapclip-app"`） | 门禁不可运行 |
-| 6 处失效架构注释 | — | `windows/mod.rs:13` 引用不存在的 `crate::application::capture_service`；`window_detection/mod.rs:5` 引用已删除的 `platform::windows::capture::win::window`；`windows/mod.rs:7` 把 overlay 职责记在 `renderer` 上；`win/d3d11.rs:250-253` 说"唯一一次 GPU→CPU 传输"；`apps/snapclip/Cargo.toml:9-11` 说 Tauri 占用 package 名 `snapclip`；`window_detection/mod.rs:33` 说"只有 `TargetKind::TopLevelWindowFrame`"（实际 `ClientArea`/`UiElement` 已在 `uia_provider.rs:905-907`、`msaa_provider.rs:202-204` 产出并被 `overlay/hover.rs:139` 消费） | 建议随 §33 一并清理（它们会让新工程师得出错误结论） |
+| 6 处失效架构注释 | — | `windows/mod.rs:13` 引用不存在的 `crate::application::capture_service`；`window_detection/mod.rs:5` 引用已删除的 `platform::windows::capture::win::window`；`windows/mod.rs:7` 把 overlay 职责记在 `renderer` 上；`win/d3d11.rs:250-253` 说"唯一一次 GPU→CPU 传输"；`apps/snapclip/Cargo.toml:9-11` 说 Tauri 占用 package 名 `snapclip`；`window_detection/mod.rs:33` 说"只有 `TargetKind::TopLevelWindowFrame`"（实际 `ClientArea`/`UiElement` 已在 `uia_provider.rs:905-907`、`msaa_provider.rs:202-204` 产出并被 `overlay/hover.rs:139` 消费） | **已完成**（`P6.06`，2026-10-10）：见 §33.1 的 `D-15` 行与 §28.2。脚本 `scripts/check-stale-comment-references.ps1` 把机械的那一半门禁化，RED 只报出 **2 处**路径失效，其余全是散文 ⇒ 实际改动 **32 个源文件**（31 `.rs` + `apps/snapclip/Cargo.toml`）。顺带修正本行自己的一个错误：`ClientArea` **没有任何生产者**（实际只有 `uia_provider.rs:904-908`/`msaa_provider.rs:201-205` 的 `UiElement` 与 `TopLevelWindowFrame`，被 `overlay/hover.rs:137-141` 消费），本行原写"`ClientArea`/`UiElement` 已产出"是把**声明当成了实现** |
 
 ### 5.7 代码现实对 V2 的十条硬约束
 
@@ -5693,7 +5693,7 @@ crates/snapclip-capture/src/scroll/
 └── panel.rs            # 预览面板的模型：八问的答案 + 视口框几何（P5.03 落点，见 §19.4.1）
 ```
 
-**这份清单是计划，不是现状**（`P4.01` 回填时核对）：`bands.rs` 与 `target.rs` **从未成为独立文件**（`BandStore`/`MemoryBudget`/`SpillRef` 落在 `canvas.rs:158/301/370`，全仓不存在 `ScrollTarget` 类型），而 `ports.rs`/`export.rs`/`panel.rs` 是执行时新增的（`panel.rs` 见 §19.4.1：`P5.03` 才发现"八问的答案"需要一个没有位置的家）。**权威是门禁**：`pwsh tools/check-dependency-direction.ps1` 会打印 `checked crates/snapclip-capture/src/scroll: N files scanned for platform references`，`P4.01` 落地后该数字是 **13**、`P5.02` 是 **15**、`P5.03` 是 **16**（10 个生产文件 + test-only 的 `testkit.rs`/`acceptance.rs`/`perf_probe.rs`/`alloc_probe.rs`/`mem_probe.rs`）。
+**这份清单是计划，不是现状**（`P4.01` 回填时核对）：`bands.rs` 与 `target.rs` **从未成为独立文件**（`BandStore`/`MemoryBudget`/`SpillRef` 落在 `canvas.rs:158/301/370`，全仓不存在 `ScrollTarget` 类型），而 `ports.rs`/`export.rs`/`panel.rs` 是执行时新增的（`panel.rs` 见 §19.4.1：`P5.03` 才发现"八问的答案"需要一个没有位置的家）。**权威是门禁**：`pwsh tools/check-dependency-direction.ps1` 会打印 `checked crates/snapclip-capture/src/scroll: N files scanned for platform references`，`P4.01` 落地后该数字是 **13**、`P5.02` 是 **15**、`P5.03` 是 **16**、`P5.06` 是 **17**（`P6.06` 复核时的实测值；10 个生产文件 + test-only 的 `testkit.rs`/`acceptance.rs`/`perf_probe.rs`/`alloc_probe.rs`/`mem_probe.rs`/`latency_probe.rs`）。
 
 **新增（test-only，不进生产二进制）**：
 
@@ -5722,9 +5722,9 @@ crates/snapclip-capture/src/windows/scroll_actuator.rs   # SendInput / PostMessa
 | `windows/providers.rs` | 新增 `ProviderKind::WgcWindow`（或等价的目标类型），新增 `read_region` 的"会话级多次调用"路径 | 回读的实现在这里（`read_back_region_bgra`），不移动 |
 | `session.rs`（capture 根） | **删除 `CaptureState::Adjusting`** | §5 已确证它**不可达**且契约里挂着（`session.rs:515-517` 自承 "not reachable until its phase lands"）。**一个永远不会到的状态是契约负债**（§20.3） |
 | `windows/mod.rs` | 把 `pub mod window_detection;`（v1 provider 实现）**改名为 `pub mod top_level_provider;`** | 解决 §5 已确证的**同名双模块**：根 `crate::window_detection`（纯契约）与 `crate::windows::window_detection`（FFI 实现）今天同名，读代码时必须靠路径区分，容易误读 |
-| `windows/mod.rs:13`、`window_detection/mod.rs:5`、`windows/win/d3d11.rs:250-253`、`window_detection/mod.rs:33`、`apps/snapclip/Cargo.toml:9-11`、`windows/mod.rs:7` | **修正 6 处失效架构注释**（§5 逐条列出） | 它们指向**不存在的模块**或**已被推翻的事实**（如"只有 `TopLevelWindowFrame`"、"唯一的 GPU→CPU 传输只发生一次"）。AGENTS.md 第 2 条（根因优先）：**误导性注释是根因级的缺陷** |
+| `windows/mod.rs:13`、`window_detection/mod.rs:5`、`windows/win/d3d11.rs:250-253`、`window_detection/mod.rs:33`、`apps/snapclip/Cargo.toml:9-11`、`windows/mod.rs:7` | **修正失效架构注释**（§5 逐条列出；**`P6.06` 实测 32 个源文件**，见 §28.2.2） | 它们指向**不存在的模块**或**已被推翻的事实**（如"只有 `TopLevelWindowFrame`"、"唯一的 GPU→CPU 传输只发生一次"）。AGENTS.md 第 2 条（根因优先）：**误导性注释是根因级的缺陷** |
 
-**不改动**：`annotation.rs`、`geometry.rs`、`ring_contrast.rs`、`sampler.rs`、`artifact.rs`、`diagnostics.rs`、`monitor_cache.rs`、`ports.rs`、`runtime.rs`、`window_detection/*`（纯契约与策略）。
+**不改动**（`P6.06` 复核：这九个文件里，`monitor_cache.rs`、`ports.rs` 与 `window_detection/*` 最终**只改了注释**、代码一行未动，`P6.04` 的改名除外）：`annotation.rs`、`geometry.rs`、`ring_contrast.rs`、`sampler.rs`、`artifact.rs`、`diagnostics.rs`、`monitor_cache.rs`、`ports.rs`、`runtime.rs`、`window_detection/*`（纯契约与策略）。
 
 #### 28.2.1 落地（`P6.03`，2026-10-09）：不可达状态被删除，而不是被记录
 
@@ -5749,6 +5749,48 @@ a state nothing can reach has to be deleted rather than documented (§28.2, ADR-
 **`docs/11` §2.2 不动**：它是 Phase 0 契约的**历史**来源；删掉它会让"契约为什么是这七个状态"失去出处。权威在 §28.2 的表行与 ADR-16。
 
 **门禁**：`cargo test --workspace --lib -- --test-threads=1` → app **64/0/3**、capture **572/0/24**（新增 1 条）、history **51**、model **23**；`cargo check --workspace --all-targets` → 0 error；依赖门禁 clean。
+
+#### 28.2.2 落地（`P6.06`，2026-10-10）：注释是负资产
+
+**任务书写的"6 处"是**一个人工清点的下限**，与 `D-14` 的"3 处"同型**：`P6.06` 实际改 **32 个源文件**（31 个 `.rs` + `apps/snapclip/Cargo.toml`），跨越四个 crate 与 shell。改法不是"把 6 条抄一遍"，而是**先让机械的那一半可判定，再把不能判定的那一半按规则清完**。
+
+**RED**：新增 `scripts/check-stale-comment-references.ps1`（三条规则：①`crate::a::b::…` 里除最后一段外每段都必须是模块——最后一段通常是 item，大写段提前结束链；②`platform::…` 一见即死，本工作区没有任何 crate 有 `platform` 模块，Win32 层是 `crate::windows`；③`src-tauri/` 一见即死，那棵树已被删除）。首跑逐字（日志 `docs/Temp/p606-red.txt`，exit=1）：
+
+```
+[comments] scanned 126 .rs file(s) under crates, apps
+  - crates/snapclip-capture/src/windows/mod.rs:13 crate::application::capture_service
+  - crates/snapclip-capture/src/windows/win/d2d.rs:11 crate::application::capture_service
+[comments] 2 stale reference(s); each one sends the next reader to a name that is not there
+```
+
+⇒ **6 处里只有 2 处是"路径失效"，其余 4 处是散文**（"只有 `TopLevelWindowFrame`"、"唯一一次 GPU→CPU 传输"、"Tauri 占用 package 名"、"把 overlay 职责记在 `renderer` 上"）。一个只认 `crate::` 的脚本永远看不见它们。
+
+**脚本自身的缺陷（写完就暴露）**：`foreach ($root in $Root)` 与 `param([string[]]$Root)` **是同一个变量**（PowerShell 变量名大小写不敏感）⇒ 循环把 `$Root` 覆盖成 `'apps'`，报头错印 "under apps"。改成 `$scanRoot` 后报头正确。这也说明**报头必须被打断**：一个扫描器打印的文件数与它实际扫的范围不一致时，"干净"就不可信。
+
+**GREEN 的三条清扫规则**（写进脚本头部，因为它们决定了下一个人该改什么）：
+
+| 形态 | 处理 | 理由 |
+|---|---|---|
+| **指针**（主动语态断言"谁产出了它/谁驱动它"，指向已删模块或已删协作者） | **改写** | 它*告诉*读者去看一个不存在的东西 |
+| **否定式不变量**（"no clipboard, no SQLite, no OCR, no Tauri, no GPUI"） | **保留** | 它不与任何不存在的东西相连，而且 `tools/check-dependency-direction.ps1` 的 `$SHELL_ONLY = @("tauri","wry","gpui","gpui-kit")` 正是按这些名字检查的 |
+| **历史陈述**（"extracted out of the previous shell"） | **保留语义、去掉死路径** | `src-tauri/` 已经不在树里，句子留着路径只会让读者去 `ls` 一个不存在的目录 |
+
+**逐类改动**（32 个文件，全部只改注释，行为零变化）：
+
+- **路径失效（2 处机械 + 4 处散文）**：`crate::application::capture_service` → `crate::artifact::CaptureService`（`windows/mod.rs`、`win/d2d.rs`）；`platform::windows::capture::win::window` → `crate::windows::win::window`（`window_detection/mod.rs`、`:snapshot.rs`）；`platform::windows::capture::monitor` → `crate::windows::monitor`（`monitor_cache.rs`）；`src-tauri/src/{icon.rs,infrastructure/…,app/…}` 六处死路径（`apps/snapclip/Cargo.toml`、`clipboard.rs`、`clipboard_ingest.rs`、`blob_store.rs`、`db.rs`、`error.rs`、`image.rs`、`store.rs`）。
+- **被推翻的事实**：`win/d3d11.rs` 的 `read_back_bgra` 不再是"唯一一次 GPU→CPU 传输"（回读已改为按区域惰性，`providers.rs:91-122`）；`window_detection/{mod.rs,model.rs}` 不再说"v1 只有 `TopLevelWindowFrame`"——实际在用的是 `TopLevelWindowFrame`（窗口吸附）与 `UiElement`（精化走查，`uia_provider.rs:904-908`、`msaa_provider.rs:201-205`），**`ClientArea` 声明了但没有生产者**（这一条连本文 §5 与 §33.1 都写错过，见两处的就地更正）；`uia_provider.rs` 的同句一并改。
+- **错误的职责**：`windows/mod.rs` 整块重写（`renderer` 只负责 D3D11 swap chain 与 Direct2D target，overlay 的 HWND/消息循环/输入/会话生命周期归 `overlay`；模块清单补齐 `overlay`/`detection_worker`/`refinement_worker`/`top_level_provider`/`uia_provider`/`msaa_provider`/`scroll_source`/`scroll_actuator`/`timed_call`）；`ports.rs` 的"Tauri command threads"→"the shell's ordinary threads"、"The Vue toolbar"→"The overlay's toolbar"。
+- **已删的协作者**：`windows/overlay.rs`、`annotation.rs`、`events/mod.rs`、`history/view.rs`、`history/model.rs`、`history/icons.rs`、`capture/mod.rs`、`lib.rs`（T1.9 的"将来会变成门禁"改成今天真实存在的门禁名）、`history/{db,error,store}.rs` 与 `snapclip-model/{lib,events,error}.rs` 的 `IpcError`/`EventEnvelope`/迁移期转发层。
+
+**`IpcError`/`EventEnvelope` 的特殊之处**：它们**全仓只出现在注释里**（`grep` 零代码命中）⇒ 注释不仅在指向不存在的东西，而且**指向一个从未存在的类型**。这是"计划语言"最贵的形态：读者会以为 IPC 层存在、以为有个信封类型在别处。
+
+**REFACTOR（门禁化）**：`scripts/check-stale-comment-references.ps1` 进 `.githooks/pre-push`（第六道门），并加进 `scripts/verify-hooks.ps1` 的命令数组。理由与 `P6.05` 同构：**看不见的纪律不存在**——一个只在有人记得时才跑的脚本，就是下一个 `crate::application::capture_service`。它同时覆盖 `Cargo.toml`（`#` 注释），因为 `D-15` 自己的清单里就有一个 `Cargo.toml` 站点。
+
+**边界（刻意不做的）**：脚本认路径，不认英语。"Tauri event publication"、"the Vue toolbar"、"the only GPU→CPU transfer"这类**散文级**失效，只能靠人读；写一条识别它们的启发式规则会开始猜语义（与 `P6.05` 对"打印后继续"的裁决同型）。
+
+**实测（`docs/Temp/p606-gate.txt`）**：`pwsh -NoProfile -File scripts/check-stale-comment-references.ps1 -Details` ⇒ `scanned 130 file(s): 0 stale reference(s)`（126 `.rs` + 4 `Cargo.toml`）、exit=0；`cargo check --workspace --all-targets` ⇒ exit=0（唯一 warning 是既有的 `unused variable: content_label`，`apps/snapclip/src/history/view.rs:776`）；`cargo test -p snapclip-capture --lib -- --test-threads=1` ⇒ **533 passed / 0 failed / 64 ignored（105.48 s）**（与 `P6.05` 后的基线逐字相同——注释不改行为，这正是**门禁数字必须不变**的那个场合）。
+
+**未取得**：① 脚本无法判定"散文说得对不对"（已知边界，见上）；② 它只扫 `crates/*/src`、`apps/*/src` 与各 crate 的 `Cargo.toml`，**不扫 `docs/`**——文档里的失效路径由各自的回填任务负责（本文 §5/§33.1 的两处就地更正即由本任务完成）；③ 它看不见 `#[cfg]` 门后的模块与跨 crate 的名字（`snapclip-history`'s service layer 是散文，不是路径）。
 
 
 ### 28.3 明确**不**做的目录操作（以及理由）
@@ -6408,7 +6450,7 @@ fn rows_match(actual, expected, sigma) -> bool
 | D-12 | `as u32` 无检查截断 | `apps/snapclip/src/capture/artifact_writer.rs:42-43` | 超限尺寸静默截断 → 产出**尺寸错误的图**而不是报错 | 尺寸域假设"不会超"；`image.rs:26-35` 已经用 `u64` 做对了，**这里没有对齐** | 删除；超限在 `begin` **之前**拒绝（§26.1） |
 | D-13 | 缩略图死分支与"读全量原图当缩略图" | `store.rs:434-437`（`role == "thumbnail"` 无人写入）+ `history/model.rs:178-187` | 一条 30 万像素高的截图让历史列表**单行加载约 2 GiB** | 存储层预留了缩略图角色但**没有任何生产者**，而消费者假设它存在 | 删除该分支；长图缩略必须走**窗口化**路径（§19.2、ADR-5） |
 | D-14 | 静默跳过的真实桌面测试（**原判 3 处，`P6.05` 实测 41 处**） | `bitblt.rs:128-145`、`providers.rs:684-747`、`window_detection.rs:121-325`（即今 `top_level_provider.rs`） | 无桌面 session 上 `cargo test` **静默通过**，门禁是假的 | 把"环境不具备"与"用例通过"混为一谈 | 删除静默 `return`；只允许 `#[ignore]` 或显式环境断言（§29.2、§29.2.2、ADR-16）——**已由 `P6.05` 完成并门禁化（脚本进 `.githooks/pre-push`）** |
-| D-15 | 6 处失效架构注释 | `windows/mod.rs:13`、`window_detection/mod.rs:5,33`、`win/d3d11.rs:250-253`、`apps/snapclip/Cargo.toml:9-11`、`windows/mod.rs:7`、`ports.rs:19,41,55` | 新读者按注释找到**不存在的模块**或**错误的职责** | 重构时只改代码不改注释 → 注释变成**负资产** | 删除/改写（§28.2） |
+| D-15 | 失效架构注释（**原判 6 处，`P6.06` 实测 32 个源文件**） | `windows/mod.rs:13`、`window_detection/mod.rs:5,33`、`win/d3d11.rs:250-253`、`apps/snapclip/Cargo.toml:9-11`、`windows/mod.rs:7`、`ports.rs:19,41,55` | 新读者按注释找到**不存在的模块**或**错误的职责** | 重构时只改代码不改注释 → 注释变成**负资产** | 改写（§28.2）——**已由 `P6.06` 完成并门禁化**（`scripts/check-stale-comment-references.ps1` 进 `.githooks/pre-push`）；机械可判定的只有 **2 处**路径失效，其余是散文，见 §28.2.2 |
 
 **D-10 为什么必须拆成两条**：`crates/snapclip-capture/src/windows/win/wgc.rs:106-108` 与 `:110-112` 的失败模式**方向相反**。前者 `.map_err(...)?` 传播 → 接口不可用时**整个捕获失败**（Win10 1903–1904 上 `IGraphicsCaptureSession2` 确实不存在）；后者只 `eprintln!` → **静默降级**。把两者写成同一条"吞错误"，会同时掩盖"该降级的地方在硬失败"与"该报出来的地方在静默"，而这两者需要**相反**的修法。
 
@@ -6647,7 +6689,7 @@ fn rows_match(actual, expected, sigma) -> bool
 |---|---|---|
 | P6.1 | 执行 §33.1 的 D-1…D-15（其中 **D-10 已拆为 D-10a/D-10b**，共 16 项）、§33.2 的 R-1…R-7、§33.4 的改名 | 全部完成且 §30 的 A 类回归全过 |
 | P6.2 | 修复静默跳过（D-14）**（`P6.05` 完成：实测 41 处而非 3 处）** | 写一个统计脚本：非 `#[ignore]` 的真实桌面用例数 == 0（已挂进 `.githooks/pre-push`） |
-| P6.3 | 6 处失效注释（D-15） | 逐个 `grep` 验证被引用的模块确实存在 |
+| P6.3 | 失效注释（D-15）**（`P6.06` 完成：实测 32 个源文件而非 6 处）** | 脚本 `scripts/check-stale-comment-references.ps1` 逐条解析注释里的路径并验证其存在（已挂进 `.githooks/pre-push`，RED 只报出 2 处路径失效 ⇒ 散文部分由人工按三条规则清完，见 §28.2.2） |
 | P6.4 | 门禁加第二遍扫描（§28.4） | `tools/check-dependency-direction.ps1` 通过 |
 | P6.5 | `E-PERF-1..4` 回填 §23.3 的"待测"格子 | **§23.3 不再有 `待测`** |
 | P6.6 | 按 §2.2 的九实体口径做一次全文命名一致性检查 | 无旧名（`ScrollFrame`/`Alignment`/`DriverCommand`/`PreviewPatch`…）残留 |
