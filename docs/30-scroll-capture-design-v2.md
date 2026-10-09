@@ -5982,7 +5982,8 @@ fn rows_match(actual, expected, sigma) -> bool
 | 捕获路径不变 | `attempt_order` 行为 | 与改动前一致（`P2.06` 只加滚动路径自己的顺序，未改 `attempt_order`；`providers::tests::wgc_is_tried_before_the_bitblt_fallback` 继续钉住） | L2 | — |
 | 依赖门禁 | `tools/check-dependency-direction.ps1` | 干净（含 §28.4 的新扫描） | CI | — |
 | 无可达状态负债 | 枚举全部 `CaptureState` 变体 | 每个都有测试可达（删除 `Adjusting` 后） | L1 | — |
-| 无静默跳过 | 全部真实桌面用例 | 只有 `#[ignore]` 或被计数的跳过 | CI（脚本统计） | — |
+| 无静默跳过 | 全部真实桌面用例 | 只有 `#[ignore]` 或被计数的跳过 | CI（脚本统计） |
+| A 类行为冻结 | 每次改动前后 | 十类行为的三十条测试仍在，且都不带 `#[ignore]`；九条既有桌面探针仍存在且仍被 `#[ignore]` | L1 | — （`P6.01` 落成 `apps/snapclip/tests/regression_baseline.rs`；数字基线 = `tools/check-test-baseline.ps1`，由 `pre-push` 对刚跑完的日志执行，见 `§33.6.1`） | — |
 
 **矩阵规模**：A 类（§30.7 后半 + 既有测试）约 20 行、B 类（30.1–30.4、30.6）约 55 行、C 类（30.5）9 行、D 类（§30.2 的失败行 + §30.3 的拒绝行 + §30.4 的上限/越界 + §30.7 的越界）约 **30 行**。
 
@@ -6307,6 +6308,14 @@ fn rows_match(actual, expected, sigma) -> bool
 ```
 
 **理由**：AGENTS.md 第 7/8 条要求"根因解决 + 新功能正确 + **相关已有功能正常** + 验证通过"。第 1 步是把"相关已有功能正常"变成**可判定**的唯一办法。**任何一步的顺序颠倒都会把"破坏性重构"变成"不可验证的重写"。**
+
+#### 33.6.1 第 1 步的落地形状（`P6.01`，2026-10-09）
+
+**表**：`apps/snapclip/tests/regression_baseline.rs`。三十行，十类行为（`f5_full_flow` / `region_capture` / `window_capture` / `browser_window` / `hotkey` / `cancel` / `history_ui` / `hit_test_budget` / `capture_path_unchanged` / `capture_state_coverage`），每行 = 一个行为 + 一个文件 + 一个测试名。元测试 `the_regression_suite_names_the_behaviours_it_freezes()` 三种红法：某个行为一行都没有（`BEHAVIOURS` 是**闭集**，没有通配分支）、某行点名的 `fn` 在文件里不存在、被冻住的测试**自己带着 `#[ignore]`**（一个不跑的测试冻不住任何东西）。第二条 `the_pre_existing_desktop_probes_are_still_present_and_still_ignored()` 把 `P6.01` 说的"**9 个既有 `#[ignore]` 保留**"钉住：9 条逐条存在且逐条仍然被 `#[ignore]`。**这 9 条是 V1 时代的那 9 条**（app 3 + capture 6：`ring_contrast_probe`、`browser_element_probe`、`dump_uia_names_under_the_cursor`、`explorer_rule_probe`、`write_drawn_text_for_the_font_subset`、`font_cost_probe`、`the_shell_can_host_the_capture_overlay`、`the_pipeline_starts_and_stops`、`the_icon_can_be_created_and_taken_away`），**不是今天的 24 条**——滚动工作自己又加了 15 条需要真实桌面的 `#[ignore]`，把它们写进钉子只会让 `P6.05`/`P6.06` 的合法增删变成噪音。
+
+**数字**：`tools/check-test-baseline.ps1` 读一份 workspace `--lib` 的运行日志，按 `Running unittests … (<deps 文件名>)` 归到 crate，取每段**最后**一条 `test result:`（公寓钉子会自我重跑并打印自己的 `1 passed; … filtered out`，取第一条会把它当成结果），然后拒绝 `failed > 0` 或任一 crate 的 `passed + ignored` 低于 §0.3 的基线。`.githooks/pre-push` 现在把 §4.3 的那次运行**留存**在 `target/test-baseline.log` 并执行这个脚本（用重定向而不是管道，因为 `/bin/sh` 不保证有 `set -o pipefail`）。实测：`app 59→67（+8）`、`capture 354→593（+239）`、`history 51→51`、`model 23→23`，全 0 failed；把 app 的 `64 passed` 改成 `40 passed` 的日志会让它退出 1 并逐条说出丢了几个。
+
+**三条裁决**：① **数字断言不能放进测试**——一个测试看不到自己 crate 的总数，除非它去跑 `cargo`，那会让门禁递归成"门禁里的门禁"；所以数字归脚本、结构归测试。② **元测试检查的是源码里的函数声明与属性，不是"跑一遍"**：它抓的是改名、删除、被 `#[ignore]`，而这恰好是 `P6.03`/`P6.04` 会做的事（跑一遍只会在同一棵树里确认同一件事）。③ **三十行不是 §30.7 的全部 A 类行**：`普通截图延迟不受滚动影响`（真实滚动会话进行中触发 F5）是 L3 场景、`依赖门禁` 是脚本、`无静默跳过` 是 `P6.05` 的统计脚本——三者都不是"既有行为的冻结"，不在这里冒充。
 
 ## 34. 验收标准
 

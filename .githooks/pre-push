@@ -10,7 +10,19 @@ echo "[pre-push] cargo test --workspace --lib -- --test-threads=1"
 # snapclip-capture test binary with 0xc0000005 (STATUS_ACCESS_VIOLATION) in
 # unsigned driver / injected-DLL code, which turns the gate into a coin flip.
 # See docs/31-scroll-capture-tdd-tasklist.md §4.2 and the R-21 row (docs/31 §14.3).
-cargo test --workspace --lib -- --test-threads=1
+#
+# The output is kept rather than piped: tools/check-test-baseline.ps1 reads it back and refuses a
+# suite that shrank below the docs/31 §0.3 baseline (P6.01 — a deletion that takes a test with it
+# leaves `cargo test` green, only smaller). Redirecting keeps the exit code without `set -o
+# pipefail`, which not every /bin/sh has.
+if ! cargo test --workspace --lib -- --test-threads=1 > target/test-baseline.log 2>&1; then
+  cat target/test-baseline.log
+  exit 1
+fi
+grep -E "^(Running unittests|test result:)" target/test-baseline.log
+
+echo "[pre-push] the test-count baseline (docs/31 §0.3)"
+powershell -NoProfile -File tools/check-test-baseline.ps1 -Log target/test-baseline.log
 
 echo "[pre-push] dependency direction"
 powershell -NoProfile -File tools/check-dependency-direction.ps1
