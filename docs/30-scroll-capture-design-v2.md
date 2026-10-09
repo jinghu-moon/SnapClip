@@ -3724,6 +3724,25 @@ impl RecoveredImage {
 - **不做"自动裁剪"的独立 UI**。理由：V2 的"旧像素优先 + 撤销"已经覆盖了"多滚了就退回去"的用例，而且**不收费**（PixPin 把它放在 VIP 里）。
 - **不在预览里画选区/标注**。理由：N12。
 
+#### 19.7.1 落地形状：面板的落点（`P5.05`，2026-10-09）
+
+**面板锚在工作区的右边缘、垂直居中**：`left = work.right − margin − panel_width`、`top = work.top + (work.height() − panel_height) / 2`，`work` = `RenderView.work_area`（在导出路径上 `scroll_panel` 是 `None`，所以面板**永远不会被烤进用户的图**）。这段算术原先是 `draw_scroll_panel` 的局部变量；`P5.05` 把它抽成 `crates/snapclip-capture/src/windows/win/d2d.rs` 的 **`pub(crate) fn scroll_panel_placement(view, metrics) -> Option<(Rect, PanelLayout)>`**，理由是**测试必须问画笔面板落在哪里，而不是自己再算一遍**——自己算的测试量的是自己的算术。
+
+**机械保证（本节的布局意图原本只存在于图里）**：`crates/snapclip-capture/src/windows/win/d2d/tests.rs` 新增 `the_preview_panel_does_not_cover_the_toolbar_hit_regions`，它是**同一次合成渲染两遍**（`scroll_panel: None` 与 `Some(..)`）后逐像素比较。三个断言各堵一个漏洞：①面板**必须真的画了东西**（否则"没遮挡"是空真）②它**只在自己报告的矩形内**作画（否则"面板的矩形"不是真正能遮住东西的区域——笔触、阴影、越界绘制都会让它变成假话）③它画到的**每一个像素**都不是覆盖层判为握把或可抓边框的点，判据取自 **`SelectionSnapshot::hit_test`**（覆盖层指针路由用的同一个调用，所以这个用例不会与被保护的命中判定漂移）。选区取**整帧**（即 §19.7 锚定面板的那个几何：滚动截取一个铺满工作区的窗口），此时右握把正好压在面板悬挂的那条边上。
+
+**用例是 `#[ignore]` 的，并且不静默跳过**：既有 22 条渲染用例的写法是 `let Ok(device) = … else { return; }`（没有 GPU 的会话里它们**假装通过**），本用例按 D-14 走 `#[ignore]` + `expect("…")`——它的 L3 身份写在 `#[ignore]` 的理由里，设备缺失时**大声失败**而不是悄悄绿。
+
+**它抓到的第一件事是真缺陷，不是布局意图的复述**：DIP 外边距与握把命中半径**各自独立四舍五入**。`PANEL_MARGIN_DIP = 16` 与 `Handle::Right` 的 `hit_handle_size` 在 100%/150%/200% 下**恰好相等**（16/24/32 px），而在 **125% 与 175%** 下差 1 px（`round(20) = 20` vs `round(12.5 + round(7.5) = 8) = 21`；`round(28) = 28` vs `round(17.5 + round(10.5) = 11) = 29`）⇒ 面板最右一列落进 `Resize(Right)`。RED 逐字（`docs/Temp/p505-red.txt`）：
+
+```
+at 120 DPI the preview panel painted (1579, 541), which the overlay's hit test calls
+Resize(Right): the panel covers a grip the user has to grab
+```
+
+**修法是让边距有下限，而不是把某个数字调大**：`margin = max(dip(PANEL_MARGIN_DIP), grip_hit_reach(Handle::Right, dpi))`，其中 `grip_hit_reach`（`crates/snapclip-capture/src/geometry.rs`）是 `SelectionSnapshot::hit_handle_size` 的**同一个原语**——它被抽成自由函数，正是因为绘制层需要这个数而手上没有选区。150% 上边距仍是 24 px（下限不生效），只有那两档 DPI 各多出 1 px。用例在 **96/120/144/168/192** 五档、1280×900 DIP（按 DPI 放大）上全绿；DPI 扫描不是装饰，100% 恰好是两处四舍五入**碰巧一致**的那一档。
+
+**仍然不在**：四个按钮的**点击命中区**属装配根 `P6`（§19.4.1），本用例保护的是握把与可抓边框，不是按钮。
+
 ## 20. 状态模型
 
 ### 20.1 决策：**不引入滚动会话的状态机**
@@ -5724,7 +5743,7 @@ fn rows_match(actual, expected, sigma) -> bool
 | 静默跳过的真实桌面用例（`bitblt.rs`、`providers.rs`、`window_detection.rs`） | **改成 §29.2 的两种合法形态**（这是对既有代码的修改，属 §33 的破坏性清单） |
 | `hit_test.rs:435` 的 p95 < 0.1 ms 断言 | 保留（§23.2 明确"滚动不新增命中测试"） |
 | `apps/snapclip/tests/ui.rs`（GPUI 6 用例） | **保留**；滚动会话**不进**这个文件（它是历史列表/设置的 UI 测试） |
-| 真实 GPU 渲染 + CPU 回读的视觉回归（`win/d2d/tests.rs` 74,729 B） | **新增一个同型用例**：覆盖层 + 滚动预览面板一起渲染，回读断言**面板不覆盖必要的操作区域**（这是 §19.7 布局的机械保证） |
+| 真实 GPU 渲染 + CPU 回读的视觉回归（`win/d2d/tests.rs` 74,729 B） | **新增一个同型用例**：覆盖层 + 滚动预览面板一起渲染，回读断言**面板不覆盖必要的操作区域**（这是 §19.7 布局的机械保证）。**已落地（`P5.05`）**：`the_preview_panel_does_not_cover_the_toolbar_hit_regions` 渲染两遍（有/无面板）后逐像素比较，五档 DPI 上跑；它是 `#[ignore]` + 设备缺失时 `expect` 的（不像同文件既有 22 条那样静默跳过），第一跑就在 125%/175% 抓到 1 px 覆盖，见 §19.7.1 |
 
 ## 30. 测试矩阵
 
@@ -5848,7 +5867,7 @@ fn rows_match(actual, expected, sigma) -> bool
 | 命令不可丢（**已可执行，`P3.08`**） | 10^5 次预览 `publish` 与 `stop`/`cancel`/`undo`×3/`set_follow` 并发 | 命令全部生效且**第一个停止承诺赢**；`dropped > 0` 与命令无关 | L1 | — |
 | 更新频率 | 100 步 | 更新次数 ≤ 10 Hz × 时长 | L2 | **Preview 更新延迟**；**已可执行**（`P5.01`：`updates_are_capped_at_ten_hertz` 用虚拟时钟断言 100 步 / 495 ms ⇒ **5** 次，并钉住 `PREVIEW_HZ == 10`；驱动侧由 `a_rate_limited_preview_publishes_less_and_still_ends_correctly` 用 `Duration::ZERO` 作对照。**注意**：可观察量是 `dropped`（发布次数）而不是 drain 到的更新条数——后者分不清"被抑制"与"被覆盖"，见 §19.3.3） |
 | 主线程同步工作 | 100 步 | ≤ 8 ms 阈值 | L2 | **UI 主线程最大同步工作**（覆盖层线程） |
-| 布局不遮挡操作 | 真实渲染 + 回读 | 面板不覆盖必要操作区域 | L3 | — |
+| 布局不遮挡操作 | 真实渲染 + 回读 | 面板不覆盖必要操作区域 | L3 | — （`P5.05`：`the_preview_panel_does_not_cover_the_toolbar_hit_regions`，选区取整帧、96/120/144/168/192 五档全绿；RED 时 120 DPI 在 `(1579, 541)` 覆盖了 `Resize(Right)`——`PANEL_MARGIN_DIP` 与握把命中半径各自四舍五入，修法是边距下限 = `grip_hit_reach`，见 §19.7.1） |
 
 ### 30.7 Memory / Regression（内存与回归）
 

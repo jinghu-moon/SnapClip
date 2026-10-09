@@ -1693,3 +1693,148 @@
             "U+FDD0 is a noncharacter and cannot be in the font"
         );
     }
+
+    /// The preview panel must not cover anything the user still has to be able to grab (docs/30
+    /// §19.7; §30.6's "布局不遮挡操作").
+    ///
+    /// The same composition is rendered twice into the same target — once without the panel, once
+    /// with it — and both are read back. Pixels, not the model, because there are three claims here
+    /// and only the readback can settle any of them:
+    ///
+    /// * the panel paints something at all, otherwise "it covers nothing" is vacuously true;
+    /// * it paints **only inside its own rectangle** — no stroke, no shadow, no stray mark reaches
+    ///   outside, so the rectangle the painter reports is the region that can hide things;
+    /// * no pixel it paints is a point the overlay calls a grip or a grabbable border. That question
+    ///   is asked of `SelectionSnapshot::hit_test`, the same call the overlay's pointer routing
+    ///   makes, so this test cannot drift away from the hit testing it exists to protect.
+    ///
+    /// The selection is the frame itself, which is the geometry §19.7 anchors the panel for — a scroll
+    /// capture of a window that fills the work area. The right grip is then centred exactly on the
+    /// edge the panel hangs off, which is why the DPI sweep is not decoration: the DIP margin and the
+    /// grip's reach are rounded independently, and 100% is one of the DPIs where they happen to agree.
+    #[test]
+    #[ignore = "renders through the real D3D11/D2D path; the L3 gate runs it with --ignored"]
+    fn the_preview_panel_does_not_cover_the_toolbar_hit_regions() {
+        use crate::geometry::{SelectionGeometry, SelectionSnapshot};
+        use crate::scroll::displacement::Status;
+        use crate::scroll::panel::ScrollPanel;
+        use crate::scroll::preview::PreviewUpdate;
+
+        // A maximised window on a 1280x900 work area at 100%, scaled by the DPI under test.
+        const FRAME_DIP: (i32, i32) = (1280, 900);
+        const DPIS: [u32; 5] = [96, 120, 144, 168, 192];
+
+        for dpi in DPIS {
+            let scale = dpi as f32 / 96.0;
+            let width = (FRAME_DIP.0 as f32 * scale).round() as u32;
+            let height = (FRAME_DIP.1 as f32 * scale).round() as u32;
+
+            let device = super::GraphicsDevice::create().expect(
+                "this probe renders for real, which is why it is #[ignore]d: without a D3D11 device \
+                 its question cannot be answered, and passing quietly is the one thing it must not do",
+            );
+            let mut renderer = OverlayRenderer::new(std::sync::Arc::new(device), dpi)
+                .expect("the overlay renders at every DPI the overlay runs at");
+            let frame_pixels = solid_bgra(width, height, [0x20, 0x28, 0x30, 0xFF]);
+            renderer
+                .update_frame(width, height, &frame_pixels)
+                .expect("a full-frame BGRA buffer is a frame");
+            renderer
+                .ensure_back_buffer(width, height)
+                .expect("the back buffer matches the frame");
+            let target = renderer
+                .device()
+                .create_render_target_texture(width, height)
+                .expect("an off-screen target");
+            let context = renderer
+                .device()
+                .create_d2d_context()
+                .expect("a D2D context over our own device");
+            let target_bitmap = super::super::d3d11::create_bitmap_from_texture(
+                &context,
+                &target.texture,
+                D2D1_BITMAP_OPTIONS_TARGET,
+                D2D1_ALPHA_MODE_PREMULTIPLIED,
+            )
+            .expect("a D2D bitmap over the target");
+
+            let frame = Rect::from_origin_size(Point::new(0, 0), width as i32, height as i32);
+            let mut view = RenderView::new(frame);
+            // The chrome is what has to survive the panel, so it has to be on: the grips under test
+            // are drawn chrome, not model state.
+            view.show_chrome = true;
+            view.cursor_visible = false;
+            view.selection = frame;
+
+            renderer
+                .draw_to(&target_bitmap, &view)
+                .expect("the composition without the panel");
+            let without = renderer
+                .device()
+                .read_back_bgra(&target.texture)
+                .expect("a CPU readback of the composed frame");
+
+            let mut panel = ScrollPanel::new(u64::from(width), u64::from(height));
+            panel.on_update(PreviewUpdate::Span {
+                primary_len: 4_000,
+                steps: 42,
+                discarded: 3,
+            });
+            panel.on_update(PreviewUpdate::Viewport {
+                band: 2_000,
+                status: Status::Confirmed { d: 120 },
+            });
+            view.scroll_panel = Some(panel);
+
+            renderer
+                .draw_to(&target_bitmap, &view)
+                .expect("the composition with the panel");
+            let with = renderer
+                .device()
+                .read_back_bgra(&target.texture)
+                .expect("a CPU readback of the same frame, with the panel");
+
+            let (panel_rect, _) = super::scroll_panel_placement(&view, renderer.metrics())
+                .expect("the panel was handed to the renderer a moment ago");
+            let snapshot = SelectionSnapshot::new(view.selection, dpi);
+
+            let mut painted = 0u32;
+            for y in panel_rect.top..panel_rect.bottom {
+                for x in panel_rect.left..panel_rect.right {
+                    let before = pixel_at(&without, width, x as u32, y as u32);
+                    let after = pixel_at(&with, width, x as u32, y as u32);
+                    if before == after {
+                        continue;
+                    }
+                    painted += 1;
+                    let geometry = snapshot.hit_test(Point::new(x, y), dpi);
+                    assert!(
+                        !matches!(geometry, SelectionGeometry::Resize(_)),
+                        "at {dpi} DPI the preview panel painted ({x}, {y}), which the overlay's hit \
+                         test calls {geometry:?}: the panel covers a grip the user has to grab"
+                    );
+                }
+            }
+            assert!(
+                painted > 0,
+                "at {dpi} DPI the panel changed nothing over a {width}x{height} frame, so this test \
+                 would have passed for a panel that was never drawn"
+            );
+
+            // And nothing outside the rectangle it reports moved: the claim is about a region the
+            // user can see, not about that region plus whatever a stroke or a shadow reaches.
+            for y in 0..height as i32 {
+                for x in 0..width as i32 {
+                    if panel_rect.contains(Point::new(x, y)) {
+                        continue;
+                    }
+                    assert_eq!(
+                        pixel_at(&with, width, x as u32, y as u32),
+                        pixel_at(&without, width, x as u32, y as u32),
+                        "at {dpi} DPI the panel changed ({x}, {y}), outside the rectangle it reports \
+                         ({panel_rect:?})"
+                    );
+                }
+            }
+        }
+    }

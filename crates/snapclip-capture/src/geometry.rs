@@ -186,6 +186,19 @@ pub struct SelectionSnapshot {
     pub hit_slop: i32,
 }
 
+/// How far a grip's hit area reaches from its anchor, in physical pixels.
+///
+/// This is the primitive behind [`SelectionSnapshot::hit_handle_size`], and it is a free function
+/// because a caller can need the number without a selection: the scroll preview panel is pinned to
+/// the work area's right edge (docs/30 §19.7) and a grip centred on that edge reaches this far past
+/// it, so the panel's margin has to be at least this large or the panel's last column belongs to the
+/// grip. At 100%/150%/200% the DIP margin and this reach happen to agree; at 125%/175% they do not,
+/// because the two round independently (`P5.05`).
+pub fn grip_hit_reach(handle: Handle, dpi: u32) -> i32 {
+    let scale = dpi.max(96) as f32 / 96.0;
+    (handle.visual_size() * scale + (6.0 * scale).round()).round() as i32
+}
+
 impl SelectionSnapshot {
     pub fn new(rect: Rect, dpi: u32) -> Self {
         let scale = dpi.max(96) as f32 / 96.0;
@@ -203,7 +216,7 @@ impl SelectionSnapshot {
 
     /// Keep the effective grip size usable on high DPI displays.
     pub fn hit_handle_size(&self, handle: Handle, dpi: u32) -> i32 {
-        (self.visual_handle_size(handle, dpi) + self.hit_slop as f32).round() as i32
+        grip_hit_reach(handle, dpi)
     }
 
     /// Hit test a monitor-local point.

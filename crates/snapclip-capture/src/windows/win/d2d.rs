@@ -465,6 +465,47 @@ pub struct OverlayRenderer {
     size: (u32, u32),
 }
 
+/// Where the scroll preview panel lands, in physical pixels, with the DIP layout it was placed from.
+///
+/// The panel hangs off the **work area**'s right edge, centred vertically (docs/30 §19.7), so it lands
+/// somewhere on screen whatever the capture geometry is. Extracted from `draw_scroll_panel` in `P5.05`
+/// because the render-level test has to ask the painter where the panel went: a test that re-derives
+/// the rectangle from the same constants is testing its own arithmetic, not the painted result.
+///
+/// `None` when there is no panel to place — the caller then draws nothing, which is what the export
+/// path needs (a panel baked into the user's image would be a bug, not a layout).
+pub(crate) fn scroll_panel_placement(
+    view: &RenderView,
+    metrics: RenderMetrics,
+) -> Option<(Rect, PanelLayout)> {
+    view.scroll_panel.as_ref()?;
+    let scale = (metrics.dpi as f32 / 96.0).max(1.0);
+    let dip = |value: i32| (value as f32 * scale).round() as i32;
+    let layout = PanelLayout::new();
+    let work = if view.work_area.is_empty() {
+        view.frame
+    } else {
+        view.work_area
+    };
+    let width = dip(layout.panel.width());
+    let height = dip(layout.panel.height());
+    // The DIP margin is a floor, not the whole story: a grip's hit area reaches `grip_hit_reach` past
+    // the edge it is centred on, and a selection that fills the work area puts the right grip exactly
+    // there. At 125%/175% the margin and the grip round in opposite directions, so the marginal DIP
+    // margin leaves the panel's last column inside a resize target and the panel eats a grab the user
+    // still needs (`P5.05`). The margin therefore has to be at least the reach it has to clear.
+    let margin = dip(PANEL_MARGIN_DIP).max(crate::geometry::grip_hit_reach(
+        crate::geometry::Handle::Right,
+        metrics.dpi,
+    ));
+    let left = (work.right - margin - width).max(work.left);
+    let top = (work.top + (work.height() - height) / 2).max(work.top);
+    Some((
+        Rect::new(left, top, left + width, top + height),
+        layout,
+    ))
+}
+
 impl OverlayRenderer {
     pub fn new(device: Arc<GraphicsDevice>, dpi: u32) -> Result<Self, String> {
         let d2d = device.create_d2d_context()?;
@@ -1307,28 +1348,20 @@ impl OverlayRenderer {
     /// * the viewport box is placed by [`ScrollPanel::viewport_box`], which is proportional, so the
     ///   strip's size in pixels is all it needs.
     fn draw_scroll_panel(&mut self, view: &RenderView, metrics: RenderMetrics) -> Result<(), String> {
+        let Some((panel_frame, layout)) = scroll_panel_placement(view, metrics) else {
+            return Ok(());
+        };
         let Some(panel) = view.scroll_panel.clone() else {
             return Ok(());
         };
         let scale = (metrics.dpi as f32 / 96.0).max(1.0);
         let dip = |value: i32| (value as f32 * scale).round() as i32;
-        let layout = PanelLayout::new();
-        let work = if view.work_area.is_empty() {
-            view.frame
-        } else {
-            view.work_area
-        };
-        let width = dip(layout.panel.width());
-        let height = dip(layout.panel.height());
-        let margin = dip(PANEL_MARGIN_DIP);
-        let left = (work.right - margin - width).max(work.left);
-        let top = (work.top + (work.height() - height) / 2).max(work.top);
         let place = |rect: Rect| {
             Rect::new(
-                left + dip(rect.left),
-                top + dip(rect.top),
-                left + dip(rect.right),
-                top + dip(rect.bottom),
+                panel_frame.left + dip(rect.left),
+                panel_frame.top + dip(rect.top),
+                panel_frame.left + dip(rect.right),
+                panel_frame.top + dip(rect.bottom),
             )
         };
 
