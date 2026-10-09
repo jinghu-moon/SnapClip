@@ -83,6 +83,23 @@ pub enum AbortReason {
     ExportBudget,
 }
 
+/// Sentences, like [`ExportError`] and [`super::observation::ObservationError`].
+///
+/// Added by `P4.05`. The reason is already a parameter of [`RowBandWriter::finish`], and that is
+/// exactly the trap: a caller that hands a reason over and then reads a refusal which does not
+/// mention it has to keep its own table of "what was I doing when this failed". §26.2 rule 3 asks
+/// for the opposite — a discarded result is recorded *together with* its reason — and the writer is
+/// the only place that knows both the reason and the row count, so it is the place that can say it.
+impl core::fmt::Display for AbortReason {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            AbortReason::Cancelled => "the export was cancelled",
+            AbortReason::MemoryLimit => "the canvas hit its memory limit",
+            AbortReason::ExportBudget => "the export budget was exhausted",
+        })
+    }
+}
+
 /// What an export produced: the bytes, and how many rows actually made it in.
 ///
 /// `rows` is the writer's own count, not the caller's — the writer is the only one that knows. It

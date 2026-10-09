@@ -69,6 +69,14 @@ pub(crate) mod preview;
 
 pub(crate) mod session;
 
+/// [`ScrollDiagnosticCode`] is `pub` for §27.1's reason rather than for convenience: it is listed
+/// there among the types that cross the crate boundary, and it is what the shell names when it
+/// reports why an export was trimmed. The module that owns it has to stay `pub(crate)` — it also
+/// owns [`session::ScrollSession`], which §27.1 keeps internal — so the re-export is the only shape
+/// that gives the vocabulary a public path without publishing the session (the [`Axis`] precedent
+/// above).
+pub use session::ScrollDiagnosticCode;
+
 #[cfg(test)]
 mod acceptance;
 

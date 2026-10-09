@@ -3136,6 +3136,40 @@ pub trait RowBandWriter {
 
 **一条被本任务改掉的 `docs/31` 期望**：§15.1 的依赖表写「`git diff --stat apps/snapclip/Cargo.toml` 在 `P4.02` 期间**应为空**」，而 `DEV-6`/`DEV-7` 的正文又写「`P4.02` 才需要把它提升为 shell 的普通依赖」——两句不能同时成立。**实际做法是后者**（`png = "0.18"` 从 `[dev-dependencies]` 移到 `[dependencies]`，`--stat` 非空），§15.1 那格已按实际改写。
 
+#### 17.7.4 落地的形状（`P4.05`，2026-10-09）
+
+**落点**：不新建文件。`apps/snapclip/src/capture/row_band_png.rs`（真实 sink 的 `finish`）＋ `crates/snapclip-capture/src/scroll/export.rs`（`AbortReason` 的 `Display`）＋ `crates/snapclip-capture/src/scroll/session.rs`（`ScrollDiagnosticCode`）＋ `crates/snapclip-capture/src/scroll/mod.rs`（re-export）。
+
+**第一处发现：任务书的两个 RED 名在开工时都已经为真。** `docs/31` P4.05 列的两个用例是 `finish_with_abort_writes_a_complete_iend_and_the_file_decodes()` 与 `a_skipped_row_range_is_an_error()`，而 `P4.02` 已经把两件事都做完了：`write_rows` 的 `first_row != self.next_row` 一道检查同时覆盖**跳过与回退**（`OutOfOrder`），`finish` 在全部行到位时本来就走到 `stream.finish()` 并由 `Writer` 的 `Drop` 写出 IEND。**两者因此落成回归钉子而不是 RED**（照 `P4.04` 的 `an_oversized_dimension_is_refused_before_the_header` 的先例，在 doc 里逐字写明"这是钉子不是 RED"）。
+
+**第二处发现（真正的缺陷）：`finish` 把 `outcome` 丢在地上。** `P4.02` 的签名是 `fn finish(mut self: Box<Self>, _outcome: Option<AbortReason>)`——下划线就是证据。后果不是"少了一条日志"，而是**因果链断在唯一同时看见原因和行数的那个函数里**：短写被拒是对的（`DEV-63` 已裁决 PNG 不可能短），但消息只说 `3 of 5 rows were written`，于是"用户按了 `Esc`"、"画布撞了内存上限"、"导出预算耗尽"三种完全不同的处境在错误里长得一模一样，调用方只能自己再维护一张表。这正是 §26.2 规则 3 禁止的形状。RED = `a_short_export_says_why_it_was_cut_short()`，实测失败消息逐字：
+
+```
+the refusal must name the reason it was given (Cancelled, so the word `cancelled`), got
+`the export sink failed: 3 of 5 rows were written; a PNG's height is fixed in its header,
+so a short write cannot become a decodable file`
+```
+
+**修法**：给 `AbortReason` 补 `impl core::fmt::Display`（三句话，与 `ExportError`/`ObservationError`/`FrameError` 同形，**不引 `thiserror`**），`finish` 用 `outcome` 组出 `"{why}; {n} of {m} rows were written, and a PNG's height is fixed in its header, so a short write cannot become a decodable file"`，`None` 时 `why` = `"the export was cut short without a reason"`——**没有原因也要说出来，而不是留白**。
+
+**第三处发现：`ScrollDiagnosticCode` 在仓库里根本不存在。** 任务书的 REFACTOR 写"只增加 `ExportTrimmed`/`ArtifactDiscarded` 两个 `ScrollDiagnosticCode`（§26.3 的 13 个之一）"，预设了另外 11 个已经在位；而 `grep -r ScrollDiagnosticCode` 只命中 `docs/`。退出条件 ③"诊断码总数 == 13"因此在开工时**不可满足**。裁决 = 本任务建立这个枚举：13 个变体（§26.3 的原文顺序）、`pub const ALL: [Self; 13]`、`pub fn as_str(self) -> &'static str`（`lower_snake_case`，因为 §26.4 的通道是一条**被 grep 的日志行**，不是本地化文案）。
+
+**放哪里**：`scroll/session.rs`（`DEV-40` 已定它是会话层类型），由 `scroll/mod.rs` 做 `pub use session::ScrollDiagnosticCode;`。这不是便利而是**唯一可行**的形状：§27.1 同时要求这个类型 `pub` 而 `ScrollSession` 留在内部，所以模块不能是 `pub`；`Axis` 的既有 re-export 就是同一情形。`export.rs` 的模块 doc 反对的是"把可见性藏进 `lib.rs` 的 re-export"（那会掩盖契约归谁所有），模块级的 re-export 反而写明了所有者。
+
+**`ScrollDiagnostic` 事件结构体刻意不落地**：§26.3 给出 `struct ScrollDiagnostic { code, step, detail }`，但今天没有任何生产者。加一个没人能证伪的 struct 与 `InjectStatus` 拒绝 `Unsupported` 是同一条理由（"没有生产者的变体是没人能证伪的声称"），也与 `export.rs` 的立场一致：词汇表可以为**已存在但尚未接线**的现象存在，而事件结构体属于真正发射它的那个装配（`P6`）。
+
+**`P4.05` 的实测（2026-10-09）**：
+
+| 项 | 值 |
+| --- | --- |
+| RED（词汇表） | `cargo test -p snapclip-capture --lib the_diagnostic_vocabulary_is_closed_at_thirteen_codes` ⇒ `error: could not compile `snapclip-capture` (lib test) due to 15 previous errors`（全部 `E0433`：`use of undeclared type `ScrollDiagnosticCode``） |
+| RED（短写原因） | `cargo test -p snapclip-app --lib capture::row_band_png` ⇒ **6 passed / 1 failed**，失败即上面那条消息（日志 `docs/Temp/p405-red.txt`） |
+| GREEN（L1） | 同一命令 ⇒ **9 passed / 0 failed / 1 ignored**（日志 `docs/Temp/p405-lib.txt`） |
+| GREEN（词汇表） | `cargo test -p snapclip-capture --lib the_diagnostic_vocabulary` ⇒ **1 passed** |
+| 依赖方向 | `tools/check-dependency-direction.ps1` = clean，capture **30** packages、`scroll/` **13** files（re-export 没有新增文件） |
+
+**三条钉子（全部诚实标注为钉子）**：`finish_with_abort_writes_a_complete_iend_and_the_file_decodes`（三种 `AbortReason` 各断言解码回读的尺寸/颜色类型/逐字节像素，证明"被标注为中止"**没有**变成"被截断"）；`a_skipped_row_range_is_an_error`（真实编码器上的跳过与回退，并证明被拒的写入没有留下痕迹）；`the_shell_can_name_the_export_diagnostics`（shell 侧对两个 code 的 `as_str()` 断言——这是 §27.1 公开边界的跨 crate 见证，`pub enum` 放在 `pub(crate) mod` 里本来是叫不出名字的）。
+
 ### 17.8 水平轴
 
 **不写第二套算法**（N6）。§6 的参考实现用**三个 `const fn`**（`primary_delta`/`cross_delta`/`primary_extent`，`types.rs:11-32`）把两轴参数化，全套算法按主轴写一遍，**只有像素搬运分叉**。V2 采用同样做法，并把 §3 的 `Axis` 定义为：
@@ -5567,8 +5601,8 @@ fn rows_match(actual, expected, sigma) -> bool
 | `Contained` | 小幅回滚完全落在已覆盖区 | 识别为 `Contained`；不写重复内容 | L1 | 已可执行（`P1.19`，用例先证明两帧字节不同） |
 | 撤销一步 | 提交 10 步后 `undo` | 回退到第 9 步状态；`primary_len` 回退 | L1 | 已可执行（`P1.22`） |
 | 条带换出 | 预算注入成 1 个条带 | 峰值不随长度增长；恢复后逐字节正确 | L1 | **Memory**；已可执行（`P1.20`，10 条条带 + 1 条预算：9 条落盘、读完仍逐字节相等） |
-| 上限三层 | `MAX_LONG_IMAGE_PIXELS` 注入 1/10 | `Partial` 且**是合法 PNG** | L1+L2 | **Memory**；前两层已可执行（`P1.21`：注入 1000 行 ⇒ 裁到 1000、丢 20 行、前缀逐字节等于文档、阈值改变不影响任何像素）；**PNG 解码回读属 `P4.02`/`P4.05`** |
-| 流式导出 | 30,000 px 高 | 严格递增校验；乱序返回错误 | L2 | **Stitch Latency** |
+| 上限三层 | `MAX_LONG_IMAGE_PIXELS` 注入 1/10 | `Partial` 且**是合法 PNG** | L1+L2 | **Memory**；三层已可执行（`P1.21`：注入 1000 行 ⇒ 裁到 1000、丢 20 行、前缀逐字节等于文档、阈值改变不影响任何像素；**PNG 解码回读已由 `P4.02` 落地、`P4.05` 补上"被标注为中止的导出仍然关闭容器"**：`row_band_png::tests::finish_with_abort_writes_a_complete_iend_and_the_file_decodes` 对三种 `AbortReason` 断言 `png` 解码回读得到声明的尺寸与逐字节相同的像素） |
+| 流式导出 | 30,000 px 高 | 严格递增校验；乱序返回错误 | L2 | **Stitch Latency**；已可执行（`P4.02` 写入检查、`P4.05` 在真实编码器上钉住：`row_band_png::tests::a_skipped_row_range_is_an_error` 同时覆盖**跳过**（写 0-1 后要求写 4 ⇒ `OutOfOrder{first_row: 4, expected: 2}`）与**回退**（要求写 1 ⇒ `OutOfOrder{first_row: 1, expected: 2}`），并证明被拒的写入没有留下痕迹） |
 | 水平轴 | 同序列两轴 | 结果逐行相等 | L1 | **分轴 P50/P95** |
 | 轴映射 | `(dx,dy)` 全组合 | `T-AXIS-1` 通过 | L1 | — |
 
@@ -5915,7 +5949,7 @@ fn rows_match(actual, expected, sigma) -> bool
 | 纯逻辑模块（**11 文件 = 10 生产 + 1 test-only**） | `crates/snapclip-capture/src/scroll/{mod,session,target,observation,displacement,orb,canvas,bands,loop_control,preview}.rs` + `testkit.rs`（`#[cfg(test)]`，只进测试；§28.2） |
 | 平台实现（2 文件） | `windows/scroll_source.rs`（窗口级 WGC 多帧帧源）、`windows/scroll_actuator.rs`（两条注入路径 + 探测） |
 | trait（5 个，改 0 个既有） | `FrameSource`、`ScrollActuator`、`RowBandSink`、`RowBandWriter`、`PreviewSink`（§27.5，ADR-11） |
-| 诊断 | `ScrollDiagnostic` + **13 个** `ScrollDiagnosticCode`（§26.3） |
+| 诊断 | `ScrollDiagnostic` + **13 个** `ScrollDiagnosticCode`（§26.3）。**`P4.05` 落地的是词汇表那一半**：`crates/snapclip-capture/src/scroll/session.rs` 的 `pub enum ScrollDiagnosticCode`（13 个变体 + `ALL` + `as_str()`，由 `scroll/mod.rs` re-export 以满足 §27.1 的公开边界），`session::tests::the_diagnostic_vocabulary_is_closed_at_thirteen_codes` 钉住数量与名字。**`ScrollDiagnostic` 事件结构体刻意未落地**：它没有生产者，一个没人能证伪的 struct 与 `InjectStatus` 拒绝加 `Unsupported` 是同一条理由（见 `§17.7.4`） |
 | 消息 | `WM_APP + 45`（已占用 `+1/+2/+17/+18/+19/+43/+44`）+ 冲突断言（§21.4） |
 | 预算 | `MemoryBudget{total, resident_canvas, resident_preview}`，默认 `视口像素×4×8`（§22.3） |
 | 实验 | `E-PERF-1..4`、`E-ACC-1`、`E-CTRL-1`、`E-MEM-1`、`E-CAP-1`、`E-INJECT-1`、`E-DYN-1`、`E-THREAD-1`（§23.1、§29.3） |

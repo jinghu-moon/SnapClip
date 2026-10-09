@@ -90,6 +90,93 @@ impl StopReason {
     }
 }
 
+/// The diagnostic vocabulary of a scroll session (`docs/30` §26.3, `P4.05`).
+///
+/// §26.4 is explicit that this is **not a second channel**: a code is the `code` field of an event
+/// that goes out through the diagnostics that already exist, so what this type buys is a closed set
+/// of names a log reader can grep for, not a logging system.
+///
+/// It is a vocabulary, and part of it is read by code that does not exist yet — the same standing as
+/// [`crate::scroll::export`]'s error enum, and the reason the list is fixed by §26.3 rather than by
+/// today's call sites. `P4.05` is where [`Self::ExportTrimmed`] and [`Self::ArtifactDiscarded`]
+/// acquire a meaning; the other eleven name phenomena that already exist (a watchdog switch, a
+/// spilled band, an undo, an invariant violation) without having a producer yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollDiagnosticCode {
+    /// A `GraphicsCaptureSession` option could not be set (§24.3, `P2.04`).
+    CaptureOptionUnavailable,
+    /// Capture fell back to a different backend (§24.1, `P2.06`).
+    CaptureBackendFallback,
+    /// The actuator watchdog moved on to the next transport (`P3.03`).
+    InjectPathSwitched,
+    /// A frame arrived and could not be used (§11.4).
+    FrameDiscarded,
+    /// A step's displacement was not confirmed, so the step was not committed (§16.2).
+    StepUncertain,
+    /// Consecutive scene cuts crossed the streak limit (§16.8).
+    SceneCutStreak,
+    /// The region model's confidence decayed past its floor (§17.3).
+    ModelDecayed,
+    /// A band was moved out to the spill file (`P1.20`).
+    BandSpilled,
+    /// The band budget forced eviction to stay inside its ceiling (`P1.20`).
+    MemoryBudgetConstrained,
+    /// A step undid the one before it (§19.6).
+    UndoPerformed,
+    /// The export stopped before every row was written, so the artifact is a prefix (`P4.05`).
+    ExportTrimmed,
+    /// The recovered canvas was dropped instead of exported (`P4.05`).
+    ArtifactDiscarded,
+    /// An invariant was violated and the canvas is not trustworthy (§20.3).
+    InvariantViolated,
+}
+
+impl ScrollDiagnosticCode {
+    /// Every code, in §26.3's order.
+    ///
+    /// Public because the count is a property of the design and not of this file: §30.7 pins the
+    /// vocabulary at thirteen, and a test that listed the variants again would be a second copy to
+    /// keep in step with this one.
+    pub const ALL: [Self; 13] = [
+        Self::CaptureOptionUnavailable,
+        Self::CaptureBackendFallback,
+        Self::InjectPathSwitched,
+        Self::FrameDiscarded,
+        Self::StepUncertain,
+        Self::SceneCutStreak,
+        Self::ModelDecayed,
+        Self::BandSpilled,
+        Self::MemoryBudgetConstrained,
+        Self::UndoPerformed,
+        Self::ExportTrimmed,
+        Self::ArtifactDiscarded,
+        Self::InvariantViolated,
+    ];
+
+    /// The stable name a diagnostic line carries (§26.4).
+    ///
+    /// Lower snake case, one spelling per code, never localised: this is the token a support log is
+    /// searched for, so it is a wire format rather than user-facing text. The human-readable part of
+    /// an event is its `detail` (§26.3).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CaptureOptionUnavailable => "capture_option_unavailable",
+            Self::CaptureBackendFallback => "capture_backend_fallback",
+            Self::InjectPathSwitched => "inject_path_switched",
+            Self::FrameDiscarded => "frame_discarded",
+            Self::StepUncertain => "step_uncertain",
+            Self::SceneCutStreak => "scene_cut_streak",
+            Self::ModelDecayed => "model_decayed",
+            Self::BandSpilled => "band_spilled",
+            Self::MemoryBudgetConstrained => "memory_budget_constrained",
+            Self::UndoPerformed => "undo_performed",
+            Self::ExportTrimmed => "export_trimmed",
+            Self::ArtifactDiscarded => "artifact_discarded",
+            Self::InvariantViolated => "invariant_violated",
+        }
+    }
+}
+
 /// What happens to the recovered pixels when the session stops (`docs/30` §20.5).
 ///
 /// Stop and cancel are the same event as far as the phase is concerned — both are `Stopped` — and
@@ -1226,5 +1313,49 @@ mod tests {
         stopped.cancel();
         assert_eq!(stopped.requested_stop(), Some(StopReason::UserStopped));
         assert_eq!(stopped.cancellation(), None);
+    }
+
+    /// `docs/30` §26.3 fixes the diagnostic vocabulary at **thirteen** codes, and §27.1 lists the
+    /// type among the `pub` boundary types. `P4.05` is where two of them — `ExportTrimmed` and
+    /// `ArtifactDiscarded` — acquire a meaning, and its exit condition ③ is stated as a property of
+    /// the whole list. The list did not exist when the task opened: every other consumer named in
+    /// §26.3 (`InjectPathSwitched`, `BandSpilled`, `UndoPerformed`, …) had a phenomenon and no code.
+    #[test]
+    fn the_diagnostic_vocabulary_is_closed_at_thirteen_codes() {
+        assert_eq!(
+            ScrollDiagnosticCode::ALL.len(),
+            13,
+            "§26.3 fixes the list: a fourteenth code is a design change, not a new variant"
+        );
+
+        // Exhaustive with no wildcard, so adding a variant stops this test *compiling* instead of
+        // letting an unclassified code through, and the string is pinned per variant because
+        // §26.4's channel is a formatted line — the name is the part a log reader greps for.
+        let mut names: Vec<&'static str> = Vec::with_capacity(13);
+        for code in ScrollDiagnosticCode::ALL {
+            let expected = match code {
+                ScrollDiagnosticCode::CaptureOptionUnavailable => "capture_option_unavailable",
+                ScrollDiagnosticCode::CaptureBackendFallback => "capture_backend_fallback",
+                ScrollDiagnosticCode::InjectPathSwitched => "inject_path_switched",
+                ScrollDiagnosticCode::FrameDiscarded => "frame_discarded",
+                ScrollDiagnosticCode::StepUncertain => "step_uncertain",
+                ScrollDiagnosticCode::SceneCutStreak => "scene_cut_streak",
+                ScrollDiagnosticCode::ModelDecayed => "model_decayed",
+                ScrollDiagnosticCode::BandSpilled => "band_spilled",
+                ScrollDiagnosticCode::MemoryBudgetConstrained => "memory_budget_constrained",
+                ScrollDiagnosticCode::UndoPerformed => "undo_performed",
+                ScrollDiagnosticCode::ExportTrimmed => "export_trimmed",
+                ScrollDiagnosticCode::ArtifactDiscarded => "artifact_discarded",
+                ScrollDiagnosticCode::InvariantViolated => "invariant_violated",
+            };
+            assert_eq!(code.as_str(), expected, "§26.3's name for {code:?}");
+            names.push(expected);
+        }
+
+        // Two codes sharing a name would make the channel ambiguous, and a missing entry in `ALL`
+        // would make the count above a lie.
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), 13, "every code needs its own name in the log line");
     }
 }
