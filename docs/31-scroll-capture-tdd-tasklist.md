@@ -232,13 +232,13 @@
 | **P0** | 前置实验与基线 | 实验数据 + 门禁设施 | 9 | 混合 | `[P0-A]` | `scroll-p0` |
 | **P1** | 纯逻辑核心 | `scroll/` 11 + `windows/` 2 文件 | 24 | **L1（全部）** | `[P1-A..D]` | `scroll-p1` |
 | **P2** | 平台帧源 | 窗口级 WGC 多帧 | 8 | L2 + L3 | `[P2-A]` | `scroll-p2` |
-| **P3** | 注入与闭环 | 驱动器 + 会话 | 9 | L1/L2 + L3 | `[P3-A]` | `scroll-p3` |
+| **P3** | 注入与闭环 | 驱动器 + 会话 | 10（计划 9，`P3.10` 执行时新增） | L1/L2 + L3 | `[P3-A]` | `scroll-p3` |
 | **P4** | 导出与内存 | 行带端口 + 流式导出 | 7 | L1/L2 + L4 | `[P4-A]` | `scroll-p4` |
 | **P5** | 预览 UI | `PreviewStream` + 覆盖层面板 | 6 | L1/L2 + L3 | `[P5-A]` | `scroll-p5` |
 | **P6** | 清理与收口 | 删除/重构/回填/门禁 | 9 | 全量回归 | `[P6-A]` | `scroll-p6` |
-| | **P0–P6 小计** | | **72** | | | |
+| | **P0–P6 小计** | | **72**（实际 **73**：`P3.10` 执行时新增，`DEV-56`） | | | |
 | **RES** | 调研（跨阶段） | 调研笔记 + 影响记录 | 9 | — | 跟随所属阶段 | — |
-| | **合计** | | **81** | | | |
+| | **合计** | | **81**（实际 **82**） | | | |
 
 ### 1.2 任务统计（可机检口径）
 
@@ -523,6 +523,7 @@ P6.07 门禁扫描 ═╝
 | `P3.02` 的 UIPI 组 | ~~**OQ-3**：官方两页互相矛盾~~ → ✅ **已解除**（2026-10-08，`docs/30 §24.6.2` 结论 6）：低完整性发送方已可构造（`tools/p009-low-integrity-launch.ps1`），实测两条路径都不通（`SendInput` 静默 0 px、`PostMessageW` `Win32 error 5`）⇒ `P3.02` 按"**开始时即拒绝 + 提示以管理员运行**"实现，**不需要侧分支** | — |
 | `P3.09` 的"非前台 `SendInput`"分支判据 | **OQ-5** 只剩一半：`MOUSE_POS` 下已实测（非前台目标滚 400 px、前台窗口 0 px），但 `CURSOR`/`FOCUS` 两个取值**本机取不到**（该设置是用户可改的系统设置） | 在两种设置下各跑一次；在此之前按本机读数 + 保守分支实现（**只会更保守**） |
 | `P3.02` 的"非浏览器目标负答案"分支（**新开**） | **OQ-15**：Electron/WinUI3 在四条臂上全 0 且**没有第二通道**，"没有可滚内容"与"注入没到达"无法区分 | 需要非像素滚动见证（首选 UI Automation `ScrollPattern` 只作见证、不作驱动）；在此之前该分支只能输出"未取得"，不能报"注入失败" |
+| `P3.06` 的退出条件 ③（手动序列**不产生错误确定**）（**新开**，2026-10-09） | **`R-24`**：`E-ACC-1` 冒烟语料 32 例上实测 **4 个错误确定 / 19 确认**（错误率 0.1250），而自动路线是 **0 / 26** ⇒ §16.6 的 F-01 前提"判定能力不能因此下降，只是失去先验"**是假的**。两条机制：① 页周期别名落在 `MANUAL_WINDOW_FRACTION = 0.15` 的窗内（周期 128 的页上 `-8` 与 `120` 等价，而 `120` 在窗外 ⇒ 门四看不见对手）；② 有噪帧上**行摘要全不匹配**（每个 `support = 0`）⇒ 候选集退化为"离零最近的八个位移"。**加宽窗已实测不是解**：`window = extent` 把错误从 4 降到 2，却把确认数从 19 打到 5（`CANDIDATE_LIMIT = 8` 被别名填满） | 两条机制各有出口且都已进 `docs/30 §36.2`：① 别名 ⇒ `OQ-20`（多尺度金字塔三臂对照，判据 = 错误确定 0 且确认数 ≥ 19）；② 有噪帧 ⇒ `OQ-21`，其第一步是**先回答"真实帧上是否真的全为 0"**（`E-ACC-1` 的 `with_noise` 给每帧独立加噪，而真实屏幕同一内容逐字节相同 ⇒ 今天的错误率可能被高估）。**在此之前 `MANUAL_WINDOW_FRACTION` 不动**。侧分支 `blocked/P3-06-manual-alias`（`fde446d`） |
 
 **不在侧分支上、但允许"先按推导实现"的任务**：`P4.02`（**`P0.04` 已于 2026-10-08 实测选定 `Compression::Balanced` + `Filter::Up`**（`docs/30 §17.7.1`），因此原文的"允许先选 `Compression::Fast` + `Filter::Sub` 并标'启动值，待校准'"**不再适用**——实现必须直接用实测组，并在 `P4.02` 里对这两个参数写断言）。
 
@@ -1961,8 +1962,6 @@ git config core.hooksPath .githooks
 
 **偏差**：DEV-53（越冲不可恢复，控制律边界）、DEV-54（端口归属矛盾 + `estimate` 签名 + `reference` 落点）、DEV-55（预览信箱每类一槽 + 合成页必须非周期）。**不建侧分支**：本任务的层级声明是 L2 / A + B，三条集成测试全部是 L1（无桌面），没有红的断言。**"Cancel latency 的 Max 实测值在案"这条阶段级退出条件仍待 L3**（`P3.01`/`P3.03`/`P3.07` 的同一环境阻塞），`P3.09` **不声称**它已满足。
 
-**P3 退出条件（阶段级）**：① `E-CTRL-1` 与 `E-INJECT-1` ⑧ 组都有产物；② Cancel latency 的 Max 实测值在案（**这一条是本阶段唯一不可跳过的性能门槛**）；③ 普通截图回归（A 类）全绿；④ `scroll-p3` 标签已打。
-
 ---
 
 ### P3.10 `E-PERF-5`：`Cancel latency` 的**真桌面 Max**（执行时新增，`DEV-56`）
@@ -2004,6 +2003,48 @@ git config core.hooksPath .githooks
 **门禁（`P3.10` 后）**：`cargo check -p snapclip-capture --all-targets` 零警告零错误；`cargo test -p snapclip-capture --lib -- --test-threads=1` → **543 passed / 0 failed / 19 ignored（93.59s）**（`P3.09` 时 541+18；+2 = `session.rs` 的 2 条不变量用例，`ignored` +1 = `cancel_latency_probe`）；`cargo test --workspace --lib -- --test-threads=1` → app 56+3（1.80s）/ capture 543+19（96.65s）/ history 51 / model 23，0 failed；`tools/check-dependency-direction.ps1` → clean（capture 30 / history 47 / model 8；`crates/snapclip-capture/src/scroll` **12** 文件）。**唯一警告是既有的** `warning: unused variable: content_label`（`snapclip-app` lib test），与 `P3.10` 无关。
 
 **偏差**：`DEV-56`（清单里没有这条任务）、`DEV-57`（取消延迟的两条察觉路径 + `cancel()` 的发布顺序 + 打开成本的口径）、`DEV-58`（WGC 交付 DWM 可见边界）。**不建侧分支**：本任务的层级声明是 L3，探针**跑通了**，没有红的断言。
+
+**P3 退出条件（阶段级）**：① `E-CTRL-1` 与 `E-INJECT-1` ⑧ 组都有产物 —— **✅ 满足**：`E-CTRL-1` 的收敛曲线（`docs/Temp/ectrl1.jsonl`）与 `E-INJECT-1` 的八组矩阵（`docs/Temp/p009-matrix-run2.txt`、`docs/Temp/p309-envcheck-matrix.txt`）都在案，**未取得的项目已逐条列明**（WebView2 无宿主、Electron/WinUI3 的负答案无法与"没有可滚内容"区分，`OQ-15`）；② Cancel latency 的 Max 实测值在案（**这一条是本阶段唯一不可跳过的性能门槛**）—— **✅ 满足（2026-10-09，`P3.10`）**：真桌面 4 次试验 **max = 44 ms**、p50 = 41 ms（400 ms 目标的 11.0%），见 `docs/30 §23.3.3`；`P3.09` 提交时这条**仍待 L3**，是 `P3.10` 把它补上的（`DEV-56`）；③ 普通截图回归（A 类）全绿 —— **✅ 满足**：`cargo test --workspace --lib -- --test-threads=1` 每次门禁都全绿（app 56+3 / capture 543+19 / history 51 / model 23，0 failed）；④ `scroll-p3` 标签已打 —— **✅ 已完成**：标签指向本阶段收口提交。
+
+**P3 阶段收口（2026-10-09）**
+
+**① 本阶段任务状态**：`P3.01`–`P3.10` 共 **10 个任务**（§1.1 的阶段总表写 9 个；`P3.10` 是执行时新增的，`DEV-56`）。**九个 `[x] 完成`、一个 `[!] 部分完成`**：`P3.06` 的退出条件 ③（手动序列在 `E-ACC-1` 夹具下**不产生错误确定**）**未满足**——实测 **4/32 错误确定**（错误率 0.1250），断言留在侧分支 `blocked/P3-06-manual-alias`（`fde446d`），主干提交 `508c240` 只带 GREEN 部分与风险行 `R-24`。逐任务执行记录见 §9 对应任务块。
+
+**② 实际产出与 V2 §23.3 的逐指标对比（含"未取得"）**
+
+| §23.3 指标 | 目标 / 通过阈值 | `P3` 的实际产出 |
+|---|---|---|
+| **Cancel latency** | P50 ≤ 60 ms，**Max ≤ 400 ms** | **✅ 已实测达标（`P3.10`，真桌面）**：4 次试验 **max = 44 ms**、**p50 = 41 ms**；400 ms 设计目标用了 11.0%、500 ms 验收界用了 8.8%。两种触发形态分别 max = **0 ms**（`mid-flight`）与 **44 ms**（`parked`）⇒ "下界 = 一次注入 + 一次稳定性等待"精确化为"**注入是可观测的起点，settle 的第一件事是查信箱**"，而 `parked` 的代价主要是**一次回读**（1188×894 = 4.25 MB），不是一个 tick。`P3.07` 的脚本时钟测量（7 个触发点，max 20 ms / P50 8 ms）是**循环自身**的贡献。**覆盖边界见 `R-26`**（4 个样本、一个目标、一条路由；不得外推到 4K） |
+| **Stop latency** | P50 ≤ 20 ms，P95 ≤ 60 ms | **未取得数字**：`P3.07` 给出的是这条指标在 **L1 的可观测量**（`disposal() == Some(Disposal::Export)`，由 `stop_commits_the_export_and_cancel_discards_it` 断言），而"导出任务已提交给 export-worker"这个动作属 `P3.09` 的装配（导出执行体在平台侧）⇒ **本阶段没有测过停止的毫秒数**。它比取消便宜得多（只是提交一个覆盖式信箱），但**不得把"便宜"写成数字**。出口 = `P6.08` 的回填或一次 L3 复跑 |
+| **Scroll Response** | P50 ≤ 30 ms，P95 ≤ 60 ms | **未取得**：`P3.05` 的 `E-CTRL-1` 量的是**收敛步数**（到 ±20% 需要几步），不是"一次注入 → 画面动"的毫秒数；本阶段没有装置测它（§23.3 的推导依据是 `RENDER_TICK_MS = 15`，而**推导不是实测**） |
+| **Stitch Latency** | P50 ≤ 8 ms，P95 ≤ 20 ms | 本阶段**不新增证据**；`P0.03` 的 `§23.3.2` 结论（`l123` 的 P50 = 67.1 / 113.0 / 254.7 ms，**目标未达成**）不变 |
+| （新增，非 §23.3 行）**`E-CTRL-1` 的收敛性** | 规格：误差按 `0.7^k` 衰减、6 步内进入 ±20% | **部分达成**：到 ±20% 的步数 = 真值 8 → **10**、12 → **9**、20 → **7**、40 → **3**、60 → **0**、90 → **2**、120 → **3**、200 → **4** ⇒ "**6 步内**"只在**启动值与真值约 2× 以内**成立（`ĝ₀ = 60` 对真值 90/120/200 分别要 2/3/4 步；对真值 8/12 要 10/9 步）。误差确实按 `0.7^k` 衰减，**但收敛的前提是"每步都能被确认"**，而 `R-25` 实测越冲方向**不可恢复** ⇒ 该前提对"比 `ĝ₀` 快 8% 以上的页"是假的 |
+| （新增，非 §23.3 行）**`E-INJECT-1` 八组** | 八组都有产物，未取得逐条列明 | **✅ 满足（含两项"未取得"）**：`win32-own` 自建夹具两条传输各 **120 px**（独立到达计数）；`chrome` 两条传输各 **800 px**（4 格 = 400 px ⇒ 100 px/格）；`edge` **`SendInput` 完全无效（0 px，`corr@0 = 1.000`）而 `PostMessageW` 有效（400 px）**（`§24.6.2` 结论 1–2）；小窗口臂 `PostMessageW + screen` 4 格 = 400 px **而 client 坐标 0 px**；非前台臂 `SendInput` 仍滚 **400 px**（`MOUSE_POS` 路由 ⇒ `§24.6` 的判定规则 1 前提修正为"先把光标放到目标上"）。**未取得**：① WebView2（运行时已装但本机无可用宿主，侧分支 `blocked/P0-05-webview2-capture`）；② `electron-Qoder IDE` 与 `winui3` 六臂**全 0**，而"没有可滚内容"与"注入没到达"在本装置里**同形** ⇒ 不报告任一答案（`OQ-15`）。UIPI 一项**已解除**：`tools/p009-low-integrity-launch.ps1` 实测本机（`EnableLUA = 0`）**无法构造"低→高"场景**，两条路径都不通，因此不是"未取得"而是"本机不可测" |
+
+**③ 偏差（偏离点 / 依据 / 是否回填 V2）**
+
+本阶段新增 **`DEV-45`…`DEV-58`（14 条，全文见 §0.6 表）**，共同的形状是"**规格说了一个结论，但没说这个结论由什么机制保证、以及在什么条件下它会失效**"。反复出现的三类裁决：
+
+1. **把"我说了"与"它发生了"分开，且让类型说出是哪一种**——`InjectStatus` 刻意**没有** `Unsupported` 变体（没有生产者的变体是没人能证伪的声称，`DEV-45`）；`InjectOutcome` 刻意**没有** `succeeded` 字段；`Posted` 在模块 doc 里被显式标注"未证明被处理"（`P3.01` 的 REFACTOR 义务），这条正是 `P3.03` 的内容位移自检存在的原因。
+2. **度量必须写明它量的是哪一段，否则"达标"是假的**——`Cancel latency` 的两条察觉路径（`DEV-57`）：只记 `inject_and_settle` 的返回路径会让"停在等首帧"的会话读 `None`，而 **`None` 不是 0**；`cancel()` 的位与时刻的发布顺序有一个**微秒级**的窗口，它真的被并行门禁钉住（`139 passed; 1 failed`）；"会话打开成本算不算指标"的裁决依据是 §23.2 的触发点（"注入之后的**最坏时刻**"）。`DEV-56` 是同一形状的阶段级版本：**退出条件写了、没人被指派去满足它**。
+3. **一个被两个来源同时"确认"的数字，可能只是几何巧合**——`P0.09` 的两种坐标空间在正常窗口尺寸下都得 800 px，小窗口臂才把它分开（`screen` 400 px / `client` 0 px）；`DEV-58` 的三种矩形（`GetClientRect` 1184×892 / `GetWindowRect` 1200×900 / DWM 可见边界 **1188×894**）里只有第三种与 WGC 一致，前两种会让 driver 在第一帧 panic（`crates/snapclip-capture/src/scroll/canvas.rs:1154` 的 invariant 1）。**这条对生产同样成立**，不只是探针的事。
+
+**是否回填 V2**：全部已回填（`docs/30 §23.3`、`§23.3.3`、`§21.4.1`、`§24.1.1`、`§24.6.2`、`§24.6.4`、`§30.2`、`§30.5`、`§36.2` 的 `OQ-15`/`OQ-17`/`OQ-18`/`OQ-20`/`OQ-21`/`OQ-22`/`OQ-23`），无一条只留在本文。
+
+**④ 推送批次与标签**
+
+计划（§8 表）是 `[P3-A]` `[P3-B]` **3 次推送**，实际是 **10 次**（每个任务一次）：`28968e0..623fd96`（`P3.01`）、`623fd96..8e4b730`（`P3.02`）、`8e4b730..a998522`（`P3.03`）、`a998522..0469dca`（`P3.04`）、`0469dca..b74b1af`（`P3.05`）、`b74b1af..508c240`（`P3.06`）、`508c240..0fd53a0`（`P3.07`）、`0fd53a0..9405b29`（`P3.08`）、`9405b29..bdcf831`（`P3.09`）、`bdcf831..160d969`（`P3.10`）。**与 `P2` 同一形状的偏差**：分批推送的前提是"同一批里的任务互不依赖地并行完成"，而 `[P3-A]`/`[P3-B]` 的十个任务实际是**串行**做的（`P3.01` 是所有后续任务的前置，`P3.04` 是 `P3.05`–`P3.09` 的前置），所以没有可合批的窗口。计划的"3 次推送"没有对应的执行形态，**不改计划数字**，只在此记录实际形态。每次推送都过了 `.githooks/pre-push`（串行 workspace 门禁 + 依赖方向门禁），最后一次的尾部为 `[pre-push] dependency direction` → `dependency direction is clean` / `[pre-push] OK`。
+
+标签：`scroll-p3` 指向本阶段收口提交。
+
+**阶段门禁（`§4.2`，打标签前对已提交状态跑）**：`cargo test -p snapclip-capture --lib -- --ignored --test-threads=1` → **17 passed / 2 failed**（`finished in 928.60s`），日志 `docs/Temp/p3-stage-l3.log`。17 个通过里含本阶段的三条 L3：`cancel_latency_probe`、`inject_matrix_probe`、`the_probe_produces_all_three_delivery_states`。两个失败**都是已知的环境条件，而且两次都是探针按设计大声拒绝**，不是代码回归：
+
+- `windows::scroll_probe::uipi_probe` — `panicked at crates\snapclip-capture\src\windows\scroll_probe.rs:3836:9: set SNAPCLIP_UIPI_TARGET to a substring of the title of a scrollable window, then run this test as the low-integrity sender: runas /trustlevel:0x20000 ...`。本机 `EnableLUA = 0`，**没有低完整性发送方可构造** ⇒ `P3.02` 的 UIPI 一项判为"**本机不可测**"而不是"未取得"（`tools/p009-low-integrity-launch.ps1` 实测两条路径都不通）。
+- `windows::scroll_probe::wda_probe` — `panicked at crates\snapclip-capture\src\windows\scroll_probe.rs:4274:5: the fixture was not visible in the control arm (0 of 10 frames), so this probe cannot tell WDA's effect from a broken fixture: other(106,196,56), …（10 次同值）`。三臂逐帧完全相同（`visible 0 / black 0 / other 10`），而 `SetWindowDisplayAffinity(0x11)` 被接受、`GetWindowDisplayAffinity` 读回 `0x11` ⇒ `OQ-2` 仍**未取得**（`docs/30 §24.5.1`）。**该探针在 panic 之前印出的 `[OQ-2] verdict: WDA affects the monitor-level capture path` 是它自己的诊断缺陷**（判据只看 arm 2、不看对照组），已记为 `R-27`。
+
+`§4.2` 的另两条门禁**不属本阶段**：`--release ... perf`（L4）与 `--features test-support --test ui`（UI 回读）——`P3` 的十个任务里没有 L4 项（`P3.10` 是 L3），UI 回读归 `P5`。
+
+**侧分支（`§3.4` 的 `[!]` 表）**：`blocked/P3-06-manual-alias`（`fde446d`，唯一在本阶段新建的）。另有两个此前阶段的侧分支仍在：`blocked/P0-02-context-owner`（`d1098cb`）与 `spike/apartment-mta`（`58bd99b`）。
 
 ---
 
@@ -2498,6 +2539,8 @@ git config core.hooksPath .githooks
 | R-25 | **闭环在"越冲"方向上不可恢复**（已发生，2026-10-09，`P3.09`）：页面每步前进**多于** `ĝ` 预期时，匹配成功但**门一** `is_verifiable` 拒绝（`overlap_ratio < RHO_MIN = 0.35`）⇒ 步被丢弃 ⇒ §16.6 规则 2 禁止从非确认步学习 ⇒ `ĝ` 不动 ⇒ 下一步同样越冲。实测真增益 72（`ĝ₀ = 60` 的 1.2×）⇒ `committed()` **恒为 0**；对 `V = 900`、9 格而言，**真增益 > 65 px/格（8%）即触发**。而 §13.2 的收敛性声称（`E-CTRL-1`："误差按 `0.7^k` 衰减"）只对**欠冲**方向成立（真增益 48 ⇒ 收敛） | 已发生 | 中（它不会静默出错——每一次都是 `Uncertain`，画布不会写错行；但它会让"页面前进比预期快"的目标**一个像素都截不到**，用户看到的是"滚了、什么都没发生"。真实触发条件是**比 `ĝ₀ = 60` 快 8% 以上的页**，而 `ĝ₀` 是启动值、不学习 ⇒ 一台滚轮步长大的机器 + 一个正常页就会撞上） | 出口两条且都要新实验：① **更小的首步**（`ĝ` 的启动值或首步上限——`Control::new` 的 `starting_px_per_notch(lines, height)` 是唯一入口）；② **§15.6 的多尺度金字塔**（设计有、未实现，`OQ-17`：金字塔让"大位移"在低分辨率层上被看见 ⇒ `|d|` 变小 ⇒ 门一不再拒绝）。**在此之前 `RHO_MIN` 与 `ĝ₀` 都不动**——`RHO_MIN = 0.35` 是 `P1.08` 的实测标定值，改它会把 `P1` 的验收结论一起改掉。判据 = 越冲用例（真增益 ≥ 1.1×）能 `committed() >= 1` | `P3.09`/`OQ-17`/`P3.05`（`E-CTRL-1` 的收敛性表要在"每步都能确认"的假设被打破后重跑） |
 
 | R-26 | **`Cancel latency` 的实测只覆盖一种窗口尺寸与一条注入路径**（2026-10-09，`P3.10`）：`max = 44 ms` 是**4 个样本、一个目标（1188×894 的 Chrome）、一条路由（`SPI_GETMOUSEWHEELROUTING = MousePosition` ⇒ `choose()` 给出 `SendInput + PlaceCursor`）**上的数。而 `parked` 的 41–44 ms 里占主导的是**一次回读**（1188×894 = 4.25 MB 的 GPU→CPU 拷贝）⇒ **成本随窗口面积走**，4K 窗口的回读是它的 8.1×（面积比），最坏情况下 `parked` 可能逼近甚至超过 400 ms 设计目标；`PostMessageW` 传输与 UIPI 分支（`E-INJECT-1` 的覆盖范围）在本探针里**从未走到** | 未发生（同一台机器上 1188×894 的窗口满足两个阈值） | 中（"达标"的结论**只在被测量的那个尺寸上成立**；把 44 ms 当成"任何窗口都 44 ms"是一条会被 4K 用户证伪的声称） | 出口：① 在**4K 窗口**上复跑 `cancel_latency_probe`（改 `ScrollTargetKind` 的启动参数或把 Chrome 窗口最大化）并把结果并入 §23.3.3；② 若 4K 的 `parked` 超界，则把"取消要立刻"的承诺改写为"**下一次回读结束时**"，或让 settle 的回读在取消后**提前返回**（`WgcFrameSource::next` 的 `timeout` 是唯一入口，但它今天只控制轮询间隔而不是回读中断）。**在此之前不得把 44 ms 外推到 4K** | `P3.10`/`P6`（任何改动取消路径或回读路径的任务都要复跑） |
+
+| R-27 | **探针的诊断行会说出一个同一次运行的断言随后拒绝的结论**（2026-10-09，P3 阶段门禁实测）：`crates/snapclip-capture/src/windows/scroll_probe.rs:4263-4270` 的 `[OQ-2] verdict: WDA affects the monitor-level capture path` **只看 arm 2**（`count(&excluded, WdaVerdict::Visible) == 0` ⇒ `affects`），不看对照组；而同一运行里三臂逐帧完全相同（`visible 0 / black 0 / other 10`）⇒ 这一行在夹具坏掉时仍会印出"WDA 生效"。紧随其后的断言（`:4274`）**正确地拒绝了这个结论**并 panic，所以这次没有假结论被记录；危险的是**读日志的人只抄那一行** | 已发生（2026-10-09） | 低到中（`OQ-2` 本来就"未取得"，但这一行是**唯一一句看起来像结论的文本**，抄进文档就是一条从未被测量过的声称） | 出口：把该行的判据改成"**先要求对照组有效**，否则印 `inconclusive`"（对照组 0 可见时不得给出任何方向），并把 `R-19` 的纪律扩写为"**诊断行与断言必须用同一个判据**"。修法在 `OQ-2` 解除（在未锁定、已连接的桌面上跑一次 `wda_probe`）时一并做——那一次复跑本来就要改这个文件 | `P0.05`（`OQ-2` 解除时）/ `P6` |
 
 ### 14.4 失败处置与回滚
 
