@@ -45,6 +45,37 @@
         assert_eq!(hotkey::RETURN_VIRTUAL_KEY, 0x0D);
     }
 
+    /// `docs/30` §21.4: the scroll session's notification is `WM_APP + 45`, and it must collide
+    /// with nothing that is already posted to a thread.
+    ///
+    /// The precedent is `export_worker.rs:670`, which asserts the same thing for one pair
+    /// (`EXPORT_READY_MESSAGE != FRAME_READY_MESSAGE`). This one covers every id that is taken,
+    /// including the two the app crate owns — `apps/snapclip/src/tray.rs:43-44` has
+    /// `TRAY_CALLBACK_MESSAGE = WM_APP + 1` and `WM_STOP_TRAY = WM_APP + 2` — which is why the
+    /// assertion is written as an offset table rather than a list of `assert_ne!`s: those two
+    /// cannot be named from here, so they are recorded by their offsets.
+    #[test]
+    fn the_scroll_message_id_collides_with_nothing_that_is_already_posted() {
+        use crate::windows::{capture_worker, detection_worker, export_worker, refinement_worker};
+
+        assert_ne!(SCROLL_READY_MESSAGE, WM_OVERLAY_COMMAND);
+        assert_ne!(SCROLL_READY_MESSAGE, capture_worker::FRAME_READY_MESSAGE);
+        assert_ne!(SCROLL_READY_MESSAGE, export_worker::EXPORT_READY_MESSAGE);
+        assert_ne!(SCROLL_READY_MESSAGE, detection_worker::DETECTION_READY_MESSAGE);
+        assert_ne!(SCROLL_READY_MESSAGE, refinement_worker::REFINEMENT_READY_MESSAGE);
+
+        let taken = [1, 2, 17, 18, 19, 43, 44];
+        let offset = SCROLL_READY_MESSAGE - WM_APP;
+        assert_eq!(
+            offset, 45,
+            "§21.4: the scroll session's message is `WM_APP + 45`"
+        );
+        assert!(
+            !taken.contains(&offset),
+            "`WM_APP + {offset}` is already posted by someone: {taken:?}"
+        );
+    }
+
     #[test]
     fn lparam_decodes_signed_client_coordinates() {
         // (10, 20)

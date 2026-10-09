@@ -3553,6 +3553,22 @@ impl StopReason { fn yields_partial(&self) -> bool { /* 除 UserCancelled 与 In
 
 **PixPin 的做法是两段的**（先"停止"进入导出态，再"保存"）——F-16 的界面上"开始/停止"与"保存/复制/贴图"是两组按钮。V2 保持**滚动会话内一次决定**（停止即导出），因为在滚动截图里"先停止看看、再决定保存"没有信息增益（用户已经看了整个预览）。
 
+#### 20.5.1 落地的形状（`P3.07`，2026-10-09）
+
+```rust
+// crates/snapclip-capture/src/scroll/session.rs
+pub(crate) enum Disposal<'a> { Export(&'a RecoveredImage), Discard }
+impl ScrollSession { pub(crate) fn disposal(&self) -> Option<Disposal<'_>>; }
+```
+
+**三条落地裁决**
+
+1. **`Disposal` 不派生 `Debug`**：`RecoveredImage` 没有 `Debug`（`P3.04` 的 DEV-48 已因此拒绝给 `ScrollSession` 派生 `Debug`）。为测试便利给生产类型加派生，会让"能不能打印"变成一条无人维护的约束。
+2. **"两个承诺"是 `stop_reason()` 的函数，不是第二个字段**：`disposal()` 只有一处判定（`let reason = self.stop?;` 之后按 `reason.yields_partial()` 分支）。`UserStopped` ⇒ `Export`（可能是 `Partial`）、`UserCancelled` ⇒ `Discard`（无文件）、`InternalError` ⇒ `Discard`（§20.4：内部错误不产生用户没要求的文件）。**刻意没有 `Disposal::Pending`**：`None` 就是"会话还在跑"，多一个变体等于多一个可以与之不一致的真相。
+3. **`Export` 借出画布而不是克隆它**（`&'a RecoveredImage`）：滚动画布可达数百 MB（`E-PERF-2` 实测 4K 下整图路径峰值 1188.3 MiB），在"决定导出"这个动作上复制一份是纯粹的浪费。生命周期参数使"导出期间会话不被改"成为编译期事实。
+
+**层级边界（诚实性）**：§30.2 的"停止延迟"行在 L1 的形式**就是** `disposal() == Some(Disposal::Export)`；而"导出任务已提交给 export-worker"这个动作本身属 `P3.09` 的装配（导出执行体在平台侧），本任务**不声称**它已落地。
+
 ### 20.6 与既有 `CaptureSession` 的关系（不允许出现两套并行状态）
 
 **§5 已确证的约束**：`CaptureSession` 的 6 个活跃状态的测试是**穷举的**（`esc_from_every_active_state_returns_to_idle`），且 `Adjusting` 不可达。新增滚动会话时**绝不能**在 `CaptureSession` 里再塞状态，否则会同时破坏那份穷举测试与它承载的"合法迁移"信息。
@@ -3687,6 +3703,46 @@ fn context(&self) -> &ID3D11DeviceContext {
 - **注入本身不可中断**（`SendInput`/`PostMessage` 是原子系统调用），因此取消延迟的下界是"一次注入 + 一次稳定性等待"——它必须作为 §23 的 **Cancel latency** 指标被测量，而不是被假设为"立即"。
 
 **新增的消息 id**：`WM_APP + 45`（§5 已确证 `+1/+2/+17/+18/+19/+43/+44` 被占用；`export_worker.rs:670` 有断言 18 ≠ 19 的先例，V2 同样加一条"45 未与既有 id 冲突"的断言）。
+
+#### 21.4.1 落地的形状与实测（`P3.07`，2026-10-09）
+
+```rust
+// crates/snapclip-capture/src/scroll/loop_control.rs
+pub(crate) trait StepHost {
+    fn now(&self) -> Instant;
+    fn digest(&self) -> Option<u64>;
+    fn inject(&mut self, notches: i32) -> Result<(), String>;
+    fn cancellation(&self) -> Option<Instant>;   // 必填，刻意不给默认实现
+}
+pub(crate) enum StepError { Injection(String), NoFrame, Cancelled { latency: Duration } }
+fn cancellation_error<H: StepHost>(host: &H) -> Option<StepError>;   // 唯一的检查点实现
+
+// crates/snapclip-capture/src/windows/overlay.rs
+#[allow(dead_code)] pub(crate) const SCROLL_READY_MESSAGE: u32 = WM_APP + 45;
+```
+
+**四条落地裁决**
+
+1. **`cancellation()` 是 poll 不是 signal**，且返回的是**用户按下的时刻**而不是"现在"。差值因此就是 §23.2 的 `Cancel latency`，不需要第二个时钟；`SendInput`/`PostMessageW` 不可召回，这一点无法用接口形状改变，所以把它变成**接口的文档**而不是注释。
+2. **`cancellation()` 没有默认实现**：给一个 `None` 的默认值，会让"忘记实现"看起来像"用户没取消"——一个永远返回"继续走"的取消通道。必填方法把这件事变成编译错误。
+3. **两个检查点，一个实现**（`cancellation_error`）：注入前一次、等待循环每轮顶部一次。合成一个函数是为了让"在哪里检查"和"在哪里测量"**不能分开漂移**——否则新增一个检查点就会是一条测量表永远看不到的延迟。
+4. **`SCROLL_READY_MESSAGE` 带 `#[allow(dead_code)]`**：它的消费者是 `P5.01` 的预览接线，此刻不存在。允许的理由写在 `#[allow]` 旁而不是"以后再删"，因为删除条件（预览接线落地）是**可判定的**。
+
+**实测表（L1，虚拟时钟，`cancel_latency_has_a_measured_max`）**——触发时机 = §23.2 要求的"注入后的最坏时刻"：
+
+| 场景 `(取消时刻 ms, 注入耗时 ms)` | 延迟 | 说明 |
+|---|---|---|
+| `(0, 0)` | **0 ms** | 取消先于本步 ⇒ **一次注入都没有发生**（断言 `injections.is_empty()`） |
+| `(1, 0)` | 14 ms | 一个 `RENDER_TICK_MS` 内 |
+| `(7, 0)` | 8 ms | 同上 |
+| `(15, 0)` | 0 ms | 恰好落在检查点上 |
+| `(16, 0)` | 14 ms | 跨过检查点 |
+| `(100, 0)` | 5 ms | 全程 `Poll::Idle`（无帧）⇒ 必须报 `Cancelled` 而**不是** `NoFrame`：用户的意图优先于"没看到东西" |
+| `(10, 30)` | **20 ms** | **取消发生在注入途中** ⇒ 循环只能等它返回（断言 `injections.len() == 1`） |
+
+实测 **max = 20 ms、P50 = 8 ms**，断言 `max ≤ 400 ms`（§23.3 设计目标）、`max ≤ 500 ms`（验收界）、`P50 ≤ 60 ms`，以及逐例 `latency ≤ inject_ms + RENDER_TICK_MS`。
+
+**下界不为零（这条必须留在测量表旁边，否则下一个人会以为可以优化到 0）**：一次注入 + 一次回读是**不可中断段**，其真值由 L3 量（`E-INJECT-1`/`E-PERF-1`）。**本任务只量循环自身的贡献**（一个 tick 的粒度），`P3.07` 的层级是 L1+L2 —— 真桌面上的 `Cancel latency` **Max** 归 `P3.09`/`P6`，本节不声称它已满足。
 
 ### 21.5 COM/WinRT 公寓：本 crate **不声明**公寓，靠 combase 的隐式 MTA（R-21 的实测结论，2026-10-08）
 
@@ -5111,8 +5167,8 @@ fn rows_match(actual, expected, sigma) -> bool
 | 平滑滚动等待 | 内容持续移动 3 帧 | 等到静止才估计 | L2 | **已可执行（`P3.04`）**：`smooth_scrolling_is_waited_out_instead_of_being_estimated`（四个互不相同的帧各 45 ms ⇒ 全部 `Waiting`，到 `STEP_TIMEOUT` ⇒ `TimedOut`）+ `the_loop_waits_until_two_consecutive_frames_agree_before_estimating` + `the_loop_injects_once_and_waits_for_the_picture_to_stop_moving` + `a_step_with_no_frames_at_all_is_not_a_timeout`，见 §13.3.1 |
 | 控制律收敛 | 快/中/慢三种增益的合成目标 | 6 步内 `ĝ` 到真值 ±20%；重叠比落 `[0.30, 0.40]` | L1 | **已可执行（`P3.05`）**：`ghat_converges_within_six_steps_to_within_twenty_percent`（40/60/120 三档）+ `the_resulting_overlap_ratio_lands_in_the_designed_band`（40/60/90 落区间；120 的格量化算术写在用例里）+ `every_step_the_law_asks_for_is_verifiable` + `the_notch_count_respects_the_wire_format`，见 §13.2.1。**`E-CTRL-1` 的实测表与三处勘误在 §13.2.1** |
 | 控制律只学确证步 | `Uncertain` / `None` 步 | `ĝ` 不变 | L1 | **已可执行（`P3.05`）**：`ghat_is_not_updated_on_uncertain_steps`（§13.5 的"缓慢且只在确证步上"是 `observe` 收 `Status` 的性质），见 §13.2.1 |
-| 取消延迟 | 注入后最坏时刻取消 | `Phase == Stopped` | L1 | **Cancel latency（Max）** |
-| 停止延迟 | 停止 | 导出任务已提交 | L1 | **Stop latency** |
+| 取消延迟 | 注入后最坏时刻取消 | `Phase == Stopped` | L1 | **已可执行（`P3.07`）**：`cancel_latency_has_a_measured_max`（7 个触发点，实测 max = 20 ms / P50 = 8 ms；**下界 = 一次注入 + 一次回读**，真桌面上的 Max 归 `P3.09`/`P6`），见 §21.4.1 |
+| 停止延迟 | 停止 | 导出任务已提交 | L1 | **已可执行（`P3.07`）**：`stop_commits_the_export_and_cancel_discards_it`（L1 的可观测量 = `disposal() == Some(Disposal::Export)`；"提交给 export-worker"这个动作是 `P3.09` 的装配），见 §20.5.1 |
 
 ### 30.3 Matching / Offset（匹配与位移）
 

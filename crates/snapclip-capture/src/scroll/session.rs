@@ -78,6 +78,26 @@ impl StopReason {
     }
 }
 
+/// What happens to the recovered pixels when the session stops (`docs/30` §20.5).
+///
+/// Stop and cancel are the same event as far as the phase is concerned — both are `Stopped` — and
+/// they differ in exactly one thing: whether there is an artifact. `Enter` promises a file,
+/// `Esc` promises none, and putting that difference in a value the assembly can match on means
+/// neither the export path nor the UI has to re-derive it from the stop reason and get it wrong
+/// once. PixPin splits the same decision across two user actions ("stop", then "save"); §20.5 keeps
+/// it as one decision inside the session, because looking at a partial image before deciding
+/// whether to keep it carries no information.
+///
+/// `docs/30` §27.1's public boundary type is `ScrollOutcome` (final size plus the artifact handle),
+/// which belongs to the session assembly (`P3.09`) — a handle is not something this module has.
+/// This is the decision `ScrollOutcome` is built on.
+pub(crate) enum Disposal<'a> {
+    /// `Enter`: the canvas is the result and goes to the export path, possibly as a partial image.
+    Export(&'a RecoveredImage),
+    /// `Esc`, or an invariant violation: nothing is exported and the pixels are dropped.
+    Discard,
+}
+
 /// Counters for "this is not working" conditions that need to persist across steps.
 ///
 /// `no_progress` is what turns a run of `MatchFailed` steps into a user-visible hint (§20.4: a
@@ -230,6 +250,21 @@ impl ScrollSession {
             self.stop = Some(reason);
         }
     }
+
+    /// What to do with the pixels now, or `None` while the session is still running.
+    ///
+    /// Derived from the stop reason, the way [`phase`] is derived from the session: there is
+    /// exactly one place that knows which reasons throw the canvas away, and it is
+    /// [`StopReason::yields_partial`] (§20.5). Asking the session rather than the reason keeps the
+    /// caller from having to hold the canvas and the reason at the same time.
+    pub(crate) fn disposal(&self) -> Option<Disposal<'_>> {
+        let reason = self.stop?;
+        Some(if reason.yields_partial() {
+            Disposal::Export(&self.canvas)
+        } else {
+            Disposal::Discard
+        })
+    }
 }
 
 /// Derive the phase. Pure; no side effects, no transitions to get out of step with the data.
@@ -319,6 +354,73 @@ mod tests {
         for (reason, expected) in yields {
             assert_eq!(reason.yields_partial(), expected, "{reason:?}");
         }
+    }
+
+    /// `docs/30` §20.5: stopping and cancelling are **different promises about the same pixels**.
+    ///
+    /// `Enter` means "give me the result now" — the canvas is the artifact, and it may be a partial
+    /// one. `Esc` means "I want nothing" — there is no artifact to write. Both end the session, so
+    /// the difference cannot live in the phase (both are `Stopped`); it lives in what the session
+    /// hands over, which is what `disposal` answers.
+    #[test]
+    fn stop_commits_the_export_and_cancel_discards_it() {
+        let frame = || {
+            Observation::new(
+                vec![7u8; 320 * 4 * 4],
+                Rect::new(0, 0, 320, 4),
+                1,
+                (320, 4),
+                Axis::Vertical,
+            )
+            .expect("a packed observation")
+        };
+
+        let mut running = ScrollSession::new(Axis::Vertical, 320, MemoryBudget::with_total(1 << 20));
+        running.start(&frame());
+        assert!(
+            running.disposal().is_none(),
+            "a running session has not decided anything about its pixels yet"
+        );
+
+        let mut stopped = ScrollSession::new(Axis::Vertical, 320, MemoryBudget::with_total(1 << 20));
+        stopped.start(&frame());
+        stopped.stop(StopReason::UserStopped);
+
+        let mut cancelled =
+            ScrollSession::new(Axis::Vertical, 320, MemoryBudget::with_total(1 << 20));
+        cancelled.start(&frame());
+        cancelled.stop(StopReason::UserCancelled);
+
+        assert_ne!(
+            stopped.stop_reason(),
+            cancelled.stop_reason(),
+            "one reason for `Enter` and another for `Esc`: the two promises are not one 'the user \
+             ended it'"
+        );
+        assert_eq!(
+            (phase(&stopped), phase(&cancelled)),
+            (Phase::Stopped, Phase::Stopped),
+            "§30.2's cancel row is checked against the phase, and both promises end the session — \
+             so the phase cannot be what tells them apart"
+        );
+
+        let Some(Disposal::Export(canvas)) = stopped.disposal() else {
+            panic!("`Enter` commits the export");
+        };
+        assert_eq!(
+            canvas.primary_len(),
+            4,
+            "the artifact is the content that was recovered, not a handle to something empty"
+        );
+
+        assert!(
+            matches!(cancelled.disposal(), Some(Disposal::Discard)),
+            "`Esc` discards the pixels: there is no partial file to hand over"
+        );
+
+        // The same distinction as the export path will ask it.
+        assert!(StopReason::UserStopped.yields_partial());
+        assert!(!StopReason::UserCancelled.yields_partial());
     }
 
     #[test]

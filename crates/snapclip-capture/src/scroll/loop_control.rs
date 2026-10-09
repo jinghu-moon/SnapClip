@@ -157,6 +157,20 @@ pub(crate) trait StepHost {
     /// whole subject is time passing: with the clock injected, the 40 ms and 400 ms rules can be
     /// exercised in microseconds instead of by sleeping.
     fn now(&self) -> Instant;
+
+    /// The instant the user asked to cancel, if they have (`docs/30` §21.4).
+    ///
+    /// Polled at every interruptible point: before the injection, right after it, on every tick of
+    /// the settle wait, and before matching. It is a **poll and not a signal** on purpose — neither
+    /// `SendInput` nor `PostMessageW` can be recalled once it has gone out, so there is nothing for
+    /// an interrupt to interrupt. The instant returned is when the *user* asked, not when the loop
+    /// noticed: the difference between the two **is** the `Cancel latency` metric of §23.2, and
+    /// only the loop can measure it.
+    ///
+    /// `None` means "keep going". `Some` is sticky — a cancelled session never resumes — and the
+    /// method is deliberately **required** rather than defaulted to `None`: a host that forgot to
+    /// answer it would make every cancellation look like a step that simply kept going.
+    fn cancellation(&self) -> Option<Instant>;
 }
 
 /// How a step's wait ended, and what the target looked like when it did.
@@ -179,6 +193,15 @@ pub(crate) enum StepError {
     /// Deliberately distinct from [`SettleVerdict::TimedOut`]: there we *have* a frame and merely
     /// cannot prove it is still; here there is nothing to estimate at all.
     NoFrame,
+    /// The user cancelled while this step was in flight, and this is how long it took the loop to
+    /// confirm it (`docs/30` §21.4, §23.2).
+    ///
+    /// The duration is **measured, not derived**: it runs from the instant the user asked to the
+    /// instant the loop regained control and looked. It is reported rather than recomputed by the
+    /// caller because only the loop knows when it got control back — and it is not zero, because an
+    /// injection that has already gone out cannot be recalled and a readback that is already in
+    /// flight has to return.
+    Cancelled { latency: Duration },
 }
 
 /// Inject a step and wait for the target to stop moving (`docs/30` §13.3).
@@ -195,6 +218,13 @@ pub(crate) fn inject_and_settle<H: StepHost>(
     settle: &mut Settle,
     notches: i32,
 ) -> Result<Settled, StepError> {
+    // A cancel that arrived before this step began must not be answered with another injection:
+    // the promise was "no more scrolling", and §13.4's manual route is not the only caller that
+    // has to honour it.
+    if let Some(cancelled) = cancellation_error(host) {
+        return Err(cancelled);
+    }
+
     // §13.4: in manual mode there is nothing to inject, and this is where that becomes mechanical.
     // The actuator is not called with zero notches — that is an invalid request by its own contract
     // (`scroll_actuator.rs`), and a manual step must not send one.
@@ -204,6 +234,9 @@ pub(crate) fn inject_and_settle<H: StepHost>(
     settle.begin(host.now());
 
     loop {
+        if let Some(cancelled) = cancellation_error(host) {
+            return Err(cancelled);
+        }
         match host.digest() {
             Some(digest) => match settle.sample(digest, host.now()) {
                 SettleVerdict::Waiting => continue,
@@ -216,6 +249,18 @@ pub(crate) fn inject_and_settle<H: StepHost>(
             }
         }
     }
+}
+
+/// The cancel to report, if the user asked for one, with how long the loop took to notice.
+///
+/// One helper rather than two inline constructions, so that "the cancel is checked here" and "the
+/// latency is measured here" cannot drift apart: every check point is a measurement, and a check
+/// point added without one would be a latency the table never sees.
+fn cancellation_error<H: StepHost>(host: &H) -> Option<StepError> {
+    let asked_at = host.cancellation()?;
+    Some(StepError::Cancelled {
+        latency: host.now().saturating_duration_since(asked_at),
+    })
 }
 
 /// How many notches this step asks for, given who is driving the scroll (`docs/30` §13.4).
@@ -688,20 +733,36 @@ mod tests {
     /// makes the two timing rules testable in microseconds.
     struct ScriptedHost {
         clock: Instant,
+        started: Instant,
         step_ms: u64,
         digests: std::collections::VecDeque<Option<u64>>,
         inject_error: Option<String>,
         injections: Vec<i32>,
+        /// When the user pressed `Esc`, in milliseconds after the host was created.
+        cancel_after_ms: Option<u64>,
+        /// How long the transport takes, in milliseconds. A **model input**: the real cost of
+        /// `SendInput`/`PostMessageW` is measured at `L3` (`E-INJECT-1`). It exists so that the
+        /// cancel-latency table can show that time the loop was not allowed to look at is *in* the
+        /// measurement rather than argued away.
+        inject_ms: u64,
     }
 
     impl ScriptedHost {
         fn new(step_ms: u64, digests: impl IntoIterator<Item = Option<u64>>) -> Self {
+            // One origin for both clocks: `cancel_after_ms` is measured from `started`, and a
+            // second `Instant::now()` here would put the "cancel at 0 ms" scenario a few
+            // nanoseconds in the future — which is exactly the difference between "the loop must
+            // not inject" and "the loop injected once more".
+            let now = Instant::now();
             Self {
-                clock: Instant::now(),
+                clock: now,
+                started: now,
                 step_ms,
                 digests: digests.into_iter().collect(),
                 inject_error: None,
                 injections: Vec::new(),
+                cancel_after_ms: None,
+                inject_ms: 0,
             }
         }
     }
@@ -709,6 +770,8 @@ mod tests {
     impl StepHost for ScriptedHost {
         fn inject(&mut self, notches: i32) -> Result<(), String> {
             self.injections.push(notches);
+            // The transport's cost is uninterruptible: the clock moves while the loop cannot look.
+            self.clock += Duration::from_millis(self.inject_ms);
             match &self.inject_error {
                 Some(detail) => Err(detail.clone()),
                 None => Ok(()),
@@ -723,6 +786,12 @@ mod tests {
 
         fn now(&self) -> Instant {
             self.clock
+        }
+
+        fn cancellation(&self) -> Option<Instant> {
+            let after = self.cancel_after_ms?;
+            let at = self.started + Duration::from_millis(after);
+            (self.clock >= at).then_some(at)
         }
     }
 
@@ -789,6 +858,112 @@ mod tests {
             1,
             "retrying is the watchdog's job (P3.03), not the wait's"
         );
+    }
+
+    /// The `Cancel latency` metric of `docs/30` §23.2, **measured** rather than claimed.
+    ///
+    /// §23.3 gives the design target `Max ≤ 400 ms` and the acceptance bound `Max ≤ 500 ms`, plus
+    /// `P50 ≤ 60 ms`, and it insists the max is given separately "because it is the only source of
+    /// the user's feeling that the thing has frozen". So the number cannot be derived on paper: the
+    /// loop has to be asked, at the worst moment, how long it took to notice.
+    ///
+    /// | `Esc` pressed at | injection in flight | loop noticed at | latency | what the loop was doing |
+    /// |---|---|---|---|---|
+    /// | 0 ms | — | 0 ms | 0 ms | nothing yet: the step had not been injected |
+    /// | 1 ms | 0 ms | 15 ms | 14 ms | waiting for the picture to settle |
+    /// | 7 ms | 0 ms | 15 ms | 8 ms | waiting for the picture to settle |
+    /// | 15 ms | 0 ms | 15 ms | 0 ms | it was already looking |
+    /// | 16 ms | 0 ms | 30 ms | 14 ms | waiting for the picture to settle |
+    /// | 100 ms | 0 ms | 105 ms | 5 ms | waiting for a frame that never came |
+    /// | 10 ms | 30 ms | 30 ms | 20 ms | **inside** the injection, which cannot be recalled |
+    ///
+    /// The last row is the floor made mechanical: the injection had already gone out, so the loop
+    /// could not look until it came back, and the 20 ms it was blind for is *in* the measurement
+    /// rather than argued away. Its 30 ms is a **model input**, not a desktop number — what the
+    /// transport actually costs is measured at `L3` (`E-INJECT-1`, and `E-PERF-1` for the readback
+    /// that is the other uninterruptible segment). The rows above it are the part the loop itself
+    /// controls: **one [`RENDER_TICK_MS`] tick**, which is what §21.4's "check at every interruptible
+    /// point" buys.
+    ///
+    /// **Do not "optimize" the floor to zero.** Neither `SendInput` nor `PostMessageW` can be
+    /// recalled, and a frame readback that is already in flight has to return; a loop cannot see a
+    /// cancel at a point where it is not allowed to look.
+    #[test]
+    fn cancel_latency_has_a_measured_max() {
+        let scenarios = [
+            (0u64, 0u64, "pressed before the step began"),
+            (1, 0, "pressed just after the injection"),
+            (7, 0, "pressed mid-tick"),
+            (15, 0, "pressed on a tick boundary"),
+            (16, 0, "pressed just after a tick"),
+            (100, 0, "pressed while waiting for a frame that never comes"),
+            (10, 30, "pressed while the injection was in flight"),
+        ];
+
+        let mut latencies = Vec::new();
+        for (after_ms, inject_ms, what) in scenarios {
+            let digests: Vec<Option<u64>> = if after_ms >= 100 {
+                // `Poll::Idle` forever: the loop is in the no-frame branch, where it must report a
+                // cancel rather than the `NoFrame` timeout it is racing against.
+                (0..20).map(|_| None).collect()
+            } else {
+                (0..20).map(|_| Some(0xAA)).collect()
+            };
+            let mut host = ScriptedHost::new(RENDER_TICK_MS as u64, digests);
+            host.cancel_after_ms = Some(after_ms);
+            host.inject_ms = inject_ms;
+            let mut settle = Settle::new();
+
+            let outcome = inject_and_settle(&mut host, &mut settle, 3);
+
+            let Err(StepError::Cancelled { latency }) = outcome else {
+                panic!("`Esc` {what} must be reported as a cancel, got {outcome:?}");
+            };
+            if after_ms == 0 {
+                assert!(
+                    host.injections.is_empty(),
+                    "a cancel that arrived before the step began must not be answered with an \
+                     injection: the promise was 'no more scrolling'"
+                );
+            }
+            if inject_ms > 0 {
+                assert_eq!(
+                    host.injections.len(),
+                    1,
+                    "an injection already in flight cannot be recalled — that is the floor of this \
+                     metric, not a bug to fix"
+                );
+            }
+            // The loop's own contribution is one tick; the rest is time it was not allowed to look.
+            assert!(
+                latency <= Duration::from_millis(inject_ms + RENDER_TICK_MS as u64),
+                "`Esc` {what}: {latency:?} exceeds one tick plus the uninterruptible injection \
+                 ({inject_ms} ms)"
+            );
+            latencies.push(latency);
+        }
+
+        let max = *latencies.iter().max().expect("seven samples");
+        let mut sorted = latencies.clone();
+        sorted.sort();
+        let p50 = sorted[sorted.len() / 2];
+
+        // The table in the doc comment, as an assertion: a measurement that is only written down
+        // drifts away from the code, and this one is the whole point of the test.
+        assert_eq!(
+            latencies,
+            [0, 14, 8, 0, 14, 5, 20].map(Duration::from_millis).to_vec(),
+            "the measured table changed — update the doc comment with it, do not relax this"
+        );
+        assert!(
+            max <= Duration::from_millis(400),
+            "§23.3's design target: max {max:?} over {latencies:?}"
+        );
+        assert!(
+            max <= Duration::from_millis(500),
+            "§23.3's acceptance bound: max {max:?} over {latencies:?}"
+        );
+        assert!(p50 <= Duration::from_millis(60), "§23.3: P50 {p50:?}");
     }
 
     #[test]

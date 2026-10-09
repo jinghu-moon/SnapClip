@@ -94,6 +94,16 @@ use super::win::d2d::ChainRingView;
 
 /// `WM_APP`-based command delivered from any thread to the overlay thread.
 const WM_OVERLAY_COMMAND: u32 = WM_APP + 17;
+/// `WM_APP`-based notification that the scroll session's state changed, sent from the scroll driver
+/// to the overlay thread (`docs/30` §21.4).
+///
+/// `pub(crate)`: both ends live in this crate — the driver posts it, this overlay thread's message
+/// loop consumes it — so there is nothing to expose to the application. The offset is checked
+/// against every id that is already taken by
+/// `tests::the_scroll_message_id_collides_with_nothing_that_is_already_posted`.
+// The consumer is the preview wiring (`P5.01`); until it lands, the only user is that test.
+#[allow(dead_code)]
+pub(crate) const SCROLL_READY_MESSAGE: u32 = WM_APP + 45;
 /// Coalescing render cadence in milliseconds (~60 Hz, docs/11 §"约 16ms 渲染节奏").
 /// Mouse and drag input only marks state dirty and arms this one-shot timer; the
 /// timer collapses every change since the last tick into a single render/present/commit.
