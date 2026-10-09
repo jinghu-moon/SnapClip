@@ -85,7 +85,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::ptr;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
@@ -102,7 +103,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CWP_SKIPINVISIBLE, ChildWindowFromPointEx, CreateWindowExW, DefWindowProcW, DestroyWindow,
     DispatchMessageW, ES_AUTOVSCROLL, ES_MULTILINE, EnumWindows, GetClassNameW, GetClientRect,
-    GetCursorPos, GetForegroundWindow, GetWindowDisplayAffinity, GetWindowTextW,
+    GetCursorPos, GetForegroundWindow, GetWindowDisplayAffinity, GetWindowRect, GetWindowTextW,
     GetWindowThreadProcessId, HWND_TOP,
     HWND_TOPMOST,
     IsIconic, IsWindowVisible, MSG,
@@ -116,9 +117,15 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::geometry::{Point, Rect};
+use crate::scroll::canvas::MemoryBudget;
 use crate::scroll::observation::Axis;
+use crate::scroll::ports::{FrameError, FrameSource, InjectOutcome, Poll, ScrollActuator};
+use crate::scroll::session::{ScrollPlan, ScrollRuntime, StopReason};
 use crate::windows::monitor;
-use crate::windows::scroll_actuator::{self, Aim, InjectPath, InjectRequest, InjectStatus};
+use crate::windows::scroll_actuator::{
+    self, Aim, InjectPath, InjectRequest, InjectStatus, TargetProbe, WheelRouting, Win32Injection,
+};
+use crate::windows::scroll_source::{WgcFrameBackend, WgcFrameSource};
 use crate::windows::win::{bitblt, d3d11, wgc};
 use windows_sys::Win32::System::Threading::{
     OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
@@ -4281,3 +4288,507 @@ fn wda_probe() {
         restored.iter().map(|v| v.name()).collect::<Vec<_>>().join(", ")
     );
 }
+
+// ---------------------------------------------------------------------------
+// P3.10 / Cancel latency: the real-desktop Max
+// ---------------------------------------------------------------------------
+
+/// The bounds DWM considers visible — **the size a window-level WGC capture delivers**.
+///
+/// Not `GetWindowRect` and not `GetClientRect`. Measured on Chrome here: the window rectangle is
+/// 1200 × 900, the client area 1184 × 892, and the frames that arrive are 1188 × 894. The
+/// difference is the invisible resize border, which DWM excludes from
+/// `DWMWA_EXTENDED_FRAME_BOUNDS` and `GraphicsCaptureItem` also excludes. A session whose canvas
+/// is built from either of the other two rectangles panics its driver on the first frame
+/// (`canvas.rs:1154`, invariant 1), so this is the only rectangle a plan may be built from.
+fn visible_geometry(hwnd: HWND) -> Option<(u32, u32)> {
+    use ::windows::Win32::Foundation::{HWND as WinHwnd, RECT as WinRect};
+    use ::windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
+
+    let mut rect = WinRect::default();
+    unsafe {
+        DwmGetWindowAttribute(
+            WinHwnd(hwnd as *mut core::ffi::c_void),
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            std::ptr::addr_of_mut!(rect).cast(),
+            std::mem::size_of::<WinRect>() as u32,
+        )
+    }
+    .ok()?;
+    Some((
+        (rect.right - rect.left).max(0) as u32,
+        (rect.bottom - rect.top).max(0) as u32,
+    ))
+}
+
+/// The **window** rectangle in screen coordinates, in physical pixels.
+///
+/// This, not the client rectangle, is what a window-level WGC capture delivers: the session's
+/// `cross_len` and `extent` have to describe the frame that will arrive, and the canvas asserts
+/// that the first frame's cross axis is the one it was built for (`canvas.rs:1154`, invariant 1).
+/// Measured on Chrome here: the window is 1188 × 894 while its client area is 1184 × 892, and a
+/// plan built from the client rectangle panics the driver on the first frame.
+fn window_geometry(hwnd: HWND) -> (u32, u32) {
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
+        return (0, 0);
+    }
+    (
+        (rect.right - rect.left).max(0) as u32,
+        (rect.bottom - rect.top).max(0) as u32,
+    )
+}
+
+/// The client area's screen origin and size, in physical pixels.
+///
+/// The actuator's `screen` is where the cursor must be for `SendInput` to route the wheel to the
+/// target under `MOUSE_POS` routing, and a cursor is placed over the *client* area — the frame's
+/// own dimensions come from [`window_geometry`].
+fn client_geometry(hwnd: HWND) -> (Point, (u32, u32)) {
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    let size = if unsafe { GetClientRect(hwnd, &mut rect) } != 0 {
+        (
+            (rect.right - rect.left).max(0) as u32,
+            (rect.bottom - rect.top).max(0) as u32,
+        )
+    } else {
+        (0, 0)
+    };
+    let mut origin = POINT { x: 0, y: 0 };
+    let origin = if unsafe { ClientToScreen(hwnd, &mut origin) } != 0 {
+        Point::new(origin.x, origin.y)
+    } else {
+        Point::new(0, 0)
+    };
+    (origin, size)
+}
+
+/// The real actuator, with a witness for "the wheel is out".
+///
+/// The witness is the whole point of this wrapper. `Cancel latency` is defined as *user presses
+/// cancel* → *the driver confirms it stopped* (§23.2), and the worst trigger is a cancel that
+/// lands immediately after an injection: the driver is then inside the settle loop, where the
+/// injection it already fired cannot be recalled (§21.4). Without a timestamp taken by the
+/// actuator itself, the probe would be guessing when that moment was, and a probe that guesses
+/// its own trigger point measures its own reaction time.
+struct Win32ScrollActuator {
+    target: isize,
+    screen: Point,
+    axis: Axis,
+    choice: scroll_actuator::Choice,
+    injections: Arc<AtomicU32>,
+    injected_at: Arc<Mutex<Option<Instant>>>,
+}
+
+impl ScrollActuator for Win32ScrollActuator {
+    type Path = InjectPath;
+
+    fn path(&self) -> InjectPath {
+        self.choice.path()
+    }
+
+    /// Never switch. The watchdog is not under test here, and a probe that changed transports
+    /// mid-measurement would report the latency of a different code path than the one it named.
+    fn switch(&mut self, _from: InjectPath) -> Option<InjectPath> {
+        None
+    }
+
+    fn inject(&mut self, notches: i32) -> InjectOutcome {
+        let request = InjectRequest {
+            target: self.target,
+            screen: self.screen,
+            notches,
+            axis: self.axis,
+            path: self.choice.path(),
+            aim: self.choice.aim(),
+        };
+        let outcome = scroll_actuator::inject(&Win32Injection, &request);
+        // Stamped after `inject` returns, because that is the moment the wheel is out: the call
+        // itself is atomic and cannot be interrupted, so "during the injection" is not a moment a
+        // caller can have.
+        *self.injected_at.lock().expect("the witness mutex is never poisoned") = Some(Instant::now());
+        self.injections.fetch_add(1, Ordering::Release);
+        outcome
+    }
+}
+
+/// The open attempt's state, shared with the trial so it can wait for it and report it.
+const OPEN_PENDING: u32 = 0;
+const OPEN_OK: u32 = 1;
+const OPEN_FAILED: u32 = 2;
+
+/// The window-level WGC source, opened **on the driver thread** and counted.
+///
+/// Three things are deliberate here.
+///
+/// * **Opened by a factory, not handed over.** `ScrollRuntime::start` takes a closure that builds
+///   the source on the driver thread, because a real source owns a D3D11 device whose immediate
+///   context belongs to exactly one thread (`docs/30` §21.3) and a WGC session whose apartment is
+///   established by its first activation (§21.5). A pre-built source would be a context with an
+///   owner being used by somebody else.
+/// * **Opened eagerly, and the open is signalled.** `WgcSession::open` takes real time (measured
+///   below at tens of milliseconds), and it belongs to the session's *assembly*, not to its loop.
+///   §23.2 defines the trigger as the worst moment **after an injection**, so folding the open into
+///   the latency would report a number for a window the metric does not describe. The `opened` flag
+///   is how the `parked` shape cancels *after* the open instead of during it.
+/// * **Counted.** The probe refuses to report a latency it did not earn, and "the session never
+///   received a frame" is the failure mode that would otherwise look like a perfectly good
+///   measurement. The counters are what turn a silent capture failure into a failed assertion.
+struct DeferredWgcSource {
+    opened: Result<WgcFrameSource, FrameError>,
+    viewport: Rect,
+    frames: Arc<AtomicU32>,
+}
+
+impl FrameSource for DeferredWgcSource {
+    fn next(&mut self, timeout: Duration) -> Result<Poll, FrameError> {
+        match &mut self.opened {
+            Ok(source) => {
+                let poll = source.next(timeout)?;
+                if matches!(poll, Poll::Frame(_)) {
+                    self.frames.fetch_add(1, Ordering::AcqRel);
+                }
+                Ok(poll)
+            }
+            // Re-reported on every read rather than latched into an ending: a failed open is a
+            // transient by the port's own definition, and the probe asserts on the frame count.
+            Err(error) => Err(error.clone()),
+        }
+    }
+
+    fn viewport(&self) -> Rect {
+        self.viewport
+    }
+}
+
+/// Open the real source, on the calling thread, and announce how the attempt went.
+fn open_wgc_source(
+    handle: isize,
+    axis: Axis,
+    viewport: Rect,
+    state: Arc<AtomicU32>,
+    frames: Arc<AtomicU32>,
+) -> DeferredWgcSource {
+    let opened = d3d11::GraphicsDevice::create()
+        .map_err(|detail| FrameError::Transient {
+            context: "GraphicsDevice::create",
+            detail,
+        })
+        .and_then(|device| WgcFrameBackend::open(Arc::new(device), handle))
+        .map(|backend| WgcFrameSource::new(Box::new(backend), axis));
+    state.store(
+        if opened.is_ok() { OPEN_OK } else { OPEN_FAILED },
+        Ordering::Release,
+    );
+    DeferredWgcSource {
+        opened,
+        viewport,
+        frames,
+    }
+}
+
+/// `SPI_GETMOUSEWHEELROUTING` as the actuator's own vocabulary (`P3.02`).
+fn routing_of(raw: u32) -> WheelRouting {
+    match raw {
+        0 => WheelRouting::Focus,
+        1 => WheelRouting::Hybrid,
+        2 => WheelRouting::MousePosition,
+        _ => WheelRouting::Unknown,
+    }
+}
+
+/// One trial's result, and the only shape the report is allowed to have.
+struct CancelTrial {
+    shape: &'static str,
+    opened: bool,
+    frames: u32,
+    injections: u32,
+    committed: u32,
+    stop: Option<StopReason>,
+    latency: Option<Duration>,
+}
+
+/// `docs/31` `P3.10` / `E-PERF-5`: `Cancel latency`'s Max on a real desktop.
+///
+/// `P3.07` measured the loop's own contribution against a scripted clock (max 20 ms over seven
+/// trigger points) and recorded, as a deviation, that the *real* Max needs the two segments the
+/// loop cannot interrupt — one injection and one read-back — whose true cost only a real desktop
+/// can produce. This is that measurement, and it is the one performance gate the `P3` stage may
+/// not skip.
+///
+/// Two trigger shapes are run, because they are different claims:
+///
+/// * **`mid-flight`** — cancel lands immediately after an injection returned. This is the worst
+///   trigger the loop can be handed: the step is already out, so the latency includes finishing
+///   the settle that step started.
+/// * **`parked`** — cancel lands before any injection. The driver is in `await_first_frame` or at
+///   the top of its loop, where the only thing between the press and the confirmation is one tick.
+///
+/// The assertions are the two the metric actually promises (§23.3): `Max ≤ 400 ms` (design) and
+/// `Max ≤ 500 ms` (acceptance). `P50 ≤ 60 ms` is reported, not asserted — a distribution with
+/// fewer than ten samples has no business claiming a percentile, and the probe says so in its
+/// output rather than by quietly rounding up.
+#[test]
+#[ignore = "P3.10: needs a real interactive desktop and a scrollable target"]
+fn cancel_latency_probe() {
+    let _ = monitor::set_per_monitor_v2_awareness();
+
+    let token = format!(
+        "{:08x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
+    );
+    let scratch = std::env::temp_dir().join(format!("snapclip-p310-{token}"));
+    std::fs::create_dir_all(&scratch).expect("creating the probe scratch dir");
+
+    let routing = read_mouse_wheel_routing()
+        .map(|raw| routing_of(raw))
+        .unwrap_or(WheelRouting::Unknown);
+    let lines = read_wheel_scroll_lines().unwrap_or(3);
+    eprintln!("[P3.10] SPI_GETMOUSEWHEELROUTING = {routing:?}, SPI_GETWHEELSCROLLLINES = {lines}");
+
+    let mut launched = launch_scroll_target(ScrollTargetKind::Chrome, &scratch, &token)
+        .expect("P3.10 needs Chrome: the demo page is the only scrollable target whose pixel-per-notch gain is already measured (E-INJECT-1: 100 px)");
+    // `require_focus: false` — Chrome is another process's window, and `SetFocus` is refused for
+    // those. Focus is also not what this probe needs: `Cancel latency` is about how long the driver
+    // takes to *notice* a cancel, and a step whose wheel lands nowhere still costs the same one
+    // injection plus one read-back. Demanding focus here would refuse to measure the metric on a
+    // machine where the routing hands the wheel to the window under the cursor instead.
+    bring_to_front(launched.window, false);
+
+    let target = launched.window as isize;
+    let (origin, size) = client_geometry(launched.window);
+    let (frame_width, frame_height) = visible_geometry(launched.window).expect(
+        "DWM must report the window's visible bounds: they are the size a window-level WGC capture \
+         delivers, and the session's canvas is built from them (canvas.rs:1154)",
+    );
+    let (window_width, window_height) = window_geometry(launched.window);
+    let screen = Point::new(origin.x + size.0 as i32 / 2, origin.y + size.1 as i32 / 2);
+
+    // A self-launched target has the same integrity level as its launcher, so the two fields the
+    // choice table reads are equal by construction and the `target_is_elevated && !self_is_elevated`
+    // arm is unreachable. This is not an assumption about the machine — `EnableLUA = 0` here, and
+    // the probe does not need to know.
+    let probe = TargetProbe {
+        target_is_elevated: false,
+        self_is_elevated: false,
+        target_is_foreground: unsafe { GetForegroundWindow() } == launched.window,
+        routing,
+    };
+    let choice = scroll_actuator::choose(&probe);
+    eprintln!(
+        "[P3.10] target 0x{target:x} class {} frame {frame_width}x{frame_height} \
+         window {window_width}x{window_height} client ({},{})-({},{}); choice {:?} + {:?} \
+         (foreground = {})",
+        launched.class,
+        origin.x,
+        origin.y,
+        origin.x + size.0 as i32,
+        origin.y + size.1 as i32,
+        choice.path(),
+        choice.aim(),
+        probe.target_is_foreground
+    );
+
+    // Two plans, because the loop's own convergence is a *different* claim from its cancel path and
+    // the probe must not conflate them. The default plan starts at `ĝ₀ = 60 px/notch`, which is what
+    // a session actually gets; the calibrated one matches the 100 px/notch `E-INJECT-1` measured for
+    // Chromium on this machine, which is what makes the steps commit at all (R-25 / OQ-22).
+    //
+    // The plan is rebuilt per trial rather than cloned: `ScrollPlan` is moved into the runtime, and
+    // giving it a `Clone` only for a probe would be a production trait bound earned by a test.
+    let build_plan = |calibrated: bool| {
+        let plan = ScrollPlan::new(
+            Axis::Vertical,
+            frame_width as u64,
+            frame_height,
+            MemoryBudget::for_viewport(frame_width as u64, frame_height as u64),
+        );
+        if calibrated {
+            plan.with_wheel(3, 33)
+        } else {
+            plan
+        }
+    };
+
+    let mut trials: Vec<CancelTrial> = Vec::new();
+    for (plan_label, calibrated) in [("default ĝ₀=60", false), ("calibrated ĝ₀=99", true)] {
+        for shape in ["mid-flight", "parked"] {
+            let plan = build_plan(calibrated);
+            let trial = run_cancel_trial(plan_label, plan, shape, target, screen, choice);
+            eprintln!(
+                "[P3.10] {plan_label:<16} {shape:<10} opened {} frames {:>2} injections {:>2} \
+                 committed {:>2} stop {:?} latency {}",
+                trial.opened,
+                trial.frames,
+                trial.injections,
+                trial.committed,
+                trial.stop,
+                match trial.latency {
+                    Some(latency) => format!("{} ms", latency.as_millis()),
+                    None => "NOT MEASURED".to_string(),
+                }
+            );
+            trials.push(trial);
+        }
+    }
+
+    shutdown_target(&mut launched);
+    let _ = std::fs::remove_dir_all(&scratch);
+
+    let mut measured: Vec<Duration> = trials.iter().filter_map(|trial| trial.latency).collect();
+    let report = || {
+        trials
+            .iter()
+            .map(|trial| {
+                format!(
+                    "{} opened={} frames={} injections={}",
+                    trial.shape, trial.opened, trial.frames, trial.injections
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    // The guard the probe must never drop: a session that never captured would report a latency
+    // that measures nothing, and it would look exactly like a fast one. This is checked per shape
+    // because the two shapes legitimately differ — `parked` cancels before any injection, so zero
+    // frames is its *definition*, while `mid-flight` cannot be claimed unless a wheel actually went
+    // out and a frame actually came back.
+    assert!(
+        trials.iter().all(|trial| trial.opened),
+        "every trial must have opened a real WGC session, or the latency it reports belongs to a \
+         session that was never capturing: {}",
+        report()
+    );
+    assert!(
+        trials
+            .iter()
+            .filter(|trial| trial.shape == "mid-flight")
+            .all(|trial| trial.injections >= 1 && trial.frames >= 1),
+        "a `mid-flight` trial must have injected a wheel and received a frame back, or its trigger \
+         point was never reached: {}",
+        report()
+    );
+    assert!(
+        trials
+            .iter()
+            .filter(|trial| trial.shape == "parked")
+            .all(|trial| trial.injections == 0),
+        "a `parked` trial must cancel before the first injection, or it is a `mid-flight` trial \
+         wearing the wrong label: {}",
+        report()
+    );
+    assert_eq!(
+        measured.len(),
+        trials.len(),
+        "every cancelled session must carry its latency: {} of {} trials reported one — a `None` \
+         here is the metric being absent, not the latency being zero (§23.2)",
+        measured.len(),
+        trials.len()
+    );
+    measured.sort();
+    let max = *measured.last().expect("at least one trial ran");
+    let p50 = measured[measured.len() / 2];
+
+    eprintln!(
+        "[P3.10] Cancel latency over {} trials: max = {} ms, p50 = {} ms (thresholds: max ≤ 400 ms \
+         design, ≤ 500 ms acceptance; p50 ≤ 60 ms target)",
+        measured.len(),
+        max.as_millis(),
+        p50.as_millis()
+    );
+    eprintln!(
+        "[P3.10] note: {} samples is not a distribution, so p50 is reported and NOT asserted",
+        measured.len()
+    );
+
+    assert!(
+        max <= Duration::from_millis(400),
+        "§23.3's design target for Cancel latency is Max ≤ 400 ms; measured {max:?}"
+    );
+    assert!(
+        max <= Duration::from_millis(500),
+        "§23.3's acceptance threshold for Cancel latency is Max ≤ 500 ms; measured {max:?}"
+    );
+}
+
+/// One trial: open a session, wait for the trigger moment, cancel, collect the session.
+fn run_cancel_trial(
+    _plan_label: &'static str,
+    plan: ScrollPlan,
+    shape: &'static str,
+    target: isize,
+    screen: Point,
+    choice: scroll_actuator::Choice,
+) -> CancelTrial {
+    let cross = plan.cross_len();
+    let extent = plan.viewport_extent();
+    let viewport = Rect::new(0, 0, cross as i32, extent as i32);
+    let frames = Arc::new(AtomicU32::new(0));
+    let state = Arc::new(AtomicU32::new(OPEN_PENDING));
+    let source_frames = Arc::clone(&frames);
+    let source_state = Arc::clone(&state);
+    let make_source =
+        move || open_wgc_source(target, Axis::Vertical, viewport, source_state, source_frames);
+
+    let injections = Arc::new(AtomicU32::new(0));
+    let injected_at = Arc::new(Mutex::new(None));
+    let actuator = Win32ScrollActuator {
+        target,
+        screen,
+        axis: Axis::Vertical,
+        choice,
+        injections: Arc::clone(&injections),
+        injected_at: Arc::clone(&injected_at),
+    };
+
+    let mut runtime = ScrollRuntime::start(plan, make_source, actuator);
+
+    match shape {
+        "mid-flight" => {
+            // The trigger: the first injection has returned. Spinning rather than sleeping is what
+            // makes this the worst case — a sleep long enough to be reliable would also be long
+            // enough to let the settle finish, which is the thing being measured.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while injections.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
+                std::hint::spin_loop();
+            }
+        }
+        _ => {
+            // Parked: wait for the session to finish opening, then cancel before any injection.
+            // Waiting on the flag rather than sleeping is what keeps the session-open cost out of
+            // the number: §23.2's trigger is a moment *after* the session is up.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while state.load(Ordering::Acquire) == OPEN_PENDING && Instant::now() < deadline {
+                std::hint::spin_loop();
+            }
+        }
+    }
+    runtime.controller().cancel();
+
+    let session = runtime
+        .teardown()
+        .expect("a cancelled driver hands its session back");
+    CancelTrial {
+        shape,
+        opened: state.load(Ordering::Acquire) == OPEN_OK,
+        frames: frames.load(Ordering::Acquire),
+        injections: injections.load(Ordering::Acquire),
+        committed: session.committed(),
+        stop: session.stop_reason(),
+        latency: session.cancel_latency(),
+    }
+}
+

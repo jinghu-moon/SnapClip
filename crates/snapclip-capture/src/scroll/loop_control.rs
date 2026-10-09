@@ -750,7 +750,7 @@ impl ScrollDriver {
         // `primary_len() == 0`, so there is no second copy of "have we started" to keep in step.
         let first = match self.await_first_frame(&mut source, controller) {
             Ok(frame) => frame,
-            Err(reason) => return self.finish(reason, preview),
+            Err(reason) => return self.finish(reason, controller, preview),
         };
         self.last_qpc = first.qpc();
         self.session.start(&first);
@@ -758,7 +758,7 @@ impl ScrollDriver {
 
         loop {
             if let Some(reason) = self.command(controller) {
-                return self.finish(reason, preview);
+                return self.finish(reason, controller, preview);
             }
             self.apply_commands(controller, preview);
 
@@ -769,7 +769,7 @@ impl ScrollDriver {
             let ended = host.ended();
 
             if let Some(reason) = ended {
-                return self.finish(stop_reason_for(reason), preview);
+                return self.finish(stop_reason_for(reason), controller, preview);
             }
 
             let frame = match settled {
@@ -785,7 +785,7 @@ impl ScrollDriver {
                 },
                 Err(StepError::Cancelled { latency }) => {
                     self.session.record_cancel_latency(latency);
-                    return self.finish(StopReason::UserCancelled, preview);
+                    return self.finish(StopReason::UserCancelled, controller, preview);
                 }
                 Err(StepError::Injection(_)) | Err(StepError::NoFrame) => {
                     // §20.4 and C2: a single failed step never stops the session. What turns a *run*
@@ -798,7 +798,7 @@ impl ScrollDriver {
                     // convergence row); it is listed as open in this module's header.
                     self.session.record_discarded();
                     if let WatchVerdict::Failed = note(&mut watch, &mut actuator, false) {
-                        return self.finish(StopReason::ActuatorFailed, preview);
+                        return self.finish(StopReason::ActuatorFailed, controller, preview);
                     }
                     continue;
                 }
@@ -825,8 +825,9 @@ impl ScrollDriver {
                 self.session.record_discarded();
             }
 
-            let moved = committed && matches!(status, Status::Confirmed { d } if d != 0);            if let WatchVerdict::Failed = note(&mut watch, &mut actuator, moved) {
-                return self.finish(StopReason::ActuatorFailed, preview);
+            let moved = committed && matches!(status, Status::Confirmed { d } if d != 0);
+            if let WatchVerdict::Failed = note(&mut watch, &mut actuator, moved) {
+                return self.finish(StopReason::ActuatorFailed, controller, preview);
             }
             self.publish_progress(preview, status);
         }
@@ -981,7 +982,25 @@ impl ScrollDriver {
     }
 
     /// Record the stop reason, tell the preview, and hand the session over.
-    fn finish(mut self, reason: StopReason, preview: &PreviewStream) -> ScrollSession {
+    ///
+    /// The cancel latency is stamped **here** rather than only at the site that noticed the cancel.
+    /// The loop notices a cancel in two places — `inject_and_settle`'s tick check, and the command
+    /// poll at the top of the loop — and a metric that exists on only one of them reads `None` for
+    /// exactly those sessions that were cancelled while the driver was parked, which is the case a
+    /// real user produces most often (`docs/30` §23.2). `record_cancel_latency` keeps the first
+    /// measurement, so when the settle loop has one of its own (taken at the tick that noticed it,
+    /// which is never later than this one) that finer value still wins.
+    fn finish(
+        mut self,
+        reason: StopReason,
+        controller: &ScrollController,
+        preview: &PreviewStream,
+    ) -> ScrollSession {
+        if matches!(reason, StopReason::UserCancelled) {
+            if let Some(asked_at) = controller.cancellation() {
+                self.session.record_cancel_latency(asked_at.elapsed());
+            }
+        }
         self.session.stop(reason);
         preview.publish(PreviewUpdate::Ended { reason });
         self.session

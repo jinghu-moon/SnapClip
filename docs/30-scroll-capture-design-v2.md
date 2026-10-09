@@ -3814,7 +3814,9 @@ fn cancellation_error<H: StepHost>(host: &H) -> Option<StepError>;   // 唯一�
 
 实测 **max = 20 ms、P50 = 8 ms**，断言 `max ≤ 400 ms`（§23.3 设计目标）、`max ≤ 500 ms`（验收界）、`P50 ≤ 60 ms`，以及逐例 `latency ≤ inject_ms + RENDER_TICK_MS`。
 
-**下界不为零（这条必须留在测量表旁边，否则下一个人会以为可以优化到 0）**：一次注入 + 一次回读是**不可中断段**，其真值由 L3 量（`E-INJECT-1`/`E-PERF-1`）。**本任务只量循环自身的贡献**（一个 tick 的粒度），`P3.07` 的层级是 L1+L2 —— 真桌面上的 `Cancel latency` **Max** 归 `P3.09`/`P6`，本节不声称它已满足。
+**下界不为零（这条必须留在测量表旁边，否则下一个人会以为可以优化到 0）**：一次注入 + 一次回读是**不可中断段**，其真值由 L3 量（`E-INJECT-1`/`E-PERF-1`）。**本任务只量循环自身的贡献**（一个 tick 的粒度），`P3.07` 的层级是 L1+L2 —— 真桌面上的 `Cancel latency` **Max** 归 `P3.09`/`P6`。
+
+> **`P3.10` 补记（2026-10-09）**：真桌面上的 Max 已实测，见 **§23.3.3** —— `cancel_latency_probe`，4 次试验 **max = 44 ms / p50 = 41 ms**（`mid-flight` 0 ms、`parked` 41–44 ms），设计目标 400 ms 与验收界 500 ms 均**通过**。那一次测量同时修正了本节的一句话：`parked` 的 41–44 ms 是 `RENDER_TICK_MS` 的 2.7–2.9×，多出来的是**一次在途回读**（1188×894 = 4.25 MB 的 GPU→CPU 拷贝），所以"一次稳定性等待"的真实代价主要是一次回读而不是一个 tick。`P3.10` 还修掉了本节落地时留下的两个缺陷：取消延迟原来只在 `inject_and_settle` 的返回路径上被记录（循环顶部的 `command()` 直接 `finish`，什么都不记 ⇒ `cancel_latency()` 读 `None`），以及 `ScrollController::cancel()` 先发布粘性位再写时刻的发布顺序窗口。
 
 ### 21.5 COM/WinRT 公寓：本 crate **不声明**公寓，靠 combase 的隐式 MTA（R-21 的实测结论，2026-10-08）
 
@@ -4028,7 +4030,7 @@ impl Scratch {
 | Stitch Latency | P50 ≤ 8 ms，P95 ≤ 20 ms | **实测（2026-10-09，§23.3.2）：目标未达成**——`l123` 的 P50 = **67.1 / 113.0 / 254.7 ms**（1080p/1440p/4K，即目标的 **8.4× / 14.1× / 31.8×**），P95 = 75.2 / 128.5 / 285.0 ms（目标 3.8× / 6.4× / 14.3×，通过阈值 P95 ≤ 30 ms 亦未过）；连"只跑到第 2 层"的最便宜可决断组合（`l12`）也是 35.1 / 63.8 / 140.9 ms | P95 ≤ 30 ms | 瓶颈**分布在三层**（4K 占比：第 1 层 35.4%、第 2 层 19.8%、第 3 层 47.3%），不是单一热点；`§23.3.1` 的 6.78 ms 是**1 字节/像素、单帧**合成帧上的数，而今天的观测是 **BGRA 双帧**（1080p 每步 16.6 MB）⇒ **原型数字不可当作生产下界**（`§23.3.2` 结论 2/3） |
 | UI 主线程最大同步工作（覆盖层线程） | ≤ 4 ms | **推导** | ≤ 8 ms | 推导：16.7 ms 帧预算的一半；§5 已确证今天 overlay 是**每帧整面重绘**，滚动会话不得把它推过预算 |
 | Preview 更新延迟 | P50 ≤ 40 ms | **未取得（原因）**：`E-PERF-4` 未执行——预览流（`P2`）尚未落地，`E-PERF-1` 的装置里没有预览路径 | P95 ≤ 100 ms | 与 10 Hz 更新上限一致（§19.3）：100 ms 是更新的周期本身 |
-| Cancel latency | P50 ≤ 60 ms，**Max ≤ 400 ms** | **推导** | Max ≤ 500 ms | 下界 = 一次注入 + 一次稳定性等待；**Max 必须单独给**，因为它是用户感知"卡住了"的唯一来源 |
+| Cancel latency | P50 ≤ 60 ms，**Max ≤ 400 ms** | **实测（2026-10-09，§23.3.3）：达标**——真桌面 4 次试验 **max = 44 ms**（400 ms 目标的 11.0%）、**p50 = 41 ms**（60 ms 目标的 68.3%）；两种触发形态分别 max = **0 ms**（`mid-flight`）与 **44 ms**（`parked`）。`P3.07` 的脚本时钟测量（7 个触发点，max 20 ms）是**循环自身**的贡献；本次是加上两个不可中断段之后的数 | Max ≤ 500 ms | 下界 = 一次注入 + 一次稳定性等待；**Max 必须单独给**，因为它是用户感知"卡住了"的唯一来源。**实测修正**：`parked` 的 41–44 ms 说明"一次稳定性等待"的代价主要是**一次回读**（1188×894 = 4.25 MB），不是一个 tick（15 ms） |
 | Stop latency | P50 ≤ 20 ms | **推导** | P95 ≤ 60 ms | 停止只是提交导出任务（§5 确证 `export_worker.submit` 覆盖式信箱），不需要等待编码 |
 | CPU（Capturing） | ≤ 1 个逻辑核的 15% | **未取得（原因已写明）**：合成序列装置没有捕获侧；真实桌面唯一的既有数据是 `P0.05` 的 WGC 回读**墙钟** 1.2–2.5 ms/帧 @1280×960（按 10 Hz 折合 ≤ 2.5% 单核），它是墙钟而**不是 CPU 时间**，也不含 WGC 采集与 D3D11 拷贝 ⇒ 不得当作本行的答案 | ≤ 25% | 需要 `E-PERF-1` 之外的装置（进程 CPU 时间 / 墙钟 + 真实 WGC 采集），见 `§23.3.2`"明确未取得" |
 | CPU（Capturing+Matching） | ≤ 1 个逻辑核的 35% | **实测（匹配侧，2026-10-09，§23.3.2）**：按本设计自己定的 10 Hz 注入节奏折算单核 = 1080p **67.1%** / 1440p **113.0%** / 4K **254.7%**（`l123` 的 P50）⇒ **35% 目标未达成**（1.9× / 3.2× / 7.3×）；**整会话**（+ 捕获回读、条带提交、预览、编码）仍**未取得** | ≤ 50% | "10 Hz 步进"是本设计自己定的注入节奏（§13），不是实测值；折算只用匹配侧的 P50，不含捕获与导出 |
@@ -4127,6 +4129,42 @@ impl Scratch {
 
 **复现所需的全部字段**：`docs/Temp/perf1-funnel.jsonl`（1 行 `kind=env` + 15 行 `kind=combo`）、每场景日志 `docs/Temp/perf1-logs/<viewport>-<combo>.log`、驱动日志 `docs/Temp/p003-funnel-run.log`、`rustc 1.98.1 (48a229cea 2026-09-01)`、`Cargo.lock` SHA256 `55F9BD802050DFA4ED11140CD87EF56755830870C747116C577B53C453965EFE`、release 二进制 `snapclip_capture-aa96571baf2e7c67.exe` SHA256 `A771E47A01940C71E4DAB4ADF1065F5C2C8E0C857CCB77C69973976E4535E38A`、`--test-threads=1`、每场景一个独立进程、1000 步 × 120 px。
 
+#### 23.3.3 `E-PERF-5` 的实测结果：`Cancel latency` 的真桌面 Max（2026-10-09）
+
+**这次测量回答了哪一半**：`P3.07` 用脚本时钟量的是**循环自身**察觉取消的代价（7 个触发点，max 20 ms），并明确记下"真桌面上的 Max 归 `P3.09`/`P6`"，理由是 §21.4 的**两个不可中断段**——一次注入与一次回读——在脚本时钟里被压缩成了一个 `Instant` 差值。本节是那两段的真实代价，也是 `P3` 阶段**唯一不可跳过的性能门槛**。
+
+**装置**：`crates/snapclip-capture/src/windows/scroll_probe.rs` 的 `#[ignore] fn cancel_latency_probe()`，日志 `docs/Temp/p310-cancel-latency.txt`。真实目标 = 自启的 Chrome（窗口类 `Chrome_WidgetWin_1`，`scroll-demo.html`）、真实窗口级 WGC 帧源（`WgcFrameSource` + `WgcFrameBackend`）、真实执行器（`scroll_actuator::inject(&Win32Injection, …)`，路径由 `choose()` 给出 = `SendInput + PlaceCursor`）、真实闭环（`ScrollRuntime` + `ScrollController`）。每次试验 = 起一个会话 → 等到触发时刻 → `cancel()` → `teardown()` → 读 `ScrollSession::cancel_latency()`。**2 个 plan × 2 个触发形态 = 4 次试验**：`mid-flight` = 自旋等第一次注入返回后立即取消（最坏触发点）；`parked` = 等会话开完（共享状态位 `OPEN_OK`）后、任何注入之前取消。
+
+**写这个探针时抓出的四个缺陷**（都是**设计/实现**的，不只是探针的，故记在这里而不是只记在任务清单）：
+
+1. **取消延迟只在两条察觉路径中的一条被记录**。`inject_and_settle` 返回 `Err(StepError::Cancelled { latency })` 时携带自己的测量，而循环**顶部**的 `command()`（`requested_stop()` / `is_shutdown()`）与 `await_first_frame` 的每 tick 检查直接 `finish(reason)`，**什么都不记** ⇒ 一个"停在等首帧"的会话被取消时 `cancel_latency()` 读 `None`。**`None` 不是 0**：§23.2 的 Max 会被"从未量过任何东西的会话"满足。修法 = `finish` 收下 `controller`，凡 `reason == UserCancelled` 就用 `controller.cancellation()` 打时间戳（`record_cancel_latency` 取**第一个**测量值，所以 settle 循环自己更早、更细的值仍然胜出）。
+2. **`ScrollController::cancel()` 的发布顺序有窗口**：它先用 `compare_exchange` 发布粘性位、**再**取互斥锁写时刻 ⇒ 驱动线程可以先看到 `requested_stop() == Some(UserCancelled)`、再读 `cancellation() == None`。窗口只有微秒宽，但 `scroll::` 全量并行跑时被钉住（`139 passed; 1 failed`，`crates/snapclip-capture/src/scroll/session.rs:1171`）。修法 = **先在锁内写时刻、再 CAS**；CAS 输给别人则把 `previous` 放回。新增单线程不变量用例 `a_cancel_publishes_its_instant_with_its_bit`（`cancel()` 后位与时刻同在；第二次 `cancel()` 不移时刻；`stop()` 先赢时 `cancel()` 不凭空造时刻）。
+3. **会话打开的成本必须排除在指标之外**。第一版探针 sleep 30 ms 后取消，读到 **88 ms**——因为 `WgcSession::open` 当时是在第一次 `next` 里**惰性**发生的。§23.2 把触发点定义为"**注入之后**的最坏时刻"，打开属于会话的**装配**而不是它的循环，所以探针改成在帧源工厂里**急切**打开，`parked` 形态改为等共享状态位。改完 88 ms → 41/44 ms。
+4. **WGC 窗口级捕获交付的是 DWM 的可见边界**。plan 的 `cross_len` 若取自 `GetClientRect`（1184×892）或 `GetWindowRect`（1200×900），driver 在第一帧就 panic：`crates/snapclip-capture/src/scroll/canvas.rs:1154` 的 `assert_eq!` 报 `the frame's cross axis is not the canvas's — the canvas width is fixed for the session (invariant 1) left: 1188 right: 1184`（用窗口矩形则是 `1188` vs `1200`）。**实际交付 1188×894**，与 `DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS)` 一致；差值是 DWM 排除的不可见 resize 边框，而 `GraphicsCaptureItem` 也排除它。探针因此改用 `visible_geometry()`。**这条对生产同样成立**：任何从"窗口矩形"推画布宽度的地方都必须用 DWM 的可见边界。
+
+| plan | 触发形态 | opened | frames | injections | committed | stop | **latency** |
+|---|---|---|---|---|---|---|---|
+| 默认 `ĝ₀ = 60` | `mid-flight` | true | 1 | 1 | 0 | `UserCancelled` | **0 ms** |
+| 默认 `ĝ₀ = 60` | `parked` | true | 1 | 0 | 0 | `UserCancelled` | **41 ms** |
+| 校准 `ĝ₀ = 99` | `mid-flight` | true | 1 | 1 | 0 | `UserCancelled` | **0 ms** |
+| 校准 `ĝ₀ = 99` | `parked` | true | 1 | 0 | 0 | `UserCancelled` | **44 ms** |
+
+`max = 44 ms`、`p50 = 41 ms`（4 个样本 ⇒ p50 **只报不断言**）。断言 = 每次试验都真的开了会话（`opened`）、`mid-flight` 必须真的注入过并收到过帧、`parked` 必须没有注入、每次都有测量值、`max ≤ 400 ms`（设计目标）且 `≤ 500 ms`（验收界）。
+
+**结论 1（`Cancel latency` 达标，且余量很大）**：`Max = 44 ms` 是 400 ms 设计目标的 **11.0%**、500 ms 验收界的 8.8%；`p50 = 41 ms` 是 60 ms 目标的 68.3%。⇒ `P3` 阶段唯一不可跳过的门槛**通过**。
+
+**结论 2（`mid-flight` 是 0 ms，因为"注入不可中断"不等于"注入后还要等"）**：两个 plan 的 `mid-flight` 都是 **0 ms**。循环在注入返回后的**下一条指令**就查信箱，所以"一次注入"这段并没有落在延迟里——落在延迟里的是它**开启的那次 settle**。§21.4 说下界 = 一次注入 + 一次稳定性等待；实测把这句话精确化成：**注入本身不是延迟的来源（它是可观测的起点），settle 的第一件事是查信箱**。
+
+**结论 3（`parked` 的 41–44 ms 主要是一次回读，不是一个 tick）**：`RENDER_TICK_MS = 15 ms`，而 `parked` 是它的 **2.7–2.9×**。多出来的是**一次在途的回读**：`WgcFrameSource::next` 做一次 WGC 轮询加 `read_region`（1188×894 = **4.25 MB** 的 GPU→CPU 拷贝），循环在这段时间里无法查信箱。⇒ 察觉取消的诚实下界是**一次回读 + 一个 tick**，而 §21.4 的"一次稳定性等待"在 1080p 级窗口上的真实代价就是这次回读。**这条是设计输入**：`P95` 级的取消延迟不可能低于一次回读，任何"取消要立刻"的承诺都必须先说明它指的是哪一段。
+
+**结论 4（`committed == 0` 是预期的，不是缺陷）**：四次试验都在会话开始后约 44 ms 内取消，而一步需要完整的 settle 加一次匹配。它同时确认**取消路径不会提交半条带**（§20.5 的 `Disposal::Discard` 承诺）。
+
+**结论 5（取消路径与控制律无关）**：两个 plan（默认 `ĝ₀ = 60` 与校准 99）的差 ≤ 3 ms，落在 4 个样本的噪声里。取消是控制律之外的一条路径，这也解释了为什么它能在注入后 0 ms 就被看见。
+
+**明确未取得（记录以免被当成"已测过"）**：① 只有 **4 个样本**，不构成分布，`p50` 不得被引用为分位数；② 只在一个目标（本机 Chrome）、一条路由（`SPI_GETMOUSEWHEELROUTING = MousePosition`）上量过——`choose()` 给出的 `SendInput + PlaceCursor` 是唯一被走到的路径，`PostMessageW` 传输与 UIPI 分支（`E-INJECT-1` 的覆盖范围）在这里**没有**被复现；③ **启动窗口**（WGC 会话打开期间按 Esc）按 §23.2 的定义**不在指标内**，因此没有被测量；④ 目标窗口只有一种尺寸（1188×894），回读成本随面积走（结论 3），4K 窗口的 `parked` 值会更高——**不得**把 44 ms 外推到 4K。
+
+**复现所需的全部字段**：日志 `docs/Temp/p310-cancel-latency.txt`、`cargo test -p snapclip-capture --lib cancel_latency_probe -- --ignored --nocapture --test-threads=1`、`rustc 1.98.1`、目标 = 自启 Chrome（`crates/snapclip-capture/tests/fixtures/scroll-demo.html`）、frame 1188×894 / window 1200×900 / client (68,40)-(1252,932)、`SPI_GETMOUSEWHEELROUTING = 2 (MousePosition)`、`SPI_GETWHEELSCROLLLINES = 3`。
+
 ### 23.4 三条必须在架构层保证的性能性质（不是靠调参）
 
 | 性质 | 保证它的机制 | 若失去它会怎样 |
@@ -4166,6 +4204,38 @@ impl Scratch {
 | 排除机制 | 三层独立：`WDA_EXCLUDEFROMCAPTURE`（`window_host.rs:227-232`）、`Exclusions` 集合、backend 自带表（`provider.rs:45-59`） | 可继承。**关键事实**：display affinity **不会**把窗口从 `EnumWindows` 移除 |
 | DXGI 单屏限制 | `duplication.rs:4374-4378` 要求窗口落在一个显示器内 → 跨屏窗口必然走 WGC（参考项目的同源事实，§6） | SnapClip 的 WGC 路径**没有**这个限制，是优点 |
 | COM 初始化 | **零** `RoInitialize`/`CoInitializeEx`（§5） | WGC 用 WinRT 但今天能工作，说明依赖了线程隐式初始化；V2 **不引入显式公寓初始化**（改对它有回归风险），但必须在 §24.6 的"未验证项"里列出 |
+
+#### 24.1.1 窗口级 WGC 交付的是 DWM 的**可见边界**，不是"窗口矩形"（`P3.10`，2026-10-09）
+
+`P2.01` 只说"窗口级捕获"、`P2.03` 只说"帧源"，本节的表里也**没有一句**说明它交付的是哪一个矩形。`P3.10` 的探针按"窗口矩形"建 plan，driver 在第一帧就拒绝：
+
+```
+panicked at crates\snapclip-capture\src\scroll\canvas.rs:1154:9:
+assertion `left == right` failed: the frame's cross axis is not the canvas's
+— the canvas width is fixed for the session (invariant 1)
+  left: 1188
+ right: 1184
+```
+
+**三种矩形的实测**（同一窗口，`crates/snapclip-capture/src/windows/scroll_probe.rs`）：
+
+| 来源 | 尺寸 | 与 WGC 的关系 |
+|---|---|---|
+| `GetClientRect`（客户区） | 1184×892 | 偏小：不含标题栏与非客户边框 |
+| `GetWindowRect`（窗口矩形） | 1200×900 | 偏大：含 DWM 的**不可见 resize 边框** |
+| `DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS)` | **1188×894** | **与 WGC 交付一致** |
+
+**规则（对生产同样成立）**：**任何从"窗口矩形"推画布宽度的地方都必须用 DWM 的可见边界**。差值是 DWM 为 resize 拖拽预留、对用户不可见的那一圈边框，而 `GraphicsCaptureItem` 也把它排除在外——所以这不是"WGC 多给或少给了几像素"，而是**窗口的可见范围本来就由 DWM 定义**。
+
+`crates/snapclip-capture/src/windows/scroll_probe.rs` 的助手：
+
+```rust
+fn visible_geometry(hwnd: HWND) -> Option<(u32, u32)>   // DwmGetWindowAttribute(.., DWMWA_EXTENDED_FRAME_BOUNDS, ..)
+```
+
+plan 的 `cross_len` 与 `viewport_extent` 只能由它给出；`GetWindowRect` 保留为诊断打印。`windows` crate 的 `Win32_Graphics_Dwm` feature 早已启用（`crates/snapclip-capture/Cargo.toml:35`）⇒ **没有新增依赖**（`N7` 不破）。
+
+**为什么不让 `canvas.rs:1154` 放宽**：那条断言是"画布宽度整会话固定"（不变量 1）的可执行形式。一帧的 cross 轴变了就是**另一个会话**（§11.1 已把"尺寸变化"定为结束流而不是移动视口），放宽它会让"目标被 resize"变成一条静默的错位写入路径。
 
 ### 24.2 必须新增的第一项能力：**窗口级 WGC**
 
@@ -5339,7 +5409,7 @@ fn rows_match(actual, expected, sigma) -> bool
 | 平滑滚动等待 | 内容持续移动 3 帧 | 等到静止才估计 | L2 | **已可执行（`P3.04`）**：`smooth_scrolling_is_waited_out_instead_of_being_estimated`（四个互不相同的帧各 45 ms ⇒ 全部 `Waiting`，到 `STEP_TIMEOUT` ⇒ `TimedOut`）+ `the_loop_waits_until_two_consecutive_frames_agree_before_estimating` + `the_loop_injects_once_and_waits_for_the_picture_to_stop_moving` + `a_step_with_no_frames_at_all_is_not_a_timeout`，见 §13.3.1 |
 | 控制律收敛 | 快/中/慢三种增益的合成目标 | 6 步内 `ĝ` 到真值 ±20%；重叠比落 `[0.30, 0.40]` | L1 | **已可执行（`P3.05`）**：`ghat_converges_within_six_steps_to_within_twenty_percent`（40/60/120 三档）+ `the_resulting_overlap_ratio_lands_in_the_designed_band`（40/60/90 落区间；120 的格量化算术写在用例里）+ `every_step_the_law_asks_for_is_verifiable` + `the_notch_count_respects_the_wire_format`，见 §13.2.1。**`E-CTRL-1` 的实测表与三处勘误在 §13.2.1** |
 | 控制律只学确证步 | `Uncertain` / `None` 步 | `ĝ` 不变 | L1 | **已可执行（`P3.05`）**：`ghat_is_not_updated_on_uncertain_steps`（§13.5 的"缓慢且只在确证步上"是 `observe` 收 `Status` 的性质），见 §13.2.1 |
-| 取消延迟 | 注入后最坏时刻取消 | `Phase == Stopped` | L1 | **已可执行（`P3.07`）**：`cancel_latency_has_a_measured_max`（7 个触发点，实测 max = 20 ms / P50 = 8 ms；**下界 = 一次注入 + 一次回读**，真桌面上的 Max 归 `P3.09`/`P6`），见 §21.4.1 |
+| 取消延迟 | 注入后最坏时刻取消 | `Phase == Stopped` | L1 | **已可执行（`P3.07`）**：`cancel_latency_has_a_measured_max`（7 个触发点，实测 max = 20 ms / P50 = 8 ms；**下界 = 一次注入 + 一次回读**），见 §21.4.1。**真桌面 Max 已实测（`P3.10`）**：`cancel_latency_probe`，4 次试验 **max = 44 ms / p50 = 41 ms**（`mid-flight` 0 ms、`parked` 41–44 ms），见 §23.3.3 |
 | 停止延迟 | 停止 | 导出任务已提交 | L1 | **已可执行（`P3.07`）**：`stop_commits_the_export_and_cancel_discards_it`（L1 的可观测量 = `disposal() == Some(Disposal::Export)`；"提交给 export-worker"这个动作是 `P3.09` 的装配），见 §20.5.1 |
 
 ### 30.3 Matching / Offset（匹配与位移）

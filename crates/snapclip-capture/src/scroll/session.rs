@@ -42,7 +42,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::scroll::canvas::{MemoryBudget, RecoveredImage};
-use crate::scroll::loop_control::ScrollDriver;
+use crate::scroll::loop_control::{ScrollDriver, RENDER_TICK_MS};
 use crate::scroll::observation::{Axis, Observation};
 use crate::scroll::ports::{FrameSource, ScrollActuator};
 use crate::scroll::preview::PreviewStream;
@@ -378,10 +378,24 @@ impl ScrollController {
     /// "I want no result" (`Esc`, §20.5). No file is written.
     ///
     /// The instant is stamped here, on the **caller's** thread — the overlay's key handler — because
-    /// that is the only moment that is the user's rather than the loop's. The CAS is what makes it
-    /// the *first* cancel: a second `Esc` on a session that is already cancelling must not move the
-    /// instant forward and make the latency look smaller.
+    /// that is the only moment that is the user's rather than the loop's.
+    ///
+    /// ## Order: the instant becomes visible before the bit does
+    ///
+    /// The loop reads the sticky bit and then asks for the instant, so a bit that can be seen
+    /// before its instant is a cancel with no latency — and `None` is not zero, so §23.2's Max
+    /// would be satisfied by the cancels that raced. The first version published the bit with a
+    /// `compare_exchange` and only then took the mutex, which is exactly that window; it is
+    /// microseconds wide and the parked-driver test hit it.
+    ///
+    /// So the store happens first, under the lock, and a `compare_exchange` that loses **puts the
+    /// previous value back**: only the cancel that won gets an instant, and it is in place before
+    /// the bit that advertises it. A second `Esc` therefore cannot move the instant forward and
+    /// make the latency look smaller, which is what the CAS was there for.
     pub(crate) fn cancel(&self) {
+        let mut slot = self.cancel_at.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = *slot;
+        *slot = Some(Instant::now());
         if self
             .stop
             .compare_exchange(
@@ -390,10 +404,9 @@ impl ScrollController {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .is_ok()
+            .is_err()
         {
-            let mut slot = self.cancel_at.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            *slot = Some(Instant::now());
+            *slot = previous;
         }
     }
 
@@ -570,9 +583,26 @@ pub(crate) struct ScrollRuntime {
 }
 
 impl ScrollRuntime {
-    pub(crate) fn start<F, A>(plan: ScrollPlan, source: F, actuator: A) -> Self
+    /// Start a driver thread and return the handles that talk to it.
+    ///
+    /// ## Why the frame source arrives as a factory
+    ///
+    /// `make_source` runs **on the driver thread**, and that is the whole reason it is a closure
+    /// rather than a value. A real frame source owns a D3D11 device and a WGC session, neither of
+    /// which is `Send`: the device's immediate context belongs to exactly one thread (`docs/30`
+    /// §21.3), and the session is opened by whichever thread first activates WinRT on it (§21.5 —
+    /// and the driver thread is a plain `std::thread` whose first activation establishes the
+    /// implicit MTA, which is the state the rest of the process already relies on). Handing a
+    /// pre-built source across the boundary would move a context that has an owner, and the
+    /// compiler is right to refuse it. Building it here keeps the two facts — one owner, one
+    /// apartment — true by construction instead of by convention.
+    ///
+    /// The actuator stays a value: it is `SendInput`/`PostMessageW` over plain integers, with no
+    /// apartment and no device behind it.
+    pub(crate) fn start<F, M, A>(plan: ScrollPlan, make_source: M, actuator: A) -> Self
     where
-        F: FrameSource + Send + 'static,
+        M: FnOnce() -> F + Send + 'static,
+        F: FrameSource + 'static,
         A: ScrollActuator + Send + 'static,
     {
         let controller = std::sync::Arc::new(ScrollController::new());
@@ -586,6 +616,7 @@ impl ScrollRuntime {
             // anonymous thread in a process that already has four workers (§21.1).
             .name("snapclip-scroll-driver".to_owned())
             .spawn(move || {
+                let source = make_source();
                 driver.run(source, actuator, &thread_controller, &thread_preview)
             })
             .expect("the scroll driver thread is spawnable");
@@ -1037,7 +1068,7 @@ mod tests {
 
         let mut runtime = ScrollRuntime::start(
             plan(),
-            IdleSource {
+            || IdleSource {
                 viewport: Rect::new(0, 0, 320, 200),
             },
             SilentActuator { injections: 0 },
@@ -1087,7 +1118,7 @@ mod tests {
         {
             let runtime = ScrollRuntime::start(
                 plan(),
-                IdleSource {
+                || IdleSource {
                     viewport: Rect::new(0, 0, 320, 200),
                 },
                 SilentActuator { injections: 0 },
@@ -1107,7 +1138,7 @@ mod tests {
     fn shutdown_ends_a_parked_driver() {
         let mut runtime = ScrollRuntime::start(
             plan(),
-            IdleSource {
+            || IdleSource {
                 viewport: Rect::new(0, 0, 320, 200),
             },
             SilentActuator { injections: 0 },
@@ -1118,5 +1149,79 @@ mod tests {
             .expect("a shutdown driver still returns its session");
         assert_eq!(session.stop_reason(), Some(StopReason::UserCancelled));
         assert!(runtime.driver_exited());
+    }
+
+    /// A cancel that arrives while the driver is parked is still a **measured** cancel.
+    ///
+    /// The loop notices a cancel in two places: inside `inject_and_settle`'s tick check, and at the
+    /// top of the loop — which is where a driver that is still waiting for its first frame lives.
+    /// Stamping the latency at only the first of them makes `cancel_latency()` read `None` for
+    /// exactly the sessions a user is most likely to produce (the screen has not moved yet, so
+    /// there is nothing for the settle loop to notice), and `None` is not zero: §23.2's Max would
+    /// then be "satisfied" by the sessions that never measured anything. Found while building the
+    /// real-desktop instrument (`P3.10`), which cannot report a Max it is unable to collect.
+    #[test]
+    fn a_cancel_while_the_driver_is_parked_still_reports_a_latency() {
+        let mut runtime = ScrollRuntime::start(
+            plan(),
+            || IdleSource {
+                viewport: Rect::new(0, 0, 320, 200),
+            },
+            SilentActuator { injections: 0 },
+        );
+
+        // Parked inside `await_first_frame`: no injection has happened and none ever will, so the
+        // only place that can notice is the command poll at the top of the loop.
+        std::thread::sleep(Duration::from_millis(5));
+        runtime.controller().cancel();
+
+        let session = runtime
+            .teardown()
+            .expect("a cancelled driver still returns its session");
+        assert_eq!(session.stop_reason(), Some(StopReason::UserCancelled));
+        let latency = session
+            .cancel_latency()
+            .expect("a cancelled session must carry the latency it took to notice");
+        assert!(
+            latency <= Duration::from_millis(RENDER_TICK_MS as u64 * 4),
+            "a parked driver notices a cancel on its next tick, not after a step timeout: {latency:?}"
+        );
+    }
+
+    /// The cancel bit and its instant are published in an order the loop can rely on.
+    ///
+    /// Single-threaded, so it cannot *reproduce* the race — it pins the invariant instead: whenever
+    /// `requested_stop` reports a cancel, `cancellation` already has the instant. The loop reads the
+    /// two in that order, and a bit that arrives first is a cancel whose latency reads `None`, which
+    /// §23.2 counts as "not measured" and the acceptance gate then treats as "no evidence of a
+    /// problem". The cross-thread version of the same claim is
+    /// `a_cancel_while_the_driver_is_parked_still_reports_a_latency`.
+    #[test]
+    fn a_cancel_publishes_its_instant_with_its_bit() {
+        let controller = ScrollController::new();
+        assert_eq!(controller.requested_stop(), None);
+        assert_eq!(controller.cancellation(), None);
+
+        controller.cancel();
+        assert_eq!(controller.requested_stop(), Some(StopReason::UserCancelled));
+        let first = controller
+            .cancellation()
+            .expect("the instant must be visible by the time the bit is");
+
+        // A second `Esc` must not move the instant forward and make the latency look smaller.
+        controller.cancel();
+        assert_eq!(
+            controller.cancellation(),
+            Some(first),
+            "the metric measures the user's *first* press"
+        );
+
+        // A cancel that lost to `stop` is not a cancel at all, so it must not invent an instant:
+        // a `Some` here would report a latency for a session the user asked to *finish*.
+        let stopped = ScrollController::new();
+        stopped.stop();
+        stopped.cancel();
+        assert_eq!(stopped.requested_stop(), Some(StopReason::UserStopped));
+        assert_eq!(stopped.cancellation(), None);
     }
 }
