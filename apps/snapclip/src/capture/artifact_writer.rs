@@ -3,19 +3,38 @@
 //!
 //! This is where the two halves of artifact production meet: capture hands over the pixels
 //! the user selected, and history owns turning them into a file. Encoding lives in
-//! `snapclip-history::image`, the write in `CaptureArtifactStore` — so capture never learns
-//! what a PNG is, and history never learns what a selection is.
+//! [`super::row_band_png`] behind `snapclip-capture`'s `RowBandSink` port, the write in
+//! `CaptureArtifactStore` — so capture never learns what a PNG is, and history never learns
+//! what a selection is.
 //!
 //! It runs on the export worker thread, never on the overlay thread.
+//!
+//! # Rows, not an image (`P4.03`)
+//!
+//! Until `P4.03` this function handed one whole image to an encoder, and the chain held four
+//! copies of the pixels (`docs/30 §22.1`): `prepared.bgra.clone()`, the BGRA→RGBA buffer the old
+//! encoder built, the second `Vec` `RgbaImage::from_raw` took of it, and the encoder's own working
+//! set. At `1920×300,000` one copy is 2.15 GiB, so "four copies" was not slowness, it was an export
+//! that cannot finish (`F-07`).
+//!
+//! The port in `docs/30 §17.7` is shaped to make that impossible rather than merely discouraged:
+//! `RowBandWriter::write_rows` takes a **slice** of rows, so the encoder is fed the caller's
+//! pixels and never needs a second whole image. Measured by
+//! `apps/snapclip/tests/export_path_copies.rs` at `1280×20,000`: the path now allocates **zero**
+//! buffers at least as large as the image, against six before (`docs/30 §22.4`'s "all four copies
+//! eliminated", and `§30.7`'s row).
 
 use std::path::PathBuf;
 
 use snapclip_capture::artifact::SelectionPixels;
 use snapclip_capture::ports::ArtifactWriter;
+use snapclip_capture::scroll::Axis;
+use snapclip_capture::scroll::export::{ImageMeta, RowBandSink};
 use snapclip_capture::{CaptureArtifact, CaptureError, CapturePayload, CaptureResult};
 use snapclip_history::artifact_store::CaptureArtifactStore;
-use snapclip_history::image::{Bgra8Image, encode_png};
 use snapclip_model::{CaptureMetadata, CaptureOutput};
+
+use super::row_band_png::PngRowBandSink;
 
 /// Encodes through `snapclip-history` and writes through its artifact store.
 pub struct HistoryArtifactWriter {
@@ -39,18 +58,52 @@ impl ArtifactWriter for HistoryArtifactWriter {
         dpi: u32,
         monitor_device_name: Option<String>,
     ) -> CaptureResult<CaptureArtifact> {
+        // `as u32` is what this line did before P4.03 and it is deliberately unchanged: P4.04 is the
+        // task whose RED evidence is "the truncation is still here", so fixing it now would take
+        // that evidence away from the task that owns it.
         let width = prepared.region.width() as u32;
         let height = prepared.region.height() as u32;
-        let image = Bgra8Image::new(width, height, prepared.bgra.clone()).ok_or_else(|| {
-            CaptureError::EncodeFailed(format!(
+        // `Bgra8Image::new` used to be the length check; it went with the copy it was attached to.
+        // Same comparison, same words — `P4.01`'s pixels are tightly packed `region`-sized BGRA.
+        let expected = u64::from(width) * u64::from(height) * 4;
+        if width == 0 || height == 0 || expected != prepared.bgra.len() as u64 {
+            return Err(CaptureError::EncodeFailed(format!(
                 "bgra buffer of {} bytes does not match {width}x{height}",
                 prepared.bgra.len()
-            ))
-        })?;
-        let png = encode_png(&image).map_err(CaptureError::EncodeFailed)?;
+            )));
+        }
+
+        let meta = ImageMeta {
+            width: u64::from(width),
+            height: u64::from(height),
+            // Not the scroll path: there is no canvas that could have been capped, so the artifact
+            // is as long as it is tall.
+            length: u64::from(height),
+            // Nor is there a scene that scrolled. `Vertical` is the reading PNG itself has —
+            // row-major, top-down — not a claim about movement.
+            axis: Axis::Vertical,
+            // `dpr` is for the scroll preview's CSS-pixel consumers (§17.7); an ordinary screenshot
+            // has none, and its DPI is carried in `CaptureMetadata::dpi` below. `1` therefore means
+            // "not applicable" rather than being a guess at the display scale.
+            dpr: 1,
+        };
+
+        let mut sink = PngRowBandSink::new();
+        let mut writer = sink
+            .begin(&meta)
+            .map_err(|error| CaptureError::EncodeFailed(error.to_string()))?;
+        // One call, not a band loop: the ordinary path already has every row in one contiguous
+        // buffer, and `write_rows` takes a slice, so slicing it into bands would be machinery for
+        // the scroll path's LRU that this path does not have — with no measurement behind it.
+        writer
+            .write_rows(0, &prepared.bgra)
+            .map_err(|error| CaptureError::EncodeFailed(error.to_string()))?;
+        let artifact = writer
+            .finish(None)
+            .map_err(|error| CaptureError::EncodeFailed(error.to_string()))?;
 
         let output = CaptureOutput {
-            bytes: png,
+            bytes: artifact.bytes,
             metadata: CaptureMetadata {
                 session_id: session_id.to_string(),
                 width,

@@ -113,6 +113,35 @@ pub enum ExportError {
     Sink(String),
 }
 
+/// Sentences, like [`super::observation::ObservationError`] and [`super::ports::FrameError`].
+///
+/// Added by `P4.03`, which is the first production call site of this port: the shell has to turn a
+/// refusal into a message, and `CaptureError::EncodeFailed` takes a `String`. Without this the call
+/// site would have had to format the `Debug` of an enum into something a user could read.
+impl core::fmt::Display for ExportError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ExportError::TooLarge { width, height } => write!(
+                f,
+                "a {width}x{height} artifact does not fit the format's u32 header fields"
+            ),
+            ExportError::OutOfOrder { first_row, expected } => write!(
+                f,
+                "rows must arrive in order: expected row {expected}, got row {first_row}"
+            ),
+            ExportError::BeyondHeight { first_row, height } => write!(
+                f,
+                "row {first_row} is past the {height} rows declared at begin"
+            ),
+            ExportError::RowLength { expected, got } => write!(
+                f,
+                "rows are {expected} bytes each, and {got} is not a whole number of them"
+            ),
+            ExportError::Sink(message) => write!(f, "the export sink failed: {message}"),
+        }
+    }
+}
+
 /// Opens one export (`docs/30` §17.7).
 ///
 /// `Send` because the sink is moved to the export worker; the writer it returns is not, because it

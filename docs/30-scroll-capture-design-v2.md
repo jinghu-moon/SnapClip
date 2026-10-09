@@ -3993,6 +3993,34 @@ struct MemoryBudget {
 
 **结论**：**只有两处不可避免的整块拷贝**——GPU→CPU 回读（每步一次）、画布↔磁盘换出（LRU 命中时零；未命中时一次）。今天链路里的 4 份导出拷贝**全部消除**（流式编码 + 消除中间 `RgbaImage`）。
 
+#### 22.4.1 落地形状（`P4.03`，2026-10-09）
+
+`P4.03` 是这张表最后一行真正被兑现的地方：**导出路径不再有第二份整图**。
+
+| # | 原来在哪 | 现在 |
+|---|---|---|
+| 1 | `apps/snapclip/src/capture/artifact_writer.rs:44` 的 `prepared.bgra.clone()` | 删。`RowBandWriter::write_rows` 收**切片**，编码器读的就是调用方那份像素 |
+| 2 | `crates/snapclip-history/src/image.rs:153` 的 `bgra_to_rgba(...).to_vec()` | 删。BGRA→RGBA 的换道搬进 `PngRowBandWriter::write_rows`，**逐行**做（`row: Vec<u8>`，一行） |
+| 3 | `crates/snapclip-history/src/image.rs:66` 的 `RgbaImage::from_raw(rgba.to_vec())` | 删。`encode_png` 整个函数随之删除（没有调用者 = `AGENTS.md` 禁的死代码）；`image.rs` 的回环用例改写成 `encode_rgba_png` 方向 |
+| 4 | `image::DynamicImage::write_to` 内部 | 换成 `png::StreamWriter`（`§17.7.3`），工作区是**三个行缓冲 + 一个 4 KiB 块缓冲**，与图像高度无关 |
+
+**实测**（装置 `apps/snapclip/tests/export_path_copies.rs`，`Release`，独立进程，1280×20,000 = 97 MiB 原始像素）：
+
+| | 编码器 | 产物 | 导出期间 `peak − live` | ≥ 一份整图的分配次数 |
+|---|---|---|---|---|
+| RED（`P4.03` 之前） | `image` 默认 | 1,265,944 B | **621,205,536 B**（592 MiB） | **6** |
+| GREEN | `PngRowBandSink`（`Balanced` + `Up`） | 216,770 B | **1,283,858 B**（1,253 KiB） | **0** |
+
+峰值降 **484×**，产物同时小 5.8×——`P0.04` 选定的编码参数在**真实导出路径**上再兑现一次。`§30.7` 的目标行写"≤ 2 份"，实测量到的答案是 **0 份**：`§22.4` 的结论本来就不是"少几份"，而是"**4 份全部消除**"，断言"≤ 2"会让一次退回 2 份的回归仍然绿。
+
+**三处落地裁决**：
+
+1. **`ExportError` 补 `Display`（`DEV-65`）。** `P4.01` 只给了 `Debug`，而 `P4.03` 是它的**第一个生产调用方**：shell 要把它变成 `CaptureError::EncodeFailed(String)`，没有 `Display` 就只能把枚举的 `Debug` 印出来。形状照 `ObservationError`/`FrameError`（`scroll/` 自己的惯例），不引 `thiserror`。
+2. **普通截图路径一次 `write_rows(0, &prepared.bgra)`，不分带（`DEV-67`）。** 这条路径的全部行本来就在一块连续缓冲里，分带是为滚动路径的 `BandStore` LRU 准备的机器——在这里它不会少拷一个字节（`write_rows` 收的就是切片）。`ImageMeta` 的 `length = height`（没有画布被截断）、`axis = Vertical`（PNG 自己就是行主序，这不是对"有没有滚动"的声称）、`dpr = 1`（`dpr` 是给滚动预览的 CSS 像素消费者用的，普通截图没有这种消费者，它的 DPI 在 `CaptureMetadata::dpi` 里；`1` 的意思是"不适用"，不是一个关于显示缩放的猜测）。
+3. **`as u32` 刻意留着（`DEV-68`）。** `P4.04` 的 RED 证据恰恰是"截断仍存在"，`P4.03` 顺手修掉就会把那条证据拿走。长度校验原样保留（`Bgra8Image::new` 的检查随它一起走了，比较与措辞照抄）。
+
+**层级与任务书的偏差（`DEV-66`）**：`P4.03` 声明 L2 / A + D + E，而"导出峰值不超过一份条带"必须在**有全局分配器**的进程里测（`CountingAllocator` 只能有一个 `#[global_allocator]`），因此它落成 `apps/snapclip/tests/export_path_copies.rs` 的独立二进制 + `#[ignore]`，与 `P4.02` 的 L4 装置同形。任务级门禁（A 类）由 `artifact_writer.rs` 既有的 `the_writer_hands_the_store_decodable_png_bytes` 兜底；任务书写的两个 RED 名**逐字保留**。
+
 ### 22.5 中间缓冲的复用策略
 
 `Observation` 的派生视图（灰度、1/4 降采样、可选梯度图）在每一步需要：
@@ -5572,7 +5600,7 @@ fn rows_match(actual, expected, sigma) -> bool
 |---|---|---|---|---|
 | 三档长度内存 | 10k / 30k / 100k px，独立进程 | peak 差异 **≤ 10%** | L4 | **Memory** |
 | 换出文件已删除 | 会话结束后 | 无残留临时文件 | L1 | — |
-| 导出拷贝数 | 30,000 px 高导出 | 峰值 **≤ 2 份**（今天 4 份） | L4 | **Memory** |
+| 导出拷贝数 | 30,000 px 高导出 | 峰值 **≤ 2 份**（今天 4 份） | L4 | **Memory**（`P4.03` 实测 **0 份**，1280×20,000，见 `§22.4.1`） |
 | `u32` 越界 | 构造 > `u32::MAX` 尺寸 | **拒绝**（不截断） | L2 | — |
 | 普通截图回归 | F5 全流程（A 类全套） | 全部通过 | L1+L3 | **Capture Latency** |
 | 普通截图延迟不受滚动影响 | 滚动会话进行中触发 F5 | P95 变化 ≤ 10% | L3 | **Capture Latency** |

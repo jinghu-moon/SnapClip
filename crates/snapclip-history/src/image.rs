@@ -4,6 +4,12 @@
 //! this crate — the artifact store encodes capture pixels to PNG, and the clipboard
 //! adapter normalises clipboard images. Capture no longer knows how bytes become a PNG.
 //!
+//! The *artifact* half of that is now only half true (`P4.03`): `encode_png`, which turned one
+//! whole `Bgra8Image` into PNG, was deleted because the export path streams rows through
+//! `apps/snapclip/src/capture/row_band_png.rs` instead — four copies of a `1920×300,000`
+//! selection is 8.6 GiB (`docs/30 §22.1`). What is left here is the decoder, the downscaler, and
+//! `encode_rgba_png` for the clipboard normaliser.
+//!
 //! Pure functions over byte buffers: no Win32, no GPU, no filesystem.
 
 use std::io::Cursor;
@@ -56,12 +62,13 @@ impl Bgra8Image {
     }
 }
 
-/// Encode BGRA pixels to PNG.
-pub fn encode_png(image: &Bgra8Image) -> Result<Vec<u8>, String> {
-    encode_rgba_png(&bgra_to_rgba(image.bytes()), image.width(), image.height())
-}
-
 /// Encode tight RGBA8 pixels to PNG.
+///
+/// This is now the only encoder in this module. `encode_png` — which took a whole `Bgra8Image`,
+/// converted it to RGBA and encoded that — was deleted by `P4.03`: its one production caller
+/// (`apps/snapclip/src/capture/artifact_writer.rs`) streams rows to the encoder instead, and a
+/// whole-image converter that nothing calls is the dead code `AGENTS.md` forbids. The clipboard
+/// normaliser and this crate's own tests still go through here.
 pub fn encode_rgba_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
     let buffer = image::RgbaImage::from_raw(width, height, rgba.to_vec())
         .ok_or_else(|| "invalid rgba buffer for png encoding".to_string())?;
@@ -150,12 +157,6 @@ pub fn png_dimensions(png: &[u8]) -> Option<(u32, u32)> {
     (width > 0 && height > 0).then_some((width, height))
 }
 
-fn bgra_to_rgba(bgra: &[u8]) -> Vec<u8> {
-    let mut rgba = bgra.to_vec();
-    rgba_to_bgra(&mut rgba);
-    rgba
-}
-
 /// Swaps the B and R lanes in place. The operation is its own inverse, which is why
 /// one helper serves both directions.
 fn rgba_to_bgra(bytes: &mut [u8]) {
@@ -166,15 +167,7 @@ fn rgba_to_bgra(bytes: &mut [u8]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Bgra8Image, decode_to_bgra8, encode_png};
-
-    fn solid_bgra(width: u32, height: u32, b: u8, g: u8, r: u8, a: u8) -> Bgra8Image {
-        let mut bytes = Vec::with_capacity((width * height * 4) as usize);
-        for _ in 0..(width * height) {
-            bytes.extend_from_slice(&[b, g, r, a]);
-        }
-        Bgra8Image::new(width, height, bytes).unwrap()
-    }
+    use super::{Bgra8Image, decode_to_bgra8, encode_rgba_png};
 
     #[test]
     fn rejects_buffers_that_do_not_match_the_dimensions() {
@@ -185,12 +178,16 @@ mod tests {
 
     #[test]
     fn png_round_trip_preserves_pixels_and_channel_order() {
-        let image = solid_bgra(3, 2, 0x10, 0x20, 0x30, 0xFF);
-        let png = encode_png(&image).unwrap();
+        // Six pixels of one colour, RGBA in and BGRA out. Before `P4.03` this went through
+        // `encode_png(&Bgra8Image)`, which did the lane swap on the way in; that whole-image
+        // converter is gone, so the test now states the direction it was really pinning: the
+        // encoder takes what the PNG format stores (RGBA), and `decode_to_bgra8` swaps back.
+        let rgba = [0x30u8, 0x20, 0x10, 0xFF].repeat(6);
+        let png = encode_rgba_png(&rgba, 3, 2).unwrap();
         let decoded = decode_to_bgra8(&png).unwrap();
         assert_eq!(decoded.width(), 3);
         assert_eq!(decoded.height(), 2);
-        assert_eq!(decoded.bytes(), image.bytes());
+        assert_eq!(decoded.bytes(), &[0x10u8, 0x20, 0x30, 0xFF].repeat(6));
     }
 
     #[test]
