@@ -3925,7 +3925,7 @@ fn cancellation_error<H: StepHost>(host: &H) -> Option<StepError>;   // 唯一�
 | 导出链**峰值 4 份完整像素** | `artifact_writer.rs:44`（`prepared.bgra.clone()`）→ `image.rs:153`（`bgra_to_rgba(...).to_vec()`）→ `image.rs:66`（`RgbaImage::from_raw(rgba.to_vec())`）→ 编码器内部再一份 | 1920×300,000 时单份 **2.304e9 B ≈ 2.15 GiB**，4 份 ≈ **8.6 GiB** 必失败 |
 | 解码上限 **24,000,000 像素** | `crates/snapclip-history/src/image.rs:11-13`（`windows/image_norm.rs:18/:38` 同值） | **"能编码出来也读不回来"**：约 24 MP 以上的产物无法被任何既有解码路径读回 |
 | 缩略图**从不生成**（死分支） | `store/clip_repository.rs:111-118` 只写 `payload_kind_name(kind)`；`store.rs:434-437` 的 `role == "thumbnail"` 无写入者；`history/model.rs:178-187` 读**全量字节** | 一条 30 万像素高的截图会让列表行加载约 **2 GiB** |
-| `as u32` **截断无检查** | `artifact_writer.rs:42-43` | 超过 `u32::MAX` 的尺寸静默错乱 |
+| `as u32` **截断无检查** | `artifact_writer.rs:42-43` | 超过 `u32::MAX` 的尺寸静默错乱（**已由 `P4.04` 删除**——越界的真实形态是反向矩形，实测错误消息曾报出调用方从未给过的 `4294967291x2`，见 `§26.1.1`） |
 | 上限**没有推导** | `docs/19` §8.4：30,000 px / 150 MP | 与竞品对照后比 PixPin 在高度上小 **16.8×**（§17.6） |
 | 原子写**无清理** | `artifact_store.rs:79-82`（`.png.tmp` + `fs::rename`），注释自承无 LRU | 崩溃会留临时文件 |
 | 单块画布**必然线性增长** | 竞品事实：PixPin 的日志三重自洽证明画布是**单块 `Format_RGB32` 连续位图**，内存 = `W×H×4`（F-16） | 1058×502,649 → **约 2 GiB**，撞 2 GiB 墙 |
@@ -4017,7 +4017,7 @@ struct MemoryBudget {
 
 1. **`ExportError` 补 `Display`（`DEV-65`）。** `P4.01` 只给了 `Debug`，而 `P4.03` 是它的**第一个生产调用方**：shell 要把它变成 `CaptureError::EncodeFailed(String)`，没有 `Display` 就只能把枚举的 `Debug` 印出来。形状照 `ObservationError`/`FrameError`（`scroll/` 自己的惯例），不引 `thiserror`。
 2. **普通截图路径一次 `write_rows(0, &prepared.bgra)`，不分带（`DEV-67`）。** 这条路径的全部行本来就在一块连续缓冲里，分带是为滚动路径的 `BandStore` LRU 准备的机器——在这里它不会少拷一个字节（`write_rows` 收的就是切片）。`ImageMeta` 的 `length = height`（没有画布被截断）、`axis = Vertical`（PNG 自己就是行主序，这不是对"有没有滚动"的声称）、`dpr = 1`（`dpr` 是给滚动预览的 CSS 像素消费者用的，普通截图没有这种消费者，它的 DPI 在 `CaptureMetadata::dpi` 里；`1` 的意思是"不适用"，不是一个关于显示缩放的猜测）。
-3. **`as u32` 刻意留着（`DEV-68`）。** `P4.04` 的 RED 证据恰恰是"截断仍存在"，`P4.03` 顺手修掉就会把那条证据拿走。长度校验原样保留（`Bgra8Image::new` 的检查随它一起走了，比较与措辞照抄）。
+3. **`as u32` 刻意留着（`DEV-68`）。** `P4.04` 的 RED 证据恰恰是"截断仍存在"，`P4.03` 顺手修掉就会把那条证据拿走。长度校验原样保留（`Bgra8Image::new` 的检查随它一起走了，比较与措辞照抄）。**下一任务确实用掉了这份证据**：`P4.04` 的 RED 失败消息逐字是 `capture artifact encoding failed: bgra buffer of 0 bytes does not match 4294967291x2`（`docs/Temp/p404-red.txt`），两行收窄随后被一次 checked 转换替换（`§26.1.1`）。
 
 **层级与任务书的偏差（`DEV-66`）**：`P4.03` 声明 L2 / A + D + E，而"导出峰值不超过一份条带"必须在**有全局分配器**的进程里测（`CountingAllocator` 只能有一个 `#[global_allocator]`），因此它落成 `apps/snapclip/tests/export_path_copies.rs` 的独立二进制 + `#[ignore]`，与 `P4.02` 的 L4 装置同形。任务级门禁（A 类）由 `artifact_writer.rs` 既有的 `the_writer_hands_the_store_decodable_png_bytes` 兜底；任务书写的两个 RED 名**逐字保留**。
 
@@ -4929,6 +4929,17 @@ impl<Path: Copy + PartialEq> ActuatorWatch<Path> {
 
 **`u32` 越界**（§22.1 的 `as u32` 截断）属于第三类：**必须在 `begin` 之前检查并拒绝，而不是截断后继续**。
 
+#### 26.1.1 截断与拒绝是两种不同的失败（`P4.04`，2026-10-09）
+
+上面那句话读起来像同一件事的两种措辞，**它不是**：
+
+- **截断**把调用方给的数字换成一个格式装得下的数字，然后**继续**。产物是一张合法的 PNG，问题是它的尺寸**不是**调用方要的那个——错误发生在下游（有人拿这张图去对齐坐标、去拼接、去算偏移），而错误现场早已没了。
+- **拒绝**返回一个错误，**一个字节都不写**。代价是调用方要处理失败；收益是"我拿到的尺寸是我要的尺寸"这条不变式在类型和值上都还成立。
+
+`D-12` 要的是后者，但执行时发现它会发生的形态比 `D-12` 写的更具体：`Rect` 的尺寸是 `i32`，所以一个尺寸**不可能因为"太大"而超过 `u32::MAX`**（最宽 `i32::MAX = 2147483647 < 4294967295`）；它越界的唯一方式是**为负**，即一个反向矩形。而 `as u32` 把 `-5` 变成 `4294967291`，于是拒绝**确实发生了**，理由却是一条编造的尺寸——实测的错误消息是 `capture artifact encoding failed: bgra buffer of 0 bytes does not match 4294967291x2`，而 `4294967291` 这个数**调用方从未给过**。这就是"静默错乱"在这一层的真身：**结论对、陈述假**——而错的陈述正是下一个人的证据。
+
+因此修法是**删掉收窄**，不是给它加个守卫。尺寸域在**端口**（`ImageMeta`）是 `u64`（§17.7），在**模型**（`CaptureMetadata`）是 `u32`；两者之间的那一次转换是这条链路上**唯一**的一次，它是 checked 的，且发生在**画第一个字节之前**（`u32::try_from` 成功且为正，否则 `EncodeFailed` 并点名矩形本身）。「装不下格式」这第二个判断只出现在 `PngRowBandSink::begin`（`u32::try_from` + `TooLarge`），因为只有它知道格式是 PNG。落点与实测见 `§22.4.1`。
+
 ### 26.2 失败必须可见（G12）的执行形式
 
 今天的反例（§5 已确证）：
@@ -5601,7 +5612,7 @@ fn rows_match(actual, expected, sigma) -> bool
 | 三档长度内存 | 10k / 30k / 100k px，独立进程 | peak 差异 **≤ 10%** | L4 | **Memory** |
 | 换出文件已删除 | 会话结束后 | 无残留临时文件 | L1 | — |
 | 导出拷贝数 | 30,000 px 高导出 | 峰值 **≤ 2 份**（今天 4 份） | L4 | **Memory**（`P4.03` 实测 **0 份**，1280×20,000，见 `§22.4.1`） |
-| `u32` 越界 | 构造 > `u32::MAX` 尺寸 | **拒绝**（不截断） | L2 | — |
+| `u32` 越界 | 构造 > `u32::MAX` 尺寸（sink 侧）／反向矩形（shell 侧） | **拒绝**（不截断） | L2 | — （`P4.04` 实测：sink 侧自 `P4.02` 起就拒绝，`row_band_png::tests::an_oversized_dimension_is_refused_before_the_header` 钉住；shell 侧曾报出编造的 `4294967291x2`，见 `§26.1.1`） |
 | 普通截图回归 | F5 全流程（A 类全套） | 全部通过 | L1+L3 | **Capture Latency** |
 | 普通截图延迟不受滚动影响 | 滚动会话进行中触发 F5 | P95 变化 ≤ 10% | L3 | **Capture Latency** |
 | 捕获路径不变 | `attempt_order` 行为 | 与改动前一致（`P2.06` 只加滚动路径自己的顺序，未改 `attempt_order`；`providers::tests::wgc_is_tried_before_the_bitblt_fallback` 继续钉住） | L2 | — |

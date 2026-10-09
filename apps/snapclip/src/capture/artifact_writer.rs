@@ -58,15 +58,38 @@ impl ArtifactWriter for HistoryArtifactWriter {
         dpi: u32,
         monitor_device_name: Option<String>,
     ) -> CaptureResult<CaptureArtifact> {
-        // `as u32` is what this line did before P4.03 and it is deliberately unchanged: P4.04 is the
-        // task whose RED evidence is "the truncation is still here", so fixing it now would take
-        // that evidence away from the task that owns it.
-        let width = prepared.region.width() as u32;
-        let height = prepared.region.height() as u32;
+        // The export port's size domain is `u64` (`docs/30 §17.7`), so the region's signed
+        // dimensions are **widened**, never narrowed. A bare truncating `u32` cast wraps a negative
+        // dimension into a size the format has no room for, and the refusal then names a number the
+        // caller never supplied (`P4.04`, `D-12`). One checked conversion, before anything is drawn:
+        // this is `docs/30 §26.1`'s "refused before `begin`", and it is the same check the sink
+        // makes for the scroll path's benefit — `ImageMeta` is `u64`, the PNG header is not.
+        //
+        // `docs/30 §26.1.1` is the statement worth keeping in view while editing this: **truncating
+        // and refusing are two different failures.** Truncating continues with a number of its own
+        // choosing and leaves a valid PNG whose dimensions are not the ones that were asked for —
+        // the error surfaces downstream, where the coordinates no longer line up and the evidence is
+        // gone. Refusing writes no byte at all and keeps "the size I got is the size I asked for"
+        // true in both the type and the value.
+        let (width, height) = match (
+            u32::try_from(prepared.region.width()),
+            u32::try_from(prepared.region.height()),
+        ) {
+            (Ok(width), Ok(height)) if width > 0 && height > 0 => (width, height),
+            _ => {
+                return Err(CaptureError::EncodeFailed(format!(
+                    "{}x{} at ({}, {}) is not a drawable region",
+                    prepared.region.width(),
+                    prepared.region.height(),
+                    prepared.region.left,
+                    prepared.region.top
+                )))
+            }
+        };
         // `Bgra8Image::new` used to be the length check; it went with the copy it was attached to.
         // Same comparison, same words — `P4.01`'s pixels are tightly packed `region`-sized BGRA.
         let expected = u64::from(width) * u64::from(height) * 4;
-        if width == 0 || height == 0 || expected != prepared.bgra.len() as u64 {
+        if expected != prepared.bgra.len() as u64 {
             return Err(CaptureError::EncodeFailed(format!(
                 "bgra buffer of {} bytes does not match {width}x{height}",
                 prepared.bgra.len()
@@ -137,7 +160,7 @@ impl ArtifactWriter for HistoryArtifactWriter {
 #[cfg(test)]
 mod tests {
     use super::HistoryArtifactWriter;
-    use snapclip_capture::artifact::{CaptureService, PixelSliceSource};
+    use snapclip_capture::artifact::{CaptureService, PixelSliceSource, SelectionPixels};
     use snapclip_capture::geometry::Rect;
     use snapclip_capture::ports::ArtifactWriter;
     use snapclip_capture::session::CapturedFrame;
@@ -220,5 +243,44 @@ mod tests {
             &[1, 1, 0, 255, 2, 1, 0, 255, 1, 2, 0, 255, 2, 2, 0, 255]
         );
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// `P4.04` / `D-12`: a dimension that cannot be drawn must be **refused**, and the refusal must
+    /// be about the region the caller handed over.
+    ///
+    /// `Rect` carries `i32`, so a dimension cannot leave the representable range by being *large* —
+    /// the widest rectangle is `i32::MAX` wide, which `u32` holds without complaint. The way it
+    /// leaves is by being **negative**, i.e. an inverted rectangle. A truncating `u32` cast turns
+    /// `-5` into `4294967291`, so the writer reports a size of `4294967291x2` that no caller ever
+    /// asked for, and the honest reason — "this region is not a drawable size" — is never said.
+    /// That is the silent garbling `docs/30 §22.1` calls out, and it is why the narrowing is
+    /// deleted rather than guarded: the value the error names must be the value the caller supplied.
+    #[test]
+    fn an_oversized_dimension_is_rejected_before_the_first_byte() {
+        let dir = root("oversized");
+        let writer = HistoryArtifactWriter::new(dir.clone());
+        let prepared = SelectionPixels {
+            frame: frame(4, 4),
+            region: Rect::new(0, 0, -5, 2),
+            bgra: Vec::new(),
+        };
+
+        let error = writer
+            .write("capture-1-1", &prepared, 144, None)
+            .expect_err("an inverted region is not an image");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("-5"),
+            "the refusal must name the region that was supplied, got `{message}`"
+        );
+        assert!(
+            !message.contains("4294967291"),
+            "4294967291 is the number the narrowing invented, not the one the caller asked for: `{message}`"
+        );
+        assert!(
+            !dir.exists(),
+            "the refusal must land before the first byte is written"
+        );
     }
 }

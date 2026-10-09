@@ -368,4 +368,37 @@ mod tests {
             without.bytes.len()
         );
     }
+
+    /// `docs/30 §30.7`'s `u32` row reads "construct a size above `u32::MAX` → refused, not
+    /// truncated". `ImageMeta` is the only place a dimension can be that large (a `Rect` holds
+    /// `i32`), so the row is pinned here, at the sink that owns the format's limits.
+    ///
+    /// This was already true when `P4.04` opened: `begin` has converted with `u32::try_from` since
+    /// `P4.02`, the task that made `ImageMeta` `u64`. It is therefore a **regression pin, not a
+    /// RED** — the RED is `artifact_writer.rs`'s
+    /// `an_oversized_dimension_is_rejected_before_the_first_byte`. "Before the first byte" is
+    /// observable only by construction: the conversion is the first thing `begin` does, so
+    /// `Encoder::new` and `write_header` are never reached for such a meta.
+    #[test]
+    fn an_oversized_dimension_is_refused_before_the_header() {
+        for oversized in [meta(u64::from(u32::MAX) + 1, 1), meta(1, u64::from(u32::MAX) + 1)] {
+            let error = match PngRowBandSink::new().begin(&oversized) {
+                Ok(_) => panic!("{oversized:?} does not fit a PNG header and must be refused"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error,
+                ExportError::TooLarge {
+                    width: oversized.width,
+                    height: oversized.height
+                }
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains(&oversized.width.to_string())
+                    && message.contains(&oversized.height.to_string()),
+                "the refusal must name the size it refused, got `{message}`"
+            );
+        }
+    }
 }
