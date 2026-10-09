@@ -2666,7 +2666,7 @@ mod tests {
         MARGIN_SCORE_FLOOR, MIN_MARGIN, MIN_RESIDUAL_GAIN, MIN_TILES, PEAK_FAMILY_RATIO,
         PRIOR_DOWNWEIGHT, PRIOR_KAPPA,
         Prior,
-        decide_evidence, decide_scored_evidence, manual_decision,
+        decide_evidence, decide_scored_evidence, estimate, manual_decision,
         REGION_DECAY, REGION_WEIGHT_MAX, REGION_WEIGHT_MIN, RHO_MIN, RHO_MIN_PERMILLE, RegionClass,
         RegionModel,
         SCENE_CUT_ALIGNMENT_ERROR, SCENE_CUT_DECAY_STREAK, SCENE_CUT_SIMILARITY, SCORE_GAIN, Scratch,
@@ -5539,5 +5539,168 @@ mod tests {
             );
         }
         assert_eq!(model.observations(0), 3, "decay is not a reset");
+    }
+
+    /// A frame of `viewport` rows taken from `image` starting at document row `offset`.
+    ///
+    /// The scripted fixture (`ScrollScript`) can only paint a *moving* region (`with_dynamic`), and
+    /// the two scenarios below are about content that changes **where the previous capture could not
+    /// have looked** and about a frame that is not the same page at all. Both need hand-built frames,
+    /// which is why this reads rows out of [`TestImage`] directly.
+    fn frame_from(image: &TestImage, offset: u32, viewport: u32) -> Vec<u8> {
+        let mut pixels = Vec::with_capacity(image.width() as usize * viewport as usize * 4);
+        for y in 0..viewport {
+            pixels.extend_from_slice(image.row(offset + y));
+        }
+        pixels
+    }
+
+    fn observation_of(pixels: Vec<u8>, width: u32, viewport: u32, qpc: i64) -> Observation {
+        Observation::new(
+            pixels,
+            crate::geometry::Rect::new(0, 0, width as i32, viewport as i32),
+            qpc,
+            (width, viewport),
+            Axis::Vertical,
+        )
+        .expect("a packed frame of the declared size")
+    }
+
+    /// `docs/30` §30.5's "lazy-loaded images" and "infinite scroll" rows, at the layer that exists
+    /// today: a page whose **revealed** rows arrive different from what the previous capture saw.
+    ///
+    /// The rows a step reveals were not on screen in the previous capture at all, so a page that
+    /// loads them late (an `IntersectionObserver` image, the next batch of an infinite scroll) is
+    /// free to put different bytes there. §15.4.2 takes the match band from the **overlap**, not
+    /// from the frame, so the change sits below everything the matcher looks at — and what must not
+    /// happen is that the freshly painted rows get explained as a small shift instead.
+    #[test]
+    fn content_that_changes_in_the_rows_being_revealed_does_not_move_the_estimate() {
+        let image = TestImage::from_structures(640, 1900, 11, 19, &mixed_structures());
+        let viewport = 900u32;
+        let step = 40i32;
+
+        // Two arms of the same step. The control leaves the revealed rows as the page has them; the
+        // other arm repaints exactly those rows, the way a late-loading region does. Whatever the
+        // funnel says about the control it must say about the repainted one — otherwise the answer
+        // depends on content the previous capture never looked at.
+        let control = revealed_rows(&image, viewport, step, false);
+        let repainted = revealed_rows(&image, viewport, step, true);
+        assert_eq!(
+            control.status(),
+            repainted.status(),
+            "the newly revealed rows moved the estimate: control {:?}, repainted {:?}",
+            control.status(),
+            repainted.status()
+        );
+        assert_eq!(
+            control.status(),
+            &Status::Confirmed { d: step },
+            "a plain step of {step} was not recovered at all, so this test cannot say anything about \
+             the repainted rows"
+        );
+    }
+
+    /// One step of `step` rows where the rows the step reveals are either left as the page has them
+    /// or repainted flat, which is what a lazy region does when it finishes loading.
+    fn revealed_rows(image: &TestImage, viewport: u32, step: i32, repaint: bool) -> Displacement {
+        let previous = observation_of(frame_from(image, 0, viewport), 640, viewport, 10);
+        let mut current = frame_from(image, step as u32, viewport);
+        if repaint {
+            let stride = image.width() as usize * 4;
+            let revealed_from = (viewport - step as u32) as usize * stride;
+            for (index, byte) in current[revealed_from..].iter_mut().enumerate() {
+                // A flat, deliberately unlike-the-page fill: the point is that these bytes differ,
+                // not that they look like anything.
+                *byte = if index % 4 == 3 { 0xFF } else { 0x40 };
+            }
+        }
+        let current = observation_of(current, 640, viewport, 20);
+        let mut scratch = Scratch::new();
+        // The closed loop, not the manual route: `P3.06` recorded that a manual session (`prior`
+        // `None`, an eight-candidate window) answers `Uncertain` for steps the closed loop confirms,
+        // and this test is about the revealed rows rather than about that difference.
+        let prior = Prior::new(step as f32);
+        estimate(
+            &previous.view(),
+            &current.view(),
+            Some(&prior),
+            1,
+            SceneCut::none(),
+            &mut scratch,
+        )
+    }
+
+    /// `docs/30` §30.5's "page zoom" row (`Ctrl`+wheel changes `devicePixelRatio`): the next frame is
+    /// the same page **at a different scale**, and no shift explains that.
+    ///
+    /// This test exists to find out what the funnel does with such a frame. The row is C-class
+    /// (boundary) precisely because the answer may be "refuse", and a wrong stitch here would be a
+    /// silent one: the canvas would carry two scales of the same rows. What must not happen is a
+    /// `Confirmed` shift — on either route, because a user can zoom while a session is running and the
+    /// closed loop would still be expecting the pixels-per-notch it learned before the zoom.
+    #[test]
+    fn a_frame_at_a_different_scale_is_not_silently_stitched() {
+        let image = TestImage::from_structures(320, 1800, 5, 16, &[Structure::NoiseBlocks { cell: 8 }]);
+        let viewport = 900u32;
+        let previous = Observation::new(
+            frame_from(&image, 0, viewport),
+            crate::geometry::Rect::new(0, 0, 320, viewport as i32),
+            10,
+            (320, viewport),
+            Axis::Vertical,
+        )
+        .expect("a packed frame");
+
+        for (name, numerator, denominator) in [("1.5x", 2u32, 3u32), ("2x", 1u32, 2u32)] {
+            let mut zoomed = Vec::with_capacity(320 * viewport as usize * 4);
+            for y in 0..viewport {
+                zoomed.extend_from_slice(image.row(y * numerator / denominator));
+            }
+            let current = Observation::new(
+                zoomed,
+                crate::geometry::Rect::new(0, 0, 320, viewport as i32),
+                20,
+                (320, viewport),
+                Axis::Vertical,
+            )
+            .expect("a packed frame");
+
+            let mut scratch = Scratch::new();
+            let manual = estimate(
+                &previous.view(),
+                &current.view(),
+                None,
+                0,
+                SceneCut::none(),
+                &mut scratch,
+            );
+            let prior = Prior::new(40.0);
+            let mut scratch = Scratch::new();
+            let closed = estimate(
+                &previous.view(),
+                &current.view(),
+                Some(&prior),
+                1,
+                SceneCut::none(),
+                &mut scratch,
+            );
+            println!(
+                "[P6.02] a {name} zoom came back as {:?} on the manual route and {:?} on the closed \
+                 loop",
+                manual.status(),
+                closed.status()
+            );
+            assert!(
+                !matches!(manual.status(), Status::Confirmed { .. }),
+                "a {name} zoom was stitched as a shift on the manual route: {:?}",
+                manual.status()
+            );
+            assert!(
+                !matches!(closed.status(), Status::Confirmed { .. }),
+                "a {name} zoom was stitched as a shift on the closed loop: {:?}",
+                closed.status()
+            );
+        }
     }
 }
