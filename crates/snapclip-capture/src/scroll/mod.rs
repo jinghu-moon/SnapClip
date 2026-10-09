@@ -1,5 +1,5 @@
-//! The scroll-capture subsystem (`docs/30` §28 lists its files: eleven production files and the
-//! test-only `testkit.rs`).
+//! The scroll-capture subsystem (`docs/30` §28.2 lists its files; the dependency gate counts them:
+//! **11 production files** — this one included — and **6 `#[cfg(test)]` ones**, 17 in all).
 //!
 //! What is here today:
 //!
@@ -14,6 +14,8 @@
 //! * `loop_control` (`P3.03`) — the closed loop's pieces: the watchdog that switches transports, the
 //!   settle window, the `ĝ` controller, and (from `P3.09`) the driver that runs them in order.
 //! * `preview` (`P3.08`) — the capacity-1 preview mailbox the overlay thread drains (§19.3).
+//! * `panel` (`P5.03`) — the eight answers of §19.1 and the viewport box of §19.4, as data; the
+//!   renderer consumes it (`windows/win/d2d.rs`) rather than computing it a second time.
 //! * `session` (`P3.04`) — the aggregate root: the axis, the canvas, the step counter, the streak,
 //!   the stop promise, and the command port (§27.2).
 //! * `ports` (`P3.09`) — the two platform seams, `FrameSource` and `ScrollActuator` (§27.1).
@@ -27,9 +29,13 @@
 //!   the only matching-cost data this repository has and `P1.05`+ must re-run it on the real
 //!   layer 1 (see `docs/30` §23.3.1 and `DEV-8`).
 //!
-//! `observation`, `displacement`, `canvas` and `orb` are production code; `testkit` and
-//! `perf_probe` are `#[cfg(test)]`. This module became a real (non-test) module with `P1.01` — see
-//! `lib.rs` and `DEV-8`.
+//! The ten module bullets above are production code, as is this file itself. `testkit`,
+//! `acceptance` and `perf_probe` are `#[cfg(test)]`, and so are `alloc_probe`, `mem_probe` and
+//! `latency_probe` further down — **six** test-only modules rather than the one this note used to
+//! claim. This module became a real (non-test) module with `P1.01` — see `lib.rs` and `DEV-8`.
+//!
+//! (`P6.09` corrected the two counts in this header after the acceptance pass read the module list
+//! against what `tools/check-dependency-direction.ps1` actually prints: 17 files.)
 //!
 //! Gate note (`docs/30` §28.4): nothing under `scroll/` may reference `windows`, `sampler` or any
 //! platform FFI. Everything here is pure arithmetic over byte buffers, and the second scan in
