@@ -248,7 +248,24 @@ impl PreviewStream {
     /// slow to consume must not be able to slow the capture down. Returning `()` is the point —
     /// §27.4 lists this among the three interfaces that deliberately do not use `Result`, because
     /// "dropped" is a normal outcome rather than an error.
+    ///
+    /// **One exception: a terminal update is never dropped.** Every other kind describes a *state*
+    /// that a later update supersedes, so losing one costs the consumer a frame of staleness and
+    /// `dropped` says so. `Ended` is the last thing the session will ever publish, so a drop there is
+    /// permanent: a consumer waiting for the end of the session — as `E-PERF-4`'s probe does, and as
+    /// the overlay does when it decides a session is over — would wait for a message that is never
+    /// coming. `P5.06` found this the hard way: one run in about thirty hung for twenty minutes on a
+    /// `try_lock` that happened to land while the consumer was polling. The wait is bounded by the
+    /// consumer's critical section, which moves `Copy` values and cannot block, and it happens once
+    /// per session, so it cannot slow the capture down in the sense constraint 5 is about.
     pub(crate) fn publish(&self, update: PreviewUpdate) {
+        if matches!(update, PreviewUpdate::Ended { .. }) {
+            self.mailbox
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(update);
+            return;
+        }
         match self.mailbox.try_lock() {
             Ok(mut mailbox) => {
                 if mailbox.push(update) {
@@ -617,7 +634,9 @@ mod tests {
     /// the only way to tell them apart is to hold it. The consumer here is a stand-in for a slow
     /// overlay thread: the publish must come back **while the lock is held**, and the update must be
     /// *gone* rather than queued. If this ever hangs, the implementation grew a blocking `lock()`
-    /// and a slow preview can now stall the capture loop.
+    /// everywhere and a slow preview can now stall the capture loop. (`Ended` is the one kind that
+    /// deliberately does wait — the next test is that exception, and it is an exception precisely
+    /// because it is reached once per session rather than once per step.)
     #[test]
     fn a_publish_while_the_consumer_holds_the_lock_is_dropped_not_queued() {
         let stream = PreviewStream::new();
@@ -649,6 +668,48 @@ mod tests {
             None,
             "a dropped update is dropped, not parked until the consumer comes back"
         );
+    }
+
+    /// The **one** exception to the rule above: a terminal update is never dropped.
+    ///
+    /// Every other kind is a *state* that a later update supersedes — losing one costs a frame of
+    /// staleness, and `dropped` says so. `Ended` is the last thing a session publishes, so a loss is
+    /// permanent: a consumer waiting for the end of the session waits for a message that is never
+    /// coming. `P5.06` found this as a twenty-minute hang (one run in roughly thirty lost its `Ended`
+    /// to a `try_lock` that landed while the consumer was polling). The publish therefore **waits**
+    /// here, bounded by a critical section that cannot block and reached once per session, and
+    /// `dropped` stays at zero.
+    #[test]
+    fn the_terminal_update_is_not_dropped_when_the_consumer_holds_the_lock() {
+        let stream = PreviewStream::new();
+        let guard = stream.mailbox.lock().expect("the mailbox is not poisoned");
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                stream.publish(PreviewUpdate::Ended {
+                    reason: StopReason::UserStopped,
+                });
+                let _ = tx.send(());
+            });
+
+            assert!(
+                rx.recv_timeout(Duration::from_millis(200)).is_err(),
+                "the terminal update went through while the consumer held the lock: it has to wait, \
+                 because nothing will ever supersede it"
+            );
+            assert_eq!(stream.dropped(), 0, "a terminal update is not a supersession");
+            drop(guard);
+            rx.recv_timeout(Duration::from_secs(5))
+                .expect("the publisher is released as soon as the consumer lets go");
+        });
+
+        assert!(matches!(
+            stream.take(),
+            Some(PreviewUpdate::Ended {
+                reason: StopReason::UserStopped
+            })
+        ));
     }
 
     /// §19.5's progress row needs three quantities, and the panel cannot read the session.

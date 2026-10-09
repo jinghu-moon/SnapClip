@@ -1838,3 +1838,168 @@
             }
         }
     }
+
+    /// "Follows the finger" has to be a number, and the number that matters is how long the
+    /// *composing* thread — the overlay's, and therefore the user's — is blocked per preview update
+    /// (docs/30 §23.2's `UI 主线程最大同步工作`, §23.3's `E-PERF-4`).
+    ///
+    /// The seam is `PreviewUpdate` → pixels: fold the update into the panel's view model
+    /// (`ScrollPanel::on_update`) and compose the whole frame into the target the overlay presents
+    /// (`OverlayRenderer::draw_to`, the same layer code `render` calls, and §5 established that it
+    /// repaints every pixel). Two things it does *not* include, and both are named rather than
+    /// quietly assumed:
+    ///
+    /// * the swap chain's `Present`, which belongs to the window host on the far side of the
+    ///   assembly root (`P6`);
+    /// * the wait in front of the fold — `RENDER_TICK_MS` of timer, which is a wait and not work.
+    ///   That wait is the reason §23.3's `Preview 更新延迟` cannot be measured from here at all.
+    ///
+    /// Four rates, because §23.1 asks whether 10 Hz is the right cap. The per-update cost does not
+    /// depend on the rate; the **duty cycle** does, and that is what the cap is chosen against. The
+    /// naps between updates keep the wall clock honest to each rate and are excluded from the
+    /// measurement — a thread that is asleep is exactly a thread that is not blocking.
+    ///
+    /// §23.3 carries two numbers: 8 ms is the pass threshold and 4 ms is the target the threshold is
+    /// meant to leave room for. Both are reported, because a measurement between them is not a pass.
+    #[test]
+    #[ignore = "composes through the real D3D11/D2D path; the L4 gate runs it with --ignored"]
+    fn the_overlay_thread_never_blocks_longer_than_eight_ms() {
+        use std::time::{Duration, Instant};
+
+        use crate::scroll::displacement::Status;
+        use crate::scroll::latency_probe::percentiles;
+        use crate::scroll::panel::ScrollPanel;
+        use crate::scroll::preview::PreviewUpdate;
+
+        /// §23.3: the pass threshold, and the target it exists to leave room for.
+        const THRESHOLD_NS: u64 = 8_000_000;
+        const TARGET_NS: u64 = 4_000_000;
+        /// A 1500x900 window at 125%: §22.6's content width, and a physical surface large enough that
+        /// the frame repaint — not the panel — is the bulk of the work.
+        const DIP: (i32, i32) = (1500, 900);
+        const DPI: u32 = 120;
+        const HZ: [u32; 4] = [5, 10, 20, 30];
+        const UPDATES: u32 = 30;
+
+        let scale = DPI as f32 / 96.0;
+        let width = (DIP.0 as f32 * scale).round() as u32;
+        let height = (DIP.1 as f32 * scale).round() as u32;
+
+        let device = super::GraphicsDevice::create().expect(
+            "this probe composes for real, which is why it is #[ignore]d: without a D3D11 device its \
+             question cannot be answered, and passing quietly is the one thing it must not do",
+        );
+        let mut renderer = OverlayRenderer::new(std::sync::Arc::new(device), DPI)
+            .expect("the overlay renders at every DPI the overlay runs at");
+        let frame_pixels = solid_bgra(width, height, [0x20, 0x28, 0x30, 0xFF]);
+        renderer
+            .update_frame(width, height, &frame_pixels)
+            .expect("a full-frame BGRA buffer is a frame");
+        renderer
+            .ensure_back_buffer(width, height)
+            .expect("the back buffer matches the frame");
+        let target = renderer
+            .device()
+            .create_render_target_texture(width, height)
+            .expect("an off-screen target");
+        let context = renderer
+            .device()
+            .create_d2d_context()
+            .expect("a D2D context over our own device");
+        let target_bitmap = super::super::d3d11::create_bitmap_from_texture(
+            &context,
+            &target.texture,
+            D2D1_BITMAP_OPTIONS_TARGET,
+            D2D1_ALPHA_MODE_PREMULTIPLIED,
+        )
+        .expect("a D2D bitmap over the target");
+
+        let frame = Rect::from_origin_size(Point::new(0, 0), width as i32, height as i32);
+        let mut view = RenderView::new(frame);
+        view.show_chrome = true;
+        view.cursor_visible = false;
+        view.selection = frame;
+
+        // Warm-up. The first composition through a freshly created context and target builds the
+        // resources every later one reuses, and it costs about as much as a whole frame budget. The
+        // overlay has composed thousands of frames before a scroll session begins, so charging that
+        // one-time cost against a per-update budget would be measuring the wrong thing — but it is
+        // reported rather than dropped, because it is real, it is bounded, and the reader of the
+        // numbers below deserves to know it exists.
+        let panel = ScrollPanel::new(1500, 900);
+        view.scroll_panel = Some(panel.clone());
+        let warm_start = Instant::now();
+        renderer
+            .draw_to(&target_bitmap, &view)
+            .expect("the warm-up composition");
+        println!(
+            "[P5.06] the first composition through a fresh target: {:.2} ms (one-time, not counted \
+             below)",
+            warm_start.elapsed().as_secs_f64() * 1e3
+        );
+        for _ in 0..2 {
+            renderer
+                .draw_to(&target_bitmap, &view)
+                .expect("a warm-up composition");
+        }
+
+        for hz in HZ {
+            let interval = Duration::from_nanos(1_000_000_000 / u64::from(hz));
+            let mut panel = ScrollPanel::new(1500, 900);
+            let mut work: Vec<u64> = Vec::with_capacity(UPDATES as usize);
+            for tick in 0..UPDATES {
+                std::thread::sleep(interval);
+                // The three updates a scrolling producer actually sends, folded the way the overlay
+                // folds them: rows announced, how many steps and how many dropped, where the viewport
+                // now is.
+                let at = Instant::now();
+                panel.on_update(PreviewUpdate::Bands {
+                    first_row: u64::from(tick) * 540,
+                    rows: 540,
+                    scale: 1,
+                });
+                panel.on_update(PreviewUpdate::Span {
+                    primary_len: u64::from(tick) * 540 + 900,
+                    steps: tick,
+                    discarded: tick / 7,
+                });
+                panel.on_update(PreviewUpdate::Viewport {
+                    band: u64::from(tick) * 540,
+                    status: Status::Confirmed { d: 540 },
+                });
+                view.scroll_panel = Some(panel.clone());
+                renderer
+                    .draw_to(&target_bitmap, &view)
+                    .expect("the composition the overlay presents");
+                work.push(at.elapsed().as_nanos() as u64);
+            }
+            let (p50, p95, max) = percentiles(&mut work);
+            // The overlay thread has 1/hz seconds per update; work × rate is the fraction of it spent
+            // blocked. `u64::from(hz) * 100` keeps the percentage in integers.
+            let duty_tenths = (max as u128 * u128::from(hz) * 1000 / 1_000_000_000) as u64;
+            let duty = format!("{}.{}", duty_tenths / 10, duty_tenths % 10);
+            println!(
+                "[P5.06] overlay @{hz} Hz: fold+compose p50 {:.2} ms / p95 {:.2} ms / max {:.2} ms \
+                 over {UPDATES} updates; worst-case duty {duty}%",
+                p50 as f64 / 1e6,
+                p95 as f64 / 1e6,
+                max as f64 / 1e6,
+            );
+            assert!(
+                max <= THRESHOLD_NS,
+                "at {hz} Hz the composing thread was blocked for {} ms, and §23.3's pass threshold \
+                 is {} ms (p50 {} ms, p95 {} ms)",
+                max as f64 / 1e6,
+                THRESHOLD_NS as f64 / 1e6,
+                p50 as f64 / 1e6,
+                p95 as f64 / 1e6,
+            );
+            if max > TARGET_NS {
+                println!(
+                    "[P5.06] ...past §23.3's {} ms target, inside the {} ms threshold",
+                    TARGET_NS as f64 / 1e6,
+                    THRESHOLD_NS as f64 / 1e6
+                );
+            }
+        }
+    }

@@ -91,6 +91,19 @@ mod acceptance;
 #[cfg(test)]
 mod alloc_probe;
 
+/// The measurement device for `E-PERF-4` (`P5.06`): what the windowed thumbnail's derivation costs.
+/// Test-only, and it is here rather than beside the renderer because §28.4 forbids this directory
+/// from naming the platform — the consumer's half of `E-PERF-4` needs a D2D device and therefore
+/// lives in `windows/win/d2d/tests.rs`.
+///
+/// It is `pub(crate)` where its siblings (`alloc_probe`, `mem_probe`, `perf_probe`) are private, and
+/// the reason is the split seam: the two halves of `E-PERF-4` are judged against the same thresholds
+/// and have to reduce their samples the same way, so `percentiles` must be reachable from the
+/// platform side. A second copy of it there would be a second opinion about what `p95` means, which
+/// is precisely how a threshold and a measurement drift apart. Test-only, so nothing ships on it.
+#[cfg(test)]
+pub(crate) mod latency_probe;
+
 #[cfg(test)]
 mod mem_probe;
 

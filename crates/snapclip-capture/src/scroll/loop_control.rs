@@ -2576,4 +2576,352 @@ mod tests {
             driver.session.canvas().primary_len()
         );
     }
+
+    /// A page the same shape as [`page`], at a width a real display produces (`P5.06`).
+    ///
+    /// The loop's own tests run at 320 px because the estimator's cost is not what they are about.
+    /// `E-PERF-4` is the one exception: §23.1 asks for the cost on the widths §22.6's table uses,
+    /// and a 320-px page would make gate three's tile count a property of the fixture rather than of
+    /// the loop.
+    fn wide_page(width: u32, height: u32, seed: u32) -> crate::scroll::testkit::TestImage {
+        use crate::scroll::testkit::{Structure, TestImage};
+
+        TestImage::from_structures(width, height, seed, height, &[Structure::NoiseBlocks { cell: 8 }])
+    }
+
+    /// [`LinkedActuator`] with a clock in front of it: when did the loop inject?
+    ///
+    /// §23.2 measures `Scroll response` **from `inject` returning**, which is why the timestamp
+    /// lives here and not at the frame: the actuator is the seam the definition names, and putting
+    /// the clock anywhere else would measure a different interval while keeping the same name.
+    struct TimedActuator {
+        inner: LinkedActuator,
+        injects: std::sync::Arc<std::sync::Mutex<Vec<Instant>>>,
+    }
+
+    impl TimedActuator {
+        fn new(
+            inner: LinkedActuator,
+            injects: std::sync::Arc<std::sync::Mutex<Vec<Instant>>>,
+        ) -> Self {
+            Self { inner, injects }
+        }
+    }
+
+    impl ScrollActuator for TimedActuator {
+        type Path = InjectPath;
+
+        fn path(&self) -> InjectPath {
+            self.inner.path()
+        }
+
+        fn switch(&mut self, from: InjectPath) -> Option<InjectPath> {
+            self.inner.switch(from)
+        }
+
+        fn inject(&mut self, notches: i32) -> InjectOutcome {
+            self.injects
+                .lock()
+                .expect("the inject log is not poisoned")
+                .push(Instant::now());
+            self.inner.inject(notches)
+        }
+    }
+
+    /// F-08 at the loop: a consumer that never looks cannot make the loop take fewer steps.
+    ///
+    /// **A pin, not a red.** `PreviewStream::publish` already takes the mailbox with `try_lock` and
+    /// counts the miss in `dropped` (§19.3 constraint 5, landed by `P3.08`), so the property holds
+    /// before this test was written. It is pinned here rather than in `preview.rs` because the claim
+    /// is about the *loop*: the loop must reach the same canvas whether or not anyone is reading,
+    /// and the only way to state that is to run it both ways and compare.
+    ///
+    /// What is *not* claimed is that a slow consumer is invisible. It is visible in `dropped`, and
+    /// that is the design: the preview is a consumer, so what it loses is its own freshness — never
+    /// the capture's progress.
+    #[test]
+    fn a_slow_consumer_does_not_slow_the_capture_loop() {
+        fn run(drain: bool) -> (ScrollSession, u64) {
+            let image = page(3000, 31);
+            let (page, pending) = SimulatedPage::new(image, 900, 60, 3);
+            let plan = ScrollPlan::new(Axis::Vertical, 320, 900, MemoryBudget::with_total(8 << 20));
+            let controller = ScrollController::new();
+            let preview = PreviewStream::new();
+
+            let session = std::thread::scope(|scope| {
+                let plan_ref = &plan;
+                let controller_ref = &controller;
+                let preview_ref = &preview;
+                let driver = scope.spawn(move || {
+                    ScrollDriver::new(plan_ref).run(
+                        page,
+                        LinkedActuator::new(pending),
+                        controller_ref,
+                        preview_ref,
+                    )
+                });
+                if drain {
+                    while !driver.is_finished() {
+                        let _ = preview_ref.take();
+                        std::thread::yield_now();
+                    }
+                }
+                driver.join().expect("the driver does not panic")
+            });
+            (session, preview.dropped())
+        }
+
+        let (slow, slow_dropped) = run(false);
+        let (fast, fast_dropped) = run(true);
+
+        assert_eq!(
+            slow.step(),
+            fast.step(),
+            "the loop takes the same number of steps whether or not a consumer is reading"
+        );
+        assert_eq!(
+            slow.committed(),
+            fast.committed(),
+            "and commits the same ones"
+        );
+        assert_eq!(
+            slow.canvas().primary_len(),
+            fast.canvas().primary_len(),
+            "so the canvas is the same image, which is the only thing the user gets to keep"
+        );
+        assert_eq!(
+            slow.stop_reason(),
+            fast.stop_reason(),
+            "a stalled consumer does not end a session and does not change why it ended"
+        );
+        assert!(
+            slow_dropped > 0,
+            "a consumer that never took anything must have lost publications rather than queued \
+             them: {slow_dropped} dropped"
+        );
+        assert!(
+            slow_dropped >= fast_dropped,
+            "and it must have lost at least as many as one that drained: {slow_dropped} against \
+             {fast_dropped}"
+        );
+    }
+
+    /// `E-PERF-4`'s first latency: `inject` returns → that step's displacement is committed and
+    /// announced (`docs/30` §23.2).
+    ///
+    /// `#[ignore]`d and release-only (`tools/p5-06-latency.ps1`): the number is wall-clock, and a
+    /// debug build's estimator is an order of magnitude slower than the one §23.3's threshold is
+    /// about.
+    ///
+    /// ## What the number contains, and what it cannot
+    ///
+    /// It contains the settle rule's own cost, which §20.3 makes **the floor**: the loop does not
+    /// commit a step until the frame has been still for `STILL_WINDOW` (40 ms), and it gives up at
+    /// `STEP_TIMEOUT` (400 ms). It does **not** contain a capture path: `SimulatedPage` answers
+    /// instantly instead of waiting for a WGC frame. So this is the loop's own pacing, and the
+    /// capture half belongs to an L3 probe (`P3.10` gave the cancel latency a real source; `P6.08`
+    /// owes the same treatment to these two numbers). Reporting them apart is the point: a threshold
+    /// met because the floor is 40 ms is a different fact from one met because the capture is fast.
+    ///
+    /// The endpoint is observed **through the preview port** rather than through a hook inside the
+    /// driver: the loop's own notion of "this step is over" is `publish_step`, so the port is the
+    /// earliest point a consumer can see it. `Duration::ZERO` opens the rate limit so that every
+    /// step is announced, and the pairing is by the step count in `Span` — not by time, because two
+    /// announcements inside one tick would make a timestamp-ordering guess.
+    #[test]
+    #[ignore = "P5.06 measures release-only wall-clock latencies; drive it with tools/p5-06-latency.ps1"]
+    fn latency_measures_one_run() {
+        use crate::scroll::latency_probe::{percentiles, DriverLatencyReport};
+        use crate::scroll::preview::PreviewUpdate;
+        use std::path::Path;
+        use std::sync::{Arc, Mutex};
+
+        /// `docs/30` §23.3's `Scroll Response` threshold: P95 ≤ 80 ms, derived there from two
+        /// `RENDER_TICK_MS` (15 ms) waits. The measurement straddles it — see the report below.
+        const SCROLL_RESPONSE_P95_NS: u64 = 80_000_000;
+        /// The bound this case *asserts*. It is deliberately looser than §23.3's threshold: that
+        /// threshold prices the settle rule at 30 ms and the implemented rule waits `STILL_WINDOW`
+        /// (40 ms) plus two ticks, so a gate on 80 ms would be red roughly one run in four. A gate
+        /// that is usually green is not a gate, and tuning a design constant until it is green would
+        /// be exactly the move `AGENTS.md` forbids. The measured shortfall belongs to §23.3, with its
+        /// numbers, as a finding.
+        const SCROLL_RESPONSE_STRUCTURAL_NS: u64 = 200_000_000;
+
+        const WIDTH: u64 = 1500;
+        const EXTENT: u64 = 900;
+        /// The page's true gain is `60` px/notch, which is also `ĝ₀ = starting_px_per_notch(3, 20)`,
+        /// so the control law is right from the first step and every step advances 9 × 60 = 540 px —
+        /// the same arithmetic `the_driver_closes_the_loop_from_injection_to_committed_rows`
+        /// documents. A different true gain would only make the first steps hunt.
+        const PAGE_GAIN: i32 = 60;
+        /// Enough page that the stop, not the end of the document, is what ends the run: 12 driven
+        /// steps cannot be served in less than 12 × `STILL_WINDOW` (40 ms) = 480 ms, and the stopper
+        /// waits 400 ms. The height covers all 12 steps at 540 px each plus the viewport.
+        const PAGE_STEPS: u32 = 12;
+        const PAGE_HEIGHT: u64 = EXTENT * 9;
+        /// When the stopper presses `Enter`, measured from the start of the run.
+        const STOP_AFTER_MS: u64 = 400;
+        /// How long the consumer waits for `Ended` before it gives up.
+        ///
+        /// The `None` arm of its loop spins, so it needs a way out that does not depend on the driver
+        /// publishing anything: if `run` panics, `thread::scope` waits for this thread before it
+        /// resumes unwinding, and a loop that only leaves on `Ended` would hang the whole process
+        /// (observed once — a stale `snapclip_capture-*.exe` held the build output lock for twenty
+        /// minutes). The deadline turns that hang into a failure, and the flag keeps it honest: a
+        /// timeout here is a broken run, not a fast one.
+        const CONSUMER_DEADLINE: Duration = Duration::from_secs(30);
+
+        let image = wide_page(WIDTH as u32, PAGE_HEIGHT as u32, 41);
+        let (page, pending) = SimulatedPage::new(image, EXTENT as u32, PAGE_GAIN, PAGE_STEPS);
+        let plan = ScrollPlan::new(
+            Axis::Vertical,
+            WIDTH,
+            EXTENT as u32,
+            MemoryBudget::with_total(64 << 20),
+        );
+        let controller = ScrollController::new();
+        let preview = PreviewStream::new();
+        let injects: Arc<Mutex<Vec<Instant>>> = Arc::new(Mutex::new(Vec::new()));
+        let stopped_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+
+        let (session, spans, ended_at) = std::thread::scope(|scope| {
+            let preview_ref = &preview;
+            let consumer = scope.spawn(move || {
+                let mut spans: Vec<(u32, Instant)> = Vec::new();
+                let deadline = Instant::now() + CONSUMER_DEADLINE;
+                let ended = loop {
+                    match preview_ref.take() {
+                        Some(PreviewUpdate::Span { steps, .. }) => {
+                            spans.push((steps, Instant::now()));
+                        }
+                        Some(PreviewUpdate::Ended { .. }) => break (Instant::now(), true),
+                        Some(_) => {}
+                        None => {
+                            if Instant::now() >= deadline {
+                                break (Instant::now(), false);
+                            }
+                            std::thread::yield_now();
+                        }
+                    }
+                };
+                (spans, ended.0, ended.1)
+            });
+
+            let stop_log = Arc::clone(&stopped_at);
+            let controller_ref = &controller;
+            let stopper = scope.spawn(move || {
+                // A user pressing `Enter` mid-run, timed from the start rather than from a step
+                // count: the step count is the thing under test, and the number of steps a wall
+                // clock buys is what a real session has anyway.
+                std::thread::sleep(Duration::from_millis(STOP_AFTER_MS));
+                let at = Instant::now();
+                controller_ref.stop();
+                *stop_log.lock().expect("the stop log is not poisoned") = Some(at);
+            });
+
+            let session = ScrollDriver::new(&plan)
+                .with_preview_interval(Duration::ZERO)
+                .run(
+                    page,
+                    TimedActuator::new(LinkedActuator::new(pending), Arc::clone(&injects)),
+                    &controller,
+                    &preview,
+                );
+            stopper.join().expect("the stopper does not panic");
+            let (spans, ended, published_ended) =
+                consumer.join().expect("the consumer does not panic");
+            // The consumer normally leaves the loop on `Ended`, which `finish` publishes
+            // unconditionally — so this is the end of the session, observed from the other side of
+            // the port. If it left on the deadline instead, the run is broken and says so.
+            assert!(
+                published_ended,
+                "the session never published `Ended` within {CONSUMER_DEADLINE:?}, so the driver \
+                 did not finish (a panic inside `run` reaches this as a timeout rather than a hang)"
+            );
+            (session, spans, ended)
+        });
+
+        let inject_instants = injects.lock().expect("the inject log is not poisoned").clone();
+        let mut responses: Vec<u64> = Vec::new();
+        let mut last_steps = 0;
+        for (steps, at) in &spans {
+            if *steps <= last_steps {
+                // The terminal `Span` republishes the last step's count; it is the same step.
+                continue;
+            }
+            if let Some(injected_at) = inject_instants.get(*steps as usize - 1) {
+                responses.push(at.saturating_duration_since(*injected_at).as_nanos() as u64);
+            }
+            last_steps = *steps;
+        }
+        assert!(
+            !responses.is_empty(),
+            "no step was announced after an injection, so nothing was measured: {spans:?}"
+        );
+        let (scroll_p50_ns, scroll_p95_ns, scroll_max_ns) = percentiles(&mut responses);
+        let stop_ns = ended_at
+            .saturating_duration_since(
+                stopped_at
+                    .lock()
+                    .expect("the stop log is not poisoned")
+                    .expect("the stopper ran before the driver returned"),
+            )
+            .as_nanos() as u64;
+
+        assert_eq!(
+            session.stop_reason(),
+            Some(StopReason::UserStopped),
+            "the stopper's press is what ended the session, so `Stop latency` is about a real stop \
+             (the run took {} steps)",
+            session.step(),
+        );
+        assert!(
+            scroll_p95_ns <= SCROLL_RESPONSE_STRUCTURAL_NS,
+            "the loop stopped responding within a small multiple of the settle floor: p95 {} ms \
+             (p50 {} ms, max {} ms over {} steps)",
+            scroll_p95_ns as f64 / 1e6,
+            scroll_p50_ns as f64 / 1e6,
+            scroll_max_ns as f64 / 1e6,
+            responses.len(),
+        );
+
+        // Reported, not asserted. §23.3's threshold is 80 ms and the measurement straddles it: the
+        // derivation there ("one injection plus one settle wait, at least 2 × `RENDER_TICK_MS`")
+        // prices the settle rule at 30 ms, while the rule actually implemented waits `STILL_WINDOW`
+        // (40 ms) *and* two ticks. A gate that is green four runs out of five is worse than no gate;
+        // the shortfall is a finding for §23.3, recorded with these numbers rather than tuned away
+        // by shaving a design constant (AGENTS.md: performance work needs a reason, and the reason
+        // here is a design decision, not a test).
+        let meets_threshold = scroll_p95_ns <= SCROLL_RESPONSE_P95_NS;
+        println!(
+            "[P5.06] Scroll response p50 {:.1} ms / p95 {:.1} ms / max {:.1} ms over {} steps; \
+             §23.3's 80 ms P95 threshold is {} and `STILL_WINDOW` is {} ms",
+            scroll_p50_ns as f64 / 1e6,
+            scroll_p95_ns as f64 / 1e6,
+            scroll_max_ns as f64 / 1e6,
+            responses.len(),
+            if meets_threshold { "met" } else { "NOT met" },
+            crate::scroll::loop_control::STILL_WINDOW.as_millis(),
+        );
+
+        let report = DriverLatencyReport {
+            pid: std::process::id(),
+            cross_len: WIDTH,
+            extent: EXTENT,
+            steps: session.step(),
+            injects: inject_instants.len() as u32,
+            scroll_p50_ns,
+            scroll_p95_ns,
+            scroll_max_ns,
+            stop_ns,
+            threshold_ns: SCROLL_RESPONSE_P95_NS,
+            meets_threshold,
+            preview_dropped: preview.dropped(),
+        };
+        let line = report.json_line();
+        println!("[P5.06] {line}");
+        if let Some(path) = std::env::var_os("SNAPCLIP_PERF4_OUT") {
+            crate::scroll::perf_probe::append_json_line(Path::new(&path), &line);
+        }
+    }
 }
