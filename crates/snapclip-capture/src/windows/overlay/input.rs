@@ -15,7 +15,10 @@ use super::*;
 enum PanelPress {
     /// A live control: the action it names.
     Action(crate::scroll::panel::PanelAction),
-    /// On the panel, but on nothing that acts (padding, the strip, a greyed button).
+    /// The viewport box itself: a press here starts a drag (`P7.07`), which is not one of the four
+    /// button actions and moves the view rather than promising anything about the pixels.
+    Viewport,
+    /// On the panel, but on nothing that acts (padding, the strip outside the box, a greyed button).
     OnPanel,
     /// Not the panel: the press belongs to whatever is underneath.
     Outside,
@@ -31,6 +34,14 @@ impl OverlayController {
         // that a user who kept moving the mouse never saw them fade, which is the disappearance this
         // exists for. Walks and new answers are the triggers now, so "scrolling stopped" really does
         // mean the chain goes away.
+
+        // A drag of the viewport box owns the pointer until the button comes up (`P7.07`): moving the
+        // view is not a selection gesture, and letting the hover path run underneath would drag the
+        // capture selection around while the user is only moving the scroll view.
+        if self.viewport_grab.is_some() && self.drag_viewport_to(point) {
+            self.invalidate();
+            return;
+        }
 
         if self.session.state() == CaptureState::Annotating {
             // The pointer drives the annotation document, not the selection.
@@ -120,9 +131,14 @@ impl OverlayController {
                     self.invalidate();
                     return;
                 }
-                // On the panel but not on a live control (the padding, the strip, a greyed button):
-                // still not the canvas. Falling through would let a press beside a button start a
-                // selection drag underneath the panel.
+                // On the panel but not on a live control (the padding, the strip outside the box, a
+                // greyed button): still not the canvas. Falling through would let a press beside a
+                // button start a selection drag underneath the panel.
+                PanelPress::Viewport => {
+                    self.begin_viewport_drag(point);
+                    self.invalidate();
+                    return;
+                }
                 PanelPress::OnPanel => return,
                 PanelPress::Outside => {}
             }
@@ -159,27 +175,16 @@ impl OverlayController {
 
     /// The action a press at `point` (client pixels) performs on the scroll panel.
     ///
-    /// Three answers rather than two, because "the panel handled it" and "the panel ignored it" are
-    /// different: a press on the panel's padding is still a press on the panel.
+    /// Four answers, because "the panel handled it", "the box was grabbed" and "the panel ignored it"
+    /// are three different things: a press on the panel's padding is still a press on the panel, and a
+    /// press on the viewport box is neither a button nor nothing.
     fn scroll_panel_press(&self, point: Point) -> PanelPress {
         let Some(panel) = self.scroll_panel.as_ref() else {
             return PanelPress::Outside;
         };
-        let Some(geometry) = self.session.geometry() else {
+        let Some((layout, local)) = self.panel_local(point) else {
             return PanelPress::Outside;
         };
-        let (frame, layout) = crate::windows::win::d2d::scroll_panel_rect(
-            geometry.work_area,
-            geometry.frame,
-            geometry.dpi,
-        );
-        // The same scale the painter used, in the other direction (`panel::to_dip_point`): the
-        // panel's rectangles are a DIP layout, the pointer arrives in pixels.
-        let local = crate::scroll::panel::to_dip_point(
-            point,
-            Point::new(frame.left, frame.top),
-            geometry.dpi,
-        );
         match layout.hit_test(local) {
             crate::scroll::panel::PanelHit::Button(index) => {
                 match crate::scroll::panel::actions(&panel.answers())[index] {
@@ -188,14 +193,107 @@ impl OverlayController {
                     None => PanelPress::OnPanel,
                 }
             }
-            // The strip's viewport box is `P7.07`'s drag; the layout cannot answer it, because that
-            // rectangle depends on where the session has got to.
-            crate::scroll::panel::PanelHit::Strip => PanelPress::OnPanel,
+            // The strip's **viewport box** is the drag (`P7.07`); the layout can hand out the strip but
+            // not the box, because where the box sits depends on where the session has got to.
+            crate::scroll::panel::PanelHit::Strip => {
+                if panel.viewport_box(layout.strip).contains(local) {
+                    PanelPress::Viewport
+                } else {
+                    PanelPress::OnPanel
+                }
+            }
             crate::scroll::panel::PanelHit::Outside => PanelPress::Outside,
         }
     }
 
+    /// The panel's placement and the point in the layout's own DIP space (`P7.06`/`P7.07`).
+    ///
+    /// One conversion for the press, the drag and the hit test: the panel's rectangles are a DIP
+    /// layout, the pointer arrives in pixels, and `panel::to_dip_point` is the renderer's own scale
+    /// applied backwards.
+    fn panel_local(&self, point: Point) -> Option<(crate::scroll::panel::PanelLayout, Point)> {
+        let geometry = self.session.geometry()?;
+        let (frame, layout) = crate::windows::win::d2d::scroll_panel_rect(
+            geometry.work_area,
+            geometry.frame,
+            geometry.dpi,
+        );
+        let local = crate::scroll::panel::to_dip_point(
+            point,
+            Point::new(frame.left, frame.top),
+            geometry.dpi,
+        );
+        Some((layout, local))
+    }
+
+    /// Grab the viewport box: remember where, and stop following (`P7.07`).
+    ///
+    /// `set_follow(false)` is the promise §19.5 makes about a drag — touching the box is the user saying
+    /// "I am looking somewhere else", and a session that kept following would yank the view back to the
+    /// newest band on the very next step.
+    fn begin_viewport_drag(&mut self, point: Point) {
+        let Some((_, local)) = self.panel_local(point) else {
+            return;
+        };
+        let Some(panel) = self.scroll_panel.as_ref() else {
+            return;
+        };
+        let snapshot = panel.clone();
+        let band = panel.answers().capture_at;
+        // The panel as it is **now** travels with the drag: `band_for_drag` is a change relative to the
+        // position it is asked about, and the live panel only catches up when the driver publishes.
+        self.viewport_grab = Some((local.y, snapshot));
+        if let Some(runtime) = self.scroll_runtime.as_ref() {
+            runtime.controller().set_follow(false);
+        }
+        self.request_strip_window();
+        eprintln!(
+            "[snapclip][capture] viewport drag begin band={band} grab_y={}",
+            local.y
+        );
+    }
+
+    /// Move the view to wherever the pointer is. `false` when no drag is in flight.
+    fn drag_viewport_to(&mut self, point: Point) -> bool {
+        let Some((grab_y, snapshot)) = self.viewport_grab.as_ref() else {
+            return false;
+        };
+        let (grab_y, snapshot) = (*grab_y, snapshot.clone());
+        let Some((layout, local)) = self.panel_local(point) else {
+            return false;
+        };
+        let band = snapshot.band_for_drag(layout.strip, grab_y, local.y);
+        if let Some(runtime) = self.scroll_runtime.as_ref() {
+            runtime.controller().set_band(band);
+        }
+        self.request_strip_window();
+        true
+    }
+
+    /// Ask the driver to derive the window the strip is showing (`docs/32` ADR-20).
+    ///
+    /// The panel is the half that knows which part of the canvas it is a picture of, and the driver is
+    /// the half that owns the canvas — so the strip's pixels exist only if somebody asks.
+    fn request_strip_window(&mut self) {
+        let Some(panel) = self.scroll_panel.as_ref() else {
+            return;
+        };
+        let (first_row, rows) = panel.strip_window();
+        if let Some(runtime) = self.scroll_runtime.as_ref() {
+            runtime
+                .controller()
+                .request_window(crate::scroll::session::WindowRequest { first_row, rows });
+        }
+    }
+
     pub(super) fn on_left_up(&mut self) {
+        // The end of a viewport drag is the end of that gesture and nothing else: no selection was
+        // being made, so nothing has to be committed or discarded (`P7.07`).
+        if self.viewport_grab.take().is_some() {
+            eprintln!("[snapclip][capture] viewport drag end");
+            self.invalidate();
+            return;
+        }
         if self.session.state() == CaptureState::Annotating {
             self.annotation_point_up();
             return;

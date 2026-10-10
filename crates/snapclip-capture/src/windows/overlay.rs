@@ -541,6 +541,14 @@ struct OverlayController {
     /// Whether `F7` started this capture session — i.e. whether confirming it means "start
     /// scrolling" rather than "produce a screenshot" (`docs/32` §4.4, `OQ-27`).
     scroll_entry_armed: bool,
+    /// An in-flight drag of the scroll panel's viewport box (`docs/32` `P7.07`): where the box was
+    /// grabbed (DIP, in the panel's own space) and the panel **as it was at that moment**.
+    ///
+    /// The snapshot is what makes a drag a drag: `ScrollPanel::band_for_drag` is a change relative to
+    /// the position it is asked about, and the live panel's position only catches up when the driver
+    /// publishes the new band. Reading the live panel per mouse move would therefore measure every
+    /// step from a stale base and move the view less than the pointer did.
+    viewport_grab: Option<(i32, crate::scroll::panel::ScrollPanel)>,
 }
 
 impl OverlayController {
@@ -642,6 +650,7 @@ impl OverlayController {
             monitor_layout: None,
             scroll_runtime: None,
             scroll_entry_armed: false,
+            viewport_grab: None,
         }
     }
 

@@ -106,6 +106,13 @@ impl OverlayMessageHandler for OverlayController {
                 None
             }
             WM_MOUSEWHEEL => {
+                // A running scroll session owns the wheel: the session is already injecting notches
+                // into the target, and the level walk (`z_held` or plain wheel) belongs to the
+                // selection, which is long gone by then (`docs/32` `P7.07`). Consumed rather than
+                // passed on, so the message cannot reach the window underneath the overlay either.
+                if self.scroll_runtime.is_some() {
+                    return Some(0);
+                }
                 let delta = ((wparam >> 16) & 0xFFFF) as u16 as i16;
                 if self.z_held && self.session.state().is_active() {
                     let direction = if delta > 0 { 1 } else { -1 };

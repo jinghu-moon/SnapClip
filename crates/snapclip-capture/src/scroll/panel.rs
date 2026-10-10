@@ -543,6 +543,38 @@ impl ScrollPanel {
         }
     }
 
+    /// The canvas window the strip is a picture of, as `(first_row, rows)`.
+    ///
+    /// The consumer's half of `docs/32` ADR-20: the driver derives thumbnails only for what it is
+    /// asked, and the panel is what knows which part of the canvas it is showing.
+    pub(crate) fn strip_window(&self) -> (u64, u64) {
+        let visible = self.visible_rows();
+        (self.visible_origin(visible), visible)
+    }
+
+    /// The band a drag means, given where the box was grabbed and where the cursor is now (`P7.07`).
+    ///
+    /// A **delta**, not an absolute position, and that is a fact about the strip rather than a choice:
+    /// at `Double` the strip's window is centred on the viewport, so the window slides as the view moves
+    /// and "put the box under the pointer" has no fixed point in the strip's coordinates. A change of
+    /// `Δpx` therefore means `Δpx × last / travel` rows, clamped into the window. At `Fit` the window is
+    /// the whole canvas and does not move, so the same formula is exactly the absolute mapping a user
+    /// would draw by hand: the box follows the pointer one-for-one.
+    pub(crate) fn band_for_drag(&self, strip: Rect, grabbed_at: i32, cursor_y: i32) -> u64 {
+        let visible = self.visible_rows();
+        let origin = self.visible_origin(visible);
+        let height = viewport_box_height(visible, self.extent, strip.height());
+        let travel = (strip.height() - height).max(0);
+        let last = visible.saturating_sub(self.extent).max(1);
+        if travel == 0 {
+            // The box fills the strip: there is nowhere to drag it, and every position is the same one.
+            return self.band.max(origin);
+        }
+        let delta_rows = i64::from(cursor_y - grabbed_at) * last as i64 / i64::from(travel);
+        let band = (self.band as i64 + delta_rows).clamp(0, (origin + last) as i64);
+        band as u64
+    }
+
     /// Fold one update into the panel's state. Every kind but one is a state and replaces the last.
     pub(crate) fn on_update(&mut self, update: PreviewUpdate) {
         match update {
@@ -1264,6 +1296,118 @@ mod tests {
         assert_eq!(live[3], Some(PanelAction::Cancel));
     }
 
+    /// `P7.07`: the drag's mapping, and its inverse.
+    ///
+    /// The properties a drag needs are not "the numbers are these" but "the ends are the ends",
+    /// "dragging down never moves the view up", "dragging past an end parks it", and "mapping a
+    /// position twice changes nothing" — the last one is what keeps the box from creeping when the
+    /// user holds the button still.
+    #[test]
+    fn the_drag_maps_a_cursor_position_back_to_a_band() {
+        let strip = PanelLayout::new().strip;
+        let mut panel = ScrollPanel::new(320, 900);
+        panel.on_update(PreviewUpdate::Span {
+            primary_len: 5_000,
+            steps: 5,
+            discarded: 0,
+        });
+        panel.toggle_zoom();
+        panel.on_update(PreviewUpdate::Viewport {
+            band: 2_000,
+            status: Status::Confirmed { d: 0 },
+        });
+
+        let box_rect = panel.viewport_box(strip);
+        let travel = strip.height() - box_rect.height();
+        assert!(
+            travel > 0,
+            "the doubled box must have somewhere to travel: {box_rect:?}"
+        );
+
+        let visible = 5_000u64.div_ceil(2);
+        let origin = 2_000u64.saturating_sub(visible / 2).min(5_000 - visible);
+        let last = visible - 900;
+
+        // Holding still is not a move, whatever the level.
+        assert_eq!(
+            panel.band_for_drag(strip, box_rect.top, box_rect.top),
+            2_000,
+            "a press that does not move must not move the view"
+        );
+
+        // A full strip of travel is the whole window, in both directions.
+        assert_eq!(
+            panel.band_for_drag(strip, box_rect.top, box_rect.top + travel),
+            origin + last,
+            "the bottom of the travel is the last band of the window"
+        );
+        assert_eq!(
+            panel.band_for_drag(strip, box_rect.top, box_rect.top - travel),
+            2_000 - last,
+            "and the top of it is the same distance back"
+        );
+
+        // Past either end it parks rather than wraps.
+        assert_eq!(
+            panel.band_for_drag(strip, box_rect.top, box_rect.top + 10 * travel),
+            origin + last
+        );
+        assert_eq!(panel.band_for_drag(strip, box_rect.top, box_rect.top - 10 * travel), 0);
+
+        // Monotone, and a delta is a delta: the same pointer movement means the same row movement
+        // wherever the view is, which is what makes the drag feel the same at both ends.
+        let mut previous = 0;
+        for step in 0..=travel {
+            let band = panel.band_for_drag(strip, strip.top, strip.top + step);
+            assert!(band >= previous, "a downward drag moved the view up: {band} < {previous}");
+            previous = band;
+        }
+        // Park the view at the window's first band first: from there half a travel cannot reach the
+        // clamp, so what this measures is the ratio and not the parking.
+        panel.on_update(PreviewUpdate::Viewport {
+            band: origin,
+            status: Status::Confirmed { d: 0 },
+        });
+        let expected = (travel / 2) as i64 * last as i64 / travel as i64;
+        for grabbed_at in [strip.top, strip.top + travel / 3, strip.top + travel] {
+            let still = panel.band_for_drag(strip, grabbed_at, grabbed_at);
+            let moved = panel.band_for_drag(strip, grabbed_at, grabbed_at + travel / 2);
+            assert_eq!(
+                moved as i64 - still as i64,
+                expected,
+                "half a travel must be the same slice of the window, wherever the box was grabbed"
+            );
+        }
+    }
+
+    /// The strip's window follows the level, and it is what the consumer asks the driver to derive.
+    #[test]
+    fn the_strip_window_is_what_the_consumer_asks_for() {
+        let mut panel = ScrollPanel::new(320, 900);
+        panel.on_update(PreviewUpdate::Span {
+            primary_len: 5_000,
+            steps: 5,
+            discarded: 0,
+        });
+        assert_eq!(
+            panel.strip_window(),
+            (0, 5_000),
+            "fitted, the strip is a picture of the whole canvas"
+        );
+
+        panel.toggle_zoom();
+        panel.on_update(PreviewUpdate::Viewport {
+            band: 2_000,
+            status: Status::Confirmed { d: 0 },
+        });
+        let (first, rows) = panel.strip_window();
+        assert_eq!(rows, 2_500, "at 2× the window is half the canvas");
+        assert_eq!(
+            first, 750,
+            "and it is centred on the viewport, clamped so the window is always full"
+        );
+    }
+
     /// The renderer scales the layout up and the input path maps a click back down; this pins that
     /// the two are inverses at the DPIs this product runs at, including the sub-96 floor.
     #[test]
@@ -1295,3 +1439,4 @@ mod tests {
         }
     }
 }
+

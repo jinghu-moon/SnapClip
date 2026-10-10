@@ -727,6 +727,12 @@ pub(crate) struct ScrollDriver {
     /// decision inside a data structure, and the ceiling is a starting value that `E-PERF-4` is meant
     /// to calibrate.
     cadence: PreviewCadence,
+    /// The last status the panel was told about.
+    ///
+    /// Kept because a **jump** (`P7.07`) has to republish the viewport's position without inventing a
+    /// new status: `PreviewUpdate::Viewport` carries both, and telling the panel "the box moved, and
+    /// the last step is now unadopted" would paint a dashed box because the user dragged.
+    last_status: Status,
 }
 
 impl ScrollDriver {
@@ -745,6 +751,7 @@ impl ScrollDriver {
             last_qpc: 0,
             announced_rows: 0,
             cadence: PreviewCadence::new(PREVIEW_INTERVAL),
+            last_status: Status::None,
         }
     }
 
@@ -957,6 +964,16 @@ impl ScrollDriver {
             self.publish_step(preview, Status::None, tick);
         }
 
+        // The consumer dragged the box (`P7.07`). Applied before the window ask so the thumbnails
+        // derived below are derived for where the user has just parked the view.
+        if let Some(band) = controller.take_band() {
+            self.viewport.jump_to(self.session.canvas(), band);
+            // The status is carried over, not reset: a drag moves the view, and `Status::None` here
+            // would paint the last step as unadopted because the user touched the box.
+            let status = self.last_status;
+            self.publish_viewport(preview, status);
+        }
+
         // The consumer's window ask (`docs/32` ADR-20). Last, because it is the only command here
         // that walks canvas rows: `follow` and `undo` are bookkeeping, this one is work.
         self.refresh_requested_window(controller, preview);
@@ -1099,7 +1116,8 @@ impl ScrollDriver {
     }
 
     /// Tell the preview where the box is and what the last step did (§19.4's three appearances).
-    fn publish_viewport(&self, preview: &PreviewStream, status: Status) {
+    fn publish_viewport(&mut self, preview: &PreviewStream, status: Status) {
+        self.last_status = status;
         preview.publish(PreviewUpdate::Viewport {
             band: self.viewport.position().max(0) as u64,
             status,
@@ -2176,6 +2194,53 @@ mod tests {
         assert!(
             unasked.canvas().primary_len() > 0,
             "the control case must have a canvas, or the assertion above would be vacuous"
+        );
+    }
+
+    /// `P7.07`: a drag parks the view where the consumer asked, clamped into the canvas, and the panel
+    /// is told about it **without** being told that the last step changed.
+    ///
+    /// The clamp is the whole first half: `u64::MAX` is what a drag past the end of the strip computes
+    /// before anyone clamps it, and a viewport parked past the canvas would make the next step's
+    /// reference window read rows that do not exist.
+    #[test]
+    fn a_drag_parks_the_viewport_inside_the_canvas_and_publishes_it() {
+        use crate::scroll::preview::PreviewUpdate;
+
+        let image = page(3000, 11);
+        let (page, pending) = SimulatedPage::new(image, 900, 60, 3);
+        let plan = ScrollPlan::new(Axis::Vertical, 320, 900, MemoryBudget::with_total(8 << 20));
+        let controller = ScrollController::new();
+        let preview = PreviewStream::new();
+        controller.set_band(u64::MAX);
+
+        let session =
+            ScrollDriver::new(&plan).run(page, LinkedActuator::new(pending), &controller, &preview);
+        let max = session.canvas().max_position(900).max(0) as u64;
+        assert!(max > 0, "the fixture must have somewhere to park, or this proves nothing");
+
+        let mut viewport_updates = Vec::new();
+        while let Some(update) = preview.take() {
+            if let PreviewUpdate::Viewport { band, status } = update {
+                viewport_updates.push((band, status));
+            }
+        }
+        assert!(
+            !viewport_updates.is_empty(),
+            "the panel must be told where the box went"
+        );
+        assert!(
+            viewport_updates.iter().all(|(band, _)| *band <= max),
+            "the published band must be inside the canvas: {viewport_updates:?} max={max}"
+        );
+        assert!(
+            viewport_updates.iter().any(|(band, _)| *band == max),
+            "a drag past the end parks the view at the end: {viewport_updates:?}"
+        );
+        assert_ne!(
+            viewport_updates.last().expect("non-empty").1,
+            Status::None,
+            "a drag moves the view; it must not repaint the last step as unadopted"
         );
     }
 

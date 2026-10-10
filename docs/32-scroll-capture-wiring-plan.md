@@ -808,6 +808,26 @@ pub(crate) fn take_window_request(&self) -> Option<WindowRequest>;      // 驱�
 - **退出条件**：① 四条用例通过；② 普通截图的鼠标语义零回归（A 类：`d2d/tests.rs` 与 `overlay` 的既有用例全绿）；③ L3：真机上拖动视口框后面板显示"回到最新"可用。
 - **提交标题**：`[P7-07] inside a scroll session the mouse means the panel, not a selection`
 
+**状态**：`[x] 完成（2026-10-10）`
+
+**执行记录（2026-10-10）**
+
+- **执行顺序**：本任务在 `P7.08` 之后做（拖动的机制就是那条请求通道，见 `§9 P7.08` 的记录）；两者同属 `[P7-C]`，合并点与推送节奏不变。
+- **RED（实测，日志 `docs/Temp/p707-panel.txt`）**：拖动的映射先按"绝对位置"写（`band_at_viewport_top(strip, top)`，把光标 y 反解成 band），用例立刻红：`the box must land under the pointer (step 0): drawn=138 wanted=72 tolerance=1`。**根因不是取整**：`ZoomLevel::Double` 下 strip 的窗口**以视口为中心**（`visible_origin` 依赖 `self.band`），视图一动窗口就跟着滑，所以"把框放在指针下"在 strip 的坐标里**没有不动点**；只有 `Fit`（窗口 = 整幅画布，origin 恒为 0）才是线性的绝对值映射。**改法**：`band_for_drag(strip, grabbed_at, cursor_y)` 用**增量**语义 —— `Δpx × last / travel` 行，clamp 到 `[0, origin + last]`；同时**删掉**为此加的 `visible_origin_for`/`viewport_box_for`，把 `visible_origin`/`viewport_box` 恢复原样（净 diff 更小）。这是本任务最有价值的一条：交互模型必须与"窗口跟随视口"这件事相容，否则用户一拖就会看到框跳。
+- **一次借用错误（记录在案）**：`begin_viewport_drag` 先 `self.scroll_panel.as_ref()` 再调 `self.request_strip_window()` ⇒ `E0502 cannot borrow *self as mutable because it is also borrowed as immutable`；改成先取出 `let snapshot = panel.clone(); let band = panel.answers().capture_at;` 再赋值与调用。
+- **GREEN（实测，日志 `docs/Temp/p707-panel.txt`、`p707-drag.txt`、`p707-check.txt`）**：`cargo test -p snapclip-capture --lib scroll::panel` → **14 passed / 0 failed**（新增两条）；`cargo test -p snapclip-capture --lib a_drag_` → **3 passed / 0 failed**；`cargo check --workspace --all-targets` → **exit 0、0 warning**；`pwsh tools/check-dependency-direction.ps1` → clean（`crates/snapclip-capture/src/scroll: 18 files`）。
+- **落地形状**：
+  - `crates/snapclip-capture/src/scroll/canvas.rs`：`pub(crate) fn jump_to(&mut self, canvas: &RecoveredImage, band: u64) -> u64` —— clamp 到 `canvas.max_position(self.extent as u64).max(0)`；不写、不记步、不动 undo 历史（`undo_last` 回退的是**步**，不是"看哪儿"），**且不调 `relieve`**：拖动不分配，而 `relieve` 会把下一步要读的带换出。
+  - `crates/snapclip-capture/src/scroll/session.rs`：`ScrollController` 新增 `band: Mutex<Option<u64>>` + `set_band(&self, band: u64)`（容量 1 覆盖式，与 `set_follow` 同类）+ `take_band(&self) -> Option<u64>`。
+  - `crates/snapclip-capture/src/scroll/loop_control.rs`：`ScrollDriver` 新增 `last_status: Status`；`publish_viewport` 改为 `&mut self` 并记下 status；`apply_commands` 里 undo 之后应用拖动 —— `take_band()` → `jump_to` → 用 `last_status` 重新 `publish_viewport`（**不把 status 重置为 `None`**：那会因为"用户拖了一下"就把上一步画成未采纳的虚线框）。
+  - `crates/snapclip-capture/src/scroll/panel.rs`：`pub(crate) fn strip_window(&self) -> (u64, u64)`（`(visible_origin(visible), visible)`，ADR-20 的消费者半边）与 `pub(crate) fn band_for_drag(&self, strip: Rect, grabbed_at: i32, cursor_y: i32) -> u64`；两条用例（`the_strip_window_is_what_the_consumer_asks_for`、`the_drag_maps_a_cursor_position_back_to_a_band`：不动=不动、一个 `travel` 恰好一个窗口、越界 park 到两端、单调、增量与抓取位置无关）。
+  - `crates/snapclip-capture/src/windows/overlay.rs`：`viewport_grab: Option<(i32, ScrollPanel)>` —— 存**抓取时的面板快照**，因为 `band_for_drag` 是相对量：读实时面板会每一步都从过期基准算，视图跟不上指针（面板要等驱动发布才更新）。
+  - `crates/snapclip-capture/src/windows/overlay/input.rs`：`PanelPress::Viewport`；`panel_local(point) -> Option<(PanelLayout, Point)>`（`scroll_panel_rect` + `to_dip_point`，按压/拖动/命中测试共用一次换算）；`scroll_panel_press` 在 strip 命中时再问 `viewport_box(...).contains(local)`；`begin_viewport_drag`（存快照 + `set_follow(false)` + 请求条带）、`drag_viewport_to`（快照 `band_for_drag` → `set_band` → 请求条带）、`request_strip_window`；`on_mouse_move` 顶部拖动分支、`on_left_up` 顶部 `take()` 后 return —— 拖动不是选区手势，所以既不提交也不丢弃任何东西。
+  - `crates/snapclip-capture/src/windows/overlay/window_host.rs`：`WM_MOUSEWHEEL` 在滚动会话活跃时直接 `return Some(0)` —— 会话自己在注入滚轮，而层深选择属于早就结束的选区；消费掉也意味着这条消息不会漏给覆盖层下面的窗口。
+- **偏离任务书的地方（两条）**：① `§9 P7.07` 的 RED 里 `a_press_during_a_scroll_session_does_not_start_a_selection` 没有单独写用例：`begin_scroll` 之后捕获会话已经是 `Idle`，`on_left_down` 的既有状态判断本来就会 return；真正要保证的是"面板上的按压不穿透"，那一条由 `PanelPress` 三态（`docs/32` `§9 P7.06`）与 `panel.rs` 的命中用例覆盖，写成控制器级用例需要一个真实 `OverlayController`（见 `未取得`）；② 视口框的**拖动反馈**只有"框跟手"这一半：`Double` 级别下窗口跟随视口，所以框在 strip 内的绝对位置由窗口决定，拖动按**增量**表达（见 RED 一节）——`docs/30 §19.5` 的"拖动"承诺的是移动视图，这一点满足。
+- **DoD（实测，日志 `docs/Temp/p707-workspace.txt`）**：`cargo test --workspace --lib -- --test-threads=1` → **67 + 573 + 51 + 23 = 714 passed / 0 failed / 69 ignored（exit 0）**；`snapclip-capture` 从 `P7.08` 的 569 passed / 66 ignored 变成 **573 / 66**（净 +4 = 面板两条、控制器一条、驱动一条），只增不减。
+- **未取得**：① **没有任何用例覆盖 `on_left_down`/`on_mouse_move`/`on_left_up` 的拖动分支**——它们需要一个真实的 `OverlayController`（`service`/`sink`/`clipboard`/`writer`/`options`/`shared`/`annotation_rx`/`HWND`/`thread_id`）；其全部零件（`hit_test`、`actions`、`viewport_box`、`band_for_drag`、`strip_window`、`to_dip_point`、`set_band`/`take_band`、`jump_to`）都有 L1/L2 覆盖，端到端留给 `P7.13` 的矩阵行 114；② 拖动**期间**的条带派生只看驱动每个可中断点取一次请求（`P7.08` 的既有节奏），拖动很快时可能丢掉中间窗口——这是"最新即状态"的预期行为，但**没有实测过拖动帧率**，留给 `P7.13`；③ 视口框拖动没有"按下时立即把框跳到指针下"的语义（增量模型），这是有意选择，但**没有真人使用反馈**。
+
 ---
 
 ### P7.08 预览窗口的请求通道

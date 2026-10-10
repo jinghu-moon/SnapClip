@@ -462,6 +462,9 @@ pub(crate) struct ScrollController {
     /// sticky bit: the newest ask is the one that matters, and an older one is not a promise anybody
     /// is waiting on.
     window: Mutex<Option<WindowRequest>>,
+    /// Where the consumer dragged the viewport box to (`P7.07`). Same class as `window` and `follow`:
+    /// a value, overwritten by the newest drag position.
+    band: Mutex<Option<u64>>,
 }
 
 const STOP_NOTHING: u32 = 0;
@@ -477,6 +480,7 @@ impl ScrollController {
             shutdown: AtomicBool::new(false),
             cancel_at: Mutex::new(None),
             window: Mutex::new(None),
+            band: Mutex::new(None),
         }
     }
 
@@ -592,6 +596,23 @@ impl ScrollController {
     /// driver must not re-derive a window it has already derived.
     pub(crate) fn take_window_request(&self) -> Option<WindowRequest> {
         self.window
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    /// Ask the driver to park the viewport at `band` (`docs/32` `P7.07`).
+    ///
+    /// A drag emits one of these per mouse move, so it is a **value** in a one-slot box like
+    /// `set_follow`: the newest position is the only one the user can still be pointing at.
+    pub(crate) fn set_band(&self, band: u64) {
+        let mut slot = self.band.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = Some(band);
+    }
+
+    /// Take the pending viewport position, if any. Reading is taking, like the other values.
+    pub(crate) fn take_band(&self) -> Option<u64> {
+        self.band
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
@@ -1122,6 +1143,25 @@ mod tests {
                 rows: 0
             })
         );
+    }
+
+    /// `P7.07`: the drag's view position is a value in a one-slot box, like `follow`.
+    ///
+    /// A mouse move emits one per pointer sample, and only the newest can still be where the user is
+    /// pointing — a queue would make the view trail the pointer by however long the queue is.
+    #[test]
+    fn a_drag_position_keeps_only_the_latest_and_is_taken_once() {
+        let controller = ScrollController::new();
+        assert_eq!(controller.take_band(), None, "nothing has been dragged yet");
+
+        controller.set_band(500);
+        controller.set_band(1_500);
+        assert_eq!(
+            controller.take_band(),
+            Some(1_500),
+            "the newest drag position is the one the user is still pointing at"
+        );
+        assert_eq!(controller.take_band(), None, "reading is taking");
     }
 
     /// Exit condition ② of `P3.08`, mechanically: the command side is **sticky bits**, not queue

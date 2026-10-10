@@ -1724,6 +1724,21 @@ impl ViewportState {
         self.extent
     }
 
+    /// Park the viewport at `band`, clamped into the canvas, without writing anything (`P7.07`).
+    ///
+    /// A drag moves the **view**, not the content: nothing is stored, no step is counted, and the undo
+    /// history is untouched — `undo_last` rewinds the last *step*, and a jump is not one. Everything
+    /// that reads the position afterwards (the reference window, the coverage the box is drawn from)
+    /// assumes the viewport lies inside the canvas, so the answer is clamped to [`RecoveredImage::max_position`].
+    ///
+    /// The relief the step path runs is deliberately absent: a jump allocates nothing, and calling
+    /// `relieve` here would let a drag evict bands the next step is about to read.
+    pub(crate) fn jump_to(&mut self, canvas: &RecoveredImage, band: u64) -> u64 {
+        let max = canvas.max_position(self.extent as u64).max(0) as u64;
+        self.position = band.min(max) as i64;
+        self.position as u64
+    }
+
     /// Applies one confirmed step: decides prepend / append / contained, writes through the canvas
     /// and advances the viewport. Returns what the step did.
     ///
