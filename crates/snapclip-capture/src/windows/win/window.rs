@@ -696,6 +696,23 @@ mod tests {
         assert!(bounds.bottom <= raw.bottom + TOLERANCE, "frame={bounds:?} raw={raw:?}");
         assert!(bounds.width() >= raw.width() / 2);
         assert!(bounds.height() >= raw.height() / 2);
+
+        // `P7.03`: "neither the client rectangle nor the window rectangle" is the property a
+        // scroll plan depends on, so it is asserted rather than tolerated. The tolerance above
+        // only has to hold for the *containment* claim; these two say the three rectangles are
+        // genuinely different, which is what makes the choice of DWM load-bearing
+        // (docs/32 §4.3, docs/31 P3.10 run 4: Chrome measured 1188×894 against 1200×900 raw
+        // and 1184×892 client).
+        assert!(
+            raw.width() > bounds.width() && raw.height() > bounds.height(),
+            "the invisible resize border must make the raw rectangle strictly larger: \
+             frame={bounds:?} raw={raw:?}"
+        );
+        assert!(
+            bounds.height() > client.height(),
+            "the frame must include the caption row that the client area excludes: \
+             frame={bounds:?} client={client:?}"
+        );
     }
 
     #[test]
@@ -839,5 +856,33 @@ mod tests {
         }
         let _ = unsafe { DestroyWindow(child) };
         pump(20);
+    }
+
+    /// `P7.03`: the visible frame has exactly **one** reader in this crate.
+    ///
+    /// The defect this pins was real: `windows/scroll_probe.rs` carried its own
+    /// `DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)` helper next to the production
+    /// [`frame_bounds`], and its sibling `window_geometry` documented the *window* rectangle as
+    /// "what a window-level WGC capture delivers" — contradicting both `frame_bounds` and the
+    /// measurement. Two implementations of one rectangle are two places to get it wrong, and
+    /// only a source gate can see them: no behavioural test can observe "this code exists".
+    ///
+    /// The precedent is `windows/scroll_source.rs`'s `this_module_never_becomes_a_context_user`,
+    /// which gates the same way for the immediate context.
+    #[test]
+    fn the_visible_frame_has_exactly_one_reader() {
+        const PROBE: &str = include_str!("../scroll_probe.rs");
+        for needle in [
+            "DwmGetWindowAttribute",
+            "DWMWA_EXTENDED_FRAME_BOUNDS",
+            "fn visible_geometry",
+        ] {
+            assert!(
+                !PROBE.contains(needle),
+                "scroll_probe.rs must ask `window::frame_bounds` for the visible frame instead \
+                 of reading DWM itself ({needle}); two readers of one rectangle are two chances \
+                 to build a plan from the wrong one (docs/32 §4.3)"
+            );
+        }
     }
 }

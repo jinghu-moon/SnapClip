@@ -323,6 +323,16 @@ pub fn choose_target(selection: Rect, candidates: &[WindowCandidate], min_extent
 
 **约束**：`windows` crate 的 `Win32_Graphics_Dwm` feature 已启用（`crates/snapclip-capture/Cargo.toml:35`）；探针里那份**保留**（它是 L3 证据的来源），新生产函数与它互不引用，落一条 L1 断言"两者对同一矩形给出同一对数字"。
 
+> **执行时更正（`P7.03`，2026-10-10）**：上面两段的前提**不成立**。生产里早就有了这个读取器——
+> `crates/snapclip-capture/src/windows/win/window.rs:175` 的 `pub fn frame_bounds(hwnd: isize) -> Option<Rect>`
+> （`DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)`，失败或空矩形再退 `GetWindowRect`），它的 doc
+> （`:165-174`）已经写明"含标题栏、排除 `GetWindowRect` 多出的不可见调整边框（每边约 7-8 px）"。
+> 真正的缺陷是**探针里的第二份实现**（`windows/scroll_probe.rs` 的 `fn visible_geometry`，以及一个 doc
+> 写反了的 `fn window_geometry`），所以本任务的形状是**删掉第二个读取者**，而不是"提升一份新的"。
+> 第二段里"两份都保留、用一条断言证明它们一致"也**被否决**：那是在保护重复，正确做法是只留一份并由
+> 源码门禁钉死（`windows/win/window.rs::the_visible_frame_has_exactly_one_reader`）。
+> 见 §9 `P7.03` 的执行记录。
+
 ### 4.4 缝 4：交接（`begin_scroll` 的调用者）
 
 **今天的形状**：`session.rs:365` 零生产调用者。`ScrollHandoff` 携带 `{ frame: CapturedFrame, selection: Rect, dpi: u32 }`（`:62`）。
@@ -667,6 +677,20 @@ pub(crate) fn take_window_request(&self) -> Option<WindowRequest>;      // 驱�
 - **REFACTOR**：给该函数加 doc，逐字写清三种矩形的实测数字与"用错会让驱动在第一帧撞 `canvas.rs` 的不变量"。
 - **退出条件**：① 两条用例通过；② 探针的 L3 复跑仍全绿（`capture_probe`）；③ 生产代码里 `GetClientRect`/`GetWindowRect` 不再被用于构造 plan（grep 证据）。
 - **提交标题**：`[P7-03] the only rectangle that matches capture is the one DWM reports`
+
+**状态**：`[x] 完成（2026-10-10）`
+
+**执行记录（2026-10-10）**
+
+- **★ 任务书的前提被侦察推翻（本任务最有价值的一条，已回填 §4.3）**：`§4.3` 写的是"把探针私有的 `visible_geometry` 提升为生产 API"，但生产里**早就有了**这个读取器——`crates/snapclip-capture/src/windows/win/window.rs:175` 的 `pub fn frame_bounds(hwnd: isize) -> Option<Rect>`（先 DWM `DWMWA_EXTENDED_FRAME_BOUNDS`，失败或空矩形再退 `GetWindowRect`），doc（`:165-174`）已经写明"含标题栏、排除 `GetWindowRect` 多出的不可见调整边框（每边约 7-8 px）"，`:22-24` 也已经 import 了 `DwmGetWindowAttribute`。真正的缺陷是**探针里的第二份实现**：`crates/snapclip-capture/src/windows/scroll_probe.rs:4304` 的 `fn visible_geometry`（自己调 DWM）配一个 `:4331` 的 `fn window_geometry`（`GetWindowRect`），而**后者的 doc 把话说反了**——它声称"窗口矩形 1188×894 …这才是窗口级 WGC 交付的框"，与同文件的 `visible_geometry` doc、与生产 doc、与 `docs/31` `P3.10` 的实测（raw 1200×900 / client 1184×892 / 帧 1188×894）三处矛盾。所以本任务的形状是**删掉第二个读取者**，不是提升一份新的。
+- **RED（实测，日志 `docs/Temp/p703-red.txt`，exit=101）**：新增的源码门禁用例 `the_visible_frame_has_exactly_one_reader`（在 `crates/snapclip-capture/src/windows/win/window.rs` 的测试模块里，用 `const PROBE: &str = include_str!("../scroll_probe.rs");` 读探针源码，断言它不含 `DwmGetWindowAttribute`/`DWMWA_EXTENDED_FRAME_BOUNDS`/`fn visible_geometry`）**在删重复之前必然红**，实测 panic 信息逐字：`scroll_probe.rs must ask \`window::frame_bounds\` for the visible frame instead of reading DWM itself (DwmGetWindowAttribute)`。门禁形态沿用 `crates/snapclip-capture/src/windows/scroll_source.rs:1218-1242` 的 `this_module_never_becomes_a_context_user`（同一台账、同一种"只有源码门禁能看见第二份实现"的理由）。
+- **L3（实测，日志 `docs/Temp/p703-l3.txt`，exit=0）**：既有用例 `frame_bounds_include_the_title_bar_and_exclude_the_invisible_border` 被**加固**两条严格断言（`raw.width() > bounds.width() && raw.height() > bounds.height()`、`bounds.height() > client.height()`），它在 `WS_OVERLAPPEDWINDOW` 装置上**第一次就通过** ⇒ 我要如实标注：**这是守卫，不是 RED**（这台机器上 DWM 帧确实严格小于原始窗口矩形、且严格高于客户区）。这正是任务书第二条 RED 想要的性质，只是它今天已经成立。
+- **GREEN（实测，日志 `docs/Temp/p703-check.txt`、`docs/Temp/p703-green.txt`）**：`cargo check --workspace --all-targets` → **exit 0**（唯一警告仍是既有的 `content_label`，**没有**新增"未使用的 import"告警）；`the_visible_frame_has_exactly_one_reader` → **1 passed**；依赖门禁 clean。
+- **L3 复跑（实测，日志 `docs/Temp/p703-latency.txt`，exit=0）**：`cargo test -p snapclip-capture --lib cancel_latency_probe -- --ignored --nocapture --test-threads=1` → 1 passed，且**日志里那行 frame 尺寸现在来自生产 `frame_bounds`**，逐字：`[latency] target 0x50f0cc6 class Chrome_WidgetWin_1 frame 1188x894 client (68,40)-(1252,932); choice SendInput + PlaceCursor (foreground = true)` ⇒ **1188×894 与 `P3.10` 用探针自己那份 DWM 读到的数字一致**（client 宽 1252-68 = 1184 也与记录一致），即"删掉第二份实现"没有改变任何可见数字。同一轮 `Cancel latency` 复测：`max = 47 ms, p50 = 41 ms`（阈值 max ≤ 500 ms 验收、p50 ≤ 60 ms 目标；`P3.10` 当时记的是 max 44 ms，本轮 47 ms 属机器噪声，都在阈值内）。
+- **落地形状**：`crates/snapclip-capture/src/windows/scroll_probe.rs` 删除 `fn visible_geometry` 与 `fn window_geometry`（原地留一段注释，指名生产 `frame_bounds` 与门禁用例的名字）、调用点改成 `crate::windows::win::window::frame_bounds(target)` 并取 `.width()/.height()`、`fn client_geometry` 的 doc 改指生产函数、那条 `eprintln!` 去掉原始窗口尺寸、import 去掉 `GetWindowRect`；**生产 `frame_bounds` 一字未改**（它本来就是对的），只在 `win/window.rs` 的测试模块新增源码门禁与两条严格断言。
+- **偏离任务书的地方（两条）**：① 任务书第二条 RED `a_frame_rect_that_is_neither_the_client_nor_the_window_rect()` 以**加固既有 L3 用例**的形式落地，而不是新写一个用例——同一组断言写在既有装置里少一次窗口创建，且它本来就在测同一件事；② 任务书"探针里那份保留、两者互不引用、落一条 L1 断言两者对同一矩形给出同一对数字"**被否决**：保留两份实现再断言它们一致，是在给重复发许可证；正确做法是只留一份，并用源码门禁钉死（理由写进 §4.3 的更正段）。
+- **DoD（实测，日志 `docs/Temp/p703-workspace.txt`）**：`cargo test --workspace --lib -- --test-threads=1` → **67 + 548 + 51 + 23 = 689 passed / 0 failed / 69 ignored（exit 0）**；`snapclip-capture` 从 `P7.02` 的 547 passed / 66 ignored 变成 **548 / 66**（净 +1 = 源码门禁），只增不减。
+- **未取得**：任务书退出条件 ③ 的"生产代码里 `GetClientRect`/`GetWindowRect` 不再被用于构造 plan（grep 证据）"今天**是空证据**——生产里还没有任何代码构造 plan（`P7.04` 才建第一个）。如实记录：这条要在 `P7.04` 落地时重查一遍，现在不能算已取得。
 
 ---
 

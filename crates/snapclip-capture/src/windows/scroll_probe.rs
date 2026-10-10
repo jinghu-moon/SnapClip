@@ -103,7 +103,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CWP_SKIPINVISIBLE, ChildWindowFromPointEx, CreateWindowExW, DefWindowProcW, DestroyWindow,
     DispatchMessageW, ES_AUTOVSCROLL, ES_MULTILINE, EnumWindows, GetClassNameW, GetClientRect,
-    GetCursorPos, GetForegroundWindow, GetWindowDisplayAffinity, GetWindowRect, GetWindowTextW,
+    GetCursorPos, GetForegroundWindow, GetWindowDisplayAffinity, GetWindowTextW,
     GetWindowThreadProcessId, HWND_TOP,
     HWND_TOPMOST,
     IsIconic, IsWindowVisible, MSG,
@@ -4293,62 +4293,19 @@ fn wda_probe() {
 // P3.10 / Cancel latency: the real-desktop Max
 // ---------------------------------------------------------------------------
 
-/// The bounds DWM considers visible — **the size a window-level WGC capture delivers**.
-///
-/// Not `GetWindowRect` and not `GetClientRect`. Measured on Chrome here: the window rectangle is
-/// 1200 × 900, the client area 1184 × 892, and the frames that arrive are 1188 × 894. The
-/// difference is the invisible resize border, which DWM excludes from
-/// `DWMWA_EXTENDED_FRAME_BOUNDS` and `GraphicsCaptureItem` also excludes. A session whose canvas
-/// is built from either of the other two rectangles panics its driver on the first frame
-/// (`canvas.rs:1154`, invariant 1), so this is the only rectangle a plan may be built from.
-fn visible_geometry(hwnd: HWND) -> Option<(u32, u32)> {
-    use ::windows::Win32::Foundation::{HWND as WinHwnd, RECT as WinRect};
-    use ::windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
-
-    let mut rect = WinRect::default();
-    unsafe {
-        DwmGetWindowAttribute(
-            WinHwnd(hwnd as *mut core::ffi::c_void),
-            DWMWA_EXTENDED_FRAME_BOUNDS,
-            std::ptr::addr_of_mut!(rect).cast(),
-            std::mem::size_of::<WinRect>() as u32,
-        )
-    }
-    .ok()?;
-    Some((
-        (rect.right - rect.left).max(0) as u32,
-        (rect.bottom - rect.top).max(0) as u32,
-    ))
-}
-
-/// The **window** rectangle in screen coordinates, in physical pixels.
-///
-/// This, not the client rectangle, is what a window-level WGC capture delivers: the session's
-/// `cross_len` and `extent` have to describe the frame that will arrive, and the canvas asserts
-/// that the first frame's cross axis is the one it was built for (`canvas.rs:1154`, invariant 1).
-/// Measured on Chrome here: the window is 1188 × 894 while its client area is 1184 × 892, and a
-/// plan built from the client rectangle panics the driver on the first frame.
-fn window_geometry(hwnd: HWND) -> (u32, u32) {
-    let mut rect = RECT {
-        left: 0,
-        top: 0,
-        right: 0,
-        bottom: 0,
-    };
-    if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
-        return (0, 0);
-    }
-    (
-        (rect.right - rect.left).max(0) as u32,
-        (rect.bottom - rect.top).max(0) as u32,
-    )
-}
+// The visible rectangle is read exactly once, in production:
+// `crate::windows::win::window::frame_bounds` (`P7.03`). This file used to carry its own DWM read
+// here plus a sibling `GetWindowRect` helper whose doc claimed the *window* rectangle was what a
+// window-level WGC capture delivers — contradicting both the production reader and the measurement
+// (Chrome: raw 1200 × 900, client 1184 × 892, delivered frame 1188 × 894). Two readers of one
+// rectangle are two chances to build a plan from the wrong one, and
+// `windows/win/window.rs::the_visible_frame_has_exactly_one_reader` now forbids the second.
 
 /// The client area's screen origin and size, in physical pixels.
 ///
 /// The actuator's `screen` is where the cursor must be for `SendInput` to route the wheel to the
 /// target under `MOUSE_POS` routing, and a cursor is placed over the *client* area — the frame's
-/// own dimensions come from [`window_geometry`].
+/// own dimensions come from `crate::windows::win::window::frame_bounds` (`P7.03`).
 fn client_geometry(hwnd: HWND) -> (Point, (u32, u32)) {
     let mut rect = RECT {
         left: 0,
@@ -4559,11 +4516,15 @@ impl LatencyArena {
 
         let target = launched.window as isize;
         let (origin, size) = client_geometry(launched.window);
-        let (frame_width, frame_height) = visible_geometry(launched.window).expect(
+        // The visible frame has exactly one reader in this crate (`P7.03`): production's
+        // `frame_bounds`. It is the rectangle a window-level WGC capture delivers, so it is the
+        // only one a plan may be built from (`canvas.rs:1154`, invariant 1).
+        let frame = crate::windows::win::window::frame_bounds(target).expect(
             "DWM must report the window's visible bounds: they are the size a window-level WGC \
              capture delivers, and the session's canvas is built from them (canvas.rs:1154)",
         );
-        let (window_width, window_height) = window_geometry(launched.window);
+        let frame_width = frame.width().max(0) as u32;
+        let frame_height = frame.height().max(0) as u32;
         let screen = Point::new(origin.x + size.0 as i32 / 2, origin.y + size.1 as i32 / 2);
 
         // A self-launched target has the same integrity level as its launcher, so the two fields the
@@ -4579,8 +4540,7 @@ impl LatencyArena {
         let choice = scroll_actuator::choose(&probe);
         eprintln!(
             "[latency] target 0x{target:x} class {} frame {frame_width}x{frame_height} \
-             window {window_width}x{window_height} client ({},{})-({},{}); choice {:?} + {:?} \
-             (foreground = {})",
+             client ({},{})-({},{}); choice {:?} + {:?} (foreground = {})",
             launched.class,
             origin.x,
             origin.y,
