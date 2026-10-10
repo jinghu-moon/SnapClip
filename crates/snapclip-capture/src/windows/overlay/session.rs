@@ -226,14 +226,18 @@ impl OverlayController {
         // The region hole (`P7.07c`): from here until the session ends, the overlay covers **only** the
         // panel. That is what keeps the target un-occluded — and therefore painting, which is the only
         // way the driver ever sees the rows it is scrolling (`set_window_region`).
-        if let Some(geometry) = self.session.geometry() {
-            let (panel, _) = crate::windows::win::d2d::scroll_panel_rect(
-                geometry.work_area,
-                geometry.frame,
-                geometry.dpi,
-            );
-            self.set_window_region(Some(panel));
-        }
+        //
+        // The rectangle comes from the monitor layout saved when the frame was prepared, **not** from
+        // `session.geometry()`: the hand-over has already reset the capture session, so that call
+        // answered `None` and the first region-hole build silently did nothing — the tell was a run
+        // whose numbers were byte-identical to the round before it.
+        let (panel, _) =
+            crate::windows::win::d2d::scroll_panel_rect(layout.work_area, layout.bounds, layout.dpi);
+        eprintln!(
+            "[snapclip][capture] scroll window region=panel ({},{})-({},{})",
+            panel.left, panel.top, panel.right, panel.bottom
+        );
+        self.set_window_region(Some(panel));
         eprintln!(
             "[snapclip][capture] scroll session started window=0x{window:x} cross={cross_len} \
              extent={extent} capture_dpi={}",
@@ -290,6 +294,7 @@ impl OverlayController {
         // The whole window comes back before anything else: leaving the hole in place would hide the
         // panel behind the desktop and let the user's clicks fall through what looks like our UI
         // (`P7.07c`).
+        eprintln!("[snapclip][capture] scroll window region=full");
         self.set_window_region(None);
         runtime.controller().cancel();
         let Some(session) = runtime.teardown() else {

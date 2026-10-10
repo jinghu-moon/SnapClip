@@ -520,7 +520,15 @@ impl OverlayController {
                 Some(rect) => CreateRectRgn(rect.left, rect.top, rect.right, rect.bottom),
                 None => null_mut(),
             };
-            SetWindowRgn(self.window, region, 1);
+            // A refused region is silence otherwise, and silence is exactly what made the first
+            // region-hole build look like "the hole did not help" (`P7.07c`).
+            if SetWindowRgn(self.window, region, 1) == 0 {
+                eprintln!(
+                    "[snapclip][capture] SetWindowRgn failed: the overlay still covers the target \
+                     (last error {})",
+                    GetLastError()
+                );
+            }
         }
     }
 }
