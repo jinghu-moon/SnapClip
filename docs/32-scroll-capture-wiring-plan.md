@@ -337,18 +337,33 @@ pub fn choose_target(selection: Rect, candidates: &[WindowCandidate], min_extent
 
 **今天的形状**：`session.rs:365` 零生产调用者。`ScrollHandoff` 携带 `{ frame: CapturedFrame, selection: Rect, dpi: u32 }`（`:62`）。
 
-**接线形状**（ADR-19 的落地）：`ScrollHandoff` 的载荷改为**几何与身份**，不再携带 GPU 帧：
+**接线形状**（ADR-19 的落地；下面是**落地后的**形状，与首版草图的差异见本节末的更正）：`ScrollHandoff` 只带**几何与身份**，不再携带 GPU 帧：
 
 ```rust
-// crates/snapclip-capture/src/session.rs（目标形状）
-pub struct ScrollHandoff { target: ScrollTarget, crop: Rect, dpi: u32 }
-// 仍由 CaptureSession::begin_scroll() 产出：它结束普通截图会话（frame.take()），
-// 并把"用户选在哪儿、那一刻的 DPI"交给滚动会话；原点像素由驱动的第一帧提供。
+// crates/snapclip-capture/src/session.rs（已落地，P7.04）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrollHandoff { target: ScrollTarget, dpi: u32 }
+impl ScrollHandoff { pub fn target(&self) -> ScrollTarget; pub fn dpi(&self) -> u32 }
+
+pub fn begin_scroll(&mut self, window: u64, window_bounds: Rect)
+    -> Result<ScrollHandoff, CaptureError>
+// 窗口身份与可见边界由调用者给（只有平台侧能解析），crop 由会话自己算
+// （选区 ∩ 窗口；空则 InvalidState 且不消耗选区）；frame.take() 是「释放」，不是「移交」。
 ```
 
-调用点：`crates/snapclip-capture/src/windows/overlay/session.rs` 里新增 `fn begin_scroll_session(&mut self)`（**与 `confirm` 并列**，不走 `confirm`——后者会构造 `ExportJob`），流程 = `session.begin_scroll()` → `ScrollPlan` 构造 → `ScrollRuntime::start(...)` → `watch_scroll_preview(...)`。
+调用点：`crates/snapclip-capture/src/windows/overlay/session.rs` 里新增 `fn begin_scroll_session(&mut self)`（**与 `confirm` 并列**，不走 `confirm`——后者会构造 `ExportJob`），流程 = 目标解析（`P7.02`）→ `session.begin_scroll(...)` → `ScrollPlan` 构造 → `ScrollRuntime::start(...)` → `watch_scroll_preview(...)`。**这个函数在 `P7.05` 落地**，理由见本节末的更正。
 
 **为什么改类型而不是留 `frame`**：`AGENTS.md` 禁止死代码。窗口级 WGC 的**第一帧就是原点**（同一窗口、同一遮挡语义），而冻结帧是**显示器**的（含遮挡）⇒ 用它当原点会在"窗口被遮挡"时留下一道接缝。改类型比留一个永远不读的字段诚实（V2 是 pre-release，`AGENTS.md` 明确不考虑向后兼容）。
+
+> **执行时更正（`P7.04`，2026-10-10）**：三处偏离首版草图，都是执行时被迫想清楚的：
+> ① **载荷是 `{ target, dpi }`，不是 `{ target, crop, dpi }`**——`crop` 已经在 `ScrollTarget` 里，
+> 再拷一份就是一个矩形两个来源，正是 `P7.02`/`P7.03` 连着踩到的缺陷类；
+> ② **`begin_scroll` 收 `(window, window_bounds)` 而不是一个算好的 `ScrollTarget`**：会话拥有选区，
+> 就拥有"选区 ∩ 窗口"这个裁剪，调用者只提供它**唯一知道**的两件事（身份与边界）；
+> ③ **overlay 侧的 `begin_scroll_session` 推迟到 `P7.05`**：在 `P7.04` 里它没有任何生产调用者，
+> 只能带一个 `#[allow(dead_code)]` 存根，而 §1.4 列的正是"看起来接好了"这一类错觉——
+> 与目标解析、`ScrollPlan`、`ScrollRuntime::start`、`watch_scroll_preview` 一起落地才是完整的一步。
+> 见 §9 `P7.04` 的执行记录。
 
 ### 4.5 缝 5：驱动装配
 
@@ -703,6 +718,18 @@ pub(crate) fn take_window_request(&self) -> Option<WindowRequest>;      // 驱�
 - **REFACTOR**：把"为什么不再携带 GPU 帧"写成 `ScrollHandoff` 的 doc（引用 ADR-19），并删掉 `session.rs` 里因此变成死代码的访问器。
 - **退出条件**：① 三条用例通过；② `cargo check --workspace --all-targets` 干净（旧签名没有残留调用者）；③ `docs/31 §0.3` 的四个 crate 测试数**只增不减**（基线门禁）。
 - **提交标题**：`[P7-04] the capture session ends where the scroll session begins`
+
+**状态**：`[x] 完成（2026-10-10）`
+
+**执行记录（2026-10-10）**
+
+- **RED（实测，日志 `docs/Temp/p704-red.txt`，exit=101）**：`cmd /c "cargo test -p snapclip-capture --lib session::tests -- --test-threads=1"` → 编译失败，逐条：`E0425 cannot find type ScrollHandoff in this scope`（测试模块的 `use super::{…}` 里没有它）、`E0061 this method takes 0 arguments but 2 arguments were supplied`（`begin_scroll(0x1234, window)`）、`E0599 no method named target found for struct ScrollHandoff`（×3）。**失败原因：编译失败（旧签名 + 缺失访问器）**，与任务书预期一致。
+- **GREEN（实测，日志 `docs/Temp/p704-green.txt`、`p704-check.txt`）**：`cargo test -p snapclip-capture --lib session::tests -- --test-threads=1` → **38 passed / 0 failed**；`cargo check --workspace --all-targets` → **exit 0**（唯一警告仍是既有的 `content_label`）；依赖门禁 clean（`crates/snapclip-capture/src/scroll: 18 files`）。全仓 `begin_scroll`/`ScrollHandoff` 的引用只有 `crates/snapclip-capture/src/session.rs` 一处（grep 19 处全在该文件）⇒ 改签名没有第二个调用者要跟着改。
+- **落地形状**（`crates/snapclip-capture/src/session.rs`）：`:67` `#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub struct ScrollHandoff { target: ScrollTarget, dpi: u32 }` + `:72` 起的 `target()`/`dpi()`；`:369` `pub fn begin_scroll(&mut self, window: u64, window_bounds: Rect) -> Result<ScrollHandoff, CaptureError>` —— 校验 `Selected | Annotating` → `selection = self.selection.intersect(self.bounds())` 非空 → `let crop = selection.intersect(window_bounds)`，`crop.is_empty()` 则 `CaptureError::InvalidState("the selection does not overlap the window")`（**拒绝时不消耗选区**）→ `self.frame.take()`（**释放**，不是移交）→ `self.reset()` → 返回 `ScrollHandoff { target: ScrollTarget::new(window, window_bounds, crop), dpi }`；文件头新增 `use crate::scroll::target::ScrollTarget;`。
+- **测试**：改写两条（`the_capture_session_ends_before_the_scroll_session_starts` 换成新调用形状并断言 `target().window()/bounds()/crop()` 与 `frame().is_none()`；`a_scroll_session_needs_a_committed_selection` 换成带窗口参数的三段），新增三条（`a_scroll_handoff_carries_geometry_and_identity_only` 用 `size_of::<ScrollHandoff>() <= 64` 防止有人把帧加回来、`the_crop_is_clipped_to_the_window`、`a_selection_outside_the_window_is_invalid_state` 断言拒绝之后会话仍是 `Selected` 且选区不变）。
+- **对任务书的三处偏离（已回填 §4.4）**：① 载荷落地为 **`{ target, dpi }`** 而不是 `{ target, crop, dpi }`——`crop` 已在 `ScrollTarget` 内，再拷一份就是一个矩形两个来源；② `begin_scroll` **接收** `(window, window_bounds)` 并由会话自己算 crop，而不是接收一个算好的 `ScrollTarget`（会话拥有选区就拥有裁剪；调用者只提供它唯一知道的两件事）；③ overlay 侧的 `fn begin_scroll_session(&mut self)` **推迟到 `P7.05`**——在 `P7.04` 里它没有任何生产调用者，只能带一个 `#[allow(dead_code)]` 存根，而 `§1.4` 列的正是"看起来接好了"这一类错觉。
+- **DoD（实测，日志 `docs/Temp/p704-workspace.txt`）**：`cargo test --workspace --lib -- --test-threads=1` → **67 + 551 + 51 + 23 = 692 passed / 0 failed / 69 ignored（exit 0）**；`snapclip-capture` 从 `P7.03` 的 548 passed / 66 ignored 变成 **551 / 66**（净 +3 = 三条新增用例；另两条是改写），只增不减。
+- **未取得**：① `P7.04` 落地后 `begin_scroll` 仍然**没有生产调用者**（`P7.05` 的 `begin_scroll_session` 才是第一个），这一点与任务书 P7.04 的意图一致：它欠的是"载荷与契约"，"第一个调用者"由 `P7.05` 一次给全（见偏离 ③）；② 冻结帧被 `take()` 之后**没有断言它被真正释放**（`frame()` 为 `None` 是唯一证据；像素级"没有第二次回读"要等 `P7.09` 的导出路径 L4 测量）。
 
 ---
 
