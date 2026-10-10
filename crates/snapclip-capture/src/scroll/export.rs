@@ -171,6 +171,21 @@ pub trait RowBandSink: Send {
     fn begin(&mut self, meta: &ImageMeta) -> Result<Box<dyn RowBandWriter>, ExportError>;
 }
 
+/// Where the rows of a long image come from, one band at a time (`docs/32` ADR-21).
+///
+/// The reading half of [`RowBandSink`]: a writer is handed a source and pulls bands out of it, which
+/// is what lets a canvas with 10^5 rows become a PNG without ever existing as one buffer. The
+/// implementation wraps the scroll canvas and therefore lives on the capture side; the trait lives
+/// here because this module is the output-format seam, and the shell implements the writer against
+/// exactly this shape.
+pub trait RowBandSource {
+    /// How many rows the image has. A precondition of the first write, not a discovery (§17.7).
+    fn row_count(&self) -> u64;
+
+    /// Read `rows` rows starting at `first_row`, tightly packed BGRA.
+    fn read_rows(&mut self, first_row: u64, rows: u64) -> Result<Vec<u8>, String>;
+}
+
 /// Receives the rows of one artifact, in strictly increasing order (`docs/30` §17.7).
 pub trait RowBandWriter {
     /// Writes `rows` (a whole number of packed BGRA8 rows, `width * 4` bytes each) starting at

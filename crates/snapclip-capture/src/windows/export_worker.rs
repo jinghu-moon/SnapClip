@@ -52,13 +52,36 @@ pub struct ExportJob {
     /// current is dropped, and its artifact deleted.
     pub generation: u64,
     pub session_id: String,
-    /// The validated, region-sized pixels to encode, read back on the overlay thread.
-    pub prepared: SelectionPixels,
+    /// What to encode: a screenshot's pixels, or a scroll session's canvas (`docs/32` ADR-21).
+    pub(crate) source: ExportSource,
     pub dpi: u32,
     pub monitor_device_name: Option<String>,
     /// Overlay UI thread id to wake with [`EXPORT_READY_MESSAGE`].
     pub notify_thread: u32,
     pub executor: ExportExecutor,
+}
+
+/// The two things an export can be (`docs/32` ADR-21).
+///
+/// One struct rather than two workers: an export is one job with one generation, one notify thread
+/// and one result slot, and a session produces either a screenshot or a long image, never both. The
+/// executor dispatches on this instead of the overlay having to build two of them.
+pub(crate) enum ExportSource {
+    /// An ordinary screenshot: the whole region, read back on the overlay thread.
+    Selection(SelectionPixels),
+    /// A scroll session's canvas, written band by band on the export thread.
+    Rows(RowBandJob),
+}
+
+/// A long image waiting to be written (`docs/32` ADR-21).
+///
+/// The canvas is behind a `Mutex` because the job travels as an `Arc` — the mailbox hands the same
+/// job to the worker and keeps it for staleness checks — while reading a band needs
+/// `&mut RecoveredImage`. The lock is what turns "shared" into "one reader at a time", and the only
+/// reader is the export thread.
+pub(crate) struct RowBandJob {
+    pub(crate) meta: crate::scroll::export::ImageMeta,
+    pub(crate) canvas: std::sync::Mutex<crate::scroll::canvas::RecoveredImage>,
 }
 
 /// An export that failed, with the stage that produced it.
@@ -376,8 +399,8 @@ fn delete_quietly(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::{
-        CompletedExport, ExportFailure, ExportJob, ExportWorker, Mailbox, WorkerEvent,
-        EXPORT_READY_MESSAGE,
+        CompletedExport, ExportFailure, ExportJob, ExportSource, ExportWorker, Mailbox,
+        WorkerEvent, EXPORT_READY_MESSAGE,
     };
     use crate::artifact::SelectionPixels;
     use crate::geometry::Rect;
@@ -440,7 +463,7 @@ mod tests {
         ExportJob {
             generation: 0,
             session_id: "session-test".into(),
-            prepared: test_selection_pixels(),
+            source: ExportSource::Selection(test_selection_pixels()),
             dpi: 96,
             monitor_device_name: Some(r"\\.\DISPLAY1".into()),
             notify_thread: unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() },
@@ -622,16 +645,23 @@ mod tests {
         let seen_in_executor = seen.clone();
         let worker = ExportWorker::new();
         let mut job = new_job(move |job: &ExportJob| {
+            let ExportSource::Selection(prepared) = &job.source else {
+                return Err(CaptureError::InvalidState("this test builds a screenshot".into()));
+            };
             *seen_in_executor.lock().unwrap() = Some((
                 job.session_id.clone(),
-                job.prepared.region.left,
-                job.prepared.region.right,
+                prepared.region.left,
+                prepared.region.right,
                 job.dpi,
                 job.monitor_device_name.clone(),
             ));
             Err(CaptureError::InvalidState("stop here".into()))
         });
-        job.prepared.region = Rect::new(2, 3, 9, 11);
+        job.source = ExportSource::Selection({
+            let mut prepared = test_selection_pixels();
+            prepared.region = Rect::new(2, 3, 9, 11);
+            prepared
+        });
         job.dpi = 144;
         job.monitor_device_name = Some(r"\\.\DISPLAY3".into());
         job.session_id = "session-metadata".into();

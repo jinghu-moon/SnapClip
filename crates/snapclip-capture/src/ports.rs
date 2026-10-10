@@ -91,4 +91,19 @@ pub trait ArtifactWriter: Send + Sync + 'static {
         dpi: u32,
         monitor_device_name: Option<String>,
     ) -> crate::CaptureResult<snapclip_model::CaptureArtifact>;
+
+    /// Write a **long** image, one band at a time (`docs/32` ADR-21).
+    ///
+    /// [`Self::write`] takes the whole image as one `SelectionPixels`, which is right for a
+    /// screenshot and impossible for a scroll session: `F7`'s output can be 10^5 rows tall, and
+    /// materialising that as one buffer is exactly what `docs/30` `F7` forbids. The height is a
+    /// precondition here rather than something discovered while writing, because a PNG's header
+    /// carries it (`§17.7`). Runs on the export worker, like [`Self::write`].
+    fn write_rows(
+        &self,
+        session_id: &str,
+        meta: &crate::scroll::export::ImageMeta,
+        source: &mut dyn crate::scroll::export::RowBandSource,
+        dpi: u32,
+    ) -> crate::CaptureResult<snapclip_model::CaptureArtifact>;
 }

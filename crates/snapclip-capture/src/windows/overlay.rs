@@ -83,7 +83,7 @@ use crate::{CaptureError, CaptureResult, CaptureState};
 
 use super::capture_worker::{self, CaptureWorker, StartRequest};
 use super::detection_worker::{self, DetectionResult, DetectionWorker};
-use super::export_worker::{self, ExportJob, ExportWorker};
+use super::export_worker::{self, ExportExecutor, ExportJob, ExportSource, ExportWorker, RowBandJob};
 use super::win::window;
 use super::refinement_worker::{self, RefinementResult, RefinementWorker};
 use super::hotkey;

@@ -15,6 +15,27 @@ use super::*;
 /// move the target and the loop would have nothing to correct from.
 pub(super) const SCROLL_LINE_HEIGHT_PX: u32 = 20;
 
+/// The scroll canvas as a [`crate::scroll::export::RowBandSource`] (`docs/32` ADR-21).
+///
+/// The adapter exists because `RecoveredImage::rows` fails with a `BandError` the output-format seam
+/// has no business knowing about, and because the canvas sits behind the export job's lock while the
+/// band loop runs. It is the whole of the "long image" reading side: 256 rows at a time, as asked.
+struct CanvasRows<'a> {
+    canvas: &'a mut crate::scroll::canvas::RecoveredImage,
+}
+
+impl crate::scroll::export::RowBandSource for CanvasRows<'_> {
+    fn row_count(&self) -> u64 {
+        self.canvas.primary_len()
+    }
+
+    fn read_rows(&mut self, first_row: u64, rows: u64) -> Result<Vec<u8>, String> {
+        self.canvas
+            .rows(first_row, rows)
+            .map_err(|error| format!("{error:?}"))
+    }
+}
+
 impl OverlayController {
     pub(super) fn session_id(&self) -> String {
         self.session.id().to_string()
@@ -205,21 +226,85 @@ impl OverlayController {
             return;
         };
         runtime.controller().cancel();
-        match runtime.teardown() {
-            Some(session) => eprintln!(
-                "[snapclip][capture] scroll session ended reason={reason} steps={} committed={} \
-                 discarded={}",
-                session.step(),
-                session.committed(),
-                session.discarded()
-            ),
-            None => eprintln!(
+        let Some(session) = runtime.teardown() else {
+            eprintln!(
                 "[snapclip][capture] scroll session ended reason={reason} (the driver returned \
                  nothing: it was already torn down)"
-            ),
-        }
+            );
+            self.scroll_preview = None;
+            self.scroll_panel = None;
+            return;
+        };
+        // The stop reason decides whether there is an artifact at all (`docs/30` §20.5): `Esc` and an
+        // internal error promise none, and everything else — the user's `Enter`, a lost target, a
+        // memory limit — produces a file, possibly a `Partial` one. `disposal()` is the one place
+        // that mapping lives, so it is asked rather than re-derived here.
+        let export = matches!(
+            session.disposal(),
+            Some(crate::scroll::session::Disposal::Export(_))
+        );
+        let stop_reason = session.stop_reason();
+        let steps = session.step();
+        let committed = session.committed();
+        let discarded = session.discarded();
         self.scroll_preview = None;
         self.scroll_panel = None;
+        eprintln!(
+            "[snapclip][capture] scroll session ended reason={reason} stop={stop_reason:?} \
+             steps={steps} committed={committed} discarded={discarded} export={export}"
+        );
+        if !export {
+            return;
+        }
+
+        // The canvas becomes the job. Its height is the whole point of the band seam: 10^5 rows exist
+        // as band storage and are written one band at a time (`docs/32` ADR-21), so the encode never
+        // needs the image in one buffer.
+        let canvas = session.into_canvas();
+        let width = canvas.cross_len();
+        let height = canvas.primary_len();
+        let meta = crate::scroll::export::ImageMeta {
+            width,
+            height,
+            // The artifact is as long as the canvas: `length` is what `docs/30` §17.7 capped, and for
+            // a vertical scroll it *is* the height (the same statement the ordinary path makes).
+            length: height,
+            axis: crate::scroll::observation::Axis::Vertical,
+            // `dpr` is for the preview's CSS-pixel consumers; this image is physical pixels and its
+            // scale travels in `dpi`, so `1` means "not applicable" rather than a guess.
+            dpr: 1,
+        };
+        let session_id = self.session_id();
+        let job = ExportJob {
+            generation: 0,
+            session_id: session_id.clone(),
+            source: ExportSource::Rows(RowBandJob {
+                meta,
+                canvas: std::sync::Mutex::new(canvas),
+            }),
+            dpi: self
+                .monitor_layout
+                .as_ref()
+                .map(|layout| layout.dpi)
+                .unwrap_or(96),
+            monitor_device_name: None,
+            notify_thread: unsafe { GetCurrentThreadId() },
+            executor: Self::export_executor(self.writer.clone()),
+        };
+        match self.export_worker.submit(job) {
+            Ok(Some(generation)) => eprintln!(
+                "[snapclip][bench] scroll export submitted session={session_id} generation={generation} \
+                 size={width}x{height}"
+            ),
+            Ok(None) | Err(_) => {
+                let error = CaptureError::EncodeFailed("scroll export worker unavailable".to_string());
+                eprintln!(
+                    "[snapclip][capture] scroll export submit failed session={session_id} error={error}"
+                );
+                self.sink
+                    .on_failed(Some(&session_id), &error, "scroll-export");
+            }
+        }
     }
 
     /// `F5`: submit a capture request and enter `Preparing`.
@@ -498,6 +583,33 @@ impl OverlayController {
         }
     }
 
+    /// The export executor both paths use (`docs/32` ADR-21).
+    ///
+    /// One closure, two sources: an ordinary screenshot is one `SelectionPixels` written in a single
+    /// call, and a scroll session is a canvas written band by band. The choice belongs to the job, so
+    /// the overlay builds one of these rather than one per path — and the band loop lives here rather
+    /// than in the writer because only this side knows the canvas can serve whole bands.
+    fn export_executor(writer: Arc<dyn ArtifactWriter>) -> ExportExecutor {
+        Box::new(move |job: &ExportJob| match &job.source {
+            ExportSource::Selection(prepared) => writer.write(
+                &job.session_id,
+                prepared,
+                job.dpi,
+                job.monitor_device_name.clone(),
+            ),
+            ExportSource::Rows(rows) => {
+                let mut canvas = rows
+                    .canvas
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut source = CanvasRows {
+                    canvas: &mut canvas,
+                };
+                writer.write_rows(&job.session_id, &rows.meta, &mut source, job.dpi)
+            }
+        })
+    }
+
     /// `Enter`: read the confirmed selection back on this thread, then hand encode +
     /// write to the export worker so the message pump keeps answering `Esc` and
     /// `WM_PAINT` while a large PNG is produced (docs/11 §Phase 3).
@@ -609,22 +721,14 @@ impl OverlayController {
         // The overlay is frozen at the confirmed selection until the export lands, so
         // cursor-follow repaints can neither race nor waste the hand-off.
         self.graphics_released = true;
-        let writer = self.writer.clone();
         let job = ExportJob {
             generation: 0,
             session_id: session_id.clone(),
-            prepared,
+            source: ExportSource::Selection(prepared),
             dpi,
             monitor_device_name: None,
             notify_thread: unsafe { GetCurrentThreadId() },
-            executor: Box::new(move |job: &ExportJob| {
-                writer.write(
-                    &job.session_id,
-                    &job.prepared,
-                    job.dpi,
-                    job.monitor_device_name.clone(),
-                )
-            }),
+            executor: Self::export_executor(self.writer.clone()),
         };
         match self.export_worker.submit(job) {
             Ok(Some(generation)) => {
@@ -656,7 +760,12 @@ impl OverlayController {
         let Some(ready) = self.export_worker.take_ready() else {
             return;
         };
-        if self.session.state() != CaptureState::Exporting {
+        // A **scroll** export is the only case where this is not `Exporting`: handing the selection
+        // over ended the capture session (ADR-19), so by the time the bands are written there is no
+        // capture state left to complete — only an artifact to publish. An ordinary screenshot that
+        // is not exporting is a stale result and is dropped, which is what this check has always said.
+        let exporting = self.session.state() == CaptureState::Exporting;
+        if !exporting && self.sink_has_no_scroll_export() {
             return;
         }
         let session_id = self.session_id();
@@ -674,9 +783,11 @@ impl OverlayController {
                     artifact.height
                 );
                 self.sink.on_completed(&artifact);
-                self.session.complete();
-                self.finish_session();
-                self.sink.on_state(&session_id, CaptureState::Idle, None);
+                if exporting {
+                    self.session.complete();
+                    self.finish_session();
+                    self.sink.on_state(&session_id, CaptureState::Idle, None);
+                }
             }
             Err(failure) => {
                 let stage = failure.stage;
@@ -689,11 +800,22 @@ impl OverlayController {
                     self.renderer = None;
                 }
                 self.sink.on_failed(Some(&session_id), &failure.error, stage);
-                self.session.fail();
-                self.finish_session();
-                self.sink.on_state(&session_id, CaptureState::Idle, None);
+                if exporting {
+                    self.session.fail();
+                    self.finish_session();
+                    self.sink.on_state(&session_id, CaptureState::Idle, None);
+                }
             }
         }
+    }
+
+    /// Whether a result arriving outside `Exporting` may still be delivered.
+    ///
+    /// Only a scroll export qualifies, and the honest test is that no scroll session is running: a
+    /// result that arrives after `stop_scroll_session` took the runtime is the scroll export's, and
+    /// one that arrives while a session *is* running belongs to nothing.
+    fn sink_has_no_scroll_export(&self) -> bool {
+        self.scroll_runtime.is_none()
     }
 
     pub(super) fn finish_session(&mut self) {

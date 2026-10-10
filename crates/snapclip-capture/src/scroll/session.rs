@@ -296,6 +296,15 @@ impl ScrollSession {
         &mut self.canvas
     }
 
+    /// Give the canvas away (`docs/32` ADR-21).
+    ///
+    /// The export path takes the pixels and the session ends with them: the canvas is 10^5 rows of
+    /// band storage, and handing it to the export worker is how it becomes a file without a second
+    /// copy. After this the session is a record of what happened — counters and a stop reason.
+    pub(crate) fn into_canvas(self) -> RecoveredImage {
+        self.canvas
+    }
+
     pub(crate) fn step(&self) -> u32 {
         self.step
     }

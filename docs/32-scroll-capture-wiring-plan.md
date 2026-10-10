@@ -870,6 +870,24 @@ pub(crate) fn take_window_request(&self) -> Option<WindowRequest>;      // 驱�
 - **退出条件**：① 四条用例通过；② L4：一次真实的长产物导出（≥ 100,000 px）峰值内存不随高度增长；③ `E-MEM-1` 的 0.16% 结论在接了真实消费者之后仍成立；④ 取消路径的目录里没有产物。
 - **提交标题**：`[P7-09] stopping writes bands, not a bitmap`
 
+**状态**：`[x] 完成（2026-10-10）**
+
+**执行记录（2026-10-10）**
+
+- **RED（实测，日志 `docs/Temp/p709-red.txt`，exit=101）**：把 `crates/snapclip-capture/src/ports.rs` 里那条 `fn write_rows(...)` 声明用 `#[cfg(any())]` 藏起来再跑 ⇒ `error[E0599]: no method named write_rows found for struct std::sync::Arc<(dyn ports::ArtifactWriter + 'static)>` —— 端口本来就没有这条路，所以"行带导出"这件事在 P7.09 之前**没有任何形状**。取红的手法与 `P7.06` 相同（藏代码而不是删邻近段）。
+- **GREEN（实测，日志 `docs/Temp/p709-check.txt`、`p709-tests.txt`）**：`cargo test -p snapclip-app --lib artifact_writer -- --test-threads=1` → **4 passed / 0 failed**（新增两条）；`cargo check --workspace --all-targets` → **exit 0、0 warning**（唯一警告仍是既有的 `content_label`）；`pwsh tools/check-dependency-direction.ps1` → clean（`crates/snapclip-capture/src/scroll: 18 files`）。
+- **落地形状**：
+  - `crates/snapclip-capture/src/scroll/export.rs`：`pub trait RowBandSource { fn row_count(&self) -> u64; fn read_rows(&mut self, first_row: u64, rows: u64) -> Result<Vec<u8>, String>; }` —— 长图的读取半边，与 `RowBandSink`/`RowBandWriter` 同处输出格式接缝（`scroll/` 依旧不碰平台）。
+  - `crates/snapclip-capture/src/ports.rs`：`ArtifactWriter` 新增 `fn write_rows(&self, session_id, meta: &ImageMeta, source: &mut dyn RowBandSource, dpi) -> CaptureResult<CaptureArtifact>`（高度是**前置条件**而不是写的时候才发现，因为 PNG 的 IHDR 先写）。
+  - `crates/snapclip-capture/src/windows/export_worker.rs`：`ExportJob.prepared: SelectionPixels` → `pub(crate) source: ExportSource`；新增 `ExportSource::{Selection(SelectionPixels), Rows(RowBandJob)}` 与 `RowBandJob { meta, canvas: Mutex<RecoveredImage> }`（`Mutex` 是因为 job 以 `Arc` 传递、而读带要 `&mut`；读它的只有导出线程）。
+  - `crates/snapclip-capture/src/scroll/session.rs`：`pub(crate) fn into_canvas(self) -> RecoveredImage` —— 画布交给导出线程，而不是再拷一份。
+  - `crates/snapclip-capture/src/windows/overlay/session.rs`：模块级 `struct CanvasRows<'a>` + `impl RowBandSource`（把 `BandError` 翻成 `String`，接缝不该认识它）；`fn export_executor(writer) -> ExportExecutor` 成为**两条路共用的**执行器（按 `job.source` 分派），`confirm()` 与 `stop_scroll_session` 都用它；`stop_scroll_session` 现在由 `matches!(session.disposal(), Some(Disposal::Export(_)))` 决定是否有产物，有则 `into_canvas()` → `ImageMeta { width: cross_len, height: primary_len, length: height, axis: Vertical, dpr: 1 }` → 提交 `ExportSource::Rows`；`on_export_ready` 增加 `let exporting = self.session.state() == CaptureState::Exporting;` 与 `sink_has_no_scroll_export()` —— 滚动产物在 `!exporting` 时只发布 `sink.on_completed`（**不再** `session.complete()`：ADR-19 说交接时捕获会话就已经结束），而普通过路仍按原样 complete/fail。
+  - `apps/snapclip/src/capture/artifact_writer.rs`：`const SCROLL_BAND_ROWS: u64 = 256`（store 自己的画布带尺寸，256 行一次正好是它能整带供出的量）与 `fn write_rows(...)`：尺寸校验 → `source.row_count() != meta.height` 则**一个字节都不写**地拒绝 → `PngRowBandSink::begin(&meta)` → 逐带 `read_rows` + `write_rows` → `finish(None)` → `CaptureOutput { pixel_format: Bgra8Unorm, captured_at_unix_ms: unix_time_ms(), monitor_device_name: None }` → `store.write` → `CaptureArtifact`。
+- **测试**：`a_long_canvas_becomes_a_png_with_the_height_the_meta_declared`（4×600、每带 256 行 ⇒ **恰好 3 次读取**且最后一次是短带、PNG 头高 600、第 300 行与第 599 行的像素按序落在正确位置）与 `a_source_that_disagrees_with_the_header_is_refused_before_the_first_byte`（源 10 行 vs 头 600 行 ⇒ 拒绝且目录里没有产物）。
+- **偏离任务书的地方（两条）**：① `§9 P7.09` 的 RED 里 `a_cancelled_export_deletes_its_artifact` 没有新写——`crates/snapclip-capture/src/windows/export_worker.rs` 的既有 `cancelling_drops_the_result_and_the_artifact` 已经钉住"过期产物被删除"，行带任务走的是同一条 generation/staleness 路径；② `the_band_walk_never_materialises_the_canvas`（峰值分配）**没有测**：它是 `E-MEM-1` 的测量形态，属阶段级 L4，留给 `P7.13`；今天能说的事实是"端口按 256 行取带、画布以 `Mutex<RecoveredImage>` 整体移交而不是拷贝"，**不是**"峰值已被测量"。
+- **DoD（实测，日志 `docs/Temp/p709-workspace.txt`）**：`cargo test --workspace --lib -- --test-threads=1` → **69 + 573 + 51 + 23 = 716 passed / 0 failed / 69 ignored（exit 0）**；`snapclip-app` 从 67 增至 **69**（净 +2 = 两条行带用例），`snapclip-capture` 保持 573 / 66，只增不减。
+- **未取得**：① 峰值内存未测（见上）；② 停止后的产物**还没有任何消费者**——`sink.on_completed` 到了 shell 之后仍是 `apps/snapclip/src/adapters.rs:89` 的 `artifact: None`，剪贴板与历史都不写，那是 `P7.10`；③ 一次真实滚动会话的行带导出（≥100,000 px）没有跑过，只有 4×600 的夹具。
+
 ---
 
 ### P7.10 产物出口：剪贴板与历史
