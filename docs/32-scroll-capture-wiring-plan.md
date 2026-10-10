@@ -888,6 +888,20 @@ pub(crate) fn take_window_request(&self) -> Option<WindowRequest>;      // 驱�
 - **DoD（实测，日志 `docs/Temp/p709-workspace.txt`）**：`cargo test --workspace --lib -- --test-threads=1` → **69 + 573 + 51 + 23 = 716 passed / 0 failed / 69 ignored（exit 0）**；`snapclip-app` 从 67 增至 **69**（净 +2 = 两条行带用例），`snapclip-capture` 保持 573 / 66，只增不减。
 - **未取得**：① 峰值内存未测（见上）；② 停止后的产物**还没有任何消费者**——`sink.on_completed` 到了 shell 之后仍是 `apps/snapclip/src/adapters.rs:89` 的 `artifact: None`，剪贴板与历史都不写，那是 `P7.10`；③ 一次真实滚动会话的行带导出（≥100,000 px）没有跑过，只有 4×600 的夹具。
 
+#### P7.09b（提交 `e1e06be` **之后**的修复，`P7.10` 之前）
+
+问"现在能不能手动测滚动截图"时发现的**两个真洞**，都在同一条链上，且都属于"没人接住驱动"：
+
+1. **`SCROLL_READY_MESSAGE` 从来没有人 post。** `crates/snapclip-capture/src/scroll/preview.rs` 的模块文档写着唤醒是"由发布者 post 的窗口消息"，`crates/snapclip-capture/src/windows/overlay/window_host.rs:53` 也确实在收到它时调 `on_scroll_ready`，但**没有任何生产者 post 它**（全仓 grep 只有定义、分派、以及测试里的 id 不相撞断言）。后果不是"慢一帧"：面板的状态、进度行、视口框在整个会话里**永不更新**，而"驱动自己结束"也永远不会被发现（`on_scroll_ready` 是唯一的折叠点）。根因属**接口设计错误**：`PreviewStream` 是邮箱而不是通道，`publish` 存完东西却没有任何手段说出"有东西可读"。
+   - **修法**：`PreviewStream` 增加 `waker: Box<dyn Fn() + Send + Sync>`，`new()` = `with_waker(|| {})`；`publish` **在最前面无条件**调用它（`try_lock` 拒绝与 `Bands` 被并进未见增量，这两种情况消费者都仍有东西可读，把唤醒绑在"存下了"上会正好丢掉最需要唤醒的那些更新）；`scroll/` 不得命名 `PostThreadMessageW`（`§28.4`），所以平台那一半由装配根通过新的 `ScrollRuntime::start_with_waker(plan, make_source, actuator, waker)` 注入，`start` 保留为 `|| {}` 的退化形式（回环自身的用例就是靠轮询的消费者）。`crates/snapclip-capture/src/windows/overlay/session.rs` 的 `begin_scroll_session` 传入 `move || PostThreadMessageW(GetCurrentThreadId(), SCROLL_READY_MESSAGE, 0, 0)`。
+2. **按"停止"不产出任何文件。** `apply_panel_action(Stop)` 只调了 `controller.stop()`；驱动随即结束并发布 `Ended`，但**收集会话的 `teardown()` 只在 `stop_scroll_session` 里**，而它此前只被 `cancel()` 调用 —— 而 cancel 的语义词是"没有产物"（`disposal()` = `Discard`）。所以 P7.09 写完的那一刻，"停止导出"这条路在**用户可触达的入口上**是断的：日志会说 `scroll session ended … export=true` 只有 Esc 才会走到，按停止则什么也没有。根因同样不是漏了一行，而是**"承诺"与"收集"分开在两处**。
+   - **修法**：`Stop` 分支在 `controller.stop()`（先latch，保证 `disposal()` 是 `Export`）之后**立即**调 `self.stop_scroll_session("panel-stop")`（借用结束之后再调，见下面的编译错误）；`crates/snapclip-capture/src/windows/overlay/render_submit.rs` 的 `on_scroll_ready` 结尾增加"驱动自己结束了就收集"——`self.scroll_runtime.as_ref().is_some_and(|runtime| runtime.driver_exited())` ⇒ `stop_scroll_session("driver-ended")`；目标消失、设备丢失、内存上限这些**驱动自杀**的原因由 `yields_partial()` 决定是否有产物，而 `driver_exited()` 是唯一不依赖消息的判据。
+
+- **RED（实测）**：这一轮没有先写用例再看红——两个洞都是"路径根本不存在"，红的形式是**手动演练会走进死路**（第 1 条会让面板永远静止，第 2 条会让用户按停止后什么也找不到）。可归入 `docs/31 §2.1` 的第四种形态：**只有把链子走一遍才会发现的接口缺口**；记录在此而不假装有过失败的用例。唯一新增的自动化覆盖是唤醒本身：`crates/snapclip-capture/src/scroll/preview.rs::publishing_wakes_the_consumer_even_when_the_update_is_merged`（发布唤醒一次、`Bands` 被并进未见增量时**仍然**唤醒、无 waker 的流合法）。
+- **GREEN（实测，日志 `docs/Temp/p709b-check1.txt`、`p709b-tests.txt`、`p709b-workspace.txt`）**：`cargo test -p snapclip-capture --lib scroll::preview` → **12 passed / 0 failed**；`cargo check --workspace --all-targets` → **exit 0、0 error**；`pwsh tools/check-dependency-direction.ps1` → clean；`cargo test --workspace --lib -- --test-threads=1` → **69 + 574 + 51 + 23 = 717 passed / 0 failed / 69 ignored**（capture 573→574）。
+- **一次编译错误（记录在案）**：`Stop` 分支若在 `let Some(runtime) = self.scroll_runtime.as_ref()` 的借用仍活着时调 `self.stop_scroll_session(...)`，会 `E0502`。改法是先 `match action` 完成全部 `controller.*` 调用（借用到此结束），**之后**再用 `if matches!(action, PanelAction::Stop)` 去 `stop_scroll_session`。
+- **未取得**：① 两条新路径（`panel-stop`、`driver-ended`）**没有自动化用例**——它们需要真实 `OverlayController`（`service`/`sink`/`clipboard`/`writer`/`options`/`shared`/`annotation_rx`/`HWND`/`thread_id`），端到端留给 `P7.13`；② 消息唤醒只有 L1 计数覆盖，**没有**"PostThreadMessage 真的把 overlay 从 GetMessage 里叫醒"的验证（需真机，`P7.13`）；③ 手动演练本身尚未执行。
+
 ---
 
 ### P7.10 产物出口：剪贴板与历史

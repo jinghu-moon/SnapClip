@@ -232,13 +232,31 @@ fn merge(previous: PreviewUpdate, update: PreviewUpdate) -> PreviewUpdate {
 pub(crate) struct PreviewStream {
     mailbox: Mutex<Mailbox>,
     dropped: AtomicU64,
+    /// What wakes the consumer after something has been published.
+    ///
+    /// The port is a mailbox, not a channel: nothing here can suspend a thread, and the consumer —
+    /// the overlay — spends its life inside a Windows message pump rather than polling. So "there is
+    /// something to read" has to be said out loud, and `docs/30` §21.4 names the sentence:
+    /// `SCROLL_READY_MESSAGE` posted to the overlay's thread. The closure is the platform-free half
+    /// of that sentence — `scroll/` may not name `PostThreadMessageW` (`§28.4`) — and the assembly
+    /// root, which owns the HWND and the thread id, supplies it through
+    /// [`ScrollRuntime::start_with_waker`](crate::scroll::session::ScrollRuntime::start_with_waker).
+    ///
+    /// A wake with nothing to read is harmless: the consumer drains and finds the slot empty.
+    waker: Box<dyn Fn() + Send + Sync>,
 }
 
 impl PreviewStream {
     pub(crate) fn new() -> Self {
+        Self::with_waker(|| {})
+    }
+
+    /// A stream that wakes its consumer through `waker` (`docs/32` `P7.09b`).
+    pub(crate) fn with_waker(waker: impl Fn() + Send + Sync + 'static) -> Self {
         Self {
             mailbox: Mutex::new(Mailbox::default()),
             dropped: AtomicU64::new(0),
+            waker: Box::new(waker),
         }
     }
 
@@ -259,6 +277,10 @@ impl PreviewStream {
     /// consumer's critical section, which moves `Copy` values and cannot block, and it happens once
     /// per session, so it cannot slow the capture down in the sense constraint 5 is about.
     pub(crate) fn publish(&self, update: PreviewUpdate) {
+        // Wake first, unconditionally. The lock below may refuse the update (`try_lock`) or merge it
+        // into an unseen delta, and both are cases where the consumer still has something to read —
+        // so tying the wake to the store would lose exactly the updates that needed it most.
+        (self.waker)();
         if matches!(update, PreviewUpdate::Ended { .. }) {
             self.mailbox
                 .lock()
@@ -517,6 +539,52 @@ mod tests {
     /// Both halves matter: `dropped == 99` proves 99 updates were superseded without a consumer, and
     /// the `take` sequence proves the surviving one is the **newest** rather than the oldest (a
     /// queue would have handed back `primary_len: 0` and grown without bound).
+    /// `P7.09b`: the port says "there is something to read" out loud.
+    ///
+    /// The consumer is a Windows message pump, not a poller — that is the whole reason the wake
+    /// exists (`docs/30` §21.4) — so this is the difference between a panel that updates and one that
+    /// keeps its initial state for the entire session. The wake is deliberately **unconditional**: a
+    /// `try_lock` refusal and a delta merged into an unseen one are both cases where the consumer
+    /// still has something to read.
+    #[test]
+    fn publishing_wakes_the_consumer_even_when_the_update_is_merged() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        let wakes = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&wakes);
+        let stream = PreviewStream::with_waker(move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
+
+        assert_eq!(wakes.load(Ordering::Relaxed), 0, "nothing published yet");
+        stream.publish(PreviewUpdate::Span {
+            primary_len: 10,
+            steps: 1,
+            discarded: 0,
+        });
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+        // A second `Bands` is merged into the unseen delta rather than stored beside it, and the
+        // consumer still has to be told: the merged update is newer than the one it has not read.
+        stream.publish(PreviewUpdate::Bands {
+            first_row: 0,
+            rows: 5,
+            scale: 1,
+        });
+        stream.publish(PreviewUpdate::Bands {
+            first_row: 0,
+            rows: 9,
+            scale: 1,
+        });
+        assert_eq!(wakes.load(Ordering::Relaxed), 3, "a merged delta still wakes");
+
+        // A stream with no waker is legal: it is what the loop's own tests use, and polling a port
+        // with a no-op wake is exactly what they intend.
+        PreviewStream::new().publish(PreviewUpdate::Ended {
+            reason: crate::scroll::session::StopReason::UserStopped,
+        });
+    }
+
     #[test]
     fn preview_updates_may_be_dropped_but_the_count_is_visible() {
         let stream = PreviewStream::new();

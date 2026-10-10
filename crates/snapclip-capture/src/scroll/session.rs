@@ -765,8 +765,29 @@ impl ScrollRuntime {
         F: FrameSource + 'static,
         A: ScrollActuator + Send + 'static,
     {
+        Self::start_with_waker(plan, make_source, actuator, || {})
+    }
+
+    /// [`Self::start`], with the wake-up the consumer needs (`docs/32` `P7.09b`).
+    ///
+    /// `waker` is called by [`PreviewStream::publish`] on the **driver** thread; in production it
+    /// posts `SCROLL_READY_MESSAGE` to the overlay's thread (`docs/30` §21.4). A test passes a
+    /// counter instead — which is also why the no-argument [`Self::start`] exists: a stream with a
+    /// no-op waker is a stream whose consumer polls, and the loop's own tests do.
+    pub(crate) fn start_with_waker<F, M, A, W>(
+        plan: ScrollPlan,
+        make_source: M,
+        actuator: A,
+        waker: W,
+    ) -> Self
+    where
+        M: FnOnce() -> F + Send + 'static,
+        F: FrameSource + 'static,
+        A: ScrollActuator + Send + 'static,
+        W: Fn() + Send + Sync + 'static,
+    {
         let controller = std::sync::Arc::new(ScrollController::new());
-        let preview = std::sync::Arc::new(PreviewStream::new());
+        let preview = std::sync::Arc::new(PreviewStream::with_waker(waker));
         let driver = ScrollDriver::new(&plan);
 
         let thread_controller = std::sync::Arc::clone(&controller);

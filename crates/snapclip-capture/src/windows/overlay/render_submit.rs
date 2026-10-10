@@ -64,6 +64,19 @@ impl OverlayController {
         if changed {
             self.invalidate();
         }
+        // A driver that ended by itself — the target went away, the device was lost, a memory limit
+        // was reached — has published its last update and left the port. Collecting it here is what
+        // turns "the session stopped" into an artifact for every reason but an explicit cancel
+        // (`docs/30` §20.5); the wake is what makes this reachable at all, since the driver posts
+        // `SCROLL_READY_MESSAGE` after `Ended` (`P7.09b`).
+        if self
+            .scroll_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.driver_exited())
+        {
+            self.stop_scroll_session("driver-ended");
+            return true;
+        }
         changed
     }
 

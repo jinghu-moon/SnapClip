@@ -166,10 +166,18 @@ impl OverlayController {
                     SCROLL_LINE_HEIGHT_PX,
                 );
         let probe = crate::windows::scroll_actuator::TargetProbe::at_session_start(handle);
+        // The overlay's own thread, and the message that means "the driver published something"
+        // (`docs/30` §21.4). Without it the port is a mailbox nobody looks in: the panel would keep
+        // its initial state for the whole session, and a driver that ends by itself would never be
+        // noticed either.
+        let notify_thread = unsafe { GetCurrentThreadId() };
+        let wake = move || unsafe {
+            PostThreadMessageW(notify_thread, crate::windows::overlay::SCROLL_READY_MESSAGE, 0, 0);
+        };
         // The device is created **inside** the factory, on the driver thread: that is what makes
         // the driver its owner (`docs/30` §21.3.1), and it is why `scroll_source.rs` never names
         // `GraphicsDevice::create` — its own gate forbids it (§11.2).
-        let runtime = crate::scroll::session::ScrollRuntime::start(
+        let runtime = crate::scroll::session::ScrollRuntime::start_with_waker(
             plan,
             move || {
                 let device = crate::windows::win::d3d11::GraphicsDevice::create()
@@ -177,6 +185,7 @@ impl OverlayController {
                 crate::windows::scroll_source::OpeningFrameSource::open(device, handle, axis, bounds)
             },
             crate::windows::scroll_actuator::WindowWheelActuator::new(handle, screen, axis, probe),
+            wake,
         );
         self.watch_scroll_preview(runtime.preview().clone(), cross_len, extent);
         self.scroll_runtime = Some(runtime);
@@ -208,6 +217,14 @@ impl OverlayController {
             crate::scroll::panel::PanelAction::Undo => runtime.controller().undo(),
             crate::scroll::panel::PanelAction::Stop => runtime.controller().stop(),
             crate::scroll::panel::PanelAction::Cancel => runtime.controller().cancel(),
+        }
+        // `Stop` is the one action that also **collects** the session: the promise is latched above
+        // (so `disposal()` will be an export rather than a discard, `docs/30` §20.5) and the join
+        // happens here, outside the borrow of `scroll_runtime` above. Leaving the join to the next
+        // `cancel` was a real hole — the driver ended, the panel said "stopped", and no file was
+        // ever written (`P7.09b`).
+        if matches!(action, crate::scroll::panel::PanelAction::Stop) {
+            self.stop_scroll_session("panel-stop");
         }
     }
 
