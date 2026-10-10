@@ -55,10 +55,10 @@ use ::windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_MOUSE, MOUSEINPUT, MOUSEEVENTF_WHEEL, SendInput,
 };
 use ::windows::Win32::UI::WindowsAndMessaging::{
-    CWP_SKIPINVISIBLE, ChildWindowFromPointEx, GetForegroundWindow, GetWindowThreadProcessId,
-    IsWindow, PostMessageW, SPI_GETMOUSEWHEELROUTING, SPI_GETWHEELSCROLLLINES,
-    SYSTEM_PARAMETERS_INFO_ACTION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetCursorPos,
-    SystemParametersInfoW,
+    CWP_SKIPINVISIBLE, ChildWindowFromPointEx, GetClassNameW, GetForegroundWindow,
+    GetWindowThreadProcessId, IsWindow, PostMessageW, SPI_GETMOUSEWHEELROUTING,
+    SPI_GETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_ACTION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    SetCursorPos, SystemParametersInfoW,
 };
 
 /// `WHEEL_DELTA`, the notches-to-units constant of the wheel API.
@@ -340,6 +340,19 @@ pub(crate) fn inject(target: &dyn InjectionTarget, request: &InjectRequest) -> I
 
 /// The real platform, in one place.
 pub(crate) struct Win32Injection;
+
+/// The class name of a window, for logs and diagnoses (`docs/32` `P7.11`).
+///
+/// Which HWND a wheel reached is useless without knowing what it is: `Chrome_RenderWidgetHostHWND`
+/// and `Intermediate D3D Window` are both "a child of the browser" and only one of them scrolls.
+pub(crate) fn window_class(handle: isize) -> String {
+    let mut buffer = [0u16; 256];
+    let written = unsafe { GetClassNameW(hwnd(handle), &mut buffer) };
+    if written <= 0 {
+        return String::from("?");
+    }
+    String::from_utf16_lossy(&buffer[..written as usize])
+}
 
 fn hwnd(handle: isize) -> HWND {
     HWND(handle as *mut core::ffi::c_void)
@@ -646,7 +659,7 @@ impl<T: InjectionTarget> ScrollActuator for WindowWheelActuator<T> {
     }
 
     fn inject(&mut self, notches: i32) -> InjectOutcome {
-        inject(
+        let outcome = inject(
             &self.injection,
             &InjectRequest {
                 target: self.target,
@@ -656,7 +669,28 @@ impl<T: InjectionTarget> ScrollActuator for WindowWheelActuator<T> {
                 path: self.path,
                 aim: self.aim,
             },
-        )
+        );
+        // The class name belongs on this side of the seam: which HWND a wheel reached is useless
+        // without knowing what it is (`Chrome_RenderWidgetHostHWND` and `Intermediate D3D Window` are
+        // both "a child of the browser" and only one of them scrolls), and naming `crate::windows`
+        // from `scroll/` is what the dependency gate forbids. Logged **once per injection**, and the
+        // successful case matters as much as the failed one (`docs/32` `P7.11`).
+        eprintln!(
+            "[snapclip][scroll] inject path={:?} notches={notches} status={:?} delivered={} \
+             window={:#x} class={} target={:#x} aim=({},{})",
+            self.path,
+            outcome.status,
+            outcome.delivered,
+            outcome.target_window.unwrap_or(0),
+            outcome
+                .target_window
+                .map(window_class)
+                .unwrap_or_else(|| String::from("-")),
+            self.target,
+            self.screen.x,
+            self.screen.y
+        );
+        outcome
     }
 }
 
