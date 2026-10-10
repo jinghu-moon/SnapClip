@@ -6,6 +6,15 @@
 
 use super::*;
 
+/// The line height the plan's starting gain assumes, in physical pixels.
+///
+/// `docs/30` §16.2's `starting_px_per_notch(lines, height)` was calibrated with `(3, 20) ⇒ 60 px`,
+/// and `E-INJECT-1` measured **100 px per notch** on this machine (`docs/30` §24.6.1). The closed
+/// loop is what turns the difference into a correction (`§16.6`), so this is a starting point
+/// rather than a measurement — but it has to exist, because a plan that assumed zero would never
+/// move the target and the loop would have nothing to correct from.
+pub(super) const SCROLL_LINE_HEIGHT_PX: u32 = 20;
+
 impl OverlayController {
     pub(super) fn session_id(&self) -> String {
         self.session.id().to_string()
@@ -55,16 +64,137 @@ impl OverlayController {
         }
     }
 
-    /// `F7`: the scroll-capture entry point (`docs/32` §4.1; task `P7.01`).
+    /// `F7`: arm the scroll intent and open the ordinary selection UI (`docs/32` §4.4, `OQ-27`).
     ///
-    /// Today it only reports that the key arrived — and it says so in the log line instead of
-    /// looking like a feature: there is no scroll session to start yet. `P7.02` resolves the
-    /// window under the cursor, `P7.04` ends the capture session and hands over, `P7.05` starts
-    /// the driver. Until then this is the whole body of the F7 path: registered, dispatched,
-    /// and visibly inert (`docs/32` §9 `P7.01` explains why a placeholder session would be
-    /// worse than this).
+    /// The shape is **"select, then confirm means scroll"**: the region a session scrolls is the
+    /// region the user picks, and the window it reads from is resolved from that selection
+    /// (`windows/scroll_target.rs`). Starting the capture session is what gives the user something
+    /// to select on, and it is also where the DPI, the frozen frame under the panel and the monitor
+    /// layout come from.
     pub(super) fn start_scroll_entry(&mut self) {
-        eprintln!("[snapclip][capture] scroll entry requested (wiring lands in P7.04/P7.05)");
+        self.scroll_entry_armed = true;
+        eprintln!("[snapclip][capture] scroll entry armed (F7): select a region and confirm");
+        self.start_session();
+    }
+
+    /// Hand a confirmed selection to a scroll session and start its driver (`docs/32` `P7.05`).
+    ///
+    /// The order is the contract: resolve the window, hand over — which **ends** the capture
+    /// session (ADR-19) — then build the plan from what the hand-over carries, then start the
+    /// driver and give the overlay the preview port. Everything after the hand-over speaks about a
+    /// session whose capture frame is already gone, so nothing here may read `self.session.frame()`.
+    ///
+    /// Every refusal happens **before** the hand-over: the user keeps a selected session they can
+    /// still export, which is the same promise `begin_scroll` itself makes for a window that does
+    /// not overlap the selection.
+    pub(super) fn begin_scroll_session(&mut self) {
+        if self.scroll_runtime.is_some() {
+            eprintln!("[snapclip][capture] a scroll session is already running");
+            return;
+        }
+        let Some(layout) = self.monitor_layout.clone() else {
+            eprintln!("[snapclip][capture] scroll entry refused: this session has no monitor layout");
+            return;
+        };
+        let axis = crate::scroll::observation::Axis::Vertical;
+        let choice = crate::windows::scroll_target::choose_in_snapshot(
+            self.session.selection(),
+            self.snapshot.candidates(),
+            &layout,
+            axis,
+        );
+        let target = match choice {
+            crate::scroll::target::TargetChoice::Accepted(target) => target,
+            other => {
+                eprintln!("[snapclip][capture] scroll entry refused: {other:?}");
+                return;
+            }
+        };
+        let window = target.window();
+        let bounds = target.bounds();
+        let handle = window as isize;
+        // The aim point is part of a `SendInput` injection under `MOUSE_POS` routing (§24.6 rule 1),
+        // so it is resolved before the hand-over: a window whose client area cannot be resolved has
+        // no injectable point, and refusing after the capture session ended would strand the user.
+        let Some(screen) = window::client_center(handle) else {
+            eprintln!("[snapclip][capture] scroll entry refused: 0x{window:x} has no client area");
+            return;
+        };
+
+        let handoff = match self.session.begin_scroll(window, bounds) {
+            Ok(handoff) => handoff,
+            Err(error) => {
+                eprintln!("[snapclip][capture] scroll hand-over failed: {error}");
+                return;
+            }
+        };
+        self.scroll_entry_armed = false;
+
+        let target = handoff.target();
+        let cross_len = target.bounds().width().max(0) as u64;
+        let extent = target.bounds().height().max(0) as u64;
+        // The plan states the viewport as a `u32` (a viewport taller than 4 Gi px is not a case the
+        // canvas has an answer for) while the memory budget is computed in pixels; the clamp keeps
+        // the two statements about the same rectangle rather than panicking on an impossible one.
+        let viewport_extent = u32::try_from(extent).unwrap_or(u32::MAX);
+        let budget = crate::scroll::canvas::MemoryBudget::for_viewport(cross_len, extent);
+        let plan =
+            crate::scroll::session::ScrollPlan::new(axis, cross_len, viewport_extent, budget)
+                .with_wheel(
+                    crate::windows::scroll_actuator::wheel_lines_per_notch(),
+                    SCROLL_LINE_HEIGHT_PX,
+                );
+        let probe = crate::windows::scroll_actuator::TargetProbe::at_session_start(handle);
+        // The device is created **inside** the factory, on the driver thread: that is what makes
+        // the driver its owner (`docs/30` §21.3.1), and it is why `scroll_source.rs` never names
+        // `GraphicsDevice::create` — its own gate forbids it (§11.2).
+        let runtime = crate::scroll::session::ScrollRuntime::start(
+            plan,
+            move || {
+                let device = crate::windows::win::d3d11::GraphicsDevice::create()
+                    .map(std::sync::Arc::new);
+                crate::windows::scroll_source::OpeningFrameSource::open(device, handle, axis, bounds)
+            },
+            crate::windows::scroll_actuator::WindowWheelActuator::new(handle, screen, axis, probe),
+        );
+        self.watch_scroll_preview(runtime.preview().clone(), cross_len, extent);
+        self.scroll_runtime = Some(runtime);
+        eprintln!(
+            "[snapclip][capture] scroll session started window=0x{window:x} cross={cross_len} \
+             extent={extent} capture_dpi={}",
+            handoff.dpi()
+        );
+    }
+
+    /// Stop and join the scroll driver, if one is running (`docs/32` `P7.05`).
+    ///
+    /// Separate from the capture session's teardown because the promises differ: a cancelled scroll
+    /// session produces **no artifact** (`docs/32` §3.4), and its driver has to be joined before
+    /// the controller goes away — a thread that outlived its owner is a thread nobody can stop.
+    ///
+    /// The artifact path (stop → row-band export → clipboard/history) is `P7.09`/`P7.10`; until
+    /// then this logs the session's own tallies and hands the panel back to nothing, which is the
+    /// honest intermediate state rather than a stop button that quietly does half the job.
+    pub(super) fn stop_scroll_session(&mut self, reason: &str) {
+        let Some(mut runtime) = self.scroll_runtime.take() else {
+            return;
+        };
+        runtime.controller().cancel();
+        match runtime.teardown() {
+            Some(session) => eprintln!(
+                "[snapclip][capture] scroll session ended reason={reason} steps={} committed={} \
+                 discarded={}",
+                session.step(),
+                session.committed(),
+                session.discarded()
+            ),
+            None => eprintln!(
+                "[snapclip][capture] scroll session ended reason={reason} (the driver returned \
+                 nothing: it was already torn down)"
+            ),
+        }
+        self.scroll_preview = None;
+        self.scroll_panel = None;
     }
 
     /// `F5`: submit a capture request and enter `Preparing`.
@@ -214,6 +344,9 @@ impl OverlayController {
         }
         self.frozen = Some(frozen);
         self.graphics_released = false;
+        // Kept for the scroll entry: the window snapshot speaks virtual-desktop coordinates and the
+        // overlay's selection is monitor-local, so the conversion needs this layout (`P7.05`).
+        self.monitor_layout = Some(monitor.layout.clone());
 
         eprintln!(
             "[snapclip][capture] overlay session armed session={}",
@@ -254,6 +387,11 @@ impl OverlayController {
             "[snapclip][capture] cancel session={} reason={} active={}",
             session_id, reason, was_active
         );
+        // The scroll driver is joined here rather than left to `Drop`: this is the one path every
+        // cancellation goes through (`docs/32` `P7.05`), and `Esc` on a running scroll session has
+        // to stop the thread that is injecting into the user's desktop.
+        self.scroll_entry_armed = false;
+        self.stop_scroll_session(reason);
         self.worker.cancel();
         self.export_worker.cancel();
         self.current_generation = 0;
@@ -339,6 +477,13 @@ impl OverlayController {
     /// write to the export worker so the message pump keeps answering `Esc` and
     /// `WM_PAINT` while a large PNG is produced (docs/11 §Phase 3).
     pub(super) fn confirm(&mut self) {
+        // `F7`'s session: the same gesture that produces a screenshot produces a scroll session
+        // when the session was started for scrolling (`docs/32` §4.4, `OQ-27`). One interception
+        // point, because `Enter` and the synchronous confirm path both end up here.
+        if self.scroll_entry_armed {
+            self.begin_scroll_session();
+            return;
+        }
         let started_at = Instant::now();
         let selection = match self.session.begin_export() {
             Ok(ExportOutcome::Produce { selection }) => selection,

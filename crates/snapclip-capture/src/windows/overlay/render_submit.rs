@@ -25,7 +25,9 @@ impl OverlayController {
     /// Separate from the panel itself so the geometry of the session — the viewport extent, which
     /// decides how tall the viewport box is — is stated once, when the session is handed over, rather
     /// than inferred from updates that never carry it.
-    #[allow(dead_code)] // The hand-over is the assembly root's (P6); this end is what P5.03 owes.
+    ///
+    /// The caller is the assembly root, `P7.05`'s `begin_scroll_session`; the `#[allow(dead_code)]`
+    /// this carried until then said so, and it is gone now that the hand-over exists.
     pub(crate) fn watch_scroll_preview(
         &mut self,
         preview: std::sync::Arc<crate::scroll::preview::PreviewStream>,

@@ -42,13 +42,23 @@
 
 use crate::geometry::Point;
 use crate::scroll::observation::Axis;
-use ::windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
+use crate::scroll::ports::ScrollActuator;
+use ::windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, POINT, WPARAM};
 use ::windows::Win32::Graphics::Gdi::ClientToScreen;
+use ::windows::Win32::Security::{
+    GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+};
+use ::windows::Win32::System::Threading::{
+    GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use ::windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_MOUSE, MOUSEINPUT, MOUSEEVENTF_WHEEL, SendInput,
 };
 use ::windows::Win32::UI::WindowsAndMessaging::{
-    CWP_SKIPINVISIBLE, ChildWindowFromPointEx, IsWindow, PostMessageW, SetCursorPos,
+    CWP_SKIPINVISIBLE, ChildWindowFromPointEx, GetForegroundWindow, GetWindowThreadProcessId,
+    IsWindow, PostMessageW, SPI_GETMOUSEWHEELROUTING, SPI_GETWHEELSCROLLLINES,
+    SYSTEM_PARAMETERS_INFO_ACTION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetCursorPos,
+    SystemParametersInfoW,
 };
 
 /// `WHEEL_DELTA`, the notches-to-units constant of the wheel API.
@@ -405,6 +415,248 @@ impl InjectionTarget for Win32Injection {
     ) -> Result<(), i32> {
         unsafe { PostMessageW(Some(hwnd(handle)), message, WPARAM(wparam), LPARAM(lparam)) }
             .map_err(|error| error.code().0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Production assembly (`docs/32` `P7.05`)
+// ---------------------------------------------------------------------------
+
+/// How many lines one notch scrolls when the setting cannot be read or says "a page".
+///
+/// `SPI_GETWHEELSCROLLLINES == 0` means **scroll a page per notch**; that is not a line count this
+/// pipeline can turn into pixels, so the plan starts from the measured default instead
+/// (`docs/30` §24.6.1 measured `SPI_GETWHEELSCROLLLINES = 3` on this machine, 100 px per notch).
+/// The closed loop corrects a wrong starting gain; it cannot correct a plan that never moves.
+pub(crate) const DEFAULT_LINES_PER_NOTCH: u32 = 3;
+
+/// Map the raw `SPI_GETMOUSEWHEELROUTING` value (`winuser.h:5321-5325`).
+pub(crate) fn routing_of(raw: u32) -> WheelRouting {
+    match raw {
+        0 => WheelRouting::Focus,
+        1 => WheelRouting::Hybrid,
+        2 => WheelRouting::MousePosition,
+        _ => WheelRouting::Unknown,
+    }
+}
+
+/// Map the raw `SPI_GETWHEELSCROLLLINES` value: `0` is "a page per notch".
+pub(crate) fn lines_of(raw: u32) -> u32 {
+    if raw == 0 {
+        DEFAULT_LINES_PER_NOTCH
+    } else {
+        raw
+    }
+}
+
+fn read_system_parameter(action: SYSTEM_PARAMETERS_INFO_ACTION) -> Option<u32> {
+    let mut value: u32 = 0;
+    let result = unsafe {
+        SystemParametersInfoW(
+            action,
+            0,
+            Some(std::ptr::from_mut(&mut value).cast::<core::ffi::c_void>()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    result.ok().map(|()| value)
+}
+
+/// Read the routing setting that decides where a `SendInput` wheel lands.
+///
+/// Promoted from `crates/snapclip-capture/src/windows/scroll_probe.rs` (`P7.05`): it is a
+/// **run-time** input to [`choose`], and two readers of one system setting are two places to
+/// disagree about where the wheel goes. An unreadable setting becomes
+/// [`WheelRouting::Unknown`], which the decision table already handles explicitly (`:199`)
+/// instead of treating it as "focus" and skipping the aim.
+pub(crate) fn wheel_routing() -> WheelRouting {
+    read_system_parameter(SPI_GETMOUSEWHEELROUTING)
+        .map(routing_of)
+        .unwrap_or(WheelRouting::Unknown)
+}
+
+/// Read how many lines one notch scrolls, for the plan's starting gain.
+pub(crate) fn wheel_lines_per_notch() -> u32 {
+    read_system_parameter(SPI_GETWHEELSCROLLLINES)
+        .map(lines_of)
+        .unwrap_or(DEFAULT_LINES_PER_NOTCH)
+}
+
+impl TargetProbe {
+    /// The four facts [`choose`] reads, gathered once, at session start.
+    ///
+    /// `target` is the window the session will scroll. Integrity comes from the **tokens**, not
+    /// from a guess: `TokenElevation` on this process and on the target's process.
+    ///
+    /// ## The two unknown-answers point in opposite directions, on purpose
+    ///
+    /// * a target token that cannot be read (a protected process refuses even
+    ///   `PROCESS_QUERY_LIMITED_INFORMATION`) is reported as **elevated**;
+    /// * our own token failing is reported as **not elevated**.
+    ///
+    /// Both choices keep the table's integrity arm armed, i.e. they keep the transport whose
+    /// failure is *legible* (a refused post with an error code) and avoid the one that gets
+    /// swallowed — the same argument the decision table makes for itself (`:168-172`). Guessing
+    /// "same level" when we do not know would silently pick the transport that fails invisibly.
+    ///
+    /// `TokenElevation` is a two-level answer, which is what [`choose`] compares; a Low-integrity
+    /// sender reaching a Medium target is **not** distinguished by this pair, and that is the case
+    /// `E-INJECT-1`'s low-integrity arm covers (`docs/32` `OQ-32`).
+    pub(crate) fn at_session_start(target: isize) -> Self {
+        Self {
+            target_is_elevated: window_process_is_elevated(target).unwrap_or(true),
+            self_is_elevated: self_token_is_elevated().unwrap_or(false),
+            target_is_foreground: unsafe { GetForegroundWindow() } == hwnd(target),
+            routing: wheel_routing(),
+        }
+    }
+}
+
+fn open_process_token(process: HANDLE) -> Option<HANDLE> {
+    let mut token = HANDLE::default();
+    unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) }.ok()?;
+    Some(token)
+}
+
+fn token_is_elevated(token: HANDLE) -> Option<bool> {
+    let mut elevation = TOKEN_ELEVATION::default();
+    let mut returned = 0u32;
+    unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(std::ptr::from_mut(&mut elevation).cast::<core::ffi::c_void>()),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        )
+    }
+    .ok()?;
+    Some(elevation.TokenIsElevated != 0)
+}
+
+fn self_token_is_elevated() -> Option<bool> {
+    let token = open_process_token(unsafe { GetCurrentProcess() })?;
+    let elevated = token_is_elevated(token);
+    unsafe {
+        let _ = CloseHandle(token);
+    }
+    elevated
+}
+
+/// Whether the process owning `window` runs elevated.
+fn window_process_is_elevated(window: isize) -> Option<bool> {
+    let mut process_id = 0u32;
+    unsafe { GetWindowThreadProcessId(hwnd(window), Some(&mut process_id)) };
+    if process_id == 0 {
+        return None;
+    }
+    let process =
+        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) }.ok()?;
+    let token = open_process_token(process);
+    let elevated = match token {
+        Some(token) => token_is_elevated(token),
+        None => None,
+    };
+    if let Some(token) = token {
+        unsafe {
+            let _ = CloseHandle(token);
+        }
+    }
+    unsafe {
+        let _ = CloseHandle(process);
+    }
+    elevated
+}
+
+/// The [`ScrollActuator`] the assembly root hands to the driver (`docs/32` `P7.05`).
+///
+/// The port takes `notches` and nothing else (`crates/snapclip-capture/src/scroll/ports.rs:196`)
+/// because the target, the aim point, the transport and the aim are decided **once**, before the
+/// first notch: rebuilding them per step would let the tenth step aim somewhere the first one did
+/// not, which is the failure `docs/30` §24.6 rule 1 exists to prevent.
+///
+/// Generic over [`InjectionTarget`] so that the port's own behaviour — one platform call per step,
+/// and what a switch does — is testable without a desktop; the assembly root names the default,
+/// which is the real platform.
+pub(crate) struct WindowWheelActuator<T = Win32Injection> {
+    target: isize,
+    screen: Point,
+    axis: Axis,
+    path: InjectPath,
+    aim: Aim,
+    injection: T,
+}
+
+impl WindowWheelActuator<Win32Injection> {
+    /// Decide the transport from `probe`, then drive `target` at `screen`.
+    pub(crate) fn new(target: isize, screen: Point, axis: Axis, probe: TargetProbe) -> Self {
+        Self::with_choice(target, screen, axis, choose(&probe), Win32Injection)
+    }
+}
+
+impl<T: InjectionTarget> WindowWheelActuator<T> {
+    /// Built from an already-decided [`Choice`] — the shape `new` uses once it has asked
+    /// [`choose`], and the shape a test uses to pin one transport.
+    pub(crate) fn with_choice(
+        target: isize,
+        screen: Point,
+        axis: Axis,
+        choice: Choice,
+        injection: T,
+    ) -> Self {
+        Self {
+            target,
+            screen,
+            axis,
+            path: choice.path(),
+            aim: choice.aim(),
+            injection,
+        }
+    }
+
+    /// The injection target, so a test can read what the port actually did.
+    #[cfg(test)]
+    pub(crate) fn injection(&self) -> &T {
+        &self.injection
+    }
+}
+
+impl<T: InjectionTarget> ScrollActuator for WindowWheelActuator<T> {
+    type Path = InjectPath;
+
+    fn path(&self) -> Self::Path {
+        self.path
+    }
+
+    /// The other transport, or `None` when there is no other one.
+    ///
+    /// `ActuatorWatch` asks this only after the current path stopped moving the target
+    /// (`scroll/loop_control.rs`, `P3.03`), and lets it happen at most twice. Moving to a post
+    /// also settles the aim, because that is the mapping the decision table itself uses
+    /// (`:189`: a post names its window and carries its coordinates, so nothing has to be aimed).
+    fn switch(&mut self, from: Self::Path) -> Option<Self::Path> {
+        match from {
+            InjectPath::SendInput => {
+                self.path = InjectPath::PostMessageW;
+                self.aim = Aim::AssumePlaced;
+                Some(self.path)
+            }
+            InjectPath::PostMessageW => None,
+        }
+    }
+
+    fn inject(&mut self, notches: i32) -> InjectOutcome {
+        inject(
+            &self.injection,
+            &InjectRequest {
+                target: self.target,
+                screen: self.screen,
+                notches,
+                axis: self.axis,
+                path: self.path,
+                aim: self.aim,
+            },
+        )
     }
 }
 
@@ -797,6 +1049,138 @@ mod tests {
         );
     }
 
+    // --- the port adapter and the two run-time settings (docs/32 P7.05) ---
+
+    #[test]
+    fn routing_of_maps_only_the_three_documented_values() {
+        assert_eq!(routing_of(0), WheelRouting::Focus);
+        assert_eq!(routing_of(1), WheelRouting::Hybrid);
+        assert_eq!(routing_of(2), WheelRouting::MousePosition);
+        assert_eq!(
+            routing_of(3),
+            WheelRouting::Unknown,
+            "winuser.h:5321-5325 documents 0, 1 and 2 only; a fourth value must not be \
+             guessed into one of them, because the guess decides where the wheel lands"
+        );
+        assert_eq!(routing_of(u32::MAX), WheelRouting::Unknown);
+    }
+
+    #[test]
+    fn lines_of_treats_zero_as_a_page_and_falls_back_to_the_measured_default() {
+        assert_eq!(
+            lines_of(0),
+            DEFAULT_LINES_PER_NOTCH,
+            "0 means 'scroll a page per notch', which is not a line count this pipeline can \
+             turn into pixels; the plan starts from the measured default and the loop corrects it"
+        );
+        assert_eq!(lines_of(3), 3);
+        assert_eq!(lines_of(17), 17);
+    }
+
+    /// `path()` answers the decision made at session start, not a fresh question per step.
+    #[test]
+    fn the_actuator_reports_the_path_it_was_given() {
+        let foreground = WindowWheelActuator::with_choice(
+            ROOT,
+            SCREEN,
+            Axis::Vertical,
+            choose(&probe(false, false, true, WheelRouting::MousePosition)),
+            Scripted::tree(),
+        );
+        assert_eq!(foreground.path(), InjectPath::SendInput);
+
+        let elevated = WindowWheelActuator::with_choice(
+            ROOT,
+            SCREEN,
+            Axis::Vertical,
+            choose(&probe(true, false, true, WheelRouting::MousePosition)),
+            Scripted::tree(),
+        );
+        assert_eq!(elevated.path(), InjectPath::PostMessageW);
+    }
+
+    /// One step is one platform call: the adapter must not aim *and* post, or inject twice.
+    #[test]
+    fn one_injection_is_one_platform_call() {
+        let mut send_input = WindowWheelActuator::with_choice(
+            ROOT,
+            SCREEN,
+            Axis::Vertical,
+            choose(&probe(false, false, true, WheelRouting::MousePosition)),
+            Scripted::tree(),
+        );
+        let outcome = send_input.inject(3);
+        assert_eq!(outcome.status, InjectStatus::Posted);
+        let scripted = send_input.injection();
+        let record = scripted.record.borrow();
+        assert_eq!(
+            record.wheels,
+            vec![wheel_delta(Axis::Vertical, 3)],
+            "the port hands the notches straight to the transport's own units"
+        );
+        assert_eq!(
+            record.cursor.len(),
+            1,
+            "under MOUSE_POS routing the aim is part of the injection"
+        );
+        assert!(record.posts.is_empty());
+        drop(record);
+
+        let mut post = WindowWheelActuator::with_choice(
+            ROOT,
+            SCREEN,
+            Axis::Vertical,
+            choose(&probe(true, false, true, WheelRouting::MousePosition)),
+            Scripted::tree(),
+        );
+        let outcome = post.inject(3);
+        assert_eq!(outcome.status, InjectStatus::Posted);
+        assert_eq!(outcome.target_window, Some(RENDERER));
+        let scripted = post.injection();
+        let record = scripted.record.borrow();
+        assert_eq!(record.posts.len(), 1);
+        assert!(
+            record.cursor.is_empty() && record.wheels.is_empty(),
+            "a post carries its own coordinates, so nothing is aimed and no input is sent"
+        );
+    }
+
+    /// Switching transports happens mid-session (`ActuatorWatch`, `P3.03`), so the aim has to
+    /// follow the new path: a post that still placed the cursor would move the user's pointer for
+    /// no reason, and a `SendInput` that assumed placement would not move it at all.
+    #[test]
+    fn switching_to_a_post_settles_the_aim_and_there_is_no_third_transport() {
+        let mut actuator = WindowWheelActuator::with_choice(
+            ROOT,
+            SCREEN,
+            Axis::Vertical,
+            choose(&probe(false, false, true, WheelRouting::MousePosition)),
+            Scripted::tree(),
+        );
+        assert_eq!(actuator.path(), InjectPath::SendInput);
+
+        assert_eq!(
+            actuator.switch(InjectPath::SendInput),
+            Some(InjectPath::PostMessageW)
+        );
+        assert_eq!(actuator.path(), InjectPath::PostMessageW);
+        actuator.inject(1);
+        let scripted = actuator.injection();
+        let record = scripted.record.borrow();
+        assert_eq!(record.posts.len(), 1);
+        assert!(
+            record.cursor.is_empty(),
+            "after the switch the aim is AssumePlaced: the post names its window"
+        );
+        drop(record);
+
+        assert_eq!(
+            actuator.switch(InjectPath::PostMessageW),
+            None,
+            "the vocabulary is two transports, not a chain of retries (§24.6 rule 1)"
+        );
+    }
+
     // --- the decision table (§24.6; task P3.02) ---
 
     fn probe(
@@ -913,9 +1297,12 @@ mod tests {
 
     #[test]
     fn the_decision_table_is_in_one_place() {
-        // Exit condition 3 of `P3.02`: the table has exactly one home. `TargetProbe`'s
-        // two elevation fields *are* the table's inputs, so if someone re-derives the
-        // path elsewhere they have to name them — which is what this scan notices.
+        // Exit condition 3 of `P3.02`, extended by `P7.05`: the table has exactly one home, and
+        // every input field has exactly three legal roles — **declared** by the probe struct,
+        // **read** by the table, and **set** by the one constructor that gathers the facts from
+        // the platform (`at_session_start`). The earlier form of this test said "two mentions",
+        // which was true only while nothing in production built a probe; a fourth mention still
+        // means someone is re-deriving the decision somewhere else, which is what it notices.
         let source = include_str!("scroll_actuator.rs");
         let production = source
             .split_once("#[cfg(test)]")
@@ -927,16 +1314,36 @@ mod tests {
             1,
             "the decision table must appear exactly once"
         );
-        assert_eq!(
-            production.matches("target_is_elevated").count(),
-            2,
-            "`target_is_elevated` is read by the table and declared by the probe struct; \
-             a third mention means the decision is being re-derived somewhere else"
-        );
-        assert_eq!(
-            production.matches("self_is_elevated").count(),
-            2,
-            "`self_is_elevated` is read by the table and declared by the probe struct"
-        );
+
+        for field in [
+            "target_is_elevated",
+            "self_is_elevated",
+            "target_is_foreground",
+            "routing",
+        ] {
+            assert_eq!(
+                production.matches(&format!("pub(crate) {field}:")).count(),
+                1,
+                "`{field}` must be declared exactly once, by the probe struct"
+            );
+            assert_eq!(
+                production.matches(&format!("probe.{field}")).count(),
+                1,
+                "`{field}` must be read exactly once, and that read belongs to the table"
+            );
+        }
+
+        for field in [
+            "target_is_elevated",
+            "self_is_elevated",
+            "target_is_foreground",
+        ] {
+            assert_eq!(
+                production.matches(field).count(),
+                3,
+                "`{field}` has three roles (declare / read / construct); a fourth mention means \
+                 the decision is being re-derived outside `choose`"
+            );
+        }
     }
 }

@@ -527,6 +527,20 @@ struct OverlayController {
     /// The panel model the overlay paints (docs/30 §19.1/§19.4/§19.7), folded forward from
     /// `scroll_preview` on every [`SCROLL_READY_MESSAGE`].
     scroll_panel: Option<crate::scroll::panel::ScrollPanel>,
+    /// The layout of the monitor this session's frame came from.
+    ///
+    /// Kept so the scroll entry can turn the window snapshot's **virtual-desktop** rectangles into
+    /// this overlay's **monitor-local** ones (`docs/32` `P7.05`); the conversion itself lives in
+    /// `windows/scroll_target.rs`, which is the only place allowed to do it.
+    monitor_layout: Option<MonitorLayout>,
+    /// The running scroll session, once a selection has been handed over (`docs/32` ADR-19).
+    ///
+    /// The controller owns it because it owns the thread's lifetime: `teardown` joins the driver,
+    /// and a session that outlived its controller would be a thread nobody can stop.
+    scroll_runtime: Option<crate::scroll::session::ScrollRuntime>,
+    /// Whether `F7` started this capture session — i.e. whether confirming it means "start
+    /// scrolling" rather than "produce a screenshot" (`docs/32` §4.4, `OQ-27`).
+    scroll_entry_armed: bool,
 }
 
 impl OverlayController {
@@ -625,6 +639,9 @@ impl OverlayController {
             previous_foreground: null_mut(),
             scroll_preview: None,
             scroll_panel: None,
+            monitor_layout: None,
+            scroll_runtime: None,
+            scroll_entry_armed: false,
         }
     }
 

@@ -22,11 +22,11 @@ use ::windows::core::BOOL;
 use ::windows::Win32::Graphics::Dwm::{
     DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
 };
-use ::windows::Win32::Graphics::Gdi::ScreenToClient;
+use ::windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
 use ::windows::Win32::UI::WindowsAndMessaging::{
     CWP_SKIPINVISIBLE, ChildWindowFromPointEx, EnumChildWindows, EnumWindows,
-    GA_PARENT, GWL_EXSTYLE, GetAncestor, GetClassNameW, GetDesktopWindow, GetWindowLongPtrW, GetWindowRect,
-    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
+    GA_PARENT, GWL_EXSTYLE, GetAncestor, GetClassNameW, GetClientRect, GetDesktopWindow,
+    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
     WINDOW_EX_STYLE, WS_EX_LAYERED, WS_EX_TRANSPARENT,
 };
 
@@ -201,6 +201,34 @@ pub fn frame_bounds(hwnd: isize) -> Option<Rect> {
     let bounds = to_rect(fallback);
     (!bounds.is_empty()).then_some(bounds)
 }
+
+/// The centre of `hwnd`'s **client** area, in virtual-desktop screen pixels.
+///
+/// This is where the pointer has to sit for a wheel-routed injection to land on the window
+/// (`docs/30` §24.6 rule 1: `SendInput` goes to the window under the cursor, so the cursor is part
+/// of the injection). The client area, not the frame: the title bar is not part of the document,
+/// and the scroll actuator's own documentation says a cursor is placed over the client area
+/// (`crates/snapclip-capture/src/windows/scroll_actuator.rs`).
+pub fn client_center(hwnd: isize) -> Option<Point> {
+    if !is_window(hwnd) {
+        return None;
+    }
+    let window = to_hwnd(hwnd);
+    let mut client = RECT::default();
+    if unsafe { GetClientRect(window, &mut client) }.is_err() {
+        return None;
+    }
+    let mut centre = POINT {
+        x: client.left + (client.right - client.left) / 2,
+        y: client.top + (client.bottom - client.top) / 2,
+    };
+    if unsafe { ClientToScreen(window, &mut centre) }.as_bool() {
+        Some(Point::new(centre.x, centre.y))
+    } else {
+        None
+    }
+}
+
 
 /// Enumerate this desktop's visible, non-minimised, non-click-through top-level
 /// windows in Z order (frontmost first).

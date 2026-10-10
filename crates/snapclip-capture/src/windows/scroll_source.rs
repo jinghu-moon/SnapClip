@@ -56,7 +56,6 @@ pub(crate) use crate::scroll::ports::{EndReason, FrameError, FrameSource, Poll};
 use super::providers::{ProviderKind, ScrollFrame};
 use super::win::d3d11::GraphicsDevice;
 use super::win::wgc::{WgcError, WgcSession};
-use super::monitor::{self, CapturedMonitor};
 use ::windows::Win32::Foundation::HWND;
 use ::windows::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindow};
 
@@ -325,6 +324,80 @@ impl FrameSource for WgcFrameSource {
     }
 }
 
+/// A [`FrameSource`] whose backend is opened lazily, **on the driver thread** (`docs/32` `P7.05`).
+///
+/// ## Why it takes a device instead of making one
+///
+/// `ScrollRuntime::start`'s factory runs on the driver thread and returns `F: FrameSource`, not a
+/// `Result` (`crates/snapclip-capture/src/scroll/session.rs:689`): a `WgcFrameSource` owns a
+/// device and is not `Send`, while "the window could not be opened" still has to be reported. So
+/// the open happens *inside* the factory and the outcome is stored — an open failure is an
+/// [`EndReason::CaptureFailed`] stream, which the driver already turns into a `StopReason`.
+///
+/// The device is passed in rather than created here on purpose: `docs/30` §21.3/§11.2 and the
+/// gate `this_module_never_becomes_a_context_user` say this file is **not** a context user, and
+/// `T-THREAD-1` is why. The assembly's closure creates the device on the driver thread (which is
+/// what makes the driver its owner, `§21.3.1`) and hands it here; this module only drives what it
+/// was given.
+///
+/// The viewport is the caller's rectangle — the DWM visible bounds a plan was built from
+/// (`docs/31` `P3.10`) — and it does not change when the open fails: the session still knows what
+/// it asked for, which is what the failure is reported against.
+pub(crate) struct OpeningFrameSource {
+    opened: Result<WgcFrameSource, FrameError>,
+    viewport: Rect,
+}
+
+impl OpeningFrameSource {
+    /// Open `window` for `axis` on the calling thread, from a device that may itself have failed.
+    ///
+    /// Both failures — "no device" and "no window" — arrive as **one** answer, because the factory
+    /// cannot return a `Result` (see the type's doc): the caller creates the device (it is the
+    /// assembly's job, not this file's) and hands the outcome over.
+    pub(crate) fn open(
+        device: Result<std::sync::Arc<GraphicsDevice>, String>,
+        window: isize,
+        axis: Axis,
+        viewport: Rect,
+    ) -> Self {
+        let opened = match device {
+            Ok(device) => WgcFrameBackend::open(device, window)
+                .map(|backend| WgcFrameSource::new(Box::new(backend), axis)),
+            Err(detail) => Err(FrameError::Transient {
+                context: "GraphicsDevice::create",
+                detail,
+            }),
+        };
+        Self { opened, viewport }
+    }
+
+    /// Built from an already-opened (or already-failed) source — the shape the tests need, and the
+    /// only way to exercise the failure branch without a desktop.
+    #[cfg(test)]
+    pub(crate) fn from_result(opened: Result<WgcFrameSource, FrameError>, viewport: Rect) -> Self {
+        Self { opened, viewport }
+    }
+}
+
+impl FrameSource for OpeningFrameSource {
+    fn next(&mut self, timeout: Duration) -> Result<Poll, FrameError> {
+        match &mut self.opened {
+            Ok(source) => source.next(timeout),
+            Err(error) => {
+                // Not a panic and not a retry: the target was resolved before the session started,
+                // so failing to open means it closed, was minimised between the snapshot and this
+                // call, or moved to another monitor. The driver maps this to `CaptureFailed`.
+                eprintln!("[snapclip][scroll] the frame source could not be opened: {error}");
+                Ok(Poll::Ended(EndReason::CaptureFailed))
+            }
+        }
+    }
+
+    fn viewport(&self) -> Rect {
+        self.viewport
+    }
+}
+
 /// Per-row FNV digests, the same ones §11.3 uses to compare frames.
 fn row_digests(pixels: &[u8], size: (u32, u32)) -> Vec<u64> {
     let stride = size.0 as usize * 4;
@@ -425,64 +498,13 @@ fn qpc_now() -> i64 {
     value
 }
 
-/// The geometry a scroll session is opened with (`docs/30` §9.2, §11.2).
-///
-/// It is produced once, from the window, and never re-derived behind the caller's back: the
-/// content size comes from the capture item (§24.2.1 fact 7 — the item's size is the content
-/// area, **not** the window rectangle), the frame rectangle is where the pointer has to sit for
-/// the wheel-routed injection paths (§24.6), and the monitor decides the capture's scale.
-/// Its first production consumer is the session assembly (`P3.09`); until then only the
-/// geometry it reports is exercised.
-#[derive(Clone)]
-pub(crate) struct ScrollSourceRuntime {
-    handle: isize,
-    content: (u32, u32),
-    frame: Rect,
-    monitor: CapturedMonitor,
-}
-
-impl ScrollSourceRuntime {
-    pub(crate) fn open(handle: isize, content: (u32, u32)) -> Result<Self, FrameError> {
-        let detail = |what: &'static str, message: String| FrameError::Transient {
-            context: what,
-            detail: message,
-        };
-        let frame = super::win::window::frame_bounds(handle)
-            .ok_or_else(|| detail("frame_bounds", format!("{handle:#x} has no DWM frame bounds")))?;
-        let centre = crate::geometry::Point::new(
-            frame.left + frame.width() / 2,
-            frame.top + frame.height() / 2,
-        );
-        let monitor = monitor::captured_monitor_at(centre)
-            .map_err(|message| detail("captured_monitor_at", message))?;
-        Ok(Self {
-            handle,
-            content,
-            frame,
-            monitor,
-        })
-    }
-
-    pub(crate) fn handle(&self) -> isize {
-        self.handle
-    }
-
-    pub(crate) fn content(&self) -> (u32, u32) {
-        self.content
-    }
-
-    pub(crate) fn frame(&self) -> Rect {
-        self.frame
-    }
-
-    pub(crate) fn monitor(&self) -> &CapturedMonitor {
-        &self.monitor
-    }
-
-    pub(crate) fn viewport(&self) -> Rect {
-        Rect::new(0, 0, self.content.0 as i32, self.content.1 as i32)
-    }
-}
+// `ScrollSourceRuntime` used to live here: a `{ handle, content, frame, monitor }` bundle whose
+// doc said its "first production consumer is the session assembly (`P3.09`)". It never got one,
+// and `P7.05` *is* that assembly — it resolves the window through `windows/scroll_target.rs`,
+// takes the visible rectangle from the plan, and gets the monitor from the overlay's own session,
+// so the bundle had nothing left to contribute. Deleted rather than kept "for later": `docs/32`
+// §1.5 A4 asked for exactly this decision, and a type that looks like an entry point while nothing
+// calls it is the illusion §1.4 is about.
 
 #[cfg(test)]
 mod tests {
@@ -492,9 +514,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        BackendFallback, BackendPoll, EndReason, FrameBackend, FrameError, FrameSource, Poll,
-        ProviderKind, SCROLL_BACKENDS, TargetGeometry, TargetLiveness, TopologyOutcome,
-        WgcFrameSource, next_scroll_backend, topology_outcome,
+        BackendFallback, BackendPoll, EndReason, FrameBackend, FrameError, FrameSource,
+        OpeningFrameSource, Poll, ProviderKind, SCROLL_BACKENDS, TargetGeometry, TargetLiveness,
+        TopologyOutcome, WgcFrameSource, next_scroll_backend, topology_outcome,
     };
     use crate::geometry::Rect;
     use crate::scroll::observation::{Axis, Observation};
@@ -1215,6 +1237,73 @@ mod tests {
         );
     }
 
+    // --- the opening wrapper (docs/32 P7.05) ---
+
+    /// A window that cannot be opened is an **end of stream**, not a panic and not an endless
+    /// `Idle`.
+    ///
+    /// `ScrollRuntime::start`'s factory returns `F: FrameSource`, never a `Result`
+    /// (`crates/snapclip-capture/src/scroll/session.rs:689`), because a real frame source is not
+    /// `Send` while "it could not be opened" still has to be reported. This is that channel.
+    #[test]
+    fn an_open_failure_ends_the_stream_instead_of_panicking() {
+        let viewport = Rect::new(0, 0, 640, 480);
+        let mut wrapper = OpeningFrameSource::from_result(
+            Err(FrameError::Transient {
+                context: "WgcFrameBackend::open",
+                detail: "no such window".to_string(),
+            }),
+            viewport,
+        );
+        assert_eq!(
+            wrapper.viewport(),
+            viewport,
+            "the viewport is known before the open: it is the rectangle the plan was built from"
+        );
+        for attempt in 0..2 {
+            assert!(
+                matches!(
+                    wrapper.next(Duration::from_millis(50)),
+                    Ok(Poll::Ended(EndReason::CaptureFailed))
+                ),
+                "attempt {attempt} must end the stream: an open failure is not a hiccup, and \
+                 retrying it would spin on a window that was already resolved before the session"
+            );
+        }
+    }
+
+    /// The happy path is a delegation: whatever the opened source answers is the answer.
+    #[test]
+    fn an_opened_source_is_delegated_to_unchanged() {
+        let viewport = Rect::new(10, 20, 650, 500);
+        let opened = source((8, 4), vec![ScriptedStep::Ended(EndReason::TargetLost)]);
+        let mut wrapper = OpeningFrameSource::from_result(Ok(opened), viewport);
+        assert_eq!(wrapper.viewport(), viewport);
+        assert!(matches!(
+            wrapper.next(Duration::from_millis(50)),
+            Ok(Poll::Ended(EndReason::TargetLost))
+        ));
+    }
+
+    /// A device that could not be created is the same kind of answer as a window that could not
+    /// be opened: the stream ends, and the driver reports `CaptureFailed` instead of panicking on
+    /// a thread with no caller left to catch it.
+    #[test]
+    fn a_failed_device_creation_also_ends_the_stream() {
+        let viewport = Rect::new(10, 20, 650, 500);
+        let mut wrapper = OpeningFrameSource::open(
+            Err("D3D11CreateDevice failed with 0x887A0004".to_string()),
+            0x1234,
+            Axis::Vertical,
+            viewport,
+        );
+        assert_eq!(wrapper.viewport(), viewport);
+        assert!(matches!(
+            wrapper.next(Duration::from_millis(50)),
+            Ok(Poll::Ended(EndReason::CaptureFailed))
+        ));
+    }
+
     #[test]
     fn this_module_never_becomes_a_context_user() {
         const SOURCE: &str = include_str!("scroll_source.rs");
@@ -1228,7 +1317,13 @@ mod tests {
         // `providers::ScrollFrame::read_region`, which is the boundary, and that is the point.
         for needle in [
             ".context()",
-            "GraphicsDevice::create",
+            // The **call**, not the name. `P7.05` gave this file a legitimate mention of the
+            // device factory: `OpeningFrameSource::open` takes `Result<Arc<GraphicsDevice>, String>`
+            // and labels a failed creation with `Transient { context: "GraphicsDevice::create" }`.
+            // Naming the call you failed in is not reaching a context — creating one would be, and
+            // that is what the parenthesis distinguishes. `.context()` below stays a bare needle,
+            // because nothing legitimate here has to spell it at all.
+            "GraphicsDevice::create(",
             "read_back_bgra",
             "read_back_region_bgra",
         ] {
