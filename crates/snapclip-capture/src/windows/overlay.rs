@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use windows_sys::Win32::{
     Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT, WPARAM},
-    Graphics::Gdi::{BeginPaint, EndPaint, ScreenToClient, PAINTSTRUCT},
+    Graphics::Gdi::{BeginPaint, CreateRectRgn, EndPaint, ScreenToClient, SetWindowRgn, PAINTSTRUCT},
     System::LibraryLoader::GetModuleHandleW,
     System::Threading::GetCurrentThreadId,
     UI::{

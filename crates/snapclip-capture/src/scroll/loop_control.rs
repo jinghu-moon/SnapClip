@@ -246,18 +246,35 @@ pub(crate) fn inject_and_settle<H: StepHost>(
         host.inject(notches).map_err(StepError::Injection)?;
     }
     settle.begin(host.now());
+    let started = host.now();
+    let mut digests = 0u32;
+    let mut empty = 0u32;
 
     loop {
         if let Some(cancelled) = cancellation_error(host) {
             return Err(cancelled);
         }
         match host.digest() {
-            Some(digest) => match settle.sample(digest, host.now()) {
-                SettleVerdict::Waiting => continue,
-                verdict => return Ok(Settled { verdict, digest }),
-            },
+            Some(digest) => {
+                digests += 1;
+                match settle.sample(digest, host.now()) {
+                    SettleVerdict::Waiting => continue,
+                    verdict => return Ok(Settled { verdict, digest }),
+                }
+            }
             None => {
+                empty += 1;
                 if settle.timed_out(host.now()) {
+                    // "No frame" is a conclusion about **evidence**, and the counters say which kind
+                    // of absence it was (`P7.11`): `digests == 0` with a large `empty` means the source
+                    // answered `Err`/`Ended` for the whole window — a stream that is over, not a page
+                    // that is still. Without these two numbers the first real sessions could only say
+                    // "NoFrame" (docs/32 §9 P7.11 真机演练记录).
+                    eprintln!(
+                        "[snapclip][scroll] settle saw no usable digest in {} ms: digests={digests} \
+                         empty={empty}",
+                        started.elapsed().as_millis()
+                    );
                     return Err(StepError::NoFrame);
                 }
             }

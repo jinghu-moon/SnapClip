@@ -324,10 +324,15 @@ impl FrameSource for WgcFrameSource {
                         Some(crop) => match crop_frame(&pixels, size, crop) {
                             Ok(cropped) => cropped,
                             Err(detail) => {
-                                return Ok(self.end(
-                                    EndReason::CaptureFailed,
-                                    format!("the session's region does not fit the frame: {detail}"),
-                                ))
+                                // Said out loud, not just carried in the `EndReason`: an ending whose
+                                // only witness is a `Poll::Ended` reaching a caller that logs the
+                                // *reason* and not the detail is an ending nobody can diagnose
+                                // (`P7.11`).
+                                let detail = format!(
+                                    "the session's region {crop:?} does not fit the frame: {detail}"
+                                );
+                                eprintln!("[snapclip][scroll] {detail}");
+                                return Ok(self.end(EndReason::CaptureFailed, detail));
                             }
                         },
                     };

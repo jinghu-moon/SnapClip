@@ -223,6 +223,17 @@ impl OverlayController {
         );
         self.watch_scroll_preview(runtime.preview().clone(), cross_len, extent);
         self.scroll_runtime = Some(runtime);
+        // The region hole (`P7.07c`): from here until the session ends, the overlay covers **only** the
+        // panel. That is what keeps the target un-occluded — and therefore painting, which is the only
+        // way the driver ever sees the rows it is scrolling (`set_window_region`).
+        if let Some(geometry) = self.session.geometry() {
+            let (panel, _) = crate::windows::win::d2d::scroll_panel_rect(
+                geometry.work_area,
+                geometry.frame,
+                geometry.dpi,
+            );
+            self.set_window_region(Some(panel));
+        }
         eprintln!(
             "[snapclip][capture] scroll session started window=0x{window:x} cross={cross_len} \
              extent={extent} capture_dpi={}",
@@ -276,6 +287,10 @@ impl OverlayController {
         let Some(mut runtime) = self.scroll_runtime.take() else {
             return;
         };
+        // The whole window comes back before anything else: leaving the hole in place would hide the
+        // panel behind the desktop and let the user's clicks fall through what looks like our UI
+        // (`P7.07c`).
+        self.set_window_region(None);
         runtime.controller().cancel();
         let Some(session) = runtime.teardown() else {
             eprintln!(
@@ -554,8 +569,16 @@ impl OverlayController {
         self.scroll_entry_armed = false;
         self.stop_scroll_session(reason);
         self.worker.cancel();
-        self.export_worker.cancel();
-        self.current_generation = 0;
+        // The export worker is cancelled only when **this** capture session has an export in flight.
+        // A scroll session's export outlives the capture session by design (ADR-19: the hand-over ends
+        // the capture session, and the bands are written afterwards), so an `Esc` pressed after the
+        // panel has already stopped must not delete the file that export is writing — which is exactly
+        // what the fifth real run did: `artifact ready … path=…png` immediately followed by
+        // `export discarded … (cancelled)` (`P7.12`'s D4).
+        if self.session.state() == CaptureState::Exporting {
+            self.export_worker.cancel();
+            self.current_generation = 0;
+        }
         self.release_session();
         if was_active {
             self.sink.on_cancelled(&session_id, reason);

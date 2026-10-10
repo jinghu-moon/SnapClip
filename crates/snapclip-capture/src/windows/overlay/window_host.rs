@@ -493,6 +493,38 @@ pub(super) fn snap_radius_px() -> u32 {
     DEFAULT_SNAP_RADIUS_PX
 }
 
+impl OverlayController {
+    /// Shrink this overlay's window region to `rect`, or restore the whole window with `None`
+    /// (`docs/32` `P7.07c`, `docs/30` §13.4).
+    ///
+    /// A fullscreen **opaque** topmost window does two things to the target while a scroll session
+    /// runs. It takes the wheel — under `MOUSE_POS` routing the system asks who is under the cursor —
+    /// and, less obviously, it makes Windows report the target as **occluded**, at which point a
+    /// Chromium browser stops painting it. The fifth real run plus `docs/Temp/wheel-ab.txt` are what
+    /// proved the second half is the blocker: the same posted `WM_MOUSEWHEEL` scrolls Edge three
+    /// different ways while nothing covers it, and changes not one byte while the overlay is up.
+    ///
+    /// A region hole is the design's own answer (§13.4): the content area is not covered at all, so the
+    /// target keeps producing frames and input reaches it naturally — and as a side effect the user can
+    /// **see** the page scroll instead of a frozen snapshot. The panel keeps its own rectangle, so its
+    /// buttons stay clickable, which is why this is `SetWindowRgn` and not `WS_EX_TRANSPARENT` (the
+    /// extended style cannot be split between the two areas).
+    ///
+    /// `redraw = 1` (Win32's `TRUE`) repaints the exposed area; the third parameter is an `i32` in
+    /// `windows-sys`, not the `BOOL` the C header spells.
+    pub(super) fn set_window_region(&self, rect: Option<Rect>) {
+        unsafe {
+            // `TRUE` hands the region object to the system, which frees it when the region is
+            // replaced — deleting it here would be a double free.
+            let region = match rect {
+                Some(rect) => CreateRectRgn(rect.left, rect.top, rect.right, rect.bottom),
+                None => null_mut(),
+            };
+            SetWindowRgn(self.window, region, 1);
+        }
+    }
+}
+
 pub(super) fn point_from_lparam(lparam: LPARAM) -> POINT {
     POINT {
         x: (lparam & 0xFFFF) as u16 as i16 as i32,
