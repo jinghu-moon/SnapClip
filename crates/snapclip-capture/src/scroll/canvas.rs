@@ -545,7 +545,16 @@ impl BandStore {
         let end = first_row + rows;
         let mut out = vec![0u8; row_bytes * rows as usize];
 
-        for entry in &self.resident {
+        // Canvas bands only. A thumbnail row is `cross_len / scale` px wide while a canvas row is
+        // `cross_len`, so copying a preview band with the canvas stride reads past the end of its own
+        // bytes — which is exactly what `P7.08`'s first live driver run produced (`range end index
+        // 80640 out of range for slice of length 8904`). The store already states the rule next to
+        // `canvas_bands`: "anything asking which rows the canvas holds has to exclude it".
+        for entry in self
+            .resident
+            .iter()
+            .filter(|entry| entry.band.scale == FULL_SCALE)
+        {
             copy_overlap(
                 &entry.band.rows,
                 entry.band.first_row,
@@ -3250,6 +3259,39 @@ mod tests {
                 committed: 2,
                 discarded: 0,
             },
+        );
+    }
+
+    /// `P7.08`'s defect, pinned: a read of the **canvas** must never walk a **preview** band.
+    ///
+    /// The first live driver run that called `refresh_window` (the real caller `P7.08` wired up) died
+    /// inside `copy_overlap` with `range end index 80640 out of range for slice of length 8904`: those
+    /// are 63 canvas rows and 21 thumbnail rows of the same canvas, i.e. one band copied with the other
+    /// one's row width. The store documents the rule next to `canvas_bands` ("anything asking which
+    /// rows the canvas holds has to exclude it") and every other reader applied it — `read_rows` did
+    /// not. A read over rows only a thumbnail covers must therefore come back as **absence**.
+    #[test]
+    fn a_canvas_read_never_walks_a_preview_band() {
+        const SCALE: u32 = 4;
+        let mut store = BandStore::new(CROSS, MemoryBudget::with_total(64 << 20));
+        store.insert(band(0, BAND_ROWS));
+        let preview_row_bytes = (CROSS * BYTES_PER_PIXEL / u64::from(SCALE)) as usize;
+        store.insert(Band::at_scale(
+            0,
+            SCALE,
+            vec![0xEE; 2 * preview_row_bytes],
+        ));
+
+        let read = store.read_rows(0, BAND_ROWS).expect("a covered range reads");
+        assert_eq!(
+            read.len() as u64,
+            CROSS * BYTES_PER_PIXEL * BAND_ROWS,
+            "a canvas read answers in canvas rows"
+        );
+        assert_eq!(
+            read,
+            band(0, BAND_ROWS).rows,
+            "the canvas band's bytes, not the thumbnail's: the two do not even share a row width"
         );
     }
 

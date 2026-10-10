@@ -956,6 +956,46 @@ impl ScrollDriver {
         if undos > 0 {
             self.publish_step(preview, Status::None, tick);
         }
+
+        // The consumer's window ask (`docs/32` ADR-20). Last, because it is the only command here
+        // that walks canvas rows: `follow` and `undo` are bookkeeping, this one is work.
+        self.refresh_requested_window(controller, preview);
+    }
+
+    /// Derive the thumbnail window the consumer asked for, if any (`docs/32` ADR-20).
+    ///
+    /// Runs here, on the driver thread, because `refresh_window` needs `&mut RecoveredImage` and the
+    /// canvas belongs to this thread — which is exactly why the consumer cannot do it and why the ask
+    /// had to travel as a command rather than as a call.
+    ///
+    /// Three answers and only one of them publishes: a window covered by the derivation announces
+    /// itself with [`PreviewUpdate::Bands`]; a request for nothing (`rows == 0`) and a window with no
+    /// whole thumbnail row in it (`window_bounds` returns `None` inside `refresh_window`) both write
+    /// nothing, because there is nothing to show and the strip keeps what it had.
+    fn refresh_requested_window(&mut self, controller: &ScrollController, preview: &PreviewStream) {
+        let Some(request) = controller.take_window_request() else {
+            return;
+        };
+        if request.rows == 0 {
+            return;
+        }
+        let scale = crate::scroll::preview::preview_scale(self.session.canvas().cross_len());
+        match crate::scroll::preview::refresh_window(
+            self.session.canvas_mut(),
+            scale,
+            request.first_row,
+            request.rows,
+        ) {
+            Ok(rows) if rows > 0 => preview.publish(PreviewUpdate::Bands {
+                first_row: request.first_row,
+                rows: u32::try_from(rows).unwrap_or(u32::MAX),
+                scale,
+            }),
+            Ok(_) => {}
+            Err(error) => eprintln!(
+                "[snapclip][scroll] the requested preview window could not be derived: {error:?}"
+            ),
+        }
     }
 
     /// One step's estimate, in the order §17.4 requires: build the reference from the **canvas**,
@@ -2082,6 +2122,63 @@ mod tests {
     /// The page serves exactly three driven frames and then goes away, so the fourth injection finds
     /// no target and the session ends with three steps committed. A budget of four would let a fourth
     /// step commit and the test would be asserting the arithmetic of its own fixture.
+    /// `docs/32` ADR-20: the driver derives **only** what the consumer asked for.
+    ///
+    /// Two runs over the same page: with a pending ask the strip gets thumbnail bands and the port
+    /// announces them, and without one the preview side of the store stays empty. The second half is
+    /// what keeps "the window is the consumer's choice" from decaying into "the driver derives
+    /// something anyway", which would spend band-filtering time on a window nobody is looking at.
+    #[test]
+    fn the_driver_derives_only_the_window_the_consumer_asked_for() {
+        use crate::scroll::preview::PreviewUpdate;
+        use crate::scroll::session::WindowRequest;
+
+        let run = |request: Option<WindowRequest>| {
+            let image = page(3000, 11);
+            let (page, pending) = SimulatedPage::new(image, 900, 60, 3);
+            let plan = ScrollPlan::new(Axis::Vertical, 320, 900, MemoryBudget::with_total(8 << 20));
+            let controller = ScrollController::new();
+            let preview = PreviewStream::new();
+            if let Some(request) = request {
+                controller.request_window(request);
+            }
+            let session =
+                ScrollDriver::new(&plan).run(page, LinkedActuator::new(pending), &controller, &preview);
+            (session, preview)
+        };
+
+        let (asked, preview) = run(Some(WindowRequest {
+            first_row: 0,
+            rows: 64,
+        }));
+        assert!(
+            asked.canvas().bands().resident_preview_bytes() > 0,
+            "the asked window must have been derived into the store: scale 3 over 64 rows is 21 \
+             whole thumbnail rows"
+        );
+        let mut announced = false;
+        while let Some(update) = preview.take() {
+            if matches!(update, PreviewUpdate::Bands { .. }) {
+                announced = true;
+            }
+        }
+        assert!(
+            announced,
+            "the derived window travels on the same port as everything else, as `Bands`"
+        );
+
+        let (unasked, _) = run(None);
+        assert_eq!(
+            unasked.canvas().bands().resident_preview_bytes(),
+            0,
+            "no ask ⇒ no derivation, even though the canvas itself is full"
+        );
+        assert!(
+            unasked.canvas().primary_len() > 0,
+            "the control case must have a canvas, or the assertion above would be vacuous"
+        );
+    }
+
     #[test]
     fn the_driver_closes_the_loop_from_injection_to_committed_rows() {
         use crate::scroll::preview::PreviewUpdate;

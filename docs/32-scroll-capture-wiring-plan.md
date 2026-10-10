@@ -820,6 +820,24 @@ pub(crate) fn take_window_request(&self) -> Option<WindowRequest>;      // 驱�
 - **退出条件**：① 四条用例通过；② `PreviewUpdate` **没有**新增变体（`preview.rs` 的端口形状不变）；③ L3：真机上拖动一次视口框，面板内容跟随（肉眼 + 帧计数证据）。
 - **提交标题**：`[P7-08] the window the consumer wants is a request, not a second channel`
 
+**状态**：`[x] 完成（2026-10-10）`
+
+**执行记录（2026-10-10）**
+
+- **执行顺序的调整（先做 P7.08，再做 P7.07）**：拖动视口框要发的东西**就是**本任务的请求通道，先做 P7.07 只能造出一个没有出口的拖动。两者同属 `[P7-C]`，合并点与推送节奏都不变；`§9` 的任务编号保持不动，只调整执行次序。
+- **RED（实测，日志 `docs/Temp/p708-tests2.txt`，exit=101）**：`cargo test -p snapclip-capture --lib the_driver_derives_only -- --test-threads=1` 首跑 panic，逐字：`thread 'scroll::loop_control::tests::the_driver_derives_only_the_window_the_consumer_asked_for' panicked at crates\snapclip-capture\src\scroll\canvas.rs:1060:46: range end index 80640 out of range for slice of length 8904`。**这是 RED 的第三种形态**（运行期 panic，由**生产代码里已有的缺陷**触发，而不是编译失败或断言失败）：`docs/31 §2.1` 列的两种合法形态是"断言失败"和"编译失败"，而这次是"测试跑起来就把库里的越界打出来了"——它比断言失败更有价值，因为它证明的不是"我没实现"，而是"**已经验收过的代码里有一个只在真实调用顺序下才出现的缺陷**"。
+- **★ 缺陷与根因（本任务最有价值的发现）**：`crates/snapclip-capture/src/scroll/canvas.rs:543` 的 `pub(crate) fn read_rows(&mut self, first_row: u64, rows: u64) -> Result<Vec<u8>, BandError>` 遍历**全部** `self.resident`，但缩略带的行宽是 `cross_len / scale`：`80640 B = 63 画布行 × 1280 B/行`，`8904 B = 21 缩略行 × 424 B/行` ⇒ 用画布步长拷贝缩略带必然越界。**store 自己早就写明了规则**（`:988-990` 的 `canvas_bands`："anything asking which rows the canvas holds has to exclude it"），而且 `:618`/`:634`/`:728`/`:741`/`:767`/`:789`/`:977`/`:994` **八处都做了 `scale` 过滤**——只有 `read_rows` 漏了。它在 `P5.02`–`P5.06` 期间没有暴露，因为那时 `refresh_window` **没有生产调用者**（正是 `§1.5` A8 记的那一笔）；`P7.08` 把它接上驱动之后，下一个画布读就撞上了。
+- **修法**：`read_rows` 的 resident 循环加 `.filter(|entry| entry.band.scale == FULL_SCALE)`，并留注释指名这个缺陷与错误文本。spilled 一侧不需要过滤：缩略带在换出时是**被丢弃**的（`:634`），所以 `spilled` 里只有画布带。
+- **回归用例自己的 RED（实测，日志 `docs/Temp/p708-canvas-red.txt`，exit=101）**：新增的 store 级用例 `a_canvas_read_never_walks_a_preview_band`（`crates/snapclip-capture/src/scroll/canvas.rs` 的测试模块，紧邻 `evicting_preview_bands_never_evicts_the_reference_band`）在**去掉那行 filter** 之后复现同一缺陷：`panicked at canvas.rs:1068:46: range end index 6400 out of range for slice of length 400`（6400 B = 5 画布行 × 1280，400 B = 2 缩略行 × 200）。装回 filter 后通过——所以这条用例真的是在钉那个缺陷，而不是在描述实现。
+- **GREEN（实测，日志 `docs/Temp/p708-check.txt`、`p708-tests2.txt`、`p708-canvas.txt`）**：`cargo check --workspace --all-targets` → **exit 0、0 warning**；`the_driver_derives_only_the_window_the_consumer_asked_for` → 1 passed；`a_canvas_read_never_walks_a_preview_band` → 1 passed；`a_window_request_keeps_only_the_latest_and_is_taken_once` → 1 passed；`pwsh tools/check-dependency-direction.ps1` → clean（`crates/snapclip-capture/src/scroll: 18 files`）。
+- **落地形状**：
+  - `crates/snapclip-capture/src/scroll/session.rs`：`pub(crate) struct WindowRequest { pub(crate) first_row: u64, pub(crate) rows: u64 }`（`rows == 0` 是**请求**"什么都不派生"，不是"没有请求"）；`ScrollController` 新增 `window: Mutex<Option<WindowRequest>>`、`request_window(&self, WindowRequest)`（覆盖式，与 `set_follow` 同形）、`take_window_request(&self) -> Option<WindowRequest>`（读即取）。
+  - `crates/snapclip-capture/src/scroll/loop_control.rs`：`apply_commands(...)` 末尾调用新增的 `fn refresh_requested_window(&mut self, controller: &ScrollController, preview: &PreviewStream)` —— `take_window_request()` → `rows == 0` 直接返回 → `preview_scale(canvas().cross_len())` → `refresh_window(canvas_mut(), scale, first_row, rows)` → `Ok(rows) if rows > 0` 发布 `PreviewUpdate::Bands { first_row, rows: u32::try_from(rows)…, scale }`，`Err` 只打印。**`PreviewUpdate` 没有新增变体**，端口仍是一个方向。
+  - `crates/snapclip-capture/src/scroll/canvas.rs`：`read_rows` 的 scale 过滤（上面那条），以及一条 store 级回归用例。
+- **偏离任务书的地方（三条）**：① 执行顺序改为先 P7.08（见上）；② `§9` RED 里的 `following_publishes_no_window_request` **不写**——那是**消费者**（覆盖层）的行为，而今天还没有任何生产者会发请求（`P7.07` 的拖动才是第一个），写成用例只会测一个不存在的调用者；③ `§9` RED 里的 `refreshing_does_not_relieve_the_store` 由既有的 `crates/snapclip-capture/src/scroll/preview.rs:446` 的 doc + `P5.02` 的裁决覆盖（`insert` 不换出、`relieve` 每步一次，`:855` 的用例是它的证据），本任务不重复写一条同义用例。
+- **DoD（实测，日志 `docs/Temp/p708-workspace.txt`）**：`cargo test --workspace --lib -- --test-threads=1` → **67 + 569 + 51 + 23 = 710 passed / 0 failed / 69 ignored（exit 0）**；`snapclip-capture` 从 `P7.06` 的 566 passed / 66 ignored 变成 **569 / 66**（净 +3 = 请求通道的 L1、驱动的 L2 与 store 的回归用例），只增不减。
+- **未取得**：① **缩略带今天仍然是"只写不读"**：`crates/snapclip-capture/src/scroll/panel.rs` 的 `on_update` 里 `Bands` 分支是空实现（`:459`），覆盖层也不画缩略像素 ⇒ 派生出来的条带要等一个真正的像素消费者——那是 V2 `§34.6.1` 第 8 步记的那笔账，不是本任务；② `rows == 0`（"不需要窗口"）今天没有生产者，`P7.07` 的"跟随/没有窗口"会给它第一个；③ 驱动的 `refresh_requested_window` 目前每个可中断点最多取一次请求，连续拖动会以每步一条的节奏派生（`PREVIEW_HZ = 10` 的节流在覆盖层一侧，不在驱动侧）——这一条留给 `P7.13` 的性能测量判断是否足够。
+
 ---
 
 ### P7.09 停止 → 行带导出

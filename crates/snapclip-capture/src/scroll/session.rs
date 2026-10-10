@@ -420,6 +420,26 @@ impl ScrollSession {
 /// **order** — and §20.5's "the first promise wins" *is* an order: pressing `Enter` and then `Esc`
 /// must export, not discard. One `AtomicU32` written with `compare_exchange` makes the first writer
 /// the winner without a lock, and makes the losing write a no-op rather than a silent overwrite.
+/// A consumer's ask for a slice of the canvas to be derived into thumbnails (`docs/32` ADR-20).
+///
+/// The window is chosen by the **consumer** because only it knows which part of the strip is on
+/// screen (`docs/30` §19.2), and the derivation runs on the **driver** because `refresh_window`
+/// needs `&mut RecoveredImage` and the canvas belongs to the driver thread. This value is the
+/// direction that was missing: the port carries driver → overlay, and this carries overlay → driver.
+///
+/// Capacity **one**, overwriting, like [`ScrollController::set_follow`]: a drag produces one of
+/// these per mouse move, and queueing them would make the preview lag the finger.
+///
+/// `rows == 0` is not "no request" — it is the request to derive **nothing**, which is what a
+/// consumer with no window to show wants (a hidden panel, or a strip whose content is off-canvas).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WindowRequest {
+    /// First canvas row of the window to derive.
+    pub(crate) first_row: u64,
+    /// How many canvas rows to derive; `0` means "none".
+    pub(crate) rows: u64,
+}
+
 pub(crate) struct ScrollController {
     /// 0 = nothing requested, 1 = `UserStopped`, 2 = `UserCancelled`. First write wins.
     stop: AtomicU32,
@@ -438,6 +458,10 @@ pub(crate) struct ScrollController {
     /// the loop instead would measure how long the loop took to look, which is precisely the thing
     /// the metric is supposed to expose rather than assume.
     cancel_at: Mutex<Option<Instant>>,
+    /// The window the consumer wants derived (`docs/32` ADR-20). A value like `follow`, not a
+    /// sticky bit: the newest ask is the one that matters, and an older one is not a promise anybody
+    /// is waiting on.
+    window: Mutex<Option<WindowRequest>>,
 }
 
 const STOP_NOTHING: u32 = 0;
@@ -452,6 +476,7 @@ impl ScrollController {
             follow: Mutex::new(None),
             shutdown: AtomicBool::new(false),
             cancel_at: Mutex::new(None),
+            window: Mutex::new(None),
         }
     }
 
@@ -552,6 +577,24 @@ impl ScrollController {
 
     pub(crate) fn is_shutdown(&self) -> bool {
         self.shutdown.load(Ordering::Acquire)
+    }
+
+    /// Ask the driver to derive `request`'s slice of the canvas into thumbnails (`docs/32` ADR-20).
+    ///
+    /// Overwrites any pending ask: a drag emits one per mouse move, and the newest is the only one
+    /// the strip can still be showing.
+    pub(crate) fn request_window(&self, request: WindowRequest) {
+        let mut slot = self.window.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = Some(request);
+    }
+
+    /// Take the pending window ask, if any. Reading is taking, like [`Self::take_follow`]: the
+    /// driver must not re-derive a window it has already derived.
+    pub(crate) fn take_window_request(&self) -> Option<WindowRequest> {
+        self.window
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
     }
 }
 
@@ -1034,6 +1077,51 @@ mod tests {
         assert!(controller.is_shutdown());
         controller.shutdown();
         assert!(controller.is_shutdown(), "`shutdown` is idempotent (§27.2)");
+    }
+
+    /// `docs/32` ADR-20: the window ask is a **value** like `follow`, not a sticky bit — a drag emits
+    /// one per mouse move, and only the newest can still be what the strip is showing.
+    #[test]
+    fn a_window_request_keeps_only_the_latest_and_is_taken_once() {
+        let controller = ScrollController::new();
+        assert_eq!(
+            controller.take_window_request(),
+            None,
+            "nothing has been asked for yet, and `None` is not `rows == 0`"
+        );
+
+        controller.request_window(WindowRequest {
+            first_row: 100,
+            rows: 200,
+        });
+        controller.request_window(WindowRequest {
+            first_row: 400,
+            rows: 50,
+        });
+        assert_eq!(
+            controller.take_window_request(),
+            Some(WindowRequest {
+                first_row: 400,
+                rows: 50
+            }),
+            "the older ask is overwritten rather than queued: a queue would make the preview lag \
+             the drag that produced it"
+        );
+        assert_eq!(controller.take_window_request(), None, "reading is taking");
+
+        // `rows == 0` is a *request*, not the absence of one: it says "derive nothing", which is what
+        // a consumer with no window to show wants.
+        controller.request_window(WindowRequest {
+            first_row: 0,
+            rows: 0,
+        });
+        assert_eq!(
+            controller.take_window_request(),
+            Some(WindowRequest {
+                first_row: 0,
+                rows: 0
+            })
+        );
     }
 
     /// Exit condition ② of `P3.08`, mechanically: the command side is **sticky bits**, not queue
