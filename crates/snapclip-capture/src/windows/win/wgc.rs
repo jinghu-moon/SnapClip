@@ -638,6 +638,25 @@ impl WgcSession {
     /// starts anyway, because a missing option changes what the pixels contain, not
     /// whether there are pixels (the full capability model is `P2.04`).
     pub fn open(device: &GraphicsDevice, hwnd: isize) -> Result<Self, WgcError> {
+        Self::open_item(device, create_item_for_window(hwnd)?)
+    }
+
+    /// Open a capture session on a **monitor** (`docs/32` `P7.13c`; `SCROLL_BACKENDS`'s second stage).
+    ///
+    /// The item is the whole monitor, so the caller's region is expressed in **monitor** coordinates.
+    /// `handle` is the monitor handle from `MonitorFromWindow`/`MonitorFromPoint`; the interop wants
+    /// the `windows` handle while `windows-sys` produces the same pointer, which is why this takes an
+    /// `isize` like its window twin.
+    pub fn open_monitor(device: &GraphicsDevice, monitor: isize) -> Result<Self, WgcError> {
+        Self::open_item(device, create_item_for_monitor(monitor)?)
+    }
+
+    /// The body both constructors share: everything after the capture item exists.
+    ///
+    /// Split out in `P7.13c` because the item is the *only* thing that differs between a window and a
+    /// monitor session — the pool, the arrival event, the option probe and the sizing rules are the
+    /// same code, and duplicating them would be two places for the pool's buffer count to drift.
+    fn open_item(device: &GraphicsDevice, item: GraphicsCaptureItem) -> Result<Self, WgcError> {
         if !is_supported() {
             return Err(WgcError::Failed {
                 context: "GraphicsCaptureSession::IsSupported",
@@ -645,7 +664,6 @@ impl WgcSession {
             });
         }
 
-        let item = create_item_for_window(hwnd)?;
         let content = item.Size().map_err(|error| WgcError::Failed {
             context: "GraphicsCaptureItem::Size",
             detail: super::hresult("GraphicsCaptureItem::Size", &error),

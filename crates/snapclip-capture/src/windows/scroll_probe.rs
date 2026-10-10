@@ -3059,6 +3059,116 @@ fn print_capture_table(reports: &[CaptureArmReport]) {
 /// condition is "at least one delivered frame", not "ten frames": Web Graphics Capture
 /// produces a frame only when the content changes, and a still page is not a failure.
 #[test]
+/// `P7.11c`: does a **window-level** WGC capture see a page scroll at all?
+///
+/// The seventh real run proved the page scrolls (the region hole keeps the browser un-occluded) while
+/// the driver still saw byte-identical frames (`settle saw no usable digest … digests=0 empty=19/20`).
+/// This probe splits the two remaining readings — "WGC's window item is stale" versus "our
+/// source/session wiring loses the change" — by building the **production source**
+/// (`WgcFrameSource` over `WgcFrameBackend`), reading one frame, posting one wheel to the browser, and
+/// reading again. No overlay, no session, no canvas: whatever this prints is the capture's own answer.
+///
+/// `SNAPCLIP_PROBE_TITLE` picks the window (default `滚动截图`); a whole page of text must be visible,
+/// or there is nothing for a scroll to change.
+#[ignore = "P7.11c: needs a real interactive desktop and a scrollable browser window"]
+#[test]
+fn wgc_window_probe() {
+    let _ = monitor::set_per_monitor_v2_awareness();
+    let needle = std::env::var("SNAPCLIP_PROBE_TITLE").unwrap_or_else(|_| "滚动截图".to_string());
+    let info = find_window_by_title(&needle, Duration::from_secs(10))
+        .unwrap_or_else(|| panic!("no visible window whose title contains {needle}"));
+    eprintln!(
+        "[P7.11c] target hwnd={:?} class={} title={}",
+        info.hwnd, info.class, info.title
+    );
+    // `require_focus = false`: the transport under test is `PostMessageW`, which does not need the
+    // keyboard focus — and `GetFocus` answers 0 for another process's window anyway, so demanding it
+    // would fail the probe for a reason that has nothing to do with the capture.
+    bring_to_front(info.hwnd, false);
+    let client = client_rect_of(info.hwnd).expect("the target has a client rect");
+    let center = Point::new((client.left + client.right) / 2, (client.top + client.bottom) / 2);
+
+    let device = std::sync::Arc::new(d3d11::GraphicsDevice::create().expect("a D3D11 device"));
+    let backend = WgcFrameBackend::open(device, info.hwnd as isize).expect("a window capture");
+    let mut source = WgcFrameSource::new(Box::new(backend), Axis::Vertical);
+
+    fn read(source: &mut WgcFrameSource, label: &str) -> Option<Vec<u8>> {
+        match source.next(Duration::from_millis(600)) {
+            Ok(Poll::Frame(observation)) => {
+                let region = observation.region();
+                eprintln!(
+                    "[P7.11c] {label}: bytes={} region={}x{} at ({},{})",
+                    observation.pixels().len(),
+                    region.width(),
+                    region.height(),
+                    region.left,
+                    region.top
+                );
+                Some(observation.pixels().to_vec())
+            }
+            other => {
+                eprintln!("[P7.11c] {label}: {other:?}");
+                None
+            }
+        }
+    }
+
+    // The screen, as a **second opinion** in the same run: if the screen changes and the capture does
+    // not, the capture is the stale one; if neither changes, the wheel never scrolled and this probe
+    // has measured nothing. `capture_signature` is this module's own BitBlt row signature.
+    let screen_signature = |label: &str| match capture_signature(client) {
+        Ok(rows) => eprintln!(
+            "[P7.11c] screen {label}: rows={} first={:?}",
+            rows.len(),
+            rows.first()
+        ),
+        Err(error) => eprintln!("[P7.11c] screen {label}: bitblt failed: {error}"),
+    };
+    screen_signature("before");
+
+    let before = read(&mut source, "before");
+    // Exactly the transport the driver uses once the overlay owns the foreground.
+    let outcome = scroll_actuator::inject(
+        &Win32Injection,
+        &InjectRequest {
+            target: info.hwnd as isize,
+            screen: Point::new(center.x, center.y),
+            // **Advance** the document (`notches > 0`), i.e. scroll down. A negative count scrolls
+            // *back*, and a page already at its top answers that with no change at all — which is a
+            // false "WGC is stale" verdict, and the first version of this probe ran with `-6`.
+            notches: 6,
+            axis: Axis::Vertical,
+            path: InjectPath::PostMessageW,
+            aim: Aim::AssumePlaced,
+        },
+    );
+    eprintln!(
+        "[P7.11c] inject status={:?} delivered={} window={:?}",
+        outcome.status, outcome.delivered, outcome.target_window
+    );
+    pump_for(Duration::from_millis(600));
+    let after = read(&mut source, "after");
+    screen_signature("after");
+
+    let (before, after) = match (before, after) {
+        (Some(before), Some(after)) => (before, after),
+        _ => panic!("the capture did not produce two frames"),
+    };
+    assert_eq!(before.len(), after.len(), "a resize is a different failure");
+    let differing = before.iter().zip(after.iter()).filter(|(a, b)| a != b).count();
+    let percent = differing * 100 / before.len().max(1);
+    eprintln!(
+        "[P7.11c] differing_bytes={differing} of {} ({percent}%)",
+        before.len()
+    );
+    // A scroll moves most of the frame; a caret or a cursor moves a few bytes. Five percent is the
+    // line between those two, and it is the number the verdict is about.
+    assert!(
+        percent >= 5,
+        "the window capture barely changed ({percent}%): WGC's window item is stale, not our session"
+    );
+}
+
 #[ignore = "P0.05: needs a real interactive desktop and at least one installed target"]
 fn capture_probe() {
     let _ = monitor::set_per_monitor_v2_awareness();

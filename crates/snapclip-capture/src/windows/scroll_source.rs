@@ -59,13 +59,18 @@ use super::win::wgc::{WgcError, WgcSession};
 use ::windows::Win32::Foundation::HWND;
 use ::windows::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindow};
 
-/// The scroll path's backend order (`docs/30` §11.5, task `P2.06`).
+/// The scroll path's backend order (`docs/30` §11.5, task `P2.06`; **reordered** in `P7.13c`).
 ///
-/// **Policy, not a retry.** The window backend is first because a window-level capture
-/// cannot contain the overlay or an occluder (§24.2) — that is a statement about what the
-/// pixels *are*, so it is decided before anything is attempted rather than after something
-/// fails. The monitor backend is the only alternative that still produces pixels when
-/// `CreateForWindow` is refused (§24.7), and it is the one path that needs `WDA` (§24.5).
+/// **Policy, not a retry.** The order was `[WgcWindow, Wgc]` because a window-level capture cannot
+/// contain the overlay or an occluder (§24.2) — a statement about what the pixels *are*, decided
+/// before anything is attempted. `P7.13c` reverses it, and the reason is a **measurement** rather than
+/// a preference: for a Chromium browser window, a window item delivered byte-identical frames while
+/// the page was visibly scrolling (`docs/Temp/p711c-wgc-window.txt`: one real wheel moved ~0.03–0.1% of
+/// the bytes), while a screen-level read of the same window did see it (`docs/Temp/wheel-ab.txt`).
+/// Meanwhile the reason the window item was first — occluders never enter it — was removed at the
+/// source: `P7.07c` shrinks the overlay's window region to the panel, so there is no occluder left to
+/// keep out. Both entries stay: the monitor item is the one that produces pixels for the targets this
+/// product is about, and the window item is where a session goes when a monitor item cannot be opened.
 ///
 /// `BitBlt` is deliberately absent. It is the *ordinary* screenshot path's final fallback
 /// (`providers::attempt_order`), and falling back to it here would silently hand back a
@@ -75,7 +80,7 @@ use ::windows::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindow};
 /// of §21.3 is that scroll work must not reshape the F5 path. Its behaviour is pinned by
 /// `providers::tests::wgc_is_tried_before_the_bitblt_fallback`.
 pub(crate) const SCROLL_BACKENDS: [ProviderKind; 2] =
-    [ProviderKind::WgcWindow, ProviderKind::Wgc];
+    [ProviderKind::Wgc, ProviderKind::WgcWindow];
 
 /// Why the scroll path moved on from one backend to the next (§11.5: a fallback that is not
 /// recorded is a fallback the user cannot see — G12).
@@ -403,9 +408,10 @@ impl OpeningFrameSource {
         region: Rect,
     ) -> Self {
         let opened = match device {
-            Ok(device) => WgcFrameBackend::open(device, window).map(|backend| {
-                WgcFrameSource::new(Box::new(backend), axis).with_crop(region)
-            }),
+            Ok(device) => open_monitor_source(&device, window, region)
+                .map(|(backend, crop)| {
+                    WgcFrameSource::new(Box::new(backend), axis).with_crop(crop)
+                }),
             Err(detail) => Err(FrameError::Transient {
                 context: "GraphicsDevice::create",
                 detail,
@@ -516,6 +522,74 @@ impl WgcFrameBackend {
             handle,
         })
     }
+
+    /// Open the **monitor** the target sits on (`P7.13c`, `SCROLL_BACKENDS`'s first entry).
+    ///
+    /// `window` is kept for liveness only: a monitor has no "closed" state of its own, while the
+    /// session still has to end when the target is closed or minimised (`TargetLiveness`).
+    pub(crate) fn open_monitor(
+        device: std::sync::Arc<GraphicsDevice>,
+        monitor: isize,
+        window: isize,
+    ) -> Result<Self, FrameError> {
+        let session =
+            WgcSession::open_monitor(&device, monitor).map_err(|error| FrameError::Transient {
+                context: "WgcSession::open_monitor",
+                detail: error.to_string(),
+            })?;
+        let (width, height) = session.size();
+        Ok(Self {
+            device,
+            session,
+            size: (width.max(0) as u32, height.max(0) as u32),
+            handle: window,
+        })
+    }
+}
+
+/// Open the monitor item for `window` and express `region` (the caller's **window-local** rectangle)
+/// in **monitor** coordinates (`P7.13c`).
+///
+/// Two coordinate spaces meet here and neither may be guessed: the capture item is the monitor, so
+/// every offset the driver later uses is monitor-relative, while the caller computed its rectangle
+/// inside the window — the same space `ScrollTarget::crop` was clipped in. The window's own origin
+/// comes from [`crate::windows::win::window::frame_bounds`], the single DWM reader the plan was built
+/// from (`P7.03`), so the two statements are about the same rectangle by construction.
+fn open_monitor_source(
+    device: &std::sync::Arc<GraphicsDevice>,
+    window: isize,
+    region: Rect,
+) -> Result<(WgcFrameBackend, Rect), FrameError> {
+    use ::windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+    };
+
+    let hwnd = HWND(window as *mut core::ffi::c_void);
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        return Err(FrameError::Transient {
+            context: "GetMonitorInfoW",
+            detail: "the monitor under the target did not answer".into(),
+        });
+    }
+    let Some(frame) = crate::windows::win::window::frame_bounds(window) else {
+        return Err(FrameError::Transient {
+            context: "window::frame_bounds",
+            detail: "the target window's visible bounds could not be read".into(),
+        });
+    };
+    let crop = Rect::new(
+        region.left + frame.left - info.rcMonitor.left,
+        region.top + frame.top - info.rcMonitor.top,
+        region.right + frame.left - info.rcMonitor.left,
+        region.bottom + frame.top - info.rcMonitor.top,
+    );
+    let backend = WgcFrameBackend::open_monitor(device.clone(), monitor.0 as isize, window)?;
+    Ok((backend, crop))
 }
 
 impl FrameBackend for WgcFrameBackend {
@@ -1120,22 +1194,21 @@ mod tests {
         let _: bool = minimised;
     }
 
-    // --- backend policy: window first, monitor as the fallback (§11.5; task P2.06) ---
+    // --- backend policy: monitor first, window as the fallback (§11.5; task P2.06, reordered P7.13c) ---
 
     #[test]
-    fn the_window_backend_is_preferred_and_the_monitor_backend_is_the_fallback() {
+    fn the_monitor_backend_is_first_and_the_window_backend_is_the_fallback() {
         // The order *is* the policy, so this asserts the list rather than the mechanism.
         assert_eq!(
             SCROLL_BACKENDS,
-            [ProviderKind::WgcWindow, ProviderKind::Wgc],
-            "a window-level capture cannot contain the overlay or an occluder (§24.2), so \
-             the window backend is the first entry, not the one we retreat to"
+            [ProviderKind::Wgc, ProviderKind::WgcWindow],
+            "a Chromium window item delivered byte-identical frames while the page was visibly \
+             scrolling (docs/Temp/p711c-wgc-window.txt), while a screen-level read of the same \
+             window did see it (docs/Temp/wheel-ab.txt); the window item's advantage — no occluders \
+             ever enter it — was removed at the source by P7.07c's region hole"
         );
-        assert_eq!(
-            next_scroll_backend(ProviderKind::WgcWindow),
-            Some(ProviderKind::Wgc)
-        );
-        assert_eq!(next_scroll_backend(ProviderKind::Wgc), None);
+        assert_eq!(next_scroll_backend(ProviderKind::Wgc), Some(ProviderKind::WgcWindow));
+        assert_eq!(next_scroll_backend(ProviderKind::WgcWindow), None);
         // BitBlt is the *ordinary* path's final fallback. It is deliberately absent here:
         // reading the desktop when the target window refuses to be captured would hand back
         // a frame that is not the target's, silently (`providers.rs` `attempt_order`).
