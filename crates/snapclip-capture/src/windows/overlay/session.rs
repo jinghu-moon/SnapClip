@@ -55,6 +55,18 @@ impl OverlayController {
         }
     }
 
+    /// `F7`: the scroll-capture entry point (`docs/32` §4.1; task `P7.01`).
+    ///
+    /// Today it only reports that the key arrived — and it says so in the log line instead of
+    /// looking like a feature: there is no scroll session to start yet. `P7.02` resolves the
+    /// window under the cursor, `P7.04` ends the capture session and hands over, `P7.05` starts
+    /// the driver. Until then this is the whole body of the F7 path: registered, dispatched,
+    /// and visibly inert (`docs/32` §9 `P7.01` explains why a placeholder session would be
+    /// worse than this).
+    pub(super) fn start_scroll_entry(&mut self) {
+        eprintln!("[snapclip][capture] scroll entry requested (wiring lands in P7.04/P7.05)");
+    }
+
     /// `F5`: submit a capture request and enter `Preparing`.
     ///
     /// Nothing here waits on WGC/BitBlt: the freeze happens on the worker

@@ -59,9 +59,16 @@ impl OverlayMessageHandler for OverlayController {
                 Some(0)
             }
             WM_HOTKEY => {
-                if (wparam as i32) == hotkey::CAPTURE_HOTKEY_ID {
-                    eprintln!("[snapclip][capture] WM_HOTKEY F5 received");
-                    self.start_session();
+                // The id is the only thing the message carries about which key fired, so the
+                // table is the dispatch (`docs/32` §4.1). An id this crate did not register
+                // reaches no entry point — and is still swallowed, so hotkey traffic never
+                // falls through to `DefWindowProcW`.
+                if let Some(hotkey) = hotkey::from_id(wparam as i32) {
+                    eprintln!("[snapclip][capture] WM_HOTKEY {} received", hotkey.label);
+                    match hotkey.kind {
+                        hotkey::HotkeyKind::Capture => self.start_session(),
+                        hotkey::HotkeyKind::Scroll => self.start_scroll_entry(),
+                    }
                 }
                 Some(0)
             }
@@ -570,7 +577,7 @@ pub(super) fn overlay_thread(
         ),
     }
 
-    if let Err(error) = hotkey::register_capture_hotkey(window) {
+    if let Err(error) = hotkey::register(window) {
         unsafe {
             DestroyWindow(window);
             UnregisterClassW(OVERLAY_CLASS.as_ptr(), instance);
@@ -603,7 +610,7 @@ pub(super) fn overlay_thread(
     if ready.send(Ok(thread_id.to_string())).is_err() {
         ACTIVE_HANDLER.with(|slot| slot.set(std::ptr::null_mut()));
         unsafe {
-            hotkey::unregister_capture_hotkey(window);
+            hotkey::unregister(window);
             DestroyWindow(window);
             UnregisterClassW(OVERLAY_CLASS.as_ptr(), instance);
         }
@@ -636,7 +643,7 @@ pub(super) fn overlay_thread(
     ACTIVE_HANDLER.with(|slot| slot.set(std::ptr::null_mut()));
     drop(controller);
     unsafe {
-        hotkey::unregister_capture_hotkey(window);
+        hotkey::unregister(window);
         DestroyWindow(window);
         UnregisterClassW(OVERLAY_CLASS.as_ptr(), instance);
     }
