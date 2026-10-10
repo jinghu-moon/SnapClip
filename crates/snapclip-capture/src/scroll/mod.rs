@@ -1,5 +1,5 @@
 //! The scroll-capture subsystem (`docs/30` §28.2 lists its files; the dependency gate counts them:
-//! **11 production files** — this one included — and **6 `#[cfg(test)]` ones**, 17 in all).
+//! **12 production files** — this one included — and **6 `#[cfg(test)]` ones**, 18 in all).
 //!
 //! What is here today:
 //!
@@ -18,6 +18,9 @@
 //!   renderer consumes it (`windows/win/d2d.rs`) rather than computing it a second time.
 //! * `session` (`P3.04`) — the aggregate root: the axis, the canvas, the step counter, the streak,
 //!   the stop promise, and the command port (§27.2).
+//! * `target` (`P7.02`) — which window the selection belongs to: five rules, an opaque window
+//!   identity, and the crop rectangle the session reads. The `HWND` and the screen → monitor-local
+//!   conversions stay in `windows/scroll_target.rs` (`docs/32` §4.2, ADR-25).
 //! * `ports` (`P3.09`) — the two platform seams, `FrameSource` and `ScrollActuator` (§27.1).
 //! * `export` (`P4.01`) — the third seam, and the one the **shell** fills rather than the platform:
 //!   rows go to an encoder a band at a time, and the height is a precondition of the first row
@@ -29,13 +32,14 @@
 //!   the only matching-cost data this repository has and `P1.05`+ must re-run it on the real
 //!   layer 1 (see `docs/30` §23.3.1 and `DEV-8`).
 //!
-//! The ten module bullets above are production code, as is this file itself. `testkit`,
+//! The eleven module bullets above are production code, as is this file itself. `testkit`,
 //! `acceptance` and `perf_probe` are `#[cfg(test)]`, and so are `alloc_probe`, `mem_probe` and
 //! `latency_probe` further down — **six** test-only modules rather than the one this note used to
 //! claim. This module became a real (non-test) module with `P1.01` — see `lib.rs` and `DEV-8`.
 //!
 //! (`P6.09` corrected the two counts in this header after the acceptance pass read the module list
-//! against what `tools/check-dependency-direction.ps1` actually prints: 17 files.)
+//! against what `tools/check-dependency-direction.ps1` actually prints: 17 files. `P7.02` moved
+//! both by one when `target` arrived: 12 production + 6 test-only = 18.)
 //!
 //! Gate note (`docs/30` §28.4): nothing under `scroll/` may reference `windows`, `sampler` or any
 //! platform FFI. Everything here is pure arithmetic over byte buffers, and the second scan in
@@ -87,6 +91,12 @@ pub(crate) mod session;
 /// that gives the vocabulary a public path without publishing the session (the [`Axis`] precedent
 /// above).
 pub use session::ScrollDiagnosticCode;
+
+/// `target` (`P7.02`) — which window the selection belongs to. Five rules (overlap, area,
+/// `z_order`, the viewport floor, the near-tie refusal) over a `Rect` and an opaque window
+/// identity (`docs/32` §4.2). It sits here rather than in `windows/` because the rule is pure
+/// arithmetic; the snapshot's coordinates and handles are converted on the other side of the seam.
+pub(crate) mod target;
 
 #[cfg(test)]
 mod acceptance;

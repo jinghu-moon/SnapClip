@@ -15,6 +15,9 @@
 //!   sources behind the detection workers
 //! * [`scroll_source`] / [`scroll_actuator`] — window-level frame stream and the wheel
 //!   injection the scroll loop drives
+//! * [`scroll_target`] — the platform half of target choice: the window snapshot's handles and
+//!   virtual-desktop coordinates become the scroll rule's opaque identity and local pixels
+//!   (`docs/32` §4.2)
 //! * [`win`] — thin GPU/WinRT wrappers (D3D11, DXGI, WGC, D2D)
 //!
 //! The adapter produces pixels through [`crate::artifact::CaptureService`] and hands
@@ -38,6 +41,7 @@ pub mod scroll_actuator;
 #[cfg(test)]
 pub mod scroll_probe;
 pub mod scroll_source;
+pub mod scroll_target;
 pub mod timed_call;
 pub mod top_level_provider;
 pub mod uia_provider;
