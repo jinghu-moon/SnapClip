@@ -968,7 +968,14 @@ pub(crate) fn take_window_request(&self) -> Option<WindowRequest>;      // 驱�
 - **据此做的产品级决定（`[P7-13c]`）**：把设计里已写好却从未接线的第二档后端接上，并把顺序**反转为 `[Wgc, WgcWindow]`**（显示器级优先）。理由写在 `SCROLL_BACKENDS` 的注释里：窗口项"不含遮挡者"这一优势已被 `P7.07c` 的区域挖洞从源头取消，而屏幕级捕获确实看得见滚动。实现：`crates/snapclip-capture/src/windows/win/wgc.rs` 的 `WgcSession::open` 拆为 `open_item`（共用的池/到达事件/选项探测/尺寸规则）+ `open`（窗口）+ `open_monitor`（显示器，经 `create_item_for_monitor`）；`crates/snapclip-capture/src/windows/scroll_source.rs` 新增 `WgcFrameBackend::open_monitor` 与 `open_monitor_source`（`MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)` + `GetMonitorInfoW` 取显示器矩形，再用**与计划同一个** DWM 读取器 `crate::windows::win::window::frame_bounds`（`P7.03`）把窗口内坐标的选区换算成显示器内坐标的裁剪框）；后端顺序用例改名为 `the_monitor_backend_is_first_and_the_window_backend_is_the_fallback`。
 - **GREEN（实测，日志 `docs/Temp/p713c-check2.txt`、`p713c-source.txt`、`p713c-workspace.txt`）**：`cargo test -p snapclip-capture --lib scroll_source` → **25 passed / 0 failed**；`cargo test --workspace --lib -- --test-threads=1` → **69 + 575 + 51 + 23 = 718 passed / 0 failed / 70 ignored**（ignored 由 69 增至 70 = 新增的 `wgc_window_probe`）；`pwsh tools/check-dependency-direction.ps1` → clean。
 - **一个被接受的副作用**：显示器级捕获**包含覆盖层**，而覆盖层现在只剩右侧面板那块区域 ⇒ 只要选区不压在面板上（面板贴着工作区右缘），捕获里就只有实时页面。写进了 `SCROLL_BACKENDS` 的注释。
-- **未取得（本轮结束时）**：① 第 8 轮（显示器级捕获）的真机结果**尚未回来**；② `wgc_window_probe` 的 `<5%` 判据无法区分"没滚"与"WGC 陈旧"，探针只有一个"用户/程序先滚一次"的隐含前提，**没有**自校验（下次要把它改成先在自己 fixture 上校准、再打浏览器）；③ `BackendFallback`/`next_scroll_backend` 仍**没有生产调用者**（顺序反转是策略，不是自动降级）。
+- **未取得（`[P7-13c]` 提交时）**：① 第 8 轮的真机结果当时**尚未回来**（见下一小节，它回来了）；② `wgc_window_probe` 的 `<5%` 判据无法区分"没滚"与"WGC 陈旧"，探针只有一个"用户/程序先滚一次"的隐含前提，**没有**自校验（下次要把它改成先在自己 fixture 上校准、再打浏览器）；③ `BackendFallback`/`next_scroll_backend` 仍**没有生产调用者**（顺序反转是策略，不是自动降级）。
+
+**第 8 轮（显示器级捕获，用户 m02341 的日志）—— 第一次走到"估计器"，但没量到位移**
+
+- 三个"第一次"同时出现在这一轮：`scroll window region=panel (3444,742)-(3816,1345)` ⇒ **挖洞真的执行了**（`P7.07d` 的修复生效）；`scroll region read … frame=3840x2160 bytes=33177600` ⇒ **取的是显示器**（`P7-13c` 的后端生效，每次读 33 MB）；`[snapclip][scroll] step=1 notches=10 position=0 status=None committed=false` ×3 ⇒ **settle 成功了**（`digests > 0`，即帧确实在变），驱动第一次走进估计器。
+- **剩下的问题换了性质**：不再是"捕获看不到变化"，而是"**变化不是一次位移**"。`Status::None` 的语义（`crates/snapclip-capture/src/scroll/displacement.rs:193`）是"没有候选过门、或 `d = 0` 而行指纹不一致、或撞上 §16.9 的边界值"，三连 `None` + `position=0` 指向"帧之间的差异不足以被认成滚动"。两个候选：① 选区覆盖的内容本身不随滚动移动（这轮日志里 `region read` 的 `region=(0,0)-3840x2160` 是显示器整幅，裁剪是 1281×933 的选区）；② 帧之间只有**非滚动**的差异（页面自身动画；光标已被 `probe_capture_options` 的 `set_cursor_capture_enabled(false)` 关掉，所以光标不是第一嫌疑）。
+- **下一步的判定手段**：把`Displacement` 的证据（`evidence()`，`crates/snapclip-capture/src/scroll/displacement.rs:261`）打进每步日志——这是 `P7.11` 的"诊断"该做的事，也是把上面两个候选分开的唯一办法。
+- **用户在这一轮之后按了两次 F7 并改用普通截图**（日志末尾 `confirm … region readback provider=wgc region=(738,289)-1165x870` + `artifact ready … capture-…-3-1.png size=1165x870` ⇒ 普通截图路径一切正常），随后按既定路线**回任务书做 `P7.10`**；本轮的失败与全部日志（含 `docs/Temp/p711c-*`、`docs/Temp/wheel-ab.txt`）记在此处，真机演练归位到 `P7.13` 的阶段验收。
 
 ---
 
