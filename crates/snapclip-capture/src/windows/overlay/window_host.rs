@@ -176,11 +176,16 @@ impl OverlayMessageHandler for OverlayController {
             // window lets that hit test fall through to the application underneath: UIA has no
             // notion of Z order and would otherwise answer the overlay for every query, which is
             // exactly what the precision top-up needs (docs/21 §5.7).
-            WM_NCHITTEST => Some(if self.hit_test_passes_through() {
-                HTTRANSPARENT as LRESULT
-            } else {
-                HTCLIENT as LRESULT
-            }),
+            //
+            // A scroll session answers the same question differently and for a different reason
+            // (docs/30 §13.4): the wheel has to reach the window underneath, and under `MOUSE_POS`
+            // routing this hit test is what decides that. `nchittest_result` holds both rules.
+            // `lparam` is in **screen** coordinates here, unlike every other mouse message.
+            WM_NCHITTEST => {
+                let mut point = point_from_lparam(lparam);
+                unsafe { ScreenToClient(self.window, &mut point) };
+                Some(self.nchittest_result(Point::new(point.x, point.y)))
+            }
             WM_ERASEBKGND => Some(1),
             WM_PAINT => {
                 // Acknowledge the update region with BeginPaint/EndPaint. Skipping it

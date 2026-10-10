@@ -173,6 +173,15 @@ impl OverlayController {
         self.invalidate();
     }
 
+    /// Whether a scroll-session hit at `point` (client pixels) belongs to the panel rather than to
+    /// the content underneath it (`docs/32` `P7.07b`).
+    ///
+    /// One hit test with two consumers — the press path and `WM_NCHITTEST` — so that "where the panel
+    /// is" cannot drift between "what a click does" and "what receives the wheel".
+    pub(super) fn scroll_panel_owns(&self, point: Point) -> bool {
+        !matches!(self.scroll_panel_press(point), PanelPress::Outside)
+    }
+
     /// The action a press at `point` (client pixels) performs on the scroll panel.
     ///
     /// Four answers, because "the panel handled it", "the box was grabbed" and "the panel ignored it"

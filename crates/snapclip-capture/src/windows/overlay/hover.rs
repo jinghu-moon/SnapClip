@@ -962,6 +962,30 @@ impl OverlayController {
         self.hit_test_pass_through.is_active() && !any_mouse_button_down()
     }
 
+    /// The result `WM_NCHITTEST` answers with at `point` (client pixels).
+    ///
+    /// Two independent reasons to fall through, and they are not the same one: the refinement worker
+    /// needs it around a single accessibility query (docs/21 §5.7), while a scroll session needs it for
+    /// its **whole lifetime** — under `MOUSE_POS` wheel routing the system asks exactly this question to
+    /// decide who receives the wheel, so a fullscreen overlay that answers `HTCLIENT` keeps every notch
+    /// for itself and the page never moves (`docs/30` §13.4, `E-INPUT-1`). The panel is the exception:
+    /// `HTTRANSPARENT` there would make `停止` unclickable, which is why both consumers share one hit
+    /// test (`scroll_panel_owns`).
+    pub(super) fn nchittest_result(&self, point: Point) -> LRESULT {
+        if self.scroll_runtime.is_some() {
+            return if self.scroll_panel_owns(point) {
+                HTCLIENT as LRESULT
+            } else {
+                HTTRANSPARENT as LRESULT
+            };
+        }
+        if self.hit_test_passes_through() {
+            HTTRANSPARENT as LRESULT
+        } else {
+            HTCLIENT as LRESULT
+        }
+    }
+
     /// A deep-selection result arrived.
     ///
     /// A published path only ever *refines* the v1 whole-window target: the overlay keeps

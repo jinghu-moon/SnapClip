@@ -633,6 +633,18 @@ impl<'a, F: FrameSource, A: ScrollActuator> Host<'a, F, A> {
 impl<F: FrameSource, A: ScrollActuator> StepHost for Host<'_, F, A> {
     fn inject(&mut self, notches: i32) -> Result<(), String> {
         let outcome = self.actuator.inject(notches);
+        // The **successful** injection is logged too, not just the failed one: "which transport, to
+        // which window, how many events" is the difference between "the target ignored a correctly
+        // aimed wheel" and "we posted to the wrong HWND" — and the first real sessions could not tell
+        // those apart (`P7.11`).
+        eprintln!(
+            "[snapclip][scroll] inject path={:?} notches={notches} status={:?} delivered={} \
+             window={:?}",
+            self.actuator.path(),
+            outcome.status,
+            outcome.delivered,
+            outcome.target_window
+        );
         match outcome.status {
             // §24.6.3: `Posted` is weak evidence — the message was *queued*. It is still the only
             // answer the port can give, and proving the content actually moved is the watchdog's job.
@@ -841,7 +853,23 @@ impl ScrollDriver {
                     self.session.record_cancel_latency(latency);
                     return self.finish(StopReason::UserCancelled, controller, preview);
                 }
-                Err(StepError::Injection(_)) | Err(StepError::NoFrame) => {
+                Err(StepError::Injection(detail)) => {
+                    // The detail has to reach the log. `InjectStatus` distinguishes "the target was
+                    // not found" from "the post was refused (code)" from "the coordinates were
+                    // refused", and without it a session that never moved says only
+                    // `ActuatorFailed` — which is what the first real run did (`P7.11`'s first half,
+                    // forced early by that run).
+                    eprintln!("[snapclip][scroll] injection failed: {detail}");
+                    self.session.record_discarded();
+                    if let WatchVerdict::Failed = note(&mut watch, &mut actuator, false) {
+                        eprintln!(
+                            "[snapclip][scroll] the watchdog gave up: every transport refused a step"
+                        );
+                        return self.finish(StopReason::ActuatorFailed, controller, preview);
+                    }
+                    continue;
+                }
+                Err(StepError::NoFrame) => {
                     // §20.4 and C2: a single failed step never stops the session. What turns a *run*
                     // of them into a transport switch — or into `ActuatorFailed` — is the watchdog.
                     //
@@ -850,8 +878,15 @@ impl ScrollDriver {
                     // end looks exactly like a dead actuator until something else says otherwise.
                     // Classifying it as `EndReached` needs the scroll-position channel (§20.4's
                     // convergence row); it is listed as open in this module's header.
+                    eprintln!(
+                        "[snapclip][scroll] no new frame after injecting {notches} notches \
+                         (either the wheel never landed, or the content did not move)"
+                    );
                     self.session.record_discarded();
                     if let WatchVerdict::Failed = note(&mut watch, &mut actuator, false) {
+                        eprintln!(
+                            "[snapclip][scroll] the watchdog gave up: three steps moved nothing"
+                        );
                         return self.finish(StopReason::ActuatorFailed, controller, preview);
                     }
                     continue;
@@ -880,7 +915,20 @@ impl ScrollDriver {
             }
 
             let moved = committed && matches!(status, Status::Confirmed { d } if d != 0);
+            // One line per step, because "the session ended with `ActuatorFailed`" is not a diagnosis
+            // (`P7.11`'s first half). `status` is the estimator's verdict — `Uncertain { d }` names a
+            // measured shift the gates would not carry, `None` names no measurement at all — and
+            // `notches` is what the controller asked for. The first real runs had neither.
+            eprintln!(
+                "[snapclip][scroll] step={} notches={notches} position={} status={status:?} \
+                 committed={committed}",
+                self.session.step(),
+                self.viewport.position()
+            );
             if let WatchVerdict::Failed = note(&mut watch, &mut actuator, moved) {
+                eprintln!(
+                    "[snapclip][scroll] the watchdog gave up: three steps in a row moved nothing"
+                );
                 return self.finish(StopReason::ActuatorFailed, controller, preview);
             }
             self.publish_step(preview, status, tick);
@@ -2861,10 +2909,17 @@ mod tests {
             "a consumer that never took anything must have lost publications rather than queued \
              them: {slow_dropped} dropped"
         );
+        // One unit of slack, and the reason is that these are two independent **schedules**, not two
+        // configurations of one: `slow_dropped > 0` above is the property that matters ("a stalled
+        // consumer loses publications instead of queueing them"), and this one adds "and it loses at
+        // least as many as one that drains". That is true on average and can miss by one when the
+        // draining run's consumer thread is descheduled at the wrong moment — measured 7 against 8 in
+        // one full-suite run and green 6/6 in isolation (`P7.09b`'s gate run). A gross violation still
+        // fails: a stalled consumer that lost two fewer would mean the port was queueing for it.
         assert!(
-            slow_dropped >= fast_dropped,
-            "and it must have lost at least as many as one that drained: {slow_dropped} against \
-             {fast_dropped}"
+            slow_dropped + 1 >= fast_dropped,
+            "and it must have lost at least as many as one that drained (within one scheduling \
+             unit): {slow_dropped} against {fast_dropped}"
         );
     }
 
