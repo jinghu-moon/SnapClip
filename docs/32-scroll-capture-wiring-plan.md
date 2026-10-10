@@ -781,6 +781,21 @@ pub(crate) fn take_window_request(&self) -> Option<WindowRequest>;      // 驱�
 - **退出条件**：① 五条用例通过；② `scroll/` 门禁干净（含注释）；③ `d2d.rs:1448` 仍只读 `buttons`（绘制侧不改）；④ L3：真机上点四个按钮各一次，行为与 §3.4 的表一致。
 - **提交标题**：`[P7-06] the buttons that are drawn are the buttons that can be clicked`
 
+**状态**：`[x] 完成（2026-10-10）`
+
+**执行记录（2026-10-10）**
+
+- **RED（实测，日志 `docs/Temp/p706-red.txt`，exit=101）**：把新增的那一块 API 用 `#[cfg(any())] mod p706_removed { use super::*; … }` 藏起来再跑 `cargo test -p snapclip-capture --lib scroll::panel -- --test-threads=1` ⇒ 逐条 `E0432`/`E0433`/`E0425`：`to_pixels`、`PanelHit`、`PanelAction`、`to_dip_point`、`actions` 全部找不到。**一条操作教训**：第一次的取红方式是"把整段删掉"，但那段位于 `impl PanelLayout` 之后、**模块自身的类型定义（`PanelColor`/`ViewState`/`Answers`/`ScrollPanel`…）之前**，于是删掉的比想删的多，日志变成了"半个模块不存在"的编译失败——不干净。改用 `#[cfg(any())]` 包一层后，日志里出现的正好是本任务新增的符号。备份与还原都是字节级一致（`docs/Temp/p706-panel-full.rs`，60,838 B）。
+- **GREEN（实测，日志 `docs/Temp/p706-check.txt`、`p706-green.txt`）**：`cargo check --workspace --all-targets` → **exit 0、0 warning**；`cargo test -p snapclip-capture --lib scroll::panel -- --test-threads=1` → **12 passed / 0 failed**（新增 6 条）；`pwsh tools/check-dependency-direction.ps1` → clean（`crates/snapclip-capture/src/scroll: 18 files`）。
+- **落地形状**：
+  - `crates/snapclip-capture/src/scroll/panel.rs`：`BUTTON_TEXT: [&str; 4] = [RETURN_TEXT, UNDO_TEXT, STOP_TEXT, CANCEL_TEXT]`；`PanelAction::{ReturnToLatest, Undo, Stop, Cancel}`；`PanelHit::{Button(usize), Strip, Outside}`；`impl PanelLayout { pub(crate) fn hit_test(&self, point: Point) -> PanelHit }`（panel 外 ⇒ `Outside`；按序查四个按钮 ⇒ `Button(index)`；strip ⇒ `Strip`；面板内 padding ⇒ `Outside`）；`pub(crate) fn actions(answers: &Answers) -> [Option<PanelAction>; 4]`（`!continuing` ⇒ 全 `None`；否则 `[can_return_to_latest.then_some(ReturnToLatest), Some(Undo), can_stop.then_some(Stop), can_cancel.then_some(Cancel)]`）；`scale_of(dpi) = (dpi as f32 / 96.0).max(1.0)`、`to_pixels`、`to_dip`、`to_dip_point`。
+  - `crates/snapclip-capture/src/windows/win/d2d.rs`：新增 `pub(crate) fn scroll_panel_rect(work_area: Rect, frame: Rect, dpi: u32) -> (Rect, PanelLayout)`（把原先 `scroll_panel_placement` 里的摆放算术原样搬出来），`scroll_panel_placement` 变成"有面板就调它"；`draw_scroll_panel` 的本地 `dip` 闭包改为委托 `panel::to_pixels`，按钮标签数组改用 `BUTTON_TEXT`。
+  - `crates/snapclip-capture/src/windows/overlay/session.rs`：`pub(super) fn apply_panel_action(&mut self, action: PanelAction)` —— **`match` 无通配臂**（新增动作即编译错），映射到 `ScrollController::{set_follow(true), undo(), stop(), cancel()}`。
+  - `crates/snapclip-capture/src/windows/overlay/input.rs`：`enum PanelPress { Action(PanelAction), OnPanel, Outside }`；`fn scroll_panel_press(&self, point: Point) -> PanelPress`（用 `self.scroll_panel` + `self.session.geometry()` + `d2d::scroll_panel_rect` + `panel::to_dip_point` + `hit_test` + `actions` 组合；`Button(index)` 且动作为 `None`（画成灰）⇒ `OnPanel`）；`on_left_down` 在滚动会话活跃时**先**走它，`Action` ⇒ 执行并 return，`OnPanel` ⇒ 直接 return（按压落在面板上就不该穿透到下面的选区），`Outside` ⇒ 落回原逻辑。
+- **偏离任务书的地方（三条，都已回填 §4.7）**：① §4.7 原写"DIP→px 的换算仍在绘制处，不搬进 `scroll/`"；落地是**一对逆函数**（`to_pixels`/`to_dip` + `to_dip_point`）放在 `crates/snapclip-capture/src/scroll/panel.rs`，绘制侧改为委托它们——纯整数算术、不涉及平台类型（门禁不拦），而**一条规则比两条各自演化更可靠**：按钮画在哪和按在哪从此不可能漂移；② `PanelHit::Button(usize)` 而不是 `Button(PanelAction)`：按钮**是否可点**由 `Answers` 决定，而"画成灰"用的是同一个 `Answers`，把动作塞进命中结果会让"灰但仍可点"成为可能；③ `PanelHit::Strip` 而不是 `Viewport`：视口框的矩形取决于会话走到哪儿（`ScrollPanel::viewport_box`），布局层答不了，留给 `P7.07` 的拖动。
+- **DoD（实测，日志 `docs/Temp/p706-workspace.txt`）**：`cargo test --workspace --lib -- --test-threads=1` → **67 + 566 + 51 + 23 = 707 passed / 0 failed / 69 ignored（exit 0）**；`snapclip-capture` 从 `P7.05` 的 559 passed / 66 ignored 变成 **566 / 66**（净 +7 = 七条面板用例），只增不减。
+- **未取得**：① 按压路径**自身**没有自动化用例——它需要一个真实的 `OverlayController`（`service`/`sink`/`clipboard`/`writer`/`detection options`/`shared`/`annotation_rx`/`HWND`/`thread_id`），其全部零件（`hit_test`、`actions`、`to_dip_point`、`scroll_panel_rect`）已分别有 L1 覆盖，端到端留给 `P7.13` 的矩阵行 114；② 视口框拖动仍是 `P7.07`；③ `panel.rs:469` 的 `note_diagnostic` 依旧带 `#[allow(dead_code)]`（调用者是 `P7.11`）。
+
 ---
 
 ### P7.07 滚动会话的鼠标语义

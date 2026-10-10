@@ -166,9 +166,34 @@ impl OverlayController {
         );
     }
 
+    /// Perform a press on the scroll panel's controls (`docs/32` `P7.06`).
+    ///
+    /// One `match` with **no wildcard arm**: a new `PanelAction` is a compile error here rather than
+    /// a button that silently does nothing, which is how "every action maps to exactly one
+    /// controller call" stays true without a test that could be forgotten.
+    ///
+    /// The controller calls are the sticky-bit / capacity-1 commands of §27.2, so none of them
+    /// blocks the overlay thread: `stop` and `cancel` latch a promise the driver reads at its next
+    /// cancellation point, `undo` adds one request, and `set_follow(true)` writes the one-slot
+    /// follow value.
+    pub(super) fn apply_panel_action(&mut self, action: crate::scroll::panel::PanelAction) {
+        let Some(runtime) = self.scroll_runtime.as_ref() else {
+            return;
+        };
+        match action {
+            crate::scroll::panel::PanelAction::ReturnToLatest => {
+                runtime.controller().set_follow(true);
+            }
+            crate::scroll::panel::PanelAction::Undo => runtime.controller().undo(),
+            crate::scroll::panel::PanelAction::Stop => runtime.controller().stop(),
+            crate::scroll::panel::PanelAction::Cancel => runtime.controller().cancel(),
+        }
+    }
+
     /// Stop and join the scroll driver, if one is running (`docs/32` `P7.05`).
     ///
     /// Separate from the capture session's teardown because the promises differ: a cancelled scroll
+    /// session produces **no artifact** (`docs/32` §3.4), and its driver has to be joined before
     /// session produces **no artifact** (`docs/32` §3.4), and its driver has to be joined before
     /// the controller goes away — a thread that outlived its owner is a thread nobody can stop.
     ///

@@ -32,7 +32,7 @@
 //!    one that recovered 12 of 42 must not look the same, and the counter is also what distinguishes
 //!    "this step was not adopted" from "nothing has gone wrong yet".
 
-use crate::geometry::Rect;
+use crate::geometry::{Point, Rect};
 use crate::scroll::displacement::Status;
 use crate::scroll::preview::PreviewUpdate;
 use crate::scroll::session::{ScrollDiagnosticCode, StopReason};
@@ -157,6 +157,110 @@ impl PanelLayout {
             trouble,
         }
     }
+
+    /// Which piece of the panel a point falls in, in the layout's own DIP space (panel-relative).
+    ///
+    /// The space is the one every rectangle in this struct is already written in, so the caller's
+    /// only job is the scale and the anchor — [`to_dip_point`] is the inverse of the renderer's one
+    /// scaling rule, and the two live together so a click cannot land where the pixels are not.
+    ///
+    /// Buttons win over the strip, and the panel frame wins over nothing: a press on the padding
+    /// between two pieces is [`PanelHit::Outside`], which is what keeps "a click beside the panel"
+    /// from being read as a click on the canvas *through* the panel.
+    pub(crate) fn hit_test(&self, point: Point) -> PanelHit {
+        if !self.panel.contains(point) {
+            return PanelHit::Outside;
+        }
+        for (index, button) in self.buttons.iter().enumerate() {
+            if button.contains(point) {
+                return PanelHit::Button(index);
+            }
+        }
+        if self.strip.contains(point) {
+            return PanelHit::Strip;
+        }
+        PanelHit::Outside
+    }
+}
+
+/// What a press on the panel asks the session to do (`docs/30` §19.5, §19.6, §20.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PanelAction {
+    /// Follow the newest band again (the view action).
+    ReturnToLatest,
+    /// Undo one committed step (§19.6).
+    Undo,
+    /// Stop and produce an artifact (§20.5).
+    Stop,
+    /// Cancel and produce nothing (§20.5).
+    Cancel,
+}
+
+/// Which piece of the panel a point fell in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PanelHit {
+    /// Index into [`PanelLayout::buttons`]; [`actions`] says whether that button is live.
+    Button(usize),
+    /// The thumbnail strip. Whether the point is inside the *viewport box* is not answerable here:
+    /// that rectangle depends on the session's position (`ScrollPanel::viewport_box`), not on the
+    /// layout, so the caller asks the model with the same point.
+    Strip,
+    /// Not the panel: the press belongs to whatever is underneath.
+    Outside,
+}
+
+/// The action each button would perform right now, index-aligned with [`PanelLayout::buttons`].
+///
+/// This is the **drawing rule**, not a second opinion about it: `windows/win/d2d.rs` dims button 0
+/// while the session already follows and draws the other three only while it continues, so the
+/// predicate that greys a button and the one that makes it unclickable are the same predicate
+/// (`Answers::can_return_to_latest`, `Answers::continuing`). A greyed button that still answered a
+/// press would be the one shape of this UI a user could not see and could not avoid.
+pub(crate) fn actions(answers: &Answers) -> [Option<PanelAction>; 4] {
+    if !answers.continuing {
+        // An ended session has nothing left to stop, cancel, undo or return from: the panel is
+        // describing what happened, not offering choices.
+        return [None, None, None, None];
+    }
+    [
+        answers
+            .can_return_to_latest
+            .then_some(PanelAction::ReturnToLatest),
+        // "Undo" has no grey state and that is deliberate (see the drawing site): the panel cannot
+        // tell an empty stack from a spent press, and a press with nothing behind it is a defined
+        // no-op rather than a mistake (§19.6 constraint 4).
+        Some(PanelAction::Undo),
+        answers.can_stop.then_some(PanelAction::Stop),
+        answers.can_cancel.then_some(PanelAction::Cancel),
+    ]
+}
+
+/// The renderer's one scaling rule, in both directions.
+///
+/// `windows/win/d2d.rs` places the panel by scaling these rectangles up, and the input path maps a
+/// click back down; keeping the pair here is what makes "the button a user sees" and "the button a
+/// user hits" the same button. The floor at 1.0 is the existing behaviour at DPI < 96, where the
+/// panel must not shrink below its layout size to stay readable.
+pub(crate) fn scale_of(dpi: u32) -> f32 {
+    (dpi as f32 / 96.0).max(1.0)
+}
+
+/// A layout length in physical pixels, the way the renderer scales it.
+pub(crate) fn to_pixels(value: i32, dpi: u32) -> i32 {
+    (value as f32 * scale_of(dpi)).round() as i32
+}
+
+/// The inverse: a physical-pixel length back in the layout's DIP space.
+pub(crate) fn to_dip(value: i32, dpi: u32) -> i32 {
+    (value as f32 / scale_of(dpi)).round() as i32
+}
+
+/// A back-buffer point, expressed in the panel's own DIP space.
+pub(crate) fn to_dip_point(point: Point, panel_origin: Point, dpi: u32) -> Point {
+    Point::new(
+        to_dip(point.x - panel_origin.x, dpi),
+        to_dip(point.y - panel_origin.y, dpi),
+    )
 }
 
 // ── The panel's words ───────────────────────────────────────────────────────────
@@ -197,6 +301,13 @@ pub(crate) const RETURN_TEXT: &str = "回到最新";
 /// §19.6's "undo one step", pressed once per step. §19.6 constraint 4 keeps the UI at "the last step"
 /// rather than a step picker, so one press is one undo and pressing it again is the next one.
 pub(crate) const UNDO_TEXT: &str = "撤销";
+
+/// The four labels, in [`PanelLayout::buttons`] order.
+///
+/// One array rather than the same literal twice: the drawing site zips the rectangles with these
+/// labels, and [`actions`] indexes the same four positions, so the button a user reads is the
+/// button the press resolves to (`P7.06`).
+pub(crate) const BUTTON_TEXT: [&str; 4] = [RETURN_TEXT, UNDO_TEXT, STOP_TEXT, CANCEL_TEXT];
 
 // ── The panel's palette ──────────────────────────────────────────────────────────
 
@@ -1002,5 +1113,185 @@ mod tests {
             strip().contains_rect(fitted) && strip().contains_rect(doubled),
             "zooming moves the box and must not push it out of the strip: {fitted:?} {doubled:?}"
         );
+    }
+
+    // --- the hit regions and the actions they name (docs/32 P7.06) ---
+
+    fn answers(continuing: bool, can_return_to_latest: bool) -> Answers {
+        Answers {
+            doing: String::new(),
+            capture_at: 0,
+            amount: String::new(),
+            valid: ViewState::Confirmed,
+            continuing,
+            can_stop: continuing,
+            can_cancel: continuing,
+            trouble: None,
+            can_return_to_latest,
+        }
+    }
+
+    /// The four buttons are drawn as a 2×2 block; a press has to resolve to one of them and never
+    /// to two, or "which button did I press" would depend on the order of a loop.
+    #[test]
+    fn the_four_button_rects_do_not_overlap() {
+        let layout = PanelLayout::new();
+        for (index, button) in layout.buttons.iter().enumerate() {
+            assert!(
+                layout.panel.contains_rect(*button),
+                "button {index} must be inside the panel it is drawn in: {button:?}"
+            );
+            for (other_index, other) in layout.buttons.iter().enumerate().skip(index + 1) {
+                assert!(
+                    button.intersect(*other).is_empty(),
+                    "buttons {index} and {other_index} overlap: {button:?} {other:?}"
+                );
+            }
+        }
+    }
+
+    /// A sweep rather than a spot check: every point of the panel resolves to at most one button,
+    /// and every button's interior resolves to itself. This is the property a click depends on, and
+    /// it is the one a future layout change can break without breaking any single-point test.
+    #[test]
+    fn every_point_of_the_panel_resolves_to_at_most_one_button() {
+        let layout = PanelLayout::new();
+        let mut seen = [false; 4];
+        for y in layout.panel.top..layout.panel.bottom {
+            for x in layout.panel.left..layout.panel.right {
+                let point = Point::new(x, y);
+                let hits: Vec<usize> = layout
+                    .buttons
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, button)| button.contains(point))
+                    .map(|(index, _)| index)
+                    .collect();
+                assert!(
+                    hits.len() <= 1,
+                    "({x},{y}) is inside {} buttons: {hits:?}",
+                    hits.len()
+                );
+                match layout.hit_test(point) {
+                    PanelHit::Button(index) => {
+                        assert_eq!(Some(index), hits.first().copied());
+                        seen[index] = true;
+                    }
+                    PanelHit::Strip => assert!(hits.is_empty()),
+                    PanelHit::Outside => assert!(hits.is_empty()),
+                }
+            }
+        }
+        assert!(
+            seen.iter().all(|reached| *reached),
+            "every button must be reachable by a press: {seen:?}"
+        );
+    }
+
+    /// Inside the panel, between the pieces, is `Outside`: the padding is not a control, and a click
+    /// there must not fall through to the canvas through the panel.
+    #[test]
+    fn the_padding_inside_the_panel_is_not_a_control() {
+        let layout = PanelLayout::new();
+        let between_rows = Point::new(
+            layout.buttons[0].left + 1,
+            layout.buttons[0].bottom + BUTTON_GAP_DIP / 2,
+        );
+        assert!(layout.panel.contains(between_rows));
+        assert!(!layout.strip.contains(between_rows));
+        assert_eq!(layout.hit_test(between_rows), PanelHit::Outside);
+
+        let far_away = Point::new(layout.panel.right + 20, layout.panel.top);
+        assert_eq!(layout.hit_test(far_away), PanelHit::Outside);
+    }
+
+    /// The strip is answerable by the layout; **whether the point is in the viewport box is not**,
+    /// because that rectangle depends on where the session has got to. The layout says "the strip",
+    /// and the caller asks the model with the same point.
+    #[test]
+    fn the_strip_is_reported_without_deciding_the_viewport_box() {
+        let layout = PanelLayout::new();
+        let inside = Point::new(
+            layout.strip.left + 2,
+            layout.strip.top + layout.strip.height() / 2,
+        );
+        assert_eq!(layout.hit_test(inside), PanelHit::Strip);
+    }
+
+    /// "Greyed" and "not clickable" are one predicate: the renderer dims button 0 while the session
+    /// already follows, and the same `Answers` field decides whether a press does anything.
+    #[test]
+    fn a_greyed_button_is_not_clickable() {
+        assert_eq!(
+            actions(&answers(true, false)),
+            [
+                None,
+                Some(PanelAction::Undo),
+                Some(PanelAction::Stop),
+                Some(PanelAction::Cancel)
+            ],
+            "following already: `回到最新` has nothing to do, and the other three do"
+        );
+        assert_eq!(
+            actions(&answers(true, true)),
+            [
+                Some(PanelAction::ReturnToLatest),
+                Some(PanelAction::Undo),
+                Some(PanelAction::Stop),
+                Some(PanelAction::Cancel)
+            ]
+        );
+        assert_eq!(
+            actions(&answers(false, false)),
+            [None, None, None, None],
+            "an ended session offers no choices: the panel is describing what happened"
+        );
+    }
+
+    /// The label order and the action order are one contract, and this is the test that says so:
+    /// index 0 is `回到最新` and `ReturnToLatest`, index 2 is `停止` and `Stop`.
+    #[test]
+    fn the_actions_line_up_with_the_labels() {
+        let live = actions(&answers(true, true));
+        assert_eq!(BUTTON_TEXT.len(), live.len());
+        assert_eq!(BUTTON_TEXT[0], RETURN_TEXT);
+        assert_eq!(live[0], Some(PanelAction::ReturnToLatest));
+        assert_eq!(BUTTON_TEXT[1], UNDO_TEXT);
+        assert_eq!(live[1], Some(PanelAction::Undo));
+        assert_eq!(BUTTON_TEXT[2], STOP_TEXT);
+        assert_eq!(live[2], Some(PanelAction::Stop));
+        assert_eq!(BUTTON_TEXT[3], CANCEL_TEXT);
+        assert_eq!(live[3], Some(PanelAction::Cancel));
+    }
+
+    /// The renderer scales the layout up and the input path maps a click back down; this pins that
+    /// the two are inverses at the DPIs this product runs at, including the sub-96 floor.
+    #[test]
+    fn the_scale_and_its_inverse_agree() {
+        for dpi in [96, 120, 144, 168, 192] {
+            for dip in [0, 1, 8, 26, 220, 248] {
+                assert_eq!(
+                    to_dip(to_pixels(dip, dpi), dpi),
+                    dip,
+                    "dip={dip} dpi={dpi} must round-trip"
+                );
+            }
+            // Anchoring, not just scaling: a point at the panel's origin is the layout's origin.
+            assert_eq!(
+                to_dip_point(Point::new(1000, 500), Point::new(1000, 500), dpi),
+                Point::new(0, 0)
+            );
+            let button = PanelLayout::new().buttons[2];
+            let centre_px = Point::new(
+                1000 + to_pixels(button.left + button.width() / 2, dpi),
+                500 + to_pixels(button.top + button.height() / 2, dpi),
+            );
+            let local = to_dip_point(centre_px, Point::new(1000, 500), dpi);
+            assert_eq!(
+                PanelLayout::new().hit_test(local),
+                PanelHit::Button(2),
+                "the drawn centre of `停止` must resolve to `停止` at dpi={dpi}"
+            );
+        }
     }
 }

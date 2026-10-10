@@ -64,8 +64,8 @@ use crate::geometry::{
     Handle, LevelReach, MagnifierConfig, Point, Rect, SizeLabelPlacement,
 };
 use crate::scroll::panel::{
-    CANCEL_TEXT, PANEL_LINE_HEIGHT_DIP, PANEL_MARGIN_DIP, PANEL_RADIUS_DIP, PanelLayout,
-    RETURN_TEXT, ScrollPanel, STOP_TEXT, UNADOPTED_RGB, UNDO_TEXT,
+    BUTTON_TEXT, PANEL_LINE_HEIGHT_DIP, PANEL_MARGIN_DIP, PANEL_RADIUS_DIP, PanelLayout,
+    ScrollPanel, UNADOPTED_RGB, to_pixels,
 };
 
 /// The font family used for the size label, per the tasklist (§6.3).
@@ -480,31 +480,38 @@ pub(crate) fn scroll_panel_placement(
     metrics: RenderMetrics,
 ) -> Option<(Rect, PanelLayout)> {
     view.scroll_panel.as_ref()?;
-    let scale = (metrics.dpi as f32 / 96.0).max(1.0);
-    let dip = |value: i32| (value as f32 * scale).round() as i32;
+    Some(scroll_panel_rect(
+        view.work_area,
+        view.frame,
+        metrics.dpi,
+    ))
+}
+
+/// Where the panel goes, in back-buffer pixels, for a work area and a DPI.
+///
+/// Split out of [`scroll_panel_placement`] in `P7.06` so the **press** path can place the panel the
+/// way the painter placed it without building a `RenderView`: the two have to agree exactly, and
+/// one function is how they do.
+pub(crate) fn scroll_panel_rect(work_area: Rect, frame: Rect, dpi: u32) -> (Rect, PanelLayout) {
     let layout = PanelLayout::new();
-    let work = if view.work_area.is_empty() {
-        view.frame
-    } else {
-        view.work_area
-    };
-    let width = dip(layout.panel.width());
-    let height = dip(layout.panel.height());
+    let work = if work_area.is_empty() { frame } else { work_area };
+    let width = to_pixels(layout.panel.width(), dpi);
+    let height = to_pixels(layout.panel.height(), dpi);
     // The DIP margin is a floor, not the whole story: a grip's hit area reaches `grip_hit_reach` past
     // the edge it is centred on, and a selection that fills the work area puts the right grip exactly
     // there. At 125%/175% the margin and the grip round in opposite directions, so the marginal DIP
     // margin leaves the panel's last column inside a resize target and the panel eats a grab the user
     // still needs (`P5.05`). The margin therefore has to be at least the reach it has to clear.
-    let margin = dip(PANEL_MARGIN_DIP).max(crate::geometry::grip_hit_reach(
+    let margin = to_pixels(PANEL_MARGIN_DIP, dpi).max(crate::geometry::grip_hit_reach(
         crate::geometry::Handle::Right,
-        metrics.dpi,
+        dpi,
     ));
     let left = (work.right - margin - width).max(work.left);
     let top = (work.top + (work.height() - height) / 2).max(work.top);
-    Some((
+    (
         Rect::new(left, top, left + width, top + height),
         layout,
-    ))
+    )
 }
 
 impl OverlayRenderer {
@@ -1355,8 +1362,7 @@ impl OverlayRenderer {
         let Some(panel) = view.scroll_panel.clone() else {
             return Ok(());
         };
-        let scale = (metrics.dpi as f32 / 96.0).max(1.0);
-        let dip = |value: i32| (value as f32 * scale).round() as i32;
+        let dip = |value: i32| to_pixels(value, metrics.dpi);
         let place = |rect: Rect| {
             Rect::new(
                 panel_frame.left + dip(rect.left),
@@ -1447,7 +1453,7 @@ impl OverlayRenderer {
             for (index, (rect, label)) in layout
                 .buttons
                 .iter()
-                .zip([RETURN_TEXT, UNDO_TEXT, STOP_TEXT, CANCEL_TEXT])
+                .zip(BUTTON_TEXT)
                 .enumerate()
             {
                 let dimmed = index == 0 && following;

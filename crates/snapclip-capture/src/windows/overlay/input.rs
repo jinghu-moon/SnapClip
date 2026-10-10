@@ -7,6 +7,20 @@
 
 use super::*;
 
+/// What a press does with the scroll panel (`docs/32` `P7.06`).
+///
+/// Three answers rather than two: "the panel handled it" and "the panel ignored it" are different,
+/// and a press on the panel's padding is still a press on the panel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PanelPress {
+    /// A live control: the action it names.
+    Action(crate::scroll::panel::PanelAction),
+    /// On the panel, but on nothing that acts (padding, the strip, a greyed button).
+    OnPanel,
+    /// Not the panel: the press belongs to whatever is underneath.
+    Outside,
+}
+
 impl OverlayController {
     pub(super) fn on_mouse_move(&mut self, client: POINT) {
         let point = Point::new(client.x, client.y);
@@ -91,8 +105,30 @@ impl OverlayController {
     }
 
     pub(super) fn on_left_down(&mut self, client: POINT) {
+        let point = Point::new(client.x, client.y);
+        // A running scroll session owns the panel's controls (`docs/32` `P7.06`). The press is
+        // resolved *before* the selection logic, because the overlay still holds the capture
+        // session's selection underneath the panel and a press on `停止` must not also start a drag.
+        if self.scroll_runtime.is_some() {
+            match self.scroll_panel_press(point) {
+                PanelPress::Action(action) => {
+                    eprintln!(
+                        "[snapclip][capture] scroll panel press point=({},{}) action={action:?}",
+                        point.x, point.y
+                    );
+                    self.apply_panel_action(action);
+                    self.invalidate();
+                    return;
+                }
+                // On the panel but not on a live control (the padding, the strip, a greyed button):
+                // still not the canvas. Falling through would let a press beside a button start a
+                // selection drag underneath the panel.
+                PanelPress::OnPanel => return,
+                PanelPress::Outside => {}
+            }
+        }
         if self.session.state() == CaptureState::Annotating {
-            self.annotation_point_down(Point::new(client.x, client.y));
+            self.annotation_point_down(point);
             return;
         }
         if !matches!(
@@ -103,7 +139,6 @@ impl OverlayController {
         }
         // A press is the user taking over; the hint must not sit next to the result (docs/21 §5.21).
         self.hint = None;
-        let point = Point::new(client.x, client.y);
         // Ask what the press *would* do, then record the gesture. Neither step changes the
         // selection (docs/14 §4.2).
         let hit = self.session.press(point);
@@ -120,6 +155,44 @@ impl OverlayController {
         );
         self.update_cursor_shape(point);
         self.invalidate();
+    }
+
+    /// The action a press at `point` (client pixels) performs on the scroll panel.
+    ///
+    /// Three answers rather than two, because "the panel handled it" and "the panel ignored it" are
+    /// different: a press on the panel's padding is still a press on the panel.
+    fn scroll_panel_press(&self, point: Point) -> PanelPress {
+        let Some(panel) = self.scroll_panel.as_ref() else {
+            return PanelPress::Outside;
+        };
+        let Some(geometry) = self.session.geometry() else {
+            return PanelPress::Outside;
+        };
+        let (frame, layout) = crate::windows::win::d2d::scroll_panel_rect(
+            geometry.work_area,
+            geometry.frame,
+            geometry.dpi,
+        );
+        // The same scale the painter used, in the other direction (`panel::to_dip_point`): the
+        // panel's rectangles are a DIP layout, the pointer arrives in pixels.
+        let local = crate::scroll::panel::to_dip_point(
+            point,
+            Point::new(frame.left, frame.top),
+            geometry.dpi,
+        );
+        match layout.hit_test(local) {
+            crate::scroll::panel::PanelHit::Button(index) => {
+                match crate::scroll::panel::actions(&panel.answers())[index] {
+                    Some(action) => PanelPress::Action(action),
+                    // Drawn greyed: the press lands on the panel and does nothing.
+                    None => PanelPress::OnPanel,
+                }
+            }
+            // The strip's viewport box is `P7.07`'s drag; the layout cannot answer it, because that
+            // rectangle depends on where the session has got to.
+            crate::scroll::panel::PanelHit::Strip => PanelPress::OnPanel,
+            crate::scroll::panel::PanelHit::Outside => PanelPress::Outside,
+        }
     }
 
     pub(super) fn on_left_up(&mut self) {
