@@ -926,6 +926,29 @@ pub(crate) fn take_window_request(&self) -> Option<WindowRequest>;      // 驱�
 - **退出条件**：① 三条用例通过；② 诊断路径只有一条（grep 证据）；③ `ScrollDiagnosticCode` 的 13 个变体没有新增（新增是破坏性改动，V2 `§27.1`）。
 - **提交标题**：`[P7-11] the panel has something to say when the loop cannot`
 
+#### 真机演练第 1–2 轮（2026-10-10）：`P7.11` 的前半被真机运行逼着提前做了
+
+> 这一节记录**手动真机演练**（用户操作、`target\debug\snapclip-app.exe` 以后台任务运行）暴露出的东西。它不是任务书的一部分，而是 `P7.13` 要做的演练被提前了两轮——因为不跑一次就不知道 `P7.05`/`P7.07` 的接线到底通不通。
+
+**轮次 1（提交 `e1e06be`/`3f07b29` 之后，用户首次按 F7 → 拖选 → Enter）**
+
+- 会话**确实开始了**（`scroll session started window=0x2280c86 cross=3840 extent=2088 capture_dpi=144`），13 次 `scroll region read`，但 `steps=3 committed=0 discarded=3`，驱动自报 `stop=Some(ActuatorFailed)`，导出 `size=3840x2088`——一张**整个窗口**的图（用户选的是 717,544→1970,1115）。
+- 当时日志只有这一行 `scroll session ended …`，**没有任何细节**：`StepError::Injection(_)` 的载荷被 `_` 丢掉、`NoFrame` 与它共用一个分支、看门狗放弃也没有句子。**这是 `P7.11` 的第一条，且它比任务书预想的更早成为阻塞项**：没有它，下面两个缺陷都只能靠猜。
+- 同一轮还暴露出 **`P7.05` 的接线错误**：`begin_scroll_session` 用 `target.bounds()`（**窗口** 3840×2088）建 `ScrollPlan` 与帧源，而不是 `target.crop()`（**选区 ∩ 窗口**）。于是画布 3840 宽、帧 32 MB、估计器被要求把浏览器的标签栏与滚动条一起当成页面内容来匹配。
+
+**轮次 2（含 `HTTRANSPARENT` 修复，用户重试）**
+
+- **`P7.05b` 的裁剪生效**：`cross=1164 extent=868`，导出 `size=1164x868` ✓。
+- 诊断句子第一次说话：`no new frame after injecting 9 notches (either the wheel never landed, or the content did not move)` ×3 → `the watchdog gave up: three steps moved nothing`。**`HTTRANSPARENT` 没有改变结果**——这本身是结论：说明滚轮不是被覆盖层截下的。
+- 读代码得到真正的原因链（`crates/snapclip-capture/src/windows/scroll_actuator.rs:190-195` 的决策表）：覆盖层在 `overlay focus requested` 之后拥有前台 ⇒ `TargetProbe::at_session_start` 的 `target_is_foreground == false` ⇒ 决策表选的是 **`InjectPath::PostMessageW`**，即 `PostMessageW(WM_MOUSEWHEEL)` 直接发给浏览器（`descend` 用 `ChildWindowFromPointEx` 下沉到最深的子窗口）。**这条路完全不经过覆盖层**，所以 `WM_NCHITTEST` 的 `HTTRANSPARENT` 在这条路径上无足轻重（它对 `SendInput`+`MOUSE_POS` 才是判据）。
+- 因此第 3 轮必须回答的问题是：**那条消息到底发给了谁**。为此新增（`P7.11` 的前半）：
+  - `crates/snapclip-capture/src/scroll/loop_control.rs` 的 `StepHost::inject` 每次注入都打印 `path/notches/status/delivered/window`；`run` 的每个成功步打印 `step=/notches=/position=/status=/committed=`；
+  - `crates/snapclip-capture/src/windows/scroll_actuator.rs` 的 `WindowWheelActuator::inject` 打印**平台侧**的同一行，并**多带两个只有平台侧才知道的字段**：`window=0x… class=…` 与 `target=0x… aim=(x,y)`。`window_class` 之所以在这里而不是在 `scroll/` 里取，是因为依赖门禁禁止 `scroll/` 命名 `crate::windows`；而**类名是"消息发对了窗口没有"的唯一判据**（`Chrome_RenderWidgetHostHWND` 与 `Intermediate D3D Window` 都是"浏览器的子窗口"，只有一个会滚）。
+- `HTTRANSPARENT` 那一改仍然保留并单独提交（`[P7-07b]`）：它对**用户自己的滚轮**（`SendInput` 语义之外的物理输入）与**点击穿透**是必需的，只是不是本轮阻塞的原因；把它当成"修好了"就会是伪完成。
+- **本轮的诚实结论**：`P7.11` 的"诊断"不是可选的打磨项，它是 `P7.13` 真机演练的前置条件；`P7.05` 的裁剪错误只有真机能发现（单元测试的视口本来就是一个矩形，不会问它是不是**用户的**那个矩形）。
+
+**轮次 2 之后的三条提交（都在门禁绿的前提下）**：`[P7-05b]` 捕获区 = 选区；`[P7-07b]` 会话期间内容区命中穿透 + 一条 flaky 断言的调度余量；`[P7-11a]` 上述两条日志。
+
 ---
 
 ### P7.12 失败与降级

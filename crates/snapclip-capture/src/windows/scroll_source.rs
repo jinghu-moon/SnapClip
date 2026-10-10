@@ -222,6 +222,16 @@ pub(crate) struct WgcFrameSource {
     backend: Box<dyn FrameBackend>,
     axis: Axis,
     size: (u32, u32),
+    /// The rectangle of each delivered frame this source is **about** (`docs/32` `P7.05b`).
+    ///
+    /// The backend delivers the whole window; a scroll session's region is the selection inside it.
+    /// Cropping on the way in is what makes the canvas, the displacement search and the exported image
+    /// agree on one rectangle — and it is not a cosmetic trim: a whole-window canvas asks the estimator
+    /// to match a browser's tab strip and scrollbars along with the page, which is exactly the frame
+    /// `P7.05b` could not confirm a step in.
+    ///
+    /// `None` means "the whole frame", which is what the probes and the backend's own tests want.
+    crop: Option<Rect>,
     /// Per-row digests of the last observation we handed out, so "the platform re-delivered the
     /// same pixels" is answered without holding a second copy of the viewport (`docs/30` §11.3).
     last_rows: Option<Vec<u64>>,
@@ -238,6 +248,7 @@ impl WgcFrameSource {
             backend,
             axis,
             size,
+            crop: None,
             last_rows: None,
             detail: None,
             ended: false,
@@ -247,6 +258,12 @@ impl WgcFrameSource {
     /// Why the stream ended, in words, once it has.
     pub(crate) fn last_detail(&self) -> Option<&str> {
         self.detail.as_deref()
+    }
+
+    /// Deliver only `crop` (a frame-local rectangle) from each frame (`docs/32` `P7.05b`).
+    pub(crate) fn with_crop(mut self, crop: Rect) -> Self {
+        self.crop = Some(crop);
+        self
     }
 
     fn end(&mut self, reason: EndReason, detail: impl Into<String>) -> Poll {
@@ -299,6 +316,21 @@ impl FrameSource for WgcFrameSource {
                         );
                         return Ok(self.end(EndReason::TargetLost, detail));
                     }
+                    // The region first, then everything else: `row_digests`, the observation and the
+                    // canvas all speak about the crop, so cropping after them would only move the
+                    // mismatch (`P7.05b`).
+                    let (pixels, size) = match self.crop {
+                        None => (pixels, size),
+                        Some(crop) => match crop_frame(&pixels, size, crop) {
+                            Ok(cropped) => cropped,
+                            Err(detail) => {
+                                return Ok(self.end(
+                                    EndReason::CaptureFailed,
+                                    format!("the session's region does not fit the frame: {detail}"),
+                                ))
+                            }
+                        },
+                    };
                     let rows = row_digests(&pixels, size);
                     if self.last_rows.as_deref() == Some(rows.as_slice()) {
                         // Byte-identical to the last observation: the platform re-delivers
@@ -354,21 +386,30 @@ impl OpeningFrameSource {
     /// Both failures — "no device" and "no window" — arrive as **one** answer, because the factory
     /// cannot return a `Result` (see the type's doc): the caller creates the device (it is the
     /// assembly's job, not this file's) and hands the outcome over.
+    ///
+    /// `region` is the part of the window this stream is about, in **frame-local** coordinates: the
+    /// selection clipped to the window, moved by the window's origin (`docs/32` `P7.05b`). It is both
+    /// what the source crops to and what `FrameSource::viewport` reports, so "the rectangle the
+    /// session is capturing" has one answer rather than two.
     pub(crate) fn open(
         device: Result<std::sync::Arc<GraphicsDevice>, String>,
         window: isize,
         axis: Axis,
-        viewport: Rect,
+        region: Rect,
     ) -> Self {
         let opened = match device {
-            Ok(device) => WgcFrameBackend::open(device, window)
-                .map(|backend| WgcFrameSource::new(Box::new(backend), axis)),
+            Ok(device) => WgcFrameBackend::open(device, window).map(|backend| {
+                WgcFrameSource::new(Box::new(backend), axis).with_crop(region)
+            }),
             Err(detail) => Err(FrameError::Transient {
                 context: "GraphicsDevice::create",
                 detail,
             }),
         };
-        Self { opened, viewport }
+        Self {
+            opened,
+            viewport: region,
+        }
     }
 
     /// Built from an already-opened (or already-failed) source — the shape the tests need, and the
@@ -399,6 +440,42 @@ impl FrameSource for OpeningFrameSource {
 }
 
 /// Per-row FNV digests, the same ones §11.3 uses to compare frames.
+/// Copy `crop` out of a tightly packed BGRA frame (`docs/32` `P7.05b`).
+///
+/// Row by row rather than a strided view: an [`Observation`] owns its pixels and the canvas reads them
+/// by row stride, so the crop has to be packed. The rectangle is clipped to the frame (a window that
+/// moved between the snapshot and the capture would otherwise index past its own bytes) but an empty
+/// intersection is an **error**, not an empty image: a silently shifted region would make every later
+/// row index wrong in a way no later gate could see.
+fn crop_frame(
+    pixels: &[u8],
+    size: (u32, u32),
+    crop: Rect,
+) -> Result<(Vec<u8>, (u32, u32)), String> {
+    let (width, height) = size;
+    let left = crop.left.max(0) as u32;
+    let top = crop.top.max(0) as u32;
+    let right = (crop.right.max(0) as u32).min(width);
+    let bottom = (crop.bottom.max(0) as u32).min(height);
+    if right <= left || bottom <= top {
+        return Err(format!("{crop:?} does not intersect {width}x{height}"));
+    }
+    let row_bytes = (right - left) as usize * 4;
+    let expected = width as usize * height as usize * 4;
+    if pixels.len() < expected {
+        return Err(format!(
+            "the frame is {} bytes and {width}x{height} needs {expected}",
+            pixels.len()
+        ));
+    }
+    let mut out = Vec::with_capacity(row_bytes * (bottom - top) as usize);
+    for y in top..bottom {
+        let start = (y as usize * width as usize + left as usize) * 4;
+        out.extend_from_slice(&pixels[start..start + row_bytes]);
+    }
+    Ok((out, (right - left, bottom - top)))
+}
+
 fn row_digests(pixels: &[u8], size: (u32, u32)) -> Vec<u64> {
     let stride = size.0 as usize * 4;
     (0..size.1 as usize)
@@ -516,7 +593,7 @@ mod tests {
     use super::{
         BackendFallback, BackendPoll, EndReason, FrameBackend, FrameError, FrameSource,
         OpeningFrameSource, Poll, ProviderKind, SCROLL_BACKENDS, TargetGeometry, TargetLiveness,
-        TopologyOutcome, WgcFrameSource, next_scroll_backend, topology_outcome,
+        TopologyOutcome, WgcFrameSource, crop_frame, next_scroll_backend, topology_outcome,
     };
     use crate::geometry::Rect;
     use crate::scroll::observation::{Axis, Observation};
@@ -717,6 +794,44 @@ mod tests {
             source.next(Duration::from_millis(50)),
             Ok(Poll::Frame(_))
         ));
+    }
+
+    /// `P7.05b`: the region a session captures is a rectangle of the window, and the crop is that
+    /// rectangle — the right rows, packed, or an error.
+    ///
+    /// The three answers are three different failures avoided: taking the wrong rows (a shift), taking
+    /// the *strided* rows (a frame the canvas' row arithmetic cannot read), and clamping a rectangle
+    /// that does not intersect the frame into a plausible-looking one.
+    #[test]
+    fn the_crop_takes_the_rectangles_rows_and_refuses_an_empty_one() {
+        let (width, height) = (4u32, 3u32);
+        let mut pixels = Vec::new();
+        for y in 0..height {
+            for x in 0..width {
+                // Pixel (x, y) says its own coordinates, so a wrong crop is a wrong number.
+                pixels.extend_from_slice(&[x as u8, y as u8, 0, 255]);
+            }
+        }
+
+        let (cropped, size) = crop_frame(&pixels, (width, height), Rect::new(1, 1, 3, 3))
+            .expect("an interior rectangle is a crop");
+        assert_eq!(size, (2, 2));
+        assert_eq!(
+            cropped,
+            vec![1, 1, 0, 255, 2, 1, 0, 255, 1, 2, 0, 255, 2, 2, 0, 255]
+        );
+
+        // Hanging off an edge is clipped, not wrapped.
+        let (edge, size) = crop_frame(&pixels, (width, height), Rect::new(2, 2, 9, 9)).unwrap();
+        assert_eq!(size, (2, 1));
+        assert_eq!(edge, vec![2, 2, 0, 255, 3, 2, 0, 255]);
+
+        // Nothing in common with the frame is an error, never an empty image.
+        let error = crop_frame(&pixels, (width, height), Rect::new(9, 9, 12, 12)).unwrap_err();
+        assert!(
+            error.contains("does not intersect"),
+            "the refusal must say what was wrong: {error}"
+        );
     }
 
     #[test]

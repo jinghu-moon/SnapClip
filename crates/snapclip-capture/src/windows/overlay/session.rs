@@ -142,6 +142,25 @@ impl OverlayController {
             return;
         };
 
+        // **Every refusal happens before the hand-over** (`docs/32` §9 `P7.05` constraint ①): the plan
+        // is built from the viewport, `ScrollPlan::new` checks nothing, and `choose_target` measured
+        // the **window** — so the assembly root is the only place that can say "this selection is too
+        // short to scroll in" while the user still has a session they can export.
+        //
+        // The region is the **selection** clipped to the window (`ScrollTarget::crop`), not the whole
+        // window. Using `bounds` here is what made the first two real runs capture a whole maximized
+        // browser — 3840×2088, tab strip and all — and fail to confirm a single step (`P7.05b`).
+        let crop = self.session.selection().intersect(bounds);
+        let (cross_len, extent) = (crop.width().max(0) as u64, crop.height().max(0) as u64);
+        if crop.is_empty() || extent < u64::from(crate::scroll::target::MIN_TARGET_EXTENT) {
+            eprintln!(
+                "[snapclip][capture] scroll entry refused: the selection is {cross_len}x{extent} \
+                 inside the window and needs at least {} px along the scroll axis",
+                crate::scroll::target::MIN_TARGET_EXTENT
+            );
+            return;
+        }
+
         let handoff = match self.session.begin_scroll(window, bounds) {
             Ok(handoff) => handoff,
             Err(error) => {
@@ -151,9 +170,19 @@ impl OverlayController {
         };
         self.scroll_entry_armed = false;
 
+        // The hand-off recomputed the same rectangle from the same two inputs, and it is the
+        // authoritative one — the check above exists to keep the session alive, not to predict it.
         let target = handoff.target();
-        let cross_len = target.bounds().width().max(0) as u64;
-        let extent = target.bounds().height().max(0) as u64;
+        let region = target.crop();
+        let cross_len = region.width().max(0) as u64;
+        let extent = region.height().max(0) as u64;
+        // The frame arrives in **window** coordinates, the selection was made in screen coordinates.
+        let frame_region = Rect::new(
+            region.left - bounds.left,
+            region.top - bounds.top,
+            region.right - bounds.left,
+            region.bottom - bounds.top,
+        );
         // The plan states the viewport as a `u32` (a viewport taller than 4 Gi px is not a case the
         // canvas has an answer for) while the memory budget is computed in pixels; the clamp keeps
         // the two statements about the same rectangle rather than panicking on an impossible one.
@@ -182,7 +211,12 @@ impl OverlayController {
             move || {
                 let device = crate::windows::win::d3d11::GraphicsDevice::create()
                     .map(std::sync::Arc::new);
-                crate::windows::scroll_source::OpeningFrameSource::open(device, handle, axis, bounds)
+                crate::windows::scroll_source::OpeningFrameSource::open(
+                    device,
+                    handle,
+                    axis,
+                    frame_region,
+                )
             },
             crate::windows::scroll_actuator::WindowWheelActuator::new(handle, screen, axis, probe),
             wake,
