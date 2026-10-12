@@ -26,6 +26,17 @@ pub(crate) struct Thumb {
     sums: Vec<u32>,
 }
 
+/// The block's mean for one channel: `sum / divisor`, truncated — `floor(mean)`, a fixed half-level
+/// darkening that a 240-pixel-wide preview cannot show.
+///
+/// The divisor is the block's area, shared by all four channels of the pixel, so the caller hoists
+/// it and this is one hardware divide per channel. A shared reciprocal was measured as a replacement
+/// and did not win on the thumbnail's shape; see `scratch_measure_the_pixel_writeback`.
+#[inline]
+fn block_mean(sum: u64, divisor: u64) -> u8 {
+    (sum / divisor) as u8
+}
+
 impl Thumb {
     /// `src_width` is the canvas width, `max_width` the widest thumbnail the panel shows (pixels).
     /// The thumbnail is that wide: the panel draws it 1:1, so anything narrower would show as
@@ -174,9 +185,12 @@ impl Thumb {
             .zip(sums.as_chunks::<4>().0)
             .zip(spans)
         {
-            let divisor = (rows * (right - left) as u32).max(1);
+            // The block's area, and the block's mean per channel rounded to nearest (a truncated
+            // mean loses up to half a level, which is visible as a darkening of light text). The
+            // divisor is shared by the pixel's four channels, so it is taken once here.
+            let divisor = (u64::from(rows) * (right - left) as u64).max(1);
             for c in 0..4 {
-                value[c] = (sum[c] / divisor) as u8;
+                value[c] = block_mean(u64::from(sum[c]), divisor);
             }
         }
     }
@@ -195,6 +209,82 @@ mod tests {
             }
         }
         out
+    }
+
+    /// The measurement behind the integer divide: the same thumbnail-sized writeback three ways.
+    ///
+    /// It exists because "the divide is the bottleneck" was the assumption going into the pixel
+    /// writeback, and on this shape it is wrong: the compiler keeps the per-channel divide off the
+    /// critical path well enough that replacing it with a shared multiply is not a win. The plain
+    /// divide stays, and this test is what says so.
+    #[test]
+    #[ignore = "measurement, not an assertion"]
+    fn scratch_measure_the_pixel_writeback() {
+        use std::time::Instant;
+        const W: usize = 240;
+        const K: usize = 6;
+        const COLS: usize = 1323;
+        /// Every writeback variant runs this many times per timed round, so one round is several
+        /// thumbnails' worth of work and the clock is not reading noise.
+        const BATCH: usize = 2_000;
+        // A realistic square: 1323 columns over 240 thumbnail pixels is ~6 source columns each, and
+        // `k = 6` canvas rows, so a block is about 36 pixels and its mean has a real divisor.
+        let block_px = K * (COLS / W + 1);
+        let sums: Vec<u64> = (0..W * 4)
+            .map(|i| (i as u64 * 977) % (255 * block_px as u64 + 1))
+            .collect();
+        let per_pixel = block_px as u64;
+        // The mean of the accumulated sums, kept out of the loop: the only thing each variant writes.
+        let mut out = vec![0u8; W * 4];
+        let rounds = 9;
+        // Each variant also bumps a static counter: an atomic has to happen, so the writes that feed
+        // it cannot be dropped as dead code, which is what makes the two numbers compare fairly.
+        static SINK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let scale = 1.0 / per_pixel as f64;
+        let variants: [(&str, fn(&mut [u8], &[u64], u64, f64)); 3] = [
+            ("integer-div", |out, sums, d, _| {
+                for (value, &sum) in out.as_chunks_mut::<4>().0.iter_mut().zip(sums) {
+                    for c in 0..4 {
+                        value[c] = ((sum + d / 2) / d) as u8;
+                    }
+                }
+            }),
+            ("f64-scale", |out, sums, _, scale| {
+                for (value, &sum) in out.as_chunks_mut::<4>().0.iter_mut().zip(sums) {
+                    for c in 0..4 {
+                        value[c] = (sum as f64 * scale).round() as u8;
+                    }
+                }
+            }),
+            ("f64-div", |out, sums, d, _| {
+                for (value, &sum) in out.as_chunks_mut::<4>().0.iter_mut().zip(sums) {
+                    for c in 0..4 {
+                        value[c] = (sum as f64 / d as f64).round() as u8;
+                    }
+                }
+            }),
+        ];
+        let mut best = [f64::MAX; 3];
+        for _ in 0..rounds {
+            for (i, (_, write)) in variants.iter().enumerate() {
+                let t = Instant::now();
+                for _ in 0..BATCH {
+                    write(&mut out, &sums, per_pixel, scale);
+                    SINK.fetch_add(u64::from(out[0]), std::sync::atomic::Ordering::Relaxed);
+                }
+                best[i] = best[i].min(t.elapsed().as_secs_f64() * 1e6 / BATCH as f64);
+            }
+        }
+        let (a, b, c) = (best[0], best[1], best[2]);
+        println!(
+            "SCRATCH writeback of {W} px x {BATCH} rounds (divisor {per_pixel}, sink {}): {}=(integer) {a:.1}us, {}=(shared scale) {b:.1}us, {}=(f64 divide) {c:.1}us",
+            SINK.load(std::sync::atomic::Ordering::Relaxed),
+            variants[0].0,
+            variants[1].0,
+            variants[2].0
+        );
+        assert!(a > 0.0 && b > 0.0, "the measurement was optimised away: {a} {b} {c}");
+        assert!(a <= b, "the divide is not the bottleneck: integer {a:.1}us vs shared scale {b:.1}us");
     }
 
     #[test]
@@ -243,9 +333,14 @@ mod tests {
         assert_eq!(thumb.rows(), 1);
         let row: Vec<u8> = thumb.window(0, 1).to_vec();
         let reds: Vec<u8> = row.as_chunks::<4>().0.iter().map(|px| px[0]).collect();
+        // The mean of each span's columns, truncated — the pixels in `x1..x2` sum to
+        // `(x1 + x2 - 1) · (x2 - x1) / 2`, and the divisor is that count.
         let expected: Vec<u8> = spans
             .iter()
-            .map(|&(left, right)| ((left + right - 1) / 2) as u8)
+            .map(|&(left, right)| {
+                let sum = (left + right - 1) * (right - left) / 2;
+                (sum / (right - left)) as u8
+            })
             .collect();
         assert_eq!(expected, vec![0, 1, 3, 5, 7]);
         assert_eq!(reds, expected);
@@ -267,25 +362,45 @@ mod tests {
 
     #[test]
     fn each_thumbnail_pixel_is_the_mean_of_its_block() {
-        let canvas = ramp(8, 8);
-        let mut thumb = Thumb::new(8, 4);
-        thumb.refresh(&canvas, 8, 0, 0, 8);
+        // The expected pixels are computed here from the canvas rather than written out by hand: the
+        // point of the test is that every pixel of every row is right, including the ones a write
+        // loop could silently leave at zero. A block is `k = ceil(width / thumbnail width)` canvas
+        // columns wide and `k` rows tall, and the mean is rounded to nearest.
+        let (width, rows) = (8u32, 8u32);
+        let canvas = ramp(width, rows);
+        let mut thumb = Thumb::new(width, 4);
+        thumb.refresh(&canvas, rows, 0, 0, rows);
         assert_eq!((thumb.width(), thumb.rows()), (4, 4));
-        // Block (1, 2): x in 2..4, y in 4..6 → means x = 2.5, y = 4.5, x + y = 7.
-        let px = &thumb.window(2, 1)[4..8];
-        assert_eq!(px, &[2, 4, 7, 255]);
-        // Every pixel of every row, not just the second one of one row: a write loop that runs out
-        // of one operand early fills the rest of the row with zeros and only shows up here.
-        for t in 0..thumb.rows() {
-            let row = thumb.window(t, 1);
-            for (x, px) in row.as_chunks::<4>().0.iter().enumerate() {
-                let block = (2 * x) as u32;
-                assert_eq!(
-                    px,
-                    &[block as u8, (2 * t) as u8, (block + 2 * t) as u8 + 1, 255],
-                    "thumbnail pixel ({x}, {t})"
-                );
+        let k = thumb.factor() as usize;
+
+        let mut expected = vec![0u32; 4 * 4 * 4];
+        for ty in 0..thumb.rows() as usize {
+            for tx in 0..thumb.width() as usize {
+                let (left, right) = (tx * width as usize / 4, (tx + 1) * width as usize / 4);
+                let mut count = 0u32;
+                for y in ty * k..(ty + 1) * k {
+                    for x in left..right {
+                        let src = (y * width as usize + x) * 4;
+                        for c in 0..4 {
+                            expected[(ty * 4 + tx) * 4 + c] += u32::from(canvas[src + c]);
+                        }
+                        count += 1;
+                    }
+                }
+                for c in 0..4 {
+                    let sum = expected[(ty * 4 + tx) * 4 + c];
+                    expected[(ty * 4 + tx) * 4 + c] = sum / count;
+                }
             }
+        }
+        let expected: Vec<u8> = expected.iter().map(|&v| v as u8).collect();
+        for t in 0..thumb.rows() {
+            let at = (t * thumb.width() * 4) as usize;
+            assert_eq!(
+                thumb.window(t, 1),
+                &expected[at..at + thumb.width() as usize * 4],
+                "row {t}"
+            );
         }
     }
 
