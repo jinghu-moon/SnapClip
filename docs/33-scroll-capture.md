@@ -84,17 +84,20 @@ crates/snapclip-capture/src/windows/
   - 超出顶部时为 **Prepend**：与 Append 镜像。
   - 否则为 **Contained**：只移动 `pos`，不写像素。
 - `Still` 时把参考帧换成当前帧（跟随动画）。`Unknown` 时参考帧不变，状态记为 `Lost`。
-- 上限：画布达到 `MAX_SCREENS = 32 × H` 后停止增长，状态记为 `Full`，自动滚动同时停止。增长按容量倍增摊销（`grow`：目标容量取 `max(所需, min(2×当前容量, 上限))`，再 `try_reserve_exact`），整次会话只搬移画布 O(log n) 次；内存不足时同样返回 `Full`、画布保持原样，而不是让 `Vec::resize` 终止进程。向上增长用 `copy_within` 原地平移已有行。（第 4 轮日志：按需精确预留导致每次追加都整块复制，追加耗时从 68 ms 涨到 123 ms；改为摊销后 release 下稳定在约 0.25 ms/次。）
+- 上限：画布同时受**行数**与**字节**两条限制，取更紧的一条。行数上限是 `MAX_SCREENS = 32 × H`；字节上限是 `MAX_BYTES = 512 MiB`，换算成行数为 `MAX_BYTES / (W × 4)`（`row_limit`）。只按行数限制不是资源策略：`32 × H` 在 1241×821 的选区下约 130 MB，但在 3840×2160 下是 1.06 GB，而扩容的一瞬间新旧两块分配同时存在。常见的 1200×1024 选区里 `32 × H` 仍然是更紧的一条（字节侧允许 131072 行，行数侧只给 38400 行），所以字节预算只在极宽或极高的选区上生效。达到上限后停止增长，状态记为 `Full`，自动滚动同时停止。增长按容量倍增摊销（`grow`：目标容量取 `max(所需, min(2×当前容量, 上限))`，再 `try_reserve_exact`），整次会话只搬移画布 O(log n) 次；内存不足时同样返回 `Full`、画布保持原样，而不是让 `Vec::resize` 终止进程。注意 `grow` 的 `limit` 只约束**倍增的选择**，真正拦住越界的是 `place` 在增长之前做的 `rows + growth > max_rows` 检查。向上增长用 `copy_within` 原地平移已有行。（第 4 轮日志：按需精确预留导致每次追加都整块复制，追加耗时从 68 ms 涨到 123 ms；改为摊销后 release 下稳定在约 0.25 ms/次。）
 
 ### 3.3 线程与消息
 
 - 捕获线程每帧调用 `next_frame(20 ms)`，回读选区，再调用 `Tracker::push`。只有画布或状态发生变化时，才更新 `Report{preview, status, auto, failure}`，并 `PostThreadMessage(SCROLL_READY_MESSAGE)`。
 - 覆盖层线程收到消息后执行 `take_report`，然后依次：上传缩略图 → 重算布局 → 必要时重设窗口区域 → 重绘。
-- **自动滚动**：每 `200 ms` 发送一格 `WM_MOUSEWHEEL(−120)`。目标窗口这样确定：
+- **自动滚动**：先发送一格 `WM_MOUSEWHEEL(−120)`，**再等页面把它显示出来**（`observe` / `OBSERVE_TIMEOUT = 1000 ms`），确认之后就发下一格。一格滚轮是请求而不是结果：慢页面、远程会话和懒重绘可能要一秒以上才重绘，按固定 `200 ms` 计时会把它们误判成"已到底"。目标窗口这样确定：
   1. 按 Z 序找到选区中心下第一个不属于本进程的可见窗口；
   2. 再用 `ChildWindowFromPointEx` 下钻到最深的子窗口。
 
-  连续 `10` 格都没有测到位移，就判定已到底，自动关闭。
+  连续 `10` 格都没有测到位移，就判定已到底，自动关闭。判定的依据是**窗口内有没有新帧**，不是墙钟：
+  - 仍在重绘的页面会顺延窗口（"连续一秒没有变化"才算一次未响应），慢页面因此有机会画完它已经开始的那一次滚动；
+  - 日志会区分两种"没动"：`the page repainted without moving`（有新帧但没位移）与 `no new frame arrived`（根本没有新帧）；
+  - 任意一次成功位移都把计数清零。
   `PostMessageW` 返回 `ERROR_ACCESS_DENIED` 时，说明目标以更高完整性级别运行（以管理员身份运行），UIPI 会丢弃低完整性进程投递的输入（`docs/archive/30` §24.6.2 实测）。这时立即关闭自动，状态栏显示「窗口拒绝自动，请手动滚」，不再把 10 次被拒误判为"已到底"。用户自己的滚轮不受影响，再次点「自动」会清除该状态。
 - **手动滚动**：滚轮直接落到页面上（F1）。覆盖层若自己收到 `WM_MOUSEWHEEL`，用同一个 `post_wheel` 转发。
 
@@ -129,6 +132,7 @@ crates/snapclip-capture/src/windows/
   - Prepend 正确；
   - 跳跃后能恢复；
   - 达到上限后停止增长；
+  - 字节预算成为更紧的一条时，行数上限由它决定（`the_byte_budget_can_be_the_cap_that_stops_the_image`：64 MiB / 1024 宽 → 16384 行，长到 16300 行后再追加即 `Full`，且重复追加不会长出一行）；
   - 内存申请失败时画布保持原样。
 - **Tracker**：随机在线滚动后与真值逐字节相等；Lost 后往回滚能恢复；Full 状态正确；预览跟随视口。
 - **缩略图与布局**：
@@ -137,7 +141,7 @@ crates/snapclip-capture/src/windows/
   - 三个按钮依序铺满底部一行，命中测试正确；阴影不触及选区。
 - **边框**：普通截图与滚动截图的边框都画在选区边缘内侧（GPU 像素测试）；滚动时选区内部与边框、面板以外全透明，没有手柄。
 - **覆盖层**：窗口区域不覆盖选区内部（边框带以内），边框带四周封闭。
-- **自动滚动**：只有 `ERROR_ACCESS_DENIED` 被视为拒绝；拒绝后自动关闭并进入 Refused，重新开启后清除；目标窗口变化时记录；目标的类名取自真实窗口。
+- **自动滚动**：只有 `ERROR_ACCESS_DENIED` 被视为拒绝；拒绝后自动关闭并进入 Refused，重新开启后清除；目标窗口变化时记录；目标的类名取自真实窗口。**等待闭环**：一帧显示位移即结束当前 notch；未到期无位移时仍在等待；到期区分"重绘但没位移"与"没有新帧"；重绘会顺延窗口（慢页面不会被旧期限判死）；连续 `AUTO_IDLE_NOTCHES` 次未响应才停止，任何一次位移都清零（`a_notch_ends_the_instant_a_frame_shows_it`、`a_notch_that_times_out_reports_what_the_page_did`、`a_page_that_keeps_repainting_gets_to_finish_the_scroll_it_started`、`auto_gives_up_only_after_a_run_of_idle_notches`、`the_closed_loop_sets_the_cadence_from_the_page`——最后一条用虚拟时间走一遍闭环，把节奏交给页面：一帧应答的页面仍是 `AUTO_INTERVAL` 一击，一个窗口才应答的页面按窗口计，每 5 s 才出一帧的页面十击后放弃）。
 - **导出**：长图（1250×25826）的剪贴板拿到的就是任务自己的像素缓冲；桌面目录不可用时剪贴板照常；历史写入失败时不做任何复制。
 - **性能证据**（`--ignored`）：
   - `the_cost_of_one_estimate_at_the_field_selection_size`：1241×821 下单次估计的耗时（实测 991 µs）；
@@ -164,8 +168,17 @@ crates/snapclip-capture/src/windows/
   | 其余（`tracker.push`：签名 + 估计 + 拼接 + 缩略图） | 11631 µs | 占每帧 90% |
   | 一帧合计 `us` | 12942 µs | 合成探针同链路约 3.3 ms，真机慢约 4× |
 
-  自动打点间隔 200 ms，真机一帧约 13 ms，**余量约 15×**（合成探针会给出"两个数量级"，那是不与桌面竞争时的数，不要拿它当验收依据）。真机与合成对不上的是 `push` 一段，而不是回读：**在把 `push` 拆成签名 / 估计 / 拼接 / 缩略图之前，不要因为"回读很贵"去改回读**。逐帧拆分由 `SNAPCLIP_SCROLL_VERBOSE` 打开，收尾聚合行（`stopped frames=… read_mean_us=… push_mean_us=…`）默认打印，见 §4.3。
-  `DO_NOT_WAIT` 轮询（2331 µs，4 次 50 µs 睡眠）比阻塞 Map **更慢**，因此不要为"异步回读"增加复杂度。
+  从上表看，真正贵的不是回读而是 `push` 那 11.6 ms，所以**在把 `push` 拆成签名 / 估计 / 拼接 / 缩略图之前，不要因为"回读很贵"去改回读**：合成探针里这三段拆开后合计只有约 1.7 ms，与真机的 11.6 ms 差一个数量级，说明缺口不在已测量的算法里。逐帧拆分由 `SNAPCLIP_SCROLL_VERBOSE` 打开，收尾聚合行（`stopped frames=… read_mean_us=… push_mean_us=…`）默认打印，见 §4.3。
+
+  **回读池化（多缓冲异步回读）已否决，有探针。** `the_latency_a_staging_pool_would_hide_at_the_field_selection_size` 把一帧跑完整（队列里排一次拷贝 → 花 11.6 ms 处理上一帧 → 取回这一帧），同一块 11.5 MB 区域、`--release`：
+
+  | 变体 | 回读等待 p50 | 一帧 p50 | 一帧 max |
+  | --- | --- | --- | --- |
+  | 现状（每帧新建 staging + 阻塞 Map） | 1196 µs | 1473 µs | 3815 µs |
+  | 双槽池 + `DO_NOT_WAIT` 轮询 | 1717 µs | 2357 µs | 2939 µs |
+  | 池 + 无 CPU 工作（拷贝自身的落地时间） | 1851 µs | 1851 µs | 2366 µs |
+
+  也就是说：拷贝要 1.85 ms 才落地，但阻塞 `Map` 在真实工作负载里只等 1.2 ms——**GPU 已经在管线里跑在 CPU 前面了**，池化没有东西可藏，反而因为 50 µs 一档的轮询多花约 0.9 ms/帧。同一份代码里 `DO_NOT_WAIT` 单次轮询（2331 µs，4 次睡眠）也慢于阻塞 Map。结论：**不要为异步回读增加复杂度**；回读真正的大头是 11.5 MB 的主机行拷贝（约 1.6 ms），那与缓冲数量无关。
 
 ### 4.2 真机测试步骤
 
@@ -183,7 +196,7 @@ crates/snapclip-capture/src/windows/
 | `first frame WxH` | 第一帧到达，选区的物理像素尺寸 |
 | `frame=N Shift { dy, votes, second } placement=… rows=… status=… quiet_since_last=… us=…` | 一次被接受的位移。`votes / second` 是最优与次优的票数；`placement` 为 `Appended/Prepended{growth, band}` 或 `Contained`；`rows` 是长图当前高度；`us` 是本帧回读 + 估计 + 拼接的耗时 |
 | `frame=N Unknown { best, votes, second, unmatched } …` | 被拒绝的一帧。`unmatched` 大说明发生跳跃或内容被替换；`votes` 与 `second` 接近说明内容重复 |
-| `auto=true/false`、`auto ended: …` | 自动滚动的开关与结束原因（到底、已达上限，或目标拒绝滚轮） |
+| `auto=true/false`、`auto ended: N notches moved nothing within 1000 ms (…)` | 自动滚动的开关与结束原因。括号里区分两种"没动"：`the page repainted without moving`（有新帧但没有位移）与 `no new frame arrived`（窗口内根本没有新帧）；被目标拒绝滚轮则单独一行说明 |
 | `auto target hwnd=0x… class=… pid=…` | 自动滚动的滚轮实际投递到的窗口；开始时和目标变化时各打印一次 |
 | `auto notch failed: …` | 一格滚轮没有投递出去（选区下没有窗口，或窗口已失效），下一格会重新寻找目标 |
 | `the long image cannot grow by N bytes past M` | 内存不足，长图停止增长（状态为 `Full`） |
@@ -198,5 +211,5 @@ crates/snapclip-capture/src/windows/
 ## 5. 已知风险
 
 - 精确哈希可能被亚像素文本渲染破坏，表现为日志里出现大量 `Unknown` 且 `votes` 偏低。到时按日志证据加入容差，现在不预先引入。
-- 有的程序不响应 `PostMessage` 投递的 `WM_MOUSEWHEEL`（snow_shot 用的也是同一方案），表现为 `auto ended: 10 notches moved nothing`。这只影响自动模式，手动滚动不受影响。对照 `auto target` 行的 `class` 可以判断滚轮投到了哪个窗口。
+- 有的程序不响应 `PostMessage` 投递的 `WM_MOUSEWHEEL`（snow_shot 用的也是同一方案），表现为 `auto ended: 10 notches moved nothing within 1000 ms (…)`。这只影响自动模式，手动滚动不受影响。对照 `auto target` 行的 `class` 可以判断滚轮投到了哪个窗口。
 - 以管理员身份运行的目标窗口会拒绝投递的滚轮（UIPI），自动模式会立即停止并在状态栏说明；手动滚动不受影响。

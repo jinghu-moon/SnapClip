@@ -6,11 +6,14 @@
 //! itself in these frames (`WDA_EXCLUDEFROMCAPTURE`), which is why the monitor can be captured while
 //! the panel sits on top of it.
 //!
-//! Auto mode is one wheel notch every [`AUTO_INTERVAL`], posted to the window under the selection's
-//! centre ([`post_wheel`]); it turns itself off after [`AUTO_IDLE_NOTCHES`] notches in a row moved
-//! nothing, which is what "the page has reached its end" looks like from outside the page. A window
-//! that refuses the posted wheel (UIPI: it runs elevated) turns auto off at once, and the toolbar
-//! says so, rather than ten silent failures reading as "the end of the page".
+//! Auto mode posts one wheel notch to the window under the selection's centre ([`post_wheel`]),
+//! and then waits for the page to show it ([`observe`]): a notch is a request, not a result, so
+//! the next one is only sent once the frame it produced has been measured. [`AUTO_IDLE_NOTCHES`]
+//! notches in a row that stayed unanswered for [`OBSERVE_TIMEOUT`] turn auto off, which is what
+//! "the page has reached its end" looks like from outside the page; a page that keeps repainting
+//! without moving is named as such in the log instead. A window that refuses the posted wheel
+//! (UIPI: it runs elevated) turns auto off at once, and the toolbar says so, rather than ten
+//! silent failures reading as "the end of the page".
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -56,6 +59,31 @@ pub(crate) const AUTO_IDLE_NOTCHES: u32 = 10;
 pub(crate) const NOTCH_DOWN: i32 = -120;
 /// How long one wait for a frame lasts, so the stop flag and the auto clock are looked at often.
 const FRAME_WAIT: Duration = Duration::from_millis(20);
+/// How long a notch waits for the page to show it. Posting a notch is a request, not a result: a
+/// slow page, a remote session, or a program that repaints lazily can take longer than the interval
+/// between notches to show the previous one, and counting that as "the page did not move" ends auto
+/// mode on a page that still has content below. Five notches' worth of slack is past the point
+/// where the page is merely slow, and well under a user's patience.
+const OBSERVE_TIMEOUT: Duration = Duration::from_millis(1000);
+
+/// One notch that has been posted and is waiting for the page to show it.
+#[derive(Debug, Clone, Copy)]
+struct Pending {
+    /// When the observation window closes if nothing has moved by then.
+    until: Instant,
+    /// Whether any frame arrived at all inside the window, which is what separates "no frames" from
+    /// "frames that did not move".
+    saw_frame: bool,
+}
+
+/// What one posted notch did, as far as the capture thread can see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Observation {
+    /// The page moved: the notch (or the user's own wheel) displaced the frame.
+    Moved,
+    /// The window closed without a displacement. `saw_frame` says whether anything was redrawn.
+    NoMove { saw_frame: bool },
+}
 
 /// What the overlay pulls on every wake-up.
 #[derive(Debug, Clone, Default)]
@@ -241,6 +269,7 @@ fn capture(spec: &Spec, shared: &Shared, tracker: &mut Option<Tracker>) -> Resul
     );
     let mut next_notch = Instant::now();
     let mut idle_notches = 0;
+    let mut pending: Option<Pending> = None;
     let mut last_target = None;
     let mut frames = 0u64;
     let mut quiet = 0u64;
@@ -253,22 +282,50 @@ fn capture(spec: &Spec, shared: &Shared, tracker: &mut Option<Tracker>) -> Resul
     let mut total_us: Vec<u64> = Vec::new();
     let mut read_us_all: Vec<u64> = Vec::new();
     let mut published: Option<Status> = None;
+    // Whether the frame the loop measured last moved the image: this is the evidence a pending
+    // notch is judged by, so auto mode reads the page instead of the clock.
+    let mut frame_moved = false;
     while !shared.stop.load(Ordering::Acquire) {
         if shared.auto.load(Ordering::Acquire) {
             let now = Instant::now();
-            if idle_notches >= AUTO_IDLE_NOTCHES {
-                eprintln!("[snapclip][scroll] auto ended: {idle_notches} notches moved nothing");
-                shared.auto.store(false, Ordering::Release);
-                wake(spec, shared);
-            } else if now >= next_notch {
+            // A notch is a request; the page has to show it before the next one is worth sending.
+            // `pending` is only resolved here, from the frames the loop has already measured, so a
+            // slow page gets its window instead of being counted as "moved nothing".
+            let observed = pending
+                .as_mut()
+                .and_then(|flight| observe(flight, frame_moved, now));
+            if let Some(observed) = observed {
+                pending = None;
+                match idle_after(observed, &mut idle_notches) {
+                    Idle::Waiting | Idle::Moved => {}
+                    Idle::GiveUp => {
+                        eprintln!(
+                            "[snapclip][scroll] auto ended: {idle_notches} notches moved nothing \
+                             within {} ms ({})",
+                            OBSERVE_TIMEOUT.as_millis(),
+                            match observed {
+                                Observation::NoMove { saw_frame: true } =>
+                                    "the page repainted without moving",
+                                _ => "no new frame arrived",
+                            }
+                        );
+                        shared.auto.store(false, Ordering::Release);
+                        wake(spec, shared);
+                    }
+                }
+            } else if pending.is_none() && now >= next_notch {
                 if shared.after_notch(post_wheel(spec.aim, NOTCH_DOWN), &mut last_target) {
                     wake(spec, shared);
                 }
-                idle_notches += 1;
+                pending = Some(Pending {
+                    until: now + OBSERVE_TIMEOUT,
+                    saw_frame: false,
+                });
                 next_notch = now + AUTO_INTERVAL;
             }
         } else {
             idle_notches = 0;
+            pending = None;
         }
 
         let Some(mut frame) = session.next_frame(FRAME_WAIT).map_err(|e| e.to_string())? else {
@@ -309,9 +366,16 @@ fn capture(spec: &Spec, shared: &Shared, tracker: &mut Option<Tracker>) -> Resul
                     pixels.len()
                 );
             }
-            if matches!(step.estimate, Estimate::Shift { .. }) {
-                idle_notches = 0;
+            // This frame is the evidence the notch in flight is judged by. A Shift is the page
+            // showing the notch; any frame at all is the page repainting, which is worth telling
+            // apart from a page that stopped answering. A repaint also buys the notch more time:
+            // the window is "no change for a second", so a page that keeps drawing gets to finish
+            // the scroll it started.
+            if let Some(flight) = pending.as_mut() {
+                flight.saw_frame = true;
+                flight.until = Instant::now() + OBSERVE_TIMEOUT;
             }
+            frame_moved = matches!(step.estimate, Estimate::Shift { .. });
             let Outcome { news, moved } = outcome(&step, published);
             if news {
                 eprintln!(
@@ -401,6 +465,48 @@ fn outcome(step: &Step, published: Option<Status>) -> Outcome {
         },
         moved: step.placement.is_some() && !full,
     }
+}
+
+/// What one resolved observation does to the run of notches that moved nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Idle {
+    /// The page moved: the run is over.
+    Moved,
+    /// It did not move, but the page has not run out of chances yet.
+    Waiting,
+    /// Enough notches in a row moved nothing: auto mode stops.
+    GiveUp,
+}
+
+fn idle_after(observed: Observation, idle_notches: &mut u32) -> Idle {
+    match observed {
+        Observation::Moved => {
+            *idle_notches = 0;
+            Idle::Moved
+        }
+        Observation::NoMove { .. } => {
+            *idle_notches += 1;
+            if *idle_notches >= AUTO_IDLE_NOTCHES {
+                Idle::GiveUp
+            } else {
+                Idle::Waiting
+            }
+        }
+    }
+}
+
+/// Judge the notch in flight. `Some(outcome)` when its window is over: either the page moved
+/// inside it, or the deadline passed. `None` while it is still worth waiting for.
+fn observe(pending: &mut Pending, moved: bool, now: Instant) -> Option<Observation> {
+    if moved {
+        return Some(Observation::Moved);
+    }
+    if now >= pending.until {
+        return Some(Observation::NoMove {
+            saw_frame: pending.saw_frame,
+        });
+    }
+    None
 }
 
 fn wake(spec: &Spec, shared: &Shared) {
@@ -722,5 +828,163 @@ mod tests {
                 moved: false
             }
         );
+    }
+
+    fn pending(until: Instant) -> Pending {
+        Pending {
+            until,
+            saw_frame: false,
+        }
+    }
+
+    /// A notch is judged by what the page did, not by the clock: the moment a frame shows the
+    /// scroll, the notch is over, however early that is.
+    #[test]
+    fn a_notch_ends_the_instant_a_frame_shows_it() {
+        let now = Instant::now();
+        for age in [Duration::ZERO, Duration::from_millis(1), Duration::from_millis(30)] {
+            let mut flight = pending(now + OBSERVE_TIMEOUT);
+            assert_eq!(observe(&mut flight, true, now + age), Some(Observation::Moved));
+        }
+    }
+
+    /// A page with nothing to give stops auto, and the timeout says which of the two nothings it
+    /// was: a page that never drew anything at all, or one that kept drawing without moving.
+    #[test]
+    fn a_notch_that_times_out_reports_what_the_page_did() {
+        let now = Instant::now();
+        let mut silent = pending(now + OBSERVE_TIMEOUT);
+        assert_eq!(observe(&mut silent, false, now), None, "the window is still open");
+        assert_eq!(
+            observe(&mut silent, false, now + OBSERVE_TIMEOUT),
+            Some(Observation::NoMove { saw_frame: false }),
+            "the deadline is inclusive: at the deadline the notch is over"
+        );
+        let mut repainted = Pending {
+            until: now + OBSERVE_TIMEOUT,
+            saw_frame: true,
+        };
+        assert_eq!(
+            observe(&mut repainted, false, now + OBSERVE_TIMEOUT),
+            Some(Observation::NoMove { saw_frame: true })
+        );
+    }
+
+    /// The field case this replaced: a page that takes longer than a second to draw the notch, or
+    /// draws it slowly. Repaints keep buying the notch time, and it is still only counted as idle
+    /// after the page has been quiet for the whole window.
+    #[test]
+    fn a_page_that_keeps_repainting_gets_to_finish_the_scroll_it_started() {
+        let mut flight = pending(Instant::now() + OBSERVE_TIMEOUT);
+        // A repaint arrives with two thirds of the window spent, and buys a fresh window.
+        let late = flight.until - Duration::from_millis(300);
+        flight.saw_frame = true;
+        flight.until = late + OBSERVE_TIMEOUT;
+        assert_eq!(
+            observe(&mut flight, false, late),
+            None,
+            "the page is still drawing; an old deadline must not end the notch"
+        );
+        assert_eq!(observe(&mut flight, true, late + Duration::from_millis(200)), Some(Observation::Moved));
+    }
+
+    /// What the closed loop did to the notch cadence. The page side is a model; the arithmetic is
+    /// the loop's: a notch is sent no sooner than `AUTO_INTERVAL` after the previous one, and it is
+    /// judged by the first frame that lands at least `page_latency` after it -- one frame later
+    /// than the old clock, which posted every `AUTO_INTERVAL` and read no frame at all.
+    #[test]
+    fn the_closed_loop_sets_the_cadence_from_the_page() {
+        /// One auto session in virtual time: frames arrive every `frame`, and the frame that shows
+        /// the notch posted at `notch_at` arrives when `at - notch_at >= page_latency`. Notches
+        /// that time out are judged `NoMove`, exactly like the real loop.
+        fn notches(frame: Duration, page_latency: Duration) -> Vec<Duration> {
+            let mut next_notch = Duration::ZERO;
+            let mut pending: Option<(Duration, Duration)> = None;
+            let mut frame_moved = false;
+            let mut posted = Vec::new();
+            let mut next_frame_at = frame;
+            for _ in 0..10_000 {
+                let at = next_frame_at;
+                next_frame_at = at + frame;
+                // The loop judges the notch in flight before it looks for the next frame, and the
+                // frame it measured is the one that arrived a frame ago.
+                if pending
+                    .filter(|&(notch_at, deadline)| frame_moved || at >= notch_at + deadline)
+                    .is_some()
+                {
+                    pending = None;
+                }
+                if pending.is_none() && at >= next_notch {
+                    posted.push(at);
+                    if posted.len() == 10 {
+                        break;
+                    }
+                    pending = Some((at, OBSERVE_TIMEOUT));
+                    next_notch = at + AUTO_INTERVAL;
+                }
+                frame_moved = pending.is_some_and(|(notch_at, _)| at >= notch_at + page_latency);
+            }
+            posted
+        }
+
+        // A page whose answer lands one frame after the notch. Every notch is judged by that frame,
+        // so the cadence is the interval plus one frame -- or one frame per notch, whichever is
+        // longer, since auto may not post twice inside the interval either.
+        let fast = notches(Duration::from_millis(40), Duration::from_millis(40));
+        assert_eq!(
+            fast.windows(2).map(|pair| pair[1] - pair[0]).collect::<Vec<_>>(),
+            vec![AUTO_INTERVAL; 9],
+            "a 40 ms page keeps the interval, and the frame it waits for fits inside it"
+        );
+
+        // The clock the loop replaced, on the same page: a notch every `AUTO_INTERVAL`, unchanged.
+        assert_eq!(
+            (0..10).map(|i| AUTO_INTERVAL * i).collect::<Vec<_>>(),
+            (0..10).map(|i| Duration::from_millis(200 * i)).collect::<Vec<_>>()
+        );
+
+        // A page that answers only when the window is already over is slower than the interval, so
+        // the answer -- not the clock -- is what spaces the notches.
+        let late = notches(Duration::from_millis(40), OBSERVE_TIMEOUT);
+        assert_eq!(
+            late.windows(2).map(|pair| pair[1] - pair[0]).collect::<Vec<_>>(),
+            vec![OBSERVE_TIMEOUT; 9],
+            "a page that takes a window to answer is read at the window"
+        );
+
+        // One frame every five seconds: a page that never answers. Ten windows, then the loop gives
+        // up on the run -- the count `idle_after` is handed below.
+        let offline = notches(Duration::from_millis(5_000), OBSERVE_TIMEOUT);
+        assert_eq!(
+            offline.windows(2).map(|pair| pair[1] - pair[0]).collect::<Vec<_>>(),
+            vec![Duration::from_millis(5_000); 9],
+            "a single frame per five seconds is unanswered, and the timeout is what advances"
+        );
+        let mut idle_notches = 0;
+        for _ in 0..10 {
+            idle_after(Observation::NoMove { saw_frame: false }, &mut idle_notches);
+        }
+        assert_eq!(idle_notches, AUTO_IDLE_NOTCHES, "ten unanswered notches is the give-up run");
+    }
+
+    /// Ten notches in a row that moved nothing is the end of auto, and one that moves is a fresh
+    /// start -- the run, not the total, is what stops it.
+    #[test]
+    fn auto_gives_up_only_after_a_run_of_idle_notches() {
+        let mut idle_notches = 0;
+        for i in 1..AUTO_IDLE_NOTCHES {
+            assert_eq!(
+                idle_after(Observation::NoMove { saw_frame: true }, &mut idle_notches),
+                Idle::Waiting,
+                "notch {i} is not yet the end"
+            );
+        }
+        assert_eq!(
+            idle_after(Observation::NoMove { saw_frame: false }, &mut idle_notches),
+            Idle::GiveUp
+        );
+        assert_eq!(idle_notches, AUTO_IDLE_NOTCHES, "the log names the run it ended on");
+        assert_eq!(idle_after(Observation::Moved, &mut idle_notches), Idle::Moved);
+        assert_eq!(idle_notches, 0, "a page that answers is not the page that stops auto");
     }
 }

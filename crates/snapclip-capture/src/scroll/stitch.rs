@@ -139,8 +139,10 @@ impl Stitcher {
 /// running out must end the growth, not the process (`Vec::resize` aborts on failure).
 ///
 /// Capacity doubles, so a session moves the canvas O(log n) times rather than once per append
-/// (each move copies the whole image), but never past `limit`, the cap's size: the last doubling
-/// must not reserve twice the largest image that can exist.
+/// (each move copies the whole image). `limit` caps only that doubling choice: the call is bounded
+/// by `len + bytes` when that is already larger, so this function never refuses a growth the
+/// caller's own row cap allowed. The row cap ([`super::row_limit`]) is what keeps the canvas inside
+/// the byte budget; this is the last line against an allocation the machine cannot serve.
 fn grow(canvas: &mut Vec<u8>, bytes: usize, limit: usize) -> bool {
     let needed = canvas.len().saturating_add(bytes);
     let wanted = needed.max(canvas.capacity().saturating_mul(2).min(limit));

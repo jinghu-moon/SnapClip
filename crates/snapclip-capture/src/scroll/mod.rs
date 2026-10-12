@@ -21,6 +21,12 @@ use thumb::Thumb;
 
 /// The long image is capped at this many selection heights (the reference implementation's cap).
 pub(crate) const MAX_SCREENS: u32 = 32;
+/// The long image is also capped at this many bytes of canvas. A row cap alone is not a resource
+/// policy: 32 selection heights is 130 MB for a 1241×821 selection but 1.06 GB for a full-screen
+/// one on a 3840×2160 monitor, and growing the canvas momentarily holds the old and the new
+/// allocation. A few hundred megapixels is already far past any real page, so the byte cap is
+/// what actually bounds a session.
+pub(crate) const MAX_BYTES: usize = 512 * 1024 * 1024;
 /// The shortest selection a session can scroll: after a scroll, two frames must still share
 /// [`estimate::MIN_OVERLAP`] rows, so a shorter one could never be measured.
 pub(crate) const MIN_VIEW: u32 = 2 * estimate::MIN_OVERLAP;
@@ -68,6 +74,16 @@ pub(crate) struct Preview {
     pub image_rows: u32,
 }
 
+/// How tall the canvas may grow: whichever of the screen cap and the byte budget is smaller, in
+/// rows. The byte side is rounded down, and one screen is always allowed even when a single frame
+/// is bigger than the budget (a session must at least hold the frame it started from).
+fn row_limit(width: u32, view: u32, max_bytes: usize) -> u32 {
+    let row = width.max(1) as usize * 4;
+    let by_bytes = max_bytes / row;
+    let rows = by_bytes.min(MAX_SCREENS as usize * view as usize);
+    rows.max(view as usize).min(u32::MAX as usize) as u32
+}
+
 #[derive(Debug)]
 pub(crate) struct Tracker {
     width: u32,
@@ -82,7 +98,19 @@ impl Tracker {
     /// `first` is the selection's first frame, `width × view` BGRA; `thumb_width` the widest
     /// thumbnail the panel shows.
     pub(crate) fn new(first: &[u8], width: u32, view: u32, thumb_width: u32) -> Self {
-        let stitcher = Stitcher::new(first, width, view, MAX_SCREENS * view);
+        Self::with_rows(
+            first,
+            width,
+            view,
+            thumb_width,
+            row_limit(width, view, MAX_BYTES),
+        )
+    }
+
+    /// The same tracker with an explicit canvas row cap, so a test can drive the byte budget
+    /// without allocating half a gigabyte.
+    fn with_rows(first: &[u8], width: u32, view: u32, thumb_width: u32, max_rows: u32) -> Self {
+        let stitcher = Stitcher::new(first, width, view, max_rows);
         let mut thumb = Thumb::new(width, thumb_width);
         thumb.refresh(stitcher.canvas(), view, 0, 0, view);
         Self {
@@ -196,7 +224,7 @@ mod tests {
     use super::estimate::tests::{page, shift_of, window};
     use super::estimate::{FrameSig, estimate};
     use super::stitch::Placement;
-    use super::{MAX_SCREENS, Status, Tracker};
+    use super::{MAX_SCREENS, Status, Tracker, row_limit};
 
     const W: u32 = 120;
     const H: u32 = 200;
@@ -289,6 +317,41 @@ mod tests {
         }
         assert_eq!(tracker.status(), Status::Full);
         assert!(tracker.image_rows() <= MAX_SCREENS * H);
+    }
+
+    /// A row cap is not a byte cap: a selection wide enough to make 32 screens cost more than the
+    /// budget must stop on the budget, not on the screen count.
+    #[test]
+    fn the_byte_budget_can_be_the_cap_that_stops_the_image() {
+        const BUDGET: usize = 64 * 1024 * 1024;
+        const VIEW: u32 = 1200;
+        let (w, view) = (1024u32, VIEW);
+        // 1024 × 4 = 4096 bytes a row, so the budget is 64 MiB / 4096 = 16384 rows, well below the
+        // 38399 rows that `MAX_SCREENS` alone would allow.
+        assert_eq!(row_limit(w, view, BUDGET), 16384);
+        assert!(row_limit(w, view, BUDGET) < MAX_SCREENS * view);
+
+        let page = page(w, 17_580, 91);
+        // `Tracker::new` uses the real budget, so the test drives the cap through the same row
+        // limit the tracker would compute: `MAX_BYTES / row` min the screen cap.
+        let limit = row_limit(w, view, BUDGET);
+        let mut tracker = Tracker::with_rows(&window(&page, w, 0, view), w, view, 40, limit);
+        // Push until one more 100-row step would not fit: `limit` binds before the page ends.
+        let mut step = 0;
+        while tracker.image_rows() + 100 <= limit {
+            step += 1;
+            tracker.push(&window(&page, w, step * 100, view));
+        }
+        // 16300 rows is where the budget stops the image: the next 100-row push would pass the
+        // 16384-row limit, so it is refused and the canvas and the status both say so.
+        assert_eq!(tracker.image_rows(), 16300, "step {step}");
+        assert!(tracker.image_rows() <= limit);
+        let refused = tracker.push(&window(&page, w, (step + 1) * 100, view));
+        assert_eq!(refused.placement, Some(Placement::Full));
+        assert_eq!(tracker.status(), Status::Full);
+        assert_eq!(tracker.image_rows(), 16300, "a refused push changes nothing");
+        let still_refused = tracker.push(&window(&page, w, (step + 2) * 100, view));
+        assert_eq!(still_refused.placement, Some(Placement::Full));
     }
 
     #[test]

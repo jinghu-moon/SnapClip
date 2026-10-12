@@ -1027,6 +1027,225 @@ mod tests {
         );
     }
 
+    /// Would a pool of staging textures with `Map(DO_NOT_WAIT)` buy the capture thread anything?
+    ///
+    /// The parts probe above answered the *atomic* question (a reused texture is cheaper than
+    /// creating one: `create_p50_us=37` of a 2474 µs call) and showed that polling a copy the CPU
+    /// has nothing else to do during is *slower* than blocking, because a poll loop can only sleep
+    /// in 50 µs steps. Neither of those is the pooling question, which is about **overlap**: the
+    /// capture thread always has a previous frame to measure, and the point of a pool is to keep
+    /// the GPU copying frame N+1 while the CPU measures frame N.
+    ///
+    /// So each variant below runs a whole frame step: queue the copy, spend `CPU_US` on the
+    /// previous frame's pixels (the field's `push` is 11.6 ms), then take the copy. Whatever the
+    /// readback costs the loop is reported as `read_wait_us` — for the pooled row that is only the
+    /// part the CPU work did not cover.
+    ///
+    /// The load is **synthetic**: `black_box` row copies instead of hashing and stitching, chosen
+    /// because the probe measures waiting, not the tracker. Read the *differences* between the
+    /// rows, not any one of them as a field number.
+    #[test]
+    #[ignore = "L4 (docs/31 D-14): needs a real D3D11 device; run with --include-ignored --nocapture"]
+    fn the_latency_a_staging_pool_would_hide_at_the_field_selection_size() {
+        use std::time::{Duration, Instant};
+
+        let device =
+            GraphicsDevice::create().expect("this test needs a D3D11 device (docs/31 D-14)");
+        let (frame_w, frame_h, sel_w, sel_h) = (3840u32, 2160u32, 2148u32, 1344u32);
+        let frame = device
+            .create_bgra_texture(frame_w, frame_h, &vec![0x5au8; (frame_w * frame_h * 4) as usize])
+            .unwrap();
+        let (x, y) = ((frame_w - sel_w) / 2, (frame_h - sel_h) / 2);
+        let src_box = ::windows::Win32::Graphics::Direct3D11::D3D11_BOX {
+            left: x,
+            top: y,
+            front: 0,
+            right: x.saturating_add(sel_w),
+            bottom: y.saturating_add(sel_h),
+            back: 1,
+        };
+        // What the capture thread does with a frame it has already read back (`tracker.push`
+        // measured 11631 µs mean on a live desktop). The probe's stand-in is 11.6 ms of row copies.
+        const CPU_US: u64 = 11_600;
+        const STEPS: usize = 20;
+        let source_rows = vec![0u8; (sel_w * sel_h * 4) as usize];
+        let mut scratch = Vec::with_capacity(source_rows.len());
+        let burn_cpu = |scratch: &mut Vec<u8>| {
+            scratch.clear();
+            for row in source_rows.as_chunks::<4096>().0 {
+                scratch.extend_from_slice(row);
+            }
+            std::hint::black_box(&scratch);
+        };
+
+        // Today's path, exactly as `read_back_region_bgra` runs it: a texture created per frame, a
+        // copy, then a blocking `Map` right where the copy was queued. `read_wait_us` is what the
+        // loop spends inside the readback; `frame_us` is the whole step.
+        let mut today = Vec::new();
+        for _ in 0..STEPS {
+            let started = Instant::now();
+            let read_started = Instant::now();
+            let staging = device
+                .create_staging_texture(sel_w, sel_h, "pool probe")
+                .unwrap();
+            unsafe {
+                let context = device.owned_context("staging pool probe");
+                context.CopySubresourceRegion(
+                    &staging,
+                    0,
+                    0,
+                    0,
+                    0,
+                    &frame.texture,
+                    0,
+                    Some(&src_box),
+                );
+                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                context
+                    .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                    .unwrap();
+                copy_rows(&mapped, sel_w, sel_h, &mut scratch);
+                context.Unmap(&staging, 0);
+            }
+            let read_wait = read_started.elapsed().as_micros();
+            burn_cpu(&mut scratch);
+            today.push((read_wait, started.elapsed().as_micros()));
+        }
+
+        // A pool of two, polled: while the CPU burns `CPU_US`, the copy for the frame just arrived
+        // is in flight, so the poll after the work either succeeds at once or waits out the rest.
+        let slots = [
+            device
+                .create_staging_texture(sel_w, sel_h, "pool probe")
+                .unwrap(),
+            device
+                .create_staging_texture(sel_w, sel_h, "pool probe")
+                .unwrap(),
+        ];
+        let mut pooled = Vec::new();
+        let mut polls_per_step = Vec::new();
+        for step in 0..STEPS {
+            let started = Instant::now();
+            let slot = &slots[step % slots.len()];
+            unsafe {
+                let context = device.owned_context("staging pool probe");
+                context.CopySubresourceRegion(slot, 0, 0, 0, 0, &frame.texture, 0, Some(&src_box));
+                context.Flush();
+            }
+            // The previous frame is measured *now*, which is the whole idea of a pool.
+            burn_cpu(&mut scratch);
+            let read_started = Instant::now();
+            let mut polls = 0u32;
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            loop {
+                polls += 1;
+                let map = unsafe {
+                    device.owned_context("staging pool probe").Map(
+                        slot,
+                        0,
+                        D3D11_MAP_READ,
+                        D3D11_MAP_FLAG_DO_NOT_WAIT.0 as u32,
+                        Some(&mut mapped),
+                    )
+                };
+                match map {
+                    Ok(()) => {
+                        unsafe {
+                            let context = device.owned_context("staging pool probe");
+                            copy_rows(&mapped, sel_w, sel_h, &mut scratch);
+                            context.Unmap(slot, 0);
+                        }
+                        break;
+                    }
+                    // S_FALSE or DXGI_ERROR_WAS_STILL_DRAWING: the copy has not landed yet.
+                    Err(error)
+                        if matches!(error.code().0, 1)
+                            || error.code() == DXGI_ERROR_WAS_STILL_DRAWING =>
+                    {
+                        std::thread::sleep(Duration::from_micros(50));
+                    }
+                    Err(error) => panic!("Map(DO_NOT_WAIT) failed: {error}"),
+                }
+            }
+            let read_wait = read_started.elapsed().as_micros();
+            burn_cpu(&mut scratch);
+            pooled.push((read_wait, started.elapsed().as_micros()));
+            polls_per_step.push(polls);
+        }
+
+        // The same pool with nothing to overlap: the copy's own landing time, which is the part a
+        // blocking `Map` pays in full and a pool can only hide behind other work.
+        let mut tight = Vec::new();
+        for step in 0..STEPS {
+            let started = Instant::now();
+            let read_started = Instant::now();
+            let slot = &slots[step % slots.len()];
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            unsafe {
+                let context = device.owned_context("staging pool probe");
+                context.CopySubresourceRegion(slot, 0, 0, 0, 0, &frame.texture, 0, Some(&src_box));
+                context.Flush();
+                loop {
+                    let map = context.Map(
+                        slot,
+                        0,
+                        D3D11_MAP_READ,
+                        D3D11_MAP_FLAG_DO_NOT_WAIT.0 as u32,
+                        Some(&mut mapped),
+                    );
+                    match map {
+                        Ok(()) => {
+                            copy_rows(&mapped, sel_w, sel_h, &mut scratch);
+                            context.Unmap(slot, 0);
+                            break;
+                        }
+                        Err(error)
+                            if matches!(error.code().0, 1)
+                                || error.code() == DXGI_ERROR_WAS_STILL_DRAWING =>
+                        {
+                            std::thread::sleep(Duration::from_micros(50));
+                        }
+                        Err(error) => panic!("Map(DO_NOT_WAIT) failed: {error}"),
+                    }
+                }
+            }
+            let read_wait = read_started.elapsed().as_micros();
+            tight.push((read_wait, started.elapsed().as_micros()));
+        }
+
+        fn median(mut values: Vec<(u128, u128)>) -> (u128, u128) {
+            values.sort_unstable();
+            values[values.len() / 2]
+        }
+        fn worst(values: &mut Vec<(u128, u128)>) -> u128 {
+            values.sort_unstable();
+            values[values.len() - 1].1
+        }
+        let (today_wait, today_total) = median(today.clone());
+        let (pooled_wait, pooled_total) = median(pooled.clone());
+        let (tight_wait, tight_total) = median(tight.clone());
+        let polls_mean = polls_per_step.iter().copied().sum::<u32>() as f64 / STEPS as f64;
+        println!(
+            "staging pool ({CPU_US} us of CPU work per frame, {STEPS} steps, 11.5 MB region):"
+        );
+        println!(
+            "  today   read_wait_p50_us={today_wait} frame_p50_us={today_total} \
+             frame_max_us={}",
+            worst(&mut today)
+        );
+        println!(
+            "  pooled  read_wait_p50_us={pooled_wait} frame_p50_us={pooled_total} \
+             frame_max_us={} polls_mean={polls_mean:.1} polls_max={}",
+            worst(&mut pooled),
+            polls_per_step.iter().copied().max().unwrap_or(0)
+        );
+        println!(
+            "  no_cpu  read_wait_p50_us={tight_wait} frame_p50_us={tight_total} \
+             frame_max_us={}",
+            worst(&mut tight)
+        );
+    }
+
     /// The magnifier colour path, end to end: a tile copy queued on the immediate
     /// context must land in its staging slot within a few *non-blocking* polls —
     /// the overlay polls once per 15 ms render tick and keeps the info panel on
