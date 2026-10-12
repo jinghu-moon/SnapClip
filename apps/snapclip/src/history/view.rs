@@ -30,7 +30,11 @@ use super::card::{PREVIEW_CHARS_PER_LINE, PREVIEW_LINES};
 use super::icons::SourceIcons;
 use super::model::HistoryState;
 use super::preview;
-use super::rich::{Span, spans_to_lines, spans_to_text, styled_line};
+use super::rich::{Span, spans_to_lines, styled_line};
+// Read only by the `test-support` block below, which flattens a rich row into the
+// string the UI test asserts on.
+#[cfg(feature = "test-support")]
+use super::rich::spans_to_text;
 use crate::clipboard::{Channels, ClipboardImage, SystemClipboard};
 use crate::events::EventBus;
 
@@ -781,6 +785,9 @@ impl Render for HistoryView {
                                 // collapsed plain text otherwise. Parsed once per clip id and
                                 // cached, so after the first frame this is a lookup.
                                 let rich_lines = view.rich_lines(&item.id);
+                                // Only the UI test reads this: it is the same text the row draws,
+                                // flattened, so a rich row can be asserted on as a string.
+                                #[cfg(feature = "test-support")]
                                 let content_label = rich_lines
                                     .as_ref()
                                     .map(|lines| {
