@@ -87,6 +87,18 @@ const ZOOMS = [0.1, 0.25, 0.5, 1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 32, 40];
 const FONT = '"HarmonyOS Sans SC","Microsoft YaHei UI","Segoe UI",sans-serif';
 const LABEL_FONT = '"Segoe UI Variable Display","HarmonyOS Sans SC","Microsoft YaHei UI",sans-serif';
 const MONO = 'Consolas,"Cascadia Mono",monospace';
+// 面板的色板与字阶。三档字阶把视觉重量还给缩略图：面板的字不许和网页正文（14px）同号。
+const PANEL_BG = [18, 20, 24], PANEL_BG_A = 0.92;   // 面板底：rgba(18,20,24,.92)
+const PANEL_INSET = [255, 255, 255];                // 井的内描边、视口框的填充都从它派生
+const TEXT_1 = [255, 255, 255], TEXT_2 = [232, 236, 242], TEXT_3 = [154, 164, 178];
+const STALL = [240, 179, 90];                       // 页面没响应：和快捷键指南的 planned 同色
+const F_TITLE = '600 12px ' + FONT, F_SUB = '500 10px ' + FONT, F_MONO = '10px ' + MONO;
+const SCROLL_PW = 168;                              // 面板宽（产品常量 PANEL_WIDTH_DIP = 160，这里先试 168）
+const SCROLL_FOOT = 26;                             // 底部那行：状态 + 键位
+const SAVE_MS = 900, END_MS = 1500;                 // 提交动画、收尾停留
+const DWELL_MS = 160;                               // 「有帧而且滚了」的最短停留，别一闪而过
+const STALL_AFTER = 3, STALL_MS = 2600;             // 连续几格没位移算「页面没响应」，以及放弃阈值
+const PULSE_MS = 1100, PERIOD_MS = 2400;            // 脉冲、动画周期
 
 const dpr = window.devicePixelRatio || 1;
 const rgba = (c, a) => `rgba(${c[0]},${c[1]},${c[2]},${a})`;
@@ -220,9 +232,11 @@ const sentence = () => SENTENCES[Math.floor(rand() * SENTENCES.length)];
 let S = null;            // 会话状态
 let scene = null;        // 布局
 let docCv = null;        // 网页长文档（视口内容）位图
+let docPreview = null;   // 收尾态用的定稿副本
 let scroll = 0;          // 网页滚动位置（CSS px）
 let blurCv = null, blurMs = 0;
 let guideOn = true, blurOn = true;
+let scrollLog = [];      // 上一次长截图的 [时间, 累计捕获行数, 已滚屏数, 是否自动]
 
 function buildScene() {
   W = innerWidth; H = innerHeight; rng = 7;
@@ -908,7 +922,8 @@ function beginScrolling() {
   const v = viewInSel(S.sel);
   if (!v) { toast('演示中的长截图需要框选网页正文区域'); return; }
   S.phase = 'scrolling';
-  S.scrollState = { v, min: scroll, max: scroll, auto: false, lastAuto: 0, end: false };
+  S.scrollState = { v, min: scroll, max: scroll, tracked: 0, auto: false, lastAuto: 0, end: false, stage: 'idle', pulse: 0, endT: 0, still: 0 };
+  scrollLog = [];
 }
 const maxScroll = () => Math.max(0, scene.doc.h - scene.viewport.h);
 function scrollBy(d) {
@@ -916,46 +931,182 @@ function scrollBy(d) {
   const next = clamp(scroll + d, 0, maxScroll());
   if (next === scroll) return false;
   scroll = next; ss.min = Math.min(ss.min, scroll); ss.max = Math.max(ss.max, scroll);
+  ss.tracked = ss.max - ss.min;                       // 累计捕获的行数：进度只认这个，与面板宽度无关
   paintScene();
   return true;
 }
+// 面板里的小零件。颜色都从色板派生，不许在绘制里写字面色。
+function panelFill(c, color, alpha) { c.fillStyle = rgba(color, alpha); c.fill(); }
+function pillWidth(c, chord, label) {
+  c.font = F_MONO;
+  const w = Math.ceil(c.measureText(chord).width) + 10;
+  c.font = F_SUB;
+  return w + 3 + c.measureText(label).width;
+}
+function pillAt(c, x, y, chord, label) {
+  c.font = F_MONO; c.textBaseline = 'middle';
+  const w = Math.ceil(c.measureText(chord).width) + 10;
+  rr(c, x, y - 18, w, 18, 9); c.fillStyle = 'rgba(255,255,255,.06)'; c.fill();
+  c.fillStyle = rgba(TEXT_2, .9); c.textAlign = 'center'; c.fillText(chord, x + w / 2, y - 8);
+  c.font = F_SUB; c.fillStyle = rgba(TEXT_3, 1); c.textAlign = 'left';
+  c.fillText(label, x + w + 3, y - 8);
+  c.textBaseline = 'middle';
+}
 function drawScrolling(c, t) {
   const ss = S.scrollState, sel = S.sel;
-  if (ss.auto && t - ss.lastAuto > 200) {
-    ss.lastAuto = t;
-    if (!scrollBy(120)) { ss.auto = false; ss.end = true; }
+  const { v } = ss;
+  // 没有内边距：井和下面那行都顶到面板两侧，和放大镜的放大区一样是满幅的，不套一层边框。
+  // 只有文字和按钮自己在两侧留 10 px 的呼吸位（那是 gutter，不是 padding）。
+  const PW = SCROLL_PW, foot = SCROLL_FOOT, well = PW, inner = well;
+
+  // ── 状态的唯一来源：观测驱动。一次打点之后要等那一格落到画面上，再决定它是位移、
+  //    没位移（页面在重绘）还是根本没来帧。──
+  if (ss.stage === 'idle' || ss.stage === 'observing' || ss.stage === 'waiting' || ss.stage === 'stalled') {
+    if (ss.stage === 'observing' && t >= ss.endT) { ss.stage = 'idle'; ss.still = 0; }
+    else if (ss.stage === 'waiting' && t >= ss.endT) { ss.stage = 'stalled'; ss.endT = t + STALL_MS; }
+    else if (ss.stage === 'stalled' && t >= ss.endT) {
+      ss.auto = false; ss.stage = 'idle'; ss.still = 0;      // 页面没响应，停止自动
+    } else if (ss.auto && ss.stage === 'idle' && t - ss.lastAuto > 200) {
+      ss.lastAuto = t;
+      if (!scrollBy(120)) { ss.auto = false; ss.end = true; }
+      else {
+        const moved = Math.abs(scroll - ss.min) >= 24;       // 一格滚轮 = 120 px，动了才算动了
+        ss.stage = moved ? 'observing' : 'waiting';
+        ss.endT = t + (moved ? DWELL_MS : 1000);
+        ss.still = moved ? 0 : ss.still + 1;
+        if (ss.still >= STALL_AFTER) { ss.stage = 'stalled'; ss.endT = t + STALL_MS; }
+      }
+    }
   }
   drawFrame(c, sel);
-  // 面板：160 DIP，放在选区右侧 8 DIP（放不下则放左侧），底边与选区对齐，随内容增长
-  const PW = 160, head = 26, foot = 24, inner = PW - 12;
-  const { v } = ss;
-  const top = ss.min + v.y0, bottom = ss.max + v.y1, len = bottom - top;
+
+  // 进度一律从「累计捕获了多少」算：那是不受面板宽度影响的两个屏幕尺寸之比。
+  const len = ss.max + v.y1 - ss.min - v.y0;
+  const ratio = clamp(ss.tracked / scene.doc.h, 0, 1);
+  const screens = ss.tracked / sel.h;
+  const saving = ss.stage === 'saving', done = ss.stage === 'done';
+  let accent = ACCENT;
+  if (ss.stage === 'waiting' || ss.stage === 'stalled') accent = STALL;
+  else if (ss.auto) accent = CAPTURE;
+
   const scale = inner / (v.x1 - v.x0);
   const thumbH = len * scale;
-  const ph = Math.min(Math.max(sel.h, 120), thumbH + head + foot + 12);
-  let px = sel.x + sel.w + 8;
-  if (px + PW > W - 4) px = sel.x - 8 - PW;
-  const py = Math.max(4, sel.y + sel.h - ph);
+  // 没有顶部栏：画面从面板顶边直接开始，尺寸牌子浮在画面上——和放大镜的「20×」同一套
+  // 规格（距边 6、高 24、圆角 6、rgba(0,0,0,.55)）。顶上的 30 px 只是给这个浮标留位。
+  // 底下那行照旧留着：状态在左，键位在右（F9 保存 / A 自动；Esc 不登记）。
+  const headPad = 30;
+  const ph = clamp(thumbH + headPad + foot + 8, headPad + foot + 8, H - 8);
+  let plotX = sel.x + sel.w + 8;
+  if (plotX + PW > W - 4) plotX = sel.x - 8 - PW;
+  // 两边都夹：选区贴着屏幕底时，面板要往上收，而不是被屏幕切掉下沿。
+  const py = clamp(sel.y + sel.h - ph, 4, H - 4 - ph);
+
   c.save(); c.shadowColor = 'rgba(0,0,0,.4)'; c.shadowBlur = 20; c.shadowOffsetY = 6;
-  rr(c, px, py, PW, ph, 10); c.fillStyle = 'rgba(18,20,24,.92)'; c.fill(); c.restore();
-  c.font = '600 12px ' + FONT; c.fillStyle = '#fff'; c.textBaseline = 'middle';
-  c.fillText('长截图', px + 10, py + head / 2 + 2);
-  c.font = '11px ' + MONO; c.fillStyle = 'rgba(232,236,242,.62)'; c.textAlign = 'right';
-  c.fillText(`${Math.round((v.x1 - v.x0) * dpr)}×${Math.round(len * dpr)}`, px + PW - 10, py + head / 2 + 2); c.textAlign = 'left';
-  const ty = py + head, th = ph - head - foot - 6;
-  c.save(); rr(c, px + 6, ty, inner, th, 6); c.clip();
-  const shown = Math.min(thumbH, th), srcLen = shown / scale, srcTop = bottom - srcLen;   // 只显示尾部
-  const dy = ty + th - shown;
-  c.drawImage(docCv, v.x0 * dpr, srcTop * dpr, (v.x1 - v.x0) * dpr, srcLen * dpr, px + 6, dy, inner, shown);
-  if (thumbH > th) {
-    const g = c.createLinearGradient(0, ty, 0, ty + 28); g.addColorStop(0, 'rgba(18,20,24,.95)'); g.addColorStop(1, 'rgba(18,20,24,0)');
-    c.fillStyle = g; c.fillRect(px + 6, ty, inner, 28);
+  rr(c, plotX, py, PW, ph, 10); panelFill(c, PANEL_BG, PANEL_BG_A); c.restore();
+
+  // 缩略图井：满幅画到面板两边，从面板顶边直接开始，下沿留给底部那行。
+  const ty = py, th = ph - foot - 6;
+  const rad = [10, 10, 4, 4];                          // 上圆角跟面板一致，下沿不用圆角
+  c.save(); rr(c, plotX, ty, well, th, rad); c.clip();
+  if (thumbH >= 1) {
+    const src = (saving || done) && docPreview ? docPreview : docCv;
+    const shown = Math.min(thumbH, th), srcLen = shown / scale, srcTop = bottomOf(ss) - srcLen;
+    const dy = ty + th - shown;
+    c.drawImage(src, v.x0 * dpr, srcTop * dpr, (v.x1 - v.x0) * dpr, srcLen * dpr,
+      px2(plotX), px2(dy), Math.round(inner), px2(shown));
+    const vy = dy + (scroll + v.y0 - srcTop) * scale, vh = (v.y1 - v.y0) * scale;
+    const vr = { x: plotX, y: vy, w: well, h: vh };
+    rr(c, vr.x, vr.y, vr.w, vr.h, 2); panelFill(c, accent, .08);   // 视口框和选区框同色，看成一个对象
+    strokeRect(c, vr, rgba(accent, 1), 1.5);
+  } else {
+    c.fillStyle = 'rgba(255,255,255,.03)'; c.fillRect(plotX, ty, well, th);
   }
-  strokeRect(c, { x: px + 6, y: dy + (scroll + v.y0 - srcTop) * scale, w: inner, h: (v.y1 - v.y0) * scale }, rgba(ACCENT, 1), 1.5);
   c.restore();
-  const keys = { a: textOf('scroll.auto'), f: textOf('scroll.finish'), x: textOf('scroll.cancel') };
-  c.font = '11px ' + FONT; c.fillStyle = 'rgba(232,236,242,.62)'; c.textBaseline = 'middle';
-  c.fillText(ss.end ? `已到底 · ${keys.f} 完成 · ${keys.x} 取消` : ss.auto ? `自动滚动中 · ${keys.a} 停止` : `${keys.f} 完成 · ${keys.a} 自动 · ${keys.x} 取消`, px + 10, py + ph - foot / 2 - 2);
+
+  // 画面上的两个浮标，同一套规格：高 24、圆角 6、rgba(0,0,0,.55)、距边 6。
+  // 右边是尺寸，左边是状态。数字只在内容真变了的时候动，否则缩略图每帧长大一点，字就跟着跳。
+  if (ss.badge !== len) { ss.badge = len; ss.badgeT = t; }
+  const bText = `${Math.round((v.x1 - v.x0) * dpr)}×${Math.round(len * dpr)}`;
+  const bY = py + 6, bH = 24;
+  c.font = F_TITLE; c.textBaseline = 'middle';
+  const bW = Math.ceil(c.measureText(bText).width) + 14;
+  rr(c, plotX + PW - 6 - bW, bY, bW, bH, 6); panelFill(c, [0, 0, 0], .55);
+  c.fillStyle = rgba(TEXT_1, 1); c.textAlign = 'center';
+  c.fillText(bText, plotX + PW - 6 - bW / 2, bY + bH / 2 + 1);
+
+  // 底边那条 2 px：进度 + 状态灯。像电量条那样压在底沿上，不占任何高度。
+  if (!done) {
+    rr(c, plotX, py + ph - 2, well, 2, [0, 0, 10, 10]);
+    c.fillStyle = 'rgba(255,255,255,.10)'; c.fill();
+  }
+  c.save(); rr(c, plotX, py + ph - 2, well * ratio, 2, [0, 0, 10, 10]);
+  c.globalAlpha = done ? .8 : .5 + .5 * pulse(t, PULSE_MS);
+  panelFill(c, done ? CAPTURE : accent, 1); c.restore();
+
+  // 底部一行：左边一句状态，右边键位（F9 保存 / A 自动）。取消不在这里——Esc 仍然有效，
+  // 只是不再占一个位置。宽度不够时状态句先让位，键位不能少。
+  const rowY = py + ph - foot / 2 - 1;
+  const hx = plotX + 10, hroom = plotX + PW - 10;
+  let stateText = ss.end ? '✓ 已到底' : ss.stage === 'stalled' ? '页面没响应'
+    : ss.stage === 'waiting' ? '页面在重绘'
+      : ss.auto ? '自动滚动中' : '↓ 底下还有内容';
+  if (done) stateText = '✓ 已存到桌面';
+  const items = (ss.auto || ss.end)
+    ? [[textOf('scroll.auto'), '停止']]
+    : done ? [[textOf('scroll.finish'), '打开']]
+      : [[textOf('scroll.finish'), '保存'], [textOf('scroll.auto'), '自动']];
+  c.font = F_SUB;
+  const stateW = c.measureText(stateText).width;
+  const pillTotal = items.reduce((sum, it, i) =>
+    sum + pillWidth(c, it[0], it[1]) + (i ? 4 : 0), 0);
+  const stateColor = done ? CAPTURE : ss.stage === 'stalled' || ss.stage === 'waiting' ? STALL : ss.auto ? CAPTURE : TEXT_3;
+  c.textBaseline = 'middle';
+  if (stateW + 10 + pillTotal <= hroom - hx) {
+    c.fillStyle = rgba(stateColor, 1);
+    c.fillText(stateText, hx, rowY);
+  }
+  let right = hroom;
+  for (let i = items.length - 1; i >= 0; i--) {
+    const w = pillWidth(c, items[i][0], items[i][1]);
+    if (right - w < hx) break;
+    right -= w;
+    pillAt(c, right, rowY, items[i][0], items[i][1]);
+    right -= 4;
+  }
+
+  if (saving) {
+    const p = clamp((t - ss.saveT) / SAVE_MS, 0, 1), ease = p * p * (3 - 2 * p);
+    rr(c, plotX, py, PW, ph, 10); panelFill(c, PANEL_BG, .78 * ease);
+    c.font = F_TITLE; c.fillStyle = rgba(TEXT_1, ease); c.textAlign = 'center'; c.textBaseline = 'middle';
+    c.fillText('正在导出长图', plotX + PW / 2, py + ph / 2 - 26);
+    c.font = F_MONO; c.fillStyle = rgba(TEXT_2, .9 * ease);
+    c.fillText(`${Math.round((v.x1 - v.x0) * dpr)}×${Math.round(len * dpr)} px`,
+      plotX + PW / 2, py + ph / 2 - 6);
+    const bw = PW - 40;
+    rr(c, plotX + 20, py + ph / 2 + 16, bw, 4, 2); panelFill(c, PANEL_INSET, .16 * ease);
+    rr(c, plotX + 20, py + ph / 2 + 16, bw * (0.12 + 0.88 * ease), 4, 2); panelFill(c, CAPTURE, ease);
+    c.textAlign = 'left';
+  }
+  if (done) {                                       // 收尾：同一块面板加一道绿边，不切不弹
+    rr(c, plotX + .75, py + .75, PW - 1.5, ph - 1.5, 10);
+    c.strokeStyle = rgba(CAPTURE, .55); c.lineWidth = 1.5; c.stroke();
+  }
+  if (ss.stage === 'saving' && t - ss.saveT >= SAVE_MS && !ss.end) {
+    ss.end = true; ss.stage = 'done'; ss.endT = t;
+  }
+  if (done && t - ss.endT > END_MS) endSession(`长图 ${Math.round((v.x1 - v.x0) * dpr)}×${Math.round(len * dpr)} 已写入桌面、剪贴板与历史`);
+}
+// 面板底边在内容坐标里的位置；井里的「只显示尾部」以它为基准。
+function bottomOf(ss) { return ss.max + ss.v.y1; }
+const px2 = v => Math.round(v);
+const pulse = (t, ms) => 0.5 - 0.5 * Math.cos((t % ms) / ms * Math.PI * 2);   // 0..1 往返，状态灯的呼吸
+// 记一笔「累计捕获行数 / 时间」，用来把面板宽度对可读性的影响量化出来：宽了会不会更慢到达页底。
+function recordScroll() {
+  const ss = S && S.scrollState;
+  if (!ss) return;
+  const last = scrollLog[scrollLog.length - 1];
+  if (last && Math.abs(last[1] - ss.tracked) < 1) return;
+  scrollLog.push([now(), ss.tracked, ss.tracked / S.sel.h, ss.auto]);
 }
 
 // ───────────────────────── 输入 ─────────────────────────
@@ -1006,7 +1157,13 @@ ov.addEventListener('wheel', e => {
   e.preventDefault();
   if (!S) return;
   const dy = e.deltaMode === 1 ? e.deltaY * 40 : e.deltaY;
-  if (S.phase === 'scrolling') { if (inside(S.sel, e.clientX, e.clientY)) scrollBy(dy); return; }
+  if (S.phase === 'scrolling') {
+    const ss = S.scrollState;
+    if (ss.stage !== 'idle' || ss.end) return;        // 导出中 / 到页底之后，滚了也不再累计
+    if (inside(S.sel, e.clientX, e.clientY)) { scrollBy(dy); ss.still = 0; }
+    recordScroll();
+    return;
+  }
   if (S.zHeld) {
     const i = ZOOMS.indexOf(S.zoom);
     S.zoom = ZOOMS[clamp(i + (dy < 0 ? 1 : -1), 0, ZOOMS.length - 1)];
@@ -1035,10 +1192,20 @@ const RUN = {
     else endSession(`已复制 ${Math.round(S.sel.w * dpr)}×${Math.round(S.sel.h * dpr)} 到剪贴板`);
   },
   'cancel': () => endSession(),
-  'scroll.auto': () => { S.scrollState.auto = !S.scrollState.auto; S.scrollState.end = false; },
+  'scroll.auto': () => {
+    const ss = S.scrollState;
+    if (ss.stage === 'saving' || ss.stage === 'done') return;
+    ss.auto = !ss.auto; ss.end = false; ss.still = 0; ss.stage = 'idle';
+  },
   'scroll.finish': () => {
-    const ss = S.scrollState, len = ss.max + ss.v.y1 - ss.min - ss.v.y0;
-    endSession(`长图 ${Math.round((ss.v.x1 - ss.v.x0) * dpr)}×${Math.round(len * dpr)} 已写入桌面、剪贴板与历史`);
+    const ss = S.scrollState;
+    if (ss.stage === 'saving' || ss.stage === 'done') return;
+    ss.auto = false; ss.still = 0;
+    ss.min = Math.min(ss.min, scroll); ss.max = Math.max(ss.max, scroll);
+    docPreview = document.createElement('canvas');     // 定稿：收尾态画的是它，捕获到此为止
+    docPreview.width = docCv.width; docPreview.height = docCv.height;
+    docPreview.getContext('2d').drawImage(docCv, 0, 0);
+    ss.stage = 'saving'; ss.saveT = now();
   },
   'scroll.cancel': () => endSession('已取消，不产生文件'),
 };

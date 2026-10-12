@@ -11,9 +11,124 @@ use crate::scroll::layout::{self, Button, Layout};
 use crate::scroll::{Auto, Status};
 use crate::windows::scroll_worker::{ScrollWorker, Spec};
 use crate::windows::win::d2d::{ScrollPanelView, frame_band};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// The provider name an exported scroll image carries.
 const SCROLL_PROVIDER: &str = "wgc-scroll";
+
+/// Diagnostics switch: what the panel is about to show, as bytes.
+///
+/// A thumbnail that looks wrong on screen and right in the saved file has two possible homes —
+/// the bytes the capture thread published, and the way the panel draws them. This line separates
+/// the two: it hashes the buffer the upload is built from, says which of its rows land where, and
+/// writes a few of those rows out, so the same rows can be recomputed from the saved image and
+/// compared. Off unless asked for; hashing a 240×700 buffer per published frame is not free.
+const SCROLL_TRACE_ENV: &str = "SNAPCLIP_SCROLL_TRACE";
+
+fn preview_trace_enabled() -> bool {
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    *TRACE.get_or_init(|| std::env::var_os(SCROLL_TRACE_ENV).is_some())
+}
+
+/// One line per published thumbnail: the geometry the panel is about to draw, and three of the
+/// buffer's rows in full.
+///
+/// `image_row` is where the buffer's row 0 sits among **all** the thumbnail's rows: the buffer is
+/// only the tail window the panel asks for, so the rows sampled here are the ones the long image
+/// has at `image_row + row`. `first`/`mid`/`last` are BGRA, one hex byte per channel, so a row that
+/// repeats with a period the image does not have — the shape of the reported fault — is visible in
+/// the log itself, without a photograph of the screen.
+fn trace_preview(preview: &crate::scroll::Preview, layout: &Layout) {
+    let well = layout.well;
+    let sample = |row: u32| -> String {
+        let row_width = preview.width as usize * 4;
+        let from = row as usize * row_width;
+        if preview.width == 0 || preview.rows == 0 || from + row_width > preview.bytes.len() {
+            return "-".into();
+        }
+        preview.bytes[from..from + row_width]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    };
+    let mid = preview.rows / 2;
+    let last = preview.rows.saturating_sub(1);
+    let image_row = (preview.viewport.1 as i64 - preview.rows as i64).max(0) as u32;
+    eprintln!(
+        "[snapclip][scroll] thumb={}x{} image_rows={} viewport=({},{}) well={}x{}@{},{} \
+         image_row={} row0@{} row_mid@{} row_last@{} row0={} row_mid={} row_last={}",
+        preview.width,
+        preview.rows,
+        preview.image_rows,
+        preview.viewport.0,
+        preview.viewport.1,
+        well.width(),
+        well.height(),
+        well.left,
+        well.top,
+        image_row,
+        image_row,
+        image_row + mid,
+        image_row + last,
+        sample(0),
+        sample(mid),
+        sample(last),
+    );
+    // Bounded on purpose: a dump is a file write, and a fast scroll publishes hundreds of previews.
+    // The first few show how the picture grows; after that only a real change in size is news, so a
+    // long session leaves a handful of files instead of hundreds of megabytes of them.
+    static DUMPS: AtomicU32 = AtomicU32::new(0);
+    static LAST_ROWS: AtomicU32 = AtomicU32::new(u32::MAX);
+    let rows = preview.rows;
+    let last = LAST_ROWS.swap(rows, Ordering::Relaxed);
+    let worth_it = last == u32::MAX
+        || rows.abs_diff(last) >= 64
+        || DUMPS.load(Ordering::Relaxed) < 4;
+    if worth_it {
+        DUMPS.fetch_add(1, Ordering::Relaxed);
+    }
+    if worth_it {
+        if let Some(path) = write_preview_bmp(preview, image_row) {
+            eprintln!("[snapclip][scroll] thumb_dump={path}");
+        }
+    }
+}
+
+/// Writes the exact buffer the panel is about to draw as a top-down BMP, and returns its path.
+///
+/// Three sampled rows can prove a repeat inside those rows; they cannot show a stripe that runs
+/// down columns the samples miss. This writes the whole window at 1:1 so it can be looked at (and
+/// diffed against the saved image) instead of inferred. BMP over PNG because the bytes on screen
+/// are BGRA rows already — a 14-byte file header and a 40-byte info header is the whole encoder.
+fn write_preview_bmp(preview: &crate::scroll::Preview, image_row: u32) -> Option<String> {
+    let (width, height) = (preview.width as usize, preview.rows as usize);
+    if width == 0 || height == 0 || preview.bytes.len() < width * height * 4 {
+        return None;
+    }
+    let pixels = width * height * 4;
+    let mut bmp = Vec::with_capacity(54 + pixels);
+    bmp.extend_from_slice(b"BM");
+    bmp.extend_from_slice(&((54 + pixels) as u32).to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes());
+    bmp.extend_from_slice(&54u32.to_le_bytes());
+    bmp.extend_from_slice(&40u32.to_le_bytes());
+    bmp.extend_from_slice(&(width as i32).to_le_bytes());
+    // Negative height: the rows go top-down, which is the order the buffer is already in.
+    bmp.extend_from_slice(&(-(height as i32)).to_le_bytes());
+    bmp.extend_from_slice(&1u16.to_le_bytes());
+    bmp.extend_from_slice(&32u16.to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes());
+    bmp.extend_from_slice(&(pixels as u32).to_le_bytes());
+    bmp.extend_from_slice(&[0u8; 16]);
+    for row in 0..height {
+        let from = row * width * 4;
+        bmp.extend_from_slice(&preview.bytes[from..from + width * 4]);
+    }
+    let path = std::env::temp_dir().join(format!("snapclip-thumb-{image_row}-{width}x{height}.bmp"));
+    std::fs::write(&path, &bmp).ok()?;
+    Some(path.display().to_string())
+}
 
 /// One running scroll session.
 pub(super) struct ScrollRun {
@@ -34,7 +149,7 @@ pub(super) struct ScrollRun {
     auto: Auto,
     failed: bool,
     /// The keys the buttons name, as bound when the session started.
-    keys: [String; 3],
+    keys: [String; 2],
 }
 
 impl ScrollRun {
@@ -70,7 +185,7 @@ impl ScrollRun {
             thumb: self.thumb,
             viewport: self.viewport,
             size: layout::size_text(self.selection.width(), self.image_rows),
-            status: layout::status_text(self.status, self.auto, self.failed),
+            status: layout::status_text(self.status, self.failed),
             buttons: std::array::from_fn(|index| {
                 let label = layout::BUTTONS[index].label(auto);
                 match self.keys[index].as_str() {
@@ -208,6 +323,9 @@ impl OverlayController {
             {
                 eprintln!("[snapclip][scroll] preview upload failed: {error}");
             }
+            if preview_trace_enabled() {
+                trace_preview(&preview, &run.layout);
+            }
             run.thumb = (preview.width, preview.rows);
             run.viewport = preview.viewport;
             run.image_rows = preview.image_rows;
@@ -232,7 +350,6 @@ impl OverlayController {
         match button {
             Button::Auto => self.toggle_scroll_auto(),
             Button::Finish => self.finish_scroll_session("button"),
-            Button::Cancel => self.cancel("scroll-button"),
         }
     }
 

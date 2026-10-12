@@ -1774,8 +1774,8 @@ fn the_overlay_thread_never_blocks_longer_than_eight_ms() {
         thumb: (preview.width, preview.rows),
         viewport: preview.viewport,
         size: crate::scroll::layout::size_text(selection.width(), preview.image_rows),
-        status: "滚动页面",
-        buttons: ["F9 完成".into(), "A 自动".into(), "Esc 取消".into()],
+        status: String::new(),
+        buttons: ["F9 保存".into(), "A 自动".into()],
     };
 
     // Warm-up: the first composition through a fresh target builds resources every later one
@@ -1856,8 +1856,18 @@ fn the_frame_is_stroked_inside_the_selection_edge() {
     }
 }
 
-/// Renders `view` onto a `width`×`height` target over a flat frame, and reads it back.
+/// Renders `view` onto a `width`×`height` target over a flat frame, and reads it back. A scroll
+/// session uploads its thumbnail first, through the same call the overlay makes.
 fn render_view(width: u32, height: u32, view: &RenderView) -> Vec<u8> {
+    render_view_with_preview(width, height, view, None)
+}
+
+fn render_view_with_preview(
+    width: u32,
+    height: u32,
+    view: &RenderView,
+    preview: Option<&crate::scroll::Preview>,
+) -> Vec<u8> {
     let device =
         super::GraphicsDevice::create().expect("this test needs a D3D11 device (docs/31 D-14)");
     let mut renderer = OverlayRenderer::new(std::sync::Arc::new(device), 96)
@@ -1882,6 +1892,11 @@ fn render_view(width: u32, height: u32, view: &RenderView) -> Vec<u8> {
         D2D1_ALPHA_MODE_PREMULTIPLIED,
     )
     .unwrap();
+    if let Some(preview) = preview {
+        renderer
+            .update_scroll_preview(preview)
+            .expect("a thumbnail upload");
+    }
     renderer.draw_to(&bitmap, view).unwrap();
     renderer.device().read_back_bgra(&target.texture).unwrap()
 }
@@ -1908,6 +1923,81 @@ fn the_editing_frame_paints_inside_the_selection_edge() {
     assert_eq!(at(23), at(60), "the frame stops inside its band");
 }
 
+/// Every corner of an uploaded thumbnail reaches the panel as its own flat colour.
+///
+/// The panel is the only place the thumbnail is drawn, and it draws it 1:1 through a layer with a
+/// rectangular clip. A bitmap whose rows were built with the wrong divisor, or that D2D reads with
+/// the wrong stride, keeps the picture's geometry but ruins the colours — which shows up as
+/// stripes. Four flat quadrants catch that, and nothing else on the panel can fake it.
+#[test]
+#[ignore = "composes through the real D3D11/D2D path; the L4 gate runs it with --ignored"]
+fn the_panel_draws_the_thumbnail_flat() {
+    let (width, height) = (360, 260);
+    let frame = Rect::new(0, 0, width as i32, height as i32);
+    // A short selection: the panel is capped at the work area's height, and a taller one would put
+    // the well's top above the frame.
+    let selection = Rect::new(60, 20, 120, 240);
+    let (thumb_width, thumb_rows) = (160u32, 160u32);
+    // One opaque colour per quadrant, in BGRA.
+    let quadrants = [
+        ([0x40, 0x30, 0x20, 0xFF], 0u32, 0u32),
+        ([0x60, 0xE0, 0xFF, 0xFF], 1, 0),
+        ([0x30, 0xC0, 0x40, 0xFF], 0, 1),
+        ([0x30, 0x60, 0xC0, 0xFF], 1, 1),
+    ];
+    let mut bytes = Vec::with_capacity((thumb_width * thumb_rows * 4) as usize);
+    for y in 0..thumb_rows {
+        for x in 0..thumb_width {
+            let quadrant = (x >= thumb_width / 2) as usize + 2 * (y >= thumb_rows / 2) as usize;
+            bytes.extend_from_slice(&quadrants[quadrant].0);
+        }
+    }
+    let preview = crate::scroll::Preview {
+        width: thumb_width,
+        rows: thumb_rows,
+        bytes,
+        viewport: (0, thumb_rows),
+        image_rows: 2400,
+    };
+    let mut view = RenderView::new(frame);
+    view.selection = selection;
+    view.cursor_visible = false;
+    view.show_chrome = true;
+    let layout = crate::scroll::layout::layout(selection, frame, thumb_rows as i32, 96);
+    // The whole thumbnail is visible: no clipped rows, so every quadrant lands where it belongs.
+    assert!(
+        layout.well.height() >= thumb_rows as i32,
+        "the well ({} rows) has to show the whole {}x{} thumbnail",
+        layout.well.height(),
+        thumb_width,
+        thumb_rows
+    );
+    view.scroll = Some(super::ScrollPanelView {
+        layout,
+        thumb: (thumb_width, thumb_rows),
+        viewport: (0, thumb_rows),
+        size: crate::scroll::layout::size_text(1200, 2400),
+        status: String::new(),
+        buttons: ["F9 保存".into(), "A 自动".into()],
+    });
+    let pixels = render_view_with_preview(width, height, &view, Some(&preview));
+
+    // The middle of each quadrant, in the composed frame.
+    let thumb = super::scroll_thumb_rect(layout.well, (thumb_width, thumb_rows));
+    assert_eq!(thumb.left, layout.well.left);
+    assert_eq!(thumb.top, layout.well.top);
+    let (half_w, half_h) = (thumb.width() / 2, thumb.height() / 2);
+    for (pixel, column, row) in quadrants {
+        let x = (thumb.left + (column as i32 * half_w) + half_w / 2) as u32;
+        let y = (thumb.top + (row as i32 * half_h) + half_h / 2) as u32;
+        let drawn = pixel_at(&pixels, width, x, y);
+        assert_eq!(
+            drawn, pixel,
+            "the quadrant at column {column}, row {row} ({x},{y}) must be its own colour"
+        );
+    }
+}
+
 /// A scroll session draws the same frame, without grips or label, and the panel, on a transparent
 /// surface: the selection's interior and everything outside the frame and the panel stay clear.
 #[test]
@@ -1925,8 +2015,8 @@ fn the_scroll_session_draws_only_the_frame_and_the_panel() {
         thumb: (0, 0),
         viewport: (0, 0),
         size: crate::scroll::layout::size_text(100, 140),
-        status: "滚动页面",
-        buttons: ["F9 完成".into(), "A 自动".into(), "Esc 取消".into()],
+        status: String::new(),
+        buttons: ["F9 保存".into(), "A 自动".into()],
     });
     let pixels = render_view(width, height, &view);
     let alpha = |x, y| pixel_at(&pixels, width, x, y)[3];
@@ -1947,7 +2037,7 @@ fn the_scroll_session_draws_only_the_frame_and_the_panel() {
     assert_eq!(alpha(18, 18), 0, "no grips in a scroll session");
     let centre = layout.panel.center();
     assert!(
-        alpha(centre.x as u32, layout.header.center().y as u32) > 200,
+        alpha(centre.x as u32, layout.buttons[0].center().y as u32) > 200,
         "the panel is painted"
     );
 }

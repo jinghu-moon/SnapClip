@@ -30,7 +30,7 @@ crates/snapclip-capture/src/scroll/
   estimate.rs   FrameSig::of + estimate(ref, cur) -> Shift{dy} | Still | Unknown      纯函数
   stitch.rs     Stitcher：连续 BGRA 画布，pos/top，Append/Prepend/Contained            纯数据
   thumb.rs      缩略图：按块求均值缩到面板宽度，增量更新                                纯函数
-  layout.rs     面板（标题、缩略图槽、状态、按钮）的几何与文字                                          纯函数
+  layout.rs     面板（缩略图槽、尺寸浮标、状态、按钮）的几何与文字                                    纯函数
   mod.rs        Tracker：估计 → 拼接 → 缩略图，每帧调用一次
 crates/snapclip-capture/src/windows/
   scroll_worker.rs   捕获线程：WGC 显示器会话 → 只回读选区 → Tracker → 发布 Report → 唤醒覆盖层；
@@ -98,7 +98,7 @@ crates/snapclip-capture/src/windows/
   - 仍在重绘的页面会顺延窗口（"连续一秒没有变化"才算一次未响应），慢页面因此有机会画完它已经开始的那一次滚动；
   - 日志会区分两种"没动"：`the page repainted without moving`（有新帧但没位移）与 `no new frame arrived`（根本没有新帧）；
   - 任意一次成功位移都把计数清零。
-  `PostMessageW` 返回 `ERROR_ACCESS_DENIED` 时，说明目标以更高完整性级别运行（以管理员身份运行），UIPI 会丢弃低完整性进程投递的输入（`docs/archive/30` §24.6.2 实测）。这时立即关闭自动，状态栏显示「窗口拒绝自动，请手动滚」，不再把 10 次被拒误判为"已到底"。用户自己的滚轮不受影响，再次点「自动」会清除该状态。
+  `PostMessageW` 返回 `ERROR_ACCESS_DENIED` 时，说明目标以更高完整性级别运行（以管理员身份运行），UIPI 会丢弃低完整性进程投递的输入（`docs/archive/30` §24.6.2 实测）。这时立即关闭自动，不再把 10 次被拒误判为"已到底"；失败原因只在日志里说明。用户自己的滚轮不受影响，再次点「自动」即可重试。
 - **手动滚动**：滚轮直接落到页面上（F1）。覆盖层若自己收到 `WM_MOUSEWHEEL`，用同一个 `post_wheel` 转发。
 
 ### 3.4 覆盖层与交互
@@ -108,10 +108,10 @@ crates/snapclip-capture/src/windows/
 | F7 | 打开截图框，并标记"Enter 进入滚动" |
 | 左键框选 → Enter | `begin_scroll`。截图会话交回 Idle，覆盖层窗口区域缩为：面板及其阴影 ∪ 选区边缘内侧的边框带（`frame_band`，即边框线宽向上取整）。边框与普通截图是同一个绘制例程 `draw_selection_frame`，只是不画手柄和尺寸标签（`FrameMarks::SCROLLING`）。边框以内是空洞，页面持续绘制并直接接收滚轮 |
 | 滚轮 / 「自动」 | 手动或自动滚动。右侧面板中缩略图底部对齐、随内容增长，当前视口以高亮框标出 |
-| F9 / Enter / 「完成」 | `finish` 交出长图，走普通截图的 `SelectionPixels` 导出路径。导出线程依次写入：**历史 → 桌面 `SnapClip-{id}.png` → 剪贴板**。剪贴板由应用侧 `clipboard.rs` 直接写入：一份 `CF_DIBV5`（自下而上的 BGRA 行，从任务里已有的像素一次写进剪贴板内存，正高度以兼容 Word），加上刚写好的 PNG 文件原样作为 `PNG` 格式，不再经 arboard 二次编码 PNG（2148×42924 在 release 下从约 1.35 s 降到 154 ms）。不回读解码 PNG，因此不受解码器对不可信输入的 24 MP 上限约束；覆盖层线程只负责发布结果 |
-| Esc / 「取消」 | 丢弃，不写任何文件。滚动期间 Esc 注册为临时全局热键（`CANCEL_HOTKEY`），焦点在页面上时同样生效 |
+| F9 / Enter / 面板「保存」 | `finish` 交出长图，走普通截图的 `SelectionPixels` 导出路径。导出线程依次写入：**历史 → 桌面 `SnapClip-{id}.png` → 剪贴板**。剪贴板由应用侧 `clipboard.rs` 直接写入：一份 `CF_DIBV5`（自下而上的 BGRA 行，从任务里已有的像素一次写进剪贴板内存，正高度以兼容 Word），加上刚写好的 PNG 文件原样作为 `PNG` 格式，不再经 arboard 二次编码 PNG（2148×42924 在 release 下从约 1.35 s 降到 154 ms）。不回读解码 PNG，因此不受解码器对不可信输入的 24 MP 上限约束；覆盖层线程只负责发布结果 |
+| Esc | 丢弃，不写任何文件。滚动期间 Esc 注册为临时全局热键（`CANCEL_HOTKEY`），焦点在页面上时同样生效。**它是唯一的取消入口，面板上不占按钮位**（`Action::ScrollCancel` 只在键位上，`layout::Button` 里没有 Cancel） |
 
-面板宽 160 DIP，与选区相距 8 DIP，优先放在右侧，放不下时翻到左侧。样式取自 `docs/design/overlay-ui-demo.html` 的 `drawScrolling`：圆角卡片带阴影；标题行左侧「长截图」，右侧 `宽×行数`；缩略图槽底部对齐显示尾部，被截断时顶部渐隐，当前视口用强调色描边；状态行；底部一行三个按钮 `F9 完成` / `A 自动` / `Esc 取消`（键名取自当前键位绑定）。
+面板宽 160 DIP，与选区相距 8 DIP，优先放在右侧，放不下时翻到左侧。样式取自 `docs/design/overlay-ui-demo.html` 的 `drawScrolling`：直角卡片带阴影；缩略图槽**满幅**——它从卡片自己的上、左、右边缘开始，图片因此贴着卡片顶边、不留任何顶栏，底部对齐显示尾部，被截断时顶部渐隐，当前视口用强调色描边；`宽×行数` 作为浮标压在缩略图右上角（离边 6 DIP、高 24 DIP，黑 55%，和放大镜的 `20×` 同一套规格），不占图片高度；状态行（20 DIP，正常滚动时为空白）；底部一行两个按钮 `F9 保存` / `A 自动`（键名取自当前键位绑定，`Button::label`）。
 
 ## 4. 验证
 
@@ -138,7 +138,8 @@ crates/snapclip-capture/src/windows/
 - **缩略图与布局**：
   - 缩略图每个像素等于对应块的均值，增量更新时只重算 band；
   - 面板位于右侧且底部对齐、随内容增长、空间不足时翻到左侧、随 DPI 缩放；
-  - 三个按钮依序铺满底部一行，命中测试正确；阴影不触及选区。
+  - 缩略图槽满幅（等于卡片本身的上、左、右边缘），尺寸浮标始终落在槽内；
+  - 两个按钮依序铺满状态行宽度，命中测试正确；阴影不触及选区。
 - **边框**：普通截图与滚动截图的边框都画在选区边缘内侧（GPU 像素测试）；滚动时选区内部与边框、面板以外全透明，没有手柄。
 - **覆盖层**：窗口区域不覆盖选区内部（边框带以内），边框带四周封闭。
 - **自动滚动**：只有 `ERROR_ACCESS_DENIED` 被视为拒绝；拒绝后自动关闭并进入 Refused，重新开启后清除；目标窗口变化时记录；目标的类名取自真实窗口。**等待闭环**：一帧显示位移即结束当前 notch；未到期无位移时仍在等待；到期区分"重绘但没位移"与"没有新帧"；重绘会顺延窗口（慢页面不会被旧期限判死）；连续 `AUTO_IDLE_NOTCHES` 次未响应才停止，任何一次位移都清零（`a_notch_ends_the_instant_a_frame_shows_it`、`a_notch_that_times_out_reports_what_the_page_did`、`a_page_that_keeps_repainting_gets_to_finish_the_scroll_it_started`、`auto_gives_up_only_after_a_run_of_idle_notches`、`the_closed_loop_sets_the_cadence_from_the_page`——最后一条用虚拟时间走一遍闭环，把节奏交给页面：一帧应答的页面仍是 `AUTO_INTERVAL` 一击，一个窗口才应答的页面按窗口计，每 5 s 才出一帧的页面十击后放弃）。
@@ -182,10 +183,10 @@ crates/snapclip-capture/src/windows/
 
 ### 4.2 真机测试步骤
 
-1. 在 Chrome 长页面上：F7 → 框选 → Enter → 手动滚动。确认右侧缩略图底部对齐并随滚动增长。
+1. 在 Chrome 长页面上：F7 → 框选 → Enter → 手动滚动。确认右侧缩略图满幅、图片贴着卡片顶边，`宽×行数` 浮在右上角并随滚动增长。
 2. 按 F9，检查三处输出：桌面 `SnapClip-*.png`、剪贴板粘贴、历史条目。
-3. 再来一轮，点「自动」，确认滚到页底后自动停止，状态显示"滚动页面"。
-4. 再来一轮，按 Esc，确认不产生任何文件。
+3. 再来一轮，点「自动」，确认滚到页底后自动停止，状态行保持安静（正常滚动不报数，状态行只在跟丢、达上限、失败时才出现）。
+4. 再来一轮，按 Esc，确认不产生任何文件（面板上没有取消按钮，这是唯一入口）。
 
 ### 4.3 日志字段（`[snapclip][scroll]`）
 

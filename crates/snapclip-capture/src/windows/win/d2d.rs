@@ -58,7 +58,7 @@ use crate::ring_contrast::{
     ACCENT_RGB, CAPTURE_RGB, CHAIN_RING_RGB, CHAIN_RING_SHADOW, HOVER_WASH_ALPHA, MASK_ALPHA,
     MASK_RGB, MASK_TINT_ALPHA, PREVIEW_WASH_ALPHA, PREVIEW_WASH_WALK_SCALE, Rgb, mix,
 };
-use crate::scroll::layout::{self as scroll_layout, Layout};
+use crate::scroll::layout::Layout;
 pub(crate) use guide_pass::{GUIDE_AVOID_DIP, GuideView};
 
 /// The font family used for the size label, per the tasklist (§6.3).
@@ -441,6 +441,8 @@ pub struct OverlayRenderer {
     scroll_muted_brush: Option<ID2D1SolidColorBrush>,
     /// The buttons' fill.
     scroll_button_brush: Option<ID2D1SolidColorBrush>,
+    /// The size badge floating on the thumbnail.
+    scroll_badge_brush: Option<ID2D1SolidColorBrush>,
     /// The panel colour fading out over the well's top when the thumbnail is cut there.
     scroll_fade_brush: Option<ID2D1LinearGradientBrush>,
     /// The thumbnail, uploaded on every report that carries one.
@@ -460,9 +462,10 @@ pub(crate) struct ScrollPanelView {
     pub viewport: (u32, u32),
     /// The header's right side: the image's `width×rows`.
     pub size: String,
-    pub status: &'static str,
-    /// The buttons' texts, in [`scroll_layout::BUTTONS`] order: key and label.
-    pub buttons: [String; 3],
+    /// The footer's status line.
+    pub status: String,
+    /// The buttons' texts, in [`Layout::buttons`] order: key and label.
+    pub buttons: [String; 2],
 }
 
 /// The scroll panel's colour, the demo's `rgba(18,20,24,.92)`.
@@ -472,14 +475,10 @@ const SCROLL_PANEL: D2D1_COLOR_F = D2D1_COLOR_F {
     b: 24.0 / 255.0,
     a: 0.92,
 };
-const SCROLL_PANEL_RADIUS_DIP: f32 = 10.0;
-const SCROLL_WELL_RADIUS_DIP: f32 = 6.0;
-const SCROLL_BUTTON_RADIUS_DIP: f32 = 5.0;
 const SCROLL_BUTTON_PAD_DIP: f32 = 3.0;
-/// How far the header's and the status line's text sit from the panel's sides.
-const SCROLL_TEXT_PAD_DIP: f32 = 10.0;
-/// The status rectangle already starts at the well's inset.
-const INSET_TO_TEXT_DIP: f32 = scroll_layout::INSET_DIP as f32;
+/// The size badge floating on the thumbnail: the loupe's `20×` badge in everything but the number.
+const SCROLL_BADGE_OPACITY: f32 = 0.55;
+const SCROLL_BADGE_PAD_DIP: f32 = 7.0;
 /// How tall the fade over a cut thumbnail is.
 const SCROLL_FADE_DIP: f32 = 28.0;
 
@@ -595,6 +594,7 @@ impl OverlayRenderer {
             scroll_title_brush: None,
             scroll_muted_brush: None,
             scroll_button_brush: None,
+            scroll_badge_brush: None,
             scroll_fade_brush: None,
             scroll_preview_bitmap: None,
             metrics: RenderMetrics::for_dpi(dpi),
@@ -1485,10 +1485,10 @@ impl OverlayRenderer {
 
     // ── Scroll capture panel (docs/33) ──────────────────────────────────────────────────────────
 
-    /// The scroll session's panel (the demo's `drawScrolling`): a shadowed rounded card with the
-    /// title and the image's size, the thumbnail's tail in a rounded well with the viewport
-    /// outlined, the status line and the buttons. Every rectangle comes from [`Layout`], which the
-    /// hit test and the window region use too.
+    /// The scroll session's panel (the demo's `drawScrolling`): a shadowed square card holding the
+    /// thumbnail's tail in a full-bleed well with the viewport outlined and the image's size on a
+    /// floating badge, then the status line and the buttons. Every rectangle comes from [`Layout`],
+    /// which the hit test and the window region use too.
     fn draw_scroll_panel(&mut self, scroll: &ScrollPanelView) -> Result<(), String> {
         let k = self.metrics.dpi.max(96) as f32 / 96.0;
         let backdrop = self.require_brush(&self.scroll_panel_brush, "scroll panel brush")?;
@@ -1497,82 +1497,65 @@ impl OverlayRenderer {
         let title = self.require_brush(&self.scroll_title_brush, "scroll title brush")?;
         let muted = self.require_brush(&self.scroll_muted_brush, "scroll muted brush")?;
         let button = self.require_brush(&self.scroll_button_brush, "scroll button brush")?;
+        let badge_background = self.require_brush(&self.scroll_badge_brush, "scroll badge brush")?;
         let fade = self
             .scroll_fade_brush
             .clone()
             .ok_or("scroll fade brush is unavailable")?;
         let layout = &scroll.layout;
-        let rounded = |rect: Rect, grow: f32, drop: f32, radius: f32| D2D1_ROUNDED_RECT {
-            rect: D2D_RECT_F {
-                left: rect.left as f32 - grow,
-                top: rect.top as f32 - grow + drop,
-                right: rect.right as f32 + grow,
-                bottom: rect.bottom as f32 + grow + drop,
-            },
-            radiusX: radius + grow,
-            radiusY: radius + grow,
-        };
-        let radius = SCROLL_PANEL_RADIUS_DIP * k;
 
         // The card: a soft shadow (three stacked layers, inside the layout's footprint), then the
-        // card itself.
+        // card itself. Both are crisp rectangles — the panel has square corners.
         unsafe {
             for grow in [1.5, 3.0, 4.0] {
-                self.d2d.FillRoundedRectangle(
-                    &rounded(layout.panel, grow * k, 2.0 * k, radius),
+                let rect = layout.panel.inflate((grow * k) as i32);
+                self.d2d.FillRectangle(
+                    &D2D_RECT_F {
+                        top: rect.top as f32 + 2.0 * k,
+                        ..to_d2d(rect)
+                    },
                     &shadow,
                 );
             }
-            self.d2d
-                .FillRoundedRectangle(&rounded(layout.panel, 0.0, 0.0, radius), &backdrop);
+            self.d2d.FillRectangle(&to_d2d(layout.panel), &backdrop);
         }
 
-        // The header: the title on the left, the size on the right.
-        let pad = SCROLL_TEXT_PAD_DIP * k;
-        let header = D2D_RECT_F {
-            left: layout.header.left as f32 + pad,
-            // The demo sets the line 2 DIP below the row's middle.
-            top: layout.header.top as f32 + 4.0 * k,
-            right: layout.header.right as f32 - pad,
-            bottom: layout.header.bottom as f32,
-        };
-        let title_format =
-            self.info_text_format_mut(false, 12.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, false)?;
-        self.draw_text_in(scroll_layout::TITLE, &title_format, header, &title)?;
-        let size_format =
-            self.info_text_format_mut(true, 11.0, DWRITE_FONT_WEIGHT_NORMAL, false)?;
-        let size_width = self.measure_text_width_in(&scroll.size, &size_format)?;
-        self.draw_text_in(
-            &scroll.size,
-            &size_format,
-            D2D_RECT_F {
-                left: header.right - size_width.ceil(),
-                ..header
-            },
-            &muted,
-        )?;
-
-        // The well: the thumbnail's newest rows, clipped to a rounded rectangle.
+        // The well: the thumbnail's newest rows, clipped to the well's rectangle. It fills the panel
+        // down to the footer, so the image starts at the panel's own top edge.
         self.draw_scroll_well(scroll, k, &accent, &fade)?;
+
+        // The size badge floats on the thumbnail's top-right corner, the way the loupe's `20×`
+        // badge floats on the magnified pixels.
+        let size_format =
+            self.info_text_format_mut(false, 11.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, false)?;
+        let size_width = self.measure_text_width_in(&scroll.size, &size_format)?;
+        let badge = Rect::new(
+            layout.badge.right - size_width.ceil() as i32 - (SCROLL_BADGE_PAD_DIP * k) as i32,
+            layout.badge.top,
+            layout.badge.right,
+            layout.badge.bottom,
+        );
+        unsafe {
+            // Square corners like everything else on the panel.
+            self.d2d.FillRectangle(&to_d2d(layout.badge), &badge_background);
+        }
+        self.draw_text_in(&scroll.size, &size_format, to_d2d(badge), &title)?;
 
         // The status line and the buttons.
         let small = self.info_text_format_mut(false, 11.0, DWRITE_FONT_WEIGHT_NORMAL, false)?;
         let status = to_d2d(layout.status);
         self.draw_text_in(
-            scroll.status,
+            &scroll.status,
             &small,
             D2D_RECT_F {
-                left: status.left + pad - INSET_TO_TEXT_DIP * k,
+                left: status.left,
                 ..status
             },
             &muted,
         )?;
         for (rect, label) in layout.buttons.iter().zip(&scroll.buttons) {
             unsafe {
-                self.d2d.FillRoundedRectangle(
-                    &rounded(*rect, 0.0, 0.0, SCROLL_BUTTON_RADIUS_DIP * k),
-                    &button,
-                );
+                self.d2d.FillRectangle(&to_d2d(*rect), &button);
             }
             // A rebound key can make a label wider than its button: it steps down to the floor,
             // and is clipped to the button there rather than spilling into the next one.
@@ -1606,17 +1589,11 @@ impl OverlayRenderer {
         let skipped = scroll.thumb.1 as i32 - thumb.height();
         let factory = unsafe { self.d2d.GetFactory() }
             .map_err(|e| super::hresult("ID2D1DeviceContext::GetFactory", &e))?;
-        let radius = SCROLL_WELL_RADIUS_DIP * k;
-        let mask: ID2D1Geometry = unsafe {
-            factory.CreateRoundedRectangleGeometry(&D2D1_ROUNDED_RECT {
-                rect: to_d2d(well),
-                radiusX: radius,
-                radiusY: radius,
-            })
-        }
-        .map_err(|e| super::hresult("CreateRoundedRectangleGeometry", &e))?
-        .cast()
-        .map_err(|e| super::hresult("cast to ID2D1Geometry", &e))?;
+        // A square clip: the well has the panel's own corners.
+        let mask: ID2D1Geometry = unsafe { factory.CreateRectangleGeometry(&to_d2d(well)) }
+            .map_err(|e| super::hresult("CreateRectangleGeometry", &e))?
+            .cast()
+            .map_err(|e| super::hresult("cast to ID2D1Geometry", &e))?;
         let layer =
             unsafe { self.d2d.CreateLayer(None) }.map_err(|e| super::hresult("CreateLayer", &e))?;
         let parameters = D2D1_LAYER_PARAMETERS1 {
@@ -2124,6 +2101,7 @@ impl OverlayRenderer {
         self.scroll_title_brush = Some(self.create_brush(&color(1.0, 1.0, 1.0, 1.0))?);
         self.scroll_muted_brush = Some(self.create_brush(&rgba(232, 236, 242, 0.62))?);
         self.scroll_button_brush = Some(self.create_brush(&color(1.0, 1.0, 1.0, 0.08))?);
+        self.scroll_badge_brush = Some(self.create_brush(&color(0.0, 0.0, 0.0, SCROLL_BADGE_OPACITY))?);
         let stops = [
             D2D1_GRADIENT_STOP {
                 position: 0.0,
@@ -2218,6 +2196,7 @@ impl OverlayRenderer {
         self.scroll_title_brush = None;
         self.scroll_muted_brush = None;
         self.scroll_button_brush = None;
+        self.scroll_badge_brush = None;
         self.scroll_fade_brush = None;
         self.scroll_preview_bitmap = None;
     }
