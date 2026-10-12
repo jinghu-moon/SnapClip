@@ -1,11 +1,13 @@
 //! The growing thumbnail beside the selection.
 //!
-//! An integer box filter: one thumbnail pixel is the mean of a `k × k` block of the canvas, with
-//! `k` the smallest factor that fits the canvas into the panel's width. Thumbnail row `t` covers
-//! content rows `[t·k, (t+1)·k)` in **content coordinates** (the first frame's top is row 0, a
-//! prepend reaches negative rows), so a prepend adds thumbnail rows in front instead of moving the
-//! box boundaries, and a canvas edit only recomputes the thumbnail rows it touches: the stitcher's
-//! band, `O(band · W)`, never the whole canvas.
+//! An integer box filter vertically and a scaled one horizontally: one thumbnail pixel is the mean
+//! of a `k × 1` block of the canvas, with `k` the smallest factor that covers the canvas's height,
+//! and the thumbnail is always exactly `max_width` pixels wide, so it fills the panel edge to edge
+//! the way the loupe's pixels fill theirs. Thumbnail row `t` covers content rows `[t·k, (t+1)·k)`
+//! in **content coordinates** (the first frame's top is row 0, a prepend reaches negative rows), so
+//! a prepend adds thumbnail rows in front instead of moving the box boundaries, and a canvas edit
+//! only recomputes the thumbnail rows it touches: the stitcher's band, `O(band · W)`, never the
+//! whole canvas.
 
 #[derive(Debug)]
 pub(crate) struct Thumb {
@@ -20,12 +22,15 @@ pub(crate) struct Thumb {
 
 impl Thumb {
     /// `src_width` is the canvas width, `max_width` the widest thumbnail the panel shows (pixels).
+    /// The thumbnail is that wide: the panel draws it 1:1, so anything narrower would show as
+    /// padding down the panel's sides.
     pub(crate) fn new(src_width: u32, max_width: u32) -> Self {
-        let k = src_width.div_ceil(max_width.max(1)).max(1);
+        let width = max_width.max(1);
+        let k = src_width.div_ceil(width).max(1);
         Self {
             k,
             src_width,
-            width: (src_width / k).max(1),
+            width,
             first: 0,
             rows: 0,
             pixels: Vec::new(),
@@ -110,21 +115,48 @@ impl Thumb {
         if lo >= hi {
             return;
         }
-        let k = self.k as usize;
+        let width = u64::from(self.width);
+        let src_width = u64::from(self.src_width);
+        // The source columns a thumbnail pixel covers: `x·W/w ..= (x+1)·W/w`. With `W ≥ w` each
+        // range holds at least one column, consecutive ranges start where the previous one ended
+        // (`clip` only widens a degenerate range), and the last ends exactly on `W` — so every
+        // canvas column is counted once and the thumbnail reaches both of the canvas's edges.
+        // Computed once for the whole row: these are the same for every canvas row, and this row is
+        // the frame's hot loop (`push_us` p50 is milliseconds, once per published frame).
+        let spans: Vec<(usize, usize)> = (0..self.width)
+            .map(|x| {
+                let x = u64::from(x);
+                let left = x * src_width / width;
+                let right = ((x + 1) * src_width / width).max(left + 1);
+                (left as usize, right as usize)
+            })
+            .collect();
         let mut sums = vec![0u32; self.width as usize * 4];
         for y in lo as usize..hi as usize {
             let line = &canvas[y * src_row..(y + 1) * src_row];
-            for (x, sum) in sums.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-                for pixel in line[x * k * 4..(x + 1) * k * 4].as_chunks::<4>().0 {
+            let pixels = line.as_chunks::<4>().0;
+            for (sum, &(left, right)) in sums.as_chunks_mut::<4>().0.iter_mut().zip(&spans) {
+                for pixel in &pixels[left..right.min(pixels.len())] {
                     for c in 0..4 {
                         sum[c] += u32::from(pixel[c]);
                     }
                 }
             }
         }
-        let n = (hi - lo) as u32 * self.k;
-        for (value, sum) in out.iter_mut().zip(&sums) {
-            *value = (sum / n) as u8;
+        let rows = (hi - lo) as u32;
+        // One iteration per thumbnail **pixel**, not per byte: zipping the four-channel sums
+        // against the output bytes would stop at a quarter of the row and leave the rest zero.
+        for ((value, sum), &(left, right)) in out
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(sums.as_chunks::<4>().0)
+            .zip(&spans)
+        {
+            let divisor = (rows * (right - left) as u32).max(1);
+            for c in 0..4 {
+                value[c] = (sum[c] / divisor) as u8;
+            }
         }
     }
 }
@@ -147,9 +179,69 @@ mod tests {
     #[test]
     fn the_factor_is_the_smallest_that_fits_the_panel() {
         assert_eq!(Thumb::new(1241, 240).factor(), 6);
-        assert_eq!(Thumb::new(1241, 240).width(), 206);
+        // The thumbnail is the panel's width whatever the canvas is: the well draws it 1:1, so a
+        // narrower bitmap would show as padding down the panel's sides.
+        assert_eq!(Thumb::new(1241, 240).width(), 240);
         assert_eq!(Thumb::new(200, 240).factor(), 1);
+        assert_eq!(Thumb::new(200, 240).width(), 240);
         assert_eq!(Thumb::new(480, 240).factor(), 2);
+        assert_eq!(Thumb::new(480, 240).width(), 240);
+    }
+
+    /// Every source column reaches the thumbnail exactly once, including the last ones.
+    #[test]
+    fn the_scaled_filter_covers_the_canvas_edge_to_edge() {
+        // Nine columns into five buckets: [0,1) [1,2) [2,4) [4,5) [5,9). Every column is counted
+        // once and none twice, so the buckets tile the canvas exactly.
+        let (src_width, width) = (9u32, 5u32);
+        let spans: Vec<(u32, u32)> = (0..width)
+            .map(|x| {
+                let left = x * src_width / width;
+                (left, ((x + 1) * src_width / width).max(left + 1))
+            })
+            .collect();
+        assert_eq!(spans, vec![(0, 1), (1, 3), (3, 5), (5, 7), (7, 9)]);
+        // The buckets touch and none moves backwards: nothing is skipped, nothing is counted twice.
+        for pair in spans.windows(2) {
+            assert_eq!(pair[1].0, pair[0].1);
+        }
+        assert_eq!(spans[0].0, 0);
+        assert_eq!(spans[width as usize - 1].1, src_width);
+
+        // The same spans over a ramp whose red channel is the column index and whose rows are
+        // identical: every red is then the mean of the columns the span covers, and a column lost
+        // at either edge shows up as a first or last bucket that misses the canvas's own edge
+        // column. A canvas exactly `k` rows tall makes each thumbnail row's divisor whole, so the
+        // numbers below are the horizontal filter alone and not a partial block's mean.
+        let canvas: Vec<u8> = (0..src_width * 2)
+            .flat_map(|i| [(i % src_width) as u8, 0, 0, 255])
+            .collect();
+        let mut thumb = Thumb::new(src_width, width);
+        assert_eq!(thumb.factor(), 2);
+        thumb.refresh(&canvas, 2, 0, 0, 2);
+        assert_eq!(thumb.rows(), 1);
+        let row: Vec<u8> = thumb.window(0, 1).to_vec();
+        let reds: Vec<u8> = row.as_chunks::<4>().0.iter().map(|px| px[0]).collect();
+        let expected: Vec<u8> = spans
+            .iter()
+            .map(|&(left, right)| ((left + right - 1) / 2) as u8)
+            .collect();
+        assert_eq!(expected, vec![0, 1, 3, 5, 7]);
+        assert_eq!(reds, expected);
+        assert_eq!(
+            reds[0], canvas[0],
+            "the canvas's first column is in the first bucket"
+        );
+        assert_eq!(
+            spans.last().unwrap().1,
+            src_width,
+            "the last bucket runs to the canvas's own right edge"
+        );
+        assert_eq!(
+            (spans.last().unwrap().0..spans.last().unwrap().1).max().unwrap(),
+            src_width - 1,
+            "so the canvas's last column is inside it"
+        );
     }
 
     #[test]
@@ -161,6 +253,19 @@ mod tests {
         // Block (1, 2): x in 2..4, y in 4..6 → means x = 2.5, y = 4.5, x + y = 7.
         let px = &thumb.window(2, 1)[4..8];
         assert_eq!(px, &[2, 4, 7, 255]);
+        // Every pixel of every row, not just the second one of one row: a write loop that runs out
+        // of one operand early fills the rest of the row with zeros and only shows up here.
+        for t in 0..thumb.rows() {
+            let row = thumb.window(t, 1);
+            for (x, px) in row.as_chunks::<4>().0.iter().enumerate() {
+                let block = (2 * x) as u32;
+                assert_eq!(
+                    px,
+                    &[block as u8, (2 * t) as u8, (block + 2 * t) as u8 + 1, 255],
+                    "thumbnail pixel ({x}, {t})"
+                );
+            }
+        }
     }
 
     #[test]
