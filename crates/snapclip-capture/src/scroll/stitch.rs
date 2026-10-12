@@ -307,10 +307,53 @@ mod tests {
         assert!(canvas[..64].iter().all(|&b| b == 7) && canvas[64..].iter().all(|&b| b == 0));
     }
 
+    /// How much the canvas really moves over a field-sized session. The field log's rising append
+    /// cost (68 ms at 1.4k rows, 123 ms at 42k) is not reallocation: at 1323x36000 the canvas moves
+    /// six times over 390 appends, for 35.7 MB copied in total. So the per-append cost that does rise
+    /// with the image is elsewhere — the prepend path shifts the whole canvas down by the growth
+    /// band by construction (`copy_within`, stitch.rs:117). Reported, not asserted.
+    #[test]
+    #[ignore = "timing report: run with --release --ignored --nocapture"]
+    fn the_canvas_moves_a_logarithmic_number_of_times_at_the_field_size() {
+        const W: u32 = 1323;
+        const H: u32 = 900;
+        const MAX_ROWS: u32 = 40 * H;
+        let page = page(W, MAX_ROWS, 5);
+        let mut stitcher = Stitcher::new(&window(&page, W, 0, H), W, H, MAX_ROWS);
+        let mut moves = 0u32;
+        let mut moved = 0u64;
+        let mut capacity = stitcher.canvas.capacity();
+        let mut appends = 0u32;
+        let mut top = 0;
+        while top + 90 + H <= MAX_ROWS {
+            top += 90;
+            let before = stitcher.canvas.len();
+            if !matches!(
+                stitcher.place(&window(&page, W, top, H), 90),
+                Placement::Appended { .. }
+            ) {
+                break;
+            }
+            appends += 1;
+            let now = stitcher.canvas.capacity();
+            if now != capacity {
+                moves += 1;
+                moved += before as u64;
+                capacity = now;
+            }
+        }
+        println!(
+            "canvas {W}x{}: {appends} appends, {moves} moves, {:.1} MB copied, peak {:.1} MB",
+            stitcher.rows(),
+            moved as f64 / 1e6,
+            capacity as f64 / 1e6,
+        );
+    }
+
     /// The field log: every frame cost more the longer the image got (68 ms at 1.4k rows, 123 ms
-    /// at 42k), because each append reserved exactly its own rows and so copied the whole canvas
-    /// into a new allocation. Growth must be amortised: the canvas moves O(log n) times, not once
-    /// per notch, and never reserves past the cap.
+    /// at 42k). `grow` is what keeps that from being an allocation per notch: the canvas moves
+    /// O(log n) times, not once per append, and never reserves past the cap. The append cost that
+    /// still rises with the image is the prepend shift, not this.
     #[test]
     fn a_long_session_moves_the_canvas_a_logarithmic_number_of_times() {
         let page = page(W, 32 * H + H, 5);

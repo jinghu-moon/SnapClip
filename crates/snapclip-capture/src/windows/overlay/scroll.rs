@@ -318,6 +318,7 @@ impl OverlayController {
         };
         let report = run.worker.take_report();
         if let Some(preview) = report.preview {
+            let mut preview = preview;
             if let Some(renderer) = self.renderer.as_mut()
                 && let Err(error) = renderer.update_scroll_preview(&preview)
             {
@@ -329,6 +330,9 @@ impl OverlayController {
             run.thumb = (preview.width, preview.rows);
             run.viewport = preview.viewport;
             run.image_rows = preview.image_rows;
+            // The pixels are in D2D's bitmap now, so the capture thread can gather the next
+            // thumbnail straight into this buffer instead of allocating a new one per frame.
+            run.worker.recycle_preview(std::mem::take(&mut preview.bytes));
         }
         run.status = report.status;
         run.auto = report.auto;

@@ -18,6 +18,12 @@ pub(crate) struct Thumb {
     first: i64,
     rows: u32,
     pixels: Vec<u8>,
+    /// Reused by [`Thumb::compute`]: the source columns each thumbnail pixel covers, and the
+    /// four-channel sums being accumulated. Both depend only on `x`, so they are computed once per
+    /// `refresh` rather than once per row, and they are kept across calls so a frame that refreshes
+    /// 100 rows allocates nothing.
+    spans: Vec<(usize, usize)>,
+    sums: Vec<u32>,
 }
 
 impl Thumb {
@@ -27,6 +33,21 @@ impl Thumb {
     pub(crate) fn new(src_width: u32, max_width: u32) -> Self {
         let width = max_width.max(1);
         let k = src_width.div_ceil(width).max(1);
+        // The source columns a thumbnail pixel covers: `x·W/w .. (x+1)·W/w`. With `W ≥ w` each
+        // range holds at least one column, consecutive ranges start where the previous one ended
+        // (`max` only widens a degenerate range), and the last ends exactly on `W` — so every canvas
+        // column is counted once and the thumbnail reaches both of the canvas's edges. This depends
+        // on the widths alone, which do not change for the lifetime of the thumbnail.
+        let spans: Vec<(usize, usize)> = (0..width)
+            .map(|x| {
+                let x = u64::from(x);
+                let src = u64::from(src_width);
+                let wide = u64::from(width);
+                let left = x * src / wide;
+                let right = (((x + 1) * src / wide).max(left + 1)) as usize;
+                (left as usize, right)
+            })
+            .collect();
         Self {
             k,
             src_width,
@@ -34,6 +55,8 @@ impl Thumb {
             first: 0,
             rows: 0,
             pixels: Vec::new(),
+            spans,
+            sums: vec![0; width as usize * 4],
         }
     }
 
@@ -71,9 +94,15 @@ impl Thumb {
         self.cover(start, end);
         let dirty_from = (top + i64::from(from)).div_euclid(k);
         let dirty_to = (top + i64::from(to) + k - 1).div_euclid(k);
+        // Borrow the two scratch buffers once for the whole dirty range: the column spans and the
+        // channel sums are the same for every row, and a frame usually refreshes dozens of them.
+        let mut sums = std::mem::take(&mut self.sums);
+        let spans = std::mem::take(&mut self.spans);
         for t in dirty_from..dirty_to {
-            self.compute(t, canvas, canvas_rows, top);
+            self.compute(t, canvas, canvas_rows, top, &spans, &mut sums);
         }
+        self.sums = sums;
+        self.spans = spans;
     }
 
     /// `count` thumbnail rows starting at stored row `from`, packed BGRA.
@@ -104,7 +133,15 @@ impl Thumb {
         }
     }
 
-    fn compute(&mut self, t: i64, canvas: &[u8], canvas_rows: u32, top: i64) {
+    fn compute(
+        &mut self,
+        t: i64,
+        canvas: &[u8],
+        canvas_rows: u32,
+        top: i64,
+        spans: &[(usize, usize)],
+        sums: &mut [u32],
+    ) {
         let k = i64::from(self.k);
         let src_row = (self.src_width * 4) as usize;
         let lo = (t * k - top).max(0);
@@ -115,27 +152,11 @@ impl Thumb {
         if lo >= hi {
             return;
         }
-        let width = u64::from(self.width);
-        let src_width = u64::from(self.src_width);
-        // The source columns a thumbnail pixel covers: `x·W/w ..= (x+1)·W/w`. With `W ≥ w` each
-        // range holds at least one column, consecutive ranges start where the previous one ended
-        // (`clip` only widens a degenerate range), and the last ends exactly on `W` — so every
-        // canvas column is counted once and the thumbnail reaches both of the canvas's edges.
-        // Computed once for the whole row: these are the same for every canvas row, and this row is
-        // the frame's hot loop (`push_us` p50 is milliseconds, once per published frame).
-        let spans: Vec<(usize, usize)> = (0..self.width)
-            .map(|x| {
-                let x = u64::from(x);
-                let left = x * src_width / width;
-                let right = ((x + 1) * src_width / width).max(left + 1);
-                (left as usize, right as usize)
-            })
-            .collect();
-        let mut sums = vec![0u32; self.width as usize * 4];
+        sums[..self.width as usize * 4].fill(0);
         for y in lo as usize..hi as usize {
             let line = &canvas[y * src_row..(y + 1) * src_row];
             let pixels = line.as_chunks::<4>().0;
-            for (sum, &(left, right)) in sums.as_chunks_mut::<4>().0.iter_mut().zip(&spans) {
+            for (sum, &(left, right)) in sums.as_chunks_mut::<4>().0.iter_mut().zip(spans) {
                 for pixel in &pixels[left..right.min(pixels.len())] {
                     for c in 0..4 {
                         sum[c] += u32::from(pixel[c]);
@@ -151,7 +172,7 @@ impl Thumb {
             .0
             .iter_mut()
             .zip(sums.as_chunks::<4>().0)
-            .zip(&spans)
+            .zip(spans)
         {
             let divisor = (rows * (right - left) as u32).max(1);
             for c in 0..4 {

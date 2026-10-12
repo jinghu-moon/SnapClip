@@ -92,6 +92,8 @@ pub(crate) struct Tracker {
     stitcher: Stitcher,
     thumb: Thumb,
     status: Status,
+    /// Scratch: how long the last `push`'s thumbnail refresh took, in microseconds.
+    last_thumb_us: u64,
 }
 
 impl Tracker {
@@ -120,6 +122,7 @@ impl Tracker {
             stitcher,
             thumb,
             status: Status::Tracking,
+            last_thumb_us: 0,
         }
     }
 
@@ -129,6 +132,13 @@ impl Tracker {
 
     pub(crate) fn image_rows(&self) -> u32 {
         self.stitcher.rows()
+    }
+
+    /// How long the last `push`'s thumbnail refresh took, in microseconds. `push` is the capture
+    /// thread's critical path, and the thumbnail is the largest part of it that scales with the
+    /// image, so it is reported next to `push_us` rather than guessed at from the code.
+    pub(crate) fn last_thumb_us(&self) -> u64 {
+        self.last_thumb_us
     }
 
     /// Measure `frame` against the reference and place it.
@@ -180,13 +190,21 @@ impl Tracker {
 
     fn refresh_thumb(&mut self, from: u32, to: u32) {
         let (rows, top) = (self.stitcher.rows(), self.stitcher.top());
+        let started = std::time::Instant::now();
         self.thumb
             .refresh(self.stitcher.canvas(), rows, top, from, to);
+        self.last_thumb_us = started.elapsed().as_micros() as u64;
     }
 
     /// At most `max_rows` thumbnail rows: all of them when they fit, otherwise the window whose
     /// bottom is the viewport's bottom (the tail while scrolling down).
-    pub(crate) fn preview(&self, max_rows: u32) -> Preview {
+    ///
+    /// `bytes` is the output buffer: a publishing session hands back the buffer of the previous
+    /// frame, so the 616 KiB window is gathered into an existing allocation instead of a new one
+    /// every frame (17 us against 121 us at the field size - an allocation that size goes out to the
+    /// kernel and back). The returned `Preview` owns the buffer; a caller that wants it again takes
+    /// it out of `Preview::bytes` when it is done with the pixels.
+    pub(crate) fn fill_preview(&self, max_rows: u32, mut bytes: Vec<u8>) -> Preview {
         let k = i64::from(self.thumb.factor());
         let first = self.thumb.first();
         let total = self.thumb.rows();
@@ -197,10 +215,13 @@ impl Tracker {
         let shown = max_rows.clamp(1, total.max(1)).min(total);
         let end = view_end.clamp(shown, total);
         let start = end - shown;
+        let window = self.thumb.window(start, shown);
+        bytes.clear();
+        bytes.extend_from_slice(window);
         Preview {
             width: self.thumb.width(),
             rows: shown,
-            bytes: self.thumb.window(start, shown).to_vec(),
+            bytes,
             viewport: (
                 view_start.saturating_sub(start).min(shown),
                 view_end.saturating_sub(start).min(shown),
@@ -359,13 +380,13 @@ mod tests {
         let page = page(W, 5000, 24);
         // W = 120 into 40 → factor 3, thumbnail rows are 3 canvas rows each.
         let mut tracker = Tracker::new(&frame_at(&page, 0, 0), W, H, 40);
-        let first = tracker.preview(1000);
+        let first = tracker.fill_preview(1000, Vec::new());
         assert_eq!((first.width, first.rows), (40, 67));
         assert_eq!(first.viewport, (0, 67));
         for top in (60..=900).step_by(60) {
             tracker.push(&frame_at(&page, top, 0));
         }
-        let preview = tracker.preview(100);
+        let preview = tracker.fill_preview(100, Vec::new());
         assert_eq!(preview.rows, 100);
         assert_eq!(preview.bytes.len(), (40 * 100 * 4) as usize);
         assert_eq!(preview.image_rows, 900 + H);
@@ -398,11 +419,14 @@ mod tests {
         let mut thumb_us = Vec::new();
         let mut preview_us = Vec::new();
         let mut preview_bytes = 0;
+        // The publishing session's own recycling: the preview buffer goes back in on every frame.
+        let mut recycled: Vec<u8> = Vec::new();
         for top in tops {
             let frame = window(&page, w, top, h);
             let started = std::time::Instant::now();
             tracker.push(&frame);
             frame_us.push(started.elapsed().as_micros());
+            thumb_us.push(tracker.last_thumb_us as u128);
 
             let started = std::time::Instant::now();
             let signature = FrameSig::of(&frame, w, h);
@@ -413,15 +437,14 @@ mod tests {
             let started = std::time::Instant::now();
             let placement = tracker.stitcher.place(&frame, shift_of(measured).unwrap_or(0));
             place_us.push(started.elapsed().as_micros());
-            let started = std::time::Instant::now();
             if let Placement::Appended { band, .. } = placement {
                 let rows = tracker.stitcher.rows();
                 tracker.refresh_thumb(rows - band, rows);
             }
-            thumb_us.push(started.elapsed().as_micros());
-
             let started = std::time::Instant::now();
-            preview_bytes = tracker.preview(160).bytes.len();
+            let preview = tracker.fill_preview(160, std::mem::take(&mut recycled));
+            preview_bytes = preview.bytes.len();
+            recycled = preview.bytes;
             preview_us.push(started.elapsed().as_micros());
         }
         let stats = |name: &str, costs: &mut Vec<u128>| {
@@ -453,7 +476,7 @@ mod tests {
         for top in (0..=840).rev().step_by(60) {
             tracker.push(&frame_at(&page, top, 0));
         }
-        let preview = tracker.preview(100);
+        let preview = tracker.fill_preview(100, Vec::new());
         // Back at the top: the window starts at the image's first row.
         assert_eq!(preview.viewport.0, 0);
         assert_eq!(preview.image_rows, 900 + H);

@@ -1836,6 +1836,106 @@ fn the_overlay_thread_never_blocks_longer_than_eight_ms() {
     }
 }
 
+/// How much of the publishing thread's work the thumbnail **upload** is, on its own: the panel's
+/// real geometry, the real bitmap sizes, and nothing else in the loop. The upload is one
+/// `CreateBitmap` per published frame, and the gather beside it is the buffer handoff: 616 KiB at
+/// the field size costs 96 us to upload, 121 us to gather into a fresh allocation and 17 us into a
+/// recycled one (measured). Reported, not asserted.
+#[test]
+#[ignore = "measures the real D2D upload path"]
+fn the_cost_of_publishing_a_thumbnail() {
+    use std::time::Instant;
+
+    use crate::scroll::Preview;
+    use crate::scroll::layout::{thumb_width, well_capacity};
+
+    const DIP: (i32, i32) = (1500, 900);
+    const DPI: u32 = 120;
+    const ROUNDS: u32 = 200;
+
+    let scale = DPI as f32 / 96.0;
+    let width = (DIP.0 as f32 * scale).round() as u32;
+    let height = (DIP.1 as f32 * scale).round() as u32;
+    let device = super::GraphicsDevice::create().expect("a D3D11 device");
+    let mut renderer = OverlayRenderer::new(std::sync::Arc::new(device), DPI)
+        .expect("the overlay renders at every DPI the overlay runs at");
+    let pixels = solid_bgra(width, height, [0x20, 0x28, 0x30, 0xFF]);
+    renderer
+        .update_frame(width, height, &pixels)
+        .expect("a full-frame BGRA buffer is a frame");
+
+    let frame = Rect::from_origin_size(Point::new(0, 0), width as i32, height as i32);
+    let selection = Rect::new(200, 150, 1300, 1000);
+    let thumb_width = thumb_width(DPI) as u32;
+    // The panel's own answer for how many rows the well holds, so the bitmap is the size the
+    // overlay really uploads rather than a number chosen to make the printout look round.
+    let max_rows = well_capacity(selection, frame, DPI) as u32;
+    // The worst case the panel ever shows: the whole well.
+    let preview = Preview {
+        width: thumb_width,
+        rows: max_rows,
+        bytes: solid_bgra(thumb_width, max_rows, [0x80, 0x90, 0xA0, 0xFF]),
+        viewport: (0, max_rows),
+        image_rows: 40_000,
+    };
+    println!(
+        "upload {}x{} = {} KiB",
+        preview.width,
+        preview.rows,
+        preview.bytes.len() / 1024
+    );
+
+    renderer
+        .update_scroll_preview(&preview)
+        .expect("a warm-up upload");
+    let mut upload_us = Vec::with_capacity(ROUNDS as usize);
+    for _ in 0..ROUNDS {
+        let at = Instant::now();
+        renderer
+            .update_scroll_preview(&preview)
+            .expect("an upload");
+        upload_us.push(at.elapsed().as_nanos() as u64);
+    }
+    upload_us.sort_unstable();
+    println!(
+        "upload p50={:.0}us p95={:.0}us max={:.0}us",
+        upload_us[upload_us.len() / 2] as f64 / 1e3,
+        upload_us[upload_us.len() * 95 / 100] as f64 / 1e3,
+        upload_us[upload_us.len() - 1] as f64 / 1e3
+    );
+
+    // The other half of a publish: gathering the window into the report's buffer. `to_vec` is what
+    // the publishing session used to do - a fresh 616 KiB allocation every frame; the recycled path
+    // is what `Tracker::fill_preview` does with the buffer the overlay hands back. The two are
+    // measured side by side because that difference is the whole question.
+    let mut fresh_us = Vec::with_capacity(ROUNDS as usize);
+    for _ in 0..ROUNDS {
+        let at = Instant::now();
+        let gathered = preview.bytes.to_vec();
+        std::hint::black_box(&gathered);
+        fresh_us.push(at.elapsed().as_nanos() as u64);
+    }
+    fresh_us.sort_unstable();
+    let mut recycled = Vec::new();
+    let mut recycled_us = Vec::with_capacity(ROUNDS as usize);
+    for _ in 0..ROUNDS {
+        let at = Instant::now();
+        recycled.clear();
+        recycled.extend_from_slice(&preview.bytes);
+        std::hint::black_box(&recycled);
+        recycled_us.push(at.elapsed().as_nanos() as u64);
+    }
+    recycled_us.sort_unstable();
+    for (name, costs) in [("to_vec", &fresh_us), ("recycled", &recycled_us)] {
+        println!(
+            "gather {name} p50={:.0}us p95={:.0}us max={:.0}us",
+            costs[costs.len() / 2] as f64 / 1e3,
+            costs[costs.len() * 95 / 100] as f64 / 1e3,
+            costs[costs.len() - 1] as f64 / 1e3
+        );
+    }
+}
+
 /// The frame's outline lies inside the selection, and the band the scroll session's window keeps
 /// is exactly as wide as the outline paints.
 #[test]

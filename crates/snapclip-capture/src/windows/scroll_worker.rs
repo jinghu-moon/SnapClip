@@ -124,6 +124,10 @@ struct Shared {
     /// frames is one message rather than one per frame.
     woken: AtomicBool,
     report: Mutex<Report>,
+    /// The buffer the overlay has finished with. The capture thread gathers the next thumbnail into
+    /// it rather than allocating one per frame; see `Tracker::fill_preview`. Empty when the overlay
+    /// has not handed one back, which is the case for the first frame of a session and nothing else.
+    recycled: Mutex<Vec<u8>>,
 }
 
 pub(crate) struct ScrollWorker {
@@ -162,6 +166,13 @@ impl ScrollWorker {
             auto: self.shared.auto_state(),
             failure: report.failure.clone(),
         }
+    }
+
+    /// Give the thumbnail's buffer back for the next frame to fill. The bytes are already in D2D's
+    /// bitmap by the time this is called, so the capture thread may write over them.
+    pub(crate) fn recycle_preview(&self, mut bytes: Vec<u8>) {
+        bytes.clear();
+        *self.shared.recycled.lock().unwrap() = bytes;
     }
 
     pub(crate) fn auto(&self) -> bool {
@@ -362,7 +373,8 @@ fn capture(spec: &Spec, shared: &Shared, tracker: &mut Option<Tracker>) -> Resul
             if verbose_timing() {
                 eprintln!(
                     "[snapclip][scroll] frame={frames} read_us={read_us} push_us={push_us} \
-                     total_us={us} bytes={}",
+                     thumb_us={} total_us={us} bytes={}",
+                    tracker.last_thumb_us(),
                     pixels.len()
                 );
             }
@@ -399,9 +411,14 @@ fn capture(spec: &Spec, shared: &Shared, tracker: &mut Option<Tracker>) -> Resul
         if tracker.status() == Status::Full && shared.auto.swap(false, Ordering::AcqRel) {
             eprintln!("[snapclip][scroll] auto ended: the image is full");
         }
+        // The buffer the overlay finished with, if it has handed one back: the next thumbnail is
+        // gathered into it instead of into a fresh 616 KiB allocation. Taking it out from under the
+        // lock leaves the slot empty while the gathering runs, which is what the overlay expects.
+        let recycled = std::mem::take(&mut *shared.recycled.lock().unwrap());
+        let preview = tracker.fill_preview(spec.preview_rows, recycled);
         {
             let mut report = shared.report.lock().unwrap();
-            report.preview = Some(tracker.preview(spec.preview_rows));
+            report.preview = Some(preview);
             report.status = Some(tracker.status());
         }
         wake(spec, shared);
@@ -669,6 +686,7 @@ pub(crate) fn post_wheel(aim: Point, delta: i32) -> Result<Target, WheelError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scroll::estimate::tests::{page, window};
 
     fn target(hwnd: isize) -> Target {
         Target {
@@ -986,5 +1004,75 @@ mod tests {
         assert_eq!(idle_notches, AUTO_IDLE_NOTCHES, "the log names the run it ended on");
         assert_eq!(idle_after(Observation::Moved, &mut idle_notches), Idle::Moved);
         assert_eq!(idle_notches, 0, "a page that answers is not the page that stops auto");
+    }
+
+    /// The overlay hands the thumbnail's buffer back on every wake-up, and the next frame gathers
+    /// into that same allocation instead of a fresh one (`fill_preview`'s own numbers: 121 us per
+    /// allocation against 17 us into a recycled buffer at 616 KiB). What this pins is that the buffer
+    /// actually survives the round trip and still grows: a slot that silently dropped it would put
+    /// the cost straight back without failing anything else.
+    #[test]
+    fn the_preview_buffer_survives_the_round_trip_to_the_overlay() {
+        const W: u32 = 40;
+        const H: u32 = 80;
+        /// The thumbnail is the panel's width, whatever the frame's width is.
+        const PANEL: u32 = 200;
+        const SHOWN: u32 = 40;
+        const WIDER: u32 = 160;
+        let worker = ScrollWorker {
+            shared: Arc::new(Shared::default()),
+            thread: None,
+            aim: Point::new(10, 20),
+        };
+        let page = page(W, 1000, 29);
+        let mut tracker = Tracker::new(&window(&page, W, 0, H), W, H, PANEL);
+        for top in (40..=600).step_by(40) {
+            tracker.push(&window(&page, W, top, H));
+        }
+        assert!(
+            tracker.image_rows() > WIDER * 4,
+            "the window has to be able to fill: {} canvas rows",
+            tracker.image_rows()
+        );
+
+        // First round trip: the overlay takes the report and hands the buffer back emptied.
+        let preview = tracker.fill_preview(SHOWN, Vec::new());
+        let row = (preview.width * 4) as usize;
+        assert_eq!(preview.bytes.len(), row * SHOWN as usize);
+        assert_eq!(preview.width, PANEL, "the thumbnail is as wide as the panel");
+        {
+            let mut report = worker.shared.report.lock().unwrap();
+            report.preview = Some(preview);
+        }
+        let held = worker.take_report().preview.expect("the report carries it").bytes;
+        let capacity = held.capacity();
+        worker.recycle_preview(held);
+
+        // The next frame wants more rows than the recycled buffer holds, so the pool hands over what
+        // it has and the gather grows it. What the recycled path has to prove is that the panel sees
+        // exactly what a fresh allocation would have shown: the same bytes, no stale prefix and no
+        // short fill. (Whether the allocator reuses the old block in place is its business; asserting
+        // a pointer here would assert the arena's state, not this code.)
+        let recycled = std::mem::take(&mut *worker.shared.recycled.lock().unwrap());
+        assert_eq!(recycled.capacity(), capacity, "emptied, not shrunk");
+        assert!(recycled.capacity() < row * WIDER as usize);
+        let again = tracker.fill_preview(WIDER, recycled);
+        assert_eq!(again.bytes.len(), row * WIDER as usize);
+        assert_eq!(
+            again,
+            tracker.fill_preview(WIDER, Vec::new()),
+            "the recycled gather is the fresh gather"
+        );
+        assert!(
+            again
+                .bytes
+                .chunks_exact(row)
+                .all(|line| line.chunks_exact(4).any(|pixel| pixel != [0, 0, 0, 255])),
+            "every row of the window is page content, not leftover zeros"
+        );
+        worker.recycle_preview(again.bytes);
+        let spare = std::mem::take(&mut *worker.shared.recycled.lock().unwrap());
+        assert_eq!(spare.capacity(), capacity.max(row * WIDER as usize));
+        assert!(spare.is_empty(), "the overlay's buffer goes back empty and ready");
     }
 }

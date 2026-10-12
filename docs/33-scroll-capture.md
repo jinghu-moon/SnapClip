@@ -84,7 +84,7 @@ crates/snapclip-capture/src/windows/
   - 超出顶部时为 **Prepend**：与 Append 镜像。
   - 否则为 **Contained**：只移动 `pos`，不写像素。
 - `Still` 时把参考帧换成当前帧（跟随动画）。`Unknown` 时参考帧不变，状态记为 `Lost`。
-- 上限：画布同时受**行数**与**字节**两条限制，取更紧的一条。行数上限是 `MAX_SCREENS = 32 × H`；字节上限是 `MAX_BYTES = 512 MiB`，换算成行数为 `MAX_BYTES / (W × 4)`（`row_limit`）。只按行数限制不是资源策略：`32 × H` 在 1241×821 的选区下约 130 MB，但在 3840×2160 下是 1.06 GB，而扩容的一瞬间新旧两块分配同时存在。常见的 1200×1024 选区里 `32 × H` 仍然是更紧的一条（字节侧允许 131072 行，行数侧只给 38400 行），所以字节预算只在极宽或极高的选区上生效。达到上限后停止增长，状态记为 `Full`，自动滚动同时停止。增长按容量倍增摊销（`grow`：目标容量取 `max(所需, min(2×当前容量, 上限))`，再 `try_reserve_exact`），整次会话只搬移画布 O(log n) 次；内存不足时同样返回 `Full`、画布保持原样，而不是让 `Vec::resize` 终止进程。注意 `grow` 的 `limit` 只约束**倍增的选择**，真正拦住越界的是 `place` 在增长之前做的 `rows + growth > max_rows` 检查。向上增长用 `copy_within` 原地平移已有行。（第 4 轮日志：按需精确预留导致每次追加都整块复制，追加耗时从 68 ms 涨到 123 ms；改为摊销后 release 下稳定在约 0.25 ms/次。）
+- 上限：画布同时受**行数**与**字节**两条限制，取更紧的一条。行数上限是 `MAX_SCREENS = 32 × H`；字节上限是 `MAX_BYTES = 512 MiB`，换算成行数为 `MAX_BYTES / (W × 4)`（`row_limit`）。只按行数限制不是资源策略：`32 × H` 在 1241×821 的选区下约 130 MB，但在 3840×2160 下是 1.06 GB，而扩容的一瞬间新旧两块分配同时存在。常见的 1200×1024 选区里 `32 × H` 仍然是更紧的一条（字节侧允许 131072 行，行数侧只给 38400 行），所以字节预算只在极宽或极高的选区上生效。达到上限后停止增长，状态记为 `Full`，自动滚动同时停止。增长按容量倍增摊销（`grow`：目标容量取 `max(所需, min(2×当前容量, 上限))`，再 `try_reserve_exact`），整次会话只搬移画布 O(log n) 次（实测 1323×36000 的会话里 390 次追加只搬移 6 次、共 35.7 MB）；内存不足时同样返回 `Full`、画布保持原样，而不是让 `Vec::resize` 终止进程。注意 `grow` 的 `limit` 只约束**倍增的选择**，真正拦住越界的是 `place` 在增长之前做的 `rows + growth > max_rows` 检查。向上增长用 `copy_within` 原地平移已有行——这是本结构固有的代价，也是"追加越晚越慢"的真正来源（实测末段每次约 0.3 ms，而首段因倍增重分配达 1.8 ms）。
 
 ### 3.3 线程与消息
 
@@ -140,6 +140,7 @@ crates/snapclip-capture/src/windows/
   - 面板位于右侧且底部对齐、随内容增长、空间不足时翻到左侧、随 DPI 缩放；
   - 缩略图槽满幅（等于卡片本身的上、左、右边缘），尺寸浮标始终落在槽内；
   - 两个按钮依序铺满状态行宽度，命中测试正确；阴影不触及选区。
+- **发布路径**：预览缓冲在覆盖层与捕获线程之间往返复用（`the_preview_buffer_survives_the_round_trip_to_the_overlay`：`take_report` 拿到的缓冲 `recycle_preview` 交回后，用它与用新分配收集出的 `Preview` 逐字段相等，且跨帧长大时不会漏填或留旧字节）。
 - **边框**：普通截图与滚动截图的边框都画在选区边缘内侧（GPU 像素测试）；滚动时选区内部与边框、面板以外全透明，没有手柄。
 - **覆盖层**：窗口区域不覆盖选区内部（边框带以内），边框带四周封闭。
 - **自动滚动**：只有 `ERROR_ACCESS_DENIED` 被视为拒绝；拒绝后自动关闭并进入 Refused，重新开启后清除；目标窗口变化时记录；目标的类名取自真实窗口。**等待闭环**：一帧显示位移即结束当前 notch；未到期无位移时仍在等待；到期区分"重绘但没位移"与"没有新帧"；重绘会顺延窗口（慢页面不会被旧期限判死）；连续 `AUTO_IDLE_NOTCHES` 次未响应才停止，任何一次位移都清零（`a_notch_ends_the_instant_a_frame_shows_it`、`a_notch_that_times_out_reports_what_the_page_did`、`a_page_that_keeps_repainting_gets_to_finish_the_scroll_it_started`、`auto_gives_up_only_after_a_run_of_idle_notches`、`the_closed_loop_sets_the_cadence_from_the_page`——最后一条用虚拟时间走一遍闭环，把节奏交给页面：一帧应答的页面仍是 `AUTO_INTERVAL` 一击，一个窗口才应答的页面按窗口计，每 5 s 才出一帧的页面十击后放弃）。
@@ -147,6 +148,8 @@ crates/snapclip-capture/src/windows/
 - **性能证据**（`--ignored`）：
   - `the_cost_of_one_estimate_at_the_field_selection_size`：1241×821 下单次估计的耗时（实测 991 µs）；
   - `the_overlay_thread_never_blocks_longer_than_eight_ms`：一次缩略图上传加整帧合成的耗时，上限 8 ms；
+  - `the_cost_of_publishing_a_thumbnail`：一帧发布里缩略图那一半的耗时，按 `CreateBitmap` 上传与缓冲收集（新分配 / 复用）拆开；
+  - `the_canvas_moves_a_logarithmic_number_of_times_at_the_field_size`：1323 宽、36000 行的会话里画布实际搬移几次、共搬多少字节；
   - `the_cost_of_one_frame_at_the_field_size`：2148×1344 一帧的 CPU 成本，按签名 / 估计 / 拼接 / 缩略图 / 预览拆开；
   - `the_cost_of_one_region_readback_at_the_field_selection_size`：2148×1344 区域从 3840×2160 帧回读的耗时，按 staging 创建 / 复用纹理的阻塞 Map / 主机行拷贝 / `DO_NOT_WAIT` 轮询拆开。
 
@@ -158,8 +161,11 @@ crates/snapclip-capture/src/windows/
   | 签名 `FrameSig::of` | 1221 µs | 1417 µs | 8 条带 × 1344 行，O(W·H)，已接近内存带宽 |
   | 估计 `estimate` | 324 µs | 420 µs | 每帧重建 2 个 `HashMap` |
   | 拼接 `place` | < 100 µs | | 0.83 MB 一次 memcpy，`Instant` 分辨不出 |
-  | 缩略图 + 预览 | 19 µs | 29 µs | |
+  | 缩略图 + 预览 | 19 µs | 29 µs | 已改为复用缓冲，见下 |
   | 一帧 CPU 合计 `push` | 2383 µs | 4368 µs | 峰值 38 ms 是画布倍增重分配，全会话仅 O(log n) 次 |
+  **发布那一半的成本（`the_cost_of_publishing_a_thumbnail`，1500×900 选区、120 DPI、200×789 = 616 KiB 缩略图，200 次，release）**：`CreateBitmap` 上传 p50 117 µs（p95 285 µs）；把窗口收进缓冲新分配 p50 94 µs，复用调用方缓冲 p50 **9 µs**（约 10 倍）。616 KiB 超过 mmap 阈值，所以那一份"分配"其实是每帧一次内核往返；`fill_preview` 接受调用方给的缓冲、`ScrollWorker::recycle_preview` 在覆盖层上传完成后把它交回，收集成本因此掉到个位数微秒。上传这一半留下的 117 µs 没有可复用的对象（每帧都要一个新位图），故保留。
+
+  **画布搬移的实测（`the_canvas_moves_a_logarithmic_number_of_times_at_the_field_size`）**：1323 宽、36000 行的会话里 390 次追加只搬移 6 次、合计 35.7 MB。所以现场日志里"追加越晚越慢"不是重分配，而是向上滚动时（`place` 的 prepend 分支）按构造要 `copy_within` 平移整个画布——这是该数据结构的固有代价，不是可以靠预留容量消掉的。
 
   上表是合成探针（同一块空闲 GPU，只跑捕获线程）。**真机不是这个数**：一次自动滚动会话 870 帧、选区 1577×858、长图 1577×7664，收尾聚合行读数为
 
