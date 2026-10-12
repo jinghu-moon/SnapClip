@@ -135,9 +135,9 @@ impl AnnotationItem {
             AnnotationGeometry::Rect { bounds } | AnnotationGeometry::Ellipse { bounds } => {
                 bounds.inflate(pad)
             }
-            AnnotationGeometry::Line { start, end }
-            | AnnotationGeometry::Arrow { start, end } => {
-                Rect::from_corners(*start, *end).inflate(pad + self.style.arrow_head_size.ceil() as i32)
+            AnnotationGeometry::Line { start, end } | AnnotationGeometry::Arrow { start, end } => {
+                Rect::from_corners(*start, *end)
+                    .inflate(pad + self.style.arrow_head_size.ceil() as i32)
             }
             AnnotationGeometry::Text { position, content } => {
                 // Rough estimate; real width comes from DirectMeasure at draw time.
@@ -145,8 +145,7 @@ impl AnnotationItem {
                 let approx_h = self.style.font_size as i32 * 2;
                 Rect::from_origin_size(*position, approx_w.max(10), approx_h).inflate(pad)
             }
-            AnnotationGeometry::Freehand { points }
-            | AnnotationGeometry::Highlight { points } => {
+            AnnotationGeometry::Freehand { points } | AnnotationGeometry::Highlight { points } => {
                 if points.is_empty() {
                     return Rect::from_origin_size(Point::new(0, 0), 1, 1);
                 }
@@ -154,7 +153,11 @@ impl AnnotationItem {
                 for p in &points[1..] {
                     r = r.union(Rect::from_origin_size(*p, 1, 1));
                 }
-                let extra = if matches!(self.kind, AnnotationKind::Highlight) { 16 } else { 0 };
+                let extra = if matches!(self.kind, AnnotationKind::Highlight) {
+                    16
+                } else {
+                    0
+                };
                 r.inflate(pad + extra)
             }
         }
@@ -163,25 +166,20 @@ impl AnnotationItem {
     /// Whether `point` is within this item's interactive region.
     pub fn hit_test(&self, point: Point) -> bool {
         match &self.geometry {
-            AnnotationGeometry::Rect { bounds } => {
-                bounds.inflate(5).contains(point)
-            }
-            AnnotationGeometry::Ellipse { bounds } => {
-                bounds.inflate(5).contains(point)
-            }
-            AnnotationGeometry::Line { start, end }
-            | AnnotationGeometry::Arrow { start, end } => {
+            AnnotationGeometry::Rect { bounds } => bounds.inflate(5).contains(point),
+            AnnotationGeometry::Ellipse { bounds } => bounds.inflate(5).contains(point),
+            AnnotationGeometry::Line { start, end } | AnnotationGeometry::Arrow { start, end } => {
                 let thr = (self.style.stroke_width / 2.0 + 5.0) as f64;
                 dist_point_to_segment(point, *start, *end) <= thr
             }
             AnnotationGeometry::Text { position, .. } => {
-                self.bounds().contains(point)
-                    || Point::new(position.x, position.y) == point
+                self.bounds().contains(point) || Point::new(position.x, position.y) == point
             }
-            AnnotationGeometry::Freehand { points }
-            | AnnotationGeometry::Highlight { points } => {
+            AnnotationGeometry::Freehand { points } | AnnotationGeometry::Highlight { points } => {
                 let thr = (self.style.stroke_width / 2.0 + 5.0) as f64;
-                points.windows(2).any(|w| dist_point_to_segment(point, w[0], w[1]) <= thr)
+                points
+                    .windows(2)
+                    .any(|w| dist_point_to_segment(point, w[0], w[1]) <= thr)
             }
         }
     }
@@ -193,10 +191,22 @@ impl AnnotationItem {
     pub fn handle_at(&self, point: Point, tol: i32) -> Option<AnnotationHandle> {
         let candidates: Vec<(AnnotationHandle, Point)> = match &self.geometry {
             AnnotationGeometry::Rect { bounds } | AnnotationGeometry::Ellipse { bounds } => vec![
-                (AnnotationHandle::Corner(0), Point::new(bounds.left, bounds.top)),
-                (AnnotationHandle::Corner(1), Point::new(bounds.right, bounds.top)),
-                (AnnotationHandle::Corner(2), Point::new(bounds.left, bounds.bottom)),
-                (AnnotationHandle::Corner(3), Point::new(bounds.right, bounds.bottom)),
+                (
+                    AnnotationHandle::Corner(0),
+                    Point::new(bounds.left, bounds.top),
+                ),
+                (
+                    AnnotationHandle::Corner(1),
+                    Point::new(bounds.right, bounds.top),
+                ),
+                (
+                    AnnotationHandle::Corner(2),
+                    Point::new(bounds.left, bounds.bottom),
+                ),
+                (
+                    AnnotationHandle::Corner(3),
+                    Point::new(bounds.right, bounds.bottom),
+                ),
             ],
             AnnotationGeometry::Line { start, end } | AnnotationGeometry::Arrow { start, end } => {
                 vec![
@@ -216,7 +226,10 @@ impl AnnotationItem {
     /// the caller commits a snapshot at resize-end via [`commit_drag`]).
     pub fn resize(&mut self, handle: AnnotationHandle, to: Point) {
         match (&mut self.geometry, handle) {
-            (AnnotationGeometry::Rect { bounds } | AnnotationGeometry::Ellipse { bounds }, AnnotationHandle::Corner(c)) => {
+            (
+                AnnotationGeometry::Rect { bounds } | AnnotationGeometry::Ellipse { bounds },
+                AnnotationHandle::Corner(c),
+            ) => {
                 let opposite = match c {
                     0 => Point::new(bounds.right, bounds.bottom),
                     1 => Point::new(bounds.left, bounds.bottom),
@@ -225,7 +238,10 @@ impl AnnotationItem {
                 };
                 *bounds = Rect::from_corners(to, opposite);
             }
-            (AnnotationGeometry::Line { start, end } | AnnotationGeometry::Arrow { start, end }, AnnotationHandle::Endpoint(e)) => {
+            (
+                AnnotationGeometry::Line { start, end } | AnnotationGeometry::Arrow { start, end },
+                AnnotationHandle::Endpoint(e),
+            ) => {
                 if e == 0 {
                     *start = to;
                 } else {
@@ -299,7 +315,8 @@ impl AnnotationDocument {
     }
 
     pub fn selected(&self) -> Option<&AnnotationItem> {
-        self.selected_id.and_then(|id| self.items.iter().find(|i| i.id == id))
+        self.selected_id
+            .and_then(|id| self.items.iter().find(|i| i.id == id))
     }
 
     pub fn selected_id(&self) -> Option<AnnotationId> {
@@ -424,7 +441,9 @@ impl AnnotationDocument {
     /// Duplicate the selected item (offset by 10 px) and select the copy.
     pub fn duplicate_selected(&mut self) {
         let Some(id) = self.selected_id else { return };
-        let Some(src) = self.items.iter().find(|i| i.id == id).cloned() else { return };
+        let Some(src) = self.items.iter().find(|i| i.id == id).cloned() else {
+            return;
+        };
         self.push_undo();
         let new_id = self.alloc_id();
         let mut copy = src;
@@ -459,7 +478,9 @@ impl AnnotationDocument {
     /// toolbar can stay enabled without polluting history.
     pub fn bring_forward(&mut self) {
         let Some(id) = self.selected_id else { return };
-        let Some(pos) = self.items.iter().position(|i| i.id == id) else { return };
+        let Some(pos) = self.items.iter().position(|i| i.id == id) else {
+            return;
+        };
         if pos + 1 >= self.items.len() {
             return;
         }
@@ -471,7 +492,9 @@ impl AnnotationDocument {
     /// is selected or the item is already at the bottom.
     pub fn send_backward(&mut self) {
         let Some(id) = self.selected_id else { return };
-        let Some(pos) = self.items.iter().position(|i| i.id == id) else { return };
+        let Some(pos) = self.items.iter().position(|i| i.id == id) else {
+            return;
+        };
         if pos == 0 {
             return;
         }
@@ -516,7 +539,11 @@ impl AnnotationDocument {
     /// Hit-test from top of the stack to bottom (reverse list order); returns the id
     /// of the first hit.
     pub fn hit_test(&self, point: Point) -> Option<AnnotationId> {
-        self.items.iter().rev().find(|i| i.hit_test(point)).map(|i| i.id)
+        self.items
+            .iter()
+            .rev()
+            .find(|i| i.hit_test(point))
+            .map(|i| i.id)
     }
 
     // ── Draft (in-progress creation) ──────────────────────────────────────────
@@ -641,16 +668,14 @@ fn translate_geometry(g: &mut AnnotationGeometry, dx: i32, dy: i32) {
         AnnotationGeometry::Rect { bounds } | AnnotationGeometry::Ellipse { bounds } => {
             *bounds = bounds.translate(delta);
         }
-        AnnotationGeometry::Line { start, end }
-        | AnnotationGeometry::Arrow { start, end } => {
+        AnnotationGeometry::Line { start, end } | AnnotationGeometry::Arrow { start, end } => {
             *start = Point::new(start.x + dx, start.y + dy);
             *end = Point::new(end.x + dx, end.y + dy);
         }
         AnnotationGeometry::Text { position, .. } => {
             *position = Point::new(position.x + dx, position.y + dy);
         }
-        AnnotationGeometry::Freehand { points }
-        | AnnotationGeometry::Highlight { points } => {
+        AnnotationGeometry::Freehand { points } | AnnotationGeometry::Highlight { points } => {
             for p in points.iter_mut() {
                 *p = Point::new(p.x + dx, p.y + dy);
             }
@@ -885,18 +910,19 @@ mod tests {
         doc.set_style(id, new_style.clone());
         assert!(doc.undo());
         // After undo, original style restored
-        assert_eq!(doc.items()[0].style.stroke_color, AnnotationStyle::default().stroke_color);
+        assert_eq!(
+            doc.items()[0].style.stroke_color,
+            AnnotationStyle::default().stroke_color
+        );
     }
 
     #[test]
     fn dist_to_horizontal_segment_correct() {
-        assert!((dist_point_to_segment(
-            Point::new(5, 3),
-            Point::new(0, 0),
-            Point::new(10, 0),
-        ) - 3.0)
-            .abs()
-            < f64::EPSILON);
+        assert!(
+            (dist_point_to_segment(Point::new(5, 3), Point::new(0, 0), Point::new(10, 0),) - 3.0)
+                .abs()
+                < f64::EPSILON
+        );
     }
 
     #[test]
@@ -929,7 +955,9 @@ mod tests {
         // One undo step restores the pre-resize bounds.
         assert!(doc.undo());
         match &doc.items()[0].geometry {
-            AnnotationGeometry::Rect { bounds } => assert_eq!(*bounds, Rect::new(100, 100, 200, 200)),
+            AnnotationGeometry::Rect { bounds } => {
+                assert_eq!(*bounds, Rect::new(100, 100, 200, 200))
+            }
             _ => unreachable!(),
         }
     }
@@ -1005,7 +1033,11 @@ mod tests {
         let order = |doc: &AnnotationDocument| -> Vec<AnnotationId> {
             doc.items().iter().map(|i| i.id).collect()
         };
-        assert_eq!(order(&doc)[0], a, "a was created first, so it is at the bottom");
+        assert_eq!(
+            order(&doc)[0],
+            a,
+            "a was created first, so it is at the bottom"
+        );
 
         doc.select(Some(a));
         doc.bring_to_front();
@@ -1037,16 +1069,35 @@ mod tests {
 
         doc.select(Some(a));
         doc.apply_style(|s| s.stroke_color = red);
-        assert_eq!(doc.items()[0].style.stroke_color, red, "selected item changed");
-        assert_eq!(doc.items()[1].style.stroke_color, default_stroke, "other item untouched");
+        assert_eq!(
+            doc.items()[0].style.stroke_color,
+            red,
+            "selected item changed"
+        );
+        assert_eq!(
+            doc.items()[1].style.stroke_color,
+            default_stroke,
+            "other item untouched"
+        );
         assert!(doc.undo(), "the selection edit is one undo step");
-        assert_eq!(doc.items()[0].style.stroke_color, default_stroke, "undo restored a");
+        assert_eq!(
+            doc.items()[0].style.stroke_color,
+            default_stroke,
+            "undo restored a"
+        );
 
         doc.select(None);
         let undo_before = doc.undo.len();
         doc.apply_style(|s| s.stroke_width = 9.0);
-        assert_eq!(doc.default_style.stroke_width, 9.0, "no selection → default style");
-        assert_eq!(doc.undo.len(), undo_before, "editing the default is not a document edit");
+        assert_eq!(
+            doc.default_style.stroke_width, 9.0,
+            "no selection → default style"
+        );
+        assert_eq!(
+            doc.undo.len(),
+            undo_before,
+            "editing the default is not a document edit"
+        );
     }
 
     fn rect(x: i32, y: i32, w: i32, h: i32) -> AnnotationGeometry {
@@ -1117,7 +1168,11 @@ mod tests {
         let undo_len = doc.undo.len();
         doc.execute(AnnotationCommand::Tool(AnnotationKind::Arrow));
         doc.execute(AnnotationCommand::SelectTool);
-        assert_eq!(doc.undo.len(), undo_len, "tool selection is not a document edit");
+        assert_eq!(
+            doc.undo.len(),
+            undo_len,
+            "tool selection is not a document edit"
+        );
     }
 
     /// The annotation data leaves are serializable so the document can be handed to

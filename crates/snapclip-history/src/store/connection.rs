@@ -2,7 +2,6 @@
 
 use super::*;
 
-
 pub(super) fn open_writer(path: &Path) -> Result<Connection, StoreError> {
     let connection = Connection::open(path)?;
     connection.busy_timeout(std::time::Duration::from_secs(2))?;

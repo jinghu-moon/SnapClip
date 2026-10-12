@@ -189,7 +189,11 @@ mod tests {
             .iter()
             .map(|(hwnd, z_order, bounds)| candidate(*hwnd, *z_order, *bounds, epoch))
             .collect();
-        WindowSnapshot::new(epoch, candidates, MonitorCache::from_bounds([rect(0, 0, 3840, 2160)]))
+        WindowSnapshot::new(
+            epoch,
+            candidates,
+            MonitorCache::from_bounds([rect(0, 0, 3840, 2160)]),
+        )
     }
 
     #[test]
@@ -226,15 +230,16 @@ mod tests {
         assert_eq!(rect_distance_squared(shared_edge, left), 0);
         assert_eq!(rect_distance_squared(shared_edge, right), 0);
 
-        let snapshot = snapshot(&[
-            (0xA, 0, left),
-            (0xB, 1, right),
-        ]);
+        let snapshot = snapshot(&[(0xA, 0, left), (0xB, 1, right)]);
         // hit_test follows containment...
         assert_eq!(snapshot.hit_test(shared_edge).unwrap().identity().hwnd, 0xB);
         // ...and nearest_target agrees even though 0xA is frontmost.
         assert_eq!(
-            snapshot.nearest_target(shared_edge, 24).unwrap().identity().hwnd,
+            snapshot
+                .nearest_target(shared_edge, 24)
+                .unwrap()
+                .identity()
+                .hwnd,
             0xB
         );
     }
@@ -247,9 +252,23 @@ mod tests {
             (0xC, 2, rect(200, 200, 300, 300)),
         ]);
         // All three overlap this point: the frontmost (lowest z_order) wins.
-        assert_eq!(snapshot.hit_test(Point::new(250, 250)).unwrap().identity().hwnd, 0xA);
+        assert_eq!(
+            snapshot
+                .hit_test(Point::new(250, 250))
+                .unwrap()
+                .identity()
+                .hwnd,
+            0xA
+        );
         // Outside the frontmost, inside the second.
-        assert_eq!(snapshot.hit_test(Point::new(150, 150)).unwrap().identity().hwnd, 0xA);
+        assert_eq!(
+            snapshot
+                .hit_test(Point::new(150, 150))
+                .unwrap()
+                .identity()
+                .hwnd,
+            0xA
+        );
         // Outside every window.
         assert_eq!(snapshot.hit_test(Point::new(900, 900)), None);
     }
@@ -261,10 +280,27 @@ mod tests {
             (0xB, 1, rect(100, 0, 200, 100)),
         ]);
         // Left/top edge belongs to the window...
-        assert_eq!(snapshot.hit_test(Point::new(0, 0)).unwrap().identity().hwnd, 0xA);
+        assert_eq!(
+            snapshot.hit_test(Point::new(0, 0)).unwrap().identity().hwnd,
+            0xA
+        );
         // ...right/bottom edge belongs to the neighbour.
-        assert_eq!(snapshot.hit_test(Point::new(100, 50)).unwrap().identity().hwnd, 0xB);
-        assert_eq!(snapshot.hit_test(Point::new(99, 50)).unwrap().identity().hwnd, 0xA);
+        assert_eq!(
+            snapshot
+                .hit_test(Point::new(100, 50))
+                .unwrap()
+                .identity()
+                .hwnd,
+            0xB
+        );
+        assert_eq!(
+            snapshot
+                .hit_test(Point::new(99, 50))
+                .unwrap()
+                .identity()
+                .hwnd,
+            0xA
+        );
         // Past the last window there is nothing.
         assert_eq!(snapshot.hit_test(Point::new(200, 50)), None);
     }
@@ -291,7 +327,11 @@ mod tests {
         // One pixel beyond: excluded.
         assert!(snapshot.nearest_target(Point::new(125, 50), 24).is_none());
         // Nothing nearby at all.
-        assert!(snapshot.nearest_target(Point::new(2000, 2000), 24).is_none());
+        assert!(
+            snapshot
+                .nearest_target(Point::new(2000, 2000), 24)
+                .is_none()
+        );
     }
 
     #[test]
@@ -315,9 +355,23 @@ mod tests {
             (0xB, 1, rect(100, 100, 300, 300)),
         ]);
         // Both contain (150,150); distance 0 each, so Z order decides.
-        assert_eq!(snapshot.nearest_target(Point::new(150, 150), 24).unwrap().identity().hwnd, 0xA);
+        assert_eq!(
+            snapshot
+                .nearest_target(Point::new(150, 150), 24)
+                .unwrap()
+                .identity()
+                .hwnd,
+            0xA
+        );
         // Only the second contains (250,250).
-        assert_eq!(snapshot.nearest_target(Point::new(250, 250), 24).unwrap().identity().hwnd, 0xB);
+        assert_eq!(
+            snapshot
+                .nearest_target(Point::new(250, 250), 24)
+                .unwrap()
+                .identity()
+                .hwnd,
+            0xB
+        );
     }
 
     #[test]
@@ -331,12 +385,23 @@ mod tests {
         // their nominal span resolves to nothing at all.
         assert_eq!(snapshot.hit_test(Point::new(50, 60)), None);
         assert_eq!(snapshot.hit_test(Point::new(200, 200)), None);
-        assert_eq!(snapshot.hit_test(Point::new(350, 350)).unwrap().identity().hwnd, 0xC);
+        assert_eq!(
+            snapshot
+                .hit_test(Point::new(350, 350))
+                .unwrap()
+                .identity()
+                .hwnd,
+            0xC
+        );
         // And they never win a snap even though the point sits inside their nominal
         // bounds: an unusable rectangle is skipped before any distance is computed.
         assert_eq!(snapshot.nearest_target(Point::new(50, 60), 64), None);
         assert_eq!(
-            snapshot.nearest_target(Point::new(295, 300), 8).unwrap().identity().hwnd,
+            snapshot
+                .nearest_target(Point::new(295, 300), 8)
+                .unwrap()
+                .identity()
+                .hwnd,
             0xC
         );
     }
@@ -365,8 +430,18 @@ mod tests {
             ],
             MonitorCache::empty(),
         );
-        assert_eq!(mixed.hit_test(Point::new(50, 50)).unwrap().identity().hwnd, 0x02);
-        assert_eq!(mixed.nearest_target(Point::new(50, 50), 24).unwrap().identity().hwnd, 0x02);
+        assert_eq!(
+            mixed.hit_test(Point::new(50, 50)).unwrap().identity().hwnd,
+            0x02
+        );
+        assert_eq!(
+            mixed
+                .nearest_target(Point::new(50, 50), 24)
+                .unwrap()
+                .identity()
+                .hwnd,
+            0x02
+        );
     }
 
     #[test]
@@ -383,7 +458,14 @@ mod tests {
             new_bounds: rect(500, 400, 600, 500),
         };
         assert!(snapshot.apply_candidate_update(&moved));
-        assert_eq!(snapshot.hit_test(Point::new(550, 450)).unwrap().identity().hwnd, 0xA);
+        assert_eq!(
+            snapshot
+                .hit_test(Point::new(550, 450))
+                .unwrap()
+                .identity()
+                .hwnd,
+            0xA
+        );
         assert_eq!(
             snapshot.hit_test(Point::new(50, 50)),
             None,
@@ -410,23 +492,29 @@ mod tests {
         let identity = snapshot.candidates()[0].identity;
 
         // Wrong epoch.
-        assert!(!snapshot.apply_candidate_update(&HoverValidity::BoundsChanged {
-            epoch: epoch + 1,
-            identity,
-            new_bounds: rect(1, 1, 2, 2),
-        }));
+        assert!(
+            !snapshot.apply_candidate_update(&HoverValidity::BoundsChanged {
+                epoch: epoch + 1,
+                identity,
+                new_bounds: rect(1, 1, 2, 2),
+            })
+        );
         // Correct epoch, recycled handle (different pid/class hash).
-        assert!(!snapshot.apply_candidate_update(&HoverValidity::BoundsChanged {
-            epoch,
-            identity: WindowIdentity::new(identity.hwnd, identity.process_id + 1, 7),
-            new_bounds: rect(1, 1, 2, 2),
-        }));
+        assert!(
+            !snapshot.apply_candidate_update(&HoverValidity::BoundsChanged {
+                epoch,
+                identity: WindowIdentity::new(identity.hwnd, identity.process_id + 1, 7),
+                new_bounds: rect(1, 1, 2, 2),
+            })
+        );
         // Correct epoch, unknown window.
-        assert!(!snapshot.apply_candidate_update(&HoverValidity::BoundsChanged {
-            epoch,
-            identity: WindowIdentity::new(0x999, 1, 2),
-            new_bounds: rect(1, 1, 2, 2),
-        }));
+        assert!(
+            !snapshot.apply_candidate_update(&HoverValidity::BoundsChanged {
+                epoch,
+                identity: WindowIdentity::new(0x999, 1, 2),
+                new_bounds: rect(1, 1, 2, 2),
+            })
+        );
         // Nothing moved.
         assert_eq!(snapshot.candidates()[0].screen_bounds, rect(0, 0, 100, 100));
     }
@@ -486,7 +574,13 @@ mod tests {
 
     #[test]
     fn point_distance_squared_matches_the_pythagorean_value() {
-        assert_eq!(point_distance_squared(Point::new(0, 0), Point::new(3, 4)), 25);
-        assert_eq!(point_distance_squared(Point::new(-1, -1), Point::new(-1, -1)), 0);
+        assert_eq!(
+            point_distance_squared(Point::new(0, 0), Point::new(3, 4)),
+            25
+        );
+        assert_eq!(
+            point_distance_squared(Point::new(-1, -1), Point::new(-1, -1)),
+            0
+        );
     }
 }

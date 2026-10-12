@@ -467,9 +467,9 @@ impl OverlayController {
             self.pending_downgrade = None;
         }
         let epoch = self.snapshot.epoch();
-        let actions = self
-            .refine
-            .on_cursor_moved(epoch, target.map(|target| target.identity()), screen);
+        let actions =
+            self.refine
+                .on_cursor_moved(epoch, target.map(|target| target.identity()), screen);
         if actions.invalidate_in_flight {
             // The cursor moved away from the question that query was asked: the answer coming
             // back is stale and will be dropped, so this is a retirement like any other.
@@ -583,10 +583,18 @@ impl OverlayController {
                         value.top,
                         value.right,
                         value.bottom,
-                        self.preview_target.map(|target| target.left).unwrap_or_default(),
-                        self.preview_target.map(|target| target.top).unwrap_or_default(),
-                        self.preview_target.map(|target| target.right).unwrap_or_default(),
-                        self.preview_target.map(|target| target.bottom).unwrap_or_default(),
+                        self.preview_target
+                            .map(|target| target.left)
+                            .unwrap_or_default(),
+                        self.preview_target
+                            .map(|target| target.top)
+                            .unwrap_or_default(),
+                        self.preview_target
+                            .map(|target| target.right)
+                            .unwrap_or_default(),
+                        self.preview_target
+                            .map(|target| target.bottom)
+                            .unwrap_or_default(),
                     ),
                     false,
                 );
@@ -652,9 +660,7 @@ impl OverlayController {
                     ),
                     false,
                 ),
-                None => self
-                    .metrics
-                    .log_line("auto-snap preview cleared", false),
+                None => self.metrics.log_line("auto-snap preview cleared", false),
             }
             self.sync_preview_rect();
             self.invalidate();
@@ -723,7 +729,7 @@ impl OverlayController {
                         self.deep_target = None;
                         self.disarm_refinement();
                         self.update_hover();
-    }
+                    }
                     Err(error) => {
                         eprintln!("[snapclip][capture] window snapshot failed: {error}");
                     }
@@ -801,8 +807,10 @@ impl OverlayController {
             }
             HoverValidity::Invalid => {
                 self.metrics.record_stale_target();
-                self.metrics
-                    .log_line(&format!("hover invalid hwnd={}", target.identity().hwnd), false);
+                self.metrics.log_line(
+                    &format!("hover invalid hwnd={}", target.identity().hwnd),
+                    false,
+                );
                 // Drop the highlight and the preview, then rebuild the snapshot. The
                 // re-hit happens when the fresh snapshot lands, so a re-entry point is
                 // never resolved against the snapshot that still lists the dead window.
@@ -929,7 +937,10 @@ impl OverlayController {
     pub(super) fn submit_refinement(&mut self, job: RefinementJob) {
         // The query needs the window frame; it comes from the same snapshot the hover came
         // from, so a window that vanished simply skips its query.
-        let Some(bounds) = self.snapshot.find(job.window).map(|candidate| candidate.screen_bounds)
+        let Some(bounds) = self
+            .snapshot
+            .find(job.window)
+            .map(|candidate| candidate.screen_bounds)
         else {
             // No query was issued for this position, so nothing is coming: end the wait here
             // instead of holding a rectangle for a deadline that has no answer behind it.
@@ -964,16 +975,13 @@ impl OverlayController {
 
     /// The result `WM_NCHITTEST` answers with at `point` (client pixels).
     ///
-    /// Two independent reasons to fall through, and they are not the same one: the refinement worker
-    /// needs it around a single accessibility query (docs/21 §5.7), while a scroll session needs it for
-    /// its **whole lifetime** — under `MOUSE_POS` wheel routing the system asks exactly this question to
-    /// decide who receives the wheel, so a fullscreen overlay that answers `HTCLIENT` keeps every notch
-    /// for itself and the page never moves (`docs/30` §13.4, `E-INPUT-1`). The panel is the exception:
-    /// `HTTRANSPARENT` there would make `停止` unclickable, which is why both consumers share one hit
-    /// test (`scroll_panel_owns`).
+    /// Two independent reasons to fall through: the refinement worker needs it around a single
+    /// accessibility query (docs/21 §5.7), and a scroll session needs it everywhere but on its panel
+    /// (`docs/33`) — the frame and the panel's shadow are only a picture, and a click on them belongs
+    /// to whatever is underneath.
     pub(super) fn nchittest_result(&self, point: Point) -> LRESULT {
-        if self.scroll_runtime.is_some() {
-            return if self.scroll_panel_owns(point) {
+        if let Some(run) = self.scroll.as_ref() {
+            return if run.layout.panel.contains(point) {
                 HTCLIENT as LRESULT
             } else {
                 HTTRANSPARENT as LRESULT
@@ -1020,7 +1028,8 @@ impl OverlayController {
                 // far the most likely reading of "the cursor passed through a parent
                 // container". Show it only once the next dwell reproduces it at the same
                 // point; anything else would expand the frame during a transit (docs/18 §13.3).
-                if classify_replacement(self.deep_target.as_ref(), &target) == Replacement::NeedsConfirmation
+                if classify_replacement(self.deep_target.as_ref(), &target)
+                    == Replacement::NeedsConfirmation
                 {
                     let cursor = self.cursor_screen();
                     let confirmed = match (&self.pending_downgrade, cursor) {
@@ -1104,15 +1113,18 @@ impl OverlayController {
         // monitor-local pixels: the two disagreeing is exactly the "probe resolves the element,
         // the app confirms the window" gap (docs/21 §8), and this line tells which side of that
         // gap a session fell on.
-        let deep_local = self.layout().zip(self.deep_target.as_ref()).map(|(layout, deep)| {
-            // What the walk selected, not necessarily what the refinement published (docs/21 §5.17).
-            window_rect_to_local(
-                self.selected_deep_level()
-                    .map(|level| level.rect)
-                    .unwrap_or(deep.screen_bounds),
-                &layout,
-            )
-        });
+        let deep_local = self
+            .layout()
+            .zip(self.deep_target.as_ref())
+            .map(|(layout, deep)| {
+                // What the walk selected, not necessarily what the refinement published (docs/21 §5.17).
+                window_rect_to_local(
+                    self.selected_deep_level()
+                        .map(|level| level.rect)
+                        .unwrap_or(deep.screen_bounds),
+                    &layout,
+                )
+            });
         self.metrics.log_line(
             &format!(
                 "confirm requested hwnd={} epoch={} confirmation={} preview_local={} \

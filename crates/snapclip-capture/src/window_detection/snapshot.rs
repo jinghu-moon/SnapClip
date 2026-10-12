@@ -206,8 +206,14 @@ mod tests {
 
     #[test]
     fn class_name_hash_is_stable_and_class_sensitive() {
-        assert_eq!(class_name_hash("Chrome_WidgetWin_1"), class_name_hash("Chrome_WidgetWin_1"));
-        assert_ne!(class_name_hash("Chrome_WidgetWin_1"), class_name_hash("Chrome_WidgetWin_2"));
+        assert_eq!(
+            class_name_hash("Chrome_WidgetWin_1"),
+            class_name_hash("Chrome_WidgetWin_1")
+        );
+        assert_ne!(
+            class_name_hash("Chrome_WidgetWin_1"),
+            class_name_hash("Chrome_WidgetWin_2")
+        );
         assert_ne!(class_name_hash(""), class_name_hash(" "));
     }
 
@@ -218,17 +224,31 @@ mod tests {
         exclusions.exclude_process(999);
 
         // Ordinary application window: kept.
-        assert!(passes_cheap_policy(&probe(0x20, "Chrome_WidgetWin_1"), &exclusions));
+        assert!(passes_cheap_policy(
+            &probe(0x20, "Chrome_WidgetWin_1"),
+            &exclusions
+        ));
         // The overlay itself.
-        assert!(!passes_cheap_policy(&probe(0x10, "Chrome_WidgetWin_1"), &exclusions));
+        assert!(!passes_cheap_policy(
+            &probe(0x10, "Chrome_WidgetWin_1"),
+            &exclusions
+        ));
         // A window owned by SnapClip's process that we never registered.
         assert!(!passes_cheap_policy(
             &CheapProbe::new(0x30, 999, "SomeToolbarClass", 0),
             &exclusions
         ));
         // Shell surfaces.
-        for class in ["Progman", "WorkerW", "Shell_TrayWnd", "XamlExplorerHostIslandWindow"] {
-            assert!(!passes_cheap_policy(&probe(0x40, class), &exclusions), "{class}");
+        for class in [
+            "Progman",
+            "WorkerW",
+            "Shell_TrayWnd",
+            "XamlExplorerHostIslandWindow",
+        ] {
+            assert!(
+                !passes_cheap_policy(&probe(0x40, class), &exclusions),
+                "{class}"
+            );
         }
     }
 
@@ -249,24 +269,39 @@ mod tests {
         let monitors = monitors();
         // Visible, on-monitor window.
         assert_eq!(
-            passes_dwm_policy(&DwmRead::new(0x10, false, Some(rect(100, 100, 400, 300))), &monitors),
+            passes_dwm_policy(
+                &DwmRead::new(0x10, false, Some(rect(100, 100, 400, 300))),
+                &monitors
+            ),
             Some(rect(100, 100, 400, 300))
         );
         // Cloaked: rejected even though the bounds are perfectly good.
         assert_eq!(
-            passes_dwm_policy(&DwmRead::new(0x11, true, Some(rect(100, 100, 400, 300))), &monitors),
+            passes_dwm_policy(
+                &DwmRead::new(0x11, true, Some(rect(100, 100, 400, 300))),
+                &monitors
+            ),
             None
         );
         // Both DWM and GetWindowRect failed.
-        assert_eq!(passes_dwm_policy(&DwmRead::new(0x12, false, None), &monitors), None);
+        assert_eq!(
+            passes_dwm_policy(&DwmRead::new(0x12, false, None), &monitors),
+            None
+        );
         // Entirely off every active display.
         assert_eq!(
-            passes_dwm_policy(&DwmRead::new(0x13, false, Some(rect(5000, 5000, 5100, 5100))), &monitors),
+            passes_dwm_policy(
+                &DwmRead::new(0x13, false, Some(rect(5000, 5000, 5100, 5100))),
+                &monitors
+            ),
             None
         );
         // Degenerate rectangle.
         assert_eq!(
-            passes_dwm_policy(&DwmRead::new(0x14, false, Some(rect(50, 50, 50, 90))), &monitors),
+            passes_dwm_policy(
+                &DwmRead::new(0x14, false, Some(rect(50, 50, 50, 90))),
+                &monitors
+            ),
             None
         );
     }
@@ -317,8 +352,16 @@ mod tests {
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0].z_order, 0, "frontmost first");
         assert_eq!(candidates[1].z_order, 1);
-        assert!(candidates.iter().all(|candidate| candidate.snapshot_epoch == epoch));
-        assert!(candidates.iter().all(|candidate| candidate.client_bounds.is_none()));
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.snapshot_epoch == epoch)
+        );
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.client_bounds.is_none())
+        );
     }
 
     #[test]
@@ -326,7 +369,10 @@ mod tests {
         let monitors = monitors();
         // Hangs off the left edge but is still partly on the display.
         let read = DwmRead::new(0x60, false, Some(rect(-500, 100, 200, 400)));
-        assert_eq!(passes_dwm_policy(&read, &monitors), Some(rect(-500, 100, 200, 400)));
+        assert_eq!(
+            passes_dwm_policy(&read, &monitors),
+            Some(rect(-500, 100, 200, 400))
+        );
         // Just past the right edge: the half-open rule makes this invisible.
         let read = DwmRead::new(0x61, false, Some(rect(3840, 100, 4000, 400)));
         assert_eq!(passes_dwm_policy(&read, &monitors), None);

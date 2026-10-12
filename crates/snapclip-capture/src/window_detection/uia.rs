@@ -235,30 +235,30 @@ pub fn level_kind_of_control_type(control_type: i32) -> LevelKind {
 /// listed, and everything else stays [`LevelKind::Unknown`].
 pub fn level_kind_of_msaa_role(role: i32) -> LevelKind {
     match role {
-        0x02 => LevelKind::Menu,        // ROLE_SYSTEM_MENUBAR
-        0x03 => LevelKind::ScrollBar,   // ROLE_SYSTEM_SCROLLBAR
-        0x0c => LevelKind::Menu,        // ROLE_SYSTEM_MENUITEM
-        0x0f => LevelKind::Document,    // ROLE_SYSTEM_DOCUMENT
-        0x10 => LevelKind::Pane,        // ROLE_SYSTEM_PANE
-        0x14 => LevelKind::Group,       // ROLE_SYSTEM_GROUPING
-        0x16 => LevelKind::ToolBar,     // ROLE_SYSTEM_TOOLBAR
-        0x18 => LevelKind::Table,       // ROLE_SYSTEM_TABLE
-        0x1d => LevelKind::DataItem,    // ROLE_SYSTEM_CELL
-        0x1e => LevelKind::Hyperlink,   // ROLE_SYSTEM_LINK
-        0x21 => LevelKind::List,        // ROLE_SYSTEM_LIST
-        0x22 => LevelKind::ListItem,    // ROLE_SYSTEM_LISTITEM
-        0x23 => LevelKind::Tree,        // ROLE_SYSTEM_OUTLINE
-        0x24 => LevelKind::Tree,        // ROLE_SYSTEM_OUTLINEITEM
-        0x25 => LevelKind::Tab,         // ROLE_SYSTEM_PAGETAB
-        0x28 => LevelKind::Image,       // ROLE_SYSTEM_GRAPHIC
-        0x29 => LevelKind::Text,        // ROLE_SYSTEM_STATICTEXT
-        0x2a => LevelKind::Text,        // ROLE_SYSTEM_TEXT
-        0x2b => LevelKind::Button,      // ROLE_SYSTEM_PUSHBUTTON
-        0x2c => LevelKind::CheckBox,    // ROLE_SYSTEM_CHECKBUTTON
-        0x2d => LevelKind::RadioButton, // ROLE_SYSTEM_RADIOBUTTON
+        0x02 => LevelKind::Menu,            // ROLE_SYSTEM_MENUBAR
+        0x03 => LevelKind::ScrollBar,       // ROLE_SYSTEM_SCROLLBAR
+        0x0c => LevelKind::Menu,            // ROLE_SYSTEM_MENUITEM
+        0x0f => LevelKind::Document,        // ROLE_SYSTEM_DOCUMENT
+        0x10 => LevelKind::Pane,            // ROLE_SYSTEM_PANE
+        0x14 => LevelKind::Group,           // ROLE_SYSTEM_GROUPING
+        0x16 => LevelKind::ToolBar,         // ROLE_SYSTEM_TOOLBAR
+        0x18 => LevelKind::Table,           // ROLE_SYSTEM_TABLE
+        0x1d => LevelKind::DataItem,        // ROLE_SYSTEM_CELL
+        0x1e => LevelKind::Hyperlink,       // ROLE_SYSTEM_LINK
+        0x21 => LevelKind::List,            // ROLE_SYSTEM_LIST
+        0x22 => LevelKind::ListItem,        // ROLE_SYSTEM_LISTITEM
+        0x23 => LevelKind::Tree,            // ROLE_SYSTEM_OUTLINE
+        0x24 => LevelKind::Tree,            // ROLE_SYSTEM_OUTLINEITEM
+        0x25 => LevelKind::Tab,             // ROLE_SYSTEM_PAGETAB
+        0x28 => LevelKind::Image,           // ROLE_SYSTEM_GRAPHIC
+        0x29 => LevelKind::Text,            // ROLE_SYSTEM_STATICTEXT
+        0x2a => LevelKind::Text,            // ROLE_SYSTEM_TEXT
+        0x2b => LevelKind::Button,          // ROLE_SYSTEM_PUSHBUTTON
+        0x2c => LevelKind::CheckBox,        // ROLE_SYSTEM_CHECKBUTTON
+        0x2d => LevelKind::RadioButton,     // ROLE_SYSTEM_RADIOBUTTON
         0x2e | 0x2f => LevelKind::ComboBox, // ROLE_SYSTEM_COMBOBOX / DROPLIST
-        0x30 => LevelKind::ProgressBar, // ROLE_SYSTEM_PROGRESSBAR
-        0x33 => LevelKind::Slider,      // ROLE_SYSTEM_SLIDER
+        0x30 => LevelKind::ProgressBar,     // ROLE_SYSTEM_PROGRESSBAR
+        0x33 => LevelKind::Slider,          // ROLE_SYSTEM_SLIDER
         _ => LevelKind::Unknown,
     }
 }
@@ -432,13 +432,7 @@ fn same_rect(left: Rect, right: Rect) -> bool {
 
 /// Smallest-first ordering; ties broken by position so the result is deterministic.
 fn rect_sort_key(rect: Rect) -> (i64, i32, i32, i32, i32) {
-    (
-        rect.area(),
-        rect.left,
-        rect.top,
-        rect.right,
-        rect.bottom,
-    )
+    (rect.area(), rect.left, rect.top, rect.right, rect.bottom)
 }
 
 /// Push `rect` onto `path` when it is a usable, not-already-present entry.
@@ -463,7 +457,11 @@ fn push_if_useful(path: &mut Vec<PathLevel>, level: PathLevel, point: Point) -> 
 /// The levels carry no kind: they are rectangles read off child **windows**, which say nothing about
 /// what is inside them. `Unknown` is what keeps the label from calling a Chromium widget host a
 /// `窗口` — the fallback is a geometric guess, and the words stay the generic ones.
-pub fn fallback_hit_path(child_rects: &[Rect], window_bounds: Rect, point: Point) -> Vec<PathLevel> {
+pub fn fallback_hit_path(
+    child_rects: &[Rect],
+    window_bounds: Rect,
+    point: Point,
+) -> Vec<PathLevel> {
     let mut containing: Vec<PathLevel> = child_rects
         .iter()
         .copied()
@@ -506,7 +504,8 @@ pub fn merge_hit_paths(
     if path.is_empty() {
         path.push(PathLevel::new(window_bounds, LevelKind::Window));
     }
-    if path.first().map(|first| first.rect) != Some(window_bounds) && window_bounds.contains(point) {
+    if path.first().map(|first| first.rect) != Some(window_bounds) && window_bounds.contains(point)
+    {
         path.insert(0, PathLevel::new(window_bounds, LevelKind::Window));
     }
 
@@ -549,7 +548,10 @@ mod tests {
     fn a_same_bounds_container_is_descent_worthy() {
         let window = rect(0, 0, 800, 600);
         let container = node(0, 0, 800, 600);
-        assert!(is_descendable(window, container), "same-bounds panes must be entered");
+        assert!(
+            is_descendable(window, container),
+            "same-bounds panes must be entered"
+        );
     }
 
     #[test]
@@ -560,17 +562,29 @@ mod tests {
         // Touching the edge only is not an overlap (half-open rectangles).
         assert!(!is_descendable(window, node(800, 0, 900, 100)));
         assert!(is_descendable(window, node(799, 0, 900, 100)));
-        assert!(!is_descendable(window, WalkNode::new(rect(10, 10, 20, 20), 0, true, true)));
+        assert!(!is_descendable(
+            window,
+            WalkNode::new(rect(10, 10, 20, 20), 0, true, true)
+        ));
     }
 
     #[test]
     fn only_same_bounds_panes_and_groups_are_structural_wrappers() {
         let parent = rect(0, 0, 800, 600);
         let typed = |bounds: Rect, control_type| WalkNode::new(bounds, control_type, false, true);
-        assert!(is_structural_wrapper(parent, typed(parent, PANE_CONTROL_TYPE)));
-        assert!(is_structural_wrapper(parent, typed(parent, GROUP_CONTROL_TYPE)));
+        assert!(is_structural_wrapper(
+            parent,
+            typed(parent, PANE_CONTROL_TYPE)
+        ));
+        assert!(is_structural_wrapper(
+            parent,
+            typed(parent, GROUP_CONTROL_TYPE)
+        ));
         // A container with a frame of its own is a real level, not a wrapper.
-        assert!(!is_structural_wrapper(parent, typed(rect(0, 40, 800, 600), PANE_CONTROL_TYPE)));
+        assert!(!is_structural_wrapper(
+            parent,
+            typed(rect(0, 40, 800, 600), PANE_CONTROL_TYPE)
+        ));
         // A real control keeps its precedence even when it fills the parent (50000 = Button).
         assert!(!is_structural_wrapper(parent, typed(parent, 50000)));
         // Unknown control types are not assumed to be structural.
@@ -708,12 +722,20 @@ mod tests {
     fn an_answer_that_covers_the_page_is_not_an_answer() {
         let window = rect(46, 20, 1834, 1234);
         // The page/web area: UIA's word for "I could not get below the document".
-        assert!(is_unspecific_hit(rect(48, 107, 1832, 1232), DOCUMENT_CONTROL_TYPE, window));
+        assert!(is_unspecific_hit(
+            rect(48, 107, 1832, 1232),
+            DOCUMENT_CONTROL_TYPE,
+            window
+        ));
         // A window-sized pane is the same statement in a different control type.
         assert!(is_unspecific_hit(rect(46, 20, 1834, 1234), 50033, window));
         // Anything meaningfully smaller is a real target, even if it is still a container.
         assert!(!is_unspecific_hit(rect(72, 211, 240, 267), 50000, window));
-        assert!(!is_unspecific_hit(rect(1412, 907, 1624, 1027), 50026, window));
+        assert!(!is_unspecific_hit(
+            rect(1412, 907, 1624, 1027),
+            50026,
+            window
+        ));
     }
 
     #[test]
@@ -760,7 +782,11 @@ mod tests {
         assert_eq!(budget.depth_left(), MAX_DEPTH - 1);
         budget.leave_children();
         budget.leave_children();
-        assert_eq!(budget.depth_left(), MAX_DEPTH, "depth is capped at the declared bound");
+        assert_eq!(
+            budget.depth_left(),
+            MAX_DEPTH,
+            "depth is capped at the declared bound"
+        );
     }
 
     #[test]
@@ -785,7 +811,10 @@ mod tests {
         let window = rect(0, 0, 1000, 800);
         let mut outcome = WalkOutcome::window_only(window, StopReason::Complete);
         // The frame's level carries the one kind a walk can state without asking anyone (§5.24 B6).
-        assert_eq!(outcome.path, vec![PathLevel::new(window, LevelKind::Window)]);
+        assert_eq!(
+            outcome.path,
+            vec![PathLevel::new(window, LevelKind::Window)]
+        );
         assert!(outcome.push(lvl(100, 100, 900, 700)));
         assert!(outcome.push(lvl(300, 300, 500, 500)));
         assert_eq!(outcome.target, rect(300, 300, 500, 500));
@@ -820,25 +849,30 @@ mod tests {
     fn the_fallback_path_collects_the_children_under_the_point_and_the_frame() {
         let window = rect(0, 0, 1000, 800);
         let children = [
-            rect(0, 0, 200, 800),   // navigation pane
+            rect(0, 0, 200, 800),      // navigation pane
             rect(200, 100, 1000, 700), // file list
-            rect(0, 800, 100, 900), // outside the window entirely
+            rect(0, 800, 100, 900),    // outside the window entirely
         ];
         let path = fallback_hit_path(&children, window, Point::new(600, 400));
-        assert!(path.iter().any(|level| level.rect == rect(200, 100, 1000, 700)));
+        assert!(
+            path.iter()
+                .any(|level| level.rect == rect(200, 100, 1000, 700))
+        );
         assert!(
             path.iter().any(|level| level.rect == window),
             "the frame closes the path"
         );
         assert!(
-            !path.iter().any(|level| level.rect == rect(0, 800, 100, 900)),
+            !path
+                .iter()
+                .any(|level| level.rect == rect(0, 800, 100, 900)),
             "off-window children stay out"
         );
         // A child *window* is a rectangle, not a kind: the fallback may only refine geometry, so its
         // levels publish as unknown and the label keeps its generic words (§5.24 B6).
         assert!(
-            path.iter().all(|level| level.kind == LevelKind::Unknown
-                || level.kind == LevelKind::Window)
+            path.iter()
+                .all(|level| level.kind == LevelKind::Unknown || level.kind == LevelKind::Window)
         );
         // A point on no child still yields the frame.
         let bare = fallback_hit_path(&children, window, Point::new(900, 750));
@@ -858,7 +892,11 @@ mod tests {
         // deeper, so it is appended and the published rectangle gets finer.
         let merged = merge_hit_paths(&[frame, pane, control], &[finer], window, point);
         assert_eq!(merged, vec![frame, pane, control, finer]);
-        assert_eq!(merged.last(), Some(&finer), "the deepest entry is published");
+        assert_eq!(
+            merged.last(),
+            Some(&finer),
+            "the deepest entry is published"
+        );
 
         // A *coarser* fallback rectangle must never replace the fine control — that was the
         // regression that made every publish the whole window.
@@ -880,12 +918,7 @@ mod tests {
         let point = Point::new(400, 350);
         let frame = PathLevel::new(window, LevelKind::Window);
         // Same rectangles from both sources, in different orders.
-        let merged = merge_hit_paths(
-            &[outer, inner],
-            &[deepest, inner, outer],
-            window,
-            point,
-        );
+        let merged = merge_hit_paths(&[outer, inner], &[deepest, inner, outer], window, point);
         let unique: Vec<PathLevel> = {
             let mut seen = Vec::new();
             for entry in &merged {
@@ -937,7 +970,10 @@ mod tests {
             merged,
             vec![PathLevel::new(window, LevelKind::Window), seed]
         );
-        assert_eq!(merged.last(), Some(&seed), "the sibling never becomes a level");
+        assert_eq!(
+            merged.last(),
+            Some(&seed),
+            "the sibling never becomes a level"
+        );
     }
-
 }

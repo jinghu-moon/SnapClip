@@ -152,7 +152,11 @@ mod tests {
         }
     }
 
-    fn prepared(frame: &CapturedFrame, selection: Rect, pixels: &dyn PixelSliceSource) -> SelectionPixels {
+    fn prepared(
+        frame: &CapturedFrame,
+        selection: Rect,
+        pixels: &dyn PixelSliceSource,
+    ) -> SelectionPixels {
         CaptureService::new()
             .prepare_selection(frame, selection, pixels)
             .unwrap()

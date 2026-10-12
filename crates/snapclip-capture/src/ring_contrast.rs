@@ -206,7 +206,11 @@ pub fn pair_contrast(page: Rgb, tone: Rgb, halo: f32, ring_alpha: f32) -> f32 {
 /// "a dark band over the user's content" when a tone alone can carry the ring, and among tones the
 /// caller's order is its preference (the shipped tone first unless told otherwise).
 pub fn ring_style_for(page: Rgb, ring_alpha: f32, tones: &[Rgb]) -> RingStyle {
-    let tones = if tones.is_empty() { &SHIPPED_TONES } else { tones };
+    let tones = if tones.is_empty() {
+        &SHIPPED_TONES
+    } else {
+        tones
+    };
     for halo in HALO_LADDER {
         for tone in tones {
             if pair_contrast(page, *tone, halo, ring_alpha) >= PAIR_THRESHOLD {
@@ -275,7 +279,11 @@ mod tests {
         // the printed value moves one channel by one.)
         let outer = outer_ring_background(grey(250));
         let pre_a2_outer = Rgb::new(140, 147, 157);
-        for (observed, expected) in [(outer.r, pre_a2_outer.r), (outer.g, pre_a2_outer.g), (outer.b, pre_a2_outer.b)] {
+        for (observed, expected) in [
+            (outer.r, pre_a2_outer.r),
+            (outer.g, pre_a2_outer.g),
+            (outer.b, pre_a2_outer.b),
+        ] {
             assert!(
                 observed.abs_diff(expected) <= 1,
                 "the outer ring's background is still the masked one: {outer:?}"
@@ -320,11 +328,21 @@ mod tests {
         // A white page is the case that shows it plainly: the masked page said 0.40, the raw frame
         // says 0.45, and at 0.40 the ring is short of the bar.
         assert_eq!(
-            ring_style_for(old_inner_background(grey(250), 0.0), FAINTEST, &SHIPPED_TONES).halo,
+            ring_style_for(
+                old_inner_background(grey(250), 0.0),
+                FAINTEST,
+                &SHIPPED_TONES
+            )
+            .halo,
             0.4
         );
         assert_eq!(
-            ring_style_for(inner_ring_background(grey(250), 0.0), FAINTEST, &SHIPPED_TONES).halo,
+            ring_style_for(
+                inner_ring_background(grey(250), 0.0),
+                FAINTEST,
+                &SHIPPED_TONES
+            )
+            .halo,
             0.6
         );
     }
@@ -471,7 +489,10 @@ mod tests {
             let inner = inner_ring_background(page, 0.0);
             println!(
                 "[ring-a4] {name:>14} {:>16} {:>16} {:>16} {:>16}",
-                format!("{:.2}:1", pair_contrast(inner, CHAIN_RING_RGB, 0.0, FAINTEST)),
+                format!(
+                    "{:.2}:1",
+                    pair_contrast(inner, CHAIN_RING_RGB, 0.0, FAINTEST)
+                ),
                 pick(inner, &SHIPPED_TONES),
                 pick(inner, &PROTOTYPE_TONES),
                 pick(inner_ring_background(page, 1.0), &SHIPPED_TONES)

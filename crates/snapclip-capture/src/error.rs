@@ -142,10 +142,7 @@ mod tests {
             CaptureError::HotkeyConflict("taken".into()).code(),
             ErrorCode::Conflict
         );
-        assert_eq!(
-            CaptureError::Unsupported.code(),
-            ErrorCode::Unsupported
-        );
+        assert_eq!(CaptureError::Unsupported.code(), ErrorCode::Unsupported);
         assert_eq!(CaptureError::Cancelled.code(), ErrorCode::Cancelled);
         assert_eq!(
             CaptureError::CaptureFailed("boom".into()).code(),

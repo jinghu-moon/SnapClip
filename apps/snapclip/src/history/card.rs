@@ -135,9 +135,7 @@ pub fn format_timestamp(
     if captured_year == now_year {
         return format!("{captured_month:02}-{captured_day:02} {hour:02}:{minute:02}");
     }
-    format!(
-        "{captured_year:04}-{captured_month:02}-{captured_day:02} {hour:02}:{minute:02}"
-    )
+    format!("{captured_year:04}-{captured_month:02}-{captured_day:02} {hour:02}:{minute:02}")
 }
 
 /// Civil date and clock time from a Unix millisecond stamp, in whatever zone it is given.
@@ -256,9 +254,6 @@ mod tests {
     fn the_civil_calendar_handles_a_known_leap_day() {
         // 2024-02-29 12:34 UTC — the case a naive month table gets wrong.
         let stamp = 1_709_210_040_000;
-        assert_eq!(
-            super::civil_from_unix_ms(stamp),
-            (2024, 2, 29, 12, 34)
-        );
+        assert_eq!(super::civil_from_unix_ms(stamp), (2024, 2, 29, 12, 34));
     }
 }

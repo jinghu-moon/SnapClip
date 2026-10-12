@@ -157,7 +157,11 @@ mod tests {
         assert!(matches!(outcome, TimedOutcome::TimedOut));
         // Admission control: the abandoned call still occupies its slot, so a second request
         // is refused instead of spawning another thread (this is what bounds the leak).
-        assert_eq!(runner.in_flight(), 1, "the abandoned call still holds its slot");
+        assert_eq!(
+            runner.in_flight(),
+            1,
+            "the abandoned call still holds its slot"
+        );
         assert!(matches!(
             runner.run(|| 2u32, Duration::from_millis(5)),
             TimedOutcome::Busy
@@ -180,8 +184,14 @@ mod tests {
         let runner = TimedCallRunner::new(2);
         assert_eq!(runner.max_in_flight(), 2);
         let blocked = Duration::from_millis(200);
-        let first = runner.run(move || std::thread::sleep(blocked), Duration::from_millis(10));
-        let second = runner.run(move || std::thread::sleep(blocked), Duration::from_millis(10));
+        let first = runner.run(
+            move || std::thread::sleep(blocked),
+            Duration::from_millis(10),
+        );
+        let second = runner.run(
+            move || std::thread::sleep(blocked),
+            Duration::from_millis(10),
+        );
         assert!(matches!(first, TimedOutcome::TimedOut));
         assert!(matches!(second, TimedOutcome::TimedOut));
         assert_eq!(runner.in_flight(), 2);

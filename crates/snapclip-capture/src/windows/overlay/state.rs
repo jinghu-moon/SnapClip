@@ -255,6 +255,66 @@ impl RingAppear {
     }
 }
 
+/// How long the shortcut guide takes to appear and to step aside.
+pub(crate) const GUIDE_FADE_IN_MS: u64 = 160;
+pub(crate) const GUIDE_FADE_OUT_MS: u64 = 120;
+/// The longest step one tick may take: a stalled tick must not make the fade jump.
+pub(crate) const GUIDE_FADE_MAX_STEP_MS: u64 = 64;
+
+/// The shortcut guide's opacity, eased toward shown or hidden on the render clock.
+///
+/// Linear in time, like the demo: the guide is a panel stepping out of the pointer's way, not an
+/// emphasis, so it needs no curve.
+#[derive(Debug, Default)]
+pub(crate) struct GuideFade {
+    pub(crate) alpha: f32,
+    /// The last tick that moved it; `None` while it rests at its goal.
+    pub(crate) at: Option<Instant>,
+}
+
+impl GuideFade {
+    /// Step toward `shown`; `true` when the painted value changed.
+    pub(crate) fn advance(&mut self, shown: bool, now: Instant) -> bool {
+        let goal = if shown { 1.0 } else { 0.0 };
+        if self.alpha == goal {
+            self.at = None;
+            return false;
+        }
+        // The first tick of a fade only starts its clock.
+        let dt = self
+            .at
+            .map_or(Duration::ZERO, |at| now.saturating_duration_since(at))
+            .min(Duration::from_millis(GUIDE_FADE_MAX_STEP_MS));
+        self.at = Some(now);
+        let span = if shown {
+            GUIDE_FADE_IN_MS
+        } else {
+            GUIDE_FADE_OUT_MS
+        };
+        let step = dt.as_secs_f32() * 1000.0 / span as f32;
+        let next = if shown {
+            (self.alpha + step).min(1.0)
+        } else {
+            (self.alpha - step).max(0.0)
+        };
+        if next == goal {
+            self.at = None;
+        }
+        let changed = next != self.alpha;
+        self.alpha = next;
+        changed
+    }
+
+    pub(crate) fn alpha(&self) -> f32 {
+        self.alpha
+    }
+
+    /// Whether a fade is under way, so the render tick has to keep itself armed.
+    pub(crate) fn running(&self) -> bool {
+        self.at.is_some()
+    }
+}
+
 /// A one-shot hint that has been armed and is waiting for its deadline (docs/21 §5.21).
 ///
 /// The **text is stored, not recomputed**: what gets painted has to be the sentence that was

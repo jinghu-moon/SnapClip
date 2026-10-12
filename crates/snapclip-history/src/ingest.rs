@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use snapclip_model::{PayloadData, PayloadKind, Publication, PublicationOrigin};
 
-use crate::store::{QueueDecision, Store};
 use crate::StoreError;
+use crate::store::{QueueDecision, Store};
 
 /// A clipboard change notification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,12 +53,9 @@ impl ClipboardSnapshot {
     }
 
     pub fn has_rich_text(&self) -> bool {
-        self.payloads.iter().any(|payload| {
-            matches!(
-                payload.payload.kind,
-                PayloadKind::Html | PayloadKind::Rtf
-            )
-        })
+        self.payloads
+            .iter()
+            .any(|payload| matches!(payload.payload.kind, PayloadKind::Html | PayloadKind::Rtf))
     }
 
     pub fn into_publication(
@@ -97,8 +94,11 @@ pub trait ClipboardStore: Send + Sync + 'static {
         payloads: Vec<PayloadData>,
     ) -> Result<(), StoreError>;
 
-    fn enqueue_ocr(&self, clip_id: String, content_hash: String)
-    -> Result<QueueDecision, StoreError>;
+    fn enqueue_ocr(
+        &self,
+        clip_id: String,
+        content_hash: String,
+    ) -> Result<QueueDecision, StoreError>;
 
     fn release_queued(&self, clip_id: String, attempt: u32) -> Result<bool, StoreError>;
 }
@@ -222,8 +222,12 @@ where
             None => (None, None),
         };
         let payloads = snapshot.payloads.clone();
-        let publication =
-            snapshot.into_publication(publication_id, captured_at_unix_ms, source_app, source_exe_path);
+        let publication = snapshot.into_publication(
+            publication_id,
+            captured_at_unix_ms,
+            source_app,
+            source_exe_path,
+        );
 
         if self
             .source
@@ -399,7 +403,10 @@ mod tests {
                 kind,
                 size_bytes: bytes.len() as u64,
                 mime_type: None,
-                image_dimensions: Some(ImageDimensions { width: 2, height: 2 }),
+                image_dimensions: Some(ImageDimensions {
+                    width: 2,
+                    height: 2,
+                }),
             },
             bytes.to_vec(),
         )
@@ -564,7 +571,10 @@ mod tests {
                     ..Default::default()
                 };
 
-                assert_eq!(service.handle(signal(7), &mut reader), IngestDecision::Saved);
+                assert_eq!(
+                    service.handle(signal(7), &mut reader),
+                    IngestDecision::Saved
+                );
                 assert_eq!(
                     service.handle(signal(7), &mut reader),
                     IngestDecision::Duplicate

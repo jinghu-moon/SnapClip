@@ -2,7 +2,6 @@
 
 use super::*;
 
-
 pub(super) fn read_payload_bytes(
     connection: &Connection,
     blob_store: &BlobStore,
@@ -25,7 +24,10 @@ pub(super) fn read_payload_bytes(
     blob_store.read(content_hash)
 }
 
-pub(super) fn sweep_orphans(connection: &Connection, blob_store: &BlobStore) -> Result<(), StoreError> {
+pub(super) fn sweep_orphans(
+    connection: &Connection,
+    blob_store: &BlobStore,
+) -> Result<(), StoreError> {
     let mut statement = connection.prepare("SELECT storage_path FROM payloads")?;
     let referenced = statement
         .query_map([], |row| row.get::<_, String>(0))?

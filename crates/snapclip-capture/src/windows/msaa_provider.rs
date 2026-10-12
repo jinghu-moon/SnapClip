@@ -15,7 +15,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use ::windows::Win32::Foundation::{HWND, VARIANT_BOOL};
-use ::windows::Win32::System::Variant::{VARIANT, VariantInit, VT_DISPATCH, VT_I4};
+use ::windows::Win32::System::Variant::{VARIANT, VT_DISPATCH, VT_I4, VariantInit};
 use ::windows::Win32::UI::Accessibility::{AccessibleObjectFromWindow, IAccessible};
 use ::windows::Win32::UI::WindowsAndMessaging::IsHungAppWindow;
 use ::windows::core::Interface;
@@ -107,10 +107,8 @@ impl MsaaDeepSelectionProvider {
     fn quarantine(&mut self, hwnd: isize, why: &str) {
         if self.quarantined.insert(hwnd) {
             self.metrics.record_refinement_quarantine_added();
-            self.metrics.log_line(
-                &format!("msaa quarantine hwnd={hwnd} why={why}"),
-                false,
-            );
+            self.metrics
+                .log_line(&format!("msaa quarantine hwnd={hwnd} why={why}"), false);
         }
     }
 
@@ -184,9 +182,7 @@ impl DeepSelectionProvider for MsaaDeepSelectionProvider {
         }
         match self.hit(hwnd, job.point, window_bounds) {
             // Isolation and the hung-window guard live in `hit`, so both callers share them.
-            Err(MsaaHitFailure::Quarantined) => {
-                RefinementOutcome::Empty(StopReason::Unsupported)
-            }
+            Err(MsaaHitFailure::Quarantined) => RefinementOutcome::Empty(StopReason::Unsupported),
             Err(MsaaHitFailure::Busy) => RefinementOutcome::Empty(StopReason::ProviderTimeout),
             Err(MsaaHitFailure::TimedOut) => RefinementOutcome::Empty(StopReason::ProviderTimeout),
             Err(MsaaHitFailure::Unavailable) => {
@@ -206,10 +202,7 @@ impl DeepSelectionProvider for MsaaDeepSelectionProvider {
                 RefinementOutcome::Target(Box::new(DeepTarget {
                     window: job.window,
                     kind,
-                    screen_bounds: path
-                        .last()
-                        .expect("the path always holds the frame")
-                        .rect,
+                    screen_bounds: path.last().expect("the path always holds the frame").rect,
                     path,
                     stop_reason: StopReason::Complete,
                 }))
@@ -238,8 +231,8 @@ fn msaa_hit_test(window: HWND, point: Point, window_bounds: Rect) -> Option<Msaa
     // means COM was already initialised, which is fine.
     let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
 
-    let mut current = accessible_for(window, OBJID_CLIENT)
-        .or_else(|| accessible_for(window, OBJID_WINDOW))?;
+    let mut current =
+        accessible_for(window, OBJID_CLIENT).or_else(|| accessible_for(window, OBJID_WINDOW))?;
     // `accHitTest` hands back either "this object is it" (`CHILDID_SELF`) or the child that owns the
     // point; oleacc's own `AccessibleObjectFromPoint` loops until the former, and a provider is free
     // to answer one level at a time, so the loop is bounded rather than assumed to be absent.
@@ -445,10 +438,18 @@ mod tests {
         );
         match outcome {
             RefinementOutcome::Empty(StopReason::ProviderFailure) => {
-                assert_eq!(provider.quarantined(), 0, "a provider error is not quarantine");
+                assert_eq!(
+                    provider.quarantined(),
+                    0,
+                    "a provider error is not quarantine"
+                );
             }
             RefinementOutcome::Empty(StopReason::ProviderTimeout) => {
-                assert_eq!(provider.quarantined(), 1, "a timeout quarantines the window");
+                assert_eq!(
+                    provider.quarantined(),
+                    1,
+                    "a timeout quarantines the window"
+                );
             }
             other => panic!("unexpected outcome {other:?}"),
         }

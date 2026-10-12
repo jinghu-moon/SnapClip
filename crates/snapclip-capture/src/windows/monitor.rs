@@ -108,10 +108,9 @@ pub fn set_per_monitor_v2_awareness() -> Result<&'static str, String> {
 pub fn cursor_position() -> Result<Point, String> {
     let mut point = POINT { x: 0, y: 0 };
     if unsafe { GetCursorPos(&mut point) }.is_err() {
-        return Err(format!(
-            "GetCursorPos failed with Win32 error {}",
-            unsafe { ::windows::Win32::Foundation::GetLastError().0 }
-        ));
+        return Err(format!("GetCursorPos failed with Win32 error {}", unsafe {
+            ::windows::Win32::Foundation::GetLastError().0
+        }));
     }
     Ok(Point::new(point.x, point.y))
 }
@@ -143,7 +142,6 @@ pub fn captured_monitor_at(point: Point) -> Result<CapturedMonitor, String> {
 pub fn captured_monitor_at_cursor() -> Result<CapturedMonitor, String> {
     captured_monitor_at(cursor_position()?)
 }
-
 
 /// Every monitor in the virtual desktop, primary first.
 ///
@@ -227,11 +225,7 @@ fn monitor_dpi(monitor: HMONITOR) -> u32 {
     let mut dpi_x = 96u32;
     let mut dpi_y = 96u32;
     let result = unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) };
-    if result < 0 || dpi_x == 0 {
-        96
-    } else {
-        dpi_x
-    }
+    if result < 0 || dpi_x == 0 { 96 } else { dpi_x }
 }
 
 /// Font height in physical pixels for a DIP size at the given monitor DPI.
@@ -327,7 +321,9 @@ mod tests {
         assert!(layout.bounds.contains(layout.bounds.center()));
 
         // A point far outside every display still resolves (nearest).
-        let far = captured_monitor_at(Point::new(-100_000, -100_000)).unwrap().layout;
+        let far = captured_monitor_at(Point::new(-100_000, -100_000))
+            .unwrap()
+            .layout;
         assert!(far.bounds.width() > 0);
 
         // Local conversion round-trips through the monitor origin.
@@ -349,6 +345,3 @@ mod tests {
         assert!(monitor.width() > 0 && monitor.height() > 0);
     }
 }
-
-
-

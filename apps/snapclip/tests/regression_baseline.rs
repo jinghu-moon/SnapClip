@@ -365,7 +365,10 @@ fn the_regression_suite_names_the_behaviours_it_freezes() {
     }
 
     // 3. The log carries the table: a green run still says what it froze.
-    println!("[P6.01] the A-class regression suite ({} rows):", A_CLASS.len());
+    println!(
+        "[P6.01] the A-class regression suite ({} rows):",
+        A_CLASS.len()
+    );
     for behaviour in BEHAVIOURS {
         for row in A_CLASS.iter().filter(|row| row.behaviour == *behaviour) {
             println!("[P6.01]   {behaviour}: {}::{}", row.file, row.test);

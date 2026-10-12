@@ -15,7 +15,7 @@ use std::thread;
 
 use snapclip_history::ingest::{
     ClipboardEventBridge, ClipboardEventSink, ClipboardIngest, ClipboardIngestHandle,
-    ClipboardSignal, ClipboardSource, ClipboardSnapshot, OcrQueue, ReadWindow, SourceAppResolver,
+    ClipboardSignal, ClipboardSnapshot, ClipboardSource, OcrQueue, ReadWindow, SourceAppResolver,
     StopSignal,
 };
 use snapclip_history::store::Store;
@@ -173,10 +173,7 @@ mod tests {
     #[test]
     #[ignore = "opens the real clipboard listener and reads the real clipboard"]
     fn the_pipeline_starts_and_stops() {
-        let root = std::env::temp_dir().join(format!(
-            "snapclip-app-ingest-{}",
-            std::process::id()
-        ));
+        let root = std::env::temp_dir().join(format!("snapclip-app-ingest-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let store = snapclip_history::store::Store::open(&root).expect("open store");
         let mut handle = super::start(store, crate::events::EventBus::new())

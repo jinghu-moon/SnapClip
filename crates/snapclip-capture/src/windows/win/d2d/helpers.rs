@@ -28,6 +28,11 @@ pub(super) fn color(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F { r, g, b, a }
 }
 
+/// A CSS-style `rgba(r, g, b, a)`.
+pub(super) fn rgba(r: u8, g: u8, b: u8, a: f32) -> D2D1_COLOR_F {
+    color_of(Rgb::new(r, g, b), a)
+}
+
 /// How much wider than the ring the underlay is drawn, in logical pixels.
 pub(super) const CHAIN_RING_SHADOW_WIDTH: f32 = 2.0;
 
@@ -52,7 +57,10 @@ pub(super) fn capture_mix_color(walking: f32, appear: f32) -> D2D1_COLOR_F {
 pub(super) fn capture_wash_color(walking: f32, appear: f32) -> D2D1_COLOR_F {
     color_of(
         CAPTURE_RGB,
-        PREVIEW_WASH_ALPHA * PREVIEW_WASH_WALK_SCALE * walking.clamp(0.0, 1.0) * appear.clamp(0.0, 1.0),
+        PREVIEW_WASH_ALPHA
+            * PREVIEW_WASH_WALK_SCALE
+            * walking.clamp(0.0, 1.0)
+            * appear.clamp(0.0, 1.0),
     )
 }
 
@@ -76,6 +84,15 @@ pub(super) fn to_d2d(rect: Rect) -> D2D_RECT_F {
     }
 }
 
+/// The parts of `frame` outside `hole`: up to four bands, or the whole frame when the hole is
+/// empty or off the frame.
+pub(super) fn outside_bands(frame: Rect, hole: Rect) -> impl Iterator<Item = Rect> {
+    frame
+        .surround(hole)
+        .into_iter()
+        .filter(|band| !band.is_empty())
+}
+
 /// Fill `frame` with `brush`, leaving `hole` at whatever was underneath it.
 ///
 /// Four bands instead of re-drawing the frame inside the hole: the pixels inside the hole keep their
@@ -88,22 +105,8 @@ pub(super) fn fill_outside(
     hole: Rect,
     brush: &ID2D1SolidColorBrush,
 ) {
-    unsafe {
-        if hole.is_empty() {
-            context.FillRectangle(&to_d2d(frame), brush);
-            return;
-        }
-        let hole = hole.intersect(frame);
-        if hole.is_empty() {
-            context.FillRectangle(&to_d2d(frame), brush);
-            return;
-        }
-        for band in frame.surround(hole) {
-            if band.is_empty() {
-                continue;
-            }
-            context.FillRectangle(&to_d2d(band), brush);
-        }
+    for band in outside_bands(frame, hole) {
+        unsafe { context.FillRectangle(&to_d2d(band), brush) };
     }
 }
 

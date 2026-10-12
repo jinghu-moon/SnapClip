@@ -2,7 +2,6 @@
 
 use super::*;
 
-
 pub(super) fn migrate(connection: &Connection) -> Result<(), StoreError> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (

@@ -16,9 +16,10 @@ use crate::geometry::{LevelReach, MonitorLayout, Point, Rect};
 
 use super::providers::FrozenFrame;
 use super::win::d2d::{
-    ChainRingView, OverlayRenderer as D2dRenderer, RenderMetrics, RenderView,
+    ChainRingView, GuideView, OverlayRenderer as D2dRenderer, RenderMetrics, RenderView,
 };
 use super::win::d3d11::{AsyncSampleBuffer, CompositionTarget, GraphicsDevice};
+use crate::keymap::{GuideGroup, LoupeHint};
 use ::windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 
 /// Everything the overlay needs to draw one frame.
@@ -77,11 +78,14 @@ pub struct OverlayFrameState {
     /// A one-shot hint in monitor-local coordinates (docs/21 §5.21): the level walk has to be
     /// explained once, or nobody finds it.
     pub hint: Option<(Point, String)>,
-    /// The scroll session's panel, when one is running (docs/30 §19.7).
-    ///
-    /// Carried as the model rather than as pre-computed rectangles so the overlay can hand over a
-    /// panel it just updated without translating it, and so the drawing layer keeps having no opinion.
-    pub(crate) scroll_panel: Option<crate::scroll::panel::ScrollPanel>,
+    /// The scroll session's panel and toolbar, while one runs (`docs/33`).
+    pub(crate) scroll: Option<super::win::d2d::ScrollPanelView>,
+    /// Blur the frame outside the mask hole (the `mask_blur` preference).
+    pub mask_blur: bool,
+    /// The loupe's hint row, with the keys as bound.
+    pub loupe_hints: Arc<[LoupeHint]>,
+    /// The bottom-left shortcut guide while it is (fading) on screen.
+    pub(crate) guide: Option<GuideView>,
 }
 
 impl OverlayFrameState {
@@ -107,7 +111,10 @@ impl OverlayFrameState {
             preview_alpha: 1.0,
             level_badge: None,
             hint: None,
-            scroll_panel: None,
+            scroll: None,
+            mask_blur: false,
+            loupe_hints: Arc::from(Vec::new()),
+            guide: None,
         }
     }
 }
@@ -128,6 +135,13 @@ pub struct Win32Renderer {
 }
 
 impl Win32Renderer {
+    pub(crate) fn update_scroll_preview(
+        &mut self,
+        preview: &crate::scroll::Preview,
+    ) -> Result<(), String> {
+        self.d2d.update_scroll_preview(preview)
+    }
+
     /// Create the device stack and bind a composition target to `window`.
     ///
     /// The window handle comes from the typed `windows` bindings because that is what
@@ -188,11 +202,9 @@ impl Win32Renderer {
     /// so no pixels cross the PCIe bus; GPU-less frames fall back to a one-off upload.
     pub fn set_frame(&mut self, frozen: &FrozenFrame) -> Result<(), String> {
         if let Some(texture) = frozen.render_source() {
-            return self.d2d.set_frame_texture(
-                frozen.frame.width,
-                frozen.frame.height,
-                texture,
-            );
+            return self
+                .d2d
+                .set_frame_texture(frozen.frame.width, frozen.frame.height, texture);
         }
         let pixels = frozen
             .pixels()
@@ -215,7 +227,9 @@ impl Win32Renderer {
         let live_items: Vec<AnnotationItem> = annotations
             .map(|d| d.items().to_vec())
             .unwrap_or_else(|| state.annotation_items.clone());
-        let live_selected = annotations.and_then(|d| d.selected_id()).or(state.annotation_selected_id);
+        let live_selected = annotations
+            .and_then(|d| d.selected_id())
+            .or(state.annotation_selected_id);
         let live_draft = annotations
             .and_then(|d| d.draft.clone())
             .or(state.annotation_draft.clone());
@@ -244,7 +258,10 @@ impl Win32Renderer {
             preview_alpha: state.preview_alpha,
             level_badge: state.level_badge,
             hint: state.hint.clone(),
-            scroll_panel: state.scroll_panel.clone(),
+            scroll: state.scroll.clone(),
+            mask_blur: state.mask_blur,
+            loupe_hints: state.loupe_hints.clone(),
+            guide: state.guide.clone(),
         };
         self.d2d.render(&view)?;
         self.d2d.present()?;
@@ -300,9 +317,20 @@ impl Win32Renderer {
             // The panel is UI, so the artifact gets none of it. `render_export` enforces the same
             // thing one layer down; this line is the one that keeps the panel out of the pixels even
             // if that invariant is ever loosened.
-            scroll_panel: None,
+            scroll: None,
+            mask_blur: false,
+            loupe_hints: state.loupe_hints.clone(),
+            guide: None,
         };
         self.d2d.render_export(&view)
+    }
+
+    /// Where the shortcut guide for `groups` sits on this monitor; `None` when it shows nothing.
+    pub(crate) fn guide_bounds(
+        &mut self,
+        groups: &Arc<[GuideGroup]>,
+    ) -> Result<Option<Rect>, String> {
+        self.d2d.guide_bounds(groups, self.frame)
     }
 
     /// Whether a failure message indicates a lost graphics device.
@@ -334,9 +362,3 @@ impl Win32Renderer {
         self.sample_buffer.reset();
     }
 }
-
-
-
-
-
-

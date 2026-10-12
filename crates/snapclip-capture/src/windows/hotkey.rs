@@ -1,4 +1,5 @@
-//! Global hotkeys (`F5` capture, `F7` scroll capture) via `RegisterHotKey` / `WM_HOTKEY`.
+//! Global hotkeys (`F5` capture, `F7` scroll capture, `F9` finish, session-scoped `Esc`) via
+//! `RegisterHotKey` / `WM_HOTKEY`.
 //!
 //! The registration is owned by the overlay UI thread: `WM_HOTKEY` is posted to the
 //! queue of the thread that registered it, and that same thread runs the message
@@ -32,6 +33,10 @@ pub enum HotkeyKind {
     Capture,
     /// Start a scroll capture (docs/32 `P7.04` onwards).
     Scroll,
+    /// Finish the running scroll session (`F9`).
+    Export,
+    /// Ends the running scroll session without output; registered only while one runs.
+    Cancel,
 }
 
 /// One global hotkey: identity, combination, and what it does.
@@ -56,7 +61,7 @@ pub const SCROLL_HOTKEY_ID: i32 = 0x5344;
 /// `F5` without modifiers, with repeat suppressed.
 pub const CAPTURE_HOTKEY: Hotkey = Hotkey {
     id: CAPTURE_HOTKEY_ID,
-    modifiers: MOD_NOREPEAT as u32,
+    modifiers: MOD_NOREPEAT,
     virtual_key: VK_F5 as u32,
     label: "F5",
     kind: HotkeyKind::Capture,
@@ -65,14 +70,34 @@ pub const CAPTURE_HOTKEY: Hotkey = Hotkey {
 /// `F7` without modifiers, with repeat suppressed (docs/32 §4.1).
 pub const SCROLL_HOTKEY: Hotkey = Hotkey {
     id: SCROLL_HOTKEY_ID,
-    modifiers: MOD_NOREPEAT as u32,
+    modifiers: MOD_NOREPEAT,
     virtual_key: VK_F7 as u32,
     label: "F7",
     kind: HotkeyKind::Scroll,
 };
 
+pub const EXPORT_HOTKEY: Hotkey = Hotkey {
+    id: 0x5345,
+    modifiers: MOD_NOREPEAT,
+    virtual_key: windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_F9 as u32,
+    label: "F9",
+    kind: HotkeyKind::Export,
+};
+
 /// Every global hotkey this crate registers, in registration order.
-pub const HOTKEYS: [Hotkey; 2] = [CAPTURE_HOTKEY, SCROLL_HOTKEY];
+pub const HOTKEYS: [Hotkey; 3] = [CAPTURE_HOTKEY, SCROLL_HOTKEY, EXPORT_HOTKEY];
+
+/// `Esc` while a scroll session runs (`docs/33`). The overlay is only the panel then, so a click on
+/// the page under the selection takes the keyboard focus away from it, and a `WM_KEYDOWN` Esc would
+/// go to the page. Global for the session's lifetime only: [`register_scoped`] at the start,
+/// [`unregister_scoped`] at the end — Esc belongs to every other application the rest of the time.
+pub const CANCEL_HOTKEY: Hotkey = Hotkey {
+    id: 0x5346,
+    modifiers: MOD_NOREPEAT,
+    virtual_key: VK_ESCAPE as u32,
+    label: "Esc",
+    kind: HotkeyKind::Cancel,
+};
 
 /// Esc / Enter are read from `WM_KEYDOWN` rather than registered as global
 /// hotkeys: they must only be consumed while the overlay owns the session.
@@ -81,7 +106,11 @@ pub const RETURN_VIRTUAL_KEY: u32 = VK_RETURN as u32;
 
 /// The row `WM_HOTKEY` reported, if this crate registered it.
 pub fn from_id(id: i32) -> Option<Hotkey> {
-    HOTKEYS.iter().copied().find(|hotkey| hotkey.id == id)
+    HOTKEYS
+        .iter()
+        .chain([&CANCEL_HOTKEY])
+        .copied()
+        .find(|hotkey| hotkey.id == id)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,43 +145,62 @@ const ERROR_HOTKEY_ALREADY_REGISTERED: u32 = 1409;
 /// Stops at the first failure and names that key. A partially registered table is not unwound
 /// here: the only caller creates the window that owns these registrations in the same breath,
 /// and destroying a window releases its hotkeys.
-pub fn register(window: HWND) -> Result<(), HotkeyError> {
+pub(crate) fn register(window: HWND) -> Result<(), HotkeyError> {
     for hotkey in HOTKEYS {
-        let result = unsafe {
-            RegisterHotKey(window, hotkey.id, hotkey.modifiers, hotkey.virtual_key)
-        };
-        if result != 0 {
-            continue;
-        }
-        let code = unsafe { GetLastError() };
-        return Err(if code == ERROR_HOTKEY_ALREADY_REGISTERED || code == 0 {
-            HotkeyError::Conflict {
-                label: hotkey.label,
-            }
-        } else {
-            HotkeyError::Failed {
-                label: hotkey.label,
-                code,
-            }
-        });
+        register_one(window, hotkey)?;
+        eprintln!(
+            "[snapclip][capture] registered global hotkey {} id={}",
+            hotkey.label, hotkey.id
+        );
     }
     Ok(())
 }
 
-/// Release every registered hotkey. Must be called from the registering thread.
-pub fn unregister(window: HWND) {
+/// Release every row of [`HOTKEYS`]. Must be called from the registering thread.
+pub(crate) fn unregister(window: HWND) {
     for hotkey in HOTKEYS {
-        unsafe {
-            UnregisterHotKey(window, hotkey.id);
+        unregister_one(window, hotkey);
+    }
+}
+
+/// Register one session-scoped key ([`CANCEL_HOTKEY`]); a failure is the caller's to report.
+pub(crate) fn register_scoped(window: HWND, hotkey: Hotkey) -> Result<(), HotkeyError> {
+    register_one(window, hotkey)
+}
+
+pub(crate) fn unregister_scoped(window: HWND, hotkey: Hotkey) {
+    unregister_one(window, hotkey);
+}
+
+fn register_one(window: HWND, hotkey: Hotkey) -> Result<(), HotkeyError> {
+    if unsafe { RegisterHotKey(window, hotkey.id, hotkey.modifiers, hotkey.virtual_key) } != 0 {
+        return Ok(());
+    }
+    let code = unsafe { GetLastError() };
+    Err(if code == ERROR_HOTKEY_ALREADY_REGISTERED || code == 0 {
+        HotkeyError::Conflict {
+            label: hotkey.label,
         }
+    } else {
+        HotkeyError::Failed {
+            label: hotkey.label,
+            code,
+        }
+    })
+}
+
+fn unregister_one(window: HWND, hotkey: Hotkey) {
+    unsafe {
+        UnregisterHotKey(window, hotkey.id);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        CAPTURE_HOTKEY, CAPTURE_HOTKEY_ID, ESCAPE_VIRTUAL_KEY, HOTKEYS, Hotkey, HotkeyError,
-        HotkeyKind, RETURN_VIRTUAL_KEY, SCROLL_HOTKEY, SCROLL_HOTKEY_ID, from_id,
+        CANCEL_HOTKEY, CAPTURE_HOTKEY, CAPTURE_HOTKEY_ID, ESCAPE_VIRTUAL_KEY, EXPORT_HOTKEY,
+        HOTKEYS, Hotkey, HotkeyError, HotkeyKind, RETURN_VIRTUAL_KEY, SCROLL_HOTKEY,
+        SCROLL_HOTKEY_ID, from_id,
     };
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         MOD_NOREPEAT, VK_ESCAPE, VK_F5, VK_F7, VK_RETURN,
@@ -160,7 +208,7 @@ mod tests {
 
     #[test]
     fn the_second_hotkey_is_registered_with_the_same_discipline() {
-        assert_eq!(HOTKEYS.len(), 2);
+        assert_eq!(HOTKEYS.len(), 3);
         assert_eq!(CAPTURE_HOTKEY_ID, 0x5343);
         assert_eq!(
             CAPTURE_HOTKEY,
@@ -192,7 +240,7 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), rows, "two hotkey rows share an id");
-        assert_eq!(HOTKEYS.map(|hotkey| hotkey.id), [0x5343, 0x5344]);
+        assert_eq!(HOTKEYS.map(|hotkey| hotkey.id), [0x5343, 0x5344, 0x5345]);
     }
 
     #[test]
@@ -242,10 +290,23 @@ mod tests {
         for hotkey in HOTKEYS {
             assert!(matches!(
                 hotkey.kind,
-                HotkeyKind::Capture | HotkeyKind::Scroll
+                HotkeyKind::Capture | HotkeyKind::Scroll | HotkeyKind::Export
             ));
             assert_eq!(from_id(hotkey.id).map(|row| row.kind), Some(hotkey.kind));
         }
+        assert_eq!(
+            from_id(CANCEL_HOTKEY.id).map(|row| row.kind),
+            Some(HotkeyKind::Cancel)
+        );
+    }
+
+    /// The session-scoped Esc must not share an id with a permanent key, or registering it would
+    /// replace one and releasing it would release the other.
+    #[test]
+    fn the_scoped_cancel_key_has_its_own_id_and_is_not_permanent() {
+        assert!(HOTKEYS.iter().all(|hotkey| hotkey.id != CANCEL_HOTKEY.id));
+        assert!(!HOTKEYS.contains(&CANCEL_HOTKEY));
+        assert_eq!(CANCEL_HOTKEY.virtual_key, VK_ESCAPE as u32);
     }
 
     #[test]
@@ -253,8 +314,10 @@ mod tests {
         assert_eq!(ESCAPE_VIRTUAL_KEY, VK_ESCAPE as u32);
         assert_eq!(RETURN_VIRTUAL_KEY, VK_RETURN as u32);
         assert!(
-            !HOTKEYS.iter().any(|hotkey| hotkey.virtual_key == VK_ESCAPE as u32
-                || hotkey.virtual_key == VK_RETURN as u32),
+            !HOTKEYS
+                .iter()
+                .any(|hotkey| hotkey.virtual_key == VK_ESCAPE as u32
+                    || hotkey.virtual_key == VK_RETURN as u32),
             "Esc/Enter must stay session-scoped `WM_KEYDOWN`, not global hotkeys"
         );
     }
@@ -262,7 +325,7 @@ mod tests {
     /// L1: the table is what `register` walks, so the registration order is the table order.
     #[test]
     fn the_registration_order_is_the_table_order() {
-        assert_eq!(HOTKEYS, [CAPTURE_HOTKEY, SCROLL_HOTKEY]);
+        assert_eq!(HOTKEYS, [CAPTURE_HOTKEY, SCROLL_HOTKEY, EXPORT_HOTKEY]);
     }
 
     /// L3 (`docs/32` §7, row 79): both keys really register on this desktop, and releasing them

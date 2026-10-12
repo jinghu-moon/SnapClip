@@ -89,7 +89,10 @@ mod tests {
         // because deciding where artifacts live belongs to the store.
         assert_eq!(output.bytes.len(), 3);
         assert_eq!(output.metadata.width, 320);
-        assert_eq!(output.metadata.monitor_device_name.as_deref(), Some(r"\\.\DISPLAY1"));
+        assert_eq!(
+            output.metadata.monitor_device_name.as_deref(),
+            Some(r"\\.\DISPLAY1")
+        );
     }
 
     #[test]

@@ -52,10 +52,6 @@ impl Bgra8Image {
         &self.bytes
     }
 
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.bytes
-    }
-
     /// Number of pixels, always consistent with `bytes().len()`.
     pub fn pixel_count(&self) -> u64 {
         u64::from(self.width) * u64::from(self.height)
@@ -112,7 +108,8 @@ pub fn decode_to_bgra8(bytes: &[u8]) -> Result<Bgra8Image, String> {
     let (width, height) = rgba.dimensions();
     let mut bgra = rgba.into_raw();
     rgba_to_bgra(&mut bgra);
-    Bgra8Image::new(width, height, bgra).ok_or_else(|| "decoded image has invalid dimensions".into())
+    Bgra8Image::new(width, height, bgra)
+        .ok_or_else(|| "decoded image has invalid dimensions".into())
 }
 
 /// Decode arbitrary encoded image bytes (PNG/BMP) into RGBA8.

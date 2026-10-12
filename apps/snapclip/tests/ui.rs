@@ -17,7 +17,7 @@ use snapclip_app::events::EventBus;
 use snapclip_app::history::icons::SourceIcons;
 use snapclip_app::history::model::HistoryState;
 use snapclip_app::history::view::HistoryView;
-use snapclip_app::settings::{Settings, SettingsStore, SettingsView};
+use snapclip_app::settings::{Settings, SettingsChanged, SettingsStore, SettingsView};
 use snapclip_history::store::Store;
 use snapclip_model::{
     AppEvent, ClipboardEvent, PayloadData, PayloadKind, PayloadRef, Publication, PublicationOrigin,
@@ -177,9 +177,13 @@ fn rows_do_not_paint_over_each_other(cx: &mut TestAppContext) {
         let third = row(2);
 
         // Each row is one row tall, no matter what its text contains.
-        for (index, snapshot) in [first.clone(), second.clone(), third.clone()].into_iter().enumerate() {
+        for (index, snapshot) in [first.clone(), second.clone(), third.clone()]
+            .into_iter()
+            .enumerate()
+        {
             assert!(
-                snapshot.bounds().size.height >= px(40.) && snapshot.bounds().size.height <= px(80.),
+                snapshot.bounds().size.height >= px(40.)
+                    && snapshot.bounds().size.height <= px(80.),
                 "row {index} measured {:?}; a row must stay one row tall",
                 snapshot.bounds().size.height
             );
@@ -234,7 +238,11 @@ fn the_filter_the_next_page_and_the_delete_flow_all_reach_the_screen(cx: &mut Te
         let store = Store::open(&data).expect("open store");
         // 60 text rows (more than one page of 50) and one image row.
         for index in 0..60 {
-            save_text(&store, &format!("clip-{index:03}"), &format!("entry {index}"));
+            save_text(
+                &store,
+                &format!("clip-{index:03}"),
+                &format!("entry {index}"),
+            );
         }
         save_image(&store, "clip-image", b"not really a png");
     }
@@ -243,8 +251,7 @@ fn the_filter_the_next_page_and_the_delete_flow_all_reach_the_screen(cx: &mut Te
 
     let mut view: Option<Entity<HistoryView>> = None;
     let handle = cx.open_window(size(px(640.), px(480.)), |window, cx| {
-        let view_entity =
-            cx.new(|cx| HistoryView::new(state, icons, EventBus::new(), window, cx));
+        let view_entity = cx.new(|cx| HistoryView::new(state, icons, EventBus::new(), window, cx));
         view = Some(view_entity.clone());
         Root::new(view_entity, window, cx)
     });
@@ -292,7 +299,11 @@ fn the_filter_the_next_page_and_the_delete_flow_all_reach_the_screen(cx: &mut Te
     // Cancel first: a dismissed confirmation must leave the row alone.
     cx.update_window(handle.into(), |_, window, cx| {
         let doomed = view.read(cx).selected_id().map(str::to_string);
-        assert_eq!(doomed.as_deref(), Some("clip-image"), "newest row is selected");
+        assert_eq!(
+            doomed.as_deref(),
+            Some("clip-image"),
+            "newest row is selected"
+        );
         window.press("delete", cx);
         assert!(window.has_active_dialog(cx), "deleting asks first");
         assert_eq!(view.read(cx).items().len(), 61, "nothing deleted yet");
@@ -347,8 +358,7 @@ fn the_arrows_belong_to_the_list_and_the_field_keeps_them_while_it_types(cx: &mu
 
     let mut view: Option<Entity<HistoryView>> = None;
     let handle = cx.open_window(size(px(640.), px(480.)), |window, cx| {
-        let view_entity =
-            cx.new(|cx| HistoryView::new(state, icons, EventBus::new(), window, cx));
+        let view_entity = cx.new(|cx| HistoryView::new(state, icons, EventBus::new(), window, cx));
         view = Some(view_entity.clone());
         Root::new(view_entity, window, cx)
     });
@@ -414,6 +424,53 @@ fn toggling_the_setting_writes_it_to_disk(cx: &mut TestAppContext) {
 
     // The assertion that matters: the file changed, not just the rendered state.
     assert!(!SettingsStore::new(&data).load().deep_select_text_runs);
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+/// The overlay switches are saved and announced, which is how the shell hands them to capture
+/// for the next session.
+#[gpui_kit::test]
+fn the_overlay_switches_are_saved_and_announced(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+
+    let data = temp_root("settings-overlay");
+    SettingsStore::new(&data)
+        .save(&Settings::default())
+        .expect("seed settings");
+
+    let mut view: Option<Entity<SettingsView>> = None;
+    let handle = cx.open_window(size(px(640.), px(480.)), |window, cx| {
+        let entity = cx.new(|_| SettingsView::new(SettingsStore::new(&data)));
+        view = Some(entity.clone());
+        Root::new(entity, window, cx)
+    });
+    let view = view.expect("view constructed");
+    let announced = std::rc::Rc::new(std::cell::RefCell::new(Vec::<Settings>::new()));
+    let sink = announced.clone();
+    let _subscription = cx.update(|cx| {
+        cx.subscribe(&view, move |_, event: &SettingsChanged, _| {
+            sink.borrow_mut().push(event.0.clone());
+        })
+    });
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(view.read(cx).settings().mask_blur);
+        assert!(view.read(cx).settings().shortcut_guide);
+        window.click("mask-blur", cx);
+        window.render_frame(cx);
+        window.click("shortcut-guide", cx);
+    })
+    .unwrap();
+
+    let saved = SettingsStore::new(&data).load();
+    assert!(!saved.mask_blur && !saved.shortcut_guide);
+    let announced = announced.borrow();
+    assert_eq!(announced.len(), 2);
+    assert!(!announced[0].mask_blur && announced[0].shortcut_guide);
+    assert_eq!(announced[1], saved);
+    let overlay = saved.overlay_preferences();
+    assert!(!overlay.mask_blur && !overlay.shortcut_guide);
     let _ = std::fs::remove_dir_all(&data);
 }
 

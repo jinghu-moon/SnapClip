@@ -64,11 +64,7 @@ fn nav_item(active: bool, accent: Hsla, border: Hsla, content: AnyElement) -> An
 /// The tray thread never touches a window; this task is the only place a [`tray::TrayCommand`]
 /// becomes a window action. `spawn_in` is what makes that possible: the task can reach the
 /// window it was created from.
-fn spawn_tray_commands(
-    tray: &tray::Tray,
-    window: &mut Window,
-    cx: &mut Context<Shell>,
-) {
+fn spawn_tray_commands(tray: &tray::Tray, window: &mut Window, cx: &mut Context<Shell>) {
     let commands = tray.commands();
     cx.spawn_in(window, async move |shell, cx| {
         while let Some(command) = commands.recv().await.ok() {
@@ -134,9 +130,7 @@ impl Shell {
             Ok(store) => match HistoryState::with_store(store.clone()) {
                 Ok(state) => match SourceIcons::new(data.join("icons")) {
                     Ok(icons) => (
-                        Ok(cx.new(|cx| {
-                            HistoryView::new(state, icons, events.clone(), window, cx)
-                        })),
+                        Ok(cx.new(|cx| HistoryView::new(state, icons, events.clone(), window, cx))),
                         Some(store),
                     ),
                     Err(error) => (Err(format!("icons: {error}")), Some(store)),
@@ -150,11 +144,23 @@ impl Shell {
         let settings_store = settings::SettingsStore::new(&data);
         // Read once for the capture start below; the settings page keeps its own copy so a
         // later edit is written to the same file.
-        let detection_options = settings_store.load().detection_options();
+        let initial = settings_store.load();
         let settings = cx.new(|_| settings::SettingsView::new(settings::SettingsStore::new(&data)));
+        // A saved change reaches the overlay from its next session on.
+        cx.subscribe(&settings, |this: &mut Self, _, event: &settings::SettingsChanged, _| {
+            if let Some(capture) = &this.capture {
+                capture.set_preferences(event.0.overlay_preferences());
+            }
+        })
+        .detach();
         // Capture is hosted here from P6 on: F5, the overlay and the export chain belong to
         // this process, which is what lets the old Tauri shell be deleted.
-        let capture = match capture::start(&data, events.clone(), detection_options) {
+        let capture = match capture::start(
+            &data,
+            events.clone(),
+            initial.detection_options(),
+            initial.overlay_preferences(),
+        ) {
             Ok(runtime) => Some(runtime),
             Err(error) => {
                 eprintln!("[snapclip-app] capture unavailable: {error}");
@@ -292,7 +298,6 @@ impl Render for Shell {
             .into_any_element()
     }
 }
-
 
 /// Start the shell. The binary entry point is a one-liner on purpose.
 pub fn run() {

@@ -24,15 +24,15 @@ impl OverlayController {
                     "frozen frame carries no device to render with".into(),
                 )
             })?;
-            self.renderer = Some(Win32Renderer::new(window, &monitor.layout, device.clone()).map_err(
-                |message| {
+            self.renderer = Some(
+                Win32Renderer::new(window, &monitor.layout, device.clone()).map_err(|message| {
                     if Win32Renderer::is_device_lost(&message) {
                         CaptureError::DeviceRemoved(message)
                     } else {
                         CaptureError::RenderFailed(message)
                     }
-                },
-            )?);
+                })?,
+            );
         }
         let renderer = self
             .renderer
@@ -133,5 +133,4 @@ impl OverlayController {
         self.restore_foreground();
         self.previous_foreground = null_mut();
     }
-
 }

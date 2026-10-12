@@ -23,16 +23,16 @@ use gpui_kit::*;
 // Only with the `test-support` feature: it registers nodes for `window.find("id")`.
 #[cfg(feature = "test-support")]
 use gpui_kit::test::TestSupportExt;
-use snapclip_history::image::decode_to_rgba8;
+use snapclip_history::image::{decode_to_rgba8, png_dimensions};
 use snapclip_model::{AppEvent, ClipSummary, PayloadKind};
 
-use crate::clipboard::SystemClipboard;
-use crate::events::EventBus;
 use super::card::{PREVIEW_CHARS_PER_LINE, PREVIEW_LINES};
 use super::icons::SourceIcons;
 use super::model::HistoryState;
 use super::preview;
 use super::rich::{Span, spans_to_lines, spans_to_text, styled_line};
+use crate::clipboard::{Channels, ClipboardImage, SystemClipboard};
+use crate::events::EventBus;
 
 /// Row height in pixels. Fixed so the virtual list can size the scroll range without
 /// measuring every row; the row content is one line of text plus one line of metadata.
@@ -105,9 +105,7 @@ impl HistoryView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let query = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("搜索剪贴板历史")
-        });
+        let query = cx.new(|cx| InputState::new(window, cx).placeholder("搜索剪贴板历史"));
         let list_focus = cx.focus_handle();
         // The list is what the arrow keys and Delete are for, so it starts focused; clicking
         // the search field moves that ownership to the field, and clicking any row brings it
@@ -220,7 +218,10 @@ impl HistoryView {
         let next = self.query.read(cx).value().to_string();
         match self.state.set_query(&next) {
             Ok(true) => {
-                self.row_sizes = Rc::new(vec![size(px(0.0), px(ROW_HEIGHT_PX)); self.state.items().len()]);
+                self.row_sizes = Rc::new(vec![
+                    size(px(0.0), px(ROW_HEIGHT_PX));
+                    self.state.items().len()
+                ]);
                 cx.notify();
             }
             Ok(false) => {}
@@ -236,8 +237,10 @@ impl HistoryView {
             eprintln!("[snapclip-app] history refresh failed: {error}");
             return;
         }
-        self.row_sizes =
-            Rc::new(vec![size(px(0.0), px(ROW_HEIGHT_PX)); self.state.items().len()]);
+        self.row_sizes = Rc::new(vec![
+            size(px(0.0), px(ROW_HEIGHT_PX));
+            self.state.items().len()
+        ]);
         cx.notify();
     }
 
@@ -254,8 +257,10 @@ impl HistoryView {
     }
 
     fn resize_rows(&mut self) {
-        self.row_sizes =
-            Rc::new(vec![size(px(0.0), px(ROW_HEIGHT_PX)); self.state.items().len()]);
+        self.row_sizes = Rc::new(vec![
+            size(px(0.0), px(ROW_HEIGHT_PX));
+            self.state.items().len()
+        ]);
     }
 
     /// Append the next page, if there is one.
@@ -349,7 +354,9 @@ impl HistoryView {
         if !self.thumbnails.contains_key(&item.id) && !self.pending_thumbnails.contains(&item.id) {
             self.pending_thumbnails.insert(item.id.clone());
             let id = item.id.clone();
-            cx.defer_in(window, move |this, _window, cx| this.load_thumbnail(&id, cx));
+            cx.defer_in(window, move |this, _window, cx| {
+                this.load_thumbnail(&id, cx)
+            });
             // Reserve the space while it loads, so the row does not jump.
             return Some(div().size(px(THUMBNAIL_PX)).into_any_element());
         }
@@ -421,10 +428,14 @@ impl HistoryView {
             Some(Ok((_payload, kind, bytes))) => {
                 let outcome = match kind {
                     PayloadKind::Image => match decode_to_rgba8(&bytes) {
-                        Ok(decoded) => {
-                            let (width, height) = (decoded.width(), decoded.height());
-                            clipboard.copy_image(width, height, decoded.into_raw())
-                        }
+                        Ok(decoded) => clipboard.copy_image(&ClipboardImage {
+                            width: decoded.width(),
+                            height: decoded.height(),
+                            pixels: decoded.as_raw(),
+                            channels: Channels::Rgba,
+                            // A stored PNG goes back as it is, not encoded again.
+                            png: png_dimensions(&bytes).is_some().then_some(&bytes[..]),
+                        }),
                         Err(error) => Err(format!("图片解码失败：{error}")),
                     },
                     _ => match String::from_utf8(bytes) {
@@ -701,16 +712,13 @@ impl Render for HistoryView {
                             .h_flex()
                             .items_center()
                             .gap_2()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(match count {
-                                        0 => "暂无记录".to_string(),
-                                        1 => "共 1 条".to_string(),
-                                        n => format!("共 {n} 条"),
-                                    }),
-                            )
+                            .child(div().text_xs().text_color(theme.muted_foreground).child(
+                                match count {
+                                    0 => "暂无记录".to_string(),
+                                    1 => "共 1 条".to_string(),
+                                    n => format!("共 {n} 条"),
+                                },
+                            ))
                             .child(div().flex_1())
                             .child(self.delete_button(theme, cx)),
                     )
@@ -833,85 +841,88 @@ impl Render for HistoryView {
                                 // which is what makes the load lazy rather than eager.
                                 let thumbnail = view.thumbnail(&item, window, cx);
                                 Some(
-                                    div()
-                                        .h_flex()
-                                        .w_full()
-                                        .items_center()
-                                        .child(marker)
-                                        .child(row
-                                        // A fixed leading column, so every row's text starts at
-                                        // the same x whether or not the source app is known.
-                                        .child(
-                                            div()
-                                                .w(px(16.0))
-                                                .flex_none()
-                                                .h_flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .child(match icon {
-                                                    Some(path) => {
-                                                        img(path).size(px(16.0)).into_any_element()
-                                                    }
-                                                    // Unknown source is a normal state, not an
-                                                    // error: the space is reserved, not filled.
-                                                    None => div()
-                                                        .size(px(16.0))
-                                                        .into_any_element(),
-                                                }),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w_0()
-                                                .v_flex()
-                                                .gap_1()
-                                                .child({
-                                                    // Both paths converge on one node, so the UI
-                                                    // test's handle on a row's content does not
-                                                    // depend on which of them ran.
-                                                    let inner: AnyElement = match rich_lines.as_ref()
-                                                    {
-                                                        Some(lines) => div()
-                                                            .v_flex()
-                                                            .children(lines.iter().map(|line| {
-                                                                let (text, highlights) =
-                                                                    styled_line(line);
-                                                                StyledText::new(text)
-                                                                    .with_highlights(highlights)
-                                                            }))
+                                    div().h_flex().w_full().items_center().child(marker).child(
+                                        row
+                                            // A fixed leading column, so every row's text starts at
+                                            // the same x whether or not the source app is known.
+                                            .child(
+                                                div()
+                                                    .w(px(16.0))
+                                                    .flex_none()
+                                                    .h_flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .child(match icon {
+                                                        Some(path) => img(path)
+                                                            .size(px(16.0))
                                                             .into_any_element(),
-                                                        None => div()
+                                                        // Unknown source is a normal state, not an
+                                                        // error: the space is reserved, not filled.
+                                                        None => {
+                                                            div().size(px(16.0)).into_any_element()
+                                                        }
+                                                    }),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .v_flex()
+                                                    .gap_1()
+                                                    .child({
+                                                        // Both paths converge on one node, so the UI
+                                                        // test's handle on a row's content does not
+                                                        // depend on which of them ran.
+                                                        let inner: AnyElement =
+                                                            match rich_lines.as_ref() {
+                                                                Some(lines) => div()
+                                                                    .v_flex()
+                                                                    .children(lines.iter().map(
+                                                                        |line| {
+                                                                            let (text, highlights) =
+                                                                                styled_line(line);
+                                                                            StyledText::new(text)
+                                                                                .with_highlights(
+                                                                                    highlights,
+                                                                                )
+                                                                        },
+                                                                    ))
+                                                                    .into_any_element(),
+                                                                None => div()
+                                                                    .truncate()
+                                                                    .child(preview.clone())
+                                                                    .into_any_element(),
+                                                            };
+                                                        // Denser than body text: this is a list to
+                                                        // scan, not a paragraph to read.
+                                                        let node = div().text_sm().child(inner);
+                                                        // Registered so the UI test can measure and
+                                                        // read the content: a multi-line preview is
+                                                        // what made rows paint over each other, and a
+                                                        // rich row has to be readable as text too.
+                                                        #[cfg(feature = "test-support")]
+                                                        let node = node
+                                                            .id(("history-preview", index))
+                                                            .aria_label(content_label)
+                                                            .test_support();
+                                                        node
+                                                    })
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(muted)
                                                             .truncate()
-                                                            .child(preview.clone())
-                                                            .into_any_element(),
-                                                    };
-                                                    // Denser than body text: this is a list to
-                                                    // scan, not a paragraph to read.
-                                                    let node = div().text_sm().child(inner);
-                                                    // Registered so the UI test can measure and
-                                                    // read the content: a multi-line preview is
-                                                    // what made rows paint over each other, and a
-                                                    // rich row has to be readable as text too.
-                                                    #[cfg(feature = "test-support")]
-                                                    let node = node
-                                                        .id(("history-preview", index))
-                                                        .aria_label(content_label)
-                                                        .test_support();
-                                                    node
-                                                })
-                                                .child(
-                                                    div()
-                                                        .text_xs()
-                                                        .text_color(muted)
-                                                        .truncate()
-                                                        .child(meta),
-                                                ),
-                                        )
-                                        // The preview is a fixed-size column on the right; a row
-                                        // with no image simply does not have one.
-                                        .children(thumbnail.map(|element| {
-                                            div().flex_none().child(element)
-                                        }))),
+                                                            .child(meta),
+                                                    ),
+                                            )
+                                            // The preview is a fixed-size column on the right; a row
+                                            // with no image simply does not have one.
+                                            .children(
+                                                thumbnail.map(|element| {
+                                                    div().flex_none().child(element)
+                                                }),
+                                            ),
+                                    ),
                                 )
                             })
                             .collect::<Vec<_>>()
@@ -928,7 +939,11 @@ impl Render for HistoryView {
                     .flex_1()
                     .min_h_0()
                     .child(list)
-                    .children(self.state.has_more().then(|| self.load_more_button(theme, cx)))
+                    .children(
+                        self.state
+                            .has_more()
+                            .then(|| self.load_more_button(theme, cx)),
+                    )
                     .into_any_element()
             } else {
                 self.render_empty(cx).into_any_element()

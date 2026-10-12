@@ -94,10 +94,9 @@ unsafe fn capture_with_dc(
         biClrImportant: 0,
     };
     let mut bits: *mut c_void = null_mut();
-    let bitmap: HBITMAP = unsafe {
-        CreateDIBSection(Some(screen_dc), &info, DIB_RGB_COLORS, &mut bits, None, 0)
-    }
-    .map_err(|error| super::hresult("CreateDIBSection", &error))?;
+    let bitmap: HBITMAP =
+        unsafe { CreateDIBSection(Some(screen_dc), &info, DIB_RGB_COLORS, &mut bits, None, 0) }
+            .map_err(|error| super::hresult("CreateDIBSection", &error))?;
     if bits.is_null() {
         unsafe {
             let _ = DeleteObject(HGDIOBJ(bitmap.0));
@@ -140,7 +139,11 @@ unsafe fn capture_with_dc(
         width,
         height,
         pixels,
-        bits_per_pixel: if planes > 0 { bits_per_pixel * planes } else { bits_per_pixel },
+        bits_per_pixel: if planes > 0 {
+            bits_per_pixel * planes
+        } else {
+            bits_per_pixel
+        },
     })
 }
 
@@ -173,9 +176,3 @@ mod tests {
         }
     }
 }
-
-
-
-
-
-

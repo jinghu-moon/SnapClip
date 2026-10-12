@@ -6,43 +6,15 @@
 
 use super::*;
 
-/// The line height the plan's starting gain assumes, in physical pixels.
-///
-/// `docs/30` §16.2's `starting_px_per_notch(lines, height)` was calibrated with `(3, 20) ⇒ 60 px`,
-/// and `E-INJECT-1` measured **100 px per notch** on this machine (`docs/30` §24.6.1). The closed
-/// loop is what turns the difference into a correction (`§16.6`), so this is a starting point
-/// rather than a measurement — but it has to exist, because a plan that assumed zero would never
-/// move the target and the loop would have nothing to correct from.
-pub(super) const SCROLL_LINE_HEIGHT_PX: u32 = 20;
-
-/// The scroll canvas as a [`crate::scroll::export::RowBandSource`] (`docs/32` ADR-21).
-///
-/// The adapter exists because `RecoveredImage::rows` fails with a `BandError` the output-format seam
-/// has no business knowing about, and because the canvas sits behind the export job's lock while the
-/// band loop runs. It is the whole of the "long image" reading side: 256 rows at a time, as asked.
-struct CanvasRows<'a> {
-    canvas: &'a mut crate::scroll::canvas::RecoveredImage,
-}
-
-impl crate::scroll::export::RowBandSource for CanvasRows<'_> {
-    fn row_count(&self) -> u64 {
-        self.canvas.primary_len()
-    }
-
-    fn read_rows(&mut self, first_row: u64, rows: u64) -> Result<Vec<u8>, String> {
-        self.canvas
-            .rows(first_row, rows)
-            .map_err(|error| format!("{error:?}"))
-    }
-}
-
 impl OverlayController {
     pub(super) fn session_id(&self) -> String {
         self.session.id().to_string()
     }
 
     pub(super) fn layout(&self) -> Option<MonitorLayout> {
-        self.renderer.as_ref().map(|renderer| renderer.layout().clone())
+        self.renderer
+            .as_ref()
+            .map(|renderer| renderer.layout().clone())
     }
 
     pub(super) fn publish_state(&self) {
@@ -85,297 +57,25 @@ impl OverlayController {
         }
     }
 
-    /// `F7`: arm the scroll intent and open the ordinary selection UI (`docs/32` §4.4, `OQ-27`).
-    ///
-    /// The shape is **"select, then confirm means scroll"**: the region a session scrolls is the
-    /// region the user picks, and the window it reads from is resolved from that selection
-    /// (`windows/scroll_target.rs`). Starting the capture session is what gives the user something
-    /// to select on, and it is also where the DPI, the frozen frame under the panel and the monitor
-    /// layout come from.
+    /// `F7`: arm the scroll intent and open the ordinary selection UI (`docs/33`). Confirming the
+    /// selection then starts a scroll session instead of producing a screenshot.
     pub(super) fn start_scroll_entry(&mut self) {
-        self.scroll_entry_armed = true;
-        eprintln!("[snapclip][capture] scroll entry armed (F7): select a region and confirm");
         self.start_session();
+        self.scroll_entry_armed = true;
+        // Enter now means "start scrolling", and the guide says so.
+        self.guide_groups = self.guide_groups_for(true);
+        eprintln!("[snapclip][capture] scroll entry armed (F7): select a region and confirm");
     }
 
-    /// Hand a confirmed selection to a scroll session and start its driver (`docs/32` `P7.05`).
-    ///
-    /// The order is the contract: resolve the window, hand over — which **ends** the capture
-    /// session (ADR-19) — then build the plan from what the hand-over carries, then start the
-    /// driver and give the overlay the preview port. Everything after the hand-over speaks about a
-    /// session whose capture frame is already gone, so nothing here may read `self.session.frame()`.
-    ///
-    /// Every refusal happens **before** the hand-over: the user keeps a selected session they can
-    /// still export, which is the same promise `begin_scroll` itself makes for a window that does
-    /// not overlap the selection.
-    pub(super) fn begin_scroll_session(&mut self) {
-        if self.scroll_runtime.is_some() {
-            eprintln!("[snapclip][capture] a scroll session is already running");
-            return;
+    /// The shortcut guide for this session's keymap; empty when the guide is turned off.
+    fn guide_groups_for(&self, scroll_entry: bool) -> Arc<[GuideGroup]> {
+        if !self.preferences.shortcut_guide {
+            return Arc::from(Vec::new());
         }
-        let Some(layout) = self.monitor_layout.clone() else {
-            eprintln!("[snapclip][capture] scroll entry refused: this session has no monitor layout");
-            return;
-        };
-        let axis = crate::scroll::observation::Axis::Vertical;
-        let choice = crate::windows::scroll_target::choose_in_snapshot(
-            self.session.selection(),
-            self.snapshot.candidates(),
-            &layout,
-            axis,
-        );
-        let target = match choice {
-            crate::scroll::target::TargetChoice::Accepted(target) => target,
-            other => {
-                eprintln!("[snapclip][capture] scroll entry refused: {other:?}");
-                return;
-            }
-        };
-        let window = target.window();
-        let bounds = target.bounds();
-        let handle = window as isize;
-        // The aim point is part of a `SendInput` injection under `MOUSE_POS` routing (§24.6 rule 1),
-        // so it is resolved before the hand-over: a window whose client area cannot be resolved has
-        // no injectable point, and refusing after the capture session ended would strand the user.
-        let Some(screen) = window::client_center(handle) else {
-            eprintln!("[snapclip][capture] scroll entry refused: 0x{window:x} has no client area");
-            return;
-        };
-
-        // **Every refusal happens before the hand-over** (`docs/32` §9 `P7.05` constraint ①): the plan
-        // is built from the viewport, `ScrollPlan::new` checks nothing, and `choose_target` measured
-        // the **window** — so the assembly root is the only place that can say "this selection is too
-        // short to scroll in" while the user still has a session they can export.
-        //
-        // The region is the **selection** clipped to the window (`ScrollTarget::crop`), not the whole
-        // window. Using `bounds` here is what made the first two real runs capture a whole maximized
-        // browser — 3840×2088, tab strip and all — and fail to confirm a single step (`P7.05b`).
-        let crop = self.session.selection().intersect(bounds);
-        let (cross_len, extent) = (crop.width().max(0) as u64, crop.height().max(0) as u64);
-        if crop.is_empty() || extent < u64::from(crate::scroll::target::MIN_TARGET_EXTENT) {
-            eprintln!(
-                "[snapclip][capture] scroll entry refused: the selection is {cross_len}x{extent} \
-                 inside the window and needs at least {} px along the scroll axis",
-                crate::scroll::target::MIN_TARGET_EXTENT
-            );
-            return;
-        }
-
-        let handoff = match self.session.begin_scroll(window, bounds) {
-            Ok(handoff) => handoff,
-            Err(error) => {
-                eprintln!("[snapclip][capture] scroll hand-over failed: {error}");
-                return;
-            }
-        };
-        self.scroll_entry_armed = false;
-
-        // The hand-off recomputed the same rectangle from the same two inputs, and it is the
-        // authoritative one — the check above exists to keep the session alive, not to predict it.
-        let target = handoff.target();
-        let region = target.crop();
-        let cross_len = region.width().max(0) as u64;
-        let extent = region.height().max(0) as u64;
-        // The frame arrives in **window** coordinates, the selection was made in screen coordinates.
-        let frame_region = Rect::new(
-            region.left - bounds.left,
-            region.top - bounds.top,
-            region.right - bounds.left,
-            region.bottom - bounds.top,
-        );
-        // The plan states the viewport as a `u32` (a viewport taller than 4 Gi px is not a case the
-        // canvas has an answer for) while the memory budget is computed in pixels; the clamp keeps
-        // the two statements about the same rectangle rather than panicking on an impossible one.
-        let viewport_extent = u32::try_from(extent).unwrap_or(u32::MAX);
-        let budget = crate::scroll::canvas::MemoryBudget::for_viewport(cross_len, extent);
-        let plan =
-            crate::scroll::session::ScrollPlan::new(axis, cross_len, viewport_extent, budget)
-                .with_wheel(
-                    crate::windows::scroll_actuator::wheel_lines_per_notch(),
-                    SCROLL_LINE_HEIGHT_PX,
-                );
-        let probe = crate::windows::scroll_actuator::TargetProbe::at_session_start(handle);
-        // The overlay's own thread, and the message that means "the driver published something"
-        // (`docs/30` §21.4). Without it the port is a mailbox nobody looks in: the panel would keep
-        // its initial state for the whole session, and a driver that ends by itself would never be
-        // noticed either.
-        let notify_thread = unsafe { GetCurrentThreadId() };
-        let wake = move || unsafe {
-            PostThreadMessageW(notify_thread, crate::windows::overlay::SCROLL_READY_MESSAGE, 0, 0);
-        };
-        // The device is created **inside** the factory, on the driver thread: that is what makes
-        // the driver its owner (`docs/30` §21.3.1), and it is why `scroll_source.rs` never names
-        // `GraphicsDevice::create` — its own gate forbids it (§11.2).
-        let runtime = crate::scroll::session::ScrollRuntime::start_with_waker(
-            plan,
-            move || {
-                let device = crate::windows::win::d3d11::GraphicsDevice::create()
-                    .map(std::sync::Arc::new);
-                crate::windows::scroll_source::OpeningFrameSource::open(
-                    device,
-                    handle,
-                    axis,
-                    frame_region,
-                )
-            },
-            crate::windows::scroll_actuator::WindowWheelActuator::new(handle, screen, axis, probe),
-            wake,
-        );
-        self.watch_scroll_preview(runtime.preview().clone(), cross_len, extent);
-        self.scroll_runtime = Some(runtime);
-        // The region hole (`P7.07c`): from here until the session ends, the overlay covers **only** the
-        // panel. That is what keeps the target un-occluded — and therefore painting, which is the only
-        // way the driver ever sees the rows it is scrolling (`set_window_region`).
-        //
-        // The rectangle comes from the monitor layout saved when the frame was prepared, **not** from
-        // `session.geometry()`: the hand-over has already reset the capture session, so that call
-        // answered `None` and the first region-hole build silently did nothing — the tell was a run
-        // whose numbers were byte-identical to the round before it.
-        let (panel, _) =
-            crate::windows::win::d2d::scroll_panel_rect(layout.work_area, layout.bounds, layout.dpi);
-        eprintln!(
-            "[snapclip][capture] scroll window region=panel ({},{})-({},{})",
-            panel.left, panel.top, panel.right, panel.bottom
-        );
-        self.set_window_region(Some(panel));
-        eprintln!(
-            "[snapclip][capture] scroll session started window=0x{window:x} cross={cross_len} \
-             extent={extent} capture_dpi={}",
-            handoff.dpi()
-        );
-    }
-
-    /// Perform a press on the scroll panel's controls (`docs/32` `P7.06`).
-    ///
-    /// One `match` with **no wildcard arm**: a new `PanelAction` is a compile error here rather than
-    /// a button that silently does nothing, which is how "every action maps to exactly one
-    /// controller call" stays true without a test that could be forgotten.
-    ///
-    /// The controller calls are the sticky-bit / capacity-1 commands of §27.2, so none of them
-    /// blocks the overlay thread: `stop` and `cancel` latch a promise the driver reads at its next
-    /// cancellation point, `undo` adds one request, and `set_follow(true)` writes the one-slot
-    /// follow value.
-    pub(super) fn apply_panel_action(&mut self, action: crate::scroll::panel::PanelAction) {
-        let Some(runtime) = self.scroll_runtime.as_ref() else {
-            return;
-        };
-        match action {
-            crate::scroll::panel::PanelAction::ReturnToLatest => {
-                runtime.controller().set_follow(true);
-            }
-            crate::scroll::panel::PanelAction::Undo => runtime.controller().undo(),
-            crate::scroll::panel::PanelAction::Stop => runtime.controller().stop(),
-            crate::scroll::panel::PanelAction::Cancel => runtime.controller().cancel(),
-        }
-        // `Stop` is the one action that also **collects** the session: the promise is latched above
-        // (so `disposal()` will be an export rather than a discard, `docs/30` §20.5) and the join
-        // happens here, outside the borrow of `scroll_runtime` above. Leaving the join to the next
-        // `cancel` was a real hole — the driver ended, the panel said "stopped", and no file was
-        // ever written (`P7.09b`).
-        if matches!(action, crate::scroll::panel::PanelAction::Stop) {
-            self.stop_scroll_session("panel-stop");
-        }
-    }
-
-    /// Stop and join the scroll driver, if one is running (`docs/32` `P7.05`).
-    ///
-    /// Separate from the capture session's teardown because the promises differ: a cancelled scroll
-    /// session produces **no artifact** (`docs/32` §3.4), and its driver has to be joined before
-    /// session produces **no artifact** (`docs/32` §3.4), and its driver has to be joined before
-    /// the controller goes away — a thread that outlived its owner is a thread nobody can stop.
-    ///
-    /// The artifact path (stop → row-band export → clipboard/history) is `P7.09`/`P7.10`; until
-    /// then this logs the session's own tallies and hands the panel back to nothing, which is the
-    /// honest intermediate state rather than a stop button that quietly does half the job.
-    pub(super) fn stop_scroll_session(&mut self, reason: &str) {
-        let Some(mut runtime) = self.scroll_runtime.take() else {
-            return;
-        };
-        // The whole window comes back before anything else: leaving the hole in place would hide the
-        // panel behind the desktop and let the user's clicks fall through what looks like our UI
-        // (`P7.07c`).
-        eprintln!("[snapclip][capture] scroll window region=full");
-        self.set_window_region(None);
-        runtime.controller().cancel();
-        let Some(session) = runtime.teardown() else {
-            eprintln!(
-                "[snapclip][capture] scroll session ended reason={reason} (the driver returned \
-                 nothing: it was already torn down)"
-            );
-            self.scroll_preview = None;
-            self.scroll_panel = None;
-            return;
-        };
-        // The stop reason decides whether there is an artifact at all (`docs/30` §20.5): `Esc` and an
-        // internal error promise none, and everything else — the user's `Enter`, a lost target, a
-        // memory limit — produces a file, possibly a `Partial` one. `disposal()` is the one place
-        // that mapping lives, so it is asked rather than re-derived here.
-        let export = matches!(
-            session.disposal(),
-            Some(crate::scroll::session::Disposal::Export(_))
-        );
-        let stop_reason = session.stop_reason();
-        let steps = session.step();
-        let committed = session.committed();
-        let discarded = session.discarded();
-        self.scroll_preview = None;
-        self.scroll_panel = None;
-        eprintln!(
-            "[snapclip][capture] scroll session ended reason={reason} stop={stop_reason:?} \
-             steps={steps} committed={committed} discarded={discarded} export={export}"
-        );
-        if !export {
-            return;
-        }
-
-        // The canvas becomes the job. Its height is the whole point of the band seam: 10^5 rows exist
-        // as band storage and are written one band at a time (`docs/32` ADR-21), so the encode never
-        // needs the image in one buffer.
-        let canvas = session.into_canvas();
-        let width = canvas.cross_len();
-        let height = canvas.primary_len();
-        let meta = crate::scroll::export::ImageMeta {
-            width,
-            height,
-            // The artifact is as long as the canvas: `length` is what `docs/30` §17.7 capped, and for
-            // a vertical scroll it *is* the height (the same statement the ordinary path makes).
-            length: height,
-            axis: crate::scroll::observation::Axis::Vertical,
-            // `dpr` is for the preview's CSS-pixel consumers; this image is physical pixels and its
-            // scale travels in `dpi`, so `1` means "not applicable" rather than a guess.
-            dpr: 1,
-        };
-        let session_id = self.session_id();
-        let job = ExportJob {
-            generation: 0,
-            session_id: session_id.clone(),
-            source: ExportSource::Rows(RowBandJob {
-                meta,
-                canvas: std::sync::Mutex::new(canvas),
-            }),
-            dpi: self
-                .monitor_layout
-                .as_ref()
-                .map(|layout| layout.dpi)
-                .unwrap_or(96),
-            monitor_device_name: None,
-            notify_thread: unsafe { GetCurrentThreadId() },
-            executor: Self::export_executor(self.writer.clone()),
-        };
-        match self.export_worker.submit(job) {
-            Ok(Some(generation)) => eprintln!(
-                "[snapclip][bench] scroll export submitted session={session_id} generation={generation} \
-                 size={width}x{height}"
-            ),
-            Ok(None) | Err(_) => {
-                let error = CaptureError::EncodeFailed("scroll export worker unavailable".to_string());
-                eprintln!(
-                    "[snapclip][capture] scroll export submit failed session={session_id} error={error}"
-                );
-                self.sink
-                    .on_failed(Some(&session_id), &error, "scroll-export");
-            }
-        }
+        self.preferences
+            .keymap
+            .guide(Context::Pick, scroll_entry)
+            .into()
     }
 
     /// `F5`: submit a capture request and enter `Preparing`.
@@ -386,11 +86,21 @@ impl OverlayController {
     pub(super) fn start_session(&mut self) {
         let started_at = Instant::now();
         eprintln!("[snapclip][capture] starting session from hotkey/command");
-        if self.session.state().is_active() {
+        if self.session.state().is_active() || self.scroll.is_some() {
             // A repeated hotkey press restarts rather than stacking sessions;
             // `cancel` bumps the generation so the old request's result dies.
             self.cancel("hotkey-restart");
         }
+        // `F5` means a screenshot; `start_scroll_entry` re-arms the scroll intent after this.
+        self.scroll_entry_armed = false;
+        // The preferences are read once per session, so a change in the settings never rearranges
+        // the session the user is in.
+        if let Ok(shared) = self.shared.lock() {
+            self.preferences = shared.preferences.clone();
+        }
+        self.loupe_hints = self.preferences.keymap.loupe_hints().into();
+        self.guide_groups = self.guide_groups_for(false);
+        self.guide = GuideFade::default();
 
         let monitor = match monitor::captured_monitor_at_cursor() {
             Ok(monitor) => monitor,
@@ -525,8 +235,7 @@ impl OverlayController {
         }
         self.frozen = Some(frozen);
         self.graphics_released = false;
-        // Kept for the scroll entry: the window snapshot speaks virtual-desktop coordinates and the
-        // overlay's selection is monitor-local, so the conversion needs this layout (`P7.05`).
+        // Kept for the scroll entry, which outlives the capture session's geometry.
         self.monitor_layout = Some(monitor.layout.clone());
 
         eprintln!(
@@ -548,6 +257,10 @@ impl OverlayController {
         // Start the periodic hover re-validation now that there is something to hover
         // over; it is disarmed with the session.
         self.arm_hover_timer();
+        // The guide fades in on the render clock.
+        if !self.guide_groups.is_empty() {
+            self.invalidate();
+        }
         eprintln!(
             "[snapclip][bench] stage=visible session={} prepare_elapsed_ms={}",
             self.session_id(),
@@ -568,18 +281,21 @@ impl OverlayController {
             "[snapclip][capture] cancel session={} reason={} active={}",
             session_id, reason, was_active
         );
-        // The scroll driver is joined here rather than left to `Drop`: this is the one path every
-        // cancellation goes through (`docs/32` `P7.05`), and `Esc` on a running scroll session has
-        // to stop the thread that is injecting into the user's desktop.
         self.scroll_entry_armed = false;
-        self.stop_scroll_session(reason);
+        // A running scroll session is discarded: dropping its worker stops and joins the thread,
+        // and nothing is written (`docs/33`).
+        if let Some(run) = self.end_scroll() {
+            eprintln!(
+                "[snapclip][scroll] cancelled session={} reason={reason}",
+                run.session_id
+            );
+            self.sink.on_cancelled(&run.session_id, reason);
+            drop(run);
+        }
         self.worker.cancel();
         // The export worker is cancelled only when **this** capture session has an export in flight.
-        // A scroll session's export outlives the capture session by design (ADR-19: the hand-over ends
-        // the capture session, and the bands are written afterwards), so an `Esc` pressed after the
-        // panel has already stopped must not delete the file that export is writing — which is exactly
-        // what the fifth real run did: `artifact ready … path=…png` immediately followed by
-        // `export discarded … (cancelled)` (`P7.12`'s D4).
+        // A scroll export outlives the capture session (the hand-over ended it), so an `Esc` after
+        // the scroll session finished must not delete the file it is writing.
         if self.session.state() == CaptureState::Exporting {
             self.export_worker.cancel();
             self.current_generation = 0;
@@ -602,14 +318,18 @@ impl OverlayController {
         let summary = self.metrics.summary_line();
         self.metrics.log_line(&summary, true);
         self.metrics.log_line(
-            &format!("last deep target {}", describe_deep(self.deep_target.as_ref())),
+            &format!(
+                "last deep target {}",
+                describe_deep(self.deep_target.as_ref())
+            ),
             true,
         );
         // Forced, like the line above: "the precision top-up ran and decided nothing" is the
         // state a user reporting "elements inside this box are not recognized" is looking at,
         // and it used to be invisible unless the per-operation log was switched on.
         if let Some(precision) = self.metrics.last_precision() {
-            self.metrics.log_line(&format!("last precision {precision}"), true);
+            self.metrics
+                .log_line(&format!("last precision {precision}"), true);
         }
         self.metrics.reset();
         self.session.cancel();
@@ -644,7 +364,8 @@ impl OverlayController {
         self.magnifier_color_format = ColorFormat::default();
         self.magnifier_relative = false;
         self.magnifier_zoom = MagnifierConfig::ZOOM_DEFAULT;
-        self.z_held = false;
+        self.held = None;
+        self.guide = GuideFade::default();
         self.sample_slot = None;
         self.annotation_doc.reset();
         self.annotation_tool = None;
@@ -662,30 +383,16 @@ impl OverlayController {
         }
     }
 
-    /// The export executor both paths use (`docs/32` ADR-21).
-    ///
-    /// One closure, two sources: an ordinary screenshot is one `SelectionPixels` written in a single
-    /// call, and a scroll session is a canvas written band by band. The choice belongs to the job, so
-    /// the overlay builds one of these rather than one per path — and the band loop lives here rather
-    /// than in the writer because only this side knows the canvas can serve whole bands.
-    fn export_executor(writer: Arc<dyn ArtifactWriter>) -> ExportExecutor {
-        Box::new(move |job: &ExportJob| match &job.source {
-            ExportSource::Selection(prepared) => writer.write(
+    /// The export executor: one `SelectionPixels` written in one call, for a screenshot and for
+    /// a scroll session's long image alike.
+    pub(super) fn export_executor(writer: Arc<dyn ArtifactWriter>) -> ExportExecutor {
+        Box::new(move |job: &ExportJob| {
+            writer.write(
                 &job.session_id,
-                prepared,
+                &job.prepared,
                 job.dpi,
                 job.monitor_device_name.clone(),
-            ),
-            ExportSource::Rows(rows) => {
-                let mut canvas = rows
-                    .canvas
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let mut source = CanvasRows {
-                    canvas: &mut canvas,
-                };
-                writer.write_rows(&job.session_id, &rows.meta, &mut source, job.dpi)
-            }
+            )
         })
     }
 
@@ -693,9 +400,8 @@ impl OverlayController {
     /// write to the export worker so the message pump keeps answering `Esc` and
     /// `WM_PAINT` while a large PNG is produced (docs/11 §Phase 3).
     pub(super) fn confirm(&mut self) {
-        // `F7`'s session: the same gesture that produces a screenshot produces a scroll session
-        // when the session was started for scrolling (`docs/32` §4.4, `OQ-27`). One interception
-        // point, because `Enter` and the synchronous confirm path both end up here.
+        // `F7`'s session: the same gesture that produces a screenshot starts a scroll session
+        // (`docs/33`). One interception point, because every confirm path ends up here.
         if self.scroll_entry_armed {
             self.begin_scroll_session();
             return;
@@ -765,7 +471,11 @@ impl OverlayController {
                 level_badge: None,
                 hint: None,
                 // The panel is UI, so the export preview path gets none of it either.
-                scroll_panel: None,
+                scroll: None,
+                // …nor the guide, nor the blur outside the selection.
+                mask_blur: false,
+                loupe_hints: self.loupe_hints.clone(),
+                guide: None,
             };
             let Some(renderer) = self.renderer.as_mut() else {
                 self.cancel("annotation-export-without-renderer");
@@ -803,7 +513,7 @@ impl OverlayController {
         let job = ExportJob {
             generation: 0,
             session_id: session_id.clone(),
-            source: ExportSource::Selection(prepared),
+            prepared,
             dpi,
             monitor_device_name: None,
             notify_thread: unsafe { GetCurrentThreadId() },
@@ -833,18 +543,20 @@ impl OverlayController {
     }
 
     /// Drain a finished export. Runs on the overlay thread when the worker posts
-    /// [`export_worker::EXPORT_READY_MESSAGE`]; ignored once the session has left
-    /// `Exporting` (an `Esc` cancelled it, and the worker already deleted the file).
+    /// [`export_worker::EXPORT_READY_MESSAGE`].
+    ///
+    /// Two owners: the capture session in `Exporting`, or a scroll session's image
+    /// (`scroll_export`), which outlives the capture session it came from. Anything else is a stale
+    /// result (an `Esc` cancelled it, and the worker already deleted the file).
     pub(super) fn on_export_ready(&mut self) {
         let Some(ready) = self.export_worker.take_ready() else {
             return;
         };
-        // A **scroll** export is the only case where this is not `Exporting`: handing the selection
-        // over ended the capture session (ADR-19), so by the time the bands are written there is no
-        // capture state left to complete — only an artifact to publish. An ordinary screenshot that
-        // is not exporting is a stale result and is dropped, which is what this check has always said.
-        let exporting = self.session.state() == CaptureState::Exporting;
-        if !exporting && self.sink_has_no_scroll_export() {
+        if let Some(scroll_id) = self.scroll_export.take() {
+            self.on_scroll_export_ready(&scroll_id, ready);
+            return;
+        }
+        if self.session.state() != CaptureState::Exporting {
             return;
         }
         let session_id = self.session_id();
@@ -862,11 +574,9 @@ impl OverlayController {
                     artifact.height
                 );
                 self.sink.on_completed(&artifact);
-                if exporting {
-                    self.session.complete();
-                    self.finish_session();
-                    self.sink.on_state(&session_id, CaptureState::Idle, None);
-                }
+                self.session.complete();
+                self.finish_session();
+                self.sink.on_state(&session_id, CaptureState::Idle, None);
             }
             Err(failure) => {
                 let stage = failure.stage;
@@ -878,23 +588,41 @@ impl OverlayController {
                     self.worker.invalidate_providers();
                     self.renderer = None;
                 }
-                self.sink.on_failed(Some(&session_id), &failure.error, stage);
-                if exporting {
-                    self.session.fail();
-                    self.finish_session();
-                    self.sink.on_state(&session_id, CaptureState::Idle, None);
-                }
+                self.sink
+                    .on_failed(Some(&session_id), &failure.error, stage);
+                self.session.fail();
+                self.finish_session();
+                self.sink.on_state(&session_id, CaptureState::Idle, None);
             }
         }
     }
 
-    /// Whether a result arriving outside `Exporting` may still be delivered.
-    ///
-    /// Only a scroll export qualifies, and the honest test is that no scroll session is running: a
-    /// result that arrives after `stop_scroll_session` took the runtime is the scroll export's, and
-    /// one that arrives while a session *is* running belongs to nothing.
-    fn sink_has_no_scroll_export(&self) -> bool {
-        self.scroll_runtime.is_none()
+    /// A scroll session's export finished: publish it (`docs/33`). The desktop and clipboard copies
+    /// already ran on the export thread ([`Self::scroll_executor`]).
+    fn on_scroll_export_ready(
+        &mut self,
+        session_id: &str,
+        ready: Result<export_worker::CompletedExport, export_worker::ExportFailure>,
+    ) {
+        match ready {
+            Ok(completed) => {
+                let artifact = completed.artifact;
+                eprintln!(
+                    "[snapclip][scroll] artifact ready session={session_id} size={}x{}",
+                    artifact.width, artifact.height
+                );
+                self.sink.on_completed(&artifact);
+            }
+            Err(failure) => {
+                eprintln!(
+                    "[snapclip][scroll] export failed session={session_id} stage={} error={}",
+                    failure.stage, failure.error
+                );
+                self.sink
+                    .on_failed(Some(session_id), &failure.error, failure.stage);
+            }
+        }
+        self.sink.on_state(session_id, CaptureState::Idle, None);
     }
 
     pub(super) fn finish_session(&mut self) {
@@ -924,9 +652,15 @@ impl OverlayController {
         if self.graphics_released || !self.cursor_visible {
             return;
         }
-        let Some(renderer) = self.renderer.as_mut() else { return; };
-        let Some(frozen) = self.frozen.as_ref() else { return; };
-        let Some(gpu_frame) = frozen.texture() else { return; };
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        let Some(frozen) = self.frozen.as_ref() else {
+            return;
+        };
+        let Some(gpu_frame) = frozen.texture() else {
+            return;
+        };
         let texture = gpu_frame.texture.clone();
         let dpi = renderer.layout().dpi;
         let config = MagnifierConfig::with_zoom(self.magnifier_zoom).scaled(dpi);
@@ -960,8 +694,12 @@ impl OverlayController {
 
     /// Poll the pending GPU slot; if complete, feed the tile data to the sampler.
     pub(super) fn poll_color_sample(&mut self) {
-        let Some(slot) = self.sample_slot.take() else { return; };
-        let Some(renderer) = self.renderer.as_mut() else { return; };
+        let Some(slot) = self.sample_slot.take() else {
+            return;
+        };
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
         match renderer.poll_sample(slot) {
             None => {
                 // Still in flight. Re-arm the tick so the poll keeps scheduling:

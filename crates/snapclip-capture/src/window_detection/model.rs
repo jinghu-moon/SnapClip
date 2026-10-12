@@ -608,7 +608,10 @@ mod tests {
         // The list covers every variant: a kind added to the enum without being added here would
         // slip past both the font list and these checks.
         assert_eq!(LevelKind::ALL.len(), 28);
-        let mut names: Vec<&str> = LevelKind::ALL.iter().map(|kind| kind.debug_name()).collect();
+        let mut names: Vec<&str> = LevelKind::ALL
+            .iter()
+            .map(|kind| kind.debug_name())
+            .collect();
         names.sort_unstable();
         let unique = names.len();
         names.dedup();
@@ -703,7 +706,10 @@ mod tests {
 
         gate.retire();
         assert_eq!(gate.latest(), None);
-        assert!(!gate.accepts(second), "no request is current after retiring");
+        assert!(
+            !gate.accepts(second),
+            "no request is current after retiring"
+        );
     }
 
     #[test]
@@ -785,7 +791,10 @@ mod tests {
         snapshot.release();
         assert_eq!(snapshot.epoch(), 0);
         assert!(snapshot.is_empty());
-        assert!(snapshot.monitors().is_empty(), "the monitor cache is released too");
+        assert!(
+            snapshot.monitors().is_empty(),
+            "the monitor cache is released too"
+        );
         assert!(
             snapshot.find(identity(0x100)).is_none(),
             "a released snapshot must not keep answering hits"
@@ -815,9 +824,7 @@ mod tests {
         outside_primary.screen_bounds = rect(-1920, -100, 0, 980);
         assert_eq!(outside_primary.screen_bounds.left, -1920);
         assert!(
-            outside_primary
-                .screen_bounds
-                .contains(Point::new(-1920, 0)),
+            outside_primary.screen_bounds.contains(Point::new(-1920, 0)),
             "the left/top edge belongs to the window"
         );
         assert!(outside_primary.screen_bounds.contains(Point::new(-1, 100)));
@@ -826,7 +833,9 @@ mod tests {
             "right edge is exclusive"
         );
         assert!(
-            !outside_primary.screen_bounds.contains(Point::new(-500, 980)),
+            !outside_primary
+                .screen_bounds
+                .contains(Point::new(-500, 980)),
             "bottom edge is exclusive"
         );
     }

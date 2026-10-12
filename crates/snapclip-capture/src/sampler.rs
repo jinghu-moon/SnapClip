@@ -374,7 +374,11 @@ mod tests {
         sampler.mark_submitted(Point::new(84, 84), Instant::now());
         assert_eq!(sampler.pending_origin(), Some(Point::new(84, 84)));
         // Completion clears the in-flight record.
-        sampler.complete(Point::new(84, 84), solid_tile(1, 2, 3), Point::new(100, 100));
+        sampler.complete(
+            Point::new(84, 84),
+            solid_tile(1, 2, 3),
+            Point::new(100, 100),
+        );
         assert_eq!(sampler.pending_origin(), None);
     }
 
@@ -441,9 +445,18 @@ mod tests {
         let mut sampler = ColorSampler::new();
         // Pure red.
         sampler.complete(Point::new(0, 0), solid_tile(255, 0, 0), Point::new(0, 0));
-        assert_eq!(sampler.formatted(ColorFormat::Hex).as_deref(), Some("#FF0000"));
-        assert_eq!(sampler.formatted(ColorFormat::Rgb).as_deref(), Some("rgb(255,0,0)"));
-        assert_eq!(sampler.formatted(ColorFormat::Hsl).as_deref(), Some("hsl(0,100%,50%)"));
+        assert_eq!(
+            sampler.formatted(ColorFormat::Hex).as_deref(),
+            Some("#FF0000")
+        );
+        assert_eq!(
+            sampler.formatted(ColorFormat::Rgb).as_deref(),
+            Some("rgb(255,0,0)")
+        );
+        assert_eq!(
+            sampler.formatted(ColorFormat::Hsl).as_deref(),
+            Some("hsl(0,100%,50%)")
+        );
         // No sample yet → nothing to render.
         sampler.reset();
         assert_eq!(sampler.formatted(ColorFormat::Hex), None);

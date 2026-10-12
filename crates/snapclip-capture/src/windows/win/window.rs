@@ -18,17 +18,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ::windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
-use ::windows::core::BOOL;
 use ::windows::Win32::Graphics::Dwm::{
     DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
 };
-use ::windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
+use ::windows::Win32::Graphics::Gdi::ScreenToClient;
 use ::windows::Win32::UI::WindowsAndMessaging::{
-    CWP_SKIPINVISIBLE, ChildWindowFromPointEx, EnumChildWindows, EnumWindows,
-    GA_PARENT, GWL_EXSTYLE, GetAncestor, GetClassNameW, GetClientRect, GetDesktopWindow,
-    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
-    WINDOW_EX_STYLE, WS_EX_LAYERED, WS_EX_TRANSPARENT,
+    CWP_SKIPINVISIBLE, ChildWindowFromPointEx, EnumChildWindows, EnumWindows, GA_PARENT,
+    GWL_EXSTYLE, GetAncestor, GetClassNameW, GetDesktopWindow, GetWindowLongPtrW, GetWindowRect,
+    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, WINDOW_EX_STYLE, WS_EX_LAYERED,
+    WS_EX_TRANSPARENT,
 };
+use ::windows::core::BOOL;
 
 use crate::geometry::{Point, Rect};
 use crate::window_detection::snapshot::{CheapProbe, DwmRead};
@@ -202,34 +202,6 @@ pub fn frame_bounds(hwnd: isize) -> Option<Rect> {
     (!bounds.is_empty()).then_some(bounds)
 }
 
-/// The centre of `hwnd`'s **client** area, in virtual-desktop screen pixels.
-///
-/// This is where the pointer has to sit for a wheel-routed injection to land on the window
-/// (`docs/30` §24.6 rule 1: `SendInput` goes to the window under the cursor, so the cursor is part
-/// of the injection). The client area, not the frame: the title bar is not part of the document,
-/// and the scroll actuator's own documentation says a cursor is placed over the client area
-/// (`crates/snapclip-capture/src/windows/scroll_actuator.rs`).
-pub fn client_center(hwnd: isize) -> Option<Point> {
-    if !is_window(hwnd) {
-        return None;
-    }
-    let window = to_hwnd(hwnd);
-    let mut client = RECT::default();
-    if unsafe { GetClientRect(window, &mut client) }.is_err() {
-        return None;
-    }
-    let mut centre = POINT {
-        x: client.left + (client.right - client.left) / 2,
-        y: client.top + (client.bottom - client.top) / 2,
-    };
-    if unsafe { ClientToScreen(window, &mut centre) }.as_bool() {
-        Some(Point::new(centre.x, centre.y))
-    } else {
-        None
-    }
-}
-
-
 /// Enumerate this desktop's visible, non-minimised, non-click-through top-level
 /// windows in Z order (frontmost first).
 ///
@@ -345,9 +317,9 @@ pub fn visible_child_rects(parent: isize, parent_bounds: Rect) -> Vec<Rect> {
             LPARAM(&mut collector as *mut Collector as isize),
         );
     }
-    collector.rects.sort_unstable_by_key(|rect| {
-        (rect.area(), rect.left, rect.top, rect.right, rect.bottom)
-    });
+    collector
+        .rects
+        .sort_unstable_by_key(|rect| (rect.area(), rect.left, rect.top, rect.right, rect.bottom));
     collector.rects.dedup();
     collector.rects
 }
@@ -412,10 +384,10 @@ mod tests {
     use super::*;
     use ::windows::Win32::Foundation::POINT;
     use ::windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DestroyWindow, DispatchMessageW, GetWindowInfo, HWND_TOP, HWND_TOPMOST, MSG,
-        PM_REMOVE, PeekMessageW, SW_HIDE, SW_MINIMIZE, SW_SHOWNA, SWP_NOACTIVATE, SWP_NOMOVE,
-        SWP_NOSIZE, SetWindowPos, ShowWindow, TranslateMessage, WINDOWINFO, WS_EX_NOACTIVATE,
-        WS_CHILD, WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
+        CreateWindowExW, DestroyWindow, DispatchMessageW, GetWindowInfo, HWND_TOP, HWND_TOPMOST,
+        MSG, PM_REMOVE, PeekMessageW, SW_HIDE, SW_MINIMIZE, SW_SHOWNA, SWP_NOACTIVATE, SWP_NOMOVE,
+        SWP_NOSIZE, SetWindowPos, ShowWindow, TranslateMessage, WINDOWINFO, WS_CHILD,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
     };
     use ::windows::core::w;
     use std::time::{Duration, Instant};
@@ -463,7 +435,10 @@ mod tests {
     }
 
     impl TestWindow {
-        fn create(extended_style: WINDOW_EX_STYLE, style: ::windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE) -> Option<Self> {
+        fn create(
+            extended_style: WINDOW_EX_STYLE,
+            style: ::windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE,
+        ) -> Option<Self> {
             let window = unsafe {
                 CreateWindowExW(
                     extended_style | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
@@ -549,11 +524,15 @@ mod tests {
             !is_click_through_layered(WS_EX_TRANSPARENT.0),
             "WS_EX_TRANSPARENT alone only changes paint ordering"
         );
-        assert!(is_click_through_layered((WS_EX_LAYERED | WS_EX_TRANSPARENT).0));
+        assert!(is_click_through_layered(
+            (WS_EX_LAYERED | WS_EX_TRANSPARENT).0
+        ));
         // The shell's full-desktop handwriting canvas: layered + transparent + more.
         assert!(is_click_through_layered(0x0a08_00a8));
         // Tool window / no-activate are not click-through.
-        assert!(!is_click_through_layered((WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE).0));
+        assert!(!is_click_through_layered(
+            (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE).0
+        ));
     }
 
     /// The pass-through flag is the one thing that crosses threads between the refinement worker
@@ -563,15 +542,23 @@ mod tests {
     #[test]
     fn the_hit_test_pass_through_lasts_exactly_as_long_as_its_guard() {
         let flag = HitTestPassThrough::default();
-        assert!(!flag.is_active(), "nothing passes through until a query asks");
+        assert!(
+            !flag.is_active(),
+            "nothing passes through until a query asks"
+        );
         {
             let _guard = flag.guard();
             assert!(flag.is_active(), "set for the accessibility call it wraps");
             let other = flag.clone();
-            let seen = std::thread::spawn(move || other.is_active()).join().unwrap();
+            let seen = std::thread::spawn(move || other.is_active())
+                .join()
+                .unwrap();
             assert!(seen, "the window procedure and the worker share one flag");
         }
-        assert!(!flag.is_active(), "the guard clears it again, on every path");
+        assert!(
+            !flag.is_active(),
+            "the guard clears it again, on every path"
+        );
         // Two guards in sequence must not leave it set (a leaked flag would make the overlay
         // miss real clicks for the rest of the session).
         drop(flag.guard());
@@ -608,7 +595,10 @@ mod tests {
         // Hiding it removes it, even though the handle is still valid.
         let _ = unsafe { ShowWindow(window.hwnd(), SW_HIDE) };
         pump(40);
-        assert!(is_window(handle), "the handle itself stays valid while hidden");
+        assert!(
+            is_window(handle),
+            "the handle itself stays valid while hidden"
+        );
         let candidates = enumerate_cheap_candidates().expect("EnumWindows succeeds");
         assert!(
             !candidates.iter().any(|probe| probe.hwnd == handle),
@@ -659,11 +649,15 @@ mod tests {
 
         let candidates = enumerate_cheap_candidates().expect("EnumWindows succeeds");
         assert!(
-            !candidates.iter().any(|probe| probe.hwnd == overlay.handle()),
+            !candidates
+                .iter()
+                .any(|probe| probe.hwnd == overlay.handle()),
             "a click-through overlay must not be a candidate"
         );
         assert!(
-            candidates.iter().any(|probe| probe.hwnd == ordinary.handle()),
+            candidates
+                .iter()
+                .any(|probe| probe.hwnd == ordinary.handle()),
             "the window under a click-through overlay stays selectable"
         );
     }
@@ -708,7 +702,10 @@ mod tests {
             x: info.rcClient.left + 20,
             y: bounds.top + (info.rcClient.top - bounds.top) / 2,
         };
-        assert!(contains(bounds, caption), "the caption belongs to the frame");
+        assert!(
+            contains(bounds, caption),
+            "the caption belongs to the frame"
+        );
         let client = to_rect(info.rcClient);
         assert!(!contains(client, caption), "the caption is not client area");
 
@@ -718,10 +715,22 @@ mod tests {
         assert!(unsafe { GetWindowRect(window.hwnd(), &mut raw) }.is_ok());
         let raw = to_rect(raw);
         const TOLERANCE: i32 = 16;
-        assert!(bounds.left >= raw.left - TOLERANCE, "frame={bounds:?} raw={raw:?}");
-        assert!(bounds.top >= raw.top - TOLERANCE, "frame={bounds:?} raw={raw:?}");
-        assert!(bounds.right <= raw.right + TOLERANCE, "frame={bounds:?} raw={raw:?}");
-        assert!(bounds.bottom <= raw.bottom + TOLERANCE, "frame={bounds:?} raw={raw:?}");
+        assert!(
+            bounds.left >= raw.left - TOLERANCE,
+            "frame={bounds:?} raw={raw:?}"
+        );
+        assert!(
+            bounds.top >= raw.top - TOLERANCE,
+            "frame={bounds:?} raw={raw:?}"
+        );
+        assert!(
+            bounds.right <= raw.right + TOLERANCE,
+            "frame={bounds:?} raw={raw:?}"
+        );
+        assert!(
+            bounds.bottom <= raw.bottom + TOLERANCE,
+            "frame={bounds:?} raw={raw:?}"
+        );
         assert!(bounds.width() >= raw.width() / 2);
         assert!(bounds.height() >= raw.height() / 2);
 
@@ -751,7 +760,10 @@ mod tests {
             .expect("desktop is available");
         let handle = window.handle();
         let class = class_name(handle).expect("a static window has a class name");
-        assert_eq!(class, "Static", "CreateWindowExW(w!(\"STATIC\")) resolves to Static");
+        assert_eq!(
+            class, "Static",
+            "CreateWindowExW(w!(\"STATIC\")) resolves to Static"
+        );
         assert_eq!(class_name(handle).as_deref(), Some(class.as_str()));
         assert_eq!(process_id(handle), std::process::id());
         assert!(is_window_visible(handle));
@@ -790,28 +802,38 @@ mod tests {
         let parent = TestWindow::create(WINDOW_EX_STYLE(0), WS_OVERLAPPEDWINDOW | WS_VISIBLE)
             .expect("desktop is available");
         parent.bring_to_front();
-        let stacked = |title| unsafe {
-            CreateWindowExW(
-                WS_EX_NOACTIVATE,
-                w!("STATIC"),
-                title,
-                WS_CHILD | WS_VISIBLE,
-                20,
-                40,
-                120,
-                60,
-                Some(parent.hwnd()),
-                None,
-                None,
-                None,
-            )
-        }
-        .expect("child window creation succeeds");
+        let stacked = |title| {
+            unsafe {
+                CreateWindowExW(
+                    WS_EX_NOACTIVATE,
+                    w!("STATIC"),
+                    title,
+                    WS_CHILD | WS_VISIBLE,
+                    20,
+                    40,
+                    120,
+                    60,
+                    Some(parent.hwnd()),
+                    None,
+                    None,
+                    None,
+                )
+            }
+            .expect("child window creation succeeds")
+        };
         let below = stacked(w!("SnapClip hidden tab"));
         let above = stacked(w!("SnapClip active tab"));
         // Explicit z-order: creation order alone does not say which sibling ends up on top.
         unsafe {
-            SetWindowPos(above, Some(HWND_TOP), 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE)
+            SetWindowPos(
+                above,
+                Some(HWND_TOP),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+            )
         }
         .expect("restack the children");
         pump(60);
@@ -884,33 +906,5 @@ mod tests {
         }
         let _ = unsafe { DestroyWindow(child) };
         pump(20);
-    }
-
-    /// `P7.03`: the visible frame has exactly **one** reader in this crate.
-    ///
-    /// The defect this pins was real: `windows/scroll_probe.rs` carried its own
-    /// `DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)` helper next to the production
-    /// [`frame_bounds`], and its sibling `window_geometry` documented the *window* rectangle as
-    /// "what a window-level WGC capture delivers" — contradicting both `frame_bounds` and the
-    /// measurement. Two implementations of one rectangle are two places to get it wrong, and
-    /// only a source gate can see them: no behavioural test can observe "this code exists".
-    ///
-    /// The precedent is `windows/scroll_source.rs`'s `this_module_never_becomes_a_context_user`,
-    /// which gates the same way for the immediate context.
-    #[test]
-    fn the_visible_frame_has_exactly_one_reader() {
-        const PROBE: &str = include_str!("../scroll_probe.rs");
-        for needle in [
-            "DwmGetWindowAttribute",
-            "DWMWA_EXTENDED_FRAME_BOUNDS",
-            "fn visible_geometry",
-        ] {
-            assert!(
-                !PROBE.contains(needle),
-                "scroll_probe.rs must ask `window::frame_bounds` for the visible frame instead \
-                 of reading DWM itself ({needle}); two readers of one rectangle are two chances \
-                 to build a plan from the wrong one (docs/32 §4.3)"
-            );
-        }
     }
 }

@@ -13,11 +13,8 @@
 //! * [`export_worker`] — persistent export thread: encode and atomic write off the UI
 //! * [`top_level_provider`], [`uia_provider`], [`msaa_provider`] — the three target
 //!   sources behind the detection workers
-//! * [`scroll_source`] / [`scroll_actuator`] — window-level frame stream and the wheel
-//!   injection the scroll loop drives
-//! * [`scroll_target`] — the platform half of target choice: the window snapshot's handles and
-//!   virtual-desktop coordinates become the scroll rule's opaque identity and local pixels
-//!   (`docs/32` §4.2)
+//! * [`scroll_worker`] — the scroll capture thread: monitor frames in, the long image and its
+//!   thumbnail out, plus the wheel the auto mode injects (`docs/33`)
 //! * [`win`] — thin GPU/WinRT wrappers (D3D11, DXGI, WGC, D2D)
 //!
 //! The adapter produces pixels through [`crate::artifact::CaptureService`] and hands
@@ -34,14 +31,7 @@ pub mod overlay;
 pub mod providers;
 pub mod refinement_worker;
 pub mod renderer;
-pub mod scroll_actuator;
-/// Measure-only probe for the injection decision (`docs/30` §24.6, `E-INJECT-1`).
-/// It exists to answer "can we actually drive this window's scroll position",
-/// never to ship: it is test-only and nothing in the capture path calls it.
-#[cfg(test)]
-pub mod scroll_probe;
-pub mod scroll_source;
-pub mod scroll_target;
+pub mod scroll_worker;
 pub mod timed_call;
 pub mod top_level_provider;
 pub mod uia_provider;

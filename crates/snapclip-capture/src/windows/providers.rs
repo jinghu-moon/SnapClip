@@ -6,15 +6,15 @@ use std::time::Instant;
 
 use ::windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 
-use crate::ports::PixelSliceSource;
 use crate::geometry::Rect;
+use crate::ports::PixelSliceSource;
 use crate::session::CapturedFrame;
 use crate::{CaptureError, CaptureResult};
 use snapclip_model::PixelFormat;
 
 use super::monitor::CapturedMonitor;
 use super::win::bitblt;
-use super::win::d3d11::{GraphicsDevice, GpuFrame};
+use super::win::d3d11::{GpuFrame, GraphicsDevice};
 use super::win::wgc;
 
 /// Which provider produced a frame.
@@ -22,11 +22,6 @@ use super::win::wgc;
 pub enum ProviderKind {
     Wgc,
     BitBlt,
-    /// The window-level WGC path (`CreateForWindow` + one session-long pool).
-    ///
-    /// It is not an alternative monitor provider: the scroll path is its only caller
-    /// (`docs/30` §24.2), and it delivers many frames per session instead of one.
-    WgcWindow,
 }
 
 impl ProviderKind {
@@ -34,83 +29,7 @@ impl ProviderKind {
         match self {
             Self::Wgc => "wgc",
             Self::BitBlt => "bitblt",
-            Self::WgcWindow => "wgc-window",
         }
-    }
-}
-
-/// What the capture stack can actually control, assembled once per session (`docs/30` §24.3).
-///
-/// It is a **value, not a log line**: the session prints it once at the start and the UI reads
-/// it to decide whether to warn the user ("this long image will carry the capture border").
-/// `None` means the platform does not offer the option at all; `Some(true)` means it was
-/// offered and the call was refused — in both cases the pixels show it, and the difference is
-/// only what the user can do about it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CaptureCapabilities {
-    /// `Some(true)` = the capture border will be drawn into the image.
-    pub border_control: Option<bool>,
-    /// `Some(true)` = the cursor will be captured into the image.
-    pub cursor_control: Option<bool>,
-    /// Recorded but never enabled (`docs/30` §11.4): we need full frames.
-    pub dirty_regions: bool,
-    /// Which provider this session ended up on.
-    pub backend: ProviderKind,
-    /// Whether the target is captured as a window (no occluders) rather than as a monitor.
-    pub window_target: bool,
-}
-
-impl CaptureCapabilities {
-    /// Assemble the table from a probed session (`P2.06` supplies `backend`/`window_target`).
-    pub fn from_options(
-        options: wgc::CaptureOptions,
-        backend: ProviderKind,
-        window_target: bool,
-    ) -> Self {
-        Self {
-            border_control: options.border_control,
-            cursor_control: options.cursor_control,
-            dirty_regions: options.dirty_regions,
-            backend,
-            window_target,
-        }
-    }
-
-    /// Every degradation, in the words the UI would use. Empty means nothing was lost.
-    ///
-    /// This is what makes G12 mechanical: a degradation that is not in this list does not
-    /// exist as far as the user is concerned, so every `None`/`Some(true)` has a sentence.
-    pub fn degradations(&self) -> Vec<&'static str> {
-        let mut out = Vec::new();
-        match self.border_control {
-            Some(false) => {}
-            Some(true) => out.push("the capture border could not be suppressed"),
-            None => out.push("this system cannot suppress the capture border"),
-        }
-        match self.cursor_control {
-            Some(false) => {}
-            Some(true) => out.push("the cursor could not be excluded from the capture"),
-            None => out.push("this system cannot exclude the cursor; it is masked out instead"),
-        }
-        out
-    }
-
-    /// One line for the session log (`docs/30` §24.3: printed once, then published).
-    pub fn describe(&self) -> String {
-        let degradations = self.degradations();
-        format!(
-            "capture backend={} window_target={} border={:?} cursor={:?} dirty_regions={} degraded={}",
-            self.backend.name(),
-            self.window_target,
-            self.border_control,
-            self.cursor_control,
-            self.dirty_regions,
-            if degradations.is_empty() {
-                "none".to_string()
-            } else {
-                degradations.join("; ")
-            }
-        )
     }
 }
 
@@ -354,7 +273,9 @@ fn crop_pixel_rows(pixels: &[u8], stride: usize, region: Rect) -> Option<Vec<u8>
     let mut output = Vec::with_capacity(width * height * 4);
     for row in 0..height {
         let source_row = top.checked_add(row)?;
-        let start = source_row.checked_mul(stride)?.checked_add(left.checked_mul(4)?)?;
+        let start = source_row
+            .checked_mul(stride)?
+            .checked_add(left.checked_mul(4)?)?;
         let end = start.checked_add(width * 4)?;
         output.extend_from_slice(pixels.get(start..end)?);
     }
@@ -444,10 +365,8 @@ impl CaptureProviders {
                         started_at.elapsed().as_millis(),
                         error
                     );
-                    self.diagnostics.push(format!(
-                        "{} provider failed: {error}",
-                        provider.name()
-                    ));
+                    self.diagnostics
+                        .push(format!("{} provider failed: {error}", provider.name()));
                     self.preferred = Some(ProviderKind::BitBlt);
                     last_error = Some(error);
                 }
@@ -467,8 +386,9 @@ impl CaptureProviders {
             ProviderKind::Wgc => {
                 // No readback here: L0 renders from this texture and the CPU copy is
                 // produced lazily only if an artifact is actually exported.
-                let gpu = wgc::capture_monitor(&self.device, monitor)
-                    .map_err(|message| classify_device_error("Windows Graphics Capture", message))?;
+                let gpu = wgc::capture_monitor(&self.device, monitor).map_err(|message| {
+                    classify_device_error("Windows Graphics Capture", message)
+                })?;
                 Ok(frozen_frame(
                     monitor,
                     ProviderKind::Wgc,
@@ -478,8 +398,8 @@ impl CaptureProviders {
                 ))
             }
             ProviderKind::BitBlt => {
-                let captured = bitblt::capture_monitor(monitor)
-                    .map_err(CaptureError::CaptureFailed)?;
+                let captured =
+                    bitblt::capture_monitor(monitor).map_err(CaptureError::CaptureFailed)?;
                 // BitBlt hands back CPU pixels, so upload them once to get the same
                 // GPU-resident L0 representation the WGC path has. Phase 3: retain the
                 // original CPU pixels so the export path crops them directly instead of
@@ -497,10 +417,6 @@ impl CaptureProviders {
                     Some(cpu_pixels),
                 ))
             }
-            ProviderKind::WgcWindow => Err(CaptureError::ProviderUnavailable(
-                "the window-level provider serves the scroll path, not a monitor capture"
-                    .into(),
-            )),
         }
     }
 }
@@ -594,13 +510,6 @@ pub(crate) fn test_frozen_frame(width: u32, height: u32) -> FrozenFrame {
 /// testable without a GPU.
 fn attempt_order(preferred: Option<ProviderKind>) -> Vec<ProviderKind> {
     let mut attempts = Vec::new();
-    // The window backend belongs to the scroll path, which orders its own backends
-    // (`docs/30` §24.7, task `P2.06`). It is returned as a *single* attempt here so a
-    // wiring mistake fails loudly instead of silently reading the desktop through the
-    // BitBlt fallback and reporting a frame that is not the target window's.
-    if preferred == Some(ProviderKind::WgcWindow) {
-        return vec![ProviderKind::WgcWindow];
-    }
     if preferred == Some(ProviderKind::Wgc) {
         attempts.push(ProviderKind::Wgc);
     }
@@ -608,261 +517,20 @@ fn attempt_order(preferred: Option<ProviderKind>) -> Vec<ProviderKind> {
     attempts
 }
 
-/// Where one region readback of a delivered frame actually goes.
-///
-/// The policy above the transfer — clip the request to the frame, refuse a second read
-/// of the same frame, account the bytes — is worth testing without a GPU, so the
-/// transfer is a seam: `GpuTransfer` is the production implementation and the tests
-/// substitute a recorder. Both go through [`ScrollFrame::read_region`].
-trait RegionTransfer {
-    /// The frame's pixel size, which is what a request is clipped against.
-    fn size(&self) -> (u32, u32);
-
-    /// Copy `region` (already clipped to the frame) out of the frame.
-    fn transfer(&mut self, region: Rect) -> Result<Vec<u8>, String>;
-}
-
-/// The production transfer: `CopySubresourceRegion` into a region-sized staging
-/// texture, so the bytes that cross the bus are the region's, not the monitor's.
-struct GpuTransfer {
-    device: Arc<GraphicsDevice>,
-    texture: ID3D11Texture2D,
-    size: (u32, u32),
-}
-
-impl RegionTransfer for GpuTransfer {
-    fn size(&self) -> (u32, u32) {
-        self.size
-    }
-
-    fn transfer(&mut self, region: Rect) -> Result<Vec<u8>, String> {
-        self.device.read_back_region_bgra(
-            &self.texture,
-            region.left.max(0) as u32,
-            region.top.max(0) as u32,
-            region.width() as u32,
-            region.height() as u32,
-        )
-    }
-}
-
-/// One delivered frame of the window-level capture path, read back **once**.
-///
-/// This is the scroll path's replacement for [`FrozenFrame`]: a session delivers many
-/// frames, each of which is alive only until the next one, and each of which may be read
-/// back exactly once (§11.3 — "每一步只允许产生一次 GPU→CPU 拷贝"). The read is lazy
-/// because a delivered frame is not a wanted frame: the step decides, and the stability
-/// window's second look at the *same* frame is not a second transfer.
-pub struct ScrollFrame {
-    /// The delivered frame, kept alive for as long as its texture is read from.
-    ///
-    /// The frame pool owns the buffer the texture points at and reclaims it when the
-    /// frame is dropped, so this field is a lifetime anchor rather than data.
-    #[allow(dead_code)]
-    delivered: Option<wgc::WgcFrame>,
-    transfer: Box<dyn RegionTransfer>,
-    reads: u32,
-    read_bytes: u64,
-}
-
-impl ScrollFrame {
-    /// Wrap a frame delivered by a [`wgc::WgcSession`].
-    pub fn from_wgc(device: Arc<GraphicsDevice>, frame: wgc::WgcFrame) -> Self {
-        let (width, height) = frame.size();
-        let size = (width.max(0) as u32, height.max(0) as u32);
-        let texture = frame.texture().clone();
-        Self {
-            delivered: Some(frame),
-            transfer: Box::new(GpuTransfer {
-                device,
-                texture,
-                size,
-            }),
-            reads: 0,
-            read_bytes: 0,
-        }
-    }
-
-    #[cfg(test)]
-    fn from_transfer(transfer: Box<dyn RegionTransfer>) -> Self {
-        Self {
-            delivered: None,
-            transfer,
-            reads: 0,
-            read_bytes: 0,
-        }
-    }
-
-    /// The frame's pixel size — the viewport of the step that will read it.
-    pub fn size(&self) -> (u32, u32) {
-        self.transfer.size()
-    }
-
-    pub fn provider(&self) -> ProviderKind {
-        ProviderKind::WgcWindow
-    }
-
-    /// How many GPU→CPU transfers this frame has paid for. At most one, ever.
-    pub fn reads(&self) -> u32 {
-        self.reads
-    }
-
-    /// Bytes that actually crossed the bus for this frame.
-    pub fn read_bytes(&self) -> u64 {
-        self.read_bytes
-    }
-
-    /// Tightly packed BGRA pixels of one region of this frame.
-    ///
-    /// `region` is frame-local and is clipped to the frame; a region that cannot supply
-    /// a single pixel is an error rather than an empty buffer, so no estimator ever sees
-    /// a zero-size frame. Calling this twice is an error too: the second call would be a
-    /// second transfer of the same pixels, which §11.3 forbids, and returning a cached
-    /// copy would hide that the caller is stepping twice over one frame.
-    pub fn read_region(&mut self, region: Rect) -> CaptureResult<Vec<u8>> {
-        if self.reads > 0 {
-            return Err(CaptureError::InvalidState(
-                "this frame has already been read back once; a frame is read once and \
-                 then replaced (§11.3) — take the next frame instead of reading this one twice"
-                    .into(),
-            ));
-        }
-        let (width, height) = self.transfer.size();
-        let frame_rect = Rect::new(0, 0, width as i32, height as i32);
-        let clipped = region.intersect(frame_rect);
-        if clipped.is_empty() {
-            return Err(CaptureError::InvalidState(if region.is_empty() {
-                "the region to read is empty".into()
-            } else {
-                "the region to read does not overlap the captured frame".into()
-            }));
-        }
-        let expected = clipped.width() as usize * clipped.height() as usize * 4;
-        let started_at = Instant::now();
-        // Counted before the call: a transfer that comes back short still happened, and
-        // the caller must not be able to retry it on this frame.
-        self.reads += 1;
-        let pixels = self
-            .transfer
-            .transfer(clipped)
-            .map_err(|message| classify_device_error("GPU region readback", message))?;
-        self.read_bytes += pixels.len() as u64;
-        if pixels.len() != expected {
-            return Err(CaptureError::CaptureFailed(format!(
-                "region readback returned {} bytes, expected {expected}",
-                pixels.len()
-            )));
-        }
-        eprintln!(
-            "[snapclip][capture] scroll region read provider={} frame={}x{} region=({},{})-{}x{} bytes={} elapsed_ms={}",
-            self.provider().name(),
-            width,
-            height,
-            clipped.left,
-            clipped.top,
-            clipped.width(),
-            clipped.height(),
-            pixels.len(),
-            started_at.elapsed().as_millis()
-        );
-        Ok(pixels)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        attempt_order, classify_device_error, crop_pixel_rows, CaptureProviders, FrozenFrame,
-        FrozenFramePixels, GraphicsDevice, ProviderKind, RegionTransfer, ScrollFrame,
+        CaptureProviders, FrozenFrame, FrozenFramePixels, GraphicsDevice, ProviderKind,
+        attempt_order, classify_device_error, crop_pixel_rows,
     };
     use crate::CaptureError;
-    use crate::ports::PixelSliceSource;
     use crate::geometry::Rect;
+    use crate::ports::PixelSliceSource;
 
     /// Shorthand for the shared test frame, which lives outside `tests` so the export
     /// worker can build an `Arc<FrozenFrame>` with no GPU either.
     fn frozen(width: u32, height: u32) -> FrozenFrame {
         super::test_frozen_frame(width, height)
-    }
-
-    /// `docs/30 §24.3`'s exit condition ③ in executable form: **every** degradation has a
-    /// sentence, so "the long image has a border" is something the user is told rather than
-    /// something they notice. The table is the single place a degradation can hide.
-    #[test]
-    fn every_degradation_reaches_the_capability_table() {
-        use super::CaptureCapabilities;
-        use crate::windows::win::wgc::CaptureOptions;
-
-        let healthy = CaptureCapabilities::from_options(
-            CaptureOptions {
-                cursor_control: Some(false),
-                border_control: Some(false),
-                dirty_regions: true,
-            },
-            ProviderKind::WgcWindow,
-            true,
-        );
-        assert!(
-            healthy.degradations().is_empty(),
-            "a session where both options applied has nothing to report"
-        );
-        let line = healthy.describe();
-        assert!(line.contains("backend=wgc-window"), "{line}");
-        assert!(line.contains("window_target=true"), "{line}");
-        assert!(line.contains("degraded=none"), "{line}");
-
-        // Both failure modes, for both options: absent interface and refused call.
-        for (options, expect_border, expect_cursor) in [
-            (
-                CaptureOptions {
-                    cursor_control: None,
-                    border_control: None,
-                    dirty_regions: false,
-                },
-                true,
-                true,
-            ),
-            (
-                CaptureOptions {
-                    cursor_control: Some(true),
-                    border_control: Some(true),
-                    dirty_regions: true,
-                },
-                true,
-                true,
-            ),
-            (
-                CaptureOptions {
-                    cursor_control: Some(false),
-                    border_control: None,
-                    dirty_regions: true,
-                },
-                true,
-                false,
-            ),
-        ] {
-            let degraded =
-                CaptureCapabilities::from_options(options, ProviderKind::WgcWindow, true);
-            let listed = degraded.degradations();
-            assert_eq!(
-                listed.iter().any(|line| line.contains("border")),
-                expect_border,
-                "border degradation missing from {listed:?} for {options:?}"
-            );
-            assert_eq!(
-                listed.iter().any(|line| line.contains("cursor")),
-                expect_cursor,
-                "cursor degradation missing from {listed:?} for {options:?}"
-            );
-            // The log line must carry the same words, not a bare `None`.
-            let line = degraded.describe();
-            for sentence in &listed {
-                assert!(
-                    line.contains(sentence),
-                    "the log line dropped {sentence:?}: {line}"
-                );
-            }
-        }
     }
 
     #[test]
@@ -892,7 +560,11 @@ mod tests {
         let frame = frozen(4, 3);
         let pixels = frame.read_region(Rect::new(1, 2, 3, 3)).unwrap();
         assert_eq!(pixels, vec![1, 2, 0, 255, 2, 2, 0, 255]);
-        assert_eq!(pixels.len(), 2 * 4, "a 2x1 selection is exactly two BGRA pixels");
+        assert_eq!(
+            pixels.len(),
+            2 * 4,
+            "a 2x1 selection is exactly two BGRA pixels"
+        );
     }
 
     #[test]
@@ -939,7 +611,9 @@ mod tests {
         let whole = crop_pixel_rows(&padded, 12, Rect::new(0, 0, 2, 2)).unwrap();
         assert_eq!(
             whole,
-            vec![10, 10, 0, 255, 11, 10, 0, 255, 12, 10, 0, 255, 13, 10, 0, 255]
+            vec![
+                10, 10, 0, 255, 11, 10, 0, 255, 12, 10, 0, 255, 13, 10, 0, 255
+            ]
         );
     }
 
@@ -976,7 +650,10 @@ mod tests {
         // After a WGC failure the preferred provider is demoted to BitBlt; the
         // next session must not re-attempt the broken WGC path, and a machine
         // that never had WGC goes straight to BitBlt.
-        assert_eq!(attempt_order(Some(ProviderKind::BitBlt)), vec![ProviderKind::BitBlt]);
+        assert_eq!(
+            attempt_order(Some(ProviderKind::BitBlt)),
+            vec![ProviderKind::BitBlt]
+        );
         assert_eq!(attempt_order(None), vec![ProviderKind::BitBlt]);
     }
 
@@ -1020,8 +697,8 @@ mod tests {
     #[ignore = "L3 (docs/31 D-14): probes and captures the monitor at the cursor; run with --ignored --test-threads=1 on a live desktop"]
     fn providers_probe_and_capture_a_real_monitor_when_available() {
         let _ = super::super::monitor::set_per_monitor_v2_awareness();
-        let mut providers = CaptureProviders::new()
-            .expect("this test needs a D3D11 device (docs/31 D-14)");
+        let mut providers =
+            CaptureProviders::new().expect("this test needs a D3D11 device (docs/31 D-14)");
         let monitor = super::super::monitor::captured_monitor_at_cursor()
             .expect("this test needs a monitor at the cursor (docs/31 D-14)");
         match providers.capture(&monitor) {
@@ -1057,16 +734,21 @@ mod tests {
     #[ignore = "L3 (docs/31 D-14): reads a region back from the monitor at the cursor; run with --ignored --test-threads=1 on a live desktop"]
     fn a_300x200_selection_reads_back_only_its_own_bytes() {
         let _ = super::super::monitor::set_per_monitor_v2_awareness();
-        let mut providers = CaptureProviders::new()
-            .expect("this test needs a D3D11 device (docs/31 D-14)");
+        let mut providers =
+            CaptureProviders::new().expect("this test needs a D3D11 device (docs/31 D-14)");
         let monitor = super::super::monitor::captured_monitor_at_cursor()
             .expect("this test needs a monitor at the cursor (docs/31 D-14)");
-        let frozen = providers
-            .capture(&monitor)
-            .unwrap_or_else(|error| panic!("capture refused on the desktop this test asked for: {error}"));
+        let frozen = providers.capture(&monitor).unwrap_or_else(|error| {
+            panic!("capture refused on the desktop this test asked for: {error}")
+        });
         // WGC frames have no CPU pixels, so this exercises `CopySubresourceRegion`.
         // A BitBlt frame is the CPU crop; both must return the selection's bytes.
-        let selection = Rect::new(0, 0, 300.min(monitor.width() as i32), 200.min(monitor.height() as i32));
+        let selection = Rect::new(
+            0,
+            0,
+            300.min(monitor.width() as i32),
+            200.min(monitor.height() as i32),
+        );
         let pixels = frozen.read_region(selection).unwrap();
         assert_eq!(
             pixels.len(),
@@ -1078,168 +760,4 @@ mod tests {
             "a region readback must never materialise the full frame"
         );
     }
-
-    // --- the scroll path reads regions (§11.3, §24.2; task P2.02) ---------------
-
-    /// Records what the device was asked for, so the *request* can be asserted and
-    /// not only its result.
-    ///
-    /// A real transfer would need a GPU; the policy under test here is which rect is
-    /// asked for, whether a frame is read at all before a step wants it, and how many
-    /// bytes are accounted — all three are visible from outside the transfer.
-    struct RegionRecorder {
-        size: (u32, u32),
-        calls: std::sync::Arc<std::sync::Mutex<Vec<Rect>>>,
-    }
-
-    impl RegionTransfer for RegionRecorder {
-        fn size(&self) -> (u32, u32) {
-            self.size
-        }
-
-        fn transfer(&mut self, region: Rect) -> Result<Vec<u8>, String> {
-            self.calls.lock().unwrap().push(region);
-            let bytes = region.width() as usize * region.height() as usize * 4;
-            Ok(vec![0u8; bytes])
-        }
-    }
-
-    fn recording_frame(
-        size: (u32, u32),
-    ) -> (ScrollFrame, std::sync::Arc<std::sync::Mutex<Vec<Rect>>>) {
-        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let frame = ScrollFrame::from_transfer(Box::new(RegionRecorder {
-            size,
-            calls: calls.clone(),
-        }));
-        (frame, calls)
-    }
-
-    #[test]
-    fn a_scroll_source_reads_a_region_instead_of_the_whole_frame() {
-        let (mut frame, calls) = recording_frame((1280, 960));
-        assert_eq!(frame.size(), (1280, 960));
-        assert_eq!(frame.provider(), ProviderKind::WgcWindow);
-        // Receiving a frame is not reading it: the transfer happens when a step asks
-        // for the region it needs (F-01 — a step only needs the newly revealed band).
-        assert_eq!(frame.reads(), 0, "delivering a frame must not read it back");
-
-        let viewport = Rect::new(0, 0, 1280, 960);
-        let pixels = frame
-            .read_region(viewport)
-            .expect("the viewport of a delivered frame must read back");
-        assert_eq!(pixels.len(), 1280 * 960 * 4);
-        assert_eq!(frame.reads(), 1);
-        assert_eq!(frame.read_bytes(), (1280 * 960 * 4) as u64);
-        assert_eq!(calls.lock().unwrap().as_slice(), &[viewport]);
-
-        // A region smaller than the frame costs the region's bytes, and the request
-        // the device receives is that region — never the frame around it.
-        let (mut frame, calls) = recording_frame((1280, 960));
-        let band = Rect::new(0, 700, 1280, 960);
-        let pixels = frame.read_region(band).unwrap();
-        assert_eq!(pixels.len(), 1280 * 260 * 4);
-        assert!(pixels.len() < (1280 * 960 * 4) / 2);
-        assert_eq!(calls.lock().unwrap().as_slice(), &[band]);
-
-        // A region hanging off the frame is clipped to it, and the clipped rect is
-        // what the device is asked for.
-        let (mut frame, calls) = recording_frame((1280, 960));
-        let pixels = frame.read_region(Rect::new(1200, 900, 1400, 1100)).unwrap();
-        assert_eq!(pixels.len(), 80 * 60 * 4);
-        assert_eq!(
-            calls.lock().unwrap().as_slice(),
-            &[Rect::new(1200, 900, 1280, 960)]
-        );
-
-        // A region with no overlap is refused *before* the transfer: an empty buffer
-        // must never reach the estimator as if it were a frame.
-        let (mut frame, calls) = recording_frame((1280, 960));
-        assert!(frame.read_region(Rect::new(2000, 2000, 10, 10)).is_err());
-        assert!(frame.read_region(Rect::new(0, 0, 0, 10)).is_err());
-        assert!(calls.lock().unwrap().is_empty());
-        assert_eq!(frame.reads(), 0, "a refused region must not reach the device");
-        assert_eq!(frame.read_bytes(), 0);
-    }
-
-    #[test]
-    fn reading_the_same_region_twice_is_an_error_or_a_cache_hit_but_never_a_second_gpu_transfer() {
-        let (mut frame, calls) = recording_frame((1280, 960));
-        let viewport = Rect::new(0, 0, 1280, 960);
-        frame.read_region(viewport).expect("the first read is the step's");
-
-        let second = frame.read_region(viewport);
-        assert!(
-            matches!(second, Err(CaptureError::InvalidState(_))),
-            "a second read of the same frame must be refused, not silently repeated"
-        );
-        assert_eq!(
-            calls.lock().unwrap().len(),
-            1,
-            "the refused read must never reach the device"
-        );
-        assert_eq!(frame.reads(), 1);
-        assert_eq!(
-            frame.read_bytes(),
-            (1280 * 960 * 4) as u64,
-            "the byte account must not count a transfer that did not happen"
-        );
-    }
-
-    #[test]
-    fn one_hundred_delivered_frames_cost_one_hundred_region_reads() {
-        // §30.1's "每步仅一次回读" row, in the form the capture layer can check on its
-        // own: 100 frames in, 100 transfers, no matter how many steps asked.
-        let mut transfers = 0u32;
-        for _ in 0..100 {
-            let (mut frame, calls) = recording_frame((1280, 960));
-            frame.read_region(Rect::new(0, 0, 1280, 960)).unwrap();
-            transfers += calls.lock().unwrap().len() as u32;
-        }
-        assert_eq!(transfers, 100);
-    }
-
-    #[test]
-    fn a_short_transfer_is_an_error_rather_than_a_truncated_frame() {
-        // A transfer that returns fewer bytes than the claim asked for must not reach
-        // the estimator: a short buffer would be read as if its rows were the frame's.
-        let (mut frame, _calls) = recording_frame((1280, 960));
-        let short = frame.read_region(Rect::new(0, 0, 4, 4)).unwrap();
-        assert_eq!(short.len(), 4 * 4 * 4);
-        assert!(frame.read_region(Rect::new(0, 0, 4, 4)).is_err());
-    }
-
-    #[test]
-    fn the_window_backend_is_not_a_monitor_backend() {
-        // `ProviderKind::WgcWindow` exists so the scroll path has a name for its own
-        // backend; it is not an alternative monitor provider, and asking the monitor
-        // path for it must fail loudly instead of silently reading the desktop.
-        assert_eq!(ProviderKind::WgcWindow.name(), "wgc-window");
-        let device = match GraphicsDevice::create() {
-            Ok(device) => std::sync::Arc::new(device),
-            Err(message) => {
-                panic!("P2.02 needs a D3D11 device to check the monitor/window split: {message}")
-            }
-        };
-        let mut providers = CaptureProviders {
-            device,
-            preferred: Some(ProviderKind::WgcWindow),
-            diagnostics: Vec::new(),
-        };
-        let monitor = super::super::monitor::captured_monitor_at_cursor();
-        if let Ok(monitor) = monitor {
-            let error = providers
-                .capture(&monitor)
-                .expect_err("the window backend must not serve a monitor capture");
-            assert!(
-                matches!(error, CaptureError::ProviderUnavailable(_)),
-                "expected ProviderUnavailable, got {error:?}"
-            );
-        }
-    }
 }
-
-
-
-
-

@@ -52,36 +52,13 @@ pub struct ExportJob {
     /// current is dropped, and its artifact deleted.
     pub generation: u64,
     pub session_id: String,
-    /// What to encode: a screenshot's pixels, or a scroll session's canvas (`docs/32` ADR-21).
-    pub(crate) source: ExportSource,
+    /// What to encode: a screenshot's selection, or a finished scroll session's long image.
+    pub prepared: SelectionPixels,
     pub dpi: u32,
     pub monitor_device_name: Option<String>,
     /// Overlay UI thread id to wake with [`EXPORT_READY_MESSAGE`].
     pub notify_thread: u32,
     pub executor: ExportExecutor,
-}
-
-/// The two things an export can be (`docs/32` ADR-21).
-///
-/// One struct rather than two workers: an export is one job with one generation, one notify thread
-/// and one result slot, and a session produces either a screenshot or a long image, never both. The
-/// executor dispatches on this instead of the overlay having to build two of them.
-pub(crate) enum ExportSource {
-    /// An ordinary screenshot: the whole region, read back on the overlay thread.
-    Selection(SelectionPixels),
-    /// A scroll session's canvas, written band by band on the export thread.
-    Rows(RowBandJob),
-}
-
-/// A long image waiting to be written (`docs/32` ADR-21).
-///
-/// The canvas is behind a `Mutex` because the job travels as an `Arc` — the mailbox hands the same
-/// job to the worker and keeps it for staleness checks — while reading a band needs
-/// `&mut RecoveredImage`. The lock is what turns "shared" into "one reader at a time", and the only
-/// reader is the export thread.
-pub(crate) struct RowBandJob {
-    pub(crate) meta: crate::scroll::export::ImageMeta,
-    pub(crate) canvas: std::sync::Mutex<crate::scroll::canvas::RecoveredImage>,
 }
 
 /// An export that failed, with the stage that produced it.
@@ -268,7 +245,11 @@ impl ExportWorker {
             .thread
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if slot.as_ref().map(|handle| !handle.is_finished()).unwrap_or(false) {
+        if slot
+            .as_ref()
+            .map(|handle| !handle.is_finished())
+            .unwrap_or(false)
+        {
             return Ok(());
         }
         // A finished (panicked) handle from a previous run is reaped here.
@@ -399,8 +380,8 @@ fn delete_quietly(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::{
-        CompletedExport, ExportFailure, ExportJob, ExportSource, ExportWorker, Mailbox,
-        WorkerEvent, EXPORT_READY_MESSAGE,
+        CompletedExport, EXPORT_READY_MESSAGE, ExportFailure, ExportJob, ExportWorker, Mailbox,
+        WorkerEvent,
     };
     use crate::artifact::SelectionPixels;
     use crate::geometry::Rect;
@@ -408,8 +389,8 @@ mod tests {
     use crate::{CaptureError, CaptureResult};
     use snapclip_model::{CaptureArtifact, CapturePayload, PixelFormat};
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A 4x4 selection of an 8x8 frame. The worker never inspects the bytes, so a
     /// flat buffer is enough to exercise the mailbox and the executor hand-off.
@@ -450,9 +431,7 @@ mod tests {
     /// A job whose executor is a function pointer; tests that need to capture state
     /// build the job literal directly instead, because a capturing closure cannot name
     /// the generic `E` of this helper.
-    fn job(
-        executor: fn(&ExportJob) -> CaptureResult<CaptureArtifact>,
-    ) -> ExportJob {
+    fn job(executor: fn(&ExportJob) -> CaptureResult<CaptureArtifact>) -> ExportJob {
         new_job(executor)
     }
 
@@ -463,7 +442,7 @@ mod tests {
         ExportJob {
             generation: 0,
             session_id: "session-test".into(),
-            source: ExportSource::Selection(test_selection_pixels()),
+            prepared: test_selection_pixels(),
             dpi: 96,
             monitor_device_name: Some(r"\\.\DISPLAY1".into()),
             notify_thread: unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() },
@@ -472,7 +451,9 @@ mod tests {
     }
 
     /// An executor that writes a real file, so staleness has something to delete.
-    fn writing(runs: Arc<AtomicUsize>) -> impl Fn(&ExportJob) -> CaptureResult<CaptureArtifact> + Send + Sync + 'static {
+    fn writing(
+        runs: Arc<AtomicUsize>,
+    ) -> impl Fn(&ExportJob) -> CaptureResult<CaptureArtifact> + Send + Sync + 'static {
         move |job| {
             runs.fetch_add(1, Ordering::SeqCst);
             let path = artifact_path("write", job.generation);
@@ -512,9 +493,7 @@ mod tests {
     fn a_cancelled_queued_job_is_never_handed_to_the_worker() {
         let mailbox = Mailbox::new();
         let runs = Arc::new(AtomicUsize::new(0));
-        let stale_generation = mailbox
-            .submit(new_job(writing(runs.clone())))
-            .unwrap();
+        let stale_generation = mailbox.submit(new_job(writing(runs.clone()))).unwrap();
         mailbox.invalidate(); // Esc before the worker even woke up
 
         // The stale job is skipped, so `wait_job` blocks; check that by inspecting the
@@ -571,7 +550,10 @@ mod tests {
             })),
         );
 
-        assert!(!path.exists(), "a cancelled artifact must not be left behind");
+        assert!(
+            !path.exists(),
+            "a cancelled artifact must not be left behind"
+        );
         assert!(
             mailbox.take_result().is_none(),
             "and must not be delivered to the overlay"
@@ -634,20 +616,23 @@ mod tests {
             delivered.is_none(),
             "a cancelled export must never reach the overlay"
         );
-        assert!(!artifact_path("write", generation).exists(), "and its file is removed");
+        assert!(
+            !artifact_path("write", generation).exists(),
+            "and its file is removed"
+        );
     }
 
     #[test]
     fn job_metadata_reaches_the_executor() {
         // Guards the `Arc<ExportJob>` hand-off: losing a field would silently strip
         // the monitor name or the DPI scale factor out of the artifact.
-        let seen = Arc::new(std::sync::Mutex::new(None::<(String, i32, i32, u32, Option<String>)>));
+        let seen = Arc::new(std::sync::Mutex::new(
+            None::<(String, i32, i32, u32, Option<String>)>,
+        ));
         let seen_in_executor = seen.clone();
         let worker = ExportWorker::new();
         let mut job = new_job(move |job: &ExportJob| {
-            let ExportSource::Selection(prepared) = &job.source else {
-                return Err(CaptureError::InvalidState("this test builds a screenshot".into()));
-            };
+            let prepared = &job.prepared;
             *seen_in_executor.lock().unwrap() = Some((
                 job.session_id.clone(),
                 prepared.region.left,
@@ -657,11 +642,7 @@ mod tests {
             ));
             Err(CaptureError::InvalidState("stop here".into()))
         });
-        job.source = ExportSource::Selection({
-            let mut prepared = test_selection_pixels();
-            prepared.region = Rect::new(2, 3, 9, 11);
-            prepared
-        });
+        job.prepared.region = Rect::new(2, 3, 9, 11);
         job.dpi = 144;
         job.monitor_device_name = Some(r"\\.\DISPLAY3".into());
         job.session_id = "session-metadata".into();
@@ -689,10 +670,7 @@ mod tests {
         worker.shutdown();
         assert!(worker.take_ready().is_none());
         assert!(
-            worker
-                .submit(job(always_fails))
-                .unwrap()
-                .is_none(),
+            worker.submit(job(always_fails)).unwrap().is_none(),
             "a shutting-down worker refuses new jobs"
         );
     }

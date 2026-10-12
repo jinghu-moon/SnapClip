@@ -191,10 +191,7 @@ pub trait WindowTargetProvider {
     ///
     /// Runs on the detection worker. `EnumWindows` and every DWM read happen here and
     /// nowhere else.
-    fn refresh(
-        &mut self,
-        exclusions: &Exclusions,
-    ) -> Result<WindowSnapshot, WindowDetectionError>;
+    fn refresh(&mut self, exclusions: &Exclusions) -> Result<WindowSnapshot, WindowDetectionError>;
 
     /// Full re-validation of one target before an automatic snap is confirmed.
     ///
@@ -220,10 +217,16 @@ mod tests {
 
         assert!(exclusions.exclude_hwnd(0x100));
         assert!(exclusions.excludes(0x100, 42));
-        assert!(!exclusions.excludes(0x101, 42), "only the handle is excluded");
+        assert!(
+            !exclusions.excludes(0x101, 42),
+            "only the handle is excluded"
+        );
 
         assert!(exclusions.exclude_process(42));
-        assert!(exclusions.excludes(0x999, 42), "process fallback covers new windows");
+        assert!(
+            exclusions.excludes(0x999, 42),
+            "process fallback covers new windows"
+        );
         assert!(!exclusions.excludes(0x999, 43));
         assert_eq!(exclusions.len_hwnds(), 1);
         assert_eq!(exclusions.len_process_ids(), 1);
@@ -262,7 +265,10 @@ mod tests {
         for class in SHELL_SURFACE_CLASSES {
             assert!(is_shell_surface_class(class), "{class}");
             // Win32 compares class names case-insensitively.
-            assert!(is_shell_surface_class(&class.to_ascii_lowercase()), "{class}");
+            assert!(
+                is_shell_surface_class(&class.to_ascii_lowercase()),
+                "{class}"
+            );
         }
         // Real application windows are not shell surfaces, even when the name starts
         // with the same letters: the match is exact, not a prefix test.

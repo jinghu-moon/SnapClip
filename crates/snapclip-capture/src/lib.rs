@@ -31,22 +31,21 @@ pub mod artifact;
 pub mod diagnostics;
 pub mod error;
 pub mod geometry;
+pub mod keymap;
 pub mod monitor_cache;
 pub mod ports;
+pub mod preferences;
 pub mod ring_contrast;
 pub mod runtime;
 pub mod sampler;
-// The scroll-capture subsystem (`docs/30` §28). `P1.01` created the directory, so the module is
-// a normal one from here on (`DEV-8`); its production items arrive with `P1.02`+. Nothing under
-// `scroll/` may reference `windows` (§28.4).
+// Scroll capture's pure half (`docs/33`); the capture thread is `windows::scroll_worker`. Nothing
+// under `scroll/` references `windows`.
 pub mod scroll;
 pub mod session;
 pub mod window_detection;
 pub mod windows;
 
-pub use artifact::{
-    CaptureService, PixelSliceSource, SelectionPixels,
-};
+pub use artifact::{CaptureService, PixelSliceSource, SelectionPixels};
 pub use error::{CaptureError, CaptureResult};
 pub use ports::{ArtifactWriter, CaptureEventSink, ClipboardWriter, OverlayPlatform};
 pub use runtime::CaptureRuntime;

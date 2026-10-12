@@ -36,6 +36,9 @@ prototypes/*/assets/
 .playwright-mcp/
 .tmp-*
 docs/Temp/
+# `docs/Temp/` above only matches at the root; the app crate keeps its own scratch
+# directory under `apps/snapclip/docs/Temp/` (probe JSONL that is not a fixture).
+apps/*/docs/Temp/
 
 # Local OCR test data, model weights, and comparison run outputs (multi-GB,
 # not redistributable; see docs for how to regenerate or download them)
@@ -62,3 +65,17 @@ subfont/__pycache__/
 # Output logs of scripts/ocr-serve.ps1. The script itself is tracked: package.json's
 # `ocr:serve` calls it, so a fresh clone has to have it (see docs/31 P0.08).
 scripts/*.log
+
+# A second cargo target directory, used to verify a build without disturbing the
+# primary `target/` (5 GB of `.o` files, an `.exe`, and a half-gigabyte `.pdb`).
+/target-verify/
+
+# The application's own stderr, when a manual run is redirected to a file. It is the
+# only place the `[snapclip][scroll]` diagnostics of a real session exist.
+/log.txt
+
+# Screenshots the browser tooling writes into the working directory, and the local
+# agent hand-off scratch (`tools/claude-continue/` holds sent images and a few .ps1
+# helpers that belong to no task).
+/.bsk-verify-example.png
+/tools/claude-continue/

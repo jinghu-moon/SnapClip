@@ -9,8 +9,11 @@
 //! corresponds to it yet, and a switch that changes nothing is worse than no switch.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use snapclip_capture::window_detection::{DetectionOptions, DEFAULT_ADOPT_TEXT_RUNS};
+use snapclip_capture::keymap::{Keymap, KeymapOverrides};
+use snapclip_capture::preferences::OverlayPreferences;
+use snapclip_capture::window_detection::{DEFAULT_ADOPT_TEXT_RUNS, DetectionOptions};
 
 /// The user's preferences.
 ///
@@ -22,12 +25,22 @@ use snapclip_capture::window_detection::{DetectionOptions, DEFAULT_ADOPT_TEXT_RU
 pub struct Settings {
     /// Whether a bare text run may be published as the snap target (docs/21 §5.19).
     pub deep_select_text_runs: bool,
+    /// Blur the screen outside the selection while picking.
+    pub mask_blur: bool,
+    /// Show the shortcut guide in the bottom-left corner while picking.
+    pub shortcut_guide: bool,
+    /// The overlay's key bindings, as changes from the defaults.
+    pub keymap: KeymapOverrides,
 }
 
 impl Default for Settings {
     fn default() -> Self {
+        let overlay = OverlayPreferences::default();
         Self {
             deep_select_text_runs: DEFAULT_ADOPT_TEXT_RUNS,
+            mask_blur: overlay.mask_blur,
+            shortcut_guide: overlay.shortcut_guide,
+            keymap: KeymapOverrides::default(),
         }
     }
 }
@@ -37,6 +50,26 @@ impl Settings {
     pub fn detection_options(&self) -> DetectionOptions {
         DetectionOptions {
             adopt_text_runs: self.deep_select_text_runs,
+        }
+    }
+
+    /// The overlay preferences these settings imply.
+    ///
+    /// Bindings that cannot be applied (a hand-edited file naming an unknown action, two actions
+    /// on one chord) are reported and replaced by the default keymap as a whole, for the same
+    /// reason a damaged file loads as defaults: a half-applied keymap is a set of keys nobody
+    /// chose, and refusing to capture over it is worse.
+    pub fn overlay_preferences(&self) -> OverlayPreferences {
+        let keymap = Keymap::new(&self.keymap).unwrap_or_else(|error| {
+            eprintln!(
+                "[snapclip-app] key bindings in the settings are invalid ({error}); using defaults"
+            );
+            Keymap::default()
+        });
+        OverlayPreferences {
+            mask_blur: self.mask_blur,
+            shortcut_guide: self.shortcut_guide,
+            keymap: Arc::new(keymap),
         }
     }
 }
@@ -98,6 +131,9 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use snapclip_capture::keymap::{Keymap, KeymapOverrides};
+    use snapclip_capture::preferences::OverlayPreferences;
+
     use super::{Settings, SettingsStore};
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -123,6 +159,10 @@ mod tests {
             settings.detection_options(),
             snapclip_capture::window_detection::DetectionOptions::default()
         );
+        assert_eq!(
+            settings.overlay_preferences(),
+            OverlayPreferences::default()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -130,13 +170,21 @@ mod tests {
     fn settings_round_trip_through_the_file() {
         let dir = root("round-trip");
         let store = SettingsStore::new(&dir);
+        let mut keymap = KeymapOverrides::default();
+        keymap.set_visible("level", false);
         let wanted = Settings {
             deep_select_text_runs: false,
+            mask_blur: false,
+            shortcut_guide: false,
+            keymap,
         };
         store.save(&wanted).expect("save");
         assert_eq!(store.load(), wanted);
-        // And the bridge to capture sees the same value.
+        // And the bridges to capture see the same values.
         assert!(!store.load().detection_options().adopt_text_runs);
+        let overlay = store.load().overlay_preferences();
+        assert!(!overlay.mask_blur && !overlay.shortcut_guide);
+        assert_ne!(*overlay.keymap, Keymap::default());
         // No temporary file is left behind.
         let leftovers = std::fs::read_dir(&dir)
             .unwrap()
@@ -171,9 +219,33 @@ mod tests {
         assert_eq!(
             store.load(),
             Settings {
-                deep_select_text_runs: false
+                deep_select_text_runs: false,
+                ..Settings::default()
             }
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalid_key_bindings_fall_back_to_the_default_keymap_and_keep_the_rest() {
+        let dir = root("bad-keymap");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"maskBlur": false, "keymap": {"chords": {"no-such-action": ["X"]}}}"#,
+        )
+        .unwrap();
+        let overlay = SettingsStore::new(&dir).load().overlay_preferences();
+        assert!(!overlay.mask_blur);
+        assert_eq!(*overlay.keymap, Keymap::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn untouched_bindings_are_not_written_out() {
+        let text = serde_json::to_string(&Settings::default()).unwrap();
+        let back: Settings = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.keymap, KeymapOverrides::default());
+        assert!(back.keymap.is_empty());
     }
 }

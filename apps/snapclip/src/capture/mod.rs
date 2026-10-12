@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use snapclip_capture::artifact::CaptureService;
 use snapclip_capture::ports::{ArtifactWriter, CaptureEventSink, ClipboardWriter};
+use snapclip_capture::preferences::OverlayPreferences;
 use snapclip_capture::runtime::CaptureRuntime;
 use snapclip_capture::window_detection::DetectionOptions;
 
@@ -35,10 +36,13 @@ use crate::events::EventBus;
 ///
 /// `options` comes from the settings file, which is how a user preference reaches the window
 /// walker; the overlay snapshots it at startup rather than re-reading on every frame.
+/// `preferences` are the overlay's presentation and keys; later changes go through
+/// `CaptureRuntime::set_preferences`.
 pub fn start(
     app_local_data: &Path,
     events: EventBus,
     options: DetectionOptions,
+    preferences: OverlayPreferences,
 ) -> Result<CaptureRuntime, String> {
     // Per-Monitor V2 has to be declared before any window exists; the caller does that at the
     // very start of `run`. The overlay inherits the process context, so this only checks it.
@@ -55,7 +59,12 @@ pub fn start(
     ));
 
     let runtime = snapclip_capture::windows::overlay::WindowsOverlay::spawn_overlay(
-        service, sink, clipboard, writer, options,
+        service,
+        sink,
+        clipboard,
+        writer,
+        options,
+        preferences,
     )
     .map_err(|message| format!("capture overlay: {message}"))?;
     Ok(CaptureRuntime::from_platform(Box::new(runtime)))
@@ -78,13 +87,16 @@ mod tests {
     #[test]
     #[ignore = "takes the F5 hotkey and creates a real overlay window"]
     fn the_shell_can_host_the_capture_overlay() {
-        let root = std::env::temp_dir().join(format!(
-            "snapclip-app-capture-host-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("snapclip-app-capture-host-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let runtime = start(&root, EventBus::new(), DetectionOptions::default())
-            .expect("the overlay should start on a desktop session");
+        let runtime = start(
+            &root,
+            EventBus::new(),
+            DetectionOptions::default(),
+            Default::default(),
+        )
+        .expect("the overlay should start on a desktop session");
         // Nothing is being selected until the user asks, so the honest state is Idle.
         assert_eq!(runtime.state(), CaptureState::Idle);
         // Dropping the runtime shuts the overlay down (its own `Drop`), including the hotkey.

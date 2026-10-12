@@ -9,4 +9,4 @@ pub mod model;
 pub mod settings_view;
 
 pub use model::{Settings, SettingsStore};
-pub use settings_view::SettingsView;
+pub use settings_view::{SettingsChanged, SettingsView};

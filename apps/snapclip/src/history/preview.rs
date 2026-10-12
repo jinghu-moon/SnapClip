@@ -47,10 +47,15 @@ pub enum PreviewError {
 impl fmt::Display for PreviewError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Decode(message) => write!(formatter, "the preview source is not a readable png: {message}"),
+            Self::Decode(message) => write!(
+                formatter,
+                "the preview source is not a readable png: {message}"
+            ),
             Self::Empty => formatter.write_str("the image has no pixels"),
             Self::TooLarge => formatter.write_str("one row of the image is too long to address"),
-            Self::Encode(message) => write!(formatter, "the preview could not be encoded: {message}"),
+            Self::Encode(message) => {
+                write!(formatter, "the preview could not be encoded: {message}")
+            }
         }
     }
 }
@@ -87,7 +92,11 @@ pub fn row_preview_png(source: &[u8]) -> Result<Vec<u8>, PreviewError> {
         png::ColorType::Rgba => 4,
         // `normalize_to_color8` expands a palette into RGB, so this is a contradiction rather
         // than a case to handle.
-        png::ColorType::Indexed => return Err(PreviewError::Decode("a palette survived the transform".into())),
+        png::ColorType::Indexed => {
+            return Err(PreviewError::Decode(
+                "a palette survived the transform".into(),
+            ));
+        }
     };
     let row_bytes = reader
         .output_line_size(width)
@@ -184,7 +193,11 @@ mod tests {
         let mut rows = Vec::with_capacity((width as usize) * (height as usize) * 4);
         for y in 0..height {
             for x in 0..width {
-                let value = if (x / 3 + y / 500) % 2 == 0 { 0x20 } else { 0xF0 };
+                let value = if (x / 3 + y / 500) % 2 == 0 {
+                    0x20
+                } else {
+                    0xF0
+                };
                 rows.extend_from_slice(&[value, value, value, 0xFF]);
             }
         }
@@ -223,7 +236,13 @@ mod tests {
     /// A `width` x `height` image with two horizontal bands: `top_rows` rows of `top`, the rest
     /// `bottom`. (A band boundary in the middle is what tells "the window" from "the whole image"
     /// apart.)
-    fn banded_png(width: u32, height: u32, top_rows: u32, top: [u8; 3], bottom: [u8; 3]) -> Vec<u8> {
+    fn banded_png(
+        width: u32,
+        height: u32,
+        top_rows: u32,
+        top: [u8; 3],
+        bottom: [u8; 3],
+    ) -> Vec<u8> {
         let mut rows = Vec::with_capacity((width as usize) * (height as usize) * 4);
         for y in 0..height {
             let colour = if y < top_rows { top } else { bottom };
@@ -269,7 +288,11 @@ mod tests {
         let mut rows = Vec::new();
         for y in 0..256u32 {
             for x in 0..256u32 {
-                let (red, green): (u8, u8) = if x < 128 && y < 128 { (0xF0, 0x20) } else { (0x20, 0xF0) };
+                let (red, green): (u8, u8) = if x < 128 && y < 128 {
+                    (0xF0, 0x20)
+                } else {
+                    (0x20, 0xF0)
+                };
                 rows.extend_from_slice(&[red, green, 0x40, 0xFF]);
             }
         }
@@ -285,7 +308,11 @@ mod tests {
 
         let preview = row_preview_png(&source).expect("a preview");
         let (width, height, pixels) = decode_rgba(&preview);
-        assert_eq!((width, height), (128, 128), "a 256x256 image at a 128 px target");
+        assert_eq!(
+            (width, height),
+            (128, 128),
+            "a 256x256 image at a 128 px target"
+        );
 
         let pixel = |x: u32, y: u32| {
             let base = ((y * width + x) * 4) as usize;
@@ -293,9 +320,21 @@ mod tests {
         };
         // Box-averaged over a 2x2 block, so the values are the source values.
         assert_eq!(pixel(0, 0), (0xF0, 0x20, 0x40), "the top-left quadrant");
-        assert_eq!(pixel(width - 1, 0), (0x20, 0xF0, 0x40), "the top-right quadrant");
-        assert_eq!(pixel(0, height - 1), (0x20, 0xF0, 0x40), "the bottom-left quadrant");
-        assert_eq!(pixel(width - 1, height - 1), (0x20, 0xF0, 0x40), "the bottom-right");
+        assert_eq!(
+            pixel(width - 1, 0),
+            (0x20, 0xF0, 0x40),
+            "the top-right quadrant"
+        );
+        assert_eq!(
+            pixel(0, height - 1),
+            (0x20, 0xF0, 0x40),
+            "the bottom-left quadrant"
+        );
+        assert_eq!(
+            pixel(width - 1, height - 1),
+            (0x20, 0xF0, 0x40),
+            "the bottom-right"
+        );
     }
 
     /// And this is the claim the module doc makes in words: the window is the **top** of a tall
@@ -306,13 +345,20 @@ mod tests {
         let source = banded_png(256, 2_000, 256, [0xFF; 3], [0x00; 3]);
         let preview = row_preview_png(&source).expect("a preview");
         let (width, height, pixels) = decode_rgba(&preview);
-        assert_eq!((width, height), (128, 128), "the window is 128 output rows tall");
+        assert_eq!(
+            (width, height),
+            (128, 128),
+            "the window is 128 output rows tall"
+        );
 
         let mean = pixels
             .chunks_exact(4)
             .map(|pixel| u32::from(pixel[0]))
             .sum::<u32>()
             / (pixels.len() as u32 / 4);
-        assert_eq!(mean, 0xFF, "the window is the top 256 rows, which are uniformly white");
+        assert_eq!(
+            mean, 0xFF,
+            "the window is the top 256 rows, which are uniformly white"
+        );
     }
 }

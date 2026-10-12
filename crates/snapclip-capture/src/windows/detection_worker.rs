@@ -25,9 +25,7 @@ use crate::diagnostics::WindowDetectionMetrics;
 use crate::window_detection::model::{
     HoverValidity, RequestGate, RequestId, WindowSnapshot, WindowTarget,
 };
-use crate::window_detection::provider::{
-    Exclusions, WindowDetectionError, WindowTargetProvider,
-};
+use crate::window_detection::provider::{Exclusions, WindowDetectionError, WindowTargetProvider};
 
 use super::top_level_provider::TopLevelWindowProvider;
 
@@ -191,7 +189,9 @@ fn run(shared: Arc<Shared>, metrics: WindowDetectionMetrics) {
                     Err(_) => return,
                 };
             }
-            pending.take().expect("the loop only exits with a job in hand")
+            pending
+                .take()
+                .expect("the loop only exits with a job in hand")
         };
 
         let result = match job {
@@ -343,7 +343,9 @@ mod tests {
         let result = wait_for_result(&worker);
         assert_eq!(request_of(&result), request);
         match result {
-            DetectionResult::Confirmed { valid, target: t, .. } => {
+            DetectionResult::Confirmed {
+                valid, target: t, ..
+            } => {
                 assert!(!valid, "a fabricated handle cannot be a live window");
                 assert_eq!(t.identity().hwnd, 0xDEAD);
             }

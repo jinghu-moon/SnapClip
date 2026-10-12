@@ -189,8 +189,7 @@ impl Mailbox {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.active_request = None;
-        if request.generation == self.current_generation()
-            && !self.stopping.load(Ordering::Acquire)
+        if request.generation == self.current_generation() && !self.stopping.load(Ordering::Acquire)
         {
             inner.result = Some(event);
             drop(inner);
@@ -293,7 +292,10 @@ impl CaptureWorker {
             .thread
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let alive = slot.as_ref().map(|handle| !handle.is_finished()).unwrap_or(false);
+        let alive = slot
+            .as_ref()
+            .map(|handle| !handle.is_finished())
+            .unwrap_or(false);
         if alive {
             return Ok(());
         }
@@ -322,9 +324,7 @@ impl CaptureWorker {
                     Err(failure) => failure.generation != current,
                 };
                 if stale {
-                    eprintln!(
-                        "[snapclip][capture] worker result discarded generation mismatch"
-                    );
+                    eprintln!("[snapclip][capture] worker result discarded generation mismatch");
                     None
                 } else {
                     Some(result)
@@ -494,9 +494,8 @@ mod tests {
         let fresh = mailbox.next_generation(); // current -> 2; the queued req is stale
 
         let waiter_mailbox = mailbox.clone();
-        let waiter = std::thread::spawn(move || {
-            waiter_mailbox.wait_request().map(|taken| taken.generation)
-        });
+        let waiter =
+            std::thread::spawn(move || waiter_mailbox.wait_request().map(|taken| taken.generation));
 
         // Let the worker take and discard the stale request, then hand it a
         // matching one. Even if it has not started waiting yet, `submit` either
@@ -512,9 +511,10 @@ mod tests {
         let mailbox = Mailbox::new();
         let req = request(5);
         mailbox.invalidate(); // generation moved on while the worker was busy
-        mailbox.complete(&req, WorkerEvent::InitializationFailed(
-            CaptureError::ProviderUnavailable("test".into()),
-        ));
+        mailbox.complete(
+            &req,
+            WorkerEvent::InitializationFailed(CaptureError::ProviderUnavailable("test".into())),
+        );
         // The event never reached the mailbox, so the overlay has nothing to
         // consume: no result, and no wake-up consumed anything either.
         assert!(mailbox.take_result().is_none());
@@ -524,10 +524,14 @@ mod tests {
     fn results_with_the_current_generation_are_delivered_once() {
         let mailbox = Mailbox::new();
         let req = request(mailbox.next_generation());
-        mailbox.complete(&req, WorkerEvent::InitializationFailed(
-            CaptureError::ProviderUnavailable("test".into()),
-        ));
+        mailbox.complete(
+            &req,
+            WorkerEvent::InitializationFailed(CaptureError::ProviderUnavailable("test".into())),
+        );
         assert!(mailbox.take_result().is_some());
-        assert!(mailbox.take_result().is_none(), "the mailbox holds one consumable result");
+        assert!(
+            mailbox.take_result().is_none(),
+            "the mailbox holds one consumable result"
+        );
     }
 }

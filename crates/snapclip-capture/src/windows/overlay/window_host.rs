@@ -20,6 +20,7 @@ impl OverlayMessageHandler for OverlayController {
                         }
                     }
                     Some(OverlayCommand::Shutdown) => {
+                        eprintln!("[snapclip][capture] overlay command Shutdown received");
                         self.cancel("shutdown");
                         // Stop the threads before quitting the pump; the workers
                         // hold the providers, the device and the in-flight export.
@@ -51,10 +52,8 @@ impl OverlayMessageHandler for OverlayController {
                 Some(0)
             }
             SCROLL_READY_MESSAGE => {
-                // The driver published into the preview port; fold it into the panel and let the
-                // render tick paint. The wake-up is the only one this port gets (docs/30 §19.3: the
-                // port deliberately carries no second one), so everything published since the last
-                // wake-up has to be drained here — which is what `on_scroll_ready` does.
+                // The scroll thread published a report; one wake-up covers everything since the
+                // last one, because the report is the latest state rather than a queue.
                 self.on_scroll_ready();
                 Some(0)
             }
@@ -68,73 +67,31 @@ impl OverlayMessageHandler for OverlayController {
                     match hotkey.kind {
                         hotkey::HotkeyKind::Capture => self.start_session(),
                         hotkey::HotkeyKind::Scroll => self.start_scroll_entry(),
+                        hotkey::HotkeyKind::Export => self.finish_scroll_session("f9"),
+                        hotkey::HotkeyKind::Cancel => self.cancel("escape-hotkey"),
                     }
                 }
                 Some(0)
             }
-            WM_KEYDOWN => {
-                // When the user's IME is Chinese/Japanese/Korean the letter keys
-                // are handed to the IME as `WM_KEYDOWN vk=VK_PROCESSKEY (0xE5)`
-                // before we can match them. We already close the overlay's IMC
-                // on focus-in, but a stale IME (or a mid-session Win+Space
-                // layout swap) can still deliver 0xE5. Translate the physical
-                // scan code out of `lParam` bits 16-23 in that case so `S/C/P`
-                // keep firing.
-                let raw_vk = wparam as u32;
-                let vk = if raw_vk == 0xE5 {
-                    let scan = ((lparam as u32) >> 16) & 0xFF;
-                    let mapped = unsafe { MapVirtualKeyW(scan, MAPVK_VSC_TO_VK) };
-                    if mapped != 0 { mapped } else { raw_vk }
-                } else {
-                    raw_vk
-                };
-                self.on_key_down(vk);
-                Some(0)
+            // Every key goes through the keymap. `WM_SYSKEYDOWN` is a key pressed with Alt (or
+            // F10): it is consumed only when the map knows it, so `Alt+F4` and the system menu
+            // keep working.
+            WM_KEYDOWN | WM_SYSKEYDOWN => {
+                let handled = self.on_key_down(key_from(wparam, lparam));
+                (message == WM_KEYDOWN || handled).then_some(0)
             }
-            WM_KEYUP => {
-                let raw_vk = wparam as u32;
-                let vk = if raw_vk == 0xE5 {
-                    let scan = ((lparam as u32) >> 16) & 0xFF;
-                    let mapped = unsafe { MapVirtualKeyW(scan, MAPVK_VSC_TO_VK) };
-                    if mapped != 0 { mapped } else { raw_vk }
-                } else {
-                    raw_vk
-                };
-                if vk == b'Z' as u32 {
-                    self.z_held = false;
-                }
+            WM_KEYUP | WM_SYSKEYUP => {
+                self.on_key_up(key_from(wparam, lparam));
                 None
             }
             WM_MOUSEWHEEL => {
-                // A running scroll session owns the wheel: the session is already injecting notches
-                // into the target, and the level walk (`z_held` or plain wheel) belongs to the
-                // selection, which is long gone by then (`docs/32` `P7.07`). Consumed rather than
-                // passed on, so the message cannot reach the window underneath the overlay either.
-                if self.scroll_runtime.is_some() {
+                let delta = ((wparam >> 16) & 0xFFFF) as u16 as i16;
+                // Over the panel: the user meant the page under the selection.
+                if let Some(run) = self.scroll.as_ref() {
+                    run.worker.forward_wheel(delta as i32);
                     return Some(0);
                 }
-                let delta = ((wparam >> 16) & 0xFFFF) as u16 as i16;
-                if self.z_held && self.session.state().is_active() {
-                    let direction = if delta > 0 { 1 } else { -1 };
-                    self.magnifier_zoom = MagnifierConfig::zoom_step(self.magnifier_zoom, direction);
-                    self.invalidate();
-                    Some(0)
-                } else {
-                    // Plain wheel walks the deep-selection levels (docs/21 §5.17): up toward the
-                    // window frame, down toward the element under the cursor. Consumed, so the page
-                    // underneath never sees a scroll it did not ask for.
-                    //
-                    // The message is translated into level steps first, so a touchpad's small deltas
-                    // add up to one walk instead of five (v3 B2, docs/21 §5.24).
-                    let steps = self.wheel.steps(delta as i32, Instant::now());
-                    let mut walked = false;
-                    for _ in 0..steps.abs() {
-                        // A stop that does not move — the end of the chain — must not end the count:
-                        // the walk is also where the level hint gets taught.
-                        walked |= self.step_deep_level(-steps.signum());
-                    }
-                    walked.then_some(0)
-                }
+                self.on_wheel(delta).then_some(0)
             }
             WM_SETFOCUS => {
                 self.disable_ime_for_overlay();
@@ -177,9 +134,8 @@ impl OverlayMessageHandler for OverlayController {
             // notion of Z order and would otherwise answer the overlay for every query, which is
             // exactly what the precision top-up needs (docs/21 §5.7).
             //
-            // A scroll session answers the same question differently and for a different reason
-            // (docs/30 §13.4): the wheel has to reach the window underneath, and under `MOUSE_POS`
-            // routing this hit test is what decides that. `nchittest_result` holds both rules.
+            // A scroll session answers it for its whole lifetime: only the panel is the
+            // overlay's (`docs/33`). `nchittest_result` holds both rules.
             // `lparam` is in **screen** coordinates here, unlike every other mouse message.
             WM_NCHITTEST => {
                 let mut point = point_from_lparam(lparam);
@@ -224,7 +180,7 @@ impl OverlayMessageHandler for OverlayController {
                 }
             }
             WM_DPICHANGED | WM_DISPLAYCHANGE | WM_DEVICECHANGE => {
-                if self.session.state().is_active() {
+                if self.session.state().is_active() || self.scroll.is_some() {
                     self.cancel("display-change");
                 }
                 // Force a full rebuild on the next session: the renderer is
@@ -235,6 +191,7 @@ impl OverlayMessageHandler for OverlayController {
                 Some(0)
             }
             WM_DESTROY => {
+                eprintln!("[snapclip][capture] overlay WM_DESTROY received");
                 self.cancel("window-destroyed");
                 unsafe { PostQuitMessage(0) };
                 Some(0)
@@ -259,7 +216,10 @@ pub(super) fn exclude_overlay_from_capture(window: HWND) -> Result<(), u32> {
 }
 
 pub(super) fn describe_rect(rect: Rect) -> String {
-    format!("({},{})->({},{})", rect.left, rect.top, rect.right, rect.bottom)
+    format!(
+        "({},{})->({},{})",
+        rect.left, rect.top, rect.right, rect.bottom
+    )
 }
 
 /// How long the chain stays fully visible after the last touch (docs/21 §5.22).
@@ -346,10 +306,7 @@ pub(crate) const LEVEL_HINT_MS: u64 = 2600;
 /// `↑ = 窗口` is the part nobody can guess, and it is what makes the chip legible the next time the
 /// wheel is used. The numbers are the badge's own, so the sentence and the chip never disagree.
 pub(crate) fn level_hint(reach: LevelReach) -> String {
-    format!(
-        "↑{} ↓{} · ↑ = 窗口 · 滚轮 / ↑↓ 切换",
-        reach.up, reach.down
-    )
+    format!("↑{} ↓{} · ↑ = 窗口 · 滚轮 / ↑↓ 切换", reach.up, reach.down)
 }
 
 /// Whether a successful level walk should (re)arm the teaching sentence (docs/21 §5.21).
@@ -415,7 +372,10 @@ pub(crate) fn preview_label(
 /// The counts come from the same `next_visible_stop` the wheel uses, so the chip cannot promise
 /// notches the walk would not take — the failure mode that made the old `6/9` misleading once B1
 /// started skipping levels that look identical.
-pub(crate) fn level_badge_reach(chain: Option<LevelChain>, path: &[PathLevel]) -> Option<LevelReach> {
+pub(crate) fn level_badge_reach(
+    chain: Option<LevelChain>,
+    path: &[PathLevel],
+) -> Option<LevelReach> {
     let chain = chain.filter(|chain| chain.len() > 1 && !chain.is_deepest())?;
     let threshold = RingOptions::default().collapse_gap_px;
     Some(LevelReach {
@@ -494,40 +454,49 @@ pub(super) fn snap_radius_px() -> u32 {
 }
 
 impl OverlayController {
-    /// Shrink this overlay's window region to `rect`, or restore the whole window with `None`
-    /// (`docs/32` `P7.07c`, `docs/30` §13.4).
-    ///
-    /// A fullscreen **opaque** topmost window does two things to the target while a scroll session
-    /// runs. It takes the wheel — under `MOUSE_POS` routing the system asks who is under the cursor —
-    /// and, less obviously, it makes Windows report the target as **occluded**, at which point a
-    /// Chromium browser stops painting it. The fifth real run plus `docs/Temp/wheel-ab.txt` are what
-    /// proved the second half is the blocker: the same posted `WM_MOUSEWHEEL` scrolls Edge three
-    /// different ways while nothing covers it, and changes not one byte while the overlay is up.
-    ///
-    /// A region hole is the design's own answer (§13.4): the content area is not covered at all, so the
-    /// target keeps producing frames and input reaches it naturally — and as a side effect the user can
-    /// **see** the page scroll instead of a frozen snapshot. The panel keeps its own rectangle, so its
-    /// buttons stay clickable, which is why this is `SetWindowRgn` and not `WS_EX_TRANSPARENT` (the
-    /// extended style cannot be split between the two areas).
-    ///
-    /// `redraw = 1` (Win32's `TRUE`) repaints the exposed area; the third parameter is an `i32` in
-    /// `windows-sys`, not the `BOOL` the C header spells.
+    /// Restore the whole window with `None`, or cut it down to `rect`.
     pub(super) fn set_window_region(&self, rect: Option<Rect>) {
+        match rect {
+            Some(rect) => self.set_window_shape(&[rect]),
+            // `TRUE` (the `i32` `1` in `windows-sys`) repaints the exposed area.
+            None => unsafe {
+                if SetWindowRgn(self.window, null_mut(), 1) == 0 {
+                    eprintln!(
+                        "[snapclip][capture] SetWindowRgn(full) failed (last error {})",
+                        GetLastError()
+                    );
+                }
+            },
+        }
+    }
+
+    /// Cut the window down to the union of `rects` (`docs/33`). While a scroll session runs the
+    /// selection is not part of it: a covered page is reported occluded and a browser stops painting
+    /// it, and a covered page cannot take the wheel. `SetWindowRgn` rather than a transparent
+    /// extended style, because the panel's buttons must stay clickable.
+    pub(super) fn set_window_shape(&self, rects: &[Rect]) {
+        use windows_sys::Win32::Graphics::Gdi::{CombineRgn, DeleteObject, RGN_OR};
         unsafe {
-            // `TRUE` hands the region object to the system, which frees it when the region is
-            // replaced — deleting it here would be a double free.
-            let region = match rect {
-                Some(rect) => CreateRectRgn(rect.left, rect.top, rect.right, rect.bottom),
-                None => null_mut(),
-            };
-            // A refused region is silence otherwise, and silence is exactly what made the first
-            // region-hole build look like "the hole did not help" (`P7.07c`).
-            if SetWindowRgn(self.window, region, 1) == 0 {
+            let base = CreateRectRgn(0, 0, 0, 0);
+            if base.is_null() {
+                eprintln!("[snapclip][capture] CreateRectRgn failed");
+                return;
+            }
+            for rect in rects.iter().filter(|rect| !rect.is_empty()) {
+                let part = CreateRectRgn(rect.left, rect.top, rect.right, rect.bottom);
+                if !part.is_null() {
+                    CombineRgn(base, base, part, RGN_OR);
+                    DeleteObject(part);
+                }
+            }
+            // On success the system owns `base` and frees it when the region is replaced.
+            if SetWindowRgn(self.window, base, 1) == 0 {
                 eprintln!(
                     "[snapclip][capture] SetWindowRgn failed: the overlay still covers the target \
                      (last error {})",
                     GetLastError()
                 );
+                DeleteObject(base);
             }
         }
     }
@@ -550,6 +519,7 @@ pub(super) fn overlay_thread(
     annotation_rx: mpsc::Receiver<AnnotationCommand>,
     ready: mpsc::SyncSender<SystemResult>,
 ) {
+    eprintln!("[snapclip][capture] overlay thread started");
     // Force the thread message queue into existence before the thread id is
     // published, so `PostThreadMessageW` cannot race with queue creation.
     let mut message: MSG = unsafe { zeroed() };
@@ -642,20 +612,22 @@ pub(super) fn overlay_thread(
         return;
     }
 
-    eprintln!("[snapclip][capture] overlay ready hwnd={:?} thread={thread_id}", window);
+    eprintln!(
+        "[snapclip][capture] overlay ready hwnd={:?} thread={thread_id}",
+        window
+    );
 
-    let mut controller: Box<dyn OverlayMessageHandler> =
-        Box::new(OverlayController::new(
-            service,
-            sink,
-            clipboard,
-            writer,
-            options,
-            shared,
-            annotation_rx,
-            window,
-            thread_id,
-        ));
+    let mut controller: Box<dyn OverlayMessageHandler> = Box::new(OverlayController::new(
+        service,
+        sink,
+        clipboard,
+        writer,
+        options,
+        shared,
+        annotation_rx,
+        window,
+        thread_id,
+    ));
     let handler_ptr = (&mut controller) as *mut Box<dyn OverlayMessageHandler>;
     ACTIVE_HANDLER.with(|slot| slot.set(handler_ptr));
 
@@ -693,6 +665,7 @@ pub(super) fn overlay_thread(
     }
 
     ACTIVE_HANDLER.with(|slot| slot.set(std::ptr::null_mut()));
+    eprintln!("[snapclip][capture] overlay message loop exiting");
     drop(controller);
     unsafe {
         hotkey::unregister(window);
@@ -731,9 +704,25 @@ unsafe extern "system" fn overlay_window_proc(
     unsafe { DefWindowProcW(window, message, wparam, lparam) }
 }
 
-
 pub(super) const OVERLAY_CLASS: &[u16] = &[
     83, 110, 97, 112, 67, 108, 105, 112, 67, 97, 112, 116, 117, 114, 101, 79, 118, 101, 114, 108,
     97, 121, 0,
 ];
 pub(super) const OVERLAY_TITLE: &[u16] = &[83, 110, 97, 112, 67, 108, 105, 112, 0];
+
+/// The virtual key of a key message.
+///
+/// Focus-in disables the IME, but a stale IME (or a mid-session Win+Space layout swap) can still
+/// hand the key over as `VK_PROCESSKEY` (0xE5); the physical scan code in `lParam` bits 16-23
+/// then names the key, so the shortcuts keep firing.
+fn key_from(wparam: WPARAM, lparam: LPARAM) -> u32 {
+    let raw = wparam as u32;
+    if raw != 0xE5 {
+        return raw;
+    }
+    let scan = ((lparam as u32) >> 16) & 0xFF;
+    match unsafe { MapVirtualKeyW(scan, MAPVK_VSC_TO_VK) } {
+        0 => raw,
+        mapped => mapped,
+    }
+}

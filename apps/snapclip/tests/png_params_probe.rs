@@ -179,16 +179,19 @@ impl SyntheticImage {
         }
 
         let tint = (hash(x / 5, y / 7, 0x1234) & 0x0F) as u8;
-        [luma.saturating_sub(tint / 2), luma, luma.saturating_sub(tint), 0xFF]
+        [
+            luma.saturating_sub(tint / 2),
+            luma,
+            luma.saturating_sub(tint),
+            0xFF,
+        ]
     }
 }
 
 /// Cheap integer hash; stands in for texture without pulling in a RNG.
 fn hash(x: u32, y: u32, salt: u32) -> u32 {
-    let mut h = x
-        .wrapping_mul(0x9E37_79B1)
-        ^ y.wrapping_mul(0x85EB_CA77)
-        ^ salt.wrapping_mul(0xC2B2_AE35);
+    let mut h =
+        x.wrapping_mul(0x9E37_79B1) ^ y.wrapping_mul(0x85EB_CA77) ^ salt.wrapping_mul(0xC2B2_AE35);
     h ^= h >> 15;
     h = h.wrapping_mul(0x2545_F491);
     h ^ (h >> 13)
@@ -325,7 +328,10 @@ fn probe_from_name(name: &str) -> Probe {
     }
     let mut names: Vec<&str> = COMBINATIONS.iter().map(|(label, _, _)| *label).collect();
     names.push("baseline/image");
-    panic!("unknown SNAPCLIP_PERF2_COMBO {name:?}; expected one of: {}", names.join(", "));
+    panic!(
+        "unknown SNAPCLIP_PERF2_COMBO {name:?}; expected one of: {}",
+        names.join(", ")
+    );
 }
 
 /// Stream `image` into `sink` one row band at a time.
@@ -368,7 +374,9 @@ fn encode_streaming<W: std::io::Write>(
             .map_err(|error| format!("row {y}: {error}"))?;
     }
     // The stream closes the zlib data; the writer closes the file.
-    stream.finish().map_err(|error| format!("stream finish: {error}"))?;
+    stream
+        .finish()
+        .map_err(|error| format!("stream finish: {error}"))?;
     writer.finish().map_err(|error| format!("finish: {error}"))
 }
 
@@ -500,7 +508,11 @@ fn perf2_measures_one_parameter_combination() {
     let decode_started = Instant::now();
     let decoded = decode_rgba(&png, raised_decode_limits()).expect("decode with raised limits");
     let decode_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
-    assert_eq!((decoded.width, decoded.height), (width, height), "decoded size");
+    assert_eq!(
+        (decoded.width, decoded.height),
+        (width, height),
+        "decoded size"
+    );
 
     // Byte-for-byte: the whole point of streaming is that the file is not merely parseable.
     let mut row = vec![0u8; line];

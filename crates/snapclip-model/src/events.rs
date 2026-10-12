@@ -11,11 +11,11 @@
 //! older than what it has already seen. It is deliberately a plain number rather than a
 //! shared clock, so this crate stays free of synchronisation machinery.
 
+use crate::ErrorCode;
 use crate::artifact::ArtifactRef;
 use crate::capture::{CaptureState, PixelFormat};
 use crate::payload::PayloadKind;
 use crate::recognition::{OcrErrorCode, OcrStatus};
-use crate::ErrorCode;
 
 /// Something a shell may need to react to, at a frequency a human can perceive.
 #[derive(Debug, Clone, PartialEq, Eq)]

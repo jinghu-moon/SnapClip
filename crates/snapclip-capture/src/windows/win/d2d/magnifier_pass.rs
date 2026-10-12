@@ -13,12 +13,8 @@ impl OverlayRenderer {
         metrics: RenderMetrics,
     ) -> Result<(), String> {
         let config = MagnifierConfig::with_zoom(view.magnifier_zoom).scaled(metrics.dpi);
-        let geometry = crate::geometry::magnifier_geometry(
-            view.cursor,
-            config,
-            view.frame,
-            view.work_area,
-        );
+        let geometry =
+            crate::geometry::magnifier_geometry(view.cursor, config, view.frame, view.work_area);
         // A missing frame bitmap means there is nothing to magnify yet.
         let Some(bitmap) = resources.frame_bitmap.as_ref() else {
             return Ok(());
@@ -105,16 +101,27 @@ impl OverlayRenderer {
             let center_x = panel.left + z2p(half_w);
             let center_y = panel.top + z2p(half_h);
             let cell_size = z2p(1).max(1);
-            let center_cell = Rect::from_origin_size(Point::new(center_x, center_y), cell_size, cell_size);
+            let center_cell =
+                Rect::from_origin_size(Point::new(center_x, center_y), cell_size, cell_size);
 
             // Light-blue crosshair bands through the sampled pixel's whole row
             // and column: the eye follows them to the cell even before the ring.
             self.d2d.FillRectangle(
-                &to_d2d(Rect::new(panel.left, center_y, panel.right, center_y + cell_size)),
+                &to_d2d(Rect::new(
+                    panel.left,
+                    center_y,
+                    panel.right,
+                    center_y + cell_size,
+                )),
                 band,
             );
             self.d2d.FillRectangle(
-                &to_d2d(Rect::new(center_x, panel.top, center_x + cell_size, panel.bottom)),
+                &to_d2d(Rect::new(
+                    center_x,
+                    panel.top,
+                    center_x + cell_size,
+                    panel.bottom,
+                )),
                 band,
             );
 
@@ -163,7 +170,8 @@ impl OverlayRenderer {
                 ));
             }
             self.d2d.FillRectangle(&to_d2d(center_cell), &cell_fill);
-            self.d2d.DrawRectangle(&to_d2d(center_cell), white, 1.0, None);
+            self.d2d
+                .DrawRectangle(&to_d2d(center_cell), white, 1.0, None);
             let outer_cell = Rect::new(
                 center_cell.left - 1,
                 center_cell.top - 1,
@@ -184,11 +192,16 @@ impl OverlayRenderer {
                     format!("{:.0}×", zoom)
                 } else if zoom >= 1.0 {
                     let r = zoom.round();
-                    if (zoom - r).abs() < 0.01 { format!("{:.0}×", r) } else { format!("{:.1}×", zoom) }
+                    if (zoom - r).abs() < 0.01 {
+                        format!("{:.0}×", r)
+                    } else {
+                        format!("{:.1}×", zoom)
+                    }
                 } else {
                     format!("{:.1}×", zoom)
                 };
-                let badge_fmt = self.info_text_format_mut(false, 14.0, DWRITE_FONT_WEIGHT_BOLD, true)?;
+                let badge_fmt =
+                    self.info_text_format_mut(false, 14.0, DWRITE_FONT_WEIGHT_BOLD, true)?;
                 let text_w = self.measure_text_width_in(&label, &badge_fmt)?;
                 let bw = text_w + badge_pad_h * 2.0;
                 let bh = badge_font_sz + badge_pad_v * 2.0;
@@ -206,126 +219,63 @@ impl OverlayRenderer {
                 self.d2d.FillRoundedRectangle(&badge_rect, &badge_bg);
                 let wide = label.encode_utf16().collect::<Vec<u16>>();
                 self.d2d.DrawText(
-                    &wide, &badge_fmt, &badge_rect.rect,
-                    white, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL,
+                    &wide,
+                    &badge_fmt,
+                    &badge_rect.rect,
+                    white,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
                 );
             }
 
             self.d2d.PopAxisAlignedClip();
 
-            // ── Info panel: two-column glass layout ──
-            // Left: colour swatch + S-cycled value (row 1) and X/Y coordinates
-            // (row 2). Right: three stacked `<kbd>` hint rows for S / C / P.
+            // ── Info strip: the session's blurred frame cropped to the strip, a tint, two rows ──
+            // Row 1: [swatch] colour value  ............  (x, y)
+            // Row 2: [S] 格式   [C] 复制   [P] 坐标   [Z] 缩放   (keys as bound, spread end to end)
             let info = geometry.info_panel;
-            let bg = self.require_brush(&self.info_bg_brush, "info bg")?;
             let primary_brush = self.require_brush(&self.info_hex_brush, "info primary colour")?;
-            let coord_val_brush = self.require_brush(&self.info_coord_value_brush, "info coord")?;
+            let coord_brush = self.require_brush(&self.info_coord_value_brush, "info coord")?;
             let hint_brush = self.require_brush(&self.info_hint_brush, "info hint")?;
-            let kbd_text_brush = self.require_brush(&self.info_kbd_text_brush, "info kbd text")?;
-            let kbd_fill_brush = self.require_brush(&self.info_kbd_fill_brush, "info kbd fill")?;
-            let kbd_bottom_brush = self.require_brush(&self.info_kbd_bottom_brush, "info kbd bot")?;
-            let swatch_border = self.require_brush(&self.info_swatch_border_brush, "swatch border")?;
-            let swatch_inset = self.require_brush(&self.info_swatch_inset_brush, "swatch inset")?;
+            let kbd_fill = self.require_brush(&self.info_kbd_fill_brush, "info kbd fill")?;
+            let swatch_border =
+                self.require_brush(&self.info_swatch_border_brush, "swatch border")?;
             let swatch_fill = self.require_brush(&self.info_swatch_fill_brush, "swatch fill")?;
-
-            // Info-strip backdrop: real Gaussian blur restricted to `info`, with
-            // a translucent tint on top. If either the effect or the tint brush
-            // is missing (or there is no frame to sample), fall back to the old
-            // solid `bg` so the strip never disappears.
-            let blur_owned = self.blur_effect.clone();
-            let tint_owned = self.info_tint_brush.clone();
-            if let (Some(fb), Some(blur), Some(tint)) = (
-                resources.frame_bitmap.as_ref(),
-                blur_owned.as_ref(),
-                tint_owned.as_ref(),
-            ) {
-                // Rebind the effect input every frame: the effect instance is
-                // cached across sessions, but `frame_bitmap` is rebuilt per
-                // session, so its input slot must be refreshed against the
-                // currently frozen frame. SetInput returns (), not Result.
-                let fb_img: ID2D1Image = fb
-                    .cast()
-                    .map_err(|error| crate::windows::win::hresult("ID2D1Bitmap1::cast", &error))?;
-                blur.SetInput(0, &fb_img, true);
-                // Mode A (context DPI = 96, coordinates in physical pixels):
-                // std_dev is expressed in DIP (= physical pixels here); the
-                // `* scale` widens the kernel proportionally on high-DPI
-                // displays so the perceived blur strength stays constant.
-                let std_dev = 12.0 * (metrics.dpi.max(96) as f32 / 96.0);
-                blur.SetValue(
-                    D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION.0 as u32,
-                    D2D1_PROPERTY_TYPE_UNKNOWN,
-                    &std_dev.to_ne_bytes(),
-                )
-                .map_err(|error| {
-                    crate::windows::win::hresult("ID2D1Effect::SetValue(STANDARD_DEVIATION)", &error)
-                })?;
-                // DrawImage is bounded to `info` via the source rectangle, so
-                // D2D only evaluates the blur over the region actually needed
-                // (info rect + kernel padding). Both optional pointers must be
-                // raw pointers in windows-rs 0.61 (`Option<*const _>`).
-                let dest = vector2(info.left as f32, info.top as f32);
-                let src = to_d2d(info);
-                let blur_img: ID2D1Image = blur
-                    .cast()
-                    .map_err(|error| crate::windows::win::hresult("ID2D1Effect::cast", &error))?;
-                self.d2d
-                    .DrawImage(
-                        &blur_img,
-                        Some(&dest as *const Vector2),
-                        Some(&src as *const D2D_RECT_F),
-                        D2D1_INTERPOLATION_MODE_LINEAR,
-                        D2D1_COMPOSITE_MODE_SOURCE_OVER,
-                    );
-                // 0.48 tint on top keeps text legible without hiding the texture.
-                self.d2d.FillRectangle(&to_d2d(info), tint);
-            } else {
-                self.d2d.FillRectangle(&to_d2d(info), &bg);
+            let tint = self.require_brush(&self.info_tint_brush, "info tint")?;
+            let backdrop = info.intersect(view.frame);
+            if let Some(blurred) = self.blurred_frame.as_ref()
+                && !backdrop.is_empty()
+            {
+                let rect = to_d2d(backdrop);
+                self.d2d.DrawBitmap(
+                    blurred,
+                    Some(&rect),
+                    1.0,
+                    D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                    Some(&rect),
+                    None,
+                );
             }
+            self.d2d.FillRectangle(&to_d2d(info), &tint);
 
-            // The loupe is a single fixed **physical**-pixel box (340×180 image +
-            // info strip, DPI-invariant — see MagnifierConfig::PANEL_WIDTH_PHYSICAL)
-            // clipped to one rounded rect, so the info strip shares that fixed
-            // width. Its fonts and spacing therefore stay in physical pixels:
-            // scaling them by DPI while the box stays put would overflow it on
-            // high-DPI displays. On the single colour/coordinate line the panel is
-            // wide enough that both fit with room to spare (asserted by
-            // `widest_colour_value_fits_the_info_row`).
-            let scale = 1.0f32;
-            let pad_v = INFO_PADDING_V_DIP * scale;
-            let pad_h = INFO_PADDING_H_DIP * scale;
-            let swatch_sz = INFO_SWATCH_SIZE_DIP * scale;
-            let swatch_radius = INFO_SWATCH_RADIUS_DIP * scale;
-            let swatch_gap = INFO_SWATCH_GAP_DIP * scale;
-            let coord_block_gap = INFO_COORD_BLOCK_GAP_DIP * scale;
-            let kbd_pad = INFO_KBD_PADDING_DIP * scale;
-            let kbd_radius = INFO_KBD_RADIUS_DIP * scale;
-            let kbd_text_gap = INFO_KBD_TEXT_GAP_DIP * scale;
-            let kbd_line_h = INFO_KBD_LINE_HEIGHT_DIP * scale;
-            let hint_item_gap = INFO_HINT_ITEM_GAP_DIP * scale;
-            let kbd_row_gap = INFO_KBD_ROW_GAP_DIP * scale;
-            let kbd_block_gap = INFO_KBD_BLOCK_GAP_DIP * scale;
+            // The strip is 76 DIP tall at every scale (`MagnifierConfig::scaled`), so its contents
+            // are DIP × k too. The loupe's width is fixed in physical pixels, which is why both rows
+            // shrink to fit, and why row 1 cuts the colour value when even its floor is too wide.
+            let k = metrics.dpi.max(96) as f32 / 96.0;
+            let swatch = INFO_SWATCH_SIZE_DIP * k;
+            let swatch_radius = INFO_SWATCH_RADIUS_DIP * k;
+            let content_l = info.left as f32 + INFO_PADDING_H_DIP * k;
+            let content_r = info.right as f32 - INFO_PADDING_H_DIP * k;
+            let avail = content_r - content_l;
+            let row1_y = info.top as f32 + INFO_PADDING_V_DIP * k;
 
-            // ── Row 1 (colour value + right-aligned coordinates) + 2×2 grid ──
-            // Row 1: [swatch] colour value  ............  (x, y)   (coords right-aligned)
-            // Row 2: [S 色值格式]  [C 复制色值]
-            // Row 3: [P 坐标模式]  [Z 滚轮缩放]
-            let content_l = info.left as f32 + pad_h;
-            let content_r = info.right as f32 - pad_h;
-            let row1_h = swatch_sz; // colour/coordinate line height (swatch-sized)
-            let content_h = (info.bottom - info.top) as f32 - pad_v * 2.0;
-            let block_h = row1_h + kbd_block_gap + kbd_line_h * 2.0 + kbd_row_gap;
-            let row1_y = info.top as f32 + pad_v + (content_h - block_h).max(0.0) / 2.0;
-            let kbd_row_a_y = row1_y + row1_h + kbd_block_gap;
-            let kbd_row_b_y = kbd_row_a_y + kbd_line_h + kbd_row_gap;
-
-            // ---- Row 1: swatch + colour value ----
+            // ---- Row 1: swatch, colour value, position ----
             let swatch_rect = D2D1_ROUNDED_RECT {
                 rect: D2D_RECT_F {
                     left: content_l,
-                    top: row1_y + (row1_h - swatch_sz) / 2.0,
-                    right: content_l + swatch_sz,
-                    bottom: row1_y + (row1_h + swatch_sz) / 2.0,
+                    top: row1_y,
+                    right: content_l + swatch,
+                    bottom: row1_y + swatch,
                 },
                 radiusX: swatch_radius,
                 radiusY: swatch_radius,
@@ -340,134 +290,135 @@ impl OverlayRenderer {
                 ));
             }
             self.d2d.FillRoundedRectangle(&swatch_rect, &swatch_fill);
-            self.d2d.DrawRoundedRectangle(&swatch_rect, &swatch_border, 1.0, None);
-            let inset_rect = D2D1_ROUNDED_RECT {
-                rect: D2D_RECT_F {
-                    left: swatch_rect.rect.left + 1.0,
-                    top: swatch_rect.rect.top + 1.0,
-                    right: swatch_rect.rect.right - 1.0,
-                    bottom: swatch_rect.rect.bottom - 1.0,
-                },
-                radiusX: (swatch_radius - 1.0).max(0.0),
-                radiusY: (swatch_radius - 1.0).max(0.0),
-            };
-            self.d2d.DrawRoundedRectangle(&inset_rect, &swatch_inset, 1.0, None);
+            self.d2d
+                .DrawRoundedRectangle(&swatch_rect, &swatch_border, 1.0, None);
 
-            // Position: a single "(x, y)" string, right-aligned on row 1, so the
-            // colour value keeps the remaining (left) width.
             let (cx, cy) = if view.magnifier_relative && !view.selection.is_empty() {
-                (view.cursor.x - view.selection.left, view.cursor.y - view.selection.top)
+                (
+                    view.cursor.x - view.selection.left,
+                    view.cursor.y - view.selection.top,
+                )
             } else {
-                (view.cursor.x + view.screen_origin.x, view.cursor.y + view.screen_origin.y)
+                (
+                    view.cursor.x + view.screen_origin.x,
+                    view.cursor.y + view.screen_origin.y,
+                )
             };
             let pos_text = format!("({}, {})", cx, cy);
-            let value_format = self.info_text_format_mut(true, INFO_COORD_VALUE_FONT_DIP, DWRITE_FONT_WEIGHT_NORMAL, false)?;
-            let pos_w = self.measure_text_width_in(&pos_text, &value_format)?;
-            let coord_left = content_r - pos_w;
-
-            // Colour value fills the band between the swatch and the position.
-            // The 340 px panel leaves ample room, so the widest value fits without
-            // ever reaching the position text (asserted by the info-row width test).
             let colour_text = view.magnifier_color_text.as_deref().unwrap_or("--");
-            let primary_format = self.info_text_format_mut(true, INFO_PRIMARY_COLOR_FONT_DIP, DWRITE_FONT_WEIGHT_SEMI_BOLD, false)?;
-            let colour_x = content_l + swatch_sz + swatch_gap;
-            let colour_right = (coord_left - coord_block_gap).max(colour_x);
-            {
-                let wide = colour_text.encode_utf16().collect::<Vec<u16>>();
-                // Draw across the full row-1 band and let the format's paragraph
-                // centring put the text on the swatch's exact vertical centre; the
-                // earlier manual (row1_h - font)/2 offset compounded with paragraph
-                // centring pushed the glyphs ~3px below the swatch.
-                self.d2d.DrawText(
-                    &wide, &primary_format,
-                    &D2D_RECT_F {
-                        left: colour_x, top: row1_y,
-                        right: colour_right, bottom: row1_y + row1_h,
-                    },
-                    &primary_brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL,
-                );
-            }
+            let fixed = swatch + (INFO_SWATCH_GAP_DIP + INFO_COORD_BLOCK_GAP_DIP) * k;
+            let row1_font =
+                shrink_to_fit(INFO_ROW1_FONT_MAX_DIP, INFO_ROW1_FONT_MIN_DIP, |size| {
+                    let colour =
+                        self.info_text_width(colour_text, size, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
+                    let pos = self.info_text_width(&pos_text, size, DWRITE_FONT_WEIGHT_NORMAL)?;
+                    Ok(fixed + colour + pos <= avail)
+                })?;
+            let pos_format =
+                self.info_text_format_mut(true, row1_font, DWRITE_FONT_WEIGHT_NORMAL, false)?;
+            let pos_w = self.measure_text_width_in(&pos_text, &pos_format)?;
+            let coord_left = content_r - pos_w;
+            let colour_format =
+                self.info_text_format_mut(true, row1_font, DWRITE_FONT_WEIGHT_SEMI_BOLD, false)?;
+            let colour_x = content_l + swatch + INFO_SWATCH_GAP_DIP * k;
+            let colour_right = (coord_left - INFO_COORD_BLOCK_GAP_DIP * k).max(colour_x);
+            // Both texts span the swatch's height and are centred in it by the format's paragraph
+            // alignment. The colour value is clipped to its band: at the floor size it is the one
+            // that gives way, the position never does.
+            let wide = colour_text.encode_utf16().collect::<Vec<u16>>();
+            self.d2d.DrawText(
+                &wide,
+                &colour_format,
+                &D2D_RECT_F {
+                    left: colour_x,
+                    top: row1_y,
+                    right: colour_right,
+                    bottom: row1_y + swatch,
+                },
+                &primary_brush,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+            let wide = pos_text.encode_utf16().collect::<Vec<u16>>();
+            self.d2d.DrawText(
+                &wide,
+                &pos_format,
+                &D2D_RECT_F {
+                    left: coord_left,
+                    top: row1_y,
+                    right: content_r,
+                    bottom: row1_y + swatch,
+                },
+                &coord_brush,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
 
-            // Right-aligned position text, sharing row 1's vertical centre.
-            {
-                let wide_pos = pos_text.encode_utf16().collect::<Vec<u16>>();
-                self.d2d.DrawText(
-                    &wide_pos, &value_format,
-                    &D2D_RECT_F {
-                        left: coord_left, top: row1_y,
-                        right: content_r, bottom: row1_y + row1_h,
+            // ---- Row 2: the hint row ----
+            let ky = row1_y + swatch + INFO_HINT_ROW_GAP_DIP * k;
+            let kh = INFO_HINT_ROW_HEIGHT_DIP * k;
+            let hints = view.loupe_hints.clone();
+            let fit = fit_hint_row(&hints, avail, k, |text, size, key| {
+                let weight = if key {
+                    DWRITE_FONT_WEIGHT_SEMI_BOLD
+                } else {
+                    DWRITE_FONT_WEIGHT_NORMAL
+                };
+                self.info_text_width(text, size, weight)
+            })?;
+            let key_format = self.info_text_format_mut(
+                true,
+                fit.font - 1.0,
+                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                true,
+            )?;
+            let label_format =
+                self.info_text_format_mut(false, fit.font, DWRITE_FONT_WEIGHT_NORMAL, false)?;
+            let inset = INFO_KBD_INSET_DIP * k;
+            let radius = INFO_KBD_RADIUS_DIP * k;
+            for (hint, slot) in hints.iter().zip(&fit.slots) {
+                let x = content_l + slot.cap_x;
+                let cap = D2D_RECT_F {
+                    left: x,
+                    top: ky + inset,
+                    right: x + slot.cap_w,
+                    bottom: ky + kh - inset,
+                };
+                self.d2d.FillRoundedRectangle(
+                    &D2D1_ROUNDED_RECT {
+                        rect: cap,
+                        radiusX: radius,
+                        radiusY: radius,
                     },
-                    &coord_val_brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL,
+                    &kbd_fill,
                 );
-            }
-
-            // ---- Row 2: four <kbd> hint items, laid out horizontally & centred ----
-            // `hint_format` measures the CJK description (left-flushed); `hint_centered`
-            // centres the single key letter inside its box. Both share the
-            // vertical-centre paragraph alignment baked into `info_text_format_mut`.
-            let hint_format = self.info_text_format_mut(false, INFO_HINT_FONT_DIP, DWRITE_FONT_WEIGHT_NORMAL, false)?;
-            let hint_centered = self.info_text_format_mut(false, INFO_HINT_FONT_DIP, DWRITE_FONT_WEIGHT_NORMAL, true)?;
-            let hints = INFO_HINTS;
-            // Measure every item (box + gap + description); the two columns
-            // share the widest item width so the grid lines up, and the whole
-            // 2×2 block is centred inside the strip.
-            let mut box_ws = [0.0f32; 4];
-            let mut desc_ws = [0.0f32; 4];
-            let mut item_ws = [0.0f32; 4];
-            for i in 0..4 {
-                let key_w = self.measure_text_width_in(hints[i].0, &hint_format)?;
-                box_ws[i] = (key_w + kbd_pad * 2.0).max(kbd_line_h);
-                desc_ws[i] = self.measure_text_width_in(hints[i].1, &hint_format)?;
-                item_ws[i] = box_ws[i] + kbd_text_gap + desc_ws[i];
-            }
-            let col_w = item_ws.iter().cloned().fold(0.0f32, f32::max);
-            let grid_w = col_w * 2.0 + hint_item_gap;
-            let col0_x = (content_l + content_r - grid_w) / 2.0;
-            let col1_x = col0_x + col_w + hint_item_gap;
-            let slots = [
-                (col0_x, kbd_row_a_y),
-                (col1_x, kbd_row_a_y),
-                (col0_x, kbd_row_b_y),
-                (col1_x, kbd_row_b_y),
-            ];
-            for i in 0..4 {
-                let (key, desc) = hints[i];
-                let (item_x, row_y) = slots[i];
-                let box_w = box_ws[i];
-                let desc_w = desc_ws[i];
-                let box_rect = D2D1_ROUNDED_RECT {
-                    rect: D2D_RECT_F {
-                        left: item_x, top: row_y,
-                        right: item_x + box_w, bottom: row_y + kbd_line_h,
-                    },
-                    radiusX: kbd_radius, radiusY: kbd_radius,
-                };
-                self.d2d.FillRoundedRectangle(&box_rect, &kbd_fill_brush);
-                let bot_rect = D2D_RECT_F {
-                    left: item_x + 1.0, top: row_y + kbd_line_h - 1.0,
-                    right: item_x + box_w - 1.0, bottom: row_y + kbd_line_h,
-                };
-                self.d2d.FillRectangle(&bot_rect, &kbd_bottom_brush);
-                {
-                    let wide = key.encode_utf16().collect::<Vec<u16>>();
-                    self.d2d.DrawText(
-                        &wide, &hint_centered,
-                        &D2D_RECT_F {
-                            left: item_x, top: row_y,
-                            right: item_x + box_w, bottom: row_y + kbd_line_h,
-                        },
-                        &kbd_text_brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL,
-                    );
-                }
-                let desc_x = item_x + box_w + kbd_text_gap;
-                let wide_desc = desc.encode_utf16().collect::<Vec<u16>>();
+                let wide = hint.key.encode_utf16().collect::<Vec<u16>>();
                 self.d2d.DrawText(
-                    &wide_desc, &hint_format,
+                    &wide,
+                    &key_format,
                     &D2D_RECT_F {
-                        left: desc_x, top: row_y,
-                        right: desc_x + desc_w + 2.0, bottom: row_y + kbd_line_h,
+                        top: ky,
+                        bottom: ky + kh,
+                        ..cap
                     },
-                    &hint_brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL,
+                    &primary_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+                let label_x = content_l + slot.label_x;
+                let wide = hint.label.encode_utf16().collect::<Vec<u16>>();
+                self.d2d.DrawText(
+                    &wide,
+                    &label_format,
+                    &D2D_RECT_F {
+                        left: label_x,
+                        top: ky,
+                        right: label_x + slot.label_w + 2.0,
+                        bottom: ky + kh,
+                    },
+                    &hint_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
                 );
             }
 
@@ -491,15 +442,27 @@ impl OverlayRenderer {
                 view.frame,
             );
             self.d2d.DrawLine(
-                vector2(reticle.horizontal.left as f32 + 0.5, view.cursor.y as f32 + 0.5),
-                vector2(reticle.horizontal.right as f32 - 0.5, view.cursor.y as f32 + 0.5),
+                vector2(
+                    reticle.horizontal.left as f32 + 0.5,
+                    view.cursor.y as f32 + 0.5,
+                ),
+                vector2(
+                    reticle.horizontal.right as f32 - 0.5,
+                    view.cursor.y as f32 + 0.5,
+                ),
                 crosshair,
                 1.0,
                 None,
             );
             self.d2d.DrawLine(
-                vector2(view.cursor.x as f32 + 0.5, reticle.vertical.top as f32 + 0.5),
-                vector2(view.cursor.x as f32 + 0.5, reticle.vertical.bottom as f32 - 0.5),
+                vector2(
+                    view.cursor.x as f32 + 0.5,
+                    reticle.vertical.top as f32 + 0.5,
+                ),
+                vector2(
+                    view.cursor.x as f32 + 0.5,
+                    reticle.vertical.bottom as f32 - 0.5,
+                ),
                 crosshair,
                 1.0,
                 None,
@@ -508,8 +471,23 @@ impl OverlayRenderer {
         Ok(())
     }
 
+    /// Advance width of `text` in the info strip's font at `size_dip` (physical pixels).
+    pub(super) fn info_text_width(
+        &mut self,
+        text: &str,
+        size_dip: f32,
+        weight: DWRITE_FONT_WEIGHT,
+    ) -> Result<f32, String> {
+        let format = self.info_text_format_mut(true, size_dip, weight, false)?;
+        self.measure_text_width_in(text, &format)
+    }
+
     /// Advance width of `text` rendered in a specific DirectWrite format.
-    pub(super) fn measure_text_width_in(&self, text: &str, format: &IDWriteTextFormat) -> Result<f32, String> {
+    pub(super) fn measure_text_width_in(
+        &self,
+        text: &str,
+        format: &IDWriteTextFormat,
+    ) -> Result<f32, String> {
         let wide = text.encode_utf16().collect::<Vec<u16>>();
         let layout = unsafe {
             self.dwrite
@@ -591,5 +569,188 @@ impl OverlayRenderer {
         self.info_formats.push((key, format.clone()));
         Ok(format)
     }
+}
 
+/// The largest size from `max` down to `min`, in [`INFO_FONT_STEP_DIP`] steps, that `fits`; `min`
+/// when none does. The last size `fits` was asked about is the one returned.
+pub(super) fn shrink_to_fit(
+    max: f32,
+    min: f32,
+    mut fits: impl FnMut(f32) -> Result<bool, String>,
+) -> Result<f32, String> {
+    let mut size = max;
+    while !fits(size)? && size - INFO_FONT_STEP_DIP >= min {
+        size -= INFO_FONT_STEP_DIP;
+    }
+    Ok(size)
+}
+
+/// One item of the hint row, in physical pixels from the row's left edge.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct HintSlot {
+    pub cap_x: f32,
+    pub cap_w: f32,
+    pub label_x: f32,
+    pub label_w: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct HintRowFit {
+    /// The label size in DIP; the key text is one smaller.
+    pub font: f32,
+    pub slots: Vec<HintSlot>,
+}
+
+/// Lay the hint row into `avail` physical pixels at scale `k`.
+///
+/// The label size steps down from 12 to 10 DIP until the items fit with at least 8 DIP between
+/// them; whatever is left is spread evenly between the items, so the row runs end to end.
+/// `measure(text, size_dip, is_key)` is the text's width in physical pixels; key text is measured
+/// one size smaller than `size_dip` and semi-bold.
+pub(super) fn fit_hint_row(
+    hints: &[LoupeHint],
+    avail: f32,
+    k: f32,
+    mut measure: impl FnMut(&str, f32, bool) -> Result<f32, String>,
+) -> Result<HintRowFit, String> {
+    let cap_min = (INFO_HINT_ROW_HEIGHT_DIP - 2.0 * INFO_KBD_INSET_DIP) * k;
+    let gaps = hints.len().saturating_sub(1) as f32;
+    let mut measured = Vec::with_capacity(hints.len());
+    let font = shrink_to_fit(INFO_HINT_FONT_MAX_DIP, INFO_HINT_FONT_MIN_DIP, |size| {
+        measured.clear();
+        for hint in hints {
+            let key = measure(&hint.key, size - 1.0, true)?;
+            let label = measure(hint.label, size, false)?;
+            measured.push(((key + INFO_KBD_TEXT_PAD_DIP * k).max(cap_min), label));
+        }
+        let sum: f32 = measured
+            .iter()
+            .map(|&(cap, label)| item_width(cap, label, k))
+            .sum();
+        Ok(sum + gaps * INFO_HINT_ITEM_GAP_MIN_DIP * k <= avail)
+    })?;
+    // `shrink_to_fit` returns the size it asked about last, so `measured` is for `font`.
+    let sum: f32 = measured
+        .iter()
+        .map(|&(cap, label)| item_width(cap, label, k))
+        .sum();
+    let gap = if gaps > 0.0 {
+        ((avail - sum) / gaps).max(0.0)
+    } else {
+        0.0
+    };
+    let mut x = 0.0;
+    let slots = measured
+        .iter()
+        .map(|&(cap_w, label_w)| {
+            let slot = HintSlot {
+                cap_x: x,
+                cap_w,
+                label_x: x + cap_w + INFO_KBD_LABEL_GAP_DIP * k,
+                label_w,
+            };
+            x += item_width(cap_w, label_w, k) + gap;
+            slot
+        })
+        .collect();
+    Ok(HintRowFit { font, slots })
+}
+
+fn item_width(cap: f32, label: f32, k: f32) -> f32 {
+    cap + INFO_KBD_LABEL_GAP_DIP * k + label
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hints() -> Vec<LoupeHint> {
+        crate::keymap::Keymap::default().loupe_hints()
+    }
+
+    /// Every character is half the size wide, key text included.
+    fn measure(text: &str, size: f32, _key: bool) -> Result<f32, String> {
+        Ok(text.chars().count() as f32 * size * 0.5)
+    }
+
+    #[test]
+    fn shrink_to_fit_takes_the_largest_size_that_fits() {
+        let mut asked = Vec::new();
+        let size = shrink_to_fit(12.0, 10.0, |size| {
+            asked.push(size);
+            Ok(size <= 11.0)
+        })
+        .unwrap();
+        assert_eq!(size, 11.0);
+        assert_eq!(asked, [12.0, 11.5, 11.0]);
+    }
+
+    #[test]
+    fn shrink_to_fit_stops_at_the_floor_when_nothing_fits() {
+        let size = shrink_to_fit(13.0, 11.0, |_| Ok(false)).unwrap();
+        assert_eq!(size, 11.0);
+    }
+
+    #[test]
+    fn a_roomy_row_keeps_the_largest_font_and_runs_end_to_end() {
+        let fit = fit_hint_row(&hints(), 400.0, 1.0, measure).unwrap();
+        assert_eq!(fit.font, INFO_HINT_FONT_MAX_DIP);
+        assert_eq!(fit.slots.len(), 4);
+        assert_eq!(fit.slots[0].cap_x, 0.0);
+        let last = fit.slots.last().unwrap();
+        assert!(
+            (last.label_x + last.label_w - 400.0).abs() < 0.01,
+            "{fit:?}"
+        );
+        // Space-between: every gap is the same.
+        let gaps: Vec<f32> = fit
+            .slots
+            .windows(2)
+            .map(|pair| pair[1].cap_x - (pair[0].label_x + pair[0].label_w))
+            .collect();
+        assert!(
+            gaps.windows(2).all(|pair| (pair[0] - pair[1]).abs() < 0.01),
+            "{gaps:?}"
+        );
+    }
+
+    #[test]
+    fn a_tight_row_steps_the_font_down_until_the_minimum_gap_fits() {
+        let roomy = fit_hint_row(&hints(), 1000.0, 1.0, measure).unwrap();
+        let widths = |font: f32| {
+            hints()
+                .iter()
+                .map(|hint| {
+                    let cap = (hint.key.chars().count() as f32 * (font - 1.0) * 0.5
+                        + INFO_KBD_TEXT_PAD_DIP)
+                        .max(INFO_HINT_ROW_HEIGHT_DIP - 2.0 * INFO_KBD_INSET_DIP);
+                    cap + INFO_KBD_LABEL_GAP_DIP + hint.label.chars().count() as f32 * font * 0.5
+                })
+                .sum::<f32>()
+                + 3.0 * INFO_HINT_ITEM_GAP_MIN_DIP
+        };
+        // Just too narrow for 12, wide enough for 11.5.
+        let avail = widths(11.5);
+        assert!(avail < widths(12.0));
+        let fit = fit_hint_row(&hints(), avail, 1.0, measure).unwrap();
+        assert_eq!(roomy.font, 12.0);
+        assert_eq!(fit.font, 11.5);
+        for pair in fit.slots.windows(2) {
+            let gap = pair[1].cap_x - (pair[0].label_x + pair[0].label_w);
+            assert!(gap >= INFO_HINT_ITEM_GAP_MIN_DIP - 0.01, "{fit:?}");
+        }
+    }
+
+    #[test]
+    fn caps_are_never_narrower_than_they_are_tall_and_scale_with_dpi() {
+        let fit = fit_hint_row(&hints(), 600.0, 1.5, measure).unwrap();
+        let min = (INFO_HINT_ROW_HEIGHT_DIP - 2.0 * INFO_KBD_INSET_DIP) * 1.5;
+        for slot in &fit.slots {
+            assert!(slot.cap_w >= min, "{slot:?}");
+            assert!(
+                (slot.label_x - slot.cap_x - slot.cap_w - INFO_KBD_LABEL_GAP_DIP * 1.5).abs()
+                    < 0.01
+            );
+        }
+    }
 }

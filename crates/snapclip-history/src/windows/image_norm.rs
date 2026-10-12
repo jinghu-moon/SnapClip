@@ -21,12 +21,8 @@ pub fn dib_to_png(dib: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
     let bmp = dib_to_bmp(dib)?;
     let rgba = image::decode_to_rgba8(&bmp).map_err(|error| format!("decode dib: {error}"))?;
     let (width, height) = rgba.dimensions();
-    let (pixels, width, height) = image::downscale_rgba_to_max_side(
-        rgba.into_raw(),
-        width,
-        height,
-        MAX_OCR_SIDE,
-    )?;
+    let (pixels, width, height) =
+        image::downscale_rgba_to_max_side(rgba.into_raw(), width, height, MAX_OCR_SIDE)?;
     let png = image::encode_rgba_png(&pixels, width, height)?;
     Ok((png, width, height))
 }
@@ -43,12 +39,8 @@ pub fn normalize_png(png: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
     }
     let rgba = image::decode_to_rgba8(png)?;
     let (width, height) = rgba.dimensions();
-    let (pixels, width, height) = image::downscale_rgba_to_max_side(
-        rgba.into_raw(),
-        width,
-        height,
-        MAX_OCR_SIDE,
-    )?;
+    let (pixels, width, height) =
+        image::downscale_rgba_to_max_side(rgba.into_raw(), width, height, MAX_OCR_SIDE)?;
     let png = image::encode_rgba_png(&pixels, width, height)?;
     Ok((png, width, height))
 }
@@ -260,6 +252,9 @@ mod tests {
         assert_eq!((width, height), (2, 1));
         assert_eq!(png_dimensions(&png), Some((2, 1)));
         let decoded = crate::image::decode_to_bgra8(&png).unwrap();
-        assert_eq!(decoded.bytes(), &[0x10, 0x20, 0x30, 0xFF, 0x40, 0x50, 0x60, 0xFF]);
+        assert_eq!(
+            decoded.bytes(),
+            &[0x10, 0x20, 0x30, 0xFF, 0x40, 0x50, 0x60, 0xFF]
+        );
     }
 }

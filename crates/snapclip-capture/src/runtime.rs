@@ -1,7 +1,7 @@
 //! Cross-thread entry point for the capture feature.
 
-use crate::ports::OverlayPlatform;
 use crate::annotation::AnnotationCommand;
+use crate::ports::OverlayPlatform;
 use crate::{CaptureResult, CaptureState};
 
 /// Owns the platform overlay controller and exposes it as the process-wide capture
@@ -42,6 +42,11 @@ impl CaptureRuntime {
         self.platform.request_confirm()
     }
 
+    /// The user's overlay preferences, applied from the next session on.
+    pub fn set_preferences(&self, preferences: crate::preferences::OverlayPreferences) {
+        self.platform.set_preferences(preferences);
+    }
+
     /// Forward one low-frequency toolbar instruction to the active session's
     /// annotation document.
     pub fn annotation_command(&self, command: AnnotationCommand) -> CaptureResult<()> {
@@ -51,6 +56,7 @@ impl CaptureRuntime {
 
 impl Drop for CaptureRuntime {
     fn drop(&mut self) {
+        eprintln!("[snapclip][capture] CaptureRuntime dropped; shutting down overlay");
         self.platform.shutdown();
     }
 }

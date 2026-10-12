@@ -14,12 +14,8 @@ use crate::monitor_cache::MonitorCache;
 use crate::window_detection::model::{
     EpochCounter, HoverValidity, WindowIdentity, WindowSnapshot, WindowTarget,
 };
-use crate::window_detection::provider::{
-    Exclusions, WindowDetectionError, WindowTargetProvider,
-};
-use crate::window_detection::snapshot::{
-    candidates_from_classified, class_name_hash, classify,
-};
+use crate::window_detection::provider::{Exclusions, WindowDetectionError, WindowTargetProvider};
+use crate::window_detection::snapshot::{candidates_from_classified, class_name_hash, classify};
 
 use super::monitor;
 use super::win::window as win32;
@@ -78,15 +74,12 @@ impl TopLevelWindowProvider {
 }
 
 impl WindowTargetProvider for TopLevelWindowProvider {
-    fn refresh(
-        &mut self,
-        exclusions: &Exclusions,
-    ) -> Result<WindowSnapshot, WindowDetectionError> {
+    fn refresh(&mut self, exclusions: &Exclusions) -> Result<WindowSnapshot, WindowDetectionError> {
         self.refresh_monitors();
 
         // Stage one: cheap user-mode enumeration (no DWM inside the callback).
-        let probes = win32::enumerate_cheap_candidates()
-            .map_err(WindowDetectionError::EnumerationFailed)?;
+        let probes =
+            win32::enumerate_cheap_candidates().map_err(WindowDetectionError::EnumerationFailed)?;
 
         // Stage two: one batched DWM pass over the survivors.
         let handles: Vec<isize> = probes.iter().map(|probe| probe.hwnd).collect();
@@ -97,7 +90,11 @@ impl WindowTargetProvider for TopLevelWindowProvider {
         let classified = classify(&probes, &reads, exclusions, &self.monitors);
         let epoch = self.epochs.bump();
         let candidates = candidates_from_classified(&classified, epoch);
-        Ok(WindowSnapshot::new(epoch, candidates, self.monitors.clone()))
+        Ok(WindowSnapshot::new(
+            epoch,
+            candidates,
+            self.monitors.clone(),
+        ))
     }
 
     fn validate(&self, target: &WindowTarget) -> bool {
@@ -145,17 +142,30 @@ mod tests {
     fn refresh_builds_a_labelled_snapshot_with_ordered_candidates() {
         require_desktop();
         let mut provider = TopLevelWindowProvider::new();
-        let snapshot = provider.refresh(&Exclusions::new()).expect("refresh succeeds");
+        let snapshot = provider
+            .refresh(&Exclusions::new())
+            .expect("refresh succeeds");
         assert!(snapshot.epoch() >= 1, "a refresh always issues a new epoch");
-        assert!(!snapshot.monitors().is_empty(), "display topology was cached");
+        assert!(
+            !snapshot.monitors().is_empty(),
+            "display topology was cached"
+        );
         assert!(
             !snapshot.is_empty(),
             "a desktop with at least this test process's window cannot be empty"
         );
         // Candidates are frontmost-first and all belong to this generation.
         let z_orders: Vec<u32> = snapshot.candidates().iter().map(|c| c.z_order).collect();
-        assert!(z_orders.windows(2).all(|pair| pair[0] < pair[1]), "{z_orders:?}");
-        assert!(snapshot.candidates().iter().all(|c| c.snapshot_epoch == snapshot.epoch()));
+        assert!(
+            z_orders.windows(2).all(|pair| pair[0] < pair[1]),
+            "{z_orders:?}"
+        );
+        assert!(
+            snapshot
+                .candidates()
+                .iter()
+                .all(|c| c.snapshot_epoch == snapshot.epoch())
+        );
         // Every candidate is a real, non-degenerate, on-screen rectangle.
         for candidate in snapshot.candidates() {
             assert!(candidate.is_usable(), "{candidate:?}");
@@ -171,8 +181,12 @@ mod tests {
     fn each_refresh_advances_the_epoch_and_drops_the_previous_snapshot() {
         require_desktop();
         let mut provider = TopLevelWindowProvider::new();
-        let first = provider.refresh(&Exclusions::new()).expect("refresh succeeds");
-        let second = provider.refresh(&Exclusions::new()).expect("refresh succeeds");
+        let first = provider
+            .refresh(&Exclusions::new())
+            .expect("refresh succeeds");
+        let second = provider
+            .refresh(&Exclusions::new())
+            .expect("refresh succeeds");
         assert!(second.epoch() > first.epoch());
         // A target from the previous generation is stale for the new snapshot.
         if let Some(target) = first.nearest_target(Point::new(0, 0), 4096) {
@@ -193,12 +207,13 @@ mod tests {
     fn exclusions_remove_a_window_from_the_snapshot() {
         require_desktop();
         let mut provider = TopLevelWindowProvider::new();
-        let snapshot = provider.refresh(&Exclusions::new()).expect("refresh succeeds");
-        let victim = snapshot
-            .candidates()
-            .first()
-            .copied()
-            .expect("the desktop this test asked for must expose at least one top-level window");
+        let snapshot = provider
+            .refresh(&Exclusions::new())
+            .expect("refresh succeeds");
+        let victim =
+            snapshot.candidates().first().copied().expect(
+                "the desktop this test asked for must expose at least one top-level window",
+            );
 
         let mut exclusions = Exclusions::new();
         exclusions.exclude_hwnd(victim.identity.hwnd);
@@ -262,16 +277,23 @@ mod tests {
     fn reset_clears_the_epoch_and_the_cached_topology() {
         require_desktop();
         let mut provider = TopLevelWindowProvider::new();
-        let snapshot = provider.refresh(&Exclusions::new()).expect("refresh succeeds");
+        let snapshot = provider
+            .refresh(&Exclusions::new())
+            .expect("refresh succeeds");
         assert!(snapshot.epoch() >= 1);
         assert!(!snapshot.monitors().is_empty());
 
         provider.reset();
         // The next session starts a fresh generation, so nothing from the previous one can
         // be matched, and the display cache is rebuilt from the current topology.
-        let next = provider.refresh(&Exclusions::new()).expect("refresh succeeds");
+        let next = provider
+            .refresh(&Exclusions::new())
+            .expect("refresh succeeds");
         assert_eq!(next.epoch(), 1, "a reset restarts the epoch sequence");
-        assert!(!next.monitors().is_empty(), "the cache is rebuilt for the new session");
+        assert!(
+            !next.monitors().is_empty(),
+            "the cache is rebuilt for the new session"
+        );
     }
 
     #[test]
@@ -279,7 +301,9 @@ mod tests {
     fn hover_revalidation_reports_bounds_changes_and_stale_targets() {
         require_desktop();
         let mut provider = TopLevelWindowProvider::new();
-        let snapshot = provider.refresh(&Exclusions::new()).expect("refresh succeeds");
+        let snapshot = provider
+            .refresh(&Exclusions::new())
+            .expect("refresh succeeds");
         // The desktop is shared with everything else running on the machine, so a candidate
         // may legitimately disappear between the refresh and the validation below. Take the
         // first candidate that is *still* valid; a desktop where nothing at all is valid is not

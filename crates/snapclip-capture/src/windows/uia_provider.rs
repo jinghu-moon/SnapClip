@@ -15,18 +15,17 @@ use ::windows::Win32::Foundation::{HWND, RECT};
 use ::windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
 };
-use ::windows::core::Interface;
 use ::windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationCacheRequest, IUIAutomationElement, TreeScope,
     TreeScope_Children, TreeScope_Element, UIA_BoundingRectanglePropertyId,
     UIA_ControlTypePropertyId, UIA_IsOffscreenPropertyId, UIA_NativeWindowHandlePropertyId,
 };
+use ::windows::core::Interface;
 
-use crate::geometry::{Point, Rect};
 use crate::diagnostics::{PrecisionOutcome, WindowDetectionMetrics};
+use crate::geometry::{Point, Rect};
 use crate::window_detection::deep::{
-    DeepSelectionProvider, DeepTarget, QueryControl, RefinementJob, RefinementOutcome,
-    StopReason,
+    DeepSelectionProvider, DeepTarget, QueryControl, RefinementJob, RefinementOutcome, StopReason,
 };
 use crate::window_detection::model::{PathLevel, SnapshotEpoch, TargetKind};
 use crate::window_detection::uia::{
@@ -316,12 +315,28 @@ impl UiaDeepSelectionProvider {
     ) -> Vec<(IUIAutomationElement, WalkNode)> {
         let mut candidates = Vec::new();
         let mut hollow = Vec::new();
-        self.collect_level(request, parent, parent_bounds, point, budget, &mut candidates, &mut hollow);
+        self.collect_level(
+            request,
+            parent,
+            parent_bounds,
+            point,
+            budget,
+            &mut candidates,
+            &mut hollow,
+        );
         while candidates.is_empty() {
             let Some(next) = hollow.pop() else {
                 break;
             };
-            self.collect_level(request, &next, parent_bounds, point, budget, &mut candidates, &mut hollow);
+            self.collect_level(
+                request,
+                &next,
+                parent_bounds,
+                point,
+                budget,
+                &mut candidates,
+                &mut hollow,
+            );
         }
         candidates
     }
@@ -441,14 +456,13 @@ impl UiaDeepSelectionProvider {
         let Some(automation) = self.automation().cloned() else {
             return ProviderHit::Unusable("UI Automation unavailable".into());
         };
-        let root = match unsafe {
-            automation.ElementFromHandle(HWND(hwnd as *mut core::ffi::c_void))
-        } {
-            Ok(root) => root,
-            Err(error) => {
-                return ProviderHit::Unusable(format!("ElementFromHandle failed: {error}"));
-            }
-        };
+        let root =
+            match unsafe { automation.ElementFromHandle(HWND(hwnd as *mut core::ffi::c_void)) } {
+                Ok(root) => root,
+                Err(error) => {
+                    return ProviderHit::Unusable(format!("ElementFromHandle failed: {error}"));
+                }
+            };
         // The overlay covers the desktop (it is what the user is looking at) and a point hit test
         // has no notion of Z order, so it would answer *us* for every query. The guard is scoped to
         // this one call: it is a real pass-through for mouse input too, and the shorter that window
@@ -673,13 +687,7 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
             // *child* is still allowed (that is how Explorer nests its panes), but the walk must
             // make progress.
             let mut candidates: Vec<(IUIAutomationElement, WalkNode)> = self
-                .containing_children(
-                    &request,
-                    &current,
-                    current_bounds,
-                    job.point,
-                    &mut budget,
-                )
+                .containing_children(&request, &current, current_bounds, job.point, &mut budget)
                 .into_iter()
                 .filter(|(child, _)| !visited.contains(&(child.as_raw() as usize)))
                 .collect();
@@ -812,8 +820,7 @@ impl DeepSelectionProvider for UiaDeepSelectionProvider {
                     );
                 // Did this transport get below the page? A document or window-sized answer says no,
                 // and that is what tells the composite to ask MSAA (docs/21 §5.19).
-                let answered_specifically =
-                    !is_unspecific_hit(hit, control_type, window_bounds);
+                let answered_specifically = !is_unspecific_hit(hit, control_type, window_bounds);
                 let mut note = format!(
                     "provider={}x{} at ({},{})",
                     raw.width(),
@@ -918,7 +925,6 @@ fn finish(outcome: WalkOutcome, job: &RefinementJob) -> DeepTarget {
 fn to_rect(rect: RECT) -> Rect {
     Rect::new(rect.left, rect.top, rect.right, rect.bottom)
 }
-
 
 #[cfg(test)]
 mod tests;

@@ -10,9 +10,7 @@ use super::annotation::AnnotationCommand;
 use super::geometry::MonitorLayout;
 use super::{CaptureError, CaptureResult};
 
-pub use crate::artifact::{
-    CaptureService, PixelSliceSource, SelectionPixels,
-};
+pub use crate::artifact::{CaptureService, PixelSliceSource, SelectionPixels};
 
 /// Receives low-frequency lifecycle events. Deliberately a trait so the capture
 /// module never depends on the shell's event bus.
@@ -59,20 +57,38 @@ pub trait OverlayPlatform: Send + Sync + 'static {
         Err(CaptureError::Unsupported)
     }
 
+    /// Use `preferences` from the next session on; a running session keeps what it started with.
+    fn set_preferences(&self, preferences: crate::preferences::OverlayPreferences);
+
     fn shutdown(&self);
 }
 
 /// Writes short text to the system clipboard on behalf of the overlay.
 ///
-/// The overlay has exactly one clipboard affordance: pressing `C` copies the colour
-/// value under the magnifier. Owning the clipboard is the composition root's job,
-/// because whoever writes to it also has to mark the write as "ours" so SnapClip's own
-/// clip monitor does not record it. Capture therefore declares the need and the shell
+/// The overlay has two clipboard affordances: pressing `C` copies the colour value under the
+/// magnifier, and finishing a scroll capture copies the long image. Owning the clipboard is the
+/// composition root's job, because whoever writes to it also has to mark the write as "ours" so
+/// SnapClip's own clip monitor does not record it. Capture therefore declares the need and the shell
 /// implements it — the alternative (capture calling into the clipboard module, as it
 /// did before this port existed) is a dependency the seam must not have.
 pub trait ClipboardWriter: Send + Sync + 'static {
     /// Copy `text`. Failures are the implementation's to log; they are never fatal.
     fn copy_text(&self, text: &str);
+
+    /// Copy an image given as tightly packed, top-down BGRA rows (a finished scroll capture), and
+    /// `png`, the file the same image was already written to, when there is one.
+    ///
+    /// Pixels, not only the file: the caller already holds them, and the image is SnapClip's own,
+    /// so it must not go back through a decoder whose limits exist for untrusted input. The file,
+    /// too, because encoding the image a second time for the clipboard's PNG format is the same
+    /// work done twice (1.2 s for a 2148x42924 capture).
+    fn copy_image(
+        &self,
+        width: u32,
+        height: u32,
+        bgra: &[u8],
+        png: Option<&std::path::Path>,
+    ) -> Result<(), String>;
 }
 
 /// Turns a prepared selection into a durable artifact.
@@ -90,20 +106,5 @@ pub trait ArtifactWriter: Send + Sync + 'static {
         prepared: &crate::artifact::SelectionPixels,
         dpi: u32,
         monitor_device_name: Option<String>,
-    ) -> crate::CaptureResult<snapclip_model::CaptureArtifact>;
-
-    /// Write a **long** image, one band at a time (`docs/32` ADR-21).
-    ///
-    /// [`Self::write`] takes the whole image as one `SelectionPixels`, which is right for a
-    /// screenshot and impossible for a scroll session: `F7`'s output can be 10^5 rows tall, and
-    /// materialising that as one buffer is exactly what `docs/30` `F7` forbids. The height is a
-    /// precondition here rather than something discovered while writing, because a PNG's header
-    /// carries it (`§17.7`). Runs on the export worker, like [`Self::write`].
-    fn write_rows(
-        &self,
-        session_id: &str,
-        meta: &crate::scroll::export::ImageMeta,
-        source: &mut dyn crate::scroll::export::RowBandSource,
-        dpi: u32,
     ) -> crate::CaptureResult<snapclip_model::CaptureArtifact>;
 }

@@ -15,11 +15,14 @@
 #      A deleted name that survives in code is a second vocabulary, and two names grow two logics
 #      (D-6). Comments are exempt on purpose - a comment that says "`Adjusting` was removed" is
 #      the record of a decision, not a second definition - so the code text is stripped first.
-#   3. the_entity_map_names_real_symbols - section 2.2 hands out ten names; the map in 2.2.1 makes
-#      each one point at a symbol in a file, and this check holds the map to the tree. It exists
-#      because `ScrollLoop` is a design role and not a type: the code calls it `ScrollSession` +
-#      `ScrollRuntime` + `ScrollController`, and without the map the next reader greps for a name
-#      that has never existed.
+#   3. the_entity_map_names_real_symbols - the map between the `entity-map:start` / `entity-map:end`
+#      markers hands out one design name per row and says which symbol in which file carries it, and
+#      this check holds the map to the tree. It exists because a design role is not a type: V2's
+#      `ScrollLoop` was played by `ScrollSession` + `ScrollRuntime` + `ScrollController`, and V3's
+#      `Axis`/`Estimate`/`RecoveredImage`/`CaptureLoop` are likewise not type names. Without the map
+#      the next reader greps for a name that has never existed.
+#      The map is its own list: an earlier revision also compared it against a hard-coded section
+#      number in V2, which meant a document renumbering turned the gate red for no defect.
 #
 # `ScrollFrame` is deliberately NOT a legacy name: it is alive - one delivered frame of the
 # window-level capture path, read back once, in `crates/snapclip-capture/src/windows/providers.rs`.
@@ -41,7 +44,7 @@
 [CmdletBinding()]
 param(
     [string[]]$Root = @('crates', 'apps'),
-    [string]$Doc = 'docs/30-scroll-capture-design-v2.md',
+    [string]$Doc = 'docs/33-scroll-capture.md',
     [switch]$Details
 )
 
@@ -146,7 +149,6 @@ $mapRows = New-Object System.Collections.Generic.List[object]
 $inMap = $false
 $sawMarkers = $false
 $entityRows = New-Object System.Collections.Generic.List[string]
-$inEntityTable = $false
 for ($i = 0; $i -lt $docLines.Count; $i++) {
     $line = $docLines[$i]
     if ($line.Trim() -eq $EntityMapStart) { $inMap = $true; $sawMarkers = $true; continue }
@@ -158,25 +160,13 @@ for ($i = 0; $i -lt $docLines.Count; $i++) {
             $mapRows.Add([pscustomobject]@{ Line = $i + 1; Design = $cells[0]; Symbols = $cells[1]; Location = $cells[2] })
         }
     }
-    if (-not $inEntityTable -and $line -match '^### 2\.2 ') { $inEntityTable = $true; continue }
-    if ($inEntityTable) {
-        if ($line.StartsWith('|')) {
-            $cells = Get-Cells $line
-            # Section 2.2 names every entity in backticks; the header does not.
-            if ($cells.Count -ge 1 -and $cells[0].Contains('`')) {
-                $name = Get-BareName $cells[0]
-                if ($name) { $entityRows.Add($name) }
-            }
-        }
-        elseif ($line.Trim() -eq '' -and $entityRows.Count -gt 0) { $inEntityTable = $false }
-    }
 }
 
 if (-not $sawMarkers) {
     $failures.Add("the_entity_map_names_real_symbols: ${Doc} has no entity map ($EntityMapStart .. $EntityMapEnd)")
 }
-if ($entityRows.Count -eq 0) {
-    $failures.Add("the_entity_map_names_real_symbols: ${Doc} has no section 2.2 entity table to compare against")
+if ($mapRows.Count -eq 0) {
+    $failures.Add("the_entity_map_names_real_symbols: ${Doc} has no entity map rows ($EntityMapStart .. $EntityMapEnd)")
 }
 
 $verified = 0
@@ -196,16 +186,11 @@ foreach ($row in $mapRows) {
         }
         else { $verified++ }
     }
-    if ($entityRows -notcontains (Get-BareName $row.Design)) {
-        $failures.Add("the_entity_map_names_real_symbols: ${Doc}:$($row.Line) maps $($row.Design), which section 2.2 does not name")
+    $name = Get-BareName $row.Design
+    if ($entityRows -contains $name) {
+        $failures.Add("the_entity_map_names_real_symbols: ${Doc}:$($row.Line) names $name twice")
     }
-}
-foreach ($name in $entityRows) {
-    $mapped = $false
-    foreach ($row in $mapRows) { if ((Get-BareName $row.Design) -eq $name) { $mapped = $true } }
-    if (-not $mapped) {
-        $failures.Add("the_entity_map_names_real_symbols: section 2.2 names $name, and the map does not")
-    }
+    else { $entityRows.Add($name) }
 }
 
 if ($failures.Count -gt 0) {

@@ -348,7 +348,11 @@ impl WindowDetectionMetrics {
 
     /// A request entered the detection mailbox (the mailbox keeps only the newest).
     pub fn record_worker_enqueued(&self) {
-        let depth = self.counters.worker_enqueued.fetch_add(1, Ordering::Relaxed) + 1
+        let depth = self
+            .counters
+            .worker_enqueued
+            .fetch_add(1, Ordering::Relaxed)
+            + 1
             - self.counters.worker_dequeued.load(Ordering::Relaxed);
         self.counters
             .worker_max_queue_depth
@@ -359,13 +363,14 @@ impl WindowDetectionMetrics {
     pub fn record_worker_dequeued(&self) {
         // Saturate rather than wrap: a dequeue without a matching enqueue (a
         // cancelled session's shutdown path) must not report a huge queue depth.
-        let _ = self
-            .counters
-            .worker_dequeued
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |dequeued| {
+        let _ = self.counters.worker_dequeued.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |dequeued| {
                 let enqueued = self.counters.worker_enqueued.load(Ordering::Relaxed);
                 (dequeued < enqueued).then_some(dequeued + 1)
-            });
+            },
+        );
     }
 
     /// A worker result was dropped because a newer request had replaced it.
@@ -669,7 +674,9 @@ impl WindowDetectionMetrics {
     pub fn record_precision(&self, outcome: PrecisionOutcome, note: &str) {
         let (counter, verb) = match outcome {
             PrecisionOutcome::Adopted => (&self.counters.refinement_precision_adopted, "adopted"),
-            PrecisionOutcome::NotFiner => (&self.counters.refinement_precision_not_finer, "not-finer"),
+            PrecisionOutcome::NotFiner => {
+                (&self.counters.refinement_precision_not_finer, "not-finer")
+            }
             PrecisionOutcome::Unavailable => (
                 &self.counters.refinement_precision_unavailable,
                 "unavailable",
@@ -679,17 +686,22 @@ impl WindowDetectionMetrics {
         if let Ok(mut last) = self.last_precision.lock() {
             *last = Some(format!("{verb} {note}"));
         }
-        self.last_precision_outcome
-            .store(match outcome {
+        self.last_precision_outcome.store(
+            match outcome {
                 PrecisionOutcome::Adopted => 1,
                 PrecisionOutcome::NotFiner => 2,
                 PrecisionOutcome::Unavailable => 3,
-            }, Ordering::Relaxed);
+            },
+            Ordering::Relaxed,
+        );
     }
 
     /// The most recent precision decision, verbatim, for the per-session forensics line.
     pub fn last_precision(&self) -> Option<String> {
-        self.last_precision.lock().ok().and_then(|last| last.clone())
+        self.last_precision
+            .lock()
+            .ok()
+            .and_then(|last| last.clone())
     }
 
     /// The most recent precision decision as a value, for the paint layer (docs/21 §5.21).
@@ -806,7 +818,10 @@ mod tests {
         metrics.record_snapshot_refresh(Duration::from_millis(3), 57);
         let reading = metrics.reading();
         assert_eq!(reading.snapshot_refresh_last_us, 3_000);
-        assert_eq!(reading.candidate_count, 57, "gauge tracks the newest snapshot");
+        assert_eq!(
+            reading.candidate_count, 57,
+            "gauge tracks the newest snapshot"
+        );
 
         // The gauge is replaced, not accumulated, when a later snapshot is smaller.
         metrics.record_snapshot_refresh(Duration::from_millis(1), 12);

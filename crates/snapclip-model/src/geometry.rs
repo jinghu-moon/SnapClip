@@ -78,17 +78,11 @@ impl Rect {
     }
 
     pub fn center(&self) -> Point {
-        Point::new(
-            self.left + self.width() / 2,
-            self.top + self.height() / 2,
-        )
+        Point::new(self.left + self.width() / 2, self.top + self.height() / 2)
     }
 
     pub fn contains(&self, point: Point) -> bool {
-        point.x >= self.left
-            && point.x < self.right
-            && point.y >= self.top
-            && point.y < self.bottom
+        point.x >= self.left && point.x < self.right && point.y >= self.top && point.y < self.bottom
     }
 
     /// Whether `other` lies inside `self` (edges may touch).
@@ -165,8 +159,14 @@ impl Rect {
         }
         // Final guarantee: an oversized rectangle is pinned to the bounds so its origin
         // stays on screen even when it cannot fit.
-        result.left = result.left.clamp(bounds.left, (bounds.right - result.width()).max(bounds.left));
-        result.top = result.top.clamp(bounds.top, (bounds.bottom - result.height()).max(bounds.top));
+        result.left = result.left.clamp(
+            bounds.left,
+            (bounds.right - result.width()).max(bounds.left),
+        );
+        result.top = result.top.clamp(
+            bounds.top,
+            (bounds.bottom - result.height()).max(bounds.top),
+        );
         result.right = result.left + result.width();
         result.bottom = result.top + result.height();
         result
@@ -271,7 +271,10 @@ mod tests {
         assert_eq!(rect.height(), 1080);
         assert!(rect.contains(Point::new(-1920, 0)));
         assert!(rect.contains(Point::new(-101, 1079)));
-        assert!(!rect.contains(Point::new(-100, 0)), "right/bottom are exclusive");
+        assert!(
+            !rect.contains(Point::new(-100, 0)),
+            "right/bottom are exclusive"
+        );
         assert!(!rect.contains(Point::new(-1921, 0)));
     }
 
@@ -324,7 +327,10 @@ mod tests {
         let rect = Rect::new(100, 100, 200, 200);
         assert_eq!(rect.inflate(5), Rect::new(95, 95, 205, 205));
         assert_eq!(rect.inflate(-5), Rect::new(105, 105, 195, 195));
-        assert_eq!(rect.translate(Point::new(-10, 20)), Rect::new(90, 120, 190, 220));
+        assert_eq!(
+            rect.translate(Point::new(-10, 20)),
+            Rect::new(90, 120, 190, 220)
+        );
         // Inflating a negative-coordinate rect moves away from the origin, not toward it.
         let negative = Rect::new(-200, -200, -100, -100);
         assert_eq!(negative.inflate(10), Rect::new(-210, -210, -90, -90));
@@ -371,7 +377,11 @@ mod tests {
         // there for consistency with the sibling payload types. Pin the exact JSON so
         // a derive/rename edit cannot silently change the IPC contract
         // (src/shared/contracts.ts).
-        let json = serde_json::to_string(&ImageDimensions { width: 1920, height: 1080 }).unwrap();
+        let json = serde_json::to_string(&ImageDimensions {
+            width: 1920,
+            height: 1080,
+        })
+        .unwrap();
         assert_eq!(json, r#"{"width":1920,"height":1080}"#);
     }
 }

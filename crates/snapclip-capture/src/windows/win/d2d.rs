@@ -4,69 +4,62 @@
 //! 1. **L0** the frozen capture frame, drawn 1:1 so the selection stays pixel exact;
 //! 2. **L1** a translucent dark mask over everything *except* the selection, drawn
 //!    as four rectangles so the selected pixels keep their original brightness;
-//! 3. **L2** rounded border, eight grips, the `width × height` label and the
-//!    magnifier.
+//! 3. **L2** the selection frame (outline inside the selection's edge, eight grips, the
+//!    `width × height` label) and the magnifier.
+//!
+//! A scroll session draws none of that: only the same selection frame, without its marks, and the
+//! scroll panel, on a transparent surface.
 //!
 //! Everything here is preview-only: the pixels that become the artifact are read
 //! back from the frozen frame by [`crate::artifact::CaptureService::prepare_selection`]
 //! and encoded by the composition root, so no mask, label or magnifier can leak into
 //! the result.
 
-use windows_numerics::Vector2;
-use std::sync::Arc;
 use ::windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_BORDER_MODE_HARD,
-    D2D1_COLOR_F, D2D1_COMPOSITE_MODE_SOURCE_OVER, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
+    D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED,
+    D2D1_BORDER_MODE_HARD, D2D1_COLOR_F, D2D1_COMPOSITE_MODE_SOURCE_OVER, D2D1_GRADIENT_STOP,
+    D2D1_PIXEL_FORMAT,
 };
 use ::windows::Win32::Graphics::Direct2D::{
-    CLSID_D2D1GaussianBlur,
-    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_OPTIONS_NONE,
-    D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1,
-    D2D1_CAP_STYLE_FLAT, D2D1_DASH_STYLE_DASH,
-    D2D1_DRAW_TEXT_OPTIONS_NONE,
-    D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED,
-    D2D1_GAUSSIANBLUR_PROP_BORDER_MODE,
-    D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION,
-    D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION,
+    CLSID_D2D1GaussianBlur, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_OPTIONS_NONE,
+    D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1, D2D1_DRAW_TEXT_OPTIONS_CLIP,
+    D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE, D2D1_EXTEND_MODE_CLAMP, D2D1_GAMMA_2_2,
+    D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED, D2D1_GAUSSIANBLUR_PROP_BORDER_MODE,
+    D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION, D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION,
     D2D1_INTERPOLATION_MODE_LINEAR, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
-    D2D1_LAYER_PARAMETERS1, D2D1_LINE_JOIN_MITER, D2D1_PROPERTY_TYPE_UNKNOWN, D2D1_ROUNDED_RECT,
-    D2D1_STROKE_STYLE_PROPERTIES,
-    D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1_ELLIPSE,
-    ID2D1Bitmap1, ID2D1DeviceContext, ID2D1Effect, ID2D1Factory, ID2D1Geometry, ID2D1Image,
-    ID2D1SolidColorBrush, ID2D1StrokeStyle,
+    D2D1_LAYER_PARAMETERS1, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_PROPERTY_TYPE_UNKNOWN,
+    D2D1_ROUNDED_RECT, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, ID2D1Bitmap1, ID2D1DeviceContext,
+    ID2D1Effect, ID2D1Geometry, ID2D1Image, ID2D1LinearGradientBrush, ID2D1RenderTarget,
+    ID2D1SolidColorBrush,
 };
 use ::windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use ::windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_ISOLATED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
     DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL,
-    DWRITE_FONT_WEIGHT_SEMI_BOLD,
-    DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+    DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
     DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_METRICS,
-    DWRITE_WORD_WRAPPING_NO_WRAP,
-    DWriteCreateFactory, IDWriteFactory,
-    IDWriteTextFormat,
+    DWRITE_WORD_WRAPPING_NO_WRAP, DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat,
 };
 use ::windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
-use ::windows::Win32::Graphics::Gdi::AddFontMemResourceEx;
 use ::windows::Win32::Graphics::Dxgi::IDXGISwapChain1;
+use ::windows::Win32::Graphics::Gdi::AddFontMemResourceEx;
 use ::windows::core::{Interface, PCWSTR};
+use std::sync::Arc;
+use windows_numerics::Vector2;
 
 use super::d3d11::GraphicsDevice;
 use crate::annotation::{AnnotationGeometry, AnnotationItem, AnnotationKind};
 // The palette and the light-math live in one place: the paint layer and the A4 ring decision read
 // the same constants, so a re-measured mask or wash cannot leave the table describing a world that
 // is no longer painted (docs/21 §5.24.11).
+use crate::geometry::{Handle, LevelReach, MagnifierConfig, Point, Rect, SizeLabelPlacement};
+use crate::keymap::LoupeHint;
 use crate::ring_contrast::{
     ACCENT_RGB, CAPTURE_RGB, CHAIN_RING_RGB, CHAIN_RING_SHADOW, HOVER_WASH_ALPHA, MASK_ALPHA,
     MASK_RGB, MASK_TINT_ALPHA, PREVIEW_WASH_ALPHA, PREVIEW_WASH_WALK_SCALE, Rgb, mix,
 };
-use crate::geometry::{
-    Handle, LevelReach, MagnifierConfig, Point, Rect, SizeLabelPlacement,
-};
-use crate::scroll::panel::{
-    BUTTON_TEXT, PANEL_LINE_HEIGHT_DIP, PANEL_MARGIN_DIP, PANEL_RADIUS_DIP, PanelLayout,
-    ScrollPanel, UNADOPTED_RGB, to_pixels,
-};
+use crate::scroll::layout::{self as scroll_layout, Layout};
+pub(crate) use guide_pass::{GUIDE_AVOID_DIP, GuideView};
 
 /// The font family used for the size label, per the tasklist (§6.3).
 const LABEL_FONT_FAMILY: &str = "Segoe UI Variable Display";
@@ -82,12 +75,12 @@ const HANDLE_SIZE_DIP: f32 = 12.0;
 const MONO_FONT_FAMILY: &str = "Consolas";
 const MONO_FONT_FALLBACK: &str = "Lucida Console";
 
-/// The info panel's primary typeface: a subsetted HarmonyOS Sans SC carrying only
-/// the Latin/digit/punctuation glyphs and the handful of CJK characters the panel
-/// draws (`格式复制坐标`). Embedded verbatim and registered privately for this
-/// process at renderer start, so no system font install or admin rights are needed.
-const INFO_EMBEDDED_FONT: &[u8] =
-    include_bytes!("../../../assets/harmonyos-sans-sc-subset.ttf");
+/// The overlay's typeface: a subsetted HarmonyOS Sans SC carrying exactly the characters the
+/// overlay can draw — every label, hint, guide row and key name, under any binding
+/// (`overlay_drawn_strings` in the tests, built by `subfont/subset.ps1`). Embedded verbatim and
+/// registered privately for this process at renderer start, so no system font install or admin
+/// rights are needed.
+const INFO_EMBEDDED_FONT: &[u8] = include_bytes!("../../../assets/harmonyos-sans-sc-subset.ttf");
 /// Family name the embedded subset registers under (its name table was reduced to
 /// this single English entry during subsetting).
 const INFO_FONT_FAMILY: &str = "HarmonyOS Sans SC";
@@ -101,41 +94,30 @@ const INFO_PADDING_H_DIP: f32 = 12.0;
 const INFO_SWATCH_SIZE_DIP: f32 = 18.0;
 const INFO_SWATCH_RADIUS_DIP: f32 = 4.0;
 const INFO_SWATCH_GAP_DIP: f32 = 8.0;
-/// Row 1: the S-cycled colour value (`#RRGGBB` / `rgb(...)` / `hsl(...)`),
-/// left-aligned on the same line as the right-aligned coordinates.
-const INFO_PRIMARY_COLOR_FONT_DIP: f32 = 13.0;
-/// Row 1: the position string `(x, y)`, right-aligned on the same line as the
-/// colour value. The colour value shares this 13 px size.
-const INFO_COORD_VALUE_FONT_DIP: f32 = 13.0;
-/// Horizontal gap between the colour value and the right-aligned position text.
+/// Row 1: the colour value (semi-bold) and the right-aligned `(x, y)` share one size, which shrinks
+/// from the first to the second in half steps until both fit; at the floor the colour value is cut.
+const INFO_ROW1_FONT_MAX_DIP: f32 = 13.0;
+const INFO_ROW1_FONT_MIN_DIP: f32 = 11.0;
+/// Least gap between the colour value and the position text.
 const INFO_COORD_BLOCK_GAP_DIP: f32 = 14.0;
-/// Rows 2–3: four `<kbd>` hint items in a 2×2 grid (key text inside the box +
-/// CJK description beside it). One point smaller than the colour/coordinate line.
-const INFO_HINT_FONT_DIP: f32 = 12.0;
-/// The four `<kbd>` rows, as (key, description).
-///
-/// A `const` rather than a local array because the font-coverage gate
-/// (`the_embedded_subset_covers_the_strings_the_overlay_draws`) has to see exactly what is drawn:
-/// the embedded subset is a hard allowlist, and a description that drifts away from it renders in
-/// a fallback font with nothing failing anywhere visible.
-const INFO_HINTS: [(&str, &str); 4] = [
-    ("S", "色值格式"),
-    ("C", "复制色值"),
-    ("P", "坐标模式"),
-    ("Z", "滚轮缩放"),
-];
-const INFO_KBD_PADDING_DIP: f32 = 3.0;
+/// Row 2: the single hint row (`[S] 格式  [C] 复制  [P] 坐标  [Z] 缩放`), below row 1.
+const INFO_HINT_ROW_GAP_DIP: f32 = 12.0;
+const INFO_HINT_ROW_HEIGHT_DIP: f32 = 22.0;
+/// The label size shrinks from the first to the second in half steps until the row fits with the
+/// least gap between items; the key text is one size smaller and semi-bold.
+const INFO_HINT_FONT_MAX_DIP: f32 = 12.0;
+const INFO_HINT_FONT_MIN_DIP: f32 = 10.0;
+const INFO_HINT_ITEM_GAP_MIN_DIP: f32 = 8.0;
+/// Key cap: text plus this much, never narrower than it is tall; inset 2 DIP top and bottom.
+const INFO_KBD_TEXT_PAD_DIP: f32 = 10.0;
+const INFO_KBD_INSET_DIP: f32 = 2.0;
 const INFO_KBD_RADIUS_DIP: f32 = 4.0;
-const INFO_KBD_TEXT_GAP_DIP: f32 = 6.0;
-/// Vertical extent of one kbd row (box height; the text is vertically centred
-/// inside). The four hints form a 2×2 grid.
-const INFO_KBD_LINE_HEIGHT_DIP: f32 = 22.0;
-/// Horizontal gap between the two kbd columns.
-const INFO_HINT_ITEM_GAP_DIP: f32 = 16.0;
-/// Vertical gap between the two kbd grid rows.
-const INFO_KBD_ROW_GAP_DIP: f32 = 8.0;
-/// Gap between the colour/coordinate line and the kbd grid below it.
-const INFO_KBD_BLOCK_GAP_DIP: f32 = 12.0;
+const INFO_KBD_LABEL_GAP_DIP: f32 = 5.0;
+/// Shrink steps of both ladders.
+const INFO_FONT_STEP_DIP: f32 = 0.5;
+
+/// The session's blurred frame (the backdrop of the info strip, the guide and the blurred mask).
+const BACKDROP_BLUR_DIP: f32 = 6.0;
 
 /// Sizes the renderer needs, all in physical pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -275,18 +257,16 @@ pub struct RenderView {
     pub level_badge: Option<LevelReach>,
     /// One-shot hint in back-buffer coordinates (docs/21 §5.21).
     pub hint: Option<(Point, String)>,
-    // ── Scroll capture (docs/30 §19.7) ────────────────────────────────────────
-    /// The scroll session's panel, when one is running (docs/30 §19.1/§19.4/§19.7).
-    ///
-    /// The model owns the eight answers and the box geometry; this layer paints what it says and
-    /// decides nothing. `None` for every other capture mode — and, importantly, on the export path:
-    /// the artifact is cut from the captured frame, so a panel drawn into it would be a panel burned
-    /// into the user's image.
-    ///
-    /// `pub(crate)` rather than `pub` on purpose: the type is crate-internal (`scroll::panel` is not
-    /// a boundary module), and widening it to satisfy a field of a `pub` struct would make it public
-    /// API for no reason.
-    pub(crate) scroll_panel: Option<crate::scroll::panel::ScrollPanel>,
+    /// The scroll session's panel, while one runs (`docs/33`). `None` for
+    /// every other mode and on the export path, where a panel would be burned into the image.
+    pub(crate) scroll: Option<ScrollPanelView>,
+    /// Blur the frame outside the mask hole (a setting). Off on the export path.
+    pub mask_blur: bool,
+    /// The loupe's hint row, with the keys as bound.
+    pub loupe_hints: Arc<[LoupeHint]>,
+    /// The bottom-left shortcut guide while it is (fading) on screen; `None` otherwise and on the
+    /// export path.
+    pub(crate) guide: Option<GuideView>,
 }
 
 impl RenderView {
@@ -320,7 +300,10 @@ impl RenderView {
             capture_green: 0.0,
             level_badge: None,
             hint: None,
-            scroll_panel: None,
+            scroll: None,
+            mask_blur: false,
+            loupe_hints: crate::keymap::Keymap::default().loupe_hints().into(),
+            guide: None,
         }
     }
 
@@ -353,9 +336,6 @@ impl RenderView {
 /// while also calling `&mut self` methods on it.
 struct ChromeResources {
     frame_bitmap: Option<ID2D1Bitmap1>,
-    border: ID2D1SolidColorBrush,
-    handle: ID2D1SolidColorBrush,
-    label_background: ID2D1SolidColorBrush,
     label_text: ID2D1SolidColorBrush,
     crosshair: ID2D1SolidColorBrush,
     /// Light-blue translucent row/column bands through the sampled pixel.
@@ -404,37 +384,40 @@ pub struct OverlayRenderer {
     magnifier_grid_brush: Option<ID2D1SolidColorBrush>,
     magnifier_info_brush: Option<ID2D1SolidColorBrush>,
     // ── Magnifier info-panel palette (glassmorphism strip) ──
-    /// `rgba(20,20,20,0.4)` — the translucent background of the whole strip.
-    info_bg_brush: Option<ID2D1SolidColorBrush>,
     /// Pure white — the primary S-cycled colour value (`#RRGGBB` /
     /// `rgb(...)` / `hsl(...)`).
     info_hex_brush: Option<ID2D1SolidColorBrush>,
-    /// `#f5f5f5` — coordinate numeric values.
+    /// `rgba(232,236,242,.72)` — the position text.
     info_coord_value_brush: Option<ID2D1SolidColorBrush>,
-    /// `#f5f5f5` — shortcut-hint description text ("色值格式" / "复制色值" …).
+    /// `rgba(232,236,242,.62)` — the hint labels ("格式" / "复制" …).
     info_hint_brush: Option<ID2D1SolidColorBrush>,
-    /// `#f5f5f5` — the key text drawn inside a `<kbd>` box.
-    info_kbd_text_brush: Option<ID2D1SolidColorBrush>,
-    /// `rgba(255,255,255,0.1)` — the `<kbd>` box fill.
+    /// `rgba(255,255,255,0.1)` — the key cap fill.
     info_kbd_fill_brush: Option<ID2D1SolidColorBrush>,
-    /// A slightly darker translucent white used as the `<kbd>` box's bottom
-    /// edge, faking the box-shadow's 3D lip without a real shadow effect.
-    info_kbd_bottom_brush: Option<ID2D1SolidColorBrush>,
-    /// Semi-transparent grey-white 1px border around the colour swatch.
+    /// `rgba(255,255,255,.55)` — the colour swatch's 1px border.
     info_swatch_border_brush: Option<ID2D1SolidColorBrush>,
-    /// Translucent black inner stroke, faking the swatch's inset shadow.
-    info_swatch_inset_brush: Option<ID2D1SolidColorBrush>,
     /// Reusable mutable brush whose `SetColor` is updated to the sampled pixel
     /// every frame, avoiding a fresh brush per repaint.
     info_swatch_fill_brush: Option<ID2D1SolidColorBrush>,
-    /// Cached `CLSID_D2D1GaussianBlur` effect that samples the frozen frame into
-    /// a real backdrop for the info strip. Created once in `recreate_resources`;
-    /// per-frame work is just `SetInput` + `SetValue(std_dev)` + `DrawImage`
-    /// restricted to the info rectangle (see docs/15).
+    /// `CLSID_D2D1GaussianBlur`, created with the target; it runs once per frozen frame, into
+    /// [`Self::blurred_frame`].
     blur_effect: Option<ID2D1Effect>,
-    /// `#121214 @ 0.48` — the tint drawn over the blurred slice so text keeps
-    /// contrast without hiding the blur texture underneath.
+    /// The frozen frame blurred once, built on the first draw that needs it and dropped with the
+    /// frame. The info strip, the guide and the blurred mask crop from it, so no draw blurs.
+    blurred_frame: Option<ID2D1Bitmap1>,
+    /// `rgba(18,18,20,.78)` over the info strip's blurred crop.
     info_tint_brush: Option<ID2D1SolidColorBrush>,
+    // ── Shortcut guide ──
+    /// `rgba(14,16,20,.66)` over the guide's blurred crop.
+    guide_tint_brush: Option<ID2D1SolidColorBrush>,
+    /// Key cap fill `rgba(236,239,244,.94)` and its text `#15181d`.
+    guide_cap_brush: Option<ID2D1SolidColorBrush>,
+    guide_cap_text_brush: Option<ID2D1SolidColorBrush>,
+    /// Row labels (white at .92), group headers (.42), and the `/` `+` separators (.5).
+    guide_label_brush: Option<ID2D1SolidColorBrush>,
+    guide_head_brush: Option<ID2D1SolidColorBrush>,
+    guide_sep_brush: Option<ID2D1SolidColorBrush>,
+    /// The guide's layout for the groups, DPI and frame it was measured for.
+    guide_layout: Option<guide_pass::CachedGuide>,
     /// `rgba(60,60,60,0.82)` — background chip behind the zoom badge drawn in
     /// the loupe panel's top-right corner.
     info_badge_bg_brush: Option<ID2D1SolidColorBrush>,
@@ -445,73 +428,106 @@ pub struct OverlayRenderer {
     ann_stroke_brush: Option<ID2D1SolidColorBrush>,
     /// Mutable fill brush reused for filled annotation items.
     ann_fill_brush: Option<ID2D1SolidColorBrush>,
-    // ── Scroll panel (docs/30 §19.7) ──────────────────────────────────────────
-    /// The panel's backdrop: near-black at high alpha, so the frozen frame behind it cannot make
-    /// the status text unreadable.
+    // ── Scroll panel (docs/33) ────────────────────────────────────────────────
+    /// The panel's backdrop.
     scroll_panel_brush: Option<ID2D1SolidColorBrush>,
-    /// The thumbnail strip's well — darker than the panel so the strip reads as a window.
-    scroll_strip_brush: Option<ID2D1SolidColorBrush>,
-    /// The viewport box when the last step was adopted (docs/30 §19.4's `Confirmed` outline) and
-    /// the outline of the two buttons.
+    /// The viewport outline: the interface accent.
     scroll_box_brush: Option<ID2D1SolidColorBrush>,
-    /// The viewport box when the last step was **not** adopted: §19.4 draws that state dashed, and
-    /// the colour has to match the action the user has to take — which is none, so it is a neutral
-    /// grey rather than the red PixPin uses for the same reading.
-    scroll_unadopted_brush: Option<ID2D1SolidColorBrush>,
-    /// Dash pattern for the unadopted viewport box. Built once; rebuilt only with the other
-    /// resources, because `CreateStrokeStyle` needs the factory and the factory cannot move between
-    /// threads (docs/30 §21.5).
-    scroll_dash_style: Option<ID2D1StrokeStyle>,
+    /// One layer of the panel's shadow; three are stacked.
+    scroll_shadow_brush: Option<ID2D1SolidColorBrush>,
+    /// The title.
+    scroll_title_brush: Option<ID2D1SolidColorBrush>,
+    /// The size, the status line and the button labels.
+    scroll_muted_brush: Option<ID2D1SolidColorBrush>,
+    /// The buttons' fill.
+    scroll_button_brush: Option<ID2D1SolidColorBrush>,
+    /// The panel colour fading out over the well's top when the thumbnail is cut there.
+    scroll_fade_brush: Option<ID2D1LinearGradientBrush>,
+    /// The thumbnail, uploaded on every report that carries one.
+    scroll_preview_bitmap: Option<ID2D1Bitmap1>,
     metrics: RenderMetrics,
     size: (u32, u32),
 }
 
-/// Where the scroll preview panel lands, in physical pixels, with the DIP layout it was placed from.
-///
-/// The panel hangs off the **work area**'s right edge, centred vertically (docs/30 §19.7), so it lands
-/// somewhere on screen whatever the capture geometry is. Extracted from `draw_scroll_panel` in `P5.05`
-/// because the render-level test has to ask the painter where the panel went: a test that re-derives
-/// the rectangle from the same constants is testing its own arithmetic, not the painted result.
-///
-/// `None` when there is no panel to place — the caller then draws nothing, which is what the export
-/// path needs (a panel baked into the user's image would be a bug, not a layout).
-pub(crate) fn scroll_panel_placement(
-    view: &RenderView,
-    metrics: RenderMetrics,
-) -> Option<(Rect, PanelLayout)> {
-    view.scroll_panel.as_ref()?;
-    Some(scroll_panel_rect(
-        view.work_area,
-        view.frame,
-        metrics.dpi,
-    ))
+/// What the scroll panel shows, decided by the overlay; the pixels are the last uploaded thumbnail
+/// ([`OverlayRenderer::update_scroll_preview`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScrollPanelView {
+    pub layout: Layout,
+    /// The uploaded thumbnail's `(width, rows)`.
+    pub thumb: (u32, u32),
+    /// The viewport's thumbnail rows `[start, end)`.
+    pub viewport: (u32, u32),
+    /// The header's right side: the image's `width×rows`.
+    pub size: String,
+    pub status: &'static str,
+    /// The buttons' texts, in [`scroll_layout::BUTTONS`] order: key and label.
+    pub buttons: [String; 3],
 }
 
-/// Where the panel goes, in back-buffer pixels, for a work area and a DPI.
-///
-/// Split out of [`scroll_panel_placement`] in `P7.06` so the **press** path can place the panel the
-/// way the painter placed it without building a `RenderView`: the two have to agree exactly, and
-/// one function is how they do.
-pub(crate) fn scroll_panel_rect(work_area: Rect, frame: Rect, dpi: u32) -> (Rect, PanelLayout) {
-    let layout = PanelLayout::new();
-    let work = if work_area.is_empty() { frame } else { work_area };
-    let width = to_pixels(layout.panel.width(), dpi);
-    let height = to_pixels(layout.panel.height(), dpi);
-    // The DIP margin is a floor, not the whole story: a grip's hit area reaches `grip_hit_reach` past
-    // the edge it is centred on, and a selection that fills the work area puts the right grip exactly
-    // there. At 125%/175% the margin and the grip round in opposite directions, so the marginal DIP
-    // margin leaves the panel's last column inside a resize target and the panel eats a grab the user
-    // still needs (`P5.05`). The margin therefore has to be at least the reach it has to clear.
-    let margin = to_pixels(PANEL_MARGIN_DIP, dpi).max(crate::geometry::grip_hit_reach(
-        crate::geometry::Handle::Right,
-        dpi,
-    ));
-    let left = (work.right - margin - width).max(work.left);
-    let top = (work.top + (work.height() - height) / 2).max(work.top);
-    (
-        Rect::new(left, top, left + width, top + height),
-        layout,
-    )
+/// The scroll panel's colour, the demo's `rgba(18,20,24,.92)`.
+const SCROLL_PANEL: D2D1_COLOR_F = D2D1_COLOR_F {
+    r: 18.0 / 255.0,
+    g: 20.0 / 255.0,
+    b: 24.0 / 255.0,
+    a: 0.92,
+};
+const SCROLL_PANEL_RADIUS_DIP: f32 = 10.0;
+const SCROLL_WELL_RADIUS_DIP: f32 = 6.0;
+const SCROLL_BUTTON_RADIUS_DIP: f32 = 5.0;
+const SCROLL_BUTTON_PAD_DIP: f32 = 3.0;
+/// How far the header's and the status line's text sit from the panel's sides.
+const SCROLL_TEXT_PAD_DIP: f32 = 10.0;
+/// The status rectangle already starts at the well's inset.
+const INSET_TO_TEXT_DIP: f32 = scroll_layout::INSET_DIP as f32;
+/// How tall the fade over a cut thumbnail is.
+const SCROLL_FADE_DIP: f32 = 28.0;
+
+/// Where the thumbnail lands inside the well: 1:1, centred across, bottom-aligned, and cut to the
+/// well's height from the top (the bottom is the newest content).
+pub(crate) fn scroll_thumb_rect(well: Rect, thumb: (u32, u32)) -> Rect {
+    let width = (thumb.0 as i32).min(well.width());
+    let height = (thumb.1 as i32).min(well.height());
+    let left = well.left + (well.width() - width) / 2;
+    Rect::new(left, well.bottom - height, left + width, well.bottom)
+}
+
+/// What the selection frame carries besides its outline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FrameMarks {
+    handles: bool,
+    size_label: bool,
+}
+
+impl FrameMarks {
+    /// A selection being made or adjusted.
+    const EDITING: Self = Self {
+        handles: true,
+        size_label: true,
+    };
+    /// A scroll session's selection: fixed, and its size is in the panel's header.
+    const SCROLLING: Self = Self {
+        handles: false,
+        size_label: false,
+    };
+}
+
+/// The frame's stroke: `width` wide with its outer edge on `selection`'s, so the outline lies
+/// inside the selection (the demo's `strokeRect`).
+pub(crate) fn frame_stroke_rect(selection: Rect, width: f32) -> D2D_RECT_F {
+    let half = width / 2.0;
+    D2D_RECT_F {
+        left: selection.left as f32 + half,
+        top: selection.top as f32 + half,
+        right: selection.right as f32 - half,
+        bottom: selection.bottom as f32 - half,
+    }
+}
+
+/// How many pixels inside the selection's edge the frame paints at `dpi`: the stroke's width,
+/// rounded up to cover its antialiased inner edge.
+pub(crate) fn frame_band(dpi: u32) -> i32 {
+    RenderMetrics::for_dpi(dpi).border_width.ceil() as i32
 }
 
 impl OverlayRenderer {
@@ -524,8 +540,9 @@ impl OverlayRenderer {
         // cached earlier by another subsystem, so an isolated factory is what
         // guarantees the private in-memory font resolves by family name.
         register_info_font_once();
-        let dwrite: IDWriteFactory = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED) }
-            .map_err(|error| super::hresult("DWriteCreateFactory", &error))?;
+        let dwrite: IDWriteFactory =
+            unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED) }
+                .map_err(|error| super::hresult("DWriteCreateFactory", &error))?;
         Ok(Self {
             device,
             d2d,
@@ -552,27 +569,34 @@ impl OverlayRenderer {
             magnifier_band_brush: None,
             magnifier_grid_brush: None,
             magnifier_info_brush: None,
-            info_bg_brush: None,
             info_hex_brush: None,
             info_coord_value_brush: None,
             info_hint_brush: None,
-            info_kbd_text_brush: None,
             info_kbd_fill_brush: None,
-            info_kbd_bottom_brush: None,
             info_swatch_border_brush: None,
-            info_swatch_inset_brush: None,
             info_swatch_fill_brush: None,
             blur_effect: None,
+            blurred_frame: None,
             info_tint_brush: None,
+            guide_tint_brush: None,
+            guide_cap_brush: None,
+            guide_cap_text_brush: None,
+            guide_label_brush: None,
+            guide_head_brush: None,
+            guide_sep_brush: None,
+            guide_layout: None,
             info_badge_bg_brush: None,
             info_formats: Vec::new(),
             ann_stroke_brush: None,
             ann_fill_brush: None,
             scroll_panel_brush: None,
-            scroll_strip_brush: None,
             scroll_box_brush: None,
-            scroll_unadopted_brush: None,
-            scroll_dash_style: None,
+            scroll_shadow_brush: None,
+            scroll_title_brush: None,
+            scroll_muted_brush: None,
+            scroll_button_brush: None,
+            scroll_fade_brush: None,
+            scroll_preview_bitmap: None,
             metrics: RenderMetrics::for_dpi(dpi),
             size: (0, 0),
         })
@@ -594,9 +618,7 @@ impl OverlayRenderer {
             return Ok(());
         }
         self.release_target();
-        let swap_chain = self
-            .device
-            .create_composition_swap_chain(width, height)?;
+        let swap_chain = self.device.create_composition_swap_chain(width, height)?;
         let target = self.device.create_target_bitmap(&self.d2d, &swap_chain)?;
         unsafe { self.d2d.SetTarget(&target) };
         self.swap_chain = Some(swap_chain);
@@ -648,6 +670,7 @@ impl OverlayRenderer {
         .map_err(|error| super::hresult("CreateBitmapFromDxgiSurface", &error))?;
         let _ = (width, height);
         self.frame_bitmap = Some(bitmap);
+        self.blurred_frame = None;
         Ok(())
     }
 
@@ -685,6 +708,7 @@ impl OverlayRenderer {
         }
         .map_err(|error| super::hresult("ID2D1DeviceContext::CreateBitmap", &error))?;
         self.frame_bitmap = Some(bitmap);
+        self.blurred_frame = None;
         Ok(())
     }
 
@@ -724,7 +748,9 @@ impl OverlayRenderer {
             preview_is_window: false,
             level_badge: None,
             hint: None,
-            scroll_panel: None,
+            scroll: None,
+            mask_blur: false,
+            guide: None,
             ..view.clone()
         };
         let (frame_w, frame_h) = self.size;
@@ -777,6 +803,9 @@ impl OverlayRenderer {
     /// target makes each presented buffer self-authoritative; the ≤60 Hz input
     /// coalescing (one present per render tick) is what bounds the cost.
     pub fn draw_to(&mut self, target: &ID2D1Bitmap1, view: &RenderView) -> Result<(), String> {
+        if needs_backdrop(view) {
+            self.ensure_blurred_frame()?;
+        }
         unsafe {
             self.d2d.SetTarget(target);
             self.d2d.BeginDraw();
@@ -789,6 +818,65 @@ impl OverlayRenderer {
             .map_err(|error| super::hresult("ID2D1DeviceContext::EndDraw", &error));
         result?;
         end_draw
+    }
+
+    /// Blur the frozen frame into [`Self::blurred_frame`], once per frame.
+    ///
+    /// σ is 6 DIP. The blur runs into its own target between draws, so the frames that crop from it
+    /// cost one `DrawBitmap` each; a per-draw blur cost a full kernel pass over the strip every
+    /// present. A 3840×2160 frame keeps about 33 MB of video memory for the session.
+    fn ensure_blurred_frame(&mut self) -> Result<(), String> {
+        if self.blurred_frame.is_some() {
+            return Ok(());
+        }
+        let (Some(frame), Some(blur)) = (self.frame_bitmap.clone(), self.blur_effect.clone())
+        else {
+            return Ok(());
+        };
+        let size = unsafe { frame.GetPixelSize() };
+        let properties = D2D1_BITMAP_PROPERTIES1 {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+            bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET,
+            ..Default::default()
+        };
+        let blurred = unsafe { self.d2d.CreateBitmap(size, None, 0, &properties) }
+            .map_err(|error| super::hresult("ID2D1DeviceContext::CreateBitmap(blur)", &error))?;
+        let input: ID2D1Image = frame
+            .cast()
+            .map_err(|error| super::hresult("ID2D1Bitmap1::cast", &error))?;
+        let std_dev = BACKDROP_BLUR_DIP * (self.metrics.dpi.max(96) as f32 / 96.0);
+        unsafe {
+            blur.SetInput(0, &input, true);
+            blur.SetValue(
+                D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION.0 as u32,
+                D2D1_PROPERTY_TYPE_UNKNOWN,
+                &std_dev.to_ne_bytes(),
+            )
+            .map_err(|error| super::hresult("ID2D1Effect::SetValue(STANDARD_DEVIATION)", &error))?;
+            let output: ID2D1Image = blur
+                .cast()
+                .map_err(|error| super::hresult("ID2D1Effect::cast", &error))?;
+            self.d2d.SetTarget(&blurred);
+            self.d2d.BeginDraw();
+            self.d2d.DrawImage(
+                &output,
+                None,
+                None,
+                D2D1_INTERPOLATION_MODE_LINEAR,
+                D2D1_COMPOSITE_MODE_SOURCE_OVER,
+            );
+            let ended = self.d2d.EndDraw(None, None);
+            // The effect holds its input; let go of the frame so dropping it frees it.
+            blur.SetInput(0, None::<&ID2D1Image>, true);
+            ended.map_err(|error| super::hresult("ID2D1DeviceContext::EndDraw(blur)", &error))?;
+        }
+        self.blurred_frame = Some(blurred);
+        Ok(())
     }
 
     /// Whether an L0 frame bitmap is loaded (diagnostics and tests).
@@ -807,6 +895,15 @@ impl OverlayRenderer {
     }
 
     fn draw_layers(&mut self, view: &RenderView) -> Result<(), String> {
+        // A scroll session: the page under the selection is live, and the window is cut down to
+        // the frame's band and the panel (`overlay/scroll.rs`). There is no frozen frame to show
+        // and nothing to mask — the surface is transparent apart from the selection frame, drawn by
+        // the same routine as a plain capture's, and the panel.
+        if let Some(scroll) = view.scroll.as_ref() {
+            unsafe { self.d2d.Clear(Some(&color(0.0, 0.0, 0.0, 0.0))) };
+            self.draw_selection_frame(view, FrameMarks::SCROLLING)?;
+            return self.draw_scroll_panel(scroll);
+        }
         let frame_bitmap = self.frame_bitmap.clone();
         let mask = self.require_brush(&self.mask_brush, "mask brush")?;
 
@@ -835,6 +932,25 @@ impl OverlayRenderer {
         // The hole is the box that would be *taken* (docs/21 §5.24, A2), which during a hover is
         // the previewed element rather than the settled selection — see `RenderView::mask_hole`.
         let hole = view.mask_hole();
+        // The blurred mask (a setting): the frame blurred outside the hole, under the same mask
+        // and tint, so the selection is the one sharp thing on screen.
+        if view.mask_blur
+            && let Some(blurred) = self.blurred_frame.as_ref()
+        {
+            for band in outside_bands(view.frame, hole) {
+                let band = to_d2d(band);
+                unsafe {
+                    self.d2d.DrawBitmap(
+                        blurred,
+                        Some(&band),
+                        1.0,
+                        D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                        Some(&band),
+                        None,
+                    )
+                };
+            }
+        }
         fill_outside(&self.d2d, view.frame, hole, &mask);
         // …and a trace of the theme colour on top of it (docs/21 §5.22). Black does the darkening;
         // the tint is only brand presence. The prototype measured why it stays small: at 30% the
@@ -846,9 +962,14 @@ impl OverlayRenderer {
 
         // L2: annotations (inside selection only, after mask, before chrome).
         if !view.annotation_items.is_empty() || view.annotation_draft.is_some() {
-            let clip_rect = if view.selection.is_empty() { view.frame } else { view.selection.intersect(view.frame) };
+            let clip_rect = if view.selection.is_empty() {
+                view.frame
+            } else {
+                view.selection.intersect(view.frame)
+            };
             unsafe {
-                self.d2d.PushAxisAlignedClip(&to_d2d(clip_rect), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                self.d2d
+                    .PushAxisAlignedClip(&to_d2d(clip_rect), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
             }
             self.draw_annotations(view)?;
             unsafe {
@@ -866,10 +987,6 @@ impl OverlayRenderer {
         if view.show_chrome && !view.selection.is_empty() {
             let resources = ChromeResources {
                 frame_bitmap,
-                border: self.require_brush(&self.border_brush, "border brush")?,
-                handle: self.require_brush(&self.handle_brush, "handle brush")?,
-                label_background: self
-                    .require_brush(&self.label_background_brush, "label background brush")?,
                 label_text: self.require_brush(&self.label_text_brush, "label text brush")?,
                 crosshair: self.require_brush(&self.crosshair_brush, "crosshair brush")?,
                 magnifier_band: self
@@ -882,10 +999,10 @@ impl OverlayRenderer {
             self.draw_chrome(view, &resources)?;
         }
 
-        // L4: the scroll panel. Above the selection chrome because during a scroll capture the
-        // panel is the only thing the user is interacting with (docs/30 §19.7), and every mode
-        // that is not a scroll capture leaves `scroll_panel` at `None`.
-        self.draw_scroll_panel(view, self.metrics)?;
+        // L3.5: the shortcut guide, above the chrome.
+        if let Some(guide) = view.guide.as_ref() {
+            self.draw_guide(guide, view.frame)?;
+        }
         Ok(())
     }
 
@@ -928,8 +1045,7 @@ impl OverlayRenderer {
                     // the box that would be captured shows its own pixels, and a 10% white veil over
                     // them would be exactly the veil that A2 exists to remove (docs/21 §5.24).
                     fill_outside(&self.d2d, rect, view.mask_hole(), &fill);
-                    self.d2d
-                        .DrawRectangle(&to_d2d(rect), &border, width, None);
+                    self.d2d.DrawRectangle(&to_d2d(rect), &border, width, None);
                 }
             }
         }
@@ -956,17 +1072,15 @@ impl OverlayRenderer {
                     // ②: the box eases in when it appears; the hole in the mask is already open, so
                     // the content is at its own brightness while the outline is still arriving.
                     let appear = view.preview_alpha.clamp(0.0, 1.0);
-                    let mix = self.require_brush(&self.preview_stroke_brush, "preview stroke brush")?;
-                    let fill = self.require_brush(&self.preview_fill_brush, "preview fill brush")?;
+                    let mix =
+                        self.require_brush(&self.preview_stroke_brush, "preview stroke brush")?;
+                    let fill =
+                        self.require_brush(&self.preview_fill_brush, "preview fill brush")?;
                     unsafe {
                         let _ = mix.SetColor(&capture_mix_color(walking, appear));
                         let _ = fill.SetColor(&capture_wash_color(walking, appear));
                     }
-                    (
-                        fill,
-                        mix,
-                        width * 2.0,
-                    )
+                    (fill, mix, width * 2.0)
                 };
                 unsafe {
                     self.d2d.FillRectangle(&to_d2d(rect), &fill);
@@ -1165,13 +1279,12 @@ impl OverlayRenderer {
             // Dark underlay first (one pixel wider), then the ring itself: the pair carries an edge
             // no screenshot can match in luminance, which a single blue line cannot promise.
             unsafe {
-                self.d2d
-                    .DrawRectangle(
-                        &to_d2d(rect),
-                        &shadow,
-                        width + CHAIN_RING_SHADOW_WIDTH,
-                        None,
-                    );
+                self.d2d.DrawRectangle(
+                    &to_d2d(rect),
+                    &shadow,
+                    width + CHAIN_RING_SHADOW_WIDTH,
+                    None,
+                );
                 let _ = brush.SetColor(&chain_ring_color(ring.alpha));
                 self.d2d.DrawRectangle(&to_d2d(rect), &brush, width, None);
             }
@@ -1235,33 +1348,60 @@ impl OverlayRenderer {
             .ok_or_else(|| format!("{name} is unavailable"))
     }
 
-    fn draw_chrome(&mut self, view: &RenderView, resources: &ChromeResources) -> Result<(), String> {
+    /// L3: the selection frame with its handles and size label, and the loupe.
+    fn draw_chrome(
+        &mut self,
+        view: &RenderView,
+        resources: &ChromeResources,
+    ) -> Result<(), String> {
+        self.draw_selection_frame(view, FrameMarks::EDITING)?;
+        if view.cursor_visible {
+            self.draw_magnifier(view, resources, self.metrics)?;
+        }
+        Ok(())
+    }
+
+    /// The selection frame: one routine for a selection being made and a scroll session's, which
+    /// differ only in `marks`.
+    ///
+    /// The outline lies just inside the selection's edge ([`frame_stroke_rect`]): it stays whole
+    /// against a screen edge, and it is the band a scroll session's window keeps ([`frame_band`]).
+    /// The handles are centred on the edge.
+    fn draw_selection_frame(&mut self, view: &RenderView, marks: FrameMarks) -> Result<(), String> {
         let selection = view.selection.intersect(view.frame);
+        if selection.is_empty() {
+            return Ok(());
+        }
         let metrics = self.metrics;
-
+        let border = self.require_brush(&self.border_brush, "border brush")?;
         unsafe {
-            self.d2d
-                .DrawRectangle(&to_d2d(selection), &resources.border, metrics.border_width, None);
-
+            self.d2d.DrawRectangle(
+                &frame_stroke_rect(selection, metrics.border_width),
+                &border,
+                metrics.border_width,
+                None,
+            );
+        }
+        if marks.handles {
+            let handle = self.require_brush(&self.handle_brush, "handle brush")?;
             let radius = metrics.handle_size / 2.0;
-            for handle in Handle::ALL {
-                let anchor = handle.anchor(selection);
+            for grip in Handle::ALL {
+                let anchor = grip.anchor(selection);
                 let grip = D2D1_ELLIPSE {
                     point: vector2(anchor.x as f32, anchor.y as f32),
                     radiusX: radius,
                     radiusY: radius,
                 };
-                self.d2d.FillEllipse(&grip, &resources.handle);
-                // Ring each white grip with the selection border colour, stroked
-                // at the same width as the selection rectangle outline.
-                self.d2d
-                    .DrawEllipse(&grip, &resources.border, metrics.border_width, None);
+                unsafe {
+                    self.d2d.FillEllipse(&grip, &handle);
+                    // Ring each white grip with the frame's colour, at the frame's width.
+                    self.d2d
+                        .DrawEllipse(&grip, &border, metrics.border_width, None);
+                }
             }
         }
-
-        self.draw_size_label(selection, view, resources, metrics)?;
-        if view.cursor_visible {
-            self.draw_magnifier(view, resources, metrics)?;
+        if marks.size_label {
+            self.draw_size_label(selection, view, metrics)?;
         }
         Ok(())
     }
@@ -1270,9 +1410,11 @@ impl OverlayRenderer {
         &mut self,
         selection: Rect,
         view: &RenderView,
-        resources: &ChromeResources,
         metrics: RenderMetrics,
     ) -> Result<(), String> {
+        let background =
+            self.require_brush(&self.label_background_brush, "label background brush")?;
+        let foreground = self.require_brush(&self.label_text_brush, "label text brush")?;
         let text = RenderMetrics::label_text_at(selection, view.screen_origin);
         let estimated = metrics.label_size_at(selection, view.screen_origin);
 
@@ -1300,8 +1442,7 @@ impl OverlayRenderer {
                 radiusX: 3.0,
                 radiusY: 3.0,
             };
-            self.d2d
-                .FillRoundedRectangle(&panel, &resources.label_background);
+            self.d2d.FillRoundedRectangle(&panel, &background);
             let wide = text.encode_utf16().collect::<Vec<u16>>();
             let text_rect = D2D_RECT_F {
                 left: placement.rect.left as f32 + metrics.label_padding_x,
@@ -1313,7 +1454,7 @@ impl OverlayRenderer {
                 &wide,
                 &format,
                 &text_rect,
-                &resources.label_text,
+                &foreground,
                 D2D1_DRAW_TEXT_OPTIONS_NONE,
                 DWRITE_MEASURING_MODE_NATURAL,
             );
@@ -1342,183 +1483,268 @@ impl OverlayRenderer {
         )
     }
 
-    // ── Scroll capture panel (docs/30 §19.1/§19.4/§19.7) ────────────────────────────────────────
+    // ── Scroll capture panel (docs/33) ──────────────────────────────────────────────────────────
 
-    /// L4: the scroll session's panel.
-    ///
-    /// The model (`crate::scroll::panel`) owns every number and every word here; this draws what it
-    /// says and decides nothing. Three consequences worth naming:
-    ///
-    /// * the panel is anchored to the **work area**, not the frame, so it stays on screen whatever
-    ///   the capture geometry is;
-    /// * the pieces come from [`PanelLayout`] in DIP and are scaled once, here — the same layout is
-    ///   correct at 100% and at 150%, and nothing in the model has to know the DPI;
-    /// * the viewport box is placed by [`ScrollPanel::viewport_box`], which is proportional, so the
-    ///   strip's size in pixels is all it needs.
-    fn draw_scroll_panel(&mut self, view: &RenderView, metrics: RenderMetrics) -> Result<(), String> {
-        let Some((panel_frame, layout)) = scroll_panel_placement(view, metrics) else {
-            return Ok(());
-        };
-        let Some(panel) = view.scroll_panel.clone() else {
-            return Ok(());
-        };
-        let dip = |value: i32| to_pixels(value, metrics.dpi);
-        let place = |rect: Rect| {
-            Rect::new(
-                panel_frame.left + dip(rect.left),
-                panel_frame.top + dip(rect.top),
-                panel_frame.left + dip(rect.right),
-                panel_frame.top + dip(rect.bottom),
-            )
-        };
-
-        let answers = panel.answers();
-        let appearance = panel.appearance();
+    /// The scroll session's panel (the demo's `drawScrolling`): a shadowed rounded card with the
+    /// title and the image's size, the thumbnail's tail in a rounded well with the viewport
+    /// outlined, the status line and the buttons. Every rectangle comes from [`Layout`], which the
+    /// hit test and the window region use too.
+    fn draw_scroll_panel(&mut self, scroll: &ScrollPanelView) -> Result<(), String> {
+        let k = self.metrics.dpi.max(96) as f32 / 96.0;
         let backdrop = self.require_brush(&self.scroll_panel_brush, "scroll panel brush")?;
-        let well = self.require_brush(&self.scroll_strip_brush, "scroll strip brush")?;
-        let text = self.require_brush(&self.label_text_brush, "label text brush")?;
-
-        unsafe {
-            let radius = dip(PANEL_RADIUS_DIP) as f32;
-            let frame = D2D1_ROUNDED_RECT {
-                rect: to_d2d(place(layout.panel)),
-                radiusX: radius,
-                radiusY: radius,
-            };
-            self.d2d.FillRoundedRectangle(&frame, &backdrop);
-            self.d2d.FillRectangle(&to_d2d(place(layout.strip)), &well);
-        }
-
-        // Question 1 and question 3. Question 5 is read off the same status line: it says what the
-        // session is doing, and the buttons below say whether it can still be stopped.
-        self.draw_panel_text(place(layout.status), &answers.doing, false, &text)?;
-        self.draw_panel_text(place(layout.amount), &answers.amount, false, &text)?;
-
-        // Questions 2 and 4 share one mark: where the box is, and what its state is. §19.4's three
-        // states differ in dash and colour, never in position — a box that moved when a step was not
-        // adopted would say the reading changed when only the confidence did.
-        let strip = place(layout.strip);
-        let placed = panel.viewport_box(strip);
-        let outline = if appearance.dashed {
-            self.require_brush(&self.scroll_unadopted_brush, "scroll unadopted brush")?
-        } else {
-            self.require_brush(&self.scroll_box_brush, "scroll box brush")?
+        let accent = self.require_brush(&self.scroll_box_brush, "scroll box brush")?;
+        let shadow = self.require_brush(&self.scroll_shadow_brush, "scroll shadow brush")?;
+        let title = self.require_brush(&self.scroll_title_brush, "scroll title brush")?;
+        let muted = self.require_brush(&self.scroll_muted_brush, "scroll muted brush")?;
+        let button = self.require_brush(&self.scroll_button_brush, "scroll button brush")?;
+        let fade = self
+            .scroll_fade_brush
+            .clone()
+            .ok_or("scroll fade brush is unavailable")?;
+        let layout = &scroll.layout;
+        let rounded = |rect: Rect, grow: f32, drop: f32, radius: f32| D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F {
+                left: rect.left as f32 - grow,
+                top: rect.top as f32 - grow + drop,
+                right: rect.right as f32 + grow,
+                bottom: rect.bottom as f32 + grow + drop,
+            },
+            radiusX: radius + grow,
+            radiusY: radius + grow,
         };
-        let dashes = if appearance.dashed {
-            self.scroll_dash_style.clone()
-        } else {
-            None
-        };
+        let radius = SCROLL_PANEL_RADIUS_DIP * k;
+
+        // The card: a soft shadow (three stacked layers, inside the layout's footprint), then the
+        // card itself.
         unsafe {
-            self.d2d.DrawRectangle(
-                &to_d2d(placed),
-                &outline,
-                metrics.border_width,
-                dashes.as_ref(),
-            );
-        }
-        if let Some(discarded) = appearance.badge {
-            // A dashed box says "this step was not adopted"; the number says how many, which is the
-            // part a user cannot reconstruct from the box (docs/30 §19.1, question 4 + G12).
-            let badge = ScrollPanel::badge_text(discarded);
-            let badge_top = placed.bottom + dip(2);
-            let anchor = Rect::new(
-                placed.left,
-                badge_top,
-                strip.right,
-                (badge_top + dip(PANEL_LINE_HEIGHT_DIP)).min(strip.bottom),
-            );
-            if !anchor.is_empty() {
-                self.draw_panel_text(anchor, &badge, true, &outline)?;
+            for grow in [1.5, 3.0, 4.0] {
+                self.d2d.FillRoundedRectangle(
+                    &rounded(layout.panel, grow * k, 2.0 * k, radius),
+                    &shadow,
+                );
             }
+            self.d2d
+                .FillRoundedRectangle(&rounded(layout.panel, 0.0, 0.0, radius), &backdrop);
         }
 
-        // The four buttons, in reading order: the view's two actions and the session's two promises
-        // (§19.5, §20.5). They are drawn only while the session is running — an "ended" panel offering
-        // a stop button, or a "back to the newest" that nothing is following, would be answering a
-        // question nobody can ask any more.
-        //
-        // "回到最新" is dimmed while it has nothing to do. §19.5's mode is the session's and this is the
-        // state in which a press would be a no-op, so it is drawn in the grey §19.4 already uses for
-        // "there is nothing here for you" rather than hidden: a control that disappears makes the user
-        // wonder whether they are in manual mode, which is the one thing this button exists to answer.
-        //
-        // "撤销" has no such state, and that is deliberate: the panel cannot tell "the stack is empty"
-        // from "the last press was spent" (`steps` counts steps, not stack entries), and a press with
-        // nothing behind it is a defined no-op (§19.6 constraint 4, pinned by the loop's test) rather
-        // than a mistake worth warning about.
-        if answers.continuing {
-            let spent = self.require_brush(&self.scroll_unadopted_brush, "scroll unadopted brush")?;
-            let following = panel.follow();
-            for (index, (rect, label)) in layout
-                .buttons
-                .iter()
-                .zip(BUTTON_TEXT)
-                .enumerate()
-            {
-                let dimmed = index == 0 && following;
-                let (brush, color) = if dimmed {
-                    (&spent, &spent)
-                } else {
-                    (&outline, &text)
-                };
-                let rect = place(*rect);
-                unsafe {
-                    self.d2d
-                        .DrawRectangle(&to_d2d(rect), brush, metrics.border_width, None);
-                }
-                self.draw_panel_text(rect, label, true, color)?;
-            }
-        }
+        // The header: the title on the left, the size on the right.
+        let pad = SCROLL_TEXT_PAD_DIP * k;
+        let header = D2D_RECT_F {
+            left: layout.header.left as f32 + pad,
+            // The demo sets the line 2 DIP below the row's middle.
+            top: layout.header.top as f32 + 4.0 * k,
+            right: layout.header.right as f32 - pad,
+            bottom: layout.header.bottom as f32,
+        };
+        let title_format =
+            self.info_text_format_mut(false, 12.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, false)?;
+        self.draw_text_in(scroll_layout::TITLE, &title_format, header, &title)?;
+        let size_format =
+            self.info_text_format_mut(true, 11.0, DWRITE_FONT_WEIGHT_NORMAL, false)?;
+        let size_width = self.measure_text_width_in(&scroll.size, &size_format)?;
+        self.draw_text_in(
+            &scroll.size,
+            &size_format,
+            D2D_RECT_F {
+                left: header.right - size_width.ceil(),
+                ..header
+            },
+            &muted,
+        )?;
 
-        // Question 8. The line is reserved whether or not there is anything in it (see `PanelLayout`).
-        if let Some(trouble) = answers.trouble.as_deref() {
-            self.draw_panel_text(place(layout.trouble), trouble, false, &text)?;
+        // The well: the thumbnail's newest rows, clipped to a rounded rectangle.
+        self.draw_scroll_well(scroll, k, &accent, &fade)?;
+
+        // The status line and the buttons.
+        let small = self.info_text_format_mut(false, 11.0, DWRITE_FONT_WEIGHT_NORMAL, false)?;
+        let status = to_d2d(layout.status);
+        self.draw_text_in(
+            scroll.status,
+            &small,
+            D2D_RECT_F {
+                left: status.left + pad - INSET_TO_TEXT_DIP * k,
+                ..status
+            },
+            &muted,
+        )?;
+        for (rect, label) in layout.buttons.iter().zip(&scroll.buttons) {
+            unsafe {
+                self.d2d.FillRoundedRectangle(
+                    &rounded(*rect, 0.0, 0.0, SCROLL_BUTTON_RADIUS_DIP * k),
+                    &button,
+                );
+            }
+            // A rebound key can make a label wider than its button: it steps down to the floor,
+            // and is clipped to the button there rather than spilling into the next one.
+            let room = rect.width() as f32 - 2.0 * SCROLL_BUTTON_PAD_DIP * k;
+            let size = magnifier_pass::shrink_to_fit(11.0, 9.0, |size| {
+                let format =
+                    self.info_text_format_mut(false, size, DWRITE_FONT_WEIGHT_NORMAL, true)?;
+                Ok(self.measure_text_width_in(label, &format)? <= room)
+            })?;
+            let format = self.info_text_format_mut(false, size, DWRITE_FONT_WEIGHT_NORMAL, true)?;
+            self.draw_text_in(label, &format, to_d2d(*rect), &title)?;
         }
         Ok(())
     }
 
-    /// One line of panel text, vertically centred in `rect`.
-    ///
-    /// The format comes from the same cache as the size label, whose first family is the embedded
-    /// subset — which is what makes the panel's Chinese characters resolve, and what the subset gate
-    /// in `tests.rs` is about.
-    fn draw_panel_text(
+    /// The thumbnail well: the bitmap's last rows bottom-aligned, the panel colour fading in over
+    /// the top when older rows are cut there, and the viewport outlined like the selection.
+    fn draw_scroll_well(
         &mut self,
-        rect: Rect,
-        text: &str,
-        centered: bool,
-        brush: &ID2D1SolidColorBrush,
+        scroll: &ScrollPanelView,
+        k: f32,
+        accent: &ID2D1SolidColorBrush,
+        fade: &ID2D1LinearGradientBrush,
     ) -> Result<(), String> {
-        if text.is_empty() || rect.is_empty() {
+        let well = scroll.layout.well;
+        if well.is_empty() {
             return Ok(());
         }
-        let (measured, format) = self.measure_label(text)?;
-        let box_rect = if centered {
-            // `measure_label` already returns the text plus symmetric padding, so it is the width to
-            // centre on — no second measurement, and the two cannot disagree.
-            let left = rect.left + ((rect.width() - measured.0) / 2).max(0);
-            Rect::new(left, rect.top, left + measured.0, rect.bottom)
-        } else {
-            rect
+        let thumb = scroll_thumb_rect(well, scroll.thumb);
+        // The bitmap's last `thumb.height()` rows are shown: the bottom is the newest content.
+        let skipped = scroll.thumb.1 as i32 - thumb.height();
+        let factory = unsafe { self.d2d.GetFactory() }
+            .map_err(|e| super::hresult("ID2D1DeviceContext::GetFactory", &e))?;
+        let radius = SCROLL_WELL_RADIUS_DIP * k;
+        let mask: ID2D1Geometry = unsafe {
+            factory.CreateRoundedRectangleGeometry(&D2D1_ROUNDED_RECT {
+                rect: to_d2d(well),
+                radiusX: radius,
+                radiusY: radius,
+            })
+        }
+        .map_err(|e| super::hresult("CreateRoundedRectangleGeometry", &e))?
+        .cast()
+        .map_err(|e| super::hresult("cast to ID2D1Geometry", &e))?;
+        let layer =
+            unsafe { self.d2d.CreateLayer(None) }.map_err(|e| super::hresult("CreateLayer", &e))?;
+        let parameters = D2D1_LAYER_PARAMETERS1 {
+            contentBounds: to_d2d(well),
+            geometricMask: std::mem::ManuallyDrop::new(Some(mask)),
+            maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+            maskTransform: windows_numerics::Matrix3x2::identity(),
+            opacity: 1.0,
+            opacityBrush: std::mem::ManuallyDrop::new(None),
+            layerOptions: Default::default(),
         };
+        unsafe {
+            self.d2d.PushLayer(&parameters, &layer);
+            if let Some(bitmap) = self.scroll_preview_bitmap.as_ref()
+                && !thumb.is_empty()
+            {
+                let source = D2D_RECT_F {
+                    left: 0.0,
+                    top: skipped as f32,
+                    right: thumb.width() as f32,
+                    bottom: scroll.thumb.1 as f32,
+                };
+                self.d2d.DrawBitmap(
+                    bitmap,
+                    Some(&to_d2d(thumb)),
+                    1.0,
+                    D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                    Some(&source),
+                    None,
+                );
+            }
+            if skipped > 0 {
+                let top = well.top as f32;
+                let bottom = top + SCROLL_FADE_DIP * k;
+                fade.SetStartPoint(vector2(0.0, top));
+                fade.SetEndPoint(vector2(0.0, bottom));
+                self.d2d.FillRectangle(
+                    &D2D_RECT_F {
+                        top,
+                        bottom,
+                        ..to_d2d(well)
+                    },
+                    fade,
+                );
+            }
+            let top = (thumb.top + scroll.viewport.0 as i32 - skipped).max(thumb.top);
+            let bottom = (thumb.top + scroll.viewport.1 as i32 - skipped).min(thumb.bottom);
+            if bottom > top {
+                let width = self.metrics.border_width;
+                self.d2d.DrawRectangle(
+                    &frame_stroke_rect(Rect::new(thumb.left, top, thumb.right, bottom), width),
+                    accent,
+                    width,
+                    None,
+                );
+            }
+            self.d2d.PopLayer();
+        }
+        let _ = std::mem::ManuallyDrop::into_inner(parameters.geometricMask);
+        Ok(())
+    }
+
+    /// One line of text in `rect`, laid out by `format` (vertically centred, never wrapped).
+    fn draw_text_in(
+        &self,
+        text: &str,
+        format: &IDWriteTextFormat,
+        rect: D2D_RECT_F,
+        brush: &ID2D1SolidColorBrush,
+    ) -> Result<(), String> {
+        if text.is_empty() {
+            return Ok(());
+        }
         let wide = text.encode_utf16().collect::<Vec<u16>>();
-        let target = D2D_RECT_F {
-            left: box_rect.left as f32,
-            top: box_rect.top as f32,
-            right: box_rect.right as f32,
-            bottom: box_rect.bottom as f32,
-        };
         unsafe {
             self.d2d.DrawText(
                 &wide,
-                &format,
-                &target,
+                format,
+                &rect,
                 brush,
-                D2D1_DRAW_TEXT_OPTIONS_NONE,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
                 DWRITE_MEASURING_MODE_NATURAL,
             );
         }
+        Ok(())
+    }
+
+    pub(crate) fn update_scroll_preview(
+        &mut self,
+        preview: &crate::scroll::Preview,
+    ) -> Result<(), String> {
+        if preview.width == 0 || preview.rows == 0 {
+            self.scroll_preview_bitmap = None;
+            return Ok(());
+        }
+        let expected = preview.width as usize * preview.rows as usize * 4;
+        if preview.bytes.len() != expected {
+            return Err(format!(
+                "scroll preview upload of {} bytes does not match {}x{}",
+                preview.bytes.len(),
+                preview.width,
+                preview.rows
+            ));
+        }
+        let properties = D2D1_BITMAP_PROPERTIES1 {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_IGNORE,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+            ..Default::default()
+        };
+        let bitmap = unsafe {
+            self.d2d.CreateBitmap(
+                D2D_SIZE_U {
+                    width: preview.width,
+                    height: preview.rows,
+                },
+                Some(preview.bytes.as_ptr() as *const _),
+                preview.width * 4,
+                &properties,
+            )
+        }
+        .map_err(|error| {
+            super::hresult("ID2D1DeviceContext::CreateBitmap(scroll preview)", &error)
+        })?;
+        self.scroll_preview_bitmap = Some(bitmap);
         Ok(())
     }
 
@@ -1539,12 +1765,11 @@ impl OverlayRenderer {
         Ok(((width.max(1), height.max(1)), format))
     }
 
-
     // ── Annotation rendering ─────────────────────────────────────────────────────────
 
     fn draw_annotations(&mut self, view: &RenderView) -> Result<(), String> {
         let stroke = self.require_brush(&self.ann_stroke_brush, "ann stroke brush")?;
-        let fill   = self.require_brush(&self.ann_fill_brush, "ann fill brush")?;
+        let fill = self.require_brush(&self.ann_fill_brush, "ann fill brush")?;
 
         // L2-a: committed items.
         for item in &view.annotation_items {
@@ -1582,7 +1807,9 @@ impl OverlayRenderer {
             match &item.geometry {
                 AnnotationGeometry::Rect { bounds } => {
                     let r = to_d2d(*bounds);
-                    if has_fill { self.d2d.FillRectangle(&r, fill); }
+                    if has_fill {
+                        self.d2d.FillRectangle(&r, fill);
+                    }
                     self.d2d.DrawRectangle(&r, stroke, sw, None);
                 }
                 AnnotationGeometry::Ellipse { bounds } => {
@@ -1593,49 +1820,83 @@ impl OverlayRenderer {
                         radiusX: bounds.width() as f32 / 2.0,
                         radiusY: bounds.height() as f32 / 2.0,
                     };
-                    if has_fill { self.d2d.FillEllipse(&ell, fill); }
+                    if has_fill {
+                        self.d2d.FillEllipse(&ell, fill);
+                    }
                     self.d2d.DrawEllipse(&ell, stroke, sw, None);
                 }
                 AnnotationGeometry::Line { start, end } => {
                     self.d2d.DrawLine(
                         vector2(start.x as f32, start.y as f32),
                         vector2(end.x as f32, end.y as f32),
-                        stroke, sw, None,
+                        stroke,
+                        sw,
+                        None,
                     );
                 }
                 AnnotationGeometry::Arrow { start, end } => {
-                    let sx = start.x as f32; let sy = start.y as f32;
-                    let ex = end.x as f32;   let ey = end.y as f32;
+                    let sx = start.x as f32;
+                    let sy = start.y as f32;
+                    let ex = end.x as f32;
+                    let ey = end.y as f32;
                     // Shaft
-                    self.d2d.DrawLine(vector2(sx, sy), vector2(ex, ey), stroke, sw, None);
+                    self.d2d
+                        .DrawLine(vector2(sx, sy), vector2(ex, ey), stroke, sw, None);
                     // Two-line arrowhead
                     let head = item.style.arrow_head_size;
                     let angle = (ey - sy).atan2(ex - sx);
                     let (cos_a, sin_a) = (angle.cos(), angle.sin());
                     // Left barb
-                    let lx = ex - head * (cos_a * (30f32).to_radians().cos() + sin_a * (30f32).to_radians().sin());
-                    let ly = ey - head * (sin_a * (30f32).to_radians().cos() - cos_a * (30f32).to_radians().sin());
+                    let lx = ex
+                        - head
+                            * (cos_a * (30f32).to_radians().cos()
+                                + sin_a * (30f32).to_radians().sin());
+                    let ly = ey
+                        - head
+                            * (sin_a * (30f32).to_radians().cos()
+                                - cos_a * (30f32).to_radians().sin());
                     // Right barb
-                    let rx = ex - head * (cos_a * (-30f32).to_radians().cos() + sin_a * (-30f32).to_radians().sin());
-                    let ry = ey - head * (sin_a * (-30f32).to_radians().cos() - cos_a * (-30f32).to_radians().sin());
-                    self.d2d.DrawLine(vector2(ex, ey), vector2(lx, ly), stroke, sw, None);
-                    self.d2d.DrawLine(vector2(ex, ey), vector2(rx, ry), stroke, sw, None);
+                    let rx = ex
+                        - head
+                            * (cos_a * (-30f32).to_radians().cos()
+                                + sin_a * (-30f32).to_radians().sin());
+                    let ry = ey
+                        - head
+                            * (sin_a * (-30f32).to_radians().cos()
+                                - cos_a * (-30f32).to_radians().sin());
+                    self.d2d
+                        .DrawLine(vector2(ex, ey), vector2(lx, ly), stroke, sw, None);
+                    self.d2d
+                        .DrawLine(vector2(ex, ey), vector2(rx, ry), stroke, sw, None);
                 }
                 AnnotationGeometry::Freehand { points }
                 | AnnotationGeometry::Highlight { points } => {
-                    if points.len() < 2 { return Ok(()); }
-                    let alpha_mult = if matches!(item.kind, AnnotationKind::Highlight) { 0.35f32 } else { 1.0 };
-                    let hl_width = if matches!(item.kind, AnnotationKind::Highlight) { sw * 3.0 } else { sw };
+                    if points.len() < 2 {
+                        return Ok(());
+                    }
+                    let alpha_mult = if matches!(item.kind, AnnotationKind::Highlight) {
+                        0.35f32
+                    } else {
+                        1.0
+                    };
+                    let hl_width = if matches!(item.kind, AnnotationKind::Highlight) {
+                        sw * 3.0
+                    } else {
+                        sw
+                    };
                     let base = item.style.stroke_color;
                     if alpha_mult < 1.0 {
-                        let hl_color = color(base[0], base[1], base[2], base[3] * alpha_mult * opacity);
+                        let hl_color =
+                            color(base[0], base[1], base[2], base[3] * alpha_mult * opacity);
                         let _ = stroke.SetColor(&hl_color);
                     }
                     for w in points.windows(2) {
                         self.d2d.DrawLine(
                             vector2(w[0].x as f32, w[0].y as f32),
                             vector2(w[1].x as f32, w[1].y as f32),
-                            stroke, hl_width, None,
+                            stroke,
+                            hl_width,
+                            None,
                         );
                     }
                 }
@@ -1654,7 +1915,9 @@ impl OverlayRenderer {
         content: &str,
         stroke: &ID2D1SolidColorBrush,
     ) -> Result<(), String> {
-        if content.is_empty() { return Ok(()); }
+        if content.is_empty() {
+            return Ok(());
+        }
         let format = self.label_text_format_mut()?;
         let wide = content.encode_utf16().collect::<Vec<u16>>();
         let fs = item.style.font_size;
@@ -1692,10 +1955,16 @@ impl OverlayRenderer {
             self.d2d.DrawRectangle(&b, &sel_brush, 1.5, None);
             // Four corner handles.
             for &(cx, cy) in &[
-                (b.left, b.top), (b.right, b.top),
-                (b.left, b.bottom), (b.right, b.bottom),
+                (b.left, b.top),
+                (b.right, b.top),
+                (b.left, b.bottom),
+                (b.right, b.bottom),
             ] {
-                let grip = D2D1_ELLIPSE { point: vector2(cx, cy), radiusX: handle_r, radiusY: handle_r };
+                let grip = D2D1_ELLIPSE {
+                    point: vector2(cx, cy),
+                    radiusX: handle_r,
+                    radiusY: handle_r,
+                };
                 self.d2d.FillEllipse(&grip, &sel_brush);
             }
         }
@@ -1737,8 +2006,7 @@ impl OverlayRenderer {
                 }
             }
         }
-        let format =
-            format.ok_or_else(|| format!("no usable label font family ({last_error})"))?;
+        let format = format.ok_or_else(|| format!("no usable label font family ({last_error})"))?;
         unsafe {
             let _ = format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
             let _ = format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
@@ -1778,26 +2046,20 @@ impl OverlayRenderer {
         // and both lift towards the capture green while the level walk is live (docs/21 §5.24, A3).
         // The starting colours are the walking ones, so a frame drawn before anything sets them is
         // never an invisible box.
-        let preview_fill = color_of(
-            CAPTURE_RGB,
-            PREVIEW_WASH_ALPHA * PREVIEW_WASH_WALK_SCALE,
-        );
+        let preview_fill = color_of(CAPTURE_RGB, PREVIEW_WASH_ALPHA * PREVIEW_WASH_WALK_SCALE);
         self.preview_fill_brush = Some(self.create_brush(&preview_fill)?);
         self.preview_stroke_brush = Some(self.create_brush(&capture_mix_color(1.0, 1.0))?);
         // The badge's hairline and its dimmed half (v3: rgba(255,255,255,.1–.14) and
         // rgba(200,208,219,.28); folded into one line brush, since the two hairlines differ by four
         // percent of alpha and no one can see it).
         self.badge_line_brush = Some(self.create_brush(&color(1.0, 1.0, 1.0, 0.13))?);
-        self.badge_dim_brush = Some(self.create_brush(&color(
-            200.0 / 255.0,
-            208.0 / 255.0,
-            219.0 / 255.0,
-            0.28,
-        ))?);
+        self.badge_dim_brush =
+            Some(self.create_brush(&color(200.0 / 255.0, 208.0 / 255.0, 219.0 / 255.0, 0.28))?);
         self.capture_brush = Some(self.create_brush(&color_of(CAPTURE_RGB, 1.0))?);
         // Mutable: `paint_chain_rings` sets each ring's own opacity.
         self.chain_ring_brush = Some(self.create_brush(&chain_ring_color(1.0))?);
-        self.chain_shadow_brush = Some(self.create_brush(&color(0.0, 0.0, 0.0, CHAIN_RING_SHADOW))?);
+        self.chain_shadow_brush =
+            Some(self.create_brush(&color(0.0, 0.0, 0.0, CHAIN_RING_SHADOW))?);
         self.mask_tint_brush = Some(self.create_brush(&color(
             accent.r * 1.0,
             accent.g * 1.0,
@@ -1808,48 +2070,20 @@ impl OverlayRenderer {
         self.label_background_brush = Some(self.create_brush(&panel)?);
         self.label_text_brush = Some(self.create_brush(&white)?);
         self.crosshair_brush = Some(self.create_brush(&crosshair)?);
-        self.magnifier_band_brush =
-            Some(self.create_brush(&color(0.30, 0.55, 1.0, 0.45))?);
+        self.magnifier_band_brush = Some(self.create_brush(&color(0.30, 0.55, 1.0, 0.45))?);
         self.magnifier_grid_brush = Some(self.create_brush(&grid)?);
         self.magnifier_info_brush = Some(self.create_brush(&info)?);
-        // ── Glassmorphism info-panel palette ──
-        // The primary path uses a real Gaussian-blur backdrop + `info_tint_brush`.
-        // This solid `info_bg_brush` remains the fallback when the effect cannot
-        // be constructed; 0.68 keeps the strip legible without going fully opaque.
-        self.info_bg_brush = Some(self.create_brush(
-            &color(20.0 / 255.0, 20.0 / 255.0, 20.0 / 255.0, 0.68),
-        )?);
-        self.info_hex_brush = Some(self.create_brush(&color(1.0, 1.0, 1.0, 1.0))?);
-        self.info_coord_value_brush = Some(self.create_brush(
-            &color(245.0 / 255.0, 245.0 / 255.0, 245.0 / 255.0, 1.0),
-        )?);
-        self.info_hint_brush = Some(self.create_brush(
-            &color(245.0 / 255.0, 245.0 / 255.0, 245.0 / 255.0, 1.0),
-        )?);
-        self.info_kbd_text_brush = Some(self.create_brush(
-            &color(245.0 / 255.0, 245.0 / 255.0, 245.0 / 255.0, 1.0),
-        )?);
-        self.info_kbd_fill_brush = Some(self.create_brush(
-            &color(1.0, 1.0, 1.0, 0.1),
-        )?);
-        self.info_kbd_bottom_brush = Some(self.create_brush(
-            &color(1.0, 1.0, 1.0, 0.06),
-        )?);
-        self.info_swatch_border_brush = Some(self.create_brush(
-            &color(1.0, 1.0, 1.0, 0.35),
-        )?);
-        self.info_swatch_inset_brush = Some(self.create_brush(
-            &color(0.0, 0.0, 0.0, 0.25),
-        )?);
+        // ── Info strip palette (docs/design/overlay-ui-demo.html) ──
+        let soft = |alpha| color(232.0 / 255.0, 236.0 / 255.0, 242.0 / 255.0, alpha);
+        self.info_hex_brush = Some(self.create_brush(&white)?);
+        self.info_coord_value_brush = Some(self.create_brush(&soft(0.72))?);
+        self.info_hint_brush = Some(self.create_brush(&soft(0.62))?);
+        self.info_kbd_fill_brush = Some(self.create_brush(&color(1.0, 1.0, 1.0, 0.1))?);
+        self.info_swatch_border_brush = Some(self.create_brush(&color(1.0, 1.0, 1.0, 0.55))?);
         self.info_swatch_fill_brush = Some(self.create_brush(&color(0.0, 0.0, 0.0, 1.0))?);
-        // ── Real Gaussian-blur backdrop for the info strip (docs/15) ──
-        // windows-rs 0.61 binds ID2D1Properties::SetValue as
-        //   (u32, D2D1_PROPERTY_TYPE, &[u8]) -> Result<()>
-        // rather than accepting a &PROPVARIANT, so raw little-endian bytes with
-        // D2D1_PROPERTY_TYPE_UNKNOWN is the correct call shape. SetInput returns
-        // () (no Result), and DrawImage's targetoffset / imagerectangle are
-        // Option<*const _> — see the call site in draw_magnifier for how those
-        // two differ from the intuitive C++ projection.
+        // ── The backdrop blur ──
+        // windows-rs binds ID2D1Properties::SetValue as (u32, D2D1_PROPERTY_TYPE, &[u8]), so the
+        // values go in as raw little-endian bytes with D2D1_PROPERTY_TYPE_UNKNOWN.
         let blur: ID2D1Effect = unsafe { self.d2d.CreateEffect(&CLSID_D2D1GaussianBlur) }
             .map_err(|error| super::hresult("ID2D1DeviceContext::CreateEffect", &error))?;
         unsafe {
@@ -1858,12 +2092,9 @@ impl OverlayRenderer {
                 D2D1_PROPERTY_TYPE_UNKNOWN,
                 &(D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED.0 as u32).to_ne_bytes(),
             )
-            .map_err(|error| {
-                super::hresult("ID2D1Effect::SetValue(OPTIMIZATION_MODE)", &error)
-            })?;
-            // HARD border mode: without it, the kernel would sample outside the
-            // info rect into transparent pixels near the frame edge and darken
-            // the strip's own edges (a visible halo at screen borders).
+            .map_err(|error| super::hresult("ID2D1Effect::SetValue(OPTIMIZATION_MODE)", &error))?;
+            // HARD border mode: the kernel would otherwise pull in transparent pixels past the
+            // frame's edge and darken a band along every screen border.
             blur.SetValue(
                 D2D1_GAUSSIANBLUR_PROP_BORDER_MODE.0 as u32,
                 D2D1_PROPERTY_TYPE_UNKNOWN,
@@ -1872,53 +2103,62 @@ impl OverlayRenderer {
             .map_err(|error| super::hresult("ID2D1Effect::SetValue(BORDER_MODE)", &error))?;
         }
         self.blur_effect = Some(blur);
-        self.info_tint_brush = Some(self.create_brush(&color(0.07, 0.07, 0.08, 0.78))?);
-        self.info_badge_bg_brush = Some(self.create_brush(&color(
-            60.0 / 255.0, 60.0 / 255.0, 60.0 / 255.0, 0.82,
-        ))?);
+        self.info_tint_brush = Some(self.create_brush(&rgba(18, 18, 20, 0.78))?);
+        // ── Shortcut guide ──
+        self.guide_tint_brush = Some(self.create_brush(&rgba(14, 16, 20, 0.66))?);
+        self.guide_cap_brush = Some(self.create_brush(&rgba(236, 239, 244, 0.94))?);
+        self.guide_cap_text_brush = Some(self.create_brush(&rgba(0x15, 0x18, 0x1d, 1.0))?);
+        self.guide_label_brush = Some(self.create_brush(&color(1.0, 1.0, 1.0, 0.92))?);
+        self.guide_head_brush = Some(self.create_brush(&color(1.0, 1.0, 1.0, 0.42))?);
+        self.guide_sep_brush = Some(self.create_brush(&color(1.0, 1.0, 1.0, 0.5))?);
+        self.info_badge_bg_brush =
+            Some(self.create_brush(&color(60.0 / 255.0, 60.0 / 255.0, 60.0 / 255.0, 0.82))?);
         // Annotation brushes: initialised to accent blue; colour set per-item at draw time.
         self.ann_stroke_brush = Some(self.create_brush(&color(0.0, 0.47, 0.83, 1.0))?);
         self.ann_fill_brush = Some(self.create_brush(&color(0.0, 0.0, 0.0, 0.0))?);
-        // ── Scroll panel (docs/30 §19.7) ────────────────────────────────────────────────
-        // The backdrop is darker and more opaque than the label panel: the panel sits over a live
-        // capture and carries whole sentences, so legibility wins over letting the frame through.
-        //
-        // The two box colours are the model's (§19.4): the adopted box is the interface accent, and
-        // the unadopted box is a neutral grey. The grey is the point — PixPin paints this state red,
-        // which reads as "something is wrong, act"; §16.10 continues past the step and the user has
-        // nothing to do, so the colour must not ask for an action nobody needs to take.
-        self.scroll_panel_brush = Some(self.create_brush(&color(0.04, 0.04, 0.05, 0.96))?);
-        self.scroll_strip_brush = Some(self.create_brush(&color(0.0, 0.0, 0.0, 0.55))?);
+        // ── Scroll panel (docs/33, the demo's `drawScrolling`) ─────────────────────────
+        // Nearly opaque: the panel sits over a live page, so legibility wins over letting it through.
+        self.scroll_panel_brush = Some(self.create_brush(&SCROLL_PANEL)?);
         self.scroll_box_brush = Some(self.create_brush(&accent)?);
-        self.scroll_unadopted_brush = Some(self.create_brush(&color(
-            f32::from(UNADOPTED_RGB.r) / 255.0,
-            f32::from(UNADOPTED_RGB.g) / 255.0,
-            f32::from(UNADOPTED_RGB.b) / 255.0,
-            1.0,
-        ))?);
-        // The dashes come from the factory rather than a hand-rolled pattern of short strokes: a
-        // `DrawRectangle` with a stroke style is one call, and the pattern then scales with the DPI
-        // the same way the geometry does.
-        unsafe {
-            let factory: ID2D1Factory = self
-                .d2d
-                .GetFactory()
-                .map_err(|error| super::hresult("ID2D1Resource::GetFactory", &error))?;
-            let properties = D2D1_STROKE_STYLE_PROPERTIES {
-                startCap: D2D1_CAP_STYLE_FLAT,
-                endCap: D2D1_CAP_STYLE_FLAT,
-                dashCap: D2D1_CAP_STYLE_FLAT,
-                lineJoin: D2D1_LINE_JOIN_MITER,
-                miterLimit: 10.0,
-                dashStyle: D2D1_DASH_STYLE_DASH,
-                dashOffset: 0.0,
-            };
-            self.scroll_dash_style = Some(
-                factory
-                    .CreateStrokeStyle(&properties, None)
-                    .map_err(|error| super::hresult("ID2D1Factory::CreateStrokeStyle", &error))?,
-            );
-        }
+        self.scroll_shadow_brush = Some(self.create_brush(&color(0.0, 0.0, 0.0, 0.1))?);
+        self.scroll_title_brush = Some(self.create_brush(&color(1.0, 1.0, 1.0, 1.0))?);
+        self.scroll_muted_brush = Some(self.create_brush(&rgba(232, 236, 242, 0.62))?);
+        self.scroll_button_brush = Some(self.create_brush(&color(1.0, 1.0, 1.0, 0.08))?);
+        let stops = [
+            D2D1_GRADIENT_STOP {
+                position: 0.0,
+                color: D2D1_COLOR_F {
+                    a: 0.95,
+                    ..SCROLL_PANEL
+                },
+            },
+            D2D1_GRADIENT_STOP {
+                position: 1.0,
+                color: D2D1_COLOR_F {
+                    a: 0.0,
+                    ..SCROLL_PANEL
+                },
+            },
+        ];
+        // The render target's overload: the device context's own takes straight-alpha stops in a
+        // different signature.
+        let target: &ID2D1RenderTarget = &self.d2d;
+        let fade = unsafe {
+            let collection = target
+                .CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)
+                .map_err(|e| super::hresult("CreateGradientStopCollection", &e))?;
+            target
+                .CreateLinearGradientBrush(
+                    &D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+                        startPoint: vector2(0.0, 0.0),
+                        endPoint: vector2(0.0, 1.0),
+                    },
+                    None,
+                    &collection,
+                )
+                .map_err(|e| super::hresult("CreateLinearGradientBrush", &e))?
+        };
+        self.scroll_fade_brush = Some(fade);
         Ok(())
     }
 
@@ -1954,31 +2194,45 @@ impl OverlayRenderer {
         self.magnifier_band_brush = None;
         self.magnifier_grid_brush = None;
         self.magnifier_info_brush = None;
-        self.info_bg_brush = None;
         self.info_hex_brush = None;
         self.info_coord_value_brush = None;
         self.info_hint_brush = None;
-        self.info_kbd_text_brush = None;
         self.info_kbd_fill_brush = None;
-        self.info_kbd_bottom_brush = None;
         self.info_swatch_border_brush = None;
-        self.info_swatch_inset_brush = None;
         self.info_swatch_fill_brush = None;
         self.blur_effect = None;
+        self.blurred_frame = None;
         self.info_tint_brush = None;
+        self.guide_tint_brush = None;
+        self.guide_cap_brush = None;
+        self.guide_cap_text_brush = None;
+        self.guide_label_brush = None;
+        self.guide_head_brush = None;
+        self.guide_sep_brush = None;
         self.info_badge_bg_brush = None;
         self.ann_stroke_brush = None;
         self.ann_fill_brush = None;
         self.scroll_panel_brush = None;
-        self.scroll_strip_brush = None;
         self.scroll_box_brush = None;
-        self.scroll_unadopted_brush = None;
-        self.scroll_dash_style = None;
+        self.scroll_shadow_brush = None;
+        self.scroll_title_brush = None;
+        self.scroll_muted_brush = None;
+        self.scroll_button_brush = None;
+        self.scroll_fade_brush = None;
+        self.scroll_preview_bitmap = None;
     }
+}
+
+/// Whether a draw of `view` crops from the blurred frame: the blurred mask, the guide, or the
+/// magnifier's info strip.
+fn needs_backdrop(view: &RenderView) -> bool {
+    view.scroll.is_none()
+        && (view.mask_blur || view.guide.is_some() || (view.show_chrome && view.cursor_visible))
 }
 
 use helpers::*;
 
+mod guide_pass;
 mod helpers;
 mod magnifier_pass;
 

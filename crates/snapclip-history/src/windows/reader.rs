@@ -4,13 +4,7 @@
 //! formats. Everything below returns platform-neutral byte payloads so the
 //! application layer never sees a HGLOBAL, DIB or CF_* constant.
 
-use std::{
-    ffi::c_void,
-    mem::zeroed,
-    ptr::null_mut,
-    thread,
-    time::Duration,
-};
+use std::{ffi::c_void, mem::zeroed, ptr::null_mut, thread, time::Duration};
 
 use windows_sys::Win32::{
     Foundation::GetLastError,
@@ -27,10 +21,7 @@ use windows_sys::Win32::{
         Memory::{GlobalLock, GlobalSize, GlobalUnlock},
         Ole::{CF_BITMAP, CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT},
     },
-    UI::{
-        Shell::DragQueryFileW,
-        WindowsAndMessaging::GetForegroundWindow,
-    },
+    UI::{Shell::DragQueryFileW, WindowsAndMessaging::GetForegroundWindow},
 };
 
 use snapclip_model::{ImageDimensions, PayloadData, PayloadKind, PayloadRef};
@@ -68,7 +59,9 @@ pub fn open_clipboard() -> Result<(), String> {
 ///
 /// # Safety
 /// The clipboard must be open on the calling thread.
-pub unsafe fn read_open_clipboard(ids: formats::ClipboardFormats) -> Result<Vec<PayloadData>, String> {
+pub unsafe fn read_open_clipboard(
+    ids: formats::ClipboardFormats,
+) -> Result<Vec<PayloadData>, String> {
     if ids.exclude != 0 && unsafe { IsClipboardFormatAvailable(ids.exclude) } != 0 {
         // SnapClip wrote this content itself: never re-capture it.
         return Ok(Vec::new());
@@ -93,10 +86,7 @@ pub unsafe fn read_open_clipboard(ids: formats::ClipboardFormats) -> Result<Vec<
         }
     }
 
-    for (format, kind) in [
-        (ids.html, PayloadKind::Html),
-        (ids.rtf, PayloadKind::Rtf),
-    ] {
+    for (format, kind) in [(ids.html, PayloadKind::Html), (ids.rtf, PayloadKind::Rtf)] {
         if format != 0 {
             if let Some(bytes) = unsafe { read_global(format, MAX_CLIPBOARD_BYTES - total_size)? } {
                 if !bytes.is_empty() {
@@ -474,4 +464,3 @@ mod tests {
         assert_eq!(snapshot.payloads.len(), 1);
     }
 }
-

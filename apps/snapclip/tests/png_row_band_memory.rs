@@ -22,9 +22,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
-use snapclip_app::capture::row_band_png::PngRowBandSink;
-use snapclip_capture::scroll::Axis;
-use snapclip_capture::scroll::export::{ImageMeta, RowBandSink};
+use snapclip_app::capture::row_band_png::{ImageMeta, PngRowBandSink};
 
 // ---------------------------------------------------------------------------
 // The allocator. `peak - live` is what the export path added on top of the rows it was handed.
@@ -132,9 +130,6 @@ fn the_sink_streams_without_materializing_the_image() {
     let plan = ImageMeta {
         width: u64::from(WIDTH),
         height: u64::from(HEIGHT),
-        length: u64::from(HEIGHT),
-        axis: Axis::Vertical,
-        dpr: 1,
     };
 
     // Both of these exist before the measurement starts, exactly as a session's would: what is
@@ -154,7 +149,7 @@ fn the_sink_streams_without_materializing_the_image() {
         writer.write_rows(row, band).expect("write_rows");
         row += u64::from(rows);
     }
-    let artifact = writer.finish(None).expect("finish");
+    let artifact = writer.finish().expect("finish");
     let extra = CountingAllocator::peak() - before;
 
     let raw_len = WIDTH as usize * HEIGHT as usize * 4;

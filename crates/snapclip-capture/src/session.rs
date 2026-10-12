@@ -3,11 +3,10 @@
 //! Pure logic: no Win32, no GPU, no Tauri. The overlay controller feeds it pointer
 //! and keyboard events and reads back the geometry it needs to draw.
 
+use super::CaptureError;
 use super::geometry::{
     MonitorLayout, Point, Rect, ResizeMode, SelectionDrag, SelectionGeometry, SelectionSnapshot,
 };
-use super::CaptureError;
-use crate::scroll::target::ScrollTarget;
 use snapclip_model::{CaptureArtifact, CapturePayload, CaptureState, PixelFormat};
 
 /// One frozen back-buffer frame: exactly what the overlay presents while the user
@@ -48,36 +47,13 @@ impl OverlayGeometry {
     }
 }
 
-/// What a finished capture session hands to a scroll session (`docs/30` §20.6; `docs/32` ADR-19).
-///
-/// Two things travel and nothing else: the **window** the frames will come from — its opaque
-/// identity, its visible bounds, and the selection clipped inside it — and the **dpi** the
-/// selection was made at. The dpi is here because the overlay's coordinates and the injected
-/// wheel are in different spaces and the conversion needs the DPI the selection was made at; a
-/// scroll session that re-queried the DPI could disagree with the overlay that produced the
-/// rectangle.
-///
-/// It deliberately does **not** carry the frozen frame. ADR-19 settled that the scroll driver's
-/// own first window frame is the origin: the driver captures the *window*, while the frozen frame
-/// is the *monitor* — the monitor frame contains whatever occluded the window at freeze time, so a
-/// band built from it would leave a seam that appears only when something was covering the window.
-/// Keeping pixels out is also what keeps this a plain `Copy` value: it exists after the capture
-/// session has already ended, so it is not a `Result`-carrying type and has no `state`.
+/// What a finished capture session hands to a scroll session (`docs/33`): the selection, in the
+/// overlay's monitor-local pixels, and the DPI it was made at. No pixels travel: the scroll thread
+/// captures the monitor itself, and its first frame is the image's origin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ScrollHandoff {
-    target: ScrollTarget,
-    dpi: u32,
-}
-
-impl ScrollHandoff {
-    /// The window to read from, with the selection already clipped to its bounds.
-    pub fn target(&self) -> ScrollTarget {
-        self.target
-    }
-
-    pub fn dpi(&self) -> u32 {
-        self.dpi
-    }
+pub struct ScrollStart {
+    pub selection: Rect,
+    pub dpi: u32,
 }
 
 /// Outcome of [`CaptureSession::begin_export`].
@@ -247,8 +223,7 @@ impl CaptureSession {
             return false;
         }
         if creating {
-            self.selection =
-                Rect::new(press_point.x, press_point.y, press_point.x, press_point.y);
+            self.selection = Rect::new(press_point.x, press_point.y, press_point.x, press_point.y);
             self.state = CaptureState::Selecting;
         }
         self.drag = Some(SelectionDrag::new(self.selection, self.dpi(), press_point));
@@ -325,7 +300,10 @@ impl CaptureSession {
     /// frozen frame is being handed to the export worker, and a repaint would race the
     /// region readback for the single-threaded D3D11 context.
     pub fn begin_export(&mut self) -> Result<ExportOutcome, CaptureError> {
-        if !matches!(self.state, CaptureState::Selected | CaptureState::Annotating) {
+        if !matches!(
+            self.state,
+            CaptureState::Selected | CaptureState::Annotating
+        ) {
             return Err(CaptureError::InvalidState(format!(
                 "cannot confirm while {}",
                 self.state.as_str()
@@ -339,71 +317,36 @@ impl CaptureSession {
         Ok(ExportOutcome::Produce { selection })
     }
 
-    /// `Selected | Annotating -> Idle`, handing the window, the crop and the DPI to a scroll
-    /// session (`docs/30` §20.6; `docs/32` `P7.04`, ADR-19).
+    /// End this session and hand its selection to a scroll session (`docs/33`).
     ///
-    /// ## This ends the capture session
-    ///
-    /// It is a **handoff and not an extension**: the ordinary screenshot is over when this returns,
-    /// and the scroll session is a different object with a different lifetime (§20.6). The alternative
-    /// — teaching `CaptureSession` to also be a scroll session — was rejected for a structural reason,
-    /// not a stylistic one: `CaptureSession`'s state set is **exhaustively tested** (every variant is
-    /// driven to by `every_capture_state_variant_is_reachable`, and `esc_from_every_active_state_returns_to_idle`
-    /// walks all six active ones), so every state added here would have to be added to both tests and to
-    /// every guard in the file. The scroll session's phases are *not* a state machine (§20.1) and must
-    /// not be squeezed into one.
-    ///
-    /// ## What travels, and what deliberately does not
-    ///
-    /// The caller supplies the **window** (opaque identity) and its **visible bounds**, because only
-    /// the platform side can resolve them (`windows/scroll_target.rs` resolves them from the window
-    /// snapshot and converts the coordinates); this session supplies the **crop**, because it owns the
-    /// selection. The frozen monitor frame does **not** travel: ADR-19 settled that the scroll driver's
-    /// own first window frame is the origin, since a monitor frame carries whatever occluded the window
-    /// at freeze time and would leave a seam that appears only when something was covering it. The frame
-    /// is still taken out of the `Option`, so `frame()` is `None` afterwards — releasing it, rather than
-    /// handing it over, is what makes "this session is finished" checkable.
-    ///
-    /// The guard is the export path's guard on purpose: a scroll session with no committed rectangle
-    /// has nothing to scroll, and "selecting" is not "selected".
-    pub fn begin_scroll(
-        &mut self,
-        window: u64,
-        window_bounds: Rect,
-    ) -> Result<ScrollHandoff, CaptureError> {
-        if !matches!(self.state, CaptureState::Selected | CaptureState::Annotating) {
+    /// A scroll session is not a capture state: it owns a thread and runs for minutes, so it starts
+    /// once this session has gone back to `Idle` through the same routine `Esc` uses. The guard is
+    /// the export path's — "selecting" is not "selected" — plus the scroll estimator's own minimum:
+    /// a selection shorter than [`crate::scroll::MIN_VIEW`] rows cannot overlap itself after a
+    /// scroll. A refusal leaves the session usable.
+    pub fn begin_scroll(&mut self) -> Result<ScrollStart, CaptureError> {
+        if !matches!(
+            self.state,
+            CaptureState::Selected | CaptureState::Annotating
+        ) {
             return Err(CaptureError::InvalidState(format!(
                 "cannot start a scroll session while {}",
                 self.state.as_str()
             )));
         }
         let selection = self.selection.intersect(self.bounds());
-        if selection.is_empty() {
-            return Err(CaptureError::InvalidState(
-                "a scroll session needs a non-empty selection".into(),
-            ));
-        }
-        // The session owns the selection, so it owns the clip: a window the selection does not
-        // touch has no rectangle to crop frames to. Refusing here must leave the session usable —
-        // the tests below pin that, because a refusal that consumed the selection would strand the
-        // user with neither a screenshot nor a scroll session.
-        let crop = selection.intersect(window_bounds);
-        if crop.is_empty() {
-            return Err(CaptureError::InvalidState(
-                "the selection does not overlap the window".into(),
-            ));
+        if selection.is_empty() || (selection.height() as u32) < crate::scroll::MIN_VIEW {
+            return Err(CaptureError::InvalidState(format!(
+                "a scroll session needs a selection at least {} px tall, not {}x{}",
+                crate::scroll::MIN_VIEW,
+                selection.width(),
+                selection.height()
+            )));
         }
         let dpi = self.dpi();
         self.frame.take();
-
-        // Everything else goes back to `Idle` through the same routine Esc uses, so there is exactly
-        // one cleanup path and no way for the two to drift apart.
         self.reset();
-
-        Ok(ScrollHandoff {
-            target: ScrollTarget::new(window, window_bounds, crop),
-            dpi,
-        })
+        Ok(ScrollStart { selection, dpi })
     }
 
     /// Build the domain artifact for a finished session.
@@ -450,7 +393,9 @@ impl CaptureSession {
 
     /// Reject input for a monitor rectangle that this session does not own.
     pub fn bounds(&self) -> Rect {
-        self.geometry.map(|geometry| geometry.frame).unwrap_or_default()
+        self.geometry
+            .map(|geometry| geometry.frame)
+            .unwrap_or_default()
     }
 
     fn reset(&mut self) {
@@ -465,7 +410,7 @@ impl CaptureSession {
 
 #[cfg(test)]
 mod tests {
-    use super::{CaptureSession, CapturedFrame, ExportOutcome, OverlayGeometry, ScrollHandoff};
+    use super::{CaptureSession, CapturedFrame, ExportOutcome, OverlayGeometry, ScrollStart};
     use crate::geometry::{Handle, MonitorLayout, Point, Rect, ResizeMode, SelectionGeometry};
     use snapclip_model::{CapturePayload, CaptureState, PixelFormat};
 
@@ -509,10 +454,7 @@ mod tests {
                 ResizeMode::Handle(Handle::BottomRight)
             }
         };
-        let creating = matches!(
-            hit,
-            SelectionGeometry::Create | SelectionGeometry::Outside
-        );
+        let creating = matches!(hit, SelectionGeometry::Create | SelectionGeometry::Outside);
         session.begin_drag(point, mode, creating);
         hit
     }
@@ -808,8 +750,14 @@ mod tests {
         assert!(!session.snap_to(Rect::default()));
         assert!(!session.snap_to(Rect::new(10, 10, 10, 400)), "zero width");
         assert!(!session.snap_to(Rect::new(10, 10, 400, 10)), "zero height");
-        assert!(!session.snap_to(Rect::new(9000, 9000, 9500, 9500)), "off the monitor");
-        assert!(!session.snap_to(Rect::new(20, 20, 22, 22)), "below the minimum size");
+        assert!(
+            !session.snap_to(Rect::new(9000, 9000, 9500, 9500)),
+            "off the monitor"
+        );
+        assert!(
+            !session.snap_to(Rect::new(20, 20, 22, 22)),
+            "below the minimum size"
+        );
         assert_eq!(session.state(), CaptureState::Selecting);
         assert_eq!(session.selection(), Rect::default());
     }
@@ -875,7 +823,10 @@ mod tests {
         assert!(session.shows_chrome());
         assert_eq!(session.selection(), Rect::new(100, 100, 400, 300));
         // A pointer press in Annotating does not re-open a selection drag.
-        assert_eq!(press(&mut session, Point::new(500, 500)), SelectionGeometry::Outside);
+        assert_eq!(
+            press(&mut session, Point::new(500, 500)),
+            SelectionGeometry::Outside
+        );
         assert_eq!(session.selection(), Rect::new(100, 100, 400, 300));
 
         // Confirm from Annotating produces the same clipped selection.
@@ -901,22 +852,8 @@ mod tests {
         assert!(session.begin_annotating().is_err());
     }
 
-    /// `docs/30` §20.6 / `R-5`: "picking a rectangle" and "scrolling" are **two lifetimes**, and the
-    /// handoff between them is one-way.
-    ///
-    /// A scroll session may run for minutes and it owns a thread, a canvas and a spill directory
-    /// (§21.1). That is not something `CaptureSession` can carry: its six active states are
-    /// exhaustively tested (`esc_from_every_active_state_returns_to_idle`), and every scroll state
-    /// added here would both break that test and hide a legal-transition fact behind a state that
-    /// only one caller ever reaches. So the entry point does not extend the capture session — it
-    /// **ends** it, through the same `begin_export`/`complete` pair the ordinary screenshot path
-    /// uses, and hands over the three facts the scroll session cannot recover on its own: the frozen
-    /// frame, the selection, and the DPI.
-    ///
-    /// The last four assertions are the whole test. A version that merely *copied* the frame out
-    /// would satisfy every assertion about the handoff while leaving `CaptureSession` holding a
-    /// selection and a geometry — which is exactly the "two parallel states" §20.6 forbids, and it is
-    /// invisible in the handoff itself.
+    /// A scroll session is not a capture state: starting one ends this session, which keeps
+    /// nothing — not the frame, not the selection — and hands over the selection and the DPI.
     #[test]
     fn the_capture_session_ends_before_the_scroll_session_starts() {
         let mut session = armed_session();
@@ -924,102 +861,52 @@ mod tests {
         session.pointer_moved(Point::new(500, 400));
         assert_eq!(session.pointer_released(), CaptureState::Selected);
 
-        let window = Rect::new(0, 0, 1920, 1080);
-        let handoff = session
-            .begin_scroll(0x1234, window)
+        let start = session
+            .begin_scroll()
             .expect("a committed selection can start a scroll session");
-
-        // Geometry and identity, nothing else (`docs/32` ADR-19).
-        assert_eq!(handoff.target().window(), 0x1234);
-        assert_eq!(handoff.target().bounds(), window);
-        assert_eq!(handoff.target().crop(), Rect::new(100, 100, 500, 400));
         assert_eq!(
-            handoff.dpi(),
-            96,
-            "the scroll session matches at the DPI the selection was made at"
+            start,
+            ScrollStart {
+                selection: Rect::new(100, 100, 500, 400),
+                dpi: 96
+            }
         );
-
-        // The mission is over: idle, and holding nothing.
         assert_eq!(session.state(), CaptureState::Idle);
-        assert!(
-            session.frame().is_none(),
-            "the frozen frame is released here, not handed to the scroll session: the driver's \
-             own first frame is the origin (docs/32 ADR-19)"
-        );
+        assert!(session.frame().is_none());
         assert!(session.geometry().is_none());
         assert!(!session.has_selection());
     }
 
-    /// `docs/32` ADR-19: the handoff is a value of geometry and identity. A `CapturedFrame` in
-    /// here would be a second owner of the pixels on another thread's device, and it would also
-    /// silently re-introduce the seam the ADR removed (a monitor frame carries occlusion that
-    /// the driver's window frames do not).
-    #[test]
-    fn a_scroll_handoff_carries_geometry_and_identity_only() {
-        let size = std::mem::size_of::<ScrollHandoff>();
-        assert!(
-            size <= 64,
-            "the scroll handoff must stay a small value (identity + two rectangles + dpi); it is \
-             {size} bytes, so something with pixels or a frame has been added back"
-        );
-    }
-
-    /// The crop is the session's own selection clipped to the window: the session owns the
-    /// selection, so it owns this rectangle rather than copying the caller's answer.
-    #[test]
-    fn the_crop_is_clipped_to_the_window() {
-        let mut session = armed_session();
-        press(&mut session, Point::new(100, 100));
-        session.pointer_moved(Point::new(900, 800));
-        session.pointer_released();
-
-        let handoff = session
-            .begin_scroll(0x3, Rect::new(0, 0, 500, 500))
-            .expect("part of the selection lies inside the window");
-        assert_eq!(handoff.target().crop(), Rect::new(100, 100, 500, 500));
-    }
-
-    /// A window that does not overlap the selection has nothing to crop frames to, and refusing
-    /// must not consume the selection: the user can still pick the right window or export.
-    #[test]
-    fn a_selection_outside_the_window_is_invalid_state() {
-        let mut session = armed_session();
-        press(&mut session, Point::new(100, 100));
-        session.pointer_moved(Point::new(500, 400));
-        session.pointer_released();
-
-        assert!(session.begin_scroll(0x2, Rect::new(1200, 0, 1920, 600)).is_err());
-        assert_eq!(
-            session.state(),
-            CaptureState::Selected,
-            "a refused hand-off must leave the session usable"
-        );
-        assert_eq!(session.selection(), Rect::new(100, 100, 500, 400));
-    }
-
-    /// The handoff has the same guard as the export path, and for the same reason: a scroll session
-    /// with no committed rectangle has nothing to scroll, and "selecting" is not "selected".
+    /// Same guard as the export path, and one-way: the second attempt has nothing to hand over.
     #[test]
     fn a_scroll_session_needs_a_committed_selection() {
         let mut session = armed_session();
-        let window = Rect::new(0, 0, 1920, 1080);
-        assert!(
-            session.begin_scroll(0x1, window).is_err(),
-            "selecting is not selected"
-        );
+        assert!(session.begin_scroll().is_err(), "selecting is not selected");
 
         press(&mut session, Point::new(10, 10));
         session.pointer_moved(Point::new(200, 150));
         assert!(
-            session.begin_scroll(0x1, window).is_err(),
+            session.begin_scroll().is_err(),
             "a drag in flight is not selected"
         );
 
         session.pointer_released();
-        assert!(session.begin_scroll(0x1, window).is_ok());
-        // And it is one-way: the second attempt has no selection to hand over.
-        assert!(session.begin_scroll(0x1, window).is_err());
+        assert!(session.begin_scroll().is_ok());
+        assert!(session.begin_scroll().is_err());
+    }
+
+    /// A selection too short to overlap itself after a scroll is refused, and the refusal leaves
+    /// the session usable: the user can still widen it or take a screenshot.
+    #[test]
+    fn a_too_short_selection_is_refused_and_kept() {
+        let mut session = armed_session();
+        let short = crate::scroll::MIN_VIEW as i32 - 1;
+        press(&mut session, Point::new(100, 100));
+        session.pointer_moved(Point::new(500, 100 + short));
+        session.pointer_released();
+
+        assert!(session.begin_scroll().is_err());
+        assert_eq!(session.state(), CaptureState::Selected);
+        assert_eq!(session.selection(), Rect::new(100, 100, 500, 100 + short));
     }
 }
-
-

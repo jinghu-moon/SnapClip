@@ -198,7 +198,9 @@ mod tests {
         let mut late = bus.subscribe();
         assert!(late.try_next().is_none());
         bus.publish(clipboard_event("new"));
-        assert!(matches!(late.try_next(), Some(AppEvent::Clipboard(event)) if event.clip_id == "new"));
+        assert!(
+            matches!(late.try_next(), Some(AppEvent::Clipboard(event)) if event.clip_id == "new")
+        );
     }
 
     #[test]
@@ -209,7 +211,10 @@ mod tests {
         assert!(gate.accept(1));
         assert!(!gate.accept(1), "the same generation twice is not new");
         assert_eq!(gate.last_accepted(), 1);
-        assert!(!gate.accept(0), "a stale event cannot move the UI backwards");
+        assert!(
+            !gate.accept(0),
+            "a stale event cannot move the UI backwards"
+        );
         assert!(gate.accept(2));
         assert_eq!(gate.last_accepted(), 2);
     }
@@ -220,10 +225,17 @@ mod tests {
         let mut stream = bus.subscribe();
         bus.publish(clipboard_event("first"));
         bus.publish(clipboard_event("second"));
-        assert!(matches!(stream.try_next(), Some(AppEvent::Clipboard(event)) if event.clip_id == "first"));
+        assert!(
+            matches!(stream.try_next(), Some(AppEvent::Clipboard(event)) if event.clip_id == "first")
+        );
         assert_eq!(stream.last_generation(), 1);
-        assert!(matches!(stream.try_next(), Some(AppEvent::Clipboard(event)) if event.clip_id == "second"));
+        assert!(
+            matches!(stream.try_next(), Some(AppEvent::Clipboard(event)) if event.clip_id == "second")
+        );
         assert_eq!(stream.last_generation(), 2);
-        assert!(stream.try_next().is_none(), "an empty stream hands out nothing");
+        assert!(
+            stream.try_next().is_none(),
+            "an empty stream hands out nothing"
+        );
     }
 }

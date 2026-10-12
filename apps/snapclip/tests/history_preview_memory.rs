@@ -139,7 +139,11 @@ fn tall_page_png() -> Vec<u8> {
     let mut rows = vec![0u8; DECODED_BYTES];
     for y in 0..HEIGHT as usize {
         for x in 0..WIDTH as usize {
-            let value = if (x / 3 + y / 500) % 2 == 0 { 0x20 } else { 0xF0 };
+            let value = if (x / 3 + y / 500) % 2 == 0 {
+                0x20
+            } else {
+                0xF0
+            };
             let base = (y * WIDTH as usize + x) * 4;
             rows[base] = value;
             rows[base + 1] = value;

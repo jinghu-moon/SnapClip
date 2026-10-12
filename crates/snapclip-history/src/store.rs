@@ -15,8 +15,8 @@ use std::{
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 
-use crate::blob_store::ClipboardBlobStore as BlobStore;
 use crate::StoreError;
+use crate::blob_store::ClipboardBlobStore as BlobStore;
 use snapclip_model::{
     ClipSummary, HistoryPage, OcrErrorCode, OcrStatus, PayloadData, PayloadKind, PayloadRef,
     Publication,
@@ -77,7 +77,6 @@ enum WriterRequest {
         response: mpsc::Sender<Result<bool, StoreError>>,
     },
 }
-
 
 impl Store {
     pub fn open(root: impl AsRef<Path>) -> Result<Self, StoreError> {
@@ -529,7 +528,6 @@ fn writer_loop(connection: Connection, blob_store: BlobStore, receiver: Receiver
     }
 }
 
-
 mod artifact_repository;
 mod clip_repository;
 mod connection;
@@ -559,11 +557,11 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    use rusqlite::Connection;
     use snapclip_model::{
         ImageDimensions, OcrStatus, PayloadData, PayloadKind, PayloadRef, Publication,
         PublicationOrigin,
     };
-    use rusqlite::Connection;
 
     use super::Store;
 
@@ -770,10 +768,16 @@ mod tests {
         let doomed = payload(PayloadKind::Text, b"doomed text", "doomed-text");
         let kept = payload(PayloadKind::Text, b"kept text", "kept-text");
         store
-            .save_publication(publication("doomed", 2, &[doomed]), vec![payload(PayloadKind::Text, b"doomed text", "doomed-text")])
+            .save_publication(
+                publication("doomed", 2, &[doomed]),
+                vec![payload(PayloadKind::Text, b"doomed text", "doomed-text")],
+            )
             .unwrap();
         store
-            .save_publication(publication("kept", 1, &[kept]), vec![payload(PayloadKind::Text, b"kept text", "kept-text")])
+            .save_publication(
+                publication("kept", 1, &[kept]),
+                vec![payload(PayloadKind::Text, b"kept text", "kept-text")],
+            )
             .unwrap();
 
         assert!(store.delete_publication("doomed".into()).unwrap());
@@ -830,9 +834,7 @@ mod tests {
         assert_eq!(page.items.len(), 1);
         let hash = blake3::hash(b"shared image bytes").to_hex().to_string();
         assert_eq!(
-            store
-                .read_payload_bytes(hash, PayloadKind::Image)
-                .unwrap(),
+            store.read_payload_bytes(hash, PayloadKind::Image).unwrap(),
             b"shared image bytes"
         );
     }

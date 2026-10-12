@@ -321,7 +321,12 @@ unsafe fn tray_icon() -> HICON {
         }
     }
     // SAFETY: a stock icon takes no pointers; a null instance means "system stock".
-    unsafe { LoadIconW(std::ptr::null_mut::<std::ffi::c_void>() as HINSTANCE, IDI_APPLICATION) }
+    unsafe {
+        LoadIconW(
+            std::ptr::null_mut::<std::ffi::c_void>() as HINSTANCE,
+            IDI_APPLICATION,
+        )
+    }
 }
 
 fn wide(value: &str) -> Vec<u16> {

@@ -1,0 +1,1212 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>SnapClip 覆盖层 UI Demo · A 精致深色</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
+  body { font-family: "HarmonyOS Sans SC", "Microsoft YaHei UI", "Segoe UI", sans-serif; }
+  canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+  #ov { cursor: crosshair; }
+  #ov.idle { pointer-events: none; }
+  .panel {
+    position: fixed; z-index: 5; border-radius: 10px; color: #e8ecf2; font-size: 12px;
+    background: rgba(18, 20, 24, .92); box-shadow: 0 8px 28px rgba(0, 0, 0, .4);
+  }
+  #bar { top: 8px; left: 50%; transform: translateX(-50%); display: flex; gap: 6px; align-items: center; padding: 6px 8px; }
+  .hidden { display: none !important; }
+  button {
+    font: inherit; color: inherit; background: rgba(255, 255, 255, .08); border: 0;
+    border-radius: 6px; padding: 5px 10px; cursor: pointer;
+  }
+  button:hover { background: rgba(255, 255, 255, .16); }
+  button.on { background: rgb(31, 117, 219); }
+  #bar .sep { width: 1px; height: 18px; background: rgba(255, 255, 255, .14); }
+  #notes { right: 12px; bottom: 52px; width: 400px; max-height: 72vh; overflow: auto; padding: 12px 14px; line-height: 1.6; }
+  #notes h3 { margin: 6px 0 2px; font-size: 13px; color: #fff; }
+  #notes ul { margin: 2px 0 6px; padding-left: 18px; }
+  #notes code { font-family: Consolas, monospace; color: #9cc7ff; }
+  #keys { background: rgb(22, 24, 29); left: 50%; top: 52px; transform: translateX(-50%); width: 560px; max-height: 80vh; overflow: auto; padding: 14px 16px; }
+  #keys h2 { margin: 0 0 4px; font-size: 14px; color: #fff; }
+  #keys .sub { color: #9aa4b2; margin-bottom: 10px; }
+  #keys .grp { margin: 12px 0 4px; color: #9aa4b2; font-size: 11px; letter-spacing: .04em; }
+  #keys .row { display: grid; grid-template-columns: 22px 1fr auto; align-items: center; gap: 8px; padding: 5px 6px; border-radius: 6px; }
+  #keys .row:hover { background: rgba(255, 255, 255, .04); }
+  #keys .chords { display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }
+  #keys .chord { font-family: Consolas, monospace; min-width: 28px; }
+  #keys .chord.fixed { opacity: .55; cursor: default; background: rgba(255, 255, 255, .04); }
+  #keys .chord.rec { background: rgb(27, 177, 95); }
+  #keys .plan { color: #f0b35a; font-size: 11px; margin-left: 6px; }
+  #keys .err { color: #ff7b7b; min-height: 18px; margin-top: 8px; }
+  #keys .foot { display: flex; gap: 8px; justify-content: space-between; margin-top: 8px; }
+  #toast {
+    position: fixed; left: 50%; bottom: 72px; transform: translateX(-50%); z-index: 6;
+    padding: 8px 14px; border-radius: 8px; background: rgba(18, 20, 24, .92); color: #fff;
+    font-size: 13px; opacity: 0; transition: opacity .2s; pointer-events: none;
+  }
+  #toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+<canvas id="bg"></canvas>
+<canvas id="ov" class="idle"></canvas>
+<div id="bar" class="panel">
+  <button id="bF5">F5 截图</button>
+  <button id="bF7">F7 长截图</button>
+  <span class="sep"></span>
+  <button id="bBlur" class="on">遮罩模糊 B</button>
+  <button id="bGuide" class="on">快捷键指南 H</button>
+  <button id="bKeys">快捷键设置 K</button>
+  <button id="bMore">模拟更多快捷键 M</button>
+  <button id="bNotes">说明 N</button>
+</div>
+<div id="keys" class="panel hidden"></div>
+<div id="notes" class="panel hidden"></div>
+<div id="toast"></div>
+<script>
+'use strict';
+// ───────────────────────── 常量：与产品 ring_contrast.rs / d2d.rs / window_host.rs 对齐 ─────────────────────────
+const ACCENT = [31, 117, 219];       // ACCENT_RGB
+const CAPTURE = [27, 177, 95];       // CAPTURE_RGB：层级游走中的预览框
+const RING = [185, 217, 255];        // CHAIN_RING_RGB
+const MASK_ALPHA = 0.45;
+const HOVER_WASH_ALPHA = 0.10;       // 悬停窗口在预览洞外的白色提亮
+const PREVIEW_WASH_ALPHA = 0.18, PREVIEW_WASH_WALK_SCALE = 0.5;
+const CHAIN_RING_SHADOW = 0.80;
+const COLLAPSE_PX = 8;               // 四边都在 8 px 内的层级视为同一层（skip-near / 链环折叠）
+const RING_CAP = 7;
+const CHAIN_RISE_MS = 120, CHAIN_IDLE_MS = 1200, CHAIN_FADE_MS = 240, CHAIN_FADE_STEPS = 8;
+const WALK_RISE_MS = 100;
+const WHEEL_UNIT = 100, WHEEL_COOLDOWN_MS = 80;
+const HINT_MS = 2600;
+const BADGE_W = 54, BADGE_H = 18;    // LEVEL_BADGE_SIZE
+const BLUR_PX = 6;                   // 遮罩模糊半径（DIP）
+// 放大镜：放大区 340×180 物理像素；信息栏的内容按 DIP 排版，快捷键改单行后高 12+18+12+22+12 = 76 DIP
+const LOUPE_W = 340, LOUPE_H = 180, INFO_H_DIP = 76, LOUPE_GAP = 24;
+const ZOOMS = [0.1, 0.25, 0.5, 1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 32, 40];
+const FONT = '"HarmonyOS Sans SC","Microsoft YaHei UI","Segoe UI",sans-serif';
+const LABEL_FONT = '"Segoe UI Variable Display","HarmonyOS Sans SC","Microsoft YaHei UI",sans-serif';
+const MONO = 'Consolas,"Cascadia Mono",monospace';
+
+const dpr = window.devicePixelRatio || 1;
+const rgba = (c, a) => `rgba(${c[0]},${c[1]},${c[2]},${a})`;
+const mix = (a, b, t) => a.map((v, i) => Math.round(v + (b[i] - v) * t));
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const now = () => performance.now();
+const $ = id => document.getElementById(id);
+
+// ───────────────────────── 快捷键注册表（指南、提示、按键分发的唯一来源） ─────────────────────────
+// chord：按键记号数组，如 ['Ctrl','Shift','C']；'Wheel'/'Click'/'Drag' 是鼠标记号。
+// chords：可选的多个组合（任一触发）。fixed：鼠标手势，只能控制显示，不能改键。
+// row：同 row 的动作在指南里合并成一行（如 滚轮 / ↑ / ↓）。ctx：生效场景。planned：规划中。
+const ACTIONS = [
+  { id: 'level.wheel', group: '吸附', row: 'level', label: '选择上层或下层 UI 元素', chords: [['Wheel']], fixed: true, ctx: 'pick' },
+  { id: 'level.up', group: '吸附', row: 'level', label: '上一层（走向窗口）', chords: [['ArrowUp']], ctx: 'pick' },
+  { id: 'level.down', group: '吸附', row: 'level', label: '下一层', chords: [['ArrowDown']], ctx: 'pick' },
+  { id: 'pick.click', group: '吸附', label: '选定当前元素', chords: [['Click']], fixed: true, ctx: 'pick' },
+  { id: 'pick.drag', group: '吸附', label: '自由框选', chords: [['Drag']], fixed: true, ctx: 'pick' },
+  { id: 'mode.cycle', group: '吸附', label: '切换检测窗口或元素', chords: [['Tab']], ctx: 'pick', planned: true },
+  { id: 'mode.free', group: '吸附', label: '切换至自由截图', chords: [['Ctrl', 'Tab']], ctx: 'pick', planned: true },
+  { id: 'loupe.zoom', group: '放大镜', label: '放大镜缩放', chords: [['Z', 'Wheel']], ctx: 'pick' },
+  { id: 'color.format', group: '放大镜', label: '切换色值格式', chords: [['S']], ctx: 'pick' },
+  { id: 'color.copy', group: '放大镜', label: '复制色值', chords: [['C']], ctx: 'pick' },
+  { id: 'coord.mode', group: '放大镜', label: '切换坐标模式', chords: [['P']], ctx: 'pick' },
+  { id: 'cursor.toggle', group: '放大镜', label: '显示或隐藏光标', chords: [['`']], ctx: 'pick', planned: true },
+  { id: 'ocr.copy', group: '输出', label: '检测文本并复制', chords: [['Shift', 'C']], ctx: 'pick', planned: true },
+  { id: 'history.browse', group: '输出', label: '查看截图历史记录', chords: [[','], ['.']], ctx: 'pick', planned: true },
+  { id: 'history.region', group: '输出', label: '使用历史截图区域', chords: [['R'], ['Shift', 'R']], ctx: 'pick', planned: true },
+  { id: 'scroll.start', group: '输出', label: '长截图', chords: [['L']], ctx: 'pick', planned: true },
+  { id: 'pin', group: '输出', label: '贴图', chords: [['Ctrl', 'T']], ctx: 'pick', planned: true },
+  { id: 'confirm', group: '输出', label: m => m === 'F7' ? '开始长截图' : '确认截图', chords: [['Enter']], ctx: 'pick' },
+  { id: 'cancel', group: '输出', label: '退出截图', chords: [['Escape']], ctx: 'pick' },
+  { id: 'scroll.auto', group: '长截图', label: '自动滚动', chords: [['A']], ctx: 'scroll' },
+  { id: 'scroll.finish', group: '长截图', label: '完成长截图', chords: [['F9']], ctx: 'scroll' },
+  { id: 'scroll.cancel', group: '长截图', label: '取消长截图', chords: [['Escape']], ctx: 'scroll' },
+];
+const DEFAULT_VISIBLE = new Set(['level', 'pick.click', 'pick.drag', 'loupe.zoom', 'color.format', 'color.copy', 'coord.mode', 'confirm', 'cancel']);
+const KEY_NAME = { Wheel: '滚轮', Click: '单击', Drag: '拖拽', ArrowUp: '↑', ArrowDown: '↓', ArrowLeft: '←', ArrowRight: '→', Escape: 'Esc', ' ': 'Space' };
+const MODS = ['Ctrl', 'Shift', 'Alt'];
+const keyName = k => KEY_NAME[k] || k;
+const chordStr = ch => ch.map(keyName).join('+');
+const rowKey = a => a.row || a.id;
+const labelText = a => typeof a.label === 'function' ? a.label(S ? S.mode : 'F5') : a.label;
+
+// 用户设置（模拟设置面板的持久化）：{ chords: {id: [[...]]}, visible: {rowKey: bool} }
+let prefs = loadPrefs();
+let showPlanned = false;
+function loadPrefs() {
+  try { const p = JSON.parse(localStorage.getItem('snapclip.keys') || 'null'); if (p && p.chords && p.visible) return p; } catch (e) { }
+  return { chords: {}, visible: {} };
+}
+function savePrefs() { localStorage.setItem('snapclip.keys', JSON.stringify(prefs)); }
+const chordsOf = a => prefs.chords[a.id] || a.chords;
+// 规划中的动作默认显示（打开 M 时才出现），用来看指南扩展后的样子
+const rowVisible = k => k in prefs.visible ? prefs.visible[k] : DEFAULT_VISIBLE.has(k) || ACTIONS.some(a => rowKey(a) === k && a.planned);
+const actionById = id => ACTIONS.find(a => a.id === id);
+const textOf = id => chordsOf(actionById(id)).map(chordStr).join(' / ');
+
+// 指南的行：按 row 合并、按 group 分组、按场景和开关过滤
+function guideGroups(ctx) {
+  const rows = new Map();
+  for (const a of ACTIONS) {
+    if (a.ctx !== ctx || (a.planned && !showPlanned)) continue;
+    const k = rowKey(a);
+    if (!rowVisible(k)) continue;
+    if (!rows.has(k)) rows.set(k, { group: a.group, label: labelText(a), chords: [] });
+    rows.get(k).chords.push(...chordsOf(a));
+  }
+  const groups = [];
+  for (const r of rows.values()) {
+    let g = groups.find(x => x.name === r.group);
+    if (!g) groups.push(g = { name: r.group, rows: [] });
+    g.rows.push(r);
+  }
+  return groups;
+}
+
+// 键盘事件 → 记号（字母数字和标点按物理键取，避免 Shift 改字符）
+function eventChord(e) {
+  const ch = [];
+  if (e.ctrlKey) ch.push('Ctrl');
+  if (e.shiftKey) ch.push('Shift');
+  if (e.altKey) ch.push('Alt');
+  let k = e.key;
+  if (/^Key[A-Z]$/.test(e.code)) k = e.code.slice(3);
+  else if (/^Digit\d$/.test(e.code)) k = e.code.slice(5);
+  else if (e.code === 'Backquote') k = '`';
+  else if (e.code === 'Comma') k = ',';
+  else if (e.code === 'Period') k = '.';
+  if (MODS.includes(k) || k === 'Control') return null;
+  ch.push(k);
+  return ch;
+}
+const sameChord = (a, b) => a.length === b.length && a.every((t, i) => t === b[i]);
+// 当前场景下，某个按键组合命中的动作（带 Wheel 的组合是“按住键 + 滚轮”，不在这里触发）
+function actionFor(ctx, ch) {
+  return ACTIONS.find(a => a.ctx === ctx && !a.fixed && chordsOf(a).some(c => !c.includes('Wheel') && sameChord(c, ch)));
+}
+const zoomHoldKey = () => chordsOf(actionById('loupe.zoom'))[0].find(t => t !== 'Wheel');
+
+// ───────────────────────── 画布 ─────────────────────────
+const bg = $('bg'), ov = $('ov');
+const bgx = bg.getContext('2d', { willReadFrequently: true });
+const ox = ov.getContext('2d');
+let W = 0, H = 0;
+
+// ───────────────────────── 假桌面：元素树（UIA 的替身） ─────────────────────────
+const NOUN = {
+  window: '窗口', container: '容器', pane: '窗格', doc: '文档', text: '文本', image: '图像',
+  button: '按钮', link: '链接', edit: '编辑', item: '列表项', list: '列表', element: '元素',
+};
+const node = (kind, name, x, y, w, h, ch = [], extra = {}) => ({ kind, name, x, y, w, h, ch, ...extra });
+const inside = (n, x, y) => x >= n.x && x < n.x + n.w && y >= n.y && y < n.y + n.h;
+const near = (a, b) => Math.abs(a.x - b.x) < COLLAPSE_PX && Math.abs(a.y - b.y) < COLLAPSE_PX &&
+  Math.abs(a.x + a.w - b.x - b.w) < COLLAPSE_PX && Math.abs(a.y + a.h - b.y - b.h) < COLLAPSE_PX;
+
+let rng = 7;
+const rand = () => ((rng = (rng * 16807) % 2147483647) / 2147483647);
+const SENTENCES = [
+  '截图覆盖层冻结当前屏幕的一帧，所有吸附、放大镜取色都读这同一帧，结果因此可以复现。',
+  '滚轮向上走向窗口，向下回到最深的元素；链环只在游走时浮现，停下一秒后自行淡出。',
+  '长截图按列条带与行签名投票估计位移，重复的行不参与投票，结论有歧义时宁可不动。',
+  'Direct2D 绘制遮罩时只在会话开始做一次高斯模糊，之后每帧只是位图的拷贝与着色。',
+  '预览框是遮罩上的一个洞，静止时是主题蓝，层级游走时抬升为绿色，并带一层半透明提亮。',
+  '标签放在框外左上；放不下就去框外左下，再不行放进框内，最后退到光标旁边。',
+  '剪贴板同时写入 CF_DIBV5 位图与原始 PNG 字节，浏览器和 Office 会优先取 PNG。',
+  '放大镜的信息栏背后是会话缓存的模糊帧，按信息栏所在位置裁一块再叠一层深色。',
+];
+const sentence = () => SENTENCES[Math.floor(rand() * SENTENCES.length)];
+
+let S = null;            // 会话状态
+let scene = null;        // 布局
+let docCv = null;        // 网页长文档（视口内容）位图
+let scroll = 0;          // 网页滚动位置（CSS px）
+let blurCv = null, blurMs = 0;
+let guideOn = true, blurOn = true;
+
+function buildScene() {
+  W = innerWidth; H = innerHeight; rng = 7;
+  const T = 44;
+  const bw = Math.round(Math.max(640, Math.min(W * 0.64, W - 400))), bx = 28, by = 24;
+  const bh = H - T - by - 20;
+  const tabs = [];
+  ['SnapClip 设计稿', '滚动截图 · 文档', 'Direct2D 效果'].forEach((t, i) => {
+    const x = bx + 10 + i * 178;
+    tabs.push(node('item', '标签', x, by + 6, 170, 32, [
+      node('image', '网站图标', x + 12, by + 15, 14, 14),
+      node('text', '标题', x + 34, by + 13, 120, 18, [], { txt: t, font: '12px ' + FONT, color: i ? '#5b6472' : '#1b1f24' }),
+    ], { active: i === 0 }));
+  });
+  const winBtns = ['最小化', '最大化', '关闭'].map((t, i) => node('button', t, bx + bw - 138 + i * 46, by, 46, 36, [], { glyph: ['—', '☐', '✕'][i] }));
+  const tabStrip = node('container', '标签栏', bx, by, bw, 38, [...tabs, ...winBtns]);
+  const navBtns = ['←', '→', '⟳'].map((g, i) => node('button', ['后退', '前进', '刷新'][i], bx + 8 + i * 36, by + 44, 32, 32, [], { glyph: g }));
+  const addr = node('edit', '地址栏', bx + 124, by + 44, bw - 180, 32, [
+    node('image', '安全', bx + 136, by + 53, 14, 14),
+    node('text', '网址', bx + 158, by + 51, Math.min(420, bw - 240), 18, [], { txt: 'snapclip.dev/docs/overlay-ui', font: '13px ' + FONT, color: '#2b313a' }),
+  ]);
+  const menu = node('button', '菜单', bx + bw - 44, by + 44, 32, 32, [], { glyph: '⋯' });
+  const toolbar = node('container', '工具栏', bx, by + 38, bw, 44, [...navBtns, addr, menu]);
+  const cy = by + 82, ch = bh - 82;
+  const navItems = [];
+  ['概览', '截图覆盖层', '吸附与层级', '放大镜', '长截图', '标注', '历史记录', '剪贴板', '设置', '快捷键', '性能', '更新日志']
+    .forEach((t, i) => {
+      if (cy + 16 + i * 36 + 30 > cy + ch - 8) return;
+      navItems.push(node('link', '导航项', bx + 12, cy + 16 + i * 36, 176, 30, [
+        node('text', '文本', bx + 26, cy + 22 + i * 36, 120, 18, [], { txt: t, font: '13px ' + FONT, color: i === 2 ? '#1f75db' : '#3b4350' }),
+      ], { active: i === 2 }));
+    });
+  const sidebar = node('container', '侧边导航', bx, cy, 200, ch, navItems);
+  const viewport = node('doc', '网页文档', bx + 200, cy, bw - 200, ch, [], { isViewport: true });
+  const content = node('pane', '网页内容', bx, cy, bw, ch, [sidebar, viewport]);
+  const browser = node('window', '浏览器', bx, by, bw, bh, [tabStrip, toolbar, content]);
+
+  const nx = bx + bw + 24, nw = W - nx - 24, ny = 60, nh = Math.min(360, (H - T) * 0.48);
+  const notesKids = [node('container', '标题栏', nx, ny, nw, 36, [
+    node('text', '标题', nx + 14, ny + 9, 80, 18, [], { txt: '便笺', font: '600 13px ' + FONT, color: '#e8ecf2' }),
+  ])];
+  const items = [];
+  for (let i = 0; i < 5; i++) {
+    const iy = ny + 44 + i * 60;
+    if (iy + 52 > ny + nh - 8) break;
+    items.push(node('item', '便笺', nx + 10, iy, nw - 20, 52, [
+      node('text', '标题', nx + 22, iy + 8, nw - 60, 18, [], { txt: ['周报要点', '放大镜信息栏改单行', '链环淡出 1.2 s', 'F9 输出三处', '字体子集重建'][i], font: '600 13px ' + FONT, color: '#f1f4f8' }),
+      node('text', '摘要', nx + 22, iy + 29, nw - 60, 16, [], { txt: sentence(), font: '12px ' + FONT, color: '#9aa4b2' }),
+    ]));
+  }
+  notesKids.push(node('list', '便笺列表', nx + 6, ny + 40, nw - 12, nh - 46, items));
+  const notes = node('window', '便笺', nx, ny, nw, nh, notesKids);
+
+  const sy = ny + nh + 20, sh = H - T - sy - 20;
+  const rows = [];
+  ['开机启动', '截图时冻结屏幕', '显示放大镜', '显示快捷键指南', '遮罩模糊'].forEach((t, i) => {
+    const ry = sy + 52 + i * 44;
+    if (ry + 38 > sy + sh - 8) return;
+    rows.push(node('container', '设置项', nx + 12, ry, nw - 24, 38, [
+      node('text', '文本', nx + 26, ry + 10, nw - 120, 18, [], { txt: t, font: '13px ' + FONT, color: '#2b313a' }),
+      node('button', '开关', nx + nw - 72, ry + 9, 40, 20, [], { toggle: i !== 0 }),
+    ]));
+  });
+  const settings = node('window', '设置', nx, sy, nw, sh, [
+    node('text', '标题', nx + 16, sy + 14, 120, 22, [], { txt: '设置', font: '600 16px ' + FONT, color: '#1b1f24' }),
+    node('container', '设置组', nx + 8, sy + 46, nw - 16, Math.max(0, sh - 54), rows),
+  ]);
+
+  const tb = [];
+  for (let i = 0; i < 7; i++) tb.push(node('button', i ? '任务栏按钮' : '开始', W / 2 - 154 + i * 44, H - T + 4, 40, 36, [], { icon: i }));
+  const taskbar = node('window', '任务栏', 0, H - T, W, T, tb);
+
+  const desktop = node('window', '桌面', 0, 0, W, H, [], {});
+  scene = { browser, notes, settings, taskbar, desktop, viewport, windows: [browser, notes, settings, taskbar] };
+  buildDoc(viewport.w);
+  scroll = 0;
+}
+
+// 网页文档：在文档坐标（相对视口左上、未滚动）里建树，并画成一张长图
+function buildDoc(vw) {
+  const aw = Math.min(680, vw - 80), ax = Math.round((vw - aw) / 2);
+  const kids = [];
+  let y = 28;
+  kids.push(node('image', '题图', ax, y, aw, 200, [], { hue: 212 })); y += 220;
+  kids.push(node('text', '标题', ax, y, aw, 36, [], { txt: '覆盖层 UI：吸附、预览与放大镜', font: '600 26px ' + FONT, color: '#111' })); y += 56;
+  const titles = ['吸附链', '预览框', '链环', '层级徽章', '标签', '遮罩', '放大镜', '信息栏', '长截图', '拼接', '剪贴板', '历史', '快捷键', '性能'];
+  for (let s = 0; s < titles.length; s++) {
+    const sec = node('container', '章节', ax, y, aw, 0, []);
+    let sy = y;
+    sec.ch.push(node('text', '小标题', ax, sy, Math.min(aw, 360), 26, [], { txt: `${s + 1}. ${titles[s]}`, font: '600 18px ' + FONT, color: '#1b1f24' }));
+    sy += 40;
+    const para = n => {
+      const p = node('container', '段落', ax, sy, aw, n * 26 - 6, []);
+      for (let i = 0; i < n; i++) p.ch.push(node('text', '文本', ax, sy + i * 26, i === n - 1 ? Math.round(aw * (0.4 + rand() * 0.4)) : aw, 20, [], { txt: sentence() + sentence(), font: '14px ' + FONT, color: '#3b4350' }));
+      sec.ch.push(p); sy += n * 26 + 14;
+    };
+    para(3 + Math.floor(rand() * 3));
+    const v = s % 4;
+    if (v === 0) { sec.ch.push(node('image', '插图', ax, sy, aw, 190, [], { hue: Math.floor(rand() * 360) })); sy += 206; }
+    if (v === 1) {
+      const lines = ['let chain = hit_test(cursor);', 'let level = chain.deepest();', 'if wheel.up() { level = level.parent_skipping_near(8); }', 'preview.set(level.rect, Walking);', 'rings.show(anchors(level), fade_after_ms(1200));'];
+      const code = node('container', '代码块', ax, sy, aw, lines.length * 20 + 24, []);
+      lines.forEach((l, i) => code.ch.push(node('text', '代码', ax + 16, sy + 12 + i * 20, Math.min(aw - 32, 9 + l.length * 7.7), 18, [], { txt: l, font: '13px ' + MONO, color: '#24292f' })));
+      sec.ch.push(code); sy += lines.length * 20 + 40;
+    }
+    if (v === 2) {
+      const row = node('container', '卡片组', ax, sy, aw, 156, []);
+      const cw = (aw - 24) / 3;
+      for (let i = 0; i < 3; i++) {
+        const cx = ax + i * (cw + 12);
+        row.ch.push(node('container', '卡片', cx, sy, cw, 156, [
+          node('image', '缩略图', cx + 10, sy + 10, cw - 20, 80, [], { hue: Math.floor(rand() * 360) }),
+          node('text', '卡片标题', cx + 10, sy + 100, cw - 20, 18, [], { txt: ['冻结帧', '吸附链', '链环'][i], font: '600 13px ' + FONT, color: '#1b1f24' }),
+          node('button', '按钮', cx + 10, sy + 124, 64, 22, [], { label: '了解' }),
+        ]));
+      }
+      sec.ch.push(row); sy += 172;
+    }
+    if (v === 3) {
+      const list = node('list', '列表', ax, sy, aw, 4 * 30, []);
+      for (let i = 0; i < 4; i++) list.ch.push(node('item', '列表项', ax, sy + i * 30, aw, 28, [
+        node('link', '链接', ax + 22, sy + i * 30 + 5, 220 + Math.floor(rand() * 200), 18, [], { txt: sentence().slice(0, 24), font: '14px ' + FONT, color: '#1f75db' }),
+      ]));
+      sec.ch.push(list); sy += 136;
+    }
+    para(2 + Math.floor(rand() * 2));
+    sec.h = sy - y;
+    kids.push(sec);
+    y = sy + 30;
+  }
+  const docH = y + 40;
+  const article = node('container', '正文', ax, 0, aw, docH, kids);
+  scene.doc = { root: article, w: vw, h: docH };
+  docCv = document.createElement('canvas');
+  docCv.width = Math.round(vw * dpr); docCv.height = Math.round(docH * dpr);
+  const c = docCv.getContext('2d');
+  c.scale(dpr, dpr);
+  c.fillStyle = '#fff'; c.fillRect(0, 0, vw, docH);
+  paintNode(c, article);
+}
+
+// ───────────────────────── 绘制假桌面 ─────────────────────────
+function rr(c, x, y, w, h, r) { c.beginPath(); c.roundRect(x, y, w, h, r); }
+
+function paintNode(c, n) {
+  switch (n.kind) {
+    case 'image': {
+      const g = c.createLinearGradient(n.x, n.y, n.x + n.w, n.y + n.h);
+      const h = n.hue ?? 210;
+      g.addColorStop(0, `hsl(${h},55%,72%)`); g.addColorStop(1, `hsl(${(h + 40) % 360},60%,48%)`);
+      c.save(); rr(c, n.x, n.y, n.w, n.h, Math.min(8, n.h / 4)); c.fillStyle = g; c.fill(); c.clip();
+      if (n.h > 40) {
+        c.fillStyle = 'rgba(255,255,255,.28)';
+        c.beginPath(); c.moveTo(n.x, n.y + n.h); c.lineTo(n.x + n.w * .35, n.y + n.h * .45); c.lineTo(n.x + n.w * .6, n.y + n.h * .8);
+        c.lineTo(n.x + n.w * .78, n.y + n.h * .55); c.lineTo(n.x + n.w, n.y + n.h); c.fill();
+        c.beginPath(); c.arc(n.x + n.w * .8, n.y + n.h * .28, Math.min(n.w, n.h) * .1, 0, 7); c.fillStyle = 'rgba(255,255,255,.55)'; c.fill();
+      }
+      c.restore();
+      break;
+    }
+    case 'text': case 'link':
+      if (n.kind === 'link' && n.active) { rr(c, n.x, n.y, n.w, n.h, 6); c.fillStyle = rgba(ACCENT, .1); c.fill(); }
+      if (n.txt) {
+        c.save(); c.beginPath(); c.rect(n.x, n.y - 2, n.w, n.h + 4); c.clip();
+        c.font = n.font; c.fillStyle = n.color; c.textBaseline = 'middle'; c.fillText(n.txt, n.x, n.y + n.h / 2);
+        c.restore();
+      }
+      break;
+    case 'button':
+      if (n.toggle !== undefined) {
+        rr(c, n.x, n.y, n.w, n.h, n.h / 2); c.fillStyle = n.toggle ? rgba(ACCENT, 1) : '#c9cfd8'; c.fill();
+        c.beginPath(); c.arc(n.toggle ? n.x + n.w - n.h / 2 : n.x + n.h / 2, n.y + n.h / 2, n.h / 2 - 3, 0, 7); c.fillStyle = '#fff'; c.fill();
+      } else if (n.label) {
+        rr(c, n.x, n.y, n.w, n.h, 6); c.fillStyle = rgba(ACCENT, 1); c.fill();
+        c.font = '12px ' + FONT; c.fillStyle = '#fff'; c.textAlign = 'center'; c.textBaseline = 'middle';
+        c.fillText(n.label, n.x + n.w / 2, n.y + n.h / 2); c.textAlign = 'left';
+      } else if (n.icon !== undefined) {
+        rr(c, n.x + 8, n.y + 6, n.w - 16, n.h - 12, 5);
+        c.fillStyle = n.icon ? `hsl(${n.icon * 47 + 180},55%,58%)` : rgba(ACCENT, 1); c.fill();
+      } else if (n.glyph) {
+        c.font = '14px ' + FONT; c.fillStyle = '#4a5260'; c.textAlign = 'center'; c.textBaseline = 'middle';
+        c.fillText(n.glyph, n.x + n.w / 2, n.y + n.h / 2); c.textAlign = 'left';
+      }
+      break;
+    case 'edit':
+      rr(c, n.x, n.y, n.w, n.h, n.h / 2); c.fillStyle = '#eef1f5'; c.fill();
+      break;
+    case 'item':
+      if (n.name === '标签') { rr(c, n.x, n.y, n.w, n.h + 6, 8); c.fillStyle = n.active ? '#fff' : 'rgba(0,0,0,0)'; c.fill(); }
+      else if (n.name === '便笺') { rr(c, n.x, n.y, n.w, n.h, 8); c.fillStyle = 'rgba(255,255,255,.05)'; c.fill(); }
+      else { c.beginPath(); c.arc(n.x + 8, n.y + n.h / 2, 3, 0, 7); c.fillStyle = '#9aa4b2'; c.fill(); }
+      break;
+    case 'container':
+      if (n.name === '代码块') { rr(c, n.x, n.y, n.w, n.h, 8); c.fillStyle = '#f4f6f9'; c.fill(); }
+      if (n.name === '卡片') { rr(c, n.x + .5, n.y + .5, n.w - 1, n.h - 1, 10); c.fillStyle = '#fafbfc'; c.fill(); c.strokeStyle = '#e4e8ee'; c.stroke(); }
+      if (n.name === '标签栏') { c.fillStyle = '#dfe4eb'; c.fillRect(n.x, n.y, n.w, n.h); }
+      if (n.name === '工具栏') { c.fillStyle = '#fff'; c.fillRect(n.x, n.y, n.w, n.h); c.fillStyle = '#e4e8ee'; c.fillRect(n.x, n.y + n.h - 1, n.w, 1); }
+      if (n.name === '侧边导航') { c.fillStyle = '#f6f7f9'; c.fillRect(n.x, n.y, n.w, n.h); c.fillStyle = '#e4e8ee'; c.fillRect(n.x + n.w - 1, n.y, 1, n.h); }
+      if (n.name === '设置项') { rr(c, n.x, n.y, n.w, n.h, 8); c.fillStyle = '#f5f7fa'; c.fill(); }
+      break;
+  }
+  if (n.isViewport) return;
+  for (const k of n.ch) paintNode(c, k);
+}
+
+function paintWindow(c, n, fill) {
+  c.save(); c.shadowColor = 'rgba(0,0,0,.35)'; c.shadowBlur = 28; c.shadowOffsetY = 8;
+  rr(c, n.x, n.y, n.w, n.h, 8); c.fillStyle = fill; c.fill(); c.restore();
+  c.save(); rr(c, n.x, n.y, n.w, n.h, 8); c.clip(); paintNode(c, n);
+}
+
+function paintScene() {
+  bg.width = Math.round(W * dpr); bg.height = Math.round(H * dpr);
+  const c = bgx;
+  c.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const g = c.createLinearGradient(0, 0, W, H);
+  g.addColorStop(0, '#203a5c'); g.addColorStop(.55, '#4d5f86'); g.addColorStop(1, '#a1739b');
+  c.fillStyle = g; c.fillRect(0, 0, W, H);
+  const { browser, notes, settings, taskbar, viewport } = scene;
+  paintWindow(c, browser, '#fff');
+  c.drawImage(docCv, 0, Math.round(scroll * dpr), docCv.width, Math.round(viewport.h * dpr), viewport.x, viewport.y, viewport.w, viewport.h);
+  c.restore();
+  paintWindow(c, notes, '#23262c'); c.restore();
+  paintWindow(c, settings, '#fff'); c.restore();
+  c.fillStyle = 'rgba(28,32,40,.92)'; c.fillRect(taskbar.x, taskbar.y, taskbar.w, taskbar.h);
+  paintNode(c, taskbar);
+  c.font = '12px ' + FONT; c.fillStyle = '#e8ecf2'; c.textAlign = 'right'; c.textBaseline = 'middle';
+  c.fillText('14:32', W - 18, H - 22); c.textAlign = 'left';
+}
+
+// ───────────────────────── 命中测试：吸附链 ─────────────────────────
+function docKids(n) {
+  // 文档节点：映射到屏幕坐标（随滚动），裁到视口
+  const vp = scene.viewport;
+  return n.ch.map(k => {
+    const x = vp.x + k.x, y = vp.y + k.y - scroll;
+    const l = Math.max(x, vp.x), t = Math.max(y, vp.y), r = Math.min(x + k.w, vp.x + vp.w), b = Math.min(y + k.h, vp.y + vp.h);
+    if (r <= l || b <= t) return null;
+    return { ...k, x: l, y: t, w: r - l, h: b - t, src: k };
+  }).filter(Boolean);
+}
+
+function chainAt(x, y) {
+  const win = scene.windows.find(n => inside(n, x, y)) || scene.desktop;
+  const raw = [win];
+  let cur = win;
+  for (;;) {
+    const kids = cur.isViewport ? docKids({ ch: [scene.doc.root] }) : cur.src ? docKids(cur.src) : cur.ch;
+    const k = kids.find(n => inside(n, x, y));
+    if (!k) break;
+    raw.push(k); cur = k;
+  }
+  // skip-near：四边都在 8 px 内的相邻层级合并（保留外层；最深的答案始终保留）
+  const out = [raw[0]];
+  for (let i = 1; i < raw.length; i++) {
+    const last = out[out.length - 1];
+    if (near(raw[i], last)) { if (i === raw.length - 1 && out.length > 1) out[out.length - 1] = raw[i]; continue; }
+    out.push(raw[i]);
+  }
+  return out;
+}
+const labelOf = n => n.kind === 'window' ? '窗口' : (NOUN[n.kind] || '元素');
+const same = (a, b) => a && b && a.x === b.x && a.y === b.y && a.w === b.w && a.h === b.h;
+
+// ───────────────────────── 会话 ─────────────────────────
+function levelKeysText() {
+  return ['level.wheel', 'level.up', 'level.down'].map(textOf).join(' / ');
+}
+function startSession(mode) {
+  if (S) return;
+  S = {
+    mode, phase: 'pick', cx: lastMouse.x, cy: lastMouse.y,
+    chain: [], level: 0, deep: null,
+    walkStart: 0, lastWalk: 0, walkedOnce: false, wheelAcc: 0, lastStep: 0,
+    hint: { text: `${levelKeysText()} 换吸附层级`, t0: now() },
+    zoom: 20, zHeld: false, fmt: 0, rel: false,
+    sel: null, drag: null, grab: null, down: null,
+    guideA: 0, lastFrame: 0, scrollState: null,
+  };
+  // 冻结帧 → 一次性模糊并缓存：遮罩、放大镜信息栏、快捷键指南都只读这张位图
+  const t = now();
+  blurCv = document.createElement('canvas');
+  blurCv.width = bg.width; blurCv.height = bg.height;
+  const b = blurCv.getContext('2d', { willReadFrequently: true });
+  b.filter = `blur(${BLUR_PX * dpr}px)`;
+  b.drawImage(bg, 0, 0);
+  b.getImageData(0, 0, 1, 1);           // 逼浏览器真正完成模糊后再计时
+  blurMs = now() - t;
+  ov.classList.remove('idle');
+  $('bar').classList.add('hidden');
+  $('keys').classList.add('hidden');
+  updateHover();
+  renderNotes();
+}
+
+function endSession(msg) {
+  S = null;
+  ov.classList.add('idle');
+  $('bar').classList.remove('hidden');
+  ox.setTransform(1, 0, 0, 1, 0, 0); ox.clearRect(0, 0, ov.width, ov.height);
+  syncBar();
+  if (msg) toast(msg);
+}
+
+function updateHover() {
+  if (!S || S.phase !== 'pick') return;
+  const c = chainAt(S.cx, S.cy);
+  const deep = c[c.length - 1];
+  if (!same(deep, S.deep)) { S.level = c.length - 1; S.deep = deep; }
+  S.chain = c;
+  S.level = clamp(S.level, 0, c.length - 1);
+}
+
+function walk(dir) {
+  if (!S || S.phase !== 'pick' || !S.chain.length) return;
+  const to = S.level + dir;
+  const t = now();
+  if (to < 0 || to >= S.chain.length) { if (chainVis(t) > 0) S.lastWalk = t; return; }
+  if (chainVis(t) === 0) S.walkStart = t;
+  S.level = to; S.lastWalk = t;
+  if (!S.walkedOnce) {
+    S.walkedOnce = true;
+    S.hint = { text: () => `↑${S.level} ↓${S.chain.length - 1 - S.level} · ↑ = 窗口 · ${levelKeysText()} 切换`, t0: t };
+  }
+}
+
+// 链环可见度：120 ms 升起；停止游走 1.2 s 后在 240 ms 内分 8 级淡出
+function chainVis(t) {
+  if (!S || !S.lastWalk) return 0;
+  const rise = Math.min(1, (t - S.walkStart) / CHAIN_RISE_MS);
+  const idle = t - S.lastWalk - CHAIN_IDLE_MS;
+  if (idle <= 0) return rise;
+  const f = idle / CHAIN_FADE_MS;
+  if (f >= 1) return 0;
+  return rise * (1 - Math.floor(f * CHAIN_FADE_STEPS) / CHAIN_FADE_STEPS);
+}
+
+// ───────────────────────── 覆盖层绘制 ─────────────────────────
+function frame() {
+  requestAnimationFrame(frame);
+  if (!S) return;
+  if (ov.width !== Math.round(W * dpr) || ov.height !== Math.round(H * dpr)) {
+    ov.width = Math.round(W * dpr); ov.height = Math.round(H * dpr);
+  }
+  const t = now();
+  const c = ox;
+  c.setTransform(1, 0, 0, 1, 0, 0); c.clearRect(0, 0, ov.width, ov.height);
+  c.setTransform(dpr, 0, 0, dpr, 0, 0);
+  if (S.phase === 'scrolling') { drawScrolling(c, t); return; }
+
+  const preview = S.phase === 'pick' ? S.chain[S.level] : null;
+  const hole = S.phase === 'pick' ? preview : S.phase === 'drag' ? normRect(S.drag) : S.sel;
+  drawMask(c, hole);
+  if (S.phase === 'pick' && preview) drawPick(c, t, preview);
+  if (S.phase === 'drag' && hole) { drawFrame(c, hole); drawSizeLabel(c, hole); }
+  if (S.phase === 'sel') { drawFrame(c, S.sel); drawHandles(c, S.sel); drawSizeLabel(c, S.sel); drawToolbarSlot(c, S.sel); }
+  drawHint(c, t);
+  if (S.phase !== 'sel' || S.grab) drawLoupe();
+  c.setTransform(dpr, 0, 0, dpr, 0, 0);
+  drawGuide(c, t);
+}
+
+function drawMask(c, hole) {
+  c.save();
+  c.beginPath(); c.rect(0, 0, W, H);
+  if (hole && hole.w > 0 && hole.h > 0) c.rect(hole.x, hole.y, hole.w, hole.h);
+  c.clip('evenodd');
+  if (blurOn) c.drawImage(blurCv, 0, 0, W, H);     // 位图拷贝：模糊在会话开始时已做过一次
+  c.fillStyle = `rgba(0,0,0,${MASK_ALPHA})`; c.fillRect(0, 0, W, H);
+  c.restore();
+}
+
+function strokeRect(c, r, color, width) {
+  c.strokeStyle = color; c.lineWidth = width;
+  c.strokeRect(r.x + width / 2, r.y + width / 2, r.w - width, r.h - width);
+}
+
+function drawPick(c, t, preview) {
+  const vis = chainVis(t);
+  const walkT = vis > 0 ? Math.min(1, (t - S.walkStart) / WALK_RISE_MS) * vis : 0;
+  const win = S.chain[0];
+
+  // 链环：锚点（窗口、相邻两层、最深答案）优先；与预览框或已画链环差 < 8 px 的折叠；最多 7 个
+  const rings = [];
+  if (vis > 0) {
+    const L = S.level, n = S.chain.length;
+    const anchors = new Set([0, L - 1, L + 1, n - 1].filter(i => i >= 0 && i < n && i !== L));
+    const rest = [...Array(n).keys()].filter(i => i !== L && !anchors.has(i)).sort((a, b) => Math.abs(a - L) - Math.abs(b - L));
+    for (const i of [...anchors, ...rest]) {
+      if (rings.length >= RING_CAP) break;
+      const r = S.chain[i];
+      if (near(r, preview) || rings.some(o => near(o.r, r))) continue;
+      rings.push({ r, a: anchors.has(i) ? 0.95 : 0.5, outer: i < L });
+    }
+  }
+  const drawRing = ({ r, a }) => {
+    const al = a * vis;
+    c.strokeStyle = `rgba(0,0,0,${CHAIN_RING_SHADOW * al})`; c.lineWidth = 3;
+    c.strokeRect(r.x + .5, r.y + .5, r.w - 1, r.h - 1);
+    c.strokeStyle = rgba(RING, al); c.lineWidth = 1;
+    c.strokeRect(r.x + .5, r.y + .5, r.w - 1, r.h - 1);
+  };
+  rings.filter(r => r.outer).forEach(drawRing);           // 外层链环画在提亮之前
+
+  // 悬停窗口：洞外白色 10% 提亮 + 1.5 主题色边框
+  if (win && !same(win, preview) && win !== scene.desktop) {
+    c.save(); c.beginPath(); c.rect(win.x, win.y, win.w, win.h); c.rect(preview.x, preview.y, preview.w, preview.h); c.clip('evenodd');
+    c.fillStyle = `rgba(255,255,255,${HOVER_WASH_ALPHA})`; c.fillRect(win.x, win.y, win.w, win.h); c.restore();
+    strokeRect(c, win, rgba(ACCENT, 1), 1.5);
+  }
+  // 预览框：静止为主题蓝；游走时抬升为绿色，并带半强度提亮
+  if (walkT > 0) { c.fillStyle = `rgba(255,255,255,${PREVIEW_WASH_ALPHA * PREVIEW_WASH_WALK_SCALE * walkT})`; c.fillRect(preview.x, preview.y, preview.w, preview.h); }
+  rings.filter(r => !r.outer).forEach(drawRing);          // 内层链环画在提亮之后
+  strokeRect(c, preview, rgba(mix(ACCENT, CAPTURE, walkT), 1), 3);
+
+  // 标签 "W×H px  种类"：框外左上 → 框外左下 → 框内左上 → 光标
+  const lab = pill(c, `${Math.round(preview.w * dpr)}×${Math.round(preview.h * dpr)} px  ${labelOf(preview)}`);
+  const lp = place([[preview.x, preview.y - 6 - lab.h], [preview.x, preview.y + preview.h + 6],
+    preview.w > lab.w + 12 && preview.h > lab.h + 12 ? [preview.x + 6, preview.y + 6] : null,
+    [S.cx + 16, S.cy + 20]], lab.w, lab.h);
+  drawPill(c, lab, lp[0], lp[1]);
+
+  // 层级徽章：只在离开最深答案后出现；框内右上 → 框外右上 → 框外右下 → 光标
+  if (S.level !== S.chain.length - 1) {
+    const fits = preview.w >= BADGE_W + 12 && preview.h >= BADGE_H + 12;
+    const bp = place([fits ? [preview.x + preview.w - 6 - BADGE_W, preview.y + 6] : null,
+      [preview.x + preview.w - BADGE_W, preview.y - 6 - BADGE_H],
+      [preview.x + preview.w - BADGE_W, preview.y + preview.h + 6],
+      [S.cx + 16, S.cy - 30]], BADGE_W, BADGE_H, [lp[0], lp[1], lab.w, lab.h]);
+    drawBadge(c, bp[0], bp[1], S.level, S.chain.length - 1 - S.level);
+  }
+}
+
+function pill(c, text, font = '12px ' + LABEL_FONT) {
+  c.font = font;
+  return { text, font, w: Math.ceil(c.measureText(text).width) + 16, h: 22 };
+}
+function drawPill(c, p, x, y, alpha = 1) {
+  c.globalAlpha = alpha;
+  rr(c, x, y, p.w, p.h, 6); c.fillStyle = 'rgba(18,20,24,.86)'; c.fill();
+  c.font = p.font; c.fillStyle = '#fff'; c.textBaseline = 'middle'; c.fillText(p.text, x + 8, y + p.h / 2 + .5);
+  c.globalAlpha = 1;
+}
+// 依次尝试候选位置，取第一个完全落在屏幕内且不压住 avoid 的
+function place(cands, w, h, avoid) {
+  const ok = ([x, y]) => x >= 2 && y >= 2 && x + w <= W - 2 && y + h <= H - 2 &&
+    !(avoid && x < avoid[0] + avoid[2] && x + w > avoid[0] && y < avoid[1] + avoid[3] && y + h > avoid[1]);
+  const list = cands.filter(Boolean);
+  const hit = list.find(ok);
+  if (hit) return hit;
+  const [x, y] = list[list.length - 1];
+  return [clamp(x, 2, W - w - 2), clamp(y, 2, H - h - 2)];
+}
+
+function drawBadge(c, x, y, up, down) {
+  rr(c, x, y, BADGE_W, BADGE_H, 4); c.fillStyle = 'rgba(18,20,24,.86)'; c.fill();
+  c.fillStyle = 'rgba(255,255,255,.13)'; c.fillRect(x + BADGE_W / 2 - .5, y + 4, 1, BADGE_H - 8);
+  c.font = '600 11px ' + MONO; c.textBaseline = 'middle'; c.textAlign = 'center';
+  c.fillStyle = up > 0 ? rgba(CAPTURE, 1) : 'rgba(200,208,219,.28)'; c.fillText(`↑${up}`, x + BADGE_W / 4, y + BADGE_H / 2 + .5);
+  c.fillStyle = down > 0 ? rgba(CAPTURE, 1) : 'rgba(200,208,219,.28)'; c.fillText(`↓${down}`, x + BADGE_W * 3 / 4, y + BADGE_H / 2 + .5);
+  c.textAlign = 'left';
+}
+
+function drawHint(c, t) {
+  if (!S.hint || S.phase !== 'pick') return;
+  const age = t - S.hint.t0;
+  if (age > HINT_MS) { S.hint = null; return; }
+  const a = age > HINT_MS - 300 ? (HINT_MS - age) / 300 : 1;
+  const text = typeof S.hint.text === 'function' ? S.hint.text() : S.hint.text;
+  const p = pill(c, text);
+  const [x, y] = place([[S.cx + 18, S.cy + 22], [S.cx - 18 - p.w, S.cy + 22], [S.cx + 18, S.cy - 22 - p.h]], p.w, p.h);
+  drawPill(c, p, x, y, a);
+}
+
+function drawFrame(c, r) { strokeRect(c, r, rgba(ACCENT, 1), 1.5); }
+function drawSizeLabel(c, r) {
+  const p = pill(c, `${Math.round(r.w * dpr)} × ${Math.round(r.h * dpr)}`);
+  const [x, y] = place([[r.x, r.y - 6 - p.h], [r.x, r.y + r.h + 6], [r.x + 6, r.y + 6]], p.w, p.h);
+  drawPill(c, p, x, y);
+}
+function handlePoints(r) {
+  const xs = [r.x, r.x + r.w / 2, r.x + r.w], ys = [r.y, r.y + r.h / 2, r.y + r.h];
+  const pts = [];
+  for (let j = 0; j < 3; j++) for (let i = 0; i < 3; i++) if (i !== 1 || j !== 1) pts.push({ x: xs[i], y: ys[j], i, j });
+  return pts;
+}
+function drawHandles(c, r) {
+  for (const p of handlePoints(r)) {
+    c.beginPath(); c.arc(p.x, p.y, 6, 0, 7);
+    c.fillStyle = '#fff'; c.fill(); c.strokeStyle = rgba(ACCENT, 1); c.lineWidth = 1.5; c.stroke();
+  }
+}
+function drawToolbarSlot(c, r) {
+  const text = `工具栏（GPUI，占位）· ${textOf('confirm')} ${labelText(actionById('confirm'))} · ${textOf('cancel')} 退出`;
+  c.font = '12px ' + FONT;
+  const w = c.measureText(text).width + 24, h = 36;
+  const [x, y] = place([[r.x + r.w - w, r.y + r.h + 10], [r.x + r.w - w, r.y - 10 - h], [r.x + r.w - w - 8, r.y + r.h - h - 8]], w, h);
+  c.save(); c.setLineDash([4, 4]); c.strokeStyle = 'rgba(255,255,255,.35)'; c.lineWidth = 1;
+  c.strokeRect(x + .5, y + .5, w - 1, h - 1); c.restore();
+  c.fillStyle = 'rgba(255,255,255,.6)'; c.textBaseline = 'middle';
+  c.fillText(text, x + 12, y + h / 2);
+}
+
+// ───────────────────────── 放大镜（物理像素坐标绘制） ─────────────────────────
+function colorText(r, g, b) {
+  if (S.fmt === 0) return '#' + [r, g, b].map(v => v.toString(16).padStart(2, '0')).join('').toUpperCase();
+  if (S.fmt === 1) return `rgb(${r}, ${g}, ${b})`;
+  const R = r / 255, G = g / 255, B = b / 255, mx = Math.max(R, G, B), mn = Math.min(R, G, B), l = (mx + mn) / 2;
+  let h = 0, s = 0;
+  if (mx !== mn) {
+    const d = mx - mn; s = l > .5 ? d / (2 - mx - mn) : d / (mx + mn);
+    h = mx === R ? (G - B) / d + (G < B ? 6 : 0) : mx === G ? (B - R) / d + 2 : (R - G) / d + 4; h *= 60;
+  }
+  return `hsl(${Math.round(h)}, ${Math.round(s * 100)}%, ${Math.round(l * 100)}%)`;
+}
+
+function drawLoupe() {
+  const c = ox, k = dpr;                 // k：DIP → 物理像素
+  c.setTransform(1, 0, 0, 1, 0, 0);
+  const px = Math.round(S.cx * k), py = Math.round(S.cy * k);
+  const INFO_H = Math.round(INFO_H_DIP * k);
+  const total = LOUPE_H + INFO_H;
+  let x = px + LOUPE_GAP, y = py + LOUPE_GAP;
+  if (x + LOUPE_W > ov.width) x = px - LOUPE_GAP - LOUPE_W;
+  if (y + total > ov.height) y = py - LOUPE_GAP - total;
+  const [r, g, b] = bgx.getImageData(clamp(px, 0, bg.width - 1), clamp(py, 0, bg.height - 1), 1, 1).data;
+
+  c.save();
+  c.shadowColor = 'rgba(0,0,0,.45)'; c.shadowBlur = 18 * k; c.shadowOffsetY = 6 * k;
+  rr(c, x, y, LOUPE_W, total, 8 * k); c.fillStyle = 'rgb(20,20,20)'; c.fill();
+  c.restore();
+  c.save(); rr(c, x, y, LOUPE_W, total, 8 * k); c.clip();
+
+  // 放大区域：光标像素恒在中心格
+  const z = S.zoom, sw = LOUPE_W / z, sh = LOUPE_H / z;
+  const cellX = Math.floor(sw / 2), cellY = Math.floor(sh / 2);
+  c.imageSmoothingEnabled = z < 1;
+  c.save(); c.beginPath(); c.rect(x, y, LOUPE_W, LOUPE_H); c.clip();
+  c.drawImage(bg, px - cellX, py - cellY, sw, sh, x, y, LOUPE_W, LOUPE_H);
+  const cs = Math.max(1, z), ccx = x + cellX * z, ccy = y + cellY * z;
+  c.fillStyle = 'rgba(77,140,255,.45)';
+  c.fillRect(x, ccy, LOUPE_W, cs); c.fillRect(ccx, y, cs, LOUPE_H);
+  if (z >= 4) {
+    c.strokeStyle = 'rgba(31,31,41,.55)'; c.lineWidth = 1; c.beginPath();
+    for (let i = 1; i < sw; i++) { const gx = Math.floor(x + i * z) + .5; c.moveTo(gx, y); c.lineTo(gx, y + LOUPE_H); }
+    for (let j = 1; j < sh; j++) { const gy = Math.floor(y + j * z) + .5; c.moveTo(x, gy); c.lineTo(x + LOUPE_W, gy); }
+    c.stroke();
+  }
+  c.fillStyle = `rgb(${r},${g},${b})`; c.fillRect(ccx, ccy, cs, cs);
+  c.lineWidth = 1; c.strokeStyle = '#fff'; c.strokeRect(ccx + .5, ccy + .5, cs - 1, cs - 1);
+  c.strokeStyle = 'rgb(20,20,20)'; c.strokeRect(ccx - .5, ccy - .5, cs + 1, cs + 1);
+  const zl = `${z}×`;
+  c.font = `bold ${14 * k}px ${FONT}`;
+  const bw = c.measureText(zl).width + 16 * k, bh = 24 * k;
+  rr(c, x + LOUPE_W - 6 * k - bw, y + 6 * k, bw, bh, 6 * k); c.fillStyle = 'rgba(0,0,0,.55)'; c.fill();
+  c.fillStyle = '#fff'; c.textAlign = 'center'; c.textBaseline = 'middle';
+  c.fillText(zl, x + LOUPE_W - 6 * k - bw / 2, y + 6 * k + bh / 2 + .5); c.textAlign = 'left';
+  c.restore();
+
+  // 信息栏：会话缓存的模糊帧按信息栏位置裁一块 + 深色着色（每帧零次模糊）
+  const iy = y + LOUPE_H;
+  c.drawImage(blurCv, x, iy, LOUPE_W, INFO_H, x, iy, LOUPE_W, INFO_H);
+  c.fillStyle = 'rgba(18,18,20,.78)'; c.fillRect(x, iy, LOUPE_W, INFO_H);
+
+  const pad = 12 * k, sw2 = 18 * k, cl = x + pad, cr = x + LOUPE_W - pad;
+  const row1 = iy + pad;
+  rr(c, cl, row1, sw2, sw2, 4 * k); c.fillStyle = `rgb(${r},${g},${b})`; c.fill();
+  c.lineWidth = 1; c.strokeStyle = 'rgba(255,255,255,.55)'; c.stroke();
+  const coord = S.rel && S.sel ? [Math.round((S.cx - S.sel.x) * k), Math.round((S.cy - S.sel.y) * k)] : [px, py];
+  c.font = `${13 * k}px ${MONO}`; c.textBaseline = 'middle';
+  c.fillStyle = 'rgba(232,236,242,.72)'; c.textAlign = 'right'; c.fillText(`(${coord[0]}, ${coord[1]})`, cr, row1 + sw2 / 2 + .5); c.textAlign = 'left';
+  c.font = `600 ${13 * k}px ${MONO}`; c.fillStyle = '#fff';
+  c.fillText(colorText(r, g, b), cl + sw2 + 8 * k, row1 + sw2 / 2 + .5);
+
+  // 快捷键单行：键帽取自注册表（改键后同步），两端对齐；放不下时缩小字号
+  const items = [['color.format', '格式'], ['color.copy', '复制'], ['coord.mode', '坐标'], ['loupe.zoom', '缩放']]
+    .map(([id, label]) => [id === 'loupe.zoom' ? keyName(zoomHoldKey()) : textOf(id), label]);
+  const avail = cr - cl, ky = row1 + sw2 + 12 * k, kh = 22 * k;
+  let fs = 12, widths, sum;
+  for (; ; fs -= 0.5) {
+    widths = items.map(([key, label]) => {
+      c.font = `600 ${(fs - 1) * k}px ${MONO}`; const kw = Math.max(kh - 4 * k, c.measureText(key).width + 10 * k);
+      c.font = `${fs * k}px ${FONT}`; return { kw, w: kw + 5 * k + c.measureText(label).width };
+    });
+    sum = widths.reduce((a, w) => a + w.w, 0);
+    if (sum + 3 * 8 * k <= avail || fs <= 10) break;
+  }
+  const gap = (avail - sum) / 3;
+  let hx = cl;
+  items.forEach(([key, label], i) => {
+    const { kw, w } = widths[i];
+    const top = ky + 2 * k, h = kh - 4 * k;
+    rr(c, hx, top, kw, h, 4 * k); c.fillStyle = 'rgba(255,255,255,.1)'; c.fill();
+    c.font = `600 ${(fs - 1) * k}px ${MONO}`; c.fillStyle = '#fff'; c.textAlign = 'center';
+    c.fillText(key, hx + kw / 2, ky + kh / 2 + .5); c.textAlign = 'left';
+    c.font = `${fs * k}px ${FONT}`; c.fillStyle = 'rgba(232,236,242,.62)';
+    c.fillText(label, hx + kw + 5 * k, ky + kh / 2 + .5);
+    hx += w + gap;
+  });
+  c.restore();
+  S.loupeFit = { fs, gap: gap / k };
+}
+
+// ───────────────────────── 左下角快捷键指南（模板：数据驱动、分组、自动分栏） ─────────────────────────
+const G = { pad: 14, rowH: 30, capH: 22, headH: 22, colGap: 22, gapL: 14, sepW: 16, margin: 20 };
+function capW(c, s) { c.font = `600 12px ${FONT}`; return Math.max(G.capH, c.measureText(s).width + 14); }
+function rowKeysW(c, r) {
+  return r.chords.reduce((a, ch, i) => a + (i ? G.sepW : 0) + ch.reduce((b, t, j) => b + (j ? G.sepW : 0) + capW(c, keyName(t)), 0), 0);
+}
+// 把分组排进若干栏：每栏高度不超过屏幕的 55%；一个分组不拆开（除非单组就超高）
+function guideLayout(c) {
+  const groups = guideGroups('pick');
+  if (!groups.length) return null;
+  const maxH = Math.max(160, H * 0.55) - G.pad * 2;
+  const cols = [[]];
+  let h = 0;
+  for (const g of groups) {
+    const gh = G.headH + g.rows.length * G.rowH;
+    if (h > 0 && h + gh > maxH) { cols.push([]); h = 0; }
+    cols[cols.length - 1].push(g); h += gh;
+  }
+  let x = G.pad, height = 0;
+  const laid = cols.map(gs => {
+    const rows = gs.flatMap(g => g.rows);
+    const kcol = Math.max(...rows.map(r => rowKeysW(c, r)));
+    c.font = `13px ${FONT}`;
+    const lcol = Math.max(...rows.map(r => c.measureText(r.label).width));
+    const col = { x, groups: gs, kcol, w: kcol + G.gapL + lcol };
+    x += col.w + G.colGap;
+    height = Math.max(height, gs.reduce((a, g) => a + G.headH + g.rows.length * G.rowH, 0));
+    return col;
+  });
+  const w = x - G.colGap + G.pad, hh = height + G.pad * 2 - (G.rowH - G.capH);
+  return { cols: laid, w, h: hh, x: G.margin, y: H - G.margin - hh };
+}
+function drawGuide(c, t) {
+  const L = guideLayout(c);
+  const dt = Math.min(64, t - (S.lastFrame || t)); S.lastFrame = t;
+  const nearCursor = L && S.cx > L.x - 48 && S.cx < L.x + L.w + 48 && S.cy > L.y - 48 && S.cy < L.y + L.h + 48;
+  const target = L && guideOn && (S.phase === 'pick' || S.phase === 'drag') && !nearCursor ? 1 : 0;
+  S.guideA = target > S.guideA ? Math.min(1, S.guideA + dt / 160) : Math.max(0, S.guideA - dt / 120);
+  if (S.guideA <= 0 || !L) return;
+  c.save(); c.globalAlpha = S.guideA;
+  rr(c, L.x, L.y, L.w, L.h, 12); c.clip();
+  c.drawImage(blurCv, L.x * dpr, L.y * dpr, L.w * dpr, L.h * dpr, L.x, L.y, L.w, L.h);
+  c.fillStyle = 'rgba(14,16,20,.66)'; c.fillRect(L.x, L.y, L.w, L.h);
+  c.textBaseline = 'middle';
+  for (const col of L.cols) {
+    let y = L.y + G.pad;
+    for (const g of col.groups) {
+      c.font = `11px ${FONT}`; c.fillStyle = 'rgba(255,255,255,.42)';
+      c.fillText(g.name, L.x + col.x, y + 8);
+      y += G.headH;
+      for (const r of g.rows) {
+        let kx = L.x + col.x + col.kcol - rowKeysW(c, r);       // 键帽列右对齐
+        r.chords.forEach((ch, i) => {
+          if (i) { c.font = `12px ${FONT}`; c.fillStyle = 'rgba(255,255,255,.5)'; c.textAlign = 'center'; c.fillText('/', kx + G.sepW / 2, y + G.capH / 2 + .5); kx += G.sepW; }
+          ch.forEach((tok, j) => {
+            if (j) { c.font = `12px ${FONT}`; c.fillStyle = 'rgba(255,255,255,.5)'; c.textAlign = 'center'; c.fillText('+', kx + G.sepW / 2, y + G.capH / 2 + .5); kx += G.sepW; }
+            const s = keyName(tok), w = capW(c, s);
+            rr(c, kx, y, w, G.capH, 5); c.fillStyle = 'rgba(236,239,244,.94)'; c.fill();
+            c.font = `600 12px ${FONT}`; c.fillStyle = '#15181d'; c.textAlign = 'center'; c.fillText(s, kx + w / 2, y + G.capH / 2 + .5);
+            kx += w;
+          });
+        });
+        c.textAlign = 'left'; c.font = `13px ${FONT}`; c.fillStyle = 'rgba(255,255,255,.92)';
+        c.fillText(r.label, L.x + col.x + col.kcol + G.gapL, y + G.capH / 2 + .5);
+        y += G.rowH;
+      }
+    }
+  }
+  c.restore();
+}
+
+// ───────────────────────── F7 长截图：滚动中 ─────────────────────────
+function viewInSel(sel) {
+  const vp = scene.viewport;
+  const l = Math.max(sel.x, vp.x), r = Math.min(sel.x + sel.w, vp.x + vp.w);
+  const t = Math.max(sel.y, vp.y), b = Math.min(sel.y + sel.h, vp.y + vp.h);
+  return r > l && b > t ? { x0: l - vp.x, x1: r - vp.x, y0: t - vp.y, y1: b - vp.y } : null;
+}
+function beginScrolling() {
+  const v = viewInSel(S.sel);
+  if (!v) { toast('演示中的长截图需要框选网页正文区域'); return; }
+  S.phase = 'scrolling';
+  S.scrollState = { v, min: scroll, max: scroll, auto: false, lastAuto: 0, end: false };
+}
+const maxScroll = () => Math.max(0, scene.doc.h - scene.viewport.h);
+function scrollBy(d) {
+  const ss = S.scrollState;
+  const next = clamp(scroll + d, 0, maxScroll());
+  if (next === scroll) return false;
+  scroll = next; ss.min = Math.min(ss.min, scroll); ss.max = Math.max(ss.max, scroll);
+  paintScene();
+  return true;
+}
+function drawScrolling(c, t) {
+  const ss = S.scrollState, sel = S.sel;
+  if (ss.auto && t - ss.lastAuto > 200) {
+    ss.lastAuto = t;
+    if (!scrollBy(120)) { ss.auto = false; ss.end = true; }
+  }
+  drawFrame(c, sel);
+  // 面板：160 DIP，放在选区右侧 8 DIP（放不下则放左侧），底边与选区对齐，随内容增长
+  const PW = 160, head = 26, foot = 24, inner = PW - 12;
+  const { v } = ss;
+  const top = ss.min + v.y0, bottom = ss.max + v.y1, len = bottom - top;
+  const scale = inner / (v.x1 - v.x0);
+  const thumbH = len * scale;
+  const ph = Math.min(Math.max(sel.h, 120), thumbH + head + foot + 12);
+  let px = sel.x + sel.w + 8;
+  if (px + PW > W - 4) px = sel.x - 8 - PW;
+  const py = Math.max(4, sel.y + sel.h - ph);
+  c.save(); c.shadowColor = 'rgba(0,0,0,.4)'; c.shadowBlur = 20; c.shadowOffsetY = 6;
+  rr(c, px, py, PW, ph, 10); c.fillStyle = 'rgba(18,20,24,.92)'; c.fill(); c.restore();
+  c.font = '600 12px ' + FONT; c.fillStyle = '#fff'; c.textBaseline = 'middle';
+  c.fillText('长截图', px + 10, py + head / 2 + 2);
+  c.font = '11px ' + MONO; c.fillStyle = 'rgba(232,236,242,.62)'; c.textAlign = 'right';
+  c.fillText(`${Math.round((v.x1 - v.x0) * dpr)}×${Math.round(len * dpr)}`, px + PW - 10, py + head / 2 + 2); c.textAlign = 'left';
+  const ty = py + head, th = ph - head - foot - 6;
+  c.save(); rr(c, px + 6, ty, inner, th, 6); c.clip();
+  const shown = Math.min(thumbH, th), srcLen = shown / scale, srcTop = bottom - srcLen;   // 只显示尾部
+  const dy = ty + th - shown;
+  c.drawImage(docCv, v.x0 * dpr, srcTop * dpr, (v.x1 - v.x0) * dpr, srcLen * dpr, px + 6, dy, inner, shown);
+  if (thumbH > th) {
+    const g = c.createLinearGradient(0, ty, 0, ty + 28); g.addColorStop(0, 'rgba(18,20,24,.95)'); g.addColorStop(1, 'rgba(18,20,24,0)');
+    c.fillStyle = g; c.fillRect(px + 6, ty, inner, 28);
+  }
+  strokeRect(c, { x: px + 6, y: dy + (scroll + v.y0 - srcTop) * scale, w: inner, h: (v.y1 - v.y0) * scale }, rgba(ACCENT, 1), 1.5);
+  c.restore();
+  const keys = { a: textOf('scroll.auto'), f: textOf('scroll.finish'), x: textOf('scroll.cancel') };
+  c.font = '11px ' + FONT; c.fillStyle = 'rgba(232,236,242,.62)'; c.textBaseline = 'middle';
+  c.fillText(ss.end ? `已到底 · ${keys.f} 完成 · ${keys.x} 取消` : ss.auto ? `自动滚动中 · ${keys.a} 停止` : `${keys.f} 完成 · ${keys.a} 自动 · ${keys.x} 取消`, px + 10, py + ph - foot / 2 - 2);
+}
+
+// ───────────────────────── 输入 ─────────────────────────
+const lastMouse = { x: 400, y: 300 };
+const normRect = d => d && { x: Math.min(d.x0, d.x1), y: Math.min(d.y0, d.y1), w: Math.abs(d.x1 - d.x0), h: Math.abs(d.y1 - d.y0) };
+const lockPreview = () => { const p = S.chain[S.level]; if (p) { S.sel = { x: p.x, y: p.y, w: p.w, h: p.h }; S.phase = 'sel'; } };
+
+ov.addEventListener('mousemove', e => {
+  if (!S) return;
+  S.cx = e.clientX; S.cy = e.clientY;
+  if (S.phase === 'pick') {
+    if (S.down && Math.hypot(S.cx - S.down.x, S.cy - S.down.y) > 4) {
+      S.phase = 'drag'; S.drag = { x0: S.down.x, y0: S.down.y, x1: S.cx, y1: S.cy }; S.down = null;
+    } else updateHover();
+  } else if (S.phase === 'drag') { S.drag.x1 = S.cx; S.drag.y1 = S.cy; }
+  else if (S.phase === 'sel' && S.grab) {
+    const g = S.grab, dx = S.cx - g.mx, dy = S.cy - g.my, o = g.orig;
+    if (g.move) S.sel = { ...o, x: clamp(o.x + dx, 0, W - o.w), y: clamp(o.y + dy, 0, H - o.h) };
+    else {
+      let l = o.x, t = o.y, r = o.x + o.w, b = o.y + o.h;
+      if (g.i === 0) l += dx; if (g.i === 2) r += dx; if (g.j === 0) t += dy; if (g.j === 2) b += dy;
+      S.sel = { x: Math.min(l, r), y: Math.min(t, b), w: Math.abs(r - l), h: Math.abs(b - t) };
+    }
+  }
+});
+ov.addEventListener('mousedown', e => {
+  if (!S) return;
+  if (e.button === 2) { if (S.phase === 'sel') { S.phase = 'pick'; S.sel = null; updateHover(); } else endSession(); return; }
+  if (S.phase === 'pick') S.down = { x: e.clientX, y: e.clientY };
+  else if (S.phase === 'sel') {
+    const h = handlePoints(S.sel).find(p => Math.hypot(p.x - e.clientX, p.y - e.clientY) <= 9);
+    if (h) S.grab = { i: h.i, j: h.j, mx: e.clientX, my: e.clientY, orig: { ...S.sel } };
+    else if (inside(S.sel, e.clientX, e.clientY)) S.grab = { move: true, mx: e.clientX, my: e.clientY, orig: { ...S.sel } };
+    else { S.phase = 'drag'; S.sel = null; S.drag = { x0: e.clientX, y0: e.clientY, x1: e.clientX, y1: e.clientY }; }
+  }
+});
+addEventListener('mouseup', () => {
+  if (!S) return;
+  if (S.phase === 'pick' && S.down) { S.down = null; lockPreview(); }      // 单击：把吸附预览锁成选区
+  else if (S.phase === 'drag') {
+    const r = normRect(S.drag); S.drag = null;
+    if (r.w >= 4 && r.h >= 4) { S.sel = r; S.phase = 'sel'; } else { S.phase = 'pick'; updateHover(); }
+  } else if (S.phase === 'sel') S.grab = null;
+});
+ov.addEventListener('contextmenu', e => e.preventDefault());
+
+ov.addEventListener('wheel', e => {
+  e.preventDefault();
+  if (!S) return;
+  const dy = e.deltaMode === 1 ? e.deltaY * 40 : e.deltaY;
+  if (S.phase === 'scrolling') { if (inside(S.sel, e.clientX, e.clientY)) scrollBy(dy); return; }
+  if (S.zHeld) {
+    const i = ZOOMS.indexOf(S.zoom);
+    S.zoom = ZOOMS[clamp(i + (dy < 0 ? 1 : -1), 0, ZOOMS.length - 1)];
+    return;
+  }
+  // 触控板：累计到 100 才算一格，两格之间至少 80 ms
+  S.wheelAcc += dy;
+  const t = now();
+  if (Math.abs(S.wheelAcc) >= WHEEL_UNIT && t - S.lastStep >= WHEEL_COOLDOWN_MS) {
+    walk(S.wheelAcc < 0 ? -1 : 1);       // 向上滚 = 走向窗口
+    S.wheelAcc = 0; S.lastStep = t;
+  }
+}, { passive: false });
+
+// 动作的执行：按键先查注册表，再按动作 id 分发；按键本身不出现在这里
+const RUN = {
+  'level.up': () => walk(-1),
+  'level.down': () => walk(1),
+  'color.format': () => { S.fmt = (S.fmt + 1) % 3; },
+  'color.copy': () => toast('已复制色值'),
+  'coord.mode': () => { S.rel = !S.rel; },
+  'confirm': () => {
+    if (S.phase === 'pick') lockPreview();
+    if (S.phase !== 'sel') return;
+    if (S.mode === 'F7') beginScrolling();
+    else endSession(`已复制 ${Math.round(S.sel.w * dpr)}×${Math.round(S.sel.h * dpr)} 到剪贴板`);
+  },
+  'cancel': () => endSession(),
+  'scroll.auto': () => { S.scrollState.auto = !S.scrollState.auto; S.scrollState.end = false; },
+  'scroll.finish': () => {
+    const ss = S.scrollState, len = ss.max + ss.v.y1 - ss.min - ss.v.y0;
+    endSession(`长图 ${Math.round((ss.v.x1 - ss.v.x0) * dpr)}×${Math.round(len * dpr)} 已写入桌面、剪贴板与历史`);
+  },
+  'scroll.cancel': () => endSession('已取消，不产生文件'),
+};
+
+let recording = null;    // 设置面板正在录入的 { id, index }
+addEventListener('keydown', e => {
+  if (recording) { e.preventDefault(); recordChord(e); return; }
+  const ch = eventChord(e);
+  if (!ch) return;
+  if (['F5', 'F7', 'F9', 'Tab'].includes(ch[ch.length - 1]) || ch[0] === 'Ctrl') e.preventDefault();
+  if (!S) {
+    const k = ch.join('+');
+    if (k === 'F5') startSession('F5');
+    else if (k === 'F7') startSession('F7');
+    else if (k === 'N') toggle('notes');
+    else if (k === 'K') toggle('keys');
+    else if (k === 'H') { guideOn = !guideOn; syncBar(); }
+    else if (k === 'B') { blurOn = !blurOn; syncBar(); }
+    else if (k === 'M') { showPlanned = !showPlanned; syncBar(); renderKeys(); }
+    return;
+  }
+  const ctx = S.phase === 'scrolling' ? 'scroll' : 'pick';
+  if (ctx === 'pick' && ch.length === 1 && ch[0] === zoomHoldKey()) { S.zHeld = true; return; }
+  const a = actionFor(ctx, ch);
+  if (!a) return;
+  e.preventDefault();
+  if (a.planned) { toast(`「${labelText(a)}」规划中`); return; }
+  RUN[a.id] && RUN[a.id]();
+});
+addEventListener('keyup', e => { const ch = eventChord(e); if (S && ch && ch[ch.length - 1] === zoomHoldKey()) S.zHeld = false; });
+addEventListener('mousemove', e => { lastMouse.x = e.clientX; lastMouse.y = e.clientY; });
+
+// 空闲时网页可以滚动，方便选长截图的起点
+bg.addEventListener('wheel', e => {
+  if (S || !inside(scene.viewport, e.clientX, e.clientY)) return;
+  scroll = clamp(scroll + e.deltaY, 0, maxScroll()); paintScene();
+}, { passive: true });
+
+// ───────────────────────── 模拟设置面板：显示哪些、改键、冲突检测 ─────────────────────────
+let keysError = '';
+function renderKeys() {
+  const el = $('keys');
+  const groups = [];
+  for (const a of ACTIONS) {
+    if (a.planned && !showPlanned) continue;
+    let g = groups.find(x => x.name === `${a.ctx === 'scroll' ? '长截图中' : '截图中'} · ${a.group}`);
+    if (!g) groups.push(g = { name: `${a.ctx === 'scroll' ? '长截图中' : '截图中'} · ${a.group}`, items: [] });
+    g.items.push(a);
+  }
+  const seenRow = new Set();
+  el.innerHTML = `<h2>截图快捷键</h2>
+    <div class="sub">勾选的行显示在截图时左下角的指南里；点击组合键可重新录入（Esc 取消录入，Backspace 删除该组合）。</div>
+    ${groups.map(g => `<div class="grp">${g.name}</div>${g.items.map(a => {
+      const rk = rowKey(a), first = !seenRow.has(rk); seenRow.add(rk);
+      const box = a.ctx === 'pick' && first ? `<input type="checkbox" data-row="${rk}" ${rowVisible(rk) ? 'checked' : ''}>` : '';
+      const chords = chordsOf(a).map((ch, i) => `<button class="chord ${a.fixed ? 'fixed' : ''} ${recording && recording.id === a.id && recording.index === i ? 'rec' : ''}" data-id="${a.id}" data-i="${i}">${recording && recording.id === a.id && recording.index === i ? '按下组合…' : chordStr(ch)}</button>`).join('');
+      const add = a.fixed ? '' : `<button class="chord" data-id="${a.id}" data-i="${chordsOf(a).length}" title="添加备用组合">＋</button>`;
+      return `<div class="row"><span>${box}</span><span>${labelText(a)}${a.planned ? '<span class="plan">规划中</span>' : ''}</span><span class="chords">${chords}${add}</span></div>`;
+    }).join('')}`).join('')}
+    <div class="err">${keysError}</div>
+    <div class="foot"><button id="kReset">恢复默认</button><button id="kClose">完成</button></div>`;
+  el.querySelectorAll('input[data-row]').forEach(i => i.onchange = () => { prefs.visible[i.dataset.row] = i.checked; savePrefs(); });
+  el.querySelectorAll('button.chord:not(.fixed)').forEach(b => b.onclick = () => { recording = { id: b.dataset.id, index: +b.dataset.i }; keysError = ''; renderKeys(); });
+  $('kReset').onclick = () => { prefs = { chords: {}, visible: {} }; savePrefs(); keysError = ''; renderKeys(); };
+  $('kClose').onclick = () => toggle('keys');
+}
+function recordChord(e) {
+  const { id, index } = recording;
+  const a = actionById(id);
+  const ch = eventChord(e);
+  if (!ch) return;                                   // 只按了修饰键：继续等
+  const list = chordsOf(a).map(c => c.slice());
+  if (sameChord(ch, ['Escape']) && !(id === 'cancel' || id === 'scroll.cancel')) { recording = null; renderKeys(); return; }
+  if (sameChord(ch, ['Backspace'])) {
+    if (index < list.length && list.length > 1) { list.splice(index, 1); prefs.chords[id] = list; savePrefs(); }
+    else keysError = '每个动作至少保留一个组合';
+    recording = null; renderKeys(); return;
+  }
+  const isZoom = id === 'loupe.zoom';
+  const next = isZoom ? [ch[ch.length - 1], 'Wheel'] : ch;
+  // 冲突：同一场景下已被其他动作占用
+  const clash = ACTIONS.find(o => o.ctx === a.ctx && o.id !== id && chordsOf(o).some(c => sameChord(c, next) || (isZoom && c.length === 1 && c[0] === next[0]) || (o.id === 'loupe.zoom' && next.length === 1 && c[0] === next[0])));
+  if (clash) { keysError = `「${chordStr(next)}」已被「${labelText(clash)}」占用`; recording = null; renderKeys(); return; }
+  list[index] = next;
+  prefs.chords[id] = list; savePrefs();
+  keysError = ''; recording = null; renderKeys();
+}
+
+// ───────────────────────── 杂项 ─────────────────────────
+let toastTimer = 0;
+function toast(msg) {
+  const t = $('toast');
+  t.textContent = msg; t.classList.add('show');
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), 1800);
+}
+function toggle(id) {
+  $(id).classList.toggle('hidden');
+  if (id === 'keys') { recording = null; keysError = ''; renderKeys(); }
+  if (id === 'notes') renderNotes();
+  syncBar();
+}
+function syncBar() {
+  $('bBlur').classList.toggle('on', blurOn);
+  $('bGuide').classList.toggle('on', guideOn);
+  $('bMore').classList.toggle('on', showPlanned);
+  $('bKeys').classList.toggle('on', !$('keys').classList.contains('hidden'));
+  $('bNotes').classList.toggle('on', !$('notes').classList.contains('hidden'));
+}
+$('bF5').onclick = () => startSession('F5');
+$('bF7').onclick = () => startSession('F7');
+$('bBlur').onclick = () => { blurOn = !blurOn; syncBar(); };
+$('bGuide').onclick = () => { guideOn = !guideOn; syncBar(); };
+$('bMore').onclick = () => { showPlanned = !showPlanned; syncBar(); renderKeys(); };
+$('bKeys').onclick = () => toggle('keys');
+$('bNotes').onclick = () => toggle('notes');
+
+function renderNotes() {
+  const fit = S && S.loupeFit;
+  $('notes').innerHTML = `
+  <h3>操作</h3>
+  <ul>
+    <li><b>F5</b> 截图 / <b>F7</b> 长截图：同一个覆盖层，F7 在确认后进入滚动拼接。</li>
+    <li>悬停吸附；<b>滚轮 / ↑ / ↓</b> 换吸附层级（↑ 走向窗口），<b>Z+滚轮</b> 放大镜缩放。</li>
+    <li><b>单击 / Enter</b> 把预览锁成选区（出现手柄）；<b>拖拽</b> 自由框选；右键返回，<b>Esc</b> 退出。</li>
+    <li>长截图：Enter 后在选区里滚动，右侧面板随内容增长；<b>A</b> 自动滚动，<b>F9</b> 完成。</li>
+    <li>Demo 开关：<b>B</b> 遮罩模糊，<b>H</b> 快捷键指南，<b>K</b> 快捷键设置，<b>M</b> 模拟更多快捷键，<b>N</b> 本说明。</li>
+  </ul>
+  <h3>吸附层级（与产品一致）</h3>
+  <ul>
+    <li>预览框是遮罩上的一个洞，描边 3 px：静止时为主题蓝；游走时用 100 ms 过渡到绿色，同时内部叠 9% 的白色提亮。</li>
+    <li>悬停窗口在洞外加 10% 白色提亮，并描 1.5 px 主题色边框。</li>
+    <li>链环：浅蓝 1 px 线加黑色阴影。优先画锚点：窗口、相邻两层、最深答案。与预览框或已画链环相差不到 8 px 的不画，最多 7 个。外层链环画在提亮下面，内层画在上面。最后一次滚轮后 1.2 s 开始淡出，分 8 级在 240 ms 内完成。</li>
+    <li>标签 <code>W×H px  种类</code>，依次尝试四个位置：框外左上 → 框外左下 → 框内左上 → 光标旁。</li>
+    <li>徽章 54×18 <code>↑n │ ↓n</code>：还能继续走的一侧显示绿色，到头的一侧变暗。只在离开最深答案后出现，放在框内右上角。</li>
+    <li>一次性提示：会话开始时显示 2.6 s「滚轮 / ↑ / ↓ 换吸附层级」；第一次游走时显示「↑n ↓n · ↑ = 窗口 · … 切换」。两条提示里的按键都从注册表读取。</li>
+  </ul>
+  <h3>快捷键：注册表驱动（为以后扩展预留）</h3>
+  <ul>
+    <li>每个动作只登记一次：<code>id / 分组 / 文案 / 默认组合（可以有多个） / 生效场景 / 是否鼠标手势</code>。左下角指南、光标提示、工具栏占位、长截图面板、放大镜信息栏和按键分发都从这张表读，代码里不写死按键。</li>
+    <li>用户设置只存差异：<code>chords[id]</code> 覆盖默认组合，<code>visible[row]</code> 控制该行是否出现在指南中。改键时检查冲突（同一场景内唯一），可以恢复默认。</li>
+    <li>指南模板：按分组显示，组内同一行可以合并多个组合（如「滚轮 / ↑ / ↓」）。总高度超过屏幕的 55% 时按分组自动分栏。按 <b>M</b> 打开 Image #3 中那批规划中的快捷键，可以看到扩展后的效果。</li>
+    <li>落到产品：Rust 侧用 <code>Action</code> 枚举加 <code>Keymap</code>（<code>HashMap&lt;Chord, Action&gt;</code>，按场景分表），放在设置模型里。<code>on_key_down</code> 只查表再分发，D2D 指南只遍历可见行。</li>
+  </ul>
+  <h3>模糊：只模糊一次，到处复用</h3>
+  <ul>
+    <li>会话开始时，把冻结帧高斯模糊一次并缓存成位图${blurMs ? `（本机这次用了 <b>${blurMs.toFixed(1)} ms</b>）` : ''}。</li>
+    <li>遮罩、放大镜信息栏、快捷键指南都按各自的位置从这张位图裁一块，再叠一层深色。之后每帧<b>不再做模糊</b>，只有位图拷贝。</li>
+    <li>产品现在每帧都会对信息栏跑一次 <code>CLSID_D2D1GaussianBlur</code>。改为缓存后：会话开始时把 effect 的输出画进 <code>ID2D1Bitmap1</code>，之后每帧只调用带源矩形的 <code>DrawBitmap</code>。</li>
+  </ul>
+  <h3>放大镜</h3>
+  <ul>
+    <li>只改信息栏里的快捷键：从 2×2 改成单行（格式 · 复制 · 坐标 · 缩放，按键随改键同步），信息栏高度从 2 行快捷键的 108 降到 76（DIP，随缩放放大）。</li>
+    <li>面板固定 340 物理像素宽，文字随 DPI 放大。150% 时单行很紧，放不下就先压缩间距、再缩字号。本机实测：字号 ${fit ? fit.fs : '—'} DIP，间距 ${fit ? fit.gap.toFixed(1) : '—'} DIP。</li>
+  </ul>
+  <h3>左下角快捷键指南</h3>
+  <ul>
+    <li>覆盖层出现时显示，背景同样取自缓存的模糊帧。光标进入面板周围 48 px 时淡出，锁定选区和长截图时隐藏。</li>
+    <li>指南里的文案在运行时由用户配置决定，没法按字面提前子集化。所以要么把所有动作的文案都放进 HarmonyOS Sans SC 子集的白名单（<code>subfont/subset.ps1</code>），要么让指南回退到系统字体。</li>
+  </ul>`;
+}
+
+addEventListener('resize', () => { if (!S) { buildScene(); paintScene(); } });
+buildScene();
+paintScene();
+syncBar();
+renderNotes();
+renderKeys();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

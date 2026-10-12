@@ -23,9 +23,9 @@ use windows_sys::Win32::{
         Threading::GetCurrentThreadId,
     },
     UI::WindowsAndMessaging::{
-        CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow,
-        DispatchMessageW, GetMessageW, MSG, PeekMessageW, PostThreadMessageW, RegisterClassW,
-        TranslateMessage, UnregisterClassW, WM_CLIPBOARDUPDATE, WM_QUIT, WNDCLASSW,
+        CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+        GetMessageW, MSG, PeekMessageW, PostThreadMessageW, RegisterClassW, TranslateMessage,
+        UnregisterClassW, WM_CLIPBOARDUPDATE, WM_QUIT, WNDCLASSW,
     },
 };
 
@@ -236,8 +236,3 @@ unsafe extern "system" {
     fn AddClipboardFormatListener(hwnd: HWND) -> i32;
     fn RemoveClipboardFormatListener(hwnd: HWND) -> i32;
 }
-
-
-
-
-

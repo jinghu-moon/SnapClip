@@ -105,10 +105,7 @@ impl Handle {
     /// callers scale the hit size with DPI.
     pub fn visual_size(self) -> f32 {
         match self {
-            Handle::Top
-            | Handle::Right
-            | Handle::Bottom
-            | Handle::Left => 10.0,
+            Handle::Top | Handle::Right | Handle::Bottom | Handle::Left => 10.0,
             Handle::TopLeft | Handle::TopRight | Handle::BottomRight | Handle::BottomLeft => 12.0,
         }
     }
@@ -123,8 +120,7 @@ pub const CORNER_HANDLES: [Handle; 4] = [
 ];
 
 /// The four edge grips.
-pub const EDGE_HANDLES: [Handle; 4] =
-    [Handle::Top, Handle::Right, Handle::Bottom, Handle::Left];
+pub const EDGE_HANDLES: [Handle; 4] = [Handle::Top, Handle::Right, Handle::Bottom, Handle::Left];
 
 /// Which edges of the selection the pointer is close to; used for the resize cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -240,9 +236,7 @@ impl SelectionSnapshot {
         }
         let edges = self.edges_at(point);
         if edges.any() {
-            return SelectionGeometry::Resize(
-                edges.handle().unwrap_or(Handle::BottomRight),
-            );
+            return SelectionGeometry::Resize(edges.handle().unwrap_or(Handle::BottomRight));
         }
         for handle in EDGE_HANDLES {
             let anchor = handle.anchor(self.rect);
@@ -278,10 +272,8 @@ impl SelectionSnapshot {
         match mode {
             ResizeMode::Move => {}
             ResizeMode::Handle(handle) => {
-                let grows_left = matches!(
-                    handle,
-                    Handle::TopLeft | Handle::BottomLeft | Handle::Left
-                );
+                let grows_left =
+                    matches!(handle, Handle::TopLeft | Handle::BottomLeft | Handle::Left);
                 let grows_top = matches!(handle, Handle::TopLeft | Handle::Top | Handle::TopRight);
                 if result.width() < minimum {
                     if grows_left {
@@ -439,10 +431,9 @@ pub struct MagnifierConfig {
     pub tile_size: i32,
     /// Offset between cursor and panel edge.
     pub gap: i32,
-    /// Height of the info strip below the panel, in physical pixels (matches
-    /// the DPI-invariant panel). Three rows — a colour+coordinates line and a
-    /// 2×2 shortcut grid — vertically centred:
-    /// 12+18+12+22+8+22+12 = 106 → rounded up to 108 px.
+    /// Height of the info strip below the panel. Its text is DIP-sized, so the strip is too:
+    /// 76 DIP (a colour+coordinates line and one shortcut row, 12+18+12+22+12) in
+    /// [`Default`], physical pixels after [`MagnifierConfig::scaled`].
     pub info_height: i32,
 }
 
@@ -458,7 +449,7 @@ impl Default for MagnifierConfig {
             source_height: 9,
             tile_size: 32,
             gap: 24,
-            info_height: 108,
+            info_height: Self::INFO_HEIGHT_DIP,
         }
     }
 }
@@ -471,14 +462,15 @@ impl MagnifierConfig {
     pub const PANEL_WIDTH_PHYSICAL: i32 = 340;
     pub const PANEL_HEIGHT_PHYSICAL: i32 = 180;
     pub const ZOOM_DEFAULT: f32 = 20.0;
+    /// The info strip's height at 96 DPI: 12 + 18 (colour row) + 12 + 22 (hint row) + 12.
+    pub const INFO_HEIGHT_DIP: i32 = 76;
     pub const ZOOM_MIN: f32 = 0.1;
     pub const ZOOM_MAX: f32 = 40.0;
 
     /// Predefined zoom ladder — 17 stops from 0.1× to 40×.
     /// Wheel up advances, wheel down retreats.
     pub const ZOOM_LEVELS: &'static [f32] = &[
-        0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 10.0, 15.0, 20.0, 30.0,
-        40.0,
+        0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 10.0, 15.0, 20.0, 30.0, 40.0,
     ];
 
     /// Return the next higher (or lower) zoom stop from `current`.
@@ -497,7 +489,9 @@ impl MagnifierConfig {
                     .iter()
                     .enumerate()
                     .min_by(|(_, a), (_, b)| {
-                        ((**a - current).abs()).partial_cmp(&(**b - current).abs()).unwrap()
+                        ((**a - current).abs())
+                            .partial_cmp(&(**b - current).abs())
+                            .unwrap()
                     })
                     .map(|(i, _)| i)
                     .unwrap_or(0)
@@ -526,10 +520,9 @@ impl MagnifierConfig {
         }
     }
 
-    /// Scale only DPI-dependent fields. Source, tile, and the loupe panel are
-    /// fixed physical pixels (the panel is 340×180 regardless of DPI), so the
-    /// info strip height stays physical too — its text is laid out in physical
-    /// pixels to fit that DPI-invariant panel. Only `gap` scales.
+    /// Scale the DPI-dependent fields. Source, tile, and the loupe panel are fixed physical
+    /// pixels (the panel is 340×180 regardless of DPI); the gap and the info strip, whose text is
+    /// DIP-sized, scale.
     pub fn scaled(&self, dpi: u32) -> Self {
         let scale = dpi.max(96) as f32 / 96.0;
         Self {
@@ -538,7 +531,7 @@ impl MagnifierConfig {
             source_height: self.source_height,
             tile_size: self.tile_size,
             gap: (self.gap as f32 * scale).round() as i32,
-            info_height: self.info_height,
+            info_height: (self.info_height as f32 * scale).round() as i32,
         }
     }
 
@@ -605,8 +598,14 @@ pub fn magnifier_geometry(
         cursor.y + config.gap
     };
 
-    left = left.clamp(work_area.left, (work_area.right - panel_w).max(work_area.left));
-    top = top.clamp(work_area.top, (work_area.bottom - total_height).max(work_area.top));
+    left = left.clamp(
+        work_area.left,
+        (work_area.right - panel_w).max(work_area.left),
+    );
+    top = top.clamp(
+        work_area.top,
+        (work_area.bottom - total_height).max(work_area.top),
+    );
     let panel = Rect::from_origin_size(Point::new(left, top), panel_w, panel_h);
     let info_panel = Rect::from_origin_size(Point::new(left, top + panel_h), panel_w, info_height);
     let bounds = panel.union(info_panel);
@@ -632,15 +631,11 @@ pub fn magnifier_geometry(
     // Tile: tile_size×tile_size region containing the cursor for async staging copy.
     // Translated at frame edges to maintain fixed tile_size.
     let tile_half = tile_size / 2;
-    let tile_left = (center.x - tile_half)
-        .clamp(frame.left, (frame.right - tile_size).max(frame.left));
-    let tile_top = (center.y - tile_half)
-        .clamp(frame.top, (frame.bottom - tile_size).max(frame.top));
-    let tile = Rect::from_origin_size(
-        Point::new(tile_left, tile_top),
-        tile_size,
-        tile_size,
-    );
+    let tile_left =
+        (center.x - tile_half).clamp(frame.left, (frame.right - tile_size).max(frame.left));
+    let tile_top =
+        (center.y - tile_half).clamp(frame.top, (frame.bottom - tile_size).max(frame.top));
+    let tile = Rect::from_origin_size(Point::new(tile_left, tile_top), tile_size, tile_size);
 
     MagnifierGeometry {
         panel,
@@ -1034,7 +1029,11 @@ mod tests {
     fn resize_follows_the_pointer_and_clamps_into_the_monitor() {
         let rect = Rect::new(100, 100, 300, 200);
         let drag = SelectionDrag::new(rect, 96, Point::new(300, 200));
-        let resized = drag.apply(ResizeMode::Handle(Handle::BottomRight), Point::new(500, 400), monitor());
+        let resized = drag.apply(
+            ResizeMode::Handle(Handle::BottomRight),
+            Point::new(500, 400),
+            monitor(),
+        );
         assert_eq!(resized, Rect::new(100, 100, 500, 400));
 
         let clamped = drag.apply(
@@ -1051,7 +1050,11 @@ mod tests {
         let drag = SelectionDrag::new(rect, 96, Point::new(300, 200));
         // Drag the right edge to the left of the left edge: the rectangle must
         // normalise instead of inverting.
-        let resized = drag.apply(ResizeMode::Handle(Handle::Right), Point::new(50, 200), monitor());
+        let resized = drag.apply(
+            ResizeMode::Handle(Handle::Right),
+            Point::new(50, 200),
+            monitor(),
+        );
         assert_eq!(resized, Rect::new(50, 100, 100, 200));
     }
 
@@ -1092,10 +1095,19 @@ mod tests {
             dpi: 144,
             primary: false,
         };
-        assert_eq!(monitor_layout.to_local(Point::new(-1920, 200)), Point::new(0, 0));
-        assert_eq!(monitor_layout.to_screen(Point::new(0, 0)), Point::new(-1920, 200));
+        assert_eq!(
+            monitor_layout.to_local(Point::new(-1920, 200)),
+            Point::new(0, 0)
+        );
+        assert_eq!(
+            monitor_layout.to_screen(Point::new(0, 0)),
+            Point::new(-1920, 200)
+        );
         assert_eq!(monitor_layout.local_bounds(), Rect::new(0, 0, 1920, 1080));
-        assert_eq!(monitor_layout.local_work_area(), Rect::new(0, 0, 1920, 1040));
+        assert_eq!(
+            monitor_layout.local_work_area(),
+            Rect::new(0, 0, 1920, 1040)
+        );
         assert!((monitor_layout.scale() - 1.5).abs() < f32::EPSILON);
     }
 
@@ -1262,8 +1274,14 @@ mod tests {
         assert_eq!(geometry.source.height(), config.source_height);
         assert_eq!(geometry.panel.width(), config.panel_width());
         assert_eq!(geometry.panel.height(), config.panel_height());
-        assert_eq!(geometry.panel.width(), geometry.source.width() * geometry.zoom as i32);
-        assert_eq!(geometry.panel.height(), geometry.source.height() * geometry.zoom as i32);
+        assert_eq!(
+            geometry.panel.width(),
+            geometry.source.width() * geometry.zoom as i32
+        );
+        assert_eq!(
+            geometry.panel.height(),
+            geometry.source.height() * geometry.zoom as i32
+        );
         assert_eq!(geometry.zoom, 20.0);
         // A 17×9 window is odd in both axes, so the cursor's own pixel is the
         // exact centre cell: column 9 of 17, row 5 of 9 (1-based).
@@ -1318,7 +1336,10 @@ mod tests {
     fn crosshair_radius_scales_with_dpi() {
         assert_eq!(crosshair_radius(96), 28);
         assert_eq!(crosshair_radius(144), 42);
-        assert!(crosshair_radius(0) == 28, "dpi below 96 clamps to the 96 baseline");
+        assert!(
+            crosshair_radius(0) == 28,
+            "dpi below 96 clamps to the 96 baseline"
+        );
     }
 
     fn layout(bounds: Rect, dpi: u32) -> MonitorLayout {

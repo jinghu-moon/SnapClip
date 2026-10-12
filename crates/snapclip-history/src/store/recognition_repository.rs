@@ -47,7 +47,6 @@ pub struct OcrStatusInfo {
     pub error_code: Option<OcrErrorCode>,
 }
 
-
 pub(super) fn enqueue_ocr(
     connection: &Connection,
     clip_id: &str,

@@ -43,7 +43,9 @@ impl CaptureArtifactStore {
         let metadata = &output.metadata;
         fs::create_dir_all(&self.root)?;
         let sequence = ARTIFACT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path = self.root.join(format!("{}-{sequence}.png", metadata.session_id));
+        let path = self
+            .root
+            .join(format!("{}-{sequence}.png", metadata.session_id));
         write_atomically(&path, &output.bytes)?;
         Ok(ArtifactRef {
             absolute_path: path,
@@ -127,17 +129,26 @@ mod tests {
     fn write_names_the_file_and_describes_it_truthfully() {
         let store = CaptureArtifactStore::new(root("write"));
         let payload = b"not really a png, but the store does not care".to_vec();
-        let reference = store.write(&output("capture-1-1", payload.clone())).unwrap();
+        let reference = store
+            .write(&output("capture-1-1", payload.clone()))
+            .unwrap();
 
         // Naming contract (docs/11 §8.2) plus a real file on disk.
-        let name = reference.absolute_path.file_name().unwrap().to_string_lossy();
+        let name = reference
+            .absolute_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy();
         assert!(name.starts_with("capture-1-1-"), "{name}");
         assert!(name.ends_with(".png"), "{name}");
         assert_eq!(fs::read(&reference.absolute_path).unwrap(), payload);
 
         assert_eq!(reference.mime, "image/png");
         assert_eq!(reference.byte_len, payload.len() as u64);
-        assert_eq!((reference.dimensions.width, reference.dimensions.height), (640, 480));
+        assert_eq!(
+            (reference.dimensions.width, reference.dimensions.height),
+            (640, 480)
+        );
         // The fingerprint is blake3 of the bytes, computed independently here.
         assert_eq!(
             reference.content_fingerprint,
@@ -167,12 +178,17 @@ mod tests {
     #[test]
     fn read_notices_a_file_that_no_longer_matches_its_fingerprint() {
         let store = CaptureArtifactStore::new(root("tamper"));
-        let reference = store.write(&output("capture-1-1", b"original".to_vec())).unwrap();
+        let reference = store
+            .write(&output("capture-1-1", b"original".to_vec()))
+            .unwrap();
         assert_eq!(store.read(&reference).unwrap(), b"original");
 
         fs::write(&reference.absolute_path, b"replaced").unwrap();
         let error = store.read(&reference).unwrap_err();
-        assert!(matches!(error, crate::StoreError::InvalidPublication(_)), "{error:?}");
+        assert!(
+            matches!(error, crate::StoreError::InvalidPublication(_)),
+            "{error:?}"
+        );
         let _ = fs::remove_dir_all(store.root());
     }
 }

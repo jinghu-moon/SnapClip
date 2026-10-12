@@ -8,9 +8,9 @@
 //! # Why the encoder writes into a shared buffer
 //!
 //! `docs/31` P4.02 prescribes `Encoder::stream_writer()` — the **borrowing** form — and then
-//! `stream.finish()` followed by `writer.finish()`. That sequence cannot be written behind
-//! `Box<dyn RowBandWriter>`, and the reason is worth writing down because it is a property of `png`
-//! 0.18.1 rather than a preference:
+//! `stream.finish()` followed by `writer.finish()`. That sequence cannot be written inside one owned
+//! writer, and the reason is worth writing down because it is a property of `png` 0.18.1 rather
+//! than a preference:
 //!
 //! * `stream_writer(&mut self)` returns a `StreamWriter<'_>` that borrows the [`png::Writer`]. Inside
 //!   one owned writer both would have to live in the same value, i.e. a self-referential struct, and
@@ -29,26 +29,63 @@
 //!
 //! # A short write cannot be a PNG
 //!
-//! The port allows `finish` to be called after fewer rows than `begin` was told about, and the
-//! `#[cfg(test)]` contract sink in `export.rs` honours that. A PNG cannot: the height is in the
-//! IHDR, which `write_header()` fixes before the first row (`F-12`), so an artifact carrying N rows
-//! under a declared height of M is not a smaller image, it is a corrupt one. `finish` therefore
-//! refuses a short write with `ExportError::Sink` instead of inventing rows or emitting a file that
-//! pretends to be complete. The legitimate partial artifact — "this canvas is a prefix of the page"
-//! — is produced by talking `begin` into the *shorter* height (`P1.21` trims the canvas before the
-//! export starts), which is exactly what `AbortReason` labels.
-//!
-//! The refusal **names the reason it was given** (`P4.05`). That is not decoration: the reason
-//! arrives as a parameter, so a message that omits it is the one place where the causal chain from
-//! "the user pressed `Esc`" to "the file is short" gets broken — §26.2 rule 3 says a discarded result
-//! is recorded together with its reason, and this is the only code that sees both.
+//! The height is in the IHDR, which `write_header()` fixes before the first row, so an artifact
+//! carrying N rows under a declared height of M is not a smaller image, it is a corrupt one.
+//! `finish` therefore refuses a short write with `ExportError::Sink` instead of inventing rows or
+//! emitting a file that pretends to be complete.
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-use snapclip_capture::scroll::export::{
-    AbortReason, Artifact, ExportError, ImageMeta, RowBandSink, RowBandWriter,
-};
+/// The image an encoder is opened for. The height is a precondition: a PNG header carries it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageMeta {
+    pub width: u64,
+    pub height: u64,
+}
+
+/// A finished encoding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Artifact {
+    pub bytes: Vec<u8>,
+    pub rows: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExportError {
+    TooLarge { width: u64, height: u64 },
+    OutOfOrder { first_row: u64, expected: u64 },
+    BeyondHeight { first_row: u64, height: u64 },
+    RowLength { expected: u64, got: u64 },
+    Sink(String),
+}
+
+impl std::fmt::Display for ExportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExportError::TooLarge { width, height } => write!(
+                f,
+                "a {width}x{height} artifact does not fit the format's u32 header fields"
+            ),
+            ExportError::OutOfOrder {
+                first_row,
+                expected,
+            } => write!(
+                f,
+                "rows must arrive in order: expected row {expected}, got row {first_row}"
+            ),
+            ExportError::BeyondHeight { first_row, height } => write!(
+                f,
+                "row {first_row} is past the {height} rows declared at begin"
+            ),
+            ExportError::RowLength { expected, got } => write!(
+                f,
+                "rows are {expected} bytes each, and {got} is not a whole number of them"
+            ),
+            ExportError::Sink(message) => write!(f, "the export sink failed: {message}"),
+        }
+    }
+}
 
 /// The buffer the encoder writes its chunks into, reachable from both sides of the stream.
 ///
@@ -78,8 +115,7 @@ fn sink_error(error: impl std::fmt::Display) -> ExportError {
 
 /// Streams packed BGRA8 rows into a PNG artifact (`docs/30` §17.7).
 ///
-/// The sink itself is configuration only, which is what lets it satisfy `RowBandSink: Send`; the
-/// state that cannot cross a thread lives in the writer `begin` returns.
+/// The sink itself is configuration only; the encoder state lives in the writer `begin` returns.
 pub struct PngRowBandSink {
     compression: png::Compression,
     filter: png::Filter,
@@ -122,8 +158,8 @@ impl PngRowBandSink {
     }
 }
 
-impl RowBandSink for PngRowBandSink {
-    fn begin(&mut self, meta: &ImageMeta) -> Result<Box<dyn RowBandWriter>, ExportError> {
+impl PngRowBandSink {
+    pub fn begin(&mut self, meta: &ImageMeta) -> Result<PngRowBandWriter, ExportError> {
         // `P4.04`: the size domain is `u64` and the format's is `u32`, so the conversion is checked
         // and refused. A truncating `as` here would produce an image that lies about its dimensions.
         let width = u32::try_from(meta.width).map_err(|_| ExportError::TooLarge {
@@ -145,17 +181,18 @@ impl RowBandSink for PngRowBandSink {
         let writer = encoder.write_header().map_err(sink_error)?;
         let stream = writer.into_stream_writer().map_err(sink_error)?;
 
-        Ok(Box::new(PngRowBandWriter {
+        Ok(PngRowBandWriter {
             meta: *meta,
             buffer,
             stream: Some(stream),
             row: Vec::new(),
             next_row: 0,
-        }))
+        })
     }
 }
 
-struct PngRowBandWriter {
+/// Rows in, in order; `finish` closes the PNG.
+pub struct PngRowBandWriter {
     meta: ImageMeta,
     buffer: Arc<Mutex<Vec<u8>>>,
     /// `None` only after `finish`, which is the only thing that can take it.
@@ -166,8 +203,8 @@ struct PngRowBandWriter {
     next_row: u64,
 }
 
-impl RowBandWriter for PngRowBandWriter {
-    fn write_rows(&mut self, first_row: u64, rows: &[u8]) -> Result<(), ExportError> {
+impl PngRowBandWriter {
+    pub fn write_rows(&mut self, first_row: u64, rows: &[u8]) -> Result<(), ExportError> {
         let row_bytes = self.meta.width * 4;
         let got = rows.len() as u64;
         if got % row_bytes != 0 {
@@ -190,19 +227,14 @@ impl RowBandWriter for PngRowBandWriter {
             });
         }
 
-        let stream = self
-            .stream
-            .as_mut()
-            .ok_or_else(|| ExportError::Sink("rows were written after the artifact closed".into()))?;
+        let stream = self.stream.as_mut().ok_or_else(|| {
+            ExportError::Sink("rows were written after the artifact closed".into())
+        })?;
         // PNG has no BGRA, so the swap is the sink's job and it is done a row at a time: a whole
         // image's worth of RGBA in one buffer is the copy `P4.03` exists to delete.
         self.row.resize(row_bytes as usize, 0);
         for band in rows.chunks_exact(row_bytes as usize) {
-            for (dst, src) in self
-                .row
-                .chunks_exact_mut(4)
-                .zip(band.chunks_exact(4))
-            {
+            for (dst, src) in self.row.chunks_exact_mut(4).zip(band.chunks_exact(4)) {
                 dst[0] = src[2];
                 dst[1] = src[1];
                 dst[2] = src[0];
@@ -214,18 +246,10 @@ impl RowBandWriter for PngRowBandWriter {
         Ok(())
     }
 
-    fn finish(mut self: Box<Self>, outcome: Option<AbortReason>) -> Result<Artifact, ExportError> {
+    pub fn finish(mut self) -> Result<Artifact, ExportError> {
         if self.next_row != self.meta.height {
-            // `docs/30` §26.2 rule 3: a discarded result is recorded together with its reason. The
-            // reason is a parameter of this call, so the only way it can go missing is if this
-            // message drops it — and "3 of 5 rows were written" on its own cannot be told apart from
-            // a caller bug, a truncated file, or a session the user cancelled (`P4.05`).
-            let why = match outcome {
-                Some(reason) => reason.to_string(),
-                None => "the export was cut short without a reason".to_string(),
-            };
             return Err(ExportError::Sink(format!(
-                "{why}; {} of {} rows were written, and a PNG's height is fixed in its header, so a \
+                "{} of {} rows were written, and a PNG's height is fixed in its header, so a \
                  short write cannot become a decodable file",
                 self.next_row, self.meta.height
             )));
@@ -240,6 +264,7 @@ impl RowBandWriter for PngRowBandWriter {
 
         // The encoder dropped its handle with the stream, so this is normally the last one and the
         // bytes move out instead of being copied.
+        let rows = self.next_row;
         let bytes = match Arc::try_unwrap(self.buffer) {
             Ok(buffer) => buffer
                 .into_inner()
@@ -249,17 +274,13 @@ impl RowBandWriter for PngRowBandWriter {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone(),
         };
-        Ok(Artifact {
-            bytes,
-            rows: self.next_row,
-        })
+        Ok(Artifact { bytes, rows })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use snapclip_capture::scroll::Axis;
 
     /// Packed BGRA8, the order the capture side hands rows over in (`export.rs`, §17.7).
     fn bgra(width: u32, height: u32) -> Vec<u8> {
@@ -284,13 +305,7 @@ mod tests {
     }
 
     fn meta(width: u64, height: u64) -> ImageMeta {
-        ImageMeta {
-            width,
-            height,
-            length: height,
-            axis: Axis::Vertical,
-            dpr: 1,
-        }
+        ImageMeta { width, height }
     }
 
     fn decode(bytes: &[u8]) -> (png::OutputInfo, Vec<u8>) {
@@ -319,9 +334,12 @@ mod tests {
         // buffer the size of the image.
         writer.write_rows(0, &rows[..(3 * 4 * 4) as usize]).unwrap();
         writer.write_rows(3, &rows[(3 * 4 * 4) as usize..]).unwrap();
-        let artifact = writer.finish(None).unwrap();
+        let artifact = writer.finish().unwrap();
 
-        assert_eq!(artifact.rows, 6, "every row was written, so every row is reported");
+        assert_eq!(
+            artifact.rows, 6,
+            "every row was written, so every row is reported"
+        );
         let (info, pixels) = decode(&artifact.bytes);
         assert_eq!((info.width, info.height), (width, height));
         assert_eq!(info.color_type, png::ColorType::Rgba);
@@ -354,14 +372,14 @@ mod tests {
             let mut sink = PngRowBandSink::new();
             let mut writer = sink.begin(&meta).unwrap();
             writer.write_rows(0, &rows).unwrap();
-            writer.finish(None).unwrap()
+            writer.finish().unwrap()
         };
         let without = {
             let mut sink = PngRowBandSink::new();
             sink.set_filter(png::Filter::NoFilter);
             let mut writer = sink.begin(&meta).unwrap();
             writer.write_rows(0, &rows).unwrap();
-            writer.finish(None).unwrap()
+            writer.finish().unwrap()
         };
 
         assert_eq!(PngRowBandSink::new().filter(), png::Filter::Up);
@@ -394,7 +412,10 @@ mod tests {
     /// `Encoder::new` and `write_header` are never reached for such a meta.
     #[test]
     fn an_oversized_dimension_is_refused_before_the_header() {
-        for oversized in [meta(u64::from(u32::MAX) + 1, 1), meta(1, u64::from(u32::MAX) + 1)] {
+        for oversized in [
+            meta(u64::from(u32::MAX) + 1, 1),
+            meta(1, u64::from(u32::MAX) + 1),
+        ] {
             let error = match PngRowBandSink::new().begin(&oversized) {
                 Ok(_) => panic!("{oversized:?} does not fit a PNG header and must be refused"),
                 Err(error) => error,
@@ -411,49 +432,6 @@ mod tests {
                 message.contains(&oversized.width.to_string())
                     && message.contains(&oversized.height.to_string()),
                 "the refusal must name the size it refused, got `{message}`"
-            );
-        }
-    }
-
-    /// `docs/30 §30.4`'s "上限三层" row reads "`MAX_LONG_IMAGE_PIXELS` injected small → `Partial`
-    /// and **it is a legal PNG**". `P1.21` already pins the trimming; what that row adds for the
-    /// encoder is that an export which was told to stop still closes its container, so the file the
-    /// user is offered is one they can open.
-    ///
-    /// This was **already true** when `P4.05` opened, and it is the *correct* behaviour rather than a
-    /// gap: when every declared row arrived, the outcome is a label on a complete file and the sink
-    /// ignores it. What the sink did *not* do is the subject of
-    /// [`Self::a_short_export_says_why_it_was_cut_short`] — this test is the pin that keeps the fix
-    /// from turning "aborted" into "truncated".
-    #[test]
-    fn finish_with_abort_writes_a_complete_iend_and_the_file_decodes() {
-        let (width, height) = (4u32, 5u32);
-        let rows = bgra(width, height);
-        let meta = meta(u64::from(width), u64::from(height));
-
-        for reason in [
-            AbortReason::Cancelled,
-            AbortReason::MemoryLimit,
-            AbortReason::ExportBudget,
-        ] {
-            let mut sink = PngRowBandSink::new();
-            let mut writer = sink.begin(&meta).expect("a PNG of 4x5");
-            writer.write_rows(0, &rows).expect("all five rows");
-            let artifact = writer
-                .finish(Some(reason))
-                .unwrap_or_else(|error| panic!("{reason:?} must still close the artifact: {error}"));
-
-            assert_eq!(
-                artifact.rows, u64::from(height),
-                "{reason:?}: every declared row arrived, so the file is complete"
-            );
-            let (info, pixels) = decode(&artifact.bytes);
-            assert_eq!((info.width, info.height), (width, height), "{reason:?}");
-            assert_eq!(info.color_type, png::ColorType::Rgba, "{reason:?}");
-            assert_eq!(
-                pixels,
-                rgba(width, height),
-                "{reason:?}: an aborted-but-complete export is byte-identical to an unlabelled one"
             );
         }
     }
@@ -492,67 +470,28 @@ mod tests {
 
         // The refused writes left no trace: the rest of the artifact is still writable in order.
         writer.write_rows(2, &bgra(width, 4)).expect("rows 2-5");
-        let artifact = writer.finish(None).expect("a complete export");
+        let artifact = writer.finish().expect("a complete export");
         assert_eq!(artifact.rows, u64::from(height));
         let (info, _) = decode(&artifact.bytes);
         assert_eq!((info.width, info.height), (width, height));
     }
 
-    /// `docs/30 §26.2` rule 3: "every discarded result is recorded **together with its reason**".
-    ///
-    /// A short write is refused (`§26.1`, and the module doc above argues why a PNG cannot be short).
-    /// The refusal is correct; what it must not be is *silent about which abort it was given*. Three
-    /// different things lead here — the user pressed `Esc`, the canvas hit its ceiling, the export
-    /// budget ran out — and a message that says only "3 of 5 rows were written" forces the caller to
-    /// guess, which is the guess §26.2 rule 3 exists to remove. The reason is already a parameter;
-    /// today it is dropped on the floor (`_outcome`).
+    /// A PNG's height is in its header, so a write that stops early is refused, and the refusal
+    /// says how much arrived.
     #[test]
-    fn a_short_export_says_why_it_was_cut_short() {
-        for (reason, wording) in [
-            (AbortReason::Cancelled, "cancelled"),
-            (AbortReason::MemoryLimit, "memory"),
-            (AbortReason::ExportBudget, "budget"),
-        ] {
-            let meta = meta(4, 5);
-            let mut sink = PngRowBandSink::new();
-            let mut writer = sink.begin(&meta).expect("a PNG of 4x5");
-            writer.write_rows(0, &bgra(4, 3)).expect("rows 0-2");
-
-            let error = match writer.finish(Some(reason)) {
-                Ok(_) => panic!("{reason:?}: three of five rows is not a decodable PNG"),
-                Err(error) => error,
-            };
-            let message = error.to_string();
-            assert!(
-                message.contains(wording),
-                "the refusal must name the reason it was given ({reason:?}, so the word `{wording}`), \
-                 got `{message}`"
-            );
-            assert!(
-                message.contains('3') && message.contains('5'),
-                "and it must still say how much arrived ({reason:?}), got `{message}`"
-            );
-        }
-    }
-
-    /// The shell is the first crate that can *name* the codes §26.3 fixes for the export path, so
-    /// what this pins is the boundary: `ScrollDiagnosticCode` is a §27.1 `pub` type that lives in a
-    /// `pub(crate)` module, and a `pub` enum inside a private module is unreachable from here until
-    /// `scroll/mod.rs` re-exports it (the `Axis` precedent).
-    ///
-    /// The names are asserted here as well as in `session.rs` on purpose: the *log line* is what the
-    /// shell emits, so the spelling is this crate's contract with `§26.4`'s channel.
-    #[test]
-    fn the_shell_can_name_the_export_diagnostics() {
-        use snapclip_capture::scroll::ScrollDiagnosticCode;
-
-        assert_eq!(
-            ScrollDiagnosticCode::ExportTrimmed.as_str(),
-            "export_trimmed"
-        );
-        assert_eq!(
-            ScrollDiagnosticCode::ArtifactDiscarded.as_str(),
-            "artifact_discarded"
+    fn a_short_export_is_refused() {
+        let meta = meta(4, 5);
+        let mut sink = PngRowBandSink::new();
+        let mut writer = sink.begin(&meta).expect("a PNG of 4x5");
+        writer.write_rows(0, &bgra(4, 3)).expect("rows 0-2");
+        let error = match writer.finish() {
+            Ok(_) => panic!("three of five rows is not a decodable PNG"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("3 of 5"),
+            "the refusal must say how much arrived, got `{message}`"
         );
     }
 }

@@ -38,9 +38,7 @@ use crate::window_detection::deep::{
 use crate::window_detection::model::{
     PathLevel, RequestGate, RequestId, SnapshotEpoch, TargetKind, WindowIdentity,
 };
-use crate::window_detection::uia::{
-    MAX_PATH_LEN, level_kind_of_msaa_role, should_adopt_msaa_box,
-};
+use crate::window_detection::uia::{MAX_PATH_LEN, level_kind_of_msaa_role, should_adopt_msaa_box};
 
 use super::msaa_provider::{MsaaDeepSelectionProvider, MsaaHitBox, MsaaHitFailure};
 use super::uia_provider::UiaDeepSelectionProvider;
@@ -166,7 +164,9 @@ impl FallbackDeepSelection {
         };
         let outcome = if msaa_adopted || uia_adopted {
             PrecisionOutcome::Adopted
-        } else if msaa_usable || uia.is_some_and(|decision| decision.outcome != PrecisionOutcome::Unavailable) {
+        } else if msaa_usable
+            || uia.is_some_and(|decision| decision.outcome != PrecisionOutcome::Unavailable)
+        {
             PrecisionOutcome::NotFiner
         } else {
             PrecisionOutcome::Unavailable
@@ -188,7 +188,13 @@ fn decision_name(outcome: crate::diagnostics::PrecisionOutcome) -> &'static str 
 /// `WxH at (x,y)`, with the visible part when the ancestors trimmed the box.
 fn describe_box(raw: Rect, visible: Rect) -> String {
     if raw == visible {
-        format!("{}x{} at ({},{})", raw.width(), raw.height(), raw.left, raw.top)
+        format!(
+            "{}x{} at ({},{})",
+            raw.width(),
+            raw.height(),
+            raw.left,
+            raw.top
+        )
     } else {
         format!(
             "{}x{} at ({},{}) visible={}x{} at ({},{})",
@@ -479,11 +485,7 @@ impl Drop for RefinementWorker {
     }
 }
 
-fn run(
-    shared: Arc<Shared>,
-    metrics: WindowDetectionMetrics,
-    factory: ProviderFactory,
-) {
+fn run(shared: Arc<Shared>, metrics: WindowDetectionMetrics, factory: ProviderFactory) {
     // Born here, on the thread that will use it: this is where COM gets initialised.
     let mut provider = factory();
     loop {
@@ -497,13 +499,17 @@ fn run(
                     provider.release();
                     return;
                 }
-                pending = match shared.wake.wait_timeout(pending, std::time::Duration::from_millis(50))
+                pending = match shared
+                    .wake
+                    .wait_timeout(pending, std::time::Duration::from_millis(50))
                 {
                     Ok((guard, _)) => guard,
                     Err(_) => return,
                 };
             }
-            pending.take().expect("the loop only exits with a job in hand")
+            pending
+                .take()
+                .expect("the loop only exits with a job in hand")
         };
 
         // A query that was superseded before it started is dropped, not run: the whole
@@ -587,9 +593,9 @@ fn publish(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::window_detection::RefinementScheduler;
     use crate::window_detection::deep::{DeepTarget, StopReason};
     use crate::window_detection::model::TargetKind;
-    use crate::window_detection::RefinementScheduler;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::time::Duration;
 
@@ -603,7 +609,10 @@ mod tests {
             kind: TargetKind::UiElement,
             screen_bounds: bounds,
             path: vec![
-                PathLevel::new(Rect::new(0, 0, 1000, 800), crate::window_detection::LevelKind::Window),
+                PathLevel::new(
+                    Rect::new(0, 0, 1000, 800),
+                    crate::window_detection::LevelKind::Window,
+                ),
                 PathLevel::unknown(bounds),
             ],
             stop_reason: reason,
@@ -724,7 +733,9 @@ mod tests {
                 .on_cursor_moved(1, Some(window()), Point::new(20, 20))
                 .arm_dwell
         );
-        let job = scheduler.on_dwell_due().expect("session one issues a query");
+        let job = scheduler
+            .on_dwell_due()
+            .expect("session one issues a query");
         worker.request(job, Rect::new(0, 0, 100, 100));
         let result = wait_for(&worker, Duration::from_secs(5)).expect("session one answers");
         let RefinementOutcome::Target(target) = result.outcome else {
@@ -745,7 +756,9 @@ mod tests {
                 .on_cursor_moved(2, Some(window()), Point::new(30, 30))
                 .arm_dwell
         );
-        let job = scheduler.on_dwell_due().expect("session two issues a query");
+        let job = scheduler
+            .on_dwell_due()
+            .expect("session two issues a query");
         worker.request(job, Rect::new(0, 0, 100, 100));
         let result = wait_for(&worker, Duration::from_secs(5)).expect("session two answers");
         let RefinementOutcome::Target(target) = result.outcome else {
@@ -790,7 +803,10 @@ mod tests {
             }
             other => panic!("expected a target, got {other:?}"),
         }
-        assert!(!observed.load(Ordering::SeqCst), "nobody cancelled this query");
+        assert!(
+            !observed.load(Ordering::SeqCst),
+            "nobody cancelled this query"
+        );
     }
 
     #[test]

@@ -35,7 +35,7 @@ use ::windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInte
 use ::windows::core::{Interface, factory};
 
 use super::super::monitor;
-use super::d3d11::{GraphicsDevice, GpuFrame};
+use super::d3d11::{GpuFrame, GraphicsDevice};
 
 /// How long to wait for the first frame before falling back to another provider.
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -190,21 +190,19 @@ type ArrivalHandler = ::windows::Foundation::TypedEventHandler<
 
 impl FrameArrivalEvent {
     fn new() -> Self {
-        let handle = unsafe {
-            CreateEventW(None, true, false, ::windows::core::PCWSTR::null())
-        }
-        .unwrap_or(HANDLE(core::ptr::null_mut()));
+        let handle = unsafe { CreateEventW(None, true, false, ::windows::core::PCWSTR::null()) }
+            .unwrap_or(HANDLE(core::ptr::null_mut()));
         Self(handle)
     }
 
     fn is_valid(&self) -> bool {
-        !self.0 .0.is_null() && self.0 .0 != (-1isize as *mut core::ffi::c_void)
+        !self.0.0.is_null() && self.0.0 != (-1isize as *mut core::ffi::c_void)
     }
 
     fn handler(&self) -> ArrivalHandler {
         // The callback holds only the raw HANDLE value (not a reference to
         // this struct), so it stays valid for as long as the event exists.
-        let handle = self.0 .0 as isize;
+        let handle = self.0.0 as isize;
         ArrivalHandler::new(move |_sender, _args| {
             let handle = HANDLE(handle as *mut core::ffi::c_void);
             unsafe {
@@ -289,24 +287,15 @@ fn create_item_for_monitor(handle: isize) -> Result<GraphicsCaptureItem, WgcErro
             }
         })?;
     let monitor = ::windows::Win32::Graphics::Gdi::HMONITOR(handle as *mut core::ffi::c_void);
-    unsafe { interop.CreateForMonitor(monitor) }.map_err(|error| {
-        WgcError::Failed {
-            context: "IGraphicsCaptureItemInterop::CreateForMonitor",
-            detail: super::hresult("IGraphicsCaptureItemInterop::CreateForMonitor", &error),
-        }
+    unsafe { interop.CreateForMonitor(monitor) }.map_err(|error| WgcError::Failed {
+        context: "IGraphicsCaptureItemInterop::CreateForMonitor",
+        detail: super::hresult("IGraphicsCaptureItemInterop::CreateForMonitor", &error),
     })
 }
 
-/// Why a window-level capture could not be set up or continued.
-///
-/// Deliberately **not** the crate-level `CaptureError`: the scrolling path has to
-/// tell "the target is gone" apart from "capture broke" (the first becomes
-/// `EndReason::TargetLost` and a `Partial` artifact, the second is a failure), and
-/// `CaptureError::WindowFailed` folds both into one variant.
+/// Why a capture session could not be set up or continued.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WgcError {
-    /// The handle does not name a capturable top-level window.
-    InvalidTarget { handle: isize, detail: String },
     /// The capture machinery itself failed.
     Failed {
         context: &'static str,
@@ -317,48 +306,9 @@ pub enum WgcError {
 impl core::fmt::Display for WgcError {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::InvalidTarget { handle, detail } => {
-                write!(formatter, "0x{handle:x} is not a capturable window: {detail}")
-            }
             Self::Failed { context, detail } => write!(formatter, "{context}: {detail}"),
         }
     }
-}
-
-/// Classify a `CreateForWindow` failure into "not a target" or "capture broke".
-///
-/// `E_INVALIDARG` is what an invalid or already-destroyed handle returns (measured
-/// in `E-CAP-1`: `CreateForWindow(0)` yields `#code -2147024809`), and `E_HANDLE` is
-/// the same refusal spelled the other way. Everything else is a capture failure.
-fn classify_item_error(handle: isize, error: &::windows::core::Error) -> WgcError {
-    let detail = super::hresult("IGraphicsCaptureItemInterop::CreateForWindow", error);
-    if error.code() == ::windows::Win32::Foundation::E_INVALIDARG
-        || error.code() == ::windows::Win32::Foundation::E_HANDLE
-    {
-        WgcError::InvalidTarget { handle, detail }
-    } else {
-        WgcError::Failed {
-            context: "IGraphicsCaptureItemInterop::CreateForWindow",
-            detail,
-        }
-    }
-}
-
-/// Build a capture item for a **top-level window** (`docs/30 §24.2`).
-///
-/// Coexists with [`create_item_for_monitor`]: the ordinary screenshot path keeps
-/// capturing the monitor, because changing it is a regression risk with no benefit
-/// to the scrolling feature (§21.3).
-pub fn create_item_for_window(hwnd: isize) -> Result<GraphicsCaptureItem, WgcError> {
-    let interop: IGraphicsCaptureItemInterop =
-        factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>().map_err(|error| {
-            WgcError::Failed {
-                context: "GraphicsCaptureItem interop factory",
-                detail: super::hresult("GraphicsCaptureItem interop factory", &error),
-            }
-        })?;
-    let window = ::windows::Win32::Foundation::HWND(hwnd as *mut core::ffi::c_void);
-    unsafe { interop.CreateForWindow(window) }.map_err(|error| classify_item_error(hwnd, &error))
 }
 
 /// Wrap a D3D11 device as the WinRT `IDirect3DDevice` the frame pool wants.
@@ -367,12 +317,13 @@ fn direct3d_device(device: &GraphicsDevice) -> Result<IDirect3DDevice, WgcError>
         context: "IDXGIDevice::cast",
         detail: super::hresult("IDXGIDevice::cast", &error),
     })?;
-    let inspectable = unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device) }.map_err(
-        |error| WgcError::Failed {
-            context: "CreateDirect3D11DeviceFromDXGIDevice",
-            detail: super::hresult("CreateDirect3D11DeviceFromDXGIDevice", &error),
-        },
-    )?;
+    let inspectable =
+        unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device) }.map_err(|error| {
+            WgcError::Failed {
+                context: "CreateDirect3D11DeviceFromDXGIDevice",
+                detail: super::hresult("CreateDirect3D11DeviceFromDXGIDevice", &error),
+            }
+        })?;
     inspectable.cast().map_err(|error| WgcError::Failed {
         context: "IDirect3DDevice::cast",
         detail: super::hresult("IDirect3DDevice::cast", &error),
@@ -630,18 +581,7 @@ pub struct WgcSession {
 }
 
 impl WgcSession {
-    /// Open a capture session on a top-level window.
-    ///
-    /// An unusable handle is [`WgcError::InvalidTarget`]; everything after the item
-    /// exists is [`WgcError::Failed`]. Capture **options** never fail the session:
-    /// each unavailable option is recorded in [`Self::diagnostics`] and the session
-    /// starts anyway, because a missing option changes what the pixels contain, not
-    /// whether there are pixels (the full capability model is `P2.04`).
-    pub fn open(device: &GraphicsDevice, hwnd: isize) -> Result<Self, WgcError> {
-        Self::open_item(device, create_item_for_window(hwnd)?)
-    }
-
-    /// Open a capture session on a **monitor** (`docs/32` `P7.13c`; `SCROLL_BACKENDS`'s second stage).
+    /// Open a capture session on a **monitor** (`docs/32` `P7.13c`; `SCROLL_BACKENDS`'s first stage).
     ///
     /// The item is the whole monitor, so the caller's region is expressed in **monitor** coordinates.
     /// `handle` is the monitor handle from `MonitorFromWindow`/`MonitorFromPoint`; the interop wants
@@ -677,10 +617,7 @@ impl WgcSession {
         )
         .map_err(|error| WgcError::Failed {
             context: "Direct3D11CaptureFramePool::CreateFreeThreaded",
-            detail: super::hresult(
-                "Direct3D11CaptureFramePool::CreateFreeThreaded",
-                &error,
-            ),
+            detail: super::hresult("Direct3D11CaptureFramePool::CreateFreeThreaded", &error),
         })?;
 
         let mut diagnostics = Vec::new();
@@ -776,7 +713,10 @@ impl WgcSession {
                                 &self.device,
                                 DirectXPixelFormat::B8G8R8A8UIntNormalized,
                                 SESSION_POOL_BUFFERS,
-                                SizeInt32 { Width: width, Height: height },
+                                SizeInt32 {
+                                    Width: width,
+                                    Height: height,
+                                },
                             )
                             .map_err(|error| WgcError::Failed {
                                 context: "Direct3D11CaptureFramePool::Recreate",
@@ -839,15 +779,9 @@ impl Drop for WgcSession {
 #[cfg(test)]
 mod tests {
     use super::{
-        CaptureOptionTarget, CaptureOptions, PoolSizing, Sizing, WgcError, WgcSession,
-        create_item_for_window, is_supported, probe_capture_options,
+        CaptureOptionTarget, CaptureOptions, PoolSizing, Sizing, is_supported,
+        probe_capture_options,
     };
-    use crate::windows::scroll_probe::{
-        WindowMatch, pump_for, visible_windows, wait_for_new_window,
-    };
-    use std::time::Duration;
-
-    use super::GraphicsDevice;
 
     #[test]
     fn support_probe_never_panics() {
@@ -876,7 +810,7 @@ mod tests {
     #[test]
     fn winrt_activation_keeps_the_implicit_apartment() {
         use ::windows::Win32::System::Com::{
-            APTTYPE, APTTYPEQUALIFIER, APTTYPEQUALIFIER_IMPLICIT_MTA, APTTYPE_MTA,
+            APTTYPE, APTTYPE_MTA, APTTYPEQUALIFIER, APTTYPEQUALIFIER_IMPLICIT_MTA,
             CoGetApartmentType,
         };
 
@@ -929,69 +863,6 @@ mod tests {
         });
 
         checked.join().expect("the probe thread must not panic");
-    }
-
-    /// A window capture item can be created for a real top-level window, and an
-    /// invalid handle is a **typed** refusal rather than a panic (`P2.01`).
-    ///
-    /// The invalid half is known to work without a desktop (`docs/30 §24.2.1`:
-    /// WinRT activation succeeds without `RoInitialize`, and `CreateForWindow(0)`
-    /// returns `E_INVALIDARG` = `#code -2147024809`), so it is asserted
-    /// unconditionally; the real half needs a desktop and a capturable window, so
-    /// it is `#[ignore]` rather than a silent skip (the rule in `P2.08`/`D-14`).
-    #[test]
-    #[ignore = "P2.01: needs a real interactive desktop and a capturable window"]
-    fn a_window_capture_item_can_be_created_for_a_top_level_window() {
-        let invalid = create_item_for_window(0);
-        assert!(
-            matches!(invalid, Err(WgcError::InvalidTarget { .. })),
-            "an invalid handle must be a typed InvalidTarget, not a panic and not a \
-             generic failure: {invalid:?}"
-        );
-
-        let known: Vec<_> = visible_windows()
-            .into_iter()
-            .map(|window| window.hwnd)
-            .collect();
-        let mut notepad = std::process::Command::new("notepad.exe")
-            .spawn()
-            .expect("notepad.exe must be launchable on this machine");
-        let window = wait_for_new_window(&known, WindowMatch::Any, Duration::from_secs(10))
-            .expect("notepad must create a top-level window within 10s");
-        pump_for(Duration::from_millis(300));
-
-        let handle = window.hwnd as isize;
-        let item = create_item_for_window(handle)
-            .unwrap_or_else(|error| panic!("a top-level window must be capturable: {error:?}"));
-        let content = item.Size().expect("the item must report a content size");
-        assert!(
-            content.Width > 0 && content.Height > 0,
-            "the item reported a degenerate content size: {content:?}"
-        );
-
-        let device = GraphicsDevice::create().expect("this test needs a D3D11 device");
-        let session = WgcSession::open(&device, handle)
-            .expect("a capture session must open on a capturable window");
-        assert_eq!(
-            session.size(),
-            (content.Width, content.Height),
-            "the session must take its size from the item, not from the window rectangle \
-             (docs/30 §24.2.1 fact 7)"
-        );
-        assert_eq!(
-            session.recreations(),
-            0,
-            "opening a session must not recreate the pool"
-        );
-        assert!(
-            session.diagnostics().is_empty(),
-            "no capture option should have been unavailable on this machine: {:?}",
-            session.diagnostics()
-        );
-        drop(session);
-
-        let _ = notepad.kill();
-        let _ = notepad.wait();
     }
 
     /// The pool is recreated when the content size changes, **never per frame**.
@@ -1105,7 +976,9 @@ mod tests {
         );
         assert_eq!(options.cursor_control, None);
         assert!(
-            diagnostics.iter().any(|line| line.contains("IGraphicsCaptureSession3")),
+            diagnostics
+                .iter()
+                .any(|line| line.contains("IGraphicsCaptureSession3")),
             "the absent interface must be named in the diagnostics, got {diagnostics:?}"
         );
 
@@ -1140,7 +1013,9 @@ mod tests {
             probe_capture_options(&mut target);
         assert_eq!(options.cursor_control, None);
         assert!(
-            diagnostics.iter().any(|line| line.contains("IGraphicsCaptureSession2")),
+            diagnostics
+                .iter()
+                .any(|line| line.contains("IGraphicsCaptureSession2")),
             "the degradation must be recorded, not swallowed, got {diagnostics:?}"
         );
 
@@ -1163,6 +1038,3 @@ mod tests {
         );
     }
 }
-
-
-

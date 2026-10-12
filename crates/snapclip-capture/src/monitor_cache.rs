@@ -32,10 +32,7 @@ impl MonitorCache {
     /// A zero-area monitor rectangle would make every window look off-screen, so an
     /// unusable entry is dropped rather than trusted.
     pub fn from_bounds(bounds: impl IntoIterator<Item = Rect>) -> Self {
-        let bounds = bounds
-            .into_iter()
-            .filter(|rect| !rect.is_empty())
-            .collect();
+        let bounds = bounds.into_iter().filter(|rect| !rect.is_empty()).collect();
         Self { bounds }
     }
 

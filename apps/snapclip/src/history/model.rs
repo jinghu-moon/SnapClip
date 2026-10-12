@@ -6,8 +6,8 @@
 
 use std::path::Path;
 
-use snapclip_history::store::Store;
 use snapclip_history::StoreError;
+use snapclip_history::store::Store;
 use snapclip_model::{ClipSummary, PayloadKind, PayloadRef};
 
 /// Rows fetched per page. The list is virtualized, so this is a paging decision only.
@@ -144,12 +144,8 @@ impl HistoryState {
         // One call covers all four combinations: the store treats an empty query as "no text
         // filter" and an absent kind as "every kind". Splitting them here (as the first slice
         // did) is how `kind` would silently stop applying to an empty search box.
-        self.store.search_history_page(
-            self.query.clone(),
-            self.kind.clone(),
-            cursor,
-            PAGE_SIZE,
-        )
+        self.store
+            .search_history_page(self.query.clone(), self.kind.clone(), cursor, PAGE_SIZE)
     }
 
     /// Delete the selected entry. Returns the id that was removed.
@@ -180,10 +176,10 @@ impl HistoryState {
             .payloads
             .iter()
             .find(|payload| payload.kind == PayloadKind::Image)?;
-        Some(self.store.read_payload_bytes(
-            image.content_hash.clone(),
-            PayloadKind::Image,
-        ))
+        Some(
+            self.store
+                .read_payload_bytes(image.content_hash.clone(), PayloadKind::Image),
+        )
     }
 
     /// The inline spans of `item`, when it carries rich text.
@@ -280,9 +276,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use snapclip_history::store::Store;
-    use snapclip_model::{
-        PayloadData, PayloadKind, PayloadRef, Publication, PublicationOrigin,
-    };
+    use snapclip_model::{PayloadData, PayloadKind, PayloadRef, Publication, PublicationOrigin};
 
     use super::HistoryState;
 
@@ -464,7 +458,11 @@ mod tests {
         {
             let store = Store::open(&dir).unwrap();
             for index in 0..120 {
-                save(&store, &format!("clip-{index:03}"), &format!("entry {index}"));
+                save(
+                    &store,
+                    &format!("clip-{index:03}"),
+                    &format!("entry {index}"),
+                );
             }
         }
         let mut state = HistoryState::open(&dir).unwrap();
@@ -493,7 +491,11 @@ mod tests {
         {
             let store = Store::open(&dir).unwrap();
             for index in 0..60 {
-                save(&store, &format!("clip-{index:03}"), &format!("entry {index}"));
+                save(
+                    &store,
+                    &format!("clip-{index:03}"),
+                    &format!("entry {index}"),
+                );
             }
         }
         let mut state = HistoryState::open(&dir).unwrap();
@@ -546,7 +548,11 @@ mod tests {
         );
 
         assert!(state.set_kind(None).unwrap());
-        assert_eq!(state.items().len(), 1, "the text row is back once unfiltered");
+        assert_eq!(
+            state.items().len(),
+            1,
+            "the text row is back once unfiltered"
+        );
         assert_eq!(state.items()[0].id, "clip-text");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -587,7 +593,10 @@ mod tests {
             .iter()
             .find(|item| item.id == "clip-image")
             .unwrap();
-        let bytes = state.image_bytes(image).expect("image row has bytes").unwrap();
+        let bytes = state
+            .image_bytes(image)
+            .expect("image row has bytes")
+            .unwrap();
         assert_eq!(bytes, b"png bytes");
         let text = state
             .items()
@@ -623,7 +632,9 @@ mod tests {
             .unwrap();
         let spans = state.rich_spans(rtf).expect("the RTF row has spans");
         assert!(
-            spans.iter().any(|span| span.bold && span.text.contains("bold")),
+            spans
+                .iter()
+                .any(|span| span.bold && span.text.contains("bold")),
             "expected a bold span, got {spans:?}"
         );
         assert!(

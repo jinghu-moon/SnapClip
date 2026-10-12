@@ -9,7 +9,6 @@ pub(super) struct HistoryCursor {
     pub(super) id: String,
 }
 
-
 pub(super) fn insert_publication(
     connection: &Connection,
     blob_store: &BlobStore,
@@ -168,4 +167,3 @@ pub(super) fn truncate_chars(value: &str, max_chars: usize) -> String {
         prefix
     }
 }
-

@@ -40,7 +40,10 @@ pub enum PointerGesture {
         selection_before_press: Rect,
     },
     /// Button moved past the drag threshold and the gesture became a free drag.
-    ManualDrag { press_point: Point, mode: ResizeMode },
+    ManualDrag {
+        press_point: Point,
+        mode: ResizeMode,
+    },
     /// Dragging an existing selection by its interior.
     MoveSelection,
     /// Dragging one of the eight resize grips.
@@ -243,8 +246,7 @@ impl GestureState {
             PointerGesture::ManualDrag { .. }
             | PointerGesture::MoveSelection
             | PointerGesture::ResizeSelection => ReleaseOutcome::CommitDrag,
-            PointerGesture::None
-            | PointerGesture::PendingPointer { .. } => ReleaseOutcome::Click,
+            PointerGesture::None | PointerGesture::PendingPointer { .. } => ReleaseOutcome::Click,
         };
         // The preview deliberately survives: `Click` + `snap_preview().is_some()` is the
         // left-click confirm (docs/14 §4.3).
@@ -269,7 +271,10 @@ impl GestureState {
         }
         match preview {
             Some((target, selection, selection_before_preview)) => {
-                if self.preview.is_some_and(|current| current.selection == selection) {
+                if self
+                    .preview
+                    .is_some_and(|current| current.selection == selection)
+                {
                     return false;
                 }
                 self.preview = Some(SnapPreview {
@@ -345,17 +350,27 @@ mod tests {
         let generation = state.dwell_generation();
         assert!(state.apply_dwell(
             generation,
-            Some((snap_target(), selection(100, 100, 300, 200), Rect::default()))
+            Some((
+                snap_target(),
+                selection(100, 100, 300, 200),
+                Rect::default()
+            ))
         ));
         // A preview never changes what the pointer is doing...
         assert_eq!(*state.gesture(), PointerGesture::None);
         assert_eq!(
-            state.snap_preview().map(|preview| preview.target.identity().hwnd),
+            state
+                .snap_preview()
+                .map(|preview| preview.target.identity().hwnd),
             Some(snap_target().identity().hwnd)
         );
         // ...and pressing does not destroy it, because the click that follows is the
         // confirm gesture (docs/14 §4.3).
-        state.press(Point::new(150, 150), SelectionGeometry::Create, Rect::default());
+        state.press(
+            Point::new(150, 150),
+            SelectionGeometry::Create,
+            Rect::default(),
+        );
         assert!(state.snap_preview().is_some());
     }
 
@@ -418,7 +433,11 @@ mod tests {
         let mut state = GestureState::new(4);
         let current = selection(10, 10, 200, 150);
         assert_eq!(
-            state.press(Point::new(10, 10), SelectionGeometry::Resize(Handle::TopLeft), current),
+            state.press(
+                Point::new(10, 10),
+                SelectionGeometry::Resize(Handle::TopLeft),
+                current
+            ),
             PressOutcome::BeginEdit(ResizeMode::Handle(Handle::TopLeft))
         );
         assert_eq!(state.gesture(), &PointerGesture::ResizeSelection);
@@ -439,8 +458,14 @@ mod tests {
         state.press(Point::new(500, 500), SelectionGeometry::Outside, before);
 
         // 2 px of jitter never becomes a drag.
-        assert_eq!(state.move_cursor(Point::new(502, 501)), MoveOutcome::Pending);
-        assert_eq!(state.move_cursor(Point::new(501, 501)), MoveOutcome::Pending);
+        assert_eq!(
+            state.move_cursor(Point::new(502, 501)),
+            MoveOutcome::Pending
+        );
+        assert_eq!(
+            state.move_cursor(Point::new(501, 501)),
+            MoveOutcome::Pending
+        );
         assert_eq!(
             state.gesture(),
             &PointerGesture::PendingPointer {
@@ -460,7 +485,10 @@ mod tests {
         );
         assert!(matches!(state.gesture(), PointerGesture::ManualDrag { .. }));
         // Further movement just continues the drag.
-        assert_eq!(state.move_cursor(Point::new(600, 520)), MoveOutcome::Dragging);
+        assert_eq!(
+            state.move_cursor(Point::new(600, 520)),
+            MoveOutcome::Dragging
+        );
         assert_eq!(state.release(), ReleaseOutcome::CommitDrag);
     }
 
@@ -472,13 +500,24 @@ mod tests {
         let generation = state.dwell_generation();
         assert!(state.apply_dwell(
             generation,
-            Some((snap_target(), selection(100, 100, 300, 200), Rect::default()))
+            Some((
+                snap_target(),
+                selection(100, 100, 300, 200),
+                Rect::default()
+            ))
         ));
         assert_eq!(
-            state.press(Point::new(150, 150), SelectionGeometry::Create, Rect::default()),
+            state.press(
+                Point::new(150, 150),
+                SelectionGeometry::Create,
+                Rect::default()
+            ),
             PressOutcome::Pending
         );
-        assert_eq!(state.move_cursor(Point::new(151, 151)), MoveOutcome::Pending);
+        assert_eq!(
+            state.move_cursor(Point::new(151, 151)),
+            MoveOutcome::Pending
+        );
         assert_eq!(state.release(), ReleaseOutcome::Click);
         assert!(
             state.snap_preview().is_some(),
@@ -492,9 +531,17 @@ mod tests {
         let generation = state.dwell_generation();
         assert!(state.apply_dwell(
             generation,
-            Some((snap_target(), selection(100, 100, 300, 200), Rect::default()))
+            Some((
+                snap_target(),
+                selection(100, 100, 300, 200),
+                Rect::default()
+            ))
         ));
-        state.press(Point::new(500, 500), SelectionGeometry::Outside, Rect::default());
+        state.press(
+            Point::new(500, 500),
+            SelectionGeometry::Outside,
+            Rect::default(),
+        );
         assert_eq!(
             state.move_cursor(Point::new(600, 600)),
             MoveOutcome::ManualDragStarted {
@@ -535,7 +582,11 @@ mod tests {
         assert!(
             !state.apply_dwell(
                 armed,
-                Some((snap_target(), selection(100, 100, 200, 200), Rect::default()))
+                Some((
+                    snap_target(),
+                    selection(100, 100, 200, 200),
+                    Rect::default()
+                ))
             ),
             "a timer armed for an older position must be ignored"
         );
@@ -545,7 +596,11 @@ mod tests {
     #[test]
     fn a_held_button_blocks_the_dwell_preview() {
         let mut state = GestureState::new(4);
-        state.press(Point::new(10, 10), SelectionGeometry::Outside, Rect::default());
+        state.press(
+            Point::new(10, 10),
+            SelectionGeometry::Outside,
+            Rect::default(),
+        );
         let generation = state.dwell_generation();
         assert!(
             !state.apply_dwell(
@@ -562,23 +617,37 @@ mod tests {
         let generation = state.dwell_generation();
         assert!(state.apply_dwell(
             generation,
-            Some((snap_target(), selection(100, 100, 300, 200), Rect::default()))
+            Some((
+                snap_target(),
+                selection(100, 100, 300, 200),
+                Rect::default()
+            ))
         ));
         // Same rectangle: no change, so the overlay can skip the repaint.
         assert!(!state.apply_dwell(
             generation,
-            Some((snap_target(), selection(100, 100, 300, 200), Rect::default()))
+            Some((
+                snap_target(),
+                selection(100, 100, 300, 200),
+                Rect::default()
+            ))
         ));
         // Another candidate: replaced.
         assert!(state.apply_dwell(
             generation,
             Some((target(4), selection(400, 400, 500, 500), Rect::default()))
         ));
-        assert_eq!(state.snap_preview().unwrap().selection, selection(400, 400, 500, 500));
+        assert_eq!(
+            state.snap_preview().unwrap().selection,
+            selection(400, 400, 500, 500)
+        );
         // Leaving the snap radius clears it.
         assert!(state.apply_dwell(generation, None));
         assert!(state.snap_preview().is_none());
-        assert!(!state.apply_dwell(generation, None), "clearing twice is a no-op");
+        assert!(
+            !state.apply_dwell(generation, None),
+            "clearing twice is a no-op"
+        );
     }
 
     #[test]
@@ -606,7 +675,11 @@ mod tests {
             generation,
             Some((snap_target(), selection(1, 1, 2, 2), Rect::default())),
         );
-        state.press(Point::new(5, 5), SelectionGeometry::Outside, Rect::default());
+        state.press(
+            Point::new(5, 5),
+            SelectionGeometry::Outside,
+            Rect::default(),
+        );
         state.reset();
         assert_eq!(*state.gesture(), PointerGesture::None);
         assert!(state.snap_preview().is_none());

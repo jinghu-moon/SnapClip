@@ -25,80 +25,77 @@ use std::time::{Duration, Instant};
 
 use windows_sys::Win32::{
     Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT, WPARAM},
-    Graphics::Gdi::{BeginPaint, CreateRectRgn, EndPaint, ScreenToClient, SetWindowRgn, PAINTSTRUCT},
+    Graphics::Gdi::{
+        BeginPaint, CreateRectRgn, EndPaint, PAINTSTRUCT, ScreenToClient, SetWindowRgn,
+    },
     System::LibraryLoader::GetModuleHandleW,
     System::Threading::GetCurrentThreadId,
     UI::{
         Controls::WM_MOUSELEAVE,
         Input::Ime::{ImmGetContext, ImmReleaseContext, ImmSetOpenStatus},
         Input::KeyboardAndMouse::{
-            GetAsyncKeyState, GetKeyState, MapVirtualKeyW, SetFocus, VK_CONTROL, VK_LBUTTON,
-            VK_MBUTTON, VK_RBUTTON, MAPVK_VSC_TO_VK,
+            GetAsyncKeyState, GetKeyState, MAPVK_VSC_TO_VK, MapVirtualKeyW, SetFocus, VK_CONTROL,
+            VK_LBUTTON, VK_MBUTTON, VK_MENU, VK_RBUTTON, VK_SHIFT,
         },
         WindowsAndMessaging::{
-            IDC_ARROW, IDC_CROSS, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE,
-            LoadCursorW,
-            SetCursor,
             CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow,
-            DispatchMessageW, GetCursorPos, GetForegroundWindow, GetMessageW, MSG, PeekMessageW,
-            PostQuitMessage,
-            PostThreadMessageW, RegisterClassW, SW_HIDE, SW_SHOW, SetForegroundWindow,
-            SetWindowPos, SetTimer, KillTimer, GetSystemMetrics, SM_CXDRAG,
-            SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE,
-            ShowWindow, TranslateMessage, UnregisterClassW, WM_APP, WM_DESTROY, WM_DEVICECHANGE,
-            WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP,
-            WM_MOUSEWHEEL, WM_SETFOCUS, WM_LBUTTONDOWN,
-            WM_MOUSEACTIVATE,
-            WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_RBUTTONDOWN,
-            WM_SETCURSOR, WM_TIMER, WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW,
-            WS_EX_TOPMOST, WS_POPUP, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, MA_ACTIVATE,
+            DispatchMessageW, GetCursorPos, GetForegroundWindow, GetMessageW, GetSystemMetrics,
+            HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, IDC_CROSS, IDC_SIZEALL, IDC_SIZENESW,
+            IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, KillTimer, LoadCursorW, MA_ACTIVATE, MSG,
+            PeekMessageW, PostQuitMessage, PostThreadMessageW, RegisterClassW, SM_CXDRAG, SW_HIDE,
+            SW_SHOW, SetCursor, SetForegroundWindow, SetTimer, SetWindowDisplayAffinity,
+            SetWindowPos, ShowWindow, TranslateMessage, UnregisterClassW, WDA_EXCLUDEFROMCAPTURE,
+            WM_APP, WM_DESTROY, WM_DEVICECHANGE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND,
+            WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE,
+            WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR,
+            WM_SETFOCUS, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW,
+            WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
         },
     },
 };
 
-use crate::artifact::{CaptureService, SelectionPixels};
 use crate::annotation::{
     AnnotationCommand, AnnotationDocument, AnnotationGeometry, AnnotationHandle, AnnotationId,
     AnnotationItem, AnnotationKind, DocumentSnapshot,
 };
-use crate::ports::{ArtifactWriter, CaptureEventSink, ClipboardWriter, OverlayPlatform};
+use crate::artifact::{CaptureService, SelectionPixels};
 use crate::diagnostics::WindowDetectionMetrics;
 use crate::geometry::{
     Handle, LevelReach, MagnifierConfig, MonitorLayout, Point, Rect, ResizeMode, SelectionGeometry,
     magnifier_geometry, window_rect_to_local,
 };
+use crate::keymap::{Action, Chord, Context, GuideGroup, Key, LoupeHint};
+use crate::ports::{ArtifactWriter, CaptureEventSink, ClipboardWriter, OverlayPlatform};
+use crate::preferences::OverlayPreferences;
 use crate::sampler::{ColorFormat, ColorSampler};
-use crate::session::{CaptureSession, ExportOutcome};
+use crate::session::{CaptureSession, CapturedFrame, ExportOutcome};
 use crate::window_detection::model::RequestId;
 use crate::window_detection::{
-    DEFAULT_DWELL_MS, DEFAULT_HOVER_REVALIDATE_MS, DEFAULT_SNAP_RADIUS_PX,
-    DeepTarget, Exclusions, LevelChain, LevelKind, PathLevel, RingOptions, RingRole, chain_rings,
-    next_visible_stop, out_quad, stops_from,
-    GestureState, HoverValidity, MoveOutcome, PressOutcome, RefinementJob, RefinementOutcome,
-    RefinementScheduler,
-    ReleaseOutcome, Replacement, WindowSnapshot, WindowTarget, classify_replacement,
-    preview_bounds,
+    DEFAULT_DWELL_MS, DEFAULT_HOVER_REVALIDATE_MS, DEFAULT_SNAP_RADIUS_PX, DeepTarget, Exclusions,
+    GestureState, HoverValidity, LevelChain, LevelKind, MoveOutcome, PathLevel, PressOutcome,
+    RefinementJob, RefinementOutcome, RefinementScheduler, ReleaseOutcome, Replacement,
+    RingOptions, RingRole, WindowSnapshot, WindowTarget, chain_rings, classify_replacement,
+    next_visible_stop, out_quad, preview_bounds, stops_from,
 };
-use crate::{CaptureError, CaptureResult, CaptureState};
+use crate::{CaptureError, CaptureResult, CaptureState, PixelFormat};
 
 use super::capture_worker::{self, CaptureWorker, StartRequest};
 use super::detection_worker::{self, DetectionResult, DetectionWorker};
-use super::export_worker::{self, ExportExecutor, ExportJob, ExportSource, ExportWorker, RowBandJob};
-use super::win::window;
-use super::refinement_worker::{self, RefinementResult, RefinementWorker};
+use super::export_worker::{self, ExportExecutor, ExportJob, ExportWorker};
 use super::hotkey;
 use super::monitor::{self, CapturedMonitor};
 use super::providers::{FrozenFrame, FrozenFramePixels};
+use super::refinement_worker::{self, RefinementResult, RefinementWorker};
 use super::renderer::{OverlayFrameState, Win32Renderer};
-use super::win::d2d::ChainRingView;
+use super::win::d2d::{ChainRingView, GUIDE_AVOID_DIP, GuideView};
+use super::win::window;
 
 /// `WM_APP`-based command delivered from any thread to the overlay thread.
 const WM_OVERLAY_COMMAND: u32 = WM_APP + 17;
-/// `WM_APP`-based notification that the scroll session's state changed, sent from the scroll driver
-/// to the overlay thread (`docs/30` §21.4).
+/// `WM_APP`-based notification that the scroll thread published a report (`docs/33`), posted by
+/// [`super::scroll_worker`] to the overlay thread.
 ///
-/// `pub(crate)`: both ends live in this crate — the driver posts it, this overlay thread's message
-/// loop consumes it — so there is nothing to expose to the application. The offset is checked
+/// `pub(crate)`: both ends live in this crate. The offset is checked
 /// against every id that is already taken by
 /// `tests::the_scroll_message_id_collides_with_nothing_that_is_already_posted`.
 pub(crate) const SCROLL_READY_MESSAGE: u32 = WM_APP + 45;
@@ -175,12 +172,13 @@ impl OverlayCommand {
 
 pub(crate) use state::*;
 
-
 /// Cross-thread state shared between [`WindowsOverlay`] and the overlay thread.
 #[derive(Debug)]
 struct OverlayShared {
     state: CaptureState,
     session_id: Option<String>,
+    /// Written by the shell's thread, read by the overlay thread when a session starts.
+    preferences: OverlayPreferences,
 }
 
 /// The concrete `OverlayPlatform` used on Windows.
@@ -211,11 +209,12 @@ impl WindowsOverlay {
         clipboard: Arc<dyn ClipboardWriter>,
         writer: Arc<dyn ArtifactWriter>,
         options: crate::window_detection::DetectionOptions,
-    ) -> Result<Self, String>
-    {
+        preferences: OverlayPreferences,
+    ) -> Result<Self, String> {
         let shared = Arc::new(Mutex::new(OverlayShared {
             state: CaptureState::Idle,
             session_id: None,
+            preferences,
         }));
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         // Bounded so a stuck/slow overlay cannot let toolbar clicks pile up without
@@ -257,7 +256,6 @@ impl WindowsOverlay {
         }
     }
 
-
     /// Post a command to the overlay thread. Never blocks on the UI thread.
     ///
     /// Rejects new commands once shutdown has started; [`WindowsOverlay::shutdown`]
@@ -293,8 +291,9 @@ impl OverlayPlatform for WindowsOverlay {
         if self.state().is_active() {
             return Ok(false);
         }
-        self.post(OverlayCommand::Start)
-            .map_err(|message| CaptureError::WindowFailed(format!("start capture failed: {message}")))?;
+        self.post(OverlayCommand::Start).map_err(|message| {
+            CaptureError::WindowFailed(format!("start capture failed: {message}"))
+        })?;
         Ok(true)
     }
 
@@ -312,16 +311,25 @@ impl OverlayPlatform for WindowsOverlay {
         // `try_send`, not `send`: a wedged overlay must never block the caller.
         // The bounded mailbox only needs to absorb a burst of clicks; if it is
         // full the toolbar is simply told the overlay is not draining.
-        self.annotation_tx.try_send(command).map_err(|error| match error {
-            mpsc::TrySendError::Full(_) => CaptureError::InvalidState(
-                "annotation mailbox is full; the overlay is not draining".into(),
-            ),
-            mpsc::TrySendError::Disconnected(_) => {
-                CaptureError::InvalidState("overlay is not running".into())
-            }
-        })?;
-        self.post(OverlayCommand::Annotation)
-            .map_err(|message| CaptureError::InvalidState(format!("annotation command failed: {message}")))
+        self.annotation_tx
+            .try_send(command)
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => CaptureError::InvalidState(
+                    "annotation mailbox is full; the overlay is not draining".into(),
+                ),
+                mpsc::TrySendError::Disconnected(_) => {
+                    CaptureError::InvalidState("overlay is not running".into())
+                }
+            })?;
+        self.post(OverlayCommand::Annotation).map_err(|message| {
+            CaptureError::InvalidState(format!("annotation command failed: {message}"))
+        })
+    }
+
+    fn set_preferences(&self, preferences: OverlayPreferences) {
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.preferences = preferences;
+        }
     }
 
     fn shutdown(&self) {
@@ -330,12 +338,25 @@ impl OverlayPlatform for WindowsOverlay {
         // thread parked in `GetMessageW` forever and the `join` below hung with it.
         let first_call = !self.shutting_down.swap(true, Ordering::AcqRel);
         if !first_call {
+            eprintln!("[snapclip][capture] overlay shutdown ignored (already requested)");
             return;
         }
+        eprintln!("[snapclip][capture] overlay shutdown requested by WindowsOverlay::shutdown");
         // Posted directly rather than through `post`, which now rejects everything.
         if let Ok(thread_id) = self.thread_id.parse::<u32>() {
-            unsafe {
-                PostThreadMessageW(thread_id, WM_OVERLAY_COMMAND, OverlayCommand::Shutdown as WPARAM, 0);
+            let posted = unsafe {
+                PostThreadMessageW(
+                    thread_id,
+                    WM_OVERLAY_COMMAND,
+                    OverlayCommand::Shutdown as WPARAM,
+                    0,
+                )
+            };
+            if posted == 0 {
+                eprintln!(
+                    "[snapclip][capture] overlay shutdown post failed thread={thread_id} error={}",
+                    unsafe { GetLastError() }
+                );
             }
         }
         if let Ok(mut thread) = self.thread.lock()
@@ -494,8 +515,18 @@ struct OverlayController {
     magnifier_relative: bool,
     /// Current loupe zoom (`Z` + wheel). `0.1..=40.0`.
     magnifier_zoom: f32,
-    /// Whether the `Z` key is currently held (gates wheel-to-zoom).
-    z_held: bool,
+    /// The key held for a wheel gesture (`Z` for the loupe zoom), if any: the wheel is looked up
+    /// together with it.
+    held: Option<Key>,
+    /// The preferences this session started with (`OverlayPreferences`): a change in the settings
+    /// applies from the next session.
+    preferences: OverlayPreferences,
+    /// The loupe's hint row, built from this session's keymap.
+    loupe_hints: Arc<[LoupeHint]>,
+    /// The shortcut guide's groups, built from this session's keymap; empty when it is off.
+    guide_groups: Arc<[GuideGroup]>,
+    /// The guide's fade.
+    guide: GuideFade,
     /// The GPU slot index of the most recent async sample request.
     sample_slot: Option<usize>,
     /// Object-based annotation document (L2 layer).
@@ -518,37 +549,17 @@ struct OverlayController {
     current_generation: u64,
     /// Window that owned the foreground before the overlay appeared.
     previous_foreground: HWND,
-    /// The scroll session's preview port, once a scroll capture has been handed to the overlay
-    /// (docs/30 §19.3).
-    ///
-    /// `Arc` because the driver thread publishes into it while this thread drains it, and the
-    /// controller only ever holds the consumer side. `None` until [`Self::watch_scroll_preview`].
-    scroll_preview: Option<std::sync::Arc<crate::scroll::preview::PreviewStream>>,
-    /// The panel model the overlay paints (docs/30 §19.1/§19.4/§19.7), folded forward from
-    /// `scroll_preview` on every [`SCROLL_READY_MESSAGE`].
-    scroll_panel: Option<crate::scroll::panel::ScrollPanel>,
-    /// The layout of the monitor this session's frame came from.
-    ///
-    /// Kept so the scroll entry can turn the window snapshot's **virtual-desktop** rectangles into
-    /// this overlay's **monitor-local** ones (`docs/32` `P7.05`); the conversion itself lives in
-    /// `windows/scroll_target.rs`, which is the only place allowed to do it.
+    /// The layout of the monitor this session's frame came from; the scroll session is placed in
+    /// it after the capture session that owned the geometry has ended.
     monitor_layout: Option<MonitorLayout>,
-    /// The running scroll session, once a selection has been handed over (`docs/32` ADR-19).
-    ///
-    /// The controller owns it because it owns the thread's lifetime: `teardown` joins the driver,
-    /// and a session that outlived its controller would be a thread nobody can stop.
-    scroll_runtime: Option<crate::scroll::session::ScrollRuntime>,
     /// Whether `F7` started this capture session — i.e. whether confirming it means "start
-    /// scrolling" rather than "produce a screenshot" (`docs/32` §4.4, `OQ-27`).
+    /// scrolling" rather than "produce a screenshot" (`docs/33`).
     scroll_entry_armed: bool,
-    /// An in-flight drag of the scroll panel's viewport box (`docs/32` `P7.07`): where the box was
-    /// grabbed (DIP, in the panel's own space) and the panel **as it was at that moment**.
-    ///
-    /// The snapshot is what makes a drag a drag: `ScrollPanel::band_for_drag` is a change relative to
-    /// the position it is asked about, and the live panel's position only catches up when the driver
-    /// publishes the new band. Reading the live panel per mouse move would therefore measure every
-    /// step from a stale base and move the view less than the pointer did.
-    viewport_grab: Option<(i32, crate::scroll::panel::ScrollPanel)>,
+    /// The running scroll session (`docs/33`).
+    scroll: Option<scroll::ScrollRun>,
+    /// The session id of a scroll image the export worker is writing. A scroll export outlives the
+    /// capture session (the hand-over ended it), so this is what tells its result from a stale one.
+    scroll_export: Option<String>,
 }
 
 impl OverlayController {
@@ -635,7 +646,11 @@ impl OverlayController {
             magnifier_color_format: ColorFormat::default(),
             magnifier_relative: false,
             magnifier_zoom: MagnifierConfig::ZOOM_DEFAULT,
-            z_held: false,
+            held: None,
+            preferences: OverlayPreferences::default(),
+            loupe_hints: Arc::from(Vec::new()),
+            guide_groups: Arc::from(Vec::new()),
+            guide: GuideFade::default(),
             sample_slot: None,
             annotation_doc: AnnotationDocument::new(),
             annotation_tool: None,
@@ -645,19 +660,14 @@ impl OverlayController {
             session_counter: 0,
             current_generation: 0,
             previous_foreground: null_mut(),
-            scroll_preview: None,
-            scroll_panel: None,
             monitor_layout: None,
-            scroll_runtime: None,
             scroll_entry_armed: false,
-            viewport_grab: None,
+            scroll: None,
+            scroll_export: None,
         }
     }
 
-
     // ---- input -----------------------------------------------------------
-
-
 }
 
 // Crate-internal re-export: the window/thread half moved to `window_host` (T1.6.1) and
@@ -665,12 +675,13 @@ impl OverlayController {
 // font gate reaches it. `pub(crate)`, not `pub`: nothing here is external API.
 pub(crate) use window_host::*;
 
+mod hover;
+mod input;
+mod render_submit;
+mod scroll;
+mod session;
+mod state;
 #[cfg(test)]
 mod tests;
 mod window_host;
-mod state;
-mod render_submit;
 mod window_restore;
-mod input;
-mod session;
-mod hover;

@@ -111,10 +111,7 @@ fn normalize_byte_escapes(raw: &[u8]) -> Vec<u8> {
         }
         // One character may need several escapes; collect until the run ends.
         let mut bytes = Vec::new();
-        while index + 3 < raw.len()
-            && raw[index] == b'\\'
-            && raw[index + 1] == b'\''
-        {
+        while index + 3 < raw.len() && raw[index] == b'\\' && raw[index + 1] == b'\'' {
             let (Some(high), Some(low)) = (hex(raw[index + 2]), hex(raw[index + 3])) else {
                 break;
             };
@@ -400,7 +397,11 @@ mod tests {
         assert_eq!(text, "前加粗后");
         assert_eq!(highlights.len(), 1);
         let (range, style) = &highlights[0];
-        assert_eq!(range.start, "前".len(), "the range starts after 前, in bytes");
+        assert_eq!(
+            range.start,
+            "前".len(),
+            "the range starts after 前, in bytes"
+        );
         assert_eq!(range.end, "前".len() + "加粗".len());
         // The slice the range names really is the bold text.
         assert_eq!(&text[range.clone()], "加粗");
@@ -423,7 +424,8 @@ mod tests {
 
     /// The other common shape: `\'xx` byte escapes under a declared code page. Without the
     /// `codepage` feature these decode to mojibake, which is the failure this test exists for.
-    const CODEPAGE_ESCAPE: &[u8] = br"{\rtf1\ansi\ansicpg936\deff0{\fonttbl{\f0\fnil Arial;}}\'c4\'e3\'ba\'c3\par plain}";
+    const CODEPAGE_ESCAPE: &[u8] =
+        br"{\rtf1\ansi\ansicpg936\deff0{\fonttbl{\f0\fnil Arial;}}\'c4\'e3\'ba\'c3\par plain}";
 
     #[test]
     fn rtf_is_recognised_and_plain_text_is_not() {
@@ -439,7 +441,9 @@ mod tests {
         let spans = rtf_spans(UNICODE_ESCAPE).expect("the sample should parse");
         // The bold word is its own span; the text after `\b0` is not.
         assert!(
-            spans.iter().any(|span| span.bold && span.text.contains("bold")),
+            spans
+                .iter()
+                .any(|span| span.bold && span.text.contains("bold")),
             "expected a bold span, got {spans:?}"
         );
         assert!(
@@ -463,7 +467,10 @@ mod tests {
         assert!(!text.contains('?'), "the \\u fallback byte leaked: {text}");
 
         // And the paragraph mark became a newline, which is what the card's three lines need.
-        assert!(text.contains('\n'), "\\par should be a line break: {text:?}");
+        assert!(
+            text.contains('\n'),
+            "\\par should be a line break: {text:?}"
+        );
     }
 
     /// The spike's finding, and the fix that came out of it.
@@ -477,7 +484,10 @@ mod tests {
         let text = spans_to_text(&rtf_spans(CODEPAGE_ESCAPE).expect("parse"));
         assert!(text.contains("你好"), "codepage escape wrong: {text}");
         // The rest of the document still parses: one escape run must not swallow the tail.
-        assert!(text.contains("plain"), "the tail after the escapes was lost: {text}");
+        assert!(
+            text.contains("plain"),
+            "the tail after the escapes was lost: {text}"
+        );
         assert!(text.contains('\n'), "\\par is still a line break: {text:?}");
     }
 
@@ -511,9 +521,8 @@ mod tests {
     fn a_fifty_kilobyte_document_parses_well_inside_a_frame() {
         // Realistic shape: a Word-ish header, DBCS byte escapes (so our normaliser runs, which
         // is the expensive half) and bold runs to give the run list some length.
-        let mut rtf = String::from(
-            r"{\rtf1\ansi\ansicpg936\deff0{\fonttbl{\f0\fnil Arial;}}\fs24 ",
-        );
+        let mut rtf =
+            String::from(r"{\rtf1\ansi\ansicpg936\deff0{\fonttbl{\f0\fnil Arial;}}\fs24 ");
         while rtf.len() < 50 * 1024 {
             rtf.push_str(r"\b 加粗文字\b0 \'c4\'e3\'ba\'c3 plain line here\par ");
         }

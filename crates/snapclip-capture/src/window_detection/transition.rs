@@ -133,7 +133,11 @@ mod tests {
         let mut transition = RectTransition::settled(from, now);
         transition.start(from, to, now);
 
-        assert_eq!(transition.value_at(now), from, "t=0 is the displayed rectangle");
+        assert_eq!(
+            transition.value_at(now),
+            from,
+            "t=0 is the displayed rectangle"
+        );
         assert!(transition.is_running(now));
         // Half way through the duration the OutQuad curve is already ~75 % of the way to
         // the target: 100 + round(0.745 * 100) = 175. That fast-then-settling shape is what
@@ -147,10 +151,7 @@ mod tests {
             "the animation is finished exactly at the duration"
         );
         // Past the end it stays at the target rather than overshooting.
-        assert_eq!(
-            transition.value_at(end + Duration::from_millis(500)),
-            to
-        );
+        assert_eq!(transition.value_at(end + Duration::from_millis(500)), to);
     }
 
     #[test]

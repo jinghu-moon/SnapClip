@@ -820,7 +820,12 @@ impl RefinementScheduler {
     /// A result is dropped when its request was superseded (a newer point arrived) or when
     /// the snapshot generation has moved on — the same `epoch + request id` rule the v1
     /// detection worker uses.
-    pub fn on_result(&mut self, request: RequestId, epoch: SnapshotEpoch, target: DeepTarget) -> bool {
+    pub fn on_result(
+        &mut self,
+        request: RequestId,
+        epoch: SnapshotEpoch,
+        target: DeepTarget,
+    ) -> bool {
         if self.in_flight != Some(request) || self.requests.latest() != Some(request) {
             return false;
         }
@@ -930,8 +935,8 @@ fn points_close(left: Point, right: Point) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::model::TargetKind;
+    use super::*;
 
     /// A path level with no kind: these tests are about geometry — collapse, merge, the cap, the
     /// walk — and `Unknown` is what keeps them from having to name a control they do not have.
@@ -1034,12 +1039,12 @@ mod tests {
     #[test]
     fn the_remaining_stops_count_notches_that_land_somewhere_new() {
         let path = vec![
-            rect(0, 0, 1000, 600),   // 0: the window frame
-            rect(1, 1, 999, 599),    // 1: 1 px in — no stop of its own
-            rect(2, 2, 998, 598),    // 2: 1 px more
-            rect(3, 3, 997, 597),    // 3: 1 px more
-            rect(80, 60, 900, 520),  // 4: a box the user can see
-            rect(81, 61, 899, 519),  // 5: the published answer
+            rect(0, 0, 1000, 600),  // 0: the window frame
+            rect(1, 1, 999, 599),   // 1: 1 px in — no stop of its own
+            rect(2, 2, 998, 598),   // 2: 1 px more
+            rect(3, 3, 997, 597),   // 3: 1 px more
+            rect(80, 60, 900, 520), // 4: a box the user can see
+            rect(81, 61, 899, 519), // 5: the published answer
         ];
         let step = RingOptions::default().collapse_gap_px;
 
@@ -1136,7 +1141,10 @@ mod tests {
         assert_eq!(chain.current(&[]), None);
         // Stepping up from an index that is still above the short path keeps answering with the
         // path's deepest level; only when the index itself reaches zero does the frame come back.
-        assert!(chain.shallower(), "walking up from the clamped index still moves");
+        assert!(
+            chain.shallower(),
+            "walking up from the clamped index still moves"
+        );
         assert_eq!(chain.current(&short), Some(rect(10, 10, 20, 20)));
         while chain.shallower() {}
         assert_eq!(chain.current(&short), Some(rect(0, 0, 800, 600)));
@@ -1155,7 +1163,11 @@ mod tests {
     }
 
     /// Move the cursor and immediately expire the dwell timer, returning the job.
-    fn submit(scheduler: &mut RefinementScheduler, epoch: SnapshotEpoch, point: Point) -> RefinementJob {
+    fn submit(
+        scheduler: &mut RefinementScheduler,
+        epoch: SnapshotEpoch,
+        point: Point,
+    ) -> RefinementJob {
         let actions = scheduler.on_cursor_moved(epoch, Some(window(0x100)), point);
         assert!(actions.arm_dwell, "a new target must arm the dwell timer");
         scheduler
@@ -1196,7 +1208,11 @@ mod tests {
         assert!(!scheduler.on_result(
             job.request,
             1,
-            deep_target(TargetKind::UiElement, rect(0, 0, 100, 100), StopReason::Complete)
+            deep_target(
+                TargetKind::UiElement,
+                rect(0, 0, 100, 100),
+                StopReason::Complete
+            )
         ));
         assert!(scheduler.cached().is_none());
     }
@@ -1220,7 +1236,11 @@ mod tests {
         assert!(!scheduler.on_result(
             first.request,
             1,
-            deep_target(TargetKind::UiElement, rect(0, 0, 20, 20), StopReason::Complete)
+            deep_target(
+                TargetKind::UiElement,
+                rect(0, 0, 20, 20),
+                StopReason::Complete
+            )
         ));
         assert!(scheduler.cached().is_none());
 
@@ -1231,7 +1251,11 @@ mod tests {
         assert!(scheduler.on_result(
             second.request,
             1,
-            deep_target(TargetKind::UiElement, rect(40, 40, 200, 200), StopReason::Complete)
+            deep_target(
+                TargetKind::UiElement,
+                rect(40, 40, 200, 200),
+                StopReason::Complete
+            )
         ));
     }
 
@@ -1246,19 +1270,32 @@ mod tests {
         let parent = submit(&mut scheduler, 1, Point::new(150, 150));
         let actions = scheduler.on_cursor_moved(1, Some(window(0x100)), Point::new(320, 320));
         assert!(actions.arm_dwell);
-        assert!(scheduler.on_dwell_due().is_none(), "single-flight defers the child's query");
-        assert!(scheduler.take_follow_up().is_none(), "nothing is issued while query 1 runs");
+        assert!(
+            scheduler.on_dwell_due().is_none(),
+            "single-flight defers the child's query"
+        );
+        assert!(
+            scheduler.take_follow_up().is_none(),
+            "nothing is issued while query 1 runs"
+        );
 
         assert!(scheduler.on_result(
             parent.request,
             1,
-            deep_target(TargetKind::UiElement, rect(100, 100, 900, 700), StopReason::Complete)
+            deep_target(
+                TargetKind::UiElement,
+                rect(100, 100, 900, 700),
+                StopReason::Complete
+            )
         ));
         let child = scheduler
             .take_follow_up()
             .expect("the deferred position is queried once the slot is free");
         assert_eq!(child.point, Point::new(320, 320));
-        assert!(scheduler.take_follow_up().is_none(), "the follow-up is issued once");
+        assert!(
+            scheduler.take_follow_up().is_none(),
+            "the follow-up is issued once"
+        );
     }
 
     #[test]
@@ -1296,15 +1333,25 @@ mod tests {
         assert!(scheduler.on_result(
             job.request,
             1,
-            deep_target(TargetKind::UiElement, rect(100, 100, 300, 300), StopReason::Complete)
+            deep_target(
+                TargetKind::UiElement,
+                rect(100, 100, 300, 300),
+                StopReason::Complete
+            )
         ));
-        assert!(scheduler.take_follow_up().is_none(), "the same position was just answered");
+        assert!(
+            scheduler.take_follow_up().is_none(),
+            "the same position was just answered"
+        );
 
         let _job = submit(&mut scheduler, 1, Point::new(150, 150));
         scheduler.on_cursor_moved(1, Some(window(0x100)), Point::new(320, 320));
         assert!(scheduler.on_dwell_due().is_none());
         scheduler.on_cursor_moved(1, None, Point::new(5000, 5000));
-        assert!(scheduler.take_follow_up().is_none(), "no window, no question");
+        assert!(
+            scheduler.take_follow_up().is_none(),
+            "no window, no question"
+        );
     }
 
     #[test]
@@ -1319,7 +1366,11 @@ mod tests {
         assert!(scheduler.on_result(
             job.request,
             1,
-            deep_target(TargetKind::UiElement, rect(100, 100, 300, 300), StopReason::Complete)
+            deep_target(
+                TargetKind::UiElement,
+                rect(100, 100, 300, 300),
+                StopReason::Complete
+            )
         ));
 
         // Moving *inside the resolved element* arms a fresh dwell: the deeper element under the
@@ -1354,10 +1405,16 @@ mod tests {
                 StopReason::BudgetExhausted
             )
         ));
-        assert!(scheduler.cached().is_some(), "the partial path is still published");
+        assert!(
+            scheduler.cached().is_some(),
+            "the partial path is still published"
+        );
         // The same point must be queried again: the budget may allow a deeper answer now.
         let actions = scheduler.on_cursor_moved(1, Some(window(0x100)), Point::new(150, 150));
-        assert!(actions.arm_dwell, "a partial path must not freeze the selection");
+        assert!(
+            actions.arm_dwell,
+            "a partial path must not freeze the selection"
+        );
     }
 
     #[test]
@@ -1367,18 +1424,29 @@ mod tests {
         assert!(scheduler.on_result(
             job.request,
             1,
-            deep_target(TargetKind::UiElement, rect(100, 100, 300, 300), StopReason::Complete)
+            deep_target(
+                TargetKind::UiElement,
+                rect(100, 100, 300, 300),
+                StopReason::Complete
+            )
         ));
         assert!(scheduler.cached().is_some());
 
         let in_flight_job = submit(&mut scheduler, 2, Point::new(160, 160));
         let actions = scheduler.on_snapshot_changed();
         assert!(actions.invalidate_in_flight);
-        assert!(scheduler.cached().is_none(), "a rebuilt snapshot invalidates the path");
+        assert!(
+            scheduler.cached().is_none(),
+            "a rebuilt snapshot invalidates the path"
+        );
         assert!(!scheduler.on_result(
             in_flight_job.request,
             2,
-            deep_target(TargetKind::UiElement, rect(0, 0, 10, 10), StopReason::Complete)
+            deep_target(
+                TargetKind::UiElement,
+                rect(0, 0, 10, 10),
+                StopReason::Complete
+            )
         ));
     }
 
@@ -1390,7 +1458,11 @@ mod tests {
         assert!(!scheduler.on_result(
             job.request,
             2,
-            deep_target(TargetKind::UiElement, rect(0, 0, 10, 10), StopReason::Complete)
+            deep_target(
+                TargetKind::UiElement,
+                rect(0, 0, 10, 10),
+                StopReason::Complete
+            )
         ));
         assert!(scheduler.cached().is_none());
     }
@@ -1427,14 +1499,18 @@ mod tests {
     fn an_abandoned_query_cannot_publish_its_answer_afterwards() {
         let mut scheduler = RefinementScheduler::new();
         let job = submit(&mut scheduler, 1, Point::new(150, 150));
-        let expired =
-            std::time::Instant::now() + Duration::from_millis(u64::from(REFINEMENT_INFLIGHT_TIMEOUT_MS));
+        let expired = std::time::Instant::now()
+            + Duration::from_millis(u64::from(REFINEMENT_INFLIGHT_TIMEOUT_MS));
         assert!(scheduler.on_in_flight_timeout(expired).is_some());
         // The wedged call may still return long after the overlay gave up on it.
         assert!(!scheduler.on_result(
             job.request,
             1,
-            deep_target(TargetKind::UiElement, rect(100, 100, 200, 200), StopReason::Complete)
+            deep_target(
+                TargetKind::UiElement,
+                rect(100, 100, 200, 200),
+                StopReason::Complete
+            )
         ));
         assert!(scheduler.cached().is_none());
     }
@@ -1446,12 +1522,19 @@ mod tests {
         assert!(scheduler.on_result(
             job.request,
             1,
-            deep_target(TargetKind::UiElement, rect(0, 0, 10, 10), StopReason::Complete)
+            deep_target(
+                TargetKind::UiElement,
+                rect(0, 0, 10, 10),
+                StopReason::Complete
+            )
         ));
         scheduler.reset();
         assert!(scheduler.cached().is_none());
         assert!(!scheduler.is_in_flight());
-        assert!(scheduler.on_dwell_due().is_none(), "no pending target survives a reset");
+        assert!(
+            scheduler.on_dwell_due().is_none(),
+            "no pending target survives a reset"
+        );
     }
 
     #[test]
@@ -1502,7 +1585,11 @@ mod tests {
     /// position is on its way (docs/18 §13.5).
     #[test]
     fn a_pending_answer_keeps_the_last_verified_rectangle_of_the_window() {
-        let control = deep_target(TargetKind::UiElement, rect(300, 300, 500, 400), StopReason::Complete);
+        let control = deep_target(
+            TargetKind::UiElement,
+            rect(300, 300, 500, 400),
+            StopReason::Complete,
+        );
         let frame = boxed(0, 0, 1000, 800);
         // The cursor left the control for its parent container: the frame must not flash while
         // the refinement answers, even though the control no longer covers the point.
@@ -1550,21 +1637,43 @@ mod tests {
     #[test]
     fn a_verified_target_for_another_window_never_leaks_into_this_one() {
         let frame = boxed(0, 0, 1000, 800);
-        let elsewhere = deep_target(TargetKind::UiElement, rect(100, 100, 200, 200), StopReason::Complete);
+        let elsewhere = deep_target(
+            TargetKind::UiElement,
+            rect(100, 100, 200, 200),
+            StopReason::Complete,
+        );
         assert_eq!(
-            preview_bounds(Some(&elsewhere), None, window(0x200), Point::new(150, 150), frame, true),
+            preview_bounds(
+                Some(&elsewhere),
+                None,
+                window(0x200),
+                Point::new(150, 150),
+                frame,
+                true
+            ),
             None,
             "another window's path is not an answer for this one"
         );
         assert_eq!(
-            preview_bounds(Some(&elsewhere), None, window(0x200), Point::new(150, 150), frame, false),
+            preview_bounds(
+                Some(&elsewhere),
+                None,
+                window(0x200),
+                Point::new(150, 150),
+                frame,
+                false
+            ),
             Some(frame)
         );
     }
 
     #[test]
     fn a_target_that_still_covers_the_cursor_is_shown_even_when_nothing_is_pending() {
-        let control = deep_target(TargetKind::UiElement, rect(300, 300, 500, 400), StopReason::Complete);
+        let control = deep_target(
+            TargetKind::UiElement,
+            rect(300, 300, 500, 400),
+            StopReason::Complete,
+        );
         assert_eq!(
             preview_bounds(
                 Some(&control),
@@ -1686,15 +1795,15 @@ mod tests {
     /// `text-message` 1 px outside it.
     fn nine_level_page() -> Vec<PathLevel> {
         vec![
-            rect(40, 24, 1240, 684),      // 1/9 window frame
-            rect(41, 58, 1239, 684),      // 2/9 document
-            rect(53, 70, 1227, 672),      // 3/9 side-pane shell
-            rect(65, 82, 945, 648),       // 4/9 message list
-            rect(69, 148, 917, 478),      // 5/9 text message
-            rect(70, 196, 916, 468),      // 6/9 code block viewer (selected in these tests)
-            rect(71, 197, 915, 467),      // 7/9 cm-scroller  ← 1 px inside the selection
-            rect(87, 213, 899, 435),      // 8/9 pre.cm-content
-            rect(115, 243, 214, 265),     // 9/9 code span (the answer)
+            rect(40, 24, 1240, 684),  // 1/9 window frame
+            rect(41, 58, 1239, 684),  // 2/9 document
+            rect(53, 70, 1227, 672),  // 3/9 side-pane shell
+            rect(65, 82, 945, 648),   // 4/9 message list
+            rect(69, 148, 917, 478),  // 5/9 text message
+            rect(70, 196, 916, 468),  // 6/9 code block viewer (selected in these tests)
+            rect(71, 197, 915, 467),  // 7/9 cm-scroller  ← 1 px inside the selection
+            rect(87, 213, 899, 435),  // 8/9 pre.cm-content
+            rect(115, 243, 214, 265), // 9/9 code span (the answer)
         ]
     }
 
@@ -1705,7 +1814,11 @@ mod tests {
         let path = nine_level_page();
         let plan = chain_rings(&path, 5, RingOptions::default());
         let drawn: Vec<usize> = plan.rings.iter().map(|ring| ring.index).collect();
-        assert_eq!(drawn, vec![0, 2, 3, 5, 7, 8], "window, two ancestors, selection, two inners");
+        assert_eq!(
+            drawn,
+            vec![0, 2, 3, 5, 7, 8],
+            "window, two ancestors, selection, two inners"
+        );
         assert_eq!(
             plan.rings
                 .iter()
@@ -1724,7 +1837,10 @@ mod tests {
         // 2/9 is 1 px from 1/9 → a double line; 5/9 and 7/9 are 1 px from the selection.
         assert_eq!(plan.collapsed, vec![1]);
         assert_eq!(plan.merged, vec![4, 6]);
-        assert!(plan.dropped.is_empty(), "six rings fit under the cap of seven");
+        assert!(
+            plan.dropped.is_empty(),
+            "six rings fit under the cap of seven"
+        );
     }
 
     /// Ramp: the further a ring is from the selection, the fainter — with a floor so the window
@@ -1746,9 +1862,22 @@ mod tests {
         // One step away is 94% of the base (the 6% ramp), and the two rings *adjacent* to the
         // selection in this fixture are exactly the ones the merge rule removes — which is why the
         // ramp starts biting at distance two.
-        assert!((alpha(3) - base * 0.94).abs() < 1e-5, "one step out: {}", alpha(3));
-        assert!((alpha(7) - base * 0.94).abs() < 1e-5, "one step in: {}", alpha(7));
-        assert!(alpha(2) < alpha(3), "two steps out is fainter than one: {} vs {}", alpha(2), alpha(3));
+        assert!(
+            (alpha(3) - base * 0.94).abs() < 1e-5,
+            "one step out: {}",
+            alpha(3)
+        );
+        assert!(
+            (alpha(7) - base * 0.94).abs() < 1e-5,
+            "one step in: {}",
+            alpha(7)
+        );
+        assert!(
+            alpha(2) < alpha(3),
+            "two steps out is fainter than one: {} vs {}",
+            alpha(2),
+            alpha(3)
+        );
         assert!(
             (alpha(0) - base * 0.80).abs() < 1e-5,
             "the window frame is floored at 80% of the base: {}",
@@ -1764,10 +1893,11 @@ mod tests {
                 ..RingOptions::default()
             },
         );
-        assert!(flat
-            .rings
-            .iter()
-            .all(|ring| ring.role == RingRole::Selected || (ring.alpha - base).abs() < 1e-6));
+        assert!(
+            flat.rings
+                .iter()
+                .all(|ring| ring.role == RingRole::Selected || (ring.alpha - base).abs() < 1e-6)
+        );
     }
 
     /// Twelve evenly spaced wrappers: the cap has to bite, and it must bite the *non-anchors*
@@ -1786,7 +1916,11 @@ mod tests {
         let drawn: Vec<usize> = plan.rings.iter().map(|ring| ring.index).collect();
         assert_eq!(drawn, vec![0, 3, 4, 5, 6, 7, 11]);
         assert_eq!(plan.rings.len(), 7, "the cap holds");
-        assert!(plan.dropped.contains(&1), "the furthest non-anchor goes first: {:?}", plan.dropped);
+        assert!(
+            plan.dropped.contains(&1),
+            "the furthest non-anchor goes first: {:?}",
+            plan.dropped
+        );
         // The anchors — window frame and the answer — never get dropped.
         assert!(drawn.contains(&0) && drawn.contains(&11));
     }
@@ -1808,7 +1942,11 @@ mod tests {
         // down, and it is the whole point of drawing the inner side at all.
         let at_window = chain_rings(&path, 0, RingOptions::default());
         assert_eq!(
-            at_window.rings.iter().map(|ring| ring.index).collect::<Vec<_>>(),
+            at_window
+                .rings
+                .iter()
+                .map(|ring| ring.index)
+                .collect::<Vec<_>>(),
             vec![0, 1]
         );
         assert_eq!(at_window.rings[1].role, RingRole::Inner);

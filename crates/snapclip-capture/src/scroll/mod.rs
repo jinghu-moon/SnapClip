@@ -1,130 +1,398 @@
-//! The scroll-capture subsystem (`docs/30` §28.2 lists its files; the dependency gate counts them:
-//! **12 production files** — this one included — and **6 `#[cfg(test)]` ones**, 18 in all).
+//! Scroll capture: one long image from a selection the user (or the auto-scroller) scrolls.
 //!
-//! What is here today:
+//! Everything here is pure arithmetic over BGRA byte buffers; the capture thread that feeds it
+//! frames lives in `windows/scroll_worker.rs`. The design is derived in `docs/33`:
 //!
-//! * `observation` (`P1.02`) — `Axis`, the one place the horizontal case is expressed.
-//! * `displacement` (`P1.04`) — what the estimator is allowed to answer and what the session is
-//!   allowed to do with the answer. Carries the three layers (`P1.05`–`P1.07`), the four gates
-//!   (`P1.08`–`P1.11`), the prior (`P1.14`) and the `Scratch` buffers (`P1.13`).
-//! * `canvas` (`P1.17`) — the recovered image, its coverage map, the bounded band store
-//!   (`P1.18`–`P1.22`) and `ViewportState`, which is where a confirmed step becomes a write.
-//! * `orb` (`P1.23`) — the conditionally triggered second opinion. It can only answer
-//!   `Agree`/`Disagree`/`NoEvidence`; it never produces a reported displacement.
-//! * `loop_control` (`P3.03`) — the closed loop's pieces: the watchdog that switches transports, the
-//!   settle window, the `ĝ` controller, and (from `P3.09`) the driver that runs them in order.
-//! * `preview` (`P3.08`) — the capacity-1 preview mailbox the overlay thread drains (§19.3).
-//! * `panel` (`P5.03`) — the eight answers of §19.1 and the viewport box of §19.4, as data; the
-//!   renderer consumes it (`windows/win/d2d.rs`) rather than computing it a second time.
-//! * `session` (`P3.04`) — the aggregate root: the axis, the canvas, the step counter, the streak,
-//!   the stop promise, and the command port (§27.2).
-//! * `target` (`P7.02`) — which window the selection belongs to: five rules, an opaque window
-//!   identity, and the crop rectangle the session reads. The `HWND` and the screen → monitor-local
-//!   conversions stay in `windows/scroll_target.rs` (`docs/32` §4.2, ADR-25).
-//! * `ports` (`P3.09`) — the two platform seams, `FrameSource` and `ScrollActuator` (§27.1).
-//! * `export` (`P4.01`) — the third seam, and the one the **shell** fills rather than the platform:
-//!   rows go to an encoder a band at a time, and the height is a precondition of the first row
-//!   rather than something discovered while writing (§17.7).
-//! * `testkit` (`P1.01`) — the synthetic fixture every later `P1` task is judged against.
-//! * `acceptance` (`P1.24`) — `E-ACC-1` as a gate: the `§29.3` scan over the whole funnel, judged by
-//!   byte equality with the generator's truth. Test-only, but it is the reason G1 is checkable.
-//! * `perf_probe` (`P0.03`) — the measurement device for `E-PERF-1`, kept because its numbers are
-//!   the only matching-cost data this repository has and `P1.05`+ must re-run it on the real
-//!   layer 1 (see `docs/30` §23.3.1 and `DEV-8`).
+//! * [`estimate`] — how far the content moved between two frames, computed for every frame;
+//! * [`stitch`] — the long image, grown by exactly the rows never seen before;
+//! * [`thumb`] — the growing thumbnail beside the selection, updated incrementally;
+//! * [`layout`] — where the panel goes and what it says.
 //!
-//! The eleven module bullets above are production code, as is this file itself. `testkit`,
-//! `acceptance` and `perf_probe` are `#[cfg(test)]`, and so are `alloc_probe`, `mem_probe` and
-//! `latency_probe` further down — **six** test-only modules rather than the one this note used to
-//! claim. This module became a real (non-test) module with `P1.01` — see `lib.rs` and `DEV-8`.
-//!
-//! (`P6.09` corrected the two counts in this header after the acceptance pass read the module list
-//! against what `tools/check-dependency-direction.ps1` actually prints: 17 files. `P7.02` moved
-//! both by one when `target` arrived: 12 production + 6 test-only = 18.)
-//!
-//! Gate note (`docs/30` §28.4): nothing under `scroll/` may reference `windows`, `sampler` or any
-//! platform FFI. Everything here is pure arithmetic over byte buffers, and the second scan in
-//! `tools/check-dependency-direction.ps1` (`P6.07`) will make that mechanical.
+//! [`Tracker`] strings the first three together: one call per captured frame.
 
-pub(crate) mod canvas;
+pub(crate) mod estimate;
+pub(crate) mod layout;
+pub(crate) mod stitch;
+pub(crate) mod thumb;
 
-pub(crate) mod displacement;
+use estimate::{Estimate, FrameSig, estimate};
+use stitch::{Placement, Stitcher};
+use thumb::Thumb;
 
-/// `export` (`P4.01`) — the seam the shell fills: rows go to an encoder one band at a time, and the
-/// height is a precondition of the first row rather than something discovered while writing
-/// (§17.7). It sits beside `ports` rather than inside it because `ports` is the **platform** seam
-/// (Windows implements it) while this one is the **output format** seam (`DEV-2`).
-///
-/// Unlike every other module here this one is `pub`, and `P4.02` is why: a port the composition root
-/// cannot name is not a port. `P4.01` declared it `pub(crate)` and `apps/snapclip` could not have
-/// implemented `RowBandSink` at all — the visibility widening is the fix, not a convenience.
-pub mod export;
+/// The long image is capped at this many selection heights (the reference implementation's cap).
+pub(crate) const MAX_SCREENS: u32 = 32;
+/// The shortest selection a session can scroll: after a scroll, two frames must still share
+/// [`estimate::MIN_OVERLAP`] rows, so a shorter one could never be measured.
+pub(crate) const MIN_VIEW: u32 = 2 * estimate::MIN_OVERLAP;
 
-pub(crate) mod loop_control;
+/// What the tracker can say about the session as a whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Status {
+    /// The last frame was placed or found still.
+    Tracking,
+    /// The last frame could not be located against the reference (scrolled too far in one frame,
+    /// or repeated content). The reference is kept, so scrolling back recovers.
+    Lost,
+    /// The image reached [`MAX_SCREENS`] and stops growing.
+    Full,
+}
 
-pub(crate) mod observation;
+/// Automatic scrolling, as the panel shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Auto {
+    #[default]
+    Off,
+    On,
+    /// The window under the selection refused the wheel (`ERROR_ACCESS_DENIED`: it runs at a higher
+    /// integrity level, and UIPI drops posted input from below). Auto turned itself off; the user's
+    /// own wheel still reaches it. Cleared when auto is turned on again.
+    Refused,
+}
 
-/// [`Axis`] is `pub` for the same reason `export` is: it is the type of `ImageMeta::axis`, so a
-/// caller outside this crate cannot build or read that field without naming it.
-pub use observation::Axis;
+/// What one frame did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Step {
+    pub estimate: Estimate,
+    pub placement: Option<Placement>,
+}
 
-pub(crate) mod orb;
+/// The thumbnail rows the panel shows, and where the viewport is among them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Preview {
+    pub width: u32,
+    pub rows: u32,
+    pub bytes: Vec<u8>,
+    /// The viewport's thumbnail rows `[start, end)`, relative to this window.
+    pub viewport: (u32, u32),
+    /// Height of the long image so far, in canvas rows.
+    pub image_rows: u32,
+}
 
-/// `panel` (`P5.03`) — the eight answers of §19.1 and the viewport box of §19.4, as data. It lives
-/// here rather than beside the drawing code because §28.4 forbids this side of the seam from naming
-/// the platform, and `windows/win/d2d.rs` is a consumer of it rather than a second copy.
-pub(crate) mod panel;
+#[derive(Debug)]
+pub(crate) struct Tracker {
+    width: u32,
+    view: u32,
+    reference: FrameSig,
+    stitcher: Stitcher,
+    thumb: Thumb,
+    status: Status,
+}
 
-/// `ports` (`P3.09`) — the platform seams: what the driver reads frames from and injects through.
-/// The vocabulary lives here and the implementations live in `windows/`, which is the only shape
-/// that satisfies §28.4's "nothing under `scroll/` may reference the Windows module" while the driver
-/// itself stays in `scroll/loop_control.rs` (§28.2).
-pub(crate) mod ports;
+impl Tracker {
+    /// `first` is the selection's first frame, `width × view` BGRA; `thumb_width` the widest
+    /// thumbnail the panel shows.
+    pub(crate) fn new(first: &[u8], width: u32, view: u32, thumb_width: u32) -> Self {
+        let stitcher = Stitcher::new(first, width, view, MAX_SCREENS * view);
+        let mut thumb = Thumb::new(width, thumb_width);
+        thumb.refresh(stitcher.canvas(), view, 0, 0, view);
+        Self {
+            width,
+            view,
+            reference: FrameSig::of(first, width, view),
+            stitcher,
+            thumb,
+            status: Status::Tracking,
+        }
+    }
 
-pub(crate) mod preview;
+    pub(crate) fn status(&self) -> Status {
+        self.status
+    }
 
-pub(crate) mod session;
+    pub(crate) fn image_rows(&self) -> u32 {
+        self.stitcher.rows()
+    }
 
-/// [`ScrollDiagnosticCode`] is `pub` for §27.1's reason rather than for convenience: it is listed
-/// there among the types that cross the crate boundary, and it is what the shell names when it
-/// reports why an export was trimmed. The module that owns it has to stay `pub(crate)` — it also
-/// owns [`session::ScrollSession`], which §27.1 keeps internal — so the re-export is the only shape
-/// that gives the vocabulary a public path without publishing the session (the [`Axis`] precedent
-/// above).
-pub use session::ScrollDiagnosticCode;
+    /// Measure `frame` against the reference and place it.
+    pub(crate) fn push(&mut self, frame: &[u8]) -> Step {
+        let current = FrameSig::of(frame, self.width, self.view);
+        let estimate = estimate(&self.reference, &current);
+        let placement = match estimate {
+            Estimate::Shift { dy, .. } => {
+                let placement = self.stitcher.place(frame, dy);
+                match placement {
+                    Placement::Appended { band, .. } => {
+                        let rows = self.stitcher.rows();
+                        self.refresh_thumb(rows - band, rows);
+                    }
+                    Placement::Prepended { band, .. } => self.refresh_thumb(0, band),
+                    Placement::Contained | Placement::Full => {}
+                }
+                if placement == Placement::Full {
+                    // The reference stays: the viewport did not move in the image, so the next
+                    // frame is still measured against the last frame that was placed.
+                    self.status = Status::Full;
+                } else {
+                    self.reference = current;
+                    self.status = Status::Tracking;
+                }
+                Some(placement)
+            }
+            Estimate::Still { .. } => {
+                // Follow what changed in place (a caret, an animation) so it never piles up into
+                // a frame too different to measure.
+                self.reference = current;
+                if self.status != Status::Full {
+                    self.status = Status::Tracking;
+                }
+                None
+            }
+            Estimate::Unknown { .. } => {
+                if self.status != Status::Full {
+                    self.status = Status::Lost;
+                }
+                None
+            }
+        };
+        Step {
+            estimate,
+            placement,
+        }
+    }
 
-/// `target` (`P7.02`) — which window the selection belongs to. Five rules (overlap, area,
-/// `z_order`, the viewport floor, the near-tie refusal) over a `Rect` and an opaque window
-/// identity (`docs/32` §4.2). It sits here rather than in `windows/` because the rule is pure
-/// arithmetic; the snapshot's coordinates and handles are converted on the other side of the seam.
-pub(crate) mod target;
+    fn refresh_thumb(&mut self, from: u32, to: u32) {
+        let (rows, top) = (self.stitcher.rows(), self.stitcher.top());
+        self.thumb
+            .refresh(self.stitcher.canvas(), rows, top, from, to);
+    }
+
+    /// At most `max_rows` thumbnail rows: all of them when they fit, otherwise the window whose
+    /// bottom is the viewport's bottom (the tail while scrolling down).
+    pub(crate) fn preview(&self, max_rows: u32) -> Preview {
+        let k = i64::from(self.thumb.factor());
+        let first = self.thumb.first();
+        let total = self.thumb.rows();
+        let content_top = self.stitcher.top() + i64::from(self.stitcher.pos());
+        let view_start = (content_top.div_euclid(k) - first).clamp(0, i64::from(total)) as u32;
+        let view_end = ((content_top + i64::from(self.view) + k - 1).div_euclid(k) - first)
+            .clamp(0, i64::from(total)) as u32;
+        let shown = max_rows.clamp(1, total.max(1)).min(total);
+        let end = view_end.clamp(shown, total);
+        let start = end - shown;
+        Preview {
+            width: self.thumb.width(),
+            rows: shown,
+            bytes: self.thumb.window(start, shown).to_vec(),
+            viewport: (
+                view_start.saturating_sub(start).min(shown),
+                view_end.saturating_sub(start).min(shown),
+            ),
+            image_rows: self.stitcher.rows(),
+        }
+    }
+
+    /// The long image: `(width, rows, bgra)`.
+    pub(crate) fn into_image(self) -> (u32, u32, Vec<u8>) {
+        (
+            self.width,
+            self.stitcher.rows(),
+            self.stitcher.into_canvas(),
+        )
+    }
+}
 
 #[cfg(test)]
-mod acceptance;
+mod tests {
+    use super::estimate::tests::{page, shift_of, window};
+    use super::estimate::{FrameSig, estimate};
+    use super::stitch::Placement;
+    use super::{MAX_SCREENS, Status, Tracker};
 
-/// The capture test binary's one `#[global_allocator]` and its four counters (`P4.07` moved it
-/// here from `perf_probe`: a binary has exactly one, and `E-MEM-1` needs a counter `E-PERF-1` did
-/// not have).
-#[cfg(test)]
-mod alloc_probe;
+    const W: u32 = 120;
+    const H: u32 = 200;
+    const HEADER: u32 = 30;
+    const FOOTER: u32 = 20;
 
-/// The measurement device for `E-PERF-4` (`P5.06`): what the windowed thumbnail's derivation costs.
-/// Test-only, and it is here rather than beside the renderer because §28.4 forbids this directory
-/// from naming the platform — the consumer's half of `E-PERF-4` needs a D2D device and therefore
-/// lives in `windows/win/d2d/tests.rs`.
-///
-/// It is `pub(crate)` where its siblings (`alloc_probe`, `mem_probe`, `perf_probe`) are private, and
-/// the reason is the split seam: the two halves of `E-PERF-4` are judged against the same thresholds
-/// and have to reduce their samples the same way, so `percentiles` must be reachable from the
-/// platform side. A second copy of it there would be a second opinion about what `p95` means, which
-/// is precisely how a threshold and a measurement drift apart. Test-only, so nothing ships on it.
-#[cfg(test)]
-pub(crate) mod latency_probe;
+    /// A small deterministic generator, so the scroll sequence is "random" but reproducible.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self, below: u32) -> u32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((self.0 >> 33) % u64::from(below)) as u32
+        }
+    }
 
-#[cfg(test)]
-mod mem_probe;
+    /// The viewport at page offset `top`, with a fixed header and footer and, optionally, a
+    /// blinking caret that differs on every frame (the "live page" fact).
+    fn frame_at(page: &[u8], top: u32, tick: u32) -> Vec<u8> {
+        let mut frame = window(page, W, top, H);
+        let row = (W * 4) as usize;
+        for y in (0..HEADER).chain(H - FOOTER..H) {
+            for x in 0..W {
+                let at = y as usize * row + x as usize * 4;
+                frame[at..at + 4].copy_from_slice(&[x as u8, y as u8, 99, 255]);
+            }
+        }
+        // The caret sits in the header, so it never touches page content the truth compares.
+        let caret = 10 + (tick % 2) * 40;
+        for y in 5..20 {
+            let at = y as usize * row + caret as usize * 4;
+            frame[at..at + 8].copy_from_slice(&[0, 0, 0, 255, 0, 0, 0, 255]);
+        }
+        frame
+    }
 
-#[cfg(test)]
-mod perf_probe;
+    fn truth(page: &[u8], last: u32, last_tick: u32) -> Vec<u8> {
+        let row = (W * 4) as usize;
+        let mut out = frame_at(page, 0, 0)[..HEADER as usize * row].to_vec();
+        out.extend_from_slice(&page[HEADER as usize * row..(last + H - FOOTER) as usize * row]);
+        out.extend_from_slice(&frame_at(page, last, last_tick)[(H - FOOTER) as usize * row..]);
+        out
+    }
 
-#[cfg(test)]
-mod testkit;
+    #[test]
+    fn a_random_live_scroll_of_a_long_page_stitches_to_the_page_byte_for_byte() {
+        let page = page(W, 5000, 21);
+        let mut rng = Lcg(7);
+        let mut tracker = Tracker::new(&frame_at(&page, 0, 0), W, H, 40);
+        let (mut top, mut tick) = (0u32, 0u32);
+        // Steps a wheel and a smooth scroll produce: zero (a live but unscrolled frame), a few
+        // rows, a notch. Never more than the content area can overlap.
+        while top < 3000 {
+            tick += 1;
+            top += [0, 1, 3, 17, 40, 64, 90][rng.next(7) as usize];
+            tracker.push(&frame_at(&page, top, tick));
+            assert_eq!(tracker.status(), Status::Tracking, "lost at offset {top}");
+        }
+        assert_eq!(tracker.image_rows(), top + H);
+        let (width, rows, image) = tracker.into_image();
+        assert_eq!((width, rows), (W, top + H));
+        assert!(
+            image == truth(&page, top, tick),
+            "the image must equal the page with one header and one footer"
+        );
+    }
+
+    #[test]
+    fn a_jump_is_reported_as_lost_and_scrolling_back_recovers() {
+        let page = page(W, 5000, 22);
+        let mut tracker = Tracker::new(&frame_at(&page, 0, 0), W, H, 40);
+        tracker.push(&frame_at(&page, 60, 1));
+        tracker.push(&frame_at(&page, 600, 2));
+        assert_eq!(tracker.status(), Status::Lost);
+        tracker.push(&frame_at(&page, 100, 3));
+        assert_eq!(tracker.status(), Status::Tracking);
+        assert_eq!(tracker.image_rows(), 100 + H);
+    }
+
+    #[test]
+    fn the_image_stops_at_its_cap_and_says_so() {
+        let page = page(W, MAX_SCREENS * H + 2 * H, 23);
+        let mut tracker = Tracker::new(&frame_at(&page, 0, 0), W, H, 40);
+        let mut top = 0;
+        while top + 80 + H <= page.len() as u32 / (W * 4) {
+            top += 80;
+            tracker.push(&frame_at(&page, top, 0));
+        }
+        assert_eq!(tracker.status(), Status::Full);
+        assert!(tracker.image_rows() <= MAX_SCREENS * H);
+    }
+
+    #[test]
+    fn the_preview_shows_the_tail_while_scrolling_down_and_marks_the_viewport() {
+        let page = page(W, 5000, 24);
+        // W = 120 into 40 → factor 3, thumbnail rows are 3 canvas rows each.
+        let mut tracker = Tracker::new(&frame_at(&page, 0, 0), W, H, 40);
+        let first = tracker.preview(1000);
+        assert_eq!((first.width, first.rows), (40, 67));
+        assert_eq!(first.viewport, (0, 67));
+        for top in (60..=900).step_by(60) {
+            tracker.push(&frame_at(&page, top, 0));
+        }
+        let preview = tracker.preview(100);
+        assert_eq!(preview.rows, 100);
+        assert_eq!(preview.bytes.len(), (40 * 100 * 4) as usize);
+        assert_eq!(preview.image_rows, 900 + H);
+        // The viewport is the last H rows, so it ends at the window's bottom.
+        assert_eq!(preview.viewport, (100 - 67, 100));
+    }
+
+    /// Cost evidence for the whole per-frame path at the field size (`docs/33` §4.1).
+    ///
+    /// One `push` is `FrameSig::of` (8·H hashes over the selection) + `estimate` (the vote) +
+    /// `stitcher.place` + the thumbnail band; `preview` is what the capture thread sends to the
+    /// overlay. Reported, not asserted — debug builds and loaded machines vary too much for a
+    /// threshold, and the split below is what says where a real frame goes. The split repeats
+    /// `push`'s own sequence (`estimate`/`place`/`refresh_thumb` are crate-private), so it is a
+    /// guide to the total above it, not a second implementation.
+    #[test]
+    #[ignore = "timing report: run with --release --include-ignored --nocapture"]
+    fn the_cost_of_one_frame_at_the_field_size() {
+        let (w, h) = (2148u32, 1344u32);
+        let page = page(w, 8 * h, 31);
+        let mut tracker = Tracker::new(&window(&page, w, 0, h), w, h, 160);
+        // 6400 rows down in 97-row steps, then back up: both the append and the prepend path.
+        let mut tops: Vec<u32> = (1..=66).map(|step| step * 97).collect();
+        tops.extend((0..33).rev().map(|step| step * 97));
+
+        let mut frame_us = Vec::new();
+        let mut signature_us = Vec::new();
+        let mut estimate_us = Vec::new();
+        let mut place_us = Vec::new();
+        let mut thumb_us = Vec::new();
+        let mut preview_us = Vec::new();
+        let mut preview_bytes = 0;
+        for top in tops {
+            let frame = window(&page, w, top, h);
+            let started = std::time::Instant::now();
+            tracker.push(&frame);
+            frame_us.push(started.elapsed().as_micros());
+
+            let started = std::time::Instant::now();
+            let signature = FrameSig::of(&frame, w, h);
+            signature_us.push(started.elapsed().as_micros());
+            let started = std::time::Instant::now();
+            let measured = estimate(&tracker.reference, &signature);
+            estimate_us.push(started.elapsed().as_micros());
+            let started = std::time::Instant::now();
+            let placement = tracker.stitcher.place(&frame, shift_of(measured).unwrap_or(0));
+            place_us.push(started.elapsed().as_micros());
+            let started = std::time::Instant::now();
+            if let Placement::Appended { band, .. } = placement {
+                let rows = tracker.stitcher.rows();
+                tracker.refresh_thumb(rows - band, rows);
+            }
+            thumb_us.push(started.elapsed().as_micros());
+
+            let started = std::time::Instant::now();
+            preview_bytes = tracker.preview(160).bytes.len();
+            preview_us.push(started.elapsed().as_micros());
+        }
+        let stats = |name: &str, costs: &mut Vec<u128>| {
+            costs.sort_unstable();
+            println!(
+                "frame {w}x{h} {name}: p50_us={} p95_us={} max_us={} samples={}",
+                costs[costs.len() / 2],
+                costs[costs.len() * 95 / 100],
+                costs[costs.len() - 1],
+                costs.len()
+            );
+        };
+        println!("preview bytes={preview_bytes}");
+        stats("signature", &mut signature_us);
+        stats("estimate", &mut estimate_us);
+        stats("place", &mut place_us);
+        stats("thumb", &mut thumb_us);
+        stats("preview", &mut preview_us);
+        stats("push", &mut frame_us);
+    }
+
+    #[test]
+    fn the_preview_follows_the_viewport_back_up() {
+        let page = page(W, 5000, 25);
+        let mut tracker = Tracker::new(&frame_at(&page, 0, 0), W, H, 40);
+        for top in (60..=900).step_by(60) {
+            tracker.push(&frame_at(&page, top, 0));
+        }
+        for top in (0..=840).rev().step_by(60) {
+            tracker.push(&frame_at(&page, top, 0));
+        }
+        let preview = tracker.preview(100);
+        // Back at the top: the window starts at the image's first row.
+        assert_eq!(preview.viewport.0, 0);
+        assert_eq!(preview.image_rows, 900 + H);
+    }
+}
