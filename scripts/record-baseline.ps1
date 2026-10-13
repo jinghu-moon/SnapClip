@@ -1,4 +1,4 @@
-# SnapClip: measures the real test baseline and names every drift. See docs/31 P0.01, §2.6.
+﻿# SnapClip: measures the real test baseline and names every drift. See docs/31 P0.01, §2.6.
 #
 # Why this exists: `docs/19` claims "475 passed / 9 ignored / 0 failed" and nothing in the
 # tree could reproduce it (docs/31 §0.3). A number nobody can re-measure is a legend, and

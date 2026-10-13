@@ -1,4 +1,4 @@
-# The P0.04 driver: measure the twelve PNG compression/filter combinations of docs/31 P0.04,
+﻿# The P0.04 driver: measure the twelve PNG compression/filter combinations of docs/31 P0.04,
 # one process per combination, and append each result as one JSON line.
 #
 # Why a script and not a test loop: the point of the experiment is that a previous

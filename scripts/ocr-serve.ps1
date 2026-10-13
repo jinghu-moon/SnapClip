@@ -1,4 +1,4 @@
-# 启动 rapidocr serve 本地评估台（模型目录默认 OCR-Model\serve）。
+﻿# 启动 rapidocr serve 本地评估台（模型目录默认 OCR-Model\serve）。
 #
 # 用法：
 #   .\scripts\ocr-serve.ps1                       # 直接跑已构建的 release 二进制

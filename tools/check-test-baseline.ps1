@@ -1,4 +1,4 @@
-#!/usr/bin/env pwsh
+﻿#!/usr/bin/env pwsh
 # SnapClip: the test-count baseline only grows.
 #
 # docs/31-scroll-capture-tdd-tasklist.md section 0.3 recorded 477 passed / 10 ignored / 0 failed

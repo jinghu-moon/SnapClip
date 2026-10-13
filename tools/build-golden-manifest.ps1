@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$Prototype = "prototypes/ocr-location-test.html",
     [string]$ImageDirectory = "OCR-test-image",
     [string]$Output = "OCR-test-image/golden-manifest.json"

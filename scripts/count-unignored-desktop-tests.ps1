@@ -1,4 +1,4 @@
-#!/usr/bin/env pwsh
+﻿#!/usr/bin/env pwsh
 # SnapClip: no test may decide at run time that it has nothing to assert.
 #
 # docs/31-scroll-capture-tdd-tasklist.md P6.05 (D-14, docs/30 section 29.2). The defect is not

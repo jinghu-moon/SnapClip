@@ -1,4 +1,4 @@
-#!/usr/bin/env pwsh
+﻿#!/usr/bin/env pwsh
 # SnapClip: no comment may point at a module that does not exist.
 #
 # docs/31-scroll-capture-tdd-tasklist.md P6.06 (D-15, docs/30 section 33.1). A comment is a

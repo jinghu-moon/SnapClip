@@ -1,4 +1,4 @@
-# SnapClip: verifies that the push gate is installed and usable. See docs/31 §4.3.
+﻿# SnapClip: verifies that the push gate is installed and usable. See docs/31 §4.3.
 #
 # Discipline that is not visible does not exist (docs/31 §2.4, D-14): "pushing is
 # trustworthy" has to be a mechanical fact, so this script fails loudly when the hook

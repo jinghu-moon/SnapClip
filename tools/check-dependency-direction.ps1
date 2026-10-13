@@ -1,4 +1,4 @@
-# Dependency-direction gate (docs/23 T1.9).
+﻿# Dependency-direction gate (docs/23 T1.9).
 #
 # The whole point of splitting the capability crates is that the dependency arrows only
 # ever point one way:
