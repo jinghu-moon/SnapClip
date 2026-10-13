@@ -148,9 +148,11 @@ fn selection(width: u32, height: u32) -> SelectionPixels {
             pixel_format: PixelFormat::Bgra8Unorm,
             captured_at_unix_ms: 1_700_000_000_000,
             provider: "p4-03",
+            origin: Some(snapclip_model::geometry::Point::new(0, 0)),
         },
         region: Rect::new(0, 0, width as i32, height as i32),
         bgra,
+        origin: Some(snapclip_model::geometry::Point::new(0, 0)),
     }
 }
 

@@ -14,7 +14,7 @@
 //!
 //! [`CaptureArtifactStore`]: https://docs.rs/snapclip-history
 
-use crate::geometry::Rect;
+use crate::geometry::{Point, Rect};
 use crate::session::CapturedFrame;
 use crate::{CaptureError, CaptureResult};
 
@@ -41,6 +41,34 @@ pub struct SelectionPixels {
     pub region: Rect,
     /// `region` sized, top-down, tightly packed.
     pub bgra: Vec<u8>,
+    /// Where `frame`'s own `(0, 0)` sits on the virtual desktop, in physical pixels.
+    ///
+    /// `region` is expressed in the frame's coordinates, and a frame is one monitor, so
+    /// this is the monitor's origin — the only thing that turns a selection into a place
+    /// on screen. Consumers that show the selection *inside* the overlay never need it;
+    /// one that puts it back on the desktop (pinning it) cannot work without it.
+    ///
+    /// `None` means "this picture is not a monitor's frozen frame and has no place on
+    /// screen", which is what a stitched scroll image reports. It is **not** the same as
+    /// `Some((0, 0))`: the primary monitor's origin is a real place, and an `Option` is
+    /// the only way to tell the two apart. A sentinel `(0, 0)` for "unknown" silently
+    /// discarded every selection made on the primary monitor — the monitor at the origin
+    /// is the common case, so the sentinel broke the common case.
+    pub origin: Option<Point>,
+}
+
+impl SelectionPixels {
+    /// `region` translated back to virtual-desktop physical pixels, or `None` when this
+    /// picture has no screen position (see [`SelectionPixels::origin`]).
+    pub fn screen_region(&self) -> Option<Rect> {
+        let origin = self.origin?;
+        Some(Rect::new(
+            self.region.left + origin.x,
+            self.region.top + origin.y,
+            self.region.right + origin.x,
+            self.region.bottom + origin.y,
+        ))
+    }
 }
 
 /// Validates a selection and reads it back from the frozen frame.
@@ -73,6 +101,7 @@ impl CaptureService {
             )));
         }
         Ok(SelectionPixels {
+            origin: frame.origin,
             frame: frame.clone(),
             region: clipped,
             bgra,
@@ -105,7 +134,7 @@ pub fn validate(frame: &CapturedFrame, selection: Rect) -> CaptureResult<Rect> {
 #[cfg(test)]
 mod tests {
     use super::{CaptureService, PixelSliceSource, SelectionPixels, validate};
-    use crate::geometry::Rect;
+    use crate::geometry::{Point, Rect};
     use crate::session::CapturedFrame;
     use crate::{CaptureError, CaptureResult};
     use snapclip_model::PixelFormat;
@@ -149,6 +178,10 @@ mod tests {
             pixel_format: PixelFormat::Bgra8Unorm,
             captured_at_unix_ms: 1_700_000_000_000,
             provider: "test",
+            // A frame is one monitor; its own coordinates start at (0, 0) whatever monitor
+            // it came from. These tests never put a selection back on screen, so the
+            // primary monitor's origin is the honest value here.
+            origin: Some(Point::new(0, 0)),
         }
     }
 

@@ -402,9 +402,11 @@ mod tests {
                 pixel_format: PixelFormat::Bgra8Unorm,
                 captured_at_unix_ms: 1,
                 provider: "test",
+                origin: Some(crate::geometry::Point::new(0, 0)),
             },
             region: Rect::new(0, 0, 4, 4),
             bgra: vec![0u8; 4 * 4 * 4],
+            origin: Some(crate::geometry::Point::new(0, 0)),
         }
     }
 

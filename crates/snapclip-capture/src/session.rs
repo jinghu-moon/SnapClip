@@ -19,6 +19,19 @@ pub struct CapturedFrame {
     pub pixel_format: PixelFormat,
     pub captured_at_unix_ms: i64,
     pub provider: &'static str,
+    /// The monitor's origin on the virtual desktop, in physical pixels.
+    ///
+    /// The frame's own coordinates start at `(0, 0)` — it is a copy of one monitor's
+    /// pixels — so the selection geometry the user drags out is monitor-local. This is
+    /// the one number stored alongside it that says *which monitor*, and therefore where
+    /// on the desktop that geometry actually is. A consumer that only draws the selection
+    /// back inside the overlay can ignore it; one that puts the pixels back on screen
+    /// (pinning) cannot.
+    ///
+    /// `None` for a composed picture that is not a monitor's frozen frame (a stitched
+    /// scroll image); `Some((0, 0))` is the primary monitor, a real place. See
+    /// [`crate::artifact::SelectionPixels::origin`].
+    pub origin: Option<Point>,
 }
 
 impl CapturedFrame {
@@ -430,6 +443,7 @@ mod tests {
             pixel_format: PixelFormat::Bgra8Unorm,
             captured_at_unix_ms: 1_700_000_000_000,
             provider: "test",
+            origin: Some(Point::new(0, 0)),
         }
     }
 

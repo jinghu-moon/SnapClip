@@ -15,6 +15,8 @@ use gpui_kit::base::StyledExt as _;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::{ActiveTheme, Root};
 use gpui_kit::*;
+use std::sync::Arc;
+use std::time::Duration;
 
 pub mod adapters;
 pub mod capture;
@@ -22,6 +24,7 @@ pub mod clipboard;
 pub mod clipboard_ingest;
 pub mod events;
 pub mod history;
+pub mod pin;
 pub mod settings;
 pub mod tray;
 
@@ -90,6 +93,43 @@ fn spawn_tray_commands(tray: &tray::Tray, window: &mut Window, cx: &mut Context<
     .detach();
 }
 
+/// Drain what the pin host reports back.
+///
+/// The pin host owns every pin window and handles F6 on its own thread, so the shell never
+/// sees a pin as a command. The only thing the host has to say is "a pin I was asked for did
+/// not appear", and it has to be said even though nothing user-visible depends on it yet: the
+/// channel is bounded, so an undrained one would eventually report "queue full" for a
+/// perfectly healthy system.
+///
+/// A 50 ms poll is deliberate. This loop costs one timer wake-up every 50 ms on the
+/// background executor, and the alternative (a Windows message to the shell's window) would
+/// add a second way to reach this state for no behavioural gain.
+fn spawn_pin_events(pins: &pin::PinManager, window: &mut Window, cx: &mut Context<Shell>) {
+    let pins = pins.clone();
+    cx.spawn_in(window, async move |shell, cx| {
+        loop {
+            let reported = pins.drain_events();
+            if reported > 0 {
+                // A pinned image that never appeared is the kind of failure the user will
+                // notice as "F6 did nothing", so it belongs in the log.
+                eprintln!("[snapclip-app] pin: {reported} 张贴图没能创建");
+                let acted = shell.update_in(cx, |_shell, _window, cx| cx.notify());
+                if acted.is_err() {
+                    // The shell is gone; nothing left to report to.
+                    return;
+                }
+            }
+            // `BackgroundExecutor::timer` is the sleep this crate has access to: GPUI's
+            // `Timer` is not re-exported through `gpui_kit`, and pulling `gpui` in as a
+            // second direct dependency for one sleep is not worth it.
+            cx.background_executor()
+                .timer(Duration::from_millis(50))
+                .await;
+        }
+    })
+    .detach();
+}
+
 /// The shell's root view: the history screen, or the reason it could not open.
 ///
 /// A shell that panics because a database file is busy is worse than one that says so, and
@@ -106,10 +146,14 @@ pub struct Shell {
     tray: Option<tray::Tray>,
     /// The hosted capture overlay. `None` when the overlay or its hotkey could not start,
     /// which is reported and survived: the rest of the shell still works.
-    capture: Option<snapclip_capture::CaptureRuntime>,
+    capture: Option<Arc<snapclip_capture::CaptureRuntime>>,
     /// The clipboard pipeline. Holding this is what keeps it running; dropping it stops the
     /// listener and joins the worker, so it must live as long as the shell.
     clipboard: Option<snapclip_history::ingest::ClipboardIngestHandle>,
+    /// The pin host: one thread that owns every pinned-image window. `None` when that
+    /// thread could not be started, which is reported and survived — F5 capture does not
+    /// depend on it.
+    pins: Option<pin::PinManager>,
 }
 
 /// Which capability the window is showing. A desktop shell keeps navigation persistent, so
@@ -155,16 +199,20 @@ impl Shell {
         .detach();
         // Capture is hosted here from P6 on: F5, the overlay and the export chain belong to
         // this process, which is what lets the old Tauri shell be deleted.
-        let capture = match capture::start(
+        //
+        // `pin_source` is the other half of F6: capture remembers the selection it just wrote
+        // (pixels plus their place on the desktop), and the pin host takes it from there.
+        // Capture does not know pins exist; the shell is what joins the two.
+        let (capture, pin_source) = match capture::start(
             &data,
             events.clone(),
             initial.detection_options(),
             initial.overlay_preferences(),
         ) {
-            Ok(runtime) => Some(runtime),
+            Ok((runtime, pin_source)) => (Some(runtime), Some(pin_source)),
             Err(error) => {
                 eprintln!("[snapclip-app] capture unavailable: {error}");
-                None
+                (None, None)
             }
         };
         // The clipboard pipeline publishes `AppEvent::Clipboard` on the bus above, which is
@@ -191,6 +239,24 @@ impl Shell {
                 None
             }
         };
+        // Pinned images outlive any screen: F6 is handled entirely on the pin host's own
+        // thread, so the shell only owns the host and drains the events it reports back.
+        //
+        // Without a capture there is no source, so pinning is not started at all: a host that
+        // could never be given a picture is a thread and a hotkey that do nothing.
+        let pins = match pin_source {
+            Some(pin_source) => match pin::PinManager::start(pin_source) {
+                Ok(pins) => {
+                    spawn_pin_events(&pins, window, cx);
+                    Some(pins)
+                }
+                Err(error) => {
+                    eprintln!("[snapclip-app] pin unavailable: {error}");
+                    None
+                }
+            },
+            None => None,
+        };
         Self {
             history,
             settings,
@@ -199,6 +265,7 @@ impl Shell {
             tray,
             capture,
             clipboard,
+            pins,
         }
     }
 
@@ -218,7 +285,7 @@ impl Shell {
     }
 
     /// The hosted capture overlay, when the shell could start one.
-    pub fn capture(&self) -> Option<&snapclip_capture::CaptureRuntime> {
+    pub fn capture(&self) -> Option<&Arc<snapclip_capture::CaptureRuntime>> {
         self.capture.as_ref()
     }
 
@@ -226,6 +293,14 @@ impl Shell {
     /// is also how anything outside can tell the shell is collecting clips at all.
     pub fn is_collecting_clips(&self) -> bool {
         self.clipboard.is_some()
+    }
+
+    /// The hosted pin manager, when the shell could start one.
+    ///
+    /// Read by whoever needs to know pins are reachable at all; holding the value is what
+    /// keeps the pin host thread alive, the same way [`Self::tray`] keeps the icon alive.
+    pub fn pins(&self) -> Option<&pin::PinManager> {
+        self.pins.as_ref()
     }
 }
 impl Render for Shell {

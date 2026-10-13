@@ -1,0 +1,501 @@
+# 34 贴图窗口
+
+贴图（pin / 钉图）：把一张图贴到屏幕上，无边框、置顶、不抢焦点。
+
+本文只有三部分：**核心不变量**（§2）、**最小实现**（§3–§5）、**可验证的验收条件**（§6–§8）。§1 列出这些设计所依赖的、不可再还原的仓库事实。
+
+写文档的规矩（与 `docs/33` 同一套）：先钉事实，再让设计只依赖事实；**凡是选择都写清代价**；**凡是阈值都必须来自实测**，没有实测就先不写阈值。
+
+## 1. 不可再还原的事实
+
+### 1.1 呈现路径与穿透
+
+| # | 事实 | 证据 |
+|---|---|---|
+| F1 | 本仓现有的覆盖层窗口走 `WS_EX_NOREDIRECTIONBITMAP` + DirectComposition，不是分层窗口；全仓没有任何一次 `UpdateLayeredWindow` 调用 | `crates/snapclip-capture/src/windows/overlay/window_host.rs:543-568`；全仓 grep `UpdateLayeredWindow` 只命中绑定与文档 |
+| F2 | 分层窗口不能用于 DirectComposition，两条呈现路径互斥 | `crates/snapclip-capture/src/windows/win/window.rs:66` |
+| F3 | `is_click_through_layered` 的存在前提是：**只有 `WS_EX_LAYERED \| WS_EX_TRANSPARENT` 同时置位**才把鼠标交给下层；`WS_EX_TRANSPARENT` 单独只影响绘制顺序，一个普通分层窗口仍然可交互 | `crates/snapclip-capture/src/windows/win/window.rs:39-49`；单测 `click_through_requires_both_layered_and_transparent`（同文件 `:517-533`） |
+| F4 | 真正被本仓用作穿透杠杆的是窗口过程对 `WM_NCHITTEST` 返回 `HTTRANSPARENT`，而且它**同时**是滚动会话的既有实现：面板内回答 `HTCLIENT`，面板外回答 `HTTRANSPARENT` | `crates/snapclip-capture/src/windows/overlay/hover.rs:982-993`；杠杆对照表 `win/window.rs:62-68`（`WS_EX_TRANSPARENT` 单独使用被实测标注为 "does not work"） |
+| F5 | `HTTRANSPARENT` 是**真的**放行，不是"改一次命中测试就算了"：按键期间必须拒绝它，否则落在那一刻的按下/抬起会跑去下层应用；本仓为此用 `GetAsyncKeyState` 而不是 `GetKeyState` | `crates/snapclip-capture/src/windows/overlay/hover.rs:964-974` |
+| F6 | `UpdateLayeredWindow` 是**整窗提交**：`hdcSrc` 里的位图被整体采用，窗口大小取自该位图与 `pptw`/`psize`；它**没有**"只重画变化区"的语义。分层窗口唯一的局部更新机制是 `UpdateLayeredWindowIndirect` 的 `UPDATELAYEREDWINDOWINFO::prcDirty` | `UPDATELAYEREDWINDOWINFO` 的 `prcDirty` 字段：`windows-sys-0.59.0\src\Windows\Win32\UI\WindowsAndMessaging\mod.rs:3611-3622`；同文件 `:445` 与 `:447` 分别导出 `UpdateLayeredWindow` 与 `UpdateLayeredWindowIndirect` |
+
+### 1.2 窗口、线程与生命周期
+
+| # | 事实 | 证据 |
+|---|---|---|
+| F7 | 进程里长期存活的消息泵有两个：托盘线程（自建隐藏窗口 + `RegisterClassW` + `GetMessageW`，把动作变成 `TrayCommand` 交回 UI 线程）与剪贴板监听线程。覆盖层线程活不过一次会话 | `apps/snapclip/src/tray.rs:3-12`、`:238`、`:291`；`apps/snapclip/src/clipboard_ingest.rs:44-62` |
+| F8 | 托盘线程已有可注册任意单条热键的现成工具：`register_scoped` / `unregister_scoped` 接受任意 `Hotkey`。覆盖层线程的 `HOTKEYS` 是定长数组 `[0x5343, 0x5344, 0x5345]`，会话级 Esc 是 `0x5346` 且不在表里；`from_id` 把 `WM_HOTKEY.wParam` 映射回动作，未登记的 id 被丢掉 | `crates/snapclip-capture/src/windows/hotkey.rs:55-114`、`:166-173` |
+| F9 | 覆盖层线程承载窗口、DirectComposition、D2D 与消息泵，会话结束即退出 | `crates/snapclip-capture/src/windows/overlay/window_host.rs:512-527` |
+| F10 | 覆盖层的窗口类只注册了 `CS_HREDRAW \| CS_VREDRAW`，没有 `CS_DBLCLKS`；覆盖层特意**不**用 `WS_EX_NOACTIVATE`，理由是"否则永远收不到 `WM_KEYDOWN`，Esc / Enter 会变成死键" | 同文件 `:543-545`、`:565-567` |
+| F19 | **`WS_POPUP` 不含可见性**：`CreateWindowExW` 只给 `WS_POPUP` 建出来的窗口是存在的、能收鼠标消息的、但**从不显示**的。要它上屏必须再给一次可见性——创建时带上 `WS_VISIBLE`，或用 `SetWindowPos(…, SWP_SHOWWINDOW)`。捕获侧走的是后者 | 覆盖层创建只给 `WS_POPUP`：`crates/snapclip-capture/src/windows/overlay/window_host.rs:563-581`，使它上屏的是 `crates/snapclip-capture/src/windows/overlay/window_restore.rs:65-76` 的 `SetWindowPos(…, SWP_SHOWWINDOW)` |
+| F18 | **用 `RegisterHotKey(null, …)` 注册的热键，`WM_HOTKEY` 是一条线程消息**（`MSG.hwnd` 为 null）。`DispatchMessageW` 对没有窗口的消息**静默丢弃**——它不会派发到任何窗口过程。覆盖层的消息泵为此显式判空并把线程消息自己交给控制器 | `crates/snapclip-capture/src/windows/overlay/window_host.rs:650-660`（注释原文 "carry no window handle, so `DispatchMessageW` would silently drop them"）；注册处 `crates/snapclip-capture/src/windows/hotkey.rs:351` |
+| F20 | **`WM_MOUSEWHEEL` 送到有焦点的窗口**（MSDN 原文 "sent to the window that has the focus"）。贴图窗口是 `WS_EX_NOACTIVATE`，永远没有焦点，所以它**收不到**滚轮消息——窗口过程里有那条分支也没用。要收必须先用 `SetCapture` 把鼠标消息接过来 | MSDN `WM_MOUSEWHEEL` 的 Remarks；贴图侧的做法见 §4.2.1（`apps/snapclip/src/pin/host.rs`）。仓里此前没有任何一处处理滚轮消息 |
+
+### 1.3 数据模型
+
+| # | 事实 | 证据 |
+|---|---|---|
+| F11 | 图像有**两条互不相同**的取字节路径。捕获产物是文件路径：`CaptureEvent.artifact: Option<ArtifactRef>`（字段注释明写"引用就是消费者打开它所需的一切，字节本身从不经过事件"）。剪贴板图像**没有** `ArtifactRef`：`ClipboardEvent` 只有 `clip_id`、`kind`、`dimensions`、`pixel_format`、`generation`，字节要按 `PayloadRef.content_hash` 从 blob 存储取 | `crates/snapclip-model/src/events.rs:62-86`；`crates/snapclip-model/src/payload.rs:25-32`；`crates/snapclip-history/src/blob_store.rs:25-41`、`:84` |
+| F12 | 内容寻址的存储 API 已存在：`ClipboardBlobStore::new(root)` / `put(&[u8]) -> BlobRef` / `read(&str) -> Vec<u8>` / `remove_orphans(&HashSet<String>)`；`BlobRef.content_hash` 就是键 | `crates/snapclip-history/src/blob_store.rs:25-108` |
+| F13 | `AppEvent` 的形状被写死为"身份、状态、尺寸和 `ArtifactRef`——**从不携带像素**" | `crates/snapclip-model/src/events.rs:1-8` |
+| F14 | 覆盖层冻结的是"当前屏幕的一帧"，吸附、放大镜取色、保存的 PNG 都读这一帧 | `docs/33` §1 F2 |
+
+### 1.4 依赖与绑定
+
+| # | 事实 | 证据 |
+|---|---|---|
+| F15 | `apps/snapclip` 与 `crates/snapclip-history` 已依赖 `windows-sys 0.59`（含 `Win32_UI_WindowsAndMessaging`）；`crates/snapclip-capture` 另有一整套 `windows 0.61` + D2D/D3D11 | `apps/snapclip/Cargo.toml:55-65`；`crates/snapclip-history/Cargo.toml:24-37`；`crates/snapclip-capture/Cargo.toml:19-76` |
+
+### 1.5 捕获侧的既有排除
+
+| # | 事实 | 证据 |
+|---|---|---|
+| F16 | 覆盖层把**整个进程**加进 `Exclusions`（`std::process::id()`），注释写明这是"对 SnapClip 稍后创建的窗口的兜底" | `crates/snapclip-capture/src/windows/overlay.rs:591-597` |
+| F17 | 窗口检测有意不查询 `WS_EX_TOOLWINDOW` / `WS_EX_NOACTIVATE` | `crates/snapclip-capture/src/window_detection/snapshot.rs:101`、`:257` |
+
+## 2. 核心不变量
+
+设计要维持的就是这五条；其余一切都是它们的结果。
+
+1. **像素只经 `Arc`，不经事件。** 事件传引用（路径或 `content_hash`），不传字节（F13）。任何"顺手把图放进事件里"的改动都违反这一条。
+2. **窗口只有一个所有者线程。** 所有贴图的 HWND 由**一个**专用线程创建、承载消息泵、并在退出时统一销毁；UI 线程只发命令。理由是"窗口过程必须在创建它的线程上执行"——这不是限制而是优势：命令天然串行，不需要 `AttachThreadInput`，没有跨线程的 z 序竞态。
+3. **提交是整个窗口，不存在部分提交。** 像素一变就重画整窗、整窗提交一次（F6）。局部更新只有在 `prcDirty` 被真机验证之后才允许讨论，届时它是一条**独立**的、有基准支撑的优化，而不是第一版的前提。
+4. **穿透由窗口过程决定，不由样式决定。** 回答 `HTTRANSPARENT` 是唯一机制（F4），按键期间必须拒绝穿透（F5），且退路必须存在——进得去就必须出得来。
+5. **一个内容，一份解码。** 同一张图被多个窗口引用时只解码一次；键是内容标识，不是路径字符串。
+
+## 3. 最小实现
+
+### 3.1 结构：六个名字，一个线程
+
+```text
+apps/snapclip/src/pin/
+  mod.rs    PinManager   —— 窗口清单、编号、事件回收（**不在** UI 线程上跑宿主循环）
+            PinEvent     —— 宿主线程 → 外壳（窗口创建失败；正常关闭宿主自己知道）
+            PinHome      —— 「谁能交出刚截的那张图」，由外壳实现（§3.4）
+  source.rs ImageSource  —— 解码后的 BGRA 像素 + 尺寸（Arc 共享）
+  host.rs   PinWindowHost / HostState —— 宿主线程、消息泵、分层窗口
+```
+
+（`TakeSelection` / `PinSource` 在 `apps/snapclip/src/capture/pin_source.rs`，见 §3.4。）
+                        的 OverlayShared::selection 才是像素真正待的地方
+```
+
+每个类型的职责边界就是第 2 节的不变量：
+
+- **`PinHome`**：回答"F6 该贴哪张图"。它是贴图模块唯一的取图接口，方向是**外壳实现、宿主调用**——这样贴图模块不认识 `snapclip-capture`，也不知道图是从剪贴板还是从刚截的选区来的。
+- **`ImageSource`**：只持有解好的像素与尺寸。不做缩放、不认识窗口、没有生命周期。`Arc` 的引用计数就是生命周期。
+- **`PinWindowHost` / `PinWindowState`**：宿主线程与每个窗口的状态（HWND、位置、`scale`、`Arc<ImageSource>`、穿透开关）。窗口过程、消息泵、DIB、提交都在这里；退出时一次性销毁全部 HWND 与 DIB。
+
+**线程模型**（一条命令通道，两个方向）：
+
+```text
+UI 线程：PinManager                        宿主线程：PinWindowHost
+  ├─ PinCommand::{Create, Move, Destroy, ──────► GetMessageW 消息泵
+  │               SetClickThrough, …}            每个 HWND 一个 WndProc
+  │                                              DIB 合成 + UpdateLayeredWindow
+  └─ PinEvent::Closed(id)  ◄──────────────────── WM_NCDESTROY / 用户双击
+     （只删记录，不碰 HWND）
+```
+
+- **`Create` 同步返回 `Result`。** "一个宿主线程"这个形态反而让错误可见：以前"每窗口一线程"时，创建失败只发生在别人的线程上，UI 线程拿不到；现在 DIB 分配结果与窗口创建结果直接回到 `PinManager`。
+- **`PinManager` 不持有 HWND。** 它只记"哪个 id 存在、在什么位置、什么 `scale`"。任何窗口操作都是命令。
+- **销毁是幂等的**：`Destroy` 之后收回来的 `Closed` 是正常路径，不是错误。
+- **应用退出**：`shutdown()` 发出 `DestroyAll` 并 **join 宿主线程**；宿主线程在自己的消息泵退出前销毁全部 HWND 与 DIB。这条路径要有测试（§6.1），它是最容易泄漏的一处。
+
+**为什么不是每窗口一线程**：`SetWindowPos` 与 `UpdateLayeredWindow` 本身并不要求调用方持有该窗口的创建线程；真正要求线程亲和的是**窗口过程**与资源生命周期。既然如此，N 个窗口需要的是"它们的消息泵在同一个线程上"，而不是"N 个线程"。单宿主线程直接消灭三样东西：每窗口的线程与退出同步、跨线程的 z 序/关闭竞态、退出时的 N 路 join。
+
+代价必须写清：宿主线程成为唯一的串行点，一次 4K 整窗提交会挡住同线程上其它窗口的**命令处理**（不挡它们的绘制——DWM 已持有各自的表面）。若 P2 量到这个阻塞可见，再按窗口分线程，届时依据是数字。
+
+**实际落地的名字比上表少一个。** `PinCommand` 没有出现：宿主线程收的是 [`PinRequest`]（`dispatch`）与 [`PinHandle`]（`close_pin`）两种值，不是一个命令枚举。多一层枚举只是把同一件事说两遍；等 P2 的移动/缩放/穿透真的需要"按窗口 id 下发动作"时再加，那时它才有内容。
+
+| 设计名 | 落地 | 位置 |
+|---|---|---|
+| `PinSource` | `PinSource` / `TakeSelection` | `apps/snapclip/src/capture/pin_source.rs:60`、`:33` |
+| `ImageSource` | `ImageSource` | `apps/snapclip/src/pin/source.rs:23` |
+| `PinManager` | `PinManager` | `apps/snapclip/src/pin/mod.rs:46` |
+| `PinWindowHost` | `PinWindowHost` | `apps/snapclip/src/pin/host.rs:150` |
+| `PinWindowState` | `PinWindowState` / `HostState` | `apps/snapclip/src/pin/host.rs:328`、`:288` |
+| `PinEvent` | `PinEvent` | `apps/snapclip/src/pin/host.rs:134` |
+| — | `PinRequest`、`PinHandle` | `apps/snapclip/src/pin/host.rs:104`、`:142` |
+| — | `PinHome`、`PinSelection` | `apps/snapclip/src/pin/mod.rs:71`、`:47` |
+
+`PinSource` 不是原计划那个 `enum { Artifact, Blob }`：它是「刚确认的那张图」这一个槽位的**转发句柄**——像素留在捕获侧的 `OverlayShared::selection`（§3.4），`PinSource` 只把它接成贴图线程能调用的 `PinHome`，自己不存第二份。它落在外壳的 `capture/` 下而不是 `pin/` 下，因为它属于「捕获欠贴图的那一个方法」而不是贴图本身。原计划的两条取字节路径没有实现，原因见 §3.4 与 §3.5。
+
+### 3.2 归属：`apps/snapclip`，用现成的 `windows-sys 0.59`
+
+宿主线程放在外层应用里，**不**放进 `snapclip-capture`。
+
+`apps/snapclip` 已经在用 `windows-sys 0.59`（F15），分层窗口需要的 API 全在这个绑定里（F6 已确认 `UPDATELAYEREDWINDOWINFO` 与两个函数都在），不需要 `windows 0.61`，也不会引入第二套绑定。实际补进 feature 列表的是**五个**（`apps/snapclip/Cargo.toml:56-77`）：`Win32_Graphics_Gdi`（DIB 段与它需要的 `GetDC`/`CreateCompatibleDC`/`CreateDIBSection`/`SelectObject`/`DeleteObject`）、`Win32_UI_Input_KeyboardAndMouse`（`VK_F6`——`RegisterHotKey` 需要它，而它原本不在列表里；后来滚轮缩放要的 `SetCapture`/`ReleaseCapture`/`TrackMouseEvent`/`TME_LEAVE` 也在这个模块）、`Win32_System_Performance`（拖动账本的 `QueryPerformanceCounter`/`QueryPerformanceFrequency`）、`Win32_UI_Controls`（`WM_MOUSELEAVE` 反常地住在那里，见 §4.2.1）与既有的 `Win32_Foundation`，不是一个新依赖。**屏幕回读路径（`BitBlt`）随 §3.4 那次改正一起删掉了**，所以 `GetWindowRect` 一类也不再被用到。
+
+`Win32_Foundation` 与 `Win32_Graphics_Gdi` 在本轮之前**已经**在列表里（托盘要用 GDI 画图标），所以实际新增的只有 `Win32_UI_Input_KeyboardAndMouse` 一项。
+
+反向的代价本来更大：放进 `snapclip-capture` 会让它导出一个与捕获毫无语义关系的贴图窗口句柄，只为借它的 D2D/D3D11 栈，而我们选的路径根本不用 D2D。
+
+### 3.3 呈现：分层窗口，整窗提交
+
+选 `WS_EX_LAYERED` + `UpdateLayeredWindow(ULW_ALPHA)`，而不是 `WS_EX_NOREDIRECTIONBITMAP` + DirectComposition。
+
+代价的对照是：DirectComposition 路径要交换链、呈现线程、设备丢失恢复三样东西；分层窗口路径要一块自己维护的 CPU 位图（DIB 段）与一次格式转换。贴图是静态图——没有动画、没有每帧变化——前者那三样一个都不需要，后者两样都是常数工作量。
+
+**每一帧的算法就一句话**：
+
+```text
+源像素按 scale 缩放 → 画进 DIB 段（BGRA，stride = 宽 × 4）
+  → 画一遍 1 DIP 边框（§5.3）
+  → UpdateLayeredWindow(hwnd, …, ULW_ALPHA)   // 整窗
+```
+
+- **没有脏矩形**，没有分层合成，没有阴影层。这是第一版唯一的绘制路径（不变量 3）。
+- 悬停换色、工具栏这类"局部变化"第一版**不做**（§5.3）；一旦要做，它们同样走整窗提交，直到 `prcDirty` 被真机验证过。
+- 整窗提交这一句本身在 4K 上要多久**没有数据**（P0 量它，§6.2）：§6.2 现有的是它**之前**那两块搬运（约 1.9 ms / 12.5 ms），而 `UpdateLayeredWindow` 是它们之后、必然更贵的那一步。在数字出来之前，本文**不给**任何耗时阈值。
+
+### 3.4 来源：F6 贴的是「按 F5 刚截的那张」，贴回它原来的位置
+
+**这条路径改过一次，第一次是错的，理由值得留着。**
+
+用户给的交互只有一句「F5 截图，F6 贴图」。第一版把它读成了「F6 是一个没有前置选择的瞬时动作」，于是去**贴光标底下的窗口**（`target_at_point` → `GetWindowRect` → `BitBlt` 回读屏幕）。这个读法被用户直接否掉了：
+
+> 「按下 F5，截取画面，这个画面就是要贴图的画面啊。」（m01493）
+
+按 F5、拖出一个选区、抬手——用户此刻手里已经有一张图了。F6 不是"找一张图来贴"，而是"把这张钉住"。第一版走弯路的地方在于**到别处找图**：真正的来源一直在用户刚确认的那个选区里，而且它是全进程唯一一份已经被验证过的完整副本。
+
+**现在的来源**（发布在 `crates/snapclip-capture/src/windows/overlay/session.rs` 的 `publish_selection`，携带在 `crates/snapclip-capture/src/windows/overlay.rs` 的 `OverlayShared::selection`）：
+
+```text
+F5 确认选区（拖拽抬手 或 吸附确认）
+  → OverlayController::publish_selection("drag" | "snap")
+  → CaptureService::prepare_selection(frozen, selection, FrozenFramePixels)
+     （与导出是同一套裁剪/校验，这时冻结帧还活着）
+  → shared.selection = Some(Arc<SelectionPixels>)   // 槽位留在覆盖层，活过会话
+F6 → 宿主线程经 PinHome::take_selection 取走槽位里的那一张
+   → ImageSource::from_bgra_bytes(…)（逐 4 字节重解释成 u32，并强制 alpha 不透明）
+   → 窗口落在选区自己的屏幕坐标上（region 的左上角）
+F9（可选）→ confirm() 重新读一次（此时可能已带注解）
+   → 再次写 shared.selection，然后才走 ArtifactWriter::write 落盘
+```
+
+**发布点在手势提交处，不在写盘处——这是第二次改正，第一次的错法也值得留着。** 第一版把 `remember` 挂在 `ArtifactWriter::write` 的装饰器上（`PinSourceWriter`）。那条路径依赖用户按 F9 保存：`write` 只在导出时被调用，而用户的流程是「框选 → F6」，从不保存，于是槽位**永远是空的**，F6 一路回答「还没有可贴的图」。写盘是用户按 F9 才发生的事，而 F6 要的是「刚框出来」这件事——把来源挂在写盘上是错的位置。那个装饰器已经删掉：现在只有一个写入者（覆盖层手势提交时）、一个槽位、一个读者（`PinSource::take_selection`），不再有"同一件事的第二遍"。
+
+**为什么必须在这时读回、不能等到 F6**：这些像素的唯一副本是冻结帧（`session.frozen`），它随会话释放（`release_session` 里 `self.frozen = None`，GPU 纹理一起走）。等到 F6 才读就只能回读屏幕，而覆盖层那时还盖着整块屏幕。代价是每次提交多一次选区大小的回读（实测 1441×900 选区约 1 ms，日志 `stage=selection_kept`），只发生在抬手时，不在鼠标移动路径上。
+
+**贴回原位的三个直接结果**：
+
+- 「钉住」在视觉上就是这副画面留在它刚才在的地方，用户不必把窗口从别处拖回去；`region` 本来就是虚拟桌面坐标，宿主线程不需要再做坐标换算。
+- 被遮挡的部分拿到的是**当初截下来的像素**，不是遮挡物——F5 冻结帧之后，屏幕上再发生什么都不影响这张图。
+- 拼接出来的滚动长图**被跳过**（`SelectionPixels::origin` 为 `None`，即"这块像素不属于屏幕上任何位置"）。跳过之后 F6 说「还没有可贴的图」，这是实话；顺带也躲开了那张 `1920×300,000`、2.15 GiB 的 `bgra` 被钉在槽位里。
+
+**第三次改正：`(0, 0)` 不能当"没有位置"的哨兵。** 第一版把「没有位置」写成 `origin == (0, 0)`。主显示器的原点**就是** `(0, 0)`，而它是最常见的那块屏——用户的主屏正是 `3840x2160 at (0, 0)`（实跑日志 `monitor bounds=3840x2160 at (0,0)`）。于是主屏上的**每一次**框选都被当成拼接长图丢掉，F6 永远回答「还没有可贴的图」，看起来和第二次的 bug 一模一样，其实是另一个原因。`origin` 因此从 `Point` 改成 `Option<Point>`：`None` 是"没有位置"，`Some((0, 0))` 是"位置就是原点"。这两件事在类型上必须能分开——用值域里的一个点表示"没有值"，就会吃掉那个点所代表的那块屏。`SelectionPixels::screen_region()` 相应返回 `Option<Rect>`。回归测试 `a_selection_at_the_primary_monitor_origin_is_still_pinned` 先在旧的哨兵写法上确认失败，再在 `Option` 上通过。
+
+**已知代价**：`prepare_selection` 会新建一个缓冲区（回读的结果，不是 `prepared.bgra` 的副本——它由 `CaptureService` 从冻结帧裁剪出来）。4K 全屏选区约 33 MB，每次 F5 提交一次；它与贴图窗口自己那份 `u32` DIB 是两笔不同的分配，都记进 §7 的账，第一版先量不猜。F6 真正贴出去时 `PinSource::take_selection` 还会把这段像素复制成 `PinSelection` 自己那份 `Arc<Vec<u8>>`（贴图窗口要独立的生命周期），那是第二笔，只在按 F6 时发生。
+
+**仍然不做的**：
+
+- **不做内容缓存**。每次 F5 覆盖槽位，每次 F6 取走并清空；不存在"同一张图被两个窗口引用"（不变量 5 因此暂时是空的）。
+- **不做来源生命周期管理**。`Artifact`/`Blob` 两条路径等真有"从剪贴板贴"/"从历史贴"的需求再补；`PinRequest::Image` 已经留着，接口在那儿。
+- **不做"最近一帧"旁路**。槽位里的就是**这一帧的选区**（已裁剪、已验证、已交给导出路径），不是覆盖层内存里那整帧。
+
+### 3.5 准入：第一版先量，不设限
+
+**原计划是"一个硬上限"**（`DECODED_LIMIT` / `WINDOW_LIMIT` + 用户可见的拒绝）。它**没有实现**，因为它依赖两个至今没有的数字：一个分层窗口的 USER/GDI 成本、以及典型贴图的字节数。在§6.2 的四项实测量出来之前写这两个常量，就是拿猜的数字当保护——而猜错的保护比没有保护更糟：它会让用户在完全正常的用量下撞墙。
+
+第一版因此**只做记账，不做拦截**：`PinManager` 记着屏幕上还有几张、宿主线程记着每张的尺寸。撞墙的真实代价（USER 对象耗尽）在下一次 F6 上表现为**创建失败**，而创建失败是一条已经实现的、带错误信息的路径（`Create` 同步返回 `Result`），不是静默损坏。
+
+这仍然是**有意的推迟，不是遗忘**：`DECODED_LIMIT` 与 `WINDOW_LIMIT` 在 P3 拿数字后补齐，补的时候连测量条件一起记录。
+
+## 4. 窗口与交互
+
+### 4.1 窗口样式
+
+| 项 | 值 | 理由 |
+|---|---|---|
+| 扩展样式 | `WS_EX_TOPMOST \| WS_EX_TOOLWINDOW \| WS_EX_NOACTIVATE \| WS_EX_LAYERED` | 置顶、不进 Alt-Tab、不抢焦点、分层 |
+| 样式 | `WS_POPUP \| WS_VISIBLE` | 无边框 |
+| 窗口类 | `CS_DBLCLKS`（必须）+ `CS_HREDRAW \| CS_VREDRAW` | 没有 `CS_DBLCLKS` 就没有 `WM_LBUTTONDBLCLK`，双击关闭是死代码（F10 说明现有窗口类没有它） |
+| 键盘 | **收不到**（`WS_EX_NOACTIVATE`），所以不使用任何快捷键 | 与覆盖层相反：覆盖层特意不用 `WS_EX_NOACTIVATE`，因为 Esc/Enter 是会话的命脉（F10）；贴图不需要键盘 |
+| 滚轮 | **不靠焦点，靠悬停期的鼠标捕获**（§4.2.1，F20） | 滚轮消息按 MSDN 归"有焦点的窗口"，而这一行刚说过贴图永远没有焦点。所以收到 `WM_MOUSEMOVE` 时取一次 `SetCapture`、登记一次 `TME_LEAVE`，离开时 `ReleaseCapture` |
+
+### 4.2 交互：第一版只做两个动作
+
+| 动作 | 触发 | 结果 | 状态 |
+|---|---|---|---|
+| 移动 | 左键按住拖动 | `SetWindowPos`；首击不移动，超过 `SM_CXDRAG/SM_CYDRAG` 才移动（否则双击不可靠） | 已实现 |
+| 关闭 | **左键双击** | 销毁窗口，释放 `ImageSource` 引用 | 已实现 |
+| 缩放 | **鼠标悬停在贴图上滚轮**（§4.2.1） | 倍数每档 ±0.1，钳在 `[0.1, 10.0]`（`100%` 是基准）；光标底下那个像素在屏幕上不动；右上角有倍数控件（§4.2.2） | 已实现 |
+| 关闭（第二条路） | 右键菜单 →「关闭」 | 与双击等价 | **未实现** |
+| 复制 | 右键菜单 →「复制」 | 把**源图像**（不是缩放后的显示缓冲）写入剪贴板 | **未实现** |
+| 穿透 | 右键菜单 →「鼠标穿透」 | 窗口过程对 `WM_NCHITTEST` 回答 `HTTRANSPARENT`（§4.3） | **未实现** |
+
+**为什么剩下三条一起推迟**：右键菜单与穿透共用同一个前置条件——"窗口的命中测试需要区分'在图像上'与'在别处'"。没有穿透时 `WM_NCHITTEST` 一律回答 `HTCLIENT`（第一版就是这样），而一旦引入穿透，`HTTRANSPARENT` 就必须与按键状态配对（F5），命中测试就从"常量"变成一个**有状态的判定**。把它做对需要 §4.3 的托盘撤销路径同时存在，否则用户会把自己关在外面。与其先放半个会把人锁住的穿透，不如整组一起等 P2。
+
+**缩放原本也挂在"一起推迟"里，现在移出来了**，因为它真正需要的东西与右键菜单/穿透不同：它不要命中测试，只要"鼠标在窗口里时把滚轮消息拿过来"（§4.2.1）。上一版把三件事捆在一起的理由（共享命中测试）对缩放不成立，这是**捆错了**，不是提前做了。
+
+**双键的分工仍然是穷尽的**：左键只有拖动与双击两件事，右键第一版不出菜单，滚轮只有缩放一件事。这条"没有第三种解析"就是全部交互规则。
+
+**拖动位置从锚点算，不做累加**。这是实测踩到的故障：第一版写的是 `窗口 = 窗口 + 光标增量`，而窗口位置在每条 `WM_MOUSEMOVE` 之后都被改写，于是**上一次的结果又当成了下一次的基准**，每一段位移被重复计入。表现是贴图越拖越跑偏、最后完全不跟鼠标。改成 `窗口 = 拖动开始时的位置 + (当前光标 − 按下时光标)` 之后，位置对同一组输入永远给出同一个答案：丢消息、消息被合并、光标被屏幕边缘夹住都不会留下累积误差，鼠标回到按下点窗口就精确回到原处。抽成纯函数 `drag_position(anchor, cursor_down, cursor_now)` 才测得动，回归测试 `dragging_keeps_the_window_under_the_cursor` 与 `a_cumulative_drag_would_lose_the_cursor`（`apps/snapclip/src/pin/host.rs`）分别盯着"公式对"和"为什么必须给公式一个锚点"。另外 `SetWindowPos` 的返回值要检查：只有窗口真的动了才更新记录的 `position`，否则程序里的位置会变成"它想去的地方"，下一个动作就建在一个假事实上。
+
+- 双击时限取 `GetDoubleClickTime()`，不写死。
+- 「首击不移动」是双击唯一需要的补偿规则。上一版还有"双击后 100 ms 内拒绝拖动"与"位移事件判定"，那是在给一个还没出现过的问题预先打补丁——去掉。
+- 键盘不可用是约束而不是遗漏：`Ctrl+C` / `Z` / `X` 第一版不做，复制走右键菜单。
+
+### 4.2.1 滚轮缩放：必须自己把滚轮"接"过来（F20）
+
+**触发是"悬停"，不是"`Ctrl`+悬停"。** 上一版的 `Ctrl+滚轮` 是从"缩放是个危险动作"推出来的，但缩放随时可以往回滚，而 `Ctrl` 需要的键盘焦点这一行恰好刚说过没有。用户的期望就是**鼠标放在贴图上滚一下**，所以不加修饰键。
+
+**为什么不能只加一个 `WM_MOUSEWHEEL` 分支。** 这是本功能唯一有含量的地方，值得写在设计里：
+
+> MSDN 对 `WM_MOUSEWHEEL` 的说明是**送到有焦点的窗口**（"sent to the window that has the focus"）。
+
+而 §4.1 已经写明贴图窗口带 `WS_EX_NOACTIVATE`，**永远不会有焦点**。也就是说：就算窗口过程里那条分支写对了，消息也永远不会被送到它面前——症状是"悬停在贴图上滚轮，一点反应都没有"，和没写这条分支完全一样。这不是 Cargo-cult 的顾虑，是这一版**必须**绕开的前置条件。
+
+所以窗口过程自己把滚轮接过来，三步（`apps/snapclip/src/pin/host.rs`）：
+
+1. `WM_MOUSEMOVE` 里 `SetCapture(hwnd)`：捕获之后，鼠标消息（含滚轮）一律先送到这个窗口，不要求焦点。
+2. 同一条分支里 `TrackMouseEvent(TME_LEAVE)`：**捕获必须能还回去**。没有它，用户的光标早就移到别处了，窗口还攥着全系统的鼠标消息——别的程序点不动、拖不动，是比"缩放不生效"严重得多的事故。
+3. 收到 `WM_MOUSELEAVE` 就 `ReleaseCapture()`，并把"光标在窗口里"这个标志清掉。`TrackMouseEvent` 只对**下一次**离开有效，所以每次进入都要重新登记；那个标志同时兼作"现在能不能 `SetCapture`"的开关，否则每一条 `WM_MOUSEMOVE` 都去捕获一次。
+
+拖动期间不释放捕获（拖动本来就需要它），但 `WM_LBUTTONUP` 之后若光标已不在窗口内，捕获同样要还掉——判断依据就是那个标志。
+
+**缩放倍数怎么走**：每一档 **±0.1**，钳在 `[0.1, 10.0]`，`100%` 是基准（这三个数都是用户定下的，见 §4.2.2 的控件范围来源）。选 0.1 而不是"每档乘 1.1"，是因为倍数从此活在一个 0.1 的栅格上，而**这个栅格可以用整数十分位精确表示**：`host.rs` 的 `zoom_step` 把倍数折算成"第几档"（`round(zoom * 10)`），加减 1，再折回 `f64`。整数永远精确、折回时每次得到同一个最近值，所以"上一档再下一档"回到**逐位相同**的原值——这条现在是精确断言，不再需要容差。
+
+> 旧实现（乘除 `1.1`）做不到这一点，这也是它必须靠"九位小数归整 + 离 1.0 不足 `1e-9` 就归成精确 1.0"来压误差的原因：六位精度下 `1/1.1` 归整成 `0.909091`，乘回 `1.1` 是 `1.0000001`，落在 1303 像素的宽度上就是 `1303.00013`，四舍五入到 1304——放大再缩小**差一个像素**。换成整十分位之后，那一整套归整逻辑连同它的两个常量一起删掉了；阶梯也因此是对称的（`1.0` 的上一档是 `1.1`、下一档是 `0.9`），不再有"往下偏要除以同一个常量"的说法。
+
+两端的档位必须精确等于 `ZOOM_MIN` / `ZOOM_MAX` 这两个**字面量常量**，这不是洁癖：`1.0 / 10.0` 得到的是 `0.1` 旁边的另一个 `f64`，于是"一直往下滚"会停在 `0.09999999999999999`——数值上没差，但它不等于 `ZOOM_MIN`，"滚到底就停在边界上"这句话就既不能被断言也不能被信任。`clamp_zoom` 因此会把落在边界 `1e-12` 以内的值按回常量（这个窗口比相邻档之间的距离小八个数量级，只可能命中边界本身）。
+
+**光标底下的像素必须不动**，这是缩放唯一的正确性判据：用户把光标压在要看的那个字上滚，那个字留在原地，别的都以它为中心伸缩。做法是每次从**原图**重采样，而不是缩放上一帧的结果——后者每滚一步就重采样一次，整数倍来回走一趟都不再逐像素相同（`integer_zoom_there_and_back_is_pixel_exact` 盯着这条）。锚点用**原图像素坐标**表达，所以不变量与倍数无关：`image_point_at_client(zoom', cursor) == image_point_at_client(zoom, cursor)`。实现是"先问光标底下原来是哪个像素，再问这个像素在新倍数下该出现在屏幕的哪个位置，把窗口按这个差值平移"（`zoom_with_cursor`）。
+
+**一条消息可以带多格。** 普通鼠标滚一格是 `WHEEL_DELTA = 120`，但一次事件可以带 `zDelta = ±360`（三格）、高精度滚轮还会给小于 120 的值。所以余数要跨消息累积（`wheel_zoom(zoom, remainder, delta)`），"没凑够一格"的时候既不改倍数、也不丢那点余数。取 `zDelta` 是取 `wParam` 的**高字**并作 `i16` 解释，屏幕坐标是 `lParam` 的两个 `i16`（副屏在主屏左边时是负数）。
+
+**由此多出一个故障面（F20）**：鼠标捕获是**进程级**的资源，忘记释放的后果超出这个窗口自己。这一类"借来的全局资源必须还"的教训与 F18/F19 同型，只是这次借的不是窗口能力而是输入路由。
+
+### 4.2.2 缩放的两个收尾：画面不能再闪，倍数要看得见
+
+这两件事都是**用户实跑之后**提出来的，也都改在了实现里。
+
+#### 闪烁：`SetWindowPos` 必须一次给出位置与尺寸
+
+第一版缩放时画面会闪。根因是**三次窗口操作各自为政**：先把新缓冲画好并 `UpdateLayeredWindow` 提交（`UpdateLayeredWindow` 会自己按缓冲尺寸改窗口），再 `SetWindowPos` 改尺寸，再 `SetWindowPos` 改位置。缩放围绕光标走，位置几乎每一档都变，所以中间必然存在一帧"新画面 ＋ 新尺寸 ＋ **旧**位置"，缩小时还会经过一帧"窗口还大、层已经小了"——露出来的那块不在层的缓冲里，屏幕上就是一块透明的闪。
+
+修法是把顺序倒过来，让窗口只有**一次**几何变化：
+
+1. 新缓冲先在旁边建好、画满。此时屏幕上一个像素都没动；失败就原样返回（半换状态是这里唯一不能接受的失败方式）。
+2. `SetWindowPos` **一次**同时给出新位置与新尺寸，带 `SWP_NOREDRAW | SWP_NOCOPYBITS`——窗口内容是第 3 步的层缓冲，让系统在这里拷旧像素或立刻重绘都是多余的工作，而且拷的画的都是马上要被覆盖的东西。
+3. 尺寸到位之后才 `UpdateLayeredWindow`。
+
+**顺序是这里唯一不能改的东西**，`host.rs` 的 `apply_zoom` 注释里写着同一条理由。
+
+#### 倍数控件：右上角那个百分比小标
+
+用户要的是"参考放大镜框的缩放倍数控件"。样式照搬捕获侧 `magnifier_pass.rs` 的那颗：14 DIP 粗体、左右 8 DIP、上下 5 DIP 内边距、距角 6 DIP、6 DIP 圆角、不透明底色。**实现完全不同**：放大镜在 D2D 上画，贴图只能往自己的 `u32` 缓冲里逐像素写，所以文字要自己光栅化——用 GDI 把字画进一张**白底黑字**的 DIB（黑有多少就是笔画覆盖率有多少），读红色通道当覆盖率掩码，再按掩码把文字色混到缓冲上。
+
+选白底黑字而不是白字黑底是有原因的：GDI 会把反锯齿的中间值算进像素颜色，只有"底色单色、字单色"时覆盖率才能从一个通道里干净地读出来。
+
+范围与步长直接决定了两件事：控件里显示 **`100%` 就是 1.0 倍**（用户定下的基准），而 `0.1`–`10.0` 的 0.1 步长正好是 100 档、每档对应一个整数百分比（`10%`–`1000%`）。文字掩码按 `(标签, DPI)` 缓存在线程局部表里：缩放每次滚轮都重画整块缓冲，同一个 `150%` 在一次连续滚动里会被重新光栅化很多遍，而标签只有 100 种。
+
+控件对齐的是**图像区的右上角**，不是窗口的右上角——那圈边框是贴图与底下窗口分开的唯一标记，被控件压掉一段就会看起来像没贴好。图像区小到放不下控件时**整个不画**：一个缺角的 `1000%` 比没有控件更容易被当成贴图坏了。
+
+### 4.3 穿透：`HTTRANSPARENT`，**第一版不做**
+
+第一版 `WM_NCHITTEST` **无条件**回答 `HTCLIENT`（`apps/snapclip/src/pin/host.rs:852`）。这是有意选择，理由写在代码注释里，摘要如下：
+
+贴图窗口参与命中测试，落在它上面的鼠标由它自己处理。**如果它一开始就返回 `HTTRANSPARENT`，它就再也收不到任何鼠标消息**——拖动和双击都是鼠标消息，会一起失效。而"双击取消"是贴图唯一的撤销动作，它必须手到擒来。所以第一版选择可交互，把"看的时候不挡操作"整件事推到后面。
+
+等到要做时，这几条**都已经由既有事实定好了**，不需要重新设计：
+
+- **唯一机制**是窗口过程回答 `HTTRANSPARENT`（F4，与滚动会话"面板外"的行为同款）。不写 `WS_EX_TRANSPARENT`：F3/F4 已证明它单独使用无效。
+- **按键期间必须拒绝穿透**（F5）。要复用这一条，就必须复用 `GetAsyncKeyState` 的读法，而不是 `GetKeyState`。
+- **撤销路径是硬要求**：托盘菜单必须列出当前所有穿透窗口，并允许逐个或全部取消。只能"进得去"的托盘陷阱不是可交付状态——**这条是穿透的前置条件，不是它的后续工作**。
+- 托盘菜单新增两个动作，收敛进既有的 `TrayCommand`（F7）。**不新增线程**；F6 的注册走的是宿主线程自己的 `RegisterHotKey`（`host.rs:373`），不是捕获 crate 的 `register_scoped`，因为后者属于覆盖层线程的台账（F8）。
+
+顺序因此是：**先有托盘的"取消穿透"，再有穿透。** 反过来做就是先给用户一把打不开的锁。
+
+### 4.4 与捕获、剪贴板的关系
+
+- **会被抓进像素**：期望行为。桌面上看得见贴图，截图就应该看得见（F14）。想"抓一张不含贴图的图"的用户需要的是先关掉贴图，不是让截图忽略它。
+- **不会被吸附为目标**：进程级排除（F16）已经保证，而该排除的注释写明它就是为了兜住"稍后创建的窗口"。**不需要**给贴图窗口加 `WS_EX_TOOLWINDOW` 或别的样式来躲检测。读到 F16/F17 容易产生"要塞进排除列表"的错觉，这里写明不需要。
+- 覆盖层自己在屏幕上是 `WDA_EXCLUDEFROMCAPTURE`（`docs/33` §1 F2），贴图窗口**不是**——它必须能被别的程序截到。
+- **F6 结束截图会话**：取走选区的同时会 `cancel_capture()`，覆盖层随之关闭。用户的动作序列是「F5 框选 → F6 贴图」，F6 之后那张整屏、置顶、可交互的覆盖层没有任何用处，留着只会压住刚贴出来的图。这件事由 `SelectionHome`（捕获侧的适配器）做，因为能结束会话的东西本来就在它手里，而贴图那边只该知道"有人给了我一张图"。副作用是：将来别的取图来源接上这条路，也会顺带结束会话——这正是要的语义，**F6 在任何情况下都表示"这次截图到此为止"**。回归测试 `taking_a_selection_ends_the_capture_session`（`apps/snapclip/src/capture/mod.rs`）盯着它，并且先在去掉 `cancel_capture()` 的版本上确认失败（`left: 0, right: 1`）。
+
+## 5. 明确不做的事
+
+### 5.1 不做脏矩形
+
+见不变量 3 与 F6。上一版把 `ptDst` + 局部尺寸说成"部分更新"，那是错的：整窗提交没有"只改一块、其余保留"的语义。唯一真正的局部机制是 `UPDATELAYEREDWINDOWINFO::prcDirty`，而它必须**真机验证**（P0 探针）之后才能进设计。第一版整窗提交，先拿数字。
+
+### 5.2 不做"最近一帧"旁路
+
+见 §3.4。磁盘往返 + PNG 解码的代价**没有测过**；在测之前加一条跨线程旁路，是拿复杂度换一个假设。
+
+### 5.3 不做视觉细化
+
+第一版**只画**：图像本身、1 DIP 边框。边框的作用不是美观，是"这里贴了东西"的唯一信号——没有它，贴图和壁纸完全融为一体。
+
+不做：阴影、圆角、工具栏、悬停换色、尺寸浮标、动画。它们每一个都要先固定一批像素规格与状态机，而现在的真窗口和真人反馈都还不存在。上一版把滚动面板的 pills 规格搬过来，是过早具体化——贴图第一版根本没有工具栏。
+
+### 5.4 不做：透明度 / 锁定 / 旋转 / 全局热键
+
+`docs/01` §7 把它们与"拖动、缩放"并列，但**并列不是推导**。透明度、锁定、旋转都会给位图加一层变换或状态，没有任何一条事实要求它们；全局热键要新增一条注册与分发（F8 已给出做法），而托盘入口已经存在。第一版都不做。
+
+## 6. 验收条件
+
+分三类：**自动测试**（能进 CI）、**实测量**（P0 必须产出的数字）、**人工核对**（每个阶段结束走一遍）。
+
+### 6.1 自动测试
+
+按不变量编号，每条都要能说清"它在守哪条不变量"。
+
+**这一张表的验收状态必须诚实记录**：P1 交付时，T1–T4、T6–T9 **一条都还没有**。已通过的是 `ImageSource` 输入的字节/尺寸校验（`apps/snapclip/src/pin/source.rs` 的 `rejects_*`/`accepts_matching_length` 一组）、钉住合成这块位图的纯函数测试（`apps/snapclip/src/pin/host.rs` 的 `pin::host::tests`：边框四边、图像行不串味、图比窗口大时夹取、窗口小到只剩边框，以及 T10 那条往返）、两条消息泵分派测试（`apps/snapclip/src/pin/host.rs` 的 `a_null_window_message_is_handled_here_and_never_dispatched` / `a_window_message_is_dispatched_to_the_window`，钉住"`hwnd` 为空的线程消息不被 `DispatchMessageW` 悄悄丢掉"这个已经踩过的坑），以及槽位语义（`apps/snapclip/src/capture/pin_source.rs` 的 `pin_source::tests`：取走即清空、新的覆盖旧的、滚动长图不被记住、**主显示器原点 `(0, 0)` 仍然能贴**，最后这条是 §3.4 第三次改正的回归）。窗口生命周期类测试全部要真实桌面，它们在 CI 上跑不了，落在这里是**待办**，不是**已验**。
+
+| # | 守的不变量 | 测试 | 断言 | 状态 |
+|---|---|---|---|---|
+| T1 | 2 | 窗口生命周期 | 创建 N 个 → 全部销毁；重复一轮。`GetProcessHandleCount` 与 `GetGuiResources(GR_USEROBJECTS/GR_GDIOBJECTS)` 回到基线 | 未实现 |
+| T2 | 2 | 应用退出清理 | `DestroyAll` 之后宿主线程 **join 成功**；没有残留 HWND（`IsWindow` 为假）；没有泄漏的 DIB/DC | 未实现 |
+| T3 | 2 | 创建失败路径 | 注入一次 DIB 分配失败（或非法尺寸），`Create` 必须返回 `Err` 且**不留下**半个窗口；随后创建一个正常窗口仍成功 | 未实现 |
+| T4 | 2 | 幂等销毁 | 对同一 id 连发两次 `Destroy`，第二次不是错误，也不产生第二个 `Closed` | 未实现 |
+| T5 | 3 | 位图格式 | 给定 BGRA 输入，DIB 的 stride = 宽 × 4、行序与字节序正确；用 `GetDIBits` 读回与输入逐字节相同（这条同时验 alpha 真的被提交，而不只是"看起来对"） | 未实现（`ImageSource` 侧的字节序已有 `apps/snapclip/src/pin/source.rs:178-193` 两条覆盖，DIB 那一半没有） |
+| T6 | 5 | 内容缓存 | 同一内容被两个窗口引用时只解码一次；`Artifact` 路径大小写不同视为同一内容；`Blob` 用 `content_hash` | **随 §3.4 一起推迟**（第一版没有内容共享） |
+| T7 | 5 | 准入 | `decoded_total` 与 `window_count` 在边界上：刚好达标可创建，再一张被拒绝，且拒绝是用户可见的 | **随 §3.5 一起推迟**（第一版不设限） |
+| T8 | 4 | 命中测试 | 给一组坐标问宿主线程"这个点会落到谁身上"：穿透关闭时是贴图自己，穿透开启时是 `HTTRANSPARENT`；**按住鼠标键时穿透被拒绝**（F5） | **随 §4.3 一起推迟** |
+| T9 | 1 | 事件不含像素 | 编译期即可保证（`AppEvent` 无字节字段，F13），保留一条断言防止有人加回来 | 未实现 |
+| T10 | 3 | 缩放往返 | `scale` 1.0 → 2.0 → 1.0 后的位图与初始逐字节相同 | **已实现**（`integer_zoom_there_and_back_is_pixel_exact`，`apps/snapclip/src/pin/host.rs`；同组还有"光标底下那个像素不动"、"一档就是 0.1"、"上一档再下一档回到逐位相同的值"、"一格滚轮只走一档"、"一条消息带三格走三档"、"滚不动了就停在 `[0.1, 10.0]`"、"滚轮坐标负数不出错"，以及 §4.2.2 的控件四条：百分比文案、四角圆角、控件落在图像区右上角且不碰边框、图像区太小就整个不画） |
+
+**相对上一版删掉的测试**：`脏区并集`（脏区不做了）、`脏区面积 < 30%` 与 `2 ms` 门槛（没有基准）、`双击穷尽性`的"要么移动要么销毁"（不是普适正确性断言，改用 §6.3 的人工核对）。
+
+**真正验过的是这四类**（写在这里，免得把上面的"未实现"读成"什么都没验"）：
+
+1. **输入边界的拒绝路径**：`ImageSource::from_bgra_bytes` 的字节数非 4 的倍数、尺寸为零、像素个数与尺寸不符（`apps/snapclip/src/pin/source.rs` 的 `rejects_*`）；空选区在进宿主线程之前就被挡下——`pin_home_selection` 的 `width == 0 || height == 0` 是最后一道（`apps/snapclip/src/pin/host.rs:693-695`），`apps/snapclip/src/pin/mod.rs` 的 `an_empty_region_is_never_a_selection` 从 `Rect::is_empty` 那一侧盯着同一件事。
+2. **合成这块位图的正确性**：边框四边都在、图像行之间不串味、图比窗口大时会夹取、窗口小到只剩边框时不越界（`apps/snapclip/src/pin/host.rs` 的 `pin::host::tests`），加上 §4.2.2 的混色两端（覆盖率为 0 时逐位不动、为 255 时完全取源色、中间值不越界、alpha 恒为 255）。
+3. **缩放算术**（T10，§4.2.1）：整数倍往返逐像素相同、光标底下那个像素在缩放前后是同一个、滚轮坐标负数不错位、`zDelta` 的符号扩展、一格只走一档而余数跨消息累积、一条消息带三格走三档、步长恒为 0.1、上一档再下一档回到逐位相同的值、滚到头就停在 `[0.1, 10.0]`、`scaled_dimension` 不回绕。**这些全部是纯函数**——"悬停在贴图上滚轮真的会缩放"这一条要真实桌面，属于 §6.3 的人工核对第 8 项。
+4. **槽位语义**：取走即清空（贴一张只用一次）、新的选区覆盖旧的、`origin == None` 的滚动长图不被记住、`origin == Some((0, 0))`（主显示器）**必须**能贴（`apps/snapclip/src/capture/pin_source.rs` 的 `pin_source::tests`）。
+
+### 6.2 实测量（P0 必须先做，数字写回本节）
+
+这是一个**原型探针**，不是产品代码：单线程、单窗口的临时程序。
+
+| 测什么 | 为什么必须先测 |
+|---|---|
+| 4K 整窗 `UpdateLayeredWindow` 耗时 | 决定"整窗提交"能否作为第一版唯一路径，也是决定是否需要 `prcDirty` 的唯一依据 |
+| 一个分层窗口的 USER / GDI 对象成本 | 决定 `WINDOW_LIMIT` 是 8 还是 800；USER 配额（约 1 万）可能比内存先撞墙 |
+| `HTTRANSPARENT` 真机行为 | 确认 F4/F5 在**贴图这种窗口形态**（`WS_EX_NOACTIVATE` + 分层 + 可点击）上成立，而不是只在覆盖层上成立 |
+| 一次"读文件 + PNG 解码"的耗时（4K） | 这是"要不要做最近一帧旁路"（§5.2）的唯一依据 |
+
+**本节的四行仍无数字，这是有意的。** 上一版在这里写了 30 ms、2 ms、30% 三个门槛，那是在测量之前定验收标准。数字由 P0/P2 产出后再写回，并注明测量条件。
+
+**已经量到的两项不是这四行里的任何一行。** F6 的像素从捕获侧交到窗口之前要过两次全图搬运（`PinSelection` 自己那份 `Arc<Vec<u8>>`、以及 `ImageSource` 的 `u32` 重解释），这两项有数：
+
+```text
+cargo test --release -p snapclip-app --lib pin_bytes_to_u32_throughput -- --ignored --nocapture
+# 测量条件：本机 release、单次运行、每档取 20 轮平均；数字随机器变，只作量级判断
+
+1459×1180（6.6 MiB）  pin_selection_clone 1148 µs（5721 MiB/s）  from_bgra_bytes  676 µs（9715 MiB/s）
+3840×2160（31.6 MiB） pin_selection_clone 5402 µs（5857 MiB/s）  from_bgra_bytes 7076 µs（4472 MiB/s）
+```
+
+按这两项算，F6 那两块纯 CPU 搬运合计约 **1.8 ms**（1459×1180）与 **12.5 ms**（4K）。4K 那一档明显不成比例——分配 31.6 MiB 的频率掉了，这不是算法慢，是分配器的代价，所以「合并这两份」既是省内存也是省这一档的时间。它们**不能**用来回答本节的任何一行：第 1 行问的是 `UpdateLayeredWindow`（`host.rs` 里 `window_us` 记的是一整段 `create_pin_window`：DIB 建立 + `paint_pin` + 提交 + `ShowWindow`，比第 1 行粗），第 2 行要的是 USER/GDI 对象成本（脚本 `scripts/measure-pin-memory.ps1` 已经在报 GDI 对象数与贴图窗口数，但还没有一张 4K 图在多个窗口下的读数），第 3、4 行没有进展。**在补齐之前，本文仍然不给任何耗时阈值。**
+
+> **数字与代码绑定的教训。** 上一版这两行写的是 `take_selection 复制 … µs` 与 `字节→u32 … µs`，而它们引用的 `pin_bytes_to_u32_throughput` 当时**已经从 `source.rs` 里被删掉了**——`ImageSource` 改成只持 `Arc<Vec<u32>>` 时，那两个测量对象少了一半。数字因此不是"过期"，是在描述一个不再存在的实现，而且没有任何门禁会失败。现在基准与文档同桌：改实现时它就在旁边，删基准时这段文字也必须一起改。
+
+### 6.3 人工核对（每个阶段结束走一遍）
+
+一页的事，目的是抓自动测试抓不到的"手感"：
+
+1. 贴一张 4K 图 → 拖到副屏（不同 DPI）→ 看起来还清楚吗？
+2. 双击关闭（连做 10 次）：每次都关掉了吗？有没有把"想拖动"误判成双击，或反过来？
+3. 贴 10 张再逐个关掉：有没有关不掉的、有没有关掉之后还在托盘里留着的？
+4. 开穿透 → 从托盘取消 → 窗口回来了吗？穿透期间它还能被别的程序截到吗？
+5. 贴图开着时按 `F5` 截图：贴图出现在像素里吗？吸附时会不会吸到自己人（F16）？
+6. 贴图开着时退出程序：所有贴图都没了吗？进程没有残留吗？
+7. 源文件被删掉之后再贴一次同一张：给出的是"文件不在了"的明确提示，而不是静默失败？
+8. **悬停在贴图上滚轮**：那个像素留在光标底下吗？**画面在滚的过程中闪不闪**（§4.2.2 的窗口几何只变一次）？右上角的倍数控件跟着变吗、显示的是整数百分比吗？滚到头（`0.1` 与 `10.0`）就停住吗？往回滚能精确回到 `100%` 吗？**把光标移到贴图外面，别的程序还点得动、拖得动吗**（§4.2.1 的捕获必须还回去）？
+
+## 7. 日志与指标
+
+日志前缀是 **`[snapclip-app][pin]`**（§7 的这一行原本写成 `[snapclip][pin]`，是实现时按 cargo 包名改的）。只记**能回答一个问题**的字段：
+
+| 行 | 回答什么问题 | 状态 |
+|---|---|---|
+| `created id=… size=WxH at=(x,y)` | 这一张到底建出来没有、多大、落在哪 | 已实现 |
+| `create stage=hotkey_to_window total_us=… take_us=… convert_and_window_us=…` | F6 从热键到上屏一共多久，多少花在"取选区"上 | 已实现（一次性，不在热路径） |
+| `create stage=decode_and_window size=WxH px=… convert_us=… window_us=…` | 同一次里"字节→u32"与"建窗提交"各占多少 | 已实现 |
+| `drag id=… moves=… moved=… elapsed_ms=… move_rate_per_s=… set_position_us_avg/max/total=…` | 「拖动跟不跟手」到底是消息太稀还是每条太慢——两者的修法相反 | 已实现（`DRAG_PROFILE`） |
+| `取走选区后结束截图会话失败：…` | F6 拿到了图但覆盖层没关掉（§4.4 的副作用失败），是不致命但用户看得见的状态 | 已实现 |
+| `TrackMouseEvent 失败 id=… 错误码 …` | 登记的"离开通知"没生效——**接下来就是捕获还不回去**（§4.2.1），必须留证据 | 已实现 |
+| `缩放失败 id=…` | 缩放这条路失败在哪里 | 已实现 |
+| `closed id=… remaining=…` / `destroyed` | 关掉了没有、还剩几张 | 已实现 |
+| `F6 还没有可贴的图：先按 F5 截一张` | 把"消息没到"与"消息到了但没目标"分开——§3.4 的两次故障里这两件事都表现为"什么都不发生" | 已实现 |
+| `source decoded kind=artifact/blob bytes=… ms=…` | 解码一次多少毫秒——这是"要不要做最近一帧旁路"的唯一依据 | **未实现**（§3.4 改成槽位之后没有这条路径） |
+| `admit rejected decoded=… MiB windows=… limit=…` | 拒绝是因为准入，还是因为 bug | **未实现**（§3.5 不设限） |
+| `budget decoded=… MiB sources=… windows=… user=… gdi=…` | 每 60 秒一次。用于**记录**，不是保护 | **未实现** |
+| `zoom id=… from=…% to=…% cursor=(x,y) at=(x,y)` | 滚动时倍数档变了几次、窗口有没有跟着挪 | **未实现，且第一版不做**（§4.2.2 的倍数控件已经把这件事实时显示给用户；只在 `ZOOM_TRACE` 门开时有一条临时 `eprintln!`）。要做也不该是每格一行：用户滚一下能来几十条消息，逐条打日志本身就会把测量对象拖慢。要量的是"一次缩放多快上屏"，那条数据应当走 `PinEvent` 回外壳并入指标，不该在窗口过程里 `eprintln!` |
+
+**热键 id 的既有台账（F8）不动**：`HOTKEYS` 仍是 `[0x5343, 0x5344, 0x5345]`，`from_id` 对未登记 id 仍返回 `None`。
+
+## 8. 落地顺序
+
+### 8.1 F6 的落点：一个**偏离原计划**的决定
+
+原计划把 F6 挂在托盘线程上（F8：它是唯一长期存活、且有窗口能收 `WM_HOTKEY` 的线程），复用捕获 crate 现成的 `register_scoped`。
+
+**实际实现没有这么做**：`RegisterHotKey` 由宿主线程自己调用（`apps/snapclip/src/pin/host.rs:373`），编号 `0x5347`，不经过 `snapclip-capture`。
+
+理由：`WM_HOTKEY` 投给**注册它的那条线程**的消息队列，而宿主线程本来就是一条常年阻塞在 `GetMessageW` 上的消息泵——它天然满足这个条件。相比之下，借道托盘线程会引入一条 `apps/snapclip → snapclip-capture` 的依赖边，只为拿一个注册函数；而 `register_scoped` 的配对语义是给**会话级**热键设计的（覆盖层的 Esc 就是这么用的，F8），F6 是**进程级**的，生命周期与宿主线程完全相同，本来就是一对 `RegisterHotKey` / `UnregisterHotKey`。
+
+代价写清：`0x5347` 现在由贴图模块自己持有，不在捕获 crate 的 `HOTKEYS` 台账里。捕获那边钉住 `[0x5343, 0x5344, 0x5345]` 的单测**不会**发现两个模块将来撞号。用编号分段（`0x5343`–`0x5346` 归捕获，`0x5347` 归贴图）是当前的唯一保护，写在这里，以便下一个人改动时知道要检查什么。
+
+**这条决定第一次落地时是坏的，故障方式值得记下来**（F18）：`RegisterHotKey(null, …)` 让 `WM_HOTKEY` 成为一条**线程消息**，`MSG.hwnd` 为 null，而宿主线程的消息泵照搬了"取消息 → `TranslateMessage` + `DispatchMessageW`"两行——`DispatchMessageW` 对没有窗口的消息静默丢弃，于是窗口过程永远不被调用。表现是：**F6 注册成功、日志干净、按下去毫无反应**，没有任何一行错误输出。
+
+修法是消息泵按 `route_message(hwnd, …)` 分流：`hwnd` 为空的消息自己交给 `on_message`，非空才 `DispatchMessageW`（`host.rs:451-500` 一带）。这正是 F18 记录的覆盖层做法，**当时没有读那一段就直接照抄了"标准消息泵"**。
+
+回归测试是 `route_message` 上的两条（`host.rs` 的 `a_null_window_message_is_handled_here_and_never_dispatched` 与 `a_window_message_is_dispatched_to_the_window`）：空窗口 + `WM_HOTKEY` 必须走 `HandleHere`，有窗口的鼠标消息必须走 `Dispatch`。另外 `WM_HOTKEY` 与"没有可贴的目标"现在各有一行日志，把"消息没到"和"消息到了但没目标"分开——这次故障里这两件事原本都表现为什么都不发生。
+
+### 8.2 阶段
+
+| 阶段 | 内容 | 出口条件 | 状态 |
+|---|---|---|---|
+| **P0** | 原型探针：单线程、单窗口、真实 `UpdateLayeredWindow`、真实 `HTTRANSPARENT` | §6.2 四行数字全部有值并写回文档 | 未做（§6.2 仍无数字） |
+| **P1** | `ImageSource` + `PinManager` + `PinWindowHost`（消息泵、DIB、整窗提交）+ 移动 + 双击关闭 + F6 贴 F5 刚截的选区（`PinHome` / `TakeSelection` / `OverlayShared::selection`） | T1–T5、T9、T10 通过；人工核对 1、2、6 通过 | **已实现，验收未达**：窗口能贴、能拖、双击能关（用户实跑确认）；F6 的选区分发走过三次修正（§3.4），前两次的故障都是"F6 永远说还没有可贴的图"，直到 `origin` 从哨兵改成 `Option<Point>` 才通。T1–T4 等桌面测试与人工核对 1、2、6 尚未逐条走完 |
+| **P1.5** | 原计划的 `PinSource { Artifact, Blob }`（两条取字节路径）**没有按原样落地**：F6 只需要"刚截的那一张"，所以落地成了捕获侧的槽位（§3.4） | 出现明确需求（"从剪贴板贴"/"从历史贴"）再补那两条读字节路径 | 未做（`PinSource` 本身已实现，形态不同） |
+| **P1.6** | 原计划的准入硬上限**被推迟**（§3.5）：两个常量要等 §6.2 的数字 | P3 拿数字后补齐 | 未做 |
+| **P2** | 右键菜单（复制 / 关闭）+ 穿透 + 托盘撤销 + 指标 | T6–T8 通过；人工核对 3、4、5、7 通过 | 未做；穿透的前置条件是先有托盘的"取消穿透"（§4.3）。**缩放原属这一阶段，已提前落地**（§4.2.1）：它不要命中测试，只要"鼠标在窗口里时把滚轮接过来"，与右键菜单/穿透没有共同的阻塞点 |
+| **P3** | **到此为止重新决策**：拿 P0/P2 的数字决定要不要 `prcDirty`、要不要"最近一帧"旁路、准入常量该是多少、要不要内容缓存（T6） | 每一项都要有数字支撑；没有数字就不做 | 未做 |
+
+**P0 仍然是下一步。** P1 是在没有 P0 数字的情况下落地的——这是有意的次序调整（先有一个能按 F6 看见结果的窗口，才有值得测量的对象），代价是 §6.2 的四个数字至今为空，而其中"4K 整窗提交耗时"是决定后续一切的那一个。
+
+## 9. 已知风险
+
+- **整窗提交可能太慢**（4K 上是未知数）。这是 P0 的第一项；若不可接受，退路是 `prcDirty`，但那要先验证。
+- **`HTTRANSPARENT` 在"分层 + 不抢焦点 + 可点击"的窗口上是否与覆盖层同行为**，只有真机确认（P0 第三项）。若不成立，穿透退回到"两个样式位"（F3）。
+- **单宿主线程的串行点**：一张大图的提交会挡住同线程其它窗口的命令处理（§3.1）。P2 看数字再决定是否分线程。
+- **`WS_EX_TOPMOST` 的 z 序只增不减**：多个贴图重叠时，点击不会把旧的抬上来（窗口不可激活）。第一版的行为是**拖动即抬升**（拖动开始时显式 `SetWindowPos(HWND_TOPMOST)`），并写明"重叠时靠拖动选择"。
+- **多显示器下"1 图像像素 = 1 物理像素"会随窗口跨屏而变**。第一版按"创建时所在显示器的 DPI"固定，跨屏不重算；留到有人抱怨再说。
+- **全屏独占程序之下贴图不可见**（DWM 不合成）。系统行为，不修。
+- **双击关闭与"双击文件图标"的肌肉记忆冲突**（桌面双击是打开，贴图双击是关闭）。这是选择双击作为主动作的已知代价；右键菜单的「关闭」是它的补偿。若实测抱怨率高，退路是给双击加一个时间窗，而不是换掉双击。
+- **F6 的编号不在捕获 crate 的台账里**（§8.1）：`0x5347` 由贴图模块自己持有，没有测试会发现两个模块撞号。
+- **第一版没有资源准入**（§3.5）：连续贴大图会一直分配到 `CreateDIBSection` 失败为止，表现为某一次 F6 报错，而不是被提前拒绝。
+- **`HTCLIENT` 无条件返回**（§4.3）：贴图会吃掉落在它上面的所有鼠标点击，第一版没有"看的时候不挡操作"的能力。
+- **"没有位置"与"位置是原点"曾经共用一个值**（§3.4 第三次改正）：`origin` 现在是 `Option<Point>`，`None` 与 `Some((0, 0))` 在类型上分开，回归测试 `a_selection_at_the_primary_monitor_origin_is_still_pinned` 盯着它。同一类错误还会出现在别处——任何"用值域里的一个点表示没有值"的设计都要先问：那个点代表的那块屏/那个时刻/那个对象，是不是最常见的那个。
+- **"窗口建起来了"与"窗口看得见"是两件事**（F19）。这是 F6 第三次坏掉，也是最隐蔽的一次：`CreateWindowExW` 返回了句柄、`UpdateLayeredWindow` 返回成功、`WM_LBUTTONDOWN`/`WM_MOUSEMOVE`/`WM_LBUTTONDBLCLK` 全都照常到达（拖动和双击逻辑本身是对的），只有屏幕上是空的。`WS_POPUP` 只决定形状，可见性要么在创建时给 `WS_VISIBLE`，要么事后 `SetWindowPos(…, SWP_SHOWWINDOW)`——捕获侧走的是后者，贴图第一版两条都没走。教训与 F18 同型：**同一个平台能力，仓里两个调用者各写一半，第二个人照抄了"看起来对"的那一半**。
+- **`WS_EX_NOACTIVATE` 收不到按焦点路由的消息**（F20，§4.2.1）：滚轮是第一个撞上这条的，用悬停期的 `SetCapture` 绕开。下一件想加"不抢焦点也能用"的输入（键盘就免谈，但 `WM_MOUSEHWHEEL`、触摸/手势属同类）会撞上同一面墙，先看这一节再决定是捕获还是别的路由。同一节还留下一个更硬的约束：**借来的全局资源必须还**——捕获忘记 `ReleaseCapture` 的后果落在整个系统上（别的程序点不动），与本窗口无关。
+
+<!-- entity-map:start -->
+| 设计名 | 落地符号 | 位置 | 状态 |
+|---|---|---|---|
+| `PinManager` | `PinManager` | `apps/snapclip/src/pin/mod.rs` | 已实现 |
+| `PinCommand` | *(P2 计划)* | `apps/snapclip/src/pin/mod.rs` | *(P2 计划)* |
+| `PinEvent` | `PinEvent` | `apps/snapclip/src/pin/host.rs` | 已实现 |
+| `PinSource` | `PinSource` | `apps/snapclip/src/capture/pin_source.rs` | 已实现（转发句柄，形态与原计划不同，见 §3.4） |
+| `TakeSelection` | `TakeSelection` | `apps/snapclip/src/capture/pin_source.rs` | 已实现（捕获欠贴图的唯一一个方法） |
+| — | `OverlayShared::selection` | `crates/snapclip-capture/src/windows/overlay.rs` | 已实现（像素真正待的地方，`publish_selection` 写入） |
+| — | `PinSelection` | `apps/snapclip/src/pin/mod.rs` | 已实现 |
+| `ImageSource` | `ImageSource` | `apps/snapclip/src/pin/source.rs` | 已实现 |
+| `PinWindowHost` | `PinWindowHost` | `apps/snapclip/src/pin/host.rs` | 已实现 |
+| `PinWindowState` | `PinWindowState` | `apps/snapclip/src/pin/host.rs` | 已实现 |
+| — | `PinRequest` | `apps/snapclip/src/pin/host.rs` | 已实现（原计划的 `PinCommand` 位） |
+| — | `PinHandle` | `apps/snapclip/src/pin/host.rs` | 已实现 |
+| `PixelFormat` | `PixelFormat` | `crates/snapclip-model/src/capture.rs` | 已有 |
+| `PayloadRef` | `PayloadRef` | `crates/snapclip-model/src/payload.rs` | 已有 |
+| `ClipboardBlobStore` | `ClipboardBlobStore` | `crates/snapclip-history/src/blob_store.rs` | 已有 |
+| `ArtifactRef` | `ArtifactRef` | `crates/snapclip-model/src/artifact.rs` | 已有 |
+| `CaptureEvent` | `CaptureEvent` | `crates/snapclip-model/src/events.rs` | 已有 |
+| `ClipboardEvent` | `ClipboardEvent` | `crates/snapclip-model/src/events.rs` | 已有 |
+| `TrayCommand` | `TrayCommand` | `apps/snapclip/src/tray.rs` | 已有 |
+<!-- entity-map:end -->

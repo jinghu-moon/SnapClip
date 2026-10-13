@@ -6484,11 +6484,13 @@ dependencies = [
 name = "snapclip-app"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "arboard",
  "async-channel",
  "blake3",
  "encoding_rs",
  "gpui-kit",
+ "parking_lot",
  "png 0.18.1",
  "rclip-rtf",
  "serde",

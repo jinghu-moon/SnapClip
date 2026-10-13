@@ -393,9 +393,16 @@ impl OverlayController {
                 pixel_format: PixelFormat::Bgra8Unorm,
                 captured_at_unix_ms: snapclip_model::unix_time_ms(),
                 provider: SCROLL_PROVIDER,
+                // A stitched long image is a composed picture, not a monitor's frozen frame, so
+                // it has no screen position to report. `None` is that statement — and it is not
+                // `(0, 0)`, which is the primary monitor's real origin (see
+                // `SelectionPixels::origin`). The pin source reads `None` as "this one cannot be
+                // pinned back onto the desktop".
+                origin: None,
             },
             region: Rect::new(0, 0, width as i32, rows as i32),
             bgra,
+            origin: None,
         };
         let job = ExportJob {
             generation: 0,
@@ -608,9 +615,11 @@ mod tests {
                         pixel_format: PixelFormat::Bgra8Unorm,
                         captured_at_unix_ms: 0,
                         provider: SCROLL_PROVIDER,
+                        origin: None,
                     },
                     region: Rect::new(0, 0, width as i32, rows as i32),
                     bgra: vec![0; width as usize * rows as usize * 4],
+                    origin: None,
                 },
                 dpi: 144,
                 monitor_device_name: None,

@@ -439,6 +439,7 @@ fn frozen_frame(
             pixel_format: PixelFormat::Bgra8Unorm,
             captured_at_unix_ms: snapclip_model::unix_time_ms(),
             provider: provider.name(),
+            origin: Some(monitor.origin()),
         },
         monitor: monitor.clone(),
         provider,
@@ -476,6 +477,7 @@ pub(crate) fn test_frozen_frame(width: u32, height: u32) -> FrozenFrame {
             pixel_format: PixelFormat::Bgra8Unorm,
             captured_at_unix_ms: 1,
             provider: "test",
+            origin: Some(crate::geometry::Point::new(0, 0)),
         },
         monitor: CapturedMonitor {
             handle: 0,

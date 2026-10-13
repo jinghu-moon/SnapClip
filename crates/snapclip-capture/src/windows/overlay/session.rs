@@ -268,6 +268,60 @@ impl OverlayController {
         );
     }
 
+    /// Read back the committed selection and leave it where a consumer outside capture
+    /// can take it: `F6` pins "the picture I just selected", and this is the moment that
+    /// picture exists.
+    ///
+    /// **It cannot move to `confirm`.** The frozen frame — the only copy of these pixels —
+    /// dies with the session (`release_session` drops it, taking the GPU texture with it),
+    /// and the user's gesture is select-then-pin, not select-then-save. Leaving the readback
+    /// at `confirm` is what made `F6` answer "还没有可贴的图" on a selection the user had
+    /// just dragged: nothing had been exported, so nothing had ever been read back.
+    ///
+    /// The cost is a region-sized readback per committed gesture (~1 ms for a 1441x900
+    /// selection on the measured path). It is paid once per drag, not per mouse move, and
+    /// `F9` re-reads the same region anyway — `FrozenFrame` caches its own pixels, so the
+    /// second read is a copy, not another GPU transfer.
+    ///
+    /// `reason` only names the gesture in the log, so a slow readback can be attributed.
+    pub(super) fn publish_selection(&mut self, reason: &str) {
+        let selection = self.session.selection();
+        if selection.is_empty() {
+            return;
+        }
+        let Some(frozen) = self.frozen.as_ref() else {
+            return;
+        };
+        let started_at = Instant::now();
+        match self
+            .service
+            .prepare_selection(&frozen.frame, selection, &FrozenFramePixels::new(frozen))
+        {
+            Ok(prepared) => {
+                let readback_ms = started_at.elapsed().as_millis();
+                eprintln!(
+                    "[snapclip][bench] stage=selection_kept reason={} session={} size={}x{} readback_ms={}",
+                    reason,
+                    self.session_id(),
+                    prepared.region.width(),
+                    prepared.region.height(),
+                    readback_ms
+                );
+                if let Ok(mut shared) = self.shared.lock() {
+                    shared.selection = Some(Arc::new(prepared));
+                }
+            }
+            // Not fatal: the pinned copy is a convenience, and the gesture itself
+            // (export, annotate, cancel) has not failed. `F6` reports its own miss.
+            Err(error) => eprintln!(
+                "[snapclip][capture] selection readback failed session={} reason={} error={}",
+                self.session_id(),
+                reason,
+                error
+            ),
+        }
+    }
+
     /// The single cancellation path used by Esc, right click, repeated F5, window
     /// destruction, display changes and device removal.
     ///
@@ -484,6 +538,12 @@ impl OverlayController {
             renderer
                 .render_export(&export_state, None)
                 .map(|bgra| SelectionPixels {
+                    // The annotated export is still this monitor's frame, so it keeps a real
+                    // screen position; no layout means the overlay is gone and the honest
+                    // answer is "no position", not "the primary monitor".
+                    origin: self
+                        .layout()
+                        .map(|layout| Point::new(layout.bounds.left, layout.bounds.top)),
                     frame: frozen.frame.clone(),
                     region: clipped,
                     bgra,
@@ -507,6 +567,15 @@ impl OverlayController {
         };
         let export_width = prepared.region.width();
         let export_height = prepared.region.height();
+        // Hand the pixels to whoever pins "the thing I just captured" (`F6`). The gesture that
+        // committed this selection already published them (`publish_selection`); this refreshed
+        // copy is the one case that differs — annotations were rendered into it above — and it
+        // is the same buffer by reference that the export worker is about to write, so the
+        // hand-off costs nothing. The slot outlives the session on purpose: the frozen texture
+        // dies with it, and the PNG the export writes is a different representation.
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.selection = Some(Arc::new(prepared.clone()));
+        }
         // The overlay is frozen at the confirmed selection until the export lands, so
         // cursor-follow repaints can neither race nor waste the hand-off.
         self.graphics_released = true;

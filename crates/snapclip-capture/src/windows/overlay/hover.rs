@@ -1169,6 +1169,11 @@ impl OverlayController {
             self.hover_target = None;
             self.disarm_dwell();
             self.publish_state();
+            // The snap is the second way a selection becomes final, and it reaches
+            // `on_left_up` through an async confirmation instead of the drag path, so it
+            // has to publish on its own (`publish_selection` explains why it happens here
+            // and not at export time).
+            self.publish_selection("snap");
             self.invalidate_all();
             return;
         }

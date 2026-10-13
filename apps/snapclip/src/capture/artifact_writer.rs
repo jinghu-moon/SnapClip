@@ -196,6 +196,8 @@ mod tests {
             pixel_format: PixelFormat::Bgra8Unorm,
             captured_at_unix_ms: 1_700_000_000_000,
             provider: "test",
+            // These tests are about encoding, not about where the pixels came from.
+            origin: Some(snapclip_model::geometry::Point::new(0, 0)),
         }
     }
 
@@ -216,6 +218,7 @@ mod tests {
             frame: frame(width, height),
             region: Rect::new(0, 0, width as i32, height as i32),
             bgra,
+            origin: Some(snapclip_model::geometry::Point::new(0, 0)),
         };
 
         let artifact = writer.write("scroll-1-1", &prepared, 144, None).unwrap();
@@ -288,6 +291,7 @@ mod tests {
             frame: frame(4, 4),
             region: Rect::new(0, 0, -5, 2),
             bgra: Vec::new(),
+            origin: Some(snapclip_model::geometry::Point::new(0, 0)),
         };
 
         let error = writer

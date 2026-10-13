@@ -60,6 +60,21 @@ pub trait OverlayPlatform: Send + Sync + 'static {
     /// Use `preferences` from the next session on; a running session keeps what it started with.
     fn set_preferences(&self, preferences: crate::preferences::OverlayPreferences);
 
+    /// Hand over the last selection the user confirmed, if this platform still holds one.
+    ///
+    /// This is the seam for **pinning what was just captured**: the overlay is the only
+    /// thing that has the pixels (the frozen frame's texture dies with the session, and
+    /// the exported file is a re-decode), so a consumer asks for them instead of reading
+    /// the screen again — which is exactly the round trip that cannot work while the
+    /// overlay still covers the monitor.
+    ///
+    /// Taking is deliberate: the selection is megabytes, so a second reader would either
+    /// copy it or race for it. The default returns `None`, which is the honest answer for
+    /// platforms that do not keep one.
+    fn take_selection(&self) -> Option<std::sync::Arc<SelectionPixels>> {
+        None
+    }
+
     fn shutdown(&self);
 }
 

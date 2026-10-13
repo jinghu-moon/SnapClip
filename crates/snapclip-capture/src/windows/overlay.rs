@@ -179,6 +179,17 @@ struct OverlayShared {
     session_id: Option<String>,
     /// Written by the shell's thread, read by the overlay thread when a session starts.
     preferences: OverlayPreferences,
+    /// The last selection the user confirmed, held for a consumer outside capture.
+    ///
+    /// `F6` pins "the thing I just captured", and nothing else in the process has those
+    /// pixels: the frozen frame's GPU texture dies with the session, and the file the
+    /// export wrote is a re-decode. It is kept here — inside the feature that produced
+    /// it — rather than pushed through a new event, because events carry identity and
+    /// never pixels (`snapclip-model`'s `AppEvent` contract).
+    ///
+    /// `Arc` because the pixels are megabytes and the reader is another thread; taking it
+    /// is a refcount move, not a copy.
+    selection: Option<Arc<SelectionPixels>>,
 }
 
 /// The concrete `OverlayPlatform` used on Windows.
@@ -215,6 +226,7 @@ impl WindowsOverlay {
             state: CaptureState::Idle,
             session_id: None,
             preferences,
+            selection: None,
         }));
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         // Bounded so a stuck/slow overlay cannot let toolbar clicks pile up without
@@ -330,6 +342,13 @@ impl OverlayPlatform for WindowsOverlay {
         if let Ok(mut shared) = self.shared.lock() {
             shared.preferences = preferences;
         }
+    }
+
+    fn take_selection(&self) -> Option<Arc<SelectionPixels>> {
+        self.shared
+            .lock()
+            .ok()
+            .and_then(|mut shared| shared.selection.take())
     }
 
     fn shutdown(&self) {

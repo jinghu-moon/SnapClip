@@ -163,6 +163,9 @@ impl OverlayController {
             ReleaseOutcome::CommitDrag => {
                 self.session.pointer_released();
                 self.session.pointer_left();
+                // The selection is final: read it back now, while the frozen frame is still
+                // alive, so `F6` can pin it without the user having to save first.
+                self.publish_selection("drag");
             }
             ReleaseOutcome::Click => {
                 self.session.pointer_left();

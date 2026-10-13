@@ -60,13 +60,35 @@ windows-sys = { version = "0.59", features = [
   "Win32_System_LibraryLoader",
   "Win32_System_Memory",
   "Win32_System_Ole",
+  "Win32_System_Performance",
   "Win32_System_Threading",
+  "Win32_UI_Input_KeyboardAndMouse",
+  # `WM_MOUSELEAVE` — the notification that says the cursor left the pin, which is when the
+  # mouse capture taken for wheel routing has to be handed back. It is odd but checked: this
+  # one message constant lives under `UI::Controls` in the bindings, not under
+  # `UI::WindowsAndMessaging` with every other `WM_*`. That is where the platform declares it
+  # (with the rest of the *shell* messages, `WM_MOUSEHOVER`/`WMN_*`), so there is nowhere
+  # smaller to get it from.
+  "Win32_UI_Controls",
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
 ] }
 
 # Source-app icons for history rows: 32px renders crisply in a 16px row.
 win-icon-extractor = { version = "0.3", default-features = false, features = ["png", "cache"] }
+
+# The pin host thread hands its `JoinHandle` across threads so `Drop` can join it. 0.12 is
+# already in this graph (a `gpui` dependency), so this adds a direct edge, not a second copy.
+# Chosen over `std::sync::Mutex` because it has no poisoning: a panic on the pin thread must not
+# turn the next `Drop` into a second panic.
+parking_lot = "0.12"
+
+# The pin module (docs/34) reports failures that cross three layers — capture, the
+# command handler, the window host thread — and the interesting part of each is the
+# chain, not the leaf. `anyhow` is what the GPUI stack already links (gpui-base and
+# gpui-kit both depend on it), so this adds a direct edge, not a second copy. The
+# capability crates keep their own typed errors; this is the shell's boundary only.
+anyhow = "1"
 
 # Clipboard writes belong to the shell; `mark_clipboard_excluded` (below, through
 # snapclip-history) is what keeps our own copy out of the history.
