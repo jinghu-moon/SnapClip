@@ -183,7 +183,7 @@ impl OverlayRenderer {
             // ── Zoom badge (top-right corner of the loupe panel) ──
             {
                 let badge_scale = metrics.dpi.max(96) as f32 / 96.0;
-                let badge_font_sz = 14.0 * badge_scale;
+                let badge_font_sz = overlay_font::ZOOM_BADGE_FONT_SIZE_DIP * badge_scale;
                 let badge_pad_h = 8.0 * badge_scale;
                 let badge_pad_v = 5.0 * badge_scale;
                 let badge_inset = 6.0 * badge_scale;
@@ -200,8 +200,12 @@ impl OverlayRenderer {
                 } else {
                     format!("{:.1}×", zoom)
                 };
-                let badge_fmt =
-                    self.info_text_format_mut(false, 14.0, DWRITE_FONT_WEIGHT_BOLD, true)?;
+                let badge_fmt = self.info_text_format_mut(
+                    false,
+                    overlay_font::ZOOM_BADGE_FONT_SIZE_DIP,
+                    DWRITE_FONT_WEIGHT(overlay_font::ZOOM_BADGE_FONT_WEIGHT),
+                    true,
+                )?;
                 let text_w = self.measure_text_width_in(&label, &badge_fmt)?;
                 let bw = text_w + badge_pad_h * 2.0;
                 let bh = badge_font_sz + badge_pad_v * 2.0;
@@ -441,6 +445,7 @@ impl OverlayRenderer {
                 crate::geometry::crosshair_radius(metrics.dpi),
                 view.frame,
             );
+            let reticle_width = if view.precision_feedback { 2.0 } else { 1.0 };
             self.d2d.DrawLine(
                 vector2(
                     reticle.horizontal.left as f32 + 0.5,
@@ -451,7 +456,7 @@ impl OverlayRenderer {
                     view.cursor.y as f32 + 0.5,
                 ),
                 crosshair,
-                1.0,
+                reticle_width,
                 None,
             );
             self.d2d.DrawLine(
@@ -464,7 +469,7 @@ impl OverlayRenderer {
                     reticle.vertical.bottom as f32 - 0.5,
                 ),
                 crosshair,
-                1.0,
+                reticle_width,
                 None,
             );
         }
@@ -530,7 +535,7 @@ impl OverlayRenderer {
         } else {
             &[LABEL_FONT_FAMILY, LABEL_FONT_FALLBACK]
         };
-        let families = std::iter::once(INFO_FONT_FAMILY).chain(fallbacks.iter().copied());
+        let families = std::iter::once(overlay_font::FAMILY).chain(fallbacks.iter().copied());
         let dw_weight = weight;
         let mut format = None;
         let mut last_err = String::new();

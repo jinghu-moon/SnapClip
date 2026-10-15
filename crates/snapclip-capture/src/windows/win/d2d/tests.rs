@@ -1210,11 +1210,11 @@ fn metrics_scale_with_dpi() {
 fn label_text_reports_physical_pixels() {
     assert_eq!(
         RenderMetrics::label_text_at(Rect::new(0, 0, 1920, 1080), Point::new(0, 0)),
-        "0,0 1920×1080 px"
+        "1920×1080 px  (0,0)"
     );
     assert_eq!(
         RenderMetrics::label_text_at(Rect::new(10, 10, 11, 11), Point::new(-1920, 200)),
-        "-1910,210 1×1 px"
+        "1×1 px  (-1910,210)"
     );
 }
 
@@ -1525,7 +1525,7 @@ fn write_drawn_text_for_the_font_subset() {
 /// half in another font (or as tofu where no fallback exists).
 #[test]
 fn the_embedded_subset_covers_the_strings_the_overlay_draws() {
-    let covered = cmap_codepoints(super::INFO_EMBEDDED_FONT);
+    let covered = cmap_codepoints(crate::overlay_font::SUBSET);
     let drawn = overlay_drawn_strings();
 
     for text in &drawn {
@@ -1574,7 +1574,7 @@ fn font_cost_probe() {
     use ::windows::core::PCWSTR;
     use std::time::Instant;
 
-    let bytes = super::INFO_EMBEDDED_FONT;
+    let bytes = crate::overlay_font::SUBSET;
     let samples = 200;
     let strings = ["3840×2088 px  容器 8/9", "#A1B2C3", "hsl(359,100%,100%)"];
 
@@ -1666,7 +1666,7 @@ fn font_cost_probe() {
 /// find the glyphs the subset does carry and not invent ranges it never read.
 #[test]
 fn the_cmap_reader_finds_glyphs_and_does_not_invent_them() {
-    let covered = cmap_codepoints(super::INFO_EMBEDDED_FONT);
+    let covered = cmap_codepoints(crate::overlay_font::SUBSET);
     for character in ['×', '0', 'p', 'x', '色'] {
         assert!(
             covered.contains(&(character as u32)),
@@ -1676,7 +1676,7 @@ fn the_cmap_reader_finds_glyphs_and_does_not_invent_them() {
     // A `cmap` answers codepoints with *glyphs*, and the font only has so many: a reader that
     // mis-reads an offset and walks a whole plane reports far more codepoints than that, which
     // is the failure mode that would make the gate above pass on a deficient font.
-    let glyphs = font_glyph_count(super::INFO_EMBEDDED_FONT);
+    let glyphs = font_glyph_count(crate::overlay_font::SUBSET);
     assert!(
         glyphs > 50,
         "the subset should carry the chrome's glyphs ({glyphs})"

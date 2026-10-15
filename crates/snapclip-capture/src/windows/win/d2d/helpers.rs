@@ -2,28 +2,6 @@
 
 use super::*;
 
-/// Register the embedded info font privately for this process, once.
-///
-/// `AddFontMemResourceEx` loads the subset straight from the bytes baked into the
-/// binary — no temp file, no system install, no admin rights. `OverlayRenderer::new`
-/// follows with `IDWriteFactory::ReloadSystemFonts` so the shared DWrite factory
-/// re-enumerates and can resolve `"HarmonyOS Sans SC"` by name. The embedded slice
-/// is `'static`, so the registration stays valid for the whole process.
-pub(super) fn register_info_font_once() {
-    static REGISTER: std::sync::Once = std::sync::Once::new();
-    REGISTER.call_once(|| unsafe {
-        let mut installed = 0u32;
-        // A failure here is non-fatal: every text format falls back to a stock
-        // family when the embedded one cannot be resolved.
-        let _ = AddFontMemResourceEx(
-            INFO_EMBEDDED_FONT.as_ptr().cast(),
-            INFO_EMBEDDED_FONT.len() as u32,
-            None,
-            &mut installed,
-        );
-    });
-}
-
 pub(super) fn color(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F { r, g, b, a }
 }

@@ -25,7 +25,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
-use std::ffi::c_void;
+use std::ffi::{c_void, CStr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::Arc;
@@ -36,12 +36,13 @@ use windows_sys::Win32::Foundation::{
     GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLACK_BRUSH, BLENDFUNCTION,
+    AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+    BLACK_BRUSH, BLENDFUNCTION, CLEARTYPE_QUALITY,
     CLIP_DEFAULT_PRECIS, CreateCompatibleDC, CreateDIBSection, CreateFontW, DEFAULT_CHARSET,
     DEFAULT_PITCH, DeleteDC, DeleteObject, DIB_RGB_COLORS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
-    DT_TOP, DrawTextW, FF_DONTCARE, FW_SEMIBOLD, FillRect, GetDC, GetStockObject, HBITMAP, HBRUSH,
-    HDC, HGDIOBJ, OUT_TT_PRECIS, ReleaseDC, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
-    WHITE_BRUSH,
+    DT_TOP, DrawTextW, FF_DONTCARE, FillRect, GetDC, GetStockObject, GetTextFaceW,
+    HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ, OUT_TT_PRECIS, ReleaseDC, SelectObject, SetBkMode,
+    SetTextColor, TRANSPARENT, WHITE_BRUSH,
 };
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Performance::{
@@ -57,8 +58,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, IsWindow,
     LoadCursorW, PostThreadMessageW, RegisterClassW, SetWindowLongPtrW, SetWindowPos,
     TranslateMessage, UnregisterClassW, UpdateLayeredWindow, CREATESTRUCTW, CS_DBLCLKS, HTCLIENT,
-    HWND_TOPMOST, IDC_ARROW, MSG, SM_CXDRAG, SM_CYDRAG, SWP_NOACTIVATE, SWP_NOCOPYBITS,
-    SWP_NOMOVE, SWP_NOREDRAW, SWP_NOSIZE, ULW_ALPHA, WM_APP, WM_HOTKEY, WM_LBUTTONDBLCLK,
+    HWND_TOPMOST, IDC_ARROW, MSG, SM_CXDRAG, SM_CYDRAG, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, ULW_ALPHA, WM_APP, WM_DPICHANGED, WM_HOTKEY, WM_LBUTTONDBLCLK,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
     WM_NCDESTROY, WM_NCHITTEST, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
@@ -114,6 +115,13 @@ const WHEEL_DELTA: i32 = 120;
 /// 见 [`DRAG_PROFILE`]）。
 const ZOOM_TRACE: bool = true;
 
+/// 贴图被移到另一块缩放的显示器上时打一行日志。
+///
+/// 这条路的验证只能靠实跑：`WM_DPICHANGED` 是系统对"窗口跨屏"的回应，单测里造不出
+/// 真的窗口和真的显示器，所以留一行日志让跨屏那一下有据可查——旧 DPI、新 DPI、重画
+/// 后的缓冲尺寸与窗口位置，四个数一摆就能看出边框和控件有没有跟着换。
+const DPI_TRACE: bool = true;
+
 /// `WM_MOUSEWHEEL` 的 `lParam` 里两个坐标的提取。
 ///
 /// 不能先做整数右移再靠 `as i16` 变回负数：把 64 位的值右移 16 位之后，高字里那一位
@@ -144,7 +152,6 @@ struct WindowSeed {
     id: u64,
     image: ImageSource,
     position: (i32, i32),
-    size: (i32, i32),
     /// 指向宿主线程 `HostState` 的裸指针。宿主线程在整个消息循环期间都持有
     /// 它，窗口的存活期严格短于宿主线程，所以这个指针在窗口的整个生命周期内
     /// 都有效。
@@ -415,6 +422,13 @@ struct PinWindowState {
     /// 存的是它，不是"当前像素尺寸"：窗口尺寸由它和一个纯函数[算出来](scaled_dimension)，
     /// 于是窗口尺寸、绘制内容、坐标换算三者不可能各说一套。
     zoom: f64,
+    /// 本窗口所在显示器的 DPI。
+    ///
+    /// 它属于**窗口**而不是进程：贴图可以被拖到另一块不同缩放的显示器上，那时窗口的物理
+    /// 尺寸、边框宽度、控件的字号与圆角半径都得整套换掉；用进程级的值，贴在 150% 副屏上
+    /// 的贴图会拿主屏的 DPI 去排版。取它用 `GetDpiForWindow`，更新靠 `WM_DPICHANGED`
+    /// （见 [`on_message`] 里那一段），`GetDpiForSystem()` 只回答主显示器的值。
+    dpi: u32,
     /// 尚未凑够一档的滚轮增量。
     ///
     /// `WM_MOUSEWHEEL` 的 `zDelta` 是 120 的倍数，但高精度滚轮会发更小的值，累加到达标
@@ -723,9 +737,12 @@ fn create_pin_window(
     image: ImageSource,
     position: (i32, i32),
 ) -> Result<()> {
-    let border = border_px();
-    let width = image.width() as i32 + border * 2;
-    let height = image.height() as i32 + border * 2;
+    // 这里的 DPI 只是一个**临时**值，用来给 `CreateWindowExW` 一个不至于为 0 的尺寸：
+    // 窗口还不存在，问不到它落在哪块显示器上。真正的尺寸在 `WM_NCCREATE` 里按
+    // `GetDpiForWindow` 重算，而那一趟会连同第一帧画面一起提交，所以这个猜测永远
+    // 不会被人看见。
+    let border = border_px(system_dpi());
+    let (width, height) = window_size(image.width(), image.height(), 1.0, border);
     if width <= 0 || height <= 0 {
         bail!("贴图尺寸非法：{width}x{height}");
     }
@@ -734,7 +751,6 @@ fn create_pin_window(
         id,
         image,
         position,
-        size: (width, height),
         host: state as *mut HostState,
     };
 
@@ -831,6 +847,40 @@ fn on_message(
         WM_NCDESTROY => {
             on_wm_ncdestroy(host, hwnd);
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+        }
+        WM_DPICHANGED => {
+            // 窗口被拖到了另一块缩放的显示器上（或者那块屏的缩放被改了）。边框宽度、
+            // 控件字号与圆角半径都是从 DPI 算出来的，所以这里不是"调一个字号"，而是
+            // 整块重画——重画路径就是缩放那条（[`repaint_window`]），区别只在输入换成了
+            // 新的 DPI。
+            let Some(window) = (unsafe { window_mut(host, hwnd) }) else {
+                return 0;
+            };
+            // 新 DPI 在 `wParam` 的高字里，系统在发这条消息之前就已经把它应用了。
+            let dpi = ((wparam >> 16) & 0xFFFF) as u32;
+            if dpi == 0 || dpi == window.dpi {
+                return 0;
+            }
+            let previous = window.dpi;
+            window.dpi = dpi;
+            // `lParam` 是系统按新 DPI 算出的建议矩形：**位置采纳，尺寸不采纳**。尺寸由
+            // `window_size` 从倍数与边框算出来，系统并不知道我们的边框与控件长什么样。
+            let suggested = unsafe { *(lparam as *const RECT) };
+            let position = (suggested.left, suggested.top);
+            match unsafe { repaint_window(hwnd, window, position) } {
+                Ok(scaled) => {
+                    if DPI_TRACE {
+                        eprintln!(
+                            "[snapclip-app][pin] dpi id={} {previous} -> {dpi} buffer={}x{} at=({}, {})",
+                            window.id, scaled.0, scaled.1, position.0, position.1
+                        );
+                    }
+                }
+                Err(err) => {
+                    eprintln!("[snapclip-app][pin] 换 DPI 重画失败 id={}：{err:#}", window.id);
+                }
+            }
+            0
         }
         WM_HOTKEY => {
             // 空窗口的 `WM_HOTKEY` 是一条线程消息，由消息泵直接送到这里
@@ -992,7 +1042,7 @@ fn on_message(
                 if notches == 0 || (zoom - window.zoom).abs() < f64::EPSILON {
                     return 0;
                 }
-                let border = border_px();
+                let border = border_px(window.dpi);
                 // 位置先算：它只依赖缩放前后倍数和光标，不依赖新的窗口尺寸。
                 let moved = zoom_with_cursor(
                     window.zoom,
@@ -1004,10 +1054,11 @@ fn on_message(
                     cursor,
                 );
                 window.zoom = zoom;
-                // 位置和尺寸交给同一次 `SetWindowPos`。这里**不能**拆成"先改尺寸、
-                // 再挪位置"：那中间会显示一帧"新尺寸 ＋ 旧位置"的旧画面，也就是用户
-                // 看到的闪烁。理由写在 `apply_zoom` 上。
-                let scaled = match unsafe { apply_zoom(hwnd, window, moved) } {
+                // 位置、尺寸、新画面交给**同一次** `UpdateLayeredWindow`。拆成"先挪窗口
+                // 再提交画面"会在中间留下一帧"新尺寸 ＋ 上一档的画面"，也就是用户看到
+                // 的闪烁。理由写在 `repaint_window` 上。
+                let started = now_us();
+                let scaled = match unsafe { repaint_window(hwnd, window, moved) } {
                     Ok(scaled) => scaled,
                     Err(err) => {
                         eprintln!("[snapclip-app][pin] 缩放失败 id={}：{err:#}", window.id);
@@ -1015,11 +1066,30 @@ fn on_message(
                     }
                 };
                 if ZOOM_TRACE {
+                    // 这条记录要能回答"闪烁发生在哪一步"，所以它不只报我们想要的数，
+                    // 还报**系统当前实际状态**：窗口真的在哪、`WS_EX_LAYERED` 还在不在。
+                    // 前者与 `window.position` 不等，说明有一条移动窗口的路没记账（锚点
+                    // 会偏）；后者掉了，窗口就不再是分层的，重画会整块闪。
+                    // 这条记录还要能回答"一档缩放贵不贵"。`apply_us` 是**整档**的成本：
+                    // 重建缓冲、重采样整幅图、提交 `UpdateLayeredWindow`。缓冲大小随倍数
+                    // 的平方涨（1405x1137 放到 5.6× 就是 7872x6371），所以高倍档上这条
+                    // 是判断"该不该改成只画可见区域"的唯一依据。
+                    let origin = window_origin(hwnd);
+                    let style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
                     eprintln!(
-                        "[snapclip-app][pin] zoom id={} zoom={zoom:.4} delta={delta} \
-                         cursor=({}, {}) at=({}, {}) buffer={}x{}",
-                        window.id, cursor.0, cursor.1, window.position.0, window.position.1,
-                        scaled.0, scaled.1
+                        "[snapclip-app][pin] zoom id={} zoom={zoom:.4} delta={delta} cursor=({}, {}) \
+                         want=({}, {}) origin=({}, {}) buffer={}x{} layered={} apply_us={}",
+                        window.id,
+                        cursor.0,
+                        cursor.1,
+                        window.position.0,
+                        window.position.1,
+                        origin.0,
+                        origin.1,
+                        scaled.0,
+                        scaled.1,
+                        style & WS_EX_LAYERED != 0,
+                        now_us().saturating_sub(started),
                     );
                 }
             }
@@ -1119,14 +1189,15 @@ unsafe fn attach_window(hwnd: HWND, seed: &mut WindowSeed) -> Result<()> {
     if seed.host.is_null() {
         bail!("窗口种子里的宿主状态指针为空");
     }
-    let border = border_px();
-    let size = (seed.size.0, seed.size.1);
-    // 创建时缩放恒为 1.0，所以窗口尺寸就是 1.0 倍那份算式的结果——和 `apply_zoom`
-    // 走的是同一个 `window_size`，不会出现"创建时算一套、缩放时算另一套"。
+    let dpi = window_dpi(hwnd);
+    let border = border_px(dpi);
+    // `seed.size` 是创建窗口时算的临时尺寸（那一刻还没有窗口，见 `create_pin_window`），
+    // 这里不采纳：窗口现在有了，尺寸按**它自己的**显示器 DPI 重算一遍。两处不一致是
+    // 正常的——贴在副屏上时本来就该不一样。重算的结果连同第一帧画面在下面一次
+    // `UpdateLayeredWindow` 里提交，中间没有一帧是错尺寸。
     let image_width = seed.image.width();
     let image_height = seed.image.height();
-    let scaled = window_size(image_width, image_height, 1.0, border);
-    debug_assert_eq!(scaled, size);
+    let size = window_size(image_width, image_height, 1.0, border);
     let mut framebuffer = LayeredBuffer::new(size.0, size.1, true)?;
     paint_pin(
         framebuffer.pixels_mut(),
@@ -1136,10 +1207,10 @@ unsafe fn attach_window(hwnd: HWND, seed: &mut WindowSeed) -> Result<()> {
         image_width,
         image_height,
         1.0,
-        system_dpi(),
+        dpi,
     );
     framebuffer
-        .submit(hwnd)
+        .submit(hwnd, Some(seed.position))
         .context("首次提交贴图内容失败")?;
 
     // 原图像素在**第一次提交之后**才取所有权：`seed.image` 是 `ImageSource`（拥有
@@ -1155,6 +1226,7 @@ unsafe fn attach_window(hwnd: HWND, seed: &mut WindowSeed) -> Result<()> {
             image_width,
             image_height,
             zoom: 1.0,
+            dpi,
             wheel_remainder: 0,
             tracking_leave: false,
             position: seed.position,
@@ -1219,36 +1291,59 @@ fn cursor_is_over(hwnd: HWND) -> bool {
     cursor.x >= rect.left && cursor.x < rect.right && cursor.y >= rect.top && cursor.y < rect.bottom
 }
 
-/// 滚轮改缩放：把窗口内容与窗口尺寸一起换掉。
+/// 窗口现在**真的**在哪（屏幕坐标）。
 ///
-/// 只在缩放真的变了的时候调用。缩放没变的那些消息（拖动、单击、鼠标进出）一律不碰
-/// 缓冲，拖动因此仍然是纯 `SetWindowPos`——"别把无关的活放进高频路径"是拖动不跟手
-/// 那条故障的反向教训。
+/// 与 `PinWindowState::position` 的区别是这条问的是系统：那个字段是我们自己的记账，
+/// 只在拖动与缩放时更新。两者对不上，说明有一条移动窗口的路没记账，缩放的光标锚点
+/// 就会偏——这条日志的用途就是让这种偏差现形（`docs/34` §6.2 里"窗口位置靠记账"
+/// 那条已知不覆盖，靠它兜底）。
+fn window_origin(hwnd: HWND) -> (i32, i32) {
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    unsafe { GetWindowRect(hwnd, &mut rect) };
+    (rect.left, rect.top)
+}
+
+/// 重画整个窗口：按窗口现在的倍数与 DPI 重算尺寸、重画缓冲、再把新位置、新尺寸与
+/// 新画面**一次**交上去。
+///
+/// 两个触发点：换了一档缩放（`WM_MOUSEWHEEL`），和窗口被拖到了另一块 DPI 不同的
+/// 显示器上（`WM_DPICHANGED`）。两者的共同点是"决定尺寸的输入变了"，所以它们共用
+/// 同一条重画路径——尺寸、边框、控件排版全是从 `window.zoom` 与 `window.dpi` 算出来的
+/// 纯函数，换了输入就整块重建，不留"这一处改了、那一处忘了"的缝。
+///
+/// 缩放没变的那些消息（拖动、单击、鼠标进出）一律不碰缓冲，拖动因此仍然是纯
+/// `SetWindowPos`——"别把无关的活放进高频路径"是拖动不跟手那条故障的反向教训。
+///
+/// 返回缩放后的整窗尺寸（供日志）。
+///
+/// **"一次到位"是这里唯一不能改的东西**，它是闪烁的根因（见 `docs/34` §4.2.2）：
+///
+/// 1. 新缓冲先在旁边建好、画满——此时屏幕上一个像素都没动，失败就原样返回。
+/// 2. `UpdateLayeredWindow` **一次**给出新位置、新尺寸与新画面。它比较的是
+///    "这份缓冲的尺寸"，而 `SetWindowPos` 只知道自己给的数字——两者分成两次调用时，
+///    中间那一帧是"新尺寸 ＋ 上一档的画面"（缩放围绕光标移动窗口，位置几乎每档都
+///    变，所以连位置都是错的）。缩放每档都重建整块缓冲，本来就要调
+///    `UpdateLayeredWindow`，位置与尺寸因此是免费附带的，不需要第二次窗口操作。
+///
+/// 拖动**不**走这条路：拖动不改尺寸，逐条 `WM_MOUSEMOVE` 只做一次 `SetWindowPos`
+/// （见 `docs/34` §4.2），把重画放进高频路径正是"拖动不跟手"那条故障的反面。
 ///
 /// # Safety
 ///
 /// 同 [`window_mut`]：`window` 必须是宿主线程 `HostState` 里仍然活着的一个元素，
 /// 而且调用期间没有别人同时可变借用那个 `HostState`。
-/// 换一档缩放：重画缓冲、按新位置与尺寸挪窗口、提交新画面。
-///
-/// 返回缩放后的整窗尺寸（供日志）。
-///
-/// **顺序是这里唯一不能改的东西**，它是闪烁的根因（见 `docs/34` §4.2.2）：
-///
-/// 1. 新缓冲先在旁边建好、画满——此时屏幕上一个像素都没动，失败就原样返回。
-/// 2. `SetWindowPos` **一次**同时给出新位置和新尺寸。位置和尺寸分成两次调用时，
-///    中间那一次是"新尺寸 ＋ 旧位置"（缩放围绕光标移动窗口，位置几乎每档都变），
-///    而窗口在那一瞬间显示的仍是**上一档**的画面。
-/// 3. 窗口尺寸到位之后才 `UpdateLayeredWindow`。
-///    `UpdateLayeredWindow` **会自己按缓冲尺寸改窗口**，所以反过来先提交的话，
-///    缩小的时候会有一瞬间"窗口还大、层已经小了"——露出来的那块不在层的缓冲里，
-///    屏幕上就是一块透明的闪。放大时反过来是一块被裁掉。
-///
-/// `SWP_NOREDRAW | SWP_NOCOPYBITS` 是为了让第 2 步**不产生任何绘制**：窗口内容是
-/// 第 3 步的层缓冲，系统在这里去拷一份旧像素或立刻重绘都是多余的工作，而且拷的、
-/// 画的都是马上要被覆盖的东西。
-unsafe fn apply_zoom(hwnd: HWND, window: &mut PinWindowState, position: (i32, i32)) -> Result<(i32, i32)> {
-    let border = border_px();
+unsafe fn repaint_window(
+    hwnd: HWND,
+    window: &mut PinWindowState,
+    position: (i32, i32),
+) -> Result<(i32, i32)> {
+    let dpi = window.dpi;
+    let border = border_px(dpi);
     let scaled = window_size(window.image_width, window.image_height, window.zoom, border);
     let mut framebuffer = LayeredBuffer::new(scaled.0, scaled.1, false)?;
     paint_pin(
@@ -1259,28 +1354,13 @@ unsafe fn apply_zoom(hwnd: HWND, window: &mut PinWindowState, position: (i32, i3
         window.image_width,
         window.image_height,
         window.zoom,
-        system_dpi(),
+        dpi,
     );
 
-    if unsafe {
-        SetWindowPos(
-            hwnd,
-            HWND_TOPMOST,
-            position.0,
-            position.1,
-            scaled.0,
-            scaled.1,
-            SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOCOPYBITS,
-        )
-    } == 0
-    {
-        bail!("调整贴图窗口位置与尺寸失败，错误码 {}", last_error());
-    }
-    window.position = position;
-
     framebuffer
-        .submit(hwnd)
-        .context("提交缩放后的贴图内容失败")?;
+        .submit(hwnd, Some(position))
+        .context("提交重画后的贴图内容失败")?;
+    window.position = position;
 
     let previous = std::mem::replace(&mut window.framebuffer, framebuffer);
     drop(previous);
@@ -1506,10 +1586,10 @@ fn wheel_zoom(zoom: f64, remainder: i32, delta: i32) -> (f64, i32, i32) {
 /// 纯函数，就是为了能单测：这里出错的典型样子是图像整体偏移一个像素、某一行串到
 /// 相邻行去，或者缩放时把最后一列少画一个像素。
 ///
-/// 缩放用的是**最近邻**：目标区域的每个像素都回原图取它落在哪个源像素上。不选双线性
-/// 有两个理由，都不是口味问题——贴图要看的是文本和图表的细节，重采样会把它抹糊；而且
-/// 最近邻在整数倍缩放（1× → 2× → 1×）下是**精确可逆**的，§6.1 的 T10 就是拿这个
-/// 当断言。
+/// 缩放走的是**重采样**（[`plan_axis`]），不是"取最近的源像素"。取最近在缩放的两个
+/// 方向上都错：放大时每个源像素被铺成一个方块，斜线成了楼梯（用户报的就是这个，
+/// 「放大后的锯齿感很明显」）；缩小时直接把中间的源像素丢掉，高频细节变成摩尔纹。
+/// 代价是重采样会让细节略微变软——但软了还认得出是什么字，锯齿就认不出了。
 fn paint_pin(
     buffer: &mut [u32],
     size: (i32, i32),
@@ -1523,51 +1603,45 @@ fn paint_pin(
     let width = size.0.max(0) as usize;
     let height = size.1.max(0) as usize;
     debug_assert_eq!(buffer.len(), width * height);
-    buffer.fill(BORDER_COLOR);
 
     let border = border.max(0) as usize;
-    if width == 0 || height == 0 || border >= width || border >= height {
-        // 窗口小到放不下边框，那就整块都是边框。
-        return;
-    }
+    let source_width = image_width as usize;
+    let source_height = image_height as usize;
     // 目标尺寸走的是和 `window_size` 同一个算式，不是调用方另算一遍的 `size`。
     let target_width = scaled_dimension(f64::from(image_width), zoom).max(0) as usize;
     let target_height = scaled_dimension(f64::from(image_height), zoom).max(0) as usize;
-    if target_width == 0 || target_height == 0 {
+
+    if width == 0
+        || height == 0
+        || border >= width
+        || border >= height
+        || target_width == 0
+        || target_height == 0
+        || source_width == 0
+        || source_height == 0
+    {
+        // 窗口小到放不下图像，那就整块都是边框。
+        buffer.fill(BORDER_COLOR);
         return;
     }
 
-    let source_width = image_width as usize;
-    let source_height = image_height as usize;
-    if source_width == 0 || source_height == 0 {
-        return;
-    }
-    // 按整窗宽高比给每个缩放轴一个系数：整数倍时它恰好是 1、0.5、2……，于是
-    // `x * factor` 这类写法在 1× 下退化成恒等，不会引入任何舍入。
-    let factor_x = target_width as f64 / f64::from(image_width);
-    let factor_y = target_height as f64 / f64::from(image_height);
-    if factor_x <= 0.0 || factor_y <= 0.0 {
-        return;
-    }
+    let drawn_width = target_width.min(width - border);
+    let drawn_height = target_height.min(height - border);
 
-    let drawn_width = target_width.min(width.saturating_sub(border));
-    let drawn_height = target_height.min(height.saturating_sub(border));
-    for row in 0..drawn_height {
-        let source_y = (row as f64 / factor_y) as usize;
-        if source_y >= source_height {
-            break;
-        }
-        let dest_row = row + border;
-        let dest_start = dest_row * width + border;
-        let source_row = source_y * source_width;
-        for column in 0..drawn_width {
-            let source_x = (column as f64 / factor_x) as usize;
-            if source_x >= source_width {
-                break;
-            }
-            buffer[dest_start + column] = image[source_row + source_x];
-        }
-    }
+    fill_border(buffer, (width, height), border, (drawn_width, drawn_height));
+
+    // 两条轴各自算一次抽头表，再在 `resample_image` 里取叉积。抽头表按 `target_*` 建，
+    // 这里只用它前面 `drawn_*` 个：被窗口裁掉的那些目标像素的抽头不需要。
+    resample_image(
+        buffer,
+        width,
+        (border, border),
+        image,
+        (source_width, source_height),
+        (drawn_width, drawn_height),
+        &plan_axis(source_width, target_width),
+        &plan_axis(source_height, target_height),
+    );
 
     // 倍数控件最后画：它要压在图像上，而上面那段会把整块图像区重写一遍。
     composite_badge(
@@ -1581,22 +1655,461 @@ fn paint_pin(
     );
 }
 
-/// 边框宽度（像素）。按系统 DPI 折算，保证在高 DPI 屏幕上物理宽度一致。
-fn border_px() -> i32 {
-    let dpi = system_dpi();
+/// 把边框色铺在图像区**之外**的那几圈上。
+///
+/// 不是 `buffer.fill`：图像区紧接着就会被整块重写，而在高倍档上那块缓冲是 200 MB 量级
+/// （1405x1137 放到 5.6× 就是 7870x6369），白填一遍等于把写带宽送给马上被覆盖的像素。
+/// 这是个实测出来的量：最近邻时代它只是浪费，改成重采样之后每一毫秒都要自己争。
+fn fill_border(buffer: &mut [u32], size: (usize, usize), border: usize, image: (usize, usize)) {
+    let (width, height) = size;
+    let left = border.min(width);
+    let right = (border + image.0).min(width);
+    let top = border.min(height);
+    let bottom = (border + image.1).min(height);
+
+    // 上边与下边整宽；只补这两条，其余行交给图象两侧那两条。
+    for row in (0..top).chain(bottom..height) {
+        let start = row * width;
+        buffer[start..start + width].fill(BORDER_COLOR);
+    }
+    for row in top..bottom {
+        let start = row * width;
+        buffer[start..start + left].fill(BORDER_COLOR);
+        buffer[start + right..start + width].fill(BORDER_COLOR);
+    }
+}
+
+/// 定点权重的量程：`WEIGHT_ONE` 表示"权重全在这一个抽头上"。
+const WEIGHT_SHIFT: u32 = 16;
+const WEIGHT_ONE: u32 = 1 << WEIGHT_SHIFT;
+
+/// 一条轴上的重采样计划：每个目标像素取哪些源像素、各占多少权重。
+///
+/// 权重是定点数，因为浮点权重会让"平坦颜色重采样之后还是那个颜色"带上一段容差，而它
+/// 本该是恒等的；逐目标像素的权重和也就能用整数断言成**恰好** `WEIGHT_ONE`。
+struct AxisPlan {
+    /// 第 `d` 个目标像素的抽头是 `taps[starts[d]..starts[d + 1]]`。长度是目标像素数
+    /// 加一，多出来的那个是结尾，于是取抽头不用再查第二张表。
+    starts: Vec<u32>,
+    /// 抽头：(源下标, 权重)。同一条轴上的所有目标像素共用这一块。
+    taps: Vec<(u32, u32)>,
+}
+
+impl AxisPlan {
+    fn taps_for(&self, destination: usize) -> &[(u32, u32)] {
+        let start = self.starts[destination] as usize;
+        let end = self.starts[destination + 1] as usize;
+        &self.taps[start..end]
+    }
+}
+
+/// 给一条轴做重采样计划。
+///
+/// 滤波器是三角形，也就是双线性（双线性正是它半径 1 的那一档）：放大时半径固定 1 个源
+/// 像素，每个目标像素恒定取两个抽头；缩小时半径撑到 `1 / 放大倍数`，抽头数随缩小倍数
+/// 变多，但**总工作量仍与源像素数同阶**——目标像素少了，每个多取几个——所以缩得越狠
+/// 不会越慢。
+///
+/// 半径不能小于 1。先前那版取 0.5，结果在正好 2× 时每个采样点都落在某个源像素中心
+/// 0.25 个像素以内、够不到相邻那个，于是**又退回成了最近邻**——锯齿照旧。三角形在半径
+/// 1 处的权重是 `1 - |t|`，要跨过一个像素间距才真正开始混合。
+///
+/// 归一化逐目标像素做，而且**必须恰好等于 `WEIGHT_ONE`**：差一个定点单位就足以让平坦
+/// 颜色重采样之后出现一道一像素的亮边或暗边。
+fn plan_axis(source_length: usize, destination_length: usize) -> AxisPlan {
+    if source_length == 0 || destination_length == 0 {
+        return AxisPlan {
+            starts: vec![0, 0],
+            taps: Vec::new(),
+        };
+    }
+    // 恒等轴：一个抽头、满权重。1× 必须逐像素还原，靠浮点凑不出来。
+    if source_length == destination_length {
+        let mut starts = Vec::with_capacity(destination_length + 1);
+        let mut taps = Vec::with_capacity(destination_length);
+        for index in 0..destination_length {
+            starts.push(index as u32);
+            taps.push((index as u32, WEIGHT_ONE));
+        }
+        starts.push(destination_length as u32);
+        return AxisPlan { starts, taps };
+    }
+
+    let scale = source_length as f64 / destination_length as f64;
+    let radius = scale.max(1.0);
+
+    // 放大（`scale < 1`）：滤波器半径固定在 1 个源像素，也就是双线性。这一档**显式**做成
+    // 两个抽头，而不是让它从下面的通用循环里掉出来——"每个目标像素恰好两个抽头"是快路
+    // （`resample_magnified`）认的形状，而通用循环在边缘处只会给出一个抽头（够不到第二
+    // 个源像素），一个抽头就足以让整条轴退回通用循环：边缘那一个像素在画面上看不出来，
+    // 代价却是整幅图慢两三倍。
+    //
+    // 权重与通用循环算出来的是同一个数（`1 - |source - center|` 在半径 1 处），两端夹取
+    // 到同一个下标时两个权重之和仍是满值，于是"两种写法给出同一个像素"是成立的。
+    if scale < 1.0 {
+        let mut starts = Vec::with_capacity(destination_length + 1);
+        let mut taps = Vec::with_capacity(destination_length * 2);
+        let last = (source_length - 1) as f64;
+        for destination in 0..destination_length {
+            starts.push((destination * 2) as u32);
+            let center = (destination as f64 + 0.5) * scale - 0.5;
+            let left = center.floor();
+            let fraction = center - left;
+            let first = left.clamp(0.0, last) as u32;
+            let second = (left + 1.0).clamp(0.0, last) as u32;
+            let weight = (fraction * f64::from(WEIGHT_ONE)).round() as u32;
+            taps.push((first, WEIGHT_ONE - weight));
+            taps.push((second, weight));
+        }
+        starts.push((destination_length * 2) as u32);
+        return AxisPlan { starts, taps };
+    }
+
+    let mut starts = Vec::with_capacity(destination_length + 1);
+    let mut taps = Vec::with_capacity(destination_length * 2);
+    // 两个都放在循环外复用：逐目标像素重新分配一次 `Vec` 会让这一步比滤波本身还贵。
+    let mut weights: Vec<(u32, f64)> = Vec::new();
+    let mut fixed: Vec<u32> = Vec::new();
+    for destination in 0..destination_length {
+        starts.push(taps.len() as u32);
+        // 源像素 `i` 的中心在坐标 `i` 上（不是 `i + 0.5`），目标像素 `d` 的中心落在
+        // `(d + 0.5) * scale - 0.5`。两边都按中心对齐，边缘才不会整体漂半个像素。
+        let center = (destination as f64 + 0.5) * scale - 0.5;
+        let first = (center - radius).ceil() as i64;
+        let last = (center + radius).floor() as i64;
+
+        weights.clear();
+        let mut sum = 0.0;
+        for source in first.max(0)..=last.min(source_length as i64 - 1) {
+            let weight = 1.0 - (source as f64 - center).abs() / radius;
+            if weight <= 0.0 {
+                // 抽头正好落在滤波器的零点上：权重是 0，留着只是白算一遍。
+                continue;
+            }
+            sum += weight;
+            weights.push((source as u32, weight));
+        }
+        if weights.is_empty() || sum <= 0.0 {
+            // 到不了这里（半径不小于 1 保证至少够得到一个源像素中心）。真到了宁可退回
+            // 最近邻：一个空抽头的目标像素会是一块纯色亮斑，比锯齿刺眼得多。
+            let nearest = center.round().clamp(0.0, (source_length - 1) as f64) as u32;
+            taps.push((nearest, WEIGHT_ONE));
+            continue;
+        }
+
+        fixed.clear();
+        let mut biggest = 0usize;
+        for (index, (_, weight)) in weights.iter().enumerate() {
+            if *weight > weights[biggest].1 {
+                biggest = index;
+            }
+            fixed.push((weight / sum * f64::from(WEIGHT_ONE)).round() as u32);
+        }
+        // 四舍五入的零头全部补给最重的那个抽头，让权重和**恰好**是 `WEIGHT_ONE`。
+        // 这里不夹取：最重的抽头至少占 `WEIGHT_ONE / 抽头数`，而零头不超过抽头数的一半，
+        // 两边差着好几个数量级。
+        let total: i64 = fixed.iter().map(|value| i64::from(*value)).sum();
+        fixed[biggest] = (i64::from(fixed[biggest]) + i64::from(WEIGHT_ONE) - total) as u32;
+        debug_assert_eq!(
+            fixed.iter().map(|value| u64::from(*value)).sum::<u64>(),
+            u64::from(WEIGHT_ONE),
+        );
+
+        for (index, (source, _)) in weights.iter().enumerate() {
+            taps.push((*source, fixed[index]));
+        }
+    }
+    starts.push(taps.len() as u32);
+    AxisPlan { starts, taps }
+}
+
+/// 把源图按两条轴的重采样计划画进缓冲。
+///
+/// 两条轴的抽头取叉积：一次缩放要读的源像素就是 `x 抽头 × y 抽头`。权重是两条轴各自的
+/// 定点数，乘积的定点量程因此是 `WEIGHT_ONE²`（`u64` 里 32 位）。累加用 `u64`：抽头最多
+/// 时（0.1× 缩放）一次加 11×11 个 `255 * 2^32`，离溢出还差五个数量级。
+/// 按两条轴的抽头表把图像重采样到 `origin` 处，按目标行切成几段并行做。
+///
+/// 并行的依据是实测：5.6× 一张 1405x1137 的图，缓冲是 50 Mpx（7870x6369），串行画要
+/// 209 ms——用户滚一档就看得出来，而这件事对目标行是**天然可分**的：每段只写自己的行，
+/// 读的源图和两张抽头表都是只读的。实测把它压到几十毫秒，比改画质之前的最近邻还快。
+///
+/// 段的任务很短（一档一次），所以段数取可用核数并封顶；再多的段只会换来调度开销。
+fn resample_image(
+    buffer: &mut [u32],
+    row_pitch: usize,
+    origin: (usize, usize),
+    image: &[u32],
+    source: (usize, usize),
+    drawn: (usize, usize),
+    x_plan: &AxisPlan,
+    y_plan: &AxisPlan,
+) {
+    if drawn.0 == 0 || drawn.1 == 0 {
+        return;
+    }
+    let first = origin.1 * row_pitch;
+    let rows = &mut buffer[first..first + drawn.1 * row_pitch];
+
+    // 行数太少时开线程是净亏：一次 spawn 的开销比那几行本身还贵。
+    const PARALLEL_MIN_ROWS: usize = 16;
+    let threads = if drawn.1 >= PARALLEL_MIN_ROWS {
+        std::thread::available_parallelism().map_or(1, |count| count.get().min(8))
+    } else {
+        1
+    };
+    if threads <= 1 {
+        resample_band(rows, row_pitch, origin.0, 0, image, source, drawn, x_plan, y_plan);
+        return;
+    }
+
+    let band = drawn.1.div_ceil(threads);
+    std::thread::scope(|scope| {
+        let mut first_row = 0usize;
+        for chunk in rows.chunks_mut(band * row_pitch) {
+            let rows = chunk.len() / row_pitch;
+            let origin_x = origin.0;
+            let start_row = first_row;
+            first_row += rows;
+            scope.spawn(move || {
+                resample_band(
+                    chunk,
+                    row_pitch,
+                    origin_x,
+                    start_row,
+                    image,
+                    source,
+                    (drawn.0, rows),
+                    x_plan,
+                    y_plan,
+                );
+            });
+        }
+    });
+}
+
+/// 一段目标行（`buffer` 已经是这一段自己的行）。`first_row` 是这一段在整幅目标里的行号，
+/// 用来查 y 轴的抽头。
+///
+/// 三条路，按抽头表的形状选：`1×` 是整行复制、放大是每个目标像素两个抽头的并行混合、
+/// 其余（也就是缩小）走通用循环。
+#[allow(clippy::too_many_arguments)]
+fn resample_band(
+    buffer: &mut [u32],
+    row_pitch: usize,
+    origin_x: usize,
+    first_row: usize,
+    image: &[u32],
+    source: (usize, usize),
+    drawn: (usize, usize),
+    x_plan: &AxisPlan,
+    y_plan: &AxisPlan,
+) {
+    if identity_plan(x_plan) && identity_plan(y_plan) {
+        resample_identity(buffer, row_pitch, origin_x, first_row, image, source.0, drawn, y_plan);
+        return;
+    }
+    if two_tap_plan(x_plan) && two_tap_plan(y_plan) {
+        resample_magnified(
+            buffer, row_pitch, origin_x, first_row, image, source.0, drawn, x_plan, y_plan,
+        );
+        return;
+    }
+    resample_filtered(
+        buffer, row_pitch, origin_x, first_row, image, source, drawn, x_plan, y_plan,
+    );
+}
+
+/// `1×` 的那条轴：一个抽头、满权重。两条轴都是它时整行搬运就够。
+fn identity_plan(plan: &AxisPlan) -> bool {
+    let destinations = plan.starts.len().saturating_sub(1);
+    plan.taps.len() == destinations
+        && (0..destinations).all(|index| plan.taps[index] == (index as u32, WEIGHT_ONE))
+}
+
+/// 放大的那条轴：每个目标像素恰好两个抽头。抽头**不必**是相邻的源像素——边缘处会夹取
+/// 到同一个下标——所以这里只查形状，不查下标之间的关系。
+fn two_tap_plan(plan: &AxisPlan) -> bool {
+    let destinations = plan.starts.len().saturating_sub(1);
+    plan.taps.len() == destinations * 2
+        && (0..=destinations).all(|index| plan.starts[index] == (index * 2) as u32)
+}
+
+/// 两条轴都是恒等轴：逐行搬运。
+///
+/// `first_row` 是这一段在**整幅目标**里的第一行，用来查 y 轴抽头；`buffer` 里的行号则是
+/// 从这一段自己算起的，所以写的位置是 `row * row_pitch`。分段并行之后这两个行号不再
+/// 相等，混用会让每一段都画到错的行上——而画面只是"某一档缩放画错了"，不报错。
+fn resample_identity(
+    buffer: &mut [u32],
+    row_pitch: usize,
+    origin_x: usize,
+    first_row: usize,
+    image: &[u32],
+    source_width: usize,
+    drawn: (usize, usize),
+    y_plan: &AxisPlan,
+) {
+    for row in 0..drawn.1 {
+        let source_start = y_plan.taps[first_row + row].0 as usize * source_width;
+        let destination_start = row * row_pitch + origin_x;
+        buffer[destination_start..destination_start + drawn.0]
+            .copy_from_slice(&image[source_start..source_start + drawn.0]);
+    }
+}
+
+/// 混合用的定点权重，满值是 `BLEND_ONE`。权重因此落在 `0..=256`，上限是 9 位而不是更多，
+/// 理由见 `blend_pixels`。
+///
+/// 抽头表里存的是 16 位权重，进这里之前降一档（`(weight + 128) >> 8`）：`(1 << 16) + 128`
+/// 右移 8 位正好是 `BLEND_ONE`，两个定点量程因此是严丝合缝对上的。
+const BLEND_SHIFT: u32 = 8;
+const BLEND_ONE: u32 = 1 << BLEND_SHIFT;
+
+/// 两个像素按定点权重混合，四个通道（含 alpha）在一个 32 位字里并行做完。
+///
+/// 用的是经典的"两个 16 位通道对"技巧：`0x00FF00FF` 掩出第 0、2 通道，`(pixel >> 8)`
+/// 之后再掩同一张掩码得到第 1、3 通道。权重取 9 位是因为 `255 * 256 = 65280` 还塞得进
+/// 16 位通道，两个乘积相加（最多也是 `255 * 256`，因为两个权重加起来恰好是 `BLEND_ONE`）
+/// 也不越过通道边界，于是四个通道可以一起算而不互相污染。
+///
+/// 第二个权重由补数得到（`BLEND_ONE - weight`）而不是各自独立舍入：平坦颜色因此是**逐位**
+/// 还原，不依赖舍入方向。两个抽头之下，9 位权重的误差上限是 1/512 个色阶，远小于量化
+/// 误差本身，这也是它敢降到 9 位的原因；抽头很多的缩小路径不走这里（见 `resample_filtered`）。
+#[inline]
+fn blend_pixels(first: u32, second: u32, weight_second: u32) -> u32 {
+    debug_assert!(weight_second <= BLEND_ONE);
+    let weight_first = BLEND_ONE - weight_second;
+    let round = 1 << (BLEND_SHIFT - 1);
+    let low = (first & 0x00FF_00FF) * weight_first
+        + (second & 0x00FF_00FF) * weight_second
+        + round;
+    let high = ((first >> 8) & 0x00FF_00FF) * weight_first
+        + ((second >> 8) & 0x00FF_00FF) * weight_second
+        + round;
+    ((low >> BLEND_SHIFT) & 0x00FF_00FF) | (((high >> BLEND_SHIFT) & 0x00FF_00FF) << 8)
+}
+
+/// 两个抽头的重采样（放大）。
+///
+/// 两次一维混合（先沿 x 再沿 y）而不是一次二维四点加权：后者要四个像素一起按
+/// `weight_x * weight_y` 加权，四通道就得回到 `resample_filtered` 那种逐通道的 64 位
+/// 累加。两次一维混合的中间结果会多舍入一次，误差不超过一个色阶，代价换来的是一行里
+/// 四个像素的读能被复用。
+#[allow(clippy::too_many_arguments)]
+fn resample_magnified(
+    buffer: &mut [u32],
+    row_pitch: usize,
+    origin_x: usize,
+    first_row: usize,
+    image: &[u32],
+    source_width: usize,
+    drawn: (usize, usize),
+    x_plan: &AxisPlan,
+    y_plan: &AxisPlan,
+) {
+    for row in 0..drawn.1 {
+        let plan_row = first_row + row;
+        let (source_row_0, _) = y_plan.taps[plan_row * 2];
+        let (source_row_1, weight_row_1) = y_plan.taps[plan_row * 2 + 1];
+        let start_0 = source_row_0 as usize * source_width;
+        let start_1 = source_row_1 as usize * source_width;
+        let weight_y = (weight_row_1 + (1 << 7)) >> 8;
+        let destination_start = row * row_pitch + origin_x;
+        for column in 0..drawn.0 {
+            let (source_x_0, _) = x_plan.taps[column * 2];
+            let (source_x_1, weight_x_1) = x_plan.taps[column * 2 + 1];
+            let weight_x = (weight_x_1 + (1 << 7)) >> 8;
+            let top = blend_pixels(
+                image[start_0 + source_x_0 as usize],
+                image[start_0 + source_x_1 as usize],
+                weight_x,
+            );
+            let bottom = blend_pixels(
+                image[start_1 + source_x_0 as usize],
+                image[start_1 + source_x_1 as usize],
+                weight_x,
+            );
+            buffer[destination_start + column] = blend_pixels(top, bottom, weight_y);
+        }
+    }
+}
+
+/// 通用循环：任意抽头数（缩小时会到十几个）。
+///
+/// 逐通道用 64 位累加，因为这里的权重是两条轴各 16 位相乘得到的 32 位定点数——抽头多的
+/// 时候只有这个精度才够（9 位权重分到十几个抽头上，误差能到几个色阶）。
+#[allow(clippy::too_many_arguments)]
+fn resample_filtered(
+    buffer: &mut [u32],
+    row_pitch: usize,
+    origin_x: usize,
+    first_row: usize,
+    image: &[u32],
+    source: (usize, usize),
+    drawn: (usize, usize),
+    x_plan: &AxisPlan,
+    y_plan: &AxisPlan,
+) {
+    const SHIFT: u32 = 2 * WEIGHT_SHIFT;
+    const HALF: u64 = 1 << (SHIFT - 1);
+
+    for row in 0..drawn.1 {
+        let destination_start = row * row_pitch + origin_x;
+        let y_taps = y_plan.taps_for(first_row + row);
+        for column in 0..drawn.0 {
+            let x_taps = x_plan.taps_for(column);
+            let mut channels = [0u64; 4];
+            for &(source_y, weight_y) in y_taps {
+                let source_row = source_y as usize * source.0;
+                for &(source_x, weight_x) in x_taps {
+                    let weight = u64::from(weight_x) * u64::from(weight_y);
+                    let mut pixel = image[source_row + source_x as usize];
+                    for channel in &mut channels {
+                        *channel += u64::from(pixel & 0xFF) * weight;
+                        pixel >>= 8;
+                    }
+                }
+            }
+            let mut pixel = 0u32;
+            for (channel, sum) in channels.iter().enumerate() {
+                // 权重归一化保证结果落在 0..=255；这里的夹取只是替权重出错兜底。
+                let value = ((sum + HALF) >> SHIFT).min(255) as u32;
+                pixel |= value << (channel * 8);
+            }
+            buffer[destination_start + column] = pixel;
+        }
+    }
+}
+
+/// 边框宽度（像素）。按这个窗口所在显示器的 DPI 折算，保证在高 DPI 屏幕上物理宽度一致。
+fn border_px(dpi: u32) -> i32 {
     ((BORDER_DIP as f64) * (dpi as f64) / 96.0).round().max(1.0) as i32
 }
 
+/// 窗口所在显示器的 DPI。取不到就退到系统 DPI，再不行按 96 算。
+///
+/// 这是窗口该用的那个 DPI：`WM_DPICHANGED` 之外的所有排版（边框、控件字号、圆角）
+/// 都要问它，问 `system_dpi()` 等于假定窗口永远在主显示器上。
+fn window_dpi(hwnd: HWND) -> u32 {
+    unsafe {
+        let Some(proc) = user32_proc(c"GetDpiForWindow") else {
+            return system_dpi();
+        };
+        let get_dpi_for_window: unsafe extern "system" fn(HWND) -> u32 = std::mem::transmute(proc);
+        match get_dpi_for_window(hwnd) {
+            0 => system_dpi(),
+            dpi => dpi,
+        }
+    }
+}
+
 /// 系统 DPI。取不到就按 96 算。
+///
+/// 只留给"还没有窗口"的那一处（创建贴图之前先算一个临时尺寸）和上面那个兜底。
 fn system_dpi() -> u32 {
     unsafe {
-        let module = GetModuleHandleW(wide("user32.dll").as_ptr());
-        if module.is_null() {
-            return 96;
-        }
-        // `GetDpiForSystem` 在 windows-sys 0.59 里没有绑定，手工取地址。
-        // 拿不到就退到 96 DPI。
-        let Some(proc) = GetProcAddress(module, c"GetDpiForSystem".as_ptr().cast()) else {
+        let Some(proc) = user32_proc(c"GetDpiForSystem") else {
             return 96;
         };
         let get_dpi_for_system: unsafe extern "system" fn() -> u32 = std::mem::transmute(proc);
@@ -1607,15 +2120,31 @@ fn system_dpi() -> u32 {
     }
 }
 
+/// 取 user32 里一个导出函数的地址，取不到返回 `None`。
+///
+/// `windows-sys` 0.59 没绑定 `GetDpiForSystem` / `GetDpiForWindow` 这两个高 DPI 入口，
+/// 只能自己取。两个都在 `user32.dll` 里，所以这一段加载逻辑只写一遍。
+unsafe fn user32_proc(name: &CStr) -> Option<*const c_void> {
+    // SAFETY: `user32.dll` 在每个进程里都已经加载，`GetModuleHandleW` 只读模块表；
+    // `name` 来自调用点的字面量，以 NUL 结尾，满足 `GetProcAddress` 对字符串的要求。
+    unsafe {
+        let module = GetModuleHandleW(wide("user32.dll").as_ptr());
+        if module.is_null() {
+            return None;
+        }
+        GetProcAddress(module, name.as_ptr().cast()).map(|proc| proc as *const c_void)
+    }
+}
+
 // ─────────────────────────── 缩放倍数控件 ───────────────────────────
 //
 // 贴图右上角那个显示当前倍数的圆角小标（`docs/34` §4.2.2）。样式照 `magnifier_pass.rs`
-// 里放大镜面板的同名控件：14 DIP 粗体、左右 8 DIP、上下 5 DIP 内边距、距角 6 DIP、
-// 6 DIP 圆角。尺寸照搬是为了让两个控件看起来是同一个东西；**实现完全不同**——放大镜
-// 在 D2D 上画，贴图只能往自己的 `u32` 缓冲里逐像素写。
+// 里放大镜面板的同名控件：14 DIP 的粗体（700，放大镜用的是 `DWRITE_FONT_WEIGHT_BOLD`）、
+// 左右 8 DIP、上下 5 DIP 内边距、距角 6 DIP、6 DIP 圆角。尺寸照搬是为了让两个控件看起来
+// 是同一个东西；**实现完全不同**——放大镜在 D2D 上画，贴图只能往自己的 `u32` 缓冲里逐像素写。
 
 /// 控件文字的字号（DIP），与放大镜那颗一致。
-const BADGE_FONT_DIP: f64 = 14.0;
+const BADGE_FONT_DIP: f64 = snapclip_capture::overlay_font::ZOOM_BADGE_FONT_SIZE_DIP as f64;
 const BADGE_PAD_H_DIP: f64 = 8.0;
 const BADGE_PAD_V_DIP: f64 = 5.0;
 const BADGE_INSET_DIP: f64 = 6.0;
@@ -1631,12 +2160,20 @@ const BADGE_TEXT_COLOR: u32 = 0xFFFF_FFFF;
 
 /// 把倍数变成控件上的字。
 ///
-/// **百分比**（`docs/34` §4.2.2）：用户说的是"基准是 100%"，那就把基准显示成 100%。
-/// 步长 0.1 决定结果只需要一位小数，四舍五入到整数后 `%` 恰好把那一档也表达清楚了
-/// （`0.1` → `10%`，`10.0` → `1000%`）。
+/// 格式**与放大镜那颗一字不差**（`magnifier_pass.rs` 的同名控件）：整档不写小数
+/// （`1×`、`2×`、`10×`），半档写一位（`0.5×`、`1.9×`），乘号是 `×` 而不是字母 `x`。
+/// 用户对这个控件的要求原话是"文本格式和放大镜框的保持一致，使用 ×"。
+///
+/// 判定"是不是整档"用文字上的四舍五入，而不是拿档位去算：`1.0`、`2.0` 这些值在
+/// 整数十分位上是精确的，`round()` 拿到的就是它自己。
 fn badge_label(zoom: f64) -> String {
-    let percent = (clamp_zoom(zoom) * 100.0).round();
-    format!("{}%", percent as i64)
+    let zoom = clamp_zoom(zoom);
+    let rounded = zoom.round();
+    if zoom >= 10.0 || (zoom - rounded).abs() < 0.01 {
+        format!("{rounded:.0}×")
+    } else {
+        format!("{zoom:.1}×")
+    }
 }
 
 /// 控件里那行字的光栅化结果：**覆盖率掩码**。
@@ -1644,12 +2181,15 @@ fn badge_label(zoom: f64) -> String {
 /// `coverage` 是每像素 0–255 的覆盖度（不是颜色），尺寸就是文字的像素外框。做成掩码
 /// 而不是"已经染好色的位图"，是因为颜色决定权必须留在 [`blend_coverage`] 里：文字色
 /// 与底色是两个常量，混色是一次整数乘法，比再建一张彩色位图便宜得多。
+/// 一行字光栅化出来的**墨迹掩码**：`coverage` 是笔画盖住每个像素的比例（0–255），
+/// `width × height` 恰好是墨迹的包围盒——行与列上的空白都裁掉了。
+///
+/// 裁成包围盒不是为了省内存（一张掩码几十字节），而是因为控件要按**墨迹**居中：
+/// 行框里字的上沿与下沿差多少由 GDI 的字模度量决定，只有量出来才知道。
 struct TextMask {
     coverage: Vec<u16>,
     width: i32,
     height: i32,
-    /// 文字占的像素宽度（`coverage` 的 stride 用的就是它）。给排版用。
-    text_width: i32,
 }
 
 thread_local! {
@@ -1675,7 +2215,116 @@ fn text_mask(text: &str, dpi: u32) -> Option<Arc<TextMask>> {
     Some(mask)
 }
 
-/// 用 GDI 把一行字画进一张**白底黑字**的位图，再把红色通道当成覆盖率读出来。
+/// 白底黑字位图里一个像素"有多黑"，也就是笔画盖住它的比例（0 = 全白 = 没笔画）。
+///
+/// 取**三个通道的平均**而不是单看一个：GDI 的字体平滑是 ClearType 档（[`create_badge_face`]），
+/// 按子像素分别染色，同一个像素的红绿蓝是三个不同的覆盖率；只读一个通道等于把笔画横向
+/// 砍掉一半，边缘看上去就是一格一格的。平均回来正是"这个像素被笔画盖住多少"。
+fn ink_coverage(pixel: u32) -> u16 {
+    let red = (pixel >> 16) & 0xFF;
+    let green = (pixel >> 8) & 0xFF;
+    let blue = pixel & 0xFF;
+    (255 - (red + green + blue) / 3) as u16
+}
+
+/// 这个像素算不算有笔画。
+///
+/// 判据与"会不会画上去"必须是同一条：`blend_coverage` 画的是所有覆盖率非零的像素，
+/// 这里就得把非零的都算进包围盒。两边用不同的阈值（比如这里漏掉覆盖率 1 的那一圈），
+/// 包围盒就比真正画上去的窄一格，按它居中会**随机**偏一个像素——取决于那圈极浅的
+/// 抗锯齿边缘落在哪一侧。
+fn has_ink(pixel: &u32) -> bool {
+    ink_coverage(*pixel) > 0
+}
+
+/// 控件用的字体：按覆盖层的族序逐个问 GDI，并把真正选中的族名**读回来核对**。
+///
+/// GDI 不会因为族名不认识而失败，它会静默替换一个（本机既不注册内嵌子集、又没有那几个界面
+/// 族时，"HarmonyOS Sans SC" 会变成 MS Sans Serif）。所以填进去的名字什么也证明不了：
+/// `CreateFontW` 之后必须用 `GetTextFaceW` 把 DC 里实际选中的名字读回来，对上了才认。
+///
+/// 返回的字体**已经**选进 `memory_dc`，连它替换掉的那个对象一起交出去；恢复与释放由调用方
+/// 收尾。最后一个族无条件接受：能走到那一步说明读回校验本身在这个环境里失灵（族名被本地化、
+/// 或 API 被挂钩），此时画一个替身字体总比整颗控件消失好。
+unsafe fn select_badge_font(memory_dc: HDC, font_height: i32) -> Option<(HFONT, HGDIOBJ)> {
+    // 覆盖层那颗在渲染器启动时注册过，这里再调一次是幂等的——但贴图可以独立于覆盖层存在
+    // （只开贴图不开截图），所以不能指望别人先注册。
+    snapclip_capture::overlay_font::register();
+    let families = snapclip_capture::overlay_font::FAMILIES;
+    unsafe {
+        for (index, family) in families.iter().enumerate() {
+            let font = create_badge_face(font_height, family);
+            if font.is_null() {
+                continue;
+            }
+            let previous = SelectObject(memory_dc, font.into());
+            if index + 1 == families.len()
+                || face_name(memory_dc).is_some_and(|name| name == *family)
+            {
+                return Some((font, previous));
+            }
+            SelectObject(memory_dc, previous);
+            DeleteObject(font.into());
+        }
+    }
+    None
+}
+
+/// `CreateFontW` 的固定参数：字号、字重、质量档一处写死，族名是唯一的变量。
+unsafe fn create_badge_face(font_height: i32, family: &str) -> HFONT {
+    unsafe {
+        CreateFontW(
+            font_height,
+            0,
+            0,
+            0,
+            // 与放大镜那颗倍数的 `DWRITE_FONT_WEIGHT_BOLD` 同档
+            // （`magnifier_pass.rs` 里 `info_text_format_mut(false, ZOOM_BADGE_FONT_SIZE_DIP, …BOLD, true)`）。
+            // 这里曾经是 `FW_SEMIBOLD`（600）：字号、内边距、圆角都照搬了，唯独笔画比放大镜
+            // 那颗细一档，摆在一起看就不是同一个控件（用户 m07964）。
+            snapclip_capture::overlay_font::ZOOM_BADGE_FONT_WEIGHT,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET as u32,
+            OUT_TT_PRECIS as u32,
+            CLIP_DEFAULT_PRECIS as u32,
+            // 要**系统默认的那一档**（ClearType），不是灰度反锯齿。
+            //
+            // 两个原因，都是量出来的（144 DPI、`1.9×`、字号 21；判据与数字都在
+            // `the_badge_text_weighs_the_same_as_on_the_badge_background` 里，跑它加
+            // `--nocapture` 会把这几个数打出来）：
+            // ClearType 一档不 hinting、笔画按字体的**自然宽度**排（掩码 43x17、有墨迹 324
+            // 像素），灰度档会把笔画往格子上吸、吸细一圈（42x17、289 像素，少 12%）；
+            // 而且 ClearType 的覆盖率自带 gamma 校正，直接线性混到深底上与"GDI 自己把白字
+            // 画在这个底色上"几乎逐像素同重（1.004x），灰度档只有 0.91x——白字压深底本来
+            // 就显细，再让掉 gamma 就更细。
+            //
+            // 覆盖率仍然要按三通道平均读（[`ink_coverage`]）：ClearType 是**子像素**染色，
+            // 一个像素的红绿蓝是三个不同的覆盖率，平均回来才是"这个像素被笔画盖住多少"。
+            CLEARTYPE_QUALITY as u32,
+            DEFAULT_PITCH as u32 | FF_DONTCARE as u32,
+            wide(family).as_ptr(),
+        )
+    }
+}
+
+/// `memory_dc` 里**真正**选中的字体族名：`CreateFontW` 要的是一个愿望，这个是结果。
+///
+/// `GetTextFaceW` 返回的字符数含结尾的 NUL，减 1 才是名字长度；读不出来时返回 `None`，调用
+/// 方据此认为"没对上"。
+unsafe fn face_name(memory_dc: HDC) -> Option<String> {
+    let mut buffer = [0u16; 64];
+    let count = unsafe { GetTextFaceW(memory_dc, buffer.len() as i32, buffer.as_mut_ptr()) };
+    if count <= 0 {
+        return None;
+    }
+    let length = (count as usize - 1).min(buffer.len());
+    Some(String::from_utf16_lossy(&buffer[..length]))
+}
+
+/// 用 GDI 把一行字画进一张**白底黑字**的位图，再把"有多黑"当成覆盖率读出来
+/// （[`ink_coverage`]）。
 ///
 /// 白底黑字是刻意的：GDI 会把反锯齿的中间值算进像素颜色里，而"黑色有多少"正好就是
 /// "笔画的覆盖率有多少"。若反过来画白字黑底，颜色与覆盖率会混在同一个通道里分不开。
@@ -1683,9 +2332,9 @@ fn text_mask(text: &str, dpi: u32) -> Option<Arc<TextMask>> {
 /// 掩码是全黑的（覆盖率 0）也不当失败——那句话只是"字没渲染出来"，控件会显示成一个
 /// 空的圆角色块，缩放本身照常工作。为一个装饰性的小标把 F6 搞失败是不划算的。
 fn rasterize_text(text: &str, dpi: u32) -> Option<TextMask> {
-    let scale = f64::from(dpi.max(96)) / 96.0;
-    let height = (BADGE_FONT_DIP * scale).round().max(1.0);
-    let font_height = -(height as i32);
+    // 字号与控件高度用同一个折算函数：两边各算一遍，迟早会算出两个不一样的像素数。
+    let height = scale_dip(BADGE_FONT_DIP, dpi);
+    let font_height = -height;
     unsafe {
         let screen_dc = GetDC(std::ptr::null_mut());
         if screen_dc.is_null() {
@@ -1697,37 +2346,32 @@ fn rasterize_text(text: &str, dpi: u32) -> Option<TextMask> {
             if memory_dc.is_null() {
                 return None;
             }
-            let font = CreateFontW(
-                font_height,
-                0,
-                0,
-                0,
-                FW_SEMIBOLD as i32,
-                0,
-                0,
-                0,
-                DEFAULT_CHARSET as u32,
-                OUT_TT_PRECIS as u32,
-                CLIP_DEFAULT_PRECIS as u32,
-                0,
-                DEFAULT_PITCH as u32 | FF_DONTCARE as u32,
-                wide("Segoe UI").as_ptr(),
-            );
-            let mask = if font.is_null() {
-                None
-            } else {
-                let previous_font = SelectObject(memory_dc, font.into());
+            // 字体族与字重都照搬放大镜那颗倍数控件：它走的是内嵌的 `HarmonyOS Sans SC`
+            // （`overlay_font::FAMILY`），贴图这边得问 GDI 要同一个族。GDI 不会因为族名不认识
+            // 而失败——它会**悄悄换一个**——所以"要到了没有"只能问回 DC（见
+            // `select_badge_font`），光把名字填进去证明不了任何事。
+            let selected = select_badge_font(memory_dc, font_height);
+            let mask = if let Some((font, previous_font)) = selected {
                 let white = GetStockObject(WHITE_BRUSH);
                 let previous_brush = SelectObject(memory_dc, white);
                 SetBkMode(memory_dc, TRANSPARENT as i32);
                 SetTextColor(memory_dc, 0x0000_0000);
 
+                // 行框留一倍余量：字在行框里的落点由 GDI 的字模度量决定（实测基线与行框
+                // 下沿齐平），行框高度正好取字号时笔画的最后一行会被切在 DIB 外面。多画
+                // 几行、量出墨迹再裁掉，比假设它一定放得下可靠。
+                let lines = font_height.unsigned_abs() * 2;
                 let width = (dpi.max(96) * 3) as i32;
                 let mut info: BITMAPINFO = std::mem::zeroed();
                 info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
                 info.bmiHeader.biWidth = width;
-                // 负高度 = 自顶向下：行号直接是像素列号，不用再翻一次。
-                info.bmiHeader.biHeight = -font_height;
+                // **负高度 = 自顶向下**，也就是缓冲的第 0 行是屏幕上的最上面一行。
+                //
+                // 这里必须是负的：下面把 `bits` 当连续的行读，而正高度（自下向上）的
+                // DIB 第 0 行是**图的底行**，读出来的字会**上下颠倒**。曾经写成
+                // `-font_height`，而 `font_height` 本身就是负的，两个负号抵消成了
+                // 正高度，于是贴图右上角的倍数控件一直是倒着的。
+                info.bmiHeader.biHeight = -(lines as i32);
                 info.bmiHeader.biPlanes = 1;
                 info.bmiHeader.biBitCount = 32;
                 info.bmiHeader.biCompression = BI_RGB;
@@ -1749,7 +2393,7 @@ fn rasterize_text(text: &str, dpi: u32) -> Option<TextMask> {
                         left: 0,
                         top: 0,
                         right: width,
-                        bottom: font_height.abs(),
+                        bottom: lines as i32,
                     };
                     // `FillRect` / `DrawTextW` 的签名收 `*mut RECT`（老 API 没有 `const`），
                     // 但两者都不写这块矩形，所以用 `&raw mut` 借出指针即可，不需要可变绑定。
@@ -1765,22 +2409,41 @@ fn rasterize_text(text: &str, dpi: u32) -> Option<TextMask> {
                     );
 
                     let stride = width as usize;
-                    let rows = font_height.unsigned_abs() as usize;
+                    let rows = lines as usize;
                     let source = std::slice::from_raw_parts(bits as *const u32, stride * rows);
 
-                    // 文字只占左边一小截，量出来之后掩码就只留那一截。
-                    let mut text_width = 0usize;
-                    for row in source.chunks_exact(stride) {
-                        let last = row.iter().rposition(|pixel| (pixel & 0xFF) < 250);
-                        if let Some(last) = last {
-                            text_width = text_width.max(last + 1);
+                    // 掩码裁成**墨迹的包围盒**：先量出字占了哪几行，再只在这几行上量它
+                    // 占哪几列。控件要按墨迹居中（见 `composite_badge`），而字在行框里
+                    // 上沿离顶差多少完全由 GDI 的字模度量决定——那是量出来的，不是算出来的。
+                    let mut ink_top = rows;
+                    let mut ink_bottom = rows;
+                    for (index, row) in source.chunks_exact(stride).enumerate() {
+                        if row.iter().any(has_ink) {
+                            if ink_top == rows {
+                                ink_top = index;
+                            }
+                            ink_bottom = index + 1;
                         }
                     }
-                    let mut coverage = Vec::with_capacity(text_width * rows);
-                    for row in source.chunks_exact(stride) {
-                        for pixel in &row[..text_width] {
-                            // 白底黑字：红通道越大越白，覆盖率就是它的补。
-                            coverage.push(255 - (pixel & 0xFF) as u16);
+                    let ink_height = ink_bottom.saturating_sub(ink_top);
+
+                    let mut ink_left = stride;
+                    let mut ink_right = 0usize;
+                    for row in source.chunks_exact(stride).skip(ink_top).take(ink_height) {
+                        if let Some(first) = row.iter().position(has_ink) {
+                            ink_left = ink_left.min(first);
+                        }
+                        if let Some(last) = row.iter().rposition(has_ink) {
+                            ink_right = ink_right.max(last + 1);
+                        }
+                    }
+                    // 一个字都没渲染出来时让区间空掉，而不是留下 `[stride, 0)` 这种反区间。
+                    let ink_left = ink_left.min(ink_right);
+                    let text_width = ink_right - ink_left;
+                    let mut coverage = Vec::with_capacity(text_width * ink_height);
+                    for row in source.chunks_exact(stride).skip(ink_top).take(ink_height) {
+                        for pixel in &row[ink_left..ink_right] {
+                            coverage.push(ink_coverage(*pixel));
                         }
                     }
 
@@ -1789,14 +2452,15 @@ fn rasterize_text(text: &str, dpi: u32) -> Option<TextMask> {
                     Some(TextMask {
                         coverage,
                         width: text_width as i32,
-                        height: rows as i32,
-                        text_width: text_width as i32,
+                        height: ink_height as i32,
                     })
                 };
                 SelectObject(memory_dc, previous_brush);
                 SelectObject(memory_dc, previous_font);
                 DeleteObject(font.into());
                 mask
+            } else {
+                None
             };
             DeleteDC(memory_dc);
             mask
@@ -1805,6 +2469,13 @@ fn rasterize_text(text: &str, dpi: u32) -> Option<TextMask> {
         result
     }
 }
+
+/// 把一个 DIP 长度折成本机像素，至少 1（免得在高 DPI 下折成 0）。
+fn scale_dip(dip: f64, dpi: u32) -> i32 {
+    let scale = f64::from(dpi.max(96)) / 96.0;
+    (dip * scale).round().max(1.0) as i32
+}
+
 /// 控件的排版尺寸，按 DPI 折算。
 struct BadgeStyle {
     /// 左右内边距。
@@ -1819,8 +2490,7 @@ struct BadgeStyle {
 
 impl BadgeStyle {
     fn new(dpi: u32) -> Self {
-        let scale = f64::from(dpi.max(96)) / 96.0;
-        let scale_dip = |dip: f64| (dip * scale).round().max(0.0) as i32;
+        let scale_dip = |dip: f64| scale_dip(dip, dpi);
         Self {
             pad_h: scale_dip(BADGE_PAD_H_DIP),
             pad_v: scale_dip(BADGE_PAD_V_DIP),
@@ -1830,13 +2500,49 @@ impl BadgeStyle {
     }
 }
 
+/// 控件在整窗缓冲里的落点：它要画的字模，以及 `(left, top, width, height)`。
+///
+/// `None` 表示这一档放不下控件、整个不画（让位规则见 [`composite_badge`]）。宽度由字模
+/// 量出来的文字宽度决定，所以落点和字模只能一起算出来——这也正是它要能被问到的原因：
+/// 控件压在图像上，任何"整幅图像逐像素"的断言都必须先把这个矩形让出去。
+fn badge_placement(
+    image_width: u32,
+    image_height: u32,
+    zoom: f64,
+    border: i32,
+    dpi: u32,
+) -> Option<(Arc<TextMask>, (i32, i32, i32, i32))> {
+    let style = BadgeStyle::new(dpi);
+    let mask = text_mask(&badge_label(zoom), dpi)?;
+    let badge_width = mask.width + style.pad_h * 2;
+    // 高度取自**字号**而不是量出来的文字高度，就为了和放大镜那颗对齐：那边是
+    // `font_sz + pad_v * 2`（`magnifier_pass.rs`），字的实际高矮不参与。所以字是
+    // **居中落在这个固定框里**，而不是让框去贴字（见 [`composite_badge`]）。
+    let badge_height = scale_dip(BADGE_FONT_DIP, dpi) + style.pad_v * 2;
+
+    // 图像区在整窗缓冲里的范围。
+    let right = border + scaled_dimension(f64::from(image_width), zoom);
+    let bottom = border + scaled_dimension(f64::from(image_height), zoom);
+
+    let badge_right = right - style.inset;
+    let badge_bottom = border + style.inset + badge_height;
+    let badge_left = badge_right - badge_width;
+    if badge_left < border || badge_bottom > bottom || badge_width <= 0 || badge_height <= 0 {
+        return None;
+    }
+    Some((
+        mask,
+        (badge_left, border + style.inset, badge_width, badge_height),
+    ))
+}
+
 /// 把缩放倍数控件画到整窗缓冲的右上角。
 ///
 /// **只覆盖图像区，不碰边框**：控件的右上角对齐的是"图像区右上角往里缩 `inset`"，
 /// 而不是窗口的右上角。贴图那圈边框是它与底下的窗口分开的唯一标记，被控件压掉一段
 /// 就会看起来像没贴好。
 ///
-/// 让位规则（见调用方 [`paint_pin`]）：图像区小到放不下控件时**整个不画**，不缩小、
+/// 让位规则（落点由 [`badge_placement`] 算）：图像区小到放不下控件时**整个不画**，不缩小、
 /// 不裁切——一个缺角的 `1000%` 比没有控件更容易被当成贴图坏了。
 fn composite_badge(
     buffer: &mut [u32],
@@ -1847,75 +2553,76 @@ fn composite_badge(
     border: i32,
     dpi: u32,
 ) {
-    let style = BadgeStyle::new(dpi);
-    let Some(mask) = text_mask(&badge_label(zoom), dpi) else {
+    let Some((mask, (badge_left, badge_top, badge_width, badge_height))) =
+        badge_placement(image_width, image_height, zoom, border, dpi)
+    else {
         return;
     };
-    let badge_width = mask.text_width + style.pad_h * 2;
-    let badge_height = mask.height + style.pad_v * 2;
-
-    // 图像区在整窗缓冲里的范围。
-    let (left, top) = (border, border);
-    let right = border + scaled_dimension(f64::from(image_width), zoom);
-    let bottom = border + scaled_dimension(f64::from(image_height), zoom);
-
-    let badge_right = right - style.inset;
-    let badge_bottom = top + style.inset + badge_height;
-    let badge_left = badge_right - badge_width;
-    if badge_left < left || badge_bottom > bottom || badge_width <= 0 || badge_height <= 0 {
-        return;
-    }
+    let style = BadgeStyle::new(dpi);
 
     let row_pitch = size.0 as usize;
     for row in 0..badge_height {
-        let destination_row = top + style.inset + row;
+        let destination_row = badge_top + row;
         if destination_row < 0 || destination_row >= size.1 {
             continue;
         }
         for column in 0..badge_width {
-            if !inside_rounded(column, row, badge_width, badge_height, style.radius) {
+            // 圆角边缘按**覆盖率**混合，不是二值的"画/不画"：二值遮罩下四个角的圆弧
+            // 只能落在整像素上，那条曲线就必然是一格一格的阶梯，而它正是控件里唯一
+            // 一条斜的轮廓——比文字更显眼（字形本身有灰度抗锯齿，圆角没有）。
+            let coverage = edge_coverage(rounded_distance(
+                column as f32 + 0.5,
+                row as f32 + 0.5,
+                badge_width as f32,
+                badge_height as f32,
+                style.radius as f32,
+            ));
+            if coverage == 0 {
                 continue;
             }
             let index = destination_row as usize * row_pitch + (badge_left + column) as usize;
             if let Some(pixel) = buffer.get_mut(index) {
-                *pixel = BADGE_BG_COLOR;
+                *pixel = over(*pixel, BADGE_BG_COLOR, coverage);
             }
         }
     }
 
+    // 墨迹在控件里**两个方向都居中**。水平方向本来就是这么算的：控件宽度 = 墨迹宽度
+    // + 左右内边距，于是 `(控件宽 - 墨迹宽) / 2` 正好就是 `pad_h`。竖直方向原来把上下
+    // 内边距加在**行框**上，而行框里字的落点由 GDI 的字模度量决定——行框比墨迹高一大截、
+    // 字又贴在行框下沿，于是字看上去明显偏下（96 DPI 偏 2.5 像素，150% 下偏 4.5 像素）。
     blend_coverage(
         buffer,
         row_pitch,
-        badge_left + style.pad_h,
-        top + style.inset + style.pad_v,
+        badge_left + (badge_width - mask.width) / 2,
+        badge_top + (badge_height - mask.height) / 2,
         &mask,
         BADGE_TEXT_COLOR,
     );
 }
 
-/// 一个点是不是在一个圆角矩形里。
+/// 一个点到圆角矩形边界的**有符号**距离（像素），负值在内部、正值在外部。
 ///
-/// 四个角各问一次到圆心的距离；圆心之外那四块小方角被圆切掉的才是"外"。
-fn inside_rounded(column: i32, row: i32, width: i32, height: i32, radius: i32) -> bool {
-    let radius = radius.min(width / 2).min(height / 2).max(0);
-    if radius == 0 {
-        return true;
-    }
-    let x = if column < radius {
-        radius - column
-    } else if column >= width - radius {
-        column - (width - radius - 1)
-    } else {
-        0
-    };
-    let y = if row < radius {
-        radius - row
-    } else if row >= height - radius {
-        row - (height - radius - 1)
-    } else {
-        0
-    };
-    x * x + y * y <= radius * radius
+/// 圆角矩形是"矩形把四个角用半径 `radius` 的圆弧切掉"：到直边的距离是 `|q| - 半长`，
+/// 到圆弧的距离则要再减掉半径。把 `q` 的负分量归零再取长度，得到的正是"离最近的角
+/// 有多远"，于是同一个式子同时管住了直边与圆弧，不需要分四种情况（旧版 `inside_rounded`
+/// 那个逐象限的写法就是为了绕开这一条，而且它只能给出布尔值）。
+fn rounded_distance(x: f32, y: f32, width: f32, height: f32, radius: f32) -> f32 {
+    let half = (width * 0.5, height * 0.5);
+    let radius = radius.min(half.0).min(half.1).max(0.0);
+    let qx = (x - half.0).abs() - (half.0 - radius);
+    let qy = (y - half.1).abs() - (half.1 - radius);
+    let outside = (qx.max(0.0) * qx.max(0.0) + qy.max(0.0) * qy.max(0.0)).sqrt();
+    outside + qx.max(qy).min(0.0) - radius
+}
+
+/// 有符号距离 → 覆盖率：以边界为中心、1 像素宽的线性斜坡。
+///
+/// 斜坡宽度取 1 像素是有依据的：采样点在像素中心，一个像素的"面积"就是 1×1，边界穿过
+/// 它时覆盖率正好从 0 线性走到 255。距离 `-0.5` 及以内是纯内部（`255`）、`+0.5` 及以外
+/// 是纯外部（`0`），所以控件内部的像素值**逐位**等于底色，不会被这条抗锯齿改动。
+fn edge_coverage(distance: f32) -> u32 {
+    ((0.5 - distance).clamp(0.0, 1.0) * 255.0).round() as u32
 }
 
 /// 把一段覆盖率覆盖到缓冲里。`mask` 的左上角落在 `(x, y)`。
@@ -2056,14 +2763,26 @@ impl LayeredBuffer {
         unsafe { std::slice::from_raw_parts_mut(self.pixels, self.len) }
     }
 
-    /// 把整窗内容提交到窗口。
-    fn submit(&self, hwnd: HWND) -> Result<()> {
+    /// 把整窗内容提交到窗口，可以直接附带新的位置与尺寸。
+    ///
+    /// `position` 为 `Some` 时**这一次调用同时完成搬窗口、改尺寸、换画面**，这是缩放
+    /// 不闪的唯一办法：`UpdateLayeredWindow` 的 `psize` 本身就是"分层窗口的新尺寸"，
+    /// 把尺寸留给 `SetWindowPos` 就会分成两步，而两步之间窗口显示的仍是上一档的画面
+    /// （缩小时是"窗口还大、层已经小了"，露出来的那块不在层里）。
+    ///
+    /// 拖动路径传 `None`：拖动不改尺寸，逐条消息只挪窗口，不该顺手重建一个 `POINT`。
+    fn submit(&self, hwnd: HWND, position: Option<(i32, i32)>) -> Result<()> {
         unsafe {
             let size = SIZE {
                 cx: self.width,
                 cy: self.height,
             };
             let src = POINT { x: 0, y: 0 };
+            let destination = position.map(|(x, y)| POINT { x, y });
+            let destination = match &destination {
+                Some(point) => point,
+                None => std::ptr::null(),
+            };
             let blend = BLENDFUNCTION {
                 BlendOp: AC_SRC_OVER as u8,
                 BlendFlags: 0,
@@ -2074,7 +2793,7 @@ impl LayeredBuffer {
             let ok = UpdateLayeredWindow(
                 hwnd,
                 std::ptr::null_mut(),
-                std::ptr::null(),
+                destination,
                 &size,
                 self.memory_dc,
                 &src,
@@ -2120,6 +2839,13 @@ impl Drop for LayeredBuffer {
 /// 这里直接用数值，省掉一层类型转换。
 const GWLP_USERDATA: i32 = -21;
 
+/// `GetWindowLongPtrW` 的扩展样式下标。
+///
+/// `windows-sys` 把 `GWL_EXSTYLE` 定义在 `WINDOW_LONG_PTR_INDEX` 里，但那个类型是
+/// `i32` 而 `GetWindowLongPtrW` 收的是 `WINDOW_LONG_PTR_INDEX`——本仓为了少拉一个
+/// 导入，和 `GWLP_USERDATA` 一样在这里按数值声明。
+const GWL_EXSTYLE: i32 = -20;
+
 fn register_window_class(instance: HINSTANCE, class_name: &[u16]) -> Result<()> {
     unsafe {
         let mut class: WNDCLASSW = std::mem::zeroed();
@@ -2162,6 +2888,123 @@ mod tests {
     /// 测试一律按 96 DPI 算：`system_dpi()` 在无桌面会话里也可能返回别的值，
     /// 而这里要断言的是像素布局，不是 DPI 折算。
     const TEST_DPI: u32 = 96;
+
+    /// 控件里的白字压在深灰底上"看起来有多重"，必须与 GDI 直接在同一个底色上画白字一样重。
+    ///
+    /// 参考那一版刻意写死 `CLEARTYPE_QUALITY`（5）：放大镜那颗控件走 D2D，D2D 的文字也是
+    /// ClearType + gamma 校正，所以"GDI 用 ClearType 把白字画在这个底色上"就是它该有的样子。
+    /// 生产那一版走 `create_badge_face` 的档位；把它改回灰度反锯齿（4）时这个比值会掉到
+    /// 0.91——比 1 少 9%，5% 的门槛就能拦住。加 `--nocapture` 跑它会把量到的数打出来。
+    #[test]
+    fn the_badge_text_weighs_the_same_as_on_the_badge_background() {
+        fn mean_channel(pixel: u32) -> u32 {
+            (((pixel >> 16) & 0xFF) + ((pixel >> 8) & 0xFF) + (pixel & 0xFF)) / 3
+        }
+        fn linear_light(value: u32) -> f64 {
+            (value as f64 / 255.0).powf(2.2)
+        }
+        /// 白字压在深底上时这个像素"看起来有多少墨"：换到线性光里，再按底色归一化。
+        fn perceived_ink(pixel: u32, background: u32) -> f64 {
+            let low = linear_light(background);
+            ((linear_light(mean_channel(pixel)) - low) / (1.0 - low)).max(0.0)
+        }
+        /// GDI 直接在 `fill` 上画 `text_colour` 的字，返回整幅位图。
+        unsafe fn painted(quality: u32, fill: u32, text_colour: u32, text: &str) -> Vec<u32> {
+            unsafe {
+                let font_height = -scale_dip(BADGE_FONT_DIP, 144);
+                let screen_dc = GetDC(std::ptr::null_mut());
+                let memory_dc = CreateCompatibleDC(screen_dc);
+                let font = CreateFontW(
+                    font_height,
+                    0,
+                    0,
+                    0,
+                    snapclip_capture::overlay_font::ZOOM_BADGE_FONT_WEIGHT,
+                    0,
+                    0,
+                    0,
+                    DEFAULT_CHARSET as u32,
+                    OUT_TT_PRECIS as u32,
+                    CLIP_DEFAULT_PRECIS as u32,
+                    quality,
+                    DEFAULT_PITCH as u32 | FF_DONTCARE as u32,
+                    wide(snapclip_capture::overlay_font::FAMILY).as_ptr(),
+                );
+                let previous_font = SelectObject(memory_dc, font.into());
+                let lines = font_height.unsigned_abs() * 2;
+                let width = 432;
+                let mut info: BITMAPINFO = std::mem::zeroed();
+                info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+                info.bmiHeader.biWidth = width;
+                info.bmiHeader.biHeight = -(lines as i32);
+                info.bmiHeader.biPlanes = 1;
+                info.bmiHeader.biBitCount = 32;
+                info.bmiHeader.biCompression = BI_RGB;
+                let mut bits: *mut c_void = std::ptr::null_mut();
+                let bitmap =
+                    CreateDIBSection(memory_dc, &info, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
+                let previous_bitmap = SelectObject(memory_dc, bitmap.into());
+                let stride = width as usize;
+                let rows = lines as usize;
+                let pixels = std::slice::from_raw_parts_mut(bits as *mut u32, stride * rows);
+                pixels.fill(fill);
+                SetBkMode(memory_dc, TRANSPARENT as i32);
+                SetTextColor(memory_dc, text_colour);
+                let mut rect = RECT {
+                    left: 0,
+                    top: 0,
+                    right: width,
+                    bottom: lines as i32,
+                };
+                let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+                DrawTextW(
+                    memory_dc,
+                    wide.as_ptr(),
+                    -1,
+                    &raw mut rect,
+                    DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX,
+                );
+                let copy = pixels.to_vec();
+                SelectObject(memory_dc, previous_bitmap);
+                DeleteObject(bitmap.into());
+                SelectObject(memory_dc, previous_font);
+                DeleteObject(font.into());
+                DeleteDC(memory_dc);
+                ReleaseDC(std::ptr::null_mut(), screen_dc);
+                copy
+            }
+        }
+
+        let background = BADGE_BG_COLOR & 0xFF;
+        let mask = text_mask("1.9×", 144).expect("控件标签总要能光栅化");
+        let masked: f64 = mask
+            .coverage
+            .iter()
+            .map(|coverage| {
+                let blended = over(BADGE_BG_COLOR, BADGE_TEXT_COLOR, u32::from(*coverage));
+                perceived_ink(blended, background)
+            })
+            .sum();
+        let reference: f64 = (unsafe { painted(5, BADGE_BG_COLOR, 0x00FF_FFFF, "1.9×") })
+            .iter()
+            .map(|pixel| perceived_ink(*pixel, background))
+            .sum();
+        assert!(
+            reference > 100.0,
+            "参考那一版得真的画出字来，不然比值没有意义（量到 {reference:.1}）"
+        );
+        let ratio = masked / reference;
+        println!(
+            "控件白字压在底色上：掩码 {}x{}、有墨迹 {} 像素、看起来的重量比 {ratio:.3}、参考图上墨迹 {reference:.1}",
+            mask.width,
+            mask.height,
+            mask.coverage.iter().filter(|coverage| **coverage > 0).count(),
+        );
+        assert!(
+            (ratio - 1.0).abs() < 0.05,
+            "控件里的白字看起来该与直接在底色上画的字一样重，量到 {ratio:.3}（灰度反锯齿那版是 0.91）"
+        );
+    }
 
     #[test]
     fn a_null_window_message_is_handled_here_and_never_dispatched() {
@@ -2452,14 +3295,120 @@ mod tests {
         assert_eq!(image_point_at_client(10, 10, 1.0, 1, (5, 5)), Some((4, 4)));
     }
 
-    /// 从原图重新采样，而不是从上一帧的缩放结果再缩放。
+    /// 光栅出来的字形必须**正着**。
     ///
-    /// 这是 §6.1 T10 钉的那条：整数倍缩放来回走一趟必须**逐像素**回到原来那张图。
-    /// 如果实现改成"缩放当前缓冲"，这里的每个像素都会被重采样两次，值就不等了。
+    /// 这条测试守的是一个真实的故障：`CreateDIBSection` 的 `biHeight` 是正数时位图
+    /// **自下向上**，而读像素的代码把 `bits` 当成连续的从上到下的行——整行字就反了。
+    /// 当时写成 `-font_height`，而 `font_height` 本身是负的，两个负号抵消成正值，
+    /// 贴图右上角的倍数控件因此一直是上下颠倒的（用户 m06398 报的就是这个）。
+    ///
+    /// 判据用 `7`：它的横杠在上、斜尾在下，墨迹明显偏上。96 DPI 下这张掩码是 7x10，
+    /// 逐行笔画数是 `[7, 3, 3, 3, 3, 3, 2, 3, 3, 2]`，重心落在第 3.75 行，而中点是第 4.5 行；
+    /// 位图一翻过来重心就跑到第 5.25 行。掩码裁到墨迹包围盒之后这条仍然成立——裁掉的
+    /// 只是行框里的空白，不是行序。
+    ///
+    /// **不能**再用"`8×` 与 `8` 的最上一行笔画齐平"那类判据：掩码裁到墨迹之后，两张掩码的
+    /// 第一行都必然是有笔画的那一行，等式退化成恒真，倒着也能过。
     #[test]
-    fn integer_zoom_there_and_back_is_pixel_exact() {
+    fn glyphs_are_rasterized_upright() {
+        let mask = text_mask("7", 96).expect("96 DPI 下应当能光栅化");
+        let (mut total, mut weighted) = (0u32, 0u32);
+        for row in 0..mask.height {
+            let start = row as usize * mask.width as usize;
+            let ink = mask.coverage[start..start + mask.width as usize]
+                .iter()
+                .filter(|value| **value > 0)
+                .count() as u32;
+            total += ink;
+            weighted += ink * row as u32;
+        }
+        assert!(total > 0, "`7` 居然一点笔画都没有");
+        // 用整数比，免得为一条重心断言引入浮点：重心在中点之上 <=> 2 * 加权和 < 总数 * (高 - 1)。
+        assert!(
+            2 * weighted < total * (mask.height as u32 - 1),
+            "`7` 的墨迹重心应当偏上（横杠在上、斜尾在下），现在 {}x{} 的掩码里重心在第 {:.2} 行——字形被上下翻过来了",
+            mask.width,
+            mask.height,
+            f64::from(weighted) / f64::from(total)
+        );
+    }
+
+    /// 控件里的字在**两个方向上都居中**，而且不贴边。
+    ///
+    /// 量的是**渲染出来的缓冲**，不是内部数字。字形掩码原来只把列裁到墨迹、行留着整个行框，
+    /// 而上下内边距是加在行框上的，于是字在竖直方向明显偏下（用户 m07766 报的就是这个：
+    /// 96 DPI 偏 2.5 像素、150% 偏 4.5 像素）。判据取"两边的间距相差不超过 1 像素"——
+    /// 墨迹尺寸与控件尺寸的差是奇数时，一像素的不对称是像素栅格本身的极限，
+    /// 再要求严格相等就只能靠调字号去凑。
+    #[test]
+    fn the_badge_label_is_centred_in_its_button() {
+        const IMAGE: u32 = 0xFF00_8000;
+        let (image_width, image_height) = (200u32, 100u32);
+        let border = 1;
+        for dpi in [96u32, 120, 144, 192] {
+            let zoom = 3.0;
+            let size = window_size(image_width, image_height, zoom, border);
+            let image = vec![IMAGE; (image_width * image_height) as usize];
+            let mut buffer = vec![0u32; (size.0 * size.1) as usize];
+            paint_pin(
+                &mut buffer,
+                size,
+                border,
+                &image,
+                image_width,
+                image_height,
+                zoom,
+                dpi,
+            );
+
+            let (_, (left, top, width, height)) =
+                badge_placement(image_width, image_height, zoom, border, dpi)
+                    .expect("这个尺寸下控件应当放得下");
+            let style = BadgeStyle::new(dpi);
+            let at = |x: i32, y: i32| buffer[y as usize * size.0 as usize + x as usize];
+
+            // 只跳过"同时贴着横边与竖边"的四个角：圆角的圆弧与它的过渡像素也在那里，
+            // 混进来量到的就是控件本身而不是字。直边上的像素恰好是底色，不碍事。
+            let corner = |x: i32, y: i32| {
+                let horizontal = x < left + style.radius || x >= left + width - style.radius;
+                let vertical = y < top + style.radius || y >= top + height - style.radius;
+                horizontal && vertical
+            };
+            let mut ink = (i32::MAX, i32::MIN, i32::MAX, i32::MIN);
+            for y in top..(top + height) {
+                for x in left..(left + width) {
+                    if !corner(x, y) && at(x, y) != BADGE_BG_COLOR {
+                        ink = (ink.0.min(x), ink.1.max(x), ink.2.min(y), ink.3.max(y));
+                    }
+                }
+            }
+            assert!(ink.0 != i32::MAX, "{dpi} DPI：控件里一颗字的像素都没有");
+            let left_margin = ink.0 - left;
+            let right_margin = left + width - 1 - ink.1;
+            let top_margin = ink.2 - top;
+            let bottom_margin = top + height - 1 - ink.3;
+            assert!(
+                (left_margin - right_margin).abs() <= 1 && (top_margin - bottom_margin).abs() <= 1,
+                "{dpi} DPI：字没居中——左 {left_margin} / 右 {right_margin}，上 {top_margin} / 下 {bottom_margin}"
+            );
+            assert!(
+                left_margin >= 1 && right_margin >= 1 && top_margin >= 1 && bottom_margin >= 1,
+                "{dpi} DPI：字贴到控件边上了——左 {left_margin} / 右 {right_margin}，上 {top_margin} / 下 {bottom_margin}"
+            );
+        }
+    }
+
+    /// 放大是**插值**出来的，回到 1× 则必须逐像素还原。
+    ///
+    /// 这两条一起就是 §6.1 T10 关心的全部。放大后必须出现"原图里根本没有"的中间值：
+    /// 实现要是退回成取最近的源像素，缓冲里就只会出现原图里那些值，第一条断言会失败。
+    /// 回到 1× 的逐像素还原是另一半——缩放每次都从**原图**重采样，而不是拿上一帧再缩一次。
+    #[test]
+    fn zooming_up_interpolates_and_one_to_one_is_pixel_exact() {
         let (image_width, image_height) = (4u32, 3u32);
-        let image = image_of(image_width, image_height);
+        // 相邻像素差 20 个通道值。不能拿 `image_of` 那个逐像素加一的序列：它相邻只差 1，
+        // 插值出来的"中间值"四舍五入之后就是端点本身，断言分不出插值与不插值。
+        let image: Vec<u32> = (0..12).map(|index| 0xFF00_0000 | (index * 20 + 10)).collect();
         let border = 1;
 
         let doubled = window_size(image_width, image_height, 2.0, border);
@@ -2483,28 +3432,33 @@ mod tests {
             2.0,
             TEST_DPI,
         );
-        // 每个源像素铺成 2x2 的方块：这是最近邻在整数倍下的定义。窗口 10x8、边框 1，
-        // 所以内容从客户端 (1,1) 起，图像第 (col,row) 个像素占客户端
-        // `x = 1+2*col ..= 2+2*col`、`y = 1+2*row ..= 2+2*row`。
-        //
         // 断言写成"客户端坐标 → 缓冲下标"由下面这个闭包算，**不要手写 `3*10+3` 这种
         // 算式**：这张图里手写算式连着错了三次（先忘了边框、又把 `x=2` 当成边框、
         // 最后把一个乘法算错），而缓冲布局本身是想验证的东西，不该由手工算术来核对。
         let at = |x: usize, y: usize| -> u32 { buffer[y * doubled.0 as usize + x] };
-        for row in 0..3usize {
-            for col in 0..4usize {
-                let expected = image[row * 4 + col];
-                for dy in 0..2usize {
-                    for dx in 0..2usize {
-                        let (x, y) = (1 + 2 * col + dx, 1 + 2 * row + dy);
-                        assert_eq!(
-                            at(x, y),
-                            expected,
-                            "客户端 ({x},{y}) 应当是图像 ({col},{row}) 的 {}",
-                            format_args!("{expected:08X}")
-                        );
-                    }
+        // 判据是"和最近邻会画成的样子哪里不同"：2× 时最近邻把每个源像素铺成 2x2 的方块，
+        // 重采样则应当在大多数格子上给出别的值。这比"数插值出来的中间值"稳——插出来的值
+        // 偶尔正好等于某个源值（斜坡上很常见），"和最近邻不同"没有这种巧合。
+        let mut differs = 0usize;
+        for y in 0..6usize {
+            for x in 0..8usize {
+                if at(x + 1, y + 1) != image[(y / 2) * 4 + x / 2] {
+                    differs += 1;
                 }
+            }
+        }
+        assert!(
+            differs >= 40,
+            "48 个内容像素里只有 {differs} 个不同于最近邻的结果——说明放大又退回成\
+             最近邻（每个源像素铺成一个方块）"
+        );
+        // 原图是递增的斜坡，插值不会让它回头。
+        for y in 1..7usize {
+            for x in 1..8usize {
+                assert!(
+                    at(x, y) <= at(x + 1, y),
+                    "第 {y} 行第 {x} 列：插值把递增的斜坡弄回头了"
+                );
             }
         }
         // 外面一圈必须是边框：内容区正好是 x=1..8、y=1..6。
@@ -2543,6 +3497,795 @@ mod tests {
                     image[row * image_width as usize + column],
                     "({column},{row}) 回到 1.0 倍时应当与原图逐像素相同"
                 );
+            }
+        }
+    }
+
+    /// 抽头表的两条硬约束：权重和**恰好**是 `WEIGHT_ONE`，源下标全在范围内。
+    ///
+    /// 这是重采样里唯一一处能悄悄错掉的地方——差一个定点单位，平坦颜色上就出现一道
+    /// 亮边；源下标越界则直接是 `image[...]` panic。两个方向都从 1 试到几百，为的是把
+    /// 恒等轴、放大、缩小、以及"目标比源多一个像素"这种边界全扫一遍。
+    #[test]
+    fn every_destination_pixel_gets_normalized_taps_inside_the_source() {
+        for source in [1usize, 2, 3, 7, 64, 600] {
+            for destination in [1usize, 2, 3, 8, 64, 599, 600, 601, 4000] {
+                let plan = plan_axis(source, destination);
+                assert_eq!(plan.starts.len(), destination + 1);
+                for index in 0..destination {
+                    let taps = plan.taps_for(index);
+                    assert!(
+                        !taps.is_empty(),
+                        "{source}→{destination} 的第 {index} 个像素一个抽头都没有"
+                    );
+                    let sum: u64 = taps.iter().map(|(_, weight)| u64::from(*weight)).sum();
+                    assert_eq!(
+                        sum,
+                        u64::from(WEIGHT_ONE),
+                        "{source}→{destination} 的第 {index} 个像素权重和是 {sum}"
+                    );
+                    for (source_index, _) in taps {
+                        assert!(
+                            (*source_index as usize) < source,
+                            "{source}→{destination} 取到了范围外的源下标 {source_index}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// 平坦颜色经过任何缩放都应当**逐像素**保持原色。
+    ///
+    /// 这是重采样最容易被破坏的那条不变量：权重和不为 1 会让画面整体偏亮或偏暗，边缘
+    /// 抽头被夹取后没有重新归一化则会让四边出现一圈暗边。两者都是"看着差不多、量起来
+    /// 差一截"，只有逐像素断言抓得住。
+    #[test]
+    fn a_flat_colour_survives_every_zoom_exactly() {
+        let colour = 0xFF_3C_78_A0u32;
+        let (image_width, image_height) = (600u32, 600u32);
+        let image = vec![colour; (image_width * image_height) as usize];
+        let border = 1;
+        // 控件压在图像区右上角，它下面那一带不参与"等于原色"的断言。
+        let badge_bottom = border as usize
+            + scale_dip(BADGE_FONT_DIP, TEST_DPI) as usize
+            + scale_dip(BADGE_PAD_V_DIP, TEST_DPI) as usize * 2
+            + scale_dip(BADGE_INSET_DIP, TEST_DPI) as usize
+            + 1;
+
+        for zoom in [ZOOM_MIN, 0.37, 1.0, 2.0] {
+            let size = window_size(image_width, image_height, zoom, border);
+            let mut buffer = vec![0u32; (size.0 * size.1) as usize];
+            paint_pin(
+                &mut buffer,
+                size,
+                border,
+                &image,
+                image_width,
+                image_height,
+                zoom,
+                TEST_DPI,
+            );
+            let target = (
+                scaled_dimension(f64::from(image_width), zoom) as usize,
+                scaled_dimension(f64::from(image_height), zoom) as usize,
+            );
+            assert!(
+                target.1 > badge_bottom + 8,
+                "{zoom}× 时图像区只有 {} 像素高，控件底下没剩下可查的行",
+                target.1
+            );
+            for row in badge_bottom..border as usize + target.1 {
+                for column in border as usize..border as usize + target.0 {
+                    assert_eq!(
+                        buffer[row * size.0 as usize + column],
+                        colour,
+                        "{zoom}× 时客户端 ({column},{row}) 不再是原色"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 缩小时必须**平均**掉被覆盖的源像素，不能挑一个代表。
+    ///
+    /// 高频棋盘格是最能分辨这两者的输入：取最近邻只会得到 0 或 255（棋盘格原样缩小，
+    /// 变成摩尔纹），重采样则得到中间灰。
+    #[test]
+    fn shrinking_averages_the_pixels_it_covers() {
+        let (image_width, image_height) = (16u32, 16u32);
+        let checkerboard: Vec<u32> = (0..image_width * image_height)
+            .map(|index| {
+                let (x, y) = (index % image_width, index / image_width);
+                let value = if (x + y) % 2 == 0 { 0 } else { 255 };
+                0xFF00_0000 | value
+            })
+            .collect();
+        let border = 1;
+        let zoom = 0.25;
+        let size = window_size(image_width, image_height, zoom, border);
+        let mut buffer = vec![0u32; (size.0 * size.1) as usize];
+        paint_pin(
+            &mut buffer,
+            size,
+            border,
+            &checkerboard,
+            image_width,
+            image_height,
+            zoom,
+            TEST_DPI,
+        );
+
+        let target = scaled_dimension(f64::from(image_width), zoom);
+        assert_eq!(target, 4);
+        for row in 0..target as usize {
+            for column in 0..target as usize {
+                let value = (buffer[(row + 1) * size.0 as usize + column + 1] & 0xFF) as i32;
+                assert!(
+                    value > 0 && value < 255,
+                    "({column},{row}) 是 {value}：端点值说明缩小时只挑了一个源像素而没平均"
+                );
+                assert!(
+                    (value - 128).abs() <= 24,
+                    "({column},{row}) 是 {value}，离棋盘格的均值 128 太远"
+                );
+            }
+        }
+    }
+
+    /// 掩码里必须出现 0 与 255 之外的值：只有两个值就说明文字是硬边（没有反锯齿），
+    /// 在 150% 缩放下看就是一圈锯齿。
+    #[test]
+    fn the_text_mask_has_intermediate_coverage() {
+        let mask = text_mask("1.9×", 96).expect("96 DPI 下应当能光栅化");
+        assert!(mask.width > 0 && mask.height > 0, "掩码是空的");
+        assert!(
+            mask.coverage.iter().any(|value| *value > 0 && *value < 255),
+            "掩码里只有 0 和 255：字体平滑被关掉了，文字边缘会是硬锯齿"
+        );
+        assert!(
+            mask.coverage.iter().any(|value| *value == 0),
+            "掩码里没有空白像素，多半是宽度量错了"
+        );
+        assert_eq!(
+            mask.coverage.len(),
+            mask.width as usize * mask.height as usize
+        );
+    }
+
+    /// 控件里的字必须是**覆盖层那颗的字**：放大镜的倍数标签走 `overlay_font::FAMILY`，
+    /// 贴图这边要到的必须同名。
+    ///
+    /// 这条不是重复上面那条：GDI 对不认识的族名不报错，它会静默替一个，所以"我填了那个名字"
+    /// 什么也证明不了——只有把 DC 里选中的族名读回来才算数。
+    #[test]
+    fn the_badge_is_drawn_in_the_overlay_typeface() {
+        let height = scale_dip(BADGE_FONT_DIP, TEST_DPI);
+        unsafe {
+            let screen_dc = GetDC(std::ptr::null_mut());
+            assert!(!screen_dc.is_null(), "取屏幕 DC 失败");
+            let memory_dc = CreateCompatibleDC(screen_dc);
+            assert!(!memory_dc.is_null(), "取内存 DC 失败");
+            let (font, previous) = select_badge_font(memory_dc, -height).expect("一个族都没要到");
+            assert_eq!(
+                face_name(memory_dc).as_deref(),
+                Some(snapclip_capture::overlay_font::FAMILY),
+                "贴图的倍数控件与放大镜那颗不是同一个字体族"
+            );
+            SelectObject(memory_dc, previous);
+            DeleteObject(font.into());
+            DeleteDC(memory_dc);
+            ReleaseDC(std::ptr::null_mut(), screen_dc);
+        }
+    }
+
+    /// 让上一条的断言有意义：族名对不上时，读回来必须**不是**那个名字。
+    ///
+    /// 没有这条，`select_badge_font` 的校验退化成恒真判断（比如 `GetTextFaceW` 传错参数、
+    /// 或拿请求名当结果名比）也照样能让上一条过。
+    #[test]
+    fn a_family_gdi_does_not_have_does_not_read_back() {
+        let height = scale_dip(BADGE_FONT_DIP, TEST_DPI);
+        unsafe {
+            let screen_dc = GetDC(std::ptr::null_mut());
+            let memory_dc = CreateCompatibleDC(screen_dc);
+            let font = create_badge_face(-height, "SnapClip No Such Font");
+            assert!(!font.is_null(), "CreateFontW 连替身都不给");
+            let previous = SelectObject(memory_dc, font.into());
+            assert_ne!(
+                face_name(memory_dc).as_deref(),
+                Some("SnapClip No Such Font"),
+                "GDI 声称有一颗不存在的字体：读回校验这条路本身失灵了"
+            );
+            SelectObject(memory_dc, previous);
+            DeleteObject(font.into());
+            DeleteDC(memory_dc);
+            ReleaseDC(std::ptr::null_mut(), screen_dc);
+        }
+    }
+
+    /// 并行混合的两个端点必须**精确**：权重全在一边时不该有任何舍入，否则平坦颜色的边缘
+    /// 会挂上一圈色偏。
+    #[test]
+    fn the_packed_blend_hits_both_ends_and_keeps_flat_colours() {
+        let first = 0x1234_5678u32;
+        let second = 0x9ABC_DEF0u32;
+        assert_eq!(blend_pixels(first, second, 0), first);
+        assert_eq!(blend_pixels(first, second, BLEND_ONE), second);
+        for weight in (0..=BLEND_ONE).step_by(7) {
+            assert_eq!(
+                blend_pixels(second, second, weight),
+                second,
+                "权重 {weight} 上的同色混合"
+            );
+        }
+    }
+
+    /// 快路与通用路必须给出同一个结果。
+    ///
+    /// 两条轴都是两个抽头时走 `resample_magnified`：它先把四通道塞进一个 32 位字并行混合，
+    /// 而且两次一维混合之间多舍入一次，所以允许差**两个**色阶（9 位权重 0.5 + 中间舍入
+    /// 0.5）。再多就说明并行混合的通道串味了——掩码写错或权重越界时画面只是"有点脏"，
+    /// 不会明显报错，这条断言是唯一能从数字上看出来的地方。
+    #[test]
+    fn the_packed_blend_agrees_with_the_general_one() {
+        let (source_width, source_height) = (9usize, 7usize);
+        let image: Vec<u32> = (0..source_width * source_height)
+            .map(|index| {
+                let red = (index * 37 % 256) as u32;
+                let green = (index * 91 % 256) as u32;
+                let blue = (index * 143 % 256) as u32;
+                0xFF00_0000 | (red << 16) | (green << 8) | blue
+            })
+            .collect();
+        let (target_width, target_height) = (23usize, 19usize);
+        let x_plan = plan_axis(source_width, target_width);
+        let y_plan = plan_axis(source_height, target_height);
+        assert!(
+            two_tap_plan(&x_plan) && two_tap_plan(&y_plan),
+            "这条用例的前提是放大"
+        );
+
+        // 三种目标矩形都要试：高比宽大、宽比高大、以及只剩一行一列的两端。
+        for (width, height) in [(23usize, 19usize), (23, 1), (1, 19), (7, 5)] {
+            let mut fast = vec![0u32; width * height];
+            let mut general = vec![0u32; width * height];
+            resample_magnified(
+                &mut fast,
+                width,
+                0,
+                0,
+                &image,
+                source_width,
+                (width, height),
+                &x_plan,
+                &y_plan,
+            );
+            resample_filtered(
+                &mut general,
+                width,
+                0,
+                0,
+                &image,
+                (source_width, source_height),
+                (width, height),
+                &x_plan,
+                &y_plan,
+            );
+            for (index, (one, other)) in fast.iter().zip(general.iter()).enumerate() {
+                for channel in 0..4 {
+                    let left = (one >> (channel * 8)) & 0xFF;
+                    let right = (other >> (channel * 8)) & 0xFF;
+                    assert!(
+                        left.abs_diff(right) <= 2,
+                        "{width}x{height} 的第 {index} 个像素第 {channel} 通道：\
+                         {left:02X} 对 {right:02X}",
+                    );
+                }
+            }
+        }
+    }
+
+    /// 分段并行必须和串行画出**一模一样**的东西。
+    ///
+    /// 分段把"整幅目标里的行号"和"这一段缓冲里的行号"拆成了两个量，混用不会报错，只会让画面
+    /// 在某一档缩放上错几行——所以这条断言比它看起来重要。`resample_image` 会真的开线程，
+    /// `resample_band` 是单段那一条路。
+    #[test]
+    fn the_parallel_resample_matches_the_serial_one() {
+        let (source_width, source_height) = (17usize, 40usize);
+        let image: Vec<u32> = (0..source_width * source_height)
+            .map(|index| 0xFF00_0000 | (index as u32).wrapping_mul(2_654_435_761).rotate_right(11))
+            .collect();
+
+        // 三种缩放分别走三条路：缩小是通用循环、1× 是整行复制、放大是并行混合。
+        for zoom in [0.5, 1.0, 3.0] {
+            let target_width = scaled_dimension(source_width as f64, zoom) as usize;
+            let target_height = scaled_dimension(source_height as f64, zoom) as usize;
+            let x_plan = plan_axis(source_width, target_width);
+            let y_plan = plan_axis(source_height, target_height);
+            let (pitch, drawn) = (target_width + 2, (target_width, target_height));
+            assert!(drawn.1 >= 16, "这条用例要真的走到并行那一段");
+
+            let mut parallel = vec![7u32; pitch * (drawn.1 + 2)];
+            let mut serial = vec![7u32; pitch * (drawn.1 + 2)];
+            resample_image(
+                &mut parallel,
+                pitch,
+                (1, 1),
+                &image,
+                (source_width, source_height),
+                drawn,
+                &x_plan,
+                &y_plan,
+            );
+            let rows = pitch..pitch + drawn.1 * pitch;
+            resample_band(
+                &mut serial[rows],
+                pitch,
+                1,
+                0,
+                &image,
+                (source_width, source_height),
+                drawn,
+                &x_plan,
+                &y_plan,
+            );
+            assert!(
+                parallel == serial,
+                "zoom={zoom}：分段并行和串行画出来的不是同一块缓冲"
+            );
+        }
+    }
+
+    /// 边框只铺在图像区**之外**：图像那几块必须一个像素都没被碰过。
+    #[test]
+    fn the_border_never_touches_the_image_area() {
+        let (width, height) = (12usize, 9usize);
+        let (border, image) = (2usize, (6usize, 4usize));
+        let mut buffer = vec![0u32; width * height];
+        fill_border(&mut buffer, (width, height), border, image);
+
+        for row in 0..height {
+            for column in 0..width {
+                let inside = (border..border + image.0).contains(&column)
+                    && (border..border + image.1).contains(&row);
+                let pixel = buffer[row * width + column];
+                assert_eq!(
+                    pixel == BORDER_COLOR,
+                    !inside,
+                    "({column}, {row}) 在图像区里={inside}，像素 {pixel:08X}",
+                );
+            }
+        }
+    }
+
+    /// 旧画法（最近邻）的参考实现，只为在同一个基准里给出"改重采样贵了多少"。
+    ///
+    /// 这段代码**不在产品路径上**，它存在的理由是让 `paint_pin_cost_at_several_zooms` 能
+    /// 报出一对数字。上一版的实现已经被删掉（它画的每个源像素都是一个方块），没有它就没
+    /// 法回答"这次改画质是不是把缩放拖慢了"。
+    fn nearest_reference(
+        buffer: &mut [u32],
+        size: (i32, i32),
+        border: i32,
+        image: &[u32],
+        image_width: u32,
+        image_height: u32,
+        zoom: f64,
+    ) {
+        let width = size.0 as usize;
+        let border = border as usize;
+        let target_width = scaled_dimension(f64::from(image_width), zoom).max(0) as usize;
+        let target_height = scaled_dimension(f64::from(image_height), zoom).max(0) as usize;
+        let factor_x = target_width as f64 / f64::from(image_width);
+        let factor_y = target_height as f64 / f64::from(image_height);
+        for row in 0..target_height {
+            let source_row = (row as f64 / factor_y) as usize * image_width as usize;
+            for column in 0..target_width {
+                let source_x = (column as f64 / factor_x) as usize;
+                buffer[(border + row) * width + border + column] = image[source_row + source_x];
+            }
+        }
+    }
+
+    /// 量一次重采样的成本，不断言什么。
+    ///
+    /// 跑法：`cargo test --release -p snapclip-app --lib paint_pin_cost -- --ignored --nocapture`
+    ///
+    /// 数字随机器变，只作量级判断。留在这里是因为"缩放卡不卡"最终只取决于这个函数：
+    /// 缓冲大小按倍数的**平方**涨（1405x1137 放到 5.6× 就是 7872x6371），抽头数按缩小
+    /// 倍数涨，两头的成本都不在别处。上一版的最近邻没有这个量，改重采样之后必须有。
+    #[test]
+    #[ignore = "测量而不是断言；用 --ignored --nocapture 手动跑"]
+    fn paint_pin_cost_at_several_zooms() {
+        let (image_width, image_height) = (1405u32, 1137u32);
+        let image: Vec<u32> = (0..image_width * image_height)
+            .map(|index| 0xFF00_0000 | (index & 0xFF))
+            .collect();
+        let border = 1;
+        for zoom in [0.1, 0.5, 1.0, 2.0, 5.6] {
+            let size = window_size(image_width, image_height, zoom, border);
+            let mut buffer = vec![0u32; (size.0 * size.1) as usize];
+            let started = std::time::Instant::now();
+            paint_pin(
+                &mut buffer,
+                size,
+                border,
+                &image,
+                image_width,
+                image_height,
+                zoom,
+                TEST_DPI,
+            );
+            let seconds = started.elapsed().as_secs_f64();
+            let megapixels = f64::from(size.0) * f64::from(size.1) / 1.0e6;
+
+            let started = std::time::Instant::now();
+            nearest_reference(
+                &mut buffer,
+                size,
+                border,
+                &image,
+                image_width,
+                image_height,
+                zoom,
+            );
+            let nearest = started.elapsed().as_secs_f64();
+
+            println!(
+                "paint_pin zoom={zoom:.3} buffer={}x{} ({megapixels:.1} Mpx) \
+                 重采样 {:.1} ms ({:.1} Mpx/s)，最近邻 {:.1} ms，倍数 {:.2}×",
+                size.0,
+                size.1,
+                seconds * 1000.0,
+                megapixels / seconds,
+                nearest * 1000.0,
+                seconds / nearest,
+            );
+        }
+    }
+
+    /// 对比用的合成图案：96x56，把贴图放大时最容易露馅的几样东西摆在一块。
+    ///
+    /// 上排是**真实字形**——直接借控件那一套白底黑字的覆盖率掩码（`text_mask`），所以这里
+    /// 看到的抗锯齿与控件上那颗字一模一样；中排是 1 像素竖条纹、45° 斜线、圆轮廓；
+    /// 下排是一条 1 像素横线加一条渐变。这五样分别对应"核会不会把它抹平""阶梯有多硬"
+    /// "曲线会不会起波纹""边界像素落在哪半边"。
+    fn filter_comparison_pattern() -> (usize, usize, Vec<u32>) {
+        const WIDTH: usize = 96;
+        const HEIGHT: usize = 56;
+        const INK: u32 = 0xFF20_2020;
+        const PAPER: u32 = 0xFFF0_F0F0;
+        let mut image = vec![PAPER; WIDTH * HEIGHT];
+        let mut put = |x: i64, y: i64, color: u32| {
+            if x >= 0 && y >= 0 && (x as usize) < WIDTH && (y as usize) < HEIGHT {
+                image[y as usize * WIDTH + x as usize] = color;
+            }
+        };
+
+        if let Some(mask) = text_mask("5.6×", 96) {
+            for row in 0..mask.height {
+                for column in 0..mask.width {
+                    let coverage = u32::from(mask.coverage[(row * mask.width + column) as usize]);
+                    if coverage == 0 {
+                        continue;
+                    }
+                    // 掩码是覆盖率：这里把它染成"黑字压在浅底上"，和控件里那次混色同源。
+                    let value = (0x20 * coverage + 0xF0 * (255 - coverage)) / 255;
+                    put(
+                        2 + i64::from(column),
+                        2 + i64::from(row),
+                        0xFF00_0000 | (value << 16) | (value << 8) | value,
+                    );
+                }
+            }
+        }
+
+        for y in 18..40 {
+            for x in 0..30 {
+                put(x, y, if x % 2 == 0 { INK } else { PAPER });
+            }
+        }
+        for step in 0..20 {
+            put(34 + step, 18 + step, INK);
+        }
+        for degree in 0..3600 {
+            let angle = std::f64::consts::TAU * f64::from(degree) / 3600.0;
+            put(
+                (78.0 + 11.0 * angle.cos()).round() as i64,
+                (29.0 + 11.0 * angle.sin()).round() as i64,
+                INK,
+            );
+        }
+        for x in 0..WIDTH {
+            put(x as i64, 42, INK);
+        }
+        for x in 0..WIDTH {
+            let value = (x * 255 / (WIDTH - 1)) as u32;
+            for y in 44..HEIGHT {
+                put(x as i64, y as i64, 0xFF00_0000 | (value << 16) | (value << 8) | value);
+            }
+        }
+        (WIDTH, HEIGHT, image)
+    }
+
+    fn nearest_kernel(offset: f64) -> f64 {
+        if offset.abs() < 0.5 { 1.0 } else { 0.0 }
+    }
+
+    fn triangle_kernel(offset: f64) -> f64 {
+        (1.0 - offset.abs()).max(0.0)
+    }
+
+    /// Mitchell–Netravali 三次核（`B = C = 1/3`）。峰值是 0.888 而不是 1，无所谓——权重
+    /// 逐目标像素归一化。它在 1.5 附近有一个约 -0.056 的负瓣，也就是"振铃"的来源，
+    /// 而负瓣正是生产那套 `u32` 定点权重装不下的东西（见 [`reference_resample`]）。
+    fn mitchell_kernel(offset: f64) -> f64 {
+        const B: f64 = 1.0 / 3.0;
+        const C: f64 = 1.0 / 3.0;
+        let x = offset.abs();
+        if x < 1.0 {
+            ((12.0 - 9.0 * B - 6.0 * C) * x * x * x + (-18.0 + 12.0 * B + 6.0 * C) * x * x
+                + (6.0 - 2.0 * B))
+                / 6.0
+        } else if x < 2.0 {
+            ((-B - 6.0 * C) * x * x * x
+                + (6.0 * B + 30.0 * C) * x * x
+                + (-12.0 * B - 48.0 * C) * x
+                + (8.0 * B + 24.0 * C))
+                / 6.0
+        } else {
+            0.0
+        }
+    }
+
+    /// Lanczos-3。最锐，负瓣也最深（约 -0.07），高对比边缘上的振铃最明显。
+    fn lanczos3_kernel(offset: f64) -> f64 {
+        fn sinc(t: f64) -> f64 {
+            if t == 0.0 {
+                1.0
+            } else {
+                let pi_t = std::f64::consts::PI * t;
+                pi_t.sin() / pi_t
+            }
+        }
+        let x = offset.abs();
+        if x >= 3.0 { 0.0 } else { sinc(x) * sinc(x / 3.0) }
+    }
+
+    /// 参考重采样：与生产**同一套几何**，但权重是 `f64`。
+    ///
+    /// 用浮点不是为了替换生产实现，而是为了让 Mitchell 与 Lanczos3 能参与比较：它们都有
+    /// 负瓣，而生产的权重是 `u32` 定点数、装不下负值。几何必须逐条对齐 [`plan_axis`]，
+    /// 否则比较的是两个变量而不是两个核：中心对齐（`(d + 0.5) * scale - 0.5`）、缩小时
+    /// 按 `scale` 把核撑开、逐目标像素归一化。`the_reference_resampler_agrees_with_production`
+    /// 就是钉住"逐条对齐"的那条断言。
+    fn reference_resample(
+        image: &[u32],
+        width: usize,
+        height: usize,
+        zoom: f64,
+        support: f64,
+        kernel: fn(f64) -> f64,
+    ) -> (usize, usize, Vec<u32>) {
+        let target_width = scaled_dimension(width as f64, zoom) as usize;
+        let target_height = scaled_dimension(height as f64, zoom) as usize;
+        let axis = |source_length: usize, target_length: usize| {
+            let scale = source_length as f64 / target_length as f64;
+            let filter_scale = scale.max(1.0);
+            let radius = support * filter_scale;
+            (0..target_length)
+                .map(|destination| {
+                    let center = (destination as f64 + 0.5) * scale - 0.5;
+                    let first = (center - radius).ceil() as i64;
+                    let last = (center + radius).floor() as i64;
+                    let mut taps: Vec<(usize, f64)> = Vec::new();
+                    let mut sum = 0.0;
+                    for source in first.max(0)..=last.min(source_length as i64 - 1) {
+                        let weight = kernel((source as f64 - center) / filter_scale);
+                        if weight == 0.0 {
+                            continue;
+                        }
+                        sum += weight;
+                        taps.push((source as usize, weight));
+                    }
+                    if taps.is_empty() || sum == 0.0 {
+                        let nearest =
+                            center.round().clamp(0.0, (source_length - 1) as f64) as usize;
+                        taps.push((nearest, 1.0));
+                    } else {
+                        for tap in &mut taps {
+                            tap.1 /= sum;
+                        }
+                    }
+                    taps
+                })
+                .collect::<Vec<_>>()
+        };
+        let x_taps = axis(width, target_width);
+        let y_taps = axis(height, target_height);
+
+        let mut out = vec![0u32; target_width * target_height];
+        for (row, row_taps) in y_taps.iter().enumerate() {
+            for (column, column_taps) in x_taps.iter().enumerate() {
+                let mut channels = [0.0f64; 4];
+                for &(source_y, weight_y) in row_taps {
+                    for &(source_x, weight_x) in column_taps {
+                        let weight = weight_x * weight_y;
+                        let pixel = image[source_y * width + source_x];
+                        for (channel, sum) in channels.iter_mut().enumerate() {
+                            *sum += f64::from((pixel >> (channel * 8)) & 0xFF) * weight;
+                        }
+                    }
+                }
+                let mut pixel = 0xFF00_0000u32;
+                for (channel, sum) in channels.iter().enumerate() {
+                    pixel |= (sum.round().clamp(0.0, 255.0) as u32) << (channel * 8);
+                }
+                out[row * target_width + column] = pixel;
+            }
+        }
+        (target_width, target_height, out)
+    }
+
+    /// 把一张 `u32` BGRA 缓冲写成 PNG。测试专用，不走生产那条编码路径。
+    fn write_comparison_png(path: &std::path::Path, width: usize, height: usize, pixels: &[u32]) {
+        let mut rgba = Vec::with_capacity(width * height * 4);
+        for pixel in pixels {
+            rgba.extend_from_slice(&[
+                (pixel >> 16) as u8,
+                (pixel >> 8) as u8,
+                *pixel as u8,
+                0xFF,
+            ]);
+        }
+        let file = std::fs::File::create(path).expect("建 PNG 文件");
+        let mut encoder =
+            png::Encoder::new(std::io::BufWriter::new(file), width as u32, height as u32);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder
+            .write_header()
+            .expect("写 PNG 头")
+            .write_image_data(&rgba)
+            .expect("写 PNG 数据");
+    }
+
+    /// 放大滤波器对比：同一张合成图案，用四种核各放大一遍，叠成一张 PNG。
+    ///
+    /// 跑法：`cargo test --release -p snapclip-app --lib filter_comparison -- --ignored --nocapture`
+    ///
+    /// 图落在 `target/filter-compare/`，**从上到下**是 nearest / triangle / mitchell /
+    /// lanczos3 四条带子；最上面那条是"不滤波"的基线，另外三条都在跟它比"软化与阶梯的
+    /// 取舍"。之所以留一个只出图、不断言的测试：贴图放大该用哪个重建核只能靠眼睛回答，
+    /// 而回答过的那张图应该能被重新生成——`docs/34` §4.2.3 的结论就挂在它上面。
+    #[test]
+    #[ignore = "出图而不是断言；用 --ignored --nocapture 手动跑"]
+    fn filter_comparison_sheets() {
+        let (width, height, image) = filter_comparison_pattern();
+        let filters: [(&str, f64, fn(f64) -> f64); 4] = [
+            ("nearest", 0.5, nearest_kernel),
+            ("triangle", 1.0, triangle_kernel),
+            ("mitchell", 2.0, mitchell_kernel),
+            ("lanczos3", 3.0, lanczos3_kernel),
+        ];
+        let directory = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../target/filter-compare"
+        ));
+        std::fs::create_dir_all(directory).expect("建对比图目录");
+
+        for zoom in [2.0f64, 4.0] {
+            let gap = 4usize;
+            let mut bands = Vec::new();
+            for (name, support, kernel) in filters {
+                let started = std::time::Instant::now();
+                let patch = reference_resample(&image, width, height, zoom, support, kernel);
+                let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+                let megapixels = (patch.0 * patch.1) as f64 / 1_000_000.0;
+                println!(
+                    "zoom={zoom:.1} {name:<9} {}x{} 用时 {elapsed_ms:.1} ms（每 Mpx {:.1} ms）",
+                    patch.0,
+                    patch.1,
+                    elapsed_ms / megapixels,
+                );
+                bands.push(patch);
+            }
+
+            let sheet_width = bands[0].0;
+            let sheet_height =
+                bands.iter().map(|band| band.1).sum::<usize>() + gap * (bands.len() - 1);
+            let mut sheet = vec![0xFF80_8080u32; sheet_width * sheet_height];
+            let mut row_offset = 0usize;
+            for (band_width, band_height, band) in &bands {
+                for row in 0..*band_height {
+                    let destination = (row_offset + row) * sheet_width;
+                    sheet[destination..destination + *band_width]
+                        .copy_from_slice(&band[row * *band_width..(row + 1) * *band_width]);
+                }
+                row_offset += band_height + gap;
+            }
+            let path = directory.join(format!("zoom-{zoom:.1}.png"));
+            write_comparison_png(&path, sheet_width, sheet_height, &sheet);
+            println!(
+                "{}（{sheet_width}x{sheet_height}，从上到下：nearest / triangle / mitchell / lanczos3）",
+                path.display()
+            );
+        }
+    }
+
+    /// 参考重采样与生产实现必须给出同一个像素，差不超过 1（定点与浮点的舍入）。
+    ///
+    /// 钉住这一条，`filter_comparison_sheets` 那张图才是**关于生产实现**的证据：图里
+    /// triangle 那一带与 `paint_pin` 画出来的是同一张。
+    #[test]
+    fn the_reference_resampler_agrees_with_production() {
+        let (image_width, image_height) = (64u32, 48u32);
+        let image = image_of(image_width, image_height);
+        for zoom in [1.7, 2.0, 3.3] {
+            let border = 1;
+            let size = window_size(image_width, image_height, zoom, border);
+            let mut buffer = vec![0u32; (size.0 * size.1) as usize];
+            paint_pin(
+                &mut buffer,
+                size,
+                border,
+                &image,
+                image_width,
+                image_height,
+                zoom,
+                TEST_DPI,
+            );
+            let (patch_width, patch_height, patch) = reference_resample(
+                &image,
+                image_width as usize,
+                image_height as usize,
+                zoom,
+                1.0,
+                triangle_kernel,
+            );
+            assert_eq!(
+                (patch_width, patch_height),
+                (
+                    scaled_dimension(f64::from(image_width), zoom) as usize,
+                    scaled_dimension(f64::from(image_height), zoom) as usize,
+                )
+            );
+            // 控件最后画、画在图像之上，所以"整幅图像逐像素"的对比必须把它那一块让出去——
+            // 矩形是问 `badge_placement` 要的，不是估出来的。
+            let badge = badge_placement(image_width, image_height, zoom, border, TEST_DPI)
+                .map(|(_, rect)| rect);
+            let mut compared = 0usize;
+            let mut skipped = 0usize;
+            for row in 0..patch_height {
+                for column in 0..patch_width {
+                    let x = border + column as i32;
+                    let y = border + row as i32;
+                    if badge.is_some_and(|(left, top, width, height)| {
+                        left <= x && x < left + width && top <= y && y < top + height
+                    }) {
+                        skipped += 1;
+                        continue;
+                    }
+                    compared += 1;
+                    let produced = buffer[y as usize * size.0 as usize + x as usize];
+                    let expected = patch[row * patch_width + column];
+                    for channel in 0..4 {
+                        let shift = channel * 8;
+                        let a = (produced >> shift) & 0xFF;
+                        let b = (expected >> shift) & 0xFF;
+                        assert!(
+                            a.abs_diff(b) <= 1,
+                            "zoom={zoom} ({column},{row}) 通道 {channel}：生产 {a} 参考 {b}"
+                        );
+                    }
+                }
+            }
+            assert!(compared > 0, "zoom={zoom} 一个像素都没比到");
+            assert_eq!(compared + skipped, patch_width * patch_height);
+            if badge.is_some() {
+                assert!(skipped > 0, "zoom={zoom} 控件压在图像上，应当让出过像素");
             }
         }
     }
@@ -2594,39 +4337,132 @@ mod tests {
     }
 
     #[test]
-    fn border_is_at_least_one_pixel() {
-        assert!(border_px() >= 1);
+    fn border_is_one_dip_rounded_with_a_floor_of_one_pixel() {
+        // 1 DIP 折成像素：100% 是 1、150% 是 1.5 → 2、200% 是 2。
+        assert_eq!(border_px(96), 1);
+        assert_eq!(border_px(144), 2);
+        assert_eq!(border_px(192), 2);
+        // 低于 100% 的 DPI 会折出 0.5 及以下，但边框永远至少 1 像素：0 宽的边框等于
+        // 图像直接糊到窗口边缘，那圈"贴图与底下的窗口分开"的标记就没了。
+        assert_eq!(border_px(48), 1);
+        assert!(border_px(0) >= 1);
     }
 
     /// 控件上的字是这个功能的**唯一可见证据**：倍数只在那个小标里。
+    ///
+    /// 格式规则与放大镜那颗一字不差（`magnifier_pass.rs`），对应用户的原话
+    /// "文本格式和放大镜框的保持一致，使用 ×"。
     #[test]
-    fn the_badge_spells_the_zoom_as_a_percentage() {
-        assert_eq!(badge_label(1.0), "100%");
-        assert_eq!(badge_label(0.1), "10%");
-        assert_eq!(badge_label(10.0), "1000%");
-        assert_eq!(badge_label(1.5), "150%");
-        // 步长 0.1 意味着小数点后一位永远够用，四舍五入到整数不丢档。
-        assert_eq!(badge_label(2.55), "255%");
-        // 倍数是脏值时不显示脏值，显示钳过之后的。
-        assert_eq!(badge_label(f64::NAN), "100%");
-        assert_eq!(badge_label(99.0), "1000%");
+    fn the_badge_spells_the_zoom_the_way_the_magnifier_does() {
+        // 整档不写小数。
+        assert_eq!(badge_label(1.0), "1×");
+        assert_eq!(badge_label(2.0), "2×");
+        assert_eq!(badge_label(10.0), "10×");
+        // 半档写一位。
+        assert_eq!(badge_label(0.5), "0.5×");
+        assert_eq!(badge_label(1.9), "1.9×");
+        assert_eq!(badge_label(0.1), "0.1×");
+        // 步长 0.1，所以一位小数永远够用；脏值显示钳过之后的。
+        assert_eq!(badge_label(f64::NAN), "1×");
+        assert_eq!(badge_label(99.0), "10×");
+        // `0` 与负数不是"很小的倍数"，是"这不是一个倍数"，归到下限。
+        assert_eq!(badge_label(0.0), "0.1×");
     }
 
-    /// 圆角：四角切掉，正中和四条边的中点都留着。
+    /// 圆角：四角切掉、正中和四条边的中点都留着；**而且边缘是渐变的**。
+    ///
+    /// 旧实现（`inside_rounded`）返回的是一个布尔值，于是圆角那段圆弧只能落在整像素上，
+    /// 弧线必然是一格一格的——这就是用户报的"倍数控件也有锯齿"。所以这个测试除了验证
+    /// 形状，还必须验证"存在既不是全透明也不是全实心的像素"，否则它测不出抗锯齿。
     #[test]
-    fn rounding_cuts_only_the_corners() {
-        let (width, height, radius) = (20, 16, 6);
-        for (x, y) in [(0, 0), (19, 0), (0, 15), (19, 15), (1, 1), (18, 14)] {
-            assert!(
-                !inside_rounded(x, y, width, height, radius),
-                "({x},{y}) 是圆角该切掉的那块"
-            );
+    fn rounding_feathers_the_edge_instead_of_switching_it_on_and_off() {
+        let (width, height, radius) = (20.0f32, 16.0f32, 6.0f32);
+        let coverage_at = |x: f32, y: f32| edge_coverage(rounded_distance(x, y, width, height, radius));
+        // 四角外那一块：距离为正，完全透明。
+        for (x, y) in [(0.5, 0.5), (19.5, 0.5), (0.5, 15.5), (19.5, 15.5)] {
+            assert_eq!(coverage_at(x, y), 0, "({x},{y}) 是圆角该切掉的那块");
         }
-        for (x, y) in [(10, 8), (0, 8), (19, 8), (10, 0), (10, 15), (5, 5)] {
-            assert!(inside_rounded(x, y, width, height, radius), "({x},{y}) 该留着");
+        // 正中与四条边的中点：距离够负，完全实心，值逐位等于底色。
+        for (x, y) in [
+            (10.0, 8.0),
+            (0.5, 8.0),
+            (19.5, 8.0),
+            (10.0, 0.5),
+            (10.0, 15.5),
+        ] {
+            assert_eq!(coverage_at(x, y), 255, "({x},{y}) 该实心");
         }
-        // 半径被夹到边长以内：2 的半径放到 4x4 上，连 (0,0) 都在内。
-        assert!(inside_rounded(0, 0, 4, 4, 0));
+        // 压在边界上正好一半；1 像素的斜坡就是覆盖率从 0 线性走到 255。
+        assert_eq!(edge_coverage(0.0), 128);
+        assert_eq!(edge_coverage(-0.5), 255);
+        assert_eq!(edge_coverage(0.5), 0);
+        assert_eq!(edge_coverage(-9.0), 255);
+        assert_eq!(edge_coverage(9.0), 0);
+
+        // 圆角弧线上必须有过渡像素——二值遮罩下这个计数恒为 0。
+        let mut feathered = 0;
+        for row in 0..height as i32 {
+            for column in 0..width as i32 {
+                let coverage = coverage_at(column as f32 + 0.5, row as f32 + 0.5);
+                if coverage != 0 && coverage != 255 {
+                    feathered += 1;
+                }
+            }
+        }
+        assert!(feathered > 0, "圆角上应当有半透明的过渡像素");
+
+        // 半径为 0 就是方角：(0.5,0.5) 这个像素中心在 4x4 里面，距离为负。
+        assert!(rounded_distance(0.5, 0.5, 4.0, 4.0, 0.0) < 0.0);
+        // 半径被夹到半边长以内：给 99 等于给一条半径 8 的弧（16 高的一半），
+        // 角还是照切，只是不会算出负半径那种无意义的形状。
+        assert!(rounded_distance(0.5, 0.5, 20.0, 16.0, 99.0) > 0.0);
+        assert!(rounded_distance(2.0, 2.0, 4.0, 4.0, 99.0) < 0.0);
+    }
+
+    /// 控件四角的抗锯齿要真的落在**画出来的缓冲**里，而不只是那个覆盖率函数算得出来。
+    ///
+    /// 底下的图像用一整块纯色，于是控件边缘出现第三种颜色就只可能是"底色 × 图像"的
+    /// 混合。扫描范围只取控件左上角那一块 `radius × radius` 的方块：那里没有文字
+    /// （文字从 `pad_h`/`pad_v` 开始），所以不会把字形的抗锯齿误当成圆角的。
+    #[test]
+    fn the_badge_corner_is_feathered_against_the_image_it_covers() {
+        let (image_width, image_height) = (200u32, 100u32);
+        let border = 1;
+        let zoom = 3.0;
+        let size = window_size(image_width, image_height, zoom, border);
+        const FLAT: u32 = 0xFF00_8000;
+        let image = vec![FLAT; (image_width * image_height) as usize];
+        let mut buffer = vec![0u32; (size.0 * size.1) as usize];
+        paint_pin(
+            &mut buffer,
+            size,
+            border,
+            &image,
+            image_width,
+            image_height,
+            zoom,
+            TEST_DPI,
+        );
+
+        let style = BadgeStyle::new(TEST_DPI);
+        let (_, (badge_left, badge_top, _, _)) =
+            badge_placement(image_width, image_height, zoom, border, TEST_DPI)
+                .expect("这个尺寸下控件应当放得下");
+        let at = |x: i32, y: i32| buffer[y as usize * size.0 as usize + x as usize];
+
+        let mut cut = 0;
+        let mut blended = 0;
+        for row in 0..style.radius {
+            for column in 0..style.radius {
+                match at(badge_left + column, badge_top + row) {
+                    FLAT => cut += 1,
+                    BADGE_BG_COLOR => {}
+                    _ => blended += 1,
+                }
+            }
+        }
+        assert!(cut > 0, "圆角该把角上的像素让给底下的图像");
+        assert!(blended > 0, "圆角边缘应当有半透明的过渡像素");
     }
 
     /// 控件落在**图像区**的右上角，不碰窗口边框。
@@ -2650,14 +4486,10 @@ mod tests {
         );
 
         let at = |x: i32, y: i32| -> u32 { buffer[y as usize * size.0 as usize + x as usize] };
-        let style = BadgeStyle::new(TEST_DPI);
-        let mask = text_mask(&badge_label(zoom), TEST_DPI).expect("掩码应当能光栅化");
-        let badge_width = mask.text_width + style.pad_h * 2;
-        let badge_height = mask.height + style.pad_v * 2;
-        let right = border + scaled_dimension(f64::from(image_width), zoom);
-        let badge_right = right - style.inset;
-        let badge_left = badge_right - badge_width;
-        let badge_top = border + style.inset;
+        let (_, (badge_left, badge_top, badge_width, badge_height)) =
+            badge_placement(image_width, image_height, zoom, border, TEST_DPI)
+                .expect("这个尺寸下控件应当放得下");
+        let badge_right = badge_left + badge_width;
 
         // 控件里靠右下的一小片只可能是底色或文字色，两者都不等于那一带的原图像素。
         let mut rendered = 0;

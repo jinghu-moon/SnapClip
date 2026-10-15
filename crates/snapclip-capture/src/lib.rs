@@ -33,6 +33,9 @@ pub mod error;
 pub mod geometry;
 pub mod keymap;
 pub mod monitor_cache;
+// The overlay's typeface and its family stack: the one place both renderers (the D2D overlay and
+// the pin window) read the font family from.
+pub mod overlay_font;
 pub mod ports;
 pub mod preferences;
 pub mod ring_contrast;

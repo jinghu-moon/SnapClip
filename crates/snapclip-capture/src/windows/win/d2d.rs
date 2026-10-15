@@ -35,14 +35,13 @@ use ::windows::Win32::Graphics::Direct2D::{
 use ::windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use ::windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_ISOLATED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-    DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL,
+    DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_NORMAL,
     DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
     DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_METRICS,
     DWRITE_WORD_WRAPPING_NO_WRAP, DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat,
 };
 use ::windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use ::windows::Win32::Graphics::Dxgi::IDXGISwapChain1;
-use ::windows::Win32::Graphics::Gdi::AddFontMemResourceEx;
 use ::windows::core::{Interface, PCWSTR};
 use std::sync::Arc;
 use windows_numerics::Vector2;
@@ -52,8 +51,12 @@ use crate::annotation::{AnnotationGeometry, AnnotationItem, AnnotationKind};
 // The palette and the light-math live in one place: the paint layer and the A4 ring decision read
 // the same constants, so a re-measured mask or wash cannot leave the table describing a world that
 // is no longer painted (docs/21 §5.24.11).
-use crate::geometry::{Handle, LevelReach, MagnifierConfig, Point, Rect, SizeLabelPlacement};
+use crate::geometry::{
+    Handle, LabelWhere, LevelReach, MagnifierConfig, Point, Rect, SizeLabelPlacement,
+    magnifier_geometry,
+};
 use crate::keymap::LoupeHint;
+use crate::overlay_font;
 use crate::ring_contrast::{
     ACCENT_RGB, CAPTURE_RGB, CHAIN_RING_RGB, CHAIN_RING_SHADOW, HOVER_WASH_ALPHA, MASK_ALPHA,
     MASK_RGB, MASK_TINT_ALPHA, PREVIEW_WASH_ALPHA, PREVIEW_WASH_WALK_SCALE, Rgb, mix,
@@ -61,9 +64,10 @@ use crate::ring_contrast::{
 use crate::scroll::layout::Layout;
 pub(crate) use guide_pass::{GUIDE_AVOID_DIP, GuideView};
 
-/// The font family used for the size label, per the tasklist (§6.3).
-const LABEL_FONT_FAMILY: &str = "Segoe UI Variable Display";
-const LABEL_FONT_FALLBACK: &str = "Segoe UI";
+/// The font family used for the size label, per the tasklist (§6.3) — the same two families the
+/// overlay's typeface falls back to.
+const LABEL_FONT_FAMILY: &str = overlay_font::FALLBACKS[0];
+const LABEL_FONT_FALLBACK: &str = overlay_font::FALLBACKS[1];
 const LABEL_FONT_SIZE_DIP: f32 = 12.0;
 
 /// Stroke width of the selection border in DIP.
@@ -74,16 +78,6 @@ const HANDLE_SIZE_DIP: f32 = 12.0;
 /// Monospace family used for every numeric value in the magnifier info panel.
 const MONO_FONT_FAMILY: &str = "Consolas";
 const MONO_FONT_FALLBACK: &str = "Lucida Console";
-
-/// The overlay's typeface: a subsetted HarmonyOS Sans SC carrying exactly the characters the
-/// overlay can draw — every label, hint, guide row and key name, under any binding
-/// (`overlay_drawn_strings` in the tests, built by `subfont/subset.ps1`). Embedded verbatim and
-/// registered privately for this process at renderer start, so no system font install or admin
-/// rights are needed.
-const INFO_EMBEDDED_FONT: &[u8] = include_bytes!("../../../assets/harmonyos-sans-sc-subset.ttf");
-/// Family name the embedded subset registers under (its name table was reduced to
-/// this single English entry during subsetting).
-const INFO_FONT_FAMILY: &str = "HarmonyOS Sans SC";
 
 /// Info-panel layout, in DIP at 96 DPI (see `RenderMetrics::for_dpi` for the
 /// scaling rule — everything here is multiplied by the same factor).
@@ -152,11 +146,11 @@ impl RenderMetrics {
     /// Displayed text for a selection in virtual-desktop coordinates.
     pub fn label_text_at(selection: Rect, screen_origin: Point) -> String {
         format!(
-            "{},{} {}×{} px",
-            selection.left + screen_origin.x,
-            selection.top + screen_origin.y,
+            "{}×{} px  ({},{})",
             selection.width(),
-            selection.height()
+            selection.height(),
+            selection.left + screen_origin.x,
+            selection.top + screen_origin.y
         )
     }
 
@@ -203,6 +197,14 @@ pub struct RenderView {
     pub cursor_visible: bool,
     /// Whether L2 chrome (border/grips/label) should be drawn.
     pub show_chrome: bool,
+    /// Whether the selection is committed enough to show edit grips.
+    pub show_handles: bool,
+    /// Whether the live size/coordinate label is useful in this state.
+    pub show_size_label: bool,
+    /// Whether the screenshot loupe is active for this interaction state.
+    pub show_magnifier: bool,
+    /// A short-lived cue that arrow keys are moving the sampling cursor.
+    pub precision_feedback: bool,
     /// Work area used to keep the label and magnifier on screen.
     pub work_area: Rect,
     /// Current color sample as RGB tuple for the info-panel swatch.
@@ -283,6 +285,10 @@ impl RenderView {
             screen_origin: Point::default(),
             cursor_visible: false,
             show_chrome: false,
+            show_handles: true,
+            show_size_label: true,
+            show_magnifier: true,
+            precision_feedback: false,
             work_area: frame,
             magnifier_rgb: None,
             magnifier_color_text: None,
@@ -538,7 +544,7 @@ impl OverlayRenderer {
         // IDWriteFactory::ReloadSystemFonts, and a shared factory may have been
         // cached earlier by another subsystem, so an isolated factory is what
         // guarantees the private in-memory font resolves by family name.
-        register_info_font_once();
+        overlay_font::register();
         let dwrite: IDWriteFactory =
             unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED) }
                 .map_err(|error| super::hresult("DWriteCreateFactory", &error))?;
@@ -1355,7 +1361,7 @@ impl OverlayRenderer {
         resources: &ChromeResources,
     ) -> Result<(), String> {
         self.draw_selection_frame(view, FrameMarks::EDITING)?;
-        if view.cursor_visible {
+        if view.cursor_visible && view.show_magnifier {
             self.draw_magnifier(view, resources, self.metrics)?;
         }
         Ok(())
@@ -1382,7 +1388,7 @@ impl OverlayRenderer {
                 None,
             );
         }
-        if marks.handles {
+        if marks.handles && view.show_handles {
             let handle = self.require_brush(&self.handle_brush, "handle brush")?;
             let radius = metrics.handle_size / 2.0;
             for grip in Handle::ALL {
@@ -1400,7 +1406,7 @@ impl OverlayRenderer {
                 }
             }
         }
-        if marks.size_label {
+        if marks.size_label && view.show_size_label {
             self.draw_size_label(selection, view, metrics)?;
         }
         Ok(())
@@ -1416,24 +1422,14 @@ impl OverlayRenderer {
             self.require_brush(&self.label_background_brush, "label background brush")?;
         let foreground = self.require_brush(&self.label_text_brush, "label text brush")?;
         let text = RenderMetrics::label_text_at(selection, view.screen_origin);
-        let estimated = metrics.label_size_at(selection, view.screen_origin);
-
-        // Position from an estimate, measure for real, then reposition when the two
-        // disagree. Keeps the panel sized to the actual glyph run without adding a
-        // frame of latency.
-        let Some(first) = self.place_label(selection, view, estimated, metrics) else {
+        // Measure the exact glyph run before choosing a placement. A character-count
+        // estimate is wrong for CJK, signs and proportional digits and can select a
+        // different ladder step, causing the label to jump while the rectangle moves.
+        let (measured, format) = self.measure_label(&text)?;
+        let Some(placement) = self.place_label(selection, view, measured, metrics) else {
             // No room beside the selection: dropping the label beats covering the
             // pixels the user is choosing.
             return Ok(());
-        };
-        let (measured, format) = self.measure_label(&text)?;
-        let placement = if measured != estimated {
-            match self.place_label(selection, view, measured, metrics) {
-                Some(placement) => placement,
-                None => return Ok(()),
-            }
-        } else {
-            first
         };
 
         unsafe {
@@ -1474,13 +1470,71 @@ impl OverlayRenderer {
         } else {
             view.work_area
         };
-        crate::geometry::size_label_placement(
+        let primary = crate::geometry::size_label_placement(
             selection,
             size,
             work_area,
             metrics.label_gap.round() as i32,
             Some(view.cursor),
-        )
+        )?;
+
+        // The label and loupe are both secondary chrome. When their default placements
+        // collide, keep the loupe attached to the sampling cursor and move the label to
+        // the next valid ladder rung instead of letting one cover the other.
+        let avoid = if view.cursor_visible {
+            Some(
+                magnifier_geometry(
+                    view.cursor,
+                    MagnifierConfig::with_zoom(view.magnifier_zoom).scaled(metrics.dpi),
+                    view.frame,
+                    work_area,
+                )
+                .bounds,
+            )
+        } else {
+            None
+        };
+        let overlaps = |rect: Rect| {
+            avoid.is_some_and(|obstacle| !rect.intersect(obstacle).is_empty())
+        };
+        if !overlaps(primary.rect) {
+            return Some(primary);
+        }
+
+        let (width, height) = (size.0.max(1), size.1.max(1));
+        let gap = metrics.label_gap.round() as i32;
+        let clamp = |left: i32, top: i32, where_: LabelWhere| {
+            let max_left = (work_area.right - width).max(work_area.left);
+            let max_top = (work_area.bottom - height).max(work_area.top);
+            let rect = Rect::from_origin_size(
+                Point::new(left.clamp(work_area.left, max_left), top.clamp(work_area.top, max_top)),
+                width,
+                height,
+            );
+            (!overlaps(rect)).then_some(SizeLabelPlacement { rect, where_ })
+        };
+        let above = selection.top - gap - height;
+        if above >= work_area.top {
+            if let Some(candidate) = clamp(selection.left, above, LabelWhere::Above) {
+                return Some(candidate);
+            }
+        }
+        let below = selection.bottom + gap;
+        if below + height <= work_area.bottom {
+            if let Some(candidate) = clamp(selection.left, below, LabelWhere::Below) {
+                return Some(candidate);
+            }
+        }
+        if width + 2 * gap <= selection.width() && height + 2 * gap <= selection.height() {
+            if let Some(candidate) = clamp(
+                selection.left + gap,
+                selection.top + gap,
+                LabelWhere::Inside,
+            ) {
+                return Some(candidate);
+            }
+        }
+        None
     }
 
     // ── Scroll capture panel (docs/33) ──────────────────────────────────────────────────────────
@@ -1960,7 +2014,7 @@ impl OverlayRenderer {
         // rejected with E_INVALIDARG on some DirectWrite versions.
         let locale = to_wide("en-us");
         // The size label uses the same embedded family, then the stock fallbacks.
-        for family in [INFO_FONT_FAMILY, LABEL_FONT_FAMILY, LABEL_FONT_FALLBACK] {
+        for family in overlay_font::FAMILIES {
             let wide = to_wide(family);
             match unsafe {
                 self.dwrite.CreateTextFormat(
