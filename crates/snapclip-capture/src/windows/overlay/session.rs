@@ -410,6 +410,7 @@ impl OverlayController {
         // left behind must not survive into the next one.
         self.refinement.retire();
         self.cursor_visible = false;
+        self.precision_feedback_until = None;
         // Stop the coalescing tick before releasing the renderer: a pending WM_TIMER
         // must not try to present into the graphics we are about to drop.
         self.disarm_render_tick();
@@ -506,6 +507,10 @@ impl OverlayController {
                 cursor: self.cursor,
                 cursor_visible: false,
                 show_chrome: false,
+                show_handles: false,
+                show_size_label: false,
+                show_magnifier: false,
+                precision_feedback: false,
                 magnifier_rgb: None,
                 magnifier_color_text: None,
                 magnifier_relative: false,

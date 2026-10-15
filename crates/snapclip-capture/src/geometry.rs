@@ -321,6 +321,33 @@ impl SelectionDrag {
     /// Moving translates and then re-fits, so the selection keeps its size even when
     /// it is larger than the monitor.
     pub fn apply(&self, mode: ResizeMode, pointer: Point, bounds: Rect) -> Rect {
+        self.apply_with_constraints(mode, pointer, bounds, false)
+    }
+
+    /// Apply a drag, optionally preserving the original aspect ratio for a corner grip.
+    ///
+    /// The constraint is evaluated from the immutable drag snapshot rather than the
+    /// current selection. This keeps the ratio stable while the pointer moves and makes
+    /// the rule independent from render/message frequency. It also means the result is a
+    /// pure function of the pointer: pressing or releasing Shift while the button is
+    /// already down re-constrains the *same* pointer position, so it can never desync
+    /// from a drag that held the modifier from the button-down. Edge grips and moves
+    /// ignore the constraint because they have no unambiguous opposite corner to
+    /// preserve.
+    pub fn apply_with_constraints(
+        &self,
+        mode: ResizeMode,
+        pointer: Point,
+        bounds: Rect,
+        preserve_aspect: bool,
+    ) -> Rect {
+        if preserve_aspect
+            && matches!(mode, ResizeMode::Handle(handle) if CORNER_HANDLES.contains(&handle))
+            && !self.snapshot.rect.is_empty()
+        {
+            return self.apply_corner_aspect(mode, pointer, bounds);
+        }
+
         let rect = self.snapshot.rect;
         let candidate = match mode {
             ResizeMode::Move => {
@@ -367,6 +394,105 @@ impl SelectionDrag {
         self.snapshot
             .with_minimum_size(candidate, mode, self.snapshot.minimum_size())
     }
+
+    /// Resize around the corner opposite the dragged grip using the original aspect
+    /// ratio.
+    ///
+    /// Only two things decide the result: the ratio and the fixed corner of the drag's
+    /// snapshot, plus where the pointer is right now. There is no anchor delta and no
+    /// per-move gate, which is what makes the geometry identical whether Shift was held
+    /// from the button-down or pressed mid-drag — the earlier anchor-relative rule made
+    /// the constraint depend on *when* the modifier arrived, so a mid-drag Shift either
+    /// froze the selection on a single-axis move or locked the already-distorted ratio
+    /// instead of the one the drag started with.
+    ///
+    /// The pointer's quadrant around the fixed corner supplies the corner signs, so the
+    /// rectangle follows the pointer through the fixed corner and mirrors into the
+    /// opposite quadrant — the same normalisation the free path gets from
+    /// `Rect::from_corners`. Clamping the distance to zero instead pinned the selection
+    /// at its minimum size and made a reverse drag impossible.
+    ///
+    /// Of the two axes the tighter one wins, so the rectangle never grows past the
+    /// pointer on either axis. Pixel dimensions are rounded independently so a 300x200
+    /// selection can still move one physical pixel at a time.
+    fn apply_corner_aspect(&self, mode: ResizeMode, pointer: Point, bounds: Rect) -> Rect {
+        let handle = match mode {
+            ResizeMode::Handle(handle) => handle,
+            ResizeMode::Move => unreachable!("aspect locking only applies to corner handles"),
+        };
+        let original = self.snapshot.rect;
+        let width = i64::from(original.width());
+        let height = i64::from(original.height());
+        let minimum = i64::from(self.snapshot.minimum_size());
+
+        let fixed = match handle {
+            Handle::TopLeft => Point::new(original.right, original.bottom),
+            Handle::TopRight => Point::new(original.left, original.bottom),
+            Handle::BottomRight => Point::new(original.left, original.top),
+            Handle::BottomLeft => Point::new(original.right, original.top),
+            _ => unreachable!("aspect locking only applies to corner handles"),
+        };
+        let fixed_x = i64::from(fixed.x);
+        let fixed_y = i64::from(fixed.y);
+        let pointer_x = i64::from(pointer.x);
+        let pointer_y = i64::from(pointer.y);
+        let sign_x = if pointer_x < fixed_x { -1_i64 } else { 1 };
+        let sign_y = if pointer_y < fixed_y { -1_i64 } else { 1 };
+        let distance_x = (pointer_x - fixed_x).abs();
+        let distance_y = (pointer_y - fixed_y).abs();
+        let (distance, dimension) = if distance_x * height <= distance_y * width {
+            (distance_x, width)
+        } else {
+            (distance_y, height)
+        };
+        let mut result_width = round_ratio(width * distance, dimension);
+        let mut result_height = round_ratio(height * distance, dimension);
+        if result_width < minimum || result_height < minimum {
+            if width >= height {
+                result_height = minimum;
+                result_width = round_ratio(width * minimum, height).max(minimum);
+            } else {
+                result_width = minimum;
+                result_height = round_ratio(height * minimum, width).max(minimum);
+            }
+        }
+
+        // A fixed corner is always inside the monitor. Limit the scale to the largest
+        // ratio-preserving rectangle that can still fit in the pointer's quadrant.
+        let room_x = if sign_x < 0 {
+            (fixed_x - i64::from(bounds.left)).max(0)
+        } else {
+            (i64::from(bounds.right) - fixed_x).max(0)
+        };
+        let room_y = if sign_y < 0 {
+            (fixed_y - i64::from(bounds.top)).max(0)
+        } else {
+            (i64::from(bounds.bottom) - fixed_y).max(0)
+        };
+        if room_x <= 0 || room_y <= 0 {
+            return Rect::new(fixed.x, fixed.y, fixed.x, fixed.y);
+        }
+        if result_width > room_x || result_height > room_y {
+            let (limit_num, limit_den) = if room_x * height <= room_y * width {
+                (room_x, width)
+            } else {
+                (room_y, height)
+            };
+            result_width = round_ratio(width * limit_num, limit_den).max(1);
+            result_height = round_ratio(height * limit_num, limit_den).max(1);
+        }
+        let result_width = result_width.min(room_x) as i32;
+        let result_height = result_height.min(room_y) as i32;
+        let active = Point::new(
+            fixed.x.saturating_add((sign_x * i64::from(result_width)) as i32),
+            fixed.y.saturating_add((sign_y * i64::from(result_height)) as i32),
+        );
+        Rect::from_corners(fixed, active)
+    }
+}
+
+fn round_ratio(numerator: i64, denominator: i64) -> i64 {
+    (numerator + denominator / 2) / denominator.max(1)
 }
 
 impl SelectionSnapshot {
@@ -1056,6 +1182,244 @@ mod tests {
             monitor(),
         );
         assert_eq!(resized, Rect::new(50, 100, 100, 200));
+    }
+
+    #[test]
+    fn shift_corner_resize_preserves_the_original_ratio_for_all_corners() {
+        let rect = Rect::new(100, 100, 400, 300);
+        let drag_points = [
+            (Handle::TopLeft, Point::new(0, 0)),
+            (Handle::TopRight, Point::new(500, 0)),
+            (Handle::BottomRight, Point::new(500, 400)),
+            (Handle::BottomLeft, Point::new(0, 400)),
+        ];
+        for (handle, pointer) in drag_points {
+            let drag = SelectionDrag::new(rect, 96, handle.anchor(rect));
+            let resized = drag.apply_with_constraints(
+                ResizeMode::Handle(handle),
+                pointer,
+                monitor(),
+                true,
+            );
+            let ratio_error = (i64::from(resized.width()) * i64::from(rect.height())
+                - i64::from(resized.height()) * i64::from(rect.width()))
+            .abs();
+            assert!(ratio_error <= i64::from(rect.width()), "{handle:?}: {resized:?}");
+            assert!(monitor().contains_rect(resized), "{handle:?}: {resized:?}");
+        }
+    }
+
+    #[test]
+    fn shift_corner_resize_scales_from_the_pointer_on_a_single_axis_move() {
+        // The previous rule demanded that both axes travel in the corner's diagonal
+        // direction and otherwise returned `original`, which froze the selection. The
+        // scale is now fitted from the pointer alone: on a horizontal-only move the
+        // vertical distance is the tighter axis and therefore sets the scale.
+        let rect = Rect::new(100, 100, 400, 300);
+        let drag = SelectionDrag::new(rect, 96, Point::new(400, 300));
+
+        // The pointer stayed on the original bottom edge, so the scale is exactly 1.
+        assert_eq!(
+            drag.apply_with_constraints(
+                ResizeMode::Handle(Handle::BottomRight),
+                Point::new(500, 300),
+                monitor(),
+                true,
+            ),
+            rect
+        );
+
+        // x grew but y halved: the box must shrink proportionally instead of ignoring
+        // the move because it is not diagonal.
+        let single_axis = drag.apply_with_constraints(
+            ResizeMode::Handle(Handle::BottomRight),
+            Point::new(700, 200),
+            monitor(),
+            true,
+        );
+        assert_eq!(single_axis, Rect::new(100, 100, 250, 200));
+        assert!(single_axis.width() < rect.width());
+        assert!(single_axis.height() < rect.height());
+
+        let diagonal = drag.apply_with_constraints(
+            ResizeMode::Handle(Handle::BottomRight),
+            Point::new(500, 400),
+            monitor(),
+            true,
+        );
+        assert!(diagonal.width() > rect.width());
+        assert!(diagonal.height() > rect.height());
+    }
+
+    #[test]
+    fn shift_corner_resize_mirrors_past_the_fixed_corner() {
+        // Regression: clamping the distance at zero pinned the rectangle to its minimum
+        // size, so the bottom-right grip could not be dragged back past the top-left
+        // corner. The pointer's quadrant around the fixed corner now decides the corner
+        // signs, mirroring the box into the opposite quadrant exactly like the free path
+        // does through `Rect::from_corners`.
+        let rect = Rect::new(100, 100, 400, 300);
+        let drag = SelectionDrag::new(rect, 96, Point::new(400, 300));
+
+        // Straight through the fixed corner: both signs flip, the ratio is kept.
+        let mirrored = drag.apply_with_constraints(
+            ResizeMode::Handle(Handle::BottomRight),
+            Point::new(0, 50),
+            monitor(),
+            true,
+        );
+        assert_eq!(mirrored, Rect::new(25, 50, 100, 100));
+
+        // Past the fixed corner on one axis only.
+        let quarter = drag.apply_with_constraints(
+            ResizeMode::Handle(Handle::BottomRight),
+            Point::new(50, 200),
+            monitor(),
+            true,
+        );
+        assert_eq!(quarter, Rect::new(50, 100, 100, 133));
+
+        for resized in [mirrored, quarter] {
+            assert!(resized.width() > 0 && resized.height() > 0, "{resized:?}");
+            assert!(monitor().contains_rect(resized), "{resized:?}");
+            let ratio_error = (i64::from(resized.width()) * i64::from(rect.height())
+                - i64::from(resized.height()) * i64::from(rect.width()))
+            .abs();
+            assert!(ratio_error <= i64::from(rect.width()), "{resized:?}");
+        }
+    }
+
+    #[test]
+    fn shift_corner_resize_can_shrink_back_toward_the_fixed_corner() {
+        let rect = Rect::new(100, 100, 400, 300);
+        let drag = SelectionDrag::new(rect, 96, Point::new(400, 300));
+        let resized = drag.apply_with_constraints(
+            ResizeMode::Handle(Handle::BottomRight),
+            Point::new(250, 200),
+            monitor(),
+            true,
+        );
+        assert!(resized.width() < rect.width());
+        assert!(resized.height() < rect.height());
+        let ratio_error = (i64::from(resized.width()) * i64::from(rect.height())
+            - i64::from(resized.height()) * i64::from(rect.width()))
+        .abs();
+        assert!(ratio_error <= i64::from(rect.width()));
+    }
+
+    #[test]
+    fn shift_corner_resize_ignores_the_press_point_and_the_hit_slop_offset() {
+        // The old rule measured from the press point, so where the button landed (and
+        // whether Shift was already down when it landed) changed the result. The
+        // geometry now depends only on the drag's snapshot rectangle, its ratio and the
+        // current pointer, which is what makes a mid-drag Shift identical to a Shift held
+        // from the button-down.
+        let rect = Rect::new(100, 100, 400, 300);
+        let exact = SelectionDrag::new(rect, 96, Point::new(400, 300));
+        // Pressed five pixels outside the visual corner but still inside the hit area.
+        let sloppy = SelectionDrag::new(rect, 96, Point::new(405, 305));
+        // Pressed on the opposite grip: an absurd anchor that must not change anything.
+        let opposite = SelectionDrag::new(rect, 96, Point::new(100, 100));
+        for pointer in [
+            Point::new(250, 200),
+            Point::new(500, 400),
+            Point::new(90, 90),
+            Point::new(700, 200),
+        ] {
+            let mode = ResizeMode::Handle(Handle::BottomRight);
+            let expected = exact.apply_with_constraints(mode, pointer, monitor(), true);
+            assert_eq!(
+                sloppy.apply_with_constraints(mode, pointer, monitor(), true),
+                expected,
+                "hit slop changed the result at {pointer:?}"
+            );
+            assert_eq!(
+                opposite.apply_with_constraints(mode, pointer, monitor(), true),
+                expected,
+                "press point changed the result at {pointer:?}"
+            );
+        }
+
+        // Reversing toward the fixed corner still shrinks the box.
+        let resized = sloppy.apply_with_constraints(
+            ResizeMode::Handle(Handle::BottomRight),
+            Point::new(250, 200),
+            monitor(),
+            true,
+        );
+        assert!(resized.width() < rect.width());
+        assert!(resized.height() < rect.height());
+    }
+
+    #[test]
+    fn shift_does_not_constrain_edge_or_move_drags() {
+        let rect = Rect::new(100, 100, 400, 300);
+        let drag = SelectionDrag::new(rect, 96, Point::new(400, 300));
+        assert_eq!(
+            drag.apply_with_constraints(
+                ResizeMode::Handle(Handle::Right),
+                Point::new(550, 300),
+                monitor(),
+                true,
+            ),
+            Rect::new(100, 100, 550, 300)
+        );
+        assert_eq!(
+            drag.apply_with_constraints(ResizeMode::Move, Point::new(500, 400), monitor(), true),
+            Rect::new(200, 200, 500, 400)
+        );
+    }
+
+    #[test]
+    fn shift_corner_resize_keeps_ratio_when_clamped_or_minimized() {
+        let rect = Rect::new(100, 100, 400, 300);
+        let drag = SelectionDrag::new(rect, 96, Point::new(400, 300));
+        let clamped = drag.apply_with_constraints(
+            ResizeMode::Handle(Handle::BottomRight),
+            Point::new(5000, 5000),
+            monitor(),
+            true,
+        );
+        assert_eq!(clamped, Rect::new(100, 100, 1570, 1080));
+        let clamped_error = (i64::from(clamped.width()) * i64::from(rect.height())
+            - i64::from(clamped.height()) * i64::from(rect.width()))
+        .abs();
+        assert!(clamped_error <= i64::from(rect.width()));
+
+        let minimum = drag.apply_with_constraints(
+            ResizeMode::Handle(Handle::BottomRight),
+            Point::new(101, 101),
+            monitor(),
+            true,
+        );
+        assert!(minimum.width() >= drag.snapshot.minimum_size());
+        assert!(minimum.height() >= drag.snapshot.minimum_size());
+        let minimum_error = (i64::from(minimum.width()) * i64::from(rect.height())
+            - i64::from(minimum.height()) * i64::from(rect.width()))
+        .abs();
+        assert!(minimum_error <= i64::from(rect.width()));
+    }
+
+    #[test]
+    fn shift_corner_resize_changes_by_pixels_instead_of_ratio_units() {
+        let rect = Rect::new(100, 100, 400, 300);
+        let drag = SelectionDrag::new(rect, 96, Point::new(400, 300));
+        let first = drag.apply_with_constraints(
+            ResizeMode::Handle(Handle::BottomRight),
+            Point::new(401, 301),
+            monitor(),
+            true,
+        );
+        let second = drag.apply_with_constraints(
+            ResizeMode::Handle(Handle::BottomRight),
+            Point::new(402, 302),
+            monitor(),
+            true,
+        );
+        assert!(first.width() >= rect.width());
+        assert!(second.width() > first.width());
+        assert!((second.width() - first.width()) <= 2);
+        assert!((second.height() - first.height()) <= 2);
     }
 
     #[test]

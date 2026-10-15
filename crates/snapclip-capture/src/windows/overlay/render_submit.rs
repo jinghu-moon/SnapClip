@@ -16,6 +16,11 @@ pub(super) fn selection_for_render(
 }
 
 impl OverlayController {
+    pub(super) fn precision_feedback_active(&self) -> bool {
+        self.precision_feedback_until
+            .is_some_and(|until| Instant::now() < until)
+    }
+
     /// Mark the surface dirty for a discrete edit (undo / redo / delete / z-order /
     /// toolbar command) and coalesce a full repaint into the next tick.
     pub(super) fn invalidate_all(&mut self) {
@@ -90,6 +95,10 @@ impl OverlayController {
         if self.advance_guide_fade() {
             self.dirty = true;
         }
+        if self.precision_feedback_until.is_some_and(|until| Instant::now() >= until) {
+            self.precision_feedback_until = None;
+            self.dirty = true;
+        }
         if !self.dirty {
             return;
         }
@@ -99,6 +108,7 @@ impl OverlayController {
             || self.chain_fade_running()
             || self.walk_activity_running()
             || self.guide.running()
+            || self.precision_feedback_active()
             // …and the box's own appear ramp, which is a plain ramp on the same clock.
             || self.preview_appear() < 1.0
         {
@@ -157,6 +167,7 @@ impl OverlayController {
         let preview_alpha = self.preview_appear();
         let level_badge = self.level_badge();
         let hint = self.hint_text();
+        let precision_feedback = self.precision_feedback_active();
         let guide = (self.guide.alpha() > 0.0).then(|| GuideView {
             groups: self.guide_groups.clone(),
             alpha: self.guide.alpha(),
@@ -185,12 +196,19 @@ impl OverlayController {
         // A scroll session draws its own view of the selection (frame and panel only); the
         // capture session behind it is Idle and has no chrome.
         let show_chrome = self.session.shows_chrome();
+        let show_handles = self.session.shows_handles();
+        let show_size_label = self.session.shows_size_label();
+        let show_magnifier = self.session.shows_magnifier();
         let scroll = self.scroll.as_ref().map(scroll::ScrollRun::view);
         let state = OverlayFrameState {
             selection,
             cursor: self.cursor,
             cursor_visible,
             show_chrome,
+            show_handles,
+            show_size_label,
+            show_magnifier,
+            precision_feedback,
             magnifier_rgb: self.sampler.rgb(),
             magnifier_color_text: self.sampler.formatted(self.magnifier_color_format),
             magnifier_relative: self.magnifier_relative,

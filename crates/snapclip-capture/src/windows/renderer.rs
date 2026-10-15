@@ -29,6 +29,14 @@ pub struct OverlayFrameState {
     pub cursor: Point,
     pub cursor_visible: bool,
     pub show_chrome: bool,
+    /// Show the eight edit grips. A draft selection deliberately hides them.
+    pub show_handles: bool,
+    /// Show the live size/coordinate label for a draft or committed selection.
+    pub show_size_label: bool,
+    /// Show the screenshot loupe. Annotation mode owns the pointer instead.
+    pub show_magnifier: bool,
+    /// Brief feedback that the keyboard nudged the sampling cursor.
+    pub precision_feedback: bool,
     /// Current color sample RGB from the magnifier sampler.
     pub magnifier_rgb: Option<(u8, u8, u8)>,
     /// The sampled colour rendered in the current `ColorFormat` (`#RRGGBB` /
@@ -95,6 +103,10 @@ impl OverlayFrameState {
             cursor: Point::default(),
             cursor_visible: false,
             show_chrome: false,
+            show_handles: true,
+            show_size_label: true,
+            show_magnifier: true,
+            precision_feedback: false,
             magnifier_rgb: None,
             magnifier_color_text: None,
             magnifier_relative: false,
@@ -241,6 +253,10 @@ impl Win32Renderer {
             screen_origin: Point::new(self.layout.bounds.left, self.layout.bounds.top),
             cursor_visible: state.cursor_visible,
             show_chrome: state.show_chrome,
+            show_handles: state.show_handles,
+            show_size_label: state.show_size_label,
+            show_magnifier: state.show_magnifier,
+            precision_feedback: state.precision_feedback,
             work_area: self.layout.local_work_area(),
             magnifier_rgb: state.magnifier_rgb,
             magnifier_color_text: state.magnifier_color_text.clone(),
@@ -289,6 +305,10 @@ impl Win32Renderer {
             screen_origin: Point::new(self.layout.bounds.left, self.layout.bounds.top),
             cursor_visible: false,
             show_chrome: false,
+            show_handles: false,
+            show_size_label: false,
+            show_magnifier: false,
+            precision_feedback: false,
             work_area: self.layout.local_work_area(),
             magnifier_rgb: None,
             magnifier_color_text: None,

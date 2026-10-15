@@ -35,7 +35,7 @@ use windows_sys::Win32::{
         Input::Ime::{ImmGetContext, ImmReleaseContext, ImmSetOpenStatus},
         Input::KeyboardAndMouse::{
             GetAsyncKeyState, GetKeyState, MAPVK_VSC_TO_VK, MapVirtualKeyW, SetFocus, VK_CONTROL,
-            VK_LBUTTON, VK_MBUTTON, VK_MENU, VK_RBUTTON, VK_SHIFT,
+            VK_LBUTTON, VK_LSHIFT, VK_MBUTTON, VK_MENU, VK_RBUTTON, VK_RSHIFT, VK_SHIFT,
         },
         WindowsAndMessaging::{
             CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow,
@@ -43,7 +43,8 @@ use windows_sys::Win32::{
             HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, IDC_CROSS, IDC_SIZEALL, IDC_SIZENESW,
             IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, KillTimer, LoadCursorW, MA_ACTIVATE, MSG,
             PeekMessageW, PostQuitMessage, PostThreadMessageW, RegisterClassW, SM_CXDRAG, SW_HIDE,
-            SW_SHOW, SetCursor, SetForegroundWindow, SetTimer, SetWindowDisplayAffinity,
+            SW_SHOW, SetCursor, SetCursorPos, SetForegroundWindow, SetTimer,
+            SetWindowDisplayAffinity,
             SetWindowPos, ShowWindow, TranslateMessage, UnregisterClassW, WDA_EXCLUDEFROMCAPTURE,
             WM_APP, WM_DESTROY, WM_DEVICECHANGE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND,
             WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE,
@@ -524,6 +525,11 @@ struct OverlayController {
     snap_radius: u32,
     cursor: Point,
     cursor_visible: bool,
+    /// Physical Shift state tracked from key messages. The async keyboard query is
+    /// used as a fallback for mouse moves that arrive before the key message.
+    shift_down: bool,
+    /// Until when the keyboard precision mode cue remains visible.
+    precision_feedback_until: Option<Instant>,
     dirty: bool,
     /// Pure color-sampling state machine (tile hit, throttle, hex formatting).
     sampler: ColorSampler,
@@ -660,6 +666,8 @@ impl OverlayController {
             snap_radius: DEFAULT_SNAP_RADIUS_PX,
             cursor: Point::default(),
             cursor_visible: false,
+            shift_down: false,
+            precision_feedback_until: None,
             dirty: false,
             sampler: ColorSampler::new(),
             magnifier_color_format: ColorFormat::default(),

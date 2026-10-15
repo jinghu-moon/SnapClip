@@ -29,6 +29,10 @@ pub enum Action {
     LevelWheel,
     LevelUp,
     LevelDown,
+    CursorUp,
+    CursorDown,
+    CursorLeft,
+    CursorRight,
     PickClick,
     PickDrag,
     LoupeZoom,
@@ -95,10 +99,14 @@ const CONFIRM_SCROLL_LABEL: &str = "开始长截图";
 
 impl Action {
     /// Every action, in guide order.
-    pub const ALL: [Action; 15] = [
+    pub const ALL: [Action; 19] = [
         Self::LevelWheel,
         Self::LevelUp,
         Self::LevelDown,
+        Self::CursorUp,
+        Self::CursorDown,
+        Self::CursorLeft,
+        Self::CursorRight,
         Self::PickClick,
         Self::PickDrag,
         Self::LoupeZoom,
@@ -134,7 +142,7 @@ impl Action {
                     "上一层（走向窗口）",
                     Pick,
                     Key,
-                    &["ArrowUp"],
+                    &["Ctrl+ArrowUp"],
                 ),
                 Self::LevelDown => (
                     "level.down",
@@ -143,7 +151,43 @@ impl Action {
                     "下一层",
                     Pick,
                     Key,
+                    &["Ctrl+ArrowDown"],
+                ),
+                Self::CursorUp => (
+                    "cursor.up",
+                    Group::Snap,
+                    "cursor.move",
+                    "移动光标 1 像素",
+                    Pick,
+                    Key,
+                    &["ArrowUp"],
+                ),
+                Self::CursorDown => (
+                    "cursor.down",
+                    Group::Snap,
+                    "cursor.move",
+                    "移动光标 1 像素",
+                    Pick,
+                    Key,
                     &["ArrowDown"],
+                ),
+                Self::CursorLeft => (
+                    "cursor.left",
+                    Group::Snap,
+                    "cursor.move",
+                    "移动光标 1 像素",
+                    Pick,
+                    Key,
+                    &["ArrowLeft"],
+                ),
+                Self::CursorRight => (
+                    "cursor.right",
+                    Group::Snap,
+                    "cursor.move",
+                    "移动光标 1 像素",
+                    Pick,
+                    Key,
+                    &["ArrowRight"],
                 ),
                 Self::PickClick => (
                     "pick.click",
@@ -158,7 +202,7 @@ impl Action {
                     "pick.drag",
                     Group::Snap,
                     "pick.drag",
-                    "自由框选",
+                    "框选 / 等比缩放",
                     Pick,
                     Mouse,
                     &["Drag"],
@@ -281,8 +325,9 @@ impl Action {
 }
 
 /// Guide rows shown when the user has not said otherwise.
-const DEFAULT_VISIBLE: [&str; 12] = [
+const DEFAULT_VISIBLE: [&str; 13] = [
     "level",
+    "cursor.move",
     "pick.click",
     "pick.drag",
     "loupe.zoom",
@@ -860,7 +905,14 @@ impl Keymap {
             if spec.context != context || !self.row_visible(spec.row) {
                 continue;
             }
-            let chords = self.chords(action).iter().map(Chord::display_tokens);
+            let mut chords: Vec<Vec<String>> = self
+                .chords(action)
+                .iter()
+                .map(Chord::display_tokens)
+                .collect();
+            if action == Action::PickDrag && context == Context::Pick {
+                chords.push(vec!["Shift".into(), "拖拽".into()]);
+            }
             let index = match groups.iter().position(|(group, _)| *group == spec.group) {
                 Some(index) => index,
                 None => {
@@ -875,7 +927,7 @@ impl Keymap {
                     spec.row,
                     GuideRow {
                         label: action.label(scroll_entry),
-                        chords: chords.collect(),
+                        chords,
                     },
                 )),
             }
@@ -945,8 +997,18 @@ mod tests {
         let pick = |key| map.action_for(Context::Pick, &press(key));
         assert_eq!(pick(Key::Escape), Some(Action::Cancel));
         assert_eq!(pick(Key::Enter), Some(Action::Confirm));
-        assert_eq!(pick(Key::ArrowUp), Some(Action::LevelUp));
-        assert_eq!(pick(Key::ArrowDown), Some(Action::LevelDown));
+        assert_eq!(pick(Key::ArrowUp), Some(Action::CursorUp));
+        assert_eq!(pick(Key::ArrowDown), Some(Action::CursorDown));
+        assert_eq!(pick(Key::ArrowLeft), Some(Action::CursorLeft));
+        assert_eq!(pick(Key::ArrowRight), Some(Action::CursorRight));
+        assert_eq!(
+            map.action_for(Context::Pick, &Chord::key(Key::ArrowUp, true, false, false)),
+            Some(Action::LevelUp)
+        );
+        assert_eq!(
+            map.action_for(Context::Pick, &Chord::key(Key::ArrowDown, true, false, false)),
+            Some(Action::LevelDown)
+        );
         assert_eq!(pick(Key::Char('S')), Some(Action::ColorFormat));
         assert_eq!(pick(Key::Char('C')), Some(Action::ColorCopy));
         assert_eq!(pick(Key::Char('P')), Some(Action::CoordMode));
@@ -1114,7 +1176,24 @@ mod tests {
         assert_eq!(names, ["吸附", "放大镜", "输出"]);
         let level = &guide[0].rows[0];
         assert_eq!(level.label, "选择上层或下层 UI 元素");
-        assert_eq!(level.chords, [vec!["滚轮"], vec!["↑"], vec!["↓"]]);
+        assert_eq!(level.chords, [vec!["滚轮"], vec!["Ctrl", "↑"], vec!["Ctrl", "↓"]]);
+        let cursor = &guide[0].rows[1];
+        assert_eq!(cursor.label, "移动光标 1 像素");
+        assert_eq!(
+            cursor.chords,
+            [
+                vec!["↑"],
+                vec!["↓"],
+                vec!["←"],
+                vec!["→"],
+            ]
+        );
+        let drag = guide[0]
+            .rows
+            .iter()
+            .find(|row| row.label == "框选 / 等比缩放")
+            .expect("aspect resize hint");
+        assert_eq!(drag.chords, [vec!["拖拽"], vec!["Shift", "拖拽"]]);
         let labels: Vec<_> = guide
             .iter()
             .flat_map(|g| &g.rows)
@@ -1124,8 +1203,9 @@ mod tests {
             labels,
             [
                 "选择上层或下层 UI 元素",
+                "移动光标 1 像素",
                 "选定当前元素",
-                "自由框选",
+                "框选 / 等比缩放",
                 "放大镜缩放",
                 "切换色值格式",
                 "复制色值",

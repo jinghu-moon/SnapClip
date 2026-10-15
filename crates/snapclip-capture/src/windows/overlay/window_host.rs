@@ -295,7 +295,7 @@ pub(crate) fn chain_visibility_at(idle: Duration) -> f32 {
 ///
 /// `pub(crate)` so the embedded-font coverage gate can require its characters
 /// (`win::d2d::tests::the_embedded_subset_covers_the_strings_the_overlay_draws`).
-pub(crate) const LEVEL_HINT: &str = "滚轮 / ↑↓ 换吸附层级";
+pub(crate) const LEVEL_HINT: &str = "滚轮 / Ctrl+↑↓ 换吸附层级 · 方向键移动光标";
 
 /// How long a one-shot hint stays on screen.
 pub(crate) const LEVEL_HINT_MS: u64 = 2600;
@@ -306,7 +306,10 @@ pub(crate) const LEVEL_HINT_MS: u64 = 2600;
 /// `↑ = 窗口` is the part nobody can guess, and it is what makes the chip legible the next time the
 /// wheel is used. The numbers are the badge's own, so the sentence and the chip never disagree.
 pub(crate) fn level_hint(reach: LevelReach) -> String {
-    format!("↑{} ↓{} · ↑ = 窗口 · 滚轮 / ↑↓ 切换", reach.up, reach.down)
+    format!(
+        "↑{} ↓{} · ↑ = 窗口 · 滚轮 / Ctrl+↑↓ 切换",
+        reach.up, reach.down
+    )
 }
 
 /// Whether a successful level walk should (re)arm the teaching sentence (docs/21 §5.21).

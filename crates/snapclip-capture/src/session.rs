@@ -139,6 +139,38 @@ impl CaptureSession {
         self.has_selection()
     }
 
+    /// Handles belong to an already established selection. During the first drag the
+    /// rectangle is a draft, so painting eight grips around it adds noise and makes the
+    /// creation gesture look like an edit gesture.
+    pub fn shows_handles(&self) -> bool {
+        if !self.has_selection() || self.state != CaptureState::Selected {
+            return false;
+        }
+        let snapshot = self.snapshot();
+        let handle = snapshot
+            .visual_handle_size(crate::geometry::Handle::TopLeft, self.dpi())
+            .ceil() as i32;
+        // A tiny selection cannot visually host eight independent grips. Keep the
+        // hit geometry available for keyboard/mouse editing, but remove the collision
+        // of circles and labels from the rendered surface.
+        let breathing_room = 2;
+        self.selection.width() >= handle + breathing_room
+            && self.selection.height() >= handle + breathing_room
+    }
+
+    /// The live size is useful while a draft is being created and while an established
+    /// selection is edited. It is kept independent from handle visibility so a draft can
+    /// communicate its dimensions without pretending it is already committed.
+    pub fn shows_size_label(&self) -> bool {
+        matches!(self.state, CaptureState::Selecting | CaptureState::Selected)
+    }
+
+    /// Annotation editing owns the pointer and its own object handles. The screenshot
+    /// loupe is therefore hidden while the selection frame remains visible as a boundary.
+    pub fn shows_magnifier(&self) -> bool {
+        matches!(self.state, CaptureState::Selecting | CaptureState::Selected)
+    }
+
     pub fn dpi(&self) -> u32 {
         self.geometry.map(|geometry| geometry.dpi).unwrap_or(96)
     }
@@ -203,9 +235,23 @@ impl CaptureSession {
     }
 
     pub fn pointer_moved(&mut self, point: Point) {
+        self.pointer_moved_with_constraints(point, false);
+    }
+
+    /// Forward a pointer move with the current resize modifier state.
+    ///
+    /// The modifier is sampled per move, and the geometry it selects is a pure function of
+    /// the pointer: it depends only on the drag snapshot's ratio and the pointer position,
+    /// never on *when* Shift arrived. A mid-drag Shift therefore re-constrains the very
+    /// same pointer position, so the result is identical to a drag that held the modifier
+    /// from the button-down. Nothing about the previous move — anchor, last applied
+    /// rectangle, or which segment of the gesture we are in — may enter the calculation;
+    /// doing so is what made Shift-after-button-down behave differently from
+    /// Shift-before-button-down.
+    pub fn pointer_moved_with_constraints(&mut self, point: Point, preserve_aspect: bool) {
         if let (Some(mode), Some(drag)) = (self.mode, self.drag) {
             let bounds = self.bounds();
-            let rect = drag.apply(mode, point, bounds);
+            let rect = drag.apply_with_constraints(mode, point, bounds, preserve_aspect);
             if rect != self.selection {
                 self.selection = rect;
             }
@@ -794,6 +840,98 @@ mod tests {
     }
 
     #[test]
+    fn shift_corner_drag_is_aspect_locked_but_shift_edge_drag_is_not() {
+        let mut session = armed_session();
+        assert!(session.snap_to(Rect::new(100, 100, 400, 300)));
+
+        assert!(session.begin_drag(
+            Point::new(400, 300),
+            ResizeMode::Handle(Handle::BottomRight),
+            false,
+        ));
+        session.pointer_moved_with_constraints(Point::new(500, 500), true);
+        assert_eq!(session.selection(), Rect::new(100, 100, 500, 367));
+        let ratio_error = (i64::from(session.selection().width()) * 200
+            - i64::from(session.selection().height()) * 300)
+        .abs();
+        assert!(ratio_error <= 300);
+        session.pointer_released();
+
+        assert!(session.begin_drag(
+            Point::new(600, 266),
+            ResizeMode::Handle(Handle::Right),
+            false,
+        ));
+        session.pointer_moved_with_constraints(Point::new(800, 266), true);
+        assert_eq!(session.selection().width(), 700);
+        assert_eq!(session.selection().height(), 267);
+    }
+
+    #[test]
+    fn enabling_shift_mid_drag_matches_a_drag_that_held_shift_from_the_start() {
+        // Regression (reported): pressing Shift *after* the button went down must produce
+        // exactly the same geometry as holding it from the start. The removed
+        // implementation compared the pointer against the drag's press point instead of
+        // the fixed corner, so a mid-drag Shift kept the already-distorted free rectangle
+        // (and a non-diagonal move froze it) rather than locking the drag's own ratio.
+        let mut mid = armed_session();
+        let mut early = armed_session();
+        for session in [&mut mid, &mut early] {
+            assert!(session.snap_to(Rect::new(100, 100, 400, 300)));
+            assert!(session.begin_drag(
+                Point::new(400, 300),
+                ResizeMode::Handle(Handle::BottomRight),
+                false,
+            ));
+        }
+
+        // Free resize first: the unconstrained rectangle is no longer 4:3.
+        mid.pointer_moved_with_constraints(Point::new(500, 400), false);
+        assert_eq!(mid.selection(), Rect::new(100, 100, 500, 400));
+
+        // Shift arrives at the same pointer: the constraint re-derives the rectangle from
+        // the fixed top-left corner and the drag's original 4:3 ratio.
+        mid.pointer_moved_with_constraints(Point::new(500, 400), true);
+        assert_eq!(mid.selection(), Rect::new(100, 100, 500, 367));
+
+        // From here the two sessions are indistinguishable, move for move.
+        for point in [
+            Point::new(500, 400),
+            Point::new(520, 380),
+            Point::new(600, 475),
+            Point::new(430, 430),
+            Point::new(200, 200),
+        ] {
+            mid.pointer_moved_with_constraints(point, true);
+            early.pointer_moved_with_constraints(point, true);
+            assert_eq!(mid.selection(), early.selection(), "at {point:?}");
+        }
+    }
+
+    #[test]
+    fn shift_corner_drag_reverses_through_the_fixed_corner() {
+        // Regression (reported): the bottom-right grip could not be dragged back past the
+        // top-left corner. The distance clamp pinned the selection at its minimum size
+        // instead of letting it mirror.
+        let mut session = armed_session();
+        assert!(session.snap_to(Rect::new(100, 100, 400, 300)));
+        assert!(session.begin_drag(
+            Point::new(400, 300),
+            ResizeMode::Handle(Handle::BottomRight),
+            false,
+        ));
+
+        // Past the fixed corner: the rectangle mirrors into the other quadrant and keeps
+        // its 3:2 ratio.
+        session.pointer_moved_with_constraints(Point::new(0, 50), true);
+        assert_eq!(session.selection(), Rect::new(25, 50, 100, 100));
+
+        // Coming back through the corner restores a forward drag.
+        session.pointer_moved_with_constraints(Point::new(250, 200), true);
+        assert_eq!(session.selection(), Rect::new(100, 100, 250, 200));
+    }
+
+    #[test]
     fn artifact_rejects_a_selection_outside_the_frozen_frame() {
         let mut session = armed_session();
         press(&mut session, Point::new(100, 100));
@@ -817,11 +955,27 @@ mod tests {
     fn chrome_is_hidden_until_a_selection_exists() {
         let mut session = armed_session();
         assert!(!session.shows_chrome());
+        assert!(!session.shows_handles());
         press(&mut session, Point::new(10, 10));
         session.pointer_moved(Point::new(110, 110));
         assert!(session.shows_chrome());
+        assert!(!session.shows_handles(), "drafts must not look like edit mode");
+        assert!(session.shows_size_label());
         session.pointer_released();
         assert!(session.shows_chrome());
+        assert!(session.shows_handles());
+    }
+
+    #[test]
+    fn tiny_committed_selection_keeps_edit_hits_but_hides_colliding_grips() {
+        let mut session = armed_session();
+        assert!(session.snap_to(Rect::new(100, 100, 112, 112)));
+        assert!(session.has_selection());
+        assert!(!session.shows_handles());
+        assert!(matches!(
+            session.pointer_hit(Point::new(100, 100)),
+            SelectionGeometry::Resize(_)
+        ));
     }
 
     #[test]
@@ -835,6 +989,9 @@ mod tests {
         assert_eq!(session.state(), CaptureState::Annotating);
         // Chrome keeps painting and the selection is unchanged.
         assert!(session.shows_chrome());
+        assert!(!session.shows_handles());
+        assert!(!session.shows_size_label());
+        assert!(!session.shows_magnifier());
         assert_eq!(session.selection(), Rect::new(100, 100, 400, 300));
         // A pointer press in Annotating does not re-open a selection drag.
         assert_eq!(

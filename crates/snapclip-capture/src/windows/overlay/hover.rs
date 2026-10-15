@@ -407,6 +407,13 @@ impl OverlayController {
             self.clear_hover();
             return;
         }
+        // Shift is the temporary, discoverable escape hatch from automatic snapping.
+        // It does not alter the selection and is sampled at the same message boundary
+        // as the pointer, so a deliberate drag never competes with a preview.
+        if unsafe { GetKeyState(VK_SHIFT as i32) < 0 } {
+            self.clear_snap_preview_for_modifier();
+            return;
+        }
         let Some(screen) = self.cursor_screen() else {
             self.clear_hover();
             return;
@@ -452,6 +459,49 @@ impl OverlayController {
         }
         self.hover_target = target;
         self.invalidate();
+    }
+
+    pub(super) fn clear_snap_preview_for_modifier(&mut self) {
+        let changed = self.gesture.clear_preview();
+        self.set_preview_target(None);
+        self.disarm_dwell();
+        self.disarm_refinement();
+        self.refinement.retire();
+        let deep_changed = self.deep_target.take().is_some() || self.deep_levels.take().is_some();
+        let hover_changed = self.hover_target.take().is_some();
+        if hover_changed || deep_changed || changed {
+            self.invalidate();
+        }
+    }
+
+    pub(super) fn on_snap_modifier_changed(&mut self) {
+        let shift = self.shift_down || unsafe { GetKeyState(VK_SHIFT as i32) < 0 };
+
+        // Modifier changes are also part of an active resize gesture. Reapply the
+        // current cursor position immediately so Shift can be pressed or released
+        // after the mouse button went down; waiting for another WM_MOUSEMOVE made
+        // the mode appear to change only intermittently.
+        if self.gesture.gesture().is_pressed() {
+            if matches!(
+                self.session.state(),
+                CaptureState::Selecting | CaptureState::Selected
+            ) {
+                self.session
+                    .pointer_moved_with_constraints(self.cursor, shift);
+                self.invalidate();
+            }
+            return;
+        }
+
+        if self.session.state() != CaptureState::Selecting {
+            return;
+        }
+        if shift {
+            self.clear_snap_preview_for_modifier();
+        } else if self.cursor_visible {
+            self.update_hover();
+            self.arm_dwell();
+        }
     }
 
     /// Feed one cursor position to the v2 refinement scheduler.

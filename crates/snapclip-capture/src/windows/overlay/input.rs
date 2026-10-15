@@ -7,9 +7,17 @@
 
 use super::*;
 
+fn nudge_point(point: POINT, dx: i32, dy: i32) -> POINT {
+    POINT {
+        x: point.x.saturating_add(dx),
+        y: point.y.saturating_add(dy),
+    }
+}
+
 impl OverlayController {
     pub(super) fn on_mouse_move(&mut self, client: POINT) {
         let point = Point::new(client.x, client.y);
+        let shift = self.shift_down || modifiers().1;
         self.cursor = point;
         self.cursor_visible = true;
         // A cursor move deliberately does **not** touch the chain (docs/21 §5.24, ④): it used to, so
@@ -51,11 +59,13 @@ impl OverlayController {
                         ResizeMode::Handle(Handle::BottomRight),
                         true,
                     );
-                    self.session.pointer_moved(point);
+                    self.session
+                        .pointer_moved_with_constraints(point, shift);
                     self.disarm_dwell();
                 }
                 MoveOutcome::Dragging => {
-                    self.session.pointer_moved(point);
+                    self.session
+                        .pointer_moved_with_constraints(point, shift);
                 }
             }
             self.update_cursor_shape(point);
@@ -197,6 +207,11 @@ impl OverlayController {
         let state = self.session.state();
         self.metrics
             .log_line(&format!("key down vk=0x{vk:02X} state={state:?}"), false);
+        if is_shift_vk(vk) {
+            self.shift_down = true;
+            self.on_snap_modifier_changed();
+            return state.is_active();
+        }
         let context = if self.scroll.is_some() {
             Context::Scroll
         } else {
@@ -225,6 +240,10 @@ impl OverlayController {
 
     /// A key went up: it no longer holds a wheel gesture.
     pub(super) fn on_key_up(&mut self, vk: u32) {
+        if is_shift_vk(vk) {
+            self.shift_down = false;
+            self.on_snap_modifier_changed();
+        }
         if self.held.is_some() && self.held == Key::from_virtual_key(vk) {
             self.held = None;
         }
@@ -273,6 +292,10 @@ impl OverlayController {
             Action::LevelDown => {
                 self.step_deep_level(1);
             }
+            Action::CursorUp => self.nudge_system_cursor(0, -1),
+            Action::CursorDown => self.nudge_system_cursor(0, 1),
+            Action::CursorLeft => self.nudge_system_cursor(-1, 0),
+            Action::CursorRight => self.nudge_system_cursor(1, 0),
             Action::Confirm => {
                 let has_selection = self.session.has_selection();
                 // F7 arms a distinct flow: Enter confirms the user's rectangle and starts the
@@ -319,6 +342,34 @@ impl OverlayController {
             // Pointer gestures: the map lists them for the guide, and the pointer handlers own them.
             Action::LevelWheel | Action::LoupeZoom | Action::PickClick | Action::PickDrag => {}
         }
+    }
+
+    /// Move the real system cursor by one physical screen pixel. The resulting `WM_MOUSEMOVE`
+    /// follows the same path as a physical mouse move, so hover detection, snapping and the
+    /// magnifier all observe the same point without a second coordinate model.
+    fn nudge_system_cursor(&mut self, dx: i32, dy: i32) {
+        if !matches!(
+            self.session.state(),
+            CaptureState::Preparing
+                | CaptureState::Armed
+                | CaptureState::Selecting
+                | CaptureState::Selected
+        ) {
+            return;
+        }
+        let mut cursor = POINT { x: 0, y: 0 };
+        if unsafe { GetCursorPos(&mut cursor) } == 0 {
+            return;
+        }
+        unsafe {
+            let target = nudge_point(cursor, dx, dy);
+            SetCursorPos(target.x, target.y);
+        }
+        // Keep the cue short and restart it for a burst of arrow-key nudges. The
+        // cursor still follows the normal WM_MOUSEMOVE path, so hover, sampling and
+        // snapping use one coordinate source.
+        self.precision_feedback_until = Some(Instant::now() + Duration::from_millis(650));
+        self.invalidate();
     }
 
     /// Copy the currently displayed colour string (HEX / RGB / HSL, whichever the `S`
@@ -639,8 +690,28 @@ impl OverlayController {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::nudge_point;
+    use windows_sys::Win32::Foundation::POINT;
+
+    #[test]
+    fn cursor_nudges_move_exactly_one_screen_pixel() {
+        let origin = POINT { x: 100, y: 200 };
+        let same = |actual: POINT, x: i32, y: i32| assert_eq!((actual.x, actual.y), (x, y));
+        same(nudge_point(origin, 0, -1), 100, 199);
+        same(nudge_point(origin, 0, 1), 100, 201);
+        same(nudge_point(origin, -1, 0), 99, 200);
+        same(nudge_point(origin, 1, 0), 101, 200);
+    }
+}
+
 /// Ctrl, Shift and Alt as they were when the message being handled was posted.
 fn modifiers() -> (bool, bool, bool) {
     let down = |vk: u16| unsafe { GetKeyState(vk as i32) < 0 };
     (down(VK_CONTROL), down(VK_SHIFT), down(VK_MENU))
+}
+
+fn is_shift_vk(vk: u32) -> bool {
+    vk == VK_SHIFT as u32 || vk == VK_LSHIFT as u32 || vk == VK_RSHIFT as u32
 }

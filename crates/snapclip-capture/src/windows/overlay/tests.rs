@@ -285,7 +285,10 @@ fn the_level_hint_counts_the_way_the_confirm_line_does() {
     let reach = super::level_badge_reach(Some(chain), &path).expect("a walked chain has stops");
     assert_eq!(reach, crate::geometry::LevelReach { up: 7, down: 1 });
     // …and the sentence that explains the chip quotes those same two numbers.
-    assert_eq!(level_hint(reach), "↑7 ↓1 · ↑ = 窗口 · 滚轮 / ↑↓ 切换");
+    assert_eq!(
+        level_hint(reach),
+        "↑7 ↓1 · ↑ = 窗口 · 滚轮 / Ctrl+↑↓ 切换"
+    );
     // The label says nothing about the level any more, so its text cannot drift from the badge.
     assert_eq!(
         preview_label(Rect::new(0, 0, 100, 50), false, None, true, false),
