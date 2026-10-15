@@ -40,8 +40,20 @@ if ($Run -or -not $Log) {
     $Log = Join-Path $root 'target\test-baseline.log'
     Write-Host '[baseline] cargo test --workspace --lib -- --test-threads=1'
     # Serial on purpose: see .githooks/pre-push and docs/31 section 4.2 (R-21).
-    $output = & cargo test --workspace --lib -- --test-threads=1 2>&1
-    $code = $LASTEXITCODE
+    #
+    # `$ErrorActionPreference` must be relaxed around this one call. `2>&1` turns every line cargo
+    # writes to stderr (progress, `Finished ...`, warnings) into an ErrorRecord, and under
+    # `Stop` Windows PowerShell 5.1 raises a NativeCommandError on the first one -- which aborts
+    # the script before the log is even written. `pwsh` does not do this, so the bug only shows up
+    # through the pre-push hook. The call's exit code is still checked on the next line.
+    $wasStrict = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = & cargo test --workspace --lib -- --test-threads=1 2>&1
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $wasStrict
+    }
     $output | Out-File -Encoding utf8 $Log
     if ($code -ne 0) {
         $output | Select-Object -Last 40 | ForEach-Object { Write-Host $_ }
