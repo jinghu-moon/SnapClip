@@ -8,7 +8,7 @@ use super::*;
 
 
 use crate::geometry::region_panel_layout;
-use crate::region::{preset_for, Region, RegionField};
+use crate::region::{Ratio, Region, RegionField};
 use crate::units::LabelToggle;
 use crate::windows::win::d2d::RegionPanelView;
 
@@ -181,7 +181,6 @@ impl OverlayController {
             panel.menu().is_some(),
             self.segment_widths,
         );
-        let hit = preset_for(region);
         Some(RegionPanelView {
             values: RegionField::ALL.map(|field| (field, panel.field_text(field, region, dpi))),
             invalid: RegionField::ALL.map(|field| {
@@ -203,12 +202,10 @@ impl OverlayController {
             locked: panel.locked(),
             toggles: LabelToggle::ALL.map(|toggle| (toggle, toggle.on(self.preferences.label))),
             status: panel.status(region, dpi),
-            preset: hit.map_or_else(|| "自定义".to_string(), |preset| preset.name.to_string()),
-            preset_hit: hit.and_then(|preset| {
-                crate::region::PRESETS
-                    .iter()
-                    .position(|item| item.name == preset.name)
-            }),
+            ratio_label: Ratio::label(panel.ratio()).to_string(),
+            ratio_selected: Ratio::menu_index(panel.ratio()),
+            destination: panel.destination(),
+            readout: panel.readout(region, dpi),
             can_start: problem.is_none(),
             layout: rects,
         })

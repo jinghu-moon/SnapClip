@@ -68,6 +68,7 @@ use crate::geometry::{
     magnifier_geometry, window_rect_to_local,
 };
 use crate::keymap::{Action, Chord, Context, GuideGroup, Key, LoupeHint};
+use crate::region::Destination;
 use crate::ports::{ArtifactWriter, CaptureEventSink, ClipboardWriter, OverlayPlatform};
 use crate::preferences::OverlayPreferences;
 use crate::sampler::{ColorFormat, ColorSampler};
@@ -603,7 +604,8 @@ struct OverlayController {
     ///
     /// 面板里选延时并确认时置位；`start_session` 只在"这次启动是延时自己发起的"时保留它，
     /// 用户手动起的会话会把它和 `pending_region` 一起清掉，不留副作用。
-    pin_after_delay: bool,
+    /// 延时到点之后要做什么（复制 / 贴图）；`None` 表示没有延时在等。
+    delay_destination: Option<Destination>,
     /// 让 `start_session` 知道这次启动来自延时（同步的一次性标记）。
     delay_in_flight: bool,
     /// The region a delayed capture is waiting to apply, in desktop pixels.
@@ -776,7 +778,7 @@ impl OverlayController {
             countdown: None,
             countdown_dragging: false,
             countdown_handle: None,
-            pin_after_delay: false,
+            delay_destination: None,
             delay_in_flight: false,
             loupe_hints: Arc::from(Vec::new()),
             guide_groups: Arc::from(Vec::new()),

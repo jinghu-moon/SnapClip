@@ -120,6 +120,29 @@ impl Region {
         }
     }
 
+    /// 以当前宽为基准套一个比例；放不下就**按比例缩小**（比例不许被撑破）。
+    ///
+    /// 位置不动，最后交给 [`Region::inside`] 挪进屏幕：它只挪不改尺寸，所以缩小后的比例仍然成立。
+    pub fn fitted_ratio(self, ratio: Ratio, screen: Rect) -> Self {
+        let (rw, rh) = (i64::from(ratio.w.max(1)), i64::from(ratio.h.max(1)));
+        let mut width = i64::from(self.width.max(1));
+        let mut height = ((width * rh + rw / 2) / rw).max(1);
+        let max_w = i64::from(screen.width().max(1));
+        let max_h = i64::from(screen.height().max(1));
+        if width > max_w || height > max_h {
+            // 两轴各自能放大的倍数取小者，再按这个倍数缩 —— 只动宽，高由比例重算。
+            let shrink = (max_w as f64 / width as f64).min(max_h as f64 / height as f64);
+            width = ((width as f64 * shrink).floor() as i64).clamp(1, max_w);
+            height = ((width * rh + rw / 2) / rw).max(1).min(max_h);
+        }
+        Self {
+            width: width as i32,
+            height: height as i32,
+            ..self
+        }
+        .inside(screen)
+    }
+
     /// 贴到本屏左上角。
     pub fn at_origin(self, screen: Rect) -> Self {
         Self {
@@ -255,59 +278,109 @@ impl Delay {
     }
 }
 
-/// 内置的预设尺寸（PixPin 的默认四项，docs/28 §2.2）。
+/// 一个**比例规格**：面板管的是"框的形状"，不是一个具体像素尺寸。
 ///
-/// 名称与尺寸成对出现，所以改名不会错位；`500×500` 那一项没有名字，用尺寸当名字。
+/// 尺寸预设（`500×500` / `480p` …）已经删掉：这个面板的核心是精确设定，用户要一个死数字
+/// 时自己敲比翻预设更快；真正跨截图稳定的是**规格**本身（docs/23 §14.55.10 的设计依据）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Preset {
+pub struct Ratio {
     pub name: &'static str,
-    pub width: i32,
-    pub height: i32,
+    pub w: i32,
+    pub h: i32,
 }
 
-pub const PRESETS: [Preset; 4] = [
-    Preset {
-        name: "500×500",
-        width: 500,
-        height: 500,
-    },
-    Preset {
-        name: "480p",
-        width: 640,
-        height: 480,
-    },
-    Preset {
-        name: "720p",
-        width: 1280,
-        height: 720,
-    },
-    Preset {
-        name: "1080p",
-        width: 1920,
-        height: 1080,
-    },
+/// 菜单第一项，也是"不锁比例"的唯一表达。
+pub const RATIO_FREE_LABEL: &str = "无比例";
+
+/// 菜单里除「无比例」之外的项，顺序就是下拉顺序。
+pub const RATIOS: [Ratio; 8] = [
+    Ratio { name: "1:1", w: 1, h: 1 },
+    Ratio { name: "4:3", w: 4, h: 3 },
+    Ratio { name: "3:4", w: 3, h: 4 },
+    Ratio { name: "16:9", w: 16, h: 9 },
+    Ratio { name: "9:16", w: 9, h: 16 },
+    Ratio { name: "3:2", w: 3, h: 2 },
+    Ratio { name: "2:3", w: 2, h: 3 },
+    Ratio { name: "21:9", w: 21, h: 9 },
 ];
 
-/// 当前区域命中的预设，没有命中就是 `None`（面板显示"自定义"）。
-pub fn preset_for(region: Region) -> Option<&'static Preset> {
-    PRESETS
-        .iter()
-        .find(|preset| preset.width == region.width && preset.height == region.height)
+/// 比例菜单的项数：「无比例」+ [`RATIOS`]。
+pub const RATIO_MENU_LEN: usize = RATIOS.len() + 1;
+
+impl Ratio {
+    /// 下拉里的第几项：`None`（无比例）是 0，其余按 [`RATIOS`] 的顺序 +1。
+    pub fn menu_index(ratio: Option<Ratio>) -> usize {
+        ratio
+            .and_then(|ratio| RATIOS.iter().position(|item| *item == ratio))
+            .map_or(0, |index| index + 1)
+    }
+
+    /// 第 `index` 项对应的比例：0 就是「无比例」。
+    pub fn at_menu(index: usize) -> Option<Ratio> {
+        index
+            .checked_sub(1)
+            .and_then(|index| RATIOS.get(index).copied())
+    }
+
+    /// 显示文案：`无比例` 或比例名。
+    pub fn label(ratio: Option<Ratio>) -> &'static str {
+        ratio.map_or(RATIO_FREE_LABEL, |ratio| ratio.name)
+    }
+
+    /// 交换宽高之后的对应比例。找不到对应项就返回 `None`（例如 `21:9` 没有 `9:21`）。
+    pub fn flipped(self) -> Option<Ratio> {
+        RATIOS
+            .iter()
+            .copied()
+            .find(|item| item.w == self.h && item.h == self.w)
+    }
+}
+
+/// 这张截图的落点。默认 `Copy`：与"确定"一直以来的行为一致（复制 + 入历史）。
+///
+/// `Save` 还没有：保存面板还没做，**选了没反应的选项比没有更糟**（docs/23 §14.55.14）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Destination {
+    Copy,
+    Pin,
+}
+
+impl Destination {
+    pub const ALL: [Self; 2] = [Self::Copy, Self::Pin];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Copy => "复制",
+            Self::Pin => "贴图",
+        }
+    }
+
+    /// 页脚读数里的动词：`将复制 …` / `将贴图 …`。
+    pub fn verb(self) -> &'static str {
+        self.label()
+    }
+
+    pub fn index(self) -> usize {
+        match self {
+            Self::Copy => 0,
+            Self::Pin => 1,
+        }
+    }
 }
 
 /// 面板上的焦点槽，按 Tab 顺序。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PanelSlot {
     Unit,
+    Ratio,
+    Swap,
     Width,
     Height,
-    Swap,
-    Lock,
     X,
     Y,
     Center,
     Origin,
-    Preset,
+    Destination,
     Delay,
     ShowSize,
     ShowPosition,
@@ -318,21 +391,22 @@ pub enum PanelSlot {
 
 impl PanelSlot {
     pub const ORDER: [Self; 16] = [
-        // 页头那一组在最上面，所以 Tab 从它开始；默认焦点另说（见 `RegionPanel::new`）。
-        Self::Unit,
+        // 卡头在数字之前（比例按钮与交换按钮都在尺寸卡头里），所以 Tab 从比例开始；
+        // 默认焦点另说（见 `RegionPanel::new`）。
+        Self::Ratio,
+        Self::Swap,
         Self::Width,
         Self::Height,
-        Self::Swap,
-        Self::Lock,
         Self::X,
         Self::Y,
         Self::Center,
         Self::Origin,
-        Self::Preset,
+        Self::Destination,
         Self::Delay,
         Self::ShowSize,
         Self::ShowPosition,
         Self::ShowUnit,
+        Self::Unit,
         Self::Cancel,
         Self::Start,
     ];
@@ -452,8 +526,10 @@ struct FieldText {
 pub struct RegionPanel {
     unit: LengthUnit,
     delay: Delay,
-    /// 锁定时的宽高比；`None` 表示未锁。
-    ratio: Option<(i32, i32)>,
+    /// 选中的比例；`None` 表示「无比例」（不锁）。
+    ratio: Option<Ratio>,
+    /// 这张截图往哪儿去。
+    destination: Destination,
     focus: PanelSlot,
     editing: Option<FieldText>,
     /// 预设下拉展开时的键盘高亮项；`None` 表示收起。
@@ -468,6 +544,7 @@ impl RegionPanel {
             unit,
             delay,
             ratio: None,
+            destination: Destination::Copy,
             focus: PanelSlot::Width,
             editing: None,
             menu: None,
@@ -486,6 +563,38 @@ impl RegionPanel {
 
     pub fn locked(&self) -> bool {
         self.ratio.is_some()
+    }
+
+    /// 选中的比例（`None` = 无比例）。
+    pub fn ratio(&self) -> Option<Ratio> {
+        self.ratio
+    }
+
+    /// 这张截图的落点。
+    pub fn destination(&self) -> Destination {
+        self.destination
+    }
+
+    /// 页脚读数：这一张会去哪、出多大（**没有校验错误时**显示的那句）。
+    pub fn readout(&self, region: Region, dpi: u32) -> String {
+        let verb = self.destination.verb();
+        match self.unit {
+            LengthUnit::Px => format!("将{verb} {}×{} px", region.width, region.height),
+            LengthUnit::Dp => format!(
+                "将{verb} {}×{} dp → {}×{} px",
+                region.shown(RegionField::Width, LengthUnit::Dp, dpi),
+                region.shown(RegionField::Height, LengthUnit::Dp, dpi),
+                region.width,
+                region.height
+            ),
+        }
+    }
+
+    /// 点了去向分段器里的哪一段。
+    pub fn choose_destination(&mut self, destination: Destination) -> PanelChange {
+        self.focus_slot(PanelSlot::Destination);
+        self.destination = destination;
+        PanelChange::Repaint
     }
 
     pub fn focus(&self) -> PanelSlot {
@@ -567,7 +676,7 @@ impl RegionPanel {
         let field = edit.field;
         let px = self.unit.to_px(value, dpi);
         let next = match self.ratio {
-            Some(ratio) => region.with_ratio(field, px, ratio),
+            Some(ratio) => region.with_ratio(field, px, (ratio.w, ratio.h)),
             None => region.set(field, px),
         };
         // 缓冲换成提交后的读数：用户看到的数和他敲的数在两种单位下都一致。
@@ -580,7 +689,7 @@ impl RegionPanel {
 
     /// 鼠标点了下拉里的第几项：键盘高亮挪过去，再按一次 Enter 的语义。
     pub fn pick(&mut self, index: usize, region: Region, dpi: u32) -> PanelChange {
-        self.menu = Some(index.min(PRESETS.len() - 1));
+        self.menu = Some(index.min(RATIO_MENU_LEN - 1));
         self.key(PanelKey::Enter, region, dpi)
     }
 
@@ -616,7 +725,7 @@ impl RegionPanel {
         if let Some(index) = self.menu {
             return match key {
                 PanelKey::Up | PanelKey::Down => {
-                    let count = PRESETS.len();
+                    let count = RATIO_MENU_LEN;
                     let next = if key == PanelKey::Down {
                         (index + 1) % count
                     } else {
@@ -626,13 +735,15 @@ impl RegionPanel {
                     PanelChange::Repaint
                 }
                 PanelKey::Enter => {
-                    let preset = PRESETS[index.min(PRESETS.len() - 1)];
+                    let picked = Ratio::at_menu(index.min(RATIO_MENU_LEN - 1));
                     self.menu = None;
-                    let next = region
-                        .set(RegionField::Width, preset.width)
-                        .set(RegionField::Height, preset.height)
-                        .inside(self.screen);
-                    
+                    self.ratio = picked;
+                    // 选「无比例」只解耦，尺寸不动；选了比例就以**当前宽**为基准套上去，
+                    // 放不下时按比例缩小（比例不许被撑破）。
+                    let next = match picked {
+                        Some(ratio) => region.fitted_ratio(ratio, self.screen),
+                        None => region,
+                    };
                     PanelChange::Region(next)
                 }
                 PanelKey::Escape | PanelKey::Tab | PanelKey::BackTab => {
@@ -762,29 +873,20 @@ impl RegionPanel {
             }
             PanelKey::Enter => match self.focus {
                 PanelSlot::Cancel => PanelChange::Cancel,
-                PanelSlot::Preset => {
-                    // 从当前命中的那一项开始，而不是永远从第一项：键盘按 Enter 打开再 Enter，
-                    // 不该把区域换成 500×500。
-                    self.menu = Some(
-                        preset_for(region)
-                            .and_then(|preset| {
-                                PRESETS.iter().position(|item| item.name == preset.name)
-                            })
-                            .unwrap_or(0),
-                    );
+                PanelSlot::Ratio => {
+                    // 从当前选中的那一项开始：按 Enter 打开再 Enter，不该把比例换成 1:1。
+                    self.menu = Some(Ratio::menu_index(self.ratio));
                     PanelChange::Repaint
                 }
                 PanelSlot::Swap => {
+                    // 只交换宽高两个数；比例非无比例时一起翻转，免得出现"锁 16:9 却显示 9:16"。
+                    // `21:9` 没有 `9:21` 对应项 ⇒ 退回无比例（唯一自洽的选择）。
+                    // 越界不自动夹：交给页脚红字，与打字路径一致（不悄悄挪选区）。
+                    if let Some(ratio) = self.ratio {
+                        self.ratio = ratio.flipped();
+                    }
                     let next = region.swapped();
-                    
                     PanelChange::Region(next)
-                }
-                PanelSlot::Lock => {
-                    self.ratio = match self.ratio {
-                        Some(_) => None,
-                        None => Some((region.width.max(1), region.height.max(1))),
-                    };
-                    PanelChange::Repaint
                 }
                 PanelSlot::Center => {
                     let next = region.centered(self.screen);
@@ -992,29 +1094,128 @@ mod tests {
         region
     }
 
+    /// 菜单里按 `Down` 走 `steps` 次再从菜单项取比例（0 是无比例）。
+    fn pick_menu(panel: &mut RegionPanel, region: Region, steps: usize) -> Region {
+        panel.click(PanelSlot::Ratio, region, 96);
+        for _ in 0..steps {
+            panel.key(PanelKey::Down, region, 96);
+        }
+        match panel.key(PanelKey::Enter, region, 96) {
+            PanelChange::Region(next) => next,
+            other => panic!("选比例要给新区域，拿到 {other:?}"),
+        }
+    }
+
     #[test]
-    fn a_locked_ratio_follows_the_edited_side() {
+    fn a_ratio_follows_the_edited_side_and_free_lets_them_go() {
         let mut panel = panel();
         let mut region = region(); // 1370×824
-        panel.click(PanelSlot::Lock, region, 96);
+        assert!(!panel.locked(), "默认是无比例");
+
+        // 16:9：以当前宽为基准算高。
+        region = pick_menu(&mut panel, region, 4);
+        assert_eq!(panel.ratio().map(|ratio| ratio.name), Some("16:9"));
         assert!(panel.locked());
+        assert_eq!((region.width, region.height), (1370, 771), "1370×9/16 四舍五入");
 
-        // 改宽：高按锁定那一刻的比例跟着走（1370:824）。
-        region = retype(&mut panel, region, PanelSlot::Width, "1");
-        assert_eq!((region.width, region.height), (1, 1), "1 宽对应的高不足 1，兜底到 1");
+        // 改宽：高跟着比例走。
+        region = retype(&mut panel, region, PanelSlot::Width, "800");
+        assert_eq!(region.height, 450, "800×9/16");
 
-        // 改高：宽按比例回来，宽仍大于高。
-        region = retype(&mut panel, region, PanelSlot::Height, "6");
-        assert_eq!(region.height, 6);
-        assert!(region.width > region.height, "比例是锁定那一刻的");
+        // 改高：宽跟着回来。
+        region = retype(&mut panel, region, PanelSlot::Height, "900");
+        assert_eq!(region.width, 1600, "900×16/9");
 
-        // 解锁之后两格各走各的。
-        panel.click(PanelSlot::Lock, region, 96);
+        // 选「无比例」只解耦，尺寸不动。菜单打开时停在当前项（16:9 = 第 4 项），
+        // 走 5 步回卷到第 0 项。
+        region = pick_menu(&mut panel, region, 5);
         assert!(!panel.locked());
+        assert_eq!((region.width, region.height), (1600, 900), "解耦不动尺寸");
         let height = region.height;
-        region = retype(&mut panel, region, PanelSlot::Width, "3");
-        assert_eq!(region.width, 3);
+        region = retype(&mut panel, region, PanelSlot::Width, "300");
+        assert_eq!(region.width, 300);
         assert_eq!(region.height, height, "没锁就不动另一格");
+    }
+
+    #[test]
+    fn swapping_flips_the_ratio_and_falls_back_when_there_is_no_counterpart() {
+        // 1:1 换完还是 1:1 —— 按菜单顺序它是第 1 项。
+        let mut panel = panel();
+        let region = region();
+        let region = pick_menu(&mut panel, region, 1);
+        let PanelChange::Region(swapped) = panel.click(PanelSlot::Swap, region, 96) else {
+            panic!("交换要给新区域");
+        };
+        assert_eq!((swapped.width, swapped.height), (region.height, region.width));
+        assert_eq!(panel.ratio().map(|ratio| ratio.name), Some("1:1"));
+
+        // 16:9 → 9:16。
+        let mut other = RegionPanel::new(LengthUnit::Dp, Delay::ALL[0], screen(), 8);
+        let start = Region {
+            width: 1370,
+            height: 824,
+            x: 1325,
+            y: 632,
+        };
+        let region = pick_menu(&mut other, start, 4);
+        let PanelChange::Region(_) = other.click(PanelSlot::Swap, region, 96) else {
+            panic!("交换要给新区域");
+        };
+        assert_eq!(other.ratio().map(|ratio| ratio.name), Some("9:16"));
+
+        // 21:9 没有 9:21 对应项 ⇒ 退回无比例（唯一自洽的选择）。
+        let mut third = RegionPanel::new(LengthUnit::Dp, Delay::ALL[0], screen(), 8);
+        let region = pick_menu(&mut third, start, 8);
+        assert_eq!(third.ratio().map(|ratio| ratio.name), Some("21:9"));
+        let _ = third.click(PanelSlot::Swap, region, 96);
+        assert_eq!(third.ratio(), None);
+    }
+
+    #[test]
+    fn swap_does_not_move_the_region_back_into_the_screen() {
+        // 交换只换两个数：越界交给页脚红字，与打字路径一致（不悄悄挪选区）。
+        let mut panel = panel();
+        let region = Region {
+            width: 500,
+            height: 500,
+            x: 3840 - 500,
+            y: 2160 - 500,
+        };
+        let PanelChange::Region(swapped) = panel.click(PanelSlot::Swap, region, 96) else {
+            panic!("交换要给新区域");
+        };
+        assert_eq!((swapped.x, swapped.y), (region.x, region.y), "位置一毫米都没动");
+    }
+
+    #[test]
+    fn the_destination_defaults_to_copy_and_drives_the_footer_readout() {
+        let mut panel = RegionPanel::new(LengthUnit::Px, Delay::ALL[0], screen(), 8);
+        let region = region();
+        assert_eq!(panel.destination(), Destination::Copy, "默认与确定一直以来的行为一致");
+        assert_eq!(panel.readout(region, 96), "将复制 1370×824 px");
+
+        panel.choose_destination(Destination::Pin);
+        assert_eq!(panel.destination(), Destination::Pin);
+        assert_eq!(panel.readout(region, 96), "将贴图 1370×824 px");
+
+        // DP 模式把换算写出来（这才是 dp 那一侧的信息量）。
+        let dp = RegionPanel::new(LengthUnit::Dp, Delay::ALL[0], screen(), 8);
+        assert_eq!(dp.readout(region, 144), "将复制 913×549 dp → 1370×824 px");
+    }
+
+    #[test]
+    fn the_ratio_button_shows_free_until_a_ratio_is_picked() {
+        let mut panel = panel();
+        let region = region();
+        assert_eq!(Ratio::label(panel.ratio()), RATIO_FREE_LABEL);
+        let region = pick_menu(&mut panel, region, 4);
+        assert_eq!(Ratio::label(panel.ratio()), "16:9");
+        // 菜单里打勾的项跟着走。
+        assert_eq!(Ratio::menu_index(panel.ratio()), 4);
+        assert_eq!(Ratio::at_menu(4).map(|ratio| ratio.name), Some("16:9"));
+        assert_eq!(Ratio::at_menu(0), None, "第 0 项是无比例，没有「0:0」这种伪值");
+        assert_eq!(RATIO_MENU_LEN, 9);
+        let _ = region;
     }
 
     #[test]
@@ -1037,12 +1238,12 @@ mod tests {
             .map(|step| PanelSlot::ORDER[(index + step) % PanelSlot::ORDER.len()])
             .collect();
         assert_eq!(seen, expected);
-        // 走完一圈停在 Unit（表里的第一项），再 Tab 回到起点。
-        assert_eq!(panel.focus(), PanelSlot::Unit);
+        // 走完一圈停在「起点 Width 的前一项」，再 Tab 回到起点。
+        assert_eq!(panel.focus(), PanelSlot::Swap);
         panel.key(PanelKey::Tab, region, 96);
         assert_eq!(panel.focus(), PanelSlot::Width, "走完一圈回到起点");
         panel.key(PanelKey::BackTab, region, 96);
-        assert_eq!(panel.focus(), PanelSlot::Unit, "反向回卷到表尾的那一项");
+        assert_eq!(panel.focus(), PanelSlot::Swap, "反向回卷回来的那一项");
     }
 
     #[test]
@@ -1065,11 +1266,10 @@ mod tests {
     fn a_field_starts_editing_as_soon_as_the_focus_lands_on_it() {
         let mut panel = panel();
         let region = region();
-        // Tab 落到 X：直接就能敲，不必先按一下。
-        for _ in 0..4 {
+        // Tab 落到 X：直接就能敲，不必先按一下。走到 X 为止（不写死步数：Tab 顺序会变）。
+        while panel.focus() != PanelSlot::X {
             panel.key(PanelKey::Tab, region, 96);
         }
-        assert_eq!(panel.focus(), PanelSlot::X);
         assert_eq!(panel.editing(), Some(RegionField::X));
         assert_eq!(panel.field_text(RegionField::X, region, 96), "1325");
     }
@@ -1092,57 +1292,58 @@ mod tests {
     }
 
     #[test]
-    fn the_dropdown_opens_picks_and_lets_escape_through_first() {
+    fn the_ratio_menu_opens_picks_and_lets_escape_through_first() {
         let mut panel = panel();
         let region = region();
-        panel.click(PanelSlot::Preset, region, 96);
-        assert_eq!(panel.menu(), Some(0), "点一下展开，键盘停在第一项");
+        panel.click(PanelSlot::Ratio, region, 96);
+        assert_eq!(panel.menu(), Some(0), "点一下展开，键盘停在「无比例」上");
         let PanelChange::Region(picked) = panel.key(PanelKey::Enter, region, 96) else {
             panic!("选中一项要给新区域");
         };
-        assert_eq!((picked.width, picked.height), (500, 500));
+        assert_eq!((picked.width, picked.height), (1370, 824), "无比例不动尺寸");
         assert_eq!(panel.menu(), None, "选完收起");
 
-        // 键盘：Enter 打开、上下键挪、Enter 选中；打开时停在当前命中项上。
+        // 键盘：Enter 打开、上下键挪、Enter 选中；打开时停在**当前**比例上。
         let mut keys = RegionPanel::new(LengthUnit::Dp, Delay::ALL[0], screen(), 8);
-        keys.click(PanelSlot::Preset, picked, 96);
-        assert_eq!(keys.menu(), Some(0), "当前是 500×500，就从它开始");
-        assert_eq!(keys.key(PanelKey::Down, picked, 96), PanelChange::Repaint);
-        assert_eq!(keys.menu(), Some(1));
-        keys.key(PanelKey::Down, picked, 96);
-        assert_eq!(keys.menu(), Some(2), "720p");
+        let picked = pick_menu(&mut keys, picked, 4);
+        keys.click(PanelSlot::Ratio, picked, 96);
+        assert_eq!(keys.menu(), Some(4), "当前是 16:9，就从它开始");
+        assert_eq!(keys.key(PanelKey::Up, picked, 96), PanelChange::Repaint);
+        assert_eq!(keys.menu(), Some(3), "3:4");
         let PanelChange::Region(picked) = keys.key(PanelKey::Enter, picked, 96) else {
             panic!("选中一项要给新区域");
         };
-        assert_eq!((picked.width, picked.height), (1280, 720));
+        assert_eq!(keys.ratio().map(|ratio| ratio.name), Some("3:4"));
+        assert!(picked.height > picked.width, "3:4 是竖的");
         assert_eq!(keys.menu(), None);
         // Esc 先收下拉，再按一次才是取消这次截图。
-        panel.click(PanelSlot::Preset, region, 96);
+        panel.click(PanelSlot::Ratio, region, 96);
         assert_eq!(panel.key(PanelKey::Escape, region, 96), PanelChange::Repaint);
         assert_eq!(panel.menu(), None);
         assert_eq!(panel.key(PanelKey::Escape, region, 96), PanelChange::Cancel);
     }
 
     #[test]
-    fn a_preset_lands_inside_the_screen() {
+    fn a_ratio_shrinks_to_fit_the_screen_and_keeps_its_proportion() {
         let mut panel = panel();
-        // 区域贴在右下角：换 1080p 会放不下，应当被挪进来而不是报错。
+        // 区域贴在右下角且很宽：套 21:9 会放不下，应当**按比例缩小并挪进来**，而不是报错。
         let region = Region {
-            width: 500,
-            height: 500,
-            x: 3840 - 500,
-            y: 2160 - 500,
+            width: 3600,
+            height: 2000,
+            x: 3840 - 3600,
+            y: 2160 - 2000,
         };
-        panel.click(PanelSlot::Preset, region, 96);
-        for _ in 0..3 {
-            let index = panel.menu().expect("下拉开着");
-            panel.menu = Some(index + 1);
-        }
-        let PanelChange::Region(picked) = panel.key(PanelKey::Enter, region, 96) else {
-            panic!("选中一项要给新区域");
-        };
-        assert_eq!((picked.width, picked.height), (1920, 1080));
-        assert_eq!((picked.x, picked.y), (3840 - 1920, 2160 - 1080));
+        let picked = pick_menu(&mut panel, region, 8);
+        assert_eq!(panel.ratio().map(|ratio| ratio.name), Some("21:9"));
+        assert!(picked.width <= 3840 && picked.height <= 2160, "必须在小屏幕里");
+        let lhs = i64::from(picked.width) * 9;
+        let rhs = i64::from(picked.height) * 21;
+        assert!(
+            (lhs - rhs).abs() <= 21,
+            "21:9 的比例要保住（{}×{}）",
+            picked.width,
+            picked.height
+        );
         assert_eq!(panel.problem(picked), None, "挪进来之后就是合法的");
     }
 

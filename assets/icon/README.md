@@ -5,7 +5,6 @@
 | 文件 | 用在哪 |
 | --- | --- |
 | `swap.svg` | 尺寸卡：互换宽高 |
-| `lock.svg` / `lock-open.svg` | 尺寸卡：比例锁定 / 未锁 |
 | `center.svg` | 位置卡：居中到屏幕 |
 | `origin.svg` | 位置卡：移到原点 |
 | `close.svg` | 面板右上角关闭 |

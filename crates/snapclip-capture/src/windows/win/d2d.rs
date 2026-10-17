@@ -69,7 +69,9 @@ use crate::geometry::{
     segment_outer_radius, segment_radius,
 };
 use crate::icons::Glyph;
-use crate::region::{Delay, PanelSlot, RegionField};
+use crate::region::{
+    Delay, Destination, PanelSlot, Ratio, RegionField, RATIOS, RATIO_FREE_LABEL,
+};
 use crate::units::{LabelDisplay, LabelToggle, LengthUnit};
 pub(crate) use guide_pass::{GUIDE_AVOID_DIP, GuideView};
 
@@ -200,10 +202,14 @@ pub struct RegionPanelView {
     pub toggles: [(LabelToggle, bool); 3],
     /// 页脚那句话（校验失败时）。
     pub status: Option<String>,
-    /// 预设触发器上的字（命中的预设名，或"自定义"）。
-    pub preset: String,
-    /// 命中的预设项，下拉里给它打勾。
-    pub preset_hit: Option<usize>,
+    /// 比例按钮上的字（`无比例` 或比例名）。
+    pub ratio_label: String,
+    /// 下拉里给哪一项打勾（`Ratio::menu_index`，0 是「无比例」）。
+    pub ratio_selected: usize,
+    /// 这张截图的落点（决定「确定」的文案与页脚读数）。
+    pub destination: Destination,
+    /// 页脚读数：没有校验错误时显示的那句。
+    pub readout: String,
     /// 开始按钮是否可用。
     pub can_start: bool,
 }
@@ -1828,20 +1834,46 @@ impl OverlayRenderer {
                 &muted,
             )?;
         }
+        // 比例按钮：住在尺寸卡头里，右对齐在交换图标左侧。常态无底，悬停/展开铺 5 圆角底；
+        // 选了比例（非「无比例」）时值用主色，提示宽高被锁在一起（docs/23 §14.55.15）。
+        let ratio_hover = panel.hover == Some(RegionPanelTarget::Slot(PanelSlot::Ratio));
+        let menu_expanded = layout.menu.is_some();
+        if ratio_hover || menu_expanded {
+            self.fill_round(layout.ratio, dip(5.0), &fill);
+        }
+        if panel.focus == Some(PanelSlot::Ratio) {
+            self.stroke_round(layout.ratio, dip(5.0), &accent, 1.5);
+        }
+        let ratio_format = self.info_text_format_mut(false, 12.0, DWRITE_FONT_WEIGHT_NORMAL, false)?;
+        let ratio_box = Rect::new(
+            layout.ratio.left + dip(7.0),
+            layout.ratio.top,
+            layout.ratio.right - dip(18.0),
+            layout.ratio.bottom,
+        );
+        let ratio_brush = if panel.locked { &accent } else { &muted };
+        self.draw_text_in(&panel.ratio_label, &ratio_format, to_d2d(ratio_box), ratio_brush)?;
+        self.draw_glyph(
+            Glyph::Chevron,
+            centered_square_at(
+                layout.ratio.right - dip(12.0),
+                layout.ratio.top + layout.ratio.height() / 2,
+                dip(PANEL_ICON_DIP),
+            ),
+            &muted,
+            menu_expanded,
+        )?;
+
         for (slot, rect) in layout.actions {
-            let pressed = slot == PanelSlot::Lock && panel.locked;
             let hovered = panel.hover == Some(RegionPanelTarget::Slot(slot));
-            if pressed {
-                self.fill_round(rect, dip(5.0), &accent_fill);
-            } else if hovered {
+            if hovered {
                 self.fill_round(rect, dip(5.0), &fill);
             }
             if panel.focus == Some(slot) {
                 self.stroke_round(rect, dip(5.0), &accent, 2.0);
             }
-            let brush = if pressed { &text } else { &muted };
-            if let Some(icon) = action_icon(slot, panel.locked) {
-                self.draw_glyph(icon, centered_square(rect, dip(PANEL_ICON_DIP)), brush, false)?;
+            if let Some(icon) = action_icon(slot) {
+                self.draw_glyph(icon, centered_square(rect, dip(PANEL_ICON_DIP)), &muted, false)?;
             }
         }
 
@@ -1908,7 +1940,9 @@ impl OverlayRenderer {
             ::windows::Win32::Graphics::DirectWrite::DWRITE_FONT_WEIGHT_BOLD,
             true,
         )?;
-        self.draw_text_in("×", &sep_format, to_d2d(layout.separators[0]), &muted)?;
+        // 锁了比例时 `×` 转主色：这两个数不再独立（docs/23 §14.55.15）。
+        let times_brush = if panel.locked { &accent } else { &muted };
+        self.draw_text_in("×", &sep_format, to_d2d(layout.separators[0]), times_brush)?;
         let mid = (layout.separators[1].left + layout.separators[1].right) / 2;
         self.line(
             Point::new(mid, layout.separators[1].top + dip(4.0)),
@@ -1917,39 +1951,42 @@ impl OverlayRenderer {
             1.0,
         );
 
-        // ── 预设行：标签 + 触发器（下拉另画）+ 延时四段 ─────────────────────
+        // ── 去向行：标签 + 复制/贴图（比例按钮已搬进尺寸卡头）+ 延时四段 ─────
         let row_label_format =
             self.info_text_format_mut(false, 10.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, false)?;
-        self.draw_text_in("预设", &row_label_format, to_d2d(layout.preset_label), &muted)?;
+        self.draw_text_in("去向", &row_label_format, to_d2d(layout.destination_label), &muted)?;
         self.draw_text_in("角标", &row_label_format, to_d2d(layout.toggle_label), &muted)?;
         self.draw_text_in("延时", &row_label_format, to_d2d(layout.delay_label), &muted)?;
 
-        let trigger_hover = panel.hover == Some(RegionPanelTarget::Slot(PanelSlot::Preset));
-        let expanded = layout.menu.is_some();
-        self.fill_round(layout.preset, dip(6.0), if trigger_hover || expanded { &fill } else { &fill });
-        if expanded {
-            self.stroke_round(layout.preset, dip(6.0), &line, 1.0);
-        }
-        if panel.focus == Some(PanelSlot::Preset) {
-            self.stroke_round(layout.preset, dip(6.0), &accent, 1.5);
-        }
-        let trigger_format = self.info_text_format_mut(false, 12.0, DWRITE_FONT_WEIGHT_NORMAL, false)?;
-        let trigger_box = Rect::new(
-            layout.preset.left + dip(9.0),
-            layout.preset.top,
-            layout.preset.right - dip(24.0),
-            layout.preset.bottom,
-        );
-        let trigger_brush = if panel.preset_hit.is_some() { &text } else { &muted };
-        self.draw_text_in(&panel.preset, &trigger_format, to_d2d(trigger_box), trigger_brush)?;
-        // 箭头：展开时同一个图标上下翻过来（不另存一份朝上的资产）。
-        let chevron_cx = layout.preset.right - dip(13.0);
-        let chevron_cy = layout.preset.top + layout.preset.height() / 2;
-        self.draw_glyph(
-            Glyph::Chevron,
-            centered_square_at(chevron_cx, chevron_cy, dip(PANEL_ICON_DIP)),
-            &muted,
-            expanded,
+        // 去向与单位、延时共用同一份分段器绘制（docs/23 §14.55.4）。
+        let destination_segments: Vec<(Rect, &str, bool)> = layout
+            .destination
+            .iter()
+            .map(|(destination, rect)| (*rect, destination.label(), *destination == panel.destination))
+            .collect();
+        let destination_hovered = layout
+            .destination
+            .iter()
+            .position(|(destination, _)| {
+                panel.hover == Some(RegionPanelTarget::Destination(*destination))
+            });
+        self.draw_segmented(
+            layout.destination_track,
+            &destination_segments,
+            destination_hovered,
+            panel.focus == Some(PanelSlot::Destination),
+            None,
+            &SegmentStyle {
+                track: &fill,
+                selected: &accent_fill,
+                hover: &line,
+                focus: &accent,
+                text: &text,
+                muted: &muted,
+                mono: false,
+                size_dip: 11.0,
+                weight: DWRITE_FONT_WEIGHT_NORMAL,
+            },
         )?;
 
         // 与单位分段器共用一份绘制（docs/23 §14.55.4）。
@@ -2012,8 +2049,16 @@ impl OverlayRenderer {
 
         // ── 页脚：一句话 + 取消 / 确定 ─────────────────────────────────
         let status_format = self.info_text_format_mut(false, 11.0, DWRITE_FONT_WEIGHT_NORMAL, false)?;
-        if let Some(status) = panel.status.as_deref() {
-            self.draw_text_in(status, &status_format, to_d2d(layout.status), &danger)?;
+        match panel.status.as_deref() {
+            // 有校验错误：红字占这个槽（读数让位）。
+            Some(status) => self.draw_text_in(status, &status_format, to_d2d(layout.status), &danger)?,
+            // 没有错误：这一张会去哪、出多大。
+            None => self.draw_text_in(
+                &panel.readout,
+                &status_format,
+                to_d2d(layout.status),
+                &muted,
+            )?,
         }
         let cancel_hover = panel.hover == Some(RegionPanelTarget::Slot(PanelSlot::Cancel));
         if cancel_hover {
@@ -2043,16 +2088,21 @@ impl OverlayRenderer {
         }
         let start_format = self.info_text_format_mut(false, 12.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, true)?;
         let start_text_brush = if panel.can_start { &text } else { &muted };
-        self.draw_text_in("确定", &start_format, to_d2d(layout.start), start_text_brush)?;
+        // 按钮文案随去向走（复制 / 贴图），仍是同一个 `PanelSlot::Start`。
+        self.draw_text_in(
+            panel.destination.label(),
+            &start_format,
+            to_d2d(layout.start),
+            start_text_brush,
+        )?;
 
         // ── 下拉：挂在触发器下面，压着下面的行 ─────────────────────────────
         if let Some(menu) = layout.menu {
             self.fill_round(menu, dip(10.0), &surface);
             self.stroke_round(menu, dip(10.0), &line, 1.0);
             let name_format = self.info_text_format_mut(false, 12.0, DWRITE_FONT_WEIGHT_NORMAL, false)?;
-            let size_format = self.info_text_format_mut(true, 10.5, DWRITE_FONT_WEIGHT_NORMAL, false)?;
             for (index, item) in layout.menu_items.iter().enumerate() {
-                let selected = panel.preset_hit == Some(index);
+                let selected = panel.ratio_selected == index;
                 let hovered = panel.hover == Some(RegionPanelTarget::MenuItem(index));
                 if selected || hovered {
                     let inset = dip(3.0);
@@ -2062,7 +2112,7 @@ impl OverlayRenderer {
                         if selected { &accent_fill } else { &fill },
                     );
                 }
-                let preset = crate::region::PRESETS[index.min(crate::region::PRESETS.len() - 1)];
+                let label = Ratio::label(Ratio::at_menu(index));
                 let check_x = item.left + dip(14.0);
                 if selected {
                     let mid_y = item.top + item.height() / 2;
@@ -2076,22 +2126,10 @@ impl OverlayRenderer {
                 let name_box = Rect::new(
                     item.left + dip(26.0),
                     item.top,
-                    item.right - dip(60.0),
-                    item.bottom,
-                );
-                self.draw_text_in(preset.name, &name_format, to_d2d(name_box), &text)?;
-                let size_box = Rect::new(
-                    item.right - dip(60.0),
-                    item.top,
                     item.right - dip(10.0),
                     item.bottom,
                 );
-                self.draw_text_in(
-                    &format!("{}×{}", preset.width, preset.height),
-                    &size_format,
-                    to_d2d(size_box),
-                    &muted,
-                )?;
+                self.draw_text_in(label, &name_format, to_d2d(name_box), &text)?;
             }
         }
         Ok(())
@@ -2866,9 +2904,27 @@ impl OverlayRenderer {
         for label in Delay::ALL.map(|delay| delay.label()) {
             delay = delay.max(self.measure_text_width(label, &delay_format)?);
         }
+        let mut destination = 0.0f32;
+        for label in Destination::ALL.map(|destination| destination.label()) {
+            destination = destination.max(self.measure_text_width(label, &delay_format)?);
+        }
+        // 比例按钮：文字 12 NORMAL + 箭头位 18 + 两侧内边距 7/7 —— 与 `draw_region_panel` 里
+        // 那处 `info_text_format_mut(false, 12.0, NORMAL, false)` 是同一份参数。
+        let ratio_format =
+            self.info_text_format_mut(false, 12.0, DWRITE_FONT_WEIGHT_NORMAL, false)?;
+        let mut ratio_label = 0.0f32;
+        for label in std::iter::once(RATIO_FREE_LABEL).chain(RATIOS.iter().map(|ratio| ratio.name)) {
+            ratio_label = ratio_label.max(self.measure_text_width(label, &ratio_format)?);
+        }
+        // 菜单：最宽项 + 26 的检查位 + 10 的右内边距 + 5×2 的菜单内边距（与绘制同一个算式）。
+        let ratio_menu = ratio_label + 26.0 * scale + 10.0 * scale + 10.0 * scale;
         Ok(SegmentWidths {
             unit: (unit + 2.0 * pad).ceil() as i32,
             delay: (delay + 2.0 * pad).ceil() as i32,
+            destination: (destination + 2.0 * pad).ceil() as i32,
+            // 按钮 = 文字 + 箭头位 18 + 左右内边距 7/7。
+            ratio_label: (ratio_label + 32.0 * scale).ceil() as i32,
+            ratio_menu: ratio_menu.ceil() as i32,
         })
     }
 
@@ -3152,10 +3208,9 @@ struct SegmentStyle<'a> {
 }
 
 /// 组内动作 → 图标；锁定那一格按状态换成开/关两把锁。
-fn action_icon(slot: PanelSlot, locked: bool) -> Option<Glyph> {
+fn action_icon(slot: PanelSlot) -> Option<Glyph> {
     match slot {
         PanelSlot::Swap => Some(Glyph::Swap),
-        PanelSlot::Lock => Some(if locked { Glyph::Lock } else { Glyph::LockOpen }),
         PanelSlot::Center => Some(Glyph::Center),
         PanelSlot::Origin => Some(Glyph::Origin),
         _ => None,

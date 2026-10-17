@@ -2,1022 +2,1287 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<title>SnapClip 自定义截图面板 · 取景器读数</title>
+<title>SnapClip 自定义截图面板 · 设计提案（拟议）· 与实现对照</title>
+<!--
+  这个文件是**设计/核对用**的 demo，不是产品 UI。
+  唯一事实来源是代码：geometry.rs（布局与间距）、region.rs / units.rs（数据与文案）、
+  windows/win/d2d.rs（绘制）。凡是 demo 与代码不一致的地方，以代码为准并改这里。
+  1 CSS px = 1 dip（面板固定 420 dip 宽）；屏幕按 3840×2160 / 150% 演示。
+
+  本版相对上一版的改动（均为拟议）：
+  ① 比例从独立行搬到「尺寸」卡右上角（按钮实测 64×22；菜单宽 = 「无比例」文本 + 现有内边距 = 实测 82，右缘对齐卡片右缘）；
+  ② 尺寸卡头右侧新增「交换宽高」按钮（22×22，与位置卡动作同规格）——交换 w/h，
+     比例非自由时同步翻转（1:1 不变；21:9 无 9:21 对应项 ⇒ 退回「自由」）；
+  ③ 原「比例行」改成「去向」行：复制 / 保存 / 贴图 三段（150×30），右侧仍是延时；
+  ④ 确定按钮文案随去向变化；页脚读数按去向分支；
+  ⑤ 图片卡的「格式 / 质量」只在「保存」时可用，其他去向压暗；摘要同步。
+  面板高度仍是 277 dip（去向与延时同行，没有新增行）。
+  ⑥ 「自由」更名为「无比例」（更准确：它就是一个比例项，不是"不设比例"的开关）；
+     菜单宽随之改成
+「无比例」文本宽 + 现有左右内边距（不再固定 140）。
+  ⑦ 「保存」标为未实现（压暗 + 点线 + tooltip），落地时先只做「复制」「贴图」两段。
+-->
 <style>
-  :root {
-    --font: "HarmonyOS Sans SC", "Microsoft YaHei UI", "Segoe UI", system-ui, sans-serif;
-    --num:  ui-monospace, "SF Mono", "Cascadia Mono", Consolas, monospace;
+:root{
+  /* ── 颜色：与 d2d.rs 的画刷一一对应（括号里是代码里的名字）──────────────── */
+  --accent: rgb(31,117,219);        /* ACCENT_RGB；panel_accent_brush / border_brush */
+  --muted: rgba(232,236,242,.62);   /* panel_muted_brush */
+  --danger: rgb(255,123,123);       /* panel_danger_brush */
+  --text: #fff;                     /* label_text_brush */
+  --surface: rgba(23,23,28,.92);    /* panel = color(0.09,0.09,0.11,0.92) */
+  --fill: rgba(255,255,255,.08);    /* panel_fill_brush */
+  --line: rgba(255,255,255,.30);
+  /* 拟议：图片卡专用的三支画刷——图片卡 = 主色淡染，输入区（尺寸 / 位置 / 其余行）一律中性灰，一眼分得出「截什么」和「出什么」 */
+  --out-fill: rgba(31,117,219,.14);   /* panel_out_fill_brush  = ACCENT @ .14 */
+  --out-line: rgba(31,117,219,.60);   /* panel_out_line_brush  = ACCENT @ .60 */
+  --out-title: rgb(124,180,243);      /* panel_out_title_brush（卡标题与收起箭头）*/    /* panel_line_brush：卡片边、下划线、芯片边、面板边、下拉边 */
 
-    --accent:       rgb(31, 117, 219);
-    --accent-hi:    rgb(47, 131, 230);
-    --accent-soft:  rgba(31, 117, 219, .14);
-    --accent-line:  rgba(90, 160, 250, .5);
-    --ring:         rgba(31, 117, 219, .22);
+  /* ── 字号（dip，d2d.rs 里 info_text_format_mut 的实参）──────────────────── */
+  --fs-title: 12px;      /* 自定义截图      SEMI_BOLD，非等宽，左对齐 */
+  --fs-card: 10px;       /* 尺寸 / 位置     SEMI_BOLD，非等宽 */
+  --fs-num: 20px;        /* 四个数字        SEMI_BOLD，等宽，居中 */
+  --fs-label: 10px;      /* 宽 / 高 / X / Y SEMI_BOLD，等宽，居中 */
+  --fs-times: 18px;      /* ×              BOLD，等宽，居中 */
+  --fs-row: 10px;        /* 去向 / 角标 / 延时 标签 SEMI_BOLD，非等宽 */
+  --fs-trigger: 12px;    /* 比例按钮（卡头内） NORMAL，非等宽，左对齐 */
+  --fs-seg-unit: 10px;   /* PX / DP        SEMI_BOLD，等宽 */
+  --fs-seg-delay: 11px;  /* 0 / 3s / 5s / 10s / 复制 / 保存 / 贴图 NORMAL，非等宽 */
+  --fs-scale: 10px;      /* 150%           NORMAL，等宽 */
+  --fs-chip: 11px;       /* 尺寸 / 位置 / 单位 NORMAL，等宽 */
+  --fs-status: 11px;     /* 页脚那句话      NORMAL，非等宽，左对齐 */
+  --fs-btn: 12px;        /* 取消 / 确定     等宽；确定 SEMI_BOLD */
 
-    --panel:        rgba(22, 24, 28, .82);
-    --panel-line:   rgba(255, 255, 255, .09);
-    --panel-hi:     rgba(255, 255, 255, .07);
-    --panel-shadow:
-      0 24px 64px rgba(0, 0, 0, .55),
-      0 6px 20px rgba(0, 0, 0, .38);
+  /* ── 几何（geometry.rs 的 REGION_*_DIP，全部 dip）──────────────────────── */
+  --panel-w: 420px;      /* REGION_WIDTH_DIP */
+  --pad: 16px;           /* REGION_PAD_DIP */
+  --head-top: 10px;      /* REGION_HEAD_TOP_DIP */
+  --head-row: 26px;      /* REGION_HEAD_ROW_DIP（关闭按钮也是 26×26）*/
+  --head-bottom: 8px;    /* REGION_HEAD_BOTTOM_DIP */
+  --body-top: 4px;       /* REGION_BODY_TOP_DIP */
+  --card-gap: 10px;      /* REGION_CARD_GAP_DIP */
+  --card-pad: 10px;      /* REGION_CARD_PAD_DIP */
+  --card-head: 22px;     /* max(REGION_CARD_HEAD_DIP 20, REGION_ICON_DIP 22) */
+  --card-gap-in: 6px;    /* REGION_CARD_GAP_IN_DIP */
+  --value-row: 28px;     /* REGION_VALUE_ROW_DIP */
+  --label-gap: 6px;      /* REGION_VALUE_LABEL_GAP_DIP */
+  --label-h: 14px;       /* REGION_VALUE_LABEL_DIP */
+  --sep: 16px;           /* REGION_SEPARATOR_DIP */
+  --row-gap: 10px;       /* REGION_ROW_GAP_DIP */
+  --row: 28px;           /* REGION_ROW_DIP */
+  --row-label: 26px;     /* REGION_ROW_LABEL_DIP */
+  --icon: 22px;          /* REGION_ICON_DIP（组内动作的命中框；比例按钮右侧的交换也用这个）*/
+  /* 拟议：菜单宽不固定 —— max-content = 「无比例」文本宽 + 现有左右内边距（见 notes 实测）*/
+  --seg-h: 30px;         /* REGION_SEGMENT_DIP：延时 / 去向 / 格式 / 质量轨道高（单位轨道只有 24）*/
+  --seg-inset: 3px;      /* REGION_UNIT_INSET_DIP / REGION_DELAY_INSET_DIP */
+  --delay-seg-w: 34px;   /* 设备层量出来的最宽选项宽（96 dpi 实测；轨道 = 4×34 + 6）*/
+  --unit-seg-w: 29px;    /* 同上（轨道 = 2×29 + 6 = 64）*/
+  --target-seg-w: 48px;  /* 拟议：去向三段宽（轨道 = 3×48 + 6 = 150）*/
+  --chip-row: 24px;      /* REGION_TOGGLE_ROW_DIP：三个芯片、单位轨道、倍率块同一高度 */
+  --chip-w: 46px;        /* REGION_TOGGLE_DIP */
+  --chip-gap: 8px;       /* REGION_TOGGLE_GAP_DIP */
+  --scale-w: 46px;       /* REGION_SCALE_WIDTH_DIP */
+  --unit-scale-gap: 8px; /* REGION_UNIT_SCALE_GAP_DIP */
+  --body-bottom: 12px;   /* REGION_BODY_BOTTOM_DIP */
+  --foot-top: 10px;      /* REGION_FOOT_TOP_DIP（页脚上方只有留白，没有分隔线）*/
+  --btn-h: 28px;         /* REGION_BUTTON_HEIGHT_DIP */
+  --btn-w: 60px;         /* REGION_FOOTER_BUTTON_WIDTH_DIP：取消与确定等宽 */
+  --foot-bottom: 11px;   /* REGION_FOOT_BOTTOM_DIP */
 
-    --t1: #ffffff;
-    --t2: #dfe5ee;
-    --t3: #8891a0;
-    --t4: #5c6470;
-    --danger: #ff7b7b;
+  /* ── 圆角（d2d.rs 各处 fill_round/stroke_round 的实参）──────────────────── */
+  --r-panel: 12px;       /* big_radius */
+  --r-card: 10px;
+  --r-btn: 6px;
+  --r-menu: 10px;
+  --r-item: 6px;         /* 下拉项：内缩 3 dip 后 6 */
+  --r-seg: 7px;          /* REGION_SEGMENT_RADIUS_DIP：分段器外框（不是胶囊）*/
+  --r-seg-inner: 4px;    /* segment_radius(7, 3) */
+  --r-scale: 4px;
+  --r-icon: 5px;         /* 组内动作悬停底 / 卡头比例按钮悬停底 */
+  --r-close: 6px;        /* 关闭按钮悬停底 */
 
-    --card:     rgba(255, 255, 255, .035);
-    --card-line:rgba(255, 255, 255, .07);
-    --surface:  rgba(255, 255, 255, .06);
-    --surface-hi:rgba(255, 255, 255, .1);
-    --well:     rgba(0, 0, 0, .3);
+  --font: "HarmonyOS Sans SC", "Microsoft YaHei UI", "Segoe UI", system-ui, sans-serif;
+  --num: ui-monospace, "Cascadia Mono", Consolas, "Courier New", monospace;
+  --blur: 6px;           /* BACKDROP_BLUR_DIP：高斯模糊的标准差 */
+}
 
-    --menu-bg:  rgba(28, 30, 36, .96);
+* { box-sizing: border-box; }
+body {
+  margin: 0; min-height: 100vh; background: #0e1014; color: #dfe5ee;
+  font: 13px/1.5 var(--font);
+  -webkit-font-smoothing: antialiased;
+}
 
-    --r: 16px;
-    --r-md: 12px;
-    --r-sm: 8px;
-    --r-xs: 6px;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; min-height: 100vh; background: #0e1014; color: var(--t2);
-    font: 13px/1.5 var(--font);
-    -webkit-font-smoothing: antialiased;
-    text-rendering: optimizeLegibility;
-  }
+/* ══ demo 自己的顶栏与舞台（不是面板的一部分）═══════════════════════════ */
+.demo-head {
+  display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center;
+  padding: 12px 20px; background: #12141a;
+  border-bottom: 1px solid rgba(255,255,255,.06);
+}
+.demo-head h1 { margin: 0; font-size: 13.5px; font-weight: 600; color: #fff; }
+.demo-head .hint { color: #8891a0; font-size: 12px; }
+.demo-head .states { display: flex; gap: 6px; margin-left: auto; align-items: center; }
+.demo-head .states > span { color: #5c6470; font-size: 11.5px; }
+.demo-head button {
+  font: inherit; font-size: 11.5px; font-weight: 500;
+  color: #dfe5ee; background: rgba(255,255,255,.05); border: 0;
+  border-radius: 6px; padding: 5px 10px; cursor: pointer;
+}
+.demo-head button:hover { background: rgba(255,255,255,.1); color: #fff; }
+.demo-head button.on { background: var(--accent); color: #fff; }
 
-  /* ── Demo 顶栏 ─────────────────────────────────────────────────────── */
-  .demo-head {
-    display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center;
-    padding: 12px 20px;
-    background: #12141a;
-    border-bottom: 1px solid rgba(255, 255, 255, .06);
-  }
-  .demo-head h1 { margin: 0; font-size: 13.5px; font-weight: 600; color: #fff; letter-spacing: -.01em; }
-  .demo-head .hint { color: var(--t3); font-size: 12px; }
-  .demo-head .states { display: flex; gap: 6px; margin-left: auto; align-items: center; }
-  .demo-head .states span { color: var(--t4); font-size: 11.5px; }
-  .demo-head button {
-    font: inherit; font-size: 11.5px; font-weight: 500;
-    color: var(--t2); background: rgba(255, 255, 255, .05); border: 0;
-    border-radius: 6px; padding: 5px 10px; cursor: pointer;
-    transition: background .15s, color .15s;
-  }
-  .demo-head button:hover { background: rgba(255, 255, 255, .1); color: #fff; }
-  .demo-head button.on {
-    background: var(--accent); color: #fff;
-    box-shadow: 0 2px 8px rgba(31, 117, 219, .35);
-  }
+.stage { display: flex; flex-direction: column; gap: 20px; padding: 22px; max-width: 700px; margin: 0 auto; }
+.frame > .cap { margin: 0 0 8px; color: #8891a0; font-size: 11.5px; }
+.scene {
+  position: relative; padding: 26px; border-radius: 14px;
+  overflow: hidden; display: flex; justify-content: center; align-items: center;
+  min-height: 700px;
+}
+.scene.light { background: #f2f4f8; }
+.scene.dark  { background: #14161a; }
+.scene.small { min-height: 380px; }
+/* 面板顶部固定、展开时向下长（实现里就是窗口顶边不动）；小工作区那一幕仍居中，用来演示下拉翻面 */
+.scene:not(.small) { align-items: flex-start; }
+.scene:not(.small) .panel { margin-top: 110px; }
+.scene .doc { position: absolute; inset: 22px 26px auto 26px; }
+.scene .doc .bar { height: 22px; border-radius: 4px 4px 0 0; background: rgba(127,140,160,.35); }
+.scene .doc .body { height: 240px; border-radius: 0 0 4px 4px; background: rgba(127,140,160,.18); }
+.scene .doc .body p { margin: 0; padding: 10px 12px; font-size: 12px; color: rgba(90,100,120,.85); }
+.scene.dark .doc .body p { color: rgba(200,210,225,.5); }
+.scene .swatch {
+  position: absolute; right: 26px; bottom: 24px; width: 130px; height: 76px; border-radius: 8px;
+  background: linear-gradient(120deg, rgb(27,177,95), rgb(31,117,219) 55%, rgb(240,179,90));
+  opacity: .9;
+}
 
-  /* ── 舞台 ─────────────────────────────────────────────────────────── */
-  .stage {
-    display: flex; flex-direction: column; gap: 20px;
-    padding: 22px; max-width: 660px; margin: 0 auto;
-  }
-  .frame > .cap { margin: 0 0 8px; color: var(--t3); font-size: 11.5px; letter-spacing: .01em; }
+/* ══ 面板 ══════════════════════════════════════════════════════════════ */
+.panel {
+  position: relative; z-index: 2;
+  width: var(--panel-w);
+  background: var(--surface);
+  border-radius: var(--r-panel);
+  box-shadow: inset 0 0 0 1px var(--line), 0 24px 64px rgba(0,0,0,.55);
+  -webkit-backdrop-filter: blur(var(--blur));
+  backdrop-filter: blur(var(--blur));
+  color: var(--text);
+  font-size: 13px;
+  user-select: none;
+}
 
-  .scene {
-    position: relative; padding: 26px;
-    border-radius: 14px; overflow: hidden;
-    display: flex; justify-content: center;
-    min-height: 320px;
-  }
-  .scene.light { background: #f2f4f8; }
-  .scene.dark  { background: #14161a; }
-  .scene .doc { position: absolute; inset: 22px 26px auto 26px; }
-  .scene .doc .bar { height: 22px; border-radius: 4px 4px 0 0; background: rgba(127, 140, 160, .35); }
-  .scene .doc .body { height: 200px; border-radius: 0 0 4px 4px; background: rgba(127, 140, 160, .18); }
-  .scene .doc .body p { margin: 0; padding: 10px 12px; font-size: 12px; color: rgba(90, 100, 120, .85); }
-  .scene.dark .doc .body p { color: rgba(200, 210, 225, .5); }
-  .scene .swatch {
-    position: absolute; right: 26px; bottom: 24px; width: 130px; height: 76px; border-radius: 8px;
-    background: linear-gradient(120deg, rgb(27, 177, 95), rgb(31, 117, 219) 55%, rgb(240, 179, 90));
-    opacity: .9;
-  }
+/* 页头：标题 + 关闭（单位分段器与倍率在角标行右侧，docs/23 §14.55.3）*/
+.head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: var(--head-top) var(--pad) var(--head-bottom);
+  height: calc(var(--head-top) + var(--head-row) + var(--head-bottom));
+}
+.head .title { font-size: var(--fs-title); font-weight: 600; letter-spacing: -.005em; }
 
-  /* ═══════════════════════════════════════════════════════════════════
-     面板 —— 宽度 460 → 420
-     ═══════════════════════════════════════════════════════════════════ */
-  .dlg {
-    position: relative; z-index: 1;
-    width: 420px; align-self: center;
-    font-size: 13px; color: var(--t2);
-    background: var(--panel);
-    border: 1px solid var(--panel-line);
-    border-radius: var(--r);
-    box-shadow: var(--panel-shadow);
-    -webkit-backdrop-filter: blur(26px) saturate(1.8);
-    backdrop-filter: blur(26px) saturate(1.8);
-  }
-  .dlg::before {
-    content: ''; position: absolute; inset: 0; border-radius: inherit; pointer-events: none;
-    box-shadow: inset 0 1px 0 var(--panel-hi);
-  }
+/* 关闭：26×26，悬停铺 6 dip 圆角底；它和页脚「取消」是同一个槽（`PanelSlot::Cancel`）*/
+.close {
+  flex: none; width: var(--head-row); height: var(--head-row);
+  display: grid; place-items: center; padding: 0;
+  background: transparent; border: 0; border-radius: var(--r-close);
+  color: var(--muted); cursor: pointer;
+}
+.close:hover, .close.is-hover { background: var(--fill); color: var(--text); }
+.close:focus-visible { outline: 0; box-shadow: 0 0 0 2px var(--accent); }
+.close svg { width: 14px; height: 14px; display: block; }   /* Glyph 画在 14 dip 方框里 */
 
-  /* ── 页头 ─────────────────────────────────────────────────────────── */
-  .dlg-head {
-    display: flex; align-items: center; gap: 8px;
-    padding: 12px 10px 11px 14px;
-    border-radius: var(--r) var(--r) 0 0;
-  }
-  .dlg-head h2 {
-    margin: 0; font-size: 13px; font-weight: 600; color: var(--t1);
-    letter-spacing: -.005em;
-  }
+.body { padding: var(--body-top) var(--pad) var(--body-bottom); }
 
-  .unit-switch {
-    display: flex; padding: 2px; gap: 1px;
-    background: var(--well);
-    border-radius: 6px;
-  }
-  .unit-switch button {
-    font: inherit; font-size: 10px; font-weight: 600;
-    letter-spacing: .04em; text-transform: uppercase;
-    padding: 4px 7px; border: 0; border-radius: 4px;
-    background: transparent; color: var(--t4);
-    cursor: default;
-    transition: background .15s, color .15s, box-shadow .15s;
-  }
-  .unit-switch button:hover { color: var(--t2); }
-  .unit-switch button.on {
-    background: rgba(255, 255, 255, .12);
-    color: var(--t1);
-    box-shadow: 0 1px 2px rgba(0, 0, 0, .4);
-  }
-  .unit-switch button:focus-visible {
-    outline: 0; box-shadow: 0 0 0 2px var(--accent);
-  }
+/* ── 两张卡：189 × 96（= 10 + 22 + 6 + 28 + 6 + 14 + 10）───────────── */
+.cards { display: grid; grid-template-columns: 1fr 1fr; gap: var(--card-gap); }
+.card {
+  background: var(--fill); box-shadow: inset 0 0 0 1px var(--line);
+  border-radius: var(--r-card);
+  padding: var(--card-pad);
+  display: flex; flex-direction: column; gap: var(--card-gap-in);
+}
+.card-head { display: flex; align-items: center; height: var(--card-head); }
+.card-title {
+  font-size: var(--fs-card); font-weight: 600; color: var(--muted);
+  letter-spacing: .01em;
+}
+.card-head .spacer { flex: 1; }
+.actions { display: flex; gap: 2px; }
+.action {
+  width: var(--icon); height: var(--icon); padding: 0;
+  display: grid; place-items: center;
+  background: transparent; border: 0; border-radius: var(--r-icon);
+  color: var(--muted); cursor: pointer;
+}
+.action:hover, .action.is-hover { background: var(--fill); color: var(--text); }
+.action.is-focus { box-shadow: 0 0 0 2px var(--accent); }
+.action:focus-visible { outline: 0; }
+.action svg { width: 14px; height: 14px; display: block; }
 
-  .scale-badge {
-    font-family: var(--num);
-    font-size: 10.5px; font-weight: 500;
-    padding: 3px 6px;
-    border-radius: 4px;
-    background: rgba(255, 255, 255, .05);
-    color: var(--t3);
-    font-variant-numeric: tabular-nums;
-    letter-spacing: .01em;
-  }
-  .dlg-head .spacer { flex: 1; }
+/* ── 拟议：比例按钮搬进「尺寸」卡头（约 52–60 × 22）────────────────────
+   常态无底、只显示「值 + ⌄」；悬停铺 5 dip 圆角底；展开或悬停时箭头转主色；
+   非「自由」时值用主色，提示数字被比例锁住。它不再是独立行里那个 150×28 的触发器。*/
+.ratio-btn {
+  flex: none; height: var(--card-head);
+  display: flex; align-items: center; gap: 4px;
+  padding: 0 6px;
+  background: transparent; border: 0; border-radius: var(--r-icon);
+  font: inherit; font-size: var(--fs-trigger); color: var(--text);
+  cursor: pointer; text-align: left;
+}
+.ratio-btn:hover, .ratio-btn.is-hover { background: var(--fill); }
+.ratio-btn:focus-visible { outline: 0; }
+.ratio-btn.is-focus { box-shadow: 0 0 0 2px var(--accent); }
+.ratio-btn .value-text { flex: none; white-space: nowrap; }
+.ratio-btn .chev { flex: none; width: 12px; height: 12px; display: grid; place-items: center; color: var(--muted); }
+.ratio-btn .chev svg { width: 12px; height: 12px; display: block; }
+.ratio-btn[aria-expanded="true"] .chev, .ratio-btn.is-hover .chev { color: var(--accent); }
+.ratio-btn[aria-expanded="true"] .chev { transform: rotate(180deg); }
+.ratio-btn.is-locked .value-text { color: var(--accent); }
 
-  /* ── 图标按钮 ─────────────────────────────────────────────────────── */
-  .ico {
-    display: grid; place-items: center;
-    width: 28px; height: 28px; padding: 0; flex: none;
-    color: var(--t3); background: transparent;
-    border: 0; border-radius: var(--r-sm);
-    cursor: default;
-    transition: background .15s, color .15s, box-shadow .15s;
-  }
-  .ico:hover, .ico.force-hover { background: var(--surface-hi); color: var(--t1); }
-  .ico:active { background: rgba(255, 255, 255, .18); }
-  .ico:focus-visible, .ico.force-focus {
-    outline: 0; color: var(--t1);
-    box-shadow: 0 0 0 2px var(--accent);
-  }
-  .ico[aria-pressed="true"] {
-    background: var(--accent); color: #fff;
-    box-shadow: 0 2px 8px rgba(31, 117, 219, .4);
-  }
-  .ico[aria-pressed="true"]:hover { background: var(--accent-hi); }
-  .ico svg { width: 14px; height: 14px; display: block; }
+/* ── 四个数字：下划线就是它的边（聚焦 2 dip 主色、非法 2 dip 红）──────── */
+.values { display: flex; align-items: flex-start; }
+.cell { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; gap: var(--label-gap); }
+.cell .field {
+  height: var(--value-row); display: flex; align-items: center; justify-content: center;
+  border-bottom: 1px solid var(--line); cursor: text;
+}
+.cell .field:hover { border-bottom-color: rgba(255,255,255,.45); }
+.cell.is-focus .field { border-bottom-color: var(--accent); border-bottom-width: 2px; }
+.cell.is-bad .field { border-bottom-color: var(--danger); border-bottom-width: 2px; }
+.num {
+  font-family: var(--num); font-size: var(--fs-num); font-weight: 600;
+  letter-spacing: -.03em; font-variant-numeric: tabular-nums; line-height: 1;
+  white-space: pre;
+}
+/* 插入符：实现里是 3 px 宽、23 dip 高、500 ms 一闪（CARET_HALF_DIP / CARET_TIMER_ID）*/
+.caret {
+  display: inline-block; vertical-align: middle;
+  width: 3px; height: 23px; margin-left: 1px;
+  background: var(--accent);
+  animation: blink 1s steps(1, end) infinite;
+}
+@keyframes blink { 0%, 49.9% { opacity: 1 } 50%, 100% { opacity: 0 } }
+.cell .label {
+  height: var(--label-h); display: flex; align-items: center; justify-content: center;
+  font-family: var(--num); font-size: var(--fs-label); font-weight: 600;
+  color: var(--muted);
+}
+.cell.is-focus .label { color: var(--accent); }
+.cell.is-bad .label { color: var(--danger); }
 
-  .ico-sm {
-    display: grid; place-items: center;
-    width: 22px; height: 22px; padding: 0; flex: none;
-    color: var(--t3); background: transparent;
-    border: 0; border-radius: 5px;
-    cursor: default;
-    transition: background .15s, color .15s, box-shadow .15s;
-  }
-  .ico-sm:hover { background: var(--surface-hi); color: var(--t1); }
-  .ico-sm:focus-visible { outline: 0; box-shadow: 0 0 0 2px var(--accent); color: var(--t1); }
-  .ico-sm[aria-pressed="true"] { background: var(--accent); color: #fff; }
-  .ico-sm[aria-pressed="true"]:hover { background: var(--accent-hi); }
-  .ico-sm svg { width: 12px; height: 12px; display: block; }
+/* 尺寸卡的分隔是 `×`（18 dip 粗体等宽），位置卡是一条竖线（上下各留 4 dip）*/
+.sep-times {
+  flex: none; width: var(--sep); align-self: stretch;
+  display: flex; align-items: center; justify-content: center;
+  font-family: var(--num); font-size: var(--fs-times); font-weight: 700;
+  color: var(--muted);
+}
+/* 拟议：选了比例（非自由）时，× 用主色，提示宽高被锁在一起 */
+.sep-times.is-linked { color: var(--accent); }
+.sep-line { flex: none; width: var(--sep); align-self: stretch; display: grid; place-items: center; }
+.sep-line::before {
+  content: ''; width: 1px; height: calc(100% - 8px); background: var(--line);
+}
 
-  /* ── 主体 ─────────────────────────────────────────────────────────── */
-  .dlg-body {
-    padding: 4px 14px 13px;
-    display: flex; flex-direction: column; gap: 11px;
-  }
+/* ── 行：去向（左）+ 延时（右）─────────────────────────────────────────
+   拟议：原来这一行是「比例 + 延时」；比例搬进尺寸卡头后，左边换成「去向」
+   （复制 / 保存 / 贴图）。行高 28、行距 10 都不变，面板仍是 277。*/
+.row {
+  display: flex; align-items: center;
+  height: var(--row); margin-top: var(--row-gap);
+  position: relative;
+}
+.row-label {
+  flex: none; width: var(--row-label);
+  font-size: var(--fs-row); font-weight: 600; color: var(--muted);
+}
 
-  .measures {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 8px;
-  }
-  .card {
-    background: var(--card);
-    border: 1px solid var(--card-line);
-    border-radius: var(--r-md);
-    padding: 10px 11px 11px;
-    display: flex; flex-direction: column; gap: 7px;
-  }
-  .card-head {
-    display: flex; align-items: center; gap: 4px;
-    height: 20px;
-  }
-  .card-title {
-    font-size: 10px; font-weight: 700;
-    letter-spacing: .12em; text-transform: uppercase;
-    color: var(--t3);
-  }
-  .card-head .spacer { flex: 1; }
-  .card-head .actions { display: flex; gap: 1px; }
+/* 下拉：宽 = max-content（「无比例」文本宽 + 26 检查位 + 10 右内边距 + 5×2 菜单内边距 = 实测 82），右缘对齐尺寸卡右缘；内边距 5，项高 30，圆角 10 */
+.menu {
+  position: absolute; z-index: 5;
+  width: max-content; padding: 5px;
+  background: var(--surface); border-radius: var(--r-menu);
+  box-shadow: inset 0 0 0 1px var(--line), 0 16px 40px rgba(0,0,0,.55), 0 4px 12px rgba(0,0,0,.35);
+  display: flex; flex-direction: column;
+}
+.menu .item {
+  position: relative; height: 30px; width: 100%;
+  display: flex; align-items: center;
+  padding: 0 10px 0 26px;
+  background: transparent; border: 0; border-radius: var(--r-item);
+  font: inherit; font-size: 12px; color: var(--text); text-align: left;
+  cursor: pointer;
+}
+.menu .item.is-hover, .menu .item.is-selected { background: var(--fill); }
+.menu .item .check {
+  position: absolute; left: 7px; width: 14px; height: 14px;
+  display: grid; place-items: center; color: var(--accent);
+}
+.menu .item .check svg { width: 14px; height: 14px; display: block; }
 
-  /* ── 数值行：大数字居中 ──────────────────────────────────────────── */
-  .values {
-    display: flex;
-    align-items: flex-start;
-    gap: 1px;
-  }
-  .value {
-    flex: 1; min-width: 0;
-    display: flex; flex-direction: column; gap: 4px;
-  }
-  .value input {
-    display: block;
-    width: 100%; min-width: 0;
-    height: 30px;
-    line-height: 30px;
-    padding: 0;
-    font: inherit; font-family: var(--num);
-    font-size: 20px; font-weight: 600;
-    letter-spacing: -.03em;
-    font-variant-numeric: tabular-nums;
-    text-align: center;
-    color: var(--t1);
-    background: transparent;
-    border: 0;
-    border-bottom: 1.5px solid rgba(255, 255, 255, .1);
-    outline: 0;
-    transition: border-color .15s, box-shadow .15s;
-  }
-  .value:hover input { border-bottom-color: rgba(255, 255, 255, .24); }
-  .value:focus-within input {
-    border-bottom-color: var(--accent);
-    box-shadow: 0 1px 0 var(--accent);
-  }
-  .value.bad input {
-    border-bottom-color: var(--danger);
-    box-shadow: 0 1px 0 var(--danger);
-  }
-  .value .label {
-    font-size: 10px; font-weight: 600;
-    letter-spacing: .1em; text-transform: uppercase;
-    color: var(--t3);
-    text-align: center;
-    transition: color .15s;
-  }
-  .value:focus-within .label { color: var(--accent-hi); }
-  .value.bad .label { color: var(--danger); }
+/* ── 分段器（单位 / 延时 / 去向 / 格式 / 质量共用）：圆角矩形，不是胶囊 ── */
+.seg {
+  position: relative; display: flex;
+  background: var(--fill); border-radius: var(--r-seg);
+}
+.seg.is-focus { box-shadow: 0 0 0 2px var(--accent); }
+.seg .block {
+  /* 绝对定位的包含块是内边距盒 ⇒ 从 0 起就是"内缩之后"的位置 */
+  position: absolute; top: 0; bottom: 0; left: 0; width: var(--seg-w);
+  border-radius: var(--r-seg-inner);
+  background: var(--accent);
+  transform: translateX(calc(var(--index) * var(--seg-w)));
+  transition: transform 140ms cubic-bezier(.22,.61,.36,1);   /* SEGMENT_SLIDE_MS = 140 */
+}
+.seg .opt {
+  position: relative; z-index: 1;
+  display: grid; place-items: center;
+  border: 0; background: transparent; cursor: pointer;
+  color: var(--muted);
+  transition: background-color .12s ease-out, color .12s ease-out;
+}
+.seg .opt.is-hover:not(.is-selected) { background: var(--line); border-radius: var(--r-seg-inner); }
+.seg .opt.is-selected { color: var(--text); }
+.seg .opt:focus-visible { outline: 0; }
 
-  .sep {
-    font-family: var(--num);
-    font-size: 15px; font-weight: 500;
-    color: var(--t4);
-    flex: none;
-    align-self: flex-start;
-    height: 30px; line-height: 30px;
-    padding: 0 3px;
-    user-select: none;
-  }
+/* 单位：轨道 64×24（2×29 + 2×3），段 29×18，文字 10 dip SEMI_BOLD 等宽 */
+.seg.unit { height: var(--chip-row); padding: var(--seg-inset); --seg-w: var(--unit-seg-w); }
+.seg.unit .opt {
+  width: var(--unit-seg-w); height: calc(var(--chip-row) - 2 * var(--seg-inset));
+  font-family: var(--num); font-size: var(--fs-seg-unit); font-weight: 600; letter-spacing: .04em;
+}
+/* 延时：轨道 142×30（4×34 + 2×3），段 34×24，文字 11 dip NORMAL */
+.seg.delay { height: var(--seg-h); padding: var(--seg-inset); --seg-w: var(--delay-seg-w); }
+.seg.delay .opt {
+  width: var(--delay-seg-w); height: calc(var(--seg-h) - 2 * var(--seg-inset));
+  font-size: var(--fs-seg-delay); font-variant-numeric: tabular-nums;
+}
+/* 拟议：去向 轨道 150×30（3×48 + 6），段 48×24，文字 11 NORMAL */
+.seg.target { height: var(--seg-h); padding: var(--seg-inset); --seg-w: var(--target-seg-w); }
+.seg .opt.is-todo { color: var(--muted); border-bottom: 1px dotted rgba(255,255,255,.5); }
+.seg.target .opt {
+  width: var(--target-seg-w); height: calc(var(--seg-h) - 2 * var(--seg-inset));
+  font-size: var(--fs-seg-delay);
+}
 
-  /* ── 行 ───────────────────────────────────────────────────────────── */
-  .row {
-    display: flex; align-items: center; gap: 8px;
-    min-width: 0;
-  }
-  .row-label {
-    flex: none; min-width: 28px;
-    font-size: 10px; font-weight: 700;
-    letter-spacing: .12em; text-transform: uppercase;
-    color: var(--t3);
-  }
-  .row .flex { flex: 1; min-width: 0; }
-  .row .spacer { flex: 1; min-width: 0; }
+/* 拟议：不可用态（PNG 无损时质量档不适用；非「保存」去向时格式 / 质量不适用）
+   ——轨道保持原位不跳版，滑块收起、整体压暗、不响应悬停/点击 */
+.seg.is-disabled { opacity: .4; pointer-events: none; }
+.seg.is-disabled .block { display: none; }
+.seg.is-disabled .opt.is-selected { color: var(--muted); }
 
-  /* ── 预设下拉菜单 ─────────────────────────────────────────────────── */
-  .preset-dropdown {
-    position: relative;
-    min-width: 0;
-  }
-  .dropdown-trigger {
-    display: flex; align-items: center; gap: 6px;
-    height: 30px; padding: 0 8px 0 10px;
-    border-radius: var(--r-sm);
-    background: var(--surface);
-    border: 1px solid transparent;
-    color: var(--t2);
-    font: inherit; font-size: 12px; font-weight: 500;
-    font-variant-numeric: tabular-nums;
-    cursor: default;
-    min-width: 110px;
-    transition: background .15s, color .15s, border-color .15s;
-  }
-  .dropdown-trigger:hover {
-    background: var(--surface-hi);
-    color: #fff;
-  }
-  .dropdown-trigger:focus-visible {
-    outline: 0; box-shadow: 0 0 0 2px var(--accent);
-  }
-  .dropdown-trigger[aria-expanded="true"] {
-    background: var(--surface-hi);
-    color: #fff;
-    border-color: rgba(255, 255, 255, .12);
-  }
-  .dropdown-trigger .label {
-    flex: 1; min-width: 0;
-    text-align: left;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  }
-  .dropdown-trigger .label.custom {
-    color: var(--t3);
-    font-style: italic;
-  }
-  .dropdown-trigger .chevron {
-    flex: none;
-    width: 12px; height: 12px;
-    color: var(--t3);
-    transition: transform .2s ease;
-  }
-  .dropdown-trigger[aria-expanded="true"] .chevron {
-    transform: rotate(180deg);
-  }
+/* 拟议：图片卡——和「尺寸 / 位置」同一套卡片语言（圆角 10、内边距 10、卡头 22），但底和边是主色淡染；
+   常驻在面板底部，收起时只剩卡头一行（整行是开关）；卡内两行等高 28、行距 6（不再用正文的 10）*/
+.card.out { margin-top: var(--card-gap); background: var(--out-fill); box-shadow: inset 0 0 0 1px var(--out-line); }
+.card.out .card-title { color: var(--out-title); }
+.card.out .row { margin-top: 0; height: 30px; }
+/* 折叠行：整个卡头就是开关（点哪都行）。收起时右侧是当前设置的摘要，展开时摘要隐去（下面的行本来就在显示它）；
+   悬停：整张卡底色略深；聚焦：卡外 2 dip 主色环；展开时箭头转 180°。*/
+.card.out.is-hover { background: rgba(31,117,219,.22); }
+.card.out.is-focus { box-shadow: inset 0 0 0 1px var(--out-line), 0 0 0 2px var(--accent); }
+.card-toggle {
+  display: flex; align-items: center; width: 100%; height: var(--card-head);
+  padding: 0; background: transparent; border: 0; cursor: pointer;
+  font: inherit; text-align: left; color: inherit;
+}
+.card-toggle:focus-visible { outline: 0; }
+.card-toggle .card-title { flex: 1; }
+.card-toggle .summary {
+  flex: none; margin-right: 6px; font-size: var(--fs-status); color: var(--out-title); opacity: .85;
+  white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+.card-toggle .chev { flex: none; width: 14px; height: 14px; display: grid; place-items: center; color: var(--out-title); }
+.card-toggle .chev svg { width: 14px; height: 14px; display: block; }
+.card.out.is-open .card-toggle .chev { transform: rotate(180deg); }
 
-  .dropdown-menu {
-    position: absolute;
-    top: calc(100% + 6px);
-    left: 0;
-    min-width: 100%;
-    padding: 5px;
-    background: var(--menu-bg);
-    border: 1px solid rgba(255, 255, 255, .1);
-    border-radius: 10px;
-    box-shadow:
-      0 16px 40px rgba(0, 0, 0, .55),
-      0 4px 12px rgba(0, 0, 0, .35);
-    -webkit-backdrop-filter: blur(20px);
-    backdrop-filter: blur(20px);
-    z-index: 30;
-    display: flex; flex-direction: column; gap: 1px;
-    animation: menuIn .14s ease-out;
-  }
-  @keyframes menuIn {
-    from { opacity: 0; transform: translateY(-4px); }
-    to   { opacity: 1; transform: translateY(0); }
-  }
+/* 拟议：滑动条（圆角行）——轨道 4 高圆角 2；滑块 14 的圆；命中区 = 行高 28。
+   已选段 = 主色，其余 = white .18（新画刷）；悬停：滑块外 4 dip 淡环；聚焦 / 拖动：2 dip 主色环（与分段器的聚焦环同一语言）*/
+.slider {
+  flex: 1; min-width: 0; margin-right: 12px;
+  position: relative; height: var(--row);
+  cursor: pointer; touch-action: none;
+}
+.slider .track, .slider .fill {
+  position: absolute; left: 0; top: 50%; height: 4px; margin-top: -2px; border-radius: 2px;
+}
+.slider .track { right: 0; background: rgba(255,255,255,.18); }
+.slider .fill  { background: var(--accent); width: calc(var(--t) * (100% - 14px) + 7px); }   /* 止于滑块圆心 */
+.slider .thumb {
+  position: absolute; top: 50%; margin-top: -7px; width: 14px; height: 14px; border-radius: 50%;
+  left: calc(var(--t) * (100% - 14px));
+  background: var(--text);
+}
+.slider.is-hover .thumb { box-shadow: 0 0 0 4px rgba(255,255,255,.12); }
+.slider.is-focus .thumb, .slider.is-drag .thumb { box-shadow: 0 0 0 2px var(--accent); }
+.slider.is-disabled { opacity: .4; pointer-events: none; }
+/* 值块：46×24 圆角 4（与倍率块同一规格）；左边一个只画「左上角」的小角标，弧度跟着滑块实时变 */
+.rvalue {
+  flex: none; width: var(--scale-w); height: var(--chip-row);
+  display: flex; align-items: center; justify-content: center; gap: 6px;
+  background: var(--fill); border-radius: var(--r-scale);
+  font-family: var(--num); font-size: var(--fs-scale); color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.rvalue.is-set { color: var(--text); }
+.rvalue .corner {
+  width: 10px; height: 10px; flex: none;
+  border-top: 1.5px solid currentColor; border-left: 1.5px solid currentColor;
+  border-top-left-radius: calc(var(--t) * 10px);
+}
 
-  .dropdown-item {
-    display: flex; align-items: center; gap: 8px;
-    height: 30px; padding: 0 9px;
-    border-radius: var(--r-xs);
-    background: transparent; border: 0;
-    color: var(--t2);
-    font: inherit; font-size: 12px; font-weight: 500;
-    cursor: default; text-align: left;
-    font-variant-numeric: tabular-nums;
-    transition: background .12s, color .12s;
-  }
-  .dropdown-item:hover { background: rgba(255, 255, 255, .06); color: #fff; }
-  .dropdown-item:focus-visible {
-    outline: 0; box-shadow: 0 0 0 2px var(--accent);
-  }
-  .dropdown-item.on {
-    background: var(--accent-soft);
-    color: #a8cdff;
-    font-weight: 600;
-  }
-  .dropdown-item.on:hover {
-    background: rgba(31, 117, 219, .22);
-    color: #cfe2ff;
-  }
-  .dropdown-item .check {
-    flex: none;
-    width: 12px; height: 12px;
-    color: var(--accent-hi);
-    opacity: 0;
-  }
-  .dropdown-item.on .check { opacity: 1; }
-  .dropdown-item .txt { flex: 1; min-width: 0; }
-  .dropdown-item .dim {
-    flex: none;
-    font-family: var(--num);
-    font-size: 10.5px;
-    color: var(--t4);
-    font-variant-numeric: tabular-nums;
-  }
-  .dropdown-item.on .dim { color: #a8cdff; opacity: .75; }
+/* 倍率块：46×24，圆角 4（不是分段器）*/
+.scale {
+  flex: none; width: var(--scale-w); height: var(--chip-row);
+  display: grid; place-items: center;
+  background: var(--fill); border-radius: var(--r-scale);
+  font-family: var(--num); font-size: var(--fs-scale); color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
 
-  .dropdown-divider {
-    height: 1px;
-    margin: 4px 6px;
-    background: rgba(255, 255, 255, .08);
-  }
+/* ── 角标行：三个胶囊 + （右侧）单位分段器与倍率 ─────────────────────── */
+.row.chips { height: var(--chip-row); }
+.chip {
+  flex: none; width: var(--chip-w); height: var(--chip-row);
+  display: grid; place-items: center;
+  border-radius: 999px;                 /* pill_radius = 高度/2 */
+  background: var(--fill); border: 1px solid var(--line);
+  font-family: var(--num); font-size: var(--fs-chip);
+  color: var(--muted); cursor: pointer;
+}
+.chip + .chip { margin-left: var(--chip-gap); }
+.chip.is-on { background: var(--accent); border-color: var(--accent); color: var(--text); font-weight: 600; }
+.chip.is-hover:not(.is-on) { background: var(--line); }
+.chip.is-focus { box-shadow: 0 0 0 2px var(--accent); }
+.row .spacer { flex: 1; }
+.unit-scale { display: flex; align-items: center; gap: var(--unit-scale-gap); }
 
-  /* ── 延时分段 ─────────────────────────────────────────────────────── */
-  .delay-group {
-    display: flex; align-items: center; gap: 6px;
-    flex: none;
-  }
-  .delay-switch {
-    display: flex; padding: 3px; gap: 1px;
-    background: var(--well);
-    border-radius: 8px;
-  }
-  .delay-switch button {
-    font: inherit; font-size: 11px; font-weight: 500;
-    padding: 4px 6px; border: 0; border-radius: 5px;
-    background: transparent; color: var(--t3);
-    cursor: default;
-    font-variant-numeric: tabular-nums;
-    letter-spacing: -.005em;
-    transition: background .15s, color .15s, box-shadow .15s;
-  }
-  .delay-switch button:hover { color: var(--t1); }
-  .delay-switch button.on {
-    background: rgba(255, 255, 255, .12);
-    color: var(--t1);
-    box-shadow: 0 1px 2px rgba(0, 0, 0, .4);
-  }
-  .delay-switch button:focus-visible {
-    outline: 0; box-shadow: 0 0 0 2px var(--accent);
-  }
+/* ── 页脚：一句话 + 取消 / 确定（上方没有分隔线，只有一个留白）───────── */
+.foot {
+  display: flex; align-items: center; gap: 8px;
+  padding: var(--foot-top) var(--pad) var(--foot-bottom);
+}
+.status {
+  flex: 1; min-width: 0;
+  font-size: var(--fs-status); color: var(--danger);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+/* 拟议：无错误时页脚显示「将复制 / 将保存 / 将贴图 …」读数——同一个槽、同一支画刷换成 muted，红字只留给错误 */
+.status.is-info { color: var(--muted); }
+.btn {
+  flex: none; width: var(--btn-w); height: var(--btn-h);
+  display: grid; place-items: center;
+  border-radius: var(--r-btn); border: 1px solid transparent;
+  font-family: var(--num); font-size: var(--fs-btn); cursor: pointer;
+}
+.btn.cancel { background: transparent; border-color: var(--line); color: var(--text); }
+.btn.cancel:hover, .btn.cancel.is-hover { background: var(--fill); border-color: var(--accent); }
+.btn.start { background: var(--accent); color: var(--text); font-weight: 600; }
+.btn.start:hover, .btn.start.is-hover { box-shadow: inset 0 0 0 1.5px var(--line); }
+.btn.start.is-disabled { background: var(--fill); color: var(--muted); cursor: default; box-shadow: none; }
+.btn.is-focus { box-shadow: 0 0 0 2px var(--accent); }
 
-  /* ── 浮层标签行 ───────────────────────────────────────────────────── */
-  .toggles { display: flex; gap: 4px; min-width: 0; }
-  .toggle {
-    font: inherit;
-    font-size: 11px; font-weight: 500;
-    height: 26px; padding: 0 9px;
-    border-radius: 999px;
-    background: transparent;
-    border: 1px solid rgba(255, 255, 255, .12);
-    color: var(--t3);
-    cursor: default;
-    transition: background .15s, color .15s, border-color .15s;
-  }
-  .toggle:hover { border-color: rgba(255, 255, 255, .26); color: var(--t2); }
-  .toggle:focus-visible { outline: 0; box-shadow: 0 0 0 2px var(--accent); }
-  .toggle.on {
-    background: var(--accent-soft);
-    border-color: var(--accent-line);
-    color: #a8cdff; font-weight: 600;
-  }
-  .toggle.on:hover {
-    background: rgba(31, 117, 219, .22);
-    color: #cfe2ff;
-  }
-
-  .preview {
-    flex: none;
-    font-family: var(--num);
-    font-size: 10px;
-    font-variant-numeric: tabular-nums;
-    letter-spacing: -.01em;
-    color: var(--t2);
-    background: rgba(0, 0, 0, .35);
-    border: 1px solid rgba(255, 255, 255, .06);
-    padding: 5px 8px;
-    border-radius: 6px;
-    white-space: nowrap;
-    overflow: hidden; text-overflow: ellipsis;
-    max-width: 132px;
-  }
-
-  /* ── 按钮 ─────────────────────────────────────────────────────────── */
-  .btn {
-    height: 32px; padding: 0 13px;
-    font: inherit; font-size: 12px; font-weight: 500;
-    border-radius: var(--r-sm);
-    border: 1px solid transparent;
-    cursor: default; white-space: nowrap;
-    transition: background .15s, color .15s, box-shadow .15s, border-color .15s;
-  }
-  .btn.outline {
-    color: var(--t2);
-    background: transparent;
-    border-color: rgba(255, 255, 255, .12);
-  }
-  .btn.outline:hover {
-    background: rgba(255, 255, 255, .06);
-    border-color: rgba(255, 255, 255, .2);
-    color: var(--t1);
-  }
-  .btn.primary {
-    background: var(--accent);
-    color: #fff; font-weight: 600;
-    border: 0;
-    box-shadow: 0 2px 8px rgba(31, 117, 219, .35);
-  }
-  .btn.primary:hover {
-    background: var(--accent-hi);
-    box-shadow: 0 4px 14px rgba(31, 117, 219, .5);
-  }
-  .btn:focus-visible {
-    outline: 0;
-    box-shadow: 0 0 0 2px var(--accent), 0 0 0 4px var(--ring);
-  }
-  .btn[disabled] {
-    opacity: .4; box-shadow: none;
-    background: var(--accent);
-    pointer-events: none;
-  }
-  .btn.outline[disabled] { background: transparent; }
-
-  /* ── 页脚 ─────────────────────────────────────────────────────────── */
-  .dlg-foot {
-    display: flex; align-items: center; gap: 8px;
-    padding: 10px 14px 12px;
-    border-top: 1px solid rgba(255, 255, 255, .06);
-    border-radius: 0 0 var(--r) var(--r);
-  }
-  .dlg-foot .status {
-    color: var(--t3); font-size: 11px;
-    min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  }
-  .dlg-foot .status.bad { color: var(--danger); }
-  .dlg-foot .spacer { flex: 1; }
-
-  /* ── 说明卡 ───────────────────────────────────────────────────────── */
-  .notes {
-    background: rgba(255, 255, 255, .035);
-    border: 1px solid rgba(255, 255, 255, .08);
-    border-radius: 14px;
-    padding: 16px 18px;
-    font-size: 12.5px; line-height: 1.65;
-    color: #c9d2dd;
-    overflow-wrap: anywhere;
-  }
-  .notes h2 { margin: 0 0 8px; font-size: 13.5px; color: #fff; letter-spacing: -.005em; }
-  .notes h3 { margin: 16px 0 5px; font-size: 11px; color: var(--t3); letter-spacing: .08em; text-transform: uppercase; }
-  .notes ul { margin: 2px 0 0; padding-left: 18px; }
-  .notes li { margin: 4px 0; }
-  .notes code { font-family: var(--num); font-size: 11.5px; color: #9cc7ff; }
-  .notes table { width: 100%; table-layout: fixed; border-collapse: collapse; margin-top: 5px; font-size: 11.5px; }
-  .notes th, .notes td {
-    text-align: left; padding: 6px 7px;
-    border-bottom: 1px solid rgba(255, 255, 255, .07);
-    vertical-align: top; word-break: break-word;
-  }
-  .notes th { color: var(--t3); font-weight: 500; }
-  .notes .num { color: #9cc7ff; font-variant-numeric: tabular-nums; }
-  .notes .todo { color: #f0b35a; }
+/* ══ 说明卡（demo 的文字部分）══════════════════════════════════════════ */
+.notes {
+  background: rgba(255,255,255,.035); border: 1px solid rgba(255,255,255,.08);
+  border-radius: 14px; padding: 16px 18px;
+  font-size: 12.5px; line-height: 1.65; color: #c9d2dd; overflow-wrap: anywhere;
+}
+.notes h2 { margin: 0 0 8px; font-size: 13.5px; color: #fff; }
+.notes h3 { margin: 16px 0 5px; font-size: 11px; color: #8891a0; letter-spacing: .08em; text-transform: uppercase; }
+.notes ul { margin: 2px 0 0; padding-left: 18px; }
+.notes li { margin: 4px 0; }
+.notes code { font-family: var(--num); font-size: 11.5px; color: #9cc7ff; }
+.notes table { width: 100%; table-layout: fixed; border-collapse: collapse; margin-top: 5px; font-size: 11.5px; }
+.notes th, .notes td { text-align: left; padding: 6px 7px; border-bottom: 1px solid rgba(255,255,255,.07); vertical-align: top; word-break: break-word; }
+.notes th { color: #8891a0; font-weight: 500; }
+.notes .num { color: #9cc7ff; font-variant-numeric: tabular-nums; }
+.notes .warn { color: #f0b35a; }
 </style>
 </head>
 <body>
 
 <div class="demo-head">
-  <h1>自定义截图面板 · 取景器读数</h1>
+  <h1>自定义截图面板 · 与实现同步</h1>
   <span class="hint">自绘（D2D）+ 高斯模糊底 · <span id="size">面板实测…</span></span>
   <div class="states">
     <span>看状态：</span>
     <button data-force="ok" class="on">正常</button>
-    <button data-force="overflow">超出屏幕</button>
-    <button data-force="nan">非整数</button>
-    <button data-force="empty">留空</button>
+    <button data-force="tiny">太小</button>
+    <button data-force="outside">本屏放不下</button>
     <button data-force="hoverfocus">悬停 + 聚焦</button>
+    <button data-force="small">小工作区（下拉翻面）</button>
+    <span style="margin-left:10px">拟议：</span>
+    <button id="toggle-output" class="on">图片区</button>
   </div>
 </div>
 
 <div class="stage">
   <div class="frame">
     <p class="cap">压在亮内容上（模糊底要把底下的亮色吃掉）</p>
-    <div class="scene light">
-      <div class="doc">
-        <div class="bar"></div>
-        <div class="body"><p>被截图的那块屏 —— 亮色文档、浅灰面板、彩色图表。</p></div>
-      </div>
-      <div class="swatch"></div>
-      <div class="dlg" id="dlg-light"></div>
-    </div>
+    <div class="scene light" id="scene-light"><div class="doc"><div class="bar"></div><div class="body"><p>被截图的那块屏 —— 亮色文档、浅灰面板、彩色图表。</p></div></div><div class="swatch"></div><div class="panel" id="panel-light"></div></div>
   </div>
   <div class="frame">
     <p class="cap">压在暗内容上（同一份颜色不能糊成一团）</p>
-    <div class="scene dark">
-      <div class="doc">
-        <div class="bar"></div>
-        <div class="body"><p>被截图的那块屏 —— 深色编辑器、暗色终端。</p></div>
-      </div>
-      <div class="swatch"></div>
-      <div class="dlg" id="dlg-dark"></div>
-    </div>
+    <div class="scene dark" id="scene-dark"><div class="doc"><div class="bar"></div><div class="body"><p>被截图的那块屏 —— 深色编辑器、暗色终端。</p></div></div><div class="swatch"></div><div class="panel" id="panel-dark"></div></div>
   </div>
+  <p class="cap" id="demo-note" style="margin:0;color:#5c6470;font-size:11.5px">demo 的反馈只写在这里，不写进面板 —— 面板页脚那行：有校验错误时是红字（`RegionProblem::message`），没有错误时是 muted 的输出读数（拟议）。</p>
 
   <aside class="notes">
-    <h2>宽度 460 → 420</h2>
-    <p style="margin:4px 0 0">继续整体收窄，重点放在<b>行间距、内边距、下拉/预览的最大宽度</b>。数值字号保持 20px 没动 —— 因为再缩就会在 4 位数上显得发飘。</p>
+    <h2>当前实现（代码是唯一事实来源）</h2>
+    <p style="margin:4px 0 0">下面的数字全部取自 <code>geometry.rs</code> 的 <code>REGION_*_DIP</code> 与 <code>d2d.rs</code> 的绘制实参；文案取自 <code>region.rs</code> / <code>units.rs</code>。面板固定 <code>420 dip</code> 宽，高度由各段相加 = <code>277 dip</code>（顶栏那行读数就是本页实测值）。<b class="warn">本版把比例搬进尺寸卡头、加了交换按钮、把原比例行换成「去向」，面板高度不变。</b></p>
+
     <table>
-      <tr><th>位置</th><th>460 版</th><th>420 版</th></tr>
-      <tr><td>面板宽</td><td>460</td><td><b>420</b></td></tr>
-      <tr><td>主体左右内边距</td><td>16</td><td>14</td></tr>
-      <tr><td>卡片列间距</td><td>10</td><td>8</td></tr>
-      <tr><td>卡片内边距</td><td>10 / 12 / 12</td><td>10 / 11 / 11</td></tr>
-      <tr><td>卡片内纵向间距</td><td>8</td><td>7</td></tr>
-      <tr><td>行间距 / 行内 gap</td><td>12 / 10</td><td>11 / 8</td></tr>
-      <tr><td>下拉触发器最小宽</td><td>130</td><td>110</td></tr>
-      <tr><td>浮层预览最大宽</td><td>160</td><td>132</td></tr>
-      <tr><td>预览字号</td><td>10.5</td><td>10</td></tr>
-      <tr><td>切换药丸内边距</td><td>0 10</td><td>0 9</td></tr>
-      <tr><td>延时分段内边距</td><td>4 7</td><td>4 6</td></tr>
-      <tr><td>行标签最小宽</td><td>30</td><td>28</td></tr>
-      <tr><td>页脚内边距</td><td>11 / 16 / 13</td><td>10 / 14 / 12</td></tr>
+      <tr><th style="width:34%">部位</th><th>规格（dip）</th></tr>
+      <tr><td>面板</td><td>420 × 277 · 圆角 12 · 底 <code>rgba(23,23,28,.92)</code> · 边 <code>white .30</code> · 底下是 σ=6 的高斯模糊</td></tr>
+      <tr><td>页头</td><td>上 10 / 行 26 / 下 8 · 标题「自定义截图」12 SEMI_BOLD · 关闭 26×26（悬停底圆角 6）</td></tr>
+      <tr><td>两张卡</td><td>各 <b>189 × 96</b> · 间距 10 · 圆角 10 · 内边距 10 · 卡头 22 · 卡头到数字 6</td></tr>
+      <tr><td>尺寸卡头 <span class="warn">拟议</span></td><td>左「尺寸」10 SEMI_BOLD · 右侧比例按钮 <b>实测 64 × 22</b>（「无比例」/「16:9」+ 12 的 ⌄，`max-content`）· 再右是<b>交换按钮 22×22</b>（与位置卡动作同规格，间距 2）· 卡头总占用约 20 + 64 + 2 + 22 = <b>108</b>，卡头可用 169，仍有余量 · 比例按钮常态无底，悬停铺 5 圆角底，展开时箭头转主色 · 非自由时值用主色 · 交换按钮悬停铺 5 圆角底</td></tr>
+      <tr><td>位置卡头</td><td>左「位置」+ 居中 / 移到原点（22×22，间距 2）</td></tr>
+      <tr><td>数字格</td><td>28 高 · 格宽 76 · 分隔 16 · 数字 20 SEMI_BOLD 等宽居中 · 下划线 1（聚焦/非法 2）· 标签 10 SEMI_BOLD（间距 6、高 14）</td></tr>
+      <tr><td>分隔</td><td>尺寸卡：<code>×</code> 18 BOLD 等宽（<b>拟议</b>：比例非自由时转主色，提示联动）· 位置卡：1 px 竖线（上下各留 4）</td></tr>
+      <tr><td>交换 <span class="warn">拟议</span></td><td>点一下宽高互换：<code>w,h ← h,w</code> · 比例非自由时<b>同步翻转</b>（16:9 → 9:16、4:3 → 3:4、1:1 不变；21:9 在 <code>RATIOS</code> 里没有 9:21 对应项 ⇒ 退回「自由」）· <b>位置不自动夹</b>：交换后越界就交给页脚红字，与打字路径一致（不悄悄挪动用户的选区）· 不重算像素（就是换位置，不做四舍五入修正）</td></tr>
+      <tr><td>比例菜单 <span class="warn">拟议</span></td><td>固定 <b>140 × 280</b>（内边距 5 + 9 × 30），<b>右缘对齐尺寸卡右缘</b>、从卡头下方展开（gap 6）· 项高 30、圆角 6（内缩 3）、左侧 26 留给勾 · 菜单宽与按钮宽解耦（按钮只有约 60，菜单放不下 9 项）</td></tr>
+      <tr><td>去向行 <span class="warn">拟议</span></td><td>行高 28（同「延时」）· 标签「去向」宽 26 · 分段器 <b>150 × 30</b>（3 × 48 + 6，<code>复制 / 保存 / 贴图</code>，圆角 7/4）· 靠左；右侧仍是「延时」142 × 30 · 两者之间留白约 44 · 默认「复制」（与现在确定的行为一致：复制 + 入历史）· <b class="warn">「保存」标为未实现</b>：文字压暗 + 点线 + tooltip，点了会在说明里告诉你；落地时先只做「复制」「贴图」两段</td></tr>
+      <tr><td>延时</td><td>标签「延时」宽 26 · 轨道 <b>142 × 30</b>（4 × 34 + 6）· 段 <b>34 × 24</b> · 圆角 <b>7 外 / 4 内</b>（不是胶囊）· 文案 <code>0 / 3s / 5s / 10s</code></td></tr>
+      <tr><td>角标行</td><td>行高 24 · 标签「角标」宽 26 · 三个胶囊 <b>46 × 24</b>（圆角 = 高/2）· 间距 <b>8</b></td></tr>
+      <tr><td>角标行右侧</td><td>单位分段器 <b>64 × 24</b>（2 × 29 + 6，圆角 7/4，文案 <b>PX / DP</b>）+ 间距 8 + 倍率块 <b>46 × 24</b>（圆角 <b>4</b>，文案 <code>150%</code>）</td></tr>
+      <tr><td>图片卡 <span class="warn">拟议</span></td><td>整宽 <b>388</b> · 上距 10 · 圆角 10 · 内边距 10 · 卡头 22 · <b>底 <code>ACCENT @ .14</code>、边 <code>ACCENT @ .60</code>、标题与箭头 <code>rgb(124,180,243)</code></b>（三支新画刷；输入区一律中性灰，图片卡一律主色淡染，不靠分隔线区分）· <b>收起 = 一行</b>（卡高 <b>42</b>）：左「图片」10 SEMI_BOLD，右侧当前设置的摘要（11 NORMAL）+ 14 的 ⌄；整个卡头就是开关，悬停整张卡底色略深，聚焦卡外 2 主色环 · <b>展开</b>（卡高 <b>114</b>）：摘要隐去，箭头转 180°，下面是「格式 / 质量」「圆角」两行 · 面板 收起 <b>329</b>、展开 <b>401</b></td></tr>
+      <tr><td>图片卡摘要 <span class="warn">拟议</span></td><td>按去向拼：保存 = <code>JPG 高 · 圆角 12</code>；复制 / 贴图 = <code>圆角 12</code>（格式不适用）；都没有就只剩箭头 · 与页脚读数用同一份文案函数</td></tr>
+      <tr><td>格式行 <span class="warn">拟议</span></td><td>行高 28（同「去向 / 延时」行）· 标签「格式」「质量」宽 26 · 格式分段器 <b>132 × 30</b>（3 × 42 + 6，PNG / JPG / WebP）靠左 · 质量分段器 <b>108 × 30</b>（3 × 34 + 6，高 / 中 / 低）右缘与延时轨道对齐 · <b>只有「保存」去向可用</b>：复制 / 贴图时整行压暗、滑块收起、不可点；选 PNG 时质量轨道同样压暗 · 图片区展开后才出现（+10 间距 +28 行）</td></tr>
+      <tr><td>圆角行 <span class="warn">拟议</span></td><td>行高 28 · 标签「圆角」宽 26 · 滑动条 <b>弹性宽</b>（左缘与去向、角标芯片、格式分段器对齐；右留 12 到值块）· 轨道 <b>4</b> 高圆角 2（已选 = 主色，其余 = <code>white .18</code>）· 滑块 <b>14</b> 的白圆（悬停外 4 淡环；聚焦 / 拖动 2 主色环）· 命中区 28 高 · 值块 <b>46 × 24</b> 圆角 4（同倍率块）：左边 10 × 10 的左上角小标（弧度实时跟随）+ 数字（0 时 muted，&gt; 0 时白）· 范围 0 … min(128 px, 短边 / 2)，步进 1（跟随 PX / DP）· 键盘 ←→↑↓ ±1、PgUp / PgDn ±8、Home / End · <b>所有去向都可用</b>（位图的角，剪贴板 / 贴图也保留透明）· 图片区展开后才出现（再 +38）</td></tr>
+      <tr><td>页脚 <span class="warn">拟议</span></td><td>左侧那句话无错误时显示输出读数：<code>将复制 1440×900 px</code> / <code>将保存 1440×900 px · PNG · 圆角 12</code> / <code>将贴图 1440×900 px</code>；DP 模式 <code>960×600 dp → 1440×900 px …</code>（muted，11 NORMAL，不估体积、不加高度）· 上留白 10（<b>没有分隔线</b>）· 按钮 <b>28</b> 高、<b>60</b> 宽且两者等宽 · 圆角 6 · 文案 <code>取消</code> / <b><code>复制</code> · <code>保存</code> · <code>贴图</code></b>（随去向变，仍是同一个 <code>PanelSlot::Start</code>）· 下 11</td></tr>
+      <tr><td>状态色</td><td>主色 <code>rgb(31,117,219)</code> · 次要字 <code>rgba(232,236,242,.62)</code> · 危险 <code>rgb(255,123,123)</code> · 填充 <code>white .08</code> · 线 <code>white .30</code></td></tr>
     </table>
 
-    <h3>验证重点</h3>
+    <h3>demo 和实现的关系</h3>
     <ul>
-      <li>4 位数 <code>1920</code> / <code>1080</code> 在 20px 等宽字 + 负字距下不溢出卡片</li>
-      <li>预设行：<code>预设 [下拉 110] … [延时 标签+4段]</code> 一行内成立</li>
-      <li>浮层行：三个药丸 + 预览 <code>913×549 dp (883,421)</code> 恰好一行不换行</li>
-      <li>下拉菜单弹出时不会被面板圆角裁掉（<code>.dlg</code> 没有 <code>overflow: hidden</code>）</li>
+      <li><b>几何与颜色逐项对齐</b>：上表每个数都能在 <code>geometry.rs</code> / <code>d2d.rs</code> 找到同一个来源；CSS 变量名后面就注了常量名。顶栏那行是本页实测（面板 420 × 277、卡 189、比例按钮 64、交换 22、菜单 82、去向轨道 150、延时轨道 142、单位轨道 64、倍率 46、芯片 46、最挤一行不溢出）。</li>
+      <li><b>比例按钮的位置变了，槽没变</b>：它还是 <code>PanelSlot::Ratio</code>，只是从独立行搬进尺寸卡头。菜单从「跟着触发器宽」改成「跟着最宽项走」（max-content = 「无比例」文本 + 26 检查位 + 10 右内边距 + 5×2 菜单内边距 = 实测 82），右缘对齐卡片右缘；按钮实测 64，比菜单窄。</li>
+      <li><b>交换按钮</b>：新的 <code>PanelSlot::Swap</code>，22×22 与位置卡的居中 / 原点同规格、同悬停语言，放在比例按钮右侧（两卡最右侧都是动作图标，视觉对齐）。</li>
+      <li><b>Tab 序</b>：卡头在数字之前 ⇒ 顺序变成「比例 → 交换 → 宽 → 高 → X → Y → 去向 → 延时 → 角标 → 单位 → 图片卡头 → …」，共 <b>16</b> 项（原 14 项 + 去向 + 交换）。若想保持「宽 → 高 → 比例 → 交换」，按钮改用绝对定位、DOM 放在数字之后；demo 用的是自然顺序。</li>
+      <li><b>场景就是"工作区"</b>：正常场景 700 高，菜单挂得下 ⇒ 挂在卡头下方；点"小工作区"把工作区压到 380 高 ⇒ 下方只剩一小截，按 <code>dropdown_top</code> 的规则翻到上方、并压住面板（这是代码的行为：能选到每一项，但必然遮住点什么）。</li>
+      <li><b>插入符</b>：实现是缓冲 + 光标下标、<code>3 px</code> 宽 <code>23 dip</code> 高、<b>500 ms</b> 闪烁、退格只删一个字符；中文输入法的全角数字在 <code>WM_CHAR</code> 那条路上归一化。本页用同一套模型，闪烁用 CSS <code>steps(1)</code> 每 1 s 一闪（半周期 500 ms）。点进数字格后用 ←/→ 把光标移到中间再输入，可验证"不是全选替换"。</li>
+      <li><b>平移动画</b>：<code>SEGMENT_SLIDE_MS = 140</code>、缓出；本页 <code>transition: transform 140ms</code>。去向、格式、质量都复用同一个 <code>.seg</code> 语言。</li>
+      <li><b>菜单底是 0.92</b>（与面板同一支画刷）⇒ 展开时下面的行会透出约 8%。这不是本页的透明 bug，是代码的画法；拿不透明确认过：底色一改实，透出立刻消失。</li>
+      <li><b>字体</b>：实现内嵌 HarmonyOS Sans SC 子集，等宽串走 Consolas 回退；浏览器里没有内嵌字体，本页用系统回退 ⇒ 字宽会有细微差别（29 / 34 / 48 是设备层按真实字体量出来的）。</li>
     </ul>
 
-    <h3>再窄要付什么代价</h3>
-    <table>
-      <tr><th>目标</th><th>代价</th></tr>
-      <tr><td>400</td><td>数值字号降到 18；或卡片内改竖排（宽在上、高在下）</td></tr>
-      <tr><td>380</td><td>预设与延时拆成两行；浮层预览移到页脚</td></tr>
-      <tr><td>360</td><td>两张卡片改为竖向堆叠，面板变回竖长</td></tr>
-      <tr><td>340</td><td>放弃并排数字，改回传统的标签 + 输入框结构</td></tr>
-    </table>
-
-    <h3 class="todo">待你确认</h3>
+    <h3 class="warn">拟议、尚未在代码里</h3>
     <ul>
-      <li class="todo">420 是否到位？还是继续压？</li>
-      <li class="todo">延时预置值是否需要更多档（15s / 30s）？</li>
-      <li class="todo">预设是否也保存延时？（PixPin 是保存的。）</li>
+      <li><b>去向默认 = 复制</b>：与现在 <code>确定</code> 的行为一致（复制 + 入历史），迁移成本为零。</li>
+      <li><b>延时与去向统一</b>：代码现在把延时到点写死成贴图（<code>panel-delay-pin</code>）⇒ 将来延时要走<em>同一个去向</em>；"3 秒后复制 / 保存 / 贴图" 都成立，而不是只有贴图。</li>
+      <li><b>「保存」暂缺</b>：目录与命名策略没定（要另做保存面板）⇒ demo 保留这一段表达设计意图，但标成"未实现"。<b>代码落地时先只做「复制」「贴图」两段</b>，等保存面板就绪再加 —— 选了没反应的选项比没有更糟。</li>
+    </ul>
+    <ul>
+      <li><b>比例搬进尺寸卡头</b>：语义上更对——比例锁的是宽高比，改宽联动高，本来就是尺寸卡的事；位置卡头有「居中 / 原点」，尺寸卡头现在有「比例 + 交换」，两张卡头对称了。它<b>不是</b>复活 §14.55.10 删掉的那个比例锁图标，而是把独立行的触发器换了位置和形态，文档要按这个说法更新（那句「尺寸卡头部没有图标」要改写为「头部有比例按钮和交换动作」）。</li>
+      <li><b>交换的含义</b>：只交换宽高两个数，不做别的。比例非自由时把比例一起翻转，是为了不让「锁 16:9 却显示 9:16 的数」出现；21:9 没有 9:21 对应项，退回「自由」是唯一自洽的选择（也可以考虑在 <code>RATIOS</code> 里补上 9:21，但那会改变菜单项数 = 改动更大，本 demo 没做）。位置不自动夹，越界显示红字——与打字路径一致，不悄悄挪选区。</li>
+      <li><b>去向（复制 / 保存 / 贴图）</b>：这是原「比例行」让出来的位置里最值得放的功能——它和图片卡是正交的两个维度（「成图自己的属性」vs「成图去哪」），代码里 <code>--out-*</code> 的注释早就把「去向」留给了复制 / 保存 / 贴图。和延时拼一行也说得通：一个「什么时候截」，一个「截完做什么」，都在流程维度上。</li>
+      <li><b>格式只在保存时有效</b>：复制到剪贴板、贴图都是位图，没有格式概念。所以格式 / 质量在非「保存」去向时压暗（和 PNG 时质量压暗同一套语言，轨道不消失、不跳版），摘要与页脚读数也不带格式。这是这个功能的隐性成本，本版已经处理；若不想接受这个分叉，就别做去向。</li>
+      <li><b>页脚输出读数</b>：复用页脚那个槽，不加行，面板仍是 277 高。切到 DP 看换算，把宽改到会越界看它如何让位给红字。<code>outputText()</code> 是这条的全部逻辑；图片区关掉时读数里的格式固定为 PNG、没有圆角。放不下时 DP 先去掉 dp 一侧、PX 先去掉「将」，不靠省略号。</li>
+      <li><b>为什么叫「去向」而不是「输出」</b>：「输出」留给成图本身的属性（图片卡里的格式 / 质量 / 圆角），「去向」是截完之后做什么。两者不混。</li>
+      <li><b>图片区</b>：面板底部常驻一张主色淡染的「图片」卡，<b>收起时只占一行</b>（右侧显示当前设置），点这一行展开成「格式 / 质量」和「圆角」两行；再点收回。<b>收起时设置照样生效</b>，页脚读数也会带上。顶栏「拟议：图片区」整个关掉 = 当前实现（面板 277）。JPG 没有透明通道：带圆角或阴影的窗口截图保存为 JPG 时，透明处要有个垫底色（待定）。</li>
+    </ul>
+
+    <h3 class="warn">拟议：圆角（滑动条）</h3>
+    <ul>
+      <li><b>含义</b>：<b>输出那张图</b>的四角统一圆角（角外透明），不是只改框的画法。读数里会带 <code>· 圆角 12</code>（恒用 px）。四个角分别设置没有做——要的话得 4 条滑动条或一个「联动」开关，面板会再长。</li>
+      <li><b>JPG 没有透明通道</b>：圆角 &gt; 0 又选了 JPG 时，四角要有垫底色（待定）；PNG / WebP 直接保留透明。</li>
+      <li><b>上限随选区变</b>：短边只有 60 px 时最多 30 px；选区缩小后超限的值按上限显示，放大回来会恢复。</li>
+      <li><b>高度</b>：图片区关掉 <b>420 × 277</b>（当前实现）；打开后收起 <b>420 × 329</b>（+52：10 上距 + 42 一行卡），展开 <b>420 × 401</b>，向下长、顶边不动。</li>
+    </ul>
+
+    <h3>不在本 demo 范围</h3>
+    <ul>
+      <li><b>浮层行为</b>：尺寸角标本身、选框与手柄、遮罩/模糊、延时倒计时、贴图 —— 都不是面板的内容，本页只画面板。</li>
+      <li><b>完整键序</b>：Tab 顺序（16 项）、方向键在分段器内换段、Esc 关面板，在实现里都有；本页只演示"聚焦态怎么画"，Esc 只用来退出输入、不收面板。</li>
+      <li><b>IME 组合过程</b>：见上（本页只有 <code>keydown</code>）。</li>
+    </ul>
+
+    <h3 class="warn">同步时发现的一处代码注释笔误（未改代码）</h3>
+    <ul>
+      <li><code>region.rs</code> 里 <code>RATIO_MENU_LEN</code> 的注释写"自由 + 六种比例"，实际是 <b>8 种比例</b>（<code>RATIOS.len() == 8</code>，菜单 9 项）。代码本身是对的，只有注释过时。</li>
     </ul>
   </aside>
 </div>
 
 <script>
 'use strict';
-const SCREEN = { w: 3840, h: 2160, scale: 1.5 };
-const PRESETS = [
-  { id: 'p500',  label: '500×500', w: 500,  h: 500  },
-  { id: 'p480',  label: '480p',    w: 640,  h: 480  },
-  { id: 'p720',  label: '720p',    w: 1280, h: 720  },
-  { id: 'p1080', label: '1080p',   w: 1920, h: 1080 },
+
+/* ── 屏幕（与产品一致：3840×2160 / 150%）──────────────────────────────── */
+const SCREEN = { w: 3840, h: 2160, dpi: 144 };
+
+/* ── 数据：全部来自 region.rs ─────────────────────────────────────────── */
+const DELAYS = [0, 3, 5, 10];                // Delay::ALL
+const RATIOS = [                             // RATIOS（8 条）
+  { name: '1:1',  w: 1,  h: 1  },
+  { name: '4:3',  w: 4,  h: 3  },
+  { name: '3:4',  w: 3,  h: 4  },
+  { name: '16:9', w: 16, h: 9  },
+  { name: '9:16', w: 9,  h: 16 },
+  { name: '3:2',  w: 3,  h: 2  },
+  { name: '2:3',  w: 2,  h: 3  },
+  { name: '21:9', w: 21, h: 9  },
 ];
-const DELAYS = [0, 3, 5, 10];
+const FREE_LABEL = '无比例';                  // 拟议：RATIO_FREE_LABEL 由「自由」改成「无比例」
+const MENU = [null, ...RATIOS];               // 第 0 项是自由（ratio_at_menu）
+
+/* 拟议（代码里还没有）：确定后动作。0 复制 / 1 保存 / 2 贴图。
+   复制到剪贴板、贴图都是位图 ⇒ 格式 / 质量不适用；只有「保存」用得上格式。 */
+const TARGETS = ['复制', '保存', '贴图'];
+/* 拟议（代码里还没有）：保存格式。PNG 无损、没有质量档；JPG / WebP 有三档。
+   档位对应的编码参数只是占位（92 / 80 / 60），真正的数要看编码器。 */
+const FORMATS = ['PNG', 'JPG', 'WebP'];
+const QUALITIES = [{ label: '高', q: 92 }, { label: '中', q: 80 }, { label: '低', q: 60 }];
+const FORMAT_SEG_W = '42px';                  // 3 × 42 + 6 = 132
+const TARGET_SEG_W = '48px';                  // 3 × 48 + 6 = 150
+
+/* 拟议（代码里还没有）：圆角。四角统一一个值，范围 0 … min(128 px, 短边/2)，步进 1（按当前单位）。
+   小于等于 0 时 = 直角；选区缩小导致超过上限时按上限显示（st.radius 本身不改，选区放大回来会恢复）。 */
+const RADIUS_MAX_PX = 128;
+const radiusCap = () => Math.max(0, Math.min(RADIUS_MAX_PX, Math.floor(Math.min(st.w, st.h) / 2)));
+const radiusPx = () => (st.outputOn ? Math.min(st.radius, radiusCap()) : 0);
+function setRadiusFromT(t) {
+  const cap = radiusCap();
+  st.radius = clamp(toPx(Math.round(clamp(t, 0, 1) * fromPx(cap))), 0, cap);
+}
+function stepRadius(delta) {
+  const cap = radiusCap();
+  st.radius = clamp(toPx(fromPx(radiusPx()) + delta), 0, cap);
+}
+function radiusRowHtml() {
+  const cap = radiusCap(), px = radiusPx(), t = cap ? px / cap : 0;
+  const cls = ['slider'];
+  if (cap === 0) cls.push('is-disabled');
+  if (focusedSlot('Radius')) cls.push('is-focus');
+  if (hovered('Radius')) cls.push('is-hover');
+  if (st.drag) cls.push('is-drag');
+  return '<div class="row">'
+    + '<span class="row-label">圆角</span>'
+    + '<div class="' + cls.join(' ') + '" data-slider role="slider" aria-label="截图框圆角" tabindex="0"'
+    +   ' aria-valuemin="0" aria-valuemax="' + fromPx(cap) + '" aria-valuenow="' + fromPx(px) + '" style="--t:' + t + '">'
+    +   '<span class="track"></span><span class="fill"></span><span class="thumb"></span>'
+    + '</div>'
+    + '<span class="rvalue' + (px > 0 ? ' is-set' : '') + '"><span class="corner" style="--t:' + t + '"></span>' + fromPx(px) + '</span>'
+    + '</div>';
+}
+
+/* 拟议：格式名（带质量档）与图片卡摘要。格式只对「保存」有意义。 */
+function formatName() {
+  if (!st.outputOn) return FORMATS[0];                 // 图片区关掉 = 当前实现，固定 PNG
+  const i = st.format;
+  return FORMATS[i] + (i > 0 ? ' ' + QUALITIES[st.quality].label : '');
+}
+function imageSummary() {
+  const parts = [];
+  if (st.target === 1) parts.push(formatName());       // 只有保存才谈格式
+  if (radiusPx() > 0) parts.push('圆角 ' + radiusPx());
+  return parts.join(' · ');
+}
+
+/* 拟议：页脚读数——「最终那张图会怎样」。
+   输出像素 = 选区物理像素（st.w × st.h 本来就存的是 px）。
+   PX 模式：输入的数就是输出；DP 模式：把 dp → px 的换算写出来（这才是信息量所在）。
+   刻意不估体积：PNG 体积取决于内容，纯色界面和照片差一个数量级，估错比不写更糟。*/
+/* 页脚那句话的可用宽 = 420 − 2×16 − 8 − 60 − 8 − 60 = 252 dip；放不下时按顺序让位：
+   DP 模式先去掉 dp 一侧（上面的数字格里本来就是 dp），PX 模式先去掉「将…」。实现里用 DirectWrite 量宽即可。 */
+const STATUS_W = 252;
+const measureCtx = document.createElement('canvas').getContext('2d');
+function textFits(text) {
+  measureCtx.font = '11px ' + getComputedStyle(document.body).fontFamily;
+  return measureCtx.measureText(text).width <= STATUS_W - 2;
+}
+function outputText() {
+  const px = st.w + '×' + st.h + ' px';
+  const dp = fromPx(st.w) + '×' + fromPx(st.h) + ' dp';
+  const verb = TARGETS[st.target];
+  const parts = [];
+  if (st.target === 1) parts.push(formatName());
+  if (radiusPx() > 0) parts.push('圆角 ' + radiusPx());
+  const tail = parts.length ? ' · ' + parts.join(' · ') : '';
+  const candidates = st.unit === 'dp'
+    ? ['将' + verb + ' ' + dp + ' → ' + px + tail, '→ ' + px + tail]
+    : ['将' + verb + ' ' + px + tail, px + tail];
+  return candidates.find(textFits) || candidates[candidates.length - 1];
+}
+const delayLabel = s => (s === 0 ? '0' : s + 's');   // Delay::label
 
 const st = {
-  unit: 'dp',
-  w: 1370, h: 824, x: 1325, y: 632,
+  unit: 'px',                                 // 默认 LengthUnit::Px
+  w: 1440, h: 900, x: 1240, y: 549,           // 桌面像素
+  ratio: null,                                // 自由
   delay: 0,
-  lock: false,
+  target: 0,                                  // 拟议：0 复制 / 1 保存 / 2 贴图
+  format: 0,                                  // 拟议：FORMATS 下标，默认 PNG
+  quality: 0,                                 // 拟议：QUALITIES 下标，默认「高」
+  radius: 0,                                  // 拟议：输出图四角统一圆角（桌面像素）
+  outputOn: true,                             // demo 开关：关掉 = 当前实现（没有图片卡；格式固定 PNG、圆角 0）
+  outputOpen: false,                          // 「图片」区默认收起
+  drag: null,                                 // 拖滑块时 = 面板元素 id
   show: { size: true, position: true, unit: true },
-  presetMenuOpen: false,
+  menu: false,
+  menuIndex: 0,
+  menuTop: 0,
+  menuLeft: 0,
+  hover: null,
+  focus: 'Width',                             // PanelSlot::Width
+  edit: null, cursor: 0, buffer: '',
   force: null,
-  result: null,
+  small: false,
 };
 
 const $ = id => document.getElementById(id);
-const round = v => Math.round(v);
-const toUnit = px => (st.unit === 'dp' ? round(px / SCREEN.scale) : px);
-const toPx   = v  => (st.unit === 'dp' ? round(v * SCREEN.scale) : v);
-const unitName = () => (st.unit === 'dp' ? 'dp' : 'px');
-const delayLabel = s => s === 0 ? '不延时' : `${s}s`;
+const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
 
-function badgeText() {
-  const parts = [];
-  if (st.show.size) parts.push(`${toUnit(st.w)}×${toUnit(st.h)}${st.show.unit ? ' ' + unitName() : ''}`);
-  if (st.show.position) parts.push(`(${toUnit(st.x)},${toUnit(st.y)})`);
-  return parts.length ? parts.join('  ') : '（标签为空）';
-}
+/* ── 单位换算：units.rs 的 from_px / to_px（四舍五入）────────────────── */
+const fromPx = (px) => (st.unit === 'dp' ? Math.round(px * 96 / SCREEN.dpi) : px);
+const toPx   = (v)  => (st.unit === 'dp' ? Math.round(v * SCREEN.dpi / 96) : v);
 
-function validate() {
-  if (st.force === 'nan')   return { rows: { size: true, position: false }, status: '宽和高要填整数' };
-  if (st.force === 'empty') return { rows: { size: true, position: false }, status: '先填宽和高' };
-  if (!Number.isInteger(st.w) || !Number.isInteger(st.h) || st.w < 1 || st.h < 1) {
-    return { rows: { size: true, position: false }, status: '宽和高要填 1 以上的整数' };
+const fieldPx = {
+  Width: () => st.w, Height: () => st.h, X: () => st.x, Y: () => st.y,
+};
+const fieldLabel = { Width: '宽', Height: '高', X: 'X', Y: 'Y' };
+
+/* ── 校验：region.rs 的 Region::check / RegionProblem::message ─────────── */
+function realProblem() {
+  if (st.w < 1 || st.h < 1) {
+    return { fields: ['Width', 'Height'], text: '宽和高要大于 ' + Math.max(0, fromPx(1)) };
   }
-  if (!Number.isInteger(st.x) || !Number.isInteger(st.y) || st.x < 0 || st.y < 0) {
-    return { rows: { size: false, position: true }, status: '位置不能小于 0' };
-  }
-  const maxW = SCREEN.w - st.x, maxH = SCREEN.h - st.y;
-  if (st.force === 'overflow' || st.w > maxW || st.h > maxH) {
+  if (st.w > SCREEN.w || st.h > SCREEN.h
+      || st.x < 0 || st.y < 0
+      || st.x + st.w > SCREEN.w || st.y + st.h > SCREEN.h) {
     return {
-      rows: { size: true, position: true },
-      status: `超出屏幕：宽 ≤ ${maxW}、高 ≤ ${maxH}`,
-      detail: `屏幕 ${SCREEN.w}×${SCREEN.h} px，按当前位置算出的可用范围`,
+      fields: ['Width', 'Height', 'X', 'Y'],
+      text: '本屏放不下：宽 ≤ ' + fromPx(SCREEN.w) + '、高 ≤ ' + fromPx(SCREEN.h),
     };
   }
-  return { rows: { size: false, position: false }, status: '' };
+  return null;
 }
-const invalid = v => v.rows.size || v.rows.position;
-const presetHits = () => PRESETS.find(p => p.w === st.w && p.h === st.h);
+function problem() {
+  if (st.force === 'tiny') {
+    return { fields: ['Width', 'Height'], text: '宽和高要大于 ' + Math.max(0, fromPx(1)) };
+  }
+  if (st.force === 'outside') {
+    return {
+      fields: ['Width', 'Height', 'X', 'Y'],
+      text: '本屏放不下：宽 ≤ ' + fromPx(SCREEN.w) + '、高 ≤ ' + fromPx(SCREEN.h),
+    };
+  }
+  return realProblem();
+}
 
-const ICONS = {
-  close:  '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M4.5 4.5l7 7M11.5 4.5l-7 7"/></svg>',
-  swap:   '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h9M9.5 3.5L12 6l-2.5 2.5M13 10H4M6.5 7.5L4 10l2.5 2.5"/></svg>',
-  lock:   '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 7V5.5a3 3 0 016 0V7"/><rect x="3.5" y="7" width="9" height="6" rx="1.6"/></svg>',
-  unlock: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 7V5.5a3 3 0 015.6-1.5"/><rect x="3.5" y="7" width="9" height="6" rx="1.6"/></svg>',
+/* ── 比例：region.rs 的 with_screen_ratio（以当前宽为基准、只缩不涨、夹进屏）*/
+function applyRatio(ratio) {
+  if (!ratio) return;
+  const widthCap = Math.min(SCREEN.w, Math.round(SCREEN.h * ratio.w / ratio.h));
+  const width = clamp(st.w, 1, Math.max(widthCap, 1));
+  const height = clamp(Math.round(width * ratio.h / ratio.w), 1, SCREEN.h);
+  st.w = width; st.h = height;
+  st.x = clamp(st.x, 0, Math.max(SCREEN.w - st.w, 0));
+  st.y = clamp(st.y, 0, Math.max(SCREEN.h - st.h, 0));
+}
+/* 打字时的耦合：Region::with_ratio */
+function withRatio(field, px) {
+  if (!st.ratio) return;
+  if (field === 'Width') {
+    st.w = Math.max(px, 1);
+    st.h = Math.max(Math.round(st.w * st.ratio.h / st.ratio.w), 1);
+  } else if (field === 'Height') {
+    st.h = Math.max(px, 1);
+    st.w = Math.max(Math.round(st.h * st.ratio.w / st.ratio.h), 1);
+  }
+}
+/* 拟议：交换宽高。只换两个数；比例非自由时同步翻转（找不到对应项就退回「自由」）。
+   位置不自动夹——越界交给页脚红字，与打字路径一致。 */
+function swapWidthHeight() {
+  const w = st.w, h = st.h;
+  st.w = Math.max(h, 1);
+  st.h = Math.max(w, 1);
+  if (st.ratio) {
+    const flipped = RATIOS.find(r => r.w === st.ratio.h && r.h === st.ratio.w);
+    st.ratio = flipped || null;
+  }
+}
+
+/* ── 图标（Glyph：14 dip 方框）───────────────────────────────────────── */
+const ICON = {
+  close: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M4.5 4.5l7 7M11.5 4.5l-7 7"/></svg>',
   center: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 4.5v-2h2M13.5 4.5v-2h-2M2.5 11.5v2h2M13.5 11.5v2h-2"/><circle cx="8" cy="8" r="1.4" fill="currentColor" stroke="none"/></svg>',
   origin: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="4"/><path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2"/></svg>',
-  chevron:'<svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4.5L6 7.5L9 4.5"/></svg>',
-  check:  '<svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 6l2.5 2.5L9.5 4"/></svg>',
+  swap: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5.5h9M9.5 3l2.5 2.5L9.5 8"/><path d="M13 10.5H4M6.5 8L4 10.5 6.5 13"/></svg>',
+  chevron: '<svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4.5L6 7.5L9 4.5"/></svg>',
+  check: '<svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 6l2.5 2.5L9.5 4"/></svg>',
 };
 const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
 
-function valueCell(key, label, value, bad, aria, hint) {
-  const hf = st.force === 'hoverfocus' && key === 'x';
-  return `<span class="value${bad ? ' bad' : ''}${hf ? ' force-hover' : ''}"${hint ? ` title="${esc(hint)}"` : ''}>
-    <input data-key="${key}" value="${esc(value)}" inputmode="numeric" aria-label="${aria}">
-    <span class="label">${label}</span>
-  </span>`;
+const hovered = key => st.hover === key;
+const focusedSlot = key => st.focus === key;
+
+/* ── 面板 ────────────────────────────────────────────────────────────── */
+function cellHtml(field, bad) {
+  const editing = st.edit === field;
+  const text = editing ? st.buffer : String(fromPx(fieldPx[field]()));
+  const before = editing ? text.slice(0, st.cursor) : '';
+  const after = editing ? text.slice(st.cursor) : '';
+  const cls = ['cell'];
+  if (focusedSlot(field)) cls.push('is-focus');
+  if (bad) cls.push('is-bad');
+  const inner = editing
+    ? esc(before) + '<span class="caret"></span>' + esc(after)
+    : esc(text);
+  return '<span class="' + cls.join(' ') + '" data-cell="' + field + '">'
+    + '<span class="field"><span class="num">' + inner + '</span></span>'
+    + '<span class="label">' + fieldLabel[field] + '</span>'
+    + '</span>';
 }
 
-function presetDropdown() {
-  const hit = presetHits();
-  const triggerLabel = hit ? hit.label : '自定义';
-  const isCustom = !hit;
-
-  const items = PRESETS.map(p => `
-    <button class="dropdown-item${hit && hit.id === p.id ? ' on' : ''}"
-            data-preset="${p.id}"
-            role="menuitem"
-            aria-checked="${hit && hit.id === p.id}">
-      <span class="check">${ICONS.check}</span>
-      <span class="txt">${p.label}</span>
-      <span class="dim">${p.w}×${p.h}</span>
-    </button>`).join('');
-
-  return `
-    <div class="preset-dropdown">
-      <button class="dropdown-trigger"
-              data-act="preset-toggle"
-              aria-haspopup="menu"
-              aria-expanded="${st.presetMenuOpen}">
-        <span class="label${isCustom ? ' custom' : ''}">${esc(triggerLabel)}</span>
-        <span class="chevron">${ICONS.chevron}</span>
-      </button>
-      ${st.presetMenuOpen ? `
-        <div class="dropdown-menu" role="menu">
-          ${items}
-          <div class="dropdown-divider"></div>
-          <button class="dropdown-item" data-act="manage-preset" role="menuitem">
-            <span class="check"></span>
-            <span class="txt">管理预设…</span>
-          </button>
-        </div>` : ''}
-    </div>`;
+function segmentedHtml(kind, options, selectedIndex, focused, extra) {
+  extra = extra || {};
+  const width = extra.width || (kind === 'unit' ? 'var(--unit-seg-w)' : 'var(--delay-seg-w)');
+  const opts = options.map((label, i) => {
+    const cls = ['opt'];
+    if (i === selectedIndex) cls.push('is-selected');
+    if (hovered(kind + ':' + i)) cls.push('is-hover');
+    // 拟议：「保存」还没实现 —— 压暗 + 点线 + tooltip，看起来就不是"已经能用"
+    if (kind === 'target' && i === 1) cls.push('is-todo');
+    return '<button class="' + cls.join(' ') + '" role="radio" aria-checked="' + (i === selectedIndex) + '"' + (extra.disabled ? ' aria-disabled="true" tabindex="-1"' : '')
+      + (kind === 'target' && i === 1 ? ' title="未实现 · 等保存面板"' : '')
+      + ' data-seg="' + kind + '" data-index="' + i + '" style="width:' + width + '">' + esc(label) + '</button>';
+  }).join('');
+  return '<div class="seg ' + (extra.cls || kind) + (focused ? ' is-focus' : '') + (extra.disabled ? ' is-disabled' : '') + '" role="radiogroup">'
+    + '<span class="block" style="--index:' + selectedIndex + ';--seg-w:' + width + '"></span>'
+    + opts
+    + '</div>';
 }
 
-function delaySwitch() {
-  return `
-    <div class="delay-group">
-      <span class="row-label">延时</span>
-      <div class="delay-switch" role="radiogroup" aria-label="截图延时">
-        ${DELAYS.map(d => `
-          <button role="radio" data-delay="${d}" aria-checked="${st.delay === d}" class="${st.delay === d ? 'on' : ''}" title="${d === 0 ? '立即截图' : `${d} 秒后截图`}">${delayLabel(d)}</button>
-        `).join('')}
-      </div>
-    </div>`;
+function menuHtml() {
+  // 当前项：ratio_menu_index —— 自由 是第 0 项，所以没选比例时第 0 项带对勾
+  const current = st.ratio ? MENU.findIndex(ratio => ratio && ratio.name === st.ratio.name) : 0;
+  const items = MENU.map((ratio, i) => {
+    const label = ratio ? ratio.name : FREE_LABEL;
+    const cls = ['item'];
+    if (i === current) cls.push('is-selected');
+    if (hovered('menu:' + i)) cls.push('is-hover');
+    const check = i === current ? '<span class="check">' + ICON.check + '</span>' : '<span class="check"></span>';
+    return '<button class="' + cls.join(' ') + '" role="menuitem" data-menu="' + i + '">'
+      + check + esc(label) + '</button>';
+  }).join('');
+  return '<div class="menu" style="left:' + (st.menuLeft || 0) + 'px;top:' + (st.menuTop || 0) + 'px">'
+    + items
+    + '</div>';
 }
 
-function dialogHtml() {
-  const bad = validate();
-  const invalidNow = invalid(bad);
-  const hint = bad.detail || '';
-  const tog = (key, label) =>
-    `<button class="toggle${st.show[key] ? ' on' : ''}" data-show="${key}" aria-pressed="${st.show[key]}" title="浮层尺寸标显示这一项">${label}</button>`;
+function panelHtml() {
+  const bad = problem();
+  const badSet = new Set(bad ? bad.fields : []);
+  const canStart = !bad;
 
-  return `
-  <div class="dlg-head">
-    <h2>自定义截图</h2>
-    <div class="unit-switch" role="radiogroup" aria-label="单位" title="数值单位；dp = px ÷ 屏幕缩放">
-      <button role="radio" data-unit="px" aria-checked="${st.unit === 'px'}" class="${st.unit === 'px' ? 'on' : ''}">px</button>
-      <button role="radio" data-unit="dp" aria-checked="${st.unit === 'dp'}" class="${st.unit === 'dp' ? 'on' : ''}">dp</button>
-    </div>
-    <span class="scale-badge" title="本屏缩放比">${Math.round(SCREEN.scale * 100)}%</span>
-    <span class="spacer"></span>
-    <button class="ico" data-act="cancel" title="取消（Esc）" aria-label="取消">${ICONS.close}</button>
-  </div>
+  const chip = (key, label) => {
+    const on = st.show[key];
+    const cls = ['chip'];
+    if (on) cls.push('is-on');
+    if (hovered('chip:' + key)) cls.push('is-hover');
+    if (focusedSlot('Show' + key[0].toUpperCase() + key.slice(1))) cls.push('is-focus');
+    return '<button class="' + cls.join(' ') + '" aria-pressed="' + on + '" data-chip="' + key + '">' + label + '</button>';
+  };
 
-  <div class="dlg-body">
+  const unitIndex = st.unit === 'px' ? 0 : 1;
+  const delayIndex = DELAYS.indexOf(st.delay);
+  const ratioText = st.ratio ? st.ratio.name : FREE_LABEL;
 
-    <div class="measures">
-      <div class="card">
-        <div class="card-head">
-          <span class="card-title">尺寸</span>
-          <span class="spacer"></span>
-          <span class="actions">
-            <button class="ico-sm" data-act="swap" title="互换宽高" aria-label="互换宽高">${ICONS.swap}</button>
-            <button class="ico-sm" data-act="lock"
-                    title="${st.lock ? '已锁定宽高比' : '锁定宽高比'}"
-                    aria-pressed="${st.lock}" aria-label="锁定宽高比">${st.lock ? ICONS.lock : ICONS.unlock}</button>
-          </span>
-        </div>
-        <div class="values">
-          ${valueCell('w', '宽', toUnit(st.w), bad.rows.size, '宽度', hint)}
-          <span class="sep">×</span>
-          ${valueCell('h', '高', toUnit(st.h), bad.rows.size, '高度', hint)}
-        </div>
-      </div>
+  return ''
+    + '<div class="head">'
+    +   '<span class="title">自定义截图</span>'
+    +   '<button class="close' + (hovered('Cancel') ? ' is-hover' : '') + '" data-act="cancel" aria-label="取消">' + ICON.close + '</button>'
+    + '</div>'
+    + '<div class="body">'
+    +   '<div class="cards">'
+    +     '<div class="card">'
+    +       '<div class="card-head"><span class="card-title">尺寸</span><span class="spacer"></span>'
+    +         '<button class="ratio-btn' + (focusedSlot('Ratio') ? ' is-focus' : '') + (hovered('Ratio') ? ' is-hover' : '') + (st.ratio ? ' is-locked' : '') + '"'
+    +           ' aria-haspopup="menu" aria-expanded="' + st.menu + '" data-act="ratio" aria-label="比例">'
+    +           '<span class="value-text">' + esc(ratioText) + '</span>'
+    +           '<span class="chev">' + ICON.chevron + '</span>'
+    +         '</button>'
+    +         '<span class="actions">'
+    +           '<button class="action' + (hovered('Swap') ? ' is-hover' : '') + (focusedSlot('Swap') ? ' is-focus' : '') + '" data-act="swap" aria-label="交换宽和高">' + ICON.swap + '</button>'
+    +         '</span>'
+    +       '</div>'
+    +       '<div class="values">'
+    +         cellHtml('Width', badSet.has('Width'))
+    +         '<span class="sep-times' + (st.ratio ? ' is-linked' : '') + '">×</span>'
+    +         cellHtml('Height', badSet.has('Height'))
+    +       '</div>'
+    +     '</div>'
+    +     '<div class="card">'
+    +       '<div class="card-head"><span class="card-title">位置</span><span class="spacer"></span>'
+    +         '<span class="actions">'
+    +           '<button class="action' + (hovered('Center') ? ' is-hover' : '') + (focusedSlot('Center') ? ' is-focus' : '') + '" data-act="center" aria-label="选区居中">' + ICON.center + '</button>'
+    +           '<button class="action' + (hovered('Origin') ? ' is-hover' : '') + (focusedSlot('Origin') ? ' is-focus' : '') + '" data-act="origin" aria-label="移到原点">' + ICON.origin + '</button>'
+    +         '</span>'
+    +       '</div>'
+    +       '<div class="values">'
+    +         cellHtml('X', badSet.has('X'))
+    +         '<span class="sep-line"></span>'
+    +         cellHtml('Y', badSet.has('Y'))
+    +       '</div>'
+    +     '</div>'
+    +   '</div>'
+    +   '<div class="row">'
+    +     '<span class="row-label">去向</span>'
+    +     segmentedHtml('target', TARGETS, st.target, focusedSlot('Target'), { width: TARGET_SEG_W, cls: 'target' })
+    +     '<span class="spacer"></span>'
+    +     '<span class="row-label">延时</span>'
+    +     segmentedHtml('delay', DELAYS.map(delayLabel), delayIndex, focusedSlot('Delay'))
+    +   '</div>'
+    +   '<div class="row chips">'
+    +     '<span class="row-label">角标</span>'
+    +     chip('size', '尺寸') + chip('position', '位置') + chip('unit', '单位')
+    +     '<span class="spacer"></span>'
+    +     '<span class="unit-scale">'
+    +       segmentedHtml('unit', ['PX', 'DP'], unitIndex, focusedSlot('Unit'))
+    +       '<span class="scale">' + Math.round(100 * SCREEN.dpi / 96) + '%</span>'
+    +     '</span>'
+    +   '</div>'
+    + (st.outputOn
+      ? '<div class="card out' + (st.outputOpen ? ' is-open' : '') + (hovered('Output') ? ' is-hover' : '') + (focusedSlot('Output') ? ' is-focus' : '') + '">'
+      +   '<button class="card-toggle" data-act="output" aria-expanded="' + st.outputOpen + '" aria-label="图片设置">'
+      +     '<span class="card-title">图片</span>'
+      +     (st.outputOpen ? '' : '<span class="summary">' + esc(imageSummary()) + '</span>')
+      +     '<span class="chev">' + ICON.chevron + '</span>'
+      +   '</button>'
+      +   (st.outputOpen
+        ? '<div class="row">'
+        +   '<span class="row-label">格式</span>'
+        +   segmentedHtml('format', FORMATS, st.format, focusedSlot('Format'), { width: FORMAT_SEG_W, cls: 'delay', disabled: st.target !== 1 })
+        +   '<span class="spacer"></span>'
+        +   '<span class="row-label">质量</span>'
+        +   segmentedHtml('quality', QUALITIES.map(q => q.label), st.quality, focusedSlot('Quality'), { cls: 'delay', disabled: st.target !== 1 || st.format === 0 })
+        + '</div>'
+        + radiusRowHtml()
+        : '')
+      + '</div>'
+      : '')
+    + '</div>'
+    + '<div class="foot">'
+    +   '<span class="status' + (bad ? '' : ' is-info') + '">' + esc(bad ? bad.text : outputText()) + '</span>'
+    +   '<button class="btn cancel' + (hovered('Cancel') ? ' is-hover' : '') + (focusedSlot('Cancel') ? ' is-focus' : '') + '" data-act="cancel">取消</button>'
+    +   '<button class="btn start' + (canStart ? (hovered('Start') ? ' is-hover' : '') : ' is-disabled') + (focusedSlot('Start') ? ' is-focus' : '') + '"'
+    +     (canStart ? '' : ' disabled') + ' data-act="start">' + esc(TARGETS[st.target]) + '</button>'
+    + '</div>'
+    + (st.menu ? menuHtml() : '');
+}
 
-      <div class="card">
-        <div class="card-head">
-          <span class="card-title">位置</span>
-          <span class="spacer"></span>
-          <span class="actions">
-            <button class="ico-sm" data-act="center" title="选区居中" aria-label="选区居中">${ICONS.center}</button>
-            <button class="ico-sm" data-act="origin" title="移到原点 (0, 0)" aria-label="移到原点">${ICONS.origin}</button>
-          </span>
-        </div>
-        <div class="values">
-          ${valueCell('x', 'X', toUnit(st.x), bad.rows.position, '横向位置', hint)}
-          <span class="sep">,</span>
-          ${valueCell('y', 'Y', toUnit(st.y), bad.rows.position, '纵向位置', hint)}
-        </div>
-      </div>
-    </div>
-
-    <div class="row">
-      <span class="row-label">预设</span>
-      ${presetDropdown()}
-      <span class="spacer"></span>
-      ${delaySwitch()}
-    </div>
-
-    <div class="row">
-      <span class="row-label">浮层</span>
-      <div class="toggles flex">${tog('size','尺寸')}${tog('position','位置')}${tog('unit','单位')}</div>
-      <span class="preview" title="截图浮层上的样子">${esc(badgeText())}</span>
-    </div>
-
-  </div>
-
-  <div class="dlg-foot">
-    <span class="status${invalidNow ? ' bad' : ''}" title="${esc(hint)}">${
-      st.result ? esc(st.result) : (invalidNow ? esc(bad.status) : '')
-    }</span>
-    <span class="spacer"></span>
-    <button class="btn outline" data-act="cancel">取消</button>
-    <button class="btn primary" data-act="start"${invalidNow ? ' disabled aria-disabled="true"' : ''}>开始截图</button>
-  </div>`;
+/* 下拉挂在哪：geometry.rs 的 dropdown_top（下方 → 上方 → 空间大的一侧 → 夹进工作区）。
+   拟议：横向不再跟按钮宽，改为 max-content（最宽项 = 「无比例」）+ 右缘对齐尺寸卡右缘。 */
+function placeMenu(panelEl, sceneEl) {
+  st.menuTop = 0;
+  st.menuLeft = 0;
+  if (!st.menu) return;
+  const btn = panelEl.querySelector('.ratio-btn');
+  const card = panelEl.querySelector('.card');
+  if (!btn || !card) return;
+  const panelBox = panelEl.getBoundingClientRect();
+  const sceneBox = sceneEl.getBoundingClientRect();
+  const btnBox = btn.getBoundingClientRect();
+  const cardBox = card.getBoundingClientRect();
+  const itemH = 30, pad = 5, gap = 6, menuW = 140;
+  const menuH = pad * 2 + MENU.length * itemH;
+  // 转成"面板内坐标"
+  st.menuLeft = Math.max(0, Math.round(cardBox.right - panelBox.left - menuW));
+  const btnTop = btnBox.top - panelBox.top;
+  const btnBottom = btnBox.bottom - panelBox.top;
+  const workTop = sceneBox.top - panelBox.top;
+  const workBottom = sceneBox.bottom - panelBox.top;
+  const below = btnBottom + gap;
+  const above = btnTop - gap - menuH;
+  const belowRoom = workBottom - below;
+  const aboveRoom = btnTop - gap - workTop;
+  let top;
+  if (belowRoom >= menuH) top = below;
+  else if (aboveRoom >= menuH) top = above;
+  else if (aboveRoom > belowRoom) top = above;
+  else top = below;
+  st.menuTop = clamp(top, workTop, Math.max(workTop, workBottom - menuH));
 }
 
 function render() {
-  $('dlg-light').innerHTML = dialogHtml();
-  $('dlg-dark').innerHTML  = dialogHtml();
-  const box = $('dlg-light').getBoundingClientRect();
-  const rows = [...$('dlg-light').querySelectorAll('.row')];
-  const tight = rows.reduce((worst, r) => {
-    const over = r.scrollWidth - r.clientWidth;
-    return over > worst.over ? { over, text: `${r.scrollWidth}/${r.clientWidth}` } : worst;
+  const light = $('panel-light');
+  const dark = $('panel-dark');
+  light.innerHTML = panelHtml();
+  dark.innerHTML = panelHtml();
+  placeMenu(light, $('scene-light'));
+  light.innerHTML = panelHtml();          // 用算出来的 left/top 重画一次
+  dark.innerHTML = panelHtml();
+
+  const box = light.getBoundingClientRect();
+  const rows = [...light.querySelectorAll('.row')];
+  const tight = rows.reduce((worst, row) => {
+    const over = row.scrollWidth - row.clientWidth;
+    return over > worst.over ? { over, text: row.scrollWidth + '/' + row.clientWidth } : worst;
   }, { over: -1, text: '—' });
-  $('size').textContent =
-    `面板 ${Math.round(box.width)} × ${Math.round(box.height)} dip · 最挤一行 ${tight.text}${tight.over > 0 ? ' 溢出' : ''}`;
+  const w = (selector) => {
+    const el = light.querySelector(selector);
+    return el ? Math.round(el.getBoundingClientRect().width) : 0;
+  };
+  // 拟议：菜单宽 = 「无比例」文本宽 + 现有左右内边距（26 检查位 + 10 右内边距 + 5×2 菜单内边距）
+  const menuEl = document.querySelector('.panel .menu');
+  let menuW;
+  if (menuEl) { menuW = menuEl.getBoundingClientRect().width; }
+  else {
+    measureCtx.font = '12px ' + getComputedStyle(document.body).fontFamily;
+    menuW = Math.ceil(26 + measureCtx.measureText(FREE_LABEL).width + 10 + 10);
+  }
+  $('size').textContent = '面板 ' + Math.round(box.width) + ' × ' + Math.round(box.height) + ' dip'
+    + ' · 菜单 ' + Math.round(menuW)
+    + ' · 卡 ' + w('.card') + ' · 比例按钮 ' + w('.ratio-btn') + ' · 交换 ' + w('[data-act="swap"]')
+    + ' · 去向轨道 ' + w('.seg.target')
+    + ' · 延时轨道 ' + w('.seg.delay') + ' · 单位轨道 ' + w('.seg.unit') + ' · 倍率 ' + w('.scale')
+    + ' · 芯片 ' + w('.chip') + ' · 最挤一行 ' + tight.text + (tight.over > 0 ? ' 溢出' : '');
+  const menu = light.querySelector('.menu');
+  if (menu) {
+    const scene = $('scene-light').getBoundingClientRect();
+    const style = getComputedStyle(menu);
+    $('size').textContent += ' · 菜单 ' + Math.round(menu.getBoundingClientRect().left - box.left)
+      + ',' + Math.round(menu.getBoundingClientRect().top - box.top)
+      + ' 高 ' + Math.round(menu.getBoundingClientRect().height)
+      + ' 场景高 ' + Math.round(scene.height)
+      + ' 底色 ' + style.backgroundColor;
+  }
 }
-const presetMatches = () => {
-  const hit = presetHits();
-  return p => Boolean(hit && hit.id === p.id);
-};
 
-function commit(key, raw) {
-  const v = raw.trim();
-  st[key] = /^\d+$/.test(v) ? toPx(Number(v)) : NaN;
-  if (key === 'w' && st.lock && Number.isFinite(st[key])) {
-    const ratio = st.h && st.w ? st.h / st.w : 1;
-    st.h = Math.max(1, round(st[key] * ratio));
-  }
-  st.result = null;
+/* ── 编辑：实现是缓冲 + 光标下标（不是"全选替换"）────────────────────── */
+function beginEdit(field) {
+  if (st.edit) commitEdit();
+  st.focus = field;
+  st.edit = field;
+  st.buffer = String(fromPx(fieldPx[field]()));
+  st.cursor = st.buffer.length;
+  render();
 }
-
-document.addEventListener('input', e => {
-  const input = e.target.closest('input[data-key]');
-  if (!input) return;
-  commit(input.dataset.key, input.value);
-  const owner = input.closest('.dlg').id;
-  const other = owner === 'dlg-light' ? 'dlg-dark' : 'dlg-light';
-  $(other).innerHTML = dialogHtml();
-  const fresh = $(owner);
-  const bad = validate();
-  const invalidNow = invalid(bad);
-  const status = fresh.querySelector('.status');
-  status.textContent = st.result || (invalidNow ? bad.status : '');
-  status.classList.toggle('bad', invalidNow);
-  status.title = bad.detail || '';
-  fresh.querySelector('[data-act="start"]').disabled = invalidNow;
-  fresh.querySelectorAll('.value').forEach(v => v.removeAttribute('title'));
-  fresh.querySelectorAll('.card')[0].querySelectorAll('.value').forEach(v => {
-    v.classList.toggle('bad', bad.rows.size);
-    if (bad.detail) v.title = bad.detail;
-  });
-  fresh.querySelectorAll('.card')[1].querySelectorAll('.value').forEach(v => {
-    v.classList.toggle('bad', bad.rows.position);
-    if (bad.detail) v.title = bad.detail;
-  });
-  const pv = fresh.querySelector('.preview');
-  if (pv) pv.textContent = badgeText();
-  const hit = presetHits();
-  const labelEl = fresh.querySelector('.dropdown-trigger .label');
-  if (labelEl) {
-    labelEl.textContent = hit ? hit.label : '自定义';
-    labelEl.classList.toggle('custom', !hit);
-  }
-  const isHit = presetMatches();
-  fresh.querySelectorAll('.dropdown-item[data-preset]').forEach(b => {
-    const p = PRESETS.find(x => x.id === b.dataset.preset);
-    const on = Boolean(p) && isHit(p);
-    b.classList.toggle('on', on);
-    b.setAttribute('aria-checked', String(on));
-  });
-});
-
-document.addEventListener('click', e => {
-  if (st.presetMenuOpen && !e.target.closest('.preset-dropdown')) {
-    st.presetMenuOpen = false;
-    render();
-    return;
-  }
-
-  const unit = e.target.closest('button[data-unit]');
-  if (unit) { st.unit = unit.dataset.unit; st.result = null; render(); return; }
-
-  const delay = e.target.closest('button[data-delay]');
-  if (delay) { st.delay = Number(delay.dataset.delay); st.result = null; render(); return; }
-
-  const show = e.target.closest('button[data-show]');
-  if (show) { st.show[show.dataset.show] = !st.show[show.dataset.show]; st.result = null; render(); return; }
-
-  const preset = e.target.closest('button[data-preset]');
-  if (preset) {
-    const p = PRESETS.find(x => x.id === preset.dataset.preset);
-    if (p) { st.w = p.w; st.h = p.h; }
-    st.presetMenuOpen = false;
-    st.result = null;
-    render();
-    return;
-  }
-
-  const act = e.target.closest('[data-act]');
-  if (!act) return;
-  switch (act.dataset.act) {
-    case 'preset-toggle':
-      st.presetMenuOpen = !st.presetMenuOpen;
-      render();
-      break;
-    case 'lock': st.lock = !st.lock; render(); break;
-    case 'swap': [st.w, st.h] = [st.h, st.w]; st.result = null; render(); break;
-    case 'center': {
-      st.x = Math.max(0, round((SCREEN.w - st.w) / 2));
-      st.y = Math.max(0, round((SCREEN.h - st.h) / 2));
-      st.result = null; render(); break;
+function commitEdit() {
+  if (!st.edit) return;
+  const field = st.edit;
+  const text = st.buffer.trim();
+  st.edit = null;
+  if (text !== '' && /^\d+$/.test(text)) {
+    const px = toPx(Number(text));
+    if (field === 'Width' || field === 'Height') {
+      if (st.ratio) withRatio(field, px); else setFieldPx(field, px);
+    } else {
+      setFieldPx(field, px);
     }
-    case 'origin':
-      st.x = 0; st.y = 0; st.result = null; render(); break;
-    case 'manage-preset':
-      st.presetMenuOpen = false;
-      st.result = '预设管理在设置页';
-      render();
-      break;
-    case 'cancel': st.result = '已取消'; render(); break;
-    case 'start':
-      if (!invalid(validate())) {
-        st.result = st.delay > 0
-          ? `${st.delay}s 后截取 ${st.w}×${st.h} px @ (${st.x},${st.y})`
-          : `已截取 ${st.w}×${st.h} px @ (${st.x},${st.y})`;
-        render();
-      }
-      break;
   }
+  render();
+}
+function setFieldPx(field, px) {
+  if (field === 'Width') st.w = Math.max(px, 1);
+  else if (field === 'Height') st.h = Math.max(px, 1);
+  else if (field === 'X') st.x = px;
+  else st.y = px;
+}
+
+/* 全角数字（中文输入法）也算数字：WM_CHAR 那条路在实现里做了同一件事 */
+function normalizeDigit(char) {
+  const code = char.codePointAt(0);
+  if (code >= 0xFF10 && code <= 0xFF19) return String.fromCodePoint(code - 0xFF10 + 0x30);
+  if (code >= 0x30 && code <= 0x39) return char;
+  return null;
+}
+
+document.addEventListener('keydown', event => {
+  if (st.edit) {
+    const field = st.edit;
+    if (event.key === 'Enter') { commitEdit(); return; }
+    if (event.key === 'Escape') { st.edit = null; render(); return; }
+    if (event.key === 'ArrowLeft') { st.cursor = Math.max(0, st.cursor - 1); render(); event.preventDefault(); return; }
+    if (event.key === 'ArrowRight') { st.cursor = Math.min(st.buffer.length, st.cursor + 1); render(); event.preventDefault(); return; }
+    if (event.key === 'Backspace') {
+      if (st.cursor > 0) { st.buffer = st.buffer.slice(0, st.cursor - 1) + st.buffer.slice(st.cursor); st.cursor -= 1; }
+      render(); event.preventDefault(); return;
+    }
+    if (event.key === 'Delete') {
+      st.buffer = st.buffer.slice(0, st.cursor) + st.buffer.slice(st.cursor + 1);
+      render(); event.preventDefault(); return;
+    }
+    const digit = normalizeDigit(event.key);
+    if (digit !== null && st.buffer.length < 6) {
+      st.buffer = st.buffer.slice(0, st.cursor) + digit + st.buffer.slice(st.cursor);
+      st.cursor += 1;
+      render(); event.preventDefault();
+    }
+    return;
+  }
+  if (st.focus === 'Radius' && st.outputOn && st.outputOpen && !st.menu) {
+    const big = 8;
+    const step = { ArrowLeft: -1, ArrowDown: -1, ArrowRight: 1, ArrowUp: 1, PageDown: -big, PageUp: big }[event.key];
+    if (step !== undefined) { stepRadius(step); render(); event.preventDefault(); return; }
+    if (event.key === 'Home') { st.radius = 0; render(); event.preventDefault(); return; }
+    if (event.key === 'End')  { st.radius = radiusCap(); render(); event.preventDefault(); return; }
+  }
+  if (st.menu) {
+    if (event.key === 'Escape') { st.menu = false; render(); return; }
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      const delta = event.key === 'ArrowDown' ? 1 : -1;
+      st.menuIndex = (st.menuIndex + delta + MENU.length) % MENU.length;
+      render(); event.preventDefault(); return;
+    }
+    if (event.key === 'Enter') { pickMenu(st.menuIndex); return; }
+  }
+  if (event.key === 'Escape') { st.menu = false; st.edit = null; render(); }
 });
 
-document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') {
-    if (st.presetMenuOpen) { st.presetMenuOpen = false; render(); return; }
-    st.result = '已取消（Esc）';
-    render();
+document.addEventListener('mouseover', event => {
+  const target = event.target.closest('[data-act],[data-cell],[data-chip],[data-seg],[data-menu],[data-slider]');
+  let key = null;
+  if (target) {
+    key = hoverKeyOf(target);
   }
-  if (e.key === 'Enter' && !invalid(validate())) {
-    st.result = st.delay > 0
-      ? `${st.delay}s 后截取 ${st.w}×${st.h} px @ (${st.x},${st.y})`
-      : `已截取 ${st.w}×${st.h} px @ (${st.x},${st.y})`;
-    render();
+  if (key !== st.hover) { st.hover = key; render(); }
+});
+document.addEventListener('mouseleave', () => { if (st.hover) { st.hover = null; render(); } });
+
+function hoverKeyOf(target) {
+  if (target.dataset.act) {
+    const act = target.dataset.act;
+    return act === 'ratio' ? 'Ratio' : act === 'cancel' ? 'Cancel' : act === 'start' ? 'Start'
+      : act === 'center' ? 'Center' : act === 'origin' ? 'Origin' : act === 'output' ? 'Output'
+      : act === 'swap' ? 'Swap' : null;
   }
-  const seg = e.target.closest('.unit-switch button[data-unit]');
-  if (seg && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
-    st.unit = st.unit === 'px' ? 'dp' : 'px';
+  if (target.dataset.cell) return null;
+  if (target.dataset.chip) return 'chip:' + target.dataset.chip;
+  if (target.dataset.seg) return target.dataset.seg + ':' + target.dataset.index;
+  if (target.dataset.menu !== undefined) return 'menu:' + target.dataset.menu;
+  if (target.dataset.slider !== undefined) return 'Radius';
+  return null;
+}
+
+function pickMenu(index) {
+  const ratio = MENU[index];
+  st.ratio = ratio;
+  if (ratio) applyRatio(ratio);
+  st.menu = false;
+  st.menuIndex = index;
+  render();
+}
+
+document.addEventListener('click', event => {
+  if (st.menu && !event.target.closest('.menu') && !event.target.closest('[data-act="ratio"]')
+      && !event.target.closest('[data-menu]') && !event.target.closest('.demo-head')) {
+    st.menu = false;
     render();
+    return;
   }
+
+  const cell = event.target.closest('[data-cell]');
+  if (cell) { beginEdit(cell.dataset.cell); return; }
+
+  const seg = event.target.closest('[data-seg]');
+  if (seg) {
+    const kind = seg.dataset.seg;
+    const index = Number(seg.dataset.index);
+    if (kind === 'unit') st.unit = index === 0 ? 'px' : 'dp';
+    else if (kind === 'target') st.target = index;
+    else if (kind === 'format') st.format = index;
+    else if (kind === 'quality') st.quality = index;
+    else st.delay = DELAYS[index];
+    st.focus = kind === 'unit' ? 'Unit' : kind === 'target' ? 'Target'
+      : kind === 'format' ? 'Format' : kind === 'quality' ? 'Quality' : 'Delay';
+    render();
+    return;
+  }
+
+  const chip = event.target.closest('[data-chip]');
+  if (chip) {
+    const key = chip.dataset.chip;
+    st.show[key] = !st.show[key];
+    st.focus = 'Show' + key[0].toUpperCase() + key.slice(1);
+    render();
+    return;
+  }
+
+  const menuItem = event.target.closest('[data-menu]');
+  if (menuItem) { pickMenu(Number(menuItem.dataset.menu)); return; }
+
+  const action = event.target.closest('[data-act]');
+  if (!action) { if (st.menu) { st.menu = false; render(); } return; }
+  const act = action.dataset.act;
+  if (act === 'ratio') {
+    st.menu = !st.menu;
+    st.focus = 'Ratio';
+    st.menuIndex = Math.max(0, MENU.findIndex(ratio => (ratio && st.ratio && ratio.name === st.ratio.name)
+      || (!ratio && !st.ratio)));
+    render(); return;
+  }
+  if (act === 'swap') {
+    swapWidthHeight();
+    st.focus = 'Swap';
+    st.menu = false;
+    render(); return;
+  }
+  if (act === 'cancel') { $('demo-note').textContent = 'demo：面板关闭（实现里 Esc 与关闭按钮、取消按钮是同一个槽）。'; st.menu = false; render(); return; }
+  if (act === 'start') {
+    if (realProblem()) return;
+    const verb = TARGETS[st.target];
+    let extra = '';
+    if (st.target === 1) extra = '，格式 ' + formatName();
+    if (radiusPx() > 0) extra += '，圆角 ' + radiusPx() + ' px';
+    $('demo-note').textContent = 'demo：' + verb + ' ' + st.w + '×' + st.h + ' px @ (' + st.x + ',' + st.y + ')'
+      + '，延时 ' + delayLabel(st.delay) + extra + '。';
+    st.menu = false; render(); return;
+  }
+  if (act === 'center') {
+    st.x = Math.max(0, Math.round((SCREEN.w - st.w) / 2));
+    st.y = Math.max(0, Math.round((SCREEN.h - st.h) / 2));
+    render(); return;
+  }
+  if (act === 'origin') { st.x = 0; st.y = 0; render(); return; }
+  if (act === 'output') { st.outputOpen = !st.outputOpen; st.focus = 'Output'; st.menu = false; render(); return; }
 });
 
-document.querySelectorAll('.demo-head button[data-force]').forEach(b => {
-  b.addEventListener('click', () => {
-    document.querySelectorAll('.demo-head button[data-force]').forEach(x => x.classList.remove('on'));
-    b.classList.add('on');
-    st.force = b.dataset.force === 'ok' ? null : b.dataset.force;
-    if (st.force === 'nan' || st.force === 'empty') { st.w = NaN; st.h = NaN; }
-    if (st.force === 'ok') { st.w = 1370; st.h = 824; st.x = 1325; st.y = 632; }
-    st.result = null;
+document.querySelectorAll('.demo-head button[data-force]').forEach(button => {
+  button.addEventListener('click', () => {
+    document.querySelectorAll('.demo-head button[data-force]').forEach(other => other.classList.remove('on'));
+    button.classList.add('on');
+    const force = button.dataset.force;
+    st.force = force === 'ok' || force === 'hoverfocus' || force === 'small' ? null : force;
+    st.small = force === 'small';
+    st.hover = force === 'hoverfocus' ? 'Ratio' : null;
+    st.focus = force === 'hoverfocus' ? 'Delay' : 'Width';
+    st.menu = force === 'small';
+    document.querySelectorAll('.scene').forEach(scene => scene.classList.toggle('small', st.small));
     render();
   });
+});
+
+function moveSlider(event) {
+  const el = document.querySelector('#' + st.drag + ' .slider');
+  if (!el) return;
+  const box = el.getBoundingClientRect();
+  setRadiusFromT((event.clientX - box.left - 7) / Math.max(box.width - 14, 1));   // 滑块圆心对准指针
+  render();
+}
+document.addEventListener('pointerdown', event => {
+  const slider = event.target.closest('[data-slider]');
+  if (!slider) return;
+  if (st.edit) commitEdit();
+  st.menu = false;
+  st.drag = slider.closest('.panel').id;
+  st.focus = 'Radius';
+  moveSlider(event);
+  event.preventDefault();
+});
+document.addEventListener('pointermove', event => { if (st.drag) moveSlider(event); });
+document.addEventListener('pointerup', () => { if (st.drag) { st.drag = null; render(); } });
+
+document.addEventListener('click', event => {
+  const seg = event.target.closest('[data-seg="target"]');
+  if (seg && seg.dataset.index === '1') {
+    $('demo-note').textContent = 'demo：「保存」还没实现 —— 落地时先只做「复制」「贴图」两段，等保存面板做好再加。选了没反应的选项，比没有这个选项更糟。';
+  }
+});
+
+$('toggle-output').addEventListener('click', event => {
+  event.currentTarget.classList.toggle('on');
+  st.outputOn = event.currentTarget.classList.contains('on');
+  render();
 });
 
 render();

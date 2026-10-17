@@ -8,7 +8,7 @@
 use super::*;
 
 use crate::geometry::{region_panel_layout, RegionPanelLayout, RegionPanelTarget};
-use crate::region::{Delay, PanelChange, PanelKey, Region};
+use crate::region::{Delay, Destination, PanelChange, PanelKey, Region};
 use crate::units::LengthUnit;
 
 /// The keys the custom-region panel knows (docs/23 §14.54).
@@ -381,7 +381,7 @@ impl OverlayController {
             // 最后重画一帧普通画面（docs/23 §14.55.9.5）。
             self.leave_countdown(super::session::CountdownExit::Cancel);
             self.pending_region = None;
-            self.pin_after_delay = false;
+            self.delay_destination = None;
             return true;
         }
         let context = if self.scroll.is_some() {
@@ -989,6 +989,13 @@ impl OverlayController {
                 }
                 PanelChange::Repaint
             }
+            Some(RegionPanelTarget::Destination(destination)) => {
+                // 点哪段选哪段，与延时同一条语义。
+                if let Some(panel) = self.region_panel.as_mut() {
+                    panel.choose_destination(destination);
+                }
+                PanelChange::Repaint
+            }
             Some(RegionPanelTarget::MenuItem(index)) => {
                 let Some(mut panel) = self.region_panel.take() else {
                     return;
@@ -1094,6 +1101,12 @@ impl OverlayController {
                     .as_ref()
                     .map(|panel| panel.delay())
                     .unwrap_or(Delay::ALL[0]);
+                // 面板马上要被收掉，先把去向取出来（延时要按它执行，docs/23 §14.55.15）。
+                let destination = self
+                    .region_panel
+                    .as_ref()
+                    .map(|panel| panel.destination())
+                    .unwrap_or(Destination::Copy);
                 if delay.seconds() > 0 {
                     // 延时：浮层先收起来，等到点再重新抓一帧 —— 冻结帧必须是等待之后的那一帧，
                     // 否则"延时"只是把同一个画面晚点截出来。区域跟着那次会话走。
@@ -1101,9 +1114,8 @@ impl OverlayController {
                     // 面板没了：把 IME 还给这个窗口（docs/23 §14.55）。
                     self.restore_ime_for_panel();
                     self.pending_region = Some(region);
-                    // 延时到点后要的是"截图并贴图"（等同延时 N 秒后按 F6），不是再开浮层
-                    // 等用户确认（docs/23 §14.55.8）。
-                    self.pin_after_delay = true;
+                    // 延时到点后按**面板里选的那个去向**执行（复制 / 贴图），不再写死贴图。
+                    self.delay_destination = Some(destination);
                     // 浮层留着，在选区正中倒数；到点再收浮层、抓"等待之后那一帧"并贴图
                     // （docs/23 §14.55.9）。等待期间鼠标穿过浮层，用户可以去操作别的窗口。
                     self.arm_countdown(delay.seconds());

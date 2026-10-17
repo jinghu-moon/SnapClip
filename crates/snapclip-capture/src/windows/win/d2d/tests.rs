@@ -2263,8 +2263,10 @@ fn render_panel_frame_with_slide(
         locked: false,
         toggles: crate::units::LabelToggle::ALL.map(|toggle| (toggle, true)),
         status: None,
-        preset: "自定义".to_string(),
-        preset_hit: None,
+        ratio_label: crate::region::RATIO_FREE_LABEL.to_string(),
+        ratio_selected: 0,
+        destination: crate::region::Destination::Copy,
+        readout: "将复制 1370×824 px".to_string(),
         can_start: true,
         layout: layout.clone(),
     });
@@ -2283,9 +2285,8 @@ fn assert_glyph_ink(pixels: &[u8], width: u32, layout: super::RegionPanelLayout)
     let boxes = [
         ("关闭", layout.close),
         ("互换", layout.actions[0].1),
-        ("锁定", layout.actions[1].1),
-        ("居中", layout.actions[2].1),
-        ("移到原点", layout.actions[3].1),
+        ("居中", layout.actions[1].1),
+        ("移到原点", layout.actions[2].1),
     ];
     for (name, rect) in boxes {
         let base = pixel_at(pixels, width, (rect.left + 2) as u32, (rect.top + 2) as u32)[1];

@@ -8,7 +8,7 @@
 //! behaviour can be unit tested without a window station.
 
 use super::CaptureError;
-use crate::region::{Delay, PanelSlot, RegionField};
+use crate::region::{Delay, Destination, PanelSlot, RegionField, RATIO_MENU_LEN};
 use crate::units::{LabelToggle, LengthUnit};
 
 // 过渡期转发（docs/23 T0.4）：定义已搬到 `snapclip-model`，这里是唯一实现的转出口。
@@ -951,15 +951,21 @@ pub struct RegionPanelLayout {
     pub close: Rect,
     pub cards: [Rect; 2],
     pub card_titles: [Rect; 2],
-    /// 组内动作：互换、锁定、居中、移到原点（顺序与 `PanelSlot` 的 Tab 顺序一致）。
-    pub actions: [(PanelSlot, Rect); 4],
+    /// 组内动作：互换、居中、移到原点（顺序与 `PanelSlot` 的 Tab 顺序一致）。
+    ///
+    /// 原来的「锁定」图标删掉了：比例就是唯一的锁定表达（`无比例` = 不锁）。
+    pub actions: [(PanelSlot, Rect); 3],
     /// 四个数字格：命中区是数字连同它下面那条下划线。
     pub fields: [(RegionField, Rect); 4],
     pub field_labels: [Rect; 4],
     /// 两张卡里的分隔：尺寸卡的 `×` 与位置卡的竖线（画用，不是控件）。
     pub separators: [Rect; 2],
-    pub preset_label: Rect,
-    pub preset: Rect,
+    /// 比例按钮：住在「尺寸」卡头里，右对齐在交换按钮左侧。
+    pub ratio: Rect,
+    pub destination_label: Rect,
+    /// 去向分段器的**容器**（复制 / 贴图）。
+    pub destination_track: Rect,
+    pub destination: [(Destination, Rect); 2],
     pub delay_label: Rect,
     /// 分段器的**容器**：四段都缩在它里面（与 `unit_track` 同一套结构）。
     pub delay_track: Rect,
@@ -969,9 +975,9 @@ pub struct RegionPanelLayout {
     pub status: Rect,
     pub cancel: Rect,
     pub start: Rect,
-    /// 预设下拉：展开时才有，且已经夹进工作区。
+    /// 比例下拉：展开时才有，且已经夹进工作区。
     pub menu: Option<Rect>,
-    pub menu_items: [Rect; 4],
+    pub menu_items: [Rect; RATIO_MENU_LEN],
 }
 
 /// 面板上被指到的东西。
@@ -983,6 +989,8 @@ pub enum RegionPanelTarget {
     Unit(LengthUnit),
     /// 延时分段器里的一段。
     Delay(Delay),
+    /// 去向分段器里的一段。
+    Destination(Destination),
     /// 预设下拉里的第几项。
     MenuItem(usize),
     /// 下拉面板自己的内边距：不是控件，但点击要停在下拉里。
@@ -1030,7 +1038,10 @@ const REGION_ROW_DIP: f32 = 28.0;
 /// 行首标签（预设 / 浮层 / 延时）的宽度。
 const REGION_ROW_LABEL_DIP: f32 = 26.0;
 const REGION_ICON_DIP: f32 = 22.0;
-const REGION_PRESET_DIP: f32 = 150.0;
+/// 比例按钮的兜底宽（dip）：`无比例` 三个汉字 + 12 的箭头 + 两侧内边距。
+const REGION_RATIO_LABEL_DIP: f32 = 64.0;
+/// 比例菜单的兜底宽（dip）：最宽项（`无比例`）+ 26 检查位 + 10 右内边距 + 5×2 菜单内边距。
+const REGION_RATIO_MENU_DIP: f32 = 82.0;
 const REGION_SEGMENT_DIP: f32 = 30.0;
 
 /// 分段器每段里，文字两侧的内边距（dip）。量宽在设备层做：最宽选项的文本宽度 + 两侧这份内边距
@@ -1048,6 +1059,14 @@ pub struct SegmentWidths {
     pub unit: i32,
     /// 延时分段器每段的宽度。
     pub delay: i32,
+    /// 去向分段器（复制 / 贴图）每段的宽度。
+    pub destination: i32,
+    /// 比例按钮的宽度：**最宽的那个比例文案**（`无比例`）量出来的 + 箭头 + 内边距。
+    ///
+    /// 不随选中项变宽变窄 —— 按钮宽度一跳，卡头里的东西就跟着晃（docs/23 §14.55.15）。
+    pub ratio_label: i32,
+    /// 比例菜单的宽度：所有项里最宽的那个文本 + 检查位 + 内边距。与按钮宽解耦。
+    pub ratio_menu: i32,
 }
 
 impl SegmentWidths {
@@ -1059,6 +1078,10 @@ impl SegmentWidths {
             // 单位那一格本来就是"容器的一半"，延时那一格是 `REGION_SEGMENT_DIP`，两者同一条配方。
             unit: dip(REGION_UNIT_BUTTON_DIP) - dip(REGION_UNIT_INSET_DIP),
             delay: dip(REGION_SEGMENT_DIP) - dip(REGION_DELAY_INSET_DIP),
+            // 两个汉字（复制 / 贴图）在 11 dip 下的经验宽度；真值由设备层量（`panel_metrics`）。
+            destination: dip(34.0),
+            ratio_label: dip(REGION_RATIO_LABEL_DIP),
+            ratio_menu: dip(REGION_RATIO_MENU_DIP),
         }
     }
 }
@@ -1147,7 +1170,6 @@ pub fn region_panel_layout(
     let row = dip(REGION_ROW_DIP);
     let row_label = dip(REGION_ROW_LABEL_DIP);
     let icon = dip(REGION_ICON_DIP);
-    let preset_width = dip(REGION_PRESET_DIP);
     let toggle_row = dip(REGION_TOGGLE_ROW_DIP);
     let toggle_width = dip(REGION_TOGGLE_DIP);
     let toggle_gap = dip(REGION_TOGGLE_GAP_DIP);
@@ -1245,9 +1267,25 @@ pub fn region_panel_layout(
             (second, Rect::from_origin_size(Point::new(second_x, y), icon, icon)),
         ]
     };
-    let [swap, lock] = actions_at(cards[0], PanelSlot::Swap, PanelSlot::Lock);
+    // 尺寸卡头：右边是交换图标（22×22），它左边是比例按钮。比例按钮的宽度由设备层按
+    // **最宽的比例文案**量出来（`widths.ratio_label`），所以选中项换名字时按钮不会跳。
+    let icon_y = card_title_y + (title_height - icon) / 2;
+    let swap = (
+        PanelSlot::Swap,
+        Rect::from_origin_size(
+            Point::new(cards[0].right - card_pad - icon, icon_y),
+            icon,
+            icon,
+        ),
+    );
+    let ratio_width = widths.ratio_label.max(1);
+    let ratio = Rect::from_origin_size(
+        Point::new(swap.1.left - 2 - ratio_width, icon_y),
+        ratio_width,
+        icon,
+    );
     let [center, origin] = actions_at(cards[1], PanelSlot::Center, PanelSlot::Origin);
-    let actions = [swap, lock, center, origin];
+    let actions = [swap, center, origin];
 
     // 两张卡里的数字按同一套列宽排：两个格子 + 一条分隔。
     let inner = card_width - 2 * card_pad;
@@ -1295,19 +1333,42 @@ pub fn region_panel_layout(
         ),
     ];
 
-    // ── 预设行（左）与延时行（右） ──────────────────────────────────────────
+    // ── 去向行（左）与延时行（右） ──────────────────────────────────────────
+    //
+    // 比例原来占的那一行现在给去向了：比例搬进了「尺寸」卡头，行数没变，所以面板高度仍是 277。
     let preset_y = cards_y + card_height + row_gap;
-    let preset_label = Rect::new(
+    let destination_label = Rect::new(
         left,
         preset_y + (row - value_label) / 2,
         left + row_label,
         preset_y + (row - value_label) / 2 + value_label,
     );
-    let preset = Rect::from_origin_size(
-        Point::new(preset_label.right, preset_y + (row - row) / 2),
-        preset_width,
-        row,
+    let destination_h = dip(REGION_SEGMENT_DIP);
+    let destination_inset = dip(REGION_DELAY_INSET_DIP);
+    let destination_w = widths.destination.max(1);
+    let destination_track_w = destination_w * Destination::ALL.len() as i32 + destination_inset * 2;
+    let destination_track = Rect::from_origin_size(
+        Point::new(
+            destination_label.right,
+            preset_y + (row - destination_h) / 2,
+        ),
+        destination_track_w,
+        destination_h,
     );
+    let destination = Destination::ALL.map(|destination| {
+        let index = destination.index() as i32;
+        (
+            destination,
+            Rect::from_origin_size(
+                Point::new(
+                    destination_track.left + destination_inset + index * destination_w,
+                    destination_track.top + destination_inset,
+                ),
+                destination_w,
+                destination_h - 2 * destination_inset,
+            ),
+        )
+    });
     // 每段同宽：宽度由设备层按**最宽选项**量出来（`SegmentWidths`），容器 = 段数 × 段宽 + 两侧内缩。
     // 这样段与段之间不再有"边界按比例取整"留下的 1 px 差（docs/23 §14.55.6）。
     let delay_w = widths.delay.max(1);
@@ -1429,20 +1490,21 @@ pub fn region_panel_layout(
     );
     let status = Rect::new(left, foot_y, cancel.left - 8, foot_y + button_height);
 
-    // ── 下拉：挂在触发器下面，夹进工作区 ────────────────────────────────────
+    // ── 下拉：挂在比例按钮下面、右缘对齐尺寸卡右缘，夹进工作区 ────────────────
+    let menu_width = widths.ratio_menu.max(1);
     let (menu, menu_items) = if menu_open {
         let menu_pad = dip(REGION_MENU_PAD_DIP);
         let item_height = dip(REGION_MENU_ITEM_DIP);
         let gap = dip(REGION_MENU_GAP_DIP);
-        let count = crate::region::PRESETS.len() as i32;
-        let menu_height = 2 * menu_pad + count * item_height;
+        let menu_height = 2 * menu_pad + RATIO_MENU_LEN as i32 * item_height;
+        // 右缘与卡片右缘对齐（按钮比菜单窄，菜单向左展开）。
         let menu = Rect::from_origin_size(
-            Point::new(preset.left, preset.bottom + gap),
-            preset.width(),
+            Point::new(cards[0].right - menu_width, ratio.bottom + gap),
+            menu_width,
             menu_height,
         )
         .clamped_into(work_area);
-        let items = [0usize, 1, 2, 3].map(|index| {
+        let items = [0usize, 1, 2, 3, 4, 5, 6, 7, 8].map(|index| {
             Rect::from_origin_size(
                 Point::new(menu.left, menu.top + menu_pad + index as i32 * item_height),
                 menu.width(),
@@ -1451,8 +1513,8 @@ pub fn region_panel_layout(
         });
         (Some(menu), items)
     } else {
-        let empty = Rect::from_origin_size(Point::new(preset.left, preset.bottom), preset.width(), 0);
-        (None, [empty; 4])
+        let empty = Rect::from_origin_size(Point::new(ratio.left, ratio.bottom), menu_width, 0);
+        (None, [empty; RATIO_MENU_LEN])
     };
 
     RegionPanelLayout {
@@ -1468,8 +1530,10 @@ pub fn region_panel_layout(
         fields,
         field_labels,
         separators,
-        preset_label,
-        preset,
+        ratio,
+        destination_label,
+        destination_track,
+        destination,
         delay_label,
         delay_track,
         delay,
@@ -1516,8 +1580,13 @@ impl RegionPanelLayout {
                 return Some(RegionPanelTarget::Slot(field.slot()));
             }
         }
-        if self.preset.contains(point) {
-            return Some(RegionPanelTarget::Slot(PanelSlot::Preset));
+        if self.ratio.contains(point) {
+            return Some(RegionPanelTarget::Slot(PanelSlot::Ratio));
+        }
+        for (destination, rect) in self.destination {
+            if rect.contains(point) {
+                return Some(RegionPanelTarget::Destination(destination));
+            }
         }
         for (delay, rect) in self.delay {
             if rect.contains(point) {
@@ -2540,7 +2609,8 @@ mod tests {
         for card in panel.cards {
             assert!(panel.panel.contains_rect(card));
         }
-        assert!(panel.panel.contains_rect(panel.preset));
+        assert!(panel.panel.contains_rect(panel.ratio));
+        assert!(panel.panel.contains_rect(panel.destination_track));
         assert!(panel.panel.contains_rect(panel.start));
         assert!(panel.panel.contains_rect(panel.close));
         assert_eq!(panel.cancel.right + 8, panel.start.left);
@@ -2679,10 +2749,18 @@ mod tests {
                 Some(RegionPanelTarget::Slot(toggle.slot()))
             );
         }
+        // 比例按钮在尺寸卡头里，命中与绘制同源。
         assert_eq!(
-            panel.target_at(panel.preset.center()),
-            Some(RegionPanelTarget::Slot(PanelSlot::Preset))
+            panel.target_at(panel.ratio.center()),
+            Some(RegionPanelTarget::Slot(PanelSlot::Ratio))
         );
+        for (destination, rect) in panel.destination {
+            assert_eq!(
+                panel.target_at(rect.center()),
+                Some(RegionPanelTarget::Destination(destination)),
+                "去向每一段都要命中自己"
+            );
+        }
         for (delay, rect) in panel.delay {
             assert_eq!(
                 panel.target_at(rect.center()),
@@ -2704,12 +2782,14 @@ mod tests {
         );
         // 面板的空白：不是控件，点击落到面板自己身上（不穿透到下面的截图）。
         assert_eq!(panel.target_at(panel.status.center()), None);
-        assert_eq!(panel.target_at(panel.card_titles[0].center()), None);
-        assert_eq!(panel.menu_item_at(panel.preset.center()), None);
+        // 卡头左边还是空白（比例按钮与交换图标在右边），点它不该命中任何控件。
+        let blank = Point::new(panel.card_titles[0].left + 4, panel.card_titles[0].center().y);
+        assert_eq!(panel.target_at(blank), None);
+        assert_eq!(panel.menu_item_at(panel.ratio.center()), None);
     }
 
     #[test]
-    fn the_preset_dropdown_hangs_below_its_trigger_and_stays_on_screen() {
+    fn the_ratio_menu_hangs_below_its_button_and_stays_on_screen() {
         let work_area = Rect::new(0, 0, 3840, 2160);
         let closed = region_panel_layout(1.0, work_area, whole(work_area), false, SegmentWidths::fixed(1.0));
         assert_eq!(closed.menu, None, "收起时没有下拉");
@@ -2717,9 +2797,11 @@ mod tests {
 
         let open = region_panel_layout(1.0, work_area, whole(work_area), true, SegmentWidths::fixed(1.0));
         let menu = open.menu.expect("展开时有下拉");
-        assert_eq!(menu.left, open.preset.left);
-        assert!(menu.top >= open.preset.bottom, "挂在触发器下面");
-        assert_eq!(menu.width(), open.preset.width());
+        // 菜单与按钮**解耦**：右缘对齐卡片右缘，宽度是量出来的最宽项，比按钮宽。
+        assert_eq!(menu.right, open.cards[0].right);
+        assert_eq!(menu.width(), SegmentWidths::fixed(1.0).ratio_menu);
+        assert!(menu.width() > open.ratio.width(), "菜单比按钮宽，向右展开");
+        assert!(menu.top >= open.ratio.bottom, "挂在按钮下面");
         assert!(work_area.contains_rect(menu));
         for (index, item) in open.menu_items.iter().enumerate() {
             assert!(menu.contains_rect(*item), "第 {index} 项在下拉里");
@@ -2794,9 +2876,21 @@ mod tests {
     fn the_segment_widths_give_every_option_the_same_width() {
         let work_area = Rect::new(0, 0, 3840, 2160);
         for widths in [
-            SegmentWidths { unit: 24, delay: 60 },
-            SegmentWidths { unit: 40, delay: 34 },
-            SegmentWidths { unit: 1, delay: 1 },
+            SegmentWidths {
+                unit: 24,
+                delay: 60,
+                ..SegmentWidths::fixed(1.0)
+            },
+            SegmentWidths {
+                unit: 40,
+                delay: 34,
+                ..SegmentWidths::fixed(1.0)
+            },
+            SegmentWidths {
+                unit: 1,
+                delay: 1,
+                ..SegmentWidths::fixed(1.0)
+            },
         ] {
             let panel = region_panel_layout(1.0, work_area, whole(work_area), false, widths);
             for (_, rect) in panel.unit {
@@ -2827,7 +2921,11 @@ mod tests {
     #[test]
     fn the_hit_test_reads_the_same_rectangles_the_drawing_does() {
         let work_area = Rect::new(0, 0, 3840, 2160);
-        let widths = SegmentWidths { unit: 37, delay: 41 };
+        let widths = SegmentWidths {
+            unit: 37,
+            delay: 41,
+            ..SegmentWidths::fixed(1.0)
+        };
         let panel = region_panel_layout(1.0, work_area, whole(work_area), false, widths);
         for (delay, rect) in panel.delay {
             assert_eq!(rect.width(), widths.delay);

@@ -14,7 +14,7 @@
 pub const ICON_BAKED_PX: u32 = 96;
 
 /// How many glyphs there are; the device-side cache is sized from it.
-pub const ICON_COUNT: usize = 8;
+pub const ICON_COUNT: usize = 6;
 
 /// A glyph the panel draws.
 ///
@@ -25,28 +25,22 @@ pub const ICON_COUNT: usize = 8;
 pub enum Glyph {
     /// 互换宽高（尺寸卡）。
     Swap = 0,
-    /// 锁定比例（按下态）。
-    Lock = 1,
-    /// 锁定比例（未按下）。
-    LockOpen = 2,
     /// 居中到屏幕。
-    Center = 3,
+    Center = 1,
     /// 移到原点。
-    Origin = 4,
+    Origin = 2,
     /// 关闭面板。
-    Close = 5,
+    Close = 3,
     /// 下拉箭头（展开时上下翻转，不另存一份资产）。
-    Chevron = 6,
+    Chevron = 4,
     /// 下拉里选中那一项的勾。
-    Check = 7,
+    Check = 5,
 }
 
 impl Glyph {
     /// Every glyph, in the order [`Glyph::index`] reports.
     pub const ALL: [Self; ICON_COUNT] = [
         Self::Swap,
-        Self::Lock,
-        Self::LockOpen,
         Self::Center,
         Self::Origin,
         Self::Close,
@@ -63,8 +57,6 @@ impl Glyph {
     pub fn name(self) -> &'static str {
         match self {
             Self::Swap => "swap",
-            Self::Lock => "lock",
-            Self::LockOpen => "lock-open",
             Self::Center => "center",
             Self::Origin => "origin",
             Self::Close => "close",
@@ -80,8 +72,6 @@ impl Glyph {
     pub fn png(self) -> &'static [u8] {
         match self {
             Self::Swap => include_bytes!("../../../assets/icon/swap.png"),
-            Self::Lock => include_bytes!("../../../assets/icon/lock.png"),
-            Self::LockOpen => include_bytes!("../../../assets/icon/lock-open.png"),
             Self::Center => include_bytes!("../../../assets/icon/center.png"),
             Self::Origin => include_bytes!("../../../assets/icon/origin.png"),
             Self::Close => include_bytes!("../../../assets/icon/close.png"),

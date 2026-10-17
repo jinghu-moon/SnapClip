@@ -292,7 +292,7 @@ impl OverlayController {
     pub(super) fn on_region_delay(&mut self) {
         if self.pending_region.is_none() {
             // 等待期间用户按了 Esc：没有要截的区域，也不该凭空开一次会话。
-            self.pin_after_delay = false;
+            self.delay_destination = None;
             return;
         }
         // 这一次启动是延时自己发起的，`start_session` 因此保留待截区域与"到点贴图"。
@@ -308,7 +308,7 @@ impl OverlayController {
         // 托盘）把它们清掉：等待期间用户改了主意再来一次，不该被上一次的意图劫持。
         if !self.delay_in_flight {
             self.pending_region = None;
-            self.pin_after_delay = false;
+            self.delay_destination = None;
         }
         if self.session.state().is_active() || self.scroll.is_some() {
             // A repeated hotkey press restarts rather than stacking sessions;
@@ -477,29 +477,38 @@ impl OverlayController {
         // 延时截图：到点之后开的这次会话把当时那块区域直接放上去（docs/23 §14.54）。
         // 放在 `overlay_ready` 之后：`snap_to` 只在会话能接受选区时才生效。
         if let Some(region) = self.pending_region.take() {
-            let pinned = std::mem::take(&mut self.pin_after_delay);
+            let destination = std::mem::take(&mut self.delay_destination);
             let accepted = self.session.snap_to(region.to_rect(self.monitor_origin()));
             if !accepted {
                 eprintln!("[snapclip][capture] delayed region refused by the session");
             }
             self.publish_state();
-            // 到点贴图：把这一帧的区域像素放进 `F6` 取图的那个槽位，然后请外壳去贴
-            // （外壳投的是同一条 `WM_HOTKEY`，所以贴图代码一行都不用新写，docs/23 §14.55.8）。
-            // 这里直接 return：**不 paint、不显示浮层**——用户正在别的窗口里操作，闪一下就是打扰。
-            if let DelayOutcome::Pin = delay_outcome(pinned, accepted) {
-                self.publish_selection("panel-delay-pin");
-                self.sink.on_pin_requested(&self.session_id());
-                self.finish_session();
-                return;
-            }
-            if let DelayOutcome::Refused = delay_outcome(pinned, accepted) {
-                // 失败要说出来，不能静默：没有合法区域就没有可贴的图。
-                self.fail(
-                    None,
-                    CaptureError::InvalidState("delayed region refused by the session".into()),
-                    provider,
-                );
-                return;
+            // 到点之后按面板里那个去向执行：
+            //   * 贴图：把这一帧的区域像素放进 `F6` 取图的那个槽位，再请外壳去贴（外壳投的是
+            //     同一条 `WM_HOTKEY`，所以贴图代码一行都没新写，docs/23 §14.55.8）。
+            //   * 复制：走既有 `confirm()` 那条路（复制 + 入历史），不另造一份。
+            // 两条都直接 return：**不 paint、不显示浮层**——用户正在别的窗口里操作，闪一下就是打扰。
+            match delay_outcome(destination, accepted) {
+                DelayOutcome::Pin => {
+                    self.publish_selection("panel-delay-pin");
+                    self.sink.on_pin_requested(&self.session_id());
+                    self.finish_session();
+                    return;
+                }
+                DelayOutcome::Copy => {
+                    self.confirm();
+                    return;
+                }
+                DelayOutcome::Show => {}
+                DelayOutcome::Refused => {
+                    // 失败要说出来，不能静默：没有合法区域就没有可复制/可贴的东西。
+                    self.fail(
+                        None,
+                        CaptureError::InvalidState("delayed region refused by the session".into()),
+                        provider,
+                    );
+                    return;
+                }
             }
         }
         // Paint the new frame while the HWND is still hidden. DirectComposition
@@ -977,7 +986,7 @@ impl OverlayController {
     pub(super) fn fail(&mut self, session_id: Option<&str>, error: CaptureError, provider: &str) {
         // 失败之后不留延时留下的意图：下一次会话从干净状态开始。
         self.pending_region = None;
-        self.pin_after_delay = false;
+        self.delay_destination = None;
         // 倒计时也要一起收：同样先退出可见状态，再退渲染模式（docs/23 §14.55.9.5）。
         if self.countdown.is_some() {
             self.leave_countdown(CountdownExit::Fail);
@@ -1090,39 +1099,63 @@ impl OverlayController {
 pub(super) enum DelayOutcome {
     /// 不是延时发起的会话：照常显示浮层等用户确认。
     Show,
-    /// 延时到点且区域被接受：把图放进贴图槽位、请外壳贴出去。
+    /// 延时到点、区域被接受、去向是**复制**：走既有 `confirm()`。
+    Copy,
+    /// 延时到点、区域被接受、去向是**贴图**：把图放进贴图槽位、请外壳贴出去。
     Pin,
     /// 延时到点但区域被会话拒绝：必须报错，不能静默什么都不做。
     Refused,
 }
 
-/// `pinned` = 这次会话是延时"截图并贴图"发起的；`accepted` = 会话接受了那块区域。
-pub(super) fn delay_outcome(pinned: bool, accepted: bool) -> DelayOutcome {
-    match (pinned, accepted) {
-        (false, _) => DelayOutcome::Show,
-        (true, true) => DelayOutcome::Pin,
-        (true, false) => DelayOutcome::Refused,
+/// `destination` = 这次会话是延时发起的，以及面板里选的那个去向；`accepted` = 会话接受了区域。
+///
+/// 去向是这张截图的规格之一：延时不再写死贴图，`复制` 与 `贴图` 各走各自现成的那条路
+/// （docs/23 §14.55.15）。
+pub(super) fn delay_outcome(
+    destination: Option<Destination>,
+    accepted: bool,
+) -> DelayOutcome {
+    match (destination, accepted) {
+        (None, _) => DelayOutcome::Show,
+        (Some(_), false) => DelayOutcome::Refused,
+        (Some(Destination::Copy), true) => DelayOutcome::Copy,
+        (Some(Destination::Pin), true) => DelayOutcome::Pin,
     }
 }
 
 #[cfg(test)]
 mod delay_outcome_tests {
     use super::{DelayOutcome, delay_outcome};
+    use crate::region::Destination;
 
     #[test]
     fn a_normal_session_just_shows_the_overlay() {
-        assert_eq!(delay_outcome(false, true), DelayOutcome::Show);
-        assert_eq!(delay_outcome(false, false), DelayOutcome::Show);
+        assert_eq!(delay_outcome(None, true), DelayOutcome::Show);
+        assert_eq!(delay_outcome(None, false), DelayOutcome::Show);
     }
 
     #[test]
-    fn a_delayed_session_that_was_accepted_asks_for_a_pin() {
-        assert_eq!(delay_outcome(true, true), DelayOutcome::Pin);
+    fn a_delayed_session_follows_the_destination_it_was_armed_with() {
+        assert_eq!(
+            delay_outcome(Some(Destination::Pin), true),
+            DelayOutcome::Pin
+        );
+        assert_eq!(
+            delay_outcome(Some(Destination::Copy), true),
+            DelayOutcome::Copy
+        );
     }
 
     #[test]
     fn a_delayed_session_whose_region_was_refused_reports_instead_of_silence() {
-        assert_eq!(delay_outcome(true, false), DelayOutcome::Refused);
+        assert_eq!(
+            delay_outcome(Some(Destination::Pin), false),
+            DelayOutcome::Refused
+        );
+        assert_eq!(
+            delay_outcome(Some(Destination::Copy), false),
+            DelayOutcome::Refused
+        );
     }
 }
 
