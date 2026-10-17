@@ -89,11 +89,13 @@ impl Thumb {
         self.first
     }
 
-    /// Recompute after canvas rows `[from, to)` changed. `canvas` holds `canvas_rows` rows whose
-    /// row 0 is content row `top`.
+    /// Recompute after canvas rows `[from, to)` changed. `canvas` holds rows
+    /// `[first, first + len)` of the image, whose row 0 is content row `top`; a store that keeps
+    /// its rows in several holders passes only the band it just wrote (docs/35 §3.5).
     pub(crate) fn refresh(
         &mut self,
         canvas: &[u8],
+        first: u32,
         canvas_rows: u32,
         top: i64,
         from: u32,
@@ -110,7 +112,7 @@ impl Thumb {
         let mut sums = std::mem::take(&mut self.sums);
         let spans = std::mem::take(&mut self.spans);
         for t in dirty_from..dirty_to {
-            self.compute(t, canvas, canvas_rows, top, &spans, &mut sums);
+            self.compute(t, canvas, first, canvas_rows, top, &spans, &mut sums);
         }
         self.sums = sums;
         self.spans = spans;
@@ -148,6 +150,7 @@ impl Thumb {
         &mut self,
         t: i64,
         canvas: &[u8],
+        first: u32,
         canvas_rows: u32,
         top: i64,
         spans: &[(usize, usize)],
@@ -157,6 +160,8 @@ impl Thumb {
         let src_row = (self.src_width * 4) as usize;
         let lo = (t * k - top).max(0);
         let hi = ((t + 1) * k - top).min(i64::from(canvas_rows));
+        let lo = lo.max(i64::from(first));
+        let hi = hi.min(i64::from(first) + (canvas.len() / src_row) as i64);
         let row = (self.width * 4) as usize;
         let at = (t - self.first) as usize * row;
         let out = &mut self.pixels[at..at + row];
@@ -165,7 +170,8 @@ impl Thumb {
         }
         sums[..self.width as usize * 4].fill(0);
         for y in lo as usize..hi as usize {
-            let line = &canvas[y * src_row..(y + 1) * src_row];
+            let at = (y - first as usize) * src_row;
+            let line = &canvas[at..at + src_row];
             let pixels = line.as_chunks::<4>().0;
             for (sum, &(left, right)) in sums.as_chunks_mut::<4>().0.iter_mut().zip(spans) {
                 for pixel in &pixels[left..right.min(pixels.len())] {
@@ -329,7 +335,7 @@ mod tests {
             .collect();
         let mut thumb = Thumb::new(src_width, width);
         assert_eq!(thumb.factor(), 2);
-        thumb.refresh(&canvas, 2, 0, 0, 2);
+        thumb.refresh(&canvas, 0, 2, 0, 0, 2);
         assert_eq!(thumb.rows(), 1);
         let row: Vec<u8> = thumb.window(0, 1).to_vec();
         let reds: Vec<u8> = row.as_chunks::<4>().0.iter().map(|px| px[0]).collect();
@@ -369,7 +375,7 @@ mod tests {
         let (width, rows) = (8u32, 8u32);
         let canvas = ramp(width, rows);
         let mut thumb = Thumb::new(width, 4);
-        thumb.refresh(&canvas, rows, 0, 0, rows);
+        thumb.refresh(&canvas, 0, rows, 0, 0, rows);
         assert_eq!((thumb.width(), thumb.rows()), (4, 4));
         let k = thumb.factor() as usize;
 
@@ -408,14 +414,14 @@ mod tests {
     fn growth_at_the_bottom_adds_rows_and_recomputes_only_the_band() {
         let mut canvas = ramp(8, 8);
         let mut thumb = Thumb::new(8, 4);
-        thumb.refresh(&canvas, 8, 0, 0, 8);
+        thumb.refresh(&canvas, 0, 8, 0, 0, 8);
         let before = thumb.window(0, 2).to_vec();
         canvas.extend_from_slice(&ramp(8, 12)[8 * 8 * 4..]);
-        thumb.refresh(&canvas, 12, 0, 8, 12);
+        thumb.refresh(&canvas, 0, 12, 0, 8, 12);
         assert_eq!(thumb.rows(), 6);
         assert_eq!(thumb.window(0, 2), before.as_slice());
         let mut fresh = Thumb::new(8, 4);
-        fresh.refresh(&canvas, 12, 0, 0, 12);
+        fresh.refresh(&canvas, 0, 12, 0, 0, 12);
         assert_eq!(thumb.window(0, 6), fresh.window(0, 6));
     }
 
@@ -425,9 +431,9 @@ mod tests {
         let full = ramp(8, 16);
         let row = 8 * 4;
         let mut thumb = Thumb::new(8, 4);
-        thumb.refresh(&full[6 * row..], 10, 0, 0, 10);
+        thumb.refresh(&full[6 * row..], 0, 10, 0, 0, 10);
         let kept = thumb.window(0, 4).to_vec();
-        thumb.refresh(&full, 16, -6, 0, 6);
+        thumb.refresh(&full, 0, 16, -6, 0, 6);
         assert_eq!(thumb.first(), -3);
         assert_eq!(thumb.rows(), 8);
         assert_eq!(thumb.window(3, 4), kept.as_slice());

@@ -10,6 +10,7 @@
 //!
 //! [`Tracker`] strings the first three together: one call per captured frame.
 
+pub(crate) mod backed;
 pub(crate) mod estimate;
 pub(crate) mod layout;
 pub(crate) mod stitch;
@@ -17,6 +18,7 @@ pub mod store;
 pub(crate) mod thumb;
 
 use estimate::{Estimate, FrameSig, estimate};
+use backed::BackedCanvas;
 use stitch::{CanvasStore, Placement, Stitcher};
 use thumb::Thumb;
 
@@ -125,11 +127,14 @@ pub(crate) struct Tracker {
     width: u32,
     view: u32,
     reference: FrameSig,
-    stitcher: Stitcher,
+    stitcher: Stitcher<BackedCanvas>,
     thumb: Thumb,
     status: Status,
     /// Scratch: how long the last `push`'s thumbnail refresh took, in microseconds.
     last_thumb_us: u64,
+    /// Scratch for the band the thumbnail reads: a frame reuses it instead of allocating the same
+    /// half megabyte every time (docs/35 §5.2: this is part of the working budget).
+    band: Vec<u8>,
 }
 
 impl Tracker {
@@ -148,13 +153,15 @@ impl Tracker {
     /// The same tracker with an explicit canvas row cap, so a test can drive the byte budget
     /// without allocating half a gigabyte.
     fn with_rows(first: &[u8], width: u32, view: u32, thumb_width: u32, max_rows: u32) -> Self {
-        let stitcher = Stitcher::new(first, width, view, max_rows);
+        let stitcher = Stitcher::with_store(
+            BackedCanvas::new(first, width, view, max_rows),
+            width,
+            view,
+        );
         let mut thumb = Thumb::new(width, thumb_width);
-        let first_frame = stitcher
-            .store()
-            .row_slice(0, view)
-            .expect("a fresh store holds exactly the first frame");
-        thumb.refresh(first_frame, view, 0, 0, view);
+        let mut first_frame = vec![0u8; (width * view * 4) as usize];
+        stitcher.store().read_rows(0, view, &mut first_frame);
+        thumb.refresh(&first_frame, 0, view, 0, 0, view);
         Self {
             width,
             view,
@@ -163,6 +170,7 @@ impl Tracker {
             thumb,
             status: Status::Tracking,
             last_thumb_us: 0,
+            band: Vec::new(),
         }
     }
 
@@ -172,6 +180,11 @@ impl Tracker {
 
     pub(crate) fn image_rows(&self) -> u32 {
         self.stitcher.rows()
+    }
+
+    /// The selection's width, in pixels.
+    pub(crate) fn width(&self) -> u32 {
+        self.width
     }
 
     /// How long the last `push`'s thumbnail refresh took, in microseconds. `push` is the capture
@@ -231,11 +244,17 @@ impl Tracker {
     fn refresh_thumb(&mut self, from: u32, to: u32) {
         let (rows, top) = (self.stitcher.rows(), self.stitcher.top());
         let started = std::time::Instant::now();
-        // A store that keeps its rows somewhere else cannot hand out a slice; the thumbnail then
-        // has to update incrementally instead (docs/35 phase 3). The in-memory store always can.
-        if let Some(canvas) = self.stitcher.store().row_slice(0, rows) {
-            self.thumb.refresh(canvas, rows, top, from, to);
-        }
+        // A thumbnail row averages `k` canvas rows, so the band plus one thumbnail row either side
+        // is everything the refresh can read (docs/35 §3.5, I4). Asking for the whole canvas would
+        // defeat the point of the backing store.
+        let k = self.thumb.factor();
+        let first = from.saturating_sub(k);
+        let last = (to + k).min(rows);
+        let bytes = ((last - first) as usize) * (self.width as usize * 4);
+        self.band.clear();
+        self.band.resize(bytes, 0);
+        self.stitcher.store().read_rows(first, last - first, &mut self.band);
+        self.thumb.refresh(&self.band, first, rows, top, from, to);
         self.last_thumb_us = started.elapsed().as_micros() as u64;
     }
 
@@ -281,17 +300,9 @@ impl Tracker {
         (width, rows, store.take_all())
     }
 
-    /// What the image costs, as its store sees it (docs/35 §5.1). Measurement only.
-    #[cfg(feature = "test-support")]
+    /// What the image costs, as its store sees it (docs/35 §5.1).
     pub(crate) fn budgets(&self) -> crate::scroll::store::Budgets {
         self.stitcher.budgets()
-    }
-
-    /// Reserves the whole row cap before the first frame, for the attribution experiment
-    /// (docs/35 §7.1 variant A). No product path calls this.
-    #[cfg(feature = "test-support")]
-    pub(crate) fn preallocate_canvas(&mut self, rows: u32) {
-        self.stitcher.preallocate(rows);
     }
 
     /// What the canvas has moved so far (docs/35 §2.2). Measurement only.
@@ -622,11 +633,9 @@ pub mod probe {
             super::MAX_SCREENS * view
         }
 
-        /// Reserves the whole row cap up front, so a run can be measured with no reallocation
-        /// (docs/35 §7.1 variant A).
-        pub fn preallocate(&mut self, rows: u32) {
-            self.tracker.preallocate_canvas(rows);
-        }
+        /// Kept for the phase 0 attribution run, which measured the *old* store: the backed store
+        /// has nothing to reserve, so this is a no-op there (docs/35-baseline.md keeps its table).
+        pub fn preallocate(&mut self, _rows: u32) {}
 
         /// What the canvas has moved so far: the three attribution candidates (docs/35 §2.2).
         pub fn counters(&self) -> super::stitch::MoveCounters {
@@ -676,13 +685,12 @@ pub mod probe {
             )
         }
 
-        pub fn canvas(&self) -> &[u8] {
+        /// The whole image, gathered from wherever its rows live.
+        pub fn image(&self) -> Vec<u8> {
             let rows = self.tracker.stitcher.rows();
-            self.tracker
-                .stitcher
-                .store()
-                .row_slice(0, rows)
-                .expect("the probe drives the in-memory store")
+            let mut out = vec![0u8; (self.tracker.width() * rows * 4) as usize];
+            self.tracker.stitcher.store().read_rows(0, rows, &mut out);
+            out
         }
 
         /// The long image: `(width, rows, bgra)`.

@@ -13,8 +13,9 @@
 //! a fixed bar on that side appears once. The band is the reference's choice (`snow_shot`'s
 //! `compositor.rs`): `max(H/2, growth + H/4)`, at most `H`.
 
-pub(crate) use super::store::{CanvasStore, MemoryCanvas};
-#[cfg(feature = "test-support")]
+pub(crate) use super::store::CanvasStore;
+#[cfg(test)]
+pub(crate) use super::store::MemoryCanvas;
 pub(crate) use super::store::Budgets;
 #[cfg(feature = "test-support")]
 pub(crate) use super::store::MoveCounters;
@@ -34,7 +35,7 @@ pub(crate) enum Placement {
 
 /// Places frames into a [`CanvasStore`].
 #[derive(Debug)]
-pub(crate) struct Stitcher<C: CanvasStore = MemoryCanvas> {
+pub(crate) struct Stitcher<C: CanvasStore> {
     width: u32,
     view: u32,
     store: C,
@@ -70,11 +71,15 @@ impl<C: CanvasStore> Stitcher<C> {
         self.top
     }
 
-    /// What this image costs, as the store sees it (docs/35 §5.1). Measurement only, like the
-    /// move counters: the product build does not ask.
-    #[cfg(feature = "test-support")]
+    /// What this image costs, as the store sees it (docs/35 §5.1).
     pub(crate) fn budgets(&self) -> Budgets {
         self.store.budgets()
+    }
+
+    /// What the three move sites have done so far, when the store has them (docs/35 §2.2).
+    #[cfg(feature = "test-support")]
+    pub(crate) fn counters(&self) -> MoveCounters {
+        self.store.counters().unwrap_or_default()
     }
 
     /// The store, for phase 2 and for tests that drive one directly.
@@ -132,8 +137,11 @@ impl<C: CanvasStore> Stitcher<C> {
 
 /// The in-memory store is the only one there is, and these are the calls the rest of the crate made
 /// when the stitcher owned the buffer (docs/35 phase 1: no caller changes).
+#[cfg(test)]
 impl Stitcher<MemoryCanvas> {
-    /// Start from the first frame. `max_rows` caps the canvas height.
+    /// Start from the first frame over the oracle store. Tests only: the product hands in a
+    /// [`BackedCanvas`](super::backed::BackedCanvas) through [`Stitcher::with_store`].
+    #[cfg(test)]
     pub(crate) fn new(first: &[u8], width: u32, view: u32, max_rows: u32) -> Self {
         Self::with_store(MemoryCanvas::new(first, width, view, max_rows), width, view)
     }
@@ -146,12 +154,6 @@ impl Stitcher<MemoryCanvas> {
     #[cfg(feature = "test-support")]
     pub(crate) fn preallocate(&mut self, rows: u32) {
         self.store.preallocate(rows);
-    }
-
-    /// What the three move sites have done so far (docs/35 §2.2).
-    #[cfg(feature = "test-support")]
-    pub(crate) fn counters(&self) -> MoveCounters {
-        self.store.counters()
     }
 
     #[cfg(test)]
@@ -167,7 +169,7 @@ impl Stitcher<MemoryCanvas> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Placement, Stitcher};
+    use super::{CanvasStore, MemoryCanvas, Placement, Stitcher};
     use crate::scroll::estimate::tests::{page, window};
     use crate::scroll::estimate::{Estimate, FrameSig, estimate};
 
@@ -208,7 +210,7 @@ mod tests {
     }
 
     /// Drive estimator + stitcher over a sequence of page offsets, the way the worker does.
-    fn run(page: &[u8], offsets: &[u32]) -> Stitcher {
+    fn run(page: &[u8], offsets: &[u32]) -> Stitcher<super::MemoryCanvas> {
         let first = frame_at(page, offsets[0]);
         let mut stitcher = Stitcher::new(&first, W, H, 32 * H);
         let mut reference = FrameSig::of(&first, W, H);
@@ -534,32 +536,52 @@ mod tests {
         true
     }
 
+    /// Which store the subject runs on: the phase 1 buffer or the phase 2 backed one. The oracle
+    /// is the same frozen reference either way, so an equal result means the backing store changed
+    /// nothing but where the rows live (docs/35 §11.2, §7.2).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Store {
+        Memory,
+        Backed,
+    }
+
     /// Drive one shift sequence through the store-based stitcher and through the oracle, and
     /// require the same placement, position, content origin and pixels after every single frame.
     /// Returns `(frames, final rows)`.
-    fn equivalence(start: u32, shifts: &[i32], max_rows: u32) -> (usize, u32) {
+    fn equivalence_with(store: Store, start: u32, shifts: &[i32], max_rows: u32) -> (usize, u32) {
         let page = page(W, 6000, 21);
         let first = frame_at(&page, start);
-        let mut subject = Stitcher::new(&first, W, H, max_rows);
+        let inner: Box<dyn CanvasStore> = match store {
+            Store::Memory => Box::new(MemoryCanvas::new(&first, W, H, max_rows)),
+            Store::Backed => Box::new(super::super::backed::BackedCanvas::new(&first, W, H, max_rows)),
+        };
+        let mut subject = Stitcher::with_store(inner, W, H);
         let mut oracle = Reference::new(&first, W, H, max_rows);
         let mut top = i64::from(start);
+        let row = (W * 4) as usize;
         for (index, &dy) in shifts.iter().enumerate() {
             let next = (top + i64::from(dy)).clamp(0, 5600);
             top = next;
             let frame = frame_at(&page, next as u32);
             let placed = subject.place(&frame, dy);
             let expected = oracle.place(&frame, dy);
-            assert_eq!(placed, expected, "placement differs at shift {index} ({dy})");
-            assert_eq!(subject.pos(), oracle.pos, "viewport row differs at shift {index}");
-            assert_eq!(subject.top(), oracle.top, "content origin differs at shift {index}");
-            assert_eq!(subject.rows(), oracle.rows, "image height differs at shift {index}");
+            assert_eq!(placed, expected, "{store:?}: placement differs at shift {index} ({dy})");
+            assert_eq!(subject.pos(), oracle.pos, "{store:?}: viewport row at shift {index}");
+            assert_eq!(subject.top(), oracle.top, "{store:?}: content origin at shift {index}");
+            assert_eq!(subject.rows(), oracle.rows, "{store:?}: image height at shift {index}");
+            let rows = subject.rows();
+            let mut pixels = vec![0u8; rows as usize * row];
+            subject.store().read_rows(0, rows, &mut pixels);
             assert!(
-                subject.canvas() == oracle.canvas.as_slice(),
-                "pixels differ at shift {index} ({dy})"
+                pixels == oracle.canvas,
+                "{store:?}: pixels differ at shift {index} ({dy})"
             );
         }
-        // Equal bytes are equal decoded pixels: the encoder never sees a different image.
         (shifts.len() + 1, subject.rows())
+    }
+
+    fn equivalence(start: u32, shifts: &[i32], max_rows: u32) -> (usize, u32) {
+        equivalence_with(Store::Memory, start, shifts, max_rows)
     }
 
     #[test]
@@ -596,6 +618,24 @@ mod tests {
         let shifts = [80, 80, 80, 80];
         let (_, rows) = equivalence(0, &shifts, H + 160);
         assert_eq!(rows, H + 160, "growth stops at the cap, and both agree on where");
+    }
+
+    /// The same six sequences over the backed store: same placements, same pixels, so the tile
+    /// file and the two rings are invisible to the image (docs/35 §7.2, stage 2's exit condition).
+    #[test]
+    fn the_backed_store_matches_the_oracle_on_every_sequence() {
+        let cases: [(u32, Vec<i32>, u32); 5] = [
+            (0, vec![60; 12], 32 * H),
+            (1000, vec![-50; 8], 32 * H),
+            (1000, vec![60, 60, -70, -50, 80, -90, 40, -30, -30, 50, -110, 70], 64 * H),
+            (500, vec![10, -10, 0, 5, -5, 3, -3], 32 * H),
+            (0, vec![80, 80, 80, 80], H + 160),
+        ];
+        for (start, shifts, max_rows) in cases {
+            let memory = equivalence_with(Store::Memory, start, &shifts, max_rows);
+            let backed = equivalence_with(Store::Backed, start, &shifts, max_rows);
+            assert_eq!(memory, backed, "the two stores disagree for {shifts:?}");
+        }
     }
 
     #[test]

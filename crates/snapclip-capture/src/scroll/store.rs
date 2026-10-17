@@ -16,7 +16,6 @@
 
 /// The budgets a store can speak for (docs/35 §5.1). The final file size is deliberately absent:
 /// compression cannot be predicted from pixel counts, so no store should pretend to know it.
-#[cfg(feature = "test-support")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Budgets {
     /// B1: the image itself, in rows.
@@ -42,23 +41,35 @@ pub(crate) trait CanvasStore {
     /// the new top. `false` leaves the store untouched.
     fn prepend(&mut self, growth: u32, band_src: &[u8]) -> bool;
 
-    /// The rows as one contiguous slice when the store happens to have one. A store that keeps its
-    /// rows anywhere else returns `None`, and its callers become incremental in phase 3 for the same
-    /// reason the thumbnail does (docs/35 §3.4).
-    fn row_slice(&self, first_row: u32, rows: u32) -> Option<&[u8]>;
+    /// Copy `rows` whole rows starting at canvas row `first_row` into `out`.
+    ///
+    /// A store that holds its rows in several places cannot hand out a slice, so this is how a
+    /// caller asks for a range it needs (docs/35 §3.5). `out` is exactly `rows × row width` bytes.
+    fn read_rows(&self, first_row: u32, rows: u32, out: &mut [u8]);
 
     /// Hand the whole image over. An in-memory store gives its buffer away, so the caller never
-    /// copies it twice; a backing store will have to answer differently in phase 2.
+    /// copies it twice; a backing store gathers it from its holders.
     fn take_all(&mut self) -> Vec<u8>;
 
-    /// The budgets this store is responsible for (docs/35 §5.1). Measurement only until phase 2's
-    /// backing store needs them to decide what to keep.
-    #[cfg(feature = "test-support")]
+    /// The budgets this store is responsible for (docs/35 §5.1). Always available: the backing
+    /// store is what decides, from these, how much stays in memory.
     fn budgets(&self) -> Budgets;
+
+    /// What the move sites did, for a store that has them (docs/35 §2.2). A backing store moves no
+    /// pixels, so it answers `None`.
+    #[cfg(feature = "test-support")]
+    fn counters(&self) -> Option<MoveCounters> {
+        None
+    }
 }
 
-/// The one store there is today: one contiguous BGRA buffer, the same `Vec<u8>` the stitcher used
-/// to own, with the same growth rule (docs/35 §2.1).
+/// The store phase 1 introduced and the model tests still compare against: one contiguous BGRA
+/// buffer, the same `Vec<u8>` the stitcher used to own, with the same growth rule (docs/35 §2.1).
+///
+/// It is the **oracle**, so it is compiled for tests only: the product uses
+/// [`BackedCanvas`](super::backed::BackedCanvas), and an oracle kept in the product would be a
+/// second implementation nobody runs.
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct MemoryCanvas {
     width: u32,
@@ -69,6 +80,7 @@ pub(crate) struct MemoryCanvas {
     counters: MoveCounters,
 }
 
+#[cfg(test)]
 impl MemoryCanvas {
     /// Start from the first frame.
     pub(crate) fn new(first: &[u8], width: u32, view: u32, max_rows: u32) -> Self {
@@ -113,11 +125,6 @@ impl MemoryCanvas {
         }
     }
 
-    #[cfg(feature = "test-support")]
-    pub(crate) fn counters(&self) -> MoveCounters {
-        self.counters
-    }
-
     fn grow_to(&mut self, growth: u32) -> bool {
         // Hoisted: the call below borrows the buffer mutably, so it cannot also read `self`.
         let row = self.row();
@@ -152,6 +159,7 @@ impl MemoryCanvas {
     }
 }
 
+#[cfg(test)]
 impl CanvasStore for MemoryCanvas {
     fn rows(&self) -> u32 {
         self.rows
@@ -198,17 +206,16 @@ impl CanvasStore for MemoryCanvas {
         true
     }
 
-    fn row_slice(&self, first_row: u32, rows: u32) -> Option<&[u8]> {
+    fn read_rows(&self, first_row: u32, rows: u32, out: &mut [u8]) {
         let first = first_row as usize * self.row();
         let end = first + rows as usize * self.row();
-        self.canvas.get(first..end)
+        out.copy_from_slice(&self.canvas[first..end]);
     }
 
     fn take_all(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.canvas)
     }
 
-    #[cfg(feature = "test-support")]
     fn budgets(&self) -> Budgets {
         Budgets {
             pixel_rows: self.rows,
@@ -216,6 +223,44 @@ impl CanvasStore for MemoryCanvas {
             working_bytes: self.canvas.capacity() as u64,
             temp_bytes: 0,
         }
+    }
+
+    #[cfg(feature = "test-support")]
+    fn counters(&self) -> Option<MoveCounters> {
+        Some(self.counters)
+    }
+}
+
+/// A store behind a box is still a store, so a test can drive either implementation through the
+/// same code path (the oracle in `stitch`'s model tests does exactly that).
+impl CanvasStore for Box<dyn CanvasStore> {
+    fn rows(&self) -> u32 {
+        (**self).rows()
+    }
+
+    fn append(&mut self, growth: u32, band_src: &[u8]) -> bool {
+        (**self).append(growth, band_src)
+    }
+
+    fn prepend(&mut self, growth: u32, band_src: &[u8]) -> bool {
+        (**self).prepend(growth, band_src)
+    }
+
+    fn read_rows(&self, first_row: u32, rows: u32, out: &mut [u8]) {
+        (**self).read_rows(first_row, rows, out)
+    }
+
+    fn take_all(&mut self) -> Vec<u8> {
+        (**self).take_all()
+    }
+
+    fn budgets(&self) -> Budgets {
+        (**self).budgets()
+    }
+
+    #[cfg(feature = "test-support")]
+    fn counters(&self) -> Option<MoveCounters> {
+        (**self).counters()
     }
 }
 
@@ -229,6 +274,7 @@ impl CanvasStore for MemoryCanvas {
 /// caller's own row cap allowed. The row cap ([`crate::scroll::row_limit`]) is what keeps the
 /// canvas inside the byte budget; this is the last line against an allocation the machine cannot
 /// serve.
+#[cfg(test)]
 fn grow(canvas: &mut Vec<u8>, bytes: usize, limit: usize) -> bool {
     let needed = canvas.len().saturating_add(bytes);
     let wanted = needed.max(canvas.capacity().saturating_mul(2).min(limit));
@@ -317,12 +363,11 @@ mod tests {
 
         let slice = store.slice();
         assert_eq!(slice.len(), (W * (H + 3) * 4) as usize);
-        assert_eq!(
-            store.row_slice(0, 1),
-            Some(&slice[..row]),
-            "the prepended row is first"
-        );
-        assert_eq!(store.row_slice(1, H), Some(&slice[row..row * ((H + 1) as usize)]));
-        assert_eq!(store.row_slice(0, H + 4), None, "past the end is not a slice");
+        let mut first = vec![0u8; row];
+        store.read_rows(0, 1, &mut first);
+        assert_eq!(first, slice[..row], "the prepended row is first");
+        let mut rest = vec![0u8; row * H as usize];
+        store.read_rows(1, H, &mut rest);
+        assert_eq!(rest, slice[row..row * ((H + 1) as usize)]);
     }
 }

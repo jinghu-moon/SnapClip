@@ -4,7 +4,10 @@
 > **本轮不改任何产品行为**：测量代码全部在 `test-support` 特性下，默认构建的 `stitch.rs`
 > 没有计数器、没有时钟读取、没有多余字段（`cargo check -p snapclip-capture` 无告警即证）。
 >
-> 复现：`cargo run -p codec-bench --release -- --attribution`
+> 复现：**这个模式已在阶段 2 退役** —— 它测的是阶段 1 的内存画布，而那块缓冲现在是
+> 测试里的对照实现（`store::MemoryCanvas`）。要重跑这张表，从阶段 0 的提交 `d27b550`
+> 检出后执行 `cargo run -p codec-bench --release -- --attribution`；`docs/35` §12 记着
+> 阶段 2 之后的同一组读数。
 
 ---
 
@@ -96,7 +99,7 @@
 ## 7. 复现与产物
 
 ```
-cargo run -p codec-bench --release -- --attribution     # 本文的表
+git checkout d27b550 -- . && cargo run -p codec-bench --release -- --attribution  # 本文的表
 cargo run -p codec-bench --release -- --scroll          # 既有基线（编码 + 拼接一起）
 ```
 

@@ -192,8 +192,23 @@ impl ScrollWorker {
     }
 
     /// Stop and hand over the long image `(width, rows, bgra)`; `None` when no frame ever arrived.
+    ///
+    /// The budgets are printed once here because this is the only point that knows what the image
+    /// cost (docs/35 §5.1): working memory is the two edge buffers, temporary storage is the tile
+    /// file, and the file size belongs to the encoder. A session that ends with a full disk or a
+    /// failed seal has its reason on stderr already; this line says how close it came.
     pub(crate) fn finish(mut self) -> Option<(u32, u32, Vec<u8>)> {
-        self.join().map(Tracker::into_image)
+        let tracker = self.join()?;
+        let budgets = tracker.budgets();
+        eprintln!(
+            "[snapclip][scroll] image {}x{}: working {:.1} MB ({} rows), temp {:.1} MB",
+            tracker.width(),
+            budgets.pixel_rows,
+            budgets.working_bytes as f64 / 1e6,
+            budgets.pixel_rows,
+            budgets.temp_bytes as f64 / 1e6,
+        );
+        Some(tracker.into_image())
     }
 
     fn join(&mut self) -> Option<Tracker> {

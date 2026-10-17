@@ -61,8 +61,10 @@ pub struct Stitched {
     /// Per-frame `Tracker::push` times, in microseconds, with the thumbnail refresh taken out.
     pub stitch_us: Vec<u64>,
     pub thumb_us: u64,
-    /// Peak extra allocation across the whole run: the canvas at its largest.
+    /// Peak extra allocation while pushing frames: the edge buffers and the tile file.
     pub peak_bytes: usize,
+    /// Peak extra allocation when the finished image is gathered for the encoder.
+    pub assembly_peak: usize,
     pub lost: usize,
     pub correct: bool,
 }
@@ -73,14 +75,13 @@ pub struct Stitched {
 /// viewports, so a 800-row view can never reach 30 000 rows while a 960-row one can.
 pub fn run(view: usize, step: usize) -> Stitched {
     let page = page(WIDTH, ROWS);
-    let (stitched, peak_bytes) = alloc_probe::peak_extra(|| {
-        let first = frame(&page, WIDTH, 0, view);
-        let mut probe = snapclip_capture::scroll::probe::ScrollProbe::new(
-            &first,
-            WIDTH as u32,
-            view as u32,
-            WIDTH as u32 / 8,
-        );
+    let first = frame(&page, WIDTH, 0, view);
+    let mut probe =
+        snapclip_capture::scroll::probe::ScrollProbe::new(&first, WIDTH as u32, view as u32, WIDTH as u32 / 8);
+    // The measured window covers only what capture holds: pushing frames, the edge buffers and the
+    // tile file. Gathering the finished image is the export path's cost (docs/35 §5.3), and the
+    // whole point of the backing store is that the two are no longer the same number.
+    let (pushed, peak_bytes) = alloc_probe::peak_extra(|| {
         let mut stitch_us = Vec::new();
         let mut thumb_us = 0;
         let mut lost = 0;
@@ -98,22 +99,21 @@ pub fn run(view: usize, step: usize) -> Stitched {
             frames += 1;
         }
         let rows = probe.image_rows();
-        let (width, height, canvas) = probe.into_image();
-        let truth = &page[..(width as usize * height as usize * 4).min(page.len())];
-        let correct = canvas.len() == truth.len() && canvas == truth;
-        Stitched {
-            frames,
-            rows,
-            stitch_us,
-            thumb_us,
-            peak_bytes: 0,
-            lost,
-            correct,
-        }
+        (frames, rows, stitch_us, thumb_us, lost)
     });
+    let ((width, height, canvas), assembly_peak) = alloc_probe::peak_extra(|| probe.into_image());
+    let truth = &page[..(width as usize * height as usize * 4).min(page.len())];
+    let correct = canvas.len() == truth.len() && canvas == truth;
+    let (frames, rows, stitch_us, thumb_us, lost) = pushed;
     Stitched {
+        frames,
+        rows,
+        stitch_us,
+        thumb_us,
         peak_bytes,
-        ..stitched
+        assembly_peak,
+        lost,
+        correct,
     }
 }
 
@@ -163,13 +163,14 @@ pub fn report() -> String {
     let stitched = run(VIEW, STEP);
     let (median, max) = median_and_max(&stitched.stitch_us);
     out.push_str(&format!(
-        "stitching: {} frames · {} rows · per-frame {:.2} ms median / {:.2} ms max · thumb total {:.1} ms · canvas peak {:.1} MB · lost {} · pixel-exact {}\n\n",
+        "stitching: {} frames · {} rows · per-frame {:.2} ms median / {:.2} ms max · thumb total {:.1} ms · working peak {:.1} MB · assembly peak {:.1} MB · lost {} · pixel-exact {}\n\n",
         stitched.frames,
         stitched.rows,
         median as f64 / 1000.0,
         max as f64 / 1000.0,
         stitched.thumb_us as f64 / 1000.0,
         megabytes(stitched.peak_bytes),
+        megabytes(stitched.assembly_peak),
         stitched.lost,
         stitched.correct
     ));
