@@ -21,6 +21,9 @@ zenjpeg = { version = "=0.8.4", default-features = false, features = ["trellis",
 mozjpeg-rs = { version = "=0.9.2", default-features = false }
 zenwebp = "=0.4.4"
 png = "0.18.1"
+# Independent JPEG decoder for the `optimize_huffman` A/B: decoding with the encoding library
+# alone would let a bug mirror itself (docs/34 §14).
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 # zenjpeg re-exports `Stop` but not `Unstoppable`; the decoder asks for `impl Stop`.
 enough = "0.4.5"
 # The scroll pipeline is measured through the real tracker, not a copy of it, so the bench depends

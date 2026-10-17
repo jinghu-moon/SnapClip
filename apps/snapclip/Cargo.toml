@@ -94,6 +94,27 @@ anyhow = "1"
 # snapclip-history) is what keeps our own copy out of the history.
 arboard = "3.6"
 
+# Lossy export (`docs/34` §9–11). Baseline + 4:4:4 at q92, with the Huffman optimiser only where
+# the whole frame fits a budget, because switching it on makes this crate buffer the frame
+# (456.5 MB on a 1280x30000 strip) instead of streaming it (13.9 MB).
+#
+# `default-features = false` because the defaults pull in the decoder, which a sink does not need;
+# `trellis` is enabled because that is the feature that makes the optimiser exist at all, even
+# though this sink never selects the more aggressive preset. Pinned to `=` because the crate is new
+# (first release 2026-06, 81k lines): an upgrade has to re-run `tools/codec-bench` before it is
+# trusted with anyone's screenshots.
+zenjpeg = { version = "=0.8.4", default-features = false, features = ["trellis"] }
+
+# Lossless WebP (`docs/34` §9.1, §13). Pinned to 0.4.4 because 0.4.5 was yanked. Default features
+# are kept on purpose: turning them off removes the `Encoder` itself, which the bench found the
+# hard way.
+zenwebp = "=0.4.4"
+
+# `Stop`'s `check` names `enough::reason::StopReason`, and `zenjpeg` re-exports the trait without
+# the reason type. `enough` is already in this graph through `zenjpeg` (0.4.5), so this is a direct
+# edge to the type a cancellation has to return, not a second copy of anything.
+enough = "0.4"
+
 [features]
 # Test-only: `.test_support()` comes from gpui-kit's test-support feature. Forwarding it
 # through this crate's own feature is what keeps the production build free of test support
@@ -105,3 +126,6 @@ test-support = ["gpui-kit/test-support"]
 blake3 = "1.5"
 # Same version and source as the normal dependency, with the helpers the guides require.
 gpui-kit = { version = "0.7", features = ["test-support"] }
+# Test-only cross-decoder for the lossless WebP round-trip: decoding with the same library that
+# encoded would let a shared bug cancel itself out (docs/34 §13).
+image = { version = "0.25", default-features = false, features = ["webp", "png", "jpeg"] }

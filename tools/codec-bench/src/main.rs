@@ -11,6 +11,7 @@
 
 mod alloc_probe;
 mod codecs;
+mod huffman_ab;
 mod quality;
 mod scroll;
 mod synthetic;
@@ -36,12 +37,16 @@ fn main() {
         println!("{}", scroll::report());
         return;
     }
+    if arguments.iter().any(|argument| argument == "--huffman-ab") {
+        println!("{}", huffman_ab::report());
+        return;
+    }
     if arguments.iter().any(|argument| argument == "--quality") {
         run_quality();
         return;
     }
     if !arguments.iter().any(|argument| argument == "--report") {
-        println!("codec-bench: pass --report or --quality");
+        println!("codec-bench: pass --report, --quality, --scroll or --huffman-ab");
         return;
     }
     run_report();

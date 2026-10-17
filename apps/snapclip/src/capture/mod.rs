@@ -24,6 +24,24 @@ pub use pin_source::{PinSource, TakeSelection};
 /// `png` out of the capture crate's graph entirely.
 pub mod row_band_png;
 
+/// What each save format can hold, as pure data (`docs/34` §13).
+///
+/// The scroll session needs this before it starts scrolling, so it is a value type with no encoder
+/// behind it: asking "can WebP hold 30000 rows" must not open a codec.
+pub mod save_format;
+
+/// Lossy export, split by what the Huffman optimiser costs in memory (`docs/34` §10–11).
+///
+/// Beside `row_band_png` rather than inside it: the two sinks share `ImageMeta`, `Artifact` and
+/// `ExportError` from there, and nothing else.
+pub mod row_band_jpeg;
+
+/// Lossless WebP export (`docs/34` §9.1).
+///
+/// Whole-image, because `zenwebp` has no streaming form, and lossless only, because lossy WebP is
+/// 4:2:0 by definition and that is what damages coloured text.
+pub mod webp_sink;
+
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 

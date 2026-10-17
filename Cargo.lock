@@ -1056,6 +1056,7 @@ name = "codec-bench"
 version = "0.1.0"
 dependencies = [
  "enough",
+ "image",
  "mozjpeg-rs",
  "png 0.18.1",
  "snapclip-capture",
@@ -6607,7 +6608,9 @@ dependencies = [
  "async-channel",
  "blake3",
  "encoding_rs",
+ "enough",
  "gpui-kit",
+ "image",
  "parking_lot",
  "png 0.18.1",
  "rclip-rtf",
@@ -6618,6 +6621,8 @@ dependencies = [
  "snapclip-model",
  "win-icon-extractor",
  "windows-sys 0.59.0",
+ "zenjpeg",
+ "zenwebp",
 ]
 
 [[package]]
