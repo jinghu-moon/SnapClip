@@ -1,10 +1,9 @@
-//! `SaveFormat` — what each output format can carry, as pure data (`docs/34` §13).
+//! `SaveFormat` — what each output format can carry, as pure data (`docs/34` §13, §15).
 //!
-//! This lives in the shell for the same reason the encoders do (`docs/30` §17.7): a format is a
-//! decision about the **output**, not a fact about capturing, so `snapclip-capture` must never learn
-//! that formats exist. The scroll session will ask this type whether the format it would save with
-//! can hold the image before it starts scrolling — which is why the answer is a value and not a
-//! string, and why nothing here allocates or touches the filesystem.
+//! The *encoders* live in the shell (`docs/30` §17.7) because they are heavy dependencies, but the
+//! *capability* has to live here: the scroll session runs in this crate and must refuse to start a
+//! capture its format could never hold. So this module is data and rules only — no codec, no
+//! allocation, no filesystem — and the shell re-exports it for its sinks.
 //!
 //! The three limits are the formats', not the crates':
 //!
@@ -17,11 +16,17 @@
 //! inventing a fourth limit here would be a product decision wearing a format's clothes. The WebP
 //! sink *does* carry a memory guard, and it says so where it is defined.
 
+use serde::{Deserialize, Serialize};
+
 /// The three formats the save path can produce.
 ///
 /// `Png` is the master and the default; `Jpeg` is the lossy export; `Webp` is lossless only (see
 /// [`SaveFormat::label`]) and only within its side limit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Stored by name (`"png"` / `"jpeg"` / `"webp"`), so a settings file written by an older build
+/// keeps loading: a missing field takes the default, which is `Png`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SaveFormat {
     Png,
     Jpeg,
@@ -175,5 +180,87 @@ mod tests {
         let message = limit.to_string();
         assert!(message.contains("20000"), "{message}");
         assert!(message.contains("16383"), "{message}");
+    }
+}
+
+/// What the save path remembers between captures.
+///
+/// Split from the overlay's presentation on purpose: a format is a decision about the output, and
+/// the overlay never draws it. `jpeg_quality` is stored raw and clamped on read
+/// ([`SavePreferences::quality`]) because a hand-edited file must not be able to make the encoder
+/// fail — the three values the UI offers (85/92/95) are a UI choice, not a storage rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SavePreferences {
+    pub format: SaveFormat,
+    /// JPEG quality, 1–100. Only consulted when `format` is `Jpeg`.
+    pub jpeg_quality: u8,
+}
+
+impl Default for SavePreferences {
+    fn default() -> Self {
+        Self {
+            format: SaveFormat::Png,
+            jpeg_quality: DEFAULT_JPEG_QUALITY,
+        }
+    }
+}
+
+impl SavePreferences {
+    /// The quality the encoder should use, clamped into the range the format accepts.
+    pub fn quality(self) -> u8 {
+        self.jpeg_quality.clamp(MIN_JPEG_QUALITY, MAX_JPEG_QUALITY)
+    }
+}
+
+/// The default JPEG quality: inside the 85–95 band the measurements picked (`docs/34` §11) and
+/// above the point where text starts to suffer.
+pub const DEFAULT_JPEG_QUALITY: u8 = 92;
+pub const MIN_JPEG_QUALITY: u8 = 1;
+pub const MAX_JPEG_QUALITY: u8 = 100;
+
+#[cfg(test)]
+mod preference_tests {
+    use super::*;
+
+    #[test]
+    fn the_defaults_are_the_products_current_behaviour() {
+        let save = SavePreferences::default();
+        assert_eq!(save.format, SaveFormat::Png);
+        assert_eq!(save.jpeg_quality, DEFAULT_JPEG_QUALITY);
+        assert_eq!(save.quality(), 92);
+    }
+
+    #[test]
+    fn a_hand_edited_quality_is_clamped_not_rejected() {
+        // A settings file is not a place to fail a capture: clamp and carry on.
+        let low = SavePreferences { format: SaveFormat::Jpeg, jpeg_quality: 0 };
+        assert_eq!(low.quality(), MIN_JPEG_QUALITY);
+        let high = SavePreferences { format: SaveFormat::Jpeg, jpeg_quality: 255 };
+        assert_eq!(high.quality(), MAX_JPEG_QUALITY);
+        let fine = SavePreferences { format: SaveFormat::Jpeg, jpeg_quality: 85 };
+        assert_eq!(fine.quality(), 85);
+    }
+
+    #[test]
+    fn the_formats_round_trip_through_their_stored_names() {
+        for (format, text) in [
+            (SaveFormat::Png, "\"png\""),
+            (SaveFormat::Jpeg, "\"jpeg\""),
+            (SaveFormat::Webp, "\"webp\""),
+        ] {
+            assert_eq!(serde_json::to_string(&format).unwrap(), text);
+            assert_eq!(serde_json::from_str::<SaveFormat>(text).unwrap(), format);
+        }
+    }
+
+    #[test]
+    fn an_older_settings_file_without_the_save_block_loads_as_the_default() {
+        // The struct-level `#[serde(default)]` is what makes the older file legal.
+        let save: SavePreferences = serde_json::from_str("{}").unwrap();
+        assert_eq!(save, SavePreferences::default());
+        let partial: SavePreferences = serde_json::from_str("{\"format\":\"webp\"}").unwrap();
+        assert_eq!(partial.format, SaveFormat::Webp);
+        assert_eq!(partial.jpeg_quality, DEFAULT_JPEG_QUALITY);
     }
 }

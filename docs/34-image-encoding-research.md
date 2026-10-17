@@ -592,3 +592,53 @@ sink 只断言它自己拥有的东西：文件更小、尺寸正确、可解码
 
 `ui_frame` 那份测试素材与 bench 合成素材不同源，所以"20% 体积差"本身也无法对着 bench 复现；
 `optimize_huffman` 在**渐进式**下的行为未测（我们只用 baseline）。
+
+## 15. 两道门：`SaveFormat` 落到能看见它的地方，滚动先问格式
+
+### 15.1 门 1 —— 能力模型搬家，并成为可持久化的偏好
+
+`SaveFormat` 原来定义在 `apps/snapclip/src/capture/save_format.rs`。问题是滚动会话跑在
+`crates/snapclip-capture` 里，它需要在开始滚动之前就知道格式能不能装下这次截图，而两边互相看不见。
+
+- **搬的是"能力"，不是"编码器"**：`SaveFormat` + `max_side()` + `can_encode` + `FormatLimit` +
+  `label()` 移入 `crates/snapclip-capture/src/save_format.rs`（纯数据与规则，没有 codec 依赖、
+  不分配、不碰文件系统）；`zenjpeg` / `zenwebp` 那些 sink 仍然留在 shell。
+- app 侧用 `pub use snapclip_capture::save_format;` re-export ⇒ 两个 sink 里那句
+  `super::save_format::SaveFormat` 一行都不用改。
+- 新增 `SavePreferences { format, jpeg_quality }`：默认 **PNG** + **92**，`quality()` 读的时候夹到
+  1–100（手改的设置文件不该让编码失败）；`SaveFormat` 用 `#[serde(rename_all = "lowercase")]`
+  存成 `"png"` / `"jpeg"` / `"webp"`。
+- `Settings` 加 `saveFormat` / `jpegQuality` 两个字段，靠结构体级 `#[serde(default)]` 做兼容：
+  旧文件缺字段 ⇒ 取默认，不报错、不重置其它字段。
+
+### 15.2 门 2 —— 滚动会话开始前的格式检查
+
+`scroll::scroll_format(preferred, width, view)` 是纯函数：用现有的 `row_limit`（`MAX_SCREENS ×
+视口高` 与 `MAX_BYTES` 取小）算出**这次滚动可能到达的最大行数**，再问 `can_encode`；装不下就返回
+`Png` 加上原因。调用点在 `begin_scroll_session()` 里、`ScrollWorker::start` **之前** —— 画布是那个
+worker 分配的，所以"拒绝"必须发生在零行的时候，而不是滚了三十秒之后。
+
+- 边界实测（纯测试）：1280×480 视口 ⇒ 32×480 = **15360** 行 ⇒ WebP 保留；1280×512 视口 ⇒
+  **16384** 行 ⇒ 降级 PNG；1280×960 ⇒ 30720 行 ⇒ 降级。JPEG 到 65535 才降（32×2100 = 67200）。
+- 可观测点：`[snapclip][scroll] format=… lowered to … before scrolling: <原因>` 与
+  `[snapclip][scroll] save format=… (chosen …)` 两行日志；控制器上留了 `scroll_save_format`
+  供保存路径接上时读取。
+
+### 15.3 顺手修掉一个竞态测试
+
+codec-bench 里"WebP 拒绝不应分配"那条原本是**竞态的**：`peak_extra` 量的是**进程级**峰值，而
+`cargo test` 并行跑 ⇒ 别的测试的分配会被算进来（实测偶发 65 KB 让断言失败）。修法两条：给测量加
+一把锁（只有持锁的测试在测），并把阈值从 8 KiB 放到 **1 MiB** —— 这个测试要区分的转换会分配
+`1280 × 29760 × 4 ≈ 152 MB`，1 MiB 仍保有 150 倍区分力。连跑 5 次稳定。
+
+### 15.4 证据
+
+| 项 | 结果 |
+| --- | --- |
+| capture lib | **505 / 0 / 80**（+12：5 条随文件搬来的 format 测试、4 条偏好、3 条滚动格式） |
+| app lib | **154 / 0 / 7**（157 → 154：5 条搬到 capture、新增 2 条兼容性测试 —— 是迁移不是删除） |
+| codec-bench | **20 / 0**（连跑 5 次稳定） |
+| workspace | `cargo check --workspace --all-targets` **0 warning** |
+| 两个 gate | dependency direction clean · `[baseline] OK` |
+
+未验证：真机滚动一次确认降级提示；`SaveFormat` 的 `quality()` 在保存路径真正接上时会怎样被 UI 约束（85/92/95 三档是 UI 决定，存储层不限制）。

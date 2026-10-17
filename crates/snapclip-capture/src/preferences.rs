@@ -1,4 +1,8 @@
-//! What the user chose about the overlay's presentation and keys.
+//! What the user chose about the overlay's presentation, keys, and what a save should produce.
+//!
+//! The save block is not presentation — the overlay never draws it — but a scroll session has to
+//! know the format before it starts scrolling (`docs/34` §15), so it rides along with the snapshot
+//! the controller already receives.
 //!
 //! The shell owns the settings file; capture only receives the result. A session reads the
 //! preferences once, when it starts, so a change made in the settings window applies from the next
@@ -7,6 +11,7 @@
 use std::sync::Arc;
 
 use crate::keymap::Keymap;
+use crate::save_format::SavePreferences;
 use crate::units::LabelDisplay;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -21,6 +26,9 @@ pub struct OverlayPreferences {
     /// physical pixels whatever this says.
     pub label: LabelDisplay,
     pub keymap: Arc<Keymap>,
+    /// What a save would produce: the format and the JPEG quality. Only the scroll pre-flight reads
+    /// it today; the save path reads it when the panel lands.
+    pub save: SavePreferences,
 }
 
 impl Default for OverlayPreferences {
@@ -30,6 +38,7 @@ impl Default for OverlayPreferences {
             shortcut_guide: true,
             label: LabelDisplay::default(),
             keymap: Arc::new(Keymap::default()),
+            save: SavePreferences::default(),
         }
     }
 }

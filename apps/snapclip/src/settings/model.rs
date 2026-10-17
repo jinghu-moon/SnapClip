@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use snapclip_capture::keymap::{Keymap, KeymapOverrides};
 use snapclip_capture::preferences::OverlayPreferences;
+use snapclip_capture::save_format::{SaveFormat, SavePreferences};
 use snapclip_capture::units::{LabelDisplay, LengthUnit};
 use snapclip_capture::window_detection::{DEFAULT_ADOPT_TEXT_RUNS, DetectionOptions};
 
@@ -40,11 +41,17 @@ pub struct Settings {
     pub show_unit: bool,
     /// The overlay's key bindings, as changes from the defaults.
     pub keymap: KeymapOverrides,
+    /// What a save should produce (`docs/34` §15). Defaults to PNG, the format that can hold
+    /// anything; an older file without these fields loads as those defaults.
+    pub save_format: SaveFormat,
+    /// JPEG quality, 1–100, clamped on read.
+    pub jpeg_quality: u8,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         let overlay = OverlayPreferences::default();
+        let save = overlay.save;
         Self {
             deep_select_text_runs: DEFAULT_ADOPT_TEXT_RUNS,
             mask_blur: overlay.mask_blur,
@@ -54,6 +61,8 @@ impl Default for Settings {
             show_coordinates: overlay.label.show_coordinates,
             show_unit: overlay.label.show_unit,
             keymap: KeymapOverrides::default(),
+            save_format: save.format,
+            jpeg_quality: save.jpeg_quality,
         }
     }
 }
@@ -89,6 +98,10 @@ impl Settings {
                 show_unit: self.show_unit,
             },
             keymap: Arc::new(keymap),
+            save: SavePreferences {
+                format: self.save_format,
+                jpeg_quality: self.jpeg_quality,
+            },
         }
     }
 
@@ -172,6 +185,7 @@ mod tests {
 
     use snapclip_capture::keymap::{Keymap, KeymapOverrides};
     use snapclip_capture::preferences::OverlayPreferences;
+    use snapclip_capture::save_format::SaveFormat;
     use snapclip_capture::units::{LabelDisplay, LengthUnit};
 
     use super::{Settings, SettingsStore};
@@ -221,6 +235,7 @@ mod tests {
             show_coordinates: false,
             show_unit: false,
             keymap,
+            ..Settings::default()
         };
         store.save(&wanted).expect("save");
         assert_eq!(store.load(), wanted);
@@ -276,6 +291,42 @@ mod tests {
                 ..Settings::default()
             }
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_older_file_without_a_save_block_keeps_png_at_ninety_two() {
+        // Backward compatibility is the struct-level `#[serde(default)]`: a file written before the
+        // save block existed must load, not reset, and it must not invent a format.
+        let dir = root("no-save-block");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("settings.json"), r#"{"maskBlur": false}"#).unwrap();
+        let settings = SettingsStore::new(&dir).load();
+        assert!(!settings.mask_blur);
+        assert_eq!(settings.save_format, SaveFormat::Png);
+        assert_eq!(settings.jpeg_quality, 92);
+        let overlay = settings.overlay_preferences();
+        assert_eq!(overlay.save.format, SaveFormat::Png);
+        assert_eq!(overlay.save.quality(), 92);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_save_block_round_trips_through_the_file() {
+        let dir = root("save-round-trip");
+        std::fs::create_dir_all(&dir).unwrap();
+        let wanted = Settings {
+            save_format: SaveFormat::Jpeg,
+            jpeg_quality: 85,
+            ..Settings::default()
+        };
+        let store = SettingsStore::new(&dir);
+        store.save(&wanted).expect("save");
+        assert_eq!(store.load(), wanted);
+        let text = std::fs::read_to_string(dir.join("settings.json")).unwrap();
+        // Stored by the name the file spells, so a hand edit is readable.
+        assert!(text.contains("\"saveFormat\": \"jpeg\""), "{text}");
+        assert!(text.contains("\"jpegQuality\": 85"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

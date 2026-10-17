@@ -72,6 +72,8 @@ mod tests {
 
     #[test]
     fn a_large_allocation_raises_the_peak_and_a_free_lowers_the_live_total() {
+        // The peak is process-wide: do not measure while another test allocates.
+        let _serial = crate::alloc_probe::test_guard();
         let (length, peak) = peak_extra(|| vec![7u8; 1 << 20].len());
         assert_eq!(length, 1 << 20);
         assert!(peak >= 1 << 20, "peak {peak} should cover the megabyte");
@@ -85,4 +87,15 @@ mod tests {
         let ((), peak) = peak_extra(|| ());
         assert_eq!(peak, 0);
     }
+}
+
+/// Serialises the tests that read the process-wide peak.
+///
+/// The counter is global, so two tests measuring at once would read each other's allocations and a
+/// refusal that allocates nothing could look like one that allocates 64 KiB. A test that takes this
+/// guard is the only one measuring for as long as it holds it.
+#[cfg(test)]
+pub fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }

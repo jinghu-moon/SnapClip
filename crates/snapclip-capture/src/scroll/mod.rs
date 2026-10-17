@@ -84,6 +84,24 @@ fn row_limit(width: u32, view: u32, max_bytes: usize) -> u32 {
     rows.max(view as usize).min(u32::MAX as usize) as u32
 }
 
+/// The format a scroll capture will actually save with, and why it was lowered if it was.
+///
+/// The question is answered **before** the worker starts, because the worker is what allocates the
+/// canvas: a WebP the container can never hold must be refused when zero rows exist, not after
+/// thirty seconds of scrolling (`docs/34` §15). The row count is the *possible* maximum
+/// ([`row_limit`]), not what the page happens to contain.
+pub(crate) fn scroll_format(
+    preferred: crate::save_format::SaveFormat,
+    width: u32,
+    view: u32,
+) -> (crate::save_format::SaveFormat, Option<crate::save_format::FormatLimit>) {
+    let rows = row_limit(width, view, MAX_BYTES);
+    match preferred.can_encode(u64::from(width), u64::from(rows)) {
+        Ok(()) => (preferred, None),
+        Err(limit) => (crate::save_format::SaveFormat::Png, Some(limit)),
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Tracker {
     width: u32,
@@ -571,5 +589,43 @@ pub mod probe {
         pub fn into_image(self) -> (u32, u32, Vec<u8>) {
             self.tracker.into_image()
         }
+    }
+}
+
+#[cfg(test)]
+mod scroll_format_tests {
+    use super::{MAX_SCREENS, scroll_format};
+    use crate::save_format::SaveFormat;
+
+    #[test]
+    fn webp_is_lowered_before_a_tall_scroll_starts() {
+        // 32 x 960 rows is past 16383, so this capture can never be a single WebP.
+        let (effective, why) = scroll_format(SaveFormat::Webp, 1280, 960);
+        assert_eq!(effective, SaveFormat::Png);
+        assert!(why.is_some());
+    }
+
+    #[test]
+    fn a_short_view_keeps_webp_and_a_tall_one_does_not() {
+        // 32 x 480 = 15360 rows, inside the container.
+        assert_eq!(scroll_format(SaveFormat::Webp, 1280, 480), (SaveFormat::Webp, None));
+        // 32 x 512 = 16384 rows, one past it.
+        let (effective, why) = scroll_format(SaveFormat::Webp, 1, 512);
+        assert_eq!(effective, SaveFormat::Png);
+        assert!(why.is_some());
+        // 32 x 511 = 16352 rows, still inside.
+        assert_eq!(scroll_format(SaveFormat::Webp, 1, 511), (SaveFormat::Webp, None));
+    }
+
+    #[test]
+    fn png_is_never_lowered_and_jpeg_only_past_its_own_limit() {
+        assert_eq!(scroll_format(SaveFormat::Png, 3840, 2100), (SaveFormat::Png, None));
+        // 32 x 960 = 30720 rows, well inside JPEG's 65535.
+        assert_eq!(scroll_format(SaveFormat::Jpeg, 1280, 960), (SaveFormat::Jpeg, None));
+        // 32 x 2100 = 67200 rows, past it.
+        let (effective, why) = scroll_format(SaveFormat::Jpeg, 1280, 2100);
+        assert_eq!(effective, SaveFormat::Png);
+        assert!(why.is_some());
+        assert_eq!(MAX_SCREENS, 32);
     }
 }

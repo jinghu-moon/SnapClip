@@ -28,7 +28,9 @@ pub mod row_band_png;
 ///
 /// The scroll session needs this before it starts scrolling, so it is a value type with no encoder
 /// behind it: asking "can WebP hold 30000 rows" must not open a codec.
-pub mod save_format;
+// The capability model lives in `snapclip-capture` (the scroll session needs it before it can
+// scroll); the encoders stay here. Re-exported so the sinks keep reading `super::save_format`.
+pub use snapclip_capture::save_format;
 
 /// Lossy export, split by what the Huffman optimiser costs in memory (`docs/34` §10–11).
 ///

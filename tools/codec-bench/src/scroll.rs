@@ -307,7 +307,9 @@ mod tests {
     #[test]
     fn webp_is_refused_before_it_can_allocate_a_long_image() {
         // The refusal has to happen before the BGRA-to-RGBA conversion, or "refused" still costs
-        // 153 MB for a 30 000-row image.
+        // 153 MB for a 30 000-row image. The peak is process-wide, so hold the measurement lock:
+        // another test's allocations must not be mistaken for ours.
+        let _serial = crate::alloc_probe::test_guard();
         let (result, peak) = alloc_probe::peak_extra(|| {
             let limit = 16_383;
             let (width, height) = (WIDTH, ROWS);
@@ -318,6 +320,10 @@ mod tests {
             }
         });
         assert!(result.is_err());
-        assert!(peak < 8 * 1024, "refusal allocated {peak} bytes");
+        // The peak is process-wide, so the tolerance has to absorb whatever the other tests in the
+        // same binary allocate while this one runs. What it must keep is the discrimination: the
+        // conversion this test exists to forbid would allocate WIDTH * ROWS * 4, about 152 MB, so a
+        // megabyte still tells "refused before allocating" apart from "converted and then refused".
+        assert!(peak < 1024 * 1024, "refusal allocated {peak} bytes");
     }
 }
