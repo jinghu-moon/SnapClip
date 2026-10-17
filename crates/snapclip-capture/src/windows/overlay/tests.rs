@@ -1275,6 +1275,33 @@ fn the_countdown_dim_layer_actually_darkens_outside_the_selection() {
     assert!(outside_in_region, "环应当留在区域里");
     assert!(!inside_in_region, "洞必须是空的（客户区坐标）");
 
+    // 6b) 圆角（docs/23 §14.55.23）：洞必须跟着弧走 —— 弧与方角之间的楔形也要算在区域里，
+    // 否则遮罩在那里留白。半径 30 时，(left+3, top+3) 到弧心 (left+30, top+30) 约 38 > 30
+    // ⇒ 在弧外、但在选区矩形内 = 楔形。
+    layer
+        .update(monitor, selection, 30)
+        .expect("换洞应当成功");
+    let rgn = unsafe { windows_sys::Win32::Graphics::Gdi::CreateRectRgn(0, 0, 0, 0) };
+    let copied = unsafe { GetWindowRgn(hwnd, rgn) };
+    assert!(copied != 0, "换洞后窗口应当仍有区域");
+    let wedge = (
+        selection.left + 3 - monitor.left,
+        selection.top + 3 - monitor.top,
+    );
+    let wedge_in_region = unsafe { PtInRegion(rgn, wedge.0, wedge.1) } != 0;
+    let centre_in_region = unsafe {
+        PtInRegion(
+            rgn,
+            selection.center().x - monitor.left,
+            selection.center().y - monitor.top,
+        )
+    } != 0;
+    let outside_again = unsafe { PtInRegion(rgn, outside_point.0, outside_point.1) } != 0;
+    unsafe { windows_sys::Win32::Graphics::Gdi::DeleteObject(rgn as _) };
+    assert!(wedge_in_region, "楔形必须在区域里，否则那里不压暗");
+    assert!(!centre_in_region, "选区中心仍必须是空的");
+    assert!(outside_again, "直边之外仍压暗");
+
     // 7) 排除出截图：延时贴图不会把遮罩带上。
     layer
         .show(monitor, selection, 0, Some(&blurred_content))

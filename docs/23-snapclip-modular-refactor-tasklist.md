@@ -4634,3 +4634,26 @@ layered 窗口、也能用带 `CAPTUREBLT` 的屏幕 `BitBlt` 看到它。
 - 修法：新增 `WindowRegion::RoundRing { outer, inner, radius }`（`CreateRoundRectRgn` 外框 + 内框 + `RGN_DIFF`；内弧半径由环宽推导，所以两弧同心）；`countdown_window_pieces` 多收一个 `radius`，> 0 时产出圆角环，**半径 0 仍走矩形环**（与改动前一致）。调用点是 `enter_countdown` 的 `NarrowRegion` 与拖动时的 `sync_countdown_region`，都传 `corner_radius_px`。
 - 证据：活桌面 `a_rounded_ring_follows_the_arc_on_a_real_window` —— 弧带里的点在内、**外弧之外的点不在内**（矩形环会误判为在内，这正是该变体的意义）、直边在内、选区中心不在内、还原后 `GetWindowRgn == 0`；圆角 0 的旧断言（`a_combined_region_keeps_the_frame_ring_and_drops_the_middle`）仍绿。
 - 未验证：真机上倒计时期间环与框的贴合观感。
+
+### §14.55.23 遮罩的洞也要跟着弧走（圆角几何的第三个消费者）
+
+**成因**：选区圆角化之后，框的描边与成图的遮罩都跟着弧走了，但**遮罩的洞**仍是矩形 ⇒ 弧与方角之间露出四个楔形空白（用户原话："遮罩没有填补截图框圆角化导致的空白"）。
+
+**两处修改**（半径与上限继续共用 `geometry::radius_cap`，不另算）：
+
+1. **常态遮罩**（浮层里选区外的压暗/模糊）：半径 > 0 且洞就是选区本身时，不再用四条直边带，而是用"整帧减去圆角洞"的几何一次填充。`ID2D1Factory` 在这个 windows crate 里**没有** `CreateCombinedGeometry` ⇒ 用 `CreateGeometryGroup(ALTERNATE)`（外矩形 + 圆角洞，奇偶填充正好抵消出环带），几何按（帧、洞、半径）缓存；模糊遮罩走 `PushLayer(geometricMask = 该几何)` 后整帧画一次，不再按四条带画。**半径 0 仍走原来的四条带路径，逐字节不变。** 只在"洞 == 选区"时生效：hover 预览态的洞是那个窗口的矩形，不该被选区的半径影响。
+2. **倒计时遮罩层**：`WindowRegion` 新增 `RoundedHole { outer, inner, radius }`（矩形外框 + `CreateRoundRectRgn` 内洞 + `RGN_DIFF`），`DimLayer` 在半径 > 0 时用它、否则仍用矩形环；半径经 `radius_cap` 夹取。
+
+**证据（真跑）**：
+
+- **L4 像素对**（`the_mask_hole_follows_the_rounded_selection`）：同一点 `(63,53)`（在选区矩形内、半径 30 的弧外）在半径 0 时是洞里的原亮度 `[200,200,200]`，半径 30 时被压暗（差 > 30）；洞中心两种半径都不压暗；直边外两种半径都压暗。
+- **GDI 区域纯测试**（`a_rounded_hole_covers_the_corner_wedge`）：楔形点在区域内、洞内点不在、直边外点在内。
+- **活桌面**（`the_countdown_dim_layer_actually_darkens_outside_the_selection` 新增 6b）：`update(monitor, selection, 30)` 后读回 `GetWindowRgn`，断言楔形在区域内、选区中心不在、直边之外仍在。
+- **渲图** `target/mask_wedge.png`：左（半径 0）方角洞；右（半径 30）圆角洞，弧外那块**已被压暗**。
+- 全套：capture **493 passed / 0 failed / 78 ignored**、app **137 passed**、`cargo check --workspace --all-targets` **0 warning**、无临时诊断代码。
+
+**未验证**：
+
+- 真机观感（弧内侧的抗锯齿过渡、压暗浓淡是否与直边一致）；
+- **模糊遮罩 + 圆角洞**的组合只有实现、没有像素测试（`mask_blur` 关闭时才是常走的路径；开启时走 `PushLayer` 那条，未单独测）；
+- hover 预览态（洞是窗口矩形）下不应用选区半径 —— 这是有意为之，但没有专门的测试钉住。
