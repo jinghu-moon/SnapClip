@@ -21,13 +21,15 @@ use ::windows::Win32::Graphics::Direct2D::Common::{
     D2D1_PIXEL_FORMAT,
 };
 use ::windows::Win32::Graphics::Direct2D::{
-    CLSID_D2D1GaussianBlur, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_OPTIONS_NONE,
+    CLSID_D2D1GaussianBlur, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+    D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_CPU_READ, D2D1_BITMAP_OPTIONS_NONE,
     D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1, D2D1_DRAW_TEXT_OPTIONS_CLIP,
     D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE, D2D1_EXTEND_MODE_CLAMP, D2D1_GAMMA_2_2,
     D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED, D2D1_GAUSSIANBLUR_PROP_BORDER_MODE,
     D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION, D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION,
     D2D1_INTERPOLATION_MODE_LINEAR, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
-    D2D1_LAYER_PARAMETERS1, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_PROPERTY_TYPE_UNKNOWN,
+    D2D1_LAYER_PARAMETERS1, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_MAP_OPTIONS_READ,
+    D2D1_PROPERTY_TYPE_UNKNOWN,
     D2D1_ROUNDED_RECT, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, ID2D1Bitmap1, ID2D1DeviceContext,
     ID2D1Effect, ID2D1Geometry, ID2D1Image, ID2D1LinearGradientBrush, ID2D1RenderTarget,
     ID2D1SolidColorBrush,
@@ -204,6 +206,17 @@ pub struct RegionPanelView {
     pub preset_hit: Option<usize>,
     /// 开始按钮是否可用。
     pub can_start: bool,
+}
+
+/// 倒计时遮罩层的内容：一帧"模糊 + 压暗"的像素，已读回 CPU（premultiplied BGRA、自上而下）。
+///
+/// 为什么需要它：遮罩层是 layered 窗口，内容由 `UpdateLayeredWindow` 一次性提交；而正常
+/// 截图态是「冻帧 + 模糊 + 压暗」（`mask_blur` 那条）。只给纯色会让倒计时期间的观感比正常态
+/// 少一层模糊（docs/23 §14.55.9.11）。
+pub(crate) struct DimSource {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
 }
 
 /// One L0/L1/L2 composition request.
@@ -975,6 +988,111 @@ impl OverlayRenderer {
         }
         self.blurred_frame = Some(blurred);
         Ok(())
+    }
+
+    /// 倒计时遮罩层要显示的那一帧：冻帧先模糊、再压上遮罩的两层，然后读回 CPU。
+    ///
+    /// `divisor` > 1 表示按 1/divisor 分辨率渲染：模糊本身就是低频，放大回来观感几乎无损，
+    /// 而读回的数据量按平方下降 —— 4K 屏上这是把这次一次性开销压到几十毫秒以内的关键。
+    ///
+    /// 必须在帧之外调用（内部自己 `BeginDraw`/`EndDraw`）；耗时由调用方测量。
+    pub(crate) fn countdown_dim_source(&mut self, divisor: u32) -> Result<DimSource, String> {
+        self.ensure_blurred_frame()?;
+        let (Some(frame), Some(blurred)) = (self.frame_bitmap.clone(), self.blurred_frame.clone())
+        else {
+            return Err("倒计时遮罩：没有冻结帧或模糊帧".to_owned());
+        };
+        let full = unsafe { frame.GetPixelSize() };
+        if full.width == 0 || full.height == 0 {
+            return Err("倒计时遮罩：冻结帧尺寸为 0".to_owned());
+        }
+        let divisor = divisor.max(1);
+        let width = (full.width / divisor).max(1);
+        let height = (full.height / divisor).max(1);
+        let size = D2D_SIZE_U { width, height };
+        let target = unsafe {
+            self.d2d
+                .CreateBitmap(size, None, 0, &Self::dim_bitmap_properties(false))
+        }
+        .map_err(|error| super::hresult("ID2D1DeviceContext::CreateBitmap(dim target)", &error))?;
+        let readback = unsafe {
+            self.d2d
+                .CreateBitmap(size, None, 0, &Self::dim_bitmap_properties(true))
+        }
+        .map_err(|error| super::hresult("ID2D1DeviceContext::CreateBitmap(dim readback)", &error))?;
+        let (Some(mask), tint) = (self.mask_brush.clone(), self.mask_tint_brush.clone()) else {
+            return Err("倒计时遮罩：遮罩画刷未创建".to_owned());
+        };
+        let previous = unsafe { self.d2d.GetTarget() }.ok();
+        let area = to_d2d(Rect::from_origin_size(
+            Point::new(0, 0),
+            width as i32,
+            height as i32,
+        ));
+        unsafe {
+            self.d2d.SetTarget(&target);
+            self.d2d.BeginDraw();
+            let clear = color(0.0, 0.0, 0.0, 0.0);
+            self.d2d.Clear(Some(&clear));
+            // 缩小是 4× 以上、源已经模糊过，双线性就够（没有高频可混叠）。
+            self.d2d.DrawBitmap(
+                &blurred,
+                Some(&area),
+                1.0,
+                D2D1_INTERPOLATION_MODE_LINEAR,
+                None,
+                None,
+            );
+            // 与正常截图态同一组画刷：先黑色遮罩，再那一点点主题色。
+            self.d2d.FillRectangle(&area, &mask);
+            if let Some(tint) = tint.as_ref() {
+                self.d2d.FillRectangle(&area, tint);
+            }
+            self.d2d.EndDraw(None, None)
+        }
+        .map_err(|error| super::hresult("ID2D1DeviceContext::EndDraw(dim)", &error))?;
+        unsafe { readback.CopyFromBitmap(None, &target, None) }
+            .map_err(|error| super::hresult("ID2D1Bitmap1::CopyFromBitmap(dim)", &error))?;
+        let mapped = unsafe { readback.Map(D2D1_MAP_OPTIONS_READ) }
+            .map_err(|error| super::hresult("ID2D1Bitmap1::Map(dim)", &error))?;
+        let row_bytes = (width as usize) * 4;
+        let mut pixels = vec![0u8; row_bytes * height as usize];
+        for row in 0..height as usize {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    mapped.bits.add(row * mapped.pitch as usize),
+                    pixels.as_mut_ptr().add(row * row_bytes),
+                    row_bytes,
+                )
+            };
+        }
+        let _ = unsafe { readback.Unmap() };
+        if let Some(previous) = previous {
+            unsafe { self.d2d.SetTarget(&previous) };
+        }
+        Ok(DimSource {
+            width,
+            height,
+            pixels,
+        })
+    }
+
+    /// 遮罩层那两张位图的属性：一张可画（目标），一张只能读（读回）。
+    fn dim_bitmap_properties(cpu_read: bool) -> D2D1_BITMAP_PROPERTIES1 {
+        D2D1_BITMAP_PROPERTIES1 {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+            bitmapOptions: if cpu_read {
+                D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW
+            } else {
+                D2D1_BITMAP_OPTIONS_TARGET
+            },
+            ..Default::default()
+        }
     }
 
     /// Whether an L0 frame bitmap is loaded (diagnostics and tests).

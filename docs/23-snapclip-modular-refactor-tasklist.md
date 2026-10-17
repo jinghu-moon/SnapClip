@@ -4170,3 +4170,56 @@ HUD 帧（选区外**透明**）⇒ 主浮层自己画的那层旧遮罩**立刻
 
 **未验证**：那一下是否真的连续 —— 合成器如何在一帧内呈现多个窗口的变化不归我们管，只能人眼。
 若仍可见：先亮后暗 ⇒ 遮罩还要更早/同帧；先暗后亮 ⇒ `PaintHud` 与遮罩的呈现次序要再压。
+
+### §14.55.9.11 倒计时遮罩层的模糊：成因、做法、实测与那道被否掉的降级
+
+**成因**：遮罩层的内容只是一层**纯色**半透明，而正常截图态是「冻帧 + 模糊 + 压暗」（`mask_blur`
+那条）。倒计时期间的选区外因此少了一层模糊，观感与正常态不一致。
+
+**做法**：内容不再填纯色，而是把**同一套**渲染链路的结果读回 CPU 交给 `UpdateLayeredWindow`。
+`d2d::OverlayRenderer::countdown_dim_source(divisor)`：把既有的 `blurred_frame`
+（`CLSID_D2D1GaussianBlur`，σ = 6 dip，与面板背景同一个 effect）按 `1/divisor` 画进一张
+`B8G8R8A8` premultiplied 目标位图，再叠上主浮层遮罩**自己的**两层画刷
+（`mask_brush` = `MASK_RGB@MASK_ALPHA`、`mask_tint_brush` = `ACCENT_RGB@MASK_TINT_ALPHA`），
+`CopyFromBitmap` 到一张 `CPU_READ|CANNOT_DRAW` 位图后 `Map` 读回。遮罩层拿到字节后逐行 memcpy
+进 DIB，再 `UpdateLayeredWindow(ULW_ALPHA)`。窗口区域（选区开洞）与 `WDA_EXCLUDEFROMCAPTURE`
+一字未动 —— 点击穿透与"不进截图"都保持原样。
+
+**分辨率：全分辨率（`DIM_DIVISOR = 1`）**。实测（3840×2160、真 GPU，`the_cost_of_the_countdown_dim_source`）：
+
+| divisor | 内容尺寸 | 耗时 |
+| --- | --- | --- |
+| **1** | **3840×2160** | **8.8 ms** |
+| 2 | 1920×1080 | 2.9 ms |
+| 4 | 960×540 | 1.2 ms |
+| 8 | 480×270 | 0.53 ms |
+| — | 首次（构建模糊帧） | 12.6 ms |
+
+全分辨率已远低于 50 ms 的降级门限，所以**不降级**。而"降级"在这里不是"慢一点"，是**画不出来**：
+低分辨率内容要靠 GDI 放大，两条路都实测踩死 ——
+
+* `StretchBlt(SRCCOPY)` 在 32bpp `BI_RGB` 的 DIB 上会把 alpha 清零 ⇒ layered 窗口整块透明
+  （活桌面测试里表现为"选区外恢复成实时桌面"，均值 726 而不是内容的 149）；
+* 改用 `AlphaBlend`（`AC_SRC_ALPHA`）后**静默失败**（返回 0、屏幕保持上一份内容）⇒ 均值 232 ≈ 旧内容。
+
+所以产品用全分辨率 + 精确 memcpy，尺寸对不上时退回纯色，绝不引入丢 alpha 的放大步骤。
+
+**模糊的量化证据**（判据：局部对比度 = 相邻像素水平平均绝对差；纯压暗只会把它按比例缩小约一半）：
+
+| 测试 | sharp | blurred | 结论 |
+| --- | --- | --- | --- |
+| L4 `the_countdown_dim_source_blurs_the_frame_under_the_mask`（640×480 棋盘帧） | 74.2 | **0.1** | 掉 700 倍 ⇒ 模糊在**内容**里 |
+| 活桌面 `the_countdown_dim_layer_actually_darkens_outside_the_selection`（棋盘内容上屏） | 38.8 | **0.0** | 掉到 0 ⇒ 模糊**真的到了屏幕上** |
+
+活桌面那条同时钉住：屏幕均值**等于**给它的内容均值（684.3 → **149.0**，内容 149.0 ⇒ 交接精确）、
+洞里仍是实时画面（±6）、排除出截图后回到基线（延时贴图不带上遮罩）、隐藏后回基线、尺寸不匹配时
+退回纯色（684.3 → 375.2，不画透明）。
+
+**观感代价（如实）**：内容是**冻帧**（这正是"与正常截图态一致"的含义），所以倒计时期间选区外显示的是
+"冻结的、模糊的、压暗的"画面，不是实时画面；选区（洞）内仍是实时的。
+
+**验证**：capture **474 passed / 0 failed / 76 ignored**、app **135 passed**、workspace **0 warning**；
+L4 与活桌面两条模糊测试、HUD/区域/捕获/进入顺序四条回归、`layered_differential` 探针（2 passed）全绿。
+
+**未验证**：真机观感（模糊与浓淡是否与正常截图态一致）；产品路径上的**总**耗时（`source_ms` /
+`paint_ms` 已打进 `countdown dim shown:` 那一行，需真机日志确认；活桌面测试只量内容那条路径）。

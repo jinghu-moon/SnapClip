@@ -986,19 +986,21 @@ fn dim_test_be_dpi_aware() {
 }
 
 /// 屏幕 `BitBlt`（带 `CAPTUREBLT`，它会包含 layered 窗口）取矩形的平均亮度。
-fn dim_test_screen_mean(rect: Rect) -> f64 {
+/// 抓一块屏幕的像素（BGRA、自上而下）。`CAPTUREBLT` 让 layered 窗口也进得来 ——
+/// 观测遮罩层时必须先临时摘掉它的"排除出截图"，否则这里永远看不到它。
+fn dim_test_screen_bgra(rect: Rect) -> (Vec<u8>, u32) {
     use windows_sys::Win32::Graphics::Gdi::{
         BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
         SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT, DIB_RGB_COLORS, SRCCOPY,
     };
-    let width = rect.width().max(1);
-    let height = rect.height().max(1);
+    let width = rect.width().max(1) as u32;
+    let height = rect.height().max(1) as u32;
     unsafe {
         let mut info: BITMAPINFO = std::mem::zeroed();
         info.bmiHeader = BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: width,
-            biHeight: -height,
+            biWidth: width as i32,
+            biHeight: -(height as i32),
             biPlanes: 1,
             biBitCount: 32,
             biCompression: BI_RGB,
@@ -1019,29 +1021,120 @@ fn dim_test_screen_mean(rect: Rect) -> f64 {
             memory,
             0,
             0,
-            width,
-            height,
+            width as i32,
+            height as i32,
             screen,
             rect.left,
             rect.top,
             SRCCOPY | CAPTUREBLT,
         );
         assert_ne!(ok, 0, "BitBlt 失败：{}", GetLastError());
-        let pixels = std::slice::from_raw_parts(bits.cast::<u32>(), (width * height) as usize);
-        let sum: f64 = pixels
-            .iter()
-            .map(|pixel| {
-                (pixel & 0xff) as f64
-                    + ((pixel >> 8) & 0xff) as f64
-                    + ((pixel >> 16) & 0xff) as f64
-            })
-            .sum();
-        let mean = sum / (pixels.len() as f64 * 3.0);
+        let bytes = std::slice::from_raw_parts(bits.cast::<u8>(), (width * height * 4) as usize);
+        let pixels = bytes.to_vec();
         DeleteObject(bitmap as _);
         DeleteDC(memory);
         ReleaseDC(std::ptr::null_mut(), screen);
-        mean
+        (pixels, width)
     }
+}
+
+/// 相邻像素的水平平均绝对差（只看亮度）：模糊把它压下去，纯压暗只按比例缩小 ——
+/// 这就是"模糊"与"只是变暗"能区分开的原因。
+fn dim_local_contrast(pixels: &[u8], width: u32) -> f64 {
+    let rows = (pixels.len() / 4) as u32 / width.max(1);
+    let mut sum = 0f64;
+    let mut count = 0u64;
+    for y in 0..rows {
+        for x in 1..width {
+            let at = ((y * width + x) * 4) as usize;
+            let before = ((y * width + x - 1) * 4) as usize;
+            let luma = |i: usize| pixels[i] as f64 + pixels[i + 1] as f64 + pixels[i + 2] as f64;
+            sum += (luma(at) - luma(before)).abs();
+            count += 1;
+        }
+    }
+    if count == 0 { 0.0 } else { sum / count as f64 }
+}
+
+/// 棋盘内容（BGRA，不透明）：局部对比度极高，用于证明"模糊确实到了屏幕上"。
+fn dim_test_checkerboard(width: u32, height: u32, cell: u32) -> Vec<u8> {
+    let mut pixels = vec![0u8; (width * height * 4) as usize];
+    for y in 0..height {
+        for x in 0..width {
+            let value: u8 = if ((x / cell) + (y / cell)) % 2 == 0 { 230 } else { 26 };
+            let at = ((y * width + x) * 4) as usize;
+            pixels[at] = value;
+            pixels[at + 1] = value;
+            pixels[at + 2] = value;
+            pixels[at + 3] = 255;
+        }
+    }
+    pixels
+}
+
+/// 把遮罩那一层（`dim_pixel`，premultiplied）叠到内容上 —— 与产品渲染器里的两步画刷等价。
+fn dim_test_wash(pixels: &mut [u8]) {
+    let [b, g, r, a] = super::dim_layer::dim_pixel();
+    let keep = 255u32 - a as u32;
+    for pixel in pixels.chunks_exact_mut(4) {
+        pixel[0] = ((pixel[0] as u32 * keep + 127) / 255) as u8 + b;
+        pixel[1] = ((pixel[1] as u32 * keep + 127) / 255) as u8 + g;
+        pixel[2] = ((pixel[2] as u32 * keep + 127) / 255) as u8 + r;
+        pixel[3] = 255;
+    }
+}
+
+fn dim_test_mean(pixels: &[u8]) -> f64 {
+    let sum: f64 = pixels
+        .chunks_exact(4)
+        .map(|pixel| pixel[0] as f64 + pixel[1] as f64 + pixel[2] as f64)
+        .sum();
+    sum / (pixels.len() / 4).max(1) as f64
+}
+
+/// 测试用的盒式模糊：代替产品那条 D2D 高斯模糊（产品那条由 L4 测试单独证明）。
+fn dim_box_blur(pixels: &[u8], width: u32, height: u32, radius: i32) -> Vec<u8> {
+    let mut out = pixels.to_vec();
+    let radius = radius.max(1);
+    let (width_i, height_i) = (width as i32, height as i32);
+    for y in 0..height_i {
+        for x in 0..width_i {
+            let mut acc = [0u32; 3];
+            let mut n = 0u32;
+            for dy in -radius..=radius {
+                let sy = y + dy;
+                if !(0..height_i).contains(&sy) {
+                    continue;
+                }
+                for dx in -radius..=radius {
+                    let sx = x + dx;
+                    if !(0..width_i).contains(&sx) {
+                        continue;
+                    }
+                    let at = ((sy as u32 * width + sx as u32) * 4) as usize;
+                    acc[0] += pixels[at] as u32;
+                    acc[1] += pixels[at + 1] as u32;
+                    acc[2] += pixels[at + 2] as u32;
+                    n += 1;
+                }
+            }
+            let at = ((y as u32 * width + x as u32) * 4) as usize;
+            out[at] = (acc[0] / n.max(1)) as u8;
+            out[at + 1] = (acc[1] / n.max(1)) as u8;
+            out[at + 2] = (acc[2] / n.max(1)) as u8;
+            out[at + 3] = 255;
+        }
+    }
+    out
+}
+
+fn dim_test_screen_mean(rect: Rect) -> f64 {
+    let (pixels, _) = dim_test_screen_bgra(rect);
+    let sum: f64 = pixels
+        .chunks_exact(4)
+        .map(|pixel| pixel[0] as f64 + pixel[1] as f64 + pixel[2] as f64)
+        .sum();
+    sum / (pixels.len() / 4).max(1) as f64
 }
 
 fn dim_test_pump(ms: u64) {
@@ -1063,37 +1156,106 @@ fn the_countdown_dim_layer_actually_darkens_outside_the_selection() {
     use windows_sys::Win32::Graphics::Gdi::{GetWindowRgn, PtInRegion};
 
     dim_test_be_dpi_aware();
-    // 一块固定的测试区域：整块窗口 600×400，洞 400×200 居中。
+    // 整块窗口 600×400，洞 400×200 居中；探针在环里与洞里各一个。
     let monitor = Rect::new(160, 160, 760, 560);
     let selection = Rect::new(260, 260, 660, 460);
-    // 两个探针：环里（选区外）与洞里（选区内）。
     let outside = Rect::new(180, 180, 220, 220);
     let inside = Rect::new(440, 340, 480, 380);
+    let (width, height) = (monitor.width() as u32, monitor.height() as u32);
 
     let baseline_outside = dim_test_screen_mean(outside);
     let baseline_inside = dim_test_screen_mean(inside);
 
+    // 内容：棋盘（对比度极高）→ 模糊 → 压暗。三样都是确定量，观感不依赖桌面内容。
+    let mut sharp = dim_test_checkerboard(width, height, 8);
+    dim_test_wash(&mut sharp);
+    let mut blurred = dim_box_blur(&sharp, width, height, 8);
+    dim_test_wash(&mut blurred);
+    let sharp_mean = dim_test_mean(&sharp);
+    let sharp_contrast = dim_local_contrast(&sharp, width);
+    let blur_mean = dim_test_mean(&blurred);
+    let blur_contrast = dim_local_contrast(&blurred, width);
+    eprintln!(
+        "[dim-live] content: sharp mean={sharp_mean:.1} contrast={sharp_contrast:.1}; blurred mean={blur_mean:.1} contrast={blur_contrast:.1}"
+    );
+    let blurred_content = super::super::win::d2d::DimSource {
+        width,
+        height,
+        pixels: blurred.clone(),
+    };
+    let sharp_content = super::super::win::d2d::DimSource {
+        width,
+        height,
+        pixels: sharp.clone(),
+    };
+
     let mut layer = super::dim_layer::DimLayer::default();
-    layer.show(monitor, selection).expect("遮罩层应当显示");
+    layer
+        .show(monitor, selection, Some(&blurred_content))
+        .expect("遮罩层应当显示");
     // 临时摘掉"排除出截图"，否则截图看不见它（这正是上一轮观测失效的一半原因）。
     layer.set_capture_exclusion(false);
     dim_test_pump(260);
 
     let shown_outside = dim_test_screen_mean(outside);
     let shown_inside = dim_test_screen_mean(inside);
-    assert!(
-        shown_outside <= baseline_outside - 25.0,
-        "选区外必须明显变暗：{baseline_outside:.1} -> {shown_outside:.1}"
+    let (blur_pixels, blur_width) = dim_test_screen_bgra(outside);
+    let shown_blur_contrast = dim_local_contrast(&blur_pixels, blur_width);
+    eprintln!(
+        "[dim-live] blurred content on screen: mean {baseline_outside:.1} -> {shown_outside:.1} (content {blur_mean:.1}); contrast {shown_blur_contrast:.1} (content {blur_contrast:.1})"
     );
+
+    // 1) 交接确实发生：屏幕上是"我们给的内容"，不是原来的桌面（棋盘内容压暗后与桌面差很远）。
+    assert!(
+        (shown_outside - blur_mean).abs() <= 12.0,
+        "屏幕上应当是遮罩层给的内容：content={blur_mean:.1} screen={shown_outside:.1}"
+    );
+    // 2) 压暗：内容本身就比未压暗的棋盘暗得多。
+    assert!(
+        blur_mean < dim_test_mean(&dim_test_checkerboard(width, height, 8)) - 100.0,
+        "遮罩内容必须明显压暗"
+    );
+    // 3) 洞里（选区内）仍然是实时画面：不能被压暗，也不该出现棋盘。
     assert!(
         (shown_inside - baseline_inside).abs() <= 6.0,
         "洞里（选区内）不能被压暗：{baseline_inside:.1} -> {shown_inside:.1}"
     );
 
-    // 区域形状：环在内、洞不在内。
-    //
-    // `PtInRegion` 与区域一样用**客户区**坐标 —— 探针点是屏幕坐标，必须先减去窗口原点
-    // （上一版产品代码就是在这一步传错坐标系，整窗被裁空）。
+    // 4) 模糊真的到了屏幕上：换成"未模糊"的同一份内容，对比度必须大幅跳起来。
+    layer
+        .show(monitor, selection, Some(&sharp_content))
+        .expect("遮罩层应当显示");
+    layer.set_capture_exclusion(false);
+    dim_test_pump(260);
+    let (sharp_pixels, sharp_width) = dim_test_screen_bgra(outside);
+    let shown_sharp_contrast = dim_local_contrast(&sharp_pixels, sharp_width);
+    eprintln!(
+        "[dim-live] sharp content on screen: contrast {shown_sharp_contrast:.1} vs blurred {shown_blur_contrast:.1}"
+    );
+    assert!(
+        shown_sharp_contrast > shown_blur_contrast * 8.0,
+        "屏幕上必须能看出模糊：sharp={shown_sharp_contrast:.1} blurred={shown_blur_contrast:.1}"
+    );
+
+    // 5) 尺寸对不上（例如显示器刚换过）时退回纯色，而不是画出一块透明：
+    let small_content = super::super::win::d2d::DimSource {
+        width: width / 4,
+        height: height / 4,
+        pixels: dim_test_checkerboard(width / 4, height / 4, 2),
+    };
+    layer
+        .show(monitor, selection, Some(&small_content))
+        .expect("遮罩层应当显示");
+    layer.set_capture_exclusion(false);
+    dim_test_pump(260);
+    let fallback_outside = dim_test_screen_mean(outside);
+    eprintln!("[dim-live] 尺寸不匹配的兜底：mean {baseline_outside:.1} -> {fallback_outside:.1}");
+    assert!(
+        fallback_outside <= baseline_outside - 25.0,
+        "尺寸不匹配时应当退回纯色（仍然压暗）：{baseline_outside:.1} -> {fallback_outside:.1}"
+    );
+
+    // 6) 区域形状：环在内、洞不在内（客户区坐标 —— 上一版就是在这里传错坐标系）。
     let hwnd = layer.hwnd_for_test();
     let rgn = unsafe { windows_sys::Win32::Graphics::Gdi::CreateRectRgn(0, 0, 0, 0) };
     let copied = unsafe { GetWindowRgn(hwnd, rgn) };
@@ -1107,7 +1269,10 @@ fn the_countdown_dim_layer_actually_darkens_outside_the_selection() {
     assert!(outside_in_region, "环应当留在区域里");
     assert!(!inside_in_region, "洞必须是空的（客户区坐标）");
 
-    // 恢复排除：遮罩必须从截图里消失（延时贴图因此不会带上它）。
+    // 7) 排除出截图：延时贴图不会把遮罩带上。
+    layer
+        .show(monitor, selection, Some(&blurred_content))
+        .expect("遮罩层应当显示");
     layer.set_capture_exclusion(true);
     dim_test_pump(200);
     let excluded_outside = dim_test_screen_mean(outside);
@@ -1116,7 +1281,7 @@ fn the_countdown_dim_layer_actually_darkens_outside_the_selection() {
         "排除出截图后，截图里应当看不到遮罩：{baseline_outside:.1} -> {excluded_outside:.1}"
     );
 
-    // 隐藏后回到基线（用非排除状态观测，证明隐藏真的生效）。
+    // 8) 隐藏后回到基线。
     layer.set_capture_exclusion(false);
     layer.hide();
     dim_test_pump(200);

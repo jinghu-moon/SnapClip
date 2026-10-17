@@ -13,17 +13,20 @@
 //! * `WDA_EXCLUDEFROMCAPTURE` 会让它从**任何截图**里消失（延时贴图因此不会把遮罩截进去），
 //!   所以验证"它真的显示了"时不能靠截图，除非临时把这一位摘掉。
 //!
-//! 颜色不另立一套：遮罩在同一条调用链上叠加了两层（`MASK_RGB` 在 `MASK_ALPHA`，再一层
-//! 主题色在 `MASK_TINT_ALPHA`），这里把它们合成**单层**等价值，像素仍是 premultiplied，
-//! 交给 `UpdateLayeredWindow(ULW_ALPHA)`。
+//! 内容：优先用渲染器给的**「冻帧 + 模糊 + 压暗」**一帧（`d2d::DimSource`，与正常截图态的
+//! `mask_blur` 观感一致）；拿不到时退回**单层纯色**（把遮罩那两层合成等价值），绝不阻断倒计时。
+//! 纯色那条的合成：`MASK_RGB` 在 `MASK_ALPHA`，再一层主题色在 `MASK_TINT_ALPHA`；像素同样是
+//! premultiplied，交给 `UpdateLayeredWindow(ULW_ALPHA)`。内容与窗口**同尺寸**时逐行精确拷贝；
+//! 尺寸对不上就退回纯色 —— 不做 GDI 缩放：`StretchBlt(SRCCOPY)` 会把 32bpp `BI_RGB` DIB 的
+//! alpha 清零、`AlphaBlend` 在这种 DIB 上静默失败，两者都会让整块窗口变透明（docs/23 §14.55.9.11）。
 
 use std::ffi::c_void;
 
 use windows_sys::Win32::Foundation::{GetLastError, HWND, POINT, SIZE};
 use windows_sys::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC, SelectObject,
-    SetWindowRgn, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
-    DIB_RGB_COLORS, HBITMAP, HDC,
+    SetWindowRgn, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+    BLENDFUNCTION, DIB_RGB_COLORS, HBITMAP, HDC,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -37,6 +40,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use crate::geometry::Rect;
 use crate::ring_contrast::{ACCENT_RGB, MASK_ALPHA, MASK_RGB, MASK_TINT_ALPHA};
+use crate::windows::win::d2d::DimSource;
 use crate::windows::win::window::{region_from_pieces, WindowRegion};
 
 /// 窗口类名。只在第一次显示时注册。
@@ -90,6 +94,8 @@ pub(super) struct DimLayer {
     bits: *mut u32,
     width: i32,
     height: i32,
+    /// 当前内容是否来自模糊渲染（诊断用：`true` = 模糊帧，`false` = 纯色兜底）。
+    content_is_blur: bool,
 }
 
 // 窗口与 GDI 对象都由本结构独占持有，且只在浮层线程上使用。
@@ -97,7 +103,12 @@ unsafe impl Send for DimLayer {}
 
 impl DimLayer {
     /// 显示（或更新）遮罩：铺满 `monitor`，选区不出现在区域里。
-    pub(super) fn show(&mut self, monitor: Rect, selection: Rect) -> Result<(), String> {
+    pub(super) fn show(
+        &mut self,
+        monitor: Rect,
+        selection: Rect,
+        content: Option<&DimSource>,
+    ) -> Result<(), String> {
         if monitor.width() <= 0 || monitor.height() <= 0 {
             return Err(format!(
                 "遮罩层尺寸非法 {}x{}",
@@ -106,7 +117,7 @@ impl DimLayer {
             ));
         }
         self.ensure_window(monitor)?;
-        self.fill();
+        self.paint(content);
         self.submit(Some((monitor.left, monitor.top)))?;
         self.apply_shape(monitor, selection)?;
         self.exclude_from_capture();
@@ -176,9 +187,11 @@ impl DimLayer {
             let pixel = unsafe { *self.bits };
             pixel.to_le_bytes()
         };
+        let content = if self.content_is_blur { "blur" } else { "flat" };
         format!(
-            "hwnd={:?} is_window={} visible={} rect=({},{},{},{}) dib=({}, {}) first_px={:?} affinity=0x{:x}(ok={}) style_complete={}",
+            "hwnd={:?} content={} is_window={} visible={} rect=({},{},{},{}) dib=({}, {}) first_px={:?} affinity=0x{:x}(ok={}) style_complete={}",
             self.hwnd,
+            content,
             unsafe { IsWindow(self.hwnd) } != 0,
             unsafe { IsWindowVisible(self.hwnd) } != 0,
             rect.left,
@@ -288,6 +301,42 @@ impl DimLayer {
         Ok(())
     }
 
+    /// 铺内容：同尺寸精确拷贝；没内容或尺寸对不上就退回纯色。
+    fn paint(&mut self, content: Option<&DimSource>) {
+        match content {
+            Some(source)
+                if source.width as i32 == self.width && source.height as i32 == self.height =>
+            {
+                self.copy_source(source);
+                self.content_is_blur = true;
+            }
+            Some(_) | None => {
+                // 尺寸对不上（例如显示器刚换过）就退回纯色：宁可少一层模糊，
+                // 也不要用 GDI 缩放把 alpha 弄丢（见模块文档）。
+                self.fill();
+                self.content_is_blur = false;
+            }
+        }
+    }
+
+    /// 内容与窗口同分辨率：逐行搬进 DIB（BGRA 逐字节一致，premultiplied 原样保留）。
+    fn copy_source(&mut self, source: &DimSource) {
+        if self.bits.is_null() {
+            return;
+        }
+        let row_bytes = (self.width as usize).saturating_mul(4);
+        let target = self.bits.cast::<u8>();
+        for row in 0..self.height as usize {
+            let from = row.saturating_mul(row_bytes);
+            let Some(slice) = source.pixels.get(from..from + row_bytes) else {
+                return;
+            };
+            unsafe {
+                std::ptr::copy_nonoverlapping(slice.as_ptr(), target.add(from), row_bytes)
+            };
+        }
+    }
+
     fn fill(&mut self) {
         if self.bits.is_null() {
             return;
@@ -387,6 +436,7 @@ impl Drop for DimLayer {
         self.hwnd = std::ptr::null_mut();
         self.bitmap = std::ptr::null_mut();
         self.memory_dc = std::ptr::null_mut();
+        self.content_is_blur = false;
     }
 }
 

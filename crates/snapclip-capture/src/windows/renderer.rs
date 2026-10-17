@@ -257,6 +257,15 @@ impl Win32Renderer {
         self.d2d.prepare_panel_icons()
     }
 
+    /// 倒计时遮罩层的内容（模糊 + 压暗，已读回 CPU）。见
+    /// [`crate::windows::win::d2d::OverlayRenderer::countdown_dim_source`]。
+    pub(crate) fn countdown_dim_source(
+        &mut self,
+        divisor: u32,
+    ) -> Result<crate::windows::win::d2d::DimSource, String> {
+        self.d2d.countdown_dim_source(divisor)
+    }
+
     pub fn render(
         &mut self,
         state: &OverlayFrameState,

@@ -2726,6 +2726,115 @@ fn the_countdown_number_paints_inside_the_selection() {
     }
 }
 
+/// 棋盘：高频细节，模糊会把它抹平，是"模糊存在"最直接的试验物。
+fn checkerboard_bgra(width: u32, height: u32, cell: u32) -> Vec<u8> {
+    let mut pixels = vec![0u8; (width * height * 4) as usize];
+    for y in 0..height {
+        for x in 0..width {
+            let light = ((x / cell) + (y / cell)) % 2 == 0;
+            let value = if light { 230 } else { 30 };
+            let at = ((y * width + x) * 4) as usize;
+            pixels[at] = value;
+            pixels[at + 1] = value;
+            pixels[at + 2] = value;
+            pixels[at + 3] = 255;
+        }
+    }
+    pixels
+}
+
+/// 相邻像素的水平平均绝对差（只看亮度）：模糊把这个数压下去，纯压暗只按比例缩小。
+fn horizontal_contrast(pixels: &[u8], width: u32) -> f64 {
+    let mut sum = 0f64;
+    let mut count = 0u64;
+    let rows = (pixels.len() / 4) as u32 / width.max(1);
+    for y in 0..rows {
+        for x in 1..width {
+            let at = ((y * width + x) * 4) as usize;
+            let before = ((y * width + x - 1) * 4) as usize;
+            let luma = |i: usize| pixels[i] as f64 + pixels[i + 1] as f64 + pixels[i + 2] as f64;
+            sum += (luma(at) - luma(before)).abs();
+            count += 1;
+        }
+    }
+    if count == 0 { 0.0 } else { sum / count as f64 }
+}
+
+fn mean_luma(pixels: &[u8]) -> f64 {
+    let mut sum = 0f64;
+    for chunk in pixels.chunks_exact(4) {
+        sum += chunk[0] as f64 + chunk[1] as f64 + chunk[2] as f64;
+    }
+    sum / (pixels.len() / 4).max(1) as f64
+}
+
+/// 倒计时遮罩层的内容必须是「冻帧 + 模糊 + 压暗」——不是"只是一层暗色"。
+///
+/// 判据是**局部对比度**：棋盘帧的水平相邻差很大，模糊后必须掉一个数量级以上；
+/// 而纯压暗只会把它按比例缩小（约一半），掉不了一个数量级 —— 所以这个阈值能区分
+/// "模糊"与"只是变暗"。
+#[test]
+#[ignore = "needs a real GPU (docs/31 D-14)"]
+fn the_countdown_dim_source_blurs_the_frame_under_the_mask() {
+    let device =
+        super::GraphicsDevice::create().expect("this test needs a D3D11 device (docs/31 D-14)");
+    let (width, height) = (640u32, 480u32);
+    let frame = checkerboard_bgra(width, height, 8);
+    let mut renderer = OverlayRenderer::new(std::sync::Arc::new(device), 96)
+        .expect("this test needs a Direct2D overlay renderer (docs/31 D-14)");
+    renderer.update_frame(width, height, &frame).unwrap();
+    renderer.ensure_back_buffer(width, height).unwrap();
+
+    let full = renderer.countdown_dim_source(1).expect("遮罩内容");
+    assert_eq!((full.width, full.height), (width, height));
+
+    let sharp = horizontal_contrast(&frame, width);
+    let blurred = horizontal_contrast(&full.pixels, width);
+    let sharp_luma = mean_luma(&frame);
+    let blurred_luma = mean_luma(&full.pixels);
+    eprintln!(
+        "[dim] contrast sharp={sharp:.1} blurred={blurred:.1}; luma sharp={sharp_luma:.1} dim={blurred_luma:.1}"
+    );
+
+    // 模糊：局部对比度掉一个数量级以上（纯压暗只能掉一半）。
+    assert!(
+        blurred * 10.0 < sharp,
+        "遮罩内容不够模糊：sharp={sharp:.1} blurred={blurred:.1}"
+    );
+    // 压暗：亮度必须显著低于原帧（遮罩是黑色的）。
+    assert!(
+        blurred_luma < sharp_luma * 0.8,
+        "遮罩内容不够暗：sharp={sharp_luma:.1} dim={blurred_luma:.1}"
+    );
+}
+
+/// 这条路径的实测耗时（measurement，不是断言）：4K 屏上决定用哪个 `DIM_DIVISOR`。
+#[test]
+#[ignore = "measurement, not an assertion"]
+fn the_cost_of_the_countdown_dim_source() {
+    let device =
+        super::GraphicsDevice::create().expect("this test needs a D3D11 device (docs/31 D-14)");
+    let (width, height) = (3840u32, 2160u32);
+    let frame = checkerboard_bgra(width, height, 16);
+    let mut renderer = OverlayRenderer::new(std::sync::Arc::new(device), 144)
+        .expect("this test needs a Direct2D overlay renderer (docs/31 D-14)");
+    renderer.update_frame(width, height, &frame).unwrap();
+    renderer.ensure_back_buffer(width, height).unwrap();
+    // 第一次会顺带生成模糊帧，单独计时，别混进"每次显示"的成本里。
+    let started = std::time::Instant::now();
+    let _ = renderer.countdown_dim_source(1).expect("warm up");
+    eprintln!("[dim] warm-up (blur built) {:?}", started.elapsed());
+    for divisor in [1u32, 2, 4, 8] {
+        let started = std::time::Instant::now();
+        let source = renderer.countdown_dim_source(divisor).expect("遮罩内容");
+        let took = started.elapsed();
+        eprintln!(
+            "[dim] divisor={divisor} {}x{} took {:?}",
+            source.width, source.height, took
+        );
+    }
+}
+
 /// 一帧带倒计时的浮层，把像素读回来。
 fn render_countdown_frame() -> (Vec<u8>, u32, Rect) {
     let device =

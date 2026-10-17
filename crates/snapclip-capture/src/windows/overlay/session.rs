@@ -145,6 +145,14 @@ impl OverlayController {
         };
     }
 
+    /// 倒计时遮罩层的内容分辨率除数：**1**（全分辨率）。
+    ///
+    /// 实测（3840×2160、真 GPU）：8.8 ms 渲染 + 读回，1/2 是 2.9 ms、1/4 是 1.2 ms ——
+    /// 但低分辨率内容要靠 GDI 放大，而 `StretchBlt` 会把 32bpp DIB 的 alpha 清零、
+    /// `AlphaBlend` 会静默失败，两者都让整块窗口变透明。既然全分辨率远低于 50 ms 门限，
+    /// 就不为省那几毫秒去换一个会丢 alpha 的放大步骤（docs/23 §14.55.9.11）。
+    const DIM_DIVISOR: u32 = 1;
+
     /// 显示（或重设）倒计时遮罩层：铺满显示器、选区开洞。
     ///
     /// **不改变 Z 序** —— 提层是 [`EnterStep::RaiseOverlay`]，顺序由数据钉住（docs/23 §14.55.9.9）。
@@ -153,9 +161,27 @@ impl OverlayController {
             return;
         };
         let selection = self.session.selection();
-        match self.dim_layer.show(monitor, selection) {
+        // 内容优先用「冻帧 + 模糊 + 压暗」那一帧：只给纯色会比正常截图态少一层模糊
+        // （docs/23 §14.55.9.11）。渲染与读回都在帧之外做，按 1/DIM_DIVISOR 分辨率降级；
+        // 拿不到就退回纯色 —— 少一层模糊也比阻断倒计时强。
+        let started = Instant::now();
+        let content = self
+            .renderer
+            .as_mut()
+            .and_then(|renderer| match renderer.countdown_dim_source(Self::DIM_DIVISOR) {
+                Ok(source) => Some(source),
+                Err(error) => {
+                    eprintln!("[snapclip][capture] countdown dim source: {error}");
+                    None
+                }
+            });
+        let source_ms = started.elapsed();
+        let started = Instant::now();
+        match self.dim_layer.show(monitor, selection, content.as_ref()) {
             Ok(()) => eprintln!(
-                "[snapclip][capture] countdown dim shown: {}",
+                "[snapclip][capture] countdown dim shown: source_ms={} paint_ms={} {}",
+                source_ms.as_millis(),
+                started.elapsed().as_millis(),
                 self.dim_layer.diagnose()
             ),
             Err(error) => eprintln!("[snapclip][capture] countdown dim layer: {error}"),
