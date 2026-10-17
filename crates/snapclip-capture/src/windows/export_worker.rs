@@ -396,6 +396,7 @@ mod tests {
     /// flat buffer is enough to exercise the mailbox and the executor hand-off.
     fn test_selection_pixels() -> SelectionPixels {
         SelectionPixels {
+            corner_radius: 0,
             frame: CapturedFrame {
                 width: 8,
                 height: 8,

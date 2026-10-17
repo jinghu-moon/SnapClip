@@ -55,6 +55,12 @@ pub struct SelectionPixels {
     /// discarded every selection made on the primary monitor — the monitor at the origin
     /// is the common case, so the sentinel broke the common case.
     pub origin: Option<Point>,
+    /// 成图四角的圆角半径（`region` 自己的物理像素，0 = 直角）。
+    ///
+    /// 面板里的圆角是**成图的属性**，必须跟着这块像素一起走：写盘的人用它遮罩，
+    /// 贴图的人用它把自己的合成结果（图像 + 边框）遮罩。两者都用同一份覆盖率算法
+    /// （`round_corners`），不存在第二套观感。
+    pub corner_radius: i32,
 }
 
 impl SelectionPixels {
@@ -102,6 +108,8 @@ impl CaptureService {
         }
         Ok(SelectionPixels {
             origin: frame.origin,
+            // 面板的圆角由发布路径（overlay::session）填，这里作为产线默认。
+            corner_radius: 0,
             frame: frame.clone(),
             region: clipped,
             bgra,
@@ -112,6 +120,67 @@ impl CaptureService {
 impl Default for CaptureService {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The most a corner may round: the panel caps it, and this caps it again so a caller that
+/// hands over a stale value cannot punch a hole through a narrow selection.
+pub const MAX_CORNER_RADIUS_PX: u32 = 128;
+
+/// Round the four corners of a tightly packed BGRA image, leaving the corners transparent.
+///
+/// Straight alpha: the colour channels are untouched and only the alpha falls off, because
+/// the pixels leave here as BGRA bytes (PNG and the clipboard both read them that way). A
+/// radius of zero returns before touching a byte, so the no-rounding path is byte-identical
+/// to the readback.
+///
+/// Coverage comes from 4x4 supersampling inside the radius square: the aliasing of a mask
+/// this small is exactly what would make a rounded window corner look like a staircase.
+pub fn round_corners(bgra: &mut [u8], width: u32, height: u32, radius: u32) {
+    let radius = radius.min(MAX_CORNER_RADIUS_PX).min(width.min(height) / 2);
+    if radius == 0 || width == 0 || height == 0 {
+        return;
+    }
+    let r = radius as f32;
+    let samples = 4u32;
+    let mut coverage = vec![255u8; (radius * radius) as usize];
+    for y in 0..radius {
+        for x in 0..radius {
+            let mut inside = 0u32;
+            for sy in 0..samples {
+                for sx in 0..samples {
+                    // Sub-pixel centre, measured from the corner's outer edge.
+                    let px = x as f32 + (sx as f32 + 0.5) / samples as f32;
+                    let py = y as f32 + (sy as f32 + 0.5) / samples as f32;
+                    // Distance from the corner circle's centre (r, r): inside the round
+                    // means inside the quarter disc, not merely inside the corner block.
+                    let dx = r - px;
+                    let dy = r - py;
+                    if dx * dx + dy * dy <= r * r {
+                        inside += 1;
+                    }
+                }
+            }
+            coverage[(y * radius + x) as usize] =
+                ((inside * 255) / (samples * samples)) as u8;
+        }
+    }
+    let mut apply = |x: u32, y: u32, cov: u8| {
+        if cov == 255 {
+            return;
+        }
+        let index = ((y * width + x) * 4 + 3) as usize;
+        let alpha = u16::from(bgra[index]) * u16::from(cov) / 255;
+        bgra[index] = alpha as u8;
+    };
+    for y in 0..radius {
+        for x in 0..radius {
+            let cov = coverage[(y * radius + x) as usize];
+            apply(x, y, cov);
+            apply(width - 1 - x, y, cov);
+            apply(x, height - 1 - y, cov);
+            apply(width - 1 - x, height - 1 - y, cov);
+        }
     }
 }
 
@@ -265,4 +334,41 @@ mod tests {
         let clipped = validate(&frame(100, 50), Rect::new(-10, -10, 10, 10)).unwrap();
         assert_eq!(clipped, Rect::new(0, 0, 10, 10));
     }
+    #[test]
+    fn rounding_a_corner_only_touches_the_corner() {
+        use super::round_corners;
+        let (w, h) = (20u32, 20u32);
+        let mut pixels = vec![7u8; (w * h * 4) as usize];
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel[3] = 255;
+        }
+        let before = pixels.clone();
+        round_corners(&mut pixels, w, h, 0);
+        assert_eq!(pixels, before, "半径 0 必须逐字节不变");
+
+        round_corners(&mut pixels, w, h, 6);
+        assert_eq!(pixels[3], 0, "左上角整像素落在圆外 ⇒ 全透明");
+        let centre = (((h / 2) * w + w / 2) * 4 + 3) as usize;
+        assert_eq!(pixels[centre], 255, "中心不透明");
+        // 圆弧穿过的那一格（角内 (1, 2)）应有中间 alpha —— 抗锯齿的证据。
+        let edge = ((2 * w + 1) * 4 + 3) as usize;
+        assert!(
+            pixels[edge] > 0 && pixels[edge] < 255,
+            "圆的边界应有部分覆盖，实测 {}",
+            pixels[edge]
+        );
+        // 颜色通道不动（直通 alpha）。
+        assert_eq!(pixels[0], 7);
+    }
+
+    #[test]
+    fn a_radius_wider_than_half_the_short_side_is_clamped() {
+        use super::{MAX_CORNER_RADIUS_PX, round_corners};
+        let (w, h) = (8u32, 40u32);
+        let mut pixels = vec![255u8; (w * h * 4) as usize];
+        round_corners(&mut pixels, w, h, MAX_CORNER_RADIUS_PX);
+        let centre = (((h / 2) * w + w / 2) * 4 + 3) as usize;
+        assert_eq!(pixels[centre], 255, "夹到短边一半后中心仍在圆内");
+    }
+
 }

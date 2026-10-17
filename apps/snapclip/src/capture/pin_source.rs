@@ -92,6 +92,7 @@ impl PinHome for PinSource {
         Some(PinSelection {
             region,
             pixels: Arc::new(selection.bgra.clone()),
+            radius: selection.corner_radius,
         })
     }
 }
@@ -121,6 +122,7 @@ mod tests {
 
     fn prepared(origin: Option<Point>, region: Rect) -> SelectionPixels {
         SelectionPixels {
+            corner_radius: 0,
             frame: frame(200, 100),
             region,
             bgra: vec![7; region.width() as usize * region.height() as usize * 4],

@@ -57,6 +57,11 @@ pub struct PinSelection {
     /// 就不知道该把窗口放哪儿。
     pub region: Rect,
     pub pixels: Arc<Vec<u8>>,
+    /// 成图四角的圆角半径（`region` 自己的物理像素，0 = 直角）。
+    ///
+    /// 半径必须跟着这块像素走，而不是从"当前偏好"再读一次：贴图是一张**已经拍摄的图**，
+    /// 它的形状在拍摄那一刻就定了，之后用户在面板里改圆角不该改变已经贴出去的那张。
+    pub radius: i32,
 }
 
 impl PinSelection {

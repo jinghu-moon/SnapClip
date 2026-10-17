@@ -156,6 +156,8 @@ struct WindowSeed {
     /// 它，窗口的存活期严格短于宿主线程，所以这个指针在窗口的整个生命周期内
     /// 都有效。
     host: *mut HostState,
+    /// 成图四角的圆角半径（原图像素）。
+    radius: i32,
 }
 
 /// 一次贴图请求：一块**已经准备好**的像素，以及它要落在屏幕上的位置。
@@ -170,6 +172,9 @@ pub struct PinRequest {
     pub image: ImageSource,
     /// 上屏位置（屏幕坐标），指的是**含边框**的窗口左上角。
     pub position: (i32, i32),
+    /// 成图四角的圆角半径（原图的物理像素，0 = 直角）。窗口会把它按当前缩放放大后
+    /// 应用在整个合成结果上（图像 + 边框），所以贴图的圆角与保存出的图是同一个形状。
+    pub radius: i32,
 }
 
 /// 宿主线程发回来的事。
@@ -503,6 +508,8 @@ struct PinWindowState {
     image: Arc<Vec<u32>>,
     image_width: u32,
     image_height: u32,
+    /// 成图四角的圆角半径（原图像素）。窗口把它按当前缩放放大后应用在整个合成结果上。
+    radius: i32,
     /// 当前缩放倍数，钳在 `[ZOOM_MIN, ZOOM_MAX]`。
     ///
     /// 存的是它，不是"当前像素尺寸"：窗口尺寸由它和一个纯函数[算出来](scaled_dimension)，
@@ -659,7 +666,7 @@ fn run_host(
             match command {
                 HostCommand::Create(request) => {
                     let id = request.id;
-                    if let Err(err) = create_pin_window(&mut state, id, request.image, request.position)
+                    if let Err(err) = create_pin_window(&mut state, id, request.image, request.position, request.radius)
                     {
                         eprintln!("[snapclip-app][pin] 创建贴图窗口失败：{err:#}");
                         // 创建失败单独记账：它是"没能创建"，不是"创建后被关闭"
@@ -804,7 +811,7 @@ fn pin_home_selection(state: &mut HostState, id: u64, selection: PinSelection) -
     let image = ImageSource::from_bgra_bytes(selection.bytes(), width, height)?;
     let convert_us = now_us().saturating_sub(started);
     let started = now_us();
-    create_pin_window(state, id, image, (region.left, region.top))?;
+    create_pin_window(state, id, image, (region.left, region.top), selection.radius)?;
     let window_us = now_us().saturating_sub(started);
     // 拆开是为了定位瓶颈：`convert` 是字节→`u32` 的重解释与分配，`window` 是
     // DIB 建立、绘制、`UpdateLayeredWindow` 提交、`ShowWindow`。
@@ -822,6 +829,7 @@ fn create_pin_window(
     id: u64,
     image: ImageSource,
     position: (i32, i32),
+    radius: i32,
 ) -> Result<()> {
     // 这里的 DPI 只是一个**临时**值，用来给 `CreateWindowExW` 一个不至于为 0 的尺寸：
     // 窗口还不存在，问不到它落在哪块显示器上。真正的尺寸在 `WM_NCCREATE` 里按
@@ -838,6 +846,7 @@ fn create_pin_window(
         image,
         position,
         host: state as *mut HostState,
+        radius,
     };
 
     let hwnd = unsafe {
@@ -1298,7 +1307,7 @@ unsafe fn attach_window(hwnd: HWND, seed: &mut WindowSeed) -> Result<()> {
         dpi,
     );
     framebuffer
-        .submit(hwnd, Some(seed.position))
+        .submit(hwnd, Some(seed.position), scaled_radius(seed.radius, 1.0))
         .context("首次提交贴图内容失败")?;
 
     // 原图像素在**第一次提交之后**才取所有权：`seed.image` 是 `ImageSource`（拥有
@@ -1313,6 +1322,7 @@ unsafe fn attach_window(hwnd: HWND, seed: &mut WindowSeed) -> Result<()> {
             image,
             image_width,
             image_height,
+            radius: seed.radius,
             zoom: 1.0,
             dpi,
             wheel_remainder: 0,
@@ -1446,7 +1456,7 @@ unsafe fn repaint_window(
     );
 
     framebuffer
-        .submit(hwnd, Some(position))
+        .submit(hwnd, Some(position), scaled_radius(window.radius, window.zoom))
         .context("提交重画后的贴图内容失败")?;
     window.position = position;
 
@@ -2759,6 +2769,77 @@ fn blend(one: u32, other: u32, coverage: u32) -> u32 {
     (one * (255 - coverage) + other * coverage + 127) / 255
 }
 
+/// 圆角半径按缩放放大：观感跟着图像走，而不是跟着窗口像素走。
+fn scaled_radius(radius: i32, zoom: f64) -> i32 {
+    if radius <= 0 {
+        return 0;
+    }
+    (f64::from(radius) * zoom).round().max(0.0) as i32
+}
+
+/// 把整窗缓冲的四角按覆盖率遮罩成圆角。
+///
+/// 此刻缓冲里的像素**全都不透明**（图像 + 边框 + 控件），所以"RGB 乘覆盖率、A 设成覆盖率"
+/// 正好就是预乘结果 —— `UpdateLayeredWindow(AC_SRC_ALPHA)` 要的就是这个，不需要再单独预乘
+/// 一遍（直接给非预乘的 alpha，透明边缘会发白）。
+///
+/// 覆盖率用 4×4 超采样算，边缘因此不是阶梯。捕获侧 `artifact::round_corners` 用的是同一套
+/// 算法、同一个观感，只是它遮罩的是原图而不是窗口的合成结果。
+fn mask_rounded_corners(buffer: &mut [u32], size: (i32, i32), radius: i32) {
+    let width = size.0.max(0) as usize;
+    let height = size.1.max(0) as usize;
+    if radius <= 0 || width == 0 || height == 0 || buffer.len() < width * height {
+        return;
+    }
+    let r = (radius as usize).min(width.min(height) / 2);
+    if r == 0 {
+        return;
+    }
+    const SAMPLES: usize = 4;
+    let total = (SAMPLES * SAMPLES) as u32;
+    for y in 0..height {
+        for x in 0..width {
+            let centre = if x < r && y < r {
+                Some((r as f64, r as f64))
+            } else if x >= width - r && y < r {
+                Some(((width - r) as f64, r as f64))
+            } else if x < r && y >= height - r {
+                Some((r as f64, (height - r) as f64))
+            } else if x >= width - r && y >= height - r {
+                Some(((width - r) as f64, (height - r) as f64))
+            } else {
+                None
+            };
+            let Some((cx, cy)) = centre else {
+                continue;
+            };
+            let mut hits = 0u32;
+            for sy in 0..SAMPLES {
+                for sx in 0..SAMPLES {
+                    let px = x as f64 + (sx as f64 + 0.5) / SAMPLES as f64;
+                    let py = y as f64 + (sy as f64 + 0.5) / SAMPLES as f64;
+                    let dx = px - cx;
+                    let dy = py - cy;
+                    if dx * dx + dy * dy <= (r * r) as f64 {
+                        hits += 1;
+                    }
+                }
+            }
+            let coverage = hits * 255 / total;
+            let index = y * width + x;
+            let pixel = buffer[index];
+            if coverage >= 255 || (pixel >> 24) == 0 {
+                continue;
+            }
+            let scale = |channel: u32| -> u32 { (channel * coverage + 127) / 255 };
+            let b = scale(pixel & 0xFF);
+            let g = scale((pixel >> 8) & 0xFF);
+            let red = scale((pixel >> 16) & 0xFF);
+            buffer[index] = (coverage << 24) | (red << 16) | (g << 8) | b;
+        }
+    }
+}
+
 /// 一块交给 `UpdateLayeredWindow` 的整窗位图。
 
 ///
@@ -2859,7 +2940,11 @@ impl LayeredBuffer {
     /// （缩小时是"窗口还大、层已经小了"，露出来的那块不在层里）。
     ///
     /// 拖动路径传 `None`：拖动不改尺寸，逐条消息只挪窗口，不该顺手重建一个 `POINT`。
-    fn submit(&self, hwnd: HWND, position: Option<(i32, i32)>) -> Result<()> {
+    fn submit(&mut self, hwnd: HWND, position: Option<(i32, i32)>, radius: i32) -> Result<()> {
+        // 圆角在**最后一步**应用：此刻缓冲里是完整的一帧合成结果（图像 + 边框 + 控件），
+        // 遮罩因此自然把边框的角也带走。半径按缩放放大过，观感与原图一致。
+        let size = (self.width, self.height);
+        mask_rounded_corners(self.pixels_mut(), size, radius);
         unsafe {
             let size = SIZE {
                 cx: self.width,
@@ -2969,6 +3054,45 @@ fn last_error() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    /// 遮罩把四角变透明、边缘留下中间 alpha、中心一个字节不动。
+    ///
+    /// 这是这条链路能在这里自证的部分：**屏幕**上的那一半（四角真的露出桌面）需要在活桌面
+    /// 上显示一个分层窗口再抓屏，而 app 的测试二进制创建不了那样的探针窗口（`CreateWindowExW`
+    /// 返回空且 `GetLastError` 为 0，查不到原因）；捕获侧已经有能创建它的
+    /// `tests/layered_differential.rs` 探针，那条屏幕级断言应当加在那里 —— 见
+    /// `docs/23 §14.55.18` 的"未验证"。
+    #[test]
+    fn the_rounded_corner_mask_clears_its_corners_and_blends_its_edges() {
+        let size = (64, 40);
+        let radius = 10;
+        let mut buffer = vec![BORDER_COLOR; (size.0 * size.1) as usize];
+        let before = buffer.clone();
+        mask_rounded_corners(&mut buffer, size, radius);
+
+        let at = |x: usize, y: usize| buffer[y * size.0 as usize + x];
+        // 四角：完全透明（预乘 ⇒ 连 RGB 也归零）。
+        assert_eq!(at(0, 0) >> 24, 0, "左上角应当完全透明");
+        assert_eq!(at(size.0 as usize - 1, 0) >> 24, 0, "右上角应当完全透明");
+        assert_eq!(at(0, size.1 as usize - 1) >> 24, 0, "左下角应当完全透明");
+        // 中心：一个字节都不动。
+        assert_eq!(at(size.0 as usize / 2, size.1 as usize / 2), BORDER_COLOR);
+        // 边缘：既有 alpha、又不是 0 也不是 255（抗锯齿而不是硬切）。
+        let edge = (0..radius as usize)
+            .map(|i| at(i, 0))
+            .find(|p| {
+                let a = p >> 24;
+                a > 0 && a < 255
+            });
+        assert!(edge.is_some(), "边缘必须有中间 alpha，否则圆角是硬切的");
+        // 半径 0 时整块缓冲逐字节不变。
+        let mut untouched = before.clone();
+        mask_rounded_corners(&mut untouched, size, 0);
+        assert_eq!(untouched, before, "半径 0 必须什么都不改");
+    }
+
+
 
     /// 账本必须把三件事分开：创建、关闭、没能创建（回归：曾经 created→destroyed 之后
     /// 还会打印"1 张贴图没能创建"，docs/23 §14.55.9.6）。

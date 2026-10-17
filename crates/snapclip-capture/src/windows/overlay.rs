@@ -579,6 +579,12 @@ struct OverlayController {
     /// session's own selection rather than a copy, so what the panel shows and what gets captured
     /// are the same rectangle by construction.
     region_panel: Option<crate::region::RegionPanel>,
+    /// 成图四角的圆角（px）。面板上设一次，之后每次提交读它 —— 面板收起后仍然生效
+    /// （docs/23 §14.55.17）。
+    corner_radius_px: u32,
+    /// 正在拖动图片卡里的圆角滑块。按下即生效，移出轨道也继续按同一段映射改值
+    /// （docs/23 §14.55.19）。
+    radius_drag: bool,
     /// 两处分段器每段的宽度：**唯一来源**，绘制与命中都读它（docs/23 §14.55.6）。
     /// 量宽要设备层，所以面板打开那一刻量一次；初值是"量宽之前的历史尺寸"，界面不会因此走样。
     segment_widths: crate::geometry::SegmentWidths,
@@ -770,6 +776,8 @@ impl OverlayController {
             label_badge: None,
             chrome_swallowed_press: false,
             region_panel: None,
+            corner_radius_px: 0,
+            radius_drag: false,
             segment_widths: crate::geometry::SegmentWidths::fixed(1.0),
             caret_visible: true,
             caret_timer_armed: false,

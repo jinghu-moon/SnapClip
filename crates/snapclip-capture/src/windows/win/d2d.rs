@@ -212,6 +212,14 @@ pub struct RegionPanelView {
     pub readout: String,
     /// 开始按钮是否可用。
     pub can_start: bool,
+    /// 图片卡是否展开（收起时画摘要、不画圆角行）。
+    pub image_open: bool,
+    /// 图片卡卡头右侧的现状摘要（收起时显示）。
+    pub image_summary: String,
+    /// 圆角值块里那个数字。
+    pub radius_text: String,
+    /// 圆角（px）：值块的角标弧度与"0 时用 muted"都看它。
+    pub radius_px: u32,
 }
 
 /// 倒计时遮罩层的内容：一帧"模糊 + 压暗"的像素，已读回 CPU（premultiplied BGRA、自上而下）。
@@ -456,6 +464,12 @@ pub struct OverlayRenderer {
     panel_line_brush: Option<ID2D1SolidColorBrush>,
     panel_accent_brush: Option<ID2D1SolidColorBrush>,
     panel_muted_brush: Option<ID2D1SolidColorBrush>,
+    /// 图片卡专用的三支：底（主色 14%）、边（主色 60%）、标题与箭头（浅主色）。
+    /// 输入区一律中性灰、图片卡一律主色淡染，不靠分隔线区分「截什么」和「出什么」
+    /// （docs/23 §14.55.19）。
+    panel_out_fill_brush: Option<ID2D1SolidColorBrush>,
+    panel_out_line_brush: Option<ID2D1SolidColorBrush>,
+    panel_out_title_brush: Option<ID2D1SolidColorBrush>,
     /// 自定义截图面板的"这一格不能用"：校验失败时描红下划线与标签（docs/23 §14.54）。
     panel_danger_brush: Option<ID2D1SolidColorBrush>,
     /// 面板图形：`assets/icon` 的 PNG（icon-bake 用 resvg 从 SVG 烘出来的），WIC 解码后按状态色
@@ -676,6 +690,9 @@ impl OverlayRenderer {
             panel_line_brush: None,
             panel_accent_brush: None,
             panel_muted_brush: None,
+            panel_out_fill_brush: None,
+            panel_out_line_brush: None,
+            panel_out_title_brush: None,
             panel_danger_brush: None,
             panel_icons: PanelIcons::new(),
             crosshair_brush: None,
@@ -1745,6 +1762,135 @@ impl OverlayRenderer {
         Ok(())
     }
 
+    /// 图片卡（docs/23 §14.55.19）：底部常驻、整行卡头是开关；主色淡染把「出什么」与
+    /// 输入区（中性灰）分开。收起时只画卡头与摘要，展开时多一行圆角滑块。
+    fn draw_image_card(&mut self, panel: &RegionPanelView) -> Result<(), String> {
+        let layout = &panel.layout;
+        let card = layout.image_card;
+        if card.height() <= 0 {
+            return Ok(());
+        }
+        let k = self.metrics.dpi.max(96) as f32 / 96.0;
+        let dip = |value: f32| (value * k).round() as i32;
+        let out_fill = self.require_brush(&self.panel_out_fill_brush, "out fill brush")?;
+        let out_line = self.require_brush(&self.panel_out_line_brush, "out line brush")?;
+        let out_title = self.require_brush(&self.panel_out_title_brush, "out title brush")?;
+        let accent = self.require_brush(&self.panel_accent_brush, "panel accent brush")?;
+        let fill = self.require_brush(&self.panel_fill_brush, "panel fill brush")?;
+        let muted = self.require_brush(&self.panel_muted_brush, "panel muted brush")?;
+        let text = self.require_brush(&self.label_text_brush, "label text brush")?;
+
+        let hovered = matches!(panel.hover, Some(RegionPanelTarget::Slot(PanelSlot::Image)));
+        let focused = panel.focus == Some(PanelSlot::Image);
+        let radius = dip(10.0);
+        self.fill_round(card, radius, &out_fill);
+        if hovered {
+            self.fill_round(card, radius, &fill);
+        }
+        self.stroke_round(card, radius, &out_line, 1.0);
+        if focused {
+            let ring = Rect::new(
+                card.left - dip(2.0),
+                card.top - dip(2.0),
+                card.right + dip(2.0),
+                card.bottom + dip(2.0),
+            );
+            self.stroke_round(ring, radius + dip(2.0), &accent, 2.0);
+        }
+
+        let title = self.info_text_format_mut(false, 10.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, false)?;
+        self.draw_text_in("图片", &title, to_d2d(layout.image_head), &out_title)?;
+
+        // 收起时右侧是现状摘要；展开时摘要隐去（下面的行本来就在显示它）。
+        if !panel.image_open {
+            let format = self.info_text_format_mut(false, 11.0, DWRITE_FONT_WEIGHT_NORMAL, false)?;
+            let width = self.measure_text_width(&panel.image_summary, &format)?.round() as i32;
+            let summary = Rect::new(
+                (layout.image_summary.right - width).max(layout.image_summary.left),
+                layout.image_summary.top,
+                layout.image_summary.right,
+                layout.image_summary.bottom,
+            );
+            self.draw_text_in(&panel.image_summary, &format, to_d2d(summary), &muted)?;
+        }
+
+        // 折叠箭头：收起指向下、展开指向上。
+        let chevron = layout.image_chevron;
+        let (head_dy, tip_dy) = if panel.image_open { (2.0, -2.0) } else { (-2.0, 2.0) };
+        let head = Point::new(chevron.left, chevron.center().y + dip(head_dy));
+        let tip = Point::new(chevron.center().x, chevron.center().y + dip(tip_dy));
+        let tail = Point::new(chevron.right, head.y);
+        self.line(head, tip, &out_title, dip(2.0) as f32);
+        self.line(tip, tail, &out_title, dip(2.0) as f32);
+
+        if !panel.image_open {
+            return Ok(());
+        }
+
+        let label = self.info_text_format_mut(false, 11.0, DWRITE_FONT_WEIGHT_NORMAL, false)?;
+        self.draw_text_in("圆角", &label, to_d2d(layout.radius_label), &muted)?;
+        // 轨道：已选部分主色、其余中性；滑块 14 的白圆。
+        let groove = layout.radius_groove;
+        let groove_radius = (groove.height().max(1) / 2).max(1);
+        self.fill_round(groove, groove_radius, &fill);
+        let filled = Rect::new(
+            groove.left,
+            groove.top,
+            layout
+                .radius_thumb
+                .center()
+                .x
+                .max(groove.left + groove_radius),
+            groove.bottom,
+        );
+        if filled.width() > 0 {
+            self.fill_round(filled, groove_radius, &accent);
+        }
+        let thumb = layout.radius_thumb;
+        let thumb_radius = thumb.width() as f32 / 2.0;
+        let circle = D2D1_ELLIPSE {
+            point: vector2(thumb.center().x as f32, thumb.center().y as f32),
+            radiusX: thumb_radius,
+            radiusY: thumb_radius,
+        };
+        unsafe { self.d2d.FillEllipse(&circle, &text) };
+        let slider_focused = panel.focus == Some(PanelSlot::Radius);
+        let slider_hovered = matches!(panel.hover, Some(RegionPanelTarget::Radius(_)));
+        if slider_focused || slider_hovered {
+            let out = dip(if slider_focused { 2.0 } else { 4.0 }) as f32;
+            let halo = D2D1_ELLIPSE {
+                point: circle.point,
+                radiusX: thumb_radius + out,
+                radiusY: thumb_radius + out,
+            };
+            let ring_brush = if slider_focused { &accent } else { &fill };
+            unsafe { self.d2d.DrawEllipse(&halo, ring_brush, 2.0, None) };
+        }
+
+        // 值块：底 + 跟随弧度的角标 + 数字（0 时 muted）。
+        let value = layout.radius_value;
+        self.fill_round(value, dip(4.0), &fill);
+        let glyph = Rect::from_origin_size(
+            Point::new(value.left + dip(8.0), value.center().y - dip(5.0)),
+            dip(10.0),
+            dip(10.0),
+        );
+        let glyph_radius =
+            crate::region::radius_glyph(panel.radius_px as i32, layout.radius_max);
+        let glyph_brush = if panel.radius_px > 0 { &accent } else { &muted };
+        self.stroke_round(glyph, glyph_radius, glyph_brush, dip(1.5) as f32);
+        let number = Rect::new(
+            glyph.right + dip(4.0),
+            value.top,
+            value.right - dip(2.0),
+            value.bottom,
+        );
+        let format = self.info_text_format_mut(true, 11.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, true)?;
+        let number_brush = if panel.radius_px > 0 { &text } else { &muted };
+        self.draw_text_in(&panel.radius_text, &format, to_d2d(number), number_brush)?;
+        Ok(())
+    }
+
     fn draw_region_panel(&mut self, panel: &RegionPanelView) -> Result<(), String> {
         let layout = &panel.layout;
         let k = self.metrics.dpi.max(96) as f32 / 96.0;
@@ -2074,6 +2220,7 @@ impl OverlayRenderer {
             self.stroke_round(layout.cancel, dip(6.0), &accent, 2.0);
         }
         let button_format = self.info_text_format_mut(false, 12.0, DWRITE_FONT_WEIGHT_NORMAL, true)?;
+        self.draw_image_card(panel)?;
         self.draw_text_in("取消", &button_format, to_d2d(layout.cancel), &text)?;
 
         let start_hover = panel.hover == Some(RegionPanelTarget::Slot(PanelSlot::Start));
@@ -2998,6 +3145,9 @@ impl OverlayRenderer {
         self.panel_line_brush = Some(self.create_brush(&color(1.0, 1.0, 1.0, 0.30))?);
         self.panel_accent_brush = Some(self.create_brush(&accent)?);
         self.panel_muted_brush = Some(self.create_brush(&rgba(232, 236, 242, 0.62))?);
+        self.panel_out_fill_brush = Some(self.create_brush(&color_of(ACCENT_RGB, 0.14))?);
+        self.panel_out_line_brush = Some(self.create_brush(&color_of(ACCENT_RGB, 0.60))?);
+        self.panel_out_title_brush = Some(self.create_brush(&rgba(124, 180, 243, 1.0))?);
         self.panel_danger_brush = Some(self.create_brush(&rgba(255, 123, 123, 1.0))?);
         // The panel's glyphs are *not* prepared here. Decoding and pre-tinting them costs a
         // measurable 1.6 ms, and this runs on the session-start path (F5 → overlay visible), so the
@@ -3131,6 +3281,9 @@ impl OverlayRenderer {
         self.panel_line_brush = None;
         self.panel_accent_brush = None;
         self.panel_muted_brush = None;
+        self.panel_out_fill_brush = None;
+        self.panel_out_line_brush = None;
+        self.panel_out_title_brush = None;
         self.panel_danger_brush = None;
         self.panel_icons.reset();
         self.crosshair_brush = None;

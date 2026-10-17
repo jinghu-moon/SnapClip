@@ -734,6 +734,26 @@ impl OverlayController {
             self.begin_scroll_session();
             return;
         }
+        // `确定` 必须按**当前去向**分派：去向 = 贴图时走贴图链路、不提交导出；
+        // 去向 = 复制时才走导出/复制。以前 `confirm()` 无条件 begin_export()，
+        // 于是"贴图"永远变成"复制"（docs/23 §14.55.20 的 Bug 3，真机日志里没有一行 [pin]）。
+        let destination = self
+            .region_panel
+            .as_ref()
+            .map(|panel| panel.destination())
+            .unwrap_or(Destination::Copy);
+        eprintln!(
+            "[snapclip][capture] confirm session={} destination={:?}",
+            self.session_id(),
+            destination
+        );
+        if confirm_action(destination) == ConfirmAction::Pin {
+            self.publish_selection("panel-confirm-pin");
+            self.sink.on_pin_requested(&self.session_id());
+            self.finish_session();
+            return;
+        }
+
         let started_at = Instant::now();
         let selection = match self.session.begin_export() {
             Ok(ExportOutcome::Produce { selection }) => selection,
@@ -823,6 +843,7 @@ impl OverlayController {
             renderer
                 .render_export(&export_state, None)
                 .map(|bgra| SelectionPixels {
+                    corner_radius: self.corner_radius_px as i32,
                     // The annotated export is still this monitor's frame, so it keeps a real
                     // screen position; no layout means the overlay is gone and the honest
                     // answer is "no position", not "the primary monitor".
@@ -836,7 +857,7 @@ impl OverlayController {
                 .map_err(CaptureError::RenderFailed)
         };
         let readback_ms = started_at.elapsed().as_millis();
-        let prepared = match prepared {
+        let mut prepared = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
                 eprintln!(
@@ -850,6 +871,16 @@ impl OverlayController {
                 return;
             }
         };
+        // Two producers feed this point (the direct frozen-frame readback and the replayed
+        // annotated export), and every consumer forks off the same `prepared` below — the pin
+        // slot and the export worker alike. Rounding here therefore lands on both destinations
+        // once, instead of once per path (docs/23 §14.55.17).
+        crate::artifact::round_corners(
+            &mut prepared.bgra,
+            prepared.region.width() as u32,
+            prepared.region.height() as u32,
+            self.corner_radius_px,
+        );
         let export_width = prepared.region.width();
         let export_height = prepared.region.height();
         // Hand the pixels to whoever pins "the thing I just captured" (`F6`). The gesture that
@@ -1120,6 +1151,39 @@ pub(super) fn delay_outcome(
         (Some(_), false) => DelayOutcome::Refused,
         (Some(Destination::Copy), true) => DelayOutcome::Copy,
         (Some(Destination::Pin), true) => DelayOutcome::Pin,
+    }
+}
+
+/// `确定` 按去向分派到哪里。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ConfirmAction {
+    Export,
+    Pin,
+}
+
+pub(super) fn confirm_action(destination: Destination) -> ConfirmAction {
+    match destination {
+        Destination::Copy => ConfirmAction::Export,
+        Destination::Pin => ConfirmAction::Pin,
+    }
+}
+
+#[cfg(test)]
+mod confirm_action_tests {
+    use super::{ConfirmAction, Destination};
+
+    #[test]
+    fn pin_does_not_export_and_copy_does_not_pin() {
+        assert_eq!(
+            super::confirm_action(Destination::Pin),
+            ConfirmAction::Pin,
+            "去向=贴图不得走导出"
+        );
+        assert_eq!(
+            super::confirm_action(Destination::Copy),
+            ConfirmAction::Export,
+            "去向=复制才走导出"
+        );
     }
 }
 

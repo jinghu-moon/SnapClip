@@ -215,6 +215,7 @@ mod tests {
             }
         }
         let prepared = SelectionPixels {
+            corner_radius: 0,
             frame: frame(width, height),
             region: Rect::new(0, 0, width as i32, height as i32),
             bgra,
@@ -288,6 +289,7 @@ mod tests {
         let dir = root("oversized");
         let writer = HistoryArtifactWriter::new(dir.clone());
         let prepared = SelectionPixels {
+            corner_radius: 0,
             frame: frame(4, 4),
             region: Rect::new(0, 0, -5, 2),
             bgra: Vec::new(),

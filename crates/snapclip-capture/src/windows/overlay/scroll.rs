@@ -387,6 +387,8 @@ impl OverlayController {
         };
         eprintln!("[snapclip][scroll] finished reason={reason} image={width}x{rows}");
         let prepared = SelectionPixels {
+            // 拼接长图没有四角可言：圆角是面板对单帧选区的要求。
+            corner_radius: 0,
             frame: CapturedFrame {
                 width,
                 height: rows,
@@ -609,6 +611,8 @@ mod tests {
                 generation: 1,
                 session_id: "s1".into(),
                 prepared: SelectionPixels {
+            // 拼接长图没有四角可言：圆角是面板对单帧选区的要求。
+            corner_radius: 0,
                     frame: CapturedFrame {
                         width,
                         height: rows,

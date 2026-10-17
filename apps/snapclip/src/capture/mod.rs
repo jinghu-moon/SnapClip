@@ -239,6 +239,7 @@ mod tests {
             origin: Some(snapclip_model::geometry::Point::new(0, 0)),
         };
         Arc::new(snapclip_capture::artifact::SelectionPixels {
+            corner_radius: 0,
             frame,
             region: snapclip_model::geometry::Rect::new(0, 0, 2, 2),
             bgra: vec![0; 16],

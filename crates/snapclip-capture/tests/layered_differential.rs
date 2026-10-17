@@ -510,3 +510,147 @@ fn the_probe_itself_can_see_a_plain_window() {
         UnregisterClassW(name.as_ptr(), instance);
     }
 }
+
+
+// ── 屏幕级证据：圆角在屏幕上真的透出桌面（docs/23 §14.55.18）────────────────
+
+/// 一块 straight-alpha 的 BGRA 内容 → 圆角 → 预乘（`ULW_ALPHA` 要求）。
+///
+/// 顺序不能反：`artifact::round_corners` 只压 alpha、不动颜色通道（它服务的是直通 alpha
+/// 的导出图），所以贴图窗口在用 ULW 上屏前必须自己预乘一次。
+fn rounded_premultiplied(width: u32, height: u32, colour: [u8; 3], radius: u32) -> Vec<u8> {
+    let mut bgra = Vec::with_capacity((width * height * 4) as usize);
+    for _ in 0..(width * height) {
+        bgra.extend_from_slice(&[colour[2], colour[1], colour[0], 255]);
+    }
+    snapclip_capture::artifact::round_corners(&mut bgra, width, height, radius);
+    for pixel in bgra.chunks_exact_mut(4) {
+        let alpha = pixel[3] as u32;
+        for channel in 0..3 {
+            pixel[channel] = ((pixel[channel] as u32 * alpha) / 255) as u8;
+        }
+    }
+    bgra
+}
+
+/// 把 BGRA 内容写进 layered 窗口的 DIB（内存里是 B,G,R,A 四个字节，按小端拼成 u32）。
+fn write_bgra(window: &Layered, bgra: &[u8]) {
+    assert_eq!(
+        bgra.len(),
+        (window.width * window.height * 4) as usize,
+        "内容尺寸与 DIB 不符"
+    );
+    for (index, pixel) in bgra.chunks_exact(4).enumerate() {
+        let value = u32::from_le_bytes([pixel[0], pixel[1], pixel[2], pixel[3]]);
+        unsafe { *window.bits.add(index) = value };
+    }
+}
+
+fn pixel_of(bitmap: &snapclip_capture::windows::win::bitblt::CapturedBitmap, x: u32, y: u32) -> [u8; 4] {
+    let index = ((y * bitmap.width + x) * 4) as usize;
+    [
+        bitmap.pixels[index],
+        bitmap.pixels[index + 1],
+        bitmap.pixels[index + 2],
+        bitmap.pixels[index + 3],
+    ]
+}
+
+/// 三个颜色通道都在容差内。
+fn close(a: [u8; 4], b: [u8; 4], tolerance: u8) -> bool {
+    (0..3).all(|channel| a[channel].abs_diff(b[channel]) <= tolerance)
+}
+
+/// `pixel` 落在「桌面基线 ↔ 内容色」之间，且与两者都明显不同 —— 这就是抗锯齿的证据。
+fn is_blend(pixel: [u8; 4], backdrop: [u8; 4], content: [u8; 4]) -> bool {
+    let inside = (0..3).all(|channel| {
+        let low = backdrop[channel].min(content[channel]);
+        let high = backdrop[channel].max(content[channel]);
+        pixel[channel] >= low.saturating_sub(3) && pixel[channel] <= high.saturating_add(3)
+    });
+    let distinct = (0..3).any(|channel| {
+        pixel[channel].abs_diff(backdrop[channel]) > 8
+            && pixel[channel].abs_diff(content[channel]) > 8
+    });
+    inside && distinct
+}
+
+/// 圆角真的在屏幕上透出桌面吗？（这是"贴图平滑圆角"唯一无法用像素缓冲自证的一步。）
+#[test]
+#[ignore = "L3 (docs/23 §14.55.18): needs a live desktop — it photographs the screen"]
+fn a_rounded_pin_shows_the_desktop_through_its_corners() {
+    use snapclip_capture::geometry::Rect;
+    use snapclip_capture::windows::win::bitblt::capture_rect;
+
+    be_dpi_aware();
+    let (instance, name) = register("SnapClipRoundedPinProbe");
+
+    let (x, y) = (360, 300);
+    let (width, height) = (240i32, 160i32);
+    let (w, h) = (width as u32, height as u32);
+    const RADIUS: u32 = 24;
+    // 橙色：与常见的浅色 / 深色桌面都拉得开，便于分辨「桌面 / 混合 / 内容」三种像素。
+    const CONTENT: [u8; 3] = [255, 140, 0];
+
+    // 基线必须在**窗口出现之前**抓：它定义了"透明处应当看到什么"。
+    let baseline = capture_rect(Rect::new(x, y, x + width, y + height)).expect("基线抓屏");
+    assert_eq!((baseline.width, baseline.height), (w, h), "基线尺寸不符");
+
+    let window = Layered::new(&name, instance, PIN_EX, true, (x, y, width, height), 255);
+    pump(120);
+
+    let corners = [(1u32, 1u32), (w - 2, 1), (1, h - 2), (w - 2, h - 2)];
+
+    // ── 圆角 24：四角透桌面、边缘有混合、中心是内容色 ───────────────────
+    write_bgra(&window, &rounded_premultiplied(w, h, CONTENT, RADIUS));
+    window.submit(None);
+    pump(160);
+    let rounded = capture_rect(Rect::new(x, y, x + width, y + height)).expect("圆角抓屏");
+
+    for (cx, cy) in corners {
+        let shown = pixel_of(&rounded, cx, cy);
+        let behind = pixel_of(&baseline, cx, cy);
+        eprintln!("[corner ({cx},{cy})] shown={shown:?} desktop={behind:?}");
+        assert!(
+            close(shown, behind, 2),
+            "圆角 {RADIUS} 时 ({cx},{cy}) 应透出桌面：shown={shown:?} desktop={behind:?}"
+        );
+    }
+
+    let expected = [CONTENT[2], CONTENT[1], CONTENT[0], 255];
+    let centre = pixel_of(&rounded, w / 2, h / 2);
+    eprintln!("[centre] shown={centre:?} content={expected:?}");
+    assert!(close(centre, expected, 2), "中心应是内容色：{centre:?} ≠ {expected:?}");
+
+    let mut blended = 0;
+    for yy in 0..(RADIUS + 12).min(h) {
+        for xx in 0..(RADIUS + 12).min(w) {
+            let shown = pixel_of(&rounded, xx, yy);
+            if is_blend(shown, pixel_of(&baseline, xx, yy), expected) {
+                blended += 1;
+            }
+        }
+    }
+    eprintln!("[antialias] {blended} blended pixels in the top-left corner region");
+    assert!(
+        blended >= 20,
+        "只有 {blended} 个混合像素：圆角边缘是硬切的，屏幕上没有抗锯齿"
+    );
+
+    // ── 半径 0：四角回到内容色（证明上面那组不是"整块没上屏"）────────────
+    write_bgra(&window, &rounded_premultiplied(w, h, CONTENT, 0));
+    window.submit(None);
+    pump(160);
+    let square = capture_rect(Rect::new(x, y, x + width, y + height)).expect("直角抓屏");
+    for (cx, cy) in corners {
+        let shown = pixel_of(&square, cx, cy);
+        eprintln!("[corner radius=0 ({cx},{cy})] shown={shown:?} content={expected:?}");
+        assert!(
+            close(shown, expected, 2),
+            "半径 0 时 ({cx},{cy}) 应是内容色而不是桌面：{shown:?}"
+        );
+    }
+
+    drop(window);
+    unsafe { UnregisterClassW(name.as_ptr(), instance) };
+}

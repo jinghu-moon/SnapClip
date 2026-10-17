@@ -972,6 +972,18 @@ pub struct RegionPanelLayout {
     pub delay: [(Delay, Rect); 4],
     pub toggle_label: Rect,
     pub toggles: [(LabelToggle, Rect); 3],
+    /// 图片卡：整张卡、整行卡头（点击开关）、卡头右侧的摘要文字区、折叠箭头。
+    pub image_card: Rect,
+    pub image_head: Rect,
+    pub image_summary: Rect,
+    pub image_chevron: Rect,
+    /// 圆角行：行标签、滑动条的命中区、可见轨道、滑块、值块，以及上限（像素）。
+    pub radius_label: Rect,
+    pub radius_track: Rect,
+    pub radius_groove: Rect,
+    pub radius_thumb: Rect,
+    pub radius_value: Rect,
+    pub radius_max: i32,
     pub status: Rect,
     pub cancel: Rect,
     pub start: Rect,
@@ -995,6 +1007,8 @@ pub enum RegionPanelTarget {
     MenuItem(usize),
     /// 下拉面板自己的内边距：不是控件，但点击要停在下拉里。
     MenuPadding,
+    /// 圆角滑块上按下的位置换算出来的像素值（0..=radius_max）。
+    Radius(u32),
 }
 
 /// 面板的尺寸与各处间距（逻辑单位，按显示器缩放）。
@@ -1037,6 +1051,32 @@ const REGION_ROW_GAP_DIP: f32 = 10.0;
 const REGION_ROW_DIP: f32 = 28.0;
 /// 行首标签（预设 / 浮层 / 延时）的宽度。
 const REGION_ROW_LABEL_DIP: f32 = 26.0;
+
+// ── 图片卡（docs/23 §14.55.19）──────────────────────────────────────────
+const REGION_RADIUS_GROOVE_DIP: f32 = 4.0;
+const REGION_RADIUS_THUMB_DIP: f32 = 14.0;
+const REGION_RADIUS_VALUE_GAP_DIP: f32 = 12.0;
+const REGION_RADIUS_VALUE_WIDTH_DIP: f32 = 46.0;
+const REGION_RADIUS_VALUE_HEIGHT_DIP: f32 = 24.0;
+const REGION_CHEVRON_DIP: f32 = 14.0;
+
+/// 图片卡此刻的形状：展开与否、圆角多少。布局要靠它算高度与滑块位置，
+/// 所以跟着 `menu_open` 一起作为纯输入传进来.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PanelCard {
+    pub open: bool,
+    pub radius_px: i32,
+}
+
+impl PanelCard {
+    pub fn collapsed() -> Self {
+        Self { open: false, radius_px: 0 }
+    }
+
+    pub fn expanded(radius_px: i32) -> Self {
+        Self { open: true, radius_px }
+    }
+}
 const REGION_ICON_DIP: f32 = 22.0;
 /// 比例按钮的兜底宽（dip）：`无比例` 三个汉字 + 12 的箭头 + 两侧内边距。
 const REGION_RATIO_LABEL_DIP: f32 = 64.0;
@@ -1143,6 +1183,7 @@ pub fn region_panel_layout(
     work_area: Rect,
     selection: Rect,
     menu_open: bool,
+    card: PanelCard,
     widths: SegmentWidths,
 ) -> RegionPanelLayout {
     let k = if scale.is_finite() && scale > 0.0 {
@@ -1182,6 +1223,14 @@ pub fn region_panel_layout(
 
     let card_height =
         card_pad + card_head + card_gap_in + value_row + value_label_gap + value_label + card_pad_bottom;
+    // 图片卡：收起只有卡头一行，展开再加一行圆角（docs/23 §14.55.19）。它是新内容，
+    // 所以这是唯一允许把面板变高的地方。
+    let image_collapsed_h = card_pad + card_head + card_pad_bottom;
+    let image_height = if card.open {
+        image_collapsed_h + card_gap_in + row
+    } else {
+        image_collapsed_h
+    };
     let height = head_top
         + head_row
         + head_bottom
@@ -1191,6 +1240,8 @@ pub fn region_panel_layout(
         + row
         + row_gap
         + toggle_row
+        + card_gap
+        + image_height
         + body_bottom
         + foot_top
         + button_height
@@ -1476,6 +1527,97 @@ pub fn region_panel_layout(
         "角标行挤了：开关组与右侧控件之间的间距不足"
     );
 
+    // ── 图片卡：整宽、常驻在页脚上方；卡头一行是开关（docs/23 §14.55.19）──────
+    let image_y = toggle_y + toggle_row + card_gap;
+    let image_card = Rect::from_origin_size(
+        Point::new(left, image_y),
+        content,
+        image_height,
+    );
+    let image_head = Rect::new(
+        image_card.left + card_pad,
+        image_y + card_pad,
+        image_card.right - card_pad,
+        image_y + card_pad + card_head,
+    );
+    let chevron = dip(REGION_CHEVRON_DIP);
+    let image_chevron = Rect::from_origin_size(
+        Point::new(
+            image_head.right - chevron,
+            image_head.top + (image_head.height() - chevron) / 2,
+        ),
+        chevron,
+        chevron,
+    );
+    // 摘要右对齐在箭头左侧；收起时才画（展开时下面的行本来就在显示它）。
+    let image_summary = Rect::new(
+        image_head.left,
+        image_head.top,
+        image_chevron.left - dip(8.0),
+        image_head.bottom,
+    );
+
+    // 圆角行：标签 + 弹性滑动条 + 右侧值块（46×24，与倍率块同规格）。
+    //
+    // 收起时这五个矩形全部压成空矩形（同一个点、尺寸 0）：它们既不占位置，也不会被
+    // `target_at` 命中 —— 否则收起的卡片会在页脚附近留下一个隐形的滑块。
+    let radius_row_y = image_head.bottom + card_gap_in;
+    let radius_value_w = dip(REGION_RADIUS_VALUE_WIDTH_DIP);
+    let radius_value_h = dip(REGION_RADIUS_VALUE_HEIGHT_DIP);
+    let radius_value = Rect::from_origin_size(
+        Point::new(
+            image_card.right - card_pad - radius_value_w,
+            radius_row_y + (row - radius_value_h) / 2,
+        ),
+        radius_value_w,
+        radius_value_h,
+    );
+    let radius_label = Rect::new(
+        image_card.left + card_pad,
+        radius_row_y + (row - value_label) / 2,
+        image_card.left + card_pad + row_label,
+        radius_row_y + (row - value_label) / 2 + value_label,
+    );
+    let track_left = radius_label.right;
+    let track_right = radius_value.left - dip(REGION_RADIUS_VALUE_GAP_DIP);
+    let radius_track = Rect::new(track_left, radius_row_y, track_right, radius_row_y + row);
+    let groove_h = dip(REGION_RADIUS_GROOVE_DIP);
+    let radius_groove = Rect::new(
+        track_left,
+        radius_row_y + (row - groove_h) / 2,
+        track_right,
+        radius_row_y + (row + groove_h) / 2,
+    );
+    let radius_max =
+        (selection.width().min(selection.height()).max(0) / 2).min(crate::region::RADIUS_MAX_PX);
+    let thumb = dip(REGION_RADIUS_THUMB_DIP);
+    let span = (radius_groove.right - radius_groove.left - thumb).max(0);
+    let t = if radius_max > 0 {
+        (card.radius_px.clamp(0, radius_max) as f32) / radius_max as f32
+    } else {
+        0.0
+    };
+    let radius_thumb = Rect::from_origin_size(
+        Point::new(
+            radius_groove.left + (span as f32 * t).round() as i32,
+            radius_groove.center().y - thumb / 2,
+        ),
+        thumb,
+        thumb,
+    );
+    let (radius_label, radius_track, radius_groove, radius_thumb, radius_value) = if card.open {
+        (
+            radius_label,
+            radius_track,
+            radius_groove,
+            radius_thumb,
+            radius_value,
+        )
+    } else {
+        let empty = Rect::from_origin_size(Point::new(image_card.left, image_card.top), 0, 0);
+        (empty, empty, empty, empty, empty)
+    };
+
     // ── 页脚：一句话 + 两个按钮 ─────────────────────────────────────────────
     let foot_y = panel.bottom - foot_bottom - button_height;
     let start = Rect::from_origin_size(
@@ -1539,6 +1681,16 @@ pub fn region_panel_layout(
         delay,
         toggle_label,
         toggles,
+        image_card,
+        image_head,
+        image_summary,
+        image_chevron,
+        radius_label,
+        radius_track,
+        radius_groove,
+        radius_thumb,
+        radius_value,
+        radius_max,
         status,
         cancel,
         start,
@@ -1548,6 +1700,15 @@ pub fn region_panel_layout(
 }
 
 impl RegionPanelLayout {
+    /// 滑动条上某个 x 对应的像素值：点击与拖动共用这一处映射（`target_at` 也走它）。
+    pub fn radius_at(&self, x: i32) -> u32 {
+        let thumb = self.radius_thumb.width();
+        let span = (self.radius_groove.width() - thumb).max(1);
+        let clamped = (x - self.radius_groove.left - thumb / 2).clamp(0, span);
+        let value = (clamped as f32 / span as f32 * self.radius_max as f32).round() as i32;
+        value.max(0) as u32
+    }
+
     /// 哪个控件在 `point` 上；面板的内边距、卡片留白与页脚空白返回 `None`。
     ///
     /// 下拉展开时它压着下面的行，所以先问下拉。
@@ -1579,6 +1740,13 @@ impl RegionPanelLayout {
             if rect.contains(point) {
                 return Some(RegionPanelTarget::Slot(field.slot()));
             }
+        }
+        // 图片卡：整行卡头是开关；展开后滑块把 x 换算成像素值（与绘制共用同一段轨道）。
+        if self.image_head.contains(point) {
+            return Some(RegionPanelTarget::Slot(PanelSlot::Image));
+        }
+        if self.radius_track.width() > 0 && self.radius_track.contains(point) {
+            return Some(RegionPanelTarget::Radius(self.radius_at(point.x)));
         }
         if self.ratio.contains(point) {
             return Some(RegionPanelTarget::Slot(PanelSlot::Ratio));
@@ -2528,6 +2696,96 @@ mod tests {
         )
     }
 
+    /// 图片卡是唯一允许让面板变高的东西：收起 42（10 + 22 + 10），展开再加一行 28 与 6 的行距。
+    #[test]
+    fn the_image_card_grows_the_panel_only_when_it_is_open() {
+        let work_area = Rect::from_origin_size(Point::new(0, 0), 3840, 2160);
+        let selection = whole(work_area);
+        let closed = region_panel_layout(
+            1.0,
+            work_area,
+            selection,
+            false,
+            PanelCard::collapsed(),
+            SegmentWidths::fixed(1.0),
+        );
+        let open = region_panel_layout(
+            1.0,
+            work_area,
+            selection,
+            false,
+            PanelCard::expanded(12),
+            SegmentWidths::fixed(1.0),
+        );
+        assert_eq!(closed.panel.height(), 329, "277 + 卡间距 10 + 卡头一行 42");
+        assert_eq!(open.panel.height(), 363, "再多一行圆角 28 与 6 的行距");
+        // 卡片整宽、居内边距之内；卡头在卡顶，摘要不越过箭头。
+        assert_eq!(closed.image_card.width(), closed.panel.width() - 32);
+        assert_eq!(closed.image_head.left, closed.image_card.left + 10);
+        assert!(closed.image_summary.right <= closed.image_chevron.left);
+        assert_eq!(closed.radius_max, 128, "短边 2160 / 2 已超过 128 的封顶");
+    }
+
+    /// 命中与绘制同源：卡头就是开关；滑块把 x 映射成像素值；收起时那一行不存在。
+    #[test]
+    fn the_image_card_head_toggles_and_the_slider_maps_positions_to_values() {
+        let work_area = Rect::from_origin_size(Point::new(0, 0), 3840, 2160);
+        let selection = whole(work_area);
+        let closed = region_panel_layout(
+            1.0,
+            work_area,
+            selection,
+            false,
+            PanelCard::collapsed(),
+            SegmentWidths::fixed(1.0),
+        );
+        assert_eq!(closed.radius_track.width(), 0, "收起时滑块压成空矩形");
+        assert_eq!(
+            closed.target_at(closed.image_head.center()),
+            Some(RegionPanelTarget::Slot(PanelSlot::Image)),
+        );
+
+        let open = region_panel_layout(
+            1.0,
+            work_area,
+            selection,
+            false,
+            PanelCard::expanded(64),
+            SegmentWidths::fixed(1.0),
+        );
+        // 两端：滑块中心在轨道起点 ⇒ 0，在终点 ⇒ 上限；整段中点 ⇒ 一半。
+        let thumb = open.radius_thumb.width();
+        let left = Point::new(
+            open.radius_groove.left + thumb / 2,
+            open.radius_groove.center().y,
+        );
+        let right = Point::new(
+            open.radius_groove.right - thumb / 2,
+            open.radius_groove.center().y,
+        );
+        assert_eq!(open.target_at(left), Some(RegionPanelTarget::Radius(0)));
+        assert_eq!(
+            open.target_at(right),
+            Some(RegionPanelTarget::Radius(open.radius_max as u32)),
+        );
+        assert_eq!(
+            open.target_at(open.radius_groove.center()),
+            Some(RegionPanelTarget::Radius(64)),
+        );
+        // 滑块跟着值走：64 的拇指在 0 的右边。
+        let zero = region_panel_layout(
+            1.0,
+            work_area,
+            selection,
+            false,
+            PanelCard::expanded(0),
+            SegmentWidths::fixed(1.0),
+        );
+        assert!(open.radius_thumb.left > zero.radius_thumb.left);
+        // 值块不在命中区里（它是读数，不是控件）。
+        assert_eq!(open.target_at(open.radius_value.center()), None);
+    }
+
     #[test]
     fn the_segment_radius_nests_inside_its_container_and_never_goes_negative() {
         assert_eq!(segment_radius(7, 3), 4);
@@ -2591,7 +2849,7 @@ mod tests {
     #[test]
     fn the_region_panel_is_420_dip_wide_and_centred() {
         let work_area = Rect::new(0, 0, 3840, 2160);
-        let panel = region_panel_layout(1.0, work_area, whole(work_area), false, SegmentWidths::fixed(1.0));
+        let panel = region_panel_layout(1.0, work_area, whole(work_area), false, PanelCard::collapsed(), SegmentWidths::fixed(1.0));
         assert_eq!(panel.panel.width(), 420);
         assert_eq!(
             panel.panel.left + panel.panel.width() / 2,
@@ -2692,7 +2950,7 @@ mod tests {
     #[test]
     fn the_four_fields_share_one_column_per_card() {
         let work_area = Rect::new(0, 0, 3840, 2160);
-        let panel = region_panel_layout(1.0, work_area, whole(work_area), false, SegmentWidths::fixed(1.0));
+        let panel = region_panel_layout(1.0, work_area, whole(work_area), false, PanelCard::collapsed(), SegmentWidths::fixed(1.0));
         // 两张卡用同一套内部列几何：宽与 X 在各自卡里的第一列、高与 Y 在第二列，
         // 所以左右两卡的数字在卡内对齐（卡与卡之间差着各自的位置，不该相同）。
         for index in [0, 2] {
@@ -2724,7 +2982,7 @@ mod tests {
     #[test]
     fn every_control_the_region_panel_draws_can_be_hit() {
         let work_area = Rect::new(0, 0, 3840, 2160);
-        let panel = region_panel_layout(1.0, work_area, whole(work_area), false, SegmentWidths::fixed(1.0));
+        let panel = region_panel_layout(1.0, work_area, whole(work_area), false, PanelCard::collapsed(), SegmentWidths::fixed(1.0));
         for (unit, rect) in panel.unit {
             assert_eq!(
                 panel.target_at(rect.center()),
@@ -2791,11 +3049,11 @@ mod tests {
     #[test]
     fn the_ratio_menu_hangs_below_its_button_and_stays_on_screen() {
         let work_area = Rect::new(0, 0, 3840, 2160);
-        let closed = region_panel_layout(1.0, work_area, whole(work_area), false, SegmentWidths::fixed(1.0));
+        let closed = region_panel_layout(1.0, work_area, whole(work_area), false, PanelCard::collapsed(), SegmentWidths::fixed(1.0));
         assert_eq!(closed.menu, None, "收起时没有下拉");
         assert_eq!(closed.menu_items[0].height(), 0);
 
-        let open = region_panel_layout(1.0, work_area, whole(work_area), true, SegmentWidths::fixed(1.0));
+        let open = region_panel_layout(1.0, work_area, whole(work_area), true, PanelCard::collapsed(), SegmentWidths::fixed(1.0));
         let menu = open.menu.expect("展开时有下拉");
         // 菜单与按钮**解耦**：右缘对齐卡片右缘，宽度是量出来的最宽项，比按钮宽。
         assert_eq!(menu.right, open.cards[0].right);
@@ -2818,7 +3076,7 @@ mod tests {
 
         // 面板贴着工作区底边时，下拉被拉回屏内而不是画到外面。
         let short = Rect::new(0, 0, 3840, 300);
-        let pinned = region_panel_layout(1.0, short, whole(short), true, SegmentWidths::fixed(1.0)).menu.expect("下拉");
+        let pinned = region_panel_layout(1.0, short, whole(short), true, PanelCard::collapsed(), SegmentWidths::fixed(1.0)).menu.expect("下拉");
         assert!(short.contains_rect(pinned), "{pinned:?}");
     }
 
@@ -2827,7 +3085,7 @@ mod tests {
         let work_area = Rect::new(0, 0, 3840, 2160);
         // 一个装不下面板的小选框：面板挪到它下面，而不是压住它。
         let selection = Rect::new(600, 400, 1000, 620);
-        let panel = region_panel_layout(1.0, work_area, selection, false, SegmentWidths::fixed(1.0));
+        let panel = region_panel_layout(1.0, work_area, selection, false, PanelCard::collapsed(), SegmentWidths::fixed(1.0));
         assert!(panel.panel.top >= selection.bottom, "{:?}", panel.panel);
         assert!(work_area.contains_rect(panel.panel));
         assert_eq!(
@@ -2837,12 +3095,12 @@ mod tests {
         );
         // 下方也没地方：翻到上面。
         let low = Rect::new(600, 2160 - 300, 1000, 2160 - 80);
-        let above = region_panel_layout(1.0, work_area, low, false, SegmentWidths::fixed(1.0));
+        let above = region_panel_layout(1.0, work_area, low, false, PanelCard::collapsed(), SegmentWidths::fixed(1.0));
         assert!(above.panel.bottom <= low.top, "{:?}", above.panel);
         assert!(work_area.contains_rect(above.panel));
         // 选框装得下就放进正中间——那是用户点尺寸栏时最想看到的位置。
         let roomy = Rect::new(200, 200, 3000, 1800);
-        let inside = region_panel_layout(1.0, work_area, roomy, false, SegmentWidths::fixed(1.0));
+        let inside = region_panel_layout(1.0, work_area, roomy, false, PanelCard::collapsed(), SegmentWidths::fixed(1.0));
         assert!(roomy.contains_rect(inside.panel), "{:?}", inside.panel);
         assert_eq!(
             inside.panel.left + inside.panel.width() / 2,
@@ -2853,8 +3111,8 @@ mod tests {
     #[test]
     fn the_region_panel_grows_with_the_display_scale() {
         let work_area = Rect::new(0, 0, 3840, 2160);
-        let at_100 = region_panel_layout(1.0, work_area, whole(work_area), false, SegmentWidths::fixed(1.0));
-        let at_200 = region_panel_layout(2.0, work_area, whole(work_area), false, SegmentWidths::fixed(2.0));
+        let at_100 = region_panel_layout(1.0, work_area, whole(work_area), false, PanelCard::collapsed(), SegmentWidths::fixed(1.0));
+        let at_200 = region_panel_layout(2.0, work_area, whole(work_area), false, PanelCard::collapsed(), SegmentWidths::fixed(2.0));
         assert_eq!(at_200.panel.width(), at_100.panel.width() * 2);
         assert_eq!(at_200.panel.height(), at_100.panel.height() * 2);
         assert_eq!(at_200.toggles[0].1.width(), at_100.toggles[0].1.width() * 2);
@@ -2867,7 +3125,7 @@ mod tests {
             "列宽 {cell_100} → {cell_200}，超过半像素取整能解释的范围"
         );
         // 退化缩放仍然排出一块能用的面板，而不是塌成 0。
-        let degenerate = region_panel_layout(0.0, work_area, whole(work_area), false, SegmentWidths::fixed(0.0));
+        let degenerate = region_panel_layout(0.0, work_area, whole(work_area), false, PanelCard::collapsed(), SegmentWidths::fixed(0.0));
         assert_eq!(degenerate.panel.width(), at_100.panel.width());
     }
 
@@ -2892,7 +3150,7 @@ mod tests {
                 ..SegmentWidths::fixed(1.0)
             },
         ] {
-            let panel = region_panel_layout(1.0, work_area, whole(work_area), false, widths);
+            let panel = region_panel_layout(1.0, work_area, whole(work_area), false, PanelCard::collapsed(), widths);
             for (_, rect) in panel.unit {
                 assert_eq!(rect.width(), widths.unit, "单位段宽 = 传进来的值");
                 assert!(panel.unit_track.contains_rect(rect), "段在容器内");
@@ -2926,7 +3184,7 @@ mod tests {
             delay: 41,
             ..SegmentWidths::fixed(1.0)
         };
-        let panel = region_panel_layout(1.0, work_area, whole(work_area), false, widths);
+        let panel = region_panel_layout(1.0, work_area, whole(work_area), false, PanelCard::collapsed(), widths);
         for (delay, rect) in panel.delay {
             assert_eq!(rect.width(), widths.delay);
             assert_eq!(

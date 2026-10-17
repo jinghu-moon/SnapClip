@@ -179,6 +179,10 @@ impl OverlayController {
             layout.local_work_area(),
             selection,
             panel.menu().is_some(),
+            crate::geometry::PanelCard {
+                open: panel.image_open(),
+                radius_px: panel.radius_px() as i32,
+            },
             self.segment_widths,
         );
         Some(RegionPanelView {
@@ -206,6 +210,10 @@ impl OverlayController {
             ratio_selected: Ratio::menu_index(panel.ratio()),
             destination: panel.destination(),
             readout: panel.readout(region, dpi),
+            image_open: panel.image_open(),
+            image_summary: panel.image_summary(dpi),
+            radius_text: panel.radius_text(dpi),
+            radius_px: panel.radius_px(),
             can_start: problem.is_none(),
             layout: rects,
         })

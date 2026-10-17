@@ -2237,6 +2237,7 @@ fn render_panel_frame_with_slide(
         Rect::new(0, 0, width as i32, height as i32),
         selection,
         false,
+        crate::geometry::PanelCard::collapsed(),
         crate::geometry::SegmentWidths::fixed(1.0),
     );
     let mut view = RenderView::new(Rect::from_origin_size(
@@ -2268,6 +2269,10 @@ fn render_panel_frame_with_slide(
         destination: crate::region::Destination::Copy,
         readout: "将复制 1370×824 px".to_string(),
         can_start: true,
+        image_open: false,
+        image_summary: "无圆角".to_string(),
+        radius_text: "0".to_string(),
+        radius_px: 0,
         layout: layout.clone(),
     });
 

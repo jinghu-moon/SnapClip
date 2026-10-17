@@ -89,7 +89,25 @@ fn nudge_point(point: POINT, dx: i32, dy: i32) -> POINT {
 }
 
 impl OverlayController {
+    /// 把指针位置换算成半径并应用 —— 点击与拖动**共用**这一处（`radius_at` 是唯一映射）。
+    fn drag_radius_to(&mut self, point: Point) {
+        if let (Some(layout), Some(mut panel)) =
+            (self.region_panel_layout(), self.region_panel.take())
+        {
+            let change = panel.set_radius(layout.radius_at(point.x), self.region_now());
+            self.region_panel = Some(panel);
+            self.apply_region_panel_change(change);
+        }
+        self.invalidate();
+    }
+
     pub(super) fn on_mouse_move(&mut self, client: POINT) {
+        // 半径滑块：按下后**一直跟着移动**改值（点击与拖动共用 `radius_at` 这一个映射）。
+        // 之前这里没有分支，所以只能点、不能拖（docs/23 §14.55.20 的 Bug 1）。
+        if self.radius_drag {
+            self.drag_radius_to(Point::new(client.x, client.y));
+            return;
+        }
         let point = Point::new(client.x, client.y);
         let shift = self.shift_down || modifiers().1;
         self.cursor = point;
@@ -233,6 +251,12 @@ impl OverlayController {
         // blank space swallows the press instead of starting a drag behind it. A press *outside* it
         // is the ordinary gesture — dragging the region with the panel open is how the two halves
         // work together (docs/23 §14.54).
+        if self.radius_drag {
+            self.drag_radius_to(point);
+            self.update_cursor_shape(point);
+            self.invalidate();
+            return;
+        }
         if self.region_panel.is_some() {
             if let Some(panel) = self.region_panel_rect() {
                 if panel.contains(point) {
@@ -289,6 +313,11 @@ impl OverlayController {
     }
 
     pub(super) fn on_left_up(&mut self) {
+        if self.radius_drag {
+            // 滑块松手：结束拖动，别让这次释放走成一次确认。
+            self.radius_drag = false;
+            return;
+        }
         if self.countdown.is_some() {
             self.end_countdown_resize();
             return;
@@ -944,6 +973,10 @@ impl OverlayController {
             renderer.layout().local_work_area(),
             self.session.selection(),
             panel.menu().is_some(),
+            crate::geometry::PanelCard {
+                open: panel.image_open(),
+                radius_px: panel.radius_px() as i32,
+            },
             self.segment_widths,
         ))
     }
@@ -988,6 +1021,14 @@ impl OverlayController {
                     panel.choose_delay(delay);
                 }
                 PanelChange::Repaint
+            }
+            Some(RegionPanelTarget::Radius(value)) => {
+                // 按下即生效，并进入拖动：继续移动（哪怕移出轨道）都按同一套映射改值。
+                self.radius_drag = true;
+                self.region_panel
+                    .as_mut()
+                    .map(|panel| panel.set_radius(value, region))
+                    .unwrap_or(PanelChange::None)
             }
             Some(RegionPanelTarget::Destination(destination)) => {
                 // 点哪段选哪段，与延时同一条语义。
@@ -1088,6 +1129,11 @@ impl OverlayController {
                 let label = self.preferences.label;
                 self.preferences.label = label.set(toggle, !toggle.on(label));
                 self.publish_preferences();
+                self.invalidate();
+            }
+            PanelChange::Radius(radius) => {
+                // 圆角只影响成图，不影响浮层画面；但面板里的滑块与摘要要跟着重画。
+                self.corner_radius_px = radius;
                 self.invalidate();
             }
             PanelChange::Region(region) => {

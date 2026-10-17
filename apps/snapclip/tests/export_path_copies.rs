@@ -142,6 +142,7 @@ fn selection(width: u32, height: u32) -> SelectionPixels {
         }
     }
     SelectionPixels {
+        corner_radius: 0,
         frame: CapturedFrame {
             width,
             height,

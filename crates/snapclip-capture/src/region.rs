@@ -103,6 +103,48 @@ impl Region {
         }
     }
 
+    /// 圆角上限：`min(128 px, 短边 / 2)`。给滑动条的范围与遮罩的夹取共用一份
+    /// （docs/23 §14.55.19）。
+    pub fn radius_max(self) -> i32 {
+        (self.width.min(self.height).max(0) / 2).min(RADIUS_MAX_PX)
+    }
+}
+
+/// 值块角标的圆角半径：0 ⇒ 直角；有值就从 1 起（小半径与 0 必须能看出差别），到上限时为 5 dip。
+///
+/// 以前直接用 `5 × 当前值 / 上限`，而上限可到 128 ⇒ 常见半径全被四舍五入成 0 或 1，
+/// 肉眼看就是"形状不跟着变"（docs/23 §14.55.20 的 Bug 2）。
+pub fn radius_glyph(radius_px: i32, radius_max: i32) -> i32 {
+    if radius_px <= 0 || radius_max <= 0 {
+        return 0;
+    }
+    let capped = radius_px.min(radius_max);
+    (1 + (4 * capped) / radius_max).min(5)
+}
+
+#[cfg(test)]
+mod radius_glyph_tests {
+    use super::radius_glyph;
+
+    #[test]
+    fn the_glyph_grows_with_the_radius_and_starts_at_one() {
+        assert_eq!(radius_glyph(0, 128), 0, "0 是直角");
+        assert_eq!(radius_glyph(1, 128), 1, "有值就从 1 起，否则与 0 看不出差别");
+        assert_eq!(radius_glyph(128, 128), 5, "上限");
+        // 单调不减
+        let mut last = 0;
+        for radius in 0..=128 {
+            let glyph = radius_glyph(radius, 128);
+            assert!(glyph >= last, "半径 {radius} 处回落了：{glyph} < {last}");
+            last = glyph;
+        }
+        // 中值必须与两端都不同（这才是"看得见变化"）
+        let mid = radius_glyph(64, 128);
+        assert!(mid > 1 && mid < 5, "中值应当是中间档，实际 {mid}");
+    }
+}
+
+impl Region {
     pub fn swapped(self) -> Self {
         Self {
             width: self.height,
@@ -292,6 +334,9 @@ pub struct Ratio {
 /// 菜单第一项，也是"不锁比例"的唯一表达。
 pub const RATIO_FREE_LABEL: &str = "无比例";
 
+/// 圆角上限（像素）：再大也只会把短边切成两半，没有意义（docs/23 §14.55.19）。
+pub const RADIUS_MAX_PX: i32 = 128;
+
 /// 菜单里除「无比例」之外的项，顺序就是下拉顺序。
 pub const RATIOS: [Ratio; 8] = [
     Ratio { name: "1:1", w: 1, h: 1 },
@@ -385,12 +430,16 @@ pub enum PanelSlot {
     ShowSize,
     ShowPosition,
     ShowUnit,
+    /// 图片卡的卡头（整行是开关）。
+    Image,
+    /// 圆角滑动条。
+    Radius,
     Cancel,
     Start,
 }
 
 impl PanelSlot {
-    pub const ORDER: [Self; 16] = [
+    pub const ORDER: [Self; 18] = [
         // 卡头在数字之前（比例按钮与交换按钮都在尺寸卡头里），所以 Tab 从比例开始；
         // 默认焦点另说（见 `RegionPanel::new`）。
         Self::Ratio,
@@ -407,6 +456,9 @@ impl PanelSlot {
         Self::ShowPosition,
         Self::ShowUnit,
         Self::Unit,
+        // 图片卡在下面，所以 Tab 在单位之后、页脚之前（docs/23 §14.55.19）。
+        Self::Image,
+        Self::Radius,
         Self::Cancel,
         Self::Start,
     ];
@@ -486,6 +538,9 @@ pub enum PanelKey {
     /// 光标移到缓冲首/尾。
     Home,
     End,
+    /// 圆角滑块的大步进（±8）。
+    PageUp,
+    PageDown,
     Digit(u8),
 }
 
@@ -500,6 +555,8 @@ pub enum PanelChange {
     Region(Region),
     /// 浮层尺寸标的一项开关翻面（值在偏好里，不在面板里）。
     Toggle(LabelToggle),
+    /// 圆角改了（像素）；控制器把它交给成图遮罩。
+    Radius(u32),
     /// 就按这个区域截。
     Confirm(Region),
     /// 离开面板，并取消这次截图。
@@ -530,6 +587,10 @@ pub struct RegionPanel {
     ratio: Option<Ratio>,
     /// 这张截图往哪儿去。
     destination: Destination,
+    /// 图片卡是否展开（默认收起：面板保持紧凑）。
+    image_open: bool,
+    /// 成图四角的圆角（像素，0 = 直角）。
+    radius_px: u32,
     focus: PanelSlot,
     editing: Option<FieldText>,
     /// 预设下拉展开时的键盘高亮项；`None` 表示收起。
@@ -545,6 +606,8 @@ impl RegionPanel {
             delay,
             ratio: None,
             destination: Destination::Copy,
+            image_open: false,
+            radius_px: 0,
             focus: PanelSlot::Width,
             editing: None,
             menu: None,
@@ -571,6 +634,65 @@ impl RegionPanel {
     }
 
     /// 这张截图的落点。
+    pub fn image_open(&self) -> bool {
+        self.image_open
+    }
+
+    pub fn radius_px(&self) -> u32 {
+        self.radius_px
+    }
+
+    /// 卡头右侧的现状摘要（收起时显示）：`无圆角` / `圆角 12`（跟随当前单位）。
+    pub fn image_summary(&self, dpi: u32) -> String {
+        if self.radius_px == 0 {
+            return "无圆角".to_string();
+        }
+        let shown = match self.unit {
+            LengthUnit::Px => self.radius_px as i32,
+            LengthUnit::Dp => crate::units::px_to_dip(self.radius_px as i32, dpi),
+        };
+        format!("圆角 {shown}")
+    }
+
+    /// 值块里那个数字（跟随当前单位）。
+    pub fn radius_text(&self, dpi: u32) -> String {
+        let shown = match self.unit {
+            LengthUnit::Px => self.radius_px as i32,
+            LengthUnit::Dp => crate::units::px_to_dip(self.radius_px as i32, dpi),
+        };
+        shown.to_string()
+    }
+
+    /// 卡头就是开关：展开 / 收起图片卡。
+    pub fn toggle_image(&mut self) -> PanelChange {
+        self.image_open = !self.image_open;
+        PanelChange::Repaint
+    }
+
+    /// 圆角：先夹到 `region.radius_max()` 再记下。范围只有这一处，滑动条与键盘都走它。
+    pub fn set_radius(&mut self, radius: u32, region: Region) -> PanelChange {
+        let clamped = (radius as i32).clamp(0, region.radius_max()) as u32;
+        self.radius_px = clamped;
+        PanelChange::Radius(clamped)
+    }
+
+    /// 圆角滑块上的键盘：←↓ 减、→↑ 加、PgUp/PgDn ±8、Home/End 到两端。
+    ///
+    /// 只在这个槽上生效；返回 `None` 表示"这个键不归滑块"（Tab、数字、Esc 照常走后面的分支）。
+    fn radius_key(&mut self, key: PanelKey, region: Region) -> Option<PanelChange> {
+        let max = region.radius_max() as u32;
+        let next = match key {
+            PanelKey::Left | PanelKey::Down => self.radius_px.saturating_sub(1),
+            PanelKey::Right | PanelKey::Up => (self.radius_px + 1).min(max),
+            PanelKey::PageUp => (self.radius_px + 8).min(max),
+            PanelKey::PageDown => self.radius_px.saturating_sub(8),
+            PanelKey::Home => 0,
+            PanelKey::End => max,
+            _ => return None,
+        };
+        Some(self.set_radius(next, region))
+    }
+
     pub fn destination(&self) -> Destination {
         self.destination
     }
@@ -833,10 +955,20 @@ impl RegionPanel {
             }
         }
 
+        if self.focus == PanelSlot::Radius {
+            if let Some(change) = self.radius_key(key, region) {
+                return change;
+            }
+        }
+
         match key {
             PanelKey::Escape => PanelChange::Cancel,
             PanelKey::Tab | PanelKey::BackTab => {
-                let next = self.focus.step(key == PanelKey::Tab);
+                let mut next = self.focus.step(key == PanelKey::Tab);
+                // 圆角行收起时不存在：Tab 跳过它（不然焦点会落到一个看不见的滑块上）。
+                if next == PanelSlot::Radius && !self.image_open {
+                    next = next.step(key == PanelKey::Tab);
+                }
                 self.focus_slot(next);
                 self.begin_edit(region, dpi);
                 PanelChange::Repaint
@@ -878,6 +1010,9 @@ impl RegionPanel {
                     self.menu = Some(Ratio::menu_index(self.ratio));
                     PanelChange::Repaint
                 }
+                PanelSlot::Image => self.toggle_image(),
+                // 滑块上按 Enter 什么都不做：那是"确定"键，不该在调圆角时误提交。
+                PanelSlot::Radius => PanelChange::None,
                 PanelSlot::Swap => {
                     // 只交换宽高两个数；比例非无比例时一起翻转，免得出现"锁 16:9 却显示 9:16"。
                     // `21:9` 没有 `9:21` 对应项 ⇒ 退回无比例（唯一自洽的选择）。
@@ -909,9 +1044,9 @@ impl RegionPanel {
             | PanelKey::Home
             | PanelKey::End
             | PanelKey::Up
-            | PanelKey::Down => {
-                PanelChange::None
-            }
+            | PanelKey::Down
+            | PanelKey::PageUp
+            | PanelKey::PageDown => PanelChange::None,
         }
     }
 }
@@ -952,6 +1087,69 @@ mod tests {
         assert_eq!(desktop.shown(RegionField::Width, LengthUnit::Dp, 144), 913);
         assert_eq!(desktop.shown(RegionField::X, LengthUnit::Dp, 144), -1080);
         assert_eq!(desktop.to_rect(origin), rect, "换回本屏像素要回到原矩形");
+    }
+
+
+    #[test]
+    fn the_image_summary_follows_the_unit_and_says_when_there_is_none() {
+        let mut panel = panel();
+        assert_eq!(panel.image_summary(144), "无圆角");
+        panel.set_radius(12, region());
+        // 12 px @150% ⇒ 8 dp。
+        assert_eq!(panel.image_summary(144), "圆角 8");
+        assert_eq!(panel.radius_text(144), "8");
+        panel.set_unit(LengthUnit::Px);
+        assert_eq!(panel.image_summary(144), "圆角 12");
+        assert_eq!(panel.radius_text(144), "12");
+    }
+
+    #[test]
+    fn the_radius_is_clamped_to_the_short_side() {
+        let mut panel = panel();
+        // 1370×824 ⇒ 短边/2 = 412 ⇒ 封顶 128。
+        assert_eq!(region().radius_max(), 128);
+        panel.set_radius(999, region());
+        assert_eq!(panel.radius_px(), 128);
+        // 短边先到顶：1000×300 ⇒ 上限 150 ⇒ 还是 128；100×40 ⇒ 上限 20。
+        let small = Region { width: 100, height: 40, x: 0, y: 0 };
+        assert_eq!(small.radius_max(), 20);
+        panel.set_radius(999, small);
+        assert_eq!(panel.radius_px(), 20);
+    }
+
+    #[test]
+    fn the_slider_keys_step_and_stop_at_the_ends() {
+        let mut panel = panel();
+        // 点一下滑块把它聚焦（点数字格以外的地方也一样：`click` 只负责聚焦 + Enter）。
+        panel.click(PanelSlot::Radius, region(), 96);
+        assert_eq!(panel.focus(), PanelSlot::Radius);
+        assert_eq!(panel.key(PanelKey::Enter, region(), 96), PanelChange::None, "滑块不提交");
+        assert_eq!(panel.key(PanelKey::Right, region(), 96), PanelChange::Radius(1));
+        assert_eq!(panel.key(PanelKey::Up, region(), 96), PanelChange::Radius(2));
+        assert_eq!(panel.key(PanelKey::PageUp, region(), 96), PanelChange::Radius(10));
+        assert_eq!(panel.key(PanelKey::PageDown, region(), 96), PanelChange::Radius(2));
+        assert_eq!(panel.key(PanelKey::Left, region(), 96), PanelChange::Radius(1));
+        assert_eq!(panel.key(PanelKey::Down, region(), 96), PanelChange::Radius(0));
+        assert_eq!(panel.key(PanelKey::Down, region(), 96), PanelChange::Radius(0), "0 是地板");
+        assert_eq!(panel.key(PanelKey::End, region(), 96), PanelChange::Radius(128));
+        assert_eq!(panel.key(PanelKey::Home, region(), 96), PanelChange::Radius(0));
+    }
+
+    #[test]
+    fn tab_skips_the_slider_while_the_card_is_closed() {
+        let mut panel = panel();
+        panel.click(PanelSlot::Image, region(), 96);
+        assert!(panel.image_open(), "点卡头就是打开");
+        panel.key(PanelKey::Enter, region(), 96);
+        assert!(!panel.image_open(), "再按一次收起");
+        panel.key(PanelKey::Tab, region(), 96);
+        assert_eq!(panel.focus(), PanelSlot::Cancel, "收起时跳过圆角，直接到取消");
+        panel.toggle_image();
+        panel.click(PanelSlot::Image, region(), 96);
+        panel.toggle_image();
+        assert!(panel.image_open());
+        panel.key(PanelKey::Tab, region(), 96);
+        assert_eq!(panel.focus(), PanelSlot::Radius, "展开后 Tab 落到滑块上");
     }
 
     #[test]
@@ -1221,6 +1419,9 @@ mod tests {
     #[test]
     fn tab_walks_the_panel_in_reading_order_and_wraps() {
         let mut panel = panel();
+        // 圆角行只在图片卡展开时存在，所以这一圈要先把卡打开（收起时 Tab 会跳过它，
+        // 那是另一条测试 `tab_skips_the_slider_while_the_card_is_closed` 的事）。
+        panel.toggle_image();
         let region = region();
         // 默认焦点落在最可能要改的那一格，不一定是 ORDER 的第一项。
         assert_eq!(panel.focus(), PanelSlot::Width);
