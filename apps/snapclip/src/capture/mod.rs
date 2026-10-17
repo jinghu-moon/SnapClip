@@ -44,6 +44,16 @@ pub mod row_band_jpeg;
 /// 4:2:0 by definition and that is what damages coloured text.
 pub mod webp_sink;
 
+/// Saving in a format other than PNG: the master is the contract, the conversion is derived
+/// from it (`docs/34` §16).
+///
+/// It decodes row by row, so the JPEG sink decides between buffering the frame for the
+/// Huffman optimiser and streaming band by band, and a scroll save never materialises the
+/// 153 MiB frame.
+pub mod convert;
+
+pub use convert::{convert, convert_to_file, Conversion};
+
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 

@@ -85,6 +85,15 @@ impl JpgRowBandSink {
         Self::default()
     }
 
+    /// The same plan at another quality, for the save path's own setting (`docs/34` §16).
+    ///
+    /// Clamped rather than refused: a hand-edited settings file must not fail an encode.
+    pub fn with_quality(quality: u8) -> Self {
+        Self {
+            quality: quality.clamp(1, 100),
+        }
+    }
+
     /// The quality handed to the encoder, 1..=100.
     pub fn quality(&self) -> u8 {
         self.quality

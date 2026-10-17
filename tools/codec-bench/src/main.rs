@@ -15,6 +15,7 @@ mod huffman_ab;
 mod quality;
 mod scroll;
 mod synthetic;
+mod transcode;
 
 use std::time::Instant;
 
@@ -37,6 +38,10 @@ fn main() {
         println!("{}", scroll::report());
         return;
     }
+    if arguments.iter().any(|argument| argument == "--transcode") {
+        println!("{}", transcode::report());
+        return;
+    }
     if arguments.iter().any(|argument| argument == "--huffman-ab") {
         println!("{}", huffman_ab::report());
         return;
@@ -46,7 +51,7 @@ fn main() {
         return;
     }
     if !arguments.iter().any(|argument| argument == "--report") {
-        println!("codec-bench: pass --report, --quality, --scroll or --huffman-ab");
+        println!("codec-bench: pass --report, --quality, --scroll, --transcode or --huffman-ab");
         return;
     }
     run_report();
