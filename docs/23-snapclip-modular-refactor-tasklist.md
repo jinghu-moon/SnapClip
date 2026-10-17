@@ -4596,3 +4596,41 @@ layered 窗口、也能用带 `CAPTUREBLT` 的屏幕 `BitBlt` 看到它。
 **验证**：capture **488 passed / 0 failed / 76 ignored**、app **136 passed**、`cargo check --workspace --all-targets` 0 warning。
 
 **未验证**：Bug 2 要求的"0 与上限并排"L4 渲图本轮没出（预算），映射本身由纯测试钉住；三个修复的真机手感需用户复测。
+
+### §14.55.21 贴图的圆角真的到了 / 截图框自己带圆角
+
+**一、贴图没有圆角（根因：发布收口没写半径）**
+- 成因：`publish_selection` 把 `prepare_selection` 的 `SelectionPixels` 直接塞进 `shared.selection`，而那里的 `corner_radius` 是 `artifact.rs` 的默认 0。面板确认走 `Pin` 时只经过这条发布路径（不经过导出那条带遮罩的路径），于是贴图拿到"未遮罩的像素 + 半径 0" ⇒ 方角。真机日志 `confirm … destination=Pin` → `pin created` 无圆角即此。
+- 修法：半径在**唯一的发布收口**里写入（`publish_selection` 读控制器的 `corner_radius_px`），所有发布路径（面板确认走 Pin、延时走 Pin、拖拽发布）自动带上。与 `length_unit` 那次"两处真相"同一类错误的同一类修法。
+- 证据：`the_session_snapshot_carries_the_panel_radius`（负值夹 0）；发布路径的结构性保证写在代码注释里。
+
+**二、半径作用到截图框 + 去掉角标**
+- 值块只剩数字（`radius_glyph` 与其测试、角标矩形一并删除，不留死代码）。
+- 框用圆角描边（`stroke_round`），半径 0 时走原来的 `DrawRectangle`，视觉与之前逐像素一致。
+- **四个角手柄骑在弧上**：`geometry::corner_handle_anchor` = 45° 弧点（`角点 + r·(1−√2/2)`），半径 0 时退回几何角点；**命中区覆盖"几何角点 + 弧点"两者**（`SelectionSnapshot::hit_test` 的角分支），所以整个角都好抓，不必点中小圆点；边手柄与内部不动。
+- **上限改成 `min(128 px, 短边 / 4)`**（`geometry::radius_cap`），框的绘制、手柄布局、滑动条范围、图像遮罩 `artifact::round_corners` **四处共用同一个函数** —— 这就是"框是圆的、图是方的"不会发生的原因。用 1/4 是因为 45° 弧点必须留在边把手命中区之外。
+- 命中判定与绘制同源：`CaptureSession` 持有半径（`set_corner_radius`），`snapshot()` 带上它；面板改半径时同步给会话。
+- 测试：`rounded_frame_tests` 四条（上限、弧点单调内移与四角对称、整个角区域都判 Resize 且边把手/内部不受影响、会话快照跟随半径并夹 0）；`region` 的夹取测试按新上限更新（100×40 ⇒ 10，1000×300 ⇒ 75）；`artifact` 的抗锯齿探针从"赌某一格"改成"扫角块找部分覆盖"（半径与取整决定弧落在哪一格，赌单格会随尺寸变化而假失败）。
+- 渲图：`target/frame_r0.png` / `frame_r32.png` / `frame_r64.png`（同一选区、同一面板状态）。R=0 是直角框 + 角点手柄；R=64 框成弧、四个角手柄骑在弧上、边手柄与之前完全一致。
+
+**已知近似（本轮不改）**：倒计时 HUD 的窗口区域按"矩形环"算，圆角框下它只是近似（角上会多留/少留几个像素的窗口）。记在此，留待需要时处理。
+
+**验证**：capture **491 passed / 0 failed / 76 ignored**、app **136 passed**、`layered_differential` **3 passed**、`cargo check --workspace --all-targets` 0 warning、无临时诊断代码。
+
+**未验证**：真机手感（角手柄在弧上的抓取、拖拽改大小时弧的实时跟随、半径 = 上限时的观感）。
+
+### §14.55.22 贴图边框沿弧 + 倒计时窗口区域改圆角环
+
+**一、贴图圆角处没有边框**
+
+- 成因：圆角遮罩（`mask_rounded_corners`）作用在**整块贴图缓冲**上（含那 2 px 边框）⇒ 方角边框在弧内被一起切掉。`paint_pin` 用 `fill_border` 铺的是**方角**边框，它自己并不知道弧在哪。
+- 修法：`paint_pin_with_radius` 在图像重采样之后、倍数控件之前调用 `rounded_border_band` —— 只处理四个**角块**，把"内弧之外"的像素按覆盖率补成边框色（与遮罩同一套几何：同圆心、同半径、同为 4×4 采样，所以内外弧同心）。直边仍由 `fill_border` 负责；半径 0 时角块为空，**一个像素都不碰**（与改动前逐字节一致，有断言）。
+- 证据：`a_rounded_pin_keeps_its_border_along_the_arc`（40×40 缓冲、边框 4、图像 32×32、半径 12）：方角时图像角上是图像色；圆角后**同一格必须是 `BORDER_COLOR`**；直边中点不动；半径 0 与旧路径逐字节相等。
+- 未验证：真机观感（角部边框的粗细与过渡是否自然）。**没有出放大渲图**：贴图缓冲在产品里没有 PNG 落盘路径，本轮预算不足，没有为此写临时编码器。
+
+**二、倒计时窗口区域在圆角框下仍是矩形环**
+
+- 成因：`countdown_window_pieces` 只产出 `WindowRegion::Ring`（矩形环），而选框已经能画成圆角 ⇒ 环与框线在四角不贴合。
+- 修法：新增 `WindowRegion::RoundRing { outer, inner, radius }`（`CreateRoundRectRgn` 外框 + 内框 + `RGN_DIFF`；内弧半径由环宽推导，所以两弧同心）；`countdown_window_pieces` 多收一个 `radius`，> 0 时产出圆角环，**半径 0 仍走矩形环**（与改动前一致）。调用点是 `enter_countdown` 的 `NarrowRegion` 与拖动时的 `sync_countdown_region`，都传 `corner_radius_px`。
+- 证据：活桌面 `a_rounded_ring_follows_the_arc_on_a_real_window` —— 弧带里的点在内、**外弧之外的点不在内**（矩形环会误判为在内，这正是该变体的意义）、直边在内、选区中心不在内、还原后 `GetWindowRgn == 0`；圆角 0 的旧断言（`a_combined_region_keeps_the_frame_ring_and_drops_the_middle`）仍绿。
+- 未验证：真机上倒计时期间环与框的贴合观感。

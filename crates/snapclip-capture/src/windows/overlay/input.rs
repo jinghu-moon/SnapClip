@@ -1132,8 +1132,10 @@ impl OverlayController {
                 self.invalidate();
             }
             PanelChange::Radius(radius) => {
-                // 圆角只影响成图，不影响浮层画面；但面板里的滑块与摘要要跟着重画。
+                // 圆角同时作用于成图（遮罩）与截图框本身（弧 + 手柄位置），所以会话也要拿到它，
+                // 否则命中判定还按直角算、与看到的圆角对不上（docs/23 §14.55.21）。
                 self.corner_radius_px = radius;
+                self.session.set_corner_radius(radius as i32);
                 self.invalidate();
             }
             PanelChange::Region(region) => {
@@ -1269,6 +1271,7 @@ impl OverlayController {
             self.session.selection(),
             self.label_badge,
             self.session.dpi(),
+            i32::try_from(self.corner_radius_px).unwrap_or(0),
         );
         self.set_window_region(&pieces);
     }

@@ -1296,7 +1296,7 @@ unsafe fn attach_window(hwnd: HWND, seed: &mut WindowSeed) -> Result<()> {
     let image_height = seed.image.height();
     let size = window_size(image_width, image_height, 1.0, border);
     let mut framebuffer = LayeredBuffer::new(size.0, size.1, true)?;
-    paint_pin(
+    paint_pin_with_radius(
         framebuffer.pixels_mut(),
         size,
         border,
@@ -1305,6 +1305,7 @@ unsafe fn attach_window(hwnd: HWND, seed: &mut WindowSeed) -> Result<()> {
         image_height,
         1.0,
         dpi,
+        scaled_radius(seed.radius, 1.0),
     );
     framebuffer
         .submit(hwnd, Some(seed.position), scaled_radius(seed.radius, 1.0))
@@ -1444,7 +1445,7 @@ unsafe fn repaint_window(
     let border = border_px(dpi);
     let scaled = window_size(window.image_width, window.image_height, window.zoom, border);
     let mut framebuffer = LayeredBuffer::new(scaled.0, scaled.1, false)?;
-    paint_pin(
+    paint_pin_with_radius(
         framebuffer.pixels_mut(),
         scaled,
         border,
@@ -1453,6 +1454,7 @@ unsafe fn repaint_window(
         window.image_height,
         window.zoom,
         dpi,
+        scaled_radius(window.radius, window.zoom),
     );
 
     framebuffer
@@ -1688,6 +1690,8 @@ fn wheel_zoom(zoom: f64, remainder: i32, delta: i32) -> (f64, i32, i32) {
 /// 方向上都错：放大时每个源像素被铺成一个方块，斜线成了楼梯（用户报的就是这个，
 /// 「放大后的锯齿感很明显」）；缩小时直接把中间的源像素丢掉，高频细节变成摩尔纹。
 /// 代价是重采样会让细节略微变软——但软了还认得出是什么字，锯齿就认不出了。
+/// 旧的方角版本：等价于半径 0，只给测试用。
+#[cfg(test)]
 fn paint_pin(
     buffer: &mut [u32],
     size: (i32, i32),
@@ -1697,6 +1701,104 @@ fn paint_pin(
     image_height: u32,
     zoom: f64,
     dpi: u32,
+) {
+    paint_pin_with_radius(
+        buffer,
+        size,
+        border,
+        image,
+        image_width,
+        image_height,
+        zoom,
+        dpi,
+        0,
+    );
+}
+
+/// 把方角边框改成沿内弧走：只动"圆角那四个角块"，直边部分 `fill_border` 已经铺好。
+///
+/// 与 `mask_rounded_corners` 用**同一套几何**（同圆心、同半径、同为 4×4 采样），所以边框的内弧
+/// 与遮罩的外弧是同心圆 —— 这是"框是圆的、图是方的"不会发生的原因。半径 0 时立刻返回，
+/// 一个像素都不碰（与改动前逐字节一致）。
+fn rounded_border_band(buffer: &mut [u32], size: (usize, usize), border: usize, radius: i32) {
+    let (width, height) = size;
+    if radius <= 0 || border == 0 || width == 0 || height == 0 || buffer.len() < width * height {
+        return;
+    }
+    let r = (radius as usize).min(width.min(height) / 2);
+    let inner_r = r.saturating_sub(border);
+    if inner_r == 0 {
+        return;
+    }
+    const SAMPLES: usize = 4;
+    let total = (SAMPLES * SAMPLES) as u32;
+    let (br, bg, bb) = (
+        (BORDER_COLOR >> 16) & 0xFF,
+        (BORDER_COLOR >> 8) & 0xFF,
+        BORDER_COLOR & 0xFF,
+    );
+    // 四个角：外层框的角块。`(sx, sy)` 把"离角的距离"翻成正方向。
+    let corners = [
+        (0usize, 0usize, 1f64, 1f64),
+        (width - r, 0, -1.0, 1.0),
+        (0, height - r, 1.0, -1.0),
+        (width - r, height - r, -1.0, -1.0),
+    ];
+    let reach = border + inner_r;
+    for (cx, cy, sx, sy) in corners {
+        for y in cy..(cy + reach).min(height) {
+            for x in cx..(cx + reach).min(width) {
+                // 离角多远（朝内为正）
+                let dx = if sx > 0.0 { x - cx } else { cx + r - 1 - x } as f64 + 0.5;
+                let dy = if sy > 0.0 { y - cy } else { cy + r - 1 - y } as f64 + 0.5;
+                if dx >= reach as f64 || dy >= reach as f64 {
+                    continue; // 直边，fill_border 已经铺好
+                }
+                let centre = (border + inner_r) as f64;
+                let mut hits = 0u32;
+                for sub_y in 0..SAMPLES {
+                    for sub_x in 0..SAMPLES {
+                        let px = dx + (sub_x as f64 + 0.5) / SAMPLES as f64;
+                        let py = dy + (sub_y as f64 + 0.5) / SAMPLES as f64;
+                        if !(px < centre || py < centre) {
+                            hits += 1;
+                            continue;
+                        }
+                        let (ddx, ddy) = (px - centre, py - centre);
+                        if ddx * ddx + ddy * ddy <= (inner_r * inner_r) as f64 {
+                            hits += 1;
+                        }
+                    }
+                }
+                let border_weight = total - hits; // 内弧之外的采样数 ⇒ 该是边框的比例
+                if border_weight == 0 {
+                    continue;
+                }
+                let index = y * width + x;
+                let current = buffer[index];
+                let keep = hits;
+                // 缓冲是 BGRA（低字节 = B）：按通道插值，比重写成纯边框色更耐看。
+                let blend_b = (current & 0xFF) * keep / total + bb * border_weight / total;
+                let blend_g = ((current >> 8) & 0xFF) * keep / total + bg * border_weight / total;
+                let blend_r = ((current >> 16) & 0xFF) * keep / total + br * border_weight / total;
+                let blend_a = ((current >> 24) & 0xFF) * keep / total
+                    + ((BORDER_COLOR >> 24) & 0xFF) * border_weight / total;
+                buffer[index] = (blend_a << 24) | (blend_r << 16) | (blend_g << 8) | blend_b;
+            }
+        }
+    }
+}
+
+fn paint_pin_with_radius(
+    buffer: &mut [u32],
+    size: (i32, i32),
+    border: i32,
+    image: &[u32],
+    image_width: u32,
+    image_height: u32,
+    zoom: f64,
+    dpi: u32,
+    radius: i32,
 ) {
     let width = size.0.max(0) as usize;
     let height = size.1.max(0) as usize;
@@ -1740,6 +1842,12 @@ fn paint_pin(
         &plan_axis(source_width, target_width),
         &plan_axis(source_height, target_height),
     );
+
+    // 圆角处的边框要沿着弧走：遮罩（`mask_rounded_corners`）只负责切掉外侧，方角边框会在弧内
+    // 被一起切掉 ⇒ 圆角处"没有边框"。这一步把内弧以外的像素补成边框色（含 4×4 抗锯齿）。
+    if radius > 0 {
+        rounded_border_band(buffer, (width, height), border, radius);
+    }
 
     // 倍数控件最后画：它要压在图像上，而上面那段会把整块图像区重写一遍。
     composite_badge(
@@ -3331,6 +3439,22 @@ mod tests {
     /// 一行像素的测试数据。
     fn image_of(width: u32, height: u32) -> Vec<u32> {
         (0..(width * height)).map(|i| 0xFF00_0000 | (i + 1)).collect()
+    }
+
+    /// 圆角处必须有边框：遮罩只切外侧，方角边框会在弧内被一起切掉（docs/23 §14.55.22）。
+    #[test]
+    fn a_rounded_pin_keeps_its_border_along_the_arc() {
+        let image = vec![0xFF00_FF00u32; 32 * 32]; // BGRA：不透明绿
+        let mut square = vec![0u32; 40 * 40];
+        paint_pin(&mut square, (40, 40), 4, &image, 32, 32, 1.0, TEST_DPI);
+        let mut rounded = vec![0u32; 40 * 40];
+        paint_pin_with_radius(&mut rounded, (40, 40), 4, &image, 32, 32, 1.0, TEST_DPI, 12);
+        let mut zero = vec![0u32; 40 * 40];
+        paint_pin_with_radius(&mut zero, (40, 40), 4, &image, 32, 32, 1.0, TEST_DPI, 0);
+        assert_eq!(zero, square, "半径 0 必须与旧路径逐字节一致");
+        assert_eq!(square[4 * 40 + 4], 0xFF00_FF00, "方角时图像角上是图像");
+        assert_eq!(rounded[4 * 40 + 4], BORDER_COLOR, "圆角时角上必须是边框，不是被裁掉");
+        assert_eq!(rounded[20 * 40 + 4], 0xFF00_FF00, "直边中点的图像不动");
     }
 
     #[test]

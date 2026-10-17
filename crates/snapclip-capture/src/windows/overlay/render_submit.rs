@@ -371,6 +371,7 @@ impl OverlayController {
             cursor_visible,
             show_chrome,
             show_handles,
+            corner_radius: self.corner_radius_px as i32,
             show_size_label,
             label,
             label_hovered,

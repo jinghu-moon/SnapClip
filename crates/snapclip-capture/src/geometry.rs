@@ -113,6 +113,32 @@ impl Handle {
     }
 }
 
+/// 圆角半径的统一上限：`min(128 px, 短边 / 4)`。
+///
+/// 用 1/4 而不是 1/2：45° 处的弧点必须留在边把手的命中区之外，否则四个角把手与四条边把手
+/// 会挤在同一处（docs/23 §14.55.21）。框的绘制、手柄布局、图像遮罩三处共用这一个函数，
+/// 免得出现"框是圆的、图是方的"。
+pub fn radius_cap(width: i32, height: i32) -> i32 {
+    (width.min(height).max(0) / 4).min(crate::region::RADIUS_MAX_PX)
+}
+
+/// 角手柄的锚点：有圆角时骑在各自圆弧的 45° 中点，没有圆角时就是几何角点。
+///
+/// 圆弧中心在 `角点内移 r` 处，45° 点再沿对角线出来 `r·(1 − √2/2)` ≈ `0.293 r`，
+/// 所以在 (left, top) 这类角上，锚点 = `角点 + (r − r·√2/2)`。
+pub fn corner_handle_anchor(rect: Rect, radius: i32, handle: Handle) -> Point {
+    let corner = handle.anchor(rect);
+    let radius = radius.min(radius_cap(rect.width(), rect.height())).max(0);
+    if radius == 0 {
+        return corner;
+    }
+    let offset = (radius as f32 * std::f32::consts::FRAC_1_SQRT_2).round() as i32;
+    let inner = radius - offset;
+    let dx = if corner.x == rect.left { inner } else { -inner };
+    let dy = if corner.y == rect.top { inner } else { -inner };
+    Point::new(corner.x + dx, corner.y + dy)
+}
+
 /// The four corner grips, checked before the edge grips.
 pub const CORNER_HANDLES: [Handle; 4] = [
     Handle::TopLeft,
@@ -178,6 +204,8 @@ pub enum SelectionGeometry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SelectionSnapshot {
     pub rect: Rect,
+    /// Rounding of the frame, in physical pixels (docs/23 §14.55.21). The grips ride its arcs.
+    pub radius: i32,
     /// Corner radius in physical pixels.
     pub corner_radius: i32,
     /// Hit tolerance in physical pixels (already DPI scaled).
@@ -202,9 +230,16 @@ impl SelectionSnapshot {
         let scale = dpi.max(96) as f32 / 96.0;
         Self {
             rect,
+            radius: 0,
             corner_radius: (8.0 * scale).round() as i32,
             hit_slop: (6.0 * scale).round() as i32,
         }
+    }
+
+    /// 给这份快照设定框的圆角（物理像素）。命中判定与绘制都读同一个值。
+    pub fn with_radius(mut self, radius: i32) -> Self {
+        self.radius = radius.max(0);
+        self
     }
 
     pub fn visual_handle_size(&self, handle: Handle, dpi: u32) -> f32 {
@@ -230,9 +265,13 @@ impl SelectionSnapshot {
             return SelectionGeometry::Create;
         }
         for handle in CORNER_HANDLES {
-            let anchor = handle.anchor(self.rect);
-            let size = self.hit_handle_size(handle, dpi);
-            if (point.x - anchor.x).abs() <= size && (point.y - anchor.y).abs() <= size {
+            let corner = handle.anchor(self.rect);
+            let arc = corner_handle_anchor(self.rect, self.radius, handle);
+            // 命中区盖住"几何角点 + 弧点"两者（再各加 grip 的 slop）：圆角越大，两者分得越开，
+            // 用户点角附近任何一处都算抓住这个角（docs/23 §14.55.21）。
+            let size = self.hit_handle_size(handle, dpi) + (corner.x - arc.x).abs().max((corner.y - arc.y).abs()) / 2;
+            let mid = Point::new((corner.x + arc.x) / 2, (corner.y + arc.y) / 2);
+            if (point.x - mid.x).abs() <= size && (point.y - mid.y).abs() <= size {
                 return SelectionGeometry::Resize(handle);
             }
         }
@@ -3201,5 +3240,78 @@ mod tests {
                 "单位 {unit:?} 的中心必须命中它自己"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod rounded_frame_tests {
+    use super::{Handle, Rect, SelectionGeometry, SelectionSnapshot, corner_handle_anchor, radius_cap};
+
+    #[test]
+    fn the_cap_is_a_quarter_of_the_short_side() {
+        // 1/4 而不是 1/2：45° 弧点必须留在边把手的命中区之外（docs/23 §14.55.21）。
+        assert_eq!(radius_cap(1370, 824), 128, "大图封顶 128");
+        assert_eq!(radius_cap(1000, 300), 75, "短边/4");
+        assert_eq!(radius_cap(100, 40), 10);
+        assert_eq!(radius_cap(0, 40), 0);
+    }
+
+    #[test]
+    fn a_corner_grip_sits_on_the_arc_and_moves_out_with_the_radius() {
+        let rect = Rect::new(0, 0, 400, 300);
+        let corner = Handle::TopLeft;
+        assert_eq!(
+            corner_handle_anchor(rect, 0, corner),
+            Handle::TopLeft.anchor(rect),
+            "半径 0 时就是几何角点"
+        );
+        let small = corner_handle_anchor(rect, 10, corner);
+        let large = corner_handle_anchor(rect, 60, corner);
+        // 弧点向框内移动，且随半径单调（45° 处内移 r·(1−√2/2) ≈ 0.293r）。
+        assert!(small.x > 0 && small.x < 10, "10 的半径应内移约 3：{small:?}");
+        assert!(large.x > small.x, "半径越大越往内：{large:?} vs {small:?}");
+        assert!(large.x < 60, "始终在框内：{large:?}");
+        // 四个角对称：右上角的 y 与左上角相同，x 关于中线对称。
+        let top_right = corner_handle_anchor(rect, 60, Handle::TopRight);
+        assert_eq!(top_right.y, large.y);
+        assert_eq!(400 - top_right.x, large.x);
+    }
+
+    #[test]
+    fn the_whole_corner_region_grabs_the_corner_grip() {
+        let rect = Rect::new(100, 100, 500, 400);
+        let snapshot = SelectionSnapshot::new(rect, 96).with_radius(48);
+        // 几何角点、弧点，以及两者之间，都应判为同一个角的 Resize。
+        let arc = corner_handle_anchor(rect, 48, Handle::TopLeft);
+        for point in [
+            Handle::TopLeft.anchor(rect),
+            arc,
+            super::Point::new((100 + arc.x) / 2, (100 + arc.y) / 2),
+        ] {
+            assert_eq!(
+                snapshot.hit_test(point, 96),
+                SelectionGeometry::Resize(Handle::TopLeft),
+                "角区域应整块可抓：{point:?}"
+            );
+        }
+        // 边把手与内部不受圆角影响。
+        assert_eq!(
+            snapshot.hit_test(super::Point::new(300, 96), 96),
+            SelectionGeometry::Resize(Handle::Top)
+        );
+        assert_eq!(
+            snapshot.hit_test(super::Point::new(300, 250), 96),
+            SelectionGeometry::Move
+        );
+    }
+
+    #[test]
+    fn the_session_snapshot_carries_the_panel_radius() {
+        // 命中判定与绘制同源：会话持有半径，快照带上它（docs/23 §14.55.21）。
+        let mut session = crate::session::CaptureSession::new("radius-test");
+        session.set_corner_radius(37);
+        assert_eq!(session.snapshot().radius, 37);
+        session.set_corner_radius(-5);
+        assert_eq!(session.snapshot().radius, 0, "负数夹到 0");
     }
 }

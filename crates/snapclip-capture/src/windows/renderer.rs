@@ -33,6 +33,8 @@ pub struct OverlayFrameState {
     pub show_chrome: bool,
     /// Show the eight edit grips. A draft selection deliberately hides them.
     pub show_handles: bool,
+    /// Rounding of the frame in physical pixels (docs/23 §14.55.21); grips ride its arcs.
+    pub corner_radius: i32,
     /// Show the live size/coordinate label for a draft or committed selection.
     pub show_size_label: bool,
     /// How that label reads, from the session's preferences — the same value the badge's own menu
@@ -115,6 +117,7 @@ impl OverlayFrameState {
             cursor_visible: false,
             show_chrome: false,
             show_handles: true,
+            corner_radius: 0,
             show_size_label: true,
             // Match `OverlayPreferences::default()`: a state built without preferences reads the
             // same numbers the overlay would show before anyone changed anything.
@@ -303,6 +306,7 @@ impl Win32Renderer {
             cursor_visible: state.cursor_visible,
             show_chrome: state.show_chrome,
             show_handles: state.show_handles,
+            corner_radius: state.corner_radius,
             show_size_label: state.show_size_label,
             label: state.label,
             label_hovered: state.label_hovered,

@@ -107,6 +107,7 @@ impl DimLayer {
         &mut self,
         monitor: Rect,
         selection: Rect,
+        radius: i32,
         content: Option<&DimSource>,
     ) -> Result<(), String> {
         if monitor.width() <= 0 || monitor.height() <= 0 {
@@ -119,7 +120,7 @@ impl DimLayer {
         self.ensure_window(monitor)?;
         self.paint(content);
         self.submit(Some((monitor.left, monitor.top)))?;
-        self.apply_shape(monitor, selection)?;
+        self.apply_shape(monitor, selection, radius)?;
         self.exclude_from_capture();
         unsafe {
             ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
@@ -138,11 +139,11 @@ impl DimLayer {
     }
 
     /// 拖动改框时只换"洞"：不重填 DIB、不重新提交层内容。
-    pub(super) fn update(&mut self, monitor: Rect, selection: Rect) -> Result<(), String> {
+    pub(super) fn update(&mut self, monitor: Rect, selection: Rect, radius: i32) -> Result<(), String> {
         if self.hwnd.is_null() {
             return Ok(());
         }
-        self.apply_shape(monitor, selection)
+        self.apply_shape(monitor, selection, radius)
     }
 
     pub(super) fn hide(&mut self) {
@@ -387,9 +388,18 @@ impl DimLayer {
         Ok(())
     }
 
-    fn apply_shape(&mut self, monitor: Rect, selection: Rect) -> Result<(), String> {
+    fn apply_shape(&mut self, monitor: Rect, selection: Rect, radius: i32) -> Result<(), String> {
         let outer = Rect::new(0, 0, monitor.width(), monitor.height());
+        let radius = radius
+            .min(crate::geometry::radius_cap(selection.width(), selection.height()))
+            .max(0);
         let pieces = match dim_hole(monitor, selection) {
+            // 有圆角时洞必须跟着弧走，否则弧与方角之间会露出四个楔形空白（docs/23 §14.55.23）。
+            Some(hole) if radius > 0 => vec![WindowRegion::RoundedHole {
+                outer,
+                inner: hole,
+                radius,
+            }],
             Some(hole) => vec![WindowRegion::Ring {
                 outer,
                 inner: hole,

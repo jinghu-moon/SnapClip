@@ -662,12 +662,14 @@ fn the_countdown_keeps_only_the_ui_that_is_on_screen() {
     use crate::windows::win::window::WindowRegion;
     let selection = Rect::new(120, 80, 620, 480);
     let badge = Rect::new(120, 44, 300, 70);
-    let pieces = super::session::countdown_window_pieces(selection, Some(badge), 96);
+    let pieces = super::session::countdown_window_pieces(selection, Some(badge), 96, 0);
 
     let (outer, inner) = pieces
         .iter()
         .find_map(|piece| match piece {
             WindowRegion::Ring { outer, inner } => Some((*outer, *inner)),
+            WindowRegion::RoundRing { outer, inner, .. } => Some((*outer, *inner)),
+            WindowRegion::RoundedHole { outer, inner, .. } => Some((*outer, *inner)),
             WindowRegion::Rect(_) => None,
         })
         .expect("选框环必须在里面");
@@ -691,6 +693,8 @@ fn the_countdown_keeps_only_the_ui_that_is_on_screen() {
         .filter_map(|piece| match piece {
             WindowRegion::Rect(rect) => Some(*rect),
             WindowRegion::Ring { .. } => None,
+            WindowRegion::RoundRing { .. } => None,
+            WindowRegion::RoundedHole { .. } => None,
         })
         .find(|rect| rect.contains(selection.center()))
         .expect("倒计时小框");
@@ -707,13 +711,15 @@ fn the_countdown_keeps_only_the_ui_that_is_on_screen() {
     assert!(!number.contains(probe), "探针点不应当落在倒计时小框里");
 
     // 高 DPI 下跟着放大，中心不变。
-    let hidpi = super::session::countdown_window_pieces(selection, Some(badge), 192);
+    let hidpi = super::session::countdown_window_pieces(selection, Some(badge), 192, 0);
     assert_eq!(hidpi.len(), pieces.len());
     assert_eq!(
         hidpi
             .iter()
             .find_map(|piece| match piece {
                 WindowRegion::Ring { outer, .. } => Some(outer.center()),
+                WindowRegion::RoundRing { outer, .. } => Some(outer.center()),
+                WindowRegion::RoundedHole { outer, .. } => Some(outer.center()),
                 WindowRegion::Rect(_) => None,
             })
             .expect("环"),
@@ -722,7 +728,7 @@ fn the_countdown_keeps_only_the_ui_that_is_on_screen() {
 
     // 空选区：空集合（调用方据此还原整块窗口）。
     assert!(
-        super::session::countdown_window_pieces(Rect::new(10, 10, 10, 400), None, 96).is_empty()
+        super::session::countdown_window_pieces(Rect::new(10, 10, 10, 400), None, 96, 0).is_empty()
     );
 }
 
@@ -794,7 +800,7 @@ fn resizing_during_the_countdown_moves_the_pin_region_with_the_frame() {
     // 窗口区域同源跟随：环的内孔跟着新选区走。
     assert_eq!(
         pieces_after,
-        super::session::countdown_window_pieces(new, None, 96),
+        super::session::countdown_window_pieces(new, None, 96, 0),
         "HUD 的窗口区域也要按新选区重算"
     );
     assert_ne!(pieces, pieces_after);
@@ -1191,7 +1197,7 @@ fn the_countdown_dim_layer_actually_darkens_outside_the_selection() {
 
     let mut layer = super::dim_layer::DimLayer::default();
     layer
-        .show(monitor, selection, Some(&blurred_content))
+        .show(monitor, selection, 0, Some(&blurred_content))
         .expect("遮罩层应当显示");
     // 临时摘掉"排除出截图"，否则截图看不见它（这正是上一轮观测失效的一半原因）。
     layer.set_capture_exclusion(false);
@@ -1223,7 +1229,7 @@ fn the_countdown_dim_layer_actually_darkens_outside_the_selection() {
 
     // 4) 模糊真的到了屏幕上：换成"未模糊"的同一份内容，对比度必须大幅跳起来。
     layer
-        .show(monitor, selection, Some(&sharp_content))
+        .show(monitor, selection, 0, Some(&sharp_content))
         .expect("遮罩层应当显示");
     layer.set_capture_exclusion(false);
     dim_test_pump(260);
@@ -1244,7 +1250,7 @@ fn the_countdown_dim_layer_actually_darkens_outside_the_selection() {
         pixels: dim_test_checkerboard(width / 4, height / 4, 2),
     };
     layer
-        .show(monitor, selection, Some(&small_content))
+        .show(monitor, selection, 0, Some(&small_content))
         .expect("遮罩层应当显示");
     layer.set_capture_exclusion(false);
     dim_test_pump(260);
@@ -1271,7 +1277,7 @@ fn the_countdown_dim_layer_actually_darkens_outside_the_selection() {
 
     // 7) 排除出截图：延时贴图不会把遮罩带上。
     layer
-        .show(monitor, selection, Some(&blurred_content))
+        .show(monitor, selection, 0, Some(&blurred_content))
         .expect("遮罩层应当显示");
     layer.set_capture_exclusion(true);
     dim_test_pump(200);
@@ -1290,4 +1296,20 @@ fn the_countdown_dim_layer_actually_darkens_outside_the_selection() {
         (hidden_outside - baseline_outside).abs() <= 6.0,
         "隐藏后必须回到基线：{baseline_outside:.1} -> {hidden_outside:.1}"
     );
+}
+
+/// 圆角选区下，倒计时窗口区域必须是圆角环（矩形环会与框线不贴合）。
+#[test]
+fn a_rounded_selection_narrows_the_countdown_region_to_a_rounded_ring() {
+    use crate::windows::win::window::WindowRegion;
+    let selection = Rect::new(100, 100, 500, 400);
+    let square = super::session::countdown_window_pieces(selection, None, 96, 0);
+    assert!(matches!(square[0], WindowRegion::Ring { .. }), "半径 0 仍走矩形环");
+    let rounded = super::session::countdown_window_pieces(selection, None, 96, 20);
+    match rounded[0] {
+        WindowRegion::RoundRing { radius, .. } => {
+            assert!(radius > 20, "外弧半径 = 选区半径 + 环宽，实际 {radius}");
+        }
+        _ => panic!("圆角选区应走圆角环"),
+    }
 }

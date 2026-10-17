@@ -31,7 +31,7 @@ use ::windows::Win32::Graphics::Direct2D::{
     D2D1_LAYER_PARAMETERS1, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_MAP_OPTIONS_READ,
     D2D1_PROPERTY_TYPE_UNKNOWN,
     D2D1_ROUNDED_RECT, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, ID2D1Bitmap1, ID2D1DeviceContext,
-    ID2D1Effect, ID2D1Geometry, ID2D1Image, ID2D1LinearGradientBrush, ID2D1RenderTarget,
+    ID2D1Brush, ID2D1Effect, ID2D1Geometry, ID2D1Image, ID2D1LinearGradientBrush, ID2D1RenderTarget,
     ID2D1SolidColorBrush,
 };
 use ::windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
@@ -250,6 +250,8 @@ pub struct RenderView {
     pub show_chrome: bool,
     /// Whether the selection is committed enough to show edit grips.
     pub show_handles: bool,
+    /// Rounding of the frame in physical pixels; the grips ride its arcs (docs/23 §14.55.21).
+    pub corner_radius: i32,
     /// Whether the live size/coordinate label is useful in this state.
     pub show_size_label: bool,
     /// How the label reads — its unit, whether it carries the origin, whether it names the unit.
@@ -352,6 +354,7 @@ impl RenderView {
             cursor_visible: false,
             show_chrome: false,
             show_handles: true,
+            corner_radius: 0,
             show_size_label: true,
             label: LabelDisplay::default(),
             label_hovered: false,
@@ -435,6 +438,8 @@ pub struct OverlayRenderer {
     /// 延时倒计时的数字：主题色 80% 透明度（docs/23 §14.55.9）。
     countdown_brush: Option<ID2D1SolidColorBrush>,
     mask_brush: Option<ID2D1SolidColorBrush>,
+    /// 圆角洞的"框减去圆角洞"几何（帧、洞、半径变化时重建）。见 `rounded_hole_geometry`。
+    mask_ring: Option<(Rect, Rect, i32, ID2D1Geometry)>,
     /// `rgba(255,255,255,0.10)` — lifts the hovered window out of the dark mask.
     hover_fill_brush: Option<ID2D1SolidColorBrush>,
     /// Accent wash at low alpha — marks the automatic-snap preview.
@@ -674,6 +679,7 @@ impl OverlayRenderer {
             border_brush: None,
             countdown_brush: None,
             mask_brush: None,
+            mask_ring: None,
             hover_fill_brush: None,
             preview_fill_brush: None,
             preview_stroke_brush: None,
@@ -1190,32 +1196,54 @@ impl OverlayRenderer {
         // The hole is the box that would be *taken* (docs/21 §5.24, A2), which during a hover is
         // the previewed element rather than the settled selection — see `RenderView::mask_hole`.
         let hole = view.mask_hole();
+        // A rounded selection needs a rounded hole: four straight bands leave the wedge between
+        // each arc and the corner of its rectangle undimmed (docs/23 §14.55.23). Only when the hole
+        // *is* the selection — a hover preview's hole is that window's own rectangle.
+        let rounded_hole = (view.corner_radius > 0 && hole == view.selection)
+            .then(|| crate::geometry::radius_cap(hole.width(), hole.height()).min(view.corner_radius))
+            .filter(|radius| *radius > 0);
         // The blurred mask (a setting): the frame blurred outside the hole, under the same mask
         // and tint, so the selection is the one sharp thing on screen.
-        if view.mask_blur
-            && let Some(blurred) = self.blurred_frame.as_ref()
-        {
-            for band in outside_bands(view.frame, hole) {
-                let band = to_d2d(band);
-                unsafe {
-                    self.d2d.DrawBitmap(
-                        blurred,
-                        Some(&band),
-                        1.0,
-                        D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
-                        Some(&band),
-                        None,
-                    )
-                };
+        if let Some(radius) = rounded_hole {
+            let ring = self.rounded_hole_geometry(view.frame, hole, radius)?;
+            if view.mask_blur
+                && let Some(blurred) = self.blurred_frame.clone()
+            {
+                self.draw_bitmap_through(view.frame, &ring, &blurred)?;
             }
+            unsafe { self.d2d.FillGeometry(&ring, &mask, None::<&ID2D1Brush>) };
+        } else {
+            if view.mask_blur
+                && let Some(blurred) = self.blurred_frame.as_ref()
+            {
+                for band in outside_bands(view.frame, hole) {
+                    let band = to_d2d(band);
+                    unsafe {
+                        self.d2d.DrawBitmap(
+                            blurred,
+                            Some(&band),
+                            1.0,
+                            D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                            Some(&band),
+                            None,
+                        )
+                    };
+                }
+            }
+            fill_outside(&self.d2d, view.frame, hole, &mask);
         }
-        fill_outside(&self.d2d, view.frame, hole, &mask);
         // …and a trace of the theme colour on top of it (docs/21 §5.22). Black does the darkening;
         // the tint is only brand presence. The prototype measured why it stays small: at 30% the
         // screen shifts towards the rings' hue and a blue ring drops from 3.1:1 to 1.2–1.8:1,
         // while 10% costs almost nothing.
         if let Some(tint) = self.mask_tint_brush.clone() {
-            fill_outside(&self.d2d, view.frame, hole, &tint);
+            match rounded_hole {
+                Some(radius) => {
+                    let ring = self.rounded_hole_geometry(view.frame, hole, radius)?;
+                    unsafe { self.d2d.FillGeometry(&ring, &tint, None::<&ID2D1Brush>) };
+                }
+                None => fill_outside(&self.d2d, view.frame, hole, &tint),
+            }
         }
 
         // L2: annotations (inside selection only, after mask, before chrome).
@@ -1268,6 +1296,91 @@ impl OverlayRenderer {
             self.draw_region_panel(panel)?;
         }
 
+        Ok(())
+    }
+
+    /// "Whole frame minus a rounded hole", cached by its three inputs.
+    ///
+    /// The third consumer of the selection's radius, after the frame stroke and the image mask:
+    /// the dim layer outside the hole has to follow the same arc or the corner wedges stay bright
+    /// (docs/23 §14.55.23).
+    fn rounded_hole_geometry(
+        &mut self,
+        frame: Rect,
+        hole: Rect,
+        radius: i32,
+    ) -> Result<ID2D1Geometry, String> {
+        if let Some((cached_frame, cached_hole, cached_radius, geometry)) = self.mask_ring.as_ref()
+            && *cached_frame == frame
+            && *cached_hole == hole
+            && *cached_radius == radius
+        {
+            return Ok(geometry.clone());
+        }
+        let factory = unsafe { self.d2d.GetFactory() }
+            .map_err(|error| super::hresult("ID2D1DeviceContext::GetFactory", &error))?;
+        let outer: ID2D1Geometry = unsafe { factory.CreateRectangleGeometry(&to_d2d(frame)) }
+            .map_err(|error| super::hresult("CreateRectangleGeometry", &error))?
+            .cast()
+            .map_err(|error| super::hresult("cast to ID2D1Geometry", &error))?;
+        let rounded = D2D1_ROUNDED_RECT {
+            rect: to_d2d(hole),
+            radiusX: radius as f32,
+            radiusY: radius as f32,
+        };
+        let inner: ID2D1Geometry = unsafe { factory.CreateRoundedRectangleGeometry(&rounded) }
+            .map_err(|error| super::hresult("CreateRoundedRectangleGeometry", &error))?
+            .cast()
+            .map_err(|error| super::hresult("cast to ID2D1Geometry", &error))?;
+        // Alternate fill: the rounded hole inside the frame rect cancels out, leaving the band.
+        // (`ID2D1Factory` in this windows crate exposes `CreateGeometryGroup`, not
+        // `CreateCombinedGeometry`.)
+        let pieces = [Some(outer), Some(inner)];
+        let geometry: ID2D1Geometry = unsafe {
+            factory.CreateGeometryGroup(
+                windows::Win32::Graphics::Direct2D::Common::D2D1_FILL_MODE_ALTERNATE,
+                &pieces,
+            )
+        }
+        .map_err(|error| super::hresult("CreateGeometryGroup", &error))?
+        .cast()
+        .map_err(|error| super::hresult("cast to ID2D1Geometry", &error))?;
+        self.mask_ring = Some((frame, hole, radius, geometry.clone()));
+        Ok(geometry)
+    }
+
+    /// Draw `bitmap` over `bounds`, clipped to `clip` — the blurred mask under a rounded hole.
+    fn draw_bitmap_through(
+        &self,
+        bounds: Rect,
+        clip: &ID2D1Geometry,
+        bitmap: &ID2D1Bitmap1,
+    ) -> Result<(), String> {
+        let layer = unsafe { self.d2d.CreateLayer(None) }
+            .map_err(|error| super::hresult("CreateLayer", &error))?;
+        let parameters = D2D1_LAYER_PARAMETERS1 {
+            contentBounds: to_d2d(bounds),
+            geometricMask: std::mem::ManuallyDrop::new(Some(clip.clone())),
+            maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+            maskTransform: windows_numerics::Matrix3x2::identity(),
+            opacity: 1.0,
+            opacityBrush: std::mem::ManuallyDrop::new(None),
+            layerOptions: Default::default(),
+        };
+        let rect = to_d2d(bounds);
+        unsafe {
+            self.d2d.PushLayer(&parameters, &layer);
+            self.d2d.DrawBitmap(
+                bitmap,
+                Some(&rect),
+                1.0,
+                D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                Some(&rect),
+                None,
+            );
+            self.d2d.PopLayer();
+        }
+        let _ = std::mem::ManuallyDrop::into_inner(parameters.geometricMask);
         Ok(())
     }
 
@@ -1641,19 +1754,46 @@ impl OverlayRenderer {
         }
         let metrics = self.metrics;
         let border = self.require_brush(&self.border_brush, "border brush")?;
-        unsafe {
-            self.d2d.DrawRectangle(
-                &frame_stroke_rect(selection, metrics.border_width),
+        // 圆角跟着选区走（docs/23 §14.55.21）：半径 0 就是原来的直角框，半径越大弧越明显。
+        // 半径上限与手柄布局、图像遮罩共用 `geometry::radius_cap`。
+        let frame_radius = view
+            .corner_radius
+            .min(crate::geometry::radius_cap(selection.width(), selection.height()));
+        if frame_radius > 0 {
+            let inset = (metrics.border_width / 2.0).round() as i32;
+            self.stroke_round(
+                Rect::new(
+                    selection.left + inset,
+                    selection.top + inset,
+                    selection.right - inset,
+                    selection.bottom - inset,
+                ),
+                (frame_radius - inset).max(0),
                 &border,
                 metrics.border_width,
-                None,
             );
+        } else {
+            unsafe {
+                self.d2d.DrawRectangle(
+                    &frame_stroke_rect(selection, metrics.border_width),
+                    &border,
+                    metrics.border_width,
+                    None,
+                );
+            }
         }
         if marks.handles && view.show_handles {
             let handle = self.require_brush(&self.handle_brush, "handle brush")?;
             let radius = metrics.handle_size / 2.0;
             for grip in Handle::ALL {
-                let anchor = grip.anchor(selection);
+                let anchor = if matches!(
+                    grip,
+                    Handle::TopLeft | Handle::TopRight | Handle::BottomRight | Handle::BottomLeft
+                ) {
+                    crate::geometry::corner_handle_anchor(selection, frame_radius, grip)
+                } else {
+                    grip.anchor(selection)
+                };
                 let grip = D2D1_ELLIPSE {
                     point: vector2(anchor.x as f32, anchor.y as f32),
                     radiusX: radius,
@@ -1867,24 +2007,10 @@ impl OverlayRenderer {
             unsafe { self.d2d.DrawEllipse(&halo, ring_brush, 2.0, None) };
         }
 
-        // 值块：底 + 跟随弧度的角标 + 数字（0 时 muted）。
+        // 值块：底 + 数字（0 时 muted）。角标那个小方框已经移除，只留数值（docs/23 §14.55.21）。
         let value = layout.radius_value;
         self.fill_round(value, dip(4.0), &fill);
-        let glyph = Rect::from_origin_size(
-            Point::new(value.left + dip(8.0), value.center().y - dip(5.0)),
-            dip(10.0),
-            dip(10.0),
-        );
-        let glyph_radius =
-            crate::region::radius_glyph(panel.radius_px as i32, layout.radius_max);
-        let glyph_brush = if panel.radius_px > 0 { &accent } else { &muted };
-        self.stroke_round(glyph, glyph_radius, glyph_brush, dip(1.5) as f32);
-        let number = Rect::new(
-            glyph.right + dip(4.0),
-            value.top,
-            value.right - dip(2.0),
-            value.bottom,
-        );
+        let number = value;
         let format = self.info_text_format_mut(true, 11.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, true)?;
         let number_brush = if panel.radius_px > 0 { &text } else { &muted };
         self.draw_text_in(&panel.radius_text, &format, to_d2d(number), number_brush)?;
@@ -3265,6 +3391,7 @@ impl OverlayRenderer {
         self.border_brush = None;
         self.countdown_brush = None;
         self.mask_brush = None;
+        self.mask_ring = None;
         self.preview_fill_brush = None;
         self.preview_stroke_brush = None;
         self.badge_line_brush = None;

@@ -121,6 +121,7 @@ impl OverlayController {
                     self.session.selection(),
                     self.label_badge,
                     self.session.dpi(),
+                    i32::try_from(self.corner_radius_px).unwrap_or(0),
                 )),
                 EnterStep::ShowDim => self.show_countdown_dim(),
                 EnterStep::RaiseOverlay => self.raise_overlay_above_dim(),
@@ -177,7 +178,7 @@ impl OverlayController {
             });
         let source_ms = started.elapsed();
         let started = Instant::now();
-        match self.dim_layer.show(monitor, selection, content.as_ref()) {
+        match self.dim_layer.show(monitor, selection, self.corner_radius_px as i32, content.as_ref()) {
             Ok(()) => eprintln!(
                 "[snapclip][capture] countdown dim shown: source_ms={} paint_ms={} {}",
                 source_ms.as_millis(),
@@ -197,7 +198,7 @@ impl OverlayController {
             return;
         };
         let selection = self.session.selection();
-        if let Err(error) = self.dim_layer.update(monitor, selection) {
+        if let Err(error) = self.dim_layer.update(monitor, selection, self.corner_radius_px as i32) {
             eprintln!("[snapclip][capture] countdown dim update: {error}");
         }
     }
@@ -215,7 +216,7 @@ impl OverlayController {
         dpi: u32,
     ) -> (Option<crate::region::Region>, Vec<WindowRegion>) {
         let pin = (!selection.is_empty()).then(|| crate::region::Region::from_rect(selection, origin));
-        (pin, countdown_window_pieces(selection, badge, dpi))
+        (pin, countdown_window_pieces(selection, badge, dpi, 0))
     }
 
     /// 倒计时每秒一跳：还在数就重绘；到 0 收浮层、抓"等待之后那一帧"并交给贴图（docs/23 §14.55.9）。
@@ -570,6 +571,10 @@ impl OverlayController {
                     prepared.region.height(),
                     readback_ms
                 );
+                // 半径在**唯一的发布收口**里写入：每条发布路径（面板确认走 Pin、延时走 Pin、
+                // 拖拽后发布）都自动带上，不再由调用点各填一次（docs/23 §14.55.21）。
+                let mut prepared = prepared;
+                prepared.corner_radius = self.corner_radius_px as i32;
                 if let Ok(mut shared) = self.shared.lock() {
                     shared.selection = Some(Arc::new(prepared));
                 }
@@ -801,6 +806,8 @@ impl OverlayController {
                 cursor_visible: false,
                 show_chrome: false,
                 show_handles: false,
+                // 导出像素与框的圆角无关：遮罩在 `round_corners` 里统一做一次。
+                corner_radius: 0,
                 show_size_label: false,
                 // The label is not drawn on the export path at all; the unit is carried through
                 // unchanged so the export state stays a faithful copy of the session's.
@@ -1230,6 +1237,7 @@ pub(super) fn countdown_window_pieces(
     selection: Rect,
     badge: Option<Rect>,
     dpi: u32,
+    radius: i32,
 ) -> Vec<WindowRegion> {
     if selection.is_empty() {
         return Vec::new();
@@ -1249,13 +1257,24 @@ pub(super) fn countdown_window_pieces(
         selection.right - reach,
         selection.bottom - reach,
     );
-    let mut pieces = vec![WindowRegion::Ring {
-        outer,
-        inner: if inner.width() > 0 && inner.height() > 0 {
-            inner
-        } else {
-            Rect::new(0, 0, 0, 0)
-        },
+    // 圆角框下矩形环会与框线不贴合：半径 > 0 时改用圆角环，外弧与框同半径、向内加一圈环宽。
+    // 半径 0 走原来的矩形环（与改动前逐字节一致）。
+    let hole = if inner.width() > 0 && inner.height() > 0 {
+        inner
+    } else {
+        Rect::new(0, 0, 0, 0)
+    };
+    let mut pieces = vec![if radius > 0 {
+        WindowRegion::RoundRing {
+            outer,
+            inner: hole,
+            radius: radius + reach,
+        }
+    } else {
+        WindowRegion::Ring {
+            outer,
+            inner: hole,
+        }
     }];
     // 角标在选区之外，单独留一块；否则倒计时期间它会消失。
     if let Some(badge) = badge.filter(|badge| !badge.is_empty()) {

@@ -87,6 +87,8 @@ pub struct CaptureSession {
     frame: Option<CapturedFrame>,
     geometry: Option<OverlayGeometry>,
     selection: Rect,
+    /// 框的圆角（物理像素）。命中判定从这份状态读，保证与绘制同源（docs/23 §14.55.21）。
+    corner_radius: i32,
     drag: Option<SelectionDrag>,
     mode: Option<ResizeMode>,
 }
@@ -99,6 +101,7 @@ impl CaptureSession {
             frame: None,
             geometry: None,
             selection: Rect::default(),
+            corner_radius: 0,
             drag: None,
             mode: None,
         }
@@ -176,7 +179,12 @@ impl CaptureSession {
     }
 
     pub fn snapshot(&self) -> SelectionSnapshot {
-        SelectionSnapshot::new(self.selection, self.dpi())
+        SelectionSnapshot::new(self.selection, self.dpi()).with_radius(self.corner_radius)
+    }
+
+    /// 面板改了圆角：命中判定要立刻按新的弧来算（绘制读的是同一个值）。
+    pub fn set_corner_radius(&mut self, radius: i32) {
+        self.corner_radius = radius.max(0);
     }
 
     /// What a click at `point` would do, without changing any state.

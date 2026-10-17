@@ -103,46 +103,13 @@ impl Region {
         }
     }
 
-    /// 圆角上限：`min(128 px, 短边 / 2)`。给滑动条的范围与遮罩的夹取共用一份
-    /// （docs/23 §14.55.19）。
+    /// 圆角上限：`min(128 px, 短边 / 4)`，与框的绘制、手柄布局、图像遮罩共用同一份
+    /// （`geometry::radius_cap`，docs/23 §14.55.21）。
     pub fn radius_max(self) -> i32 {
-        (self.width.min(self.height).max(0) / 2).min(RADIUS_MAX_PX)
+        crate::geometry::radius_cap(self.width, self.height)
     }
 }
 
-/// 值块角标的圆角半径：0 ⇒ 直角；有值就从 1 起（小半径与 0 必须能看出差别），到上限时为 5 dip。
-///
-/// 以前直接用 `5 × 当前值 / 上限`，而上限可到 128 ⇒ 常见半径全被四舍五入成 0 或 1，
-/// 肉眼看就是"形状不跟着变"（docs/23 §14.55.20 的 Bug 2）。
-pub fn radius_glyph(radius_px: i32, radius_max: i32) -> i32 {
-    if radius_px <= 0 || radius_max <= 0 {
-        return 0;
-    }
-    let capped = radius_px.min(radius_max);
-    (1 + (4 * capped) / radius_max).min(5)
-}
-
-#[cfg(test)]
-mod radius_glyph_tests {
-    use super::radius_glyph;
-
-    #[test]
-    fn the_glyph_grows_with_the_radius_and_starts_at_one() {
-        assert_eq!(radius_glyph(0, 128), 0, "0 是直角");
-        assert_eq!(radius_glyph(1, 128), 1, "有值就从 1 起，否则与 0 看不出差别");
-        assert_eq!(radius_glyph(128, 128), 5, "上限");
-        // 单调不减
-        let mut last = 0;
-        for radius in 0..=128 {
-            let glyph = radius_glyph(radius, 128);
-            assert!(glyph >= last, "半径 {radius} 处回落了：{glyph} < {last}");
-            last = glyph;
-        }
-        // 中值必须与两端都不同（这才是"看得见变化"）
-        let mid = radius_glyph(64, 128);
-        assert!(mid > 1 && mid < 5, "中值应当是中间档，实际 {mid}");
-    }
-}
 
 impl Region {
     pub fn swapped(self) -> Self {
@@ -1106,15 +1073,19 @@ mod tests {
     #[test]
     fn the_radius_is_clamped_to_the_short_side() {
         let mut panel = panel();
-        // 1370×824 ⇒ 短边/2 = 412 ⇒ 封顶 128。
+        // 上限是 `min(128, 短边 / 4)`（不是 /2）：45° 的弧点必须留在边把手命中区之外，
+        // 否则角把手与边把手会挤在一处（docs/23 §14.55.21）。
+        // 1370×824 ⇒ 短边/4 = 206 ⇒ 封顶 128。
         assert_eq!(region().radius_max(), 128);
         panel.set_radius(999, region());
         assert_eq!(panel.radius_px(), 128);
-        // 短边先到顶：1000×300 ⇒ 上限 150 ⇒ 还是 128；100×40 ⇒ 上限 20。
+        // 短边先到顶：1000×300 ⇒ 75；100×40 ⇒ 10。
+        let wide = Region { width: 1000, height: 300, x: 0, y: 0 };
+        assert_eq!(wide.radius_max(), 75);
         let small = Region { width: 100, height: 40, x: 0, y: 0 };
-        assert_eq!(small.radius_max(), 20);
+        assert_eq!(small.radius_max(), 10);
         panel.set_radius(999, small);
-        assert_eq!(panel.radius_px(), 20);
+        assert_eq!(panel.radius_px(), 10);
     }
 
     #[test]

@@ -2881,6 +2881,79 @@ fn render_countdown_frame() -> (Vec<u8>, u32, Rect) {
     (pixels, width, selection)
 }
 
+/// 一帧普通画面（无 chrome、无面板），选区带圆角：用来量"遮罩的洞"是否跟着弧走。
+fn render_masked_frame(radius: i32) -> (Vec<u8>, u32) {
+    let device =
+        super::GraphicsDevice::create().expect("this test needs a D3D11 device (docs/31 D-14)");
+    let (width, height) = (400u32, 300u32);
+    let background = [200u8, 200, 200, 255];
+    let mut renderer = OverlayRenderer::new(std::sync::Arc::new(device), 96)
+        .expect("this test needs a Direct2D overlay renderer (docs/31 D-14)");
+    renderer
+        .update_frame(width, height, &solid_bgra(width, height, background))
+        .unwrap();
+    renderer.ensure_back_buffer(width, height).unwrap();
+    let target = renderer
+        .device()
+        .create_render_target_texture(width, height)
+        .unwrap();
+    let d2d_context = renderer.device().create_d2d_context().unwrap();
+    let target_bitmap = super::super::d3d11::create_bitmap_from_texture(
+        &d2d_context,
+        &target.texture,
+        D2D1_BITMAP_OPTIONS_TARGET,
+        D2D1_ALPHA_MODE_PREMULTIPLIED,
+    )
+    .unwrap();
+
+    let mut view = RenderView::new(Rect::from_origin_size(
+        Point::new(0, 0),
+        width as i32,
+        height as i32,
+    ));
+    view.selection = Rect::new(60, 50, 340, 250);
+    view.corner_radius = radius;
+    view.show_chrome = false;
+    view.show_handles = false;
+    view.show_size_label = false;
+    view.cursor_visible = false;
+    renderer.draw_to(&target_bitmap, &view).unwrap();
+    let pixels = renderer.device().read_back_bgra(&target.texture).unwrap();
+    (pixels, width)
+}
+
+/// 遮罩的洞必须跟着选区的圆角走（docs/23 §14.55.23）：半径 > 0 时，弧与方角之间的那块楔形
+/// 也要被压暗；半径 0 时它是"洞里"，不该被压暗。这两个半径在同一格上的差异就是判据。
+#[test]
+#[ignore = "L4 (docs/31 D-14): renders through the real D3D11/D2D path; run with --ignored on a machine with a GPU"]
+fn the_mask_hole_follows_the_rounded_selection() {
+    let (flat, width) = render_masked_frame(0);
+    let (rounded, _) = render_masked_frame(30);
+    // 楔形：在选区矩形内（(60,50)-(340,250)），但在半径 30 的弧外（弧心 (90,80)）。
+    let wedge = (63, 53);
+    let flat_px = pixel_at(&flat, width, wedge.0, wedge.1);
+    let round_px = pixel_at(&rounded, width, wedge.0, wedge.1);
+    assert!(
+        flat_px[0] >= 200,
+        "半径 0 时楔形属于洞里，应当还是原亮度：{flat_px:?}"
+    );
+    assert!(
+        round_px[0] + 30 < flat_px[0],
+        "半径 30 时楔形在弧外，必须被压暗：{round_px:?} vs {flat_px:?}"
+    );
+
+    // 洞里（选区正中）：两种半径都不压暗。
+    for (pixels, label) in [(&flat, "r0"), (&rounded, "r30")] {
+        let px = pixel_at(pixels, width, 200, 150);
+        assert!(px[0] >= 200, "{label} 洞里不该被压暗：{px:?}");
+    }
+    // 直边之外：两种半径都压暗。
+    for (pixels, label) in [(&flat, "r0"), (&rounded, "r30")] {
+        let px = pixel_at(pixels, width, 200, 20);
+        assert!(px[0] + 30 < 200, "{label} 直边外必须压暗：{px:?}");
+    }
+}
+
 /// 倒计时 HUD 的一帧：背景用棋盘（高频细节），这样任何多余的"冻结画面/遮罩"都会留下灰块。
 fn render_countdown_hud() -> (Vec<u8>, u32, Rect) {
     let device =
@@ -2966,3 +3039,4 @@ fn the_countdown_hud_paints_only_the_frame_the_badge_and_the_number() {
         "选区内部还留着冻结画面/遮罩的底色"
     );
 }
+

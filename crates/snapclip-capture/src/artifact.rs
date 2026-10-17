@@ -137,7 +137,8 @@ pub const MAX_CORNER_RADIUS_PX: u32 = 128;
 /// Coverage comes from 4x4 supersampling inside the radius square: the aliasing of a mask
 /// this small is exactly what would make a rounded window corner look like a staircase.
 pub fn round_corners(bgra: &mut [u8], width: u32, height: u32, radius: u32) {
-    let radius = radius.min(MAX_CORNER_RADIUS_PX).min(width.min(height) / 2);
+    // 与框的绘制、手柄布局共用一个上限（docs/23 §14.55.21）。
+    let radius = radius.min(crate::geometry::radius_cap(width as i32, height as i32) as u32);
     if radius == 0 || width == 0 || height == 0 {
         return;
     }
@@ -350,13 +351,18 @@ mod tests {
         assert_eq!(pixels[3], 0, "左上角整像素落在圆外 ⇒ 全透明");
         let centre = (((h / 2) * w + w / 2) * 4 + 3) as usize;
         assert_eq!(pixels[centre], 255, "中心不透明");
-        // 圆弧穿过的那一格（角内 (1, 2)）应有中间 alpha —— 抗锯齿的证据。
-        let edge = ((2 * w + 1) * 4 + 3) as usize;
-        assert!(
-            pixels[edge] > 0 && pixels[edge] < 255,
-            "圆的边界应有部分覆盖，实测 {}",
-            pixels[edge]
-        );
+        // 圆弧穿过的那些格子要出现中间 alpha —— 抗锯齿的证据。别赌某一格：扫角块，
+        // 只要存在"部分覆盖"就算通过（弧落在哪一像素取决于半径与取整）。
+        let mut partial = 0;
+        for y in 0..6u32 {
+            for x in 0..6u32 {
+                let alpha = pixels[((y * w + x) * 4 + 3) as usize];
+                if alpha > 0 && alpha < 255 {
+                    partial += 1;
+                }
+            }
+        }
+        assert!(partial > 0, "圆的边界应有部分覆盖的像素（抗锯齿）");
         // 颜色通道不动（直通 alpha）。
         assert_eq!(pixels[0], 7);
     }
@@ -364,7 +370,8 @@ mod tests {
     #[test]
     fn a_radius_wider_than_half_the_short_side_is_clamped() {
         use super::{MAX_CORNER_RADIUS_PX, round_corners};
-        let (w, h) = (8u32, 40u32);
+        // 宽度要够：上限是 `min(128, 短边/4)`，8 宽会把半径压到 2，探针就测不到"圆的边界"了。
+        let (w, h) = (24u32, 40u32);
         let mut pixels = vec![255u8; (w * h * 4) as usize];
         round_corners(&mut pixels, w, h, MAX_CORNER_RADIUS_PX);
         let centre = (((h / 2) * w + w / 2) * 4 + 3) as usize;

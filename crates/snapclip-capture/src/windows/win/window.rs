@@ -58,6 +58,25 @@ pub enum WindowRegion {
     Rect(Rect),
     /// A rectangle minus another — the selection's frame band, handles included.
     Ring { outer: Rect, inner: Rect },
+    /// A rounded frame band: the arcs follow the selection's own corners (docs/23 §14.55.22).
+    ///
+    /// `radius` is the **outer** band radius; the hole's radius is derived from the band width,
+    /// so the two arcs stay concentric however wide the band is.
+    RoundRing {
+        outer: Rect,
+        inner: Rect,
+        radius: i32,
+    },
+    /// A plain outer rect minus a **rounded** inner hole.
+    ///
+    /// The countdown dim layer's shape: the band is the whole screen, so only the *hole* has to
+    /// follow the selection's corners — deriving an inner radius from a band width, as
+    /// `RoundRing` does, would make no sense at this size (docs/23 §14.55.23).
+    RoundedHole {
+        outer: Rect,
+        inner: Rect,
+        radius: i32,
+    },
 }
 
 /// Combine `pieces` into one region for `SetWindowRgn`.
@@ -68,7 +87,7 @@ pub fn region_from_pieces(
     pieces: &[WindowRegion],
 ) -> Option<windows_sys::Win32::Graphics::Gdi::HRGN> {
     use windows_sys::Win32::Graphics::Gdi::{
-        CombineRgn, CreateRectRgn, DeleteObject, RGN_DIFF, RGN_OR,
+        CombineRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject, RGN_DIFF, RGN_OR,
     };
     unsafe {
         let combined = CreateRectRgn(0, 0, 0, 0);
@@ -83,6 +102,80 @@ pub fn region_from_pieces(
                         continue;
                     }
                     CreateRectRgn(rect.left, rect.top, rect.right, rect.bottom)
+                }
+                WindowRegion::RoundRing {
+                    outer,
+                    inner,
+                    radius,
+                } => {
+                    if outer.is_empty() {
+                        continue;
+                    }
+                    let band_width = (outer.width() - inner.width()).max(0) / 2;
+                    let outer_diameter = (radius.max(0) * 2).min(outer.width()).min(outer.height());
+                    let inner_radius = (radius.max(0) - band_width).max(0);
+                    let inner_diameter =
+                        (inner_radius * 2).min(inner.width()).min(inner.height());
+                    // `CreateRoundRectRgn` 的圆角参数是椭圆的**直径**，不是半径。
+                    let band = CreateRoundRectRgn(
+                        outer.left,
+                        outer.top,
+                        outer.right + 1,
+                        outer.bottom + 1,
+                        outer_diameter.max(1),
+                        outer_diameter.max(1),
+                    );
+                    if band.is_null() {
+                        continue;
+                    }
+                    if !inner.is_empty() && inner.width() > 0 && inner.height() > 0 {
+                        let hole = CreateRoundRectRgn(
+                            inner.left,
+                            inner.top,
+                            inner.right + 1,
+                            inner.bottom + 1,
+                            inner_diameter,
+                            inner_diameter,
+                        );
+                        if !hole.is_null() {
+                            CombineRgn(band, band, hole, RGN_DIFF);
+                            DeleteObject(hole);
+                        }
+                    }
+                    band
+                }
+                WindowRegion::RoundedHole {
+                    outer,
+                    inner,
+                    radius,
+                } => {
+                    if outer.is_empty() {
+                        continue;
+                    }
+                    let band = CreateRectRgn(outer.left, outer.top, outer.right, outer.bottom);
+                    if band.is_null() {
+                        continue;
+                    }
+                    if !inner.is_empty() && inner.width() > 0 && inner.height() > 0 {
+                        // `CreateRoundRectRgn`'s corner argument is the ellipse *diameter*.
+                        let diameter = (radius.max(0) * 2)
+                            .min(inner.width())
+                            .min(inner.height())
+                            .max(1);
+                        let hole = CreateRoundRectRgn(
+                            inner.left,
+                            inner.top,
+                            inner.right + 1,
+                            inner.bottom + 1,
+                            diameter,
+                            diameter,
+                        );
+                        if !hole.is_null() {
+                            CombineRgn(band, band, hole, RGN_DIFF);
+                            DeleteObject(hole);
+                        }
+                    }
+                    band
                 }
                 WindowRegion::Ring { outer, inner } => {
                     let band = CreateRectRgn(outer.left, outer.top, outer.right, outer.bottom);
@@ -897,6 +990,80 @@ mod tests {
     assert_eq!(unsafe { GetWindowRgn(raw, probe) }, 0, "还原后没有区域");
     unsafe { DeleteObject(probe) };
 }
+
+    /// 圆角洞：弧与方角之间那块楔形必须落在区域里（否则遮罩在那里留白，docs/23 §14.55.23）。
+    #[test]
+    fn a_rounded_hole_covers_the_corner_wedge() {
+        use windows_sys::Win32::Graphics::Gdi::{DeleteObject, PtInRegion};
+
+        let pieces = [WindowRegion::RoundedHole {
+            outer: Rect::new(0, 0, 400, 300),
+            inner: Rect::new(60, 50, 340, 250),
+            radius: 30,
+        }];
+        let region = region_from_pieces(&pieces).expect("圆角洞必须能合成");
+        // 弧心 (90, 80)、半径 30；(63, 53) 到弧心约 38 ⇒ 在弧外、但仍在选区矩形内。
+        assert_ne!(
+            unsafe { PtInRegion(region, 63, 53) },
+            0,
+            "弧与方角之间的楔形必须被压暗"
+        );
+        assert_eq!(
+            unsafe { PtInRegion(region, 150, 150) },
+            0,
+            "洞里（选区内容）不该被压暗"
+        );
+        assert_ne!(
+            unsafe { PtInRegion(region, 200, 20) },
+            0,
+            "直边之外仍然压暗"
+        );
+        unsafe { DeleteObject(region as _) };
+    }
+
+    /// 圆角环在活桌面上真的成弧：弧带里的点在内、**外弧之外**的点不在内（矩形环会误判为在内）。
+    #[test]
+    #[ignore = "L3 (docs/31 D-14): creates a real window; run with --ignored --test-threads=1 on a live desktop"]
+    fn a_rounded_ring_follows_the_arc_on_a_real_window() {
+        use windows_sys::Win32::Graphics::Gdi::{
+            CreateRectRgn, DeleteObject, GetWindowRgn, PtInRegion, SetWindowRgn,
+        };
+
+        require_desktop();
+        let window = TestWindow::create(WINDOW_EX_STYLE(0), WS_POPUP | WS_VISIBLE)
+            .expect("desktop is available");
+        let raw = window.handle() as *mut core::ffi::c_void;
+
+        // 外框 300x200、内框 260x160（环宽 20）、外弧半径 40 ⇒ 内弧半径 20，同心于 (80,100)。
+        let pieces = [WindowRegion::RoundRing {
+            outer: Rect::new(40, 60, 340, 260),
+            inner: Rect::new(60, 80, 320, 240),
+            radius: 40,
+        }];
+        let region = region_from_pieces(&pieces).expect("round ring must combine");
+        assert_ne!(unsafe { SetWindowRgn(raw, region, 1) }, 0, "SetWindowRgn 必须成功");
+
+        let probe = unsafe { CreateRectRgn(0, 0, 0, 0) };
+        assert!(!probe.is_null());
+        assert_ne!(unsafe { GetWindowRgn(raw, probe) }, 0, "窗口现在有区域");
+        unsafe {
+            // 内弧之外、外弧之内 ⇒ 弧带（把图像的角吃成边框的那一圈）
+            assert_ne!(PtInRegion(probe, 60, 80), 0, "弧带里的点属于窗口");
+            // 角方块之内、外弧之外 ⇒ 不属于窗口；矩形环会把它算进去（这正是本变体的意义）
+            assert_eq!(
+                PtInRegion(probe, 44, 64),
+                0,
+                "外弧之外必须不属于窗口，否则环与圆角框不贴合"
+            );
+            // 直边与选区中心
+            assert_ne!(PtInRegion(probe, 48, 160), 0, "直边属于窗口");
+            assert_eq!(PtInRegion(probe, 200, 150), 0, "选区中心不属于窗口");
+        }
+
+        assert_ne!(unsafe { SetWindowRgn(raw, std::ptr::null_mut(), 1) }, 0);
+        assert_eq!(unsafe { GetWindowRgn(raw, probe) }, 0, "还原后没有区域");
+        unsafe { DeleteObject(probe) };
+    }
 
     /// 倒计时里拖边框靠 `SetCapture` 才收得到窗口外的 `WM_MOUSEMOVE`（`overlay/input.rs`）。
     ///
