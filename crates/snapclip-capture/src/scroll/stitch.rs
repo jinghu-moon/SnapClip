@@ -1,8 +1,10 @@
 //! The long image: frames placed at the content position the estimator measured.
 //!
-//! The canvas is one contiguous BGRA buffer, `width` pixels wide. `pos` is the canvas row the top
-//! of the viewport currently shows. A measured shift moves `pos`; when the viewport leaves the
-//! canvas, the canvas grows by exactly the rows that were never seen before.
+//! The stitcher decides *where* a frame goes; a [`CanvasStore`] decides *how* those rows are held
+//! (docs/35 phase 1). Today the only store is one contiguous BGRA buffer, `width` pixels wide, so
+//! this module behaves exactly as it did when it owned that buffer itself. `pos` is the canvas row
+//! the top of the viewport currently shows. A measured shift moves `pos`; when the viewport leaves
+//! the canvas, the store grows by exactly the rows that were never seen before.
 //!
 //! Growth rewrites a **band** at the growing edge rather than only the new rows: a fixed footer
 //! (or, scrolling up, a fixed header) sits at that edge of every frame, and rewriting at least
@@ -10,6 +12,12 @@
 //! content. Only the last copy survives, where it belongs. The opposite edge is never written, so
 //! a fixed bar on that side appears once. The band is the reference's choice (`snow_shot`'s
 //! `compositor.rs`): `max(H/2, growth + H/4)`, at most `H`.
+
+pub(crate) use super::store::{CanvasStore, MemoryCanvas};
+#[cfg(feature = "test-support")]
+pub(crate) use super::store::Budgets;
+#[cfg(feature = "test-support")]
+pub(crate) use super::store::MoveCounters;
 
 /// What one measured shift did to the canvas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,60 +32,32 @@ pub(crate) enum Placement {
     Full,
 }
 
-/// What the three "move a lot of bytes" sites in [`Stitcher`] actually did (docs/35 §2.2, §7.1).
-///
-/// Compiled only with `test-support`: the product build has no counters, no clock reads and no
-/// extra field, so the default path is byte for byte the code it was (`docs/35` phase 0).
-#[cfg(feature = "test-support")]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct MoveCounters {
-    /// `grow` calls that had to reallocate (the canvas pointer moved) and how much they copied.
-    pub grow_moves: u32,
-    pub grow_bytes: u64,
-    pub grow_us: u64,
-    /// `Prepended` shifts of the whole known canvas (`copy_within`).
-    pub shift_moves: u32,
-    pub shift_bytes: u64,
-    pub shift_us: u64,
-    /// `band` overwrites: frame bytes copied into the canvas at the growing edge.
-    pub band_copies: u32,
-    pub band_bytes: u64,
-    pub band_us: u64,
-}
-
+/// Places frames into a [`CanvasStore`].
 #[derive(Debug)]
-pub(crate) struct Stitcher {
+pub(crate) struct Stitcher<C: CanvasStore = MemoryCanvas> {
     width: u32,
     view: u32,
-    max_rows: u32,
-    canvas: Vec<u8>,
-    rows: u32,
+    store: C,
     pos: u32,
     /// Content coordinate of canvas row 0: the first frame's top is 0, and every prepend lowers it.
     top: i64,
-    #[cfg(feature = "test-support")]
-    counters: MoveCounters,
 }
 
-impl Stitcher {
-    /// Start from the first frame. `max_rows` caps the canvas height.
-    pub(crate) fn new(first: &[u8], width: u32, view: u32, max_rows: u32) -> Self {
-        debug_assert_eq!(first.len(), (width * view * 4) as usize);
+impl<C: CanvasStore> Stitcher<C> {
+    /// A stitcher over an existing store (docs/35 phase 2 hands in a different one).
+    pub(crate) fn with_store(store: C, width: u32, view: u32) -> Self {
+        debug_assert_eq!(store.rows(), view, "a store starts with exactly one frame");
         Self {
             width,
             view,
-            max_rows: max_rows.max(view),
-            canvas: first.to_vec(),
-            rows: view,
+            store,
             pos: 0,
             top: 0,
-            #[cfg(feature = "test-support")]
-            counters: MoveCounters::default(),
         }
     }
 
     pub(crate) fn rows(&self) -> u32 {
-        self.rows
+        self.store.rows()
     }
 
     /// The canvas row the viewport's top shows.
@@ -90,12 +70,21 @@ impl Stitcher {
         self.top
     }
 
-    pub(crate) fn canvas(&self) -> &[u8] {
-        &self.canvas
+    /// What this image costs, as the store sees it (docs/35 §5.1). Measurement only, like the
+    /// move counters: the product build does not ask.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn budgets(&self) -> Budgets {
+        self.store.budgets()
     }
 
-    pub(crate) fn into_canvas(self) -> Vec<u8> {
-        self.canvas
+    /// The store, for phase 2 and for tests that drive one directly.
+    pub(crate) fn store(&self) -> &C {
+        &self.store
+    }
+
+    /// The store, by value, so the caller can ask it for the finished image.
+    pub(crate) fn into_store(self) -> C {
+        self.store
     }
 
     /// Place `frame`, whose content moved by `dy` relative to the frame placed last
@@ -105,47 +94,25 @@ impl Stitcher {
         let row = (self.width * 4) as usize;
         let view = self.view as i64;
         let cand = i64::from(self.pos) + i64::from(dy);
-        if cand + view > i64::from(self.rows) {
-            let growth = (cand + view - i64::from(self.rows)) as u32;
-            if self.rows + growth > self.max_rows || !self.grow_to(growth, row) {
+        let known = i64::from(self.store.rows());
+        if cand + view > known {
+            let growth = (cand + view - known) as u32;
+            let band = self.band(growth) as usize;
+            // The last `band` rows of the newest frame replace the previous copy of the edge.
+            if !self.store.append(growth, &frame[(self.view as usize - band) * row..]) {
                 return Placement::Full;
             }
-            self.rows += growth;
-            let band = self.band(growth) as usize;
-            let to = self.rows as usize * row;
-            #[cfg(feature = "test-support")]
-            let band_started = std::time::Instant::now();
-            self.canvas[to - band * row..to]
-                .copy_from_slice(&frame[(self.view as usize - band) * row..]);
-            #[cfg(feature = "test-support")]
-            self.note_band(band * row, band_started);
-            self.pos = self.rows - self.view;
+            self.pos = self.store.rows() - self.view;
             Placement::Appended {
                 growth,
                 band: band as u32,
             }
         } else if cand < 0 {
             let growth = (-cand) as u32;
-            let known = self.canvas.len();
-            if self.rows + growth > self.max_rows || !self.grow_to(growth, row) {
+            let band = self.band(growth) as usize;
+            if !self.store.prepend(growth, &frame[..band * row]) {
                 return Placement::Full;
             }
-            self.rows += growth;
-            #[cfg(feature = "test-support")]
-            let shift_started = std::time::Instant::now();
-            self.canvas.copy_within(..known, growth as usize * row);
-            #[cfg(feature = "test-support")]
-            {
-                self.counters.shift_moves += 1;
-                self.counters.shift_bytes += known as u64;
-                self.counters.shift_us += shift_started.elapsed().as_micros() as u64;
-            }
-            let band = self.band(growth) as usize;
-            #[cfg(feature = "test-support")]
-            let band_started = std::time::Instant::now();
-            self.canvas[..band * row].copy_from_slice(&frame[..band * row]);
-            #[cfg(feature = "test-support")]
-            self.note_band(band * row, band_started);
             self.pos = 0;
             self.top -= i64::from(growth);
             Placement::Prepended {
@@ -158,98 +125,49 @@ impl Stitcher {
         }
     }
 
-    /// The one `grow` call site, so the measurement feature can wrap it instead of the branches.
-    fn grow_to(&mut self, growth: u32, row: usize) -> bool {
-        #[cfg(feature = "test-support")]
-        {
-            let before_len = self.canvas.len();
-            let before = self.canvas.as_ptr();
-            let started = std::time::Instant::now();
-            let ok = grow(
-                &mut self.canvas,
-                growth as usize * row,
-                self.max_rows as usize * row,
-            );
-            let us = started.elapsed().as_micros() as u64;
-            if ok {
-                self.counters.grow_us += us;
-                if self.canvas.as_ptr() != before {
-                    // A move copied everything that was already in the canvas.
-                    self.counters.grow_moves += 1;
-                    self.counters.grow_bytes += before_len as u64;
-                }
-            }
-            ok
-        }
-        #[cfg(not(feature = "test-support"))]
-        {
-            grow(
-                &mut self.canvas,
-                growth as usize * row,
-                self.max_rows as usize * row,
-            )
-        }
-    }
-
-    #[cfg(feature = "test-support")]
-    fn note_band(&mut self, bytes: usize, started: std::time::Instant) {
-        self.counters.band_copies += 1;
-        self.counters.band_bytes += bytes as u64;
-        self.counters.band_us += started.elapsed().as_micros() as u64;
-    }
-
-    /// What the three move sites have done so far (docs/35 §2.2).
-    #[cfg(feature = "test-support")]
-    pub(crate) fn counters(&self) -> MoveCounters {
-        self.counters
-    }
-
-    /// Reserve the whole row cap up front, so the variant A experiment runs with no reallocation
-    /// (`docs/35` §7.1). `try_reserve_exact` rather than `reserve_exact`: the experiment must not
-    /// abort a process when the cap is bigger than the machine will serve.
-    #[cfg(feature = "test-support")]
-    pub(crate) fn preallocate(&mut self, rows: u32) {
-        let bytes = (self.width as usize) * 4 * (rows.min(self.max_rows) as usize);
-        let spare = bytes.saturating_sub(self.canvas.len());
-        if spare == 0 {
-            return;
-        }
-        if let Err(error) = self.canvas.try_reserve_exact(spare) {
-            eprintln!("[snapclip][scroll] the preallocation experiment could not reserve: {error}");
-        }
-    }
-
     fn band(&self, growth: u32) -> u32 {
         (self.view / 2).max(growth + self.view / 4).min(self.view)
     }
 }
 
-/// Append `bytes` zeroes to `canvas`, or leave it untouched and return `false` when the memory
-/// cannot be had. A long image is the one allocation here that the user's scrolling sizes, and
-/// running out must end the growth, not the process (`Vec::resize` aborts on failure).
-///
-/// Capacity doubles, so a session moves the canvas O(log n) times rather than once per append
-/// (each move copies the whole image). `limit` caps only that doubling choice: the call is bounded
-/// by `len + bytes` when that is already larger, so this function never refuses a growth the
-/// caller's own row cap allowed. The row cap ([`super::row_limit`]) is what keeps the canvas inside
-/// the byte budget; this is the last line against an allocation the machine cannot serve.
-fn grow(canvas: &mut Vec<u8>, bytes: usize, limit: usize) -> bool {
-    let needed = canvas.len().saturating_add(bytes);
-    let wanted = needed.max(canvas.capacity().saturating_mul(2).min(limit));
-    if let Err(error) = canvas.try_reserve_exact(wanted - canvas.len()) {
-        eprintln!(
-            "[snapclip][scroll] the long image cannot grow by {bytes} bytes past {}: {error}",
-            canvas.len()
-        );
-        return false;
+/// The in-memory store is the only one there is, and these are the calls the rest of the crate made
+/// when the stitcher owned the buffer (docs/35 phase 1: no caller changes).
+impl Stitcher<MemoryCanvas> {
+    /// Start from the first frame. `max_rows` caps the canvas height.
+    pub(crate) fn new(first: &[u8], width: u32, view: u32, max_rows: u32) -> Self {
+        Self::with_store(MemoryCanvas::new(first, width, view, max_rows), width, view)
     }
-    canvas.resize(canvas.len() + bytes, 0);
-    true
+
+    #[cfg(test)]
+    pub(crate) fn canvas(&self) -> &[u8] {
+        self.store.slice()
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn preallocate(&mut self, rows: u32) {
+        self.store.preallocate(rows);
+    }
+
+    /// What the three move sites have done so far (docs/35 §2.2).
+    #[cfg(feature = "test-support")]
+    pub(crate) fn counters(&self) -> MoveCounters {
+        self.store.counters()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn canvas_len(&self) -> usize {
+        self.store.slice().len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn canvas_capacity(&self) -> usize {
+        self.store.capacity()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Placement, Stitcher, grow};
+    use super::{Placement, Stitcher};
     use crate::scroll::estimate::tests::{page, window};
     use crate::scroll::estimate::{Estimate, FrameSig, estimate};
 
@@ -424,18 +342,6 @@ mod tests {
         assert_eq!(stitcher.pos(), 80);
     }
 
-    /// Out of memory is the end of the image, not of the process: the canvas is left as it was.
-    #[test]
-    fn a_canvas_that_cannot_grow_is_left_untouched() {
-        let mut canvas = vec![7u8; 64];
-        assert!(!grow(&mut canvas, usize::MAX - 8, usize::MAX));
-        assert_eq!(canvas, vec![7u8; 64]);
-        assert!(grow(&mut canvas, 16, 96));
-        assert!(canvas.capacity() <= 96, "doubling stops at the limit");
-        assert_eq!(canvas.len(), 80);
-        assert!(canvas[..64].iter().all(|&b| b == 7) && canvas[64..].iter().all(|&b| b == 0));
-    }
-
     /// How much the canvas really moves over a field-sized session. The field log's rising append
     /// cost (68 ms at 1.4k rows, 123 ms at 42k) is not reallocation: at 1323x36000 the canvas moves
     /// six times over 390 appends, for 35.7 MB copied in total. So the per-append cost that does rise
@@ -451,12 +357,12 @@ mod tests {
         let mut stitcher = Stitcher::new(&window(&page, W, 0, H), W, H, MAX_ROWS);
         let mut moves = 0u32;
         let mut moved = 0u64;
-        let mut capacity = stitcher.canvas.capacity();
+        let mut capacity = stitcher.canvas_capacity();
         let mut appends = 0u32;
         let mut top = 0;
         while top + 90 + H <= MAX_ROWS {
             top += 90;
-            let before = stitcher.canvas.len();
+            let before = stitcher.canvas_len();
             if !matches!(
                 stitcher.place(&window(&page, W, top, H), 90),
                 Placement::Appended { .. }
@@ -464,7 +370,7 @@ mod tests {
                 break;
             }
             appends += 1;
-            let now = stitcher.canvas.capacity();
+            let now = stitcher.canvas_capacity();
             if now != capacity {
                 moves += 1;
                 moved += before as u64;
@@ -488,7 +394,7 @@ mod tests {
         let page = page(W, 32 * H + H, 5);
         let mut stitcher = Stitcher::new(&window(&page, W, 0, H), W, H, 32 * H);
         let mut moves = 0;
-        let mut capacity = stitcher.canvas.capacity();
+        let mut capacity = stitcher.canvas_capacity();
         let mut top = 0;
         while top + 9 + H <= 32 * H {
             top += 9;
@@ -496,13 +402,13 @@ mod tests {
                 stitcher.place(&window(&page, W, top, H), 9),
                 Placement::Appended { .. }
             ));
-            if stitcher.canvas.capacity() != capacity {
+            if stitcher.canvas_capacity() != capacity {
                 moves += 1;
-                capacity = stitcher.canvas.capacity();
+                capacity = stitcher.canvas_capacity();
             }
         }
         assert!(moves <= 8, "{moves} reallocations over {} appends", top / 9);
-        assert!(stitcher.canvas.capacity() <= (32 * H * W * 4) as usize);
+        assert!(stitcher.canvas_capacity() <= (32 * H * W * 4) as usize);
         assert_eq!(
             stitcher.canvas(),
             &page[..(stitcher.rows() * W * 4) as usize]
@@ -533,6 +439,163 @@ mod tests {
             costs.iter().max().unwrap(),
             stitcher.rows()
         );
+    }
+
+    // ── Phase 1: the store seam must not change what the stitcher does ──────────────────────────
+    //
+    // The oracle below is the placement logic exactly as it stood before the seam. It shares no
+    // code with the implementation on purpose: a reference that called into the thing under test
+    // would prove nothing (docs/35 phase 1, §8).
+
+    struct Reference {
+        canvas: Vec<u8>,
+        width: u32,
+        view: u32,
+        max_rows: u32,
+        rows: u32,
+        pos: u32,
+        top: i64,
+    }
+
+    impl Reference {
+        fn new(first: &[u8], width: u32, view: u32, max_rows: u32) -> Self {
+            Self {
+                canvas: first.to_vec(),
+                width,
+                view,
+                max_rows: max_rows.max(view),
+                rows: view,
+                pos: 0,
+                top: 0,
+            }
+        }
+
+        fn place(&mut self, frame: &[u8], dy: i32) -> Placement {
+            let row = (self.width * 4) as usize;
+            let view = self.view as i64;
+            let cand = i64::from(self.pos) + i64::from(dy);
+            if cand + view > i64::from(self.rows) {
+                let growth = (cand + view - i64::from(self.rows)) as u32;
+                if self.rows + growth > self.max_rows || !self.grow_to(growth, row) {
+                    return Placement::Full;
+                }
+                self.rows += growth;
+                let band = self.band(growth) as usize;
+                let to = self.rows as usize * row;
+                self.canvas[to - band * row..to]
+                    .copy_from_slice(&frame[(self.view as usize - band) * row..]);
+                self.pos = self.rows - self.view;
+                Placement::Appended {
+                    growth,
+                    band: band as u32,
+                }
+            } else if cand < 0 {
+                let growth = (-cand) as u32;
+                let known = self.canvas.len();
+                if self.rows + growth > self.max_rows || !self.grow_to(growth, row) {
+                    return Placement::Full;
+                }
+                self.rows += growth;
+                self.canvas.copy_within(..known, growth as usize * row);
+                let band = self.band(growth) as usize;
+                self.canvas[..band * row].copy_from_slice(&frame[..band * row]);
+                self.pos = 0;
+                self.top -= i64::from(growth);
+                Placement::Prepended {
+                    growth,
+                    band: band as u32,
+                }
+            } else {
+                self.pos = cand as u32;
+                Placement::Contained
+            }
+        }
+
+        fn grow_to(&mut self, growth: u32, row: usize) -> bool {
+            reference_grow(
+                &mut self.canvas,
+                growth as usize * row,
+                self.max_rows as usize * row,
+            )
+        }
+
+        fn band(&self, growth: u32) -> u32 {
+            (self.view / 2).max(growth + self.view / 4).min(self.view)
+        }
+    }
+
+    fn reference_grow(canvas: &mut Vec<u8>, bytes: usize, limit: usize) -> bool {
+        let needed = canvas.len().saturating_add(bytes);
+        let wanted = needed.max(canvas.capacity().saturating_mul(2).min(limit));
+        if canvas.try_reserve_exact(wanted - canvas.len()).is_err() {
+            return false;
+        }
+        canvas.resize(canvas.len() + bytes, 0);
+        true
+    }
+
+    /// Drive one shift sequence through the store-based stitcher and through the oracle, and
+    /// require the same placement, position, content origin and pixels after every single frame.
+    /// Returns `(frames, final rows)`.
+    fn equivalence(start: u32, shifts: &[i32], max_rows: u32) -> (usize, u32) {
+        let page = page(W, 6000, 21);
+        let first = frame_at(&page, start);
+        let mut subject = Stitcher::new(&first, W, H, max_rows);
+        let mut oracle = Reference::new(&first, W, H, max_rows);
+        let mut top = i64::from(start);
+        for (index, &dy) in shifts.iter().enumerate() {
+            let next = (top + i64::from(dy)).clamp(0, 5600);
+            top = next;
+            let frame = frame_at(&page, next as u32);
+            let placed = subject.place(&frame, dy);
+            let expected = oracle.place(&frame, dy);
+            assert_eq!(placed, expected, "placement differs at shift {index} ({dy})");
+            assert_eq!(subject.pos(), oracle.pos, "viewport row differs at shift {index}");
+            assert_eq!(subject.top(), oracle.top, "content origin differs at shift {index}");
+            assert_eq!(subject.rows(), oracle.rows, "image height differs at shift {index}");
+            assert!(
+                subject.canvas() == oracle.canvas.as_slice(),
+                "pixels differ at shift {index} ({dy})"
+            );
+        }
+        // Equal bytes are equal decoded pixels: the encoder never sees a different image.
+        (shifts.len() + 1, subject.rows())
+    }
+
+    #[test]
+    fn a_pure_downward_sequence_matches_the_oracle() {
+        let shifts = [60; 12];
+        let (frames, rows) = equivalence(0, &shifts, 32 * H);
+        assert_eq!((frames, rows), (13, 12 * 60 + H));
+    }
+
+    #[test]
+    fn a_pure_upward_sequence_matches_the_oracle() {
+        let shifts = [-50; 8];
+        let (frames, rows) = equivalence(1000, &shifts, 32 * H);
+        assert_eq!((frames, rows), (9, 8 * 50 + H));
+    }
+
+    #[test]
+    fn several_direction_reversals_match_the_oracle() {
+        // Every step stays inside the page, and the run starts away from the top so the upward
+        // moves reach the prepend path rather than being contained (docs/35 phase 0).
+        let shifts = [60, 60, -70, -50, 80, -90, 40, -30, -30, 50, -110, 70];
+        let (frames, rows) = equivalence(1000, &shifts, 64 * H);
+        assert!(frames == 13 && rows >= H, "{frames} frames, {rows} rows");
+    }
+
+    #[test]
+    fn contained_moves_match_the_oracle_and_write_nothing() {
+        let shifts = [10, -10, 0, 5, -5, 3, -3];
+        let (_, _) = equivalence(500, &shifts, 32 * H);
+    }
+
+    #[test]
+    fn a_sequence_that_hits_the_row_cap_matches_the_oracle() {
+        let shifts = [80, 80, 80, 80];
+        let (_, rows) = equivalence(0, &shifts, H + 160);
+        assert_eq!(rows, H + 160, "growth stops at the cap, and both agree on where");
     }
 
     #[test]

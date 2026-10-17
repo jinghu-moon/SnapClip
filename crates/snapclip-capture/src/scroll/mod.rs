@@ -13,10 +13,11 @@
 pub(crate) mod estimate;
 pub(crate) mod layout;
 pub(crate) mod stitch;
+pub mod store;
 pub(crate) mod thumb;
 
 use estimate::{Estimate, FrameSig, estimate};
-use stitch::{Placement, Stitcher};
+use stitch::{CanvasStore, Placement, Stitcher};
 use thumb::Thumb;
 
 /// The long image is capped at this many selection heights (the reference implementation's cap).
@@ -149,7 +150,11 @@ impl Tracker {
     fn with_rows(first: &[u8], width: u32, view: u32, thumb_width: u32, max_rows: u32) -> Self {
         let stitcher = Stitcher::new(first, width, view, max_rows);
         let mut thumb = Thumb::new(width, thumb_width);
-        thumb.refresh(stitcher.canvas(), view, 0, 0, view);
+        let first_frame = stitcher
+            .store()
+            .row_slice(0, view)
+            .expect("a fresh store holds exactly the first frame");
+        thumb.refresh(first_frame, view, 0, 0, view);
         Self {
             width,
             view,
@@ -226,8 +231,11 @@ impl Tracker {
     fn refresh_thumb(&mut self, from: u32, to: u32) {
         let (rows, top) = (self.stitcher.rows(), self.stitcher.top());
         let started = std::time::Instant::now();
-        self.thumb
-            .refresh(self.stitcher.canvas(), rows, top, from, to);
+        // A store that keeps its rows somewhere else cannot hand out a slice; the thumbnail then
+        // has to update incrementally instead (docs/35 phase 3). The in-memory store always can.
+        if let Some(canvas) = self.stitcher.store().row_slice(0, rows) {
+            self.thumb.refresh(canvas, rows, top, from, to);
+        }
         self.last_thumb_us = started.elapsed().as_micros() as u64;
     }
 
@@ -267,11 +275,16 @@ impl Tracker {
 
     /// The long image: `(width, rows, bgra)`.
     pub(crate) fn into_image(self) -> (u32, u32, Vec<u8>) {
-        (
-            self.width,
-            self.stitcher.rows(),
-            self.stitcher.into_canvas(),
-        )
+        let rows = self.stitcher.rows();
+        let width = self.width;
+        let mut store = self.stitcher.into_store();
+        (width, rows, store.take_all())
+    }
+
+    /// What the image costs, as its store sees it (docs/35 §5.1). Measurement only.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn budgets(&self) -> crate::scroll::store::Budgets {
+        self.stitcher.budgets()
     }
 
     /// Reserves the whole row cap before the first frame, for the attribution experiment
@@ -539,6 +552,7 @@ mod tests {
 /// be honest if the real stitcher is the thing being measured.
 #[cfg(feature = "test-support")]
 pub mod probe {
+    use super::stitch::CanvasStore;
     use super::{Status, Tracker};
 
     /// What one pushed frame cost, and where the canvas ended up.
@@ -564,7 +578,7 @@ pub mod probe {
     }
 
     /// The three move sites' running totals (docs/35 §2.2).
-    pub use super::stitch::MoveCounters;
+    pub use super::store::MoveCounters;
 
     /// Drives the real tracker either at the product's own limits or at an explicit row cap.
     pub struct ScrollProbe {
@@ -650,8 +664,25 @@ pub mod probe {
             self.tracker.image_rows()
         }
 
+        /// The four budgets the store answers for, so a run can report what the image cost
+        /// (docs/35 §5.1): `(pixel_rows, pixel_bytes, working_bytes, temp_bytes)`.
+        pub fn budgets(&self) -> (u32, u64, u64, u64) {
+            let budgets = self.tracker.budgets();
+            (
+                budgets.pixel_rows,
+                budgets.pixel_bytes,
+                budgets.working_bytes,
+                budgets.temp_bytes,
+            )
+        }
+
         pub fn canvas(&self) -> &[u8] {
-            self.tracker.stitcher.canvas()
+            let rows = self.tracker.stitcher.rows();
+            self.tracker
+                .stitcher
+                .store()
+                .row_slice(0, rows)
+                .expect("the probe drives the in-memory store")
         }
 
         /// The long image: `(width, rows, bgra)`.

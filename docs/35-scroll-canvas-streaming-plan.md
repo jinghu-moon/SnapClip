@@ -271,3 +271,62 @@ B2 = 边缘缓冲（容量 × width × 4） + 编码器内部缓冲 + 装配时�
 | PicPick Scrolling Window | <https://picpick.app/zh-tw/help/capture/> | 工具自己向下滚动并收集 [事实] |
 | Snagit 滚动捕获教程 | <https://www.techsmith.de/learn/tutorials/snagit/scrollendes-capture> | 存在该功能；**未能确认**是否支持向上 [未验证] |
 | 帧池语义 | <https://learn.microsoft.com/en-us/uwp/api/windows.graphics.capture.direct3d11captureframepool> | 池满时停止交付新帧而非无限排队 ⇒ 背压必须显式失败 [事实] |
+
+---
+
+## 11. 阶段 1 记录：store 接缝与语义等价（已完成）
+
+### 11.1 做了什么
+
+- 新增 `crates/snapclip-capture/src/scroll/store.rs`：`CanvasStore` trait + `MemoryCanvas`（**唯一实现**，
+  就是以前 `Stitcher` 自己持有的那块 `Vec<u8>`）+ `grow()`（从 `stitch.rs` 原样搬来，行为不变）。
+- `Stitcher<C: CanvasStore = MemoryCanvas>`：**默认类型参数**让所有既有调用点（`Stitcher::new`、
+  `canvas()`、`into_canvas()`、`preallocate()`、`counters()`）原样可用 ⇒ 阶段 1 **不改任何调用方签名**。
+- 四个真正读画布的地方改为走接缝：缩略图首帧、`refresh_thumb`、`into_image`、`probe::canvas`。
+- 接缝**只带阶段 1 用得到的六个操作**：`rows / append / prepend / row_slice / take_all / budgets`。
+  `seal / replay / read_rows` 留到阶段 2 与后备存储一起加 —— 接口跑到实现前面就是死代码（§8）。
+
+### 11.2 等价如何证明（这是阶段 1 的出口条件）
+
+- **冻结的参考实现** `Reference`（`stitch.rs` 测试模块）：把**接缝之前的 `place()` 逻辑逐行复制**，
+  与实现**不共享任何代码** —— 会调用被测对象的"参考"什么也证明不了。
+- `equivalence()`：同一 `dy` 序列分别驱动新实现与参考，**每一帧之后**比较
+  `placement` / `pos` / `top` / `rows` / **画布字节**；字节相同 ⇒ 解码像素相同（编码器看到的图没变）。
+- 五类序列（外加阶段 0 的分配失败单测）：
+
+| 序列 | 起始 | 结果 |
+| --- | --- | --- |
+| 纯向下 | 0 | 13 帧，12×60 + H 行 ✓ |
+| 纯向上 | 1000 | 9 帧，8×50 + H 行 ✓ |
+| 多次方向反转 | 1000 | 13 帧，含 prepend 与 contained 混合 ✓ |
+| `Contained` 插入 | 500 | 7 帧，一步都不写画布 ✓ |
+| 撞行数上限 | 0 | 停在 H+160 行，两侧对"哪里停"一致 ✓ |
+| 分配失败 | — | `store::tests::a_buffer_that_cannot_grow_is_left_untouched`（缓冲区原样保留）✓ |
+
+### 11.3 读数：行为没变
+
+`codec-bench --scroll`（同一帧序列）：
+
+| 指标 | 阶段 0 基线 | 阶段 1 之后 |
+| --- | --- | --- |
+| 每帧中位 | 1.29 ms | **1.32 ms** |
+| 每帧最大 | 16.07 ms | **16.01 ms** |
+| 画布峰值 | 161.9 MB | **161.9 MB** |
+| 像素正确 | true | **true** |
+
+⇒ 都在噪声内 ⇒ 阶段 1 是**纯重构**，没有顺手改行为（也没有消掉尖峰 —— 那是阶段 2 的事）。
+
+### 11.4 重构过程中被参考实现抓住的一个真 bug（记下来，因为它证明这套装置有用）
+
+`MemoryCanvas::prepend` 第一版把 `known = canvas.len()` 写在 `grow_to()` **之后**：缓冲区已经长大，
+于是"往下搬"的长度多带了新增的零行 ⇒ `scrolling_up_from_the_middle_grows_the_canvas_at_the_top`
+立刻失败，`equivalence` 的向上序列同样会失败。改成**先读长度、再增长**后通过。
+这正是"参考实现不共享代码"的价值：如果参考也走新代码，这个 bug 会被两边一起犯、一起通过。
+
+### 11.5 阶段 2 要接的东西
+
+1. `seal(upto_row)`、`replay(sink)`、`read_rows(first, out)`（后备存储需要它们）；
+2. 真正的 `BackedCanvas`：边缘缓冲 + 已封口 tile 写临时文件 + 目录记录逻辑顺序（§3.1）；
+3. 缩略图改为**增量**（`row_slice` 返回 `None` 时现在的实现是跳过刷新 —— 阶段 3 补上）；
+4. 把 `budgets()` 从 `test-support` 门控变成常驻（后备存储要用它决定留什么）。
+
