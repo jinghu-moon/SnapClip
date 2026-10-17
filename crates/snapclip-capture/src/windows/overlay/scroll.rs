@@ -265,6 +265,28 @@ impl OverlayController {
         self.hint = None;
 
         let selection = start.selection;
+        // Before the worker exists: the worker is what allocates the canvas, so a format the
+        // container can never hold has to be lowered while zero rows exist (`docs/34` §15).
+        let preferred = self.preferences.save.format;
+        let (effective, lowered) = crate::scroll::scroll_format(
+            preferred,
+            selection.width().max(1) as u32,
+            selection.height().max(1) as u32,
+        );
+        self.scroll_save_format = effective;
+        match lowered {
+            Some(limit) => eprintln!(
+                "[snapclip][scroll] format={} lowered to {} before scrolling: {limit}",
+                preferred.label(),
+                effective.label()
+            ),
+            None => {}
+        }
+        eprintln!(
+            "[snapclip][scroll] save format={} (chosen {})",
+            effective.label(),
+            preferred.label()
+        );
         let centre = selection.center();
         let aim = Point::new(centre.x + layout.bounds.left, centre.y + layout.bounds.top);
         let monitor = match monitor::captured_monitor_at(aim) {

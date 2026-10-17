@@ -567,6 +567,9 @@ struct OverlayController {
     /// The preferences this session started with (`OverlayPreferences`): a change in the settings
     /// applies from the next session.
     preferences: OverlayPreferences,
+    /// The format a scroll capture will actually save with, after the pre-flight check
+    /// (`docs/34` §15). The save path reads it once it is wired; today the check logs it.
+    scroll_save_format: crate::save_format::SaveFormat,
     /// Where the badge was painted last frame, in back-buffer coordinates.
     ///
     /// The panel hangs off the badge and the badge itself is the pointer's way in, so the hit test
@@ -773,6 +776,7 @@ impl OverlayController {
             magnifier_zoom: MagnifierConfig::ZOOM_DEFAULT,
             held: None,
             preferences: OverlayPreferences::default(),
+            scroll_save_format: crate::save_format::SaveFormat::Png,
             label_badge: None,
             chrome_swallowed_press: false,
             region_panel: None,
