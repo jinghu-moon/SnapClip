@@ -734,3 +734,47 @@ codec-bench 里"WebP 拒绝不应分配"那条原本是**竞态的**：`peak_ext
 - 缺陷的确切触发条件（"高对比内容"只是这批素材上的相关性，未定位到 zenjpeg 内部代码）；
 - 该缺陷是否也影响 `optimize_huffman(true)` 的**其他**输出路径（目前只测了 baseline + 4:4:4 + q92）；
 - `ui-1080` 上的等价性是否在更大、更杂的真实 UI 素材上仍成立。
+
+## 18. 决定：滚动截图只做 PNG；JPG/WebP 只给普通截图
+
+§17 的裁定把原来那条"短图开优化、长图关优化"的配方推翻了：**关优化的那一支在高对比内容上是错的**（§17.1）。而开优化必须整帧缓冲（§10：1280×30000 要 456.5 MB）。于是"长图 JPG"没有一条既正确又省内存的路 —— 三个候选修法（全开接受 456 MB / 长图换编码路径 / 检出高对比内容回避）都不划算，产品决定是**不做**：
+
+| 格式 | 允许的范围 | 依据 |
+| --- | --- | --- |
+| **PNG** | 任何尺寸（包括滚动长图） | 母版与默认；行带流式，1280×30000 = 550 ms / 7.3 MB |
+| **JPG** | **≤ 16 MP**（覆盖 4K 的 8.3 MP） | 唯一的正确臂要整帧缓冲，预算定为 `JPEG_FRAME_BUDGET_PIXELS = 16_000_000` |
+| **WebP** | **≤ 16383 每边** 且 ≤ 16 MP（内存守卫） | 容器上限（§9.1）+ 整图无损编码的峰值（§10：4K 素材 257 MB） |
+
+### 18.1 删掉了什么
+
+- `JpgRowBandSink` 的**流式臂**（关优化 + 逐带 push）**整条删除**，连同行带预算 `SHORT_IMAGE_MAX_BYTES`、`plan()` / `JpgPlan` 以及只服务它的测试。**没有**把它留成"永不触发"的常量 —— 留一条已知会出错的路径比没有更危险。
+- sink 现在只有一种模式：**缓冲整帧 + 开 Huffman**。`config()` 里 `optimize_huffman(true)` 是写死的，不是开关；注释与模块文档改成"**开优化是正确性要求，不是体积优化**（§17.1）"。
+
+### 18.2 两条守卫
+
+- **sink 侧**：`begin()` 先查 `can_encode`，再查 `within_jpeg_frame_budget`；超预算返回结构化 `ExportError::JpegFrameBudget`（文案会指明 "PNG holds it losslessly"），**在分配整帧缓冲之前**就返回。
+- **滚动侧**：`scroll_format()` 增加一条 —— JPG 即使格式装得下（比如 30720 行远小于 65535），只要"宽度 × 可能的最大行数"超过 16 MP，就**降级为 PNG**；原因用新的 `Lowering::FrameBudget` 表达（与 `Lowering::Format` 分开，因为一个是格式限制、一个是保存路径的预算）。日志沿用同一处可观测点：`format=JPG lowered to PNG before scrolling: …`。
+
+### 18.3 边界（有测试）
+
+| 场景 | 结果 |
+| --- | --- |
+| 4K 普通截图（3840×2160 = 8.3 MP） | JPG 可用 |
+| 2048×7812（15,998,976 px） | 恰好可用 |
+| 2048×7813（16,001,024 px） | 拒绝（`JpegFrameBudget`） |
+| 滚动 640 宽 × 15360 行（9.8 MP） | JPG 保留 |
+| 滚动 1280 宽 × 15360 行（19.7 MP） | 降级 PNG（`FrameBudget`） |
+| 滚动 1280 宽 × 30720 行（39.3 MP） | 降级 PNG（`FrameBudget`） |
+| 滚动 1280 宽 × 67200 行 | 降级 PNG（`Format`，超 65535 边长） |
+| WebP 任意滚动静止 | 降级 PNG（`Format`，超 16383） |
+
+### 18.4 验证
+
+`snapclip-capture` **507 passed / 0 failed / 80 ignored** · `snapclip-app` **160 passed / 0 failed / 7 ignored** · `codec-bench` **26 passed** · `cargo check --workspace --all-targets` **0 warning** · 两个 gate（test baseline、dependency direction）**OK**。全仓已无 `SHORT_IMAGE_MAX_BYTES` / `JpgPlan` / `optimise_huffman` 的引用。
+
+### 18.5 未验证
+
+- **真机保存流程尚未接上**：`convert()` 与两个 sink 都还只有测试调用点，保存面板做出来后才会真正跑一遍；届时"4K JPG 的实际耗时/峰值"应以真机读数为准。
+- 16 MP 这个预算的**内存后果未实测**：16 MP × 4 B = 64 MB 的整帧缓冲 + 编码器自身的开销，是估算而非测量（普通 4K 约 33 MB 缓冲）。
+- WebP 的 16 MP 内存守卫仍是 §10 那次 4K 素材 257 MB 的线性外推，同样未实测。
+- §17.1 那个 zenjpeg 缺陷的触发条件仍未定位到源码，所以"哪些内容会踩雷"只有相关性证据（高对比、多行重复纹理）。

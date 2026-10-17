@@ -1,18 +1,21 @@
-//! `JpgRowBandSink` — lossy export, split by what the optimiser costs (`docs/34` §10–11, §13).
+//! `JpgRowBandSink` — lossy export, one strategy only (`docs/34` §10–11, §17–18).
 //!
-//! # Why there are two strategies and not one
+//! # Why there is one arm and not two
 //!
-//! `docs/34` §10 measured this rather than assumed it. `zenjpeg`'s `BytesEncoder::push` is true
-//! streaming while the optimiser is off — a 1280x30000 strip encodes in 393 ms with a 13.9 MB peak —
-//! but turning Huffman optimisation on makes it buffer the whole frame first: 2.95 s and a 456.5 MB
-//! peak on the same strip. Huffman optimisation is also **free quality-wise**: §11 decoded the
-//! optimised and plain output and got byte-identical pixels, with 5.6–9 % fewer bytes.
+//! `docs/34` §10 measured that `zenjpeg`'s `BytesEncoder::push` streams truly while the Huffman
+//! optimiser is off (1280x30000 in 393 ms, 13.9 MB peak) and buffers the whole frame once it is on
+//! (2.95 s, 456.5 MB). §11 then measured the optimiser as free in pixels on UI material, so this
+//! sink used to stream tall frames with the optimiser off to keep the peak low.
 //!
-//! So the trade is stated in bytes of frame, not in taste:
+//! §17 showed that arm is **wrong**: relative to the source, the optimiser-off encode lands at a
+//! mean error of 81.8 on high-contrast content, against 10.4 with the optimiser on, while the
+//! segments differ only in `DHT`. Two independent decoders reproduce it, and it follows the content
+//! rather than the switch. So Huffman optimisation here is a **correctness requirement**, not a size
+//! trick, and a streaming arm without it cannot be offered at any memory saving.
 //!
-//! * A frame that fits [`SHORT_IMAGE_MAX_BYTES`] is buffered and encoded with the optimiser on. The
-//!   buffer is bounded by that constant, so the peak is bounded too.
-//! * Anything larger streams band by band with the optimiser off, and pays the 5.6–9 %.
+//! That leaves one arm: buffer the frame, encode once with the optimiser on. The buffer is bounded
+//! by [`JPEG_FRAME_BUDGET_PIXELS`], and an image past it is refused rather than encoded wrongly — a
+//! 30000-row scroll capture stays PNG (`docs/34` §18).
 //!
 //! # What is fixed, and not configurable
 //!
@@ -35,36 +38,10 @@ use std::sync::Arc;
 use zenjpeg::encoder::{ChromaSubsampling, EncoderConfig, PixelLayout, Stop as JpegStop};
 
 use super::row_band_png::{Artifact, ExportError, ImageMeta};
+use super::save_format::{within_jpeg_frame_budget, SaveFormat, JPEG_FRAME_BUDGET_PIXELS};
 
 /// The quality `docs/34` §11 selected: q95 and q85 are both worse trades for UI material.
 pub const JPEG_QUALITY: u8 = 92;
-
-/// A frame at or below this size is buffered so the Huffman optimiser can run.
-///
-/// 16 MiB is `docs/34` §10's measurement turned into a budget: the optimiser needs the whole frame
-/// in memory (456.5 MB for a 1280x30000 strip), and spending at most this much to save 5.6–9 % is a
-/// trade worth making for ordinary screenshots while never letting a scroll capture reach it.
-pub const SHORT_IMAGE_MAX_BYTES: u64 = 16 * 1024 * 1024;
-
-/// What [`JpgRowBandSink::plan`] decided for a given image. A value so the choice can be asserted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct JpgPlan {
-    /// Whether Huffman optimisation runs. Costs the whole frame in memory when it does.
-    pub optimise_huffman: bool,
-    /// Whether the sink holds every row before encoding.
-    pub buffers_whole_frame: bool,
-}
-
-impl JpgPlan {
-    /// The strategy this plan describes, for logs and tests.
-    pub fn strategy(self) -> &'static str {
-        if self.buffers_whole_frame {
-            "buffered+optimised"
-        } else {
-            "streaming"
-        }
-    }
-}
 
 /// Rows in, a complete JPEG out. BGRA goes in as it arrives; nothing is converted first.
 pub struct JpgRowBandSink {
@@ -85,7 +62,7 @@ impl JpgRowBandSink {
         Self::default()
     }
 
-    /// The same plan at another quality, for the save path's own setting (`docs/34` §16).
+    /// The same sink at another quality, for the save path's own setting (`docs/34` §16).
     ///
     /// Clamped rather than refused: a hand-edited settings file must not fail an encode.
     pub fn with_quality(quality: u8) -> Self {
@@ -99,31 +76,30 @@ impl JpgRowBandSink {
         self.quality
     }
 
-    /// Which strategy an image of this size gets. Pure: no encoder, no allocation.
-    pub fn plan(&self, meta: &ImageMeta) -> JpgPlan {
-        let frame_bytes = meta.width.saturating_mul(meta.height).saturating_mul(4);
-        let short = frame_bytes <= SHORT_IMAGE_MAX_BYTES;
-        JpgPlan {
-            optimise_huffman: short,
-            buffers_whole_frame: short,
-        }
-    }
-
-    /// Opens an encoder for `meta`. The format's limits are checked here, before anything allocates.
+    /// Opens an encoder for `meta`. Every limit is checked here, before anything allocates.
+    ///
+    /// The frame budget is checked before the format's side limit is reported, because "this is too
+    /// big for JPG" is more useful than "this is past 65535" for a scroll capture that is only
+    /// 30000 rows tall: the first names the real reason, the second names a limit it never reached.
     pub fn begin(&mut self, meta: &ImageMeta) -> Result<JpgRowBandWriter, ExportError> {
-        super::save_format::SaveFormat::Jpeg
+        if meta.width == 0 || meta.height == 0 {
+            return Err(ExportError::Sink("a 0-sided image has no JPEG encoding".into()));
+        }
+        SaveFormat::Jpeg
             .can_encode(meta.width, meta.height)
             .map_err(|_| ExportError::TooLarge {
                 width: meta.width,
                 height: meta.height,
             })?;
-        if meta.width == 0 || meta.height == 0 {
-            return Err(ExportError::Sink("a 0-sided image has no JPEG encoding".into()));
+        if !within_jpeg_frame_budget(meta.width, meta.height) {
+            return Err(ExportError::JpegFrameBudget {
+                width: meta.width,
+                height: meta.height,
+                max: JPEG_FRAME_BUDGET_PIXELS,
+            });
         }
 
-        let plan = self.plan(meta);
-        let config = config(self.quality, plan.optimise_huffman);
-        let encoder = config
+        let encoder = config(self.quality)
             .encode_from_bytes(
                 u32::try_from(meta.width).map_err(|_| ExportError::TooLarge {
                     width: meta.width,
@@ -140,26 +116,24 @@ impl JpgRowBandSink {
         let cancelled = Arc::new(AtomicBool::new(false));
         Ok(JpgRowBandWriter {
             meta: *meta,
-            plan,
             encoder: Some(encoder),
             cancelled,
-            buffered: if plan.buffers_whole_frame {
-                Some(Vec::with_capacity(
-                    usize::try_from(meta.width * meta.height * 4).unwrap_or(0),
-                ))
-            } else {
-                None
-            },
+            buffered: Vec::with_capacity(
+                usize::try_from(meta.width * meta.height * 4).unwrap_or(0),
+            ),
             next_row: 0,
         })
     }
 }
 
 /// The one place the encoder configuration is built, so every path agrees on 4:4:4 and baseline.
-fn config(quality: u8, optimise_huffman: bool) -> EncoderConfig {
+///
+/// The optimiser is on unconditionally: §17 measured the alternative as wrong on high-contrast
+/// content, so it is not a knob.
+fn config(quality: u8) -> EncoderConfig {
     EncoderConfig::ycbcr(f32::from(quality), ChromaSubsampling::None)
         .force_baseline()
-        .optimize_huffman(optimise_huffman)
+        .optimize_huffman(true)
 }
 
 fn sink_error(error: impl std::fmt::Display) -> ExportError {
@@ -179,25 +153,21 @@ impl JpegStop for Cancel {
     }
 }
 
-/// Rows in, in order; `finish` closes the JPEG.
+/// Rows in, in order; `finish` encodes the frame and closes the JPEG.
 pub struct JpgRowBandWriter {
     meta: ImageMeta,
-    plan: JpgPlan,
     /// `None` only after `finish`, which is the only thing that can take it.
     encoder: Option<zenjpeg::encoder::BytesEncoder>,
     cancelled: Arc<AtomicBool>,
-    /// Every row, for the buffered strategy. `None` when streaming.
-    buffered: Option<Vec<u8>>,
+    /// Every row, in order: the optimiser needs the whole frame (`docs/34` §10), and it is on
+    /// because the alternative is wrong (§17).
+    buffered: Vec<u8>,
     next_row: u64,
 }
 
 impl JpgRowBandWriter {
-    /// The strategy this writer is running.
-    pub fn plan(&self) -> JpgPlan {
-        self.plan
-    }
-
-    /// Stops the encoder at the next row boundary. `finish` then fails instead of producing a file.
+    /// Stops the encoder at its next cancellation point. `finish` then fails instead of producing a
+    /// file.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
     }
@@ -225,23 +195,9 @@ impl JpgRowBandWriter {
             });
         }
 
-        if let Some(buffer) = self.buffered.as_mut() {
-            // The buffered strategy keeps the rows and encodes once at `finish`, because that is
-            // the only way the optimiser can see the whole frame (`docs/34` §10).
-            buffer.extend_from_slice(rows);
-        } else {
-            let encoder = self.encoder.as_mut().ok_or_else(|| {
-                ExportError::Sink("rows were written after the artifact closed".into())
-            })?;
-            encoder
-                .push(
-                    rows,
-                    usize::try_from(count).unwrap_or(0),
-                    usize::try_from(row_bytes).unwrap_or(0),
-                    Cancel(Arc::clone(&self.cancelled)),
-                )
-                .map_err(sink_error)?;
-        }
+        // Kept, not pushed: the optimiser has to see the whole frame before it writes anything
+        // (`docs/34` §10), and it is the only correct arm (§17).
+        self.buffered.extend_from_slice(rows);
         self.next_row += count;
         Ok(())
     }
@@ -259,16 +215,14 @@ impl JpgRowBandWriter {
             .take()
             .ok_or_else(|| ExportError::Sink("the artifact was already closed".into()))?;
 
-        if let Some(rows) = self.buffered {
-            encoder
-                .push(
-                    &rows,
-                    usize::try_from(self.meta.height).unwrap_or(0),
-                    usize::try_from(self.meta.width * 4).unwrap_or(0),
-                    Cancel(Arc::clone(&self.cancelled)),
-                )
-                .map_err(sink_error)?;
-        }
+        encoder
+            .push(
+                &self.buffered,
+                usize::try_from(self.meta.height).unwrap_or(0),
+                usize::try_from(self.meta.width * 4).unwrap_or(0),
+                Cancel(Arc::clone(&self.cancelled)),
+            )
+            .map_err(sink_error)?;
 
         let bytes = encoder.finish().map_err(sink_error)?;
         Ok(Artifact {
@@ -279,10 +233,7 @@ impl JpgRowBandWriter {
 }
 
 /// Encodes one whole BGRA image. The convenience path for callers that already hold the rows.
-pub fn encode_bgra(
-    bgra: &[u8],
-    meta: &ImageMeta,
-) -> Result<Artifact, ExportError> {
+pub fn encode_bgra(bgra: &[u8], meta: &ImageMeta) -> Result<Artifact, ExportError> {
     let mut sink = JpgRowBandSink::new();
     let mut writer = sink.begin(meta)?;
     writer.write_rows(0, bgra)?;
@@ -321,37 +272,6 @@ mod tests {
     }
 
     #[test]
-    fn a_small_frame_is_buffered_so_the_optimiser_can_run() {
-        let plan = JpgRowBandSink::new().plan(&meta(1920, 1080));
-        assert!(plan.buffers_whole_frame);
-        assert!(plan.optimise_huffman);
-        assert_eq!(plan.strategy(), "buffered+optimised");
-        // 1920 * 1080 * 4 = 8.3 MB, inside the 16 MiB budget.
-        assert!(1920 * 1080 * 4 <= SHORT_IMAGE_MAX_BYTES);
-    }
-
-    #[test]
-    fn a_tall_frame_streams_and_pays_the_optimiser() {
-        // The scroll capture case: 1280 x 30000 is 153 MB of rows, far past the budget.
-        let plan = JpgRowBandSink::new().plan(&meta(1280, 30_000));
-        assert!(!plan.buffers_whole_frame, "the whole frame must not be held");
-        assert!(!plan.optimise_huffman, "the optimiser would force the buffer back");
-        assert_eq!(plan.strategy(), "streaming");
-    }
-
-    #[test]
-    fn the_budget_boundary_is_where_it_says_it_is() {
-        let sink = JpgRowBandSink::new();
-        // Exactly at the budget still buffers.
-        let at = SHORT_IMAGE_MAX_BYTES / 4;
-        let width = 1024;
-        let height = at / width;
-        assert!(sink.plan(&meta(width, height)).buffers_whole_frame);
-        // One row more does not.
-        assert!(!sink.plan(&meta(width, height + 1)).buffers_whole_frame);
-    }
-
-    #[test]
     fn a_small_image_round_trips_and_is_baseline() {
         let frame = ui_frame(160, 120);
         let artifact = encode_bgra(&frame, &meta(160, 120)).expect("encode");
@@ -370,42 +290,54 @@ mod tests {
     }
 
     #[test]
-    fn the_optimised_arm_is_smaller_than_the_plain_one() {
-        // Same picture, same quantisation tables; only the optimiser differs (docs/34 §11).
-        // A real screenshot size: at 320x240 the optimiser's table overhead outweighs the gain,
-        // and `docs/34` §11 measured the 6–9 % on full frames, not on thumbnails.
-        let frame = ui_frame(1920, 1080);
+    fn the_sink_encodes_with_the_optimiser_on() {
+        // §17: the optimiser-off arm is wrong on high-contrast content, so the sink must not have a
+        // switch. `EncoderConfig` keeps its fields private, so this compares bytes instead: the
+        // sink's output must be the output of an encoder built with the optimiser explicitly on.
         let meta = meta(1920, 1080);
-        let mut optimised = JpgRowBandSink::new();
-        let mut writer = optimised.begin(&meta).expect("begin");
-        writer.write_rows(0, &frame).expect("rows");
-        let optimised = writer.finish().expect("finish").bytes;
+        let frame = ui_frame(1920, 1080);
+        let from_sink = encode_bgra(&frame, &meta).expect("encode").bytes;
 
-        // Force the streaming arm by asking the same encoder for a frame past the budget is not
-        // possible for this size, so build the plain configuration directly.
-        let mut encoder = config(JPEG_QUALITY, false)
+        let mut explicit = EncoderConfig::ycbcr(f32::from(JPEG_QUALITY), ChromaSubsampling::None)
+            .force_baseline()
+            .optimize_huffman(true)
             .encode_from_bytes(1920, 1080, PixelLayout::Bgra8Srgb)
             .expect("start");
-        encoder
+        explicit
             .push(&frame, 1080, 1920 * 4, enough::Unstoppable)
             .expect("push");
-        let plain = encoder.finish().expect("finish");
+        let explicit = explicit.finish().expect("finish");
 
-        assert!(
-            optimised.len() < plain.len(),
-            "optimised {} vs plain {}",
-            optimised.len(),
-            plain.len()
+        assert_eq!(
+            from_sink, explicit,
+            "the sink must build the optimised arm, byte for byte"
         );
-        // Only what this sink owns is asserted here: the optimiser makes the file smaller and the
-        // result still decodes at the size it was asked for. Whether the two arms are pixel-equal is
-        // a question for `tools/codec-bench` (docs/34 §11), which owns the comparison against a
-        // lossless reference; a rounding-level diff belongs there, not in a sink unit test.
-        let (width, height, pixels) = decode(&optimised);
-        assert_eq!((width, height), (1920, 1080));
-        assert_eq!(pixels.len(), 1920 * 1080 * 4);
-        let (plain_width, plain_height, _) = decode(&plain);
-        assert_eq!((plain_width, plain_height), (1920, 1080));
+    }
+
+    #[test]
+    fn a_4k_frame_fits_the_budget_and_a_30k_row_capture_does_not() {
+        let mut sink = JpgRowBandSink::new();
+        // 3840 x 2160 = 8.3 MP: a 4K screenshot is well inside the 16 MP frame budget.
+        assert!(sink.begin(&meta(3840, 2160)).is_ok());
+        // 1280 x 30000 = 38.4 MP: the scroll capture case is refused, not encoded wrongly.
+        assert!(matches!(
+            sink.begin(&meta(1280, 30_000)),
+            Err(ExportError::JpegFrameBudget { .. })
+        ));
+        // The budget is a pixel count, so a frame just inside it is accepted and just past it is not.
+        assert!(within_jpeg_frame_budget(4000, 4000));
+        assert!(!within_jpeg_frame_budget(4001, 4000));
+    }
+
+    #[test]
+    fn the_frame_budget_is_refused_before_the_rows_exist() {
+        // The refusal has to come from `begin`, so a caller that streams a master in has not read a
+        // single row before it learns the answer. `write_rows` is therefore never reachable here.
+        let mut sink = JpgRowBandSink::new();
+        // 2048 x 7813 = 16,001,024 pixels: one row past the 16,000,000 budget.
+        assert!(sink.begin(&meta(2048, 7813)).is_err());
+        // 2048 x 7812 = 15,998,976: the last row that fits.
+        assert!(sink.begin(&meta(2048, 7812)).is_ok());
     }
 
     #[test]
@@ -447,15 +379,13 @@ mod tests {
     }
 
     #[test]
-    fn cancelling_stops_the_streaming_arm() {
+    fn cancelling_stops_the_encode() {
         let mut sink = JpgRowBandSink::new();
-        // Tall enough to stream, so the cancel hits `push` rather than `finish`.
-        let meta = meta(1024, 6000);
+        let meta = meta(64, 64);
         let mut writer = sink.begin(&meta).expect("begin");
-        let band = vec![0x80u8; 1024 * 4 * 64];
-        writer.write_rows(0, &band).expect("first band");
+        writer.write_rows(0, &vec![0x80u8; 64 * 4 * 64]).expect("rows");
         writer.cancel();
-        let error = writer.write_rows(64, &band).unwrap_err();
+        let error = writer.finish().unwrap_err();
         assert!(
             !error.to_string().is_empty(),
             "a cancelled encode must say so"

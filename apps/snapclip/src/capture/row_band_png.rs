@@ -54,6 +54,10 @@ pub struct Artifact {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExportError {
     TooLarge { width: u64, height: u64 },
+    /// The JPG save path holds the whole frame so the optimiser can run, which is the only arm that
+    /// encodes correctly (`docs/34` §17); an image past that budget is refused, never encoded on the
+    /// other arm (`docs/34` §18).
+    JpegFrameBudget { width: u64, height: u64, max: u64 },
     OutOfOrder { first_row: u64, expected: u64 },
     BeyondHeight { first_row: u64, height: u64 },
     RowLength { expected: u64, got: u64 },
@@ -66,6 +70,10 @@ impl std::fmt::Display for ExportError {
             ExportError::TooLarge { width, height } => write!(
                 f,
                 "a {width}x{height} artifact does not fit the format's u32 header fields"
+            ),
+            ExportError::JpegFrameBudget { width, height, max } => write!(
+                f,
+                "a {width}x{height} artifact is past the JPG save path's {max}-pixel budget;                  PNG holds it losslessly"
             ),
             ExportError::OutOfOrder {
                 first_row,

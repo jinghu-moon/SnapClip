@@ -245,6 +245,7 @@ fn measure(body: impl FnOnce() -> Result<usize, String>) -> Measured {
 }
 
 /// The markers of a JPEG, in file order, with their payloads.
+#[cfg(test)]
 fn segments(jpeg: &[u8]) -> Vec<(&'static str, Vec<u8>)> {
     fn name(marker: u8) -> &'static str {
         match marker {
@@ -280,6 +281,7 @@ fn segments(jpeg: &[u8]) -> Vec<(&'static str, Vec<u8>)> {
 }
 
 /// Concatenated payloads of every segment with this marker (DHT and DQT may repeat).
+#[cfg(test)]
 fn payload(segments: &[(&'static str, Vec<u8>)], marker: &str) -> Vec<u8> {
     let mut out = Vec::new();
     for (name, body) in segments {
@@ -290,6 +292,7 @@ fn payload(segments: &[(&'static str, Vec<u8>)], marker: &str) -> Vec<u8> {
     out
 }
 
+#[cfg(test)]
 fn differing(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b).filter(|(x, y)| x != y).count() + a.len().abs_diff(b.len())
 }

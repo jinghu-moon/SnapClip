@@ -275,8 +275,8 @@ impl OverlayController {
         );
         self.scroll_save_format = effective;
         match lowered {
-            Some(limit) => eprintln!(
-                "[snapclip][scroll] format={} lowered to {} before scrolling: {limit}",
+            Some(reason) => eprintln!(
+                "[snapclip][scroll] format={} lowered to {} before scrolling: {reason}",
                 preferred.label(),
                 effective.label()
             ),

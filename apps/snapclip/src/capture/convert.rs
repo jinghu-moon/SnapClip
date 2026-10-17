@@ -341,24 +341,25 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A frame above the sink's budget is streamed, not buffered. The bench measures the peak
-    /// itself (`codec-bench --transcode`); this pins the plan the conversion depends on.
+    /// A frame past the JPG save path's budget is refused before the master is read, because the
+    /// only correct JPG arm holds the whole frame (`docs/34` §17–18).
     #[test]
-    fn a_tall_master_uses_the_streaming_plan() {
-        // 2049 rows of 2048 pixels is just past the 16 MiB budget, so the sink streams.
-        let meta = ImageMeta {
-            width: 2048,
-            height: 2049,
+    fn the_jpeg_frame_budget_is_refused_before_the_master_is_read() {
+        let tall = ImageMeta {
+            width: 1280,
+            height: 30_000,
         };
-        let plan = JpgRowBandSink::new().plan(&meta);
+        let refusal = SinkWriter::begin(SaveFormat::Jpeg, 92, &tall);
         assert!(
-            !plan.buffers_whole_frame,
-            "a 2048x2049 frame is past the budget, so it must stream"
+            matches!(refusal, Err(ExportError::JpegFrameBudget { .. })),
+            "a 38 MP scroll capture must be refused, not encoded"
         );
-        assert!(
-            !plan.optimise_huffman,
-            "streaming and the whole-frame optimiser cannot both be on"
-        );
+        // A 4K frame is 8.3 MP, inside the budget, so the same call opens a writer.
+        let four_k = ImageMeta {
+            width: 3840,
+            height: 2160,
+        };
+        assert!(SinkWriter::begin(SaveFormat::Jpeg, 92, &four_k).is_ok());
     }
 
     /// WebP's side limit is refused by the same rule the scroll session asks.

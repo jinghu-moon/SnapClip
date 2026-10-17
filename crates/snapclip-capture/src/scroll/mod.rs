@@ -94,12 +94,29 @@ pub(crate) fn scroll_format(
     preferred: crate::save_format::SaveFormat,
     width: u32,
     view: u32,
-) -> (crate::save_format::SaveFormat, Option<crate::save_format::FormatLimit>) {
+) -> (
+    crate::save_format::SaveFormat,
+    Option<crate::save_format::Lowering>,
+) {
+    use crate::save_format::{within_jpeg_frame_budget, Lowering, SaveFormat};
+
     let rows = row_limit(width, view, MAX_BYTES);
-    match preferred.can_encode(u64::from(width), u64::from(rows)) {
-        Ok(()) => (preferred, None),
-        Err(limit) => (crate::save_format::SaveFormat::Png, Some(limit)),
+    if let Err(limit) = preferred.can_encode(u64::from(width), u64::from(rows)) {
+        return (SaveFormat::Png, Some(Lowering::Format(limit)));
     }
+    // JPG could hold these rows, but its only correct arm holds the whole frame (`docs/34` §17), and
+    // a scroll capture is exactly the image that must not be held (`docs/34` §18).
+    if preferred == SaveFormat::Jpeg && !within_jpeg_frame_budget(u64::from(width), u64::from(rows))
+    {
+        return (
+            SaveFormat::Png,
+            Some(Lowering::FrameBudget {
+                pixels: u64::from(width) * u64::from(rows),
+                max: crate::save_format::JPEG_FRAME_BUDGET_PIXELS,
+            }),
+        );
+    }
+    (preferred, None)
 }
 
 #[derive(Debug)]
@@ -595,14 +612,14 @@ pub mod probe {
 #[cfg(test)]
 mod scroll_format_tests {
     use super::{MAX_SCREENS, scroll_format};
-    use crate::save_format::SaveFormat;
+    use crate::save_format::{Lowering, SaveFormat};
 
     #[test]
     fn webp_is_lowered_before_a_tall_scroll_starts() {
         // 32 x 960 rows is past 16383, so this capture can never be a single WebP.
         let (effective, why) = scroll_format(SaveFormat::Webp, 1280, 960);
         assert_eq!(effective, SaveFormat::Png);
-        assert!(why.is_some());
+        assert!(matches!(why, Some(Lowering::Format(_))), "{why:?}");
     }
 
     #[test]
@@ -618,14 +635,31 @@ mod scroll_format_tests {
     }
 
     #[test]
-    fn png_is_never_lowered_and_jpeg_only_past_its_own_limit() {
+    fn png_is_never_lowered() {
         assert_eq!(scroll_format(SaveFormat::Png, 3840, 2100), (SaveFormat::Png, None));
-        // 32 x 960 = 30720 rows, well inside JPEG's 65535.
-        assert_eq!(scroll_format(SaveFormat::Jpeg, 1280, 960), (SaveFormat::Jpeg, None));
-        // 32 x 2100 = 67200 rows, past it.
+        assert_eq!(scroll_format(SaveFormat::Png, 1280, 960), (SaveFormat::Png, None));
+    }
+
+    #[test]
+    fn jpeg_is_lowered_when_the_frame_would_not_fit_its_budget() {
+        // 32 x 480 = 15360 rows of 640 pixels is 9.8 MP: inside the 16 MP JPG frame budget.
+        assert_eq!(scroll_format(SaveFormat::Jpeg, 640, 480), (SaveFormat::Jpeg, None));
+        // The same rows at 1280 wide is 19.7 MP, so the JPG save path would have to hold the frame.
+        let (effective, why) = scroll_format(SaveFormat::Jpeg, 1280, 480);
+        assert_eq!(effective, SaveFormat::Png);
+        assert!(matches!(why, Some(Lowering::FrameBudget { .. })), "{why:?}");
+        // 32 x 960 = 30720 rows: the scroll capture this rule exists for, and it stays PNG.
+        let (effective, why) = scroll_format(SaveFormat::Jpeg, 1280, 960);
+        assert_eq!(effective, SaveFormat::Png);
+        assert!(matches!(why, Some(Lowering::FrameBudget { .. })), "{why:?}");
+    }
+
+    #[test]
+    fn jpeg_still_reports_the_formats_own_limit_first() {
+        // 32 x 2100 = 67200 rows is past JPEG's 65535 per side: a format limit, not a budget.
         let (effective, why) = scroll_format(SaveFormat::Jpeg, 1280, 2100);
         assert_eq!(effective, SaveFormat::Png);
-        assert!(why.is_some());
+        assert!(matches!(why, Some(Lowering::Format(_))), "{why:?}");
         assert_eq!(MAX_SCREENS, 32);
     }
 }

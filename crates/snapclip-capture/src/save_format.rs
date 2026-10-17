@@ -12,9 +12,11 @@
 //! * WebP's container caps a side at 16383 (Google's own FAQ), which is why a 30000-row scroll
 //!   capture can never be a single WebP file no matter which encoder is used.
 //!
-//! There is deliberately no pixel-count limit: none of the three formats specifies one, and
-//! inventing a fourth limit here would be a product decision wearing a format's clothes. The WebP
-//! sink *does* carry a memory guard, and it says so where it is defined.
+//! There is deliberately no *format* pixel-count limit: none of the three specifies one, and
+//! inventing a fourth limit here would be a product decision wearing a format's clothes. The save
+//! path does have one budget, and it is named as a budget rather than a limit:
+//! [`JPEG_FRAME_BUDGET_PIXELS`]. It lives here because the scroll session has to answer the same
+//! question as the sink — can this capture be saved as JPG at all — before it starts.
 
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +68,46 @@ impl std::fmt::Display for FormatLimit {
 }
 
 impl std::error::Error for FormatLimit {}
+
+/// The most pixels the JPG save path encodes in one frame.
+///
+/// Not a format limit ([`SaveFormat::max_side`] is): JPEG itself carries 65535 per side. This is the
+/// budget of the only correct JPG arm, which holds the whole frame so the Huffman optimiser can run
+/// (`docs/34` §10, §17). 16 MP covers 4K with room to spare and refuses a 30000-row scroll capture,
+/// which stays PNG (`docs/34` §18).
+pub const JPEG_FRAME_BUDGET_PIXELS: u64 = 16_000_000;
+
+/// Whether an image of this size can be saved as JPG at all.
+///
+/// Both the scroll session and the sink ask this, so a capture the encoder would refuse is lowered
+/// before it starts rather than after it is read.
+pub fn within_jpeg_frame_budget(width: u64, height: u64) -> bool {
+    width.saturating_mul(height) <= JPEG_FRAME_BUDGET_PIXELS
+}
+
+/// Why a scroll capture will not be saved in the format the user chose.
+///
+/// Two different answers, kept apart because they mean different things: the format cannot express
+/// the rows, or the format could but the save path for it cannot hold the frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lowering {
+    /// The format's own header cannot express this many rows.
+    Format(FormatLimit),
+    /// The format could, but the save path would have to hold the whole frame.
+    FrameBudget { pixels: u64, max: u64 },
+}
+
+impl std::fmt::Display for Lowering {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Lowering::Format(limit) => write!(f, "{limit}"),
+            Lowering::FrameBudget { pixels, max } => write!(
+                f,
+                "the JPG save path holds the whole frame, and {pixels} pixels exceed its {max} budget"
+            ),
+        }
+    }
+}
 
 impl SaveFormat {
     /// The largest side the format can hold, in pixels.
