@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use snapclip_capture::keymap::{Keymap, KeymapOverrides};
 use snapclip_capture::preferences::OverlayPreferences;
+use snapclip_capture::units::{LabelDisplay, LengthUnit};
 use snapclip_capture::window_detection::{DEFAULT_ADOPT_TEXT_RUNS, DetectionOptions};
 
 /// The user's preferences.
@@ -29,6 +30,14 @@ pub struct Settings {
     pub mask_blur: bool,
     /// Show the shortcut guide in the bottom-left corner while picking.
     pub shortcut_guide: bool,
+    /// The unit the size/coordinate label is measured in (`px` or `dp`).
+    pub length_unit: LengthUnit,
+    /// Whether that label shows the selection's size.
+    pub show_size: bool,
+    /// Whether that label also shows the selection's origin.
+    pub show_coordinates: bool,
+    /// Whether that label prints the unit it is in (`1024×768 px`).
+    pub show_unit: bool,
     /// The overlay's key bindings, as changes from the defaults.
     pub keymap: KeymapOverrides,
 }
@@ -40,6 +49,10 @@ impl Default for Settings {
             deep_select_text_runs: DEFAULT_ADOPT_TEXT_RUNS,
             mask_blur: overlay.mask_blur,
             shortcut_guide: overlay.shortcut_guide,
+            length_unit: overlay.label.length_unit,
+            show_size: overlay.label.show_size,
+            show_coordinates: overlay.label.show_coordinates,
+            show_unit: overlay.label.show_unit,
             keymap: KeymapOverrides::default(),
         }
     }
@@ -69,8 +82,34 @@ impl Settings {
         OverlayPreferences {
             mask_blur: self.mask_blur,
             shortcut_guide: self.shortcut_guide,
+            label: LabelDisplay {
+                length_unit: self.length_unit,
+                show_size: self.show_size,
+                show_coordinates: self.show_coordinates,
+                show_unit: self.show_unit,
+            },
             keymap: Arc::new(keymap),
         }
+    }
+
+    /// Adopt the display settings a capture ended with (docs/23 §14.53/§14.54); `true` when they differ.
+    ///
+    /// The badge's menu and the custom-region panel edit the same four values this file stores. The
+    /// merge is here, on the value, so the rule can be tested without a window; the view is what
+    /// writes the result out.
+    pub fn adopt_label(&mut self, label: LabelDisplay) -> bool {
+        if self.length_unit == label.length_unit
+            && self.show_size == label.show_size
+            && self.show_coordinates == label.show_coordinates
+            && self.show_unit == label.show_unit
+        {
+            return false;
+        }
+        self.length_unit = label.length_unit;
+        self.show_size = label.show_size;
+        self.show_coordinates = label.show_coordinates;
+        self.show_unit = label.show_unit;
+        true
     }
 }
 
@@ -133,6 +172,7 @@ mod tests {
 
     use snapclip_capture::keymap::{Keymap, KeymapOverrides};
     use snapclip_capture::preferences::OverlayPreferences;
+    use snapclip_capture::units::{LabelDisplay, LengthUnit};
 
     use super::{Settings, SettingsStore};
 
@@ -176,14 +216,27 @@ mod tests {
             deep_select_text_runs: false,
             mask_blur: false,
             shortcut_guide: false,
+            length_unit: LengthUnit::Dp,
+            show_size: true,
+            show_coordinates: false,
+            show_unit: false,
             keymap,
         };
         store.save(&wanted).expect("save");
         assert_eq!(store.load(), wanted);
+        // The file spells the readout's unit the way the page does, so a hand-edited file needs no
+        // translation table, and a field the user never touched keeps its default (above).
+        let text = std::fs::read_to_string(dir.join("settings.json")).unwrap();
+        assert!(text.contains("\"lengthUnit\": \"dp\""), "{text}");
+        assert!(text.contains("\"showCoordinates\": false"), "{text}");
+        assert!(text.contains("\"showUnit\": false"), "{text}");
         // And the bridges to capture see the same values.
         assert!(!store.load().detection_options().adopt_text_runs);
         let overlay = store.load().overlay_preferences();
         assert!(!overlay.mask_blur && !overlay.shortcut_guide);
+        assert_eq!(overlay.label.length_unit, LengthUnit::Dp);
+        assert!(!overlay.label.show_coordinates);
+        assert!(!overlay.label.show_unit);
         assert_ne!(*overlay.keymap, Keymap::default());
         // No temporary file is left behind.
         let leftovers = std::fs::read_dir(&dir)
@@ -247,5 +300,28 @@ mod tests {
         let back: Settings = serde_json::from_str(&text).unwrap();
         assert_eq!(back.keymap, KeymapOverrides::default());
         assert!(back.keymap.is_empty());
+    }
+
+    #[test]
+    fn adopting_the_overlay_label_keeps_the_rest_of_the_settings() {
+        let mut settings = Settings {
+            deep_select_text_runs: false,
+            mask_blur: false,
+            shortcut_guide: false,
+            ..Settings::default()
+        };
+        let from_the_menu = LabelDisplay {
+            length_unit: LengthUnit::Dp,
+            show_size: false,
+            show_coordinates: false,
+            show_unit: false,
+        };
+        assert!(settings.adopt_label(from_the_menu));
+        assert_eq!(settings.length_unit, LengthUnit::Dp);
+        assert!(!settings.show_size && !settings.show_coordinates && !settings.show_unit);
+        // Everything the badge's menu says nothing about stays exactly as it was.
+        assert!(!settings.deep_select_text_runs && !settings.mask_blur && !settings.shortcut_guide);
+        // The same values again are not a change, so nothing is written and nothing is announced.
+        assert!(!settings.adopt_label(from_the_menu));
     }
 }

@@ -54,11 +54,43 @@ impl snapclip_history::ingest::ClipboardEventSink for ClipboardEvents {
 /// a mouse move or a frame. That is the property T4.5's "零 IPC 高频路径" is about.
 pub struct CaptureEvents {
     bus: EventBus,
+    /// 「请把刚截的那张贴出去」的投递器（延时时到点用）。
+    ///
+    /// 存成闭包而不是直接存 `PinPoster`：接线发生在**贴图管理器起来之后**（两份东西各自
+    /// 在半路上创建），闭包让"到底怎么贴"留在接线处一行，也让这件事可以被测——测试塞一个
+    /// 记账的闭包进来，断言延时到点时确实发了这一条（docs/23 §14.55.8）。
+    pin_poster: std::sync::Mutex<
+        Option<std::sync::Arc<dyn Fn() -> Result<(), String> + Send + Sync>>,
+    >,
 }
 
 impl CaptureEvents {
     pub fn new(bus: EventBus) -> Self {
-        Self { bus }
+        Self {
+            bus,
+            pin_poster: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// 接上"怎么贴图"。外壳在贴图管理器起来之后调用一次（见 `lib.rs`）。
+    pub fn set_pin_poster(
+        &self,
+        poster: std::sync::Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
+    ) {
+        *self
+            .pin_poster
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(poster);
+    }
+
+    /// 把一次"请贴图"交给接好的投递器；没接上时返回 `None`（外壳的接线问题，要说出来）。
+    fn post_pin(&self) -> Option<Result<(), String>> {
+        let poster = self
+            .pin_poster
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()?;
+        Some(poster())
     }
 
     fn state(&self, session_id: &str, state: CaptureState) -> u64 {
@@ -100,6 +132,22 @@ impl CaptureEventSink for CaptureEvents {
             error_code: None,
             generation: 0,
         }));
+    }
+
+    /// 延时截图到点：图已经在贴图槽位里，请贴图那条链路把它贴出去。
+    ///
+    /// 这里**只发一次请求**，贴图怎么做由接线处决定：`lib.rs` 接的是"投一条 `WM_HOTKEY`"，
+    /// 也就是用户按 `F6` 的同一条路（docs/23 §14.55.8）。
+    fn on_pin_requested(&self, session_id: &str) {
+        match self.post_pin() {
+            Some(Ok(())) => {}
+            Some(Err(error)) => eprintln!(
+                "[snapclip-app][capture] session={session_id} 延时截图请求贴图失败：{error}"
+            ),
+            None => eprintln!(
+                "[snapclip-app][capture] session={session_id} 延时截图到点，但贴图功能没接上"
+            ),
+        }
     }
 
     fn on_cancelled(&self, session_id: &str, _reason: &str) {
@@ -267,5 +315,44 @@ mod tests {
             dpi: 96,
             primary: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod delay_pin_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// 延时截图到点：事件出口必须**正好发一次**"请贴图"。
+    ///
+    /// 这是这条路径上能自动化验证的那一半——另一半（投一条 `WM_HOTKEY`、贴图窗口真的出现）
+    /// 要真机与真窗口，只能人工看（docs/23 §14.55.8）。
+    #[test]
+    fn a_pin_request_reaches_the_poster_exactly_once() {
+        let events = CaptureEvents::new(EventBus::new());
+        let posted = Arc::new(AtomicUsize::new(0));
+        let counter = posted.clone();
+        events.set_pin_poster(Arc::new(move || {
+            counter.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }));
+        events.on_pin_requested("session-1");
+        assert_eq!(posted.load(Ordering::Acquire), 1);
+    }
+
+    /// 没接上投递器（贴图功能没起来）时不能 panic：那是接线问题，日志里说清楚就够了。
+    #[test]
+    fn a_pin_request_without_a_poster_is_not_a_crash() {
+        let events = CaptureEvents::new(EventBus::new());
+        events.on_pin_requested("session-1");
+    }
+
+    /// 投递器报错也不能 panic：失败要说出来（日志），但不该把消息泵带走。
+    #[test]
+    fn a_failing_poster_is_reported_rather_than_propagated() {
+        let events = CaptureEvents::new(EventBus::new());
+        events.set_pin_poster(Arc::new(|| Err("宿主线程已经不在了".to_string())));
+        events.on_pin_requested("session-1");
     }
 }

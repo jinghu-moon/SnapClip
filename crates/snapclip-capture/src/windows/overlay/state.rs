@@ -315,6 +315,70 @@ impl GuideFade {
     }
 }
 
+/// 分段器切换选项时，选中块从上一段滑到新段（docs/23 §14.55.5）。
+///
+/// 只存"从第几段出发"和进度：**段矩形由布局给出，插值在绘制端做** —— 模型（`region.rs`）不知道
+/// 动画存在，命中判定也始终用布局矩形。写法照 [`GuideFade`]：控制器持时钟、渲染 tick 推进、视图带进度。
+///
+/// 时长：140 ms。短到不挡手，长到看得见"落位"。
+pub(crate) const SEGMENT_SLIDE_MS: u64 = 140;
+
+#[derive(Debug, Default)]
+pub(crate) struct SegmentSlide {
+    /// 起点段号；`None` 表示没有正在进行的平移。
+    from: Option<usize>,
+    /// 目标段号（静止时就是当前选中段）。
+    to: usize,
+    started: Option<Instant>,
+}
+
+impl SegmentSlide {
+    /// 起一次平移。动画进行中再次切换时，起点取**上一个目标** —— 块因此总是沿同一方向继续往前，
+    /// 不会往回跳；代价只是被打断时少滑一小段（比"从当前视觉位置重新起算"要的信息更少）。
+    pub(crate) fn start(&mut self, to: usize, now: Instant) {
+        if self.from.is_none() && self.to == to {
+            return;
+        }
+        self.from = Some(self.to);
+        self.to = to;
+        self.started = Some(now);
+    }
+
+    /// 静止时把"当前段"跟上选中项（面板可能一开始就不是第 0 段）。
+    pub(crate) fn settle(&mut self, selected: usize) {
+        if self.from.is_none() {
+            self.to = selected;
+        }
+    }
+
+    /// 进度 0..1；静止时恒为 1。
+    pub(crate) fn progress(&self, now: Instant) -> f32 {
+        let Some(started) = self.started else {
+            return 1.0;
+        };
+        let elapsed_ms = now.saturating_duration_since(started).as_secs_f32() * 1000.0;
+        (elapsed_ms / SEGMENT_SLIDE_MS as f32).clamp(0.0, 1.0)
+    }
+
+    /// 还在动，所以渲染 tick 必须继续给自己排帧。
+    pub(crate) fn running(&self, now: Instant) -> bool {
+        self.from.is_some() && self.progress(now) < 1.0
+    }
+
+    /// 到点就落定，下一次 tick 不再需要保活。
+    pub(crate) fn settle_if_done(&mut self, now: Instant) {
+        if self.from.is_some() && self.progress(now) >= 1.0 {
+            self.from = None;
+            self.started = None;
+        }
+    }
+
+    /// 视图要的那一份：起点段号 + 进度；静止时 `None`（绘制端直接画在选中段上）。
+    pub(crate) fn view(&self, now: Instant) -> Option<(usize, f32)> {
+        self.from.map(|from| (from, self.progress(now)))
+    }
+}
+
 /// A one-shot hint that has been armed and is waiting for its deadline (docs/21 §5.21).
 ///
 /// The **text is stored, not recomputed**: what gets painted has to be the sentence that was

@@ -97,7 +97,7 @@ pub const PREVIEW_WASH_ALPHA: f32 = 0.18;
 pub const PREVIEW_WASH_WALK_SCALE: f32 = 0.5;
 
 /// `over` painted on top of `under` at `alpha`, in sRGB.
-fn mix_over(over: Rgb, under: Rgb, alpha: f32) -> Rgb {
+pub(crate) fn mix_over(over: Rgb, under: Rgb, alpha: f32) -> Rgb {
     let alpha = alpha.clamp(0.0, 1.0);
     let over = over.channels();
     let under = under.channels();

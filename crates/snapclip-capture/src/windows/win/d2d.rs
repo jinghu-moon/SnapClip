@@ -62,6 +62,13 @@ use crate::ring_contrast::{
     MASK_RGB, MASK_TINT_ALPHA, PREVIEW_WASH_ALPHA, PREVIEW_WASH_WALK_SCALE, Rgb, mix,
 };
 use crate::scroll::layout::Layout;
+use crate::geometry::{
+    REGION_SEGMENT_PAD_DIP, RegionPanelLayout, RegionPanelTarget, SegmentWidths, pill_radius,
+    segment_outer_radius, segment_radius,
+};
+use crate::icons::Glyph;
+use crate::region::{Delay, PanelSlot, RegionField};
+use crate::units::{LabelDisplay, LabelToggle, LengthUnit};
 pub(crate) use guide_pass::{GUIDE_AVOID_DIP, GuideView};
 
 /// The font family used for the size label, per the tasklist (§6.3) — the same two families the
@@ -143,32 +150,6 @@ impl RenderMetrics {
         }
     }
 
-    /// Displayed text for a selection in virtual-desktop coordinates.
-    pub fn label_text_at(selection: Rect, screen_origin: Point) -> String {
-        format!(
-            "{}×{} px  ({},{})",
-            selection.width(),
-            selection.height(),
-            selection.left + screen_origin.x,
-            selection.top + screen_origin.y
-        )
-    }
-
-    /// Pixel size of a selection's label, including padding.
-    pub fn label_size_at(&self, selection: Rect, screen_origin: Point) -> (i32, i32) {
-        let text = Self::label_text_at(selection, screen_origin);
-        self.label_size_for_text(&text)
-    }
-
-    fn label_size_for_text(&self, text: &str) -> (i32, i32) {
-        // Segoe UI digits are close to 0.62 em wide; the label is measured properly
-        // by DirectWrite before drawing, this estimate only positions the panel.
-        let text_width = text.chars().count() as f32 * self.label_font_size * 0.62;
-        (
-            (text_width + self.label_padding_x * 2.0).ceil() as i32,
-            (self.label_font_size * 1.45 + self.label_padding_y * 2.0).ceil() as i32,
-        )
-    }
 }
 
 /// One ring of the level chain to paint (docs/21 §5.22), in back-buffer coordinates.
@@ -180,6 +161,49 @@ pub struct ChainRingView {
     pub inner: bool,
     /// Effective opacity for the ring brush — the outer/inner base after the distance ramp.
     pub alpha: f32,
+}
+
+/// 自定义截图面板要画的东西（docs/23 §14.54）。
+///
+/// 与徽标本身同一个路子：绘制需要的每一项都由调用方算好放进来，画的地方只负责画 ——
+/// 布局、命中目标、数值文本和状态都不在这里重算。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegionPanelView {
+    /// 每个控件的矩形，也是命中测试读的那一份。
+    pub layout: RegionPanelLayout,
+    /// 四个数字格此刻写的字（正在输入的那一格写的是输入缓冲）。
+    pub values: [(RegionField, String); 4],
+    /// 四个数字格此刻是否非法（描红）。
+    pub invalid: [bool; 4],
+    /// 键盘焦点；面板没拿到焦点就是 `None`。
+    pub focus: Option<PanelSlot>,
+    /// 正在输入的那一格（数字缓冲的归属）。
+    pub editing: Option<RegionField>,
+    /// 插入点在缓冲里的位置（字节，0..=len）；光标画在它对应的 x 上。
+    pub caret: usize,
+    /// 光标这一刻是否可见：控制器用低频计时器开关它，于是光标会闪（docs/23 §14.55）。
+    pub caret_visible: bool,
+    /// 指针悬停的控件。
+    pub hover: Option<RegionPanelTarget>,
+    /// 单位组与延时组各自选中的项。
+    pub unit: LengthUnit,
+    pub delay: Delay,
+    /// 分段器选中块的平移：`(起点段号, 进度 0..1)`；静止时 `None`（直接画在选中段上）。
+    /// 段矩形始终由布局给出，插值只影响"画在哪"，命中判定读的还是布局（docs/23 §14.55.5）。
+    pub unit_slide: Option<(usize, f32)>,
+    pub delay_slide: Option<(usize, f32)>,
+    /// 宽高比是否锁定。
+    pub locked: bool,
+    /// 三个显示开关的开合。
+    pub toggles: [(LabelToggle, bool); 3],
+    /// 页脚那句话（校验失败时）。
+    pub status: Option<String>,
+    /// 预设触发器上的字（命中的预设名，或"自定义"）。
+    pub preset: String,
+    /// 命中的预设项，下拉里给它打勾。
+    pub preset_hit: Option<usize>,
+    /// 开始按钮是否可用。
+    pub can_start: bool,
 }
 
 /// One L0/L1/L2 composition request.
@@ -201,6 +225,21 @@ pub struct RenderView {
     pub show_handles: bool,
     /// Whether the live size/coordinate label is useful in this state.
     pub show_size_label: bool,
+    /// How the label reads — its unit, whether it carries the origin, whether it names the unit.
+    ///
+    /// How the readout reads, from the session's preferences — the value the custom-region panel
+    /// edits while the session runs (docs/23 §14.54).
+    pub label: LabelDisplay,
+    /// Whether the pointer is on the badge, so it is painted as the control it is (docs/23 §14.53).
+    ///
+    /// Set from the pointer and the badge's own rectangle: it lights up the moment the pointer is on
+    /// it, which is what tells the user that the badge is a control — and that a click there opens the
+    /// custom-region panel (docs/23 §14.54).
+    pub label_hovered: bool,
+    /// 自定义截图面板（docs/23 §14.54）；`None` 表示这次会话没有打开它。
+    pub region_panel: Option<RegionPanelView>,
+    /// 延时倒计时的剩余秒数（docs/23 §14.55.9）。
+    pub countdown: Option<u32>,
     /// Whether the screenshot loupe is active for this interaction state.
     pub show_magnifier: bool,
     /// A short-lived cue that arrow keys are moving the sampling cursor.
@@ -287,6 +326,10 @@ impl RenderView {
             show_chrome: false,
             show_handles: true,
             show_size_label: true,
+            label: LabelDisplay::default(),
+            label_hovered: false,
+            region_panel: None,
+            countdown: None,
             show_magnifier: true,
             precision_feedback: false,
             work_area: frame,
@@ -362,6 +405,8 @@ pub struct OverlayRenderer {
     target: Option<ID2D1Bitmap1>,
     frame_bitmap: Option<ID2D1Bitmap1>,
     border_brush: Option<ID2D1SolidColorBrush>,
+    /// 延时倒计时的数字：主题色 80% 透明度（docs/23 §14.55.9）。
+    countdown_brush: Option<ID2D1SolidColorBrush>,
     mask_brush: Option<ID2D1SolidColorBrush>,
     /// `rgba(255,255,255,0.10)` — lifts the hovered window out of the dark mask.
     hover_fill_brush: Option<ID2D1SolidColorBrush>,
@@ -385,6 +430,18 @@ pub struct OverlayRenderer {
     handle_brush: Option<ID2D1SolidColorBrush>,
     label_background_brush: Option<ID2D1SolidColorBrush>,
     label_text_brush: Option<ID2D1SolidColorBrush>,
+    /// The custom-region panel's own parts (docs/23 §14.54): the fill of its cards and of whatever
+    /// the pointer is on, its hairline, the accent that marks the selected segment and the primary
+    /// button, and a muted foreground for everything that is not the value being edited.
+    panel_fill_brush: Option<ID2D1SolidColorBrush>,
+    panel_line_brush: Option<ID2D1SolidColorBrush>,
+    panel_accent_brush: Option<ID2D1SolidColorBrush>,
+    panel_muted_brush: Option<ID2D1SolidColorBrush>,
+    /// 自定义截图面板的"这一格不能用"：校验失败时描红下划线与标签（docs/23 §14.54）。
+    panel_danger_brush: Option<ID2D1SolidColorBrush>,
+    /// 面板图形：`assets/icon` 的 PNG（icon-bake 用 resvg 从 SVG 烘出来的），WIC 解码后按状态色
+    /// 预着色（docs/23 §14.54）。
+    panel_icons: PanelIcons,
     crosshair_brush: Option<ID2D1SolidColorBrush>,
     magnifier_band_brush: Option<ID2D1SolidColorBrush>,
     magnifier_grid_brush: Option<ID2D1SolidColorBrush>,
@@ -535,6 +592,31 @@ pub(crate) fn frame_band(dpi: u32) -> i32 {
     RenderMetrics::for_dpi(dpi).border_width.ceil() as i32
 }
 
+/// The loupe's rectangle when it is on screen, for the size label to step aside (docs/23 §14.53).
+///
+/// `cursor_visible` and `show_magnifier` are two different questions, and this asks both: the first
+/// is "is the pointer over the overlay", the second is "is the loupe painted". A label that stepped
+/// aside for an invisible loupe would place itself around nothing.
+fn loupe_obstacle(view: &RenderView, metrics: RenderMetrics) -> Option<Rect> {
+    if !view.cursor_visible || !view.show_magnifier {
+        return None;
+    }
+    let work_area = if view.work_area.is_empty() {
+        view.frame
+    } else {
+        view.work_area
+    };
+    Some(
+        magnifier_geometry(
+            view.cursor,
+            MagnifierConfig::with_zoom(view.magnifier_zoom).scaled(metrics.dpi),
+            view.frame,
+            work_area,
+        )
+        .bounds,
+    )
+}
+
 impl OverlayRenderer {
     pub fn new(device: Arc<GraphicsDevice>, dpi: u32) -> Result<Self, String> {
         let d2d = device.create_d2d_context()?;
@@ -557,6 +639,7 @@ impl OverlayRenderer {
             target: None,
             frame_bitmap: None,
             border_brush: None,
+            countdown_brush: None,
             mask_brush: None,
             hover_fill_brush: None,
             preview_fill_brush: None,
@@ -570,6 +653,12 @@ impl OverlayRenderer {
             handle_brush: None,
             label_background_brush: None,
             label_text_brush: None,
+            panel_fill_brush: None,
+            panel_line_brush: None,
+            panel_accent_brush: None,
+            panel_muted_brush: None,
+            panel_danger_brush: None,
+            panel_icons: PanelIcons::new(),
             crosshair_brush: None,
             magnifier_band_brush: None,
             magnifier_grid_brush: None,
@@ -755,6 +844,9 @@ impl OverlayRenderer {
             level_badge: None,
             hint: None,
             scroll: None,
+            label_hovered: false,
+            region_panel: None,
+            countdown: None,
             mask_blur: false,
             guide: None,
             ..view.clone()
@@ -910,6 +1002,25 @@ impl OverlayRenderer {
             self.draw_selection_frame(view, FrameMarks::SCROLLING)?;
             return self.draw_scroll_panel(scroll);
         }
+
+        // A delay countdown: the window is cut down to the frame's band, the badge and the countdown
+        // box (`overlay/session.rs`), so this surface must be **transparent apart from exactly those
+        // pieces**. Anything else drawn here — the frozen frame, the mask, the snap hints, the guide,
+        // the loupe, the panel (already closed) — lands inside that region as a grey block over the
+        // live screen (docs/23 §14.55.9.2). Hence an early return instead of a flag on every layer:
+        // what is painted and what the region covers are the same set by construction.
+        //
+        // `FrameMarks::EDITING` is the whole of the first piece: the same routine that draws a
+        // plain capture's frame draws its handles and its size label (`marks.size_label`).
+        if let Some(seconds) = view.countdown {
+            unsafe { self.d2d.Clear(Some(&color(0.0, 0.0, 0.0, 0.0))) };
+            self.draw_selection_frame(view, FrameMarks::EDITING)?;
+            let text = self.require_brush(&self.countdown_brush, "countdown brush")?;
+            let format =
+                self.info_text_format_mut(false, COUNTDOWN_DIP, DWRITE_FONT_WEIGHT_SEMI_BOLD, true)?;
+            self.draw_text_in(&seconds.to_string(), &format, to_d2d(view.selection), &text)?;
+            return Ok(());
+        }
         let frame_bitmap = self.frame_bitmap.clone();
         let mask = self.require_brush(&self.mask_brush, "mask brush")?;
 
@@ -1009,6 +1120,13 @@ impl OverlayRenderer {
         if let Some(guide) = view.guide.as_ref() {
             self.draw_guide(guide, view.frame)?;
         }
+
+        // L3.7: the custom-region panel, above the badge: it is the layer the user is typing into,
+        // and its own dropdown hangs over everything below it (docs/23 §14.54).
+        if let Some(panel) = view.region_panel.as_ref() {
+            self.draw_region_panel(panel)?;
+        }
+
         Ok(())
     }
 
@@ -1319,10 +1437,12 @@ impl OverlayRenderer {
             return Ok(());
         };
         unsafe {
+            // 方向芯片（↑/↓）同样是胶囊：以前写死 3.0，所以三处芯片里只有一处是真胶囊。
+            let radius = pill_radius(placement.rect);
             let panel = D2D1_ROUNDED_RECT {
                 rect: to_d2d(placement.rect),
-                radiusX: 3.0,
-                radiusY: 3.0,
+                radiusX: radius,
+                radiusY: radius,
             };
             self.d2d.FillRoundedRectangle(&panel, &background);
             let wide = text.encode_utf16().collect::<Vec<u16>>();
@@ -1412,16 +1532,554 @@ impl OverlayRenderer {
         Ok(())
     }
 
+    /// 填一块圆角矩形（面板、卡片、药丸都从这里走）。
+    fn fill_round(&self, rect: Rect, radius: i32, brush: &ID2D1SolidColorBrush) {
+        let rounded = D2D1_ROUNDED_RECT {
+            rect: to_d2d(rect),
+            radiusX: radius as f32,
+            radiusY: radius as f32,
+        };
+        unsafe { self.d2d.FillRoundedRectangle(&rounded, brush) };
+    }
+
+    /// 描一块圆角矩形的边（发丝线、聚焦环、按钮轮廓）。
+    fn stroke_round(&self, rect: Rect, radius: i32, brush: &ID2D1SolidColorBrush, width: f32) {
+        let rounded = D2D1_ROUNDED_RECT {
+            rect: to_d2d(rect),
+            radiusX: radius as f32,
+            radiusY: radius as f32,
+        };
+        unsafe { self.d2d.DrawRoundedRectangle(&rounded, brush, width, None) };
+    }
+
+    /// 一条线（两点之间）：图标与分隔线都用它。
+    fn line(&self, from: Point, to: Point, brush: &ID2D1SolidColorBrush, width: f32) {
+        unsafe {
+            self.d2d.DrawLine(
+                vector2(from.x as f32, from.y as f32),
+                vector2(to.x as f32, to.y as f32),
+                brush,
+                width,
+                None,
+            )
+        };
+    }
+
+    /// L3.7: the custom-region panel (docs/23 §14.54).
+    ///
+    /// One translucent layer over the frozen screen: the screen's own mask blur is what shows through
+    /// it, so the panel does not blur anything itself. Every rectangle comes from
+    /// [`RegionPanelLayout`] — the same one the pointer hit-tests against — so what is drawn is what
+    /// clicks.
+    /// 面板底下的毛玻璃：把**未调暗**的帧模糊结果按面板的圆角矩形裁一块画上去（docs/23 §14.55）。
+    ///
+    /// 模糊源是 [`Self::blurred_frame`]：mask 那一路、info strip、guide、magnifier 都从它裁，它是纯粹
+    /// 的帧模糊、**没有叠加遮罩暗度**，所以这里不会把暗度叠第二次。圆角裁剪用 D2D 的正规做法
+    /// （`PushLayer` + `geometricMask` 的圆角矩形几何），不用直角 clip 糊过去。
+    fn draw_panel_backdrop(&self, bounds: Rect, radius: i32) -> Result<(), String> {
+        let Some(blurred) = self.blurred_frame.clone() else {
+            // 没有模糊源（导出路径根本不建它）就只留那层半透明底：可读性不受影响，只是不毛玻璃。
+            return Ok(());
+        };
+        let rounded = D2D1_ROUNDED_RECT {
+            rect: to_d2d(bounds),
+            radiusX: radius as f32,
+            radiusY: radius as f32,
+        };
+        let factory = unsafe { self.d2d.GetFactory() }
+            .map_err(|error| super::hresult("ID2D1DeviceContext::GetFactory", &error))?;
+        let mask: ID2D1Geometry = unsafe { factory.CreateRoundedRectangleGeometry(&rounded) }
+            .map_err(|error| super::hresult("CreateRoundedRectangleGeometry", &error))?
+            .cast()
+            .map_err(|error| super::hresult("cast to ID2D1Geometry", &error))?;
+        let layer = unsafe { self.d2d.CreateLayer(None) }
+            .map_err(|error| super::hresult("CreateLayer", &error))?;
+        let parameters = D2D1_LAYER_PARAMETERS1 {
+            contentBounds: to_d2d(bounds),
+            geometricMask: std::mem::ManuallyDrop::new(Some(mask)),
+            maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+            maskTransform: windows_numerics::Matrix3x2::identity(),
+            opacity: 1.0,
+            opacityBrush: std::mem::ManuallyDrop::new(None),
+            layerOptions: Default::default(),
+        };
+        // 源与目标同一块矩形：模糊帧与后缓冲同一坐标系，1:1，不需要插值。
+        let rect = to_d2d(bounds);
+        unsafe {
+            self.d2d.PushLayer(&parameters, &layer);
+            self.d2d.DrawBitmap(
+                &blurred,
+                Some(&rect),
+                1.0,
+                D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                Some(&rect),
+                None,
+            );
+            self.d2d.PopLayer();
+        }
+        let _ = std::mem::ManuallyDrop::into_inner(parameters.geometricMask);
+        Ok(())
+    }
+
+    fn draw_region_panel(&mut self, panel: &RegionPanelView) -> Result<(), String> {
+        let layout = &panel.layout;
+        let k = self.metrics.dpi.max(96) as f32 / 96.0;
+        let dip = |value: f32| (value * k).round() as i32;
+        let surface = self.require_brush(&self.label_background_brush, "label background brush")?;
+        let text = self.require_brush(&self.label_text_brush, "label text brush")?;
+        let muted = self.require_brush(&self.panel_muted_brush, "panel muted brush")?;
+        let line = self.require_brush(&self.panel_line_brush, "panel line brush")?;
+        let fill = self.require_brush(&self.panel_fill_brush, "panel fill brush")?;
+        let accent = self.require_brush(&self.border_brush, "border brush")?;
+        let accent_fill = self.require_brush(&self.panel_accent_brush, "panel accent brush")?;
+        let danger = self.require_brush(&self.panel_danger_brush, "panel danger brush")?;
+
+        let big_radius = dip(12.0);
+        // 先铺面板范围里的毛玻璃，再压那层半透明底色：文字对比度由底色保证（docs/23 §14.55）。
+        self.draw_panel_backdrop(layout.panel, big_radius)?;
+        self.fill_round(layout.panel, big_radius, &surface);
+        self.stroke_round(layout.panel, big_radius, &line, 1.0);
+
+        // ── 页头：标题 / 单位 / 倍率 / 关闭 ─────────────────────────────────
+        let title_format = self.info_text_format_mut(false, 12.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, false)?;
+        self.draw_text_in("自定义截图", &title_format, to_d2d(layout.title), &text)?;
+
+        // 容器由布局给出：两块的并集曾让它与选中块等大，选中背景因此贴着外框（docs/23 §14.55）。
+        let unit_segments: Vec<(Rect, &str, bool)> = layout
+            .unit
+            .iter()
+            .map(|(unit, rect)| (*rect, unit.segment_label(), *unit == panel.unit))
+            .collect();
+        let unit_hovered = layout
+            .unit
+            .iter()
+            .position(|(unit, _)| panel.hover == Some(RegionPanelTarget::Unit(*unit)));
+        self.draw_segmented(
+            layout.unit_track,
+            &unit_segments,
+            unit_hovered,
+            panel.focus == Some(PanelSlot::Unit),
+            panel.unit_slide,
+            &SegmentStyle {
+                track: &fill,
+                selected: &accent_fill,
+                hover: &line,
+                focus: &accent,
+                text: &text,
+                muted: &muted,
+                mono: true,
+                size_dip: 10.0,
+                weight: DWRITE_FONT_WEIGHT_SEMI_BOLD,
+            },
+        )?;
+
+        self.fill_round(layout.scale, dip(4.0), &fill);
+        let scale_format = self.info_text_format_mut(true, 10.0, DWRITE_FONT_WEIGHT_NORMAL, true)?;
+        self.draw_text_in(
+            &format!("{}%", (k * 100.0).round() as i32),
+            &scale_format,
+            to_d2d(layout.scale),
+            &muted,
+        )?;
+
+        // 关闭：两条线画一个叉。它和页脚的取消是同一件事（布局里也指向同一个槽）。
+        let close_hover = panel.hover == Some(RegionPanelTarget::Slot(PanelSlot::Cancel));
+        if close_hover {
+            self.fill_round(layout.close, dip(6.0), &fill);
+        }
+        let close_brush = if close_hover { &text } else { &muted };
+        self.draw_glyph(
+            Glyph::Close,
+            centered_square(layout.close, dip(PANEL_ICON_DIP)),
+            close_brush,
+            false,
+        )?;
+
+        // ── 两张卡 ────────────────────────────────────────────────────────
+        let card_title_format =
+            self.info_text_format_mut(false, 10.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, false)?;
+        for (index, card) in layout.cards.into_iter().enumerate() {
+            self.fill_round(card, dip(10.0), &fill);
+            self.stroke_round(card, dip(10.0), &line, 1.0);
+            let title = layout.card_titles[index];
+            let title_box = Rect::new(title.left, title.top, title.left + dip(60.0), title.bottom);
+            self.draw_text_in(
+                if index == 0 { "尺寸" } else { "位置" },
+                &card_title_format,
+                to_d2d(title_box),
+                &muted,
+            )?;
+        }
+        for (slot, rect) in layout.actions {
+            let pressed = slot == PanelSlot::Lock && panel.locked;
+            let hovered = panel.hover == Some(RegionPanelTarget::Slot(slot));
+            if pressed {
+                self.fill_round(rect, dip(5.0), &accent_fill);
+            } else if hovered {
+                self.fill_round(rect, dip(5.0), &fill);
+            }
+            if panel.focus == Some(slot) {
+                self.stroke_round(rect, dip(5.0), &accent, 2.0);
+            }
+            let brush = if pressed { &text } else { &muted };
+            if let Some(icon) = action_icon(slot, panel.locked) {
+                self.draw_glyph(icon, centered_square(rect, dip(PANEL_ICON_DIP)), brush, false)?;
+            }
+        }
+
+        // ── 四个数字：下划线是它的边，聚焦转主色、非法转红 ────────────────
+        let number_format = self.info_text_format_mut(true, 20.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, true)?;
+        let label_format = self.info_text_format_mut(false, 10.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, true)?;
+        for (index, (field, rect)) in layout.fields.iter().enumerate() {
+            let invalid = panel.invalid[index];
+            let focused = panel.focus == Some(field.slot());
+            let underline = if invalid {
+                &danger
+            } else if focused {
+                &accent
+            } else {
+                &line
+            };
+            let underline_y = rect.bottom;
+            self.line(
+                Point::new(rect.left, underline_y),
+                Point::new(rect.right, underline_y),
+                underline,
+                if focused || invalid { 2.0 } else { 1.0 },
+            );
+            let value = panel
+                .values
+                .iter()
+                .find(|(item, _)| item == field)
+                .map(|(_, value)| value.as_str())
+                .unwrap_or("");
+            self.draw_text_in(value, &number_format, to_d2d(*rect), &text)?;
+            // 插入光标：数字是**居中**画的，所以文字左端 = 格子中心 - 总宽/2，插入点 = 文字左端 +
+            // **光标左侧前缀**的推进宽度（不是"总宽/2"——那样退格到中间就会画错位置）。
+            // 可见性由 `caret_visible` 决定，于是光标能闪（docs/23 §14.55）。
+            if panel.editing == Some(*field) && panel.caret_visible {
+                let full = self.measure_text_width(value, &number_format)?;
+                let prefix: String = value.chars().take(panel.caret).collect();
+                let before = self.measure_text_width(&prefix, &number_format)?;
+                let text_left = rect.left + rect.width() / 2 - (full / 2.0).ceil() as i32;
+                let caret_x = text_left + before.ceil() as i32;
+                let center_y = rect.top + rect.height() / 2;
+                // 加长到与数字视觉高度相当（20 dip 字号 ⇒ 约 23 dip），加粗到 3 px 并随 DPI 缩放。
+                let half = dip(CARET_HALF_DIP);
+                self.line(
+                    Point::new(caret_x, center_y - half),
+                    Point::new(caret_x, center_y + half),
+                    &accent,
+                    (3.0 * k).max(1.0),
+                );
+            }
+            let label = layout.field_labels[index];
+            let label_brush = if invalid {
+                &danger
+            } else if focused {
+                &accent
+            } else {
+                &muted
+            };
+            self.draw_text_in(field.label(), &label_format, to_d2d(label), label_brush)?;
+        }
+        // 分隔：尺寸卡是 `×`（宽 × 高），位置卡是一条竖线。
+        let sep_format = self.info_text_format_mut(
+            true,
+            18.0,
+            ::windows::Win32::Graphics::DirectWrite::DWRITE_FONT_WEIGHT_BOLD,
+            true,
+        )?;
+        self.draw_text_in("×", &sep_format, to_d2d(layout.separators[0]), &muted)?;
+        let mid = (layout.separators[1].left + layout.separators[1].right) / 2;
+        self.line(
+            Point::new(mid, layout.separators[1].top + dip(4.0)),
+            Point::new(mid, layout.separators[1].bottom - dip(4.0)),
+            &line,
+            1.0,
+        );
+
+        // ── 预设行：标签 + 触发器（下拉另画）+ 延时四段 ─────────────────────
+        let row_label_format =
+            self.info_text_format_mut(false, 10.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, false)?;
+        self.draw_text_in("预设", &row_label_format, to_d2d(layout.preset_label), &muted)?;
+        self.draw_text_in("角标", &row_label_format, to_d2d(layout.toggle_label), &muted)?;
+        self.draw_text_in("延时", &row_label_format, to_d2d(layout.delay_label), &muted)?;
+
+        let trigger_hover = panel.hover == Some(RegionPanelTarget::Slot(PanelSlot::Preset));
+        let expanded = layout.menu.is_some();
+        self.fill_round(layout.preset, dip(6.0), if trigger_hover || expanded { &fill } else { &fill });
+        if expanded {
+            self.stroke_round(layout.preset, dip(6.0), &line, 1.0);
+        }
+        if panel.focus == Some(PanelSlot::Preset) {
+            self.stroke_round(layout.preset, dip(6.0), &accent, 1.5);
+        }
+        let trigger_format = self.info_text_format_mut(false, 12.0, DWRITE_FONT_WEIGHT_NORMAL, false)?;
+        let trigger_box = Rect::new(
+            layout.preset.left + dip(9.0),
+            layout.preset.top,
+            layout.preset.right - dip(24.0),
+            layout.preset.bottom,
+        );
+        let trigger_brush = if panel.preset_hit.is_some() { &text } else { &muted };
+        self.draw_text_in(&panel.preset, &trigger_format, to_d2d(trigger_box), trigger_brush)?;
+        // 箭头：展开时同一个图标上下翻过来（不另存一份朝上的资产）。
+        let chevron_cx = layout.preset.right - dip(13.0);
+        let chevron_cy = layout.preset.top + layout.preset.height() / 2;
+        self.draw_glyph(
+            Glyph::Chevron,
+            centered_square_at(chevron_cx, chevron_cy, dip(PANEL_ICON_DIP)),
+            &muted,
+            expanded,
+        )?;
+
+        // 与单位分段器共用一份绘制（docs/23 §14.55.4）。
+        let delay_segments: Vec<(Rect, &str, bool)> = layout
+            .delay
+            .iter()
+            .map(|(delay, rect)| (*rect, delay.label(), *delay == panel.delay))
+            .collect();
+        let delay_hovered = layout
+            .delay
+            .iter()
+            .position(|(delay, _)| panel.hover == Some(RegionPanelTarget::Delay(*delay)));
+        self.draw_segmented(
+            layout.delay_track,
+            &delay_segments,
+            delay_hovered,
+            panel.focus == Some(PanelSlot::Delay),
+            panel.delay_slide,
+            &SegmentStyle {
+                track: &fill,
+                selected: &accent_fill,
+                hover: &line,
+                focus: &accent,
+                text: &text,
+                muted: &muted,
+                mono: false,
+                size_dip: 11.0,
+                weight: DWRITE_FONT_WEIGHT_NORMAL,
+            },
+        )?;
+
+        // ── 角标行：三个开关 + 角标预览 ──────────────────────────────────
+        let toggle_format = self.info_text_format_mut(false, 11.0, DWRITE_FONT_WEIGHT_NORMAL, true)?;
+        for (toggle, rect) in layout.toggles {
+            let on = panel
+                .toggles
+                .iter()
+                .find(|(item, _)| *item == toggle)
+                .map(|(_, on)| *on)
+                .unwrap_or(false);
+            let hovered = panel.hover == Some(RegionPanelTarget::Slot(toggle.slot()));
+            // 胶囊：半径 = 高度/2（三个开关与角标、分段器同一套算法）。
+            let radius = pill_radius(rect).round() as i32;
+            if on {
+                self.fill_round(rect, radius, &accent_fill);
+                self.stroke_round(rect, radius, &accent, 1.0);
+            } else {
+                // **静止的未选中芯片也有胶囊底**：它不该只是"细描边的文字"。悬停用白色 30% 那支
+                // 画刷当底色（现成资源，不新增），所以静止与悬停一眼可分（docs/23 §14.55.2）。
+                self.fill_round(rect, radius, if hovered { &line } else { &fill });
+                self.stroke_round(rect, radius, &line, 1.0);
+            }
+            let brush = if on { &text } else { &muted };
+            self.draw_text_in(toggle.label(), &toggle_format, to_d2d(rect), brush)?;
+            if panel.focus == Some(toggle.slot()) {
+                self.stroke_round(rect, radius, &accent, 2.0);
+            }
+        }
+        // 预览标签也是胶囊：与角标、方向芯片共用同一套半径算法。
+
+        // ── 页脚：一句话 + 取消 / 确定 ─────────────────────────────────
+        let status_format = self.info_text_format_mut(false, 11.0, DWRITE_FONT_WEIGHT_NORMAL, false)?;
+        if let Some(status) = panel.status.as_deref() {
+            self.draw_text_in(status, &status_format, to_d2d(layout.status), &danger)?;
+        }
+        let cancel_hover = panel.hover == Some(RegionPanelTarget::Slot(PanelSlot::Cancel));
+        if cancel_hover {
+            self.fill_round(layout.cancel, dip(6.0), &fill);
+        }
+        self.stroke_round(
+            layout.cancel,
+            dip(6.0),
+            if cancel_hover { &accent } else { &line },
+            1.0,
+        );
+        if panel.focus == Some(PanelSlot::Cancel) {
+            self.stroke_round(layout.cancel, dip(6.0), &accent, 2.0);
+        }
+        let button_format = self.info_text_format_mut(false, 12.0, DWRITE_FONT_WEIGHT_NORMAL, true)?;
+        self.draw_text_in("取消", &button_format, to_d2d(layout.cancel), &text)?;
+
+        let start_hover = panel.hover == Some(RegionPanelTarget::Slot(PanelSlot::Start));
+        let start_brush = if panel.can_start { &accent_fill } else { &fill };
+        self.fill_round(layout.start, dip(6.0), start_brush);
+        if start_hover && panel.can_start {
+            // 主按钮已经是主题色：悬停时加一圈亮边，而不是再造一个更亮的蓝。
+            self.stroke_round(layout.start, dip(6.0), &line, 1.5);
+        }
+        if panel.focus == Some(PanelSlot::Start) {
+            self.stroke_round(layout.start, dip(6.0), &accent, 2.0);
+        }
+        let start_format = self.info_text_format_mut(false, 12.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, true)?;
+        let start_text_brush = if panel.can_start { &text } else { &muted };
+        self.draw_text_in("确定", &start_format, to_d2d(layout.start), start_text_brush)?;
+
+        // ── 下拉：挂在触发器下面，压着下面的行 ─────────────────────────────
+        if let Some(menu) = layout.menu {
+            self.fill_round(menu, dip(10.0), &surface);
+            self.stroke_round(menu, dip(10.0), &line, 1.0);
+            let name_format = self.info_text_format_mut(false, 12.0, DWRITE_FONT_WEIGHT_NORMAL, false)?;
+            let size_format = self.info_text_format_mut(true, 10.5, DWRITE_FONT_WEIGHT_NORMAL, false)?;
+            for (index, item) in layout.menu_items.iter().enumerate() {
+                let selected = panel.preset_hit == Some(index);
+                let hovered = panel.hover == Some(RegionPanelTarget::MenuItem(index));
+                if selected || hovered {
+                    let inset = dip(3.0);
+                    self.fill_round(
+                        Rect::new(item.left + inset, item.top, item.right - inset, item.bottom),
+                        dip(6.0),
+                        if selected { &accent_fill } else { &fill },
+                    );
+                }
+                let preset = crate::region::PRESETS[index.min(crate::region::PRESETS.len() - 1)];
+                let check_x = item.left + dip(14.0);
+                if selected {
+                    let mid_y = item.top + item.height() / 2;
+                    self.draw_glyph(
+                        Glyph::Check,
+                        centered_square_at(check_x, mid_y, dip(PANEL_ICON_DIP)),
+                        &text,
+                        false,
+                    )?;
+                }
+                let name_box = Rect::new(
+                    item.left + dip(26.0),
+                    item.top,
+                    item.right - dip(60.0),
+                    item.bottom,
+                );
+                self.draw_text_in(preset.name, &name_format, to_d2d(name_box), &text)?;
+                let size_box = Rect::new(
+                    item.right - dip(60.0),
+                    item.top,
+                    item.right - dip(10.0),
+                    item.bottom,
+                );
+                self.draw_text_in(
+                    &format!("{}×{}", preset.width, preset.height),
+                    &size_format,
+                    to_d2d(size_box),
+                    &muted,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 画一个分段器：容器底 + 四边内缩的选中块 + 每段文字 + 聚焦环。
+    ///
+    /// 圆角走**嵌套规则**（外层 [`segment_outer_radius`]，内层减掉实际内缩），所以是圆角矩形、
+    /// 不是胶囊；指到哪一段就亮哪一段（两处分段器同一个语义）。单位与延时都调用这里
+    /// （docs/23 §14.55.4）。
+    fn draw_segmented(
+        &mut self,
+        track: Rect,
+        segments: &[(Rect, &str, bool)],
+        hovered: Option<usize>,
+        focused: bool,
+        slide: Option<(usize, f32)>,
+        style: &SegmentStyle<'_>,
+    ) -> Result<(), String> {
+        let scale = self.metrics.dpi.max(96) as f32 / 96.0;
+        let outer = segment_outer_radius(scale);
+        // 内层半径 = 外层 − 实际内缩（由第一段到容器的左边距量出；横向纵向本来一致）。
+        let inset = segments.first().map_or(0, |(rect, _, _)| rect.left - track.left);
+        let inner = segment_radius(outer, inset);
+        self.fill_round(track, outer, style.track);
+        // 选中块：平移期间在"起点段"与"选中段"之间插值；文字与命中判定用的仍是布局矩形。
+        let selected = segments.iter().position(|(_, _, selected)| *selected);
+        let block = selected.map(|to| match slide {
+            Some((from, t)) if from != to && from < segments.len() => {
+                crate::geometry::segment_slide(segments[from].0, segments[to].0, t)
+            }
+            _ => segments[to].0,
+        });
+        if let Some(block) = block {
+            self.fill_round(block, inner, style.selected);
+        }
+        for (index, (rect, label, selected)) in segments.iter().enumerate() {
+            if !*selected && hovered == Some(index) {
+                self.fill_round(*rect, inner, style.hover);
+            }
+            let brush = if *selected { style.text } else { style.muted };
+            let format =
+                self.info_text_format_mut(style.mono, style.size_dip, style.weight, true)?;
+            self.draw_text_in(label, &format, to_d2d(*rect), brush)?;
+        }
+        if focused {
+            self.stroke_round(track, outer, style.focus, 2.0);
+        }
+        Ok(())
+    }
+
+    /// 面板的图形：`assets/icon` 的 PNG，按当前状态色画到 `rect` 里。
+    ///
+    /// 图是 `icon-bake` 用 resvg 从设计给的 SVG 烘出来的（docs/23 §14.54），所以它就是设计稿那张图；
+    /// 着色与缩放分别由颜色矩阵与目标矩形负责，不需要变换。
+    fn draw_glyph(
+        &mut self,
+        glyph: Glyph,
+        rect: Rect,
+        brush: &ID2D1SolidColorBrush,
+        flip_v: bool,
+    ) -> Result<(), String> {
+        let colour = unsafe { brush.GetColor() };
+        self.panel_icons
+            .draw(&self.d2d, glyph, rect, colour, flip_v)
+    }
+
+    /// 一段文字在某个格式下的推进宽度（px）——插入光标要落在文字右端（docs/23 §14.55）。
+    fn measure_text_width(
+        &mut self,
+        text: &str,
+        format: &IDWriteTextFormat,
+    ) -> Result<f32, String> {
+        let wide = text.encode_utf16().collect::<Vec<u16>>();
+        let layout = unsafe {
+            self.dwrite
+                .CreateTextLayout(&wide, format, f32::INFINITY, f32::INFINITY)
+        }
+        .map_err(|error| super::hresult("IDWriteFactory::CreateTextLayout", &error))?;
+        let mut text_metrics = DWRITE_TEXT_METRICS::default();
+        unsafe { layout.GetMetrics(&mut text_metrics) }
+            .map_err(|error| super::hresult("IDWriteTextLayout::GetMetrics", &error))?;
+        Ok(text_metrics.width)
+    }
+
     fn draw_size_label(
         &mut self,
         selection: Rect,
         view: &RenderView,
         metrics: RenderMetrics,
     ) -> Result<(), String> {
-        let background =
-            self.require_brush(&self.label_background_brush, "label background brush")?;
+        // The badge is the one control in the overlay that answers to the pointer rather than to the
+        // keymap, so it says so: the pointer on it fills it with the interface accent (the same brush
+        // the frame's outline uses) while the white text stays as it is — the pairing every "on" state
+        // in the overlay already uses (docs/23 §14.53).
+        let background = if view.label_hovered {
+            self.require_brush(&self.border_brush, "border brush")?
+        } else {
+            self.require_brush(&self.label_background_brush, "label background brush")?
+        };
         let foreground = self.require_brush(&self.label_text_brush, "label text brush")?;
-        let text = RenderMetrics::label_text_at(selection, view.screen_origin);
+        let text = view.label.text(selection, view.screen_origin, metrics.dpi);
+        if text.is_empty() {
+            // 三项都关掉：标签没有说话可说，不画比画一个空盒子诚实（docs/23 §14.54）。
+            return Ok(());
+        }
         // Measure the exact glyph run before choosing a placement. A character-count
         // estimate is wrong for CJK, signs and proportional digits and can select a
         // different ladder step, causing the label to jump while the rectangle moves.
@@ -1433,10 +2091,12 @@ impl OverlayRenderer {
         };
 
         unsafe {
+            // 胶囊：圆角取高度的一半（`geometry::pill_radius`）——三处芯片共用同一个算法。
+            let radius = pill_radius(placement.rect);
             let panel = D2D1_ROUNDED_RECT {
                 rect: to_d2d(placement.rect),
-                radiusX: 3.0,
-                radiusY: 3.0,
+                radiusX: radius,
+                radiusY: radius,
             };
             self.d2d.FillRoundedRectangle(&panel, &background);
             let wide = text.encode_utf16().collect::<Vec<u16>>();
@@ -1456,6 +2116,31 @@ impl OverlayRenderer {
             );
         }
         Ok(())
+    }
+
+    /// Where the size label will be painted, in back-buffer coordinates, or `None` when this state
+    /// has no label to place.
+    ///
+    /// The paint path and the pointer path both go through this, so the badge the user aims at is
+    /// the badge the user sees — the pointer's hover test runs against this rectangle, and a click on
+    /// it opens the custom-region panel (docs/23 §14.54). Measuring with the same DirectWrite layout
+    /// the paint uses is what keeps a change of unit or of the origin from moving the badge away from
+    /// the rectangle the hit test already answered for.
+    pub fn size_label_bounds(&mut self, view: &RenderView) -> Result<Option<Rect>, String> {
+        if view.selection.is_empty() {
+            return Ok(None);
+        }
+        let text = view
+            .label
+            .text(view.selection, view.screen_origin, self.metrics.dpi);
+        if text.is_empty() {
+            // 三项都关掉：没有徽标可画，也就没有徽标菜单（docs/23 §14.54）。
+            return Ok(None);
+        }
+        let (measured, _format) = self.measure_label(&text)?;
+        Ok(self
+            .place_label(view.selection, view, measured, self.metrics)
+            .map(|placement| placement.rect))
     }
 
     fn place_label(
@@ -1481,19 +2166,7 @@ impl OverlayRenderer {
         // The label and loupe are both secondary chrome. When their default placements
         // collide, keep the loupe attached to the sampling cursor and move the label to
         // the next valid ladder rung instead of letting one cover the other.
-        let avoid = if view.cursor_visible {
-            Some(
-                magnifier_geometry(
-                    view.cursor,
-                    MagnifierConfig::with_zoom(view.magnifier_zoom).scaled(metrics.dpi),
-                    view.frame,
-                    work_area,
-                )
-                .bounds,
-            )
-        } else {
-            None
-        };
+        let avoid = loupe_obstacle(view, metrics);
         let overlaps = |rect: Rect| {
             avoid.is_some_and(|obstacle| !rect.intersect(obstacle).is_empty())
         };
@@ -2046,6 +2719,49 @@ impl OverlayRenderer {
         Ok(format)
     }
 
+    /// Decode the baked glyph PNGs and pre-tint them for every colour the panel draws them in.
+    ///
+    /// **Must be called outside a frame**: each tint render needs its own `BeginDraw`/`EndDraw`, and
+    /// Direct2D forbids nesting those inside the frame's draw pass (see `d2d::panel_icon`). The
+    /// controller calls it before the frame that shows the panel, so the 1.6 ms is paid when the user
+    /// opens the panel instead of on the session-start path.
+    ///
+    /// The colour list comes from the panel's own brushes, so the palette cannot drift from what
+    /// `draw_glyph` later asks for.
+    /// 量出两处分段器**最宽选项**的宽度（物理像素），供布局给每段同宽用。
+    ///
+    /// 量宽用的字体/字号/字重必须与绘制**完全一致**（这里刻意与 `draw_region_panel` 里那两处
+    /// `info_text_format_mut` 写成同一份参数），否则量出来的宽度和画出来的文字对不上。
+    /// 每段各留 `REGION_SEGMENT_PAD_DIP` 的左右内边距，文字在各段内居中（docs/23 §14.55.6）。
+    pub(crate) fn segment_widths(&mut self) -> Result<SegmentWidths, String> {
+        let scale = self.metrics.dpi.max(96) as f32 / 96.0;
+        let pad = REGION_SEGMENT_PAD_DIP * scale;
+        let mut unit = 0.0f32;
+        let unit_format =
+            self.info_text_format_mut(true, 10.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, true)?;
+        for label in LengthUnit::ALL.map(|unit| unit.segment_label()) {
+            unit = unit.max(self.measure_text_width(label, &unit_format)?);
+        }
+        let mut delay = 0.0f32;
+        let delay_format =
+            self.info_text_format_mut(false, 11.0, DWRITE_FONT_WEIGHT_NORMAL, true)?;
+        for label in Delay::ALL.map(|delay| delay.label()) {
+            delay = delay.max(self.measure_text_width(label, &delay_format)?);
+        }
+        Ok(SegmentWidths {
+            unit: (unit + 2.0 * pad).ceil() as i32,
+            delay: (delay + 2.0 * pad).ceil() as i32,
+        })
+    }
+
+    pub(crate) fn prepare_panel_icons(&mut self) -> Result<(), String> {
+        let colours: Vec<D2D1_COLOR_F> = [&self.label_text_brush, &self.panel_muted_brush]
+            .into_iter()
+            .filter_map(|brush| brush.as_ref().map(|brush| unsafe { brush.GetColor() }))
+            .collect();
+        self.panel_icons.prepare(&self.d2d, &colours)
+    }
+
     fn recreate_resources(&mut self) -> Result<(), String> {
         // Premultiplied like a D2D brush wants it: the mask is black at 45 %.
         let (mask_r, mask_g, mask_b) = MASK_RGB.channels_f32();
@@ -2066,6 +2782,8 @@ impl OverlayRenderer {
         let info = color(0.02, 0.02, 0.025, 0.94);
         self.mask_brush = Some(self.create_brush(&mask)?);
         self.border_brush = Some(self.create_brush(&accent)?);
+        // 倒计时数字：主题色、80% 透明度。用 ACCENT_RGB 的同一个来源，不另立颜色。
+        self.countdown_brush = Some(self.create_brush(&color_of(ACCENT_RGB, 0.8))?);
         // Window-snap hints reuse the existing palette: a neutral wash for the hovered
         // window and a low-alpha accent wash for the preview, so no new colour is
         // introduced (docs/14 §8).
@@ -2100,6 +2818,18 @@ impl OverlayRenderer {
         self.handle_brush = Some(self.create_brush(&white)?);
         self.label_background_brush = Some(self.create_brush(&panel)?);
         self.label_text_brush = Some(self.create_brush(&white)?);
+        // The custom-region panel: the accent marks whatever is currently selected or on, and the
+        // muted white carries the labels the user is not editing (docs/23 §14.54).
+        self.panel_fill_brush = Some(self.create_brush(&color(1.0, 1.0, 1.0, 0.08))?);
+        self.panel_line_brush = Some(self.create_brush(&color(1.0, 1.0, 1.0, 0.30))?);
+        self.panel_accent_brush = Some(self.create_brush(&accent)?);
+        self.panel_muted_brush = Some(self.create_brush(&rgba(232, 236, 242, 0.62))?);
+        self.panel_danger_brush = Some(self.create_brush(&rgba(255, 123, 123, 1.0))?);
+        // The panel's glyphs are *not* prepared here. Decoding and pre-tinting them costs a
+        // measurable 1.6 ms, and this runs on the session-start path (F5 → overlay visible), so the
+        // work moved to `prepare_panel_icons`, which the controller calls just before the frame that
+        // shows the panel. A device rebuild still drops the palette here; the next ask re-does it.
+        self.panel_icons.reset();
         self.crosshair_brush = Some(self.create_brush(&crosshair)?);
         self.magnifier_band_brush = Some(self.create_brush(&color(0.30, 0.55, 1.0, 0.45))?);
         self.magnifier_grid_brush = Some(self.create_brush(&grid)?);
@@ -2209,6 +2939,7 @@ impl OverlayRenderer {
         self.swap_chain = None;
         self.size = (0, 0);
         self.border_brush = None;
+        self.countdown_brush = None;
         self.mask_brush = None;
         self.preview_fill_brush = None;
         self.preview_stroke_brush = None;
@@ -2222,6 +2953,12 @@ impl OverlayRenderer {
         self.handle_brush = None;
         self.label_background_brush = None;
         self.label_text_brush = None;
+        self.panel_fill_brush = None;
+        self.panel_line_brush = None;
+        self.panel_accent_brush = None;
+        self.panel_muted_brush = None;
+        self.panel_danger_brush = None;
+        self.panel_icons.reset();
         self.crosshair_brush = None;
         self.magnifier_band_brush = None;
         self.magnifier_grid_brush = None;
@@ -2260,14 +2997,71 @@ impl OverlayRenderer {
 /// magnifier's info strip.
 fn needs_backdrop(view: &RenderView) -> bool {
     view.scroll.is_none()
-        && (view.mask_blur || view.guide.is_some() || (view.show_chrome && view.cursor_visible))
+        && (view.mask_blur
+            || view.guide.is_some()
+            // 面板自己要有毛玻璃（docs/23 §14.55），所以它开着就得有模糊源。
+            || view.region_panel.is_some()
+            || (view.show_chrome && view.cursor_visible))
 }
 
 use helpers::*;
+use panel_icon::PanelIcons;
+
+/// 面板图形画多大：方形边长（dip）。
+const PANEL_ICON_DIP: f32 = 14.0;
+
+/// 延时倒计时数字的字号（dip）。选 96：在 1080p 上约一屏高的十分之一，隔着房间也看得见，
+/// 又不至于在小选区里被裁掉（放不下时 D2D 只是居中裁切，不会崩）。
+const COUNTDOWN_DIP: f32 = 96.0;
+
+/// 插入光标的高度一半（dip）：数字是 20 dip，视觉高度约 15 dip，所以上下各 7.5。
+const CARET_HALF_DIP: f32 = 11.5;
+
+/// 分段器共用的一份画刷 + 标签字体。
+///
+/// 单位（PX/DP，等宽小号）与延时（正文）只有字体与段数不同，其余完全一样；抽成一份，
+/// 两处就不会各自漂移（docs/23 §14.55.4）。
+struct SegmentStyle<'a> {
+    track: &'a ID2D1SolidColorBrush,
+    selected: &'a ID2D1SolidColorBrush,
+    hover: &'a ID2D1SolidColorBrush,
+    focus: &'a ID2D1SolidColorBrush,
+    text: &'a ID2D1SolidColorBrush,
+    muted: &'a ID2D1SolidColorBrush,
+    mono: bool,
+    size_dip: f32,
+    weight: DWRITE_FONT_WEIGHT,
+}
+
+/// 组内动作 → 图标；锁定那一格按状态换成开/关两把锁。
+fn action_icon(slot: PanelSlot, locked: bool) -> Option<Glyph> {
+    match slot {
+        PanelSlot::Swap => Some(Glyph::Swap),
+        PanelSlot::Lock => Some(if locked { Glyph::Lock } else { Glyph::LockOpen }),
+        PanelSlot::Center => Some(Glyph::Center),
+        PanelSlot::Origin => Some(Glyph::Origin),
+        _ => None,
+    }
+}
+
+/// `rect` 里居中的正方形：图标的外接框（不随槽的宽高比变形）。
+fn centered_square(rect: Rect, size: i32) -> Rect {
+    centered_square_at(
+        rect.left + rect.width() / 2,
+        rect.top + rect.height() / 2,
+        size,
+    )
+}
+
+fn centered_square_at(cx: i32, cy: i32, size: i32) -> Rect {
+    let half = size / 2;
+    Rect::new(cx - half, cy - half, cx - half + size, cy - half + size)
+}
 
 mod guide_pass;
 mod helpers;
 mod magnifier_pass;
+mod panel_icon;
 
 #[cfg(test)]
 mod tests;

@@ -175,9 +175,43 @@ pub struct PinRequest {
 /// 宿主线程发回来的事。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinEvent {
-    /// 一个贴图窗口消失了（双击关闭、宿主销毁、或创建后立刻失败）。
-    /// 调用方据此回收自己那边的记录。
+    /// 一个贴图真的上屏了。
+    Created { id: u64 },
+    /// 一个贴上屏之后被关闭（双击、宿主销毁…）。**这不是失败。**
     Closed { id: u64 },
+    /// 请求过这个贴图，但它始终没出现（创建失败）。
+    Failed { id: u64 },
+}
+
+/// 一批事件的汇总：日志要能说出"创建了几张、关掉了几张、几张没出现"。
+///
+/// 以前这里只有一个条数，把"创建后被关闭"也算进"没能创建"，于是日志长期说谎
+/// （`[pin] created id=1` → `[pin] destroyed id=1` → `pin: 1 张贴图没能创建`，docs/23 §14.55.9.6）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PinReport {
+    pub created: usize,
+    pub closed: usize,
+    pub failed: usize,
+}
+
+impl PinReport {
+    /// 这一批里有没有值得一提的事。
+    pub fn any(self) -> bool {
+        self.created + self.closed + self.failed > 0
+    }
+}
+
+/// 把事件流汇总成一份报告（纯函数：没有线程、没有窗口，便于测试）。
+pub fn summarize(events: impl IntoIterator<Item = PinEvent>) -> PinReport {
+    let mut report = PinReport::default();
+    for event in events {
+        match event {
+            PinEvent::Created { .. } => report.created += 1,
+            PinEvent::Closed { .. } => report.closed += 1,
+            PinEvent::Failed { .. } => report.failed += 1,
+        }
+    }
+    report
 }
 
 /// 一个已经上屏（或正在上屏）的贴图。
@@ -192,6 +226,36 @@ pub struct PinHandle {
 #[derive(Clone)]
 pub struct PinWindowHost {
     inner: Arc<HostInner>,
+}
+
+/// 「把刚截的那张贴出去」的跨线程手柄。
+///
+/// 它做的事与用户按 `F6` **完全一样**：往贴图宿主线程投一条 `WM_HOTKEY`。留着这一层，
+/// 是为了让"消息号 + 热键号"只出现在本模块里——调用方只需要一个能跨线程调用的手柄，
+/// 而不是自己拼一条窗口消息（docs/23 §14.55.8）。
+///
+/// 只带线程 id，不带 `Arc<HostInner>`：那个结构里有一个 `Receiver`，它不是 `Sync`，而这份
+/// 手柄要被事件出口（`Send + Sync`）持有。"线程还在不在"由 `PostThreadMessageW` 的返回值
+/// 回答——线程没了它就是失败，比事先查一个可能过期的标志更诚实。
+#[derive(Clone, Copy)]
+pub struct PinPoster {
+    thread_id: u32,
+}
+
+impl PinPoster {
+    /// 投递一次贴图请求。
+    ///
+    /// 宿主线程不在、或投递失败都返回错误：调用方必须把这件事说出来（延时截图到点了
+    /// 却贴不出来，是用户要能看见的失败，不是日志里的静默）。
+    pub fn post(&self) -> Result<()> {
+        let posted = unsafe {
+            PostThreadMessageW(self.thread_id, WM_HOTKEY, PIN_HOTKEY_ID as WPARAM, 0)
+        };
+        if posted == 0 {
+            bail!("PostThreadMessageW(WM_HOTKEY) 失败：{}", last_error());
+        }
+        Ok(())
+    }
 }
 
 struct HostInner {
@@ -281,6 +345,13 @@ impl PinWindowHost {
         self.send(HostCommand::Close(handle))
     }
 
+    /// 拿一个可以跨线程调用的贴图手柄（见 [`PinPoster`]）。
+    pub fn pin_poster(&self) -> PinPoster {
+        PinPoster {
+            thread_id: self.inner.thread_id,
+        }
+    }
+
     /// 取一条宿主线程发回来的事件，没有就返回 `None`。
     ///
     /// 非阻塞轮询。贴图数量很少，调用方在自己的消息循环里顺手取一下即可，
@@ -361,10 +432,25 @@ impl HostState {
     ///
     /// 队列满了不是静默失败：那意味着有东西在往这条通道里塞不属于它的消息。
     fn report_closed(&mut self, id: u64) {
-        if self.events.try_send(PinEvent::Closed { id }).is_err() {
+        self.report(PinEvent::Closed { id }, id, "「贴图已关闭」");
+    }
+
+    /// 上报「这张贴图真的上屏了」。
+    fn report_created(&mut self, id: u64) {
+        self.report(PinEvent::Created { id }, id, "「贴图已创建」");
+    }
+
+    /// 上报「请求过，但始终没出现」——**只有这条路算失败**。
+    fn report_failed(&mut self, id: u64) {
+        self.report(PinEvent::Failed { id }, id, "「贴图创建失败」");
+    }
+
+    /// 队列满了不是静默失败：那意味着有东西在往这条通道里塞不属于它的消息。
+    fn report(&mut self, event: PinEvent, id: u64, what: &str) {
+        if self.events.try_send(event).is_err() {
             eprintln!(
-                "[snapclip-app][pin] 「贴图已关闭」队列已满，丢弃 id={id}；\
-                 这条通道只应承载创建失败，不该积压"
+                "[snapclip-app][pin] {what}队列已满，丢弃 id={id}；\
+                 这条通道是宿主线程回报生命周期的唯一通道，不该积压"
             );
         }
     }
@@ -576,9 +662,9 @@ fn run_host(
                     if let Err(err) = create_pin_window(&mut state, id, request.image, request.position)
                     {
                         eprintln!("[snapclip-app][pin] 创建贴图窗口失败：{err:#}");
-                        // 创建失败也报一条关闭：调用方是按 id 记账的，
-                        // 不报就等于它永远等着一张不存在的贴图。
-                        state.report_closed(id);
+                        // 创建失败单独记账：它是"没能创建"，不是"创建后被关闭"
+                        //（这两件事以前混成一条，日志因此说谎，docs/23 §14.55.9.6）。
+                        state.report_failed(id);
                     }
                 }
                 HostCommand::Close(handle) => {
@@ -785,6 +871,8 @@ fn create_pin_window(
         "[snapclip-app][pin] created id={id} size={width}x{height} at=({}, {})",
         position.0, position.1
     );
+    // 上屏是一次事件：账本要能把"创建"与"关闭"分开数（docs/23 §14.55.9.6）。
+    state.report_created(id);
 
     // `wnd_proc` 在 `WM_NCCREATE` 里已经把窗口状态推进 `state.windows`。
     // 没推进去说明初始化中途失败（`WM_NCCREATE` 返回 0 会让创建失败）。
@@ -2881,6 +2969,22 @@ fn last_error() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 账本必须把三件事分开：创建、关闭、没能创建（回归：曾经 created→destroyed 之后
+    /// 还会打印"1 张贴图没能创建"，docs/23 §14.55.9.6）。
+    #[test]
+    fn the_pin_report_separates_created_closed_and_failed() {
+        let lifecycle = summarize([PinEvent::Created { id: 1 }, PinEvent::Closed { id: 1 }]);
+        assert_eq!(
+            lifecycle,
+            PinReport { created: 1, closed: 1, failed: 0 },
+            "创建后被关闭不算失败"
+        );
+        assert!(lifecycle.any());
+        let failure = summarize([PinEvent::Failed { id: 2 }]);
+        assert_eq!((failure.created, failure.closed, failure.failed), (0, 0, 1));
+        assert!(!summarize([]).any(), "没有事件就不该打印任何一行");
+    }
 
     /// 边框色独立写一遍，避免「实现改了测试跟着改」。
     const BORDER: u32 = 0xFF40_4040;

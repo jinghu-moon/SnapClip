@@ -57,14 +57,17 @@ pub fn start(
     events: EventBus,
     options: DetectionOptions,
     preferences: OverlayPreferences,
-) -> Result<(Arc<CaptureRuntime>, Arc<PinSource>), String> {
+) -> Result<(Arc<CaptureRuntime>, Arc<PinSource>, Arc<CaptureEvents>), String> {
     // Per-Monitor V2 has to be declared before any window exists; the caller does that at the
     // very start of `run`. The overlay inherits the process context, so this only checks it.
     snapclip_capture::windows::monitor::set_per_monitor_v2_awareness()
         .map_err(|message| format!("DPI awareness: {message}"))?;
 
     let service = Arc::new(CaptureService::new());
-    let sink: Arc<dyn CaptureEventSink> = Arc::new(CaptureEvents::new(events));
+    // 事件出口留一份具体类型在外面：延时截图到点时要给它接上"怎么贴图"，而那件事
+    // 只有外壳知道（贴图管理器在半路上才起来，docs/23 §14.55.8）。
+    let capture_events = Arc::new(CaptureEvents::new(events));
+    let sink: Arc<dyn CaptureEventSink> = capture_events.clone();
     let clipboard: Arc<dyn ClipboardWriter> = Arc::new(SystemClipboardWriter);
     // Artifacts land in `<app local data>/artifacts/capture` (docs/11 §8.2); the writer is
     // the only thing that knows how to turn pixels into a file.
@@ -95,7 +98,7 @@ pub fn start(
     // dropping the shell's copy is what shuts the overlay down (`CaptureRuntime::drop`).
     let runtime = Arc::new(runtime);
     pin_source.set_home(Arc::new(SelectionHome::new(runtime.clone())));
-    Ok((runtime, pin_source))
+    Ok((runtime, pin_source, capture_events))
 }
 
 /// [`TakeSelection`] 的宿主：把外壳持有的 [`CaptureRuntime`] 接在 [`PinSource`] 后面。
@@ -172,7 +175,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("snapclip-app-capture-host-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let (runtime, pin_source) = start(
+        let (runtime, pin_source, _capture_events) = start(
             &root,
             EventBus::new(),
             DetectionOptions::default(),

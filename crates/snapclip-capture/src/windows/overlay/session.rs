@@ -4,6 +4,7 @@
 //! it publishes, the worker hand-offs, the single cancellation path and the colour sampler.
 //! `pub(super)` because the parent module's window procedure and the input handlers call in.
 
+use crate::windows::win::window::WindowRegion;
 use super::*;
 
 impl OverlayController {
@@ -83,9 +84,206 @@ impl OverlayController {
     /// Nothing here waits on WGC/BitBlt: the freeze happens on the worker
     /// thread and the message pump keeps running, so `Esc` cancels while the
     /// screen is still being captured (docs/11 §2.2/§3.3).
+    /// 面板选了延时：收起浮层，等画面变完再抓（`REGION_DELAY_TIMER_ID`）。
+    ///
+    /// 抓的是等待**之后**那一帧，所以这里结束当前会话并叫一次新的；区域存在 `pending_region` 里，
+    /// 由那次会话在能接受选区时放上去（docs/23 §14.54）。
+    /// 面板确认了延时：**浮层留在屏幕上**，在选区正中倒数，到点再抓（docs/23 §14.55.9）。
+    ///
+    /// 与旧行为的差别：以前是"收起浮层干等"，用户看不到还剩几秒；现在是"看得见地等"。
+    pub(super) fn arm_countdown(&mut self, seconds: u32) {
+        self.countdown = Some(Countdown::start(Instant::now(), seconds));
+        // 基线与差值是这条日志的意义所在：它回答"从开始等到退出，有没有画过普通帧"
+        // （docs/23 §14.55.9.5）。
+        self.frames_normal_at_countdown = self.frames_normal;
+        // 结构闸生效，并记下两个新读数（可见普通帧 / 被压掉的普通帧）的基线。
+        self.countdown_hud = true;
+        self.frames_normal_visible_at_countdown = self.frames_normal_visible;
+        self.frames_suppressed_at_countdown = self.frames_suppressed;
+        // 新的一次等待：不带着上一次可能残留的拖拽手势。
+        self.countdown_dragging = false;
+        self.countdown_handle = None;
+        // 进入倒计时的顺序是数据（`countdown_enter_steps`）。第一条最关键：**先把屏幕上的
+        // 普通画面同步换成 HUD 帧**，再收窄窗口区域、再叠遮罩层 —— 反过来会在收窄区域的那一刻
+        // 把屏幕上旧遮罩切掉一半，而新遮罩还没出现，用户看到的就是"面板消失时选区外闪一下"
+        // （docs/23 §14.55.9.9）。
+        self.enter_countdown();
+        unsafe { SetTimer(self.window, COUNTDOWN_TIMER_ID, COUNTDOWN_TICK_MS, None) };
+        self.invalidate();
+    }
+
+    /// 按 [`countdown_enter_steps`] 进入倒计时。
+    pub(super) fn enter_countdown(&mut self) {
+        for step in countdown_enter_steps() {
+            match *step {
+                EnterStep::PaintHud => self.paint_now(),
+                EnterStep::NarrowRegion => self.set_window_region(&countdown_window_pieces(
+                    self.session.selection(),
+                    self.label_badge,
+                    self.session.dpi(),
+                )),
+                EnterStep::ShowDim => self.show_countdown_dim(),
+                EnterStep::RaiseOverlay => self.raise_overlay_above_dim(),
+            }
+        }
+    }
+
+    /// 把主浮层提回遮罩层之上：两者都是 TOPMOST，不提的话框环的外半边会被遮罩压暗。
+    pub(super) fn raise_overlay_above_dim(&mut self) {
+        unsafe {
+            SetWindowPos(
+                self.window,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE
+                    | windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
+                    | windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOSIZE,
+            )
+        };
+    }
+
+    /// 显示（或重设）倒计时遮罩层：铺满显示器、选区开洞。
+    ///
+    /// **不改变 Z 序** —— 提层是 [`EnterStep::RaiseOverlay`]，顺序由数据钉住（docs/23 §14.55.9.9）。
+    pub(super) fn show_countdown_dim(&mut self) {
+        let Some(monitor) = self.renderer.as_ref().map(|renderer| renderer.layout().bounds) else {
+            return;
+        };
+        let selection = self.session.selection();
+        match self.dim_layer.show(monitor, selection) {
+            Ok(()) => eprintln!(
+                "[snapclip][capture] countdown dim shown: {}",
+                self.dim_layer.diagnose()
+            ),
+            Err(error) => eprintln!("[snapclip][capture] countdown dim layer: {error}"),
+        }
+    }
+
+    /// 拖动改框时挪洞（不重填、不重新提交层内容）。
+    pub(super) fn update_countdown_dim(&mut self) {
+        if self.countdown.is_none() {
+            return;
+        }
+        let Some(monitor) = self.renderer.as_ref().map(|renderer| renderer.layout().bounds) else {
+            return;
+        };
+        let selection = self.session.selection();
+        if let Err(error) = self.dim_layer.update(monitor, selection) {
+            eprintln!("[snapclip][capture] countdown dim update: {error}");
+        }
+    }
+
+
+
+    /// 倒计时里拖边框改大小之后，两样东西必须一起跟随新选区：
+    ///
+    /// * 到点贴图用的区域 —— 不跟随的话，用户改了框也白改，贴的还是点「确定」那一刻的区域；
+    /// * HUD 的窗口区域 —— 不跟随的话，框线会跑到窗口外面被裁掉。
+    pub(super) fn countdown_after_resize(
+        selection: Rect,
+        origin: Point,
+        badge: Option<Rect>,
+        dpi: u32,
+    ) -> (Option<crate::region::Region>, Vec<WindowRegion>) {
+        let pin = (!selection.is_empty()).then(|| crate::region::Region::from_rect(selection, origin));
+        (pin, countdown_window_pieces(selection, badge, dpi))
+    }
+
+    /// 倒计时每秒一跳：还在数就重绘；到 0 收浮层、抓"等待之后那一帧"并交给贴图（docs/23 §14.55.9）。
+    pub(super) fn on_countdown_tick(&mut self) {
+        let Some(countdown) = self.countdown else {
+            return;
+        };
+        match countdown.step(Instant::now()) {
+            CountdownStep::Show(_) => self.invalidate(),
+            CountdownStep::Fire => {
+                // 顺序由 `countdown_exit_steps` 钉住（docs/23 §14.55.9.5）：**先让窗口不可见**，
+                // 再退出 HUD 渲染模式、还原区域，并且**不请求重绘**——那一帧普通画面（冻结画面 +
+                // 遮罩）就是用户看到的"边框外侧一圈暗灰"。
+                self.leave_countdown(CountdownExit::Fire);
+                self.on_region_delay();
+            }
+        }
+    }
+
+    /// 还剩几秒（给视图画数字用）；没有倒计时就是 `None`。
+    pub(super) fn countdown_seconds_left(&self) -> Option<u32> {
+        let now = Instant::now();
+        match self.countdown?.step(now) {
+            CountdownStep::Show(seconds) => Some(seconds),
+            CountdownStep::Fire => None,
+        }
+    }
+
+    /// 倒计时收尾的**状态部分**：停表、把鼠标还回来、清掉倒计时；返回此前是否在跑（幂等）。
+    ///
+    /// **不碰窗口区域** —— 区域由调用方按"窗口此刻还可见吗"决定先后：到点那条路必须**先隐藏**
+    /// 再还原（否则可见的窗口会按普通帧画一次，就是那一下灰底，docs/23 §14.55.9.4）；而取消那条路
+    /// 窗口本来就该继续显示普通画面，直接还原再重绘即可。
+    pub(super) fn finish_countdown(&mut self) -> bool {
+        if self.countdown.take().is_none() {
+            return false;
+        }
+        unsafe { KillTimer(self.window, COUNTDOWN_TIMER_ID) };
+        // 遮罩暗色层与倒计时同生共死：三个出口都经这里（docs/23 §14.55.9.7）。
+        // 正在拖边框时按 Esc：先把鼠标还回来（docs/23 §14.55.9.3）。
+        self.release_countdown_capture();
+        // 解闸。到点/失败这两个出口走 `ExitStep::Hide` 在前，所以此时窗口已不可见；
+        // Esc 取消这条窗口要继续可见，先解闸再重画才是对的（docs/23 §14.55.9.6）。
+        self.countdown_hud = false;
+        true
+    }
+
+    /// 走一遍"退出倒计时"的顺序，顺序本身在 [`countdown_exit_steps`] 里。
+    ///
+    /// 顺带把这一帧的统计打进日志：倒计时过渡时是否画过**普通帧**，从日志就能判断，不必靠人眼
+    /// 反复确认（docs/23 §14.55.9.5）。
+    pub(super) fn leave_countdown(&mut self, exit: CountdownExit) {
+        for step in countdown_exit_steps(exit) {
+            match step {
+                ExitStep::Hide => self.hide_overlay(),
+                ExitStep::HideDim => self.dim_layer.hide(),
+                ExitStep::ClearCountdown => {
+                    self.finish_countdown();
+                }
+                ExitStep::RestoreRegion => self.set_window_region(&[]),
+                ExitStep::Repaint => self.invalidate(),
+            }
+        }
+        eprintln!(
+            "[snapclip][capture] countdown exit={exit:?} normal_frames_since_start={} normal_frames_visible_since_start={} suppressed_frames_since_start={} hud_frames_since_start={}",
+            self.frames_normal - self.frames_normal_at_countdown,
+            self.frames_normal_visible - self.frames_normal_visible_at_countdown,
+            self.frames_suppressed - self.frames_suppressed_at_countdown,
+            self.frames_hud
+        );
+    }
+
+    /// 延时到点：结束等待，开一次带着那块区域的会话。
+    pub(super) fn on_region_delay(&mut self) {
+        if self.pending_region.is_none() {
+            // 等待期间用户按了 Esc：没有要截的区域，也不该凭空开一次会话。
+            self.pin_after_delay = false;
+            return;
+        }
+        // 这一次启动是延时自己发起的，`start_session` 因此保留待截区域与"到点贴图"。
+        self.delay_in_flight = true;
+        self.start_session();
+        self.delay_in_flight = false;
+    }
+
     pub(super) fn start_session(&mut self) {
         let started_at = Instant::now();
         eprintln!("[snapclip][capture] starting session from hotkey/command");
+        // 延时留下的"待截区域/到点贴图"只归延时自己发起的会话。用户手动起的会话（F5/F7、
+        // 托盘）把它们清掉：等待期间用户改了主意再来一次，不该被上一次的意图劫持。
+        if !self.delay_in_flight {
+            self.pending_region = None;
+            self.pin_after_delay = false;
+        }
         if self.session.state().is_active() || self.scroll.is_some() {
             // A repeated hotkey press restarts rather than stacking sessions;
             // `cancel` bumps the generation so the old request's result dies.
@@ -101,6 +299,8 @@ impl OverlayController {
         self.loupe_hints = self.preferences.keymap.loupe_hints().into();
         self.guide_groups = self.guide_groups_for(false);
         self.guide = GuideFade::default();
+        self.unit_slide = SegmentSlide::default();
+        self.delay_slide = SegmentSlide::default();
 
         let monitor = match monitor::captured_monitor_at_cursor() {
             Ok(monitor) => monitor,
@@ -248,6 +448,34 @@ impl OverlayController {
             return;
         }
         self.publish_state();
+        // 延时截图：到点之后开的这次会话把当时那块区域直接放上去（docs/23 §14.54）。
+        // 放在 `overlay_ready` 之后：`snap_to` 只在会话能接受选区时才生效。
+        if let Some(region) = self.pending_region.take() {
+            let pinned = std::mem::take(&mut self.pin_after_delay);
+            let accepted = self.session.snap_to(region.to_rect(self.monitor_origin()));
+            if !accepted {
+                eprintln!("[snapclip][capture] delayed region refused by the session");
+            }
+            self.publish_state();
+            // 到点贴图：把这一帧的区域像素放进 `F6` 取图的那个槽位，然后请外壳去贴
+            // （外壳投的是同一条 `WM_HOTKEY`，所以贴图代码一行都不用新写，docs/23 §14.55.8）。
+            // 这里直接 return：**不 paint、不显示浮层**——用户正在别的窗口里操作，闪一下就是打扰。
+            if let DelayOutcome::Pin = delay_outcome(pinned, accepted) {
+                self.publish_selection("panel-delay-pin");
+                self.sink.on_pin_requested(&self.session_id());
+                self.finish_session();
+                return;
+            }
+            if let DelayOutcome::Refused = delay_outcome(pinned, accepted) {
+                // 失败要说出来，不能静默：没有合法区域就没有可贴的图。
+                self.fail(
+                    None,
+                    CaptureError::InvalidState("delayed region refused by the session".into()),
+                    provider,
+                );
+                return;
+            }
+        }
         // Paint the new frame while the HWND is still hidden. DirectComposition
         // retains the previous swap-chain contents, so showing first would expose
         // the previous session's selection for one compositor frame. This first paint
@@ -390,6 +618,8 @@ impl OverlayController {
         self.frozen = None;
         self.graphics_released = false;
         self.gesture.reset();
+        // 会话结束（取消/失败/完成）时若还在拖倒计时边框，捕获必须还回去。
+        self.release_countdown_capture();
         self.set_preview_target(None);
         self.hover_target = None;
         self.dwell_armed = None;
@@ -421,6 +651,14 @@ impl OverlayController {
         self.magnifier_zoom = MagnifierConfig::ZOOM_DEFAULT;
         self.held = None;
         self.guide = GuideFade::default();
+        self.unit_slide = SegmentSlide::default();
+        self.delay_slide = SegmentSlide::default();
+        self.label_badge = None;
+        self.chrome_swallowed_press = false;
+        // 面板属于它所在的那次会话：下一个会话要么自己打开它，要么没有。
+        self.region_panel = None;
+        // 会话结束：面板没了，IME 必须还给这个窗口（docs/23 §14.55）。
+        self.restore_ime_for_panel();
         self.sample_slot = None;
         self.annotation_doc.reset();
         self.annotation_tool = None;
@@ -509,6 +747,11 @@ impl OverlayController {
                 show_chrome: false,
                 show_handles: false,
                 show_size_label: false,
+                // The label is not drawn on the export path at all; the unit is carried through
+                // unchanged so the export state stays a faithful copy of the session's.
+                label: self.preferences.label,
+                label_hovered: false,
+                region_panel: None,
                 show_magnifier: false,
                 precision_feedback: false,
                 magnifier_rgb: None,
@@ -535,6 +778,8 @@ impl OverlayController {
                 mask_blur: false,
                 loupe_hints: self.loupe_hints.clone(),
                 guide: None,
+                // 倒计时是给用户的提示，不进导出像素（docs/23 §14.55.9）。
+                countdown: None,
             };
             let Some(renderer) = self.renderer.as_mut() else {
                 self.cancel("annotation-export-without-renderer");
@@ -704,6 +949,13 @@ impl OverlayController {
     }
 
     pub(super) fn fail(&mut self, session_id: Option<&str>, error: CaptureError, provider: &str) {
+        // 失败之后不留延时留下的意图：下一次会话从干净状态开始。
+        self.pending_region = None;
+        self.pin_after_delay = false;
+        // 倒计时也要一起收：同样先退出可见状态，再退渲染模式（docs/23 §14.55.9.5）。
+        if self.countdown.is_some() {
+            self.leave_countdown(CountdownExit::Fail);
+        }
         let id = session_id
             .map(str::to_string)
             .unwrap_or_else(|| self.session_id());
@@ -801,5 +1053,259 @@ impl OverlayController {
                 self.sampler.mark_stale();
             }
         }
+    }
+}
+
+/// 延时到点后，这一次会话该怎么收场。
+///
+/// 抽成纯函数是为了能被测试盯住：这条路径要真跑起来得有一帧真实画面与一次会话，
+/// 而"到底该贴图、该显示、还是该报错"本身只是一个判断（docs/23 §14.55.8）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DelayOutcome {
+    /// 不是延时发起的会话：照常显示浮层等用户确认。
+    Show,
+    /// 延时到点且区域被接受：把图放进贴图槽位、请外壳贴出去。
+    Pin,
+    /// 延时到点但区域被会话拒绝：必须报错，不能静默什么都不做。
+    Refused,
+}
+
+/// `pinned` = 这次会话是延时"截图并贴图"发起的；`accepted` = 会话接受了那块区域。
+pub(super) fn delay_outcome(pinned: bool, accepted: bool) -> DelayOutcome {
+    match (pinned, accepted) {
+        (false, _) => DelayOutcome::Show,
+        (true, true) => DelayOutcome::Pin,
+        (true, false) => DelayOutcome::Refused,
+    }
+}
+
+#[cfg(test)]
+mod delay_outcome_tests {
+    use super::{DelayOutcome, delay_outcome};
+
+    #[test]
+    fn a_normal_session_just_shows_the_overlay() {
+        assert_eq!(delay_outcome(false, true), DelayOutcome::Show);
+        assert_eq!(delay_outcome(false, false), DelayOutcome::Show);
+    }
+
+    #[test]
+    fn a_delayed_session_that_was_accepted_asks_for_a_pin() {
+        assert_eq!(delay_outcome(true, true), DelayOutcome::Pin);
+    }
+
+    #[test]
+    fn a_delayed_session_whose_region_was_refused_reports_instead_of_silence() {
+        assert_eq!(delay_outcome(true, false), DelayOutcome::Refused);
+    }
+}
+
+/// 倒计时期间窗口应收窄到的矩形：就是选区本身。
+///
+/// 空选区返回 `None`（还原整块），否则把一个退化矩形交给 `SetWindowRgn` 会让窗口消失。
+pub(super) fn countdown_window_pieces(
+    selection: Rect,
+    badge: Option<Rect>,
+    dpi: u32,
+) -> Vec<WindowRegion> {
+    if selection.is_empty() {
+        return Vec::new();
+    }
+    let scale = dpi.max(96) as f32 / 96.0;
+    // 选框环：外框外扩、内框内缩；环宽要够放框线与手柄圆点。
+    let reach = (COUNTDOWN_RING_REACH_DIP * scale).round().max(1.0) as i32;
+    let outer = Rect::new(
+        selection.left - reach,
+        selection.top - reach,
+        selection.right + reach,
+        selection.bottom + reach,
+    );
+    let inner = Rect::new(
+        selection.left + reach,
+        selection.top + reach,
+        selection.right - reach,
+        selection.bottom - reach,
+    );
+    let mut pieces = vec![WindowRegion::Ring {
+        outer,
+        inner: if inner.width() > 0 && inner.height() > 0 {
+            inner
+        } else {
+            Rect::new(0, 0, 0, 0)
+        },
+    }];
+    // 角标在选区之外，单独留一块；否则倒计时期间它会消失。
+    if let Some(badge) = badge.filter(|badge| !badge.is_empty()) {
+        pieces.push(WindowRegion::Rect(badge));
+    }
+    // 倒计时数字所在的小方框。
+    let side = (COUNTDOWN_BOX_DIP * scale).round() as i32;
+    let centre = selection.center();
+    pieces.push(WindowRegion::Rect(Rect::from_origin_size(
+        Point::new(centre.x - side / 2, centre.y - side / 2),
+        side,
+        side,
+    )));
+    pieces
+}
+
+/// 倒计时那块小方框的边长（dip）：够放下 96 dip 的数字并留出余量。
+const COUNTDOWN_BOX_DIP: f32 = 168.0;
+/// 选框环的环宽（dip，单侧）：要盖住框线并让手柄圆点完整。
+const COUNTDOWN_RING_REACH_DIP: f32 = 8.0;
+
+
+/// 倒计时怎么退出。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CountdownExit {
+    /// 到点：窗口先不可见，再退出 HUD、还原区域；**不请求重绘**。
+    Fire,
+    /// Esc 取消：窗口要继续可见，所以不清可见性，最后重画一帧普通画面。
+    Cancel,
+    /// 失败：和到点一样，先退出可见状态（失败后浮层不该留在屏幕上）。
+    Fail,
+}
+
+/// 进入倒计时的一步。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EnterStep {
+    /// 先**同步**画一帧 HUD（透明背景 + 框线/角标/数字 + 倒计时），把屏幕上那张普通画面换掉。
+    PaintHud,
+    /// 再把窗口区域收窄到框环/角标/倒计时框：此时屏幕上已经没有旧画面可被切掉了。
+    NarrowRegion,
+    /// **先**叠上遮罩层（选区外压暗；layered + transparent，点击可穿）。
+    ShowDim,
+    /// 紧接着把主浮层提回遮罩层之上：旧画面是不透明的，于是它立刻盖住刚出现的遮罩，
+    /// 屏幕上回到"只有旧遮罩"。这一提必须排在换画面之前，否则两层暗色会叠着露出来。
+    RaiseOverlay,
+}
+
+/// 进入倒计时的**顺序**：做成数据，测试才能钉住"交接时暗色不断档、也不叠层"。
+///
+/// 两种曾经的写法都被实测否掉：
+/// * "收窄区域 → 显示遮罩 → 等合并 tick 重绘"：收窄时屏幕上还是旧画面，旧遮罩被切掉、新遮罩
+///   还没出现 ⇒ 暗色闪一下（§14.55.9.9）；
+/// * "先换 HUD 帧 → 再显示遮罩"：`PaintHud` 让主浮层在选区外变透明（旧遮罩立刻消失），而新遮罩
+///   要到下一拍才出现 ⇒ 暗色**先消失再恢复**（§14.55.9.10，用户描述为"突然消失，再恢复"）。
+///
+/// 现在的顺序把"交接"压在同一段同步调用里，中间不放任何重绘：
+/// 1. `ShowDim` —— 新遮罩就位（它显示时会被提到最顶，于是短暂压在旧画面之上）；
+/// 2. `RaiseOverlay` —— 立刻把主浮层提回遮罩之上，不透明的旧画面重新盖住它 ⇒ 看不出变化；
+/// 3. `PaintHud` —— 换成透明背景的 HUD 帧，**露出**早已就位的遮罩 ⇒ 暗色自始至终都在；
+/// 4. `NarrowRegion` —— HUD 帧在选区外本来就透明，此刻收窄不会切掉任何可见内容。
+pub(super) fn countdown_enter_steps() -> &'static [EnterStep] {
+    &[
+        EnterStep::ShowDim,
+        EnterStep::RaiseOverlay,
+        EnterStep::PaintHud,
+        EnterStep::NarrowRegion,
+    ]
+}
+
+/// 退出倒计时的一步。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ExitStep {
+    Hide,
+    /// 收掉遮罩层。它必须在"退出可见状态"这一步里（和 `Hide` 一起），不能留到最后。
+    HideDim,
+    ClearCountdown,
+    RestoreRegion,
+    Repaint,
+}
+
+/// 退出倒计时的**顺序**：把它做成数据，才能被测试钉住"先隐藏、再退渲染模式"这个交错的先后。
+///
+/// 曾经的实现是"先清状态、后隐藏"：中间留出一瞬"窗口仍可见、倒计时已结束"，渲染器于是按普通帧
+/// 画了一次（冻结画面 + 遮罩），用户看到的是框线外侧突然出现一圈暗灰（docs/23 §14.55.9.5）。
+pub(super) fn countdown_exit_steps(exit: CountdownExit) -> &'static [ExitStep] {
+    match exit {
+        CountdownExit::Fire | CountdownExit::Fail => &[
+            ExitStep::Hide,
+            ExitStep::HideDim,
+            ExitStep::ClearCountdown,
+            ExitStep::RestoreRegion,
+        ],
+        CountdownExit::Cancel => &[
+            ExitStep::HideDim,
+            ExitStep::ClearCountdown,
+            ExitStep::RestoreRegion,
+            ExitStep::Repaint,
+        ],
+    }
+}
+
+/// 延时倒计时：面板收起后，在选区正中显示剩余秒数（docs/23 §14.55.9）。
+///
+/// 只吃一个时钟读数，所以能用假时刻测；`Option` 在控制器里承担"只触发一次"的语义
+/// （`on_countdown_tick` 用 `take` 取走它，取走之后不可能再 Fire）。
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Countdown {
+    deadline: Instant,
+}
+
+impl Countdown {
+    pub(super) fn start(now: Instant, seconds: u32) -> Self {
+        Self {
+            deadline: now + std::time::Duration::from_secs(seconds.max(1) as u64),
+        }
+    }
+
+    pub(super) fn step(self, now: Instant) -> CountdownStep {
+        countdown_step(self.deadline.saturating_duration_since(now))
+    }
+}
+
+/// 一次倒计时推进的结论：还在数（显示这个数字），还是该抓帧了。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CountdownStep {
+    Show(u32),
+    Fire,
+}
+
+/// 剩余时长 → 显示的数字（**向上取整**：还剩 0.4 秒也要显示 1，不能出现"显示 0 却还在等"）。
+pub(super) fn countdown_seconds(left: std::time::Duration) -> u32 {
+    ((left.as_millis() as u64).saturating_add(999) / 1000) as u32
+}
+
+pub(super) fn countdown_step(left: std::time::Duration) -> CountdownStep {
+    match countdown_seconds(left) {
+        0 => CountdownStep::Fire,
+        seconds => CountdownStep::Show(seconds),
+    }
+}
+
+
+#[cfg(test)]
+mod countdown_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn the_number_rounds_up_and_never_shows_zero_while_waiting() {
+        assert_eq!(countdown_seconds(Duration::from_millis(3000)), 3);
+        assert_eq!(countdown_seconds(Duration::from_millis(2999)), 3);
+        assert_eq!(countdown_seconds(Duration::from_millis(1001)), 2);
+        assert_eq!(countdown_seconds(Duration::from_millis(1)), 1);
+        assert_eq!(countdown_step(Duration::ZERO), CountdownStep::Fire);
+    }
+
+    #[test]
+    fn the_countdown_walks_down_to_fire_exactly_at_the_deadline() {
+        let start = Instant::now();
+        let countdown = Countdown::start(start, 3);
+        assert_eq!(countdown.step(start), CountdownStep::Show(3));
+        assert_eq!(countdown.step(start + Duration::from_millis(900)), CountdownStep::Show(3));
+        assert_eq!(countdown.step(start + Duration::from_millis(1100)), CountdownStep::Show(2));
+        assert_eq!(countdown.step(start + Duration::from_millis(2999)), CountdownStep::Show(1));
+        assert_eq!(countdown.step(start + Duration::from_secs(3)), CountdownStep::Fire);
+        assert_eq!(countdown.step(start + Duration::from_secs(9)), CountdownStep::Fire);
+    }
+
+    #[test]
+    fn a_zero_second_countdown_still_shows_one_second() {
+        // 面板允许的延时就那几个值，都不是 0；真给 0 也不该"立刻抓帧"而没有任何提示。
+        let start = Instant::now();
+        let countdown = Countdown::start(start, 0);
+        assert_eq!(countdown.step(start), CountdownStep::Show(1));
     }
 }

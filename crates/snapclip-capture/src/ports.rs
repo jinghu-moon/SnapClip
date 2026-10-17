@@ -20,6 +20,11 @@ pub trait CaptureEventSink: Send + Sync + 'static {
     fn on_completed(&self, artifact: &snapclip_model::CaptureArtifact);
     fn on_cancelled(&self, session_id: &str, reason: &str);
     fn on_failed(&self, session_id: Option<&str>, error: &CaptureError, provider: &str);
+
+    /// 延时截图到点了：图已经在贴图槽位里，请外壳把它贴出去（docs/23 §14.55.8）。
+    ///
+    /// 这一条只说"贴"，不说"怎么贴"：`F6` 那条链路怎么贴图是外壳的事，捕获侧不该知道。
+    fn on_pin_requested(&self, _session_id: &str) {}
 }
 
 /// A sink that drops everything. Useful for tests and headless runs.
@@ -59,6 +64,16 @@ pub trait OverlayPlatform: Send + Sync + 'static {
 
     /// Use `preferences` from the next session on; a running session keeps what it started with.
     fn set_preferences(&self, preferences: crate::preferences::OverlayPreferences);
+
+    /// The preferences a session starting now would use (docs/23 §14.53).
+    ///
+    /// The overlay's custom-region panel edits the display settings in place (docs/23 §14.54), and
+    /// this is how such an edit gets out of the overlay: the shell asks when a capture ends and writes
+    /// the answer into the settings file, so what the user changed in the panel outlives the process.
+    /// `None` means the platform keeps no such state, and the shell's own copy is still the truth.
+    fn preferences(&self) -> Option<crate::preferences::OverlayPreferences> {
+        None
+    }
 
     /// Hand over the last selection the user confirmed, if this platform still holds one.
     ///

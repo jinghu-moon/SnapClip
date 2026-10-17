@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use crate::keymap::Keymap;
+use crate::units::LabelDisplay;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct OverlayPreferences {
@@ -15,6 +16,10 @@ pub struct OverlayPreferences {
     pub mask_blur: bool,
     /// Show the shortcut guide in the bottom-left corner while picking.
     pub shortcut_guide: bool,
+    /// How the size/coordinate badge reads — the unit, the origin, the unit's name — which is also
+    /// what the badge's own menu changes. Presentation only: the capture measures and exports
+    /// physical pixels whatever this says.
+    pub label: LabelDisplay,
     pub keymap: Arc<Keymap>,
 }
 
@@ -23,6 +28,7 @@ impl Default for OverlayPreferences {
         Self {
             mask_blur: true,
             shortcut_guide: true,
+            label: LabelDisplay::default(),
             keymap: Arc::new(Keymap::default()),
         }
     }

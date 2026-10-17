@@ -1,0 +1,12 @@
+[package]
+name = "icon-bake"
+version = "0.1.0"
+description = "Rasterises assets/icon/*.svg into the white-on-transparent PNGs the overlay draws (docs/23 §14.54)"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+# `resvg` lives here and nowhere else: this is a development-time tool. The overlay ships the
+# baked PNGs, so neither the capture crate nor the app gains an SVG dependency.
+[dependencies]
+resvg = "0.45"

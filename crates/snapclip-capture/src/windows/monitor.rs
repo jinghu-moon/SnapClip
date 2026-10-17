@@ -228,31 +228,12 @@ fn monitor_dpi(monitor: HMONITOR) -> u32 {
     if result < 0 || dpi_x == 0 { 96 } else { dpi_x }
 }
 
-/// Font height in physical pixels for a DIP size at the given monitor DPI.
-///
-/// Chrome metrics are computed from a DPI scale factor; this helper documents the
-/// conversion and is exercised by the DPI tests at 96/120/144/192.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn dip_to_px(dip: f32, dpi: u32) -> f32 {
-    dip * dpi.max(96) as f32 / 96.0
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        captured_monitor_at, captured_monitor_at_cursor, dip_to_px, enumerate,
-        set_per_monitor_v2_awareness,
+        captured_monitor_at, captured_monitor_at_cursor, enumerate, set_per_monitor_v2_awareness,
     };
     use crate::geometry::{Point, Rect};
-
-    #[test]
-    fn dip_conversion_follows_the_dpi_scale() {
-        assert_eq!(dip_to_px(8.0, 96), 8.0);
-        assert_eq!(dip_to_px(8.0, 192), 16.0);
-        assert!((dip_to_px(10.0, 120) - 12.5).abs() < f32::EPSILON);
-        // Degenerate DPI values must never produce zero-sized chrome.
-        assert_eq!(dip_to_px(4.0, 0), 4.0);
-    }
 
     #[test]
     fn dpi_awareness_is_declared_and_idempotent() {

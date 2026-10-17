@@ -103,6 +103,26 @@ impl OverlayController {
     /// Word/Chrome is untouched: they see their usual state once the overlay
     /// releases focus. Called from `WM_SETFOCUS`, i.e. every time the overlay
     /// gains the keyboard (session start, click-back, `WM_MOUSEACTIVATE`).
+    /// 面板打开期间把 IME 从 overlay 窗口上摘掉，并记下原来的 context（幂等）。
+    ///
+    /// `ImmSetOpenStatus(himc, 0)` 只把 IME 切到"英文模式"，是 IMM 时代的兼容垫片：现代 TSF 输入法
+    /// （微软拼音等）经常直接忽略它，数字仍被输入法吃掉（docs/23 §14.55）。摘掉 context 之后这个
+    /// HWND 收到的是普通按键，`WM_CHAR` 也照常产生；只影响我们自己的窗口。
+    pub(super) fn detach_ime_for_panel(&mut self) {
+        if self.saved_ime.is_some() {
+            return;
+        }
+        let previous = unsafe { ImmAssociateContext(self.window, std::ptr::null_mut()) };
+        self.saved_ime = Some(previous);
+    }
+
+    /// 把面板打开前的 IME context 还回去（幂等；没摘过就什么都不做）。
+    pub(super) fn restore_ime_for_panel(&mut self) {
+        if let Some(previous) = self.saved_ime.take() {
+            unsafe { ImmAssociateContext(self.window, previous) };
+        }
+    }
+
     pub(super) fn disable_ime_for_overlay(&self) {
         unsafe {
             let himc = ImmGetContext(self.window);

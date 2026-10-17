@@ -24,6 +24,7 @@ members = [
     "crates/snapclip-capture",
     "crates/snapclip-history",
     "apps/snapclip",
+    "tools/icon-bake",
 ]
 exclude = ["crates/rapid-ocr-rs"]
 

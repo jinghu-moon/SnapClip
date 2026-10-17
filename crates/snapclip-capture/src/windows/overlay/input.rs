@@ -7,6 +7,80 @@
 
 use super::*;
 
+use crate::geometry::{region_panel_layout, RegionPanelLayout, RegionPanelTarget};
+use crate::region::{Delay, PanelChange, PanelKey, Region};
+use crate::units::LengthUnit;
+
+/// The keys the custom-region panel knows (docs/23 §14.54).
+///
+/// Anything else is not "unknown" but "not the panel's": while it is open the keyboard belongs to
+/// it entirely, because its fields are text and the session's chords would fire on letters the user
+/// meant as numbers or as nothing at all.
+fn panel_key(vk: u32, shift: bool) -> Option<PanelKey> {
+    const VK_BACK: u32 = 0x08;
+    const VK_END: u32 = 0x23;
+    const VK_HOME: u32 = 0x24;
+    const VK_DELETE: u32 = 0x2E;
+    const VK_TAB: u32 = 0x09;
+    const VK_LEFT: u32 = 0x25;
+    const VK_UP: u32 = 0x26;
+    const VK_RIGHT: u32 = 0x27;
+    const VK_DOWN: u32 = 0x28;
+    match vk {
+        VK_TAB if shift => Some(PanelKey::BackTab),
+        VK_TAB => Some(PanelKey::Tab),
+        VK_LEFT => Some(PanelKey::Left),
+        VK_UP => Some(PanelKey::Up),
+        VK_RIGHT => Some(PanelKey::Right),
+        VK_DOWN => Some(PanelKey::Down),
+        VK_BACK => Some(PanelKey::Backspace),
+        VK_DELETE => Some(PanelKey::Delete),
+        VK_HOME => Some(PanelKey::Home),
+        VK_END => Some(PanelKey::End),
+        vk if vk == crate::windows::hotkey::ESCAPE_VIRTUAL_KEY => Some(PanelKey::Escape),
+        vk if vk == crate::windows::hotkey::RETURN_VIRTUAL_KEY => Some(PanelKey::Enter),
+        // 数字**不在这里**：它走 `WM_CHAR`（见 `on_char`）。两条路都收的话，一个字符会落两次。
+        _ => None,
+    }
+}
+
+/// 命中结果 → 光标。普通截图与倒计时 HUD 共用这一套映射，免得两处各写一遍之后走偏。
+pub(super) fn selection_cursor(geometry: SelectionGeometry) -> *const u16 {
+    match geometry {
+        SelectionGeometry::Resize(Handle::TopLeft)
+        | SelectionGeometry::Resize(Handle::BottomRight) => IDC_SIZENWSE,
+        SelectionGeometry::Resize(Handle::TopRight)
+        | SelectionGeometry::Resize(Handle::BottomLeft) => IDC_SIZENESW,
+        SelectionGeometry::Resize(Handle::Top)
+        | SelectionGeometry::Resize(Handle::Bottom) => IDC_SIZENS,
+        SelectionGeometry::Resize(Handle::Left)
+        | SelectionGeometry::Resize(Handle::Right) => IDC_SIZEWE,
+        SelectionGeometry::Move => IDC_SIZEALL,
+        SelectionGeometry::Create | SelectionGeometry::Outside => IDC_CROSS,
+    }
+}
+
+/// 倒计时 HUD 里的光标：**只有边框与手柄上是改大小光标**，其余一律普通箭头 —— 那几秒浮层只在
+/// "选框环"上存在，指针在别处时它已经不属于这个窗口（docs/23 §14.55.9.3）。
+pub(super) fn countdown_cursor(geometry: SelectionGeometry) -> *const u16 {
+    match geometry {
+        SelectionGeometry::Resize(_) => selection_cursor(geometry),
+        _ => IDC_ARROW,
+    }
+}
+
+/// HUD 光标：拖拽中**锁定那个方向**的改大小光标（指针此时可能已经远离边框，按命中结果算会
+/// 跳回箭头），不拖时按命中结果。
+pub(super) fn countdown_cursor_while(
+    dragging: Option<Handle>,
+    geometry: SelectionGeometry,
+) -> *const u16 {
+    match dragging {
+        Some(handle) => selection_cursor(SelectionGeometry::Resize(handle)),
+        None => countdown_cursor(geometry),
+    }
+}
+
 fn nudge_point(point: POINT, dx: i32, dy: i32) -> POINT {
     POINT {
         x: point.x.saturating_add(dx),
@@ -20,6 +94,18 @@ impl OverlayController {
         let shift = self.shift_down || modifiers().1;
         self.cursor = point;
         self.cursor_visible = true;
+        // 倒计时 HUD：拖动中把移动喂给既有的改大小手势（窗口只在环上，只有捕获才收得到）；
+        // 不拖的时候只更新光标（docs/23 §14.55.9.3）。
+        if self.countdown.is_some() {
+            if self.countdown_dragging {
+                self.session.pointer_moved_with_constraints(point, shift);
+                // 区域每帧跟随：只在松手时更新的话，往外拖时框线会跑出窗口被裁掉。
+                self.sync_countdown_region();
+            }
+            self.update_cursor_shape(point);
+            self.invalidate();
+            return;
+        }
         // A cursor move deliberately does **not** touch the chain (docs/21 §5.24, ④): it used to, so
         // that "the hand is on its way to inspect it" would not lose the rings — but the effect was
         // that a user who kept moving the mouse never saw them fade, which is the disappearance this
@@ -80,24 +166,50 @@ impl OverlayController {
     ///
     /// Uses the same hit test as the press handler so the cursor always matches what a
     /// click would do.
+    /// 面板盖住的地方由面板决定光标样式：控件上是指手，面板内其余地方是箭头。
+    ///
+    /// 返回 `true` 表示这次已经设好光标，调用方不要再套截图那份样式。数字输入格按用户口径
+    /// 也算"控件"⇒手指（docs/23 §14.55.6）。
+    fn panel_cursor(&self, point: Point) -> bool {
+        let Some(layout) = self.region_panel_layout() else {
+            return false;
+        };
+        if !layout.panel.contains(point) {
+            return false;
+        }
+        let on_control = matches!(
+            layout.target_at(point),
+            Some(RegionPanelTarget::Slot(_))
+                | Some(RegionPanelTarget::Unit(_))
+                | Some(RegionPanelTarget::Delay(_))
+                | Some(RegionPanelTarget::MenuItem(_))
+        );
+        let cursor = if on_control {
+            IDC_HAND
+        } else {
+            IDC_ARROW
+        };
+        unsafe { SetCursor(LoadCursorW(null_mut(), cursor) as _) };
+        true
+    }
+
     pub(super) fn update_cursor_shape(&mut self, point: Point) {
+        // 倒计时 HUD：边框/手柄上是改大小光标（拖得动），其余照旧是普通箭头（docs/23 §14.55.9.3）。
+        if self.countdown.is_some() {
+            let cursor =
+                countdown_cursor_while(self.countdown_handle, self.session.pointer_hit(point));
+            unsafe { SetCursor(LoadCursorW(null_mut(), cursor) as _) };
+            return;
+        }
+        if self.panel_cursor(point) {
+            return;
+        }
         let cursor = if self.scroll.is_some() {
             IDC_ARROW
         } else if !self.session.has_selection() {
             IDC_CROSS
         } else {
-            match self.session.pointer_hit(point) {
-                SelectionGeometry::Resize(Handle::TopLeft)
-                | SelectionGeometry::Resize(Handle::BottomRight) => IDC_SIZENWSE,
-                SelectionGeometry::Resize(Handle::TopRight)
-                | SelectionGeometry::Resize(Handle::BottomLeft) => IDC_SIZENESW,
-                SelectionGeometry::Resize(Handle::Top)
-                | SelectionGeometry::Resize(Handle::Bottom) => IDC_SIZENS,
-                SelectionGeometry::Resize(Handle::Left)
-                | SelectionGeometry::Resize(Handle::Right) => IDC_SIZEWE,
-                SelectionGeometry::Move => IDC_SIZEALL,
-                SelectionGeometry::Create | SelectionGeometry::Outside => IDC_CROSS,
-            }
+            selection_cursor(self.session.pointer_hit(point))
         };
         unsafe { SetCursor(LoadCursorW(null_mut(), cursor) as _) };
     }
@@ -111,6 +223,31 @@ impl OverlayController {
 
     pub(super) fn on_left_down(&mut self, client: POINT) {
         let point = Point::new(client.x, client.y);
+        // 倒计时是等待中的 HUD：**只允许拖边框/手柄改大小** —— 选区已经定了，这时候再起框选
+        // 或移动选区都不是用户的意思（docs/23 §14.55.9.3）。
+        if self.countdown.is_some() {
+            self.begin_countdown_resize(point);
+            return;
+        }
+        // The custom-region panel is the topmost layer: a press inside it belongs to it, and its
+        // blank space swallows the press instead of starting a drag behind it. A press *outside* it
+        // is the ordinary gesture — dragging the region with the panel open is how the two halves
+        // work together (docs/23 §14.54).
+        if self.region_panel.is_some() {
+            if let Some(panel) = self.region_panel_rect() {
+                if panel.contains(point) {
+                    self.chrome_swallowed_press = true;
+                    self.on_region_panel_press(point);
+                    return;
+                }
+            }
+        }
+        // 尺寸栏上的按下：开关精确面板（docs/23 §14.54）。悬停只把它点亮，点才开面板。
+        if self.label_badge.is_some_and(|badge| badge.contains(point)) {
+            self.chrome_swallowed_press = true;
+            self.toggle_region_panel();
+            return;
+        }
         if let Some(run) = self.scroll.as_ref() {
             if let Some(button) = run.layout.button_at(point.x, point.y) {
                 self.on_scroll_button(button);
@@ -152,6 +289,16 @@ impl OverlayController {
     }
 
     pub(super) fn on_left_up(&mut self) {
+        if self.countdown.is_some() {
+            self.end_countdown_resize();
+            return;
+        }
+        // A press overlay chrome took is not the gesture's: swallowing the release with it is what
+        // keeps a click on the badge or in the panel from committing the selection a moment later.
+        if self.chrome_swallowed_press {
+            self.chrome_swallowed_press = false;
+            return;
+        }
         if self.scroll.is_some() {
             return;
         }
@@ -207,10 +354,35 @@ impl OverlayController {
         let state = self.session.state();
         self.metrics
             .log_line(&format!("key down vk=0x{vk:02X} state={state:?}"), false);
+        // 倒计时期间只认 Esc（取消）：等待的那几秒里本应用可能仍是前台窗口，Enter/S 之类
+        // 会把这次截图提前做掉或改掉设置（docs/23 §14.55.9）。
+        if self.countdown.is_some() && Key::from_virtual_key(vk) != Some(Key::Escape) {
+            return false;
+        }
         if is_shift_vk(vk) {
             self.shift_down = true;
             self.on_snap_modifier_changed();
             return state.is_active();
+        }
+        // The panel is a form that is being typed into: while it is open every key belongs to it, or
+        // the session's chords (`S`, `B`, `H`…) would fire on the letters the user meant as text
+        // (docs/23 §14.54).
+        if self.region_panel.is_some() {
+            let shift = self.shift_down || modifiers().1;
+            if let Some(key) = panel_key(vk, shift) {
+                self.on_region_panel_key(key);
+            }
+            return true;
+        }
+        // 倒计时期间 Esc = 取消这次延时：停表、把鼠标还回来、不抓帧；选区还在，用户想截可以照常截
+        // （docs/23 §14.55.9）。
+        if self.countdown.is_some() && vk == crate::windows::hotkey::ESCAPE_VIRTUAL_KEY {
+            // 取消是"回到普通截图状态"：窗口继续可见，所以顺序里没有 Hide 那一步，
+            // 最后重画一帧普通画面（docs/23 §14.55.9.5）。
+            self.leave_countdown(super::session::CountdownExit::Cancel);
+            self.pending_region = None;
+            self.pin_after_delay = false;
+            return true;
         }
         let context = if self.scroll.is_some() {
             Context::Scroll
@@ -687,6 +859,360 @@ impl OverlayController {
         unsafe {
             TrackMouseEvent(&mut event);
         }
+    }
+
+    /// The panel's own rectangle, from the same layout the paint pass and the hit test use.
+    fn region_panel_rect(&self) -> Option<Rect> {
+        self.region_panel_layout().map(|layout| layout.panel)
+    }
+
+    /// 点尺寸栏：打开或收起精确面板。
+    ///
+    /// 面板的校验范围就是本屏（`monitor_bounds`），最小选区与会话用同一条规则（`minimum_selection`）
+    /// —— 面板的描红和会话的 `snap_to` 因此不会各说一套（docs/23 §14.54）。
+    fn toggle_region_panel(&mut self) {
+        if self.region_panel.is_none() {
+            // 打开面板时量一次分段器选项宽度 —— 在帧之外（量宽/建文本布局不需要 BeginDraw），
+            // 且只量一次：绘制与命中此后都读 `self.segment_widths` 这一份（docs/23 §14.55.6）。
+            if let Some(renderer) = self.renderer.as_mut() {
+                match renderer.segment_widths() {
+                    Ok(widths) => self.segment_widths = widths,
+                    Err(error) => {
+                        eprintln!("[snapclip][capture] segment widths unavailable: {error}")
+                    }
+                }
+            }
+        }
+        self.region_panel = if self.region_panel.is_some() {
+            None
+        } else {
+            Some(crate::region::RegionPanel::new(
+                self.preferences.label.length_unit,
+                crate::region::Delay::ALL[0],
+                self.monitor_bounds(),
+                self.minimum_selection(),
+            ))
+        };
+        // IME 跟着面板的寿命走：开着就摘掉（数字才不会被输入法吃掉），关了就还回去（docs/23 §14.55）。
+        if self.region_panel.is_some() {
+            self.detach_ime_for_panel();
+        } else {
+            self.restore_ime_for_panel();
+        }
+        self.invalidate();
+    }
+
+    /// 本屏在桌面上的矩形：面板的校验与"居中"都在这个范围里。
+    fn monitor_bounds(&self) -> Rect {
+        self.renderer
+            .as_ref()
+            .map(|renderer| renderer.layout().bounds)
+            .unwrap_or_default()
+    }
+
+    /// 单位只有**一份真相**：面板切了 dp/px 就写回偏好，角标读的正是偏好。
+    ///
+    /// 以前面板的 `unit` 是自己的状态、偏好里另有一份，于是面板切单位只改了面板里的数字，
+    /// 选框左上角的角标仍按旧单位显示——用户报的"角标不跟随面板"（docs/23 §14.55.6）。
+    fn sync_panel_unit(&mut self) {
+        let Some(unit) = self.region_panel.as_ref().map(|panel| panel.unit()) else {
+            return;
+        };
+        if self.preferences.label.length_unit == unit {
+            return;
+        }
+        self.preferences.label.length_unit = unit;
+        self.publish_preferences();
+        self.invalidate();
+    }
+
+    /// 会话能接受的最小选区：面板描红用的是同一条规则，不另说一套。
+    fn minimum_selection(&self) -> i32 {
+        crate::geometry::SelectionSnapshot::new(Rect::default(), self.session.dpi())
+            .minimum_size()
+    }
+
+    /// The panel's layout as of this moment (docs/23 §14.54).
+    ///
+    /// Recomputed rather than cached: it is a pure function of the display scale, the work area and
+    /// whether the dropdown is open, and a cache would be one more thing that can lag the drawing.
+    fn region_panel_layout(&self) -> Option<RegionPanelLayout> {
+        let panel = self.region_panel.as_ref()?;
+        let renderer = self.renderer.as_ref()?;
+        Some(region_panel_layout(
+            self.session.dpi() as f32 / 96.0,
+            renderer.layout().local_work_area(),
+            self.session.selection(),
+            panel.menu().is_some(),
+            self.segment_widths,
+        ))
+    }
+
+    /// Where this monitor's origin sits on the desktop: the one place the panel's numbers and the
+    /// session's selection are converted between desktop pixels and this monitor's pixels.
+    pub(super) fn monitor_origin(&self) -> Point {
+        self.renderer
+            .as_ref()
+            .map(|renderer| {
+                let bounds = renderer.layout().bounds;
+                Point::new(bounds.left, bounds.top)
+            })
+            .unwrap_or_default()
+    }
+
+    /// The region the panel is showing right now: the session's selection in desktop pixels.
+    fn region_now(&self) -> Region {
+        Region::from_rect(self.session.selection(), self.monitor_origin())
+    }
+
+    /// A press inside the panel: whatever it landed on acts, blank space does nothing.
+    fn on_region_panel_press(&mut self, point: Point) {
+        let Some(layout) = self.region_panel_layout() else {
+            return;
+        };
+        let dpi = self.session.dpi();
+        let region = self.region_now();
+        // 分段器换了选项就起一次平移（快照前后值，谁变了给谁起，点选与键盘同一条路）。
+        let before = self.region_panel.as_ref().map(|panel| (panel.unit(), panel.delay()));
+        let change = match layout.target_at(point) {
+            None | Some(RegionPanelTarget::MenuPadding) => return,
+            Some(RegionPanelTarget::Unit(unit)) => {
+                if let Some(panel) = self.region_panel.as_mut() {
+                    panel.set_unit(unit);
+                }
+                PanelChange::Repaint
+            }
+            Some(RegionPanelTarget::Delay(delay)) => {
+                // 点哪段选哪段（与 hover 的逐段语义一致）。
+                if let Some(panel) = self.region_panel.as_mut() {
+                    panel.choose_delay(delay);
+                }
+                PanelChange::Repaint
+            }
+            Some(RegionPanelTarget::MenuItem(index)) => {
+                let Some(mut panel) = self.region_panel.take() else {
+                    return;
+                };
+                let change = panel.pick(index, region, dpi);
+                self.region_panel = Some(panel);
+                change
+            }
+            Some(RegionPanelTarget::Slot(slot)) => {
+                let Some(mut panel) = self.region_panel.take() else {
+                    return;
+                };
+                let change = panel.click(slot, region, dpi);
+                self.region_panel = Some(panel);
+                change
+            }
+        };
+        if let Some((unit, delay)) = before {
+            self.start_segment_slides(unit, delay);
+        }
+        self.apply_region_panel_change(change);
+        self.sync_panel_unit();
+    }
+
+    /// 分段器换了选项就起一次平移：`from` 由段号给出，插值在绘制端做（docs/23 §14.55.5）。
+    fn start_segment_slides(&mut self, before_unit: LengthUnit, before_delay: Delay) {
+        let Some(panel) = self.region_panel.as_ref() else {
+            return;
+        };
+        let now = Instant::now();
+        if before_unit != panel.unit() {
+            self.unit_slide.start(panel.unit().index(), now);
+        }
+        if before_delay != panel.delay() {
+            self.delay_slide.start(panel.delay().index(), now);
+        }
+    }
+
+    /// A key press while the panel has the keyboard.
+    /// 字符入口：`WM_CHAR` 送来的字，中文输入法组合结束后送来的也是字符。
+    ///
+    /// 数字只从这里入账（`panel_key` 不再收 VK 数字，否则同一个字符会落两次）。这里只做字符→按键的
+    /// 归一化（中文输入法常送全角 `１`）；数字格的规则——只数字、7 位以内——仍在 `RegionPanel` 里。
+    /// docs/23 §14.55。
+    pub(super) fn on_char(&mut self, character: char) -> bool {
+        if self.region_panel.is_none() {
+            return false;
+        }
+        let Some(key) = crate::region::panel_key_from_char(character) else {
+            return false;
+        };
+        self.on_region_panel_key(key);
+        true
+    }
+
+    fn on_region_panel_key(&mut self, key: PanelKey) {
+        let dpi = self.session.dpi();
+        let region = self.region_now();
+        let Some(mut panel) = self.region_panel.take() else {
+            return;
+        };
+        let before = (panel.unit(), panel.delay());
+        let change = panel.key(key, region, dpi);
+        self.region_panel = Some(panel);
+        self.start_segment_slides(before.0, before.1);
+        self.apply_region_panel_change(change);
+        self.sync_panel_unit();
+    }
+
+    /// Hand this session's display preferences to the shared slot: "use these from now on".
+    ///
+    /// The custom-region panel is the one editor of those settings inside a session, and this is its
+    /// only door out: the slot is what the next session reads and what the shell writes to disk when
+    /// the capture ends (docs/23 §14.54).
+    pub(super) fn publish_preferences(&mut self) {
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.preferences = self.preferences.clone();
+        }
+    }
+
+    /// Turn one decision of the panel into session state: the selection, a display switch, the
+    /// capture itself, or the end of the session.
+    fn apply_region_panel_change(&mut self, change: PanelChange) {
+        // 聚焦、敲键、点选之后立刻让光标可见（像所有文本框那样），别在"暗"的半个周期里打字。
+        self.caret_visible = true;
+        match change {
+            PanelChange::None => {}
+            PanelChange::Repaint => self.invalidate(),
+            PanelChange::Toggle(toggle) => {
+                let label = self.preferences.label;
+                self.preferences.label = label.set(toggle, !toggle.on(label));
+                self.publish_preferences();
+                self.invalidate();
+            }
+            PanelChange::Region(region) => {
+                self.apply_region_from_panel(region);
+                self.invalidate();
+            }
+            PanelChange::Confirm(region) => {
+                self.apply_region_from_panel(region);
+                let delay = self
+                    .region_panel
+                    .as_ref()
+                    .map(|panel| panel.delay())
+                    .unwrap_or(Delay::ALL[0]);
+                if delay.seconds() > 0 {
+                    // 延时：浮层先收起来，等到点再重新抓一帧 —— 冻结帧必须是等待之后的那一帧，
+                    // 否则"延时"只是把同一个画面晚点截出来。区域跟着那次会话走。
+                    self.region_panel = None;
+                    // 面板没了：把 IME 还给这个窗口（docs/23 §14.55）。
+                    self.restore_ime_for_panel();
+                    self.pending_region = Some(region);
+                    // 延时到点后要的是"截图并贴图"（等同延时 N 秒后按 F6），不是再开浮层
+                    // 等用户确认（docs/23 §14.55.8）。
+                    self.pin_after_delay = true;
+                    // 浮层留着，在选区正中倒数；到点再收浮层、抓"等待之后那一帧"并贴图
+                    // （docs/23 §14.55.9）。等待期间鼠标穿过浮层，用户可以去操作别的窗口。
+                    self.arm_countdown(delay.seconds());
+                    self.invalidate();
+                    return;
+                }
+                if self.session.has_selection() {
+                    self.confirm();
+                } else {
+                    // 区域本身不合法：面板已经把那句话写在页脚上，这里不另说一套。
+                    self.invalidate();
+                }
+            }
+            PanelChange::Cancel => {
+                self.region_panel = None;
+                self.restore_ime_for_panel();
+                self.cancel("region-panel");
+            }
+        }
+    }
+
+    /// Put a region the panel produced onto the session's selection.
+    ///
+    /// The one conversion between the two coordinate systems: the panel speaks desktop pixels
+    /// (what the badge and the artifact speak), the session stores this monitor's pixels.
+    fn apply_region_from_panel(&mut self, region: Region) {
+        if !self.session.snap_to(region.to_rect(self.monitor_origin())) {
+            // The session refused it (too small, or not in a state that takes a selection): the
+            // panel marks the same cells red from the same rule, so nothing more is said here.
+            return;
+        }
+        self.publish_state();
+    }
+
+    /// 倒计时 HUD 里按下：只接受"边框/手柄改大小"，并抓住鼠标。
+    ///
+    /// 命中判定与几何都复用普通状态那一套（`hit_test` 对边框与手柄都答 `Resize`，
+    /// `CaptureSession::begin_drag` 是同一个手势机），这里只决定"允许哪一种"。
+    fn begin_countdown_resize(&mut self, point: Point) {
+        let SelectionGeometry::Resize(handle) = self.session.pointer_hit(point) else {
+            return;
+        };
+        if !self.session.begin_drag(point, ResizeMode::Handle(handle), false) {
+            return;
+        }
+        // 唯一的 `SetCapture`（docs/23 §14.55.9.3）：HUD 的窗口只在选框环上存在，往外拖时指针
+        // 立刻离开窗口，不捕获就收不到 `WM_MOUSEMOVE`，拖动会中途断掉。
+        unsafe { SetCapture(self.window) };
+        self.countdown_dragging = true;
+        self.countdown_handle = Some(handle);
+        self.update_cursor_shape(point);
+        self.invalidate();
+    }
+
+    /// 松开：结束手势，并把改过的大小同时写回"到点贴图的那份区域"与 HUD 的窗口区域。
+    fn end_countdown_resize(&mut self) {
+        if !self.countdown_dragging {
+            return;
+        }
+        self.release_countdown_capture();
+        self.session.pointer_released();
+        self.sync_countdown_targets();
+        self.publish_state();
+        self.invalidate();
+    }
+
+    /// 释放捕获并清掉手势（幂等）。松手、Esc、会话被取消/失败都经 `release_session` 走到这里。
+    pub(super) fn release_countdown_capture(&mut self) {
+        if !self.countdown_dragging {
+            return;
+        }
+        self.countdown_dragging = false;
+        self.countdown_handle = None;
+        unsafe { ReleaseCapture() };
+        self.session.pointer_left();
+    }
+
+    /// 松手时：贴图区域与窗口区域一起跟随当前选区。
+    ///
+    /// **贴图区域不跟着更新，用户改了框也没用** —— 到点贴的会是点「确定」那一刻的区域
+    /// （docs/23 §14.55.9.3）。
+    fn sync_countdown_targets(&mut self) {
+        if self.countdown.is_none() {
+            return;
+        }
+        let (pin, pieces) = Self::countdown_after_resize(
+            self.session.selection(),
+            self.monitor_origin(),
+            self.label_badge,
+            self.session.dpi(),
+        );
+        if pin.is_some() {
+            self.pending_region = pin;
+        }
+        self.set_window_region(&pieces);
+    }
+
+    /// 拖动过程中：窗口区域跟着新选区走，否则框线会跑到窗口外面被裁掉。
+    fn sync_countdown_region(&mut self) {
+        if self.countdown.is_none() {
+            return;
+        }
+        self.update_countdown_dim();
+        let pieces = super::session::countdown_window_pieces(
+            self.session.selection(),
+            self.label_badge,
+            self.session.dpi(),
+        );
+        self.set_window_region(&pieces);
     }
 }
 

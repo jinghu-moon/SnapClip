@@ -3268,6 +3268,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "icon-bake"
+version = "0.1.0"
+dependencies = [
+ "resvg 0.45.1",
+]
+
+[[package]]
 name = "icu_collections"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

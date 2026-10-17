@@ -1434,7 +1434,7 @@ P0.5 期间的决策：D2（OCR/recognize 本轮暂缓，P4/P6 不再依赖 P3�
           import。按本 crate 既有风格改成全限定 `serde::Serialize` 路径（与 geometry.rs 一致）。
 计划修正：docs/23 T1.3 说要迁 "ClipId/ArtifactId/SessionId/RecognitionTaskId" —— **这些类型不存在**，
           本仓库的 id 一律是 `String`。如实记录，没有为了对上文档而发明类型。
-提交 SHA：9c62e17
+提交 SHA：见提交
 推送/tag：origin/main 已推送
 回退对象：f61b5b2
 ```
@@ -1474,7 +1474,7 @@ P0.5 期间的决策：D2（OCR/recognize 本轮暂缓，P4/P6 不再依赖 P3�
 测试守恒核对：按静态 `#[test]` 计数逐文件对账——353 个搬入 crate，其中 2 个（需要真 PNG 编码器）
           搬回壳，壳新增 1 个；结果 crate 351 静态（345 run + 6 ignored）、壳 60（59 run + 1 被
           feature 关掉）、model 14。**没有任何测试在搬移中丢失**。
-提交 SHA：652afbb
+提交 SHA：见提交
 推送/tag：origin/main 已推送
 回退对象：9c62e17
 ```
@@ -1533,7 +1533,7 @@ P0.5 期间的决策：D2（OCR/recognize 本轮暂缓，P4/P6 不再依赖 P3�
       字段可见性要单独给（`ArmedHint` 的字段是控制器在读）。
 教训（建议提升为 §11 风险条目）：**对超大文件做机械搬运时，先算账再落盘**；
 "我大概记得边界在哪"是这个仓库已经踩过两次的坑。
-提交 SHA：7f23566 / 57d57a9 / 0d97910 / 42ce51b
+提交 SHA：见提交 / 57d57a9 / 0d97910 / 42ce51b
 回退对象：58c66cb
 ```
 
@@ -1868,7 +1868,7 @@ T2.8/T2.9（**实质已满足，逐条取证**）：
           `median_area_pct=0.0 control_level_points=24/25`；按 §0.3 单独复跑两次都回到基线
           `65.8 / 12-25 / 25-25`（刚跑完会自起 Chromium 的浏览器探针，机器繁忙），
           判定为环境假红，非回归。此现象与 §0.3 记录的既有假红同类，已写进提交消息。
-提交 SHA：458d971 / 16e203f / <本条提交>
+提交 SHA：见提交 / 16e203f / <本条提交>
 推送/tag：origin/main
 回退对象：6218eee
 ```
@@ -2894,3 +2894,1279 @@ tag：`refactor-p6`（= 本次重构的完成点）。回退：`git reset --hard
 推送/tag：origin/main
 回退对象：0d3ac32
 ```
+
+### §14.52 尺寸/坐标标签的 `px` / `dp` 单位（`T4.4` 之后新增设置项）
+
+```
+任务编号：T4.4 后续新增设置项（用户 m00279 提出）
+状态：已验证（未提交）
+分支：main
+需求（用户原话）：「截图框左上角是位置和尺寸，但是这里有问题：屏幕是有缩放比例的，我建议尺寸单位
+  增加一个 dp，dp = px ÷ 屏幕缩放比。因此需要设计 px 与 dp 的切换面板。该如何设计？这样吗？」
+  （用户 mock：浮层卡片 = `px`/`dp` 单选 + 「* dp = px ÷ 屏幕缩放比」+ 「位置」「单位」两个开关）
+设计裁决（已答复用户，实现按此）：
+  1. 单位做成**设置页偏好**（`Settings.length_unit`），会话开始时读一次 → 下一次截图生效。
+     不在截图浮层里做面板：右键已经是"取消本次截图"，浮层内面板还要额外定义命中与关闭语义；
+     既有偏好模型本身也写了"会话中途不重排"。浮层内键位切换（仿 `Action::ColorFormat`）留作后续。
+     **本条已被 §14.53 覆盖**：用户随后明确要求"鼠标放在尺寸按钮，弹出悬浮菜单"，浮层内的卡片按
+     §14.53 实现；本条其余裁决（2/3/4）继续有效。
+  2. `dp` **同时换算尺寸与坐标**（一条规则、一个后缀，不混用单位）。
+  3. mock 里的「单位」开关删除（与 px/dp 单选重复）；「位置」实现为 `show_coordinates`
+     （关闭后只显示尺寸，因为尺寸才是标签存在的理由）。
+  4. 帮助行不写 `*` 脚注，改成公式 + 具体例子（150% 下 1500 px = 1000 dp）。**不做**"本机缩放
+     是多少"的实时读数：设置窗口可能不在截图那块屏上，取一个数会失真；留作后续小改。
+新增：
+  crates/snapclip-capture/src/units.rs（新）  `LengthUnit{Px,Dp}` + `suffix()`/`from_px()`/`px_to_dip()`
+  crates/snapclip-capture/src/preferences.rs  `OverlayPreferences.length_unit`（默认 px）+ `show_coordinates`
+  crates/snapclip-capture/src/windows/win/d2d.rs   `RenderView.length_unit/show_coordinates`；
+      `label_text_at(selection, screen_origin, unit, show_coordinates)` 按单位换算，宽度仍按真实文本测量
+  crates/snapclip-capture/src/windows/renderer.rs、windows/overlay/{session,render_submit}.rs  透传
+  apps/snapclip/src/settings/model.rs  `Settings.length_unit` + `show_coordinates`（camelCase，缺字段回落默认值）
+  apps/snapclip/src/settings/settings_view.rs  「标签单位」两个 `Radio` + 「标签显示坐标」开关 + 帮助行
+  apps/snapclip/tests/ui.rs  `picking_the_label_unit_writes_it_to_disk`
+删除（死代码/单一出口）：
+  crates/snapclip-capture/src/windows/monitor.rs  `dip_to_px` 及其测试——生产零调用方，只靠
+    `#[cfg_attr(not(test), allow(dead_code))]` 活着。换算的单一出口改到 `units.rs`，
+    免得同一件事在两个模块各有一份（docs/22 §186「值对象只有一份」同一精神）。
+换算规则：`dp = round(px ÷ dpi/96)`，`dpi.max(96)` 与既有 chrome 缩放口径一致；半值**远离零**取整
+  ——坐标可以为负（主屏左边的显示器），两侧取整不一致的读数按设计稿核对时更容易出错。
+  1920 px：96dpi→1920 / 120dpi→1536 / 144dpi→1280 / 192dpi→960；`-1920 px` @144dpi → `-1280 dp`。
+API 又一次"不凭记忆"救场：本要"小集合二选一"用 `RadioGroup`，但它在 `radio.rs:403`
+  把子项 id 覆盖成 `Integer(ix)`——每个选项在无障碍树和测试里都没有名字
+  （实测报错 `missing ElementId Name("label-unit-dp") in scope`），而它的 base 只是个空容器
+  （`gpui-base/src/radio_group.rs` 只有 axis/extend/interactivity，没有键盘与焦点行为）。
+  改成两个 `Radio` 各自带单位作为 id、各写各的值（`Radio` 自己的文档就写了
+  "you can manage the group by yourself"）：少一张 index→单位 映射表，测试也点到真控件。
+文案（Design Guides「Forms and settings」）：标签点名对象（「标签单位」），帮助行给公式和例子，
+  结果行贴着控件显示（已改为 px / 已改为 dp / 保存失败：…），没有多余的"管理/模块"类包装词。
+验证（逐条命令、实际输出）：
+  - `cargo test -p snapclip-capture --lib -- --test-threads=1` → 419 passed / 0 failed / 59 ignored
+  - `cargo test -p snapclip-app --features test-support --test ui` → 8 passed（+1 单位单选写盘）
+  - `cargo test -p snapclip-app --lib` → 130 passed
+  - `cargo check --workspace --all-targets` → 0 warning
+  - `cargo test -p snapclip-capture --lib`（并行）末段真实窗口测试曾以 `0xc0000005` 结束；串行全绿。
+    属既有并行 flake（改动只是换算算术），记录在此以免下次误判。
+人工验证：overlay 里标签的实际字号/贴合、以及缩放显示器上是不是整 dp，需用户在真机确认——
+  自动化覆盖到"点击 → 视图状态 → 文件"，覆盖不到像素。
+剩余/记账：
+  1. `apps/snapclip/tests/regression_baseline.rs::the_regression_suite_names_the_behaviours_it_freezes`
+     在本次改动之前就失败：A 类冻结行 `browser_window` 指向
+     `d2d/tests.rs::an_element_preview_keeps_its_own_pixels_and_the_window_fallback_does_not`，
+     而那条测试本身是 `#[ignore]`（需要真实 GPU）。HEAD 上同样带 `#[ignore]`，与本改动无关。
+     没顺手改：要么取消 ignore（无 GPU 跑不了），要么把该行移出 A 类（那是"冻结什么"的产品决定）。
+  2. 浮层内键位切换（仿 `Action::ColorFormat`）未做。
+  3. 「本机缩放比」实时读数未做。
+提交 SHA：见提交
+推送/tag：未推送（工作区改动）
+回退对象：0bb0a0f 之上的未提交工作区
+```
+
+### §14.53 尺寸徽标的悬浮菜单（用户 m00774/m00775 改口径，覆盖 §14.52 裁决 1）
+
+> **本节已被 §14.54 取代（整节作废）**：用户原话「悬停小菜单可以移除，悬停小菜单的功能已经被包含在
+> 大的面板中了」。徽标上停 180ms 弹小卡片这一套（`LabelMenu` 状态机、`label_menu_layout`、D2D 的
+> `draw_label_menu`、`LabelMenuTarget`、`LabelDisplay::after`、`label_menu.rs` 整个文件）已全部删除；
+> 保留下来的是同一次交互里仍然成立的两条：徽标**悬停高亮**（现在表示"这里可以点"）与
+> **点徽标开/关 §14.54 的面板**。删掉 12 条测试（geometry 4 + label_menu.rs 模块 8），
+> capture lib 从 455 passed 降到 443 passed / 0 failed。下面的文字保留为历史记录。
+
+```
+任务编号：T4.4 后续（用户 m00774 截图 + m00775 口径）
+状态：已验证（未提交）
+分支：main
+需求（用户原话）：「事实上我认为图片这种更合适。鼠标放在尺寸按钮，弹出悬浮菜单。用户更改更加方便」
+  （用户 mock：徽标上方浮层 = `px`/`dp` 单选 +「* dp = px ÷ 屏幕缩放比」+「位置」「单位」两个开关）
+口径变化：§14.52 的裁决 1「不在截图浮层里做面板，只做设置页」作废。裁决 2/3/4 保留并落地为：
+  `dp` 同时换算尺寸与坐标；「单位」不再是重复的单选开关，而是**标签是否打印单位后缀**（`show_unit`）；
+  帮助行用公式 + 具体例子。
+设计裁决：
+  1. 菜单挂在徽标本体上：指针**停在"画出来的那个徽标矩形"内** `LABEL_MENU_DWELL`=180ms 才开
+     （扫过不开，否则每次拖拽经过徽标都会弹卡片）；指针在「徽标 ∪ 卡片」内保持，离开即关；
+     按下/抬起/Escape/会话结束都关。停顿由渲染 tick 计时——指针停住后不再有鼠标消息，
+     这正是停顿要存在的原因，所以 `label_menu.dwelling()` 会续上渲染 tick（与
+     `precision_feedback_until` 同一形状）。
+  2. **命中矩形 == 画的矩形**：徽标矩形由渲染器用它自己那一份测量+定位算出
+     （`Win32Renderer::size_label_bounds` → `measure_label` + `place_label`，与
+     `draw_size_label` 同源）；卡片与各行矩形来自 `geometry::label_menu_layout()` 纯函数。
+     输入侧与绘制侧读同一个值：不重算、**不用字数估算**（估算对 CJK/比例数字会算错，
+     会选错摆放梯级，标签位置就会和悬停区错开）。
+  3. 一行一个控件、整行可点：`px`/`dp` 两行（第 1 行左右两半）、一行非交互帮助文字、
+     「位置」= 既有 `show_coordinates`、「单位」= 新增 `show_unit`。
+  4. 立即生效 + 落盘（**两条修改路径共用同一个写盘点**）：
+     - 菜单改的是本次会话读到的那份偏好（`self.preferences.label`），下一帧标签就变；
+       同时 `publish_preferences()` 把它写回共享槽（下一个会话读它）。
+     - shell 侧订阅总线，收到任何 Capture 事件就回拉一次（`OverlayPlatform::preferences()`，
+       默认 `None`），交给设置页 `SettingsView::adopt_label` 写盘；值没变则**不写、不广播**，
+       页面自己的 `SettingsChanged` 订阅再把值推回 capture。于是页面与浮层不会各说一套。
+     - 没有新增 `AppEvent` 变体：那会把 capture 的 `LengthUnit` 拖进 `snapclip-model`
+       （docs/22 §186 值对象只有一份 + 依赖方向）。合并规则放在 `Settings::adopt_label`
+       这个值方法上，所以"取哪些字段、值没变就不写"能在**无窗口**的单测里钉住。
+新增：
+  crates/snapclip-capture/src/units.rs   `LabelDisplay{length_unit,show_coordinates,show_unit}` +
+      `text()`（徽标整句）+ `after(target)`（菜单一行的语义）
+  crates/snapclip-capture/src/geometry.rs   `LabelMenuLayout`/`LabelMenuTarget`/`label_menu_layout()`
+      （纯布局：卡片、行、命中分区、单选圆环、开关药丸；按 dpi scale 缩放并 `clamped_into` 工作区）
+  crates/snapclip-capture/src/windows/overlay/label_menu.rs（新）   纯状态机 `LabelMenu`
+      （dwell / 保持 / 关闭 / 悬停行 / `dwelling()`）+ `OverlayController` 的接线
+      （`track_label_menu` / `label_menu_view` / `run_label_menu_target` / `publish_preferences`）
+  crates/snapclip-capture/src/windows/win/d2d.rs   `LabelMenuView` + `draw_label_menu()` +
+      5 个画刷（hover / track / track_on / knob / muted）+ `size_label_bounds()`
+  crates/snapclip-capture/src/ports.rs、runtime.rs、windows/overlay.rs
+      `OverlayPlatform::preferences()`（默认 `None`）+ `CaptureRuntime::preferences()` + Windows 读共享槽
+  apps/snapclip/src/settings/model.rs   `show_unit` + `Settings::adopt_label()`
+  apps/snapclip/src/settings/settings_view.rs   「标签显示单位」开关 + `adopt_label()`
+  apps/snapclip/src/lib.rs   shell 订阅总线回拉（`Shell::adopt_overlay_label`，`cx.spawn` 持有 `Task`）
+  apps/snapclip/tests/ui.rs   `the_unit_suffix_switch_writes_to_disk`、
+      `adopting_the_overlay_label_writes_it_to_disk`
+修改：
+  crates/snapclip-capture/src/windows/overlay/{input,render_submit,session}.rs
+      鼠标移动 / 渲染 tick / Escape / 会话结束的接线；`on_left_down` 与 `on_left_up` **最前面**
+      一起吞掉菜单上的按下与抬起
+  crates/snapclip-capture/src/windows/renderer.rs   `OverlayFrameState.label/label_menu`；
+      抽出 `fn view(...)` 让"绘制的那一帧"与"取徽标矩形的那一帧"同一份
+  crates/snapclip-capture/src/windows/win/d2d/tests.rs   删掉随 `label_text_at/label_size_at`
+      一起作废的旧测试（行为已由 `units.rs` 的标签文本测试覆盖）
+删除：
+  `RenderMetrics::label_text_at/label_size_at/label_size_for_text`（迁到 `LabelDisplay::text`；
+  字数估算本来就没有生产调用方，标签宽度一直由 DirectWrite 实测）
+踩过的坑（写在这里免得下次重踩）：
+  - 菜单上的按下如果只在 `on_left_down` 里 `return`，抬起仍会走
+    `on_left_up → ReleaseOutcome::Click → confirm_snap_preview`，等于点一下面板就把选区确认了；
+    用 `label_menu_swallowed_press` 把 down/up 一起吞掉。
+  - 卡片必须在**会话结束**（`release_session_graphics` 那条统一收尾）里关掉，否则它会挂着一个
+    已经不存在的徽标画到下一个会话的框上。
+文案（Design Guides「Forms and settings」/「Feedback and overlays」）：行标签点名对象
+  （「位置」「单位」），帮助行在浮层里用 `*` + 公式（与用户 mock 一致），设置页里用公式 + 例子；
+  单选是自绘圆环（选中实心 + 白点、未选描边），开关是自绘药丸，配色沿用 overlay 既有画刷。
+验证（逐条命令、实际输出）：
+  - `cargo test -p snapclip-capture --lib -- --test-threads=1` → **427 passed / 0 failed / 59 ignored**
+    （§14.52 时 419；本次 +8：`geometry` 的 6 条菜单布局/命中、`label_menu` 的纯状态机若干、
+    `units::a_menu_row_changes_only_the_things_it_names`）
+  - `cargo test -p snapclip-app --features test-support --lib` → **131 passed / 0 failed / 7 ignored**
+    （+1：`adopting_the_overlay_label_keeps_the_rest_of_the_settings`）
+  - `cargo check --workspace --all-targets` → **0 error / 0 warning**（含 `--features test-support
+    --all-targets`，即两个新 UI 测试也能编译）
+  - 两条新 UI 测试**本次没能执行**：用户正在运行 app（PID 62936），
+    `target\debug\snapclip-app.exe` 被占用，`cargo test -p snapclip-app … --test ui` 在链接 bin
+    时以 `拒绝访问 (os error 5)` 失败。关掉 app 后复跑即可（用户本来也要重启才能拿到新构建）。
+人工验证：徽标菜单在真机上的尺寸/位置/悬停手感（自动化只覆盖纯几何、纯状态机与设置页写盘），
+  需用户重启 app 后确认。
+人工验证后补修（用户反馈，同一条功能）：
+  现象（用户原话）：「鼠标放在尺寸栏上，出现菜单，但是鼠标离开尺寸栏，移动到菜单上，菜单消失了」。
+  根因两处，都在"指针离开徽标、走向卡片"这一条路上：
+    1. 保持打开的条件只认 `panel.contains(point) || badge.contains(point)`，而卡片与徽标之间留着
+       `MENU_GAP_DIP`=6 的缝：缝里两个矩形都不成立，鼠标消息只要有一步入缝就判成"指针已离开"。
+       为跨缝写好的 `LabelMenuLayout::reach()`（卡片∪徽标的包围矩形）此前只在测试里用过——
+       设计里有桥，状态机没用。
+    2. 放大镜跟着指针、默认挂在指针右下 `gap`=24px，面板 340×180 + 信息条：指针一进卡片，
+       放大镜矩形正好压住徽标，`place_label` 为避免遮挡把标签挪到下一级 → 徽标位置变了 →
+       `open.badge != badge` → 关菜单。卡片只有 ~120 dip 高，所以指针停在卡片上**任何**位置都会触发，
+       是必现而不是边角情况；两条根因叠加，与用户"必现"的观察一致。
+  修法（三条，都在根因上）：
+    - 保持打开改判 `open.layout.reach(badge).contains(point)`：卡片∪徽标∪两者之间的缝。
+    - 菜单开着时不画放大镜：`show_magnifier = session.shows_magnifier() && menu 未开`。
+      指针在卡片上时，放大镜采的是被卡片盖住的像素，而且会盖住用户正要点的行——两件事都不该发生。
+    - 抽出 `loupe_obstacle(view, metrics)`：标签的避让跟随"真正画出来的放大镜"
+      （`cursor_visible && show_magnifier`）。以前只看 `cursor_visible`，会为一个没画出来的放大镜让位。
+  关键行为对比（AGENTS §9）：
+    | 项目 | 修改前 | 修改后 |
+    | 指针从徽标移向卡片 | 菜单关闭（缝内判为离开 / 放大镜顶走徽标） | 菜单保持，卡片不跳动 |
+    | 指针在卡片上时的放大镜 | 画出来、盖住卡片并顶走徽标 | 不画 |
+    | 标签避让的依据 | `cursor_visible` | 真正绘制（`cursor_visible && show_magnifier`） |
+  验证：`cargo test -p snapclip-capture --lib -- --test-threads=1` → **429 passed / 0 failed / 59 ignored**
+    （+2：`label_menu::the_pointer_can_cross_from_the_badge_to_the_card`（沿徽标→缝→卡片逐像素走一遍都保持打开）、
+    `d2d::tests::the_label_steps_aside_only_for_a_loupe_that_is_painted`）；
+    `cargo check --workspace --all-targets` → 0 error / 0 warning。
+追加需求（用户，同一次人工验证；后一条消息收紧了口径）：
+  「鼠标悬浮在尺寸栏上的时候，尺寸栏的背景色变为主题色」
+  →「更希望卡片开着期间徽标一直保持主题色」。
+  实现：规则放在 `LabelMenu::highlights(point, badge)`（与它描述的状态同一个文件、可单测）：
+  指针停在徽标上 **或** 卡片还开着 → 徽标用主题色；没有徽标（没选区）则一律不高亮。
+  所以停顿期间就亮（不必等卡片出现，"停一下会开出东西"看得出来），指针移到卡片上之后继续亮
+  （卡片是徽标的，两者读作一个正在使用的控件），卡片关了才灭。
+  `draw_size_label` 在该标志为真时用 `border_brush` 填充（它的文档就是"the interface accent"，
+  与选区描边同一个画刷，不新增资源），白字保持不动——和菜单里"开"的开关是同一套配色；
+  导出路径显式盖成 `false`（徽标本来就不进导出）。
+  顺带补了同一处根因的旧洞：`on_mouse_leave` 现在会关掉卡片。指针离开本显示器之后不再有
+  `WM_MOUSEMOVE`，原来那张卡片会一直留到点击/Esc/会话结束——高亮会跟着 `cursor_visible` 灭掉，
+  但卡片不会自己走。
+  验证：`cargo test -p snapclip-capture --lib -- --test-threads=1` → **431 passed / 0 failed / 59 ignored**
+    （+2：`d2d::tests::the_hovered_badge_keeps_its_white_text_readable`（用仓库自己的 `contrast_ratio`
+    钉住"白字在主题色上 ≥ 4.5:1"，实测 4.54:1，主题色调亮时会红）、
+    `label_menu::the_badge_stays_highlighted_while_its_card_is_open`）；
+    `cargo check --workspace --all-targets` → 0 error / 0 warning。
+  人工验证：亮起/熄灭的时机与观感需真机确认——颜色对与状态规则可测，绘制路径不可测。
+  剩余/记账：
+  1. 浮层内的键位切换（仿 `Action::ColorFormat`）仍未做。
+  2. 「本机缩放比」实时读数未做（浮层的帮助行写的是公式，不是本机数值）。
+  3. `regression_baseline` 的既有失败见 §14.52 记账 1，与本条无关。
+提交 SHA：见提交
+推送/tag：未推送（工作区改动）
+回退对象：0bb0a0f 之上的未提交工作区
+```
+
+### §14.54 自定义截图面板（第一步：值与规则，尚未接上绘制）
+
+```
+任务编号：T4.4 后续（用户 m00774 的 PixPin「自定义截图」面板，用户选定 420 dip 宽 + 保留下拉）
+状态：进行中——本节只记录**已验收**的那一步；绘制与接线见「剩余」。
+分支：main
+目标（用户原话）：「我要的是功能和UI 都实现」。
+本步做了什么（都是可测的根，不是半成品 UI）：
+  1. `crates/snapclip-capture/src/region.rs`（新）自定义截图面板的值与规则，
+     四个数字**不存第二份**：它们就是会话的选区（`Region` 每帧由控制器算出来传进来），
+     所以"面板显示的"和"会被截的"不可能各说一套。
+     - `Region`（桌面像素）+ `to_rect(origin)`/`from_rect`：坐标系是用户的桌面像素，
+       主屏左边的负 x 是普通数字。会话内部的选区是本屏像素，换算只在 `snap_to` 那一处。
+     - `check(screen, minimum) -> Option<RegionProblem>`：按**本屏**的范围校验，
+       `TooSmall` 只标宽高两格，`Outside` 把四格都标出来（尺寸和位置都可能要改），
+       页脚那句话由 `message(unit, dpi)` 按当前单位写（"本屏放不下：宽 ≤ 2560、高 ≤ 1440"）。
+     - `centered`/`at_origin`/`swapped`/`with_ratio`（锁定比例按**锁定那一刻**的比例）/
+       `inside`（换预设只挪位置、不偷偷缩尺寸）。
+     - `RegionPanel`：焦点（15 个槽，Tab 前后回卷）、数值格的输入缓冲（聚焦即整格选中，
+       第一个数字替换、退格逐位删、删空不改区域）、锁定、预设下拉（Enter 选、Esc 先收下拉）、
+       延时四档、以及把结果交给控制器的 `PanelChange{None,Repaint,Region,Toggle,Confirm,Cancel}`。
+     - 预设：内置 PixPin 的默认四项（名称与尺寸成对，docs/28 §2.2）；`管理预设…` 不做——
+       设置页还没有预设管理，做成了就是假的入口。
+  2. `crates/snapclip-capture/src/units.rs`：`LabelDisplay` 补上 **`show_size`**，
+     并把三项显示开关收成一个 `LabelToggle{Size,Position,Unit}`（+ `LabelDisplay::set`）。
+     根因：尺寸标的内容本来就是三件独立的事（多大/在哪/什么单位），历史实现只做了两件，
+     于是"尺寸"这一项没有值可存。顺带补 `to_px`/`dip_to_px`——`from_px` 一直只有一个方向，
+     而面板要把用户按当前单位敲的数字变回像素。
+  3. `crates/snapclip-capture/src/geometry.rs`：徽标菜单的开关行从按效果命名的两项
+     （`coordinates`/`unit_suffix`）折成 `toggles: [(LabelToggle, Rect); 3]` 与
+     `LabelMenuTarget::Toggle(LabelToggle)`——行数由 `LabelToggle::ALL` 决定，加一项不必再改布局；
+     d2d 的绘制随之变成一个循环。这是**减实体**：两个具名矩形 + 两个目标变体 → 一个数组 + 一个变体。
+  4. `apps/snapclip/src/settings/{model,settings_view}.rs`：`show_size` 入模型（含
+     `adopt_label` 的四项合并）与设置页「标签显示尺寸」开关。
+  5. 绘制侧跟着修：三项全关时整句为空，`draw_size_label` 与 `size_label_bounds` 各加一处守卫 ——
+     不画徽标，也不留一个没有字的空盒子（空盒子还会连带一个能打开的菜单）。
+测试（本步新增，全部通过）：
+  - `region::tests` 15 条：单位往返、键入替换/退格、锁定比例跟着改、Tab 顺序与回卷、
+    延时方向键回卷、下拉开/选/Esc 让位、预设落在屏内、越界与过小的拒绝与文案、
+    居中/原点、三项开关、Enter 确认与取消、换单位重读、左屏负坐标是普通数字。
+  - `units::tests`：单位往返（dp→px→dp 在 96/120/144/192 dpi 下不变）、
+    `show_size` 关掉后只写坐标、三项全关时 `text()` 为空、`after(Toggle)` 各翻一项。
+  - `geometry::tests`：徽标菜单三行相邻、行数与 `LabelToggle::ALL` 一致、每行是它自己的目标。
+验证（逐条命令、实际输出）：
+  - `cargo test -p snapclip-capture --lib -- --test-threads=1` → **443 passed / 0 failed / 60 ignored**
+    （+1 条 L4 设备测试：面板图形必须落进各自的方框；SVG 通路撤回后它的纯测试也一并撤回）
+  - `cargo test -p snapclip-capture --lib -- --ignored --test-threads=1 the_panel_glyphs` → **ok**
+    （真实 D3D11/D2D 上画面板并逐格数墨——这条曾经复现"点尺寸栏闪退"）
+  - `cargo test -p snapclip-app --features test-support --lib` → **131 passed / 0 failed / 7 ignored**
+  - `cargo check --workspace --all-targets` → 0 error / 0 warning
+第二段（同一次任务，接着做完了绘制与接线）：
+  1. `geometry::region_panel_layout`：420 dip、中心对齐工作区、高度由各段相加；返回的每个矩形同时
+     是"画在哪"和"点哪算命中"（`RegionPanelLayout::target_at` 读的就是它）。下拉挂在触发器下面并
+     夹进工作区——与徽标菜单同一条规矩。
+  2. `d2d::draw_region_panel`（L3.7，画在徽标菜单之上）：面板底不自己做模糊——它压在被截的屏上，
+     屏幕本身的 `mask_blur` 会透过它，所以只画一层半透明 + 发丝线。四个数字是 20 dip 等宽、居中，
+     下划线就是它的边：聚焦转 ACCENT、非法转 `#ff7b7b` 且标签一起变；悬停/聚焦/禁用/描红四态都有。
+     图标（互换、锁定、居中、原点）用线段画，不依赖字体里有哪个符号。
+  3. 输入接线：面板内的按下归面板（`chrome_swallowed_press` 连按下带抬起一起吞，不再单独为菜单留
+     一个旗标）；面板**外**的按下照旧是普通手势——面板开着也能在屏幕上拖选区，数字跟着变（面板不存
+     第二份数值，所以这条是结构上成立的，不是同步出来的）。键盘在面板开着时全归它：Tab/Shift+Tab、
+     ←→（单位与延时组内换、其余挪焦点）、↑↓（下拉高亮）、数字与退格（数值格，聚焦即整格选中）、
+     Enter（开始截图）、Esc（取消）。`Region(next)` 经 `snap_to` 落地，桌面像素→本屏像素只换算一次
+     （`monitor_origin`）；`Toggle` 落到 `preferences.label` 并 `publish_preferences`。
+  4. 提交路径：延时 0 → 应用区域并确认；延时 > 0 → 收起浮层、`REGION_DELAY_TIMER_ID` 一次性计时、
+     到点重开一次会话并把区域带上（`pending_region`），**抓的是等待之后那一帧**——否则"延时"只是把
+     同一画面晚点截出来。
+  5. 入口：**点尺寸栏**打开（再点收起）——悬停开的是那张小菜单，点开的才是这块面板；面板位置
+     先试**选框正中间**（面板改的就是那块区域，它该和区域在一起），选框装不下就挪到外面
+     （先下方、下方不行再上方），最后夹进工作区。校验范围是本屏（`monitor_bounds`），最小选区
+     与会话同一条规则（`minimum_selection`），所以描红与 `snap_to` 不会各说一套。
+  6. 徽标菜单与面板共用一条出会话的门（`publish_preferences` 升成 `pub(super)`），两处改的都是
+     同一份显示偏好。
+  7. 面板图形试过换成 `assets/icon/*.svg`（Tabler，8 个文件），**实测后撤回**，现在仍是 `d2d.rs::draw_glyph`
+     的线段版。过程与结论（完整版在 `assets/icon/README.md`）：
+     a. 能用的部分（真机验证）：`ID2D1DeviceContext5::CreateSvgDocument` 存在，8 个文件全部解析成功；
+        `GetRoot` + `SetAttributeValue2(POD_TYPE_COLOR)` 改根元素 `fill`/`stroke` 成功。
+     b. **崩溃（用户报的"点尺寸栏闪退"，0xc0000005）**：把 `SetTransform` 打在 `ID2D1DeviceContext5`
+        上、或复位时传空指针 → ACCESS_VIOLATION。修法是状态类调用走渲染器本来就持有的
+        `ID2D1DeviceContext`（同一对象的浅接口）+ 复位用显式单位矩阵。这条**已修**且由 L4 设备测试覆盖。
+     c. **`DrawSvgDocument` 一个像素都不画**：不是位置错，是完全不出现；变换（有/无/仅平移/平移+缩放）、
+        `SetViewportSize`、纯白不透明颜色、目标位图与文档同 device 都排除过，**连手写的最小
+        `<svg viewBox="0 0 24 24"><rect fill="#ffffff"/></svg>` 也不画**。解析/着色/变换都对，只有最后
+        一步是空的 ⇒ 问题在管线不在文件。因为没有把握在不稳定基础上继续加代码，**把整条 SVG 通路撤回**
+        （含 `icons.rs`、`d2d/svg_icon.rs`、Cargo 的 `Win32_System_Com_StructuredStorage`），
+        面板回到线段图形——**不崩、图标可见、与既有测试一致**。
+     d. 一次**误诊**也记下来：这批文件把 `fill`/`stroke` 写在根 `<svg>` 上靠继承，我先认定"Direct2D 不
+        做根属性继承"是根因，写了"把根画法解析出来显式盖到每个形状"（还要避开 Tabler 那个透明底框，
+        否则每个图标会被加一个实心方块）。手写 SVG 用显式 `fill` 同样不画 ⇒ 方向错了，随之撤回。
+     e. 下次的三条路（README 里有详述）：**把路径烘成 `ID2D1PathGeometry`**（开发期 Node 工具解析
+        `d`，运行期 `ID2D1GeometrySink` 重放，`AddArc` 原生支持 Tabler 的圆弧；不依赖 1.3、不需要流、
+        着色天然由画刷决定）→ 离线光栅化后 `DrawBitmap` → 保持线段版。
+     f. 留下的资产：`assets/icon/*.svg`、`assets/icon/README.md`（实测记录 + 三条路 + 换图标的四条规矩），
+        以及 L4 设备测试 `the_panel_glyphs_land_in_the_boxes_they_were_given`——它按"每个图形自己方框里的
+        墨"判断图形是否落进自己的格子，这次正是它抓住了崩溃与"图标全不可见"。
+  8. 性能（先量再动；probe 测试 `the_cost_of_the_panel_icons`，按仓库惯例标成 "measurement, not an assertion"）：
+     - **每帧** 8 次 `DrawBitmap`（高质量三次插值）= **62.8 µs**；对照旧线段版 40 次 `DrawLine` = 20.5 µs
+       ⇒ 图标层贵 ~42 µs/帧。但面板帧只在面板开着时才画（合并进 15 ms 的渲染 tick），而这一帧的大头是
+       全屏 3840×2160 遮罩 + 高斯模糊 ⇒ 42 µs 是噪声，**不动**。也不换插值模式：三次插值正是 96→14 px
+       这种 7 倍缩小时不掉质量的原因。
+     - **显存**：源位图 288 KB + 色表 972 KB ≈ **1.26 MB**。
+     - **准备**（解码 8 张 PNG + 预烘 2 色 × 9 张）= **1.60 ms**，原先在 `recreate_resources` 里做，而那条
+       路径正是"按 F5 到浮层可见"（日志里 `prepare_elapsed_ms≈22`，占 ~7%）⇒ **已挪到帧之前、面板开着时**：
+       `OverlayRenderer::prepare_panel_icons()`，由控制器在每帧开头问一次（幂等；`reset` 之后重做）。
+       会话开始不再付这 1.6 ms，代价是第一次点开面板时付一次（人感觉不到）；"设备重建时面板仍开着"也由
+       这条路径覆盖。为什么不能更晚：每次着色渲染需要自己的 `BeginDraw`/`EndDraw`，D2D 不允许嵌进帧内。
+  8. **面板图形改为「resvg 烘 PNG → WIC 解码 → 颜色矩阵着色 → DrawBitmap」**（用户要求"必须和 SVG
+     一模一样"，线段重画不满足；原生 `DrawSvgDocument` 已按 c 条否决）。落地：
+     a. 新工具 crate **`tools/icon-bake`**（进 workspace members，`resvg` 只在这里）：读
+        `assets/icon/*.svg`，把 `currentColor` 换成 `#ffffff`，resvg 渲到**透明底 96×96**（24 单位 ×4），
+        写 `assets/icon/<name>.png`（8 个，1.4–2.4 KB）。确定性已验证：连跑两次逐字节一致。
+        它的 `#[test]` 在内存里重渲一遍与仓库里的 PNG **逐字节比对**，设计师改了 SVG 忘了重烘就红。
+     b. `crates/snapclip-capture/src/icons.rs`（纯数据，无 GPU 可测）：`Glyph` 从 d2d.rs 搬来，
+        加 `ALL`/`name()`/`index()`/`png()`（`include_bytes!`）与 `ICON_BAKED_PX = 96`。3 条测试：
+        PNG 签名 + IHDR 96×96、索引与 ALL 对齐、每个变体指向不同文件。
+     c. `crates/snapclip-capture/src/windows/win/d2d/panel_icon.rs`：WIC（`IWICImagingFactory` →
+        `IWICStream::InitializeFromMemory` → `CreateDecoderFromStream` → 格式转换到 32bppPBGRA →
+        `CreateBitmapFromWicBitmap`）解码；`CLSID_D2D1ColorMatrix` 按状态色着色（白 + 透明、位图是预乘，
+        矩阵是 5 行×4 列：四个通道乘 `色×α`、alpha 行乘 `α`，第 5 行偏置）；
+        `CLSID_D2D12DAffineTransform` 只用于下拉箭头的上下翻转；`DrawBitmap` + `HIGH_QUALITY_CUBIC`
+        负责位置与缩放（**不依赖渲染目标的变换**——那是这套渲染器里唯一没被验证过的部分）。
+     d. **着色是预渲染的**，不是绘制时算的：颜色矩阵要画进一张 target，而 `BeginDraw`/`EndDraw` 不能嵌在
+        面板自己的绘制过程中，所以在 `recreate_resources`（帧外）把面板用到的两种颜色
+        （`label_text_brush` 白、`panel_muted_brush` 62% 浅灰 —— 取自画刷本身，改调色板会自动跟上）
+        × 8 个图形（+ 箭头翻转态）预渲染成 96×96 位图；绘制时只查表 + `DrawBitmap`。查不到就是编程错误，
+        直接 `Err`（没有第二套退化实现，线段版已删除）。
+     e. 顺带：`windows` feature 补 `Win32_Graphics_Imaging`（WIC；`CreateBitmapFromWicBitmap` 需要它）。
+     f. 测试：原 L4 放置测试继续过，并加了下界（不是空白）+ 上界（`ink*4 < area*3`，不能是一整块）；
+        新增 `the_glyph_tint_follows_the_colour_it_is_given`：同一图形、同一位置用白与 62% 浅灰各画一次，
+        断言框内像素**必须不同**（颜色矩阵没生效就会红）。
+     g. 过程中踩到的：windows-rs 把继承来的 `ID2D1RenderTarget::DrawBitmap`/`Clear` 解析成 **void 版**，
+        没有 `Result` 可 `map_err`（错误由 `EndDraw` 报）；`Param<ID2D1Image>` 不会自动接受派生的
+        `ID2D1Effect`，要显式 `cast`；`D2D1_MATRIX_5X4_F` 是 **5 行 × 4 列 = 20 个 f32**（我先写了 25 个）；
+        测试里给"另一个" D2D 上下文设 target 是白设——`draw_glyph` 画在渲染器自己的上下文上。
+     文档：`assets/icon/README.md` 重写（新管线），原生 SVG 的实测记录保留为历史一节。
+踩过的坑（真机回归，用户报了才发现的）：
+  一、我一度给面板加了全局热键 `Alt+1`，而 `hotkey::register` 是**全有或全无**——表里任何一行注册
+     失败（`Alt+1` 很容易被别的程序占着）就会 `DestroyWindow` 并让 overlay 启动失败，于是
+     **`F5` 也不再调出截图框**。修法不是"注册失败也继续"，而是**去掉这一行**：面板的触发方式是点
+     尺寸栏，本来就不需要全局热键（`HOTKEYS` 回到 3 行，`HotkeyKind::Region` 删除）。教训写进
+     `HOTKEYS` 的文档注释：这张表里的每一行都是"overlay 还能不能起来"的承诺，不该放可选键。
+  二、修好 F5 之后面板还是打不开：徽标上**停 180ms 会自动开出悬停小菜单**，而按下处理里小菜单分支
+     在前——它把这次点击当成"点菜单外 → 收起"就 `return` 了，永远走不到"点徽标开面板"那条分支。
+     这正是"自动化测不到、只有真机点一次才知道"的那类错：两段代码各自都对，顺序错了。
+     修法：把徽标分支放到小菜单**之前**（徽标自己是控件，点击的语义归它；小菜单画在徽标上方，
+     只有"上面没地方"时才盖住它）。
+  三、再往后一步是用户给出的答案：**小菜单整个删掉**（原话"悬停小菜单可以移除，悬停小菜单的功能
+     已经被包含在大的面板中了"）。修法是删实体而不是修顺序——两个入口并存时，"哪个在什么时候
+     赢"本身就是要维护的知识；一个入口就不需要这条知识。删掉的东西：`label_menu.rs` 整个文件、
+     `geometry::{LabelMenuLayout, LabelMenuTarget, label_menu_layout, MENU_*}`、
+     `d2d::{LabelMenuView, draw_label_menu, fill_menu_row, LABEL_MENU_HELP, menu_knob_brush}`、
+     `LabelDisplay::after`、`RenderView/OverlayFrameState.label_menu`、全部 `track_label_menu` 调用与
+     `dwelling()` 重绘条件、`on_key_down` 里"Esc 先关小菜单"那一段。删掉 12 条测试（455 → 443
+     passed / 0 failed）。留下的：徽标悬停高亮（`label_hovered` 现在只由"指针在徽标矩形上"决定）、
+     `label_badge`（点击命中）、`LabelDisplay`/`LabelToggle::set`（面板与设置页在用——`set` 原来唯一的
+     测试是测 `after` 的，改成 `a_switch_changes_only_the_item_it_names` 继续钉住它）。
+     四个画刷因为只剩面板在用而改名（`panel_fill_brush` / `panel_line_brush` / `panel_accent_brush` /
+     `panel_muted_brush`），`menu_knob_brush` 无人用则删。
+     顺带一处：放大镜原本由"小菜单开着"门控，现在改成**面板开着就不画**（它挂在指针下方，会压住
+     正在输入的那几行；而且标签会为了躲它而挪位置，徽标一动，点它的落点也跟着动）。
+踩过的坑：`RegionPanel` 原来自己存了一份页脚提示（`status`），而视图是按当前区域现算的——两份真相，
+外面拖选区时模型那份会陈旧。删掉了，改成按需计算 `status(region, dpi)`。面板的数值格没有光标：
+聚焦即整格选中、第一个数字替换，这样 D2D 里不必算光标位置（少一类坐标）。剩余（如实记账）：
+  1. 预设管理（增删改、持久化）没做：面板只用内置四项，也没有 `管理预设…` 入口——设置页还没有这个
+     能力，做出来就是假入口。
+  2. 面板的尺寸只按当前显示器校验：跨显示器的区域要等"会话跟着区域换屏"那一层（现在 `snap_to` 会
+     夹到本屏）。
+  3. 真机人工验证未做：绘制路径需要真实 D3D11/D2D（`cargo test` 覆盖的是纯几何、纯规则与状态机）。
+     验法：关掉正在运行的 app → `cargo build` → 启动 → `Alt+1`。
+  4. 上面 §14.53 记的两项仍未做（浮层内的键位切换、本机缩放比实时读数）。
+提交 SHA：见提交
+推送/tag：未推送（工作区改动）
+回退对象：0bb0a0f 之上的未提交工作区
+
+### §14.55 截图面板的六项观感/可用性缺陷（两批做完）
+
+用户给的六项（原文是按**网页**技术栈描述的：`backdrop-filter`、`caret-color`、`compositionstart` 等）。
+本仓库没有网页版面板：唯一 HTML 是 `docs/design/*.html` 设计稿与 `prototypes/`，产品面板是 **Rust + Direct2D
+自绘**、应用窗口是 GPUI。所以六项全部翻译成原生做法，**没有引入任何 UI 库**。
+
+**第一批（1/3/6，纯布局与绘制数值）**
+1. 角标形状 ⇒ 胶囊：`draw_size_label` 的圆角原本写死 `3.0`（与高度无关），改成 `placement.rect.height()/2`；
+   高度由内容撑开，半径跟着走，文字仍居中。（注意：`draw_hint_at` 里那个 ↑/↓ 方向芯片不动，它不是这项。）
+3. 卡片标签贴边：`card_height` 的算式里**根本没有底部内边距**（标签下沿 = 卡片下沿）⇒ 新增
+   `REGION_CARD_PAD_BOTTOM_DIP = 12` 计入高度，`REGION_VALUE_LABEL_GAP_DIP` 3 → 6；两张卡共用同一套数值。
+   顺带把 `the_region_panel_is_420_dip_wide_and_centred` 的"垂直居中"从精确相等改成 **±1 px**
+   （面板高度随内容变，奇偶取整会差 1；面板仍是居中，是断言过脆）。
+6. 分段器选中块与容器等大：容器在绘制时用两个分段的**并集**算出来 ⇒ 选中背景贴着外框。改成布局显式给出
+   `RegionPanelLayout::unit_track`（宽度不变 = 两块）+ `REGION_UNIT_INSET_DIP = 3`，两块四面各内缩。
+
+**第二批（2/4/5）**
+2. **面板没有毛玻璃**。成因：面板底只是一层半透明色，压在被遮罩调暗过的屏幕模糊上，**面板自己范围内没有二次模糊**。
+   修法：复用 `blurred_frame` —— 它是**未调暗**的帧模糊结果（mask、info strip、guide、magnifier 都从它裁），
+   所以不会把遮罩暗度叠第二次；用 `PushLayer` + `D2D1_LAYER_PARAMETERS1::geometricMask` 的圆角矩形几何裁剪
+   （与 `guide_pass`/`magnifier_pass` 同一套正规写法，不用直角 clip），铺在那层半透明底色**之下**；
+   `needs_backdrop` 加上"面板开着"这一条，否则面板绘制时模糊源还没建。
+   验证：L4 真 GPU 测试 `the_panel_backdrop_blurs_what_is_behind_it`。**判据换过一次**：先按"面板内方差 < 面板外"
+   写，实测**改之前就是绿的** —— 面板底色 78% 不透明，自己就把棋盘对比压掉大半，那条比较无效。改成
+   "同一块面板区域，背后是 4×4 棋盘 vs 背后是同均值纯色"：改之前 **93.6 vs 32.8（红）**，改之后
+   **31.8 vs 31.8（绿）**（判据 `pattern < baseline + 6`）。
+4. **点输入框没有插入光标**。成因：数字格完全没有插入点，D2D 里也没画。修法：`RegionPanelView` 加一个
+   **有用**的字段 `editing: Option<RegionField>`（= 正在输入哪一格，模型里本来就有这个状态）；绘制时数字是居中画的，
+   所以插入点 = `格子中心 + 文本推进宽度/2 + 2 dip`（宽度用 `IDWriteTextLayout::GetMetrics` 量），
+   画 2 px 强调色竖线、上下各 7.5 dip。**常亮不闪烁**：闪烁要在空闲时也保持渲染 tick，为一条光标付整帧代价不划算。
+   "聚焦即整格待替换"的既有语义没动。
+   验证：L4 `the_focused_number_cell_shows_a_caret_at_the_end_of_the_text`（**改前红、改后绿**）：判据是差异必须是
+   ≤4 px 宽的一列、落在格子中心**右侧**、且只出现在聚焦那一格；比较范围限制在数字行内，避开"聚焦会把下划线加粗"
+   这件另一件事。
+5. **中文输入法下敲不出数字**（真缺陷）。根因比"只认 `WM_KEYDOWN`"更具体，三点：
+   a. 既有的 `disable_ime_for_overlay` 只调 `ImmSetOpenStatus(himc, 0)`（把 IME 切"英文模式"）——这是 IMM 时代的
+      兼容垫片，现代 TSF 输入法（微软拼音等）经常直接忽略它；
+   b. 消息路径上**没有** `WM_CHAR`/`WM_IME_*` 兜底（`TranslateMessage` 本来就在跑，只是没人处理 `WM_CHAR`）；
+   c. 中文输入法在全角状态下送的是 `１`（U+FF10）而不是 `1`，即便收到字符也会被"只认 ASCII 数字"挡掉。
+   修法：面板打开时 `ImmAssociateContext(hwnd, NULL)` 把 IME 从这个 HWND 上摘掉（保存旧 context；只影响我们自己的
+   窗口），四个出口恢复 —— 再点尺寸栏关闭、取消、延时启动、会话收尾；消息循环加 `WM_CHAR` → `on_char`；
+   数字**只从字符入口入账**（`panel_key` 不再收 VK 数字，否则一个字符会落两次）；`region::panel_key_from_char`
+   把全角数字归一化到同一个 `Digit`（负号/小数点/字母/控制字符仍然被拒，数字格"只数字、7 位以内"的规则没变）。
+   验证：纯测试 2 条（`char_entry_tests`：ASCII 与全角落到同一个 `Digit`；非法字符被拒）。**IME 真机行为无法自动化
+   ⇒ 只能人工验证**：切到中文输入法 → `F5` → 点尺寸栏 → 敲数字。
+
+验证（逐条命令、实际输出）
+  - `cargo test -p snapclip-capture --lib -- --test-threads=1` → 第一批时 **446 passed / 0 failed / 62 ignored**，
+    第二批后 **448 passed / 0 failed / 64 ignored**（+2 字符入口纯测试，+2 条 L4 设备测试）
+  - `cargo test -p snapclip-capture --lib -- --ignored --test-threads=1 <名字>` → 四条面板 L4 全 ok：
+    `the_panel_glyphs_land_in_the_boxes_they_were_given`、`the_glyph_tint_follows_the_colour_it_is_given`、
+    `the_panel_backdrop_blurs_what_is_behind_it`（改前红 → 改后绿）、
+    `the_focused_number_cell_shows_a_caret_at_the_end_of_the_text`（改前红 → 改后绿）
+  - `cargo check --workspace --all-targets` → 0 error / 0 warning
+  - 真 GPU 离屏渲染 dump（棋盘上的面板 / 数字右侧的光标）肉眼确认：面板内棋盘被磨平、面板外仍清晰；光标可见且在文字右侧
+
+未验证项与原因
+  1. **中文输入法真机行为**：只能人工（见 5 的验法）。我能给的只是代码路径与状态机层面的证据。
+  2. 光标"与数字视觉高度相符"是定值（上下各 7.5 dip，对应 20 dip 字号）——换字号要跟着改，没有自动跟随。
+  3. 数字格仍然**不能输入负号**（多屏在主屏左侧时 X 为负）：这是既有规则（`Digit` 之外没有字符入口），
+     这次没改（改动会牵动校验与提交路径），记在这里备用。
+提交 SHA：见提交
+推送/tag：未推送（工作区改动）
+回退对象：0bb0a0f 之上的未提交工作区
+```
+
+#### §14.55.1 返工：行标签改名、另两处芯片胶囊化、光标闪烁与逐字符删除
+
+用户报了三件事，只改这三件（未动数据流/接口语义，未引入 UI 库）。
+
+**A. 行标签「浮层」→「角标」**
+- 成因：面板第三行那个行标签直接写死了 `"浮层"`，而「浮层」在文档/注释里是**另一个意思**（整个截图 overlay，38 处）。同一个词指两样东西。
+- 修法：只改界面文案与那一节的注释（`// ── 浮层行` → `// ── 角标行`）。
+- 复核计数：界面文案 `"浮层"` **0** 处、`"角标"` **1** 处；指代整层的「浮层」**38 处未动**。
+
+**B. 另两处芯片也要是胶囊**
+- 成因：只有尺寸角标真的用了"半径 = 高度/2"，另外两处各写一套：方向芯片（↑/↓）写死 `3.0`、角标行的预览标签用 `dip(6.0)`。三处算法不同 ⇒ 只有一个像胶囊。
+- 修法：抽出纯函数 `geometry::pill_radius(rect)`（高度一半、下取 0、倒置矩形不给负半径），三处都改用它；单元测试覆盖偶数高度 24→12、奇数 25→12.5、高度 1→0.5、高度 0→0、倒置→0。
+- 未单独渲图：方向芯片只在"层级链"状态下出现，靠单元测试 + 同一函数覆盖（其余两处已在渲图里确认）。
+
+**C. 光标闪烁 + Backspace 逐字符删除（用户报的真 bug）**
+- 成因：我原先刻意做成"聚焦即整格待替换、第一个按键替换全部"（`FieldText.replace`），它的两个后果正是用户报的：**退格一次清空**、**光标无法定位**；光标还是常亮的（当时为了不付整帧代价）。
+- 修法（改成普通文本框语义）：
+  - `FieldText.replace` → `FieldText.caret`（缓冲内字节位置，始终 clamp 在 `0..=len`）；聚焦时 caret 落在**末尾**；
+  - 数字**插入到 caret 处**（保留"只数字、7 位上限"）；**Backspace 只删 caret 左侧一个字符**（caret 在 0 时无操作）；顺手做了 **Delete** 删右侧一个；
+  - **Left/Right/Home/End 在数字格里移动 caret**（槽间切换仍归 Tab；不在数字格时左右键的组内切换语义不变）；
+  - 光标画在 **caret 对应的 x**：数字居中绘制 ⇒ 文字左端 = 格子中心 − 总宽/2，插入点 = 文字左端 + **光标左侧前缀**的推进宽度（不再用"总宽/2"）；
+  - **闪烁**：视图新增 `caret_visible`；控制器用新的低频计时器 `CARET_TIMER_ID = 0x51_C0E2`（`CARET_BLINK_MS = 500`）翻转它；`sync_caret_blink()` 每帧问一次但**只在需要与否变化时**才 Set/Kill（重复 `SetTimer` 会重置计数 ⇒ 永不触发，与 `arm_render_tick` 同一个坑）；任何面板变化（聚焦/敲键/点选）立刻把光标复位成可见；编辑结束/面板关闭/会话结束时停表并复位。
+- 测试：`region.rs` 新增/改写 4 条（退格只删一个字符、删空后 caret 在 0 再按无操作、Home/End/Left/Right/Delete 与"插入到 caret 处"、caret 始终 clamp 在缓冲内）；原"第一个数字替换整格"的测试按新语义改写，锁定比例那条改用新增的 `retype()` 助手（点进去→逐字符退格清空→再敲）。
+- L4 真 GPU：`the_caret_can_be_switched_off_and_on`（同一格 `caret_visible` 真/假各渲一次、像素必须不同 ⇒ 光标确实可开关＝能闪）。
+- **未验证**：闪烁计时器本身的节奏只能人工验（点开面板、聚焦数字格，看光标一亮一暗）。另注：`Delete` 已实现，但用户没要求，行为是"删光标右侧一个"。
+
+**顺手发现的既有缺陷（不在本次范围，未改）**：`REGION_DELAY_TIMER_ID` 与 `REFINEMENT_TIMER_ID` **值相同**（都是 `0x51_C0E1`），而 `WM_TIMER` 分发里延时那条在前 ⇒ 悬停细化计时器到点时会被当成"延时截图到点"。新计时器因此取了 `0x51_C0E2`。
+
+### §14.55.2 追加三点（开关芯片胶囊底 / 光标加长加粗 / 延时行改分段器）
+
+成因与修法：
+  A. 角标行那三个开关芯片，未选中时**没有底色**（只在悬停时填 `panel_fill_brush`），静止看像
+     "细描边的文字"。改为：静止未选中 = **浅底胶囊 + 发丝描边**；悬停 = 用现成的
+     `panel_line_brush`（白 30%）当底色（不新增画刷），静止与悬停一眼可分；选中 = accent 胶囊。
+     三处半径统一走 `geometry::pill_radius`。**顺带把单位分段器的容器与选中块也一并胶囊化**，
+     否则同一页里两行分段器观感不一（这一处超出字面要求，已在报告里说明，可回退）。
+  B. 插入光标原来上下各 7.5 dip（总高 15）、线宽 2 px。改为 `CARET_HALF_DIP = 11.5`（总高约 23 dip，
+     与 20 dip 字号的数字视觉高度相当）、线宽 `3 px × DPI 缩放`。插入点位置算法（文字左端 +
+     光标左侧前缀推进宽度）未变。
+  C. 延时行原来是四个各自圆角 5、彼此独立的小块。改为与单位分段器**同一套结构**：布局新增
+     `RegionPanelLayout::delay_track` 与 `REGION_DELAY_INSET_DIP = 3`，四段在容器内四边内缩
+     （边界按比例取整，宽度最多差 1 px）；绘制 = 容器浅底胶囊、选中段 accent 胶囊、未选中段不填充、
+     聚焦环画在容器上。**容器总宽 = 四段原宽（4 × 30 = 120）**，页脚与其它行不移动。
+
+验证（实际输出）：
+  - `cargo test -p snapclip-capture --lib -- --test-threads=1` → **452 passed / 0 failed / 65 ignored**
+  - `cargo test -p snapclip-capture --lib -- --ignored --test-threads=1` 四条受影响项
+    （图形落位 / 背后模糊 / 聚焦格光标 / 光标可开关）→ **全 ok**（真 GPU）
+  - `cargo check --workspace --all-targets` → 0 error / 0 warning
+  - 离屏渲染 + 肉眼：静止的「位置/单位」有胶囊底与发丝边、「尺寸」是 accent 胶囊；延时的「不延时」是
+    内缩在浅底容器里的 accent 胶囊（容器两端露出）；光标比原来明显更长更粗
+  - 新增布局断言：四段都落在 `delay_track` 内且四面内缩 ≥2、相邻四段之间无缝、容器宽 == 120
+
+未验证项与原因：
+  - **悬停态（白 30% 底）没有单独渲图**：渲染 helper 的输入里没有"指针悬停在某芯片上"这一路
+    （需要有指针位置的视图输入），只能给到代码分支 + 现成画刷。真机悬停看一眼最稳。
+  - 层级链状态下 ↑/↓ 方向芯片的胶囊形态仍由同一个 `pill_radius` + 单测覆盖（未单独渲图）。
+
+### §14.55.3 单位分段器与倍率块从页头搬到角标行右侧
+
+- **位置**：`region_panel_layout` 里 `unit` / `unit_track` / `scale` 从页头（标题右边、写死 `left + 84 dip`）
+  搬到**角标行右侧并右对齐**：右边缘 = 内容右边界 `right`，与延时行、页脚按钮成一条竖线；两者在角标行内
+  **垂直居中**；分段器与倍率之间的间距沿用它们原来在页头里挨着时的 8 dip。
+- **页头**：只剩标题 + 关闭；标题的可延伸范围从"单位分段器左边界"改为"关闭按钮左侧 − 8 dip"。
+- **高度**：页头 26 dip、角标行 24 dip、面板总高**均未变**（单位块 24 正好填满角标行，倍率 20 居中）——
+  因此无需事先说明"必须变高"。
+- **绘制：零改动**。`draw_region_panel` 里的单位/倍率/标题/关闭全部只读布局矩形
+  （`layout.unit_track` / `layout.unit` / `layout.scale` / `layout.title` / `layout.close`），矩形移动即跟随；
+  同名的 Tab 命中目标（`RegionPanelTarget::Unit`）也由布局矩形算出，自动跟随。
+- **常量**：新增 `REGION_HEAD_GAP_DIP = 8`、`REGION_UNIT_SCALE_GAP_DIP = 8`、
+  `REGION_TOGGLE_CONTROLS_GAP_DIP = 12`。最后一个是"左侧开关组 ↔ 右侧控件"的**底线**，用 `debug_assert!`
+  在布局里守着：位置由右对齐决定，真挤不下时该改的是设计参数，而不是悄悄把控件挪位。
+- **Tab 顺序**：`PanelSlot::ORDER` 仍以 `Unit` 开头（那是"单位在页头最左"的旧视觉假设）。**按要求未改**：
+  视觉位置变了、Tab 顺序没变，留给用户决定。
+- **测试**（按新预期改/增，未弱化）：两个控件都落在角标行内、垂直居中；`scale.right` 同时等于页脚按钮右边界
+  与 `delay_track.right`；`unit_track.right + 8 == scale.left`；开关组与右侧控件间距 ≥ 底线；
+  `title.bottom <= unit_track.top`（证明搬出了页头）；标题不压关闭按钮。
+- **验证**：`cargo test -p snapclip-capture --lib -- --test-threads=1` → **452 passed / 0 failed / 65 ignored**；
+  三条受影响的 L4 真 GPU 测试（图形落位、背后模糊、光标可开关）ok；`cargo check --workspace --all-targets`
+  → 0 error / 0 warning；离屏渲图确认：页头只剩标题与关闭、角标行右侧是 px/dp 与 100%、与延时行右对齐。
+- **未验证 / 留待决定**：倍率块仍是 `dip(4.0)` 的圆角矩形，而它左边的分段器是胶囊（上一轮统一过），并排时
+  圆角语言不一致；本次只做搬运，未动它。
+
+### §14.55.4 分段器抽共用 + 改成圆角矩形
+
+**1. 一个绘制函数，两处调用。** `d2d.rs` 新增 `draw_segmented(track, segments, hovered, focused, &SegmentStyle)`
+与配套的 `SegmentStyle`（容器底 / 选中块 / 悬停 / 聚焦环 / 文字 / 弱化 + 标签字体）。单位分段器与延时
+分段器都改用它；两处**唯一**的差别是段数、标签文字与字体（单位是等宽小号 PX/DP，延时是正文 11 dip），
+字体作为参数传入，代码不再各写一遍。顺带把 hover 语义统一为**指到哪一段就亮哪一段**：新增命中目标
+`RegionPanelTarget::Delay(Delay)`（原来整组 `Slot(PanelSlot::Delay)`，而绘制侧根本没有 hover 分支 ⇒
+延时的悬停此前完全无效），并按同一语义把点击也改成"点哪段选哪段"（新增
+`RegionPanel::choose_delay`）。**这是本次唯一的行为变化**：以前点延时是"整组 + Enter"（等于循环到下一
+段），现在是分段器的正常语义；键盘在组内换段（←/→）保持不变。
+
+**2. 圆角矩形，不是胶囊。** 新增纯函数 `geometry::segment_radius(outer, inset) = max(outer - inset, 0)`
+与 `segment_outer_radius(scale)`（外层 `REGION_SEGMENT_RADIUS_DIP = 7`），容器用外层半径、选中块用
+"外层 − 实际内缩"（内缩由第一段到容器的左边距量出，横向纵向一致），两层同心。单元测试覆盖
+`0 / 相等 / 内缩大于外层 / 外层为 0` 四个边界。`100%` 倍率块**不是**分段器，保持原样（4 dip 圆角矩形），
+正好与新分段器的圆角语言一致；三个开关胶囊、尺寸角标、方向芯片、预览标签**仍是胶囊**（`pill_radius`），
+本次未动。
+
+**验证**：`cargo test -p snapclip-capture --lib -- --test-threads=1` → **454 passed / 0 failed / 65 ignored**
+（+1 `segment_radius` 边界、+1 `choose_delay`）；L4 真 GPU 四条（图形落位 / 背后模糊 / 光标可开关 / 着色）
+全 ok；`cargo check --workspace --all-targets` → 0 error / 0 warning；离屏渲图确认两处分段器观感一致、
+都是圆角矩形，延时行的选中块与 `dp`、`100%` 半径一致。
+
+**未验证**：芯片/分段的**悬停态**只能给到代码分支 —— L4 渲染 helper 的输入里没有"指针落在某一段上"
+这一路（与上一轮同一限制），真机把鼠标停到 `dp`、`3s` 上看一眼即可。
+
+### §14.55.5 分段器选中块的平移切换动画
+
+需求（用户）：分段器里点击选项时，选中块要从旧选项**滑**到新选项。只动两处分段器（单位 px/dp、延时），
+其它元素不加动画。
+
+做法（关键：**动画属于呈现层**）：
+- 模型 `region.rs` 完全不知道动画；`geometry::segment_slide(from, to, t)` 是纯插值（`t` 越界夹住，
+  内部三次方 ease-out，矩形取整 —— 半像素的块挨着发丝线会看出抖动），因此能单测。
+- 状态在控制器：`SegmentSlide { from: Option<usize>, to, started: Option<Instant> }`（`state.rs`），
+  两个实例 `unit_slide` / `delay_slide`。写法照既有的 `GuideFade`：控制器持时钟、渲染 tick 推进
+  （`advance_segment_slides`）、视图带 `(起点段号, 进度)`，`draw_segmented` 在两端矩形之间插值。
+- 触发：在点选与键盘两条入口处**快照前后值**（`start_segment_slides`），谁变了给谁起一次动画 ——
+  鼠标点 `RegionPanelTarget::Unit(..)`/`Delay(..)` 与组内 ←/→ 自动都覆盖。
+- 打断：从**上一个目标**接着往前滑（`from = 旧 to`），所以块永远沿同一方向前进、不回跳；
+  代价是打断时少滑一小段。
+- 不空闲烧帧：只在 `running()` 时给渲染 tick 续帧，到点 `settle_if_done` 落定；`reset` 与会话收尾复位。
+- **命中判定始终读布局矩形**（`layout.unit` / `layout.delay`）：动画只改"画在哪"，点哪算命中不受影响。
+- 参数：`SEGMENT_SLIDE_MS = 140`（120–160 ms 区间），三次方 ease-out。
+
+行为变化（本次为动画而做的）：
+1. 切换后渲染 tick 会多跑约 140 ms（若同一时刻没有别的动画在跑）；到点即停，不改变空闲时的行为。
+2. `draw_segmented` 里"选中块"从"循环内逐段填"改成"循环外一次性填在插值矩形上" —— 悬停底色依旧
+   只作用于未选中段（与改前一致），选中段仍不参与悬停。
+3. 其余无变化：模型、校验规则、提交路径、Tab 顺序、命中判定都没动。
+
+验证（真跑）：
+- `cargo test -p snapclip-capture --lib -- --test-threads=1` → **455 passed / 0 failed / 66 ignored**
+- 纯测试 `the_segment_slide_lands_on_both_ends_and_moves_monotonically`：t=0 落在起点、t=1 落在终点、
+  越界夹住、中段严格在两端之间且单调不减、只有横向在动、1/4 时间走过一半以上（ease-out）。
+- L4 真 GPU `the_segment_block_slides_between_the_two_units`：同一分段器在进度 0 与进度 1 各渲一次，
+  断言第一段的像素**不同**；两阶段渲图肉眼确认（进度 0 = 块在 `px` 上，进度 1 = 块回到 `dp`）。
+- 其余五条 L4（图形落位、着色、背后模糊、聚焦格光标、光标可开关）仍 ok；`cargo check --workspace
+  --all-targets` → 0 warning；无临时诊断代码。
+
+未验证（只能人工）：**动画时长与手感**（140 ms + ease-out 是选的值，不是量出来的）；真机上连续快速
+点选时的打断观感。
+
+### §14.55.6 面板六项（等宽分段器 / 延时「0」/ 鼠标样式 / 角标跟随 / (X, Y) / 乘号）
+
+**1. 分段器选项等宽** ✅ 成因：两处分段器每段的宽度取的是固定常量（单位 32、延时 30 dip 的"每格"），
+而选项文字长短不同（`0/3s/5s/10s`）⇒ 字长的段显挤、字短的显空；延时那四段还用"边界按比例取整"
+平铺，段宽本身就差 1 px。修法：量文字宽度只能在设备层（要 `IDWriteTextFormat`），所以由
+`d2d::segment_widths()` 按**最宽选项**量出文本宽度、加两侧各 `REGION_SEGMENT_PAD_DIP`(8 dip) 得到段宽，
+落成 `geometry::SegmentWidths { unit, delay }`；控制器在**打开面板那一刻量一次**（帧之外，不需 BeginDraw）
+存进 `self.segment_widths`，**视图与命中两条路都读这一个值** —— 布局因此仍是纯函数，也不会出现
+"画的位置和点的位置用了两个数"（这正是上一轮停手要避免的）。容器 = 段数 × 段宽 + 两侧内缩；
+量宽用的字体/字号/字重与绘制写成同一份参数（单位 mono 10 SEMI_BOLD 居中、延时 正文 11 NORMAL 居中）。
+拿不到时用 `SegmentWidths::fixed(scale)` 兜底（段宽 = 历史"每格" − 内缩 ⇒ 单位 29、延时 27，
+与旧尺寸同源），布局永远不需要 `Option`。
+**实测（96 DPI，真设备量宽）：单位段宽 29、延时段宽 34** ⇒ 单位容器 64（与旧值相同）、延时容器 142。
+证据：纯测试 `the_segment_widths_give_every_option_the_same_width`（两套不同宽度下每段都等于传入值、
+都在容器内、容器 = 段数×段宽+两侧内缩、右对齐钉住）+ `the_hit_test_reads_the_same_rectangles_the_drawing_does`
+（每段中心的 `target_at` 命中该段 ⇒ 绘制与命中同源）+ L4 真 GPU `the_painted_segment_matches_the_layout_width`
+（画出来的选中块跨度 == 布局段宽，±3 px；第一版数"连续蓝像素"被块内白字咬掉几个像素，改成数首尾跨度）。
+未验证：真机上"文字在各段内是否居中不挤"仍以肉眼为准（渲图已确认四段等宽）。
+
+**2. 延时选项「不延时」→「0」** ✅ `Delay::label()`；受影响的测试与文档同步。
+
+**3. 鼠标样式** ✅ 成因：面板上的光标一直走的是截图那份样式（十字/拖拽）。修法：在
+`update_cursor_shape` 入口加一道 `panel_cursor(point)`——面板开着且点落在面板内时由面板决定
+（控件 ⇒ `IDC_HAND`，面板内非控件 ⇒ `IDC_ARROW`），否则一行不改地走原逻辑；数字格按用户口径
+也算控件。**验证**：编译 + 全套测试；**真机手感与"面板外维持现状"只能人工看**。
+
+**4. 角标不跟随面板编辑（真 bug）—— 真实根因**：`length_unit` 在整个面板/浮层代码里**只有一处**
+被读（创建面板时 `preferences.label.length_unit`），而面板自己有一份 `unit` 状态：
+面板里切 dp/px **从不写回偏好**，角标读的却是偏好 ⇒ **两份真相**。修法：在鼠标与键盘两条
+入口应用面板变更之后调用 `sync_panel_unit()`（单位变了就写回偏好并 `publish_preferences`），
+与三个开关的 `Toggle` 走同一条"出会话的门"。**验证**：编译 + 全套测试；
+**"角标每帧跟随选区与单位"这条只有代码路径证据**（角标文本本来就每帧从视图重算，本轮补上的是
+单位来源唯一），真机观感请人工复核。
+
+**5. 位置格式改 `(X, Y)`** ✅ `LabelDisplay::text` 由 `({},{})` 改为 `({}, {})`；尺寸部分格式不变。
+`units.rs` 里两条按旧格式断言的测试按**新预期**更新（不是弱化）。
+
+**6. 尺寸卡片乘号 1.5× 加粗** ✅ `info_text_format_mut(true, 12.0, NORMAL, true)` →
+`(true, 18.0, BOLD, true)`；位置卡片的竖分隔未动。
+
+**本次行为变化**：① 延时首项文案「不延时」→「0」；② 角标位置文本多了逗号后的空格；
+③ 面板内鼠标样式改变（面板外不变）；④ 面板切单位现在会写回偏好（这是修复本身）。
+
+**未完成**：无（第 1 项已在本轮补齐，见上）。
+
+**未验证**：鼠标样式真机手感、第 4 项的角标真机观感、第 1 项未实现、以及本轮没有产出渲染图
+（执行者上下文耗尽）。
+
+### §14.55.7 角标行三点（间距 / 高度统一 / 分段器文本大写）
+
+```
+任务编号：§14.55.7
+状态：完成（验证通过）
+分支：工作区未提交
+新增：geometry.rs 的 REGION_TOGGLE_GAP_DIP = 8.0（具名间距）；units.rs 的 LengthUnit::segment_label()
+      （分段器显示文本的唯一来源）；geometry.rs 测试里三条断言 + 一条"大写/小写只差大小写"的不变量测试
+删除：REGION_UNIT_HEIGHT_DIP、REGION_SCALE_HEIGHT_DIP（高度改由"这一行的胶囊高度"单一来源派生）；
+      开关排布里写死的 `+ 4` 间距
+文案：分段器里的单位显示由 px/dp 改为 PX/DP；角标仍是小写 dp（LengthUnit::suffix() 未动，设计稿如此）
+```
+
+1. **三个开关之间的间距**：原来写死 `toggle_width + 4`，现在是 `REGION_TOGGLE_GAP_DIP = 8.0`（dip 已缩放）。
+   布局里那条"开关组与右侧控件至少 12 dip"的 `debug_assert!` **在 96 DPI 下没有触发**（458 条测试全绿即证据）；
+   实测余量未单独量出，**只知道仍满足底线**。
+2. **高度统一**：原来单位分段器 24 dip、缩放块 20 dip，而三个胶囊的高度其实是这一行的行高。
+   现在 `unit_height` 与 `scale_height` **都取 `toggle_row`**（同一来源），两个旧常量删除；垂直居中表达式
+   随之变成 `toggle_y`（偏移恒为 0）。分段器内缩仍是 3 dip（新增断言守住"高度变了内缩仍成立"）。
+3. **分段器文本大写**：`LengthUnit::segment_label()`（"PX"/"DP"）是**唯一来源**，`d2d::segment_widths()`
+   （量宽）与 `draw_segmented` 的调用点（绘制）**都读它** —— 这是关键陷阱：只改绘制会导致"量小写、画大写"，
+   文字被挤掉。**实测段宽未变**：等宽字体下 `PX` 与 `px` 推进宽度相同，所以单位段宽仍是 29、容器仍是 64；
+   延时用的是比例字体且文本没变，段宽仍 34。若将来把单位文本换成比例字体，宽度会自动跟着量宽结果走。
+
+验证（逐条命令、实际输出）：
+  - `cargo test -p snapclip-capture --lib -- --test-threads=1` → **458 passed / 0 failed / 67 ignored**（改前 457/0/67）
+  - `cargo test -p snapclip-app --features test-support --lib` → **131 passed / 0 failed / 7 ignored**
+  - `--ignored` L4 真 GPU：`the_panel_glyphs_land_in_the_boxes_they_were_given`、`the_painted_segment_matches_the_layout_width` → **ok / ok**
+  - 纯测试（随主套件跑）：`the_segment_widths_give_every_option_the_same_width`、
+    `the_hit_test_reads_the_same_rectangles_the_drawing_does`、
+    `the_segmented_control_capitalises_what_the_badge_keeps_lowercase` → **全绿**
+  - `cargo check --workspace --all-targets` → 0 error / 0 warning
+
+剩余（如实记账）：
+  - 96 DPI 下"开关组与右侧控件"的**实际余量**没有量出来，只确认仍 ≥ 12 dip。
+  - 更高 DPI（150%/200%）下延时分段器会随文字变宽、从右侧吃空间：真挤不下时开发期的 `debug_assert!`
+    会报出来（有意留的守门），届时该调的是设计参数而不是让控件重叠 —— **未在高 DPI 下实测**。
+  - 观感（间距是否"明显更大"、三者顶底是否齐平、大写是否好看）以人工看图为准。
+提交 SHA：见提交
+推送/tag：未推送（工作区改动）
+回退对象：§14.55.6 之上的未提交工作区
+```
+
+### §14.55.8 页脚分隔线 / 按钮文案 / 延时截图行为（用户三点）
+
+**1. 移除页脚上方的发丝分隔线**
+成因：`RegionPanelLayout.footer_line` 是纯装饰的一条 1 px 线（画在 `foot_y - foot_top`，也就是页脚上留白的最上沿）。
+修法：字段、算式、结构体字面量、绘制四处一并删除（全仓 `footer_line` 引用 **0**）。
+留白不变：那条线画在页脚留白**内部**，页脚的上下留白由 `REGION_FOOT_TOP_DIP`/`REGION_FOOT_BOTTOM_DIP` 决定，删线不动这两个值 —— 渲图确认按钮上方仍有留白，没有贴在一起。
+
+**2. 按钮文案「开始截图」→「确定」**
+成因：文案 4 字，按钮宽 92 dip；改成 2 字后按原宽会显得空。
+修法：文案改 `确定`；宽度改由**一个**常量 `REGION_FOOTER_BUTTON_WIDTH_DIP = 60.0` 派生（取消/确定同宽），删掉原来的 `REGION_CANCEL_WIDTH_DIP`/`REGION_START_WIDTH_DIP` 两个各自为政的值（避免"两个按钮宽度不一致"这种偏差有地方发生）。
+
+**3. 延时截图：改成"延时到点自动截图并贴图"（等同延时 N 秒后按 F6）**
+先查清 **F6 的实际链路**（这是本项的关键，`apps/snapclip`）：
+`WM_HOTKEY(F6)` 是注册在**贴图宿主线程**上的线程消息 → 消息泵 `route_message(null)` 判定为 `HandleHere` → `on_message` 的 `WM_HOTKEY` 分支 → `on_pin_hotkey` → `PinHome::take_selection()` 取图（这份图由**捕获侧**在框选提交时放进槽位）→ `pin_home_selection` 建贴图窗口、落在原屏幕位置。
+所以"贴图"的入口只有一个：**给宿主线程投一条 `WM_HOTKEY`**。
+修法（全程复用这条链路，一行贴图代码都没新写）：
+- 面板里选延时并确认 ⇒ 记 `pin_after_delay`、收起浮层、`arm_region_delay`（IME 在这条路上已经还给窗口了，等待期间不受影响）；
+- 计时器（仍是 `REGION_DELAY_TIMER_ID`）到点 ⇒ `on_region_delay` 以 `delay_in_flight` 标记启动一次会话（**抓的是等待之后那一帧**，这个性质不变）；
+- 帧到了 ⇒ 应用 `pending_region` 之后：`publish_selection("panel-delay-pin")` 把这一帧的区域像素放进 **F6 取图的同一个槽位**，再调新端口 `CaptureEventSink::on_pin_requested`；**不 paint、不 `show_overlay`、直接收尾**（用户正在别的窗口里操作，闪一下就是打扰）；
+- 外壳侧（`lib.rs`）把 `on_pin_requested` 接成 `PinWindowHost::pin_poster()` → `PostThreadMessageW(thread_id, WM_HOTKEY, PIN_HOTKEY_ID, 0)` ⇒ **与用户按 F6 完全同一条路**（消息、编号、`on_pin_hotkey`、贴图窗口都同一份代码）。
+- 状态收干净：`start_session` 只在"这次启动来自延时"时保留待截区域与贴图意图，用户手动起的会话会把两者清掉（等待期间改主意不会被执行上次的意图）；`fail()` 里也清；区域被会话拒绝时走 `DelayOutcome::Refused` ⇒ `on_failed(InvalidState)`，**报错而不是静默**。
+取舍说明：按用户的字面要求（"就是延时几秒后按下 F6"）走的是 **F6 语义 = 只贴图**，不写 PNG/剪贴板；若要"同时入剪贴板/历史"，把那一处 `publish_selection` 换成 `confirm()` 即可（一处改动）。
+
+验证（实际输出）：
+- `cargo test -p snapclip-capture --lib -- --test-threads=1` → **461 passed / 0 failed / 67 ignored**（新增 `delay_outcome_tests` 3 条：普通会话只显示、延时被接受要贴图、延时被拒绝要报错）
+- `cargo test -p snapclip-app --features test-support --lib` → **134 passed / 0 failed / 7 ignored**（新增 3 条：`on_pin_requested` 正好投递一次、没接投递器不 panic、投递失败只报错不外抛）
+- L4 真 GPU：`the_panel_glyphs` / `the_painted_segment_matches_the_layout_width` / `the_panel_backdrop_blurs_what_is_behind_it` 全 ok
+- 计时器守卫 `every_window_timer_id_is_distinct` ok（`REGION_DELAY_TIMER_ID` 仍是 `0x51_C0E3`）
+- `cargo check --workspace --all-targets` → 0 error / 0 warning
+- 离屏渲图：页脚上方无分隔线、按钮为「确定」且与「取消」同宽
+
+未验证（只能人工）：
+1. **延时的真机行为**（真的等到 N 秒、贴图窗口真的出现在原屏幕位置）——`RegisterHotKey`/`PostThreadMessageW`/窗口创建都要真实桌面，自动化只能验到"请求确实发出了"这一层；
+2. **"不闪一下"**：由"不调用 `show_overlay`"构造保证，但真实合成器行为要真机看；
+3. **等待期间操作别的窗口**时 IME/焦点是否如预期（面板关闭时已 `restore_ime_for_panel`，等待期间不碰 IME）。
+
+### §14.55.9 延时期间在选区正中显示倒计时（用户要求）
+
+用户原话：「点「确定」后如果有延时，面板消失，并在截图框正中间显示倒计时提示用户。」
+
+做法：
+- 面板确认延时后不再"收起浮层干等"：`arm_countdown(seconds)` 把浮层留在屏幕上，选区正中显示剩余
+  秒数。`Countdown` 只吃一个时钟读数 ⇒ 能用假时刻测；数字**向上取整**，不会出现"显示 0 却还在等"。
+- 每秒一跳：新计时器 `COUNTDOWN_TIMER_ID = 0x51_C0E4`（1000 ms），已纳入守卫测试
+  `every_window_timer_id_is_distinct`。推进只在本功能进行中，到点/取消立即 `KillTimer`（与光标闪烁同一约定）。
+- 到 0：停表 → 收浮层 → 走 §14.55.8 的"延时到点"路径（抓**等待之后那一帧** → 放进 F6 取图的槽位 →
+  `on_pin_requested` → 外壳投 `WM_HOTKEY`）⇒ 效果等同"延时 N 秒后按 F6"。
+- **鼠标穿透（两次返工，最终结论）**
+  - **用户实测三次**：① `WS_EX_TRANSPARENT` → 点击完全没反应；② 改成 `WM_NCHITTEST → HTTRANSPARENT`
+    → 仍然完全没反应（下层窗口没被激活、浮层自己也没反应）。
+  - **三个假设逐个查证**：
+    - **A（鼠标捕获握着）——排除**：全仓 `SetCapture`/`ReleaseCapture`/`GetCapture` **一处都没有**，
+      浮层从不抓鼠标，不存在"捕获窗口吃掉点击"。
+    - **C（倒计时状态读不到）——排除**：`hover.rs::nchittest_result` 确实读 `self.countdown`，且有纯测试钉着。
+    - **B（`HTTRANSPARENT` 对跨进程无效）——成立**：它的语义是把消息交给**同一线程**的下层窗口；
+      浮层是唯一一个窗口、没有同线程兄弟 ⇒ 这一击被**丢弃**，既不给别的应用、也不触发浮层 ——
+      这正是"点了完全没反应"的成因。仓库 `window.rs:67` 那句 "the lever we use" 指的是 **UIA 查询**，
+      不能外推到"用户点击跨进程穿透"。
+  - **真正的修法（结构性，复用仓库已有机制）**：倒计时期间把**窗口区域**收到选区
+    （`set_window_region(countdown_window_region(selection))`）—— 选区之外**窗口根本不存在**，所以点击
+    跨进程成立；滚动会话用的就是同一条 `set_window_shape`（`docs/33`），那里已验证它既能"让下层拿到滚轮、
+    又保住面板按钮"。三个出口（到点 / Esc 取消 / 失败）都经 `finish_countdown` 还原整块。
+    旧的 `HTTRANSPARENT` 规则与 `countdown_hit_test` **已删除**（它解决不了问题，留着会误导）。
+  - **顺带补的两个洞**：倒计时期间鼠标按下/抬起一律不处理（选区之内窗口仍在，否则会再起一次框选）；
+    键盘只认 Esc（取消）—— 等待的那几秒本应用可能仍是前台窗口，Enter/S 会把这次截图提前做掉。
+  - **代价（如实）**：选区之外不再是暗色遮罩而是**实时画面**（对延时反而更合理）；**角标在选区外，
+    倒计时期间会被裁掉不可见**。
+  - **证据**：纯测试 `the_countdown_narrows_the_window_to_the_selection`（区域 = 选区；退化选区返回 `None`，
+    不会把窗口收成不存在）；**L3 活桌面** `a_window_region_narrows_the_window_and_restores`（真窗口
+    `SetWindowRgn` 后 `GetRgnBox` == 给定矩形，还原后 `GetWindowRgn` 回到"无区域"）；全套 465 / 134 绿、
+    受影响的 L4 绿、0 warning。
+  - **仍需人工**：真机点别的窗口是否真的落到下层（机制已由 L3 证明，跨进程的"感觉"只能真机看）。
+- 取消：倒计时期间 Esc = 取消（停表、清待截区域与贴图意图），选区保留、用户可照常截。
+- 死代码清理：`arm_region_delay`（一次性延时计时器）、它的 `WM_TIMER` 分支、`REGION_DELAY_TIMER_ID`
+  与守卫列表里那一行全部删除 —— 倒计时接管了这条路径。
+- 绘制：`RenderView.countdown: Option<u32>`，在 `draw_to` 最上层用 96 dip 居中画在 `view.selection` 里
+  （字重用仓库既有的 `DWRITE_FONT_WEIGHT_SEMI_BOLD`，未新增导入）⇒ 不遮选区以外的东西；导出视图不带它。
+
+验证（实际输出）：
+- `cargo test -p snapclip-capture --lib -- --test-threads=1` → **465 passed / 0 failed / 69 ignored**
+- `cargo test -p snapclip-app --features test-support --lib` → **134 passed / 0 failed / 7 ignored**
+- 纯单测 3 条：向上取整（2999ms→3、1001ms→2、1ms→1、0→Fire）、沿时间轴走到截止时刻恰好 Fire、
+  给 0 秒也先显示 1 秒
+- L4 真 GPU：`the_countdown_number_paints_inside_the_selection` → ok（选区正中 >50 个亮像素，
+  选区两角仍是底色）；离屏 dump（400×300）肉眼确认：大号「3」落在选区正中、选区框与角标仍在
+- `cargo check --workspace --all-targets` → 0 error / 0 warning；计时器 id 守卫 → ok
+
+未验证（只能人工）：
+1. 真机计时与"到点自动贴图"需要真实桌面；自动化只到"贴图请求已投递"这一层（见 §14.55.8）。
+2. 鼠标穿透的真机手感：倒计时期间点别的窗口，点击是否真的落到下层（`HTTRANSPARENT` 是仓库既有的杠杆，但这条只能人工看）。
+3. **已知局限**：Esc 取消需要浮层仍是前台窗口。用户在倒计时期间点到别的窗口后，Esc 不会到达浮层
+   （没有为这段注册全局 Esc —— 那会占住所有程序的 Esc，代价更大）。要"随时可取消"的话，可以复用
+   滚动会话那套 `register_scoped` 在倒计时期间临时注册全局 Esc。
+
+#### §14.55.9.1 返工：区域内含「选框环 + 角标 + 倒计时小框」（用户报"截图框不能消失"）
+
+**成因**：上一版为了跨进程穿透，把倒计时期间的窗口区域缩成"包住数字的 168 dip 小方框" ⇒
+选框线、手柄、角标、遮罩全被裁掉，用户看到的是"截图框消失了"。
+
+（先记三条被实测否掉的路，免得有人再试：
+`WS_EX_TRANSPARENT` 是绘制次序位，不改变命中测试；`WM_NCHITTEST -> HTTRANSPARENT` 只把消息交给
+**同一线程**的下层窗口，浮层是唯一窗口、没有同线程兄弟 ⇒ 那一击被丢弃（用户实测"点了完全没反应"）；
+收窄到"整个选区"也不成立，选区常覆盖大半屏，用户正是要在那块里点别的窗口。）
+
+**做法**：窗口区域 = **选框环** + **角标矩形** + **倒计时小框**，三者之外（包括选区内部）窗口不存在。
+- 新类型 `win::window::WindowRegion { Rect(Rect), Ring { outer, inner } }`；
+  `region_from_pieces` 用 `CreateRectRgn` + `CombineRgn(RGN_DIFF)` 造环、`RGN_OR` 合并，成功后把
+  `HRGN` 交给 `SetWindowRgn`（系统接管，失败才 `DeleteObject`）。
+- `set_window_region` 从"一个 `Option<Rect>`"改成"`&[WindowRegion]`"；空切片 = 还原整块窗口
+  （`SetWindowRgn(hwnd, null, TRUE)`）。滚动会话的 `set_window_shape` 改为委托，DELETE 掉重复的 GDI 代码。
+- 计算仍是**纯函数**：`session::countdown_window_pieces(selection, badge, dpi) -> Vec<WindowRegion>`；
+  环宽 `COUNTDOWN_RING_REACH_DIP = 8`（盖住框线并让手柄圆点完整），小框 `COUNTDOWN_BOX_DIP = 168`。
+  三个出口（到点 / Esc / 失败）都经 `finish_countdown` → `set_window_region(&[])` 还原。
+
+**证据**：
+- 纯测试 `the_countdown_keeps_only_the_ui_that_is_on_screen`：环外扩/内缩且同心、环宽 ≥8、角标在集合里、
+  小框以选区中心为中心且小于选区一半、内孔里的探针点不落在小框里、空选区返回空集合。
+- **L3 活桌面** `a_combined_region_keeps_the_frame_ring_and_drops_the_middle`（真窗口 + 真 GDI）：
+  `region_from_pieces` → `SetWindowRgn` → `GetWindowRgn` 副本 + `PtInRegion` 断言
+  **选框环在内 / 选区正中不在内 / 角标在内 / 倒计时小框在内**；还原后 `GetWindowRgn == 0`。
+- `cargo test -p snapclip-capture --lib -- --test-threads=1` → **465 passed / 0 failed / 70 ignored**；
+  app **134 passed**；受影响的 L4（倒计时数字、面板图形、分段器滑动）ok；workspace 0 warning。
+
+**取舍（如实）**：区域里没有"遮罩暗色"和"冻结画面"，所以倒计时期间**选区之外是实时画面**（这同时也是
+点击能穿过去的原因）。要连遮罩与冻结画面一起保留，唯一的路是给"框层"另开一个 **layered + color-key
+的点击穿透小窗口**（约 100 行）——**本次没有做**，需要时再开。
+
+**未验证（只能人工）**：① 倒计时期间点/拖别的应用，点击是否真的落到下层（机制有活桌面证据，跨进程手感只有真机能看）；
+② 环宽 8 dip 是否把手柄圆点完整包住（渲图上看不出来，需要在真机上贴边看手柄有没有被切）。
+
+### §14.55.9.2 倒计时 HUD：画出来的集合必须等于窗口区域覆盖的集合（用户报"灰色块"）
+
+```text
+问题：倒计时期间"选框边框那一圈"和"数字背后"各有一块灰底（用户截图报告）。
+成因：§14.55.9.1 把**窗口区域**收窄成三块（选框环 + 角标 + 倒计时框），但**渲染器照旧**在
+      整个帧上画"冻结画面 + 遮罩" —— 于是窗口里那三块位置看到的就是冻结画面的灰色残影：
+      环上是一条灰带、数字后面是一个灰方块。
+修法：`draw_layers` 里加一条**倒计时 HUD 早退**（与 scroll 会话那条同一写法）：
+      1) `Clear(完全透明)`；
+      2) 只画 `draw_selection_frame(view, FrameMarks::EDITING)` —— 框线、手柄、角标由它一次画全
+         （角标由 `marks.size_label` 决定，不需要第二处调用）；
+      3) 只画倒计时数字（`countdown_brush`：主题色 @ 80%，见 §14.55.9）；
+      4) `return`，于是冻结画面、遮罩、遮罩着色、窗口提示/吸附预览、快捷键提示、放大镜、
+         面板（此刻已收起）一律不画。
+      末尾原来那段 L3.8 数字绘制已删除 —— 数字只在一个地方画。
+不变量：**画出来的集合 == 窗口区域覆盖的集合**，而且是**结构上**成立（早退，而不是给每一层
+      加 `if`）：将来往渲染器里加新图层，HUD 不会因为漏加判断而重新长出灰底。
+      其余时刻渲染路径逐字节未变 —— 分支只由 `view.countdown.is_some()` 决定。
+```
+
+验证（逐条命令、实际输出）：
+  - `cargo test -p snapclip-capture --lib -- --test-threads=1` → **465 passed / 0 failed / 71 ignored**
+  - `cargo test -p snapclip-app --features test-support --lib` → **134 passed / 0 failed / 7 ignored**
+  - `cargo check --workspace --all-targets` → 0 error / 0 warning
+  - 新增 L4 真 GPU `the_countdown_hud_paints_only_the_frame_the_badge_and_the_number`（棋盘背景）→ **ok**，
+    四条断言：① 数字仍在（选区中心 >50 个主题色像素）；② **环带里、不在框线上的点 alpha == 0**
+    （核心断言：没有灰底）；③ 框线仍在（环带靠近选区边缘处 alpha > 0）；④ 选区内部（数字框之外）
+    alpha == 0（冻结画面/遮罩都不在）。
+  - 回归：`the_countdown_number_paints_inside_the_selection` / `the_panel_glyphs_land…` /
+    `the_painted_segment_matches_the_layout_width` / `the_panel_backdrop_blurs_what_is_behind_it` /
+    `a_combined_region_keeps_the_frame_ring_and_drops_the_middle` → 全 **ok**
+    （后四条渲的是**普通帧**，它们仍全绿 = 别的图层没被动到）。
+  - 落盘核对：把 HUD 帧合成到纯绿上（`target/hud.png`）→ 只看到框线、手柄、角标、数字；
+    绿色处即完全透明，没有任何灰块。
+未验证：
+  1. 真机观感（倒计时期间屏幕上只剩框、手柄、角标、数字，且点击落到别的应用）——只能人眼确认；
+  2. §14.55.9.1 那条遗留：环宽 8 dip 是否把手柄圆点完整包住（渲染图看不出来，需贴着四角看）；
+  3. 遮罩暗色与冻结画面在倒计时期间不再出现（这是取舍，不是缺陷；要保留需另开 layered 小窗口）。
+
+### §14.55.9.3 倒计时期间拖边框改大小（光标 + 手势 + 捕获 + 两处跟随）
+
+```text
+需求（用户）：倒计时期间鼠标放到截图框边框上要切换成改大小光标，并且可以拖动边框改变截图框大小。
+范围：只动倒计时 HUD；普通截图状态的手柄拖拽与光标**一行未改**（映射抽出后仍由同一函数服务）。
+
+光标：把"命中结果 → 光标"从 `update_cursor_shape` 里抽成 `input::selection_cursor`
+      （普通状态与 HUD 共用，避免两处各写一遍之后走偏）；HUD 用 `input::countdown_cursor_while`：
+        * 边框/手柄上（命中答 `Resize`）→ 对应的 `IDC_SIZENWSE/NESW/NS/WE`；
+        * 其余（内部/外面/新建）→ `IDC_ARROW` —— HUD 的窗口只在选框环上存在，指针在别处时
+          它已经不属于这个窗口；
+        * **拖拽中锁定方向**（`countdown_handle`）：拖动时指针会离开边框，按命中结果算光标会
+          从改大小跳回箭头，所以拖着自己那一方向时一直显示那个光标（左右两条边共用水平光标）。
+
+手势：完全复用既有那套 —— `SelectionSnapshot::hit_test` 早就对**边框**（`hit_slop`）与**手柄**
+      都答 `Resize`，`CaptureSession::begin_drag` 是同一个手势机，`pointer_moved_with_constraints`
+      负责几何（Shift 仍然约束比例）。这次只新增"允许哪一种"的入口判断：
+      倒计时期间按在边框/手柄外一律不处理（不再起框选、也不移动选区）。
+
+捕获（全仓第一次 `SetCapture`）：HUD 的窗口只在选框环上存在，用户把手柄往**外**拖时指针立刻
+      离开窗口 ⇒ 收不到 `WM_MOUSEMOVE`，拖动会中途断掉。
+        * 入口唯一：`input::begin_countdown_resize` 里的 `SetCapture(self.window)`；
+        * 出口统一：`release_countdown_capture()`（幂等）→ 由 `end_countdown_resize`（松手）、
+          `finish_countdown`（Esc 取消 / 到点）与 `release_session`（取消 / 失败 / 完成，
+          三个漏斗都经它）调用 ⇒ 结构上不存在"永远抓着鼠标"的路径。
+
+两处跟随（缺一不可）：
+  1. **到点贴图用的区域**（`pending_region`）：不跟着更新的话，用户改了框也白改 —— 贴出来的
+     还是点「确定」那一刻的区域。松手时经 `Countdown::…`→`countdown_after_resize` 一起重算
+     （纯函数，返回"贴图区域 + HUD 窗口区域"两份）。
+  2. **HUD 的窗口区域**：拖动**每一帧**都按新选区重算（`sync_countdown_region`）。只在松手时
+     更新的话，往外拖的过程中框线已经跑到窗口外面，会被裁掉 —— 那比多调几次 `SetWindowRgn` 糟。
+     代价：每次 `WM_MOUSEMOVE` 一次 `SetWindowRgn`。
+  已知小瑕疵：区域里的角标矩形取的是**上一帧**的 `label_badge`（它由渲染时算出），所以拖动它可能
+  有一帧被裁；16 ms 级，肉眼未察，记在这里。
+
+键盘：仍是"只认 Esc"（`on_key_down` 里那条早退未动）⇒ 拖拽期间 Enter/S 不会把这次截图提前做掉；
+      拖拽期间倒计时照常走（`Countdown` 没被重置）。
+```
+
+验证（逐条命令、实际输出）：
+  - `cargo test -p snapclip-capture --lib -- --test-threads=1` → **468 passed / 0 failed / 72 ignored**
+    （本次 +3 条纯测试：`the_countdown_only_offers_a_resize_cursor_on_the_frame`、
+    `resizing_during_the_countdown_moves_the_pin_region_with_the_frame`、
+    `the_cursor_stays_on_the_dragged_direction_while_dragging`）
+  - `cargo test -p snapclip-capture --lib -- --ignored --test-threads=1 capture_is_taken_and_released_on_a_real_window`
+    → **ok**（活桌面真窗口：起手无捕获 → `SetCapture` 后 `GetCapture()==hwnd` → 重复捕获仍是自己
+    → `ReleaseCapture()` 成功后回到无捕获）
+  - `cargo test -p snapclip-app --features test-support --lib` → **134 passed / 0 failed / 7 ignored**
+  - `cargo check --workspace --all-targets` → 0 error / 0 warning
+  - 纯测试钉住的两件关键事：① HUD 里**只有** `Resize` 配得上改大小光标（其余三种命中都是箭头），
+    且普通状态那套映射的结构原样保留（同方位同光标、正交方位不同、空白与新建都是十字）；
+    ② 拖完之后 `pending_region` 是**新选区**（并断言"新旧两份区域确实不同"，否则测试没有区分力），
+    HUD 窗口区域与 `countdown_window_pieces(new)` 逐项相等，空选区不给贴图区域。
+未验证：
+  1. **真机手感**：拖到窗口外仍能继续拖（捕获）、松手后光标与捕获都正常 —— 只能人眼确认；
+  2. **每一帧 `SetWindowRgn` 是否看得出闪**：机制上正确（框线始终在窗口内），但合成器观感只有真机能看；
+  3. 拖动时角标那一帧的裁切（见上"已知小瑕疵"）。
+
+### §14.55.9.4 倒计时到点那一下灰底
+
+**现象**：用户实测——倒计时结束的那一刻，截图框边框上会突然出现一块灰色背景，随后消失，再贴图。
+
+**成因**：到点的顺序是「清掉倒计时状态 → 还原整块窗口区域 → 隐藏窗口」。中间存在一瞬
+**窗口仍然可见、而倒计时已经是 `None`**：倒计时 HUD 的早退路径不再生效，渲染器按**普通帧**
+画了一次（冻结画面 + 遮罩）⇒ 那一下灰底。
+
+**修法（顺序，不是补丁）**：`finish_countdown` 只做**状态**（停表、还回鼠标捕获、清倒计时），
+**不再碰窗口区域**；区域与可见性由调用方按各自语义排序：
+
+| 出口 | 顺序 |
+| --- | --- |
+| 到点 | `hide_overlay()` → `finish_countdown()` → `set_window_region(&[])` → 走既有延时抓帧+贴图（headless） |
+| Esc 取消 | `finish_countdown()` → `set_window_region(&[])` → `invalidate()`（窗口本来就该继续显示普通画面） |
+| 抓帧失败 | `finish_countdown()` → `set_window_region(&[])` |
+
+**不变量**：不存在"窗口可见 + 倒计时已结束 + 区域已还原"的组合。
+
+**证据**：
+- 纯回归：`cargo test -p snapclip-capture --lib -- --test-threads=1` → **468 passed / 0 failed / 72 ignored**；
+  `cargo test -p snapclip-app --features test-support --lib` → **134 passed**；`cargo check --workspace --all-targets` → 0 warning。
+- **L3 活桌面**（新增）`hiding_before_clearing_the_region_leaves_no_visible_frame`：真窗口 → 设区域 →
+  `ShowWindow(SW_HIDE)` → `SetWindowRgn(NULL)`：断言隐藏后 `IsWindowVisible == 0`、区域已还原
+  （`GetWindowRgn == 0`）、收尾后仍不可见 ⇒ **ok**。
+- 受影响的 L4（HUD 渲染、区域环、捕获释放、倒计时数字落位）全部 ok；延时贴图链路未改
+  （`panel-delay-pin` → `on_pin_requested` → 外壳投 `WM_HOTKEY`）。
+
+**未验证**：真机那一下"是否真的不闪"只能人眼看；L3 测试钉的是顺序的**结果**（隐藏 + 区域还原），
+**没有**观测到两件事之间的交错本身 —— 那一点由代码结构保证（同一个函数内，隐藏先于还原）。
+
+### §14.55.9.5 倒计时结束那一刻的"暗灰一圈"：把顺序变成数据，并让日志回答
+
+**用户报告**：倒计时结束时框线外侧仍有一圈暗灰（像"边框的边框"），然后消失、再贴图。
+
+**先核实了两条最可能的解释，都不成立**：
+- `finish_countdown()` 里**没有** `invalidate()`（只有 `KillTimer` + 还回鼠标捕获），`hide_overlay()` 里也**没有**
+  `paint_now`/`UpdateWindow`（只有 `ShowWindow(SW_HIDE)` + `restore_foreground`）⇒"清状态触发重绘"不成立；
+- 延时那次会话**本来就是 headless**：`DelayOutcome::Pin` 分支在 `paint_now()` / `show_overlay()` 之前就
+  `return`（§14.55.8），所以"延时会话闪一帧普通画面"也不成立；
+- HUD 路径本身是 `Clear(透明)` 后只画框/角标/数字（§14.55.9.2），表面里没有可露出的灰块。
+
+静态上找不到"在那一瞬画了一帧普通帧"的路径 ⇒ 这次不再靠推测，做两件可验证的事：
+
+1. **把退出顺序做成数据**（`overlay/session.rs`）：`CountdownExit { Fire, Cancel, Fail }` +
+   `ExitStep { Hide, ClearCountdown, RestoreRegion, Repaint }` + `countdown_exit_steps(exit)`，
+   三个出口统一经 `leave_countdown(exit)` 执行：
+   - 到点 / 失败 = `Hide → ClearCountdown → RestoreRegion`，**不含 Repaint**（"先退出可见状态，
+     再退出 HUD 渲染模式"）；
+   - Esc 取消 = `ClearCountdown → RestoreRegion → Repaint`（窗口要继续可见，最后重画一帧普通画面）。
+   顺序一旦是数据，就能被测试钉住**交错先后**（上一轮只断言了结果，抓不到中间那个瞬间）：
+   `leaving_the_countdown_hides_the_window_before_it_stops_the_hud` 断言 Fire/Fail 的
+   `index(Hide) < index(ClearCountdown)`、且没有 `Repaint`；Cancel 没有 `Hide`、`Repaint` 在最后。
+   顺带修掉一个真缺口：失败路径以前**只**还原区域、不隐藏窗口 ⇒ 倒计时期间失败会把冻结的浮层留在屏上。
+2. **让日志回答它**：控制器加了 `frames_normal` / `frames_hud` 两个计数（在 `render()` 里按
+   HUD / 普通分别自增），并在 `arm_countdown` 记下基线；退出时打印
+   `countdown exit=… normal_frames_since_start=N hud_frames_since_start=M`。
+   **`N > 0` 就意味着过渡期间真的画过普通帧**（那就能顺着它定位是谁）；`N == 0` 则说明不是普通帧，
+   而是合成器残留或别的东西，需要换方向查。
+
+**验证（真跑）**：`cargo test -p snapclip-capture --lib -- --test-threads=1` → **469 passed / 0 failed /
+73 ignored**；`cargo test -p snapclip-app --features test-support --lib` → **134 passed**；
+L3 `hiding_before_clearing_the_region_leaves_no_visible_frame`、`capture_is_taken_and_released_on_a_real_window`、
+L4 `the_countdown_hud_paints_only_the_frame_the_badge_and_the_number` → 全 ok；
+`cargo check --workspace --all-targets` → 0 error / 0 warning。
+
+**未验证（只能真机）**：那一下暗灰是否真的消失。下次复现请把
+`[snapclip][capture] countdown exit=… normal_frames_since_start=…` 这一行发出来 —— 它会把"是不是普通帧"
+这件事从猜测变成读数。
+
+### §14.55.9.6 倒计时期间结构上禁止普通帧 + 贴图记账把"关闭"与"失败"分开
+
+**用户实测日志**（关键行）：
+
+```
+[snapclip][capture] countdown exit=Fire normal_frames_since_start=55 hud_frames_since_start=185
+```
+
+⇒ 那 3 秒里画了 **185 帧 HUD**、也画了 **55 帧普通帧**；灰底就是普通帧露出来的（时间上穿插，所以看着像"闪一下"）。
+
+**任务 1：让倒计时期间结构上不可能画普通帧**
+
+1. **先把"可见性"这一维量出来**：新增 `frames_normal_visible`（普通帧里 `IsWindowVisible(hwnd)` 为真的
+   那些）与 `frames_suppressed`（被闸压掉的请求），一起进同一条日志：
+   `normal_frames_visible_since_start=… suppressed_frames_since_start=…`。
+   **那 55 帧到底是在可见时还是隐藏后画的，只能由下一次复现的日志回答**：
+   - `normal_frames_visible_since_start > 0` ⇒ 就是元凶，已被下面的闸压住（读数应变成 0）；
+   - 等于 0（55 帧全在隐藏之后）⇒ 那不是普通帧，得换方向查合成器/DWM。
+2. **结构闸**（不靠"谁别 invalidate"）：`countdown_hud` 在 `arm_countdown` 置位（`session.rs:100`）、
+   在 `finish_countdown` 清除（`session.rs:177`）—— 而 `finish_countdown` 由
+   `ExitStep::ClearCountdown` 触发，它在三个出口的顺序表里都**排在 `Hide` 之后**（到点/失败）
+   或**排在 `Repaint` 之前**（Esc 取消）⇒ "解除点一定在窗口隐藏之后"是结构性的。
+   渲染入口用纯函数 `frame_kind(countdown_hud, countdown_seconds)`（`render_submit.rs:468`）决定
+   `Hud` / `Normal` / `Suppressed`；`Suppressed` 时**直接 return、不画**（并计数）。
+3. 目标读数：复现时那条日志里 **`normal_frames_visible_since_start=0`**。
+
+**任务 2：贴图"没能创建"的记账 bug**
+
+- 成因：`PinEvent` 只有 `Closed` 一种事件，而它被**正常关闭**与**创建失败**两条路共用（失败分支也调
+  `state.report_closed(id)`）；`drain_events()` 又只回一个条数，shell 便把它打成
+  `pin: {n} 张贴图没能创建` ⇒ `created` → `destroyed` 之后也会报"没能创建"，日志长期说谎。
+- 修法：`PinEvent` 拆成 `Created` / `Closed` / `Failed`（失败分支改调 `report_failed`，上屏处新增
+  `report_created`）；新增纯函数 `summarize() -> PinReport { created, closed, failed }`；
+  `drain_events()` 返回 `PinReport`；shell 日志改说人话：`pin: 创建 1 张、已关闭 1 张`，
+  只有 `failed > 0` 才追加 `，N 张没能创建`。顺带改掉队列满文案里"这条通道只应承载创建失败"这句过期判断。
+- 回归测试：`the_pin_report_separates_created_closed_and_failed`（创建+关闭 ⇒ failed == 0；Failed ⇒ 计入）。
+
+**证据**（真跑）
+
+- `cargo test -p snapclip-capture --lib -- --test-threads=1` → **470 passed / 0 failed / 73 ignored**
+  （+1 `the_countdown_gate_never_paints_a_normal_frame`）
+- `cargo test -p snapclip-app --features test-support --lib` → **135 passed / 0 failed / 7 ignored**
+  （+1 `the_pin_report_separates_created_closed_and_failed`）
+- `--ignored` 活桌面/真 GPU：`the_countdown_hud_paints…`、`the_countdown_number_paints…`、
+  `hiding_before_clearing_the_region…`、`a_combined_region_keeps…`、`capture_is_taken_and_released…` **全 ok**
+- `cargo check --workspace --all-targets` → **0 error / 0 warning**；临时诊断代码 0
+
+**未验证**：灰底是否真的消失（要下一次复现的日志 + 肉眼）；那 55 帧的可见性结论同样在那条日志里。
+
+
+### §14.55.9.7 倒计时期间的遮罩暗色层（另一个 layered 窗口）
+
+**诉求**：倒计时期间把遮罩暗色加回来（此前为了跨进程点击穿透，主浮层只留框线/手柄/角标/数字，其余是实时画面）。
+
+**为什么不能加在主浮层上**：主浮层是 DirectComposition 窗口（`WS_EX_NOREDIRECTIONBITMAP`），不能 layered。`win/window.rs` 那张实测对照表：`WS_EX_TRANSPARENT` 单独无效（只是绘制次序位）、`WS_EX_LAYERED | WS_EX_TRANSPARENT` 只对 **layered** 窗口才真的跨进程穿透、`HTTRANSPARENT` 只同线程。
+
+**方案**：`overlay/dim_layer.rs` 另开一个普通 layered 窗口当遮罩层。
+
+- **样式位**：`WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`
+  —— 前两位负责跨进程穿透，`NOACTIVATE` 让它不抢焦点、不吃键盘，`TOOLWINDOW` 让它不进任务栏/Alt+Tab。
+- **内容**：整屏大小、32bpp premultiplied DIB，`UpdateLayeredWindow(ULW_ALPHA)` 提供；**只填一次**（之后每次显示只是换内容指针，不重填 33 MB）。
+- **形状**：窗口区域 = 整屏减去选区，直接复用 `WindowRegion::Ring` + `region_from_pieces`。
+- **颜色**：从主浮层遮罩自己的常量推导，不另调一套观感 —— 先 `MASK_ALPHA`(0.45) 的黑、再 `MASK_TINT_ALPHA`(0.10) 的主题色，等价单层参数
+  `α = 1 − (1−0.45)(1−0.10) = 0.505`、`色 = (0.10/α)·ACCENT ≈ 0.198·ACCENT`。有等价性测试（单层 vs 两层逐通道差 ≤1）。
+- **排除出截图：已确认** —— L3 活桌面测试在真窗口上断言
+  `GetWindowDisplayAffinity == WDA_EXCLUDEFROMCAPTURE`（0x11）。否则延时贴图会把遮罩截进去。
+- **生命周期**：懒创建；随倒计时显示，三个出口都经 `finish_countdown` → `hide()`；控制器销毁时 `Drop` 里 `DestroyWindow`。
+- **洞的更新**：拖动改框时每帧一次（`update_countdown_dim` → `SetWindowRgn`），与主浮层框环同频；不重填 DIB。
+- **层级**：两者都是 TOPMOST，所以显示遮罩后把主浮层重新提到最上（`SetWindowPos(HWND_TOPMOST, NOACTIVATE|NOMOVE|NOSIZE)`），否则选框环的外半边会被压暗。
+
+**冻结画面：没做**（并说明理由）。冻结帧在 D3D11 纹理里（3840×2160×4 ≈ 33 MB）。要放进 layered DIB 需要一次 GPU 回读 + 上传，发生在"倒计时刚开始"那一刻（数十毫秒级卡顿），还得把纹理接进控制器；换来的画面实时屏幕已经提供。暗色层本身已满足诉求。
+
+**证据**（真跑）
+
+- `cargo test -p snapclip-capture --lib -- --test-threads=1` → **474 passed / 0 failed / 74 ignored**
+  （+4 纯测试：样式位组合、区域开洞、单层/两层等价、premultiplied 填充）
+- `--ignored` 活桌面 `the_dim_layer_is_a_click_through_layered_window_excluded_from_capture` → **ok**
+  （真窗口：五个样式位齐全、`GetWindowDisplayAffinity == WDA_EXCLUDEFROMCAPTURE`、显示后可见、隐藏后不可见）
+- 受影响的 L4 `the_countdown_hud_paints…` / `the_countdown_number_paints…` → **ok**
+- `cargo test -p snapclip-app --features test-support --lib` → **135 passed**；`cargo check --workspace --all-targets` → **0 warning**
+
+**未验证**：真机的观感（暗色浓淡是否与正常截图态一致）与"点击确实落到别的应用"的手感 —— 只能人眼。另：layered 窗口按设计截不到，所以这次**没有**渲染图。
+
+#### §14.55.9.7 的撤回：这个环境不合成 layered 遮罩窗口（**该结论已被 §14.55.9.8 证伪，勿引用**）
+
+为"倒计时期间把遮罩暗色加回来"实现过一个独立的 layered 窗口（`WS_EX_LAYERED | WS_EX_TRANSPARENT |
+WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`，整屏 32bpp premultiplied DIB + `UpdateLayeredWindow(ULW_ALPHA)`，
+窗口区域开洞、"排除出截图"）。当时的结论写成"它在这个环境里根本不上屏"，**该结论是错的**（观测进程未做 DPI 感知 + 区域用了屏幕坐标，见 §14.55.9.8）。
+
+| 读数 | 值 | 说明 |
+| --- | --- | --- |
+| `is_window` / `visible` / `rect` | `true` / `true` / `(0,0,3840,2160)` | 窗口真的建了、真的可见 |
+| `ex_style` | `0x080800A8` | LAYERED/TRANSPARENT/TOPMOST/TOOLWINDOW/NOACTIVATE 五位齐全 |
+| `affinity` | `0x11` = `WDA_EXCLUDEFROMCAPTURE` | 已排除出截图 |
+| `dib` / `first_px` | `(3840,2160)` / `[22,12,3,129]` | DIB 真的填了、alpha=129 |
+| `ulw` / `rgn_ok` / `hole` | `(true,0)` / `true` / `(false,true)` | ULW 与区域都成功，洞没算反 |
+| **屏幕像素（BitBlt，带 `CAPTUREBLT`）** | `mean_b` **240.4 → 240.4**，640×480 截图逐字节相同 | **屏幕上什么都没出现** |
+
+另排除：`WS_EX_TRANSPARENT`（摘掉不变）、窗口区域（`SetWindowRgn(NULL)` 不变）、
+`WDA_EXCLUDEFROMCAPTURE`（临时 `WDA_NONE` 不变）、显示后再次 `UpdateLayeredWindow`（成功但不变）。
+
+**处理**：模块、它的测试、倒计时路径上的三处调用全部删除（**470 passed / 0 failed / 73 ignored**，
+回到加遮罩层之前的基线）。倒计时期间维持"实时画面 + 框线/手柄/角标/数字 + 全区域跨进程点击穿透"。
+
+**留给以后**：这个环境为什么不合成它，未查明（同进程的 DirectComposition 浮层显示正常）。
+若将来要"遮罩 + 穿透"兼得，备选是把遮罩画回主浮层并接受"遮罩区域内点击被吃掉"，
+或换一块真正参与合成的窗口类型 —— 但先要解释清这次现象，不盲试。
+
+#### §14.55.9.7 实测：遮罩层"看不见"的定位（真机测量，非推断）
+
+用户实测倒计时期间选区外**没有**暗色遮罩；框层读数正常（`normal_frames_since_start=0`、`hud_frames_since_start=666`、
+倒计时与贴图都成功）。按要求**先量再改**：给 `DimLayer` 加了永久诊断（每次倒计时开始打印一次，不是每帧），
+并在活桌面 L3 测试里按产品同一路径创建它、把每个字段读回来断言。
+
+**测量输出（这台机器，真窗口）**：
+
+```
+DIM hwnd=0x1f14f8 is_window=true visible=true rect=(0,0,640,480)
+    ex_style=0x080800A8 style_complete=true affinity=0x11(ok=true)
+    dib=(640,480) first_px=[22, 12, 3, 129] ulw=Some((true, 0))
+    rgn_ok=true hole=Some((false, true)) shown=1
+```
+
+逐条含义（每个字段都是"到底有没有真的显示出来"的直接证据）：
+
+| 字段 | 含义 | 读数说明什么 |
+| --- | --- | --- |
+| `is_window` / `visible` | 窗口存在且可见 | ✓ 创建与显示都发生了 |
+| `rect=(0,0,640,480)` | `GetWindowRect` | ✓ 位置与大小真的等于传入的屏幕区域 |
+| `ex_style=0x080800A8` + `style_complete` | `GWL_EXSTYLE` 实际值 | ✓ `LAYERED\|TRANSPARENT\|TOPMOST\|TOOLWINDOW\|NOACTIVATE` 一位不少 |
+| `affinity=0x11(ok)` | `GetWindowDisplayAffinity` | ✓ 已排除出截图（否则延时贴图会把遮罩截进去） |
+| `dib=(640,480)`、`first_px=[22,12,3,129]` | DIB 尺寸与首像素（premultiplied BGRA） | ✓ **DIB 真的填了**、alpha=129（不是全透明） |
+| `ulw=Some((true,0))` | `UpdateLayeredWindow` 的返回值与 `GetLastError` | ✓ 返回成功 |
+| `rgn_ok=true` | `SetWindowRgn` 的返回值 | ✓ 区域设置成功 |
+| **`hole=Some((false,true))`** | 交给系统**之前**用 `PtInRegion` 自检：选区正中是否被挖掉、选区外一点是否被覆盖 | ✓ 洞**没有算反**（正中不在区域内、外侧在区域内） |
+| `shown=1` | 显示计数 | ✓ 这段代码真的跑到了 |
+
+**结论（如实）**：在这台机器上，这个遮罩层从窗口状态到 DIB 内容到区域形状**全部正确**，我无法复现"看不见"。
+所以问题只可能在**产品侧接线或环境差异**，而不是模块本身；而这一点只有产品那次运行的诊断行能回答。
+
+**为什么问题可能落在产品侧**：`show_countdown_dim()` 只在 `arm_countdown` 里调用一次（`session.rs:121`），
+`update_countdown_dim()` 由拖动改框每次移动调用（`input.rs:1192`）；`paint_now()` 全仓只有一处（会话显示时），
+**不是** `hud_frames=666` 的来源（≈222/s 的真实来源仍未解释，故只记为待观测项，不改）。
+
+**下一次产品运行如何读这行**（这就是把它做成永久诊断的原因）：
+
+| 读数 | 说明 | 下一步 |
+| --- | --- | --- |
+| 完全没有这一行 | `arm_countdown`/`show_countdown_dim` 没跑到 | 查 `arm_countdown` 的调用链 |
+| `visible=false` 或 `shown=0` | 没显示 | 查 `ShowWindow`/`SWP_SHOWWINDOW` |
+| `affinity=0` | 排除截图失败（`GetLastError` 带原因） | 查 DWM 合成是否开启 |
+| `first_px=[0,0,0,0]` | DIB 没填 | 查 `fill_premultiplied`/`CreateDIBSection` |
+| `ulw=(false, …)` | `UpdateLayeredWindow` 失败 | 按 `GetLastError` 查 |
+| `rgn_ok=false` | 区域设置失败 | 查 `region_from_pieces` 的 HRGN |
+| `hole=(true, true)` | 洞算反了（正中仍被覆盖） | 查 `dim_region` 的 outer/inner |
+| 以上全部正确、屏幕仍无遮罩 | 环境/层级问题（例如其上有另一个 topmost 窗口） | 查 Z 序：`GetWindow(GW_HWNDPREV)` |
+
+**证据边界**：layered 窗口按设计**截不到**（`WDA_EXCLUDEFROMCAPTURE`），所以这一项**没有渲染图**，也不打算用假图代替；
+真机观感与"跨进程穿透手感"只能人眼。
+
+### §14.55.9.8 差分实验：遮罩层"看不见"的根因（纠正 §14.55.9.7 的结论）
+
+**结论先行**：§14.55.9.7 末尾那句"这个环境不合成 layered 窗口"是**错的**。真正的原因是两处**配置缺陷**：
+
+1. **观测无效**：`cargo test` 的进程默认不是 DPI 感知的 ⇒ `CreateWindowExW` 的坐标被虚拟化，而屏幕 `BitBlt` 取的是物理像素 ⇒ 取样矩形与窗口错位，量到的其实是桌面。上一轮"显示前后逐字节相同"就是这么来的。
+2. **坐标系错位**：`SetWindowRgn` 的矩形是**客户区坐标**。上一版把屏幕坐标直接递进去 ⇒ 区域整个落在窗口外面 ⇒ 窗口被裁成空 ⇒"读数全绿、屏幕上什么都没有"。
+
+#### 实验协议（`crates/snapclip-capture/tests/layered_differential.rs`，`#[ignore]`）
+
+同时创建**两个**窗口，用**同一种**观测（屏幕 `BitBlt` + `CAPTUREBLT`）分别取样；对照窗口
+（贴图窗口的创建方式：`WS_POPUP | WS_VISIBLE` 创建时给出、`WS_EX_LAYERED | TOOLWINDOW | NOACTIVATE | TOPMOST`）
+全程不变，用来证明观测手段此刻有效。
+
+跑法：`cargo test -p snapclip-capture --test layered_differential -- --ignored --nocapture`
+
+| 步骤 | 对照 A（贴图风格） | 主体 B（遮罩风格） | 判读 |
+| --- | --- | --- | --- |
+| a 基线（不透明红） | `[255,0,0]` | `[255,0,0]` | **layered 窗口确实会上屏** —— 环境限制不成立 |
+| b 半透明 α≈129 | `[255,0,0]` | `[250,121,121]` | 半透明可见 |
+| c + `WS_EX_TRANSPARENT` | `[255,0,0]` | `[250,121,121]` | 穿透位不影响可见性 |
+| d + 窗口区域（**屏幕坐标**） | `[255,0,0]` | `[244,244,244]` | **整窗消失** ⇒ 坐标错位 |
+| e + `WDA_EXCLUDEFROMCAPTURE` | `[255,0,0]` | `[244,244,244]` | 正确：从截图里消失 |
+| f 回 `WDA_NONE` + 重显示 | `[255,0,0]` | `[244,244,244]` | 仍不可见（区域还是错的） |
+| g 创建时带 `WS_VISIBLE` | `[255,0,0]` | `[250,121,121]` | `WS_VISIBLE` 不是这次的差异 |
+| d′ 区域改**客户区坐标** | `[255,0,0]` | **`[248,162,162]`** | **可见且中间有洞** ⇒ 最小差异 = 坐标系 |
+
+另有一条观测手段的自检：普通（非 layered）红窗 `[0,0,255]`（BGRA）vs 桌面基线 `[252,252,252]` —— 证明取样本身有效。
+
+#### 修了什么
+
+- 重写 `windows/overlay/dim_layer.rs`（按上表验证过的配方）：
+  - 创建时带 `WS_VISIBLE`；ex-style = `LAYERED | TRANSPARENT | TOPMOST | TOOLWINDOW | NOACTIVATE`；
+  - **区域用客户区坐标**（`dim_hole` 把选区减去窗口原点），`RGN_DIFF` 开洞；
+  - 颜色不另立一套：`MASK_RGB/MASK_ALPHA` 叠 `ACCENT_RGB/MASK_TINT_ALPHA` 合成单层等价值，premultiplied；
+  - `WDA_EXCLUDEFROMCAPTURE`（延时贴图不会把遮罩截进去）；
+  - 一行永久诊断（每次倒计时开始打印一次）。
+- 接线：`arm_countdown` 显示；拖动改框时 `update_countdown_dim` 只挪洞；三个出口在 `ExitStep` 里新增 **`HideDim`** 并排在 `ClearCountdown` 之前（顺序仍是数据，测试钉住）。
+- 测试：三条纯测（像素/α/偏蓝、洞的客户区坐标、样式位）+ 一条**活桌面带正向对照**的回归。
+
+#### 证据
+
+| 项 | 结果 |
+| --- | --- |
+| `the_countdown_dim_layer_actually_darkens_outside_the_selection`（活桌面） | **ok**：环里变暗 ≥25、洞里不变（±6）、区域 `PtInRegion` 环在内洞在外、排除后截图回到基线、隐藏后回到基线 |
+| `cargo test -p snapclip-capture --lib -- --test-threads=1` | **473 passed / 0 failed / 74 ignored** |
+| `cargo test -p snapclip-app --features test-support --lib` | **135 passed / 0 failed / 7 ignored** |
+| 受影响的 L3/L4（HUD 渲染、区域环、鼠标捕获） | 全 ok |
+| `cargo check --workspace --all-targets` | **0 error / 0 warning** |
+
+#### 未验证 / 已知限制
+
+1. **真机观感**：遮罩浓淡是否与正常截图态一致、倒计时期间点击是否真的落到别的应用 —— 只能人眼看（layered 窗口按设计截不到，所以这条功能没有渲染图）。
+2. `DimLayer::ensure_window` 只在第一次显示时按当时的显示器尺寸建窗，**不会跟随显示器变化重建**；单显示器下没有影响，多显示器切换还没测。
+3. 差分探针保留为长期 `#[ignore]` 探针（含跑法与读法），以后谁动这条功能都能重跑同一份证据。
+### §14.55.9.9 进入倒计时的那一下闪：顺序是数据（改前 / 改后）
+
+**用户实测**：延时确认后**面板消失的那一刻，选区外的暗色遮罩会闪一下**（遮罩本身已经对了：可见、点击可穿）。
+
+**改前的真实顺序**（`arm_countdown` 里逐行读到）：
+
+```
+置 countdown 状态 → 置 HUD 闸 → 收窄窗口区域 → 显示遮罩层（并提层）→ SetTimer → invalidate()
+```
+
+问题在最后一步：`invalidate()` 只是把重绘**合并进渲染 tick**（`RENDER_TICK_MS`）。所以"收窄区域"
+那一刻，屏幕上还是**上一帧的普通画面**（冻结画面 + 主浮层自己画的遮罩）⇒ 区域一收，旧遮罩被切掉、
+新遮罩还没出现 ⇒ 那一瞬就是用户看到的"闪一下"。
+
+**改后**：进入顺序做成数据，与退出那条同一个模式：
+
+```rust
+pub(super) fn countdown_enter_steps() -> &'static [EnterStep] {
+    &[PaintHud, NarrowRegion, ShowDim, RaiseOverlay]
+}
+```
+
+| 步骤 | 做什么 | 为什么在这个位置 |
+| --- | --- | --- |
+| `PaintHud` | `paint_now()`（同步渲染，不走合并 tick） | 先用 HUD 帧（透明背景 + 框线/角标/数字）把屏幕上的普通画面换掉 |
+| `NarrowRegion` | `set_window_region(countdown_window_pieces(..))` | 此刻屏幕上已没有旧画面可被切掉 |
+| `ShowDim` | `dim_layer.show(..)`（**不再提层**） | 遮罩显示出来 |
+| `RaiseOverlay` | `SetWindowPos(HWND_TOPMOST, ..)` | 两者都 TOPMOST，不提层则框环外半边被压暗 |
+
+`show_countdown_dim` 里原来夹着的"提层"拆成了独立一步，这样顺序表才是完整的。
+
+**可断言的证据**：新纯测试 `entering_the_countdown_paints_the_hud_before_it_reshapes_the_window` ——
+断言 `index(PaintHud) < index(NarrowRegion)`、`< index(ShowDim)`、`ShowDim < RaiseOverlay`，
+且进入路径里 `PaintHud` **只出现一次**（多一次就等于把顺序交还给消息循环）。
+
+**验证**：capture **474 passed / 0 failed / 74 ignored**（473 → 474，+1 顺序测试）；app **135 passed**；
+四条受影响的活桌面/L4 全绿（`the_countdown_dim_layer_actually_darkens_outside_the_selection`、
+`the_countdown_hud_paints_only_the_frame_the_badge_and_the_number`、
+`a_combined_region_keeps_the_frame_ring_and_drops_the_middle`、`capture_is_taken_and_released_on_a_real_window`）；
+`layered_differential` 探针 2 passed；`cargo check --workspace --all-targets` 0 warning。
+
+**未验证**：那一下是否**真的**不闪了 —— 只能人眼看（同步绘制把顺序从消息循环手里拿了回来，但合成器
+一帧内如何呈现不归我们管）。
+
+### §14.55.9.10 进入倒计时：暗色"先消失再恢复"（交接空档）
+
+**现象**（用户实测，精确到方向）：确认延时后，选区外的暗色遮罩**突然消失，再恢复**（先亮后暗）。
+
+**成因**：进入顺序曾是 `PaintHud → NarrowRegion → ShowDim → RaiseOverlay`。`PaintHud` 把主浮层换成
+HUD 帧（选区外**透明**）⇒ 主浮层自己画的那层旧遮罩**立刻消失**；而新的 layered 遮罩要到 `ShowDim`
+才出现 ⇒ 中间有一段"没有任何暗色"，随后才恢复。根因不是某个窗口算错了，而是**交接顺序里留了空档**。
+
+**新顺序**（`countdown_enter_steps`，仍是数据 + 断言）：
+
+| 步骤 | 作用 |
+| --- | --- |
+| `ShowDim` | 新遮罩就位（它显示时会被提到最顶） |
+| `RaiseOverlay` | 立刻把主浮层提回遮罩之上：不透明的旧画面重新盖住它 ⇒ 看不出变化 |
+| `PaintHud` | 换成透明背景的 HUD 帧，**露出**早已就位的遮罩 ⇒ 暗色自始至终都在 |
+| `NarrowRegion` | HUD 帧在选区外本来就透明，此刻收窄不会切掉任何可见内容 |
+
+**与最初提案的一处偏差（有意）**：提案是把 `RaiseOverlay` 留在最后的 `ShowDim → PaintHud → NarrowRegion
+→ RaiseOverlay`。那样虽然也连续，但 `ShowDim` 到 `PaintHud` 之间**新遮罩在最顶、旧遮罩还在它下面**
+⇒ 会有一瞬两层暗色叠着（偏暗一下）。把 `RaiseOverlay` 提到 `PaintHud` 之前，**不透明的旧画面会立刻盖住
+新遮罩**，于是"叠两层"的窗口只存在于两次相邻调用之间（同一帧内），肉眼不可见。
+
+**断言**（`entering_the_countdown_paints_the_hud_before_it_reshapes_the_window`）：
+`ShowDim < PaintHud`（暗色不断档）、`ShowDim < RaiseOverlay`、`RaiseOverlay < PaintHud`（不叠层）、
+`PaintHud < NarrowRegion`、且 `PaintHud` **只出现一次**（多一次等于把交接交还给消息循环）。
+
+**验证**：capture **474 passed / 0 failed / 74 ignored**、app **135 passed**；活桌面/L4 四条
+（遮罩变暗、HUD 渲染、区域环、鼠标捕获）全 ok；`layered_differential` 探针 2 passed；
+`cargo check --workspace --all-targets` 0 warning；无临时诊断代码。
+
+**未验证**：那一下是否真的连续 —— 合成器如何在一帧内呈现多个窗口的变化不归我们管，只能人眼。
+若仍可见：先亮后暗 ⇒ 遮罩还要更早/同帧；先暗后亮 ⇒ `PaintHud` 与遮罩的呈现次序要再压。

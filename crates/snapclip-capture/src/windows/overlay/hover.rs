@@ -1030,6 +1030,9 @@ impl OverlayController {
     /// (`docs/33`) — the frame and the panel's shadow are only a picture, and a click on them belongs
     /// to whatever is underneath.
     pub(super) fn nchittest_result(&self, point: Point) -> LRESULT {
+        // 注意：倒计时**不**靠这里。`HTTRANSPARENT` 只覆盖同一线程的下层窗口，浮层没有同线程
+        // 兄弟，交了就是丢弃 ⇒ 等待期间改由**窗口区域**收到选区（`arm_countdown`），席外根本
+        // 没有窗口，跨进程成立（docs/23 §14.55.9）。
         if let Some(run) = self.scroll.as_ref() {
             return if run.layout.panel.contains(point) {
                 HTCLIENT as LRESULT

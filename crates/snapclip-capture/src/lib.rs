@@ -31,6 +31,8 @@ pub mod artifact;
 pub mod diagnostics;
 pub mod error;
 pub mod geometry;
+// The panel's glyphs (`assets/icon/*.svg` baked to PNG): pure data, so it needs no GPU to test.
+pub mod icons;
 pub mod keymap;
 pub mod monitor_cache;
 // The overlay's typeface and its family stack: the one place both renderers (the D2D overlay and
@@ -38,6 +40,9 @@ pub mod monitor_cache;
 pub mod overlay_font;
 pub mod ports;
 pub mod preferences;
+// The custom-region panel's values and rules: four numbers, a unit, a delay, and the three things
+// the size badge can show. Pure — the window and the drawing are in `windows::overlay`.
+pub mod region;
 pub mod ring_contrast;
 pub mod runtime;
 pub mod sampler;
@@ -45,6 +50,8 @@ pub mod sampler;
 // under `scroll/` references `windows`.
 pub mod scroll;
 pub mod session;
+// The length unit the overlay's size/coordinate readouts are measured in.
+pub mod units;
 pub mod window_detection;
 pub mod windows;
 

@@ -16,10 +16,12 @@ use crate::geometry::{LevelReach, MonitorLayout, Point, Rect};
 
 use super::providers::FrozenFrame;
 use super::win::d2d::{
-    ChainRingView, GuideView, OverlayRenderer as D2dRenderer, RenderMetrics, RenderView,
+    ChainRingView, GuideView, OverlayRenderer as D2dRenderer, RegionPanelView, RenderMetrics,
+    RenderView,
 };
 use super::win::d3d11::{AsyncSampleBuffer, CompositionTarget, GraphicsDevice};
 use crate::keymap::{GuideGroup, LoupeHint};
+use crate::units::LabelDisplay;
 use ::windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 
 /// Everything the overlay needs to draw one frame.
@@ -33,6 +35,15 @@ pub struct OverlayFrameState {
     pub show_handles: bool,
     /// Show the live size/coordinate label for a draft or committed selection.
     pub show_size_label: bool,
+    /// How that label reads, from the session's preferences — the same value the badge's own menu
+    /// changes while the session runs.
+    pub label: LabelDisplay,
+    /// Whether the pointer is on the badge, so it is painted as the control it is (docs/23 §14.53).
+    pub label_hovered: bool,
+    /// 自定义截图面板（docs/23 §14.54）；`None` 表示这次会话没打开它。
+    pub region_panel: Option<RegionPanelView>,
+    /// 延时倒计时的剩余秒数；`Some` 时在选区正中画大号数字（docs/23 §14.55.9）。
+    pub countdown: Option<u32>,
     /// Show the screenshot loupe. Annotation mode owns the pointer instead.
     pub show_magnifier: bool,
     /// Brief feedback that the keyboard nudged the sampling cursor.
@@ -105,6 +116,12 @@ impl OverlayFrameState {
             show_chrome: false,
             show_handles: true,
             show_size_label: true,
+            // Match `OverlayPreferences::default()`: a state built without preferences reads the
+            // same numbers the overlay would show before anyone changed anything.
+            label: LabelDisplay::default(),
+            label_hovered: false,
+            region_panel: None,
+            countdown: None,
             show_magnifier: true,
             precision_feedback: false,
             magnifier_rgb: None,
@@ -230,11 +247,34 @@ impl Win32Renderer {
     /// `annotations` is borrowed from the overlay controller so we can avoid
     /// cloning the item list every tick; `OverlayFrameState.annotation_items`
     /// carries the data when the controller wants to decouple.
+    /// Prepare the overlay panel's icons. **Outside a frame only** (see `d2d::panel_icon`).
+    /// 量出两处分段器的选项宽度（详见 `d2d::segment_widths`）。控制器存一份，绘制与命中共用。
+    pub fn segment_widths(&mut self) -> Result<crate::geometry::SegmentWidths, String> {
+        self.d2d.segment_widths()
+    }
+
+    pub fn prepare_panel_icons(&mut self) -> Result<(), String> {
+        self.d2d.prepare_panel_icons()
+    }
+
     pub fn render(
         &mut self,
         state: &OverlayFrameState,
         annotations: Option<&AnnotationDocument>,
     ) -> Result<(), String> {
+        let view = self.view(state, annotations);
+        self.d2d.render(&view)?;
+        self.d2d.present()?;
+        return self.composition.commit();
+    }
+
+    /// The one description of a frame: the paint pass draws exactly this, and the pointer pass
+    /// hit-tests the badge from exactly this.
+    ///
+    /// The badge's rectangle is the pointer's way into the custom-region panel (docs/23 §14.54), so
+    /// "the badge the user aims at" and "the badge the user sees" being the same rectangle has to be
+    /// structural, not two pieces of arithmetic that happen to agree today.
+    fn view(&self, state: &OverlayFrameState, annotations: Option<&AnnotationDocument>) -> RenderView {
         // Build the RenderView. Prefer live borrow when available.
         let live_items: Vec<AnnotationItem> = annotations
             .map(|d| d.items().to_vec())
@@ -246,7 +286,7 @@ impl Win32Renderer {
             .and_then(|d| d.draft.clone())
             .or(state.annotation_draft.clone());
 
-        let view = RenderView {
+        RenderView {
             frame: self.frame,
             selection: state.selection,
             cursor: state.cursor,
@@ -255,6 +295,10 @@ impl Win32Renderer {
             show_chrome: state.show_chrome,
             show_handles: state.show_handles,
             show_size_label: state.show_size_label,
+            label: state.label,
+            label_hovered: state.label_hovered,
+            region_panel: state.region_panel.clone(),
+            countdown: state.countdown,
             show_magnifier: state.show_magnifier,
             precision_feedback: state.precision_feedback,
             work_area: self.layout.local_work_area(),
@@ -278,10 +322,7 @@ impl Win32Renderer {
             mask_blur: state.mask_blur,
             loupe_hints: state.loupe_hints.clone(),
             guide: state.guide.clone(),
-        };
-        self.d2d.render(&view)?;
-        self.d2d.present()?;
-        self.composition.commit()
+        }
     }
 
     /// Produce the annotated export for `state.selection`.
@@ -295,52 +336,38 @@ impl Win32Renderer {
         state: &OverlayFrameState,
         annotations: Option<&AnnotationDocument>,
     ) -> Result<Vec<u8>, String> {
-        let live_items: Vec<AnnotationItem> = annotations
-            .map(|d| d.items().to_vec())
-            .unwrap_or_else(|| state.annotation_items.clone());
+        // An artifact carries the selection, its annotations and nothing else: no chrome, no cursor,
+        // no badge, no loupe, no hints, no panel. The overrides below repeat
+        // what `OverlayRenderer::render_export` and `Win32Renderer::render_export` already clear one
+        // layer down, so the pixels cannot come to depend on those invariants holding.
         let view = RenderView {
-            frame: self.frame,
-            selection: state.selection,
-            cursor: state.cursor,
-            screen_origin: Point::new(self.layout.bounds.left, self.layout.bounds.top),
             cursor_visible: false,
             show_chrome: false,
             show_handles: false,
             show_size_label: false,
+            label_hovered: false,
+            // The panel is UI, so the artifact gets none of it.
+            region_panel: None,
+            countdown: None,
             show_magnifier: false,
             precision_feedback: false,
-            work_area: self.layout.local_work_area(),
             magnifier_rgb: None,
             magnifier_color_text: None,
             magnifier_relative: false,
             magnifier_zoom: 20.0,
-            annotation_items: live_items,
             annotation_selected_id: None,
             annotation_draft: None,
-            // Hover/preview hints are cleared by `OverlayRenderer::render_export`, which
-            // owns the "no hints in the artifact" invariant.
-            hover_bounds: state.hover_bounds,
-            preview_bounds: state.preview_bounds,
-            // Hover/preview/path hints are stripped by `OverlayRenderer::render_export`.
-            chain_rings: state.chain_rings.clone(),
-            // …and so are the labels and the one-shot hint: an artifact never carries UI.
             preview_label: None,
             preview_is_window: false,
-            // An artifact carries no UI, so nothing may fade in either; the view built here has no
-            // preview at all.
             preview_alpha: 1.0,
-            // An artifact carries no UI, so nothing may walk its colour either; the view built here
-            // has no preview anyway, and the mask hole is the exported selection.
             capture_green: 0.0,
             level_badge: None,
             hint: None,
-            // The panel is UI, so the artifact gets none of it. `render_export` enforces the same
-            // thing one layer down; this line is the one that keeps the panel out of the pixels even
-            // if that invariant is ever loosened.
+            // The panel is UI, so the artifact gets none of it.
             scroll: None,
             mask_blur: false,
-            loupe_hints: state.loupe_hints.clone(),
             guide: None,
+            ..self.view(state, annotations)
         };
         self.d2d.render_export(&view)
     }
@@ -351,6 +378,21 @@ impl Win32Renderer {
         groups: &Arc<[GuideGroup]>,
     ) -> Result<Option<Rect>, String> {
         self.d2d.guide_bounds(groups, self.frame)
+    }
+
+    /// Where the size badge sits on this monitor, or `None` when this state shows no badge.
+    ///
+    /// The badge's rectangle is what the pointer's hover test and the panel's trigger both run
+    /// against, so both the paint pass and the pointer pass have to agree — which is why the view they
+    /// are given is built by one function ([`Self::view`]). Annotations are deliberately not resolved: the
+    /// badge's rectangle depends on the selection, the cursor, the work area and the display, never
+    /// on what has been drawn inside the selection.
+    pub(crate) fn size_label_bounds(
+        &mut self,
+        state: &OverlayFrameState,
+    ) -> Result<Option<Rect>, String> {
+        let view = self.view(state, None);
+        self.d2d.size_label_bounds(&view)
     }
 
     /// Whether a failure message indicates a lost graphics device.

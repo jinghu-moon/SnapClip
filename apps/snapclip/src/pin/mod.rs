@@ -39,7 +39,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use snapclip_model::geometry::Rect;
 
-pub use host::{PinEvent, PinHandle, PinRequest, PinWindowHost};
+pub use host::{PinEvent, PinHandle, PinPoster, PinRequest, PinWindowHost};
 pub use source::ImageSource;
 
 /// 一块被选中的像素，以及它在屏幕上的位置——F6 要贴的东西。
@@ -93,6 +93,11 @@ struct PinManagerInner {
 }
 
 impl PinManager {
+    /// 拿一个可以跨线程调用的贴图手柄：调用它等于用户按了一次 `F6`。
+    pub fn pin_poster(&self) -> PinPoster {
+        self.inner.host.pin_poster()
+    }
+
     /// 起贴图管理器。它会在后台起一条宿主线程。
     ///
     /// 这条线程在贴第一张图之前只是一条阻塞在 `GetMessageW` 上的空泵，
@@ -113,19 +118,18 @@ impl PinManager {
         self.inner.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// 把宿主线程报回来的事件收掉，返回收到的条数。
+    /// 把宿主线程报回来的事件收掉，汇总成一份报告（创建 / 关闭 / 没能创建）。
     ///
-    /// 非阻塞，调用方应当在事件循环里顺手轮询。现在**唯一**会到达这里的事件是
-    /// 「窗口创建失败」（正常关闭是用户双击，宿主线程不需要告诉任何人），
-    /// 所以它只回一个条数给日志：返回值非零就意味着有贴图没贴出来。
+    /// 非阻塞，调用方应当在事件循环里顺手轮询。三种事件必须分开数：把"创建后被关闭"
+    /// 当成"没能创建"会让日志长期说谎（docs/23 §14.55.9.6）。
     ///
     /// 必须有人轮询：那条通道是有界的，没人收就会在攒够 64 条之后开始丢。
-    pub fn drain_events(&self) -> usize {
-        let mut count = 0;
-        while self.inner.host.try_recv_event().is_some() {
-            count += 1;
+    pub fn drain_events(&self) -> host::PinReport {
+        let mut events = Vec::new();
+        while let Some(event) = self.inner.host.try_recv_event() {
+            events.push(event);
         }
-        count
+        host::summarize(events)
     }
 }
 

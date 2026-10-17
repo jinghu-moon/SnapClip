@@ -6,7 +6,7 @@
 use super::{
     ChainRingView, MASK_ALPHA, MASK_TINT_ALPHA, OverlayRenderer, PREVIEW_WASH_ALPHA,
     PREVIEW_WASH_WALK_SCALE, RenderMetrics, RenderView, capture_mix_color, capture_wash_color,
-    to_d2d,
+    loupe_obstacle, to_d2d,
 };
 use crate::annotation::{AnnotationGeometry, AnnotationItem, AnnotationKind, AnnotationStyle};
 use crate::geometry::LevelReach;
@@ -1206,28 +1206,41 @@ fn metrics_scale_with_dpi() {
     assert!(at_100.border_width >= 1.0);
 }
 
+/// The label only steps aside for a loupe that is really painted (docs/23 §14.53). The two flags it
+/// asks about can differ — "is the pointer over the overlay" and "is the loupe painted" are separate
+/// questions — and a label that moved for an invisible loupe would place itself around nothing.
 #[test]
-fn label_text_reports_physical_pixels() {
-    assert_eq!(
-        RenderMetrics::label_text_at(Rect::new(0, 0, 1920, 1080), Point::new(0, 0)),
-        "1920×1080 px  (0,0)"
+fn the_label_steps_aside_only_for_a_loupe_that_is_painted() {
+    let frame = Rect::from_origin_size(Point::new(0, 0), 1920, 1080);
+    let metrics = RenderMetrics::for_dpi(96);
+    let mut view = RenderView::new(frame);
+    view.cursor = Point::new(600, 400);
+    view.cursor_visible = true;
+    view.show_magnifier = true;
+    assert!(
+        loupe_obstacle(&view, metrics).is_some(),
+        "a painted loupe is an obstacle the label has to avoid"
     );
-    assert_eq!(
-        RenderMetrics::label_text_at(Rect::new(10, 10, 11, 11), Point::new(-1920, 200)),
-        "1×1 px  (-1910,210)"
-    );
+    // Hidden, and the rectangle goes with it.
+    view.show_magnifier = false;
+    assert!(loupe_obstacle(&view, metrics).is_none());
+    // A pointer that is not over the overlay has no loupe either, however the flag reads.
+    view.show_magnifier = true;
+    view.cursor_visible = false;
+    assert!(loupe_obstacle(&view, metrics).is_none());
 }
 
+/// The badge lights up in the interface accent while the pointer is on it (docs/23 §14.53) — the same
+/// brush the frame's outline uses, with the white text left alone, because the badge's numbers are the
+/// whole point of the badge. This is the pair that fill produces, and the bar is the text one rather
+/// than the interface one: a highlight that washed the numbers out would be worse than no highlight.
 #[test]
-fn label_size_grows_with_digits_and_dpi() {
-    let metrics = RenderMetrics::for_dpi(96);
-    let origin = Point::new(0, 0);
-    let small = metrics.label_size_at(Rect::new(0, 0, 9, 9), origin);
-    let large = metrics.label_size_at(Rect::new(0, 0, 1920, 1080), origin);
-    assert!(large.0 > small.0);
-    assert!(small.0 > 0 && small.1 > 0);
-    let scaled = RenderMetrics::for_dpi(192);
-    assert!(scaled.label_size_at(Rect::new(0, 0, 9, 9), origin).0 > small.0);
+fn the_hovered_badge_keeps_its_white_text_readable() {
+    let ratio = crate::ring_contrast::contrast_ratio(Rgb::new(255, 255, 255), ACCENT_RGB);
+    assert!(
+        ratio >= 4.5,
+        "white on the badge's hover fill is {ratio:.2}:1, below the 4.5:1 text bar"
+    );
 }
 
 #[test]
@@ -2139,5 +2152,702 @@ fn the_scroll_session_draws_only_the_frame_and_the_panel() {
     assert!(
         alpha(centre.x as u32, layout.buttons[0].center().y as u32) > 200,
         "the panel is painted"
+    );
+}
+
+/// 面板的图形必须落在各自的方框里。
+///
+/// 这条在真实设备上跑过一次真事：接 SVG 图标那一步，面板一画就 ACCESS_VIOLATION（用户点尺寸栏
+/// 直接闪退），后来又是"图标一个都看不见"。它按**每个图形自己方框的角落**取基准色、数比它亮的
+/// 像素——图形没落进自己的框，这里就红。
+#[test]
+#[ignore = "L4 (docs/31 D-14): renders through the real D3D11/D2D path; run with --ignored on a machine with a GPU"]
+fn the_panel_glyphs_land_in_the_boxes_they_were_given() {
+    let (pixels, width, layout) = render_panel_with_glyphs();
+    assert_glyph_ink(&pixels, width, layout);
+}
+
+/// 画一帧只有面板的浮层，把像素读回来。
+fn render_panel_with_glyphs() -> (Vec<u8>, u32, super::RegionPanelLayout) {
+    render_panel_with_slide(None)
+}
+
+/// 同一个面板，单位分段器的选中块停在给定进度上（`None` = 不在平移）。
+fn render_panel_with_slide(
+    unit_slide: Option<(usize, f32)>,
+) -> (Vec<u8>, u32, super::RegionPanelLayout) {
+    render_panel_frame_with_slide(
+        &solid_bgra(520, 380, [24, 24, 28, 255]),
+        None,
+        None,
+        0,
+        true,
+        unit_slide,
+    )
+}
+
+/// 同上，但可以指定帧内容、焦点与正在编辑的那一格（backdrop 模糊与光标两条测试要用）。
+fn render_panel_frame(
+    frame_pixels: &[u8],
+    focus: Option<crate::region::PanelSlot>,
+    editing: Option<crate::region::RegionField>,
+    caret: usize,
+    caret_visible: bool,
+) -> (Vec<u8>, u32, super::RegionPanelLayout) {
+    render_panel_frame_with_slide(frame_pixels, focus, editing, caret, caret_visible, None)
+}
+
+/// 同上，但单位分段器的选中块停在给定进度上（`None` = 不在平移）。
+fn render_panel_frame_with_slide(
+    frame_pixels: &[u8],
+    focus: Option<crate::region::PanelSlot>,
+    editing: Option<crate::region::RegionField>,
+    caret: usize,
+    caret_visible: bool,
+    unit_slide: Option<(usize, f32)>,
+) -> (Vec<u8>, u32, super::RegionPanelLayout) {
+    let device =
+        super::GraphicsDevice::create().expect("this test needs a D3D11 device (docs/31 D-14)");
+    let (width, height) = (520u32, 380u32);
+    let mut renderer = OverlayRenderer::new(std::sync::Arc::new(device), 96)
+        .expect("this test needs a Direct2D overlay renderer (docs/31 D-14)");
+    renderer
+        .update_frame(width, height, frame_pixels)
+        .unwrap();
+    renderer.ensure_back_buffer(width, height).unwrap();
+    // 面板的图形现在由控制器在帧之前准备；直接驱动渲染器的测试要自己来。
+    renderer.prepare_panel_icons().unwrap();
+    let target = renderer
+        .device()
+        .create_render_target_texture(width, height)
+        .unwrap();
+    let d2d_context = renderer.device().create_d2d_context().unwrap();
+    let target_bitmap = super::super::d3d11::create_bitmap_from_texture(
+        &d2d_context,
+        &target.texture,
+        D2D1_BITMAP_OPTIONS_TARGET,
+        D2D1_ALPHA_MODE_PREMULTIPLIED,
+    )
+    .unwrap();
+
+    // 选框够大，面板（420 dip 宽）落在它正中间。
+    let selection = Rect::new(40, 30, 480, 350);
+    let layout = crate::geometry::region_panel_layout(
+        1.0,
+        Rect::new(0, 0, width as i32, height as i32),
+        selection,
+        false,
+        crate::geometry::SegmentWidths::fixed(1.0),
+    );
+    let mut view = RenderView::new(Rect::from_origin_size(
+        Point::new(0, 0),
+        width as i32,
+        height as i32,
+    ));
+    view.selection = selection;
+    view.show_chrome = true;
+    view.cursor_visible = false;
+    view.region_panel = Some(super::RegionPanelView {
+        values: crate::region::RegionField::ALL.map(|field| (field, "320".to_string())),
+        invalid: [false; 4],
+        hover: None,
+        focus,
+        editing,
+        caret,
+        caret_visible,
+        unit: crate::units::LengthUnit::Dp,
+        delay: crate::region::Delay::ALL[0],
+        unit_slide,
+        delay_slide: None,
+        // 不锁比例：四个动作格都没有悬停/按下的底色，格子里除了图形就只有卡片底色。
+        locked: false,
+        toggles: crate::units::LabelToggle::ALL.map(|toggle| (toggle, true)),
+        status: None,
+        preset: "自定义".to_string(),
+        preset_hit: None,
+        can_start: true,
+        layout: layout.clone(),
+    });
+
+    renderer.draw_to(&target_bitmap, &view).unwrap();
+    let pixels = renderer.device().read_back_bgra(&target.texture).unwrap();
+    (pixels, width, layout)
+}
+
+/// 每个图形自己的方框里都要有"墨"：拿方框的**角**当基准（图形居中，够不着角），数明显比它亮的
+/// 像素。这比断言某个像素的颜色结实：不写死调色板，只问"这块方框里有没有图形"。
+///
+/// 上下都要卡：太少说明图形没画出来（或画到别处去了），接近铺满说明画的不是图形而是一整块
+/// ——图标是线稿，任何一格都不该被填满。
+fn assert_glyph_ink(pixels: &[u8], width: u32, layout: super::RegionPanelLayout) {
+    let boxes = [
+        ("关闭", layout.close),
+        ("互换", layout.actions[0].1),
+        ("锁定", layout.actions[1].1),
+        ("居中", layout.actions[2].1),
+        ("移到原点", layout.actions[3].1),
+    ];
+    for (name, rect) in boxes {
+        let base = pixel_at(pixels, width, (rect.left + 2) as u32, (rect.top + 2) as u32)[1];
+        let ink = ink_count(pixels, width, rect, base);
+        let area = (rect.width().max(0) * rect.height().max(0)) as usize;
+        assert!(
+            ink > 4,
+            "{name} 的方框里只有 {ink} 个像素比底色亮。\
+             上下文原点附近有 {} 个亮像素：如果墨都堆在原点，就是放置没生效。",
+            ink_count(pixels, width, Rect::new(0, 0, 32, 32), 0),
+        );
+        assert!(
+            ink * 4 < area * 3,
+            "{name} 的方框里有 {ink}/{area} 个亮像素：这看起来是一整块，不是线稿图标"
+        );
+    }
+}
+
+/// 着色必须跟着传进来的颜色走：同一个图形、同一个位置，两种颜色画出来的像素必须不同。
+///
+/// 这条盯的是颜色矩阵：它要是没生效，两种颜色会画出一模一样的白图。
+#[test]
+#[ignore = "L4 (docs/31 D-14): renders through the real D3D11/D2D path; run with --ignored on a machine with a GPU"]
+fn the_glyph_tint_follows_the_colour_it_is_given() {
+    let device =
+        super::GraphicsDevice::create().expect("this test needs a D3D11 device (docs/31 D-14)");
+    let (width, height) = (200u32, 200u32);
+    let background = [24u8, 24, 28, 255];
+    let mut renderer = OverlayRenderer::new(std::sync::Arc::new(device), 96)
+        .expect("this test needs a Direct2D overlay renderer (docs/31 D-14)");
+    renderer
+        .update_frame(width, height, &solid_bgra(width, height, background))
+        .unwrap();
+    renderer.ensure_back_buffer(width, height).unwrap();
+    // 面板的图形现在由控制器在帧之前准备；直接驱动渲染器的测试要自己来。
+    renderer.prepare_panel_icons().unwrap();
+    let target = renderer
+        .device()
+        .create_render_target_texture(width, height)
+        .unwrap();
+    // 用**渲染器自己的**设备上下文建标签位图：`draw_glyph` 画在它上面，测试若用另一个上下文，
+    // 画出来的东西不会落到被读回的那张位图上。
+    let target_bitmap = super::super::d3d11::create_bitmap_from_texture(
+        &renderer.d2d,
+        &target.texture,
+        D2D1_BITMAP_OPTIONS_TARGET,
+        D2D1_ALPHA_MODE_PREMULTIPLIED,
+    )
+    .unwrap();
+
+    // 面板的两个图形颜色：不透明白与 62% 的浅灰（都来自面板自己的画刷，所以都在预着色表里）。
+    let white = renderer.label_text_brush.clone().expect("white brush");
+    let muted = renderer.panel_muted_brush.clone().expect("muted brush");
+    let rect = Rect::new(80, 80, 101, 101);
+
+    let mut drawn: Vec<Vec<u8>> = Vec::new();
+    for brush in [&white, &muted] {
+        unsafe {
+            renderer.d2d.SetTarget(&target_bitmap);
+            renderer.d2d.BeginDraw();
+        }
+        renderer
+            .draw_glyph(crate::icons::Glyph::Close, rect, brush, false)
+            .unwrap();
+        unsafe { renderer.d2d.EndDraw(None, None).unwrap() };
+        drawn.push(renderer.device().read_back_bgra(&target.texture).unwrap());
+    }
+
+    let box_pixels = |pixels: &[u8]| -> Vec<[u8; 4]> {
+        (rect.top..rect.bottom)
+            .flat_map(|y| {
+                (rect.left..rect.right)
+                    .map(move |x| pixel_at(pixels, width, x as u32, y as u32))
+            })
+            .collect()
+    };
+    let opaque = box_pixels(&drawn[0]);
+    let translucent = box_pixels(&drawn[1]);
+    assert!(
+        opaque.iter().any(|pixel| pixel[1] > 200),
+        "白色那一次应当画出接近纯白的像素"
+    );
+    assert_ne!(
+        opaque, translucent,
+        "两种颜色画出来的像素完全一样：颜色矩阵没生效"
+    );
+}
+
+/// 方框里"明显比 `base` 亮"的像素个数（绿通道：图形是浅色，面板底色是暗的）。
+fn ink_count(pixels: &[u8], width: u32, rect: Rect, base: u8) -> usize {
+    let mut ink = 0;
+    for y in rect.top.max(0)..rect.bottom {
+        for x in rect.left.max(0)..rect.right {
+            if pixel_at(pixels, width, x as u32, y as u32)[1] > base.saturating_add(40) {
+                ink += 1;
+            }
+        }
+    }
+    ink
+}
+
+/// 面板图形这一层的成本（测量，不是断言）：跑
+/// `cargo test -p snapclip-capture --lib -- --ignored --nocapture the_cost_of_the_panel_icons`
+#[test]
+#[ignore = "measurement, not an assertion"]
+fn the_cost_of_the_panel_icons() {
+    use ::windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
+    use std::time::{Duration, Instant};
+
+    let device = super::GraphicsDevice::create().expect("this test needs a D3D11 device");
+    let (width, height) = (520u32, 380u32);
+    let mut renderer = OverlayRenderer::new(std::sync::Arc::new(device), 96).expect("renderer");
+    renderer
+        .update_frame(width, height, &solid_bgra(width, height, [24, 24, 28, 255]))
+        .unwrap();
+    renderer.ensure_back_buffer(width, height).unwrap();
+    let d2d = renderer.device().create_d2d_context().unwrap();
+    let target = renderer.device().create_render_target_texture(width, height).unwrap();
+    let bitmap = super::super::d3d11::create_bitmap_from_texture(
+        &d2d,
+        &target.texture,
+        D2D1_BITMAP_OPTIONS_TARGET,
+        D2D1_ALPHA_MODE_PREMULTIPLIED,
+    )
+    .unwrap();
+    let colours = [
+        D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
+        D2D1_COLOR_F { r: 0.91, g: 0.93, b: 0.95, a: 0.62 },
+        D2D1_COLOR_F { r: 0.18, g: 0.44, b: 0.92, a: 1.0 },
+    ];
+
+    // 预烘要在有 target 的上下文上做（effect 渲染需要 target），所以先设目标
+    unsafe { d2d.SetTarget(&bitmap) };
+
+    // 1) 准备：解码 + 预烘 3 色 × 9 张 96×96（会话开始或面板首次打开时一次）
+    let mut prep = Duration::ZERO;
+    for _ in 0..10 {
+        let mut icons = super::panel_icon::PanelIcons::new();
+        let started = Instant::now();
+        icons.prepare(&d2d, &colours).unwrap();
+        prep += started.elapsed();
+    }
+    eprintln!(
+        "PANEL_ICONS prepare = {:.2} ms / 次（3 色 × 9 张 = 27 张 96×96，含 8 次 PNG 解码）",
+        prep.as_secs_f64() * 100.0
+    );
+
+    let mut icons = super::panel_icon::PanelIcons::new();
+    icons.prepare(&d2d, &colours).unwrap();
+    let brush = renderer.panel_muted_brush.clone().expect("brush");
+    let rects: Vec<Rect> = (0..8)
+        .map(|i| Rect::new(60 + i * 20, 60, 74 + i * 20, 74))
+        .collect();
+
+    let runs = 200u32;
+    let started = Instant::now();
+    unsafe { d2d.BeginDraw() };
+    for _ in 0..runs {
+        for (i, glyph) in crate::icons::Glyph::ALL.iter().enumerate() {
+            icons.draw(&d2d, *glyph, rects[i], colours[0], false).unwrap();
+        }
+    }
+    unsafe { d2d.EndDraw(None, None).unwrap() };
+    let blits = started.elapsed();
+
+    let started = Instant::now();
+    unsafe { d2d.BeginDraw() };
+    for _ in 0..runs {
+        // 旧实现同一层的量级：4 个动作图形 + 关闭 + 箭头 + 勾 ≈ 40 次画线
+        for i in 0..40 {
+            let x = 60 + i;
+            unsafe {
+                d2d.DrawLine(
+                    super::vector2(x as f32, 60.0),
+                    super::vector2(x as f32, 74.0),
+                    &brush,
+                    1.4,
+                    None,
+                )
+            };
+        }
+    }
+    unsafe { d2d.EndDraw(None, None).unwrap() };
+    let lines = started.elapsed();
+
+    let per = |d: Duration| d.as_secs_f64() * 1_000_000.0 / runs as f64;
+    eprintln!(
+        "PANEL_ICONS per frame: 8 DrawBitmap(HIGH_QUALITY_CUBIC) = {:.1} µs | 40 DrawLine = {:.1} µs（各 {} 帧，含一次 BeginDraw/EndDraw）",
+        per(blits),
+        per(lines),
+        runs
+    );
+    eprintln!(
+        "PANEL_ICONS vram: 源位图 {} KB + 色表 {} KB",
+        (crate::icons::ICON_COUNT as u32 * crate::icons::ICON_BAKED_PX * crate::icons::ICON_BAKED_PX * 4) / 1024,
+        (3 * 9 * crate::icons::ICON_BAKED_PX * crate::icons::ICON_BAKED_PX * 4) / 1024
+    );
+}
+
+/// 4×4 棋盘：高频细节是"面板背后有没有被模糊"的判据。
+fn checkerboard(width: u32, height: u32) -> Vec<u8> {
+    let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            let value = if ((x / 4) + (y / 4)) % 2 == 0 { 230 } else { 24 };
+            pixels.extend_from_slice(&[value, value, value, 255]);
+        }
+    }
+    pixels
+}
+
+/// 一块矩形里绿通道的方差（棋盘的高频被模糊压掉，方差就掉下来）。
+fn variance(pixels: &[u8], width: u32, rect: Rect) -> f64 {
+    let (mut count, mut sum, mut sum_sq) = (0f64, 0f64, 0f64);
+    for y in rect.top..rect.bottom {
+        for x in rect.left..rect.right {
+            let value = pixel_at(pixels, width, x as u32, y as u32)[1] as f64;
+            count += 1.0;
+            sum += value;
+            sum_sq += value * value;
+        }
+    }
+    if count == 0.0 {
+        return 0.0;
+    }
+    sum_sq / count - (sum / count) * (sum / count)
+}
+
+/// 面板自己范围内必须有 backdrop 模糊（docs/23 §14.55）。
+///
+/// 判据不是"面板内方差 < 面板外"：面板底色是 78% 不透明的暗色，它自己就把棋盘的对比压掉了大半，
+/// 于是**没有模糊时那条比较也会通过**（我先按那个写法试过，实测在改之前就绿——所以换掉）。
+/// 真正能判定的问法是：同一块面板区域，**背后是棋盘**与**背后是同均值纯色**，两者应当几乎一样
+/// （模糊把图案抹平了）；没有模糊时棋盘那侧会明显更高。
+#[test]
+#[ignore = "L4 (docs/31 D-14): renders through the real D3D11/D2D path; run with --ignored on a machine with a GPU"]
+fn the_panel_backdrop_blurs_what_is_behind_it() {
+    let checker = checkerboard(520, 380);
+    let flat = solid_bgra(520, 380, [127, 127, 127, 255]);
+    let (over_checker, width, layout) = render_panel_frame(&checker, None, None, 0, true);
+    let (over_flat, _, _) = render_panel_frame(&flat, None, None, 0, true);
+    let panel = layout.panel;
+    // 面板左内沿的一条窄带：在卡片左侧的留白里，没有文字、没有图形。
+    // 取样带收在卡片那一行里：再往下会穿过页脚的分隔线，那点结构两种帧都有，只会稀释判据。
+    let strip = Rect::new(panel.left + 3, panel.top + 50, panel.left + 9, panel.top + 140);
+    let pattern = variance(&over_checker, width, strip);
+    let baseline = variance(&over_flat, width, strip);
+    eprintln!(
+        "PANEL_BLUR strip variance: over checkerboard = {pattern:.1}, over flat = {baseline:.1}"
+    );
+    // 判据相对基线：模糊生效时两侧应当几乎相等（实测 31.8 vs 31.8）；没有模糊时棋盘那侧高出一大截
+    // （实测改之前是 93.6 vs 32.8）。
+    assert!(
+        pattern < baseline + 6.0,
+        "面板内仍带着棋盘的高频（方差 {pattern:.1}，纯色基线 {baseline:.1}）：backdrop 没有模糊"
+    );
+}
+
+/// 聚焦的数字格要出现插入光标：同一格渲染两次（不聚焦 / 聚焦并编辑），差异必须是**窄窄一列**，
+/// 且落在居中文字的右侧（docs/23 §14.55）。
+#[test]
+#[ignore = "L4 (docs/31 D-14): renders through the real D3D11/D2D path; run with --ignored on a machine with a GPU"]
+fn the_focused_number_cell_shows_a_caret_at_the_end_of_the_text() {
+    let frame = solid_bgra(520, 380, [24, 24, 28, 255]);
+    let (plain, width, layout) = render_panel_frame(&frame, None, None, 0, true);
+    let (focused, _, _) = render_panel_frame(
+        &frame,
+        Some(crate::region::PanelSlot::Width),
+        Some(crate::region::RegionField::Width),
+        4,
+        true,
+    );
+    // 只看数字那一行：聚焦还会把那格的下划线加粗，那是另一件事，不该混进光标的判据里。
+    let cell = layout.fields[0].1;
+    let row = Rect::new(cell.left, cell.top, cell.right, cell.bottom - 4);
+    let (mut count, mut min_x, mut max_x) = (0usize, i32::MAX, i32::MIN);
+    for y in row.top..row.bottom {
+        for x in row.left..row.right {
+            if pixel_at(&plain, width, x as u32, y as u32)
+                != pixel_at(&focused, width, x as u32, y as u32)
+            {
+                count += 1;
+                min_x = min_x.min(x);
+                max_x = max_x.max(x);
+            }
+        }
+    }
+    assert!(count > 0, "聚焦那一格没有任何变化：光标没画出来");
+    assert!(
+        max_x - min_x <= 4,
+        "差异宽 {} px（{min_x}..{max_x}）：光标应该是一条竖线",
+        max_x - min_x
+    );
+    assert!(
+        (min_x + max_x) / 2 > cell.left + cell.width() / 2,
+        "光标在 x={}，应当在居中文字（格子中心 {}）的右侧",
+        (min_x + max_x) / 2,
+        cell.left + cell.width() / 2
+    );
+    // 只有聚焦那一格该变。
+    let other = layout.fields[1].1;
+    let mut stray = 0;
+    for y in other.top..other.bottom {
+        for x in other.left..other.right {
+            if pixel_at(&plain, width, x as u32, y as u32)
+                != pixel_at(&focused, width, x as u32, y as u32)
+            {
+                stray += 1;
+            }
+        }
+    }
+    assert_eq!(stray, 0, "只有聚焦那一格该出现光标");
+}
+
+/// 光标**能开能关** —— 也就是"能闪"。计时器本身（500 ms 低频 `WM_TIMER`）只能人工验：
+/// 点开面板、聚焦数字格，看光标一亮一暗（docs/23 §14.55）。
+#[test]
+#[ignore = "L4 (docs/31 D-14): renders through the real D3D11/D2D path; run with --ignored on a machine with a GPU"]
+fn the_caret_can_be_switched_off_and_on() {
+    let frame = solid_bgra(520, 380, [24, 24, 28, 255]);
+    let (on, width, layout) = render_panel_frame(
+        &frame,
+        Some(crate::region::PanelSlot::Width),
+        Some(crate::region::RegionField::Width),
+        4,
+        true,
+    );
+    let (off, _, _) = render_panel_frame(
+        &frame,
+        Some(crate::region::PanelSlot::Width),
+        Some(crate::region::RegionField::Width),
+        4,
+        false,
+    );
+    // 只看数字那一行：聚焦本身还会加粗下划线，那是另一件事。
+    let cell = layout.fields[0].1;
+    let row = Rect::new(cell.left, cell.top, cell.right, cell.bottom - 4);
+    let mut count = 0;
+    for y in row.top..row.bottom {
+        for x in row.left..row.right {
+            if pixel_at(&on, width, x as u32, y as u32)
+                != pixel_at(&off, width, x as u32, y as u32)
+            {
+                count += 1;
+            }
+        }
+    }
+    assert!(
+        count > 0,
+        "caret_visible 开关没有改变任何像素：光标不可闪"
+    );
+}
+
+/// 分段器选中块的平移：同一分段器在**进度 0** 与**进度 1** 各渲一次，第一段必须是"被块盖住 / 没被
+/// 盖住"两种样子 —— 这是"块真的画在了两个位置"的唯一自动证据。
+///
+/// 动画的时长与手感（140 ms、ease-out 落位）**只能人工看**：测试能证明两端，证明不了中间的过程。
+#[test]
+#[ignore = "L4 (docs/31 D-14): renders through the real D3D11/D2D path; run with --ignored on a machine with a GPU"]
+fn the_segment_block_slides_between_the_two_units() {
+    let (start, width, layout) = render_panel_with_slide(Some((0, 0.0)));
+    let (end, _, _) = render_panel_with_slide(Some((0, 1.0)));
+    // 视图里选中的是 Dp（第 1 段）：进度 0 时块停在 Px（第 0 段）上，进度 1 时回到 Dp。
+    let px = layout.unit[0].1;
+    let (x, y) = (
+        (px.left + px.width() / 2) as u32,
+        (px.top + px.height() / 2) as u32,
+    );
+    assert_ne!(
+        pixel_at(&start, width, x, y),
+        pixel_at(&end, width, x, y),
+        "进度 0 与进度 1 时第一段应当一个是选中块、一个不是"
+    );
+    // 也确认它没有跑到容器之外：两端都还在容器里。
+    assert!(layout.unit_track.contains_rect(px));
+}
+
+/// 分段器每段同宽：**画出来的选中块宽度**必须等于布局给的段宽 —— 证明量宽这一份值真的同时喂给了
+/// 布局（每段同宽）与绘制（块画在段矩形上），而不是两处各算一套（docs/23 §14.55.6）。
+#[test]
+#[ignore = "L4 (docs/31 D-14): renders through the real D3D11/D2D path; run with --ignored on a machine with a GPU"]
+fn the_painted_segment_matches_the_layout_width() {
+    let (pixels, width, layout) = render_panel_with_glyphs();
+    for (name, track, selected) in [
+        ("单位", layout.unit_track, layout.unit[1].1),
+        ("延时", layout.delay_track, layout.delay[0].1),
+    ] {
+        // 选中块是强调色（蓝：B 高、R 低）。数**首尾跨度**而不是连续像素数：块里的文字是白色的，
+        // 会把连续计数咬掉几个像素（第一版就是这么误报 23 vs 29 的）。
+        let y = selected.center().y as u32;
+        let mut span: Option<(i32, i32)> = None;
+        for x in track.left.max(0)..track.right {
+            let offset = ((y * width + x as u32) * 4) as usize;
+            let (blue, red) = (pixels[offset], pixels[offset + 2]);
+            if blue as i32 > 150 && blue as i32 > red as i32 + 60 {
+                span = Some(match span {
+                    Some((lo, _)) => (lo, x),
+                    None => (x, x),
+                });
+            }
+        }
+        let run = span.map_or(0, |(lo, hi)| hi - lo + 1);
+        assert!(
+            (run - selected.width()).abs() <= 3,
+            "{name} 的选中块画出来 {run} px（跨度），布局给的段宽是 {} px",
+            selected.width()
+        );
+    }
+}
+
+/// 延时倒计时的数字必须画在**选区正中**（docs/23 §14.55.9）。
+#[test]
+#[ignore = "L4 (docs/31 D-14): renders through the real D3D11/D2D path; run with --ignored on a machine with a GPU"]
+fn the_countdown_number_paints_inside_the_selection() {
+    let (pixels, width, selection) = render_countdown_frame();
+    let centre = selection.center();
+    let mut ink = 0;
+    for y in (centre.y - 30).max(0)..(centre.y + 30) {
+        for x in (centre.x - 30).max(0)..(centre.x + 30) {
+            let p = pixel_at(&pixels, width, x as u32, y as u32);
+            // 数字现在用主题色 + 80% 透明度画（docs/23 §14.55.9）：判据从"亮"改成"蓝占优"，
+            // 顺带把颜色钉住，而不只是"那里有东西"。
+            if p[0] > 150 && p[0] > p[1] {
+                ink += 1;
+            }
+        }
+    }
+    assert!(ink > 50, "选区正中只有 {ink} 个主题色像素：倒计时数字没画在那里（或颜色不对）");
+    // 选区里除了这个数字不该多出别的东西：四角仍是原始底色。
+    for (x, y) in [
+        (selection.left + 8, selection.top + 8),
+        (selection.right - 8, selection.bottom - 8),
+    ] {
+        assert!(
+            pixel_at(&pixels, width, x as u32, y as u32)[0] < 150,
+            "倒计时不该画到选区角上"
+        );
+    }
+}
+
+/// 一帧带倒计时的浮层，把像素读回来。
+fn render_countdown_frame() -> (Vec<u8>, u32, Rect) {
+    let device =
+        super::GraphicsDevice::create().expect("this test needs a D3D11 device (docs/31 D-14)");
+    let (width, height) = (400u32, 300u32);
+    let background = [16u8, 16, 20, 255];
+    let mut renderer = OverlayRenderer::new(std::sync::Arc::new(device), 96)
+        .expect("this test needs a Direct2D overlay renderer (docs/31 D-14)");
+    renderer
+        .update_frame(width, height, &solid_bgra(width, height, background))
+        .unwrap();
+    renderer.ensure_back_buffer(width, height).unwrap();
+    let target = renderer
+        .device()
+        .create_render_target_texture(width, height)
+        .unwrap();
+    let d2d_context = renderer.device().create_d2d_context().unwrap();
+    let target_bitmap = super::super::d3d11::create_bitmap_from_texture(
+        &d2d_context,
+        &target.texture,
+        D2D1_BITMAP_OPTIONS_TARGET,
+        D2D1_ALPHA_MODE_PREMULTIPLIED,
+    )
+    .unwrap();
+
+    let selection = Rect::new(60, 50, 340, 250);
+    let mut view = RenderView::new(Rect::from_origin_size(
+        Point::new(0, 0),
+        width as i32,
+        height as i32,
+    ));
+    view.selection = selection;
+    view.countdown = Some(3);
+    view.show_chrome = true;
+    view.cursor_visible = false;
+    renderer.draw_to(&target_bitmap, &view).unwrap();
+    let pixels = renderer.device().read_back_bgra(&target.texture).unwrap();
+    (pixels, width, selection)
+}
+
+/// 倒计时 HUD 的一帧：背景用棋盘（高频细节），这样任何多余的"冻结画面/遮罩"都会留下灰块。
+fn render_countdown_hud() -> (Vec<u8>, u32, Rect) {
+    let device =
+        super::GraphicsDevice::create().expect("this test needs a D3D11 device (docs/31 D-14)");
+    let (width, height) = (400u32, 300u32);
+    let mut renderer = OverlayRenderer::new(std::sync::Arc::new(device), 96)
+        .expect("this test needs a Direct2D overlay renderer (docs/31 D-14)");
+    renderer
+        .update_frame(width, height, &checkerboard(width, height))
+        .unwrap();
+    renderer.ensure_back_buffer(width, height).unwrap();
+    let target = renderer
+        .device()
+        .create_render_target_texture(width, height)
+        .unwrap();
+    let d2d_context = renderer.device().create_d2d_context().unwrap();
+    let target_bitmap = super::super::d3d11::create_bitmap_from_texture(
+        &d2d_context,
+        &target.texture,
+        D2D1_BITMAP_OPTIONS_TARGET,
+        D2D1_ALPHA_MODE_PREMULTIPLIED,
+    )
+    .unwrap();
+    let selection = Rect::new(60, 50, 340, 250);
+    let mut view = RenderView::new(Rect::from_origin_size(
+        Point::new(0, 0),
+        width as i32,
+        height as i32,
+    ));
+    view.selection = selection;
+    view.countdown = Some(3);
+    renderer.draw_to(&target_bitmap, &view).unwrap();
+    let pixels = renderer.device().read_back_bgra(&target.texture).unwrap();
+    (pixels, width, selection)
+}
+
+/// 倒计时期间"画出来的集合 == 窗口区域覆盖的集合"（docs/23 §14.55.9.2）。
+///
+/// 窗口区域只有三块：选框环、角标、倒计时框。所以环带里**除框线之外**必须完全透明 ——
+/// 否则那块半透明灰底会实实在在地出现在用户屏幕上（用户截图报的就是这个）。
+#[test]
+#[ignore = "L4 (docs/31 D-14): renders through the real D3D11/D2D path; run with --ignored on a machine with a GPU"]
+fn the_countdown_hud_paints_only_the_frame_the_badge_and_the_number() {
+    let (pixels, width, selection) = render_countdown_hud();
+    let alpha = |x: i32, y: i32| pixel_at(&pixels, width, x as u32, y as u32)[3];
+
+    // 1) 数字还在：选区正中一片主题色（判据与既有那条一致）。
+    let centre = selection.center();
+    let mut accent = 0;
+    for y in (centre.y - 40)..(centre.y + 40) {
+        for x in (centre.x - 40)..(centre.x + 40) {
+            let p = pixel_at(&pixels, width, x as u32, y as u32);
+            if p[0] > 150 && p[0] > p[1] {
+                accent += 1;
+            }
+        }
+    }
+    assert!(accent > 50, "倒计时数字没画出来：只有 {accent} 个主题色像素");
+
+    // 2) 环带里、但不在框线上的点：**完全透明**。这是这次的核心断言。
+    let quarter_x = selection.left + selection.width() / 4;
+    let quarter_y = selection.top + selection.height() / 4;
+    assert_eq!(alpha(quarter_x, selection.top - 4), 0, "环带上沿出现了半透明灰底");
+    assert_eq!(alpha(quarter_x, selection.bottom + 4), 0, "环带下沿出现了半透明灰底");
+    assert_eq!(alpha(selection.left - 4, quarter_y), 0, "环带左沿出现了半透明灰底");
+    assert_eq!(alpha(selection.right + 4, quarter_y), 0, "环带右沿出现了半透明灰底");
+
+    // 3) 框线自己仍然画出来（环带里靠近选区边缘的那一条）。
+    assert!(
+        alpha(quarter_x, selection.top + 1) > 0,
+        "框线没画出来：环带只剩透明"
+    );
+
+    // 4) 选区内部（数字框之外）必须透明：冻结画面与遮罩都不该出现。
+    assert_eq!(
+        alpha(selection.left + 30, selection.top + 30),
+        0,
+        "选区内部还留着冻结画面/遮罩的底色"
+    );
+    assert_eq!(
+        alpha(selection.left + 30, selection.bottom - 30),
+        0,
+        "选区内部还留着冻结画面/遮罩的底色"
     );
 }

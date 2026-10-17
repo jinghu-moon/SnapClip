@@ -18,6 +18,7 @@ use snapclip_app::history::icons::SourceIcons;
 use snapclip_app::history::model::HistoryState;
 use snapclip_app::history::view::HistoryView;
 use snapclip_app::settings::{Settings, SettingsChanged, SettingsStore, SettingsView};
+use snapclip_capture::units::{LabelDisplay, LengthUnit};
 use snapclip_history::store::Store;
 use snapclip_model::{
     AppEvent, ClipboardEvent, PayloadData, PayloadKind, PayloadRef, Publication, PublicationOrigin,
@@ -424,6 +425,122 @@ fn toggling_the_setting_writes_it_to_disk(cx: &mut TestAppContext) {
 
     // The assertion that matters: the file changed, not just the rendered state.
     assert!(!SettingsStore::new(&data).load().deep_select_text_runs);
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+/// The label unit has the same acceptance as a switch: picking `dp` has to reach the file,
+/// because that file is what the shell hands to the next capture session.
+#[gpui_kit::test]
+fn picking_the_label_unit_writes_it_to_disk(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+
+    let data = temp_root("settings-unit");
+    let store = SettingsStore::new(&data);
+    store.save(&Settings::default()).expect("seed settings");
+
+    let mut view: Option<Entity<SettingsView>> = None;
+    let handle = cx.open_window(size(px(640.), px(480.)), |window, cx| {
+        let entity = cx.new(|_| SettingsView::new(SettingsStore::new(&data)));
+        view = Some(entity.clone());
+        Root::new(entity, window, cx)
+    });
+    let view = view.expect("view constructed");
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            view.read(cx).settings().length_unit,
+            LengthUnit::Px,
+            "the group starts from the file, which holds the default"
+        );
+
+        window.click("label-unit-dp", cx);
+
+        assert_eq!(view.read(cx).settings().length_unit, LengthUnit::Dp);
+    })
+    .unwrap();
+
+    assert_eq!(SettingsStore::new(&data).load().length_unit, LengthUnit::Dp);
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+/// The unit suffix is a switch like the others, and it has the same acceptance: clicking it has to
+/// reach the file the next capture session is started from.
+#[gpui_kit::test]
+fn the_unit_suffix_switch_writes_to_disk(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+
+    let data = temp_root("settings-unit-suffix");
+    SettingsStore::new(&data)
+        .save(&Settings::default())
+        .expect("seed settings");
+
+    let mut view: Option<Entity<SettingsView>> = None;
+    let handle = cx.open_window(size(px(640.), px(480.)), |window, cx| {
+        let entity = cx.new(|_| SettingsView::new(SettingsStore::new(&data)));
+        view = Some(entity.clone());
+        Root::new(entity, window, cx)
+    });
+    let view = view.expect("view constructed");
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(view.read(cx).settings().show_unit, "the default is on");
+
+        window.click("label-unit-suffix", cx);
+
+        assert!(!view.read(cx).settings().show_unit);
+    })
+    .unwrap();
+
+    assert!(!SettingsStore::new(&data).load().show_unit);
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+/// The badge's menu in the overlay is the second way to change the display settings, and the page is
+/// what writes them down: the shell hands the menu's result to the page, not to the file, so the two
+/// cannot disagree (docs/23 §14.53).
+#[gpui_kit::test]
+fn adopting_the_overlay_label_writes_it_to_disk(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+
+    let data = temp_root("settings-adopt-label");
+    SettingsStore::new(&data)
+        .save(&Settings::default())
+        .expect("seed settings");
+
+    let mut view: Option<Entity<SettingsView>> = None;
+    let handle = cx.open_window(size(px(640.), px(480.)), |window, cx| {
+        let entity = cx.new(|_| SettingsView::new(SettingsStore::new(&data)));
+        view = Some(entity.clone());
+        Root::new(entity, window, cx)
+    });
+    let view = view.expect("view constructed");
+
+    let from_the_menu = LabelDisplay {
+        length_unit: LengthUnit::Dp,
+        show_size: false,
+        show_coordinates: false,
+        show_unit: false,
+    };
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            view.update(cx, |view, cx| view.adopt_label(from_the_menu, cx)),
+            "the menu's values differ from the page's"
+        );
+        // The same values again are not a change: a capture the user never opened the menu in must
+        // not rewrite the file, and must not announce a change to capture either.
+        assert!(
+            !view.update(cx, |view, cx| view.adopt_label(from_the_menu, cx)),
+            "nothing changed the second time"
+        );
+    })
+    .unwrap();
+
+    let saved = SettingsStore::new(&data).load();
+    assert_eq!(saved.length_unit, LengthUnit::Dp);
+    assert!(!saved.show_coordinates && !saved.show_unit);
     let _ = std::fs::remove_dir_all(&data);
 }
 

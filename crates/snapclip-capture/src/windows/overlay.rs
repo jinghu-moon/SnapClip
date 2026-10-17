@@ -26,28 +26,30 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::{
     Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT, WPARAM},
     Graphics::Gdi::{
-        BeginPaint, CreateRectRgn, EndPaint, PAINTSTRUCT, ScreenToClient, SetWindowRgn,
+        BeginPaint, EndPaint, PAINTSTRUCT, ScreenToClient, SetWindowRgn,
     },
     System::LibraryLoader::GetModuleHandleW,
     System::Threading::GetCurrentThreadId,
     UI::{
         Controls::WM_MOUSELEAVE,
-        Input::Ime::{ImmGetContext, ImmReleaseContext, ImmSetOpenStatus},
+        Input::Ime::{HIMC, ImmAssociateContext, ImmGetContext, ImmReleaseContext, ImmSetOpenStatus},
         Input::KeyboardAndMouse::{
-            GetAsyncKeyState, GetKeyState, MAPVK_VSC_TO_VK, MapVirtualKeyW, SetFocus, VK_CONTROL,
+            GetAsyncKeyState, GetKeyState, MAPVK_VSC_TO_VK, MapVirtualKeyW, ReleaseCapture,
+            SetCapture, SetFocus, VK_CONTROL,
             VK_LBUTTON, VK_LSHIFT, VK_MBUTTON, VK_MENU, VK_RBUTTON, VK_RSHIFT, VK_SHIFT,
         },
         WindowsAndMessaging::{
             CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow,
             DispatchMessageW, GetCursorPos, GetForegroundWindow, GetMessageW, GetSystemMetrics,
-            HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, IDC_CROSS, IDC_SIZEALL, IDC_SIZENESW,
+            HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_SIZEALL, IDC_SIZENESW,
             IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, KillTimer, LoadCursorW, MA_ACTIVATE, MSG,
             PeekMessageW, PostQuitMessage, PostThreadMessageW, RegisterClassW, SM_CXDRAG, SW_HIDE,
             SW_SHOW, SetCursor, SetCursorPos, SetForegroundWindow, SetTimer,
             SetWindowDisplayAffinity,
             SetWindowPos, ShowWindow, TranslateMessage, UnregisterClassW, WDA_EXCLUDEFROMCAPTURE,
             WM_APP, WM_DESTROY, WM_DEVICECHANGE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND,
-            WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE,
+            WM_CHAR, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
+            WM_MOUSEACTIVATE,
             WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR,
             WM_SETFOCUS, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW,
             WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
@@ -114,6 +116,18 @@ const DWELL_TIMER_ID: usize = 0x51_C0DF;
 /// Periodic timer that re-validates the hovered window on the detection worker
 /// (docs/14 §5.5). It only *enqueues*; the DWM read happens off this thread.
 const HOVER_TIMER_ID: usize = 0x51_C0E0;
+
+
+/// 光标闪烁的低频计时器（docs/23 §14.55）。id 必须与其它几个都不同：`0x51_C0E1` 已被
+/// `REGION_DELAY_TIMER_ID` 与 `REFINEMENT_TIMER_ID` 同时占用（既有缺陷，另行记录）。
+const CARET_TIMER_ID: usize = 0x51_C0E2;
+
+/// 延时倒计时：每秒一跳，推动选区正中的剩余秒数（docs/23 §14.55.9）。到点即停。
+const COUNTDOWN_TIMER_ID: usize = 0x51_C0E4;
+const COUNTDOWN_TICK_MS: u32 = 1000;
+
+/// 光标闪烁周期：500 ms 一亮一暗，与常见文本框一致。
+const CARET_BLINK_MS: u32 = 500;
 
 /// One-shot timer that fires once the hovered target has been still for
 /// [`crate::window_detection::REFINEMENT_DWELL_MS`] (docs/18 §2). Expiry only
@@ -345,6 +359,12 @@ impl OverlayPlatform for WindowsOverlay {
         }
     }
 
+    /// The one slot both writers share: the settings file (through `set_preferences`) and the
+    /// custom-region panel (which edits the session's copy and publishes it back, docs/23 §14.54).
+    fn preferences(&self) -> Option<OverlayPreferences> {
+        self.shared.lock().ok().map(|shared| shared.preferences.clone())
+    }
+
     fn take_selection(&self) -> Option<Arc<SelectionPixels>> {
         self.shared
             .lock()
@@ -546,12 +566,82 @@ struct OverlayController {
     /// The preferences this session started with (`OverlayPreferences`): a change in the settings
     /// applies from the next session.
     preferences: OverlayPreferences,
+    /// Where the badge was painted last frame, in back-buffer coordinates.
+    ///
+    /// The panel hangs off the badge and the badge itself is the pointer's way in, so the hit test
+    /// reads the rectangle the paint pass used instead of measuring the label a second way.
+    label_badge: Option<Rect>,
+    /// Whether the press that is down was taken by overlay chrome (the custom-region panel), so its
+    /// release is swallowed with it and never reaches the selection gesture.
+    chrome_swallowed_press: bool,
+    /// The custom-region panel, while this session has it open (docs/23 §14.54). It edits the
+    /// session's own selection rather than a copy, so what the panel shows and what gets captured
+    /// are the same rectangle by construction.
+    region_panel: Option<crate::region::RegionPanel>,
+    /// 两处分段器每段的宽度：**唯一来源**，绘制与命中都读它（docs/23 §14.55.6）。
+    /// 量宽要设备层，所以面板打开那一刻量一次；初值是"量宽之前的历史尺寸"，界面不会因此走样。
+    segment_widths: crate::geometry::SegmentWidths,
+    /// 光标这一刻可见吗；由 `CARET_TIMER_ID` 翻转（docs/23 §14.55）。
+    caret_visible: bool,
+    /// 倒计时 HUD 里正在拖边框/手柄改大小。这是全仓唯一会 `SetCapture` 的手势：HUD 的窗口只在
+    /// "选框环"上存在，往外拖时指针立刻离开窗口，不捕获就收不到 `WM_MOUSEMOVE`
+    /// （docs/23 §14.55.9.3）。
+    countdown_dragging: bool,
+    /// 正在拖的那个方向。拖动中指针会离开边框（HUD 的命中判定按指针位置答"外面"），
+    /// 光标因此不能按命中结果算，否则会从改大小跳回箭头（docs/23 §14.55.9.3）。
+    countdown_handle: Option<Handle>,
+    /// 闪烁计时器当前是否开着（只在变化时 Set/Kill，否则重复 SetTimer 会重置计数）。
+    caret_timer_armed: bool,
+    /// The overlay window's IME context, saved while the panel is open (docs/23 §14.55).
+    ///
+    /// The panel is a numeric form, and a Chinese IME eats digits before `WM_KEYDOWN` sees them —
+    /// `ImmSetOpenStatus`, the shim this crate relied on, is ignored by modern TSF IMEs. Detaching
+    /// the context gives this HWND plain keys; closing the panel puts it back. Only our own window
+    /// is affected.
+    saved_ime: Option<HIMC>,
+    /// 延时到点后这一次会话要不要**贴图**（而不是开浮层等用户确认）。
+    ///
+    /// 面板里选延时并确认时置位；`start_session` 只在"这次启动是延时自己发起的"时保留它，
+    /// 用户手动起的会话会把它和 `pending_region` 一起清掉，不留副作用。
+    pin_after_delay: bool,
+    /// 让 `start_session` 知道这次启动来自延时（同步的一次性标记）。
+    delay_in_flight: bool,
+    /// The region a delayed capture is waiting to apply, in desktop pixels.
+    ///
+    /// Set when the panel's `开始截图` chooses a delay; consumed by the session that starts when the
+    /// timer fires, once it is ready to take a selection (docs/23 §14.54).
+    pending_region: Option<crate::region::Region>,
+    /// 延时期间的倒计时（`Some` 时浮层留在屏幕上显示剩余秒数，docs/23 §14.55.9）。
+    countdown: Option<session::Countdown>,
     /// The loupe's hint row, built from this session's keymap.
     loupe_hints: Arc<[LoupeHint]>,
     /// The shortcut guide's groups, built from this session's keymap; empty when it is off.
     guide_groups: Arc<[GuideGroup]>,
     /// The guide's fade.
     guide: GuideFade,
+    /// 已经presented 的帧数，按 HUD / 普通分：倒计时过渡时"有没有画过普通帧"靠它回答
+    /// （写在 `countdown exit=` 那条日志里，docs/23 §14.55.9.5）。
+    frames_normal: u64,
+    frames_hud: u64,
+    /// 进入倒计时那一刻的普通帧计数：退出时打差值，直接回答"过渡期间画过普通帧没有"。
+    frames_normal_at_countdown: u64,
+    /// 倒计时 HUD 是否仍在生效（`arm_countdown` 置位，`finish_countdown` 清除）。
+    ///
+    /// 这不是"别让谁 invalidate"的约定，而是渲染入口的一道结构闸：生效期间只许画 HUD，
+    /// 普通帧请求被直接压掉（docs/23 §14.55.9.6）。
+    countdown_hud: bool,
+    /// 倒计时期间压暗选区之外的那一层（独立的 layered 窗口，跨进程点击穿透）。
+    /// 只在倒计时ing时显示，三个出口都经 `countdown_exit_steps` 收掉（docs/23 §14.55.9.8）。
+    dim_layer: dim_layer::DimLayer,
+    /// 普通帧里**窗口可见**的那些（`IsWindowVisible`）：用来把"露出来的一帧"和"看不见的无害帧"分开。
+    frames_normal_visible: u64,
+    /// 被上面那道闸压掉的普通帧请求。
+    frames_suppressed: u64,
+    frames_normal_visible_at_countdown: u64,
+    frames_suppressed_at_countdown: u64,
+    /// 两处分段器的选中块平移（单位、延时各一份，docs/23 §14.55.5）。
+    unit_slide: SegmentSlide,
+    delay_slide: SegmentSlide,
     /// The GPU slot index of the most recent async sample request.
     sample_slot: Option<usize>,
     /// Object-based annotation document (L2 layer).
@@ -675,9 +765,33 @@ impl OverlayController {
             magnifier_zoom: MagnifierConfig::ZOOM_DEFAULT,
             held: None,
             preferences: OverlayPreferences::default(),
+            label_badge: None,
+            chrome_swallowed_press: false,
+            region_panel: None,
+            segment_widths: crate::geometry::SegmentWidths::fixed(1.0),
+            caret_visible: true,
+            caret_timer_armed: false,
+            saved_ime: None,
+            pending_region: None,
+            countdown: None,
+            countdown_dragging: false,
+            countdown_handle: None,
+            pin_after_delay: false,
+            delay_in_flight: false,
             loupe_hints: Arc::from(Vec::new()),
             guide_groups: Arc::from(Vec::new()),
             guide: GuideFade::default(),
+            frames_normal: 0,
+            frames_hud: 0,
+            frames_normal_at_countdown: 0,
+            countdown_hud: false,
+            dim_layer: dim_layer::DimLayer::default(),
+            frames_normal_visible: 0,
+            frames_suppressed: 0,
+            frames_normal_visible_at_countdown: 0,
+            frames_suppressed_at_countdown: 0,
+            unit_slide: SegmentSlide::default(),
+            delay_slide: SegmentSlide::default(),
             sample_slot: None,
             annotation_doc: AnnotationDocument::new(),
             annotation_tool: None,
@@ -702,6 +816,7 @@ impl OverlayController {
 // font gate reaches it. `pub(crate)`, not `pub`: nothing here is external API.
 pub(crate) use window_host::*;
 
+mod dim_layer;
 mod hover;
 mod input;
 mod render_submit;
@@ -712,3 +827,27 @@ mod state;
 mod tests;
 mod window_host;
 mod window_restore;
+
+#[cfg(test)]
+mod timer_id_tests {
+    use super::*;
+
+    /// 每个窗口计时器都要有自己的 id：`WM_TIMER` 只带 id，重复的 id 会让分发把甲当成乙。
+    /// 这里正是因为抢了同一个值（延时截图与悬停细化都是 0x51_C0E1）才加的守卫（docs/23 §14.55.1）。
+    #[test]
+    fn every_window_timer_id_is_distinct() {
+        let ids = [
+            ("RENDER", RENDER_TIMER_ID),
+            ("DWELL", DWELL_TIMER_ID),
+            ("HOVER", HOVER_TIMER_ID),
+            ("CARET", CARET_TIMER_ID),
+            ("COUNTDOWN", COUNTDOWN_TIMER_ID),
+            ("REFINEMENT", REFINEMENT_TIMER_ID),
+        ];
+        for (index, (name, id)) in ids.iter().enumerate() {
+            for (other_name, other) in ids.iter().skip(index + 1) {
+                assert_ne!(id, other, "{name} 与 {other_name} 用了同一个计时器 id 0x{id:X}");
+            }
+        }
+    }
+}

@@ -477,7 +477,7 @@ impl OverlayController {
     pub(super) fn end_scroll(&mut self) -> Option<ScrollRun> {
         let run = self.scroll.take()?;
         hotkey::unregister_scoped(self.window, hotkey::CANCEL_HOTKEY);
-        self.set_window_region(None);
+        self.set_window_region(&[]);
         Some(run)
     }
 }

@@ -85,6 +85,11 @@ pub const EXPORT_HOTKEY: Hotkey = Hotkey {
 };
 
 /// Every global hotkey this crate registers, in registration order.
+///
+/// Registration is all-or-nothing (see [`register`]), so a row here is a promise the overlay can
+/// start at all. That is why the custom-region panel has **no** global hotkey: it opens from the
+/// size badge inside a session the user already started, and putting an optional key in this table
+/// once cost the primary `F5` its registration (docs/23 §14.54).
 pub const HOTKEYS: [Hotkey; 3] = [CAPTURE_HOTKEY, SCROLL_HOTKEY, EXPORT_HOTKEY];
 
 /// `Esc` while a scroll session runs (`docs/33`). The overlay is only the panel then, so a click on
@@ -325,7 +330,9 @@ mod tests {
     /// L1: the table is what `register` walks, so the registration order is the table order.
     #[test]
     fn the_registration_order_is_the_table_order() {
-        assert_eq!(HOTKEYS, [CAPTURE_HOTKEY, SCROLL_HOTKEY, EXPORT_HOTKEY]);
+        assert_eq!(
+            HOTKEYS,
+            [CAPTURE_HOTKEY, SCROLL_HOTKEY, EXPORT_HOTKEY]        );
     }
 
     /// L3 (`docs/32` §7, row 79): both keys really register on this desktop, and releasing them

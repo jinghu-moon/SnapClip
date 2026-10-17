@@ -108,11 +108,21 @@ fn spawn_pin_events(pins: &pin::PinManager, window: &mut Window, cx: &mut Contex
     let pins = pins.clone();
     cx.spawn_in(window, async move |shell, cx| {
         loop {
-            let reported = pins.drain_events();
-            if reported > 0 {
-                // A pinned image that never appeared is the kind of failure the user will
-                // notice as "F6 did nothing", so it belongs in the log.
-                eprintln!("[snapclip-app] pin: {reported} 张贴图没能创建");
+            let report = pins.drain_events();
+            if report.any() {
+                // 说人话：创建、关闭、没能创建是三件事。只有第三件需要担心
+                //（"F6 没反应"的那种失败），前两件是正常生命周期（docs/23 §14.55.9.6）。
+                let mut parts = Vec::new();
+                if report.created > 0 {
+                    parts.push(format!("创建 {} 张", report.created));
+                }
+                if report.closed > 0 {
+                    parts.push(format!("已关闭 {} 张", report.closed));
+                }
+                if report.failed > 0 {
+                    parts.push(format!("{} 张没能创建", report.failed));
+                }
+                eprintln!("[snapclip-app] pin: {}", parts.join("、"));
                 let acted = shell.update_in(cx, |_shell, _window, cx| cx.notify());
                 if acted.is_err() {
                     // The shell is gone; nothing left to report to.
@@ -154,6 +164,9 @@ pub struct Shell {
     /// thread could not be started, which is reported and survived — F5 capture does not
     /// depend on it.
     pins: Option<pin::PinManager>,
+    /// Drains the capture events the overlay publishes, so a display setting changed on the size
+    /// badge reaches the settings file (docs/23 §14.53). Held because dropping the task stops it.
+    _label_sync: Task<()>,
 }
 
 /// Which capability the window is showing. A desktop shell keeps navigation persistent, so
@@ -203,18 +216,42 @@ impl Shell {
         // `pin_source` is the other half of F6: capture remembers the selection it just wrote
         // (pixels plus their place on the desktop), and the pin host takes it from there.
         // Capture does not know pins exist; the shell is what joins the two.
-        let (capture, pin_source) = match capture::start(
+        let (capture, pin_source, capture_events) = match capture::start(
             &data,
             events.clone(),
             initial.detection_options(),
             initial.overlay_preferences(),
         ) {
-            Ok((runtime, pin_source)) => (Some(runtime), Some(pin_source)),
+            Ok((runtime, pin_source, capture_events)) => {
+                (Some(runtime), Some(pin_source), Some(capture_events))
+            }
             Err(error) => {
                 eprintln!("[snapclip-app] capture unavailable: {error}");
-                (None, None)
+                (None, None, None)
             }
         };
+        // The overlay's size badge carries its own menu for the display settings this page shows
+        // (docs/23 §14.53). The overlay edits its session's copy and publishes it where the next
+        // session reads it; this drain is what notices and writes it down, so a change made on the
+        // badge survives a restart instead of lasting only until the app is closed. It reads
+        // through the settings page rather than the file, so the page and the file cannot disagree.
+        let mut stream = events.subscribe();
+        let _label_sync = cx.spawn(async move |this: WeakEntity<Self>, cx| {
+            while let Some(event) = stream.next().await {
+                if !matches!(event, snapclip_model::events::AppEvent::Capture(_)) {
+                    continue;
+                }
+                // The change happens inside `Entity::update`, which is the rule that keeps
+                // rendering single-threaded — the same shape the history screen uses.
+                if this
+                    .update(cx, |shell, cx| shell.adopt_overlay_label(cx))
+                    .is_err()
+                {
+                    // The shell is gone; stop draining rather than spinning on a closed bus.
+                    break;
+                }
+            }
+        });
         // The clipboard pipeline publishes `AppEvent::Clipboard` on the bus above, which is
         // what makes the history screen refresh by itself while it is open.
         let clipboard = match store.clone() {
@@ -257,6 +294,16 @@ impl Shell {
             },
             None => None,
         };
+        // 延时截图到点要贴图：把那件事接到与 `F6` **完全相同**的一条路上——往贴图宿主
+        // 线程投一条 `WM_HOTKEY`。捕获侧只说"请贴图"，怎么贴由这里决定（docs/23 §14.55.8）。
+        if let Some(events) = capture_events.as_ref() {
+            if let Some(pins) = pins.as_ref() {
+                let poster = pins.pin_poster();
+                events.set_pin_poster(std::sync::Arc::new(move || {
+                    poster.post().map_err(|error| error.to_string())
+                }));
+            }
+        }
         Self {
             history,
             settings,
@@ -266,7 +313,26 @@ impl Shell {
             capture,
             clipboard,
             pins,
+            _label_sync,
         }
+    }
+
+    /// Take the display settings the overlay is holding, if the badge's menu changed them
+    /// (docs/23 §14.53).
+    ///
+    /// Called on every capture event, which is every moment the overlay could have moved them; the
+    /// write itself happens only when a value actually differs, so a capture the user never touched
+    /// costs one comparison. The settings page is the writer, so the change is saved, the page is
+    /// updated, and the page's own `SettingsChanged` subscriber hands it back to capture for the
+    /// next session — one path for both places the setting can be changed from.
+    fn adopt_overlay_label(&mut self, cx: &mut Context<Self>) {
+        let Some(preferences) = self.capture.as_ref().and_then(|capture| capture.preferences())
+        else {
+            return;
+        };
+        let _ = self
+            .settings
+            .update(cx, |view, cx| view.adopt_label(preferences.label, cx));
     }
 
     /// The shell's event channel. The composition root is the only place that creates it,

@@ -652,3 +652,477 @@ fn a_guide_at_rest_does_not_keep_the_tick_alive() {
     assert!(!fade.advance(false, Instant::now()));
     assert!(!fade.running());
 }
+
+/// 倒计时期间窗口只剩"屏幕上真有 UI 的地方"：选框环、角标、倒计时小框。
+/// 选区内部（除这三处）不再属于窗口 —— 这正是点击能跨进程落到别的应用的原因
+/// （`HTTRANSPARENT` 只覆盖同线程；收窄到整个选区也不成立，选区常覆盖大半屏；只留小框又会让
+/// "截图框消失"。docs/23 §14.55.9）。
+#[test]
+fn the_countdown_keeps_only_the_ui_that_is_on_screen() {
+    use crate::windows::win::window::WindowRegion;
+    let selection = Rect::new(120, 80, 620, 480);
+    let badge = Rect::new(120, 44, 300, 70);
+    let pieces = super::session::countdown_window_pieces(selection, Some(badge), 96);
+
+    let (outer, inner) = pieces
+        .iter()
+        .find_map(|piece| match piece {
+            WindowRegion::Ring { outer, inner } => Some((*outer, *inner)),
+            WindowRegion::Rect(_) => None,
+        })
+        .expect("选框环必须在里面");
+    assert!(
+        outer.left < selection.left && outer.right > selection.right,
+        "{outer:?}"
+    );
+    assert!(
+        inner.left > selection.left && inner.right < selection.right,
+        "{inner:?}"
+    );
+    assert!(inner.left - outer.left >= 8, "环宽要够放框线与手柄圆点");
+    assert_eq!(outer.center(), selection.center(), "环与选区同心");
+
+    assert!(
+        pieces.contains(&WindowRegion::Rect(badge)),
+        "角标要留在窗口里，否则倒计时期间它会消失"
+    );
+    let number = pieces
+        .iter()
+        .filter_map(|piece| match piece {
+            WindowRegion::Rect(rect) => Some(*rect),
+            WindowRegion::Ring { .. } => None,
+        })
+        .find(|rect| rect.contains(selection.center()))
+        .expect("倒计时小框");
+    assert_eq!(number.center(), selection.center());
+    assert!(number.width() < selection.width() / 2, "{number:?}");
+
+    // 选区内部、但既不在环带里也不在小框里的那一点，不属于窗口。
+    // 环的内孔里、且离小框足够远的一点（小框以选区中心为中心）。
+    let probe = Point::new(selection.right - 40, selection.bottom - 30);
+    assert!(
+        probe.x > inner.left && probe.x < inner.right && probe.y > inner.top && probe.y < inner.bottom,
+        "探针点落在环的内孔里"
+    );
+    assert!(!number.contains(probe), "探针点不应当落在倒计时小框里");
+
+    // 高 DPI 下跟着放大，中心不变。
+    let hidpi = super::session::countdown_window_pieces(selection, Some(badge), 192);
+    assert_eq!(hidpi.len(), pieces.len());
+    assert_eq!(
+        hidpi
+            .iter()
+            .find_map(|piece| match piece {
+                WindowRegion::Ring { outer, .. } => Some(outer.center()),
+                WindowRegion::Rect(_) => None,
+            })
+            .expect("环"),
+        selection.center()
+    );
+
+    // 空选区：空集合（调用方据此还原整块窗口）。
+    assert!(
+        super::session::countdown_window_pieces(Rect::new(10, 10, 10, 400), None, 96).is_empty()
+    );
+}
+
+/// 倒计时 HUD 的光标：**边框与手柄上是改大小光标，别处一律箭头**。
+///
+/// 断言只比较"光标之间的关系"，不点名具体常量（那两套常量在这里类型不同，而这条测试要钉的是
+/// 映射结构）：同一方位必须同一种光标，不同方位必须不同；HUD 里只有 `Resize` 配得上改大小光标。
+#[test]
+fn the_countdown_only_offers_a_resize_cursor_on_the_frame() {
+    use super::input::{countdown_cursor, selection_cursor};
+    use crate::geometry::{Handle, SelectionGeometry};
+
+    let resize = SelectionGeometry::Resize;
+    let arrow = countdown_cursor(SelectionGeometry::Move);
+    // HUD 里：边框/手柄沿用普通状态那套映射，且都不等于箭头。
+    for handle in Handle::ALL {
+        assert_eq!(countdown_cursor(resize(handle)), selection_cursor(resize(handle)));
+        assert_ne!(countdown_cursor(resize(handle)), arrow, "{handle:?} 该是改大小光标");
+    }
+    // 边框之外的三种命中在 HUD 里都是箭头（窗口只在环上，那里已经不属于它）。
+    for other in [
+        SelectionGeometry::Move,
+        SelectionGeometry::Create,
+        SelectionGeometry::Outside,
+    ] {
+        assert_eq!(countdown_cursor(other), arrow, "{other:?} 在 HUD 里该是普通箭头");
+    }
+    // 普通状态那套映射的结构原样保留（回归）：方位相同→同一种，方位不同→不同种，
+    // 空白与新建都是十字，移动是四向箭头。
+    assert_eq!(selection_cursor(resize(Handle::TopLeft)), selection_cursor(resize(Handle::BottomRight)));
+    assert_eq!(selection_cursor(resize(Handle::TopRight)), selection_cursor(resize(Handle::BottomLeft)));
+    assert_eq!(selection_cursor(resize(Handle::Top)), selection_cursor(resize(Handle::Bottom)));
+    assert_eq!(selection_cursor(resize(Handle::Left)), selection_cursor(resize(Handle::Right)));
+    assert_ne!(selection_cursor(resize(Handle::TopLeft)), selection_cursor(resize(Handle::TopRight)));
+    assert_ne!(selection_cursor(resize(Handle::Left)), selection_cursor(resize(Handle::Top)));
+    assert_eq!(selection_cursor(SelectionGeometry::Create), selection_cursor(SelectionGeometry::Outside));
+    assert_ne!(selection_cursor(SelectionGeometry::Move), selection_cursor(SelectionGeometry::Outside));
+    assert_ne!(selection_cursor(SelectionGeometry::Move), selection_cursor(resize(Handle::Left)));
+}
+
+/// 倒计时里拖完边框：**到点贴图用的区域必须是新选区**，不是点「确定」那一刻的旧区域。
+///
+/// 这是这条链路最容易漏的一环：改了框却不更新 `pending_region`，贴出来还是原来那块。
+#[test]
+fn resizing_during_the_countdown_moves_the_pin_region_with_the_frame() {
+    use crate::geometry::{Point, Rect};
+    let origin = Point::new(0, 412);
+    let old = Rect::new(0, 412, 1698, 1815);
+    let new = Rect::new(40, 500, 1200, 1400);
+
+    let (pin, pieces) = OverlayController::countdown_after_resize(old, origin, None, 96);
+    let (pin_after, pieces_after) = OverlayController::countdown_after_resize(new, origin, None, 96);
+
+    assert_eq!(
+        pin.map(|region| region.to_rect(origin)),
+        Some(old),
+        "起手贴图区域就是点「确定」那一刻的选区"
+    );
+    assert_eq!(
+        pin_after.map(|region| region.to_rect(origin)),
+        Some(new),
+        "拖完之后贴图区域必须跟着新选区走"
+    );
+    assert_ne!(
+        pin_after.map(|region| region.to_rect(origin)),
+        pin.map(|region| region.to_rect(origin)),
+        "两份区域必须真的不同，否则这条测试没有区分力"
+    );
+    // 窗口区域同源跟随：环的内孔跟着新选区走。
+    assert_eq!(
+        pieces_after,
+        super::session::countdown_window_pieces(new, None, 96),
+        "HUD 的窗口区域也要按新选区重算"
+    );
+    assert_ne!(pieces, pieces_after);
+    // 退化选区不给贴图区域（会话会拒绝，不该静默贴一块空图）。
+    let (degenerate, _) =
+        OverlayController::countdown_after_resize(Rect::new(10, 10, 10, 400), origin, None, 96);
+    assert!(degenerate.is_none());
+}
+
+/// 拖动中指示方向要**锁住**：指针离开边框后命中的是"外面"，按命中结果算光标会跳回箭头。
+#[test]
+fn the_cursor_stays_on_the_dragged_direction_while_dragging() {
+    use super::input::{countdown_cursor_while, selection_cursor};
+    use crate::geometry::{Handle, SelectionGeometry};
+
+    let dragged = countdown_cursor_while(
+        Some(Handle::Left),
+        SelectionGeometry::Outside,
+    );
+    assert_eq!(
+        dragged,
+        selection_cursor(SelectionGeometry::Resize(Handle::Left)),
+        "拖着左边框时指针跑到外面，光标仍该是左右改大小"
+    );
+    assert_eq!(
+        countdown_cursor_while(Some(Handle::Right), SelectionGeometry::Outside),
+        dragged,
+        "左右两条边共用同一个水平改大小光标"
+    );
+    assert_ne!(
+        countdown_cursor_while(Some(Handle::Top), SelectionGeometry::Outside),
+        dragged,
+        "正交方向要显示不同的光标（垂直 ≠ 水平）"
+    );
+    // 不拖的时候才按命中结果走（外面是箭头、边框上是改大小）。
+    assert_eq!(
+        countdown_cursor_while(None, SelectionGeometry::Outside),
+        countdown_cursor_while(None, SelectionGeometry::Move),
+        "不拖时外面/内部都是箭头"
+    );
+    assert_ne!(
+        countdown_cursor_while(None, SelectionGeometry::Resize(Handle::Top)),
+        countdown_cursor_while(None, SelectionGeometry::Outside),
+        "不拖时边框上仍是改大小光标"
+    );
+}
+
+/// 退出倒计时的**顺序**必须钉住（docs/23 §14.55.9.5）：
+///
+/// * 到点 / 失败：**先让窗口不可见**，再清倒计时、还原区域，且**不请求重绘** —— 那一帧普通画面
+///   （冻结画面 + 遮罩）就是用户看到的"框线外侧突然出现一圈暗灰"；
+/// * Esc 取消：窗口要继续可见，所以没有 Hide 那一步，最后重画一帧普通画面。
+///
+/// 这条测的是三个出口的**交错先后**，不是结果。上一版只断言了结果，抓不到中间那一帧。
+#[test]
+fn leaving_the_countdown_hides_the_window_before_it_stops_the_hud() {
+    use super::session::{CountdownExit, ExitStep, countdown_exit_steps};
+
+    let index = |steps: &[ExitStep], step: ExitStep| steps.iter().position(|s| *s == step);
+
+    for exit in [CountdownExit::Fire, CountdownExit::Fail] {
+        let steps = countdown_exit_steps(exit);
+        let hide = index(steps, ExitStep::Hide)
+            .unwrap_or_else(|| panic!("{exit:?} 应当先隐藏窗口：{steps:?}"));
+        let clear = index(steps, ExitStep::ClearCountdown)
+            .unwrap_or_else(|| panic!("{exit:?} 应当清倒计时：{steps:?}"));
+        assert!(
+            hide < clear,
+            "{exit:?} 必须先不可见、再退出 HUD 渲染模式：{steps:?}"
+        );
+        assert_eq!(
+            index(steps, ExitStep::Repaint),
+            None,
+            "{exit:?} 不该请求重绘 —— 那一帧就是灰底：{steps:?}"
+        );
+    }
+
+    let steps = countdown_exit_steps(CountdownExit::Cancel);
+    assert_eq!(
+        index(steps, ExitStep::Hide),
+        None,
+        "取消时窗口要继续可见：{steps:?}"
+    );
+    assert_eq!(
+        index(steps, ExitStep::Repaint),
+        Some(steps.len() - 1),
+        "取消要重画一帧普通画面，且是最后一步：{steps:?}"
+    );
+    assert!(
+        index(steps, ExitStep::ClearCountdown) < index(steps, ExitStep::RestoreRegion),
+        "取消也要先清状态、再还原区域：{steps:?}"
+    );
+    // 遮罩层也必须跟着"退出可见状态"一起收，不能留到最后（否则它会盖着下一个会话）。
+    for exit in [CountdownExit::Fire, CountdownExit::Cancel, CountdownExit::Fail] {
+        let steps = countdown_exit_steps(exit);
+        assert!(
+            steps.contains(&ExitStep::HideDim),
+            "{exit:?} 必须收掉遮罩层: {steps:?}"
+        );
+        let hide_dim = steps.iter().position(|s| *s == ExitStep::HideDim).unwrap();
+        let clear = steps
+            .iter()
+            .position(|s| *s == ExitStep::ClearCountdown)
+            .unwrap();
+        assert!(
+            hide_dim < clear,
+            "{exit:?} 必须先收遮罩层再清状态: {steps:?}"
+        );
+    }
+}
+
+/// 进入倒计时的顺序：**先换画面，再改窗口形状/叠加层**（docs/23 §14.55.9.9）。
+///
+/// 反过来（先收窄窗口区域）会在那一刻把屏幕上旧画面的遮罩切掉一半、而新遮罩还没出现 ——
+/// 用户看到的就是"面板消失时选区外的暗色闪一下"。
+#[test]
+fn entering_the_countdown_paints_the_hud_before_it_reshapes_the_window() {
+    use super::session::{EnterStep, countdown_enter_steps};
+
+    let steps = countdown_enter_steps();
+    let index = |step: EnterStep| {
+        steps
+            .iter()
+            .position(|s| *s == step)
+            .unwrap_or_else(|| panic!("{step:?} 必须在进入顺序里：{steps:?}"))
+    };
+
+    // 暗色不能断档：遮罩先就位，再由 HUD 帧把它"露"出来。
+    assert!(
+        index(EnterStep::ShowDim) < index(EnterStep::PaintHud),
+        "先叠遮罩、再换画面，否则旧遮罩先消失一段时间：{steps:?}"
+    );
+    // 也不能叠层：提层排在换画面之前，不透明的旧画面会立刻盖住刚出现的遮罩。
+    assert!(
+        index(EnterStep::ShowDim) < index(EnterStep::RaiseOverlay),
+        "遮罩就位之后才谈得上提层：{steps:?}"
+    );
+    assert!(
+        index(EnterStep::RaiseOverlay) < index(EnterStep::PaintHud),
+        "提层必须在换画面之前：{steps:?}"
+    );
+    // HUD 帧在选区外透明，收窄区域放在换画面之后即可。
+    assert!(
+        index(EnterStep::PaintHud) < index(EnterStep::NarrowRegion),
+        "先换画面再收窄区域：{steps:?}"
+    );
+    // 同步换画面只能发生一次：多一次就等于把交接顺序交还给消息循环。
+    assert_eq!(
+        steps
+            .iter()
+            .filter(|step| **step == EnterStep::PaintHud)
+            .count(),
+        1,
+        "进入路径里 PaintHud 只能出现一次：{steps:?}"
+    );
+}
+
+/// 倒计时期间**结构上**不许画普通帧（docs/23 §14.55.9.6）。
+///
+/// 不是"别让谁 invalidate"的约定：闸生效着、倒计时却已结束（窗口还没隐藏）时，渲染入口把
+/// 这一帧直接压掉 —— "先画一帧再隐藏"就是用户看到的那下灰底。
+#[test]
+fn the_countdown_gate_never_paints_a_normal_frame() {
+    use super::render_submit::{frame_kind, FrameKind};
+
+    assert_eq!(frame_kind(false, None), FrameKind::Normal, "平时就是普通帧");
+    assert_eq!(frame_kind(false, Some(3)), FrameKind::Hud, "在数就是 HUD");
+    assert_eq!(frame_kind(true, Some(3)), FrameKind::Hud, "在数且闸生效：HUD");
+    assert_eq!(
+        frame_kind(true, None),
+        FrameKind::Suppressed,
+        "闸还生效、倒计时已结束（窗口未隐藏）⇒ 压掉"
+    );
+}
+
+
+// ─── 倒计时遮罩层：带正向对照的活桌面回归（docs/23 §14.55.9.8）────────────────
+
+/// 让测试进程与产品一致地 per-monitor-v2 感知。
+///
+/// 不这么做整个观测都无效：`cargo test` 默认不是 DPI 感知的，窗口坐标是**虚拟化**的，
+/// 而屏幕 `BitBlt` 取**物理**像素 ⇒ 取样矩形与窗口错位（上一版"逐字节相同"的结论
+/// 就是这么来的，§14.55.9.8 的差分实验纠正了它）。
+fn dim_test_be_dpi_aware() {
+    use windows_sys::Win32::UI::HiDpi::{
+        SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    };
+    unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+}
+
+/// 屏幕 `BitBlt`（带 `CAPTUREBLT`，它会包含 layered 窗口）取矩形的平均亮度。
+fn dim_test_screen_mean(rect: Rect) -> f64 {
+    use windows_sys::Win32::Graphics::Gdi::{
+        BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
+        SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT, DIB_RGB_COLORS, SRCCOPY,
+    };
+    let width = rect.width().max(1);
+    let height = rect.height().max(1);
+    unsafe {
+        let mut info: BITMAPINFO = std::mem::zeroed();
+        info.bmiHeader = BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            biHeight: -height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB,
+            biSizeImage: 0,
+            biXPelsPerMeter: 0,
+            biYPelsPerMeter: 0,
+            biClrUsed: 0,
+            biClrImportant: 0,
+        };
+        let screen = GetDC(std::ptr::null_mut());
+        let memory = CreateCompatibleDC(screen);
+        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        let bitmap =
+            CreateDIBSection(memory, &info, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
+        assert!(!bitmap.is_null() && !bits.is_null(), "观测用 DIB 创建失败");
+        SelectObject(memory, bitmap as _);
+        let ok = BitBlt(
+            memory,
+            0,
+            0,
+            width,
+            height,
+            screen,
+            rect.left,
+            rect.top,
+            SRCCOPY | CAPTUREBLT,
+        );
+        assert_ne!(ok, 0, "BitBlt 失败：{}", GetLastError());
+        let pixels = std::slice::from_raw_parts(bits.cast::<u32>(), (width * height) as usize);
+        let sum: f64 = pixels
+            .iter()
+            .map(|pixel| {
+                (pixel & 0xff) as f64
+                    + ((pixel >> 8) & 0xff) as f64
+                    + ((pixel >> 16) & 0xff) as f64
+            })
+            .sum();
+        let mean = sum / (pixels.len() as f64 * 3.0);
+        DeleteObject(bitmap as _);
+        DeleteDC(memory);
+        ReleaseDC(std::ptr::null_mut(), screen);
+        mean
+    }
+}
+
+fn dim_test_pump(ms: u64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// 遮罩层必须**真的把选区之外压暗**，而且这个压暗必须：
+/// 不进截图（排除出捕获）、不进选区（洞是对的）、隐藏后消失。
+///
+/// 观测方式自带**正向对照**：同一块矩形在"显示前 / 显示后 / 排除后 / 隐藏后"四个时刻的
+/// 亮度对比 —— 前两次必须变暗，后两次必须回到基线。没有这条，就只能像上一版那样用
+/// 一张"逐字节相同"的截图得出反结论。
+#[test]
+#[ignore = "L3 (docs/31 D-14): needs a live desktop; shows a real layered window"]
+fn the_countdown_dim_layer_actually_darkens_outside_the_selection() {
+    use windows_sys::Win32::Graphics::Gdi::{GetWindowRgn, PtInRegion};
+
+    dim_test_be_dpi_aware();
+    // 一块固定的测试区域：整块窗口 600×400，洞 400×200 居中。
+    let monitor = Rect::new(160, 160, 760, 560);
+    let selection = Rect::new(260, 260, 660, 460);
+    // 两个探针：环里（选区外）与洞里（选区内）。
+    let outside = Rect::new(180, 180, 220, 220);
+    let inside = Rect::new(440, 340, 480, 380);
+
+    let baseline_outside = dim_test_screen_mean(outside);
+    let baseline_inside = dim_test_screen_mean(inside);
+
+    let mut layer = super::dim_layer::DimLayer::default();
+    layer.show(monitor, selection).expect("遮罩层应当显示");
+    // 临时摘掉"排除出截图"，否则截图看不见它（这正是上一轮观测失效的一半原因）。
+    layer.set_capture_exclusion(false);
+    dim_test_pump(260);
+
+    let shown_outside = dim_test_screen_mean(outside);
+    let shown_inside = dim_test_screen_mean(inside);
+    assert!(
+        shown_outside <= baseline_outside - 25.0,
+        "选区外必须明显变暗：{baseline_outside:.1} -> {shown_outside:.1}"
+    );
+    assert!(
+        (shown_inside - baseline_inside).abs() <= 6.0,
+        "洞里（选区内）不能被压暗：{baseline_inside:.1} -> {shown_inside:.1}"
+    );
+
+    // 区域形状：环在内、洞不在内。
+    //
+    // `PtInRegion` 与区域一样用**客户区**坐标 —— 探针点是屏幕坐标，必须先减去窗口原点
+    // （上一版产品代码就是在这一步传错坐标系，整窗被裁空）。
+    let hwnd = layer.hwnd_for_test();
+    let rgn = unsafe { windows_sys::Win32::Graphics::Gdi::CreateRectRgn(0, 0, 0, 0) };
+    let copied = unsafe { GetWindowRgn(hwnd, rgn) };
+    assert!(copied != 0, "窗口应当有区域");
+    let client = |rect: Rect| (rect.left + 20 - monitor.left, rect.top + 20 - monitor.top);
+    let inside_point = client(inside);
+    let outside_point = client(outside);
+    let inside_in_region = unsafe { PtInRegion(rgn, inside_point.0, inside_point.1) } != 0;
+    let outside_in_region = unsafe { PtInRegion(rgn, outside_point.0, outside_point.1) } != 0;
+    unsafe { windows_sys::Win32::Graphics::Gdi::DeleteObject(rgn as _) };
+    assert!(outside_in_region, "环应当留在区域里");
+    assert!(!inside_in_region, "洞必须是空的（客户区坐标）");
+
+    // 恢复排除：遮罩必须从截图里消失（延时贴图因此不会带上它）。
+    layer.set_capture_exclusion(true);
+    dim_test_pump(200);
+    let excluded_outside = dim_test_screen_mean(outside);
+    assert!(
+        (excluded_outside - baseline_outside).abs() <= 6.0,
+        "排除出截图后，截图里应当看不到遮罩：{baseline_outside:.1} -> {excluded_outside:.1}"
+    );
+
+    // 隐藏后回到基线（用非排除状态观测，证明隐藏真的生效）。
+    layer.set_capture_exclusion(false);
+    layer.hide();
+    dim_test_pump(200);
+    let hidden_outside = dim_test_screen_mean(outside);
+    assert!(
+        (hidden_outside - baseline_outside).abs() <= 6.0,
+        "隐藏后必须回到基线：{baseline_outside:.1} -> {hidden_outside:.1}"
+    );
+}

@@ -47,6 +47,15 @@ impl CaptureRuntime {
         self.platform.set_preferences(preferences);
     }
 
+    /// The preferences the overlay ended its last session with (docs/23 §14.53).
+    ///
+    /// The shell calls this when a capture ends: the overlay's custom-region panel is the second
+    /// place the display settings can be changed, and this is the only way its edit reaches the
+    /// settings file (docs/23 §14.54).
+    pub fn preferences(&self) -> Option<crate::preferences::OverlayPreferences> {
+        self.platform.preferences()
+    }
+
     /// Take the last selection the user confirmed, if one is still held.
     ///
     /// `F6`'s input: pin what was just captured, rather than reading the screen again
