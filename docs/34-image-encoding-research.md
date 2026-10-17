@@ -322,3 +322,52 @@ WebP ：本轮不做（UI 不提供该项）
 3. trellis 在真流式下是否可用（目前由 Huffman 那句反推，无官方明文）；
 4. `trellis` 默认值的两处文档冲突已做交叉核对，但**未编译验证**；
 5. 各配置的实际耗时 / 体积 / 峰值内存（按 §5 的基准计划量）。
+
+## 10. 基准：`tools/codec-bench` 的首轮实测
+
+`cargo run -p codec-bench --release -- --report`。素材是**程序生成**的合成截图（彩色小字、1px 细线、圆角、平色面板、渐变、半透明窗口），四类：`ui-1080`(1920×1080) · `ui-4k`(3840×2160) · `scroll-tall`(1280×30000) · `alpha-2k`(2000×2000)。三个指标：输出字节、中位耗时、**峰值额外分配**（进程内统计分配器的包装，回答"这次编码额外吃了多少内存"）。JPEG 统一 quality 92 / 4:4:4 / baseline。
+
+| 素材 | 编码器 | 字节 | 中位 ms | 峰值 +MB |
+| --- | --- | --- | --- | --- |
+| ui-1080 | png row-band | 43,168 | 13.1 | 0.4 |
+| ui-1080 | zenjpeg trellis+huffman | 248,328 | 110.1 | 25.1 |
+| ui-1080 | zenjpeg plain | 219,083 | 15.3 | 1.4 |
+| ui-1080 | mozjpeg 444 trellis | 597,750 | 29.1 | 7.0 |
+| ui-1080 | zenwebp lossless | **10,724** | 58.5 | 64.3 |
+| ui-4k | png row-band | 99,137 | 42.3 | 0.5 |
+| ui-4k | zenjpeg trellis+huffman | 566,435 | 358.5 | 98.9 |
+| ui-4k | zenjpeg plain | 515,441 | 56.5 | 2.9 |
+| ui-4k | mozjpeg 444 trellis | 1,320,525 | 105.4 | 25.8 |
+| ui-4k | zenwebp lossless | 20,878 | 200.3 | 257.1 |
+| scroll-tall | png row-band | 941,703 | 250.3 | **1.9** |
+| scroll-tall | zenjpeg trellis+huffman | 6,460,133 | 2954.3 | **456.5** |
+| scroll-tall | zenjpeg trellis+huffman 64r | 6,460,133 | 2992.7 | **456.5** |
+| scroll-tall | zenjpeg plain | 6,064,082 | **393.0** | **13.9** |
+| scroll-tall | mozjpeg 444 trellis | 16,501,515 | 833.3 | 125.9 |
+| alpha-2k | png row-band | 43,623 | 33.1 | 0.4 |
+| alpha-2k | zenjpeg trellis+huffman | 220,247 | 224.5 | 47.8 |
+| alpha-2k | zenjpeg plain | 203,517 | 37.4 | 1.5 |
+| alpha-2k | mozjpeg 444 trellis | 585,423 | 68.3 | 12.5 |
+| alpha-2k | zenwebp lossless | 8,380 | 144.0 | 124.0 |
+
+### 10.1 这张表回答了什么
+
+1. **trellis / Huffman 在长图上不是"更慢一点"，是"整帧缓冲"。** `scroll-tall` 打开它们后峰值 **456.5 MB**、耗时 **2.95 s**；关掉后 **13.9 MB / 393 ms**。也就是说 `BytesEncoder::push` 在**不开**这些优化时确实是逐带流式（13.9 MB ≈ 少量缓冲），**一旦开 trellis 就会退化成整帧块缓冲**。这正是上一节那条"最大未验证项"的答案。
+2. **分带大小不影响输出**：整帧一次 push 与 64 行一带 push 的字节数**完全相同**（6,460,133）⇒ sink 可以按任意带长喂，不受 8/16 倍数约束（mozjpeg-rs 则要求倍数）。
+3. **在截图素材上，trellis+Huffman 反而更大**（248KB vs 219KB，566KB vs 515KB，长图 6.46MB vs 6.06MB）—— 注意这是**预设**对比（`MozjpegBaseline` 还换了量化表），不是"只翻转 trellis"的干净 A/B，所以结论只能是：**这套"照片优化"预设对截图没有收益，还带来 7.5× 时间与 33× 内存**。
+4. **WebP 无损是这轮最大的意外收益**：ui-1080 **10.7 KB vs PNG 43.2 KB（约 1/4）**，ui-4k 20.9 KB vs 99.1 KB。代价是整帧缓冲（1080p 64 MB、4K **257 MB**）与更慢（58 / 200 ms）。⇒ 适合**普通截图**，绝不适合长图。
+5. **mozjpeg-rs 应当淘汰**：它在这批素材上**在自己的 `write_bits` 里 panic**（移位 64），streaming 构造器没有 trellis 旋钮，同 quality 下输出是 zenjpeg 的 2.4 倍（注：此处用它自带的 `baseline_fastest()` 预设，不算完全公平，但 panic 一条已足够）。
+
+### 10.2 因此的落地结论（覆盖 §9 的两条待定）
+
+- **PNG**：不动。长图 1280×30000 = 250 ms / 942 KB / **峰值 1.9 MB**。
+- **JPG**：`zenjpeg`，**baseline + 4:4:4 + quality 92 + `plain`（不开 trellis/Huffman）**。短图快（15 ms @1080p）、省内存（1.4 MB），长图逐带流式 13.9 MB。
+- **WebP**：`zenwebp` **无损**，只给两轴 ≤16383 的普通截图（UI 素材上体积约为 PNG 的 1/4）；长图 UI 上不提供。
+- **mozjpeg-rs**：从候选里移除（panic + 输出更大 + 流式无 trellis）。
+
+### 10.3 未验证
+
+- 合成素材偏"平"，真实照片类截图的比例关系会不同（这正说明 WebP 的"1/4"是**内容相关**的，不是产品保证）。
+- JPEG 的质量用肉眼与 SSIM 都还没测（本轮只测体积/耗时/内存）。
+- `zenwebp` 在 4K 上 257 MB 峰值是否可接受，取决于产品允许多大的截图走 WebP。
+- mozjpeg-rs 的批量 `Encoder`（带 trellis）没有测，所以"它的批量质量"仍是未知。
