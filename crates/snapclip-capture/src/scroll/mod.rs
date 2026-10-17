@@ -44,6 +44,10 @@ pub(crate) enum Status {
     Lost,
     /// The image reached [`MAX_SCREENS`] and stops growing.
     Full,
+    /// The backing store could not write (a full disk, a vanished temp directory). The image
+    /// stops growing, but the reason is not the row cap and the panel must not say it is
+    /// (docs/35 §12.4).
+    Storage,
 }
 
 /// Automatic scrolling, as the panel shows it.
@@ -211,8 +215,14 @@ impl Tracker {
                 }
                 if placement == Placement::Full {
                     // The reference stays: the viewport did not move in the image, so the next
-                    // frame is still measured against the last frame that was placed.
-                    self.status = Status::Full;
+                    // frame is still measured against the last frame that was placed. A refusal
+                    // with a store error behind it is a full disk, not the row cap; saying "the
+                    // limit" there would send the user looking for a limit that did not arrive.
+                    self.status = if self.stitcher.storage_error().is_some() {
+                        Status::Storage
+                    } else {
+                        Status::Full
+                    };
                 } else {
                     self.reference = current;
                     self.status = Status::Tracking;
@@ -290,6 +300,40 @@ impl Tracker {
             ),
             image_rows: self.stitcher.rows(),
         }
+    }
+
+    /// Walk the long image as row bands, first row first, so a consumer can write it out without
+    /// ever holding the whole image (docs/35 §13). `f` gets `(first_row, bgra)` and returns
+    /// whether to keep going.
+    ///
+    /// Gated with the probe until the exporter reads from it: an interface ahead of its consumer
+    /// is dead code, and the stage that wires the exporter is the one that lifts this.
+    #[cfg(test)]
+    pub(crate) fn for_each_band(
+        &self,
+        band_rows: u32,
+        mut f: impl FnMut(u32, &[u8]) -> bool,
+    ) {
+        let rows = self.stitcher.rows();
+        let row_bytes = self.width as usize * 4;
+        let band_rows = band_rows.max(1);
+        let mut buffer = Vec::new();
+        let mut first = 0;
+        while first < rows {
+            let count = (rows - first).min(band_rows);
+            buffer.resize(count as usize * row_bytes, 0);
+            self.stitcher.store().read_rows(first, count, &mut buffer);
+            if !f(first, &buffer) {
+                return;
+            }
+            first += count;
+        }
+    }
+
+    /// Arm one failing seal, so a full disk can be tested without one (docs/35 §12.4).
+    #[cfg(test)]
+    pub(crate) fn fail_seals(&mut self) {
+        self.stitcher.fail_seals();
     }
 
     /// The long image: `(width, rows, bgra)`.
@@ -385,6 +429,62 @@ mod tests {
             image == truth(&page, top, tick),
             "the image must equal the page with one header and one footer"
         );
+    }
+
+    #[test]
+    fn a_failed_seal_is_reported_as_storage_not_as_the_row_cap() {
+        let page = page(W, 5000, 22);
+        let mut tracker = Tracker::new(&frame_at(&page, 0, 0), W, H, 40);
+        tracker.fail_seals();
+        // Scroll far enough that a tile has to be sealed, which is where the armed failure fires.
+        // Small steps, like a real wheel: a single 700-row jump is what the estimator calls a
+        // jump, and `Lost` would end the loop before any tile was sealed.
+        let mut pushes = 0;
+        for (tick, top) in (1..=18u32).map(|n| n * 64).enumerate() {
+            tracker.push(&frame_at(&page, top, tick as u32 + 1));
+            pushes += 1;
+            let status = tracker.status();
+            if status == Status::Full || status == Status::Storage {
+                break;
+            }
+            assert_eq!(status, Status::Tracking, "the sequence must keep tracking");
+        }
+        assert_eq!(
+            tracker.status(),
+            Status::Storage,
+            "a failed write must not be reported as the row cap (after {pushes} pushes)"
+        );
+        assert!(tracker.stitcher.storage_error().is_some());
+    }
+
+    #[test]
+    fn the_bands_add_up_to_the_whole_image() {
+        let page = page(W, 5000, 22);
+        let build = || {
+            let mut tracker = Tracker::new(&frame_at(&page, 0, 0), W, H, 40);
+            for (tick, top) in [64u32, 128, 192, 256, 320].into_iter().enumerate() {
+                tracker.push(&frame_at(&page, top, tick as u32 + 1));
+            }
+            tracker
+        };
+        let mut banded = Vec::new();
+        {
+            let tracker = build();
+            tracker.for_each_band(64, |first, bytes| {
+                assert_eq!(
+                    first as usize * W as usize * 4,
+                    banded.len(),
+                    "the bands arrive in order, without gaps"
+                );
+                banded.extend_from_slice(bytes);
+                true
+            });
+        }
+        let (width, rows, image) = build().into_image();
+        assert_eq!(width, W);
+        assert_eq!(banded.len(), image.len(), "no band was skipped");
+        assert_eq!(banded, image, "the bands are the image, in order");
+        assert!(rows > 0);
     }
 
     #[test]

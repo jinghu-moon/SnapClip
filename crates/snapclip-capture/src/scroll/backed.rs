@@ -216,6 +216,9 @@ pub(crate) struct BackedCanvas {
     /// Why the last seal or unseal failed, kept for the `Debug` output and the log line that
     /// already went to stderr (docs/35 §6).
     error: Option<String>,
+    /// The probe's way of making the next seal fail, so a full disk can be tested without one.
+    #[cfg(test)]
+    fail_seals: bool,
 }
 
 impl BackedCanvas {
@@ -237,6 +240,8 @@ impl BackedCanvas {
             middle: Tiles::new(),
             middle_bytes: 0,
             error: None,
+            #[cfg(test)]
+            fail_seals: false,
         }
     }
 
@@ -346,6 +351,10 @@ impl BackedCanvas {
     fn seal_ring(&mut self, ring_is_front: bool, rows: u32) -> bool {
         if rows == 0 {
             return true;
+        }
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_seals) {
+            return self.fail("the long image cannot seal a tile: injected failure".to_owned());
         }
         let mut bytes = vec![0u8; rows as usize * self.row];
         match (&self.front, ring_is_front) {
@@ -462,6 +471,12 @@ impl BackedCanvas {
         true
     }
 
+    /// Armed by the tests and the probe: the next seal behaves like a full disk (docs/35 §12.4).
+    #[cfg(test)]
+    pub(crate) fn fail_seals(&mut self) {
+        self.fail_seals = true;
+    }
+
     fn fail(&mut self, error: String) -> bool {
         eprintln!("[snapclip][scroll] {error}");
         self.error = Some(error);
@@ -557,6 +572,10 @@ impl CanvasStore for BackedCanvas {
         let rows = self.rows;
         self.gather(0, rows, &mut out);
         out
+    }
+
+    fn storage_error(&self) -> Option<&str> {
+        self.error.as_deref()
     }
 
     fn budgets(&self) -> Budgets {

@@ -44,6 +44,14 @@ pub(crate) struct Stitcher<C: CanvasStore> {
     top: i64,
 }
 
+#[cfg(test)]
+impl Stitcher<super::backed::BackedCanvas> {
+    /// Arm one failing seal, so a full disk can be tested without one (docs/35 §12.4).
+    pub(crate) fn fail_seals(&mut self) {
+        self.store.fail_seals();
+    }
+}
+
 impl<C: CanvasStore> Stitcher<C> {
     /// A stitcher over an existing store (docs/35 phase 2 hands in a different one).
     pub(crate) fn with_store(store: C, width: u32, view: u32) -> Self {
@@ -72,6 +80,11 @@ impl<C: CanvasStore> Stitcher<C> {
     }
 
     /// What this image costs, as the store sees it (docs/35 §5.1).
+    /// Why the store's last write failed, if it did (docs/35 §12.4).
+    pub(crate) fn storage_error(&self) -> Option<&str> {
+        self.store.storage_error()
+    }
+
     pub(crate) fn budgets(&self) -> Budgets {
         self.store.budgets()
     }

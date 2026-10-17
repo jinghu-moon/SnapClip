@@ -280,6 +280,77 @@ mod tests {
         assert_ne!(tag(1), tag(2));
     }
 
+    /// The plan's own case (docs/35 §5): down three, up two notches, down two. The reversal must
+    /// neither duplicate nor drop a row, and the result is still the page, pixel for pixel.
+    ///
+    /// The upward steps are wheel-sized because a jump as large as a downward step is what the
+    /// estimator refuses (its own tests move 1 to 90 rows upward against a 600-row step down).
+    #[test]
+    fn a_down_up_down_scroll_reproduces_the_page() {
+        const UP: i64 = 120;
+        let page = page(WIDTH, 6 * STEP + VIEW);
+        let view = VIEW;
+        let mut probe = snapclip_capture::scroll::probe::ScrollProbe::new(
+            &frame(&page, WIDTH, 0, view),
+            WIDTH as u32,
+            view as u32,
+            WIDTH as u32 / 8,
+        );
+        let mut top = 0i64;
+        let (mut first, mut last) = (0i64, view as i64);
+        for step in [STEP as i64, STEP as i64, STEP as i64, -UP, -UP, STEP as i64, STEP as i64] {
+            top += step;
+            let report = probe.push(&frame(&page, WIDTH, top as usize, view));
+            assert!(!report.lost, "the reversal lost the anchor at {top}");
+            first = first.min(top);
+            last = last.max(top + view as i64);
+        }
+        let (width, rows, image) = probe.into_image();
+        assert_eq!(width as usize, WIDTH);
+        assert_eq!(rows as i64, last - first, "the span is the rows the viewport visited");
+        assert!(
+            image == page[first as usize * WIDTH * 4..last as usize * WIDTH * 4],
+            "a down-up-down sequence changed the image"
+        );
+    }
+
+    /// Starting mid page and scrolling up first is the only sequence that reaches `Prepended`:
+    /// after one downward step the canvas is already taller than the viewport and the same gesture
+    /// is `Contained` (docs/35-baseline.md).
+    #[test]
+    fn scrolling_up_first_prepends_and_still_reproduces_the_page() {
+        const UP: i64 = 120;
+        let page = page(WIDTH, 8 * STEP + VIEW);
+        let view = VIEW;
+        let start = 4 * STEP;
+        let mut probe = snapclip_capture::scroll::probe::ScrollProbe::new(
+            &frame(&page, WIDTH, start, view),
+            WIDTH as u32,
+            view as u32,
+            WIDTH as u32 / 8,
+        );
+        let mut top = start as i64;
+        let (mut first, mut last) = (top, top + view as i64);
+        for step in [-UP, -UP, STEP as i64, STEP as i64, STEP as i64] {
+            top += step;
+            let report = probe.push(&frame(&page, WIDTH, top as usize, view));
+            assert!(!report.lost, "the upward step lost the anchor at {top}");
+            first = first.min(top);
+            last = last.max(top + view as i64);
+        }
+        let (width, rows, image) = probe.into_image();
+        assert_eq!(width as usize, WIDTH);
+        assert_eq!(
+            rows as i64,
+            last - first,
+            "the top edge must grow by the rows scrolled above the start"
+        );
+        assert!(
+            image == page[first as usize * WIDTH * 4..last as usize * WIDTH * 4],
+            "an upward-first sequence changed the image"
+        );
+    }
+
     #[test]
     fn a_scroll_run_reproduces_the_page_pixel_for_pixel() {
         // A short page so the test is cheap; the same code drives the 30 000-row report.

@@ -55,6 +55,13 @@ pub(crate) trait CanvasStore {
     /// store is what decides, from these, how much stays in memory.
     fn budgets(&self) -> Budgets;
 
+    /// Why the last write to the backing store failed, if it did (docs/35 §12.4). A store that
+    /// keeps everything in memory has nothing to fail; one that seals to disk does, and the
+    /// session has to be able to tell that apart from the row cap.
+    fn storage_error(&self) -> Option<&str> {
+        None
+    }
+
     /// What the move sites did, for a store that has them (docs/35 §2.2). A backing store moves no
     /// pixels, so it answers `None`.
     #[cfg(feature = "test-support")]
@@ -256,6 +263,10 @@ impl CanvasStore for Box<dyn CanvasStore> {
 
     fn budgets(&self) -> Budgets {
         (**self).budgets()
+    }
+
+    fn storage_error(&self) -> Option<&str> {
+        (**self).storage_error()
     }
 
     #[cfg(feature = "test-support")]

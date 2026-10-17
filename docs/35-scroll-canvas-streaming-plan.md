@@ -404,3 +404,40 @@ B2 = 边缘缓冲（容量 × width × 4） + 编码器内部缓冲 + 装配时�
 再跑只会打印零，看起来像"没有搬移"✗。基线表保留在 `docs/35-baseline.md`，复现方式改为从阶段 0
 的提交 `d27b550` 检出后运行（文首已注明）。阶段 3 要接的正是**装配那 145 MB**：`.partial` →
 改名，不经 `Vec<u8>`。
+
+## 13. 阶段 3 记录：存储失败可见、回放按行、双向端到端（部分完成）
+
+### 13.1 做了什么
+
+| 件 | 形状 |
+| --- | --- |
+| **`Status::Storage`** | `CanvasStore` 新增 `storage_error()`（内存实现返回 `None`，后备实现返回最后一条写盘错误）；`Tracker::push` 在放置被拒时**先看它**：有错误 ⇒ `Storage`，否则才是 `Full`（行数上限） |
+| **用户可见的区分** | `status_text`：`Full` ⇒ `已达上限`，`Storage` ⇒ `截图失败，见日志`。用既有文案是刻意的：字体子集是硬白名单，新字符会渲染成豆腐（`docs/21 §5.21`） |
+| **失败注入** | `#[cfg(test)] fail_seals()` 让**下一次封口**像满盘一样失败，于是"磁盘写失败"不需要一块满的磁盘就能测 |
+| **回放按行** | `Tracker::for_each_band(band_rows, f)` 用 `row_slice` 逐带走完长图，`f(first_row, bgra)` 返回是否继续 |
+| **双向端到端** | `codec-bench` 新增两条：`a_down_up_down_scroll_reproduces_the_page`（下 3、上 2 档、下 2）与 `scrolling_up_first_prepends_and_still_reproduces_the_page`（从页面中间开始、先向上 ⇒ **唯一能进 `Prepended` 的序列**） |
+
+### 13.2 证据
+
+- `a_failed_seal_is_reported_as_storage_not_as_the_row_cap`：注入失败后 `Status::Storage`，且 `storage_error()` 有内容 ✓
+- `the_bands_add_up_to_the_whole_image`：逐带拼接的结果与 `into_image()` **字节相同**、且首行偏移连续无空洞 ✓
+- 两条端到端用例：产物与页面**逐像素相同**（含向上滚动）✓；向上用例的最终行数等于视口访问过的行跨度 ✓
+- 全套：capture **519**（默认）/ **521**（`test-support`）、codec-bench **28**、`cargo check --workspace --all-targets` 0 warning、两个 gate 通过
+
+### 13.3 没做完的部分（如实记录）
+
+**装配峰值没有下降**：`into_image()` 仍然把整图物化成 `Vec<u8>`（**145.3 MB**，§12.3）。
+
+原因不是缺一行代码，而是**导出端口的形状**：`ArtifactWriter::write(&SelectionPixels, …)` 收的是**已经拥有整幅像素**的结构，而 `SelectionPixels` 同时被历史、桌面文件与剪贴板消费。要让装配不再物化整图，需要把端口改成"行带来源"，并回答两个产品问题：
+
+1. **剪贴板**要的是连续 DIB ⇒ 对 30 000 行的长图，那份 145 MB 是**剪贴板本身**的需要，不是装配的浪费；要么接受，要么改成延迟渲染（`WM_RENDERFORMAT`，从文件解码）；
+2. **历史/桌面文件**只要文件 ⇒ 可以完全走流式（写 `.partial` → 改名）。
+
+本阶段交付的是**能支撑那条改造的两块料**：按行回放（`for_each_band`，现有测试证明它等于整图）与"存储失败对用户可见"（否则流式导出失败时会退化成一句"已达上限"，比现在更糟）。
+
+### 13.4 下一步（阶段 4 之前必须先做）
+
+1. 端口增加"行带来源"入口（`write_rows` 形态），历史/桌面文件走它 ⇒ 写 `.partial`、成功后改名、失败删除；
+2. 剪贴板：先沿用现有整幅路径（**只在需要剪贴板时**物化一份）；延迟渲染列为独立项；
+3. 完成后重跑 `--scroll`，报告**装配峰值**（目标：从 145.3 MB 降到"一个带 + 编码器内部"量级，实测为准，不预设数字）；
+4. 阶段 4 再把"像素等价 / 峰值 / 每帧 p50 p99 max"变成断言。

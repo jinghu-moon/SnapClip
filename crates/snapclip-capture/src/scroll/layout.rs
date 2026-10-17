@@ -79,6 +79,7 @@ pub(crate) fn status_text(status: Option<super::Status>, failed: bool) -> String
         (true, _) => "截图失败，见日志".to_owned(),
         (false, None) | (false, Some(Status::Tracking)) => String::new(),
         (false, Some(Status::Full)) => "已达上限".to_owned(),
+        (false, Some(Status::Storage)) => "截图失败，见日志".to_owned(),
         (false, Some(Status::Lost)) => "跟丢了，请往回滚".to_owned(),
     }
 }
@@ -96,7 +97,7 @@ pub(crate) fn drawn_strings() -> Vec<String> {
     drawn.push(size_text(1234, 56789));
     drawn.push(status_text(None, false));
     drawn.push(status_text(None, true));
-    for status in [Status::Tracking, Status::Lost, Status::Full] {
+    for status in [Status::Tracking, Status::Lost, Status::Full, Status::Storage] {
         drawn.push(status_text(Some(status), false));
     }
     drawn
