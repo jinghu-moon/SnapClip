@@ -482,3 +482,94 @@ mod tests {
         assert_eq!(preview.image_rows, 900 + H);
     }
 }
+
+/// The measurement surface `tools/codec-bench --scroll` drives (docs/34 §12).
+///
+/// Compiled only with `--features test-support`, so the product build is untouched: the code path
+/// underneath is the same `Tracker` the capture thread pushes frames into. It exists because the
+/// cost that matters for a long scroll is the *canvas*, not the encoder, and that number can only
+/// be honest if the real stitcher is the thing being measured.
+#[cfg(feature = "test-support")]
+pub mod probe {
+    use super::{Status, Tracker};
+
+    /// What one pushed frame cost, and where the canvas ended up.
+    #[derive(Debug, Clone, Copy)]
+    pub struct Frame {
+        /// Time in `Tracker::push` with the thumbnail refresh subtracted.
+        pub stitch_us: u64,
+        /// Time the thumbnail refresh took.
+        pub thumb_us: u64,
+        pub image_rows: u32,
+        pub placed: bool,
+        pub tracking: bool,
+        pub lost: bool,
+        pub full: bool,
+    }
+
+    /// Drives the real tracker either at the product's own limits or at an explicit row cap.
+    pub struct ScrollProbe {
+        tracker: Tracker,
+    }
+
+    impl ScrollProbe {
+        /// The product's own limits: `MAX_SCREENS` and `MAX_BYTES`.
+        pub fn new(first: &[u8], width: u32, view: u32, thumb_width: u32) -> Self {
+            Self {
+                tracker: Tracker::new(first, width, view, thumb_width),
+            }
+        }
+
+        /// An explicit canvas row cap, for measuring where the cap bites.
+        pub fn with_row_cap(
+            first: &[u8],
+            width: u32,
+            view: u32,
+            thumb_width: u32,
+            max_rows: u32,
+        ) -> Self {
+            Self {
+                tracker: Tracker::with_rows(first, width, view, thumb_width, max_rows),
+            }
+        }
+
+        /// The row cap the product would apply to this selection.
+        pub fn row_cap(width: u32, view: u32) -> u32 {
+            super::row_limit(width, view, super::MAX_BYTES)
+        }
+
+        /// The screen cap that a tall-enough viewport would run into first, in rows.
+        pub fn screen_cap(view: u32) -> u32 {
+            super::MAX_SCREENS * view
+        }
+
+        pub fn push(&mut self, frame: &[u8]) -> Frame {
+            let started = std::time::Instant::now();
+            let step = self.tracker.push(frame);
+            let total_us = started.elapsed().as_micros() as u64;
+            let status = self.tracker.status();
+            Frame {
+                stitch_us: total_us.saturating_sub(self.tracker.last_thumb_us()),
+                thumb_us: self.tracker.last_thumb_us(),
+                image_rows: self.tracker.image_rows(),
+                placed: step.placement.is_some(),
+                tracking: status == Status::Tracking,
+                lost: status == Status::Lost,
+                full: status == Status::Full,
+            }
+        }
+
+        pub fn image_rows(&self) -> u32 {
+            self.tracker.image_rows()
+        }
+
+        pub fn canvas(&self) -> &[u8] {
+            self.tracker.stitcher.canvas()
+        }
+
+        /// The long image: `(width, rows, bgra)`.
+        pub fn into_image(self) -> (u32, u32, Vec<u8>) {
+            self.tracker.into_image()
+        }
+    }
+}

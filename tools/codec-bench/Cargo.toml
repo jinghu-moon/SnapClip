@@ -23,3 +23,7 @@ zenwebp = "=0.4.4"
 png = "0.18.1"
 # zenjpeg re-exports `Stop` but not `Unstoppable`; the decoder asks for `impl Stop`.
 enough = "0.4.5"
+# The scroll pipeline is measured through the real tracker, not a copy of it, so the bench depends
+# on the capture crate with its `test-support` feature. The dependency only goes this way: nothing
+# in the product ever depends on the bench or on its codec dependencies.
+snapclip-capture = { path = "../../crates/snapclip-capture", features = ["test-support"] }

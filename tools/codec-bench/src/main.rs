@@ -12,6 +12,7 @@
 mod alloc_probe;
 mod codecs;
 mod quality;
+mod scroll;
 mod synthetic;
 
 use std::time::Instant;
@@ -31,6 +32,10 @@ const ZOOM: usize = 8;
 
 fn main() {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if arguments.iter().any(|argument| argument == "--scroll") {
+        println!("{}", scroll::report());
+        return;
+    }
     if arguments.iter().any(|argument| argument == "--quality") {
         run_quality();
         return;

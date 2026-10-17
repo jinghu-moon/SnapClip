@@ -6,6 +6,11 @@ edition = "2024"
 license = "AGPL-3.0-only"
 publish = false
 
+# Measurement only: exposes `scroll::probe`, which lets `tools/codec-bench --scroll` drive the real
+# stitcher without a window (docs/34 §12). Off by default, and nothing in the product enables it.
+[features]
+test-support = []
+
 [dependencies]
 snapclip-model = { path = "../snapclip-model" }
 blake3 = "1.5"

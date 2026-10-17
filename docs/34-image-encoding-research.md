@@ -437,3 +437,44 @@ JPG = baseline + 4:4:4 + q92
 - 真实（非合成）截图的比例关系；合成素材的"文字"是规则笔画，真实字形的高频更复杂。
 - **纯 trellis 的 A/B 无法从外部做**（API 私有），所以"trellis 对截图无益"这条只对 mozjpeg 预设成立。
 - 4:2:0 在**纯灰度**文字上损失会小得多 —— 我们的素材刻意用了彩色字，这是偏向 4:4:4 的选择，但截图里彩色文字与图标是常态。
+
+## 12. 滚动截图链路的性能（`codec-bench --scroll`）
+
+编码器的数字（§10）只说明"最后一步多贵"，而滚动截图的成本大头在**画布**：拼接器在编码器看到图像之前，就已经把整张长图握在内存里。所以这一节测的是真实链路。
+
+### 12.1 怎么测
+
+`tools/codec-bench/src/scroll.rs`，`cargo run -p codec-bench --release -- --scroll`：
+
+- 页面 1280×30000，每行带自己的行号标记（错拼立刻可查），视口 1280×960，每帧滚动 600 px（重叠 360 行，远高于估计器 32 行的下限）；
+- 帧序列喂给**真实的** `Tracker` —— 通过 `snapclip-capture` 的 `test-support` 特性暴露的 `scroll::probe`（产品构建不变，特性默认关闭）；
+- 三组读数：每帧拼接耗时、整个过程的**峰值额外分配**（计数分配器）、拼完之后的编码（体积/耗时/峰值）；
+- **正确性**：拼出来的长图与"直接生成的完整页面"**逐像素比对**。
+
+### 12.2 实测（1280×30000，960 视口，49 帧）
+
+```
+canvas cap: 25600 rows at a 800-row viewport, 30720 at a 960-row one
+stitching : 49 frames · 29760 rows · 1.31 ms median / 16.02 ms max per frame
+            thumb total 27.2 ms · canvas peak 161.9 MB · lost 0 · pixel-exact true
+PNG       : 3.42 MB · 550 ms · 7.3 MB peak
+JPG       : 33.8 MB · 555 ms · 96.4 MB peak  (baseline 4:4:4 q92, plain, 64-row bands)
+WebP      : refused before encoding, 0.0 MB peak (1280x29760 > 16383)
+verdict   : 88.5 ms stitching + 578 ms PNG, 161.9 MB canvas peak; the bottleneck is the canvas.
+```
+
+（合成素材是高熵纹理，JPG 与 PNG 的绝对体积都比真实 UI 页面大一个量级，**两者之间的比例不可外推**；这里可信的是耗时、峰值内存与"能否编码"。）
+
+### 12.3 三条结论
+
+1. **画布是瓶颈**：161.9 MB 的峰值全部来自拼接器，编码器只占 7.3 MB（PNG）。要控内存，控画布，不是控编码器。
+2. **每帧有 16 ms 的尖峰**（中位 1.31 ms）：那是画布增长时重新分配 + 拷贝造成的，也就是**滚动过程中可能掉一帧**。要更平滑就得让画布按更大块增长（或预先按上限预留）。
+3. **上限与视口绑定**：`MAX_SCREENS × 视口高`（再受 `MAX_BYTES` 约束）⇒ **800 行视口最多 25 600 行，根本到不了 30 000**；960 行视口能到 30 720。产品上如果要支持 30 000 行的页面，视口至少要 938 行——这是产品参数，不是编码问题。
+
+### 12.4 WebP 的产品含义（必须前置检查）
+
+`1280×29760` 超过 WebP 的 16383 上限，所以滚动截图**不能存 WebP**。测得的拒绝是"编码前就拒绝、峰值 0.0 MB"，但那是在 bench 里做的；**产品里目前没有任何格式概念参与滚动**（`overlay/scroll.rs` 只有 `format!` 字符串，没有格式限制）。
+
+⇒ **要求**：滚动会话开始时就要检查当前保存格式的上限，不满足就**立刻**降级为 PNG 并告知用户。最晚不能晚于第一帧之后——"滚了半天才发现存不了"是不可接受的。
+
+**建议位置**：`crates/snapclip-capture/src/windows/overlay/scroll.rs:240` `begin_scroll_session()`（或更早的 `session.rs:63 start_scroll_entry()`，取决于在哪里能读到当前默认格式）。检查依据就是 `width`、以及滚动可能到达的最大行数（`MAX_SCREENS × view`，与 `MAX_BYTES` 取小）。

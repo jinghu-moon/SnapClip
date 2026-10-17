@@ -1058,6 +1058,7 @@ dependencies = [
  "enough",
  "mozjpeg-rs",
  "png 0.18.1",
+ "snapclip-capture",
  "zenjpeg",
  "zenwebp",
 ]
