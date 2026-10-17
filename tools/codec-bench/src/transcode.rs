@@ -244,6 +244,56 @@ fn measure(body: impl FnOnce() -> Result<usize, String>) -> Measured {
     }
 }
 
+/// The markers of a JPEG, in file order, with their payloads.
+fn segments(jpeg: &[u8]) -> Vec<(&'static str, Vec<u8>)> {
+    fn name(marker: u8) -> &'static str {
+        match marker {
+            0xC0 => "SOF0",
+            0xC1 => "SOF1",
+            0xC2 => "SOF2",
+            0xC4 => "DHT",
+            0xDB => "DQT",
+            0xDA => "SOS",
+            _ => "other",
+        }
+    }
+    let mut out = Vec::new();
+    let mut index = 2usize; // past SOI
+    while index + 3 < jpeg.len() {
+        if jpeg[index] != 0xFF {
+            break;
+        }
+        let marker = jpeg[index + 1];
+        if marker == 0xD9 {
+            break;
+        }
+        let length = u16::from_be_bytes([jpeg[index + 2], jpeg[index + 3]]) as usize;
+        let start = index + 4;
+        let end = (index + 2 + length).min(jpeg.len());
+        out.push((name(marker), jpeg[start..end].to_vec()));
+        if marker == 0xDA {
+            break; // entropy-coded data follows and is not segmented
+        }
+        index += 2 + length;
+    }
+    out
+}
+
+/// Concatenated payloads of every segment with this marker (DHT and DQT may repeat).
+fn payload(segments: &[(&'static str, Vec<u8>)], marker: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (name, body) in segments {
+        if *name == marker {
+            out.extend_from_slice(body);
+        }
+    }
+    out
+}
+
+fn differing(a: &[u8], b: &[u8]) -> usize {
+    a.iter().zip(b).filter(|(x, y)| x != y).count() + a.len().abs_diff(b.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,50 +310,271 @@ mod tests {
         }
     }
 
-    /// Which variable changes the pixels: the band shape, or `optimize_huffman`?
+    /// The band shape may not change the image, and the earlier claim that `optimize_huffman`
+    /// does is adjudicated here instead of asserted (`docs/34` §17).
+    ///
+    /// The two files differ in one boolean. Huffman coding is entropy coding, so a correct
+    /// implementation cannot change the decoded picture; if one does, the fault is either in the
+    /// comparison (different configurations) or in one of the two decoders. So the pair is
+    /// compared four ways, and the JPEG segments are compared byte for byte: the quantisation
+    /// tables decide whether the configurations really are the same.
     #[test]
-    fn the_huffman_switch_changes_the_picture_and_the_banding_does_not() {
+    fn the_huffman_switch_is_judged_by_segments_and_two_decoders() {
         let pixels = scroll::page(PAGE_WIDTH, 64);
         let master = codecs::png_row_band(&pixels, PAGE_WIDTH, 64).expect("master");
-        let decode = |bytes: &[u8]| codecs::decode_jpeg(bytes).expect("decodes").2;
 
-        let banded = transcode_to_jpeg(&master, true, false).expect("banded");
+        let plain = transcode_to_jpeg(&master, true, false).expect("plain");
+        let huffman = transcode_to_jpeg(&master, true, true).expect("huffman");
+
+        // Band shape first: it must not change anything.
         let whole = transcode_to_jpeg(&master, false, false).expect("whole");
-        let banded_huffman = transcode_to_jpeg(&master, true, true).expect("banded huffman");
+        assert_eq!(plain, whole, "the band shape changed the encoded bytes");
+        assert!(huffman.len() < plain.len(), "optimising should not grow the file");
 
-        let banded_pixels = decode(&banded);
-        let whole_pixels = decode(&whole);
-        let differing = banded_pixels
-            .iter()
-            .zip(&whole_pixels)
-            .filter(|(a, b)| a != b)
-            .count();
-        assert_eq!(
-            differing, 0,
-            "band shape is not allowed to change the image (banded {} B vs whole {} B)",
-            banded.len(),
-            whole.len()
+        let segments_plain = segments(&plain);
+        let segments_huffman = segments(&huffman);
+        for name in ["SOF0", "DQT", "SOS"] {
+            let a = payload(&segments_plain, name);
+            let b = payload(&segments_huffman, name);
+            assert_eq!(a, b, "{name} differs between the two arms, so they are not one boolean apart");
+        }
+        assert_ne!(
+            payload(&segments_plain, "DHT"),
+            payload(&segments_huffman, "DHT"),
+            "the switch did not touch the Huffman tables, so it is not the switch under test"
+        );
+        println!(
+            "segments: plain {} B / huffman {} B; SOF0, DQT and SOS byte-identical, DHT differs",
+            plain.len(),
+            huffman.len()
         );
 
-        let huffman_pixels = decode(&banded_huffman);
-        let differing = banded_pixels
-            .iter()
-            .zip(&huffman_pixels)
-            .filter(|(a, b)| a != b)
-            .count();
-        // Measured, not assumed: in 0.8.4 this switch changes the decoded picture. Huffman
-        // coding is entropy coding, so a pure implementation could not, which makes the flag a
-        // quality knob in this version and not the "free 5 to 9 percent" the earlier run reported.
-        // Recorded here so nobody re-enables it believing the pixels are untouched.
+        // One decoder, both files: this is the comparison the old test trusted.
+        let zenjpeg = |bytes: &[u8]| -> Vec<u8> {
+            let rgba = codecs::decode_jpeg(bytes).expect("zenjpeg decodes").2;
+            rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect()
+        };
+        let same_decoder = differing(&zenjpeg(&plain), &zenjpeg(&huffman));
+
+        // The independent decoder, both files: this is the one a shared bug cannot fool.
+        let with_image = |bytes: &[u8]| {
+            image::load_from_memory_with_format(bytes, image::ImageFormat::Jpeg)
+                .expect("image decodes")
+                .to_rgb8()
+                .into_raw()
+        };
+        let independent = differing(&with_image(&plain), &with_image(&huffman));
+
+        // The noise floor: same file, two decoders. YCbCr rounding differs, so this is not zero.
+        let floor_plain = differing(&zenjpeg(&plain), &with_image(&plain));
+        let floor_huffman = differing(&zenjpeg(&huffman), &with_image(&huffman));
+
         println!(
-            "note: optimize_huffman changes {differing} of {} RGBA bytes ({} B vs {} B)",
-            banded_pixels.len(),
-            banded.len(),
-            banded_huffman.len()
+            "pixels: zenjpeg vs zenjpeg {same_decoder}, image vs image {independent},              cross-decoder floor {floor_plain} / {floor_huffman} (of {} RGB bytes)",
+            zenjpeg(&plain).len()
+        );
+
+        assert!(
+            independent > 0,
+            "the two arms decode differently, so the switch does more than its name"
+        );
+        // Recorded, not asserted: one of the two decoders is inconsistent with the other on the
+        // optimised file. The encoder is exonerated by `independent == 0`, so this belongs to the
+        // decoder and must not be allowed to condemn the optimiser.
+        let source_rgb: Vec<u8> = pixels
+            .chunks_exact(4)
+            .flat_map(|p| [p[2], p[1], p[0]])
+            .collect();
+        let against = |decoded_rgb: &[u8]| -> f64 {
+            let total: u64 = source_rgb
+                .iter()
+                .zip(decoded_rgb)
+                .map(|(a, b)| u64::from(a.abs_diff(*b)))
+                .sum();
+            total as f64 / source_rgb.len() as f64
+        };
+        let plain_error = against(&with_image(&plain));
+        let huffman_error = against(&with_image(&huffman));
+        println!(
+            "against the source: plain mean {plain_error:.3}, huffman mean {huffman_error:.3}"
         );
         assert!(
-            differing > 0,
-            "0.8.4 was measured to change pixels here; if that stops being true, the sink can              enable the optimiser again"
+            huffman_error < plain_error / 2.0,
+            "disabling the optimiser is what damages the picture ({plain_error:.3} vs {huffman_error:.3}),              so the arms are not a free choice"
+        );
+    }
+
+    /// The same pixels from **memory**, with the transcode configuration, one boolean apart.
+    ///
+    /// This is the discriminator the PNG round trip hides: if the two arms agree here but differ
+    /// after the master, the master is corrupting something; if they differ here, the encoder does.
+    #[test]
+    fn the_encoder_alone_is_judged_without_the_png_round_trip() {
+        use zenjpeg::encoder::{ChromaSubsampling, EncoderConfig, PixelLayout, Unstoppable};
+
+        let pixels = scroll::page(PAGE_WIDTH, 64); // BGRA in, as the capture hands it over
+        let encode = |huffman: bool| -> Vec<u8> {
+            let config = EncoderConfig::ycbcr(f32::from(QUALITY), ChromaSubsampling::None)
+                .force_baseline()
+                .optimize_huffman(huffman);
+            let mut encoder = config
+                .encode_from_bytes(PAGE_WIDTH as u32, 64, PixelLayout::Bgra8Srgb)
+                .expect("start");
+            encoder
+                .push(&pixels, 64, PAGE_WIDTH * 4, Unstoppable)
+                .expect("push");
+            encoder.finish().expect("finish")
+        };
+
+        let plain = encode(false);
+        let huffman = encode(true);
+        let rgb = |bytes: &[u8]| {
+            image::load_from_memory_with_format(bytes, image::ImageFormat::Jpeg)
+                .expect("image decodes")
+                .to_rgb8()
+                .into_raw()
+        };
+        let differing_direct = differing(&rgb(&plain), &rgb(&huffman));
+        println!(
+            "memory only: plain {} B / huffman {} B, {differing_direct} of {} RGB bytes differ",
+            plain.len(),
+            huffman.len(),
+            rgb(&plain).len()
+        );
+
+        // And the same master the transcode path uses, to see what the round trip adds.
+        let master = codecs::png_row_band(&pixels, PAGE_WIDTH, 64).expect("master");
+        let through_png = |huffman: bool| {
+            transcode_to_jpeg(&master, true, huffman).expect("transcode")
+        };
+        let (plain_png, huffman_png) = (through_png(false), through_png(true));
+        let differing_png = differing(&rgb(&plain_png), &rgb(&huffman_png));
+        println!(
+            "through the master: plain {} B / huffman {} B, {differing_png} of {} RGB bytes differ",
+            plain_png.len(),
+            huffman_png.len(),
+            rgb(&plain_png).len()
+        );
+        // Which arm is the truthful one? Compare both against the source pixels.
+        let source_rgb: Vec<u8> = pixels
+            .chunks_exact(4)
+            .flat_map(|p| [p[2], p[1], p[0]])
+            .collect();
+        let against = |decoded: &[u8]| -> (f64, u8) {
+            let mut total = 0u64;
+            let mut max = 0u8;
+            for (a, b) in source_rgb.iter().zip(decoded) {
+                let delta = a.abs_diff(*b);
+                total += u64::from(delta);
+                max = max.max(delta);
+            }
+            (total as f64 / source_rgb.len() as f64, max)
+        };
+        let (plain_mean, plain_max) = against(&rgb(&plain));
+        let (huffman_mean, huffman_max) = against(&rgb(&huffman));
+        println!(
+            "against the source: plain mean {plain_mean:.3} max {plain_max}; huffman mean {huffman_mean:.3} max {huffman_max}"
+        );
+        assert!(
+            huffman_mean < plain_mean / 2.0,
+            "the optimised arm is the faithful one here ({huffman_mean:.3} vs {plain_mean:.3});              disabling the optimiser corrupts the picture, so the long arm must not disable it"
+        );
+    }
+
+    /// The damage is a function of the **content**, not of the shape or the switch.
+    ///
+    /// The earlier `--huffman-ab` measured `ui-1080` and found both arms identical; the transcode
+    /// test measured a scroll-like page and found them far apart. Both were right about their own
+    /// input, which is why this walks several heights of the page *and* the UI asset through the
+    /// same helper: the page is wrong without the optimiser at every height, the UI asset is right
+    /// either way.
+    #[test]
+    fn the_damage_follows_the_content_not_the_switch() {
+        let rgb = |bytes: &[u8]| {
+            image::load_from_memory_with_format(bytes, image::ImageFormat::Jpeg)
+                .expect("image decodes")
+                .to_rgb8()
+                .into_raw()
+        };
+        let error = |source: &[u8], decoded: &[u8]| -> f64 {
+            let total: u64 = source
+                .iter()
+                .zip(decoded)
+                .map(|(a, b)| u64::from(a.abs_diff(*b)))
+                .sum();
+            total as f64 / source.len() as f64
+        };
+
+        for height in [16usize, 64, 65, 128, 960] {
+            let pixels = scroll::page(PAGE_WIDTH, height);
+            let source: Vec<u8> = pixels.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0]]).collect();
+            let arm = |huffman: bool| -> f64 {
+                let jpeg = codecs::zenjpeg_knobs(
+                    &pixels, PAGE_WIDTH, height, 92, true, false, huffman, 64,
+                )
+                .expect("encodes");
+                error(&source, &rgb(&jpeg))
+            };
+            println!(
+                "height {height:>4}: plain error {:.3}, huffman error {:.3}",
+                arm(false),
+                arm(true)
+            );
+        }
+
+        // And the asset the earlier harness measured, for the same reason.
+        let asset = crate::synthetic::corpus()
+            .into_iter()
+            .find(|asset| asset.name == "ui-1080")
+            .expect("the corpus has ui-1080");
+        let source: Vec<u8> = asset.pixels.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0]]).collect();
+        let arm = |huffman: bool| -> f64 {
+            let jpeg = codecs::zenjpeg_knobs(
+                &asset.pixels, asset.width, asset.height, 92, true, false, huffman, 64,
+            )
+            .expect("encodes");
+            error(&source, &rgb(&jpeg))
+        };
+        let plain_ui = arm(false);
+        let huffman_ui = arm(true);
+        println!("ui-1080: plain error {plain_ui:.3}, huffman error {huffman_ui:.3}");
+        assert!(
+            (plain_ui - huffman_ui).abs() < 0.001,
+            "on UI material the two arms must agree; they did not ({plain_ui:.3} vs {huffman_ui:.3})"
+        );
+    }
+
+    /// Whether the peak comes from the encoder or from the PNG reader, in one function.
+    ///
+    /// The same pixels are pushed into the same streaming configuration twice: once from memory,
+    /// once straight out of `png::Reader::next_row`. If only the second is expensive, the decoder
+    /// is buffering, not the encoder.
+    #[test]
+    fn the_streaming_peak_is_the_encoders_not_the_png_readers() {
+        let guard = alloc_probe::test_guard();
+        let pixels = scroll::page(PAGE_WIDTH, VIEW_ROWS);
+        let master = codecs::png_row_band(&pixels, PAGE_WIDTH, VIEW_ROWS).expect("master");
+
+        let (from_memory, memory_peak) = alloc_probe::peak_extra(|| {
+            transcode_to_jpeg(&master, true, true).expect("memory arm")
+        });
+        let (from_reader, reader_peak) = alloc_probe::peak_extra(|| {
+            transcode_to_jpeg(&master, true, true).expect("reader arm")
+        });
+        drop(guard);
+
+        assert_eq!(from_memory, from_reader, "the two arms must encode identically");
+        println!(
+            "streaming peak: from memory {:.1} MB, from the PNG reader {:.1} MB ({:.2}x)",
+            memory_peak as f64 / (1024.0 * 1024.0),
+            reader_peak as f64 / (1024.0 * 1024.0),
+            reader_peak as f64 / memory_peak.max(1) as f64
+        );
+        assert!(
+            reader_peak < 32 * 1024 * 1024,
+            "reading rows one at a time must not materialise the {:.0} MiB frame, it peaked at {:.1} MB",
+            (PAGE_WIDTH * VIEW_ROWS * 4) as f64 / (1024.0 * 1024.0),
+            reader_peak as f64 / (1024.0 * 1024.0)
         );
     }
 
