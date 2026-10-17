@@ -272,3 +272,53 @@ WebP ：本轮不做（UI 不提供该项）
 2. `Subsampling` / `quality` 的**默认值**（文档未写，落地时显式设置即可绕开）；
 3. **默认特性是否关闭 C 版** `mozjpeg-sys`（影响"纯 Rust、无 C 工具链"这一条）；
 4. 3840×30000 的**实际耗时与峰值内存**（计划项，未测）。
+
+## 9. 对 `zenjpeg 0.8.4` 的门（"高性能 / 高质量"定为前提后复验）
+
+> **前提变更**：§4.2 与 §8 的选型建立在"风险最小"上。用户明确"高性能 / 高质量，这是前提" ⇒ 本节按能力复验 `zenjpeg`，结论**覆盖 §8 那句"不需要转向 zenjpeg"**。
+
+| # | 问题 | 结论 | 出处 |
+| --- | --- | --- | --- |
+| 1 | **流式** | ✅ `BytesEncoder` 自述 "wraps `StreamingEncoder` to provide **true streaming encoding without buffering the entire image in memory**"；`push(data, rows, stride_bytes, stop)` 接受**任意行数**（页面未给倍数约束，与 `mozjpeg-rs` 不同），另有 `push_packed(data, stop)`；`finish()` / `finish_into(&mut Vec<u8>)` / **`finish_to(W: Write)`**；`rows_pushed()` / `rows_remaining()` | docs.rs `encoder/struct.BytesEncoder.html`；源码 `encode/byte_encoders.rs:19-35,176-263,308-416` |
+| 2 | **4:4:4** | ✅ `ChromaSubsampling::None` = "4:4:4 - No subsampling (full chroma resolution, best quality, largest files)"；经 `EncoderConfig::ycbcr(quality, ChromaSubsampling::None)` | `encoder/enum.ChromaSubsampling.html`；源码 `encode/encoder_types.rs:259-268` |
+| 3 | **BGRA 直入** | ✅ `PixelLayout::Bgra8Srgb` = "BGRA, 4 bytes/pixel, sRGB gamma (alpha ignored on encode)"。`BytesEncoder` 按 layout 收字节 ⇒ **流式也吃 BGRA** ⇒ 省掉逐带 BGRA→RGB | `encoder/enum.PixelLayout.html`；源码 `encoder_types.rs:367-409` |
+| 4 | **超限 / 非法尺寸** | ⚠️ 全部走 `Result`（`Error`/`Result` 在 crate 根导出），**没有 panic 路径**；但"尺寸上限"的**具体错误变体名**在本次抓到的页面里未见 ⇒ 记为未验证。可编码性：3840×30000 < JPEG 65535 ✓ | `zenjpeg/index.html`（Encoder API 段） |
+| 5 | **流式下的优化** | ⚠️ **部分确认**：`finish_with_huffman_frequencies` 文档写 "Returns `None` for counts if **streaming-through mode** was used (no buffered blocks to count from)" ⇒ 存在"真流式（不缓冲块）"与"缓冲块"两种模式，**真流式拿不到 Huffman 优化**；trellis 同样依赖块数据（文档未直说 ⇒ 未验证）。**`BytesEncoder::push` 属于哪一种模式，抓到的页面没有明说** ⇒ 本节最大的未验证项 | `struct.BytesEncoder.html#method.finish_with_huffman_frequencies` |
+
+**顺带核实**
+
+- 许可：crates.io `license = "AGPL-3.0-only OR LicenseRef-Imazen-Commercial"` ✓；依赖表里**没有任何 `-sys` / C 绑定** ⇒ 纯 Rust ✓；
+- MSRV `rust_version = 1.93`；本机 rustc 1.98.1、仓库未声明 `rust-version` ⇒ 不阻塞 ✓；
+- **`trellis` 默认值有冲突**：crates.io 的 `features.default = ["decoder","yuv"]`（**不含 trellis**），docs.rs 的特性表却写 trellis ✅ 默认 —— 以 Cargo 可读的 crates.io 元数据为准 ⇒ **落地必须显式启用 `trellis`**；
+- 默认特性含 `decoder` ⇒ 只做编码时应 `default-features = false`，否则白编一个解码器；
+- 取消：`Stop` trait + `Unstoppable`，`push(..., stop)` **每条带都可取消** ✓，与 `export_worker` 的"取消时删半成品"语义对得上 ✓。
+
+**一句话结论**：在"高性能 / 高质量"前提下，`zenjpeg` **能满足**「真流式 + 4:4:4 + BGRA 直入 + 非渐进 + 3840×30000 + 峰值内存不超一个帧带」，并在两处**优于 `mozjpeg-rs`**：**BGRA 直入**（省逐带转换）、**`push` 无行倍数约束**（m-rs 要求 8/16 的倍数）。它与 m-rs 在"真流式丢掉 Huffman/trellis"这一点上**相同**；**未验证**的是 `push` 走 streaming-through 还是 strip 缓冲 —— 这条决定长图 JPG 的体积与速度，**必须在基准里量**。
+
+### 9.1 顺带：`zenwebp 0.4.4` 的无损路径
+
+| 项 | 结论 | 出处 |
+| --- | --- | --- |
+| 无损配置 | `LosslessConfig`：`quality`（0–100 压缩努力，默认 75）、`method`（0–6，默认 4）、`alpha_quality`（默认 100 = 无损 alpha）、`near_lossless`（默认 100 = 关闭 ⇒ 真无损）、`exact`（默认 false：alpha=0 处的 RGB 允许被改） | `encoder/struct.LosslessConfig.html` |
+| 资源上限 | `with_max_dimensions` / `with_max_memory` / `estimate_memory(_ceiling)` ⇒ 16383 超限可在**编码前**拒绝 | 同上 |
+| 流式 | ❌ 没有逐行接口：`EncodeRequest` + `encode()` / `encode_to(W)` 是**整图**路径（`std` 只为 `io::Write`） ⇒ WebP 只能整图编码 | `zenwebp/index.html` |
+| alpha | ✅ `Rgba8` + `alpha_quality` | 同上 |
+| 纯 Rust | ✅ crate 根自述 `#![forbid(unsafe_code)]`（SIMD 走 `archmage` 安全封装）；依赖表无 C 绑定 | `zenwebp/index.html`（Safety 段） |
+| 版本 | **0.4.5 已被 yank** ⇒ 钉 `=0.4.4` | crates.io 元数据 |
+
+**一句话**：`zenwebp` 的无损路径**满足"高质量"**（真无损 + 无损 alpha + 可限资源），但**不满足"流式"** —— 对 WebP 不构成问题（它只承载 ≤16383 的普通截图），却再次说明 **WebP 不能作为滚动长图的格式**（与 §1.2 一致）。
+
+### 9.2 裁定（覆盖 §4.2 / §8 的选型）
+
+- 前提"高性能 / 高质量"成立时（用户已明确）：**JPG 用 `zenjpeg 0.8.4`** —— `ChromaSubsampling::None`(4:4:4) + `PixelLayout::Bgra8Srgb` + 非渐进 + **显式启用 `trellis`**；
+- 若改回"接受 5–10% 体积换更成熟依赖"：`mozjpeg-rs 0.9.2`（BSD-3）仍是安全退路，两者 sink 同构（`W: Write` + 行带）⇒ **换库只改 sink 内部**；
+- **WebP**：`zenwebp 0.4.4` 无损、仅 ≤16383、**整图**编码；
+- 三者的 sink 都落在 `apps/snapclip` 侧，`snapclip-capture` 只给 BGRA 行带与尺寸（§2 结论不变）。
+
+### 9.3 §9 的未验证项
+
+1. `BytesEncoder::push` 是 streaming-through 还是 strip 缓冲（决定长图 JPG 的体积/速度）；
+2. `Error` 里"尺寸上限"的具体变体名；
+3. trellis 在真流式下是否可用（目前由 Huffman 那句反推，无官方明文）；
+4. `trellis` 默认值的两处文档冲突已做交叉核对，但**未编译验证**；
+5. 各配置的实际耗时 / 体积 / 峰值内存（按 §5 的基准计划量）。
