@@ -24,6 +24,27 @@ pub(crate) enum Placement {
     Full,
 }
 
+/// What the three "move a lot of bytes" sites in [`Stitcher`] actually did (docs/35 §2.2, §7.1).
+///
+/// Compiled only with `test-support`: the product build has no counters, no clock reads and no
+/// extra field, so the default path is byte for byte the code it was (`docs/35` phase 0).
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MoveCounters {
+    /// `grow` calls that had to reallocate (the canvas pointer moved) and how much they copied.
+    pub grow_moves: u32,
+    pub grow_bytes: u64,
+    pub grow_us: u64,
+    /// `Prepended` shifts of the whole known canvas (`copy_within`).
+    pub shift_moves: u32,
+    pub shift_bytes: u64,
+    pub shift_us: u64,
+    /// `band` overwrites: frame bytes copied into the canvas at the growing edge.
+    pub band_copies: u32,
+    pub band_bytes: u64,
+    pub band_us: u64,
+}
+
 #[derive(Debug)]
 pub(crate) struct Stitcher {
     width: u32,
@@ -34,6 +55,8 @@ pub(crate) struct Stitcher {
     pos: u32,
     /// Content coordinate of canvas row 0: the first frame's top is 0, and every prepend lowers it.
     top: i64,
+    #[cfg(feature = "test-support")]
+    counters: MoveCounters,
 }
 
 impl Stitcher {
@@ -48,6 +71,8 @@ impl Stitcher {
             rows: view,
             pos: 0,
             top: 0,
+            #[cfg(feature = "test-support")]
+            counters: MoveCounters::default(),
         }
     }
 
@@ -82,20 +107,18 @@ impl Stitcher {
         let cand = i64::from(self.pos) + i64::from(dy);
         if cand + view > i64::from(self.rows) {
             let growth = (cand + view - i64::from(self.rows)) as u32;
-            if self.rows + growth > self.max_rows
-                || !grow(
-                    &mut self.canvas,
-                    growth as usize * row,
-                    self.max_rows as usize * row,
-                )
-            {
+            if self.rows + growth > self.max_rows || !self.grow_to(growth, row) {
                 return Placement::Full;
             }
             self.rows += growth;
             let band = self.band(growth) as usize;
             let to = self.rows as usize * row;
+            #[cfg(feature = "test-support")]
+            let band_started = std::time::Instant::now();
             self.canvas[to - band * row..to]
                 .copy_from_slice(&frame[(self.view as usize - band) * row..]);
+            #[cfg(feature = "test-support")]
+            self.note_band(band * row, band_started);
             self.pos = self.rows - self.view;
             Placement::Appended {
                 growth,
@@ -104,19 +127,25 @@ impl Stitcher {
         } else if cand < 0 {
             let growth = (-cand) as u32;
             let known = self.canvas.len();
-            if self.rows + growth > self.max_rows
-                || !grow(
-                    &mut self.canvas,
-                    growth as usize * row,
-                    self.max_rows as usize * row,
-                )
-            {
+            if self.rows + growth > self.max_rows || !self.grow_to(growth, row) {
                 return Placement::Full;
             }
             self.rows += growth;
+            #[cfg(feature = "test-support")]
+            let shift_started = std::time::Instant::now();
             self.canvas.copy_within(..known, growth as usize * row);
+            #[cfg(feature = "test-support")]
+            {
+                self.counters.shift_moves += 1;
+                self.counters.shift_bytes += known as u64;
+                self.counters.shift_us += shift_started.elapsed().as_micros() as u64;
+            }
             let band = self.band(growth) as usize;
+            #[cfg(feature = "test-support")]
+            let band_started = std::time::Instant::now();
             self.canvas[..band * row].copy_from_slice(&frame[..band * row]);
+            #[cfg(feature = "test-support")]
+            self.note_band(band * row, band_started);
             self.pos = 0;
             self.top -= i64::from(growth);
             Placement::Prepended {
@@ -126,6 +155,67 @@ impl Stitcher {
         } else {
             self.pos = cand as u32;
             Placement::Contained
+        }
+    }
+
+    /// The one `grow` call site, so the measurement feature can wrap it instead of the branches.
+    fn grow_to(&mut self, growth: u32, row: usize) -> bool {
+        #[cfg(feature = "test-support")]
+        {
+            let before_len = self.canvas.len();
+            let before = self.canvas.as_ptr();
+            let started = std::time::Instant::now();
+            let ok = grow(
+                &mut self.canvas,
+                growth as usize * row,
+                self.max_rows as usize * row,
+            );
+            let us = started.elapsed().as_micros() as u64;
+            if ok {
+                self.counters.grow_us += us;
+                if self.canvas.as_ptr() != before {
+                    // A move copied everything that was already in the canvas.
+                    self.counters.grow_moves += 1;
+                    self.counters.grow_bytes += before_len as u64;
+                }
+            }
+            ok
+        }
+        #[cfg(not(feature = "test-support"))]
+        {
+            grow(
+                &mut self.canvas,
+                growth as usize * row,
+                self.max_rows as usize * row,
+            )
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    fn note_band(&mut self, bytes: usize, started: std::time::Instant) {
+        self.counters.band_copies += 1;
+        self.counters.band_bytes += bytes as u64;
+        self.counters.band_us += started.elapsed().as_micros() as u64;
+    }
+
+    /// What the three move sites have done so far (docs/35 §2.2).
+    #[cfg(feature = "test-support")]
+    pub(crate) fn counters(&self) -> MoveCounters {
+        self.counters
+    }
+
+    /// Reserve the whole row cap up front, so the variant A experiment runs with no reallocation
+    /// (`docs/35` §7.1). `try_reserve_exact` rather than `reserve_exact`: the experiment must not
+    /// abort a process when the cap is bigger than the machine will serve.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn preallocate(&mut self, rows: u32) {
+        let bytes = (self.width as usize) * 4 * (rows.min(self.max_rows) as usize);
+        let spare = bytes.saturating_sub(self.canvas.len());
+        if spare == 0 {
+            return;
+        }
+        if let Err(error) = self.canvas.try_reserve_exact(spare) {
+            eprintln!("[snapclip][scroll] the preallocation experiment could not reserve: {error}");
         }
     }
 
@@ -217,6 +307,45 @@ mod tests {
             }
         }
         stitcher
+    }
+
+    /// The three counters must name the site that actually moved bytes, because the plan's
+    /// attribution rests on them (docs/35 §7.1, phase 0).
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn the_counters_name_the_site_that_moved_the_canvas() {
+        let page = page(W, 4000, 21);
+
+        // A downward run copies bands and may reallocate, but never shifts.
+        let mut down = Stitcher::new(&window(&page, W, 0, H), W, H, 32 * H);
+        for top in (60..=600).step_by(60) {
+            down.place(&window(&page, W, top, H), 60);
+        }
+        let appended = down.counters();
+        assert_eq!(appended.shift_moves, 0, "a downward run never prepends");
+        assert_eq!(appended.shift_bytes, 0);
+        assert!(appended.band_copies >= 10, "{appended:?}");
+        assert!(appended.band_bytes > 0);
+        assert!(appended.grow_moves >= 1, "the canvas doubles: {appended:?}");
+        assert!(appended.grow_bytes > 0);
+
+        // Preallocating the cap removes the reallocation without changing the result.
+        let mut preallocated = Stitcher::new(&window(&page, W, 0, H), W, H, 32 * H);
+        preallocated.preallocate(32 * H);
+        for top in (60..=600).step_by(60) {
+            preallocated.place(&window(&page, W, top, H), 60);
+        }
+        let reserved = preallocated.counters();
+        assert_eq!(reserved.grow_moves, 0, "no reallocation after reserving: {reserved:?}");
+        assert_eq!(reserved.shift_moves, 0);
+        assert!(preallocated.canvas() == down.canvas(), "the pixels are the same");
+
+        // An upward step past the canvas top is the shift.
+        let mut up = Stitcher::new(&window(&page, W, 1000, H), W, H, 32 * H);
+        up.place(&window(&page, W, 950, H), -50);
+        let prepended = up.counters();
+        assert_eq!(prepended.shift_moves, 1, "{prepended:?}");
+        assert_eq!(prepended.shift_bytes, (W * H * 4) as u64);
     }
 
     #[test]

@@ -30,3 +30,14 @@ enough = "0.4.5"
 # on the capture crate with its `test-support` feature. The dependency only goes this way: nothing
 # in the product ever depends on the bench or on its codec dependencies.
 snapclip-capture = { path = "../../crates/snapclip-capture", features = ["test-support"] }
+
+# The attribution run reports the process working set next to the counting allocator's peak: the
+# first is what the process held, the second is what the code asked for, and their gap is the
+# allocator's retention. Both versions are already in the workspace lock through the capture crate,
+# so this adds no new download.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_System_ProcessStatus",
+  "Win32_System_Threading",
+] }

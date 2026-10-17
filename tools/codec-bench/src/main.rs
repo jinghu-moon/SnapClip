@@ -9,7 +9,9 @@
 //!   q92 is enough, and whether turning the optimisations on changes the decoded pixels at all.
 //!   It writes a zoomed crop of one text region so the numbers can be checked by eye.
 
+mod attribution;
 mod alloc_probe;
+mod rss;
 mod codecs;
 mod huffman_ab;
 mod quality;
@@ -34,6 +36,10 @@ const ZOOM: usize = 8;
 
 fn main() {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if arguments.iter().any(|argument| argument == "--attribution") {
+        println!("{}", attribution::report());
+        return;
+    }
     if arguments.iter().any(|argument| argument == "--scroll") {
         println!("{}", scroll::report());
         return;
@@ -51,7 +57,7 @@ fn main() {
         return;
     }
     if !arguments.iter().any(|argument| argument == "--report") {
-        println!("codec-bench: pass --report, --quality, --scroll, --transcode or --huffman-ab");
+        println!("codec-bench: pass --report, --quality, --scroll, --transcode, --attribution or --huffman-ab");
         return;
     }
     run_report();

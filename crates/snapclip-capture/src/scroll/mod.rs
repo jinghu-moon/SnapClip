@@ -273,6 +273,19 @@ impl Tracker {
             self.stitcher.into_canvas(),
         )
     }
+
+    /// Reserves the whole row cap before the first frame, for the attribution experiment
+    /// (docs/35 §7.1 variant A). No product path calls this.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn preallocate_canvas(&mut self, rows: u32) {
+        self.stitcher.preallocate(rows);
+    }
+
+    /// What the canvas has moved so far (docs/35 §2.2). Measurement only.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn move_counters(&self) -> stitch::MoveCounters {
+        self.stitcher.counters()
+    }
 }
 
 #[cfg(test)]
@@ -540,7 +553,18 @@ pub mod probe {
         pub tracking: bool,
         pub lost: bool,
         pub full: bool,
+        /// What this one frame moved, so the slowest frame can be attributed rather than guessed
+        /// (docs/35 §7.1): the canvas reallocated, shifted for a prepend, or overwrote a band.
+        pub grow_moves: u32,
+        pub grow_bytes: u64,
+        pub shift_bytes: u64,
+        pub band_bytes: u64,
+        pub appended: bool,
+        pub prepended: bool,
     }
+
+    /// The three move sites' running totals (docs/35 §2.2).
+    pub use super::stitch::MoveCounters;
 
     /// Drives the real tracker either at the product's own limits or at an explicit row cap.
     pub struct ScrollProbe {
@@ -568,6 +592,12 @@ pub mod probe {
             }
         }
 
+        /// Content coordinate of canvas row 0: negative once the session scrolled above the frame
+        /// it started from, which is how a measurement compares a canvas with the page (docs/35).
+        pub fn top(&self) -> i64 {
+            self.tracker.stitcher.top()
+        }
+
         /// The row cap the product would apply to this selection.
         pub fn row_cap(width: u32, view: u32) -> u32 {
             super::row_limit(width, view, super::MAX_BYTES)
@@ -578,10 +608,23 @@ pub mod probe {
             super::MAX_SCREENS * view
         }
 
+        /// Reserves the whole row cap up front, so a run can be measured with no reallocation
+        /// (docs/35 §7.1 variant A).
+        pub fn preallocate(&mut self, rows: u32) {
+            self.tracker.preallocate_canvas(rows);
+        }
+
+        /// What the canvas has moved so far: the three attribution candidates (docs/35 §2.2).
+        pub fn counters(&self) -> super::stitch::MoveCounters {
+            self.tracker.move_counters()
+        }
+
         pub fn push(&mut self, frame: &[u8]) -> Frame {
+            let before = self.tracker.move_counters();
             let started = std::time::Instant::now();
             let step = self.tracker.push(frame);
             let total_us = started.elapsed().as_micros() as u64;
+            let after = self.tracker.move_counters();
             let status = self.tracker.status();
             Frame {
                 stitch_us: total_us.saturating_sub(self.tracker.last_thumb_us()),
@@ -591,6 +634,15 @@ pub mod probe {
                 tracking: status == Status::Tracking,
                 lost: status == Status::Lost,
                 full: status == Status::Full,
+                grow_moves: after.grow_moves - before.grow_moves,
+                grow_bytes: after.grow_bytes - before.grow_bytes,
+                shift_bytes: after.shift_bytes - before.shift_bytes,
+                band_bytes: after.band_bytes - before.band_bytes,
+                appended: matches!(step.placement, Some(super::stitch::Placement::Appended { .. })),
+                prepended: matches!(
+                    step.placement,
+                    Some(super::stitch::Placement::Prepended { .. })
+                ),
             }
         }
 

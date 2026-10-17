@@ -1060,6 +1060,7 @@ dependencies = [
  "mozjpeg-rs",
  "png 0.18.1",
  "snapclip-capture",
+ "windows-sys 0.59.0",
  "zenjpeg",
  "zenwebp",
 ]
