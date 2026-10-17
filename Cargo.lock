@@ -1055,6 +1055,7 @@ dependencies = [
 name = "codec-bench"
 version = "0.1.0"
 dependencies = [
+ "enough",
  "mozjpeg-rs",
  "png 0.18.1",
  "zenjpeg",

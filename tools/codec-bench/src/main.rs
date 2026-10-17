@@ -1,27 +1,48 @@
-//! Measures PNG, JPEG and WebP encoders on synthetic screenshot material (docs/34 §10).
+//! Measures PNG, JPEG and WebP encoders on synthetic screenshot material (docs/34 §10, §11).
 //!
-//! Run with `cargo run -p codec-bench --release -- --report`. The first question it answers is the
-//! one the documentation could not: whether `zenjpeg`'s `BytesEncoder::push` really streams without
-//! buffering blocks, which decides whether long scroll captures keep the Huffman and trellis
-//! optimisations. The `verdict` section prints the three sizes that answer it — same image, same
-//! quality, only the band size and the optimisation switches differ.
+//! Two modes:
+//!
+//! * `--report` answers the size/time/memory question and, with it, whether `zenjpeg`'s
+//!   `BytesEncoder::push` really streams without buffering blocks — which decides whether long
+//!   scroll captures keep the Huffman and trellis optimisations.
+//! * `--quality` answers the quality question on the same material: how much 4:2:0 costs, whether
+//!   q92 is enough, and whether turning the optimisations on changes the decoded pixels at all.
+//!   It writes a zoomed crop of one text region so the numbers can be checked by eye.
 
 mod alloc_probe;
 mod codecs;
+mod quality;
 mod synthetic;
 
 use std::time::Instant;
 
 use codecs::{JpegOptions, Outcome};
+use synthetic::TextRegion;
 
 #[global_allocator]
 static ALLOCATOR: alloc_probe::Counting = alloc_probe::Counting;
 
+/// Rows per `push` for the quality run. Banding does not change the output (docs/34 §10), so this
+/// is the streaming shape the product will actually use rather than one whole-image call.
+const QUALITY_BAND_ROWS: usize = 64;
+
+/// Bits of zoom in the text-crop dump: enough to see 4:2:0 smear a one pixel stroke.
+const ZOOM: usize = 8;
+
 fn main() {
-    if !std::env::args().any(|argument| argument == "--report") {
-        println!("codec-bench: pass --report to print the table");
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if arguments.iter().any(|argument| argument == "--quality") {
+        run_quality();
         return;
     }
+    if !arguments.iter().any(|argument| argument == "--report") {
+        println!("codec-bench: pass --report or --quality");
+        return;
+    }
+    run_report();
+}
+
+fn run_report() {
     let mut rows: Vec<(&'static str, String, Outcome)> = Vec::new();
     let mut verdict: Vec<(String, Outcome)> = Vec::new();
 
@@ -91,6 +112,246 @@ fn main() {
 
     print_table(&rows);
     print_verdict(&verdict);
+}
+
+/// One JPEG variant of the quality matrix: everything that decides its pixels and size.
+struct Variant {
+    label: &'static str,
+    quality: u8,
+    subsample_444: bool,
+    trellis: bool,
+    optimize_huffman: bool,
+}
+
+fn variants() -> Vec<Variant> {
+    vec![
+        Variant { label: "q92 444 plain", quality: 92, subsample_444: true, trellis: false, optimize_huffman: false },
+        Variant { label: "q95 444 plain", quality: 95, subsample_444: true, trellis: false, optimize_huffman: false },
+        Variant { label: "q85 444 plain", quality: 85, subsample_444: true, trellis: false, optimize_huffman: false },
+        Variant { label: "q92 420 plain", quality: 92, subsample_444: false, trellis: false, optimize_huffman: false },
+        // Same quantisation tables as plain: only the entropy coder changes, so the decoded pixels
+        // must be identical and only the size may move.
+        Variant { label: "q92 444 huffman only", quality: 92, subsample_444: true, trellis: false, optimize_huffman: true },
+        Variant { label: "q92 444 preset(trellis)", quality: 92, subsample_444: true, trellis: true, optimize_huffman: true },
+    ]
+}
+
+/// A decoded variant, reused by the table and the crop dump.
+struct Decoded {
+    bytes: usize,
+    pixels: Vec<u8>,
+}
+
+fn run_quality() {
+    println!("\nquality — JPEG decoded and compared against the lossless PNG of the same asset");
+    println!("text regions: {ZOOM}x crop of the first one is written to target/jpeg_text_zoom.png");
+    println!(
+        "\n{:<10} {:<24} {:>10} {:>9} {:>9} {:>10} {:>10}",
+        "asset", "variant", "bytes", "ssim", "psnr", "text ssim", "text psnr"
+    );
+    println!("{}", "-".repeat(86));
+
+    // The tall scroll strip is left out: its quality question is the same as ui-4k's, and a
+    // 38-megapixel decode twice per variant would only slow the run down.
+    for asset in synthetic::corpus().into_iter().filter(|asset| asset.height <= 4_000) {
+        let png = match codecs::png_row_band(&asset.pixels, asset.width, asset.height) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                eprintln!("codec-bench: {} / png: {error}", asset.name);
+                continue;
+            }
+        };
+        let (width, height, reference) = match codecs::decode_png(&png) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                eprintln!("codec-bench: {} / png decode: {error}", asset.name);
+                continue;
+            }
+        };
+        if (width, height) != (asset.width, asset.height) {
+            eprintln!("codec-bench: {} / png size mismatch", asset.name);
+            continue;
+        }
+        let mut plain_444: Option<Decoded> = None;
+
+        for variant in variants() {
+            let encoded = match codecs::zenjpeg_knobs(
+                &asset.pixels,
+                asset.width,
+                asset.height,
+                variant.quality,
+                variant.subsample_444,
+                variant.trellis,
+                variant.optimize_huffman,
+                QUALITY_BAND_ROWS,
+            ) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    eprintln!("codec-bench: {} / {}: {error}", asset.name, variant.label);
+                    continue;
+                }
+            };
+            let (jpeg_width, jpeg_height, pixels) = match codecs::decode_jpeg(&encoded) {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    eprintln!("codec-bench: {} / {} decode: {error}", asset.name, variant.label);
+                    continue;
+                }
+            };
+            if (jpeg_width, jpeg_height) != (width, height) {
+                eprintln!("codec-bench: {} / {} decoded to {}x{}", asset.name, variant.label, jpeg_width, jpeg_height);
+                continue;
+            }
+            let all = quality::whole(&reference, &pixels, width, height);
+            let text = quality::in_regions(&reference, &pixels, width, height, &asset.text_regions);
+            println!(
+                "{:<10} {:<24} {:>10} {:>9.4} {:>9.2} {:>10.4} {:>10.2}",
+                asset.name, variant.label, encoded.len(), all.ssim, all.psnr, text.ssim, text.psnr
+            );
+            let decoded = Decoded { bytes: encoded.len(), pixels };
+            if variant.label == "q92 444 plain" {
+                plain_444 = Some(decoded);
+            }
+        }
+
+        // The clean A/B this section exists for: plain and huffman-only use the same quantisation
+        // tables, so their decoded pixels must match exactly. Anything else means the entropy coder
+        // changed the picture, which it must not.
+        if let Some(plain) = plain_444.as_ref() {
+            if let Some(huffman) = huffman_only(&asset, &reference) {
+                let identical = plain.pixels == huffman.pixels;
+                println!(
+                    "  {:<8} plain vs huffman-only: {} bytes vs {} bytes, pixels {}",
+                    asset.name,
+                    plain.bytes,
+                    huffman.bytes,
+                    if identical { "IDENTICAL" } else { "DIFFER" }
+                );
+            }
+        }
+    }
+
+    write_text_crop();
+    print_quality_verdict();
+}
+
+/// Re-encodes one asset with huffman only, for the pixel-identity check printed above.
+fn huffman_only(asset: &synthetic::Asset, reference: &[u8]) -> Option<Decoded> {
+    let encoded = codecs::zenjpeg_knobs(
+        &asset.pixels,
+        asset.width,
+        asset.height,
+        92,
+        true,
+        false,
+        true,
+        QUALITY_BAND_ROWS,
+    )
+    .ok()?;
+    let (_, _, pixels) = codecs::decode_jpeg(&encoded).ok()?;
+    if pixels.len() != reference.len() {
+        return None;
+    }
+    Some(Decoded { bytes: encoded.len(), pixels })
+}
+
+/// Writes PNG / q92 4:4:4 / q92 4:2:0 crops of the first text region of `ui-1080`, side by side at
+/// `ZOOM`, so 4:2:0's smear can be seen instead of only scored.
+fn write_text_crop() {
+    let Some(asset) = synthetic::corpus().into_iter().find(|asset| asset.name == "ui-1080") else {
+        return;
+    };
+    let Some(region) = asset.text_regions.first().copied() else {
+        return;
+    };
+    // A line box spans the panel's whole width; the dump takes a readable slice of it at 8x.
+    const SLICE: usize = 160;
+    let region = TextRegion { x1: (region.x0 + SLICE).min(region.x1), ..region };
+    let Some(png) = codecs::png_row_band(&asset.pixels, asset.width, asset.height).ok() else {
+        return;
+    };
+    let Some((width, _height, reference)) = codecs::decode_png(&png).ok() else {
+        return;
+    };
+    let panel = |subsample_444: bool| -> Option<Vec<u8>> {
+        let encoded = codecs::zenjpeg_knobs(
+            &asset.pixels,
+            asset.width,
+            asset.height,
+            92,
+            subsample_444,
+            false,
+            false,
+            QUALITY_BAND_ROWS,
+        )
+        .ok()?;
+        let (_, _, pixels) = codecs::decode_jpeg(&encoded).ok()?;
+        Some(pixels)
+    };
+    let Some(full_444) = panel(true) else { return };
+    let Some(quarter) = panel(false) else { return };
+
+    let (truth, crop_width, crop_height) = quality::crop(&reference, width, region);
+    if crop_width == 0 || crop_height == 0 {
+        return;
+    }
+    let (with_444, _, _) = quality::crop(&full_444, width, region);
+    let (with_420, _, _) = quality::crop(&quarter, width, region);
+
+    const GAP: usize = 8;
+    let panels: [&Vec<u8>; 3] = [&truth, &with_444, &with_420];
+    let strip_width = (crop_width * ZOOM * 3) + GAP * 2;
+    let strip_height = crop_height * ZOOM;
+    let mut strip = vec![255u8; strip_width * strip_height * 4];
+    for (panel_index, panel) in panels.iter().enumerate() {
+        let offset_x = panel_index * (crop_width * ZOOM + GAP);
+        for y in 0..crop_height * ZOOM {
+            for x in 0..crop_width * ZOOM {
+                let source_x = x / ZOOM;
+                let source_y = y / ZOOM;
+                let source = (source_y * crop_width + source_x) * 4;
+                let target = (y * strip_width + offset_x + x) * 4;
+                strip[target..target + 4].copy_from_slice(&panel[source..source + 4]);
+            }
+        }
+    }
+
+    let path = std::path::Path::new("target/jpeg_text_zoom.png");
+    let result = (|| -> Result<(), String> {
+        let file = std::fs::File::create(path).map_err(|error| format!("create: {error}"))?;
+        let writer = std::io::BufWriter::new(file);
+        let mut encoder = png::Encoder::new(writer, strip_width as u32, strip_height as u32);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().map_err(|error| format!("header: {error}"))?;
+        writer.write_image_data(&strip).map_err(|error| format!("data: {error}"))
+    })();
+    match result {
+        Ok(()) => println!(
+            "\nwrote {} — PNG | q92 4:4:4 | q92 4:2:0, {crop_width}x{crop_height} at {ZOOM}x \
+             (text region at {},{} of ui-1080, {}x{} total)",
+            path.display(),
+            region.x0,
+            region.y0,
+            asset.width,
+            asset.height
+        ),
+        Err(error) => eprintln!("codec-bench: could not write the crop: {error}"),
+    }
+}
+
+fn print_quality_verdict() {
+    println!(
+        "\nread it like this:\n\
+         * `text ssim` is the number that matters — whole-image SSIM stays high because a UI is\n\
+           mostly flat surfaces that survive compression almost perfectly.\n\
+         * 4:2:0 against 4:4:4 at the same quality shows what chroma subsampling costs on coloured\n\
+           text and thin strokes.\n\
+         * `huffman only` must decode to the same pixels as `plain`: the entropy coder changes\n\
+           bytes, not the picture.
+         * `preset(trellis)` is *not* a controlled A/B: the crate keeps the trellis knob private, so
+           the only way in is the mozjpeg preset, which also swaps the quantisation tables."
+    );
 }
 
 fn iterations_for(pixels: usize) -> usize {

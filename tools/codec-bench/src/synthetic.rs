@@ -12,6 +12,29 @@ pub struct Asset {
     pub height: usize,
     /// BGRA, four bytes per pixel, rows top to bottom.
     pub pixels: Vec<u8>,
+    /// Line boxes where text was drawn, in pixels. The generator knows this because it drew the
+    /// text itself, and it is the only honest way to measure JPEG on text: whole-image SSIM is
+    /// dominated by the flat surfaces around it (docs/34 §11).
+    pub text_regions: Vec<TextRegion>,
+}
+
+/// Half-open pixel rectangle: `x0..x1` by `y0..y1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextRegion {
+    pub x0: usize,
+    pub y0: usize,
+    pub x1: usize,
+    pub y1: usize,
+}
+
+impl TextRegion {
+    pub fn width(&self) -> usize {
+        self.x1.saturating_sub(self.x0)
+    }
+
+    pub fn height(&self) -> usize {
+        self.y1.saturating_sub(self.y0)
+    }
 }
 
 /// Deterministic xorshift; good enough for texture, and reproducible.
@@ -105,6 +128,9 @@ fn rounded_rect(
 }
 
 /// Rows of "text": short strokes of a few colours at text scale, which is what hurts JPEG.
+///
+/// Every line the loop actually draws is also recorded, so the quality run can restrict its
+/// metrics to those boxes.
 fn glyph_rows(
     pixels: &mut [u8],
     width: usize,
@@ -113,6 +139,7 @@ fn glyph_rows(
     top: i32,
     lines: i32,
     cell: i32,
+    text_regions: &mut Vec<TextRegion>,
 ) {
     const INK: [[u8; 4]; 5] = [
         [40, 40, 40, 255],
@@ -135,6 +162,13 @@ fn glyph_rows(
             }
             x += cell + rng.range(2, 6);
         }
+        // The line box: the full width the strokes may occupy, one text cell tall.
+        text_regions.push(TextRegion {
+            x0: 24,
+            y0: y.max(0) as usize,
+            x1: (width as i32 - 24).max(25) as usize,
+            y1: (y + cell).min(height as i32).max(y + 1) as usize,
+        });
         y += cell + 6;
     }
 }
@@ -142,6 +176,7 @@ fn glyph_rows(
 fn ui(name: &'static str, width: usize, height: usize, seed: u64) -> Asset {
     let mut rng = Rng(seed);
     let mut pixels = blank(width, height);
+    let mut text_regions = Vec::new();
     // A vertical gradient, then flat panels, hairlines and text: the mix that separates encoders.
     for y in 0..height {
         let shade = 236 - (y * 40 / height) as u8;
@@ -158,15 +193,16 @@ fn ui(name: &'static str, width: usize, height: usize, seed: u64) -> Asset {
         rounded_rect(&mut pixels, width, x0, y0, x1, y0 + 34, 10, [90, 120, 160, 255]);
         vertical(&mut pixels, width, x0, y0, y1, [150, 150, 150, 255]);
         horizontal(&mut pixels, width, x0, x1, y1 - 1, [150, 150, 150, 255]);
-        glyph_rows(&mut pixels, width, height, &mut rng, y0 + 60, 6, 11);
+        glyph_rows(&mut pixels, width, height, &mut rng, y0 + 60, 6, 11, &mut text_regions);
     }
-    glyph_rows(&mut pixels, width, height, &mut rng, 24, 2, 13);
-    Asset { name, width, height, pixels }
+    glyph_rows(&mut pixels, width, height, &mut rng, 24, 2, 13, &mut text_regions);
+    Asset { name, width, height, pixels, text_regions }
 }
 
 fn scroll(name: &'static str, width: usize, height: usize, seed: u64) -> Asset {
     let mut rng = Rng(seed);
     let mut pixels = blank(width, height);
+    let mut text_regions = Vec::new();
     // Repeated document bands: flat surfaces, hairlines and text, repeated far past any format
     // limit that WebP has.
     let band = 240;
@@ -174,15 +210,16 @@ fn scroll(name: &'static str, width: usize, height: usize, seed: u64) -> Asset {
     while y < height {
         horizontal(&mut pixels, width, 0, width as i32, y as i32, [245, 245, 245, 255]);
         horizontal(&mut pixels, width, 32, width as i32 - 32, (y + band - 1) as i32, [210, 210, 210, 255]);
-        glyph_rows(&mut pixels, width, height, &mut rng, y as i32 + 16, 4, 10);
+        glyph_rows(&mut pixels, width, height, &mut rng, y as i32 + 16, 4, 10, &mut text_regions);
         y += band;
     }
-    Asset { name, width, height, pixels }
+    Asset { name, width, height, pixels, text_regions }
 }
 
 fn translucent(name: &'static str, width: usize, height: usize, seed: u64) -> Asset {
     let mut rng = Rng(seed);
     let mut pixels = blank(width, height);
+    let mut text_regions = Vec::new();
     for y in 0..height {
         let shade = 30 + (y * 60 / height) as u8;
         horizontal(&mut pixels, width, 0, width as i32, y as i32, [shade + 20, shade, shade, 255]);
@@ -193,9 +230,9 @@ fn translucent(name: &'static str, width: usize, height: usize, seed: u64) -> As
         let y0 = 160 + window * 300;
         rounded_rect(&mut pixels, width, x0, y0, x0 + 460, y0 + 300, 16, [250, 250, 250, 190]);
         rounded_rect(&mut pixels, width, x0, y0, x0 + 460, y0 + 36, 16, [40, 90, 140, 210]);
-        glyph_rows(&mut pixels, width, height, &mut rng, y0 + 60, 3, 9);
+        glyph_rows(&mut pixels, width, height, &mut rng, y0 + 60, 3, 9, &mut text_regions);
     }
-    Asset { name, width, height, pixels }
+    Asset { name, width, height, pixels, text_regions }
 }
 
 #[cfg(test)]

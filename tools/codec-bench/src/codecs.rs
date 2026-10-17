@@ -158,6 +158,76 @@ pub fn mozjpeg(
     stream.finish().map_err(|error| format!("mozjpeg finish: {error}"))
 }
 
+/// zenjpeg with the entropy coder as a **separate** knob, and the trellis arm as a preset.
+///
+/// `optimize_huffman` is a public switch and cannot change the picture, only the bytes, so `plain`
+/// versus `huffman only` is a clean A/B. Trellis is not: the crate keeps `TrellisConfig` and the
+/// `trellis` field crate-private, so the only way in is `OptimizationPreset::MozjpegBaseline`,
+/// which also swaps the quantisation tables. That arm is therefore labelled as a preset in the
+/// report rather than pretended to be a controlled experiment (docs/34 §11).
+pub fn zenjpeg_knobs(
+    bgra: &[u8],
+    width: usize,
+    height: usize,
+    quality: u8,
+    subsample_444: bool,
+    trellis: bool,
+    optimize_huffman: bool,
+    band_rows: usize,
+) -> Result<Vec<u8>, String> {
+    use zenjpeg::encoder::{ChromaSubsampling, EncoderConfig, OptimizationPreset, PixelLayout, Unstoppable};
+    let subsampling = if subsample_444 { ChromaSubsampling::None } else { ChromaSubsampling::Quarter };
+    let mut config = EncoderConfig::ycbcr(f32::from(quality), subsampling);
+    config = if trellis {
+        config.optimization(OptimizationPreset::MozjpegBaseline)
+    } else {
+        config.force_baseline().optimize_huffman(optimize_huffman)
+    };
+    let mut encoder = config
+        .encode_from_bytes(width as u32, height as u32, PixelLayout::Bgra8Srgb)
+        .map_err(|error| format!("zenjpeg start: {error}"))?;
+    let stride = width * 4;
+    let band = if band_rows == 0 { height } else { band_rows };
+    let mut y = 0;
+    while y < height {
+        let rows = band.min(height - y);
+        let start = y * stride;
+        encoder
+            .push(&bgra[start..start + rows * stride], rows, stride, Unstoppable)
+            .map_err(|error| format!("zenjpeg push: {error}"))?;
+        y += rows;
+    }
+    encoder.finish().map_err(|error| format!("zenjpeg finish: {error}"))
+}
+
+/// Decodes a JPEG to RGBA, so its pixels can be compared with the lossless reference.
+pub fn decode_jpeg(bytes: &[u8]) -> Result<(usize, usize, Vec<u8>), String> {
+    use zenjpeg::decoder::{Decoder, PixelFormat};
+    let result = Decoder::new()
+        .output_format(PixelFormat::Rgba)
+        .decode(bytes, enough::Unstoppable)
+        .map_err(|error| format!("zenjpeg decode: {error}"))?;
+    let (width, height) = result.dimensions();
+    let pixels = result.into_pixels_u8().ok_or_else(|| "zenjpeg decode: no u8 pixels".to_string())?;
+    Ok((width as usize, height as usize, pixels))
+}
+
+/// Decodes one of our own PNGs to RGBA. Anything that is not RGBA is refused rather than guessed at.
+pub fn decode_png(bytes: &[u8]) -> Result<(usize, usize, Vec<u8>), String> {
+    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    let mut reader = decoder.read_info().map_err(|error| format!("png decode: {error}"))?;
+    let size = reader
+        .output_buffer_size()
+        .ok_or_else(|| "png decode: no output size".to_string())?;
+    let mut buffer = vec![0u8; size];
+    let info = reader.next_frame(&mut buffer).map_err(|error| format!("png frame: {error}"))?;
+    if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
+        return Err(format!("png decode: expected 8-bit RGBA, got {:?}/{:?}", info.color_type, info.bit_depth));
+    }
+    buffer.truncate(info.buffer_size());
+    Ok((info.width as usize, info.height as usize, buffer))
+}
+
 /// zenwebp lossless. Whole image in; dimensions past the format limit are refused up front.
 pub fn zenwebp_lossless(bgra: &[u8], width: usize, height: usize) -> Result<Vec<u8>, String> {
     use zenwebp::{EncodeRequest, LosslessConfig, PixelLayout};
