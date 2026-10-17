@@ -121,6 +121,33 @@ pub trait ClipboardWriter: Send + Sync + 'static {
     ) -> Result<(), String>;
 }
 
+/// Rows on demand, for pictures that are never held whole (docs/35 §13.4).
+///
+/// A scroll capture's long image can be tens of thousands of rows; materialising it to hand
+/// over one buffer costs the whole image in memory. A writer that can stream asks for bands
+/// instead, and the source decides whether the rows come from a file, a ring buffer or a
+/// single contiguous image.
+pub trait BandSource: Send {
+    /// How many rows the picture has.
+    fn rows(&self) -> u32;
+    /// Fill `out` with `rows` rows starting at `first_row`, top-down, tightly packed BGRA.
+    ///
+    /// Returns false when the rows cannot be supplied; the writer then refuses the artifact
+    /// rather than writing a short one.
+    fn read_rows(&mut self, first_row: u32, rows: u32, out: &mut Vec<u8>) -> bool;
+}
+
+/// Everything about a picture except its pixels, so a banded one can be named, stamped and
+/// placed exactly like a whole one.
+#[derive(Debug, Clone, Copy)]
+pub struct SelectionSpec {
+    pub region: crate::geometry::Rect,
+    pub pixel_format: snapclip_model::PixelFormat,
+    pub captured_at_unix_ms: i64,
+    pub origin: Option<snapclip_model::geometry::Point>,
+    pub corner_radius: i32,
+}
+
 /// Turns a prepared selection into a durable artifact.
 ///
 /// Owned by the composition root, because this is where encoding and writing meet: the
@@ -137,4 +164,51 @@ pub trait ArtifactWriter: Send + Sync + 'static {
         dpi: u32,
         monitor_device_name: Option<String>,
     ) -> crate::CaptureResult<snapclip_model::CaptureArtifact>;
+
+    /// Write a picture that never exists whole (docs/35 §13.4).
+    ///
+    /// The default materialises the rows and calls [`ArtifactWriter::write`], so a writer
+    /// that only knows the whole-image shape keeps working. The shell's writer overrides it
+    /// and streams the bands, which is what keeps a thirty-thousand-row capture from costing
+    /// its whole image in memory on the way to a file.
+    fn write_bands(
+        &self,
+        session_id: &str,
+        spec: &SelectionSpec,
+        bands: &mut dyn BandSource,
+        dpi: u32,
+        monitor_device_name: Option<String>,
+    ) -> crate::CaptureResult<snapclip_model::CaptureArtifact> {
+        let width = u32::try_from(spec.region.width()).unwrap_or(0);
+        let rows = bands.rows();
+        if width == 0 || rows == 0 || u32::try_from(spec.region.height()).ok() != Some(rows) {
+            return Err(crate::CaptureError::EncodeFailed(format!(
+                "{}x{} is not a drawable region",
+                spec.region.width(),
+                spec.region.height()
+            )));
+        }
+        let mut bgra = Vec::new();
+        bgra.resize(rows as usize * width as usize * 4, 0);
+        if !bands.read_rows(0, rows, &mut bgra) {
+            return Err(crate::CaptureError::EncodeFailed(
+                "band source could not supply its rows".into(),
+            ));
+        }
+        let prepared = crate::artifact::SelectionPixels {
+            frame: crate::session::CapturedFrame {
+                width,
+                height: rows,
+                pixel_format: spec.pixel_format,
+                captured_at_unix_ms: spec.captured_at_unix_ms,
+                provider: "band-source",
+                origin: spec.origin,
+            },
+            region: spec.region,
+            bgra,
+            origin: spec.origin,
+            corner_radius: spec.corner_radius,
+        };
+        self.write(session_id, &prepared, dpi, monitor_device_name)
+    }
 }

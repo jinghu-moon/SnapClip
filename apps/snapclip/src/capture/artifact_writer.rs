@@ -48,6 +48,44 @@ impl HistoryArtifactWriter {
     }
 }
 
+/// A picture that already sits in one buffer, offered to the streaming path as a source.
+///
+/// The whole-image entry point is this source with one band, so both entry points run the
+/// same encoding loop (docs/35 §13.4).
+struct WholeImage<'a> {
+    bgra: &'a [u8],
+    rows: u32,
+}
+
+impl snapclip_capture::ports::BandSource for WholeImage<'_> {
+    fn rows(&self) -> u32 {
+        self.rows
+    }
+
+    fn read_rows(&mut self, first_row: u32, rows: u32, out: &mut Vec<u8>) -> bool {
+        let start = first_row as usize * self.row_bytes();
+        let len = rows as usize * self.row_bytes();
+        match self.bgra.get(start..start + len) {
+            Some(slice) => {
+                out.clear();
+                out.extend_from_slice(slice);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+impl WholeImage<'_> {
+    fn row_bytes(&self) -> usize {
+        if self.rows == 0 {
+            0
+        } else {
+            self.bgra.len() / self.rows as usize
+        }
+    }
+}
+
 impl ArtifactWriter for HistoryArtifactWriter {
     fn write(
         &self,
@@ -56,41 +94,50 @@ impl ArtifactWriter for HistoryArtifactWriter {
         dpi: u32,
         monitor_device_name: Option<String>,
     ) -> CaptureResult<CaptureArtifact> {
-        // The export port's size domain is `u64` (`docs/30 §17.7`), so the region's signed
-        // dimensions are **widened**, never narrowed. A bare truncating `u32` cast wraps a negative
-        // dimension into a size the format has no room for, and the refusal then names a number the
-        // caller never supplied (`P4.04`, `D-12`). One checked conversion, before anything is drawn:
-        // this is `docs/30 §26.1`'s "refused before `begin`", and it is the same check the sink
-        // makes — `ImageMeta` is `u64`, the PNG header is not.
-        //
-        // `docs/30 §26.1.1` is the statement worth keeping in view while editing this: **truncating
-        // and refusing are two different failures.** Truncating continues with a number of its own
-        // choosing and leaves a valid PNG whose dimensions are not the ones that were asked for —
-        // the error surfaces downstream, where the coordinates no longer line up and the evidence is
-        // gone. Refusing writes no byte at all and keeps "the size I got is the size I asked for"
-        // true in both the type and the value.
-        let (width, height) = match (
-            u32::try_from(prepared.region.width()),
-            u32::try_from(prepared.region.height()),
-        ) {
-            (Ok(width), Ok(height)) if width > 0 && height > 0 => (width, height),
-            _ => {
-                return Err(CaptureError::EncodeFailed(format!(
-                    "{}x{} at ({}, {}) is not a drawable region",
-                    prepared.region.width(),
-                    prepared.region.height(),
-                    prepared.region.left,
-                    prepared.region.top
-                )));
-            }
-        };
-        // `Bgra8Image::new` used to be the length check; it went with the copy it was attached to.
-        // Same comparison, same words — `P4.01`'s pixels are tightly packed `region`-sized BGRA.
+        let (width, height) = checked_size(prepared.region)?;
+        // `Bgra8Image::new` used to be the length check; it went with the copy it was attached
+        // to. Same comparison, same words — `P4.01`'s pixels are tightly packed `region`-sized
+        // BGRA.
         let expected = u64::from(width) * u64::from(height) * 4;
         if expected != prepared.bgra.len() as u64 {
             return Err(CaptureError::EncodeFailed(format!(
                 "bgra buffer of {} bytes does not match {width}x{height}",
                 prepared.bgra.len()
+            )));
+        }
+        let spec = snapclip_capture::ports::SelectionSpec {
+            region: prepared.region,
+            pixel_format: prepared.frame.pixel_format,
+            captured_at_unix_ms: prepared.frame.captured_at_unix_ms,
+            origin: prepared.origin,
+            corner_radius: prepared.corner_radius,
+        };
+        let mut whole = WholeImage {
+            bgra: &prepared.bgra,
+            rows: height,
+        };
+        self.write_bands(session_id, &spec, &mut whole, dpi, monitor_device_name)
+    }
+
+    /// Streams the rows into the encoder one band at a time (docs/35 §13.4).
+    ///
+    /// The only buffer this needs is one band plus whatever the encoder holds, so a scroll
+    /// capture's thirty thousand rows never become one `Vec` on the way to a file. The
+    /// encoded PNG is still a `Vec` in `Artifact`, but that is the finished file (megabytes),
+    /// not the picture (hundreds).
+    fn write_bands(
+        &self,
+        session_id: &str,
+        spec: &snapclip_capture::ports::SelectionSpec,
+        bands: &mut dyn snapclip_capture::ports::BandSource,
+        dpi: u32,
+        monitor_device_name: Option<String>,
+    ) -> CaptureResult<snapclip_model::CaptureArtifact> {
+        let (width, height) = checked_size(spec.region)?;
+        if bands.rows() != height {
+            return Err(CaptureError::EncodeFailed(format!(
+                "band source has {} rows but the region is {height} tall",
+                bands.rows()
             )));
         }
 
@@ -103,11 +150,27 @@ impl ArtifactWriter for HistoryArtifactWriter {
         let mut writer = sink
             .begin(&meta)
             .map_err(|error| CaptureError::EncodeFailed(error.to_string()))?;
-        // One call, not a band loop: every row is already in one contiguous buffer (a scroll
-        // capture's long image too), and `write_rows` takes a slice.
-        writer
-            .write_rows(0, &prepared.bgra)
-            .map_err(|error| CaptureError::EncodeFailed(error.to_string()))?;
+
+        let row_bytes = width as usize * 4;
+        // About four megabytes a band: big enough to keep the call count low, small enough
+        // that the band never becomes the picture.
+        let band_rows = ((4 << 20) / row_bytes.max(1)).clamp(1, 1024) as u32;
+        let mut scratch: Vec<u8> = Vec::new();
+        let mut first = 0u32;
+        while first < height {
+            let count = (height - first).min(band_rows);
+            scratch.resize(count as usize * row_bytes, 0);
+            if !bands.read_rows(first, count, &mut scratch) {
+                return Err(CaptureError::EncodeFailed(format!(
+                    "band source failed at row {first} of {height}"
+                )));
+            }
+            writer
+                .write_rows(u64::from(first), &scratch)
+                .map_err(|error| CaptureError::EncodeFailed(error.to_string()))?;
+            first += count;
+        }
+
         let artifact = writer
             .finish()
             .map_err(|error| CaptureError::EncodeFailed(error.to_string()))?;
@@ -119,8 +182,8 @@ impl ArtifactWriter for HistoryArtifactWriter {
                 width,
                 height,
                 dpi,
-                pixel_format: prepared.frame.pixel_format,
-                captured_at_unix_ms: prepared.frame.captured_at_unix_ms,
+                pixel_format: spec.pixel_format,
+                captured_at_unix_ms: spec.captured_at_unix_ms,
                 monitor_device_name,
             },
         };
@@ -134,13 +197,32 @@ impl ArtifactWriter for HistoryArtifactWriter {
             width,
             height,
             dpi,
-            pixel_format: prepared.frame.pixel_format,
-            captured_at_unix_ms: prepared.frame.captured_at_unix_ms,
+            pixel_format: spec.pixel_format,
+            captured_at_unix_ms: spec.captured_at_unix_ms,
             monitor_device_name: output.metadata.monitor_device_name.clone(),
             payload: CapturePayload::PngFile {
                 path: reference.absolute_path,
             },
         })
+    }
+}
+
+/// The export port's size domain is `u64` (`docs/30 §17.7`), so a region's signed dimensions
+/// are widened, never narrowed; truncating and refusing are two different failures
+/// (`docs/30 §26.1.1`).
+fn checked_size(region: snapclip_capture::geometry::Rect) -> CaptureResult<(u32, u32)> {
+    match (
+        u32::try_from(region.width()),
+        u32::try_from(region.height()),
+    ) {
+        (Ok(width), Ok(height)) if width > 0 && height > 0 => Ok((width, height)),
+        _ => Err(CaptureError::EncodeFailed(format!(
+            "{}x{} at ({}, {}) is not a drawable region",
+            region.width(),
+            region.height(),
+            region.left,
+            region.top
+        ))),
     }
 }
 
@@ -313,5 +395,80 @@ mod tests {
             !dir.exists(),
             "the refusal must land before the first byte is written"
         );
+    }
+
+    /// docs/35 §13.4 (stage 3b): the banded entry point and the whole-image one are the same
+    /// encoder loop, so they must produce the same file.
+    #[test]
+    fn a_banded_picture_writes_the_same_png_as_a_whole_one() {
+        struct Rows {
+            width: u32,
+            rows: u32,
+        }
+
+        impl snapclip_capture::ports::BandSource for Rows {
+            fn rows(&self) -> u32 {
+                self.rows
+            }
+
+            fn read_rows(&mut self, first_row: u32, rows: u32, out: &mut Vec<u8>) -> bool {
+                out.clear();
+                for y in first_row..first_row + rows {
+                    if y >= self.rows {
+                        return false;
+                    }
+                    for x in 0..self.width {
+                        out.extend_from_slice(&[x as u8, y as u8, 0, 255]);
+                    }
+                }
+                true
+            }
+        }
+
+        let (width, height) = (320u32, 200u32);
+        let directory = root("banded-eq");
+        let writer = HistoryArtifactWriter::new(directory.clone());
+        let mut bgra = Vec::new();
+        for y in 0..height {
+            for x in 0..width {
+                bgra.extend_from_slice(&[x as u8, y as u8, 0, 255]);
+            }
+        }
+        let prepared = SelectionPixels {
+            corner_radius: 0,
+            frame: frame(width, height),
+            region: Rect::new(0, 0, width as i32, height as i32),
+            bgra,
+            origin: None,
+        };
+
+        let whole = writer
+            .write("eq-whole", &prepared, 96, None)
+            .expect("whole export");
+        let spec = snapclip_capture::ports::SelectionSpec {
+            region: prepared.region,
+            pixel_format: prepared.frame.pixel_format,
+            captured_at_unix_ms: prepared.frame.captured_at_unix_ms,
+            origin: prepared.origin,
+            corner_radius: prepared.corner_radius,
+        };
+        let mut bands = Rows {
+            width,
+            rows: height,
+        };
+        let banded = writer
+            .write_bands("eq-banded", &spec, &mut bands, 96, None)
+            .expect("banded export");
+
+        let bytes_of = |artifact: &snapclip_model::CaptureArtifact| {
+            let path = artifact.png_path().expect("a PNG payload");
+            std::fs::read(path).expect("the artifact is readable")
+        };
+        assert_eq!(
+            bytes_of(&whole),
+            bytes_of(&banded),
+            "the banded entry point wrote a different file than the whole-image one",
+        );
+        let _ = fs::remove_dir_all(directory);
     }
 }
