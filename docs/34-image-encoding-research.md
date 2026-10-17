@@ -175,7 +175,7 @@ WebP ：本轮不做（UI 不提供该项）
 | 纯 Rust | 默认是（C 版是可选特性） | 是 |
 | 已知能力 | 带 trellis 量化 | 自述流式 + 4:4:4 + Bgra8Srgb |
 
-**落地前必须先核**（本轮未验证）：`mozjpeg-rs` 的 **streaming API** 是否逐行、是否支持 **4:4:4 / 非渐进 / BGRA 直接输入**。若它只支持整图编码 ⇒ 对 1280×30000 也不致命（图像本来就在内存里，见 §2.2 的口径），但会**多一次整图 RGB 缓冲**（180 MB 级），需要按 `P4.03` 的"零整图拷贝"纪律重新评估。
+**落地前必须先核**：`mozjpeg-rs` 的 **streaming API** 是否逐行、是否支持 **4:4:4 / 非渐进 / BGRA 直接输入**。若它只支持整图编码 ⇒ 会**多一次整图 RGB 缓冲**（180 MB 级），需要按 `P4.03` 的"零整图拷贝"纪律重新评估。**→ 已于 §8 核查完毕：支持逐行流式与 4:4:4，不支持 BGRA 直入（按行带转换即可），结论是不需要转 `zenjpeg`。**
 
 ### 4.3 WebP：为什么不做（问题 ③ 的回答）
 
@@ -239,3 +239,36 @@ WebP ：本轮不做（UI 不提供该项）
 
 **③ 只做 PNG + JPG（跳过 WebP）会损失什么？**
 损失：短图更小的体积、"支持 WebP"这个勾选项、以及"有损 + alpha"这种 WebP 独有能力。**不损失任何功能**。而且长图（>16383）根本不能用 WebP，有损 WebP 固定 4:2:0 对 UI 文字更差，授权干净的纯 Rust 选项只有无损 ⇒ 收益不足以支撑"两套行为"的复杂度。
+
+---
+
+## 8. 落地前的门：`mozjpeg-rs 0.9.2` API 核查（已验，2026-10-17）
+
+全部出处为 docs.rs 0.9.2 的 API 页与其 `Source` 行号；未写"未验证"的条目均已查到明确文档。
+
+| # | 问题 | 答案 | 出处 |
+| --- | --- | --- | --- |
+| 1 | **流式** | **支持**：`StreamingEncoder::start_rgb(width, height, writer) -> EncodingStream<W>`，随后 `EncodingStream::write_scanlines(&[u8])` 与 `finish()`；文档原话 "scanline-by-scanline encoding, which is memory-efficient for large images"。**约束**：一次喂的行数必须是 **8 或 16 的倍数**（取决于子采样）⇒ 行带取 8 或 16 行即可 | `struct.StreamingEncoder.html`（源码 `encode/streaming.rs:200-225`） |
+| 2 | **4:4:4** | **支持**：`Subsampling::S444`（"No subsampling (highest quality)"），另有 `S422/S420/S440/Gray`。**默认值文档未写明** ⇒ 必须显式设 `S444`，不要依赖默认 | `enum.Subsampling.html`（源码 `types.rs:494-506`） |
+| 3 | **非渐进** | **支持**，而且流式只能是 baseline：流式模式文档明写 "No progressive mode (requires multiple passes)"，另提供 `force_baseline(bool)`。注意**批量 `Encoder` 默认是 progressive**（`Preset::ProgressiveBalanced`）⇒ 流式路径不要走默认 preset | 同 #1 页面 |
+| 4 | **BGRA 直入** | **不支持**：只有 `start_rgb`（3 字节/像素）与 `start_gray`。⇒ 需要**按行带**做 BGRA→RGB 转换（每带一次，峰值内存仍是一个帧带级 ✓，**不是**整帧 RGB 缓冲） | 同 #1 页面 |
+| 5 | **超限** | **明确返回错误、不 panic**：`Error::DimensionLimitExceeded{width,height,max_width,max_height}`、`PixelCountExceeded`、`AllocationLimitExceeded`、`InvalidDimensions`、`InvalidStride`、`Cancelled`、`TimedOut`。3840×30000 在 u32 与 JPEG 65535 之内 ⇒ **可编码** | `enum.Error.html`（源码 `error.rs:11-103`） |
+
+**顺带核实的三条**
+
+- 流式模式确实**不支持** trellis / 渐进 / Huffman 优化 —— 文档原文列出这三项"requires buffering the entire image"，与上一轮"未验证"的猜测**一致**；
+- `quality(u8)` 范围 **1–100**（越界走 `Error::InvalidQuality`）；默认值文档未写明 ⇒ 显式传；
+- 许可证 **BSD-3-Clause**；`mozjpeg-sys`（C 版）是**可选依赖**，默认路径是纯 Rust —— 但"默认特性是否关闭"本轮**未查**（记入未验证）；另有 `Unstoppable`/`Stop` 协作取消，与仓库现有的取消语义对得上。
+
+### 一句话结论
+
+**能满足** SnapClip 的约束：**逐行流式 + 4:4:4 + 非渐进 + 3840×30000 + 峰值内存不超一个帧带**。唯一额外代价是 **BGRA→RGB 的行带转换**（不是整帧拷贝，不破坏内存目标），所以**不需要为此转向 `zenjpeg`**。卡点只有"不直接吃 BGRA"这一条，且它不影响 §2.2 的内存口径。
+
+**落地形态**：`start_rgb` 接受任意 `W: Write` ⇒ JPG sink 可以照 `row_band_png::PngRowBandSink` 的结构写，逐带转换 + `write_scanlines` + `finish`，与现有 PNG 路径并列。
+
+### §8 的未验证项
+
+1. 流式模式的**行倍数**到底按 8 还是 16（取决于子采样；S444 应为 8，未查实）；
+2. `Subsampling` / `quality` 的**默认值**（文档未写，落地时显式设置即可绕开）；
+3. **默认特性是否关闭 C 版** `mozjpeg-sys`（影响"纯 Rust、无 C 工具链"这一条）；
+4. 3840×30000 的**实际耗时与峰值内存**（计划项，未测）。
