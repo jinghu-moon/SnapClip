@@ -138,3 +138,66 @@ cargo build --release --features test-support
 - `dy` 采样来自**节流后**的日志，存在采样偏差 ✗（这正是需要直方图的原因）；
 - Notepad3 的滚动实现（逐行/平滑/按像素）**未查证** ✗ —— 本文只证明它不能解释 7 vs 93；
 - 未检查 WGC 帧池与 staging 纹理的实际生命周期 ✗。
+
+---
+
+## 七、仪器（已实现，`test-support` 门控）
+
+两件都只存在于测量构建里，产品构建中**一行代码都没有**。
+
+### 7.1 放置直方图（`scroll::stats`）
+
+每帧记一笔，会话结束时打印一行：
+
+```
+[snapclip][scroll] placements: appended=N contained=N prepended=N unknown=N full=N moved_px=SUM nonzero=N frames=N
+```
+
+- `moved_px` 是 `|dy|` 的累计，`nonzero` 是有位移的帧数 —— 这两个数直接回答"到底移动了多少像素"，而不是依赖节流日志里的样本；
+- `unknown` 不是 `Placement` 变体（估计失败时 `placement = None`），所以在 worker 里与 `Placement` 一并统计；
+- 纯结构 + 纯函数，单测覆盖：五种放置各归各的计数、负位移按距离累计、以及"一段很长的静止帧"必须与"每帧都在动"在计数上明显不同。
+
+### 7.2 进程内工作集（`windows::proc_mem`）
+
+每 **1000 帧**打印一行：
+
+```
+[snapclip][scroll] mem: frame=N ws=X.X MB timings=N reads=N rows=N
+```
+
+- `ws` 取自 `K32GetProcessMemoryInfo`（`-1` 伪句柄，无需打开/关闭进程）—— FFI 在本文件内声明，**不**扩大 `windows-sys` 的特性集（那是 crate 级的 ✗）；
+- `timings` / `reads` 是两个逐帧样本向量的长度（每帧 8 字节 ✗ 太小，不足以解释 5 KB/帧），`rows` 是画布行数 ✓；
+- 单测断言返回值"在本进程上合理"（> 1 MiB 且 < 1 TiB）—— **结构体布局写错也会返回一个数** ✗，所以必须用一个量级检查兜住。
+
+### 7.3 零影响的证明（以及上一版证明方法的错误）
+
+**正确的证明在 debug rlib 上做**（`[profile.release]` 是 `lto = true` + `strip = true` ⇒ release rlib 里是 bitcode，**字符串字面量根本不在里面** ✗）：
+
+| 构建 | `placements: appended` | `mem: frame=` | `K32GetProcessMemoryInfo` | `SEAL_FAULT_AT` |
+| --- | ---: | ---: | ---: | ---: |
+| 默认 | **0** | **0** | **0** | 0 |
+| `--features test-support` | **1** | **1** | **2** | 0 |
+| `--features seal-faults` | 0 | 0 | 0 | **1** |
+
+每种仪器只出现在带它自己特性的构建里 ✓，默认构建三项全 0 ✓。
+
+> **更正**：`docs/35 §19` 里"默认 release rlib 搜 `SEAL_FAULT_AT` = 0，带特性 = 2"这条证据**不成立** ✗ —— 在 `lto = true` 下 release rlib 是 bitcode，字面量不在其中；那里的 0 与 2 都不能说明门控。改用本节的 debug rlib 方法后，`seal-faults` 的门控才真正被证明（表中 `SEAL_FAULT_AT` 只在 `seal-faults` 构建里出现 ✓）。
+
+### 7.4 真机步骤
+
+```powershell
+cd D:\100_Projects\110_Daily\SnapClip
+cargo build --release --features test-support
+.\target\release\snapclip-app.exe
+```
+
+按 F7 框选并让自动滚动跑完，然后贴出这两行：
+
+```
+[snapclip][scroll] stopped frames=... read_us=... push_us=...
+[snapclip][scroll] placements: appended=... contained=... prepended=... unknown=... full=... moved_px=... nonzero=... frames=...
+[snapclip][scroll] mem: frame=1000 ws=... MB timings=1000 reads=1000 rows=...
+```
+
+- 若 `contained`（或 `unknown`）占绝大多数 ⇒ 那些帧**没有产生增长**，与"图像缺内容"无关（用户已确认无缺失横带 ✓），但与"采集耗时"直接相关 ✓；
+- 若 `ws` 与 `timings` / `reads` 同步涨 ⇒ 样本向量是元凶；若 `ws` 涨而三者都不涨 ⇒ 元凶在采集器/渲染层，不在滚动截图路径 ✓。

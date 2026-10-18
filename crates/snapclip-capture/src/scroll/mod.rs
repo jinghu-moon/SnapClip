@@ -14,6 +14,10 @@ pub(crate) mod backed;
 pub(crate) mod estimate;
 pub(crate) mod layout;
 pub(crate) mod stitch;
+// Measurement only (docs/39 §3): what the stitcher did with each frame, as counts rather than
+// one log line per interesting frame. Absent from the product by construction.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod stats;
 pub mod store;
 pub(crate) mod thumb;
 

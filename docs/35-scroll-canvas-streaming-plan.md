@@ -673,8 +673,10 @@ cargo test --release -p snapclip-app --test export_path_copies -- --ignored --no
 | 检查 | 结果 |
 | --- | --- |
 | `cargo check -p snapclip-capture --lib`（默认 / `test-support` / `seal-faults` / 两者） | 四种配置均 **0 warning** |
-| 默认 release rlib 里搜 `SEAL_FAULT_AT` 与 `injected seal fault` | **0 次**（字符串根本没被编译进去） |
-| 正对照：带 `seal-faults` 的 release rlib | `SEAL_FAULT_AT` **2 次**（证明上面那个搜索方法有效） |
+> **更正（证据无效）**：本节曾用"release rlib 里搜 `SEAL_FAULT_AT` 为 0 次"证明门控有效 ✗ —— 但 `[profile.release]` 是 `lto = true` + `strip = true`，rlib 里是 bitcode、字符串字面量不在其中，所以那次搜索什么也没证明 ✗。有效的证据是 **debug rlib** 上的对照表（每种仪器只出现在带它自己特性的构建里、默认构建三项全 0），见 `docs/39` §7.3 ✓。
+> **更正（证据无效）**：本节曾用"release rlib 里搜 `SEAL_FAULT_AT` 为 0 次"证明门控有效 ✗ —— 但 `[profile.release]` 是 `lto = true` + `strip = true`，rlib 里是 bitcode、字符串字面量不在其中，所以那次搜索什么也没证明 ✗。有效的证据是 **debug rlib** 上的对照表（每种仪器只出现在带它自己特性的构建里、默认构建三项全 0），见 `docs/39` §7.3 ✓。
+
+> **更正（证据无效）**：本节曾用"release rlib 里搜 `SEAL_FAULT_AT` 为 0 次"证明门控有效 ✗ —— 但 `[profile.release]` 是 `lto = true` + `strip = true`，rlib 里是 bitcode、字符串字面量不在其中，所以那次搜索什么也没证明 ✗。有效的证据是 **debug rlib** 上的对照表（每种仪器只出现在带它自己特性的构建里、默认构建三项全 0），见 `docs/39` §7.3 ✓。
 
 环境变量只在 feature 打开时读取；解析单独抽成纯函数并用 `#[cfg(feature = "seal-faults")]` 测（测试并行、环境是进程全局，不能直接改环境）。
 

@@ -299,6 +299,11 @@ fn capture(spec: &Spec, shared: &Shared, tracker: &mut Option<Tracker>) -> Resul
     let mut last_target = None;
     let mut frames = 0u64;
     let mut quiet = 0u64;
+    // Measurement only (docs/39 section 3): a throttled log can only report the frames that had
+    // news, so a session where most frames moved nothing looks, from the log alone, like one
+    // where every frame did. These counts close that gap and print once, at the end.
+    #[cfg(any(test, feature = "test-support"))]
+    let mut placement_stats = crate::scroll::stats::PlacementStats::default();
     // Per-frame cost split, accumulated for the closing line: a real session must be able to say
     // where its time went without a rebuild and without flooding stderr.
     let mut read_total_us = 0u64;
@@ -380,11 +385,26 @@ fn capture(spec: &Spec, shared: &Shared, tracker: &mut Option<Tracker>) -> Resul
             let pushed = Instant::now();
             let step = tracker.push(&pixels);
             let push_us = pushed.elapsed().as_micros();
+            #[cfg(any(test, feature = "test-support"))]
+            placement_stats.record(&step.estimate, step.placement.as_ref());
             let us = started.elapsed().as_micros();
             read_total_us += read_us as u64;
             push_total_us += push_us as u64;
             total_us.push(us as u64);
             read_us_all.push(read_us as u64);
+            #[cfg(any(test, feature = "test-support"))]
+            if frames % 1000 == 0 {
+                // The three counters that grow with frames rather than with rows: the two
+                // per-frame sample vectors and the image itself. Whatever tracks `ws` is the
+                // owner of the rise (docs/39 section 3).
+                eprintln!(
+                    "[snapclip][scroll] mem: frame={frames} ws={} timings={} reads={} rows={}",
+                    super::proc_mem::working_set_mb(),
+                    total_us.len(),
+                    read_us_all.len(),
+                    tracker.image_rows(),
+                );
+            }
             if verbose_timing() {
                 eprintln!(
                     "[snapclip][scroll] frame={frames} read_us={read_us} push_us={push_us} \
@@ -457,6 +477,8 @@ fn capture(spec: &Spec, shared: &Shared, tracker: &mut Option<Tracker>) -> Resul
         stats(&read_us_all),
         stats(&rest_us)
     );
+    #[cfg(any(test, feature = "test-support"))]
+    eprintln!("[snapclip][scroll] {}", placement_stats.line());
     Ok(())
 }
 
