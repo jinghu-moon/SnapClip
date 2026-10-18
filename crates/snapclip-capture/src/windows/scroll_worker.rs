@@ -37,7 +37,7 @@ use super::win::wgc::{WgcFrame, WgcSession};
 use crate::geometry::{Point, Rect};
 use crate::scroll::estimate::Estimate;
 use crate::scroll::stitch::Placement;
-use crate::scroll::{Auto, Preview, Status, Step, Tracker};
+use crate::scroll::{should_log, Auto, Preview, Status, Step, Tracker};
 
 /// One auto notch every this long: slow enough for a page to repaint before the next one.
 pub(crate) const AUTO_INTERVAL: Duration = Duration::from_millis(200);
@@ -405,14 +405,17 @@ fn capture(spec: &Spec, shared: &Shared, tracker: &mut Option<Tracker>) -> Resul
             frame_moved = matches!(step.estimate, Estimate::Shift { .. });
             let Outcome { news, moved } = outcome(&step, published);
             if news {
-                eprintln!(
-                    "[snapclip][scroll] frame={frames} {:?} placement={:?} rows={} status={:?} \
-                     quiet_since_last={quiet} us={us}",
-                    step.estimate,
-                    step.placement,
-                    tracker.image_rows(),
-                    tracker.status(),
-                );
+                // 逐帧那条日志是诊断，不是心跳：一帧一行比一帧本身还贵（docs/36）。
+                if should_log(frames, tracker.status(), published) {
+                    eprintln!(
+                        "[snapclip][scroll] frame={frames} {:?} placement={:?} rows={} status={:?} \
+                         quiet_since_last={quiet} us={us}",
+                        step.estimate,
+                        step.placement,
+                        tracker.image_rows(),
+                        tracker.status(),
+                    );
+                }
                 quiet = 0;
             } else {
                 quiet += 1;

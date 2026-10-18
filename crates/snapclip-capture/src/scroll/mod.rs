@@ -23,7 +23,13 @@ use stitch::{CanvasStore, Placement, Stitcher};
 use thumb::Thumb;
 
 /// The long image is capped at this many selection heights (the reference implementation's cap).
-pub(crate) const MAX_SCREENS: u32 = 32;
+/// How many viewport heights an automatic scroll may reach.
+///
+/// This used to be the memory ceiling: the old stitcher held the whole picture, so one more screen
+/// was one more screen of RAM. The canvas is now a bounded edge ring with sealed tiles in a temp
+/// file (docs/35), so raising this buys rows with temp disk and time, not with resident memory:
+/// at an 808 row viewport, 48 screens is 38 784 rows and roughly 190 MB of tiles.
+pub(crate) const MAX_SCREENS: u32 = 48;
 /// The long image is also capped at this many bytes of canvas. A row cap alone is not a resource
 /// policy: 32 selection heights is 130 MB for a 1241×821 selection but 1.06 GB for a full-screen
 /// one on a 3840×2160 monitor, and growing the canvas momentarily holds the old and the new
@@ -48,6 +54,22 @@ pub(crate) enum Status {
     /// stops growing, but the reason is not the row cap and the panel must not say it is
     /// (docs/35 §12.4).
     Storage,
+}
+
+/// How many frames may pass between two scroll log lines when nothing about the status changes.
+///
+/// The per-frame line is a diagnostic, not a heartbeat. At a few hundred frames a second one line
+/// per frame costs more than the frame itself: the first run on a real machine sat at 22 ms on the
+/// ninetyfifth percentile with console I/O as the largest suspect. Status changes still print
+/// immediately, because those are the events a diagnosis needs.
+pub(crate) const LOG_EVERY_FRAMES: u64 = 60;
+
+/// Whether the scroll loop should print the line for `frame`.
+///
+/// A status change always prints, the first frame always prints, and otherwise every
+/// [`LOG_EVERY_FRAMES`] frames. Pure so the rule can be tested without a console.
+pub(crate) fn should_log(frame: u64, status: Status, previous: Option<Status>) -> bool {
+    previous.map_or(true, |prev| prev != status) || frame % LOG_EVERY_FRAMES == 0
 }
 
 /// Automatic scrolling, as the panel shows it.
@@ -580,7 +602,7 @@ mod tests {
         const VIEW: u32 = 1200;
         let (w, view) = (1024u32, VIEW);
         // 1024 × 4 = 4096 bytes a row, so the budget is 64 MiB / 4096 = 16384 rows, well below the
-        // 38399 rows that `MAX_SCREENS` alone would allow.
+        // 57600 rows that `MAX_SCREENS` alone would allow.
         assert_eq!(row_limit(w, view, BUDGET), 16384);
         assert!(row_limit(w, view, BUDGET) < MAX_SCREENS * view);
 
@@ -875,14 +897,18 @@ mod scroll_format_tests {
 
     #[test]
     fn a_short_view_keeps_webp_and_a_tall_one_does_not() {
-        // 32 x 480 = 15360 rows, inside the container.
-        assert_eq!(scroll_format(SaveFormat::Webp, 1280, 480), (SaveFormat::Webp, None));
-        // 32 x 512 = 16384 rows, one past it.
-        let (effective, why) = scroll_format(SaveFormat::Webp, 1, 512);
+        // The potential rows are MAX_SCREENS times the viewport, so the WebP boundary moves with
+        // the screen cap: with the cap at 48, a viewport of 341 is the tallest that still fits the
+        // format's 16383 rows. Derived here rather than written down, so the next cap change reads
+        // as a boundary shift and not as a broken test.
+        let fits = 16_383 / super::MAX_SCREENS as u32; // 341
+        assert_eq!(
+            scroll_format(SaveFormat::Webp, 1280, fits),
+            (SaveFormat::Webp, None)
+        );
+        let (effective, why) = scroll_format(SaveFormat::Webp, 1, fits + 1);
         assert_eq!(effective, SaveFormat::Png);
         assert!(why.is_some());
-        // 32 x 511 = 16352 rows, still inside.
-        assert_eq!(scroll_format(SaveFormat::Webp, 1, 511), (SaveFormat::Webp, None));
     }
 
     #[test]
@@ -893,7 +919,7 @@ mod scroll_format_tests {
 
     #[test]
     fn jpeg_is_lowered_when_the_frame_would_not_fit_its_budget() {
-        // 32 x 480 = 15360 rows of 640 pixels is 9.8 MP: inside the 16 MP JPG frame budget.
+        // MAX_SCREENS x 480 rows of 640 pixels stays inside the 16 MP JPG frame budget.
         assert_eq!(scroll_format(SaveFormat::Jpeg, 640, 480), (SaveFormat::Jpeg, None));
         // The same rows at 1280 wide is 19.7 MP, so the JPG save path would have to hold the frame.
         let (effective, why) = scroll_format(SaveFormat::Jpeg, 1280, 480);
@@ -907,11 +933,33 @@ mod scroll_format_tests {
 
     #[test]
     fn jpeg_still_reports_the_formats_own_limit_first() {
-        // 32 x 2100 = 67200 rows is past JPEG's 65535 per side: a format limit, not a budget.
+        // MAX_SCREENS x 2100 rows is past JPEG's 65535 per side: a format limit, not a budget.
         let (effective, why) = scroll_format(SaveFormat::Jpeg, 1280, 2100);
         assert_eq!(effective, SaveFormat::Png);
         assert!(matches!(why, Some(Lowering::Format(_))), "{why:?}");
-        assert_eq!(MAX_SCREENS, 32);
+        assert_eq!(MAX_SCREENS, 48);
+    }
+
+    #[test]
+    fn the_scroll_log_prints_on_a_change_and_then_every_sixty_frames() {
+        use super::{should_log, Status};
+        // 首帧必打（还没有"上一次状态"）。
+        assert!(should_log(2, Status::Tracking, None));
+        // 状态变化必打，不论帧号。
+        assert!(should_log(3, Status::Lost, Some(Status::Tracking)));
+        assert!(should_log(4, Status::Full, Some(Status::Lost)));
+        assert!(should_log(5, Status::Storage, Some(Status::Full)));
+        // 状态不变时按帧号节流，且第 60 / 120 帧会打。
+        assert!(!should_log(6, Status::Full, Some(Status::Full)));
+        assert!(!should_log(59, Status::Full, Some(Status::Full)));
+        assert!(should_log(60, Status::Full, Some(Status::Full)));
+        assert!(!should_log(61, Status::Full, Some(Status::Full)));
+        assert!(should_log(120, Status::Full, Some(Status::Full)));
+        // 一帧最多打一行：纯函数，同一输入只有一个答案。
+        assert_eq!(
+            should_log(120, Status::Full, Some(Status::Full)),
+            should_log(120, Status::Full, Some(Status::Full))
+        );
     }
 }
 
