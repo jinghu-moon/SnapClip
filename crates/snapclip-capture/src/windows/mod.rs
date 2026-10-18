@@ -29,6 +29,10 @@ pub mod monitor;
 pub mod msaa_provider;
 pub mod overlay;
 pub mod providers;
+// Measurement only (docs/39 section 3): the process's own working set, so a rise seen from
+// outside can be correlated with counters taken inside. Absent from the product.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod proc_mem;
 pub mod refinement_worker;
 pub mod renderer;
 pub mod tile_sweep;
