@@ -117,9 +117,9 @@
 ```powershell
 cargo build --release --features test-support
 .\target\release\snapclip-app.exe
-# F7 → 框选 → 等它滚动；结束后日志里会出现：
-#   [snapclip][scroll] placements appended=… contained=… unknown=… full=…
-#   [snapclip][scroll] rss=… MB at frames=…  (每 1000 帧一次)
+# F7 → 框选 → 等它滚动；结束后日志里会出现（格式以此为准，已在干净检出上核对）：
+#   [snapclip][scroll] placements: appended=… contained=… prepended=… unknown=… full=… moved_px=… nonzero=… frames=…
+#   [snapclip][scroll] mem: frame=… ws=… MB timings=… reads=… rows=…      (每 1000 帧一行)
 ```
 
 ---
@@ -193,11 +193,12 @@ cargo build --release --features test-support
 .\target\release\snapclip-app.exe
 ```
 
-按 F7 框选并让自动滚动跑完，然后贴出这两行：
+按 F7 框选并让自动滚动跑完，然后贴出这三行：
 
 ```
 [snapclip][scroll] stopped frames=... read_us=... push_us=...
 [snapclip][scroll] placements: appended=... contained=... prepended=... unknown=... full=... moved_px=... nonzero=... frames=...
+[snapclip][scroll] mem: frame=... ws=... MB timings=... reads=... rows=...
 [snapclip][scroll] mem: frame=1000 ws=... MB timings=1000 reads=1000 rows=...
 ```
 
@@ -292,3 +293,59 @@ stage=export ... size=1250x80882 encode_write_ms=4353
 - **"等静止"帧数的调参**（4/6/8 三档对比）✗ —— 当前约 10 帧，是 6 分钟耗时的主因 ✓；
 - **采集/渲染侧约 1.2 KB/帧 的增长**（9 684 帧约 +10 MB）✗ —— 量级温和，单独立项 ✓；
 - **Notepad3 的滚动实现**未查证（不影响本节的结论，因为 `unknown` 已解释一切 ✓）。
+
+### 8.7 剪贴板的瞬时峰值（外部采样抓到的、唯一的大数）✗
+
+同一次外部采样（818 样本 / 420 s）在**导出阶段**抓到一个尖峰，其余时段都很平稳：
+
+| 时段 | 工作集 |
+| --- | --- |
+| 启动期 0–30 s | 97.8 → 131.9 MB（GPU/UI 初始化 ✓） |
+| 采集期 70–175 s | 130.3 → 139.1 MB（与进程内 `mem:` 一致 ✓） |
+| **t ≈ 194 s（导出 + 剪贴板）** | **941.3 MB** ✗ |
+| 之后 210–419 s | 103–104 MB 平稳 ✓ |
+
+对账：**404 MB（80 882 × 1250 × 4 的连续 DIB）× 2 + 基础约 100 MB ≈ 908 MB** ✓，观测 941 MB ✓。
+
+**公式**：`剪贴板峰值 ≈ 行数 × 宽 × 4 × 2`（一张 DIB + 一份中间副本 ✓）。常见规模：
+
+| 行数 | 峰值量级 |
+| ---: | ---: |
+| 25 857 | 约 260 MB |
+| 38 815 | 约 390 MB |
+| 80 882（100 屏上限附近） | **约 810 MB** ✗ |
+
+**这是 Windows 剪贴板要求"连续 DIB"的固有成本** ✓，不是拼接器的 ✓（拼接器全程 4.0 MB ✓），也不是这次改造引入的 ✗ —— 但它在长图上**随行数线性增长** ✗，所以 100 屏时会把进程推到 ~1 GB 的瞬时峰值 ✓。
+
+**三个可选处置（均未实现 ✗）**：
+
+1. **不动** ✓ —— 瞬时（约 0.2 s）、随即回落、64 位进程不会失败 ✓；代价是低内存机器/pagefile 会难受 ✗；
+2. **超大图改走文件型剪贴板**（`CF_HDROP` ✓）—— 粘出来是文件而不是位图 ✗，是**行为变化**，需产品决定 ✗；
+3. **大图只保存不发剪贴板**，并提示一句 ✓ —— 最保守的方案 ✓。
+
+结论：记录为**已知产品级代价** ✓，不阻塞本次改造 ✓。
+
+---
+
+## 九、本文命令的验证（干净检出）
+
+下面每一条都在 **commit `0980def`** 的**干净 worktree**（`git worktree add … 0980def`，独立 `CARGO_TARGET_DIR`）里逐条真实执行过：
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo build --release` | **exit 0** ✓ |
+| `cargo build --release --features test-support` | **exit 0** ✓（注意：`P7-74` 之前这条在干净检出上会因漏提交 `mod proc_mem;` 而失败 ✗） |
+| `cargo build --release --features seal-faults` | **exit 0** ✓ |
+| `cargo test -p snapclip-capture --lib` | **exit 0**，531 passed ✓ |
+| `cargo check -p snapclip-capture --lib`（默认 / test-support / seal-faults / 两者） | 四种配置 **exit 0** ✓ |
+| `cargo run -p codec-bench --release -- --assert` | **exit 0**，`all three targets hold` ✓ |
+| `cargo run -p codec-bench --release -- --scroll` | **exit 0** ✓ |
+| `cargo test --release -p snapclip-app --test export_path_copies -- --ignored --nocapture` | **exit 0**，3 passed ✓（需先关闭正在运行的 SnapClip） |
+| `git hook run pre-push` | **exit 0**，`[pre-push] OK` ✓ —— **前置条件：`target/` 必须已存在** |
+
+两条**前置条件**（不满足会失败，不是命令写错）：
+
+1. **`git hook run pre-push` 要求仓库根下有 `target/`** ✗ —— 干净检出里没有这个目录时，它会因 `target/test-baseline.log: No such file or directory` 而失败 ✓；先跑一次任意 `cargo` 命令（例如上表第一条）即可 ✓。
+2. **`export_path_copies` 会重编 `snapclip-app.exe`** ✓ ⇒ 运行中的实例锁文件会导致 `os error 5` ✗ ⇒ 先关掉应用 ✓。
+
+**已退役**：`--attribution` 现在只打印用法并以 0 退出，**不产出数据** ✗ —— 它测的那个"内存画布"在阶段 2 之后已被 `BackedCanvas` 取代 ✓；要看历史基线请检出 `d27b550`。
