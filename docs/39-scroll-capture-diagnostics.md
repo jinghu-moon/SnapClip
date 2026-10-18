@@ -268,7 +268,7 @@ stage=export ... size=1250x80882 encode_write_ms=4353
 - 即自动滚动**每次要等约 10 帧**（≈0.3 s）确认"画面静止"才走下一步 ✓；
 - 所以"7 行/帧"只是**平均值**的错觉 ✓ —— 真正推进时每次都是 **93 行** ✓，其余时间页面根本没动 ✓。
 
-⇒ **慢但正确** ✓。唯一可行的加速杠杆是"等静止"的帧数（**未实现、待调参** ✗）：需先对比 4 / 6 / 8 帧三档的速度与正确率 ✓，不能直接拍一个值 ✗。
+加速杠杆**不是**"等静止"的帧数 ✗（那个旋钮不存在 ✓，见第十节），而是 notch 间隔 `AUTO_INTERVAL` ✓ —— 已实测三档并改为 **60 ms** ✓（见第十节）。
 
 ### 8.4 结论三：+59 MB 是被启动期放大的 ✗ → 真实增长约 +1.2 KB/帧 ✓ [实测]
 
@@ -290,7 +290,7 @@ stage=export ... size=1250x80882 encode_write_ms=4353
 
 ### 8.6 仍未做
 
-- **"等静止"帧数的调参**（4/6/8 三档对比）✗ —— 当前约 10 帧，是 6 分钟耗时的主因 ✓；
+- ~~"等静止"帧数的调参~~ ✅ **已完成**：旋钮不存在 ✗，真旋钮是 notch 间隔 ✓ ⇒ 三档实测后默认改为 **60 ms**（3 m 43 s → 约 1 m 26 s ✓），见第十节 ✓；
 - **采集/渲染侧约 1.2 KB/帧 的增长**（9 684 帧约 +10 MB）✗ —— 量级温和，单独立项 ✓；
 - **Notepad3 的滚动实现**未查证（不影响本节的结论，因为 `unknown` 已解释一切 ✓）。
 
@@ -356,15 +356,15 @@ stage=export ... size=1250x80882 encode_write_ms=4353
 
 §八 里那句"每次推进约等 11.2 帧"描述的是**现象**，不是代码里的旋钮。自动滚动是一个**闭环**：
 
-- 一个 notch 发出后，**不早于 `AUTO_INTERVAL`（200 ms）**才发下一个；
+- 一个 notch 发出后，**不早于 `AUTO_INTERVAL`（现为 60 ms）**才发下一个；
 - 这个 notch 由"**在它之后至少一个页面延迟才到达的那一帧**"来判定动没动（`observe`）；
 - 连续 `AUTO_IDLE_NOTCHES`（10）个 notch 都没动 ⇒ 自动模式结束。
 
 所以一次采集的耗时 ≈ **notch 数 × max(AUTO_INTERVAL, 页面延迟)**。真机 861 次推进、9 684 帧 ⇒ 约 11.2 帧/次，
-其中既有 `AUTO_INTERVAL` 的 200 ms 间隔，也有目标窗口自身的滚动动画延迟。
+其中既有 `AUTO_INTERVAL` 间隔，也有目标窗口自身的滚动动画延迟。
 
 ⇒ 真正可调的是**notch 间隔**（`AUTO_INTERVAL`），不是"静置帧数" ✗。本轮已把它做成**仅测量构建可覆盖**
-（`test-support` 门控，环境变量 **`SCROLL_AUTO_INTERVAL_MS`**，解析规则：20–5000 ms，非法值回退默认 200 ms）。
+（`test-support` 门控，环境变量 **`SCROLL_AUTO_INTERVAL_MS`**，解析规则：20–5000 ms，非法值回退默认值（现为 60 ms））。
 **默认值没有改** ✗。
 
 ### 10.2 三档测量步骤
@@ -374,9 +374,9 @@ stage=export ... size=1250x80882 encode_write_ms=4353
 ```powershell
 cargo build --release --features test-support
 
-$env:SCROLL_AUTO_INTERVAL_MS="200"; .	argetelease\snapclip-app.exe   # 基准档（等于默认）
-$env:SCROLL_AUTO_INTERVAL_MS="100"
-$env:SCROLL_AUTO_INTERVAL_MS="60"
+$env:SCROLL_AUTO_INTERVAL_MS="200"; .\target\release\snapclip-app.exe
+$env:SCROLL_AUTO_INTERVAL_MS="100"; .\target\release\snapclip-app.exe
+$env:SCROLL_AUTO_INTERVAL_MS="60"; .\target\release\snapclip-app.exe
 ```
 
 每档记四项：
@@ -404,3 +404,23 @@ $env:SCROLL_AUTO_INTERVAL_MS="60"
 
 间隔做成了可覆盖（`crates/snapclip-capture/src/windows/scroll_worker.rs`，`auto_interval()` / `parse_ms_override()`），
 三档**尚未实测** ✗ —— 需要真机各跑一次。
+
+
+### 实测结果（同一页面、同一选区 1250×809，release + `test-support`）
+
+| 档位 | 到撞上限的帧数 | 实际耗时 | 产物 SHA-256 | `appended` | `image` |
+| --- | ---: | ---: | --- | ---: | --- |
+| 200 ms（旧默认） | 9 299 | **3 m 43 s** | `86a4557b…519e` | 861 | 1250×80 882 |
+| 100 ms | 5 401 | **2 m 09 s** | 同一哈希 ✓ | 861 | 同上 ✓ |
+| **60 ms** | **3 502** | 约 **1 m 26 s** `[换算]` | **同一哈希** ✓ | 861 | 同上 ✓ |
+
+- **三份 PNG 逐字节相同**：同 SHA-256、同大小 **38 786 672 B** ✓ ⇒ 三档**零内容差异** ✓；
+- `appended` 均为 **861**、每帧 `dy` 均为 93 ✓ ⇒ 一次都没漏 ✓；
+- 加速：100 ms ≈ **1.72×**、60 ms ≈ **2.65×**（按到撞上限的帧数 9 299 / 5 401 / 3 502 ✓）。
+
+**结论：`60 ms` 成为默认** ✓（`AUTO_INTERVAL` 200 → 60 ms ✓）；100 ms 作为保守备选 ✓。
+**`OBSERVE_TIMEOUT` 仍是 1000 ms，未动** ✓ —— 它是"给页面多久才判没动"的安全窗 ✓，与间隔无关 ✓。
+
+一条附带修正 ✓：60 ms 那次的 `frames=6278` / `full=2777` 比 100 ms 还大 ✗，看着像变慢 ✓，实际是**撞上限之后还在滚**的帧被记账了 ✓ ⇒ 公平比较必须用"到撞上限的帧数" ✓。
+
+另一条被 60 ms 暴露并已改正的测试假设 ✓：`the_closed_loop_sets_the_cadence_from_the_page` 原先断言"40 ms 的页面 ⇒ 间隔就是 `AUTO_INTERVAL`" ✗ —— 实际上一个 notch 需要**两帧**才能判定 ✓（一帧承载位移、一帧读取 ✓），所以页面最快只能每 80 ms 响应一次 ✓。断言已改为 `max(AUTO_INTERVAL, 2 × frame)` ✓ —— 这是把性质说对 ✓，不是弱化断言 ✓。

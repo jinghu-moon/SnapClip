@@ -40,7 +40,18 @@ use crate::scroll::stitch::Placement;
 use crate::scroll::{should_log, Auto, Preview, Status, Step, Tracker};
 
 /// One auto notch every this long: slow enough for a page to repaint before the next one.
-pub(crate) const AUTO_INTERVAL: Duration = Duration::from_millis(200);
+///
+/// Measured, not guessed (`docs/39` section 10, one 1250x809 region of a 30 000 line document,
+/// release build, same page every time): at 200 ms a 100 screen capture took 3 m 43 s over 9 299
+/// frames, at 100 ms 2 m 09 s over 5 401, and at 60 ms about 1 m 26 s over 3 502 before the row cap
+/// ended it. All three runs produced the same file, byte for byte, the same SHA-256 and the same
+/// 861 appends of 93 rows, so the spacing changed the wall clock and nothing else.
+///
+/// Shorter is also not more dangerous, which is why the fastest of the three became the default.
+/// The displacement estimate is content matching: a page caught mid-scroll matches at whatever it
+/// really moved, and a frame that fails to match is covered by the next one, which measures the
+/// accumulated movement as long as the overlap stays above `MIN_OVERLAP`.
+pub(crate) const AUTO_INTERVAL: Duration = Duration::from_millis(60);
 
 /// Diagnostics switch: split every frame into read / push so a real session can say where its
 /// time goes. Reading the clock per frame is not free, so it stays off unless asked for.
@@ -1037,22 +1048,24 @@ mod tests {
             posted
         }
 
-        // A page whose answer lands one frame after the notch. Every notch is judged by that frame,
-        // so the cadence is the interval plus one frame -- or one frame per notch, whichever is
-        // longer, since auto may not post twice inside the interval either.
-        let fast = notches(Duration::from_millis(40), Duration::from_millis(40));
+        // A page that answers one frame after the notch. A notch needs two frames before it can be
+        // judged -- one carrying the movement and one reading it -- so with 40 ms frames the page
+        // can answer no faster than every 80 ms. The interval is a floor, not a ceiling: whichever
+        // of the two is slower is what actually spaces the notches, and at 60 ms the page is.
+        let fast_frame = Duration::from_millis(40);
+        let fast = notches(fast_frame, fast_frame);
+        let expected = AUTO_INTERVAL.max(fast_frame * 2);
         assert_eq!(
             fast.windows(2).map(|pair| pair[1] - pair[0]).collect::<Vec<_>>(),
-            vec![AUTO_INTERVAL; 9],
-            "a 40 ms page keeps the interval, and the frame it waits for fits inside it"
+            vec![expected; 9],
+            "a 40 ms page is read every two frames, or at the interval when that is slower"
         );
 
-        // The clock the loop replaced, on the same page: a notch every `AUTO_INTERVAL`, unchanged.
-        assert_eq!(
-            (0..10).map(|i| AUTO_INTERVAL * i).collect::<Vec<_>>(),
-            (0..10).map(|i| Duration::from_millis(200 * i)).collect::<Vec<_>>()
-        );
-
+        // The old clock posted a notch every `AUTO_INTERVAL` and read no frame; that is the `fast`
+        // case above, whose spacing is asserted against the constant rather than against a copy of
+        // its value. A mirror of today's number would only pin the constant twice and would fail
+        // the moment the interval is retuned, which is exactly what happened when it went from 200
+        // to 60 ms.
         // A page that answers only when the window is already over is slower than the interval, so
         // the answer -- not the clock -- is what spaces the notches.
         let late = notches(Duration::from_millis(40), OBSERVE_TIMEOUT);
