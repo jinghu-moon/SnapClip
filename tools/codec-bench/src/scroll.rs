@@ -106,7 +106,7 @@ pub fn run(view: usize, step: usize) -> Stitched {
         alloc_probe::peak_extra(|| probe.into_image().expect("the tiles are intact"));
     // The review of docs/37 is right that a seal is not a band: report what was actually
     // sealed, and what deflating one of those actually costs on this machine (docs/35 §17.1).
-    if let Some((seals, max_rows, sealed_bytes)) = seal_stats {
+    if let Some((seals, max_rows, sealed_bytes, writes, mut per_seal_us)) = seal_stats {
         let avg = if seals > 0 { sealed_bytes / seals } else { 0 };
         let row = (width as u64) * 4;
         let rows_avg = if row > 0 { avg / row } else { 0 };
@@ -114,6 +114,24 @@ pub fn run(view: usize, step: usize) -> Stitched {
             "seals={seals} largest={max_rows} rows avg={rows_avg} rows bytes={sealed_bytes} ({:.1} MB)",
             sealed_bytes as f64 / (1024.0 * 1024.0)
         );
+        // What sealing itself costs on disk: how many writes it took and how long each seal's
+        // write took. This is the uncompressed cost the compression question has to beat
+        // (docs/35 §17.1, §19).
+        per_seal_us.sort_unstable();
+        let median = per_seal_us.get(per_seal_us.len() / 2).copied().unwrap_or(0);
+        let worst = per_seal_us.last().copied().unwrap_or(0);
+        println!("seal writes={writes} median={median} us worst={worst} us  [measured]");
+        if median > 0 && rows_avg > 0 && row > 0 {
+            // Conversion, not a measurement: a real capture seals about 93 rows per frame, so
+            // scale the measured per-byte cost to that seal size.
+            let real_bytes = 93 * row;
+            let per_byte_us = median as f64 / (rows_avg * row) as f64;
+            println!(
+                "converted to a 93 row seal ({} KB): about {:.2} ms per seal  [conversion]",
+                real_bytes / 1024,
+                per_byte_us * real_bytes as f64 / 1000.0
+            );
+        }
         if avg > 0 {
             let start = ((page.len() as u64).saturating_sub(avg)) as usize;
             let payload = &page[start..];

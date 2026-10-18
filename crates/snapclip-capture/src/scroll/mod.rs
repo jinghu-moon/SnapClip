@@ -28,10 +28,12 @@ use thumb::Thumb;
 /// This used to be the memory ceiling: the old stitcher held the whole picture, so one more screen
 /// was one more screen of RAM. The canvas is now a bounded edge ring with sealed tiles in a temp
 /// file (docs/35), so raising this buys rows with temp disk and time, not with resident memory:
-/// at an 808 row viewport, 48 screens is 38 784 rows and roughly 190 MB of tiles.
-pub(crate) const MAX_SCREENS: u32 = 48;
+/// at an 808 row viewport, 100 screens is 80 900 rows and roughly 396 MB of tiles, while
+/// `MAX_BYTES` allows about 404 MB at 1250 wide, so at that width the row cap binds first and the
+/// byte cap stays the backstop for very wide selections.
+pub(crate) const MAX_SCREENS: u32 = 100;
 /// The long image is also capped at this many bytes of canvas. A row cap alone is not a resource
-/// policy: 32 selection heights is 130 MB for a 1241×821 selection but 1.06 GB for a full-screen
+/// policy: 100 selection heights is 404 MB for a 1250×809 selection but 3.3 GB for a full-screen
 /// one on a 3840×2160 monitor, and growing the canvas momentarily holds the old and the new
 /// allocation. A few hundred megapixels is already far past any real page, so the byte cap is
 /// what actually bounds a session.
@@ -906,9 +908,9 @@ pub mod probe {
             self.tracker.image_rows()
         }
 
-        /// `(seal count, largest seal in rows, bytes written)` for the seal-cost measurement
-        /// (docs/35 §17.1).
-        pub fn seal_stats(&self) -> (u64, u32, u64) {
+        /// `(seals, largest seal in rows, bytes written, writes, per-seal write microseconds)` for
+        /// the seal-cost measurement (docs/35 §17.1).
+        pub fn seal_stats(&self) -> (u64, u32, u64, u64, Vec<u64>) {
             self.tracker.stitcher.store().seal_stats()
         }
 
@@ -946,7 +948,7 @@ mod scroll_format_tests {
 
     #[test]
     fn webp_is_lowered_before_a_tall_scroll_starts() {
-        // 32 x 960 rows is past 16383, so this capture can never be a single WebP.
+        // 100 x 960 rows is past 16383, so this capture can never be a single WebP.
         let (effective, why) = scroll_format(SaveFormat::Webp, 1280, 960);
         assert_eq!(effective, SaveFormat::Png);
         assert!(matches!(why, Some(Lowering::Format(_))), "{why:?}");
@@ -955,10 +957,10 @@ mod scroll_format_tests {
     #[test]
     fn a_short_view_keeps_webp_and_a_tall_one_does_not() {
         // The potential rows are MAX_SCREENS times the viewport, so the WebP boundary moves with
-        // the screen cap: with the cap at 48, a viewport of 341 is the tallest that still fits the
+        // the screen cap: at 100 screens a viewport of 163 is the tallest that still fits the
         // format's 16383 rows. Derived here rather than written down, so the next cap change reads
         // as a boundary shift and not as a broken test.
-        let fits = 16_383 / super::MAX_SCREENS as u32; // 341
+        let fits = 16_383 / super::MAX_SCREENS as u32; // 163
         assert_eq!(
             scroll_format(SaveFormat::Webp, 1280, fits),
             (SaveFormat::Webp, None)
@@ -976,14 +978,15 @@ mod scroll_format_tests {
 
     #[test]
     fn jpeg_is_lowered_when_the_frame_would_not_fit_its_budget() {
-        // MAX_SCREENS x 480 rows of 640 pixels stays inside the 16 MP JPG frame budget.
-        assert_eq!(scroll_format(SaveFormat::Jpeg, 640, 480), (SaveFormat::Jpeg, None));
-        // The same rows at 1280 wide is 19.7 MP, so the JPG save path would have to hold the frame.
-        let (effective, why) = scroll_format(SaveFormat::Jpeg, 1280, 480);
+        // MAX_SCREENS x 240 rows of 640 pixels is 15.4 MP, inside the 16 MP JPG frame budget.
+        assert_eq!(scroll_format(SaveFormat::Jpeg, 640, 240), (SaveFormat::Jpeg, None));
+        // The same rows at 1280 wide is 30.7 MP, so the JPG save path would have to hold the frame.
+        let (effective, why) = scroll_format(SaveFormat::Jpeg, 1280, 240);
         assert_eq!(effective, SaveFormat::Png);
         assert!(matches!(why, Some(Lowering::FrameBudget { .. })), "{why:?}");
-        // 32 x 960 = 30720 rows: the scroll capture this rule exists for, and it stays PNG.
-        let (effective, why) = scroll_format(SaveFormat::Jpeg, 1280, 960);
+        // 100 x 600 = 60000 rows of 1280 pixels is 76.8 MP: the scroll capture this rule exists
+        // for, still inside JPEG's 65535-row side, and it stays PNG.
+        let (effective, why) = scroll_format(SaveFormat::Jpeg, 1280, 600);
         assert_eq!(effective, SaveFormat::Png);
         assert!(matches!(why, Some(Lowering::FrameBudget { .. })), "{why:?}");
     }
@@ -994,7 +997,7 @@ mod scroll_format_tests {
         let (effective, why) = scroll_format(SaveFormat::Jpeg, 1280, 2100);
         assert_eq!(effective, SaveFormat::Png);
         assert!(matches!(why, Some(Lowering::Format(_))), "{why:?}");
-        assert_eq!(MAX_SCREENS, 48);
+        assert_eq!(MAX_SCREENS, 100);
     }
 
     #[test]

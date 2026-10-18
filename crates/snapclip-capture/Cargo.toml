@@ -10,6 +10,10 @@ publish = false
 # stitcher without a window (docs/34 §12). Off by default, and nothing in the product enables it.
 [features]
 test-support = []
+# Development only: `SEAL_FAULT_AT=<n>` makes the nth seal of a scroll capture fail the way a full
+# disk would, so the `Storage` path can be walked in a release build without filling a disk
+# (docs/35 §19). Off by default, and nothing in the product enables it.
+seal-faults = []
 
 [dependencies]
 snapclip-model = { path = "../snapclip-model" }

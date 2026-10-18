@@ -237,15 +237,75 @@ pub(crate) struct BackedCanvas {
     /// Why the last seal or unseal failed, kept for the `Debug` output and the log line that
     /// already went to stderr (docs/35 §6).
     error: Option<String>,
-    /// The probe's way of making the next seal fail, so a full disk can be tested without one.
-    #[cfg(test)]
-    fail_seals: bool,
-    /// How many tiles this store sealed, and the largest one, for the seal-cost measurement
-    /// (docs/35 §17.1). Gated so the default build carries no counters.
+    /// What makes a seal fail on purpose: the tests arm it directly, and the `seal-faults`
+    /// feature arms it from `SEAL_FAULT_AT` so a release build can walk the real full-disk path
+    /// without a full disk (docs/35 §19).
+    #[cfg(any(test, feature = "seal-faults"))]
+    fault: SealFault,
+    /// How many tiles this store sealed, the largest one, and what the writes cost, for the
+    /// seal-cost measurement (docs/35 §17.1). Gated so the default build carries no counters.
     #[cfg(feature = "test-support")]
     seal_count: u64,
     #[cfg(feature = "test-support")]
     seal_max_rows: u32,
+    #[cfg(feature = "test-support")]
+    seal_writes: u64,
+    #[cfg(feature = "test-support")]
+    seal_write_us: Vec<u64>,
+}
+
+/// What makes a seal fail on purpose.
+///
+/// The tests arm the next seal directly. With the `seal-faults` feature, `SEAL_FAULT_AT=<n>` arms
+/// the nth one instead, so a release build walks the same path a full disk takes: the seal is
+/// refused, the status is `Storage`, and no half-written artifact is ever committed. The log line
+/// says the failure was injected, so a later reader does not mistake it for hardware trouble.
+#[cfg(any(test, feature = "seal-faults"))]
+#[derive(Debug)]
+struct SealFault {
+    /// Fail the seal whose 1-based index equals this, once.
+    at: Option<u32>,
+    /// How many seals this store has attempted.
+    seen: u32,
+}
+
+#[cfg(any(test, feature = "seal-faults"))]
+impl SealFault {
+    fn new() -> Self {
+        // The environment is read only when the feature is on, so the default build neither reads
+        // it nor carries the parsing.
+        #[cfg(feature = "seal-faults")]
+        let at = Self::from_env_value(std::env::var("SEAL_FAULT_AT").ok().as_deref());
+        #[cfg(not(feature = "seal-faults"))]
+        let at = None;
+        Self { at, seen: 0 }
+    }
+
+    /// The parse the feature relies on, split out so its test never touches the process
+    /// environment (the environment is global and the tests run in parallel).
+    #[cfg(feature = "seal-faults")]
+    fn from_env_value(value: Option<&str>) -> Option<u32> {
+        value
+            .and_then(|value| value.trim().parse().ok())
+            .filter(|count| *count > 0)
+    }
+
+    /// Arm the next seal, which is what the tests and the probe ask for.
+    #[cfg(test)]
+    fn arm_next(&mut self) {
+        self.at = Some(self.seen + 1);
+    }
+
+    /// Count this attempt and say whether it is the one that must fail.
+    fn take(&mut self) -> Option<u32> {
+        self.seen += 1;
+        if self.at == Some(self.seen) {
+            self.at = None;
+            Some(self.seen)
+        } else {
+            None
+        }
+    }
 }
 
 impl BackedCanvas {
@@ -267,20 +327,30 @@ impl BackedCanvas {
             middle: Tiles::new(),
             middle_bytes: 0,
             error: None,
-            #[cfg(test)]
-            fail_seals: false,
+            #[cfg(any(test, feature = "seal-faults"))]
+            fault: SealFault::new(),
             #[cfg(feature = "test-support")]
             seal_count: 0,
             #[cfg(feature = "test-support")]
             seal_max_rows: 0,
+            #[cfg(feature = "test-support")]
+            seal_writes: 0,
+            #[cfg(feature = "test-support")]
+            seal_write_us: Vec::new(),
         }
     }
 
-    /// How many tiles were sealed, the largest seal in rows, and the bytes written to the tile
-    /// file (docs/35 §17.1 paperwork).
+    /// How many tiles were sealed, the largest seal in rows, the bytes written to the tile file,
+    /// how many writes that took, and how long each seal's write took (docs/35 §17.1 paperwork).
     #[cfg(feature = "test-support")]
-    pub(crate) fn seal_stats(&self) -> (u64, u32, u64) {
-        (self.seal_count, self.seal_max_rows, self.middle_bytes)
+    pub(crate) fn seal_stats(&self) -> (u64, u32, u64, u64, Vec<u64>) {
+        (
+            self.seal_count,
+            self.seal_max_rows,
+            self.middle_bytes,
+            self.seal_writes,
+            self.seal_write_us.clone(),
+        )
     }
 
     fn front_rows(&self) -> u32 {
@@ -401,9 +471,10 @@ impl BackedCanvas {
         if rows == 0 {
             return true;
         }
-        #[cfg(test)]
-        if std::mem::take(&mut self.fail_seals) {
-            return self.fail("the long image cannot seal a tile: injected failure".to_owned());
+        #[cfg(any(test, feature = "seal-faults"))]
+        if let Some(index) = self.fault.take() {
+            let error = format!("the long image cannot seal a tile: injected seal fault at #{index}");
+            return self.fail(error);
         }
         let mut bytes = vec![0u8; rows as usize * self.row];
         match (&self.front, ring_is_front) {
@@ -411,6 +482,8 @@ impl BackedCanvas {
             _ => self.back.read(0, rows, &mut bytes),
         }
         let offset = self.middle.bytes;
+        #[cfg(feature = "test-support")]
+        let started = std::time::Instant::now();
         let written = {
             let file = match self.middle.ensure_file() {
                 Ok(file) => file,
@@ -436,6 +509,10 @@ impl BackedCanvas {
                 {
                     self.seal_count += 1;
                     self.seal_max_rows = self.seal_max_rows.max(rows);
+                    // One write_all per seal today; counted rather than inferred so splitting a
+                    // seal into several writes later does not quietly break the report.
+                    self.seal_writes += 1;
+                    self.seal_write_us.push(started.elapsed().as_micros() as u64);
                 }
                 if ring_is_front {
                     if let Some(front) = self.front.as_mut() {
@@ -557,7 +634,7 @@ impl BackedCanvas {
     /// Armed by the tests and the probe: the next seal behaves like a full disk (docs/35 §12.4).
     #[cfg(test)]
     pub(crate) fn fail_seals(&mut self) {
-        self.fail_seals = true;
+        self.fault.arm_next();
     }
 
     /// The file this store writes sealed rows to (tests only).
@@ -707,6 +784,20 @@ impl CanvasStore for BackedCanvas {
 #[cfg(test)]
 mod tests {
     use super::BackedCanvas;
+
+    /// The feature arms from `SEAL_FAULT_AT`, so only the parse is testable here: the environment
+    /// is process-global and the tests run in parallel (docs/35 §19).
+    #[cfg(feature = "seal-faults")]
+    #[test]
+    fn the_seal_fault_arms_only_on_a_positive_count() {
+        use super::SealFault;
+        assert_eq!(SealFault::from_env_value(Some("12")), Some(12));
+        assert_eq!(SealFault::from_env_value(Some(" 3 ")), Some(3));
+        assert_eq!(SealFault::from_env_value(Some("0")), None);
+        assert_eq!(SealFault::from_env_value(Some("-2")), None);
+        assert_eq!(SealFault::from_env_value(Some("no")), None);
+        assert_eq!(SealFault::from_env_value(None), None);
+    }
     use crate::scroll::store::{CanvasStore, MemoryCanvas};
 
     const W: u32 = 8;
