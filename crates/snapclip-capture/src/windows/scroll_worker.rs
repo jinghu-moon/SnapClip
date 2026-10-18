@@ -66,6 +66,43 @@ const FRAME_WAIT: Duration = Duration::from_millis(20);
 /// where the page is merely slow, and well under a user's patience.
 const OBSERVE_TIMEOUT: Duration = Duration::from_millis(1000);
 
+/// Environment override for the notch spacing, read only in builds that carry the measurement
+/// tools (`test-support`). The cadence is a *time* constant, not a frame count: auto mode posts a
+/// notch no sooner than [`AUTO_INTERVAL`] after the previous one and judges it by the first frame
+/// that lands at least one page latency later, so the cost of a capture is notches multiplied by
+/// the larger of those two. `docs/39` section 10 measures the three candidate spacings.
+#[cfg(feature = "test-support")]
+const AUTO_INTERVAL_ENV: &str = "SCROLL_AUTO_INTERVAL_MS";
+
+/// A millisecond override, clamped so a typo cannot post notches in a tight loop.
+///
+/// Zero, a negative number, a non-numeric string and anything above five seconds are all rejected:
+/// the first would spin the wheel as fast as the loop runs, the last is slower than any page needs.
+#[cfg(any(test, feature = "test-support"))]
+fn parse_ms_override(raw: &str) -> Option<Duration> {
+    let ms: u64 = raw.trim().parse().ok()?;
+    (20..=5_000).contains(&ms).then(|| Duration::from_millis(ms))
+}
+
+/// [`AUTO_INTERVAL`], or the override when a measurement build was asked for one.
+///
+/// Resolved once per session, like [`verbose_timing`]: reading the environment per notch would be a
+/// per-notch cost, and the value must not change under a running session.
+fn auto_interval() -> Duration {
+    #[cfg(feature = "test-support")]
+    {
+        static OVERRIDE: OnceLock<Option<Duration>> = OnceLock::new();
+        if let Some(interval) = *OVERRIDE.get_or_init(|| {
+            std::env::var(AUTO_INTERVAL_ENV)
+                .ok()
+                .and_then(|raw| parse_ms_override(&raw))
+        }) {
+            return interval;
+        }
+    }
+    AUTO_INTERVAL
+}
+
 /// One notch that has been posted and is waiting for the page to show it.
 #[derive(Debug, Clone, Copy)]
 struct Pending {
@@ -352,7 +389,7 @@ fn capture(spec: &Spec, shared: &Shared, tracker: &mut Option<Tracker>) -> Resul
                     until: now + OBSERVE_TIMEOUT,
                     saw_frame: false,
                 });
-                next_notch = now + AUTO_INTERVAL;
+                next_notch = now + auto_interval();
             }
         } else {
             idle_notches = 0;
@@ -946,7 +983,22 @@ mod tests {
         assert_eq!(observe(&mut flight, true, late + Duration::from_millis(200)), Some(Observation::Moved));
     }
 
-    /// What the closed loop did to the notch cadence. The page side is a model; the arithmetic is
+    /// The override is a measurement tool, so its parser has to refuse the values that would make
+    /// the measurement meaningless: zero or negative would spin the wheel every loop iteration, a
+    /// non-number is a typo, and anything past five seconds is slower than the page it measures.
+    /// A rejected value must fall back to the shipped cadence rather than fail the session.
+    #[test]
+    fn an_auto_interval_override_is_clamped_and_falls_back_on_nonsense() {
+        assert_eq!(parse_ms_override("200"), Some(Duration::from_millis(200)));
+        assert_eq!(parse_ms_override(" 60 "), Some(Duration::from_millis(60)));
+        assert_eq!(parse_ms_override("20"), Some(Duration::from_millis(20)));
+        assert_eq!(parse_ms_override("5000"), Some(Duration::from_millis(5000)));
+        for nonsense in ["0", "-1", "19", "5001", "", "fast", "1.5", "200ms"] {
+            assert_eq!(parse_ms_override(nonsense), None, "{nonsense:?} must be refused");
+        }
+    }
+
+    /// The closed loop sets the cadence from the page. The page side is a model; the arithmetic is
     /// the loop's: a notch is sent no sooner than `AUTO_INTERVAL` after the previous one, and it is
     /// judged by the first frame that lands at least `page_latency` after it -- one frame later
     /// than the old clock, which posted every `AUTO_INTERVAL` and read no frame at all.

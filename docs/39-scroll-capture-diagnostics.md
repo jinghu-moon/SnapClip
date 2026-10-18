@@ -349,3 +349,58 @@ stage=export ... size=1250x80882 encode_write_ms=4353
 2. **`export_path_copies` 会重编 `snapclip-app.exe`** ✓ ⇒ 运行中的实例锁文件会导致 `os error 5` ✗ ⇒ 先关掉应用 ✓。
 
 **已退役**：`--attribution` 现在只打印用法并以 0 退出，**不产出数据** ✗ —— 它测的那个"内存画布"在阶段 2 之后已被 `BackedCanvas` 取代 ✓；要看历史基线请检出 `d27b550`。
+
+## 十、静置（notch 间隔）三档测量
+
+### 10.1 先纠正一个说法：没有"等 N 帧静止"这个参数
+
+§八 里那句"每次推进约等 11.2 帧"描述的是**现象**，不是代码里的旋钮。自动滚动是一个**闭环**：
+
+- 一个 notch 发出后，**不早于 `AUTO_INTERVAL`（200 ms）**才发下一个；
+- 这个 notch 由"**在它之后至少一个页面延迟才到达的那一帧**"来判定动没动（`observe`）；
+- 连续 `AUTO_IDLE_NOTCHES`（10）个 notch 都没动 ⇒ 自动模式结束。
+
+所以一次采集的耗时 ≈ **notch 数 × max(AUTO_INTERVAL, 页面延迟)**。真机 861 次推进、9 684 帧 ⇒ 约 11.2 帧/次，
+其中既有 `AUTO_INTERVAL` 的 200 ms 间隔，也有目标窗口自身的滚动动画延迟。
+
+⇒ 真正可调的是**notch 间隔**（`AUTO_INTERVAL`），不是"静置帧数" ✗。本轮已把它做成**仅测量构建可覆盖**
+（`test-support` 门控，环境变量 **`SCROLL_AUTO_INTERVAL_MS`**，解析规则：20–5000 ms，非法值回退默认 200 ms）。
+**默认值没有改** ✗。
+
+### 10.2 三档测量步骤
+
+同一页面、同一选区、**同一版本**的 `--release --features test-support` 构建，分别跑一次：
+
+```powershell
+cargo build --release --features test-support
+
+$env:SCROLL_AUTO_INTERVAL_MS="200"; .	argetelease\snapclip-app.exe   # 基准档（等于默认）
+$env:SCROLL_AUTO_INTERVAL_MS="100"
+$env:SCROLL_AUTO_INTERVAL_MS="60"
+```
+
+每档记四项：
+
+1. `[snapclip][scroll] stopped frames=…` 与**你从开始到结束的秒数**；
+2. `placements: appended=… contained=… prepended=… unknown=… full=… moved_px=… nonzero=… frames=…`
+   —— **重点看四条等式是否仍然成立**：
+   `809 + appended × dy == 行数`、`appended × dy + full × dy == moved_px`、
+   `appended + full == nonzero`、`appended + full + unknown == frames`；
+3. **最终行数是否与基准档一致**（不一致 ⇒ 有位移被跳过 ✗）；
+4. **图是否无重复、无缺失横带** ✓。
+
+### 10.3 验收判据（写死，不事后放宽）
+
+某一档只有在**同时**满足下面三条时，才可以考虑设为默认：
+
+- 四条等式仍成立；
+- 最终行数与基准档**一致**；
+- 图**无重复/缺失横带**。
+
+任何一条不满足 ⇒ **放弃该档**，并把当时的 `placements` 行记进本节。提前步进最危险的后果是踩在滚动动画中途，
+位移估计给出错误 `dy` ⇒ **内容错位**（比"慢"严重得多）。
+
+### 10.4 状态
+
+间隔做成了可覆盖（`crates/snapclip-capture/src/windows/scroll_worker.rs`，`auto_interval()` / `parse_ms_override()`），
+三档**尚未实测** ✗ —— 需要真机各跑一次。
