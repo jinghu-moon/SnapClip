@@ -136,7 +136,19 @@ fn main() {
     }
     if !arguments.iter().any(|argument| argument == "--report") {
         println!("codec-bench: pass --report, --quality, --scroll, --transcode, --bands, --assert or --huffman-ab");
-        return;
+        if arguments.is_empty() {
+            return;
+        }
+        // A mode that no longer exists must not look like a measurement that succeeded. --attribution
+        // was retired in P7-52: it measured the in-memory canvas, which is now only a test control.
+        if arguments.iter().any(|argument| argument == "--attribution") {
+            eprintln!(
+                "codec-bench: --attribution is retired; it measured a canvas that is now only a test control. For the historical baseline check out d27b550."
+            );
+        } else {
+            eprintln!("codec-bench: unrecognised arguments: {arguments:?}");
+        }
+        std::process::exit(2);
     }
     run_report();
 }

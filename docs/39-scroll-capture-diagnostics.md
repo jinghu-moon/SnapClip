@@ -341,11 +341,11 @@ stage=export ... size=1250x80882 encode_write_ms=4353
 | `cargo run -p codec-bench --release -- --assert` | **exit 0**，`all three targets hold` ✓ |
 | `cargo run -p codec-bench --release -- --scroll` | **exit 0** ✓ |
 | `cargo test --release -p snapclip-app --test export_path_copies -- --ignored --nocapture` | **exit 0**，3 passed ✓（需先关闭正在运行的 SnapClip） |
-| `git hook run pre-push` | **exit 0**，`[pre-push] OK` ✓ —— **前置条件：`target/` 必须已存在** |
+| `git hook run pre-push` | **exit 0**，`[pre-push] OK` ✓ —— **在无 `target/` 的干净检出上通过**（钩子自己 `mkdir -p target`，P7-76 起）|
 
 两条**前置条件**（不满足会失败，不是命令写错）：
 
-1. **`git hook run pre-push` 要求仓库根下有 `target/`** ✗ —— 干净检出里没有这个目录时，它会因 `target/test-baseline.log: No such file or directory` 而失败 ✓；先跑一次任意 `cargo` 命令（例如上表第一条）即可 ✓。
+1. ~~`git hook run pre-push` 要求仓库根下有 `target/`~~ —— **已修**：钩子在重定向日志前自己 `mkdir -p target` ✓；任何 `CARGO_TARGET_DIR` 设置下也成立 ✓（那正是原失败最容易出现的场景）。
 2. **`export_path_copies` 会重编 `snapclip-app.exe`** ✓ ⇒ 运行中的实例锁文件会导致 `os error 5` ✗ ⇒ 先关掉应用 ✓。
 
 **已退役**：`--attribution` 现在只打印用法并以 0 退出，**不产出数据** ✗ —— 它测的那个"内存画布"在阶段 2 之后已被 `BackedCanvas` 取代 ✓；要看历史基线请检出 `d27b550`。

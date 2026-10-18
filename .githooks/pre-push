@@ -15,6 +15,9 @@ echo "[pre-push] cargo test --workspace --lib -- --test-threads=1"
 # suite that shrank below the docs/31 §0.3 baseline (P6.01 — a deletion that takes a test with it
 # leaves `cargo test` green, only smaller). Redirecting keeps the exit code without `set -o
 # pipefail`, which not every /bin/sh has.
+# A fresh clone has no target directory, and the redirect below creates nothing.
+mkdir -p target
+
 if ! cargo test --workspace --lib -- --test-threads=1 > target/test-baseline.log 2>&1; then
   cat target/test-baseline.log
   exit 1
