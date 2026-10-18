@@ -906,6 +906,12 @@ pub mod probe {
             self.tracker.image_rows()
         }
 
+        /// `(seal count, largest seal in rows, bytes written)` for the seal-cost measurement
+        /// (docs/35 §17.1).
+        pub fn seal_stats(&self) -> (u64, u32, u64) {
+            self.tracker.stitcher.store().seal_stats()
+        }
+
         /// The four budgets the store answers for, so a run can report what the image cost
         /// (docs/35 §5.1): `(pixel_rows, pixel_bytes, working_bytes, temp_bytes)`.
         pub fn budgets(&self) -> (u32, u64, u64, u64) {

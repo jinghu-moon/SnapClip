@@ -194,3 +194,26 @@ mmap **不算"不占临时磁盘"**：文件仍在磁盘上；而且**写入的�
 - fpng README（对 lodepng 的 1.33× 体积、110 MP/s、Unlicense、C++）：https://github.com/richgel999/fpng
 - PowerToys 的 WGC 捕获与逐帧回读：https://github.com/microsoft/PowerToys/blob/main/src/modules/MeasureTool/MeasureToolCore/ScreenCapturing.cpp
 - 超长页面分段拼接的旁证：https://github.com/dgtlmoon/changedetection.io/blob/master/changedetectionio/content_fetchers/screenshot_handler.py
+
+## 7. 更正（2026-10-18，实测后）
+
+本文原先把"封口一次 ≈ 2.0 MB ⇒ deflate 20–40 ms"当作结论，**那是估算，而且用错了数据** ✗：
+404 行是拼接器的**覆盖 band**（`stitch.rs:146-148`，写进边缘环的窗口），**不是每次封口写入 tile 的行数**。
+真正封口的行数是 `BackedCanvas::append` 里的 `excess = back.rows + growth - view`
+（`crates/snapclip-capture/src/scroll/backed.rs:557`）—— 即"环形缓冲溢出的行数"。
+
+用 `test-support` 门控的计数器（seal_count / seal_max_rows）在 `codec-bench --scroll` 上实测：
+
+| 项 | 实测 |
+| --- | ---: |
+| 封口次数 | **48 次 / 49 帧** |
+| 每次封口行数 | 600（= bench 的每帧滚动量 600 行） |
+| 每次封口字节 | **3.07 MB** |
+| `deflate(level 1)` 对这 3.07 MB | **12.1 ms**，压缩比只有 **2.4×** |
+
+两条结论都变了：
+1. **压缩比不是 18×** ✗ —— 合成高熵页面只有 **2.4×**（PNG 的 18× 来自它自己的行过滤，不能反推到 tile ✓ 审阅这条成立）；
+2. **封口大小取决于每帧滚动量** ✓ —— bench 是 600 行/帧 ⇒ 3.07 MB/次 ⇒ 12.1 ms ✗（打穿 8 ms 门禁）；
+   真机是 **93 行/帧** ⇒ 约 **465 KB/次** ⇒ 约 **1.8 ms** ✓（**在门禁之内** ✓）。
+
+⇒ 所以"CPU 压缩必然打穿门禁"这个结论**不成立** ✗，正确说法是：**取决于滚动速度与内容，必须实测** ✓。

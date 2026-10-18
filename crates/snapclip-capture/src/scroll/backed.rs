@@ -240,6 +240,12 @@ pub(crate) struct BackedCanvas {
     /// The probe's way of making the next seal fail, so a full disk can be tested without one.
     #[cfg(test)]
     fail_seals: bool,
+    /// How many tiles this store sealed, and the largest one, for the seal-cost measurement
+    /// (docs/35 §17.1). Gated so the default build carries no counters.
+    #[cfg(feature = "test-support")]
+    seal_count: u64,
+    #[cfg(feature = "test-support")]
+    seal_max_rows: u32,
 }
 
 impl BackedCanvas {
@@ -263,7 +269,18 @@ impl BackedCanvas {
             error: None,
             #[cfg(test)]
             fail_seals: false,
+            #[cfg(feature = "test-support")]
+            seal_count: 0,
+            #[cfg(feature = "test-support")]
+            seal_max_rows: 0,
         }
+    }
+
+    /// How many tiles were sealed, the largest seal in rows, and the bytes written to the tile
+    /// file (docs/35 §17.1 paperwork).
+    #[cfg(feature = "test-support")]
+    pub(crate) fn seal_stats(&self) -> (u64, u32, u64) {
+        (self.seal_count, self.seal_max_rows, self.middle_bytes)
     }
 
     fn front_rows(&self) -> u32 {
@@ -415,6 +432,11 @@ impl BackedCanvas {
                 self.middle.bytes = self.middle.bytes.max(offset + bytes.len() as u64);
                 self.middle.push(offset, rows, ring_is_front);
                 self.middle_bytes += bytes.len() as u64;
+                #[cfg(feature = "test-support")]
+                {
+                    self.seal_count += 1;
+                    self.seal_max_rows = self.seal_max_rows.max(rows);
+                }
                 if ring_is_front {
                     if let Some(front) = self.front.as_mut() {
                         front.shrink_back(rows);

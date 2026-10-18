@@ -101,8 +101,42 @@ pub fn run(view: usize, step: usize) -> Stitched {
         let rows = probe.image_rows();
         (frames, rows, stitch_us, thumb_us, lost)
     });
+    let seal_stats = Some(probe.seal_stats());
     let ((width, height, canvas), assembly_peak) =
         alloc_probe::peak_extra(|| probe.into_image().expect("the tiles are intact"));
+    // The review of docs/37 is right that a seal is not a band: report what was actually
+    // sealed, and what deflating one of those actually costs on this machine (docs/35 §17.1).
+    if let Some((seals, max_rows, sealed_bytes)) = seal_stats {
+        let avg = if seals > 0 { sealed_bytes / seals } else { 0 };
+        let row = (width as u64) * 4;
+        let rows_avg = if row > 0 { avg / row } else { 0 };
+        println!(
+            "seals={seals} largest={max_rows} rows avg={rows_avg} rows bytes={sealed_bytes} ({:.1} MB)",
+            sealed_bytes as f64 / (1024.0 * 1024.0)
+        );
+        if avg > 0 {
+            let start = ((page.len() as u64).saturating_sub(avg)) as usize;
+            let payload = &page[start..];
+            let mut best: Option<(u128, usize)> = None;
+            for _ in 0..3 {
+                let t = std::time::Instant::now();
+                let out = miniz_oxide::deflate::compress_to_vec(payload, 1);
+                let us = t.elapsed().as_micros();
+                if best.map_or(true, |(b, _)| us < b) {
+                    best = Some((us, out.len()));
+                }
+            }
+            if let Some((us, out_len)) = best {
+                println!(
+                    "deflate(level 1) on {} bytes -> {} bytes ({:.1}x) in {} us  [synthetic content]",
+                    payload.len(),
+                    out_len,
+                    payload.len() as f64 / out_len as f64,
+                    us
+                );
+            }
+        }
+    }
     let truth = &page[..(width as usize * height as usize * 4).min(page.len())];
     let correct = canvas.len() == truth.len() && canvas == truth;
     let (frames, rows, stitch_us, thumb_us, lost) = pushed;
