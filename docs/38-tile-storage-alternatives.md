@@ -1,3 +1,5 @@
+> **结论已并入 [`docs/35 §17`](35-scroll-canvas-streaming-plan.md)。** 本文保留完整的候选对比与来源，作为决策依据。
+
 # 38 · 滚动截图封口 tile 的存储：备选方案调研
 
 > 本文是对 `docs/37-compressed-tile-container.md` 的**独立复核**。结论不迁就上一份文档：
