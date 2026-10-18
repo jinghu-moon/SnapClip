@@ -607,3 +607,49 @@ cargo test --release -p snapclip-app --test export_path_copies -- --ignored --no
 - ⇒ 所以"必然打穿门禁"不成立 ✗，**17.1 的措辞应读作"待测"** ✓；
 - **要测的三样**：① 每次封口的真实字节数（已有计数器 ✓）② 所选编码器在**这台机器**上的压缩耗时（已有 `deflate` 实测方法 ✓）③ **封口帧的 max**（不是平均值 ✗）；
 - **在拿到这三项实测之前，不做任何压缩相关的架构改动** ✓；另两条被否决的路线（mmap、只写最终 PNG）与数据无关，仍然成立 ✓。
+
+## 18. 前边缘解封路径的三件事（2026-10-18）
+
+### 18.1 `unseal_front` 的 `offset: 0` 回填：**不可达**，但仍改为真实 offset
+
+容量分支要求 `front.grow_front(rows)` 失败，而 `rows <= need = wanted - front_rows()`、
+`need + front_rows() == wanted <= view`，且 `view` 就是环的容量 ⇒ `rows + front_rows() <= cap` 恒成立
+⇒ 该分支**不可达**（`Ring::grow_front` 的判据见 `backed.rs`，测试
+`the_front_ring_always_has_room_for_what_unsealing_takes` 钉住这个不等式；把判据从 `>` 改成 `>=` 即红）。
+
+即使不可达，它也不能*说谎*：回填现在用**真实 offset**（tile 被截去的那一段从 `tile.offset` 起算），
+并保留 `debug_assert!(false, ...)` 作为"这条路径不该发生"的断言 —— 真发生了，行会原样放回，而不是带着 `offset: 0` 混进去。
+
+### 18.2 `middle.order` 非空但 tile 读不回来：谁能造成
+
+| 来源 | 生产可达？ | 依据 |
+| --- | --- | --- |
+| 测试注入 `break_tile_file` | 仅测试 | 显式删除 |
+| 外部删除（杀毒、清理器、用户） | **是** | 文件在 `%TEMP%`，任何进程都能删 |
+| 磁盘满 | 否（不会留下不一致的目录） | `ensure_file`/`write_all` 失败 ⇒ `fail()` 且**不** push 目录 |
+| `Tiles::drop` | 否 | 只在销毁时删，此时不再有读 |
+| 启动清扫 `windows/tile_sweep.rs` | **否** | 在 `begin_scroll_session` 里、`ScrollWorker::start` 之前跑（`overlay/scroll.rs:247` vs `:324`）⇒ 任何 store 都还不存在；且判据要求"别的 pid ∧ ≥1 小时 ∧ 进程已不在"，访问被拒当作活着 |
+
+检出方式：读矩形路径 `read_middle`（上一轮）与**本轮**的 `unseal_front` 都返回 `RowReadError::Missing`，
+不再有任何"失败即填零并继续"的静默路径。`grep -rn "fill(0)" scroll/` 现只剩两处：
+`backed.rs:490/502`（**本节的容忍路径**，见 18.3）与 `thumb.rs:171`（累加器清零，与错误无关）。
+
+### 18.3 `unseal_front` 改为 `Result`，但**不是**一律拒绝
+
+`unseal_front` 现在返回 `Result<(), RowReadError>`：读不出来时**报错**，同时仍把这批行按零写进前环
+（**仅在**它们会被同一步的 band 覆盖时有意义）。`prepend` 拿到 `Err` 后判断：
+
+- 前环仍能满足 `existing` 行（`existing = band - growth`）⇒ **记录并继续** —— 因为这些零值一定被
+  `front.write(0, band_src)` 覆盖，图像是完整的；一律拒绝会**丢掉一张本来正确的截图** ✗；
+- 前环不够（理论上不可达）⇒ `fail()` ⇒ `prepend` 返回 false ⇒ `Status::Storage` ⇒ 导出以
+  `EncodeFailed` 结束、`.partial` 不成为成品。
+
+这条与"一律拒绝"的差别是刻意的：**容忍的前提是被覆盖**，而这个前提由 `existing = band - growth`
+的结构保证，并有两测试钉住（`a_prepend_over_a_broken_tile_still_writes_its_band`、
+`unsealing_reports_a_broken_tile_instead_of_pretending`）。
+
+### 18.4 本轮读数
+
+`capture --lib` **527 passed / 0 failed / 80 ignored**（默认 525）；两条新测试都做过变异：
+把 `unseal_front` 改回"永远 Ok" ⇒ `a broken tile must be reported, got Ok(())` 红；
+把 `grow_front` 的 `>` 改成 `>=` ⇒ `the whole ring fits at once` 红。六类序列的 oracle 等价测试仍绿。

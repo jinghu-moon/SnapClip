@@ -459,29 +459,50 @@ impl BackedCanvas {
     /// Two sources, in order: the middle's first tile, and — once the middle is empty — the back
     /// ring's first rows, which are then the rows immediately below the front (the image is short
     /// enough that the two rings meet).
-    fn unseal_front(&mut self, wanted: u32) -> bool {
+    fn unseal_front(&mut self, wanted: u32) -> Result<(), RowReadError> {
         if self.front.is_none() {
             self.front = Some(Ring::new(self.row, self.view));
         }
         let wanted = wanted.min(self.view).min(self.rows);
+        let mut broken: Option<String> = None;
         while self.front_rows() < wanted {
             let need = wanted - self.front_rows();
-            let take = match self.middle.order.front().copied() {
+            let (bytes, from) = match self.middle.order.front().copied() {
                 Some(tile) => {
                     let take = need.min(tile.rows);
-                    self.middle.order.pop_front();
                     let mut bytes = vec![0u8; take as usize * self.row];
-                    if let Some(mut file) = self.readable_file() {
-                        if let Err(error) = file
-                            .seek(SeekFrom::Start(tile.offset))
-                            .and_then(|_| file.read_exact(&mut bytes))
-                        {
-                            eprintln!(
-                                "[snapclip][scroll] unsealing a tile failed: {error}; its rows read as zero"
+                    // Read before consuming: a tile that cannot be read must stay in the directory
+                    // (the export path reports it), and the rows this call needs are the `existing`
+                    // rows a prepend overwrites in the same step, so zeros are tolerable here only
+                    // while the band covers them, which `prepend` checks.
+                    match self.readable_file() {
+                        Some(mut file) => {
+                            if let Err(error) = file
+                                .seek(SeekFrom::Start(tile.offset))
+                                .and_then(|_| file.read_exact(&mut bytes))
+                            {
+                                let why =
+                                    format!("{}: {error}", self.middle.path.display());
+                                eprintln!(
+                                    "[snapclip][scroll] unsealing a tile failed: {why}"
+                                );
+                                broken.get_or_insert(why);
+                                bytes.fill(0);
+                            }
+                        }
+                        None => {
+                            let why = format!(
+                                "the tile file {} is gone",
+                                self.middle.path.display()
                             );
+                            eprintln!(
+                                "[snapclip][scroll] unsealing a tile failed: {why}"
+                            );
+                            broken.get_or_insert(why);
                             bytes.fill(0);
                         }
                     }
+                    self.middle.order.pop_front();
                     if take < tile.rows {
                         self.middle.order.push_front(Tile {
                             offset: tile.offset + u64::from(take) * self.row as u64,
@@ -490,7 +511,7 @@ impl BackedCanvas {
                     } else {
                         self.middle.rows -= take;
                     }
-                    (bytes, true)
+                    (bytes, Some(tile.offset))
                 }
                 None => {
                     let take = need.min(self.back.rows);
@@ -500,30 +521,38 @@ impl BackedCanvas {
                     let mut bytes = vec![0u8; take as usize * self.row];
                     self.back.read(0, take, &mut bytes);
                     self.back.shrink_front(take);
-                    (bytes, false)
+                    (bytes, None)
                 }
             };
-            let (bytes, from_middle) = take;
             let rows = (bytes.len() / self.row) as u32;
             let front = self.front.as_mut().expect("just ensured");
             if !front.grow_front(rows) {
-                // The ring cannot hold it: give up without corrupting either side.
+                // Unreachable: rows <= need and need + front_rows() <= wanted <= view == cap, so
+                // the ring always has room. If that ever stops holding, put the rows back where
+                // they came from rather than losing them.
                 front.shrink_front(rows.min(front.rows));
-                if from_middle {
-                    self.middle.order.push_front(Tile {
-                        offset: 0,
-                        rows,
-                    });
-                    self.middle.rows += rows;
-                } else {
-                    self.back.grow_front(rows);
+                match from {
+                    Some(offset) => self.middle.order.push_front(Tile { offset, rows }),
+                    None => {
+                        self.back.grow_front(rows);
+                    }
                 }
-                return self.fail("the front edge buffer is smaller than the band".into());
+                debug_assert!(
+                    false,
+                    "the front edge buffer is smaller than the band: {rows} of {wanted}"
+                );
+                return Err(RowReadError::Missing(
+                    "the front edge buffer is smaller than the band".into(),
+                ));
             }
             front.write(0, &bytes);
         }
-        true
+        match broken {
+            Some(why) => Err(RowReadError::Missing(why)),
+            None => Ok(()),
+        }
     }
+
 
     /// Armed by the tests and the probe: the next seal behaves like a full disk (docs/35 §12.4).
     #[cfg(test)]
@@ -610,8 +639,20 @@ impl CanvasStore for BackedCanvas {
         // The band covers the `growth` new top rows plus the `band - growth` rows that were already
         // the top, so those have to be unsealed from the middle before the prepend can write.
         let existing = band - growth;
-        if !self.unseal_front(existing.max(1)) {
-            return false;
+        if let Err(error) = self.unseal_front(existing.max(1)) {
+            // The rows just unsealed are exactly the `existing` rows the band is about to overwrite
+            // (`existing = band - growth` by construction), so a broken tile is tolerable only
+            // while the front ring can still supply every row the band replaces. Below that the
+            // zeros would survive into the image, and the prepend has to be refused.
+            let short = existing > self.front_rows();
+            if short {
+                return self.fail(format!(
+                    "the rows below the front cannot be read back: {error}"
+                ));
+            }
+            eprintln!(
+                "[snapclip][scroll] a prepend unsealed {existing} rows from a broken tile;                  they are the rows the band replaces, so the image stays whole"
+            );
         }
         if self.front_rows() + growth > self.view {
             let excess = self.front_rows() + growth - self.view;
@@ -712,6 +753,46 @@ mod tests {
             .expect("the rows the prepend just wrote are still in the ring");
         assert_eq!(&top[..row], &src[..row], "the prepended row");
         assert_eq!(&top[row..], &src[row..2 * row], "and the row below it");
+    }
+
+    /// The capacity branch in `unseal_front` cannot be reached: what it grows by is at most the
+    /// room the call is allowed to fill, because `rows <= need` and `need + front_rows <= wanted`
+    /// and `wanted <= view`, which is the ring's capacity. This pins the guard that makes it so.
+    #[test]
+    fn the_front_ring_always_has_room_for_what_unsealing_takes() {
+        let mut whole = super::Ring::new(1, 5);
+        assert!(whole.grow_front(5), "the whole ring fits at once");
+        let mut parts = super::Ring::new(1, 5);
+        assert!(parts.grow_front(2));
+        assert!(parts.grow_front(3), "the remainder fits exactly");
+        assert!(!parts.grow_front(1), "and one row more does not");
+    }
+
+    /// A tile that cannot be read back has to be reported by the unseal path, not smoothed over:
+    /// the caller decides whether the rows it wanted are covered by the band it is about to write.
+    #[test]
+    fn unsealing_reports_a_broken_tile_instead_of_pretending() {
+        let first = frame(1);
+        let mut backed = BackedCanvas::new(&first, W, VIEW, 64 * VIEW);
+        let growth = 90;
+        let band = (VIEW / 2).max(growth + VIEW / 4).min(VIEW);
+        for step in 0..6u32 {
+            let src = band_src(2 + step as u8, band);
+            assert!(backed.prepend(growth, &src), "prepend {step}");
+        }
+        let down = band_src(8, band);
+        assert!(backed.append(growth, &down), "the downward step");
+        assert!(backed.budgets().temp_bytes > 0, "the run must have sealed tiles");
+
+        backed.break_tile_file();
+
+        match backed.unseal_front(2) {
+            Err(super::RowReadError::Missing(why)) => assert!(
+                why.contains("gone") || why.contains("cannot"),
+                "the reason names the file: {why}"
+            ),
+            other => panic!("a broken tile must be reported, got {other:?}"),
+        }
     }
 
     /// Every append must leave both stores holding the same bytes, because the backing store only
