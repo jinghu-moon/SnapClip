@@ -441,3 +441,22 @@ B2 = 边缘缓冲（容量 × width × 4） + 编码器内部缓冲 + 装配时�
 2. 剪贴板：先沿用现有整幅路径（**只在需要剪贴板时**物化一份）；延迟渲染列为独立项；
 3. 完成后重跑 `--scroll`，报告**装配峰值**（目标：从 145.3 MB 降到"一个带 + 编码器内部"量级，实测为准，不预设数字）；
 4. 阶段 4 再把"像素等价 / 峰值 / 每帧 p50 p99 max"变成断言。
+
+## 15. 阶段 3b：文件路径的装配不再物化整图
+
+**做了什么**：`scroll_worker::finish()` 交回一个 `ScrollBands`（持有 tracker，crate 私有），它实现 `BandSource`；`ExportJob` 的像素从一个 `SelectionPixels` 变成一个 `ExportSource`：`Whole` 或 `Bands`。文件写入走 `write_bands`（按 4 MB 带、行带编码、`.partial` 后再提交），**不再先把整幅拼出来**。
+
+**为什么用内部可变性而不是 `&mut ExportJob`**：导出执行器是 `Box<dyn Fn + Send + Sync>`，由 worker 线程通过共享引用调用，拿不到整 job 的独占借用；需要变换的只有"为剪贴板物化一次"这一个动作，所以 `ExportSource` 放在 `Mutex` 里，比重塑执行器形状便宜。
+
+**剪贴板仍是整幅**：一张 30000 行的连续位图天生就要那 145 MB，这是它的价格而不是泄漏；`materialise()` 是唯一物化点，且只被剪贴板调用。
+
+**实测（`codec-bench --bands`，1280×29760）**：
+
+| 路径 | 输出 | 耗时 | 峰值额外分配 |
+| --- | ---: | ---: | ---: |
+| **带写入（文件路径）** | 0.93 MB | 309 ms | **4.6 MB** |
+| 整幅（旧形状，`SelectionPixels` 拥有整图） | 0.93 MB | 324 ms | **154.5 MB** |
+
+⇒ **33.8× 少**，与阶段 3 记的 145.3 MB 对上（差异是编码器与页面共用）。
+
+**证据**：`the_band_source_reproduces_the_whole_image`（逐带回放 == 整图，逐字节）、`a_long_image_reaches_the_writer_as_bands`（长图到达 writer 时是 `write_bands`，且**不会**被当作整幅传进去 —— 整幅入口在该测试里直接 panic）。

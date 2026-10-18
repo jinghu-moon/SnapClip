@@ -330,6 +330,26 @@ impl Tracker {
         }
     }
 
+    /// How many rows the long image has.
+    pub(crate) fn rows(&self) -> u32 {
+        self.stitcher.rows()
+    }
+
+    /// Fill `out` with `rows` rows starting at `first_row`, top-down, tightly packed BGRA.
+    /// False when the store cannot supply them, so a consumer refuses the artifact rather
+    /// than writing a short one (docs/35 §15).
+    pub(crate) fn read_rows(&self, first_row: u32, rows: u32, out: &mut [u8]) -> bool {
+        let row_bytes = self.width as usize * 4;
+        if rows == 0
+            || first_row + rows > self.stitcher.rows()
+            || out.len() != rows as usize * row_bytes
+        {
+            return false;
+        }
+        self.stitcher.store().read_rows(first_row, rows, out);
+        true
+    }
+
     /// Arm one failing seal, so a full disk can be tested without one (docs/35 §12.4).
     #[cfg(test)]
     pub(crate) fn fail_seals(&mut self) {
@@ -357,11 +377,29 @@ impl Tracker {
 }
 
 #[cfg(test)]
+pub(crate) use tests::test_bands;
+
+#[cfg(test)]
 mod tests {
+    /// Bands backed by a real tracker over a synthetic page, for tests that need a long image to
+    /// hand the exporter (`docs/35 §15`). The step sizes mirror `the_bands_add_up_to_the_whole_image`
+    /// so the estimator keeps tracking instead of calling a jump.
+    pub(crate) fn test_bands() -> ScrollBands {
+        let page = page(W, 5000, 22);
+        let mut tracker = Tracker::new(&frame_at(&page, 0, 0), W, H, 40);
+        for (tick, top) in [64u32, 128, 192, 256, 320].into_iter().enumerate() {
+            tracker.push(&frame_at(&page, top, tick as u32 + 1));
+            assert_eq!(tracker.status(), Status::Tracking, "the sequence must keep tracking");
+        }
+        ScrollBands::new(tracker)
+    }
+
+
     use super::estimate::tests::{page, shift_of, window};
     use super::estimate::{FrameSig, estimate};
     use super::stitch::Placement;
     use super::{MAX_SCREENS, Status, Tracker, row_limit};
+    use super::ScrollBands;
 
     const W: u32 = 120;
     const H: u32 = 200;
@@ -429,6 +467,28 @@ mod tests {
             image == truth(&page, top, tick),
             "the image must equal the page with one header and one footer"
         );
+    }
+
+    #[test]
+    fn the_band_source_reproduces_the_whole_image() {
+        let (width, rows, whole) = test_bands().into_image();
+        assert_eq!(width, W);
+        let mut bands = test_bands();
+        let total = crate::ports::BandSource::rows(&bands);
+        assert_eq!(total, rows, "the two trackers must agree on the height");
+        let mut replayed = Vec::new();
+        let mut first = 0u32;
+        while first < total {
+            let count = (total - first).min(64);
+            let mut out = Vec::new();
+            assert!(
+                crate::ports::BandSource::read_rows(&mut bands, first, count, &mut out),
+                "bands must supply row {first}"
+            );
+            replayed.extend_from_slice(&out);
+            first += count;
+        }
+        assert_eq!(replayed, whole, "band replay must equal the whole image");
     }
 
     #[test]
@@ -852,5 +912,43 @@ mod scroll_format_tests {
         assert_eq!(effective, SaveFormat::Png);
         assert!(matches!(why, Some(Lowering::Format(_))), "{why:?}");
         assert_eq!(MAX_SCREENS, 32);
+    }
+}
+
+/// A finished long image handed to the exporter as row bands, so thirty thousand rows reach the
+/// writer without the whole picture ever being in memory (docs/35 §15).
+///
+/// The tracker already owns a temp tile file and a bounded edge ring; this wrapper adds only the
+/// width and rows a consumer needs to size its bands.
+pub(crate) struct ScrollBands {
+    tracker: Tracker,
+}
+
+impl ScrollBands {
+    pub(crate) fn new(tracker: Tracker) -> Self {
+        Self { tracker }
+    }
+
+    pub(crate) fn width(&self) -> u32 {
+        self.tracker.width()
+    }
+
+    /// The whole picture, for the one consumer that cannot stream: the clipboard wants a
+    /// contiguous bitmap, and about 145 MB at thirty thousand rows is what that costs. It is the
+    /// clipboard's price, not a leak (docs/35 §15).
+    pub(crate) fn into_image(self) -> (u32, u32, Vec<u8>) {
+        self.tracker.into_image()
+    }
+}
+
+impl crate::ports::BandSource for ScrollBands {
+    fn rows(&self) -> u32 {
+        self.tracker.rows()
+    }
+
+    fn read_rows(&mut self, first_row: u32, rows: u32, out: &mut Vec<u8>) -> bool {
+        let row_bytes = self.tracker.width() as usize * 4;
+        out.resize(rows as usize * row_bytes, 0);
+        self.tracker.read_rows(first_row, rows, out)
     }
 }

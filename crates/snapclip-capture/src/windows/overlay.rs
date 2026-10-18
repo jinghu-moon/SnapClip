@@ -72,7 +72,7 @@ use crate::region::Destination;
 use crate::ports::{ArtifactWriter, CaptureEventSink, ClipboardWriter, OverlayPlatform};
 use crate::preferences::OverlayPreferences;
 use crate::sampler::{ColorFormat, ColorSampler};
-use crate::session::{CaptureSession, CapturedFrame, ExportOutcome};
+use crate::session::{CaptureSession, ExportOutcome};
 use crate::window_detection::model::RequestId;
 use crate::window_detection::{
     DEFAULT_DWELL_MS, DEFAULT_HOVER_REVALIDATE_MS, DEFAULT_SNAP_RADIUS_PX, DeepTarget, Exclusions,
@@ -81,7 +81,7 @@ use crate::window_detection::{
     RingOptions, RingRole, WindowSnapshot, WindowTarget, chain_rings, classify_replacement,
     next_visible_stop, out_quad, preview_bounds, stops_from,
 };
-use crate::{CaptureError, CaptureResult, CaptureState, PixelFormat};
+use crate::{CaptureError, CaptureResult, CaptureState};
 
 use super::capture_worker::{self, CaptureWorker, StartRequest};
 use super::detection_worker::{self, DetectionResult, DetectionWorker};

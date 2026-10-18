@@ -10,6 +10,7 @@
 //!   It writes a zoomed crop of one text region so the numbers can be checked by eye.
 
 mod alloc_probe;
+mod bands;
 mod codecs;
 mod huffman_ab;
 mod quality;
@@ -38,6 +39,10 @@ fn main() {
         println!("{}", scroll::report());
         return;
     }
+    if arguments.iter().any(|argument| argument == "--bands") {
+        println!("{}", bands::report());
+        return;
+    }
     if arguments.iter().any(|argument| argument == "--transcode") {
         println!("{}", transcode::report());
         return;
@@ -51,7 +56,7 @@ fn main() {
         return;
     }
     if !arguments.iter().any(|argument| argument == "--report") {
-        println!("codec-bench: pass --report, --quality, --scroll, --transcode or --huffman-ab");
+        println!("codec-bench: pass --report, --quality, --scroll, --transcode, --bands or --huffman-ab");
         return;
     }
     run_report();

@@ -9,6 +9,7 @@
 use super::*;
 use crate::scroll::layout::{self, Button, Layout};
 use crate::scroll::{Auto, Status};
+use crate::windows::export_worker::ExportSource;
 use crate::windows::scroll_worker::{ScrollWorker, Spec};
 use crate::windows::win::d2d::{ScrollPanelView, frame_band};
 use std::sync::OnceLock;
@@ -399,7 +400,7 @@ impl OverlayController {
         let dpi = run.dpi;
         let image = run.worker.finish();
         self.release_session();
-        let Some((width, rows, bgra)) = image else {
+        let Some(bands) = image else {
             eprintln!("[snapclip][scroll] finished reason={reason}: no frame ever arrived");
             let error = CaptureError::CaptureFailed("the scroll session captured nothing".into());
             self.sink
@@ -407,31 +408,16 @@ impl OverlayController {
             self.sink.on_state(&session_id, CaptureState::Idle, None);
             return;
         };
+        // The long image stays as bands: the writer walks them, and only the clipboard ever
+        // materialises the whole picture (docs/35 §15). Materialising here is what used to cost
+        // 145 MB on the file path.
+        let width = bands.width();
+        let rows = crate::ports::BandSource::rows(&bands);
         eprintln!("[snapclip][scroll] finished reason={reason} image={width}x{rows}");
-        let prepared = SelectionPixels {
-            // 拼接长图没有四角可言：圆角是面板对单帧选区的要求。
-            corner_radius: 0,
-            frame: CapturedFrame {
-                width,
-                height: rows,
-                pixel_format: PixelFormat::Bgra8Unorm,
-                captured_at_unix_ms: snapclip_model::unix_time_ms(),
-                provider: SCROLL_PROVIDER,
-                // A stitched long image is a composed picture, not a monitor's frozen frame, so
-                // it has no screen position to report. `None` is that statement — and it is not
-                // `(0, 0)`, which is the primary monitor's real origin (see
-                // `SelectionPixels::origin`). The pin source reads `None` as "this one cannot be
-                // pinned back onto the desktop".
-                origin: None,
-            },
-            region: Rect::new(0, 0, width as i32, rows as i32),
-            bgra,
-            origin: None,
-        };
         let job = ExportJob {
             generation: 0,
             session_id: session_id.clone(),
-            prepared,
+            source: std::sync::Mutex::new(ExportSource::bands(bands)),
             dpi,
             monitor_device_name: None,
             notify_thread: unsafe { GetCurrentThreadId() },
@@ -463,9 +449,36 @@ impl OverlayController {
         clipboard: Arc<dyn ClipboardWriter>,
         desktop: Result<std::path::PathBuf, String>,
     ) -> ExportExecutor {
-        let write = Self::export_executor(writer);
         Box::new(move |job: &ExportJob| {
-            let artifact = write(job)?;
+            // A scroll session's long image reaches the writer as bands; a screenshot arrives whole.
+            // This is the step that keeps thirty thousand rows out of memory on the file path.
+            let mut source = job.source.lock().expect("the export source is never poisoned");
+            let artifact = match source.spec() {
+                Some(spec) => {
+                    let bands = source
+                        .bands_mut()
+                        .expect("a spec is only present while the bands are");
+                    writer.write_bands(
+                        &job.session_id,
+                        &spec,
+                        bands,
+                        job.dpi,
+                        job.monitor_device_name.clone(),
+                    )?
+                }
+                None => {
+                    let prepared = source.pixels().ok_or_else(|| {
+                        CaptureError::EncodeFailed("an export carried neither pixels nor bands".into())
+                    })?;
+                    writer.write(
+                        &job.session_id,
+                        prepared,
+                        job.dpi,
+                        job.monitor_device_name.clone(),
+                    )?
+                }
+            };
+            drop(source);
             if let Some(path) = artifact.png_path() {
                 let copied = desktop
                     .clone()
@@ -478,7 +491,13 @@ impl OverlayController {
                     Err(error) => eprintln!("[snapclip][scroll] desktop copy failed: {error}"),
                 }
             }
-            let image = &job.prepared;
+            // The clipboard is the one consumer that cannot stream: it wants one contiguous
+            // bitmap, which is materialised here and nowhere else (docs/35 §15).
+            let mut source = job
+                .source
+                .lock()
+                .expect("the export source is never poisoned");
+            let image = source.materialise()?;
             let started = Instant::now();
             match clipboard.copy_image(
                 image.frame.width,
@@ -563,7 +582,9 @@ mod tests {
         use std::path::PathBuf;
         use std::sync::{Arc, Mutex};
 
-        use super::super::{CapturedFrame, ExportJob, OverlayController, SCROLL_PROVIDER};
+        use super::super::{ExportJob, OverlayController, SCROLL_PROVIDER};
+        use crate::session::CapturedFrame;
+        use crate::windows::export_worker::ExportSource;
         use crate::artifact::SelectionPixels;
         use crate::geometry::Rect;
         use crate::ports::{ArtifactWriter, ClipboardWriter};
@@ -632,7 +653,7 @@ mod tests {
             ExportJob {
                 generation: 1,
                 session_id: "s1".into(),
-                prepared: SelectionPixels {
+                source: Mutex::new(ExportSource::whole(SelectionPixels {
             // 拼接长图没有四角可言：圆角是面板对单帧选区的要求。
             corner_radius: 0,
                     frame: CapturedFrame {
@@ -646,7 +667,7 @@ mod tests {
                     region: Rect::new(0, 0, width as i32, rows as i32),
                     bgra: vec![0; width as usize * rows as usize * 4],
                     origin: None,
-                },
+                })),
                 dpi: 144,
                 monitor_device_name: None,
                 notify_thread: 0,
@@ -687,17 +708,82 @@ mod tests {
                 std::fs::read(dir.join("desktop").join("SnapClip-s1.png")).unwrap(),
                 b"png"
             );
+            // One guard: locking twice in one expression is a self-deadlock.
+            let source = job.source.lock().expect("unlocked");
+            let pixels = source.pixels().expect("the job materialised");
             assert_eq!(
                 *clipboard.0.lock().unwrap(),
                 vec![(
                     1250,
                     25826,
-                    job.prepared.bgra.as_ptr() as usize,
-                    job.prepared.bgra.len(),
+                    pixels.bgra.as_ptr() as usize,
+                    pixels.bgra.len(),
                     Some(dir.join("history.png"))
                 )]
             );
             std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        /// A long image reaches the writer as bands, not as one picture (`docs/35 §15`).
+        #[test]
+        fn a_long_image_reaches_the_writer_as_bands() {
+            #[derive(Default)]
+            struct Bands {
+                rows: std::sync::atomic::AtomicU32,
+                calls: std::sync::atomic::AtomicU32,
+            }
+            impl ArtifactWriter for Bands {
+                fn write(
+                    &self,
+                    _session_id: &str,
+                    _prepared: &SelectionPixels,
+                    _dpi: u32,
+                    _monitor_device_name: Option<String>,
+                ) -> CaptureResult<CaptureArtifact> {
+                    panic!("a banded export must not be handed one whole picture");
+                }
+                fn write_bands(
+                    &self,
+                    session_id: &str,
+                    spec: &crate::ports::SelectionSpec,
+                    bands: &mut dyn crate::ports::BandSource,
+                    dpi: u32,
+                    _monitor_device_name: Option<String>,
+                ) -> CaptureResult<CaptureArtifact> {
+                    self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    self.rows
+                        .store(crate::ports::BandSource::rows(bands), std::sync::atomic::Ordering::SeqCst);
+                    Ok(CaptureArtifact {
+                        session_id: session_id.into(),
+                        width: spec.region.width() as u32,
+                        height: bands.rows(),
+                        dpi,
+                        pixel_format: PixelFormat::Bgra8Unorm,
+                        captured_at_unix_ms: 0,
+                        monitor_device_name: None,
+                        payload: CapturePayload::PngFile {
+                            path: PathBuf::from("bands.png"),
+                        },
+                    })
+                }
+            }
+            let writer = Arc::new(Bands::default());
+            let clipboard = Arc::new(Recorder::default());
+            let executor = OverlayController::scroll_executor(writer.clone(), clipboard, Ok(scratch("bands")));
+            let bands = crate::scroll::test_bands();
+            let expected = crate::ports::BandSource::rows(&bands);
+            let job = ExportJob {
+                generation: 1,
+                session_id: "s1".into(),
+                source: Mutex::new(ExportSource::bands(bands)),
+                dpi: 144,
+                monitor_device_name: None,
+                notify_thread: 0,
+                executor: Box::new(|_| unreachable!()),
+            };
+            executor(&job).expect("the banded write succeeds");
+            assert_eq!(writer.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(writer.rows.load(std::sync::atomic::Ordering::SeqCst), expected);
         }
 
         /// A desktop that cannot be resolved does not withhold the clipboard or the history entry.

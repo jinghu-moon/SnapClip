@@ -720,9 +720,13 @@ impl OverlayController {
     /// a scroll session's long image alike.
     pub(super) fn export_executor(writer: Arc<dyn ArtifactWriter>) -> ExportExecutor {
         Box::new(move |job: &ExportJob| {
+            let source = job.source.lock().expect("the export source is never poisoned");
+            let prepared = source.pixels().ok_or_else(|| {
+                CaptureError::EncodeFailed("a banded export needs the banded writer".into())
+            })?;
             writer.write(
                 &job.session_id,
-                &job.prepared,
+                prepared,
                 job.dpi,
                 job.monitor_device_name.clone(),
             )
@@ -905,7 +909,9 @@ impl OverlayController {
         let job = ExportJob {
             generation: 0,
             session_id: session_id.clone(),
-            prepared,
+            source: std::sync::Mutex::new(crate::windows::export_worker::ExportSource::whole(
+                prepared,
+            )),
             dpi,
             monitor_device_name: None,
             notify_thread: unsafe { GetCurrentThreadId() },

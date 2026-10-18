@@ -197,7 +197,7 @@ impl ScrollWorker {
     /// cost (docs/35 §5.1): working memory is the two edge buffers, temporary storage is the tile
     /// file, and the file size belongs to the encoder. A session that ends with a full disk or a
     /// failed seal has its reason on stderr already; this line says how close it came.
-    pub(crate) fn finish(mut self) -> Option<(u32, u32, Vec<u8>)> {
+    pub(crate) fn finish(mut self) -> Option<crate::scroll::ScrollBands> {
         let tracker = self.join()?;
         let budgets = tracker.budgets();
         eprintln!(
@@ -208,7 +208,7 @@ impl ScrollWorker {
             budgets.pixel_rows,
             budgets.temp_bytes as f64 / 1e6,
         );
-        Some(tracker.into_image())
+        Some(crate::scroll::ScrollBands::new(tracker))
     }
 
     fn join(&mut self) -> Option<Tracker> {

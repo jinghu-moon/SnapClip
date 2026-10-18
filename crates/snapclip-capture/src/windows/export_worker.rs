@@ -52,13 +52,123 @@ pub struct ExportJob {
     /// current is dropped, and its artifact deleted.
     pub generation: u64,
     pub session_id: String,
-    /// What to encode: a screenshot's selection, or a finished scroll session's long image.
-    pub prepared: SelectionPixels,
+    /// What to encode: a screenshot's selection, or a finished scroll session's bands.
+    ///
+    /// Behind a `Mutex` because the executor is boxed as `Fn + Sync` and called from the worker
+    /// thread: materialising a band source for the clipboard is the one mutation, and a guard is
+    /// cheaper than reshaping the executor around it (docs/35 §15).
+    pub(crate) source: Mutex<ExportSource>,
     pub dpi: u32,
     pub monitor_device_name: Option<String>,
     /// Overlay UI thread id to wake with [`EXPORT_READY_MESSAGE`].
     pub notify_thread: u32,
     pub executor: ExportExecutor,
+}
+
+/// What an export encodes.
+///
+/// A screenshot arrives as one `SelectionPixels`. A finished scroll session arrives as row bands,
+/// because materialising thirty thousand rows only to write them out again is the 145 MB peak that
+/// stage 2 took off the canvas (docs/35 §15). Bands are materialised only for a consumer that cannot
+/// stream, which is the clipboard's contiguous bitmap.
+pub(crate) enum ExportSource {
+    Whole(SelectionPixels),
+    Bands {
+        /// Taken at the one materialisation.
+        bands: Option<crate::scroll::ScrollBands>,
+        /// Filled by that materialisation.
+        pixels: Option<SelectionPixels>,
+        /// Everything about the picture except its pixels, so a banded writer can name it.
+        spec: crate::ports::SelectionSpec,
+    },
+}
+
+impl ExportSource {
+    pub(crate) fn whole(pixels: SelectionPixels) -> Self {
+        Self::Whole(pixels)
+    }
+
+    /// A finished scroll session's bands, plus the metadata their artifact will be written under.
+    pub(crate) fn bands(bands: crate::scroll::ScrollBands) -> Self {
+        let width = bands.width();
+        let rows = crate::ports::BandSource::rows(&bands);
+        let spec = crate::ports::SelectionSpec {
+            region: crate::geometry::Rect::new(0, 0, width as i32, rows as i32),
+            pixel_format: snapclip_model::PixelFormat::Bgra8Unorm,
+            captured_at_unix_ms: snapclip_model::unix_time_ms(),
+            // A stitched long image is composed, not a monitor's frozen frame, so it has no screen
+            // position to report — and `None` is not `(0, 0)`.
+            origin: None,
+            corner_radius: 0,
+        };
+        Self::Bands { bands: Some(bands), pixels: None, spec }
+    }
+
+    /// The pixels when they exist as a whole picture, either from the start or after
+    /// `materialise`.
+    pub(crate) fn pixels(&self) -> Option<&SelectionPixels> {
+        match self {
+            Self::Whole(pixels) => Some(pixels),
+            Self::Bands { pixels, .. } => pixels.as_ref(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pixels_mut(&mut self) -> Option<&mut SelectionPixels> {
+        match self {
+            Self::Whole(pixels) => Some(pixels),
+            Self::Bands { pixels, .. } => pixels.as_mut(),
+        }
+    }
+
+    /// The artifact metadata, which a banded source has before it has pixels.
+    pub(crate) fn spec(&self) -> Option<crate::ports::SelectionSpec> {
+        match self {
+            Self::Whole(_) => None,
+            Self::Bands { spec, .. } => Some(*spec),
+        }
+    }
+
+    /// The bands, while they are still bands.
+    pub(crate) fn bands_mut(&mut self) -> Option<&mut crate::scroll::ScrollBands> {
+        match self {
+            Self::Whole(_) => None,
+            Self::Bands { bands, .. } => bands.as_mut(),
+        }
+    }
+
+    /// The whole picture, materialising a band source once for a consumer that cannot stream. The
+    /// clipboard wants one contiguous bitmap, so about 145 MB at thirty thousand rows is its price
+    /// rather than a leak (docs/35 §15).
+    pub(crate) fn materialise(&mut self) -> CaptureResult<&SelectionPixels> {
+        if matches!(self, Self::Whole(_)) {
+            return Ok(self.pixels().expect("a whole source has pixels"));
+        }
+        let Self::Bands { bands, pixels, spec } = self else {
+            unreachable!("the whole case returned above")
+        };
+        if pixels.is_none() {
+            let Some(bands) = bands.take() else {
+                return Err(CaptureError::EncodeFailed("the bands were already taken".into()));
+            };
+            let (width, height, bgra) = bands.into_image();
+            *pixels = Some(SelectionPixels {
+                frame: crate::session::CapturedFrame {
+                    width,
+                    height,
+                    pixel_format: spec.pixel_format,
+                    captured_at_unix_ms: spec.captured_at_unix_ms,
+                    provider: "scroll-bands",
+                    origin: spec.origin,
+                },
+                region: spec.region,
+                bgra,
+                origin: spec.origin,
+                corner_radius: spec.corner_radius,
+            });
+        }
+        Ok(pixels.as_ref().expect("just filled"))
+    }
 }
 
 /// An export that failed, with the stage that produced it.
@@ -380,9 +490,10 @@ fn delete_quietly(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::{
-        CompletedExport, EXPORT_READY_MESSAGE, ExportFailure, ExportJob, ExportWorker, Mailbox,
-        WorkerEvent,
+        CompletedExport, EXPORT_READY_MESSAGE, ExportFailure, ExportJob, ExportSource, ExportWorker,
+        Mailbox, WorkerEvent,
     };
+    use std::sync::Mutex;
     use crate::artifact::SelectionPixels;
     use crate::geometry::Rect;
     use crate::session::CapturedFrame;
@@ -445,7 +556,7 @@ mod tests {
         ExportJob {
             generation: 0,
             session_id: "session-test".into(),
-            prepared: test_selection_pixels(),
+            source: Mutex::new(ExportSource::whole(test_selection_pixels())),
             dpi: 96,
             monitor_device_name: Some(r"\\.\DISPLAY1".into()),
             notify_thread: unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() },
@@ -635,7 +746,8 @@ mod tests {
         let seen_in_executor = seen.clone();
         let worker = ExportWorker::new();
         let mut job = new_job(move |job: &ExportJob| {
-            let prepared = &job.prepared;
+            let source = job.source.lock().expect("unlocked");
+            let prepared = source.pixels().expect("a whole source");
             *seen_in_executor.lock().unwrap() = Some((
                 job.session_id.clone(),
                 prepared.region.left,
@@ -645,7 +757,8 @@ mod tests {
             ));
             Err(CaptureError::InvalidState("stop here".into()))
         });
-        job.prepared.region = Rect::new(2, 3, 9, 11);
+        job.source.lock().expect("unlocked").pixels_mut().expect("a whole source").region =
+            Rect::new(2, 3, 9, 11);
         job.dpi = 144;
         job.monitor_device_name = Some(r"\\.\DISPLAY3".into());
         job.session_id = "session-metadata".into();
