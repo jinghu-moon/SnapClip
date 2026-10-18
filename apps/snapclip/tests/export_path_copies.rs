@@ -241,3 +241,101 @@ fn the_export_path_allocates_no_second_full_copy() {
     );
     let _ = std::fs::remove_dir_all(directory);
 }
+
+
+/// A band source over a page the caller already owns: the shape a scroll session hands the writer.
+struct Bands<'a> {
+    image: &'a [u8],
+    width: u32,
+    rows: u32,
+}
+
+impl snapclip_capture::ports::BandSource for Bands<'_> {
+    fn rows(&self) -> u32 {
+        self.rows
+    }
+
+    fn read_rows(&mut self, first_row: u32, rows: u32, out: &mut Vec<u8>) -> bool {
+        let row_bytes = self.width as usize * 4;
+        let start = first_row as usize * row_bytes;
+        let end = (first_row + rows) as usize * row_bytes;
+        if end > self.image.len() {
+            return false;
+        }
+        out.clear();
+        out.extend_from_slice(&self.image[start..end]);
+        true
+    }
+}
+
+/// The banded path must not hold a second whole image either (`docs/35 §16`).
+///
+/// **Needs the application closed.** This test target links the shell crate, so cargo rebuilds
+/// `target/debug/snapclip-app.exe`; while a running instance holds that file the link fails with
+/// `os error 5` and the probe cannot run. Close SnapClip, then:
+///
+/// ```text
+/// cargo test --release -p snapclip-app --test export_path_copies -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "L4: needs the running app closed, and a release build for a real 20,000 px export"]
+fn the_banded_export_never_owns_the_whole_image() {
+    let (width, height) = (1280u32, 20_000u32);
+    let row_bytes = width as usize * 4;
+    // The fixture is the caller's own page, allocated before the measurement, exactly like the
+    // whole-image probe above.
+    let mut image = Vec::with_capacity(row_bytes * height as usize);
+    for y in 0..height {
+        for x in 0..width {
+            let ink = (x / 7) % 5 == 0 && (y % 13) < 9;
+            let value = if ink { 32 } else { 244 };
+            image.extend_from_slice(&[value, value, value, 255]);
+        }
+    }
+    let raw_len = image.len();
+    let directory = root("bands");
+    let writer = HistoryArtifactWriter::new(directory.clone());
+    let spec = snapclip_capture::ports::SelectionSpec {
+        region: Rect::new(0, 0, width as i32, height as i32),
+        pixel_format: PixelFormat::Bgra8Unorm,
+        captured_at_unix_ms: 1_700_000_000_000,
+        origin: Some(snapclip_model::geometry::Point::new(0, 0)),
+        corner_radius: 0,
+    };
+
+    let before = CountingAllocator::live();
+    CountingAllocator::arm(raw_len);
+    let artifact = writer
+        .write_bands(
+            "capture-p403-bands",
+            &spec,
+            &mut Bands {
+                image: &image,
+                width,
+                rows: height,
+            },
+            96,
+            None,
+        )
+        .expect("the banded export must succeed");
+    let extra = CountingAllocator::peak() - before;
+    let full_copies = CountingAllocator::disarm();
+
+    println!(
+        "[P4.03 bands] {width}x{height} raw {raw_len} B ({} MiB), artifact {} B,          export peak-live {extra} B ({} KiB), full-copy allocations {full_copies}",
+        raw_len / (1024 * 1024),
+        artifact_len(&artifact),
+        extra / 1024,
+    );
+
+    assert_eq!((artifact.width, artifact.height), (width, height));
+    assert_eq!(
+        full_copies, 0,
+        "the banded export allocated {full_copies} buffer(s) at least as large as the image",
+    );
+    assert!(
+        extra < raw_len / 4,
+        "the banded export held {extra} B over live for a {raw_len} B image; a banded writer          should hold a band, not a quarter of the picture",
+    );
+    let _ = std::fs::remove_dir_all(directory);
+}

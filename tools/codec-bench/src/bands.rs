@@ -72,11 +72,30 @@ fn encode_whole(page: &[u8]) -> u64 {
     len
 }
 
-pub fn report() -> String {
+/// Both paths measured on the same long page, in bytes and milliseconds.
+pub struct Bands {
+    pub banded_bytes: u64,
+    pub banded_ms: f64,
+    pub banded_peak: usize,
+    pub whole_bytes: u64,
+    pub whole_ms: f64,
+    pub whole_peak: usize,
+}
+
+/// The banded writer must stay within this fraction of the whole-picture peak (docs/35 §16).
+pub const BANDED_PEAK_RATIO: f64 = 0.10;
+/// And within this absolute ceiling, so a regression in the *whole* path cannot hide the ratio.
+pub const BANDED_PEAK_CEILING: usize = 16 << 20;
+
+pub fn compare() -> Bands {
     let page: Vec<u8> = (0..WIDTH as usize * ROWS as usize * 4)
         .map(|i| (i % 251) as u8)
         .collect();
 
+    // The peak counter is process-wide, so hold the lock: a parallel test's allocations must not
+    // be mistaken for ours (the same reason `webp_is_refused_before_it_can_allocate_a_long_image`
+    // takes it).
+    let _serial = alloc_probe::test_guard();
     let started = Instant::now();
     let (banded_bytes, banded_peak) = alloc_probe::peak_extra(|| encode_bands(&page));
     let banded_ms = started.elapsed().as_secs_f64() * 1e3;
@@ -85,18 +104,78 @@ pub fn report() -> String {
     let (whole_bytes, whole_peak) = alloc_probe::peak_extra(|| encode_whole(&page));
     let whole_ms = started.elapsed().as_secs_f64() * 1e3;
 
-    format!(
-        "bands {WIDTH}x{ROWS}: output {:.2} MB, {:.0} ms, peak extra {:.1} MB\n\
-         whole {WIDTH}x{ROWS}: output {:.2} MB, {:.0} ms, peak extra {:.1} MB\n\
-         verdict: the banded writer peaks at {:.1} MB against {:.1} MB when the exporter owns the whole picture ({:.1}x less)",
-        banded_bytes as f64 / 1e6,
+    Bands {
+        banded_bytes,
         banded_ms,
-        banded_peak as f64 / 1e6,
-        whole_bytes as f64 / 1e6,
+        banded_peak,
+        whole_bytes,
         whole_ms,
-        whole_peak as f64 / 1e6,
-        banded_peak as f64 / 1e6,
-        whole_peak as f64 / 1e6,
-        whole_peak as f64 / banded_peak.max(1) as f64,
+        whole_peak,
+    }
+}
+
+/// Whether the banded path is still doing what it exists for; `Err` carries the diagnosis.
+pub fn check(bands: &Bands) -> Result<(), String> {
+    let ratio = bands.banded_peak as f64 / bands.whole_peak.max(1) as f64;
+    if ratio > BANDED_PEAK_RATIO {
+        return Err(format!(
+            "banded peak {:.1} MB is {:.1}% of the whole picture's {:.1} MB, over the {:.0}% ceiling",
+            bands.banded_peak as f64 / 1e6,
+            ratio * 100.0,
+            bands.whole_peak as f64 / 1e6,
+            BANDED_PEAK_RATIO * 100.0
+        ));
+    }
+    if bands.banded_peak > BANDED_PEAK_CEILING {
+        return Err(format!(
+            "banded peak {:.1} MB is over the {:.0} MB absolute ceiling",
+            bands.banded_peak as f64 / 1e6,
+            BANDED_PEAK_CEILING as f64 / 1e6
+        ));
+    }
+    Ok(())
+}
+
+pub fn report() -> String {
+    let bands = compare();
+    let verdict = match check(&bands) {
+        Ok(()) => format!(
+            "verdict: the banded writer peaks at {:.1} MB against {:.1} MB when the exporter owns the whole picture ({:.1}x less), inside the {:.0}% / {:.0} MB targets",
+            bands.banded_peak as f64 / 1e6,
+            bands.whole_peak as f64 / 1e6,
+            bands.whole_peak as f64 / bands.banded_peak.max(1) as f64,
+            BANDED_PEAK_RATIO * 100.0,
+            BANDED_PEAK_CEILING as f64 / 1e6
+        ),
+        Err(diagnosis) => format!("TARGET MISSED: {diagnosis}"),
+    };
+    format!(
+        "bands {WIDTH}x{ROWS}: output {:.2} MB, {:.0} ms, peak extra {:.1} MB
+         whole {WIDTH}x{ROWS}: output {:.2} MB, {:.0} ms, peak extra {:.1} MB
+         {verdict}",
+        bands.banded_bytes as f64 / 1e6,
+        bands.banded_ms,
+        bands.banded_peak as f64 / 1e6,
+        bands.whole_bytes as f64 / 1e6,
+        bands.whole_ms,
+        bands.whole_peak as f64 / 1e6,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The stage 4 peak target, as a test.
+    ///
+    /// Ignored for the same reason as the scroll targets: two encodes of a 30 000-row page belong
+    /// in a release run. `--assert` is the entry point that checks them together.
+    #[test]
+    #[ignore = "release speed: two 30 000-row encodes; `--assert` runs them in release"]
+    fn the_banded_writer_stays_under_a_tenth_of_the_whole_picture() {
+        let bands = compare();
+        if let Err(diagnosis) = check(&bands) {
+            panic!("{diagnosis}");
+        }
+    }
 }

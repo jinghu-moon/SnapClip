@@ -167,10 +167,10 @@ pub trait ArtifactWriter: Send + Sync + 'static {
 
     /// Write a picture that never exists whole (docs/35 §13.4).
     ///
-    /// The default materialises the rows and calls [`ArtifactWriter::write`], so a writer
-    /// that only knows the whole-image shape keeps working. The shell's writer overrides it
-    /// and streams the bands, which is what keeps a thirty-thousand-row capture from costing
-    /// its whole image in memory on the way to a file.
+    /// There is no default: a writer must say what it does with rows. A writer that genuinely
+    /// needs the whole picture can call [`whole_from_bands`] and delegate to
+    /// [`ArtifactWriter::write`], but it has to say so at the call site, because the silent
+    /// fallback is the 154 MB path this method exists to remove.
     fn write_bands(
         &self,
         session_id: &str,
@@ -178,37 +178,49 @@ pub trait ArtifactWriter: Send + Sync + 'static {
         bands: &mut dyn BandSource,
         dpi: u32,
         monitor_device_name: Option<String>,
-    ) -> crate::CaptureResult<snapclip_model::CaptureArtifact> {
-        let width = u32::try_from(spec.region.width()).unwrap_or(0);
-        let rows = bands.rows();
-        if width == 0 || rows == 0 || u32::try_from(spec.region.height()).ok() != Some(rows) {
-            return Err(crate::CaptureError::EncodeFailed(format!(
-                "{}x{} is not a drawable region",
-                spec.region.width(),
-                spec.region.height()
-            )));
-        }
-        let mut bgra = Vec::new();
-        bgra.resize(rows as usize * width as usize * 4, 0);
-        if !bands.read_rows(0, rows, &mut bgra) {
-            return Err(crate::CaptureError::EncodeFailed(
-                "band source could not supply its rows".into(),
-            ));
-        }
-        let prepared = crate::artifact::SelectionPixels {
-            frame: crate::session::CapturedFrame {
-                width,
-                height: rows,
-                pixel_format: spec.pixel_format,
-                captured_at_unix_ms: spec.captured_at_unix_ms,
-                provider: "band-source",
-                origin: spec.origin,
-            },
-            region: spec.region,
-            bgra,
-            origin: spec.origin,
-            corner_radius: spec.corner_radius,
-        };
-        self.write(session_id, &prepared, dpi, monitor_device_name)
+    ) -> crate::CaptureResult<snapclip_model::CaptureArtifact>;
+}
+
+/// Materialise a band source into a whole picture.
+///
+/// This used to be the **default** `write_bands`, which meant any implementor that did not care
+/// silently fell back to holding the whole image: exactly the 154 MB path the banded writer
+/// exists to remove. It is now an explicit call, so a writer that wants it has to say so
+/// (docs/35 §16).
+pub fn whole_from_bands(
+    spec: &SelectionSpec,
+    bands: &mut dyn BandSource,
+) -> crate::CaptureResult<crate::artifact::SelectionPixels> {
+
+    let width = u32::try_from(spec.region.width()).unwrap_or(0);
+    let rows = bands.rows();
+    if width == 0 || rows == 0 || u32::try_from(spec.region.height()).ok() != Some(rows) {
+        return Err(crate::CaptureError::EncodeFailed(format!(
+            "{}x{} is not a drawable region",
+            spec.region.width(),
+            spec.region.height()
+        )));
     }
+    let mut bgra = Vec::new();
+    bgra.resize(rows as usize * width as usize * 4, 0);
+    if !bands.read_rows(0, rows, &mut bgra) {
+        return Err(crate::CaptureError::EncodeFailed(
+            "band source could not supply its rows".into(),
+        ));
+    }
+    let prepared = crate::artifact::SelectionPixels {
+        frame: crate::session::CapturedFrame {
+            width,
+            height: rows,
+            pixel_format: spec.pixel_format,
+            captured_at_unix_ms: spec.captured_at_unix_ms,
+            provider: "band-source",
+            origin: spec.origin,
+        },
+        region: spec.region,
+        bgra,
+        origin: spec.origin,
+        corner_radius: spec.corner_radius,
+    };
+        Ok(prepared)
 }

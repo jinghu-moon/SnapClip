@@ -622,6 +622,20 @@ mod tests {
                     },
                 })
             }
+
+            /// This double writes a placeholder file and does not care where the rows came from,
+            /// so it asks for the explicit materialisation rather than getting it by default.
+            fn write_bands(
+                &self,
+                session_id: &str,
+                spec: &crate::ports::SelectionSpec,
+                bands: &mut dyn crate::ports::BandSource,
+                dpi: u32,
+                monitor_device_name: Option<String>,
+            ) -> CaptureResult<CaptureArtifact> {
+                let prepared = crate::ports::whole_from_bands(spec, bands)?;
+                self.write(session_id, &prepared, dpi, monitor_device_name)
+            }
         }
 
         /// Records what reached the clipboard: the size, where the pixels lived, and the PNG.

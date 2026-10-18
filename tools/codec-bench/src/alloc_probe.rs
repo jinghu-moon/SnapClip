@@ -94,7 +94,6 @@ mod tests {
 /// The counter is global, so two tests measuring at once would read each other's allocations and a
 /// refusal that allocates nothing could look like one that allocates 64 KiB. A test that takes this
 /// guard is the only one measuring for as long as it holds it.
-#[cfg(test)]
 pub fn test_guard() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())

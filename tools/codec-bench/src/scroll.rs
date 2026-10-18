@@ -131,6 +131,90 @@ fn megabytes(bytes: usize) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
 
+
+/// The three sequences whose products must be the page itself (docs/35 §5).
+///
+/// Each returns `(name, matched)` so a caller can print all three before failing on any of them.
+pub fn sequences_exact() -> [(&'static str, bool); 3] {
+    [("down", down_only_exact()), ("down up down", down_up_down_exact()), ("upward first", upward_first_exact())]
+}
+
+fn down_only_exact() -> bool {
+    run(VIEW, STEP).correct
+}
+
+/// Drive one page through a `[i64]` sequence of steps and return whether the image is the page.
+fn run_sequence(start: usize, page_rows: usize, steps: &[i64]) -> bool {
+    const UP_SCALE: i64 = 120;
+    let page = page(WIDTH, page_rows);
+    let view = VIEW;
+    let mut probe = snapclip_capture::scroll::probe::ScrollProbe::new(
+        &frame(&page, WIDTH, start, view),
+        WIDTH as u32,
+        view as u32,
+        WIDTH as u32 / 8,
+    );
+    let mut top = start as i64;
+    let (mut first, mut last) = (top, top + view as i64);
+    for step in steps {
+        top += step * UP_SCALE;
+        let report = probe.push(&frame(&page, WIDTH, top as usize, view));
+        if report.lost {
+            return false;
+        }
+        first = first.min(top);
+        last = last.max(top + view as i64);
+    }
+    let (width, rows, image) = probe.into_image();
+    width as usize == WIDTH
+        && rows as i64 == last - first
+        && image == page[first as usize * WIDTH * 4..last as usize * WIDTH * 4]
+}
+
+fn down_up_down_exact() -> bool {
+    // Three steps down, two wheel notches up, two down.
+    run_sequence(0, 6 * STEP + VIEW, &[5, 5, 5, -1, -1, 5, 5])
+}
+
+fn upward_first_exact() -> bool {
+    // Starting mid page and crossing the start is the only way to reach `Prepended`.
+    run_sequence(4 * STEP, 8 * STEP + VIEW, &[-1, -1, 5, 5, 5])
+}
+
+/// The per-frame times over the full page, in microseconds: `(median, p99, max)`.
+///
+/// Only meaningful in a release build; a debug run is several times slower and is not what the
+/// targets are about.
+pub fn frame_times() -> (u64, u64, u64) {
+    // Three passes, then the median of each statistic. One pass takes the median already, but a
+    // single unlucky frame anywhere in the run moves that run's p99, and a gate that fails one run
+    // in four is worse than no gate; the pathology this checks for (the capacity-doubling memcpy)
+    // is present in every pass, so it survives the vote.
+    let mut p50s = Vec::new();
+    let mut p99s = Vec::new();
+    let mut maxes = Vec::new();
+    for _ in 0..3 {
+        let stitched = run(VIEW, STEP);
+        let mut sorted = stitched.stitch_us.clone();
+        sorted.sort_unstable();
+        if sorted.is_empty() {
+            return (0, 0, 0);
+        }
+        p50s.push(sorted[sorted.len() / 2]);
+        p99s.push(sorted[(sorted.len() * 99 / 100).min(sorted.len() - 1)]);
+        maxes.push(*sorted.last().unwrap_or(&0));
+    }
+    fn median(values: &mut [u64]) -> u64 {
+        values.sort_unstable();
+        values[values.len() / 2]
+    }
+    (median(&mut p50s), median(&mut p99s), median(&mut maxes))
+}
+
+/// The stage 4 targets, in the units they are checked in (docs/35 §16).
+pub const MAX_FRAME_US: u64 = 8_000;
+pub const P99_FRAME_US: u64 = 6_000;
+
 /// The whole `--scroll` report.
 pub fn report() -> String {
     let mut out = String::new();
@@ -287,31 +371,7 @@ mod tests {
     /// estimator refuses (its own tests move 1 to 90 rows upward against a 600-row step down).
     #[test]
     fn a_down_up_down_scroll_reproduces_the_page() {
-        const UP: i64 = 120;
-        let page = page(WIDTH, 6 * STEP + VIEW);
-        let view = VIEW;
-        let mut probe = snapclip_capture::scroll::probe::ScrollProbe::new(
-            &frame(&page, WIDTH, 0, view),
-            WIDTH as u32,
-            view as u32,
-            WIDTH as u32 / 8,
-        );
-        let mut top = 0i64;
-        let (mut first, mut last) = (0i64, view as i64);
-        for step in [STEP as i64, STEP as i64, STEP as i64, -UP, -UP, STEP as i64, STEP as i64] {
-            top += step;
-            let report = probe.push(&frame(&page, WIDTH, top as usize, view));
-            assert!(!report.lost, "the reversal lost the anchor at {top}");
-            first = first.min(top);
-            last = last.max(top + view as i64);
-        }
-        let (width, rows, image) = probe.into_image();
-        assert_eq!(width as usize, WIDTH);
-        assert_eq!(rows as i64, last - first, "the span is the rows the viewport visited");
-        assert!(
-            image == page[first as usize * WIDTH * 4..last as usize * WIDTH * 4],
-            "a down-up-down sequence changed the image"
-        );
+        assert!(down_up_down_exact(), "a down-up-down sequence changed the image");
     }
 
     /// Starting mid page and scrolling up first is the only sequence that reaches `Prepended`:
@@ -319,36 +379,22 @@ mod tests {
     /// is `Contained` (docs/35-baseline.md).
     #[test]
     fn scrolling_up_first_prepends_and_still_reproduces_the_page() {
-        const UP: i64 = 120;
-        let page = page(WIDTH, 8 * STEP + VIEW);
-        let view = VIEW;
-        let start = 4 * STEP;
-        let mut probe = snapclip_capture::scroll::probe::ScrollProbe::new(
-            &frame(&page, WIDTH, start, view),
-            WIDTH as u32,
-            view as u32,
-            WIDTH as u32 / 8,
-        );
-        let mut top = start as i64;
-        let (mut first, mut last) = (top, top + view as i64);
-        for step in [-UP, -UP, STEP as i64, STEP as i64, STEP as i64] {
-            top += step;
-            let report = probe.push(&frame(&page, WIDTH, top as usize, view));
-            assert!(!report.lost, "the upward step lost the anchor at {top}");
-            first = first.min(top);
-            last = last.max(top + view as i64);
-        }
-        let (width, rows, image) = probe.into_image();
-        assert_eq!(width as usize, WIDTH);
-        assert_eq!(
-            rows as i64,
-            last - first,
-            "the top edge must grow by the rows scrolled above the start"
-        );
         assert!(
-            image == page[first as usize * WIDTH * 4..last as usize * WIDTH * 4],
+            upward_first_exact(),
             "an upward-first sequence changed the image"
         );
+    }
+
+    /// The stage 4 pixel target, as a test: all three sequences, full-sized page.
+    ///
+    /// Ignored because the full page is what `--assert` measures in release; a debug build would
+    /// take minutes and the same three sequences run shorter in the tests above.
+    #[test]
+    #[ignore = "release speed: the full 30 000-row page; `--assert` runs it in release"]
+    fn the_three_sequences_reproduce_the_page() {
+        for (name, matched) in sequences_exact() {
+            assert!(matched, "the {name} sequence no longer reproduces the page");
+        }
     }
 
     #[test]

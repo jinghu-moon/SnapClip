@@ -33,8 +33,87 @@ const QUALITY_BAND_ROWS: usize = 64;
 /// Bits of zoom in the text-crop dump: enough to see 4:2:0 smear a one pixel stroke.
 const ZOOM: usize = 8;
 
+
+/// The stage 4 gate: the three targets from `docs/35 §16`, checked rather than described.
+///
+/// Everything is measured and printed **before** anything is judged, so a failure comes with the
+/// number that failed and not just a line number. The exit code is non-zero when a target misses,
+/// which is what lets a release check fail the run.
+fn assert_targets() {
+    let mut failures: Vec<String> = Vec::new();
+    println!("scroll capture targets (docs/35 §16)
+");
+
+    println!("product vs the page (pixel for pixel):");
+    for (name, matched) in scroll::sequences_exact() {
+        println!("  {name:<14} {}", if matched { "exact" } else { "CHANGED" });
+        if !matched {
+            failures.push(format!("the {name} sequence no longer reproduces the page"));
+        }
+    }
+
+    let (p50, p99, max) = scroll::frame_times();
+    println!(
+        "
+per frame: p50 {:.2} ms · p99 {:.2} ms · max {:.2} ms",
+        p50 as f64 / 1000.0,
+        p99 as f64 / 1000.0,
+        max as f64 / 1000.0
+    );
+    println!(
+        "  targets: p99 <= {:.1} ms · max <= {:.1} ms",
+        scroll::P99_FRAME_US as f64 / 1000.0,
+        scroll::MAX_FRAME_US as f64 / 1000.0
+    );
+    if p99 > scroll::P99_FRAME_US {
+        failures.push(format!(
+            "p99 {:0.2} ms is over the {:.1} ms target",
+            p99 as f64 / 1000.0,
+            scroll::P99_FRAME_US as f64 / 1000.0
+        ));
+    }
+    if max > scroll::MAX_FRAME_US {
+        failures.push(format!(
+            "the worst frame {:.2} ms is over the {:.1} ms target",
+            max as f64 / 1000.0,
+            scroll::MAX_FRAME_US as f64 / 1000.0
+        ));
+    }
+
+    let bands = bands::compare();
+    let ratio = bands.banded_peak as f64 / bands.whole_peak.max(1) as f64;
+    println!(
+        "
+assembly: banded {:.1} MB · whole {:.1} MB · {:.1}% (target <= {:.0}%, ceiling {:.0} MB)",
+        bands.banded_peak as f64 / 1e6,
+        bands.whole_peak as f64 / 1e6,
+        ratio * 100.0,
+        bands::BANDED_PEAK_RATIO * 100.0,
+        bands::BANDED_PEAK_CEILING as f64 / 1e6
+    );
+    if let Err(diagnosis) = bands::check(&bands) {
+        failures.push(diagnosis);
+    }
+
+    if failures.is_empty() {
+        println!("
+all three targets hold");
+        return;
+    }
+    for failure in &failures {
+        println!("  FAILED: {failure}");
+    }
+    println!("
+{} target(s) missed", failures.len());
+    std::process::exit(1);
+}
+
 fn main() {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if arguments.iter().any(|argument| argument == "--assert") {
+        assert_targets();
+        return;
+    }
     if arguments.iter().any(|argument| argument == "--scroll") {
         println!("{}", scroll::report());
         return;
@@ -56,7 +135,7 @@ fn main() {
         return;
     }
     if !arguments.iter().any(|argument| argument == "--report") {
-        println!("codec-bench: pass --report, --quality, --scroll, --transcode, --bands or --huffman-ab");
+        println!("codec-bench: pass --report, --quality, --scroll, --transcode, --bands, --assert or --huffman-ab");
         return;
     }
     run_report();
