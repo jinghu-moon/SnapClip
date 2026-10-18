@@ -242,6 +242,40 @@ mod tests {
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
+    /// A band source that cannot supply its rows must fail the export **before** anything is
+    /// written, because the alternative is publishing a picture with a hole in it (docs/36 §12.1).
+    #[test]
+    fn a_band_source_that_fails_writes_no_artifact() {
+        struct Broken;
+        impl snapclip_capture::ports::BandSource for Broken {
+            fn rows(&self) -> u32 {
+                4
+            }
+            fn read_rows(&mut self, _first: u32, _rows: u32, _out: &mut Vec<u8>) -> bool {
+                false
+            }
+        }
+
+        let path = root("broken-bands");
+        let writer = HistoryArtifactWriter::new(path.clone());
+        let spec = snapclip_capture::ports::SelectionSpec {
+            region: Rect::new(0, 0, 4, 4),
+            pixel_format: PixelFormat::Bgra8Unorm,
+            captured_at_unix_ms: 0,
+            origin: None,
+            corner_radius: 0,
+        };
+        let error = writer
+            .write_bands("broken-bands", &spec, &mut Broken, 96, None)
+            .expect_err("a band source that cannot read must fail the export");
+        assert!(
+            format!("{error}").contains("band source failed"),
+            "the error should name the read, not the encoder: {error}"
+        );
+        let written = fs::read_dir(&path).map(|dir| dir.count()).unwrap_or(0);
+        assert_eq!(written, 0, "an artifact was written for a picture that could not be read");
+    }
+
     fn root(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "snapclip-app-writer-{name}-{}-{}",

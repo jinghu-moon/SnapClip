@@ -151,7 +151,11 @@ impl ExportSource {
             let Some(bands) = bands.take() else {
                 return Err(CaptureError::EncodeFailed("the bands were already taken".into()));
             };
-            let (width, height, bgra) = bands.into_image();
+            let (width, height, bgra) = bands.into_image().map_err(|error| {
+                // The clipboard is the one consumer that materialises the whole picture, so this is
+                // the one place a broken tile file can still reach a user (docs/36 §12.1).
+                CaptureError::EncodeFailed(format!("the clipboard bitmap cannot be built: {error}"))
+            })?;
             *pixels = Some(SelectionPixels {
                 frame: crate::session::CapturedFrame {
                     width,

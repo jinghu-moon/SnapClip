@@ -186,7 +186,10 @@ impl Tracker {
         );
         let mut thumb = Thumb::new(width, thumb_width);
         let mut first_frame = vec![0u8; (width * view * 4) as usize];
-        stitcher.store().read_rows(0, view, &mut first_frame);
+        stitcher
+            .store()
+            .read_rows(0, view, &mut first_frame)
+            .expect("the first frame was just written to the store");
         thumb.refresh(&first_frame, 0, view, 0, 0, view);
         Self {
             width,
@@ -285,7 +288,11 @@ impl Tracker {
         let bytes = ((last - first) as usize) * (self.width as usize * 4);
         self.band.clear();
         self.band.resize(bytes, 0);
-        self.stitcher.store().read_rows(first, last - first, &mut self.band);
+        if let Err(error) = self.stitcher.store().read_rows(first, last - first, &mut self.band) {
+            // A stale preview is a cosmetic problem; a zeroed one would look like content.
+            eprintln!("[snapclip][scroll] the preview cannot be refreshed: {error}");
+            return;
+        }
         self.thumb.refresh(&self.band, first, rows, top, from, to);
         self.last_thumb_us = started.elapsed().as_micros() as u64;
     }
@@ -335,7 +342,7 @@ impl Tracker {
         &self,
         band_rows: u32,
         mut f: impl FnMut(u32, &[u8]) -> bool,
-    ) {
+    ) -> Result<(), crate::scroll::store::RowReadError> {
         let rows = self.stitcher.rows();
         let row_bytes = self.width as usize * 4;
         let band_rows = band_rows.max(1);
@@ -344,12 +351,13 @@ impl Tracker {
         while first < rows {
             let count = (rows - first).min(band_rows);
             buffer.resize(count as usize * row_bytes, 0);
-            self.stitcher.store().read_rows(first, count, &mut buffer);
+            self.stitcher.store().read_rows(first, count, &mut buffer)?;
             if !f(first, &buffer) {
-                return;
+                return Ok(());
             }
             first += count;
         }
+        Ok(())
     }
 
     /// How many rows the long image has.
@@ -360,16 +368,20 @@ impl Tracker {
     /// Fill `out` with `rows` rows starting at `first_row`, top-down, tightly packed BGRA.
     /// False when the store cannot supply them, so a consumer refuses the artifact rather
     /// than writing a short one (docs/35 §15).
-    pub(crate) fn read_rows(&self, first_row: u32, rows: u32, out: &mut [u8]) -> bool {
+    pub(crate) fn read_rows(
+        &self,
+        first_row: u32,
+        rows: u32,
+        out: &mut [u8],
+    ) -> Result<(), crate::scroll::store::RowReadError> {
         let row_bytes = self.width as usize * 4;
         if rows == 0
             || first_row + rows > self.stitcher.rows()
             || out.len() != rows as usize * row_bytes
         {
-            return false;
+            return Err(crate::scroll::store::RowReadError::OutOfRange);
         }
-        self.stitcher.store().read_rows(first_row, rows, out);
-        true
+        self.stitcher.store().read_rows(first_row, rows, out)
     }
 
     /// Arm one failing seal, so a full disk can be tested without one (docs/35 §12.4).
@@ -378,12 +390,18 @@ impl Tracker {
         self.stitcher.fail_seals();
     }
 
+    /// Test hook: break the sealed tile file (docs/36 §12).
+    #[cfg(test)]
+    pub(crate) fn break_tile_file(&mut self) {
+        self.stitcher.break_tile_file();
+    }
+
     /// The long image: `(width, rows, bgra)`.
-    pub(crate) fn into_image(self) -> (u32, u32, Vec<u8>) {
+    pub(crate) fn into_image(self) -> Result<(u32, u32, Vec<u8>), crate::scroll::store::RowReadError> {
         let rows = self.stitcher.rows();
         let width = self.width;
         let mut store = self.stitcher.into_store();
-        (width, rows, store.take_all())
+        Ok((width, rows, store.take_all()?))
     }
 
     /// What the image costs, as its store sees it (docs/35 §5.1).
@@ -416,6 +434,37 @@ mod tests {
         ScrollBands::new(tracker)
     }
 
+
+    /// The store used to zero the rows it could not read and still report success, which is how a
+    /// picture ends up with a hole in it (docs/36 §12.1).
+    ///
+    /// This test is written the wrong way round **on purpose**: it first proves that the hole
+    /// happens, because "the code fills zeros" is not proof that a user would ever get one. Once
+    /// the reader reports failure it is flipped to demand the failure.
+    #[test]
+    fn a_broken_tile_file_is_not_reported_as_success() {
+        use crate::ports::BandSource;
+
+        let mut bands = test_bands();
+        let rows = bands.rows();
+        let row_bytes = bands.width() as usize * 4;
+        let mut patient = vec![0u8; rows as usize * row_bytes];
+        assert!(bands.read_rows(0, rows, &mut patient), "a healthy read");
+        assert!(
+            patient.chunks(4).any(|px| px != &patient[..4]),
+            "the page is uniform, so a zeroed row would be indistinguishable"
+        );
+
+        // The file a crash or a cleaner would take away.
+        bands.break_tile_file();
+
+        let mut after = vec![0u8; rows as usize * row_bytes];
+        let ok = bands.read_rows(0, rows, &mut after);
+        // The fix: the port refuses, so the writer refuses the artifact instead of publishing a
+        // picture with a hole in it. Before the fix this assertion was `assert!(ok)` plus a
+        // comparison that showed the returned rows were zeros.
+        assert!(!ok, "the port must refuse rows it could not read");
+    }
 
     use super::estimate::tests::{page, shift_of, window};
     use super::estimate::{FrameSig, estimate};
@@ -483,7 +532,7 @@ mod tests {
             assert_eq!(tracker.status(), Status::Tracking, "lost at offset {top}");
         }
         assert_eq!(tracker.image_rows(), top + H);
-        let (width, rows, image) = tracker.into_image();
+        let (width, rows, image) = tracker.into_image().expect("the tiles are intact");
         assert_eq!((width, rows), (W, top + H));
         assert!(
             image == truth(&page, top, tick),
@@ -493,7 +542,7 @@ mod tests {
 
     #[test]
     fn the_band_source_reproduces_the_whole_image() {
-        let (width, rows, whole) = test_bands().into_image();
+        let (width, rows, whole) = test_bands().into_image().expect("the tiles are intact");
         assert_eq!(width, W);
         let mut bands = test_bands();
         let total = crate::ports::BandSource::rows(&bands);
@@ -552,17 +601,19 @@ mod tests {
         let mut banded = Vec::new();
         {
             let tracker = build();
-            tracker.for_each_band(64, |first, bytes| {
-                assert_eq!(
-                    first as usize * W as usize * 4,
-                    banded.len(),
-                    "the bands arrive in order, without gaps"
-                );
-                banded.extend_from_slice(bytes);
-                true
-            });
+            tracker
+                .for_each_band(64, |first, bytes| {
+                    assert_eq!(
+                        first as usize * W as usize * 4,
+                        banded.len(),
+                        "the bands arrive in order, without gaps"
+                    );
+                    banded.extend_from_slice(bytes);
+                    true
+                })
+                .expect("the tiles are intact");
         }
-        let (width, rows, image) = build().into_image();
+        let (width, rows, image) = build().into_image().expect("the tiles are intact");
         assert_eq!(width, W);
         assert_eq!(banded.len(), image.len(), "no band was skipped");
         assert_eq!(banded, image, "the bands are the image, in order");
@@ -871,12 +922,12 @@ pub mod probe {
         pub fn image(&self) -> Vec<u8> {
             let rows = self.tracker.stitcher.rows();
             let mut out = vec![0u8; (self.tracker.width() * rows * 4) as usize];
-            self.tracker.stitcher.store().read_rows(0, rows, &mut out);
+            self.tracker.stitcher.store().read_rows(0, rows, &mut out).expect("rows");
             out
         }
 
         /// The long image: `(width, rows, bgra)`.
-        pub fn into_image(self) -> (u32, u32, Vec<u8>) {
+        pub fn into_image(self) -> Result<(u32, u32, Vec<u8>), crate::scroll::store::RowReadError> {
             self.tracker.into_image()
         }
     }
@@ -984,8 +1035,16 @@ impl ScrollBands {
     /// The whole picture, for the one consumer that cannot stream: the clipboard wants a
     /// contiguous bitmap, and about 145 MB at thirty thousand rows is what that costs. It is the
     /// clipboard's price, not a leak (docs/35 §15).
-    pub(crate) fn into_image(self) -> (u32, u32, Vec<u8>) {
+    pub(crate) fn into_image(
+        self,
+    ) -> Result<(u32, u32, Vec<u8>), crate::scroll::store::RowReadError> {
         self.tracker.into_image()
+    }
+
+    /// Test hook: break the sealed tile file behind these bands (docs/36 §12).
+    #[cfg(test)]
+    pub(crate) fn break_tile_file(&mut self) {
+        self.tracker.break_tile_file();
     }
 }
 
@@ -997,6 +1056,16 @@ impl crate::ports::BandSource for ScrollBands {
     fn read_rows(&mut self, first_row: u32, rows: u32, out: &mut Vec<u8>) -> bool {
         let row_bytes = self.tracker.width() as usize * 4;
         out.resize(rows as usize * row_bytes, 0);
-        self.tracker.read_rows(first_row, rows, out)
+        match self.tracker.read_rows(first_row, rows, out) {
+            Ok(()) => true,
+            Err(error) => {
+                // The writer refuses the artifact on `false`; saying so here is what makes a broken
+                // tile file a failed export instead of a picture with a hole (docs/36 §12.1).
+                eprintln!(
+                    "[snapclip][scroll] rows {first_row}..+{rows} cannot be read: {error}"
+                );
+                false
+            }
+        }
     }
 }

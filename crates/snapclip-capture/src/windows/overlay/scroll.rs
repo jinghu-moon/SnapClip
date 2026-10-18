@@ -242,6 +242,9 @@ impl OverlayController {
         if self.scroll.is_some() {
             return;
         }
+        // A crashed session leaves its tile file behind; this is the platform's only chance to
+        // clear it before a new store exists (docs/36 §12.2).
+        crate::windows::tile_sweep::sweep();
         let Some(layout) = self.monitor_layout.clone() else {
             eprintln!("[snapclip][scroll] refused: this session has no monitor layout");
             return;

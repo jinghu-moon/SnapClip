@@ -31,6 +31,7 @@ pub mod overlay;
 pub mod providers;
 pub mod refinement_worker;
 pub mod renderer;
+pub mod tile_sweep;
 pub mod scroll_worker;
 pub mod timed_call;
 pub mod top_level_provider;

@@ -31,7 +31,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use super::store::{Budgets, CanvasStore};
+use super::store::{Budgets, CanvasStore, RowReadError};
 
 /// A fixed-capacity ring of rows. Logical row `i` lives at physical row `(head + i) % cap`, so
 /// growing at either end is index arithmetic and never a move.
@@ -130,6 +130,27 @@ impl Ring {
 struct Tile {
     offset: u64,
     rows: u32,
+}
+
+/// The pid inside `snapclip-scroll-{pid}-{serial}.tile`, if the name is ours at all.
+///
+/// The sweep that uses this lives in the platform layer, because `scroll/` stays free of
+/// platform calls (the dependency gate checks it).
+pub(crate) fn tile_owner(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix("snapclip-scroll-")?.strip_suffix(".tile")?;
+    rest.split('-').next()?.parse().ok()
+}
+
+/// Whether a tile file may be deleted (docs/36 §12.2). Split out so the policy can be tested
+/// without waiting an hour or killing a process.
+///
+/// `running` is injected rather than called, so this stays platform-free.
+pub(crate) fn tile_is_orphan(pid: u32, me: u32, age_secs: u64, running: impl Fn(u32) -> bool) -> bool {
+    if pid == me {
+        // Nothing of ours can exist before the first seal, so this is a pid reuse.
+        return true;
+    }
+    age_secs >= 3_600 && !running(pid)
 }
 
 /// The sealed middle: one append-only file and a directory that gives it a logical order.
@@ -259,7 +280,7 @@ impl BackedCanvas {
     }
 
     /// Read `rows` whole rows starting at canvas row `first` into `out`.
-    fn gather(&self, first: u32, rows: u32, out: &mut [u8]) {
+    fn gather(&self, first: u32, rows: u32, out: &mut [u8]) -> Result<(), RowReadError> {
         debug_assert_eq!(out.len(), rows as usize * self.row);
         let mut done = 0;
         let front_rows = self.front_rows();
@@ -278,7 +299,11 @@ impl BackedCanvas {
                 done += take;
             } else if at < middle_end {
                 let take = (rows - done).min(middle_end - at);
-                self.read_middle(at - middle_first, take, &mut out[done as usize * self.row..]);
+                self.read_middle(
+                    at - middle_first,
+                    take,
+                    &mut out[done as usize * self.row..(done + take) as usize * self.row],
+                )?;
                 done += take;
             } else {
                 let take = (rows - done).min(self.rows - at);
@@ -290,12 +315,15 @@ impl BackedCanvas {
                 done += take;
             }
         }
+        Ok(())
     }
 
-    fn read_middle(&self, first: u32, rows: u32, out: &mut [u8]) {
+    fn read_middle(&self, first: u32, rows: u32, out: &mut [u8]) -> Result<(), RowReadError> {
         let Some(mut file) = self.readable_file() else {
-            out[..rows as usize * self.row].fill(0);
-            return;
+            return Err(RowReadError::Missing(format!(
+                "the tile file {} is gone",
+                self.middle.path.display()
+            )));
         };
         let mut skip = first;
         let mut done = 0;
@@ -311,11 +339,9 @@ impl BackedCanvas {
                 .seek(SeekFrom::Start(offset))
                 .and_then(|_| file.read_exact(into))
             {
-                eprintln!(
-                    "[snapclip][scroll] reading the tile file {} failed: {error}",
-                    self.middle.path.display()
-                );
-                into.fill(0);
+                let why = format!("{}: {error}", self.middle.path.display());
+                eprintln!("[snapclip][scroll] reading the tile file failed: {why}");
+                return Err(RowReadError::Missing(why));
             }
             done += take;
             skip = 0;
@@ -324,8 +350,14 @@ impl BackedCanvas {
             }
         }
         if done < rows {
-            out[done as usize * self.row..rows as usize * self.row].fill(0);
+            // The directory promised these rows; a short read is the same lie as a missing file.
+            return Err(RowReadError::Missing(format!(
+                "the tile file {} ended {} rows early",
+                self.middle.path.display(),
+                rows - done
+            )));
         }
+        Ok(())
     }
 
     fn readable_file(&self) -> Option<File> {
@@ -477,6 +509,20 @@ impl BackedCanvas {
         self.fail_seals = true;
     }
 
+    /// The file this store writes sealed rows to (tests only).
+    #[cfg(test)]
+    pub(crate) fn tile_path(&self) -> &std::path::Path {
+        &self.middle.path
+    }
+
+    /// Test hook: make the sealed tile file unreadable the way a crash, a cleaner or a full disk
+    /// would, so the reader's honesty can be tested (docs/36 §12).
+    #[cfg(test)]
+    pub(crate) fn break_tile_file(&mut self) {
+        self.middle.file.take();
+        let _ = std::fs::remove_file(&self.middle.path);
+    }
+
     fn fail(&mut self, error: String) -> bool {
         eprintln!("[snapclip][scroll] {error}");
         self.error = Some(error);
@@ -561,17 +607,17 @@ impl CanvasStore for BackedCanvas {
         true
     }
 
-    fn read_rows(&self, first_row: u32, rows: u32, out: &mut [u8]) {
+    fn read_rows(&self, first_row: u32, rows: u32, out: &mut [u8]) -> Result<(), RowReadError> {
         debug_assert_eq!(out.len(), rows as usize * self.row);
         debug_assert!(first_row + rows <= self.rows);
-        self.gather(first_row, rows, out);
+        self.gather(first_row, rows, out)
     }
 
-    fn take_all(&mut self) -> Vec<u8> {
+    fn take_all(&mut self) -> Result<Vec<u8>, RowReadError> {
         let mut out = vec![0u8; self.rows as usize * self.row];
         let rows = self.rows;
-        self.gather(0, rows, &mut out);
-        out
+        self.gather(0, rows, &mut out)?;
+        Ok(out)
     }
 
     fn storage_error(&self) -> Option<&str> {
@@ -624,8 +670,8 @@ mod tests {
             let rows = memory.rows();
             let mut a = vec![0u8; (W * rows * 4) as usize];
             let mut b = vec![0u8; (W * rows * 4) as usize];
-            memory.read_rows(0, rows, &mut a);
-            backed.read_rows(0, rows, &mut b);
+            memory.read_rows(0, rows, &mut a).expect("memory rows");
+            backed.read_rows(0, rows, &mut b).expect("backed rows");
             if a != b {
                 let row = (W * 4) as usize;
                 let bad = (0..rows as usize).find(|r| a[r * row..(r + 1) * row] != b[r * row..(r + 1) * row]);
@@ -674,19 +720,33 @@ mod budget_tests {
         assert_eq!(grown.temp_bytes, 2 * row as u64, "{grown:?}");
     }
 
+    /// A crash leaves the tile file behind, so the next run sweeps it (docs/36 §12.2). The two
+    /// rules that matter are that an orphan goes and that a **live** file never does.
+    #[test]
+    fn the_sweep_takes_orphans_and_never_a_live_file() {
+        use super::{tile_is_orphan, tile_owner};
+
+        assert_eq!(tile_owner("snapclip-scroll-4242-7.tile"), Some(4242));
+        assert_eq!(tile_owner("snapclip-scroll-4242-7.tmp"), None);
+        assert_eq!(tile_owner("other-4242-7.tile"), None);
+        assert_eq!(tile_owner("snapclip-scroll-abc-7.tile"), None);
+
+        // A pid that is not ours, gone, and old enough: sweep it.
+        assert!(tile_is_orphan(4242, 7, 4_000, |_| false));
+        // The same pid alive: keep it.
+        assert!(!tile_is_orphan(4242, 7, 4_000, |pid| pid == 4242));
+        // The same pid, dead, but young: keep it, so a slow writer is never mistaken for a corpse.
+        assert!(!tile_is_orphan(4242, 7, 60, |_| false));
+        // Our own pid: nothing of ours exists before the first seal, so this is a reused pid.
+        assert!(tile_is_orphan(7, 7, 0, |_| true));
+    }
+
     /// The tile file is the store's own: dropping the store removes it, so a cancelled or finished
     /// session leaves no working files behind (docs/35 §7.2).
     #[test]
     fn dropping_the_store_removes_its_tile_file() {
-        fn mine() -> Vec<String> {
-            std::fs::read_dir(std::env::temp_dir())
-                .expect("temp dir")
-                .filter_map(|entry| entry.ok())
-                .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                .filter(|name| name.starts_with(&format!("snapclip-scroll-{}-", std::process::id())))
-                .collect()
-        }
-
+        // It checks its **own** path rather than every file carrying this pid: tests run in
+        // parallel, and a sibling store's live file is not this test's business.
         let mut store = BackedCanvas::new(&frame(1), W, VIEW, 64 * VIEW);
         let row = (W * 4) as usize;
         for step in 0..6u32 {
@@ -694,8 +754,9 @@ mod budget_tests {
             assert!(store.append(2, &band), "step {step}");
         }
         assert!(store.budgets().temp_bytes > 0, "rows left the ring: {:?}", store.budgets());
-        assert!(!mine().is_empty(), "the tile file should exist while the store lives");
+        let path = store.tile_path().to_path_buf();
+        assert!(path.exists(), "the tile file should exist while the store lives");
         drop(store);
-        assert!(mine().is_empty(), "the tile file outlived its store: {:?}", mine());
+        assert!(!path.exists(), "the tile file outlived its store: {}", path.display());
     }
 }

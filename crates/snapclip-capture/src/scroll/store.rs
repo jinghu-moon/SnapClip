@@ -14,6 +14,28 @@
 //! process holds, temporary storage is what a backing store may write, and the final file is what
 //! an encoder produces. A store answers for the first three; the file size belongs to encoding.
 
+/// Why a range of rows could not be handed over (docs/36 §12.1).
+///
+/// The store used to answer `()`, which let a missing tile file turn into a row of zeros and then
+/// into a published picture with a hole in it. A caller can only refuse an artifact if the store
+/// tells it that it failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowReadError {
+    /// The range is not inside the image.
+    OutOfRange,
+    /// A sealed tile file is gone, truncated, or unreadable.
+    Missing(String),
+}
+
+impl std::fmt::Display for RowReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OutOfRange => write!(f, "the row range is outside the image"),
+            Self::Missing(why) => write!(f, "sealed rows cannot be read: {why}"),
+        }
+    }
+}
+
 /// The budgets a store can speak for (docs/35 §5.1). The final file size is deliberately absent:
 /// compression cannot be predicted from pixel counts, so no store should pretend to know it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -45,11 +67,14 @@ pub(crate) trait CanvasStore {
     ///
     /// A store that holds its rows in several places cannot hand out a slice, so this is how a
     /// caller asks for a range it needs (docs/35 §3.5). `out` is exactly `rows × row width` bytes.
-    fn read_rows(&self, first_row: u32, rows: u32, out: &mut [u8]);
+    ///
+    /// `Err` means the rows are **not** in `out`; a store must never answer `Ok` with zeros where
+    /// the pixels should be (docs/36 §12.1).
+    fn read_rows(&self, first_row: u32, rows: u32, out: &mut [u8]) -> Result<(), RowReadError>;
 
     /// Hand the whole image over. An in-memory store gives its buffer away, so the caller never
     /// copies it twice; a backing store gathers it from its holders.
-    fn take_all(&mut self) -> Vec<u8>;
+    fn take_all(&mut self) -> Result<Vec<u8>, RowReadError>;
 
     /// The budgets this store is responsible for (docs/35 §5.1). Always available: the backing
     /// store is what decides, from these, how much stays in memory.
@@ -213,14 +238,19 @@ impl CanvasStore for MemoryCanvas {
         true
     }
 
-    fn read_rows(&self, first_row: u32, rows: u32, out: &mut [u8]) {
-        let first = first_row as usize * self.row();
-        let end = first + rows as usize * self.row();
+    fn read_rows(&self, first_row: u32, rows: u32, out: &mut [u8]) -> Result<(), RowReadError> {
+        let row = self.row();
+        let first = first_row as usize * row;
+        let end = first + rows as usize * row;
+        if end > self.canvas.len() || out.len() != rows as usize * row {
+            return Err(RowReadError::OutOfRange);
+        }
         out.copy_from_slice(&self.canvas[first..end]);
+        Ok(())
     }
 
-    fn take_all(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.canvas)
+    fn take_all(&mut self) -> Result<Vec<u8>, RowReadError> {
+        Ok(std::mem::take(&mut self.canvas))
     }
 
     fn budgets(&self) -> Budgets {
@@ -253,11 +283,11 @@ impl CanvasStore for Box<dyn CanvasStore> {
         (**self).prepend(growth, band_src)
     }
 
-    fn read_rows(&self, first_row: u32, rows: u32, out: &mut [u8]) {
+    fn read_rows(&self, first_row: u32, rows: u32, out: &mut [u8]) -> Result<(), RowReadError> {
         (**self).read_rows(first_row, rows, out)
     }
 
-    fn take_all(&mut self) -> Vec<u8> {
+    fn take_all(&mut self) -> Result<Vec<u8>, RowReadError> {
         (**self).take_all()
     }
 
@@ -375,10 +405,10 @@ mod tests {
         let slice = store.slice();
         assert_eq!(slice.len(), (W * (H + 3) * 4) as usize);
         let mut first = vec![0u8; row];
-        store.read_rows(0, 1, &mut first);
+        store.read_rows(0, 1, &mut first).expect("first row");
         assert_eq!(first, slice[..row], "the prepended row is first");
         let mut rest = vec![0u8; row * H as usize];
-        store.read_rows(1, H, &mut rest);
+        store.read_rows(1, H, &mut rest).expect("rest");
         assert_eq!(rest, slice[row..row * ((H + 1) as usize)]);
     }
 }

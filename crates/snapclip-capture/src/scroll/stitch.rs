@@ -52,6 +52,12 @@ impl Stitcher<super::backed::BackedCanvas> {
     pub(crate) fn fail_seals(&mut self) {
         self.store.fail_seals();
     }
+
+    /// Test hook: break the sealed tile file under this stitcher (docs/36 §12).
+    #[cfg(test)]
+    pub(crate) fn break_tile_file(&mut self) {
+        self.store.break_tile_file();
+    }
 }
 
 impl<C: CanvasStore> Stitcher<C> {
@@ -586,7 +592,7 @@ mod tests {
             assert_eq!(subject.rows(), oracle.rows, "{store:?}: image height at shift {index}");
             let rows = subject.rows();
             let mut pixels = vec![0u8; rows as usize * row];
-            subject.store().read_rows(0, rows, &mut pixels);
+            subject.store().read_rows(0, rows, &mut pixels).expect("rows");
             assert!(
                 pixels == oracle.canvas,
                 "{store:?}: pixels differ at shift {index} ({dy})"
