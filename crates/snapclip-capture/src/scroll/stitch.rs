@@ -1,8 +1,10 @@
 //! The long image: frames placed at the content position the estimator measured.
 //!
 //! The stitcher decides *where* a frame goes; a [`CanvasStore`] decides *how* those rows are held
-//! (docs/35 phase 1). Today the only store is one contiguous BGRA buffer, `width` pixels wide, so
-//! this module behaves exactly as it did when it owned that buffer itself. `pos` is the canvas row
+//! (docs/35 phase 1). The production store is `BackedCanvas` — a fixed-capacity edge ring plus
+//! sealed tiles in a temp file (`backed.rs`) — and `MemoryCanvas` is kept as its test oracle, so
+//! this module is unchanged by either; the algorithm below is what matters here (docs/36).
+//! `pos` is the canvas row
 //! the top of the viewport currently shows. A measured shift moves `pos`; when the viewport leaves
 //! the canvas, the store grows by exactly the rows that were never seen before.
 //!

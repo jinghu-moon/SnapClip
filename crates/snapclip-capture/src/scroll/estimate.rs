@@ -1,6 +1,6 @@
 //! How far the content moved between two frames of the same viewport.
 //!
-//! The facts this is derived from (`docs/33`):
+//! The facts this is derived from (`docs/33`):；算法的完整说明见 docs/36
 //!
 //! * a live page is almost never byte-identical from one frame to the next (cursor, caret,
 //!   animation), so the answer is computed for **every** frame and never waits for stillness;
