@@ -101,7 +101,8 @@ pub fn run(view: usize, step: usize) -> Stitched {
         let rows = probe.image_rows();
         (frames, rows, stitch_us, thumb_us, lost)
     });
-    let ((width, height, canvas), assembly_peak) = alloc_probe::peak_extra(|| probe.into_image());
+    let ((width, height, canvas), assembly_peak) =
+        alloc_probe::peak_extra(|| probe.into_image().expect("the tiles are intact"));
     let truth = &page[..(width as usize * height as usize * 4).min(page.len())];
     let correct = canvas.len() == truth.len() && canvas == truth;
     let (frames, rows, stitch_us, thumb_us, lost) = pushed;
@@ -165,7 +166,7 @@ fn run_sequence(start: usize, page_rows: usize, steps: &[i64]) -> bool {
         first = first.min(top);
         last = last.max(top + view as i64);
     }
-    let (width, rows, image) = probe.into_image();
+    let (width, rows, image) = probe.into_image().expect("the tiles are intact");
     width as usize == WIDTH
         && rows as i64 == last - first
         && image == page[first as usize * WIDTH * 4..last as usize * WIDTH * 4]
@@ -274,7 +275,7 @@ pub fn report() -> String {
             let next = frame(&page, WIDTH, top, VIEW);
             probe.push(&next);
         }
-        probe.into_image()
+        probe.into_image().expect("the tiles are intact")
     };
 
     out.push_str("format | bytes | encode ms | encode peak MB | note\n");
@@ -416,7 +417,7 @@ mod tests {
             let next = frame(&page, WIDTH, top, view);
             probe.push(&next);
         }
-        let (width, height, canvas) = probe.into_image();
+        let (width, height, canvas) = probe.into_image().expect("the tiles are intact");
         assert_eq!(width as usize, WIDTH);
         assert_eq!(height as usize, rows, "the whole page was captured");
         assert!(canvas == page, "the stitch must be pixel exact");
