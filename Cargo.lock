@@ -1057,6 +1057,7 @@ version = "0.1.0"
 dependencies = [
  "enough",
  "image",
+ "miniz_oxide 0.9.1",
  "mozjpeg-rs",
  "png 0.18.1",
  "snapclip-capture",

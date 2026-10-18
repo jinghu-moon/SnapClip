@@ -581,6 +581,11 @@ impl CanvasStore for BackedCanvas {
                 return false;
             }
         }
+        // Whatever `unseal_front` brings up is the `existing` rows the band is about to overwrite
+        // (`existing = band - growth` by construction), so a tile that cannot be read back cannot
+        // corrupt the image: `front.write(0, band_src)` replaces those rows in the same step. That
+        // is why the reader may fill zeros here — they never survive — while the export path, which
+        // has no such overwrite behind it, refuses (docs/36 §12.1).
         let existing = band - growth;
         if self.back.rows < existing {
             return self.fail(format!(
@@ -672,6 +677,41 @@ mod tests {
 
     fn band_src(value: u8, band: u32) -> Vec<u8> {
         vec![value; (W * band * 4) as usize]
+    }
+
+    /// A tile that cannot be read back must not reach the image, even when a prepend has to unseal
+    /// rows from it: the rows a prepend unseals are exactly the rows its band overwrites, so the
+    /// band replaces them in that same step. This test pins that invariant — break the file, then
+    /// prepend — and the top of the image must still be the band that was just written.
+    #[test]
+    fn a_prepend_over_a_broken_tile_still_writes_its_band() {
+        let first = frame(1);
+        let mut backed = BackedCanvas::new(&first, W, VIEW, 64 * VIEW);
+        let growth = 90;
+        let band = (VIEW / 2).max(growth + VIEW / 4).min(VIEW);
+        for step in 0..6u32 {
+            let src = band_src(2 + step as u8, band);
+            assert!(backed.prepend(growth, &src), "prepend {step}");
+        }
+        // A downward step drops the front ring, so the next prepend has to rebuild it from the
+        // middle, which is the only path that reads tiles back.
+        let down = band_src(8, band);
+        assert!(backed.append(growth, &down), "the downward step");
+        assert!(backed.budgets().temp_bytes > 0, "the run must have sealed tiles");
+
+        backed.break_tile_file();
+
+        let src = band_src(9, band);
+        assert!(backed.prepend(growth, &src), "the prepend still has to work");
+
+        // The top two rows live in the front ring, so they can be read without the file.
+        let row = (W * 4) as usize;
+        let mut top = vec![0u8; 2 * row];
+        backed
+            .read_rows(0, 2, &mut top)
+            .expect("the rows the prepend just wrote are still in the ring");
+        assert_eq!(&top[..row], &src[..row], "the prepended row");
+        assert_eq!(&top[row..], &src[row..2 * row], "and the row below it");
     }
 
     /// Every append must leave both stores holding the same bytes, because the backing store only
