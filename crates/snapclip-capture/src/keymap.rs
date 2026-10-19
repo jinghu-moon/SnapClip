@@ -40,6 +40,7 @@ pub enum Action {
     ColorCopy,
     CoordMode,
     Annotate,
+    OpenRegionPanel,
     Confirm,
     Cancel,
     ScrollAuto,
@@ -99,7 +100,7 @@ const CONFIRM_SCROLL_LABEL: &str = "开始长截图";
 
 impl Action {
     /// Every action, in guide order.
-    pub const ALL: [Action; 19] = [
+    pub const ALL: [Action; 20] = [
         Self::LevelWheel,
         Self::LevelUp,
         Self::LevelDown,
@@ -114,6 +115,7 @@ impl Action {
         Self::ColorCopy,
         Self::CoordMode,
         Self::Annotate,
+        Self::OpenRegionPanel,
         Self::Confirm,
         Self::Cancel,
         Self::ScrollAuto,
@@ -251,6 +253,15 @@ impl Action {
                     Pick,
                     Key,
                     &["A"],
+                ),
+                Self::OpenRegionPanel => (
+                    "panel.open",
+                    Group::Output,
+                    "panel",
+                    "打开自定义截图",
+                    Pick,
+                    Key,
+                    &["Ctrl+Enter"],
                 ),
                 Self::Confirm => (
                     "confirm",

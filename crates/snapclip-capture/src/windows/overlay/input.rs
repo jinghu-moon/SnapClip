@@ -513,6 +513,15 @@ impl OverlayController {
                     self.confirm();
                 }
             }
+            // The panel's entry must not depend on the size label's layout (docs/46): with all
+            // three readouts off there is no badge to click, and the panel is where those
+            // readouts are switched back on. Availability is the context plus a live selection.
+            Action::OpenRegionPanel => {
+                if Self::panel_entry_available(state, self.session.has_selection()) {
+                    self.open_region_panel();
+                    self.invalidate();
+                }
+            }
             // Selected -> Annotating (selection is locked, tools go live).
             Action::Annotate => {
                 if state == CaptureState::Selected && self.session.begin_annotating().is_ok() {
@@ -899,6 +908,23 @@ impl OverlayController {
     ///
     /// 面板的校验范围就是本屏（`monitor_bounds`），最小选区与会话用同一条规则（`minimum_selection`）
     /// —— 面板的描红和会话的 `snap_to` 因此不会各说一套（docs/23 §14.54）。
+    /// Whether the panel can be opened at all. Deliberately independent of the size label: it
+    /// used to be reachable only through the badge, and with all three readouts off there is no
+    /// badge, which locked the panel — and the switches that turn the readouts back on — away
+    /// (docs/45, docs/46). Context plus a live selection is the whole condition.
+    fn panel_entry_available(state: CaptureState, has_selection: bool) -> bool {
+        matches!(state, CaptureState::Selecting | CaptureState::Selected) && has_selection
+    }
+
+    /// Opens the panel if it is closed. Idempotent: an already open panel is left alone, because
+    /// Escape is the close gesture and one key must not mean two opposite things (docs/46).
+    fn open_region_panel(&mut self) {
+        if self.region_panel.is_some() {
+            return;
+        }
+        self.toggle_region_panel();
+    }
+
     fn toggle_region_panel(&mut self) {
         if self.region_panel.is_none() {
             // 打开面板时量一次分段器选项宽度 —— 在帧之外（量宽/建文本布局不需要 BeginDraw），
@@ -1279,8 +1305,68 @@ impl OverlayController {
 
 #[cfg(test)]
 mod tests {
-    use super::nudge_point;
+    use super::{nudge_point, OverlayController};
+    use crate::keymap::{Chord, Context, Key, Keymap};
+    use crate::CaptureState;
+    use crate::units::LabelDisplay;
     use windows_sys::Win32::Foundation::POINT;
+
+    /// `docs/46`: the entry is the context plus a live selection, and the three readout
+    /// preferences must not be able to remove it. All eight combinations are exercised, because
+    /// the lock-out only appeared in the one where every readout is off.
+    #[test]
+    fn the_panel_entry_ignores_the_size_label_preferences() {
+        for size in [false, true] {
+            for position in [false, true] {
+                for coords in [false, true] {
+                    let label = LabelDisplay {
+                        show_size: size,
+                        show_coordinates: position,
+                        show_unit: coords,
+                        ..LabelDisplay::default()
+                    };
+                    // The condition does not take the label at all; build it anyway so a future
+                    // signature that starts taking it would have to come through here.
+                    let _ = label;
+                    for state in [CaptureState::Selecting, CaptureState::Selected] {
+                        assert!(
+                            OverlayController::panel_entry_available(state, true),
+                            "state={state:?} size={size} position={position} coords={coords}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_panel_entry_needs_a_live_selection() {
+        for state in [CaptureState::Idle, CaptureState::Preparing, CaptureState::Annotating] {
+            assert!(!OverlayController::panel_entry_available(state, true), "{state:?}");
+        }
+        assert!(!OverlayController::panel_entry_available(CaptureState::Selecting, false));
+    }
+
+    #[test]
+    fn ctrl_enter_opens_the_panel_in_the_pick_context() {
+        let map = Keymap::default();
+        let chord = Chord::key(Key::Enter, true, false, false);
+        assert_eq!(
+            map.action_for(Context::Pick, &chord),
+            Some(crate::keymap::Action::OpenRegionPanel)
+        );
+    }
+
+    #[test]
+    fn enter_still_confirms_and_ctrl_enter_is_not_bound_while_scrolling() {
+        let map = Keymap::default();
+        let ctrl_enter = Chord::key(Key::Enter, true, false, false);
+        assert_eq!(
+            map.action_for(Context::Pick, &Chord::key(Key::Enter, false, false, false)),
+            Some(crate::keymap::Action::Confirm)
+        );
+        assert_eq!(map.action_for(Context::Scroll, &ctrl_enter), None);
+    }
 
     #[test]
     fn cursor_nudges_move_exactly_one_screen_pixel() {
