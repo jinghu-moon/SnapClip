@@ -122,3 +122,38 @@
 - 设置窗口是否已有"快捷键"展示区未查（`[待定]`）；
 - `Ctrl+Enter` 在**滚动截图会话中**是否被别处（非 keymap）处理未查（`[待定]`）；
 - 文本测量失败注入的具体钩子位置未查（`d2d.rs` 的 `measure_text_*`，需实现时确认）。
+
+### 8.1 端到端宿主的缺失（结构性空白 ✗，不是本次缺陷）
+
+**事实**：overlay **没有任何能驱动 `on_key_down` 的测试宿主** ✗。`windows/overlay/input.rs` 的测试只有纯函数用例，没有构造 controller、投递合成按键的入口。
+
+**后果**：所有键盘行为——`Enter` 确认 ✓、`Esc` 关闭 ✓、`Ctrl+Enter` 打开面板 ✓、滚动上下文里的键 ✓——目前都只能靠「**纯函数 + 键位映射**」间接验证 ✓，**不能**证明「真实按键事件之后状态机确实前进一步」✗。
+
+**本次因此能证明的边界**：
+
+- ✅ 产品实际调用的同一份判定 `panel_entry_available(state, has_selection)` 在 **8 种标签组合**下为真 ✓；
+- ✅ `Ctrl+Enter` 在 `Context::Pick` 里映射到 `OpenRegionPanel` ✓（`keymap.rs:264`）；
+- ❌ 不能证明「真实 `WM_KEYDOWN` 之后面板真的打开」✗。
+
+**提议（独立事项）**：新增 **overlay 键鼠宿主** —— 构造 controller，注入合成的 `WM_KEYDOWN` / 鼠标消息，断言状态机与面板可见性。它会让**所有**键盘行为可端到端测，不止这一条 ✓。
+
+### 8.2 运行期先红证据（非仅编译期 ✓）
+
+实现后补测时，「先红」一度只有编译期证据 ✗。为拿到**行为**证据，把绑定临时改成不存在的键 `Ctrl+Alt+Shift+F12`（`keymap.rs` 的 `&["Ctrl+Enter"]` ✗），再跑：
+
+```
+test windows::overlay::input::tests::ctrl_enter_opens_the_panel_in_the_pick_context ... FAILED
+panicked at crates\snapclip-capture\src\windows\overlay\input.rs:1354:9:
+  left: None
+ right: Some(OpenRegionPanel)
+test result: FAILED. 533 passed; 1 failed; 80 ignored; 0 measured; 0 filtered out
+```
+
+恢复绑定后（`git diff --stat` 对 `keymap.rs` 为空 ✓）：
+
+```
+test windows::overlay::input::tests::ctrl_enter_opens_the_panel_in_the_pick_context ... ok
+test result: ok. 534 passed; 0 failed; 80 ignored; 0 measured; 0 filtered out
+```
+
+⇒ 失败原因正是「**绑定没了**」✓（`left: None`），不是断言被改 ✗；恢复后转绿 ✓。
