@@ -1,6 +1,6 @@
 # 保存面板：分阶段 TDD 任务清单
 
-> **本清单不决定产品项。** 所有产品决策都引用 `docs/42-save-panel-decisions.md` 的编号（D1–D10）。
+> **本清单不决定产品项。** 所有产品决策都引用 `docs/42-save-panel-decisions.md` 的编号（D1–D11）。
 > 若某条任务需要规格未定的产品决定，本清单只能写「阻塞于 D*」，**不得自行决定**。
 > 规格仍是产品意图的权威来源；`docs/42` 是"哪些地方规格被覆盖、被延后"的正式记录。
 
@@ -15,11 +15,12 @@
 | D3 | 删除"移除元数据" | S6 无此项 |
 | D4 | JPG 默认 4:4:4，4:2:0 作高级项 | S6 默认值；S2 体积按 4:4:4 |
 | D5 | **解码预览必须实现** | S4 同时含字节数与解码画面；**无"可选"分支** |
-| D6 | 保存后面板保持打开 `[已定]` ✓ | S3 底栏策略；S8 Toast 位置 |
+| D6 | 保存后面板保持打开 `[已定]` ✓ | S3 底栏区域；S5 保存操作；S8 Toast 位置 |
 | D7 | Toast 位置 `[已定]` ✓（面板内底栏上方 / 已关则右下角） | S8 |
-| D8 | 质量 92/75/50，其中 75、50 `[待测]` | S2、S5 只承诺 92 |
-| D9 | 单一数据源 `SaveSource` | S1 接口、S3 持有、S10 接线 |
+| D8 | 质量 92/75/50，其中 75、50 `[待测]` | S2、S6 只承诺 92 |
+| D9 | 单一文件型 `EncodedArtifact` 服务预览、复制、拖出与保存 | S1/S2 共用编码结果；保存不重编码 |
 | D10 | PDF 页尺寸 / WebP 回退 `[已定]` ✓（A4 纵向边距 0、按页宽缩放 + 按页高分页、1px=1pt 仅单页可容纳时、WebP 源走 PNG/Flate） | S7（已解闸 ✓） |
+| D11 | 文本输入使用**原生 `EDIT`** + 独立普通窗口 + DWM backdrop，外壳自绘 | S5 做窗口、外壳、原生字段与校验；S9 验 UIA 由系统提供 |
 
 ## 0.1 现状锚点（全部查证过）
 
@@ -31,29 +32,52 @@
 | `convert(master, format, quality, impl Write)` / `convert_to_file` | `apps/snapclip/src/capture/convert.rs:36` / `:135` | `[已有]`，**无生产调用者** |
 | 既有转换测试 7 条 | 同文件 `:302`–`:394` | `[已有]`，可扩展 |
 | JPG 行带 sink；**SOF2 断言** | `apps/snapclip/src/capture/row_band_jpeg.rs:282-288` | `[已有]`（D2 的依据） |
-| `ExportSource{Whole,Bands}` / `materialise()` | `crates/snapclip-capture/src/windows/export_worker.rs:74-86` / `:143` | `[已有]`，`SaveSource` 与之同构 |
+| `ExportSource{Whole,Bands}` / `materialise()` | `crates/snapclip-capture/src/windows/export_worker.rs:74-86` / `:143` | `[已有]`，但 crate-private；保存源需由 capture crate 提供 opaque 所有权 API |
 | 导出线程协议：容量 1 mailbox + generation + 过时丢弃 + `WM_APP+19` | 同文件 `:13-16` / `:224-236` / `:30-31` | `[已有]`，**复用它，不新建线程池** |
-| `ScrollBands`（实现 `BandSource`） | `crates/snapclip-capture/src/scroll/mod.rs:1035` | `[已有]` |
+| `ScrollBands`（实现 `BandSource`） | `crates/snapclip-capture/src/scroll/mod.rs:1035` | `[已有]`，`pub(crate)`；app 不得直接持有 |
 | `Destination{Copy,Pin}` | `crates/snapclip-capture/src/region.rs:355` | `[缺]` `Save` |
 | 确认分派 `confirm_action` | `crates/snapclip-capture/src/windows/overlay/session.rs:1177` | `[需改]` |
 | 滚动"桌面副本"写死 `SnapClip-{session_id}.png` | `crates/snapclip-capture/src/windows/overlay/scroll.rs:567`（`copy_into`） | `[需改]` |
 | 滚动前置格式检查 | `crates/snapclip-capture/src/scroll/mod.rs:129-147`、`overlay/scroll.rs:280` | `[已有]` |
 | 字体子集词汇表 / 生成器 / **覆盖门禁测试** | `subfont/drawn-text.txt`、`subfont/build_subset.py`、`subfont/subset.ps1`、`crates/snapclip-capture/src/windows/win/d2d/tests.rs:1451` | `[已有]`，**新文案必须先进词汇表** |
-| 现有窗口创建（单一 `CreateWindowExW`，无 EDIT 子控件） | `crates/snapclip-capture/src/windows/overlay.rs:42` | `[缺]` 原生 EDIT 宿主 |
+| 现有窗口创建（单一 `CreateWindowExW`） | `crates/snapclip-capture/src/windows/overlay.rs:42` | `[已有]`；保存面板需新增 D2D 自绘输入控件，不创建 EDIT 子窗口 |
 
 ## 0.2 平台前提（本清单的唯一技术底座）
 
-**本项目是 Win32 + D2D 的桌面应用，不是 GPUI 应用。** 所有涉及 UI 的阶段（S3–S9）按下列事实编写，**不得**出现"复用 GPUI 的异步任务/组件"之类的前提：
+**本项目是 Win32 + D2D 的桌面应用，不是 GPUI 应用。** 所有涉及 UI 的阶段（S0、S3–S9）按下列事实编写，**不得**出现"复用 GPUI 的异步任务/组件"之类的前提：
 
 - **线程模型**：面板在**自己的窗口线程**上（或现有 overlay 窗口线程上作为**模态层**），有独立的渲染目标；
 - **异步**：复用导出线程的**容量 1 mailbox + 单调 generation + 过时丢弃 + `WM_APP` 通知**（`export_worker.rs:13-16/224-236/30-31`），不新建线程池；
 - **绘制**：D2D（现有 `windows/win/d2d/*`）；文本**走字体子集**；
-- **文本输入**：用**原生 `EDIT` 子窗口**宿主（位置/尺寸由布局驱动，样式去边框后由 D2D 画外壳）。**不自绘 DirectWrite 文本光标** ✗ —— IME、选区、撤销、复制粘贴、UI Automation 都由系统提供，自绘要重做这五样且极易出错；
+- **文本输入（D11）**：字段用**原生 `EDIT` 子控件** ✓（独立普通窗口 ✓）⇒ 组合输入/候选窗/插入点/选区/拖选/撤销/复制粘贴/键盘导航/**UIA** 全部由系统提供 ✓；外壳（圆角外框、悬停/聚焦描边）由 D2D 画 ✓，`EDIT` 内缩 1–2 dip ✓。**禁止**再实现自绘 TextField / IMM32 / TSF ✗；
 - **模态焦点**：面板打开时用 `EnableWindow(parent, false)` 或在宿主侧维护焦点栈，`Esc` / `Tab` 由面板的消息循环处理；子控件之间用 `IsDialogMessage` 或显式 `Tab` 处理。
+
+## 0.2.1 现有自绘控件基线（必须复用）
+
+项目已经有一套运行中的自定义截图面板，不能把保存面板当成从零开始的第二套 D2D 控件系统。当前实现的职责边界如下：
+
+| 现有能力 | 代码位置 | 对保存面板的处理 |
+| --- | --- | --- |
+| D2D/DWrite 文本绘制、测量、等宽数字、灰度抗锯齿 | `crates/snapclip-capture/src/windows/win/d2d.rs`：`draw_text_in`、`measure_text_width`、`info_text_format_mut` | 抽为共享绘制服务；保存面板不得再写一套文本测量和基线算法 |
+| 面板 token 与画刷：`fill`、`line`、`accent`、`muted`、`danger`，圆角填充/描边 | 同文件：`fill_round`、`stroke_round`、`panel_*_brush` | 作为共享 `PanelTheme` / `PanelPainter`；颜色和圆角以规格 token 为准 |
+| 分段控件：轨道、选中块、悬停、焦点环、滑动过渡 | 同文件：`draw_segmented` | 保存面板的格式、质量、尺寸模式、保存后动作优先复用 |
+| 图标缓存与着色绘制 | 同文件：`draw_glyph`、`panel_icon.rs` | 复用图标缓存和 DPI 缩放；保存面板只增加缺失图标 |
+| 布局矩形与命中测试共用同一份数据 | `geometry.rs`：`RegionPanelLayout`、`RegionPanelTarget::target_at` | 保存面板采用同样的“layout 是命中测试唯一来源”规则 |
+| 焦点顺序、编辑缓冲、键盘分派、`PanelChange` | `region.rs`：`PanelSlot::ORDER`、`RegionPanel`、`PanelKey`、`PanelChange`；`overlay/input.rs` 负责分派 | 复用状态机模式和测试方式；不复用截图业务字段 |
+| 视图快照与渲染分离 | `overlay/render_submit.rs`：`region_panel_view` → `RegionPanelView` → `draw_region_panel` | 保存面板也采用“状态计算 → 不可变 View → 绘制”的调用链 |
+
+**抽取边界**：
+
+1. 抽取已有通用控件与绘制能力：`PanelTheme`、`TextLayout`/测量、`SegmentedControl`、`IconButton`、圆角/焦点/悬停状态、布局与命中测试工具；TextField 编辑核心在 S5 新增，但必须依赖这些能力。
+2. 保留领域状态：截图面板的 `RegionPanel`、选区联动、单位/延时/圆角和 `PanelChange::Region` 不进入保存面板；保存面板另建自己的状态机。
+3. 现有 `RegionPanel` 的输入入口只接受数字（`panel_key_from_char`）✗，且它是**浮层内自绘**的 ✓；保存面板按 D11 使用**原生 `EDIT`** ✓，两者不共用输入实现 ✓（D11 改变后这条不再是“要自研 TextField”的理由 ✓）。
+4. 共享模块的归属应与依赖方向一致。若保存面板继续位于 `snapclip-app`，通用控件应移入独立的 `snapclip-ui` Windows/D2D crate；不得让 app 访问 `snapclip-capture` 的 `pub(crate)` 绘制实现，也不得让 capture 依赖 app。只有在两者合并到同一 UI crate 后，才保留模块内 `pub(crate)`。
+
+**抽取验收**：先把现有自定义截图面板迁移到共享控件并保持现有 `geometry.rs` / `region.rs` / D2D 回归测试全绿，再让保存面板消费同一控件。迁移前后应比较分段器、数字字段插入点、焦点环、悬停态、DPI 缩放和命中测试；不能只验证保存面板而放弃截图面板回归。
 
 ## 0.3 S0 必须就位的文案（逐字，来自规格）
 
-**校验 11 条**（语义实现在 S3；S0 只保证字形能渲染）：
+**校验 11 条**（字形覆盖由 S0 建立；字段语义和反馈在 S5 实现）：
 
 ```
 路径为空
@@ -74,7 +98,9 @@
 
 **冲突与 Toast**：`改为覆盖`、`改为重命名`；Toast 四操作在 S8 实现时逐字从规格 §7.6 摘录。
 
-> **纪律**：S0 只负责"字形就位"，不负责语义。S0 的验收是**门禁测试转绿**，不是肉眼检查。
+> **`snapclip-ui` 的 `TextField` 与本文无关** ✗：D11 定为原生 `EDIT` ✓ ⇒ 保存面板**不使用**该控件 ✓；其去留见 `docs/47` 与 `docs/42 D11`（**当前无任何调用方** ✗，建议删除或明确标注预留，由上层决定 ✓）。
+
+> **纪律**：S0 同时负责共享控件内核、既有截图面板迁移回归和新文案字形门禁；产品字段语义仍由 S5/S6 实现。截图基线与迁移测试必须真实执行，不能以代码抽取完成代替验收。
 
 ---
 
@@ -82,82 +108,126 @@
 
 | 阶段 | 内容 | 人天 | 出口 |
 | --- | --- | ---: | --- |
-| S0 | 文案字形 + 基线确认 | 1 | 覆盖门禁测试绿 |
-| S1 | 保存服务（`SaveSource`，无 UI） | 3–4 | 18 条服务测试绿；PNG 字节相同 |
+| **S0** | **已有自绘控件封装 + 现有截图面板迁移 + 文案基线** | 待重新估算 | 面板外壳、文本绘制、图标、分段器、按钮、布局命中等共享能力就位；现有截图面板迁移后回归绿；字体覆盖门禁绿 |
+| S1 | 保存与 artifact 提交（`PendingCapture`，无 UI） | 3–4 | 20 条服务测试绿；PNG 字节相同 |
 | S2 | 编码服务（字节数 + 可解码字节） | 2–3 | 体积与实际文件一致；代际取消 |
-| S3 | 模态表单骨架（Win32 窗口 + 原生 EDIT） | 6–9 | 11 条校验逐条可见；真实窗口测试绿 |
+| S3 | **整体面板框架（Win32 窗口 + D2D 外壳）** | 待重新估算 | 920 dip 设计视口、标题栏/底栏、两栏网格、模态焦点与共享视觉 token 就位 |
 | **S4** | **预览：字节数 + 解码画面 + 对比滑块** | 7–9 | 解码画面与产物逐像素一致 |
-| S5 | 尺寸缩放 + 限制体积 | 4–5 | 结果 ≤ 上限（无容差） |
-| S6 | 高级选项（按 D1–D4 裁剪） | 3–4 | 每项生效且可恢复默认 |
+| S5 | **右侧操作栏基础表单（原生字段）** | **3–5** | 路径/命名/格式/质量/校验与原生 `EDIT` 输入可用 |
+| S6 | **右侧操作设置：尺寸、限制体积与高级项** | 待重新估算 | 尺寸联动正确、产物不越体积上限、高级选项生效 |
 | S7 | 长截图分割 + PDF | **已解闸** ✓（D10 已定），估时待细化 ✗ | —— |
 | S8 | Toast / 撤销 / 重命名 / 保存后动作 | 4–5 | 撤销与回滚在失败注入下正确 |
 | S9 | 键盘 / UIA / 动效 / 高对比 | 4–6 | 人工脚本 + 可自动化部分单测 |
 | S10 | 接进捕获流程（`Destination::Save`） | 2–3 | 确认后不写文件；滚动走同一命名规则 |
 
-**总人天（不含 S7）**：**36–49**。S7 已因 D10 定稿而**解除实施闸门** ✓，但**估时仍待细化** ✗（切分逻辑与 PDF 排版可共用，具体人天在 S7 展开测试清单后再给，**不给承诺值**）。
+**总人天（重算）**：S5 由 13–22 降为 **3–5** ✓（D11 改为原生 `EDIT` ✓）⇒ 在旧口径（36–49，不含 S7）上减少 **10–17** ⇒ 约 **19–39 人天（不含 S7）** ✓。S3/S4/S6 与 M2–M5 的边界不变 ✓；S7 已解除闸门但**不给承诺值** ✗。**旧的 36–49 不再作为承诺** ✗。
 
 ---
 
-## S0. 前置：文案字形 + 基线确认
+## S0. 已有自绘控件封装、现有面板迁移与文案基线
 
-**目标**：11 条校验文案与冲突/Toast 文案全部能被字体子集渲染；现有保存/转换测试全绿作为基线。
+**目标**：先把现有自定义截图面板已经验证过的绘制与交互能力封装成共享层，再让原面板迁移到共享层。S0 不把缺失的 TextField 假装成“已有能力”；它只建立后续 TextField、Select、Toast 等控件必须遵守的绘制、布局、命中和状态契约。
+
+### S0 当前实施状态
+
+截至本轮，S0 已完成第一批可复用能力并已接入截图面板：
+
+| 能力 | 当前实现 | 状态 |
+| --- | --- | --- |
+| 共享 crate 与依赖方向 | `crates/snapclip-ui`；capture/app 依赖它，UI 不依赖业务层 | 已完成 |
+| D2D 原语 | `PanelPainter` 统一圆角填充、描边、线条、文本绘制与 DirectWrite 测量 | 已完成 |
+| 分段器 | `SegmentState` + `PanelPainter::segmented`；RegionPanel 已消费共享实现 | 已完成 |
+| 按钮 | `panel/button.rs`：`Button` / `ButtonState`，含命中与 `paint` 绘制入口 | 已完成 |
+| Tag 胶囊 / 下拉 / 单选框 | `panel/tag.rs`、`panel/dropdown.rs`、`panel/radio.rs`：几何、状态、命中和 D2D 绘制入口 | 已完成（截图面板的尺寸/位置/单位已使用 Tag；保存面板后续复用） |
+| 主题 token | `PanelTheme`；RegionPanel 画刷初始化使用同一组 token | 已完成 |
+| 图标资产与图标按钮 | `snapclip-ui::panel::icons` 提供 `Glyph`/PNG 契约，`panel/icon_button.rs` 提供几何与命中；`PanelIcons` 仍由 capture 持有设备相关 WIC/D2D 缓存 | 共享契约已完成；设备缓存按生命周期留在 renderer |
+| 通用 PanelLayout | 仍由 `RegionPanelLayout` 持有领域布局；尚未抽出跨面板布局接口 | 未完成 |
+| 迁移前后视觉快照对比 | 现有 D2D 测试和几何/命中回归已运行；GPU 真实渲染测试仍按现有 L4 规则 `ignored` | 部分完成 |
+
+因此本轮不能把整个 S0 标记为完成；保存面板在 S3–S6 之前仍需等待跨面板布局契约和视觉基线比较收口。图标不再需要在保存面板复制一套资产或缓存接口。
+
+**基础能力**：
+
+- `PanelTheme` / 画刷缓存：surface、fill、line、line-soft、accent、muted、danger、warning，以及 DPI 下的圆角、边框和焦点环；
+- 文本绘制服务：DirectWrite 字体回退、字号/字重、文本测量、基线、等宽数字和灰度抗锯齿；
+- 已有通用视觉控件：`SegmentState`、`IconButton`、`Button`、`Tag`、`Dropdown`、`RadioGroup`、圆角容器和状态画刷；图标资产契约在 `snapclip-ui`，WIC/D2D 设备缓存留在 renderer；`TextField` 的通用交互实现留给后续阶段，但必须消费同一套 token 和 layout 约定；
+- 布局/命中测试约定：绘制和命中测试共用不可变 layout；
+- `PanelView` 快照约定：状态机先计算不可变视图，再由绘制器消费，渲染器不反推业务状态。
+
+现有自定义截图面板的数字字段仍是领域输入逻辑，不得把它误称为通用 TextField；保存面板的任意文本 TextField 在 S5 实现，但必须消费 S0 的文本绘制、token、状态和命中测试约定。不得复制文本测量、焦点环和分段器绘制逻辑。
 
 **测试先行清单**
 
 | # | 测试名 | 断言 | 先红原因 |
 | --- | --- | --- | --- |
-| 1 | `the_embedded_subset_draws_every_new_save_panel_character` | `windows/win/d2d/tests.rs:1451` 的覆盖门禁对新词表全绿 | 词表未加 |
-| 2 | `the_existing_conversion_suite_still_passes` | `convert.rs` 的 7 条测试全绿（基线） | —— （用于确认没破坏） |
+| 1 | `the_existing_region_panel_is_green_before_extraction` | 现有 `region::`、`geometry::`、D2D 视觉回归作为迁移前基线 | ——（基线） |
+| 2 | `shared_controls_have_one_layout_and_hit_test_source` | 分段器、按钮、菜单和图标的绘制矩形与命中矩形来自同一 layout | 控件内核不存在 |
+| 3 | `shared_paint_primitives_match_the_existing_region_panel` | 文本、圆角、图标、分段器和按钮在共享层的输出与现有面板一致 | 共享绘制层不存在 |
+| 4 | `the_region_panel_uses_the_shared_controls_without_visual_drift` | 迁移前后固定 DPI/状态截图的几何、颜色、字重和命中行为一致 | 现有面板尚未迁移 |
+| 5 | `the_embedded_subset_draws_every_new_save_panel_character` | `windows/win/d2d/tests.rs:1451` 覆盖门禁对新词表全绿 | 词表未加 |
+| 6 | `the_existing_conversion_suite_still_passes` | `convert.rs` 的 7 条测试全绿 | ——（基线） |
 
-**实现清单**：`subfont/drawn-text.txt` 增补文案字符 → 跑 `subfont/subset.ps1` → 门禁绿。
+**实现顺序**：先固定现有截图面板的测试/截图基线；从 `d2d.rs` 抽取 `draw_text_in`、文本测量/格式、圆角填充/描边、分段器、图标着色和画刷/token；整理 layout 即命中测试唯一来源；将现有 RegionPanel 的视觉控件迁移到共享层并删除重复实现；最后补字体子集文案并运行门禁。当前已完成文本、测量、圆角、线条、分段器、主题、基础按钮命中、图标资产契约和 `IconButton` 几何迁移；跨面板布局契约和迁移前后固定状态的 GPU 快照比较仍待完成。文本输入按 D11 由**原生 `EDIT`** 承担 ✓，其插入点/选区/撤销/剪贴板/UIA 均由系统提供 ✓；S0 不涉及文本输入 ✓。
+
+**实现清单**：优先新增独立的 `snapclip-ui` Windows/D2D crate（只有依赖图证明不需新 crate 时才选择同 UI crate 内模块）；截图面板和保存面板共同依赖它。不得让 `snapclip-app` 访问 `snapclip-capture` 的 `pub(crate)` 绘制实现。
 
 **验收命令**
 
 ```bash
 powershell -NoProfile -ExecutionPolicy Bypass -File subfont/subset.ps1
-cargo test -p snapclip-capture --lib windows::win::d2d
+cargo test -p snapclip-capture --lib region:: -- --test-threads=1
+cargo test -p snapclip-capture --lib geometry:: -- --test-threads=1
+cargo test -p snapclip-capture --lib windows::win::d2d -- --test-threads=1
 ```
 
-**风险与回退**：字体重建可能改变现有字形度量 ⇒ 以门禁 + 现有 UI 测试为准；若红，分批加入。
+**阶段出口**：已有视觉控件只有一套实现；现有截图面板完成迁移且迁移前后回归通过；S3–S6 只能组合共享视觉控件。TextField 尚未完成不视为 S0 失败，但 S5 不得绕过共享绘制层自行实现。
 
-**估时**：1 人天。
+**风险与回退**：抽取可能改变字形度量或命中热区 ⇒ 以迁移前后截图、DPI 矩阵和现有单测验收；不通过保留第二套旧控件来“回退”。
+
+**估时**：待按控件内核、迁移和回归重新估算 ✓；已**不再包含 IMM32** ✗（D11 改为原生 `EDIT` ✓）。
 
 ---
 
-## S1. 保存服务（`SaveSource`，无 UI）
+## S1. 编码产物与保存提交（`PendingCapture`，无 UI）
 
-**目标**：给定 `SaveSource` + `SaveRequest`，把像素写成目标文件并返回最终路径；全程校验、失败语义明确、原子提交。**`SaveSource` 承载数据源，服务本身不持有像素的所有权**。
+**目标**：从 capture crate 的 `PendingCapture` 编码出唯一的文件型 `EncodedArtifact`，再将该 artifact 的字节提交到目标路径。预览、复制、拖出和保存共用该产物（D9）；保存操作不再次编码。输入源和临时产物分别由 `PendingCapture` 与 `EncodedArtifact` 单一持有。
 
-**接口（登记在此，实施时可微调但需回改本表）**
+**接口（编码参数与文件命名分离，路径变化不使编码缓存失效）**
 
 ```rust
-pub fn save(source: &mut SaveSource, request: &SaveRequest) -> Result<SaveOutcome, SaveError>;
+pub fn encode(source: &mut PendingCapture, request: &EncodeRequest) -> Result<EncodedArtifact, SaveError>;
+pub fn save(artifact: &EncodedArtifact, request: &SaveRequest) -> Result<SaveOutcome, SaveError>;
+
+pub struct EncodeRequest {
+    pub output_size: Size,
+    pub format: SaveFormat,
+    pub quality: u8,
+    pub advanced: AdvancedOptions,
+}
 
 pub struct SaveRequest {
     pub directory: PathBuf,
     pub template: Template,
     pub sequence: u32,
-    pub format: SaveFormat,
-    pub quality: u8,
-    pub advanced: AdvancedOptions,   // S6 才填满；S1 先只有默认值
     pub conflict: ConflictPolicy,    // 默认 AutoRename
 }
 
 pub struct SaveOutcome { pub path: PathBuf, pub bytes: u64, pub format: SaveFormat }
 ```
 
-- `SaveSource::Whole` / `Written`：读像素（`Written` 直接读文件）；
-- `SaveSource::Bands`：**按行回放**喂行带 sink ⇒ **不物化整图**（D9 的硬约束）；
-- 编码结果落 `.partial` ⇒ rename；**`.partial` 不得残留**。
+- `PendingCapture` 是 capture crate 的 opaque 类型；内部独占 `SelectionPixels`、滚动 tile lease 或现有 artifact。app crate 不引用 crate-private 的 `ScrollBands`，也不重复保存 lease。
+- 编码器直接写临时 artifact 文件，不把完整编码结果强制装进 `Vec<u8>`。`EncodedArtifact` 独占清理该文件；其 key 包含源身份、尺寸、格式、质量和高级项。
+- PNG/JPEG 使用有界行带写入；WebP 只在现有尺寸与像素预算内接受，超限必须在读取首行前拒绝。S1 覆盖三种格式的 whole source；Bands 对 PNG/JPEG 覆盖行带路径，WebP 按格式预算验证接受/拒绝行为。
+- 保存将 artifact 复制到目标目录的 `.partial`，flush 后提交；保留 artifact 供面板再次保存。失败时清理目标 `.partial`，不得破坏缓存 artifact。
 
 **测试先行清单**
 
 | # | 测试名 | 断言 | 先红原因 |
 | --- | --- | --- | --- |
-| 1 | `a_png_request_copies_the_master_byte_for_byte` | 目标文件与 `Written` 母版字节相同 | 服务不存在 |
-| 2 | `a_banded_png_request_matches_the_whole_png_byte_for_byte` | `Bands` 与 `Whole` 产出的 PNG **字节相同**（D9：不物化也不改像素） | 同上 |
-| 3 | `a_jpeg_request_produces_a_readable_jpeg_of_the_source_size` | 解码宽高 = 源宽高 | 同上 |
-| 4 | `a_webp_request_produces_a_lossless_webp` | 解码后逐像素等于源（D1） | 同上 |
+| 1 | `a_png_request_copies_the_master_byte_for_byte` | `EncodedArtifact` 提交后的目标与 artifact 字节相同 | 服务不存在 |
+| 2 | `a_banded_png_request_matches_the_whole_png_byte_for_byte` | 同一编码器配置下 `Bands` 与 `Whole` 的 PNG 字节相同（且 Bands 不物化整图） | 同上 |
+| 3 | `a_jpeg_request_produces_a_readable_jpeg_of_the_source_size` | Whole 与预算内 Bands 均可解码，尺寸 = 源尺寸 | 同上 |
+| 4 | `a_webp_request_produces_a_lossless_webp` | 预算内 Whole 可解码且逐像素等于源（D1）；超预算在读取前拒绝 | 同上 |
 | 5 | `a_second_save_of_the_same_name_becomes_underscore_two` | `名_2.PNG`；第一个仍在 | 同上 |
 | 6 | `overwriting_a_name_replaces_it_and_no_partial_survives` | 只剩一个文件；无 `.partial` | 同上 |
 | 7 | `the_template_expands_every_variable_the_spec_defines` | 5 个变量各一个用例 | 变量解析不存在 |
@@ -173,18 +243,19 @@ pub struct SaveOutcome { pub path: PathBuf, pub bytes: u64, pub format: SaveForm
 | 17 | `a_jpeg_request_beyond_the_budget_is_refused_before_any_row_is_read` | 超 16 MP ⇒ `FormatTooLarge`，且**未回放任何行**（用计数断言） | 同上 |
 | 18 | `a_webp_request_beyond_16383_refuses` | 宽或高 > 16383 ⇒ `FormatTooLarge` | 同上 |
 | 19 | `the_sequence_advances_only_after_a_successful_save` | 成功 +1；失败不变 | 同上 |
-| 20 | `cancelling_midway_leaves_no_file_and_no_partial` | 取消源回放 ⇒ 无文件、无 `.partial` | 同上 |
+| 20 | `cancelling_midway_leaves_no_file_and_no_partial` | 取消编码或提交 ⇒ 无目标文件、无 `.partial`；artifact owner 清理临时文件 | 同上 |
 
 **实现清单**
 
 | 文件 | 内容 |
 | --- | --- |
-| `apps/snapclip/src/save/mod.rs`（新） | `SaveRequest` / `SaveOutcome` / `SaveError` / `SaveSource` 门面 |
-| `apps/snapclip/src/save/source.rs`（新） | `SaveSource` 三支 + 行回放适配（复用 `BandSource`） |
+| `crates/snapclip-capture/src/save_source.rs`（新） | opaque `PendingCapture` 与受控行带访问；封装 `ScrollBands`，由 capture crate 唯一持有和清理 |
+| `apps/snapclip/src/save/mod.rs`（新） | `EncodeRequest` / `SaveRequest` / `SaveOutcome` / `SaveError` / `EncodedArtifact` 门面 |
+| `apps/snapclip/src/save/source.rs`（新） | capture crate opaque source 到编码器的适配；不暴露 `ScrollBands` |
 | `apps/snapclip/src/save/template.rs`（新） | `Template::parse` / `expand` |
 | `apps/snapclip/src/save/validate.rs`（新） | 11 条校验（纯函数，不产出文件） |
 | `apps/snapclip/src/save/conflict.rs`（新） | `resolve(dir, stem, ext, policy)`；不区分大小写 |
-| `apps/snapclip/src/save/service.rs`（新） | 校验 → 冲突 → 编码（`Written`/`Whole` 走 `convert_to_file`；`Bands` 走 `write_bands`）→ 返回 |
+| `apps/snapclip/src/save/service.rs`（新） | 校验 → 格式能力检查 → `EncodedArtifact` 临时文件编码 → artifact 字节原子提交；保存不重编码 |
 | `crates/snapclip-capture/src/save_format.rs` | 上限判据复用 `can_encode` / `within_jpeg_frame_budget` |
 
 **验收命令**
@@ -203,22 +274,23 @@ git hook run pre-push
 
 ## S2. 编码服务（字节数 + 可解码字节）
 
-**目标**：一次编码同时产出 ①编码后字节数 ②**可解码的字节**（S4 的解码预览要用，D5）；带防抖、代际取消、缓存。
+**目标**：一次编码产出文件型 `EncodedArtifact`，其文件大小是实测体积、内容供 S4 解码；S1 保存直接提交同一个 artifact。带防抖、代际取消和有界缓存。
 
 **测试先行清单**
 
 | # | 测试名 | 断言 | 先红原因 |
 | --- | --- | --- | --- |
-| 1 | `a_lower_jpeg_quality_never_increases_the_byte_count` | q92、q75、q50 的字节数**非递增**（**不断言严格单调** ✗：平坦区域可能相等） | 服务不存在 |
-| 2 | `a_cached_request_encodes_nothing` | 同一 key 第二次 ⇒ `encodes == 0` | 同上 |
+| 1 | `the_encoded_artifact_size_equals_its_file_length` | 报告体积等于 artifact 文件长度 | 服务不存在 |
+| 2 | `a_cached_request_reuses_the_same_artifact` | 同一 key 第二次不编码，artifact 内容相同 | 同上 |
 | 3 | `changing_an_advanced_option_invalidates_the_cache` | 键含格式/质量/高级项/源摘要 | 同上 |
-| 4 | `a_newer_request_supersedes_the_older_one` | 旧代次结果被丢弃（复用 export worker 协议） | 同上 |
-| 5 | `the_reported_size_equals_the_file_that_saving_writes` | 预估字节数 == S1 实际文件大小 | 同上 |
-| 6 | `the_produced_bytes_decode_to_the_source_pixels` | PNG/WebP 解码后逐像素等于源；JPG 允许有损但尺寸一致 | 同上 |
+| 4 | `a_newer_request_supersedes_the_older_one` | 旧代次结果被丢弃并清理临时 artifact（复用 export worker 协议） | 同上 |
+| 5 | `saving_a_preview_artifact_does_not_encode_again` | 保存目标逐字节等于预览所用 artifact；编码调用数不增加 | 同上 |
+| 6 | `the_artifact_decodes_to_the_expected_pixels` | PNG/WebP 无损逐像素一致；JPG 只断言可解码、尺寸正确 | 同上 |
+| 7 | `the_artifact_cache_obeys_its_byte_budget` | 活跃预览可保留；缓存按字节上限驱逐且删除临时文件 | 上限与实现不存在 |
 
-**实现清单**：`save/encode.rs`（复用 `convert()` 的 `impl Write` 到内存 sink ⇒ 同时得到字节数与字节）、`save/cache.rs`（key + LRU）、`save/generation.rs`（复用导出线程的 generation 语义，不自建线程池）。
+**实现清单**：`save/encode.rs`（编码器写入临时文件，产出 `EncodedArtifact`）、`save/cache.rs`（key + 按字节限额的 artifact LRU）、`save/generation.rs`（复用导出线程的 generation 语义，不自建线程池）。完整编码字节不得默认驻留内存；S2 必须用真实尺寸语料记录峰值内存并据此定缓存上限。
 
-**验收命令**：`cargo test -p snapclip-app --lib save::encode save::cache`
+**验收命令**：`cargo test -p snapclip-app --lib save::`
 
 **风险与回退**：大图编码会占 CPU ⇒ 必须在后台线程（导出线程），面板只收结果。
 
@@ -226,52 +298,33 @@ git hook run pre-push
 
 ---
 
-## S3. 模态表单骨架（Win32 + 原生 EDIT）
+## S3. 整体面板框架（Win32 + D2D 外壳）
 
-**目标**：920 宽的模态面板：路径 / 模板 / 格式 / 质量 / 冲突 / 底栏；11 条校验逐条可见；键盘可达；**数据源由 `PendingCapture` 持有**。
+**目标**：先搭完整面板的整体结构，再进入具体区域。建立 920 dip 设计视口、无边框模态窗口、标题栏、左预览/右操作两栏网格、底栏和浮层层级；S3 只呈现结构占位，不提前实现预览内容或右侧表单行为。整体尺寸、间距、圆角、色彩和字体 token 依据规格 §2 与 §11。
 
-**平台实现（按 §0.2）**：独立窗口线程或宿主模态层；D2D 绘制外壳；文本字段 = **原生 `EDIT` 子窗口**（去边框、字号由字体子集渲染、`EM_*` 消息处理 IME/选区/撤销）；模态焦点用 `EnableWindow` + 焦点栈；`Tab`/`Esc`/`Enter` 由面板消息循环处理。
+**平台实现**：面板运行于现有 overlay UI 线程或其 owned modal window；D2D 绘制面板外壳。模态焦点、父窗口禁用/恢复、关闭路径和 `PendingCapture` 唯一所有权在此阶段确立。左栏预览区与右栏操作区仅使用边界明确的布局槽位，后续 S4 填充左栏，S5–S6 填充右栏。
 
 **测试先行清单**
 
 | # | 测试名 | 断言 | 层次 | 先红原因 |
 | --- | --- | --- | --- | --- |
-| 1 | `the_form_reports_each_validation_rule_without_saving` | 11 条规则各一个非法状态 ⇒ 状态行逐字等于 §0.3 | 单测（纯状态机） | 表单不存在 |
-| 2 | `the_save_button_is_disabled_while_an_error_stands` | error ⇒ 禁用；只有 warn ⇒ 可用 | 单测 | 同上 |
-| 3 | `the_warning_offers_the_repair_it_names` | "立即创建"可点且真的创建目录 | 单测 + 临时目录 | 同上 |
-| 4 | `jpeg_is_disabled_for_a_scroll_source_above_the_budget` | 超 16 MP 的 `Bands` 源 ⇒ JPG 项禁用并给出原因 | 单测 | 上限未接 UI |
-| 5 | `the_sequence_previews_the_next_number` | 显示下一个值；成功后自增 | 单测 | 未接 |
-| 6 | `escape_cancels_and_enter_saves` | 键盘分派表 | 单测（分派）+ 真实窗口（见下） | 未接 |
-| 7 | `the_quality_row_is_absent_for_png_and_webp` | D1：WebP 也无质量档 | 单测 | 未接 |
-| 8 | `a_pending_capture_is_dropped_when_the_panel_closes` | 关闭 ⇒ `PendingCapture` 释放；`Bands` 的 tile 文件被删 | **真实窗口测试** | 生命周期未接 |
-| 9 | `the_edit_control_accepts_and_reports_ime_composition` | 原生 EDIT 收到 `WM_IME_*` 后文本正确 | **真实窗口测试**（可能需要注入 IME 消息） | 无 EDIT 宿主 |
-| 10 | `focus_stays_inside_the_modal_panel` | `Tab` 循环不出面板；父窗口被禁用 | **真实窗口测试** | 未接 |
+| 1 | `the_panel_layout_matches_the_demo_frame` | 固定 920 dip 视口下标题栏、两栏、间距、底栏边界符合 §2 和 §11.4 | 布局单测 + 截图 | 面板不存在 |
+| 2 | `the_preview_and_action_slots_keep_their_declared_geometry` | 左 556、右 320、栏间距 12 dip；小屏按 §15 适配，不挤压控件 | 布局单测 | 两栏布局不存在 |
+| 3 | `the_modal_frame_restores_parent_state_on_every_close_path` | 取消、Esc、关闭按钮和异常退出均恢复父窗口状态并释放 `PendingCapture` | 真实窗口测试 | 生命周期未接 |
+| 4 | `the_panel_shell_renders_with_shared_tokens` | surface、line、字体和圆角 token 有固定环境截图基线 | 截图基准 + 实机检查 | D2D 外壳未实现 |
 
-> **测试层次纪律**：1–7 是纯状态机单测（不需窗口）；8–10 必须**真开窗口**（`CreateWindowExW` + `SendMessage` 驱动），**不得**降级为人工验收。窗口测试在 CI 里可能因桌面会话受限而跳过 —— 跳过必须写成 `#[ignore = "needs an interactive desktop"]` 并登记，**不许静默 skip**。
-
-**实现清单**
-
-| 文件 | 内容 |
-| --- | --- |
-| `apps/snapclip/src/ui/save_panel/mod.rs`（新） | 状态机（字段、派生量、校验状态） |
-| `apps/snapclip/src/ui/save_panel/window.rs`（新） | 窗口类注册、消息循环、模态焦点、`WM_APP` 处理 |
-| `apps/snapclip/src/ui/save_panel/edit_host.rs`（新） | 原生 `EDIT` 子控件宿主（创建/移动/取值/IME/选中） |
-| `apps/snapclip/src/ui/save_panel/layout.rs`（新） | 布局（规格 §11.3 token） |
-| `apps/snapclip/src/ui/save_panel/draw.rs`（新） | D2D 外壳与状态行（文本走字体子集） |
-| `apps/snapclip/src/save/pending.rs`（新） | `PendingCapture`（持有 `SaveSource` + Drop 清理） |
-| `crates/snapclip-capture/src/preferences.rs` | 持久化：模板/序号/路径/格式/质量/限制体积/保存后动作 |
+**实现清单**：`window.rs`（窗口类、消息循环、模态焦点与 `WM_APP`）、`layout.rs`（仅整体框架与两栏几何）、`draw.rs`（面板外壳、标题栏、底栏、占位区域）、`pending.rs`（capture crate opaque handle 的唯一所有权）。前置条件是 S0 的共享控件抽取和现有截图面板迁移回归已通过。
 
 **验收命令**
 
 ```bash
-cargo test -p snapclip-app --lib ui::save_panel
+cargo test -p snapclip-app --lib ui::save_panel::layout
 cargo test -p snapclip-app --features test-support --lib ui::save_panel::window
-cargo build --release
 ```
 
-**风险与回退**：原生 EDIT 的样式与 D2D 外壳的贴合是主要风险 ⇒ 先接受"EDIT 外观略朴素（去边框 + 底色一致）"，不追求像素级一致；如 EDIT 与 D2D 混排不可接受，再评估自绘（但那要接受 IME/UIA 的代价，需重新决策）。
+**阶段验收**：先在完整面板视口检查整体框架与区域比例；此时只验布局与外观基线，不以占位区域冒充预览或操作功能。窗口缩小时遵守规格 §15，不通过整体缩放字体或控件来挤入视口。
 
-**估时**：6–9 人天。
+**估时**：待按窗口、模态生命周期与 D2D 外壳重新估算。
 
 ---
 
@@ -279,7 +332,7 @@ cargo build --release
 
 **目标**：左栏显示**真实产物**：①编码后字节数 ②**编码后再解码**的画面 ③对比滑块（有损格式）；含缩放/网格/尺寸标签/背景。
 
-**前置**：JPG/WebP **解码器**。选型要在本阶段开头完成并登记（候选：小而专的解码 crate；`image` 因体积被否）。解码器只用于**预览**，不进入保存路径。
+**前置**：JPG/WebP **解码器**。选型要在本阶段开头完成并登记（候选：小而专的解码 crate；`image` 因体积被否）。解码器只用于**预览与剪贴板表示**，不进入编码/保存路径。大图解码按可见区域或有界 tile 供给，缓存按字节计量并驱逐；S2/S4 用支持的最大输入确定并验证上限。
 
 **测试先行清单**
 
@@ -296,7 +349,12 @@ cargo build --release
 
 **实现清单**：`ui/save_panel/preview.rs`（变换、脏区、网格、背景）、`save/decode.rs`（解码器封装）、`save/compare.rs`（滑块合成）。
 
-**验收命令**：`cargo test -p snapclip-app --lib ui::save_panel::preview save::decode`
+**验收命令**：
+
+```bash
+cargo test -p snapclip-app --lib ui::save_panel::preview
+cargo test -p snapclip-app --lib save::decode
+```
 
 **风险与回退**：解码依赖的编译时间/许可是唯一硬风险 ⇒ 若不可接受，**必须回到 D5 重新决策**（不是默默降级 ✗）。
 
@@ -304,7 +362,40 @@ cargo build --release
 
 ---
 
-## S5. 尺寸缩放 + 限制体积
+## S5. 右侧操作栏基础表单（原生字段）
+
+**目标**：在 S3 的右栏槽位内实现路径/命名/格式/质量/冲突与保存底栏。输入字段使用**原生 `EDIT`** ✓（D11 ✓），外壳与按钮由 D2D/`snapclip-ui` 绘制 ✓；状态机、校验、持久化由右栏统一驱动 ✓。**数据源由 `PendingCapture` 持有** ✓，右栏不复制源像素 ✓。
+
+**平台实现（D11）**：面板是**独立普通窗口** ✓（截图框已消失 ✓），输入字段是**真实 `WS_CHILD` `EDIT`** ✓ ⇒ IME/候选窗/撤销/剪贴板/拖选/UIA 由系统提供 ✓。**不自绘 TextField、不接 IMM32、不接 TSF** ✗。`Tab` 在真实控件间传递焦点 ✓；`EDIT` 通过 `WM_CTLCOLOR*` 与父窗口的 D2D 外壳对齐颜色与字体 ✓；`EDIT` **内缩 1–2 dip**，圆角由外框负责 ✓。
+
+**测试先行清单**
+
+| # | 测试名 | 断言 | 层次 | 先红原因 |
+| --- | --- | --- | --- | --- |
+| 1 | `the_form_reports_each_validation_rule_without_saving` | 11 条规则各一非法状态 ⇒ 状态行逐字等于 §0.3 | 单测（纯状态机） | 表单不存在 |
+| 2 | `the_save_button_is_disabled_while_an_error_stands` | error ⇒ 禁用；仅 warn ⇒ 可用 | 单测 | 同上 |
+| 3 | `the_warning_offers_the_repair_it_names` | “立即创建”可点且真的创建目录 | 单测 + 临时目录 | 同上 |
+| 4 | `jpeg_is_disabled_for_a_scroll_source_above_the_budget` | 超 16 MP 的 `Bands` 源 ⇒ JPG 禁用并给出原因 | 单测 | 上限未接 UI |
+| 5 | `the_sequence_previews_the_next_number` | 显示下一个值；成功后自增 | 单测 | 未接 |
+| 6 | `escape_cancels_and_enter_saves` | 键盘分派表 | 单测（分派）+ 真实窗口 | 未接 |
+| 7 | `the_quality_row_is_absent_for_png_and_webp` | D1：WebP 也无质量档 | 单测 | 未接 |
+| 8 | `the_native_edit_fields_receive_focus_in_tab_order` | `Tab` 在真实 `EDIT` 之间循环、不越出面板 | 真实窗口 | 控件不存在 |
+| 9 | `a_native_edit_accepts_composition_and_commits_once` | 真实 IME 组合/提交/取消；字符**只出现一次** ✗ | 真实窗口（需交互桌面） | 控件不存在 |
+| 10 | `the_edit_inset_keeps_the_rounded_frame_visible` | 位图断言：外框圆角完整、`EDIT` 背景与框同色、内缩 1–2 dip | 位图（`render_view`） | 外框未接 |
+| 11 | `cancelling_the_panel_follows_d12` | 默认退出截图；配置为回退时截图框恢复且 `PendingCapture` 未释放 | 真实窗口 + 单测 | D12 未接 |
+| 12 | `the_basic_action_rows_follow_the_demo_order` | 行序与 §2、§5 一致；为 S6 保留规格定义的区域 | 布局单测 + 截图 | 右栏不存在 |
+
+> **层次纪律**：1–7、12 为纯单测 ✓；8/9/11 需**真实窗口** ✓（无桌面 CI 用 `#[ignore = "needs an interactive desktop"]` 登记 ✓，发布前门禁必须执行 ✓）；10 用现有位图装置 ✓。**不写任何 IMM32 / 组合渲染 / 候选窗测试** ✗ —— 那些行为属于系统 ✓，只验“能输入中文且只提交一次” ✓。
+
+**实现清单**：`mod.rs`（右栏状态机、派生量与校验）、`snapclip-ui`（外壳、按钮、分段器、`Tag`）、`layout.rs`（右栏行组 + `EDIT` 的放置矩形）、`draw.rs`（标签、外框、状态行）、`native_edit.rs`（`CreateWindowExW("EDIT")` + 字体/`WM_CTLCOLOR*` + 内缩 ✓）、`preferences.rs`（模板/序号/路径/格式/质量/保存后动作）。**不再需要** `ime.rs`（IMM32）✗ 与共享 `TextField` ✗。
+
+**阶段验收**：S3 面板框架与 S4 预览就位后，确认右栏密度/分组/底栏对齐，再确认字段行为；`EDIT` 的视觉与外壳一致性由第 10 条位图断言收口 ✓。右栏不得靠增大面板或改左栏几何来掩盖布局问题 ✓。
+
+**估时**：**3–5 人天** ✓（原 13–22 ✗ —— 差额全部来自“不再自研文本输入” ✓）。
+
+## S6. 右侧操作设置：尺寸、限制体积与高级项
+
+### S6.1 尺寸缩放 + 限制体积
 
 **目标**：数值/百分比/锁比/预设；"限制体积"用质量搜索。
 
@@ -326,7 +417,7 @@ cargo build --release
 
 ---
 
-## S6. 高级选项（按 D1–D4 裁剪）
+### S6.2 高级选项（按 D1–D4 裁剪）
 
 **内容**：PNG 压缩等级（已有，接出去）；PNG 色板量化（规格 §6.2，需评估）；JPG 填充色；JPG 色度采样（**默认 4:4:4**，4:2:0 高级项并标注"文字更糊"）。**不做**：WebP 无损开关（D1）、渐进式（D2）、移除元数据（D3）。
 
@@ -398,7 +489,7 @@ cargo build --release
 
 **真实窗口测试**（不得只靠人工）：`Tab` 顺序、`Esc`、`Enter`、`Ctrl+C`、焦点不出面板、错误用 `LiveRegion` 属性。
 
-**只能人工**（写明并只承认人工结论）：13 条动效的观感、三套高对比主题下 ≥4.5:1 的对比度、UIA 树的语义是否可理解（用 Inspect.exe）。
+**只能人工**（写明并只承认人工结论）：13 条动效的观感、三套高对比主题下 ≥4.5:1 的对比度、UIA 树的语义是否可理解（用 Inspect.exe）。所有区域实现完成后，以规格 §11.4 为准，在同 Windows/DPI/字体环境做 demo 与原生面板截图对比，覆盖面板布局、颜色、字体、控件状态和层级；记录差异并修正可见偏差。抗锯齿逐像素差异可接受，几何偏移、比例、色值、字重或基线明显不符则不通过。
 
 **估时**：4–6 人天。
 
@@ -444,13 +535,16 @@ cargo run -p codec-bench --release -- --assert
 
 | 里程碑 | 包含 | 人天 | 说明 |
 | --- | --- | ---: | --- |
-| **M1 能保存** | S0 + S1 | 4–5 | 保存服务 + 20 条测试；`convert()` 有生产调用者 |
-| **M2 面板可用** | + S2 + S3 | 12–17 | 能选格式、看体积、键盘可用、11 条校验可见 |
-| **M3 所见即所存** | + S4 | 19–26 | 预览显示**真实解码结果**（D5），对比滑块可用 |
-| **M4 能控** | + S5 + S6 | 26–35 | 尺寸、体积上限、高级项 |
-| **M5 完整** | + S8 + S9 + S10 | 36–49（不含 S7） | **S7 已解闸** ✓，其估时待细化 ✗ |
+| **M1 能保存** | S0 + S1 | 待重算 | 共享控件内核已迁移回归；保存服务 + 20 条测试；`convert()` 有生产调用者 |
+| **M2 面板框架就位** | + S2 + S3 | 待重算 | 完整窗口框架、标题栏、左右区域、底栏与模态生命周期正确 |
+| **M3 所见即所存** | + S4 | 待重算 | 左侧预览显示**真实解码结果**（D5），对比滑块可用 |
+| **M4 操作可用** | + S5 + S6 | 待重算 | 右侧基础表单、尺寸/体积上限与高级项可用 |
+| **M5 核心流程可交付** | + S8 + S9 + S10 | 待重算（不含 S7） | 不包含长截图分割与 PDF；不得称为完整保存面板 |
+| **长截图输出完整** | S7 | 待估 | D10 已定、可以实施；完成测试拆解与估时后纳入整体排期 |
 
-> **D5 的纪律**：M2 **不是**"预览已完成"的里程碑 —— 它只有字节数。**M3 才算"所见即所存"**，任何文档/汇报不得把 M2 说成预览已完成 ✗。
+> **阶段顺序**：S0 先统一并迁移基础控件；M2 验整体框架，M3 验左侧预览，M4 验右侧操作，随后 S9 验完整面板。后续 UI 阶段不得绕过 S0 另造控件。
+
+> **D5 的纪律**：M2 **不是**"预览已完成"的里程碑 —— 它只有面板框架与字节服务。**M3 才算"所见即所存"**，任何文档/汇报不得把 M2 说成预览已完成 ✗。
 
 ---
 
@@ -471,9 +565,9 @@ cargo run -p codec-bench --release -- --assert
 
 | 项 | 手段 | 阻塞谁 |
 | --- | --- | --- |
-| 质量 75 / 50 的文字与渐变损失（D8） | `codec-bench --quality` 三类内容 | S5 的档位搜索、S6 质量行 |
+| 质量 75 / 50 的文字与渐变损失（D8） | `codec-bench --quality` 三类内容 | S6 的档位搜索与质量行 |
 | 4:2:0 在真实截图上的代价 | 同上 + `docs/34 §11` 方法 | S6 的默认值说明 |
 | PDF 页尺寸 / WebP 回退（D10） | **已定** ✓ | S7（解闸 ✓，估时待细化 ✗） |
 | 解码依赖选型（S4） | 体积/许可/编译时间对比 | S4 |
-| 重采样依赖选型（S5） | 同上 | S5 的缩放部分 |
-| 保存后是否关窗（D6）/ Toast 位置（D7） | 用户拍板 | S3 底栏、S8 位置 |
+| 重采样依赖选型（S6） | 同上 | S6 的缩放部分 |
+| 文本输入实现（D11） | **已定：原生 `EDIT` + 独立普通窗口 + DWM backdrop** | S5、S9 |
