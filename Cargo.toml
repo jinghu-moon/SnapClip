@@ -21,6 +21,7 @@
 resolver = "2"
 members = [
     "crates/snapclip-model",
+    "crates/snapclip-ui",
     "crates/snapclip-capture",
     "crates/snapclip-history",
     "apps/snapclip",

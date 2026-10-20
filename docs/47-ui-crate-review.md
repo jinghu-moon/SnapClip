@@ -55,3 +55,5 @@
 
 - 未在真实窗口里跑 `component_gallery`（按指示不必真跑 GUI）；控件的**实际像素**是否与 demo 一致未比对；
 - `text_field` 的 `caret_visible(elapsed_ms)` 是否与面板动画时钟同源未核对。
+
+> **后续（不改本文结论）**：`snapclip-ui/src/panel/text_field.rs` 已在 `P8-03` **删除** ✓（零调用方 ✓）；保存面板改用**原生 `EDIT`**（`docs/42` D11 ✓）。本文对提前做到 S6 的判断作为历史证据保留 ✓。
