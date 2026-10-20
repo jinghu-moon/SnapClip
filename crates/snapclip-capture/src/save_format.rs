@@ -33,6 +33,8 @@ pub enum SaveFormat {
     Png,
     Jpeg,
     Webp,
+    /// AVIF (`docs/49`). Save-time only: the encoder is whole-frame, so a capture never uses it.
+    Avif,
 }
 
 /// Why a format cannot hold an image. Structured rather than a message: the caller decides how to
@@ -85,6 +87,19 @@ pub fn within_jpeg_frame_budget(width: u64, height: u64) -> bool {
     width.saturating_mul(height) <= JPEG_FRAME_BUDGET_PIXELS
 }
 
+/// The most pixels the AVIF save path encodes in one frame.
+///
+/// AVIF has no streaming encoder in this dependency (`docs/49`): `encode` takes a whole frame, so
+/// the save path has to hold it, and the same budget the JPG arm uses is the right shape. A long
+/// scroll capture is refused by this before anything is allocated and stays PNG in the artifact,
+/// then is transcoded only if it fits.
+pub const AVIF_FRAME_BUDGET_PIXELS: u64 = 16_000_000;
+
+/// Whether an image of this size can be saved as AVIF at all.
+pub fn within_avif_frame_budget(width: u64, height: u64) -> bool {
+    width.saturating_mul(height) <= AVIF_FRAME_BUDGET_PIXELS
+}
+
 /// Why a scroll capture will not be saved in the format the user chose.
 ///
 /// Two different answers, kept apart because they mean different things: the format cannot express
@@ -103,7 +118,7 @@ impl std::fmt::Display for Lowering {
             Lowering::Format(limit) => write!(f, "{limit}"),
             Lowering::FrameBudget { pixels, max } => write!(
                 f,
-                "the JPG save path holds the whole frame, and {pixels} pixels exceed its {max} budget"
+                "the save path holds the whole frame, and {pixels} pixels exceed its {max} budget"
             ),
         }
     }
@@ -119,6 +134,10 @@ impl SaveFormat {
             SaveFormat::Png => u64::from(u32::MAX),
             SaveFormat::Jpeg => 65_535,
             SaveFormat::Webp => 16_383,
+            // Conservative: 16384 is the figure this repository could defend without a source, and
+            // the real container limit has not been verified (`docs/49`). A test pins the figure so
+            // a future correction changes one number and one expectation.
+            SaveFormat::Avif => 16_384,
         }
     }
 
@@ -147,6 +166,7 @@ impl SaveFormat {
             SaveFormat::Png => "PNG",
             SaveFormat::Jpeg => "JPG",
             SaveFormat::Webp => "WebP（无损）",
+            SaveFormat::Avif => "AVIF",
         }
     }
 }
@@ -154,6 +174,25 @@ impl SaveFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn avif_uses_the_conservative_side_limit() {
+        assert_eq!(SaveFormat::Avif.max_side(), 16_384);
+        assert_eq!(SaveFormat::Avif.can_encode(16_384, 16_384), Ok(()));
+        assert!(matches!(
+            SaveFormat::Avif.can_encode(16_385, 10),
+            Err(FormatLimit::TooWide { .. })
+        ));
+        assert_eq!(SaveFormat::Avif.label(), "AVIF");
+    }
+
+    #[test]
+    fn avif_refuses_a_frame_over_its_budget() {
+        assert!(within_avif_frame_budget(4000, 4000));
+        assert!(!within_avif_frame_budget(1250, 30_000));
+        assert!(!within_avif_frame_budget(1250, 12_801));
+        assert!(within_avif_frame_budget(1250, 12_800));
+    }
 
     #[test]
     fn webp_stops_at_the_container_limit() {

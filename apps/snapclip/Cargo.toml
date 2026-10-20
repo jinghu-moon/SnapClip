@@ -17,6 +17,7 @@ gpui-kit = "0.7"
 
 # Capability crates, not UI: the shell composes them and owns no feature logic of its own.
 snapclip-model = { path = "../../crates/snapclip-model" }
+snapclip-ui = { path = "../../crates/snapclip-ui" }
 snapclip-history = { path = "../../crates/snapclip-history" }
 snapclip-capture = { path = "../../crates/snapclip-capture" }
 serde = { version = "1", features = ["derive"] }
@@ -109,6 +110,7 @@ zenjpeg = { version = "=0.8.4", default-features = false, features = ["trellis"]
 # are kept on purpose: turning them off removes the `Encoder` itself, which the bench found the
 # hard way.
 zenwebp = "=0.4.4"
+
 
 # `Stop`'s `check` names `enough::reason::StopReason`, and `zenjpeg` re-exports the trait without
 # the reason type. `enough` is already in this graph through `zenjpeg` (0.4.5), so this is a direct

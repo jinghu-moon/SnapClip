@@ -141,15 +141,23 @@ pub(crate) fn scroll_format(
     }
     // JPG could hold these rows, but its only correct arm holds the whole frame (`docs/34` §17), and
     // a scroll capture is exactly the image that must not be held (`docs/34` §18).
-    if preferred == SaveFormat::Jpeg && !within_jpeg_frame_budget(u64::from(width), u64::from(rows))
-    {
-        return (
-            SaveFormat::Png,
-            Some(Lowering::FrameBudget {
-                pixels: u64::from(width) * u64::from(rows),
-                max: crate::save_format::JPEG_FRAME_BUDGET_PIXELS,
-            }),
-        );
+    // The whole-frame arms: both hold the frame to encode it, so a scroll capture that would not
+    // fit is lowered before the session starts (`docs/49` for AVIF, `docs/34` §18 for JPG). BMP is
+    // not a preference: it exists only as a save-time transcode, so it has no arm here.
+    let whole_frame = match preferred {
+        SaveFormat::Jpeg => Some(crate::save_format::JPEG_FRAME_BUDGET_PIXELS),
+        SaveFormat::Avif => Some(crate::save_format::AVIF_FRAME_BUDGET_PIXELS),
+        SaveFormat::Png | SaveFormat::Webp => None,
+    };
+    if let Some(max) = whole_frame {
+        let pixels = u64::from(width) * u64::from(rows);
+        let fits = match preferred {
+            SaveFormat::Avif => crate::save_format::within_avif_frame_budget(u64::from(width), u64::from(rows)),
+            _ => within_jpeg_frame_budget(u64::from(width), u64::from(rows)),
+        };
+        if !fits {
+            return (SaveFormat::Png, Some(Lowering::FrameBudget { pixels, max }));
+        }
     }
     (preferred, None)
 }

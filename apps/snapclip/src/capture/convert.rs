@@ -233,6 +233,9 @@ impl SinkWriter {
             SaveFormat::Png => Err(ExportError::Sink(
                 "PNG is a copy, so it never reaches a row sink".into(),
             )),
+            SaveFormat::Avif => Err(ExportError::Sink(
+                "AVIF is whole-frame, so it never reaches a row sink".into(),
+            )),
         }
     }
 
