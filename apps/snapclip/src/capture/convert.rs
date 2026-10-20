@@ -16,8 +16,12 @@ use std::path::Path;
 
 use super::row_band_jpeg::JpgRowBandSink;
 use super::row_band_png::{ExportError, ImageMeta};
-use super::save_format::SaveFormat;
+use super::save_format::{within_avif_frame_budget, SaveFormat};
 use super::webp_sink::WebpSink;
+
+use almost_enough::{StopToken, Unstoppable};
+use rgb::Rgba;
+use zenavif::{encode_with, EncoderConfig, PixelBuffer};
 
 /// What a conversion did, for the caller's log line.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,10 +221,70 @@ fn swap_to_bgra(source: &[u8], target: &mut [u8], color: png::ColorType) {
     }
 }
 
-/// One of the two row sinks, behind one interface for the loop above.
+/// The AVIF arm: the one format with no row interface. The encoder takes a whole frame, so this
+/// holds one, and `SaveFormat::can_encode` is what keeps that bounded before a single row arrives.
+struct WholeAvif {
+    quality: u8,
+    width: u32,
+    height: u32,
+    pixels: Vec<Rgba<u8>>,
+}
+
+impl WholeAvif {
+    fn begin(quality: u8, meta: &ImageMeta) -> Self {
+        // Reserved once, from a size the caller already approved, so the frame is one allocation
+        // rather than a sequence of reallocations.
+        let expected = usize::try_from(meta.width.saturating_mul(meta.height)).unwrap_or(0);
+        Self {
+            quality,
+            width: meta.width as u32,
+            height: meta.height as u32,
+            pixels: Vec::with_capacity(expected),
+        }
+    }
+
+    /// Rows arrive as BGRA and AVIF wants RGBA. The swap happens per pixel here, because the two
+    /// layouts are compatible: handing the buffer over unconverted would encode with red and blue
+    /// exchanged and report success (`docs/49`).
+    fn write_rows(&mut self, first_row: u64, rows: &[u8]) -> Result<(), ExportError> {
+        let written = self.pixels.len() as u64;
+        let expected = written / u64::from(self.width);
+        if first_row != expected {
+            return Err(ExportError::Sink(format!(
+                "AVIF received row {first_row} when the frame expects row {expected}"
+            )));
+        }
+        for pixel in rows.chunks_exact(4) {
+            self.pixels.push(Rgba {
+                r: pixel[2],
+                g: pixel[1],
+                b: pixel[0],
+                a: pixel[3],
+            });
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<Vec<u8>, ExportError> {
+        let typed = PixelBuffer::<Rgba<u8>>::from_pixels(self.pixels, self.width, self.height)
+            .map_err(|error| ExportError::Sink(format!("the AVIF frame is not usable: {error}")))?;
+        let erased: PixelBuffer = PixelBuffer::from(typed);
+        // Effort 10 is the fastest setting the dependency has, and it is still about 0.7 MP/s
+        // (`docs/49`): the budget, the worker and the cancellation are all sized around that.
+        let config = EncoderConfig::default()
+            .quality(f32::from(self.quality).clamp(1.0, 100.0))
+            .speed(10);
+        let encoded = encode_with(&erased, &config, StopToken::new(Unstoppable))
+            .map_err(|error| ExportError::Sink(format!("the AVIF frame cannot be encoded: {error}")))?;
+        Ok(encoded.avif_file)
+    }
+}
+
+/// One of the row sinks, behind one interface for the loop above.
 enum SinkWriter {
     Jpeg(super::row_band_jpeg::JpgRowBandWriter),
     Webp(super::webp_sink::WebpWriter),
+    Avif(WholeAvif),
 }
 
 impl SinkWriter {
@@ -233,9 +297,18 @@ impl SinkWriter {
             SaveFormat::Png => Err(ExportError::Sink(
                 "PNG is a copy, so it never reaches a row sink".into(),
             )),
-            SaveFormat::Avif => Err(ExportError::Sink(
-                "AVIF is whole-frame, so it never reaches a row sink".into(),
-            )),
+            SaveFormat::Avif => {
+                // The budget is a save path policy rather than a format limit, so it is checked
+                // here, in front of the frame buffer the encoder would need (`docs/49`).
+                if !within_avif_frame_budget(meta.width, meta.height) {
+                    return Err(ExportError::TooLarge {
+                        width: meta.width,
+                        height: meta.height,
+                    });
+                }
+                Ok(Self::Avif(WholeAvif::begin(quality, meta)))
+            }
+
         }
     }
 
@@ -243,18 +316,52 @@ impl SinkWriter {
         match self {
             Self::Jpeg(writer) => writer.write_rows(first_row, rows),
             Self::Webp(writer) => writer.write_rows(first_row, rows),
+            Self::Avif(writer) => writer.write_rows(first_row, rows),
         }
     }
 
     fn finish(self, out: &mut impl Write) -> Result<u64, ExportError> {
-        let artifact = match self {
-            Self::Jpeg(writer) => writer.finish()?,
-            Self::Webp(writer) => writer.finish()?,
+        // AVIF returns its bytes directly because there is no shared artifact type to wrap them in;
+        // the two row sinks keep the length so the copy below sees one shape.
+        let bytes = match self {
+            Self::Jpeg(writer) => writer.finish()?.bytes,
+            Self::Webp(writer) => writer.finish()?.bytes,
+            Self::Avif(writer) => writer.finish()?,
         };
-        out.write_all(&artifact.bytes)
+        out.write_all(&bytes)
             .map_err(|error| ExportError::Sink(format!("the artifact cannot be written: {error}")))?;
-        Ok(artifact.bytes.len() as u64)
+        Ok(bytes.len() as u64)
     }
+}
+
+/// Decodes an AVIF artifact back to BGRA rows for the preview.
+///
+/// The preview has to show the encoded file decoded, not the source pixels, or it lies about what
+/// saving produced. An opaque image comes back as `Rgb8` because the encoder drops an alpha channel
+/// nothing needs, so the channel count is read from the descriptor rather than assumed (`docs/49`).
+pub fn decode_avif(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), ExportError> {
+    let image = zenavif::decode(bytes)
+        .map_err(|error| ExportError::Sink(format!("the AVIF artifact cannot be decoded: {error}")))?;
+    let width = image.width();
+    let height = image.height();
+    let source = image
+        .as_contiguous_bytes()
+        .ok_or_else(|| ExportError::Sink("the decoded AVIF frame is not contiguous".into()))?;
+    let channels = match image.descriptor().format {
+        zenpixels::PixelFormat::Rgb8 => 3,
+        zenpixels::PixelFormat::Rgba8 => 4,
+        other => {
+            return Err(ExportError::Sink(format!(
+                "the decoded AVIF frame is {other:?}, and the preview reads RGB or RGBA"
+            )))
+        }
+    };
+    let mut bgra = Vec::with_capacity(source.len() / channels * 4);
+    for pixel in source.chunks_exact(channels) {
+        let alpha = if channels == 4 { pixel[3] } else { 255 };
+        bgra.extend_from_slice(&[pixel[2], pixel[1], pixel[0], alpha]);
+    }
+    Ok((width, height, bgra))
 }
 
 #[cfg(test)]
@@ -412,6 +519,108 @@ mod tests {
             !destination.with_extension("partial").exists(),
             "a failure must not leave its temporary either"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+    /// AVIF is lossy, so the round trip is a tolerance rather than a byte comparison, and the
+    /// tolerance has to be tight enough to catch a channel swap or a frame that came back the wrong
+    /// size. The checker pattern is deliberate: a flat image would hide a swap.
+    #[test]
+    fn an_avif_request_round_trips_through_its_decoder() {
+        let frame = ui_frame(64, 48);
+        let path = written("avif-round-trip", &master(64, 48, &frame));
+        let mut out = Vec::new();
+        let conversion = convert(&path, SaveFormat::Avif, 80, &mut out).expect("an avif");
+        assert_eq!((conversion.width, conversion.height), (64, 48));
+        assert_eq!(conversion.bytes, out.len() as u64);
+
+        let (width, height, decoded) = decode_avif(&out).expect("the artifact decodes");
+        assert_eq!((width, height), (64, 48));
+        assert_eq!(decoded.len(), (64 * 48 * 4) as usize);
+        assert_ne!(decoded, frame, "a lossy round trip cannot be the source bytes");
+
+        let mut worst = 0i32;
+        for (source, got) in frame.chunks_exact(4).zip(decoded.chunks_exact(4)) {
+            for channel in 0..3 {
+                worst = worst.max((i32::from(source[channel]) - i32::from(got[channel])).abs());
+            }
+            assert_eq!(got[3], 255, "an opaque frame stays opaque");
+        }
+        // A hard checker is the worst case for a lossy codec, so the bound is loose. It still
+        // catches what this test exists for: a red/blue channel swap on this pattern moves a
+        // channel by at least 180.
+        assert!(worst <= 60, "AVIF drifts by {worst} on a two colour pattern");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The budget is checked in front of the frame buffer, so an over budget image is refused
+    /// before anything is allocated rather than after. The sink is asked directly because building
+    /// a master that large would cost 48 MB and a minute, and the guard is the same one `convert`
+    /// reaches first.
+    #[test]
+    fn avif_refuses_a_frame_over_its_budget_before_allocating_it() {
+        // 1250 x 9601 is 12 001 250 pixels: one row over the 12 MP budget.
+        let over = ImageMeta {
+            width: 1250,
+            height: 9601,
+        };
+        assert!(matches!(
+            SinkWriter::begin(SaveFormat::Avif, 80, &over),
+            Err(ExportError::TooLarge { .. })
+        ));
+        // One row less fits, so the refusal is the budget and not something else.
+        let fits = ImageMeta {
+            width: 1250,
+            height: 9600,
+        };
+        assert!(SinkWriter::begin(SaveFormat::Avif, 80, &fits).is_ok());
+    }
+
+    /// The budget allows a 4K capture (8.29 MP), and the encoder has to cope with that width. This
+    /// strip is 3840 wide and 216 tall, so the width is real without paying for a full frame.
+    #[test]
+    fn the_avif_encoder_handles_a_four_k_width() {
+        let frame = ui_frame(3840, 216);
+        let path = written("avif-4k-wide", &master(3840, 216, &frame));
+        let mut out = Vec::new();
+        let conversion = convert(&path, SaveFormat::Avif, 80, &mut out).expect("a 4K wide avif");
+        assert_eq!((conversion.width, conversion.height), (3840, 216));
+        let (width, height, _) = decode_avif(&out).expect("it decodes back");
+        assert_eq!((width, height), (3840, 216));
+        let _ = std::fs::remove_file(&path);
+    }
+    /// Not a correctness test: this is the measurement `docs/49` is built on, kept so the numbers
+    /// can be re-taken on another machine instead of trusted from this one. Run with
+    /// `--ignored --nocapture`.
+    #[test]
+    #[ignore = "measurement: encodes a full 4K frame three times and prints the timings"]
+    fn measure_a_four_k_save_in_each_format() {
+        use std::time::Instant;
+        // Two contents, because the encoder is far more sensitive to that than to area: a checker
+        // is the worst case, and text-like rows on white are what a screenshot actually is.
+        let mut text_like = Vec::with_capacity((3840 * 2160 * 4) as usize);
+        for y in 0..2160u32 {
+            let ink = y % 16 == 0 || (y / 16) % 5 == 0;
+            for x in 0..3840u32 {
+                let stroke = ink && (x % 7 == 0 || (x / 40) % 3 == 0);
+                let (b, g, r) = if stroke { (30, 30, 30) } else { (255, 255, 255) };
+                text_like.extend_from_slice(&[b, g, r, 255]);
+            }
+        }
+        let frame = text_like;
+        let path = written("avif-4k-measure", &master(3840, 2160, &frame));
+        for format in [SaveFormat::Avif, SaveFormat::Png, SaveFormat::Webp] {
+            let mut out = Vec::new();
+            let started = Instant::now();
+            let conversion = convert(&path, format, 80, &mut out).expect("a conversion");
+            println!(
+                "{:?}: {} bytes in {} ms ({}x{})",
+                format,
+                conversion.bytes,
+                started.elapsed().as_millis(),
+                conversion.width,
+                conversion.height
+            );
+        }
         let _ = std::fs::remove_file(&path);
     }
 }

@@ -111,6 +111,18 @@ zenjpeg = { version = "=0.8.4", default-features = false, features = ["trellis"]
 # hard way.
 zenwebp = "=0.4.4"
 
+# AVIF save (`docs/49`). Whole frame only: the encoder cannot stream rows, so the save path holds
+# the frame and a 12 MP budget decides whether that is allowed at all. Default features keep this
+# on the pure Rust `rav1d-safe` path; `unsafe-asm` is deliberately not enabled because it is the
+# C FFI assembly path, and the whole point here is a dependency with no C in it.
+zenavif = { version = "0.1.6", default-features = false, features = ["encode"] }
+# `zenavif` re-exports `PixelBuffer` but not the pixel descriptor, and the pixel type itself lives
+# in `rgb`, so both are declared directly rather than reached through a re-export that is not there.
+rgb = "0.8"
+zenpixels = "0.2"
+# `encode_with` takes a stop token; `StopToken` and `Unstoppable` live here.
+almost-enough = "0.4"
+
 
 # `Stop`'s `check` names `enough::reason::StopReason`, and `zenjpeg` re-exports the trait without
 # the reason type. `enough` is already in this graph through `zenjpeg` (0.4.5), so this is a direct

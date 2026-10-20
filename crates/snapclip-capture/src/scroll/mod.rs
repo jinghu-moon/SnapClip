@@ -1013,6 +1013,24 @@ mod scroll_format_tests {
     }
 
     #[test]
+    fn avif_is_lowered_when_the_frame_would_not_fit_its_budget() {
+        // 100 screens of 76 rows at 1250 wide is 9.5 MP: inside the 12 MP AVIF budget.
+        assert_eq!(
+            scroll_format(SaveFormat::Avif, 1250, 76),
+            (SaveFormat::Avif, None)
+        );
+        // 100 screens of 97 rows is 12.1 MP, just over it.
+        let (effective, why) = scroll_format(SaveFormat::Avif, 1250, 97);
+        assert_eq!(effective, SaveFormat::Png);
+        assert!(matches!(why, Some(Lowering::FrameBudget { .. })), "{why:?}");
+        // The case this rule exists for: a capture whose frame the encoder would have to hold. It
+        // stays inside AVIF's 65 535 row side (25 000 rows), so the budget is what refuses it.
+        let (effective, why) = scroll_format(SaveFormat::Avif, 1250, 250);
+        assert_eq!(effective, SaveFormat::Png);
+        assert!(matches!(why, Some(Lowering::FrameBudget { .. })), "{why:?}");
+    }
+
+    #[test]
     fn the_scroll_log_prints_on_a_change_and_then_every_sixty_frames() {
         use super::{should_log, Status};
         // 首帧必打（还没有"上一次状态"）。

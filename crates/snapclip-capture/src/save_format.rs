@@ -90,10 +90,11 @@ pub fn within_jpeg_frame_budget(width: u64, height: u64) -> bool {
 /// The most pixels the AVIF save path encodes in one frame.
 ///
 /// AVIF has no streaming encoder in this dependency (`docs/49`): `encode` takes a whole frame, so
-/// the save path has to hold it, and the same budget the JPG arm uses is the right shape. A long
-/// scroll capture is refused by this before anything is allocated and stays PNG in the artifact,
-/// then is transcoded only if it fits.
-pub const AVIF_FRAME_BUDGET_PIXELS: u64 = 16_000_000;
+/// the save path holds it. The budget is the measured one, not the container limit: the encoder
+/// runs at roughly 0.7 MP/s on this machine, so 12 MP is about nine seconds on the export worker
+/// and 16 MP would be twelve. A long scroll capture is refused by this before anything is
+/// allocated, stays PNG in the artifact, and is transcoded only if it fits.
+pub const AVIF_FRAME_BUDGET_PIXELS: u64 = 12_000_000;
 
 /// Whether an image of this size can be saved as AVIF at all.
 pub fn within_avif_frame_budget(width: u64, height: u64) -> bool {
@@ -134,10 +135,9 @@ impl SaveFormat {
             SaveFormat::Png => u64::from(u32::MAX),
             SaveFormat::Jpeg => 65_535,
             SaveFormat::Webp => 16_383,
-            // Conservative: 16384 is the figure this repository could defend without a source, and
-            // the real container limit has not been verified (`docs/49`). A test pins the figure so
-            // a future correction changes one number and one expectation.
-            SaveFormat::Avif => 16_384,
+            // 65 535 is the AV1 limit (`docs/49`): the probe encoded 17 000 pixels across and
+            // failed at 65 536. The side limit is not the practical gate; the pixel budget is.
+            SaveFormat::Avif => 65_535,
         }
     }
 
@@ -176,11 +176,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn avif_uses_the_conservative_side_limit() {
-        assert_eq!(SaveFormat::Avif.max_side(), 16_384);
-        assert_eq!(SaveFormat::Avif.can_encode(16_384, 16_384), Ok(()));
+    #[test]
+    fn avif_stops_at_the_av1_side_limit() {
+        // 65 535 is the AV1 limit, confirmed by the probe: 17 000 across encodes, 65 536 does not.
+        assert_eq!(SaveFormat::Avif.max_side(), 65_535);
+        assert_eq!(SaveFormat::Avif.can_encode(65_535, 1), Ok(()));
         assert!(matches!(
-            SaveFormat::Avif.can_encode(16_385, 10),
+            SaveFormat::Avif.can_encode(65_536, 1),
             Err(FormatLimit::TooWide { .. })
         ));
         assert_eq!(SaveFormat::Avif.label(), "AVIF");
@@ -188,10 +190,14 @@ mod tests {
 
     #[test]
     fn avif_refuses_a_frame_over_its_budget() {
-        assert!(within_avif_frame_budget(4000, 4000));
+        // 12 MP is the measured ceiling: the encoder runs at about 0.7 MP/s, so 12 MP is a few
+        // seconds on the worker and 16 MP is not. A 4K capture (8.29 MP) fits.
+        assert!(within_avif_frame_budget(4000, 3000));
+        assert!(!within_avif_frame_budget(4000, 3001));
         assert!(!within_avif_frame_budget(1250, 30_000));
-        assert!(!within_avif_frame_budget(1250, 12_801));
-        assert!(within_avif_frame_budget(1250, 12_800));
+        assert!(within_avif_frame_budget(3840, 2160));
+        assert!(!within_avif_frame_budget(1250, 9_601));
+        assert!(within_avif_frame_budget(1250, 9_600));
     }
 
     #[test]
