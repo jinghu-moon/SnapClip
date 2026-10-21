@@ -1321,3 +1321,72 @@ impl PanelRenderer {
         )
     }
 }
+
+/// Where an image of `source` (width, height) lands inside `card` (left, top, right, bottom):
+/// centred, scaled to fit, and never enlarged past its own size.
+///
+/// Pure arithmetic, and expressed as plain numbers rather than whichever rectangle type the
+/// painter happens to use, so the placement can be checked without a device context. This is the
+/// only part of drawing the preview that can be wrong silently: an image drawn at the wrong
+/// scale still looks like an image.
+pub fn fit_preview(source: (f32, f32), card: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
+    let (source_w, source_h) = source;
+    let (left, top, right, bottom) = card;
+    let card_w = (right - left).max(0.0);
+    let card_h = (bottom - top).max(0.0);
+    if source_w <= 0.0 || source_h <= 0.0 || card_w <= 0.0 || card_h <= 0.0 {
+        // Nothing to draw: a degenerate rectangle at the card's origin, so callers need no branch.
+        return (left, top, left, top);
+    }
+    let scale = (card_w / source_w).min(card_h / source_h).min(1.0);
+    let drawn_w = source_w * scale;
+    let drawn_h = source_h * scale;
+    let x = left + (card_w - drawn_w) / 2.0;
+    let y = top + (card_h - drawn_h) / 2.0;
+    (x, y, x + drawn_w, y + drawn_h)
+}
+
+#[cfg(test)]
+mod preview_fit_tests {
+    use super::fit_preview;
+
+    /// A wide image fills the card's width and is centred vertically.
+    #[test]
+    fn a_wide_image_touches_the_sides_and_is_centred() {
+        let (x, y, right, bottom) = fit_preview((1000.0, 500.0), (0.0, 0.0, 400.0, 300.0));
+        assert_eq!((x, right), (0.0, 400.0), "the width is the binding constraint");
+        assert_eq!(y, 50.0, "leftover height is split evenly");
+        assert_eq!(bottom, 250.0);
+    }
+
+    /// A tall image fills the card's height instead.
+    #[test]
+    fn a_tall_image_touches_the_top_and_bottom() {
+        let (x, y, right, bottom) = fit_preview((300.0, 900.0), (0.0, 0.0, 400.0, 300.0));
+        assert_eq!((y, bottom), (0.0, 300.0), "the height is the binding constraint");
+        assert_eq!((x, right), (150.0, 250.0), "leftover width is split evenly");
+    }
+
+    /// An image smaller than the card is not blown up: enlarging a screenshot would misrepresent
+    /// what is being saved.
+    #[test]
+    fn a_small_image_is_centred_at_its_own_size() {
+        let (x, y, right, bottom) = fit_preview((100.0, 100.0), (0.0, 0.0, 400.0, 300.0));
+        assert_eq!((x, y, right, bottom), (150.0, 100.0, 250.0, 200.0));
+    }
+
+    /// The card's origin is respected, not assumed to be zero.
+    #[test]
+    fn the_placement_is_relative_to_the_card_origin() {
+        let (x, y, right, bottom) = fit_preview((200.0, 100.0), (16.0, 48.0, 416.0, 348.0));
+        assert_eq!((x, y), (116.0, 148.0), "centred inside a card that starts at its own corner");
+        assert_eq!((right, bottom), (316.0, 248.0));
+    }
+
+    /// A degenerate source or card yields an empty rectangle rather than a panic or a huge scale.
+    #[test]
+    fn a_degenerate_input_yields_nothing_to_draw() {
+        assert_eq!(fit_preview((0.0, 10.0), (0.0, 0.0, 400.0, 300.0)), (0.0, 0.0, 0.0, 0.0));
+        assert_eq!(fit_preview((10.0, 10.0), (5.0, 5.0, 5.0, 5.0)), (5.0, 5.0, 5.0, 5.0));
+    }
+}
