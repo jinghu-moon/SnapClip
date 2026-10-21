@@ -1461,6 +1461,31 @@ impl PanelRenderer {
             field_state,
         )
     }
+
+    /// [`PanelRenderer::paint`] with a captured picture for the preview card.
+    ///
+    /// Additive on purpose: `paint` keeps its signature and delegates with no picture, so the
+    /// window that has nothing to show and every existing bitmap test are untouched.
+    pub fn paint_with_preview(
+        &self,
+        hdc: *mut core::ffi::c_void,
+        area: Rect,
+        dpi: f32,
+        fill_surface: bool,
+        field_state: crate::panel::FieldState,
+        preview: Option<(&[u8], u32, u32)>,
+    ) -> Result<()> {
+        paint_to_dc_with_preview(
+            &self.factory,
+            &self.dwrite,
+            HDC(hdc),
+            area,
+            dpi,
+            fill_surface,
+            field_state,
+            preview,
+        )
+    }
 }
 
 /// Where an image of `source` (width, height) lands inside `card` (left, top, right, bottom):

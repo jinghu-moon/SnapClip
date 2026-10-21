@@ -62,6 +62,17 @@ pub struct CaptureEvents {
     pin_poster: std::sync::Mutex<
         Option<std::sync::Arc<dyn Fn() -> Result<(), String> + Send + Sync>>,
     >,
+    /// 「请为这张选区开保存面板」的投递器，与 `pin_poster` 同一形状、同一理由：接线发生在外壳
+    /// 起来之后，存成闭包让"怎么开面板"留在接线处一行，测试也能塞一个记账闭包进来断言确实收到了那张图。
+    save_opener: std::sync::Mutex<
+        Option<
+            std::sync::Arc<
+                dyn Fn(&snapclip_capture::ports::SelectionPixels) -> Result<(), String>
+                    + Send
+                    + Sync,
+            >,
+        >,
+    >,
 }
 
 impl CaptureEvents {
@@ -69,6 +80,7 @@ impl CaptureEvents {
         Self {
             bus,
             pin_poster: std::sync::Mutex::new(None),
+            save_opener: std::sync::Mutex::new(None),
         }
     }
 
@@ -81,6 +93,19 @@ impl CaptureEvents {
             .pin_poster
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(poster);
+    }
+
+    /// 接上「怎么开保存面板」。外壳在启动时调用一次（见 `lib.rs`），与贴图那条同一个位置。
+    pub fn set_save_opener(
+        &self,
+        opener: std::sync::Arc<
+            dyn Fn(&snapclip_capture::ports::SelectionPixels) -> Result<(), String> + Send + Sync,
+        >,
+    ) {
+        *self
+            .save_opener
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(opener);
     }
 
     /// 把一次"请贴图"交给接好的投递器；没接上时返回 `None`（外壳的接线问题，要说出来）。

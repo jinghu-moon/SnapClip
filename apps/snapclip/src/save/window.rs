@@ -283,11 +283,15 @@ impl<P: AfterCancelPolicy> Shell<P> {
 // -------------------------------------------------------------------------------------------------
 
 /// What the shell was asked to open.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ShellOptions {
     /// Size in dip, which is the mock's unit.
     pub width_dip: f32,
     pub height_dip: f32,
+    /// The captured picture for the preview card: tightly packed top down BGRA, then width and
+    /// height. `None` is the development entry's empty panel. Owned rather than borrowed because
+    /// the options cross a thread boundary and the picture outlives the caller.
+    pub preview: Option<(Vec<u8>, u32, u32)>,
 }
 
 impl Default for ShellOptions {
@@ -295,6 +299,7 @@ impl Default for ShellOptions {
         Self {
             width_dip: PANEL_WIDTH_DIP,
             height_dip: PANEL_HEIGHT_DIP,
+            preview: None,
         }
     }
 }
@@ -413,7 +418,7 @@ fn open_and_pump(_options: ShellOptions, ready: std::sync::mpsc::Sender<Result<i
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
-fn open_and_pump(options: ShellOptions, ready: std::sync::mpsc::Sender<Result<isize, ShellError>>) {
+fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Result<isize, ShellError>>) {
     use windows_sys::Win32::Foundation::RECT;
     use windows_sys::Win32::Graphics::Gdi::{
         GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
@@ -529,6 +534,7 @@ fn open_and_pump(options: ShellOptions, ready: std::sync::mpsc::Sender<Result<is
         let state = Box::into_raw(Box::new(WindowState {
             backdrop,
             renderer,
+            preview: options.preview.take(),
             field_state: snapclip_ui::panel::FieldState::Idle,
             name_edit: std::ptr::null_mut(),
             fill_brush,
@@ -571,6 +577,9 @@ struct WindowState {
     field_state: snapclip_ui::panel::FieldState,
     /// The name field's child window, once it exists.
     name_edit: windows_sys::Win32::Foundation::HWND,
+    /// The captured picture, handed to the frame painter so the preview card shows the real
+    /// selection rather than a stand-in.
+    preview: Option<(Vec<u8>, u32, u32)>,
     /// The brush `WM_CTLCOLOREDIT` returns. The child paints its own background, and on a dark panel
     /// the default white would show as a lit rectangle, so the field's resolved fill is handed over
     /// instead. Created once and owned by this state.
@@ -799,7 +808,14 @@ extern "system" fn window_proc(
                     // The surface fill is skipped when DWM is drawing the material, so a backdrop
                     // keeps showing through while the frame's own lines still land on top of it.
                     painted = renderer
-                        .paint(hdc as *mut _, area, dpi, !s.backdrop, s.field_state)
+                        .paint_with_preview(
+                            hdc as *mut _,
+                            area,
+                            dpi,
+                            !s.backdrop,
+                            s.field_state,
+                            s.preview.as_ref().map(|(bgra, w, h)| (bgra.as_slice(), *w, *h)),
+                        )
                         .is_ok();
                 }
             }
