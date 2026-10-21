@@ -1477,6 +1477,9 @@ fn overlay_drawn_strings() -> Vec<String> {
         "角标".to_owned(),
         "延时".to_owned(),
         "取消".to_owned(),
+        // The save panel's header title, drawn by `snapclip-ui`'s frame
+        // (`save-panel-demo-v3.html:473`), so the subset has to carry it too.
+        snapclip_ui::panel::TITLE.to_owned(),
     ];
     // The hint row and the shortcut guide: every label, group, key and separator they can draw,
     // under any binding.

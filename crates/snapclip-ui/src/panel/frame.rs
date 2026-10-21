@@ -19,12 +19,16 @@ use windows::Win32::Graphics::Direct2D::{
     ID2D1RenderTarget, ID2D1SolidColorBrush,
 };
 use windows::Win32::Graphics::DirectWrite::{
-    DWRITE_FACTORY_TYPE_ISOLATED, DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat,
+    DWRITE_FACTORY_TYPE_ISOLATED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+    DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
+    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::HDC;
 use windows::Win32::Foundation::RECT;
 use windows::core::Result;
+
+use crate::panel::theme::FAMILY;
 
 /// Panel metrics in dips, each paired with the line it came from in the design.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -48,6 +52,16 @@ pub struct FrameMetrics {
     pub close_size: i32,
     /// `--r-card` (`:53`), the preview card's radius.
     pub card_radius: i32,
+    /// `.row-header { height: 22px }` (`:165`), the label row above every field.
+    pub row_label_height: i32,
+    /// `.form-row { gap: 6px }` (`:164`), between a label row and its field.
+    pub row_gap: i32,
+    /// `.text-input { height: 32px }` (`:167`).
+    pub field_height: i32,
+    /// `.form { gap: 12px }` (`:162`), between rows inside a group.
+    pub row_spacing: i32,
+    /// `.form-row.grp { margin-top: 4px }` (`:163`); groups therefore sit 12 + 4 = 16 apart.
+    pub group_spacing: i32,
 }
 
 /// The design's own numbers.
@@ -62,6 +76,11 @@ pub const DEMO: FrameMetrics = FrameMetrics {
     column_gap: 12,
     close_size: 26,
     card_radius: 10,
+    row_label_height: 22,
+    row_gap: 6,
+    field_height: 32,
+    row_spacing: 12,
+    group_spacing: 4,
 };
 
 impl FrameMetrics {
@@ -74,6 +93,21 @@ impl FrameMetrics {
     /// The right column: whatever the panel's width leaves after padding, preview and gap.
     pub fn form_width(&self) -> i32 {
         self.panel_width - self.pad_x * 2 - self.preview_width - self.column_gap
+    }
+
+    /// One form slot: a label row, the gap under it, and its field.
+    pub fn row_height(&self) -> i32 {
+        self.row_label_height + self.row_gap + self.field_height
+    }
+
+    /// Slot to slot inside a group: the slot plus the form's own gap.
+    pub fn row_pitch(&self) -> i32 {
+        self.row_height() + self.row_spacing
+    }
+
+    /// Slot to slot across a group boundary: the form's gap plus the group's margin.
+    pub fn group_pitch(&self) -> i32 {
+        self.row_height() + self.row_spacing + self.group_spacing
     }
 
     /// The layout at a given DPI scale, in pixels.
@@ -175,8 +209,11 @@ fn brush(target: &ID2D1RenderTarget, rgba: [u8; 4]) -> Result<ID2D1SolidColorBru
     unsafe { target.CreateSolidColorBrush(&color, None) }
 }
 
-/// What the frame draws. Nothing here is a control: the title is optional because the text format
-/// arrives with the text layer, and the close button is a placeholder that does not respond yet.
+/// The header title, verbatim from the design (`save-panel-demo-v3.html:473`).
+pub const TITLE: &str = "保存图片";
+
+/// What the frame draws. Nothing here is a control: the close button is a placeholder that does
+/// not respond yet, and the title is the only text the frame itself owns.
 pub struct Frame<'a> {
     pub metrics: &'a FrameMetrics,
     pub rects: &'a FrameRects,
@@ -249,6 +286,40 @@ pub fn factory() -> Result<ID2D1Factory> {
     unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None) }
 }
 
+/// The header title's format: `--fs-title: 12px` (`:31`) at weight 600 (`.head .title`, `:95`),
+/// centred vertically so the text sits on the header's own centre line.
+pub fn title_format(dwrite: &IDWriteFactory, dpi: f32) -> Result<IDWriteTextFormat> {
+    let scale = (dpi / 96.0).max(0.5);
+    let mut last: Option<windows::core::Error> = None;
+    // One family per attempt: CreateTextFormat does not take a stack, so we walk it ourselves in
+    // the same order the overlay does (`snapclip-capture`'s font stack) starting with the subset.
+    for family in [FAMILY, "Segoe UI Variable Display", "Segoe UI"] {
+        let wide = windows::core::HSTRING::from(family);
+        let made = unsafe {
+            dwrite.CreateTextFormat(
+                &wide,
+                None,
+                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                12.0 * scale,
+                &windows::core::HSTRING::from(""),
+            )
+        };
+        match made {
+            Ok(format) => {
+                unsafe {
+                    let _ = format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                    let _ = format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                }
+                return Ok(format);
+            }
+            Err(error) => last = Some(error),
+        }
+    }
+    Err(last.expect("at least one family was tried"))
+}
+
 fn properties(dpi: f32) -> D2D1_RENDER_TARGET_PROPERTIES {
     D2D1_RENDER_TARGET_PROPERTIES {
         r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
@@ -275,7 +346,6 @@ pub fn paint_to_dc(
     area: Rect,
     dpi: f32,
     fill_surface: bool,
-    title: Option<(&str, &IDWriteTextFormat)>,
 ) -> Result<()> {
     let target = unsafe { factory.CreateDCRenderTarget(&properties(dpi)) }?;
     let bind = RECT {
@@ -289,6 +359,9 @@ pub fn paint_to_dc(
     let scale = (dpi / 96.0).max(0.5);
     let metrics = DEMO;
     let rects = metrics.rects(scale);
+    // The title is part of the frame, not of any control: the design puts it in the header and
+    // every drawn character has to be in the embedded subset, which the glyph gate enforces.
+    let title = title_format(dwrite, dpi)?;
     let painter = PanelPainter {
         context: &target,
         text_factory: dwrite,
@@ -296,14 +369,13 @@ pub fn paint_to_dc(
     unsafe { target.BeginDraw() };
     unsafe { target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED) };
     // Hairlines at 1 dip are meant to be one pixel, not two half-lit ones.
-    unsafe { target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED) };
     Frame {
         metrics: &metrics,
         rects: &rects,
         brushes: &brushes,
         scale,
         fill_surface,
-        title,
+        title: Some((TITLE, &title)),
     }
     .paint(&painter);
     unsafe { target.EndDraw(None, None)? };
@@ -329,14 +401,14 @@ pub fn paint_to_target(
     unsafe { target.BeginDraw() };
     unsafe { target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED) };
     // Hairlines at 1 dip are meant to be one pixel, not two half-lit ones.
-    unsafe { target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED) };
+    let title = title_format(dwrite, dpi)?;
     Frame {
         metrics: &metrics,
         rects: &rects,
         brushes: &brushes,
         scale,
         fill_surface,
-        title: None,
+        title: Some((TITLE, &title)),
     }
     .paint(&painter);
     unsafe { target.EndDraw(None, None)? };
@@ -449,20 +521,67 @@ mod tests {
                 Rect::new(0, 0, self.width, self.height),
                 96.0,
                 true,
-                None,
             )
             .expect("the frame paints");
         }
 
-        /// RGBA at a pixel, top-down, so row zero is the top row. The DIB is BGRA in memory.
-        fn at(&self, x: i32, y: i32) -> [u8; 4] {
-            assert!(x >= 0 && y >= 0 && x < self.width && y < self.height);
-            let base = ((y * self.width + x) * 4) as isize;
-            unsafe {
-                let px = (self.bits as *const u8).offset(base);
-                [*px.add(2), *px.add(1), *px, *px.add(3)]
+        /// The pixels, through the only view that exists. Deliberately no direct byte accessor:
+        /// the DIB is BGRA and reading it as RGB has already produced one false test result in
+        /// this repository (`docs/48`'s encoder trap is the same confusion).
+        fn pixels(&self) -> Bgra8<'_> {
+            Bgra8 {
+                bytes: unsafe {
+                    core::slice::from_raw_parts(
+                        self.bits as *const u8,
+                        (self.width * self.height * 4) as usize,
+                    )
+                },
+                width: self.width,
             }
         }
+    }
+
+    /// One pixel with its channels named, so an assertion cannot swap red for blue by accident.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct Px {
+        b: u8,
+        g: u8,
+        r: u8,
+        a: u8,
+    }
+
+    /// A 32-bit top-down BGRA buffer, as the DIB section actually lays it out.
+    struct Bgra8<'a> {
+        bytes: &'a [u8],
+        width: i32,
+    }
+
+    impl Bgra8<'_> {
+        fn pixel(&self, x: i32, y: i32) -> Px {
+            let at = ((y * self.width + x) * 4) as usize;
+            Px {
+                b: self.bytes[at],
+                g: self.bytes[at + 1],
+                r: self.bytes[at + 2],
+                a: self.bytes[at + 3],
+            }
+        }
+    }
+
+    fn surface_px() -> Px {
+        Px {
+            b: DEMO_PALETTE.surface[2],
+            g: DEMO_PALETTE.surface[1],
+            r: DEMO_PALETTE.surface[0],
+            a: 255,
+        }
+    }
+
+    fn close(px: Px, want: Px, tolerance: i32) -> bool {
+        (px.b as i32 - want.b as i32).abs() <= tolerance
+            && (px.g as i32 - want.g as i32).abs() <= tolerance
+            && (px.r as i32 - want.r as i32).abs() <= tolerance
+            && (px.a as i32 - want.a as i32).abs() <= tolerance
     }
 
     impl Drop for Canvas {
@@ -474,20 +593,50 @@ mod tests {
         }
     }
 
-    fn close(a: [u8; 4], b: [u8; 4], tolerance: i32) -> bool {
-        (0..4).all(|i| (a[i] as i32 - b[i] as i32).abs() <= tolerance)
+    #[test]
+    fn the_first_form_slot_starts_where_the_design_puts_it() {
+        let rects = DEMO.rects(1.0);
+        assert_eq!(rects.form.top, 48, ".body padding-top 4 under the 44 dip header (:100)");
+        assert_eq!(DEMO.row_height(), 60, "22 label + 6 gap + 32 field (:165, :164, :167)");
+    }
+
+    #[test]
+    fn the_form_groups_are_sixteen_apart() {
+        assert_eq!(DEMO.row_pitch() - DEMO.row_height(), 12, ".form gap is 12px (:162)");
+        assert_eq!(DEMO.group_pitch() - DEMO.row_pitch(), 4, ".form-row.grp margin-top (:163)");
+        assert_eq!(
+            DEMO.group_pitch() - DEMO.row_height(),
+            16,
+            "the design's own note says groups sit 16 apart (:163)"
+        );
+    }
+
+    #[test]
+    fn the_form_column_ends_before_the_panel_padding() {
+        let rects = DEMO.rects(1.0);
+        assert_eq!(rects.form.right, DEMO.panel_width - DEMO.pad_x, "right padding is 16 (:42)");
+    }
+
+    #[test]
+    fn a_pixel_view_names_the_channels_in_dib_order() {
+        let canvas = Canvas::new(4, 2);
+        unsafe {
+            let px = canvas.bits as *mut u8;
+            *px.add(0) = 0;
+            *px.add(1) = 0;
+            *px.add(2) = 255;
+            *px.add(3) = 255;
+        }
+        let got = canvas.pixels().pixel(0, 0);
+        assert_eq!(got, Px { b: 0, g: 0, r: 255, a: 255 }, "the DIB stores BGRA, blue first");
     }
 
     #[test]
     fn the_sheet_is_the_designs_surface_colour() {
         let canvas = Canvas::new(920, 520);
         canvas.render();
-        // A point in the right column, clear of the card's edge and the divider.
-        let got = canvas.at(700, 300);
-        assert!(
-            close(got, [23, 23, 28, 255], 3),
-            "the surface should be --surface: got {got:?}"
-        );
+        let got = canvas.pixels().pixel(700, 300);
+        assert!(close(got, surface_px(), 3), "the surface should be --surface: got {got:?}");
     }
 
     #[test]
@@ -495,17 +644,11 @@ mod tests {
         let canvas = Canvas::new(920, 520);
         canvas.render();
         let rects = DEMO.rects(1.0);
-        let above = canvas.at(400, rects.divider_y - 4);
-        assert!(
-            close(above, [23, 23, 28, 255], 3),
-            "just above the divider is still surface: got {above:?}"
-        );
-        let near: Vec<[u8; 4]> = (-1..=1)
-            .map(|d| canvas.at(400, rects.divider_y + d))
-            .collect();
-        let lit = near
-            .iter()
-            .any(|px| !close(*px, [23, 23, 28, 255], 3));
+        let px = canvas.pixels();
+        let above = px.pixel(400, rects.divider_y - 4);
+        assert!(close(above, surface_px(), 3), "above the divider is still surface: {above:?}");
+        let near: Vec<Px> = (-1..=1).map(|d| px.pixel(400, rects.divider_y + d)).collect();
+        let lit = near.iter().any(|p| !close(*p, surface_px(), 3));
         assert!(lit, "one of the three rows at the divider must be the --line stroke: {near:?}");
     }
 
@@ -515,18 +658,24 @@ mod tests {
         canvas.render();
         let rects = DEMO.rects(1.0);
         let mid = rects.preview.top + rects.preview.height() / 2;
-        let outside = canvas.at(rects.preview.left - 4, mid);
-        assert!(
-            close(outside, [23, 23, 28, 255], 3),
-            "left of the card is the surface: got {outside:?}"
-        );
-        let edge: Vec<[u8; 4]> = (-1..=1)
-            .map(|d| canvas.at(rects.preview.left + d, mid))
-            .collect();
-        let lit = edge
-            .iter()
-            .any(|px| !close(*px, [23, 23, 28, 255], 3));
+        let px = canvas.pixels();
+        let outside = px.pixel(rects.preview.left - 4, mid);
+        assert!(close(outside, surface_px(), 3), "left of the card is the surface: {outside:?}");
+        let edge: Vec<Px> = (-1..=1).map(|d| px.pixel(rects.preview.left + d, mid)).collect();
+        let lit = edge.iter().any(|p| !close(*p, surface_px(), 3));
         assert!(lit, "the card's edge is drawn at x = 16: {edge:?}");
+    }
+
+    #[test]
+    fn the_title_is_drawn_inside_the_header() {
+        let canvas = Canvas::new(920, 520);
+        canvas.render();
+        let rects = DEMO.rects(1.0);
+        let px = canvas.pixels();
+        let lit = (rects.title_left..rects.title_left + 90)
+            .flat_map(|x| (rects.header.top + 8..rects.divider_y - 8).map(move |y| (x, y)))
+            .any(|(x, y)| !close(px.pixel(x, y), surface_px(), 12));
+        assert!(lit, "the header title paints inside the header");
     }
 }
 
@@ -555,14 +704,6 @@ impl PanelRenderer {
         dpi: f32,
         fill_surface: bool,
     ) -> Result<()> {
-        paint_to_dc(
-            &self.factory,
-            &self.dwrite,
-            HDC(hdc),
-            area,
-            dpi,
-            fill_surface,
-            None,
-        )
+        paint_to_dc(&self.factory, &self.dwrite, HDC(hdc), area, dpi, fill_surface)
     }
 }

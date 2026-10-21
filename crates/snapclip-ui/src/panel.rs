@@ -40,7 +40,7 @@ pub use dropdown::{Dropdown, DropdownKey, DropdownTarget};
 pub use feedback::{Toast, Tooltip};
 pub use frame::{
     DEMO, DEMO_PALETTE, Frame, FrameBrushes, FrameMetrics, FramePalette, FrameRects,
-    PanelRenderer, factory, paint_to_dc, paint_to_target,
+    PanelRenderer, TITLE, factory, paint_to_dc, paint_to_target, title_format,
 };
 pub use icon_button::IconButton;
 pub use icons::{Glyph, ICON_BAKED_PX, ICON_COUNT};
@@ -53,7 +53,7 @@ pub use segmented::{
 };
 pub use slider::{Slider, SliderKey};
 pub use tag::{Tag, TagState};
-pub use theme::PanelTheme;
+pub use theme::{FAMILY, PanelTheme};
 pub use toggle::{Switch, SwitchState, Toggle, ToggleState};
 
 #[cfg(windows)]

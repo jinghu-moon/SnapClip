@@ -17,8 +17,9 @@ use ::windows::Win32::Graphics::Gdi::AddFontMemResourceEx;
 pub const SUBSET: &[u8] = include_bytes!("../assets/harmonyos-sans-sc-subset.ttf");
 
 /// Family name the embedded subset registers under (its name table was reduced to this single
-/// English entry during subsetting).
-pub const FAMILY: &str = "HarmonyOS Sans SC";
+/// English entry during subsetting). The name itself is owned by the ui crate, so the save panel
+/// and the overlay cannot drift apart; only the registration and the bytes live here.
+pub const FAMILY: &str = snapclip_ui::panel::FAMILY;
 
 /// The stock UI families to fall through to, in order, when [`FAMILY`] cannot be resolved.
 pub const FALLBACKS: [&str; 2] = ["Segoe UI Variable Display", "Segoe UI"];
