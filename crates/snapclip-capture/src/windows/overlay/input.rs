@@ -1409,10 +1409,49 @@ mod tests {
         )
     }
 
+    /// A monitor layout and a frame, copied in shape from the session's own tests, because
+    /// driving a session to `Selecting` needs both.
+    fn layout() -> crate::geometry::MonitorLayout {
+        crate::geometry::MonitorLayout {
+            bounds: crate::geometry::Rect::new(0, 0, 1920, 1080),
+            work_area: crate::geometry::Rect::new(0, 0, 1920, 1040),
+            dpi: 96,
+            primary: true,
+        }
+    }
+
+    fn frame() -> crate::session::CapturedFrame {
+        crate::session::CapturedFrame {
+            width: 1920,
+            height: 1080,
+            pixel_format: snapclip_model::PixelFormat::Bgra8Unorm,
+            captured_at_unix_ms: 1_700_000_000_000,
+            provider: "test",
+            origin: Some(crate::geometry::Point::new(0, 0)),
+        }
+    }
+
+    /// `Idle -> Armed -> Selecting`, the state `press` and `snap_to` require before they do
+    /// anything at all. Without this the fixture sits idle and the action under test never runs.
+    fn armed_session() -> crate::session::CaptureSession {
+        let mut session = crate::session::CaptureSession::new("fixture");
+        session
+            .arm(frame(), &layout())
+            .expect("a fresh session arms");
+        session
+            .overlay_ready()
+            .expect("an armed session can be shown");
+        session
+    }
+
     /// Gives the fixture a real selection by driving the session the way its own tests do, so
     /// the branch that arms the save panel is reached through the product's own state.
     fn controller_with_a_selection() -> OverlayController {
         let mut controller = controller_for_tests();
+        // Selecting first: both calls below are no-ops while the session is idle, which is
+        // exactly why the earlier version of this fixture could not reach the branch it was
+        // written for, and why the test above it had to be ignored.
+        controller.session = armed_session();
         let point = crate::geometry::Point { x: 10, y: 10 };
         controller.session.press(point);
         controller.session.snap_to(crate::geometry::Rect {
@@ -1424,14 +1463,10 @@ mod tests {
         controller
     }
 
-    /// `docs/41`: the line that arms the save panel still has no test, and this records why.
-    ///
-    /// `press` and `snap_to` both return early unless the session is already `Selecting` or
-    /// `Selected`, and `CaptureSession::new` starts `Idle`, so the fixture cannot reach the
-    /// branch that sets the flag. Driving the session there needs `preparing` -> `arm(layout)`
-    /// -> `overlay_ready`, which needs a monitor layout and a frame.
+    /// The line that arms the save panel. `Ctrl+S` with a selection has to set `pending_save`,
+    /// and deleting that assignment has to turn this red, which is what makes the line covered
+    /// rather than merely present.
     #[test]
-    #[ignore = "needs a session driven to Selecting; press and snap_to are no-ops while idle"]
     fn arming_the_save_panel_sets_the_flag() {
         use crate::keymap::Action;
 
