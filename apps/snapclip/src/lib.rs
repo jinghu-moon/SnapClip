@@ -27,6 +27,7 @@ pub mod history;
 pub mod pin;
 pub mod save;
 pub mod settings;
+pub mod startup;
 pub mod tray;
 
 use history::icons::SourceIcons;
@@ -34,6 +35,7 @@ use history::model::HistoryState;
 use history::view::HistoryView;
 
 use events::EventBus;
+use startup::{subsystems, StartupOptions};
 
 /// The same database and cache directories the Tauri host writes while both shells exist
 /// (docs/23 T4.9: they share only the capability crates and the data).
@@ -442,11 +444,12 @@ impl Render for Shell {
 }
 
 /// Start the shell. The binary entry point is a one-liner on purpose.
-pub fn run() {
+pub fn run(options: StartupOptions) {
     // Per-Monitor V2 has to be declared before anything creates a window or reads a cursor
     // position; once a window exists the declaration can no longer be changed and capture
     // geometry would be reported in virtualised coordinates (docs/14 §3). This is why it is
-    // here and not in `Shell::new` — GPUI opens its window inside `run`, below.
+    // here and not in `Shell::new` — GPUI opens its window inside `run`, below. The development
+    // panel below is a window too, which is the other reason this stays first.
     #[cfg(windows)]
     match snapclip_capture::windows::monitor::set_per_monitor_v2_awareness() {
         Ok(mode) => eprintln!("[snapclip-app][startup] dpi awareness={mode}"),
@@ -454,6 +457,25 @@ pub fn run() {
             eprintln!("[snapclip-app][startup] dpi awareness declaration failed: {message}")
         }
     }
+
+    // The development entry (`docs/41` S2) adds a window beside the launch and never replaces it
+    // (`startup.rs` records why: replacing it once took F5, F7 and F9 with it). Holding the handle
+    // on this frame is what keeps the panel's thread and its window alive for as long as the
+    // application runs; dropping it closes the panel.
+    let _development_panel = if subsystems(options).save_panel {
+        match save::window::open(save::window::ShellOptions::default()) {
+            Ok(panel) => {
+                eprintln!("[save-panel] development entry: the panel opens beside the shell");
+                Some(panel)
+            }
+            Err(error) => {
+                eprintln!("[save-panel] development entry failed: {error:?}");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
