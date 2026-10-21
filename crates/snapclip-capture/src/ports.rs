@@ -25,6 +25,12 @@ pub trait CaptureEventSink: Send + Sync + 'static {
     ///
     /// 这一条只说"贴"，不说"怎么贴"：`F6` 那条链路怎么贴图是外壳的事，捕获侧不该知道。
     fn on_pin_requested(&self, _session_id: &str) {}
+
+    /// 用户要求保存：选区像素已经读回来了，请外壳把它交给保存面板（docs/41 S2 批次 B）。
+    ///
+    /// 与 [`Self::on_pin_requested`] 同形：这一条只说"存"，不说"怎么存"——面板长什么样、
+    /// 存到哪、用什么格式，都是外壳的事，捕获侧不该知道。
+    fn on_save_requested(&self, _session_id: &str, _pixels: &SelectionPixels) {}
 }
 
 /// A sink that drops everything. Useful for tests and headless runs.
