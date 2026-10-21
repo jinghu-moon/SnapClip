@@ -230,3 +230,9 @@ pub struct EncodedArtifact { /* opaque; path, size, format, dimensions, request 
 | 2026-10-18 | D6/D7/D10 由 `[待确认]` 改为 `[已定]`，并更正 D10 的 "1px=1pt 通用" 表述（仅单页可容纳时成立） |
 | 2026-10-18 | 建立本文件；收口 D1–D5、D9；给出 D6/D7/D10 推荐待确认；D8 标待测 |
 | 2026-10-18 | D11 确认自绘 DirectWrite；修正 D9 的 source/artifact 所有权、单次编码和剪贴板规则 |
+
+### 预览卡片角落溢出（新增偏离，D13 之后）
+
+预览卡片的棋盘格方块**会超出圆角弧线至多约 10 dip** ✗ —— 卡片描边画在其上 ✓，所以边框本身读起来是对的 ✓。
+
+**已知解法**：用浮层里已有的 **mask-ring** 几何（`CreateGeometryGroup` + alternate fill ✓）按圆角裁剪 ✓；本轮**不修** ✗。

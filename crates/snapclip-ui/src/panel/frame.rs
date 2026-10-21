@@ -62,6 +62,8 @@ pub struct FrameMetrics {
     pub row_spacing: i32,
     /// `.form-row.grp { margin-top: 4px }` (`:163`); groups therefore sit 12 + 4 = 16 apart.
     pub group_spacing: i32,
+    /// `.preview-frame` checkerboard tile: `… 50% / 16px 16px` (`:111`).
+    pub checker_tile: i32,
 }
 
 /// The design's own numbers.
@@ -81,6 +83,7 @@ pub const DEMO: FrameMetrics = FrameMetrics {
     field_height: 32,
     row_spacing: 12,
     group_spacing: 4,
+    checker_tile: 16,
 };
 
 impl FrameMetrics {
@@ -195,6 +198,9 @@ pub struct FrameBrushes {
     pub danger: ID2D1SolidColorBrush,
     /// `--warning`, the warning field's border.
     pub warning: ID2D1SolidColorBrush,
+    /// The preview card's checkerboard, the two colours of `:111`.
+    pub checker_light: ID2D1SolidColorBrush,
+    pub checker_dark: ID2D1SolidColorBrush,
     /// The surface the field rules composite their fill over. Kept so `paint` can ask the pure
     /// rule for colours without being handed the palette again.
     surface_rgba: [u8; 4],
@@ -222,6 +228,8 @@ impl FrameBrushes {
             accent: brush(target, focused.border)?,
             danger: brush(target, error.border)?,
             warning: brush(target, warning.border)?,
+            checker_light: brush(target, CHECKER_LIGHT)?,
+            checker_dark: brush(target, CHECKER_DARK)?,
             surface_rgba: palette.surface,
             field_brushes: [
                 (focused.border, brush(target, focused.border)?),
@@ -264,6 +272,18 @@ fn brush(target: &ID2D1RenderTarget, rgba: [u8; 4]) -> Result<ID2D1SolidColorBru
 /// The header title, verbatim from the design (`save-panel-demo-v3.html:473`).
 pub const TITLE: &str = "保存图片";
 
+/// `box-shadow: inset 0 0 0 1px var(--line)` (`:92`) — the sheet's own edge.
+pub const PANEL_INNER_STROKE_DIP: f32 = 1.0;
+
+/// The radius our own inner stroke is drawn at. The window's real corner belongs to the compositor
+/// and is about eight dips (`docs/42` D13); drawing our stroke at the same radius makes it follow
+/// the edge the user can actually see, instead of being clipped by it.
+pub const PANEL_CORNER_APPROX_DIP: i32 = 8;
+
+/// The preview card's checkerboard colours: `#32363e` and `#21242a` (`:111`).
+pub const CHECKER_LIGHT: [u8; 4] = [50, 54, 62, 255];
+pub const CHECKER_DARK: [u8; 4] = [33, 36, 42, 255];
+
 /// What the frame draws. Nothing here is a control: the close button is a placeholder that does
 /// not respond yet, and the title is the only text the frame itself owns.
 pub struct Frame<'a> {
@@ -292,6 +312,24 @@ impl Frame<'_> {
             painter.fill_round(canvas, 0, &self.brushes.surface);
         }
 
+        // The sheet's own edge: `inset 0 0 0 1px var(--line)` (`:92`). Drawn whether or not we fill
+        // the surface, because this edge is ours and the material behind it is the compositor's.
+        // Without it the panel reads as a rectangle of colour with no boundary, which is what the
+        // first screenshot of this window showed.
+        let edge = (PANEL_INNER_STROKE_DIP * self.scale).round() as i32;
+        let stroke = PANEL_INNER_STROKE_DIP * self.scale;
+        painter.stroke_round(
+            Rect::new(
+                edge,
+                edge,
+                canvas.right - edge,
+                canvas.bottom - edge,
+            ),
+            (PANEL_CORNER_APPROX_DIP as f32 * self.scale).round() as i32,
+            &self.brushes.line,
+            stroke,
+        );
+
         let line = 1.0 * self.scale;
         painter.line(
             (0, self.rects.divider_y),
@@ -300,7 +338,48 @@ impl Frame<'_> {
             line,
         );
 
-        // The preview card's boundary. Its content is a later step; its edge is the frame.
+        // The card's checkerboard: `repeating-conic-gradient(#32363e 0% 25%, #21242a 0% 50%) 50% /
+        // 16px 16px` (`:111`). It is what says "this area is a canvas" rather than "this area is
+        // unfinished", and it is the single largest difference between our sheet and the design.
+        //
+        // It goes down **before** the card's own stroke, and that order is the fix for a defect a
+        // screenshot caught: the tiles are square and reach the card's edge, so painting them after
+        // the stroke erased the rounded border at all four corners.
+        {
+            let tile = (self.metrics.checker_tile as f32 * self.scale).round() as i32;
+            let preview = self.rects.preview;
+            if tile > 0 {
+                let mut ty = preview.top;
+                let mut row = 0i32;
+                while ty < preview.bottom {
+                    let mut tx = preview.left;
+                    let mut col = 0i32;
+                    while tx < preview.right {
+                        let brush = if (row + col) % 2 == 0 {
+                            &self.brushes.checker_light
+                        } else {
+                            &self.brushes.checker_dark
+                        };
+                        painter.fill_round(
+                            Rect::new(
+                                tx,
+                                ty,
+                                (tx + tile).min(preview.right),
+                                (ty + tile).min(preview.bottom),
+                            ),
+                            0,
+                            brush,
+                        );
+                        tx += tile;
+                        col += 1;
+                    }
+                    ty += tile;
+                    row += 1;
+                }
+            }
+        }
+
+        // The card's boundary, drawn over the checkerboard so its rounded corners stay visible.
         painter.stroke_round(
             self.rects.preview,
             (self.metrics.card_radius as f32 * self.scale).round() as i32,
@@ -611,8 +690,8 @@ mod tests {
             "the preview card's right edge must be near {card_right} px"
         );
         assert!(
-            close(view.pixel(canvas.width - 2, px(300)), surface_px(), 6),
-            "nothing may be drawn at the far right of the window"
+            close(view.pixel(canvas.width - 6, px(300)), surface_px(), 6),
+            "nothing but the sheet's own edge may be drawn at the far right of the window"
         );
 
         // The form column is present: the first field's fill is drawn between the card and the
@@ -775,6 +854,46 @@ mod tests {
             && (px.a as i32 - want.a as i32).abs() <= tolerance
     }
 
+    /// **A visual assertion must name a position and a colour.**
+    ///
+    /// Sampling "somewhere near here there is a pixel that is not one of the fills" is what let three
+    /// bitmap assertions in this module pass while the thing they were named after was broken. The
+    /// rule is that a visual assertion states *where* and *what*, and that a mutation can make it
+    /// fail: change the colour, change the order, or delete the element.
+    fn assert_px(px: &Bgra8, x: i32, y: i32, want: Px, tolerance: i32, what: &str) {
+        let seen = px.pixel(x, y);
+        assert!(
+            close(seen, want, tolerance),
+            "{what}: at ({x}, {y}) expected {want:?}, saw {seen:?}"
+        );
+    }
+
+    /// The negative form, for "this place must be none of these colours" — the shape the idle field's
+    /// border assertion takes, where the edge must not carry any of the three border colours. A
+    /// single-colour version of this was written first and had no caller: the assertion that needs it
+    /// excludes three colours, not one.
+    fn assert_not_any(px: &Bgra8, x: i32, y: i32, unwanted: &[Px], tolerance: i32, what: &str) {
+        let seen = px.pixel(x, y);
+        assert!(
+            !unwanted.iter().any(|w| close(seen, *w, tolerance)),
+            "{what}: at ({x}, {y}) must not be any of {unwanted:?}, but it is {seen:?}"
+        );
+    }
+
+    /// A `--line` stroke is white at thirty percent alpha, so over a fill it reads as a blend rather
+    /// than as one exact value. Computing the blend is what lets an assertion name the colour it
+    /// expects instead of merely excluding the fills that lie beneath.
+    fn line_over(fill: [u8; 4]) -> Px {
+        let a = f32::from(DEMO_PALETTE.line[3]) / 255.0;
+        let over = |under: u8| (255.0 * a + (1.0 - a) * f32::from(under)).round() as u8;
+        Px {
+            b: over(fill[2]),
+            g: over(fill[1]),
+            r: over(fill[0]),
+            a: 255,
+        }
+    }
+
     impl Drop for Canvas {
         fn drop(&mut self) {
             unsafe {
@@ -894,23 +1013,18 @@ mod tests {
             crate::panel::field_colours(crate::panel::FieldState::Error, DEMO_PALETTE.surface).border,
             crate::panel::field_colours(crate::panel::FieldState::Warning, DEMO_PALETTE.surface).border,
         ];
-        let is_border = |seen: Px| borders.iter().any(|b| close(seen, Px { b: b[2], g: b[1], r: b[0], a: b[3] }, 24));
 
         // The top edge, along its whole width.
+        let border_px: Vec<Px> = borders
+            .iter()
+            .map(|b| Px { b: b[2], g: b[1], r: b[0], a: b[3] })
+            .collect();
         for x in field.left..field.right {
-            let seen = px.pixel(x, field.top);
-            assert!(
-                !is_border(seen),
-                "the idle field's top edge at x={x} must not be a border: saw {seen:?}"
-            );
+            assert_not_any(&px, x, field.top, &border_px, 24, "the idle field's top edge");
         }
         // The left edge, down its whole height.
         for y in field.top..field.bottom {
-            let seen = px.pixel(field.left, y);
-            assert!(
-                !is_border(seen),
-                "the idle field's left edge at y={y} must not be a border: saw {seen:?}"
-            );
+            assert_not_any(&px, field.left, y, &border_px, 24, "the idle field's left edge");
         }
         // And the interior is still the fill, so the test above is not passing because the field
         // was never painted at all.
@@ -1010,6 +1124,158 @@ mod tests {
                 crate::panel::edit_font_height(scale),
                 -px(metrics.field_height as f32),
                 "the font must not be the field's own height at scale {scale}"
+            );
+        }
+    }
+
+    /// The panel's own inner stroke: `box-shadow: inset 0 0 0 1px var(--line)` (`:92`). Without it
+    /// the sheet has no edge of its own and reads as a rectangle of colour lying on the desktop,
+    /// which is what the first real screenshot showed next to the capture panel.
+    ///
+    /// The stroke is drawn over the surface, so what it produces is the line colour composited on
+    /// the surface and not the raw token; the assertion therefore says "not the surface" on each of
+    /// the four edges and "still the surface" in the middle, which is the same shape the divider
+    /// test already uses.
+    #[test]
+    fn the_panel_has_a_one_dip_inner_stroke() {
+        let canvas = Canvas::new(920, 520);
+        canvas.render();
+        let px = canvas.pixels();
+        let right = DEMO.panel_width - 1;
+        let bottom = DEMO.panel_height() - 1;
+        let mid_x = DEMO.panel_width / 2;
+        let mid_y = DEMO.panel_height() / 2;
+
+        let edge = |what: &str, samples: Vec<(i32, i32)>| {
+            let seen: Vec<Px> = samples.iter().map(|(x, y)| px.pixel(*x, *y)).collect();
+            assert!(
+                seen.iter().any(|p| !close(*p, surface_px(), 3)),
+                "the panel's {what} edge must carry the inner stroke, saw {seen:?}"
+            );
+        };
+        edge("top", (0..=2).map(|d| (mid_x, d)).collect());
+        edge("bottom", (0..=2).map(|d| (mid_x, bottom - d)).collect());
+        edge("left", (0..=2).map(|d| (d, mid_y)).collect());
+        edge("right", (0..=2).map(|d| (right - d, mid_y)).collect());
+
+        // And the stroke is an edge, not a fill: somewhere with no other content must stay surface.
+        // The header's own centre line is such a place; the sheet's geometric middle is not, because
+        // the preview card and its checkerboard are there.
+        let middle = px.pixel(mid_x, DEMO.header_height / 2);
+        assert!(
+            close(middle, surface_px(), 3),
+            "the header is surface, not stroke: saw {middle:?}"
+        );
+    }
+
+    /// The preview card is the design's checkerboard: a repeating conic gradient of two colours at
+    /// sixteen dip (`:111`), which is what tells a user the area is a canvas rather than a hole.
+    ///
+    /// Sampling adjacent tile centres must differ, and centres a whole tile apart must match again;
+    /// that is what makes this bite when nothing is drawn, because three equal samples fail the
+    /// first assertion instead of passing quietly.
+    #[test]
+    fn the_preview_card_is_a_sixteen_dip_checkerboard() {
+        let canvas = Canvas::new(920, 520);
+        canvas.render();
+        let px = canvas.pixels();
+        let rects = DEMO.rects(1.0);
+        // The design's own number (`:111`), written out rather than read from the metric: a test
+        // that samples through the same constant it is guarding cannot fail when that constant
+        // changes, which is the mistake the closed-loop cadence test made once already.
+        let tile = 16;
+        let at = |cx: i32, cy: i32| {
+            px.pixel(rects.preview.left + cx * tile + tile / 2, rects.preview.top + cy * tile + tile / 2)
+        };
+        let light = Px { b: 62, g: 54, r: 50, a: 255 };
+        let dark = Px { b: 42, g: 36, r: 33, a: 255 };
+        let is_checker = |p: Px| close(p, light, 6) || close(p, dark, 6);
+
+        let a = at(0, 0);
+        let b = at(1, 0);
+        let c = at(2, 0);
+        let d = at(0, 1);
+        assert!(is_checker(a), "the first tile is one of the two checker colours: saw {a:?}");
+        assert!(is_checker(b), "the second tile is one of the two checker colours: saw {b:?}");
+        assert!(
+            !close(a, b, 6),
+            "adjacent tiles must differ, saw {a:?} and {b:?} — a flat fill means no checkerboard"
+        );
+        assert!(close(a, c, 6), "a tile two steps along is the same colour again: {a:?} vs {c:?}");
+        assert!(!close(a, d, 6), "the tile below is the other colour: {a:?} vs {d:?}");
+    }
+
+    /// The card's border must survive its own checkerboard. The tiles are square and reach the card's
+    /// edge, so drawing them after the stroke erased the rounded border at all four corners — a
+    /// screenshot found it, and this is what stops it coming back.
+    ///
+    /// Each sample sits just past the corner arc, where the stroke runs straight along the edge; with
+    /// the order reversed the sample is a checker colour instead of the line.
+    #[test]
+    fn the_card_border_is_drawn_over_the_checkerboard() {
+        let canvas = Canvas::new(920, 520);
+        canvas.render();
+        let px = canvas.pixels();
+        let rects = DEMO.rects(1.0);
+        let card = rects.preview;
+        let past = DEMO.card_radius + 2;
+        // The two tile colours are read from the card itself rather than copied as literals, so this
+        // assertion cannot drift from the painter. What a border must not be is any of the three fills
+        // underneath it: the surface, or either tile. The stroke is `--line` at partial alpha, so it
+        // reads as a blend and has no single exact value to name; naming the fills it must not be is
+        // what makes this bite. Painting the border with a tile brush puts a named fill on the edge,
+        // and so does drawing the tiles after the stroke.
+        let sample_y = card.top + 24;
+        let tile_a = px.pixel(card.left + 8, sample_y);
+        let tile_b = px.pixel(card.left + 24, sample_y);
+        assert!(
+            !close(tile_a, tile_b, 6),
+            "the two tiles sampled must differ, or this is not a checkerboard: {tile_a:?} vs {tile_b:?}"
+        );
+        let samples = [
+            ("top, past the left corner", (card.left + past, card.top), 1),
+            ("top, past the right corner", (card.right - past, card.top), 1),
+            ("bottom, past the left corner", (card.left + past, card.bottom), -1),
+            ("bottom, past the right corner", (card.right - past, card.bottom), -1),
+        ];
+        // What the edge must be, named exactly: `--line` is white at thirty percent alpha, so over a
+        // tile it is a blend, and either tile may lie under any given sample. Excluding the fills was
+        // not enough: a border painted with a tile brush, or tiles painted after the stroke, still
+        // found *some* pixel near the edge that was not a fill, and the assertion passed.
+        let line_on_light = line_over(CHECKER_LIGHT);
+        let line_on_dark = line_over(CHECKER_DARK);
+        for (what, (x, y), inward) in samples {
+            let mut stroke_row = None;
+            for sy in y - 1..=y + 1 {
+                let seen = px.pixel(x, sy);
+                if close(seen, line_on_light, 12) || close(seen, line_on_dark, 12) {
+                    stroke_row = Some(sy);
+                    break;
+                }
+            }
+            let sy = match stroke_row {
+                Some(sy) => sy,
+                None => panic!(
+                    "the card's border at {what} must be --line over a tile; \
+                     rows {}-1..={}+1 saw {:?}, {:?}, {:?}",
+                    y,
+                    y,
+                    px.pixel(x, y - 1),
+                    px.pixel(x, y),
+                    px.pixel(x, y + 1)
+                ),
+            };
+            if close(px.pixel(x, sy), line_on_light, 12) {
+                assert_px(&px, x, sy, line_on_light, 12, what);
+            } else {
+                assert_px(&px, x, sy, line_on_dark, 12, what);
+            }
+            // Just inside the stroke the card is checkered, so the edge is a stroke and not the fill.
+            // Which way is inside depends on which edge this is.
+            let inner = px.pixel(x, y + 2 * inward);
+            assert!(
+                close(inner, tile_a, 6) || close(inner, tile_b, 6),
+                "inside the card's border at {what} the checkerboard must show: saw {inner:?}"
             );
         }
     }

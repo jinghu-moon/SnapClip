@@ -617,3 +617,23 @@ cargo run -p codec-bench --release -- --assert
 | 解码依赖选型（S4） | **已定 ✓**：PNG/JPG 走 WIC ✓、WebP 走 `zenwebp` ✓ ⇒ 零新依赖 | —— |
 | 重采样依赖选型（S6） | 同上 | S6 的缩放部分 |
 | 文本输入实现（D11） | **已定：原生 `EDIT` + 独立普通窗口 + DWM backdrop** | S5、S9 |
+
+### 视觉断言的纪律（三次事故之后立的规矩）✗
+
+**每一条视觉断言必须同时说出"哪个位置"和"什么颜色"。** ✗
+
+禁止"某处存在某个像素满足…"这类写法 ✓ —— 它在三处连续失效：
+
+| 断言 | 变异 | 结果 |
+| --- | --- | --- |
+| `a_focused_field_draws_its_border_and_ring` | 删掉内环 | **仍然通过** ✗ |
+| `an_idle_field_has_no_visible_border` | 边框改成可见 | **仍然通过** ✗ |
+| `the_card_border_is_drawn_over_the_checkerboard` | 描边换成棋盘格画刷 | **仍然通过** ✗ |
+
+做法：
+
+- 用 `assert_px(&canvas, x, y, colour, tol, what)` ✓ 与 `assert_not_any(&canvas, x, y, &[colours], tol, what)` ✓
+  （`crates/snapclip-ui/src/panel/frame.rs` 的测试模块 ✓），**位置 + 颜色**缺一不可 ✓；
+- `--line` 这类**半透明描边**要按"叠在什么之上"算出**混合色**再断言 ✓（`line_over(fill)` ✓）—— 只排除底下的填充是不够的 ✓；
+- 每条视觉断言都要用**变异**证明它会咬 ✓：**换颜色** ✓ / **换绘制顺序** ✓ / **删元素** ✓。
+  变异还原后必须 `touch` 文件并**看到 `Compiling`** ✓，否则跑的是变异后的二进制 ✓（`Copy-Item` 保留 mtime 的坑 ✓）。
