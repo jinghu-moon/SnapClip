@@ -9,6 +9,8 @@ mod button;
 mod checkbox;
 #[path = "panel/dropdown.rs"]
 mod dropdown;
+#[path = "panel/frame.rs"]
+mod frame;
 #[path = "panel/feedback.rs"]
 mod feedback;
 #[path = "panel/icon_button.rs"]
@@ -36,6 +38,10 @@ pub use button::{Button, ButtonState};
 pub use checkbox::{Checkbox, CheckboxState};
 pub use dropdown::{Dropdown, DropdownKey, DropdownTarget};
 pub use feedback::{Toast, Tooltip};
+pub use frame::{
+    DEMO, DEMO_PALETTE, Frame, FrameBrushes, FrameMetrics, FramePalette, FrameRects,
+    PanelRenderer, factory, paint_to_dc, paint_to_target,
+};
 pub use icon_button::IconButton;
 pub use icons::{Glyph, ICON_BAKED_PX, ICON_COUNT};
 pub use interaction::{InteractionState, PointerEvent};

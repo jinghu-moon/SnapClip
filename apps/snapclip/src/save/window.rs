@@ -502,7 +502,8 @@ fn open_and_pump(options: ShellOptions, ready: std::sync::mpsc::Sender<Result<is
         // the failure is remembered rather than ignored: without a backdrop the window has to paint
         // the mock's surface itself, and a silently transparent window would look broken.
         let backdrop = apply_backdrop(hwnd);
-        let state = Box::into_raw(Box::new(WindowState { backdrop }));
+        let renderer = snapclip_ui::panel::PanelRenderer::new().ok();
+let state = Box::into_raw(Box::new(WindowState { backdrop, renderer }));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
 
         ShowWindow(hwnd, SW_SHOW);
@@ -525,6 +526,9 @@ fn open_and_pump(options: ShellOptions, ready: std::sync::mpsc::Sender<Result<is
 struct WindowState {
     /// Whether DWM agreed to draw a backdrop. When it did not, `WM_PAINT` fills the mock's surface.
     backdrop: bool,
+    /// The frame's painter. Absent only if Direct2D could not start, in which case the
+    /// fallback fill still gives the window a readable surface.
+    renderer: Option<snapclip_ui::panel::PanelRenderer>,
 }
 
 #[cfg(windows)]
@@ -639,7 +643,26 @@ extern "system" fn window_proc(
         WM_PAINT => {
             let mut paint: PAINTSTRUCT = std::mem::zeroed();
             let hdc = BeginPaint(hwnd, &mut paint);
-            if !state(hwnd).map(|s| s.backdrop).unwrap_or(false) {
+            let mut client: RECT = std::mem::zeroed();
+            windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut client);
+            let mut painted = false;
+            if let Some(s) = state(hwnd) {
+                if let Some(renderer) = s.renderer.as_ref() {
+                    let dpi = windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) as f32;
+                    let area = snapclip_model::geometry::Rect::new(
+                        client.left,
+                        client.top,
+                        client.right,
+                        client.bottom,
+                    );
+                    // The surface fill is skipped when DWM is drawing the material, so a backdrop
+                    // keeps showing through while the frame's own lines still land on top of it.
+                    painted = renderer
+                        .paint(hdc as *mut _, area, dpi, !s.backdrop)
+                        .is_ok();
+                }
+            }
+            if !painted && !state(hwnd).map(|s| s.backdrop).unwrap_or(false) {
                 // The mock's surface, as the fallback when DWM refused a backdrop.
                 let [r, g, b, _a] = SURFACE_RGBA;
                 let colour = u32::from(r) | (u32::from(g) << 8) | (u32::from(b) << 16);

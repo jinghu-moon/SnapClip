@@ -2,8 +2,8 @@ use super::{SegmentState, segment_outer_radius, segment_radius, segment_slide};
 use snapclip_model::geometry::Rect;
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 use windows::Win32::Graphics::Direct2D::{
-    D2D1_ELLIPSE, D2D1_ROUNDED_RECT, ID2D1DeviceContext, ID2D1HwndRenderTarget,
-    ID2D1SolidColorBrush,
+    D2D1_ELLIPSE, D2D1_ROUNDED_RECT, ID2D1DCRenderTarget, ID2D1DeviceContext,
+    ID2D1HwndRenderTarget, ID2D1RenderTarget, ID2D1SolidColorBrush,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_MEASURING_MODE_NATURAL, DWRITE_TEXT_METRICS, IDWriteFactory, IDWriteTextFormat,
@@ -99,6 +99,8 @@ macro_rules! impl_paint_target {
 
 impl_paint_target!(ID2D1DeviceContext);
 impl_paint_target!(ID2D1HwndRenderTarget);
+impl_paint_target!(ID2D1RenderTarget);
+impl_paint_target!(ID2D1DCRenderTarget);
 
 pub struct PanelPainter<'a> {
     pub context: &'a dyn PaintTarget,
