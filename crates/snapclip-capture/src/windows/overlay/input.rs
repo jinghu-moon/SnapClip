@@ -1325,6 +1325,93 @@ mod tests {
     use crate::units::LabelDisplay;
     use windows_sys::Win32::Foundation::POINT;
 
+    // ── Controller fixture ────────────────────────────────────────────────────────────────
+    //
+    // `docs/41`: the `Ctrl+S` branch sets `pending_save`, and nothing tested that line, because
+    // reaching it needed a controller and the controller needed nine collaborators. The
+    // collaborators below are the smallest ones that let an action actually run; two of them
+    // are trait objects whose real implementations live in the shell.
+
+    /// A clipboard writer that copies nothing. A fixture test never copies, and a stand-in that
+    /// silently succeeded would hide a test that had wandered into the wrong path.
+    // Not used yet on purpose: the fixture exists so the next stage can write the assertions
+    // that reach the `Ctrl+S` branch, and a stand-in with no caller is a warning the compiler
+    // is right to raise.
+    #[allow(dead_code)]
+    struct TestClipboard;
+
+    impl crate::ports::ClipboardWriter for TestClipboard {
+        fn copy_text(&self, _text: &str) {}
+
+        fn copy_image(
+            &self,
+            _width: u32,
+            _height: u32,
+            _bgra: &[u8],
+            _png: Option<&std::path::Path>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// An artifact writer that refuses to write. Reaching it from a fixture test means the test
+    /// is exercising the export path, which is not what the fixture is for, so it panics rather
+    /// than pretending to have produced a file.
+    #[allow(dead_code)]
+    struct TestWriter;
+
+    impl crate::ports::ArtifactWriter for TestWriter {
+        fn write(
+            &self,
+            _session_id: &str,
+            _prepared: &crate::artifact::SelectionPixels,
+            _dpi: u32,
+            _monitor_device_name: Option<String>,
+        ) -> crate::CaptureResult<snapclip_model::CaptureArtifact> {
+            unimplemented!("the controller fixture does not write artifacts")
+        }
+
+        fn write_bands(
+            &self,
+            _session_id: &str,
+            _spec: &crate::ports::SelectionSpec,
+            _bands: &mut dyn crate::ports::BandSource,
+            _dpi: u32,
+            _monitor_device_name: Option<String>,
+        ) -> crate::CaptureResult<snapclip_model::CaptureArtifact> {
+            unimplemented!("the controller fixture does not write artifacts")
+        }
+    }
+
+    /// The smallest controller that can run an action. It owns no window and no frame; the
+    /// window handle is null because no action taken here touches the window, and the session
+    /// starts idle with no selection.
+    #[allow(dead_code)]
+    fn controller_for_tests() -> OverlayController {
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(super::OverlayShared {
+            state: CaptureState::Idle,
+            session_id: None,
+            preferences: Default::default(),
+            selection: None,
+        }));
+        // The sender is dropped at the end of this function, which is what a controller with no
+        // annotation surface would see.
+        let (_annotation_tx, annotation_rx) =
+            std::sync::mpsc::sync_channel::<crate::annotation::AnnotationCommand>(1);
+        OverlayController::new(
+            std::sync::Arc::new(crate::artifact::CaptureService::new()),
+            std::sync::Arc::new(crate::ports::NullEventSink),
+            std::sync::Arc::new(TestClipboard),
+            std::sync::Arc::new(TestWriter),
+            Default::default(),
+            shared,
+            annotation_rx,
+            // `windows-sys` types `HWND` as a pointer alias, so a null pointer is the value.
+            std::ptr::null_mut(),
+            0,
+        )
+    }
+
     /// `docs/41`: `Ctrl+S` arms the save panel. The binding, its context and its label are
     /// asserted by field name, because `Spec` is a struct and destructuring it as a tuple is
     /// what silently dropped these assertions in an earlier attempt.
