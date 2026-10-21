@@ -534,6 +534,11 @@ impl OverlayController {
                     // layer. A direct `hide_overlay` from an action handler skips those steps.
                     self.pending_save = true;
                     self.invalidate();
+                    // The handoff belongs to the session, not to the action handler:
+                    // `request_save` reads the region back, tells the sink, and leaves through
+                    // `finish_session`, so the dim layer, the countdown and the window region
+                    // all unwind in the documented order.
+                    self.request_save();
                 }
             }
             // Selected -> Annotating (selection is locked, tools go live).
@@ -1385,6 +1390,14 @@ mod tests {
     /// window handle is null because no action taken here touches the window, and the session
     /// starts idle with no selection.
     fn controller_for_tests() -> OverlayController {
+        controller_for_tests_with_sink(std::sync::Arc::new(crate::ports::NullEventSink))
+    }
+
+    /// The same fixture with a sink the test can read back. `Ctrl+S` ends the session, so the
+    /// only way to observe what it handed over is to record it as it arrives.
+    fn controller_for_tests_with_sink(
+        sink: std::sync::Arc<dyn crate::ports::CaptureEventSink>,
+    ) -> OverlayController {
         let shared = std::sync::Arc::new(std::sync::Mutex::new(super::OverlayShared {
             state: CaptureState::Idle,
             session_id: None,
@@ -1397,7 +1410,7 @@ mod tests {
             std::sync::mpsc::sync_channel::<crate::annotation::AnnotationCommand>(1);
         OverlayController::new(
             std::sync::Arc::new(crate::artifact::CaptureService::new()),
-            std::sync::Arc::new(crate::ports::NullEventSink),
+            sink,
             std::sync::Arc::new(TestClipboard),
             std::sync::Arc::new(TestWriter),
             Default::default(),
@@ -1461,6 +1474,140 @@ mod tests {
             bottom: 110,
         });
         controller
+    }
+
+    /// Records what the capture side hands to the shell, because `Ctrl+S` ends the session and
+    /// there is nothing left to inspect afterwards. Only the size is kept: the pixels are not
+    /// `Clone` and the assertions here are about the handoff happening at all, with the right
+    /// region, and once.
+    #[derive(Default)]
+    struct RecordingSink {
+        saves: std::sync::Mutex<Vec<(String, i32, i32)>>,
+    }
+
+    impl crate::ports::CaptureEventSink for RecordingSink {
+        fn on_started(&self, _: &str, _: &crate::geometry::MonitorLayout) {}
+        fn on_state(&self, _: &str, _: CaptureState, _: Option<&crate::geometry::MonitorLayout>) {}
+        fn on_completed(&self, _: &snapclip_model::CaptureArtifact) {}
+        fn on_cancelled(&self, _: &str, _: &str) {}
+        fn on_failed(&self, _: Option<&str>, _: &crate::CaptureError, _: &str) {}
+
+        fn on_save_requested(&self, session_id: &str, pixels: &crate::artifact::SelectionPixels) {
+            if let Ok(mut saves) = self.saves.lock() {
+                saves.push((
+                    session_id.to_string(),
+                    pixels.region.width(),
+                    pixels.region.height(),
+                ));
+            }
+        }
+    }
+
+    /// A controller with a live selection and a sink the test can read.
+    fn controller_with_a_selection_and_sink(
+        sink: std::sync::Arc<RecordingSink>,
+    ) -> OverlayController {
+        let mut controller = controller_for_tests_with_sink(sink);
+        controller.session = armed_session();
+        let point = crate::geometry::Point { x: 10, y: 10 };
+        controller.session.press(point);
+        controller.session.snap_to(crate::geometry::Rect {
+            left: 10,
+            top: 10,
+            right: 110,
+            bottom: 110,
+        });
+        controller
+    }
+
+    /// `Ctrl+S` hands the selected pixels to the shell exactly once, with the region the user
+    /// dragged. Deleting the `request_save` call, or the sink call inside it, has to turn this
+    /// red.
+    #[test]
+    fn the_save_request_carries_the_selected_pixels() {
+        use crate::keymap::Action;
+
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let mut controller = controller_with_a_selection_and_sink(sink.clone());
+        // The fixture has no frozen frame, so `publish_selection` cannot read one back; it
+        // returns early and leaves the slot as it found it. Seeding the slot is therefore the
+        // honest way to ask the question this test is about: when the pixels are there, is the
+        // shell told once, with the region the user dragged?
+        let region = controller.session.selection();
+        let bgra = vec![0u8; (region.width() * region.height() * 4) as usize];
+        if let Ok(mut shared) = controller.shared.lock() {
+            shared.selection = Some(std::sync::Arc::new(crate::artifact::SelectionPixels {
+                frame: frame(),
+                region,
+                bgra,
+                origin: Some(crate::geometry::Point::new(0, 0)),
+                corner_radius: 0,
+            }));
+        }
+        controller.run_action(Action::OpenSavePanel);
+
+        let saves = sink.saves.lock().expect("the recording sink is not poisoned");
+        assert_eq!(
+            saves.len(),
+            1,
+            "ctrl+s with a selection must ask the shell to save exactly once"
+        );
+        assert_eq!(
+            (saves[0].1, saves[0].2),
+            (100, 100),
+            "the handoff must carry the region the user dragged, not an empty or default one"
+        );
+    }
+
+    /// Without a selection there is nothing to hand over, so the sink stays silent. This is the
+    /// half that a branch entered by accident would fail.
+    #[test]
+    fn no_selection_means_no_save_request() {
+        use crate::keymap::Action;
+
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let mut controller = controller_for_tests_with_sink(sink.clone());
+        // Idle: no selection, and `panel_entry_available` refuses, so the action is a no-op.
+        controller.run_action(Action::OpenSavePanel);
+
+        let saves = sink.saves.lock().expect("the recording sink is not poisoned");
+        assert!(
+            saves.is_empty(),
+            "an idle session has no pixels to save and must not ask the shell"
+        );
+    }
+
+    /// The guard inside `request_save` is invisible through the action path, because the entry
+    /// predicate already requires a selection, so it is called directly here. The case it
+    /// exists for is real: the shared slot keeps the last selection for consumers outside
+    /// capture and is not cleared when a session ends, so a session with no selection of its
+    /// own could otherwise hand over the previous session's picture.
+    #[test]
+    fn a_stale_read_back_is_not_handed_over_without_a_selection() {
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let mut controller = controller_for_tests_with_sink(sink.clone());
+        if let Ok(mut shared) = controller.shared.lock() {
+            shared.selection = Some(std::sync::Arc::new(crate::artifact::SelectionPixels {
+                frame: frame(),
+                region: crate::geometry::Rect {
+                    left: 0,
+                    top: 0,
+                    right: 4,
+                    bottom: 4,
+                },
+                bgra: vec![0u8; 4 * 4 * 4],
+                origin: Some(crate::geometry::Point::new(0, 0)),
+                corner_radius: 0,
+            }));
+        }
+        // Idle, so there is no selection of this session's own, but the slot is not empty.
+        controller.request_save();
+
+        let saves = sink.saves.lock().expect("the recording sink is not poisoned");
+        assert!(
+            saves.is_empty(),
+            "a session with no selection must not hand over the previous session's pixels"
+        );
     }
 
     /// The line that arms the save panel. `Ctrl+S` with a selection has to set `pending_save`,

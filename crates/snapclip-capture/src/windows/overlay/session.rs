@@ -733,6 +733,34 @@ impl OverlayController {
         })
     }
 
+    /// `Ctrl+S`: hand the selected pixels to the shell, then leave the way every session
+    /// leaves.
+    ///
+    /// The read back happens here rather than at export, because the shell wants the pixels
+    /// before anything is encoded, and `publish_selection` is the one funnel that already
+    /// reads the region and keeps it in `shared.selection` for a consumer outside capture
+    /// (docs/23 §14.55.21). The sink is told **before** `finish_session`, because finishing
+    /// clears the session id; the delay-to-pin path does the same two steps in the same order.
+    ///
+    /// Leaving is `finish_session`, never a direct `hide_overlay`: the exit sequence also
+    /// hides the dim layer, clears the countdown and restores the window region, and skipping
+    /// those steps is what the comment in `input.rs` warns about.
+    pub(super) fn request_save(&mut self) {
+        if self.session.selection().is_empty() {
+            return;
+        }
+        self.publish_selection("panel-save");
+        let pixels = self
+            .shared
+            .lock()
+            .ok()
+            .and_then(|shared| shared.selection.clone());
+        if let Some(pixels) = pixels {
+            self.sink.on_save_requested(&self.session_id(), &pixels);
+        }
+        self.finish_session();
+    }
+
     /// `Enter`: read the confirmed selection back on this thread, then hand encode +
     /// write to the export worker so the message pump keeps answering `Esc` and
     /// `WM_PAINT` while a large PNG is produced (docs/11 §Phase 3).
