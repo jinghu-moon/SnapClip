@@ -33,8 +33,9 @@ pub enum SaveFormat {
     Png,
     Jpeg,
     Webp,
-    /// AVIF (`docs/49`). Save-time only: the encoder is whole-frame, so a capture never uses it.
-    Avif,
+    /// BMP (`docs/49`): save-time only, top-down 32bpp, no compression. Not a capture
+    /// preference, so the scroll preflight has no arm for it.
+    Bmp,
 }
 
 /// Why a format cannot hold an image. Structured rather than a message: the caller decides how to
@@ -87,20 +88,6 @@ pub fn within_jpeg_frame_budget(width: u64, height: u64) -> bool {
     width.saturating_mul(height) <= JPEG_FRAME_BUDGET_PIXELS
 }
 
-/// The most pixels the AVIF save path encodes in one frame.
-///
-/// AVIF has no streaming encoder in this dependency (`docs/49`): `encode` takes a whole frame, so
-/// the save path holds it. The budget is the measured one, not the container limit: the encoder
-/// runs at roughly 0.7 MP/s on this machine, so 12 MP is about nine seconds on the export worker
-/// and 16 MP would be twelve. A long scroll capture is refused by this before anything is
-/// allocated, stays PNG in the artifact, and is transcoded only if it fits.
-pub const AVIF_FRAME_BUDGET_PIXELS: u64 = 12_000_000;
-
-/// Whether an image of this size can be saved as AVIF at all.
-pub fn within_avif_frame_budget(width: u64, height: u64) -> bool {
-    width.saturating_mul(height) <= AVIF_FRAME_BUDGET_PIXELS
-}
-
 /// Why a scroll capture will not be saved in the format the user chose.
 ///
 /// Two different answers, kept apart because they mean different things: the format cannot express
@@ -111,6 +98,8 @@ pub enum Lowering {
     Format(FormatLimit),
     /// The format could, but the save path would have to hold the whole frame.
     FrameBudget { pixels: u64, max: u64 },
+    /// The format is written by the save path only, so the capture keeps its PNG artifact.
+    SaveTimeOnly,
 }
 
 impl std::fmt::Display for Lowering {
@@ -120,6 +109,10 @@ impl std::fmt::Display for Lowering {
             Lowering::FrameBudget { pixels, max } => write!(
                 f,
                 "the save path holds the whole frame, and {pixels} pixels exceed its {max} budget"
+            ),
+            Lowering::SaveTimeOnly => write!(
+                f,
+                "this format is written by the save path, and the capture artifact stays PNG"
             ),
         }
     }
@@ -135,9 +128,8 @@ impl SaveFormat {
             SaveFormat::Png => u64::from(u32::MAX),
             SaveFormat::Jpeg => 65_535,
             SaveFormat::Webp => 16_383,
-            // 65 535 is the AV1 limit (`docs/49`): the probe encoded 17 000 pixels across and
-            // failed at 65 536. The side limit is not the practical gate; the pixel budget is.
-            SaveFormat::Avif => 65_535,
+            // `biHeight` is an `i32`, and the height is written negative for top-down rows.
+            SaveFormat::Bmp => i32::MAX as u64,
         }
     }
 
@@ -166,7 +158,7 @@ impl SaveFormat {
             SaveFormat::Png => "PNG",
             SaveFormat::Jpeg => "JPG",
             SaveFormat::Webp => "WebP（无损）",
-            SaveFormat::Avif => "AVIF",
+            SaveFormat::Bmp => "BMP",
         }
     }
 }
@@ -176,28 +168,15 @@ mod tests {
     use super::*;
 
     #[test]
-    #[test]
-    fn avif_stops_at_the_av1_side_limit() {
-        // 65 535 is the AV1 limit, confirmed by the probe: 17 000 across encodes, 65 536 does not.
-        assert_eq!(SaveFormat::Avif.max_side(), 65_535);
-        assert_eq!(SaveFormat::Avif.can_encode(65_535, 1), Ok(()));
+    fn bmp_stops_at_the_signed_height_limit() {
+        // `biHeight` is a signed 32-bit field, and BMP writes it negative for top-down rows.
+        assert_eq!(SaveFormat::Bmp.max_side(), 2_147_483_647);
+        assert_eq!(SaveFormat::Bmp.can_encode(2_147_483_647, 1), Ok(()));
         assert!(matches!(
-            SaveFormat::Avif.can_encode(65_536, 1),
+            SaveFormat::Bmp.can_encode(2_147_483_648, 1),
             Err(FormatLimit::TooWide { .. })
         ));
-        assert_eq!(SaveFormat::Avif.label(), "AVIF");
-    }
-
-    #[test]
-    fn avif_refuses_a_frame_over_its_budget() {
-        // 12 MP is the measured ceiling: the encoder runs at about 0.7 MP/s, so 12 MP is a few
-        // seconds on the worker and 16 MP is not. A 4K capture (8.29 MP) fits.
-        assert!(within_avif_frame_budget(4000, 3000));
-        assert!(!within_avif_frame_budget(4000, 3001));
-        assert!(!within_avif_frame_budget(1250, 30_000));
-        assert!(within_avif_frame_budget(3840, 2160));
-        assert!(!within_avif_frame_budget(1250, 9_601));
-        assert!(within_avif_frame_budget(1250, 9_600));
+        assert_eq!(SaveFormat::Bmp.label(), "BMP");
     }
 
     #[test]

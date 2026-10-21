@@ -141,23 +141,25 @@ pub(crate) fn scroll_format(
     }
     // JPG could hold these rows, but its only correct arm holds the whole frame (`docs/34` §17), and
     // a scroll capture is exactly the image that must not be held (`docs/34` §18).
-    // The whole-frame arms: both hold the frame to encode it, so a scroll capture that would not
-    // fit is lowered before the session starts (`docs/49` for AVIF, `docs/34` §18 for JPG). BMP is
-    // not a preference: it exists only as a save-time transcode, so it has no arm here.
-    let whole_frame = match preferred {
-        SaveFormat::Jpeg => Some(crate::save_format::JPEG_FRAME_BUDGET_PIXELS),
-        SaveFormat::Avif => Some(crate::save_format::AVIF_FRAME_BUDGET_PIXELS),
-        SaveFormat::Png | SaveFormat::Webp => None,
-    };
-    if let Some(max) = whole_frame {
+    // JPG's only correct arm holds the whole frame, so a capture that would not fit is lowered
+    // before the session starts (`docs/34` §18). BMP is not a preference: it exists only as a
+    // save-time transcode, so it has no arm here.
+    // BMP is a save-time target rather than a capture format: the artifact every capture keeps is
+    // PNG (`docs/42`), and BMP exists to transcode that master on the way out.
+    if matches!(preferred, SaveFormat::Bmp) {
+        return (SaveFormat::Png, Some(Lowering::SaveTimeOnly));
+    }
+    if matches!(preferred, SaveFormat::Jpeg)
+        && !within_jpeg_frame_budget(u64::from(width), u64::from(rows))
+    {
         let pixels = u64::from(width) * u64::from(rows);
-        let fits = match preferred {
-            SaveFormat::Avif => crate::save_format::within_avif_frame_budget(u64::from(width), u64::from(rows)),
-            _ => within_jpeg_frame_budget(u64::from(width), u64::from(rows)),
-        };
-        if !fits {
-            return (SaveFormat::Png, Some(Lowering::FrameBudget { pixels, max }));
-        }
+        return (
+            SaveFormat::Png,
+            Some(Lowering::FrameBudget {
+                pixels,
+                max: crate::save_format::JPEG_FRAME_BUDGET_PIXELS,
+            }),
+        );
     }
     (preferred, None)
 }
@@ -724,9 +726,8 @@ mod tests {
     #[test]
     #[ignore = "timing report: run with --release --include-ignored --nocapture"]
     fn the_cost_of_one_frame_at_the_field_size() {
-        // Timing numbers are only meaningful in release. A debug build of the AVIF encoder is about
-        // thirty times slower, which is how a four kilobyte per second reading became eighty seven
-        // seconds for one frame and nearly led to the format being dropped.
+        // Timing numbers are only meaningful in release: a debug build of an encoder of this kind
+        // can be thirty times slower, which is how a plausible reading turns into a wrong decision.
         assert!(
             !cfg!(debug_assertions),
             "this measurement must run with --release: cargo test --release ... -- --ignored --nocapture"
@@ -990,6 +991,13 @@ mod scroll_format_tests {
     }
 
     #[test]
+    fn bmp_is_lowered_to_png_because_it_is_only_a_save_target() {
+        let (effective, why) = scroll_format(SaveFormat::Bmp, 1250, 809);
+        assert_eq!(effective, SaveFormat::Png);
+        assert!(matches!(why, Some(Lowering::SaveTimeOnly)), "{why:?}");
+    }
+
+    #[test]
     fn png_is_never_lowered() {
         assert_eq!(scroll_format(SaveFormat::Png, 3840, 2100), (SaveFormat::Png, None));
         assert_eq!(scroll_format(SaveFormat::Png, 1280, 960), (SaveFormat::Png, None));
@@ -1017,24 +1025,6 @@ mod scroll_format_tests {
         assert_eq!(effective, SaveFormat::Png);
         assert!(matches!(why, Some(Lowering::Format(_))), "{why:?}");
         assert_eq!(MAX_SCREENS, 100);
-    }
-
-    #[test]
-    fn avif_is_lowered_when_the_frame_would_not_fit_its_budget() {
-        // 100 screens of 76 rows at 1250 wide is 9.5 MP: inside the 12 MP AVIF budget.
-        assert_eq!(
-            scroll_format(SaveFormat::Avif, 1250, 76),
-            (SaveFormat::Avif, None)
-        );
-        // 100 screens of 97 rows is 12.1 MP, just over it.
-        let (effective, why) = scroll_format(SaveFormat::Avif, 1250, 97);
-        assert_eq!(effective, SaveFormat::Png);
-        assert!(matches!(why, Some(Lowering::FrameBudget { .. })), "{why:?}");
-        // The case this rule exists for: a capture whose frame the encoder would have to hold. It
-        // stays inside AVIF's 65 535 row side (25 000 rows), so the budget is what refuses it.
-        let (effective, why) = scroll_format(SaveFormat::Avif, 1250, 250);
-        assert_eq!(effective, SaveFormat::Png);
-        assert!(matches!(why, Some(Lowering::FrameBudget { .. })), "{why:?}");
     }
 
     #[test]

@@ -325,12 +325,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "assert_matches"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b34d609dfbaf33d6889b2b7106d3ca345eacad44200913df5ba02bfd31d2ba9"
-
-[[package]]
 name = "async-broadcast"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -506,26 +500,6 @@ name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
-
-[[package]]
-name = "atomig"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd0f41f4bb89f5c6450325e283fb78c4a3d042181b54f3855ee2f872919f9863"
-dependencies = [
- "atomig-macro",
-]
-
-[[package]]
-name = "atomig-macro"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "49c98dba06b920588de7d63f6acc23f1e6a9fade5fd6198e564506334fb5a4f5"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
 
 [[package]]
 name = "atspi"
@@ -713,15 +687,6 @@ name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
-
-[[package]]
-name = "bitreader"
-version = "0.3.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "886559b1e163d56c765bc3a985febb4eee8009f625244511d8ee3c432e08c066"
-dependencies = [
- "cfg-if",
-]
 
 [[package]]
 name = "bitstream-io"
@@ -1885,12 +1850,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
-name = "fallible_collections"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dab93c7205280c4785c44517fe84d99751b81f6deb8450cb196da6be88e332bb"
-
-[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2235,21 +2194,6 @@ dependencies = [
  "archmage",
  "bytemuck",
  "paste",
-]
-
-[[package]]
-name = "generator"
-version = "0.8.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1be81b31c9ce4caf7f3178eeb90662bb1864d3ad363ec6bdada3201adff19c37"
-dependencies = [
- "cc",
- "cfg-if",
- "libc",
- "log",
- "rustversion",
- "windows-link 0.2.1",
- "windows-result 0.4.1",
 ]
 
 [[package]]
@@ -3839,12 +3783,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "leb128"
-version = "0.2.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c83bff1d572d6b9aeef67ddfc8448e4a3737909cb28e81f97c791b9018703e52"
-
-[[package]]
 name = "lebe"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3973,19 +3911,6 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 dependencies = [
  "serde_core",
  "value-bag",
-]
-
-[[package]]
-name = "loom"
-version = "0.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "419e0dc8046cb947daa77eb95ae174acfbddb7673b4151f56d1eed8e93fbfaca"
-dependencies = [
- "cfg-if",
- "generator",
- "scoped-tls",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -4154,15 +4079,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "matchers"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
-dependencies = [
- "regex-automata",
-]
-
-[[package]]
 name = "maybe-rayon"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4328,16 +4244,6 @@ dependencies = [
  "spirv",
  "thiserror 2.0.21",
  "unicode-ident",
-]
-
-[[package]]
-name = "nasm-rs"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "706bf8a5e8c8ddb99128c3291d31bd21f4bcde17f0f4c20ec678d85c74faa149"
-dependencies = [
- "jobserver",
- "log",
 ]
 
 [[package]]
@@ -5701,43 +5607,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a611d15b50743feb4c76b7d03edcb0e64f399c26961e4efe6975bc398be6aa3d"
 
 [[package]]
-name = "rav1d-disjoint-mut"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5d170ff0b912935f0d796c3b28bdacf46311840161e91f120f485cc92f1f977"
-dependencies = [
- "aligned",
- "aligned-vec",
- "loom",
- "spin 0.12.3",
- "zerocopy",
-]
-
-[[package]]
-name = "rav1d-safe"
-version = "0.5.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "717c3ef9a98101f3d2e33c4a8a4d1fd8b4fb0d39fa67a838e3308386ad9e7a1a"
-dependencies = [
- "aligned",
- "archmage",
- "assert_matches",
- "atomig",
- "bitflags 2.13.2",
- "cc",
- "cfg-if",
- "nasm-rs",
- "parking_lot",
- "paste",
- "rav1d-disjoint-mut",
- "raw-cpuid",
- "safe_unaligned_simd",
- "strum",
- "to_method",
- "zerocopy",
-]
-
-[[package]]
 name = "rav1e"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6736,7 +6605,6 @@ dependencies = [
 name = "snapclip-app"
 version = "0.1.0"
 dependencies = [
- "almost-enough",
  "anyhow",
  "arboard",
  "async-channel",
@@ -6748,7 +6616,6 @@ dependencies = [
  "parking_lot",
  "png 0.18.1",
  "rclip-rtf",
- "rgb",
  "serde",
  "serde_json",
  "snapclip-capture",
@@ -6757,9 +6624,7 @@ dependencies = [
  "snapclip-ui",
  "win-icon-extractor",
  "windows-sys 0.59.0",
- "zenavif",
  "zenjpeg",
- "zenpixels",
  "zenwebp",
 ]
 
@@ -6836,12 +6701,6 @@ checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
 dependencies = [
  "lock_api",
 ]
-
-[[package]]
-name = "spin"
-version = "0.12.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0134f9043ed38b087ac4f7d4af44c79e2c9e5094421fe3164f435ce585953b10"
 
 [[package]]
 name = "spirv"
@@ -7335,12 +7194,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
-name = "to_method"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7c4ceeeca15c8384bbc3e011dbd8fccb7f068a440b752b7d9b32ceb0ca0e2e8"
-
-[[package]]
 name = "tokio"
 version = "1.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7559,14 +7412,10 @@ version = "0.3.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb7f578e5945fb242538965c2d0b04418d38ec25c79d160cd279bf0731c8d319"
 dependencies = [
- "matchers",
  "nu-ansi-term",
- "once_cell",
- "regex-automata",
  "sharded-slab",
  "smallvec",
  "thread_local",
- "tracing",
  "tracing-core",
  "tracing-log",
 ]
@@ -9392,57 +9241,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "zenavif"
-version = "0.1.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d998e2cd26b3f82d0cf7fd5f36b3d81dd07184b90c2f53328df05fdcaabf6cb"
-dependencies = [
- "almost-enough",
- "archmage",
- "bytemuck",
- "enough",
- "imgref",
- "linear-srgb",
- "log",
- "magetypes",
- "rav1d-safe",
- "rgb",
- "safe_unaligned_simd",
- "thiserror 2.0.21",
- "whereat",
- "yuv",
- "zenavif-parse",
- "zenpixels",
- "zenpixels-convert",
- "zenravif",
-]
-
-[[package]]
-name = "zenavif-parse"
-version = "0.6.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35ea3a5640719078e3d91e5feab60dd5d7cff3c34bf5c666925044745c58569d"
-dependencies = [
- "arrayvec",
- "bitreader",
- "byteorder",
- "enough",
- "fallible_collections",
- "leb128",
- "log",
- "zencodec",
-]
-
-[[package]]
-name = "zenavif-serialize"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbc63468f1ad230080baa8f87b0bf1b6aad9987f85e533566337181e0a5349c6"
-dependencies = [
- "arrayvec",
-]
-
-[[package]]
 name = "zencodec"
 version = "0.1.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9495,73 +9293,6 @@ dependencies = [
  "imgref",
  "rgb",
  "whereat",
-]
-
-[[package]]
-name = "zenpixels-convert"
-version = "0.2.16"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf516a64a98f08fa2aa19e86f1389e49894f750441044d65369687cf88a1b8dd"
-dependencies = [
- "archmage",
- "bytemuck",
- "garb",
- "libm",
- "linear-srgb",
- "magetypes",
- "once_cell",
- "paste",
- "rgb",
- "whereat",
- "zenpixels",
-]
-
-[[package]]
-name = "zenrav1e"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c2f798defdace5a2d991e4f679697768cf256a3cef130bfa2d84702cebf3a76"
-dependencies = [
- "aligned-vec",
- "arbitrary",
- "arg_enum_proc_macro",
- "arrayvec",
- "av1-grain",
- "bitstream-io",
- "built",
- "cfg-if",
- "enough",
- "interpolate_name",
- "itertools 0.14.0",
- "libfuzzer-sys",
- "log",
- "maybe-rayon",
- "noop_proc_macro",
- "num-derive",
- "num-traits",
- "pastey",
- "profiling",
- "rand 0.9.5",
- "rand_chacha 0.9.0",
- "simd_helpers",
- "thiserror 2.0.21",
- "v_frame",
- "wasm-bindgen",
-]
-
-[[package]]
-name = "zenravif"
-version = "0.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51edf23ff0690e4a7c3c7df67ee2143709f9bf33ecb8785cfffa33bba95ac314"
-dependencies = [
- "almost-enough",
- "imgref",
- "loop9",
- "quick-error 2.0.1",
- "rgb",
- "zenavif-serialize",
- "zenrav1e",
 ]
 
 [[package]]

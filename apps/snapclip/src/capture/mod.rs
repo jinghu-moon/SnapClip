@@ -22,6 +22,7 @@ pub use pin_source::{PinSource, TakeSelection};
 /// It lives in the shell and not in `snapclip-capture` because which encoder to use is a decision
 /// about the **output format**, not a fact about capturing — and that direction is what keeps
 /// `png` out of the capture crate's graph entirely.
+pub mod row_band_bmp;
 pub mod row_band_png;
 
 /// What each save format can hold, as pure data (`docs/34` §13).
