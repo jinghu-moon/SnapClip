@@ -25,6 +25,10 @@ pub const EDIT_INSET_DIP: f32 = 1.5;
 /// The horizontal padding the design puts between the frame and the text.
 pub const EDIT_PADDING_DIP: f32 = 10.0;
 
+/// `--r-input: 6px` — `save-panel-demo-v3.html:54`. The frame's corner; the native child is inset
+/// so this is the corner the user actually sees.
+pub const INPUT_RADIUS_DIP: f32 = 6.0;
+
 /// The colour of the field frame, and of the ring inside it when it has focus.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct FieldColours {

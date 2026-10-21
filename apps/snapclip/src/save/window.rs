@@ -321,6 +321,17 @@ impl ShellHandle {
     /// The taskbar entry, the message queue and the abort path all end here: one posted `WM_CLOSE`
     /// and one join, so a caller that got a handle can always get rid of it.
     pub fn close(mut self) {
+        self.request_close();
+        self.join();
+    }
+
+    /// Wait for the window to be closed by the user, then join. Used by the development entry, which
+    /// has no other reason to stay alive.
+    pub fn wait(mut self) {
+        self.join();
+    }
+
+    fn request_close(&mut self) {
         #[cfg(windows)]
         if self.hwnd != 0 {
             unsafe {
@@ -332,6 +343,9 @@ impl ShellHandle {
                 );
             }
         }
+    }
+
+    fn join(&mut self) {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -503,8 +517,31 @@ fn open_and_pump(options: ShellOptions, ready: std::sync::mpsc::Sender<Result<is
         // the mock's surface itself, and a silently transparent window would look broken.
         let backdrop = apply_backdrop(hwnd);
         let renderer = snapclip_ui::panel::PanelRenderer::new().ok();
-let state = Box::into_raw(Box::new(WindowState { backdrop, renderer }));
+        // The child's background: the field's own fill, resolved from `--fill` over the surface.
+        // A native `EDIT` cannot be translucent, so the composite is computed once here.
+        let fill = snapclip_ui::panel::field_colours(
+            snapclip_ui::panel::FieldState::Idle,
+            SURFACE_RGBA,
+        )
+        .fill;
+        let fill_colour = u32::from(fill[0]) | (u32::from(fill[1]) << 8) | (u32::from(fill[2]) << 16);
+        let fill_brush = windows_sys::Win32::Graphics::Gdi::CreateSolidBrush(fill_colour);
+        let state = Box::into_raw(Box::new(WindowState {
+            backdrop,
+            renderer,
+            field_state: snapclip_ui::panel::FieldState::Idle,
+            name_edit: std::ptr::null_mut(),
+            fill_brush,
+        }));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
+
+        // The name field: a real `EDIT` child, inset inside the frame the frame painter draws. Its
+        // font is the embedded subset registered for GDI, so the native control and the drawn panel
+        // share one face without installing anything on the machine.
+        let edit = create_name_edit(hwnd);
+        if let Some(s) = (state as *mut WindowState).as_mut() {
+            s.name_edit = edit;
+        }
 
         ShowWindow(hwnd, SW_SHOW);
     }
@@ -529,6 +566,108 @@ struct WindowState {
     /// The frame's painter. Absent only if Direct2D could not start, in which case the
     /// fallback fill still gives the window a readable surface.
     renderer: Option<snapclip_ui::panel::PanelRenderer>,
+    /// The first field's frame state. The native `EDIT` child draws no border, no focus ring and no
+    /// error colour (`snapclip_ui::panel::field`), so the frame is told what to draw around it.
+    field_state: snapclip_ui::panel::FieldState,
+    /// The name field's child window, once it exists.
+    name_edit: windows_sys::Win32::Foundation::HWND,
+    /// The brush `WM_CTLCOLOREDIT` returns. The child paints its own background, and on a dark panel
+    /// the default white would show as a lit rectangle, so the field's resolved fill is handed over
+    /// instead. Created once and owned by this state.
+    fill_brush: windows_sys::Win32::Graphics::Gdi::HBRUSH,
+}
+
+/// Create the name field: a real `EDIT` child, inset inside the frame the frame painter draws.
+///
+/// Two things make this a native control rather than a drawn one. The font is the **embedded
+/// subset**, registered for GDI from memory with `AddFontMemResourceEx`, so the child shares the
+/// panel's face without the family being installed on the machine. And the child is **inset** by
+/// `EDIT_INSET_DIP`, so the rounded corner the user sees is the frame's, not the child's square one.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn create_name_edit(parent: windows_sys::Win32::Foundation::HWND) -> windows_sys::Win32::Foundation::HWND {
+    use windows_sys::Win32::Graphics::Gdi::{
+        AddFontMemResourceEx, CreateFontW, CLEARTYPE_QUALITY, DEFAULT_CHARSET, FF_DONTCARE,
+        FW_SEMIBOLD,
+    };
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, GetClientRect, ES_AUTOHSCROLL, WS_CHILD, WS_TABSTOP, WS_VISIBLE,
+    };
+
+    unsafe {
+        // Register the subset from memory. The returned handle is intentionally never removed: the
+        // registration lives as long as the process, and `RemoveFontMemResourceEx` on a handle the
+        // GDI objects still reference would pull the face out from under them.
+        let mut loaded: u32 = 0;
+        let bytes = snapclip_capture::overlay_font::SUBSET;
+        let _ = AddFontMemResourceEx(
+            bytes.as_ptr() as *const core::ffi::c_void,
+            bytes.len() as u32,
+            std::ptr::null_mut(),
+            &mut loaded,
+        );
+
+        let dpi = GetDpiForWindow(parent).max(96);
+        let scale = f64::from(dpi) / 96.0;
+        let metrics = snapclip_ui::panel::DEMO;
+        let rects = metrics.rects(scale as f32);
+        let field = snapclip_ui::panel::name_field_rect(&metrics, &rects, scale as f32);
+        let inset = (f64::from(snapclip_ui::panel::EDIT_INSET_DIP) * scale).round() as i32;
+
+        let family: Vec<u16> = snapclip_ui::panel::FAMILY
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let height = -((f64::from(metrics.field_height) * scale).round() as i32);
+        let font = CreateFontW(
+            height,
+            0,
+            0,
+            0,
+            FW_SEMIBOLD as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET as u32,
+            0,
+            0,
+            CLEARTYPE_QUALITY as u32,
+            FF_DONTCARE as u32,
+            family.as_ptr(),
+        );
+
+        let class: Vec<u16> = "EDIT\0".encode_utf16().collect();
+        let text: Vec<u16> = "捕获\0".encode_utf16().collect();
+        let edit = CreateWindowExW(
+            0,
+            class.as_ptr(),
+            text.as_ptr(),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL as u32,
+            field.left + inset,
+            field.top + inset,
+            (field.right - field.left - inset * 2).max(1),
+            (field.bottom - field.top - inset * 2).max(1),
+            parent,
+            std::ptr::null_mut(),
+            GetModuleHandleW(std::ptr::null()),
+            std::ptr::null_mut(),
+        );
+        if edit.is_null() {
+            return edit;
+        }
+
+        use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
+        const WM_SETFONT: u32 = 0x0030;
+        SendMessageW(edit, WM_SETFONT, font as usize, 1);
+
+        // The child is inside the frame's rect, so its own square corners are covered by the frame's
+        // fill; nothing else has to be clipped.
+        let mut client: windows_sys::Win32::Foundation::RECT = std::mem::zeroed();
+        GetClientRect(parent, &mut client);
+        edit
+    }
 }
 
 #[cfg(windows)]
@@ -658,7 +797,7 @@ extern "system" fn window_proc(
                     // The surface fill is skipped when DWM is drawing the material, so a backdrop
                     // keeps showing through while the frame's own lines still land on top of it.
                     painted = renderer
-                        .paint(hdc as *mut _, area, dpi, !s.backdrop)
+                        .paint(hdc as *mut _, area, dpi, !s.backdrop, s.field_state)
                         .is_ok();
                 }
             }
@@ -699,6 +838,50 @@ extern "system" fn window_proc(
             }
             0
         }
+        // The child's colours. An `EDIT` paints its own background from the system colours, which on
+        // a dark panel is a lit white rectangle, so the field's resolved fill and its text colour are
+        // handed over here instead.
+        WM_CTLCOLOREDIT => {
+            if let Some(s) = state(hwnd) {
+                let colours = snapclip_ui::panel::field_colours(s.field_state, SURFACE_RGBA);
+                let child = wparam as windows_sys::Win32::Graphics::Gdi::HDC;
+                windows_sys::Win32::Graphics::Gdi::SetBkColor(child, bgr(colours.fill));
+                windows_sys::Win32::Graphics::Gdi::SetTextColor(child, bgr(colours.text));
+                return s.fill_brush as isize;
+            }
+            DefWindowProcW(hwnd, message, wparam, lparam)
+        }
+        // Focus is not the child's business: the border and the ring around it belong to the frame,
+        // so the window is invalidated and the frame repainted in the new state. Repainting the whole
+        // frame rather than just the field's rect is deliberate — one panel of six fields is a few
+        // hundred microseconds, and a dirty-rect scheme would be a second geometry path to keep in
+        // step with the first (`docs/41` S2).
+        WM_COMMAND => {
+            const EN_SETFOCUS: u16 = 0x0100;
+            const EN_KILLFOCUS: u16 = 0x0200;
+            let notification = ((wparam >> 16) & 0xFFFF) as u16;
+            let control = lparam as windows_sys::Win32::Foundation::HWND;
+            let mut repaint = false;
+            if let Some(s) = state_mut(hwnd) {
+                if control == s.name_edit {
+                    match notification {
+                        EN_SETFOCUS => {
+                            s.field_state = snapclip_ui::panel::FieldState::Focused;
+                            repaint = true;
+                        }
+                        EN_KILLFOCUS => {
+                            s.field_state = snapclip_ui::panel::FieldState::Idle;
+                            repaint = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if repaint {
+                windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0);
+            }
+            0
+        }
         WM_CLOSE => {
             DestroyWindow(hwnd);
             0
@@ -725,6 +908,32 @@ fn state(hwnd: windows_sys::Win32::Foundation::HWND) -> Option<&'static WindowSt
         pointer.as_ref()
     }
 }
+
+/// The same pointer, mutably. The window thread is the only writer — the state is created on it, read
+/// by its own message procedure, and dropped by it — so there is no aliasing to guard against.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn state_mut(hwnd: windows_sys::Win32::Foundation::HWND) -> Option<&'static mut WindowState> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, GWLP_USERDATA};
+    unsafe {
+        let pointer = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
+        pointer.as_mut()
+    }
+}
+
+/// GDI wants `0x00BBGGRR`, which is the reverse of the byte order the palette is written in.
+#[cfg(windows)]
+fn bgr(rgba: [u8; 4]) -> u32 {
+    u32::from(rgba[0]) | (u32::from(rgba[1]) << 8) | (u32::from(rgba[2]) << 16)
+}
+
+/// `WM_CTLCOLOREDIT`: the child asks its parent what to paint its background with.
+#[cfg(windows)]
+const WM_CTLCOLOREDIT: u32 = 0x0133;
+
+/// `WM_COMMAND`: the child reports focus changes through it.
+#[cfg(windows)]
+const WM_COMMAND: u32 = 0x0111;
 
 #[cfg(windows)]
 #[allow(unsafe_code)]

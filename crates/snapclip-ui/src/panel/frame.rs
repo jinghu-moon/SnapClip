@@ -186,16 +186,46 @@ pub struct FrameBrushes {
     pub line: ID2D1SolidColorBrush,
     pub text: ID2D1SolidColorBrush,
     pub muted: ID2D1SolidColorBrush,
+    /// The field background, already composited: a native `EDIT` cannot be translucent, so the
+    /// frame and the child both use this opaque value (`field.rs`).
+    pub field_fill: ID2D1SolidColorBrush,
+    /// `--accent`, the focused field's border and its inner ring.
+    pub accent: ID2D1SolidColorBrush,
+    /// `--danger`, the error field's border.
+    pub danger: ID2D1SolidColorBrush,
+    /// `--warning`, the warning field's border.
+    pub warning: ID2D1SolidColorBrush,
 }
 
 impl FrameBrushes {
     pub fn new(target: &ID2D1RenderTarget, palette: &FramePalette) -> Result<Self> {
+        // The field's own colours, resolved once here rather than at every paint: they are pure
+        // functions of the state and the surface.
+        let idle = crate::panel::field_colours(crate::panel::FieldState::Idle, palette.surface);
+        let focused = crate::panel::field_colours(crate::panel::FieldState::Focused, palette.surface);
+        let error = crate::panel::field_colours(crate::panel::FieldState::Error, palette.surface);
+        let warning = crate::panel::field_colours(crate::panel::FieldState::Warning, palette.surface);
         Ok(Self {
             surface: brush(target, palette.surface)?,
             line: brush(target, palette.line)?,
             text: brush(target, palette.text)?,
             muted: brush(target, palette.muted)?,
+            field_fill: brush(target, idle.fill)?,
+            accent: brush(target, focused.border)?,
+            danger: brush(target, error.border)?,
+            warning: brush(target, warning.border)?,
         })
+    }
+
+    /// The brush for a state's border, or `None` when the design draws no border at all.
+    fn field_border(&self, state: crate::panel::FieldState) -> Option<&ID2D1SolidColorBrush> {
+        match state {
+            // `:167` — the mock's idle border is transparent, so an idle field has no visible edge.
+            crate::panel::FieldState::Idle => None,
+            crate::panel::FieldState::Focused => Some(&self.accent),
+            crate::panel::FieldState::Error => Some(&self.danger),
+            crate::panel::FieldState::Warning => Some(&self.warning),
+        }
     }
 }
 
@@ -222,6 +252,9 @@ pub struct Frame<'a> {
     /// Fill the surface. Skipped when the compositor draws the panel's material behind us.
     pub fill_surface: bool,
     pub title: Option<(&'a str, &'a IDWriteTextFormat)>,
+    /// The state of the first form field's frame. The native `EDIT` itself draws no border, no
+    /// focus ring and no error state, so those belong to the frame (`field.rs`).
+    pub field_state: crate::panel::FieldState,
 }
 
 impl Frame<'_> {
@@ -269,6 +302,32 @@ impl Frame<'_> {
             &self.brushes.muted,
             stroke,
         );
+
+        // The first field's frame. The child window sits inside this rect, inset by
+        // `EDIT_INSET_DIP`, and paints its own background with the same resolved fill, so the
+        // rounded corner here is the only corner the user sees (`field.rs`).
+        let field = crate::panel::name_field_rect(self.metrics, self.rects, self.scale);
+        let field_radius = (crate::panel::INPUT_RADIUS_DIP * self.scale).round() as i32;
+        painter.fill_round(field, field_radius, &self.brushes.field_fill);
+        if let Some(border) = self.brushes.field_border(self.field_state) {
+            painter.stroke_round(field, field_radius, border, line);
+            // `:169` — focus adds a one dip ring inside the border, which the native control
+            // cannot draw for itself.
+            if self.field_state == crate::panel::FieldState::Focused {
+                let ring = (crate::panel::EDIT_INSET_DIP * self.scale).round() as i32;
+                painter.stroke_round(
+                    Rect::new(
+                        field.left + ring,
+                        field.top + ring,
+                        field.right - ring,
+                        field.bottom - ring,
+                    ),
+                    (field_radius - ring).max(0),
+                    border,
+                    line,
+                );
+            }
+        }
 
         if let Some((text, format)) = self.title {
             painter.draw_text(
@@ -347,6 +406,29 @@ pub fn paint_to_dc(
     dpi: f32,
     fill_surface: bool,
 ) -> Result<()> {
+    paint_to_dc_with_state(
+        factory,
+        dwrite,
+        hdc,
+        area,
+        dpi,
+        fill_surface,
+        crate::panel::FieldState::Idle,
+    )
+}
+
+/// [`paint_to_dc`] with the first field's frame state. Kept separate so the existing signature — and
+/// every caller of it — stays valid: the state only matters once a window owns a focused field.
+#[allow(clippy::too_many_arguments)]
+pub fn paint_to_dc_with_state(
+    factory: &ID2D1Factory,
+    dwrite: &IDWriteFactory,
+    hdc: HDC,
+    area: Rect,
+    dpi: f32,
+    fill_surface: bool,
+    field_state: crate::panel::FieldState,
+) -> Result<()> {
     let target = unsafe { factory.CreateDCRenderTarget(&properties(dpi)) }?;
     let bind = RECT {
         left: area.left,
@@ -376,6 +458,7 @@ pub fn paint_to_dc(
         scale,
         fill_surface,
         title: Some((TITLE, &title)),
+        field_state,
     }
     .paint(&painter);
     unsafe { target.EndDraw(None, None)? };
@@ -409,6 +492,7 @@ pub fn paint_to_target(
         scale,
         fill_surface,
         title: Some((TITLE, &title)),
+        field_state: crate::panel::FieldState::Idle,
     }
     .paint(&painter);
     unsafe { target.EndDraw(None, None)? };
@@ -511,16 +595,26 @@ mod tests {
         }
 
         fn render(&self) {
+            self.render_state(crate::panel::FieldState::Idle);
+        }
+
+        /// The same canvas with the first field focused, so the border and the ring can be sampled.
+        fn render_focused(&self) {
+            self.render_state(crate::panel::FieldState::Focused);
+        }
+
+        fn render_state(&self, field_state: crate::panel::FieldState) {
             let factory = factory().expect("a Direct2D factory");
             let dwrite = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED) }
                 .expect("a DirectWrite factory");
-            paint_to_dc(
+            paint_to_dc_with_state(
                 &factory,
                 &dwrite,
                 self.dc,
                 Rect::new(0, 0, self.width, self.height),
                 96.0,
                 true,
+                field_state,
             )
             .expect("the frame paints");
         }
@@ -667,8 +761,7 @@ mod tests {
     }
 
     #[test]
-    fn the_title_is_drawn_inside_the_header() {
-        let canvas = Canvas::new(920, 520);
+    fn the_title_is_drawn_inside_the_header() {        let canvas = Canvas::new(920, 520);
         canvas.render();
         let rects = DEMO.rects(1.0);
         let px = canvas.pixels();
@@ -676,6 +769,47 @@ mod tests {
             .flat_map(|x| (rects.header.top + 8..rects.divider_y - 8).map(move |y| (x, y)))
             .any(|(x, y)| !close(px.pixel(x, y), surface_px(), 12));
         assert!(lit, "the header title paints inside the header");
+    }
+
+    /// The field's frame, at the mock's own slot. An idle field has **no visible border** (`:167`),
+    /// which is the detail this project got wrong first: the border is transparent until focus, so
+    /// an idle field must read as a filled rectangle and nothing else.
+    #[test]
+    fn an_idle_field_has_no_visible_border() {
+        let canvas = Canvas::new(920, 520);
+        canvas.render();
+        let px = canvas.pixels();
+        let rects = DEMO.rects(1.0);
+        let field = crate::panel::name_field_rect(&DEMO, &rects, 1.0);
+        // The fill the frame paints and the child is given: `--fill` over the surface.
+        let fill = Px { b: 41, g: 41, r: 46, a: 255 };
+        assert!(
+            !close(fill, surface_px(), 3),
+            "the fill has to differ from the surface, or an idle field would be invisible"
+        );
+        for x in [field.left + 20, (field.left + field.right) / 2, field.right - 20] {
+            let seen = px.pixel(x, field.top);
+            assert!(
+                close(seen, fill, 6),
+                "the idle field's edge at x={x} must be the fill, not a border: saw {seen:?}"
+            );
+        }
+    }
+
+    /// The inset is what keeps the rounded corner ours: the frame's own stroke must survive around
+    /// the square child. Focus is the state that draws it, so the ring is asserted here too.
+    #[test]
+    fn a_focused_field_draws_its_border_and_ring() {
+        let canvas = Canvas::new(920, 520);
+        canvas.render_focused();
+        let px = canvas.pixels();
+        let rects = DEMO.rects(1.0);
+        let field = crate::panel::name_field_rect(&DEMO, &rects, 1.0);
+        let accent = Px { b: 219, g: 117, r: 31, a: 255 };
+        let lit = (field.left..field.right)
+            .any(|x| close(px.pixel(x, field.top), accent, 12))
+            || (field.top..field.bottom).any(|y| close(px.pixel(field.left, y), accent, 12));
+        assert!(lit, "a focused field's frame must paint the accent border (:169)");
     }
 }
 
@@ -697,13 +831,25 @@ impl PanelRenderer {
 
     /// Paint into a window's DC. `hdc` is the raw handle the Win32 bindings hand out, which is what
     /// `BeginPaint` returns; the parameter is a pointer so callers with either binding can pass it.
+    ///
+    /// `field_state` is the first field's frame state: the native child draws no border, no focus
+    /// ring and no error colour, so the frame around it has to be told what state it is in.
     pub fn paint(
         &self,
         hdc: *mut core::ffi::c_void,
         area: Rect,
         dpi: f32,
         fill_surface: bool,
+        field_state: crate::panel::FieldState,
     ) -> Result<()> {
-        paint_to_dc(&self.factory, &self.dwrite, HDC(hdc), area, dpi, fill_surface)
+        paint_to_dc_with_state(
+            &self.factory,
+            &self.dwrite,
+            HDC(hdc),
+            area,
+            dpi,
+            fill_surface,
+            field_state,
+        )
     }
 }
