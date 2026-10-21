@@ -1325,6 +1325,35 @@ mod tests {
     use crate::units::LabelDisplay;
     use windows_sys::Win32::Foundation::POINT;
 
+    /// `docs/41`: `Ctrl+S` arms the save panel. The binding, its context and its label are
+    /// asserted by field name, because `Spec` is a struct and destructuring it as a tuple is
+    /// what silently dropped these assertions in an earlier attempt.
+    ///
+    /// The label reuses the panel title's four characters, which are already in the embedded
+    /// subset, so adding this action must not disturb the glyph gate.
+    #[test]
+    fn the_save_panel_action_is_bound_to_ctrl_s_in_the_pick_context() {
+        use crate::keymap::{Action, Group};
+
+        assert_eq!(
+            Action::ALL.len(),
+            21,
+            "adding an action must grow ALL, which is a fixed length array"
+        );
+
+        let spec = Action::OpenSavePanel.spec();
+        assert_eq!(spec.id, "panel.save");
+        assert_eq!(spec.group, Group::Output);
+        assert_eq!(spec.row, "panel", "the save entry shares the panel row");
+        assert_eq!(spec.label, "保存图片");
+        assert_eq!(spec.context, Context::Pick);
+        assert_eq!(
+            spec.defaults,
+            &["Ctrl+S"],
+            "ctrl+s is free in the pick context and means save in this product"
+        );
+    }
+
     /// `docs/46`: the entry is the context plus a live selection, and the three readout
     /// preferences must not be able to remove it. All eight combinations are exercised, because
     /// the lock-out only appeared in the one where every readout is off.
