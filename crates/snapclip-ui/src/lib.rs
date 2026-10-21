@@ -4,3 +4,5 @@
 //! geometry contracts that must agree between painting and hit testing.
 
 pub mod panel;
+
+pub mod copy;

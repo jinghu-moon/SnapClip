@@ -1467,6 +1467,16 @@ fn overlay_drawn_strings() -> Vec<String> {
         "#ABCDEF".to_owned(),
         "rgb(255,0,0)".to_owned(),
         "hsl(359,100%,100%)".to_owned(),
+        "图片".to_owned(),
+        "圆角".to_owned(),
+        "自定义截图".to_owned(),
+        "尺寸".to_owned(),
+        "位置".to_owned(),
+        "×".to_owned(),
+        "去向".to_owned(),
+        "角标".to_owned(),
+        "延时".to_owned(),
+        "取消".to_owned(),
     ];
     // The hint row and the shortcut guide: every label, group, key and separator they can draw,
     // under any binding.
@@ -1503,6 +1513,26 @@ fn overlay_drawn_strings() -> Vec<String> {
     drawn.push(level_hint(LevelReach { up: 8, down: 1 }));
     // …and the scroll panel and its toolbar (docs/33), listed by the module that lays them out.
     drawn.extend(crate::scroll::layout::drawn_strings());
+    // …and the save panel's copy (docs/41 §0.3). Called through the producers in `snapclip-ui`, so
+    // the sentences have one home: if the wording changes there, this list follows without anyone
+    // copying a string, and the coverage gate below cannot drift from what the panel renders.
+    for copy in snapclip_ui::copy::ValidationCopy::ALL {
+        drawn.push(copy.message().to_owned());
+        if let Some(repair) = copy.repair() {
+            drawn.push(repair.to_owned());
+        }
+    }
+    for link in [
+        snapclip_ui::copy::ConflictLink::Overwrite,
+        snapclip_ui::copy::ConflictLink::Rename,
+    ] {
+        drawn.push(link.text().to_owned());
+    }
+    // The filled forms, through their formatters: `{盘}` alone would not tell the subset it needs a
+    // digit and a unit, which only appear once the message is built.
+    drawn.push(snapclip_ui::copy::not_enough_space('C', "1 MB", "3 MB"));
+    drawn.push(snapclip_ui::copy::illegal_chars("<>"));
+    drawn.push(snapclip_ui::copy::reserved_name("CON"));
     drawn
 }
 
@@ -2354,7 +2384,7 @@ fn the_glyph_tint_follows_the_colour_it_is_given() {
             renderer.d2d.BeginDraw();
         }
         renderer
-            .draw_glyph(crate::icons::Glyph::Close, rect, brush, false)
+            .draw_glyph(snapclip_ui::panel::Glyph::Close, rect, brush, false)
             .unwrap();
         unsafe { renderer.d2d.EndDraw(None, None).unwrap() };
         drawn.push(renderer.device().read_back_bgra(&target.texture).unwrap());
@@ -2450,7 +2480,7 @@ fn the_cost_of_the_panel_icons() {
     let started = Instant::now();
     unsafe { d2d.BeginDraw() };
     for _ in 0..runs {
-        for (i, glyph) in crate::icons::Glyph::ALL.iter().enumerate() {
+        for (i, glyph) in snapclip_ui::panel::Glyph::ALL.iter().enumerate() {
             icons.draw(&d2d, *glyph, rects[i], colours[0], false).unwrap();
         }
     }
@@ -2486,8 +2516,8 @@ fn the_cost_of_the_panel_icons() {
     );
     eprintln!(
         "PANEL_ICONS vram: 源位图 {} KB + 色表 {} KB",
-        (crate::icons::ICON_COUNT as u32 * crate::icons::ICON_BAKED_PX * crate::icons::ICON_BAKED_PX * 4) / 1024,
-        (3 * 9 * crate::icons::ICON_BAKED_PX * crate::icons::ICON_BAKED_PX * 4) / 1024
+        (snapclip_ui::panel::ICON_COUNT as u32 * snapclip_ui::panel::ICON_BAKED_PX * snapclip_ui::panel::ICON_BAKED_PX * 4) / 1024,
+        (3 * 9 * snapclip_ui::panel::ICON_BAKED_PX * snapclip_ui::panel::ICON_BAKED_PX * 4) / 1024
     );
 }
 
@@ -3177,3 +3207,83 @@ fn the_countdown_hud_paints_only_the_frame_the_badge_and_the_number() {
     );
 }
 
+
+/// DIAGNOSTIC (docs/44, to keep or drop once the decision lands): what the overlay
+/// actually paints when every label item is switched off.
+#[test]
+fn with_every_label_item_off_no_badge_is_painted_and_no_menu_can_open() {
+    use crate::units::{LabelDisplay, LengthUnit};
+
+    let device =
+        super::GraphicsDevice::create().expect("this test needs a D3D11 device (docs/31 D-14)");
+    let width = 640u32;
+    let height = 480u32;
+    let background = [200u8, 180, 160, 255];
+    let mut renderer = OverlayRenderer::new(std::sync::Arc::new(device), 96)
+        .expect("this test needs a Direct2D overlay renderer (docs/31 D-14)");
+    renderer
+        .update_frame(width, height, &solid_bgra(width, height, background))
+        .unwrap();
+    renderer.ensure_back_buffer(width, height).unwrap();
+    let target = renderer
+        .device()
+        .create_render_target_texture(width, height)
+        .unwrap();
+    let d2d_context = renderer.device().create_d2d_context().unwrap();
+    let bitmap = super::super::d3d11::create_bitmap_from_texture(
+        &d2d_context,
+        &target.texture,
+        D2D1_BITMAP_OPTIONS_TARGET,
+        D2D1_ALPHA_MODE_PREMULTIPLIED,
+    )
+    .unwrap();
+
+    let mut view = RenderView::new(Rect::from_origin_size(
+        Point::new(0, 0),
+        width as i32,
+        height as i32,
+    ));
+    view.selection = Rect::new(200, 200, 400, 280);
+    view.show_chrome = true;
+    view.cursor_visible = false;
+
+    // All three items on: the badge exists and the menu has an anchor.
+    view.label = LabelDisplay {
+        length_unit: LengthUnit::Px,
+        show_size: true,
+        show_coordinates: true,
+        show_unit: true,
+    };
+    let with_items = renderer.size_label_bounds(&view).unwrap();
+    assert!(
+        with_items.is_some(),
+        "with items on the badge must have bounds; the menu hangs off them"
+    );
+
+    // All three off: the text is empty, so the badge is not placed.
+    view.label = LabelDisplay {
+        length_unit: LengthUnit::Px,
+        show_size: false,
+        show_coordinates: false,
+        show_unit: false,
+    };
+    let without_items = renderer.size_label_bounds(&view).unwrap();
+    assert_eq!(
+        without_items, None,
+        "with every item off the badge has no bounds, so no badge menu can be opened"
+    );
+
+    renderer.draw_to(&bitmap, &view).unwrap();
+    let composed = renderer.device().read_back_bgra(&target.texture).unwrap();
+    let panel = pixel_at(
+        &composed,
+        width,
+        (view.selection.left + 12) as u32,
+        (view.selection.top - 12) as u32,
+    );
+    assert_eq!(
+        panel,
+        masked(background),
+        "with every item off nothing is painted where the badge used to be"
+    );
+}
