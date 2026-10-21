@@ -463,6 +463,10 @@ struct OverlayController {
     export_worker: ExportWorker,
     renderer: Option<Win32Renderer>,
     session: CaptureSession,
+    /// Set by `Ctrl+S` when a selection exists. The save panel's own stage consumes it;
+    /// hiding the overlay must go through the session exit sequence (`ExitStep::Hide`),
+    /// never by calling `hide_overlay` from an action handler.
+    pending_save: bool,
     frozen: Option<FrozenFrame>,
     /// Explicit pointer gesture (docs/14 §4.2). Button-down no longer mutates the
     /// selection; the gesture decides when a drag actually starts.
@@ -733,6 +737,7 @@ impl OverlayController {
             export_worker: ExportWorker::new(),
             renderer: None,
             session: CaptureSession::new("idle"),
+            pending_save: false,
             frozen: None,
             gesture: GestureState::new(system_drag_threshold(96)),
             hover_target: None,

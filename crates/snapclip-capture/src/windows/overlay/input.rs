@@ -522,6 +522,20 @@ impl OverlayController {
                     self.invalidate();
                 }
             }
+            // Ctrl+S arms the save destination. The decision is the same predicate the region
+            // panel uses, so it depends on the context and a live selection and never on the
+            // label badge (docs/46, docs/42 D11). The handoff itself (hiding the frame, moving
+            // the selected pixels into the panel) lands with the delivery batch.
+            Action::OpenSavePanel => {
+                if Self::panel_entry_available(state, self.session.has_selection()) {
+                    // Arms the save panel for the stage that owns it. Hiding the overlay here
+                    // would be wrong: the frame must leave through the session exit sequence
+                    // (`ExitStep::Hide`), which also restores the window region and the dim
+                    // layer. A direct `hide_overlay` from an action handler skips those steps.
+                    self.pending_save = true;
+                    self.invalidate();
+                }
+            }
             // Selected -> Annotating (selection is locked, tools go live).
             Action::Annotate => {
                 if state == CaptureState::Selected && self.session.begin_annotating().is_ok() {
@@ -1366,6 +1380,30 @@ mod tests {
             Some(crate::keymap::Action::Confirm)
         );
         assert_eq!(map.action_for(Context::Scroll, &ctrl_enter), None);
+    }
+
+    /// `docs/41` S2: `Ctrl+S` arms the save panel from the capture frame, and only there.
+    #[test]
+    fn ctrl_s_arms_the_save_panel_in_the_pick_context() {
+        let map = Keymap::default();
+        let ctrl_s = Chord::key(Key::Char('S'), true, false, false);
+        assert_eq!(
+            map.action_for(Context::Pick, &ctrl_s),
+            Some(crate::keymap::Action::OpenSavePanel)
+        );
+        assert_eq!(map.action_for(Context::Scroll, &ctrl_s), None);
+        assert_eq!(
+            map.action_for(Context::Pick, &Chord::key(Key::Enter, false, false, false)),
+            Some(crate::keymap::Action::Confirm)
+        );
+    }
+
+    /// `ALL` is a fixed-size array, so adding a variant without widening it is a compile error
+    /// today; this keeps the count honest if it ever becomes a slice. The chord itself is
+    /// asserted through the keymap above, which is the behaviour that matters.
+    #[test]
+    fn the_save_panel_action_is_declared_once() {
+        assert_eq!(crate::keymap::Action::ALL.len(), 21);
     }
 
     #[test]

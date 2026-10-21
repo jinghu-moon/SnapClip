@@ -637,3 +637,10 @@ cargo run -p codec-bench --release -- --assert
 - `--line` 这类**半透明描边**要按"叠在什么之上"算出**混合色**再断言 ✓（`line_over(fill)` ✓）—— 只排除底下的填充是不够的 ✓；
 - 每条视觉断言都要用**变异**证明它会咬 ✓：**换颜色** ✓ / **换绘制顺序** ✓ / **删元素** ✓。
   变异还原后必须 `touch` 文件并**看到 `Compiling`** ✓，否则跑的是变异后的二进制 ✓（`Copy-Item` 保留 mtime 的坑 ✓）。
+
+### 批次 A 记录：`Ctrl+S` 的两条设计约束（实测得出）
+
+- **隐藏截图框不得直接调 `hide_overlay`** ✗ —— 必须走**会话退出序列**（`ExitStep::Hide`，`windows/overlay/window_restore.rs:149` 附近）✓，否则会跳过恢复窗口 region、清理遮罩等步骤 ✓。`Ctrl+S` 的处理器**只置 `pending_save` 并重绘** ✓，隐藏交给退出序列 ✓。
+- **读回的 BGRA 目前没有留存** ✗ —— `SelectionPixels` 是**导出时现场构造**的（`windows/overlay/session.rs` 的导出路径 ✓）⇒ 面板要预览，必须在**导出路径之前**把读回结果接出来 ✓（批次 B ✓）。
+
+另记：`keymap.rs` 的 `ALL` 是**定长数组** `[Action; 21]` ✗ ⇒ 新增动作**必须同时改长度** ✓（这是上一次 `E0308` 的根因 ✓）。
