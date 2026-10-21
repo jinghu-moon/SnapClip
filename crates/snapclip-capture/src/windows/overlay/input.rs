@@ -1337,7 +1337,6 @@ mod tests {
     // Not used yet on purpose: the fixture exists so the next stage can write the assertions
     // that reach the `Ctrl+S` branch, and a stand-in with no caller is a warning the compiler
     // is right to raise.
-    #[allow(dead_code)]
     struct TestClipboard;
 
     impl crate::ports::ClipboardWriter for TestClipboard {
@@ -1357,7 +1356,6 @@ mod tests {
     /// An artifact writer that refuses to write. Reaching it from a fixture test means the test
     /// is exercising the export path, which is not what the fixture is for, so it panics rather
     /// than pretending to have produced a file.
-    #[allow(dead_code)]
     struct TestWriter;
 
     impl crate::ports::ArtifactWriter for TestWriter {
@@ -1386,7 +1384,6 @@ mod tests {
     /// The smallest controller that can run an action. It owns no window and no frame; the
     /// window handle is null because no action taken here touches the window, and the session
     /// starts idle with no selection.
-    #[allow(dead_code)]
     fn controller_for_tests() -> OverlayController {
         let shared = std::sync::Arc::new(std::sync::Mutex::new(super::OverlayShared {
             state: CaptureState::Idle,
@@ -1410,6 +1407,67 @@ mod tests {
             std::ptr::null_mut(),
             0,
         )
+    }
+
+    /// Gives the fixture a real selection by driving the session the way its own tests do, so
+    /// the branch that arms the save panel is reached through the product's own state.
+    fn controller_with_a_selection() -> OverlayController {
+        let mut controller = controller_for_tests();
+        let point = crate::geometry::Point { x: 10, y: 10 };
+        controller.session.press(point);
+        controller.session.snap_to(crate::geometry::Rect {
+            left: 10,
+            top: 10,
+            right: 110,
+            bottom: 110,
+        });
+        controller
+    }
+
+    /// `docs/41`: the line that arms the save panel still has no test, and this records why.
+    ///
+    /// `press` and `snap_to` both return early unless the session is already `Selecting` or
+    /// `Selected`, and `CaptureSession::new` starts `Idle`, so the fixture cannot reach the
+    /// branch that sets the flag. Driving the session there needs `preparing` -> `arm(layout)`
+    /// -> `overlay_ready`, which needs a monitor layout and a frame.
+    #[test]
+    #[ignore = "needs a session driven to Selecting; press and snap_to are no-ops while idle"]
+    fn arming_the_save_panel_sets_the_flag() {
+        use crate::keymap::Action;
+
+        let mut controller = controller_with_a_selection();
+        assert!(
+            controller.session.has_selection(),
+            "the fixture must reach the branch with a selection"
+        );
+        assert!(!controller.pending_save, "nothing is armed before the action runs");
+
+        controller.run_action(Action::OpenSavePanel);
+
+        assert!(
+            controller.pending_save,
+            "ctrl+s with a selection must arm the save panel"
+        );
+    }
+
+    /// The other half of the same predicate: no selection means nothing happens, which is what
+    /// keeps the shortcut from doing anything before a drag has happened.
+    ///
+    /// Honest limit: this passes because the session is `Idle` and the branch never runs, not
+    /// because the branch decided to do nothing. It pins the default and nothing else.
+    #[test]
+    fn arming_the_save_panel_needs_a_selection() {
+        use crate::keymap::Action;
+
+        let mut controller = controller_for_tests();
+        assert!(!controller.session.has_selection(), "the bare fixture has no selection");
+
+        controller.run_action(Action::OpenSavePanel);
+
+        assert!(
+            !controller.pending_save,
+            "without a selection the save panel must not be armed"
+        );
     }
 
     /// `docs/41`: `Ctrl+S` arms the save panel. The binding, its context and its label are
