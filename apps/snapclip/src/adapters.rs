@@ -118,6 +118,19 @@ impl CaptureEvents {
         Some(poster())
     }
 
+    /// 把一次"请开保存面板"交给接好的投递器；没接上时返回 `None`（外壳的接线问题，要说出来）。
+    fn post_save(
+        &self,
+        pixels: &snapclip_capture::ports::SelectionPixels,
+    ) -> Option<Result<(), String>> {
+        let opener = self
+            .save_opener
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()?;
+        Some(opener(pixels))
+    }
+
     fn state(&self, session_id: &str, state: CaptureState) -> u64 {
         self.bus.publish(AppEvent::Capture(CaptureEvent {
             session_id: session_id.to_string(),
@@ -157,6 +170,26 @@ impl CaptureEventSink for CaptureEvents {
             error_code: None,
             generation: 0,
         }));
+    }
+
+    /// 用户按了 `Ctrl+S`：选区像素已经交到这里，请打开保存面板。
+    ///
+    /// 与 `on_pin_requested` 同一个分工：这里**只说"要开面板"并给出那张图**，
+    /// 面板怎么开、开在哪里由接线处决定（`lib.rs` 接的是 `save::window::open`）。
+    fn on_save_requested(
+        &self,
+        session_id: &str,
+        pixels: &snapclip_capture::ports::SelectionPixels,
+    ) {
+        match self.post_save(pixels) {
+            Some(Ok(())) => {}
+            Some(Err(error)) => eprintln!(
+                "[snapclip-app][capture] session={session_id} 打开保存面板失败：{error}"
+            ),
+            None => eprintln!(
+                "[snapclip-app][capture] session={session_id} 收到保存请求，但保存面板没接上"
+            ),
+        }
     }
 
     /// 延时截图到点：图已经在贴图槽位里，请贴图那条链路把它贴出去。

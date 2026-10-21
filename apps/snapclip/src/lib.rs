@@ -306,6 +306,29 @@ impl Shell {
                     poster.post().map_err(|error| error.to_string())
                 }));
             }
+            // 用户按 `Ctrl+S` 之后：捕获侧只说"要开保存面板，并把这张选区图给你"，怎么开由这里
+            // 决定。句柄存在闭包捕获的槽里，**替换旧句柄时先把它关掉**——`ShellHandle` 没有
+            // `Drop`，只丢句柄不会关窗，连按两次 `Ctrl+S` 就会开出两张面板。
+            let save_panels: std::sync::Arc<
+                std::sync::Mutex<Option<save::window::ShellHandle>>,
+            > = std::sync::Arc::new(std::sync::Mutex::new(None));
+            events.set_save_opener(std::sync::Arc::new(move |pixels| {
+                let width = (pixels.region.right - pixels.region.left) as u32;
+                let height = (pixels.region.bottom - pixels.region.top) as u32;
+                let options = save::window::ShellOptions {
+                    preview: Some((pixels.bgra.clone(), width, height)),
+                    ..Default::default()
+                };
+                let handle = save::window::open(options).map_err(|error| format!("{error:?}"))?;
+                let previous = save_panels
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .replace(handle);
+                if let Some(previous) = previous {
+                    previous.close();
+                }
+                Ok(())
+            }));
         }
         Self {
             history,
