@@ -414,3 +414,75 @@ mod delay_pin_tests {
         events.on_pin_requested("session-1");
     }
 }
+
+#[cfg(test)]
+mod save_open_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// 一张 2×2 的选区，首像素是**纯红**（BGRA 顺序 ⇒ `b=0, g=0, r=255, a=255`）。
+    ///
+    /// 首像素取一个不会在别处出现的值，是为了让"交过去的到底是哪张图"可以被断言，
+    /// 而不是只断言"调用了一次"（docs/41 的视觉断言纪律：指名位置与颜色）。
+    fn pixels() -> snapclip_capture::ports::SelectionPixels {
+        snapclip_capture::ports::SelectionPixels {
+            frame: snapclip_capture::session::CapturedFrame {
+                width: 2,
+                height: 2,
+                pixel_format: snapclip_model::PixelFormat::Bgra8Unorm,
+                captured_at_unix_ms: 0,
+                provider: "test",
+                origin: Some(snapclip_model::Point::new(0, 0)),
+            },
+            region: snapclip_model::Rect::new(0, 0, 2, 2),
+            bgra: vec![0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255],
+            origin: Some(snapclip_model::Point::new(0, 0)),
+            corner_radius: 0,
+        }
+    }
+
+    /// 收到"请开保存面板"时，事件出口必须**正好发一次**，并且把**那张图**带过去。
+    #[test]
+    fn a_save_request_reaches_the_opener_exactly_once() {
+        let events = CaptureEvents::new(EventBus::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let counter = calls.clone();
+        let recorder = seen.clone();
+        events.set_save_opener(Arc::new(move |pixels| {
+            counter.fetch_add(1, Ordering::AcqRel);
+            *recorder.lock().unwrap_or_else(|p| p.into_inner()) = Some((
+                pixels.region.right - pixels.region.left,
+                pixels.region.bottom - pixels.region.top,
+                pixels.bgra.get(..4).map(|px| [px[0], px[1], px[2], px[3]]),
+            ));
+            Ok(())
+        }));
+
+        events.on_save_requested("session-1", &pixels());
+
+        assert_eq!(calls.load(Ordering::Acquire), 1, "must be asked exactly once");
+        let seen = *seen.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(
+            seen,
+            Some((2, 2, Some([0, 0, 255, 255]))),
+            "the opener must receive the region's size and the first pixel as BGRA"
+        );
+    }
+
+    /// 没接上投递器（保存面板那条接线还没做）时不能 panic：那是接线问题，日志里说清楚就够。
+    #[test]
+    fn a_save_request_without_an_opener_is_not_a_crash() {
+        let events = CaptureEvents::new(EventBus::new());
+        events.on_save_requested("session-1", &pixels());
+    }
+
+    /// 投递器报错也不能 panic：失败要说出来（日志），但不该把消息泵带走。
+    #[test]
+    fn a_failing_opener_is_reported_rather_than_propagated() {
+        let events = CaptureEvents::new(EventBus::new());
+        events.set_save_opener(Arc::new(|_| Err("宿主线程已经不在了".to_string())));
+        events.on_save_requested("session-1", &pixels());
+    }
+}
