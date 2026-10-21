@@ -59,6 +59,9 @@ pub enum SaveError {
     UnsupportedFormat(SaveFormat),
     NotEnoughSpace(String),
     Io(String),
+    /// The caller asked to stop. Distinct from an I/O failure because nothing went wrong: the
+    /// panel treats it as "the user changed their mind", not as an error to explain.
+    Cancelled,
 }
 
 impl SaveError {
@@ -74,6 +77,9 @@ impl SaveError {
             }
             SaveError::NotEnoughSpace(why) => format!("not enough space: {why}"),
             SaveError::Io(why) => format!("the file cannot be written: {why}"),
+            // Never drawn: the user cancelled, so there is nothing to explain. Kept ascii so it
+            // cannot accidentally become a string the font subset has to carry.
+            SaveError::Cancelled => "cancelled".to_owned(),
         }
     }
 }
@@ -93,8 +99,20 @@ impl std::error::Error for SaveError {}
 /// device, and only then renamed onto the target, so an interrupted save cannot leave a
 /// plausible-looking truncated file (and a failed one leaves the directory as it found it).
 pub fn save(master: &Path, request: &SaveRequest) -> Result<SaveOutcome, SaveError> {
+    save_with(master, request, &mut NoCancel)
+}
+
+/// Saves with a cancellation signal. [`save`] is this with [`NoCancel`].
+///
+/// Cancelling **keeps whatever was at the target**: the old file survives because the body only
+/// ever goes to the `.partial`, which is removed on the way out.
+pub fn save_with(
+    master: &Path,
+    request: &SaveRequest,
+    cancel: &mut dyn Cancel,
+) -> Result<SaveOutcome, SaveError> {
     let (stem, warnings) = prepare(request)?;
-    commit(request, &stem, |sink| {
+    commit(request, &stem, cancel, |sink| {
         let mut source = std::fs::File::open(master)?;
         std::io::copy(&mut source, sink)?;
         Ok(())
@@ -107,15 +125,36 @@ pub fn save(master: &Path, request: &SaveRequest) -> Result<SaveOutcome, SaveErr
     })
 }
 
+/// Asked at defined points during a save; returning true aborts it.
+///
+/// The points are fixed, so a caller cannot be surprised by a cancel landing anywhere: before the
+/// `.partial` exists, and again after the body is written but before the rename commits it.
+pub trait Cancel {
+    fn cancelled(&mut self) -> bool;
+}
+
+/// Never cancels. What plain [`save`] uses.
+pub struct NoCancel;
+
+impl Cancel for NoCancel {
+    fn cancelled(&mut self) -> bool {
+        false
+    }
+}
+
 /// Saves bytes that were produced elsewhere (the banded encoder, and later the transcoder).
 pub fn commit_bytes(request: &SaveRequest, bytes: &[u8]) -> Result<SaveOutcome, SaveError> {
     let (stem, warnings) = prepare(request)?;
-    commit(request, &stem, |sink| sink.write_all(bytes)).map(|(path, written)| SaveOutcome {
-        path,
-        bytes: written,
-        format: request.format,
-        warnings,
-    })
+    // Bytes arrive already encoded, so there is no long write to interrupt yet; the bands path
+    // gets its own cancel signal when it grows one (`docs/41` S1 remaining).
+    commit(request, &stem, &mut NoCancel, |sink| sink.write_all(bytes)).map(
+        |(path, written)| SaveOutcome {
+            path,
+            bytes: written,
+            format: request.format,
+            warnings,
+        },
+    )
 }
 
 /// Validates the request and returns the stem the files should be named after, plus the warnings
@@ -219,6 +258,7 @@ fn is_reserved(stem: &str) -> bool {
 fn commit(
     request: &SaveRequest,
     stem: &str,
+    cancel: &mut dyn Cancel,
     write_body: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
 ) -> Result<(std::path::PathBuf, u64), SaveError> {
     let extension = extension_of(request.format);
@@ -234,6 +274,12 @@ fn commit(
     }
     std::fs::create_dir_all(&request.directory).map_err(io_error)?;
 
+    // The first of the two cancel points: nothing has been created, so cancelling here is as if
+    // the caller had never asked.
+    if cancel.cancelled() {
+        return Err(SaveError::Cancelled);
+    }
+
     let partial = partial_path(&target);
     let written = (|| -> std::io::Result<u64> {
         let mut sink = std::fs::OpenOptions::new()
@@ -241,6 +287,14 @@ fn commit(
             .create_new(true)
             .open(&partial)?;
         write_body(&mut sink)?;
+        // The second point: the body is on disk but the rename has not committed it. Saying so
+        // as `Interrupted` keeps the cancel distinct from a real write failure further out.
+        if cancel.cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "cancelled",
+            ));
+        }
         // Flush to the device before the rename: otherwise a crash can commit a directory entry
         // that points at zero-filled blocks.
         sink.sync_all()?;
@@ -317,6 +371,9 @@ fn io_error(error: std::io::Error) -> SaveError {
     match error.raw_os_error() {
         // ERROR_DISK_FULL / ENOSPC.
         Some(112) | Some(39) => SaveError::NotEnoughSpace(error.to_string()),
+        _ if error.kind() == std::io::ErrorKind::Interrupted && error.to_string() == "cancelled" => {
+            SaveError::Cancelled
+        }
         _ => SaveError::Io(error.to_string()),
     }
 }
@@ -578,5 +635,83 @@ mod tests {
             partial_files(&dir).is_empty(),
             "and leaves nothing behind in the parent"
         );
+    }
+
+    /// Cancels on the `at`-th question, so a test can land the cancel on a named point instead of
+    /// racing a thread against the write.
+    struct CancelAt {
+        asked: usize,
+        at: usize,
+    }
+
+    impl Cancel for CancelAt {
+        fn cancelled(&mut self) -> bool {
+            let answer = self.asked == self.at;
+            self.asked += 1;
+            answer
+        }
+    }
+
+    /// Cancelling before anything is created must leave the directory exactly as it was: a cancel
+    /// is not a failure, so it must not look like one on disk either.
+    #[test]
+    fn cancelling_before_the_first_byte_leaves_nothing_behind() {
+        let dir = scratch("cancel-before");
+        let master = master(&dir);
+        let out = dir.join("out");
+        let mut cancel = CancelAt { asked: 0, at: 0 };
+        let error = save_with(&master, &request(&out, ConflictPolicy::AutoRename), &mut cancel)
+            .expect_err("a cancel is not a save");
+        assert!(matches!(error, SaveError::Cancelled), "{error:?}");
+        assert!(
+            fs::read_dir(&out).map(|mut d| d.next().is_none()).unwrap_or(true),
+            "a cancel before the first byte creates nothing"
+        );
+    }
+
+    /// The important one: the body has been written, then the save is cancelled. The `.partial`
+    /// must go, and the file that was there before must come through byte for byte — a cancel
+    /// that destroyed the old file would be worse than not saving at all.
+    #[test]
+    fn cancelling_between_partial_and_commit_removes_the_partial_and_keeps_the_old_file() {
+        let dir = scratch("cancel-after-body");
+        let master = master(&dir);
+        let out = dir.join("out");
+        fs::create_dir_all(&out).expect("out");
+        let old = out.join("shot.png");
+        fs::write(&old, b"the previous picture").expect("old file");
+
+        // Question 0 happens before the `.partial` exists; question 1 after the body is written.
+        let mut cancel = CancelAt { asked: 0, at: 1 };
+        let error = save_with(&master, &request(&out, ConflictPolicy::Overwrite), &mut cancel)
+            .expect_err("a cancel is not a save");
+        assert!(matches!(error, SaveError::Cancelled), "{error:?}");
+        assert_eq!(
+            fs::read(&old).expect("the old file survives"),
+            b"the previous picture",
+            "a cancel must not touch the file it was going to replace"
+        );
+        assert!(
+            partial_files(&out).is_empty(),
+            "the .partial is removed on cancel: {:?}",
+            partial_files(&out)
+        );
+    }
+
+    /// A cancel is its own answer. The panel shows a different thing for "you stopped this" and
+    /// "the disk refused", and a test that only checked `is_err` could not tell them apart.
+    #[test]
+    fn cancelling_is_reported_as_cancelled_and_not_as_an_io_error() {
+        let dir = scratch("cancel-kind");
+        let master = master(&dir);
+        let out = dir.join("out");
+        let mut cancel = CancelAt { asked: 0, at: 0 };
+        let error = save_with(&master, &request(&out, ConflictPolicy::AutoRename), &mut cancel)
+            .expect_err("a cancel is not a save");
+        assert!(
+            !matches!(error, SaveError::Io(_)),
+            "a cancel is not an i/o failure: {error:?}"
+        );
+        assert_eq!(error.message(), "cancelled");
     }
 }

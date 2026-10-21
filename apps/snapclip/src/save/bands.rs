@@ -215,10 +215,19 @@ mod tests {
         };
         let max = SaveFormat::Webp.max_side();
         let width = u32::try_from(max + 1).expect("fits");
-        assert!(matches!(
-            save_bands(&mut rows, width, &request),
-            Err(SaveError::Capability(_))
-        ));
+        let error = save_bands(&mut rows, width, &request).expect_err("too wide for the format");
+        assert!(matches!(error, SaveError::Capability(_)), "{error:?}");
+        // The size question comes before anything touches the disk, so a refusal leaves the
+        // directory exactly as it found it: no `.partial`, no half written file.
+        let leftovers: Vec<_> = match std::fs::read_dir(&request.directory) {
+            Ok(entries) => entries.filter_map(|e| e.ok()).map(|e| e.file_name()).collect(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => panic!("the directory cannot be read: {error}"),
+        };
+        assert!(
+            leftovers.is_empty(),
+            "a refused banded save writes nothing: {leftovers:?}"
+        );
     }
 
     fn scratch(label: &str) -> PathBuf {
