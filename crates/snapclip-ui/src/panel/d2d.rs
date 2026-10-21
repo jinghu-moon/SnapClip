@@ -1,8 +1,13 @@
 use super::{SegmentState, segment_outer_radius, segment_radius, segment_slide};
 use snapclip_model::geometry::Rect;
-use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
+use windows::Win32::Graphics::Direct2D::Common::{
+    D2D1_ALPHA_MODE_IGNORE, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
+};
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Direct2D::{
-    D2D1_ELLIPSE, D2D1_ROUNDED_RECT, ID2D1DCRenderTarget, ID2D1DeviceContext, ID2D1HwndRenderTarget,
+    D2D1_BITMAP_INTERPOLATION_MODE, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES,
+    D2D1_ELLIPSE,
+    D2D1_ROUNDED_RECT, ID2D1Bitmap, ID2D1DCRenderTarget, ID2D1DeviceContext, ID2D1HwndRenderTarget,
     ID2D1RenderTarget, ID2D1SolidColorBrush,
 };
 use windows::Win32::Graphics::DirectWrite::{
@@ -39,6 +44,28 @@ pub trait PaintTarget {
         rect: &D2D_RECT_F,
         brush: &ID2D1SolidColorBrush,
     );
+    /// Draw a bitmap with the five argument form every render target shares.
+    ///
+    /// The device context also has a six argument overload with a perspective transform, which is why
+    /// the implementations below call through the base interface instead of on the concrete type:
+    /// `ID2D1DeviceContext` derives from `ID2D1RenderTarget`, so its pointer is a valid base pointer
+    /// and the shared form is reachable from all four targets.
+    fn draw_bitmap(
+        &self,
+        bitmap: &ID2D1Bitmap,
+        dest: Option<&D2D_RECT_F>,
+        opacity: f32,
+        mode: D2D1_BITMAP_INTERPOLATION_MODE,
+        src: Option<&D2D_RECT_F>,
+    );
+    /// Create a bitmap from tightly packed pixels. Base form, same reason as `draw_bitmap`.
+    fn create_bitmap(
+        &self,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+        pitch: u32,
+    ) -> Result<ID2D1Bitmap>;
 }
 
 macro_rules! impl_paint_target {
@@ -91,6 +118,54 @@ macro_rules! impl_paint_target {
                         windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_CLIP,
                         DWRITE_MEASURING_MODE_NATURAL,
                     );
+                }
+            }
+            fn draw_bitmap(
+                &self,
+                bitmap: &ID2D1Bitmap,
+                dest: Option<&D2D_RECT_F>,
+                opacity: f32,
+                mode: D2D1_BITMAP_INTERPOLATION_MODE,
+                src: Option<&D2D_RECT_F>,
+            ) {
+                // Through the base interface: see the trait. `$target` may be the device context,
+                // whose own `DrawBitmap` takes a sixth argument.
+                let base: &ID2D1RenderTarget =
+                    unsafe { &*(self as *const $target as *const ID2D1RenderTarget) };
+                unsafe {
+                    base.DrawBitmap(
+                        bitmap,
+                        dest.map(|r| r as *const D2D_RECT_F),
+                        opacity,
+                        mode,
+                        src.map(|r| r as *const D2D_RECT_F),
+                    );
+                }
+            }
+            fn create_bitmap(
+                &self,
+                width: u32,
+                height: u32,
+                pixels: &[u8],
+                pitch: u32,
+            ) -> Result<ID2D1Bitmap> {
+                let base: &ID2D1RenderTarget =
+                    unsafe { &*(self as *const $target as *const ID2D1RenderTarget) };
+                let props = D2D1_BITMAP_PROPERTIES {
+                    pixelFormat: D2D1_PIXEL_FORMAT {
+                        format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                        // The selection is opaque, so no alpha channel is interpreted.
+                        alphaMode: D2D1_ALPHA_MODE_IGNORE,
+                    },
+                    dpiX: 96.0,
+                    dpiY: 96.0,
+                };
+                let size = D2D_SIZE_U {
+                    width,
+                    height,
+                };
+                unsafe {
+                    base.CreateBitmap(size, Some(pixels.as_ptr().cast()), pitch, &props)
                 }
             }
         }
@@ -150,6 +225,23 @@ impl PanelPainter<'_> {
             radiusY: radius,
         };
         self.context.stroke_circle(&ellipse, brush, width);
+    }
+
+    /// A bitmap from tightly packed BGRA rows, ready to be drawn by [`PanelPainter::draw_bitmap_at`].
+    pub fn bgra_bitmap(&self, width: u32, height: u32, bgra: &[u8]) -> Result<ID2D1Bitmap> {
+        self.context.create_bitmap(width, height, bgra, width * 4)
+    }
+
+    /// Draw a bitmap into `dest`, scaled with linear interpolation.
+    pub fn draw_bitmap_at(&self, bitmap: &ID2D1Bitmap, dest: Rect) {
+        let rect = to_d2d(dest);
+        self.context.draw_bitmap(
+            bitmap,
+            Some(&rect),
+            1.0,
+            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+            None,
+        );
     }
 
     pub fn draw_text(

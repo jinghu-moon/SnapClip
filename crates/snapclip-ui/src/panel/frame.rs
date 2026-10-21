@@ -17,6 +17,7 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_RENDER_TARGET_PROPERTIES,
     D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE, D2D1CreateFactory, ID2D1Factory,
     ID2D1RenderTarget, ID2D1SolidColorBrush,
+    ID2D1Bitmap,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_ISOLATED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
@@ -297,6 +298,11 @@ pub struct Frame<'a> {
     /// The state of the first form field's frame. The native `EDIT` itself draws no border, no
     /// focus ring and no error state, so those belong to the frame (`field.rs`).
     pub field_state: crate::panel::FieldState,
+    /// The captured picture and its own pixel size, drawn into the preview card.
+    ///
+    /// The bitmap is built by the caller because only the caller knows whether the pixels are the
+    /// capture or the development entry's synthetic stand-in.
+    pub preview: Option<(&'a ID2D1Bitmap, u32, u32)>,
 }
 
 impl Frame<'_> {
@@ -376,6 +382,30 @@ impl Frame<'_> {
                     ty += tile;
                     row += 1;
                 }
+            }
+        }
+
+        // The captured picture, between the checkerboard and the card's boundary: the board says
+        // "canvas", the picture is what the canvas holds, and the boundary stays on top of both.
+        if let Some((bitmap, source_w, source_h)) = self.preview {
+            let card = self.rects.preview;
+            let (x, y, right, bottom) = fit_preview(
+                (source_w as f32, source_h as f32),
+                (
+                    card.left as f32,
+                    card.top as f32,
+                    card.right as f32,
+                    card.bottom as f32,
+                ),
+            );
+            let dest = Rect::new(
+                x.round() as i32,
+                y.round() as i32,
+                right.round() as i32,
+                bottom.round() as i32,
+            );
+            if dest.width() > 0 && dest.height() > 0 {
+                painter.draw_bitmap_at(bitmap, dest);
             }
         }
 
@@ -538,6 +568,22 @@ pub fn paint_to_dc_with_state(
     fill_surface: bool,
     field_state: crate::panel::FieldState,
 ) -> Result<()> {
+    paint_to_dc_with_preview(factory, dwrite, hdc, area, dpi, fill_surface, field_state, None)
+}
+
+/// [`paint_to_dc_with_state`] with a captured picture for the preview card. The old signature
+/// delegates here with `None`, so nothing that already calls it changes.
+#[allow(clippy::too_many_arguments)]
+pub fn paint_to_dc_with_preview(
+    factory: &ID2D1Factory,
+    dwrite: &IDWriteFactory,
+    hdc: HDC,
+    area: Rect,
+    dpi: f32,
+    fill_surface: bool,
+    field_state: crate::panel::FieldState,
+    preview: Option<(&[u8], u32, u32)>,
+) -> Result<()> {
     // DPI 96 on the target, deliberately: `rects(scale)` below already converts every dip to a
     // pixel, so a target carrying the real DPI would scale those pixels a second time. That is
     // exactly what shipped once: at 150% the panel drew at 1.5 x its intended size, the preview
@@ -562,6 +608,10 @@ pub fn paint_to_dc_with_state(
         context: &target,
         text_factory: dwrite,
     };
+    let preview = match preview {
+        Some((bgra, w, h)) => Some((painter.bgra_bitmap(w, h, bgra)?, w, h)),
+        None => None,
+    };
     unsafe { target.BeginDraw() };
     unsafe { target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED) };
     // Hairlines at 1 dip are meant to be one pixel, not two half-lit ones.
@@ -573,6 +623,7 @@ pub fn paint_to_dc_with_state(
         fill_surface,
         title: Some((TITLE, &title)),
         field_state,
+        preview: preview.as_ref().map(|(b, w, h)| (b, *w, *h)),
     }
     .paint(&painter);
     unsafe { target.EndDraw(None, None)? };
@@ -591,6 +642,18 @@ pub fn paint_to_target(
     dpi: f32,
     fill_surface: bool,
 ) -> Result<FrameRects> {
+    paint_to_target_with_preview(target, dwrite, dpi, fill_surface, None)
+}
+
+/// [`paint_to_target`] with a captured picture for the preview card. The old signature delegates
+/// here with `None`, so no existing caller or bitmap test has to change.
+pub fn paint_to_target_with_preview(
+    target: &ID2D1RenderTarget,
+    dwrite: &IDWriteFactory,
+    dpi: f32,
+    fill_surface: bool,
+    preview: Option<(&[u8], u32, u32)>,
+) -> Result<FrameRects> {
     let brushes = FrameBrushes::new(target, &DEMO_PALETTE)?;
     let scale = (dpi / 96.0).max(0.5);
     let metrics = DEMO;
@@ -598,6 +661,12 @@ pub fn paint_to_target(
     let painter = PanelPainter {
         context: target,
         text_factory: dwrite,
+    };
+    // The bitmap is made here, on the target that will draw it: the pixels arrive from the caller
+    // (the capture, or the development entry's stand-in) but the device object belongs to the target.
+    let preview = match preview {
+        Some((bgra, w, h)) => Some((painter.bgra_bitmap(w, h, bgra)?, w, h)),
+        None => None,
     };
     unsafe { target.BeginDraw() };
     unsafe { target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED) };
@@ -611,6 +680,7 @@ pub fn paint_to_target(
         fill_surface,
         title: Some((TITLE, &title)),
         field_state: crate::panel::FieldState::Idle,
+        preview: preview.as_ref().map(|(b, w, h)| (b, *w, *h)),
     }
     .paint(&painter);
     unsafe { target.EndDraw(None, None)? };
@@ -793,6 +863,24 @@ mod tests {
                 field_state,
             )
             .expect("the frame paints");
+        }
+
+        /// Render with a captured picture in the preview card.
+        fn render_preview(&self, bgra: &[u8], w: u32, h: u32) {
+            let factory = factory().expect("a Direct2D factory");
+            let dwrite = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED) }
+                .expect("a DirectWrite factory");
+            paint_to_dc_with_preview(
+                &factory,
+                &dwrite,
+                self.dc,
+                Rect::new(0, 0, self.width, self.height),
+                self.dpi,
+                true,
+                crate::panel::FieldState::Idle,
+                Some((bgra, w, h)),
+            )
+            .expect("the frame paints with a preview");
         }
 
         /// The pixels, through the only view that exists. Deliberately no direct byte accessor:
@@ -1279,6 +1367,59 @@ mod tests {
             );
         }
     }
+    /// The preview must show the captured picture, not a placeholder.
+    ///
+    /// A four quadrant image, red at the top left and blue at the bottom right, is handed in as the
+    /// pixels a capture would produce. The positions are derived from `fit_preview`, which is the
+    /// function that decides where the picture goes, and each assertion names a position and a
+    /// colour: "some pixel somewhere is red" would pass with the picture drawn in the wrong place.
+    #[test]
+    fn the_panel_preview_shows_the_captured_picture_and_not_a_placeholder() {
+        let (w, h) = (200u32, 100u32);
+        let mut bgra = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                let top_left = x < w / 2 && y < h / 2;
+                let bottom_right = x >= w / 2 && y >= h / 2;
+                let (r, g, b) = if top_left {
+                    (255, 0, 0)
+                } else if bottom_right {
+                    (0, 0, 255)
+                } else {
+                    (0, 128, 0)
+                };
+                // The buffer is BGRA, like the capture's.
+                bgra[i] = b;
+                bgra[i + 1] = g;
+                bgra[i + 2] = r;
+                bgra[i + 3] = 255;
+            }
+        }
+
+        let canvas = Canvas::new(920, 520);
+        canvas.render_preview(&bgra, w, h);
+        let px = canvas.pixels();
+
+        let card = DEMO.rects(1.0).preview;
+        let (left, top, ..) = fit_preview(
+            (w as f32, h as f32),
+            (
+                card.left as f32,
+                card.top as f32,
+                card.right as f32,
+                card.bottom as f32,
+            ),
+        );
+        // The picture is not enlarged, so source pixels map one to one from the fitted origin.
+        let red = Px { b: 0, g: 0, r: 255, a: 255 };
+        let blue = Px { b: 255, g: 0, r: 0, a: 255 };
+        let at = |sx: i32, sy: i32| (left.round() as i32 + sx, top.round() as i32 + sy);
+        let (rx, ry) = at(20, 20);
+        let (bx, by) = at(w as i32 - 20, h as i32 - 20);
+        assert_px(&px, rx, ry, red, 12, "the picture's top left quadrant is where the capture put it");
+        assert_px(&px, bx, by, blue, 12, "the picture's bottom right quadrant is where the capture put it");
+    }
 }
 
 /// Owns the two factories a window needs and paints the frame onto a device context.
@@ -1389,4 +1530,5 @@ mod preview_fit_tests {
         assert_eq!(fit_preview((0.0, 10.0), (0.0, 0.0, 400.0, 300.0)), (0.0, 0.0, 0.0, 0.0));
         assert_eq!(fit_preview((10.0, 10.0), (5.0, 5.0, 5.0, 5.0)), (5.0, 5.0, 5.0, 5.0));
     }
+
 }
