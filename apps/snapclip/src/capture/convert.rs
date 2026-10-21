@@ -632,4 +632,66 @@ mod tests {
         }
         let _ = std::fs::remove_file(&path);
     }
+
+    /// Measures the real thing on a real file: nothing is synthesised. Point `SNAPCLIP_MEASURE_PNG`
+    /// at a PNG and this transcodes it through the product's own `convert` into every implemented
+    /// format and prints time against size. Synthetic content lies about this: the AVIF encoder is
+    /// far more sensitive to sharp edges, which is what a screenshot of a user interface is made of.
+    #[test]
+    #[ignore = "measurement: transcodes one real PNG into every format and prints the table"]
+    fn measure_formats_on_a_file() {
+        assert!(
+            !cfg!(debug_assertions),
+            "this measurement must run with --release: cargo test --release ... -- --ignored --nocapture"
+        );
+        use std::time::Instant;
+        let Ok(path) = std::env::var("SNAPCLIP_MEASURE_PNG") else {
+            println!(
+                "usage: SNAPCLIP_MEASURE_PNG=<file.png> cargo test --release -p snapclip-app --lib \
+                 -- --ignored --nocapture measure_formats_on_a_file"
+            );
+            return;
+        };
+        // Reading the master is not what we are measuring, so its time is reported separately.
+        let started = Instant::now();
+        let info = png::Decoder::new(BufReader::new(
+            std::fs::File::open(&path).unwrap_or_else(|error| panic!("{path}: {error}")),
+        ))
+        .read_info()
+        .expect("a readable png")
+        .info()
+        .clone();
+        println!(
+            "source: {path}\n        {}x{} ({:.2} MP), header read in {} ms",
+            info.width,
+            info.height,
+            f64::from(info.width) * f64::from(info.height) / 1e6,
+            started.elapsed().as_millis()
+        );
+        let mut baseline = 0u64;
+        for format in [SaveFormat::Png, SaveFormat::Webp, SaveFormat::Avif] {
+            let mut out = Vec::new();
+            let started = Instant::now();
+            let result = convert(std::path::Path::new(&path), format, 80, &mut out);
+            let elapsed = started.elapsed().as_millis();
+            match result {
+                Ok(conversion) => {
+                    if format == SaveFormat::Png {
+                        baseline = u64::from(conversion.bytes);
+                    }
+                    let ratio = if baseline > 0 {
+                        format!("{:.2}x png", conversion.bytes as f64 / baseline as f64)
+                    } else {
+                        "-".to_owned()
+                    };
+                    println!(
+                        "{format:?}: {} B in {elapsed} ms  ({ratio})",
+                        conversion.bytes
+                    );
+                }
+                Err(error) => println!("{format:?}: refused — {error}"),
+            }
+        }
+        println!("Bmp: not implemented yet (docs/49)");
+    }
 }
