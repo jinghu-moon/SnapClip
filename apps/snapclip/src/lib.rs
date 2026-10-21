@@ -25,6 +25,7 @@ pub mod clipboard_ingest;
 pub mod events;
 pub mod history;
 pub mod pin;
+pub mod save;
 pub mod settings;
 pub mod tray;
 
