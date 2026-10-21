@@ -7,6 +7,13 @@
 //! The path rules (validation, template expansion, conflict) are separate from the bytes,
 //! because a changed name must not force a re-encode (`docs/42` D9).
 
+pub mod bands;
+pub mod caps;
+pub mod copy;
 pub mod service;
+pub mod template;
 
+pub use caps::{CapabilityError, check as check_capability};
+pub use copy::{ConflictLink, Level, ValidationCopy};
 pub use service::{ConflictPolicy, SaveError, SaveOutcome, SaveRequest};
+pub use template::{TemplateError, TemplateValues, expand as expand_template};
