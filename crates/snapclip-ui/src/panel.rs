@@ -9,6 +9,8 @@ mod button;
 mod checkbox;
 #[path = "panel/dropdown.rs"]
 mod dropdown;
+#[path = "panel/field.rs"]
+mod field;
 #[path = "panel/frame.rs"]
 mod frame;
 #[path = "panel/feedback.rs"]
@@ -38,6 +40,10 @@ pub use button::{Button, ButtonState};
 pub use checkbox::{Checkbox, CheckboxState};
 pub use dropdown::{Dropdown, DropdownKey, DropdownTarget};
 pub use feedback::{Toast, Tooltip};
+pub use field::{
+    EDIT_INSET_DIP, EDIT_PADDING_DIP, FieldColours, FieldState, NAME_FIELD_TAB_STOPS,
+    field_colours, name_field_rect,
+};
 pub use frame::{
     DEMO, DEMO_PALETTE, Frame, FrameBrushes, FrameMetrics, FramePalette, FrameRects,
     PanelRenderer, TITLE, factory, paint_to_dc, paint_to_target, title_format,
