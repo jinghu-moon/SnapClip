@@ -13,6 +13,10 @@ pub mod copy;
 pub mod service;
 pub mod template;
 
+// The panel's window shell (`docs/41` S2). It knows nothing about paths or bytes; it owns the
+// window and the lifecycle, and asks the modules above to do the work.
+pub mod window;
+
 pub use caps::{CapabilityError, check as check_capability};
 pub use copy::{ConflictLink, Level, ValidationCopy};
 pub use service::{ConflictPolicy, SaveError, SaveOutcome, SaveRequest};
