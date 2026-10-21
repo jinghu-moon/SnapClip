@@ -41,8 +41,8 @@ pub use checkbox::{Checkbox, CheckboxState};
 pub use dropdown::{Dropdown, DropdownKey, DropdownTarget};
 pub use feedback::{Toast, Tooltip};
 pub use field::{
-    EDIT_INSET_DIP, EDIT_PADDING_DIP, FieldColours, FieldState, INPUT_RADIUS_DIP,
-    NAME_FIELD_TAB_STOPS, field_colours, name_field_rect,
+    EDIT_FONT_DIP, EDIT_INSET_DIP, EDIT_PADDING_DIP, FieldColours, FieldState, INPUT_RADIUS_DIP,
+    NAME_FIELD_TAB_STOPS, edit_font_height, field_colours, name_field_rect,
 };
 pub use frame::{
     DEMO, DEMO_PALETTE, Frame, FrameBrushes, FrameMetrics, FramePalette, FrameRects,

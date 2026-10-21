@@ -25,6 +25,19 @@ pub const EDIT_INSET_DIP: f32 = 1.5;
 /// The horizontal padding the design puts between the frame and the text.
 pub const EDIT_PADDING_DIP: f32 = 10.0;
 
+/// `--fs-input: 12px` — `save-panel-demo-v3.html:39`. The size of the text **inside** the field.
+///
+/// This is not the field's height, and the two were confused once: the native control was given a
+/// font as tall as its own box, which filled it edge to edge. A field is thirty two dip tall and
+/// its text is twelve.
+pub const EDIT_FONT_DIP: f32 = 12.0;
+
+/// The height GDI wants for the field's font: `CreateFontW` takes logical units, and the process
+/// is per-monitor aware, so a scaled negative height is the pixel size the design asks for.
+pub fn edit_font_height(scale: f32) -> i32 {
+    -((f64::from(EDIT_FONT_DIP) * f64::from(scale)).round() as i32)
+}
+
 /// `--r-input: 6px` — `save-panel-demo-v3.html:54`. The frame's corner; the native child is inset
 /// so this is the corner the user actually sees.
 pub const INPUT_RADIUS_DIP: f32 = 6.0;

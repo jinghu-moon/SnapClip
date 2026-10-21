@@ -195,6 +195,14 @@ pub struct FrameBrushes {
     pub danger: ID2D1SolidColorBrush,
     /// `--warning`, the warning field's border.
     pub warning: ID2D1SolidColorBrush,
+    /// The surface the field rules composite their fill over. Kept so `paint` can ask the pure
+    /// rule for colours without being handed the palette again.
+    surface_rgba: [u8; 4],
+    /// Every colour the field rule can name, paired with its brush. The rule decides *which*
+    /// colour a state gets; this only says how to paint it. Both sides are built from the same
+    /// `field_colours` call, so a change to a state's colour reaches the painter by construction
+    /// rather than by someone remembering to edit a second `match`.
+    field_brushes: [([u8; 4], ID2D1SolidColorBrush); 3],
 }
 
 impl FrameBrushes {
@@ -214,18 +222,32 @@ impl FrameBrushes {
             accent: brush(target, focused.border)?,
             danger: brush(target, error.border)?,
             warning: brush(target, warning.border)?,
+            surface_rgba: palette.surface,
+            field_brushes: [
+                (focused.border, brush(target, focused.border)?),
+                (error.border, brush(target, error.border)?),
+                (warning.border, brush(target, warning.border)?),
+            ],
         })
     }
 
-    /// The brush for a state's border, or `None` when the design draws no border at all.
-    fn field_border(&self, state: crate::panel::FieldState) -> Option<&ID2D1SolidColorBrush> {
-        match state {
-            // `:167` — the mock's idle border is transparent, so an idle field has no visible edge.
-            crate::panel::FieldState::Idle => None,
-            crate::panel::FieldState::Focused => Some(&self.accent),
-            crate::panel::FieldState::Error => Some(&self.danger),
-            crate::panel::FieldState::Warning => Some(&self.warning),
+    /// The surface the field rules composite over.
+    pub fn surface_rgba(&self) -> [u8; 4] {
+        self.surface_rgba
+    }
+
+    /// The brush for a colour the field rule produced, or `None` when the rule asked for nothing
+    /// visible. The colour is the *only* thing consulted, so the rule stays authoritative: an
+    /// idle field is transparent because `field_colours` says so, not because a second `match`
+    /// here happens to agree.
+    pub fn field_brush(&self, rgba: [u8; 4]) -> Option<&ID2D1SolidColorBrush> {
+        if rgba[3] == 0 {
+            return None;
         }
+        self.field_brushes
+            .iter()
+            .find(|(colour, _)| *colour == rgba)
+            .map(|(_, brush)| brush)
     }
 }
 
@@ -306,27 +328,35 @@ impl Frame<'_> {
         // The first field's frame. The child window sits inside this rect, inset by
         // `EDIT_INSET_DIP`, and paints its own background with the same resolved fill, so the
         // rounded corner here is the only corner the user sees (`field.rs`).
+        //
+        // Everything about this frame comes from `field_colours`: which state has a border, which
+        // has an inner ring, and what colour each is. The painter holds no opinion of its own, so
+        // changing a rule changes the picture and the tests with it.
         let field = crate::panel::name_field_rect(self.metrics, self.rects, self.scale);
         let field_radius = (crate::panel::INPUT_RADIUS_DIP * self.scale).round() as i32;
+        let colours =
+            crate::panel::field_colours(self.field_state, self.brushes.surface_rgba());
         painter.fill_round(field, field_radius, &self.brushes.field_fill);
-        if let Some(border) = self.brushes.field_border(self.field_state) {
+
+        // `:167` idle is transparent, so this branch simply does not run there.
+        if let Some(border) = self.brushes.field_brush(colours.border) {
             painter.stroke_round(field, field_radius, border, line);
-            // `:169` — focus adds a one dip ring inside the border, which the native control
-            // cannot draw for itself.
-            if self.field_state == crate::panel::FieldState::Focused {
-                let ring = (crate::panel::EDIT_INSET_DIP * self.scale).round() as i32;
-                painter.stroke_round(
-                    Rect::new(
-                        field.left + ring,
-                        field.top + ring,
-                        field.right - ring,
-                        field.bottom - ring,
-                    ),
-                    (field_radius - ring).max(0),
-                    border,
-                    line,
-                );
-            }
+        }
+        // `:169` — focus adds a one dip ring inside the border, which the native control cannot
+        // draw for itself.
+        if let Some(ring_brush) = colours.inset.and_then(|c| self.brushes.field_brush(c)) {
+            let ring = (crate::panel::EDIT_INSET_DIP * self.scale).round() as i32;
+            painter.stroke_round(
+                Rect::new(
+                    field.left + ring,
+                    field.top + ring,
+                    field.right - ring,
+                    field.bottom - ring,
+                ),
+                (field_radius - ring).max(0),
+                ring_brush,
+                line,
+            );
         }
 
         if let Some((text, format)) = self.title {
@@ -429,7 +459,12 @@ pub fn paint_to_dc_with_state(
     fill_surface: bool,
     field_state: crate::panel::FieldState,
 ) -> Result<()> {
-    let target = unsafe { factory.CreateDCRenderTarget(&properties(dpi)) }?;
+    // DPI 96 on the target, deliberately: `rects(scale)` below already converts every dip to a
+    // pixel, so a target carrying the real DPI would scale those pixels a second time. That is
+    // exactly what shipped once: at 150% the panel drew at 1.5 x its intended size, the preview
+    // card left the window and the form column collapsed to a sliver. Text is unaffected because
+    // `title_format` is handed the real `dpi` and sets an already scaled font size.
+    let target = unsafe { factory.CreateDCRenderTarget(&properties(96.0)) }?;
     let bind = RECT {
         left: area.left,
         top: area.top,
@@ -467,6 +502,10 @@ pub fn paint_to_dc_with_state(
 
 /// Paint onto an existing render target. Used by the tests, which own a bitmap target and read its
 /// pixels back, and available to any caller that already has a target.
+///
+/// The target must be at DPI 96. Geometry is in pixels here — `rects(scale)` has already converted
+/// every dip — so a target carrying the real DPI would scale it again; see `paint_to_dc_with_state`.
+/// Pass the real `dpi` anyway: it sizes the text and drives the layout scale.
 pub fn paint_to_target(
     target: &ID2D1RenderTarget,
     dwrite: &IDWriteFactory,
@@ -544,6 +583,56 @@ mod tests {
         }
     }
 
+    /// The regression this panel actually shipped with. At 150% the drawing target carried the
+    /// real DPI while the geometry was already in pixels, so everything drew 1.5x too large: the
+    /// preview card left the window and the form column collapsed to a sliver. Every other bitmap
+    /// test here ran at 96, where the two conversions coincide, which is exactly why they were all
+    /// green while the window was wrong.
+    #[test]
+    fn the_panel_fits_its_window_at_one_hundred_and_fifty_percent() {
+        let scale = 1.5f32;
+        let px = |dip: i32| (dip as f32 * scale).round() as i32;
+        let canvas = Canvas::new_at(px(920), px(520), 144.0);
+        canvas.render();
+        let view = canvas.pixels();
+
+        // The divider sits at the header's height, not at that height scaled twice.
+        let divider = px(44);
+        assert!(
+            (divider - 2..=divider + 2).any(|y| !close(view.pixel(px(200), y), surface_px(), 6)),
+            "the divider must land at {divider} px, not at {}",
+            44.0 * scale * scale
+        );
+
+        // The preview card's right edge is inside the window, and past it is still surface.
+        let card_right = px(16 + 556);
+        assert!(
+            (card_right - 3..=card_right + 3).any(|x| !close(view.pixel(x, px(300)), surface_px(), 6)),
+            "the preview card's right edge must be near {card_right} px"
+        );
+        assert!(
+            close(view.pixel(canvas.width - 2, px(300)), surface_px(), 6),
+            "nothing may be drawn at the far right of the window"
+        );
+
+        // The form column is present: the first field's fill is drawn between the card and the
+        // padding, rather than being pushed off the window.
+        let fill = Px {
+            b: 46,
+            g: 41,
+            r: 41,
+            a: 255,
+        };
+        assert!(
+            close(
+                view.pixel(px(584 + 40), px(44 + 4 + 22 + 6 + 16)),
+                fill,
+                8
+            ),
+            "the first field must be drawn in the form column, not collapsed to a sliver"
+        );
+    }
+
     /// A memory DC with a top-down 32-bit DIB behind it: the same drawing code the window runs,
     /// with pixels we can read back.
     struct Canvas {
@@ -552,10 +641,17 @@ mod tests {
         bits: *mut core::ffi::c_void,
         width: i32,
         height: i32,
+        /// The DPI the drawing is told it is at. The target itself is always DPI 96, because the
+        /// geometry handed to it is already in pixels; see `paint_to_dc_with_state`.
+        dpi: f32,
     }
 
     impl Canvas {
         fn new(width: i32, height: i32) -> Self {
+            Self::new_at(width, height, 96.0)
+        }
+
+        fn new_at(width: i32, height: i32, dpi: f32) -> Self {
             unsafe {
                 let dc = CreateCompatibleDC(None);
                 let header = BITMAPINFOHEADER {
@@ -590,6 +686,7 @@ mod tests {
                     bits,
                     width,
                     height,
+                    dpi,
                 }
             }
         }
@@ -612,7 +709,7 @@ mod tests {
                 &dwrite,
                 self.dc,
                 Rect::new(0, 0, self.width, self.height),
-                96.0,
+                self.dpi,
                 true,
                 field_state,
             )
@@ -774,6 +871,10 @@ mod tests {
     /// The field's frame, at the mock's own slot. An idle field has **no visible border** (`:167`),
     /// which is the detail this project got wrong first: the border is transparent until focus, so
     /// an idle field must read as a filled rectangle and nothing else.
+    ///
+    /// Two exact places are checked, the top edge and the left edge, and every pixel along both of
+    /// them: the earlier version sampled three points on one row, which a border on the left edge
+    /// would have survived.
     #[test]
     fn an_idle_field_has_no_visible_border() {
         let canvas = Canvas::new(920, 520);
@@ -787,17 +888,42 @@ mod tests {
             !close(fill, surface_px(), 3),
             "the fill has to differ from the surface, or an idle field would be invisible"
         );
-        for x in [field.left + 20, (field.left + field.right) / 2, field.right - 20] {
+        // The three colours a border could be, from the rule itself rather than a copy of it.
+        let borders = [
+            crate::panel::field_colours(crate::panel::FieldState::Focused, DEMO_PALETTE.surface).border,
+            crate::panel::field_colours(crate::panel::FieldState::Error, DEMO_PALETTE.surface).border,
+            crate::panel::field_colours(crate::panel::FieldState::Warning, DEMO_PALETTE.surface).border,
+        ];
+        let is_border = |seen: Px| borders.iter().any(|b| close(seen, Px { b: b[2], g: b[1], r: b[0], a: b[3] }, 24));
+
+        // The top edge, along its whole width.
+        for x in field.left..field.right {
             let seen = px.pixel(x, field.top);
             assert!(
-                close(seen, fill, 6),
-                "the idle field's edge at x={x} must be the fill, not a border: saw {seen:?}"
+                !is_border(seen),
+                "the idle field's top edge at x={x} must not be a border: saw {seen:?}"
             );
         }
+        // The left edge, down its whole height.
+        for y in field.top..field.bottom {
+            let seen = px.pixel(field.left, y);
+            assert!(
+                !is_border(seen),
+                "the idle field's left edge at y={y} must not be a border: saw {seen:?}"
+            );
+        }
+        // And the interior is still the fill, so the test above is not passing because the field
+        // was never painted at all.
+        let middle = px.pixel((field.left + field.right) / 2, (field.top + field.bottom) / 2);
+        assert!(close(middle, fill, 6), "the idle field is a fill: saw {middle:?}");
     }
 
     /// The inset is what keeps the rounded corner ours: the frame's own stroke must survive around
     /// the square child. Focus is the state that draws it, so the ring is asserted here too.
+    ///
+    /// The border is checked on the field's edge and the ring at `EDIT_INSET_DIP` inside it, as two
+    /// separate facts. The earlier version asked whether accent appeared anywhere on the outline,
+    /// which stayed true with the ring deleted, so it proved nothing about the ring.
     #[test]
     fn a_focused_field_draws_its_border_and_ring() {
         let canvas = Canvas::new(920, 520);
@@ -806,10 +932,86 @@ mod tests {
         let rects = DEMO.rects(1.0);
         let field = crate::panel::name_field_rect(&DEMO, &rects, 1.0);
         let accent = Px { b: 219, g: 117, r: 31, a: 255 };
-        let lit = (field.left..field.right)
-            .any(|x| close(px.pixel(x, field.top), accent, 12))
-            || (field.top..field.bottom).any(|y| close(px.pixel(field.left, y), accent, 12));
-        assert!(lit, "a focused field's frame must paint the accent border (:169)");
+        let ring = (crate::panel::EDIT_INSET_DIP * 1.0).round() as i32;
+        let mid_x = (field.left + field.right) / 2;
+
+        // The border, on the edge.
+        assert!(
+            (field.top..=field.top + 1).any(|y| close(px.pixel(mid_x, y), accent, 12)),
+            "a focused field must paint the accent border on its edge (:169): saw {:?}",
+            px.pixel(mid_x, field.top)
+        );
+        // The ring, at the inset the child window is placed by.
+        assert!(
+            (field.top + ring - 1..=field.top + ring + 1)
+                .any(|y| close(px.pixel(mid_x, y), accent, 12)),
+            "the inset ring must sit {ring} px inside the edge (:169), as the child is placed: saw {:?}",
+            px.pixel(mid_x, field.top + ring)
+        );
+        // Between them is the fill, which is what makes them two strokes rather than one thick one.
+        // The exact pixel each lands on depends on how the one dip border and the one and a half dip
+        // ring round, so this counts the accent runs rather than naming rows: two runs mean two
+        // strokes, and a ring that is not drawn leaves one. The earlier version sampled the row
+        // `ring / 2` and called it the gap, which is the border's own row, so it stayed true with the
+        // ring deleted and proved nothing.
+        let runs = {
+            let mut runs = 0usize;
+            let mut inside = false;
+            for y in field.top - 1..=field.top + 6 {
+                let accent_here = close(px.pixel(mid_x, y), accent, 12);
+                if accent_here && !inside {
+                    runs += 1;
+                }
+                inside = accent_here;
+            }
+            runs
+        };
+        assert!(
+            runs >= 2,
+            "the focused field draws the border and the ring as two strokes; saw {runs} accent run(s)"
+        );
+
+        // The same field at 2x, where the two strokes are three pixels apart and can be told apart.
+        let big = Canvas::new_at(1840, 1040, 192.0);
+        big.render_focused();
+        let big_px = big.pixels();
+        let big_rects = DEMO.rects(2.0);
+        let big_field = crate::panel::name_field_rect(&DEMO, &big_rects, 2.0);
+        let big_ring = (crate::panel::EDIT_INSET_DIP * 2.0).round() as i32;
+        let big_mid = (big_field.left + big_field.right) / 2;
+        assert!(
+            (big_field.top..=big_field.top + 1).any(|y| close(big_px.pixel(big_mid, y), accent, 12)),
+            "at 2x the accent border is on the edge"
+        );
+        assert!(
+            (big_field.top + big_ring - 1..=big_field.top + big_ring + 1)
+                .any(|y| close(big_px.pixel(big_mid, y), accent, 12)),
+            "at 2x the ring sits {big_ring} px inside the edge"
+        );
+        assert!(
+            !close(big_px.pixel(big_mid, big_field.top + big_ring / 2), accent, 12),
+            "at 2x the border and the ring are separate strokes, not one thick edge"
+        );
+    }
+
+    /// The field's font is `--fs-input`, not the field's height. The two were confused once and the
+    /// native control's text filled its whole box, which is exactly what a screenshot showed.
+    #[test]
+    fn the_field_font_is_the_input_size_and_not_the_field_height() {
+        let metrics = DEMO;
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            let px = |dip: f32| (dip * scale).round() as i32;
+            assert_eq!(
+                crate::panel::edit_font_height(scale),
+                -px(crate::panel::EDIT_FONT_DIP),
+                "the font is --fs-input (:39) at scale {scale}"
+            );
+            assert_ne!(
+                crate::panel::edit_font_height(scale),
+                -px(metrics.field_height as f32),
+                "the font must not be the field's own height at scale {scale}"
+            );
+        }
     }
 }
 

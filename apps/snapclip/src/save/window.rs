@@ -620,7 +620,9 @@ fn create_name_edit(parent: windows_sys::Win32::Foundation::HWND) -> windows_sys
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
-        let height = -((f64::from(metrics.field_height) * scale).round() as i32);
+        // The font is `--fs-input`, not the field's height. They were confused once and the control
+        // filled its own box edge to edge.
+        let height = snapclip_ui::panel::edit_font_height(scale as f32);
         let font = CreateFontW(
             height,
             0,
