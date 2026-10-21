@@ -373,6 +373,13 @@ mod tests {
     #[test]
     #[ignore = "timing report: run with --release --ignored --nocapture"]
     fn the_canvas_moves_a_logarithmic_number_of_times_at_the_field_size() {
+        // Timing numbers are only meaningful in release. A debug build of the AVIF encoder is about
+        // thirty times slower, which is how a four kilobyte per second reading became eighty seven
+        // seconds for one frame and nearly led to the format being dropped.
+        assert!(
+            !cfg!(debug_assertions),
+            "this measurement must run with --release: cargo test --release ... -- --ignored --nocapture"
+        );
         const W: u32 = 1323;
         const H: u32 = 900;
         const MAX_ROWS: u32 = 40 * H;
@@ -444,6 +451,12 @@ mod tests {
     #[ignore = "timing report: run with --release --ignored --nocapture"]
     fn the_cost_of_an_append_at_the_field_size() {
         let (width, view) = (2148u32, 1344u32);
+        // Timing numbers are only meaningful in release. A debug build is about thirty times
+        // slower, which is how the AVIF measurement once produced eighty seven seconds for one frame.
+        assert!(
+            !cfg!(debug_assertions),
+            "this measurement must run with --release: cargo test --release ... -- --ignored --nocapture"
+        );
         let frame = vec![0x5au8; (width * view * 4) as usize];
         let mut stitcher = Stitcher::new(&frame, width, view, 32 * view);
         let mut costs = Vec::new();

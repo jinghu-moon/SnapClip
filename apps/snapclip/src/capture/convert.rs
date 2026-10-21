@@ -269,7 +269,9 @@ impl WholeAvif {
         let typed = PixelBuffer::<Rgba<u8>>::from_pixels(self.pixels, self.width, self.height)
             .map_err(|error| ExportError::Sink(format!("the AVIF frame is not usable: {error}")))?;
         let erased: PixelBuffer = PixelBuffer::from(typed);
-        // Effort 10 is the fastest setting the dependency has, and it is still about 0.7 MP/s
+        // Speed 10 is the fastest setting the dependency has, and in release it is about 0.37 s per
+        // megapixel (3.08 s for a 4K frame); the earlier 0.7 MP/s figure in this comment was a
+        // debug build's number and is not a property of the encoder.
         // (`docs/49`): the budget, the worker and the cancellation are all sized around that.
         let config = EncoderConfig::default()
             .quality(f32::from(self.quality).clamp(1.0, 100.0))
@@ -594,6 +596,13 @@ mod tests {
     #[test]
     #[ignore = "measurement: encodes a full 4K frame three times and prints the timings"]
     fn measure_a_four_k_save_in_each_format() {
+        // Timing numbers are only meaningful in release. A debug build of the AVIF encoder is about
+        // thirty times slower, which is how a four kilobyte per second reading became eighty seven
+        // seconds for one frame and nearly led to the format being dropped.
+        assert!(
+            !cfg!(debug_assertions),
+            "this measurement must run with --release: cargo test --release ... -- --ignored --nocapture"
+        );
         use std::time::Instant;
         // Two contents, because the encoder is far more sensitive to that than to area: a checker
         // is the worst case, and text-like rows on white are what a screenshot actually is.

@@ -226,6 +226,13 @@ mod tests {
     #[test]
     #[ignore = "measurement, not an assertion"]
     fn scratch_measure_the_pixel_writeback() {
+        // Timing numbers are only meaningful in release. A debug build of the AVIF encoder is about
+        // thirty times slower, which is how a four kilobyte per second reading became eighty seven
+        // seconds for one frame and nearly led to the format being dropped.
+        assert!(
+            !cfg!(debug_assertions),
+            "this measurement must run with --release: cargo test --release ... -- --ignored --nocapture"
+        );
         use std::time::Instant;
         const W: usize = 240;
         const K: usize = 6;

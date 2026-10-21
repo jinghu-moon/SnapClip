@@ -724,6 +724,13 @@ mod tests {
     #[test]
     #[ignore = "timing report: run with --release --include-ignored --nocapture"]
     fn the_cost_of_one_frame_at_the_field_size() {
+        // Timing numbers are only meaningful in release. A debug build of the AVIF encoder is about
+        // thirty times slower, which is how a four kilobyte per second reading became eighty seven
+        // seconds for one frame and nearly led to the format being dropped.
+        assert!(
+            !cfg!(debug_assertions),
+            "this measurement must run with --release: cargo test --release ... -- --ignored --nocapture"
+        );
         let (w, h) = (2148u32, 1344u32);
         let page = page(w, 8 * h, 31);
         let mut tracker = Tracker::new(&window(&page, w, 0, h), w, h, 160);
