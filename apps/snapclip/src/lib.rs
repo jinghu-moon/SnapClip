@@ -319,14 +319,23 @@ impl Shell {
                     preview: Some((pixels.bgra.clone(), width, height)),
                     ..Default::default()
                 };
-                let handle = save::window::open(options).map_err(|error| format!("{error:?}"))?;
+                // Close the previous panel BEFORE creating the new one. A window handle is
+                // reused once its window is destroyed, so closing a stale handle after the new
+                // panel exists can post `WM_CLOSE` to the panel that was just opened, because the
+                // system handed it the same number. Closing first removes the window that the
+                // stale number could have referred to, which is why the order is the fix.
                 let previous = save_panels
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .replace(handle);
+                    .take();
                 if let Some(previous) = previous {
                     previous.close();
                 }
+                let handle = save::window::open(options).map_err(|error| format!("{error:?}"))?;
+                save_panels
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .replace(handle);
                 Ok(())
             }));
         }

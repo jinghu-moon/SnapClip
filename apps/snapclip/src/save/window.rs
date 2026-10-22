@@ -350,6 +350,11 @@ impl ShellHandle {
             let alive = unsafe {
                 windows_sys::Win32::UI::WindowsAndMessaging::IsWindow(self.hwnd as _)
             } != 0;
+            eprintln!(
+                "[save-panel] request_close hwnd={:#x} alive={alive} -> {}",
+                self.hwnd,
+                if alive { "posting WM_CLOSE" } else { "skipping (stale handle)" }
+            );
             if alive {
                 unsafe {
                     windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -554,6 +559,16 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
         }
 
         ShowWindow(hwnd, SW_SHOW);
+        {
+            let mut rect: windows_sys::Win32::Foundation::RECT = std::mem::zeroed();
+            let got = windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut rect);
+            let visible = windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd);
+            eprintln!(
+                "[save-panel] shown hwnd={hwnd:p} visible={visible} client={}x{} (GetClientRect={got})",
+                rect.right - rect.left,
+                rect.bottom - rect.top
+            );
+        }
     }
 
     let _ = ready.send(Ok(hwnd as isize));
@@ -905,6 +920,7 @@ extern "system" fn window_proc(
             0
         }
         WM_CLOSE => {
+            eprintln!("[save-panel] WM_CLOSE received hwnd={hwnd:p}");
             DestroyWindow(hwnd);
             0
         }
