@@ -182,6 +182,9 @@ pub struct FramePalette {
     /// `.row-label { color: rgba(232,236,242,.74) }` (`:166`), 0.74 × 255 = 189. The row labels are
     /// a little stronger than `--muted`, which is what separates them from the hint text.
     pub label: [u8; 4],
+    /// `--accent-text: rgb(94,162,245)` (`:29`) — the brighter blue the design uses for small marks
+    /// on the dark surface, because the primary accent is only about 4:1 against it.
+    pub accent_text: [u8; 4],
 }
 
 pub const DEMO_PALETTE: FramePalette = FramePalette {
@@ -190,6 +193,7 @@ pub const DEMO_PALETTE: FramePalette = FramePalette {
     text: [255, 255, 255, 255],
     muted: [232, 236, 242, 158],
     label: [232, 236, 242, 189],
+    accent_text: [94, 162, 245, 255],
 };
 
 /// Brushes the frame paints with. A brush belongs to the target that made it, so the caller
@@ -210,6 +214,10 @@ pub struct FrameBrushes {
     pub danger: ID2D1SolidColorBrush,
     /// `--warning`, the warning field's border.
     pub warning: ID2D1SolidColorBrush,
+    /// `--accent-text` (`:29`), the locked link hub's icon colour.
+    pub accent_text: ID2D1SolidColorBrush,
+    /// The same colour as bytes, for the icon's tint, which is arithmetic rather than a brush.
+    pub accent_text_rgba: [u8; 4],
     /// The preview card's checkerboard, the two colours of `:111`.
     pub checker_light: ID2D1SolidColorBrush,
     pub checker_dark: ID2D1SolidColorBrush,
@@ -241,6 +249,8 @@ impl FrameBrushes {
             accent: brush(target, focused.border)?,
             danger: brush(target, error.border)?,
             warning: brush(target, warning.border)?,
+            accent_text: brush(target, palette.accent_text)?,
+            accent_text_rgba: palette.accent_text,
             checker_light: brush(target, CHECKER_LIGHT)?,
             checker_dark: brush(target, CHECKER_DARK)?,
             surface_rgba: palette.surface,
@@ -328,7 +338,7 @@ pub struct Frame<'a> {
 }
 
 impl Frame<'_> {
-    pub fn paint(&self, painter: &PanelPainter) {
+    pub fn paint(&self, painter: &PanelPainter) -> Result<()> {
         let canvas = Rect::new(
             0,
             0,
@@ -544,6 +554,28 @@ impl Frame<'_> {
                 painter.draw_text(word, format, rect, brush);
             }
         }
+
+        // The size row's link hub (`:246`). The design gives it no background and no border until it
+        // is hovered (`:247`), and the icon is `--accent-text` because the hub starts locked (`:248`,
+        // `:603`), so the default state is the icon alone. Its rectangle comes from the same place
+        // the two cells were laid out around, so the icon cannot drift away from the row.
+        //
+        // The picture is the baked Tabler file rather than a redrawing of it. `assets/icon/README.md`
+        // records that Direct2D's `DrawSvgDocument` paints nothing on this machine, and that redrawing
+        // the shapes with lines is by definition not the same picture, so the icon arrives as pixels
+        // and is tinted on the way in.
+        let icon = crate::panel::field::link_hub_icon_rect(self.metrics, self.rects, self.scale);
+        let tinted = crate::panel::icons::tint_rgba_to_premultiplied_bgra(
+            crate::panel::icons::Glyph::Link.raw(),
+            self.brushes.accent_text_rgba,
+        );
+        let bitmap = painter.bgra_bitmap_with_alpha(
+            crate::panel::icons::ICON_BAKED_PX,
+            crate::panel::icons::ICON_BAKED_PX,
+            &tinted,
+        )?;
+        painter.draw_bitmap_at(&bitmap, icon);
+        Ok(())
     }
 }
 
@@ -736,7 +768,7 @@ pub fn paint_to_dc_with_preview(
         preview: preview.as_ref().map(|(b, w, h)| (b, *w, *h)),
         quality,
     }
-    .paint(&painter);
+    .paint(&painter)?;
     unsafe { target.EndDraw(None, None)? };
     Ok(())
 }
@@ -799,7 +831,7 @@ pub fn paint_to_target_with_preview(
         preview: preview.as_ref().map(|(b, w, h)| (b, *w, *h)),
         quality,
     }
-    .paint(&painter);
+    .paint(&painter)?;
     unsafe { target.EndDraw(None, None)? };
     Ok(rects)
 }
@@ -856,6 +888,37 @@ mod tests {
         }
         for y in field.top..field.bottom {
             assert_not_any(px, field.left, y, &border_px, 24, what);
+        }
+    }
+
+    /// The size row's link hub draws the chain icon in `--accent-text` (`:29`, `:248`).
+    ///
+    /// Rendered at double scale on purpose. The icon's stroke is 1.4 dip wide, so at unit scale it
+    /// lands across two pixels and never reaches its full colour, which would force the tolerance
+    /// wide enough to accept almost anything. At 2× there is a solid core to sample.
+    ///
+    /// The points come from the icon's own rectangle: the mockup's chain has a diagonal through the
+    /// middle (`:709`, `M6.5 9.5l3-3`), so the centre and the two points one dip along that diagonal
+    /// are on the stroke, and the hub's corners are not. That is what tells an icon from a filled box.
+    #[test]
+    fn the_link_hub_icon_is_drawn_in_accent_text() {
+        let canvas = Canvas::new_at(1840, 1040, 192.0);
+        canvas.render();
+        let px = canvas.pixels();
+        let rects = DEMO.rects(2.0);
+        let hub = crate::panel::field::link_hub_rect(&DEMO, &rects, 2.0);
+        let icon = crate::panel::field::link_hub_icon_rect(&DEMO, &rects, 2.0);
+        let want = fill_rgb(94, 162, 245);
+        let middle = (icon.left + 16, icon.top + 16);
+        for (x, y) in [
+            (middle.0, middle.1),
+            (middle.0 - 2, middle.1 + 2),
+            (middle.0 + 2, middle.1 - 2),
+        ] {
+            assert_px(&px, x, y, want, 8, "the link hub's chain stroke");
+        }
+        for (x, y) in [(hub.left + 2, hub.top + 2), (hub.right - 3, hub.bottom - 3)] {
+            assert_not_any(&px, x, y, &[want], 8, "a hub corner outside the icon");
         }
     }
 

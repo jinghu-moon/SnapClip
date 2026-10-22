@@ -62,19 +62,51 @@ pub fn svg_paths() -> Result<Vec<PathBuf>, String> {
     Ok(svgs)
 }
 
-/// Rewrite every PNG next to its SVG, and report the paths written.
+/// Rewrite every PNG and every `.rgba` next to its SVG, and report the paths written.
 pub fn bake_all() -> Result<Vec<PathBuf>, String> {
     let mut written = Vec::new();
     for svg in svg_paths()? {
         let png = svg.with_extension("png");
         std::fs::write(&png, render(&svg)?).map_err(|error| format!("{}: {error}", png.display()))?;
         written.push(png);
+        let rgba = svg.with_extension("rgba");
+        std::fs::write(&rgba, render_rgba(&svg)?)
+            .map_err(|error| format!("{}: {error}", rgba.display()))?;
+        written.push(rgba);
     }
     Ok(written)
 }
 
+/// One SVG → the raw pixels, for renderers that cannot use a colour matrix effect.
+///
+/// The save panel paints through a DC render target, which has no device context and therefore no
+/// effect graph, so it tints the pixels itself. The pixels are written **straight**, not
+/// premultiplied, which is what the tinting function on that side expects; `tiny_skia` hands them
+/// over premultiplied, so each channel is divided back out by its alpha here.
+pub fn render_rgba(svg: &Path) -> Result<Vec<u8>, String> {
+    let mut pixmap = render_pixmap(svg)?;
+    for pixel in pixmap.data_mut().chunks_exact_mut(4) {
+        let alpha = u32::from(pixel[3]);
+        if alpha == 0 {
+            pixel.copy_from_slice(&[0, 0, 0, 0]);
+            continue;
+        }
+        for channel in &mut pixel[..3] {
+            *channel = ((u32::from(*channel) * 255) / alpha).min(255) as u8;
+        }
+    }
+    Ok(pixmap.take())
+}
+
 /// One SVG → the PNG bytes the overlay loads, in memory.
 pub fn render(svg: &Path) -> Result<Vec<u8>, String> {
+    render_pixmap(svg)?
+        .encode_png()
+        .map_err(|error| format!("{}: {error}", svg.display()))
+}
+
+/// One SVG → the rendered pixmap, before it is encoded either way.
+fn render_pixmap(svg: &Path) -> Result<resvg::tiny_skia::Pixmap, String> {
     let source =
         std::fs::read_to_string(svg).map_err(|error| format!("{}: {error}", svg.display()))?;
     // `currentColor` is not SVG, it is CSS: resolve it before the file reaches any renderer.
@@ -90,9 +122,7 @@ pub fn render(svg: &Path) -> Result<Vec<u8>, String> {
         resvg::tiny_skia::Transform::from_scale(scale, scale),
         &mut pixmap.as_mut(),
     );
-    pixmap
-        .encode_png()
-        .map_err(|error| format!("{}: {error}", svg.display()))
+    Ok(pixmap)
 }
 
 #[cfg(test)]
@@ -139,5 +169,49 @@ mod tests {
         let height = u32::from_be_bytes(png[20..24].try_into().unwrap());
         assert_eq!((width, height), (ICON_BAKED_PX, ICON_BAKED_PX));
         assert_eq!(png[25], 6, "colour type must be RGBA");
+    }
+
+    /// The committed `.rgba` files are the same render, written straight rather than premultiplied.
+    ///
+    /// The panel divides the alpha back out of `tiny_skia`'s premultiplied pixels before writing, so
+    /// a fully opaque white pixel stays 255 and a transparent one stays zero.
+    #[test]
+    fn the_committed_raw_pixels_are_straight_and_current() {
+        for svg in svg_paths().unwrap() {
+            let rgba = svg.with_extension("rgba");
+            let committed = std::fs::read(&rgba).unwrap_or_else(|error| {
+                panic!(
+                    "{} is missing ({error}); run `cargo run -p icon-bake`",
+                    rgba.display()
+                )
+            });
+            assert_eq!(
+                committed.len(),
+                (ICON_BAKED_PX * ICON_BAKED_PX * 4) as usize,
+                "{}",
+                rgba.display()
+            );
+            assert_eq!(
+                committed,
+                render_rgba(&svg).unwrap(),
+                "{} is stale; run `cargo run -p icon-bake`",
+                rgba.display()
+            );
+        }
+    }
+
+    /// A pixel with ink keeps its alpha and stays white; the corners stay transparent.
+    #[test]
+    fn raw_pixels_are_white_where_there_is_ink() {
+        let pixels = render_rgba(&svg_paths().unwrap().remove(0)).unwrap();
+        let opaque = pixels
+            .chunks_exact(4)
+            .find(|pixel| pixel[3] == 255)
+            .expect("an icon has some fully opaque ink");
+        assert_eq!(&opaque[..3], &[255, 255, 255], "ink is white before tinting");
+        assert!(
+            pixels.chunks_exact(4).any(|pixel| pixel[3] == 0),
+            "an icon has transparent surroundings"
+        );
     }
 }

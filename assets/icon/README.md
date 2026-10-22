@@ -1,15 +1,21 @@
 # 面板图标（Tabler）
 
-这 8 个图标是 [Tabler Icons](https://tabler.io/icons)（MIT）的 24×24 文件，对应浮层面板上的 8 个图形：
+这 7 个图标都是 24×24 的描边文件，对应面板上的 7 个图形：
 
-| 文件 | 用在哪 |
-| --- | --- |
-| `swap.svg` | 尺寸卡：互换宽高 |
-| `center.svg` | 位置卡：居中到屏幕 |
-| `origin.svg` | 位置卡：移到原点 |
-| `close.svg` | 面板右上角关闭 |
-| `chevron.svg` | 预设下拉的箭头（展开时上下翻转） |
-| `check.svg` | 下拉里选中那一项的勾 |
+| 文件 | 用在哪 | 来源 |
+| --- | --- | --- |
+| `swap.svg` | 尺寸卡：互换宽高 | Tabler |
+| `center.svg` | 位置卡：居中到屏幕 | Tabler |
+| `origin.svg` | 位置卡：移到原点 | Tabler |
+| `close.svg` | 面板右上角关闭 | Tabler |
+| `chevron.svg` | 预设下拉的箭头（展开时上下翻转） | Tabler |
+| `check.svg` | 下拉里选中那一项的勾 | Tabler |
+| `link.svg` | 保存面板：尺寸行两格之间的锁定 | 设计稿自带的 `ICON.link` |
+
+`swap`…`check` 是 [Tabler Icons](https://tabler.io/icons)（MIT）的原文件。`link.svg` 不是：设计稿的
+`docs/design/save-panel-demo-v3.html:709` 自己画了这个图标（16 单位、三条子路径），照它重画成 24 单位
+才**和设计一致**，而换一个"看起来差不多"的 Tabler 图标则不是同一个图形 —— 所以这里用的是设计稿的路径，
+只加了一层 `scale(1.5)`（见文件内注释），**没有**改任何坐标数字。
 
 面板上画出来的就是这些文件本身，**不是照着它们重画的线段**。
 
@@ -41,9 +47,11 @@ assets/icon/*.svg ──(cargo run -p icon-bake, resvg)──▶ assets/icon/*.p
 ## 换图标 / 加图标时
 
 1. 把 SVG 放进 `assets/icon/`（`viewBox="0 0 24 24"`；`currentColor` 由烘焙工具换成 `#ffffff`）。
+   工具的缩放是 `96 / 24`（`tools/icon-bake/src/main.rs:26`），**不看文件自己的 viewBox**，所以小于 24 单位
+   的画法要么按比例改坐标、要么用 `<g transform="scale(...)">` 包一层（`link.svg` 用的是后者）。
 2. 跑 `cargo run -p icon-bake`。
-3. 在 `crates/snapclip-capture/src/icons.rs` 的 `Glyph` 里加一个变体（`ALL` / `name()` / `png()` 各一处），
-   再在调用点用 `Glyph::新名字`。
+3. 在 `crates/snapclip-ui/src/panel/icons.rs` 的 `Glyph` 里加一个变体（`ICON_COUNT` / `ALL` / `name()` /
+   `png()` 各一处），再在调用点用 `Glyph::新名字`。
 4. 因为 resvg 渲染，**不再有"Direct2D 的 SVG 子集"这类限制**（`<style>`、`<use>`、渐变、clip 都能画）。
    测试会盯住"每个变体指向不同文件""PNG 是 96×96 RGBA""PNG 与 SVG 一致"。
 

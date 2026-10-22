@@ -387,11 +387,11 @@ pub fn size_cell_rect(
     let px = |dip: i32| (dip as f32 * scale).round() as i32;
     let row = field_rect(metrics, rects, scale, Row::Size);
     let gap = px(8);
-    let hub = px(28);
-    let cell_width = (row.right - row.left - 2 * gap - hub) / 2;
+    let hub = link_hub_rect(metrics, rects, scale);
+    let cell_width = (row.right - row.left - 2 * gap - (hub.right - hub.left)) / 2;
     let left = match cell {
         SizeCell::Width => row.left,
-        SizeCell::Height => row.left + cell_width + gap + hub + gap,
+        SizeCell::Height => hub.right + gap,
     };
     // The design lays the row out with flex, so the second cell takes whatever the first two cells
     // and the hub leave behind. Integer division drops a pixel on odd widths, and the flex behaviour
@@ -408,7 +408,45 @@ pub fn size_cell_rect(
     }
 }
 
-/// `--r-seg: 7px` (`:57`) — the segmented track's corner.
+/// `.link-hub { width: 28px; height: 28px }` (`:246`) — the hub between the two size cells.
+pub const LINK_HUB_DIP: i32 = 28;
+
+/// `.link-hub svg { width: 16px; height: 16px }` (`:249`) — the icon's own box, centred in the hub.
+pub const LINK_HUB_ICON_DIP: i32 = 16;
+
+/// The hub's rectangle in the size row. One source for it, so the icon is drawn exactly where the
+/// two cells were laid out around it: `cell | gap | hub | gap | cell`, with the hub taking the
+/// width the flex row leaves and the second cell absorbing the odd pixel (see [`size_cell_rect`]).
+pub fn link_hub_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let row = field_rect(metrics, rects, scale, Row::Size);
+    let gap = px(8);
+    let hub = px(LINK_HUB_DIP);
+    let left = row.left + (row.right - row.left - 2 * gap - hub) / 2 + gap;
+    Rect {
+        left,
+        top: row.top,
+        right: left + hub,
+        bottom: row.bottom,
+    }
+}
+
+/// The icon's box inside the hub: 16 dip square, centred in the 28 dip hub (`:246`, `:249`).
+pub fn link_hub_icon_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let hub = link_hub_rect(metrics, rects, scale);
+    let side = px(LINK_HUB_ICON_DIP);
+    let left = hub.left + (hub.right - hub.left - side) / 2;
+    let top = hub.top + (hub.bottom - hub.top - side) / 2;
+    Rect {
+        left,
+        top,
+        right: left + side,
+        bottom: top + side,
+    }
+}
+
+
 pub const QUALITY_SEG_RADIUS_DIP: f32 = 7.0;
 
 /// `--r-seg-inner: 4px` (`:58`) — the selected block's corner, and the options' own.

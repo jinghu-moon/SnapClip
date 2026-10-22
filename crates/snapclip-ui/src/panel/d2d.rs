@@ -1,14 +1,14 @@
 use super::{SegmentState, segment_outer_radius, segment_radius, segment_slide};
 use snapclip_model::geometry::Rect;
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_ALPHA_MODE_IGNORE, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
+    D2D1_ALPHA_MODE, D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_PIXEL_FORMAT,
+    D2D_SIZE_U, D2D_RECT_F,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Direct2D::{
     D2D1_BITMAP_INTERPOLATION_MODE, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES,
-    D2D1_ELLIPSE,
-    D2D1_ROUNDED_RECT, ID2D1Bitmap, ID2D1DCRenderTarget, ID2D1DeviceContext, ID2D1HwndRenderTarget,
-    ID2D1RenderTarget, ID2D1SolidColorBrush,
+    D2D1_ELLIPSE, D2D1_ROUNDED_RECT, ID2D1Bitmap, ID2D1DCRenderTarget, ID2D1DeviceContext,
+    ID2D1HwndRenderTarget, ID2D1RenderTarget, ID2D1SolidColorBrush,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_MEASURING_MODE_NATURAL, DWRITE_TEXT_METRICS, IDWriteFactory, IDWriteTextFormat,
@@ -59,12 +59,17 @@ pub trait PaintTarget {
         src: Option<&D2D_RECT_F>,
     );
     /// Create a bitmap from tightly packed pixels. Base form, same reason as `draw_bitmap`.
+    ///
+    /// The alpha mode is a parameter rather than two methods: the preview picture is opaque and
+    /// ignores its alpha channel, while icons are white on transparent and are prepared
+    /// premultiplied, and the macro that implements this for the four targets should carry one body.
     fn create_bitmap(
         &self,
         width: u32,
         height: u32,
         pixels: &[u8],
         pitch: u32,
+        alpha_mode: D2D1_ALPHA_MODE,
     ) -> Result<ID2D1Bitmap>;
 }
 
@@ -148,14 +153,14 @@ macro_rules! impl_paint_target {
                 height: u32,
                 pixels: &[u8],
                 pitch: u32,
+                alpha_mode: D2D1_ALPHA_MODE,
             ) -> Result<ID2D1Bitmap> {
                 let base: &ID2D1RenderTarget =
                     unsafe { &*(self as *const $target as *const ID2D1RenderTarget) };
                 let props = D2D1_BITMAP_PROPERTIES {
                     pixelFormat: D2D1_PIXEL_FORMAT {
                         format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                        // The selection is opaque, so no alpha channel is interpreted.
-                        alphaMode: D2D1_ALPHA_MODE_IGNORE,
+                        alphaMode: alpha_mode,
                     },
                     dpiX: 96.0,
                     dpiY: 96.0,
@@ -228,8 +233,28 @@ impl PanelPainter<'_> {
     }
 
     /// A bitmap from tightly packed BGRA rows, ready to be drawn by [`PanelPainter::draw_bitmap_at`].
+    ///
+    /// The pixels are treated as opaque, which is what the captured preview picture is.
     pub fn bgra_bitmap(&self, width: u32, height: u32, bgra: &[u8]) -> Result<ID2D1Bitmap> {
-        self.context.create_bitmap(width, height, bgra, width * 4)
+        self.context
+            .create_bitmap(width, height, bgra, width * 4, D2D1_ALPHA_MODE_IGNORE)
+    }
+
+    /// The same, for pixels that carry their own alpha, prepared premultiplied. Icons are white on
+    /// transparent and are tinted before they get here, so their alpha has to be honoured.
+    pub fn bgra_bitmap_with_alpha(
+        &self,
+        width: u32,
+        height: u32,
+        bgra: &[u8],
+    ) -> Result<ID2D1Bitmap> {
+        self.context.create_bitmap(
+            width,
+            height,
+            bgra,
+            width * 4,
+            D2D1_ALPHA_MODE_PREMULTIPLIED,
+        )
     }
 
     /// Draw a bitmap into `dest`, scaled with linear interpolation.
