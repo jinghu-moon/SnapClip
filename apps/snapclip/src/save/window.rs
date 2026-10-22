@@ -648,16 +648,20 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
             preview: options.preview.take(),
             field_state: snapclip_ui::panel::FieldState::Idle,
             name_edit: std::ptr::null_mut(),
+            path_edit: std::ptr::null_mut(),
             fill_brush,
         }));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
 
-        // The name field: a real `EDIT` child, inset inside the frame the frame painter draws. Its
-        // font is the embedded subset registered for GDI, so the native control and the drawn panel
-        // share one face without installing anything on the machine.
-        let edit = create_name_edit(hwnd);
+        // Both fields: real `EDIT` children, each inset inside the frame the frame painter draws for
+        // its own row (`:542` is the path row, `:556` the name row). Their font is the embedded
+        // subset registered for GDI, so the native controls and the drawn panel share one face
+        // without installing anything on the machine.
+        let name_edit = create_field_edit(hwnd, snapclip_ui::panel::Row::Name, "捕获");
+        let path_edit = create_field_edit(hwnd, snapclip_ui::panel::Row::Path, "");
         if let Some(s) = (state as *mut WindowState).as_mut() {
-            s.name_edit = edit;
+            s.name_edit = name_edit;
+            s.path_edit = path_edit;
         }
 
         ShowWindow(hwnd, SW_SHOW);
@@ -728,6 +732,9 @@ struct WindowState {
     field_state: snapclip_ui::panel::FieldState,
     /// The name field's child window, once it exists.
     name_edit: windows_sys::Win32::Foundation::HWND,
+    /// The path field's child window, once it exists. Both fields go through one constructor and one
+    /// frame loop (`snapclip_ui::panel::field_rect`), so the second field is not a copy of the first.
+    path_edit: windows_sys::Win32::Foundation::HWND,
     /// The captured picture, handed to the frame painter so the preview card shows the real
     /// selection rather than a stand-in.
     preview: Option<(Vec<u8>, u32, u32)>,
@@ -745,7 +752,11 @@ struct WindowState {
 /// `EDIT_INSET_DIP`, so the rounded corner the user sees is the frame's, not the child's square one.
 #[cfg(windows)]
 #[allow(unsafe_code)]
-fn create_name_edit(parent: windows_sys::Win32::Foundation::HWND) -> windows_sys::Win32::Foundation::HWND {
+fn create_field_edit(
+    parent: windows_sys::Win32::Foundation::HWND,
+    row: snapclip_ui::panel::Row,
+    text: &str,
+) -> windows_sys::Win32::Foundation::HWND {
     use windows_sys::Win32::Graphics::Gdi::{
         AddFontMemResourceEx, CreateFontW, CLEARTYPE_QUALITY, DEFAULT_CHARSET, FF_DONTCARE,
         FW_SEMIBOLD,
@@ -773,7 +784,7 @@ fn create_name_edit(parent: windows_sys::Win32::Foundation::HWND) -> windows_sys
         let scale = f64::from(dpi) / 96.0;
         let metrics = snapclip_ui::panel::DEMO;
         let rects = metrics.rects(scale as f32);
-        let field = snapclip_ui::panel::name_field_rect(&metrics, &rects, scale as f32);
+        let field = snapclip_ui::panel::field_rect(&metrics, &rects, scale as f32, row);
         let inset = (f64::from(snapclip_ui::panel::EDIT_INSET_DIP) * scale).round() as i32;
 
         let family: Vec<u16> = snapclip_ui::panel::FAMILY
@@ -801,7 +812,7 @@ fn create_name_edit(parent: windows_sys::Win32::Foundation::HWND) -> windows_sys
         );
 
         let class: Vec<u16> = "EDIT\0".encode_utf16().collect();
-        let text: Vec<u16> = "捕获\0".encode_utf16().collect();
+        let text: Vec<u16> = format!("{text}\0").encode_utf16().collect();
         let edit = CreateWindowExW(
             0,
             class.as_ptr(),

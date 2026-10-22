@@ -434,38 +434,46 @@ impl Frame<'_> {
             stroke,
         );
 
-        // The first field's frame. The child window sits inside this rect, inset by
-        // `EDIT_INSET_DIP`, and paints its own background with the same resolved fill, so the
-        // rounded corner here is the only corner the user sees (`field.rs`).
+        // Both field frames, in the mockup's order: the path row first and the name row second
+        // (`:542`, `:556`). Each child window sits inside its own rect, inset by `EDIT_INSET_DIP`,
+        // and paints its own background with the same resolved fill, so the rounded corner here is
+        // the only corner the user sees (`field.rs`).
         //
-        // Everything about this frame comes from `field_colours`: which state has a border, which
+        // Everything about these frames comes from `field_colours`: which state has a border, which
         // has an inner ring, and what colour each is. The painter holds no opinion of its own, so
-        // changing a rule changes the picture and the tests with it.
-        let field = crate::panel::name_field_rect(self.metrics, self.rects, self.scale);
+        // changing a rule changes the picture and the tests with it. Both rows run this one loop,
+        // which is what keeps the second field from becoming a copy of the first.
         let field_radius = (crate::panel::INPUT_RADIUS_DIP * self.scale).round() as i32;
-        let colours =
-            crate::panel::field_colours(self.field_state, self.brushes.surface_rgba());
-        painter.fill_round(field, field_radius, &self.brushes.field_fill);
+        // Only the name field is wired to focus so far, so the path row is painted idle until the
+        // stage that gives it a child window of its own.
+        for (row, state) in [
+            (crate::panel::Row::Path, crate::panel::FieldState::Idle),
+            (crate::panel::Row::Name, self.field_state),
+        ] {
+            let field = crate::panel::field_rect(self.metrics, self.rects, self.scale, row);
+            let colours = crate::panel::field_colours(state, self.brushes.surface_rgba());
+            painter.fill_round(field, field_radius, &self.brushes.field_fill);
 
-        // `:167` idle is transparent, so this branch simply does not run there.
-        if let Some(border) = self.brushes.field_brush(colours.border) {
-            painter.stroke_round(field, field_radius, border, line);
-        }
-        // `:169` — focus adds a one dip ring inside the border, which the native control cannot
-        // draw for itself.
-        if let Some(ring_brush) = colours.inset.and_then(|c| self.brushes.field_brush(c)) {
-            let ring = (crate::panel::EDIT_INSET_DIP * self.scale).round() as i32;
-            painter.stroke_round(
-                Rect::new(
-                    field.left + ring,
-                    field.top + ring,
-                    field.right - ring,
-                    field.bottom - ring,
-                ),
-                (field_radius - ring).max(0),
-                ring_brush,
-                line,
-            );
+            // `:167` idle is transparent, so this branch simply does not run there.
+            if let Some(border) = self.brushes.field_brush(colours.border) {
+                painter.stroke_round(field, field_radius, border, line);
+            }
+            // `:169` — focus adds a one dip ring inside the border, which the native control cannot
+            // draw for itself.
+            if let Some(ring_brush) = colours.inset.and_then(|c| self.brushes.field_brush(c)) {
+                let ring = (crate::panel::EDIT_INSET_DIP * self.scale).round() as i32;
+                painter.stroke_round(
+                    Rect::new(
+                        field.left + ring,
+                        field.top + ring,
+                        field.right - ring,
+                        field.bottom - ring,
+                    ),
+                    (field_radius - ring).max(0),
+                    ring_brush,
+                    line,
+                );
+            }
         }
 
         if let Some((text, format)) = self.title {
