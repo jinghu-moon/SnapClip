@@ -649,19 +649,36 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
             field_state: snapclip_ui::panel::FieldState::Idle,
             name_edit: std::ptr::null_mut(),
             path_edit: std::ptr::null_mut(),
+            size_width_edit: std::ptr::null_mut(),
+            size_height_edit: std::ptr::null_mut(),
             fill_brush,
         }));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
 
-        // Both fields: real `EDIT` children, each inset inside the frame the frame painter draws for
-        // its own row (`:542` is the path row, `:556` the name row). Their font is the embedded
-        // subset registered for GDI, so the native controls and the drawn panel share one face
-        // without installing anything on the machine.
-        let name_edit = create_field_edit(hwnd, snapclip_ui::panel::Row::Name, "捕获");
-        let path_edit = create_field_edit(hwnd, snapclip_ui::panel::Row::Path, "");
+        // Four fields, one constructor: real `EDIT` children, each inset inside the frame the frame
+        // painter draws for its own rect (`:542` the path row, `:556` the name row, `:235` the two
+        // size cells). Their font is the embedded subset registered for GDI, so the native controls
+        // and the drawn panel share one face without installing anything on the machine.
+        //
+        // The size cells start empty. The design shows the captured dimensions there, and those come
+        // from the selection the panel was opened with, which is not plumbed into the options yet.
+        let dpi = windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd).max(96);
+        let scale = (f64::from(dpi) / 96.0) as f32;
+        let metrics = snapclip_ui::panel::DEMO;
+        let rects = metrics.rects(scale);
+        let slot = |row| snapclip_ui::panel::field_rect(&metrics, &rects, scale, row);
+        let cell = |c| snapclip_ui::panel::size_cell_rect(&metrics, &rects, scale, c);
+        let name_edit = create_field_edit(hwnd, slot(snapclip_ui::panel::Row::Name), "捕获");
+        let path_edit = create_field_edit(hwnd, slot(snapclip_ui::panel::Row::Path), "");
+        let size_width_edit =
+            create_field_edit(hwnd, cell(snapclip_ui::panel::SizeCell::Width), "");
+        let size_height_edit =
+            create_field_edit(hwnd, cell(snapclip_ui::panel::SizeCell::Height), "");
         if let Some(s) = (state as *mut WindowState).as_mut() {
             s.name_edit = name_edit;
             s.path_edit = path_edit;
+            s.size_width_edit = size_width_edit;
+            s.size_height_edit = size_height_edit;
         }
 
         ShowWindow(hwnd, SW_SHOW);
@@ -735,6 +752,10 @@ struct WindowState {
     /// The path field's child window, once it exists. Both fields go through one constructor and one
     /// frame loop (`snapclip_ui::panel::field_rect`), so the second field is not a copy of the first.
     path_edit: windows_sys::Win32::Foundation::HWND,
+    /// The two size cells of the second row. Created but not yet wired for focus: `WM_COMMAND`
+    /// still answers only for the name field, which is the interaction stage's job.
+    size_width_edit: windows_sys::Win32::Foundation::HWND,
+    size_height_edit: windows_sys::Win32::Foundation::HWND,
     /// The captured picture, handed to the frame painter so the preview card shows the real
     /// selection rather than a stand-in.
     preview: Option<(Vec<u8>, u32, u32)>,
@@ -754,7 +775,7 @@ struct WindowState {
 #[allow(unsafe_code)]
 fn create_field_edit(
     parent: windows_sys::Win32::Foundation::HWND,
-    row: snapclip_ui::panel::Row,
+    field: snapclip_model::geometry::Rect,
     text: &str,
 ) -> windows_sys::Win32::Foundation::HWND {
     use windows_sys::Win32::Graphics::Gdi::{
@@ -782,9 +803,6 @@ fn create_field_edit(
 
         let dpi = GetDpiForWindow(parent).max(96);
         let scale = f64::from(dpi) / 96.0;
-        let metrics = snapclip_ui::panel::DEMO;
-        let rects = metrics.rects(scale as f32);
-        let field = snapclip_ui::panel::field_rect(&metrics, &rects, scale as f32, row);
         let inset = (f64::from(snapclip_ui::panel::EDIT_INSET_DIP) * scale).round() as i32;
 
         let family: Vec<u16> = snapclip_ui::panel::FAMILY

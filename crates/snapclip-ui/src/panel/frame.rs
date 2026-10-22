@@ -751,6 +751,36 @@ mod tests {
     }
 
     /// An idle directory field is filled and carries no visible border, by position and colour.
+    /// A field slot while idle: filled with `--fill` over the surface, and with no border anywhere on
+    /// its top edge or its left edge. The design keeps the border transparent until the field is
+    /// focused (`:167`), so an idle field is fill only, and a test that checked only the fill would
+    /// pass for a field that had grown a border.
+    fn assert_idle_field(px: &Bgra8, field: snapclip_model::geometry::Rect, what: &str) {
+        assert_px(
+            px,
+            field.left + 40,
+            field.top + 8,
+            fill_rgb(41, 41, 46),
+            3,
+            what,
+        );
+        // The three colours a border could be, taken from the rule itself rather than copied.
+        let border_px: Vec<Px> = [
+            crate::panel::field_colours(crate::panel::FieldState::Focused, DEMO_PALETTE.surface).border,
+            crate::panel::field_colours(crate::panel::FieldState::Error, DEMO_PALETTE.surface).border,
+            crate::panel::field_colours(crate::panel::FieldState::Warning, DEMO_PALETTE.surface).border,
+        ]
+        .iter()
+        .map(|b| Px { b: b[2], g: b[1], r: b[0], a: b[3] })
+        .collect();
+        for x in field.left..field.right {
+            assert_not_any(px, x, field.top, &border_px, 24, what);
+        }
+        for y in field.top..field.bottom {
+            assert_not_any(px, field.left, y, &border_px, 24, what);
+        }
+    }
+
     #[test]
     fn the_directory_field_is_filled_and_has_no_border_when_idle() {
         let canvas = Canvas::new(920, 520);
@@ -758,16 +788,22 @@ mod tests {
         let px = canvas.pixels();
         let rects = DEMO.rects(1.0);
         let field = crate::panel::path_field_rect(&DEMO, &rects, 1.0);
-        let fill = Px { b: 46, g: 41, r: 41, a: 255 };
-        assert_px(
-            &px,
-            field.left + 40,
-            field.top + 8,
-            fill,
-            3,
-            "an idle directory field must be filled with --fill over the surface",
-        );
+        assert_idle_field(&px, field, "an idle directory field");
+    }
 
+    #[test]
+    fn the_size_cells_are_filled_and_have_no_border_when_idle() {
+        let canvas = Canvas::new(920, 520);
+        canvas.render();
+        let px = canvas.pixels();
+        let rects = DEMO.rects(1.0);
+        for (cell, what) in [
+            (crate::panel::SizeCell::Width, "an idle width cell"),
+            (crate::panel::SizeCell::Height, "an idle height cell"),
+        ] {
+            let field = crate::panel::size_cell_rect(&DEMO, &rects, 1.0, cell);
+            assert_idle_field(&px, field, what);
+        }
     }
     use super::*;
     use windows::Win32::Graphics::DirectWrite::DWRITE_FACTORY_TYPE_ISOLATED;
@@ -1148,6 +1184,8 @@ mod tests {
             *px.add(3) = 255;
         }
         let got = canvas.pixels().pixel(0, 0);
+        // Deliberately not `fill_rgb`: this is the assertion that pins the channel order, and routing it
+        // through the helper would make it compare the helper with itself.
         assert_eq!(got, Px { b: 0, g: 0, r: 255, a: 255 }, "the DIB stores BGRA, blue first");
     }
 
@@ -1212,7 +1250,7 @@ mod tests {
         let rects = DEMO.rects(1.0);
         let field = crate::panel::name_field_rect(&DEMO, &rects, 1.0);
         // The fill the frame paints and the child is given: `--fill` over the surface.
-        let fill = Px { b: 46, g: 41, r: 41, a: 255 };
+        let fill = fill_rgb(41, 41, 46);
         assert!(
             !close(fill, surface_px(), 3),
             "the fill has to differ from the surface, or an idle field would be invisible"
@@ -1255,7 +1293,7 @@ mod tests {
         let px = canvas.pixels();
         let rects = DEMO.rects(1.0);
         let field = crate::panel::name_field_rect(&DEMO, &rects, 1.0);
-        let accent = Px { b: 219, g: 117, r: 31, a: 255 };
+        let accent = fill_rgb(31, 117, 219);
         let ring = (crate::panel::EDIT_INSET_DIP * 1.0).round() as i32;
         let mid_x = (field.left + field.right) / 2;
 
@@ -1397,8 +1435,8 @@ mod tests {
         let at = |cx: i32, cy: i32| {
             px.pixel(rects.preview.left + cx * tile + tile / 2, rects.preview.top + cy * tile + tile / 2)
         };
-        let light = Px { b: 62, g: 54, r: 50, a: 255 };
-        let dark = Px { b: 42, g: 36, r: 33, a: 255 };
+        let light = fill_rgb(50, 54, 62);
+        let dark = fill_rgb(33, 36, 42);
         let is_checker = |p: Px| close(p, light, 6) || close(p, dark, 6);
 
         let a = at(0, 0);
@@ -1534,8 +1572,8 @@ mod tests {
             ),
         );
         // The picture is not enlarged, so source pixels map one to one from the fitted origin.
-        let red = Px { b: 0, g: 0, r: 255, a: 255 };
-        let blue = Px { b: 255, g: 0, r: 0, a: 255 };
+        let red = fill_rgb(255, 0, 0);
+        let blue = fill_rgb(0, 0, 255);
         let at = |sx: i32, sy: i32| (left.round() as i32 + sx, top.round() as i32 + sy);
         let (rx, ry) = at(20, 20);
         let (bx, by) = at(w as i32 - 20, h as i32 - 20);
