@@ -15,7 +15,9 @@
 //! - `.text-input { padding: 0 10px; height: 32px }` (:167)
 
 use crate::panel::frame::{FrameMetrics, FrameRects};
-use snapclip_model::geometry::Rect;
+use crate::panel::interaction::PointerEvent;
+use crate::panel::segmented::{Segment, SegmentState};
+use snapclip_model::geometry::{Point, Rect};
 
 /// How far the native `EDIT` sits inside its frame, in dip. One and a half, so a one dip border
 /// plus the inset leaves the rounded corner visible at every DPI we support without the child
@@ -485,6 +487,53 @@ pub fn quality_option_rect(
     }
 }
 
+/// The quality control's interaction state, built from the **same rectangles the painter draws**.
+///
+/// Hit testing and drawing therefore cannot drift apart: both ask this one geometry, so a click
+/// lands on the option whose block the user can see. The state machine that owns `selected`,
+/// `pressed` and `hovered` is `segmented`'s, not a second one written here.
+pub fn quality_segment_state(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    chosen: usize,
+) -> SegmentState {
+    SegmentState {
+        track: quality_seg_rect(metrics, rects, scale),
+        segments: (0..QUALITY_OPTIONS)
+            .map(|index| Segment {
+                rect: quality_option_rect(metrics, rects, scale, index),
+                selected: index == chosen,
+                disabled: false,
+            })
+            .collect(),
+        hovered: None,
+        pressed: None,
+        focused: false,
+        slide: None,
+    }
+}
+
+/// Which option the state marks as chosen. The selection lives in the state's `selected` flags —
+/// written only by `pointer_event` — so this is a read of that one source rather than a second copy
+/// of the answer kept beside it.
+pub fn chosen_quality(state: &SegmentState) -> usize {
+    state
+        .segments
+        .iter()
+        .position(|segment| segment.selected)
+        .unwrap_or(0)
+}
+
+/// Feed one pointer event to the quality control and report the newly chosen option, if the event
+/// changed it. A press that is released on a different option changes nothing, which is what the
+/// press-and-release pairing in `segmented` exists to express.
+pub fn quality_pointer(state: &mut SegmentState, event: PointerEvent, point: Point) -> Option<usize> {
+    let before = chosen_quality(state);
+    let activated = state.pointer_event(event, point)?;
+    (chosen_quality(state) != before).then_some(activated)
+}
+
 /// How many fields take part in tab navigation. The real window keeps this number true by creating
 /// exactly that many `WS_TABSTOP` children; the test pins it so adding a field without adding it
 /// here fails rather than silently changing the tab order.
@@ -813,5 +862,133 @@ mod tests {
     /// The local shorthand, so the tests read like the design rather than like `crate::panel::DEMO`.
     fn metrics() -> FrameMetrics {
         crate::panel::DEMO
+    }
+
+    /// The centre of one option, which is a point the user can see and therefore aim at.
+    fn option_centre(scale: f32, index: usize) -> Point {
+        let metrics = metrics();
+        let rects = metrics.rects(scale);
+        let rect = quality_option_rect(&metrics, &rects, scale, index);
+        Point::new(
+            (rect.left + rect.right) / 2,
+            (rect.top + rect.bottom) / 2,
+        )
+    }
+
+    /// The hit rectangles are the drawn rectangles, because the state is built from the same
+    /// producer. A second geometry here is how a click would land on the option next to the one the
+    /// user aimed at, and it would look like a drawing bug rather than a hit testing one.
+    #[test]
+    fn the_hit_rectangles_are_the_rectangles_that_are_drawn() {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let metrics = metrics();
+            let rects = metrics.rects(scale);
+            let state = quality_segment_state(&metrics, &rects, scale, 0);
+
+            assert_eq!(
+                state.track,
+                quality_seg_rect(&metrics, &rects, scale),
+                "the track is the drawn track"
+            );
+            assert_eq!(
+                state.segments.len(),
+                QUALITY_OPTIONS,
+                "one hit rectangle per drawn option (:641-:643)"
+            );
+            for index in 0..QUALITY_OPTIONS {
+                assert_eq!(
+                    state.segments[index].rect,
+                    quality_option_rect(&metrics, &rects, scale, index),
+                    "option {index}'s hit rectangle is the one it is drawn at (:265, :266)"
+                );
+                assert_eq!(
+                    state.target_at(option_centre(scale, index)),
+                    Some(index),
+                    "the centre of option {index} must hit option {index}"
+                );
+            }
+        }
+    }
+
+    /// The chosen option is a press and a release on the same option. This is the control's whole
+    /// contract, and it is `segmented`'s state machine that enforces it rather than a rule here.
+    #[test]
+    fn clicking_the_second_option_selects_it() {
+        let metrics = metrics();
+        let rects = metrics.rects(1.0);
+        let mut state = quality_segment_state(&metrics, &rects, 1.0, 0);
+        assert_eq!(chosen_quality(&state), 0, "the panel opens on the first option");
+
+        let second = option_centre(1.0, 1);
+        assert_eq!(
+            quality_pointer(&mut state, PointerEvent::Down, second),
+            None,
+            "a press chooses nothing on its own"
+        );
+        assert_eq!(
+            quality_pointer(&mut state, PointerEvent::Up, second),
+            Some(1),
+            "releasing on the same option chooses it"
+        );
+        assert_eq!(chosen_quality(&state), 1, "the chosen option moved to the second");
+        assert!(
+            !state.segments[0].selected,
+            "and only one option is chosen at a time"
+        );
+    }
+
+    /// Pressing one option and releasing over another is not a choice, and neither is a press that
+    /// never got a release. Both are the state machine's, and both would be lost by a hit test that
+    /// answered on the press alone.
+    #[test]
+    fn a_press_released_elsewhere_chooses_nothing() {
+        let metrics = metrics();
+        let rects = metrics.rects(1.0);
+        let mut state = quality_segment_state(&metrics, &rects, 1.0, 0);
+
+        quality_pointer(&mut state, PointerEvent::Down, option_centre(1.0, 0));
+        assert_eq!(
+            quality_pointer(&mut state, PointerEvent::Up, option_centre(1.0, 2)),
+            None,
+            "a release over a different option chooses nothing"
+        );
+        assert_eq!(chosen_quality(&state), 0, "and the chosen option does not move");
+
+        quality_pointer(&mut state, PointerEvent::Down, option_centre(1.0, 2));
+        assert_eq!(
+            quality_pointer(&mut state, PointerEvent::Cancel, option_centre(1.0, 2)),
+            None,
+            "a cancelled press chooses nothing"
+        );
+        assert_eq!(chosen_quality(&state), 0);
+    }
+
+    /// Every option is reachable, not just the two the other tests use. The design has three
+    /// (`:641`-`:643`) and the width arithmetic is what decides whether the last one is inside the
+    /// track at all.
+    ///
+    /// Each round starts on a **different** option, because choosing the option that is already
+    /// chosen is not a change and the contract above says so: `quality_pointer` reports a new
+    /// choice, not a repeated one.
+    #[test]
+    fn every_option_can_be_chosen_by_clicking_it() {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let metrics = metrics();
+            let rects = metrics.rects(scale);
+
+            for index in 0..QUALITY_OPTIONS {
+                let start = (index + 1) % QUALITY_OPTIONS;
+                let mut state = quality_segment_state(&metrics, &rects, scale, start);
+                let point = option_centre(scale, index);
+
+                quality_pointer(&mut state, PointerEvent::Down, point);
+                assert_eq!(
+                    quality_pointer(&mut state, PointerEvent::Up, point),
+                    Some(index),
+                    "option {index} must be clickable at {scale}"
+                );
+                assert_eq!(chosen_quality(&state), index);
+            }
+        }
     }
 }

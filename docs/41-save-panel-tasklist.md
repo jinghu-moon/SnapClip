@@ -662,7 +662,6 @@ cargo run -p codec-bench --release -- --assert
 | # | 缺口 | 落点 | 归属批次 |
 | --- | --- | --- | --- |
 | A1 | 两个尺寸格**起始为空** ✗（设计显示截图尺寸 ✓，尚未接进 `ShellOptions` ✗） | 选区宽高 → `ShellOptions.preview` 那条链路 ✓（**不要编造数字** ✗） | 尺寸格接数字 ✓ |
-| A3 | **分段器不可点** ✗（`quality` 是 `Frame` 上的索引 ✓，调用方恒传 0 ✓） | 复用 `segmented.rs` 的 `SegmentState` / `pointer_event` / `target_at` ✓ | 交互批 ✓ |
 | A4 | **`.link-hub` 与两个 ghost 按钮未画** ✗（`更改` ✓ / 文件夹图标 ✓） | 同上 ✓（**画了不接就是假控件** ✗） | 交互批 ✓ |
 | A5 | **`保存后` 的两个 chip 未画** ✗（高 24 ✓、行内 gap 12 ✓、chip 间 gap 8 ✓ 均已量 ✓） | 同上 ✓ | 交互批 ✓ |
 | A6 | **尺寸行还有两个模式钮（`数值`/`百分比`，`:585`–`:586` ✓）与一个重置钮（`:589` ✓）** ✗ —— 它们的宽度**会影响尺寸行的横向切分** ✗ | `size_cell_rect` 让出 label 与钮的宽度 ✓ | 与 A1 同批 ✓（省一次切分改动 ✓） |
@@ -791,3 +790,19 @@ cargo run -p codec-bench --release -- --assert
 **变异** ✓（`ROW_DIP: 28 → 32` ✗）：`assertion left == right failed: --row, the design's own content height for a segment or estimate row (:47) / left: 32 / right: 28` ✓；还原后 `sha identical: True` ✓、**89 passed / 0 failed** ✓。
 
 **① 缺口分诊** ✓：把散在各批末尾的「新增已知缺口」收进**一个**待办视图 ✓（A 还没做 8 条 ✓ / B 做不了或有意不做 3 条 ✓ / C 未来会变成 bug 1 条 ✓），每条带**落点**与**归属批次** ✓，已完成的**划掉** ✓ —— 目的：它**不能变成只增不减的清单** ✗。
+
+### 交互批其二（本批）：分段器可点（A3 ✓ 已划掉）
+
+**接的是现成件** ✓：`segmented.rs` 的 `SegmentState` / `target_at` / `pointer_event` ✓ —— **没有写第二套命中测试** ✗。命中矩形与绘制矩形都来自 `field.rs` 的 `quality_option_rect` ✓（`quality_segment_state` 一处构造 ✓）⇒ 点击落在**看得见的那一档**上 ✓。
+
+**单一写者** ✓：选中的档位**只存在 `SegmentState.selected` 里** ✓（由 `pointer_event` 写 ✓），窗口侧只提供 `chosen_quality()` 读取 ✓（`field.rs` 的 `chosen_quality` ✓）—— 没有"索引 + 状态"两份答案 ✓。
+
+**索引如何到达绘制** ✓：`paint_to_dc_with_preview` / `paint_to_target_with_preview` / `PanelRenderer::paint_with_preview` 各加一个 `quality: usize` ✓，旧的 `_with_state` / `paint_to_target` 委托 **0** ✓ ⇒ 既有测试**一行未改** ✓。
+
+**窗口侧** ✓：`WindowState` 加 `segment` ✓ + `segment_scale` ✓；`WM_LBUTTONDOWN` / `WM_LBUTTONUP` 取 `lParam` 的**客户区像素** ✓（分段器几何本来就是像素 ✓ —— `rects(scale)` 已换算 ✓ ⇒ **没有二次换算** ✗），选中变化才 `InvalidateRect` ✓。
+
+**测试** ✓（`ui` **97/0** ✓，`app` **211/0/9** ✓）：`the_hit_rectangles_are_the_rectangles_that_are_drawn` ✓（四 DPI ✓ 每档中心命中自己 ✓）· `clicking_the_second_option_selects_it` ✓ · `a_press_released_elsewhere_chooses_nothing` ✓ · `every_option_can_be_chosen_by_clicking_it` ✓ · `clicking_an_option_moves_the_block_the_painter_draws` ✓（**点击 → 索引 → 位图** 一条链 ✓）· `the_window_is_the_only_writer_of_the_quality_choice` ✓ · `a_scale_change_rebuilds_the_geometry_and_keeps_the_choice` ✓。
+
+**两条变异都真红** ✓（备份逐字节比对 ✓ + 见到 `Compiling` ✓）：命中矩形取自**轨道** ✗ ⇒ 四条红 ✓（`option 0's hit rectangle is the one it is drawn at (:265, :266)` ✓）；画家**忽略索引**、恒画第 0 档 ✗ ⇒ `clicking_an_option_moves_the_block_the_painter_draws` 红 ✓（`expected Px { b: 219, g: 117, r: 31 } saw Px { b: 46, g: 41, r: 41 }` ✓）。
+
+**一处自己的失手** ✗：第一次写测试时让"点击**已选中**的档位"也期望 `Some(index)` ✓，而契约是"**报告新选择，而不是重复的选择**" ✓ ⇒ 是**测试错了** ✓（不是代码 ✓），改成从**另一档**起手 ✓。另：还原脚本第一次**解析失败** ✗ ⇒ 整段**没执行** ✓ ⇒ 靠"检查文件当前状态"发现 ✓（**脚本没跑 ≠ 跑失败** ✗，这种要按"变异没发生"处理 ✓）。

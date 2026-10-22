@@ -642,6 +642,11 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
         .fill;
         let fill_colour = u32::from(fill[0]) | (u32::from(fill[1]) << 8) | (u32::from(fill[2]) << 16);
         let fill_brush = windows_sys::Win32::Graphics::Gdi::CreateSolidBrush(fill_colour);
+        // The quality control starts on the first option, at this window's scale. It is built here
+        // rather than lazily so the first paint has a real choice to mark.
+        let scale = dpi_scale(hwnd);
+        let metrics = snapclip_ui::panel::DEMO;
+        let rects = metrics.rects(scale);
         let state = Box::into_raw(Box::new(WindowState {
             backdrop,
             renderer,
@@ -649,6 +654,8 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
             fields: snapclip_ui::panel::FieldStates::IDLE,
             controls: [std::ptr::null_mut(); snapclip_ui::panel::FieldId::ALL.len()],
             fill_brush,
+            segment: snapclip_ui::panel::quality_segment_state(&metrics, &rects, scale, 0),
+            segment_scale: scale,
         }));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
 
@@ -757,6 +764,14 @@ struct WindowState {
     /// the default white would show as a lit rectangle, so the field's resolved fill is handed over
     /// instead. Created once and owned by this state.
     fill_brush: windows_sys::Win32::Graphics::Gdi::HBRUSH,
+    /// The quality control's state. Its geometry comes from the same producer the painter draws
+    /// with, so a click lands on the option whose block the user can see, and its selection is owned
+    /// by `segmented`'s state machine rather than by a second set of rules here. The chosen option is
+    /// read from this, never kept beside it.
+    segment: snapclip_ui::panel::SegmentState,
+    /// The scale the segment geometry was built at. The rectangles are pixels, so a window that
+    /// moves between monitors has to rebuild them.
+    segment_scale: f32,
 }
 
 impl WindowState {
@@ -798,6 +813,41 @@ impl WindowState {
             .iter()
             .position(|candidate| *candidate == id)
             .expect("every field is in the list")
+    }
+
+    /// The option the quality control marks as chosen.
+    fn chosen_quality(&self) -> usize {
+        snapclip_ui::panel::chosen_quality(&self.segment)
+    }
+
+    /// The segment's state at this scale, rebuilt when the scale has moved since it was built. What
+    /// the user picked survives the rebuild: a DPI change must not change the choice.
+    fn segment_at_scale(&mut self, scale: f32) -> &mut snapclip_ui::panel::SegmentState {
+        if self.segment_scale != scale {
+            let metrics = snapclip_ui::panel::DEMO;
+            let rects = metrics.rects(scale);
+            let chosen = self.chosen_quality();
+            self.segment =
+                snapclip_ui::panel::quality_segment_state(&metrics, &rects, scale, chosen);
+            self.segment_scale = scale;
+        }
+        &mut self.segment
+    }
+
+    /// Feed one pointer event to the quality control, and report whether the choice changed.
+    ///
+    /// This is the only writer of the chosen option. Both the hit rectangles and the drawn
+    /// rectangles come from `snapclip_ui::panel`, and the press-and-release pairing is the state
+    /// machine's, so this adds no second opinion about either.
+    fn quality_pointer(
+        &mut self,
+        scale: f32,
+        event: snapclip_ui::panel::PointerEvent,
+        point: snapclip_model::geometry::Point,
+    ) -> bool {
+        let before = self.chosen_quality();
+        let chosen = snapclip_ui::panel::quality_pointer(self.segment_at_scale(scale), event, point);
+        chosen.is_some() && self.chosen_quality() != before
     }
 }
 
@@ -975,12 +1025,13 @@ extern "system" fn window_proc(
     unsafe {
     use windows_sys::Win32::Foundation::RECT;
     use windows_sys::Win32::Graphics::Gdi::{
-        BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, PAINTSTRUCT,
+        BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, InvalidateRect, PAINTSTRUCT,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         DefWindowProcW, DestroyWindow, GetWindowLongPtrW, PostQuitMessage, SetWindowPos,
         GWLP_USERDATA, HTCLIENT, HTCAPTION, SWP_NOACTIVATE, SWP_NOZORDER, WM_CLOSE, WM_DESTROY,
-        WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_NCCALCSIZE, WM_NCHITTEST, WM_PAINT,
+        WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_NCCALCSIZE,
+        WM_NCHITTEST, WM_PAINT,
     };
 
     match message {
@@ -1031,6 +1082,7 @@ extern "system" fn window_proc(
                             !s.backdrop,
                             s.fields,
                             s.preview.as_ref().map(|(bgra, w, h)| (bgra.as_slice(), *w, *h)),
+                            s.chosen_quality(),
                         )
                         .is_ok();
                 }
@@ -1046,6 +1098,28 @@ extern "system" fn window_proc(
                 DeleteObject(brush);
             }
             EndPaint(hwnd, &paint);
+            0
+        }
+        // The quality control is drawn by the frame rather than being a child window, so its clicks
+        // arrive here. The coordinates in `lParam` are client pixels, and the segment's rectangles
+        // are pixels too — `rects(scale)` has already converted every dip — so the point is used as
+        // it arrives and no conversion happens twice.
+        WM_LBUTTONDOWN | WM_LBUTTONUP => {
+            let point = snapclip_model::geometry::Point::new(
+                (lparam & 0xffff) as i16 as i32,
+                ((lparam >> 16) & 0xffff) as i16 as i32,
+            );
+            let event = if message == WM_LBUTTONDOWN {
+                snapclip_ui::panel::PointerEvent::Down
+            } else {
+                snapclip_ui::panel::PointerEvent::Up
+            };
+            let chosen = state_mut(hwnd)
+                .map(|s| s.quality_pointer(dpi_scale(hwnd), event, point))
+                .unwrap_or(false);
+            if chosen {
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+            }
             0
         }
         WM_DPICHANGED => {
@@ -1241,6 +1315,13 @@ mod tests {
             controls: [std::ptr::null_mut(); snapclip_ui::panel::FieldId::ALL.len()],
             preview: None,
             fill_brush: std::ptr::null_mut(),
+            segment: snapclip_ui::panel::quality_segment_state(
+                &snapclip_ui::panel::DEMO,
+                &snapclip_ui::panel::DEMO.rects(1.0),
+                1.0,
+                0,
+            ),
+            segment_scale: 1.0,
         };
 
         // Every field has its own slot: no two fields share an index, which is what would let one
@@ -1275,6 +1356,105 @@ mod tests {
                 assert_eq!(state.control(id), std::ptr::null_mut(), "{id:?} was not registered");
             }
         }
+    }
+
+    /// The window's own writer for the quality choice: a click on an option changes it, a click
+    /// anywhere else does not, and a press released over a different option is not a choice.
+    ///
+    /// This is the half the `snapclip-ui` test cannot reach, because the choice belongs to the
+    /// window that receives the messages rather than to the frame that draws the block.
+    #[test]
+    fn the_window_is_the_only_writer_of_the_quality_choice() {
+        let mut state = WindowState {
+            backdrop: false,
+            renderer: None,
+            fields: snapclip_ui::panel::FieldStates::IDLE,
+            controls: [std::ptr::null_mut(); snapclip_ui::panel::FieldId::ALL.len()],
+            preview: None,
+            fill_brush: std::ptr::null_mut(),
+            segment: snapclip_ui::panel::quality_segment_state(
+                &snapclip_ui::panel::DEMO,
+                &snapclip_ui::panel::DEMO.rects(1.0),
+                1.0,
+                0,
+            ),
+            segment_scale: 1.0,
+        };
+
+        let centre = |index: usize| {
+            let metrics = snapclip_ui::panel::DEMO;
+            let rects = metrics.rects(1.0);
+            let rect = snapclip_ui::panel::quality_option_rect(&metrics, &rects, 1.0, index);
+            snapclip_model::geometry::Point::new(
+                (rect.left + rect.right) / 2,
+                (rect.top + rect.bottom) / 2,
+            )
+        };
+
+        assert_eq!(state.chosen_quality(), 0, "the panel opens on the first option");
+
+        // A click on the second option: press and release on the same one.
+        state.quality_pointer(1.0, snapclip_ui::panel::PointerEvent::Down, centre(1));
+        assert!(
+            state.quality_pointer(1.0, snapclip_ui::panel::PointerEvent::Up, centre(1)),
+            "clicking an option is a change the window has to repaint"
+        );
+        assert_eq!(state.chosen_quality(), 1);
+
+        // Clicking the option that is already chosen is not a change, so nothing needs repainting.
+        state.quality_pointer(1.0, snapclip_ui::panel::PointerEvent::Down, centre(1));
+        assert!(
+            !state.quality_pointer(1.0, snapclip_ui::panel::PointerEvent::Up, centre(1)),
+            "choosing what is already chosen is not a change"
+        );
+        assert_eq!(state.chosen_quality(), 1);
+
+        // A press released elsewhere is not a choice either.
+        state.quality_pointer(1.0, snapclip_ui::panel::PointerEvent::Down, centre(0));
+        assert!(!state.quality_pointer(1.0, snapclip_ui::panel::PointerEvent::Up, centre(2)));
+        assert_eq!(state.chosen_quality(), 1);
+
+        // And a click that misses the track entirely changes nothing.
+        assert!(!state.quality_pointer(
+            1.0,
+            snapclip_ui::panel::PointerEvent::Down,
+            snapclip_model::geometry::Point::new(0, 0)
+        ));
+    }
+
+    /// The scale the geometry was built at is remembered, so a window that moves to a monitor with
+    /// a different scale rebuilds the rectangles without losing the choice.
+    #[test]
+    fn a_scale_change_rebuilds_the_geometry_and_keeps_the_choice() {
+        let mut state = WindowState {
+            backdrop: false,
+            renderer: None,
+            fields: snapclip_ui::panel::FieldStates::IDLE,
+            controls: [std::ptr::null_mut(); snapclip_ui::panel::FieldId::ALL.len()],
+            preview: None,
+            fill_brush: std::ptr::null_mut(),
+            segment: snapclip_ui::panel::quality_segment_state(
+                &snapclip_ui::panel::DEMO,
+                &snapclip_ui::panel::DEMO.rects(1.0),
+                1.0,
+                2,
+            ),
+            segment_scale: 1.0,
+        };
+
+        let metrics = snapclip_ui::panel::DEMO;
+        let before = snapclip_ui::panel::quality_option_rect(&metrics, &metrics.rects(1.0), 1.0, 0);
+
+        // Touch the state at a different scale, which is what a DPI change does.
+        let _ = state.segment_at_scale(1.5);
+        let after = snapclip_ui::panel::quality_option_rect(&metrics, &metrics.rects(1.5), 1.5, 0);
+
+        assert_eq!(state.segment_scale, 1.5, "the new scale is remembered");
+        assert_eq!(state.chosen_quality(), 2, "a DPI change must not change the choice");
+        assert!(
+            after.left > before.left,
+            "and the rectangles really were rebuilt at the new scale"
+        );
     }
 
     /// A policy that counts its own invocations, because D12 promises "exactly once".

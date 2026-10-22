@@ -669,11 +669,14 @@ pub fn paint_to_dc_with_state(
     fill_surface: bool,
     fields: crate::panel::FieldStates,
 ) -> Result<()> {
-    paint_to_dc_with_preview(factory, dwrite, hdc, area, dpi, fill_surface, fields, None)
+    paint_to_dc_with_preview(factory, dwrite, hdc, area, dpi, fill_surface, fields, None, 0)
 }
 
 /// [`paint_to_dc_with_state`] with a captured picture for the preview card. The old signature
 /// delegates here with `None`, so nothing that already calls it changes.
+///
+/// `quality` is the option the segmented control marks as chosen. It travels with the paint call
+/// rather than living in the frame, because it belongs to the window that receives the clicks.
 #[allow(clippy::too_many_arguments)]
 pub fn paint_to_dc_with_preview(
     factory: &ID2D1Factory,
@@ -684,6 +687,7 @@ pub fn paint_to_dc_with_preview(
     fill_surface: bool,
     fields: crate::panel::FieldStates,
     preview: Option<(&[u8], u32, u32)>,
+    quality: usize,
 ) -> Result<()> {
     // DPI 96 on the target, deliberately: `rects(scale)` below already converts every dip to a
     // pixel, so a target carrying the real DPI would scale those pixels a second time. That is
@@ -730,7 +734,7 @@ pub fn paint_to_dc_with_preview(
         chip: Some(&chip),
         fields,
         preview: preview.as_ref().map(|(b, w, h)| (b, *w, *h)),
-        quality: 0,
+        quality,
     }
     .paint(&painter);
     unsafe { target.EndDraw(None, None)? };
@@ -749,7 +753,7 @@ pub fn paint_to_target(
     dpi: f32,
     fill_surface: bool,
 ) -> Result<FrameRects> {
-    paint_to_target_with_preview(target, dwrite, dpi, fill_surface, None)
+    paint_to_target_with_preview(target, dwrite, dpi, fill_surface, None, 0)
 }
 
 /// [`paint_to_target`] with a captured picture for the preview card. The old signature delegates
@@ -760,6 +764,7 @@ pub fn paint_to_target_with_preview(
     dpi: f32,
     fill_surface: bool,
     preview: Option<(&[u8], u32, u32)>,
+    quality: usize,
 ) -> Result<FrameRects> {
     let brushes = FrameBrushes::new(target, &DEMO_PALETTE)?;
     let scale = (dpi / 96.0).max(0.5);
@@ -792,7 +797,7 @@ pub fn paint_to_target_with_preview(
         chip: Some(&chip),
         fields: crate::panel::FieldStates::IDLE,
         preview: preview.as_ref().map(|(b, w, h)| (b, *w, *h)),
-        quality: 0,
+        quality,
     }
     .paint(&painter);
     unsafe { target.EndDraw(None, None)? };
@@ -915,6 +920,55 @@ mod tests {
             "the track has to extend past the last option, or the insets are not being applied"
         );
     }
+    /// A click and the picture it produces, in one test. The state machine chooses the option and
+    /// the painter is told that choice; splitting the two is how a control ends up clickable but
+    /// unchanged on screen, which is the one failure of a self drawn control that no return value
+    /// reports.
+    #[test]
+    fn clicking_an_option_moves_the_block_the_painter_draws() {
+        let rects = DEMO.rects(1.0);
+        let mut state = crate::panel::quality_segment_state(&DEMO, &rects, 1.0, 0);
+        let second = crate::panel::quality_option_rect(&DEMO, &rects, 1.0, 1);
+        let aim = snapclip_model::geometry::Point::new(
+            (second.left + second.right) / 2,
+            (second.top + second.bottom) / 2,
+        );
+
+        crate::panel::quality_pointer(&mut state, crate::panel::PointerEvent::Down, aim);
+        assert_eq!(
+            crate::panel::quality_pointer(&mut state, crate::panel::PointerEvent::Up, aim),
+            Some(1),
+            "the click chooses the second option"
+        );
+
+        let canvas = Canvas::new(920, 520);
+        canvas.render_quality(crate::panel::chosen_quality(&state));
+        let px = canvas.pixels();
+        // Four dips in from each option's own corner: inside the block, clear of the centred word.
+        let corner = |rect: snapclip_model::geometry::Rect| (rect.left + 4, rect.top + 4);
+
+        let (sx, sy) = corner(second);
+        assert_px(
+            &px,
+            sx,
+            sy,
+            fill_rgb(31, 117, 219),
+            6,
+            "the clicked option carries the accent block (:265)",
+        );
+
+        let first = crate::panel::quality_option_rect(&DEMO, &rects, 1.0, 0);
+        let (fx, fy) = corner(first);
+        assert_px(
+            &px,
+            fx,
+            fy,
+            fill_rgb(41, 41, 46),
+            6,
+            "and the option it left is track fill again (:263)",
+        );
+    }
+
     /// Every row's label is drawn in the label row above it, and the row below does not steal its
     /// neighbour's ink. The design puts the label 22 dips tall with a 6 dip gap under it (`:165`,
     /// `:164`), so the box each word is drawn into is arithmetic rather than a guess. A row with no
@@ -1174,8 +1228,30 @@ mod tests {
                 true,
                 crate::panel::FieldStates::IDLE,
                 Some((bgra, w, h)),
+                0,
             )
             .expect("the frame paints with a preview");
+        }
+
+        /// Render with one of the quality options chosen, which is the state a click leaves behind.
+        /// Everything else is idle, so the only thing that moves between these renders is the block
+        /// the segmented control draws.
+        fn render_quality(&self, quality: usize) {
+            let factory = factory().expect("a Direct2D factory");
+            let dwrite = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED) }
+                .expect("a DirectWrite factory");
+            paint_to_dc_with_preview(
+                &factory,
+                &dwrite,
+                self.dc,
+                Rect::new(0, 0, self.width, self.height),
+                self.dpi,
+                true,
+                crate::panel::FieldStates::IDLE,
+                None,
+                quality,
+            )
+            .expect("the frame paints with a chosen quality");
         }
 
         /// The pixels, through the only view that exists. Deliberately no direct byte accessor:
@@ -1946,6 +2022,7 @@ impl PanelRenderer {
         fill_surface: bool,
         fields: crate::panel::FieldStates,
         preview: Option<(&[u8], u32, u32)>,
+        quality: usize,
     ) -> Result<()> {
         paint_to_dc_with_preview(
             &self.factory,
@@ -1956,6 +2033,7 @@ impl PanelRenderer {
             fill_surface,
             fields,
             preview,
+            quality,
         )
     }
 }
