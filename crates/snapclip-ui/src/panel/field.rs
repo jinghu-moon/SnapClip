@@ -429,7 +429,7 @@ mod tests {
             assert_eq!(
                 field.top,
                 rects.form.top
-                    + px(metrics.row_pitch())
+                    + px(metrics.text_row_pitch())
                     + px(metrics.row_label_height + metrics.row_gap),
                 "the directory row takes the first slot; below it, label {} plus gap {} then the field (:165, :164)",
                 metrics.row_label_height,
@@ -459,8 +459,8 @@ mod tests {
             let rects = metrics().rects(scale);
             let saved = label_rect(&metrics(), &rects, scale, Row::Saved);
             let size = label_rect(&metrics(), &rects, scale, Row::Size);
-            let one_row = (metrics().row_pitch() as f32 * scale).round() as i32;
-            let one_group = (metrics().group_pitch() as f32 * scale).round() as i32;
+            let one_row = (metrics().text_row_pitch() as f32 * scale).round() as i32;
+            let one_group = (metrics().text_group_pitch() as f32 * scale).round() as i32;
             // The after-save row is a header with no content, so from its top to the next row's top
             // there is its own label height, the row gap and the group margin — 22 + 12 + 4.
             let expected = ((metrics().row_label_height
@@ -511,7 +511,7 @@ mod tests {
             let size = label_rect(&metrics(), &rects, scale, Row::Size);
             assert!(name.top < saved.top, "the after-save row is below the name row (:568)");
             assert!(saved.top < size.top, "the after-save row is above the size row (:579)");
-            let one_row = (metrics().row_pitch() as f32 * scale).round() as i32;
+            let one_row = (metrics().text_row_pitch() as f32 * scale).round() as i32;
             assert_eq!(
                 saved.top - name.top,
                 one_row,
@@ -527,7 +527,7 @@ mod tests {
             let rects = metrics().rects(scale);
             let size = field_rect(&metrics(), &rects, scale, Row::Size);
             let quality = field_rect(&metrics(), &rects, scale, Row::Quality);
-            let one_row = (metrics().row_pitch() as f32 * scale).round() as i32;
+            let one_row = (metrics().text_row_pitch() as f32 * scale).round() as i32;
             assert_eq!(
                 quality.top - size.top,
                 one_row,

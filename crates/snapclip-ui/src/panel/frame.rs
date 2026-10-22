@@ -100,19 +100,23 @@ impl FrameMetrics {
         self.panel_width - self.pad_x * 2 - self.preview_width - self.column_gap
     }
 
-    /// One form slot: a label row, the gap under it, and its field.
-    pub fn row_height(&self) -> i32 {
+    /// One slot of a row that carries a **text field**: its label row, the gap under it, and the
+    /// field. Named for that kind of row rather than for rows in general, because the form also
+    /// has rows whose content is `--row` (28, see `field::ROW_DIP`) and the two are not
+    /// interchangeable: 22 + 6 + 32 = 60 against 28 (`:165`, `:164`, `:167`, `:47`).
+    pub fn text_row_height(&self) -> i32 {
         self.row_label_height + self.row_gap + self.field_height
     }
 
-    /// Slot to slot inside a group: the slot plus the form's own gap.
-    pub fn row_pitch(&self) -> i32 {
-        self.row_height() + self.row_spacing
+    /// Slot to slot inside a group, for a text-field row: the slot plus the form's own gap.
+    pub fn text_row_pitch(&self) -> i32 {
+        self.text_row_height() + self.row_spacing
     }
 
-    /// Slot to slot across a group boundary: the form's gap plus the group's margin.
-    pub fn group_pitch(&self) -> i32 {
-        self.row_height() + self.row_spacing + self.group_spacing
+    /// Slot to slot across a group boundary, for a text-field row: the form's gap plus the
+    /// group's margin.
+    pub fn text_group_pitch(&self) -> i32 {
+        self.text_row_height() + self.row_spacing + self.group_spacing
     }
 
     /// The layout at a given DPI scale, in pixels.
@@ -843,7 +847,7 @@ mod tests {
                 path.top,
                 name.top
             );
-            let expected = (DEMO.row_pitch() as f32 * scale).round() as i32;
+            let expected = (DEMO.text_row_pitch() as f32 * scale).round() as i32;
             assert_eq!(
                 name.top - path.top,
                 expected,
@@ -1399,17 +1403,40 @@ mod tests {
     fn the_first_form_slot_starts_where_the_design_puts_it() {
         let rects = DEMO.rects(1.0);
         assert_eq!(rects.form.top, 48, ".body padding-top 4 under the 44 dip header (:100)");
-        assert_eq!(DEMO.row_height(), 60, "22 label + 6 gap + 32 field (:165, :164, :167)");
+        assert_eq!(DEMO.text_row_height(), 60, "22 label + 6 gap + 32 field (:165, :164, :167)");
     }
 
     #[test]
     fn the_form_groups_are_sixteen_apart() {
-        assert_eq!(DEMO.row_pitch() - DEMO.row_height(), 12, ".form gap is 12px (:162)");
-        assert_eq!(DEMO.group_pitch() - DEMO.row_pitch(), 4, ".form-row.grp margin-top (:163)");
+        assert_eq!(DEMO.text_row_pitch() - DEMO.text_row_height(), 12, ".form gap is 12px (:162)");
+        assert_eq!(DEMO.text_group_pitch() - DEMO.text_row_pitch(), 4, ".form-row.grp margin-top (:163)");
         assert_eq!(
-            DEMO.group_pitch() - DEMO.row_height(),
+            DEMO.text_group_pitch() - DEMO.text_row_height(),
             16,
             "the design's own note says groups sit 16 apart (:163)"
+        );
+    }
+
+    /// Two kinds of row live in this form and they are not the same height: a row carrying a text
+    /// field is 60 (label 22 + gap 6 + field 32, `:165`, `:164`, `:167`) while a row whose content
+    /// is `--row` is 28 (`:47`, used by the segment `:263` and the estimate `:269`).
+    ///
+    /// This is asserted rather than assumed because the three metrics that describe a slot used to
+    /// be named as if they described **any** row, which invites the next row to borrow a height
+    /// that does not belong to it. The names now say which kind of row they mean, and this pins
+    /// the difference itself so that collapsing the two heights cannot pass unnoticed.
+    #[test]
+    fn a_text_row_and_a_row_of_design_height_are_not_interchangeable() {
+        assert_eq!(DEMO.text_row_height(), 60, "a row with a text field (:165, :164, :167)");
+        assert_eq!(
+            crate::panel::ROW_DIP,
+            28,
+            "--row, the design's own content height for a segment or estimate row (:47)"
+        );
+        assert_ne!(
+            DEMO.text_row_height(),
+            crate::panel::ROW_DIP,
+            "a text row and a --row row are different heights, so one name cannot cover both"
         );
     }
 
