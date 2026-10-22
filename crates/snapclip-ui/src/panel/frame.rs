@@ -444,13 +444,44 @@ impl Frame<'_> {
         // changing a rule changes the picture and the tests with it. Both rows run this one loop,
         // which is what keeps the second field from becoming a copy of the first.
         let field_radius = (crate::panel::INPUT_RADIUS_DIP * self.scale).round() as i32;
-        // Only the name field is wired to focus so far, so the path row is painted idle until the
-        // stage that gives it a child window of its own.
-        for (row, state) in [
-            (crate::panel::Row::Path, crate::panel::FieldState::Idle),
-            (crate::panel::Row::Name, self.field_state),
+        // Only the name field is wired to focus so far, so the path and size rows are painted idle
+        // until the stage that gives them child windows of their own. The size row is two cells
+        // rather than one slot (`:235`, `:246`), which is why the loop runs over rects: every field
+        // still goes through this one block.
+        let size_width = crate::panel::field::size_cell_rect(
+            self.metrics,
+            self.rects,
+            self.scale,
+            crate::panel::field::SizeCell::Width,
+        );
+        let size_height = crate::panel::field::size_cell_rect(
+            self.metrics,
+            self.rects,
+            self.scale,
+            crate::panel::field::SizeCell::Height,
+        );
+        for (field, state) in [
+            (
+                crate::panel::field_rect(
+                    self.metrics,
+                    self.rects,
+                    self.scale,
+                    crate::panel::Row::Path,
+                ),
+                crate::panel::FieldState::Idle,
+            ),
+            (
+                crate::panel::field_rect(
+                    self.metrics,
+                    self.rects,
+                    self.scale,
+                    crate::panel::Row::Name,
+                ),
+                self.field_state,
+            ),
+            (size_width, crate::panel::FieldState::Idle),
+            (size_height, crate::panel::FieldState::Idle),
         ] {
-            let field = crate::panel::field_rect(self.metrics, self.rects, self.scale, row);
             let colours = crate::panel::field_colours(state, self.brushes.surface_rgba());
             painter.fill_round(field, field_radius, &self.brushes.field_fill);
 
@@ -1017,6 +1048,25 @@ mod tests {
         );
     }
 
+    /// A colour written the way the design writes it.
+    ///
+    /// The mockup states colours in rgb order and the buffer stores bgra, and this project has
+    /// confused the two three times, so the swap happens here once and call sites copy the design's
+    /// numbers without having to think about the order.
+    fn fill_rgb(r: u8, g: u8, b: u8) -> Px {
+        Px { b, g, r, a: 255 }
+    }
+
+    #[test]
+    fn fill_rgb_takes_the_designs_order_and_stores_the_buffers() {
+        let px = fill_rgb(41, 41, 46);
+        assert_eq!(
+            (px.b, px.g, px.r),
+            (46, 41, 41),
+            "the design writes rgb and the buffer stores bgra"
+        );
+    }
+
     /// A `--line` stroke is white at thirty percent alpha, so over a fill it reads as a blend rather
     /// than as one exact value. Computing the blend is what lets an assertion name the colour it
     /// expects instead of merely excluding the fills that lie beneath.
@@ -1037,6 +1087,29 @@ mod tests {
                 let _ = DeleteObject(self.bitmap.into());
                 let _ = DeleteDC(self.dc);
             }
+        }
+    }
+
+    #[test]
+    fn the_size_row_sits_below_the_name_row_and_splits_into_two_cells() {
+        use crate::panel::field::{Row, SizeCell, field_rect, size_cell_rect};
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            let rects = DEMO.rects(scale);
+            let name = field_rect(&DEMO, &rects, scale, Row::Name);
+            let width = size_cell_rect(&DEMO, &rects, scale, SizeCell::Width);
+            let height = size_cell_rect(&DEMO, &rects, scale, SizeCell::Height);
+            let one_pitch = (DEMO.row_pitch() as f32 * scale).round() as i32;
+            assert_eq!(
+                width.top,
+                name.top + one_pitch,
+                "the size row is one pitch below the name row (:163)"
+            );
+            assert_eq!(height.top, width.top, "both cells sit on the same row");
+            assert!(width.right < height.left, "the link hub sits between the two cells (:246)");
+            assert_eq!(
+                height.right, rects.form.right,
+                "the second cell ends at the form's right edge"
+            );
         }
     }
 

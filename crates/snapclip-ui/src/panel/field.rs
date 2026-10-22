@@ -113,6 +113,7 @@ pub fn path_field_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -
 pub enum Row {
     Path,
     Name,
+    Size,
 }
 
 impl Row {
@@ -120,6 +121,7 @@ impl Row {
         match self {
             Row::Path => 0,
             Row::Name => 1,
+            Row::Size => 2,
         }
     }
 }
@@ -140,6 +142,46 @@ pub fn field_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32, row: R
         top,
         right: rects.form.right,
         bottom: top + px(metrics.field_height),
+    }
+}
+
+/// The two cells of the size row. The design lays this row out as two flex cells with a link hub
+/// between them (`.values { gap: 8px }`, `:235`; `.link-hub { width: 28px }`, `:246`), so the row
+/// cannot use the full-width slot the other rows use. It keeps their vertical arithmetic and splits
+/// the width itself, so the row still sits on its slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SizeCell {
+    Width,
+    Height,
+}
+
+pub fn size_cell_rect(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    cell: SizeCell,
+) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let row = field_rect(metrics, rects, scale, Row::Size);
+    let gap = px(8);
+    let hub = px(28);
+    let cell_width = (row.right - row.left - 2 * gap - hub) / 2;
+    let left = match cell {
+        SizeCell::Width => row.left,
+        SizeCell::Height => row.left + cell_width + gap + hub + gap,
+    };
+    // The design lays the row out with flex, so the second cell takes whatever the first two cells
+    // and the hub leave behind. Integer division drops a pixel on odd widths, and the flex behaviour
+    // is for the last cell to absorb it rather than for the row to stop short of the form edge.
+    let right = match cell {
+        SizeCell::Width => left + cell_width,
+        SizeCell::Height => row.right,
+    };
+    Rect {
+        left,
+        top: row.top,
+        right,
+        bottom: row.bottom,
     }
 }
 
