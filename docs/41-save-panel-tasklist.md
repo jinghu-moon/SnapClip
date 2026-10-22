@@ -714,3 +714,29 @@ cargo run -p codec-bench --release -- --assert
 
 - **`保存后` 的两个 chip 未画、宽度也未预留** ✗ —— 与 `.link-hub` 同理 ✓：**画了不接就是假控件** ✗。**宽度未预留是有意的** ✓：chip 宽 = **文字宽 + 2×10**（`:192` ✓），而文字宽**要测量文本** ✗，`field.rs` 里没有设备上下文 ✗ ⇒ **不编造宽度** ✓（与尺寸格"不编造数字"同一条规矩 ✓）⇒ 等交互批（届时已有绘制目标 ✓）再定 ✓。已知的量 ✓：chip 高 **24** ✓、行内 gap **12** ✓、chip 间 gap **8** ✓。
 - **尺寸行还有两个模式钮与一个重置钮** ✗（本批实读 demo 时发现 ✓）：`数值` / `百分比`（`.size-mode-btn`，`:585`–`:586` ✓，默认 `数值` ✓）与一个 `.action` 重置钮（`:589` ✓，`aria-label="重置为原始大小"` ✓）⇒ 它们是**控件** ✓，同样留到交互批 ✓，且**它们的宽度会影响尺寸行的横向切分** ✗（`size_cell_rect` 现在把整行给了两个格子 ✓）⇒ 与"尺寸格接数字"同批处理更省 ✓。
+
+### 预估行（本批）：表单的最后一行，也是第三组
+
+**demo 实读** ✓：`.form-row.grp`（`:666` ✓）⇒ 它**开新组** ✓（与 `:163` 的注释 `… | 预估` 一致 ✓）；`.row-header { height: 22px }`（`:165` ✓）里是 `.row-label` **`预估大小`**（`:667` ✓）；内容是 `.est-size { font-size: 12px; height: var(--row) }`（`:269` ✓）⇒ 高 **28** ✓ —— 与分段器**同一个 `--row`** ✓。
+
+**结构上的新东西** ✗：`Row::Estimate`（index 5 ✓）+ `FORM_ROWS` 扩到 **6** ✓ ⇒ **label 自动画出来** ✓ —— `frame.rs` 的 label 循环**遍历 `FORM_ROWS`** ✓，所以本批**没有改 `frame.rs`** ✗（它不在改动列表里 ✓）。这是前几批"把字符串与几何交给生产者"的回报 ✓。
+
+**顺手修的一处命名与设计不符** ✗：`QUALITY_SEG_HEIGHT_DIP` 改名为 **`ROW_DIP`** ✓ —— 因为 demo 的 `--row: 28px`（`:47` ✓）被**两个**用户共享 ✓：`.seg { height: var(--row) }`（`:263` ✓）与 `.est-size { height: var(--row) }`（`:269` ✓）⇒ 以**设计自己的变量**命名 ✓，而不是以它**第一个用户**命名 ✗（后者会让第二个用户复制一个常量 ✗）。
+
+**字形门禁红→绿** ✓：`预估大小` 的 `预` `估` `大` **不在**子集里 ✓ ⇒ 门禁**先红** ✓（`the_embedded_subset_covers_the_strings_the_overlay_draws` FAILED ✓）⇒ 重建一次 ✓ ⇒ **285 → 288 codepoints** ✓（`小` 本就在 ✓）⇒ 绿 ✓。
+
+**顺带印证门禁为什么必需** ✗✓：门禁红的同时 **`ui` 87 全绿** ✓ —— 位图断言**仍然通过** ✓，因为 DirectWrite 对缺失字形**回退到系统字体** ✗ ⇒ **有墨、但字形不是我们的** ✗。那种事**只有门禁看得见** ✓。
+
+**三条变异都真红** ✓（备份逐字节比对 ✓ + 确认看到 `Compiling` ✓）：
+
+- 把 `Estimate` 从 `FORM_ROWS` 去掉 ✗ ⇒ **编译错**（`[Row; 6]` 只剩 5 个 ✓）—— 这与早前 `Action::ALL` 的定长数组是**同一类** ✓：**加变体必须同时改长度** ✓ ⇒ 换一种**行为变异** ✓：把 `Estimate` 换成**重复的 `Quality`**（数组仍 6 个 ✓）⇒ `the_estimate_row_is_last_and_opens_the_third_group` **FAILED** ✓（`the estimate is the last row of the form (:666)` ✓）；
+- label 画成**表面色** ✗ ⇒ `the_row_labels_are_drawn_above_their_rows` **FAILED** ✓（点名 `Path` ✓ —— 它按顺序查，先撞上第一行 ✓）；
+- **把预估行的 label 改成空串** ✗ ⇒ 同一条测试 **FAILED** ✓，信息**专指这一行** ✓：`Estimate's label ("") must put ink in its own row, at Rect { left: 584, top: 374, right: 904, bottom: 396 }` ✓ ⇒ 这是"**它真的被画了**"的最强证据 ✓。
+
+**本批的验证** ✓：`ui` **88/0** ✓ · `app` **208/0/9** ✓ · `capture` **544/0/80** ✓ · `check --workspace --all-targets` Finished ✓。
+
+**新增已知缺口** ✗：
+
+- **`.enc-state` 与 `.enc-bar` 未画** ✗（`:349` ✓ `:351` ✓）—— 它们是**编码进度指示** ✓，需要**我们没有的状态** ✗（编码尚未发生 ✓）⇒ 不画 ✓，不编造进度 ✓；
+- **`.est-size` 的预估值未画** ✗（demo 显示 `227.31 KB` ✓ `:668` ✓）—— **动态数据** ✗，与尺寸格"不编造数字"同一条规矩 ✓；
+- **`FrameMetrics::row_height()/row_pitch()/group_pitch()` 的名字现在偏窄** ✗ —— 它们描述的是"**文本字段那一行**"（22+6+32 = 60 ✓），而表单里已有 28 高的行 ✓ ⇒ 名字读起来像"任何一行的高度" ✗，这正是"名字撒谎"那类坑（`…has_no_border…` ✗ 那次）✓ ⇒ 建议改名（如 `text_row_height` ✓），但会影响多处测试 ✓ ⇒ **单列一批** ✓，本批不动 ✗。

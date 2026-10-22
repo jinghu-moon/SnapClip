@@ -116,18 +116,21 @@ pub enum Row {
     Saved,
     Size,
     Quality,
+    Estimate,
 }
 
 /// Every row of the form, top to bottom, in the order the design lays them out: the path row
-/// (`:542`), the name row (`:556`), the after-save row (`:568`), the size row (`:235`) and the
-/// quality row (`:637`). The layout walks this list to add up the rows above a given one, so a row
-/// missing from it is a row the rest of the form does not know about.
-pub const FORM_ROWS: [Row; 5] = [
+/// (`:542`), the name row (`:556`), the after-save row (`:568`), the size row (`:235`), the quality
+/// row (`:637`) and the estimate row (`:666`). The layout walks this list to add up the rows above a
+/// given one, and the painter walks it to draw the labels, so a row missing from it is a row the
+/// rest of the form does not know about.
+pub const FORM_ROWS: [Row; 6] = [
     Row::Path,
     Row::Name,
     Row::Saved,
     Row::Size,
     Row::Quality,
+    Row::Estimate,
 ];
 
 impl Row {
@@ -138,18 +141,20 @@ impl Row {
             Row::Saved => 2,
             Row::Size => 3,
             Row::Quality => 4,
+            Row::Estimate => 5,
         }
     }
 
     /// Which of the design's three groups the row belongs to. Its own note on the group margin
     /// spells them out — `组间 16 / 组内 12：位置·文件名 | 尺寸·质量 | 预估` (`:163`) — so the path,
     /// name and after-save rows share a group, the size and quality rows share the next, and the
-    /// estimate row will open the last. The after-save row carries no `.grp` (`:569`), which is why
-    /// it does not open a group even though it is not a field.
+    /// estimate row opens the last one with `.form-row.grp` (`:666`). The after-save row carries no
+    /// `.grp` (`:569`), which is why it does not open a group even though it is not a field.
     fn group(self) -> i32 {
         match self {
             Row::Path | Row::Name | Row::Saved => 0,
             Row::Size | Row::Quality => 1,
+            Row::Estimate => 2,
         }
     }
 
@@ -162,22 +167,24 @@ impl Row {
     }
 
     /// The height of the row's content box. It is not the same for every row: a text field is
-    /// `height: 32px` (`:167`), while the quality row's content is `.quality-line`, whose
-    /// `min-height: var(--row)` is **28** (`:306`, `:47`). The rows below inherit the difference,
-    /// so it is stated per row rather than assumed to be the field height. The after-save row has no
-    /// content box at all, so its height is zero and callers must ask `has_content` first.
+    /// `height: 32px` (`:167`), while the quality row's content is `.quality-line` and the estimate
+    /// row's is `.est-size`, and both of those are `height: var(--row)` — **28** (`:306`, `:269`,
+    /// `:47`). The rows below inherit the difference, so it is stated per row rather than assumed to
+    /// be the field height. The after-save row has no content box at all, so its height is zero and
+    /// callers must ask `has_content` first.
     fn content_height(self, metrics: &FrameMetrics) -> i32 {
         match self {
             Row::Path | Row::Name | Row::Size => metrics.field_height,
-            Row::Quality => QUALITY_SEG_HEIGHT_DIP,
+            Row::Quality | Row::Estimate => ROW_DIP,
             Row::Saved => 0,
         }
     }
 
     /// The row's label, one character for one character from the design: the save path
     /// (`save-panel-demo-v3.html:542`), the file name (`:553`), the after-save actions (`:571`), the
-    /// size (`:582`) and the quality (`:630`). They are produced here rather than copied into the
-    /// painter so the font subset's list can call this and cannot drift from what is drawn.
+    /// size (`:582`), the quality (`:630`) and the estimate (`:667`). They are produced here rather
+    /// than copied into the painter so the font subset's list can call this and cannot drift from
+    /// what is drawn.
     pub fn label(self) -> &'static str {
         match self {
             Row::Path => "保存路径",
@@ -185,6 +192,7 @@ impl Row {
             Row::Saved => "保存后",
             Row::Size => "尺寸",
             Row::Quality => "质量",
+            Row::Estimate => "预估大小",
         }
     }
 }
@@ -317,10 +325,12 @@ pub fn form_drawn_strings() -> Vec<&'static str> {
     all
 }
 
-/// The height the segmented control is drawn at: `.seg { height: var(--row) }` (`:263`) and
-/// `--row: 28px` (`:47`). It is **not** the text field's 32, and the quality row's content box is
-/// this height rather than the field height.
-pub const QUALITY_SEG_HEIGHT_DIP: i32 = 28;
+/// The design's `--row: 28px` (`:47`), the height of a row's content when that content is not a text
+/// field. It is named for the design's own variable rather than for one of its users, because two
+/// rows share it: the segmented control is `.seg { height: var(--row) }` (`:263`) and the estimate
+/// is `.est-size { height: var(--row) }` (`:269`). It is **not** the text field's 32 (`:167`), and a
+/// row using it must say so in `Row::content_height`.
+pub const ROW_DIP: i32 = 28;
 
 /// The segmented control's track. `.quality-line` is a row with `justify-content: space-between`
 /// (`:306`), so the control sits at the end of the form column, and its height is the row's content
@@ -534,12 +544,51 @@ mod tests {
         let quality = field_rect(&metrics(), &rects, 1.0, Row::Quality);
         assert_eq!(
             quality.bottom - quality.top,
-            QUALITY_SEG_HEIGHT_DIP,
+            ROW_DIP,
             "the quality row's content is .quality-line, whose min-height is --row (:306, :47)"
         );
         assert_ne!(
-            QUALITY_SEG_HEIGHT_DIP, metrics().field_height,
+            ROW_DIP, metrics().field_height,
             "if these ever become equal this test stops meaning anything"
+        );
+    }
+
+    /// The estimate row is the last row of the form and opens the third group. Its label is
+    /// `预估大小` (`:667`) and the design marks it `.form-row.grp` (`:666`), so the gap above it is the
+    /// group gap rather than the row gap — the same sixteen the size row gets below the name row.
+    /// Its content is `.est-size { height: var(--row) }` (`:269`), which is the same twenty eight the
+    /// segmented control uses, so the two rows share one constant rather than two that agree.
+    #[test]
+    fn the_estimate_row_is_last_and_opens_the_third_group() {
+        assert_eq!(
+            FORM_ROWS.last(),
+            Some(&Row::Estimate),
+            "the estimate is the last row of the form (:666)"
+        );
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            let metrics = metrics();
+            let rects = metrics.rects(scale);
+            let quality = field_rect(&metrics, &rects, scale, Row::Quality);
+            let estimate = label_rect(&metrics, &rects, scale, Row::Estimate);
+            let gap = ((metrics.row_spacing + metrics.group_spacing) as f32 * scale).round() as i32;
+            assert_eq!(
+                estimate.top,
+                quality.bottom + gap,
+                "the estimate row opens a group, so it is 16 below the quality row, not 12 (:163, :666)"
+            );
+            assert_eq!(
+                estimate.bottom - estimate.top,
+                (metrics.row_label_height as f32 * scale).round() as i32,
+                "every row starts with its label row (:165)"
+            );
+        }
+        let metrics = metrics();
+        let rects = metrics.rects(1.0);
+        let estimate = field_rect(&metrics, &rects, 1.0, Row::Estimate);
+        assert_eq!(
+            estimate.bottom - estimate.top,
+            ROW_DIP,
+            "the estimate's content is .est-size, whose height is --row (:269, :47)"
         );
     }
 
