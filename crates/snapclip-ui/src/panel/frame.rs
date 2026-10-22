@@ -21,8 +21,9 @@ use windows::Win32::Graphics::Direct2D::{
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_ISOLATED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-    DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
-    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat,
+    DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_FONT_WEIGHT_NORMAL,
+    DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_CENTER,
+    DWRITE_TEXT_ALIGNMENT_LEADING, DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::HDC;
@@ -174,6 +175,9 @@ pub struct FramePalette {
     pub text: [u8; 4],
     /// `--muted: rgba(232,236,242,.62)` (`:21`), 0.62 × 255 = 158.
     pub muted: [u8; 4],
+    /// `.row-label { color: rgba(232,236,242,.74) }` (`:166`), 0.74 × 255 = 189. The row labels are
+    /// a little stronger than `--muted`, which is what separates them from the hint text.
+    pub label: [u8; 4],
 }
 
 pub const DEMO_PALETTE: FramePalette = FramePalette {
@@ -181,6 +185,7 @@ pub const DEMO_PALETTE: FramePalette = FramePalette {
     line: [255, 255, 255, 77],
     text: [255, 255, 255, 255],
     muted: [232, 236, 242, 158],
+    label: [232, 236, 242, 189],
 };
 
 /// Brushes the frame paints with. A brush belongs to the target that made it, so the caller
@@ -190,6 +195,8 @@ pub struct FrameBrushes {
     pub line: ID2D1SolidColorBrush,
     pub text: ID2D1SolidColorBrush,
     pub muted: ID2D1SolidColorBrush,
+    /// The row labels' own colour, a little stronger than `--muted` (`:166`).
+    pub label: ID2D1SolidColorBrush,
     /// The field background, already composited: a native `EDIT` cannot be translucent, so the
     /// frame and the child both use this opaque value (`field.rs`).
     pub field_fill: ID2D1SolidColorBrush,
@@ -225,6 +232,7 @@ impl FrameBrushes {
             line: brush(target, palette.line)?,
             text: brush(target, palette.text)?,
             muted: brush(target, palette.muted)?,
+            label: brush(target, palette.label)?,
             field_fill: brush(target, idle.fill)?,
             accent: brush(target, focused.border)?,
             danger: brush(target, error.border)?,
@@ -295,6 +303,11 @@ pub struct Frame<'a> {
     /// Fill the surface. Skipped when the compositor draws the panel's material behind us.
     pub fill_surface: bool,
     pub title: Option<(&'a str, &'a IDWriteTextFormat)>,
+    /// The row labels' format (`--fs-row: 11px`, `:35`) and the segmented options' (`--fs-chip:
+    /// 11px`, `:36`). The two sizes agree and the weights do not — `.row-label` is 500 (`:166`)
+    /// while `.seg .opt` inherits the body's — so they are two formats rather than one.
+    pub row_label: Option<&'a IDWriteTextFormat>,
+    pub chip: Option<&'a IDWriteTextFormat>,
     /// The state of the first form field's frame. The native `EDIT` itself draws no border, no
     /// focus ring and no error state, so those belong to the frame (`field.rs`).
     pub field_state: crate::panel::FieldState,
@@ -535,6 +548,31 @@ impl Frame<'_> {
                 &self.brushes.text,
             );
         }
+
+        // The form's own words: one label above each row (`:542`, `:553`, `:582`, `:630`) and one
+        // word inside each quality option (`:641`–`:643`). Both come from `snapclip-ui`'s producers
+        // rather than from literals here, and every one of those characters is in the embedded
+        // subset because the coverage gate's list calls the same producer.
+        if let Some(format) = self.row_label {
+            for row in crate::panel::field::FORM_ROWS {
+                let rect =
+                    crate::panel::field::label_rect(self.metrics, self.rects, self.scale, row);
+                painter.draw_text(row.label(), format, rect, &self.brushes.label);
+            }
+        }
+        if let Some(format) = self.chip {
+            for (index, word) in crate::panel::field::QUALITY_OPTION_WORDS.iter().enumerate() {
+                let rect =
+                    crate::panel::quality_option_rect(self.metrics, self.rects, self.scale, index);
+                // `:266` the options are `--muted`; `:267` the chosen one is `--text`.
+                let brush = if index == self.quality {
+                    &self.brushes.text
+                } else {
+                    &self.brushes.muted
+                };
+                painter.draw_text(word, format, rect, brush);
+            }
+        }
     }
 }
 
@@ -543,23 +581,27 @@ pub fn factory() -> Result<ID2D1Factory> {
     unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None) }
 }
 
-/// The header title's format: `--fs-title: 12px` (`:31`) at weight 600 (`.head .title`, `:95`),
-/// centred vertically so the text sits on the header's own centre line.
-pub fn title_format(dwrite: &IDWriteFactory, dpi: f32) -> Result<IDWriteTextFormat> {
+/// A text format in the embedded family at a given size and weight. `CreateTextFormat` does not take
+/// a stack, so the families are walked here in the same order the overlay uses, starting with the
+/// subset. Every string the panel draws goes through this, so the fallback order exists once.
+pub fn text_format(
+    dwrite: &IDWriteFactory,
+    dpi: f32,
+    size_dip: f32,
+    weight: DWRITE_FONT_WEIGHT,
+) -> Result<IDWriteTextFormat> {
     let scale = (dpi / 96.0).max(0.5);
     let mut last: Option<windows::core::Error> = None;
-    // One family per attempt: CreateTextFormat does not take a stack, so we walk it ourselves in
-    // the same order the overlay does (`snapclip-capture`'s font stack) starting with the subset.
     for family in [FAMILY, "Segoe UI Variable Display", "Segoe UI"] {
         let wide = windows::core::HSTRING::from(family);
         let made = unsafe {
             dwrite.CreateTextFormat(
                 &wide,
                 None,
-                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                weight,
                 DWRITE_FONT_STYLE_NORMAL,
                 DWRITE_FONT_STRETCH_NORMAL,
-                12.0 * scale,
+                size_dip * scale,
                 &windows::core::HSTRING::from(""),
             )
         };
@@ -575,6 +617,35 @@ pub fn title_format(dwrite: &IDWriteFactory, dpi: f32) -> Result<IDWriteTextForm
         }
     }
     Err(last.expect("at least one family was tried"))
+}
+
+/// The header title's format: `--fs-title: 12px` (`:31`) at weight 600 (`.head .title`, `:95`),
+/// centred vertically so the text sits on the header's own centre line.
+pub fn title_format(dwrite: &IDWriteFactory, dpi: f32) -> Result<IDWriteTextFormat> {
+    text_format(dwrite, dpi, 12.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)
+}
+
+/// `--fs-row: 11px` (`save-panel-demo-v3.html:35`). The row labels' size.
+pub const ROW_LABEL_FONT_DIP: f32 = 11.0;
+
+/// `--fs-chip: 11px` (`save-panel-demo-v3.html:36`). The segmented options' size.
+pub const CHIP_FONT_DIP: f32 = 11.0;
+
+/// The row labels: `--fs-row: 11px` (`:35`) at `.row-label`'s weight 500 (`:166`).
+pub fn row_label_format(dwrite: &IDWriteFactory, dpi: f32) -> Result<IDWriteTextFormat> {
+    text_format(dwrite, dpi, ROW_LABEL_FONT_DIP, DWRITE_FONT_WEIGHT_MEDIUM)
+}
+
+/// The segmented options' words: `--fs-chip: 11px` (`:36`). `.seg .opt` sets `font: inherit` and
+/// then only the size (`:266`), so their weight is the body's rather than the label's.
+pub fn chip_format(dwrite: &IDWriteFactory, dpi: f32) -> Result<IDWriteTextFormat> {
+    let format = text_format(dwrite, dpi, CHIP_FONT_DIP, DWRITE_FONT_WEIGHT_NORMAL)?;
+    // `.seg .opt { display: grid; place-items: center }` (`:266`) centres the word in its option,
+    // so this format is the one that does not lead-align.
+    unsafe {
+        let _ = format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    }
+    Ok(format)
 }
 
 fn properties(dpi: f32) -> D2D1_RENDER_TARGET_PROPERTIES {
@@ -663,6 +734,9 @@ pub fn paint_to_dc_with_preview(
     // The title is part of the frame, not of any control: the design puts it in the header and
     // every drawn character has to be in the embedded subset, which the glyph gate enforces.
     let title = title_format(dwrite, dpi)?;
+    // The form's own text, at the two sizes the design gives it (`:35`, `:36`).
+    let row_label = row_label_format(dwrite, dpi)?;
+    let chip = chip_format(dwrite, dpi)?;
     let painter = PanelPainter {
         context: &target,
         text_factory: dwrite,
@@ -681,6 +755,8 @@ pub fn paint_to_dc_with_preview(
         scale,
         fill_surface,
         title: Some((TITLE, &title)),
+        row_label: Some(&row_label),
+        chip: Some(&chip),
         field_state,
         preview: preview.as_ref().map(|(b, w, h)| (b, *w, *h)),
         quality: 0,
@@ -732,6 +808,8 @@ pub fn paint_to_target_with_preview(
     unsafe { target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED) };
     // Hairlines at 1 dip are meant to be one pixel, not two half-lit ones.
     let title = title_format(dwrite, dpi)?;
+    let row_label = row_label_format(dwrite, dpi)?;
+    let chip = chip_format(dwrite, dpi)?;
     Frame {
         metrics: &metrics,
         rects: &rects,
@@ -739,6 +817,8 @@ pub fn paint_to_target_with_preview(
         scale,
         fill_surface,
         title: Some((TITLE, &title)),
+        row_label: Some(&row_label),
+        chip: Some(&chip),
         field_state: crate::panel::FieldState::Idle,
         preview: preview.as_ref().map(|(b, w, h)| (b, *w, *h)),
         quality: 0,
@@ -829,9 +909,13 @@ mod tests {
     }
 
     /// The segmented control marks the chosen option with an accent block and leaves the others on
-    /// the track's fill. Both are named by position and colour: the block's centre is the accent, and
-    /// a neighbouring option's centre is still the fill, so a control that marked every option, or
-    /// marked none, or marked the wrong one, fails here.
+    /// the track's fill. Both are named by position and colour, so a control that marked every
+    /// option, or marked none, or marked the wrong one, fails here.
+    ///
+    /// The samples sit in an option's corner rather than at its centre, because the centre is where
+    /// the option's word is drawn (`:641`–`:643`): the centre was the right place to look before
+    /// there was any text, and pointing at a glyph would make this test about the glyph's ink
+    /// instead of about the block behind it.
     #[test]
     fn the_quality_segment_marks_the_chosen_option_with_the_accent() {
         let canvas = Canvas::new(920, 520);
@@ -839,26 +923,78 @@ mod tests {
         let px = canvas.pixels();
         let rects = DEMO.rects(1.0);
         let track = crate::panel::quality_seg_rect(&DEMO, &rects, 1.0);
-        let centre = |rect: snapclip_model::geometry::Rect| {
-            ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2)
-        };
+        // Four dips in from the option's own corner: inside the block, clear of the centred word.
+        let corner = |rect: snapclip_model::geometry::Rect| (rect.left + 4, rect.top + 4);
 
         let chosen = crate::panel::quality_option_rect(&DEMO, &rects, 1.0, 0);
-        let (cx, cy) = centre(chosen);
+        let (cx, cy) = corner(chosen);
         assert_px(&px, cx, cy, fill_rgb(31, 117, 219), 6, "the chosen option is --accent (:265)");
 
         let other = crate::panel::quality_option_rect(&DEMO, &rects, 1.0, 1);
-        let (ox, oy) = centre(other);
+        let (ox, oy) = corner(other);
         assert_px(&px, ox, oy, fill_rgb(41, 41, 46), 6, "an unchosen option is the track's --fill (:263)");
 
         // The track itself is filled even where no option is: the last inset's worth of pixels to
         // the right of the third option belongs to the track, not to the surface behind it.
         let last = crate::panel::quality_option_rect(&DEMO, &rects, 1.0, crate::panel::QUALITY_OPTIONS - 1);
-        let (lx, ly) = centre(last);
+        let (lx, ly) = corner(last);
         assert_px(&px, lx, ly, fill_rgb(41, 41, 46), 6, "the third option's cell is track fill (:263)");
         assert!(
             track.right > last.right,
             "the track has to extend past the last option, or the insets are not being applied"
+        );
+    }
+    /// Every row's label is drawn in the label row above it, and the row below does not steal its
+    /// neighbour's ink. The design puts the label 22 dips tall with a 6 dip gap under it (`:165`,
+    /// `:164`), so the box each word is drawn into is arithmetic rather than a guess.
+    #[test]
+    fn the_row_labels_are_drawn_above_their_rows() {
+        let canvas = Canvas::new(920, 520);
+        canvas.render();
+        let px = canvas.pixels();
+        let rects = DEMO.rects(1.0);
+        for row in crate::panel::FORM_ROWS {
+            let label = crate::panel::label_rect(&DEMO, &rects, 1.0, row);
+            let field = crate::panel::field_rect(&DEMO, &rects, 1.0, row);
+            assert_eq!(
+                label.bottom,
+                field.top - DEMO.row_gap,
+                "{:?}'s label sits one gap above its row (:164)",
+                row
+            );
+            assert_eq!(
+                label.bottom - label.top,
+                DEMO.row_label_height,
+                "{:?}'s label row is 22 dips tall (:165)",
+                row
+            );
+            assert!(
+                ink_inside(&px, label, 12) >= 4,
+                "{:?}'s label (\"{}\") must put ink in its own row, at {:?}",
+                row,
+                row.label(),
+                label
+            );
+        }
+    }
+
+    /// The chosen option's word is `--text` while the others are `--muted` (`:266`, `:267`), so the
+    /// brightest pixel of the chosen box is brighter than the brightest of an unchosen one. Both
+    /// boxes are named, and swapping the two brushes — or dropping the word — fails here.
+    #[test]
+    fn the_chosen_quality_word_is_brighter_than_the_unchosen_ones() {
+        let canvas = Canvas::new(920, 520);
+        canvas.render();
+        let px = canvas.pixels();
+        let rects = DEMO.rects(1.0);
+        let option = |index: usize| {
+            crate::panel::quality_option_rect(&DEMO, &rects, 1.0, index)
+        };
+        let chosen = brightest_inside(&px, option(0));
+        let muted = brightest_inside(&px, option(1));
+        assert!(
+            chosen > muted + 20,
+            "the chosen word is --text over the others' --muted (:266, :267): chosen={chosen} unchosen={muted}"
         );
     }
     use super::*;
@@ -1138,6 +1274,37 @@ mod tests {
             !unwanted.iter().any(|w| close(seen, *w, tolerance)),
             "{what}: at ({x}, {y}) must not be any of {unwanted:?}, but it is {seen:?}"
         );
+    }
+
+    /// How many pixels inside `rect` differ from the surface by more than `tolerance`. Text is
+    /// anti-aliased, so no single pixel of it has a predictable value; what is predictable is that
+    /// a drawn string puts ink inside the box it was given and a missing one puts none. The
+    /// assertion still names the box, and a mutation that stops drawing the string makes it zero.
+    fn ink_inside(px: &Bgra8, rect: snapclip_model::geometry::Rect, tolerance: i32) -> usize {
+        let surface = surface_px();
+        let mut ink = 0;
+        for y in rect.top.max(0)..rect.bottom.max(0) {
+            for x in rect.left.max(0)..rect.right.max(0) {
+                if !close(px.pixel(x, y), surface, tolerance) {
+                    ink += 1;
+                }
+            }
+        }
+        ink
+    }
+
+    /// The brightest pixel in a box, as a plain luma. Used where the assertion is about one word
+    /// being drawn in a brighter colour than another, which is a relation between two named boxes.
+    fn brightest_inside(px: &Bgra8, rect: snapclip_model::geometry::Rect) -> i32 {
+        let mut best = -1;
+        for y in rect.top.max(0)..rect.bottom.max(0) {
+            for x in rect.left.max(0)..rect.right.max(0) {
+                let p = px.pixel(x, y);
+                let luma = (i32::from(p.r) + i32::from(p.g) + i32::from(p.b)) / 3;
+                best = best.max(luma);
+            }
+        }
+        best
     }
 
     /// A colour written the way the design writes it.

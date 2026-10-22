@@ -1481,6 +1481,14 @@ fn overlay_drawn_strings() -> Vec<String> {
         // (`save-panel-demo-v3.html:473`), so the subset has to carry it too.
         snapclip_ui::panel::TITLE.to_owned(),
     ];
+    // …and the save panel's form text: the four row labels (`:542`, `:553`, `:582`, `:630`) and the
+    // three quality options (`:641`–`:643`). Taken from the panel's own producer rather than copied,
+    // so a label added there without the subset being rebuilt fails the gate below.
+    drawn.extend(
+        snapclip_ui::panel::form_drawn_strings()
+            .into_iter()
+            .map(str::to_owned),
+    );
     // The hint row and the shortcut guide: every label, group, key and separator they can draw,
     // under any binding.
     drawn.extend(crate::keymap::drawn_strings());

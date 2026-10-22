@@ -659,7 +659,7 @@ cargo run -p codec-bench --release -- --assert
 - **四个字段共用一个绘制循环** ✓（矩形 + 状态 ✓），但 `WM_CTLCOLOREDIT`（`window.rs:1042` ✓）用的是**单一的** `s.field_state` ✗（只跟踪文件名 ✓）⇒ 一旦焦点接到路径或尺寸格 ✗，底色会**跟错状态** ✗ ⇒ 交互批必须把它改成**按控件取状态** ✓。
 - **数值字段的等宽字体未用** ✗ —— demo 的 `.dim-input` 用 `--num`（`:235` 附近 ✓）与 `--fs-num 16px` ✓，而 `create_field_edit` 用的是面板字体 `FAMILY` ✗ ⇒ 当前不匹配 ✗；本批**没有**动字体栈 ✗（不顺手改 ✓）。
 - **路径行与尺寸格尚未接焦点** ✗ —— `WM_COMMAND`（`window.rs:1046` ✓）现在**只认 `name_edit`** ✓ ⇒ Tab 顺序与焦点环对这两者无效 ✓，属**交互批** ✓。
-- **三行 label 文字未画** ✗（`保存路径` ✓ `文件名` ✓ 与尺寸行的 label ✓）—— 会牵动**字形子集** ✗ ⇒ **三行合成一批**、**重建一次** ✓，而不是重建三次 ✗。
+- ~~**三行 label 文字未画**~~ ✓ **已画**（字形子集批 ✓，见下）：四行的 label ✓ 与分段器的三个词 ✓ 一次做完 ✓，子集**只重建一次** ✓（280 ⇒ **285** codepoints ✓）。
 - **`.link-hub` 与两个 ghost 按钮未画** ✗（`更改` ✓ / 文件夹图标 ✓）—— 画了不接就是**假控件** ✗ ⇒ 留到交互批 ✓。
 
 ### 质量行记录：组间距与分段器（实测得出）
@@ -672,5 +672,24 @@ cargo run -p codec-bench --release -- --assert
 
 **新增已知缺口** ✗：
 
-- **分段器的三个词（`高`/`中`/`低`）未画** ✗ —— 与三行 label 同属**字形子集**批 ✓（一次重建 ✓）；
+- ~~**分段器的三个词（`高`/`中`/`低`）未画**~~ ✓ **已画**（字形子集批 ✓）；
 - **分段器不可点** ✗ —— `quality` 目前是 `Frame` 上的一个索引 ✓（调用方恒传 0 ✓），点击、设置与写回属**交互批** ✓；`FORM_FIELD_TAB_STOPS` 仍是 **2** ✓，因为分段器还不是原生子窗口 ✓。
+
+### 字形子集批（本批）：一次重建，四处文字
+
+**做法** ✓：文字**由生产者产出**，不在门禁里抄 ✗ —— `Row::label()`（`field.rs` ✓）与 `QUALITY_OPTION_WORDS` ✓ 由 `form_drawn_strings()` ✓ 汇总 ✓，而**字形门禁**（`overlay_drawn_strings()` ✓，`d2d/tests.rs:1459` ✓）**调用同一个函数** ✓ ⇒ 加一个 label 却忘了重建子集 ⇒ **门禁红** ✓，这正是我们要的约束 ✓。
+
+**红→绿证据** ✓：加完文字、未重建时 ✓ `the_embedded_subset_covers_the_strings_the_overlay_draws` **FAILED** ✓；跑 `subfont/subset.ps1` ✓（先由 `write_drawn_text_for_the_font_subset` 重写 `drawn-text.txt` ✓，再由 `build_subset.py` 建字体 ✓）⇒ 输出 `required: 285 codepoints` ✓、`all required ones covered` ✓ ⇒ 门禁**绿** ✓（子集 43.4 KB ✓）。
+
+**字号与颜色** ✓（全部来自 demo ✓）：label 用 `--fs-row: 11px`（`:35` ✓）weight 500（`:166` ✓）`rgba(232,236,242,.74)`（`:166` ✓，**比 `--muted` 略强** ✓，所以 palette 里多了一个 `label` ✓）；分段器的词用 `--fs-chip: 11px`（`:36` ✓）`--muted`（`:266` ✓）、选中为 `--text`（`:267` ✓）⇒ 两个 11px 的**格式**而不是一个 ✓，因为 `.seg .opt` 是 `font: inherit` ✓，字重是正文的、不是 label 的 ✓。
+
+**两条变异都红了** ✓（按上面的检查清单 ✓）：
+- label 画成**表面色** ✗ ⇒ `the_row_labels_are_drawn_above_their_rows` **FAILED** ✓（`Path's label ("保存路径") must put ink in its own row, at Rect { left: 584, top: 48, right: 904, bottom: 70 }` ✓）；
+- 选中词与未选中词的画刷**对调** ✗ ⇒ `the_chosen_quality_word_is_brighter_than_the_unchosen_ones` **FAILED** ✓（`chosen=185 unchosen=242` ✓）。
+
+**一处连带修正** ✓：`the_quality_segment_marks_the_chosen_option_with_the_accent` 原来采样选项的**中心** ✗ —— 而那里正是**词**所在 ✓ ⇒ 画上文字后它红了 ✓，而这是**正确**的红 ✓（不是误报 ✓）⇒ 采样点移到**选项的角上**（`left+4, top+4` ✓，仍在块内 ✓、避开居中的词 ✓）✓ —— 断言**没有被削弱** ✗：它仍然指名位置与颜色 ✓，并写明了为什么不在中心 ✓。
+
+**两条新的已知缺口** ✗：
+
+- **demo 有一行我们尚未建模** ✗ —— `保存后`（`:571` ✓，两个开关 chip `复制路径` ✓ `打开文件夹` ✓）夹在 `文件名` 与 `尺寸` 之间 ✓ ⇒ demo 的第一组其实是**三行** ✓，而 `FORM_ROWS` 是**两行** ✓ ⇒ 一旦实现那一行 ✓，**组边界与它下面所有行的 y 都会变** ✗ ⇒ 届时 `Row` 要加变体 ✓、`FORM_ROWS` 与 `Row::group()` 要更新 ✓，而 `the_size_row_opens_a_group_and_sits_sixteen_below_the_name_row` 之类的断言会**正好指出**该改哪里 ✓。
+- **尺寸格的 `宽`/`高` 与单位 `px` 未画** ✗ —— 它们是 `.cell-label`（13px ✓ `:237` ✓）与 `.dim-unit` ✓，位于**每个格子之前** ✓，而 `size_cell_rect` 把**整个格子**给了输入框 ✗ ⇒ 要画它们得先改**尺寸行的横向切分** ✓（让出 label 的宽度 ✓）⇒ 与"尺寸格接数字"同批做更省 ✓。

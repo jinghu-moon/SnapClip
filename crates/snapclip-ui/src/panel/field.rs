@@ -154,6 +154,35 @@ impl Row {
             Row::Quality => QUALITY_SEG_HEIGHT_DIP,
         }
     }
+
+    /// The row's label, one character for one character from the design: the save path
+    /// (`save-panel-demo-v3.html:542`), the file name (`:553`), the size (`:582`) and the quality
+    /// (`:630`). They are produced here rather than copied into the painter so the font subset's
+    /// list can call this and cannot drift from what is drawn.
+    pub fn label(self) -> &'static str {
+        match self {
+            Row::Path => "保存路径",
+            Row::Name => "文件名",
+            Row::Size => "尺寸",
+            Row::Quality => "质量",
+        }
+    }
+}
+
+/// The label row above a row's content: `.row-header { height: 22px }` (`:165`) sits `6` (`:164`)
+/// above the content it names, so the label's own rect is the content's top lifted by both. It
+/// spans the column rather than the field, because the design puts a row's other furniture — the
+/// size mode buttons, the quality switch — on the same line (`:583`, `:631`).
+pub fn label_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32, row: Row) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let content = field_rect(metrics, rects, scale, row);
+    let bottom = content.top - px(metrics.row_gap);
+    Rect {
+        left: content.left,
+        top: bottom - px(metrics.row_label_height),
+        right: content.right,
+        bottom,
+    }
 }
 
 /// The rect of one row's content box, from the column arithmetic the design already uses: a label
@@ -242,9 +271,20 @@ pub const QUALITY_SEG_INSET_DIP: f32 = 3.0;
 /// rather than assumed.
 pub const QUALITY_OPTION_WIDTH_DIP: f32 = 34.0;
 
-/// The options the design offers: `高`, `中`, `低` (`:641`–`:643`). The words themselves belong to
-/// the stage that rebuilds the embedded font subset; the count is geometry.
+/// The options the design offers (`:641`–`:643`). The count is geometry; the words are below.
 pub const QUALITY_OPTIONS: usize = 3;
+
+/// The three option words, verbatim from the design: `高`, `中`, `低` (`:641`, `:642`, `:643`), in
+/// the order the block slides through them.
+pub const QUALITY_OPTION_WORDS: [&str; QUALITY_OPTIONS] = ["高", "中", "低"];
+
+/// Every string the panel's form draws. The font subset's list calls this rather than copying the
+/// words, so a label added here cannot be drawn without the subset being rebuilt for it.
+pub fn form_drawn_strings() -> Vec<&'static str> {
+    let mut all: Vec<&'static str> = FORM_ROWS.iter().map(|row| row.label()).collect();
+    all.extend(QUALITY_OPTION_WORDS);
+    all
+}
 
 /// The height the segmented control is drawn at: `.seg { height: var(--row) }` (`:263`) and
 /// `--row: 28px` (`:47`). It is **not** the text field's 32, and the quality row's content box is
