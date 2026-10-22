@@ -10,3 +10,6 @@ publish = false
 # baked PNGs, so neither the capture crate nor the app gains an SVG dependency.
 [dependencies]
 resvg = "0.45"
+# Already in the tree as `resvg`'s own parser, so this adds no crate to the build; it is asked
+# directly because the preflight has to see elements the renderer would quietly ignore.
+roxmltree = "0.20"

@@ -1,6 +1,9 @@
 # 面板图标（Tabler）
 
-这 7 个图标都是 24×24 的描边文件，对应面板上的 7 个图形：
+目录里现在有 18 个 SVG（都已烘焙成 `.png` + `.rgba`）。下表是**已经在面板上用到的** 7 个；其余 11 个
+（`folder` / `folder-open` / `refresh` / `braces` / `copy` / `info-circle` / `grip-vertical` /
+`chevrons-left-right` / `link-off` / `minus` / `plus`）已烘好但还没有 `Glyph` 变体 —— 按"不留没有
+消费者的实现"，等各自的调用点出现时再加。
 
 | 文件 | 用在哪 | 来源 |
 | --- | --- | --- |
@@ -12,10 +15,13 @@
 | `check.svg` | 下拉里选中那一项的勾 | Tabler |
 | `link.svg` | 保存面板：尺寸行两格之间的锁定 | 设计稿自带的 `ICON.link` |
 
-`swap`…`check` 是 [Tabler Icons](https://tabler.io/icons)（MIT）的原文件。`link.svg` 不是：设计稿的
-`docs/design/save-panel-demo-v3.html:709` 自己画了这个图标（16 单位、三条子路径），照它重画成 24 单位
-才**和设计一致**，而换一个"看起来差不多"的 Tabler 图标则不是同一个图形 —— 所以这里用的是设计稿的路径，
-只加了一层 `scale(1.5)`（见文件内注释），**没有**改任何坐标数字。
+`swap`…`check` 是 [Tabler Icons](https://tabler.io/icons)（MIT）的原文件。`link.svg` 现在也是 Tabler 的原文件
+（`icons-tabler-filled` 的 `link`，24 单位、`fill="currentColor"`）。
+
+⚠️ **与设计稿有出入**：设计稿 `docs/design/save-panel-demo-v3.html:709` 自己画的 `ICON.link` 是**描边**的链条
+（16 单位、三条子路径），而这里放的是 Tabler 的**填充**版本 —— 两者**不是同一个图形**。要么把设计稿的路径按
+`viewBox="0 0 24 24"` 重做成文件，要么接受 Tabler 的观感；这是一个设计选择，不该由烘焙工具决定。
+（工具现在会**读文件自己的尺寸**，所以 16 单位的文件可以直接放进来，不再需要手工包 `scale(1.5)`。）
 
 面板上画出来的就是这些文件本身，**不是照着它们重画的线段**。
 
@@ -39,16 +45,26 @@ assets/icon/*.svg ──(cargo run -p icon-bake, resvg)──▶ assets/icon/*.p
   出图，浮层只负责贴图与着色。
 - **`resvg` 只出现在 `tools/icon-bake`**：它是开发期工具。浮层用的是烘好的 PNG，所以 capture crate
   与 app 都不引入 SVG 依赖。
-- **96×96**：24 单位 × 4，覆盖到 400% 缩放；面板按 14 dip 往下缩，这一步是超采样下采样。
+- **96×96**：画布按**文件自己的尺寸**缩放而来（24 单位 ⇒ ×4；16 单位 ⇒ ×6），覆盖到 400% 缩放；
+  面板按 14 dip 往下缩，这一步是超采样下采样。
+- **画布来自文件，不是假设的**：工具读 `usvg` 给出的固有尺寸再缩放，所以 16 单位的文件也**铺满画布**。
+  以前写死 24 单位，16 单位的文件会以 2/3 大小挤在左上角，唯一的办法是手工包一层 `scale(1.5)`。
+- **居中是被测出来的，不是假设的**：渲染后测 alpha bbox，把**像素整体平移**到画布中心（不是重渲染一次 ——
+  位移是整数像素，图就是渲染器画的那张）。加这一步时实测发现**18 个图标里有 3 个偏了 2 px**
+  （`check` / `folder` / `folder-open`：它们的画法看着对称，其实不是）。
+- **不可预测的 SVG 会被拒绝**：`<text>`/`<tspan>`/`<mask>`/`<image>`/动画/外部 `href`/`filter` 一律不烘 ——
+  换台机器或换个 resvg 小版本就会画出别的样子，而这种漂移**在只看本机对比的测试里是看不见的**。
 - **白色 + 透明底**：颜色留到绘制时给，所以一张 PNG 服务所有状态。
 - **改动 SVG 之后必须重烘**：`cargo run -p icon-bake`。忘了也没关系 —— `cargo test -p icon-bake`
   会重新渲染并逐字节比对，不一致就红。
+- **PNG 编码器用 `tiny_skia` 的**：另外实现过一版手写固定 Huffman + LZ77 的 DEFLATE，实测产物小 35–60%，
+  对 18 个开发期资产约合 **14 KB** —— 不值得为此维护一百八十行压缩代码。
 
 ## 换图标 / 加图标时
 
-1. 把 SVG 放进 `assets/icon/`（`viewBox="0 0 24 24"`；`currentColor` 由烘焙工具换成 `#ffffff`）。
-   工具的缩放是 `96 / 24`（`tools/icon-bake/src/main.rs:26`），**不看文件自己的 viewBox**，所以小于 24 单位
-   的画法要么按比例改坐标、要么用 `<g transform="scale(...)">` 包一层（`link.svg` 用的是后者）。
+1. 把 SVG 放进 `assets/icon/`（`currentColor` 由烘焙工具换成 `#ffffff`）。`viewBox` 是多少都行 ——
+   工具按文件自己的尺寸缩放到铺满 96×96，所以 16 单位的文件可以直接放（`viewBox="0 0 16 16"`）。
+   唯一会被拒绝的是上面列的"不可预测"元素。
 2. 跑 `cargo run -p icon-bake`。
 3. 在 `crates/snapclip-ui/src/panel/icons.rs` 的 `Glyph` 里加一个变体（`ICON_COUNT` / `ALL` / `name()` /
    `png()` 各一处），再在调用点用 `Glyph::新名字`。
@@ -58,9 +74,12 @@ assets/icon/*.svg ──(cargo run -p icon-bake, resvg)──▶ assets/icon/*.p
 ## 改完跑一次这两条
 
 ```
-cargo test -p icon-bake                                              # PNG 是否跟 SVG 一致
+cargo test -p icon-bake                                              # 产物是否跟 SVG 一致、是否居中、预检是否拦得住
 cargo test -p snapclip-capture --lib -- --ignored --test-threads=1 the_panel_glyphs the_glyph_tint
 ```
+
+第一条里除了"PNG 与 SVG 一致"，还有两条是**对着已提交的产物**断言的：**每个图标的墨都居中**（读
+`.rgba` 而不是当场渲染 —— 当场渲染天生居中，那样写就成同义反复了）、以及 `.rgba` 是**直通**像素。
 
 第二条在真 GPU 上画面板，按"每个图形自己方框里的墨"断言：图形落进自己的格子、墨量是线稿而不是
 一整块、并且**换一种状态色画出来的像素必须不同**（颜色矩阵没生效就会红）。
