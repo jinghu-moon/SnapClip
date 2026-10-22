@@ -697,6 +697,47 @@ pub fn paint_to_target_with_preview(
 
 #[cfg(test)]
 mod tests {
+    /// The directory row is the one above the name row, one row pitch apart, at every scale.
+    #[test]
+    fn the_directory_row_sits_above_the_name_row() {
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            let rects = DEMO.rects(scale);
+            let path = crate::panel::path_field_rect(&DEMO, &rects, scale);
+            let name = crate::panel::name_field_rect(&DEMO, &rects, scale);
+            assert!(
+                path.top < name.top,
+                "the directory row must be above the name row at {scale}: path.top={} name.top={}",
+                path.top,
+                name.top
+            );
+            let expected = (DEMO.row_pitch() as f32 * scale).round() as i32;
+            assert_eq!(
+                name.top - path.top,
+                expected,
+                "the two rows must be one row pitch apart at {scale}"
+            );
+        }
+    }
+
+    /// An idle directory field is filled and carries no visible border, by position and colour.
+    #[test]
+    fn the_directory_field_is_filled_and_has_no_border_when_idle() {
+        let canvas = Canvas::new(920, 520);
+        canvas.render();
+        let px = canvas.pixels();
+        let rects = DEMO.rects(1.0);
+        let field = crate::panel::path_field_rect(&DEMO, &rects, 1.0);
+        let fill = Px { b: 46, g: 41, r: 41, a: 255 };
+        assert_px(
+            &px,
+            field.left + 40,
+            field.top + 8,
+            fill,
+            3,
+            "an idle directory field must be filled with --fill over the surface",
+        );
+
+    }
     use super::*;
     use windows::Win32::Graphics::DirectWrite::DWRITE_FACTORY_TYPE_ISOLATED;
     use windows::Win32::Graphics::Gdi::{
@@ -1098,7 +1139,7 @@ mod tests {
         let rects = DEMO.rects(1.0);
         let field = crate::panel::name_field_rect(&DEMO, &rects, 1.0);
         // The fill the frame paints and the child is given: `--fill` over the surface.
-        let fill = Px { b: 41, g: 41, r: 46, a: 255 };
+        let fill = Px { b: 46, g: 41, r: 41, a: 255 };
         assert!(
             !close(fill, surface_px(), 3),
             "the fill has to differ from the surface, or an idle field would be invisible"
