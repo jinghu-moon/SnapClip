@@ -691,5 +691,26 @@ cargo run -p codec-bench --release -- --assert
 
 **两条新的已知缺口** ✗：
 
-- **demo 有一行我们尚未建模** ✗ —— `保存后`（`:571` ✓，两个开关 chip `复制路径` ✓ `打开文件夹` ✓）夹在 `文件名` 与 `尺寸` 之间 ✓ ⇒ demo 的第一组其实是**三行** ✓，而 `FORM_ROWS` 是**两行** ✓ ⇒ 一旦实现那一行 ✓，**组边界与它下面所有行的 y 都会变** ✗ ⇒ 届时 `Row` 要加变体 ✓、`FORM_ROWS` 与 `Row::group()` 要更新 ✓，而 `the_size_row_opens_a_group_and_sits_sixteen_below_the_name_row` 之类的断言会**正好指出**该改哪里 ✓。
+- ~~**demo 有一行我们尚未建模**~~ ✓ **已建模并画出**（本批 ✓，见下）。
 - **尺寸格的 `宽`/`高` 与单位 `px` 未画** ✗ —— 它们是 `.cell-label`（13px ✓ `:237` ✓）与 `.dim-unit` ✓，位于**每个格子之前** ✓，而 `size_cell_rect` 把**整个格子**给了输入框 ✗ ⇒ 要画它们得先改**尺寸行的横向切分** ✓（让出 label 的宽度 ✓）⇒ 与"尺寸格接数字"同批做更省 ✓。
+
+### `保存后` 行（本批）：一行"只有 header、没有字段"
+
+**demo 实读** ✓：`.form-row`（**不是 `.grp`** ✗，`:569` ✓）⇒ 它与 `位置`/`文件名` **同组** ✓；行内是 `.row-header.after-row { justify-content: flex-start; gap: 12px }`（`:302` ✓），label `保存后`（`:571` ✓）之后是两个 `role="switch"` 的 chip ✓（`复制路径` `:573` ✓、`打开文件夹` `:574` ✓，**默认关** ✓）；`.after-toggles { gap: 8px }`（`:303` ✓）、`.chip { height: 24px; padding: 0 10px; border-radius: 999px }`（`:192` ✓）。
+
+**结构上的新东西** ✗：这是**第一行没有字段** ✓ —— 它的 `.row-header` **就是整行** ✓ ⇒ 因此**没有** `.form-row { gap: 6px }`（`:164` ✓）✓。原公式 `label + gap + content` 会**多算 6 dip** ✗ ⇒ 引入 `Row::has_content()` ✓（`Saved` 为 `false` ✓），累加时**只在有内容时才加 gap 与 content_height** ✓；`content_height()` 对无内容行返回 **0** ✓ 并在文档里写明"**先问 `has_content`**" ✓。
+
+**顺带修正一处耦合** ✓：`label_rect` 原来是"**从内容矩形往上抬** `gap + label_height`" ✗ —— 对无内容行**没有意义** ✗ ⇒ 改为抽出 `row_label_top()` ✓（累加的唯一出处 ✓），`label_rect` 与 `field_rect` **都从它派生** ✓ ⇒ "往上抬"这种隐式耦合消失 ✓，且对既有行**结果不变** ✓（87 绿 ✓）。
+
+**门禁没有红，如实记录** ✗：`保存后` 三个字（`保` `存` `后`）**已在子集里** ✓（`保存路径` 已覆盖 ✓）⇒ 门禁**直接绿** ✓，**不需要重建** ✓。
+
+**两条变异都真红** ✓（备份逐字节比对 ✓）：
+- 把 `Row::Saved` 从 `FORM_ROWS` 去掉 ✗ ⇒ **9 条测试红** ✓（含 `the_after_save_row_sits_between_the_name_row_and_the_size_row` ✓、尺寸与质量的几何 ✓）⇒ 说明这一行**真的接进了布局** ✓，不是画了个孤儿 ✓；
+- label 画成**表面色** ✗ ⇒ `the_row_labels_are_drawn_above_their_rows` **FAILED** ✓（`Path's label ("保存路径") must put ink in its own row` ✓）。
+
+**两条期望按"预期正确变化"更新** ✓（不是为让错误实现通过 ✗）：`the_size_row_opens_a_group_and_sits_sixteen_below_the_name_row` ✓ 与 `the_size_row_sits_below_the_name_row_and_splits_into_two_cells` ✓ 原来量的是"**尺寸行比文件名行低 16**" ✗ —— 现在尺寸行的上一行是 `保存后` ✓ ⇒ 改为**从 `保存后` 行顶量**：它自己的 label 行 22 + 行间 12 + 组间 4 ✓（内容行再加 22 + 6 ✓）✓。
+
+**新增已知缺口** ✗：
+
+- **`保存后` 的两个 chip 未画、宽度也未预留** ✗ —— 与 `.link-hub` 同理 ✓：**画了不接就是假控件** ✗。**宽度未预留是有意的** ✓：chip 宽 = **文字宽 + 2×10**（`:192` ✓），而文字宽**要测量文本** ✗，`field.rs` 里没有设备上下文 ✗ ⇒ **不编造宽度** ✓（与尺寸格"不编造数字"同一条规矩 ✓）⇒ 等交互批（届时已有绘制目标 ✓）再定 ✓。已知的量 ✓：chip 高 **24** ✓、行内 gap **12** ✓、chip 间 gap **8** ✓。
+- **尺寸行还有两个模式钮与一个重置钮** ✗（本批实读 demo 时发现 ✓）：`数值` / `百分比`（`.size-mode-btn`，`:585`–`:586` ✓，默认 `数值` ✓）与一个 `.action` 重置钮（`:589` ✓，`aria-label="重置为原始大小"` ✓）⇒ 它们是**控件** ✓，同样留到交互批 ✓，且**它们的宽度会影响尺寸行的横向切分** ✗（`size_cell_rect` 现在把整行给了两个格子 ✓）⇒ 与"尺寸格接数字"同批处理更省 ✓。

@@ -946,7 +946,9 @@ mod tests {
     }
     /// Every row's label is drawn in the label row above it, and the row below does not steal its
     /// neighbour's ink. The design puts the label 22 dips tall with a 6 dip gap under it (`:165`,
-    /// `:164`), so the box each word is drawn into is arithmetic rather than a guess.
+    /// `:164`), so the box each word is drawn into is arithmetic rather than a guess. A row with no
+    /// content — the after-save row (`:569`–`:577`) — has no field to sit above, so for it the label
+    /// row is the whole row.
     #[test]
     fn the_row_labels_are_drawn_above_their_rows() {
         let canvas = Canvas::new(920, 520);
@@ -956,12 +958,21 @@ mod tests {
         for row in crate::panel::FORM_ROWS {
             let label = crate::panel::label_rect(&DEMO, &rects, 1.0, row);
             let field = crate::panel::field_rect(&DEMO, &rects, 1.0, row);
+            let has_content = row != crate::panel::Row::Saved;
             assert_eq!(
-                label.bottom,
-                field.top - DEMO.row_gap,
-                "{:?}'s label sits one gap above its row (:164)",
+                field.bottom > field.top,
+                has_content,
+                "{:?}'s content box is present exactly when the row has content",
                 row
             );
+            if has_content {
+                assert_eq!(
+                    label.bottom,
+                    field.top - DEMO.row_gap,
+                    "{:?}'s label sits one gap above its row (:164)",
+                    row
+                );
+            }
             assert_eq!(
                 label.bottom - label.top,
                 DEMO.row_label_height,
@@ -1351,17 +1362,25 @@ mod tests {
 
     #[test]
     fn the_size_row_sits_below_the_name_row_and_splits_into_two_cells() {
-        use crate::panel::field::{Row, SizeCell, field_rect, size_cell_rect};
+        use crate::panel::field::{Row, SizeCell, label_rect, size_cell_rect};
         for scale in [1.0f32, 1.25, 1.5, 2.0] {
             let rects = DEMO.rects(scale);
-            let name = field_rect(&DEMO, &rects, scale, Row::Name);
+            let saved = label_rect(&DEMO, &rects, scale, Row::Saved);
             let width = size_cell_rect(&DEMO, &rects, scale, SizeCell::Width);
             let height = size_cell_rect(&DEMO, &rects, scale, SizeCell::Height);
-            let one_group = (DEMO.group_pitch() as f32 * scale).round() as i32;
+            // From the after-save row's top: that row is a label row on its own, then the row gap,
+            // the group margin, the size row's label row and its gap — and the cells start there.
+            let expected = ((DEMO.row_label_height
+                + DEMO.row_spacing
+                + DEMO.group_spacing
+                + DEMO.row_label_height
+                + DEMO.row_gap) as f32
+                * scale)
+                .round() as i32;
             assert_eq!(
                 width.top,
-                name.top + one_group,
-                "the size row opens the second group, so it is 16 below the name row, not 12 (:163)"
+                saved.top + expected,
+                "the size row opens the second group below the after-save row (:163, :579)"
             );
             assert_eq!(height.top, width.top, "both cells sit on the same row");
             assert!(width.right < height.left, "the link hub sits between the two cells (:246)");
@@ -1371,6 +1390,10 @@ mod tests {
             );
         }
     }
+
+    /// The after-save row's label reaches the screen. It is covered by
+    /// `the_row_labels_are_drawn_above_their_rows`, which walks `FORM_ROWS` and therefore picks this
+    /// row up without being told about it.
 
     #[test]
     fn the_first_form_slot_starts_where_the_design_puts_it() {

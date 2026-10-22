@@ -113,98 +113,129 @@ pub fn path_field_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -
 pub enum Row {
     Path,
     Name,
+    Saved,
     Size,
     Quality,
 }
 
 /// Every row of the form, top to bottom, in the order the design lays them out: the path row
-/// (`:542`), the name row (`:556`), the size row (`:235`) and the quality row (`:637`). The layout
-/// walks this list to add up the rows above a given one, so a row missing from it is a row the rest
-/// of the form does not know about.
-pub const FORM_ROWS: [Row; 4] = [Row::Path, Row::Name, Row::Size, Row::Quality];
+/// (`:542`), the name row (`:556`), the after-save row (`:568`), the size row (`:235`) and the
+/// quality row (`:637`). The layout walks this list to add up the rows above a given one, so a row
+/// missing from it is a row the rest of the form does not know about.
+pub const FORM_ROWS: [Row; 5] = [
+    Row::Path,
+    Row::Name,
+    Row::Saved,
+    Row::Size,
+    Row::Quality,
+];
 
 impl Row {
     fn index(self) -> usize {
         match self {
             Row::Path => 0,
             Row::Name => 1,
-            Row::Size => 2,
-            Row::Quality => 3,
+            Row::Saved => 2,
+            Row::Size => 3,
+            Row::Quality => 4,
         }
     }
 
     /// Which of the design's three groups the row belongs to. Its own note on the group margin
-    /// spells them out — `组间 16 / 组内 12：位置·文件名 | 尺寸·质量 | 预估` (`:163`) — so the path
-    /// and name rows share a group, the size and quality rows share the next, and the estimate row
-    /// will open the last.
+    /// spells them out — `组间 16 / 组内 12：位置·文件名 | 尺寸·质量 | 预估` (`:163`) — so the path,
+    /// name and after-save rows share a group, the size and quality rows share the next, and the
+    /// estimate row will open the last. The after-save row carries no `.grp` (`:569`), which is why
+    /// it does not open a group even though it is not a field.
     fn group(self) -> i32 {
         match self {
-            Row::Path | Row::Name => 0,
+            Row::Path | Row::Name | Row::Saved => 0,
             Row::Size | Row::Quality => 1,
         }
+    }
+
+    /// Whether the row has a content box under its label. Most rows do, but the after-save row is a
+    /// `.row-header` on its own (`:569`–`:577`) — its label and its two chips are the whole row — so
+    /// it has no second child and therefore no `.form-row { gap: 6px }` (`:164`) either. Adding the
+    /// gap unconditionally would push every row below it down by six.
+    fn has_content(self) -> bool {
+        !matches!(self, Row::Saved)
     }
 
     /// The height of the row's content box. It is not the same for every row: a text field is
     /// `height: 32px` (`:167`), while the quality row's content is `.quality-line`, whose
     /// `min-height: var(--row)` is **28** (`:306`, `:47`). The rows below inherit the difference,
-    /// so it is stated per row rather than assumed to be the field height.
+    /// so it is stated per row rather than assumed to be the field height. The after-save row has no
+    /// content box at all, so its height is zero and callers must ask `has_content` first.
     fn content_height(self, metrics: &FrameMetrics) -> i32 {
         match self {
             Row::Path | Row::Name | Row::Size => metrics.field_height,
             Row::Quality => QUALITY_SEG_HEIGHT_DIP,
+            Row::Saved => 0,
         }
     }
 
     /// The row's label, one character for one character from the design: the save path
-    /// (`save-panel-demo-v3.html:542`), the file name (`:553`), the size (`:582`) and the quality
-    /// (`:630`). They are produced here rather than copied into the painter so the font subset's
-    /// list can call this and cannot drift from what is drawn.
+    /// (`save-panel-demo-v3.html:542`), the file name (`:553`), the after-save actions (`:571`), the
+    /// size (`:582`) and the quality (`:630`). They are produced here rather than copied into the
+    /// painter so the font subset's list can call this and cannot drift from what is drawn.
     pub fn label(self) -> &'static str {
         match self {
             Row::Path => "保存路径",
             Row::Name => "文件名",
+            Row::Saved => "保存后",
             Row::Size => "尺寸",
             Row::Quality => "质量",
         }
     }
 }
 
-/// The label row above a row's content: `.row-header { height: 22px }` (`:165`) sits `6` (`:164`)
-/// above the content it names, so the label's own rect is the content's top lifted by both. It
-/// spans the column rather than the field, because the design puts a row's other furniture — the
-/// size mode buttons, the quality switch — on the same line (`:583`, `:631`).
-pub fn label_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32, row: Row) -> Rect {
-    let px = |dip: i32| (dip as f32 * scale).round() as i32;
-    let content = field_rect(metrics, rects, scale, row);
-    let bottom = content.top - px(metrics.row_gap);
-    Rect {
-        left: content.left,
-        top: bottom - px(metrics.row_label_height),
-        right: content.right,
-        bottom,
-    }
-}
-
-/// The rect of one row's content box, from the column arithmetic the design already uses: a label
-/// row (`.row-header { height: 22px }`, `:165`), the gap under it (`.form-row { gap: 6px }`, `:164`),
-/// the row's content, and the gap to the next row (`.form { gap: 12px }`, `:162`) — plus the group's
-/// own margin when the next row opens a new group (`.form-row.grp { margin-top: 4px }`, `:163`),
-/// which is what makes groups sit 16 apart while rows inside one sit 12 apart.
+/// The top of a row's label, which is the top of the row itself. Every row starts with its label,
+/// and the rows above it are added up: a label row (`.row-header { height: 22px }`, `:165`), the gap
+/// under it (`.form-row { gap: 6px }`, `:164`) and the row's content — but only for a row that has
+/// content, because the after-save row is a header on its own. Then the gap to the next row
+/// (`.form { gap: 12px }`, `:162`), plus the group's own margin when the next row opens a new group
+/// (`.form-row.grp { margin-top: 4px }`, `:163`), which is what makes groups sit 16 apart while rows
+/// inside one sit 12 apart.
 ///
 /// The rows are added up rather than multiplied by an index, because their content heights differ
-/// and a single pitch would put the rows below the quality row in the wrong place. One function for
-/// every row, so a row cannot drift away from the others.
-pub fn field_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32, row: Row) -> Rect {
+/// and a single pitch would put the rows below the quality row in the wrong place.
+fn row_label_top(metrics: &FrameMetrics, rects: &FrameRects, scale: f32, row: Row) -> i32 {
     let px = |dip: i32| (dip as f32 * scale).round() as i32;
     let mut above = 0;
     for (index, candidate) in FORM_ROWS.iter().enumerate().take(row.index()) {
-        above += metrics.row_label_height + metrics.row_gap + candidate.content_height(metrics);
+        above += metrics.row_label_height;
+        if candidate.has_content() {
+            above += metrics.row_gap + candidate.content_height(metrics);
+        }
         above += metrics.row_spacing;
         if FORM_ROWS[index + 1].group() != candidate.group() {
             above += metrics.group_spacing;
         }
     }
-    let top = rects.form.top + px(above + metrics.row_label_height + metrics.row_gap);
+    rects.form.top + px(above)
+}
+
+/// The label row above a row's content: `.row-header { height: 22px }` (`:165`) sits `6` (`:164`)
+/// above the content it names, and for a row with no content it is the whole row. It spans the
+/// column rather than the field, because the design puts a row's other furniture — the size mode
+/// buttons, the quality switch, the after-save chips — on the same line (`:583`, `:631`, `:572`).
+pub fn label_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32, row: Row) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let top = row_label_top(metrics, rects, scale, row);
+    Rect {
+        left: rects.form.left,
+        top,
+        right: rects.form.right,
+        bottom: top + px(metrics.row_label_height),
+    }
+}
+
+/// The rect of one row's content box, which sits a label row and a gap below the row's own top. One
+/// function for every row, so a row cannot drift away from the others. Rows without content — the
+/// after-save row — have no box here; ask `Row::has_content` before using the result.
+pub fn field_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32, row: Row) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let top = row_label_top(metrics, rects, scale, row) + px(metrics.row_label_height + metrics.row_gap);
     Rect {
         left: rects.form.left,
         top,
@@ -416,18 +447,65 @@ mod tests {
     fn the_size_row_opens_a_group_and_sits_sixteen_below_the_name_row() {
         for scale in [1.0f32, 1.25, 1.5, 2.0] {
             let rects = metrics().rects(scale);
-            let name = field_rect(&metrics(), &rects, scale, Row::Name);
-            let size = field_rect(&metrics(), &rects, scale, Row::Size);
+            let saved = label_rect(&metrics(), &rects, scale, Row::Saved);
+            let size = label_rect(&metrics(), &rects, scale, Row::Size);
             let one_row = (metrics().row_pitch() as f32 * scale).round() as i32;
             let one_group = (metrics().group_pitch() as f32 * scale).round() as i32;
+            // The after-save row is a header with no content, so from its top to the next row's top
+            // there is its own label height, the row gap and the group margin — 22 + 12 + 4.
+            let expected = ((metrics().row_label_height
+                + metrics().row_spacing
+                + metrics().group_spacing) as f32
+                * scale)
+                .round() as i32;
             assert_eq!(
-                size.top - name.top,
-                one_group,
-                "the size row opens a group, so it is 16 apart from the name row, not 12 (:163)"
+                size.top - saved.top,
+                expected,
+                "the size row opens a group below the after-save row (:163)"
             );
             assert!(
                 one_group > one_row,
                 "a group pitch has to be larger than a row pitch or the margin is not being added"
+            );
+        }
+    }
+
+    /// The after-save row is a `.row-header` on its own (`:569`–`:577`): no field, and therefore no
+    /// `.form-row { gap: 6px }` (`:164`) either. Its whole row is its label.
+    #[test]
+    fn the_after_save_row_is_a_header_with_no_content() {
+        assert!(!Row::Saved.has_content());
+        for row in [Row::Path, Row::Name, Row::Size, Row::Quality] {
+            assert!(row.has_content(), "{row:?} has a content box");
+        }
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            let rects = metrics().rects(scale);
+            let label = label_rect(&metrics(), &rects, scale, Row::Saved);
+            let expected = (metrics().row_label_height as f32 * scale).round() as i32;
+            assert_eq!(
+                label.bottom - label.top,
+                expected,
+                "the after-save row is one label row tall"
+            );
+        }
+    }
+
+    /// The row order the design lays out, checked against the row above and below rather than
+    /// against absolute numbers, so a row inserted in the wrong place fails here.
+    #[test]
+    fn the_after_save_row_sits_between_the_name_row_and_the_size_row() {
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            let rects = metrics().rects(scale);
+            let name = label_rect(&metrics(), &rects, scale, Row::Name);
+            let saved = label_rect(&metrics(), &rects, scale, Row::Saved);
+            let size = label_rect(&metrics(), &rects, scale, Row::Size);
+            assert!(name.top < saved.top, "the after-save row is below the name row (:568)");
+            assert!(saved.top < size.top, "the after-save row is above the size row (:579)");
+            let one_row = (metrics().row_pitch() as f32 * scale).round() as i32;
+            assert_eq!(
+                saved.top - name.top,
+                one_row,
+                "the after-save row is inside the first group, so it is one row pitch down"
             );
         }
     }
