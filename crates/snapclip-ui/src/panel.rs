@@ -41,9 +41,12 @@ pub use checkbox::{Checkbox, CheckboxState};
 pub use dropdown::{Dropdown, DropdownKey, DropdownTarget};
 pub use feedback::{Toast, Tooltip};
 pub use field::{
-    EDIT_FONT_DIP, EDIT_INSET_DIP, EDIT_PADDING_DIP, FieldColours, FieldState, INPUT_RADIUS_DIP,
-    FORM_FIELD_TAB_STOPS, Row, SizeCell, edit_font_height, field_colours, field_rect,
-    name_field_rect, path_field_rect, size_cell_rect,
+    EDIT_FONT_DIP, EDIT_INSET_DIP, EDIT_PADDING_DIP, FieldColours, FieldState, FORM_ROWS,
+    FORM_FIELD_TAB_STOPS, INPUT_RADIUS_DIP, QUALITY_OPTIONS, QUALITY_OPTION_WIDTH_DIP,
+    QUALITY_SEG_HEIGHT_DIP, QUALITY_SEG_INNER_RADIUS_DIP, QUALITY_SEG_INSET_DIP,
+    QUALITY_SEG_RADIUS_DIP, QUALITY_SEG_WIDTH_DIP, Row, SizeCell, edit_font_height, field_colours,
+    field_rect, name_field_rect, path_field_rect, quality_option_rect, quality_seg_rect,
+    size_cell_rect,
 };
 pub use frame::{
     DEMO, DEMO_PALETTE, Frame, FrameBrushes, FrameMetrics, FramePalette, FrameRects,

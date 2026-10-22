@@ -114,34 +114,73 @@ pub enum Row {
     Path,
     Name,
     Size,
+    Quality,
 }
 
+/// Every row of the form, top to bottom, in the order the design lays them out: the path row
+/// (`:542`), the name row (`:556`), the size row (`:235`) and the quality row (`:637`). The layout
+/// walks this list to add up the rows above a given one, so a row missing from it is a row the rest
+/// of the form does not know about.
+pub const FORM_ROWS: [Row; 4] = [Row::Path, Row::Name, Row::Size, Row::Quality];
+
 impl Row {
-    fn index(self) -> i32 {
+    fn index(self) -> usize {
         match self {
             Row::Path => 0,
             Row::Name => 1,
             Row::Size => 2,
+            Row::Quality => 3,
+        }
+    }
+
+    /// Which of the design's three groups the row belongs to. Its own note on the group margin
+    /// spells them out — `组间 16 / 组内 12：位置·文件名 | 尺寸·质量 | 预估` (`:163`) — so the path
+    /// and name rows share a group, the size and quality rows share the next, and the estimate row
+    /// will open the last.
+    fn group(self) -> i32 {
+        match self {
+            Row::Path | Row::Name => 0,
+            Row::Size | Row::Quality => 1,
+        }
+    }
+
+    /// The height of the row's content box. It is not the same for every row: a text field is
+    /// `height: 32px` (`:167`), while the quality row's content is `.quality-line`, whose
+    /// `min-height: var(--row)` is **28** (`:306`, `:47`). The rows below inherit the difference,
+    /// so it is stated per row rather than assumed to be the field height.
+    fn content_height(self, metrics: &FrameMetrics) -> i32 {
+        match self {
+            Row::Path | Row::Name | Row::Size => metrics.field_height,
+            Row::Quality => QUALITY_SEG_HEIGHT_DIP,
         }
     }
 }
 
-/// The rect of one form slot, from the slot arithmetic the design already uses: a label row
-/// (`.row-header { height: 22px }`, `:165`), the gap under it (`.form-row { gap: 6px }`, `:164`),
-/// the field (`height: 32px`, `:167`), and the gap between rows (`.form { gap: 12px }`, `:162`).
-/// One function for every row, so a second field cannot drift away from the first.
+/// The rect of one row's content box, from the column arithmetic the design already uses: a label
+/// row (`.row-header { height: 22px }`, `:165`), the gap under it (`.form-row { gap: 6px }`, `:164`),
+/// the row's content, and the gap to the next row (`.form { gap: 12px }`, `:162`) — plus the group's
+/// own margin when the next row opens a new group (`.form-row.grp { margin-top: 4px }`, `:163`),
+/// which is what makes groups sit 16 apart while rows inside one sit 12 apart.
+///
+/// The rows are added up rather than multiplied by an index, because their content heights differ
+/// and a single pitch would put the rows below the quality row in the wrong place. One function for
+/// every row, so a row cannot drift away from the others.
 pub fn field_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32, row: Row) -> Rect {
     let px = |dip: i32| (dip as f32 * scale).round() as i32;
-    let pitch =
-        metrics.row_label_height + metrics.row_gap + metrics.field_height + metrics.row_spacing;
-    let top = rects.form.top
-        + px(row.index() * pitch)
-        + px(metrics.row_label_height + metrics.row_gap);
+    let mut above = 0;
+    for (index, candidate) in FORM_ROWS.iter().enumerate().take(row.index()) {
+        above += metrics.row_label_height + metrics.row_gap + candidate.content_height(metrics);
+        above += metrics.row_spacing;
+        if FORM_ROWS[index + 1].group() != candidate.group() {
+            above += metrics.group_spacing;
+        }
+    }
+    let top = rects.form.top + px(above + metrics.row_label_height + metrics.row_gap);
     Rect {
         left: rects.form.left,
         top,
         right: rects.form.right,
-        bottom: top + px(metrics.field_height),
+        bottom: top + px(row.content_height(metrics)),
     }
 }
 
@@ -182,6 +221,72 @@ pub fn size_cell_rect(
         top: row.top,
         right,
         bottom: row.bottom,
+    }
+}
+
+/// `--r-seg: 7px` (`:57`) — the segmented track's corner.
+pub const QUALITY_SEG_RADIUS_DIP: f32 = 7.0;
+
+/// `--r-seg-inner: 4px` (`:58`) — the selected block's corner, and the options' own.
+pub const QUALITY_SEG_INNER_RADIUS_DIP: f32 = 4.0;
+
+/// `.seg { width: 108px }` (`:263`) — the whole track.
+pub const QUALITY_SEG_WIDTH_DIP: f32 = 108.0;
+
+/// `.seg.quality { --seg-inset: 3px }` (`:264`) — the track's padding, which the selected block is
+/// inset by on all four sides.
+pub const QUALITY_SEG_INSET_DIP: f32 = 3.0;
+
+/// `.seg.quality { --seg-w: 34px }` (`:264`) — one option's width, and therefore how far the block
+/// slides per step. Three options and the two insets make up the track exactly, which is asserted
+/// rather than assumed.
+pub const QUALITY_OPTION_WIDTH_DIP: f32 = 34.0;
+
+/// The options the design offers: `高`, `中`, `低` (`:641`–`:643`). The words themselves belong to
+/// the stage that rebuilds the embedded font subset; the count is geometry.
+pub const QUALITY_OPTIONS: usize = 3;
+
+/// The height the segmented control is drawn at: `.seg { height: var(--row) }` (`:263`) and
+/// `--row: 28px` (`:47`). It is **not** the text field's 32, and the quality row's content box is
+/// this height rather than the field height.
+pub const QUALITY_SEG_HEIGHT_DIP: i32 = 28;
+
+/// The segmented control's track. `.quality-line` is a row with `justify-content: space-between`
+/// (`:306`), so the control sits at the end of the form column, and its height is the row's content
+/// box, which for this row is `--row`.
+pub fn quality_seg_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -> Rect {
+    let px = |dip: f32| (dip * scale).round() as i32;
+    let row = field_rect(metrics, rects, scale, Row::Quality);
+    let width = px(QUALITY_SEG_WIDTH_DIP);
+    Rect {
+        left: row.right - width,
+        top: row.top,
+        right: row.right,
+        bottom: row.bottom,
+    }
+}
+
+/// One option inside the track: the rect it occupies, and — when it is the chosen one — the rect
+/// the block is drawn at. The design uses one geometry for both: `.opt { width: var(--seg-w) }`
+/// inside the track's `padding: var(--seg-inset)` (`:266`), and `.block { left/top/bottom:
+/// var(--seg-inset); width: var(--seg-w); transform: translateX(index * var(--seg-w)) }` (`:265`),
+/// which lands on the same rect.
+pub fn quality_option_rect(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    index: usize,
+) -> Rect {
+    let px = |dip: f32| (dip * scale).round() as i32;
+    let track = quality_seg_rect(metrics, rects, scale);
+    let inset = px(QUALITY_SEG_INSET_DIP);
+    let width = px(QUALITY_OPTION_WIDTH_DIP);
+    let left = track.left + inset + width * index as i32;
+    Rect {
+        left,
+        top: track.top + inset,
+        right: left + width,
+        bottom: track.bottom - inset,
     }
 }
 
@@ -261,5 +366,115 @@ mod tests {
             FORM_FIELD_TAB_STOPS, 2,
             "the directory and the name are both focusable, and a third added without declaring it here fails"
         );
+    }
+
+    /// The size row opens the second group, so it sits one group pitch — 12 + 4 — below the name
+    /// row rather than the 12 that separates rows inside a group. The design's own note says groups
+    /// are 16 apart (`:163`), and without the margin the size, quality and estimate rows all creep
+    /// upwards by 4 dips each.
+    #[test]
+    fn the_size_row_opens_a_group_and_sits_sixteen_below_the_name_row() {
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            let rects = metrics().rects(scale);
+            let name = field_rect(&metrics(), &rects, scale, Row::Name);
+            let size = field_rect(&metrics(), &rects, scale, Row::Size);
+            let one_row = (metrics().row_pitch() as f32 * scale).round() as i32;
+            let one_group = (metrics().group_pitch() as f32 * scale).round() as i32;
+            assert_eq!(
+                size.top - name.top,
+                one_group,
+                "the size row opens a group, so it is 16 apart from the name row, not 12 (:163)"
+            );
+            assert!(
+                one_group > one_row,
+                "a group pitch has to be larger than a row pitch or the margin is not being added"
+            );
+        }
+    }
+
+    /// The quality row stays inside its group, so it is one ordinary row pitch below the size row.
+    #[test]
+    fn the_quality_row_stays_inside_its_group() {
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            let rects = metrics().rects(scale);
+            let size = field_rect(&metrics(), &rects, scale, Row::Size);
+            let quality = field_rect(&metrics(), &rects, scale, Row::Quality);
+            let one_row = (metrics().row_pitch() as f32 * scale).round() as i32;
+            assert_eq!(
+                quality.top - size.top,
+                one_row,
+                "size and quality share a group, so only the 12 dip row gap separates them (:162)"
+            );
+        }
+    }
+
+    /// The row's content is not always the field height: the quality row's is `--row`, which is 28.
+    /// A row that assumed 32 would put everything below it 4 dips too low.
+    #[test]
+    fn the_quality_row_is_as_tall_as_the_segment_and_not_as_tall_as_a_field() {
+        let rects = metrics().rects(1.0);
+        let quality = field_rect(&metrics(), &rects, 1.0, Row::Quality);
+        assert_eq!(
+            quality.bottom - quality.top,
+            QUALITY_SEG_HEIGHT_DIP,
+            "the quality row's content is .quality-line, whose min-height is --row (:306, :47)"
+        );
+        assert_ne!(
+            QUALITY_SEG_HEIGHT_DIP, metrics().field_height,
+            "if these ever become equal this test stops meaning anything"
+        );
+    }
+
+    /// Three options and the two insets add up to the track exactly. The design states the three
+    /// numbers separately (`:263`, `:264`), so the arithmetic that ties them together is checked
+    /// rather than trusted: a wrong option width would leave a gap or overhang at the end of the
+    /// track, which is the kind of thing a screenshot shows and a colour assertion does not.
+    #[test]
+    fn three_options_and_two_insets_make_up_the_track() {
+        let metrics = metrics();
+        let rects = metrics.rects(1.0);
+        let track = quality_seg_rect(&metrics, &rects, 1.0);
+        assert_eq!(
+            track.right - track.left,
+            QUALITY_SEG_WIDTH_DIP as i32,
+            ".seg has width 108px (:263)"
+        );
+        assert_eq!(
+            (QUALITY_OPTION_WIDTH_DIP * QUALITY_OPTIONS as f32 + 2.0 * QUALITY_SEG_INSET_DIP) as i32,
+            QUALITY_SEG_WIDTH_DIP as i32,
+            "3 x 34 + 2 x 3 must be the 108 dip track (:263, :264)"
+        );
+        let first = quality_option_rect(&metrics, &rects, 1.0, 0);
+        let last = quality_option_rect(&metrics, &rects, 1.0, QUALITY_OPTIONS - 1);
+        assert_eq!(
+            first.left,
+            track.left + QUALITY_SEG_INSET_DIP as i32,
+            "the first option starts one inset inside the track (:264, :266)"
+        );
+        assert_eq!(
+            last.right,
+            track.right - QUALITY_SEG_INSET_DIP as i32,
+            "the last option ends one inset before the track does, or the arithmetic above is wrong"
+        );
+    }
+
+    /// The control sits at the end of the form column: `.quality-line` is a space-between row
+    /// (`:306`), so its right edge is the column's.
+    #[test]
+    fn the_quality_segment_ends_at_the_form_column() {
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            let rects = metrics().rects(scale);
+            let track = quality_seg_rect(&metrics(), &rects, scale);
+            assert_eq!(
+                track.right, rects.form.right,
+                "the segmented control ends at the form column's right edge at {scale} (:306)"
+            );
+            assert!(track.left > rects.form.left, "the track is narrower than the column");
+        }
+    }
+
+    /// The local shorthand, so the tests read like the design rather than like `crate::panel::DEMO`.
+    fn metrics() -> FrameMetrics {
+        crate::panel::DEMO
     }
 }

@@ -303,6 +303,10 @@ pub struct Frame<'a> {
     /// The bitmap is built by the caller because only the caller knows whether the pixels are the
     /// capture or the development entry's synthetic stand-in.
     pub preview: Option<(&'a ID2D1Bitmap, u32, u32)>,
+    /// Which quality option the segmented control marks as chosen, by index into the design's three
+    /// (`:641`–`:643`). It is the one piece of state the control has so far: the options' words, the
+    /// click handling and the setting it writes back belong to later stages.
+    pub quality: usize,
 }
 
 impl Frame<'_> {
@@ -507,6 +511,22 @@ impl Frame<'_> {
             }
         }
 
+        // The quality row's segmented control: a track with a block marking the chosen option
+        // (`:263`–`:265`). It is not a field — there is no child window and no border rule — so it is
+        // painted here rather than inside the field loop above. The options' words are text, and
+        // every drawn character has to be in the embedded subset, so they belong to the stage that
+        // rebuilds it.
+        let seg = crate::panel::quality_seg_rect(self.metrics, self.rects, self.scale);
+        let seg_radius = (crate::panel::QUALITY_SEG_RADIUS_DIP * self.scale).round() as i32;
+        painter.fill_round(seg, seg_radius, &self.brushes.field_fill);
+        if self.quality < crate::panel::QUALITY_OPTIONS {
+            let block =
+                crate::panel::quality_option_rect(self.metrics, self.rects, self.scale, self.quality);
+            let block_radius =
+                (crate::panel::QUALITY_SEG_INNER_RADIUS_DIP * self.scale).round() as i32;
+            painter.fill_round(block, block_radius, &self.brushes.accent);
+        }
+
         if let Some((text, format)) = self.title {
             painter.draw_text(
                 text,
@@ -663,6 +683,7 @@ pub fn paint_to_dc_with_preview(
         title: Some((TITLE, &title)),
         field_state,
         preview: preview.as_ref().map(|(b, w, h)| (b, *w, *h)),
+        quality: 0,
     }
     .paint(&painter);
     unsafe { target.EndDraw(None, None)? };
@@ -720,6 +741,7 @@ pub fn paint_to_target_with_preview(
         title: Some((TITLE, &title)),
         field_state: crate::panel::FieldState::Idle,
         preview: preview.as_ref().map(|(b, w, h)| (b, *w, *h)),
+        quality: 0,
     }
     .paint(&painter);
     unsafe { target.EndDraw(None, None)? };
@@ -804,6 +826,40 @@ mod tests {
             let field = crate::panel::size_cell_rect(&DEMO, &rects, 1.0, cell);
             assert_idle_field(&px, field, what);
         }
+    }
+
+    /// The segmented control marks the chosen option with an accent block and leaves the others on
+    /// the track's fill. Both are named by position and colour: the block's centre is the accent, and
+    /// a neighbouring option's centre is still the fill, so a control that marked every option, or
+    /// marked none, or marked the wrong one, fails here.
+    #[test]
+    fn the_quality_segment_marks_the_chosen_option_with_the_accent() {
+        let canvas = Canvas::new(920, 520);
+        canvas.render();
+        let px = canvas.pixels();
+        let rects = DEMO.rects(1.0);
+        let track = crate::panel::quality_seg_rect(&DEMO, &rects, 1.0);
+        let centre = |rect: snapclip_model::geometry::Rect| {
+            ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2)
+        };
+
+        let chosen = crate::panel::quality_option_rect(&DEMO, &rects, 1.0, 0);
+        let (cx, cy) = centre(chosen);
+        assert_px(&px, cx, cy, fill_rgb(31, 117, 219), 6, "the chosen option is --accent (:265)");
+
+        let other = crate::panel::quality_option_rect(&DEMO, &rects, 1.0, 1);
+        let (ox, oy) = centre(other);
+        assert_px(&px, ox, oy, fill_rgb(41, 41, 46), 6, "an unchosen option is the track's --fill (:263)");
+
+        // The track itself is filled even where no option is: the last inset's worth of pixels to
+        // the right of the third option belongs to the track, not to the surface behind it.
+        let last = crate::panel::quality_option_rect(&DEMO, &rects, 1.0, crate::panel::QUALITY_OPTIONS - 1);
+        let (lx, ly) = centre(last);
+        assert_px(&px, lx, ly, fill_rgb(41, 41, 46), 6, "the third option's cell is track fill (:263)");
+        assert!(
+            track.right > last.right,
+            "the track has to extend past the last option, or the insets are not being applied"
+        );
     }
     use super::*;
     use windows::Win32::Graphics::DirectWrite::DWRITE_FACTORY_TYPE_ISOLATED;
@@ -1134,11 +1190,11 @@ mod tests {
             let name = field_rect(&DEMO, &rects, scale, Row::Name);
             let width = size_cell_rect(&DEMO, &rects, scale, SizeCell::Width);
             let height = size_cell_rect(&DEMO, &rects, scale, SizeCell::Height);
-            let one_pitch = (DEMO.row_pitch() as f32 * scale).round() as i32;
+            let one_group = (DEMO.group_pitch() as f32 * scale).round() as i32;
             assert_eq!(
                 width.top,
-                name.top + one_pitch,
-                "the size row is one pitch below the name row (:163)"
+                name.top + one_group,
+                "the size row opens the second group, so it is 16 below the name row, not 12 (:163)"
             );
             assert_eq!(height.top, width.top, "both cells sit on the same row");
             assert!(width.right < height.left, "the link hub sits between the two cells (:246)");
