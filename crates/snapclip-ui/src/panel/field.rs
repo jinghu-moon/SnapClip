@@ -98,8 +98,43 @@ pub fn field_colours(state: FieldState, surface: [u8; 4]) -> FieldColours {
 /// The rect of the first form slot's field, derived from the design's own slot arithmetic rather
 /// than from a second set of numbers: the label row, its gap, then the field.
 pub fn name_field_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -> Rect {
+    field_rect(metrics, rects, scale, Row::Name)
+}
+
+/// The save path field, the first row of the form.
+pub fn path_field_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -> Rect {
+    field_rect(metrics, rects, scale, Row::Path)
+}
+
+/// Which row of the form a field sits in. The design puts the save path above the file name
+/// (`save-panel-demo-v3.html:542` is the path row, `:556` the name row), so the path is row zero
+/// even though the name field existed first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Row {
+    Path,
+    Name,
+}
+
+impl Row {
+    fn index(self) -> i32 {
+        match self {
+            Row::Path => 0,
+            Row::Name => 1,
+        }
+    }
+}
+
+/// The rect of one form slot, from the slot arithmetic the design already uses: a label row
+/// (`.row-header { height: 22px }`, `:165`), the gap under it (`.form-row { gap: 6px }`, `:164`),
+/// the field (`height: 32px`, `:167`), and the gap between rows (`.form { gap: 12px }`, `:162`).
+/// One function for every row, so a second field cannot drift away from the first.
+pub fn field_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32, row: Row) -> Rect {
     let px = |dip: i32| (dip as f32 * scale).round() as i32;
-    let top = rects.form.top + px(metrics.row_label_height + metrics.row_gap);
+    let pitch =
+        metrics.row_label_height + metrics.row_gap + metrics.field_height + metrics.row_spacing;
+    let top = rects.form.top
+        + px(row.index() * pitch)
+        + px(metrics.row_label_height + metrics.row_gap);
     Rect {
         left: rects.form.left,
         top,
@@ -108,10 +143,10 @@ pub fn name_field_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -
     }
 }
 
-/// How many fields take part in tab navigation in a panel with a single field. The real window
-/// keeps this number true by creating exactly one `WS_TABSTOP` child; the test pins it so adding a
-/// field without adding it here fails rather than silently changing the tab order.
-pub const NAME_FIELD_TAB_STOPS: usize = 1;
+/// How many fields take part in tab navigation. The real window keeps this number true by creating
+/// exactly that many `WS_TABSTOP` children; the test pins it so adding a field without adding it
+/// here fails rather than silently changing the tab order.
+pub const FORM_FIELD_TAB_STOPS: usize = 2;
 
 #[cfg(test)]
 mod tests {
@@ -165,8 +200,10 @@ mod tests {
             assert_eq!(field.right, rects.form.right, "the field spans the form column");
             assert_eq!(
                 field.top,
-                rects.form.top + px(metrics.row_label_height + metrics.row_gap),
-                "label row {} plus gap {} then the field (:165, :164)",
+                rects.form.top
+                    + px(metrics.row_pitch())
+                    + px(metrics.row_label_height + metrics.row_gap),
+                "the directory row takes the first slot; below it, label {} plus gap {} then the field (:165, :164)",
                 metrics.row_label_height,
                 metrics.row_gap
             );
@@ -174,10 +211,13 @@ mod tests {
         }
     }
 
-    /// One field, one tab stop. Adding a field without declaring it here fails rather than
+    /// Two fields, two tab stops. Adding a field without declaring it here fails rather than
     /// silently changing the tab order.
     #[test]
-    fn the_only_tab_stop_in_an_empty_panel_is_the_name_field() {
-        assert_eq!(NAME_FIELD_TAB_STOPS, 1, "the first panel has exactly one focusable field");
+    fn the_first_panel_declares_both_of_its_fields() {
+        assert_eq!(
+            FORM_FIELD_TAB_STOPS, 2,
+            "the directory and the name are both focusable, and a third added without declaring it here fails"
+        );
     }
 }
