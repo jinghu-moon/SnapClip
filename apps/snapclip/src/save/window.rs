@@ -435,10 +435,11 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DispatchMessageW, GetMessageW, LoadCursorW, RegisterClassW, SetWindowLongPtrW,
-        SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, IDC_ARROW,
+        CreateWindowExW, DispatchMessageW, GetClassNameW, GetMessageW, GetWindow, GetWindowLongW,
+        GetWindowRect, LoadCursorW, RegisterClassW, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+        TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWL_EXSTYLE, GWLP_USERDATA, GW_HWNDPREV, IDC_ARROW,
         MSG, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, WNDCLASSW, WS_CAPTION, WS_EX_TOOLWINDOW,
-        WS_OVERLAPPED, WS_SYSMENU,
+        WS_EX_TOPMOST, WS_OVERLAPPED, WS_SYSMENU,
     };
 
     let class_name: Vec<u16> = "SnapClipSavePanel\0".encode_utf16().collect();
@@ -468,9 +469,12 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
         return;
     }
 
+    // Topmost, because the windows this panel replaces are: the capture overlay and its dim layer
+    // are both `WS_EX_TOPMOST`, and a panel created without it is painted underneath them and
+    // reported as visible by every check that only asks the window about itself.
     let hwnd = unsafe {
         CreateWindowExW(
-            WS_EX_TOOLWINDOW,
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
             class_name.as_ptr(),
             title.as_ptr(),
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
@@ -563,11 +567,41 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
             let mut rect: windows_sys::Win32::Foundation::RECT = std::mem::zeroed();
             let got = windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut rect);
             let visible = windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd);
+            let mut screen: windows_sys::Win32::Foundation::RECT = std::mem::zeroed();
+            let screen_ok = GetWindowRect(hwnd, &mut screen);
+            let own_topmost =
+                GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST != 0;
             eprintln!(
-                "[save-panel] shown hwnd={hwnd:p} visible={visible} client={}x{} (GetClientRect={got})",
+                "[save-panel] shown hwnd={hwnd:p} visible={visible} client={}x{} (GetClientRect={got}) \
+                 rect=({},{})-({},{}) (GetWindowRect={screen_ok}) topmost={own_topmost}",
                 rect.right - rect.left,
-                rect.bottom - rect.top
+                rect.bottom - rect.top,
+                screen.left,
+                screen.top,
+                screen.right,
+                screen.bottom,
             );
+            // Who is above us, and are they topmost? The capture side's overlay and dim layer are,
+            // so if either is still up and visible the panel is painted underneath it no matter what
+            // the window says about itself. Class names identify them: SnapClipCaptureOverlay and the
+            // dim layer's class.
+            let mut above = GetWindow(hwnd, GW_HWNDPREV);
+            let mut step = 0;
+            while !above.is_null() && step < 6 {
+                let mut class: [u16; 128] = [0; 128];
+                let len = GetClassNameW(above, class.as_mut_ptr(), class.len() as i32);
+                let name = String::from_utf16_lossy(&class[..len.max(0) as usize]);
+                let ex = GetWindowLongW(above, GWL_EXSTYLE) as u32;
+                let above_visible =
+                    windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible(above);
+                eprintln!(
+                    "[save-panel]   above[{step}] hwnd={above:p} class={name:?} \
+                     visible={above_visible} topmost={}",
+                    ex & WS_EX_TOPMOST != 0
+                );
+                above = GetWindow(above, GW_HWNDPREV);
+                step += 1;
+            }
         }
     }
 
