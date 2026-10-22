@@ -328,6 +328,9 @@ impl ShellHandle {
     pub fn close(mut self) {
         self.request_close();
         self.join();
+        // The window is gone and the thread is joined; clearing the handle keeps `Drop` from
+        // posting a second `WM_CLOSE` to a number the system is free to hand to another window.
+        self.hwnd = 0;
     }
 
     /// Wait for the window to be closed by the user, then join. Used by the development entry, which
@@ -339,13 +342,23 @@ impl ShellHandle {
     fn request_close(&mut self) {
         #[cfg(windows)]
         if self.hwnd != 0 {
-            unsafe {
-                windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
-                    self.hwnd as _,
-                    windows_sys::Win32::UI::WindowsAndMessaging::WM_CLOSE,
-                    0,
-                    0,
-                );
+            // A window handle is reused once its window is destroyed, and this handle may belong
+            // to a panel the user already closed. Posting `WM_CLOSE` to a reused number closes
+            // whatever window inherited it — in practice the panel that was just opened, which is
+            // how a second `Ctrl+S` produced neither a panel nor an error. Ask whether the window
+            // still exists first, and skip the post when it does not.
+            let alive = unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::IsWindow(self.hwnd as _)
+            } != 0;
+            if alive {
+                unsafe {
+                    windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+                        self.hwnd as _,
+                        windows_sys::Win32::UI::WindowsAndMessaging::WM_CLOSE,
+                        0,
+                        0,
+                    );
+                }
             }
         }
     }
@@ -360,18 +373,9 @@ impl ShellHandle {
 impl Drop for ShellHandle {
     fn drop(&mut self) {
         // A handle dropped without `close` still must not leak a window thread, and the `Drop` of
-        // `ShellHandle::close`'s joined thread is already gone by now.
-        #[cfg(windows)]
-        if self.hwnd != 0 {
-            unsafe {
-                windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
-                    self.hwnd as _,
-                    windows_sys::Win32::UI::WindowsAndMessaging::WM_CLOSE,
-                    0,
-                    0,
-                );
-            }
-        }
+        // `ShellHandle::close`'s joined thread is already gone by now. This goes through the same
+        // guarded request as `close`, because a dropped handle is the case most likely to be stale.
+        self.request_close();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }

@@ -182,7 +182,14 @@ impl CaptureEventSink for CaptureEvents {
         pixels: &snapclip_capture::ports::SelectionPixels,
     ) {
         match self.post_save(pixels) {
-            Some(Ok(())) => {}
+            // The success path used to print nothing, which made a real report — a second `Ctrl+S`
+            // with no panel — impossible to read: "opened, and you did not see it" and "never
+            // opened" looked identical. Say what happened on all three paths.
+            Some(Ok(())) => eprintln!(
+                "[snapclip-app][capture] session={session_id} 保存面板已打开 ({}x{})",
+                pixels.region.right - pixels.region.left,
+                pixels.region.bottom - pixels.region.top
+            ),
             Some(Err(error)) => eprintln!(
                 "[snapclip-app][capture] session={session_id} 打开保存面板失败：{error}"
             ),
@@ -468,6 +475,31 @@ mod save_open_tests {
             seen,
             Some((2, 2, Some([0, 0, 255, 255]))),
             "the opener must receive the region's size and the first pixel as BGRA"
+        );
+    }
+
+    /// 同一个出口必须能**连续**服务两次 `Ctrl+S`：接线槽存的是 `Arc`，取用是克隆而非取走。
+    ///
+    /// 用户报的"第二次按 `Ctrl+S` 没有面板"正是从这条缺口漏出去的：出口若在第一次被
+    /// `take` 掉，第二次就静默什么都不做 —— 没有面板，也没有错误。
+    #[test]
+    fn the_opener_is_still_there_for_the_second_request() {
+        let events = CaptureEvents::new(EventBus::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        events.set_save_opener(Arc::new(move |_| {
+            counter.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }));
+
+        events.on_save_requested("session-1", &pixels());
+        events.on_save_requested("session-2", &pixels());
+
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            2,
+            "the opener must still be installed for the second request; consuming it on the \
+             first is how a second Ctrl+S opened nothing at all"
         );
     }
 
