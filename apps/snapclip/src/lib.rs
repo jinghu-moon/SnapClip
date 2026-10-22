@@ -307,8 +307,9 @@ impl Shell {
                 }));
             }
             // 用户按 `Ctrl+S` 之后：捕获侧只说"要开保存面板，并把这张选区图给你"，怎么开由这里
-            // 决定。句柄存在闭包捕获的槽里，**替换旧句柄时先把它关掉**——`ShellHandle` 没有
-            // `Drop`，只丢句柄不会关窗，连按两次 `Ctrl+S` 就会开出两张面板。
+            // 决定。句柄存在闭包捕获的槽里；替换走 `replace_panel`，它**先关旧的再存新的**——
+            // 顺序是契约：窗口句柄在窗口销毁后会被系统复用，先开新再关旧可能把 `WM_CLOSE`
+            // 打到刚开的那张上（那个 bug 的真机症状是"日志说已打开、人却看不见"）。
             let save_panels: std::sync::Arc<
                 std::sync::Mutex<Option<save::window::ShellHandle>>,
             > = std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -319,23 +320,13 @@ impl Shell {
                     preview: Some((pixels.bgra.clone(), width, height)),
                     ..Default::default()
                 };
-                // Close the previous panel BEFORE creating the new one. A window handle is
-                // reused once its window is destroyed, so closing a stale handle after the new
-                // panel exists can post `WM_CLOSE` to the panel that was just opened, because the
-                // system handed it the same number. Closing first removes the window that the
-                // stale number could have referred to, which is why the order is the fix.
-                let previous = save_panels
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .take();
-                if let Some(previous) = previous {
-                    previous.close();
-                }
-                let handle = save::window::open(options).map_err(|error| format!("{error:?}"))?;
-                save_panels
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .replace(handle);
+                // 先关旧、再建新、最后存 —— 顺序是契约，`replace_panel` 的文档与两条测试
+                // 写明了理由（句柄会被系统复用）。
+                save::window::replace_panel(
+                    &save_panels,
+                    || save::window::open(options).map_err(|error| format!("{error:?}")),
+                    |previous| previous.close(),
+                )?;
                 Ok(())
             }));
         }

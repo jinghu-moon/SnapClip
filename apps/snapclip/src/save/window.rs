@@ -24,6 +24,107 @@ use std::sync::Arc;
 use super::service;
 
 // -------------------------------------------------------------------------------------------------
+// Two facts that were each learned by shipping a panel nobody could see
+// -------------------------------------------------------------------------------------------------
+
+/// The panel's extended window style.
+///
+/// It **must** contain `WS_EX_TOPMOST`: the two windows this panel replaces, the capture overlay
+/// and its dim layer, are both topmost. A panel created without that bit is painted underneath
+/// them and still reports `IsWindowVisible` as true, because every check that only asks the window
+/// about itself answers yes. That is exactly how a panel that is never seen passes every test, and
+/// it is why this is a constant with a test rather than a literal at the call site.
+pub(crate) const PANEL_EX_STYLE: u32 = windows_sys::Win32::UI::WindowsAndMessaging::WS_EX_TOOLWINDOW
+    | windows_sys::Win32::UI::WindowsAndMessaging::WS_EX_TOPMOST;
+
+/// Replace the panel in `slot`: **close the old one, then create the new one, then store it.**
+///
+/// The order is the contract, not an implementation detail. A window handle is reused once its
+/// window is destroyed, so closing a stale handle *after* the new panel exists can post
+/// `WM_CLOSE` to the panel that was just opened, because the system handed it the same number.
+/// Closing first removes the window the stale number could have referred to.
+///
+/// `create` is a factory rather than a value so that the whole sequence lives inside this
+/// function: a caller that builds the new panel before calling in would reintroduce the bug the
+/// order exists to prevent. The sequence is asserted in `panel_slot_tests` through the two
+/// closures, which the test supplies and therefore observes.
+pub(crate) fn replace_panel<T, E>(
+    slot: &std::sync::Mutex<Option<T>>,
+    create: impl FnOnce() -> Result<T, E>,
+    close: impl FnOnce(T),
+) -> Result<(), E> {
+    let previous = slot
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(previous) = previous {
+        close(previous);
+    }
+    let next = create()?;
+    slot.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .replace(next);
+    Ok(())
+}
+
+#[cfg(test)]
+mod panel_slot_tests {
+    use super::{PANEL_EX_STYLE, replace_panel};
+    use std::sync::Mutex;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WS_EX_TOOLWINDOW, WS_EX_TOPMOST};
+
+    #[test]
+    fn the_panel_asks_to_be_above_the_windows_it_replaces() {
+        assert_ne!(
+            PANEL_EX_STYLE & WS_EX_TOPMOST,
+            0,
+            "the capture overlay and its dim layer are topmost, so a panel without this bit is \
+             painted underneath them and still reports itself visible"
+        );
+        assert_ne!(
+            PANEL_EX_STYLE & WS_EX_TOOLWINDOW,
+            0,
+            "the panel stays out of the taskbar"
+        );
+    }
+
+    #[test]
+    fn the_previous_panel_is_closed_before_the_new_one_exists() {
+        let slot: Mutex<Option<u32>> = Mutex::new(Some(1));
+        let order: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+        // What the closer sees is the whole point: if the slot still names the old panel while
+        // the new window already exists, a stale handle can name the window that took its place.
+        let seen = Mutex::new(None);
+        replace_panel(
+            &slot,
+            || {
+                order.lock().unwrap().push("create");
+                Ok::<u32, ()>(2)
+            },
+            |previous| {
+                order.lock().unwrap().push("close");
+                *seen.lock().unwrap() = Some((previous, *slot.lock().unwrap()));
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some((1, None)),
+            "the closer must run while the slot is empty: that is what keeps a stale handle from \
+             naming the panel that was just created"
+        );
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["close", "create"],
+            "close, then create: creating before closing is how a stale handle ends up naming the \
+             new panel"
+        );
+        assert_eq!(*slot.lock().unwrap(), Some(2));
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
 // Geometry (from the mock)
 // -------------------------------------------------------------------------------------------------
 
@@ -438,7 +539,7 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
         CreateWindowExW, DispatchMessageW, GetClassNameW, GetMessageW, GetWindow, GetWindowLongW,
         GetWindowRect, LoadCursorW, RegisterClassW, SetWindowLongPtrW, SetWindowPos, ShowWindow,
         TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWL_EXSTYLE, GWLP_USERDATA, GW_HWNDPREV, IDC_ARROW,
-        MSG, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, WNDCLASSW, WS_CAPTION, WS_EX_TOOLWINDOW,
+        MSG, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, WNDCLASSW, WS_CAPTION,
         WS_EX_TOPMOST, WS_OVERLAPPED, WS_SYSMENU,
     };
 
@@ -469,12 +570,9 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
         return;
     }
 
-    // Topmost, because the windows this panel replaces are: the capture overlay and its dim layer
-    // are both `WS_EX_TOPMOST`, and a panel created without it is painted underneath them and
-    // reported as visible by every check that only asks the window about itself.
     let hwnd = unsafe {
         CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+            PANEL_EX_STYLE,
             class_name.as_ptr(),
             title.as_ptr(),
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
