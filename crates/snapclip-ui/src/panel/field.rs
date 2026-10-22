@@ -66,6 +66,120 @@ pub enum FieldState {
     Warning,
 }
 
+/// Which field of the form a native `EDIT` is.
+///
+/// The window keeps a table of control handle to identity, and every question about a control — what
+/// colours its background, which field just took focus — is asked through this identity. That is the
+/// whole point of the type: without it the message handlers have to compare handles one field at a
+/// time, and the next field added silently gets answered from the previous one's state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldId {
+    Path,
+    Name,
+    SizeWidth,
+    SizeHeight,
+}
+
+impl FieldId {
+    /// Every field, in the order they were created. A new field is added here and to the control
+    /// table, and both the drawing loop and the message handlers pick it up without a new branch.
+    pub const ALL: [FieldId; 4] = [
+        FieldId::Path,
+        FieldId::Name,
+        FieldId::SizeWidth,
+        FieldId::SizeHeight,
+    ];
+
+    /// The slot this field sits on. One formula per row and one per cell, so a field's frame and the
+    /// child window inside it cannot disagree about where the field is.
+    pub fn rect(
+        self,
+        metrics: &FrameMetrics,
+        rects: &FrameRects,
+        scale: f32,
+    ) -> Rect {
+        match self {
+            FieldId::Path => field_rect(metrics, rects, scale, Row::Path),
+            FieldId::Name => field_rect(metrics, rects, scale, Row::Name),
+            FieldId::SizeWidth => size_cell_rect(metrics, rects, scale, SizeCell::Width),
+            FieldId::SizeHeight => size_cell_rect(metrics, rects, scale, SizeCell::Height),
+        }
+    }
+}
+
+/// Every field's frame state, together.
+///
+/// Focus is not stored as "the focused field" plus a per-control copy: the focus notifications are
+/// the only writer, and they name the field they are about. So a field that is added later is
+/// answered from its own entry rather than from whatever the window happened to track before.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FieldStates {
+    path: FieldState,
+    name: FieldState,
+    size_width: FieldState,
+    size_height: FieldState,
+}
+
+impl FieldStates {
+    /// Nothing focused, nothing wrong.
+    pub const IDLE: FieldStates = FieldStates {
+        path: FieldState::Idle,
+        name: FieldState::Idle,
+        size_width: FieldState::Idle,
+        size_height: FieldState::Idle,
+    };
+
+    /// The state of one field.
+    pub fn state_of(self, id: FieldId) -> FieldState {
+        match id {
+            FieldId::Path => self.path,
+            FieldId::Name => self.name,
+            FieldId::SizeWidth => self.size_width,
+            FieldId::SizeHeight => self.size_height,
+        }
+    }
+
+    /// Put one field into a state, leaving the others alone. This is what the focus notifications do.
+    pub fn set(&mut self, id: FieldId, state: FieldState) {
+        match id {
+            FieldId::Path => self.path = state,
+            FieldId::Name => self.name = state,
+            FieldId::SizeWidth => self.size_width = state,
+            FieldId::SizeHeight => self.size_height = state,
+        }
+    }
+
+    /// Exactly one field focused, the rest idle.
+    pub fn focused_on(id: Option<FieldId>) -> Self {
+        let mut states = FieldStates::IDLE;
+        if let Some(id) = id {
+            states.set(id, FieldState::Focused);
+        }
+        states
+    }
+
+    /// The name field in `state`, the rest idle.
+    ///
+    /// The frame's entry points take a single state because that is what most callers and every
+    /// bitmap test mean: the first field's frame. Named for the field it describes rather than left
+    /// as a bare state so the two cannot be confused later.
+    pub fn name_in(state: FieldState) -> Self {
+        FieldStates {
+            name: state,
+            ..FieldStates::IDLE
+        }
+    }
+
+    /// Every field with its state, in `FieldId::ALL` order, for the drawing loop.
+    pub fn iter(self) -> [(FieldId, FieldState); FieldId::ALL.len()] {
+        let mut out = [(FieldId::Path, FieldState::Idle); FieldId::ALL.len()];
+        for (slot, id) in out.iter_mut().zip(FieldId::ALL) {
+            *slot = (id, self.state_of(id));
+        }
+        out
+    }
+}
+
 /// `--fill` is white at eight percent over the surface, so the child and the frame agree without
 /// making the child translucent, which a `EDIT` cannot be.
 fn fill_over_surface(surface: [u8; 4]) -> [u8; 4] {
@@ -374,7 +488,10 @@ pub fn quality_option_rect(
 /// How many fields take part in tab navigation. The real window keeps this number true by creating
 /// exactly that many `WS_TABSTOP` children; the test pins it so adding a field without adding it
 /// here fails rather than silently changing the tab order.
-pub const FORM_FIELD_TAB_STOPS: usize = 2;
+///
+/// Deliberately a literal rather than `FieldId::ALL.len()`: deriving it would make the guard a
+/// tautology, and the point of the number is that a fifth field has to be declared on purpose.
+pub const FORM_FIELD_TAB_STOPS: usize = 4;
 
 #[cfg(test)]
 mod tests {
@@ -439,14 +556,67 @@ mod tests {
         }
     }
 
-    /// Two fields, two tab stops. Adding a field without declaring it here fails rather than
+    /// Four fields, four tab stops. Adding a field without declaring it here fails rather than
     /// silently changing the tab order.
     #[test]
-    fn the_first_panel_declares_both_of_its_fields() {
+    fn the_form_declares_one_tab_stop_per_field() {
         assert_eq!(
-            FORM_FIELD_TAB_STOPS, 2,
-            "the directory and the name are both focusable, and a third added without declaring it here fails"
+            FORM_FIELD_TAB_STOPS, 4,
+            "the path, the name and the two size cells are focusable, and a fifth added without declaring it here fails"
         );
+        assert_eq!(
+            FieldId::ALL.len(),
+            FORM_FIELD_TAB_STOPS,
+            "every field takes part in tab navigation, so the two lists cannot disagree"
+        );
+    }
+
+    /// The window answers a child control's questions by looking its identity up in a table, so the
+    /// thing that must hold is that one field's state never answers for another. This is the rule the
+    /// message handler used to break by reading a single state for every control.
+    #[test]
+    fn each_field_answers_from_its_own_state() {
+        let states = FieldStates::focused_on(Some(FieldId::Path));
+        assert_eq!(
+            states.state_of(FieldId::Path),
+            FieldState::Focused,
+            "the field that was focused carries the accent"
+        );
+        for other in FieldId::ALL {
+            if other == FieldId::Path {
+                continue;
+            }
+            assert_eq!(
+                states.state_of(other),
+                FieldState::Idle,
+                "{other:?} is not the focused field, so its frame draws no border (:167)"
+            );
+        }
+
+        // And the same in the other direction: focusing the name must not leave the path focused.
+        let states = FieldStates::focused_on(Some(FieldId::Name));
+        assert_eq!(states.state_of(FieldId::Path), FieldState::Idle);
+        assert_eq!(states.state_of(FieldId::Name), FieldState::Focused);
+
+        // No focus at all is every field idle, which is what a freshly opened panel looks like.
+        assert_eq!(FieldStates::focused_on(None), FieldStates::IDLE);
+    }
+
+    /// The drawing loop asks for every field's state at once. If this ever returned a single state
+    /// repeated, the panel would draw one field's border on all of them.
+    #[test]
+    fn the_drawing_loop_sees_every_field_with_its_own_state() {
+        let states = FieldStates::focused_on(Some(FieldId::SizeHeight));
+        let seen = states.iter();
+        assert_eq!(seen.len(), FieldId::ALL.len(), "every field is drawn");
+        for (id, state) in seen {
+            let expected = if id == FieldId::SizeHeight {
+                FieldState::Focused
+            } else {
+                FieldState::Idle
+            };
+            assert_eq!(state, expected, "{id:?} was drawn in the wrong state");
+        }
     }
 
     /// The size row opens the second group, so it sits one group pitch — 12 + 4 — below the name

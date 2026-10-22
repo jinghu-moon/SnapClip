@@ -312,9 +312,10 @@ pub struct Frame<'a> {
     /// while `.seg .opt` inherits the body's — so they are two formats rather than one.
     pub row_label: Option<&'a IDWriteTextFormat>,
     pub chip: Option<&'a IDWriteTextFormat>,
-    /// The state of the first form field's frame. The native `EDIT` itself draws no border, no
-    /// focus ring and no error state, so those belong to the frame (`field.rs`).
-    pub field_state: crate::panel::FieldState,
+    /// The state of every form field's frame. The native `EDIT` itself draws no border, no focus ring
+    /// and no error state, so those belong to the frame (`field.rs`), and each field carries its own
+    /// — one shared state is what made a focused path row draw the name row's frame.
+    pub fields: crate::panel::FieldStates,
     /// The captured picture and its own pixel size, drawn into the preview card.
     ///
     /// The bitmap is built by the caller because only the caller knows whether the pixels are the
@@ -456,53 +457,19 @@ impl Frame<'_> {
         );
 
         // Both field frames, in the mockup's order: the path row first and the name row second
-        // (`:542`, `:556`). Each child window sits inside its own rect, inset by `EDIT_INSET_DIP`,
-        // and paints its own background with the same resolved fill, so the rounded corner here is
-        // the only corner the user sees (`field.rs`).
+        // (`:542`, `:556`), then the size row's two cells (`:235`, `:246`). Each child window sits
+        // inside its own rect, inset by `EDIT_INSET_DIP`, and paints its own background with the same
+        // resolved fill, so the rounded corner here is the only corner the user sees (`field.rs`).
         //
         // Everything about these frames comes from `field_colours`: which state has a border, which
         // has an inner ring, and what colour each is. The painter holds no opinion of its own, so
-        // changing a rule changes the picture and the tests with it. Both rows run this one loop,
-        // which is what keeps the second field from becoming a copy of the first.
+        // changing a rule changes the picture and the tests with it. Every field runs this one loop,
+        // which is what keeps the second, third and fourth from becoming copies of the first.
         let field_radius = (crate::panel::INPUT_RADIUS_DIP * self.scale).round() as i32;
-        // Only the name field is wired to focus so far, so the path and size rows are painted idle
-        // until the stage that gives them child windows of their own. The size row is two cells
-        // rather than one slot (`:235`, `:246`), which is why the loop runs over rects: every field
-        // still goes through this one block.
-        let size_width = crate::panel::field::size_cell_rect(
-            self.metrics,
-            self.rects,
-            self.scale,
-            crate::panel::field::SizeCell::Width,
-        );
-        let size_height = crate::panel::field::size_cell_rect(
-            self.metrics,
-            self.rects,
-            self.scale,
-            crate::panel::field::SizeCell::Height,
-        );
-        for (field, state) in [
-            (
-                crate::panel::field_rect(
-                    self.metrics,
-                    self.rects,
-                    self.scale,
-                    crate::panel::Row::Path,
-                ),
-                crate::panel::FieldState::Idle,
-            ),
-            (
-                crate::panel::field_rect(
-                    self.metrics,
-                    self.rects,
-                    self.scale,
-                    crate::panel::Row::Name,
-                ),
-                self.field_state,
-            ),
-            (size_width, crate::panel::FieldState::Idle),
-            (size_height, crate::panel::FieldState::Idle),
-        ] {
+        // The states come from the field list, one per field: a field that is added later is drawn
+        // from its own entry rather than from whatever state the window tracked before.
+        for (id, state) in self.fields.iter() {
+            let field = id.rect(self.metrics, self.rects, self.scale);
             let colours = crate::panel::field_colours(state, self.brushes.surface_rgba());
             painter.fill_round(field, field_radius, &self.brushes.field_fill);
 
@@ -686,12 +653,12 @@ pub fn paint_to_dc(
         area,
         dpi,
         fill_surface,
-        crate::panel::FieldState::Idle,
+        crate::panel::FieldStates::IDLE,
     )
 }
 
-/// [`paint_to_dc`] with the first field's frame state. Kept separate so the existing signature — and
-/// every caller of it — stays valid: the state only matters once a window owns a focused field.
+/// [`paint_to_dc`] with the form fields' frame states. Kept separate so the existing signature — and
+/// every caller of it — stays valid: the states only matter once a window owns the child controls.
 #[allow(clippy::too_many_arguments)]
 pub fn paint_to_dc_with_state(
     factory: &ID2D1Factory,
@@ -700,9 +667,9 @@ pub fn paint_to_dc_with_state(
     area: Rect,
     dpi: f32,
     fill_surface: bool,
-    field_state: crate::panel::FieldState,
+    fields: crate::panel::FieldStates,
 ) -> Result<()> {
-    paint_to_dc_with_preview(factory, dwrite, hdc, area, dpi, fill_surface, field_state, None)
+    paint_to_dc_with_preview(factory, dwrite, hdc, area, dpi, fill_surface, fields, None)
 }
 
 /// [`paint_to_dc_with_state`] with a captured picture for the preview card. The old signature
@@ -715,7 +682,7 @@ pub fn paint_to_dc_with_preview(
     area: Rect,
     dpi: f32,
     fill_surface: bool,
-    field_state: crate::panel::FieldState,
+    fields: crate::panel::FieldStates,
     preview: Option<(&[u8], u32, u32)>,
 ) -> Result<()> {
     // DPI 96 on the target, deliberately: `rects(scale)` below already converts every dip to a
@@ -761,7 +728,7 @@ pub fn paint_to_dc_with_preview(
         title: Some((TITLE, &title)),
         row_label: Some(&row_label),
         chip: Some(&chip),
-        field_state,
+        fields,
         preview: preview.as_ref().map(|(b, w, h)| (b, *w, *h)),
         quality: 0,
     }
@@ -823,7 +790,7 @@ pub fn paint_to_target_with_preview(
         title: Some((TITLE, &title)),
         row_label: Some(&row_label),
         chip: Some(&chip),
-        field_state: crate::panel::FieldState::Idle,
+        fields: crate::panel::FieldStates::IDLE,
         preview: preview.as_ref().map(|(b, w, h)| (b, *w, *h)),
         quality: 0,
     }
@@ -1173,6 +1140,11 @@ mod tests {
         }
 
         fn render_state(&self, field_state: crate::panel::FieldState) {
+            self.render_fields(crate::panel::FieldStates::name_in(field_state));
+        }
+
+        /// Render with each field's own state, which is what the window hands over.
+        fn render_fields(&self, fields: crate::panel::FieldStates) {
             let factory = factory().expect("a Direct2D factory");
             let dwrite = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED) }
                 .expect("a DirectWrite factory");
@@ -1183,7 +1155,7 @@ mod tests {
                 Rect::new(0, 0, self.width, self.height),
                 self.dpi,
                 true,
-                field_state,
+                fields,
             )
             .expect("the frame paints");
         }
@@ -1200,7 +1172,7 @@ mod tests {
                 Rect::new(0, 0, self.width, self.height),
                 self.dpi,
                 true,
-                crate::panel::FieldState::Idle,
+                crate::panel::FieldStates::IDLE,
                 Some((bgra, w, h)),
             )
             .expect("the frame paints with a preview");
@@ -1338,6 +1310,73 @@ mod tests {
             (px.b, px.g, px.r),
             (46, 41, 41),
             "the design writes rgb and the buffer stores bgra"
+        );
+    }
+
+    /// Every field draws from its own state, not from one state shared by all of them.
+    ///
+    /// This is the regression for the defect the window had: `WM_CTLCOLOREDIT` and the focus handler
+    /// both answered from a single state, so a focused path row painted the name row's frame, and the
+    /// two size cells would have been answered the same way. The mutation is to make the painter read
+    /// one field's state for every field, which turns the second assertion below red.
+    #[test]
+    fn each_field_draws_its_own_frame_state() {
+        let metrics = DEMO;
+        let rects = metrics.rects(1.0);
+        let path = crate::panel::FieldId::Path.rect(&metrics, &rects, 1.0);
+        let name = crate::panel::FieldId::Name.rect(&metrics, &rects, 1.0);
+        let focused =
+            crate::panel::field_colours(crate::panel::FieldState::Focused, DEMO_PALETTE.surface);
+        // The three states that do paint a border. Idle is not one of them (`:167`), which is why the
+        // idle assertion is "none of these" rather than "not this colour".
+        let border_px = |c: [u8; 4]| Px { b: c[2], g: c[1], r: c[0], a: 255 };
+        let error =
+            crate::panel::field_colours(crate::panel::FieldState::Error, DEMO_PALETTE.surface);
+        let warning =
+            crate::panel::field_colours(crate::panel::FieldState::Warning, DEMO_PALETTE.surface);
+        let borders = [
+            border_px(focused.border),
+            border_px(error.border),
+            border_px(warning.border),
+        ];
+        let accent = border_px(focused.border);
+
+        // The path row focused: it carries the accent, and the name row below it does not.
+        let canvas = Canvas::new(920, 520);
+        canvas.render_fields(crate::panel::FieldStates::focused_on(Some(
+            crate::panel::FieldId::Path,
+        )));
+        let px = canvas.pixels();
+        assert!(
+            (path.top..=path.top + 1).any(|y| close(px.pixel(path.left + 40, y), accent, 12)),
+            "the focused path row's own border must be the accent"
+        );
+        assert_not_any(
+            &px,
+            name.left + 40,
+            name.top,
+            &borders,
+            12,
+            "the name row is not the focused field, so its frame draws no border (:167)",
+        );
+
+        // And the other way round, which is the half a single shared state could not express.
+        let canvas = Canvas::new(920, 520);
+        canvas.render_fields(crate::panel::FieldStates::focused_on(Some(
+            crate::panel::FieldId::Name,
+        )));
+        let px = canvas.pixels();
+        assert!(
+            (name.top..=name.top + 1).any(|y| close(px.pixel(name.left + 40, y), accent, 12)),
+            "the focused name row's own border must be the accent"
+        );
+        assert_not_any(
+            &px,
+            path.left + 40,
+            path.top,
+            &borders,
+            12,
+            "the path row is not the focused field, so its frame draws no border (:167)",
         );
     }
 
@@ -1874,15 +1913,15 @@ impl PanelRenderer {
     /// Paint into a window's DC. `hdc` is the raw handle the Win32 bindings hand out, which is what
     /// `BeginPaint` returns; the parameter is a pointer so callers with either binding can pass it.
     ///
-    /// `field_state` is the first field's frame state: the native child draws no border, no focus
-    /// ring and no error colour, so the frame around it has to be told what state it is in.
+    /// `fields` are the form fields' frame states: the native children draw no border, no focus ring
+    /// and no error colour, so the frames around them have to be told what state each is in.
     pub fn paint(
         &self,
         hdc: *mut core::ffi::c_void,
         area: Rect,
         dpi: f32,
         fill_surface: bool,
-        field_state: crate::panel::FieldState,
+        fields: crate::panel::FieldStates,
     ) -> Result<()> {
         paint_to_dc_with_state(
             &self.factory,
@@ -1891,7 +1930,7 @@ impl PanelRenderer {
             area,
             dpi,
             fill_surface,
-            field_state,
+            fields,
         )
     }
 
@@ -1905,7 +1944,7 @@ impl PanelRenderer {
         area: Rect,
         dpi: f32,
         fill_surface: bool,
-        field_state: crate::panel::FieldState,
+        fields: crate::panel::FieldStates,
         preview: Option<(&[u8], u32, u32)>,
     ) -> Result<()> {
         paint_to_dc_with_preview(
@@ -1915,7 +1954,7 @@ impl PanelRenderer {
             area,
             dpi,
             fill_surface,
-            field_state,
+            fields,
             preview,
         )
     }

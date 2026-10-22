@@ -662,7 +662,6 @@ cargo run -p codec-bench --release -- --assert
 | # | 缺口 | 落点 | 归属批次 |
 | --- | --- | --- | --- |
 | A1 | 两个尺寸格**起始为空** ✗（设计显示截图尺寸 ✓，尚未接进 `ShellOptions` ✗） | 选区宽高 → `ShellOptions.preview` 那条链路 ✓（**不要编造数字** ✗） | 尺寸格接数字 ✓ |
-| A2 | **路径行与尺寸格未接焦点** ✗（`WM_COMMAND`，`window.rs:1046` ✓，只认 `name_edit` ✓） | `WM_COMMAND` 分支 ✓ + Tab 顺序 ✓ + 焦点环 ✓ | 交互批 ✓ |
 | A3 | **分段器不可点** ✗（`quality` 是 `Frame` 上的索引 ✓，调用方恒传 0 ✓） | 复用 `segmented.rs` 的 `SegmentState` / `pointer_event` / `target_at` ✓ | 交互批 ✓ |
 | A4 | **`.link-hub` 与两个 ghost 按钮未画** ✗（`更改` ✓ / 文件夹图标 ✓） | 同上 ✓（**画了不接就是假控件** ✗） | 交互批 ✓ |
 | A5 | **`保存后` 的两个 chip 未画** ✗（高 24 ✓、行内 gap 12 ✓、chip 间 gap 8 ✓ 均已量 ✓） | 同上 ✓ | 交互批 ✓ |
@@ -680,16 +679,28 @@ cargo run -p codec-bench --release -- --assert
 
 #### C. 未来会变成 bug（优先解决 ✗）
 
-| # | 缺口 | 现在为什么无害 | 什么时候会爆 |
-| --- | --- | --- | --- |
-| C1 | **`WM_CTLCOLOREDIT`（`window.rs:1042` ✓）用的是单一的 `s.field_state`** ✗（只跟踪文件名 ✓） | 目前只有文件名有焦点 ✓ | **交互批一接上焦点** ✗ ⇒ 表现成"**某个格子的边框颜色不对**"✗ —— 而每一处单独读都像是对的 ✓ ⇒ **交互批必须把它改成按控件取状态** ✓ |
+（空 ✓ —— C1 已解决 ✓，见下方「已划掉」✓）
 
 #### 已划掉（曾在本节，现已完成 ✓）
 
 - ~~**三行 label 文字未画**~~ ✓ 已画（字形子集批 ✓，一次重建 ✓ 280 ⇒ 285 ✓）；
 - ~~**分段器三个词未画**~~ ✓ 已画（同批 ✓）；
 - ~~**demo 有一行（`保存后`）未建模**~~ ✓ 已建模并画出 ✓；
-- ~~**`FrameMetrics::row_height()/row_pitch()/group_pitch()` 名字偏窄**~~ ✓ 已改名为 `text_row_height()` / `text_row_pitch()` / `text_group_pitch()` ✓，并加了一条断言把"两类行不同高"钉在明处 ✓（见本节末 ✓）。
+- ~~**`FrameMetrics::row_height()/row_pitch()/group_pitch()` 名字偏窄**~~ ✓ 已改名为 `text_row_height()` / `text_row_pitch()` / `text_group_pitch()` ✓，并加了一条断言把"两类行不同高"钉在明处 ✓（见本节末 ✓）；
+- ~~**A2：路径行与尺寸格未接焦点**~~ ✓ 已接 ✓ —— 焦点不再是"一个状态 + 若干副本"✗，而是**每个字段各有一份**（`FieldStates` ✓）；`WM_COMMAND` 按控件**查表**取字段身份 ✓；`FORM_FIELD_TAB_STOPS` 2 ⇒ **4** ✓；
+- ~~**C1：`WM_CTLCOLOREDIT` 用单一的 `s.field_state`**~~ ✓ 已解决 ✓ —— 同一个查表 ✓ ⇒ **加一个字段不必改消息处理** ✗ ✓。
+
+#### 交互批其一：焦点与每字段状态（本批）
+
+**形状** ✗：`FieldId`（字段身份 ✓，`ALL` 是**唯一**字段清单 ✓，`rect()` 给出它的槽位 ✓）与 `FieldStates`（每字段一份状态 ✓）都在 `field.rs` ✓；窗口只留**一张控件表**（`controls: [HWND; FieldId::ALL.len()]` ✓），`WM_CTLCOLOREDIT` 与 `WM_COMMAND` 都从 `field_of(hwnd)` 起手 ✓ ⇒ **两处都没有逐字段分支** ✗。
+
+**焦点通知是唯一写者** ✓：`EN_SETFOCUS` / `EN_KILLFOCUS` 各自**点名它是哪个字段** ✓ ⇒ 不需要"清掉上一个"的逻辑 ✓，也没有"当前聚焦字段"这份额外状态 ✓。
+
+**一条被测试逼出来的契约** ✗✓：控件表**初始全是空句柄** ✓，而 `field_of` 若只按相等匹配 ✓ ⇒ **空句柄会命中第一个字段** ✗（测试当场红 ✓）⇒ 修法是**空句柄不算字段** ✓ —— 这与"读单一状态"是**同一个错误的下一层** ✗✓：把"谁都不是"的输入当成"第一个"✓。
+
+**证据** ✓：`each_field_draws_its_own_frame_state` ✓（位图 ✓ 指名位置与颜色 ✓：路径聚焦时**路径有 accent ✓ 且文件名无边框 ✓**，反向再来一遍 ✓）、`each_field_answers_from_its_own_state` ✓、`the_drawing_loop_sees_every_field_with_its_own_state` ✓、`the_form_declares_one_tab_stop_per_field` ✓（4 ✓）、`the_control_table_answers_with_one_field_per_handle` ✓（app 侧 ✓ 唯一性 ✓ 空句柄 ✓）。
+
+**变异三条** ✓（按本节末的清单 ✓）：把绘制循环改成读**单一**字段状态 ✗ ⇒ 位图断言红 ✓（`the focused name row's own border must be the accent` ✓）；把 `state_of` 改成恒返回 `path` ✗ ⇒ **四条**红 ✓；把控件表索引恒为 0 ✗ ⇒ 唯一性断言红 ✓（`left: 1 / right: 4` ✓）。
 
 ### 质量行记录：组间距与分段器（实测得出）
 

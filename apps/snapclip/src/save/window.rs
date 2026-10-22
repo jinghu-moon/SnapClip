@@ -646,11 +646,8 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
             backdrop,
             renderer,
             preview: options.preview.take(),
-            field_state: snapclip_ui::panel::FieldState::Idle,
-            name_edit: std::ptr::null_mut(),
-            path_edit: std::ptr::null_mut(),
-            size_width_edit: std::ptr::null_mut(),
-            size_height_edit: std::ptr::null_mut(),
+            fields: snapclip_ui::panel::FieldStates::IDLE,
+            controls: [std::ptr::null_mut(); snapclip_ui::panel::FieldId::ALL.len()],
             fill_brush,
         }));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
@@ -660,25 +657,25 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
         // size cells). Their font is the embedded subset registered for GDI, so the native controls
         // and the drawn panel share one face without installing anything on the machine.
         //
+        // The loop is over the field list rather than over four hand-written calls: a field is an
+        // entry in that list, so the fifth one is a variant plus a rect, not another copy of this.
+        //
         // The size cells start empty. The design shows the captured dimensions there, and those come
         // from the selection the panel was opened with, which is not plumbed into the options yet.
         let dpi = windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd).max(96);
         let scale = (f64::from(dpi) / 96.0) as f32;
         let metrics = snapclip_ui::panel::DEMO;
         let rects = metrics.rects(scale);
-        let slot = |row| snapclip_ui::panel::field_rect(&metrics, &rects, scale, row);
-        let cell = |c| snapclip_ui::panel::size_cell_rect(&metrics, &rects, scale, c);
-        let name_edit = create_field_edit(hwnd, slot(snapclip_ui::panel::Row::Name), "捕获");
-        let path_edit = create_field_edit(hwnd, slot(snapclip_ui::panel::Row::Path), "");
-        let size_width_edit =
-            create_field_edit(hwnd, cell(snapclip_ui::panel::SizeCell::Width), "");
-        let size_height_edit =
-            create_field_edit(hwnd, cell(snapclip_ui::panel::SizeCell::Height), "");
+        let initial_text = |id| match id {
+            snapclip_ui::panel::FieldId::Name => "捕获",
+            _ => "",
+        };
         if let Some(s) = (state as *mut WindowState).as_mut() {
-            s.name_edit = name_edit;
-            s.path_edit = path_edit;
-            s.size_width_edit = size_width_edit;
-            s.size_height_edit = size_height_edit;
+            for id in snapclip_ui::panel::FieldId::ALL {
+                let control =
+                    create_field_edit(hwnd, id.rect(&metrics, &rects, scale), initial_text(id));
+                s.set_control(id, control);
+            }
         }
 
         ShowWindow(hwnd, SW_SHOW);
@@ -744,18 +741,15 @@ struct WindowState {
     /// The frame's painter. Absent only if Direct2D could not start, in which case the
     /// fallback fill still gives the window a readable surface.
     renderer: Option<snapclip_ui::panel::PanelRenderer>,
-    /// The first field's frame state. The native `EDIT` child draws no border, no focus ring and no
-    /// error colour (`snapclip_ui::panel::field`), so the frame is told what to draw around it.
-    field_state: snapclip_ui::panel::FieldState,
-    /// The name field's child window, once it exists.
-    name_edit: windows_sys::Win32::Foundation::HWND,
-    /// The path field's child window, once it exists. Both fields go through one constructor and one
-    /// frame loop (`snapclip_ui::panel::field_rect`), so the second field is not a copy of the first.
-    path_edit: windows_sys::Win32::Foundation::HWND,
-    /// The two size cells of the second row. Created but not yet wired for focus: `WM_COMMAND`
-    /// still answers only for the name field, which is the interaction stage's job.
-    size_width_edit: windows_sys::Win32::Foundation::HWND,
-    size_height_edit: windows_sys::Win32::Foundation::HWND,
+    /// The frame state of **every** form field, keyed by identity. The native `EDIT` children draw no
+    /// border, no focus ring and no error colour (`snapclip_ui::panel::field`), so the frame is told
+    /// what to draw around each of them.
+    fields: snapclip_ui::panel::FieldStates,
+    /// The child window for each field, indexed the same way `FieldId::ALL` is. Every question about a
+    /// control — what colours it, which field just took focus — is answered by finding its identity in
+    /// this table, so adding a field is a new table entry rather than a new branch in the message
+    /// handlers. Reading a single shared state for every control is what this replaced.
+    controls: [windows_sys::Win32::Foundation::HWND; snapclip_ui::panel::FieldId::ALL.len()],
     /// The captured picture, handed to the frame painter so the preview card shows the real
     /// selection rather than a stand-in.
     preview: Option<(Vec<u8>, u32, u32)>,
@@ -763,6 +757,48 @@ struct WindowState {
     /// the default white would show as a lit rectangle, so the field's resolved fill is handed over
     /// instead. Created once and owned by this state.
     fill_brush: windows_sys::Win32::Graphics::Gdi::HBRUSH,
+}
+
+impl WindowState {
+    /// The child window of one field, or null before it has been created.
+    fn control(&self, id: snapclip_ui::panel::FieldId) -> windows_sys::Win32::Foundation::HWND {
+        self.controls[Self::slot(id)]
+    }
+
+    /// Record a field's child window. The only writer of the table.
+    fn set_control(
+        &mut self,
+        id: snapclip_ui::panel::FieldId,
+        hwnd: windows_sys::Win32::Foundation::HWND,
+    ) {
+        self.controls[Self::slot(id)] = hwnd;
+    }
+
+    /// Which field a child window is, if any. This is the lookup that keeps the message handlers free
+    /// of per-field branches: `WM_CTLCOLOREDIT` and `WM_COMMAND` both start here.
+    ///
+    /// An unregistered handle is not a field. The table starts as nulls, so a lookup that matched on
+    /// equality alone would answer with the first field for a handle nobody created — which is the
+    /// same mistake as reading one shared state, one layer down.
+    fn field_of(
+        &self,
+        hwnd: windows_sys::Win32::Foundation::HWND,
+    ) -> Option<snapclip_ui::panel::FieldId> {
+        if hwnd.is_null() {
+            return None;
+        }
+        snapclip_ui::panel::FieldId::ALL
+            .into_iter()
+            .find(|id| self.control(*id) == hwnd)
+    }
+
+    /// A field's index in the table, taken from the field list so the two cannot drift.
+    fn slot(id: snapclip_ui::panel::FieldId) -> usize {
+        snapclip_ui::panel::FieldId::ALL
+            .iter()
+            .position(|candidate| *candidate == id)
+            .expect("every field is in the list")
+    }
 }
 
 /// Create the name field: a real `EDIT` child, inset inside the frame the frame painter draws.
@@ -993,7 +1029,7 @@ extern "system" fn window_proc(
                             area,
                             dpi,
                             !s.backdrop,
-                            s.field_state,
+                            s.fields,
                             s.preview.as_ref().map(|(bgra, w, h)| (bgra.as_slice(), *w, *h)),
                         )
                         .is_ok();
@@ -1039,9 +1075,18 @@ extern "system" fn window_proc(
         // The child's colours. An `EDIT` paints its own background from the system colours, which on
         // a dark panel is a lit white rectangle, so the field's resolved fill and its text colour are
         // handed over here instead.
+        //
+        // Which field is asking comes from the table, not from a state the window happens to track:
+        // `lparam` is the child's handle, and the answer is that child's own entry. Reading one shared
+        // state here is what made a focused path row paint the name row's colours, and it would have
+        // gone on being wrong for every field added afterwards.
         WM_CTLCOLOREDIT => {
             if let Some(s) = state(hwnd) {
-                let colours = snapclip_ui::panel::field_colours(s.field_state, SURFACE_RGBA);
+                let state_of_field = s
+                    .field_of(lparam as windows_sys::Win32::Foundation::HWND)
+                    .map(|id| s.fields.state_of(id))
+                    .unwrap_or(snapclip_ui::panel::FieldState::Idle);
+                let colours = snapclip_ui::panel::field_colours(state_of_field, SURFACE_RGBA);
                 let child = wparam as windows_sys::Win32::Graphics::Gdi::HDC;
                 windows_sys::Win32::Graphics::Gdi::SetBkColor(child, bgr(colours.fill));
                 windows_sys::Win32::Graphics::Gdi::SetTextColor(child, bgr(colours.text));
@@ -1050,10 +1095,13 @@ extern "system" fn window_proc(
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
         // Focus is not the child's business: the border and the ring around it belong to the frame,
-        // so the window is invalidated and the frame repainted in the new state. Repainting the whole
-        // frame rather than just the field's rect is deliberate — one panel of six fields is a few
-        // hundred microseconds, and a dirty-rect scheme would be a second geometry path to keep in
-        // step with the first (`docs/41` S2).
+        // so the window is invalidated and the frame repainted with the new state. The field is found
+        // in the table rather than compared against each control in turn, so the next field added is
+        // wired by existing.
+        //
+        // Repainting the whole frame rather than just the field's rect is deliberate — one panel of
+        // six fields is a few hundred microseconds, and a dirty-rect scheme would be a second geometry
+        // path to keep in step with the first (`docs/41` S2).
         WM_COMMAND => {
             const EN_SETFOCUS: u16 = 0x0100;
             const EN_KILLFOCUS: u16 = 0x0200;
@@ -1061,17 +1109,15 @@ extern "system" fn window_proc(
             let control = lparam as windows_sys::Win32::Foundation::HWND;
             let mut repaint = false;
             if let Some(s) = state_mut(hwnd) {
-                if control == s.name_edit {
-                    match notification {
-                        EN_SETFOCUS => {
-                            s.field_state = snapclip_ui::panel::FieldState::Focused;
-                            repaint = true;
-                        }
-                        EN_KILLFOCUS => {
-                            s.field_state = snapclip_ui::panel::FieldState::Idle;
-                            repaint = true;
-                        }
-                        _ => {}
+                if let Some(id) = s.field_of(control) {
+                    let next = match notification {
+                        EN_SETFOCUS => Some(snapclip_ui::panel::FieldState::Focused),
+                        EN_KILLFOCUS => Some(snapclip_ui::panel::FieldState::Idle),
+                        _ => None,
+                    };
+                    if let Some(next) = next {
+                        s.fields.set(id, next);
+                        repaint = true;
                     }
                 }
             }
@@ -1182,6 +1228,54 @@ fn read_u32(hwnd: isize, attribute: u32) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The control table is the one place a field's identity is decided, and the message handlers ask
+    /// it rather than comparing handles one field at a time. What has to hold is that the lookup is
+    /// unambiguous and that a handle nobody registered is not mistaken for a field.
+    #[test]
+    fn the_control_table_answers_with_one_field_per_handle() {
+        let mut state = WindowState {
+            backdrop: false,
+            renderer: None,
+            fields: snapclip_ui::panel::FieldStates::IDLE,
+            controls: [std::ptr::null_mut(); snapclip_ui::panel::FieldId::ALL.len()],
+            preview: None,
+            fill_brush: std::ptr::null_mut(),
+        };
+
+        // Every field has its own slot: no two fields share an index, which is what would let one
+        // field's state answer for another.
+        let mut slots: Vec<usize> = snapclip_ui::panel::FieldId::ALL
+            .into_iter()
+            .map(WindowState::slot)
+            .collect();
+        slots.sort_unstable();
+        slots.dedup();
+        assert_eq!(
+            slots.len(),
+            snapclip_ui::panel::FieldId::ALL.len(),
+            "each field needs its own entry in the table"
+        );
+
+        // A handle nobody registered is not a field, so the handlers fall back to idle rather than
+        // to whichever field happened to be first.
+        assert_eq!(state.field_of(std::ptr::null_mut()), None);
+
+        // And a registered handle resolves to the field that registered it.
+        let handle = 0x1234 as windows_sys::Win32::Foundation::HWND;
+        state.set_control(snapclip_ui::panel::FieldId::SizeHeight, handle);
+        assert_eq!(
+            state.field_of(handle),
+            Some(snapclip_ui::panel::FieldId::SizeHeight),
+            "a control answers as the field that owns it"
+        );
+        assert_eq!(state.control(snapclip_ui::panel::FieldId::SizeHeight), handle);
+        for id in snapclip_ui::panel::FieldId::ALL {
+            if id != snapclip_ui::panel::FieldId::SizeHeight {
+                assert_eq!(state.control(id), std::ptr::null_mut(), "{id:?} was not registered");
+            }
+        }
+    }
 
     /// A policy that counts its own invocations, because D12 promises "exactly once".
     struct Counting {
