@@ -1,4 +1,4 @@
-# Rebuilds the overlay's embedded UI font subset: the glyphs of **the strings the overlay draws**,
+﻿# Rebuilds the overlay's embedded UI font subset: the glyphs of **the strings the overlay draws**,
 # plus printable ASCII (the panel draws computed text — colour values, coordinates, sizes).
 #
 # The list of drawn strings is Rust's answer, not something to maintain here: it comes from
