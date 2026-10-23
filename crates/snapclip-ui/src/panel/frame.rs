@@ -1543,6 +1543,105 @@ mod tests {
     }
 
     #[test]
+    fn the_size_row_takes_its_numbers_from_the_design() {
+        // The relational test above cannot catch a constant that is simply the wrong size, because
+        // every rectangle is derived from the same constants and the relations keep holding. These
+        // are the numbers the design states, each with the line it comes from.
+        use crate::panel::field::{SIZE_GAP_DIP, SIZE_LABEL_DIP, SIZE_UNIT_MARGIN_DIP};
+        assert_eq!(SIZE_LABEL_DIP, 20, ".cell-label width (:237)");
+        assert_eq!(SIZE_GAP_DIP, 8, ".values gap (:235)");
+        assert_eq!(SIZE_UNIT_MARGIN_DIP, 4, ".dim-unit margin-left (:244)");
+        assert_eq!(
+            crate::panel::field::LINK_HUB_DIP,
+            28,
+            ".link-hub width (:246)"
+        );
+    }
+
+    #[test]
+    fn a_size_cell_is_a_label_then_a_number_then_a_unit() {
+        // `.values` is a flex row of five children with an 8 dip gap (`:235`): the cell's label, the
+        // cell itself, the hub, the other label and the other cell. Inside a cell the wrapper is the
+        // filled box (`:238`), the number is right aligned and the unit follows it (`:242`, `:244`).
+        use crate::panel::field::{
+            SIZE_GAP_DIP, SizeCell, size_cell_input_rect, size_cell_label_rect, size_cell_rect,
+            size_cell_unit_rect,
+        };
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            let rects = DEMO.rects(scale);
+            let gap = (SIZE_GAP_DIP as f32 * scale).round() as i32;
+            for cell in [SizeCell::Width, SizeCell::Height] {
+                let wrapper = size_cell_rect(&DEMO, &rects, scale, cell);
+                let label = size_cell_label_rect(&DEMO, &rects, scale, cell);
+                let input = size_cell_input_rect(&DEMO, &rects, scale, cell);
+                let unit = size_cell_unit_rect(&DEMO, &rects, scale, cell);
+
+                assert_eq!(
+                    label.right + gap,
+                    wrapper.left,
+                    "{cell:?} at {scale}: the label must be one gap before the cell"
+                );
+                assert!(
+                    label.left < label.right && label.right <= input.left,
+                    "{cell:?} at {scale}: label {label:?} must end at or before the number {input:?}"
+                );
+                assert!(
+                    input.left < input.right && input.right <= unit.left,
+                    "{cell:?} at {scale}: number {input:?} must end at or before the unit {unit:?}"
+                );
+                assert!(
+                    unit.left < unit.right && unit.right <= wrapper.right,
+                    "{cell:?} at {scale}: unit {unit:?} must stay inside the cell {wrapper:?}"
+                );
+                for part in [label, input, unit] {
+                    assert_eq!(
+                        (part.top, part.bottom),
+                        (wrapper.top, wrapper.bottom),
+                        "{cell:?} at {scale}: every part is on the cell's line"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_two_size_cells_are_separated_by_the_hub() {
+        use crate::panel::field::{
+            Row, SIZE_GAP_DIP, SizeCell, link_hub_rect, size_cell_label_rect, size_cell_rect,
+            size_cell_unit_rect,
+        };
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            let rects = DEMO.rects(scale);
+            let gap = (SIZE_GAP_DIP as f32 * scale).round() as i32;
+            let hub = link_hub_rect(&DEMO, &rects, scale);
+            let width = size_cell_rect(&DEMO, &rects, scale, SizeCell::Width);
+            let height = size_cell_rect(&DEMO, &rects, scale, SizeCell::Height);
+            let height_label = size_cell_label_rect(&DEMO, &rects, scale, SizeCell::Height);
+            let width_unit = size_cell_unit_rect(&DEMO, &rects, scale, SizeCell::Width);
+
+            assert_eq!(
+                width.right + gap,
+                hub.left,
+                "{scale}: the first cell ends one gap before the hub"
+            );
+            assert!(
+                width_unit.right < width.right,
+                "{scale}: the unit sits inside the cell's own padding"
+            );
+            assert_eq!(
+                hub.right + gap,
+                height_label.left,
+                "{scale}: the second label starts one gap after the hub"
+            );
+            assert_eq!(
+                height.right,
+                crate::panel::field::field_rect(&DEMO, &rects, scale, Row::Size).right,
+                "{scale}: the second cell must absorb the remainder"
+            );
+        }
+    }
+
+    #[test]
     fn the_size_row_sits_below_the_name_row_and_splits_into_two_cells() {
         use crate::panel::field::{Row, SizeCell, label_rect, size_cell_rect};
         for scale in [1.0f32, 1.25, 1.5, 2.0] {

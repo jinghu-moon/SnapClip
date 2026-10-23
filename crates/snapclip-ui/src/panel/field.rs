@@ -378,6 +378,33 @@ pub enum SizeCell {
     Height,
 }
 
+/// `.cell-label { width: 20px }` (`:237`) — the `宽` / `高` word before each cell.
+pub const SIZE_LABEL_DIP: i32 = 20;
+
+/// `.values { gap: 8px }` (`:235`) — the gap between the row's five children: label, cell, hub,
+/// label, cell.
+pub const SIZE_GAP_DIP: i32 = 8;
+
+/// `.dim-unit { margin-left: 4px }` (`:244`) — the space between the number and its unit.
+pub const SIZE_UNIT_MARGIN_DIP: i32 = 4;
+
+/// The box reserved for the `px` unit after each number.
+///
+/// The design gives the unit its font size (`--fs-num`'s 12px, `:244`) and its left margin, but not
+/// its width: that depends on the glyphs, and this module has no device context to measure text
+/// with. The unit is a fixed two-letter string, so the box is reserved rather than measured, and
+/// the test only asks that the three parts of a cell do not overlap and stay inside it.
+pub const SIZE_UNIT_DIP: i32 = 18;
+
+/// The flex row's fixed width: two labels, four gaps and the hub. What is left over is shared by
+/// the two cells.
+fn size_row_fixed_dip() -> i32 {
+    2 * SIZE_LABEL_DIP + 4 * SIZE_GAP_DIP + LINK_HUB_DIP
+}
+
+/// One cell's box, which is the input wrapper: `.input-wrap { flex: 1; height: 32px; background:
+/// var(--fill) }` (`:238`) inside `.cell { flex: 1 }` (`:236`). The cell's label sits before it, so
+/// this is the cell minus its label and one gap.
 pub fn size_cell_rect(
     metrics: &FrameMetrics,
     rects: &FrameRects,
@@ -386,16 +413,18 @@ pub fn size_cell_rect(
 ) -> Rect {
     let px = |dip: i32| (dip as f32 * scale).round() as i32;
     let row = field_rect(metrics, rects, scale, Row::Size);
-    let gap = px(8);
+    let gap = px(SIZE_GAP_DIP);
+    let label = px(SIZE_LABEL_DIP);
     let hub = link_hub_rect(metrics, rects, scale);
-    let cell_width = (row.right - row.left - 2 * gap - (hub.right - hub.left)) / 2;
+    let cell_width = (row.right - row.left - px(size_row_fixed_dip())) / 2;
     let left = match cell {
-        SizeCell::Width => row.left,
-        SizeCell::Height => hub.right + gap,
+        SizeCell::Width => row.left + label + gap,
+        SizeCell::Height => hub.right + gap + label + gap,
     };
-    // The design lays the row out with flex, so the second cell takes whatever the first two cells
-    // and the hub leave behind. Integer division drops a pixel on odd widths, and the flex behaviour
-    // is for the last cell to absorb it rather than for the row to stop short of the form edge.
+    // The design lays the row out with flex, so the second cell takes whatever the first cell, the
+    // hub and the labels leave behind. Integer division drops a pixel on odd widths, and the flex
+    // behaviour is for the last cell to absorb it rather than for the row to stop short of the form
+    // edge.
     let right = match cell {
         SizeCell::Width => left + cell_width,
         SizeCell::Height => row.right,
@@ -405,6 +434,62 @@ pub fn size_cell_rect(
         top: row.top,
         right,
         bottom: row.bottom,
+    }
+}
+
+/// The `宽` / `高` word before a cell: 20 dip wide, on the cell's line (`:237`, `:595`, `:605`).
+pub fn size_cell_label_rect(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    cell: SizeCell,
+) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let wrapper = size_cell_rect(metrics, rects, scale, cell);
+    let gap = px(SIZE_GAP_DIP);
+    let label = px(SIZE_LABEL_DIP);
+    Rect {
+        left: wrapper.left - gap - label,
+        top: wrapper.top,
+        right: wrapper.left - gap,
+        bottom: wrapper.bottom,
+    }
+}
+
+/// The number's own box inside the wrapper: `.dim-input` is right aligned and the unit follows it
+/// (`:242`–`:244`), so the number ends where the unit's reserved box begins.
+pub fn size_cell_input_rect(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    cell: SizeCell,
+) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let wrapper = size_cell_rect(metrics, rects, scale, cell);
+    let inset = px(EDIT_PADDING_DIP as i32);
+    Rect {
+        left: wrapper.left + inset,
+        top: wrapper.top,
+        right: wrapper.right - inset - px(SIZE_UNIT_MARGIN_DIP) - px(SIZE_UNIT_DIP),
+        bottom: wrapper.bottom,
+    }
+}
+
+/// The `px` unit's box at the wrapper's right edge (`:244`).
+pub fn size_cell_unit_rect(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    cell: SizeCell,
+) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let wrapper = size_cell_rect(metrics, rects, scale, cell);
+    let inset = px(EDIT_PADDING_DIP as i32);
+    Rect {
+        left: wrapper.right - inset - px(SIZE_UNIT_DIP),
+        top: wrapper.top,
+        right: wrapper.right - inset,
+        bottom: wrapper.bottom,
     }
 }
 
