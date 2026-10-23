@@ -92,8 +92,12 @@ impl FieldId {
         FieldId::SizeHeight,
     ];
 
-    /// The slot this field sits on. One formula per row and one per cell, so a field's frame and the
-    /// child window inside it cannot disagree about where the field is.
+    /// Where the child window goes. One formula per row and one per cell, so the control and the
+    /// frame around it cannot disagree about where the field is.
+    ///
+    /// A size cell is not a single box: the design puts a `宽` or `高` label before the number and a
+    /// `px` unit after it, all three inside one wrapper (`:237`, `:242`, `:244`). The control is the
+    /// number alone, so it takes the input rectangle; the wrapper is painted separately.
     pub fn rect(
         self,
         metrics: &FrameMetrics,
@@ -103,8 +107,24 @@ impl FieldId {
         match self {
             FieldId::Path => field_rect(metrics, rects, scale, Row::Path),
             FieldId::Name => field_rect(metrics, rects, scale, Row::Name),
+            FieldId::SizeWidth => size_cell_input_rect(metrics, rects, scale, SizeCell::Width),
+            FieldId::SizeHeight => size_cell_input_rect(metrics, rects, scale, SizeCell::Height),
+        }
+    }
+
+    /// Where the frame is painted. This is the same rectangle as [`FieldId::rect`] for a row, whose
+    /// field is one box, and the whole wrapper for a size cell, because the label and the unit share
+    /// it with the number.
+    pub fn frame_rect(
+        self,
+        metrics: &FrameMetrics,
+        rects: &FrameRects,
+        scale: f32,
+    ) -> Rect {
+        match self {
             FieldId::SizeWidth => size_cell_rect(metrics, rects, scale, SizeCell::Width),
             FieldId::SizeHeight => size_cell_rect(metrics, rects, scale, SizeCell::Height),
+            FieldId::Path | FieldId::Name => self.rect(metrics, rects, scale),
         }
     }
 }
@@ -531,6 +551,124 @@ pub fn link_hub_icon_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32
     }
 }
 
+/// `.size-mode { padding: 2px; border: 1px solid var(--line-soft); border-radius: var(--r-input) }`
+/// (`:225`, `:54`) — the two-button container at the end of the size row's header line.
+pub const SIZE_MODE_PADDING_DIP: i32 = 2;
+pub const SIZE_MODE_BORDER_DIP: i32 = 1;
+pub const SIZE_MODE_RADIUS_DIP: i32 = 6;
+
+/// `.size-mode-btn { padding: 0 10px; height: 20px; border-radius: 4px }` (`:226`).
+pub const SIZE_MODE_BUTTON_HEIGHT_DIP: i32 = 20;
+pub const SIZE_MODE_BUTTON_PADDING_DIP: i32 = 10;
+pub const SIZE_MODE_BUTTON_RADIUS_DIP: i32 = 4;
+
+/// `.row-header-actions { gap: 8px }` (`:224`) — between the mode container and the reset button.
+pub const SIZE_MODE_GAP_DIP: i32 = 8;
+
+/// `.action { width: 24px; height: 24px; border-radius: var(--r-icon) }` (`:229`, `:60`) and
+/// `.action svg { width: 14px; height: 14px }` (`:232`).
+pub const SIZE_MODE_RESET_DIP: i32 = 24;
+pub const SIZE_MODE_RESET_RADIUS_DIP: i32 = 5;
+pub const SIZE_MODE_RESET_ICON_DIP: i32 = 14;
+
+/// The two mode words, verbatim from the design: `数值` (`:585`) and `百分比` (`:586`).
+pub const SIZE_MODE_WORDS: [&str; 2] = ["数值", "百分比"];
+
+/// Which word the design marks as on: `数值` carries `is-on` (`:585`). The buttons are painted but
+/// do not respond yet, so the choice is a constant rather than state; `docs/41` records the gap.
+pub const SIZE_MODE_CHOSEN: usize = 0;
+
+/// `--line-soft` is white at eighteen percent over whatever is behind it (`:28`), resolved here the
+/// way `--fill` is, because our brushes are opaque.
+pub fn line_soft_over_surface(surface: [u8; 4]) -> [u8; 4] {
+    let mix = |c: u8| ((u16::from(c) * 82 + 255 * 18) / 100) as u8;
+    [mix(surface[0]), mix(surface[1]), mix(surface[2]), 255]
+}
+
+/// One mode button's width: its word plus the design's ten dip padding on each side (`:226`).
+///
+/// The word's own width is measured by the caller and handed in, because it depends on the glyphs
+/// and this module has no device context; `PanelPainter::measure_text_width` is the measurement.
+pub fn size_mode_button_width(scale: f32, text_width_px: i32) -> i32 {
+    text_width_px + 2 * (SIZE_MODE_BUTTON_PADDING_DIP as f32 * scale).round() as i32
+}
+
+/// The reset button, at the end of the size row's header line. `.row-header` is
+/// `justify-content: space-between` (`:165`) and `.actions` is its last child (`:588`), so the
+/// button is anchored to the column's right edge and grows nothing.
+pub fn size_mode_reset_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let header = label_rect(metrics, rects, scale, Row::Size);
+    let side = px(SIZE_MODE_RESET_DIP);
+    let top = header.top + (header.bottom - header.top - side) / 2;
+    Rect {
+        left: header.right - side,
+        top,
+        right: header.right,
+        bottom: top + side,
+    }
+}
+
+/// The icon's box inside the reset button: fourteen dip, centred (`:232`).
+pub fn size_mode_reset_icon_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let button = size_mode_reset_rect(metrics, rects, scale);
+    let side = px(SIZE_MODE_RESET_ICON_DIP);
+    let left = button.left + (button.right - button.left - side) / 2;
+    let top = button.top + (button.bottom - button.top - side) / 2;
+    Rect {
+        left,
+        top,
+        right: left + side,
+        bottom: top + side,
+    }
+}
+
+/// The mode container: its right edge is one gap left of the reset button (`:224`) and its width is
+/// the two buttons plus the container's own padding and border (`:225`). The buttons' widths are
+/// measured by the caller, so this stays a pure function of numbers it is handed.
+pub fn size_mode_rect(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    buttons_width_px: i32,
+) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let header = label_rect(metrics, rects, scale, Row::Size);
+    let reset = size_mode_reset_rect(metrics, rects, scale);
+    let chrome = 2 * (px(SIZE_MODE_PADDING_DIP) + px(SIZE_MODE_BORDER_DIP));
+    let width = buttons_width_px + chrome;
+    let height = px(SIZE_MODE_BUTTON_HEIGHT_DIP) + chrome;
+    let right = reset.left - px(SIZE_MODE_GAP_DIP);
+    let top = header.top + (header.bottom - header.top - height) / 2;
+    Rect {
+        left: right - width,
+        top,
+        right,
+        bottom: top + height,
+    }
+}
+
+/// One of the two buttons inside the container. `widths` are the measured widths of the two words,
+/// so the second starts where the first ends; both sit inside the border and padding.
+pub fn size_mode_button_rect(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    widths: [i32; 2],
+    index: usize,
+) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let container = size_mode_rect(metrics, rects, scale, widths[0] + widths[1]);
+    let inset = px(SIZE_MODE_PADDING_DIP + SIZE_MODE_BORDER_DIP);
+    let left = container.left + inset + if index == 0 { 0 } else { widths[0] };
+    Rect {
+        left,
+        top: container.top + inset,
+        right: left + widths[index],
+        bottom: container.bottom - inset,
+    }
+}
 
 pub const QUALITY_SEG_RADIUS_DIP: f32 = 7.0;
 
@@ -556,11 +694,21 @@ pub const QUALITY_OPTIONS: usize = 3;
 /// the order the block slides through them.
 pub const QUALITY_OPTION_WORDS: [&str; QUALITY_OPTIONS] = ["高", "中", "低"];
 
+/// The two words inside a size cell, verbatim from the design: `宽` (`:595`) and `高` (`:605`), in
+/// the order the two cells appear.
+pub const SIZE_CELL_WORDS: [&str; 2] = ["宽", "高"];
+
+/// The unit drawn after each number: `.dim-unit` (`:244`) reads `px`.
+pub const SIZE_UNIT_TEXT: &str = "px";
+
 /// Every string the panel's form draws. The font subset's list calls this rather than copying the
 /// words, so a label added here cannot be drawn without the subset being rebuilt for it.
 pub fn form_drawn_strings() -> Vec<&'static str> {
     let mut all: Vec<&'static str> = FORM_ROWS.iter().map(|row| row.label()).collect();
     all.extend(QUALITY_OPTION_WORDS);
+    all.extend(SIZE_MODE_WORDS);
+    all.extend(SIZE_CELL_WORDS);
+    all.push(SIZE_UNIT_TEXT);
     all
 }
 

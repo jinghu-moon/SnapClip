@@ -7,7 +7,7 @@
 pub const ICON_BAKED_PX: u32 = 96;
 
 /// How many glyphs are available to panel components.
-pub const ICON_COUNT: usize = 7;
+pub const ICON_COUNT: usize = 8;
 
 /// A panel glyph baked from `assets/icon/*.svg`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +27,8 @@ pub enum Glyph {
     Check = 5,
     /// Chain link, for the size row's lock between the two cells.
     Link = 6,
+    /// Circular arrow, for the size row's reset to the captured size.
+    Refresh = 7,
 }
 
 impl Glyph {
@@ -38,6 +40,7 @@ impl Glyph {
         Self::Chevron,
         Self::Check,
         Self::Link,
+        Self::Refresh,
     ];
 
     pub const fn index(self) -> usize {
@@ -53,6 +56,7 @@ impl Glyph {
             Self::Chevron => "chevron",
             Self::Check => "check",
             Self::Link => "link",
+            Self::Refresh => "refresh",
         }
     }
 
@@ -66,6 +70,7 @@ impl Glyph {
             Self::Chevron => include_bytes!("../../../../assets/icon/chevron.png"),
             Self::Check => include_bytes!("../../../../assets/icon/check.png"),
             Self::Link => include_bytes!("../../../../assets/icon/link.png"),
+            Self::Refresh => include_bytes!("../../../../assets/icon/refresh.png"),
         }
     }
 
@@ -84,6 +89,7 @@ impl Glyph {
             Self::Chevron => include_bytes!("../../../../assets/icon/chevron.rgba"),
             Self::Check => include_bytes!("../../../../assets/icon/check.rgba"),
             Self::Link => include_bytes!("../../../../assets/icon/link.rgba"),
+            Self::Refresh => include_bytes!("../../../../assets/icon/refresh.rgba"),
         }
     }
 }

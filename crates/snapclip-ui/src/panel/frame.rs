@@ -205,6 +205,8 @@ pub struct FrameBrushes {
     pub muted: ID2D1SolidColorBrush,
     /// The row labels' own colour, a little stronger than `--muted` (`:166`).
     pub label: ID2D1SolidColorBrush,
+    /// `--line-soft` (`:28`) resolved over the surface, for the size row's mode container.
+    pub line_soft: ID2D1SolidColorBrush,
     /// The field background, already composited: a native `EDIT` cannot be translucent, so the
     /// frame and the child both use this opaque value (`field.rs`).
     pub field_fill: ID2D1SolidColorBrush,
@@ -218,6 +220,8 @@ pub struct FrameBrushes {
     pub accent_text: ID2D1SolidColorBrush,
     /// The same colour as bytes, for the icon's tint, which is arithmetic rather than a brush.
     pub accent_text_rgba: [u8; 4],
+    /// `--muted` as bytes, for icons tinted on the processor rather than by a brush.
+    pub muted_rgba: [u8; 4],
     /// The preview card's checkerboard, the two colours of `:111`.
     pub checker_light: ID2D1SolidColorBrush,
     pub checker_dark: ID2D1SolidColorBrush,
@@ -245,12 +249,19 @@ impl FrameBrushes {
             text: brush(target, palette.text)?,
             muted: brush(target, palette.muted)?,
             label: brush(target, palette.label)?,
+            // `--line-soft` is a translucent white, and our brushes are opaque, so it is resolved
+            // over the surface here rather than left to blend: one place, and no caller has to know.
+            line_soft: brush(
+                target,
+                crate::panel::line_soft_over_surface(palette.surface),
+            )?,
             field_fill: brush(target, idle.fill)?,
             accent: brush(target, focused.border)?,
             danger: brush(target, error.border)?,
             warning: brush(target, warning.border)?,
             accent_text: brush(target, palette.accent_text)?,
             accent_text_rgba: palette.accent_text,
+            muted_rgba: palette.muted,
             checker_light: brush(target, CHECKER_LIGHT)?,
             checker_dark: brush(target, CHECKER_DARK)?,
             surface_rgba: palette.surface,
@@ -479,7 +490,7 @@ impl Frame<'_> {
         // The states come from the field list, one per field: a field that is added later is drawn
         // from its own entry rather than from whatever state the window tracked before.
         for (id, state) in self.fields.iter() {
-            let field = id.rect(self.metrics, self.rects, self.scale);
+            let field = id.frame_rect(self.metrics, self.rects, self.scale);
             let colours = crate::panel::field_colours(state, self.brushes.surface_rgba());
             painter.fill_round(field, field_radius, &self.brushes.field_fill);
 
@@ -501,6 +512,30 @@ impl Frame<'_> {
                     (field_radius - ring).max(0),
                     ring_brush,
                     line,
+                );
+            }
+        }
+
+        // The size cells' own words. Each cell is a wrapper holding a `宽` or `高` label, the number
+        // the child window draws, and a `px` unit (`:237`, `:242`, `:244`, `:595`, `:605`). The
+        // wrapper is painted by the loop above, which is why the cell's frame rectangle and the
+        // control's rectangle are two different things here and the same thing everywhere else.
+        if let (Some(word_format), Some(unit_format)) = (self.row_label, self.chip) {
+            for (cell, word) in [
+                (crate::panel::SizeCell::Width, crate::panel::field::SIZE_CELL_WORDS[0]),
+                (crate::panel::SizeCell::Height, crate::panel::field::SIZE_CELL_WORDS[1]),
+            ] {
+                let label =
+                    crate::panel::field::size_cell_label_rect(self.metrics, self.rects, self.scale, cell);
+                painter.draw_text(word, word_format, label, &self.brushes.muted);
+
+                let unit =
+                    crate::panel::field::size_cell_unit_rect(self.metrics, self.rects, self.scale, cell);
+                painter.draw_text(
+                    crate::panel::field::SIZE_UNIT_TEXT,
+                    unit_format,
+                    unit,
+                    &self.brushes.muted,
                 );
             }
         }
@@ -565,16 +600,92 @@ impl Frame<'_> {
         // the shapes with lines is by definition not the same picture, so the icon arrives as pixels
         // and is tinted on the way in.
         let icon = crate::panel::field::link_hub_icon_rect(self.metrics, self.rects, self.scale);
-        let tinted = crate::panel::icons::tint_rgba_to_premultiplied_bgra(
-            crate::panel::icons::Glyph::Link.raw(),
+        Self::draw_glyph(
+            painter,
+            crate::panel::icons::Glyph::Link,
+            icon,
             self.brushes.accent_text_rgba,
-        );
+        )?;
+
+        // The size row's mode buttons and its reset (`:583`–`:591`). The header line is
+        // `justify-content: space-between` (`:165`), so this group is anchored to the column's right
+        // edge and grows leftward. A button is its word plus ten dip on each side (`:226`), and a
+        // word's width depends on its glyphs, so it is measured through the device rather than
+        // reserved. `数值` carries `is-on` (`:585`) and is drawn at the label weight, which is the
+        // only difference the design makes between the two.
+        if let (Some(chosen_format), Some(other_format)) = (self.row_label, self.chip) {
+            let chosen = crate::panel::SIZE_MODE_CHOSEN;
+            let mut widths = [0i32; 2];
+            for (index, word) in crate::panel::SIZE_MODE_WORDS.iter().enumerate() {
+                let format = if index == chosen { chosen_format } else { other_format };
+                let measured = painter.measure_text_width(word, format)?.round() as i32;
+                widths[index] = crate::panel::size_mode_button_width(self.scale, measured);
+            }
+            let radius = (crate::panel::SIZE_MODE_RADIUS_DIP as f32 * self.scale).round() as i32;
+            let container = crate::panel::size_mode_rect(
+                self.metrics,
+                self.rects,
+                self.scale,
+                widths[0] + widths[1],
+            );
+            // `:225` the container is `--surface` with a `--line-soft` edge; both are already
+            // resolved, because the material behind the panel is the compositor's business.
+            painter.fill_round(container, radius, &self.brushes.surface);
+            painter.stroke_round(container, radius, &self.brushes.line_soft, line);
+
+            let button_radius =
+                (crate::panel::SIZE_MODE_BUTTON_RADIUS_DIP as f32 * self.scale).round() as i32;
+            for (index, word) in crate::panel::SIZE_MODE_WORDS.iter().enumerate() {
+                let button = crate::panel::size_mode_button_rect(
+                    self.metrics,
+                    self.rects,
+                    self.scale,
+                    widths,
+                    index,
+                );
+                // `:227` the chosen button takes the field fill behind its word and the text
+                // colour; the other one is transparent and `--muted` (`:226`).
+                if index == chosen {
+                    painter.fill_round(button, button_radius, &self.brushes.field_fill);
+                    painter.draw_text(word, chosen_format, button, &self.brushes.text);
+                } else {
+                    painter.draw_text(word, other_format, button, &self.brushes.muted);
+                }
+            }
+
+            // `:229` the reset is a bare `--muted` icon until it is hovered, and its picture is
+            // `ICON.reset` (`:589`), which the design's own key table maps to this circular arrow.
+            let reset =
+                crate::panel::size_mode_reset_icon_rect(self.metrics, self.rects, self.scale);
+            Self::draw_glyph(
+                painter,
+                crate::panel::icons::Glyph::Refresh,
+                reset,
+                self.brushes.muted_rgba,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Draw a baked glyph, tinted to a colour, into `rect`.
+    ///
+    /// The pixels arrive white on transparent from `icon-bake` and are coloured here, because the
+    /// panel paints through a DC render target, which has no colour matrix effect to tint with. The
+    /// order of the tint's output and the bitmap's alpha mode are decided in one place, so the next
+    /// icon does not have to remember either.
+    fn draw_glyph(
+        painter: &PanelPainter,
+        glyph: crate::panel::icons::Glyph,
+        rect: Rect,
+        colour: [u8; 4],
+    ) -> Result<()> {
+        let tinted = crate::panel::icons::tint_rgba_to_premultiplied_bgra(glyph.raw(), colour);
         let bitmap = painter.bgra_bitmap_with_alpha(
             crate::panel::icons::ICON_BAKED_PX,
             crate::panel::icons::ICON_BAKED_PX,
             &tinted,
         )?;
-        painter.draw_bitmap_at(&bitmap, icon);
+        painter.draw_bitmap_at(&bitmap, rect);
         Ok(())
     }
 }
@@ -944,6 +1055,94 @@ mod tests {
         ] {
             let field = crate::panel::size_cell_rect(&DEMO, &rects, 1.0, cell);
             assert_idle_field(&px, field, what);
+        }
+    }
+
+    /// A size cell is a wrapper holding the number, with its `宽`/`高` word outside the wrapper and
+    /// its `px` unit inside it (`:237`, `:242`, `:244`). Both words are drawn, both in `--muted`, and
+    /// the samples are named positions with named colours rather than a search for any ink.
+    ///
+    /// The colours are blends, not the brush value: the text is `--muted` at 62% alpha (`:21`), so
+    /// what reaches the buffer is the brush over whatever lies beneath — the surface for the word
+    /// outside the wrapper and the field fill for the unit inside it.
+    #[test]
+    fn the_size_cells_draw_their_word_and_their_unit() {
+        let canvas = Canvas::new(920, 520);
+        canvas.render();
+        let px = canvas.pixels();
+        let rects = DEMO.rects(1.0);
+        let surface = DEMO_PALETTE.surface;
+        // The fill the painter resolves for an idle field, which is what the unit is drawn over.
+        let fill = [41u8, 41, 46, 255];
+
+        // The word is outside the wrapper, so it lands on the panel's surface.
+        let muted = DEMO_PALETTE.muted;
+        let word_on_surface = blend(muted, surface);
+        let unit_on_fill = blend(muted, fill);
+        for (cell, word, unit) in [
+            (crate::panel::SizeCell::Width, "宽", "px"),
+            (crate::panel::SizeCell::Height, "高", "px"),
+        ] {
+            let _ = (word, unit);
+            let label = crate::panel::field::size_cell_label_rect(&DEMO, &rects, 1.0, cell);
+            let wrapper = crate::panel::size_cell_rect(&DEMO, &rects, 1.0, cell);
+            let unit_rect = crate::panel::field::size_cell_unit_rect(&DEMO, &rects, 1.0, cell);
+
+            assert!(
+                label.right <= wrapper.left,
+                "the word sits outside the wrapper and before it (:237)"
+            );
+            assert!(
+                unit_rect.left >= wrapper.left && unit_rect.right <= wrapper.right,
+                "the unit sits inside the wrapper, after the number (:244)"
+            );
+            // The words are anti-aliased, so a stroke's core pixel is a rasteriser detail; what is
+            // not a detail is which colour the glyph is painted in and which rectangle it lands in.
+            assert_ink(&px, label, word_on_surface, 12, "the cell's word is --muted over the surface (:237)");
+            assert_ink(&px, unit_rect, unit_on_fill, 12, "the cell's unit is --muted over the field fill (:244)");
+        }
+    }
+
+    /// The closest pixel in `rect` to `want` must be within `tolerance`, which for anti-aliased text
+    /// is the honest form: the glyph's core pixel is wherever the rasteriser put it, but the colour
+    /// it was painted in and the rectangle it belongs to are both named here.
+    fn assert_ink(px: &Bgra8, rect: Rect, want: Px, tolerance: i32, what: &str) {
+        let mut best: Option<(i32, i32, Px)> = None;
+        for y in rect.top..rect.bottom {
+            for x in rect.left..rect.right {
+                let seen = px.pixel(x, y);
+                let distance = (i32::from(seen.b) - i32::from(want.b)).abs()
+                    + (i32::from(seen.g) - i32::from(want.g)).abs()
+                    + (i32::from(seen.r) - i32::from(want.r)).abs();
+                if best.is_none_or(|(_, _, previous)| distance < distance_of(previous, want)) {
+                    best = Some((x, y, seen));
+                }
+            }
+        }
+        let (x, y, seen) = best.expect("the rectangle is not empty");
+        assert!(
+            close(seen, want, tolerance),
+            "{what}: no pixel in {rect:?} is within {tolerance} of {want:?}; the closest is {seen:?} at ({x}, {y})"
+        );
+    }
+
+    fn distance_of(seen: Px, want: Px) -> i32 {
+        (i32::from(seen.b) - i32::from(want.b)).abs()
+            + (i32::from(seen.g) - i32::from(want.g)).abs()
+            + (i32::from(seen.r) - i32::from(want.r)).abs()
+    }
+
+    /// `--muted` (white at 62%) painted over a background, resolved to the pixel it produces.
+    fn blend(brush: [u8; 4], under: [u8; 4]) -> Px {
+        let a = f32::from(brush[3]) / 255.0;
+        let over = |index: usize| {
+            (f32::from(brush[index]) * a + f32::from(under[index]) * (1.0 - a)).round() as u8
+        };
+        Px {
+            b: over(2),
+            g: over(1),
+            r: over(0),
+            a: 255,
         }
     }
 

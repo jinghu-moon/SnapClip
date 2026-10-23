@@ -46,9 +46,16 @@ pub use field::{
     FORM_FIELD_TAB_STOPS, INPUT_RADIUS_DIP, QUALITY_OPTIONS, QUALITY_OPTION_WORDS,
     QUALITY_OPTION_WIDTH_DIP, QUALITY_SEG_INNER_RADIUS_DIP,
     QUALITY_SEG_INSET_DIP, QUALITY_SEG_RADIUS_DIP, QUALITY_SEG_WIDTH_DIP, ROW_DIP, Row, SizeCell,
+    SIZE_MODE_BUTTON_HEIGHT_DIP, SIZE_MODE_BUTTON_PADDING_DIP, SIZE_MODE_BUTTON_RADIUS_DIP,
+    SIZE_MODE_BORDER_DIP, SIZE_MODE_CHOSEN, SIZE_MODE_GAP_DIP, SIZE_MODE_PADDING_DIP,
+    SIZE_MODE_RADIUS_DIP, SIZE_MODE_RESET_DIP, SIZE_MODE_RESET_ICON_DIP, SIZE_MODE_RESET_RADIUS_DIP,
+    SIZE_MODE_WORDS,
     chosen_quality, edit_font_height, field_colours, field_rect, form_drawn_strings, label_rect,
+    line_soft_over_surface,
     name_field_rect, path_field_rect, quality_option_rect, quality_pointer, quality_seg_rect,
     quality_segment_state, size_cell_rect,
+    size_mode_button_rect, size_mode_button_width, size_mode_rect, size_mode_reset_icon_rect,
+    size_mode_reset_rect,
 };
 pub use frame::{
     CHIP_FONT_DIP, DEMO, DEMO_PALETTE, Frame, FrameBrushes, FrameMetrics, FramePalette, FrameRects,
