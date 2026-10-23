@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>图标对照 · 浏览器渲染 vs 烘焙产物</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 24px; background: #16181d; color: #e8ecf2;
+         font: 14px/1.6 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  h2 { font-size: 14px; margin: 24px 0 8px; color: #9aa4b2; font-weight: 600; }
+  p { margin: 6px 0; color: #9aa4b2; }
+  code { background: #22262e; padding: 1px 5px; border-radius: 4px; color: #cfd6e0; }
+  .wrap { max-width: 1180px; margin: 0 auto; }
+  .bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+         margin: 16px 0; padding: 12px; background: #1c1f26; border: 1px solid #2b3038; border-radius: 10px; }
+  button { font: inherit; padding: 6px 12px; border-radius: 7px; cursor: pointer;
+           background: #2a2f38; color: #e8ecf2; border: 1px solid #3a4150; }
+  button:hover { background: #333a45; }
+  button.primary { background: #1f75db; border-color: #1f75db; }
+  button.primary:hover { background: #2b82e8; }
+  input[type=range] { width: 160px; }
+  .note { background: #1c1f26; border: 1px solid #2b3038; border-left: 3px solid #1f75db;
+          border-radius: 8px; padding: 10px 14px; margin: 12px 0; }
+  .note b { color: #e8ecf2; }
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid #262b33; white-space: nowrap; }
+  th { color: #9aa4b2; font-weight: 600; }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover { background: #1c1f26; }
+  tbody tr.sel { background: #22303f; }
+  .ok { color: #4fc08d; }
+  .warn { color: #eeba18; }
+  .bad { color: #f4645f; }
+  .muted { color: #6b7480; }
+  .views { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 12px; }
+  .view { background: #1c1f26; border: 1px solid #2b3038; border-radius: 10px; padding: 10px; }
+  .view .cap { font-size: 12px; color: #9aa4b2; margin-bottom: 6px; }
+  canvas { display: block; width: 192px; height: 192px; image-rendering: pixelated;
+           background: repeating-conic-gradient(#32363e 0% 25%, #21242a 0% 50%) 50% / 16px 16px;
+           border-radius: 6px; }
+  #status { color: #9aa4b2; }
+  #report { width: 100%; height: 150px; margin-top: 10px; background: #14171c; color: #cfd6e0;
+            border: 1px solid #2b3038; border-radius: 8px; padding: 10px; font: 12px/1.5 Consolas, monospace; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>图标对照 · 浏览器渲染 vs 烘焙产物</h1>
+  <p>用<b>独立的第二个渲染器</b>（浏览器）把 SVG 画一遍，与 <code>icon-bake</code> 烘出来的 PNG 逐像素对照。</p>
+
+  <div class="note">
+    <b>为什么要点一下选择文件，而不是打开就能用</b><br>
+    <code>file://</code> 页面里，直接 <code>&lt;img src="x.svg"&gt;</code> 画到 canvas 会把它<b>污染</b>，<code>getImageData</code> 会抛 SecurityError。
+    所以本页把文件读成文本后走 <code>Blob URL</code>（与 <code>assets/log</code> 里那份烘焙器同一手法），canvas 不被污染，逐像素比较才成立。
+    <br><b>不需要任何服务器</b>，双击本文件打开即可。
+  </div>
+
+  <div class="bar">
+    <input id="files" type="file" multiple accept=".svg,.png" hidden>
+    <input id="dir" type="file" webkitdirectory hidden>
+    <button class="primary" id="pickFiles">选择 SVG 与 PNG</button>
+    <button id="pickDir">选择 assets/icon 文件夹</button>
+    <button id="clear">清空</button>
+    <label class="muted">容差 ±<input id="tol" type="range" min="0" max="64" value="8"><span id="tolVal">8</span></label>
+    <label class="muted"><input id="alphaOnly" type="checkbox"> 只比 alpha（只看形状）</label>
+    <button id="export">导出报告</button>
+    <span id="status">等待选择文件…</span>
+  </div>
+
+  <p class="muted">也可以直接把 <code>assets/icon</code> 里的文件<b>拖进本页</b>。同名配对：<code>link.svg</code> ↔ <code>link.png</code>。</p>
+
+  <h2>结论</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>图标</th><th>差异像素</th><th>占比</th><th>最大通道差</th>
+        <th>alpha 差异像素</th><th>最大差异块</th><th>判定</th>
+      </tr>
+    </thead>
+    <tbody id="rows"><tr><td colspan="7" class="muted">还没有结果</td></tr></tbody>
+  </table>
+
+  <h2>视图</h2>
+  <div class="views">
+    <div class="view"><div class="cap">浏览器渲染（左）</div><canvas id="cBrowser" width="96" height="96"></canvas></div>
+    <div class="view"><div class="cap">烘焙 PNG（右）</div><canvas id="cBaked" width="96" height="96"></canvas></div>
+    <div class="view"><div class="cap">差异（超过容差的像素标红）</div><canvas id="cDiff" width="96" height="96"></canvas></div>
+  </div>
+  <textarea id="report" readonly placeholder="导出报告会出现在这里"></textarea>
+</div>
+
+<script>
+"use strict";
+const SIZE = 96;
+const DEFAULT_UNITS = 24;   // 与 icon-bake 一致：文件没给尺寸时按 24 单位
+
+const $ = id => document.getElementById(id);
+const state = { files: new Map(), tol: 8, alphaOnly: false, results: [], selected: null };
+
+/* ---------- 读取与配对 ---------- */
+function baseName(name) { return name.replace(/\.(svg|png)$/i, ""); }
+
+async function addFiles(list) {
+  for (const file of list) {
+    const lower = file.name.toLowerCase();
+    if (!lower.endsWith(".svg") && !lower.endsWith(".png")) continue;
+    const key = baseName(file.name);
+    if (!state.files.has(key)) state.files.set(key, {});
+    const slot = state.files.get(key);
+    if (lower.endsWith(".svg")) slot.svg = file; else slot.png = file;
+  }
+  await analyseAll();
+}
+
+/* ---------- SVG 尺寸：与 icon-bake 同规则 ---------- */
+function parseLength(text) {
+  const m = /^\s*([+-]?[\d.]+)/.exec(text || "");
+  return m ? parseFloat(m[1]) : NaN;
+}
+function intrinsicSize(svgText) {
+  const doc = new DOMParser().parseFromString(svgText, "image/svg+xml");
+  if (doc.querySelector("parsererror")) throw new Error("SVG 解析失败");
+  const root = doc.documentElement;
+  let w = parseLength(root.getAttribute("width"));
+  let h = parseLength(root.getAttribute("height"));
+  if (!(w > 0) || !(h > 0)) {
+    const vb = (root.getAttribute("viewBox") || "").trim().split(/[\s,]+/).map(Number);
+    if (vb.length === 4 && vb[2] > 0 && vb[3] > 0) { w = vb[2]; h = vb[3]; }
+  }
+  if (!(w > 0) || !(h > 0)) { w = DEFAULT_UNITS; h = DEFAULT_UNITS; }
+  return { w, h };
+}
+
+/* ---------- 渲染 ---------- */
+function loadImage(url) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error("图像加载失败"));
+    img.src = url;
+  });
+}
+function ctxOf(canvas) {
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  ctx.clearRect(0, 0, SIZE, SIZE);
+  return ctx;
+}
+/** 浏览器渲染：把 SVG 文本做成 Blob URL，按“长边缩放到 96、短边居中”画进 96×96。 */
+async function renderSvg(svgText) {
+  const { w, h } = intrinsicSize(svgText);
+  // 强制白色：源文件用 currentColor，在 <img> 里会解析成黑色；icon-bake 也是把 currentColor 换成白色。
+  // 用子元素 <style> 而不是给根节点加 style 属性，避免与已有的 style 属性撞车。
+  const white = svgText.replace(/(<svg\b[^>]*>)/i, '$1<style>:root{color:#ffffff}</style>');
+  const url = URL.createObjectURL(new Blob([white], { type: "image/svg+xml" }));
+  try {
+    const img = await loadImage(url);
+    const canvas = document.createElement("canvas");
+    canvas.width = canvas.height = SIZE;
+    const ctx = ctxOf(canvas);
+    const unit = Math.max(w, h), scale = SIZE / unit;
+    const dw = w * scale, dh = h * scale;
+    ctx.drawImage(img, (SIZE - dw) / 2, (SIZE - dh) / 2, dw, dh);
+    return ctx.getImageData(0, 0, SIZE, SIZE);
+  } finally { URL.revokeObjectURL(url); }
+}
+/** 烘焙产物：PNG 本身就是 96×96，按 1:1 取像素。 */
+async function renderPng(pngFile) {
+  const url = URL.createObjectURL(pngFile);
+  try {
+    const img = await loadImage(url);
+    const canvas = document.createElement("canvas");
+    canvas.width = canvas.height = SIZE;
+    const ctx = ctxOf(canvas);
+    ctx.drawImage(img, 0, 0, SIZE, SIZE);
+    return { data: ctx.getImageData(0, 0, SIZE, SIZE), natural: [img.naturalWidth, img.naturalHeight] };
+  } finally { URL.revokeObjectURL(url); }
+}
+
+/* ---------- 比较 ---------- */
+function largestComponent(mask) {
+  const seen = new Uint8Array(mask.length);
+  let best = 0;
+  const stack = [];
+  for (let i = 0; i < mask.length; i++) {
+    if (!mask[i] || seen[i]) continue;
+    let size = 0;
+    stack.push(i); seen[i] = 1;
+    while (stack.length) {
+      const p = stack.pop(); size++;
+      const x = p % SIZE, y = (p - x) / SIZE;
+      const push = q => { if (mask[q] && !seen[q]) { seen[q] = 1; stack.push(q); } };
+      if (x > 0) push(p - 1);
+      if (x < SIZE - 1) push(p + 1);
+      if (y > 0) push(p - SIZE);
+      if (y < SIZE - 1) push(p + SIZE);
+    }
+    if (size > best) best = size;
+  }
+  return best;
+}
+function compare(a, b, tol, alphaOnly) {
+  const n = SIZE * SIZE;
+  const out = new ImageData(SIZE, SIZE);
+  const mask = new Uint8Array(n);
+  let diff = 0, alphaDiff = 0, maxDelta = 0, sumDelta = 0;
+  for (let i = 0; i < n; i++) {
+    const o = i * 4;
+    const dr = Math.abs(a.data[o] - b.data[o]);
+    const dg = Math.abs(a.data[o + 1] - b.data[o + 1]);
+    const db = Math.abs(a.data[o + 2] - b.data[o + 2]);
+    const da = Math.abs(a.data[o + 3] - b.data[o + 3]);
+    // 默认按 RGBA 四通道取最大差；"只比 alpha" 时忽略颜色，只看覆盖形状。
+    const d = alphaOnly ? da : Math.max(dr, dg, db, da);
+    sumDelta += d;
+    if (d > maxDelta) maxDelta = d;
+    if (da > tol) alphaDiff++;
+    if (d > tol) {
+      diff++; mask[i] = 1;
+      out.data[o] = 244; out.data[o + 1] = 100; out.data[o + 2] = 95; out.data[o + 3] = 255;
+    } else {
+      out.data[o] = 30; out.data[o + 1] = 33; out.data[o + 2] = 38;
+      out.data[o + 3] = 255;
+    }
+  }
+  return { diff, alphaDiff, maxDelta, meanDelta: sumDelta / n, block: largestComponent(mask), image: out };
+}
+function verdictOf(r) {
+  const ratio = r.diff / (SIZE * SIZE);
+  if (r.diff === 0) return ["逐像素一致", "ok"];
+  if (r.block > 200) return ["不一致：差异成片（形状可能不同）", "bad"];
+  if (ratio < 0.005) return ["形状一致：差异只在边缘抗锯齿", "ok"];
+  if (ratio < 0.02) return ["接近：差异偏多，建议人眼看一下", "warn"];
+  return ["需人看：差异像素较多", "bad"];
+}
+
+/* ---------- 主流程 ---------- */
+async function analyseAll() {
+  const keys = [...state.files.keys()].sort();
+  const rows = [];
+  state.results = [];
+  for (const key of keys) {
+    const slot = state.files.get(key);
+    if (!slot.svg || !slot.png) { rows.push({ key, missing: true, slot }); continue; }
+    try {
+      const svgText = await slot.svg.text();
+      const a = await renderSvg(svgText);
+      const b = await renderPng(slot.png);
+      const r = compare(a, b, state.tol, state.alphaOnly);
+      r.verdict = verdictOf(r);
+      r.pngNatural = b.natural;
+      state.results.push({ key, a, b, r });
+      rows.push({ key, r, slot, natural: b.natural });
+    } catch (error) {
+      rows.push({ key, error: String(error && error.message || error), slot });
+    }
+  }
+  drawTable(rows);
+  const ok = state.results.length;
+  $("status").textContent = `已对照 ${ok} 个图标（缺文件的会标出来）`;
+  if (!state.selected && state.results.length) select(state.results[0].key);
+}
+function select(key) {
+  const entry = state.results.find(x => x.key === key);
+  if (!entry) return;
+  state.selected = key;
+  for (const tr of $("rows").querySelectorAll("tr")) tr.classList.toggle("sel", tr.dataset.key === key);
+  $("cBrowser").getContext("2d").putImageData(entry.a, 0, 0);
+  $("cBaked").getContext("2d").putImageData(entry.b.data, 0, 0);
+  $("cDiff").getContext("2d").putImageData(entry.r.image, 0, 0);
+}
+function drawTable(rows) {
+  const tbody = $("rows");
+  tbody.innerHTML = "";
+  if (!rows.length) { tbody.innerHTML = '<tr><td colspan="7" class="muted">还没有结果</td></tr>'; return; }
+  for (const row of rows) {
+    const tr = document.createElement("tr");
+    tr.dataset.key = row.key;
+    if (row.missing) {
+      const need = !row.slot.svg ? "缺少 .svg" : "缺少 .png（先跑 cargo run -p icon-bake）";
+      tr.innerHTML = `<td>${row.key}</td><td colspan="6" class="warn">${need}</td>`;
+    } else if (row.error) {
+      tr.innerHTML = `<td>${row.key}</td><td colspan="6" class="bad">${row.error}</td>`;
+    } else {
+      const r = row.r, ratio = (r.diff / (SIZE * SIZE) * 100).toFixed(2);
+      const [text, cls] = r.verdict;
+      const size = row.natural && (row.natural[0] !== SIZE || row.natural[1] !== SIZE)
+        ? ` <span class="warn">(PNG 是 ${row.natural[0]}×${row.natural[1]})</span>` : "";
+      tr.innerHTML = `<td>${row.key}${size}</td><td>${r.diff}</td><td>${ratio}%</td>` +
+        `<td>${r.maxDelta}</td><td>${r.alphaDiff}</td><td>${r.block}</td><td class="${cls}">${text}</td>`;
+      tr.onclick = () => select(row.key);
+    }
+    tbody.appendChild(tr);
+  }
+}
+function buildReport() {
+  const lines = [
+    `# 图标对照报告（浏览器渲染 vs 烘焙 PNG）`,
+    `# 容差：每通道 ±${state.tol}；${state.alphaOnly ? "只比 alpha（形状）" : "差异按 RGBA 四通道取最大值"}`,
+    `# 注意：判定看形状，边缘抗锯齿必然不同；"最大差异块"指最大的 4 连通差异区域像素数`,
+    `key\tdiff_px\tratio\tmax_delta\talpha_diff\tmax_block\tverdict`
+  ];
+  for (const row of state.results) {
+    const r = row.r;
+    lines.push([row.key, r.diff, (r.diff / (SIZE * SIZE) * 100).toFixed(2) + "%",
+      r.maxDelta, r.alphaDiff, r.block, r.verdict[0]].join("\t"));
+  }
+  return lines.join("\n");
+}
+
+/* ---------- 交互 ---------- */
+$("pickFiles").onclick = () => $("files").click();
+$("pickDir").onclick = () => $("dir").click();
+$("files").onchange = e => addFiles(e.target.files);
+$("dir").onchange = e => addFiles(e.target.files);
+$("clear").onclick = () => {
+  state.files.clear(); state.results = []; state.selected = null;
+  $("rows").innerHTML = '<tr><td colspan="7" class="muted">还没有结果</td></tr>';
+  for (const id of ["cBrowser", "cBaked", "cDiff"]) ctxOf($(id));
+  $("status").textContent = "已清空";
+};
+$("tol").oninput = async e => {
+  state.tol = Number(e.target.value);
+  $("tolVal").textContent = String(state.tol);
+  await analyseAll();
+};
+$("alphaOnly").onchange = async e => {
+  state.alphaOnly = e.target.checked;
+  await analyseAll();
+};
+$("export").onclick = () => {
+  $("report").value = state.results.length ? buildReport() : "还没有结果";
+  $("report").select();
+};
+for (const type of ["dragenter", "dragover"]) {
+  document.addEventListener(type, e => { e.preventDefault(); });
+}
+document.addEventListener("drop", e => {
+  e.preventDefault();
+  if (e.dataTransfer && e.dataTransfer.files) addFiles(e.dataTransfer.files);
+});
+</script>
+</body>
+</html>
