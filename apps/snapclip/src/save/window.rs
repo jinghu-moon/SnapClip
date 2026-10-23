@@ -1170,6 +1170,20 @@ extern "system" fn window_proc(
             } else {
                 snapclip_ui::panel::PointerEvent::Up
             };
+            // The close button is drawn by the frame, so its clicks arrive here too. The button is
+            // hit tested, not the 14 dip glyph inside it: the mockup's button is 26 dip (`:96`) and
+            // its svg is 14 (`:98`), and a corner target should be the size of the thing that looks
+            // clickable. Closing goes through the same message `Esc` posts, and the window posts it
+            // to its own handle, so there is no stale number to aim at.
+            if event == snapclip_ui::panel::PointerEvent::Down {
+                let metrics = snapclip_ui::panel::DEMO;
+                let rects = metrics.rects(dpi_scale(hwnd));
+                if snapclip_ui::panel::close_button_contains(&rects, dpi_scale(hwnd), (point.x, point.y))
+                {
+                    windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                    return 0;
+                }
+            }
             let chosen = state_mut(hwnd)
                 .map(|s| s.quality_pointer(dpi_scale(hwnd), event, point))
                 .unwrap_or(false);

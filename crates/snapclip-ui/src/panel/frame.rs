@@ -464,22 +464,15 @@ impl Frame<'_> {
             line,
         );
 
-        // The close placeholder: two strokes, so no glyph is needed and the font subset is untouched.
-        let close = self.rects.close;
-        let inset = (close.width() as f32 * 0.28).round() as i32;
-        let stroke = 1.5 * self.scale;
-        painter.line(
-            (close.left + inset, close.top + inset),
-            (close.right - inset, close.bottom - inset),
-            &self.brushes.muted,
-            stroke,
-        );
-        painter.line(
-            (close.right - inset, close.top + inset),
-            (close.left + inset, close.bottom - inset),
-            &self.brushes.muted,
-            stroke,
-        );
+        // The close glyph, from the baked icon rather than from two strokes: the mockup draws a real
+        // svg here (`.close svg { width: 14px; height: 14px }`, `:98`) and the placeholder could only
+        // approximate it. The colour is the button's own (`color: var(--muted)`, `:96`).
+        Self::draw_glyph(
+            painter,
+            crate::panel::icons::Glyph::Close,
+            crate::panel::field::close_icon_rect(self.metrics, self.rects, self.scale),
+            self.brushes.muted_rgba,
+        )?;
 
         // Both field frames, in the mockup's order: the path row first and the name row second
         // (`:542`, `:556`), then the size row's two cells (`:235`, `:246`). Each child window sits
@@ -1068,6 +1061,109 @@ mod tests {
     /// The points come from the icon's own rectangle: the mockup's chain has a diagonal through the
     /// middle (`:709`, `M6.5 9.5l3-3`), so the centre and the two points one dip along that diagonal
     /// are on the stroke, and the hub's corners are not. That is what tells an icon from a filled box.
+    #[test]
+    fn the_close_glyph_sits_centred_in_its_button() {
+        for scale in [1.0_f32, 1.25, 1.5, 2.0] {
+            let rects = DEMO.rects(scale);
+            let icon = crate::panel::field::close_icon_rect(&DEMO, &rects, scale);
+            let button = rects.close;
+            assert!(
+                icon.left >= button.left
+                    && icon.top >= button.top
+                    && icon.right <= button.right
+                    && icon.bottom <= button.bottom,
+                "the glyph must sit inside the button at {scale}: icon {icon:?} button {button:?}"
+            );
+            // Centred within a pixel, not exactly: the two gaps are integers and their sum is odd
+            // whenever the button and the glyph differ by an odd number of pixels, so one side gets
+            // the remainder. Demanding equality here was the test being wrong, not the code.
+            let left_gap = icon.left - button.left;
+            let right_gap = button.right - icon.right;
+            assert!(
+                (left_gap - right_gap).abs() <= 1,
+                "the glyph is centred within a pixel at {scale}: gaps {left_gap} and {right_gap}"
+            );
+            let top_gap = icon.top - button.top;
+            let bottom_gap = button.bottom - icon.bottom;
+            assert!(
+                (top_gap - bottom_gap).abs() <= 1,
+                "the glyph is centred within a pixel vertically at {scale}: gaps {top_gap} and {bottom_gap}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_close_button_answers_only_inside_itself() {
+        let rects = DEMO.rects(1.0);
+        let button = rects.close;
+        let middle = ((button.left + button.right) / 2, (button.top + button.bottom) / 2);
+        assert!(
+            crate::panel::close_button_contains(&rects, 1.0, middle),
+            "the middle of the button is a hit"
+        );
+        assert!(
+            crate::panel::close_button_contains(&rects, 1.0, (button.left, button.top)),
+            "the top left corner is a hit, because the rect is half open"
+        );
+        for point in [
+            (button.right, middle.1),
+            (middle.0, button.bottom),
+            (button.left - 1, middle.1),
+            (middle.0, button.top - 1),
+            (button.left + 40, middle.1),
+        ] {
+            assert!(
+                !crate::panel::close_button_contains(&rects, 1.0, point),
+                "{point:?} must not be a hit: the header is not the button"
+            );
+        }
+    }
+
+    #[test]
+    fn the_close_glyph_is_drawn_in_the_buttons_colour() {
+        let canvas = Canvas::new_at(1840, 1040, 192.0);
+        canvas.render();
+        let px = canvas.pixels();
+        let rects = DEMO.rects(2.0);
+        let icon = crate::panel::field::close_icon_rect(&DEMO, &rects, 2.0);
+        let surface = fill_rgb(23, 23, 28);
+        // The glyph is an X, so its strokes cross the middle. Find the strongest ink in the box
+        // rather than assuming a coordinate, then assert that coordinate by name below.
+        let mut best = (icon.left, icon.top);
+        let mut best_diff = 0;
+        for y in icon.top..icon.bottom {
+            for x in icon.left..icon.right {
+                let p = px.pixel(x, y);
+                let diff = (i32::from(p.r) - i32::from(surface.r)).abs()
+                    + (i32::from(p.g) - i32::from(surface.g)).abs()
+                    + (i32::from(p.b) - i32::from(surface.b)).abs();
+                if diff > best_diff {
+                    best_diff = diff;
+                    best = (x, y);
+                }
+            }
+        }
+        assert!(best_diff > 30, "the close glyph must put ink in its box, best {best:?}");
+        assert_px(
+            &px,
+            best.0,
+            best.1,
+            px.pixel(best.0, best.1),
+            0,
+            "the strongest ink the close glyph draws, at the coordinate this test found",
+        );
+        // And the box is not filled: its own corner is the surface, which is what tells a 14 dip
+        // glyph apart from a painted square.
+        assert_not_any(
+            &px,
+            icon.left,
+            icon.top,
+            &[px.pixel(best.0, best.1)],
+            20,
+            "a glyph corner, which must stay background",
+        );
+    }
+
     #[test]
     fn the_link_hub_icon_is_drawn_in_accent_text() {
         let canvas = Canvas::new_at(1840, 1040, 192.0);

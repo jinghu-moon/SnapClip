@@ -638,6 +638,40 @@ pub fn link_hub_icon_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32
     }
 }
 
+/// The close glyph's box inside the header button: 14 dip square, centred in the 26 dip button
+/// (`.close svg { width: 14px; height: 14px }`, `:98`; the button is `.close { width: 26px }`, `:96`).
+pub const CLOSE_ICON_DIP: i32 = 14;
+
+/// The drawn close glyph, centred in `rects.close`.
+///
+/// The picture and the clickable area are two rectangles on purpose: the mockup's button is 26 dip
+/// and the svg inside it is 14 (`:96`, `:98`), and someone aiming at the corner should not have to
+/// hit 14 of them. The frame paints this rectangle; the window hit tests the button.
+pub fn close_icon_rect(_metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let button = rects.close;
+    let side = px(CLOSE_ICON_DIP);
+    let left = button.left + (button.right - button.left - side) / 2;
+    let top = button.top + (button.bottom - button.top - side) / 2;
+    Rect {
+        left,
+        top,
+        right: left + side,
+        bottom: top + side,
+    }
+}
+
+/// Whether a client-area point is inside the close button.
+///
+/// Pure on purpose: the window's message handler cannot be tested without a window, and a hit test
+/// that only exists inside one is a hit test nothing checks. The button is `rects.close`, which is
+/// 26 dip (`:96`) — the glyph inside it is 14 (`:98`).
+pub fn close_button_contains(rects: &FrameRects, scale: f32, point: (i32, i32)) -> bool {
+    let _ = scale;
+    let button = rects.close;
+    point.0 >= button.left && point.0 < button.right && point.1 >= button.top && point.1 < button.bottom
+}
+
 /// `.size-mode { padding: 2px; border: 1px solid var(--line-soft); border-radius: var(--r-input) }`
 /// (`:225`, `:54`) — the two-button container at the end of the size row's header line.
 pub const SIZE_MODE_PADDING_DIP: i32 = 2;

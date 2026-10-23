@@ -55,7 +55,7 @@ pub use field::{
     SIZE_MODE_BUTTON_HEIGHT_DIP, SIZE_MODE_BUTTON_PADDING_DIP, SIZE_MODE_BUTTON_RADIUS_DIP,
     SIZE_MODE_BORDER_DIP, SIZE_MODE_CHOSEN, SIZE_MODE_GAP_DIP, SIZE_MODE_PADDING_DIP,
     SIZE_MODE_RADIUS_DIP, SIZE_MODE_RESET_DIP, SIZE_MODE_RESET_ICON_DIP, SIZE_MODE_RESET_RADIUS_DIP,
-    SIZE_MODE_WORDS,
+    SIZE_MODE_WORDS, CLOSE_ICON_DIP, close_button_contains, close_icon_rect,
     chosen_quality, edit_font_height, edit_font_height_for, field_colours, field_rect,
     form_drawn_strings, label_rect,
     line_soft_over_surface,
