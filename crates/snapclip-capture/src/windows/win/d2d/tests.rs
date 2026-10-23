@@ -1595,6 +1595,25 @@ fn the_embedded_subset_covers_the_strings_the_overlay_draws() {
     }
 }
 
+/// The save panel's numeric face is a second embedded subset with the same failure mode as the UI
+/// one: a character outside it is not an error anywhere, it renders per glyph in whatever the system
+/// falls back to, and only the screen shows it. The allowlist lives in the ui crate, beside the face
+/// it describes, so the font the panel asks for and the font checked here cannot drift apart.
+#[test]
+fn the_embedded_number_subset_covers_the_numbers_the_panel_shows() {
+    let covered = cmap_codepoints(snapclip_ui::panel::NUMBER_SUBSET);
+
+    for character in snapclip_ui::panel::NUMBER_CHARACTERS.chars() {
+        assert!(
+            covered.contains(&(character as u32)),
+            "the embedded numeric subset has no glyph for {character:?} (U+{:04X}), which the size \
+             row and the estimate row draw in that face: rebuild it with\n\
+             `python3 subfont/build_number_font.py`",
+            character as u32,
+        );
+    }
+}
+
 /// Glyph count from the font's `maxp` table — the ceiling a `cmap` reader can be held to.
 fn font_glyph_count(bytes: &[u8]) -> usize {
     let u16_at = |at: usize| u16::from_be_bytes([bytes[at], bytes[at + 1]]) as usize;

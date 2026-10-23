@@ -333,6 +333,10 @@ pub struct Frame<'a> {
     /// while `.seg .opt` inherits the body's — so they are two formats rather than one.
     pub row_label: Option<&'a IDWriteTextFormat>,
     pub chip: Option<&'a IDWriteTextFormat>,
+    /// The numeric face's format, for the `px` unit beside each size cell (`--fs-num`'s family,
+    /// `.dim-unit`'s size). `None` falls back to [`Self::chip`] so the unit still draws if the
+    /// caller did not build one.
+    pub number: Option<&'a IDWriteTextFormat>,
     /// The state of every form field's frame. The native `EDIT` itself draws no border, no focus ring
     /// and no error state, so those belong to the frame (`field.rs`), and each field carries its own
     /// — one shared state is what made a focused path row draw the name row's frame.
@@ -520,7 +524,7 @@ impl Frame<'_> {
         // the child window draws, and a `px` unit (`:237`, `:242`, `:244`, `:595`, `:605`). The
         // wrapper is painted by the loop above, which is why the cell's frame rectangle and the
         // control's rectangle are two different things here and the same thing everywhere else.
-        if let (Some(word_format), Some(unit_format)) = (self.row_label, self.chip) {
+        if let (Some(word_format), Some(unit_format)) = (self.row_label, self.number.or(self.chip)) {
             for (cell, word) in [
                 (crate::panel::SizeCell::Width, crate::panel::field::SIZE_CELL_WORDS[0]),
                 (crate::panel::SizeCell::Height, crate::panel::field::SIZE_CELL_WORDS[1]),
@@ -704,10 +708,29 @@ pub fn text_format(
     size_dip: f32,
     weight: DWRITE_FONT_WEIGHT,
 ) -> Result<IDWriteTextFormat> {
+    text_format_in(
+        dwrite,
+        dpi,
+        size_dip,
+        weight,
+        &[FAMILY, "Segoe UI Variable Display", "Segoe UI"],
+    )
+}
+
+/// [`text_format`] for a caller that draws in another face. The size row's number and unit are set
+/// in the embedded numeric face (`fonts.rs`), which is registered separately and falls back
+/// through its own list.
+pub fn text_format_in(
+    dwrite: &IDWriteFactory,
+    dpi: f32,
+    size_dip: f32,
+    weight: DWRITE_FONT_WEIGHT,
+    families: &[&str],
+) -> Result<IDWriteTextFormat> {
     let scale = (dpi / 96.0).max(0.5);
     let mut last: Option<windows::core::Error> = None;
-    for family in [FAMILY, "Segoe UI Variable Display", "Segoe UI"] {
-        let wide = windows::core::HSTRING::from(family);
+    for family in families {
+        let wide = windows::core::HSTRING::from(*family);
         let made = unsafe {
             dwrite.CreateTextFormat(
                 &wide,
@@ -760,6 +783,34 @@ pub fn chip_format(dwrite: &IDWriteFactory, dpi: f32) -> Result<IDWriteTextForma
         let _ = format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
     }
     Ok(format)
+}
+
+/// `--fs-num: 16px` (`save-panel-demo-v3.html:33`). The size cells' numbers.
+pub const NUMBER_FONT_DIP: f32 = 16.0;
+
+/// `.dim-unit { font-size: 12px }` (`save-panel-demo-v3.html:244`). The unit beside a number.
+pub const UNIT_FONT_DIP: f32 = 12.0;
+
+/// The numeric face's size format, used for the `px` unit beside each size cell.
+///
+/// `.dim-input` and `.dim-unit` both set `font-family: var(--num)` (`:242`, `:244`) — a monospaced
+/// face so the digits line up between the two cells and a changing value does not shuffle the text
+/// sideways. The face is the embedded subset in `fonts.rs`, registered separately from the UI font,
+/// so it carries its own fallback list.
+///
+/// The number itself is not drawn here: it lives in a native `EDIT`, whose alignment is the control
+/// style `ES_RIGHT` rather than a text format.
+pub fn number_format(dwrite: &IDWriteFactory, dpi: f32) -> Result<IDWriteTextFormat> {
+    let families: Vec<&str> = std::iter::once(crate::panel::NUMBER_FAMILY)
+        .chain(crate::panel::NUMBER_FALLBACKS)
+        .collect();
+    text_format_in(
+        dwrite,
+        dpi,
+        UNIT_FONT_DIP,
+        DWRITE_FONT_WEIGHT_MEDIUM,
+        &families,
+    )
 }
 
 fn properties(dpi: f32) -> D2D1_RENDER_TARGET_PROPERTIES {
@@ -855,6 +906,8 @@ pub fn paint_to_dc_with_preview(
     // The form's own text, at the two sizes the design gives it (`:35`, `:36`).
     let row_label = row_label_format(dwrite, dpi)?;
     let chip = chip_format(dwrite, dpi)?;
+    // The numbers' face, for the size cells' `px` unit (`:242`, `:244`).
+    let number = number_format(dwrite, dpi)?;
     let painter = PanelPainter {
         context: &target,
         text_factory: dwrite,
@@ -875,6 +928,7 @@ pub fn paint_to_dc_with_preview(
         title: Some((TITLE, &title)),
         row_label: Some(&row_label),
         chip: Some(&chip),
+        number: Some(&number),
         fields,
         preview: preview.as_ref().map(|(b, w, h)| (b, *w, *h)),
         quality,
@@ -929,6 +983,8 @@ pub fn paint_to_target_with_preview(
     let title = title_format(dwrite, dpi)?;
     let row_label = row_label_format(dwrite, dpi)?;
     let chip = chip_format(dwrite, dpi)?;
+    // The numbers' face, for the size cells' `px` unit (`:242`, `:244`).
+    let number = number_format(dwrite, dpi)?;
     Frame {
         metrics: &metrics,
         rects: &rects,
@@ -938,6 +994,7 @@ pub fn paint_to_target_with_preview(
         title: Some((TITLE, &title)),
         row_label: Some(&row_label),
         chip: Some(&chip),
+        number: Some(&number),
         fields: crate::panel::FieldStates::IDLE,
         preview: preview.as_ref().map(|(b, w, h)| (b, *w, *h)),
         quality,

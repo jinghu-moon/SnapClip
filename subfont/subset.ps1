@@ -1,4 +1,4 @@
-﻿# Rebuilds the overlay's embedded UI font subset: the glyphs of **the strings the overlay draws**,
+# Rebuilds the overlay's embedded UI font subset: the glyphs of **the strings the overlay draws**,
 # plus printable ASCII (the panel draws computed text — colour values, coordinates, sizes).
 #
 # The list of drawn strings is Rust's answer, not something to maintain here: it comes from
@@ -12,6 +12,10 @@
 #
 # Requires: python3 with fontTools (pip install fonttools) and the source font at
 # `refer/HarmonyOS_SansSC_Regular.ttf` (that directory is gitignored).
+#
+# This is the UI font. The save panel's numeric face — Fira Code, for the size cells' numbers and
+# unit — is a second, much smaller subset with a fixed allowlist rather than a drawn-string list,
+# and it has its own script: `python3 subfont/build_number_font.py`.
 $ErrorActionPreference = "Stop"
 Set-Location (Split-Path -Parent $PSScriptRoot)
 # Keep Python's output readable in Windows PowerShell 5.1 (which decodes the console with the

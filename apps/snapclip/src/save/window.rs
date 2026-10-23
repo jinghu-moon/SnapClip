@@ -682,6 +682,11 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
         let scale = (f64::from(dpi) / 96.0) as f32;
         let metrics = snapclip_ui::panel::DEMO;
         let rects = metrics.rects(scale);
+        // The numeric face has to be resolvable before the first paint asks DirectWrite for it, so
+        // it is registered here rather than relying on the controls below happening to register it
+        // first. `AddFontMemResourceEx` is idempotent, and both subsets stay registered for the life
+        // of the process.
+        snapclip_ui::panel::register_number_font();
         let initial_text = |id| initial_text(id, options.capture_size);
         if let Some(s) = (state as *mut WindowState).as_mut() {
             for id in snapclip_ui::panel::FieldId::ALL {
@@ -689,6 +694,7 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
                     hwnd,
                     id.rect(&metrics, &rects, scale),
                     &initial_text(id),
+                    id.face(),
                 );
                 s.set_control(id, control);
             }
@@ -894,6 +900,7 @@ fn create_field_edit(
     parent: windows_sys::Win32::Foundation::HWND,
     field: snapclip_model::geometry::Rect,
     text: &str,
+    face: snapclip_ui::panel::FieldFace,
 ) -> windows_sys::Win32::Foundation::HWND {
     use windows_sys::Win32::Graphics::Gdi::{
         AddFontMemResourceEx, CreateFontW, CLEARTYPE_QUALITY, DEFAULT_CHARSET, FF_DONTCARE,
@@ -902,7 +909,7 @@ fn create_field_edit(
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, GetClientRect, ES_AUTOHSCROLL, WS_CHILD, WS_TABSTOP, WS_VISIBLE,
+        CreateWindowExW, GetClientRect, ES_AUTOHSCROLL, ES_RIGHT, WS_CHILD, WS_TABSTOP, WS_VISIBLE,
     };
 
     unsafe {
@@ -910,7 +917,13 @@ fn create_field_edit(
         // registration lives as long as the process, and `RemoveFontMemResourceEx` on a handle the
         // GDI objects still reference would pull the face out from under them.
         let mut loaded: u32 = 0;
-        let bytes = snapclip_capture::overlay_font::SUBSET;
+        // The face decides which subset has to be registered: the size cells are set in the numeric
+        // font, everything else in the UI font. Both are registered from memory and both stay
+        // registered for the life of the process.
+        let bytes = match face {
+            snapclip_ui::panel::FieldFace::Text => snapclip_capture::overlay_font::SUBSET,
+            snapclip_ui::panel::FieldFace::Number => snapclip_ui::panel::NUMBER_SUBSET,
+        };
         let _ = AddFontMemResourceEx(
             bytes.as_ptr() as *const core::ffi::c_void,
             bytes.len() as u32,
@@ -922,13 +935,19 @@ fn create_field_edit(
         let scale = f64::from(dpi) / 96.0;
         let inset = (f64::from(snapclip_ui::panel::EDIT_INSET_DIP) * scale).round() as i32;
 
-        let family: Vec<u16> = snapclip_ui::panel::FAMILY
+        let family_name = match face {
+            snapclip_ui::panel::FieldFace::Text => snapclip_ui::panel::FAMILY,
+            snapclip_ui::panel::FieldFace::Number => snapclip_ui::panel::NUMBER_FAMILY,
+        };
+        let family: Vec<u16> = family_name
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
         // The font is `--fs-input`, not the field's height. They were confused once and the control
         // filled its own box edge to edge.
-        let height = snapclip_ui::panel::edit_font_height(scale as f32);
+        // The font size comes from the face: `--fs-input` for a field, `--fs-num` for a number.
+        // The field's height was confused with its font size once, and the control filled its box.
+        let height = snapclip_ui::panel::edit_font_height_for(scale as f32, face.font_dip());
         let font = CreateFontW(
             height,
             0,
@@ -952,7 +971,13 @@ fn create_field_edit(
             0,
             class.as_ptr(),
             text.as_ptr(),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL as u32,
+            // `.dim-input { text-align: right }` (`:242`): a number is right aligned in its control,
+            // so the digits line up against the unit beside them.
+            WS_CHILD
+                | WS_VISIBLE
+                | WS_TABSTOP
+                | ES_AUTOHSCROLL as u32
+                | if face.right_aligned() { ES_RIGHT as u32 } else { 0 },
             field.left + inset,
             field.top + inset,
             (field.right - field.left - inset * 2).max(1),

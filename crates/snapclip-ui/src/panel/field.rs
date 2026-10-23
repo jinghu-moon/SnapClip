@@ -34,10 +34,18 @@ pub const EDIT_PADDING_DIP: f32 = 10.0;
 /// its text is twelve.
 pub const EDIT_FONT_DIP: f32 = 12.0;
 
-/// The height GDI wants for the field's font: `CreateFontW` takes logical units, and the process
+/// `--fs-num: 16px` — `save-panel-demo-v3.html:33`. The size cells' numbers, in the numeric face.
+pub const NUMBER_EDIT_FONT_DIP: f32 = 16.0;
+
+/// The height GDI wants for a font at this size: `CreateFontW` takes logical units, and the process
 /// is per-monitor aware, so a scaled negative height is the pixel size the design asks for.
+pub fn edit_font_height_for(scale: f32, font_dip: f32) -> i32 {
+    -((f64::from(font_dip) * f64::from(scale)).round() as i32)
+}
+
+/// The height GDI wants for a field's font at the UI size.
 pub fn edit_font_height(scale: f32) -> i32 {
-    -((f64::from(EDIT_FONT_DIP) * f64::from(scale)).round() as i32)
+    edit_font_height_for(scale, EDIT_FONT_DIP)
 }
 
 /// `--r-input: 6px` — `save-panel-demo-v3.html:54`. The frame's corner; the native child is inset
@@ -126,6 +134,85 @@ impl FieldId {
             FieldId::SizeHeight => size_cell_rect(metrics, rects, scale, SizeCell::Height),
             FieldId::Path | FieldId::Name => self.rect(metrics, rects, scale),
         }
+    }
+
+    /// The face this field's native control is set in.
+    ///
+    /// Kept beside the identity rather than at the creation site, so that "which fields are
+    /// numeric" has one answer next to the thing it describes — the same reason the rectangles live
+    /// here. The mockup sets the size cells' input and unit in `--num` (`:242`, `:244`) and nothing
+    /// else in the form.
+    pub fn face(self) -> FieldFace {
+        match self {
+            FieldId::SizeWidth | FieldId::SizeHeight => FieldFace::Number,
+            FieldId::Path | FieldId::Name => FieldFace::Text,
+        }
+    }
+}
+
+/// Which typeface a field's native control asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldFace {
+    /// The UI font: the path and the file name (`--fs-input: 12px`, `:39`).
+    Text,
+    /// The embedded numeric face: the size cells (`--fs-num: 16px`, `:33`). `.dim-input` also sets
+    /// `text-align: right` (`:242`), so a number is right aligned inside its control.
+    Number,
+}
+
+impl FieldFace {
+    /// The font size this face is set at, in dip.
+    pub fn font_dip(self) -> f32 {
+        match self {
+            FieldFace::Text => EDIT_FONT_DIP,
+            FieldFace::Number => NUMBER_EDIT_FONT_DIP,
+        }
+    }
+
+    /// Whether the control's text is right aligned. `.dim-input { text-align: right }` (`:242`).
+    pub fn right_aligned(self) -> bool {
+        matches!(self, FieldFace::Number)
+    }
+}
+
+#[cfg(test)]
+mod face_tests {
+    use super::*;
+
+    /// Which fields are numeric is a decision, not an accident of a call site: the two size cells
+    /// and nothing else. `.dim-input` and `.dim-unit` are the only `--num` users in the form
+    /// (`save-panel-demo-v3.html:242`, `:244`).
+    #[test]
+    fn only_the_size_cells_are_set_in_the_numeric_face() {
+        assert_eq!(FieldId::SizeWidth.face(), FieldFace::Number);
+        assert_eq!(FieldId::SizeHeight.face(), FieldFace::Number);
+        assert_eq!(FieldId::Path.face(), FieldFace::Text);
+        assert_eq!(FieldId::Name.face(), FieldFace::Text);
+    }
+
+    /// `--fs-num: 16px` (`:33`) against `--fs-input: 12px` (`:39`), and the number is right
+    /// aligned while the file name is not. Both come from the face rather than from the call site,
+    /// so a control cannot be created at the wrong size or with the wrong alignment.
+    #[test]
+    fn the_numeric_face_is_larger_and_right_aligned() {
+        assert_eq!(FieldFace::Number.font_dip(), NUMBER_EDIT_FONT_DIP);
+        assert_eq!(FieldFace::Text.font_dip(), EDIT_FONT_DIP);
+        assert!(FieldFace::Number.font_dip() > FieldFace::Text.font_dip());
+        assert!(FieldFace::Number.right_aligned());
+        assert!(!FieldFace::Text.right_aligned());
+    }
+
+    /// GDI takes logical units, and the process is per-monitor aware, so the height is the size in
+    /// pixels, negated. A face's size has to survive that conversion at every scale.
+    #[test]
+    fn a_face_height_is_its_size_at_every_scale() {
+        for scale in [1.0_f32, 1.25, 1.5, 2.0] {
+            for face in [FieldFace::Text, FieldFace::Number] {
+                let expected = -((f64::from(face.font_dip()) * f64::from(scale)).round() as i32);
+                assert_eq!(edit_font_height_for(scale, face.font_dip()), expected);
+            }
+        }
+        assert_eq!(edit_font_height(1.5), edit_font_height_for(1.5, EDIT_FONT_DIP));
     }
 }
 

@@ -11,6 +11,8 @@ mod checkbox;
 mod dropdown;
 #[path = "panel/field.rs"]
 mod field;
+#[path = "panel/fonts.rs"]
+mod fonts;
 #[path = "panel/frame.rs"]
 mod frame;
 #[path = "panel/feedback.rs"]
@@ -40,17 +42,22 @@ pub use button::{Button, ButtonState};
 pub use checkbox::{Checkbox, CheckboxState};
 pub use dropdown::{Dropdown, DropdownKey, DropdownTarget};
 pub use feedback::{Toast, Tooltip};
+pub use fonts::{
+    NUMBER_CHARACTERS, NUMBER_FAMILY, NUMBER_FALLBACKS, NUMBER_SUBSET, register_number_font,
+};
 pub use field::{
-    EDIT_FONT_DIP, EDIT_INSET_DIP, EDIT_PADDING_DIP, FieldColours, FieldId, FieldState,
+    EDIT_FONT_DIP, EDIT_INSET_DIP, EDIT_PADDING_DIP, FieldColours, FieldFace, FieldId, FieldState,
     FieldStates, FORM_ROWS,
-    FORM_FIELD_TAB_STOPS, INPUT_RADIUS_DIP, QUALITY_OPTIONS, QUALITY_OPTION_WORDS,
+    FORM_FIELD_TAB_STOPS, INPUT_RADIUS_DIP, NUMBER_EDIT_FONT_DIP, QUALITY_OPTIONS,
+    QUALITY_OPTION_WORDS,
     QUALITY_OPTION_WIDTH_DIP, QUALITY_SEG_INNER_RADIUS_DIP,
     QUALITY_SEG_INSET_DIP, QUALITY_SEG_RADIUS_DIP, QUALITY_SEG_WIDTH_DIP, ROW_DIP, Row, SizeCell,
     SIZE_MODE_BUTTON_HEIGHT_DIP, SIZE_MODE_BUTTON_PADDING_DIP, SIZE_MODE_BUTTON_RADIUS_DIP,
     SIZE_MODE_BORDER_DIP, SIZE_MODE_CHOSEN, SIZE_MODE_GAP_DIP, SIZE_MODE_PADDING_DIP,
     SIZE_MODE_RADIUS_DIP, SIZE_MODE_RESET_DIP, SIZE_MODE_RESET_ICON_DIP, SIZE_MODE_RESET_RADIUS_DIP,
     SIZE_MODE_WORDS,
-    chosen_quality, edit_font_height, field_colours, field_rect, form_drawn_strings, label_rect,
+    chosen_quality, edit_font_height, edit_font_height_for, field_colours, field_rect,
+    form_drawn_strings, label_rect,
     line_soft_over_surface,
     name_field_rect, path_field_rect, quality_option_rect, quality_pointer, quality_seg_rect,
     quality_segment_state, size_cell_rect,
@@ -59,8 +66,9 @@ pub use field::{
 };
 pub use frame::{
     CHIP_FONT_DIP, DEMO, DEMO_PALETTE, Frame, FrameBrushes, FrameMetrics, FramePalette, FrameRects,
-    PanelRenderer, ROW_LABEL_FONT_DIP, TITLE, chip_format, factory, paint_to_dc, paint_to_target,
-    row_label_format, title_format,
+    NUMBER_FONT_DIP, PanelRenderer, ROW_LABEL_FONT_DIP, TITLE, UNIT_FONT_DIP, chip_format, factory,
+    number_format, paint_to_dc, paint_to_target,
+    row_label_format, text_format_in, title_format,
 };
 pub use icon_button::IconButton;
 pub use icons::{Glyph, ICON_BAKED_PX, ICON_COUNT};
