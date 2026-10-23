@@ -318,6 +318,7 @@ impl Shell {
                 let height = (pixels.region.bottom - pixels.region.top) as u32;
                 let options = save::window::ShellOptions {
                     preview: Some((pixels.bgra.clone(), width, height)),
+                    capture_size: Some((width, height)),
                     ..Default::default()
                 };
                 // 先关旧、再建新、最后存 —— 顺序是契约，`replace_panel` 的文档与两条测试

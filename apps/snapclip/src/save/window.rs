@@ -393,6 +393,12 @@ pub struct ShellOptions {
     /// height. `None` is the development entry's empty panel. Owned rather than borrowed because
     /// the options cross a thread boundary and the picture outlives the caller.
     pub preview: Option<(Vec<u8>, u32, u32)>,
+    /// The captured size in pixels, shown in the two size cells. It comes from the same selection
+    /// the picture does, so it is absent exactly when the picture is: the development entry opens
+    /// a panel with no capture, and a panel with no capture has no size to show. Writing a
+    /// plausible number there would be inventing the answer to a question the panel exists to
+    /// answer.
+    pub capture_size: Option<(u32, u32)>,
 }
 
 impl Default for ShellOptions {
@@ -401,6 +407,7 @@ impl Default for ShellOptions {
             width_dip: PANEL_WIDTH_DIP,
             height_dip: PANEL_HEIGHT_DIP,
             preview: None,
+            capture_size: None,
         }
     }
 }
@@ -667,20 +674,22 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
         // The loop is over the field list rather than over four hand-written calls: a field is an
         // entry in that list, so the fifth one is a variant plus a rect, not another copy of this.
         //
-        // The size cells start empty. The design shows the captured dimensions there, and those come
-        // from the selection the panel was opened with, which is not plumbed into the options yet.
+        // The size cells show the captured dimensions, which come from the selection the panel was
+        // opened with. `initial_text` is a free function rather than a closure so that the pairing
+        // of width and height can be asserted without a window: they are two numbers of the same
+        // type, and swapping them would look entirely reasonable on screen.
         let dpi = windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd).max(96);
         let scale = (f64::from(dpi) / 96.0) as f32;
         let metrics = snapclip_ui::panel::DEMO;
         let rects = metrics.rects(scale);
-        let initial_text = |id| match id {
-            snapclip_ui::panel::FieldId::Name => "捕获",
-            _ => "",
-        };
+        let initial_text = |id| initial_text(id, options.capture_size);
         if let Some(s) = (state as *mut WindowState).as_mut() {
             for id in snapclip_ui::panel::FieldId::ALL {
-                let control =
-                    create_field_edit(hwnd, id.rect(&metrics, &rects, scale), initial_text(id));
+                let control = create_field_edit(
+                    hwnd,
+                    id.rect(&metrics, &rects, scale),
+                    &initial_text(id),
+                );
                 s.set_control(id, control);
             }
         }
@@ -854,6 +863,28 @@ impl WindowState {
 /// Create the name field: a real `EDIT` child, inset inside the frame the frame painter draws.
 ///
 /// Two things make this a native control rather than a drawn one. The font is the **embedded
+/// What each field holds when the panel opens.
+///
+/// A free function rather than a closure so that the one thing that can go wrong here can be
+/// asserted without a window: the width and the height are two numbers of the same type, and
+/// handing the width to the height cell would look entirely reasonable on screen. The path row
+/// starts empty because the panel's own default is a question for the next stage, and the name
+/// row starts with the mockup's default name.
+fn initial_text(
+    id: snapclip_ui::panel::FieldId,
+    capture_size: Option<(u32, u32)>,
+) -> String {
+    use snapclip_ui::panel::FieldId;
+    match (id, capture_size) {
+        (FieldId::Name, _) => "捕获".to_string(),
+        (FieldId::SizeWidth, Some((width, _))) => width.to_string(),
+        (FieldId::SizeHeight, Some((_, height))) => height.to_string(),
+        // No capture, no number. The development entry opens a panel with nothing captured, and a
+        // plausible size there would be invented rather than measured.
+        _ => String::new(),
+    }
+}
+
 /// subset**, registered for GDI from memory with `AddFontMemResourceEx`, so the child shares the
 /// panel's face without the family being installed on the machine. And the child is **inset** by
 /// `EDIT_INSET_DIP`, so the rounded corner the user sees is the frame's, not the child's square one.
@@ -1302,6 +1333,44 @@ fn read_u32(hwnd: isize, attribute: u32) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two size cells are two numbers of the same type, so nothing about the type stops the
+    /// width from being handed to the height cell. On screen that would look entirely reasonable,
+    /// which is why the pairing is asserted here rather than noticed later.
+    #[test]
+    fn the_size_cells_take_the_width_and_the_height_in_that_order() {
+        let size = Some((1440, 900));
+        assert_eq!(
+            initial_text(snapclip_ui::panel::FieldId::SizeWidth, size),
+            "1440"
+        );
+        assert_eq!(
+            initial_text(snapclip_ui::panel::FieldId::SizeHeight, size),
+            "900"
+        );
+    }
+
+    /// The development entry opens a panel with nothing captured. A plausible size there would be
+    /// invented rather than measured, and the panel exists to tell the user what they captured.
+    #[test]
+    fn a_panel_without_a_capture_shows_no_size() {
+        for id in [
+            snapclip_ui::panel::FieldId::SizeWidth,
+            snapclip_ui::panel::FieldId::SizeHeight,
+        ] {
+            assert_eq!(initial_text(id, None), "", "{id:?} must stay empty");
+        }
+    }
+
+    /// The name row's default is the mockup's, and the path row has no default yet.
+    #[test]
+    fn the_name_row_starts_with_the_mocks_default_name() {
+        assert_eq!(
+            initial_text(snapclip_ui::panel::FieldId::Name, None),
+            "捕获"
+        );
+        assert_eq!(initial_text(snapclip_ui::panel::FieldId::Path, None), "");
+    }
 
     /// The control table is the one place a field's identity is decided, and the message handlers ask
     /// it rather than comparing handles one field at a time. What has to hold is that the lookup is
