@@ -7,6 +7,7 @@
 //! The path rules (validation, template expansion, conflict) are separate from the bytes,
 //! because a changed name must not force a re-encode (`docs/42` D9).
 
+pub mod assemble;
 pub mod bands;
 pub mod caps;
 pub mod copy;
@@ -17,6 +18,7 @@ pub mod template;
 // window and the lifecycle, and asks the modules above to do the work.
 pub mod window;
 
+pub use assemble::{PanelValues, request_for as request_for_panel, save_panel};
 pub use caps::{CapabilityError, check as check_capability};
 pub use copy::{ConflictLink, Level, ValidationCopy};
 pub use service::{ConflictPolicy, SaveError, SaveOutcome, SaveRequest};
