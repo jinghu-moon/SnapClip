@@ -16,9 +16,11 @@
 //!   fill the baked bitmap, so a 24-unit file and a 16-unit file both arrive full size. Hard-coding
 //!   24 units used to mean a 16-unit file baked at two thirds scale in the top-left corner, and the
 //!   workaround was wrapping the artwork in `scale(1.5)` by hand.
-//! * **The artwork is centred.** The alpha bounding box is measured after rendering and the pixels
-//!   are shifted to put its centre on the canvas centre. Three of the eighteen committed icons were
-//!   two pixels off before this; the SVGs look symmetric and are not.
+//! * **The artwork stays where the SVG puts it.** The canvas is scaled to fill, and nothing is
+//!   moved afterwards: optical centring is not geometric centring, and the bake is not in a
+//!   position to second-guess where the designer placed the drawing. An earlier version measured
+//!   the ink and shifted it to the canvas centre, which silently moved three icons that look
+//!   symmetric and are not; the rule is now that the PNG is the SVG, scaled.
 //!
 //! Run `cargo run -p icon-bake` after changing any `.svg`. It is deterministic — the same input
 //! produces byte-identical output — and the tests below fail if the committed PNGs drift from the
@@ -134,7 +136,7 @@ pub fn render(svg: &Path) -> Result<Vec<u8>, String> {
         .map_err(|error| format!("{}: {error}", svg.display()))
 }
 
-/// One SVG → the rendered, centred pixmap, before it is encoded either way.
+/// One SVG → the rendered pixmap, before it is encoded either way.
 fn render_pixmap(svg: &Path) -> Result<resvg::tiny_skia::Pixmap, String> {
     let source =
         std::fs::read_to_string(svg).map_err(|error| format!("{}: {error}", svg.display()))?;
@@ -168,7 +170,6 @@ fn render_pixmap(svg: &Path) -> Result<resvg::tiny_skia::Pixmap, String> {
         resvg::tiny_skia::Transform::from_row(scale, 0.0, 0.0, scale, dx, dy),
         &mut pixmap.as_mut(),
     );
-    centre(&mut pixmap);
     Ok(pixmap)
 }
 
@@ -220,70 +221,6 @@ fn preflight(source: &str) -> Result<(), String> {
     } else {
         Err(format!("not predictable enough to bake: {}", complaints.join("; ")))
     }
-}
-
-/// Move the artwork so the centre of its ink sits on the centre of the canvas.
-///
-/// This shifts pixels rather than rendering again. The offset is a whole number of pixels, so the
-/// pixels themselves are unchanged and the picture is exactly the one the renderer produced; a
-/// second render would cost another full rasterisation to arrive at the same place.
-fn centre(pixmap: &mut resvg::tiny_skia::Pixmap) {
-    let Some((min_x, min_y, max_x, max_y)) = ink_bounds(pixmap) else {
-        return; // Nothing was drawn; there is nothing to centre, and `render` reports emptiness.
-    };
-    // Bounds are inclusive, so the centre of the ink is half a pixel past the midpoint of the ends.
-    let centre_x = (min_x + max_x + 1) as f32 / 2.0;
-    let centre_y = (min_y + max_y + 1) as f32 / 2.0;
-    let half = ICON_BAKED_PX as f32 / 2.0;
-    let shift_x = (half - centre_x).round() as i32;
-    let shift_y = (half - centre_y).round() as i32;
-    if shift_x == 0 && shift_y == 0 {
-        return;
-    }
-
-    let width = pixmap.width() as i32;
-    let height = pixmap.height() as i32;
-    let stride = width as usize * 4;
-    let source = pixmap.data().to_vec();
-    let target = pixmap.data_mut();
-    target.fill(0);
-    for y in 0..height {
-        let source_y = y - shift_y;
-        if source_y < 0 || source_y >= height {
-            continue;
-        }
-        for x in 0..width {
-            let source_x = x - shift_x;
-            if source_x < 0 || source_x >= width {
-                continue;
-            }
-            let from = source_y as usize * stride + source_x as usize * 4;
-            let to = y as usize * stride + x as usize * 4;
-            target[to..to + 4].copy_from_slice(&source[from..from + 4]);
-        }
-    }
-}
-
-/// The inclusive bounding box of every pixel with any alpha, or `None` if there is no ink.
-fn ink_bounds(pixmap: &resvg::tiny_skia::Pixmap) -> Option<(u32, u32, u32, u32)> {
-    let width = pixmap.width();
-    let height = pixmap.height();
-    let data = pixmap.data();
-    let (mut min_x, mut min_y) = (width, height);
-    let (mut max_x, mut max_y) = (0u32, 0u32);
-    let mut any = false;
-    for y in 0..height {
-        for x in 0..width {
-            if data[((y * width + x) * 4 + 3) as usize] > 0 {
-                any = true;
-                min_x = min_x.min(x);
-                max_x = max_x.max(x);
-                min_y = min_y.min(y);
-                max_y = max_y.max(y);
-            }
-        }
-    }
-    any.then_some((min_x, min_y, max_x, max_y))
 }
 
 #[cfg(test)]
@@ -374,43 +311,6 @@ mod tests {
             pixels.chunks_exact(4).any(|pixel| pixel[3] == 0),
             "an icon has transparent surroundings"
         );
-    }
-
-    /// Every committed icon has its ink centred, measured rather than assumed.
-    ///
-    /// Three of them were two pixels off before the shift was added: their artwork looks symmetric
-    /// in the file and is not. This reads the **committed** pixels rather than a fresh render,
-    /// because a fresh render is centred by construction and would agree with itself.
-    ///
-    /// The tolerance is half a pixel because the centre of an even number of pixels falls between
-    /// two of them.
-    #[test]
-    fn the_committed_icons_are_centred() {
-        for svg in svg_paths().unwrap() {
-            let rgba = svg.with_extension("rgba");
-            let pixels = std::fs::read(&rgba).unwrap_or_else(|error| {
-                panic!(
-                    "{} is missing ({error}); run `cargo run -p icon-bake`",
-                    rgba.display()
-                )
-            });
-            let mut pixmap = resvg::tiny_skia::Pixmap::new(ICON_BAKED_PX, ICON_BAKED_PX).unwrap();
-            pixmap.data_mut().copy_from_slice(&pixels);
-            let (min_x, min_y, max_x, max_y) = ink_bounds(&pixmap).unwrap();
-            let centre_x = (min_x + max_x + 1) as f32 / 2.0;
-            let centre_y = (min_y + max_y + 1) as f32 / 2.0;
-            let half = ICON_BAKED_PX as f32 / 2.0;
-            assert!(
-                (centre_x - half).abs() <= 0.5,
-                "{}: committed ink centre x is {centre_x}, not {half}",
-                svg.display()
-            );
-            assert!(
-                (centre_y - half).abs() <= 0.5,
-                "{}: committed ink centre y is {centre_y}, not {half}",
-                svg.display()
-            );
-        }
     }
 
     /// A file whose own units are 16 fills the canvas exactly as the 24-unit original does.

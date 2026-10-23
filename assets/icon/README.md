@@ -15,13 +15,13 @@
 | `check.svg` | 下拉里选中那一项的勾 | Tabler |
 | `link.svg` | 保存面板：尺寸行两格之间的锁定 | 设计稿自带的 `ICON.link` |
 
-`swap`…`check` 是 [Tabler Icons](https://tabler.io/icons)（MIT）的原文件。`link.svg` 现在也是 Tabler 的原文件
-（`icons-tabler-filled` 的 `link`，24 单位、`fill="currentColor"`）。
+`swap`…`check` 是 [Tabler Icons](https://tabler.io/icons)（MIT）的原文件。`link.svg` **不是** Tabler 的文件，它是
+设计稿 `docs/design/save-panel-demo-v3.html:709` 里 `ICON.link` 的**描边链条**：三条子路径逐字照抄，只补了 XML 命名
+空间，一个坐标都没改。设计稿里它是 16 单位，而烘焙工具读文件自己的尺寸，所以它原样放进来了 —— 不再需要手工包一层
+`scale(1.5)`。（Tabler 的 `icons-tabler-filled` 版本是**填充**的，与设计稿不是同一个图形，所以没有采用。）
 
-⚠️ **与设计稿有出入**：设计稿 `docs/design/save-panel-demo-v3.html:709` 自己画的 `ICON.link` 是**描边**的链条
-（16 单位、三条子路径），而这里放的是 Tabler 的**填充**版本 —— 两者**不是同一个图形**。要么把设计稿的路径按
-`viewBox="0 0 24 24"` 重做成文件，要么接受 Tabler 的观感；这是一个设计选择，不该由烘焙工具决定。
-（工具现在会**读文件自己的尺寸**，所以 16 单位的文件可以直接放进来，不再需要手工包 `scale(1.5)`。）
+设计稿 key → 上游名的对照，供以后对表：`link` → 设计稿（无上游）· `unlink` → Tabler `link-off` ·
+`reset` → Tabler `refresh` · `folderOpen` → Tabler `folder-open` · `check` → Tabler `check`。
 
 面板上画出来的就是这些文件本身，**不是照着它们重画的线段**。
 
@@ -49,16 +49,18 @@ assets/icon/*.svg ──(cargo run -p icon-bake, resvg)──▶ assets/icon/*.p
   面板按 14 dip 往下缩，这一步是超采样下采样。
 - **画布来自文件，不是假设的**：工具读 `usvg` 给出的固有尺寸再缩放，所以 16 单位的文件也**铺满画布**。
   以前写死 24 单位，16 单位的文件会以 2/3 大小挤在左上角，唯一的办法是手工包一层 `scale(1.5)`。
-- **居中是被测出来的，不是假设的**：渲染后测 alpha bbox，把**像素整体平移**到画布中心（不是重渲染一次 ——
-  位移是整数像素，图就是渲染器画的那张）。加这一步时实测发现**18 个图标里有 3 个偏了 2 px**
-  （`check` / `folder` / `folder-open`：它们的画法看着对称，其实不是）。
+- **PNG 里的位置与 SVG 里一致**：工具只把画布缩放到铺满，**不移动**图形。曾经做过"测 alpha bbox 再把墨平移到画布
+  中心"，那是**光学居中**，而设计稿摆在哪就是哪 —— 烘焙不该替设计师重摆一遍。那次改动把 3 个"看着对称、其实不对称"
+  的图标（`check` / `folder` / `folder-open`）悄悄挪了 2 px，所以现在这条被明确写死：**PNG 就是缩放后的 SVG**。
 - **不可预测的 SVG 会被拒绝**：`<text>`/`<tspan>`/`<mask>`/`<image>`/动画/外部 `href`/`filter` 一律不烘 ——
   换台机器或换个 resvg 小版本就会画出别的样子，而这种漂移**在只看本机对比的测试里是看不见的**。
 - **白色 + 透明底**：颜色留到绘制时给，所以一张 PNG 服务所有状态。
 - **改动 SVG 之后必须重烘**：`cargo run -p icon-bake`。忘了也没关系 —— `cargo test -p icon-bake`
   会重新渲染并逐字节比对，不一致就红。
-- **PNG 编码器用 `tiny_skia` 的**：另外实现过一版手写固定 Huffman + LZ77 的 DEFLATE，实测产物小 35–60%，
-  对 18 个开发期资产约合 **14 KB** —— 不值得为此维护一百八十行压缩代码。
+- **PNG 编码器用 `tiny_skia` 的，不手写 DEFLATE**：另外实现过一版手写固定 Huffman + LZ77 的 DEFLATE，实测产物小
+  35–60%。但它换来的只是**二进制体积**：PNG 只在启动时被解码一次成 96×96 的位图，之后**显存与每帧成本与压缩率无关**
+  —— 所以这不是性能优化，只是体积优化。按现有 18 张 PNG 合计 **36 KB** 算，省下来是 **13–22 KB**，不值得为此维护
+  一百八十行压缩代码。
 
 ## 换图标 / 加图标时
 
@@ -74,12 +76,12 @@ assets/icon/*.svg ──(cargo run -p icon-bake, resvg)──▶ assets/icon/*.p
 ## 改完跑一次这两条
 
 ```
-cargo test -p icon-bake                                              # 产物是否跟 SVG 一致、是否居中、预检是否拦得住
+cargo test -p icon-bake                                              # 产物是否跟 SVG 一致、预检是否拦得住
 cargo test -p snapclip-capture --lib -- --ignored --test-threads=1 the_panel_glyphs the_glyph_tint
 ```
 
-第一条里除了"PNG 与 SVG 一致"，还有两条是**对着已提交的产物**断言的：**每个图标的墨都居中**（读
-`.rgba` 而不是当场渲染 —— 当场渲染天生居中，那样写就成同义反复了）、以及 `.rgba` 是**直通**像素。
+第一条里除了"PNG 与 SVG 一致"，还有一条是**对着已提交的产物**断言的：`.rgba` 是**直通**像素。位置那条不需要单独
+的测试 —— "已提交产物 == 渲染结果"本身就把位置钉住了（渲染不移动图形，产物一旦被挪过就红）。
 
 第二条在真 GPU 上画面板，按"每个图形自己方框里的墨"断言：图形落进自己的格子、墨量是线稿而不是
 一整块、并且**换一种状态色画出来的像素必须不同**（颜色矩阵没生效就会红）。
