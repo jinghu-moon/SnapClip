@@ -41,9 +41,14 @@ pub struct FrameMetrics {
     pub pad_x: i32,
     /// `.head { height }` (`:94`).
     pub header_height: i32,
-    /// `.body { padding: 4px 16px 12px }` (`:100`), top and bottom.
+    /// `.body { padding: 4px 16px 12px }` (`:100`); only the top padding is left in the body.
     pub body_pad_top: i32,
-    pub body_pad_bottom: i32,
+    /// The footer strip below the body: `.foot { padding: 12px 16px 12px }` (`:274`) around
+    /// `--btn-h: 32px` (`:50`), so `12 + 32 + 12 = 56`.
+    ///
+    /// This replaces the mock's `12px` body bottom padding rather than adding to it: the footer
+    /// draws its own top padding, and the body ends where the footer begins.
+    pub footer_height: i32,
     /// `--preview-w` (`:43`).
     pub preview_width: i32,
     /// `--preview-h` (`:44`).
@@ -74,7 +79,7 @@ pub const DEMO: FrameMetrics = FrameMetrics {
     pad_x: 16,
     header_height: 44,
     body_pad_top: 4,
-    body_pad_bottom: 12,
+    footer_height: 56,
     preview_width: 556,
     preview_height: 460,
     column_gap: 12,
@@ -89,10 +94,13 @@ pub const DEMO: FrameMetrics = FrameMetrics {
 };
 
 impl FrameMetrics {
-    /// Total height: the header, the body's padding and the preview. The mockup sizes itself to
-    /// content and has no height of its own, so this is derived rather than quoted.
+    /// Total height: the header, the body's top padding, the preview and the footer. The mockup
+    /// sizes itself to content and has no height of its own, so this is derived rather than quoted.
+    ///
+    /// `44 + 4 + 460 + 56 = 564`. The footer's own `12px` top padding is what used to be the body's
+    /// bottom padding, which is why the body no longer contributes one.
     pub fn panel_height(&self) -> i32 {
-        self.header_height + self.body_pad_top + self.preview_height + self.body_pad_bottom
+        self.header_height + self.body_pad_top + self.preview_height + self.footer_height
     }
 
     /// The right column: whatever the panel's width leaves after padding, preview and gap.
@@ -207,6 +215,9 @@ pub struct FrameBrushes {
     pub label: ID2D1SolidColorBrush,
     /// `--line-soft` (`:28`) resolved over the surface, for the size row's mode container.
     pub line_soft: ID2D1SolidColorBrush,
+    /// The footer's top hairline: `rgba(255,255,255,.04)` (`:274`), resolved over the surface for
+    /// the same reason as `line_soft`. Fainter on purpose — the footer is divided, not edged.
+    pub footer_line: ID2D1SolidColorBrush,
     /// The field background, already composited: a native `EDIT` cannot be translucent, so the
     /// frame and the child both use this opaque value (`field.rs`).
     pub field_fill: ID2D1SolidColorBrush,
@@ -254,6 +265,10 @@ impl FrameBrushes {
             line_soft: brush(
                 target,
                 crate::panel::line_soft_over_surface(palette.surface),
+            )?,
+            footer_line: brush(
+                target,
+                crate::panel::footer_line_over_surface(palette.surface),
             )?,
             field_fill: brush(target, idle.fill)?,
             accent: brush(target, focused.border)?,
@@ -337,6 +352,10 @@ pub struct Frame<'a> {
     /// `.dim-unit`'s size). `None` falls back to [`Self::chip`] so the unit still draws if the
     /// caller did not build one.
     pub number: Option<&'a IDWriteTextFormat>,
+    /// The footer buttons' formats: `.btn` is `--fs-btn: 12px` (`:38`, `:279`) at the body weight,
+    /// and `.btn.start` is 600 (`:282`), which is the only difference between save and the rest.
+    pub button: Option<&'a IDWriteTextFormat>,
+    pub button_strong: Option<&'a IDWriteTextFormat>,
     /// The state of every form field's frame. The native `EDIT` itself draws no border, no focus ring
     /// and no error state, so those belong to the frame (`field.rs`), and each field carries its own
     /// — one shared state is what made a focused path row draw the name row's frame.
@@ -661,6 +680,70 @@ impl Frame<'_> {
                 self.brushes.muted_rgba,
             )?;
         }
+
+        // The footer (`:274`–`:288`, `:674`–`:687`): a hairline across the top, then copy, a
+        // separator, cancel and save, anchored to the right because the mockup's status text takes
+        // the rest of the line with `flex: 1` (`:275`). The status itself is not drawn yet, which
+        // `docs/41` records, so nothing occupies the space it will.
+        if let (Some(button_format), Some(strong_format)) = (self.button, self.button_strong) {
+            let border_y = crate::panel::footer_border_y(self.metrics, self.scale);
+            // One dip, rounded up to at least one pixel so the rule never vanishes at low scale.
+            let hairline = (self.scale.round() as i32).max(1);
+            painter.fill_round(
+                Rect::new(0, border_y, self.rects.header.right, border_y + hairline),
+                0,
+                &self.brushes.footer_line,
+            );
+
+            let mut widths = [0i32; 3];
+            for (index, button) in crate::panel::FOOTER_BUTTONS.iter().enumerate() {
+                let (word, format) = match button {
+                    crate::panel::FooterButton::Copy => ("复制", button_format),
+                    crate::panel::FooterButton::Cancel => ("取消", button_format),
+                    crate::panel::FooterButton::Save => ("保存", strong_format),
+                };
+                let measured = painter.measure_text_width(word, format)?.round() as i32;
+                widths[index] = crate::panel::footer_button_width(self.scale, *button, measured);
+            }
+
+            let radius =
+                (crate::panel::FOOTER_BUTTON_RADIUS_DIP as f32 * self.scale).round() as i32;
+            for button in crate::panel::FOOTER_BUTTONS {
+                let rect =
+                    crate::panel::footer_button_rect(self.metrics, self.scale, widths, button);
+                match button {
+                    // `:282` save is the one filled button: `--accent` behind white text at 600.
+                    crate::panel::FooterButton::Save => {
+                        painter.fill_round(rect, radius, &self.brushes.accent);
+                        painter.draw_text("保存", strong_format, rect, &self.brushes.text);
+                    }
+                    // `:280` cancel is transparent with a `--line-soft` edge and `--text`.
+                    crate::panel::FooterButton::Cancel => {
+                        painter.stroke_round(rect, radius, &self.brushes.line_soft, line);
+                        painter.draw_text("取消", button_format, rect, &self.brushes.text);
+                    }
+                    // `:286` copy is a ghost: no background, `--muted`, and its word follows the
+                    // glyph rather than centring in the button.
+                    crate::panel::FooterButton::Copy => {
+                        let text = crate::panel::footer_copy_text_rect(self.metrics, self.scale, widths);
+                        painter.draw_text("复制", button_format, text, &self.brushes.muted);
+                    }
+                }
+            }
+
+            let icon = crate::panel::footer_copy_icon_rect(self.metrics, self.scale, widths);
+            Self::draw_glyph(
+                painter,
+                crate::panel::icons::Glyph::Copy,
+                icon,
+                self.brushes.muted_rgba,
+            )?;
+
+            // `:288` the separator is a one-dip `--line-soft` rule, sixteen dip tall.
+            let separator =
+                crate::panel::footer_separator_rect(self.metrics, self.scale, widths);
+            painter.fill_round(separator, 0, &self.brushes.line_soft);
+        }
         Ok(())
     }
 
@@ -772,6 +855,29 @@ pub fn chip_format(dwrite: &IDWriteFactory, dpi: f32) -> Result<IDWriteTextForma
     let format = text_format(dwrite, dpi, CHIP_FONT_DIP, DWRITE_FONT_WEIGHT_NORMAL)?;
     // `.seg .opt { display: grid; place-items: center }` (`:266`) centres the word in its option,
     // so this format is the one that does not lead-align.
+    unsafe {
+        let _ = format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    }
+    Ok(format)
+}
+
+/// `--fs-btn: 12px` (`save-panel-demo-v3.html:38`). The footer buttons' size.
+pub const BUTTON_FONT_DIP: f32 = 12.0;
+
+/// The footer's buttons: `--fs-btn` at the body weight, centred because `.btn` is a grid with
+/// `place-items: center` (`:279`).
+pub fn button_format(dwrite: &IDWriteFactory, dpi: f32) -> Result<IDWriteTextFormat> {
+    let format = text_format(dwrite, dpi, BUTTON_FONT_DIP, DWRITE_FONT_WEIGHT_NORMAL)?;
+    unsafe {
+        let _ = format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    }
+    Ok(format)
+}
+
+/// `.btn.start { font-weight: 600 }` (`:282`) — the save button differs from the others in nothing
+/// else.
+pub fn button_strong_format(dwrite: &IDWriteFactory, dpi: f32) -> Result<IDWriteTextFormat> {
+    let format = text_format(dwrite, dpi, BUTTON_FONT_DIP, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
     unsafe {
         let _ = format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
     }
@@ -901,6 +1007,9 @@ pub fn paint_to_dc_with_preview(
     let chip = chip_format(dwrite, dpi)?;
     // The numbers' face, for the size cells' `px` unit (`:242`, `:244`).
     let number = number_format(dwrite, dpi)?;
+    // The footer's buttons, at `--fs-btn` (`:38`) and, for save, 600 (`:282`).
+    let button = button_format(dwrite, dpi)?;
+    let button_strong = button_strong_format(dwrite, dpi)?;
     let painter = PanelPainter {
         context: &target,
         text_factory: dwrite,
@@ -922,6 +1031,8 @@ pub fn paint_to_dc_with_preview(
         row_label: Some(&row_label),
         chip: Some(&chip),
         number: Some(&number),
+        button: Some(&button),
+        button_strong: Some(&button_strong),
         fields,
         preview: preview.as_ref().map(|(b, w, h)| (b, *w, *h)),
         quality,
@@ -978,6 +1089,9 @@ pub fn paint_to_target_with_preview(
     let chip = chip_format(dwrite, dpi)?;
     // The numbers' face, for the size cells' `px` unit (`:242`, `:244`).
     let number = number_format(dwrite, dpi)?;
+    // The footer's buttons, at `--fs-btn` (`:38`) and, for save, 600 (`:282`).
+    let button = button_format(dwrite, dpi)?;
+    let button_strong = button_strong_format(dwrite, dpi)?;
     Frame {
         metrics: &metrics,
         rects: &rects,
@@ -988,6 +1102,8 @@ pub fn paint_to_target_with_preview(
         row_label: Some(&row_label),
         chip: Some(&chip),
         number: Some(&number),
+        button: Some(&button),
+        button_strong: Some(&button_strong),
         fields: crate::panel::FieldStates::IDLE,
         preview: preview.as_ref().map(|(b, w, h)| (b, *w, *h)),
         quality,
@@ -1119,6 +1235,52 @@ mod tests {
         }
     }
 
+    /// The footer, at double scale for the same reason the close glyph is: a one dip hairline at
+    /// unit scale never reaches full intensity, so the pixel it lands on is a blend.
+    #[test]
+    fn the_footer_draws_its_hairline_and_its_filled_button() {
+        let canvas = Canvas::new_at(1840, 1128, 192.0);
+        canvas.render();
+        let px = canvas.pixels();
+
+        // The hairline is one dip of `rgba(255,255,255,.04)` over the surface (`:274`).
+        let border_y = crate::panel::footer_border_y(&DEMO, 2.0);
+        let expected = crate::panel::footer_line_over_surface(DEMO_PALETTE.surface);
+        assert_px(
+            &px,
+            400,
+            border_y + 1,
+            fill_rgb(expected[0], expected[1], expected[2]),
+            4,
+            "the footer's top border",
+        );
+
+        // Save is the one filled button: `--accent` behind its word (`:282`). The sample is a
+        // corner of the button, away from the centred word, so it reads the fill rather than a
+        // glyph.
+        let widths = [88, 60, 70];
+        let save =
+            crate::panel::footer_button_rect(&DEMO, 2.0, widths, crate::panel::FooterButton::Save);
+        let accent =
+            crate::panel::field_colours(crate::panel::FieldState::Focused, DEMO_PALETTE.surface)
+                .border;
+        assert_px(
+            &px,
+            save.left + 6,
+            save.top + 6,
+            fill_rgb(accent[0], accent[1], accent[2]),
+            8,
+            "the save button's fill",
+        );
+
+        // The strip above the border is still the panel's body, not the footer.
+        assert_ne!(
+            px.pixel(400, border_y - 6),
+            px.pixel(400, border_y + 6),
+            "the footer must begin at its border"
+        );
+    }
+
     #[test]
     fn the_close_glyph_is_drawn_in_the_buttons_colour() {
         let canvas = Canvas::new_at(1840, 1040, 192.0);
@@ -1188,7 +1350,7 @@ mod tests {
 
     #[test]
     fn the_directory_field_is_filled_and_has_no_border_when_idle() {
-        let canvas = Canvas::new(920, 520);
+        let canvas = Canvas::new(920, DEMO.panel_height());
         canvas.render();
         let px = canvas.pixels();
         let rects = DEMO.rects(1.0);
@@ -1198,7 +1360,7 @@ mod tests {
 
     #[test]
     fn the_size_cells_are_filled_and_have_no_border_when_idle() {
-        let canvas = Canvas::new(920, 520);
+        let canvas = Canvas::new(920, DEMO.panel_height());
         canvas.render();
         let px = canvas.pixels();
         let rects = DEMO.rects(1.0);
@@ -1220,7 +1382,7 @@ mod tests {
     /// outside the wrapper and the field fill for the unit inside it.
     #[test]
     fn the_size_cells_draw_their_word_and_their_unit() {
-        let canvas = Canvas::new(920, 520);
+        let canvas = Canvas::new(920, DEMO.panel_height());
         canvas.render();
         let px = canvas.pixels();
         let rects = DEMO.rects(1.0);
@@ -1309,7 +1471,7 @@ mod tests {
     /// instead of about the block behind it.
     #[test]
     fn the_quality_segment_marks_the_chosen_option_with_the_accent() {
-        let canvas = Canvas::new(920, 520);
+        let canvas = Canvas::new(920, DEMO.panel_height());
         canvas.render();
         let px = canvas.pixels();
         let rects = DEMO.rects(1.0);
@@ -1356,7 +1518,7 @@ mod tests {
             "the click chooses the second option"
         );
 
-        let canvas = Canvas::new(920, 520);
+        let canvas = Canvas::new(920, DEMO.panel_height());
         canvas.render_quality(crate::panel::chosen_quality(&state));
         let px = canvas.pixels();
         // Four dips in from each option's own corner: inside the block, clear of the centred word.
@@ -1391,7 +1553,7 @@ mod tests {
     /// row is the whole row.
     #[test]
     fn the_row_labels_are_drawn_above_their_rows() {
-        let canvas = Canvas::new(920, 520);
+        let canvas = Canvas::new(920, DEMO.panel_height());
         canvas.render();
         let px = canvas.pixels();
         let rects = DEMO.rects(1.0);
@@ -1434,7 +1596,7 @@ mod tests {
     /// boxes are named, and swapping the two brushes — or dropping the word — fails here.
     #[test]
     fn the_chosen_quality_word_is_brighter_than_the_unchosen_ones() {
-        let canvas = Canvas::new(920, 520);
+        let canvas = Canvas::new(920, DEMO.panel_height());
         canvas.render();
         let px = canvas.pixels();
         let rects = DEMO.rects(1.0);
@@ -1460,7 +1622,10 @@ mod tests {
     #[test]
     fn the_panel_is_the_designs_width_and_a_derived_height() {
         assert_eq!(DEMO.panel_width, 920, "--panel-w, demo :41");
-        assert_eq!(DEMO.panel_height(), 520, "44 header + 4 + 460 preview + 12");
+        // The footer is the last strip: 44 header + 4 body top + 460 preview + 56 footer (:94,
+        // :100, :44, :274 with --btn-h: 32 at :50). The mock's 12px body bottom padding is the
+        // footer's own top padding, not a fourth term.
+        assert_eq!(DEMO.panel_height(), 564, "44 header + 4 + 460 preview + 56 footer");
         assert_eq!(DEMO.form_width(), 320, "920 - 32 padding - 556 preview - 12 gap");
     }
 
@@ -1833,7 +1998,7 @@ mod tests {
         let accent = border_px(focused.border);
 
         // The path row focused: it carries the accent, and the name row below it does not.
-        let canvas = Canvas::new(920, 520);
+        let canvas = Canvas::new(920, DEMO.panel_height());
         canvas.render_fields(crate::panel::FieldStates::focused_on(Some(
             crate::panel::FieldId::Path,
         )));
@@ -1852,7 +2017,7 @@ mod tests {
         );
 
         // And the other way round, which is the half a single shared state could not express.
-        let canvas = Canvas::new(920, 520);
+        let canvas = Canvas::new(920, DEMO.panel_height());
         canvas.render_fields(crate::panel::FieldStates::focused_on(Some(
             crate::panel::FieldId::Name,
         )));
@@ -2093,7 +2258,7 @@ mod tests {
 
     #[test]
     fn the_sheet_is_the_designs_surface_colour() {
-        let canvas = Canvas::new(920, 520);
+        let canvas = Canvas::new(920, DEMO.panel_height());
         canvas.render();
         let got = canvas.pixels().pixel(700, 300);
         assert!(close(got, surface_px(), 3), "the surface should be --surface: got {got:?}");
@@ -2101,7 +2266,7 @@ mod tests {
 
     #[test]
     fn the_divider_sits_at_the_header_height() {
-        let canvas = Canvas::new(920, 520);
+        let canvas = Canvas::new(920, DEMO.panel_height());
         canvas.render();
         let rects = DEMO.rects(1.0);
         let px = canvas.pixels();
@@ -2114,7 +2279,7 @@ mod tests {
 
     #[test]
     fn the_preview_card_starts_after_the_padding() {
-        let canvas = Canvas::new(920, 520);
+        let canvas = Canvas::new(920, DEMO.panel_height());
         canvas.render();
         let rects = DEMO.rects(1.0);
         let mid = rects.preview.top + rects.preview.height() / 2;
@@ -2127,7 +2292,7 @@ mod tests {
     }
 
     #[test]
-    fn the_title_is_drawn_inside_the_header() {        let canvas = Canvas::new(920, 520);
+    fn the_title_is_drawn_inside_the_header() {        let canvas = Canvas::new(920, DEMO.panel_height());
         canvas.render();
         let rects = DEMO.rects(1.0);
         let px = canvas.pixels();
@@ -2146,7 +2311,7 @@ mod tests {
     /// would have survived.
     #[test]
     fn an_idle_field_has_no_visible_border() {
-        let canvas = Canvas::new(920, 520);
+        let canvas = Canvas::new(920, DEMO.panel_height());
         canvas.render();
         let px = canvas.pixels();
         let rects = DEMO.rects(1.0);
@@ -2190,7 +2355,7 @@ mod tests {
     /// which stayed true with the ring deleted, so it proved nothing about the ring.
     #[test]
     fn a_focused_field_draws_its_border_and_ring() {
-        let canvas = Canvas::new(920, 520);
+        let canvas = Canvas::new(920, DEMO.panel_height());
         canvas.render_focused();
         let px = canvas.pixels();
         let rects = DEMO.rects(1.0);
@@ -2288,7 +2453,7 @@ mod tests {
     /// test already uses.
     #[test]
     fn the_panel_has_a_one_dip_inner_stroke() {
-        let canvas = Canvas::new(920, 520);
+        let canvas = Canvas::new(920, DEMO.panel_height());
         canvas.render();
         let px = canvas.pixels();
         let right = DEMO.panel_width - 1;
@@ -2326,7 +2491,7 @@ mod tests {
     /// first assertion instead of passing quietly.
     #[test]
     fn the_preview_card_is_a_sixteen_dip_checkerboard() {
-        let canvas = Canvas::new(920, 520);
+        let canvas = Canvas::new(920, DEMO.panel_height());
         canvas.render();
         let px = canvas.pixels();
         let rects = DEMO.rects(1.0);
@@ -2363,7 +2528,7 @@ mod tests {
     /// the order reversed the sample is a checker colour instead of the line.
     #[test]
     fn the_card_border_is_drawn_over_the_checkerboard() {
-        let canvas = Canvas::new(920, 520);
+        let canvas = Canvas::new(920, DEMO.panel_height());
         canvas.render();
         let px = canvas.pixels();
         let rects = DEMO.rects(1.0);
@@ -2459,7 +2624,7 @@ mod tests {
             }
         }
 
-        let canvas = Canvas::new(920, 520);
+        let canvas = Canvas::new(920, DEMO.panel_height());
         canvas.render_preview(&bgra, w, h);
         let px = canvas.pixels();
 

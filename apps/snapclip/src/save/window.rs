@@ -147,19 +147,24 @@ pub const HEADER_HEIGHT_DIP: f32 = 44.0;
 pub const PREVIEW_HEIGHT_DIP: f32 = 460.0;
 
 /// `.body { padding: 4px 16px 12px }` — `save-panel-demo-v3.html:100`.
+///
+/// Only the top padding is left in the body: the mock's `12px` at the bottom is the footer's own
+/// top padding, and the footer now sits below the body rather than being drawn by it.
 pub const BODY_PAD_TOP_DIP: f32 = 4.0;
-/// See [`BODY_PAD_TOP_DIP`]; the mock's body padding is `4px 16px 12px`.
-pub const BODY_PAD_BOTTOM_DIP: f32 = 12.0;
+
+/// `.foot { padding: 12px 16px 12px }` (`save-panel-demo-v3.html:274`) around `--btn-h: 32px`
+/// (`:50`), so the strip is `12 + 32 + 12 = 56` dip.
+pub const FOOTER_HEIGHT_DIP: f32 = 56.0;
 
 /// The shell's height before there is any content.
 ///
 /// The mock sizes the panel by its content, so there is no `height` to copy. The default content
-/// is header + body padding + the preview column, which is `44 + 4 + 460 + 12 = 520` dip. Later
-/// steps replace this with a measurement of the real rows; until then the window reserves exactly
-/// the height the mock's default content needs, so the shell looks like the mock rather than like
-/// an arbitrary rectangle.
+/// is the header, the body's top padding, the preview column and the footer, which is
+/// `44 + 4 + 460 + 56 = 564` dip. Later steps replace this with a measurement of the real rows;
+/// until then the window reserves exactly the height the mock's default content needs, so the
+/// shell looks like the mock rather than like an arbitrary rectangle.
 pub const PANEL_HEIGHT_DIP: f32 =
-    HEADER_HEIGHT_DIP + BODY_PAD_TOP_DIP + PREVIEW_HEIGHT_DIP + BODY_PAD_BOTTOM_DIP;
+    HEADER_HEIGHT_DIP + BODY_PAD_TOP_DIP + PREVIEW_HEIGHT_DIP + FOOTER_HEIGHT_DIP;
 
 /// `--surface: rgba(23,23,28,.92)` — `save-panel-demo-v3.html:25`.
 ///
@@ -1592,14 +1597,17 @@ mod tests {
     #[test]
     fn the_shell_opens_at_the_mock_size_and_radius() {
         // The mock's defaults, with the height derivation spelled out so a change is deliberate.
+        // The mock's defaults, with the height derivation spelled out so a change is deliberate.
+        // The last term is the footer (`:274` with `--btn-h: 32` at `:50`), not the mock's `12px`
+        // body bottom padding: that padding is the footer's own top padding now.
         assert_eq!(PANEL_WIDTH_DIP, 920.0);
         assert_eq!(PANEL_RADIUS_DIP, 12.0);
         assert_eq!(PANEL_PADDING_DIP, 16.0);
         assert_eq!(COLUMN_GAP_DIP, 12.0);
         assert_eq!(
             PANEL_HEIGHT_DIP,
-            44.0 + 4.0 + 460.0 + 12.0,
-            "the mock's content height: header (94) + body top (100) + preview (44) + body bottom (100)"
+            44.0 + 4.0 + 460.0 + 56.0,
+            "the mock's content height: header (94) + body top (100) + preview (44) + footer (274)"
         );
     }
 

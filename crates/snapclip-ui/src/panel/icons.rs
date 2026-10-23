@@ -7,7 +7,7 @@
 pub const ICON_BAKED_PX: u32 = 96;
 
 /// How many glyphs are available to panel components.
-pub const ICON_COUNT: usize = 8;
+pub const ICON_COUNT: usize = 9;
 
 /// A panel glyph baked from `assets/icon/*.svg`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +29,8 @@ pub enum Glyph {
     Link = 6,
     /// Circular arrow, for the size row's reset to the captured size.
     Refresh = 7,
+    /// Two stacked sheets, for the footer's copy-to-clipboard button.
+    Copy = 8,
 }
 
 impl Glyph {
@@ -41,6 +43,7 @@ impl Glyph {
         Self::Check,
         Self::Link,
         Self::Refresh,
+        Self::Copy,
     ];
 
     pub const fn index(self) -> usize {
@@ -57,6 +60,7 @@ impl Glyph {
             Self::Check => "check",
             Self::Link => "link",
             Self::Refresh => "refresh",
+            Self::Copy => "copy",
         }
     }
 
@@ -71,6 +75,7 @@ impl Glyph {
             Self::Check => include_bytes!("../../../../assets/icon/check.png"),
             Self::Link => include_bytes!("../../../../assets/icon/link.png"),
             Self::Refresh => include_bytes!("../../../../assets/icon/refresh.png"),
+            Self::Copy => include_bytes!("../../../../assets/icon/copy.png"),
         }
     }
 
@@ -90,6 +95,7 @@ impl Glyph {
             Self::Check => include_bytes!("../../../../assets/icon/check.rgba"),
             Self::Link => include_bytes!("../../../../assets/icon/link.rgba"),
             Self::Refresh => include_bytes!("../../../../assets/icon/refresh.rgba"),
+            Self::Copy => include_bytes!("../../../../assets/icon/copy.rgba"),
         }
     }
 }

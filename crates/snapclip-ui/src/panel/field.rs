@@ -706,6 +706,14 @@ pub fn line_soft_over_surface(surface: [u8; 4]) -> [u8; 4] {
     [mix(surface[0]), mix(surface[1]), mix(surface[2]), 255]
 }
 
+/// The footer's top border: `border-top: 1px solid rgba(255,255,255,.04)` (`:274`), resolved over
+/// the surface for the same reason as [`line_soft_over_surface`]. It is deliberately fainter than
+/// `--line-soft`: the footer is separated from the body by a hairline, not by an edge.
+pub fn footer_line_over_surface(surface: [u8; 4]) -> [u8; 4] {
+    let mix = |c: u8| ((u16::from(c) * 96 + 255 * 4) / 100) as u8;
+    [mix(surface[0]), mix(surface[1]), mix(surface[2]), 255]
+}
+
 /// One mode button's width: its word plus the design's ten dip padding on each side (`:226`).
 ///
 /// The word's own width is measured by the caller and handed in, because it depends on the glyphs
@@ -933,6 +941,189 @@ pub fn quality_pointer(state: &mut SegmentState, event: PointerEvent, point: Poi
 /// Deliberately a literal rather than `FieldId::ALL.len()`: deriving it would make the guard a
 /// tautology, and the point of the number is that a fifth field has to be declared on purpose.
 pub const FORM_FIELD_TAB_STOPS: usize = 4;
+
+// -------------------------------------------------------------------------------------------------
+// The footer: `:274`-`:288` and `:674`-`:687`
+// -------------------------------------------------------------------------------------------------
+
+/// `.foot { padding: 12px 16px 12px; gap: 8px }` (`:274`). The vertical padding is not repeated
+/// here: it is part of `FrameMetrics::footer_height`, which is what the layout measures.
+pub const FOOTER_PAD_X_DIP: i32 = 16;
+pub const FOOTER_GAP_DIP: i32 = 8;
+
+/// `--btn-h: 32px` (`:50`) and `--r-btn: 6px` (`:59`).
+pub const FOOTER_BUTTON_HEIGHT_DIP: i32 = 32;
+pub const FOOTER_BUTTON_RADIUS_DIP: i32 = 6;
+
+/// `.btn { padding: 0 16px }` (`:279`), `.btn.start { padding: 0 24px }` (`:282`) and
+/// `.btn.copy { padding: 0 12px; gap: 6px }` (`:286`).
+pub const FOOTER_BUTTON_PAD_DIP: i32 = 16;
+pub const FOOTER_SAVE_PAD_DIP: i32 = 24;
+pub const FOOTER_COPY_PAD_DIP: i32 = 12;
+pub const FOOTER_COPY_GAP_DIP: i32 = 6;
+
+/// `.btn.copy svg { width: 13px; height: 13px }` (`:287`).
+pub const FOOTER_COPY_ICON_DIP: i32 = 13;
+
+/// `.foot .sep { width: 1px; height: 16px }` (`:288`), between copy and cancel (`:683`).
+pub const FOOTER_SEP_WIDTH_DIP: i32 = 1;
+pub const FOOTER_SEP_HEIGHT_DIP: i32 = 16;
+
+/// The three buttons, in the order the mockup writes them (`:679`, `:684`, `:686`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FooterButton {
+    Copy,
+    Cancel,
+    Save,
+}
+
+/// Right to left, which is also the order they are laid out in: the status text takes whatever is
+/// left (`:275`, `flex: 1`), so everything else is anchored to the right edge.
+pub const FOOTER_BUTTONS: [FooterButton; 3] = [
+    FooterButton::Save,
+    FooterButton::Cancel,
+    FooterButton::Copy,
+];
+
+/// The strip below the body: the panel's last `footer_height` dips.
+pub fn footer_rect(metrics: &FrameMetrics, scale: f32) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let top = px(metrics.panel_height() - metrics.footer_height);
+    Rect {
+        left: 0,
+        top,
+        right: px(metrics.panel_width),
+        bottom: px(metrics.panel_height()),
+    }
+}
+
+/// The y of the footer's top border: `.foot { border-top: 1px solid rgba(255,255,255,.04) }`
+/// (`:274`).
+pub fn footer_border_y(metrics: &FrameMetrics, scale: f32) -> i32 {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    px(metrics.panel_height() - metrics.footer_height)
+}
+
+/// A button's width from its measured text: padding on both sides, plus the icon and its gap for
+/// the copy button (`:286`, `:287`).
+///
+/// The text is measured at paint time because measuring needs a device context, which is the same
+/// split the size row's mode buttons use. Nothing here invents a width.
+pub fn footer_button_width(scale: f32, button: FooterButton, text_width_px: i32) -> i32 {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let pad = match button {
+        FooterButton::Save => FOOTER_SAVE_PAD_DIP,
+        FooterButton::Cancel => FOOTER_BUTTON_PAD_DIP,
+        FooterButton::Copy => FOOTER_COPY_PAD_DIP,
+    };
+    let extra = match button {
+        FooterButton::Copy => px(FOOTER_COPY_ICON_DIP) + px(FOOTER_COPY_GAP_DIP),
+        _ => 0,
+    };
+    text_width_px + extra + 2 * px(pad)
+}
+
+/// The rectangle of one footer button, given every button's width.
+///
+/// `widths` is in the order of [`FOOTER_BUTTONS`], so a caller that measures them in one pass does
+/// not have to know the layout to hand them over.
+pub fn footer_button_rect(
+    metrics: &FrameMetrics,
+    scale: f32,
+    widths: [i32; 3],
+    button: FooterButton,
+) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let strip = footer_rect(metrics, scale);
+    let height = px(FOOTER_BUTTON_HEIGHT_DIP);
+    let top = strip.top + (strip.bottom - strip.top - height) / 2;
+    let mut right = strip.right - px(FOOTER_PAD_X_DIP);
+    for (index, candidate) in FOOTER_BUTTONS.iter().enumerate() {
+        let width = widths[index];
+        let left = right - width;
+        if *candidate == button {
+            return Rect {
+                left,
+                top,
+                right,
+                bottom: top + height,
+            };
+        }
+        // The separator sits between copy and cancel (`:683`), so it counts as part of the gap.
+        right = left - px(FOOTER_GAP_DIP);
+        if *candidate == FooterButton::Cancel {
+            right -= px(FOOTER_SEP_WIDTH_DIP) + px(FOOTER_GAP_DIP);
+        }
+    }
+    Rect {
+        left: right,
+        top,
+        right,
+        bottom: top + height,
+    }
+}
+
+/// The separator between copy and cancel, centred on the strip's line (`:288`).
+pub fn footer_separator_rect(metrics: &FrameMetrics, scale: f32, widths: [i32; 3]) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let cancel = footer_button_rect(metrics, scale, widths, FooterButton::Cancel);
+    let width = px(FOOTER_SEP_WIDTH_DIP);
+    let height = px(FOOTER_SEP_HEIGHT_DIP);
+    let right = cancel.left - px(FOOTER_GAP_DIP);
+    let strip = footer_rect(metrics, scale);
+    let top = strip.top + (strip.bottom - strip.top - height) / 2;
+    Rect {
+        left: right - width,
+        top,
+        right,
+        bottom: top + height,
+    }
+}
+
+/// The copy glyph inside the copy button: 13 dip, at the button's own left padding (`:286`, `:287`).
+pub fn footer_copy_icon_rect(metrics: &FrameMetrics, scale: f32, widths: [i32; 3]) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let button = footer_button_rect(metrics, scale, widths, FooterButton::Copy);
+    let side = px(FOOTER_COPY_ICON_DIP);
+    let left = button.left + px(FOOTER_COPY_PAD_DIP);
+    let top = button.top + (button.bottom - button.top - side) / 2;
+    Rect {
+        left,
+        top,
+        right: left + side,
+        bottom: top + side,
+    }
+}
+
+/// Where the copy button's word goes: `.btn.copy` is a flex row — icon, then `gap: 6px`, then the
+/// word (`:286`) — so the word is not centred in the button the way the other two are.
+pub fn footer_copy_text_rect(metrics: &FrameMetrics, scale: f32, widths: [i32; 3]) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let button = footer_button_rect(metrics, scale, widths, FooterButton::Copy);
+    let icon = footer_copy_icon_rect(metrics, scale, widths);
+    Rect {
+        left: icon.right + px(FOOTER_COPY_GAP_DIP),
+        top: button.top,
+        right: button.right - px(FOOTER_COPY_PAD_DIP),
+        bottom: button.bottom,
+    }
+}
+
+/// Whether a client-area point is inside one footer button. Pure for the same reason the close
+/// button's test is: a hit test that lives only inside a message handler is never checked.
+pub fn footer_button_contains(
+    metrics: &FrameMetrics,
+    scale: f32,
+    widths: [i32; 3],
+    button: FooterButton,
+    point: (i32, i32),
+) -> bool {
+    let rect = footer_button_rect(metrics, scale, widths, button);
+    point.0 >= rect.left
+        && point.0 < rect.right
+        && point.1 >= rect.top
+        && point.1 < rect.bottom
+}
 
 #[cfg(test)]
 mod tests {
@@ -1380,6 +1571,159 @@ mod tests {
                     "option {index} must be clickable at {scale}"
                 );
                 assert_eq!(chosen_quality(&state), index);
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // The footer (`:274`-`:288`)
+    // ---------------------------------------------------------------------------------------------
+
+    /// Four scales, because every number here is a dip that gets rounded.
+    const FOOTER_SCALES: [f32; 4] = [1.0, 1.25, 1.5, 2.0];
+
+    /// Widths the way a caller would measure them: `保存` is the widest word, `复制` carries an
+    /// icon. The numbers are inputs, not claims — the layout is what these tests are about.
+    const FOOTER_WIDTHS: [i32; 3] = [88, 60, 70];
+
+    #[test]
+    fn the_footer_sits_under_the_body_and_ends_the_panel() {
+        for scale in FOOTER_SCALES {
+            let metrics = crate::panel::DEMO;
+            let strip = footer_rect(&metrics, scale);
+            let px = |dip: i32| (dip as f32 * scale).round() as i32;
+            assert_eq!(strip.top, px(metrics.panel_height() - metrics.footer_height));
+            assert_eq!(strip.bottom, px(metrics.panel_height()));
+            assert_eq!(strip.left, 0);
+            assert_eq!(strip.right, px(metrics.panel_width));
+            // The body's preview column ends where the footer begins, so nothing overlaps.
+            let preview_bottom = px(metrics.header_height + metrics.body_pad_top + metrics.preview_height);
+            assert!(
+                preview_bottom <= strip.top,
+                "the preview must end above the footer at {scale}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_footer_buttons_run_right_to_left_in_the_designs_order() {
+        for scale in FOOTER_SCALES {
+            let metrics = crate::panel::DEMO;
+            let widths = FOOTER_WIDTHS;
+            let save = footer_button_rect(&metrics, scale, widths, FooterButton::Save);
+            let cancel = footer_button_rect(&metrics, scale, widths, FooterButton::Cancel);
+            let copy = footer_button_rect(&metrics, scale, widths, FooterButton::Copy);
+            let px = |dip: i32| (dip as f32 * scale).round() as i32;
+
+            assert_eq!(
+                save.right,
+                px(metrics.panel_width) - px(FOOTER_PAD_X_DIP),
+                "save is flush with the footer's right padding"
+            );
+            assert_eq!(
+                cancel.right,
+                save.left - px(FOOTER_GAP_DIP),
+                "cancel sits one gap left of save"
+            );
+            // Copy is a further gap and the separator away, because `.foot .sep` (`:288`) stands
+            // between them (`:683`).
+            assert_eq!(
+                copy.right,
+                cancel.left - px(FOOTER_GAP_DIP) - px(FOOTER_SEP_WIDTH_DIP) - px(FOOTER_GAP_DIP),
+                "the separator stands between copy and cancel"
+            );
+            for rect in [copy, cancel, save] {
+                assert_eq!(
+                    rect.bottom - rect.top,
+                    px(FOOTER_BUTTON_HEIGHT_DIP),
+                    "--btn-h (:50)"
+                );
+            }
+            assert!(copy.left < cancel.left && cancel.left < save.left);
+        }
+    }
+
+    #[test]
+    fn the_footer_keeps_its_absolute_numbers() {
+        // Relations between rectangles cannot catch a wrong constant when every rectangle comes
+        // from the same constants, which is how the size row's own test learned to check both.
+        assert_eq!(FOOTER_PAD_X_DIP, 16, ".foot padding, :274");
+        assert_eq!(FOOTER_GAP_DIP, 8, ".foot gap, :274");
+        assert_eq!(FOOTER_BUTTON_HEIGHT_DIP, 32, "--btn-h, :50");
+        assert_eq!(FOOTER_BUTTON_RADIUS_DIP, 6, "--r-btn, :59");
+        assert_eq!(FOOTER_BUTTON_PAD_DIP, 16, ".btn padding, :279");
+        assert_eq!(FOOTER_SAVE_PAD_DIP, 24, ".btn.start padding, :282");
+        assert_eq!(FOOTER_COPY_PAD_DIP, 12, ".btn.copy padding, :286");
+        assert_eq!(FOOTER_COPY_ICON_DIP, 13, ".btn.copy svg, :287");
+        assert_eq!(FOOTER_SEP_WIDTH_DIP, 1, ".foot .sep width, :288");
+        assert_eq!(FOOTER_SEP_HEIGHT_DIP, 16, ".foot .sep height, :288");
+        assert_eq!(
+            crate::panel::DEMO.footer_height,
+            12 + 32 + 12,
+            "padding + button + padding, :274, :50"
+        );
+    }
+
+    #[test]
+    fn the_separator_stands_between_copy_and_cancel() {
+        for scale in FOOTER_SCALES {
+            let metrics = crate::panel::DEMO;
+            let widths = FOOTER_WIDTHS;
+            let separator = footer_separator_rect(&metrics, scale, widths);
+            let copy = footer_button_rect(&metrics, scale, widths, FooterButton::Copy);
+            let cancel = footer_button_rect(&metrics, scale, widths, FooterButton::Cancel);
+            assert!(separator.left >= copy.right, "the separator follows copy");
+            assert!(separator.right <= cancel.left, "the separator precedes cancel");
+            assert_eq!(
+                separator.right - separator.left,
+                (FOOTER_SEP_WIDTH_DIP as f32 * scale).round() as i32
+            );
+        }
+    }
+
+    #[test]
+    fn the_copy_glyph_leads_its_word_inside_the_button() {
+        for scale in FOOTER_SCALES {
+            let metrics = crate::panel::DEMO;
+            let widths = FOOTER_WIDTHS;
+            let button = footer_button_rect(&metrics, scale, widths, FooterButton::Copy);
+            let icon = footer_copy_icon_rect(&metrics, scale, widths);
+            let text = footer_copy_text_rect(&metrics, scale, widths);
+            let px = |dip: i32| (dip as f32 * scale).round() as i32;
+            assert_eq!(icon.left, button.left + px(FOOTER_COPY_PAD_DIP));
+            assert_eq!(text.left, icon.right + px(FOOTER_COPY_GAP_DIP));
+            assert_eq!(text.right, button.right - px(FOOTER_COPY_PAD_DIP));
+            assert!(
+                icon.right <= text.left && text.right <= button.right,
+                "the glyph and its word must stay inside the button at {scale}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_footer_button_answers_only_inside_itself() {
+        let metrics = crate::panel::DEMO;
+        for scale in FOOTER_SCALES {
+            let widths = FOOTER_WIDTHS;
+            for button in FOOTER_BUTTONS {
+                let rect = footer_button_rect(&metrics, scale, widths, button);
+                let centre = ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
+                assert!(
+                    footer_button_contains(&metrics, scale, widths, button, centre),
+                    "{button:?} must answer at its own centre"
+                );
+                let others = [
+                    (rect.left - 2, centre.1),
+                    (rect.right + 1, centre.1),
+                    (centre.0, rect.top - 2),
+                    (centre.0, rect.bottom + 1),
+                ];
+                for point in others {
+                    assert!(
+                        !footer_button_contains(&metrics, scale, widths, button, point),
+                        "{button:?} must not answer at {point:?} (scale {scale})"
+                    );
+                }
             }
         }
     }
