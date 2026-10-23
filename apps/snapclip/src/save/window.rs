@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use super::service;
+use super::{save_panel, ConflictPolicy, PanelValues};
 
 // -------------------------------------------------------------------------------------------------
 // Two facts that were each learned by shipping a panel nobody could see
@@ -645,6 +646,12 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
         // the mock's surface itself, and a silently transparent window would look broken.
         let backdrop = apply_backdrop(hwnd);
         let renderer = snapclip_ui::panel::PanelRenderer::new().ok();
+        // The footer buttons' widths, measured once, here. The paint and the click handling both
+        // read these numbers, so a click can only land on the button whose rectangle is on screen
+        // rather than on a second measurement that happens to agree. Measuring needs only the
+        // DirectWrite factory, so it works before the first paint and a click that arrives early
+        // still lands where the button will be.
+        let footer_widths = measure_footer_widths(hwnd, renderer.as_ref());
         // The child's background: the field's own fill, resolved from `--fill` over the surface.
         // A native `EDIT` cannot be translucent, so the composite is computed once here.
         let fill = snapclip_ui::panel::field_colours(
@@ -668,6 +675,7 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
             fill_brush,
             segment: snapclip_ui::panel::quality_segment_state(&metrics, &rects, scale, 0),
             segment_scale: scale,
+            footer_widths,
         }));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
 
@@ -792,6 +800,119 @@ struct WindowState {
     /// The scale the segment geometry was built at. The rectangles are pixels, so a window that
     /// moves between monitors has to rebuild them.
     segment_scale: f32,
+    /// The footer buttons' widths, in the order `FOOTER_BUTTONS` lists them.
+    ///
+    /// Measured once and read by both the paint and the click handling, so the rectangle a button is
+    /// drawn in and the rectangle a click is tested against are one set of numbers. Measuring inside
+    /// the paint would leave the hit test guessing, and guessing is how a click lands on a button
+    /// that is not there.
+    footer_widths: [i32; 3],
+}
+
+/// The footer buttons' widths for this window, or zeros if Direct2D never started.
+///
+/// Zeros are not a plausible width, and they are not meant to be: without a renderer there is no
+/// panel to paint and no button to click, and the caller logs that. Inventing a width would put a
+/// click target where nothing is drawn.
+fn measure_footer_widths(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    renderer: Option<&snapclip_ui::panel::PanelRenderer>,
+) -> [i32; 3] {
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96) as f32;
+    match renderer.map(|renderer| renderer.measure_footer_widths(dpi)) {
+        Some(Ok(widths)) => widths,
+        Some(Err(error)) => {
+            eprintln!("[save-panel] could not measure the footer buttons: {error:?}");
+            [0; 3]
+        }
+        None => [0; 3],
+    }
+}
+
+/// What the panel's name field holds, read back from the control that owns it.
+///
+/// The text lives in the child `EDIT`, not in Rust, so a save has to ask the control. Reading it
+/// here rather than keeping a copy means there is no second place that could disagree with what
+/// the user sees.
+fn control_text(hwnd: windows_sys::Win32::Foundation::HWND) -> String {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowTextLengthW, GetWindowTextW};
+    if hwnd.is_null() {
+        return String::new();
+    }
+    let len = unsafe { GetWindowTextLengthW(hwnd) };
+    if len <= 0 {
+        return String::new();
+    }
+    let mut buffer = vec![0u16; len as usize + 1];
+    let written = unsafe { GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };
+    String::from_utf16_lossy(&buffer[..written.max(0) as usize])
+}
+
+/// The local date and time in the forms the naming template asks for: `YYYY-MM-DD` and `HHmm`
+/// (`docs/design/…规格.md` names both). Local rather than UTC, because a file named for yesterday
+/// is a surprise; no separator in the time because a colon is not a legal file name character.
+fn local_date_and_time() -> (String, String) {
+    let mut now: windows_sys::Win32::Foundation::SYSTEMTIME = unsafe { std::mem::zeroed() };
+    unsafe { windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut now) };
+    (
+        format!("{:04}-{:02}-{:02}", now.wYear, now.wMonth, now.wDay),
+        format!("{:02}{:02}", now.wHour, now.wMinute),
+    )
+}
+
+/// The panel's answers as the save step wants them.
+///
+/// Separate from [`save_from_panel`] because the two fields it reads are both strings and of the
+/// same kind: swapping the directory and the name would produce a save that looks entirely
+/// reasonable and writes to the wrong place. A function can be asserted without a window.
+fn panel_values<'a>(
+    directory: &'a str,
+    name: &'a str,
+    date: &'a str,
+    time: &'a str,
+) -> PanelValues<'a> {
+    PanelValues {
+        directory,
+        name,
+        // The panel has no format control yet, so the save is PNG. Recorded in `docs/41` rather
+        // than offered as a choice that does not exist.
+        format: snapclip_capture::save_format::SaveFormat::Png,
+        conflict: ConflictPolicy::AutoRename,
+        date,
+        time,
+        // The spec advances the sequence after a successful save and remembers it; there is no
+        // stored sequence yet, so the next one is the first. Recorded in `docs/41`.
+        sequence: 1,
+        app: "SnapClip",
+    }
+}
+
+/// Save what the panel is showing, through the one path that writes files.
+///
+/// The values come from the controls themselves, so what is saved is what the user sees. The name
+/// stays a template here and is expanded by the save step, which is why the date and time are read
+/// now rather than when the panel opened: a name means the day it was written.
+fn save_from_panel(hwnd: windows_sys::Win32::Foundation::HWND) {
+    let Some(s) = state(hwnd) else {
+        return;
+    };
+    let Some((bgra, width, height)) = s.preview.as_ref() else {
+        eprintln!("[save-panel] save with no capture: there is nothing to write");
+        return;
+    };
+    let name = control_text(s.control(snapclip_ui::panel::FieldId::Name));
+    let directory = control_text(s.control(snapclip_ui::panel::FieldId::Path));
+    let (date, time) = local_date_and_time();
+    let values = panel_values(&directory, &name, &date, &time);
+    match save_panel(&values, *width, *height, bgra) {
+        Ok(outcome) => eprintln!(
+            "[save-panel] saved {} bytes to {} as {}",
+            outcome.bytes,
+            outcome.path.display(),
+            outcome.format.label()
+        ),
+        Err(error) => eprintln!("[save-panel] save failed: {}", error.message()),
+    }
 }
 
 impl WindowState {
@@ -1144,6 +1265,7 @@ extern "system" fn window_proc(
                             s.fields,
                             s.preview.as_ref().map(|(bgra, w, h)| (bgra.as_slice(), *w, *h)),
                             s.chosen_quality(),
+                            s.footer_widths,
                         )
                         .is_ok();
                 }
@@ -1189,6 +1311,41 @@ extern "system" fn window_proc(
                     return 0;
                 }
             }
+            // The footer's buttons are drawn by the frame as well, and their widths are the ones the
+            // paint used, so the rectangle tested here is the rectangle on screen.
+            if event == snapclip_ui::panel::PointerEvent::Down {
+                let metrics = snapclip_ui::panel::DEMO;
+                let scale = dpi_scale(hwnd);
+                let widths = state(hwnd).map(|s| s.footer_widths).unwrap_or([0; 3]);
+                for button in snapclip_ui::panel::FOOTER_BUTTONS {
+                    if !snapclip_ui::panel::footer_button_contains(
+                        &metrics,
+                        scale,
+                        widths,
+                        button,
+                        (point.x, point.y),
+                    ) {
+                        continue;
+                    }
+                    match button {
+                        // Drawn but not wired: the clipboard is its own piece of work, and a button
+                        // that pretends to copy would be worse than one that visibly does nothing.
+                        snapclip_ui::panel::FooterButton::Copy => {}
+                        snapclip_ui::panel::FooterButton::Cancel => {
+                            windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+                                hwnd, WM_CLOSE, 0, 0,
+                            );
+                        }
+                        snapclip_ui::panel::FooterButton::Save => {
+                            save_from_panel(hwnd);
+                            windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+                                hwnd, WM_CLOSE, 0, 0,
+                            );
+                        }
+                    }
+                    return 0;
+                }
+            }
             let chosen = state_mut(hwnd)
                 .map(|s| s.quality_pointer(dpi_scale(hwnd), event, point))
                 .unwrap_or(false);
@@ -1209,6 +1366,12 @@ extern "system" fn window_proc(
                 suggested.bottom - suggested.top,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
+            // The footer's widths are pixels, so a new scale makes the old ones stale. They are
+            // measured from the same renderer the paint uses, so re-measuring here keeps the click
+            // targets on the buttons as they are now drawn.
+            if let Some(s) = state_mut(hwnd) {
+                s.footer_widths = measure_footer_widths(hwnd, s.renderer.as_ref());
+            }
             0
         }
         // `Esc` is a cancel, and at this layer cancelling the panel *is* closing it: the shell's
@@ -1378,6 +1541,35 @@ fn read_u32(hwnd: isize, attribute: u32) -> Option<u32> {
 mod tests {
     use super::*;
 
+    /// The directory and the name are both strings, so nothing about the types stops them being
+    /// handed over the wrong way round. A save with them swapped looks entirely reasonable and
+    /// writes somewhere else, which is why the pairing is asserted rather than noticed later.
+    #[test]
+    fn the_save_takes_the_directory_and_the_name_in_that_order() {
+        let values = panel_values(r"C:\shots", "SnapClip_[日期]", "2026-10-24", "0115");
+        assert_eq!(values.directory, r"C:\shots");
+        assert_eq!(values.name, "SnapClip_[日期]");
+        assert_eq!(values.date, "2026-10-24");
+        assert_eq!(values.time, "0115");
+        assert_eq!(values.app, "SnapClip");
+    }
+
+    /// The time the spec asks for is `HHmm` (`docs/design/…规格.md`): no separator, because a colon
+    /// is not a legal file name character, and local rather than UTC, because a file named for
+    /// yesterday is a surprise.
+    #[test]
+    fn the_local_date_and_time_are_filename_shaped() {
+        let (date, time) = local_date_and_time();
+        assert_eq!(date.len(), 10, "YYYY-MM-DD: {date}");
+        assert_eq!(date.as_bytes()[4], b'-');
+        assert_eq!(date.as_bytes()[7], b'-');
+        assert_eq!(time.len(), 4, "HHmm: {time}");
+        assert!(
+            date.bytes().chain(time.bytes()).all(|b| b.is_ascii_digit() || b == b'-'),
+            "nothing in a file name may need escaping: {date} {time}"
+        );
+    }
+
     /// The two size cells are two numbers of the same type, so nothing about the type stops the
     /// width from being handed to the height cell. On screen that would look entirely reasonable,
     /// which is why the pairing is asserted here rather than noticed later.
@@ -1435,6 +1627,7 @@ mod tests {
                 0,
             ),
             segment_scale: 1.0,
+            footer_widths: [40, 52, 64],
         };
 
         // Every field has its own slot: no two fields share an index, which is what would let one
@@ -1492,6 +1685,7 @@ mod tests {
                 0,
             ),
             segment_scale: 1.0,
+            footer_widths: [40, 52, 64],
         };
 
         let centre = |index: usize| {
@@ -1553,6 +1747,7 @@ mod tests {
                 2,
             ),
             segment_scale: 1.0,
+            footer_widths: [40, 52, 64],
         };
 
         let metrics = snapclip_ui::panel::DEMO;

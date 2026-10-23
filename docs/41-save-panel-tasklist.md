@@ -662,11 +662,16 @@ cargo run -p codec-bench --release -- --assert
 | # | 缺口 | 落点 | 归属批次 |
 | --- | --- | --- | --- |
 | ~~A1~~ | ~~两个尺寸格**起始为空** ✗~~ ✓ **已显示真实宽高**（`ShellOptions.capture_size` ✓，`SelectionPixels.region` 那条链路 ✓；没有捕获时**显示空** ✗ 而不编造 ✓） | — | 已完成 ✓ |
-| A4 | **`.link-hub` 与两个 ghost 按钮未画** ✗（`更改` ✓ / 文件夹图标 ✓）—— hub **已画**（`link` 图标 ✓，烘焙管线 ✓），ghost 按钮**未画** ✗ | 同上 ✓（**画了不接就是假控件** ✗） | 交互批 ✓ |
+| ~~A4~~ | ~~**`.link-hub` 与两个 ghost 按钮未画** ✗~~ ✓ hub **已画**（`link` 图标 ✓）；**两个 ghost 按钮仍未画** ✗（`更改` ✓ / 文件夹图标 ✓）⇒ 见 A9 | 同上 ✓ | 交互批 ✓ |
 | A5 | **`保存后` 的两个 chip 未画** ✗（高 24 ✓、行内 gap 12 ✓、chip 间 gap 8 ✓ 均已量 ✓） | 同上 ✓ | 交互批 ✓ |
 | ~~A6~~ | ~~**尺寸行还有两个模式钮（`数值`/`百分比`，`:585`–`:586` ✓）与一个重置钮（`:589` ✓）** ✗~~ ✓ **已画出**（`.size-mode-btn` 的几何来自 `:226`/`:227` ✓，重置钮用 `refresh` 图标 ✓，宽度**真的测量了文字** ✓）⇒ 仍**只画不接** ✗ | — | 已完成绘制 ✓；点击属交互批 ✗ |
 | ~~A7~~ | ~~**尺寸格的 `宽`/`高` 与单位 `px` 未画** ✗~~ ✓ **已画出**（三段几何同源 ✓：`size_cell_label_rect` / `size_cell_input_rect` / `size_cell_unit_rect` ✓，第二格吸收余数 ✓） | — | 已完成 ✓ |
 | ~~A8~~ | ~~**数值字段的等宽字体未用** ✗~~ ✓ **已用**：`assets/font/FiraCode-Regular.ttf`（283 KB）取子集到 **3.3 KB**（`subfont/build_number_font.py` ✓，16 个字符 ✓）⇒ 内嵌在 `snapclip-ui`（`panel/fonts.rs` ✓）⇒ 尺寸格的 `EDIT`（`WM_SETFONT` + `ES_RIGHT` ✓）与 `px` 单位（`number_format` ✓）都用它；门禁 `the_embedded_number_subset_covers_the_numbers_the_panel_shows` ✓ | — | 已完成 ✓ |
+| A9 | **`.link-hub` 之外的两个 ghost 按钮未画** ✗（路径行的 `更改` ✓ 与文件夹图标 ✓，demo `:545`/`:546` ✓） | 宽度需要测量文本 ✓（同 B1 ✓） | 交互批 ✓ |
+| A10 | **格式下拉未画** ✗（demo `:561` ✓，`.PNG`/`.JPG`/`.WebP` ✓）⇒ 保存**固定用 PNG** ✗ | `save/window.rs` 的 `panel_values` ✓ | 格式批 ✓ |
+| A11 | **`[序号]` 固定为 1** ✗ —— 规格 `:201` 要求"每次保存成功后 +1 并记住" ✓，而没有存序号的地方 ✗ | `panel_values` 的 `sequence: 1` ✓ | 序号批 ✓ |
+| A12 | **保存失败只记日志** ✗ —— `SaveError::Validation{copy}` 是**键** ✓，怎么呈现属 UI 设计 ✓ | `save_from_panel` 的 `Err` 分支 ✓ | 错误提示批 ✓ |
+| A13 | **悬停态未做** ✗（`.close:hover` ✓ `:97` ✓、`.btn:hover` ✓） | 需要鼠标进入/离开消息 ✓ | 交互批 ✓ |
 
 > **A8 的一条边界** ✗：`SIZE_UNIT_DIP = 18` 仍是**预留值** ✗（demo 无此数 ✓，而 `measure_text_width` **已可用** ✓）⇒ 改成实测会动几何与测试 ✓ ⇒ 留作单独一批 ✓。
 
@@ -823,3 +828,30 @@ cargo run -p codec-bench --release -- --assert
 1. `.cell-label` 在 demo 里是 **13px**（`:237`），而面板用的是 **11px 的 label 格式** —— 字号未建独立格式；
 2. `SIZE_UNIT_DIP = 18` 是**预留值**（demo 无此数，文字宽要测量）—— 现在 `measure_text_width` 已存在，
    可以改为实测，但那会动几何与测试，留作单独一批。
+
+### 底部接线（本批）：一次测量，绘制与命中共用
+
+**形状** ✗（上一批定、本批实现）：`Frame` 多一个 `footer_widths: Option<[i32; 3]>`，窗口在**建窗时**测一次
+（那时有 DC）存进 `WindowState`，**画时**传给 `Frame`、**点时**用同一份 ⇒ "**命中矩形 = 绘制矩形**" ✓。
+`Frame` 里保留了"调用方没给就自己量"的回退（有注释 ✓），而**窗口总是传入** ✓ ⇒ 窗口的点击与绘制必然一致 ✓。
+
+**三个点击** ✓：`保存` ⇒ `save_panel(&panel_values(…), w, h, bgra)` ⇒ 成功记日志（路径/字节/格式）+ **走现成的 `close`** ✓
+（**不**自己 `PostMessage` 到可能被复用的句柄 ✗）；`取消` ⇒ 同一条 `WM_CLOSE` ✓；`复制` ⇒ **只画不接** ✓（剪贴板另说 ✓）。
+`WM_DPICHANGED` 里**重测一次** ✓（宽度是像素 ✓，换 DPI 就失效 ✓）。
+
+**两条取值按规格** ✓：`[日期]` = `YYYY-MM-DD`、`[时间]` = `HHmm`（规格 `:194`/`:195` ✓，**无冒号**因为文件名不能有冒号 ✓），
+用 `GetLocalTime` ✓（**本地**而非 UTC ✓ —— 文件按昨天的日子命名是个意外 ✓）⇒ 为此给 app 的 `windows-sys` 加了
+`Win32_System_SystemInformation` ✓（有注释说明为什么 ✓）。
+
+**一条结构性决定** ✓：`panel_values(directory, name, date, time)` 抽成**自由函数** ✓ —— 目录与文件名**都是字符串** ✗ ⇒
+互换在屏幕上**看起来完全合理** ✓ ⇒ 必须**不用窗口就能断言** ✓（与 `initial_text` 同一招 ✓）。
+
+**证据** ✓（`ui` **120/0** ✓、`app` **221/0/9** ✓、`capture` **545/0/80** ✓、`check` Finished ✓ **无死代码** ✓、`[pre-push] OK` ✓）：
+`a_footer_click_is_answered_where_the_button_is_drawn` ✓（ui ✓ 三个按钮 × 四个 DPI ✓：四角与中心都命中 ✓，界外三点都不命中 ✓）、
+`the_save_takes_the_directory_and_the_name_in_that_order` ✓、`the_local_date_and_time_are_filename_shaped` ✓（长度 ✓ 分隔符 ✓ 全是数字或 `-` ✓）。
+
+**两条变异都真红** ✓（都**先断言替换命中 1 处** ✓，还原**逐字节一致** ✓）：
+- 让 `footer_button_contains` **自己算一份矩形** ✗ ⇒ `a_footer_click_is_answered_where_the_button_is_drawn` **FAILED** ✓；
+- 互换 `panel_values` 的**两个实参** ✗ ⇒ `the_save_takes_the_directory_and_the_name_in_that_order` **FAILED** ✓（`left: "SnapClip_[日期]" / right: "C:\shots"` ✓）。
+
+**本批修的三处编译错** ✗（上一批死在中间态 ✓）：`paint_with_preview` 少第 8 个实参 ✓；`GetDpiForWindow` 缺 `unsafe` ✓（它在自由函数里，不在 WndProc 的 unsafe 块内 ✓）；三处**测试**用的 `WindowState` 字面量缺 `footer_widths` ✓。

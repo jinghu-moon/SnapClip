@@ -15,6 +15,35 @@ use windows::Win32::Graphics::DirectWrite::{
 };
 use windows::core::Result;
 
+/// How wide a string lays out, in pixels, at the given format.
+///
+/// Free rather than a painter method because measuring needs a DirectWrite factory and nothing else —
+/// no render target, no device, no window. That is what lets a caller measure a button's width before
+/// it has anything to paint into, and hand the same number to the code that decides whether a click
+/// landed on that button.
+pub fn measure_text(
+    dwrite: &IDWriteFactory,
+    text: &str,
+    format: &IDWriteTextFormat,
+) -> Result<DWRITE_TEXT_METRICS> {
+    let wide = text.encode_utf16().collect::<Vec<_>>();
+    let layout = unsafe {
+        dwrite.CreateTextLayout(&wide, format, f32::INFINITY, f32::INFINITY)?
+    };
+    let mut metrics = DWRITE_TEXT_METRICS::default();
+    unsafe { layout.GetMetrics(&mut metrics)? };
+    Ok(metrics)
+}
+
+/// [`measure_text`]'s width alone, which is all the layout ever asks for.
+pub fn measure_text_width(
+    dwrite: &IDWriteFactory,
+    text: &str,
+    format: &IDWriteTextFormat,
+) -> Result<f32> {
+    Ok(measure_text(dwrite, text, format)?.width)
+}
+
 #[derive(Clone, Copy)]
 pub struct SegmentColors<'a> {
     pub track: &'a ID2D1SolidColorBrush,
@@ -302,14 +331,7 @@ impl PanelPainter<'_> {
         text: &str,
         format: &IDWriteTextFormat,
     ) -> Result<DWRITE_TEXT_METRICS> {
-        let wide = text.encode_utf16().collect::<Vec<_>>();
-        let layout = unsafe {
-            self.text_factory
-                .CreateTextLayout(&wide, format, f32::INFINITY, f32::INFINITY)?
-        };
-        let mut metrics = DWRITE_TEXT_METRICS::default();
-        unsafe { layout.GetMetrics(&mut metrics)? };
-        Ok(metrics)
+        measure_text(self.text_factory, text, format)
     }
 
     pub fn segmented(

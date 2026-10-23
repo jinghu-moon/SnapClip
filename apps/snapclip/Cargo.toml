@@ -66,6 +66,10 @@ windows-sys = { version = "0.59", features = [
   "Win32_System_Memory",
   "Win32_System_Ole",
   "Win32_System_Performance",
+  # `GetLocalTime` — the naming template's `[日期]` and `[时间]` mean the day the file was written,
+  # and it must be the user's local day rather than UTC. The bindings put it here, next to the other
+  # system information calls.
+  "Win32_System_SystemInformation",
   "Win32_System_Threading",
   "Win32_UI_Input_KeyboardAndMouse",
   # `WM_MOUSELEAVE` — the notification that says the cursor left the pin, which is when the

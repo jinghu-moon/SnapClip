@@ -356,6 +356,13 @@ pub struct Frame<'a> {
     /// and `.btn.start` is 600 (`:282`), which is the only difference between save and the rest.
     pub button: Option<&'a IDWriteTextFormat>,
     pub button_strong: Option<&'a IDWriteTextFormat>,
+    /// The footer buttons' widths in pixels, in the order of [`crate::panel::FOOTER_BUTTONS`].
+    ///
+    /// A caller that also answers clicks hands them over, so the rectangles the buttons are painted
+    /// in and the rectangles that decide whether a click landed are the same numbers rather than two
+    /// measurements that happen to agree. `None` measures here, which is what a caller that only
+    /// paints — every bitmap test — does.
+    pub footer_widths: Option<[i32; 3]>,
     /// The state of every form field's frame. The native `EDIT` itself draws no border, no focus ring
     /// and no error state, so those belong to the frame (`field.rs`), and each field carries its own
     /// — one shared state is what made a focused path row draw the name row's frame.
@@ -695,38 +702,51 @@ impl Frame<'_> {
                 &self.brushes.footer_line,
             );
 
-            let mut widths = [0i32; 3];
-            for (index, button) in crate::panel::FOOTER_BUTTONS.iter().enumerate() {
-                let (word, format) = match button {
-                    crate::panel::FooterButton::Copy => ("复制", button_format),
-                    crate::panel::FooterButton::Cancel => ("取消", button_format),
-                    crate::panel::FooterButton::Save => ("保存", strong_format),
-                };
-                let measured = painter.measure_text_width(word, format)?.round() as i32;
-                widths[index] = crate::panel::footer_button_width(self.scale, *button, measured);
-            }
+            // The widths come from the caller when it also answers clicks, so a click can only land
+            // on a button whose rectangle is the one on screen. A caller that only paints measures
+            // here; both paths end in `footer_button_width`, so there is one rule for how wide a
+            // button is and one place that knows it.
+            let widths = match self.footer_widths {
+                Some(widths) => widths,
+                None => {
+                    let mut widths = [0i32; 3];
+                    for (index, button) in crate::panel::FOOTER_BUTTONS.iter().enumerate() {
+                        let word = crate::panel::footer_button_text(*button);
+                        let format = if crate::panel::footer_button_is_strong(*button) {
+                            strong_format
+                        } else {
+                            button_format
+                        };
+                        let measured = painter.measure_text_width(word, format)?.round() as i32;
+                        widths[index] =
+                            crate::panel::footer_button_width(self.scale, *button, measured);
+                    }
+                    widths
+                }
+            };
 
             let radius =
                 (crate::panel::FOOTER_BUTTON_RADIUS_DIP as f32 * self.scale).round() as i32;
             for button in crate::panel::FOOTER_BUTTONS {
                 let rect =
                     crate::panel::footer_button_rect(self.metrics, self.scale, widths, button);
+                let word = crate::panel::footer_button_text(button);
                 match button {
                     // `:282` save is the one filled button: `--accent` behind white text at 600.
                     crate::panel::FooterButton::Save => {
                         painter.fill_round(rect, radius, &self.brushes.accent);
-                        painter.draw_text("保存", strong_format, rect, &self.brushes.text);
+                        painter.draw_text(word, strong_format, rect, &self.brushes.text);
                     }
                     // `:280` cancel is transparent with a `--line-soft` edge and `--text`.
                     crate::panel::FooterButton::Cancel => {
                         painter.stroke_round(rect, radius, &self.brushes.line_soft, line);
-                        painter.draw_text("取消", button_format, rect, &self.brushes.text);
+                        painter.draw_text(word, button_format, rect, &self.brushes.text);
                     }
                     // `:286` copy is a ghost: no background, `--muted`, and its word follows the
                     // glyph rather than centring in the button.
                     crate::panel::FooterButton::Copy => {
                         let text = crate::panel::footer_copy_text_rect(self.metrics, self.scale, widths);
-                        painter.draw_text("复制", button_format, text, &self.brushes.muted);
+                        painter.draw_text(word, button_format, text, &self.brushes.muted);
                     }
                 }
             }
@@ -884,6 +904,32 @@ pub fn button_strong_format(dwrite: &IDWriteFactory, dpi: f32) -> Result<IDWrite
     Ok(format)
 }
 
+/// The footer buttons' widths, measured the way the painter measures them.
+///
+/// A caller that paints and also answers clicks measures once here and hands the result to both, so
+/// the rectangle a button is drawn in and the rectangle a click is tested against are one set of
+/// numbers. Nothing about this needs a render target: text layout only needs the factory, which is
+/// why the window can do it at startup, before the first paint, and why a click that arrives before
+/// anything has been drawn still lands where the button will be.
+pub fn measure_footer_widths(dwrite: &IDWriteFactory, dpi: f32) -> Result<[i32; 3]> {
+    let scale = (dpi / 96.0).max(0.5);
+    let button = button_format(dwrite, dpi)?;
+    let strong = button_strong_format(dwrite, dpi)?;
+    let mut widths = [0i32; 3];
+    for (index, footer) in crate::panel::FOOTER_BUTTONS.iter().enumerate() {
+        let format = if crate::panel::footer_button_is_strong(*footer) {
+            &strong
+        } else {
+            &button
+        };
+        let measured =
+            crate::panel::d2d::measure_text_width(dwrite, crate::panel::footer_button_text(*footer), format)?
+                .round() as i32;
+        widths[index] = crate::panel::footer_button_width(scale, *footer, measured);
+    }
+    Ok(widths)
+}
+
 /// `--fs-num: 16px` (`save-panel-demo-v3.html:33`). The size cells' numbers.
 pub const NUMBER_FONT_DIP: f32 = 16.0;
 
@@ -962,7 +1008,7 @@ pub fn paint_to_dc_with_state(
     fill_surface: bool,
     fields: crate::panel::FieldStates,
 ) -> Result<()> {
-    paint_to_dc_with_preview(factory, dwrite, hdc, area, dpi, fill_surface, fields, None, 0)
+    paint_to_dc_with_preview(factory, dwrite, hdc, area, dpi, fill_surface, fields, None, 0, None)
 }
 
 /// [`paint_to_dc_with_state`] with a captured picture for the preview card. The old signature
@@ -970,6 +1016,11 @@ pub fn paint_to_dc_with_state(
 ///
 /// `quality` is the option the segmented control marks as chosen. It travels with the paint call
 /// rather than living in the frame, because it belongs to the window that receives the clicks.
+///
+/// `footer_widths` is the same: the window measures the footer buttons once and hands the numbers
+/// here and to its click handling, so a click cannot land on a button whose drawn rectangle differs
+/// from the one tested. `None` measures inside the paint, which is what a caller that only paints
+/// wants.
 #[allow(clippy::too_many_arguments)]
 pub fn paint_to_dc_with_preview(
     factory: &ID2D1Factory,
@@ -981,6 +1032,7 @@ pub fn paint_to_dc_with_preview(
     fields: crate::panel::FieldStates,
     preview: Option<(&[u8], u32, u32)>,
     quality: usize,
+    footer_widths: Option<[i32; 3]>,
 ) -> Result<()> {
     // DPI 96 on the target, deliberately: `rects(scale)` below already converts every dip to a
     // pixel, so a target carrying the real DPI would scale those pixels a second time. That is
@@ -1033,6 +1085,7 @@ pub fn paint_to_dc_with_preview(
         number: Some(&number),
         button: Some(&button),
         button_strong: Some(&button_strong),
+        footer_widths,
         fields,
         preview: preview.as_ref().map(|(b, w, h)| (b, *w, *h)),
         quality,
@@ -1054,7 +1107,7 @@ pub fn paint_to_target(
     dpi: f32,
     fill_surface: bool,
 ) -> Result<FrameRects> {
-    paint_to_target_with_preview(target, dwrite, dpi, fill_surface, None, 0)
+    paint_to_target_with_preview(target, dwrite, dpi, fill_surface, None, 0, None)
 }
 
 /// [`paint_to_target`] with a captured picture for the preview card. The old signature delegates
@@ -1066,6 +1119,7 @@ pub fn paint_to_target_with_preview(
     fill_surface: bool,
     preview: Option<(&[u8], u32, u32)>,
     quality: usize,
+    footer_widths: Option<[i32; 3]>,
 ) -> Result<FrameRects> {
     let brushes = FrameBrushes::new(target, &DEMO_PALETTE)?;
     let scale = (dpi / 96.0).max(0.5);
@@ -1104,6 +1158,7 @@ pub fn paint_to_target_with_preview(
         number: Some(&number),
         button: Some(&button),
         button_strong: Some(&button_strong),
+        footer_widths,
         fields: crate::panel::FieldStates::IDLE,
         preview: preview.as_ref().map(|(b, w, h)| (b, *w, *h)),
         quality,
@@ -1809,6 +1864,7 @@ mod tests {
                 crate::panel::FieldStates::IDLE,
                 Some((bgra, w, h)),
                 0,
+                None,
             )
             .expect("the frame paints with a preview");
         }
@@ -1830,6 +1886,7 @@ mod tests {
                 crate::panel::FieldStates::IDLE,
                 None,
                 quality,
+                None,
             )
             .expect("the frame paints with a chosen quality");
         }
@@ -2693,6 +2750,9 @@ impl PanelRenderer {
     ///
     /// Additive on purpose: `paint` keeps its signature and delegates with no picture, so the
     /// window that has nothing to show and every existing bitmap test are untouched.
+    ///
+    /// `footer_widths` comes from [`PanelRenderer::measure_footer_widths`] so that the window can
+    /// test a click against the same rectangles it paints.
     pub fn paint_with_preview(
         &self,
         hdc: *mut core::ffi::c_void,
@@ -2702,6 +2762,7 @@ impl PanelRenderer {
         fields: crate::panel::FieldStates,
         preview: Option<(&[u8], u32, u32)>,
         quality: usize,
+        footer_widths: [i32; 3],
     ) -> Result<()> {
         paint_to_dc_with_preview(
             &self.factory,
@@ -2713,7 +2774,17 @@ impl PanelRenderer {
             fields,
             preview,
             quality,
+            Some(footer_widths),
         )
+    }
+
+    /// The footer buttons' widths, for a caller that has to decide whether a click landed on one.
+    ///
+    /// Measured with the same formats and the same rule the paint uses, so the two agree by
+    /// construction rather than by both being written carefully. Needs no window and no render
+    /// target, so the window can call it once at startup and on a dpi change.
+    pub fn measure_footer_widths(&self, dpi: f32) -> Result<[i32; 3]> {
+        measure_footer_widths(&self.dwrite, dpi)
     }
 }
 

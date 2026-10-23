@@ -985,6 +985,26 @@ pub const FOOTER_BUTTONS: [FooterButton; 3] = [
     FooterButton::Copy,
 ];
 
+/// The word on a footer button, once.
+///
+/// Both the caller that measures the buttons and the code that paints them need this, and a width is
+/// only right if the word it was measured from is the word that gets drawn. Keeping the pairs in one
+/// place is what makes those the same word rather than two lists that agree today.
+pub fn footer_button_text(button: FooterButton) -> &'static str {
+    match button {
+        FooterButton::Copy => "复制",
+        FooterButton::Cancel => "取消",
+        FooterButton::Save => "保存",
+    }
+}
+
+/// Whether a footer button draws in the strong format. `.btn.start { font-weight: 600 }` (`:282`) is
+/// the only difference between save and the other two, and a width measured at the wrong weight is
+/// the wrong width.
+pub fn footer_button_is_strong(button: FooterButton) -> bool {
+    matches!(button, FooterButton::Save)
+}
+
 /// The strip below the body: the panel's last `footer_height` dips.
 pub fn footer_rect(metrics: &FrameMetrics, scale: f32) -> Rect {
     let px = |dip: i32| (dip as f32 * scale).round() as i32;
@@ -1640,6 +1660,45 @@ mod tests {
                 );
             }
             assert!(copy.left < cancel.left && cancel.left < save.left);
+        }
+    }
+
+    #[test]
+    fn a_footer_click_is_answered_where_the_button_is_drawn() {
+        // The window measures the widths once and hands the same numbers to the paint and to the
+        // click handling, so the two rectangles are one set of numbers. This asserts that the two
+        // functions agree about it: a click may only land on a button whose rectangle is the one
+        // on screen, and a disagreement here is a click answered beside the button it hit.
+        for scale in FOOTER_SCALES {
+            let metrics = crate::panel::DEMO;
+            let widths = FOOTER_WIDTHS;
+            for button in FOOTER_BUTTONS {
+                let rect = footer_button_rect(&metrics, scale, widths, button);
+                let inside = [
+                    (rect.left, rect.top),
+                    (rect.right - 1, rect.top),
+                    (rect.left, rect.bottom - 1),
+                    (rect.right - 1, rect.bottom - 1),
+                    ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2),
+                ];
+                for point in inside {
+                    assert!(
+                        footer_button_contains(&metrics, scale, widths, button, point),
+                        "{button:?} is drawn at {rect:?}, so {point:?} is on it"
+                    );
+                }
+                let outside = [
+                    (rect.left - 1, rect.top),
+                    (rect.right, rect.top),
+                    (rect.left, rect.bottom),
+                ];
+                for point in outside {
+                    assert!(
+                        !footer_button_contains(&metrics, scale, widths, button, point),
+                        "{button:?} must not answer outside {rect:?}"
+                    );
+                }
+            }
         }
     }
 

@@ -58,7 +58,8 @@ pub use field::{
     SIZE_MODE_WORDS, CLOSE_ICON_DIP, close_button_contains, close_icon_rect,
     FOOTER_BUTTON_HEIGHT_DIP, FOOTER_BUTTON_RADIUS_DIP, FOOTER_BUTTONS, FOOTER_GAP_DIP,
     FOOTER_PAD_X_DIP, FooterButton, footer_border_y, footer_button_contains, footer_button_rect,
-    footer_button_width, footer_copy_icon_rect, footer_copy_text_rect, footer_line_over_surface,
+    footer_button_width, footer_button_is_strong, footer_button_text, footer_copy_icon_rect,
+    footer_copy_text_rect, footer_line_over_surface,
     footer_rect, footer_separator_rect,
     chosen_quality, edit_font_height, edit_font_height_for, field_colours, field_rect,
     form_drawn_strings, label_rect,
@@ -71,7 +72,7 @@ pub use field::{
 pub use frame::{
     CHIP_FONT_DIP, DEMO, DEMO_PALETTE, Frame, FrameBrushes, FrameMetrics, FramePalette, FrameRects,
     NUMBER_FONT_DIP, PanelRenderer, ROW_LABEL_FONT_DIP, TITLE, UNIT_FONT_DIP, chip_format, factory,
-    number_format, paint_to_dc, paint_to_target,
+    measure_footer_widths, number_format, paint_to_dc, paint_to_target,
     row_label_format, text_format_in, title_format,
 };
 pub use icon_button::IconButton;
