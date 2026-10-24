@@ -7,7 +7,7 @@
 pub const ICON_BAKED_PX: u32 = 96;
 
 /// How many glyphs are available to panel components.
-pub const ICON_COUNT: usize = 12;
+pub const ICON_COUNT: usize = 13;
 
 /// A panel glyph baked from `assets/icon/*.svg`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +38,8 @@ pub enum Glyph {
     FolderOpen = 10,
     /// Braces with a dot, for the name row's insert-a-variable button (`.name-var`, `:557`).
     Braces = 11,
+    /// An info circle, for the size row's over-resolution hint (.warn-hint, :622).
+    InfoCircle = 12,
 }
 
 impl Glyph {
@@ -54,6 +56,7 @@ impl Glyph {
         Self::Folder,
         Self::FolderOpen,
         Self::Braces,
+        Self::InfoCircle,
     ];
 
     pub const fn index(self) -> usize {
@@ -74,6 +77,7 @@ impl Glyph {
             Self::Folder => "folder",
             Self::FolderOpen => "folder-open",
             Self::Braces => "braces",
+            Self::InfoCircle => "info-circle",
         }
     }
 
@@ -92,6 +96,7 @@ impl Glyph {
             Self::Folder => include_bytes!("../../../../assets/icon/folder.png"),
             Self::FolderOpen => include_bytes!("../../../../assets/icon/folder-open.png"),
             Self::Braces => include_bytes!("../../../../assets/icon/braces.png"),
+            Self::InfoCircle => include_bytes!("../../../../assets/icon/info-circle.png"),
         }
     }
 
@@ -115,6 +120,7 @@ impl Glyph {
             Self::Folder => include_bytes!("../../../../assets/icon/folder.rgba"),
             Self::FolderOpen => include_bytes!("../../../../assets/icon/folder-open.rgba"),
             Self::Braces => include_bytes!("../../../../assets/icon/braces.rgba"),
+            Self::InfoCircle => include_bytes!("../../../../assets/icon/info-circle.rgba"),
         }
     }
 }

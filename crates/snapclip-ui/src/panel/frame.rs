@@ -463,6 +463,18 @@ pub struct Frame<'a> {
     /// (`.size-presets .chip { font-family: var(--num) }`, `:259`, with `.chip`'s `font-size: 11px`,
     /// `:192`).
     pub preset_label: Option<&'a IDWriteTextFormat>,
+    /// Whether the size row's over-resolution hint is painted (`.warn-hint`, `:621`–`:623`).
+    ///
+    /// The row reserves the line whether or not this is set — see `field::Row::content_height`, which
+    /// explains why a hint that comes and goes cannot move the rows below it in a window whose height
+    /// is their sum. This flag therefore decides only whether anything is drawn in the reserved line.
+    pub warn_hint: bool,
+    /// The five naming variables' current values, in `VARIABLE_LABELS` order, drawn right aligned on
+    /// the token menu's rows (`.var-item .val`, `:219`–`:221`).
+    ///
+    /// Supplied by the caller from the same values the save expands, so the menu cannot promise a
+    /// date the file name would not get. `None` draws the labels on their own.
+    pub var_values: Option<[&'a str; 5]>,
 }
 
 impl Frame<'_> {
@@ -703,6 +715,28 @@ impl Frame<'_> {
                         ..chip
                     },
                     &self.brushes.muted,
+                );
+            }
+        }
+
+        // The over-resolution hint (`:621`–`:623`), on the line the row reserved for it whether or
+        // not it shows. The icon is the design's info circle at the sentence's own size and in
+        // `--warning`, the token `.warn-hint` uses (`:254`); the sentence follows it after the
+        // design's four dip gap, in the same ten dip face the quality row's hint uses (`:262`).
+        if self.warn_hint {
+            if let Some(hint_format) = self.hint {
+                let icon = crate::panel::warn_hint_icon_rect(self.metrics, self.rects, self.scale);
+                Self::draw_glyph(
+                    painter,
+                    crate::panel::icons::Glyph::InfoCircle,
+                    icon,
+                    crate::panel::WARNING_RGBA,
+                )?;
+                painter.draw_text(
+                    crate::panel::WARN_HINT_TEXT,
+                    hint_format,
+                    crate::panel::warn_hint_text_rect(self.metrics, self.rects, self.scale),
+                    &self.brushes.warning_text,
                 );
             }
         }
@@ -1376,6 +1410,22 @@ impl Frame<'_> {
                 item.bottom,
             );
             painter.draw_text(label, label_format, text, &self.brushes.text);
+            // `.var-item .val { font-family: var(--num); font-size: 11px; color: var(--muted) }`
+            // (`:221`), right aligned against the row's own padding. The shared eleven dip numeric
+            // format is leading aligned — it is the size shortcuts' format — so the value's left
+            // edge is computed from its measured width instead of changing that format's alignment,
+            // which would move the shortcuts' words.
+            if let (Some(values), Some(value_format)) = (self.var_values, self.preset_label) {
+                if let Some(value) = values.get(index) {
+                    let width = painter.measure_text_width(value, value_format)? as i32;
+                    painter.draw_text(
+                        value,
+                        value_format,
+                        Rect::new(text.right - width, item.top, text.right, item.bottom),
+                        &self.brushes.muted,
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -1987,6 +2037,15 @@ pub struct PaintInput<'a> {
     pub size_mode_widths: Option<[i32; 2]>,
     /// The size limit and the estimate, or `None` when this painter shows neither.
     pub limit: Option<LimitView<'a>>,
+    /// Whether the size row's over-resolution hint belongs on screen: either side of the output is
+    /// larger than the capture (`field::warn_hint_shown`).
+    ///
+    /// Kept a flag rather than the two sizes, because the window already answers it from the same
+    /// output size the save will use, and a painter that recomputed it from the fields would be a
+    /// second reader of the same question.
+    pub warn_hint: bool,
+    /// The five naming variables' current values, in `VARIABLE_LABELS` order (`:196`).
+    pub variable_values: Option<[&'a str; 5]>,
 }
 
 impl<'a> PaintInput<'a> {
@@ -2012,6 +2071,8 @@ impl<'a> PaintInput<'a> {
             size_mode: crate::panel::SIZE_MODE_CHOSEN,
             size_mode_widths: None,
             limit: None,
+            warn_hint: false,
+            variable_values: None,
         }
     }
 }
@@ -2109,6 +2170,8 @@ pub fn paint_to_dc_with_preview(
         size_mode_widths: input.size_mode_widths,
         hint: Some(&hint),
         preset_label: Some(&preset_label),
+        warn_hint: input.warn_hint,
+        var_values: input.variable_values,
         fields: input.fields,
         preview: preview.as_ref().map(|(b, w, h)| (b, *w, *h)),
         quality: input.quality,
@@ -2553,8 +2616,132 @@ mod tests {
         }
     }
 
-    /// The fill row is drawn for JPG and for nothing else, and each swatch is its own colour at its
-    /// own place.
+    /// The size row's over-resolution hint: the info circle and the sentence, both in `--warning`.
+    ///
+    /// At double scale for the same reason the status line is: ten dip text at unit scale
+    /// antialiases below its own colour, so an assertion on the colour would have to accept a blend
+    /// and would stop testing the colour.
+    /// The token menu's right column: the variable's current value, in `--muted` (`:221`).
+    ///
+    /// The band sampled is the right end of the first row, where the value is right aligned; the
+    /// label sits at the left of the same row in `--text`, so a value drawn in the label's colour
+    /// is a change this notices.
+    #[test]
+    fn the_token_menu_prints_each_variables_current_value() {
+        let canvas = Canvas::new_at(1840, 1128, 192.0);
+        canvas.render_var_values(true);
+        let px = canvas.pixels();
+        let item = crate::panel::var_item_rect(&DEMO, &DEMO.rects(2.0), 2.0, 0);
+        let pad = (crate::panel::VAR_MENU_PAD_DIP as f32 * 2.0).round() as i32;
+        let band = Rect {
+            left: item.right - pad - 120,
+            top: item.top,
+            right: item.right - pad,
+            bottom: item.bottom,
+        };
+        let muted = fill_rgb(152, 157, 161);
+        // Stated as a ceiling rather than as "some pixel is near --muted": the closest-pixel search
+        // passes on an antialiased edge of text drawn in any colour, which is how this assertion
+        // missed a value drawn in the label's colour. Nothing in the value's band may be brighter
+        // than --muted allows, and the band must carry ink at all.
+        let muted = fill_rgb(152, 157, 161);
+        let mut inked = false;
+        for y in band.top..band.bottom {
+            for x in band.left..band.right {
+                let seen = px.pixel(x, y);
+                assert!(
+                    seen.r <= muted.r + 14 && seen.g <= muted.g + 14 && seen.b <= muted.b + 14,
+                    "no pixel of the value may be brighter than --muted (`:221`): at ({x}, {y}) it is {seen:?}"
+                );
+                if seen.r > 60 {
+                    inked = true;
+                }
+            }
+        }
+        assert!(inked, "the value's band must carry ink, not just the menu's surface");
+    }
+
+    /// Without values the same band is the menu's own surface, which is what makes the assertion
+    /// above an answer rather than a decoration.
+    #[test]
+    fn a_token_menu_without_values_leaves_its_right_side_clean() {
+        let canvas = Canvas::new_at(1840, 1128, 192.0);
+        canvas.render_var_values(false);
+        let px = canvas.pixels();
+        let item = crate::panel::var_item_rect(&DEMO, &DEMO.rects(2.0), 2.0, 0);
+        let pad = (crate::panel::VAR_MENU_PAD_DIP as f32 * 2.0).round() as i32;
+        let band = Rect {
+            left: item.right - pad - 120,
+            top: item.top,
+            right: item.right - pad,
+            bottom: item.bottom,
+        };
+        let surface = fill_rgb(23, 23, 28);
+        for y in band.top..band.bottom {
+            for x in band.left..band.right {
+                assert!(
+                    close(px.pixel(x, y), surface, 6),
+                    "the value band is ink at ({x}, {y}) with no values to show: {:?}",
+                    px.pixel(x, y)
+                );
+            }
+        }
+    }
+    #[test]
+    fn the_over_resolution_hint_is_drawn_in_the_warning_colour() {
+        let canvas = Canvas::new_at(1840, 1128, 192.0);
+        canvas.render_warn_hint(true);
+        let px = canvas.pixels();
+        let rects = DEMO.rects(2.0);
+        let warning = fill_rgb(240, 179, 90);
+        for (what, rect) in [
+            (
+                "the sentence",
+                crate::panel::warn_hint_text_rect(&DEMO, &rects, 2.0),
+            ),
+            (
+                "the icon",
+                crate::panel::warn_hint_icon_rect(&DEMO, &rects, 2.0),
+            ),
+        ] {
+            let (got, x, y) = strongest(&px, rect, warning);
+            assert!(
+                close(got, warning, 12),
+                "{what} must be drawn in --warning (`:254`): the closest pixel in its own box is \
+                 {got:?} at ({x}, {y})"
+            );
+        }
+    }
+
+    /// A size that is no larger than the capture leaves the hint's reserved line blank.
+    ///
+    /// The line is reserved either way, so this is what makes the assertion above mean something:
+    /// if the row always drew the hint, the colour test would pass while the sentence warned about
+    /// nothing.
+    #[test]
+    fn a_row_with_nothing_to_warn_about_leaves_the_hint_line_clean() {
+        let canvas = Canvas::new_at(1840, 1128, 192.0);
+        canvas.render_warn_hint(false);
+        let px = canvas.pixels();
+        let rect = crate::panel::warn_hint_rect(&DEMO, &DEMO.rects(2.0), 2.0);
+let surface = fill_rgb(23, 23, 28);
+        let mut ink = Vec::new();
+        for y in rect.top..rect.bottom {
+            for x in rect.left..rect.right {
+                if !close(px.pixel(x, y), surface, 6) {
+                    ink.push((x, y, px.pixel(x, y)));
+                }
+            }
+        }
+        assert!(
+            ink.is_empty(),
+            "the hint's line {rect:?} has {} ink pixels, first five: {:?}",
+            ink.len(),
+            &ink[..ink.len().min(5)]
+        );
+    }
+
+    /// The fill row is drawn for JPG and for nothing else, and each swatch is its own colour at its    /// own place.
     ///
     /// The absolute colours are the point: a rule that only asked "is there ink in these boxes"
     /// passes for three identical swatches, for one hue wheel everywhere, and for a row drawn in a
@@ -3379,6 +3566,44 @@ mod tests {
                 },
             )
             .expect("the frame paints with a preview");
+        }
+
+        /// Render the token menu open, with or without each variable's current value.
+        fn render_var_values(&self, with_values: bool) {
+            let factory = factory().expect("a Direct2D factory");
+            let dwrite = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED) }
+                .expect("a DirectWrite factory");
+            let values = ["2026-10-24", "1432", "7", "1440x900", "SnapClip"];
+            paint_to_dc_with_preview(
+                &factory,
+                &dwrite,
+                self.dc,
+                Rect::new(0, 0, self.width, self.height),
+                &PaintInput {
+                    var_open: true,
+                    variable_values: if with_values { Some(values) } else { None },
+                    ..PaintInput::idle(self.dpi)
+                },
+            )
+            .expect("the frame paints the token menu");
+        }
+        /// Render with the size row's over-resolution hint shown or not, which is the only thing
+        /// that decides whether the line the row reserves carries anything. Everything else is idle.
+        fn render_warn_hint(&self, shown: bool) {
+            let factory = factory().expect("a Direct2D factory");
+            let dwrite = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED) }
+                .expect("a DirectWrite factory");
+            paint_to_dc_with_preview(
+                &factory,
+                &dwrite,
+                self.dc,
+                Rect::new(0, 0, self.width, self.height),
+                &PaintInput {
+                    warn_hint: shown,
+                    ..PaintInput::idle(self.dpi)
+                },
+            )
+            .expect("the frame paints with the hint shown or not");
         }
 
         /// Render with one of the quality options chosen, which is the state a click leaves behind.

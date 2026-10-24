@@ -1303,6 +1303,9 @@ fn control_text(hwnd: windows_sys::Win32::Foundation::HWND) -> String {
 /// The local date and time in the forms the naming template asks for: `YYYY-MM-DD` and `HHmm`
 /// (`docs/design/…规格.md` names both). Local rather than UTC, because a file named for yesterday
 /// is a surprise; no separator in the time because a colon is not a legal file name character.
+/// The application's own name, which [软件名] expands to (:198) and the token menu shows.
+const APP_NAME: &str = "SnapClip";
+
 fn local_date_and_time() -> (String, String) {
     let mut now: windows_sys::Win32::Foundation::SYSTEMTIME = unsafe { std::mem::zeroed() };
     unsafe { windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut now) };
@@ -1357,7 +1360,7 @@ fn panel_values<'a>(
         // Supplied by the shell's shared counter rather than assumed here: the number a save uses
         // is the one the previous successful save left behind, and the panel has no copy of it.
         sequence,
-        app: "SnapClip",
+        app: APP_NAME,
     }
 }
 
@@ -2514,6 +2517,34 @@ extern "system" fn window_proc(
                         format_of_index(s.format) == SaveFormat::Png,
                     );
                     let estimate_text = s.estimate.map(crate::save::estimate::format_bytes);
+                    // The over-resolution hint and the token menu's values, read here for the same
+                    // reason the save reads them there: the width and height the sentence warns
+                    // about are the size fields' own answer, and a menu promising a date the file
+                    // name would not get is worse than no menu.
+                    let (date_text, time_text) = local_date_and_time();
+                    let source_size = s
+                        .preview
+                        .as_ref()
+                        .map(|(_, width, height)| super::scale::Size::new(*width, *height))
+                        .unwrap_or(super::scale::Size::new(0, 0));
+                    let output_size = super::scale::output_size(
+                        super::scale::SizeMode::from_index(s.size_mode),
+                        &control_text(s.control(snapclip_ui::panel::FieldId::SizeWidth)),
+                        &control_text(s.control(snapclip_ui::panel::FieldId::SizeHeight)),
+                        source_size,
+                    );
+                    let warn_hint = snapclip_ui::panel::warn_hint_shown(
+                        (output_size.width, output_size.height),
+                        (source_size.width, source_size.height),
+                    );
+                    let sequence_text = s
+                        .remembered
+                        .lock()
+                        .map(|remembered| remembered.sequence.next())
+                        .unwrap_or(1)
+                        .to_string();
+                    let resolution_text =
+                        format!("{}x{}", output_size.width, output_size.height);
                     // The surface fill is skipped when DWM is drawing the material, so a backdrop
                     // keeps showing through while the frame's own lines still land on top of it.
                     painted = renderer
@@ -2541,6 +2572,14 @@ extern "system" fn window_proc(
                                 size_presets: Some(s.size_presets),
                                 size_mode: s.size_mode,
                                 size_mode_widths: Some(s.size_mode_widths),
+                                warn_hint,
+                                variable_values: Some([
+                                    date_text.as_str(),
+                                    time_text.as_str(),
+                                    sequence_text.as_str(),
+                                    resolution_text.as_str(),
+                                    APP_NAME,
+                                ]),
                                 // The switch is always drawn — turning it on is the whole point of
                                 // it — while the note and the escape hatch exist only when a
                                 // measurement has something to say (`:234`, `:235`).

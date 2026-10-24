@@ -90,6 +90,8 @@ pub use field::{
     SIZE_PRESET_GAP_DIP, SIZE_PRESET_INDENT_DIP, SIZE_PRESET_MARGIN_DIP, SIZE_PRESET_PCT,
     SIZE_PRESET_WORDS, size_preset_contains, size_preset_rect, size_preset_size,
     size_preset_width, size_presets_rect,
+    WARN_HINT_DIP, WARN_HINT_TEXT, warn_hint_icon_rect, warn_hint_rect, warn_hint_shown,
+    warn_hint_text_rect,
     size_mode_button_rect, size_mode_button_width, size_mode_contains, size_mode_rect,
     size_mode_reset_icon_rect, size_mode_reset_rect, size_reset_contains,
     rect_contains, rects_intersect, path_change_contains, path_open_contains, path_chip_at,

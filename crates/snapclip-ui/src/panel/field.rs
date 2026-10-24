@@ -665,15 +665,24 @@ impl Row {
             // `.chip { height: 24px }`, `:192`), with `.form-row { gap: 6px }` (`:164`) between them.
             // So it is 62 and every row below it moves down by thirty.
             Row::Path => metrics.field_height + metrics.row_gap + AFTER_CHIP_HEIGHT_DIP,
-            // The size row is the second row whose content is two things: `.values` (`:594`, 32 dip
-            // like a text field) and the four shortcuts under it (`.size-presets`, `:614`, 24 dip
-            // with `margin-top: 2px`), separated by the row's own `gap: 6px` (`:164`). So it is 64,
-            // and every row below it moves down by thirty two.
+            // The size row is the third row whose content is stacked: `.values` (`:594`, 32 dip like
+            // a text field), the four shortcuts under it (`.size-presets`, `:614`, 24 dip with
+            // `margin-top: 2px`) and the over-resolution hint under those (`.warn-hint`, `:621`,
+            // 12 dip — its icon is the taller child, `:622`). Each pair is separated by the row's
+            // own `gap: 6px` (`:164`). So it is 82, and every row below it moves down by fifty.
+            //
+            // The hint's line is reserved whether or not it shows. The mockup puts it in the flow, so
+            // the form grows and everything below shifts when it appears; a window whose height is
+            // the sum of these rows cannot do that without resizing itself, and a panel that changes
+            // height while you type a size is worse than a line that is sometimes blank. This is the
+            // same trade the quality row's note and fill row made.
             Row::Size => {
                 metrics.field_height
                     + metrics.row_gap
                     + SIZE_PRESET_MARGIN_DIP
                     + AFTER_CHIP_HEIGHT_DIP
+                    + metrics.row_gap
+                    + WARN_HINT_DIP
             }
             Row::Name => metrics.field_height,
             // The quality row's own line is `--row` tall (`:637`); the limit's note and the fill row
@@ -882,7 +891,11 @@ pub fn size_cell_rect(
         left,
         top: row.top,
         right,
-        bottom: row.bottom,
+        // The wrapper is the cell itself, `height: 32px` (`:167`), not the row's whole content box:
+        // a row can stack more than one line (the shortcuts, the over-resolution hint), and a wrapper
+        // that grew with them would paint the cell's `--fill` background under both. That is what it
+        // did once the shortcuts arrived, and the hint's line is where it showed.
+        bottom: row.top + px(metrics.field_height),
     }
 }
 
@@ -1083,6 +1096,77 @@ pub fn size_preset_size(pct: u32, original: (u32, u32)) -> (u32, u32) {
         scaled.max(1) as u32
     };
     (scale(original.0), scale(original.1))
+}
+
+/// `.warn-hint` (`:254`, `:621`): the line under the size shortcuts that says enlarging will blur.
+///
+/// Its height is the sentence's own ten dip (`:254`), not the icon's twelve: the row has to end
+/// inside the body, and the four dip the icon adds would push the form two dip past it. The icon
+/// overhangs its line by a dip at each end, which nothing clips because the line bounds nothing.
+/// The row reserves the line whether or not it is shown, which is the deliberate difference from
+/// the mockup: a fixed-height window cannot grow a row, so the line cannot come and go.
+pub const WARN_HINT_DIP: i32 = 10;
+
+/// The hint's icon, `.warn-hint svg { width: 12; height: 12 }` (`:622`) — the info circle.
+pub const WARN_HINT_ICON_DIP: i32 = 12;
+
+/// `.warn-hint { gap: 4px }` (`:254`), between the icon and the sentence.
+pub const WARN_HINT_GAP_DIP: i32 = 4;
+
+/// `.warn-hint { padding-left: 28px }` (`:254`), the same indentation the shortcuts above it use
+/// (`.size-presets { padding-left: 28px }`, `:258`) so the two lines share a left edge.
+pub const WARN_HINT_INDENT_DIP: i32 = 28;
+
+/// The sentence, one character for one character from `:623`.
+pub const WARN_HINT_TEXT: &str = "超过原始分辨率，放大将损失清晰度";
+
+/// Whether the size row's hint belongs on screen: `isWarnW || isWarnH` (`:1069`), which is "either
+/// side of the output is larger than the picture it came from".
+///
+/// A pure function because the painter and, later, any state that wants to reserve space for it have
+/// to agree about it without a window in the way.
+pub fn warn_hint_shown(output: (u32, u32), source: (u32, u32)) -> bool {
+    output.0 > source.0 || output.1 > source.1
+}
+
+/// The hint's line: under the shortcuts (`:621`, after `.size-presets` at `:614`), one row gap
+/// between them (`:164`), indented like the shortcuts, and as wide as the row.
+pub fn warn_hint_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let presets = size_presets_rect(metrics, rects, scale);
+    let row = field_rect(metrics, rects, scale, Row::Size);
+    let top = presets.bottom + px(metrics.row_gap);
+    Rect {
+        left: row.left + px(WARN_HINT_INDENT_DIP),
+        top,
+        right: row.right,
+        bottom: top + px(WARN_HINT_DIP),
+    }
+}
+
+/// The hint's icon, at the left of its line and vertically centred in it.
+pub fn warn_hint_icon_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let line = warn_hint_rect(metrics, rects, scale);
+    let side = px(WARN_HINT_ICON_DIP);
+    let top = line.top + ((line.bottom - line.top) - side) / 2;
+    Rect {
+        left: line.left,
+        top,
+        right: line.left + side,
+        bottom: top + side,
+    }
+}
+
+/// The hint's sentence, after the icon and its gap.
+pub fn warn_hint_text_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let line = warn_hint_rect(metrics, rects, scale);
+    let icon = warn_hint_icon_rect(metrics, rects, scale);
+    Rect {
+        left: icon.right + px(WARN_HINT_GAP_DIP),
+        ..line
+    }
 }
 
 /// The button inside the name field that opens the naming-variable menu: `.name-var { right: 4px;
@@ -1419,6 +1503,9 @@ pub fn form_drawn_strings() -> Vec<&'static str> {
     // The estimate row's two states (`:243`).
     all.push(ENCODE_STATE_BUSY);
     all.push(ENCODE_STATE_DONE);
+    // The size row's over-resolution hint (`:623`), drawn only when the output is larger than the
+    // capture but reserved either way.
+    all.push(WARN_HINT_TEXT);
     // The four size shortcuts are drawn in the numeric face (`.size-presets .chip`, `:259`), so they
     // are not in this list: `number_characters` carries the digits and the percent sign they use,
     // and a test below holds the two lists together.
@@ -2657,6 +2744,63 @@ mod tests {
 
     const SURFACE: [u8; 4] = [23, 23, 28, 235];
 
+    /// The hint's line is the design's own figures: under the shortcuts (`:621` after `:614`), one
+    /// row gap below them (`:164`), indented 28 like the shortcuts (`:254`), and as tall as its
+    /// icon (`:622`).
+    ///
+    /// Written as absolute numbers rather than by comparing the rectangles with each other, because
+    /// every one of them derives from the same constants and would agree with a wrong one as
+    /// readily as with a right one.
+    /// The form column has to fit in the band the panel reserves for it: the preview's height is
+    /// the body's height, and a row that grew past it would be drawn under the footer.
+    ///
+    /// Stated in dip at unit scale, so the numbers are the design's own rather than a scaled pair.
+    #[test]
+    fn the_form_fits_inside_the_preview_band() {
+        let metrics = metrics();
+        let rects = metrics.rects(1.0);
+        let bottom = field_rect(&metrics, &rects, 1.0, Row::Estimate).bottom;
+        let band = metrics.header_height + metrics.body_pad_top + metrics.preview_height;
+        assert!(
+            bottom <= band,
+            "the form ends at {bottom} but the band ends at {band}: {} dip over",
+            bottom - band
+        );
+    }
+    #[test]
+    fn the_hint_line_sits_under_the_shortcuts_at_the_designs_numbers() {
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            let demo = crate::panel::DEMO;
+            let rects = demo.rects(scale);
+            let presets = size_presets_rect(&demo, &rects, scale);
+            let row = field_rect(&demo, &rects, scale, Row::Size);
+            let hint = warn_hint_rect(&demo, &rects, scale);
+            let px = |dip: i32| (dip as f32 * scale).round() as i32;
+            assert_eq!(hint.top, presets.bottom + px(6), "one row gap under the shortcuts");
+            assert_eq!(hint.left, row.left + px(28), "indented like the shortcuts (:254)");
+            assert_eq!(hint.height(), px(10), "as tall as the sentence its own size (:254)");
+            assert_eq!(hint.right, row.right, "the line runs to the column's edge");
+            let icon = warn_hint_icon_rect(&demo, &rects, scale);
+            assert_eq!((icon.width(), icon.height()), (px(12), px(12)), "the icon is 12 square");
+            assert_eq!(icon.left, hint.left, "the icon starts the line");
+            let text = warn_hint_text_rect(&demo, &rects, scale);
+            assert_eq!(text.left, icon.right + px(4), "the sentence follows a four dip gap");
+        }
+    }
+
+    /// The hint appears when either side of the output is larger than the capture (`:1069`).
+    ///
+    /// Its line is reserved either way, so this predicate is the only thing that decides whether
+    /// anything is drawn in it — a function rather than a comparison in the painter, so the same
+    /// answer reaches the window and the frame.
+    #[test]
+    fn the_hint_appears_only_when_a_side_grows() {
+        assert!(!warn_hint_shown((10, 10), (10, 10)), "the capture itself is not a warning");
+        assert!(!warn_hint_shown((8, 6), (10, 10)), "shrinking is not a warning either");
+        assert!(warn_hint_shown((11, 10), (10, 10)), "wider than the capture warns");
+        assert!(warn_hint_shown((10, 11), (10, 10)), "taller than the capture warns");
+    }
+
     /// `--warning` (`:23`) is one value for the border (`:334`), the status line (`:327`) and the
     /// conflict link (`:328`). The border used to carry `255,191,0`, a yellow the mockup does not
     /// contain, so the same message appeared in two colours depending on where you read it.
@@ -3816,10 +3960,11 @@ mod tests {
 
     /// Under the two size cells sits a line of four shortcuts (`.size-presets`, `:614`).
     ///
-    /// The row's content is therefore 32 + 6 + 2 + 24 — `.values` (`:594`) is a text field's 32, the
-    /// form's gap is 6 (`:164`), the line has `margin-top: 2px` (`:258`) and a chip is 24 (`:192`) —
-    /// which is why the rows below moved down by thirty two and why this row could not keep the plain
-    /// field height.
+    /// The row's content is therefore 32 + 6 + 2 + 24 + 6 + 12 — `.values` (`:594`) is a text field's
+    /// 32, the form's gap is 6 (`:164`), the line has `margin-top: 2px` (`:258`), a chip is 24
+    /// (`:192`), and the over-resolution hint under it (`.warn-hint`, `:621`) is another form gap and
+    /// the 12 dip its icon measures (`:622`) — which is why the rows below moved down and why this row
+    /// could not keep the plain field height.
     #[test]
     fn the_size_row_is_its_cells_and_a_line_of_four_shortcuts() {
         for scale in [1.0f32, 1.25, 1.5, 2.0] {
@@ -3832,10 +3977,10 @@ mod tests {
 
             assert_eq!(
                 row.bottom - row.top,
-                round(32 + 6 + 2 + 24),
-                "the cells, the form gap, the line's own margin and a chip (:167, :164, :258, :192)"
+                round(32 + 6 + 2 + 24 + 6 + 10),
+                "the cells, the gap, the line's margin, a chip, and the hint's line (:167, :164, :258, :192, :621)"
             );
-            assert_eq!(row.bottom - row.top, round(64), "sixty four, stated once");
+            assert_eq!(row.bottom - row.top, round(80), "eighty, stated once");
             assert_eq!(
                 line.top,
                 row.top + round(32 + 6 + 2),
