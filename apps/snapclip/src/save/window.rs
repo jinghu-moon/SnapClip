@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use super::service;
-use super::{save_panel, ConflictPolicy, PanelValues};
+use super::{save_panel, ConflictPolicy, PanelValues, Sequence};
 
 // -------------------------------------------------------------------------------------------------
 // Two facts that were each learned by shipping a panel nobody could see
@@ -405,6 +405,12 @@ pub struct ShellOptions {
     /// plausible number there would be inventing the answer to a question the panel exists to
     /// answer.
     pub capture_size: Option<(u32, u32)>,
+    /// The save counter, shared by every panel this shell opens.
+    ///
+    /// It outlives a single panel on purpose: the spec remembers the number across saves, and a
+    /// panel is opened per capture. The handle is shared rather than copied so the panel that
+    /// writes a file is also the one that moves the counter, and no second copy can disagree.
+    pub sequence: std::sync::Arc<std::sync::Mutex<Sequence>>,
 }
 
 impl Default for ShellOptions {
@@ -414,6 +420,7 @@ impl Default for ShellOptions {
             height_dip: PANEL_HEIGHT_DIP,
             preview: None,
             capture_size: None,
+            sequence: std::sync::Arc::new(std::sync::Mutex::new(Sequence::FIRST)),
         }
     }
 }
@@ -676,6 +683,9 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
             segment: snapclip_ui::panel::quality_segment_state(&metrics, &rects, scale, 0),
             segment_scale: scale,
             footer_widths,
+            // Handed over rather than created here: the counter is shared by every panel of this
+            // shell, and a panel that made its own would start at one again.
+            sequence: options.sequence.clone(),
         }));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
 
@@ -807,6 +817,10 @@ struct WindowState {
     /// the paint would leave the hit test guessing, and guessing is how a click lands on a button
     /// that is not there.
     footer_widths: [i32; 3],
+    /// The save counter this panel shares with every other panel of the same shell. The panel
+    /// reads it when it saves and moves it only after a save succeeds, so a cancelled or failed
+    /// attempt leaves the number where it was.
+    sequence: std::sync::Arc<std::sync::Mutex<Sequence>>,
 }
 
 /// The footer buttons' widths for this window, or zeros if Direct2D never started.
@@ -870,6 +884,7 @@ fn panel_values<'a>(
     name: &'a str,
     date: &'a str,
     time: &'a str,
+    sequence: u32,
 ) -> PanelValues<'a> {
     PanelValues {
         directory,
@@ -880,9 +895,9 @@ fn panel_values<'a>(
         conflict: ConflictPolicy::AutoRename,
         date,
         time,
-        // The spec advances the sequence after a successful save and remembers it; there is no
-        // stored sequence yet, so the next one is the first. Recorded in `docs/41`.
-        sequence: 1,
+        // Supplied by the shell's shared counter rather than assumed here: the number a save uses
+        // is the one the previous successful save left behind, and the panel has no copy of it.
+        sequence,
         app: "SnapClip",
     }
 }
@@ -903,8 +918,21 @@ fn save_from_panel(hwnd: windows_sys::Win32::Foundation::HWND) {
     let name = control_text(s.control(snapclip_ui::panel::FieldId::Name));
     let directory = control_text(s.control(snapclip_ui::panel::FieldId::Path));
     let (date, time) = local_date_and_time();
-    let values = panel_values(&directory, &name, &date, &time);
-    match save_panel(&values, *width, *height, bgra) {
+    // The number this attempt would use. Taken before the save because the name is expanded with
+    // it, and moved afterwards only if the save succeeded and the name asked for it.
+    let sequence = *s
+        .sequence
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let values = panel_values(&directory, &name, &date, &time, sequence.next());
+    let attempt = save_panel(&values, *width, *height, bgra);
+    // One write of the counter, after the attempt: `after` is the rule, and it lives in one place
+    // so the cancel and failure cases cannot drift from it.
+    let moved = sequence.after(&attempt, &name);
+    if let Ok(mut guard) = s.sequence.lock() {
+        *guard = moved;
+    }
+    match attempt {
         Ok(outcome) => eprintln!(
             "[save-panel] saved {} bytes to {} as {}",
             outcome.bytes,
@@ -1546,11 +1574,12 @@ mod tests {
     /// writes somewhere else, which is why the pairing is asserted rather than noticed later.
     #[test]
     fn the_save_takes_the_directory_and_the_name_in_that_order() {
-        let values = panel_values(r"C:\shots", "SnapClip_[日期]", "2026-10-24", "0115");
+        let values = panel_values(r"C:\shots", "SnapClip_[日期]", "2026-10-24", "0115", 7);
         assert_eq!(values.directory, r"C:\shots");
         assert_eq!(values.name, "SnapClip_[日期]");
         assert_eq!(values.date, "2026-10-24");
         assert_eq!(values.time, "0115");
+        assert_eq!(values.sequence, 7, "the number comes from the shell's counter");
         assert_eq!(values.app, "SnapClip");
     }
 
@@ -1628,6 +1657,7 @@ mod tests {
             ),
             segment_scale: 1.0,
             footer_widths: [40, 52, 64],
+            sequence: std::sync::Arc::new(std::sync::Mutex::new(Sequence::FIRST)),
         };
 
         // Every field has its own slot: no two fields share an index, which is what would let one
@@ -1686,6 +1716,7 @@ mod tests {
             ),
             segment_scale: 1.0,
             footer_widths: [40, 52, 64],
+            sequence: std::sync::Arc::new(std::sync::Mutex::new(Sequence::FIRST)),
         };
 
         let centre = |index: usize| {
@@ -1748,6 +1779,7 @@ mod tests {
             ),
             segment_scale: 1.0,
             footer_widths: [40, 52, 64],
+            sequence: std::sync::Arc::new(std::sync::Mutex::new(Sequence::FIRST)),
         };
 
         let metrics = snapclip_ui::panel::DEMO;

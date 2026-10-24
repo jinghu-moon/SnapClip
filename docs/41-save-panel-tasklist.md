@@ -669,7 +669,8 @@ cargo run -p codec-bench --release -- --assert
 | ~~A8~~ | ~~**数值字段的等宽字体未用** ✗~~ ✓ **已用**：`assets/font/FiraCode-Regular.ttf`（283 KB）取子集到 **3.3 KB**（`subfont/build_number_font.py` ✓，16 个字符 ✓）⇒ 内嵌在 `snapclip-ui`（`panel/fonts.rs` ✓）⇒ 尺寸格的 `EDIT`（`WM_SETFONT` + `ES_RIGHT` ✓）与 `px` 单位（`number_format` ✓）都用它；门禁 `the_embedded_number_subset_covers_the_numbers_the_panel_shows` ✓ | — | 已完成 ✓ |
 | A9 | **`.link-hub` 之外的两个 ghost 按钮未画** ✗（路径行的 `更改` ✓ 与文件夹图标 ✓，demo `:545`/`:546` ✓） | 宽度需要测量文本 ✓（同 B1 ✓） | 交互批 ✓ |
 | A10 | **格式下拉未画** ✗（demo `:561` ✓，`.PNG`/`.JPG`/`.WebP` ✓）⇒ 保存**固定用 PNG** ✗ | `save/window.rs` 的 `panel_values` ✓ | 格式批 ✓ |
-| A11 | **`[序号]` 固定为 1** ✗ —— 规格 `:201` 要求"每次保存成功后 +1 并记住" ✓，而没有存序号的地方 ✗ | `panel_values` 的 `sequence: 1` ✓ | 序号批 ✓ |
+| ~~A11~~ | ~~**`[序号]` 固定为 1** ✗~~ ✓ **已做**：`Sequence`（`save/assemble.rs` ✓）由 shell 的 `Arc<Mutex<Sequence>>` **跨面板共享** ✓（面板每次捕获一个 ✓），只在**保存成功且名字含 `[序号]`** 时 +1 ✓（见文末「序号」一节 ✓） | — | 已完成 ✓ |
+| ~~A11b~~ | ~~**名字模板不跨面板记住** ✗~~ ✓ 规格 `:201` 的另一半（"模板与序号随输入实时记住" ✗）⇒ **模板**那半是新缺口 ✓：现在每次开面板都是默认模板 ✓ | 需要 `EDIT` 的 `EN_CHANGE` ✓ 把文本写回共享状态 ✓ | 偏好批 ✓ |
 | A12 | **保存失败只记日志** ✗ —— `SaveError::Validation{copy}` 是**键** ✓，怎么呈现属 UI 设计 ✓ | `save_from_panel` 的 `Err` 分支 ✓ | 错误提示批 ✓ |
 | A13 | **悬停态未做** ✗（`.close:hover` ✓ `:97` ✓、`.btn:hover` ✓） | 需要鼠标进入/离开消息 ✓ | 交互批 ✓ |
 
@@ -855,3 +856,33 @@ cargo run -p codec-bench --release -- --assert
 - 互换 `panel_values` 的**两个实参** ✗ ⇒ `the_save_takes_the_directory_and_the_name_in_that_order` **FAILED** ✓（`left: "SnapClip_[日期]" / right: "C:\shots"` ✓）。
 
 **本批修的三处编译错** ✗（上一批死在中间态 ✓）：`paint_with_preview` 少第 8 个实参 ✓；`GetDpiForWindow` 缺 `unsafe` ✓（它在自由函数里，不在 WndProc 的 unsafe 块内 ✓）；三处**测试**用的 `WindowState` 字面量缺 `footer_widths` ✓。
+
+---
+
+#### 序号（A11 ✓ 已完成）
+
+**规格** ✓（`:196` ✓ `:201` ✓）：`[序号]` 是"下一个序号" ✓；**模板含 `[序号]` 时，每次保存成功后 +1 并记住** ✓；撤销保存时回退 ✓。
+
+**形状** ✓：`Sequence`（`apps/snapclip/src/save/assemble.rs` ✓）是一个**只有一个数**的类型 ✓，规则写成**一个纯函数** ✓：
+
+```rust
+pub fn after<T>(self, result: &Result<T, SaveError>, template: &str) -> Self {
+    match result {
+        Ok(_) if template::uses_sequence(template) => Self(self.0.saturating_add(1)),
+        _ => self,
+    }
+}
+```
+
+⇒ 三条规则压在**一个 match** 里 ✓：成功才动 ✓、名字要了才动 ✓、取消与失败**都不动** ✓；"撤销保存时回退"因此**不需要 undo 步骤** ✓ —— 计数器**根本没动** ✓。
+
+**谁持有它** ✓：`lib.rs` 在装 `save_opener` 时建**一个** `Arc<Mutex<Sequence>>` ✓ ⇒ 每次开面板把它 clone 进 `ShellOptions.sequence` ✓ ⇒ `WindowState` 存着 ✓ ⇒ 保存时读 ✓、保存后写回 ✓。面板**自己不留副本** ✗（一份数只有一个写者 ✓，与"控件表只有一个写者"同一原则 ✓）。
+
+**证据** ✓（`app` **224/0/9** ✓，+3 ✓）：
+`a_successful_save_advances_the_sequence_when_the_name_asks_for_it` ✓、`a_template_without_the_sequence_does_not_consume_a_number` ✓、`neither_cancelling_nor_failing_uses_up_a_number` ✓、`the_save_takes_the_directory_and_the_name_in_that_order` ✓（现在也断言序号从外面进来 ✓）。
+
+**两条变异都真红** ✓（都先确认**替换命中 1 处** ✓，还原**逐字节一致** ✓）：
+- 让失败也推进 ✗ ⇒ `neither_cancelling_nor_failing_uses_up_a_number` **FAILED** ✓（`a cancelled save wrote no file: left: 3 right: 2` ✓）；
+- 去掉"名字要了才推进"这个条件 ✗ ⇒ `a_template_without_the_sequence_does_not_consume_a_number` **FAILED** ✓（`the name never asked for a number: left: 2 right: 1` ✓）。
+
+**仍缺的一半** ✗：规格同一句里的"**模板也要记住**" ✗ —— 现在每次开面板都是默认模板 ✓ ⇒ 新缺口 **A11b** ✓，需要 `EDIT` 的 `EN_CHANGE` 把文本写回共享状态 ✓。

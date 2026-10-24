@@ -45,6 +45,34 @@ pub struct PanelValues<'a> {
     pub app: &'a str,
 }
 
+/// The number the next save will use, and the rule that moves it.
+///
+/// The spec advances the counter only after a save succeeds, and only when the name actually asks
+/// for it: a template without `[序号]` has no reason to consume a number. Cancelling and failing
+/// leave it where it was, which is what makes the spec's "撤销保存时回退" true without an explicit
+/// undo step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sequence(u32);
+
+impl Sequence {
+    /// The spec's "下一个序号" starts at one; nothing else in the project supplies a number.
+    pub const FIRST: Self = Self(1);
+
+    /// The number a save starting now would use.
+    pub fn next(self) -> u32 {
+        self.0
+    }
+
+    /// What the counter becomes after one attempt. Only success, and only a name that asks for
+    /// the number, moves it.
+    pub fn after<T>(self, result: &Result<T, SaveError>, template: &str) -> Self {
+        match result {
+            Ok(_) if template::uses_sequence(template) => Self(self.0.saturating_add(1)),
+            _ => self,
+        }
+    }
+}
+
 /// The request one save will run with. Separate from [`save_panel`] so the name a save would
 /// use can be asserted without touching a disk.
 pub fn request_for(
@@ -289,5 +317,44 @@ mod tests {
         assert_eq!(out.len(), 4 * 4 * 4);
         assert!(!whole.read_rows(3, 2, &mut out), "rows 3..5 do not exist");
         assert!(!whole.read_rows(0, 5, &mut out), "five rows do not exist");
+    }
+
+    /// Success moves the number, and only when the name asks for it.
+    #[test]
+    fn a_successful_save_advances_the_sequence_when_the_name_asks_for_it() {
+        let first = Sequence::FIRST;
+        assert_eq!(first.next(), 1, "the spec's next sequence starts at one");
+
+        let second = first.after(&Ok::<(), SaveError>(()), "SnapClip_[序号]");
+        assert_eq!(second.next(), 2, "one save consumes one number");
+
+        let third = second.after(&Ok::<(), SaveError>(()), "SnapClip_[序号]");
+        assert_eq!(third.next(), 3, "and the next save the next one");
+    }
+
+    /// A template with no number in it has no reason to consume one.
+    #[test]
+    fn a_template_without_the_sequence_does_not_consume_a_number() {
+        let first = Sequence::FIRST;
+        let after = first.after(&Ok::<(), SaveError>(()), "SnapClip_[日期]");
+        assert_eq!(after.next(), 1, "the name never asked for a number");
+    }
+
+    /// Neither cancelling nor failing uses a number up, which is the spec's "撤销保存时回退"
+    /// without an explicit undo: the counter was never moved.
+    #[test]
+    fn neither_cancelling_nor_failing_uses_up_a_number() {
+        let second = Sequence::FIRST.after(&Ok::<(), SaveError>(()), "SnapClip_[序号]");
+        assert_eq!(second.next(), 2);
+
+        let cancelled = second.after(&Err::<(), SaveError>(SaveError::Cancelled), "SnapClip_[序号]");
+        assert_eq!(cancelled.next(), 2, "a cancelled save wrote no file");
+
+        let failed: Result<(), SaveError> = Err(SaveError::Validation {
+            copy: ValidationCopy::StemEmpty,
+            detail: None,
+        });
+        let after_failure = second.after(&failed, "SnapClip_[序号]");
+        assert_eq!(after_failure.next(), 2, "a failed save wrote no file either");
     }
 }

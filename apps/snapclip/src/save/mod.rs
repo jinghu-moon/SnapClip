@@ -18,7 +18,7 @@ pub mod template;
 // window and the lifecycle, and asks the modules above to do the work.
 pub mod window;
 
-pub use assemble::{PanelValues, request_for as request_for_panel, save_panel};
+pub use assemble::{PanelValues, Sequence, request_for as request_for_panel, save_panel};
 pub use caps::{CapabilityError, check as check_capability};
 pub use copy::{ConflictLink, Level, ValidationCopy};
 pub use service::{ConflictPolicy, SaveError, SaveOutcome, SaveRequest};
