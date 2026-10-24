@@ -187,6 +187,13 @@ pub const SURFACE_RGBA: [u8; 4] = [23, 23, 28, 235];
 /// the backdrop is applied.
 pub const BACKDROP_BLUR_DIP: f32 = 6.0;
 
+/// The size limit's default and floor, in kilobytes (`:647`, `:236`).
+///
+/// The floor is the design's: `下限 10`. A limit below what a format's own header costs could never
+/// be met, so a value under the floor is treated as the floor rather than as an impossible request.
+pub const DEFAULT_LIMIT_KB: u32 = 500;
+pub const MIN_LIMIT_KB: u32 = 10;
+
 // -------------------------------------------------------------------------------------------------
 // D12: what happens to the capture after the panel is cancelled
 // -------------------------------------------------------------------------------------------------
@@ -688,6 +695,9 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
         // land on the chip the paint drew, and each chip is as wide as its own word.
         let size_presets = measure_size_presets(hwnd, renderer.as_ref());
     let size_mode_widths = measure_size_mode(hwnd, renderer.as_ref());
+        // The size limit's four words, measured here for the same reason: the switch's right edge is
+        // where the label line ends, so its click target is as wide as `限制体积`.
+        let limit_words = measure_limit_words(hwnd, renderer.as_ref());
         // The child's background: the field's own fill, resolved from `--fill` over the surface.
         // A native `EDIT` cannot be translucent, so the composite is computed once here.
         let fill = snapclip_ui::panel::field_colours(
@@ -727,6 +737,13 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
             size_presets,
         size_mode: snapclip_ui::panel::SIZE_MODE_CHOSEN,
         size_mode_widths,
+            // The limit starts switched off, with no measurement behind it: the switch is the only
+            // thing that asks for one, and a number measured for a limit nobody asked about would be
+            // work the panel does on every open for nothing.
+            limit_on: false,
+            limit_words,
+            estimate: None,
+            over_limit: false,
             copy: options
                 .copy
                 .take()
@@ -972,6 +989,21 @@ struct WindowState {
     /// The two mode buttons' widths, measured once beside the shortcuts' for the same reason: the
     /// click handler tests the rectangles the paint drew.
     size_mode_widths: [i32; 2],
+    /// Whether the size limit is switched on (`:232`). While it is, the quality line shows the
+    /// `不超过 [ 500 ] KB` group instead of the tier segment, and a save is required to fit — one
+    /// flag, asked by the painter, the click handler and the save.
+    limit_on: bool,
+    /// The limit's four words, measured once beside the other words so the switch that is drawn is
+    /// the switch that is clicked.
+    limit_words: snapclip_ui::panel::LimitWidths,
+    /// What this panel would write, as the encoder measured it (`:244`).
+    ///
+    /// `None` before the first measurement: an estimate that has not been made is not zero bytes,
+    /// and a row that said `0.00 KB` would be inventing a number.
+    estimate: Option<u64>,
+    /// Whether the last measurement was over the limit, which decides the note's shape and whether
+    /// the escape hatch is offered (`:234`).
+    over_limit: bool,
     /// Where the footer's copy button sends the picture. Behind a trait so a test can see what was
     /// asked for without writing to the user's clipboard.
     copy: std::sync::Arc<dyn ImageCopy>,
@@ -1059,6 +1091,28 @@ fn measure_size_mode(
             [0; 2]
         }
         None => [0; 2],
+    }
+}
+
+/// The size limit's four words, measured once like the buttons above.
+///
+/// Its own function rather than a field of the state's constructor, because `WM_DPICHANGED` has to
+/// re-measure it too: the widths are pixels, and a window that moves to another monitor would
+/// otherwise test clicks against the old monitor's words. With no widths at all, the switch would be
+/// as wide as its track and the label would be unreachable — so an unmeasurable run falls back to
+/// zero rather than to a guess.
+fn measure_limit_words(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    renderer: Option<&snapclip_ui::panel::PanelRenderer>,
+) -> snapclip_ui::panel::LimitWidths {
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96) as f32;
+    match renderer.map(|renderer| renderer.measure_limit_words(dpi)) {
+        Some(Ok(widths)) => widths,
+        Some(Err(error)) => {
+            eprintln!("[save-panel] could not measure the size limit's words: {error:?}");
+            snapclip_ui::panel::LimitWidths::default()
+        }
+        None => snapclip_ui::panel::LimitWidths::default(),
     }
 }
 
@@ -1421,62 +1475,36 @@ fn save_from_panel(hwnd: windows_sys::Win32::Foundation::HWND) -> Option<service
         // about to be replaced by a newer one.
         state.fields.clear_messages();
     }
-    let Some(s) = state(hwnd) else {
-        return None;
-    };
-    let Some((bgra, width, height)) = s.preview.as_ref() else {
+    // What this attempt would write, assembled by the same function the estimate row uses, so the
+    // number on screen and the file that lands describe one request rather than two.
+    let Some((attempt, name)) = with_panel_request(hwnd, |values, frame, name| {
+        let attempt = save_under_limit(hwnd, values, frame);
+        (attempt, name.to_owned())
+    }) else {
         eprintln!("[save-panel] save with no capture: there is nothing to write");
         return None;
     };
-    let name = control_text(s.control(snapclip_ui::panel::FieldId::Name));
-    let directory = control_text(s.control(snapclip_ui::panel::FieldId::Path));
-    // What the two size fields say, read at save time like the name is: the controls are what the
-    // user sees, and a half-edited pair falls back to the selection rather than to a guess.
-    let source = super::scale::Size::new(*width, *height);
-    let output = super::scale::output_size(
-        super::scale::SizeMode::from_index(s.size_mode),
-        &control_text(s.control(snapclip_ui::panel::FieldId::SizeWidth)),
-        &control_text(s.control(snapclip_ui::panel::FieldId::SizeHeight)),
-        source,
-    );
-    if output != source {
-        eprintln!(
-            "[save-panel] resampling {}x{} to {}x{}",
-            source.width, source.height, output.width, output.height
-        );
-    }
-    let (date, time) = local_date_and_time();
-    // The number this attempt would use. Taken before the save because the name is expanded with
-    // it, and moved afterwards only if the save succeeded and the name asked for it. The template
-    // is read from the control rather than from here: the control is what the user sees, and the
-    // remembered copy is kept in step by the change notification.
-    let remembered = s
-        .remembered
-        .lock()
-        .map(|remembered| remembered.clone())
-        .unwrap_or_default();
-    let values = panel_values(
-        &directory,
-        &name,
-        &date,
-        &time,
-        remembered.sequence.next(),
-        format_of_index(s.format),
-        super::assemble::quality_of_tier(s.chosen_quality()),
-        s.fill,
-    );
-    let frame = super::scale::Frame {
-        bgra,
-        source,
-        output,
+    let Some(attempt) = attempt else {
+        // The limit could not be met at any size the encoder accepts, so nothing was written: a file
+        // that breaks the rule the user asked for is worse than no file, and the row already offers
+        // the escape hatch that shrinks the picture. The line that would say so has no sentence in
+        // the design yet, which is recorded in `docs/41`.
+        eprintln!("[save-panel] no size fits the limit, so nothing was written");
+        return None;
     };
-    let attempt = save_panel(&values, &frame);
-    // One write of the counter, after the attempt: `after` is the rule, and it lives in one place
-    // so the cancel and failure cases cannot drift from it. Only the counter is written back; the
+    // One write of the counter, after the attempt: `after` is the rule, and it lives in one place so
+    // the cancel and failure cases cannot drift from it. Only the counter is written back; the
     // template was written as it was typed and must not be overwritten with the one read above.
-    let moved = remembered.sequence.after(&attempt, &name);
-    if let Ok(mut guard) = s.remembered.lock() {
-        guard.sequence = moved;
+    if let Some(s) = state(hwnd) {
+        let remembered = s
+            .remembered
+            .lock()
+            .map(|remembered| remembered.clone())
+            .unwrap_or_default();
+        let moved = remembered.sequence.after(&attempt, &name);
+        if let Ok(mut guard) = s.remembered.lock() {
+            guard.sequence = moved;
+        }
     }
     // What the line says comes from `status_of`; this only records it. The panel is told to repaint
     // by the caller, which is the only place that knows whether the window should stay open.
@@ -1503,6 +1531,229 @@ fn save_from_panel(hwnd: windows_sys::Win32::Foundation::HWND) -> Option<service
         ),
     }
     attempt.ok()
+}
+
+/// Build the panel's values and frame, hand them to `f`, and return its answer.
+///
+/// One place assembles what the panel would write. The estimate row and the save both come through
+/// here, so the number on screen and the file that lands cannot describe different requests, and
+/// editing one of them (a field, the mode, the tier) does not have to be remembered twice.
+///
+/// The name is handed to `f` because the save moves the counter according to whether the name asked
+/// for one, and the weighing has no use for it.
+fn with_panel_request<T>(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    f: impl FnOnce(
+        &super::assemble::PanelValues<'_>,
+        &super::scale::Frame<'_>,
+        &str,
+    ) -> T,
+) -> Option<T> {
+    let s = state(hwnd)?;
+    let (bgra, width, height) = s.preview.as_ref()?;
+    let name = control_text(s.control(snapclip_ui::panel::FieldId::Name));
+    let directory = control_text(s.control(snapclip_ui::panel::FieldId::Path));
+    // What the two size fields say, read at save time like the name is: the controls are what the
+    // user sees, and a half-edited pair falls back to the selection rather than to a guess.
+    let source = super::scale::Size::new(*width, *height);
+    let output = super::scale::output_size(
+        super::scale::SizeMode::from_index(s.size_mode),
+        &control_text(s.control(snapclip_ui::panel::FieldId::SizeWidth)),
+        &control_text(s.control(snapclip_ui::panel::FieldId::SizeHeight)),
+        source,
+    );
+    let (date, time) = local_date_and_time();
+    // The number this attempt would use. Read here because the name is expanded with it; it is moved
+    // afterwards only if the save succeeded and the name asked for one.
+    let sequence = s
+        .remembered
+        .lock()
+        .map(|remembered| remembered.sequence.next())
+        .unwrap_or(1);
+    let values = panel_values(
+        &directory,
+        &name,
+        &date,
+        &time,
+        sequence,
+        format_of_index(s.format),
+        super::assemble::quality_of_tier(s.chosen_quality()),
+        s.fill,
+    );
+    let frame = super::scale::Frame {
+        bgra,
+        source,
+        output,
+    };
+    if output != source {
+        eprintln!(
+            "[save-panel] resampling {}x{} to {}x{}",
+            source.width, source.height, output.width, output.height
+        );
+    }
+    Some(f(&values, &frame, &name))
+}
+
+/// The limit as a number of kilobytes, from what the field says.
+///
+/// Empty, unparseable and below the design's floor all resolve to the floor (`:236`): a limit that
+/// nothing can meet would refuse every save, and refusing everything is not what an unreadable
+/// number should mean.
+fn limit_kilobytes(text: &str) -> u32 {
+    text.trim()
+        .parse::<u32>()
+        .map(|kilobytes| kilobytes.max(MIN_LIMIT_KB))
+        .unwrap_or(MIN_LIMIT_KB)
+}
+
+/// The limit in bytes, or `None` when the switch is off.
+///
+/// The switch, not the field, decides whether a limit applies: the field keeps its number while the
+/// limit is off, which is what makes turning the switch back on restore the value the user chose.
+fn limit_bytes(hwnd: windows_sys::Win32::Foundation::HWND) -> Option<u64> {
+    let s = state(hwnd)?;
+    if !s.limit_on {
+        return None;
+    }
+    let text = control_text(s.control(snapclip_ui::panel::FieldId::Limit));
+    Some(u64::from(limit_kilobytes(&text)) * 1024)
+}
+
+/// The sentence under the quality line (`:234`), built from the last measurement.
+///
+/// A pure function so the two shapes and the digits between them can be asserted without a window.
+/// `None` when nothing has been measured: an empty note reserves the line's space and keeps the rows
+/// below it from jumping when a number arrives (the space is reserved in the layout).
+fn limit_note(estimate: Option<u64>, over: bool, png: bool) -> Option<String> {
+    use crate::save::estimate::format_bytes;
+    use snapclip_ui::panel::{
+        LIMIT_NOTE_OK_AFTER, LIMIT_NOTE_OK_BEFORE, LIMIT_NOTE_OVER_AFTER, LIMIT_NOTE_OVER_BEFORE,
+        LIMIT_NOTE_OVER_PNG_BEFORE,
+    };
+    let written = format_bytes(estimate?);
+    Some(if over {
+        let before = if png {
+            LIMIT_NOTE_OVER_PNG_BEFORE
+        } else {
+            LIMIT_NOTE_OVER_BEFORE
+        };
+        format!("{before}{written}{LIMIT_NOTE_OVER_AFTER}")
+    } else {
+        format!("{LIMIT_NOTE_OK_BEFORE}{written}{LIMIT_NOTE_OK_AFTER}")
+    })
+}
+
+/// Save, shrinking first when a limit is given and the panel's own size would be over it.
+///
+/// `None` means the limit could not be met at any size the encoder accepts, and therefore that
+/// nothing was written.
+fn save_under_limit(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    values: &super::assemble::PanelValues<'_>,
+    frame: &super::scale::Frame<'_>,
+) -> Option<Result<service::SaveOutcome, service::SaveError>> {
+    save_with_limit(limit_bytes(hwnd), values, frame)
+}
+
+/// The rule behind [`save_under_limit`], with the limit passed in.
+///
+/// A free function so the promise can be asserted without a window: what a limit means is a
+/// property of the file, and a test that went through the window would be asserting the window.
+fn save_with_limit(
+    limit: Option<u64>,
+    values: &super::assemble::PanelValues<'_>,
+    frame: &super::scale::Frame<'_>,
+) -> Option<Result<service::SaveOutcome, service::SaveError>> {
+    let Some(limit) = limit else {
+        return Some(save_panel(values, frame));
+    };
+    let fitted = super::estimate::fit_under(frame.output, limit, |size| {
+        super::assemble::weigh(values, &frame.at(size)).ok()
+    });
+    let Some((size, _bytes)) = fitted else {
+        return None;
+    };
+    Some(save_panel(values, &frame.at(size)))
+}
+
+/// Toggle the switch, show or hide its input, and take the measurement the row needs.
+fn toggle_limit(hwnd: windows_sys::Win32::Foundation::HWND) {
+    {
+        let Some(s) = state_mut(hwnd) else {
+            return;
+        };
+        s.limit_on = !s.limit_on;
+        // A measurement from the previous state describes a different request, and a stale number
+        // beside a live switch is worse than none.
+        s.estimate = None;
+        s.over_limit = false;
+    }
+    refresh_estimate(hwnd);
+    // The limit's input is a native child, so it appears and disappears with the switch rather than
+    // with the painter; `apply_menu_occlusion` is the one place that decides which controls exist on
+    // screen, and it reads `limit_on` for this one.
+    apply_menu_occlusion(hwnd);
+    unsafe { windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0) };
+}
+
+/// Measure what this panel would write and update the note and the estimate.
+///
+/// Called at the moments the panel changes what the file would be, and **never from the paint**: a
+/// measurement is a real encode, so a repaint that measured would turn a drag into a slideshow.
+fn refresh_estimate(hwnd: windows_sys::Win32::Foundation::HWND) {
+    let on = state(hwnd).map(|s| s.limit_on).unwrap_or(false);
+    if !on {
+        if let Some(s) = state_mut(hwnd) {
+            s.estimate = None;
+            s.over_limit = false;
+        }
+        return;
+    }
+    let measured =
+        with_panel_request(hwnd, |values, frame, _| super::assemble::weigh(values, frame));
+    let limit = limit_bytes(hwnd);
+    if let Some(s) = state_mut(hwnd) {
+        s.estimate = measured.and_then(|outcome| outcome.ok());
+        s.over_limit =
+            matches!((s.estimate, limit), (Some(bytes), Some(limit)) if bytes > limit);
+    }
+    unsafe { windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0) };
+}
+
+/// Shrink the two size fields until the file fits under the limit (`:235`).
+///
+/// The rule is the encoder's length, not a fraction of an estimate: `fit_under` weighs each
+/// candidate with a real encode. The size that fits is written back into the two cells, so what the
+/// panel shows is what the file is, and the next save starts from it rather than shrinking again.
+fn shrink_to_fit(hwnd: windows_sys::Win32::Foundation::HWND) {
+    let Some(limit) = limit_bytes(hwnd) else {
+        return;
+    };
+    let fitted = with_panel_request(hwnd, |values, frame, _| {
+        super::estimate::fit_under(frame.output, limit, |size| {
+            super::assemble::weigh(values, &frame.at(size)).ok()
+        })
+    })
+    .flatten();
+    let Some((size, bytes)) = fitted else {
+        eprintln!("[save-panel] even the smallest size is over the limit");
+        return;
+    };
+    if let Some(s) = state_mut(hwnd) {
+        let Some((_, width, height)) = s.preview.as_ref() else {
+            return;
+        };
+        let source = super::scale::Size::new(*width, *height);
+        let text = super::scale::display_text(
+            super::scale::SizeMode::from_index(s.size_mode),
+            size,
+            source,
+        );
+        s.set_size_text(&text.0, &text.1);
+        s.estimate = Some(bytes);
+        s.over_limit = bytes > limit;
+    }
+    unsafe { windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0) };
 }
 
 /// Put a directory into the path field.
@@ -1711,7 +1962,11 @@ fn apply_menu_occlusion(hwnd: windows_sys::Win32::Foundation::HWND) {
         if control.is_null() {
             continue;
         }
-        let show = !hidden.contains(&index);
+        let show = !hidden.contains(&index)
+            // The limit's input exists only while the switch is on: the quality line shows the
+            // `不超过 [ 500 ] KB` group then and the tier segment otherwise, so a control the frame
+            // does not draw must not be visible — or focusable — either.
+            && (*id != snapclip_ui::panel::FieldId::Limit || state.limit_on);
         unsafe {
             let _ = ShowWindow(control, if show { SW_SHOWNA } else { SW_HIDE });
         }
@@ -1866,6 +2121,10 @@ fn initial_text(
         (FieldId::Name, _) => template.to_string(),
         (FieldId::SizeWidth, Some((width, _))) => width.to_string(),
         (FieldId::SizeHeight, Some((_, height))) => height.to_string(),
+        // The limit's default is the mockup's own `500` (`:647`). It is a default rather than a
+        // measurement, which is why it survives the switch being off: the control exists either way
+        // and only its visibility and the sentence beside it depend on the switch.
+        (FieldId::Limit, _) => DEFAULT_LIMIT_KB.to_string(),
         // No capture, no number. The development entry opens a panel with nothing captured, and a
         // plausible size there would be invented rather than measured.
         _ => String::new(),
@@ -2109,6 +2368,15 @@ extern "system" fn window_proc(
                         client.right,
                         client.bottom,
                     );
+                    // The estimate row's two strings live here rather than in the state: they are
+                    // formatted from the measurement and read by one paint, and a stored copy would
+                    // be a second place that has to be kept in step with the number it came from.
+                    let limit_note = limit_note(
+                        s.estimate,
+                        s.over_limit,
+                        format_of_index(s.format) == SaveFormat::Png,
+                    );
+                    let estimate_text = s.estimate.map(crate::save::estimate::format_bytes);
                     // The surface fill is skipped when DWM is drawing the material, so a backdrop
                     // keeps showing through while the frame's own lines still land on top of it.
                     painted = renderer
@@ -2134,11 +2402,31 @@ extern "system" fn window_proc(
                                 size_presets: Some(s.size_presets),
                                 size_mode: s.size_mode,
                                 size_mode_widths: Some(s.size_mode_widths),
-        // The size limit's controls and the estimate are not wired to this window yet: the
-        // measurement and the drawing exist, and showing them here before the switch, the
-        // kilobytes and the shrink link answer a click would put three dead controls on the
-        // panel. docs/41 records what is left.
-        limit: None,
+                                // The switch is always drawn — turning it on is the whole point of
+                                // it — while the note and the escape hatch exist only when a
+                                // measurement has something to say (`:234`, `:235`).
+                                limit: Some(snapclip_ui::panel::LimitView {
+                                    on: s.limit_on,
+                                    switch_word_px: s.limit_words.switch_word_px,
+                                    note: limit_note.as_deref(),
+                                    note_warn: s.over_limit,
+                                    auto_shrink_px: if s.limit_on && s.over_limit {
+                                        s.limit_words.auto_shrink_px
+                                    } else {
+                                        0
+                                    },
+                                    estimate: estimate_text.as_deref(),
+                                    // A synchronous encode cannot show the state while it runs, so
+                                    // the finished word is the only one this panel can honestly
+                                    // draw; `docs/41` records why `编码中` would be theatre here.
+                                    encode_state: if s.estimate.is_some() {
+                                        Some(snapclip_ui::panel::ENCODE_STATE_DONE)
+                                    } else {
+                                        None
+                                    },
+                                    encode_done: s.estimate.is_some(),
+                                    encode_state_px: s.limit_words.measured_px,
+                                }),
                                 status: s
                                     .status
                                     .as_ref()
@@ -2306,6 +2594,10 @@ extern "system" fn window_proc(
                             s.format = index;
                             s.format_open = false;
                         }
+                        // The file's format decides what it weighs, so a measurement taken under the
+                        // old one describes a file that no longer exists. Only a limit that is on
+                        // needs the new number, which is why the refresh itself checks the switch.
+                        refresh_estimate(hwnd);
                         InvalidateRect(hwnd, std::ptr::null(), 0);
                         return 0;
                     }
@@ -2446,6 +2738,41 @@ extern "system" fn window_proc(
                     return 0;
                 }
             }
+            // The size limit's switch (`:231`) and the escape hatch it offers (`:235`). Both are
+            // drawn by the frame from the same rectangles this tests, and the link answers only
+            // while the note says the limit was missed — a link that shrank the picture when it
+            // already fit would be a button with nothing to do.
+            if event == snapclip_ui::panel::PointerEvent::Down {
+                let metrics = snapclip_ui::panel::DEMO;
+                let scale = dpi_scale(hwnd);
+                let rects = metrics.rects(scale);
+                let point = (point.x, point.y);
+                let (over, words) = state(hwnd)
+                    .map(|s| (s.limit_on && s.over_limit, s.limit_words))
+                    .unwrap_or((false, snapclip_ui::panel::LimitWidths::default()));
+                let switch = snapclip_ui::panel::limit_switch_rect(
+                    &metrics,
+                    &rects,
+                    scale,
+                    words.switch_word_px,
+                );
+                if snapclip_ui::panel::rect_contains(switch, point) {
+                    toggle_limit(hwnd);
+                    return 0;
+                }
+                if over {
+                    let link = snapclip_ui::panel::auto_shrink_rect(
+                        &metrics,
+                        &rects,
+                        scale,
+                        words.auto_shrink_px,
+                    );
+                    if snapclip_ui::panel::rect_contains(link, point) {
+                        shrink_to_fit(hwnd);
+                        return 0;
+                    }
+                }
+            }
             // The fill row's swatches answer only while the row is drawn: `:1102` shows it for JPG
             // alone, and the same predicate gates this, so a swatch that is not on screen cannot
             // change the colour the encoder will composite with.
@@ -2478,6 +2805,9 @@ extern "system" fn window_proc(
                 .map(|s| s.quality_pointer(dpi_scale(hwnd), event, point))
                 .unwrap_or(false);
             if chosen {
+                // The tier decides the encoder's quality, so the estimate belongs to the old one
+                // until it is taken again for the new one.
+                refresh_estimate(hwnd);
                 InvalidateRect(hwnd, std::ptr::null(), 0);
             }
             0
@@ -2508,6 +2838,9 @@ extern "system" fn window_proc(
                 s.size_presets = measure_size_presets(hwnd, s.renderer.as_ref());
                 // The two mode buttons are words as well, measured in two weights.
                 s.size_mode_widths = measure_size_mode(hwnd, s.renderer.as_ref());
+                // The limit's words are pixels too, so they go stale the same way: the switch would
+                // otherwise be tested against the previous monitor's word width.
+                s.limit_words = measure_limit_words(hwnd, s.renderer.as_ref());
             }
             apply_menu_occlusion(hwnd);
             0
@@ -3088,6 +3421,10 @@ mod tests {
             size_presets: [40, 36, 36, 36],
         size_mode: snapclip_ui::panel::SIZE_MODE_CHOSEN,
         size_mode_widths: [56, 64],
+            limit_on: false,
+            limit_words: snapclip_ui::panel::LimitWidths::default(),
+            estimate: None,
+            over_limit: false,
             copy: std::sync::Arc::new(SystemImageCopy),
         };
 
@@ -3158,6 +3495,10 @@ mod tests {
             size_presets: [40, 36, 36, 36],
         size_mode: snapclip_ui::panel::SIZE_MODE_CHOSEN,
         size_mode_widths: [56, 64],
+            limit_on: false,
+            limit_words: snapclip_ui::panel::LimitWidths::default(),
+            estimate: None,
+            over_limit: false,
             copy: std::sync::Arc::new(SystemImageCopy),
         };
 
@@ -3232,6 +3573,10 @@ mod tests {
             size_presets: [40, 36, 36, 36],
         size_mode: snapclip_ui::panel::SIZE_MODE_CHOSEN,
         size_mode_widths: [56, 64],
+            limit_on: false,
+            limit_words: snapclip_ui::panel::LimitWidths::default(),
+            estimate: None,
+            over_limit: false,
             copy: std::sync::Arc::new(SystemImageCopy),
         };
 
@@ -3455,6 +3800,10 @@ mod tests {
             size_presets: [40, 36, 36, 36],
         size_mode: snapclip_ui::panel::SIZE_MODE_CHOSEN,
         size_mode_widths: [56, 64],
+            limit_on: false,
+            limit_words: snapclip_ui::panel::LimitWidths::default(),
+            estimate: None,
+            over_limit: false,
             copy: recorder.clone(),
         };
         state.controls.fill(std::ptr::null_mut());
@@ -3483,8 +3832,7 @@ mod tests {
     /// The three shortcut chips are the shell's own folders, and a chip past the third is not a
     /// chip: it answers `None` rather than a directory nobody asked for.
     #[test]
-    fn a_shortcut_beyond_the_three_is_not_a_shortcut() {
-        assert_eq!(shortcut_directory(3), None);
+    fn a_shortcut_beyond_the_three_is_not_a_shortcut() {        assert_eq!(shortcut_directory(3), None);
         assert_eq!(shortcut_directory(99), None);
         for index in 0..3 {
             if let Some(path) = shortcut_directory(index) {
@@ -3498,6 +3846,134 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// What the limit field means, including the cases where it does not say a number.
+    ///
+    /// The floor is the design's (`:236`: `下限 10`), and it is also the answer for text that is not
+    /// a number: a limit nothing can meet would refuse every save, and "unreadable" must not mean
+    /// "impossible".
+    #[test]
+    fn the_limit_field_reads_as_kilobytes_or_as_the_floor() {
+        assert_eq!(limit_kilobytes("500"), 500);
+        assert_eq!(limit_kilobytes(" 300 "), 300, "surrounding space is not a number");
+        assert_eq!(limit_kilobytes("5"), MIN_LIMIT_KB, "below the design's floor");
+        assert_eq!(limit_kilobytes("0"), MIN_LIMIT_KB, "zero kilobytes is not a limit");
+        assert_eq!(limit_kilobytes(""), MIN_LIMIT_KB, "an empty field is not a number");
+        assert_eq!(limit_kilobytes("abc"), MIN_LIMIT_KB, "nor is a word");
+        assert_eq!(limit_kilobytes("-1"), MIN_LIMIT_KB, "nor is a negative count");
+    }
+
+    /// The sentence under the quality line, in its three shapes (`:234`).
+    ///
+    /// The digits are asserted as well as the words: a note that always said the same number would
+    /// pass a test that only looked for the phrase.
+    #[test]
+    fn the_note_says_what_the_limit_did() {
+        let fits = limit_note(Some(234_567), false, false).expect("a measured note");
+        assert_eq!(
+            fits,
+            format!(
+                "{}{}{}",
+                snapclip_ui::panel::LIMIT_NOTE_OK_BEFORE,
+                crate::save::estimate::format_bytes(234_567),
+                snapclip_ui::panel::LIMIT_NOTE_OK_AFTER
+            ),
+            "a file under the limit says so, with its own weight"
+        );
+        let over = limit_note(Some(655_360), true, false).expect("a measured note");
+        assert!(
+            over.starts_with(snapclip_ui::panel::LIMIT_NOTE_OVER_BEFORE)
+                && over.ends_with(snapclip_ui::panel::LIMIT_NOTE_OVER_AFTER)
+                && over.contains(&crate::save::estimate::format_bytes(655_360)),
+            "an over-limit jpeg says the lowest tier is still too big, and how big: {over:?}"
+        );
+        let over_png = limit_note(Some(655_360), true, true).expect("a measured note");
+        assert!(
+            over_png.starts_with(snapclip_ui::panel::LIMIT_NOTE_OVER_PNG_BEFORE)
+                && over_png.ends_with(snapclip_ui::panel::LIMIT_NOTE_OVER_AFTER),
+            "png has no tier to lower, so its sentence says it is lossless instead: {over_png:?}"
+        );
+        assert_eq!(limit_note(None, false, false), None, "nothing measured, nothing said");
+        assert_eq!(limit_note(None, true, true), None, "nothing measured, nothing claimed");
+    }
+
+    /// The limit is a promise about the **file**, which is the only place it can be checked.
+    ///
+    /// The picture is noise because noise does not compress: it makes the unlimited file larger than
+    /// the limit this test then asks for, so the shrinking half cannot pass by the picture having
+    /// been small already.
+    #[test]
+    fn a_limit_the_picture_exceeds_writes_a_file_under_it() {
+        let directory = std::env::temp_dir().join(format!(
+            "snapclip-limit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&directory).expect("a scratch directory");
+        let directory_text = directory.to_string_lossy().into_owned();
+        // Nine hundred by seven hundred of noise: the pixels are incompressible, so a limit bites.
+        let (width, height) = (900u32, 700u32);
+        let mut bgra = Vec::with_capacity((width as usize) * (height as usize) * 4);
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        for _ in 0..(width as usize * height as usize) {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            bgra.extend_from_slice(&[seed as u8, (seed >> 8) as u8, (seed >> 16) as u8, 255]);
+        }
+        let size = crate::save::scale::Size::new(width, height);
+        let frame = crate::save::scale::Frame {
+            bgra: &bgra,
+            source: size,
+            output: size,
+        };
+        // A literal name, so the values' borrow outlives the call rather than the argument.
+        let values = |name: &'static str| {
+            panel_values(
+                &directory_text,
+                name,
+                "2026-10-24",
+                "1042",
+                1,
+                SaveFormat::Png,
+                92,
+                snapclip_ui::panel::FILL_WHITE,
+            )
+        };
+
+        let unlimited = save_with_limit(None, &values("noise"), &frame)
+            .expect("no limit is no refusal")
+            .expect("the unlimited save");
+        let unlimited_bytes = std::fs::metadata(&unlimited.path)
+            .expect("the unlimited file")
+            .len();
+        let limit: u64 = 200 * 1024;
+        assert!(
+            unlimited_bytes > limit,
+            "the picture must be over the limit for the shrinking half to mean anything: \
+             {unlimited_bytes} bytes"
+        );
+
+        let limited = save_with_limit(Some(limit), &values("capped"), &frame)
+            .expect("a limit this size is reachable")
+            .expect("the limited save");
+        let limited_bytes = std::fs::metadata(&limited.path)
+            .expect("the limited file")
+            .len();
+        assert!(
+            limited_bytes <= limit,
+            "the file is {limited_bytes} bytes, over the {limit} byte limit"
+        );
+        // The file is a real picture at a smaller size, not an empty file that trivially fits.
+        assert!(
+            limited_bytes > 1024,
+            "a ten kilobyte limit should still leave a picture: {limited_bytes} bytes"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }
 

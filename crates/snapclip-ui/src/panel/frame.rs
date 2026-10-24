@@ -1808,6 +1808,40 @@ pub fn measure_size_mode(dwrite: &IDWriteFactory, dpi: f32) -> Result<[i32; 2]> 
     Ok(widths)
 }
 
+/// The widths of the words the size limit draws, measured once so the click targets are the drawn
+/// ones.
+///
+/// Four words rather than one: the switch's label sits on the label line, the note's escape hatch
+/// on the note's line, and the estimate's state word on the estimate row — the last of which has two
+/// spellings, and the right edge of the row depends on which one is showing. Measuring them inside
+/// the paint would leave the click handlers guessing, and guessing is what put a click beside a
+/// button rather than on it (`docs/41` A19).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LimitWidths {
+    /// `限制体积`, beside the switch's track.
+    pub switch_word_px: i32,
+    /// `自动缩小尺寸`, the link that appears when the limit cannot be met.
+    pub auto_shrink_px: i32,
+    /// `编码中`, right aligned on the estimate row's label line.
+    pub encoding_px: i32,
+    /// `✓ 实测`, the same place once a measurement landed.
+    pub measured_px: i32,
+}
+
+pub fn measure_limit_words(dwrite: &IDWriteFactory, dpi: f32) -> Result<LimitWidths> {
+    let label = row_label_format(dwrite, dpi)?;
+    let hint = hint_format(dwrite, dpi)?;
+    let width = |dwrite: &IDWriteFactory, word: &str, format: &IDWriteTextFormat| -> Result<i32> {
+        Ok(crate::panel::d2d::measure_text_width(dwrite, word, format)?.round() as i32)
+    };
+    Ok(LimitWidths {
+        switch_word_px: width(dwrite, crate::panel::field::LIMIT_SWITCH_LABEL, &label)?,
+        auto_shrink_px: width(dwrite, crate::panel::field::AUTO_SHRINK_LABEL, &hint)?,
+        encoding_px: width(dwrite, crate::panel::field::ENCODE_STATE_BUSY, &hint)?,
+        measured_px: width(dwrite, crate::panel::field::ENCODE_STATE_DONE, &hint)?,
+    })
+}
+
 fn properties(dpi: f32) -> D2D1_RENDER_TARGET_PROPERTIES {
     D2D1_RENDER_TARGET_PROPERTIES {
         r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
@@ -2464,11 +2498,6 @@ mod tests {
         }
     }
 
-    /// The insert-a-variable button is drawn on the parent, in the strip the name control gives up.
-    ///
-    /// Checked at 2× for the same reason as the close glyph: the graphic is a line drawing, and at
-    /// unit scale a one point four dip stroke is spread over two pixels and never reaches its colour.
-    #[test]
     /// The fill row is drawn for JPG and for nothing else, and each swatch is its own colour at its
     /// own place.
     ///
@@ -2535,6 +2564,10 @@ mod tests {
         );
     }
 
+    /// The insert-a-variable button is drawn on the parent, in the strip the name control gives up.
+    ///
+    /// Checked at 2× for the same reason as the close glyph: the graphic is a line drawing, and at
+    /// unit scale a one point four dip stroke is spread over two pixels and never reaches its colour.
     #[test]
     fn the_variable_button_is_drawn_inside_the_name_field() {
         let canvas = Canvas::new_at(1840, 1040, 192.0);
@@ -4308,6 +4341,12 @@ impl PanelRenderer {
     /// button the user can see.
     pub fn measure_size_mode(&self, dpi: f32) -> Result<[i32; 2]> {
         measure_size_mode(&self.dwrite, dpi)
+    }
+
+    /// The size limit's four words, for the same reason: a click on the switch has to land on the
+    /// switch that is drawn, and its right edge is where the label line ends.
+    pub fn measure_limit_words(&self, dpi: f32) -> Result<LimitWidths> {
+        measure_limit_words(&self.dwrite, dpi)
     }
 }
 

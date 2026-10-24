@@ -49,6 +49,21 @@ pub struct Frame<'a> {
     pub output: Size,
 }
 
+impl Frame<'_> {
+    /// The same pixels at another output size.
+    ///
+    /// The shrink pass weighs candidate sizes; each is the same capture resampled differently, so
+    /// this is the only thing that changes between attempts. Named rather than spelled out so a
+    /// caller cannot forget one of the three fields and weigh a picture it will not write.
+    pub fn at(&self, output: Size) -> Frame<'_> {
+        Frame {
+            bgra: self.bgra,
+            source: self.source,
+            output,
+        }
+    }
+}
+
 /// What the two size fields mean (`S.sizeMode`, `:734`).
 ///
 /// The mockup keeps one pair of numbers and one mode, and switching the mode only changes how

@@ -1403,6 +1403,22 @@ pub fn form_drawn_strings() -> Vec<&'static str> {
     all.push(QUALITY_HINT_TEXT);
     // The fill row's label (`:656`), drawn only for JPG but drawn all the same.
     all.push(FILL_ROW_LABEL);
+    // The size limit's words (`:230`–`:235`): the switch's label, the group's `不超过` and `KB`, the
+    // link that escapes an over-limit save, and the two halves of the note's two sentences. They are
+    // named here rather than left to the numbers' face, because they are Chinese and the numeric
+    // subset carries only digits and symbols.
+    all.push(LIMIT_SWITCH_LABEL);
+    all.push(LIMIT_LABEL);
+    all.push(LIMIT_UNIT);
+    all.push(AUTO_SHRINK_LABEL);
+    all.push(LIMIT_NOTE_OK_BEFORE);
+    all.push(LIMIT_NOTE_OK_AFTER);
+    all.push(LIMIT_NOTE_OVER_BEFORE);
+    all.push(LIMIT_NOTE_OVER_AFTER);
+    all.push(LIMIT_NOTE_OVER_PNG_BEFORE);
+    // The estimate row's two states (`:243`).
+    all.push(ENCODE_STATE_BUSY);
+    all.push(ENCODE_STATE_DONE);
     // The four size shortcuts are drawn in the numeric face (`.size-presets .chip`, `:259`), so they
     // are not in this list: `number_characters` carries the digits and the percent sign they use,
     // and a test below holds the two lists together.
@@ -1657,6 +1673,28 @@ pub const LIMIT_NOTE_GAP_DIP: i32 = 8;
 
 /// The link that appears when even the lowest quality tier is over the limit (`:235`, `:653`).
 pub const AUTO_SHRINK_LABEL: &str = "自动缩小尺寸";
+
+/// What the note under the quality line says (`:234`).
+///
+/// Two shapes, and the numbers between the static halves are formatted by the caller: the words are
+/// here so the font subset knows about them, and so the sentence is written once rather than beside
+/// every branch that can produce it.
+pub const LIMIT_NOTE_OK_BEFORE: &str = "当前 ";
+pub const LIMIT_NOTE_OK_AFTER: &str = "，未超出上限";
+pub const LIMIT_NOTE_OVER_BEFORE: &str = "最低质量仍为 ";
+pub const LIMIT_NOTE_OVER_AFTER: &str = "，超出上限";
+/// PNG has no tier to lower, so its over-limit sentence says that instead (`:234`).
+pub const LIMIT_NOTE_OVER_PNG_BEFORE: &str = "无损输出，当前 ";
+
+/// The two words beside the estimate (`:243`): the measurement running, and the one that landed.
+///
+/// `编码中` carries no counter here because this project encodes synchronously; drawing `2/6` would
+/// be an invented number, and the specification's counter belongs to a background encoder.
+pub const ENCODE_STATE_BUSY: &str = "编码中";
+/// The landed state, **without** the design's check mark: `✓` (U+2713) has no glyph in the embedded
+/// HarmonyOS Sans SC subset, and the subset builder refuses to ship a text the face cannot draw. The
+/// accent colour and the position carry the meaning instead.
+pub const ENCODE_STATE_DONE: &str = "实测";
 
 /// What the quality row's line shows.
 ///

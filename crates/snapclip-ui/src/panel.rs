@@ -59,6 +59,8 @@ pub use field::{
     quality_line, QualityLine, limit_switch_rect, limit_track_rect, limit_knob_rect, limit_label_rect,
     limit_input_rect, limit_unit_rect, limit_note_rect, auto_shrink_rect, estimate_value_rect,
     encode_state_rect, LIMIT_LABEL, LIMIT_UNIT, LIMIT_SWITCH_LABEL, quality_extra_height,
+    AUTO_SHRINK_LABEL, LIMIT_NOTE_OK_BEFORE, LIMIT_NOTE_OK_AFTER, LIMIT_NOTE_OVER_BEFORE,
+    LIMIT_NOTE_OVER_AFTER, LIMIT_NOTE_OVER_PNG_BEFORE, ENCODE_STATE_BUSY, ENCODE_STATE_DONE,
     QUALITY_OPTION_WIDTH_DIP, QUALITY_SEG_INNER_RADIUS_DIP,
     QUALITY_SEG_INSET_DIP, QUALITY_SEG_RADIUS_DIP, QUALITY_SEG_WIDTH_DIP, ROW_DIP, Row, SizeCell,
     AFTER_CHIP_GAP_DIP, AFTER_CHIP_HEIGHT_DIP, AFTER_CHIP_PAD_DIP, AFTER_CHIP_WORDS,
@@ -96,9 +98,10 @@ pub use field::{
 };
 pub use frame::{
     CHIP_FONT_DIP, DEMO, DEMO_PALETTE, Frame, FrameBrushes, FrameMetrics, FramePalette, FrameRects,
-    NUMBER_FONT_DIP, PaintInput, PanelRenderer, ROW_LABEL_FONT_DIP, TITLE, UNIT_FONT_DIP,
-    chip_format, factory, measure_footer_widths, measure_path_chips, measure_size_presets,
-    number_format,
+    LimitView, LimitWidths, NUMBER_FONT_DIP, PaintInput, PanelRenderer, ROW_LABEL_FONT_DIP, TITLE,
+    UNIT_FONT_DIP,
+    chip_format, factory, measure_footer_widths, measure_limit_words, measure_path_chips,
+    measure_size_presets, number_format,
     row_label_format, status_format, text_format_in, title_format, var_label_format, VAR_FONT_DIP,
     HINT_FONT_DIP, PRESET_FONT_DIP, hint_format, preset_label_format,
 };
