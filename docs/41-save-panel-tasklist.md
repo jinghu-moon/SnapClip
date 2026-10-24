@@ -676,11 +676,11 @@ cargo run -p codec-bench --release -- --assert
 | A15 | **格式菜单每项右侧的预估体积未画** ✗（`.fmt-item .val` ✓ `:186`，`:203` 要求"当前尺寸与质量下的预估体积"✓）—— 要先有体积模型 ✓ | `fmt_item_rect` 已给出每行矩形 ✓ | 预估批 ✓ |
 | A16 | **切换格式的连带变化未做** ✗（`:204`：质量行 ✓ 高级选项 ✓ JPG 填充行 ✓ 与重新估算 ✓）—— 后两者**还没画** ✓ | — | 高级项批 ✓ |
 | A17 | **行头 `.field-msg` 与修复胶囊未做** ✗（`:335`–`:341` ✓，`repair()` 已在 `copy.rs` 里备好 ✓）—— 失败目前只在**底部一行** ✓，指出**哪个字段**要等它 | 字段级提示需要一个"哪个字段出错"的来源 ✓ | 错误提示批其二 ✓ |
-| A18 | **字段边框变红未做** ✗（`.text-input.is-error { border-color: danger }` ✓ `:333`）—— `FieldState::Error` 的规则**早就写好** ✓，只差把失败接到具体字段上 ✓ | 同上 ✓（先要有"哪个字段"✓） | 与 A17 同批 ✓ |
+| ~~A18~~ | ~~**字段边框变红未做** ✗~~ ✓ **已做**：`copy::ValidationCopy` 的**键**经 `panel::problem_of` 映射成 `(FieldId, FieldState)` ✓（`Stem*` ⇒ 文件名 ✓、`Path*`/`DirectoryMissing`/`NoWritePermission`/`NotEnoughSpace`/`PathTooLong` ⇒ 路径 ✓；`level()` 决定 Error/Warning ✓）⇒ 保存失败时只有**相关字段**变红 ✓，其余不动 ✓（位图断言 ✓）；**焦点不再能抹掉它** ✗ —— `FieldStates::set_focus` 遇到消息态就返回 ✓（democratic：`:333` 在 `:169` 之后 ✓ ⇒ 消息赢 ✓） | 已解决 ✓ | 已完成 ✓ |
 | ~~A19~~ | ~~**绘制入口的实参已经 13 个** ✗~~ ✓ **已做**：收成 `PaintInput` ✓（字段有名 ✓ —— `quality` ✓ `format` ✓ `format_open` ✓ `fill_surface` ✓ `footer_widths` ✓ `status` ✓ `preview` ✓ `fields` ✓ `dpi` ✓）；`PanelRenderer::paint_with_preview` 只剩 `(hdc, area, input)` ✓；**只用于保留旧签名的三个壳子已删** ✗（`paint_to_dc` ✓ `paint_to_dc_with_state` ✓ `PanelRenderer::paint` ✓），**位图目标那条路径也删了** ✗（`paint_to_target` ✓ `paint_to_target_with_preview` ✓ —— 全仓**无任何调用者** ✓，其文档注释还写着"测试在用"✗，而测试走的是内存 DC ✓） | — | 已完成 ✓（**同名类型的值互换仍拦不住** ✗ ⇒ 见 A23 ✓） |
 | A20 | **三种失败的状态文案是开发者语** ✗ —— `Capability` ✓ `UnsupportedFormat` ✓ `Io` ✓ 走的是 `SaveError::message()` ✓，那是 `Debug`/英文短句 ✓（ascii ✓ 所以能画 ✓），不是给用户看的措辞 ✓ | 规格 §8.2 没有这三条的句子 ✓ ⇒ 要先定文案 ✓（新增句子会牵动字形子集 ✓） | 文案批 ✓ |
 | A21 | **`detail` 可能引用用户输入** ✗ —— 例如 `illegal_chars("a*b")` ✓ 与 `reserved_name(名字)` ✓ ⇒ 用户打的字**不一定在子集里** ✗ ⇒ 会**回退系统字体** ✓（能显示 ✓，字形不是我们的 ✓） | 子集装不下任意输入 ✓；要么限定显示 ✓、要么接受回退 ✓ —— **先记录** ✓ | 文案批（与 A20 一起决定）✓ |
-| A22 | **两个黄色** ✗ —— `field_colours` 的 `WARNING` 是 `[255,191,0]` ✗，而 demo 的 `--warning` 是 `rgb(240,179,90)` ✓（`:23` ✓，`.status.is-warning` 与冲突链接都用它 ✓）；demo **没有**字段警告边框的规则 ✗ | 字段警告边框的规则**不在设计稿里** ✓ ⇒ 那个黄是**推断出来的** ✓，而本批的状态行用的是**设计稿的黄** ✓（`FramePalette::warning` ✓） | 画字段警告态时统一 ✓ |
+| ~~A22~~ | ~~**两个黄色** ✗~~ ✓ **已做** —— **并纠正了本行的两处错误** ✗✓：① demo **有**字段警告边框的规则 ✓（`.text-input.is-warn { border-color: var(--warning) }` `:334` ✓，`inp.classList.toggle('is-warn', …)` `:1425` ✓，尺寸格还有 `.cell.is-warning` `:241`/`:243` ✓）—— 前一版说"没有"✗ 是**错的** ✓ ② 那个黄不是"推断"的 ✓ ⇒ 现在 **`panel::WARNING_RGBA` 是唯一来源** ✓（`field_colours` ✓ 与 `FramePalette::warning` ✓ 都读它 ✓）⇒ 边框 (`:334`) ✓ 状态行 (`:327`) ✓ 冲突链接 (`:328`) ✓ **同色** ✓ | 已解决 ✓ | 已完成 ✓ |
 | A23 | **同类型字段的「值」仍可互换** ✗ —— `PaintInput` 的 `quality` 与 `format` 都是 `usize` ✓，`fill_surface` 与 `format_open` 都是 `bool` ✓ ⇒ 把 `quality: s.format` 写在 `format` 的位置上**编译照样通过** ✗（实测 ✓：互换两个 `usize` 的值 ⇒ `Finished` ✓） | 结构体拦的是**位置**错 ✗，不是**类型**错 ✗；要拦后者得给每个量一个 **newtype**（`Quality(usize)` ✓ `Format(usize)` ✓）⇒ 值**根本不能**互相赋值 ✓ | 若要根治：类型化批（`Quality` ✓ `Format` ✓ `OptionalWidths` ✓）✓；不划算就写明"这里靠命名 + 评审" ✓ |
 
 > **A10 的两条行为决定**（不是遗漏 ✓）：① 菜单打开时，**菜单外的一次点击只关闭菜单、不做别的** ✓ —— 菜单里的第一下属于菜单 ✓（与常见菜单一致 ✓）；② 菜单的**每项体积**与**悬停态**见 A15/A13 ✓。
@@ -951,4 +951,46 @@ error[E0063]: missing field `format_open` in initializer of `PaintInput<'_>`
 **它拦不住的** ✗✓ —— 变异：把两个 `usize` 字段的**值**互换 ✗ ⇒ **`Finished`** ✓（编译通过 ✓）
 ⇒ 结构体拦的是**位置** ✗，不是**类型** ✗；而要拦类型得给每个量一个 **newtype** ✓ ⇒ 记入 **A23** ✓，本批**不做** ✗（它不是 A19 的要求 ✓，且会散到所有调用点 ✓）。
 
-**没改测试** ✓：`ui` **132/0** ✓、`app` **230/0/9** ✓ —— 与改前**条数完全一致** ✓（只有**调用写法**从位置参数变成结构体字面量 ✓，**没有一条断言或期望被动过** ✓）。
+**没改测试** ✓：`ui` **132/0** ✓、`app` **230/0/9** ✓ —— 与改前**条数完全一致** ✓（只有**调用写法**从位置参数变成结构体成员 ✓，**没有一条断言或期望被动过** ✓）。
+
+---
+
+## A18 + A22：字段边框说出"哪里错了"，两个黄收成一个
+
+**A18 的形状** ✓：`copy::ValidationCopy`（**键** ✓）⇒ `panel::problem_of(copy) -> Option<(FieldId, FieldState)>` ✓ —— **纯函数** ✓、**不活在消息处理里** ✗：
+
+- `Stem*`（空 ✓ 非法字符 ✓ 保留名 ✓ 尾点/尾空格）⇒ **文件名**字段 ✓；
+- `Path*` ✓ `DirectoryMissing` ✓ `NoWritePermission` ✓ `NotEnoughSpace` ✓ `PathTooLong` ⇒ **路径**字段 ✓；
+- 级别由 `copy.level()` 决定 ✓：`Warn` ⇒ `FieldState::Warning` ✓（`DirectoryMissing` ✓ `StemTrailingDotOrSpace` ✓）、其余 ⇒ `Error` ✓。
+
+于是保存失败时：**状态行说发生了什么** ✓、**边框说发生在哪个字段** ✓ ⇒ 两处信息**不重复也不矛盾** ✓。
+
+**一条被测试逼出来的规则** ✗✓：焦点通知原来会把 `Error`/`Warning` **覆盖成 `Focused`/`Idle`** ✗ ⇒ 用户一点进出错的字段 ✓，红边框就**消失** ✓ —— 而那正是他要改它的时候 ✗。修法不是加一个"当前聚焦字段"的第二份状态 ✗（那会引入两个写者 ✗），而是让**焦点在一个有消息的字段上不生效** ✓：
+
+```rust
+pub fn set_focus(&mut self, id: FieldId, focused: bool) {
+    if self.state_of(id).is_message() { return; }
+    self.set(id, if focused { FieldState::Focused } else { FieldState::Idle });
+}
+```
+
+⇒ 与 CSS 一致 ✓：`:333` 的 `.is-error` 在 `:169` 的 `:focus` **之后** ✓ ⇒ 消息赢 ✓ —— 所以这不是"我们定的"，是**设计稿定的** ✓。
+
+**清空** ✓：每次保存尝试开始 `clear_messages()` ✓（与清状态行同一处 ✓）⇒ 旧句子不会活过一个新尝试 ✓。
+
+**A22 的两处更正** ✗✓（本批推翻了自己上一版的两条说法）：
+
+1. demo **有**字段警告边框 ✓（`:334` ✓，`:1425` 还把 `is-warn` 挂在输入上 ✓，尺寸格另有 `.cell.is-warning` ✓ `:241`/`:243`）⇒ 上一版写"demo 没有"✗ 是**错的** ✓；
+2. 那个黄**不是**推断的 ✓ ⇒ 现在 `panel::WARNING_RGBA = [240,179,90,255]` ✓ 是**唯一字面量** ✓：`field_colours(Warning)` ✓ 与 `FramePalette::warning` ✓ 都读它 ✓ ⇒ 边框 ✓ 状态行 ✓ 冲突链接 ✓ **三处同色** ✓。
+
+**变异（三条，全红 ✓，还原逐字节一致 ✓）**
+
+| 变异 | 红的信息 |
+| --- | --- |
+| 警告黄改回 `255,191,0` ✗ | `warning border is --warning (:334, :23)` ✓ |
+| 焦点覆盖消息（删掉 `is_message` 守卫）✗ | `focus must not overwrite a message about the value (:333 over :169)` ✓ |
+| `Level::Warn` 当成 `Error` ✗ | `DirectoryMissing keeps its level` ✓ |
+
+⚠️ **第三条第一次没跑成** ✗：替换锚点在我自己的测试里**也命中了一处** ✓ ⇒ 命中数 2 ✓ ⇒ 守卫（"必须正好 1 处"）**跳过**了 ✓ —— 这正是 `docs/41` 变异清单第 1 条要防的"变异没发生" ✓；换成带上下文的锚点才拿到红 ✓。
+
+**门禁** ✓：`ui` **136/0** ✓（132 ⇒ +4）· `app` **230/0/9** ✓ · `capture` **545/0/80** ✓ · `icon-bake` ✓ · `check --workspace --all-targets` Finished ✓ **无 `never used`** ✓。

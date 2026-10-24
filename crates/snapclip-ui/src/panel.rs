@@ -49,6 +49,7 @@ pub use fonts::{
 pub use field::{
     EDIT_FONT_DIP, EDIT_INSET_DIP, EDIT_PADDING_DIP, FieldColours, FieldFace, FieldId, FieldState,
     FieldStates, FORM_ROWS,
+    problem_of, WARNING_RGBA,
     FMT_BUTTON_DIP, FMT_CHECK_DIP, FMT_CHEV_DIP, FMT_GAP_DIP, FMT_ITEM_DIP, FMT_MENU_DIP, FMT_RADIUS_DIP, FMT_RING_DIP,
     FMT_MENU_PAD_DIP, FMT_ITEM_RADIUS_DIP, FMT_MENU_LINE_DIP, FMT_MENU_RADIUS_DIP, FMT_OPTIONS, fmt_button_contains, fmt_button_rect, fmt_check_rect,
     fmt_chev_rect, fmt_item_at, fmt_item_label_rect, fmt_item_rect, fmt_label_rect,

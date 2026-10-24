@@ -973,6 +973,9 @@ fn save_from_panel(hwnd: windows_sys::Win32::Foundation::HWND) -> Option<service
     // sit above a save that is about to succeed, and the user would read the wrong outcome.
     if let Some(state) = state_mut(hwnd) {
         state.status = None;
+        // ...and the fields that were marked stop being marked, for the same reason: the answer is
+        // about to be replaced by a newer one.
+        state.fields.clear_messages();
     }
     let Some(s) = state(hwnd) else {
         return None;
@@ -1003,6 +1006,11 @@ fn save_from_panel(hwnd: windows_sys::Win32::Foundation::HWND) -> Option<service
     let status = status_of(&attempt);
     if let Some(state) = state_mut(hwnd) {
         state.status = status.clone();
+        // A validation key names the field it is about, and that field's border says so too: the
+        // status line says what happened, the border says where. Other failures have no field.
+        if let Err(service::SaveError::Validation { copy, .. }) = &attempt {
+            state.fields.mark(snapclip_ui::panel::problem_of(*copy));
+        }
     }
     match &attempt {
         Ok(outcome) => eprintln!(
@@ -1599,14 +1607,17 @@ extern "system" fn window_proc(
             let mut repaint = false;
             if let Some(s) = state_mut(hwnd) {
                 if let Some(id) = s.field_of(control) {
+                    // Focus is not allowed to overwrite a message about the value: the field would
+                    // fall silent exactly while the user is fixing what it complained about.
                     let next = match notification {
-                        EN_SETFOCUS => Some(snapclip_ui::panel::FieldState::Focused),
-                        EN_KILLFOCUS => Some(snapclip_ui::panel::FieldState::Idle),
+                        EN_SETFOCUS => Some(true),
+                        EN_KILLFOCUS => Some(false),
                         _ => None,
                     };
-                    if let Some(next) = next {
-                        s.fields.set(id, next);
-                        repaint = true;
+                    if let Some(focused) = next {
+                        let before = s.fields.state_of(id);
+                        s.fields.set_focus(id, focused);
+                        repaint = s.fields.state_of(id) != before;
                     }
                 }
             }

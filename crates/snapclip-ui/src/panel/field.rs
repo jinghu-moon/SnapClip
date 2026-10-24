@@ -12,6 +12,8 @@
 //! - `.text-input { border: 1px solid transparent }` (:167)  idle has no visible border
 //! - `.text-input:focus { border-color: accent; box-shadow: inset 0 0 0 1px accent }` (:169)
 //! - `.text-input.is-error { border-color: danger }` (:333)
+//! - `.text-input.is-warn { border-color: warning }` (:334), with `--warning: rgb(240,179,90)` (:23)
+//!   shared by `.status.is-warning` (:327) and the conflict link (:328)
 //! - `.text-input { padding: 0 10px; height: 32px }` (:167)
 
 use crate::panel::frame::{FrameMetrics, FrameRects};
@@ -74,6 +76,18 @@ pub enum FieldState {
     Focused,
     Error,
     Warning,
+}
+
+impl FieldState {
+    /// Whether this state is a message about the value rather than about the cursor.
+    ///
+    /// The design lets both apply at once (`:169` focus, `:333`/`:334` the message), and the message
+    /// wins because its rules come later. Paint order is therefore not a decision anyone makes here:
+    /// a field that has something wrong with it keeps saying so while it is being edited, which is
+    /// also when the user needs to read it.
+    pub fn is_message(self) -> bool {
+        matches!(self, FieldState::Error | FieldState::Warning)
+    }
 }
 
 /// Which field of the form a native `EDIT` is.
@@ -248,13 +262,44 @@ impl FieldStates {
         }
     }
 
-    /// Put one field into a state, leaving the others alone. This is what the focus notifications do.
+    /// Put one field into a state, leaving the others alone.
     pub fn set(&mut self, id: FieldId, state: FieldState) {
         match id {
             FieldId::Path => self.path = state,
             FieldId::Name => self.name = state,
             FieldId::SizeWidth => self.size_width = state,
             FieldId::SizeHeight => self.size_height = state,
+        }
+    }
+
+    /// Apply a focus change, unless the field is saying something about its value.
+    ///
+    /// This is the only rule that keeps a validation message alive while the user edits the field
+    /// that has it: the notification arrives, the message would be overwritten by `Focused` or
+    /// `Idle`, and the border would go quiet exactly when the text is still wrong. On losing focus
+    /// the message stays for the same reason. It is cleared where a new attempt is made, which is
+    /// the only place that knows the answer changed.
+    pub fn set_focus(&mut self, id: FieldId, focused: bool) {
+        if self.state_of(id).is_message() {
+            return;
+        }
+        self.set(id, if focused { FieldState::Focused } else { FieldState::Idle });
+    }
+
+    /// Put a message on one field. Returns whether anything was there to clear afterwards.
+    pub fn mark(&mut self, problem: Option<(FieldId, FieldState)>) {
+        if let Some((id, state)) = problem {
+            self.set(id, state);
+        }
+    }
+
+    /// Clear every message, leaving focus alone. Called when a save attempt starts, so a sentence
+    /// about the previous attempt cannot outlive it.
+    pub fn clear_messages(&mut self) {
+        for id in FieldId::ALL {
+            if self.state_of(id).is_message() {
+                self.set(id, FieldState::Idle);
+            }
         }
     }
 
@@ -296,11 +341,18 @@ fn fill_over_surface(surface: [u8; 4]) -> [u8; 4] {
     [mix(surface[0]), mix(surface[1]), mix(surface[2]), 255]
 }
 
+/// `--warning: rgb(240,179,90)` — `save-panel-demo-v3.html:23`. The one warning yellow.
+///
+/// Three rules use it: a warning field's border (`:334`), the status line's warning (`:327`) and the
+/// conflict link (`:328`). It was two literals before — the border's was a brighter yellow taken by
+/// eye — so the same message was drawn in two colours depending on where you looked.
+pub const WARNING_RGBA: [u8; 4] = [240, 179, 90, 255];
+
 /// The colours for a state. Pure, so the rules can be tested without a device.
 pub fn field_colours(state: FieldState, surface: [u8; 4]) -> FieldColours {
     const ACCENT: [u8; 4] = [31, 117, 219, 255];
     const DANGER: [u8; 4] = [255, 123, 123, 255];
-    const WARNING: [u8; 4] = [255, 191, 0, 255];
+    const WARNING: [u8; 4] = WARNING_RGBA;
     const TEXT: [u8; 4] = [255, 255, 255, 255];
     const CLEAR: [u8; 4] = [0, 0, 0, 0];
 
@@ -316,6 +368,35 @@ pub fn field_colours(state: FieldState, surface: [u8; 4]) -> FieldColours {
         FieldState::Error => FieldColours { fill, border: DANGER, inset: None, text: TEXT },
         FieldState::Warning => FieldColours { fill, border: WARNING, inset: None, text: TEXT },
     }
+}
+
+/// Which field a validation message is about, and how loudly it says it.
+///
+/// The key travels from the save service, so this is the one place that decides where a sentence
+/// appears. A message with no field is still said on the status line — the mapping returning `None`
+/// means "the row is fine, the attempt is not", not "say nothing".
+pub fn problem_of(
+    copy: crate::copy::ValidationCopy,
+) -> Option<(FieldId, FieldState)> {
+    use crate::copy::{Level, ValidationCopy};
+    let field = match copy {
+        ValidationCopy::PathEmpty
+        | ValidationCopy::PathNotAbsolute
+        | ValidationCopy::PathIllegalChars
+        | ValidationCopy::NoWritePermission
+        | ValidationCopy::NotEnoughSpace
+        | ValidationCopy::DirectoryMissing
+        | ValidationCopy::PathTooLong => FieldId::Path,
+        ValidationCopy::StemEmpty
+        | ValidationCopy::StemIllegalChars
+        | ValidationCopy::StemReservedName
+        | ValidationCopy::StemTrailingDotOrSpace => FieldId::Name,
+    };
+    let state = match copy.level() {
+        Level::Warn => FieldState::Warning,
+        Level::Error => FieldState::Error,
+    };
+    Some((field, state))
 }
 
 /// The rect of the first form slot's field, derived from the design's own slot arithmetic rather
@@ -1446,6 +1527,93 @@ mod tests {
     use super::*;
 
     const SURFACE: [u8; 4] = [23, 23, 28, 235];
+
+    /// `--warning` (`:23`) is one value for the border (`:334`), the status line (`:327`) and the
+    /// conflict link (`:328`). The border used to carry `255,191,0`, a yellow the mockup does not
+    /// contain, so the same message appeared in two colours depending on where you read it.
+    #[test]
+    fn the_field_warning_is_the_designs_warning() {
+        let border = field_colours(FieldState::Warning, SURFACE).border;
+        assert_eq!(border, [240, 179, 90, 255], "warning border is --warning (:334, :23)");
+        assert_eq!(
+            crate::panel::frame::DEMO_PALETTE.warning,
+            border,
+            "the status line and the field border must be the same yellow (:327, :334)"
+        );
+        assert_eq!(
+            border, WARNING_RGBA,
+            "the border reads the one constant, so the two cannot drift apart again"
+        );
+    }
+
+    /// Every one of the eleven keys names its field, and the level decides how loudly it says so.
+    /// A key with no field would mean the sentence appears nowhere but the status line, which is
+    /// right for a whole-attempt failure and wrong for a field the user can fix.
+    #[test]
+    fn every_validation_key_names_the_field_it_is_about() {
+        use crate::copy::{Level, ValidationCopy};
+        for copy in ValidationCopy::ALL {
+            let (field, state) = problem_of(copy).expect("every key names a field");
+            let expected_field = match copy {
+                ValidationCopy::StemEmpty
+                | ValidationCopy::StemIllegalChars
+                | ValidationCopy::StemReservedName
+                | ValidationCopy::StemTrailingDotOrSpace => FieldId::Name,
+                ValidationCopy::PathEmpty
+                | ValidationCopy::PathNotAbsolute
+                | ValidationCopy::PathIllegalChars
+                | ValidationCopy::NoWritePermission
+                | ValidationCopy::NotEnoughSpace
+                | ValidationCopy::DirectoryMissing
+                | ValidationCopy::PathTooLong => FieldId::Path,
+            };
+            assert_eq!(field, expected_field, "{copy:?} belongs to {expected_field:?}");
+            let expected_state = match copy.level() {
+                Level::Warn => FieldState::Warning,
+                Level::Error => FieldState::Error,
+            };
+            assert_eq!(state, expected_state, "{copy:?} keeps its level");
+        }
+    }
+
+    /// The rule that keeps a message readable: focus changes the cursor, not the verdict.
+    #[test]
+    fn a_message_survives_focus_until_the_next_attempt() {
+        let mut states = FieldStates::IDLE;
+        states.mark(problem_of(crate::copy::ValidationCopy::StemEmpty));
+        assert_eq!(states.state_of(FieldId::Name), FieldState::Error);
+
+        // Clicking into the field must not turn the red border into the focus accent.
+        states.set_focus(FieldId::Name, true);
+        assert_eq!(
+            states.state_of(FieldId::Name),
+            FieldState::Error,
+            "focus must not overwrite a message about the value (:333 over :169)"
+        );
+
+        // Another field is unaffected by both.
+        states.set_focus(FieldId::Path, true);
+        assert_eq!(states.state_of(FieldId::Path), FieldState::Focused);
+
+        // A new attempt clears the message and nothing else.
+        states.clear_messages();
+        assert_eq!(states.state_of(FieldId::Name), FieldState::Idle);
+        assert_eq!(
+            states.state_of(FieldId::Path),
+            FieldState::Focused,
+            "clearing messages leaves focus alone"
+        );
+    }
+
+    /// The focus path still works on a field with nothing wrong with it.
+    #[test]
+    fn focus_still_paints_a_clean_field() {
+        let mut states = FieldStates::IDLE;
+        states.set_focus(FieldId::Name, true);
+        assert_eq!(states.state_of(FieldId::Name), FieldState::Focused);
+        states.set_focus(FieldId::Name, false);
+        assert_eq!(states.state_of(FieldId::Name), FieldState::Idle);
+    }
 
     /// The four rules quoted at the top of the file, tested without a device.
     #[test]

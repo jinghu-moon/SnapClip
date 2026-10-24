@@ -193,12 +193,12 @@ pub struct FramePalette {
     /// `--accent-text: rgb(94,162,245)` (`:29`) — the brighter blue the design uses for small marks
     /// on the dark surface, because the primary accent is only about 4:1 against it.
     pub accent_text: [u8; 4],
-    /// `--warning: rgb(240,179,90)` (`:23`) — the colour `.status.is-warning` (`:327`) and the
-    /// conflict link (`:328`) use.
+    /// `--warning: rgb(240,179,90)` (`:23`) — the colour `.status.is-warning` (`:327`), the conflict
+    /// link (`:328`) and `.text-input.is-warn` (`:334`) all use.
     ///
-    /// It is **not** the colour `field_colours` gives a warning field's border (`255,191,0`): that
-    /// token does not appear in the mockup at all and is recorded as an open question in `docs/41`.
-    /// Two different yellows for two different jobs is exactly how "the warning looks wrong" starts.
+    /// One token, one value: `field_colours` reads the same constant for a warning field's border
+    /// (`panel::WARNING_RGBA`), because two yellows for two jobs is how "the warning looks wrong"
+    /// starts — and it already had, when the border carried a brighter yellow taken by eye.
     pub warning: [u8; 4],
 }
 
@@ -209,7 +209,7 @@ pub const DEMO_PALETTE: FramePalette = FramePalette {
     muted: [232, 236, 242, 158],
     label: [232, 236, 242, 189],
     accent_text: [94, 162, 245, 255],
-    warning: [240, 179, 90, 255],
+    warning: crate::panel::field::WARNING_RGBA,
 };
 
 /// Brushes the frame paints with. A brush belongs to the target that made it, so the caller
