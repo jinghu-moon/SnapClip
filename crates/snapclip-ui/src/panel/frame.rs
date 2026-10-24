@@ -410,6 +410,15 @@ pub struct Frame<'a> {
     /// Whether the menu is open. Open draws the accent border, turns the chevron over and draws the
     /// menu itself; the message handler owns the flag, and the painter only reads it.
     pub format_open: bool,
+    /// The colour a transparent pixel becomes when the format cannot carry alpha (`S.fill`, `:724`).
+    ///
+    /// Straight order in the buffer's channels, the same shape the save takes, so the swatch that
+    /// looks chosen and the colour the encoder composites are one value rather than two that have to
+    /// agree. Only JPG spends it, and only while its row is shown (`:1102`).
+    pub fill: [u8; 3],
+    /// The fill row's label format: `.limit-label { font-size: var(--fs-row) }` (`:309`) at normal
+    /// weight, which is neither the row label's 500 (`:166`) nor the hint's ten dip (`:262`).
+    pub fill_label: Option<&'a IDWriteTextFormat>,
     /// The footer's one line of message, with the severity that decides its colour.
     ///
     /// The level comes from the message's own rule (`copy::ValidationCopy::level`), not from the
@@ -727,6 +736,65 @@ impl Frame<'_> {
             );
         }
 
+        // The transparent fill row (`:655`), which `:1102` shows for JPG and for nothing else: PNG
+        // carries alpha and this project's WebP is lossless, so JPEG is the only format whose
+        // transparent pixels have to become a colour. The same predicate gates the click, so a row
+        // that is not drawn cannot be changed.
+        if crate::panel::fill_row_shown(self.format) {
+            let row = crate::panel::fill_row_rect(self.metrics, self.rects, self.scale);
+            if let Some(format) = self.fill_label {
+                painter.draw_text(crate::panel::field::FILL_ROW_LABEL, format, row, &self.brushes.muted);
+            }
+            let chosen = crate::panel::fill_swatch_selected(self.fill);
+            let radius = crate::panel::FILL_SWATCH_RADIUS_DIP * self.scale;
+            let swatch_side =
+                crate::panel::field::fill_swatch_rect(self.metrics, self.rects, self.scale, 0)
+                    .width();
+            // Supersampled: the swatch is drawn at several times its final size and the bitmap
+            // scale brings the edge down, which is where the smoothing comes from — the same
+            // arrangement the baked glyphs use.
+            let baked = (swatch_side * 4).clamp(16, 96) as u32;
+            let baked_radius = radius * 4.0;
+            for index in 0..crate::panel::FILL_SWATCHES {
+                let rect =
+                    crate::panel::fill_swatch_rect(self.metrics, self.rects, self.scale, index);
+                let pixels = match (index, chosen) {
+                    (0, _) => crate::panel::icons::rounded_square_bgra(
+                        baked,
+                        crate::panel::FILL_WHITE,
+                        baked_radius,
+                    ),
+                    (1, _) => crate::panel::icons::rounded_square_bgra(
+                        baked,
+                        crate::panel::FILL_BLACK,
+                        baked_radius,
+                    ),
+                    // The one that opens a picker wears the design's conic gradient (`:317`) until a
+                    // colour has been picked, and that colour afterwards, so a custom choice is
+                    // visible after the dialog closes rather than only while it is open.
+                    (_, 2) => crate::panel::icons::rounded_square_bgra(
+                        baked,
+                        self.fill,
+                        baked_radius,
+                    ),
+                    _ => crate::panel::icons::hue_wheel_bgra(baked, baked_radius),
+                };
+                let bitmap = painter.bgra_bitmap_with_alpha(baked, baked, &pixels)?;
+                painter.draw_bitmap_at(&bitmap, rect);
+                let corner = radius.round() as i32;
+                painter.stroke_round(rect, corner, &self.brushes.line, 1.0);
+                if index == chosen {
+                    // `.bg-opt.is-on { box-shadow: 0 0 0 1.5px var(--surface), 0 0 0 3px var(--accent) }`
+                    // (`:153`): the ring sits three dip out, a dip and a half thick, with the panel
+                    // showing through the gap.
+                    let offset = (crate::panel::FILL_RING_OFFSET_DIP * self.scale).round() as i32;
+                    let ring = rect.inflate(offset);
+                    let width = crate::panel::FILL_RING_DIP * self.scale;
+                    painter.stroke_round(ring, corner + offset, &self.brushes.accent, width);
+                }
+            }
+        }
+
         if let Some((text, format)) = self.title {
             painter.draw_text(
                 text,
@@ -741,9 +809,21 @@ impl Frame<'_> {
         // rather than from literals here, and every one of those characters is in the embedded
         // subset because the coverage gate's list calls the same producer.
         if let Some(format) = self.row_label {
+            let fill_row = crate::panel::fill_row_shown(self.format);
             for row in crate::panel::field::FORM_ROWS {
-                let rect =
-                    crate::panel::field::label_rect(self.metrics, self.rects, self.scale, row);
+                // The estimate is the only row below the quality row, so it is the only one whose
+                // position depends on whether the fill row is showing — and that is decided by the
+                // chosen format (`:1102`), not by a constant.
+                let rect = if row == crate::panel::field::Row::Estimate {
+                    crate::panel::estimate_label_rect(
+                        self.metrics,
+                        self.rects,
+                        self.scale,
+                        fill_row,
+                    )
+                } else {
+                    crate::panel::field::label_rect(self.metrics, self.rects, self.scale, row)
+                };
                 painter.draw_text(row.label(), format, rect, &self.brushes.label);
             }
         }
@@ -1401,6 +1481,12 @@ pub fn status_format(dwrite: &IDWriteFactory, dpi: f32) -> Result<IDWriteTextFor
     text_format(dwrite, dpi, STATUS_FONT_DIP, DWRITE_FONT_WEIGHT_NORMAL)
 }
 
+/// The fill row's label: `.limit-label { font-size: var(--fs-row) }` (`:309`) at the body weight —
+/// eleven dip like a row label (`:35`), but without the 500 that `.row-label` carries (`:166`).
+pub fn fill_label_format(dwrite: &IDWriteFactory, dpi: f32) -> Result<IDWriteTextFormat> {
+    text_format(dwrite, dpi, STATUS_FONT_DIP, DWRITE_FONT_WEIGHT_NORMAL)
+}
+
 /// `.var-item { font-size: 12px }` (`save-panel-demo-v3.html:219`). The token menu's labels.
 pub const VAR_FONT_DIP: f32 = 12.0;
 
@@ -1618,6 +1704,9 @@ pub struct PaintInput<'a> {
     pub format: usize,
     /// Whether the format menu is open.
     pub format_open: bool,
+    /// The colour a transparent pixel becomes when the format cannot carry alpha, in the buffer's
+    /// own channel order, the same value `PanelValues::fill` gives the encoder.
+    pub fill: [u8; 3],
     /// The footer's button widths, measured by the window so a click is tested against the
     /// rectangles that were drawn. `None` measures here, which is what a caller that only paints
     /// wants.
@@ -1652,6 +1741,7 @@ impl<'a> PaintInput<'a> {
             quality: 0,
             format: 0,
             format_open: false,
+            fill: crate::panel::FILL_WHITE,
             footer_widths: None,
             path_change: 0,
             status: None,
@@ -1712,6 +1802,8 @@ pub fn paint_to_dc_with_preview(
     let hint = hint_format(dwrite, input.dpi)?;
     // The size row's four shortcuts, in the numeric face at the chip's own eleven dip (`:259`).
     let preset_label = preset_label_format(dwrite, input.dpi)?;
+    // The fill row's label (`.limit-label`, `:309`).
+    let fill_label = fill_label_format(dwrite, input.dpi)?;
     let painter = PanelPainter {
         context: &target,
         text_factory: dwrite,
@@ -1738,6 +1830,8 @@ pub fn paint_to_dc_with_preview(
         format_label: Some(&format_label),
         format: input.format,
         format_open: input.format_open,
+        fill: input.fill,
+        fill_label: Some(&fill_label),
         footer_widths: input.footer_widths,
         path_change: input.path_change,
         status: input.status,
@@ -2147,6 +2241,73 @@ mod tests {
     ///
     /// Checked at 2× for the same reason as the close glyph: the graphic is a line drawing, and at
     /// unit scale a one point four dip stroke is spread over two pixels and never reaches its colour.
+    #[test]
+    /// The fill row is drawn for JPG and for nothing else, and each swatch is its own colour at its
+    /// own place.
+    ///
+    /// The absolute colours are the point: a rule that only asked "is there ink in these boxes"
+    /// passes for three identical swatches, for one hue wheel everywhere, and for a row drawn in a
+    /// format that has no fill to choose. `:1102` is what decides the row's existence, and the same
+    /// function gates the click, so this also pins that a PNG panel has nothing there to click.
+    #[test]
+    fn the_fill_row_draws_three_swatches_for_jpg_and_none_for_png() {
+        let canvas = Canvas::new_at(1840, 1040, 192.0);
+        let rects = DEMO.rects(2.0);
+        let centre = |rect: Rect| ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
+
+        canvas.render_fill(crate::panel::FMT_JPG_INDEX, crate::panel::FILL_WHITE);
+        let jpg = canvas.pixels();
+        let white = crate::panel::fill_swatch_rect(&DEMO, &rects, 2.0, 0);
+        let black = crate::panel::fill_swatch_rect(&DEMO, &rects, 2.0, 1);
+        let wheel = crate::panel::fill_swatch_rect(&DEMO, &rects, 2.0, 2);
+
+        let (wx, wy) = centre(white);
+        assert_px(
+            &jpg,
+            wx,
+            wy,
+            Px { b: 255, g: 255, r: 255, a: 255 },
+            8,
+            "the first swatch is the white fill",
+        );
+        let (bx, by) = centre(black);
+        assert_px(
+            &jpg,
+            bx,
+            by,
+            Px { b: 0, g: 0, r: 0, a: 255 },
+            8,
+            "the second swatch is the black fill",
+        );
+        // The third opens a picker, so with white chosen it still shows the design's wheel (`:317`)
+        // rather than a third flat swatch: one colour there would mean the row cannot say "any
+        // colour", and a grey would mean the wheel was painted without its hues.
+        let (cx, cy) = centre(wheel);
+        let seen = jpg.pixel(cx, cy);
+        assert!(
+            !(close(seen, Px { b: 255, g: 255, r: 255, a: 255 }, 8)
+                || close(seen, Px { b: 0, g: 0, r: 0, a: 255 }, 8)),
+            "the third swatch is the colour wheel, not white or black, saw {seen:?}"
+        );
+        assert!(
+            (i32::from(seen.b) - i32::from(seen.r)).abs() > 24,
+            "and it is a colour rather than a grey, saw {seen:?}"
+        );
+
+        // PNG keeps its alpha, so `:1102` never shows the row. What can be said about the same
+        // place is only that neither swatch is there: without the fill row the rows below it move
+        // up by its height, so the pixel is no longer the empty row it was, and claiming it were
+        // the surface would be an assertion about the layout rather than about the swatches.
+        canvas.render_fill(crate::panel::FMT_PNG_INDEX, crate::panel::FILL_WHITE);
+        let png = canvas.pixels();
+        let seen = png.pixel(wx, wy);
+        assert!(
+            !(close(seen, Px { b: 255, g: 255, r: 255, a: 255 }, 8)
+                || close(seen, Px { b: 0, g: 0, r: 0, a: 255 }, 8)),
+            "a PNG panel has no fill row, so no swatch is drawn at ({wx},{wy}), saw {seen:?}"
+        );
+    }
+
     #[test]
     fn the_variable_button_is_drawn_inside_the_name_field() {
         let canvas = Canvas::new_at(1840, 1040, 192.0);
@@ -2841,6 +3002,26 @@ mod tests {
                 &PaintInput {
                     size_mode: mode,
                     size_mode_widths: Some(SIZE_MODE_WIDTHS),
+                    ..PaintInput::idle(self.dpi)
+                },
+            )
+            .expect("the frame paints");
+        }
+
+        /// Render with a chosen format and fill colour, which is the state the format menu and the
+        /// fill row's swatches leave behind.
+        fn render_fill(&self, format: usize, fill: [u8; 3]) {
+            let factory = factory().expect("a Direct2D factory");
+            let dwrite = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED) }
+                .expect("a DirectWrite factory");
+            paint_to_dc_with_preview(
+                &factory,
+                &dwrite,
+                self.dc,
+                Rect::new(0, 0, self.width, self.height),
+                &PaintInput {
+                    format,
+                    fill,
                     ..PaintInput::idle(self.dpi)
                 },
             )

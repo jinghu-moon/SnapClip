@@ -709,6 +709,7 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
             fields: snapclip_ui::panel::FieldStates::IDLE,
             controls: [std::ptr::null_mut(); snapclip_ui::panel::FieldId::ALL.len()],
             fill_brush,
+            fill: snapclip_ui::panel::FILL_WHITE,
             segment: snapclip_ui::panel::quality_segment_state(&metrics, &rects, scale, 0),
             segment_scale: scale,
             footer_widths,
@@ -908,6 +909,12 @@ struct WindowState {
     /// the default white would show as a lit rectangle, so the field's resolved fill is handed over
     /// instead. Created once and owned by this state.
     fill_brush: windows_sys::Win32::Graphics::Gdi::HBRUSH,
+    /// The colour a transparent pixel becomes when the format cannot carry alpha (`S.fill`, `:724`).
+    ///
+    /// Straight order in the buffer's channels, which is what `PanelValues::fill` and the fill row's
+    /// swatches both read, so the colour the panel shows chosen and the colour the encoder
+    /// composites are one value. Only JPEG spends it; PNG and this project's WebP keep their alpha.
+    fill: [u8; 3],
     /// The quality control's state. Its geometry comes from the same producer the painter draws
     /// with, so a click lands on the option whose block the user can see, and its selection is owned
     /// by `segmented`'s state machine rather than by a second set of rules here. The chosen option is
@@ -1214,13 +1221,6 @@ fn local_date_and_time() -> (String, String) {
     )
 }
 
-/// The colour a transparent pixel becomes in a format that has no alpha channel.
-///
-/// The mockup's default (S.fill, :724) and what the two swatches beside it will offer once they
-/// are drawn: white. Kept here rather than in the window state because nothing can change it yet, and
-/// a field nobody writes is a field that eventually lies.
-const WHITE_FILL: [u8; 3] = [255, 255, 255];
-
 /// Which format a menu index stands for.
 ///
 /// The menu's order is the design's (FMT_OPTIONS, :717): PNG, JPG, WebP. The mapping lives here
@@ -1279,6 +1279,66 @@ fn panel_values<'a>(
 /// - everything else says something, at the level its own rule gives it, so a warning that does not
 ///   block a save and an error that does cannot be painted the same red.
 ///
+/// Answers a click on one of the fill row's three swatches (`:658`–`:660`), reporting whether the
+/// colour changed.
+///
+/// The first two are the design's fixed colours and simply become the fill. The third is an
+/// `<input type="color">` in the mock, so it opens the system picker instead: only a confirmed
+/// choice changes the colour, which is the same rule the folder picker follows — a cancelled dialog
+/// leaves the panel exactly as it was. The colour travels in the buffer's channel order, and
+/// `COLORREF` is `0x00BBGGRR`, so the conversion happens here once rather than at each use.
+fn choose_fill(hwnd: windows_sys::Win32::Foundation::HWND, index: usize) -> bool {
+    let Some(s) = state_mut(hwnd) else {
+        return false;
+    };
+    match index {
+        0 | 1 => {
+            let wanted = if index == 0 {
+                snapclip_ui::panel::FILL_WHITE
+            } else {
+                snapclip_ui::panel::FILL_BLACK
+            };
+            let changed = s.fill != wanted;
+            s.fill = wanted;
+            changed
+        }
+        _ => {
+            use windows_sys::Win32::UI::Controls::Dialogs::{CHOOSECOLORW, ChooseColorW};
+            let current = s.fill;
+            let start = u32::from(current[0])
+                | u32::from(current[1]) << 8
+                | u32::from(current[2]) << 16;
+            let mut custom: [u32; 16] = [0; 16];
+            let mut picker = CHOOSECOLORW {
+                lStructSize: std::mem::size_of::<CHOOSECOLORW>() as u32,
+                hwndOwner: hwnd,
+                hInstance: std::ptr::null_mut(),
+                rgbResult: start,
+                lpCustColors: custom.as_mut_ptr(),
+                // `CC_RGBINIT` starts on the colour the panel already has; `CC_FULLOPEN` opens the
+                // custom half straight away, which is the only half a swatch that says "custom"
+                // should lead to.
+                Flags: 0x0000_0001 | 0x0000_0002,
+                lCustData: 0,
+                lpfnHook: None,
+                lpTemplateName: std::ptr::null(),
+            };
+            let confirmed = unsafe { ChooseColorW(&mut picker) } != 0;
+            if !confirmed {
+                return false;
+            }
+            let picked = [
+                (picker.rgbResult & 0xff) as u8,
+                ((picker.rgbResult >> 8) & 0xff) as u8,
+                ((picker.rgbResult >> 16) & 0xff) as u8,
+            ];
+            let changed = s.fill != picked;
+            s.fill = picked;
+            changed
+        }
+    }
+}
+
 /// The wording comes from the two places that own it: the validation table's `copy` (with its filled
 /// `detail` when it has one), and `SaveError::message` for the rest.
 fn status_of(
@@ -1403,7 +1463,7 @@ fn save_from_panel(hwnd: windows_sys::Win32::Foundation::HWND) -> Option<service
         remembered.sequence.next(),
         format_of_index(s.format),
         super::assemble::quality_of_tier(s.chosen_quality()),
-        WHITE_FILL,
+        s.fill,
     );
     let frame = super::scale::Frame {
         bgra,
@@ -2066,6 +2126,7 @@ extern "system" fn window_proc(
                                 quality: s.chosen_quality(),
                                 format: s.format,
                                 format_open: s.format_open,
+                                fill: s.fill,
                                 footer_widths: Some(s.footer_widths),
                                 path_change: s.path_change,
                                 var_open: s.var_open,
@@ -2378,6 +2439,30 @@ extern "system" fn window_proc(
                         reset_size(hwnd, s);
                     }
                     return 0;
+                }
+            }
+            // The fill row's swatches answer only while the row is drawn: `:1102` shows it for JPG
+            // alone, and the same predicate gates this, so a swatch that is not on screen cannot
+            // change the colour the encoder will composite with.
+            if event == snapclip_ui::panel::PointerEvent::Down {
+                let metrics = snapclip_ui::panel::DEMO;
+                let scale = dpi_scale(hwnd);
+                let rects = metrics.rects(scale);
+                let shown = state(hwnd)
+                    .map(|s| snapclip_ui::panel::fill_row_shown(s.format))
+                    .unwrap_or(false);
+                if shown {
+                    if let Some(index) = snapclip_ui::panel::fill_swatch_at(
+                        &metrics,
+                        &rects,
+                        scale,
+                        (point.x, point.y),
+                    ) {
+                        if choose_fill(hwnd, index) {
+                            InvalidateRect(hwnd, std::ptr::null(), 0);
+                        }
+                        return 0;
+                    }
                 }
             }
             // The quality control only answers while it is drawn. PNG has no tier to pick, so the row
@@ -2717,7 +2802,7 @@ mod tests {
             7,
             format_of_index(0),
             crate::save::assemble::quality_of_tier(0),
-            WHITE_FILL,
+            snapclip_ui::panel::FILL_WHITE,
         );
         assert_eq!(values.directory, r"C:\shots");
         assert_eq!(values.name, "SnapClip_[日期]");
@@ -2979,6 +3064,7 @@ mod tests {
             controls: [std::ptr::null_mut(); snapclip_ui::panel::FieldId::ALL.len()],
             preview: None,
             fill_brush: std::ptr::null_mut(),
+            fill: snapclip_ui::panel::FILL_WHITE,
             segment: snapclip_ui::panel::quality_segment_state(
                 &snapclip_ui::panel::DEMO,
                 &snapclip_ui::panel::DEMO.rects(1.0),
@@ -3048,6 +3134,7 @@ mod tests {
             controls: [std::ptr::null_mut(); snapclip_ui::panel::FieldId::ALL.len()],
             preview: None,
             fill_brush: std::ptr::null_mut(),
+            fill: snapclip_ui::panel::FILL_WHITE,
             segment: snapclip_ui::panel::quality_segment_state(
                 &snapclip_ui::panel::DEMO,
                 &snapclip_ui::panel::DEMO.rects(1.0),
@@ -3121,6 +3208,7 @@ mod tests {
             controls: [std::ptr::null_mut(); snapclip_ui::panel::FieldId::ALL.len()],
             preview: None,
             fill_brush: std::ptr::null_mut(),
+            fill: snapclip_ui::panel::FILL_WHITE,
             segment: snapclip_ui::panel::quality_segment_state(
                 &snapclip_ui::panel::DEMO,
                 &snapclip_ui::panel::DEMO.rects(1.0),
@@ -3343,6 +3431,7 @@ mod tests {
             controls: [std::ptr::null_mut(); snapclip_ui::panel::FieldId::ALL.len()],
             preview: Some((bgra.clone(), 4, 3)),
             fill_brush: std::ptr::null_mut(),
+            fill: snapclip_ui::panel::FILL_WHITE,
             segment: snapclip_ui::panel::quality_segment_state(
                 &snapclip_ui::panel::DEMO,
                 &snapclip_ui::panel::DEMO.rects(1.0),

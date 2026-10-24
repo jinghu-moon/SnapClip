@@ -1244,6 +1244,39 @@ check --workspace --all-targets  Finished ✓  死代码 0 ✓
 
 **新增缺口**：
 
-- **A34 填充色的两个色块没画、没接** ✗ —— 现在只有默认白，`WHITE_FILL` 是常量；色块与自定义色要 `ChooseColorW`，且色块只在 JPG 时出现。
-- **A35 填充的文件级断言缺** ✗ —— `over_fill` 是纯函数且有测试，但「存成 JPG 后那个透明像素变成填充色」需要**解码 JPEG** 才能断言，本批没做（WIC 能解，但要先把 WIC 引进 app 的测试）。
+- ~~**A34 填充色的两个色块没画、没接** ✗~~ ⇒ **已做** ✓（见文末「JPG 的填充行」）。
+- ~~**A35 填充的文件级断言缺** ✗~~ ⇒ **已做** ✓：`image` 0.25（含 `jpeg`）**本来就是 app 的 dev-dependency** ✓，注释写明用途就是跨解码器 ✓ ⇒ **零新依赖** ✓。
 - **A36 尺寸模式与重置的消息处理没有被测试** ✗ —— 规则（`output_size` / `display_text` / 两个命中函数）都被断言，但「点击真的到达它们」要真窗口。
+
+## JPG 的填充行（这一批）
+
+**为什么只在 JPG** ✗✓ —— 这一条是**从 demo 的 JS 里读实**的 ✓，不是猜的 ✓：`:1102` 是 `$('fill-row').classList.toggle('is-on', S.format === 1)` ✓ ⇒ 只有 `.JPG` ✓。理由也成立 ✓：PNG 有 alpha ✓，本项目的 WebP 无损且保留 alpha ✓ ⇒ 只有 JPEG 必须替透明像素选一个颜色 ✓。`fill_row_shown(format)` 是**唯一判定** ✓，`paint` 与命中**都问它** ✓ ⇒ 看不见的行点不动 ✓。
+
+**几何**（全部带行号 ✓）：`.fill-row { min-height: 22px }`（`:315`）· `.form-row { gap: 6px }`（`:164`）· `.bg-opt { 16×16; border-radius: 4 }`（`:150`, `:58`）· `.bg-switch { gap: 8px }`（`:149`）· `.bg-opt.is-on { box-shadow: 0 0 0 1.5px surface, 0 0 0 3px accent }`（`:153`）· `.limit-label`（`:309`）· `透明区域填充`（`:656`）。
+
+**布局后果** ✗：填充行在**质量行内部** ✓ ⇒ 它一出现 ✓，**预估行下移 28**（22 + 6）✗ ⇒ 而它**由格式决定** ✓ ⇒ 预估行的位置成了**格式的函数** ✗。这里**没有**把标志穿过十六个调用点 ✗，而是加了一个 `estimate_label_rect(.., fill_row)` ✓ —— 因为**只有这一行**在质量行下面 ✓；理由写在函数注释里 ✓。
+
+**画法** ✗：没有白/黑画刷 ✗ ⇒ 三个色块用**位图**画 ✓，圆角**烘焙进 alpha** ✓（`icons::rounded_square_bgra` ✓）；第三块是 demo 的**色轮** ✓（`:317`）⇒ `icons::hue_wheel_bgra` ✓，角度从**正上方顺时针** ✓（与 CSS `conic-gradient` 同向 ✓），自绘 96×96 后由 `draw_bitmap_at` 缩小 ✓（平滑来自降采样 ✓，与图标同法 ✓）。选了自定义色之后，第三块**显示那个颜色** ✓（否则关掉取色器就看不见自己选了什么 ✗）。
+
+**接** ✓：白/黑两个直接置位 ✓；第三个开**系统取色器** ✓（`ChooseColorW` + `CC_RGBINIT|CC_FULLOPEN` ✓ —— demo 那里是 `<input type="color">` ✓），**取消则不变** ✓（与文件夹选择器同一条规则 ✓）。`COLORREF` 是 `0x00BBGGRR` ✓，缓冲是直通的 `[b,g,r]` ✓ ⇒ 转换只在一处 ✓。新增的 feature 只有 `Win32_UI_Controls_Dialogs` ✓（不是新 crate ✓）。
+
+**A35 的文件级证据** ✗✓：16×16 的图，正中 4×4 **完全透明** ✓ ⇒ 存 JPG（填充黑）⇒ 用 **`image` 解码**（与编码器 `zenjpeg` **不同** ✓）⇒ **那一点读回来是黑的** ✓；**对照**：同一张图填充白 ⇒ 那一点**是白的** ✓（否则"编码器把一切都压暗了"也能让第一条通过 ✗）；再存 PNG ⇒ 同一点 **alpha 仍是 0** ✓。
+
+**变异**（各先断言替换命中 1 处 ✓，还原后 SHA256 逐字节一致 ✓）✗：
+
+| 变异 | 红的信息 |
+| --- | --- |
+| 填充恒为白（忽略面板选择）✗ | `the transparent pixel became the black fill, but the file reads Rgba([252,255,234,255])` ✓ |
+| 填充对**所有格式**都施加 ✗ | `PNG keeps the selection's transparency`（left 255 / right 0）✓ |
+| 填充行对**所有格式**都显示 ✗ | 纯逻辑那条 + 位图那条（`no swatch is drawn at (1696,874), saw Px{b:255,…}`）✓ |
+| 白/黑两块**互换** ✗ | `the first swatch is the white fill: … saw Px{b:0,…}` ✓ |
+
+**两条测试我一开始写错了，都是"自己比自己"的近亲** ✗✓：
+
+1. `the_custom_swatch_is_a_wheel_rather_than_one_colour` 里把 `top` 放进**与 `top` 自己比较**的循环里 ✗ ⇒ 这条断言**永远为假不了** ✓；改成**两两比较** ✓。这正是这一轮反复遇到的那一类 ✗，这次是我自己写出来的 ✓。
+2. 色块居中那条要求"上下间隙**相等**"✗ —— 两次独立取整在奇数余数上会差 1 px ✓ ⇒ 改成"**相差 ≤ 1**" ✓（不是弱化 ✓，是整数网格上唯一能成立的说法 ✓）。
+
+**诚实边界** ✗：
+
+- **A37** ✗：色块与取色器的**点击消息处理没有被测试** ✓ —— 规则（`fill_row_shown` / `fill_swatch_at` / `fill_swatch_selected`）与绘制都有断言 ✓，但"点击真的到达 `choose_fill`"要真窗口 ✓。
+- 填充行**没有**把限制体积、`不超过…KB`、`自动缩小尺寸`（`:645`–`:653`）一起做 ✓ —— 那属于 A30 ✓。

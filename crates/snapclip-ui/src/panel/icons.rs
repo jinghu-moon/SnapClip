@@ -168,6 +168,89 @@ pub fn flipped_180(rgba: &[u8], side: usize) -> Vec<u8> {
     out
 }
 
+/// A rounded square of one colour, as premultiplied BGRA ready for a bitmap.
+///
+/// The corners are baked into the alpha because a bitmap has none of its own: the fill row's
+/// swatches are drawn with `draw_bitmap_at`, and a square of colour under a rounded border would
+/// show its square corners outside it. The caller generates at several times the drawn size and
+/// lets the bitmap scale down, which is where the edge smoothing comes from.
+pub fn rounded_square_bgra(side: u32, colour: [u8; 3], radius: f32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(side as usize * side as usize * 4);
+    let edge = side as f32;
+    for y in 0..side {
+        for x in 0..side {
+            if rounded_rect_covers(x as f32 + 0.5, y as f32 + 0.5, edge, radius) {
+                // Premultiplied, which is what the bitmap's alpha mode expects. The colour arrives
+                // in the buffer's own order already (blue first), as `PanelValues::fill` does, and
+                // alpha is full because a swatch is a solid colour.
+                out.extend_from_slice(&[colour[0], colour[1], colour[2], 255]);
+            } else {
+                out.extend_from_slice(&[0, 0, 0, 0]);
+            }
+        }
+    }
+    out
+}
+
+/// The custom-colour swatch: `.bg-opt.custom { background: conic-gradient(#f55, #fc4, #5d5, #4cf,
+/// #55f, #f5c, #f55) }` (`:317`), the design's way of saying "pick any colour".
+///
+/// The design's gradient starts at the top and turns clockwise, so the hue is the angle measured
+/// from straight up, and the swatch's rounded corners come from the same mask as the flat ones.
+pub fn hue_wheel_bgra(side: u32, radius: f32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(side as usize * side as usize * 4);
+    let edge = side as f32;
+    let centre = edge / 2.0;
+    for y in 0..side {
+        for x in 0..side {
+            if !rounded_rect_covers(x as f32 + 0.5, y as f32 + 0.5, edge, radius) {
+                out.extend_from_slice(&[0, 0, 0, 0]);
+                continue;
+            }
+            // `atan2(dx, -dy)`: nothing at the top of the wheel, turning clockwise, which is the
+            // direction CSS's conic-gradient turns.
+            let dx = x as f32 + 0.5 - centre;
+            let dy = y as f32 + 0.5 - centre;
+            let turn = (dx.atan2(-dy) / std::f32::consts::TAU).rem_euclid(1.0);
+            let [r, g, b] = hue_to_rgb(turn);
+            out.extend_from_slice(&[b, g, r, 255]);
+        }
+    }
+    out
+}
+
+/// Full-saturation, full-value hue at `turn` of the circle, as RGB.
+fn hue_to_rgb(turn: f32) -> [u8; 3] {
+    let scaled = turn * 6.0;
+    let sector = scaled.floor();
+    let fraction = scaled - sector;
+    let rising = (fraction * 255.0).round() as u8;
+    let falling = ((1.0 - fraction) * 255.0).round() as u8;
+    match sector as i32 % 6 {
+        0 => [255, rising, 0],
+        1 => [falling, 255, 0],
+        2 => [0, 255, rising],
+        3 => [0, falling, 255],
+        4 => [rising, 0, 255],
+        _ => [255, 0, falling],
+    }
+}
+
+/// Whether a point in the mask's own square lies inside the rounded rectangle that fills it.
+fn rounded_rect_covers(x: f32, y: f32, side: f32, radius: f32) -> bool {
+    let radius = radius.min(side / 2.0);
+    if radius <= 0.0 {
+        return x >= 0.0 && x < side && y >= 0.0 && y < side;
+    }
+    // The nearest point of the inner rectangle: a corner region is only covered within `radius` of
+    // the corner's own centre, everywhere else every point of the square is inside.
+    let nearest_x = x.clamp(radius, side - radius);
+    let nearest_y = y.clamp(radius, side - radius);
+    let dx = x - nearest_x;
+    let dy = y - nearest_y;
+    dx * dx + dy * dy <= radius * radius
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,5 +343,53 @@ mod tests {
         let twice = flipped_180(&once, 3);
         assert_eq!(twice, rgba, "twice is the identity");
         assert_eq!(once.len(), rgba.len(), "the buffer keeps its size");
+    }
+
+    /// A swatch is a rounded square: opaque through the middle, and nothing at all in the corners,
+    /// which is what keeps a bitmap-drawn swatch from showing square corners inside a rounded border.
+    #[test]
+    fn a_rounded_square_is_ink_inside_and_empty_in_its_corners() {
+        let side = 16;
+        let pixels = rounded_square_bgra(side, [255, 255, 255], 4.0);
+        let at = |x: usize, y: usize| -> [u8; 4] {
+            let at = (y * side as usize + x) * 4;
+            [pixels[at], pixels[at + 1], pixels[at + 2], pixels[at + 3]]
+        };
+        assert_eq!(at(8, 8), [255, 255, 255, 255], "the middle is the colour");
+        assert_eq!(at(0, 0)[3], 0, "the top left corner is empty");
+        assert_eq!(at(15, 0)[3], 0, "the top right corner is empty");
+        assert_eq!(at(0, 15)[3], 0, "the bottom left corner is empty");
+        assert_eq!(at(15, 15)[3], 0, "the bottom right corner is empty");
+        assert_eq!(at(8, 0)[3], 255, "the top edge's middle is ink");
+    }
+
+    /// The custom swatch says "any colour" by being more than one: if it painted a single colour the
+    /// panel would look like it had picked one. Four points around the wheel must differ.
+    #[test]
+    fn the_custom_swatch_is_a_wheel_rather_than_one_colour() {
+        let side = 32;
+        let pixels = hue_wheel_bgra(side, 8.0);
+        let rgb = |x: usize, y: usize| -> [u8; 3] {
+            let at = (y * side as usize + x) * 4;
+            [pixels[at + 2], pixels[at + 1], pixels[at]]
+        };
+        let points = [
+            ("top", rgb(16, 4)),
+            ("right", rgb(28, 16)),
+            ("bottom", rgb(16, 28)),
+            ("left", rgb(4, 16)),
+        ];
+        // Compared pairwise rather than each against the first: a loop that includes the reference
+        // point in its own comparison asserts nothing about it, which is the shape of a test that
+        // can never fail.
+        for (index, (name, colour)) in points.iter().enumerate() {
+            for (other_name, other) in points.iter().skip(index + 1) {
+                assert_ne!(
+                    colour, other,
+                    "{name} and {other_name} are the same colour ({colour:?}), so the swatch is not a wheel"
+                );
+            }
+        }
+        assert_eq!(pixels[3], 0, "the corner outside the rounded mask stays empty");
     }
 }

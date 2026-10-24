@@ -633,4 +633,75 @@ mod tests {
             "the file is the size the percentage asked for, not the capture's size"
         );
     }
+
+    /// A transparent pixel has to become the panel's fill before a JPEG encoder sees it, and the
+    /// proof has to be the file rather than a field: the pixel that was transparent reads back as
+    /// the chosen colour, and the same picture written as PNG still has its alpha.
+    ///
+    /// Decoded with `image` rather than with the encoder's own library, because a round trip through
+    /// one implementation lets a shared mistake cancel itself out — the reason the WebP round trip
+    /// uses a different decoder too.
+    #[test]
+    fn a_transparent_pixel_becomes_the_fill_in_a_jpeg_and_stays_transparent_in_a_png() {
+        let dir = scratch("assemble-fill");
+        let size = Size::new(16, 16);
+        // Opaque blue, with a four by four hole in the middle where the selection let the desktop
+        // through. The hole is large enough that chroma subsampling cannot fill it with its
+        // neighbours, which is why the sample is taken from its centre.
+        let mut bgra = Vec::new();
+        for y in 0..size.height {
+            for x in 0..size.width {
+                let in_hole = (6..10).contains(&x) && (6..10).contains(&y);
+                if in_hole {
+                    bgra.extend_from_slice(&[0, 0, 0, 0]);
+                } else {
+                    bgra.extend_from_slice(&[200, 60, 40, 255]);
+                }
+            }
+        }
+        let frame = Frame {
+            bgra: &bgra,
+            source: size,
+            output: size,
+        };
+        let centre = (7u32, 7u32);
+
+        let write = |tag: &str, format: SaveFormat, fill: [u8; 3]| -> image::RgbaImage {
+            let mut v = values();
+            v.directory = dir.to_str().expect("a utf-8 temporary path");
+            v.name = tag;
+            v.format = format;
+            v.quality = TIER_QUALITY[0];
+            v.fill = fill;
+            let outcome = save_panel(&v, &frame).expect("a save on a writable directory");
+            let bytes = std::fs::read(&outcome.path).expect("the saved file");
+            let decoded = image::load_from_memory(&bytes).expect("the file decodes");
+            decoded.to_rgba8()
+        };
+
+        // Black fill: the hole comes back dark, which it could not be while the pixel was still
+        // transparent — an encoder that ignored the alpha writes blue there.
+        let black = write("fill-black", SaveFormat::Jpeg, [0, 0, 0]);
+        let dark = black.get_pixel(centre.0, centre.1);
+        assert!(
+            dark[0] < 64 && dark[1] < 64 && dark[2] < 64,
+            "the transparent pixel became the black fill, but the file reads {dark:?}"
+        );
+        // The control: the same picture with a white fill must come back bright, so the assertion
+        // above is about the fill rather than about the encoder darkening everything.
+        let white = write("fill-white", SaveFormat::Jpeg, [255, 255, 255]);
+        let bright = white.get_pixel(centre.0, centre.1);
+        assert!(
+            bright[0] > 192 && bright[1] > 192 && bright[2] > 192,
+            "the white fill must reach the file too, but it reads {bright:?}"
+        );
+
+        // PNG carries alpha, so the same pixel is still transparent and the fill never applies.
+        let png = write("fill-png", SaveFormat::Png, [0, 0, 0]);
+        assert_eq!(
+            png.get_pixel(centre.0, centre.1)[3],
+            0,
+            "PNG keeps the selection's transparency"
+        );
+    }
 }

@@ -83,6 +83,9 @@ windows-sys = { version = "0.59", features = [
   # (with the rest of the *shell* messages, `WM_MOUSEHOVER`/`WMN_*`), so there is nowhere
   # smaller to get it from.
   "Win32_UI_Controls",
+  # The fill row's custom swatch opens the system colour picker (`:660` is an `<input
+  # type="color">`); `ChooseColorW` lives behind this feature.
+  "Win32_UI_Controls_Dialogs",
   "Win32_UI_Shell",
   # `SHBrowseForFolderW` — the save panel's `更改` button. Its result is an `ITEMIDLIST`, which the
   # bindings only expose with the shell's common types enabled; still no new crate, just the submodule

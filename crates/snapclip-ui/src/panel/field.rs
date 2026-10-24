@@ -1383,6 +1383,8 @@ pub fn form_drawn_strings() -> Vec<&'static str> {
     // The quality row's hint, which takes the control's place when the format has no quality tier
     // (`:638`, `:1096`). It is drawn, so its characters have to be in the subset.
     all.push(QUALITY_HINT_TEXT);
+    // The fill row's label (`:656`), drawn only for JPG but drawn all the same.
+    all.push(FILL_ROW_LABEL);
     // The four size shortcuts are drawn in the numeric face (`.size-presets .chip`, `:259`), so they
     // are not in this list: `number_characters` carries the digits and the percent sign they use,
     // and a test below holds the two lists together.
@@ -1518,6 +1520,133 @@ pub fn quality_hint_over_surface(surface: [u8; 4]) -> [u8; 4] {
         ((u32::from(surface[index]) * (100 - alpha) + tint[index] * alpha) / 100) as u8
     };
     [mix(0), mix(1), mix(2), 255]
+}
+
+// -------------------------------------------------------------------------------------------------
+// The transparent fill row: `:655`-`:662`, shown for `.JPG` only by `:1102`
+// -------------------------------------------------------------------------------------------------
+
+/// `.fill-row { min-height: 22px }` (`:315`) — the line inside the quality block that says what a
+/// transparent pixel becomes when the format cannot carry alpha.
+pub const FILL_ROW_HEIGHT_DIP: i32 = 22;
+
+/// `.form-row { gap: 6px }` (`:164`): `.quality-line` and `.fill-row` are siblings inside the
+/// quality row, so this is the gap between them.
+pub const FILL_ROW_GAP_DIP: i32 = 6;
+
+/// `.bg-opt { width: 16px; height: 16px }` (`:150`).
+pub const FILL_SWATCH_DIP: i32 = 16;
+
+/// `.bg-opt { border-radius: var(--r-seg-inner) }` (`:150`, and `--r-seg-inner: 4px` at `:58`).
+pub const FILL_SWATCH_RADIUS_DIP: f32 = 4.0;
+
+/// `.bg-switch { gap: 8px }` (`:149`): between the swatches.
+pub const FILL_SWATCH_GAP_DIP: i32 = 8;
+
+/// `.bg-opt.is-on { box-shadow: 0 0 0 1.5px var(--surface), 0 0 0 3px var(--accent) }` (`:153`) —
+/// the chosen swatch wears an accent ring, held a dip and a half off the swatch itself.
+pub const FILL_RING_DIP: f32 = 1.5;
+pub const FILL_RING_OFFSET_DIP: f32 = 3.0;
+
+/// `:658`-`:660`: white, black, and one that opens a colour picker.
+pub const FILL_SWATCHES: usize = 3;
+
+/// The two fixed choices, in the buffer's own channel order so they can be compared with the
+/// panel's fill without converting anything.
+pub const FILL_WHITE: [u8; 3] = [255, 255, 255];
+pub const FILL_BLACK: [u8; 3] = [0, 0, 0];
+
+/// `透明区域填充` (`:656`) — the row's label.
+pub const FILL_ROW_LABEL: &str = "透明区域填充";
+
+/// `.JPG`'s index in [`FMT_OPTIONS`] (`:717`).
+pub const FMT_JPG_INDEX: usize = 1;
+
+/// Whether the fill row is shown for a format index.
+///
+/// `:1102` toggles it for `S.format === 1` and for nothing else: PNG carries alpha and this
+/// project's WebP is lossless, so JPEG is the only format whose transparent pixels have to be
+/// replaced. The painter and the hit test both ask this one function, so a row that is not drawn
+/// cannot answer a click.
+pub fn fill_row_shown(format: usize) -> bool {
+    format == FMT_JPG_INDEX
+}
+
+/// Which swatch the panel's fill colour belongs to (`:1248`): white and black have their own, and
+/// every other colour belongs to the one that opens the picker (`:1249`).
+pub fn fill_swatch_selected(fill: [u8; 3]) -> usize {
+    match fill {
+        FILL_WHITE => 0,
+        FILL_BLACK => 1,
+        _ => 2,
+    }
+}
+
+/// The row's box: inside the quality row, under `.quality-line` (`:637`, `:655`).
+pub fn fill_row_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let line = field_rect(metrics, rects, scale, Row::Quality);
+    let top = line.bottom + px(FILL_ROW_GAP_DIP);
+    Rect::new(line.left, top, line.right, top + px(FILL_ROW_HEIGHT_DIP))
+}
+
+/// One swatch. `.fill-row { justify-content: space-between }` (`:315`) puts the group against the
+/// column's right edge, and `.bg-switch { gap: 8px }` (`:149`) spaces the swatches apart; the row is
+/// taller than they are, so they sit in its middle.
+pub fn fill_swatch_rect(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    index: usize,
+) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let row = fill_row_rect(metrics, rects, scale);
+    let side = px(FILL_SWATCH_DIP);
+    let gap = px(FILL_SWATCH_GAP_DIP);
+    let group = FILL_SWATCHES as i32 * side + (FILL_SWATCHES as i32 - 1) * gap;
+    let left = row.right - group + index as i32 * (side + gap);
+    let top = row.top + (row.height() - side) / 2;
+    Rect::new(left, top, left + side, top + side)
+}
+
+/// The swatch under a point, or none. It goes through [`fill_swatch_rect`] like the painter does,
+/// so the clickable swatch is the drawn one.
+pub fn fill_swatch_at(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    point: (i32, i32),
+) -> Option<usize> {
+    (0..FILL_SWATCHES)
+        .find(|&index| rect_contains(fill_swatch_rect(metrics, rects, scale, index), point))
+}
+
+/// How far the rows below the quality row move when the fill row appears: the gap above it and its
+/// own height.
+pub fn fill_row_added_height(scale: f32) -> i32 {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    px(FILL_ROW_GAP_DIP + FILL_ROW_HEIGHT_DIP)
+}
+
+/// The estimate row's label.
+///
+/// The estimate is the only row below the quality row, so it is the only one that moves when the
+/// fill row appears — and `:1102` shows that row per format, which makes the estimate's position a
+/// function of the chosen format. It is a function of its own rather than a flag folded into
+/// [`label_rect`], because every other row's position is format-independent and threading the flag
+/// through all of them would make sixteen call sites ask a question only this one has.
+pub fn estimate_label_rect(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    fill_row: bool,
+) -> Rect {
+    let rect = label_rect(metrics, rects, scale, Row::Estimate);
+    if !fill_row {
+        return rect;
+    }
+    let shift = fill_row_added_height(scale);
+    Rect::new(rect.left, rect.top + shift, rect.right, rect.bottom + shift)
 }
 
 /// How many fields take part in tab navigation. The real window keeps this number true by creating
@@ -3563,5 +3692,114 @@ mod tests {
                 "one pixel to the left is outside the reset at {scale}"
             );
         }
+    }
+
+    /// `:1102` shows the fill row for `.JPG` and for nothing else: PNG carries alpha and this
+    /// project's WebP is lossless, so JPEG is the only format whose transparent pixels have to
+    /// become a colour.
+    #[test]
+    fn the_fill_row_is_shown_for_jpg_and_nothing_else() {
+        assert!(!fill_row_shown(FMT_PNG_INDEX), "PNG has an alpha channel");
+        assert!(fill_row_shown(FMT_JPG_INDEX), "JPG has no alpha, so it needs a fill");
+        assert!(!fill_row_shown(2), "this project's WebP is lossless and keeps alpha");
+    }
+
+    /// The three swatches sit against the row's right edge, sixteen dip square, eight apart, in the
+    /// middle of the row (`:149`, `:150`, `:315`).
+    #[test]
+    fn the_swatches_sit_at_the_end_of_the_fill_row() {
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            let metrics = metrics();
+            let rects = metrics.rects(scale);
+            let round = |dip: i32| (dip as f32 * scale).round() as i32;
+
+            let row = fill_row_rect(&metrics, &rects, scale);
+            let last = fill_swatch_rect(&metrics, &rects, scale, FILL_SWATCHES - 1);
+            assert_eq!(last.right, row.right, "the group ends at the column's right edge at {scale}");
+
+            // Absolute numbers rather than the constants: both sides would move together with a
+            // wrong constant and the assertion would agree with itself.
+            for index in 0..FILL_SWATCHES {
+                let swatch = fill_swatch_rect(&metrics, &rects, scale, index);
+                assert_eq!(swatch.width(), round(16), "`.bg-opt` is 16 dip wide (:150) at {scale}");
+                assert_eq!(swatch.height(), round(16), "`.bg-opt` is 16 dip tall (:150) at {scale}");
+                if index > 0 {
+                    let previous = fill_swatch_rect(&metrics, &rects, scale, index - 1);
+                    assert_eq!(
+                        swatch.left - previous.right,
+                        round(8),
+                        "the gap between swatches is 8 dip (:149) at {scale}"
+                    );
+                }
+            }
+            // The row is taller than the swatch, so it is centred in it rather than pinned to the
+            // top: `22` of row (`:315`) and `16` of swatch (`:150`) leave three above and below.
+            // Two independent roundings can differ by a pixel on an odd remainder, so the two gaps
+            // have to be within one of each other rather than equal — exact equality is not
+            // something an integer grid can promise.
+            let first = fill_swatch_rect(&metrics, &rects, scale, 0);
+            let above = first.top - row.top;
+            let below = row.bottom - first.bottom;
+            assert!(
+                (above - below).abs() <= 1,
+                "the swatch is centred at {scale}: {above} above and {below} below"
+            );
+        }
+    }
+
+    /// `:1248` marks the swatch whose colour the panel is using, and `:1249` gives every other
+    /// colour to the one that opens the picker.
+    #[test]
+    fn the_marked_swatch_is_the_one_the_colour_belongs_to() {
+        assert_eq!(fill_swatch_selected(FILL_WHITE), 0, "white has a swatch of its own");
+        assert_eq!(fill_swatch_selected(FILL_BLACK), 1, "so does black");
+        assert_eq!(fill_swatch_selected([12, 34, 56]), 2, "anything else is the custom one");
+    }
+
+    /// The estimate is the only row below the quality row, and `:1102` shows the fill row per
+    /// format, so the estimate's position is a function of the chosen format.
+    #[test]
+    fn the_estimate_moves_down_by_the_fill_row() {
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            let metrics = metrics();
+            let rects = metrics.rects(scale);
+            let round = |dip: i32| (dip as f32 * scale).round() as i32;
+
+            let plain = estimate_label_rect(&metrics, &rects, scale, false);
+            let shifted = estimate_label_rect(&metrics, &rects, scale, true);
+            // `22` of row (`:315`) and the `6` gap above it (`:164`): 28 dip.
+            assert_eq!(
+                shifted.top - plain.top,
+                round(28),
+                "the fill row and its gap are 28 dip at {scale}"
+            );
+            assert_eq!(shifted.bottom - plain.bottom, round(28), "the label moves as a whole");
+            assert_eq!(shifted.left, plain.left, "only the vertical position changes at {scale}");
+        }
+    }
+
+    /// A click answers the swatch under it and nothing else — including nothing at all outside the
+    /// row, so a miss cannot silently pick a colour.
+    #[test]
+    fn a_click_finds_the_swatch_under_it_or_none() {
+        let scale = 1.5;
+        let metrics = metrics();
+        let rects = metrics.rects(scale);
+        for index in 0..FILL_SWATCHES {
+            let swatch = fill_swatch_rect(&metrics, &rects, scale, index);
+            let middle = swatch.center();
+            assert_eq!(
+                fill_swatch_at(&metrics, &rects, scale, (middle.x, middle.y)),
+                Some(index),
+                "the middle of swatch {index} answers that swatch"
+            );
+        }
+        let row = fill_row_rect(&metrics, &rects, scale);
+        let left_of_group = (row.left + 2, row.top + 2);
+        assert_eq!(
+            fill_swatch_at(&metrics, &rects, scale, left_of_group),
+            None,
+            "the row's label side is not a swatch"
+        );
     }
 }

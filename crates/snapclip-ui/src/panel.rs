@@ -76,6 +76,11 @@ pub use field::{
     quality_segment_state, size_cell_rect,
     FMT_PNG_INDEX, QUALITY_HINT_TEXT, quality_hint_over_surface, quality_hint_rect,
     quality_segment_shown,
+    // The transparent fill row (`:655`-`:662`), shown by `:1102` for JPG only.
+    FILL_BLACK, FILL_RING_DIP, FILL_RING_OFFSET_DIP, FILL_ROW_GAP_DIP, FILL_ROW_HEIGHT_DIP,
+    FILL_ROW_LABEL, FILL_SWATCHES, FILL_SWATCH_DIP, FILL_SWATCH_GAP_DIP, FILL_SWATCH_RADIUS_DIP,
+    FILL_WHITE, FMT_JPG_INDEX, estimate_label_rect, fill_row_added_height, fill_row_rect,
+    fill_row_shown, fill_swatch_at, fill_swatch_rect, fill_swatch_selected,
     SIZE_PRESET_GAP_DIP, SIZE_PRESET_INDENT_DIP, SIZE_PRESET_MARGIN_DIP, SIZE_PRESET_PCT,
     SIZE_PRESET_WORDS, size_preset_contains, size_preset_rect, size_preset_size,
     size_preset_width, size_presets_rect,
