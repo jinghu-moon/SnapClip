@@ -132,6 +132,17 @@ impl ConflictLink {
             ConflictLink::Rename => "改为重命名",
         }
     }
+
+    /// Which of the two words this is, in the order `panel::measure_conflict_link` measured them.
+    ///
+    /// A caller indexes the measured widths with this instead of matching a second time, so the two
+    /// orders cannot drift apart.
+    pub fn index(self) -> usize {
+        match self {
+            ConflictLink::Overwrite => 0,
+            ConflictLink::Rename => 1,
+        }
+    }
 }
 
 #[cfg(test)]

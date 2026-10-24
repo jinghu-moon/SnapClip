@@ -698,6 +698,9 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
         // The size limit's four words, measured here for the same reason: the switch's right edge is
         // where the label line ends, so its click target is as wide as `限制体积`.
         let limit_words = measure_limit_words(hwnd, renderer.as_ref());
+        // The conflict link's two words: the one drawn is the one clicked, so both are measured once
+        // here rather than inside the paint.
+        let conflict_widths = measure_conflict_link(hwnd, renderer.as_ref());
         // The child's background: the field's own fill, resolved from `--fill` over the surface.
         // A native `EDIT` cannot be translucent, so the composite is computed once here.
         let fill = snapclip_ui::panel::field_colours(
@@ -741,6 +744,9 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
             // thing that asks for one, and a number measured for a limit nobody asked about would be
             // work the panel does on every open for nothing.
             limit_on: false,
+            conflict: ConflictPolicy::AutoRename,
+            conflict_shown: false,
+            conflict_widths,
             limit_words,
             estimate: None,
             over_limit: false,
@@ -800,6 +806,9 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
                 s.set_control(id, control);
             }
         }
+        // The controls now hold the name and the directory, so the question can be asked: the panel
+        // opens with the link already showing if the file it would name is there (:1149).
+        refresh_conflict(hwnd);
 
         ShowWindow(hwnd, SW_SHOW);
         {
@@ -993,6 +1002,16 @@ struct WindowState {
     /// `不超过 [ 500 ] KB` group instead of the tier segment, and a save is required to fit — one
     /// flag, asked by the painter, the click handler and the save.
     limit_on: bool,
+    /// Whether a taken name is reused (Overwrite) or numbered (AutoRename), which the footer's
+    /// link flips (:989).
+    conflict: ConflictPolicy,
+    /// Whether the name the panel would write is already a file, which is what shows the link
+    /// (:1149). Recomputed when the name, the directory or the format changes, not on every paint:
+    /// the answer comes from the file system.
+    conflict_shown: bool,
+    /// Both of the link's words, measured once beside the footer's widths so the link that is drawn
+    /// is the link that is clicked.
+    conflict_widths: [i32; 2],
     /// The limit's four words, measured once beside the other words so the switch that is drawn is
     /// the switch that is clicked.
     limit_words: snapclip_ui::panel::LimitWidths,
@@ -1031,6 +1050,24 @@ fn measure_footer_widths(
 
 /// The path row's `更改` button width, measured the same way and for the same reason: the input's
 /// rectangle leaves room for this button, so both the control and the paint read this one number.
+
+/// The conflict link's two words, measured once beside the footer's widths for the same reason: the
+/// word drawn is the word clicked, and the word changes with the policy.
+fn measure_conflict_link(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    renderer: Option<&snapclip_ui::panel::PanelRenderer>,
+) -> [i32; 2] {
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96) as f32;
+    match renderer.map(|renderer| renderer.measure_conflict_link(dpi)) {
+        Some(Ok(widths)) => widths,
+        Some(Err(error)) => {
+            eprintln!("[save-panel] could not measure the conflict link: {error:?}");
+            [0; 2]
+        }
+        None => [0; 2],
+    }
+}
+
 fn measure_path_change(
     hwnd: windows_sys::Win32::Foundation::HWND,
     renderer: Option<&snapclip_ui::panel::PanelRenderer>,
@@ -1302,6 +1339,7 @@ fn panel_values<'a>(
     format: SaveFormat,
     quality: u8,
     fill: [u8; 3],
+    conflict: ConflictPolicy,
 ) -> PanelValues<'a> {
     PanelValues {
         directory,
@@ -1311,7 +1349,8 @@ fn panel_values<'a>(
         format,
         // The quality tier's number, mapped by the one function that knows `docs/42` D8.
         quality,
-        conflict: ConflictPolicy::AutoRename,
+        // Whether a taken name is reused or numbered, which the footer's link can change.
+        conflict,
         fill,
         date,
         time,
@@ -1579,6 +1618,7 @@ fn with_panel_request<T>(
         format_of_index(s.format),
         super::assemble::quality_of_tier(s.chosen_quality()),
         s.fill,
+        s.conflict,
     );
     let frame = super::scale::Frame {
         bgra,
@@ -1775,18 +1815,112 @@ fn set_directory(hwnd: windows_sys::Win32::Foundation::HWND, directory: &str) {
     unsafe { windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0) };
 }
 
+/// The word the conflict link shows, which is the action a press would take (:1150).
+///
+/// Renaming is the default, so the link offers overwriting, and only offers renaming once the policy
+/// has been flipped. A label that named the current policy instead would read as a statement of fact
+/// and be unclickable in the mind of anyone who reads it.
+fn conflict_link(policy: ConflictPolicy) -> snapclip_ui::copy::ConflictLink {
+    match policy {
+        ConflictPolicy::AutoRename => snapclip_ui::copy::ConflictLink::Overwrite,
+        ConflictPolicy::Overwrite => snapclip_ui::copy::ConflictLink::Rename,
+    }
+}
+
+/// Ask the file system whether the name this panel would write is already taken (:1149).
+///
+/// The answer decides whether the link is shown, and a name that is free resets the policy to
+/// numbering (:1138), because overwriting is only ever offered against a file that exists. The
+/// question is asked when the name, the directory or the format changes rather than on every paint,
+/// since the answer comes from the file system and a repaint is not evidence that it changed.
+fn refresh_conflict(hwnd: windows_sys::Win32::Foundation::HWND) {
+    let taken = with_panel_request(hwnd, |values, frame, _| {
+        super::assemble::request_for(
+            values,
+            frame.output.width as u64,
+            frame.output.height as u64,
+        )
+        .ok()
+        .and_then(|request| super::service::plain_target(&request).ok())
+        .map(|path| path.exists())
+        .unwrap_or(false)
+    })
+    .unwrap_or(false);
+    let mut changed = false;
+    if let Some(s) = state_mut(hwnd) {
+        changed = s.conflict_shown != taken;
+        s.conflict_shown = taken;
+        if !taken && s.conflict != ConflictPolicy::AutoRename {
+            s.conflict = ConflictPolicy::AutoRename;
+            changed = true;
+        }
+    }
+    if changed {
+        unsafe { windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0) };
+    }
+}
+
 /// Ask the shell for a folder and put the answer in the path field.
 ///
 /// `SHBrowseForFolderW` rather than `IFileOpenDialog`, because the app takes Windows through
 /// `windows-sys` and the COM dialog would mean carrying interface definitions for one call. It is
 /// the older dialog; it is also the one that needs no apartment, no `CoInitialize` and no new
 /// dependency. Cancelling changes nothing, which is the distinction that makes this safe to click.
+/// The folder the browse dialog opens at: the path field's text, when it names something.
+///
+/// The dialog takes a NUL-terminated UTF-16 string through its lParam, and the buffer has to
+/// outlive the call, which is why this hands back the buffer rather than a pointer. An empty field
+/// asks for nothing and leaves the dialog at the shell's own default, rather than at a path that is
+/// not a path.
+fn browse_initial_path(current: &str) -> Option<Vec<u16>> {
+    let trimmed = current.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut buffer: Vec<u16> = trimmed.encode_utf16().collect();
+    buffer.push(0);
+    Some(buffer)
+}
+
+/// Tells the folder dialog where to start, once it exists (BFFM_INITIALIZED).
+///
+/// A callback rather than a field, because BROWSEINFOW has no "start here" member: the starting
+/// folder arrives as a message after the dialog is built, carrying the string the caller put in
+/// lParam.
+unsafe extern "system" fn browse_initial(
+    dialog: windows_sys::Win32::Foundation::HWND,
+    message: u32,
+    _lparam: windows_sys::Win32::Foundation::LPARAM,
+    data: windows_sys::Win32::Foundation::LPARAM,
+) -> i32 {
+    use windows_sys::Win32::UI::Shell::{BFFM_INITIALIZED, BFFM_SETSELECTIONW};
+    if message == BFFM_INITIALIZED as u32 && data != 0 {
+        // A string pointer the caller owns crosses the boundary here; it lives in choose_folder's
+        // frame for the whole call, which outlives the dialog.
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(
+                dialog,
+                BFFM_SETSELECTIONW,
+                1,
+                data,
+            );
+        }
+    }
+    0
+}
+
 fn choose_folder(hwnd: windows_sys::Win32::Foundation::HWND) {
     use windows_sys::Win32::System::Com::CoTaskMemFree;
     use windows_sys::Win32::UI::Shell::{
         BROWSEINFOW, SHBrowseForFolderW, SHGetPathFromIDListW,
     };
     let title: Vec<u16> = "选择保存位置\0".encode_utf16().collect();
+    // :1133 the dialog opens where the field already points, so correcting a folder that is nearly
+    // right does not mean walking back from the shell's default every time.
+    let current = state(hwnd)
+        .map(|s| control_text(s.control(snapclip_ui::panel::FieldId::Path)))
+        .unwrap_or_default();
+    let initial = browse_initial_path(&current);
     let mut display = [0u16; 260];
     let mut info = BROWSEINFOW {
         hwndOwner: hwnd,
@@ -1796,8 +1930,11 @@ fn choose_folder(hwnd: windows_sys::Win32::Foundation::HWND) {
         // `BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE`: folders only, and a dialog the user can
         // resize and navigate — the default is a tree that starts somewhere unhelpful.
         ulFlags: 0x0001 | 0x0040,
-        lpfn: None,
-        lParam: 0,
+        lpfn: Some(browse_initial),
+        lParam: initial
+            .as_ref()
+            .map(|path| path.as_ptr() as isize)
+            .unwrap_or(0),
         iImage: 0,
     };
     let pidl = unsafe { SHBrowseForFolderW(&mut info) };
@@ -2397,6 +2534,8 @@ extern "system" fn window_proc(
                                 fill: s.fill,
                                 footer_widths: Some(s.footer_widths),
                                 path_change: s.path_change,
+                                conflict: s.conflict_shown.then(|| conflict_link(s.conflict)),
+                                conflict_widths: Some(s.conflict_widths),
                                 var_open: s.var_open,
                                 path_chips: Some(s.path_chips),
                                 size_presets: Some(s.size_presets),
@@ -2475,6 +2614,38 @@ extern "system" fn window_proc(
                 {
                     windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(hwnd, WM_CLOSE, 0, 0);
                     return 0;
+                }
+                // The conflict link (:989): a press flips the policy for the next save. Its word is
+                // the action, so the rectangle to test is the one for the word being drawn.
+                let link = state(hwnd).and_then(|s| {
+                    s.conflict_shown.then(|| {
+                        let word = conflict_link(s.conflict);
+                        (s.conflict_widths[word.index()], s.footer_widths)
+                    })
+                });
+                if let Some((width, widths)) = link {
+                    let metrics = snapclip_ui::panel::DEMO;
+                    let scale = dpi_scale(hwnd);
+                    if snapclip_ui::panel::conflict_link_contains(
+                        &metrics,
+                        scale,
+                        widths,
+                        width,
+                        (point.x, point.y),
+                    ) {
+                        if let Some(s) = state_mut(hwnd) {
+                            s.conflict = match s.conflict {
+                                ConflictPolicy::AutoRename => ConflictPolicy::Overwrite,
+                                ConflictPolicy::Overwrite => ConflictPolicy::AutoRename,
+                            };
+                        }
+                        windows_sys::Win32::Graphics::Gdi::InvalidateRect(
+                            hwnd,
+                            std::ptr::null(),
+                            0,
+                        );
+                        return 0;
+                    }
                 }
             }
             // The token menu is the topmost thing the frame draws, so it is answered before
@@ -2598,6 +2769,9 @@ extern "system" fn window_proc(
                         // old one describes a file that no longer exists. Only a limit that is on
                         // needs the new number, which is why the refresh itself checks the switch.
                         refresh_estimate(hwnd);
+                        // The extension is part of the target, so a different format asks about a
+                        // different file: shot.png may be free while shot.jpg is not.
+                        refresh_conflict(hwnd);
                         InvalidateRect(hwnd, std::ptr::null(), 0);
                         return 0;
                     }
@@ -2841,6 +3015,8 @@ extern "system" fn window_proc(
                 // The limit's words are pixels too, so they go stale the same way: the switch would
                 // otherwise be tested against the previous monitor's word width.
                 s.limit_words = measure_limit_words(hwnd, s.renderer.as_ref());
+                // The link's words are pixels too, so they go stale on a dpi change as well.
+                s.conflict_widths = measure_conflict_link(hwnd, s.renderer.as_ref());
             }
             apply_menu_occlusion(hwnd);
             0
@@ -2913,6 +3089,7 @@ extern "system" fn window_proc(
                 return 0;
             }
             let mut repaint = false;
+            let mut conflict_dirty = false;
             if let Some(s) = state_mut(hwnd) {
                 if let Some(id) = s.field_of(control) {
                     // The name field is a template, and the spec keeps it as it is typed (`:201`), so
@@ -2925,6 +3102,12 @@ extern "system" fn window_proc(
                         if let Ok(mut remembered) = s.remembered.lock() {
                             note_edit(&mut remembered, id, true, &edited);
                         }
+                        // The name and the directory decide which file the link is about, so a change
+                        // to either re-asks the question; the other fields cannot move the target.
+                        conflict_dirty = matches!(
+                            id,
+                            snapclip_ui::panel::FieldId::Name | snapclip_ui::panel::FieldId::Path
+                        );
                     }
                     // Focus is not allowed to overwrite a message about the value: the field would
                     // fall silent exactly while the user is fixing what it complained about.
@@ -2939,6 +3122,9 @@ extern "system" fn window_proc(
                         repaint = s.fields.state_of(id) != before;
                     }
                 }
+            }
+            if conflict_dirty {
+                refresh_conflict(hwnd);
             }
             if repaint {
                 windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0);
@@ -3141,6 +3327,7 @@ mod tests {
             format_of_index(0),
             crate::save::assemble::quality_of_tier(0),
             snapclip_ui::panel::FILL_WHITE,
+            ConflictPolicy::AutoRename,
         );
         assert_eq!(values.directory, r"C:\shots");
         assert_eq!(values.name, "SnapClip_[日期]");
@@ -3422,6 +3609,9 @@ mod tests {
         size_mode: snapclip_ui::panel::SIZE_MODE_CHOSEN,
         size_mode_widths: [56, 64],
             limit_on: false,
+        conflict: ConflictPolicy::AutoRename,
+        conflict_shown: false,
+        conflict_widths: [0; 2],
             limit_words: snapclip_ui::panel::LimitWidths::default(),
             estimate: None,
             over_limit: false,
@@ -3496,6 +3686,9 @@ mod tests {
         size_mode: snapclip_ui::panel::SIZE_MODE_CHOSEN,
         size_mode_widths: [56, 64],
             limit_on: false,
+        conflict: ConflictPolicy::AutoRename,
+        conflict_shown: false,
+        conflict_widths: [0; 2],
             limit_words: snapclip_ui::panel::LimitWidths::default(),
             estimate: None,
             over_limit: false,
@@ -3574,6 +3767,9 @@ mod tests {
         size_mode: snapclip_ui::panel::SIZE_MODE_CHOSEN,
         size_mode_widths: [56, 64],
             limit_on: false,
+        conflict: ConflictPolicy::AutoRename,
+        conflict_shown: false,
+        conflict_widths: [0; 2],
             limit_words: snapclip_ui::panel::LimitWidths::default(),
             estimate: None,
             over_limit: false,
@@ -3801,6 +3997,9 @@ mod tests {
         size_mode: snapclip_ui::panel::SIZE_MODE_CHOSEN,
         size_mode_widths: [56, 64],
             limit_on: false,
+        conflict: ConflictPolicy::AutoRename,
+        conflict_shown: false,
+        conflict_widths: [0; 2],
             limit_words: snapclip_ui::panel::LimitWidths::default(),
             estimate: None,
             over_limit: false,
@@ -3942,6 +4141,7 @@ mod tests {
                 SaveFormat::Png,
                 92,
                 snapclip_ui::panel::FILL_WHITE,
+                ConflictPolicy::AutoRename,
             )
         };
 
@@ -3977,3 +4177,119 @@ mod tests {
     }
 }
 
+    /// The link's word is the action a press takes, so the two policies name each other.
+    #[test]
+    fn the_conflict_link_offers_the_policy_that_is_not_in_force() {
+        // Renaming is the default, so the link offers overwriting, and the words are the design's
+        // own (copy::ConflictLink). A label naming the policy in force would read as a statement
+        // of fact rather than as something to press.
+        assert_eq!(
+            conflict_link(ConflictPolicy::AutoRename),
+            snapclip_ui::copy::ConflictLink::Overwrite
+        );
+        assert_eq!(
+            conflict_link(ConflictPolicy::Overwrite),
+            snapclip_ui::copy::ConflictLink::Rename
+        );
+        assert_eq!(conflict_link(ConflictPolicy::AutoRename).text(), "改为覆盖");
+        assert_eq!(conflict_link(ConflictPolicy::Overwrite).text(), "改为重命名");
+    }
+
+    /// The choice has to survive the trip from the panel to the request, or the link would flip a
+    /// flag that nothing reads and the next save would quietly rename anyway.
+    #[test]
+    fn the_panels_conflict_choice_reaches_the_values() {
+        let values = panel_values(
+            r"C:\\shots",
+            "SnapClip_[日期]",
+            "2026-10-24",
+            "0115",
+            7,
+            format_of_index(0),
+            crate::save::assemble::quality_of_tier(0),
+            snapclip_ui::panel::FILL_WHITE,
+            ConflictPolicy::Overwrite,
+        );
+        assert_eq!(values.conflict, ConflictPolicy::Overwrite);
+    }
+
+    /// The file system decides, and the panel's choice is what picks between replacing and keeping
+    /// beside. Asserted on the files because that is where the difference is.
+    #[test]
+    fn a_taken_name_is_replaced_or_kept_beside_by_the_panels_choice() {
+        let directory = std::env::temp_dir().join(format!(
+            "snapclip-conflict-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&directory).expect("a scratch directory");
+        let directory_text = directory.to_string_lossy().into_owned();
+        let (width, height) = (8u32, 8u32);
+        let mut bgra = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                bgra.extend_from_slice(&[(x * 31) as u8, (y * 31) as u8, 128, 255]);
+            }
+        }
+        let size = crate::save::scale::Size::new(width, height);
+        let frame = crate::save::scale::Frame {
+            bgra: &bgra,
+            source: size,
+            output: size,
+        };
+        let values = |conflict: ConflictPolicy| {
+            panel_values(
+                &directory_text,
+                "shot",
+                "2026-10-24",
+                "1042",
+                1,
+                SaveFormat::Png,
+                92,
+                snapclip_ui::panel::FILL_WHITE,
+                conflict,
+            )
+        };
+
+        // Last night's screenshot, holding bytes no png encoder would ever write.
+        let plain = directory.join("shot.png");
+        std::fs::write(&plain, b"last night").expect("a sentinel file");
+
+        let renamed = save_panel(&values(ConflictPolicy::AutoRename), &frame).expect("the save");
+        assert_ne!(
+            renamed.path, plain,
+            "a taken name is not reused while renaming"
+        );
+        assert_eq!(
+            std::fs::read(&plain).expect("the sentinel"),
+            b"last night",
+            "renaming has to leave the existing file alone"
+        );
+        assert!(renamed.path.exists(), "the renamed file is on disk");
+
+        let overwritten = save_panel(&values(ConflictPolicy::Overwrite), &frame).expect("the save");
+        assert_eq!(overwritten.path, plain, "overwriting keeps the name");
+        assert_ne!(
+            std::fs::read(&plain).expect("the replaced file"),
+            b"last night",
+            "overwriting replaces the bytes"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The folder dialog starts where the field points, and asks for the shell's default when the
+    /// field names nothing rather than for a path that is not a path.
+    #[test]
+    fn the_folder_dialog_starts_where_the_path_field_points() {
+        assert!(browse_initial_path("").is_none());
+        assert!(browse_initial_path("   ").is_none());
+        let path = browse_initial_path(r"C:\shots").expect("a path asks for a start");
+        assert_eq!(*path.last().expect("terminated"), 0, "the dialog reads a c string");
+        assert_eq!(
+            String::from_utf16_lossy(&path[..path.len() - 1]),
+            r"C:\shots"
+        );
+    }

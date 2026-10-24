@@ -1323,3 +1323,33 @@ check --workspace --all-targets  Finished ✓  死代码 0 ✓
 - **A42** 预估行的 `编码中`（`:243`）**画不出来**：编码是同步的，没有消息泵在编码期间重绘 ⇒ 只能显示完成态 `实测`。要做真的进度就得把编码挪到后台线程。
 - **A43** 一个都装不下时**没有句子**：设计稿没有这条文案，本批只记日志、不写文件（`docs/41` A20 是同一类）。
 - **A44** `:236` 的 `↑/↓ ±50、Shift ±200` **未做**；`A39`（开关状态持久）仍未做。
+---
+
+### 冲突链接（改为覆盖 / 改为重命名）与文件夹对话框的起点
+
+**目标**：名字已被占用时，底栏出现一条链接；点它改变的是"这次保存要不要覆盖"。文件夹对话框从路径框当前的位置开始，而不是从系统默认。
+
+**一处逻辑**（service）：新增 	arget_of(request)（按请求的 conflict 解析）与 plain_target(request)（按覆盖解析，即"如果没有被占用会用哪个名字"）。两者都走 prepare + esolve，所以裁剪尾点、补扩展名、_2 编号只有一份。面板**不自己拼路径** ✗。
+
+**可见性**：plain_target(...).exists() 为真才显示链接（:1149）；名字一变自由，策略**自动回到重命名**（:1138），因为覆盖只有在存在文件时才是一个有意义的选择。
+
+**文案是动作**：copy::ConflictLink 的两个词是"改为覆盖"/"改为重命名"，即点击**将要做的事**（:1150），不是当前策略的名字。策略 → 链接的映射是自由函数 conflict_link(policy)，带测试。
+
+**几何**：链接是 .foot 里 .status 与 .copy 之间的 lex: none（:328）；.link-btn 没有内边距（:158），所以宽度就是词宽。measure_conflict_link 测**两个词**（[i32; 2]），用 ConflictLink::index() 取当前那个 ⇒ 画的和点的同一组数字；ooter_status_rect 多收一个 link_width: Option<i32>，句子让出"链接 + 一个间距"（.status { flex: 1 } :275）。
+
+**时机**：开面板时问一次；名字/目录 EN_CHANGE 后问一次；换格式后问一次（扩展名变了 ⇒ 问的是另一个文件）。**重绘里不问**：答案来自文件系统，重绘不是它改变的证据。
+
+**文件夹对话框的起点**（:1133）：BROWSEINFOW 没有"从这里开始"的成员，起点在 BFFM_INITIALIZED 之后经 BFFM_SETSELECTIONW 送进去，字符串由 lParam 带着；rowse_initial_path(current) 是纯函数（空/全空白 ⇒ None，否则 NUL 结尾的 UTF-16），带测试。
+
+**证据（文件级）**：_taken_name_is_replaced_or_kept_beside_by_the_panels_choice —— 先写一个内容为 last night 的 shot.png；重命名保存 ⇒ 路径**不是** shot.png、原文件**字节未变**、新文件在盘上；覆盖保存 ⇒ 路径**就是** shot.png、字节**被替换**。	he_plain_target_is_the_name_the_save_starts_from 钉住 plain_target 原地不动而 	arget_of 前进到 shot_2.png。
+
+**变异（三条，全红，还原后 SHA256 逐字节一致，都见 Compiling snapclip-app）**：
+
+- 面板的选择被忽略（panel_values 写死 AutoRename）⇒ 两条红：	he_panels_conflict_choice_reaches_the_values（left: AutoRename / right: Overwrite）与 _taken_name_is_replaced_or_kept_beside_by_the_panels_choice（ssertion failed: overwriting keeps the name）。
+- 链接显示**当前策略**而不是动作 ⇒ 	he_conflict_link_offers_the_policy_that_is_not_in_force 红（left: Rename / right: Overwrite）。
+- plain_target 跟着策略走 ⇒ 	he_plain_target_is_the_name_the_save_starts_from 红（left: …\shot_2.png / right: …\shot.png）。
+
+**新缺口：**
+
+- **A45** 设计稿在名字被占用时还有两句状态句（:1142 ⚠ 同名文件已存在，将保存为 <name>、:1143 ⚠ 将覆盖已有文件 <name>）**未做**：它们与"保存成功/失败"共用底栏那一条状态行，需要先定优先级（本轮只做了链接本身）。
+- **A46** 更改 用的仍是 SHBrowseForFolderW（旧式树对话框）：不是一个按钮值得手写 COM 接口的程度，代价是观感，不是行为。

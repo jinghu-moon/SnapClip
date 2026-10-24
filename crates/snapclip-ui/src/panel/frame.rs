@@ -428,6 +428,10 @@ pub struct Frame<'a> {
     pub status: Option<(crate::copy::Level, &'a str)>,
     /// The status line's format (`--fs-status: 11px`, `:37`).
     pub status_format: Option<&'a IDWriteTextFormat>,
+    /// The conflict link (:676) and both of its words' widths (:1150). The link is the action a
+    /// click takes, and the width drawn is the width clicked because the window measured both.
+    pub conflict: Option<crate::copy::ConflictLink>,
+    pub conflict_widths: Option<[i32; 2]>,
     /// Whether the token menu is open. The message handler owns the flag and the painter reads it,
     /// the same division as the format menu above.
     pub var_open: bool,
@@ -1278,9 +1282,20 @@ impl Frame<'_> {
             // leave. `.status.is-error` is `--danger` (`:276`) and `.is-warning` is `--warning`
             // (`:327`), and the level travels with the message so the panel cannot pick its own
             // colour for it.
+            // The link and the sentence share the strip: .status { flex: 1 } (:275) gives up
+            // exactly what lex: none (:328) takes, so one width is computed and used by both.
+            let link_width = self
+                .conflict
+                .zip(self.conflict_widths)
+                .map(|(link, measured)| measured[link.index()]);
             if let (Some((level, text)), Some(format)) = (self.status, self.status_format) {
                 if !text.is_empty() {
-                    let rect = crate::panel::footer_status_rect(self.metrics, self.scale, widths);
+                    let rect = crate::panel::footer_status_rect(
+                        self.metrics,
+                        self.scale,
+                        widths,
+                        link_width,
+                    );
                     let colour = match level {
                         crate::copy::Level::Error => &self.brushes.danger,
                         // `--warning` (`:23`), not the field border's yellow: `.status.is-warning`
@@ -1289,6 +1304,17 @@ impl Frame<'_> {
                     };
                     painter.draw_text(text, format, rect, colour);
                 }
+            }
+
+            // `:676` the conflict link, when the name about to be written is already a file. It is
+            // `flex: none` between the sentence and the copy button (`:328`), at the status size and
+            // in `--warning`, and its word is the action a click would take (`:1150`).
+            if let (Some(link), Some(format), Some(width)) =
+                (self.conflict, self.status_format, link_width)
+            {
+                let rect =
+                    crate::panel::conflict_link_rect(self.metrics, self.scale, widths, width);
+                painter.draw_text(link.text(), format, rect, &self.brushes.warning_text);
             }
         }
 
@@ -1670,6 +1696,27 @@ pub fn measure_path_change(dwrite: &IDWriteFactory, dpi: f32) -> Result<i32> {
     Ok(crate::panel::field::ghost_button_width(scale, measured))
 }
 
+/// The conflict link's two words, measured in the status face (`:328` puts it at the status size).
+///
+/// Both words are measured because the link shows the action rather than the policy: whichever
+/// policy is in force, the other word is what appears, so a caller that measured one would have the
+/// wrong width half the time.
+pub fn measure_conflict_link(dwrite: &IDWriteFactory, dpi: f32) -> Result<[i32; 2]> {
+    let format = status_format(dwrite, dpi)?;
+    let mut widths = [0i32; 2];
+    for (index, link) in [
+        crate::copy::ConflictLink::Overwrite,
+        crate::copy::ConflictLink::Rename,
+    ]
+    .iter()
+    .enumerate()
+    {
+        widths[index] =
+            crate::panel::d2d::measure_text_width(dwrite, link.text(), &format)?.round() as i32;
+    }
+    Ok(widths)
+}
+
 /// The footer buttons' widths, measured the way the painter measures them.
 ///
 /// A caller that paints and also answers clicks measures once here and hands the result to both, so
@@ -1923,6 +1970,10 @@ pub struct PaintInput<'a> {
     /// The footer's one line of message with its level: the window decides whether there is one and
     /// what it says, the frame decides how the two levels look.
     pub status: Option<(crate::copy::Level, &'a str)>,
+    /// The conflict link, when the name the panel would write is already a file.
+    pub conflict: Option<crate::copy::ConflictLink>,
+    /// Both of the link's words, measured by the window for the same reason as the footer's.
+    pub conflict_widths: Option<[i32; 2]>,
     /// Whether the token menu is open. Only one menu can be open at a time; the window closes one
     /// when the other opens, so this is a fact about the panel rather than a preference.
     pub var_open: bool,
@@ -1953,6 +2004,8 @@ impl<'a> PaintInput<'a> {
             footer_widths: None,
             path_change: 0,
             status: None,
+            conflict: None,
+            conflict_widths: None,
             var_open: false,
             path_chips: None,
             size_presets: None,
@@ -2045,6 +2098,8 @@ pub fn paint_to_dc_with_preview(
         path_change: input.path_change,
         status: input.status,
         status_format: Some(&status_format),
+        conflict: input.conflict,
+        conflict_widths: input.conflict_widths,
         var_open: input.var_open,
         var_label: Some(&var_label),
         path_chips: input.path_chips,
@@ -2465,7 +2520,7 @@ mod tests {
             let canvas = Canvas::new_at(1840, 1128, 192.0);
             let widths = canvas.render_status(Some((level, text)));
             let px = canvas.pixels();
-            let rect = crate::panel::footer_status_rect(&DEMO, 2.0, widths);
+            let rect = crate::panel::footer_status_rect(&DEMO, 2.0, widths, None);
             let (got, x, y) = strongest(&px, rect, colour);
             assert!(
                 close(got, colour, 12),
@@ -2484,7 +2539,7 @@ mod tests {
         let canvas = Canvas::new_at(1840, 1128, 192.0);
         let widths = canvas.render_status(None);
         let px = canvas.pixels();
-        let rect = crate::panel::footer_status_rect(&DEMO, 2.0, widths);
+        let rect = crate::panel::footer_status_rect(&DEMO, 2.0, widths, None);
         let surface = fill_rgb(23, 23, 28);
         // Every pixel in the status's box is the surface: nothing is drawn there.
         for y in rect.top..rect.bottom {
@@ -4329,6 +4384,10 @@ impl PanelRenderer {
     /// paint drew rather than a second measurement of the same words.
     pub fn measure_path_chips(&self, dpi: f32) -> Result<[i32; 3]> {
         measure_path_chips(&self.dwrite, dpi)
+    }
+    /// The conflict link's two words, for the same reason: the link drawn is the link clicked.
+    pub fn measure_conflict_link(&self, dpi: f32) -> Result<[i32; 2]> {
+        measure_conflict_link(&self.dwrite, dpi)
     }
 
     /// The four size shortcuts' widths, for the same reason: a click on `50%` has to land on the

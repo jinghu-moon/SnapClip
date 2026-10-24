@@ -348,6 +348,34 @@ fn resolve(
     }
 }
 
+/// The path this request would write, honouring its conflict policy.
+///
+/// The panel asks this rather than joining a stem and an extension itself: the trimming and the
+/// `_2` numbering are rules of the save, and a second copy of them would eventually disagree with
+/// what lands on disk.
+pub fn target_of(request: &SaveRequest) -> Result<std::path::PathBuf, SaveError> {
+    let (stem, _warnings) = prepare(request)?;
+    Ok(resolve(
+        &request.directory,
+        &stem,
+        extension_of(request.format),
+        request.conflict,
+    ))
+}
+
+/// The path the file would take if nothing were in the way: same stem, same extension, no
+/// numbering. Whether this exists is what shows the `改为覆盖` link, because renaming only asks a
+/// question when there is an answer already there.
+pub fn plain_target(request: &SaveRequest) -> Result<std::path::PathBuf, SaveError> {
+    let (stem, _warnings) = prepare(request)?;
+    Ok(resolve(
+        &request.directory,
+        &stem,
+        extension_of(request.format),
+        ConflictPolicy::Overwrite,
+    ))
+}
+
 /// The extension the file gets. Kept beside the commit rather than on `SaveFormat`, because the
 /// format crate knows what bytes are legal and the save step knows what a user expects to see.
 fn extension_of(format: SaveFormat) -> &'static str {
@@ -419,6 +447,36 @@ mod tests {
             .expect("png data");
         drop(writer);
         path
+    }
+
+    /// The name the panel asks about is the name the save would use: same trimming, same extension,
+    /// same `_2` numbering. A panel that joined this itself would eventually disagree with what
+    /// lands on disk, which is why there is one function for it.
+    #[test]
+    fn the_plain_target_is_the_name_the_save_starts_from() {
+        let dir = scratch("plain-target");
+        let renaming = request(&dir, ConflictPolicy::AutoRename);
+        let plain = plain_target(&renaming).expect("a valid request");
+        assert_eq!(plain, dir.join("shot.png"), "a free name is its own target");
+
+        fs::write(&plain, b"last night").expect("a file in the way");
+        // The plain target does not move and the save's target does. That difference is what shows
+        // the conflict link, so the two cannot be the same question.
+        assert_eq!(
+            plain_target(&renaming).expect("still valid"),
+            plain,
+            "the plain target stays the taken name"
+        );
+        assert_eq!(
+            target_of(&renaming).expect("still valid"),
+            dir.join("shot_2.png"),
+            "renaming steps to the next free name"
+        );
+        assert_eq!(
+            target_of(&request(&dir, ConflictPolicy::Overwrite)).expect("still valid"),
+            plain,
+            "overwriting keeps the taken name"
+        );
     }
 
     fn request(directory: &Path, conflict: ConflictPolicy) -> SaveRequest {

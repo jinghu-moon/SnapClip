@@ -2141,22 +2141,68 @@ pub fn footer_button_contains(
 /// The band is the buttons' own, because `.foot` is `align-items: center` (`:274`) and the status is
 /// a single line of eleven dip text: centring it in the same band is what puts it on their middle
 /// line rather than on the strip's.
+///
+/// `link_width` is the conflict link when one is showing: the sentence is `.status { flex: 1 }`
+/// (`:275`) and the link is `flex: none` (`:328`), so the sentence gives up exactly the link and a
+/// gap rather than running underneath it.
 pub fn footer_status_rect(
     metrics: &FrameMetrics,
     scale: f32,
     widths: [i32; 3],
+    link_width: Option<i32>,
 ) -> Rect {
     let px = |dip: i32| (dip as f32 * scale).round() as i32;
     let strip = footer_rect(metrics, scale);
     let buttons = footer_button_rect(metrics, scale, widths, FooterButton::Copy);
     let left = strip.left + px(FOOTER_PAD_X_DIP);
-    let right = (buttons.left - px(FOOTER_GAP_DIP)).max(left);
+    let right = match link_width {
+        Some(link) => buttons.left - px(FOOTER_GAP_DIP) * 2 - link.max(0),
+        None => buttons.left - px(FOOTER_GAP_DIP),
+    }
+    .max(left);
     Rect {
         left,
         right,
         top: buttons.top,
         bottom: buttons.bottom,
     }
+}
+
+/// The `改为覆盖` / `改为重命名` link (`:676`), in the footer between the status and the copy button.
+///
+/// `.link-btn` (`:158`) has no padding and inherits the font, so its width is the measured width of
+/// whichever word it is showing. The word is the **action** the click would take, not the policy in
+/// force (`:1150`), which is why the window measures both.
+pub fn conflict_link_rect(
+    metrics: &FrameMetrics,
+    scale: f32,
+    widths: [i32; 3],
+    link_width: i32,
+) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let buttons = footer_button_rect(metrics, scale, widths, FooterButton::Copy);
+    let right = buttons.left - px(FOOTER_GAP_DIP);
+    Rect {
+        left: right - link_width.max(0),
+        right,
+        top: buttons.top,
+        bottom: buttons.bottom,
+    }
+}
+
+/// Whether a point is on the conflict link. The rectangle it tests is the one the painter draws,
+/// measured by the window, so a link that is shown is a link that can be pressed.
+pub fn conflict_link_contains(
+    metrics: &FrameMetrics,
+    scale: f32,
+    widths: [i32; 3],
+    link_width: i32,
+    point: (i32, i32),
+) -> bool {
+    rect_contains(
+        conflict_link_rect(metrics, scale, widths, link_width),
+        point,
+    )
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3352,7 +3398,7 @@ mod tests {
             let widths = FOOTER_WIDTHS;
             let strip = footer_rect(&metrics, scale);
             let copy = footer_button_rect(&metrics, scale, widths, FooterButton::Copy);
-            let status = footer_status_rect(&metrics, scale, widths);
+            let status = footer_status_rect(&metrics, scale, widths, None);
             let px = |dip: i32| (dip as f32 * scale).round() as i32;
 
             assert_eq!(
@@ -3383,7 +3429,7 @@ mod tests {
         // rectangle is not an empty one: it would fill the whole strip when it reached a painter.
         let metrics = crate::panel::DEMO;
         let scale = 2.0;
-        let zero = footer_status_rect(&metrics, scale, [0; 3]);
+        let zero = footer_status_rect(&metrics, scale, [0; 3], None);
         assert!(zero.right >= zero.left, "a status is never backwards");
     }
 
