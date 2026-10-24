@@ -1172,3 +1172,62 @@ fn note_edit(remembered, id, is_change, edited) -> bool
 - 快捷键：`shortcut_directory(3)` ⇒ `None` ✓（不是"第四个别名"✗）。
 
 **仍缺** ✗：变量菜单每项的**当前值** ✓（新缺口 A32）；`更改` 对话框的**默认目录**取的是系统默认而不是当前路径 ✓（A33）。
+
+### 键盘与两条误导：`Enter` 保存、PNG 不显示质量档、四个尺寸预设（本批）
+
+三件都不是"画东西"✗ —— 两件是**行为**✓，一件是**去掉误导**✗。
+
+**① `Enter` 保存（`docs/design/save-panel-demo-v3.html:686` 的 `title="保存 (Enter)"`）**
+
+核实结论 ✗✓：**改之前完全收不到** ✗。消息循环只有 `GetMessageW` + `TranslateMessage` + `DispatchMessageW` ✓，没有 `IsDialogMessageW` ⇒
+
+- 单行 `EDIT` **自己吃掉** `Enter` ✓（还会响一声 ✓）⇒ 父窗口根本收不到 `WM_KEYDOWN` ✗；
+- 于是 `Esc` 也只有在**面板自己持有焦点**时才有用 ✗（在输入框里按 `Esc` 是没反应的 ✗）。
+
+修法 ✓：消息循环里先问 `IsDialogMessageW(hwnd, &message)` ✓（返回非零 ⇒ `continue` ✓），面板补 `WS_EX_CONTROLPARENT` ✓（**不补它，`IsDialogMessage` 不会下沉到子控件** ✗）。于是：
+
+- `Enter` ⇒ `WM_COMMAND(IDOK=1)` ✓、`Esc` ⇒ `IDCANCEL=2` ✓ ⇒ 由**纯函数** `shortcut_command` ✓ 映射成 `Shortcut::{Save, Cancel}` ✓；
+- 顺带 `Tab` 从此能在四个字段间走 ✓（`WS_TABSTOP` 早就有 ✓，缺的就是这一环 ✓）；
+- `IsDialogMessage` 会给**焦点控件先拒绝的机会** ✓ ⇒ 将来到多行编辑框时，换行仍然是换行 ✓。
+
+保存的两条入口（`Enter` 与底部的按钮）现在共用 `attempt_save` ✓ ⇒ **不会有一天两处对"失败后关不关面板"意见不同** ✗✓。
+
+**② PNG 不显示质量分段器，改显示「无损」提示（`:638`、`:639`、`:1096`、`:1097`）**
+
+demo 有两条**行为**规则而我们只画了控件 ✗：`:639` 给分段器 `display:none` ✓、`:1097` 只在**非 PNG** 时显示 ✓；`:638` 的提示文字只在 PNG 时出现 ✓（`:1096`）。
+
+- 唯一的判定是 `quality_segment_shown(format)` ✓（`FMT_PNG_INDEX = 0` ✓，`.PNG` 在 `FMT_OPTIONS` 的第 0 位 ✓）；**画**与**命中**都问它 ✓ ⇒ 看不见的控件**点不动** ✗✓（否则点在空白上会改一个屏幕上看不到的设置 ✗）；
+- 提示色 `.hint-text { color: rgba(232,236,242,.56) }`（`:262`）⇒ 我们的笔刷不透明 ✓ ⇒ `quality_hint_over_surface` 合成为 `(145,142,142)` ✓（有断言 ✓）。
+
+**③ 四个尺寸预设（`:614`–`:619`、`:258`、`:259`）**
+
+`100% / 75% / 50% / 25%` ✓，点了**真的改尺寸** ✓ —— 走 `size_preset_size` ✓（四舍五入 ✓、**最小 1 像素** ✓），写进**两个尺寸格的原生控件** ✓ ⇒ 保存读的仍是那两个控件 ✓（**一个写者** ✓，而不是"预设另存一份数字"✗）。
+
+结构性后果 ✗：尺寸行的内容变成 `32 + 6 + 2 + 24 = 64` ✓（`.values` + `.form-row` 的 gap + `.size-presets { margin-top: 2px }` + `.chip { height: 24px }`）⇒ **下面所有行再下移 32** ✓。两条按旧间距钉住的测试按**预期正确变化**改 ✓：
+
+- `the_size_row_is_its_cells_and_a_line_of_four_shortcuts` ✓（新，四种 DPI ✓，内容高 64 ✓ 是**字面量**而不是关系式 ✓）；
+- `the_quality_row_stays_inside_its_group` ✓ —— 从"相差一个行距"改成"**内容的底 + 12 = 下一行的标签顶**"✓：行距是随行高变的 ✗，而"组内只隔 12"才是设计说的那句 ✓（`:162`）。
+
+**证据** ✓
+
+```
+ui   161/0  ✓（142 ⇒ +19：几何 5 + 位图 2 + 语义 1 …）
+app  256/0/9 ✓（+1：shortcut_command）
+capture 545/0/80 ✓   icon-bake 7/0 ✓
+check --workspace --all-targets  Finished ✓  死代码 0 ✓
+两个 gate：desktop-tests 0 unmarked ✓  ledger ✓  stale comments 0 ✓  dep-direction clean ✓  baseline OK ✓
+```
+
+**三条变异都真红 ✓，还原逐字节一致 ✓**（各先断言 `grep -Fxc` 命中**正好 1 处** ✓）：
+
+| 变异 | 红的信息 |
+| --- | --- |
+| 分段器对所有格式都显示 ✗ | `the_quality_control_is_hidden_for_png_and_the_hint_takes_its_place` FAILED |
+| 预设忽略百分比 ✗ | `a_shortcut_scales_the_capture_to_its_percentage` FAILED（"half is half"） |
+| 预设字号 11 → 0 ✗ | `the_size_row_draws_its_four_shortcuts` FAILED |
+
+⚠️ 第二轮演练里**两条第一次没跑成** ✗：`perl -0pi -e "s/…/…/"` 的锚点里含 `/` ⇒ 替换**没发生** ✓ ⇒ 那条"测试仍然绿"**不算证据** ✓；而 `grep -Fc` 对**多行锚点**是按行计数的 ✗ ⇒ 守卫读到 3838 处 ⇒ **拒绝执行** ✓（正是它该做的 ✓）。改成单行锚点 + `s{}{}` 分隔符才拿到红 ✓。
+
+**字形子集** ✗✓：新文字（`PNG 格式是无损压缩，不支持质量调整`）⇒ 门禁**先红** ✓（`no glyph for '无' (U+65E0)` ✓）⇒ 重建 ⇒ **297 → 303 codepoints** ✓ ⇒ 绿 ✓。四个预设处于**数字字面**（`.size-presets .chip { font-family: var(--num) }`，`:259`）⇒ 只用数字与 `%` ✓ ⇒ `number-chars.txt` 已含 ✓ ⇒ 无需重建数字子集 ✓。
+
+**仍缺** ✗：`数值`/`百分比` 模式与**重置钮**（下一批 ✓）；尺寸行的 `warn-hint`（`:621`，超过原图时出现 ✓，A29 的另一半 ✓）；`.adv-btn` 与体积上限（A30 ✓）。

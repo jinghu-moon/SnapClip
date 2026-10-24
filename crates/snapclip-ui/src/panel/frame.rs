@@ -221,6 +221,9 @@ pub struct FrameBrushes {
     pub muted: ID2D1SolidColorBrush,
     /// The row labels' own colour, a little stronger than `--muted` (`:166`).
     pub label: ID2D1SolidColorBrush,
+    /// `.hint-text { color: rgba(232,236,242,.56) }` (`:262`) resolved over the surface: the quality
+    /// row's hint, which is fainter than a label because it explains rather than names.
+    pub hint: ID2D1SolidColorBrush,
     /// `--line-soft` (`:28`) resolved over the surface, for the size row's mode container.
     pub line_soft: ID2D1SolidColorBrush,
     /// The footer's top hairline: `rgba(255,255,255,.04)` (`:274`), resolved over the surface for
@@ -270,6 +273,10 @@ impl FrameBrushes {
             text: brush(target, palette.text)?,
             muted: brush(target, palette.muted)?,
             label: brush(target, palette.label)?,
+            hint: brush(
+                target,
+                crate::panel::field::quality_hint_over_surface(palette.surface),
+            )?,
             // `--line-soft` is a translucent white, and our brushes are opaque, so it is resolved
             // over the surface here rather than left to blend: one place, and no caller has to know.
             line_soft: brush(
@@ -424,6 +431,19 @@ pub struct Frame<'a> {
     /// click handler with a second measurement — which is the arrangement the footer's widths
     /// already replaced. `None` measures here, for callers that only paint.
     pub path_chips: Option<[i32; 3]>,
+    /// The four size shortcuts' widths in pixels, in the design's order (`:615`–`:618`).
+    ///
+    /// The same division as the footer's and the path chips': the caller that also answers clicks
+    /// measures once and hands the numbers over, so the chip a click lands on is the chip that was
+    /// drawn. `None` measures here, for a caller that only paints.
+    pub size_presets: Option<[i32; 4]>,
+    /// The quality row's hint (`.hint-text`, ten dip, `:262`): the line that takes the segmented
+    /// control's place when the format has no quality tier (`:638`, `:639`).
+    pub hint: Option<&'a IDWriteTextFormat>,
+    /// The shortcuts' words, which the design sets in the numeric face at the chip's own eleven dip
+    /// (`.size-presets .chip { font-family: var(--num) }`, `:259`, with `.chip`'s `font-size: 11px`,
+    /// `:192`).
+    pub preset_label: Option<&'a IDWriteTextFormat>,
 }
 
 impl Frame<'_> {
@@ -625,20 +645,82 @@ impl Frame<'_> {
             }
         }
 
+        // The four shortcuts under the cells (`.size-presets`, `:614`). A chip is a pill with an
+        // edge and `--muted` words (`.chip`, `:192`), set in the numeric face and the chip's own
+        // eleven dip (`:259`). Their widths are measurements, so they come from the caller or are
+        // made here; either way one rule decides how wide a chip is.
+        if let Some(words_format) = self.preset_label {
+            let widths = match self.size_presets {
+                Some(widths) => widths,
+                None => {
+                    let mut widths = [0i32; 4];
+                    for (index, word) in crate::panel::field::SIZE_PRESET_WORDS.iter().enumerate() {
+                        let measured = painter.measure_text_width(word, words_format)? as i32;
+                        widths[index] = crate::panel::field::size_preset_width(self.scale, measured);
+                    }
+                    widths
+                }
+            };
+            let pill = ((crate::panel::field::AFTER_CHIP_HEIGHT_DIP as f32 * self.scale).round()
+                as i32)
+                / 2;
+            for (index, word) in crate::panel::field::SIZE_PRESET_WORDS.iter().enumerate() {
+                let chip = crate::panel::field::size_preset_rect(
+                    self.metrics,
+                    self.rects,
+                    self.scale,
+                    widths,
+                    index,
+                );
+                let edge = self.scale.round().max(1.0);
+                painter.stroke_round(chip, pill, &self.brushes.line_soft, edge);
+                let inset = (crate::panel::field::AFTER_CHIP_PAD_DIP as f32 * self.scale).round()
+                    as i32;
+                painter.draw_text(
+                    word,
+                    words_format,
+                    Rect {
+                        left: chip.left + inset,
+                        ..chip
+                    },
+                    &self.brushes.muted,
+                );
+            }
+        }
+
         // The quality row's segmented control: a track with a block marking the chosen option
         // (`:263`–`:265`). It is not a field — there is no child window and no border rule — so it is
         // painted here rather than inside the field loop above. The options' words are text, and
         // every drawn character has to be in the embedded subset, so they belong to the stage that
         // rebuilds it.
-        let seg = crate::panel::quality_seg_rect(self.metrics, self.rects, self.scale);
-        let seg_radius = (crate::panel::QUALITY_SEG_RADIUS_DIP * self.scale).round() as i32;
-        painter.fill_round(seg, seg_radius, &self.brushes.field_fill);
-        if self.quality < crate::panel::QUALITY_OPTIONS {
-            let block =
-                crate::panel::quality_option_rect(self.metrics, self.rects, self.scale, self.quality);
-            let block_radius =
-                (crate::panel::QUALITY_SEG_INNER_RADIUS_DIP * self.scale).round() as i32;
-            painter.fill_round(block, block_radius, &self.brushes.accent);
+        //
+        // The control is only shown for a format with a quality tier: `:639` hides it for PNG and
+        // `:1097` shows it otherwise, because a lossless copy has nothing to adjust. The row then
+        // carries the hint instead (`:638`, `:1096`). The predicate is shared with the click handler,
+        // so the control cannot be changed by a click while it is not drawn.
+        if crate::panel::quality_segment_shown(self.format) {
+            let seg = crate::panel::quality_seg_rect(self.metrics, self.rects, self.scale);
+            let seg_radius = (crate::panel::QUALITY_SEG_RADIUS_DIP * self.scale).round() as i32;
+            painter.fill_round(seg, seg_radius, &self.brushes.field_fill);
+            if self.quality < crate::panel::QUALITY_OPTIONS {
+                let block = crate::panel::quality_option_rect(
+                    self.metrics,
+                    self.rects,
+                    self.scale,
+                    self.quality,
+                );
+                let block_radius =
+                    (crate::panel::QUALITY_SEG_INNER_RADIUS_DIP * self.scale).round() as i32;
+                painter.fill_round(block, block_radius, &self.brushes.accent);
+            }
+        } else if let Some(format) = self.hint {
+            let rect = crate::panel::quality_hint_rect(self.metrics, self.rects, self.scale);
+            painter.draw_text(
+                crate::panel::field::QUALITY_HINT_TEXT,
+                format,
+                rect,
+                &self.brushes.hint,
+            );
         }
 
         if let Some((text, format)) = self.title {
@@ -661,17 +743,25 @@ impl Frame<'_> {
                 painter.draw_text(row.label(), format, rect, &self.brushes.label);
             }
         }
-        if let Some(format) = self.chip {
-            for (index, word) in crate::panel::field::QUALITY_OPTION_WORDS.iter().enumerate() {
-                let rect =
-                    crate::panel::quality_option_rect(self.metrics, self.rects, self.scale, index);
-                // `:266` the options are `--muted`; `:267` the chosen one is `--text`.
-                let brush = if index == self.quality {
-                    &self.brushes.text
-                } else {
-                    &self.brushes.muted
-                };
-                painter.draw_text(word, format, rect, brush);
+        // The options' words belong to the control, so they are shown exactly when it is: PNG draws
+        // the hint instead and has no options to name (`:639`, `:1097`).
+        if crate::panel::quality_segment_shown(self.format) {
+            if let Some(format) = self.chip {
+                for (index, word) in crate::panel::field::QUALITY_OPTION_WORDS.iter().enumerate() {
+                    let rect = crate::panel::quality_option_rect(
+                        self.metrics,
+                        self.rects,
+                        self.scale,
+                        index,
+                    );
+                    // `:266` the options are `--muted`; `:267` the chosen one is `--text`.
+                    let brush = if index == self.quality {
+                        &self.brushes.text
+                    } else {
+                        &self.brushes.muted
+                    };
+                    painter.draw_text(word, format, rect, brush);
+                }
             }
         }
 
@@ -1412,6 +1502,51 @@ pub fn format_label_format(dwrite: &IDWriteFactory, dpi: f32) -> Result<IDWriteT
     )
 }
 
+/// `.hint-text { font-size: 10px }` (`save-panel-demo-v3.html:262`). The quality row's explanation,
+/// a dip smaller than the row labels because it explains rather than names.
+pub const HINT_FONT_DIP: f32 = 10.0;
+
+/// The quality row's hint (`:262`): ten dip at the body weight, leading-aligned and vertically
+/// centred, because `.hint-text` is a flex line that starts where its box does.
+pub fn hint_format(dwrite: &IDWriteFactory, dpi: f32) -> Result<IDWriteTextFormat> {
+    text_format(dwrite, dpi, HINT_FONT_DIP, DWRITE_FONT_WEIGHT_NORMAL)
+}
+
+/// `.chip { font-size: 11px }` (`:192`) in the numeric face, which is what
+/// `.size-presets .chip { font-family: var(--num) }` (`:259`) asks for.
+pub const PRESET_FONT_DIP: f32 = 11.0;
+
+/// The four size shortcuts' words: eleven dip in the embedded numeric face, so `100%` and `25%` line
+/// up with the digits above them the way the design sets them (`:259`).
+pub fn preset_label_format(dwrite: &IDWriteFactory, dpi: f32) -> Result<IDWriteTextFormat> {
+    let families: Vec<&str> = std::iter::once(crate::panel::NUMBER_FAMILY)
+        .chain(crate::panel::NUMBER_FALLBACKS)
+        .collect();
+    text_format_in(
+        dwrite,
+        dpi,
+        PRESET_FONT_DIP,
+        DWRITE_FONT_WEIGHT_NORMAL,
+        &families,
+    )
+}
+
+/// The four shortcuts' widths in pixels, measured from the renderer that will draw them.
+///
+/// The window measures these once and hands them to both the painter and the hit test, for the same
+/// reason the footer's widths travel: a chip whose clickable rectangle was measured twice could
+/// answer a click at a place it is not drawn.
+pub fn measure_size_presets(dwrite: &IDWriteFactory, dpi: f32) -> Result<[i32; 4]> {
+    let scale = (dpi / 96.0).max(0.5);
+    let format = preset_label_format(dwrite, dpi)?;
+    let mut widths = [0i32; 4];
+    for (index, word) in crate::panel::field::SIZE_PRESET_WORDS.iter().enumerate() {
+        let measured = crate::panel::d2d::measure_text_width(dwrite, word, &format)?.round() as i32;
+        widths[index] = crate::panel::field::size_preset_width(scale, measured);
+    }
+    Ok(widths)
+}
+
 fn properties(dpi: f32) -> D2D1_RENDER_TARGET_PROPERTIES {
     D2D1_RENDER_TARGET_PROPERTIES {
         r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
@@ -1464,6 +1599,8 @@ pub struct PaintInput<'a> {
     pub var_open: bool,
     /// The three shortcut chips' widths, measured by the window for the same reason as the footer's.
     pub path_chips: Option<[i32; 3]>,
+    /// The four size shortcuts' widths, measured by the window for the same reason as the footer's.
+    pub size_presets: Option<[i32; 4]>,
 }
 
 impl<'a> PaintInput<'a> {
@@ -1482,6 +1619,7 @@ impl<'a> PaintInput<'a> {
             status: None,
             var_open: false,
             path_chips: None,
+            size_presets: None,
         }
     }
 }
@@ -1529,6 +1667,11 @@ pub fn paint_to_dc_with_preview(
     let status_format = status_format(dwrite, input.dpi)?;
     // The token menu's labels (`.var-item`, 12 dip, `:219`).
     let var_label = var_label_format(dwrite, input.dpi)?;
+    // The quality row's hint (`.hint-text`, ten dip, `:262`), shown in place of the control when the
+    // format has no quality tier.
+    let hint = hint_format(dwrite, input.dpi)?;
+    // The size row's four shortcuts, in the numeric face at the chip's own eleven dip (`:259`).
+    let preset_label = preset_label_format(dwrite, input.dpi)?;
     let painter = PanelPainter {
         context: &target,
         text_factory: dwrite,
@@ -1562,6 +1705,9 @@ pub fn paint_to_dc_with_preview(
         var_open: input.var_open,
         var_label: Some(&var_label),
         path_chips: input.path_chips,
+        size_presets: input.size_presets,
+        hint: Some(&hint),
+        preset_label: Some(&preset_label),
         fields: input.fields,
         preview: preview.as_ref().map(|(b, w, h)| (b, *w, *h)),
         quality: input.quality,
@@ -2186,10 +2332,13 @@ mod tests {
     /// the option's word is drawn (`:641`–`:643`): the centre was the right place to look before
     /// there was any text, and pointing at a glyph would make this test about the glyph's ink
     /// instead of about the block behind it.
+    ///
+    /// The format is JPG: PNG has no quality tier, so the control is not on screen at all for it
+    /// (`:639`) and there would be nothing to mark.
     #[test]
     fn the_quality_segment_marks_the_chosen_option_with_the_accent() {
         let canvas = Canvas::new(920, DEMO.panel_height());
-        canvas.render();
+        canvas.render_format_index(1);
         let px = canvas.pixels();
         let rects = DEMO.rects(1.0);
         let track = crate::panel::quality_seg_rect(&DEMO, &rects, 1.0);
@@ -2311,10 +2460,87 @@ mod tests {
     /// The chosen option's word is `--text` while the others are `--muted` (`:266`, `:267`), so the
     /// brightest pixel of the chosen box is brighter than the brightest of an unchosen one. Both
     /// boxes are named, and swapping the two brushes — or dropping the word — fails here.
+    ///
+    /// PNG has no quality tier, so the control gives way to a line that says so (`:639`, `:638`,
+    /// `:1096`). The same point that is the accent block under JPG is not accent here, and the hint
+    /// is drawn in its own grey.
+    #[test]
+    fn the_quality_control_gives_way_to_the_hint_for_png() {
+        let canvas = Canvas::new_at(1840, (DEMO.panel_height() as f32 * 2.0) as i32, 192.0);
+        let rects = DEMO.rects(2.0);
+        let chosen = crate::panel::quality_option_rect(&DEMO, &rects, 2.0, 0);
+        let probe = (chosen.left + 8, chosen.top + 8);
+        let accent = fill_rgb(31, 117, 219);
+
+        canvas.render_format_index(1);
+        assert_px(
+            &canvas.pixels(),
+            probe.0,
+            probe.1,
+            accent,
+            12,
+            "JPG draws the control (:1097)",
+        );
+
+        canvas.render_format_index(0);
+        let px = canvas.pixels();
+        assert_not_any(&px, probe.0, probe.1, &[accent], 16, "PNG draws no block (:639)");
+        let hint = crate::panel::quality_hint_rect(&DEMO, &rects, 2.0);
+        assert!(
+            any_close(&px, hint, fill_rgb(142, 142, 145), 24),
+            "PNG draws the hint in .hint-text's grey (:262, :638)"
+        );
+    }
+
+    /// The four shortcuts are drawn under the cells: a pill's edge and a word in the numeric face
+    /// (`:192`, `:259`). The widths are the ones `measure_size_presets` reports, so the rectangles
+    /// sampled here are the rectangles the painter used.
+    #[test]
+    fn the_size_row_draws_its_four_shortcuts() {
+        let canvas = Canvas::new_at(1840, (DEMO.panel_height() as f32 * 2.0) as i32, 192.0);
+        canvas.render();
+        let px = canvas.pixels();
+        let rects = DEMO.rects(2.0);
+        let dwrite = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED) }
+            .expect("a DirectWrite factory");
+        let widths = crate::panel::measure_size_presets(&dwrite, 192.0).expect("the widths");
+        let edge = crate::panel::line_soft_over_surface(DEMO_PALETTE.surface);
+
+        for (index, word) in crate::panel::field::SIZE_PRESET_WORDS.iter().enumerate() {
+            let chip = crate::panel::size_preset_rect(&DEMO, &rects, 2.0, widths, index);
+            let middle = (chip.left + chip.right) / 2;
+            assert_px(
+                &px,
+                middle,
+                chip.top,
+                fill_rgb(edge[2], edge[1], edge[0]),
+                10,
+                "the pill's --line-soft edge (:192)",
+            );
+            // Inside the padding, so the only ink left is the word itself.
+            let text = snapclip_model::geometry::Rect {
+                left: chip.left + 18,
+                right: chip.right - 2,
+                top: chip.top + 2,
+                bottom: chip.bottom - 2,
+            };
+            assert!(
+                ink_inside(&px, text, 12) >= 4,
+                "{word} must be drawn inside its chip (:259)"
+            );
+        }
+    }
+
+
+    /// The chosen option's word is `--text` while the others are `--muted` (`:266`, `:267`), so the
+    /// brightest pixel of the chosen box is brighter than the brightest of an unchosen one. Both
+    /// boxes are named, and swapping the two brushes — or dropping the word — fails here.
+    ///
+    /// Rendered as JPG for the same reason the accent test is: PNG hides the control (`:639`).
     #[test]
     fn the_chosen_quality_word_is_brighter_than_the_unchosen_ones() {
         let canvas = Canvas::new(920, DEMO.panel_height());
-        canvas.render();
+        canvas.render_format_index(1);
         let px = canvas.pixels();
         let rects = DEMO.rects(1.0);
         let option = |index: usize| {
@@ -2533,6 +2759,9 @@ mod tests {
         /// Render with one of the quality options chosen, which is the state a click leaves behind.
         /// Everything else is idle, so the only thing that moves between these renders is the block
         /// the segmented control draws.
+        ///
+        /// The format is JPG, not PNG: PNG has no quality tier, so the control is not drawn at all
+        /// for it (`:639`) and there would be no block to sample.
         fn render_quality(&self, quality: usize) {
             let factory = factory().expect("a Direct2D factory");
             let dwrite = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED) }
@@ -2544,10 +2773,30 @@ mod tests {
                 Rect::new(0, 0, self.width, self.height),
                 &PaintInput {
                     quality,
+                    format: 1,
                     ..PaintInput::idle(self.dpi)
                 },
             )
             .expect("the frame paints with a chosen quality");
+        }
+
+        /// Render with a chosen format index, which is what decides whether the quality control is
+        /// shown: PNG hides it and shows the hint instead (`:639`, `:638`).
+        fn render_format_index(&self, format: usize) {
+            let factory = factory().expect("a Direct2D factory");
+            let dwrite = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED) }
+                .expect("a DirectWrite factory");
+            paint_to_dc_with_preview(
+                &factory,
+                &dwrite,
+                self.dc,
+                Rect::new(0, 0, self.width, self.height),
+                &PaintInput {
+                    format,
+                    ..PaintInput::idle(self.dpi)
+                },
+            )
+            .expect("the frame paints with a chosen format");
         }
 
         /// Render with a footer status line, which is the state a failed save leaves behind.
@@ -3510,6 +3759,12 @@ impl PanelRenderer {
     /// paint drew rather than a second measurement of the same words.
     pub fn measure_path_chips(&self, dpi: f32) -> Result<[i32; 3]> {
         measure_path_chips(&self.dwrite, dpi)
+    }
+
+    /// The four size shortcuts' widths, for the same reason: a click on `50%` has to land on the
+    /// chip the user can see, and the chip's width is its word's.
+    pub fn measure_size_presets(&self, dpi: f32) -> Result<[i32; 4]> {
+        measure_size_presets(&self.dwrite, dpi)
     }
 }
 

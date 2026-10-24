@@ -74,6 +74,11 @@ pub use field::{
     line_soft_over_surface,
     name_field_rect, path_field_rect, quality_option_rect, quality_pointer, quality_seg_rect,
     quality_segment_state, size_cell_rect,
+    FMT_PNG_INDEX, QUALITY_HINT_TEXT, quality_hint_over_surface, quality_hint_rect,
+    quality_segment_shown,
+    SIZE_PRESET_GAP_DIP, SIZE_PRESET_INDENT_DIP, SIZE_PRESET_MARGIN_DIP, SIZE_PRESET_PCT,
+    SIZE_PRESET_WORDS, size_preset_contains, size_preset_rect, size_preset_size,
+    size_preset_width, size_presets_rect,
     size_mode_button_rect, size_mode_button_width, size_mode_rect, size_mode_reset_icon_rect,
     size_mode_reset_rect,
     rect_contains, rects_intersect, path_change_contains, path_open_contains, path_chip_at,
@@ -84,8 +89,10 @@ pub use field::{
 pub use frame::{
     CHIP_FONT_DIP, DEMO, DEMO_PALETTE, Frame, FrameBrushes, FrameMetrics, FramePalette, FrameRects,
     NUMBER_FONT_DIP, PaintInput, PanelRenderer, ROW_LABEL_FONT_DIP, TITLE, UNIT_FONT_DIP,
-    chip_format, factory, measure_footer_widths, measure_path_chips, number_format,
+    chip_format, factory, measure_footer_widths, measure_path_chips, measure_size_presets,
+    number_format,
     row_label_format, status_format, text_format_in, title_format, var_label_format, VAR_FONT_DIP,
+    HINT_FONT_DIP, PRESET_FONT_DIP, hint_format, preset_label_format,
 };
 pub use icon_button::IconButton;
 pub use icons::{Glyph, ICON_BAKED_PX, ICON_COUNT};

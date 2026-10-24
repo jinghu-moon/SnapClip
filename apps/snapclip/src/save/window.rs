@@ -37,7 +37,12 @@ use snapclip_capture::save_format::SaveFormat;
 /// about itself answers yes. That is exactly how a panel that is never seen passes every test, and
 /// it is why this is a constant with a test rather than a literal at the call site.
 pub(crate) const PANEL_EX_STYLE: u32 = windows_sys::Win32::UI::WindowsAndMessaging::WS_EX_TOOLWINDOW
-    | windows_sys::Win32::UI::WindowsAndMessaging::WS_EX_TOPMOST;
+    | windows_sys::Win32::UI::WindowsAndMessaging::WS_EX_TOPMOST
+    // `IsDialogMessageW` only descends into the children of a window that says it is a container,
+    // and descending is how `Tab` reaches the next field and how `Enter` and `Esc` become commands
+    // at all (`Enter` is a save, `Esc` a cancel). Without the bit the panel is a window full of
+    // loose controls and its keyboard is whatever each control happens to do with it.
+    | windows_sys::Win32::UI::WindowsAndMessaging::WS_EX_CONTROLPARENT;
 
 /// Replace the panel in `slot`: **close the old one, then create the new one, then store it.**
 ///
@@ -570,10 +575,10 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
     use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DispatchMessageW, GetClassNameW, GetMessageW, GetWindow, GetWindowLongW,
-        GetWindowRect, LoadCursorW, RegisterClassW, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-        TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWL_EXSTYLE, GWLP_USERDATA, GW_HWNDPREV, IDC_ARROW,
-        MSG, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, WNDCLASSW, WS_CAPTION,
-        WS_EX_TOPMOST, WS_OVERLAPPED, WS_SYSMENU,
+        GetWindowRect, IsDialogMessageW, LoadCursorW, RegisterClassW, SetWindowLongPtrW,
+        SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWL_EXSTYLE,
+        GWLP_USERDATA, GW_HWNDPREV, IDC_ARROW, MSG, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER,
+        WNDCLASSW, WS_CAPTION, WS_EX_TOPMOST, WS_OVERLAPPED, WS_SYSMENU,
     };
 
     let class_name: Vec<u16> = "SnapClipSavePanel\0".encode_utf16().collect();
@@ -679,6 +684,9 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
         // handler tests the chips the paint drew, and three words of different lengths make three
         // chips of different widths.
         let path_chips = measure_path_chips(hwnd, renderer.as_ref());
+        // The size row's four shortcuts, measured here for the same reason: a click on `50%` has to
+        // land on the chip the paint drew, and each chip is as wide as its own word.
+        let size_presets = measure_size_presets(hwnd, renderer.as_ref());
         // The child's background: the field's own fill, resolved from `--fill` over the surface.
         // A native `EDIT` cannot be translucent, so the composite is computed once here.
         let fill = snapclip_ui::panel::field_colours(
@@ -714,6 +722,7 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
             // Both menus start closed: the panel opens on the form, not on a popup.
             var_open: false,
             path_chips,
+            size_presets,
             copy: options
                 .copy
                 .take()
@@ -819,6 +828,14 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
     let mut message: MSG = unsafe { std::mem::zeroed() };
     unsafe {
         while GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) > 0 {
+            // `IsDialogMessage` is what makes this a form rather than a window full of loose
+            // controls: `Tab` moves between the fields, and the keys a focused control does not want
+            // arrive as `WM_COMMAND` (`Enter` as `IDOK`, `Esc` as `IDCANCEL`). It gives the focused
+            // control first refusal, so a control that wants the key — a multi-line editor's newline,
+            // for instance — still gets it. This is why the panel carries `WS_EX_CONTROLPARENT`.
+            if IsDialogMessageW(hwnd, &message) != 0 {
+                continue;
+            }
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }
@@ -933,6 +950,9 @@ struct WindowState {
     /// Measured once beside the footer's, for the same reason: the click handler tests the chips
     /// that were drawn rather than a second measurement of the same three words.
     path_chips: [i32; 3],
+    /// The four size shortcuts' widths, in the design's order (`:615`–`:618`), measured once beside
+    /// the footer's for the same reason: the click handler tests the chips the paint drew.
+    size_presets: [i32; 4],
     /// Where the footer's copy button sends the picture. Behind a trait so a test can see what was
     /// asked for without writing to the user's clipboard.
     copy: std::sync::Arc<dyn ImageCopy>,
@@ -976,7 +996,8 @@ fn measure_path_change(
 }
 
 /// The three shortcut chips' widths, measured once like the buttons above.
-fn measure_path_chips(    hwnd: windows_sys::Win32::Foundation::HWND,
+fn measure_path_chips(
+    hwnd: windows_sys::Win32::Foundation::HWND,
     renderer: Option<&snapclip_ui::panel::PanelRenderer>,
 ) -> [i32; 3] {
     let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96) as f32;
@@ -987,6 +1008,22 @@ fn measure_path_chips(    hwnd: windows_sys::Win32::Foundation::HWND,
             [0; 3]
         }
         None => [0; 3],
+    }
+}
+
+/// The four size shortcuts' widths, measured once like the buttons above.
+fn measure_size_presets(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    renderer: Option<&snapclip_ui::panel::PanelRenderer>,
+) -> [i32; 4] {
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96) as f32;
+    match renderer.map(|renderer| renderer.measure_size_presets(dpi)) {
+        Some(Ok(widths)) => widths,
+        Some(Err(error)) => {
+            eprintln!("[save-panel] could not measure the size shortcuts: {error:?}");
+            [0; 4]
+        }
+        None => [0; 4],
     }
 }
 
@@ -1167,6 +1204,56 @@ fn status_of(
         // a full disk, an I/O failure. Their `message` is developer-facing and ascii, which is
         // recorded in `docs/41` as a gap rather than dressed up as user-facing wording here.
         Err(error) => Some((snapclip_ui::copy::Level::Error, error.message())),
+    }
+}
+
+/// What one of the dialog manager's commands means for this panel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shortcut {
+    /// `Enter`, which the mockup titles as the save button's key (`:686`).
+    Save,
+    /// `Esc`, which the mockup titles as cancel's (`:684`); cancelling closes the panel (`docs/42`
+    /// D12).
+    Cancel,
+}
+
+/// The dialog manager's two command ids, and what the panel does with them.
+///
+/// `IsDialogMessageW` gives the focused control first refusal on a key. `Enter` in a single-line
+/// edit is not wanted by the control, so the manager sends `WM_COMMAND` with `IDOK` (1) to the
+/// panel; `Esc` arrives the same way as `IDCANCEL` (2). The mapping is a function rather than two
+/// `if`s inside the message handler, for the reason `status_of` and `note_edit` are functions: a
+/// rule that only lives inside a handler is a rule no test can reach.
+fn shortcut_command(command: usize) -> Option<Shortcut> {
+    match command {
+        1 => Some(Shortcut::Save),
+        2 => Some(Shortcut::Cancel),
+        _ => None,
+    }
+}
+
+/// Save, and close the panel only if a file exists.
+///
+/// The footer's save button and the `Enter` key both land here, so the two cannot disagree about
+/// what a save does: success closes the panel, and a rejection leaves it open with the reason in the
+/// footer, which is what `docs/41` A12 is about.
+fn attempt_save(hwnd: windows_sys::Win32::Foundation::HWND) {
+    if save_from_panel(hwnd).is_some() {
+        // The picture exists, so the panel has nothing left to ask.
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+                hwnd,
+                windows_sys::Win32::UI::WindowsAndMessaging::WM_CLOSE,
+                0,
+                0,
+            );
+        }
+    } else {
+        // The panel stays open with the reason in its footer: closing here is what made every
+        // rejected save invisible (`docs/41` A12).
+        unsafe {
+            windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0);
+        }
     }
 }
 
@@ -1523,6 +1610,24 @@ impl WindowState {
         snapclip_ui::panel::chosen_quality(&self.segment)
     }
 
+    /// Put a size into the two cells' controls, which is what a shortcut does.
+    ///
+    /// The controls are where the size lives — the save reads their text — so a shortcut writes the
+    /// text rather than a second pair of numbers that the paint would then have to agree with. One
+    /// writer, and it is the one the user can also type into.
+    fn set_size_text(&self, width: u32, height: u32) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW;
+        for (id, value) in [
+            (snapclip_ui::panel::FieldId::SizeWidth, width),
+            (snapclip_ui::panel::FieldId::SizeHeight, height),
+        ] {
+            let text: Vec<u16> = value.to_string().encode_utf16().chain([0]).collect();
+            unsafe {
+                SetWindowTextW(self.control(id), text.as_ptr());
+            }
+        }
+    }
+
     /// The segment's state at this scale, rebuilt when the scale has moved since it was built. What
     /// the user picked survives the rebuild: a DPI change must not change the choice.
     fn segment_at_scale(&mut self, scale: f32) -> &mut snapclip_ui::panel::SegmentState {
@@ -1868,6 +1973,7 @@ extern "system" fn window_proc(
                                 path_change: s.path_change,
                                 var_open: s.var_open,
                                 path_chips: Some(s.path_chips),
+                                size_presets: Some(s.size_presets),
                                 status: s
                                     .status
                                     .as_ref()
@@ -2107,23 +2213,42 @@ extern "system" fn window_proc(
                             );
                         }
                         snapclip_ui::panel::FooterButton::Save => {
-                            let saved = save_from_panel(hwnd);
-                            if saved.is_some() {
-                                // The picture exists, so the panel has nothing left to ask.
-                                windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
-                                    hwnd, WM_CLOSE, 0, 0,
-                                );
-                            } else {
-                                // The panel stays open with the reason in its footer: closing here
-                                // is what made every rejected save invisible (`docs/41` A12).
-                                InvalidateRect(hwnd, std::ptr::null(), 0);
-                            }
+                            attempt_save(hwnd);
+                        }
+                    }
+                    return 0;
+                }
+
+                // The four size shortcuts under the cells (`:614`, `:258`). A shortcut sets both
+                // numbers through the same rule the save applies, so what the panel shows and what
+                // the file gets cannot disagree.
+                let presets = state(hwnd).map(|s| s.size_presets).unwrap_or([0; 4]);
+                let rects = metrics.rects(scale);
+                if let Some(index) = snapclip_ui::panel::size_preset_contains(
+                    &metrics,
+                    &rects,
+                    scale,
+                    presets,
+                    (point.x, point.y),
+                ) {
+                    if let Some(s) = state(hwnd) {
+                        if let Some((_, width, height)) = s.preview.as_ref() {
+                            let size = snapclip_ui::panel::size_preset_size(
+                                snapclip_ui::panel::SIZE_PRESET_PCT[index],
+                                (*width, *height),
+                            );
+                            s.set_size_text(size.0, size.1);
+                            InvalidateRect(hwnd, std::ptr::null(), 0);
                         }
                     }
                     return 0;
                 }
             }
+            // The quality control only answers while it is drawn. PNG has no tier to pick, so the row
+            // shows the hint instead (`:639`, `:1096`), and a click on that space has to do nothing
+            // rather than change a setting nothing on screen refers to.
             let chosen = state_mut(hwnd)
+                .filter(|s| snapclip_ui::panel::quality_segment_shown(s.format))
                 .map(|s| s.quality_pointer(dpi_scale(hwnd), event, point))
                 .unwrap_or(false);
             if chosen {
@@ -2152,6 +2277,9 @@ extern "system" fn window_proc(
                 // makes all three stale for the same reason.
                 s.path_chips = measure_path_chips(hwnd, s.renderer.as_ref());
                 s.path_change = measure_path_change(hwnd, s.renderer.as_ref());
+                // The size shortcuts are words too, so their widths are pixels and go stale the same
+                // way.
+                s.size_presets = measure_size_presets(hwnd, s.renderer.as_ref());
             }
             apply_menu_occlusion(hwnd);
             0
@@ -2160,9 +2288,14 @@ extern "system" fn window_proc(
         // state machine owns what that means (`Shell::close`), and the window only has to stop
         // being a window. The close button arrives with the controls.
         WM_KEYDOWN => {
-            use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+            use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
             if wparam == VK_ESCAPE as usize {
                 windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            } else if wparam == VK_RETURN as usize {
+                // The panel itself can hold the focus — a click on empty space leaves it there — and
+                // then no control is there to translate the key, so the panel answers it directly.
+                // The same key pressed inside a field arrives through `shortcut_command` instead.
+                attempt_save(hwnd);
             }
             0
         }
@@ -2202,6 +2335,22 @@ extern "system" fn window_proc(
             const EN_CHANGE: u16 = 0x0300;
             let notification = ((wparam >> 16) & 0xFFFF) as u16;
             let control = lparam as windows_sys::Win32::Foundation::HWND;
+            // A command with no control behind it is the dialog manager's, not a child's:
+            // `IsDialogMessage` sends the keys a focused control will not take as `IDOK` and
+            // `IDCANCEL`. The mockup's own titles promise the two (`保存 (Enter)`, `:686`; `取消
+            // (Esc)`, `:684`).
+            if control.is_null() {
+                match shortcut_command(wparam & 0xFFFF) {
+                    Some(Shortcut::Save) => attempt_save(hwnd),
+                    Some(Shortcut::Cancel) => {
+                        windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+                            hwnd, WM_CLOSE, 0, 0,
+                        );
+                    }
+                    None => {}
+                }
+                return 0;
+            }
             let mut repaint = false;
             if let Some(s) = state_mut(hwnd) {
                 if let Some(id) = s.field_of(control) {
@@ -2513,6 +2662,25 @@ mod tests {
         }
     }
 
+    /// `Enter` saves and `Esc` cancels, and nothing else is a shortcut.
+    ///
+    /// The ids are the dialog manager's: `IDOK` is 1 and `IDCANCEL` is 2. `IsDialogMessage` sends
+    /// them when the focused control will not take the key, which is why the panel could not see
+    /// `Enter` at all until the message loop started translating: a single-line edit swallows it, so
+    /// there was no `WM_KEYDOWN` for the panel to receive.
+    #[test]
+    fn the_two_shortcut_keys_are_enter_and_escape() {
+        assert_eq!(shortcut_command(1), Some(Shortcut::Save), "IDOK is Enter (:686)");
+        assert_eq!(shortcut_command(2), Some(Shortcut::Cancel), "IDCANCEL is Esc (:684)");
+        for other in [0usize, 3, 7] {
+            assert_eq!(
+                shortcut_command(other),
+                None,
+                "{other} is a command id, but not one of these two"
+            );
+        }
+    }
+
     /// The name row opens with the remembered template; the path row opens where the shell says.
     ///
     /// The template is the spec's (`:68`), not the mockup's placeholder: the box holds a template
@@ -2687,6 +2855,7 @@ mod tests {
             status: None,
             var_open: false,
             path_chips: [40, 52, 64],
+            size_presets: [40, 36, 36, 36],
             copy: std::sync::Arc::new(SystemImageCopy),
         };
 
@@ -2753,6 +2922,7 @@ mod tests {
             status: None,
             var_open: false,
             path_chips: [40, 52, 64],
+            size_presets: [40, 36, 36, 36],
             copy: std::sync::Arc::new(SystemImageCopy),
         };
 
@@ -2823,6 +2993,7 @@ mod tests {
             status: None,
             var_open: false,
             path_chips: [40, 52, 64],
+            size_presets: [40, 36, 36, 36],
             copy: std::sync::Arc::new(SystemImageCopy),
         };
 
@@ -3042,6 +3213,7 @@ mod tests {
             status: None,
             var_open: false,
             path_chips: [40, 52, 64],
+            size_presets: [40, 36, 36, 36],
             copy: recorder.clone(),
         };
         state.controls.fill(std::ptr::null_mut());

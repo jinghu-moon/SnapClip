@@ -651,7 +651,17 @@ impl Row {
             // `.chip { height: 24px }`, `:192`), with `.form-row { gap: 6px }` (`:164`) between them.
             // So it is 62 and every row below it moves down by thirty.
             Row::Path => metrics.field_height + metrics.row_gap + AFTER_CHIP_HEIGHT_DIP,
-            Row::Name | Row::Size => metrics.field_height,
+            // The size row is the second row whose content is two things: `.values` (`:594`, 32 dip
+            // like a text field) and the four shortcuts under it (`.size-presets`, `:614`, 24 dip
+            // with `margin-top: 2px`), separated by the row's own `gap: 6px` (`:164`). So it is 64,
+            // and every row below it moves down by thirty two.
+            Row::Size => {
+                metrics.field_height
+                    + metrics.row_gap
+                    + SIZE_PRESET_MARGIN_DIP
+                    + AFTER_CHIP_HEIGHT_DIP
+            }
+            Row::Name => metrics.field_height,
             Row::Quality | Row::Estimate => ROW_DIP,
             Row::Saved => 0,
         }
@@ -952,6 +962,111 @@ pub fn link_hub_icon_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32
     }
 }
 
+// -------------------------------------------------------------------------------------------------
+// The size row's shortcuts: `.size-presets` (`:614`–`:619`) and its CSS (`:258`)
+// -------------------------------------------------------------------------------------------------
+
+/// `.size-presets { gap: 6px }` (`:258`) — between the four shortcuts.
+pub const SIZE_PRESET_GAP_DIP: i32 = 6;
+
+/// `.size-presets { padding-left: 28px }` (`:258`) — the line starts under the cells, past the `宽`
+/// label, so it reads as belonging to the numbers above it rather than to the row's label.
+pub const SIZE_PRESET_INDENT_DIP: i32 = 28;
+
+/// `.size-presets { margin-top: 2px }` (`:258`), on top of the `.form-row { gap: 6px }` (`:164`) that
+/// already separates it from `.values`.
+pub const SIZE_PRESET_MARGIN_DIP: i32 = 2;
+
+/// The four percentages the design offers, in its own order (`:615`–`:618`): `100%`, `75%`, `50%`,
+/// `25%`.
+pub const SIZE_PRESET_PCT: [u32; 4] = [100, 75, 50, 25];
+
+/// What each shortcut says, verbatim from the design (`:615`–`:618`). Kept beside the percentages
+/// rather than formatted from them, because every drawn character has to be in the embedded subset
+/// and the subset's list is produced from these very strings; a test holds the two lists together.
+pub const SIZE_PRESET_WORDS: [&str; 4] = ["100%", "75%", "50%", "25%"];
+
+/// One shortcut's width: its word plus the chip's ten dip on each side (`.chip { padding: 0 10px }`,
+/// `:192`). The word is measured by the caller, which has a device; this module has none.
+pub fn size_preset_width(scale: f32, text_width_px: i32) -> i32 {
+    text_width_px + 2 * (AFTER_CHIP_PAD_DIP as f32 * scale).round() as i32
+}
+
+/// The line the four shortcuts sit on.
+///
+/// The size row's content is `.values` (`:594`, 32 dip tall) and then `.size-presets` (`:614`), and
+/// `.form-row` stacks its children with `gap: 6px` (`:164`) while the shortcuts add `margin-top: 2px`
+/// of their own (`:258`). So the line starts at the content's top plus `32 + 6 + 2` and is 24 dip
+/// tall, which is the chip's height (`.chip { height: 24px }`, `:192`).
+pub fn size_presets_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let row = field_rect(metrics, rects, scale, Row::Size);
+    // Summed in dip and rounded once, the way every other stacked offset is: rounding the three
+    // terms separately would move the line by a pixel at 125% (`2 * 1.25` rounds up, `40 * 1.25` does
+    // not), and the line would then sit a pixel off the design at exactly one scale.
+    let top = row.top + px(metrics.field_height + metrics.row_gap + SIZE_PRESET_MARGIN_DIP);
+    Rect {
+        left: row.left + px(SIZE_PRESET_INDENT_DIP),
+        top,
+        right: row.right,
+        bottom: top + px(AFTER_CHIP_HEIGHT_DIP),
+    }
+}
+
+/// One shortcut, given all four measured widths so the caller measures once and both the painter and
+/// the hit test read the same numbers.
+pub fn size_preset_rect(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    widths: [i32; 4],
+    index: usize,
+) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let line = size_presets_rect(metrics, rects, scale);
+    let mut left = line.left;
+    for width in widths.iter().take(index) {
+        left += width + px(SIZE_PRESET_GAP_DIP);
+    }
+    Rect {
+        left,
+        top: line.top,
+        right: left + widths[index],
+        bottom: line.bottom,
+    }
+}
+
+/// Which shortcut a client point is inside, if any. Pure for the same reason the other hit tests are:
+/// a test that only lives inside the message handler is a test nothing can reach.
+pub fn size_preset_contains(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    widths: [i32; 4],
+    point: (i32, i32),
+) -> Option<usize> {
+    (0..SIZE_PRESET_WORDS.len()).find(|index| {
+        let rect = size_preset_rect(metrics, rects, scale, widths, *index);
+        point.0 >= rect.left
+            && point.0 < rect.right
+            && point.1 >= rect.top
+            && point.1 < rect.bottom
+    })
+}
+
+/// What a shortcut asks for: the captured size scaled by that percentage.
+///
+/// `100%` is the capture itself, and rounding is to nearest so that `75%` of an odd number does not
+/// quietly lose a pixel; a scale of zero would be an image with no pixels, so the result never falls
+/// below one.
+pub fn size_preset_size(pct: u32, original: (u32, u32)) -> (u32, u32) {
+    let scale = |value: u32| -> u32 {
+        let scaled = (u64::from(value) * u64::from(pct) + 50) / 100;
+        scaled.max(1) as u32
+    };
+    (scale(original.0), scale(original.1))
+}
+
 /// The button inside the name field that opens the naming-variable menu: `.name-var { right: 4px;
 /// top: 4px; width: 24px; height: 24px }` (`:213`), holding a 16-unit graphic (`:558`).
 pub const NAME_WAND_DIP: i32 = 24;
@@ -1231,6 +1346,12 @@ pub fn form_drawn_strings() -> Vec<&'static str> {
     all.push(GHOST_WORD_CHANGE);
     all.extend(PATH_CHIP_WORDS);
     all.push(SIZE_UNIT_TEXT);
+    // The quality row's hint, which takes the control's place when the format has no quality tier
+    // (`:638`, `:1096`). It is drawn, so its characters have to be in the subset.
+    all.push(QUALITY_HINT_TEXT);
+    // The four size shortcuts are drawn in the numeric face (`.size-presets .chip`, `:259`), so they
+    // are not in this list: `number_characters` carries the digits and the percent sign they use,
+    // and a test below holds the two lists together.
     all
 }
 
@@ -1325,6 +1446,44 @@ pub fn quality_pointer(state: &mut SegmentState, event: PointerEvent, point: Poi
     let before = chosen_quality(state);
     let activated = state.pointer_event(event, point)?;
     (chosen_quality(state) != before).then_some(activated)
+}
+
+/// `PNG 格式是无损压缩，不支持质量调整` (`:638`) — what the quality row says instead of the control
+/// when the chosen format has no quality to adjust.
+pub const QUALITY_HINT_TEXT: &str = "PNG 格式是无损压缩，不支持质量调整";
+
+/// The index [`FMT_OPTIONS`] gives `.PNG` (`:717`): the only one of the three without a quality tier.
+pub const FMT_PNG_INDEX: usize = 0;
+
+/// Whether the quality control is shown at all for a format index into [`FMT_OPTIONS`].
+///
+/// The design hides the control for PNG — `style="display:none"` on it (`:639`) and `:1097` shows it
+/// only when the format is not PNG — and puts the hint in its place (`:1096`, `:638`), because a
+/// lossless copy has no tier to pick. The rule lives here so that the painter and the hit test ask
+/// the same question: a control that is not drawn must not answer a click either, or the panel would
+/// change a setting nothing on screen refers to.
+pub fn quality_segment_shown(format: usize) -> bool {
+    format != FMT_PNG_INDEX
+}
+
+/// The hint's box, which is the quality row's content.
+///
+/// `:306` puts the hint and the control on one line with `justify-content: space-between`, and only
+/// one of them is ever shown, so the hint takes the whole content box when it is.
+pub fn quality_hint_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -> Rect {
+    field_rect(metrics, rects, scale, Row::Quality)
+}
+
+/// `.hint-text { color: rgba(232,236,242,.56) }` (`:262`) resolved over whatever is behind it,
+/// because our brushes are opaque. The channel order is the buffer's, so the tint reads
+/// `(242,236,232)` for the design's `(232,236,242)`.
+pub fn quality_hint_over_surface(surface: [u8; 4]) -> [u8; 4] {
+    let tint = [242u32, 236, 232];
+    let alpha = 56u32;
+    let mix = |index: usize| -> u8 {
+        ((u32::from(surface[index]) * (100 - alpha) + tint[index] * alpha) / 100) as u8
+    };
+    [mix(0), mix(1), mix(2), 255]
 }
 
 /// How many fields take part in tab navigation. The real window keeps this number true by creating
@@ -2358,17 +2517,21 @@ mod tests {
         }
     }
 
-    /// The quality row stays inside its group, so it is one ordinary row pitch below the size row.
+    /// The quality row stays inside its group, so nothing but the form's twelve dip gap separates it
+    /// from the content above it. Stated as the gap it is rather than as a row pitch, because the
+    /// size row's content is not the height of a text field — it is the cells and a line of
+    /// shortcuts, 64 — and a pitch would have to be rewritten every time a row grew.
     #[test]
     fn the_quality_row_stays_inside_its_group() {
         for scale in [1.0f32, 1.25, 1.5, 2.0] {
-            let rects = metrics().rects(scale);
-            let size = field_rect(&metrics(), &rects, scale, Row::Size);
-            let quality = field_rect(&metrics(), &rects, scale, Row::Quality);
-            let one_row = (metrics().text_row_pitch() as f32 * scale).round() as i32;
+            let metrics = metrics();
+            let rects = metrics.rects(scale);
+            let round = |dip: i32| (dip as f32 * scale).round() as i32;
+            let size = field_rect(&metrics, &rects, scale, Row::Size);
+            let quality = label_rect(&metrics, &rects, scale, Row::Quality);
             assert_eq!(
-                quality.top - size.top,
-                one_row,
+                quality.top,
+                size.bottom + round(12),
                 "size and quality share a group, so only the 12 dip row gap separates them (:162)"
             );
         }
@@ -3167,6 +3330,153 @@ mod tests {
                 assert_eq!(icon.right - icon.left, round(12), "the chip's folder is 12 (:195)");
                 assert_eq!(icon.left, chip.left + round(10), "after the chip's padding (:192)");
             }
+        }
+    }
+
+    /// Under the two size cells sits a line of four shortcuts (`.size-presets`, `:614`).
+    ///
+    /// The row's content is therefore 32 + 6 + 2 + 24 — `.values` (`:594`) is a text field's 32, the
+    /// form's gap is 6 (`:164`), the line has `margin-top: 2px` (`:258`) and a chip is 24 (`:192`) —
+    /// which is why the rows below moved down by thirty two and why this row could not keep the plain
+    /// field height.
+    #[test]
+    fn the_size_row_is_its_cells_and_a_line_of_four_shortcuts() {
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            let metrics = metrics();
+            let rects = metrics.rects(scale);
+            let round = |dip: i32| (dip as f32 * scale).round() as i32;
+            let row = field_rect(&metrics, &rects, scale, Row::Size);
+            let line = size_presets_rect(&metrics, &rects, scale);
+            let widths = [40, 36, 36, 36];
+
+            assert_eq!(
+                row.bottom - row.top,
+                round(32 + 6 + 2 + 24),
+                "the cells, the form gap, the line's own margin and a chip (:167, :164, :258, :192)"
+            );
+            assert_eq!(row.bottom - row.top, round(64), "sixty four, stated once");
+            assert_eq!(
+                line.top,
+                row.top + round(32 + 6 + 2),
+                "the shortcuts start under the cells, past the form gap and their own margin"
+            );
+            assert_eq!(line.bottom - line.top, round(24), "a chip is 24 high (:192)");
+            assert_eq!(
+                line.left,
+                row.left + round(28),
+                "the line is indented past the 宽 label (:258)"
+            );
+            for index in 0..4 {
+                let chip = size_preset_rect(&metrics, &rects, scale, widths, index);
+                assert_eq!(chip.top, line.top, "all four sit on the same line");
+                if index == 0 {
+                    assert_eq!(chip.left, line.left, "the first starts the line");
+                } else {
+                    let before = size_preset_rect(&metrics, &rects, scale, widths, index - 1);
+                    assert_eq!(
+                        chip.left,
+                        before.right + round(6),
+                        "the shortcuts are six apart (:258)"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Each percentage and the word drawn for it are the same number, so the button cannot say `75%`
+    /// and scale by seventy.
+    #[test]
+    fn the_shortcut_percentages_and_their_words_agree() {
+        assert_eq!(SIZE_PRESET_PCT, [100, 75, 50, 25]);
+        for (pct, word) in SIZE_PRESET_PCT.iter().zip(SIZE_PRESET_WORDS) {
+            assert_eq!(word, format!("{pct}%"), "the word is the number it scales by");
+        }
+    }
+
+    /// A shortcut asks for the capture at its own percentage.
+    #[test]
+    fn a_shortcut_scales_the_capture_to_its_percentage() {
+        let capture = (1440, 900);
+        assert_eq!(size_preset_size(100, capture), capture, "100% is the capture itself");
+        assert_eq!(size_preset_size(50, capture), (720, 450), "half is half");
+        assert_eq!(size_preset_size(25, capture), (360, 225), "a quarter is a quarter");
+        // Rounded to nearest rather than truncated, so 75% of an odd width keeps its pixel.
+        assert_eq!(size_preset_size(75, (1441, 901)), (1081, 676), "75% rounds to nearest");
+        // A scale that would leave no pixels cannot: an image with a zero side is not an image.
+        assert_eq!(size_preset_size(25, (2, 3)), (1, 1), "never below one pixel");
+    }
+
+    /// A click is answered by the shortcut it landed on and by no other.
+    #[test]
+    fn a_shortcut_answers_only_inside_its_own_chip() {
+        let metrics = metrics();
+        let rects = metrics.rects(1.0);
+        let widths = [40, 36, 36, 36];
+        for index in 0..4 {
+            let chip = size_preset_rect(&metrics, &rects, 1.0, widths, index);
+            let centre = ((chip.left + chip.right) / 2, (chip.top + chip.bottom) / 2);
+            assert_eq!(
+                size_preset_contains(&metrics, &rects, 1.0, widths, centre),
+                Some(index),
+                "a click inside chip {index} chooses it"
+            );
+            assert_eq!(
+                size_preset_contains(&metrics, &rects, 1.0, widths, (chip.left, chip.top)),
+                Some(index),
+                "the top left corner is inside, half open intervals"
+            );
+            assert_eq!(
+                size_preset_contains(&metrics, &rects, 1.0, widths, (chip.right, chip.top)),
+                None,
+                "the right edge belongs to the chip after it"
+            );
+        }
+        let line = size_presets_rect(&metrics, &rects, 1.0);
+        assert_eq!(
+            size_preset_contains(&metrics, &rects, 1.0, widths, (line.left, line.top - 1)),
+            None,
+            "above the line is not a shortcut"
+        );
+    }
+
+    /// PNG has no quality tier, so the control is hidden and the hint takes its place (`:639`,
+    /// `:1096`, `:638`). The same predicate is what the click handler asks, so a control that is not
+    /// drawn cannot be clicked either.
+    #[test]
+    fn the_quality_control_is_hidden_for_png_and_the_hint_takes_its_place() {
+        assert!(!quality_segment_shown(FMT_PNG_INDEX), "PNG hides the control (:639)");
+        assert_eq!(FMT_OPTIONS[FMT_PNG_INDEX], ".PNG", "index zero is PNG (:717)");
+        for (index, word) in FMT_OPTIONS.iter().enumerate().skip(1) {
+            assert!(
+                quality_segment_shown(index),
+                "{word} has a quality tier, so the control is shown (:1097)"
+            );
+        }
+
+        // The hint occupies the control's own line, because only one of the two is ever shown.
+        let metrics = metrics();
+        let rects = metrics.rects(1.5);
+        let hint = quality_hint_rect(&metrics, &rects, 1.5);
+        let row = field_rect(&metrics, &rects, 1.5, Row::Quality);
+        assert_eq!(hint, row, "the hint is the quality row's content box");
+    }
+
+    /// `rgba(232,236,242,.56)` (`:262`) resolved over the surface: our brushes are opaque, so the
+    /// painter needs the colour it will actually produce rather than a translucent one.
+    #[test]
+    fn the_quality_hint_is_the_designs_grey_over_the_surface() {
+        let surface = [23u8, 23, 28, 235];
+        let hint = quality_hint_over_surface(surface);
+        assert_eq!(hint[3], 255, "resolved colours are opaque");
+        // 44% surface + 56% of the design's (232,236,242), in buffer order (b,g,r).
+        assert_eq!(hint[0], 145, "blue: 44% of 23 plus 56% of 242");
+        assert_eq!(hint[1], 142, "green: 44% of 23 plus 56% of 236");
+        assert_eq!(hint[2], 142, "red: 44% of 28 plus 56% of 232");
+        for (index, blended) in hint.iter().take(3).enumerate() {
+            assert!(
+                *blended > surface[index],
+                "the hint is lighter than the surface behind it"
+            );
         }
     }
 }
