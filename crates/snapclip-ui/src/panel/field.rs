@@ -120,6 +120,9 @@ impl FieldId {
     /// A size cell is not a single box: the design puts a `宽` or `高` label before the number and a
     /// `px` unit after it, all three inside one wrapper (`:237`, `:242`, `:244`). The control is the
     /// number alone, so it takes the input rectangle; the wrapper is painted separately.
+    ///
+    /// The name field likewise gives up its rightmost 34 dip to the naming-variable button
+    /// (`:212`), so its control is the field box less that strip.
     pub fn rect(
         self,
         metrics: &FrameMetrics,
@@ -128,7 +131,7 @@ impl FieldId {
     ) -> Rect {
         match self {
             FieldId::Path => field_rect(metrics, rects, scale, Row::Path),
-            FieldId::Name => field_rect(metrics, rects, scale, Row::Name),
+            FieldId::Name => name_text_rect(metrics, rects, scale),
             FieldId::SizeWidth => size_cell_input_rect(metrics, rects, scale, SizeCell::Width),
             FieldId::SizeHeight => size_cell_input_rect(metrics, rects, scale, SizeCell::Height),
         }
@@ -777,6 +780,78 @@ pub fn link_hub_icon_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32
     let side = px(LINK_HUB_ICON_DIP);
     let left = hub.left + (hub.right - hub.left - side) / 2;
     let top = hub.top + (hub.bottom - hub.top - side) / 2;
+    Rect {
+        left,
+        top,
+        right: left + side,
+        bottom: top + side,
+    }
+}
+
+/// The button inside the name field that opens the naming-variable menu: `.name-var { right: 4px;
+/// top: 4px; width: 24px; height: 24px }` (`:213`), holding a 16-unit graphic (`:558`).
+pub const NAME_WAND_DIP: i32 = 24;
+
+/// The wand's inset from the field's top and right edges (`:213`).
+pub const NAME_WAND_INSET_DIP: i32 = 4;
+
+/// The wand's graphic, which the design draws in a 16-unit box (`:558`).
+pub const NAME_WAND_ICON_DIP: i32 = 16;
+
+/// `.name-wrap .text-input { padding-right: 34px }` (`:212`): the field's text stops this far short
+/// of its right edge, which is what leaves the wand's strip clear.
+///
+/// The design reserves that room with inner padding. A child window is painted above its parent, so
+/// a wand painted on the field would be hidden by the edit control underneath it; the control is
+/// therefore shortened by the same amount instead. The frame still fills the whole field box, so the
+/// strip reads as part of the field rather than as a gap.
+pub const NAME_TEXT_ROOM_DIP: i32 = 34;
+
+/// The rectangle the name field's native control occupies: the field box, less the room the wand
+/// needs on the right. This is `FieldId::Name`'s control rectangle; the frame around it is the whole
+/// field box, so the two differ by exactly the wand's strip.
+pub fn name_text_rect(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let field = field_rect(metrics, rects, scale, Row::Name);
+    Rect {
+        right: field.right - px(NAME_TEXT_ROOM_DIP),
+        ..field
+    }
+}
+
+/// The wand's own box, inset four dip from the field's top and right edges (`:213`).
+pub fn name_wand_rect(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let field = field_rect(metrics, rects, scale, Row::Name);
+    let inset = px(NAME_WAND_INSET_DIP);
+    let side = px(NAME_WAND_DIP);
+    Rect {
+        left: field.right - inset - side,
+        top: field.top + inset,
+        right: field.right - inset,
+        bottom: field.top + inset + side,
+    }
+}
+
+/// The wand's graphic, centred in its box: 16 dip in 24 (`:558` in a `:213` button).
+pub fn name_wand_icon_rect(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let wand = name_wand_rect(metrics, rects, scale);
+    let side = px(NAME_WAND_ICON_DIP);
+    let left = wand.left + (wand.right - wand.left - side) / 2;
+    let top = wand.top + (wand.bottom - wand.top - side) / 2;
     Rect {
         left,
         top,
@@ -2045,6 +2120,72 @@ mod tests {
     /// The local shorthand, so the tests read like the design rather than like `crate::panel::DEMO`.
     fn metrics() -> FrameMetrics {
         crate::panel::DEMO
+    }
+
+    /// The name field's control gives up its right-hand strip to the insert-a-variable button, and
+    /// that button sits in exactly that strip.
+    ///
+    /// The two facts are one decision: `.name-wrap .text-input { padding-right: 34px }` (`:212`) is
+    /// what keeps the text out from under `.name-var { right: 4px; top: 4px; width: 24px; height:
+    /// 24px }` (`:213`). The control cannot be padded the way the mockup's input is, so it is
+    /// shortened instead — a control that kept its full width would hide the button, because a child
+    /// window is painted above its parent.
+    #[test]
+    fn the_name_control_gives_up_its_strip_to_the_variable_button() {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let metrics = metrics();
+            let rects = metrics.rects(scale);
+            let round = |dip: i32| (dip as f32 * scale).round() as i32;
+
+            let field = field_rect(&metrics, &rects, scale, Row::Name);
+            let control = FieldId::Name.rect(&metrics, &rects, scale);
+            // An absolute number rather than the constant, because both sides would move together
+            // with a wrong constant and the assertion would agree with itself.
+            assert_eq!(
+                field.right - control.right,
+                round(34),
+                "the design reserves 34 dip of text room at the field's right edge (:212)"
+            );
+            assert_eq!(
+                control.left, field.left,
+                "and keeps the field's left edge, so the fill is continuous"
+            );
+
+            let wand = name_wand_rect(&metrics, &rects, scale);
+            assert_eq!(
+                wand.right,
+                field.right - round(NAME_WAND_INSET_DIP),
+                "the button is inset from the field's right edge (:213)"
+            );
+            assert_eq!(wand.top, field.top + round(NAME_WAND_INSET_DIP), ":213");
+            assert_eq!(
+                wand.bottom - wand.top,
+                round(NAME_WAND_DIP),
+                "the button is 24 dip tall (:213)"
+            );
+            assert!(
+                wand.left >= control.right,
+                "the button starts where the control's strip begins, not on top of it"
+            );
+
+            let icon = name_wand_icon_rect(&metrics, &rects, scale);
+            assert_eq!(
+                icon.right - icon.left,
+                round(NAME_WAND_ICON_DIP),
+                "the graphic is 16 dip (:558)"
+            );
+            assert!(
+                icon.left >= wand.left && icon.right <= wand.right,
+                "the graphic stays inside its button"
+            );
+            // Centred, allowing the single pixel that integer rounding can leave over on one side.
+            let left_gap = icon.left - wand.left;
+            let right_gap = wand.right - icon.right;
+            assert!(
+                (left_gap - right_gap).abs() <= 1,
+                "the graphic is centred in its button, not left aligned"
+            );
+        }
     }
 
     /// The centre of one option, which is a point the user can see and therefore aim at.

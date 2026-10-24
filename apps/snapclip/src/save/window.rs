@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use super::service;
-use super::{save_panel, ConflictPolicy, PanelValues, Remembered, DEFAULT_TEMPLATE};
+use super::{save_panel, ConflictPolicy, PanelValues, Remembered};
 use snapclip_capture::save_format::SaveFormat;
 
 // -------------------------------------------------------------------------------------------------
@@ -1941,7 +1941,7 @@ mod tests {
             initial_text(
                 snapclip_ui::panel::FieldId::SizeWidth,
                 size,
-                super::DEFAULT_TEMPLATE,
+                crate::save::DEFAULT_TEMPLATE,
                 ""
             ),
             "1440"
@@ -1950,7 +1950,7 @@ mod tests {
             initial_text(
                 snapclip_ui::panel::FieldId::SizeHeight,
                 size,
-                super::DEFAULT_TEMPLATE,
+                crate::save::DEFAULT_TEMPLATE,
                 ""
             ),
             "900"
@@ -1966,7 +1966,7 @@ mod tests {
             snapclip_ui::panel::FieldId::SizeHeight,
         ] {
             assert_eq!(
-                initial_text(id, None, super::DEFAULT_TEMPLATE, ""),
+                initial_text(id, None, crate::save::DEFAULT_TEMPLATE, ""),
                 "",
                 "{id:?} must stay empty"
             );
@@ -1984,7 +1984,7 @@ mod tests {
             initial_text(
                 snapclip_ui::panel::FieldId::Name,
                 None,
-                super::DEFAULT_TEMPLATE,
+                crate::save::DEFAULT_TEMPLATE,
                 ""
             ),
             "SnapClip_[日期]"
@@ -2009,14 +2009,14 @@ mod tests {
             initial_text(
                 FieldId::Path,
                 None,
-                super::DEFAULT_TEMPLATE,
+                crate::save::DEFAULT_TEMPLATE,
                 "D:\\Pictures"
             ),
             "D:\\Pictures",
             "the path row shows the directory it was given"
         );
         assert_eq!(
-            initial_text(FieldId::Path, None, super::DEFAULT_TEMPLATE, ""),
+            initial_text(FieldId::Path, None, crate::save::DEFAULT_TEMPLATE, ""),
             "",
             "a shell that declines leaves the field empty rather than inventing a directory"
         );
@@ -2115,7 +2115,7 @@ mod tests {
         );
         assert_eq!(
             remembered.template,
-            super::DEFAULT_TEMPLATE,
+            crate::save::DEFAULT_TEMPLATE,
             "the remembered template is unchanged"
         );
     }

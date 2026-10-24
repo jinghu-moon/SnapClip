@@ -568,6 +568,20 @@ impl Frame<'_> {
             }
         }
 
+        // The naming-variable button, inside the name field's own box (`.name-var { right: 4px;
+        // top: 4px; width: 24px }`, `:213`, holding a 16-unit graphic, `:558`).
+        //
+        // It is painted here, on the parent, because a child window is drawn above its parent: a
+        // button placed under the edit control would be invisible. The control therefore gives up
+        // this strip (`name_text_rect`) and the frame still fills the whole field box, so the strip
+        // reads as part of the field rather than as a gap.
+        Self::draw_glyph(
+            painter,
+            crate::panel::icons::Glyph::Braces,
+            crate::panel::field::name_wand_icon_rect(self.metrics, self.rects, self.scale),
+            self.brushes.muted_rgba,
+        )?;
+
         // The size cells' own words. Each cell is a wrapper holding a `宽` or `高` label, the number
         // the child window draws, and a `px` unit (`:237`, `:242`, `:244`, `:595`, `:605`). The
         // wrapper is painted by the loop above, which is why the cell's frame rectangle and the
@@ -1700,6 +1714,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The insert-a-variable button is drawn on the parent, in the strip the name control gives up.
+    ///
+    /// Checked at 2× for the same reason as the close glyph: the graphic is a line drawing, and at
+    /// unit scale a one point four dip stroke is spread over two pixels and never reaches its colour.
+    #[test]
+    fn the_variable_button_is_drawn_inside_the_name_field() {
+        let canvas = Canvas::new_at(1840, 1040, 192.0);
+        canvas.render();
+        let px = canvas.pixels();
+        let rects = DEMO.rects(2.0);
+        let icon = crate::panel::field::name_wand_icon_rect(&DEMO, &rects, 2.0);
+        let fill = fill_rgb(41, 41, 46);
+
+        // Find the strongest ink in the graphic's box rather than assuming a coordinate: the shape is
+        // a pair of braces, and its strokes need not cross the middle.
+        let mut best = (icon.left, icon.top);
+        let mut best_diff = 0;
+        for y in icon.top..icon.bottom {
+            for x in icon.left..icon.right {
+                let p = px.pixel(x, y);
+                let diff = (i32::from(p.r) - i32::from(fill.r)).abs()
+                    + (i32::from(p.g) - i32::from(fill.g)).abs()
+                    + (i32::from(p.b) - i32::from(fill.b)).abs();
+                if diff > best_diff {
+                    best_diff = diff;
+                    best = (x, y);
+                }
+            }
+        }
+        assert!(
+            best_diff > 30,
+            "the variable button must put ink in its box, over the field's fill; best {best:?}"
+        );
+        // And it is a graphic, not a filled square: the box's own corner stays the field's fill,
+        // which is what tells a 16 dip braces apart from a painted block.
+        assert_not_any(
+            &px,
+            icon.left,
+            icon.top,
+            &[px.pixel(best.0, best.1)],
+            20,
+            "a corner of the graphic's box, which must stay the field's fill",
+        );
     }
 
     #[test]
