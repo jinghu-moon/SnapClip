@@ -24,6 +24,7 @@ use snapclip_capture::save_format::SaveFormat;
 
 use super::bands;
 use super::copy::ValidationCopy;
+use super::scale::Frame;
 use super::service::{ConflictPolicy, SaveError, SaveOutcome, SaveRequest};
 use super::template::{self, TemplateError, TemplateValues};
 
@@ -34,8 +35,11 @@ pub struct PanelValues<'a> {
     pub directory: &'a str,
     /// What the name field holds, exactly as typed: `SnapClip_[日期]`.
     pub name: &'a str,
-    /// The format the panel is set to. Only PNG exists so far (`docs/41` S4).
+    /// The format the panel is set to.
     pub format: SaveFormat,
+    /// The encoder quality the panel's tier asks for. Only JPEG spends it: PNG is a copy and this
+    /// project's WebP is lossless (`docs/42` D1, spec `:94`).
+    pub quality: u8,
     /// What to do when the name is taken. The panel's default is to rename.
     pub conflict: ConflictPolicy,
     /// Values for the template's variables, all supplied by the caller.
@@ -173,25 +177,49 @@ fn template_failure(error: TemplateError) -> SaveError {
     }
 }
 
-/// Saves the selection the panel is showing.
+/// The encoder quality each tier asks for, from `docs/42` D8: **92 / 75 / 50**.
+///
+/// The first is the project's measured default (`docs/34` §11). The other two are the numbers that
+/// decision recorded, marked there as not yet measured; they are used as recorded rather than
+/// invented here, and the gap stays visible in `docs/42` instead of being quietly filled by a
+/// number nobody will find again.
+pub const TIER_QUALITY: [u8; 3] = [92, 75, 50];
+
+/// The quality a tier index asks for. An index outside the three tiers is the first tier, which is
+/// what the panel opens on; there is no fourth answer to give.
+pub fn quality_of_tier(tier: usize) -> u8 {
+    TIER_QUALITY.get(tier).copied().unwrap_or(TIER_QUALITY[0])
+}
+
+/// Saves the selection the panel is showing, at the size the panel asks for.
 ///
 /// The pixels arrive exactly as the capture handed them over: `width * height * 4` bytes,
-/// top down, tightly packed BGRA. They are encoded as PNG and committed through the same
-/// atomic path every other save uses, so an interrupted save cannot leave a truncated file
-/// that looks whole.
-pub fn save_panel(
-    values: &PanelValues<'_>,
-    width: u32,
-    height: u32,
-    bgra: &[u8],
-) -> Result<SaveOutcome, SaveError> {
-    let request = request_for(values, u64::from(width), u64::from(height))?;
+/// top down, tightly packed BGRA, at [`Frame::source`]'s size. [`Frame::output`] is what the size
+/// fields say, and the file is written at that size — the two are only allowed to differ because
+/// the resampling happens here, once, before the encoder sees a row.
+///
+/// The name's `[分辨率]` uses the output size, because that is the resolution of the file the
+/// user gets, not of the selection it came from.
+pub fn save_panel(values: &PanelValues<'_>, frame: &Frame<'_>) -> Result<SaveOutcome, SaveError> {
+    let output = frame.output;
+    let request = request_for(values, u64::from(output.width), u64::from(output.height))?;
+    let scaled = super::scale::scaled(frame);
     let mut bands = WholeImage {
-        bgra,
-        width,
-        height,
+        bgra: &scaled,
+        width: output.width,
+        height: output.height,
     };
-    bands::save_bands(&mut bands, width, &request)
+    if request.format == SaveFormat::Png {
+        return bands::save_bands(&mut bands, output.width, &request);
+    }
+    // Every other format is a transcode of the same PNG master, so the encoder that exists writes
+    // the master and the transcoder spends the quality exactly once. The format's size limits are
+    // asked here because the banded path asks them for its own (PNG) format.
+    super::caps::check(request.format, u64::from(output.width), u64::from(output.height))
+        .map_err(SaveError::Capability)?;
+    let master = bands::encode_png_bands(&mut bands, output.width)?;
+    let encoded = super::transcode::to_bytes(&master, request.format, values.quality)?;
+    super::service::commit_bytes(&request, &encoded)
 }
 
 /// The pixels the panel already holds, offered to the encoder a band at a time.
@@ -234,18 +262,34 @@ impl BandSource for WholeImage<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::save::scale::Size;
 
     fn values() -> PanelValues<'static> {
         PanelValues {
             directory: "C:\\shots",
             name: "SnapClip_[日期]",
             format: SaveFormat::Png,
+            quality: TIER_QUALITY[0],
             conflict: ConflictPolicy::AutoRename,
             date: "2026-10-23",
             time: "1042",
             sequence: 7,
             app: "SnapClip",
         }
+    }
+
+    /// A directory of its own per test, removed by the caller when it is done with it.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "snapclip-assemble-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("a clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("a temporary directory");
+        dir
     }
 
     /// The name a save would use is the template expanded with the selection's size, and it can
@@ -304,15 +348,7 @@ mod tests {
     /// the size it was handed, and the file is where the request said it would be.
     #[test]
     fn a_selection_becomes_a_png_of_the_size_it_was_given() {
-        let dir = std::env::temp_dir().join(format!(
-            "snapclip-assemble-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("a clock")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).expect("a temporary directory");
+        let dir = scratch("assemble");
 
         // 3x2, so a swap of the two numbers cannot pass: the PNG header records width then
         // height, and a square test image would hide exactly that mistake.
@@ -328,7 +364,12 @@ mod tests {
         let mut v = values();
         v.directory = dir.to_str().expect("a utf-8 temporary path");
         v.name = "shot_[分辨率]";
-        let outcome = save_panel(&v, width, height, &bgra).expect("a save on a writable directory");
+        let frame = Frame {
+            bgra: &bgra,
+            source: Size::new(width, height),
+            output: Size::new(width, height),
+        };
+        let outcome = save_panel(&v, &frame).expect("a save on a writable directory");
 
         assert_eq!(outcome.format, SaveFormat::Png);
         assert_eq!(outcome.path.file_name().unwrap(), "shot_3x2.png");
@@ -345,6 +386,87 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The size fields decide the file, not the selection: a capture that arrives 3x2 and a panel
+    /// that asks for 6x4 must write a 6x4 PNG, and the name's resolution must be the written size
+    /// rather than the one the pixels arrived with.
+    #[test]
+    fn the_panels_size_is_the_size_of_the_file() {
+        let dir = scratch("assemble-scale");
+        let source = Size::new(3, 2);
+        let output = Size::new(6, 4);
+        let mut bgra = Vec::new();
+        for y in 0..source.height {
+            for x in 0..source.width {
+                bgra.extend_from_slice(&[(x as u8) * 40, (y as u8) * 80, 200, 255]);
+            }
+        }
+        let mut v = values();
+        v.directory = dir.to_str().expect("a utf-8 temporary path");
+        v.name = "shot_[分辨率]";
+        let frame = Frame {
+            bgra: &bgra,
+            source,
+            output,
+        };
+        let outcome = save_panel(&v, &frame).expect("a save on a writable directory");
+
+        let written = std::fs::read(&outcome.path).expect("the saved file");
+        let png_width = u32::from_be_bytes([written[16], written[17], written[18], written[19]]);
+        let png_height = u32::from_be_bytes([written[20], written[21], written[22], written[23]]);
+        assert_eq!(
+            (png_width, png_height),
+            (output.width, output.height),
+            "the file is the size the panel asked for"
+        );
+        assert_eq!(
+            outcome.path.file_name().unwrap(),
+            "shot_6x4.png",
+            "and the name reports the written size, not the one the pixels arrived with"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The chosen format is the file's format: a JPEG request writes a file that starts with the
+    /// JPEG marker and carries the extension the format owns.
+    #[test]
+    fn the_chosen_format_is_the_file_that_lands() {
+        let dir = scratch("assemble-format");
+        let size = Size::new(4, 3);
+        let mut bgra = Vec::new();
+        for y in 0..size.height {
+            for x in 0..size.width {
+                bgra.extend_from_slice(&[(x as u8) * 50, (y as u8) * 70, 180, 255]);
+            }
+        }
+        let mut v = values();
+        v.directory = dir.to_str().expect("a utf-8 temporary path");
+        v.format = SaveFormat::Jpeg;
+        v.quality = TIER_QUALITY[0];
+        let frame = Frame {
+            bgra: &bgra,
+            source: size,
+            output: size,
+        };
+        let outcome = save_panel(&v, &frame).expect("a jpeg save");
+
+        assert_eq!(outcome.format, SaveFormat::Jpeg);
+        assert_eq!(outcome.path.file_name().unwrap(), "SnapClip_2026-10-23.jpg");
+        let written = std::fs::read(&outcome.path).expect("the saved file");
+        assert_eq!(&written[..2], &[0xFF, 0xD8], "the body is a JPEG, not a renamed PNG");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The tiers are the numbers the decision recorded (`docs/42` D8), not numbers invented here.
+    #[test]
+    fn the_quality_tiers_are_the_recorded_numbers() {
+        assert_eq!(quality_of_tier(0), 92, "the project's measured default");
+        assert_eq!(quality_of_tier(1), 75);
+        assert_eq!(quality_of_tier(2), 50);
+        assert_eq!(quality_of_tier(9), 92, "an index outside the tiers is the first tier");
     }
 
     /// A band source that is asked for rows it does not have must refuse rather than hand back a

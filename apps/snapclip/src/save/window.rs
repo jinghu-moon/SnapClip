@@ -966,6 +966,7 @@ fn panel_values<'a>(
     time: &'a str,
     sequence: u32,
     format: SaveFormat,
+    quality: u8,
 ) -> PanelValues<'a> {
     PanelValues {
         directory,
@@ -973,6 +974,8 @@ fn panel_values<'a>(
         // The format control's choice, mapped from its index by the one function that knows the
         // order of the menu.
         format,
+        // The quality tier's number, mapped by the one function that knows `docs/42` D8.
+        quality,
         conflict: ConflictPolicy::AutoRename,
         date,
         time,
@@ -1035,6 +1038,20 @@ fn save_from_panel(hwnd: windows_sys::Win32::Foundation::HWND) -> Option<service
     };
     let name = control_text(s.control(snapclip_ui::panel::FieldId::Name));
     let directory = control_text(s.control(snapclip_ui::panel::FieldId::Path));
+    // What the two size fields say, read at save time like the name is: the controls are what the
+    // user sees, and a half-edited pair falls back to the selection rather than to a guess.
+    let source = super::scale::Size::new(*width, *height);
+    let output = super::scale::output_size(
+        &control_text(s.control(snapclip_ui::panel::FieldId::SizeWidth)),
+        &control_text(s.control(snapclip_ui::panel::FieldId::SizeHeight)),
+        source,
+    );
+    if output != source {
+        eprintln!(
+            "[save-panel] resampling {}x{} to {}x{}",
+            source.width, source.height, output.width, output.height
+        );
+    }
     let (date, time) = local_date_and_time();
     // The number this attempt would use. Taken before the save because the name is expanded with
     // it, and moved afterwards only if the save succeeded and the name asked for it. The template
@@ -1052,8 +1069,14 @@ fn save_from_panel(hwnd: windows_sys::Win32::Foundation::HWND) -> Option<service
         &time,
         remembered.sequence.next(),
         format_of_index(s.format),
+        super::assemble::quality_of_tier(s.chosen_quality()),
     );
-    let attempt = save_panel(&values, *width, *height, bgra);
+    let frame = super::scale::Frame {
+        bgra,
+        source,
+        output,
+    };
+    let attempt = save_panel(&values, &frame);
     // One write of the counter, after the attempt: `after` is the rule, and it lives in one place
     // so the cancel and failure cases cannot drift from it. Only the counter is written back; the
     // template was written as it was typed and must not be overwritten with the one read above.
@@ -1917,7 +1940,15 @@ mod tests {
     /// writes somewhere else, which is why the pairing is asserted rather than noticed later.
     #[test]
     fn the_save_takes_the_directory_and_the_name_in_that_order() {
-        let values = panel_values(r"C:\shots", "SnapClip_[日期]", "2026-10-24", "0115", 7, format_of_index(0));
+        let values = panel_values(
+            r"C:\shots",
+            "SnapClip_[日期]",
+            "2026-10-24",
+            "0115",
+            7,
+            format_of_index(0),
+            crate::save::assemble::quality_of_tier(0),
+        );
         assert_eq!(values.directory, r"C:\shots");
         assert_eq!(values.name, "SnapClip_[日期]");
         assert_eq!(values.date, "2026-10-24");

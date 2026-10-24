@@ -1115,3 +1115,32 @@ fn note_edit(remembered, id, is_change, edited) -> bool
 | # | 缺口 | 归属 |
 | --- | --- | --- |
 | **A31** | 路径行两钮与三个 chip **只画不接** ✗（点击未接 ✓；`图片`/`下载` 两条路径**也还没取** ✗ —— 没有消费者就不加 ✓ 与"不留无用实现"一致 ✓） | 交互批 ✓ |
+
+## 让已有控件真的生效（尺寸 / 格式 / 质量）
+
+用户的原话：「不能只实现 UI，功能也要实现」。先核实了四条，再动手：
+
+| 控件 | 核实到的旧状态 | 现在 |
+| --- | --- | --- |
+| **尺寸格** | `save_from_panel` 把 `s.preview` 的选中尺寸直接交给 `save_panel` ✗ ⇒ 改动两个格子**对输出没有任何影响** ✗ | **生效** ✓：保存时读两个 `EDIT`，按 `output_size` 得到输出尺寸，`scale::scaled` 在编码前重采样一次 |
+| **格式菜单** | 选 `.JPG` / `.WebP` 会走到 `bands::save_bands` 的 `UnsupportedFormat` ✗ ⇒ **保存直接失败** | **生效** ✓：非 PNG 走「PNG 母版 → `transcode::to_bytes` → `commit_bytes`」，仍是同一处原子提交 |
+| **质量分段器** | `PanelValues` 里**没有** `quality` ✗ ⇒ 选档**不传**给编码器 ✗ | **生效** ✓：`quality_of_tier`（`docs/42` D8 的 **92 / 75 / 50**）经 `PanelValues.quality` 进转码器；只有 JPEG 花它（PNG 是拷贝、本项目 WebP 无损 ✓） |
+| **数值 / 百分比 模式** | `SIZE_MODE_CHOSEN` 是**常量** ✗ ⇒ 没有消费者 ✗ | **仍未接** ✗（见下） |
+| **重置钮** | 未接 ✗ | **仍未接** ✗（见下） |
+
+新增模块与抉择：
+
+- `apps/snapclip/src/save/scale.rs` ✓ —— `parse_size` / `output_size` / `scaled`。**缩小用面积平均、放大用双线性**：不这样，双线性缩小会丢像素（文字闪），面积平均放大会退化成最近邻（台阶）。两遍分离，中间只有一行输出的宽度。
+- `apps/snapclip/src/save/transcode.rs` ✓ —— `to_bytes(png, format, quality)`：母版落到临时文件（转码器从路径读）、转码进内存、**无论成败都删掉母版** ✓。
+- `save_panel` 收 `Frame { bgra, source, output }` ✓ —— 两个 `Size` 同类型 ⇒ **用具名字段而不是位置参数** ✗（与 `initial_text` / `panel_values` / `status_of` 同一类教训）。
+
+证据：`253 passed` ✓（`app`，含 **8 条缩放** ✓ + **4 条转码** ✓ + **2 条集成** ✓）；`ui 142/0` ✓；`check --workspace` Finished ✓；**死代码 0** ✓。变异四例都真红：
+
+```
+输出尺寸写回选区   ⇒ the_panels_size_is_the_size_of_the_file FAILED（"the file is the size the panel asked for"）
+格式恒走 PNG 路径  ⇒ the_chosen_format_is_the_file_that_lands FAILED
+档位恒为第一档     ⇒ the_quality_tiers_are_the_recorded_numbers FAILED
+质量恒 92          ⇒ the_quality_reaches_the_encoder FAILED
+```
+
+仍未接的两件（**不是遗漏** ✗）：`数值` / `百分比` 与**重置钮**都需要点击接线，而模式切换还要把所选档位穿过 `PaintInput`/`Frame` 才能在画面上体现 ✓ ⇒ 与「质量行」「高级钮」同属**交互批** ✓。**模式对保存语义的影响**（`数值` 是像素、`百分比` 是相对原图的百分比）也一并留到那批 ✓，因为只做一半会出现"切了模式但数字含义没变"✗ —— 那比不做更容易误读。

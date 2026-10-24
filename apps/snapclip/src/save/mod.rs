@@ -15,8 +15,10 @@ pub mod copy;
 // "where is the desktop", so it lives beside the panel that shows it rather than in the UI crate,
 // which must not ask Windows anything a drawing cannot explain.
 pub mod dirs;
+pub mod scale;
 pub mod service;
 pub mod template;
+pub mod transcode;
 
 // The panel's window shell (`docs/41` S2). It knows nothing about paths or bytes; it owns the
 // window and the lifecycle, and asks the modules above to do the work.
@@ -28,5 +30,6 @@ pub use assemble::{
 };
 pub use caps::{CapabilityError, check as check_capability};
 pub use copy::{ConflictLink, Level, ValidationCopy};
+pub use scale::{Frame as ScaleFrame, Size, output_size, parse_size};
 pub use service::{ConflictPolicy, SaveError, SaveOutcome, SaveRequest};
 pub use template::{TemplateError, TemplateValues, expand as expand_template};
