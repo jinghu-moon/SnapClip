@@ -40,11 +40,15 @@ INSTALLED = ROOT / "crates" / "snapclip-ui" / "assets" / "fira-code-numbers-subs
 # rename would have to happen here, and the two would silently disagree.
 FAMILY = "Fira Code"
 
-# Exactly the characters the numeric face is used for. The size row shows a number and `px`
-# (`:242`, `:244`), the percentage mode adds `%`, and the estimate row's unit is `KB` with a decimal
-# point in front of it (`:648`, `227.31 KB`). Nothing else is drawn in this face — the labels and
-# the mode words stay in the UI font, so their glyphs are not wanted here.
-ALLOWED = "0123456789" + "px" + "%" + "KB" + "."
+# Exactly the characters the numeric face is used for, read from the one file the Rust side also
+# embeds (`crates/snapclip-ui/src/panel/fonts.rs`). The set used to be spelled out twice, once here
+# and once in Rust, which is two rules rather than one: a character added for the panel could be
+# missing from the subset and only the coverage gate would notice.
+#
+# It holds the digits, `px` (`:242`, `:244`), `%` for the percentage mode, `KB` and `.` for the
+# estimate row's unit (`:648`), and the letters of `.PNG` / `.JPG` / `.WebP` (`:717`), which the
+# format control draws in this face (`:173`, `:182`).
+ALLOWED = (ROOT / "subfont" / "number-chars.txt").read_text(encoding="utf-8").strip()
 
 # Tables the renderer never reads (same set the UI subset drops).
 DROP_TABLES = (

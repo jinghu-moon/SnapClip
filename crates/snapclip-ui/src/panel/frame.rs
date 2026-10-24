@@ -376,6 +376,15 @@ pub struct Frame<'a> {
     /// (`:641`–`:643`). It is the one piece of state the control has so far: the options' words, the
     /// click handling and the setting it writes back belong to later stages.
     pub quality: usize,
+    /// The format control's word: `.fmt-btn` and `.fmt-item` both set `font-family: var(--num)` at
+    /// twelve dip (`:173`, `:182`), so the label is not the footer's format even though the size
+    /// agrees — the face differs.
+    pub format_label: Option<&'a IDWriteTextFormat>,
+    /// Which format the button shows, by index into [`crate::panel::FMT_OPTIONS`].
+    pub format: usize,
+    /// Whether the menu is open. Open draws the accent border, turns the chevron over and draws the
+    /// menu itself; the message handler owns the flag, and the painter only reads it.
+    pub format_open: bool,
 }
 
 impl Frame<'_> {
@@ -764,6 +773,117 @@ impl Frame<'_> {
                 crate::panel::footer_separator_rect(self.metrics, self.scale, widths);
             painter.fill_round(separator, 0, &self.brushes.line_soft);
         }
+
+        // The format control last, because its menu hangs over everything else. The button shares the
+        // name row's band and the menu is positioned against the window's own height, so both need
+        // the height the canvas was built with rather than a constant.
+        let window_height = canvas.bottom;
+        self.paint_format(painter, window_height)?;
+        Ok(())
+    }
+
+    /// The format button and, when it is open, its menu (`:173`–`:185`, `:561`, `:696`).
+    ///
+    /// The two states of the button are the design's: a transparent border when closed (`:173`) and
+    /// an accent border with a one dip ring when open (`:175`), the same shape a focused field has
+    /// but inset by one dip rather than one and a half. The chevron turns over in the open state
+    /// (`:178`), which is done on the glyph's pixels because the panel has no transform.
+    fn paint_format(&self, painter: &PanelPainter, window_height: i32) -> Result<()> {
+        let Some(label_format) = self.format_label else {
+            return Ok(());
+        };
+        let scale = self.scale;
+        let radius = (crate::panel::FMT_RADIUS_DIP as f32 * scale).round() as i32;
+        let line = scale.round().max(1.0);
+        let button = crate::panel::fmt_button_rect(self.metrics, self.rects, scale);
+        let chosen = self.format.min(crate::panel::FMT_OPTIONS.len() - 1);
+
+        painter.fill_round(button, radius, &self.brushes.field_fill);
+        if self.format_open {
+            painter.stroke_round(button, radius, &self.brushes.accent, line);
+            let ring = (crate::panel::FMT_RING_DIP as f32 * scale).round() as i32;
+            painter.stroke_round(
+                Rect::new(
+                    button.left + ring,
+                    button.top + ring,
+                    button.right - ring,
+                    button.bottom - ring,
+                ),
+                (radius - ring).max(0),
+                &self.brushes.accent,
+                line,
+            );
+        }
+
+        // `.fmt-btn { color: var(--text); font-family: var(--num) }` (`:173`), and the word starts at
+        // the left padding.
+        painter.draw_text(
+            crate::panel::FMT_OPTIONS[chosen],
+            label_format,
+            crate::panel::fmt_label_rect(self.metrics, self.rects, scale),
+            &self.brushes.text,
+        );
+        // The chevron is `--muted` closed and `--accent-text`, turned over, open (`:176`, `:178`).
+        let chev = crate::panel::fmt_chev_rect(self.metrics, self.rects, scale);
+        if self.format_open {
+            Self::draw_glyph_turned(
+                painter,
+                crate::panel::icons::Glyph::Chevron,
+                chev,
+                self.brushes.accent_text_rgba,
+            )?;
+        } else {
+            Self::draw_glyph(
+                painter,
+                crate::panel::icons::Glyph::Chevron,
+                chev,
+                self.brushes.muted_rgba,
+            )?;
+        }
+
+        if !self.format_open {
+            return Ok(());
+        }
+
+        // `.fmt-menu` (`:180`): the surface, a ten dip corner, and a one dip `--line` inset because
+        // the drop shadow a normal window cannot draw is what normally separates a menu from below.
+        let menu = crate::panel::fmt_menu_rect(self.metrics, self.rects, scale, window_height);
+        let menu_radius = (crate::panel::FMT_MENU_RADIUS_DIP as f32 * scale).round() as i32;
+        painter.fill_round(menu, menu_radius, &self.brushes.surface);
+        let inset = (crate::panel::FMT_MENU_LINE_DIP as f32 * scale).round() as i32;
+        painter.stroke_round(
+            Rect::new(
+                menu.left + inset / 2,
+                menu.top + inset / 2,
+                menu.right - inset / 2,
+                menu.bottom - inset / 2,
+            ),
+            (menu_radius - inset).max(0),
+            &self.brushes.line,
+            line,
+        );
+
+        let item_radius = (crate::panel::FMT_ITEM_RADIUS_DIP as f32 * scale).round() as i32;
+        for index in 0..crate::panel::FMT_OPTIONS.len() {
+            let item = crate::panel::fmt_item_rect(self.metrics, self.rects, scale, window_height, index);
+            // `.fmt-item.is-selected { background: var(--fill) }` (`:183`), the same fill the fields
+            // and the segmented track use.
+            if index == chosen {
+                painter.fill_round(item, item_radius, &self.brushes.field_fill);
+                Self::draw_glyph(
+                    painter,
+                    crate::panel::icons::Glyph::Check,
+                    crate::panel::fmt_check_rect(self.metrics, self.rects, scale, window_height, index),
+                    self.brushes.accent_text_rgba,
+                )?;
+            }
+            painter.draw_text(
+                crate::panel::FMT_OPTIONS[index],
+                label_format,
+                crate::panel::fmt_item_label_rect(self.metrics, self.rects, scale, window_height, index),
+                &self.brushes.text,
+            );
+        }
         Ok(())
     }
 
@@ -785,6 +905,23 @@ impl Frame<'_> {
             crate::panel::icons::ICON_BAKED_PX,
             &tinted,
         )?;
+        painter.draw_bitmap_at(&bitmap, rect);
+        Ok(())
+    }
+
+    /// [`Self::draw_glyph`] with the icon turned by half a turn, for the open format button's
+    /// chevron (`:178`). The rotation is done on the pixels because the panel has no transform.
+    fn draw_glyph_turned(
+        painter: &PanelPainter,
+        glyph: crate::panel::icons::Glyph,
+        rect: Rect,
+        colour: [u8; 4],
+    ) -> Result<()> {
+        let side = crate::panel::icons::ICON_BAKED_PX as usize;
+        let turned = crate::panel::icons::flipped_180(glyph.raw(), side);
+        let tinted = crate::panel::icons::tint_rgba_to_premultiplied_bgra(&turned, colour);
+        let bitmap =
+            painter.bgra_bitmap_with_alpha(side as u32, side as u32, &tinted)?;
         painter.draw_bitmap_at(&bitmap, rect);
         Ok(())
     }
@@ -958,6 +1095,23 @@ pub fn number_format(dwrite: &IDWriteFactory, dpi: f32) -> Result<IDWriteTextFor
     )
 }
 
+/// The format control's word: twelve dip in the numeric face, because `.fmt-btn` and `.fmt-item`
+/// set `font-family: var(--num)` (`:173`, `:182`). Leading alignment — both start at their own left
+/// padding rather than centring, which is what makes `.PNG` and `.WebP` line up between the button
+/// and its menu.
+pub fn format_label_format(dwrite: &IDWriteFactory, dpi: f32) -> Result<IDWriteTextFormat> {
+    let families: Vec<&str> = std::iter::once(crate::panel::NUMBER_FAMILY)
+        .chain(crate::panel::NUMBER_FALLBACKS)
+        .collect();
+    text_format_in(
+        dwrite,
+        dpi,
+        BUTTON_FONT_DIP,
+        DWRITE_FONT_WEIGHT_NORMAL,
+        &families,
+    )
+}
+
 fn properties(dpi: f32) -> D2D1_RENDER_TARGET_PROPERTIES {
     D2D1_RENDER_TARGET_PROPERTIES {
         r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
@@ -1008,7 +1162,7 @@ pub fn paint_to_dc_with_state(
     fill_surface: bool,
     fields: crate::panel::FieldStates,
 ) -> Result<()> {
-    paint_to_dc_with_preview(factory, dwrite, hdc, area, dpi, fill_surface, fields, None, 0, None)
+    paint_to_dc_with_preview(factory, dwrite, hdc, area, dpi, fill_surface, fields, None, 0, 0, false, None)
 }
 
 /// [`paint_to_dc_with_state`] with a captured picture for the preview card. The old signature
@@ -1032,6 +1186,8 @@ pub fn paint_to_dc_with_preview(
     fields: crate::panel::FieldStates,
     preview: Option<(&[u8], u32, u32)>,
     quality: usize,
+    format: usize,
+    format_open: bool,
     footer_widths: Option<[i32; 3]>,
 ) -> Result<()> {
     // DPI 96 on the target, deliberately: `rects(scale)` below already converts every dip to a
@@ -1062,6 +1218,8 @@ pub fn paint_to_dc_with_preview(
     // The footer's buttons, at `--fs-btn` (`:38`) and, for save, 600 (`:282`).
     let button = button_format(dwrite, dpi)?;
     let button_strong = button_strong_format(dwrite, dpi)?;
+    // The format control's word, in the numeric face (:173, :182).
+    let format_label = format_label_format(dwrite, dpi)?;
     let painter = PanelPainter {
         context: &target,
         text_factory: dwrite,
@@ -1085,6 +1243,9 @@ pub fn paint_to_dc_with_preview(
         number: Some(&number),
         button: Some(&button),
         button_strong: Some(&button_strong),
+        format_label: Some(&format_label),
+        format,
+        format_open,
         footer_widths,
         fields,
         preview: preview.as_ref().map(|(b, w, h)| (b, *w, *h)),
@@ -1107,7 +1268,7 @@ pub fn paint_to_target(
     dpi: f32,
     fill_surface: bool,
 ) -> Result<FrameRects> {
-    paint_to_target_with_preview(target, dwrite, dpi, fill_surface, None, 0, None)
+    paint_to_target_with_preview(target, dwrite, dpi, fill_surface, None, 0, 0, false, None)
 }
 
 /// [`paint_to_target`] with a captured picture for the preview card. The old signature delegates
@@ -1119,6 +1280,8 @@ pub fn paint_to_target_with_preview(
     fill_surface: bool,
     preview: Option<(&[u8], u32, u32)>,
     quality: usize,
+    format: usize,
+    format_open: bool,
     footer_widths: Option<[i32; 3]>,
 ) -> Result<FrameRects> {
     let brushes = FrameBrushes::new(target, &DEMO_PALETTE)?;
@@ -1146,6 +1309,8 @@ pub fn paint_to_target_with_preview(
     // The footer's buttons, at `--fs-btn` (`:38`) and, for save, 600 (`:282`).
     let button = button_format(dwrite, dpi)?;
     let button_strong = button_strong_format(dwrite, dpi)?;
+    // The format control's word, in the numeric face (:173, :182).
+    let format_label = format_label_format(dwrite, dpi)?;
     Frame {
         metrics: &metrics,
         rects: &rects,
@@ -1158,6 +1323,9 @@ pub fn paint_to_target_with_preview(
         number: Some(&number),
         button: Some(&button),
         button_strong: Some(&button_strong),
+        format_label: Some(&format_label),
+        format,
+        format_open,
         footer_widths,
         fields: crate::panel::FieldStates::IDLE,
         preview: preview.as_ref().map(|(b, w, h)| (b, *w, *h)),
@@ -1170,6 +1338,158 @@ pub fn paint_to_target_with_preview(
 
 #[cfg(test)]
 mod tests {
+    impl Canvas {
+        /// Paint with a chosen format and, optionally, its menu open.
+        ///
+        /// The same entry point the window uses, so the pixels these tests read are the pixels the
+        /// panel draws; the only thing that differs from the runtime is who decided the two values.
+        fn render_format(&self, format: usize, open: bool) {
+            let factory = factory().expect("a Direct2D factory");
+            let dwrite = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED) }
+                .expect("a DirectWrite factory");
+            paint_to_dc_with_preview(
+                &factory,
+                &dwrite,
+                self.dc,
+                Rect::new(0, 0, self.width, self.height),
+                self.dpi,
+                true,
+                crate::panel::FieldStates::IDLE,
+                None,
+                0,
+                format,
+                open,
+                None,
+            )
+            .expect("the frame paints with a chosen format");
+        }
+    }
+
+    /// The strongest pixel inside a rectangle, and where it was found. The glyph tests need to know
+    /// both: a word's antialiased edge is dimmer than its stroke, so the colour assertion is made on
+    /// the darkest-or-brightest ink the rectangle actually contains.
+    fn strongest(px: &Bgra8, rect: Rect, colour: Px) -> (Px, i32, i32) {
+        let mut best = (Px { b: 0, g: 0, r: 0, a: 255 }, 0, 0);
+        let mut best_distance = i32::MAX;
+        for y in rect.top..rect.bottom {
+            for x in rect.left..rect.right {
+                let got = px.pixel(x, y);
+                let distance = (i32::from(got.b) - i32::from(colour.b)).abs()
+                    + (i32::from(got.g) - i32::from(colour.g)).abs()
+                    + (i32::from(got.r) - i32::from(colour.r)).abs();
+                if distance < best_distance {
+                    best_distance = distance;
+                    best = (got, x, y);
+                }
+            }
+        }
+        best
+    }
+
+    /// The format button draws the word of the format it is set to, in `--text` (`:173`).
+    ///
+    /// At double scale, because a twelve dip word at unit scale antialiases to a fraction of its
+    /// ink and never reaches the colour it was asked for — the same fact that made the border and
+    /// the ring indistinguishable at 1×, and the close glyph's test run at 2×.
+    #[test]
+    fn the_format_button_draws_the_chosen_word_in_the_text_colour() {
+        for (format, word) in crate::panel::FMT_OPTIONS.iter().enumerate() {
+            let canvas = Canvas::new_at(1840, 1128, 192.0);
+            canvas.render_format(format, false);
+            let px = canvas.pixels();
+            let rects = DEMO.rects(2.0);
+            let label = crate::panel::fmt_label_rect(&DEMO, &rects, 2.0);
+            let (got, x, y) = strongest(&px, label, fill_rgb(255, 255, 255));
+            assert!(
+                close(got, fill_rgb(255, 255, 255), 12),
+                "{word} must be drawn in --text (:173): the closest pixel in the label's box is \
+                 {got:?} at ({x}, {y})"
+            );
+
+            // The label is a word, not a block: the box's far corner has to be the fill behind it.
+            assert!(
+                close(px.pixel(label.right - 1, label.bottom - 1), fill_rgb(41, 41, 46), 12),
+                "the label's corner must stay the field's fill, so the ink is text rather than a slab"
+            );
+        }
+    }
+
+    /// The open button's border is `--accent` with a one dip ring (`:175`); the closed one has a
+    /// transparent border (`:173`) and shows the fill only.
+    #[test]
+    fn the_format_button_border_is_accent_only_when_open() {
+        let canvas = Canvas::new_at(1840, 1128, 192.0);
+        let rects = DEMO.rects(2.0);
+        let button = crate::panel::fmt_button_rect(&DEMO, &rects, 2.0);
+        let probe = ((button.left + button.right) / 2, button.top + 1);
+
+        canvas.render_format(0, false);
+        let closed = canvas.pixels();
+        assert!(
+            close(closed.pixel(probe.0, probe.1), fill_rgb(41, 41, 46), 12),
+            "a closed button's top edge is the fill, because its border is transparent (:173)"
+        );
+
+        canvas.render_format(0, true);
+        let open = canvas.pixels();
+        assert_px(
+            &open,
+            probe.0,
+            probe.1,
+            fill_rgb(31, 117, 219),
+            12,
+            "an open button's top edge is --accent (:175)",
+        );
+    }
+
+    /// The open menu marks the chosen option with the check glyph in `--accent-text` (`:184`), and
+    /// leaves the others without one — which is what makes the menu say which format is in effect.
+    #[test]
+    fn the_open_format_menu_marks_only_the_chosen_option() {
+        let canvas = Canvas::new_at(1840, 1128, 192.0);
+        let rects = DEMO.rects(2.0);
+        let height = (DEMO.panel_height() as f32 * 2.0).round() as i32;
+        for chosen in 0..crate::panel::FMT_OPTIONS.len() {
+            canvas.render_format(chosen, true);
+            let px = canvas.pixels();
+            for index in 0..crate::panel::FMT_OPTIONS.len() {
+                let check = crate::panel::fmt_check_rect(&DEMO, &rects, 2.0, height, index);
+                let (got, x, y) = strongest(&px, check, fill_rgb(94, 162, 245));
+                if index == chosen {
+                    assert!(
+                        close(got, fill_rgb(94, 162, 245), 14),
+                        "the chosen option {index} must carry the check in --accent-text (:184): \
+                         closest {got:?} at ({x}, {y})"
+                    );
+                } else {
+                    assert!(
+                        !close(got, fill_rgb(94, 162, 245), 14),
+                        "option {index} is not chosen and must not be marked: found {got:?} at \
+                         ({x}, {y})"
+                    );
+                }
+            }
+
+            // The chosen row is also the one with `--fill` behind it (`:183`), sampled at the item's
+            // right end where neither the check nor the word reaches.
+            for index in 0..crate::panel::FMT_OPTIONS.len() {
+                let item = crate::panel::fmt_item_rect(&DEMO, &rects, 2.0, height, index);
+                let probe = (item.right - 6, item.top + 4);
+                if index == chosen {
+                    assert!(
+                        close(px.pixel(probe.0, probe.1), fill_rgb(41, 41, 46), 10),
+                        "the chosen row has --fill behind it (:183), index {index}"
+                    );
+                } else {
+                    assert!(
+                        !close(px.pixel(probe.0, probe.1), fill_rgb(41, 41, 46), 10),
+                        "an unchosen row is the menu's own surface, index {index}"
+                    );
+                }
+            }
+        }
+    }
+
     /// The directory row is the one above the name row, one row pitch apart, at every scale.
     #[test]
     fn the_directory_row_sits_above_the_name_row() {
@@ -1864,6 +2184,8 @@ mod tests {
                 crate::panel::FieldStates::IDLE,
                 Some((bgra, w, h)),
                 0,
+                0,
+                false,
                 None,
             )
             .expect("the frame paints with a preview");
@@ -1886,6 +2208,8 @@ mod tests {
                 crate::panel::FieldStates::IDLE,
                 None,
                 quality,
+                0,
+                false,
                 None,
             )
             .expect("the frame paints with a chosen quality");
@@ -2762,6 +3086,8 @@ impl PanelRenderer {
         fields: crate::panel::FieldStates,
         preview: Option<(&[u8], u32, u32)>,
         quality: usize,
+        format: usize,
+        format_open: bool,
         footer_widths: [i32; 3],
     ) -> Result<()> {
         paint_to_dc_with_preview(
@@ -2774,6 +3100,8 @@ impl PanelRenderer {
             fields,
             preview,
             quality,
+            format,
+            format_open,
             Some(footer_widths),
         )
     }

@@ -43,11 +43,16 @@ pub use checkbox::{Checkbox, CheckboxState};
 pub use dropdown::{Dropdown, DropdownKey, DropdownTarget};
 pub use feedback::{Toast, Tooltip};
 pub use fonts::{
-    NUMBER_CHARACTERS, NUMBER_FAMILY, NUMBER_FALLBACKS, NUMBER_SUBSET, register_number_font,
+    NUMBER_CHARACTERS, NUMBER_FAMILY, NUMBER_FALLBACKS, NUMBER_SUBSET, number_characters,
+    register_number_font,
 };
 pub use field::{
     EDIT_FONT_DIP, EDIT_INSET_DIP, EDIT_PADDING_DIP, FieldColours, FieldFace, FieldId, FieldState,
     FieldStates, FORM_ROWS,
+    FMT_BUTTON_DIP, FMT_CHECK_DIP, FMT_CHEV_DIP, FMT_GAP_DIP, FMT_ITEM_DIP, FMT_MENU_DIP, FMT_RADIUS_DIP, FMT_RING_DIP,
+    FMT_MENU_PAD_DIP, FMT_ITEM_RADIUS_DIP, FMT_MENU_LINE_DIP, FMT_MENU_RADIUS_DIP, FMT_OPTIONS, fmt_button_contains, fmt_button_rect, fmt_check_rect,
+    fmt_chev_rect, fmt_item_at, fmt_item_label_rect, fmt_item_rect, fmt_label_rect,
+    fmt_menu_contains, fmt_menu_height_dip, fmt_menu_rect,
     FORM_FIELD_TAB_STOPS, INPUT_RADIUS_DIP, NUMBER_EDIT_FONT_DIP, QUALITY_OPTIONS,
     QUALITY_OPTION_WORDS,
     QUALITY_OPTION_WIDTH_DIP, QUALITY_SEG_INNER_RADIUS_DIP,

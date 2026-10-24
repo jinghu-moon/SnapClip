@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use super::service;
 use super::{save_panel, ConflictPolicy, PanelValues, Sequence};
+use snapclip_capture::save_format::SaveFormat;
 
 // -------------------------------------------------------------------------------------------------
 // Two facts that were each learned by shipping a panel nobody could see
@@ -685,6 +686,8 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
             footer_widths,
             // Handed over rather than created here: the counter is shared by every panel of this
             // shell, and a panel that made its own would start at one again.
+            format: 0,
+            format_open: false,
             sequence: options.sequence.clone(),
         }));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
@@ -817,6 +820,12 @@ struct WindowState {
     /// the paint would leave the hit test guessing, and guessing is how a click lands on a button
     /// that is not there.
     footer_widths: [i32; 3],
+    /// Which format the format control shows, by index into FMT_OPTIONS. The control is drawn by
+    /// the frame and answered here, so the number lives beside the other state the frame reads.
+    format: usize,
+    /// Whether the format menu is open. Opening draws the accent border, turns the chevron over and
+    /// paints the menu; the flag lives here because only the window knows what the last click hit.
+    format_open: bool,
     /// The save counter this panel shares with every other panel of the same shell. The panel
     /// reads it when it saves and moves it only after a save succeeds, so a cancelled or failed
     /// attempt leaves the number where it was.
@@ -874,6 +883,19 @@ fn local_date_and_time() -> (String, String) {
     )
 }
 
+/// Which format a menu index stands for.
+///
+/// The menu's order is the design's (FMT_OPTIONS, :717): PNG, JPG, WebP. The mapping lives here
+/// rather than in the message handler because a click is not needed to check it, and because the
+/// index and the format are both small integers whose swap would save a file of the wrong kind.
+fn format_of_index(index: usize) -> SaveFormat {
+    match index {
+        1 => SaveFormat::Jpeg,
+        2 => SaveFormat::Webp,
+        _ => SaveFormat::Png,
+    }
+}
+
 /// The panel's answers as the save step wants them.
 ///
 /// Separate from [`save_from_panel`] because the two fields it reads are both strings and of the
@@ -885,13 +907,14 @@ fn panel_values<'a>(
     date: &'a str,
     time: &'a str,
     sequence: u32,
+    format: SaveFormat,
 ) -> PanelValues<'a> {
     PanelValues {
         directory,
         name,
-        // The panel has no format control yet, so the save is PNG. Recorded in `docs/41` rather
-        // than offered as a choice that does not exist.
-        format: snapclip_capture::save_format::SaveFormat::Png,
+        // The format control's choice, mapped from its index by the one function that knows the
+        // order of the menu.
+        format,
         conflict: ConflictPolicy::AutoRename,
         date,
         time,
@@ -924,7 +947,7 @@ fn save_from_panel(hwnd: windows_sys::Win32::Foundation::HWND) {
         .sequence
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    let values = panel_values(&directory, &name, &date, &time, sequence.next());
+    let values = panel_values(&directory, &name, &date, &time, sequence.next(), format_of_index(s.format));
     let attempt = save_panel(&values, *width, *height, bgra);
     // One write of the counter, after the attempt: `after` is the rule, and it lives in one place
     // so the cancel and failure cases cannot drift from it.
@@ -1293,6 +1316,8 @@ extern "system" fn window_proc(
                             s.fields,
                             s.preview.as_ref().map(|(bgra, w, h)| (bgra.as_slice(), *w, *h)),
                             s.chosen_quality(),
+                            s.format,
+                            s.format_open,
                             s.footer_widths,
                         )
                         .is_ok();
@@ -1336,6 +1361,60 @@ extern "system" fn window_proc(
                 if snapclip_ui::panel::close_button_contains(&rects, dpi_scale(hwnd), (point.x, point.y))
                 {
                     windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                    return 0;
+                }
+            }
+            // The format control's menu hangs over everything below it, so it is answered before
+            // the footer: a click on an option must choose a format rather than fall through to a
+            // button that happens to be underneath. The rectangles come from the same producers the
+            // painter uses, and the window's height is the panel's own, which is what the menu's
+            // flip rule is written against.
+            if event == snapclip_ui::panel::PointerEvent::Down {
+                let metrics = snapclip_ui::panel::DEMO;
+                let scale = dpi_scale(hwnd);
+                let rects = metrics.rects(scale);
+                let window_height = (metrics.panel_height() as f32 * scale).round() as i32;
+                let point = (point.x, point.y);
+                let open = state(hwnd).map(|s| s.format_open).unwrap_or(false);
+                if open {
+                    if let Some(index) = snapclip_ui::panel::fmt_item_at(
+                        &metrics,
+                        &rects,
+                        scale,
+                        window_height,
+                        true,
+                        point,
+                    ) {
+                        if let Some(s) = state_mut(hwnd) {
+                            s.format = index;
+                            s.format_open = false;
+                        }
+                        InvalidateRect(hwnd, std::ptr::null(), 0);
+                        return 0;
+                    }
+                    let inside = snapclip_ui::panel::fmt_menu_contains(
+                        &metrics,
+                        &rects,
+                        scale,
+                        window_height,
+                        point,
+                    ) || snapclip_ui::panel::fmt_button_contains(&metrics, &rects, scale, point);
+                    if !inside {
+                        // A click anywhere else dismisses the menu and does nothing else: the first
+                        // click after opening a menu belongs to the menu, which is how menus behave.
+                        if let Some(s) = state_mut(hwnd) {
+                            s.format_open = false;
+                        }
+                        InvalidateRect(hwnd, std::ptr::null(), 0);
+                        return 0;
+                    }
+                }
+                if snapclip_ui::panel::fmt_button_contains(&metrics, &rects, scale, point) {
+                    let still_open = !open;
+                    if let Some(s) = state_mut(hwnd) {
+                        s.format_open = still_open;
+                    }
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
                     return 0;
                 }
             }
@@ -1574,13 +1653,29 @@ mod tests {
     /// writes somewhere else, which is why the pairing is asserted rather than noticed later.
     #[test]
     fn the_save_takes_the_directory_and_the_name_in_that_order() {
-        let values = panel_values(r"C:\shots", "SnapClip_[日期]", "2026-10-24", "0115", 7);
+        let values = panel_values(r"C:\shots", "SnapClip_[日期]", "2026-10-24", "0115", 7, format_of_index(0));
         assert_eq!(values.directory, r"C:\shots");
         assert_eq!(values.name, "SnapClip_[日期]");
         assert_eq!(values.date, "2026-10-24");
         assert_eq!(values.time, "0115");
         assert_eq!(values.sequence, 7, "the number comes from the shell's counter");
         assert_eq!(values.app, "SnapClip");
+    }
+
+    /// The menu's order is the design's (FMT_OPTIONS, :717), and the index it reports is not a
+    /// format: the translation lives in one function so a save cannot write a JPG where the panel
+    /// said WebP. Both are small integers, which is exactly the pair this repository has had to
+    /// assert separately every time.
+    #[test]
+    fn the_menu_index_is_the_format_the_save_writes() {
+        assert_eq!(format_of_index(0), SaveFormat::Png, ".PNG is first (:717)");
+        assert_eq!(format_of_index(1), SaveFormat::Jpeg, ".JPG is second");
+        assert_eq!(format_of_index(2), SaveFormat::Webp, ".WebP is third");
+        assert_eq!(
+            format_of_index(99),
+            SaveFormat::Png,
+            "an out-of-range index falls back to the first rather than panicking"
+        );
     }
 
     /// The time the spec asks for is `HHmm` (`docs/design/…规格.md`): no separator, because a colon
@@ -1657,6 +1752,8 @@ mod tests {
             ),
             segment_scale: 1.0,
             footer_widths: [40, 52, 64],
+            format: 0,
+            format_open: false,
             sequence: std::sync::Arc::new(std::sync::Mutex::new(Sequence::FIRST)),
         };
 
@@ -1716,6 +1813,8 @@ mod tests {
             ),
             segment_scale: 1.0,
             footer_widths: [40, 52, 64],
+            format: 0,
+            format_open: false,
             sequence: std::sync::Arc::new(std::sync::Mutex::new(Sequence::FIRST)),
         };
 
@@ -1779,6 +1878,8 @@ mod tests {
             ),
             segment_scale: 1.0,
             footer_widths: [40, 52, 64],
+            format: 0,
+            format_open: false,
             sequence: std::sync::Arc::new(std::sync::Mutex::new(Sequence::FIRST)),
         };
 

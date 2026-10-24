@@ -319,9 +319,15 @@ pub fn field_colours(state: FieldState, surface: [u8; 4]) -> FieldColours {
 }
 
 /// The rect of the first form slot's field, derived from the design's own slot arithmetic rather
-/// than from a second set of numbers: the label row, its gap, then the field.
+/// than from a second set of numbers: the label row, its gap, then the field — less the format
+/// button that shares the row (`:554`–`:561`, `.file-row { gap: 8px }`, `:171`).
+///
+/// The name field is the `.name-wrap` of the mockup (`:555`, `flex: 1`), so it takes the row's width
+/// minus the gap and the eighty dip button. That also narrows the native `EDIT` inside it, which is
+/// the point: the button must not sit on top of the text the user is typing.
 pub fn name_field_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -> Rect {
-    field_rect(metrics, rects, scale, Row::Name)
+    let band = field_rect(metrics, rects, scale, Row::Name);
+    fmt_name_field_rect(metrics, rects, scale, band)
 }
 
 /// The save path field, the first row of the form.
@@ -1145,6 +1151,268 @@ pub fn footer_button_contains(
         && point.1 < rect.bottom
 }
 
+// ---------------------------------------------------------------------------------------------
+// The format control: the button at the right of the name row and the menu it opens.
+//
+// The design puts it beside the name field (`:189`), eighty dip wide, showing the chosen format in
+// the numeric face with a chevron after it (`:173`, `:176`). Opening it draws a menu of three
+// options, right-aligned to the button, with a check beside the chosen one (`:180`–`:185`, `:894`).
+// ---------------------------------------------------------------------------------------------
+
+/// `--fmt-w: 80px` (`save-panel-demo-v3.html:49`). The format button's width.
+pub const FMT_BUTTON_DIP: i32 = 80;
+
+/// `.file-row { display: flex; gap: 8px }` (`:171`) — the space between the name field and the
+/// button, which is also what the name field gives up.
+pub const FMT_GAP_DIP: i32 = 8;
+
+/// `.fmt-btn`'s horizontal padding is `0 8px 0 10px` (`:173`): the label starts ten dip in and the
+/// chevron ends eight dip before the right edge.
+pub const FMT_PAD_LEFT_DIP: i32 = 10;
+pub const FMT_PAD_RIGHT_DIP: i32 = 8;
+
+/// `.fmt-btn { gap: 6px }` (`:173`) — between the label and the chevron, when `space-between` does
+/// not already separate them.
+pub const FMT_LABEL_GAP_DIP: i32 = 6;
+
+/// `.fmt-btn .chev { width: 12px; height: 12px }` (`:176`).
+pub const FMT_CHEV_DIP: i32 = 12;
+
+/// `--r-input: 6px` (`:54`), which `.fmt-btn` shares with the fields.
+pub const FMT_RADIUS_DIP: i32 = 6;
+
+/// `box-shadow: inset 0 0 0 1px var(--accent)` (`:175`): the open button's ring sits one dip inside
+/// its border, not the one and a half the fields use for their focus ring.
+pub const FMT_RING_DIP: i32 = 1;
+
+/// `.fmt-menu { width: 156px; padding: 5px }` (`:180`) and `--r-menu: 10px` (`:55`).
+pub const FMT_MENU_DIP: i32 = 156;
+pub const FMT_MENU_PAD_DIP: i32 = 5;
+pub const FMT_MENU_RADIUS_DIP: i32 = 10;
+
+/// `.fmt-menu`'s inset line: `inset 0 0 0 1px var(--line)` (`:246`'s sibling at `:180`).
+pub const FMT_MENU_LINE_DIP: i32 = 1;
+
+/// `.fmt-item { height: 30px }`, `--r-item: 6px`, `padding: 0 10px 0 26px` (`:182`, `:56`).
+pub const FMT_ITEM_DIP: i32 = 30;
+pub const FMT_ITEM_RADIUS_DIP: i32 = 6;
+pub const FMT_ITEM_PAD_LEFT_DIP: i32 = 26;
+pub const FMT_ITEM_PAD_RIGHT_DIP: i32 = 10;
+
+/// `.fmt-item .check { left: 7px; width: 14px; height: 14px }` (`:184`).
+pub const FMT_CHECK_LEFT_DIP: i32 = 7;
+pub const FMT_CHECK_DIP: i32 = 14;
+
+/// `placeFmtMenu` (`:901`): the menu is right-aligned to the button and never further left than six
+/// dip from the panel's edge; it opens six dip below the button and flips above it when that would
+/// take it past the window's own bottom (`:902`).
+pub const FMT_MENU_MIN_LEFT_DIP: i32 = 6;
+pub const FMT_MENU_OFFSET_DIP: i32 = 6;
+
+/// `.fmt-menu`'s own height: its two five dip paddings and three thirty dip items (`:180`, `:182`).
+/// The mockup's flip test spells out the same `+ 100` (`:902`).
+pub fn fmt_menu_height_dip() -> i32 {
+    FMT_MENU_PAD_DIP * 2 + FMT_ITEM_DIP * FMT_OPTIONS.len() as i32
+}
+
+/// `const FORMATS = ['.PNG', '.JPG', '.WebP']` (`:717`). The dots and the capitals are the design's,
+/// and the words are drawn in the numeric face (`:173`, `:182`), so their characters belong to that
+/// subset rather than to the panel's.
+pub const FMT_OPTIONS: [&str; 3] = [".PNG", ".JPG", ".WebP"];
+
+/// The button's rect: the name row's band, less the gap, at its right end (`:171`, `:561`).
+pub fn fmt_button_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let band = field_rect(metrics, rects, scale, Row::Name);
+    let right = rects.form.right;
+    Rect {
+        left: right - px(FMT_BUTTON_DIP),
+        top: band.top,
+        right,
+        bottom: band.top + px(metrics.field_height),
+    }
+}
+
+/// The name field's rect inside a row band: everything left of the gap and the button (`:555`).
+fn fmt_name_field_rect(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    band: Rect,
+) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let button = fmt_button_rect(metrics, rects, scale);
+    Rect {
+        left: band.left,
+        top: band.top,
+        right: button.left - px(FMT_GAP_DIP),
+        bottom: band.top + px(metrics.field_height),
+    }
+}
+
+/// The button's label, which starts at its left padding and stops before the chevron (`:173`).
+pub fn fmt_label_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let button = fmt_button_rect(metrics, rects, scale);
+    let chev = fmt_chev_rect(metrics, rects, scale);
+    Rect {
+        left: button.left + px(FMT_PAD_LEFT_DIP),
+        top: button.top,
+        right: chev.left - px(FMT_LABEL_GAP_DIP),
+        bottom: button.bottom,
+    }
+}
+
+/// The button's chevron, at the right end of its padding (`:173`, `:176`).
+pub fn fmt_chev_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let button = fmt_button_rect(metrics, rects, scale);
+    let side = px(FMT_CHEV_DIP);
+    let right = button.right - px(FMT_PAD_RIGHT_DIP);
+    let top = button.top + (button.bottom - button.top - side) / 2;
+    Rect {
+        left: right - side,
+        top,
+        right,
+        bottom: top + side,
+    }
+}
+
+/// The menu's rect, right-aligned to the button (`:901`) and flipped above it when it would run past
+/// `window_height` (`:902`).
+///
+/// The window's height is an argument rather than a constant because the mockup asks the window
+/// (`window.innerHeight`), and this function has to be answerable without one.
+pub fn fmt_menu_rect(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    window_height: i32,
+) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let button = fmt_button_rect(metrics, rects, scale);
+    let width = px(FMT_MENU_DIP);
+    // Each part is rounded and then added, rather than rounding the total: the menu's height is its
+    // padding and its items, and at 125% rounding the hundred dip sum gives a menu one pixel shorter
+    // than the three items inside it. The same rule as the footer's widths.
+    let height = px(FMT_MENU_PAD_DIP) * 2 + px(FMT_ITEM_DIP) * FMT_OPTIONS.len() as i32;
+    let left = (button.right - width).max(px(FMT_MENU_MIN_LEFT_DIP));
+    let offset = px(FMT_MENU_OFFSET_DIP);
+    let top = if button.bottom + offset + height > window_height {
+        button.top - height - offset
+    } else {
+        button.bottom + offset
+    };
+    Rect {
+        left,
+        top,
+        right: left + width,
+        bottom: top + height,
+    }
+}
+
+/// One option's rect inside the menu (`:182`). The rows are the menu's padding plus whole item
+/// heights, so the menu's own height is the last item's bottom plus the second padding.
+pub fn fmt_item_rect(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    window_height: i32,
+    index: usize,
+) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let menu = fmt_menu_rect(metrics, rects, scale, window_height);
+    let top = menu.top + px(FMT_MENU_PAD_DIP) + px(FMT_ITEM_DIP) * index as i32;
+    Rect {
+        left: menu.left + px(FMT_MENU_PAD_DIP),
+        top,
+        right: menu.right - px(FMT_MENU_PAD_DIP),
+        bottom: top + px(FMT_ITEM_DIP),
+    }
+}
+
+/// The check beside the chosen option: `left: 7px`, fourteen dip square, centred (`:184`).
+pub fn fmt_check_rect(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    window_height: i32,
+    index: usize,
+) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let item = fmt_item_rect(metrics, rects, scale, window_height, index);
+    let side = px(FMT_CHECK_DIP);
+    let left = item.left + px(FMT_CHECK_LEFT_DIP);
+    let top = item.top + (item.bottom - item.top - side) / 2;
+    Rect {
+        left,
+        top,
+        right: left + side,
+        bottom: top + side,
+    }
+}
+
+/// An option's word: after the twenty six dip left padding that leaves room for the check (`:182`).
+pub fn fmt_item_label_rect(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    window_height: i32,
+    index: usize,
+) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let item = fmt_item_rect(metrics, rects, scale, window_height, index);
+    Rect {
+        left: item.left + px(FMT_ITEM_PAD_LEFT_DIP),
+        top: item.top,
+        right: item.right - px(FMT_ITEM_PAD_RIGHT_DIP),
+        bottom: item.bottom,
+    }
+}
+
+fn fmt_contains(rect: Rect, point: (i32, i32)) -> bool {
+    point.0 >= rect.left && point.0 < rect.right && point.1 >= rect.top && point.1 < rect.bottom
+}
+
+/// Whether a point is on the format button. Pure, so a click can be answered from a test.
+pub fn fmt_button_contains(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    point: (i32, i32),
+) -> bool {
+    fmt_contains(fmt_button_rect(metrics, rects, scale), point)
+}
+
+/// Which option a point lands on, if the menu is open. Closed, nothing is hit — the menu is not on
+/// screen, and a click that passed through where it would be must not choose a format.
+pub fn fmt_item_at(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    window_height: i32,
+    open: bool,
+    point: (i32, i32),
+) -> Option<usize> {
+    if !open {
+        return None;
+    }
+    (0..FMT_OPTIONS.len())
+        .find(|index| fmt_contains(fmt_item_rect(metrics, rects, scale, window_height, *index), point))
+}
+
+/// Whether a point is anywhere in the open menu, padding included — the region that keeps a click
+/// from counting as "outside the menu" and closing it.
+pub fn fmt_menu_contains(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    window_height: i32,
+    point: (i32, i32),
+) -> bool {
+    fmt_contains(fmt_menu_rect(metrics, rects, scale, window_height), point)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1193,8 +1461,17 @@ mod tests {
             let rects = metrics.rects(scale);
             let field = name_field_rect(&metrics, &rects, scale);
             let px = |dip: i32| (dip as f32 * scale).round() as i32;
-            assert_eq!(field.left, rects.form.left, "the field spans the form column");
-            assert_eq!(field.right, rects.form.right, "the field spans the form column");
+            assert_eq!(field.left, rects.form.left, "the field starts at the form column");
+            // The name row shares its width with the format button (`:554`–`:561`): the field is the
+            // mockup's `.name-wrap` (`flex: 1`), so it stops one gap short of the button rather than
+            // at the column's edge. The button and the field together still fill the column.
+            let button = fmt_button_rect(&metrics, &rects, scale);
+            assert_eq!(
+                field.right,
+                button.left - px(FMT_GAP_DIP),
+                "the name field gives up the gap and the format button's width (:171, :561)"
+            );
+            assert_eq!(button.right, rects.form.right, "the button ends at the form's right edge");
             assert_eq!(
                 field.top,
                 rects.form.top
@@ -1784,6 +2061,178 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// The format button's four numbers, pinned against the design rather than against each other.
+    ///
+    /// A related test can only show that the rectangles agree with the constants; a wrong constant
+    /// agrees with itself. These are the values from `:49`, `:171` and `:173`.
+    #[test]
+    fn the_format_button_takes_eighty_dip_and_its_gap_from_the_name_row() {
+        let metrics = crate::panel::DEMO;
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            let px = |dip: i32| (dip as f32 * scale).round() as i32;
+            assert_eq!(FMT_BUTTON_DIP, 80, "--fmt-w (:49)");
+            assert_eq!(FMT_GAP_DIP, 8, ".file-row gap (:171)");
+            assert_eq!(FMT_PAD_LEFT_DIP, 10, ".fmt-btn padding-left (:173)");
+            assert_eq!(FMT_PAD_RIGHT_DIP, 8, ".fmt-btn padding-right (:173)");
+
+            let rects = metrics.rects(scale);
+            let button = fmt_button_rect(&metrics, &rects, scale);
+            assert_eq!(
+                button.right - button.left,
+                px(80),
+                "the button is eighty dip wide (scale {scale})"
+            );
+            assert_eq!(
+                button.bottom - button.top,
+                px(metrics.field_height),
+                "and as tall as a field, so the row is one band (scale {scale})"
+            );
+            assert_eq!(button.top, field_rect(&metrics, &rects, scale, Row::Name).top);
+
+            // The chevron sits at the right padding and the label starts at the left one.
+            let chev = fmt_chev_rect(&metrics, &rects, scale);
+            assert_eq!(chev.right, button.right - px(FMT_PAD_RIGHT_DIP));
+            assert_eq!(chev.right - chev.left, px(FMT_CHEV_DIP), ":176");
+            assert_eq!(fmt_label_rect(&metrics, &rects, scale).left, button.left + px(10));
+        }
+    }
+
+    /// The menu is right-aligned to the button and its three items add up to its own height, which
+    /// is the number the mockup's flip test uses (`+ 100`, `:902`).
+    #[test]
+    fn the_format_menu_hangs_from_the_button_and_holds_three_items() {
+        let metrics = crate::panel::DEMO;
+        let px = |dip: i32| dip as i32;
+        assert_eq!(fmt_menu_height_dip(), 100, "two five dip paddings and three 30 dip items (:180, :182)");
+        assert_eq!(FMT_OPTIONS, [".PNG", ".JPG", ".WebP"], "逐字 (:717)");
+
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            let rects = metrics.rects(scale);
+            let window_height = (metrics.panel_height() as f32 * scale).round() as i32;
+            let button = fmt_button_rect(&metrics, &rects, scale);
+            let menu = fmt_menu_rect(&metrics, &rects, scale, window_height);
+            assert_eq!(menu.right, button.right, "right-aligned to the button (:901)");
+            assert_eq!(
+                menu.right - menu.left,
+                (FMT_MENU_DIP as f32 * scale).round() as i32,
+                "156 dip wide (:180)"
+            );
+            assert_eq!(
+                menu.top,
+                button.bottom + (6.0 * scale).round() as i32,
+                "six dip below the button (:902)"
+            );
+            assert_eq!(
+                menu.bottom - menu.top,
+                (5.0 * scale).round() as i32 * 2
+                    + (30.0 * scale).round() as i32 * FMT_OPTIONS.len() as i32,
+                "three items and two paddings, each rounded on its own"
+            );
+
+            // The items stack without gaps or overlaps, and the last one plus the padding is the
+            // menu's own bottom.
+            let first = fmt_item_rect(&metrics, &rects, scale, window_height, 0);
+            assert_eq!(first.top, menu.top + (5.0 * scale).round() as i32);
+            for index in 1..FMT_OPTIONS.len() {
+                let previous = fmt_item_rect(&metrics, &rects, scale, window_height, index - 1);
+                let item = fmt_item_rect(&metrics, &rects, scale, window_height, index);
+                assert_eq!(item.top, previous.bottom, "items touch (index {index})");
+            }
+            let last = fmt_item_rect(&metrics, &rects, scale, window_height, FMT_OPTIONS.len() - 1);
+            assert_eq!(last.bottom + (5.0 * scale).round() as i32, menu.bottom);
+            assert_eq!(px(0), 0);
+        }
+    }
+
+    /// The flip rule: above the button only when it would otherwise leave the window (`:902`). The
+    /// window's height is an argument, so both branches are reachable here.
+    #[test]
+    fn the_format_menu_flips_above_the_button_only_when_it_would_leave_the_window() {
+        let metrics = crate::panel::DEMO;
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            let rects = metrics.rects(scale);
+            let px = |dip: i32| (dip as f32 * scale).round() as i32;
+            let button = fmt_button_rect(&metrics, &rects, scale);
+            // The same part-by-part height the menu itself uses, so the boundary tested here is the
+            // boundary the function tests.
+            let height = px(5) * 2 + px(30) * FMT_OPTIONS.len() as i32;
+            let offset = px(6);
+
+            // Room below: hangs below, as the panel it is in always has.
+            let roomy = button.bottom + offset + height;
+            let below = fmt_menu_rect(&metrics, &rects, scale, roomy);
+            assert_eq!(below.top, button.bottom + offset, "room below ⇔ below (scale {scale})");
+
+            // One pixel less: it would leave the window, so it flips above.
+            let tight = fmt_menu_rect(&metrics, &rects, scale, roomy - 1);
+            assert_eq!(
+                tight.top,
+                button.top - height - offset,
+                "no room below ⇔ above, by the same gap (scale {scale})"
+            );
+            assert_eq!(tight.bottom, tight.top + height);
+        }
+    }
+
+    /// Closed, the menu answers nothing: a click that passes through where it would be must not
+    /// choose a format. Open, each option answers on its own row and nowhere else.
+    #[test]
+    fn a_closed_format_menu_chooses_nothing_and_an_open_one_answers_per_row() {
+        let metrics = crate::panel::DEMO;
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            let rects = metrics.rects(scale);
+            let window_height = (metrics.panel_height() as f32 * scale).round() as i32;
+            let centre = |index: usize| {
+                let item = fmt_item_rect(&metrics, &rects, scale, window_height, index);
+                ((item.left + item.right) / 2, (item.top + item.bottom) / 2)
+            };
+
+            for index in 0..FMT_OPTIONS.len() {
+                assert_eq!(
+                    fmt_item_at(&metrics, &rects, scale, window_height, false, centre(index)),
+                    None,
+                    "a closed menu must not answer at all (index {index}, scale {scale})"
+                );
+                assert_eq!(
+                    fmt_item_at(&metrics, &rects, scale, window_height, true, centre(index)),
+                    Some(index),
+                    "an open menu answers on its own row (index {index}, scale {scale})"
+                );
+            }
+
+            // The item's own edges: left and top answer, right and bottom do not.
+            let item = fmt_item_rect(&metrics, &rects, scale, window_height, 1);
+            assert_eq!(
+                fmt_item_at(&metrics, &rects, scale, window_height, true, (item.left, item.top)),
+                Some(1),
+                "half-open on the leading edge"
+            );
+            assert_eq!(
+                fmt_item_at(&metrics, &rects, scale, window_height, true, (item.right, item.top)),
+                None,
+                "half-open on the trailing edge"
+            );
+
+            // The button answers on its own rectangle and not on the menu's, and the menu's padding
+            // counts as the menu so that a click there does not close it.
+            let button = fmt_button_rect(&metrics, &rects, scale);
+            let menu = fmt_menu_rect(&metrics, &rects, scale, window_height);
+            assert!(fmt_button_contains(
+                &metrics,
+                &rects,
+                scale,
+                ((button.left + button.right) / 2, (button.top + button.bottom) / 2)
+            ));
+            assert!(!fmt_button_contains(&metrics, &rects, scale, (menu.left, menu.top)));
+            assert!(fmt_menu_contains(&metrics, &rects, scale, window_height, (menu.left, menu.top)));
+            assert_eq!(
+                fmt_item_at(&metrics, &rects, scale, window_height, true, (menu.left, menu.top)),
+                None,
+                "the padding is the menu but not an option"
+            );
         }
     }
 }

@@ -20,12 +20,24 @@ use windows::Win32::Graphics::Gdi::AddFontMemResourceEx;
 /// entry, and `subfont/build_number_font.py` refuses to install a build that says anything else.
 pub const NUMBER_FAMILY: &str = "Fira Code";
 
-/// Every character the numeric face may be asked to draw: the digits, the `px` unit, the percent
-/// sign for the percentage mode, and the `KB` and decimal point the estimate row's unit uses
-/// (`docs/design/save-panel-demo-v3.html:242`, `:244`, `:648`). The coverage gate checks the
-/// embedded artifact against this list, so a character that is drawn but missing from the subset is
-/// a red test rather than a string that silently renders half in a fallback face.
-pub const NUMBER_CHARACTERS: &str = "0123456789px%KB.";
+/// Every character the numeric face may be asked to draw, read from the one file that also feeds the
+/// subsetting script.
+///
+/// The set used to exist twice — once here and once inside `subfont/build_number_font.py` — and two
+/// copies of a rule are two rules. It now lives in `subfont/number-chars.txt`, which the script
+/// reads and this constant embeds, so a character added for one cannot be missing from the other.
+///
+/// The set is: the digits, the `px` unit, the percent sign for the percentage mode, the `KB` and
+/// decimal point the estimate row's unit uses (`docs/design/save-panel-demo-v3.html:242`, `:244`,
+/// `:648`), and the letters of the format control's `.PNG` / `.JPG` / `.WebP` (`:717`), which the
+/// design also sets in this face (`:173`, `:182`).
+pub const NUMBER_CHARACTERS: &str = include_str!("../../../../subfont/number-chars.txt");
+
+/// The set with the file's incidental whitespace removed. Every reader goes through this, so a
+/// trailing newline added by an editor is not read as a character the font has to carry.
+pub fn number_characters() -> impl Iterator<Item = char> {
+    NUMBER_CHARACTERS.trim().chars()
+}
 
 /// The numeric subset, read straight out of the binary by `include_bytes!`.
 pub const NUMBER_SUBSET: &[u8] = include_bytes!("../../assets/fira-code-numbers-subset.ttf");

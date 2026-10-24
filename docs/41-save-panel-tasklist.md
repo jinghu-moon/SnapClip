@@ -668,11 +668,17 @@ cargo run -p codec-bench --release -- --assert
 | ~~A7~~ | ~~**尺寸格的 `宽`/`高` 与单位 `px` 未画** ✗~~ ✓ **已画出**（三段几何同源 ✓：`size_cell_label_rect` / `size_cell_input_rect` / `size_cell_unit_rect` ✓，第二格吸收余数 ✓） | — | 已完成 ✓ |
 | ~~A8~~ | ~~**数值字段的等宽字体未用** ✗~~ ✓ **已用**：`assets/font/FiraCode-Regular.ttf`（283 KB）取子集到 **3.3 KB**（`subfont/build_number_font.py` ✓，16 个字符 ✓）⇒ 内嵌在 `snapclip-ui`（`panel/fonts.rs` ✓）⇒ 尺寸格的 `EDIT`（`WM_SETFONT` + `ES_RIGHT` ✓）与 `px` 单位（`number_format` ✓）都用它；门禁 `the_embedded_number_subset_covers_the_numbers_the_panel_shows` ✓ | — | 已完成 ✓ |
 | A9 | **`.link-hub` 之外的两个 ghost 按钮未画** ✗（路径行的 `更改` ✓ 与文件夹图标 ✓，demo `:545`/`:546` ✓） | 宽度需要测量文本 ✓（同 B1 ✓） | 交互批 ✓ |
-| A10 | **格式下拉未画** ✗（demo `:561` ✓，`.PNG`/`.JPG`/`.WebP` ✓）⇒ 保存**固定用 PNG** ✗ | `save/window.rs` 的 `panel_values` ✓ | 格式批 ✓ |
+| ~~A10~~ | ~~**格式下拉未画** ✗~~ ✓ **已画并可点**：按钮（`--fmt-w: 80` ✓ `:49`，等宽字 ✓ 箭头 ✓）在名字行右端，菜单（`156` ✓ `:180`）右对齐它、三项 `.PNG`/`.JPG`/`.WebP` ✓ `:717`，当前项打勾 ✓ `:184`，展开时描边变蓝 + 箭头**翻转** ✓ `:175`/`:178`（翻转在像素上做 ✓，见 `icons::flipped_180` ✓）；选中项**送进保存** ✓（`format_of_index` ✓ `save/window.rs` ✓）。缺口见 A15/A16 | — | 已完成 ✓ |
 | ~~A11~~ | ~~**`[序号]` 固定为 1** ✗~~ ✓ **已做**：`Sequence`（`save/assemble.rs` ✓）由 shell 的 `Arc<Mutex<Sequence>>` **跨面板共享** ✓（面板每次捕获一个 ✓），只在**保存成功且名字含 `[序号]`** 时 +1 ✓（见文末「序号」一节 ✓） | — | 已完成 ✓ |
 | ~~A11b~~ | ~~**名字模板不跨面板记住** ✗~~ ✓ 规格 `:201` 的另一半（"模板与序号随输入实时记住" ✗）⇒ **模板**那半是新缺口 ✓：现在每次开面板都是默认模板 ✓ | 需要 `EDIT` 的 `EN_CHANGE` ✓ 把文本写回共享状态 ✓ | 偏好批 ✓ |
 | A12 | **保存失败只记日志** ✗ —— `SaveError::Validation{copy}` 是**键** ✓，怎么呈现属 UI 设计 ✓ | `save_from_panel` 的 `Err` 分支 ✓ | 错误提示批 ✓ |
-| A13 | **悬停态未做** ✗（`.close:hover` ✓ `:97` ✓、`.btn:hover` ✓） | 需要鼠标进入/离开消息 ✓ | 交互批 ✓ |
+| A13 | **悬停态未做** ✗（`.close:hover` ✓ `:97` ✓、`.btn:hover` ✓、`.fmt-btn:hover` ✓ `:174`） | 需要鼠标进入/离开消息 ✓ | 交互批 ✓ |
+| A15 | **格式菜单每项右侧的预估体积未画** ✗（`.fmt-item .val` ✓ `:186`，`:203` 要求"当前尺寸与质量下的预估体积"✓）—— 要先有体积模型 ✓ | `fmt_item_rect` 已给出每行矩形 ✓ | 预估批 ✓ |
+| A16 | **切换格式的连带变化未做** ✗（`:204`：质量行 ✓ 高级选项 ✓ JPG 填充行 ✓ 与重新估算 ✓）—— 后两者**还没画** ✓ | — | 高级项批 ✓ |
+
+> **A10 的两条行为决定**（不是遗漏 ✓）：① 菜单打开时，**菜单外的一次点击只关闭菜单、不做别的** ✓ —— 菜单里的第一下属于菜单 ✓（与常见菜单一致 ✓）；② 菜单的**每项体积**与**悬停态**见 A15/A13 ✓。
+>
+> **A10 的一条工程改动** ✓：`.fmt-btn` / `.fmt-item` 用 `--num` 等宽字 ✓（`:173`/`:182`）⇒ `.PNG`/`.JPG`/`.WebP` 的字母要进**数字子集** ✗ ⇒ 允许集从 `fonts.rs` 与 `build_number_font.py` **两处**收进 `subfont/number-chars.txt` **一处** ✓（两个副本就是两条规则 ✗），子集 3.3 KB → **4.3 KB** ✓，23 个字符 ✓。
 
 > **A8 的一条边界** ✗：`SIZE_UNIT_DIP = 18` 仍是**预留值** ✗（demo 无此数 ✓，而 `measure_text_width` **已可用** ✓）⇒ 改成实测会动几何与测试 ✓ ⇒ 留作单独一批 ✓。
 

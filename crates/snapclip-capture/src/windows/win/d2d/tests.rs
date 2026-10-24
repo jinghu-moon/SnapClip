@@ -1603,7 +1603,7 @@ fn the_embedded_subset_covers_the_strings_the_overlay_draws() {
 fn the_embedded_number_subset_covers_the_numbers_the_panel_shows() {
     let covered = cmap_codepoints(snapclip_ui::panel::NUMBER_SUBSET);
 
-    for character in snapclip_ui::panel::NUMBER_CHARACTERS.chars() {
+    for character in snapclip_ui::panel::number_characters() {
         assert!(
             covered.contains(&(character as u32)),
             "the embedded numeric subset has no glyph for {character:?} (U+{:04X}), which the size \

@@ -125,6 +125,24 @@ pub fn tint_rgba_to_premultiplied_bgra(rgba: &[u8], colour: [u8; 4]) -> Vec<u8> 
     out
 }
 
+/// Turn a baked icon by half a turn.
+///
+/// `.fmt-btn[aria-expanded="true"] .chev { transform: rotate(180deg) }` (`save-panel-demo-v3.md`
+/// `:178`) is the design's only rotated glyph: the chevron points down when the menu is closed and up
+/// when it is open. The panel has no transform, so the rotation happens on the pixels — a square
+/// buffer read from the far corner inwards. Pure, so it is asserted without a device.
+pub fn flipped_180(rgba: &[u8], side: usize) -> Vec<u8> {
+    let mut out = vec![0u8; rgba.len()];
+    for y in 0..side {
+        for x in 0..side {
+            let from = (y * side + x) * 4;
+            let to = ((side - 1 - y) * side + (side - 1 - x)) * 4;
+            out[to..to + 4].copy_from_slice(&rgba[from..from + 4]);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,5 +206,34 @@ mod tests {
         assert_eq!(out[3], 128, "alpha is carried through");
         assert_eq!(out[2], 47, "red is tinted to 94 and then halved: 94 * 128 / 255");
         assert_eq!(out[0], 122, "blue is tinted to 245 and then halved: 245 * 128 / 255");
+    }
+
+    /// Half a turn is a corner-to-corner read, and doing it twice is doing nothing — which is the
+    /// property that makes it a rotation rather than a shuffle.
+    #[test]
+    fn turning_a_glyph_twice_restores_it() {
+        // A three by three buffer with one distinct pixel in each corner.
+        let mut rgba = vec![0u8; 3 * 3 * 4];
+        let mut put = |x: usize, y: usize, value: u8| {
+            let at = (y * 3 + x) * 4;
+            rgba[at] = value;
+            rgba[at + 3] = 255;
+        };
+        put(0, 0, 10);
+        put(2, 0, 20);
+        put(0, 2, 30);
+        put(2, 2, 40);
+
+        let once = flipped_180(&rgba, 3);
+        let px = |buffer: &[u8], x: usize, y: usize| buffer[(y * 3 + x) * 4];
+        assert_eq!(px(&once, 2, 2), 10, "top left goes to bottom right");
+        assert_eq!(px(&once, 0, 2), 20, "top right goes to bottom left");
+        assert_eq!(px(&once, 2, 0), 30, "bottom left goes to top right");
+        assert_eq!(px(&once, 0, 0), 40, "bottom right goes to top left");
+        assert_eq!(px(&once, 1, 1), 0, "the centre stays, and stays empty");
+
+        let twice = flipped_180(&once, 3);
+        assert_eq!(twice, rgba, "twice is the identity");
+        assert_eq!(once.len(), rgba.len(), "the buffer keeps its size");
     }
 }
