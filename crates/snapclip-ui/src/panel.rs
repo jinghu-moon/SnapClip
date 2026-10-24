@@ -95,7 +95,7 @@ pub use field::{
     size_mode_button_rect, size_mode_button_width, size_mode_contains, size_mode_rect,
     size_mode_reset_icon_rect, size_mode_reset_rect, size_reset_contains,
     rect_contains, rects_intersect, path_change_contains, path_open_contains, path_chip_at,
-    name_wand_contains, fields_under, insert_variable,
+    name_wand_contains, fields_under, hidden_fields, insert_variable,
     VARIABLE_LABELS, VARIABLE_TOKENS, VAR_ITEM_H_DIP, VAR_MENU_GAP_DIP, VAR_MENU_OVERHANG_DIP,
     VAR_MENU_PAD_DIP, VAR_MENU_W_DIP, var_item_at, var_item_rect, var_menu_contains, var_menu_rect,
 };

@@ -55,6 +55,16 @@ pub struct SegmentColors<'a> {
 }
 
 pub trait PaintTarget {
+    /// Erase the target to transparent black.
+    ///
+    /// Every frame starts with this so it does not depend on the frame before it. The panel draws
+    /// with a DWM backdrop and deliberately leaves its body unpainted, which means whatever the
+    /// previous frame wrote stays in the target wherever the new frame draws nothing — a menu that
+    /// closed, a hint that stopped being relevant, any rectangle that moved. Those leftovers are
+    /// not merely stale pixels: the target carries alpha, and DWM composites it against the
+    /// desktop, so a stale shape drawn over a translucent backdrop reads as the menu still being
+    /// there but see-through.
+    fn clear(&self);
     fn fill_round(&self, rect: &D2D1_ROUNDED_RECT, brush: &ID2D1SolidColorBrush);
     fn stroke_round(&self, rect: &D2D1_ROUNDED_RECT, brush: &ID2D1SolidColorBrush, width: f32);
     fn line(
@@ -105,6 +115,13 @@ pub trait PaintTarget {
 macro_rules! impl_paint_target {
     ($target:ty) => {
         impl PaintTarget for $target {
+            fn clear(&self) {
+                // Through the base interface, same reason as `draw_bitmap`: one body for four
+                // targets, and `Clear` is declared on the render target the other three derive from.
+                let base: &ID2D1RenderTarget =
+                    unsafe { &*(self as *const $target as *const ID2D1RenderTarget) };
+                unsafe { base.Clear(None) };
+            }
             fn fill_round(&self, rect: &D2D1_ROUNDED_RECT, brush: &ID2D1SolidColorBrush) {
                 unsafe { self.FillRoundedRectangle(rect, brush) };
             }
@@ -217,6 +234,13 @@ pub struct PanelPainter<'a> {
 }
 
 impl PanelPainter<'_> {
+    /// Erase the target before a frame, so a frame does not inherit the last one. See
+    /// [`PaintTarget::clear`] for why the panel needs this even though it paints every element it
+    /// shows.
+    pub fn clear(&self) {
+        self.context.clear();
+    }
+
     pub fn fill_round(&self, rect: Rect, radius: i32, brush: &ID2D1SolidColorBrush) {
         let rounded = rounded(rect, radius);
         self.context.fill_round(&rounded, brush);

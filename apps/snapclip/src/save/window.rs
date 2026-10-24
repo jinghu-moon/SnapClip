@@ -2094,9 +2094,8 @@ fn apply_menu_occlusion(hwnd: windows_sys::Win32::Foundation::HWND) {
         .collect();
     // The one place that decides which boxes a menu covers: `fields_under` is a free function so
     // the rule can be asserted without a window, and so two handlers cannot answer it differently.
-    let hidden = menu
-        .map(|menu| snapclip_ui::panel::fields_under(menu, &boxes))
-        .unwrap_or_default();
+    let hidden = snapclip_ui::panel::hidden_fields(menu, &boxes);
+    let mut shown: Vec<(usize, bool)> = Vec::with_capacity(fields.len());
     for (index, id) in fields.iter().enumerate() {
         let control = state.control(*id);
         if control.is_null() {
@@ -2110,7 +2109,46 @@ fn apply_menu_occlusion(hwnd: windows_sys::Win32::Foundation::HWND) {
         unsafe {
             let _ = ShowWindow(control, if show { SW_SHOWNA } else { SW_HIDE });
         }
+        shown.push((index, show));
     }
+    // One line per transition, and a transition is the only thing that calls this: with the menu
+    // flags, the rectangle it covers and every box's new visibility on the same line, one real
+    // click sequence says whether the state moved and whether the boxes came back.
+    eprintln!(
+        "[save-panel] occlusion format_open={} var_open={} menu={:?} hidden={:?} shown={:?}",
+        state.format_open,
+        state.var_open,
+        menu.map(|rect| (rect.left, rect.top, rect.right, rect.bottom)),
+        hidden,
+        shown
+    );
+}
+
+/// Close whichever menu is open and put the panel back as it is without one.
+///
+/// Returns whether anything was open. This is the only place that closes a menu, because closing one
+/// has two halves that must not drift apart: the flag decides what the painter draws, and the boxes
+/// the menu covered are hidden while it is open. Two handlers used to clear the flag, repaint, and
+/// leave the boxes hidden, which made a field disappear until another menu was opened and closed by
+/// the one handler that did restore it.
+fn close_menus(hwnd: windows_sys::Win32::Foundation::HWND, why: &str) -> bool {
+    let open = {
+        let Some(state) = state_mut(hwnd) else {
+            return false;
+        };
+        let open = state.format_open || state.var_open;
+        state.format_open = false;
+        state.var_open = false;
+        open
+    };
+    if open {
+        eprintln!("[save-panel] menu closed: {why}");
+        apply_menu_occlusion(hwnd);
+        unsafe {
+            windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0);
+        }
+    }
+    open
 }
 
 impl WindowState {
@@ -2465,7 +2503,8 @@ extern "system" fn window_proc(
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         DefWindowProcW, DestroyWindow, GetWindowLongPtrW, PostQuitMessage, SetWindowPos,
-        GWLP_USERDATA, HTCLIENT, HTCAPTION, SWP_NOACTIVATE, SWP_NOZORDER, WM_CLOSE, WM_DESTROY,
+        GWLP_USERDATA, HTCLIENT, HTCAPTION, SWP_NOACTIVATE, SWP_NOZORDER, WA_INACTIVE, WM_ACTIVATE,
+        WM_CLOSE, WM_DESTROY,
         WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_NCCALCSIZE,
         WM_NCHITTEST, WM_PAINT,
     };
@@ -2484,6 +2523,17 @@ extern "system" fn window_proc(
             } else {
                 HTCLIENT as isize
             }
+        }
+        // A menu is a popup inside this window, not an owned popup window, so clicking anything
+        // outside the panel takes the activation away and no mouse message ever arrives here. The
+        // menu would then stay open for as long as the panel lives, which is why the deactivation
+        // is what closes it.
+        WM_ACTIVATE => {
+            let active = (wparam & 0xFFFF) as u32;
+            if active == WA_INACTIVE {
+                close_menus(hwnd, "the panel lost activation");
+            }
+            0
         }
         WM_ERASEBKGND => {
             // With a backdrop the client must stay empty so DWM's material shows through.
@@ -2554,6 +2604,9 @@ extern "system" fn window_proc(
                             &snapclip_ui::panel::PaintInput {
                                 dpi,
                                 fill_surface: !s.backdrop,
+                                // A window keeps its pixels between frames, so it erases first;
+                                // see `PaintInput::clear_first` for what the residue did.
+                                clear_first: true,
                                 fields: s.fields,
                                 preview: s
                                     .preview
@@ -2705,8 +2758,7 @@ extern "system" fn window_proc(
                         }
                         insert_token(hwnd, token);
                         apply_menu_occlusion(hwnd);
-                        return 0;
-                    }
+                        return 0;                    }
                     let on_wand =
                         snapclip_ui::panel::name_wand_contains(&metrics, &rects, scale, point);
                     let inside = snapclip_ui::panel::var_menu_contains(&metrics, &rects, scale, point)
@@ -2802,8 +2854,10 @@ extern "system" fn window_proc(
                     ) {
                         if let Some(s) = state_mut(hwnd) {
                             s.format = index;
-                            s.format_open = false;
                         }
+                        // The one way to close a menu, so the boxes it covered come back: see
+                        // `close_menus`.
+                        close_menus(hwnd, "a format was chosen");
                         // The file's format decides what it weighs, so a measurement taken under the
                         // old one describes a file that no longer exists. Only a limit that is on
                         // needs the new number, which is why the refresh itself checks the switch.
@@ -2824,9 +2878,7 @@ extern "system" fn window_proc(
                     if !inside {
                         // A click anywhere else dismisses the menu and does nothing else: the first
                         // click after opening a menu belongs to the menu, which is how menus behave.
-                        if let Some(s) = state_mut(hwnd) {
-                            s.format_open = false;
-                        }
+                        close_menus(hwnd, "a click landed outside the format menu");
                         InvalidateRect(hwnd, std::ptr::null(), 0);
                         return 0;
                     }

@@ -1996,6 +1996,15 @@ pub struct PaintInput<'a> {
     pub dpi: f32,
     /// Whether to fill the surface. A window with the DWM backdrop behind it says `false`.
     pub fill_surface: bool,
+    /// Erase the target before drawing. A window needs it; a fresh canvas does not.
+    ///
+    /// A window's target keeps its pixels between frames, and with the backdrop the body is
+    /// deliberately left unpainted, so a shape a later frame does not draw would survive — and its
+    /// alpha would let DWM blend the desktop through it, which reads as a menu that closed but is
+    /// still there, see-through. An offscreen canvas is created, painted and read inside one test,
+    /// so erasing it first would only destroy the sheet colour the harness pre-fills to stand in for
+    /// the compositor's material.
+    pub clear_first: bool,
     /// Each form field's frame state: the native children draw no border, no focus ring and no
     /// error colour, so the frames around them have to be told what state each one is in.
     pub fields: crate::panel::FieldStates,
@@ -2054,6 +2063,7 @@ impl<'a> PaintInput<'a> {
         Self {
             dpi,
             fill_surface: true,
+            clear_first: false,
             fields: crate::panel::FieldStates::IDLE,
             preview: None,
             quality: 0,
@@ -2137,6 +2147,12 @@ pub fn paint_to_dc_with_preview(
     };
     unsafe { target.BeginDraw() };
     unsafe { target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED) };
+    // Independent of the last frame: see `PaintTarget::clear`. With a backdrop the body is left
+    // unpainted on purpose, so anything the previous frame wrote would otherwise survive wherever
+    // this one draws nothing — and that residue carries alpha, which DWM blends with the desktop.
+    if input.clear_first {
+        painter.clear();
+    }
     // Hairlines at 1 dip are meant to be one pixel, not two half-lit ones.
     Frame {
         metrics: &metrics,
@@ -2183,6 +2199,46 @@ pub fn paint_to_dc_with_preview(
 
 #[cfg(test)]
 mod tests {
+    /// A window keeps its pixels from one frame to the next and so erases before painting; an
+    /// offscreen canvas does not, because the harness pre-fills it to stand in for the compositor's
+    /// material.
+    ///
+    /// Both sides are asserted: erasing leaves the body transparent wherever the frame draws nothing,
+    /// and not erasing leaves the pre-fill alone. Half of that would pass with an erase that always
+    /// runs or never runs.
+    #[test]
+    fn erasing_the_target_leaves_the_unpainted_body_transparent() {
+        let canvas = Canvas::new(920, DEMO.panel_height());
+        let factory = factory().expect("a Direct2D factory");
+        let dwrite = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED) }
+            .expect("a DirectWrite factory");
+        let paint = |clear_first: bool| {
+            paint_to_dc_with_preview(
+                &factory,
+                &dwrite,
+                canvas.dc,
+                Rect::new(0, 0, canvas.width, canvas.height),
+                &PaintInput {
+                    fill_surface: false,
+                    clear_first,
+                    ..PaintInput::idle(1.0)
+                },
+            )
+            .expect("the frame paints");
+        };
+        paint(false);
+        let kept = canvas.pixels().pixel(20, 20);
+        assert_eq!(
+            kept.a, 255,
+            "without an erase the material behind the body survives"
+        );
+        paint(true);
+        let erased = canvas.pixels().pixel(20, 20);
+        assert_eq!(
+            erased.a, 0,
+            "with an erase nothing the frame did not draw is left"
+        );
+    }
 
     /// The limit's controls are the design's own rectangles, written as absolute numbers.
     ///

@@ -2733,6 +2733,16 @@ pub fn fields_under(menu: Rect, fields: &[Rect]) -> Vec<usize> {
         .collect()
 }
 
+/// Which of `fields` are hidden while the given menu is open — none when no menu is open.
+///
+/// Closing a menu means calling this with `None`, so the invariant "no menu hides nothing" is a
+/// property of the rule rather than of the handlers. It is the assertion that catches a close path
+/// that forgets to restore the boxes a menu hid.
+pub fn hidden_fields(menu: Option<Rect>, fields: &[Rect]) -> Vec<usize> {
+    menu.map(|menu| fields_under(menu, fields))
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 #[path = "field_click_tests.rs"]
 mod click_tests;

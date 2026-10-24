@@ -1408,3 +1408,24 @@ check --workspace --all-targets  Finished ✓  死代码 0 ✓
   需要让高度取 `max(预览带, 表单底)`，并把 footer 的位置一起搬过去。
 - **A48** 提示的图标（12 dip）比它所在的行（10 dip）高 1 dip 上下各一 —— 不裁剪，但两行同时出现时
   图标与上一行 chip 的间距会比设计稿小 1 dip。
+
+## 诊断：格式菜单关掉后"只是变透明"（本次修复）
+
+用户实测：格式菜单打开后，再点触发按钮或点菜单外，菜单没有消失，只是变透明。
+
+**根因（两层，都在结构上，不是某一行写错）**
+
+1. 面板用 DWM 材质（`DWMWA_SYSTEMBACKDROP_TYPE` = `DWMSBT_TRANSIENTWINDOW`）且 `WM_ERASEBKGND` 返回 1、`fill_surface = false` ⇒ **本体刻意不填**，未绘制处透出材质。而绘制入口**从不 Clear**（`frame.rs`、`d2d.rs` 都没有 `Clear`）⇒ 某帧没画到的像素 = **上一帧留下的**。
+2. 菜单关闭只清标志 + `InvalidateRect`，没有任何东西把菜单矩形重画成不透明 ⇒ 旧菜单的半透明像素留在目标里，而目标**带 alpha** ⇒ DWM 把它与桌面合成 ⇒「菜单还在，只是透明」。
+
+**修法**
+
+- `PaintTarget::clear()`（四个目标共用基类 `ID2D1RenderTarget::Clear(None)`）+ `PanelPainter::clear()`；`PaintInput::clear_first` 决定是否执行。**窗口传 `true`**（目标跨帧保留像素）；**离屏画布传 `false`**（`idle()` 的默认）——画布在同一个测试里创建、绘制、读取，而它预先填的表面色正是**装置对 DWM 材质的模拟**，先清掉会毁掉这个模拟（这一条被 8 条表面色断言当场抓到）。
+- `close_menus(hwnd, why)` 成为**关闭菜单的唯一入口**：清两个标志 + `apply_menu_occlusion` + `InvalidateRect`。此前有两条路径只清标志不恢复被隐藏的输入框（选格式、点菜单外）⇒ 那些框会一直隐身。
+- 新增 `WM_ACTIVATE`：菜单是窗内自绘的弹层，点面板**外面**拿不到鼠标消息，失活才是关闭时机。
+- `panel::hidden_fields(Option<Rect>, &[Rect])`：把"无菜单 ⇒ 不隐藏任何框"变成**规则的属性**，可断言（`a_closed_menu_hides_nothing`）。
+- 仪表：`apply_menu_occlusion` 每次转换打一行 `[save-panel] occlusion format_open=… var_open=… menu=… hidden=… shown=…`，`close_menus` 打关闭原因。
+
+**证据**：`erasing_the_target_leaves_the_unpainted_body_transparent` 两侧都断言（不清 ⇒ a=255，清 ⇒ a=0）；变异 M1（`None` 也返回全部索引）红在"with no menu open every box is shown"；变异 M2（去掉清底）红在"with an erase nothing the frame did not draw is left"；两次还原 SHA256 逐字节一致。
+
+**未覆盖**：真实窗口里"点击 → 不再残留"只能人眼确认；`close_menus` 与 `WM_ACTIVATE` 的消息处理没有窗口级测试（需要真窗口）。

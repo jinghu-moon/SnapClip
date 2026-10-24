@@ -238,3 +238,27 @@ fn the_tokens_are_the_ones_the_specification_names() {
         ["日期", "时间", "序号", "分辨率", "软件名"]
     );
 }
+
+/// Closing a menu must restore every box it hid, and that invariant belongs to the rule rather than
+/// to the handlers: with no menu open, nothing is hidden. Two close paths used to clear the flag and
+/// repaint while leaving the boxes hidden, which is what this asserts against.
+#[test]
+fn a_closed_menu_hides_nothing() {
+    let metrics = DEMO;
+    let rects = metrics.rects(1.0);
+    let boxes: Vec<Rect> = FieldId::ALL
+        .iter()
+        .map(|id| id.rect(&metrics, &rects, 1.0, 0))
+        .collect();
+    assert!(
+        hidden_fields(None, &boxes).is_empty(),
+        "with no menu open every box is shown"
+    );
+    let menu = fmt_menu_rect(&metrics, &rects, 1.0, metrics.panel_height());
+    let covered = hidden_fields(Some(menu), &boxes);
+    assert!(!covered.is_empty(), "the format menu covers a field");
+    assert!(
+        covered.len() < boxes.len(),
+        "and the fields it does not cover stay visible"
+    );
+}
