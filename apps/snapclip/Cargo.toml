@@ -84,6 +84,10 @@ windows-sys = { version = "0.59", features = [
   # smaller to get it from.
   "Win32_UI_Controls",
   "Win32_UI_Shell",
+  # `SHBrowseForFolderW` — the save panel's `更改` button. Its result is an `ITEMIDLIST`, which the
+  # bindings only expose with the shell's common types enabled; still no new crate, just the submodule
+  # the dialog already lives in.
+  "Win32_UI_Shell_Common",
   "Win32_UI_WindowsAndMessaging",
 ] }
 

@@ -412,6 +412,18 @@ pub struct Frame<'a> {
     pub status: Option<(crate::copy::Level, &'a str)>,
     /// The status line's format (`--fs-status: 11px`, `:37`).
     pub status_format: Option<&'a IDWriteTextFormat>,
+    /// Whether the token menu is open. The message handler owns the flag and the painter reads it,
+    /// the same division as the format menu above.
+    pub var_open: bool,
+    /// The token menu's label format (`.var-item { font-size: 12px }`, `:219`).
+    pub var_label: Option<&'a IDWriteTextFormat>,
+    /// The three shortcut chips' widths, measured by the caller.
+    ///
+    /// Their words are not all the same width, so the chips are not either, and the window has to
+    /// hit-test the same rectangles the painter draws. Measuring inside the paint would leave the
+    /// click handler with a second measurement — which is the arrangement the footer's widths
+    /// already replaced. `None` measures here, for callers that only paint.
+    pub path_chips: Option<[i32; 3]>,
 }
 
 impl Frame<'_> {
@@ -735,11 +747,22 @@ impl Frame<'_> {
                 self.brushes.muted_rgba,
             )?;
 
-            let mut widths = [0i32; 3];
-            for (index, word) in crate::panel::field::PATH_CHIP_WORDS.iter().enumerate() {
-                let measured = painter.measure_text_width(word, chip_format)?.round() as i32;
-                widths[index] = crate::panel::field::path_chip_width(self.scale, measured);
-            }
+            // The chip widths, measured by the caller when it has a device and by this paint when it
+            // does not. The window measures them so that its hit test and this drawing use one set
+            // of numbers; a second measurement that happens to agree is a click waiting to land
+            // beside its chip.
+            let widths = match self.path_chips {
+                Some(widths) => widths,
+                None => {
+                    let mut measured_widths = [0i32; 3];
+                    for (index, word) in crate::panel::field::PATH_CHIP_WORDS.iter().enumerate() {
+                        let measured = painter.measure_text_width(word, chip_format)?.round() as i32;
+                        measured_widths[index] =
+                            crate::panel::field::path_chip_width(self.scale, measured);
+                    }
+                    measured_widths
+                }
+            };
             let height =
                 (crate::panel::field::AFTER_CHIP_HEIGHT_DIP as f32 * self.scale).round();
             let pill = (height / 2.0).round() as i32;
@@ -951,6 +974,60 @@ impl Frame<'_> {
         // the height the canvas was built with rather than a constant.
         let window_height = canvas.bottom;
         self.paint_format(painter, window_height)?;
+        // The token menu, for the same reason and after it: only one of the two can be open, so the
+        // order between them is a statement about nothing, and the last thing drawn is the one that
+        // would win if both ever were.
+        self.paint_variables(painter)?;
+        Ok(())
+    }
+
+    /// The token menu (`:217`–`:221`, `:690`), drawn only while it is open.
+    ///
+    /// It hangs under the name field's variable button and covers part of the rows below it. The
+    /// frame draws it, but Windows paints the native text boxes afterwards, so the window hides the
+    /// boxes it covers for as long as it is open — a menu that appears behind a text field would be
+    /// worse than no menu.
+    fn paint_variables(&self, painter: &PanelPainter) -> Result<()> {
+        if !self.var_open {
+            return Ok(());
+        }
+        let Some(label_format) = self.var_label else {
+            return Ok(());
+        };
+        let scale = self.scale;
+        let line = scale.round().max(1.0);
+        let menu = crate::panel::var_menu_rect(self.metrics, self.rects, scale);
+        // `--r-menu` is the same corner the format menu uses (`:180`), and the one dip inset stands
+        // in for the drop shadow a normal window cannot draw.
+        let radius = (crate::panel::FMT_MENU_RADIUS_DIP as f32 * scale).round() as i32;
+        painter.fill_round(menu, radius, &self.brushes.surface);
+        let inset = (crate::panel::FMT_MENU_LINE_DIP as f32 * scale).round() as i32;
+        painter.stroke_round(
+            Rect::new(
+                menu.left + inset / 2,
+                menu.top + inset / 2,
+                menu.right - inset / 2,
+                menu.bottom - inset / 2,
+            ),
+            (radius - inset).max(0),
+            &self.brushes.line,
+            line,
+        );
+
+        let item_radius = (crate::panel::FMT_ITEM_RADIUS_DIP as f32 * scale).round() as i32;
+        let pad = (crate::panel::VAR_MENU_PAD_DIP as f32 * scale).round() as i32;
+        for (index, label) in crate::panel::VARIABLE_LABELS.iter().enumerate() {
+            let item = crate::panel::var_item_rect(self.metrics, self.rects, scale, index);
+            let _ = item_radius;
+            // `.var-item { padding: 0 10px; text-align: left }` (`:219`), and `--text` for the word.
+            let text = Rect::new(
+                item.left + pad,
+                item.top,
+                item.right - pad,
+                item.bottom,
+            );
+            painter.draw_text(label, label_format, text, &self.brushes.text);
+        }
         Ok(())
     }
 
@@ -1222,6 +1299,30 @@ pub fn status_format(dwrite: &IDWriteFactory, dpi: f32) -> Result<IDWriteTextFor
     text_format(dwrite, dpi, STATUS_FONT_DIP, DWRITE_FONT_WEIGHT_NORMAL)
 }
 
+/// `.var-item { font-size: 12px }` (`save-panel-demo-v3.html:219`). The token menu's labels.
+pub const VAR_FONT_DIP: f32 = 12.0;
+
+/// The token menu's labels: twelve dip at the body weight, leading-aligned because `.var-item` is
+/// `text-align: left` (`:219`) rather than centred like a button.
+pub fn var_label_format(dwrite: &IDWriteFactory, dpi: f32) -> Result<IDWriteTextFormat> {
+    text_format(dwrite, dpi, VAR_FONT_DIP, DWRITE_FONT_WEIGHT_NORMAL)
+}
+
+/// The three shortcut chips' widths, measured once for the same reason the footer's are.
+///
+/// The window needs them to answer a click on a chip and the paint needs them to draw one, and two
+/// measurements that happen to agree are not one number used twice.
+pub fn measure_path_chips(dwrite: &IDWriteFactory, dpi: f32) -> Result<[i32; 3]> {
+    let scale = (dpi / 96.0).max(0.5);
+    let format = chip_format(dwrite, dpi)?;
+    let mut widths = [0i32; 3];
+    for (index, word) in crate::panel::field::PATH_CHIP_WORDS.iter().enumerate() {
+        let measured = crate::panel::d2d::measure_text_width(dwrite, word, &format)?;
+        widths[index] = crate::panel::field::path_chip_width(scale, measured.round() as i32);
+    }
+    Ok(widths)
+}
+
 /// The path row's `更改` button width, measured the way the painter measures it.
 ///
 /// The button is a word with twelve dip of padding (`:189`), and the input gives up exactly this
@@ -1358,6 +1459,11 @@ pub struct PaintInput<'a> {
     /// The footer's one line of message with its level: the window decides whether there is one and
     /// what it says, the frame decides how the two levels look.
     pub status: Option<(crate::copy::Level, &'a str)>,
+    /// Whether the token menu is open. Only one menu can be open at a time; the window closes one
+    /// when the other opens, so this is a fact about the panel rather than a preference.
+    pub var_open: bool,
+    /// The three shortcut chips' widths, measured by the window for the same reason as the footer's.
+    pub path_chips: Option<[i32; 3]>,
 }
 
 impl<'a> PaintInput<'a> {
@@ -1374,6 +1480,8 @@ impl<'a> PaintInput<'a> {
             footer_widths: None,
             path_change: 0,
             status: None,
+            var_open: false,
+            path_chips: None,
         }
     }
 }
@@ -1419,6 +1527,8 @@ pub fn paint_to_dc_with_preview(
     let format_label = format_label_format(dwrite, input.dpi)?;
     // The footer's status line (`--fs-status: 11px`, :37).
     let status_format = status_format(dwrite, input.dpi)?;
+    // The token menu's labels (`.var-item`, 12 dip, `:219`).
+    let var_label = var_label_format(dwrite, input.dpi)?;
     let painter = PanelPainter {
         context: &target,
         text_factory: dwrite,
@@ -1449,6 +1559,9 @@ pub fn paint_to_dc_with_preview(
         path_change: input.path_change,
         status: input.status,
         status_format: Some(&status_format),
+        var_open: input.var_open,
+        var_label: Some(&var_label),
+        path_chips: input.path_chips,
         fields: input.fields,
         preview: preview.as_ref().map(|(b, w, h)| (b, *w, *h)),
         quality: input.quality,
@@ -3393,6 +3506,11 @@ impl PanelRenderer {
         measure_path_change(&self.dwrite, dpi)
     }
 
+    /// The three shortcut chips' widths, for the same reason: the click handler tests the chips the
+    /// paint drew rather than a second measurement of the same words.
+    pub fn measure_path_chips(&self, dpi: f32) -> Result<[i32; 3]> {
+        measure_path_chips(&self.dwrite, dpi)
+    }
 }
 
 /// Where an image of `source` (width, height) lands inside `card` (left, top, right, bottom):

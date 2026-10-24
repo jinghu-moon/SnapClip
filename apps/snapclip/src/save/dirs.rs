@@ -7,24 +7,36 @@
 //! validation exists to describe.
 
 use windows_sys::Win32::System::Com::CoTaskMemFree;
-use windows_sys::Win32::UI::Shell::{FOLDERID_Desktop, SHGetKnownFolderPath};
+use windows_sys::Win32::UI::Shell::{
+    FOLDERID_Desktop, FOLDERID_Downloads, FOLDERID_Pictures, SHGetKnownFolderPath,
+};
 
 /// The user's desktop as an absolute path with no trailing separator, or an empty string.
 ///
 /// No trailing separator because every place that joins a file name to this path adds its own,
 /// and two separators in a row is the kind of detail that only shows up in someone's file dialog.
 pub fn desktop() -> String {
+    known_folder(&FOLDERID_Desktop)
+}
+
+/// The user's pictures folder, in the same shape as [`desktop`].
+pub fn pictures() -> String {
+    known_folder(&FOLDERID_Pictures)
+}
+
+/// The user's downloads folder, in the same shape as [`desktop`].
+pub fn downloads() -> String {
+    known_folder(&FOLDERID_Downloads)
+}
+
+/// One known folder, as text, or nothing when the shell declines to name it.
+fn known_folder(id: &windows_sys::core::GUID) -> String {
     // SAFETY: `SHGetKnownFolderPath` writes one pointer and returns a failure code we check
     // before reading it. On success the buffer is allocated with `CoTaskMemAlloc`, which is why
     // it is released with `CoTaskMemFree` exactly once, after the text has been copied out.
     unsafe {
         let mut path: *mut u16 = std::ptr::null_mut();
-        let result = SHGetKnownFolderPath(
-            &FOLDERID_Desktop,
-            0,
-            std::ptr::null_mut(),
-            &mut path,
-        );
+        let result = SHGetKnownFolderPath(id, 0, std::ptr::null_mut(), &mut path);
         if result < 0 || path.is_null() {
             return String::new();
         }

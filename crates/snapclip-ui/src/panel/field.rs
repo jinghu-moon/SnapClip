@@ -1828,6 +1828,189 @@ pub fn fmt_menu_contains(
     fmt_contains(fmt_menu_rect(metrics, rects, scale, window_height), point)
 }
 
+// -------------------------------------------------------------------------------------------------
+// The controls the window answers
+// -------------------------------------------------------------------------------------------------
+
+/// Whether a point is inside a rectangle, half-open.
+///
+/// Left and top belong to the rectangle; right and bottom belong to whatever is next. Two
+/// rectangles that share an edge therefore cannot both answer for the pixel on it, which is the
+/// only way a click can be said to land on exactly one control.
+pub fn rect_contains(rect: Rect, point: (i32, i32)) -> bool {
+    point.0 >= rect.left && point.0 < rect.right && point.1 >= rect.top && point.1 < rect.bottom
+}
+
+/// Whether two rectangles have any pixel in common.
+pub fn rects_intersect(a: Rect, b: Rect) -> bool {
+    a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
+}
+
+/// The `更改` button at the path row's right end (`:545`), which asks the shell for a folder.
+pub fn path_change_contains(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    change_width: i32,
+    point: (i32, i32),
+) -> bool {
+    rect_contains(
+        path_change_rect(metrics, rects, scale, change_width),
+        point,
+    )
+}
+
+/// The square folder button beside it (`:546`), which opens the folder the path names.
+pub fn path_open_contains(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    point: (i32, i32),
+) -> bool {
+    rect_contains(path_open_rect(metrics, rects, scale), point)
+}
+
+/// Which shortcut chip the point is on, if any (`:739`–`:741`).
+pub fn path_chip_at(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    widths: &[i32; 3],
+    point: (i32, i32),
+) -> Option<usize> {
+    (0..widths.len())
+        .find(|index| rect_contains(path_chip_rect(metrics, rects, scale, widths, *index), point))
+}
+
+/// The variable button inside the name field (`:213`), which opens the token menu.
+pub fn name_wand_contains(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    point: (i32, i32),
+) -> bool {
+    rect_contains(name_wand_rect(metrics, rects, scale), point)
+}
+
+/// The five tokens the mockup's menu inserts, in its order (`:1049`–`:1053`; the table the names
+/// come from is `:192`–`:198`). The token is what goes into the template; the label is what the
+/// menu shows beside it.
+pub const VARIABLE_TOKENS: [&str; 5] = ["[日期]", "[时间]", "[序号]", "[分辨率]", "[软件名]"];
+
+/// What each token is called in the menu, without its brackets (`:1049`–`:1053`).
+pub const VARIABLE_LABELS: [&str; 5] = ["日期", "时间", "序号", "分辨率", "软件名"];
+
+/// `.var-menu { width: 184px; padding: 5px }` (`:217`).
+pub const VAR_MENU_W_DIP: i32 = 184;
+pub const VAR_MENU_PAD_DIP: i32 = 5;
+
+/// `.var-item { height: 32px }` (`:219`).
+pub const VAR_ITEM_H_DIP: i32 = 32;
+
+/// The menu hangs eight dip below the button (`openVar`, `:916`) and overhangs its right edge by
+/// four (`:915`). Both are the mockup's own arithmetic for keeping the menu inside the panel, so
+/// the button can sit four dip from the column's edge and the menu still fit.
+pub const VAR_MENU_GAP_DIP: i32 = 8;
+pub const VAR_MENU_OVERHANG_DIP: i32 = 4;
+
+/// The token menu's box: hung under the name field's button, its right edge four dip past it.
+pub fn var_menu_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let button = name_wand_rect(metrics, rects, scale);
+    let right = button.right + px(VAR_MENU_OVERHANG_DIP);
+    let left = right - px(VAR_MENU_W_DIP);
+    let top = button.bottom + px(VAR_MENU_GAP_DIP);
+    let height = px(VAR_MENU_PAD_DIP) * 2 + px(VAR_ITEM_H_DIP) * VARIABLE_TOKENS.len() as i32;
+    Rect {
+        left,
+        top,
+        right,
+        bottom: top + height,
+    }
+}
+
+/// One token's row inside the menu, after the menu's own padding (`:217`, `:219`).
+pub fn var_item_rect(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    index: usize,
+) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let menu = var_menu_rect(metrics, rects, scale);
+    let pad = px(VAR_MENU_PAD_DIP);
+    let row = px(VAR_ITEM_H_DIP);
+    let top = menu.top + pad + row * index as i32;
+    Rect {
+        left: menu.left + pad,
+        top,
+        right: menu.right - pad,
+        bottom: top + row,
+    }
+}
+
+/// Whether a point is anywhere in the open token menu, padding included.
+pub fn var_menu_contains(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    point: (i32, i32),
+) -> bool {
+    rect_contains(var_menu_rect(metrics, rects, scale), point)
+}
+
+/// Which token the point is on, if any.
+pub fn var_item_at(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    point: (i32, i32),
+) -> Option<usize> {
+    (0..VARIABLE_TOKENS.len())
+        .find(|index| rect_contains(var_item_rect(metrics, rects, scale, *index), point))
+}
+
+/// Put `token` where the caret is, replacing whatever is selected, and answer the new text and
+/// where the caret belongs afterwards.
+///
+/// In UTF-16 code units, because that is the unit the edit control counts in: `EM_GETSEL` and
+/// `EM_SETSEL` speak in them and a `String` counts in bytes, so a name with a character outside
+/// ASCII has two different positions for the same caret. Converting in the middle of an insertion
+/// is how such a name acquires half of a character.
+///
+/// An out-of-range caret or a backwards selection is clamped rather than refused. The positions and
+/// the text can only disagree if the control changed between the two calls, and the useful answer
+/// then is still "the token goes in".
+pub fn insert_variable(text: &[u16], start: usize, end: usize, token: &str) -> (Vec<u16>, usize) {
+    let len = text.len();
+    let start = start.min(len);
+    let end = end.clamp(start, len);
+    let token: Vec<u16> = token.encode_utf16().collect();
+    let mut out = Vec::with_capacity(len - (end - start) + token.len());
+    out.extend_from_slice(&text[..start]);
+    out.extend_from_slice(&token);
+    out.extend_from_slice(&text[end..]);
+    let caret = start + token.len();
+    (out, caret)
+}
+
+/// Which of `fields` a menu covers, by index.
+///
+/// The frame paints the panel and Windows paints the child windows afterwards, so a menu the frame
+/// draws cannot appear above a text box: the box wins the overlap. The window therefore hides the
+/// boxes a menu covers for as long as it is open, and this is the list it hides. Pure, so the rule
+/// can be checked without a window — and so that "which boxes does this menu cover" is answered in
+/// one place rather than by two handlers that could disagree.
+pub fn fields_under(menu: Rect, fields: &[Rect]) -> Vec<usize> {
+    (0..fields.len())
+        .filter(|index| rects_intersect(menu, fields[*index]))
+        .collect()
+}
+
+#[cfg(test)]
+#[path = "field_click_tests.rs"]
+mod click_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

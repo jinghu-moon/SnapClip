@@ -76,12 +76,16 @@ pub use field::{
     quality_segment_state, size_cell_rect,
     size_mode_button_rect, size_mode_button_width, size_mode_rect, size_mode_reset_icon_rect,
     size_mode_reset_rect,
+    rect_contains, rects_intersect, path_change_contains, path_open_contains, path_chip_at,
+    name_wand_contains, fields_under, insert_variable,
+    VARIABLE_LABELS, VARIABLE_TOKENS, VAR_ITEM_H_DIP, VAR_MENU_GAP_DIP, VAR_MENU_OVERHANG_DIP,
+    VAR_MENU_PAD_DIP, VAR_MENU_W_DIP, var_item_at, var_item_rect, var_menu_contains, var_menu_rect,
 };
 pub use frame::{
     CHIP_FONT_DIP, DEMO, DEMO_PALETTE, Frame, FrameBrushes, FrameMetrics, FramePalette, FrameRects,
     NUMBER_FONT_DIP, PaintInput, PanelRenderer, ROW_LABEL_FONT_DIP, TITLE, UNIT_FONT_DIP,
-    chip_format, factory, measure_footer_widths, number_format,
-    row_label_format, status_format, text_format_in, title_format,
+    chip_format, factory, measure_footer_widths, measure_path_chips, number_format,
+    row_label_format, status_format, text_format_in, title_format, var_label_format, VAR_FONT_DIP,
 };
 pub use icon_button::IconButton;
 pub use icons::{Glyph, ICON_BAKED_PX, ICON_COUNT};

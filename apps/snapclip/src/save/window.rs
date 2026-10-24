@@ -419,6 +419,9 @@ pub struct ShellOptions {
     /// default. Empty means the shell declined to say, and the panel then opens on the empty
     /// value the path validation exists to describe rather than on an invented directory.
     pub directory: String,
+    /// Where the footer's copy button sends the picture. `None` means the real clipboard; a test
+    /// hands in a recorder so it can see what was asked for without touching the user's clipboard.
+    pub copy: Option<CopySink>,
 }
 
 impl Default for ShellOptions {
@@ -430,6 +433,7 @@ impl Default for ShellOptions {
             capture_size: None,
             remembered: std::sync::Arc::new(std::sync::Mutex::new(Remembered::default())),
             directory: String::new(),
+            copy: None,
         }
     }
 }
@@ -671,6 +675,10 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
         // The path row's button width, measured for the same reason: the input's rectangle gives up
         // that width, and the control and the painted button have to be told the same number.
         let path_change = measure_path_change(hwnd, renderer.as_ref());
+        // The shortcut chips' widths, measured here for the same reason the buttons' are: the click
+        // handler tests the chips the paint drew, and three words of different lengths make three
+        // chips of different widths.
+        let path_chips = measure_path_chips(hwnd, renderer.as_ref());
         // The child's background: the field's own fill, resolved from `--fill` over the surface.
         // A native `EDIT` cannot be translucent, so the composite is computed once here.
         let fill = snapclip_ui::panel::field_colours(
@@ -703,6 +711,14 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
             remembered: options.remembered.clone(),
             // Nothing has been attempted yet, so the footer's status line has nothing to say.
             status: None,
+            // Both menus start closed: the panel opens on the form, not on a popup.
+            var_open: false,
+            path_chips,
+            copy: options
+                .copy
+                .take()
+                .map(|sink| sink.0)
+                .unwrap_or_else(|| std::sync::Arc::new(SystemImageCopy)),
         }));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
 
@@ -809,6 +825,44 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
     }
 }
 
+/// What the panel needs from the clipboard in order to copy the picture it is showing.
+///
+/// One method with three numbers rather than the capture crate's port, because the port takes a PNG
+/// path and the panel has pixels rather than a file: it copies before anything is written, which is
+/// what the footer's copy button is for. The type exists so the window can be tested with a
+/// clipboard that records instead of writing to the user's machine.
+pub trait ImageCopy: Send + Sync + 'static {
+    fn copy_image(&self, width: u32, height: u32, bgra: &[u8]) -> Result<(), String>;
+}
+
+/// A copy destination that can sit in [`ShellOptions`], which derives `Debug`.
+///
+/// The trait object has no `Debug` to print, and printing the sink's identity would say nothing a
+/// test could use, so this wrapper prints its own name and inherits the clone.
+#[derive(Clone)]
+pub struct CopySink(pub std::sync::Arc<dyn ImageCopy>);
+
+impl std::fmt::Debug for CopySink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CopySink(..)")
+    }
+}
+
+/// The real clipboard, through the shell's existing writer.
+pub struct SystemImageCopy;
+
+impl ImageCopy for SystemImageCopy {
+    fn copy_image(&self, width: u32, height: u32, bgra: &[u8]) -> Result<(), String> {
+        crate::clipboard::SystemClipboard.copy_image(&crate::clipboard::ClipboardImage {
+            width,
+            height,
+            pixels: bgra,
+            channels: crate::clipboard::Channels::Bgra,
+            png: None,
+        })
+    }
+}
+
 /// Per-window state that the WndProc needs. It is boxed and pointed at by `GWLP_USERDATA`, which is
 /// the only way to carry Rust data into a Win32 callback without a global.
 #[cfg(windows)]
@@ -871,6 +925,17 @@ struct WindowState {
     /// caused it corrected — closing on failure, which is what it used to do, made every rejection
     /// invisible.
     status: Option<(snapclip_ui::copy::Level, String)>,
+    /// Whether the token menu is open. Only one menu is open at a time, and opening this one closes
+    /// the format's, because two popups over one form would be a puzzle rather than a menu.
+    var_open: bool,
+    /// The three shortcut chips' widths, in the order `PATH_CHIP_WORDS` lists them.
+    ///
+    /// Measured once beside the footer's, for the same reason: the click handler tests the chips
+    /// that were drawn rather than a second measurement of the same three words.
+    path_chips: [i32; 3],
+    /// Where the footer's copy button sends the picture. Behind a trait so a test can see what was
+    /// asked for without writing to the user's clipboard.
+    copy: std::sync::Arc<dyn ImageCopy>,
 }
 
 /// The footer buttons' widths for this window, or zeros if Direct2D never started.
@@ -908,6 +973,95 @@ fn measure_path_change(
         }
         None => 0,
     }
+}
+
+/// The three shortcut chips' widths, measured once like the buttons above.
+fn measure_path_chips(    hwnd: windows_sys::Win32::Foundation::HWND,
+    renderer: Option<&snapclip_ui::panel::PanelRenderer>,
+) -> [i32; 3] {
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96) as f32;
+    match renderer.map(|renderer| renderer.measure_path_chips(dpi)) {
+        Some(Ok(widths)) => widths,
+        Some(Err(error)) => {
+            eprintln!("[save-panel] could not measure the shortcut chips: {error:?}");
+            [0; 3]
+        }
+        None => [0; 3],
+    }
+}
+
+/// The characters a control holds, as UTF-16, which is the unit the control itself counts in.
+///
+/// The insertion has to work in that unit rather than in a `String`'s bytes: a name with a Chinese
+/// character has more bytes than positions, and converting between the two in the middle of an
+/// insertion is how half a character ends up in a file name.
+fn control_text_utf16(hwnd: windows_sys::Win32::Foundation::HWND) -> Vec<u16> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowTextLengthW, GetWindowTextW};
+    if hwnd.is_null() {
+        return Vec::new();
+    }
+    let len = unsafe { GetWindowTextLengthW(hwnd) };
+    if len <= 0 {
+        return Vec::new();
+    }
+    let mut buffer = vec![0u16; len as usize + 1];
+    let written = unsafe { GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };
+    buffer.truncate(written.max(0) as usize);
+    buffer
+}
+
+/// Replace a control's text and put the caret where the caller says.
+fn set_control_text_and_caret(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    text: &[u16],
+    caret: usize,
+) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
+    const EM_SETSEL: u32 = 0x00B1;
+    if hwnd.is_null() {
+        return;
+    }
+    let mut wide = text.to_vec();
+    while wide.last() == Some(&0) {
+        wide.pop();
+    }
+    let text_ptr = wide.as_ptr();
+    // `SetWindowTextW` takes a NUL-terminated string; the slice has no terminator, so it is added.
+    let mut terminated = wide.clone();
+    terminated.push(0);
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(
+            hwnd,
+            terminated.as_ptr(),
+        );
+        let _ = text_ptr;
+        SendMessageW(
+            hwnd,
+            EM_SETSEL,
+            caret as usize,
+            caret as isize,
+        );
+    }
+}
+
+/// Where a control's selection is, in the units it counts in.
+fn control_selection(hwnd: windows_sys::Win32::Foundation::HWND) -> (usize, usize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
+    const EM_GETSEL: u32 = 0x00B0;
+    if hwnd.is_null() {
+        return (0, 0);
+    }
+    let mut start: u32 = 0;
+    let mut end: u32 = 0;
+    unsafe {
+        SendMessageW(
+            hwnd,
+            EM_GETSEL,
+            &mut start as *mut u32 as usize,
+            &mut end as *mut u32 as isize,
+        );
+    }
+    (start as usize, end as usize)
 }
 
 /// What the panel's name field holds, read back from the control that owns it.
@@ -1109,6 +1263,218 @@ fn save_from_panel(hwnd: windows_sys::Win32::Foundation::HWND) -> Option<service
         ),
     }
     attempt.ok()
+}
+
+/// Put a directory into the path field.
+///
+/// The field is the only place the shell reads the directory from, so a shortcut chip changes the
+/// field rather than a second copy of the path. That also means the user sees what the chip did,
+/// and can edit the result before saving.
+fn set_directory(hwnd: windows_sys::Win32::Foundation::HWND, directory: &str) {
+    let Some(state) = state(hwnd) else {
+        return;
+    };
+    let control = state.control(snapclip_ui::panel::FieldId::Path);
+    if control.is_null() {
+        return;
+    }
+    let text: Vec<u16> = directory.encode_utf16().collect();
+    let caret = text.len();
+    set_control_text_and_caret(control, &text, caret);
+    unsafe { windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0) };
+}
+
+/// Ask the shell for a folder and put the answer in the path field.
+///
+/// `SHBrowseForFolderW` rather than `IFileOpenDialog`, because the app takes Windows through
+/// `windows-sys` and the COM dialog would mean carrying interface definitions for one call. It is
+/// the older dialog; it is also the one that needs no apartment, no `CoInitialize` and no new
+/// dependency. Cancelling changes nothing, which is the distinction that makes this safe to click.
+fn choose_folder(hwnd: windows_sys::Win32::Foundation::HWND) {
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{
+        BROWSEINFOW, SHBrowseForFolderW, SHGetPathFromIDListW,
+    };
+    let title: Vec<u16> = "选择保存位置\0".encode_utf16().collect();
+    let mut display = [0u16; 260];
+    let mut info = BROWSEINFOW {
+        hwndOwner: hwnd,
+        pidlRoot: std::ptr::null_mut(),
+        pszDisplayName: display.as_mut_ptr(),
+        lpszTitle: title.as_ptr(),
+        // `BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE`: folders only, and a dialog the user can
+        // resize and navigate — the default is a tree that starts somewhere unhelpful.
+        ulFlags: 0x0001 | 0x0040,
+        lpfn: None,
+        lParam: 0,
+        iImage: 0,
+    };
+    let pidl = unsafe { SHBrowseForFolderW(&mut info) };
+    if pidl.is_null() {
+        // Cancelled. Nothing is written, because "no answer" is not an answer.
+        return;
+    }
+    let mut path = [0u16; 260];
+    let ok = unsafe { SHGetPathFromIDListW(pidl, path.as_mut_ptr()) } != 0;
+    unsafe { CoTaskMemFree(pidl as *const core::ffi::c_void) };
+    if !ok {
+        eprintln!("[save-panel] the chosen folder has no file system path");
+        return;
+    }
+    let len = path.iter().position(|unit| *unit == 0).unwrap_or(path.len());
+    let chosen = String::from_utf16_lossy(&path[..len]);
+    set_directory(hwnd, &chosen);
+}
+
+/// Open the folder the path field names, in the shell's own browser.
+///
+/// The path is the user's text, so it can be anything: a path that does not exist is a logged
+/// no-op rather than a dialog, because the field's own validation already explains bad paths and a
+/// second voice saying the same thing is noise.
+fn open_directory(path: &str) {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    if path.trim().is_empty() {
+        return;
+    }
+    let probe = std::path::Path::new(path);
+    if !probe.is_dir() {
+        eprintln!("[save-panel] cannot open {}: not a directory", probe.display());
+        return;
+    }
+    let verb: Vec<u16> = "open\0".encode_utf16().collect();
+    let target: Vec<u16> = format!("{}\0", probe.display()).encode_utf16().collect();
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    // `ShellExecuteW` returns a value greater than 32 on success; the cast keeps the comparison in
+    // one type, which is what the API's own documentation asks for.
+    if result as isize <= 32 {
+        eprintln!("[save-panel] could not open {}: {}", probe.display(), result as isize);
+    }
+}
+
+/// Insert a token into the name field where the caret is.
+///
+/// The rule that decides the new text and the caret is `insert_variable`, a free function, so it can
+/// be checked without a control; this only decides which field receives it, and keeps the focus
+/// where it was so the next token goes on the same line as the last.
+fn insert_token(hwnd: windows_sys::Win32::Foundation::HWND, token: &str) {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+    let Some(state) = state(hwnd) else {
+        return;
+    };
+    let control = state.control(snapclip_ui::panel::FieldId::Name);
+    if control.is_null() {
+        return;
+    }
+    let text = control_text_utf16(control);
+    let (start, end) = control_selection(control);
+    let (text, caret) = snapclip_ui::panel::insert_variable(&text, start, end, token);
+    set_control_text_and_caret(control, &text, caret);
+    unsafe { SetFocus(control) };
+    unsafe { windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0) };
+}
+
+/// Copy the picture the panel is showing, at the size its two cells say.
+///
+/// The same size rule the save uses (`scale::output_size` and `scale::scaled`), so what lands on the
+/// clipboard is what would have been written: a copy button that disagreed with the save button
+/// about the size would be worse than no copy button.
+fn copy_picture(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    state: &WindowState,
+) -> Option<Result<(), String>> {
+    let (bgra, width, height) = state.preview.as_ref()?;
+    let source = super::scale::Size::new(*width, *height);
+    let output = super::scale::output_size(
+        &control_text(state.control(snapclip_ui::panel::FieldId::SizeWidth)),
+        &control_text(state.control(snapclip_ui::panel::FieldId::SizeHeight)),
+        source,
+    );
+    let frame = super::scale::Frame {
+        bgra,
+        source,
+        output,
+    };
+    let pixels = super::scale::scaled(&frame);
+    let _ = hwnd;
+    Some(state.copy.copy_image(output.width, output.height, &pixels))
+}
+
+/// Which folder a shortcut chip stands for, by index into `PATH_CHIP_WORDS` (`:739`–`:741`).
+///
+/// The shell's own folders, in the mockup's order: desktop, pictures, downloads. A folder the
+/// system declines to name answers `None`, and the chip then does nothing rather than writing an
+/// invented path into the field the user is about to save into.
+fn shortcut_directory(index: usize) -> Option<String> {
+    let directory = match index {
+        0 => super::dirs::desktop(),
+        1 => super::dirs::pictures(),
+        2 => super::dirs::downloads(),
+        _ => return None,
+    };
+    if directory.is_empty() {
+        eprintln!("[save-panel] the system did not name shortcut {index}");
+        return None;
+    }
+    Some(directory)
+}
+
+/// Hide the native text boxes a menu would be drawn underneath.
+///
+/// Windows paints a window's children after the window itself, so a menu the frame draws cannot
+/// cover a text box — the box wins the overlap. While a menu is open the boxes it covers are
+/// hidden and the rest are left alone, so the fields not under the menu keep their caret and their
+/// focus ring. When no menu is open every box is shown again.
+fn apply_menu_occlusion(hwnd: windows_sys::Win32::Foundation::HWND) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE, SW_SHOWNA};
+    let Some(state) = state(hwnd) else {
+        return;
+    };
+    let metrics = snapclip_ui::panel::DEMO;
+    let scale = dpi_scale(hwnd);
+    let rects = metrics.rects(scale);
+    let window_height = (metrics.panel_height() as f32 * scale).round() as i32;
+    let menu = if state.var_open {
+        Some(snapclip_ui::panel::var_menu_rect(&metrics, &rects, scale))
+    } else if state.format_open {
+        Some(snapclip_ui::panel::fmt_menu_rect(
+            &metrics,
+            &rects,
+            scale,
+            window_height,
+        ))
+    } else {
+        None
+    };
+    let fields = snapclip_ui::panel::FieldId::ALL;
+    let boxes: Vec<snapclip_model::geometry::Rect> = fields
+        .iter()
+        .map(|id| id.rect(&metrics, &rects, scale, state.path_change))
+        .collect();
+    // The one place that decides which boxes a menu covers: `fields_under` is a free function so
+    // the rule can be asserted without a window, and so two handlers cannot answer it differently.
+    let hidden = menu
+        .map(|menu| snapclip_ui::panel::fields_under(menu, &boxes))
+        .unwrap_or_default();
+    for (index, id) in fields.iter().enumerate() {
+        let control = state.control(*id);
+        if control.is_null() {
+            continue;
+        }
+        let show = !hidden.contains(&index);
+        unsafe {
+            let _ = ShowWindow(control, if show { SW_SHOWNA } else { SW_HIDE });
+        }
+    }
 }
 
 impl WindowState {
@@ -1500,6 +1866,8 @@ extern "system" fn window_proc(
                                 format_open: s.format_open,
                                 footer_widths: Some(s.footer_widths),
                                 path_change: s.path_change,
+                                var_open: s.var_open,
+                                path_chips: Some(s.path_chips),
                                 status: s
                                     .status
                                     .as_ref()
@@ -1547,6 +1915,98 @@ extern "system" fn window_proc(
                 if snapclip_ui::panel::close_button_contains(&rects, dpi_scale(hwnd), (point.x, point.y))
                 {
                     windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                    return 0;
+                }
+            }
+            // The token menu is the topmost thing the frame draws, so it is answered before
+            // anything it covers: a click on a token must insert that token rather than fall
+            // through to a row underneath, and a click anywhere else first closes the menu.
+            if event == snapclip_ui::panel::PointerEvent::Down {
+                let metrics = snapclip_ui::panel::DEMO;
+                let scale = dpi_scale(hwnd);
+                let rects = metrics.rects(scale);
+                let point = (point.x, point.y);
+                let open = state(hwnd).map(|s| s.var_open).unwrap_or(false);
+                if open {
+                    if let Some(index) = snapclip_ui::panel::var_item_at(&metrics, &rects, scale, point)
+                    {
+                        let token = snapclip_ui::panel::VARIABLE_TOKENS[index];
+                        if let Some(s) = state_mut(hwnd) {
+                            s.var_open = false;
+                        }
+                        insert_token(hwnd, token);
+                        apply_menu_occlusion(hwnd);
+                        return 0;
+                    }
+                    let on_wand =
+                        snapclip_ui::panel::name_wand_contains(&metrics, &rects, scale, point);
+                    let inside = snapclip_ui::panel::var_menu_contains(&metrics, &rects, scale, point)
+                        || on_wand;
+                    if inside {
+                        // The button again closes the menu, which is what a button that opened it
+                        // should do; its padding is swallowed so a near miss does not dismiss it.
+                        if on_wand {
+                            if let Some(s) = state_mut(hwnd) {
+                                s.var_open = false;
+                            }
+                            apply_menu_occlusion(hwnd);
+                            InvalidateRect(hwnd, std::ptr::null(), 0);
+                        }
+                        return 0;
+                    }
+                    if let Some(s) = state_mut(hwnd) {
+                        s.var_open = false;
+                    }
+                    apply_menu_occlusion(hwnd);
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    return 0;
+                }
+                // The variable button itself, which is inside the name field and therefore above
+                // the field's text: only the strip the control gave up can be clicked, and that is
+                // the strip this tests.
+                if snapclip_ui::panel::name_wand_contains(&metrics, &rects, scale, point) {
+                    // One menu at a time: opening this one closes the format's, so a click cannot
+                    // leave two popups over the same form.
+                    if let Some(s) = state_mut(hwnd) {
+                        s.var_open = true;
+                        s.format_open = false;
+                    }
+                    apply_menu_occlusion(hwnd);
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    return 0;
+                }
+            }
+            // The path row's controls, before the footer and after the menus: the input is a native
+            // child, so a click that lands on it never arrives here, which is why only the three
+            // chips and the two drawn buttons are tested.
+            if event == snapclip_ui::panel::PointerEvent::Down {
+                let metrics = snapclip_ui::panel::DEMO;
+                let scale = dpi_scale(hwnd);
+                let rects = metrics.rects(scale);
+                let point = (point.x, point.y);
+                let (change, chips) = state(hwnd)
+                    .map(|s| (s.path_change, s.path_chips))
+                    .unwrap_or((0, [0; 3]));
+                if snapclip_ui::panel::path_change_contains(&metrics, &rects, scale, change, point) {
+                    choose_folder(hwnd);
+                    return 0;
+                }
+                if snapclip_ui::panel::path_open_contains(&metrics, &rects, scale, point) {
+                    open_directory(&control_text(
+                        state(hwnd)
+                            .map(|s| s.control(snapclip_ui::panel::FieldId::Path))
+                            .unwrap_or(std::ptr::null_mut()),
+                    ));
+                    return 0;
+                }
+                if let Some(index) =
+                    snapclip_ui::panel::path_chip_at(&metrics, &rects, scale, &chips, point)
+                {
+                    // The shortcut is the shell's answer for that folder, not a literal in the
+                    // panel: the mockup's three paths name one person's home (`:739`–`:741`).
+                    if let Some(directory) = shortcut_directory(index) {
+                        set_directory(hwnd, &directory);
+                    }
                     return 0;
                 }
             }
@@ -1599,7 +2059,10 @@ extern "system" fn window_proc(
                     let still_open = !open;
                     if let Some(s) = state_mut(hwnd) {
                         s.format_open = still_open;
+                        // One menu at a time, in this direction too.
+                        s.var_open = false;
                     }
+                    apply_menu_occlusion(hwnd);
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                     return 0;
                 }
@@ -1621,9 +2084,23 @@ extern "system" fn window_proc(
                         continue;
                     }
                     match button {
-                        // Drawn but not wired: the clipboard is its own piece of work, and a button
-                        // that pretends to copy would be worse than one that visibly does nothing.
-                        snapclip_ui::panel::FooterButton::Copy => {}
+                        // The picture goes to the clipboard at the size the two cells say, through
+                        // the same rule the save uses. A failure is logged and leaves the panel
+                        // open: the clipboard can be held by another process for a moment, and that
+                        // is not a reason to close the window or to invent a message about it.
+                        snapclip_ui::panel::FooterButton::Copy => {
+                            if let Some(state) = state(hwnd) {
+                                match copy_picture(hwnd, state) {
+                                    Some(Ok(())) => eprintln!("[save-panel] copied the picture"),
+                                    Some(Err(error)) => {
+                                        eprintln!("[save-panel] could not copy: {error}")
+                                    }
+                                    // No capture, so there is no picture: the development entry's
+                                    // empty panel has nothing to copy and says so only in the log.
+                                    None => eprintln!("[save-panel] nothing to copy"),
+                                }
+                            }
+                        }
                         snapclip_ui::panel::FooterButton::Cancel => {
                             windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
                                 hwnd, WM_CLOSE, 0, 0,
@@ -1671,7 +2148,12 @@ extern "system" fn window_proc(
             // targets on the buttons as they are now drawn.
             if let Some(s) = state_mut(hwnd) {
                 s.footer_widths = measure_footer_widths(hwnd, s.renderer.as_ref());
+                // The chips' widths are pixels too, and so is the `更改` button's, so a new scale
+                // makes all three stale for the same reason.
+                s.path_chips = measure_path_chips(hwnd, s.renderer.as_ref());
+                s.path_change = measure_path_change(hwnd, s.renderer.as_ref());
             }
+            apply_menu_occlusion(hwnd);
             0
         }
         // `Esc` is a cancel, and at this layer cancelling the panel *is* closing it: the shell's
@@ -2203,6 +2685,9 @@ mod tests {
             format_open: false,
             remembered: std::sync::Arc::new(std::sync::Mutex::new(Remembered::default())),
             status: None,
+            var_open: false,
+            path_chips: [40, 52, 64],
+            copy: std::sync::Arc::new(SystemImageCopy),
         };
 
         // Every field has its own slot: no two fields share an index, which is what would let one
@@ -2266,6 +2751,9 @@ mod tests {
             format_open: false,
             remembered: std::sync::Arc::new(std::sync::Mutex::new(Remembered::default())),
             status: None,
+            var_open: false,
+            path_chips: [40, 52, 64],
+            copy: std::sync::Arc::new(SystemImageCopy),
         };
 
         let centre = |index: usize| {
@@ -2333,6 +2821,9 @@ mod tests {
             format_open: false,
             remembered: std::sync::Arc::new(std::sync::Mutex::new(Remembered::default())),
             status: None,
+            var_open: false,
+            path_chips: [40, 52, 64],
+            copy: std::sync::Arc::new(SystemImageCopy),
         };
 
         let metrics = snapclip_ui::panel::DEMO;
@@ -2503,4 +2994,97 @@ mod tests {
             );
         }
     }
+    /// A clipboard that records instead of writing, so a test can see what was asked for without
+    /// touching the user's clipboard.
+    struct RecordingCopy {
+        seen: std::sync::Mutex<Vec<(u32, u32, usize)>>,
+    }
+
+    impl ImageCopy for RecordingCopy {
+        fn copy_image(&self, width: u32, height: u32, bgra: &[u8]) -> Result<(), String> {
+            self.seen
+                .lock()
+                .expect("the recorder's lock")
+                .push((width, height, bgra.len()));
+            Ok(())
+        }
+    }
+
+    /// The footer's copy button hands the clipboard the picture at the size the two cells say, and
+    /// it is the same rule the save uses: a copy that disagreed with the save about the size would
+    /// be worse than no copy button.
+    #[test]
+    fn copying_uses_the_size_the_cells_say_and_the_picture_that_came_in() {
+        let recorder = std::sync::Arc::new(RecordingCopy {
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        // Four by three BGRA, tightly packed: twelve pixels, forty eight bytes.
+        let bgra = vec![0x7fu8; 4 * 3 * 4];
+        let mut state = WindowState {
+            backdrop: false,
+            renderer: None,
+            fields: snapclip_ui::panel::FieldStates::IDLE,
+            controls: [std::ptr::null_mut(); snapclip_ui::panel::FieldId::ALL.len()],
+            preview: Some((bgra.clone(), 4, 3)),
+            fill_brush: std::ptr::null_mut(),
+            segment: snapclip_ui::panel::quality_segment_state(
+                &snapclip_ui::panel::DEMO,
+                &snapclip_ui::panel::DEMO.rects(1.0),
+                1.0,
+                0,
+            ),
+            segment_scale: 1.0,
+            footer_widths: [40, 52, 64],
+            path_change: 56,
+            format: 0,
+            format_open: false,
+            remembered: std::sync::Arc::new(std::sync::Mutex::new(Remembered::default())),
+            status: None,
+            var_open: false,
+            path_chips: [40, 52, 64],
+            copy: recorder.clone(),
+        };
+        state.controls.fill(std::ptr::null_mut());
+
+        // With no controls the size cells read as empty text, so the output size is the source's:
+        // the panel says "leave it as it came" and the copy follows that.
+        let outcome = copy_picture(std::ptr::null_mut(), &state);
+        let seen = recorder.seen.lock().expect("the recorder's lock").clone();
+        assert_eq!(
+            outcome,
+            Some(Ok(())),
+            "a panel with a picture and no resizing copies it"
+        );
+        assert_eq!(
+            seen,
+            vec![(4, 3, 48)],
+            "one copy, at the picture's own size, with every byte the panel holds"
+        );
+
+        // A panel with no picture has nothing to copy, and says so by answering `None` rather than
+        // by copying an empty image.
+        state.preview = None;
+        assert_eq!(copy_picture(std::ptr::null_mut(), &state), None);
+    }
+
+    /// The three shortcut chips are the shell's own folders, and a chip past the third is not a
+    /// chip: it answers `None` rather than a directory nobody asked for.
+    #[test]
+    fn a_shortcut_beyond_the_three_is_not_a_shortcut() {
+        assert_eq!(shortcut_directory(3), None);
+        assert_eq!(shortcut_directory(99), None);
+        for index in 0..3 {
+            if let Some(path) = shortcut_directory(index) {
+                assert!(
+                    path.contains(":\\") || path.starts_with("\\\\"),
+                    "shortcut {index} must be an absolute path, and this is {path:?}"
+                );
+                assert!(
+                    !path.ends_with('\\'),
+                    "shortcut {index} must not end with a separator, and this is {path:?}"
+                );
+            }
+        }
+    }
 }
+
