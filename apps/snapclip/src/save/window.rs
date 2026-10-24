@@ -2134,6 +2134,11 @@ extern "system" fn window_proc(
                                 size_presets: Some(s.size_presets),
                                 size_mode: s.size_mode,
                                 size_mode_widths: Some(s.size_mode_widths),
+        // The size limit's controls and the estimate are not wired to this window yet: the
+        // measurement and the drawing exist, and showing them here before the switch, the
+        // kilobytes and the shrink link answer a click would put three dead controls on the
+        // panel. docs/41 records what is left.
+        limit: None,
                                 status: s
                                     .status
                                     .as_ref()

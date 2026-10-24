@@ -235,7 +235,44 @@ pub fn save_panel(values: &PanelValues<'_>, frame: &Frame<'_>) -> Result<SaveOut
     super::service::commit_bytes(&request, &encoded)
 }
 
+/// The bytes a save would write, without writing them.
+///
+/// Every step is the one [`save_panel`] takes — the same resample, the same fill for JPEG, the
+/// same band encoder, the same transcoder — so the only difference is that the PNG master is
+/// built in memory instead of streamed to a file. That difference is a real one and is worth
+/// naming: a selection big enough to matter costs the whole PNG in memory here, which the save
+/// path deliberately avoids. It buys a number the panel can show before the user commits, and a
+/// test holds the two lengths equal so the two paths cannot drift apart quietly.
+pub fn weigh(values: &PanelValues<'_>, frame: &Frame<'_>) -> Result<u64, SaveError> {
+    let output = frame.output;
+    super::caps::check(
+        values.format,
+        u64::from(output.width),
+        u64::from(output.height),
+    )
+    .map_err(SaveError::Capability)?;
+    let scaled = super::scale::scaled(frame);
+    let scaled = if values.format == SaveFormat::Jpeg {
+        super::scale::over_fill(&scaled, values.fill)
+    } else {
+        scaled
+    };
+    let mut bands = WholeImage {
+        bgra: &scaled,
+        width: output.width,
+        height: output.height,
+    };
+    let master = bands::encode_png_bands(&mut bands, output.width)?;
+    let encoded = if values.format == SaveFormat::Png {
+        master
+    } else {
+        super::transcode::to_bytes(&master, values.format, values.quality)?
+    };
+    Ok(encoded.len() as u64)
+}
+
 /// The pixels the panel already holds, offered to the encoder a band at a time.
+
 ///
 /// The banded path exists for captures that never exist whole (`docs/35`); a selection does
 /// exist whole, so this source simply hands out the rows it was given. It is still a
@@ -472,6 +509,47 @@ mod tests {
         assert_eq!(&written[..2], &[0xFF, 0xD8], "the body is a JPEG, not a renamed PNG");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What the panel weighs before a save is the length of the file the save produces.
+    ///
+    /// The two paths differ — one builds the PNG master in memory, the other streams it to a
+    /// file — so this is the test that keeps the two equal, and it walks all three formats the
+    /// menu offers because the transcoded ones put a second encoder between the pixels and the
+    /// length.
+    #[test]
+    fn what_the_panel_weighs_is_what_the_save_writes() {
+        let size = Size::new(5, 4);
+        let mut bgra = Vec::new();
+        for y in 0..size.height {
+            for x in 0..size.width {
+                // Some variety, so that the encoders have a real decision to make rather than a
+                // flat field they can collapse.
+                bgra.extend_from_slice(&[(x as u8) * 30, (y as u8) * 40, 120, 200]);
+            }
+        }
+        let frame = Frame {
+            bgra: &bgra,
+            source: size,
+            output: size,
+        };
+        for format in [SaveFormat::Png, SaveFormat::Jpeg, SaveFormat::Webp] {
+            let dir = scratch(&format!("weigh-{format:?}"));
+            let mut v = values();
+            v.directory = dir.to_str().expect("a utf-8 temporary path");
+            v.format = format;
+            let weighed = weigh(&v, &frame).expect("a weighed save");
+            let outcome = save_panel(&v, &frame).expect("a real save");
+            assert_eq!(
+                weighed, outcome.bytes,
+                "{format:?}: the number the panel showed is the number the save reported"
+            );
+            let on_disk = std::fs::metadata(&outcome.path)
+                .expect("the saved file")
+                .len();
+            assert_eq!(on_disk, weighed, "{format:?}: and the file is that many bytes");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// The tiers are the numbers the decision recorded (`docs/42` D8), not numbers invented here.

@@ -450,6 +450,8 @@ pub struct Frame<'a> {
     pub size_mode: usize,
     /// The two mode buttons' widths, measured by the caller for the same reason as the shortcuts'.
     pub size_mode_widths: Option<[i32; 2]>,
+    /// The size limit and the estimate, or `None` when this painter shows neither.
+    pub limit: Option<LimitView<'a>>,
     /// The quality row's hint (`.hint-text`, ten dip, `:262`): the line that takes the segmented
     /// control's place when the format has no quality tier (`:638`, `:639`).
     pub hint: Option<&'a IDWriteTextFormat>,
@@ -711,29 +713,168 @@ impl Frame<'_> {
         // `:1097` shows it otherwise, because a lossless copy has nothing to adjust. The row then
         // carries the hint instead (`:638`, `:1096`). The predicate is shared with the click handler,
         // so the control cannot be changed by a click while it is not drawn.
-        if crate::panel::quality_segment_shown(self.format) {
-            let seg = crate::panel::quality_seg_rect(self.metrics, self.rects, self.scale);
-            let seg_radius = (crate::panel::QUALITY_SEG_RADIUS_DIP * self.scale).round() as i32;
-            painter.fill_round(seg, seg_radius, &self.brushes.field_fill);
-            if self.quality < crate::panel::QUALITY_OPTIONS {
-                let block = crate::panel::quality_option_rect(
+        // The size limit's switch (`:631`) sits at the right end of the quality row's label line,
+        // on or off: turning it on is the whole point of it, so it cannot hide while it is off.
+        // The track is `.switch-track` (`:297`), the knob its `::after` (`:298`, `:300`).
+        if let Some(limit) = self.limit {
+            if let Some(format) = self.row_label {
+                let switch = crate::panel::limit_switch_rect(
                     self.metrics,
                     self.rects,
                     self.scale,
-                    self.quality,
+                    limit.switch_word_px,
                 );
-                let block_radius =
-                    (crate::panel::QUALITY_SEG_INNER_RADIUS_DIP * self.scale).round() as i32;
-                painter.fill_round(block, block_radius, &self.brushes.accent);
+                let track = crate::panel::limit_track_rect(switch, self.scale);
+                let track_radius = track.height() / 2;
+                if limit.on {
+                    painter.fill_round(track, track_radius, &self.brushes.accent);
+                } else {
+                    painter.fill_round(track, track_radius, &self.brushes.field_fill);
+                    let edge = self.scale.max(1.0);
+                    painter.stroke_round(track, track_radius, &self.brushes.line, edge);
+                }
+                let knob = crate::panel::limit_knob_rect(track, self.scale, limit.on);
+                let centre = (
+                    (knob.left + knob.right) as f32 / 2.0,
+                    (knob.top + knob.bottom) as f32 / 2.0,
+                );
+                let knob_radius = knob.width() as f32 / 2.0;
+                let knob_brush = if limit.on {
+                    &self.brushes.text
+                } else {
+                    &self.brushes.muted
+                };
+                painter.fill_circle(centre, knob_radius, knob_brush);
+                let gap = (crate::panel::field::LIMIT_SWITCH_GAP_DIP as f32 * self.scale).round()
+                    as i32;
+                let word = Rect::new(track.right + gap, switch.top, switch.right, switch.bottom);
+                let word_brush = if limit.on {
+                    &self.brushes.text
+                } else {
+                    &self.brushes.muted
+                };
+                painter.draw_text(
+                    crate::panel::field::LIMIT_SWITCH_LABEL,
+                    format,
+                    word,
+                    word_brush,
+                );
             }
-        } else if let Some(format) = self.hint {
-            let rect = crate::panel::quality_hint_rect(self.metrics, self.rects, self.scale);
-            painter.draw_text(
-                crate::panel::field::QUALITY_HINT_TEXT,
-                format,
-                rect,
-                &self.brushes.hint,
-            );
+        }
+
+        // The line under the quality label carries one of three things and never two (`:232`): the
+        // limit group when the limit is on, the segment when the format has a quality, and the
+        // explanation when it does not. One function decides which, and the click handler asks it,
+        // so a line that is not drawn cannot be changed by a click.
+        match crate::panel::quality_line(self.format, self.limit.map_or(false, |limit| limit.on)) {
+            crate::panel::QualityLine::Limit => {
+                if let Some(format) = self.row_label {
+                    painter.draw_text(
+                        crate::panel::field::LIMIT_LABEL,
+                        format,
+                        crate::panel::limit_label_rect(self.metrics, self.rects, self.scale),
+                        &self.brushes.muted,
+                    );
+                }
+                if let Some(format) = self.number.or(self.chip) {
+                    painter.draw_text(
+                        crate::panel::field::LIMIT_UNIT,
+                        format,
+                        crate::panel::limit_unit_rect(self.metrics, self.rects, self.scale),
+                        &self.brushes.muted,
+                    );
+                }
+            }
+            crate::panel::QualityLine::Segment => {
+                let seg = crate::panel::quality_seg_rect(self.metrics, self.rects, self.scale);
+                let seg_radius = (crate::panel::QUALITY_SEG_RADIUS_DIP * self.scale).round() as i32;
+                painter.fill_round(seg, seg_radius, &self.brushes.field_fill);
+                if self.quality < crate::panel::QUALITY_OPTIONS {
+                    let block = crate::panel::quality_option_rect(
+                        self.metrics,
+                        self.rects,
+                        self.scale,
+                        self.quality,
+                    );
+                    let block_radius =
+                        (crate::panel::QUALITY_SEG_INNER_RADIUS_DIP * self.scale).round() as i32;
+                    painter.fill_round(block, block_radius, &self.brushes.accent);
+                }
+            }
+            crate::panel::QualityLine::Hint => {
+                if let Some(format) = self.hint {
+                    let rect = crate::panel::quality_hint_rect(self.metrics, self.rects, self.scale);
+                    painter.draw_text(
+                        crate::panel::field::QUALITY_HINT_TEXT,
+                        format,
+                        rect,
+                        &self.brushes.hint,
+                    );
+                }
+            }
+        }
+
+        // What the limit was able to do (`:234`), under the quality line, and the escape hatch when
+        // it could not (`:235`). The note's space is reserved in the layout whether or not there is
+        // a note, so a limit that starts being exceeded does not move the rows under it.
+        if let Some(limit) = self.limit {
+            if let Some(note) = limit.note {
+                if let Some(format) = self.hint {
+                    let rect = crate::panel::limit_note_rect(self.metrics, self.rects, self.scale);
+                    let brush = if limit.note_warn {
+                        &self.brushes.warning_text
+                    } else {
+                        &self.brushes.muted
+                    };
+                    painter.draw_text(note, format, rect, brush);
+                }
+            }
+            if limit.auto_shrink_px > 0 {
+                if let Some(format) = self.hint {
+                    let rect = crate::panel::auto_shrink_rect(
+                        self.metrics,
+                        self.rects,
+                        self.scale,
+                        limit.auto_shrink_px,
+                    );
+                    painter.draw_text(
+                        crate::panel::field::AUTO_SHRINK_LABEL,
+                        format,
+                        rect,
+                        &self.brushes.accent_text,
+                    );
+                }
+            }
+            // The estimate row (`:666`): the number under its label, the state beside it.
+            let fill_row = crate::panel::fill_row_shown(self.format);
+            if let Some(estimate) = limit.estimate {
+                if let Some(format) = self.number.or(self.chip) {
+                    let rect = crate::panel::estimate_value_rect(
+                        self.metrics,
+                        self.rects,
+                        self.scale,
+                        fill_row,
+                    );
+                    painter.draw_text(estimate, format, rect, &self.brushes.text);
+                }
+            }
+            if let Some(state) = limit.encode_state {
+                if let Some(format) = self.hint {
+                    let rect = crate::panel::encode_state_rect(
+                        self.metrics,
+                        self.rects,
+                        self.scale,
+                        limit.encode_state_px,
+                        fill_row,
+                    );
+                    let brush = if limit.encode_done {
+                        &self.brushes.accent_text
+                    } else {
+                        &self.brushes.muted
+                    };
+                    painter.draw_text(state, format, rect, brush);
+                }
+            }
         }
 
         // The transparent fill row (`:655`), which `:1102` shows for JPG and for nothing else: PNG
@@ -1687,6 +1828,37 @@ fn properties(dpi: f32) -> D2D1_RENDER_TARGET_PROPERTIES {
 /// and `format` are indices into two different lists, and `fill_surface` and `format_open` are both
 /// booleans. Passed positionally a swap compiles and draws the wrong thing without a word, and this
 /// panel has already lost time to two such swaps. Named fields make the swap unrepresentable.
+/// The size limit and the estimate, as the row shows them (`:230`-`:237`, `:240`-`:244`).
+///
+/// One struct rather than nine parameters, because most of these are strings whose meaning is only
+/// clear from their name and three of them are widths that are pixel counts of the same type.
+#[derive(Clone, Copy)]
+pub struct LimitView<'a> {
+    /// Whether the limit switch is on, which decides whether the quality line shows the group or
+    /// the segment (`:232`).
+    pub on: bool,
+    /// The measured width of `限制体积` beside the switch's track: a measurement, handed over so the
+    /// clickable switch is the drawn one.
+    pub switch_word_px: i32,
+
+    /// The line under the quality line: whether the limit was met (`:234`). `None` leaves the
+    /// reserved space empty.
+    pub note: Option<&'a str>,
+    /// Whether the note is a warning, which is the orange case (`:313`).
+    pub note_warn: bool,
+    /// The measured width of `自动缩小尺寸`, or zero when the link is not offered (`:235`).
+    pub auto_shrink_px: i32,
+    /// The estimate row's number, already formatted (`227.31 KB`, `:242`).
+    pub estimate: Option<&'a str>,
+    /// `编码中` while a measurement runs, `✓ 实测` once one landed (`:243`).
+    pub encode_state: Option<&'a str>,
+    /// Whether the encode state is the finished one, which is the accent-coloured case (`:350`).
+    pub encode_done: bool,
+    /// The measured width of the encode state's word, which is right aligned on the estimate row's
+    /// label line.
+    pub encode_state_px: i32,
+}
+
 pub struct PaintInput<'a> {
     /// The window's real DPI. Sizes the text and drives the layout scale; the target itself is
     /// built at 96 so that `rects(scale)` is not applied twice.
@@ -1728,6 +1900,8 @@ pub struct PaintInput<'a> {
     pub size_mode: usize,
     /// The two mode buttons' widths, measured by the window for the same reason as the footer's.
     pub size_mode_widths: Option<[i32; 2]>,
+    /// The size limit and the estimate, or `None` when this painter shows neither.
+    pub limit: Option<LimitView<'a>>,
 }
 
 impl<'a> PaintInput<'a> {
@@ -1750,6 +1924,7 @@ impl<'a> PaintInput<'a> {
             size_presets: None,
             size_mode: crate::panel::SIZE_MODE_CHOSEN,
             size_mode_widths: None,
+            limit: None,
         }
     }
 }
@@ -1841,6 +2016,7 @@ pub fn paint_to_dc_with_preview(
         path_chips: input.path_chips,
         size_presets: input.size_presets,
         size_mode: input.size_mode,
+        limit: input.limit,
         size_mode_widths: input.size_mode_widths,
         hint: Some(&hint),
         preset_label: Some(&preset_label),
@@ -1855,6 +2031,57 @@ pub fn paint_to_dc_with_preview(
 
 #[cfg(test)]
 mod tests {
+
+    /// The limit's controls are the design's own rectangles, written as absolute numbers.
+    ///
+    /// Every rectangle in `field.rs` derives from the same constants, so a test that compared two
+    /// of them would agree with a wrong constant as readily as with a right one. These are the
+    /// design's figures (`:293`, `:297`, `:298`, `:300`, `:307`, `:310`, `:311`) scaled by one.
+    #[test]
+    fn the_limit_controls_are_the_designs_own_numbers() {
+        let rects = DEMO.rects(1.0);
+        let switch = crate::panel::limit_switch_rect(&DEMO, &rects, 1.0, 44);
+        assert_eq!((switch.width(), switch.height()), (74, 14), "24 + 6 + 44 wide, 14 tall");
+        assert_eq!(switch.right, rects.form.right, "the switch ends at the column's edge");
+        let track = crate::panel::limit_track_rect(switch, 1.0);
+        assert_eq!((track.width(), track.height()), (24, 14), ".switch-track (:297)");
+        let off = crate::panel::limit_knob_rect(track, 1.0, false);
+        assert_eq!((off.left - track.left, off.width()), (3, 8), "inset 3, knob 8 (:298)");
+        let on = crate::panel::limit_knob_rect(track, 1.0, true);
+        assert_eq!(on.right, track.right - 3, "the knob ends 3 in when on (:300)");
+
+        let line = crate::panel::field_rect(&DEMO, &rects, 1.0, crate::panel::Row::Quality);
+        let label = crate::panel::limit_label_rect(&DEMO, &rects, 1.0);
+        assert_eq!((label.left, label.width()), (line.left, 34), "the reserved word (:646)");
+        let input = crate::panel::limit_input_rect(&DEMO, &rects, 1.0);
+        assert_eq!(input.left, line.left + 34 + 6, "word, then the group's gap (:307)");
+        assert_eq!((input.width(), input.height()), (64, 28), ".limit-input (:310)");
+        assert_eq!((input.top, input.bottom), (line.top, line.bottom), "it fills the line");
+        let unit = crate::panel::limit_unit_rect(&DEMO, &rects, 1.0);
+        assert_eq!(unit.left, input.right + 6, "the unit after the input (:307)");
+
+        let note = crate::panel::limit_note_rect(&DEMO, &rects, 1.0);
+        assert_eq!((note.top, note.height()), (line.bottom + 8, 16), ".limit-note (:311)");
+        // The note's space is reserved, so the estimate moves down even with nothing to say.
+        assert_eq!(crate::panel::quality_extra_height(1.0, false), 24, "8 + 16");
+        let estimate = crate::panel::estimate_label_rect(&DEMO, &rects, 1.0, false);
+        assert_eq!(
+            estimate.top,
+            crate::panel::label_rect(&DEMO, &rects, 1.0, crate::panel::Row::Estimate).top + 24
+        );
+        let fill = crate::panel::fill_row_rect(&DEMO, &rects, 1.0);
+        assert_eq!(fill.top, note.bottom + 6, "the fill row sits under the note");
+    }
+
+    /// The quality line shows exactly one of its three things, and the limit wins.
+    #[test]
+    fn the_quality_line_shows_one_thing_at_a_time() {
+        use crate::panel::QualityLine;
+        assert_eq!(crate::panel::quality_line(1, false), QualityLine::Segment);
+        assert_eq!(crate::panel::quality_line(0, false), QualityLine::Hint);
+        assert_eq!(crate::panel::quality_line(0, true), QualityLine::Limit);
+        assert_eq!(crate::panel::quality_line(1, true), QualityLine::Limit);
+    }
     impl Canvas {
         /// Paint with a chosen format and, optionally, its menu open.
         ///
@@ -2673,8 +2900,29 @@ mod tests {
         let px = canvas.pixels();
         let rects = DEMO.rects(1.0);
         for row in crate::panel::FORM_ROWS {
-            let label = crate::panel::label_rect(&DEMO, &rects, 1.0, row);
-            let field = crate::panel::field_rect(&DEMO, &rects, 1.0, row);
+            // The estimate row moves down by the space the quality row's optional lines take, so
+            // its label is asked for the way the painter asks: through the one function that knows
+            // about that shift.
+            let label = if row == crate::panel::Row::Estimate {
+                crate::panel::estimate_label_rect(
+                    &DEMO,
+                    &rects,
+                    1.0,
+                    crate::panel::fill_row_shown(0),
+                )
+            } else {
+                crate::panel::label_rect(&DEMO, &rects, 1.0, row)
+            };
+            let field = if row == crate::panel::Row::Estimate {
+                crate::panel::estimate_value_rect(
+                    &DEMO,
+                    &rects,
+                    1.0,
+                    crate::panel::fill_row_shown(0),
+                )
+            } else {
+                crate::panel::field_rect(&DEMO, &rects, 1.0, row)
+            };
             let has_content = row != crate::panel::Row::Saved;
             assert_eq!(
                 field.bottom > field.top,

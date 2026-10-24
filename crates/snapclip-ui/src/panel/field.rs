@@ -102,16 +102,21 @@ pub enum FieldId {
     Name,
     SizeWidth,
     SizeHeight,
+    /// The kilobytes the size limit asks for. Only reachable while the limit switch is on, but a
+    /// field all the same: it is a number the user types, so it is a native control with a frame
+    /// like every other one, and the table below carries it whether or not it is on screen.
+    Limit,
 }
 
 impl FieldId {
     /// Every field, in the order they were created. A new field is added here and to the control
     /// table, and both the drawing loop and the message handlers pick it up without a new branch.
-    pub const ALL: [FieldId; 4] = [
+    pub const ALL: [FieldId; 5] = [
         FieldId::Path,
         FieldId::Name,
         FieldId::SizeWidth,
         FieldId::SizeHeight,
+        FieldId::Limit,
     ];
 
     /// Where the child window goes. One formula per row and one per cell, so the control and the
@@ -137,6 +142,9 @@ impl FieldId {
             FieldId::Name => name_text_rect(metrics, rects, scale),
             FieldId::SizeWidth => size_cell_input_rect(metrics, rects, scale, SizeCell::Width),
             FieldId::SizeHeight => size_cell_input_rect(metrics, rects, scale, SizeCell::Height),
+            // The limit input is `.limit-input`: a box of its own inside the limit group (`:310`),
+            // so its control is the same rectangle its frame is drawn in.
+            FieldId::Limit => limit_input_rect(metrics, rects, scale),
         }
     }
 
@@ -153,7 +161,9 @@ impl FieldId {
         match self {
             FieldId::SizeWidth => size_cell_rect(metrics, rects, scale, SizeCell::Width),
             FieldId::SizeHeight => size_cell_rect(metrics, rects, scale, SizeCell::Height),
-            FieldId::Path | FieldId::Name => self.rect(metrics, rects, scale, path_change),
+            FieldId::Path | FieldId::Name | FieldId::Limit => {
+                self.rect(metrics, rects, scale, path_change)
+            }
         }
     }
 
@@ -165,7 +175,7 @@ impl FieldId {
     /// else in the form.
     pub fn face(self) -> FieldFace {
         match self {
-            FieldId::SizeWidth | FieldId::SizeHeight => FieldFace::Number,
+            FieldId::SizeWidth | FieldId::SizeHeight | FieldId::Limit => FieldFace::Number,
             FieldId::Path | FieldId::Name => FieldFace::Text,
         }
     }
@@ -248,6 +258,7 @@ pub struct FieldStates {
     name: FieldState,
     size_width: FieldState,
     size_height: FieldState,
+    limit: FieldState,
 }
 
 impl FieldStates {
@@ -257,6 +268,7 @@ impl FieldStates {
         name: FieldState::Idle,
         size_width: FieldState::Idle,
         size_height: FieldState::Idle,
+        limit: FieldState::Idle,
     };
 
     /// The state of one field.
@@ -266,6 +278,7 @@ impl FieldStates {
             FieldId::Name => self.name,
             FieldId::SizeWidth => self.size_width,
             FieldId::SizeHeight => self.size_height,
+            FieldId::Limit => self.limit,
         }
     }
 
@@ -276,6 +289,7 @@ impl FieldStates {
             FieldId::Name => self.name = state,
             FieldId::SizeWidth => self.size_width = state,
             FieldId::SizeHeight => self.size_height = state,
+            FieldId::Limit => self.limit = state,
         }
     }
 
@@ -662,6 +676,10 @@ impl Row {
                     + AFTER_CHIP_HEIGHT_DIP
             }
             Row::Name => metrics.field_height,
+            // The quality row's own line is `--row` tall (`:637`); the limit's note and the fill row
+            // are laid out under it and the estimate row is moved down by their height instead
+            // (`estimate_label_rect`), because those two lines come and go with the limit switch and
+            // the format and folding them in here would make every row's position depend on state.
             Row::Quality | Row::Estimate => ROW_DIP,
             Row::Saved => 0,
         }
@@ -1582,13 +1600,214 @@ pub fn fill_swatch_selected(fill: [u8; 3]) -> usize {
     }
 }
 
-/// The row's box: inside the quality row, under `.quality-line` (`:637`, `:655`).
+/// The row's box: inside the quality row, under the limit's note (`:637`, `:651`, `:655`).
 pub fn fill_row_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -> Rect {
     let px = |dip: i32| (dip as f32 * scale).round() as i32;
-    let line = field_rect(metrics, rects, scale, Row::Quality);
-    let top = line.bottom + px(FILL_ROW_GAP_DIP);
-    Rect::new(line.left, top, line.right, top + px(FILL_ROW_HEIGHT_DIP))
+    let note = limit_note_rect(metrics, rects, scale);
+    let top = note.bottom + px(FILL_ROW_GAP_DIP);
+    Rect::new(note.left, top, note.right, top + px(FILL_ROW_HEIGHT_DIP))
 }
+
+// ---------------------------------------------------------------------------------------------
+// The size limit (`:230`-`:237`)
+// ---------------------------------------------------------------------------------------------
+
+/// `.switch-track { width: 24px; height: 14px }` (`:297`).
+pub const LIMIT_TRACK_W_DIP: i32 = 24;
+pub const LIMIT_TRACK_H_DIP: i32 = 14;
+
+/// `.switch { gap: 6px }` (`:293`): from the track to the word beside it.
+pub const LIMIT_SWITCH_GAP_DIP: i32 = 6;
+
+/// `.switch-track::after { top: 3px; left: 3px; width: 8px; height: 8px }` (`:298`).
+pub const LIMIT_KNOB_DIP: i32 = 8;
+pub const LIMIT_KNOB_INSET_DIP: i32 = 3;
+
+/// `.switch input:checked ~ .switch-track::after { transform: translateX(10px) }` (`:300`), which
+/// is the track's width less the knob's box: 24 - 3 - 3 - 8.
+pub const LIMIT_KNOB_TRAVEL_DIP: i32 = 10;
+
+/// `.switch-text` is `--fs-row` (`:295`), the row label's eleven dip.
+pub const LIMIT_SWITCH_LABEL: &str = "限制体积";
+
+/// `.limit-group { gap: 6px }` (`:307`).
+pub const LIMIT_GROUP_GAP_DIP: i32 = 6;
+
+/// `.limit-input { width: 64px; height: 28px }` (`:310`). The height is `--row`, which is the whole
+/// quality line, so the input fills it.
+pub const LIMIT_INPUT_W_DIP: i32 = 64;
+pub const LIMIT_INPUT_H_DIP: i32 = 28;
+
+/// `.limit-label` is `--fs-row` (`:309`) and says `不超过` (`:646`).
+pub const LIMIT_LABEL: &str = "不超过";
+
+/// The width the `不超过` label is given before the input.
+///
+/// **Reserved, not measured.** Three characters at eleven dip come to about thirty three, and the
+/// painter's text has no way to hand back a width from inside this module. It is recorded rather
+/// than hidden: the same compromise as the size row's `px` unit, and for the same reason.
+pub const LIMIT_LABEL_RESERVED_DIP: i32 = 34;
+
+/// `.dim-unit` after the limit input, which is the same unit the size row draws.
+pub const LIMIT_UNIT: &str = "KB";
+
+/// `.limit-note { min-height: 16px; gap: 8px }` (`:311`).
+pub const LIMIT_NOTE_H_DIP: i32 = 16;
+pub const LIMIT_NOTE_GAP_DIP: i32 = 8;
+
+/// The link that appears when even the lowest quality tier is over the limit (`:235`, `:653`).
+pub const AUTO_SHRINK_LABEL: &str = "自动缩小尺寸";
+
+/// What the quality row's line shows.
+///
+/// The three share one line (`:232`: "打开后，质量档的位置换成 `不超过 [ 500 ] KB`"), so exactly one
+/// of them is on screen at a time. The limit wins over the other two, because it is the only one
+/// the user asked for; the segment gives way to the hint when the format has no quality to set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QualityLine {
+    Limit,
+    Segment,
+    Hint,
+}
+
+/// Which of the three the quality line shows. One function, asked by the painter and by the hit
+/// test, so a line that is not drawn cannot answer a click.
+pub fn quality_line(format: usize, limit_on: bool) -> QualityLine {
+    if limit_on {
+        return QualityLine::Limit;
+    }
+    if crate::panel::quality_segment_shown(format) {
+        QualityLine::Segment
+    } else {
+        QualityLine::Hint
+    }
+}
+
+/// The switch, right-aligned on the quality row's label line: `.switch` sits in `.row-header`
+/// after the label (`:630`), and the header is the row label's own box (`:165`).
+///
+/// The word's width is a parameter because it is a measurement; the track's is the design's.
+pub fn limit_switch_rect(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    word_width_px: i32,
+) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let band = label_rect(metrics, rects, scale, Row::Quality);
+    let track_w = px(LIMIT_TRACK_W_DIP);
+    let track_h = px(LIMIT_TRACK_H_DIP);
+    let width = track_w + px(LIMIT_SWITCH_GAP_DIP) + word_width_px;
+    let right = rects.form.right;
+    let left = right - width;
+    let top = band.top + (band.bottom - band.top - track_h) / 2;
+    Rect::new(left, top, right, top + track_h)
+}
+
+/// The track alone: the leftmost part of the switch, because `.switch` puts the track first and
+/// the word after it (`:633`/`:634`).
+pub fn limit_track_rect(switch: Rect, scale: f32) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    Rect::new(
+        switch.left,
+        switch.top,
+        switch.left + px(LIMIT_TRACK_W_DIP),
+        switch.bottom,
+    )
+}
+
+/// The knob inside the track, moved to the right end when the switch is on (`:298`, `:300`).
+pub fn limit_knob_rect(track: Rect, scale: f32, on: bool) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let inset = px(LIMIT_KNOB_INSET_DIP);
+    let size = px(LIMIT_KNOB_DIP);
+    let travel = if on { px(LIMIT_KNOB_TRAVEL_DIP) } else { 0 };
+    let left = track.left + inset + travel;
+    let top = track.top + (track.height() - size) / 2;
+    Rect::new(left, top, left + size, top + size)
+}
+
+/// The `不超过` word, on the quality line where the segment would be.
+pub fn limit_label_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -> Rect {
+    let line = field_rect(metrics, rects, scale, Row::Quality);
+    Rect::new(line.left, line.top, line.left + limit_label_width(scale), line.bottom)
+}
+
+/// The reserved label width, in pixels at this scale.
+pub fn limit_label_width(scale: f32) -> i32 {
+    (LIMIT_LABEL_RESERVED_DIP as f32 * scale).round() as i32
+}
+
+/// The input box, after the label. `.limit-input` is sixty four by twenty eight (`:310`), which is
+/// exactly the line's height, so it sits on the line rather than inside it.
+pub fn limit_input_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let line = field_rect(metrics, rects, scale, Row::Quality);
+    let left = line.left + limit_label_width(scale) + px(LIMIT_GROUP_GAP_DIP);
+    let width = px(LIMIT_INPUT_W_DIP);
+    let height = px(LIMIT_INPUT_H_DIP).min(line.bottom - line.top);
+    Rect::new(left, line.top, left + width, line.top + height)
+}
+
+/// The `KB` after the input.
+pub fn limit_unit_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let input = limit_input_rect(metrics, rects, scale);
+    let left = input.right + px(LIMIT_GROUP_GAP_DIP);
+    Rect::new(left, input.top, left + px(SIZE_UNIT_DIP), input.bottom)
+}
+
+/// The line under the quality line that says whether the limit was met (`:651`).
+///
+/// `.limit-note` is sixteen tall and only displayed when it has something to say (`:311`/`:312`),
+/// but the space is reserved whether or not it is used, because a row that grows and shrinks would
+/// move every row under it while the user is typing. That is a deviation from the mockup and is
+/// recorded as one.
+pub fn limit_note_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let line = field_rect(metrics, rects, scale, Row::Quality);
+    let head = line.bottom + px(LIMIT_NOTE_GAP_DIP);
+    let left = line.left;
+    Rect::new(left, head, line.right, head + px(LIMIT_NOTE_H_DIP))
+}
+
+/// The `自动缩小尺寸` link, at the note's right end (`:651` aligns the two ends apart).
+pub fn auto_shrink_rect(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    word_width_px: i32,
+) -> Rect {
+    let note = limit_note_rect(metrics, rects, scale);
+    Rect::new(note.right - word_width_px, note.top, note.right, note.bottom)
+}
+
+/// Where the estimate row's number goes: the row's content band, which `.est-size` fills
+/// (`:668`, `--row` tall), moved down by whatever the quality row's optional lines took.
+pub fn estimate_value_rect(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    fill_row: bool,
+) -> Rect {
+    let rect = field_rect(metrics, rects, scale, Row::Estimate);
+    let shift = quality_extra_height(scale, fill_row);
+    Rect::new(rect.left, rect.top + shift, rect.right, rect.bottom + shift)
+}
+
+/// Where `编码中` / `✓ 实测` goes: the right end of the estimate row's label line (`:667`), on the
+/// same shifted position as that row's own label.
+pub fn encode_state_rect(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    word_width_px: i32,
+    fill_row: bool,
+) -> Rect {
+    let band = estimate_label_rect(metrics, rects, scale, fill_row);
+    Rect::new(band.right - word_width_px, band.top, band.right, band.bottom)
+}
+
 
 /// One swatch. `.fill-row { justify-content: space-between }` (`:315`) puts the group against the
 /// column's right edge, and `.bg-switch { gap: 8px }` (`:149`) spaces the swatches apart; the row is
@@ -1621,8 +1840,24 @@ pub fn fill_swatch_at(
         .find(|&index| rect_contains(fill_swatch_rect(metrics, rects, scale, index), point))
 }
 
+/// How far the rows below the quality row move: the limit's note, which is always reserved, and
+/// the fill row, which only JPEG shows.
+///
+/// The note's space is reserved even when the note is empty, because the note is where the limit's
+/// verdict goes and a row that grows the moment a limit starts being exceeded would move the numbers
+/// the user is reading. The fill row keeps its older rule and appears only for JPEG (`:1102`).
+pub fn quality_extra_height(scale: f32, fill_row: bool) -> i32 {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let note = px(LIMIT_NOTE_GAP_DIP + LIMIT_NOTE_H_DIP);
+    if fill_row {
+        note + px(FILL_ROW_GAP_DIP + FILL_ROW_HEIGHT_DIP)
+    } else {
+        note
+    }
+}
+
 /// How far the rows below the quality row move when the fill row appears: the gap above it and its
-/// own height.
+/// own height. Kept beside [`quality_extra_height`], which is what most callers want.
 pub fn fill_row_added_height(scale: f32) -> i32 {
     let px = |dip: i32| (dip as f32 * scale).round() as i32;
     px(FILL_ROW_GAP_DIP + FILL_ROW_HEIGHT_DIP)
@@ -1631,10 +1866,11 @@ pub fn fill_row_added_height(scale: f32) -> i32 {
 /// The estimate row's label.
 ///
 /// The estimate is the only row below the quality row, so it is the only one that moves when the
-/// fill row appears — and `:1102` shows that row per format, which makes the estimate's position a
-/// function of the chosen format. It is a function of its own rather than a flag folded into
-/// [`label_rect`], because every other row's position is format-independent and threading the flag
-/// through all of them would make sixteen call sites ask a question only this one has.
+/// quality row's optional lines change — the limit's note always takes its space, and `:1102` shows
+/// the fill row per format, which makes the estimate's position a function of the chosen format. It
+/// is a function of its own rather than a flag folded into [`label_rect`], because every other row's
+/// position is format-independent and threading the flag through all of them would make sixteen
+/// call sites ask a question only this one has.
 pub fn estimate_label_rect(
     metrics: &FrameMetrics,
     rects: &FrameRects,
@@ -1642,10 +1878,7 @@ pub fn estimate_label_rect(
     fill_row: bool,
 ) -> Rect {
     let rect = label_rect(metrics, rects, scale, Row::Estimate);
-    if !fill_row {
-        return rect;
-    }
-    let shift = fill_row_added_height(scale);
+    let shift = quality_extra_height(scale, fill_row);
     Rect::new(rect.left, rect.top + shift, rect.right, rect.bottom + shift)
 }
 
@@ -1654,8 +1887,8 @@ pub fn estimate_label_rect(
 /// here fails rather than silently changing the tab order.
 ///
 /// Deliberately a literal rather than `FieldId::ALL.len()`: deriving it would make the guard a
-/// tautology, and the point of the number is that a fifth field has to be declared on purpose.
-pub const FORM_FIELD_TAB_STOPS: usize = 4;
+/// tautology, and the point of the number is that a sixth field has to be declared on purpose.
+pub const FORM_FIELD_TAB_STOPS: usize = 5;
 
 // -------------------------------------------------------------------------------------------------
 // The footer: `:274`-`:288` and `:674`-`:687`
@@ -2335,6 +2568,7 @@ mod click_tests;
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     const SURFACE: [u8; 4] = [23, 23, 28, 235];
@@ -2505,7 +2739,7 @@ mod tests {
     #[test]
     fn the_form_declares_one_tab_stop_per_field() {
         assert_eq!(
-            FORM_FIELD_TAB_STOPS, 4,
+            FORM_FIELD_TAB_STOPS, 5,
             "the path, the name and the two size cells are focusable, and a fifth added without declaring it here fails"
         );
         assert_eq!(

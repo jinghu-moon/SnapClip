@@ -15,6 +15,9 @@ pub mod copy;
 // "where is the desktop", so it lives beside the panel that shows it rather than in the UI crate,
 // which must not ask Windows anything a drawing cannot explain.
 pub mod dirs;
+// What a save would weigh and how to make it fit. The policy lives here; the measurement itself
+// is `assemble::weigh`, because only that module knows how a save builds its bytes.
+pub mod estimate;
 pub mod scale;
 pub mod service;
 pub mod template;

@@ -1280,3 +1280,17 @@ check --workspace --all-targets  Finished ✓  死代码 0 ✓
 
 - **A37** ✗：色块与取色器的**点击消息处理没有被测试** ✓ —— 规则（`fill_row_shown` / `fill_swatch_at` / `fill_swatch_selected`）与绘制都有断言 ✓，但"点击真的到达 `choose_fill`"要真窗口 ✓。
 - 填充行**没有**把限制体积、`不超过…KB`、`自动缩小尺寸`（`:645`–`:653`）一起做 ✓ —— 那属于 A30 ✓。
+
+## B 步（体积上限 · 预估体积 · 自动缩小）—— 做了一半，接线未做
+
+**已完成并验证：**
+
+- `save/estimate.rs` —— `format_bytes`（`227.31 KB` 二进制单位、两位小数）、`shrink_step`（面积平方根 × 0.97 余量，宁可多一步也不越限）、`fit_under`（**每次都用真实编码**，首试原尺寸）、`best_tier`（从最高档往下试，全不满足回报最低档的字节数）、`preset_of`。9 条纯逻辑测试。
+- `assemble::weigh` —— 与 `save_panel` **同一条编码链**（同 resample、同 JPG 填充、同 band 编码器、同转码器），只是母版落在内存里。`what_the_panel_weighs_is_what_the_save_writes` 用 PNG/JPG/WebP 三种格式断言"面板说的字节数 = 真写出来的文件长度"——这是这一批唯一的硬证据。
+- UI —— `FieldId::Limit`（第五个字段，`FORM_FIELD_TAB_STOPS` 4 → 5）、`limit_switch_rect`/`limit_track_rect`/`limit_knob_rect`、`limit_label_rect`/`limit_input_rect`/`limit_unit_rect`、`limit_note_rect`/`auto_shrink_rect`、`estimate_value_rect`/`encode_state_rect`、`quality_line`（三选一的唯一判定）、`quality_extra_height`；`frame.rs` 画开关（轨道 + 旋钮 + 词）、限制组（`不超过 [64×28] KB`）、说明行、`自动缩小尺寸`、预估值、`编码中 / ✓ 实测`。两条几何测试用**绝对数字**钉住（`:293`/`:297`/`:298`/`:300`/`:307`/`:310`/`:311`）。
+
+**一起修掉的旧缺陷：** `Row::Quality` 的内容高只算了 28，而填充行画在它下面 28 ⇒ 会压到估算行。现在改成"说明行的空间**恒定预留** 24（8 + 16）、填充行接在说明行下面"，估算行由 `quality_extra_height` 位移。**偏离 demo**：demo 的说明行与填充行是按需显示（会跳动），我们恒定预留（不跳）。
+
+**没做（下一批，接线）：** `PaintInput.limit` 目前传 `None` ⇒ 开关/限制组/说明/预估**都还没出现在窗口上**。差的正是"接上"这一半：`WindowState` 的限制状态、`FieldId::Limit` 的原生 `EDIT`（含开关时的显隐）、开关与 `自动缩小尺寸` 的点击、`LimitView` 的宽度测量、以及"预估在打开面板/换格式/换质量时实测一次"（**尺寸编辑不刷新**，见 A38）。
+
+**新缺口：** **A38** 预估值在尺寸编辑时不刷新（需要防抖后台实测；同步实测会卡在每次按键上）；**A39** `limit` 开关的**状态持久化**（规格 `:232` 说"开关状态持久"，`Remembered` 还没有它）；**A40** `自动缩小尺寸` 之后的"宽高滚动并闪烁"（`:235`）没有动效。
