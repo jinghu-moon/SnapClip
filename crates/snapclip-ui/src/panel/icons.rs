@@ -7,7 +7,7 @@
 pub const ICON_BAKED_PX: u32 = 96;
 
 /// How many glyphs are available to panel components.
-pub const ICON_COUNT: usize = 9;
+pub const ICON_COUNT: usize = 12;
 
 /// A panel glyph baked from `assets/icon/*.svg`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +31,13 @@ pub enum Glyph {
     Refresh = 7,
     /// Two stacked sheets, for the footer's copy-to-clipboard button.
     Copy = 8,
+    /// A folder, for the path row's shortcut chips (`.path-chips`, `:548`).
+    Folder = 9,
+    /// An open folder, for the path row's "show it in Explorer" button (`.btn-ghost.icon-only`,
+    /// `:546`).
+    FolderOpen = 10,
+    /// Braces with a dot, for the name row's insert-a-variable button (`.name-var`, `:557`).
+    Braces = 11,
 }
 
 impl Glyph {
@@ -44,6 +51,9 @@ impl Glyph {
         Self::Link,
         Self::Refresh,
         Self::Copy,
+        Self::Folder,
+        Self::FolderOpen,
+        Self::Braces,
     ];
 
     pub const fn index(self) -> usize {
@@ -61,6 +71,9 @@ impl Glyph {
             Self::Link => "link",
             Self::Refresh => "refresh",
             Self::Copy => "copy",
+            Self::Folder => "folder",
+            Self::FolderOpen => "folder-open",
+            Self::Braces => "braces",
         }
     }
 
@@ -76,6 +89,9 @@ impl Glyph {
             Self::Link => include_bytes!("../../../../assets/icon/link.png"),
             Self::Refresh => include_bytes!("../../../../assets/icon/refresh.png"),
             Self::Copy => include_bytes!("../../../../assets/icon/copy.png"),
+            Self::Folder => include_bytes!("../../../../assets/icon/folder.png"),
+            Self::FolderOpen => include_bytes!("../../../../assets/icon/folder-open.png"),
+            Self::Braces => include_bytes!("../../../../assets/icon/braces.png"),
         }
     }
 
@@ -96,6 +112,9 @@ impl Glyph {
             Self::Link => include_bytes!("../../../../assets/icon/link.rgba"),
             Self::Refresh => include_bytes!("../../../../assets/icon/refresh.rgba"),
             Self::Copy => include_bytes!("../../../../assets/icon/copy.rgba"),
+            Self::Folder => include_bytes!("../../../../assets/icon/folder.rgba"),
+            Self::FolderOpen => include_bytes!("../../../../assets/icon/folder-open.rgba"),
+            Self::Braces => include_bytes!("../../../../assets/icon/braces.rgba"),
         }
     }
 }

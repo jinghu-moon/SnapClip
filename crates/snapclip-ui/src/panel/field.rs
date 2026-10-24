@@ -562,6 +562,66 @@ pub fn field_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32, row: R
     }
 }
 
+/// The after-save switches, which sit on the row's own label line because that row is a header on
+/// its own (`.form-row` holding only a `.row-header`, `:569`–`:577`).
+///
+/// `.after-row { justify-content: flex-start; gap: 12px }` (`:302`) puts them a fixed distance after
+/// the label, and `.after-toggles { gap: 8px }` (`:303`) spaces them from each other. Both start off
+/// (`aria-checked="false"`, `:573`/`:574`), so the resting chip — `.chip { height: 24px;
+/// padding: 0 10px; border-radius: 999px }` (`:192`), an edge and `--muted` text — is what the panel
+/// paints.
+pub const AFTER_CHIP_HEIGHT_DIP: i32 = 24;
+
+/// `.chip { padding: 0 10px }` (`:192`): ten dip on each side of the word.
+pub const AFTER_CHIP_PAD_DIP: i32 = 10;
+
+/// `.after-row { gap: 12px }` (`:302`): from the label's own text to the first switch.
+pub const AFTER_LABEL_GAP_DIP: i32 = 12;
+
+/// `.after-toggles { gap: 8px }` (`:303`): between the two switches.
+pub const AFTER_CHIP_GAP_DIP: i32 = 8;
+
+/// The two switches' words, in the mockup's order (`:573`, `:574`).
+pub const AFTER_CHIP_WORDS: [&str; 2] = ["复制路径", "打开文件夹"];
+
+/// A chip is its word plus the design's padding on both sides. The caller measures the word,
+/// because a word's width depends on its glyphs and this module has no device.
+pub fn after_chip_width(scale: f32, text_width_px: i32) -> i32 {
+    let pad = (AFTER_CHIP_PAD_DIP as f32 * scale).round() as i32;
+    text_width_px + pad * 2
+}
+
+/// One after-save switch, given the label's measured width and both chips' widths.
+///
+/// The label's width is a parameter rather than a constant for the same reason the chips' widths
+/// are: it is a measurement, and a number invented here would be wrong for every font but this one.
+/// The switch's height is the design's 24 (`:192`) and the label line's is 22 (`:165`), so the chip
+/// is centred on the line rather than aligned to its top.
+pub fn after_chip_rect(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    label_width_px: i32,
+    widths: [i32; 2],
+    index: usize,
+) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let band = label_rect(metrics, rects, scale, Row::Saved);
+    let height = px(AFTER_CHIP_HEIGHT_DIP);
+    let line = px(metrics.row_label_height);
+    let top = band.top - (height - line).max(0) / 2;
+    let mut left = band.left + label_width_px + px(AFTER_LABEL_GAP_DIP);
+    for width in widths.iter().take(index) {
+        left += width + px(AFTER_CHIP_GAP_DIP);
+    }
+    Rect {
+        left,
+        top,
+        right: left + widths[index],
+        bottom: top + height,
+    }
+}
+
 /// The two cells of the size row. The design lays this row out as two flex cells with a link hub
 /// between them (`.values { gap: 8px }`, `:235`; `.link-hub { width: 28px }`, `:246`), so the row
 /// cannot use the full-width slot the other rows use. It keeps their vertical arithmetic and splits
@@ -924,6 +984,9 @@ pub fn form_drawn_strings() -> Vec<&'static str> {
     all.extend(QUALITY_OPTION_WORDS);
     all.extend(SIZE_MODE_WORDS);
     all.extend(SIZE_CELL_WORDS);
+    // The after-save switches (`:573`, `:574`). They are chips on a label line rather than a row's
+    // content, which is why they are not in `FORM_ROWS` and have to be named here.
+    all.extend(AFTER_CHIP_WORDS);
     all.push(SIZE_UNIT_TEXT);
     all
 }
@@ -1791,6 +1854,50 @@ mod tests {
                 label.bottom - label.top,
                 expected,
                 "the after-save row is one label row tall"
+            );
+        }
+    }
+
+    /// The after-save switches sit on the label line, a fixed gap after the label's own text and
+    /// the design's gap apart.
+    ///
+    /// The gaps and the height are the design's (`:192`, `:302`, `:303`); the label's width is a
+    /// parameter, because it is a measurement and a number written here would only be right for
+    /// the font this build happens to load.
+    #[test]
+    fn the_after_save_switches_sit_on_the_label_line_after_the_label() {
+        let label_width = 66;
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            let rects = metrics().rects(scale);
+            let band = label_rect(&metrics(), &rects, scale, Row::Saved);
+            let widths = [72, 96];
+            let first = after_chip_rect(&metrics(), &rects, scale, label_width, widths, 0);
+            let second = after_chip_rect(&metrics(), &rects, scale, label_width, widths, 1);
+            let px = |dip: i32| (dip as f32 * scale).round() as i32;
+
+            assert_eq!(
+                first.left,
+                band.left + label_width + px(AFTER_LABEL_GAP_DIP),
+                "the first switch follows the label by the design's gap (:302)"
+            );
+            assert_eq!(
+                second.left,
+                first.right + px(AFTER_CHIP_GAP_DIP),
+                "the second switch follows the first by its own gap (:303)"
+            );
+            assert_eq!(
+                first.bottom - first.top,
+                px(AFTER_CHIP_HEIGHT_DIP),
+                "a chip is twenty four dip tall (:192)"
+            );
+            // A 24 dip chip centred on a 22 dip line: one dip above and one below, rounded to
+            // whichever pixel the grid allows, so the centres may differ by at most one.
+            let chip_middle = (first.top + first.bottom) / 2;
+            let line_middle = (band.top + band.bottom) / 2;
+            assert!(
+                (chip_middle - line_middle).abs() <= 1,
+                "the chip is centred on the label line, and their middles are {chip_middle} and \
+                 {line_middle}"
             );
         }
     }

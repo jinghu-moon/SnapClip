@@ -663,7 +663,8 @@ cargo run -p codec-bench --release -- --assert
 | --- | --- | --- | --- |
 | ~~A1~~ | ~~两个尺寸格**起始为空** ✗~~ ✓ **已显示真实宽高**（`ShellOptions.capture_size` ✓，`SelectionPixels.region` 那条链路 ✓；没有捕获时**显示空** ✗ 而不编造 ✓） | — | 已完成 ✓ |
 | ~~A4~~ | ~~**`.link-hub` 与两个 ghost 按钮未画** ✗~~ ✓ hub **已画**（`link` 图标 ✓）；**两个 ghost 按钮仍未画** ✗（`更改` ✓ / 文件夹图标 ✓）⇒ 见 A9 | 同上 ✓ | 交互批 ✓ |
-| A5 | **`保存后` 的两个 chip 未画** ✗（高 24 ✓、行内 gap 12 ✓、chip 间 gap 8 ✓ 均已量 ✓） | 同上 ✓ | 交互批 ✓ |
+| A5 | ~~**`保存后` 的两个 chip 未画** ✗~~ ✓ **已画**（`复制路径` ✓ `打开文件夹` ✓；高 24 ✓ 行内 gap 12 ✓ chip 间 8 ✓ 按 `:192` / `:302` / `:303` ✓，宽度与 label 宽度都**真的测量** ✓）；**点击未接** ✗ | 同上 ✓ | 交互批 ✓ |
+| ~~A24~~ | ~~**路径框没有默认值** ✗ ⇒ 面板一打开就是红框~~ ✓ **已修**：`save/dirs.rs::desktop()` 从 shell 取**真实的桌面** ✓（`SHGetKnownFolderPath` ✓，不是抄 demo 那句 `C:\Users\阿伟\Desktop` ✗ `:544`）；`ShellOptions.directory` ✓ ⇒ `initial_text(Path)` ✓；开发入口也走同一条 ✓ | — | 已完成 ✓ |
 | ~~A6~~ | ~~**尺寸行还有两个模式钮（`数值`/`百分比`，`:585`–`:586` ✓）与一个重置钮（`:589` ✓）** ✗~~ ✓ **已画出**（`.size-mode-btn` 的几何来自 `:226`/`:227` ✓，重置钮用 `refresh` 图标 ✓，宽度**真的测量了文字** ✓）⇒ 仍**只画不接** ✗ | — | 已完成绘制 ✓；点击属交互批 ✗ |
 | ~~A7~~ | ~~**尺寸格的 `宽`/`高` 与单位 `px` 未画** ✗~~ ✓ **已画出**（三段几何同源 ✓：`size_cell_label_rect` / `size_cell_input_rect` / `size_cell_unit_rect` ✓，第二格吸收余数 ✓） | — | 已完成 ✓ |
 | ~~A8~~ | ~~**数值字段的等宽字体未用** ✗~~ ✓ **已用**：`assets/font/FiraCode-Regular.ttf`（283 KB）取子集到 **3.3 KB**（`subfont/build_number_font.py` ✓，16 个字符 ✓）⇒ 内嵌在 `snapclip-ui`（`panel/fonts.rs` ✓）⇒ 尺寸格的 `EDIT`（`WM_SETFONT` + `ES_RIGHT` ✓）与 `px` 单位（`number_format` ✓）都用它；门禁 `the_embedded_number_subset_covers_the_numbers_the_panel_shows` ✓ | — | 已完成 ✓ |
@@ -1051,4 +1052,44 @@ fn note_edit(remembered, id, is_change, edited) -> bool
 `note_edit` 与 `remember_template` 是**规则** ✓，都被断言了 ✓；而"**消息处理里确实调用了它们**"✗ **没有测试覆盖** ✗ —— 它需要一个真窗口 ✓（桌面测试 ✓）。这一条只能靠**编译**（`note_edit` 是唯一入口 ✓）与**人眼**（打一个字、关掉、再开一次 ✓）确认 ✓。
 
 ⇒ 真机验证 ✓：开面板 ✓ → 把名字改成 `我的_[序号]` ✓ → 点「取消」关掉 ✓ → 再按一次 `Ctrl+S` ✓ ⇒ 名字框应是 **`我的_[序号]`** ✓（而不是 `SnapClip_[日期]` ✗）。
+
+---
+
+## 面板与设计稿的差距：第一批（A24 + A5）
+
+用户指出"保存面板与原型还有很大差距" ✗，并把它归到两件事：**空的地方没画** ✗ 与 **选型差异**（普通窗口 + 原生 `EDIT` ⇒ DWM 圆角 8 ✓ 无自绘模糊 ✓ 无自定阴影 ✗，见 D13 ✓）。
+
+### 做了什么
+
+| 项 | 内容 |
+| --- | --- |
+| **A24 默认目录** ✓ | 新增 `apps/snapclip/src/save/dirs.rs` ✓：`desktop()` 用 `SHGetKnownFolderPath(FOLDERID_Desktop)` 取**真实桌面** ✓，并用 `CoTaskMemFree` 释放 ✓（为此给 app 的 `windows-sys` 加 `Win32_System_Com` ✓，注释写明理由 ✓）。`ShellOptions.directory` ✓ ⇒ `initial_text(FieldId::Path, …)` ✓；**开发入口也走同一条** ✓。**不再抄 demo 的 `C:\Users\阿伟\Desktop`** ✗（`:544` 是一个人的桌面 ✓，不是默认值 ✓） |
+| **A5 保存后两个 chip** ✓ | `field.rs`：`AFTER_CHIP_*` 常量（高 24 ✓ `:192`、padding 10 ✓、label→chip 12 ✓ `:302`、chip 间 8 ✓ `:303`）+ `AFTER_CHIP_WORDS` ✓ + `after_chip_width` ✓ + `after_chip_rect` ✓；`frame.rs` 在**标签循环之后**画两个胶囊 ✓（`--line-soft` 描边 ✓ `--muted` 文字 ✓ 未选中 ⇒ **不填底** ✓）；`form_drawn_strings()` **收进这两个词** ✓ ⇒ 字形门禁会替我们盯着 ✓ |
+| **`Glyph` 新变体** ✓ | `Folder` ✓ `FolderOpen` ✓ `Braces` ✓（三个图标早已烘好 ✓，`ICON_COUNT` 9 → 12 ✓）—— 为 A9（路径行的两个 ghost 按钮）与魔法棒准备 ✓，**本批尚未画它们** ✗ |
+
+### 证据
+
+- **字形门禁先红** ✓：`no glyph for '夹' (U+5939), drawn by "打开文件夹"` ⇒ 重建子集 ⇒ **292 → 293 codepoints** ⇒ 绿 ✓（`subfont/subset.ps1` ✓）。
+- `ui` **137/0** ✓（新增 `the_after_save_switches_sit_on_the_label_line_after_the_label` ✓ 四 DPI ✓ 断言：首个 chip 距 label 恰好一个 gap ✓、两 chip 相距恰好一个 gap ✓、高 24 ✓、在 22 dip 标签行上**居中（±1 px）** ✓）
+- `app` **238/0/9** ✓（新增 `the_path_row_starts_where_the_shell_says_and_nowhere_else` ✓ 与 `dirs` 的 `the_desktop_is_absolute_or_empty_and_never_ends_with_a_separator` ✓）
+
+### 两条诚实边界 ✗
+
+1. **chip 的像素没有断言** ✗ —— 它们的 x 取决于 `保存后` 这个词的**测量宽度** ✓，而测试装置手里没有设备 ✓；几何由上面那条测试守着 ✓，"看得见"只能人判 ✓。**不假装有** ✗。
+2. **chip 点击未接** ✗（A5 只剩这一半 ✓），并且它们**看起来像开关** ✓ ⇒ 属"画了不接"✓，按规矩记在这里 ✓。
+
+### 还没画的（按"看起来像坏了"✗ 排序）
+
+| # | 缺口 | demo |
+| --- | --- | --- |
+| A9 | 路径行的 `更改` ✓ 与**打开文件夹**两个 ghost 按钮（图标**已备** ✓ `folder-open` ✓） | `:545` / `:546` ✓ |
+| A25 | 路径行的三个**快捷 chip**（桌面 ✓ 图片 ✓ 下载 ✓，带 `folder` 图标 ✓） | `:548` ✓ / `:1008` ✓ |
+| A26 | 名字行里的**魔法棒**（插入变量 ✓，图标**已备** ✓ `braces` ✓） | `:557` ✓ |
+| A27 | 质量行的 `.adv-btn`（图标**未备** ✗ —— 那是 sliders 图形 ✓，`assets/icon/` 里没有 ✗ ⇒ **要么下载要么不画** ✗） | `:630` ✓ |
+| A28 | 预估大小的**数值** ✗（`227.31 KB` 是动态值 ✓ ⇒ 要先有体积模型 ✓ ⇒ 现在**留空** ✓，**不编造** ✗） | `:668` ✓ |
+| A29 | 尺寸行的 `.size-presets`（100/75/50/25 ✓）与 `.warn-hint` ✗ | `:614` / `:621` ✓ |
+| A30 | 质量行的 `限制体积` 开关 ✓、`PNG 无损` 提示 ✓、`不超过 … KB` ✓、`.fill-row` 透明填充 ✗ | `:631` / `:638` / `:645` / `:655` ✓ |
+| A31 | 预估行的 `.enc-state` / `.enc-bar`（编码进度 ✓） | `:667` ✓ |
+
+⇒ 观感差距的**八成**在这些"空位"✓；**选型那部分**（圆角 8 vs 12 ✓ 无自绘模糊 ✓ 无自定阴影 ✗）改不了 ✓，见 D13 ✓。
 

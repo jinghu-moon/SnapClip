@@ -642,6 +642,37 @@ impl Frame<'_> {
             }
         }
 
+        // The after-save switches (`:572`–`:575`). That row is a header on its own, so its furniture
+        // sits on the label line rather than under it. Both switches start off
+        // (`aria-checked="false"`), so the resting look is an edge and `--muted` text with nothing
+        // filled. The label's width and each chip's are measured: they are words, and a number
+        // invented here would only be right for the font this build happens to load.
+        if let (Some(row_format), Some(chip_format)) = (self.row_label, self.chip) {
+            let label_width = painter
+                .measure_text_width(crate::panel::field::Row::Saved.label(), row_format)?
+                .round() as i32;
+            let mut widths = [0i32; 2];
+            for (index, word) in crate::panel::field::AFTER_CHIP_WORDS.iter().enumerate() {
+                let measured = painter.measure_text_width(word, chip_format)?.round() as i32;
+                widths[index] = crate::panel::after_chip_width(self.scale, measured);
+            }
+            // `.chip { border-radius: 999px }` (`:192`): a pill, whose radius is half its height.
+            let height = (crate::panel::field::AFTER_CHIP_HEIGHT_DIP as f32 * self.scale).round();
+            let radius = (height / 2.0).round() as i32;
+            for (index, word) in crate::panel::field::AFTER_CHIP_WORDS.iter().enumerate() {
+                let rect = crate::panel::field::after_chip_rect(
+                    self.metrics,
+                    self.rects,
+                    self.scale,
+                    label_width,
+                    widths,
+                    index,
+                );
+                painter.stroke_round(rect, radius, &self.brushes.line_soft, line);
+                painter.draw_text(word, chip_format, rect, &self.brushes.muted);
+            }
+        }
+
         // The size row's link hub (`:246`). The design gives it no background and no border until it
         // is hovered (`:247`), and the icon is `--accent-text` because the hub starts locked (`:248`,
         // `:603`), so the default state is the icon alone. Its rectangle comes from the same place

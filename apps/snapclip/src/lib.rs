@@ -320,10 +320,15 @@ impl Shell {
             events.set_save_opener(std::sync::Arc::new(move |pixels| {
                 let width = (pixels.region.right - pixels.region.left) as u32;
                 let height = (pixels.region.bottom - pixels.region.top) as u32;
+                // Where the path field opens. Asked once per panel from the shell, because it is
+                // a fact about this machine rather than a constant of the design: the mockup's
+                // `C:\Users\阿伟\Desktop` (`:544`) is one person's desktop.
+                let directory = save::dirs::desktop();
                 let options = save::window::ShellOptions {
                     preview: Some((pixels.bgra.clone(), width, height)),
                     capture_size: Some((width, height)),
                     remembered: save_remembered.clone(),
+                    directory: directory.clone(),
                     ..Default::default()
                 };
                 // 先关旧、再建新、最后存 —— 顺序是契约，`replace_panel` 的文档与两条测试
@@ -492,7 +497,14 @@ pub fn run(options: StartupOptions) {
     // on this frame is what keeps the panel's thread and its window alive for as long as the
     // application runs; dropping it closes the panel.
     let _development_panel = if subsystems(options).save_panel {
-        match save::window::open(save::window::ShellOptions::default()) {
+        // The path field opens where the shell says, the same way a panel opened by a capture
+        // does. Everything else is absent on purpose: there is no capture here, so there is no
+        // picture and no size to show.
+        let development = save::window::ShellOptions {
+            directory: save::dirs::desktop(),
+            ..Default::default()
+        };
+        match save::window::open(development) {
             Ok(panel) => {
                 eprintln!("[save-panel] development entry: the panel opens beside the shell");
                 Some(panel)

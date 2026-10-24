@@ -61,6 +61,10 @@ windows-sys = { version = "0.59", features = [
   "Win32_Graphics_Dwm",
   "Win32_UI_HiDpi",
   "Win32_Graphics_Gdi",
+  # `CoTaskMemFree` — `SHGetKnownFolderPath` hands back a buffer allocated with the task
+  # allocator, and freeing it with anything else is undefined behaviour. The desktop path the
+  # save panel opens with comes from that call (`save/dirs.rs`).
+  "Win32_System_Com",
   "Win32_System_DataExchange",
   "Win32_System_LibraryLoader",
   "Win32_System_Memory",

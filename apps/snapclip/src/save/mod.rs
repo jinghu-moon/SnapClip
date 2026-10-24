@@ -11,6 +11,10 @@ pub mod assemble;
 pub mod bands;
 pub mod caps;
 pub mod copy;
+// Where the path field points before the user says otherwise. It is the shell's answer to
+// "where is the desktop", so it lives beside the panel that shows it rather than in the UI crate,
+// which must not ask Windows anything a drawing cannot explain.
+pub mod dirs;
 pub mod service;
 pub mod template;
 

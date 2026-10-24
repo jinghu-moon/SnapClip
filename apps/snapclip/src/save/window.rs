@@ -413,6 +413,12 @@ pub struct ShellOptions {
     /// is shared rather than copied so the panel that writes a file is also the one that moves the
     /// counter, and no second copy can disagree.
     pub remembered: std::sync::Arc<std::sync::Mutex<Remembered>>,
+    /// Where the path field opens: the user's desktop, from the shell rather than from the mockup.
+    ///
+    /// The mockup's `C:\Users\阿伟\Desktop` (`:544`) is one person's desktop, so it is not a
+    /// default. Empty means the shell declined to say, and the panel then opens on the empty
+    /// value the path validation exists to describe rather than on an invented directory.
+    pub directory: String,
 }
 
 impl Default for ShellOptions {
@@ -423,6 +429,7 @@ impl Default for ShellOptions {
             preview: None,
             capture_size: None,
             remembered: std::sync::Arc::new(std::sync::Mutex::new(Remembered::default())),
+            directory: String::new(),
         }
     }
 }
@@ -724,7 +731,14 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
             .lock()
             .map(|remembered| remembered.template.clone())
             .unwrap_or_default();
-        let initial_text = |id| initial_text(id, options.capture_size, &template);
+        let initial_text = |id| {
+            initial_text(
+                id,
+                options.capture_size,
+                &template,
+                options.directory.as_str(),
+            )
+        };
         if let Some(s) = (state as *mut WindowState).as_mut() {
             for id in snapclip_ui::panel::FieldId::ALL {
                 let control = create_field_edit(
@@ -1156,13 +1170,22 @@ fn note_edit(
 /// starts empty because the panel's own default is a question for the next stage, and the name
 /// row starts with **the remembered template** — the spec's `SnapClip_[日期]` on a first run
 /// (`:68`), and whatever the last panel was left with afterwards (`:201`).
+/// A free function rather than a closure so that the one thing that can go wrong here can be
+/// asserted without a window: the width and the height are two numbers of the same type, and
+/// handing the width to the height cell would look entirely reasonable on screen. The path row
+/// starts at **the directory the shell named** — the mockup's `C:\Users\阿伟\Desktop` (`:544`) is
+/// one person's desktop, so the real one is asked for rather than copied — and the name row starts
+/// with **the remembered template**: the spec's `SnapClip_[日期]` on a first run (`:68`), and
+/// whatever the last panel was left with afterwards (`:201`).
 fn initial_text(
     id: snapclip_ui::panel::FieldId,
     capture_size: Option<(u32, u32)>,
     template: &str,
+    directory: &str,
 ) -> String {
     use snapclip_ui::panel::FieldId;
     match (id, capture_size) {
+        (FieldId::Path, _) => directory.to_string(),
         (FieldId::Name, _) => template.to_string(),
         (FieldId::SizeWidth, Some((width, _))) => width.to_string(),
         (FieldId::SizeHeight, Some((_, height))) => height.to_string(),
@@ -1915,11 +1938,21 @@ mod tests {
     fn the_size_cells_take_the_width_and_the_height_in_that_order() {
         let size = Some((1440, 900));
         assert_eq!(
-            initial_text(snapclip_ui::panel::FieldId::SizeWidth, size, super::DEFAULT_TEMPLATE),
+            initial_text(
+                snapclip_ui::panel::FieldId::SizeWidth,
+                size,
+                super::DEFAULT_TEMPLATE,
+                ""
+            ),
             "1440"
         );
         assert_eq!(
-            initial_text(snapclip_ui::panel::FieldId::SizeHeight, size, super::DEFAULT_TEMPLATE),
+            initial_text(
+                snapclip_ui::panel::FieldId::SizeHeight,
+                size,
+                super::DEFAULT_TEMPLATE,
+                ""
+            ),
             "900"
         );
     }
@@ -1933,14 +1966,14 @@ mod tests {
             snapclip_ui::panel::FieldId::SizeHeight,
         ] {
             assert_eq!(
-                initial_text(id, None, super::DEFAULT_TEMPLATE),
+                initial_text(id, None, super::DEFAULT_TEMPLATE, ""),
                 "",
                 "{id:?} must stay empty"
             );
         }
     }
 
-    /// The name row opens with the remembered template, and the path row has no default yet.
+    /// The name row opens with the remembered template; the path row opens where the shell says.
     ///
     /// The template is the spec's (`:68`), not the mockup's placeholder: the box holds a template
     /// whose variables are expanded at save time (`:189`), and `SnapClip_[日期]` is what the mockup
@@ -1948,17 +1981,44 @@ mod tests {
     #[test]
     fn the_name_row_starts_with_the_template_it_was_given() {
         assert_eq!(
-            initial_text(snapclip_ui::panel::FieldId::Name, None, super::DEFAULT_TEMPLATE),
+            initial_text(
+                snapclip_ui::panel::FieldId::Name,
+                None,
+                super::DEFAULT_TEMPLATE,
+                ""
+            ),
             "SnapClip_[日期]"
         );
         // A remembered template wins over the default: the panel opens with what the last one held.
         assert_eq!(
-            initial_text(snapclip_ui::panel::FieldId::Name, None, "我的_[序号]"),
+            initial_text(snapclip_ui::panel::FieldId::Name, None, "我的_[序号]", ""),
             "我的_[序号]"
         );
+    }
+
+    /// The path row opens on the directory the shell found, and on nothing when it declined.
+    ///
+    /// The mockup's `C:\Users\阿伟\Desktop` (`:544`) is one person's desktop, so the value is
+    /// passed in rather than copied; this asserts it is carried through unchanged, and that an
+    /// empty answer stays empty instead of turning into some plausible directory.
+    #[test]
+    fn the_path_row_starts_where_the_shell_says_and_nowhere_else() {
+        use snapclip_ui::panel::FieldId;
+
         assert_eq!(
-            initial_text(snapclip_ui::panel::FieldId::Path, None, super::DEFAULT_TEMPLATE),
-            ""
+            initial_text(
+                FieldId::Path,
+                None,
+                super::DEFAULT_TEMPLATE,
+                "D:\\Pictures"
+            ),
+            "D:\\Pictures",
+            "the path row shows the directory it was given"
+        );
+        assert_eq!(
+            initial_text(FieldId::Path, None, super::DEFAULT_TEMPLATE, ""),
+            "",
+            "a shell that declines leaves the field empty rather than inventing a directory"
         );
     }
 
@@ -1979,7 +2039,7 @@ mod tests {
 
         let first = read(&remembered);
         assert_eq!(
-            initial_text(FieldId::Name, None, &first),
+            initial_text(FieldId::Name, None, &first, ""),
             "SnapClip_[日期]",
             "a first run opens with the spec's template"
         );
@@ -1992,7 +2052,7 @@ mod tests {
 
         let second = read(&remembered);
         assert_eq!(
-            initial_text(FieldId::Name, None, &second),
+            initial_text(FieldId::Name, None, &second, ""),
             "我的_[序号]",
             "the next panel opens with the remembered template"
         );
@@ -2046,6 +2106,7 @@ mod tests {
             snapclip_ui::panel::FieldId::Name,
             None,
             &remembered.template,
+            "",
         );
 
         assert!(
