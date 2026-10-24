@@ -2732,13 +2732,20 @@ mod tests {
             right: item.right - pad,
             bottom: item.bottom,
         };
+        // `--surface` is `rgba(23,23,28,.92)` (`:25`), so the menu is deliberately a little
+        // translucent and whatever it covers bleeds through by one part in twelve. The band is
+        // therefore asserted to be no brighter than the surface plus that bleed: a value word is
+        // `--muted`, which is far brighter than this, so it cannot pass — and a rule of "exactly the
+        // surface colour" would fail on the design's own transparency.
         let surface = fill_rgb(23, 23, 28);
+        let bleed = 24;
         for y in band.top..band.bottom {
             for x in band.left..band.right {
+                let seen = px.pixel(x, y);
+                let brightest = seen.r.max(seen.g).max(seen.b);
                 assert!(
-                    close(px.pixel(x, y), surface, 6),
-                    "the value band is ink at ({x}, {y}) with no values to show: {:?}",
-                    px.pixel(x, y)
+                    brightest <= surface.r.max(surface.g).max(surface.b) + bleed,
+                    "the value band carries ink at ({x}, {y}) with no values to show: {seen:?}"
                 );
             }
         }
@@ -2910,10 +2917,16 @@ let surface = fill_rgb(23, 23, 28);
             }
         }
         assert!(painted, "the wand must be painted in --muted over the field's fill");
-        assert!(middle_ink, "the braces' band runs through the middle of their box");
+        // The shape, stated as what braces are: two strokes with a gap between them. This used to
+        // demand ink through the middle, which passed for the wrong reason: the button was placed
+        // under the eighty dip format button, so the ink found inside its box was the format
+        // button's own word. Now that the button sits in its own strip the gap is measurable, and
+        // it is what separates two strokes from a filled block.
+        assert!(left_ink, "the left stroke of the braces is painted");
+        assert!(right_ink, "and so is the right one");
         assert!(
-            !left_ink && !right_ink,
-            "and it must not reach the box's edges, or the graphic is a block: left {left_ink}, right {right_ink}"
+            !middle_ink,
+            "the two strokes leave their middle clear; ink there would be a block, not braces"
         );
     }
 

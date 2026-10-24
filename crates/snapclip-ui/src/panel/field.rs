@@ -161,9 +161,10 @@ impl FieldId {
         match self {
             FieldId::SizeWidth => size_cell_rect(metrics, rects, scale, SizeCell::Width),
             FieldId::SizeHeight => size_cell_rect(metrics, rects, scale, SizeCell::Height),
-            FieldId::Path | FieldId::Name | FieldId::Limit => {
-                self.rect(metrics, rects, scale, path_change)
-            }
+            // The name row's field is `.name-wrap`: the box the frame paints stops at the format
+            // button, while the native control inside it also gives up the wand's strip.
+            FieldId::Name => name_field_rect(metrics, rects, scale),
+            FieldId::Path | FieldId::Limit => self.rect(metrics, rects, scale, path_change),
         }
     }
 
@@ -1188,16 +1189,21 @@ pub const NAME_WAND_ICON_DIP: i32 = 16;
 /// strip reads as part of the field rather than as a gap.
 pub const NAME_TEXT_ROOM_DIP: i32 = 34;
 
-/// The rectangle the name field's native control occupies: the field box, less the room the wand
-/// needs on the right. This is `FieldId::Name`'s control rectangle; the frame around it is the whole
-/// field box, so the two differ by exactly the wand's strip.
+/// The rectangle the name field's native control occupies: `.name-wrap` and then the room the wand
+/// needs, both taken off the same box.
+///
+/// Two reductions, one reason, and one place: this is `name_field_rect` less the wand's strip, and
+/// `name_field_rect` is the row less the format button. Deriving one from the other is what makes
+/// the second reduction impossible to forget — the box used to be the row less the wand only, which
+/// left the edit control running underneath the eighty dip format button, where a child window both
+/// hides what the frame draws and eats the clicks meant for it.
 pub fn name_text_rect(
     metrics: &FrameMetrics,
     rects: &FrameRects,
     scale: f32,
 ) -> Rect {
     let px = |dip: i32| (dip as f32 * scale).round() as i32;
-    let field = field_rect(metrics, rects, scale, Row::Name);
+    let field = name_field_rect(metrics, rects, scale);
     Rect {
         right: field.right - px(NAME_TEXT_ROOM_DIP),
         ..field
@@ -1211,7 +1217,9 @@ pub fn name_wand_rect(
     scale: f32,
 ) -> Rect {
     let px = |dip: i32| (dip as f32 * scale).round() as i32;
-    let field = field_rect(metrics, rects, scale, Row::Name);
+    // The wand sits inside `.name-wrap`, not inside the row: the format button owns the row's right
+    // end, and a wand placed against the row's edge would be drawn under that button.
+    let field = name_field_rect(metrics, rects, scale);
     let inset = px(NAME_WAND_INSET_DIP);
     let side = px(NAME_WAND_DIP);
     Rect {
@@ -3296,27 +3304,40 @@ mod tests {
             let rects = metrics.rects(scale);
             let round = |dip: i32| (dip as f32 * scale).round() as i32;
 
-            let field = field_rect(&metrics, &rects, scale, Row::Name);
+            // The row is `.file-row` (`:171`): the field's wrap, then the format button. Two
+            // reductions are asserted separately because they were once one: the wrap stops a gap
+            // short of the button, and the control gives up the wand's strip inside the wrap. The
+            // control used to be measured from the row's edge instead, which left it running under
+            // the eighty dip button, where it hid the button and ate its clicks.
+            let wrap = name_field_rect(&metrics, &rects, scale);
+            let band = field_rect(&metrics, &rects, scale, Row::Name);
             let control = FieldId::Name.rect(&metrics, &rects, scale, 0);
+            let button = fmt_button_rect(&metrics, &rects, scale);
             // An absolute number rather than the constant, because both sides would move together
             // with a wrong constant and the assertion would agree with itself.
             assert_eq!(
-                field.right - control.right,
-                round(34),
-                "the design reserves 34 dip of text room at the field's right edge (:212)"
+                button.left - wrap.right,
+                round(8),
+                "the wrap stops one gap short of the format button (:171, gap 8px)"
             );
             assert_eq!(
-                control.left, field.left,
+                wrap.right - control.right,
+                round(34),
+                "the design reserves 34 dip of text room at the wrap's right edge (:212)"
+            );
+            assert_eq!(
+                control.left, band.left,
                 "and keeps the field's left edge, so the fill is continuous"
             );
+            assert_eq!(wrap.left, band.left, "the wrap starts where the row does");
 
             let wand = name_wand_rect(&metrics, &rects, scale);
             assert_eq!(
                 wand.right,
-                field.right - round(NAME_WAND_INSET_DIP),
-                "the button is inset from the field's right edge (:213)"
+                wrap.right - round(NAME_WAND_INSET_DIP),
+                "the button is inset from the wrap's right edge (:213)"
             );
-            assert_eq!(wand.top, field.top + round(NAME_WAND_INSET_DIP), ":213");
+            assert_eq!(wand.top, wrap.top + round(NAME_WAND_INSET_DIP), ":213");
             assert_eq!(
                 wand.bottom - wand.top,
                 round(NAME_WAND_DIP),
@@ -4274,5 +4295,59 @@ mod tests {
             None,
             "the row's label side is not a swatch"
         );
+    }
+
+    /// A child window is painted above everything the frame draws, so a control the frame draws in
+    /// the same row as a text box has to sit outside that box: inside it, the box hides the control
+    /// and swallows its clicks.
+    ///
+    /// One test over the whole set, because this bug arrived one button at a time. The name field's
+    /// control was narrowed for the variable button and left running underneath the format button,
+    /// which is eighty dip wide: the button drew, and clicking it did nothing, because the click
+    /// landed on the text box below it.
+    ///
+    /// `rects_intersect` is the same predicate the occlusion uses, so "a control must not sit under
+    /// a box" and "a box under a menu must be hidden" cannot disagree about touching rectangles.
+    #[test]
+    fn no_text_box_reaches_under_a_control_the_frame_draws() {
+        let metrics = metrics();
+        // The window measures this one; the relations are the same for any width, and the path
+        // input is derived from this rectangle, so the test asserts the derivation.
+        let change = 48;
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let rects = metrics.rects(scale);
+            let drawn = [
+                (
+                    "the format button",
+                    fmt_button_rect(&metrics, &rects, scale),
+                ),
+                (
+                    "the variable button",
+                    name_wand_rect(&metrics, &rects, scale),
+                ),
+                (
+                    "the change button",
+                    path_change_rect(&metrics, &rects, scale, change),
+                ),
+                (
+                    "the folder button",
+                    path_open_rect(&metrics, &rects, scale),
+                ),
+                (
+                    "the size cells' link hub",
+                    link_hub_rect(&metrics, &rects, scale),
+                ),
+            ];
+            for id in FieldId::ALL {
+                let control = id.rect(&metrics, &rects, scale, change);
+                for (what, button) in drawn {
+                    assert!(
+                        !rects_intersect(control, button),
+                        "{id:?}'s text box {control:?} reaches under {what} {button:?} at \
+                         {scale}x: a child window would hide it and eat its clicks"
+                    );
+                }
+            }
+        }
     }
 }

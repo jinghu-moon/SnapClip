@@ -1429,3 +1429,29 @@ check --workspace --all-targets  Finished ✓  死代码 0 ✓
 **证据**：`erasing_the_target_leaves_the_unpainted_body_transparent` 两侧都断言（不清 ⇒ a=255，清 ⇒ a=0）；变异 M1（`None` 也返回全部索引）红在"with no menu open every box is shown"；变异 M2（去掉清底）红在"with an erase nothing the frame did not draw is left"；两次还原 SHA256 逐字节一致。
 
 **未覆盖**：真实窗口里"点击 → 不再残留"只能人眼确认；`close_menus` 与 `WM_ACTIVATE` 的消息处理没有窗口级测试（需要真窗口）。
+## 名字框的 `EDIT` 压在格式按钮底下（P9-70）
+
+真机现象：格式下拉**永远打不开**；用户日志里 `format_open=true` 一次都没出现，只有魔法棒的 `var_open=true`。
+
+根因是**同一个坑第二次**：`FieldId::Name` 的控制矩形只让出了魔法棒的 34 dip（`:212`），而**没有让出格式按钮的 80 + gap 8**（`:561`）。原生子窗口画在父窗口之上，所以那个 `EDIT` 不但盖住按钮，还**吃掉落在按钮上的点击** —— `WM_LBUTTONDOWN` 收不到，菜单自然打不开。
+
+修法：一条推导链，不新增第二处算术。
+
+```
+field_rect(Row::Name)            // .file-row 的整行
+  → name_field_rect              // 减 80 + gap 8 = .name-wrap
+    → name_text_rect             // 再减 34 = EDIT
+    → name_wand_rect             // .name-wrap 右端内缩 4，宽 24
+```
+
+`FieldId::frame_rect(Name)` 同时改为 `name_field_rect`：画的框是 `.name-wrap`，`EDIT` 比它再少一条魔法棒带。
+
+**顺带抓到的第二条缺陷**：`the_variable_button_is_drawn_inside_the_name_field` 断言"加号中间必须有墨"，它**一直在给错误的东西作证** —— 旧的图标位置 1752..1800 落在格式按钮 1648..1808 里，它读到的墨是**格式按钮自己的字**。改成"两道笔画 + 中间必须有空隙"后，它才真的在说 braces。
+
+**第三条**：`a_token_menu_without_values_leaves_its_right_side_clean` 要求值带**恰好等于**表面色，而 `--surface` 是 `rgba(23,23,28,.92)`（`:25`）—— 92% 是设计稿的透明度，底下那行 chip 的词本来就会透出 8%。改成"不比表面亮 24 以上"，值词是 `--muted`，远超这个上限。
+
+新断言 `no_text_box_reaches_under_a_control_the_frame_draws`：五个字段 × 五个自绘控件（格式钮 / 魔法棒 / 更改 / 文件夹 / 尺寸链） × 四种 DPI，用 `rects_intersect` —— 与遮挡用的是同一个谓词，所以"控件不许压在框下"和"菜单压住的框要隐藏"不可能对"相切"有两种看法。变异（把控制矩形改回从行带派生）后三条测试红，报的正是诊断：
+
+```
+Name's text box { left: 584, right: 870 } reaches under the format button { left: 824, ... } at 1x
+```
