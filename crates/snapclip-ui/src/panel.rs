@@ -76,8 +76,8 @@ pub use field::{
 };
 pub use frame::{
     CHIP_FONT_DIP, DEMO, DEMO_PALETTE, Frame, FrameBrushes, FrameMetrics, FramePalette, FrameRects,
-    NUMBER_FONT_DIP, PanelRenderer, ROW_LABEL_FONT_DIP, TITLE, UNIT_FONT_DIP, chip_format, factory,
-    measure_footer_widths, number_format, paint_to_dc, paint_to_target,
+    NUMBER_FONT_DIP, PaintInput, PanelRenderer, ROW_LABEL_FONT_DIP, TITLE, UNIT_FONT_DIP,
+    chip_format, factory, measure_footer_widths, number_format,
     row_label_format, status_format, text_format_in, title_format,
 };
 pub use icon_button::IconButton;

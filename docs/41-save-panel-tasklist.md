@@ -677,10 +677,11 @@ cargo run -p codec-bench --release -- --assert
 | A16 | **切换格式的连带变化未做** ✗（`:204`：质量行 ✓ 高级选项 ✓ JPG 填充行 ✓ 与重新估算 ✓）—— 后两者**还没画** ✓ | — | 高级项批 ✓ |
 | A17 | **行头 `.field-msg` 与修复胶囊未做** ✗（`:335`–`:341` ✓，`repair()` 已在 `copy.rs` 里备好 ✓）—— 失败目前只在**底部一行** ✓，指出**哪个字段**要等它 | 字段级提示需要一个"哪个字段出错"的来源 ✓ | 错误提示批其二 ✓ |
 | A18 | **字段边框变红未做** ✗（`.text-input.is-error { border-color: danger }` ✓ `:333`）—— `FieldState::Error` 的规则**早就写好** ✓，只差把失败接到具体字段上 ✓ | 同上 ✓（先要有"哪个字段"✓） | 与 A17 同批 ✓ |
-| A19 | **绘制入口的实参已经 13 个** ✗（`paint_to_dc_with_preview` ✓ `paint_to_target_with_preview` ✓ `paint_with_preview` ✓ 各一长串位置参数 ✓）—— 再加一项就是第 14 个 ✓，而位置参数**错一个不会编译不过**（同类型可以互换 ✗） | 收成一个 `PanelScene` 结构体 ✓ ⇒ 字段有名 ✓、默认值一处 ✓ | **下一个要给绘制加参数的批次先做它** ✓ |
+| ~~A19~~ | ~~**绘制入口的实参已经 13 个** ✗~~ ✓ **已做**：收成 `PaintInput` ✓（字段有名 ✓ —— `quality` ✓ `format` ✓ `format_open` ✓ `fill_surface` ✓ `footer_widths` ✓ `status` ✓ `preview` ✓ `fields` ✓ `dpi` ✓）；`PanelRenderer::paint_with_preview` 只剩 `(hdc, area, input)` ✓；**只用于保留旧签名的三个壳子已删** ✗（`paint_to_dc` ✓ `paint_to_dc_with_state` ✓ `PanelRenderer::paint` ✓），**位图目标那条路径也删了** ✗（`paint_to_target` ✓ `paint_to_target_with_preview` ✓ —— 全仓**无任何调用者** ✓，其文档注释还写着"测试在用"✗，而测试走的是内存 DC ✓） | — | 已完成 ✓（**同名类型的值互换仍拦不住** ✗ ⇒ 见 A23 ✓） |
 | A20 | **三种失败的状态文案是开发者语** ✗ —— `Capability` ✓ `UnsupportedFormat` ✓ `Io` ✓ 走的是 `SaveError::message()` ✓，那是 `Debug`/英文短句 ✓（ascii ✓ 所以能画 ✓），不是给用户看的措辞 ✓ | 规格 §8.2 没有这三条的句子 ✓ ⇒ 要先定文案 ✓（新增句子会牵动字形子集 ✓） | 文案批 ✓ |
 | A21 | **`detail` 可能引用用户输入** ✗ —— 例如 `illegal_chars("a*b")` ✓ 与 `reserved_name(名字)` ✓ ⇒ 用户打的字**不一定在子集里** ✗ ⇒ 会**回退系统字体** ✓（能显示 ✓，字形不是我们的 ✓） | 子集装不下任意输入 ✓；要么限定显示 ✓、要么接受回退 ✓ —— **先记录** ✓ | 文案批（与 A20 一起决定）✓ |
 | A22 | **两个黄色** ✗ —— `field_colours` 的 `WARNING` 是 `[255,191,0]` ✗，而 demo 的 `--warning` 是 `rgb(240,179,90)` ✓（`:23` ✓，`.status.is-warning` 与冲突链接都用它 ✓）；demo **没有**字段警告边框的规则 ✗ | 字段警告边框的规则**不在设计稿里** ✓ ⇒ 那个黄是**推断出来的** ✓，而本批的状态行用的是**设计稿的黄** ✓（`FramePalette::warning` ✓） | 画字段警告态时统一 ✓ |
+| A23 | **同类型字段的「值」仍可互换** ✗ —— `PaintInput` 的 `quality` 与 `format` 都是 `usize` ✓，`fill_surface` 与 `format_open` 都是 `bool` ✓ ⇒ 把 `quality: s.format` 写在 `format` 的位置上**编译照样通过** ✗（实测 ✓：互换两个 `usize` 的值 ⇒ `Finished` ✓） | 结构体拦的是**位置**错 ✗，不是**类型**错 ✗；要拦后者得给每个量一个 **newtype**（`Quality(usize)` ✓ `Format(usize)` ✓）⇒ 值**根本不能**互相赋值 ✓ | 若要根治：类型化批（`Quality` ✓ `Format` ✓ `OptionalWidths` ✓）✓；不划算就写明"这里靠命名 + 评审" ✓ |
 
 > **A10 的两条行为决定**（不是遗漏 ✓）：① 菜单打开时，**菜单外的一次点击只关闭菜单、不做别的** ✓ —— 菜单里的第一下属于菜单 ✓（与常见菜单一致 ✓）；② 菜单的**每项体积**与**悬停态**见 A15/A13 ✓。
 >
@@ -932,3 +933,22 @@ pub fn after<T>(self, result: &Result<T, SaveError>, template: &str) -> Self {
 **一条被测试抓出来的真不一致** ✗✓：`field_colours` 的 `WARNING` 是 `[255,191,0]` ✗，而 demo 的 `--warning` 是 `rgb(240,179,90)` ✓ —— **两个黄** ✓。本条线用**设计稿的黄** ✓（`FramePalette::warning` ✓ + `warning_text` 笔刷 ✓），字段边框那个**不动** ✗（不在本批范围 ✓）⇒ 记入 **A22** ✓。
 
 **一条工程账** ✗：绘制入口的**位置参数已到 13 个** ✓ ⇒ 记入 **A19** ✓（下一个给绘制加参数的批次先把它们收成结构体 ✓ —— 位置参数错一个**不会编译不过** ✓，同类型可以互换 ✗）。
+
+### 收参数（本批）：`PaintInput`，以及它拦得住与拦不住的东西
+
+**做了什么** ✓：`paint_to_dc_with_preview` 的 13 个位置参数、`paint_with_preview` 的 11 个 ✓ ⇒ 收成一个 `PaintInput` ✓（9 个命名字段 ✓ + `PaintInput::idle(dpi)` ✓ 给"其余都不显示"的调用者 ✓）。`PanelRenderer::paint_with_preview` 现在是 `(hdc, area, &input)` ✓。
+
+**顺手删掉的** ✗（都只用于保留旧签名 ✓）：`paint_to_dc` ✓ `paint_to_dc_with_state` ✓ `PanelRenderer::paint` ✓ —— 以及**位图目标那条路径** ✓（`paint_to_target` ✓ `paint_to_target_with_preview` ✓）：全仓 `grep` **无任何调用者** ✗，而它的文档注释还写着"测试在用"✗（测试走的是内存 DC ✓）⇒ 留着就是"无用实现" ✓。
+
+**一条行为上的收紧** ✗（**没有**调用者受影响 ✓）：目标那条路径原来把 `fields` **写死成 IDLE** ✗，现在从 `input.fields` 取 ✓ —— 两条路径的规则合成一条 ✓。
+
+**它拦得住的** ✓ —— 变异：**漏掉一个字段** ✗ ⇒
+```
+error[E0063]: missing field `format_open` in initializer of `PaintInput<'_>`
+```
+⇒ 位置上**漏一个会静默移位** ✗ 的那类错，现在**编译不过** ✓。
+
+**它拦不住的** ✗✓ —— 变异：把两个 `usize` 字段的**值**互换 ✗ ⇒ **`Finished`** ✓（编译通过 ✓）
+⇒ 结构体拦的是**位置** ✗，不是**类型** ✗；而要拦类型得给每个量一个 **newtype** ✓ ⇒ 记入 **A23** ✓，本批**不做** ✗（它不是 A19 的要求 ✓，且会散到所有调用点 ✓）。
+
+**没改测试** ✓：`ui` **132/0** ✓、`app` **230/0/9** ✓ —— 与改前**条数完全一致** ✓（只有**调用写法**从位置参数变成结构体字面量 ✓，**没有一条断言或期望被动过** ✓）。

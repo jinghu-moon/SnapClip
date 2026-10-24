@@ -1172,72 +1172,63 @@ fn properties(dpi: f32) -> D2D1_RENDER_TARGET_PROPERTIES {
     }
 }
 
+/// Everything the frame paints that is not the canvas itself: what to draw and in which state.
+///
+/// The fields are named because several of them share a type and mean different things: `quality`
+/// and `format` are indices into two different lists, and `fill_surface` and `format_open` are both
+/// booleans. Passed positionally a swap compiles and draws the wrong thing without a word, and this
+/// panel has already lost time to two such swaps. Named fields make the swap unrepresentable.
+pub struct PaintInput<'a> {
+    /// The window's real DPI. Sizes the text and drives the layout scale; the target itself is
+    /// built at 96 so that `rects(scale)` is not applied twice.
+    pub dpi: f32,
+    /// Whether to fill the surface. A window with the DWM backdrop behind it says `false`.
+    pub fill_surface: bool,
+    /// Each form field's frame state: the native children draw no border, no focus ring and no
+    /// error colour, so the frames around them have to be told what state each one is in.
+    pub fields: crate::panel::FieldStates,
+    /// The captured picture -- BGRA, width, height -- for the preview card.
+    pub preview: Option<(&'a [u8], u32, u32)>,
+    /// Which option the quality segment marks as chosen.
+    pub quality: usize,
+    /// Which save format the format button shows.
+    pub format: usize,
+    /// Whether the format menu is open.
+    pub format_open: bool,
+    /// The footer's button widths, measured by the window so a click is tested against the
+    /// rectangles that were drawn. `None` measures here, which is what a caller that only paints
+    /// wants.
+    pub footer_widths: Option<[i32; 3]>,
+    /// The footer's one line of message with its level: the window decides whether there is one and
+    /// what it says, the frame decides how the two levels look.
+    pub status: Option<(crate::copy::Level, &'a str)>,
+}
+
+impl<'a> PaintInput<'a> {
+    /// The least a caller has to decide: a DPI and the fields, with nothing else shown.
+    pub fn idle(dpi: f32) -> Self {
+        Self {
+            dpi,
+            fill_surface: true,
+            fields: crate::panel::FieldStates::IDLE,
+            preview: None,
+            quality: 0,
+            format: 0,
+            format_open: false,
+            footer_widths: None,
+            status: None,
+        }
+    }
+}
+
 /// Paint the frame onto a device context. This is the real path: the window's `WM_PAINT` hands its
 /// own HDC here and the tests hand a memory DC, so both run the same drawing code.
-///
-/// `HwndRenderTarget` and `RenderTarget` both satisfy `PaintTarget`; the generic parameter keeps
-/// this usable with either while the tests use the HDC form.
-pub fn paint_to_dc(
-    factory: &ID2D1Factory,
-    dwrite: &IDWriteFactory,
-    hdc: HDC,
-    area: Rect,
-    dpi: f32,
-    fill_surface: bool,
-) -> Result<()> {
-    paint_to_dc_with_state(
-        factory,
-        dwrite,
-        hdc,
-        area,
-        dpi,
-        fill_surface,
-        crate::panel::FieldStates::IDLE,
-    )
-}
-
-/// [`paint_to_dc`] with the form fields' frame states. Kept separate so the existing signature — and
-/// every caller of it — stays valid: the states only matter once a window owns the child controls.
-#[allow(clippy::too_many_arguments)]
-pub fn paint_to_dc_with_state(
-    factory: &ID2D1Factory,
-    dwrite: &IDWriteFactory,
-    hdc: HDC,
-    area: Rect,
-    dpi: f32,
-    fill_surface: bool,
-    fields: crate::panel::FieldStates,
-) -> Result<()> {
-    paint_to_dc_with_preview(
-        factory, dwrite, hdc, area, dpi, fill_surface, fields, None, 0, 0, false, None, None,
-    )
-}
-
-/// [`paint_to_dc_with_state`] with a captured picture for the preview card. The old signature
-/// delegates here with `None`, so nothing that already calls it changes.
-///
-/// `quality` is the option the segmented control marks as chosen. It travels with the paint call
-/// rather than living in the frame, because it belongs to the window that receives the clicks.
-///
-/// `footer_widths` is the same: the window measures the footer buttons once and hands the numbers
-/// here and to its click handling, so a click cannot land on a button whose drawn rectangle differs
-/// from the one tested. `None` measures inside the paint, which is what a caller that only paints
-/// wants.
-#[allow(clippy::too_many_arguments)]
 pub fn paint_to_dc_with_preview(
     factory: &ID2D1Factory,
     dwrite: &IDWriteFactory,
     hdc: HDC,
     area: Rect,
-    dpi: f32,
-    fill_surface: bool,
-    fields: crate::panel::FieldStates,
-    preview: Option<(&[u8], u32, u32)>,
-    quality: usize,
-    format: usize,
-    format_open: bool,
-    footer_widths: Option<[i32; 3]>,
-    status: Option<(crate::copy::Level, &str)>,
+    input: &PaintInput<'_>,
 ) -> Result<()> {
     // DPI 96 on the target, deliberately: `rects(scale)` below already converts every dip to a
     // pixel, so a target carrying the real DPI would scale those pixels a second time. That is
@@ -1253,29 +1244,29 @@ pub fn paint_to_dc_with_preview(
     };
     unsafe { target.BindDC(hdc, &bind)? };
     let brushes = FrameBrushes::new(&target, &DEMO_PALETTE)?;
-    let scale = (dpi / 96.0).max(0.5);
+    let scale = (input.dpi / 96.0).max(0.5);
     let metrics = DEMO;
     let rects = metrics.rects(scale);
     // The title is part of the frame, not of any control: the design puts it in the header and
     // every drawn character has to be in the embedded subset, which the glyph gate enforces.
-    let title = title_format(dwrite, dpi)?;
+    let title = title_format(dwrite, input.dpi)?;
     // The form's own text, at the two sizes the design gives it (`:35`, `:36`).
-    let row_label = row_label_format(dwrite, dpi)?;
-    let chip = chip_format(dwrite, dpi)?;
+    let row_label = row_label_format(dwrite, input.dpi)?;
+    let chip = chip_format(dwrite, input.dpi)?;
     // The numbers' face, for the size cells' `px` unit (`:242`, `:244`).
-    let number = number_format(dwrite, dpi)?;
+    let number = number_format(dwrite, input.dpi)?;
     // The footer's buttons, at `--fs-btn` (`:38`) and, for save, 600 (`:282`).
-    let button = button_format(dwrite, dpi)?;
-    let button_strong = button_strong_format(dwrite, dpi)?;
+    let button = button_format(dwrite, input.dpi)?;
+    let button_strong = button_strong_format(dwrite, input.dpi)?;
     // The format control's word, in the numeric face (:173, :182).
-    let format_label = format_label_format(dwrite, dpi)?;
+    let format_label = format_label_format(dwrite, input.dpi)?;
     // The footer's status line (`--fs-status: 11px`, :37).
-    let status_format = status_format(dwrite, dpi)?;
+    let status_format = status_format(dwrite, input.dpi)?;
     let painter = PanelPainter {
         context: &target,
         text_factory: dwrite,
     };
-    let preview = match preview {
+    let preview = match input.preview {
         Some((bgra, w, h)) => Some((painter.bgra_bitmap(w, h, bgra)?, w, h)),
         None => None,
     };
@@ -1287,7 +1278,7 @@ pub fn paint_to_dc_with_preview(
         rects: &rects,
         brushes: &brushes,
         scale,
-        fill_surface,
+        fill_surface: input.fill_surface,
         title: Some((TITLE, &title)),
         row_label: Some(&row_label),
         chip: Some(&chip),
@@ -1295,115 +1286,18 @@ pub fn paint_to_dc_with_preview(
         button: Some(&button),
         button_strong: Some(&button_strong),
         format_label: Some(&format_label),
-        format,
-        format_open,
-        footer_widths,
-        status,
+        format: input.format,
+        format_open: input.format_open,
+        footer_widths: input.footer_widths,
+        status: input.status,
         status_format: Some(&status_format),
-        fields,
+        fields: input.fields,
         preview: preview.as_ref().map(|(b, w, h)| (b, *w, *h)),
-        quality,
+        quality: input.quality,
     }
     .paint(&painter)?;
     unsafe { target.EndDraw(None, None)? };
     Ok(())
-}
-
-/// Paint onto an existing render target. Used by the tests, which own a bitmap target and read its
-/// pixels back, and available to any caller that already has a target.
-///
-/// The target must be at DPI 96. Geometry is in pixels here — `rects(scale)` has already converted
-/// every dip — so a target carrying the real DPI would scale it again; see `paint_to_dc_with_state`.
-/// Pass the real `dpi` anyway: it sizes the text and drives the layout scale.
-pub fn paint_to_target(
-    target: &ID2D1RenderTarget,
-    dwrite: &IDWriteFactory,
-    dpi: f32,
-    fill_surface: bool,
-) -> Result<FrameRects> {
-    paint_to_target_with_preview(
-        target,
-        dwrite,
-        dpi,
-        fill_surface,
-        None,
-        0,
-        0,
-        false,
-        None,
-        None,
-    )
-}
-
-/// [`paint_to_target`] with a captured picture for the preview card. The old signature delegates
-/// here with `None`, so no existing caller or bitmap test has to change.
-#[allow(clippy::too_many_arguments)]
-pub fn paint_to_target_with_preview(
-    target: &ID2D1RenderTarget,
-    dwrite: &IDWriteFactory,
-    dpi: f32,
-    fill_surface: bool,
-    preview: Option<(&[u8], u32, u32)>,
-    quality: usize,
-    format: usize,
-    format_open: bool,
-    footer_widths: Option<[i32; 3]>,
-    status: Option<(crate::copy::Level, &str)>,
-) -> Result<FrameRects> {
-    let brushes = FrameBrushes::new(target, &DEMO_PALETTE)?;
-    let scale = (dpi / 96.0).max(0.5);
-    let metrics = DEMO;
-    let rects = metrics.rects(scale);
-    let painter = PanelPainter {
-        context: target,
-        text_factory: dwrite,
-    };
-    // The bitmap is made here, on the target that will draw it: the pixels arrive from the caller
-    // (the capture, or the development entry's stand-in) but the device object belongs to the target.
-    let preview = match preview {
-        Some((bgra, w, h)) => Some((painter.bgra_bitmap(w, h, bgra)?, w, h)),
-        None => None,
-    };
-    unsafe { target.BeginDraw() };
-    unsafe { target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED) };
-    // Hairlines at 1 dip are meant to be one pixel, not two half-lit ones.
-    let title = title_format(dwrite, dpi)?;
-    let row_label = row_label_format(dwrite, dpi)?;
-    let chip = chip_format(dwrite, dpi)?;
-    // The numbers' face, for the size cells' `px` unit (`:242`, `:244`).
-    let number = number_format(dwrite, dpi)?;
-    // The footer's buttons, at `--fs-btn` (`:38`) and, for save, 600 (`:282`).
-    let button = button_format(dwrite, dpi)?;
-    let button_strong = button_strong_format(dwrite, dpi)?;
-    // The format control's word, in the numeric face (:173, :182).
-    let format_label = format_label_format(dwrite, dpi)?;
-    // The footer's status line (`--fs-status: 11px`, :37).
-    let status_format = status_format(dwrite, dpi)?;
-    Frame {
-        metrics: &metrics,
-        rects: &rects,
-        brushes: &brushes,
-        scale,
-        fill_surface,
-        title: Some((TITLE, &title)),
-        row_label: Some(&row_label),
-        chip: Some(&chip),
-        number: Some(&number),
-        button: Some(&button),
-        button_strong: Some(&button_strong),
-        format_label: Some(&format_label),
-        format,
-        format_open,
-        footer_widths,
-        status,
-        status_format: Some(&status_format),
-        fields: crate::panel::FieldStates::IDLE,
-        preview: preview.as_ref().map(|(b, w, h)| (b, *w, *h)),
-        quality,
-    }
-    .paint(&painter)?;
-    unsafe { target.EndDraw(None, None)? };
-    Ok(rects)
 }
 
 #[cfg(test)]
@@ -1422,15 +1316,11 @@ mod tests {
                 &dwrite,
                 self.dc,
                 Rect::new(0, 0, self.width, self.height),
-                self.dpi,
-                true,
-                crate::panel::FieldStates::IDLE,
-                None,
-                0,
-                format,
-                open,
-                None,
-                None,
+                &PaintInput {
+                    format,
+                    format_open: open,
+                    ..PaintInput::idle(self.dpi)
+                },
             )
             .expect("the frame paints with a chosen format");
         }
@@ -2282,14 +2172,15 @@ mod tests {
             let factory = factory().expect("a Direct2D factory");
             let dwrite = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED) }
                 .expect("a DirectWrite factory");
-            paint_to_dc_with_state(
+            paint_to_dc_with_preview(
                 &factory,
                 &dwrite,
                 self.dc,
                 Rect::new(0, 0, self.width, self.height),
-                self.dpi,
-                true,
-                fields,
+                &PaintInput {
+                    fields,
+                    ..PaintInput::idle(self.dpi)
+                },
             )
             .expect("the frame paints");
         }
@@ -2304,15 +2195,10 @@ mod tests {
                 &dwrite,
                 self.dc,
                 Rect::new(0, 0, self.width, self.height),
-                self.dpi,
-                true,
-                crate::panel::FieldStates::IDLE,
-                Some((bgra, w, h)),
-                0,
-                0,
-                false,
-                None,
-                None,
+                &PaintInput {
+                    preview: Some((bgra, w, h)),
+                    ..PaintInput::idle(self.dpi)
+                },
             )
             .expect("the frame paints with a preview");
         }
@@ -2329,15 +2215,10 @@ mod tests {
                 &dwrite,
                 self.dc,
                 Rect::new(0, 0, self.width, self.height),
-                self.dpi,
-                true,
-                crate::panel::FieldStates::IDLE,
-                None,
-                quality,
-                0,
-                false,
-                None,
-                None,
+                &PaintInput {
+                    quality,
+                    ..PaintInput::idle(self.dpi)
+                },
             )
             .expect("the frame paints with a chosen quality");
         }
@@ -2358,15 +2239,11 @@ mod tests {
                 &dwrite,
                 self.dc,
                 Rect::new(0, 0, self.width, self.height),
-                self.dpi,
-                true,
-                crate::panel::FieldStates::IDLE,
-                None,
-                0,
-                0,
-                false,
-                Some(widths),
-                status,
+                &PaintInput {
+                    footer_widths: Some(widths),
+                    status,
+                    ..PaintInput::idle(self.dpi)
+                },
             )
             .expect("the frame paints with a status");
             widths
@@ -3203,30 +3080,6 @@ impl PanelRenderer {
         Ok(Self { factory, dwrite })
     }
 
-    /// Paint into a window's DC. `hdc` is the raw handle the Win32 bindings hand out, which is what
-    /// `BeginPaint` returns; the parameter is a pointer so callers with either binding can pass it.
-    ///
-    /// `fields` are the form fields' frame states: the native children draw no border, no focus ring
-    /// and no error colour, so the frames around them have to be told what state each is in.
-    pub fn paint(
-        &self,
-        hdc: *mut core::ffi::c_void,
-        area: Rect,
-        dpi: f32,
-        fill_surface: bool,
-        fields: crate::panel::FieldStates,
-    ) -> Result<()> {
-        paint_to_dc_with_state(
-            &self.factory,
-            &self.dwrite,
-            HDC(hdc),
-            area,
-            dpi,
-            fill_surface,
-            fields,
-        )
-    }
-
     /// [`PanelRenderer::paint`] with a captured picture for the preview card.
     ///
     /// Additive on purpose: `paint` keeps its signature and delegates with no picture, so the
@@ -3237,36 +3090,13 @@ impl PanelRenderer {
     ///
     /// `status` is the footer's one line of message, with its level: the window decides *whether*
     /// there is a message and *what* it says, and the frame only decides how the two levels look.
-    #[allow(clippy::too_many_arguments)]
     pub fn paint_with_preview(
         &self,
         hdc: *mut core::ffi::c_void,
         area: Rect,
-        dpi: f32,
-        fill_surface: bool,
-        fields: crate::panel::FieldStates,
-        preview: Option<(&[u8], u32, u32)>,
-        quality: usize,
-        format: usize,
-        format_open: bool,
-        footer_widths: [i32; 3],
-        status: Option<(crate::copy::Level, &str)>,
+        input: &PaintInput<'_>,
     ) -> Result<()> {
-        paint_to_dc_with_preview(
-            &self.factory,
-            &self.dwrite,
-            HDC(hdc),
-            area,
-            dpi,
-            fill_surface,
-            fields,
-            preview,
-            quality,
-            format,
-            format_open,
-            Some(footer_widths),
-            status,
-        )
+        paint_to_dc_with_preview(&self.factory, &self.dwrite, HDC(hdc), area, input)
     }
 
     /// The footer buttons' widths, for a caller that has to decide whether a click landed on one.

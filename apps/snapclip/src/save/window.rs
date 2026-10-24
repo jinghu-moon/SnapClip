@@ -1365,17 +1365,23 @@ extern "system" fn window_proc(
                         .paint_with_preview(
                             hdc as *mut _,
                             area,
-                            dpi,
-                            !s.backdrop,
-                            s.fields,
-                            s.preview.as_ref().map(|(bgra, w, h)| (bgra.as_slice(), *w, *h)),
-                            s.chosen_quality(),
-                            s.format,
-                            s.format_open,
-                            s.footer_widths,
-                            s.status
-                                .as_ref()
-                                .map(|(level, text)| (*level, text.as_str())),
+                            &snapclip_ui::panel::PaintInput {
+                                dpi,
+                                fill_surface: !s.backdrop,
+                                fields: s.fields,
+                                preview: s
+                                    .preview
+                                    .as_ref()
+                                    .map(|(bgra, w, h)| (bgra.as_slice(), *w, *h)),
+                                quality: s.chosen_quality(),
+                                format: s.format,
+                                format_open: s.format_open,
+                                footer_widths: Some(s.footer_widths),
+                                status: s
+                                    .status
+                                    .as_ref()
+                                    .map(|(level, text)| (*level, text.as_str())),
+                            },
                         )
                         .is_ok();
                 }
