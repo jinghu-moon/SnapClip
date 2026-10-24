@@ -122,15 +122,18 @@ impl FieldId {
     /// number alone, so it takes the input rectangle; the wrapper is painted separately.
     ///
     /// The name field likewise gives up its rightmost 34 dip to the naming-variable button
-    /// (`:212`), so its control is the field box less that strip.
+    /// (`:212`), so its control is the field box less that strip. The path row gives up the width of
+    /// its two buttons, which is why the `更改` button's measured width is a parameter: it is a
+    /// measurement, and a number invented here would be wrong for every font but this one.
     pub fn rect(
         self,
         metrics: &FrameMetrics,
         rects: &FrameRects,
         scale: f32,
+        path_change: i32,
     ) -> Rect {
         match self {
-            FieldId::Path => field_rect(metrics, rects, scale, Row::Path),
+            FieldId::Path => path_field_rect(metrics, rects, scale, path_change),
             FieldId::Name => name_text_rect(metrics, rects, scale),
             FieldId::SizeWidth => size_cell_input_rect(metrics, rects, scale, SizeCell::Width),
             FieldId::SizeHeight => size_cell_input_rect(metrics, rects, scale, SizeCell::Height),
@@ -145,11 +148,12 @@ impl FieldId {
         metrics: &FrameMetrics,
         rects: &FrameRects,
         scale: f32,
+        path_change: i32,
     ) -> Rect {
         match self {
             FieldId::SizeWidth => size_cell_rect(metrics, rects, scale, SizeCell::Width),
             FieldId::SizeHeight => size_cell_rect(metrics, rects, scale, SizeCell::Height),
-            FieldId::Path | FieldId::Name => self.rect(metrics, rects, scale),
+            FieldId::Path | FieldId::Name => self.rect(metrics, rects, scale, path_change),
         }
     }
 
@@ -414,9 +418,164 @@ pub fn name_field_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -
     fmt_name_field_rect(metrics, rects, scale, band)
 }
 
-/// The save path field, the first row of the form.
-pub fn path_field_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -> Rect {
-    field_rect(metrics, rects, scale, Row::Path)
+/// `.path-row { display: flex; gap: 8px }` (`:188`): the input, then the two buttons.
+pub const PATH_ROW_GAP_DIP: i32 = 8;
+
+/// `.btn-ghost { padding: 0 12px }` (`:189`): twelve dip either side of the word.
+pub const GHOST_PAD_DIP: i32 = 12;
+
+/// `.btn-ghost.icon-only { width: 32px; padding: 0 }` (`:205`): the square icon button.
+pub const GHOST_ICON_ONLY_DIP: i32 = 32;
+
+/// `.btn-ghost.icon-only svg { width: 16px; height: 16px }` (`:207`).
+pub const GHOST_ICON_DIP: i32 = 16;
+
+/// `.btn-ghost { border-radius: var(--r-input) }` (`:189`, `--r-input: 6px`, `:54`). The ghost's
+/// face is `--fill`, so its corners are visible and the radius is not decoration.
+pub const GHOST_RADIUS_DIP: i32 = 6;
+
+/// The path row's worded button (`:545`). Produced here for the same reason every other drawn word
+/// is: the font subset's list calls this, so a word cannot be drawn without being demanded.
+pub const GHOST_WORD_CHANGE: &str = "更改";
+
+/// `.path-chips { gap: 6px }` (`:191`): between the three shortcut chips.
+pub const PATH_CHIP_GAP_DIP: i32 = 6;
+
+/// `.chip { gap: 4px }` (`:192`): between a chip's folder and its word.
+pub const PATH_CHIP_ICON_GAP_DIP: i32 = 4;
+
+/// `.path-chips svg { width: 12px }` (`:195`).
+pub const PATH_CHIP_ICON_DIP: i32 = 12;
+
+/// The three shortcuts the mockup shows under the path (`:739`–`:741`), in its order. Each is a
+/// folder and a word (`:1008`), so the row is not only a field: it is a field and three chips.
+pub const PATH_CHIP_WORDS: [&str; 3] = ["桌面", "图片", "下载"];
+
+/// A ghost button's width: its word plus the design's padding on both sides. The word is measured by
+/// the caller because this module has no device, which is the same division as the chips above.
+pub fn ghost_button_width(scale: f32, text_width_px: i32) -> i32 {
+    let pad = (GHOST_PAD_DIP as f32 * scale).round() as i32;
+    text_width_px + pad * 2
+}
+
+/// The square icon button at the row's right end (`:546`, `.btn-ghost.icon-only`, `:205`).
+pub fn path_open_rect(_metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let side = px(GHOST_ICON_ONLY_DIP);
+    let band = field_rect(_metrics, rects, scale, Row::Path);
+    Rect {
+        left: rects.form.right - side,
+        top: band.top,
+        right: rects.form.right,
+        bottom: band.top + px(_metrics.field_height),
+    }
+}
+
+/// Its graphic, centred in the square and drawn at sixteen dip (`:207`).
+pub fn path_open_icon_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let button = path_open_rect(metrics, rects, scale);
+    let side = px(GHOST_ICON_DIP);
+    Rect {
+        left: button.left + (button.right - button.left - side) / 2,
+        top: button.top + (button.bottom - button.top - side) / 2,
+        right: button.left + (button.right - button.left - side) / 2 + side,
+        bottom: button.top + (button.bottom - button.top - side) / 2 + side,
+    }
+}
+
+/// The `更改` button, to the left of the square one (`:545`), its width measured from its word.
+pub fn path_change_rect(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    change_width: i32,
+) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let band = field_rect(metrics, rects, scale, Row::Path);
+    let open = path_open_rect(metrics, rects, scale);
+    let right = open.left - px(PATH_ROW_GAP_DIP);
+    Rect {
+        left: right - change_width,
+        top: band.top,
+        right,
+        bottom: band.top + px(metrics.field_height),
+    }
+}
+
+/// The save path field: the row's content box less what the two buttons take from its right end.
+///
+/// The input is the one that gives way, so the native control cannot sit under the buttons the way
+/// the name field's would have sat under its variable button — the same reason, one row up.
+pub fn path_field_rect(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    change_width: i32,
+) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let band = field_rect(metrics, rects, scale, Row::Path);
+    let change = path_change_rect(metrics, rects, scale, change_width);
+    Rect {
+        left: band.left,
+        top: band.top,
+        right: change.left - px(PATH_ROW_GAP_DIP),
+        bottom: band.top + px(metrics.field_height),
+    }
+}
+
+/// A shortcut chip's width: the folder, its gap, the word, and ten dip on each side (`:192`,
+/// `:195`). The word is measured by the caller.
+pub fn path_chip_width(scale: f32, text_width_px: i32) -> i32 {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    px(PATH_CHIP_ICON_DIP) + px(PATH_CHIP_ICON_GAP_DIP) + text_width_px + px(AFTER_CHIP_PAD_DIP) * 2
+}
+
+/// One shortcut chip, on the line under the input (`.path-chips`, `:548`), spaced by the design's
+/// six (`:191`). It is a chip like the after-save switches — same height, same padding, same edge —
+/// so it borrows those constants instead of restating them.
+pub fn path_chip_rect(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    widths: &[i32; 3],
+    index: usize,
+) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let band = field_rect(metrics, rects, scale, Row::Path);
+    let height = px(AFTER_CHIP_HEIGHT_DIP);
+    let top = band.top + px(metrics.field_height + metrics.row_gap);
+    let mut left = band.left;
+    for width in widths.iter().take(index) {
+        left += width + px(PATH_CHIP_GAP_DIP);
+    }
+    Rect {
+        left,
+        top,
+        right: left + widths[index],
+        bottom: top + height,
+    }
+}
+
+/// A chip's folder, after its ten dip of padding and centred on its line.
+pub fn path_chip_icon_rect(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    widths: &[i32; 3],
+    index: usize,
+) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let chip = path_chip_rect(metrics, rects, scale, widths, index);
+    let side = px(PATH_CHIP_ICON_DIP);
+    let left = chip.left + px(AFTER_CHIP_PAD_DIP);
+    let top = chip.top + (chip.bottom - chip.top - side) / 2;
+    Rect {
+        left,
+        top,
+        right: left + side,
+        bottom: top + side,
+    }
 }
 
 /// Which row of the form a field sits in. The design puts the save path above the file name
@@ -487,7 +646,12 @@ impl Row {
     /// callers must ask `has_content` first.
     fn content_height(self, metrics: &FrameMetrics) -> i32 {
         match self {
-            Row::Path | Row::Name | Row::Size => metrics.field_height,
+            // The path row is the one row whose content is two things: the input
+            // (`height: 32px`, `:167`) and the shortcut chips under it (`.path-chips`, `:548`,
+            // `.chip { height: 24px }`, `:192`), with `.form-row { gap: 6px }` (`:164`) between them.
+            // So it is 62 and every row below it moves down by thirty.
+            Row::Path => metrics.field_height + metrics.row_gap + AFTER_CHIP_HEIGHT_DIP,
+            Row::Name | Row::Size => metrics.field_height,
             Row::Quality | Row::Estimate => ROW_DIP,
             Row::Saved => 0,
         }
@@ -1062,6 +1226,10 @@ pub fn form_drawn_strings() -> Vec<&'static str> {
     // The after-save switches (`:573`, `:574`). They are chips on a label line rather than a row's
     // content, which is why they are not in `FORM_ROWS` and have to be named here.
     all.extend(AFTER_CHIP_WORDS);
+    // The path row's worded button and its three shortcuts (`:545`, `:548`). The shortcuts are chips
+    // under a field rather than a row's content of their own, so they too are named here.
+    all.push(GHOST_WORD_CHANGE);
+    all.extend(PATH_CHIP_WORDS);
     all.push(SIZE_UNIT_TEXT);
     all
 }
@@ -1806,12 +1974,20 @@ mod tests {
                 "the name field gives up the gap and the format button's width (:171, :561)"
             );
             assert_eq!(button.right, rects.form.right, "the button ends at the form's right edge");
-            assert_eq!(
-                field.top,
-                rects.form.top
-                    + px(metrics.text_row_pitch())
-                    + px(metrics.row_label_height + metrics.row_gap),
-                "the directory row takes the first slot; below it, label {} plus gap {} then the field (:165, :164)",
+            // The path row is taller than a text row: its content is the input (32) and the chips
+            // under it (24 plus the 6 gap), so from the form's top to the name field there is the
+            // path row's own label and gap, its two-part content, the gap to the next row, then the
+            // name row's label and gap. Deriving it from the constants keeps the arithmetic honest
+            // while the numbers stay absolute.
+            let expected = rects.form.top
+                + px(metrics.row_label_height + metrics.row_gap)
+                + px(metrics.field_height + metrics.row_gap + AFTER_CHIP_HEIGHT_DIP)
+                + px(metrics.row_spacing)
+                + px(metrics.row_label_height + metrics.row_gap);
+            assert!(
+                (field.top - expected).abs() <= 1,
+                "the directory row takes the first slot; below it, label {} plus gap {} then the \
+                 field, then its chips (:165, :164, :548)",
                 metrics.row_label_height,
                 metrics.row_gap
             );
@@ -1901,10 +2077,12 @@ mod tests {
                 + metrics().group_spacing) as f32
                 * scale)
                 .round() as i32;
-            assert_eq!(
-                size.top - saved.top,
-                expected,
-                "the size row opens a group below the after-save row (:163)"
+            // Two sums rounded independently, so one pixel either way is the most an integer grid
+            // can promise at 1.25 and 1.5 scale.
+            assert!(
+                (size.top - saved.top - expected).abs() <= 1,
+                "the size row opens a group below the after-save row (:163): got {} expected {expected}",
+                size.top - saved.top
             );
             assert!(
                 one_group > one_row,
@@ -2138,7 +2316,7 @@ mod tests {
             let round = |dip: i32| (dip as f32 * scale).round() as i32;
 
             let field = field_rect(&metrics, &rects, scale, Row::Name);
-            let control = FieldId::Name.rect(&metrics, &rects, scale);
+            let control = FieldId::Name.rect(&metrics, &rects, scale, 0);
             // An absolute number rather than the constant, because both sides would move together
             // with a wrong constant and the assertion would agree with itself.
             assert_eq!(
@@ -2721,6 +2899,91 @@ mod tests {
                 None,
                 "the padding is the menu but not an option"
             );
+        }
+    }
+
+    /// The path row ends with its two buttons, and the input gives up exactly their room.
+    ///
+    /// The mockup lays the row out as `.path-row { display: flex; gap: 8px }` (`:188`) with the input
+    /// first, then `更改` (`:545`) and a square icon button (`:546`, `.btn-ghost.icon-only`, `:205`).
+    /// The input is the child that gives way, because a child window is painted above its parent: a
+    /// control that kept the row's full width would sit under both buttons.
+    #[test]
+    fn the_path_row_ends_with_its_two_buttons() {
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            let metrics = metrics();
+            let rects = metrics.rects(scale);
+            let round = |dip: i32| (dip as f32 * scale).round() as i32;
+            let measured = 24;
+            let change = ghost_button_width(scale, measured);
+            let input = path_field_rect(&metrics, &rects, scale, change);
+            let change_rect = path_change_rect(&metrics, &rects, scale, change);
+            let open = path_open_rect(&metrics, &rects, scale);
+            let row = field_rect(&metrics, &rects, scale, Row::Path);
+
+            // Absolute numbers, because a relation between constants that move together would agree
+            // with itself whatever they were.
+            assert_eq!(change, measured + 2 * round(12), "the ghost is its word plus 12 either side (:189)");
+            assert_eq!(open.right - open.left, round(32), "the square button is 32 wide (:205)");
+            assert_eq!(open.right, rects.form.right, "it ends at the column's right edge (:546)");
+            assert_eq!(
+                change_rect.right,
+                open.left - round(8),
+                "one flex gap between the two buttons (:188)"
+            );
+            assert_eq!(
+                input.right,
+                change_rect.left - round(8),
+                "and one between the input and the first button (:188)"
+            );
+            assert_eq!(input.left, row.left, "the input starts at the column's left edge");
+            assert_eq!(
+                input.bottom - input.top,
+                round(32),
+                "the input keeps the text field's height (:167), not the row's"
+            );
+            assert_eq!(change_rect.top, row.top, "both buttons sit on the input's line");
+        }
+    }
+
+    /// Under the input sits a line of three shortcut chips (`.path-chips`, `:548`).
+    ///
+    /// The row's content is therefore 32 + 6 + 24 — `.chip { height: 24px }` (`:192`) — which is why
+    /// the rows below it moved down by thirty when the chips arrived, and why the row cannot use the
+    /// same content height as every other text row.
+    #[test]
+    fn the_path_row_is_an_input_and_a_line_of_three_chips() {
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            let metrics = metrics();
+            let rects = metrics.rects(scale);
+            let round = |dip: i32| (dip as f32 * scale).round() as i32;
+            let input = path_field_rect(&metrics, &rects, scale, 56);
+            let row = field_rect(&metrics, &rects, scale, Row::Path);
+            let widths = [path_chip_width(scale, 20), path_chip_width(scale, 20), path_chip_width(scale, 20)];
+
+            assert_eq!(
+                row.bottom - row.top,
+                round(32 + 6 + 24),
+                "the row's content is the input, the form gap and a chip (:167, :164, :192)"
+            );
+            for index in 0..3 {
+                let chip = path_chip_rect(&metrics, &rects, scale, &widths, index);
+                assert_eq!(
+                    chip.top,
+                    input.bottom + round(6),
+                    "chips start one form gap under the input (:164)"
+                );
+                assert_eq!(chip.bottom - chip.top, round(24), "a chip is 24 high (:192)");
+                if index == 0 {
+                    assert_eq!(chip.left, row.left, "the first chip starts at the column's edge");
+                } else {
+                    let before = path_chip_rect(&metrics, &rects, scale, &widths, index - 1);
+                    assert_eq!(chip.left, before.right + round(6), "chips are six apart (:191)");
+                }
+                let icon = path_chip_icon_rect(&metrics, &rects, scale, &widths, index);
+                assert_eq!(icon.right - icon.left, round(12), "the chip's folder is 12 (:195)");
+                assert_eq!(icon.left, chip.left + round(10), "after the chip's padding (:192)");
+            }
         }
     }
 }

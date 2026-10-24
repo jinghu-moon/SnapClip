@@ -668,6 +668,9 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
         // DirectWrite factory, so it works before the first paint and a click that arrives early
         // still lands where the button will be.
         let footer_widths = measure_footer_widths(hwnd, renderer.as_ref());
+        // The path row's button width, measured for the same reason: the input's rectangle gives up
+        // that width, and the control and the painted button have to be told the same number.
+        let path_change = measure_path_change(hwnd, renderer.as_ref());
         // The child's background: the field's own fill, resolved from `--fill` over the surface.
         // A native `EDIT` cannot be translucent, so the composite is computed once here.
         let fill = snapclip_ui::panel::field_colours(
@@ -692,6 +695,7 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
             segment: snapclip_ui::panel::quality_segment_state(&metrics, &rects, scale, 0),
             segment_scale: scale,
             footer_widths,
+            path_change,
             format: 0,
             format_open: false,
             // Handed over rather than created here: the template and the counter are shared by every
@@ -743,7 +747,7 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
             for id in snapclip_ui::panel::FieldId::ALL {
                 let control = create_field_edit(
                     hwnd,
-                    id.rect(&metrics, &rects, scale),
+                    id.rect(&metrics, &rects, scale, s.path_change),
                     &initial_text(id),
                     id.face(),
                 );
@@ -845,6 +849,11 @@ struct WindowState {
     /// the paint would leave the hit test guessing, and guessing is how a click lands on a button
     /// that is not there.
     footer_widths: [i32; 3],
+    /// The path row's `更改` button width, measured once beside the footer's.
+    ///
+    /// The input's rectangle gives up this width, so the control and the paint read the same number
+    /// rather than each deciding how much room the buttons need.
+    path_change: i32,
     /// Which format the format control shows, by index into FMT_OPTIONS. The control is drawn by
     /// the frame and answered here, so the number lives beside the other state the frame reads.
     format: usize,
@@ -881,6 +890,23 @@ fn measure_footer_widths(
             [0; 3]
         }
         None => [0; 3],
+    }
+}
+
+/// The path row's `更改` button width, measured the same way and for the same reason: the input's
+/// rectangle leaves room for this button, so both the control and the paint read this one number.
+fn measure_path_change(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    renderer: Option<&snapclip_ui::panel::PanelRenderer>,
+) -> i32 {
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96) as f32;
+    match renderer.map(|renderer| renderer.measure_path_change(dpi)) {
+        Some(Ok(width)) => width,
+        Some(Err(error)) => {
+            eprintln!("[save-panel] could not measure the path row's button: {error:?}");
+            0
+        }
+        None => 0,
     }
 }
 
@@ -1450,6 +1476,7 @@ extern "system" fn window_proc(
                                 format: s.format,
                                 format_open: s.format_open,
                                 footer_widths: Some(s.footer_widths),
+                                path_change: s.path_change,
                                 status: s
                                     .status
                                     .as_ref()
@@ -2140,6 +2167,7 @@ mod tests {
             ),
             segment_scale: 1.0,
             footer_widths: [40, 52, 64],
+            path_change: 56,
             format: 0,
             format_open: false,
             remembered: std::sync::Arc::new(std::sync::Mutex::new(Remembered::default())),
@@ -2202,6 +2230,7 @@ mod tests {
             ),
             segment_scale: 1.0,
             footer_widths: [40, 52, 64],
+            path_change: 56,
             format: 0,
             format_open: false,
             remembered: std::sync::Arc::new(std::sync::Mutex::new(Remembered::default())),
@@ -2268,6 +2297,7 @@ mod tests {
             ),
             segment_scale: 1.0,
             footer_widths: [40, 52, 64],
+            path_change: 56,
             format: 0,
             format_open: false,
             remembered: std::sync::Arc::new(std::sync::Mutex::new(Remembered::default())),

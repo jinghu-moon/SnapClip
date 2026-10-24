@@ -374,6 +374,13 @@ pub struct Frame<'a> {
     /// measurements that happen to agree. `None` measures here, which is what a caller that only
     /// paints — every bitmap test — does.
     pub footer_widths: Option<[i32; 3]>,
+    /// The measured width of the path row's `更改` button, in pixels.
+    ///
+    /// The path input gives up this width so its native control cannot sit under the button, which
+    /// means the control and the painting have to be told the same measurement — the same reason the
+    /// footer's widths travel. Zero means "paint a button that is no wider than its padding"; the
+    /// window always hands a real number.
+    pub path_change: i32,
     /// The state of every form field's frame. The native `EDIT` itself draws no border, no focus ring
     /// and no error state, so those belong to the frame (`field.rs`), and each field carries its own
     /// — one shared state is what made a focused path row draw the name row's frame.
@@ -542,7 +549,7 @@ impl Frame<'_> {
         // The states come from the field list, one per field: a field that is added later is drawn
         // from its own entry rather than from whatever state the window tracked before.
         for (id, state) in self.fields.iter() {
-            let field = id.frame_rect(self.metrics, self.rects, self.scale);
+            let field = id.frame_rect(self.metrics, self.rects, self.scale, self.path_change);
             let colours = crate::panel::field_colours(state, self.brushes.surface_rgba());
             painter.fill_round(field, field_radius, &self.brushes.field_fill);
 
@@ -687,7 +694,90 @@ impl Frame<'_> {
             }
         }
 
-        // The size row's link hub (`:246`). The design gives it no background and no border until it
+        // The path row's two buttons and its three shortcuts (`:545`, `:546`, `:548`).
+        //
+        // The buttons are `.btn-ghost`: a `--fill` face with a transparent edge (`:189`), `--text`
+        // for the word and `--muted` for the square one's graphic (`:205`). `--fill` over the
+        // surface is the colour the fields already composite, so the ghost borrows that brush
+        // instead of inventing a second one for the same value.
+        //
+        // The shortcuts are the same chip as the after-save switches — same height, same padding,
+        // same `--line-soft` edge — because the mockup uses `.chip` for both (`:192`). Each carries
+        // the folder from the baked icon set (`:1008`) and its word, so the chip is an icon and a
+        // text on one line rather than centred text over a picture.
+        if let (Some(_row_format), Some(chip_format)) = (self.row_label, self.chip) {
+            let radius = (crate::panel::field::GHOST_RADIUS_DIP as f32 * self.scale).round() as i32;
+
+            let measured = painter
+                .measure_text_width(crate::panel::field::GHOST_WORD_CHANGE, chip_format)?
+                .round() as i32;
+            let change = crate::panel::field::ghost_button_width(self.scale, measured);
+            let change_rect = crate::panel::field::path_change_rect(
+                self.metrics,
+                self.rects,
+                self.scale,
+                change,
+            );
+            painter.fill_round(change_rect, radius, &self.brushes.field_fill);
+            painter.draw_text(
+                crate::panel::field::GHOST_WORD_CHANGE,
+                chip_format,
+                change_rect,
+                &self.brushes.text,
+            );
+
+            let open_rect = crate::panel::field::path_open_rect(self.metrics, self.rects, self.scale);
+            painter.fill_round(open_rect, radius, &self.brushes.field_fill);
+            Self::draw_glyph(
+                painter,
+                crate::panel::icons::Glyph::FolderOpen,
+                crate::panel::field::path_open_icon_rect(self.metrics, self.rects, self.scale),
+                self.brushes.muted_rgba,
+            )?;
+
+            let mut widths = [0i32; 3];
+            for (index, word) in crate::panel::field::PATH_CHIP_WORDS.iter().enumerate() {
+                let measured = painter.measure_text_width(word, chip_format)?.round() as i32;
+                widths[index] = crate::panel::field::path_chip_width(self.scale, measured);
+            }
+            let height =
+                (crate::panel::field::AFTER_CHIP_HEIGHT_DIP as f32 * self.scale).round();
+            let pill = (height / 2.0).round() as i32;
+            let icon_gap = (crate::panel::field::PATH_CHIP_ICON_GAP_DIP as f32 * self.scale)
+                .round() as i32;
+            for (index, word) in crate::panel::field::PATH_CHIP_WORDS.iter().enumerate() {
+                let rect = crate::panel::field::path_chip_rect(
+                    self.metrics,
+                    self.rects,
+                    self.scale,
+                    &widths,
+                    index,
+                );
+                painter.stroke_round(rect, pill, &self.brushes.line_soft, line);
+                let icon = crate::panel::field::path_chip_icon_rect(
+                    self.metrics,
+                    self.rects,
+                    self.scale,
+                    &widths,
+                    index,
+                );
+                Self::draw_glyph(
+                    painter,
+                    crate::panel::icons::Glyph::Folder,
+                    icon,
+                    self.brushes.muted_rgba,
+                )?;
+                let text = snapclip_model::geometry::Rect {
+                    left: icon.right + icon_gap,
+                    top: rect.top,
+                    right: rect.right,
+                    bottom: rect.bottom,
+                };
+                painter.draw_text(word, chip_format, text, &self.brushes.muted);
+            }
+        }
+
+
         // is hovered (`:247`), and the icon is `--accent-text` because the hub starts locked (`:248`,
         // `:603`), so the default state is the icon alone. Its rectangle comes from the same place
         // the two cells were laid out around, so the icon cannot drift away from the row.
@@ -1132,6 +1222,24 @@ pub fn status_format(dwrite: &IDWriteFactory, dpi: f32) -> Result<IDWriteTextFor
     text_format(dwrite, dpi, STATUS_FONT_DIP, DWRITE_FONT_WEIGHT_NORMAL)
 }
 
+/// The path row's `更改` button width, measured the way the painter measures it.
+///
+/// The button is a word with twelve dip of padding (`:189`), and the input gives up exactly this
+/// width so the native control stops short of the button. One measurement, two consumers — the same
+/// arrangement as the footer's, and for the same reason: a second measurement that happens to agree
+/// is not the same as one number used twice.
+pub fn measure_path_change(dwrite: &IDWriteFactory, dpi: f32) -> Result<i32> {
+    let scale = (dpi / 96.0).max(0.5);
+    let format = chip_format(dwrite, dpi)?;
+    let measured = crate::panel::d2d::measure_text_width(
+        dwrite,
+        crate::panel::field::GHOST_WORD_CHANGE,
+        &format,
+    )?
+    .round() as i32;
+    Ok(crate::panel::field::ghost_button_width(scale, measured))
+}
+
 /// The footer buttons' widths, measured the way the painter measures them.
 ///
 /// A caller that paints and also answers clicks measures once here and hands the result to both, so
@@ -1244,6 +1352,9 @@ pub struct PaintInput<'a> {
     /// rectangles that were drawn. `None` measures here, which is what a caller that only paints
     /// wants.
     pub footer_widths: Option<[i32; 3]>,
+    /// The path row's `更改` button width, measured by the window for the same reason: the input's
+    /// own rectangle and the button's are one measurement used twice.
+    pub path_change: i32,
     /// The footer's one line of message with its level: the window decides whether there is one and
     /// what it says, the frame decides how the two levels look.
     pub status: Option<(crate::copy::Level, &'a str)>,
@@ -1261,6 +1372,7 @@ impl<'a> PaintInput<'a> {
             format: 0,
             format_open: false,
             footer_widths: None,
+            path_change: 0,
             status: None,
         }
     }
@@ -1334,6 +1446,7 @@ pub fn paint_to_dc_with_preview(
         format: input.format,
         format_open: input.format_open,
         footer_widths: input.footer_widths,
+        path_change: input.path_change,
         status: input.status,
         status_format: Some(&status_format),
         fields: input.fields,
@@ -1496,12 +1609,14 @@ mod tests {
         }
     }
 
-    /// The directory row is the one above the name row, one row pitch apart, at every scale.
+    /// The directory row is the one above the name row, and it is taller than a text row: its
+    /// content is the input (32) *and* the shortcut chips under it (24 plus the design's 6 gap), so
+    /// the name row's field starts 102 below the path row's field rather than one 72 pitch lower.
     #[test]
     fn the_directory_row_sits_above_the_name_row() {
         for scale in [1.0f32, 1.25, 1.5, 2.0] {
             let rects = DEMO.rects(scale);
-            let path = crate::panel::path_field_rect(&DEMO, &rects, scale);
+            let path = crate::panel::path_field_rect(&DEMO, &rects, scale, 56);
             let name = crate::panel::name_field_rect(&DEMO, &rects, scale);
             assert!(
                 path.top < name.top,
@@ -1509,11 +1624,22 @@ mod tests {
                 path.top,
                 name.top
             );
-            let expected = (DEMO.text_row_pitch() as f32 * scale).round() as i32;
-            assert_eq!(
-                name.top - path.top,
-                expected,
-                "the two rows must be one row pitch apart at {scale}"
+            // The path row's content (62), the gap to the next row (12), the name row's label (22)
+            // and the gap under it (6). Two independently rounded sums may differ by one pixel, so
+            // the comparison allows exactly that: `row_label_top` rounds each total once, and 1.25
+            // scale puts a half-pixel inside both.
+            let expected = ((DEMO.field_height
+                + DEMO.row_gap
+                + crate::panel::field::AFTER_CHIP_HEIGHT_DIP
+                + DEMO.row_spacing
+                + DEMO.row_label_height
+                + DEMO.row_gap) as f32
+                * scale)
+                .round() as i32;
+            assert!(
+                (name.top - path.top - expected).abs() <= 1,
+                "the two rows must be one tall row plus a row's label apart at {scale}: got {} expected {expected}",
+                name.top - path.top
             );
         }
     }
@@ -1727,37 +1853,47 @@ mod tests {
         let px = canvas.pixels();
         let rects = DEMO.rects(2.0);
         let icon = crate::panel::field::name_wand_icon_rect(&DEMO, &rects, 2.0);
-        let fill = fill_rgb(41, 41, 46);
-
-        // Find the strongest ink in the graphic's box rather than assuming a coordinate: the shape is
-        // a pair of braces, and its strokes need not cross the middle.
-        let mut best = (icon.left, icon.top);
-        let mut best_diff = 0;
+        // The shape, named by where the ink is: braces are two strokes with a gap between them, so
+        // the columns that carry ink form exactly two runs. A block, a single stroke, an X (three
+        // runs) and a glyph with no ink all fail this, which "there is ink in the box" did not.
+        let want = blend(DEMO_PALETTE.muted, [41, 41, 46, 255]);
+        // The colour: `--muted` composited over the field's fill, an absolute value rather than the
+        // strongest pixel sampled from the same picture. This is the assertion that fails when the
+        // tint drops the colour's alpha, which it did until this batch.
+        //
+        // The shape: at sixteen dip the braces' strokes merge into one band, so what can be said is
+        // that the band is centred and does not reach either edge. That rules out a block, an empty
+        // box and a glyph drawn at the wrong size; it does **not** tell braces from another icon of
+        // similar size, which is a limit of a pixel rule at this resolution rather than something
+        // this test checks by accident — `docs/41` records it.
+        let mut painted = false;
+        let mut middle_ink = false;
+        let middle = (icon.left + icon.right) / 2;
+        let edge = 4;
+        let mut left_ink = false;
+        let mut right_ink = false;
         for y in icon.top..icon.bottom {
             for x in icon.left..icon.right {
-                let p = px.pixel(x, y);
-                let diff = (i32::from(p.r) - i32::from(fill.r)).abs()
-                    + (i32::from(p.g) - i32::from(fill.g)).abs()
-                    + (i32::from(p.b) - i32::from(fill.b)).abs();
-                if diff > best_diff {
-                    best_diff = diff;
-                    best = (x, y);
+                if !close(px.pixel(x, y), want, 16) {
+                    continue;
+                }
+                painted = true;
+                if (x - middle).abs() <= 2 {
+                    middle_ink = true;
+                }
+                if x < icon.left + edge {
+                    left_ink = true;
+                }
+                if x >= icon.right - edge {
+                    right_ink = true;
                 }
             }
         }
+        assert!(painted, "the wand must be painted in --muted over the field's fill");
+        assert!(middle_ink, "the braces' band runs through the middle of their box");
         assert!(
-            best_diff > 30,
-            "the variable button must put ink in its box, over the field's fill; best {best:?}"
-        );
-        // And it is a graphic, not a filled square: the box's own corner stays the field's fill,
-        // which is what tells a 16 dip braces apart from a painted block.
-        assert_not_any(
-            &px,
-            icon.left,
-            icon.top,
-            &[px.pixel(best.0, best.1)],
-            20,
-            "a corner of the graphic's box, which must stay the field's fill",
+            !left_ink && !right_ink,
+            "and it must not reach the box's edges, or the graphic is a block: left {left_ink}, right {right_ink}"
         );
     }
 
@@ -1768,42 +1904,30 @@ mod tests {
         let px = canvas.pixels();
         let rects = DEMO.rects(2.0);
         let icon = crate::panel::field::close_icon_rect(&DEMO, &rects, 2.0);
-        let surface = fill_rgb(23, 23, 28);
-        // The glyph is an X, so its strokes cross the middle. Find the strongest ink in the box
-        // rather than assuming a coordinate, then assert that coordinate by name below.
-        let mut best = (icon.left, icon.top);
-        let mut best_diff = 0;
-        for y in icon.top..icon.bottom {
-            for x in icon.left..icon.right {
-                let p = px.pixel(x, y);
-                let diff = (i32::from(p.r) - i32::from(surface.r)).abs()
-                    + (i32::from(p.g) - i32::from(surface.g)).abs()
-                    + (i32::from(p.b) - i32::from(surface.b)).abs();
-                if diff > best_diff {
-                    best_diff = diff;
-                    best = (x, y);
-                }
-            }
-        }
-        assert!(best_diff > 30, "the close glyph must put ink in its box, best {best:?}");
+        // `color: var(--muted)` on the button (`:96`) over the surface: an absolute colour, not the
+        // strongest pixel sampled out of the same picture. The old version compared that pixel with
+        // itself at tolerance zero, which could not fail whatever the glyph was.
+        let want = blend(DEMO_PALETTE.muted, [23, 23, 28, 255]);
+        // The glyph is an X, so its two strokes cross in the middle of its box.
+        let middle = ((icon.left + icon.right) / 2, (icon.top + icon.bottom) / 2);
         assert_px(
             &px,
-            best.0,
-            best.1,
-            px.pixel(best.0, best.1),
-            0,
-            "the strongest ink the close glyph draws, at the coordinate this test found",
+            middle.0,
+            middle.1,
+            want,
+            12,
+            "the two strokes of the close glyph cross in the middle of its box",
         );
-        // And the box is not filled: its own corner is the surface, which is what tells a 14 dip
-        // glyph apart from a painted square.
-        assert_not_any(
-            &px,
-            icon.left,
-            icon.top,
-            &[px.pixel(best.0, best.1)],
-            20,
-            "a glyph corner, which must stay background",
-        );
+        // And the box is not filled: its four corners stay the surface, which is what tells a 14 dip
+        // glyph apart from a painted block — and from any other icon that fills its frame.
+        for (x, y) in [
+            (icon.left, icon.top),
+            (icon.right - 1, icon.top),
+            (icon.left, icon.bottom - 1),
+            (icon.right - 1, icon.bottom - 1),
+        ] {
+            assert_not_any(&px, x, y, &[want], 40, "a corner of the close glyph's box");
+        }
     }
 
     #[test]
@@ -1834,7 +1958,7 @@ mod tests {
         canvas.render();
         let px = canvas.pixels();
         let rects = DEMO.rects(1.0);
-        let field = crate::panel::path_field_rect(&DEMO, &rects, 1.0);
+        let field = crate::panel::path_field_rect(&DEMO, &rects, 1.0, 56);
         assert_idle_field(&px, field, "an idle directory field");
     }
 
@@ -2404,6 +2528,64 @@ mod tests {
     /// bitmap assertions in this module pass while the thing they were named after was broken. The
     /// rule is that a visual assertion states *where* and *what*, and that a mutation can make it
     /// fail: change the colour, change the order, or delete the element.
+    /// Whether any pixel inside `rect` is `want` within `tolerance`.
+    ///
+    /// Some graphics are found by scanning rather than by naming a coordinate: a folder's stroke
+    /// need not cross its box's centre, and guessing a coordinate would produce a test that either
+    /// fails for the right reason today or passes for the wrong one tomorrow.
+    fn any_close(px: &Bgra8, rect: snapclip_model::geometry::Rect, want: Px, tolerance: i32) -> bool {
+        for y in rect.top..rect.bottom {
+            for x in rect.left..rect.right {
+                if close(px.pixel(x, y), want, tolerance) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// The path row's square button is a filled ghost with a folder in it, and its first chip too.
+    ///
+    /// Both colours are absolute: `--fill` over the surface for the button's face (the same composite
+    /// the fields use) and `--muted` over that face for the graphic. The chips start at the column's
+    /// left edge, so their first folder is at a fixed place even though each chip's width depends on
+    /// its word.
+    #[test]
+    fn the_path_row_draws_a_filled_button_and_its_chips() {
+        let canvas = Canvas::new_at(1840, 1128, 192.0);
+        canvas.render();
+        let px = canvas.pixels();
+        let rects = DEMO.rects(2.0);
+        let face = fill_rgb(41, 41, 46);
+        let ink = blend(DEMO_PALETTE.muted, [41, 41, 46, 255]);
+
+        let open = crate::panel::field::path_open_rect(&DEMO, &rects, 2.0);
+        // Ten pixels in, because the button carries the design's six dip corner (`:54`): a point on
+        // the arc is the surface behind the button, not the button.
+        assert_px(
+            &px,
+            open.left + 10,
+            open.top + 10,
+            face,
+            6,
+            "the square button's --fill face (:189)",
+        );
+        let open_icon = crate::panel::field::path_open_icon_rect(&DEMO, &rects, 2.0);
+        assert!(
+            any_close(&px, open_icon, ink, 16),
+            "the square button carries its folder in --muted (:205)"
+        );
+
+        let widths = [crate::panel::field::path_chip_width(2.0, 20); 3];
+        let chip_icon = crate::panel::field::path_chip_icon_rect(&DEMO, &rects, 2.0, &widths, 0);
+        assert!(
+            any_close(&px, chip_icon, ink, 16),
+            "the first chip carries the folder the mockup puts before its word (:1008)"
+        );
+        let chip = crate::panel::field::path_chip_rect(&DEMO, &rects, 2.0, &widths, 0);
+        assert_eq!(chip.left, rects.form.left, "the chips start at the column's edge (:548)");
+    }
+
     fn assert_px(px: &Bgra8, x: i32, y: i32, want: Px, tolerance: i32, what: &str) {
         let seen = px.pixel(x, y);
         assert!(
@@ -2484,8 +2666,8 @@ mod tests {
     fn each_field_draws_its_own_frame_state() {
         let metrics = DEMO;
         let rects = metrics.rects(1.0);
-        let path = crate::panel::FieldId::Path.rect(&metrics, &rects, 1.0);
-        let name = crate::panel::FieldId::Name.rect(&metrics, &rects, 1.0);
+        let path = crate::panel::FieldId::Path.rect(&metrics, &rects, 1.0, 0);
+        let name = crate::panel::FieldId::Name.rect(&metrics, &rects, 1.0, 0);
         let focused =
             crate::panel::field_colours(crate::panel::FieldState::Focused, DEMO_PALETTE.surface);
         // The three states that do paint a border. Idle is not one of them (`:167`), which is why the
@@ -2680,10 +2862,15 @@ mod tests {
                 + DEMO.row_gap) as f32
                 * scale)
                 .round() as i32;
-            assert_eq!(
-                width.top,
-                saved.top + expected,
-                "the size row opens the second group below the after-save row (:163, :579)"
+            // Two independently rounded sums can differ by one pixel: `row_label_top` adds up the
+            // rows above and rounds the total once, and at 1.25 scale the two totals straddle a
+            // half-pixel. The assertion is therefore "within a pixel", which is what an integer
+            // grid can promise — not "exactly equal", which it cannot.
+            assert!(
+                (width.top - (saved.top + expected)).abs() <= 1,
+                "the size row opens the second group below the after-save row (:163, :579): got {} expected {}",
+                width.top - saved.top,
+                expected
             );
             assert_eq!(height.top, width.top, "both cells sit on the same row");
             assert!(width.right < height.left, "the link hub sits between the two cells (:246)");
@@ -2765,7 +2952,10 @@ mod tests {
     fn the_sheet_is_the_designs_surface_colour() {
         let canvas = Canvas::new(920, DEMO.panel_height());
         canvas.render();
-        let got = canvas.pixels().pixel(700, 300);
+        // The header band, right of the title: the form column no longer has a bare patch at this
+        // height, because the path row now carries a filled button and three chips where its
+        // surface used to show.
+        let got = canvas.pixels().pixel(700, 12);
         assert!(close(got, surface_px(), 3), "the surface should be --surface: got {got:?}");
     }
 
@@ -3197,6 +3387,12 @@ impl PanelRenderer {
     pub fn measure_footer_widths(&self, dpi: f32) -> Result<[i32; 3]> {
         measure_footer_widths(&self.dwrite, dpi)
     }
+
+    /// The path row's `更改` button width, for the same reason and with the same guarantee.
+    pub fn measure_path_change(&self, dpi: f32) -> Result<i32> {
+        measure_path_change(&self.dwrite, dpi)
+    }
+
 }
 
 /// Where an image of `source` (width, height) lands inside `card` (left, top, right, bottom):
@@ -3266,5 +3462,4 @@ mod preview_fit_tests {
         assert_eq!(fit_preview((0.0, 10.0), (0.0, 0.0, 400.0, 300.0)), (0.0, 0.0, 0.0, 0.0));
         assert_eq!(fit_preview((10.0, 10.0), (5.0, 5.0, 5.0, 5.0)), (5.0, 5.0, 5.0, 5.0));
     }
-
 }

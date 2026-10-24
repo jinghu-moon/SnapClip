@@ -126,12 +126,18 @@ impl Glyph {
 /// the output order rather than leaving it to be remembered. Getting that order wrong has cost this
 /// project three separate times.
 ///
-/// Tinting multiplies the ink by the requested colour; the alpha is kept and then multiplied into
-/// each channel, because a premultiplied bitmap expects `rgb * a`.
+/// Tinting multiplies the ink by the requested colour; the two alphas — the icon's own and the
+/// colour's — are multiplied into one, and that combined alpha is then multiplied into each channel,
+/// because a premultiplied bitmap expects `rgb * a`.
+///
+/// The colour's alpha matters and used to be dropped: `--muted` is white at sixty two percent, so an
+/// icon tinted with it must be translucent and composite over what is behind it. Keeping only the
+/// source alpha drew every icon opaque, which is why the close glyph and the variable wand were
+/// full-strength grey rather than the muted grey the design asks for.
 pub fn tint_rgba_to_premultiplied_bgra(rgba: &[u8], colour: [u8; 4]) -> Vec<u8> {
     let mut out = vec![0u8; rgba.len()];
     for (src, dst) in rgba.chunks_exact(4).zip(out.chunks_exact_mut(4)) {
-        let alpha = u32::from(src[3]);
+        let alpha = u32::from(src[3]) * u32::from(colour[3]) / 255;
         let channel = |value: u8, tint: u8| -> u8 {
             let tinted = u32::from(value) * u32::from(tint) / 255;
             ((tinted * alpha) / 255) as u8
@@ -139,7 +145,7 @@ pub fn tint_rgba_to_premultiplied_bgra(rgba: &[u8], colour: [u8; 4]) -> Vec<u8> 
         dst[0] = channel(src[2], colour[2]); // blue
         dst[1] = channel(src[1], colour[1]); // green
         dst[2] = channel(src[0], colour[0]); // red
-        dst[3] = src[3];
+        dst[3] = alpha as u8;
     }
     out
 }
