@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use super::service;
-use super::{save_panel, ConflictPolicy, PanelValues, Sequence};
+use super::{save_panel, ConflictPolicy, PanelValues, Remembered, DEFAULT_TEMPLATE};
 use snapclip_capture::save_format::SaveFormat;
 
 // -------------------------------------------------------------------------------------------------
@@ -406,12 +406,13 @@ pub struct ShellOptions {
     /// plausible number there would be inventing the answer to a question the panel exists to
     /// answer.
     pub capture_size: Option<(u32, u32)>,
-    /// The save counter, shared by every panel this shell opens.
+    /// What this shell remembers from one panel to the next: the name template and the next number.
     ///
-    /// It outlives a single panel on purpose: the spec remembers the number across saves, and a
-    /// panel is opened per capture. The handle is shared rather than copied so the panel that
-    /// writes a file is also the one that moves the counter, and no second copy can disagree.
-    pub sequence: std::sync::Arc<std::sync::Mutex<Sequence>>,
+    /// Both outlive a single panel on purpose — the spec keeps the template and the number across
+    /// saves (`:201`), and a panel is opened per capture — so they cannot live inside one. The handle
+    /// is shared rather than copied so the panel that writes a file is also the one that moves the
+    /// counter, and no second copy can disagree.
+    pub remembered: std::sync::Arc<std::sync::Mutex<Remembered>>,
 }
 
 impl Default for ShellOptions {
@@ -421,7 +422,7 @@ impl Default for ShellOptions {
             height_dip: PANEL_HEIGHT_DIP,
             preview: None,
             capture_size: None,
-            sequence: std::sync::Arc::new(std::sync::Mutex::new(Sequence::FIRST)),
+            remembered: std::sync::Arc::new(std::sync::Mutex::new(Remembered::default())),
         }
     }
 }
@@ -684,11 +685,11 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
             segment: snapclip_ui::panel::quality_segment_state(&metrics, &rects, scale, 0),
             segment_scale: scale,
             footer_widths,
-            // Handed over rather than created here: the counter is shared by every panel of this
-            // shell, and a panel that made its own would start at one again.
             format: 0,
             format_open: false,
-            sequence: options.sequence.clone(),
+            // Handed over rather than created here: the template and the counter are shared by every
+            // panel of this shell, and a panel that made its own would start from the default again.
+            remembered: options.remembered.clone(),
             // Nothing has been attempted yet, so the footer's status line has nothing to say.
             status: None,
         }));
@@ -715,7 +716,15 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
         // first. `AddFontMemResourceEx` is idempotent, and both subsets stay registered for the life
         // of the process.
         snapclip_ui::panel::register_number_font();
-        let initial_text = |id| initial_text(id, options.capture_size);
+        // The template the last panel left behind, or the spec's default on the first open (`:68`).
+        // Read once here rather than inside the loop: the field's first text is a copy, and the
+        // remembered template is what the next panel will read.
+        let template = options
+            .remembered
+            .lock()
+            .map(|remembered| remembered.template.clone())
+            .unwrap_or_default();
+        let initial_text = |id| initial_text(id, options.capture_size, &template);
         if let Some(s) = (state as *mut WindowState).as_mut() {
             for id in snapclip_ui::panel::FieldId::ALL {
                 let control = create_field_edit(
@@ -828,10 +837,10 @@ struct WindowState {
     /// Whether the format menu is open. Opening draws the accent border, turns the chevron over and
     /// paints the menu; the flag lives here because only the window knows what the last click hit.
     format_open: bool,
-    /// The save counter this panel shares with every other panel of the same shell. The panel
-    /// reads it when it saves and moves it only after a save succeeds, so a cancelled or failed
-    /// attempt leaves the number where it was.
-    sequence: std::sync::Arc<std::sync::Mutex<Sequence>>,
+    /// What the shell remembers from one panel to the next: the name template and the next number.
+    /// The panel reads the number when it saves, moves it only after a save succeeds, and writes the
+    /// template back as the name is edited.
+    remembered: std::sync::Arc<std::sync::Mutex<Remembered>>,
     /// What the last save attempt has to say, and how loudly (`docs/41` A12).
     ///
     /// `None` is the panel that has not failed at anything: the status line's space is empty. A
@@ -988,18 +997,29 @@ fn save_from_panel(hwnd: windows_sys::Win32::Foundation::HWND) -> Option<service
     let directory = control_text(s.control(snapclip_ui::panel::FieldId::Path));
     let (date, time) = local_date_and_time();
     // The number this attempt would use. Taken before the save because the name is expanded with
-    // it, and moved afterwards only if the save succeeded and the name asked for it.
-    let sequence = *s
-        .sequence
+    // it, and moved afterwards only if the save succeeded and the name asked for it. The template
+    // is read from the control rather than from here: the control is what the user sees, and the
+    // remembered copy is kept in step by the change notification.
+    let remembered = s
+        .remembered
         .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    let values = panel_values(&directory, &name, &date, &time, sequence.next(), format_of_index(s.format));
+        .map(|remembered| remembered.clone())
+        .unwrap_or_default();
+    let values = panel_values(
+        &directory,
+        &name,
+        &date,
+        &time,
+        remembered.sequence.next(),
+        format_of_index(s.format),
+    );
     let attempt = save_panel(&values, *width, *height, bgra);
     // One write of the counter, after the attempt: `after` is the rule, and it lives in one place
-    // so the cancel and failure cases cannot drift from it.
-    let moved = sequence.after(&attempt, &name);
-    if let Ok(mut guard) = s.sequence.lock() {
-        *guard = moved;
+    // so the cancel and failure cases cannot drift from it. Only the counter is written back; the
+    // template was written as it was typed and must not be overwritten with the one read above.
+    let moved = remembered.sequence.after(&attempt, &name);
+    if let Ok(mut guard) = s.remembered.lock() {
+        guard.sequence = moved;
     }
     // What the line says comes from `status_of`; this only records it. The panel is told to repaint
     // by the caller, which is the only place that knows whether the window should stay open.
@@ -1108,20 +1128,42 @@ impl WindowState {
 /// Create the name field: a real `EDIT` child, inset inside the frame the frame painter draws.
 ///
 /// Two things make this a native control rather than a drawn one. The font is the **embedded
+/// Apply one `WM_COMMAND` notification to the shell's memory, reporting whether it changed.
+///
+/// The handler's part is three lines and this function's part is the rule, kept apart for the same
+/// reason `status_of` and `initial_text` are free functions: a decision that lives only inside a
+/// message handler is a decision no test can reach. What is asserted here is which notifications
+/// count — a change in the name box writes the template, and everything else (focus in either
+/// direction, a change in any other field) leaves it alone, because a path being edited is not a
+/// name being edited.
+fn note_edit(
+    remembered: &mut Remembered,
+    id: snapclip_ui::panel::FieldId,
+    is_change: bool,
+    edited: &str,
+) -> bool {
+    if !is_change || id != snapclip_ui::panel::FieldId::Name {
+        return false;
+    }
+    remembered.remember_template(edited)
+}
+
 /// What each field holds when the panel opens.
 ///
 /// A free function rather than a closure so that the one thing that can go wrong here can be
 /// asserted without a window: the width and the height are two numbers of the same type, and
 /// handing the width to the height cell would look entirely reasonable on screen. The path row
 /// starts empty because the panel's own default is a question for the next stage, and the name
-/// row starts with the mockup's default name.
+/// row starts with **the remembered template** — the spec's `SnapClip_[日期]` on a first run
+/// (`:68`), and whatever the last panel was left with afterwards (`:201`).
 fn initial_text(
     id: snapclip_ui::panel::FieldId,
     capture_size: Option<(u32, u32)>,
+    template: &str,
 ) -> String {
     use snapclip_ui::panel::FieldId;
     match (id, capture_size) {
-        (FieldId::Name, _) => "捕获".to_string(),
+        (FieldId::Name, _) => template.to_string(),
         (FieldId::SizeWidth, Some((width, _))) => width.to_string(),
         (FieldId::SizeHeight, Some((_, height))) => height.to_string(),
         // No capture, no number. The development entry opens a panel with nothing captured, and a
@@ -1602,11 +1644,23 @@ extern "system" fn window_proc(
         WM_COMMAND => {
             const EN_SETFOCUS: u16 = 0x0100;
             const EN_KILLFOCUS: u16 = 0x0200;
+            const EN_CHANGE: u16 = 0x0300;
             let notification = ((wparam >> 16) & 0xFFFF) as u16;
             let control = lparam as windows_sys::Win32::Foundation::HWND;
             let mut repaint = false;
             if let Some(s) = state_mut(hwnd) {
                 if let Some(id) = s.field_of(control) {
+                    // The name field is a template, and the spec keeps it as it is typed (`:201`), so
+                    // the shell can open the next panel with what this one was left holding. Setting
+                    // a control's text fires the same notification as typing does — the panel's own
+                    // initial text arrives here too — which is why the rule, not this handler,
+                    // decides whether anything actually changed.
+                    if notification == EN_CHANGE {
+                        let edited = control_text(control);
+                        if let Ok(mut remembered) = s.remembered.lock() {
+                            note_edit(&mut remembered, id, true, &edited);
+                        }
+                    }
                     // Focus is not allowed to overwrite a message about the value: the field would
                     // fall silent exactly while the user is fixing what it complained about.
                     let next = match notification {
@@ -1861,11 +1915,11 @@ mod tests {
     fn the_size_cells_take_the_width_and_the_height_in_that_order() {
         let size = Some((1440, 900));
         assert_eq!(
-            initial_text(snapclip_ui::panel::FieldId::SizeWidth, size),
+            initial_text(snapclip_ui::panel::FieldId::SizeWidth, size, super::DEFAULT_TEMPLATE),
             "1440"
         );
         assert_eq!(
-            initial_text(snapclip_ui::panel::FieldId::SizeHeight, size),
+            initial_text(snapclip_ui::panel::FieldId::SizeHeight, size, super::DEFAULT_TEMPLATE),
             "900"
         );
     }
@@ -1878,18 +1932,131 @@ mod tests {
             snapclip_ui::panel::FieldId::SizeWidth,
             snapclip_ui::panel::FieldId::SizeHeight,
         ] {
-            assert_eq!(initial_text(id, None), "", "{id:?} must stay empty");
+            assert_eq!(
+                initial_text(id, None, super::DEFAULT_TEMPLATE),
+                "",
+                "{id:?} must stay empty"
+            );
         }
     }
 
-    /// The name row's default is the mockup's, and the path row has no default yet.
+    /// The name row opens with the remembered template, and the path row has no default yet.
+    ///
+    /// The template is the spec's (`:68`), not the mockup's placeholder: the box holds a template
+    /// whose variables are expanded at save time (`:189`), and `SnapClip_[日期]` is what the mockup
+    /// puts in it (`:556`). A panel with no memory — a first run — gets that default.
     #[test]
-    fn the_name_row_starts_with_the_mocks_default_name() {
+    fn the_name_row_starts_with_the_template_it_was_given() {
         assert_eq!(
-            initial_text(snapclip_ui::panel::FieldId::Name, None),
-            "捕获"
+            initial_text(snapclip_ui::panel::FieldId::Name, None, super::DEFAULT_TEMPLATE),
+            "SnapClip_[日期]"
         );
-        assert_eq!(initial_text(snapclip_ui::panel::FieldId::Path, None), "");
+        // A remembered template wins over the default: the panel opens with what the last one held.
+        assert_eq!(
+            initial_text(snapclip_ui::panel::FieldId::Name, None, "我的_[序号]"),
+            "我的_[序号]"
+        );
+        assert_eq!(
+            initial_text(snapclip_ui::panel::FieldId::Path, None, super::DEFAULT_TEMPLATE),
+            ""
+        );
+    }
+
+    /// The template survives the panel that held it.
+    ///
+    /// This walks the cycle the window performs, without a window: the panel opens with the
+    /// remembered template, the change notification writes an edited one back, and the next panel
+    /// opens with that. The assertion that the two differ is what makes the first line mean
+    /// something — otherwise "both open with the default" would pass too.
+    #[test]
+    fn the_next_panel_opens_with_the_template_the_last_one_was_left_with() {
+        use snapclip_ui::panel::FieldId;
+
+        let remembered = std::sync::Arc::new(std::sync::Mutex::new(Remembered::default()));
+        let read = |remembered: &std::sync::Arc<std::sync::Mutex<Remembered>>| {
+            remembered.lock().map(|r| r.template.clone()).unwrap_or_default()
+        };
+
+        let first = read(&remembered);
+        assert_eq!(
+            initial_text(FieldId::Name, None, &first),
+            "SnapClip_[日期]",
+            "a first run opens with the spec's template"
+        );
+
+        // What the change notification does when the user types.
+        remembered
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remember_template("我的_[序号]");
+
+        let second = read(&remembered);
+        assert_eq!(
+            initial_text(FieldId::Name, None, &second),
+            "我的_[序号]",
+            "the next panel opens with the remembered template"
+        );
+        assert_ne!(first, second, "the two panels do not open with the same text");
+    }
+
+    /// Which notifications write the remembered template.
+    ///
+    /// The path row is the one that matters: it is the other `EDIT` in the panel, its text is also a
+    /// string, and a rule that matched on "a text field changed" would put a directory into the name
+    /// box of the next panel. Every other field has the same shape, so the rule names the field.
+    #[test]
+    fn only_a_change_in_the_name_box_writes_the_template() {
+        use snapclip_ui::panel::FieldId;
+
+        let mut remembered = Remembered::default();
+
+        assert!(
+            note_edit(&mut remembered, FieldId::Name, true, "我的_[序号]"),
+            "a change in the name box is a template edit"
+        );
+        assert_eq!(remembered.template, "我的_[序号]");
+
+        assert!(
+            !note_edit(&mut remembered, FieldId::Path, true, "C:\\shots"),
+            "a change in the path box is not an edit of the name"
+        );
+        assert_eq!(
+            remembered.template, "我的_[序号]",
+            "the path must not become the template"
+        );
+
+        assert!(
+            !note_edit(&mut remembered, FieldId::Name, false, "别的"),
+            "gaining or losing focus is not an edit"
+        );
+        assert_eq!(
+            remembered.template, "我的_[序号]",
+            "focus must not write the text it was given"
+        );
+    }
+
+    /// Opening a panel sets the name box's text to the remembered template, and setting a control's
+    /// text fires the same change notification as typing does. The handler therefore runs with the
+    /// text it has just installed, which must be a no-op rather than a write that could reorder the
+    /// shell's state behind the open.
+    #[test]
+    fn installing_the_initial_text_is_not_a_change() {
+        let mut remembered = Remembered::default();
+        let initial = initial_text(
+            snapclip_ui::panel::FieldId::Name,
+            None,
+            &remembered.template,
+        );
+
+        assert!(
+            !remembered.remember_template(&initial),
+            "the panel's own initial text must not count as an edit"
+        );
+        assert_eq!(
+            remembered.template,
+            super::DEFAULT_TEMPLATE,
+            "the remembered template is unchanged"
+        );
     }
 
     /// The control table is the one place a field's identity is decided, and the message handlers ask
@@ -1914,7 +2081,7 @@ mod tests {
             footer_widths: [40, 52, 64],
             format: 0,
             format_open: false,
-            sequence: std::sync::Arc::new(std::sync::Mutex::new(Sequence::FIRST)),
+            remembered: std::sync::Arc::new(std::sync::Mutex::new(Remembered::default())),
             status: None,
         };
 
@@ -1976,7 +2143,7 @@ mod tests {
             footer_widths: [40, 52, 64],
             format: 0,
             format_open: false,
-            sequence: std::sync::Arc::new(std::sync::Mutex::new(Sequence::FIRST)),
+            remembered: std::sync::Arc::new(std::sync::Mutex::new(Remembered::default())),
             status: None,
         };
 
@@ -2042,7 +2209,7 @@ mod tests {
             footer_widths: [40, 52, 64],
             format: 0,
             format_open: false,
-            sequence: std::sync::Arc::new(std::sync::Mutex::new(Sequence::FIRST)),
+            remembered: std::sync::Arc::new(std::sync::Mutex::new(Remembered::default())),
             status: None,
         };
 

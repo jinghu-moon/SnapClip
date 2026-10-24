@@ -670,7 +670,7 @@ cargo run -p codec-bench --release -- --assert
 | A9 | **`.link-hub` 之外的两个 ghost 按钮未画** ✗（路径行的 `更改` ✓ 与文件夹图标 ✓，demo `:545`/`:546` ✓） | 宽度需要测量文本 ✓（同 B1 ✓） | 交互批 ✓ |
 | ~~A10~~ | ~~**格式下拉未画** ✗~~ ✓ **已画并可点**：按钮（`--fmt-w: 80` ✓ `:49`，等宽字 ✓ 箭头 ✓）在名字行右端，菜单（`156` ✓ `:180`）右对齐它、三项 `.PNG`/`.JPG`/`.WebP` ✓ `:717`，当前项打勾 ✓ `:184`，展开时描边变蓝 + 箭头**翻转** ✓ `:175`/`:178`（翻转在像素上做 ✓，见 `icons::flipped_180` ✓）；选中项**送进保存** ✓（`format_of_index` ✓ `save/window.rs` ✓）。缺口见 A15/A16 | — | 已完成 ✓ |
 | ~~A11~~ | ~~**`[序号]` 固定为 1** ✗~~ ✓ **已做**：`Sequence`（`save/assemble.rs` ✓）由 shell 的 `Arc<Mutex<Sequence>>` **跨面板共享** ✓（面板每次捕获一个 ✓），只在**保存成功且名字含 `[序号]`** 时 +1 ✓（见文末「序号」一节 ✓） | — | 已完成 ✓ |
-| ~~A11b~~ | ~~**名字模板不跨面板记住** ✗~~ ✓ 规格 `:201` 的另一半（"模板与序号随输入实时记住" ✗）⇒ **模板**那半是新缺口 ✓：现在每次开面板都是默认模板 ✓ | 需要 `EDIT` 的 `EN_CHANGE` ✓ 把文本写回共享状态 ✓ | 偏好批 ✓ |
+| ~~A11b~~ | ~~**名字模板不跨面板记住** ✗~~ ✓ **已完成**：模板与序号收进同一个 `Remembered` ✓（`save/assemble.rs` ✓），由 shell 的 `Arc<Mutex<Remembered>>` 跨面板共享 ✓；名字框的初值来自它 ✓（默认 `SnapClip_[日期]` ✓ = 规格 `:68` = demo `:556` ✓）；`EN_CHANGE` 只写**名字框** ✓ 的文本 ✓（见文末「模板持久化」一节 ✓） | — | 已完成 ✓ |
 | ~~A12~~ | ~~**保存失败只记日志** ✗~~ ✓ **已做**：底部的**状态行** ✓（`.status` ✓ `:275`/`:675`，`--fs-status: 11px` ✓ `:37`）显示 `status_of` 的结果 ✓ —— 校验错误用 `copy` 的句子 ✓（有 `detail` 用 `detail` ✓）、级别决定颜色 ✓（error `--danger` ✓ `:276`，warn `--warning` ✓ `:327`）、**取消与成功都不显示** ✓；**失败时面板不再关闭** ✓（关掉就把原因带走了 ✗） | — | 已完成 ✓ |
 | A13 | **悬停态未做** ✗（`.close:hover` ✓ `:97` ✓、`.btn:hover` ✓、`.fmt-btn:hover` ✓ `:174`） | 需要鼠标进入/离开消息 ✓ | 交互批 ✓ |
 | A15 | **格式菜单每项右侧的预估体积未画** ✗（`.fmt-item .val` ✓ `:186`，`:203` 要求"当前尺寸与质量下的预估体积"✓）—— 要先有体积模型 ✓ | `fmt_item_rect` 已给出每行矩形 ✓ | 预估批 ✓ |
@@ -994,3 +994,61 @@ pub fn set_focus(&mut self, id: FieldId, focused: bool) {
 ⚠️ **第三条第一次没跑成** ✗：替换锚点在我自己的测试里**也命中了一处** ✓ ⇒ 命中数 2 ✓ ⇒ 守卫（"必须正好 1 处"）**跳过**了 ✓ —— 这正是 `docs/41` 变异清单第 1 条要防的"变异没发生" ✓；换成带上下文的锚点才拿到红 ✓。
 
 **门禁** ✓：`ui` **136/0** ✓（132 ⇒ +4）· `app` **230/0/9** ✓ · `capture` **545/0/80** ✓ · `icon-bake` ✓ · `check --workspace --all-targets` Finished ✓ **无 `never used`** ✓。
+
+---
+
+## 模板持久化（A11b ✓）
+
+规格 `:201` 的一句话把两件事放在一起：**"模板与序号随输入实时记住"** ✓ —— 序号那半在「序号」一节 ✓，这里是模板那半 ✓。
+
+### 形状：一个 `Remembered`，两个写者各管一半 ✓
+
+```rust
+pub struct Remembered { pub template: String, pub sequence: Sequence }
+```
+
+- **为什么收进同一个结构体** ✓：两者的**存活期与所有者相同** ✓（都比一个面板长 ✓、都由 shell 持有 ✓、都出自规格的**同一句** ✓）⇒ 一个 `Arc<Mutex<Remembered>>` 而不是两个句柄 ✓；
+- **写者仍然分开** ✗：模板由 `EN_CHANGE` 写 ✓（跟着输入 ✓），序号只在**保存成功且名字含 `[序号]`** 时移动 ✓（`Sequence::after` ✓）⇒ 保存那一步**只写回 `sequence`** ✓，**不碰模板** ✓（有一条测试专钉这一点 ✓ —— 否则保存会把手打字的内容退回到"保存开始时"的版本 ✗）。
+
+### 默认值是规格的，不是别处的 ✓
+
+`DEFAULT_TEMPLATE = "SnapClip_[日期]"` ✓ —— 规格 `:68` ✓ 与 demo `:556` ✓ **一致** ✓。
+
+⚠️ **这里修了一处不一致** ✗：名字框原先是 `捕获` ✗，而规格与 demo 都是 `SnapClip_[日期]` ✓ ⇒ 现在由 `DEFAULT_TEMPLATE` 给出 ✓。
+
+### 哪条通知算"改过" ✓
+
+```rust
+fn note_edit(remembered, id, is_change, edited) -> bool
+    if !is_change || id != FieldId::Name { return false }
+    remembered.remember_template(edited)
+```
+
+- **`EDIT` 置文本也会触发 `EN_CHANGE`** ✗ ⇒ 面板装自己的初值时也会走到这里 ✓ ⇒ 规则里"**文本没变就不写**"✓ 让这一趟成为**无操作** ✓（有测试 ✓）；
+- **路径框是另一个 `EDIT`** ✗ 而且**文本也是字符串** ✓ ⇒ 只按"某个文本框变了"匹配就会把**目录**塞进下一张面板的名字框里 ✗ ⇒ 规则**点名 `FieldId::Name`** ✓（有测试 ✓）。
+
+### 证据
+
+| 测试 | 钉住什么 |
+| --- | --- |
+| `a_first_run_starts_with_the_specs_template_and_the_specs_number` ✓ | 默认值是 `SnapClip_[日期]` ✓ 与序号 1 ✓ |
+| `an_edited_template_is_taken_and_an_unchanged_one_is_not` ✓ | 改了就写 ✓、没变就不写 ✓、**清空也算用户的决定** ✓（合法性归保存判断 ✓） |
+| `moving_the_number_leaves_the_template_alone` ✓ | 保存**只动序号** ✓，不碰模板 ✓ |
+| `only_a_change_in_the_name_box_writes_the_template` ✓ | **路径框不算** ✓、**焦点不算** ✓ |
+| `the_next_panel_opens_with_the_template_the_last_one_was_left_with` ✓ | 跨面板 ✓（并断言两次**不同** ✓ —— 否则"都打开成默认"也能通过 ✗） |
+| `installing_the_initial_text_is_not_a_change` ✓ | 装初值那一趟是**无操作** ✓ |
+| `the_name_row_starts_with_the_template_it_was_given` ✓ | 记忆的模板**优先于**默认 ✓ |
+
+**两条变异都真红** ✓（各自**先断言替换命中 1 处** ✓，还原后**逐字节一致** ✓）：
+
+| 变异 | 红的信息 |
+| --- | --- |
+| `note_edit` 不看字段 id ✗ | `路径那一格 must not become the template` ✓（`only_a_change_in_the_name_box_writes_the_template`） |
+| `remember_template` 永不写回 ✗ | `the next panel opens with the remembered template` ✓ |
+
+### 一条诚实边界 ✗
+
+`note_edit` 与 `remember_template` 是**规则** ✓，都被断言了 ✓；而"**消息处理里确实调用了它们**"✗ **没有测试覆盖** ✗ —— 它需要一个真窗口 ✓（桌面测试 ✓）。这一条只能靠**编译**（`note_edit` 是唯一入口 ✓）与**人眼**（打一个字、关掉、再开一次 ✓）确认 ✓。
+
+⇒ 真机验证 ✓：开面板 ✓ → 把名字改成 `我的_[序号]` ✓ → 点「取消」关掉 ✓ → 再按一次 `Ctrl+S` ✓ ⇒ 名字框应是 **`我的_[序号]`** ✓（而不是 `SnapClip_[日期]` ✗）。
+

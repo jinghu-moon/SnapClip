@@ -73,6 +73,51 @@ impl Sequence {
     }
 }
 
+/// The template a shell starts with: the spec's default (`:68`), which is also the value the
+/// mockup puts in the name field (`:556`). Written down once so the field's first text and the
+/// remembered template cannot disagree about what "the default" means.
+pub const DEFAULT_TEMPLATE: &str = "SnapClip_[日期]";
+
+/// What a shell remembers from one panel to the next: the name template and the next number.
+///
+/// The spec puts them in one sentence — "模板与序号随输入实时记住" (`:201`) — and they outlive a
+/// panel for the same reason: a panel is opened per capture, so anything that is meant to survive
+/// one has to live outside it. One struct rather than two handles because they have one lifetime
+/// and one owner; the write points stay separate, because the template is written while the user
+/// types while the number only moves after a save succeeds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Remembered {
+    /// The template the next panel opens with.
+    pub template: String,
+    /// The number the next save will use.
+    pub sequence: Sequence,
+}
+
+impl Default for Remembered {
+    fn default() -> Self {
+        Self {
+            template: DEFAULT_TEMPLATE.to_owned(),
+            sequence: Sequence::FIRST,
+        }
+    }
+}
+
+impl Remembered {
+    /// Take an edited template, reporting whether anything changed.
+    ///
+    /// A rule of its own rather than three lines inside the message handler, because the case that
+    /// matters can only be asserted outside a window: setting a control's text fires the same change
+    /// notification as typing does, so the panel's own initial text arrives here as an edit. A rule
+    /// that wrote back unconditionally would look identical on screen and wake the shell for nothing.
+    pub fn remember_template(&mut self, edited: &str) -> bool {
+        if edited == self.template {
+            return false;
+        }
+        self.template = edited.to_owned();
+        true
+    }
+}
+
 /// The request one save will run with. Separate from [`save_panel`] so the name a save would
 /// use can be asserted without touching a disk.
 pub fn request_for(
@@ -356,5 +401,59 @@ mod tests {
         });
         let after_failure = second.after(&failed, "SnapClip_[序号]");
         assert_eq!(after_failure.next(), 2, "a failed save wrote no file either");
+    }
+
+    /// A first run opens with the spec's template, which is also the mockup's input value.
+    #[test]
+    fn a_first_run_starts_with_the_specs_template_and_the_specs_number() {
+        let fresh = Remembered::default();
+        assert_eq!(fresh.template, "SnapClip_[日期]", "the spec's default (:68)");
+        assert_eq!(fresh.sequence.next(), 1, "the spec's next sequence is one");
+    }
+
+    /// The template is written as it is typed, and only when it is different.
+    ///
+    /// The second half is the half that cannot be seen: setting a control's text fires the same
+    /// change notification as typing, so the panel's own initial text arrives here too. A rule that
+    /// wrote back unconditionally would look identical on screen.
+    #[test]
+    fn an_edited_template_is_taken_and_an_unchanged_one_is_not() {
+        let mut remembered = Remembered::default();
+
+        assert!(
+            remembered.remember_template("我的_[序号]"),
+            "a different template is a change"
+        );
+        assert_eq!(remembered.template, "我的_[序号]");
+
+        assert!(
+            !remembered.remember_template("我的_[序号]"),
+            "the same text again is not a change"
+        );
+        assert_eq!(remembered.template, "我的_[序号]");
+
+        assert!(
+            remembered.remember_template(""),
+            "an emptied box is still the user's choice, and the save decides whether it is legal"
+        );
+        assert_eq!(remembered.template, "");
+    }
+
+    /// The template and the number are one record with one owner, and each is written by its own
+    /// event: typing writes the template, a successful save writes the number. Moving the number
+    /// must not put the template back to what it was when the save started.
+    #[test]
+    fn moving_the_number_leaves_the_template_alone() {
+        let mut remembered = Remembered::default();
+        remembered.remember_template("我的_[序号]");
+
+        let moved = remembered.sequence.after(&Ok::<(), SaveError>(()), "我的_[序号]");
+        remembered.sequence = moved;
+
+        assert_eq!(remembered.sequence.next(), 2, "the save consumed a number");
+        assert_eq!(
+            remembered.template, "我的_[序号]",
+            "the template is the user's, not the save's"
+        );
     }
 }

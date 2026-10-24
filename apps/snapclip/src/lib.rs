@@ -313,16 +313,17 @@ impl Shell {
             let save_panels: std::sync::Arc<
                 std::sync::Mutex<Option<save::window::ShellHandle>>,
             > = std::sync::Arc::new(std::sync::Mutex::new(None));
-            // One counter for every panel this shell opens: the spec remembers the number across
-            // saves, and a panel is opened per capture, so the counter cannot live in a panel.
-            let save_sequence = std::sync::Arc::new(std::sync::Mutex::new(save::Sequence::FIRST));
+            // One record for every panel this shell opens: the spec remembers the name template and
+            // the number across saves (`:201`), and a panel is opened per capture, so neither can
+            // live inside a panel.
+            let save_remembered = std::sync::Arc::new(std::sync::Mutex::new(save::Remembered::default()));
             events.set_save_opener(std::sync::Arc::new(move |pixels| {
                 let width = (pixels.region.right - pixels.region.left) as u32;
                 let height = (pixels.region.bottom - pixels.region.top) as u32;
                 let options = save::window::ShellOptions {
                     preview: Some((pixels.bgra.clone(), width, height)),
                     capture_size: Some((width, height)),
-                    sequence: save_sequence.clone(),
+                    remembered: save_remembered.clone(),
                     ..Default::default()
                 };
                 // 先关旧、再建新、最后存 —— 顺序是契约，`replace_panel` 的文档与两条测试
