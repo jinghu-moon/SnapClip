@@ -42,6 +42,11 @@ pub struct PanelValues<'a> {
     pub quality: u8,
     /// What to do when the name is taken. The panel's default is to rename.
     pub conflict: ConflictPolicy,
+    /// The colour a transparent pixel becomes when the format cannot carry alpha (`S.fill`, `:724`).
+    ///
+    /// Straight-order `[blue, green, red]`, matching the buffers, because the fill is composited onto
+    /// them channel by channel. Only JPEG uses it; PNG and this project's WebP keep their alpha.
+    pub fill: [u8; 3],
     /// Values for the template's variables, all supplied by the caller.
     pub date: &'a str,
     pub time: &'a str,
@@ -204,6 +209,14 @@ pub fn save_panel(values: &PanelValues<'_>, frame: &Frame<'_>) -> Result<SaveOut
     let output = frame.output;
     let request = request_for(values, u64::from(output.width), u64::from(output.height))?;
     let scaled = super::scale::scaled(frame);
+    // JPEG has no alpha, so a transparent pixel has to be composited over the fill the panel shows
+    // before anything is encoded. Doing it here rather than inside the transcoder keeps the master a
+    // faithful copy of the panel's picture for the formats that do carry alpha.
+    let scaled = if request.format == SaveFormat::Jpeg {
+        super::scale::over_fill(&scaled, values.fill)
+    } else {
+        scaled
+    };
     let mut bands = WholeImage {
         bgra: &scaled,
         width: output.width,
@@ -262,7 +275,7 @@ impl BandSource for WholeImage<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::save::scale::Size;
+    use crate::save::scale::{output_size, Size, SizeMode};
 
     fn values() -> PanelValues<'static> {
         PanelValues {
@@ -271,6 +284,7 @@ mod tests {
             format: SaveFormat::Png,
             quality: TIER_QUALITY[0],
             conflict: ConflictPolicy::AutoRename,
+            fill: [255, 255, 255],
             date: "2026-10-23",
             time: "1042",
             sequence: 7,
@@ -576,6 +590,47 @@ mod tests {
         assert_eq!(
             remembered.template, "我的_[序号]",
             "the template is the user's, not the save's"
+        );
+    }
+
+    /// A percentage pair reaches the file: what the mode computes is the size in the png header.
+    ///
+    /// This is the chain the panel walks, minus the window: the two fields are read in percent, the
+    /// mode turns them into a size, and the size is what lands. Asserting the intermediate `Size`
+    /// alone would not say the file followed it.
+    #[test]
+    fn a_percentage_size_reaches_the_file() {
+        let dir = scratch("assemble-percent");
+        let source = Size::new(100, 60);
+        let mut bgra = Vec::new();
+        for y in 0..source.height {
+            for x in 0..source.width {
+                bgra.extend_from_slice(&[(x as u8).wrapping_mul(3), (y as u8).wrapping_mul(7), 90, 255]);
+            }
+        }
+        let output = output_size(SizeMode::Percent, "50", "25", source);
+        assert_eq!(
+            output,
+            Size::new(50, 15),
+            "fifty percent wide and twenty five tall"
+        );
+        let frame = Frame {
+            bgra: &bgra,
+            source,
+            output,
+        };
+        let mut v = values();
+        v.directory = dir.to_str().expect("a utf-8 temporary path");
+        v.name = "percent";
+        let outcome = save_panel(&v, &frame).expect("a save on a writable directory");
+
+        let written = std::fs::read(&outcome.path).expect("the saved file");
+        let png_width = u32::from_be_bytes([written[16], written[17], written[18], written[19]]);
+        let png_height = u32::from_be_bytes([written[20], written[21], written[22], written[23]]);
+        assert_eq!(
+            (png_width, png_height),
+            (output.width, output.height),
+            "the file is the size the percentage asked for, not the capture's size"
         );
     }
 }

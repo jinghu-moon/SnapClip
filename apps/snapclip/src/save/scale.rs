@@ -49,6 +49,30 @@ pub struct Frame<'a> {
     pub output: Size,
 }
 
+/// What the two size fields mean (`S.sizeMode`, `:734`).
+///
+/// The mockup keeps one pair of numbers and one mode, and switching the mode only changes how
+/// those numbers are written down (`:1072`, `:1073`) — the size itself does not move. That is why
+/// [`display_text`] exists next to [`output_size`]: one reads the fields, the other writes them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SizeMode {
+    /// The fields hold pixel counts (`数值`, `:585`).
+    Pixels,
+    /// The fields hold percentages of the capture (`百分比`, `:586`).
+    Percent,
+}
+
+impl SizeMode {
+    /// The mode a stored index names. Anything but the design's second button is pixels, so a
+    /// state that was never set behaves like a fresh panel.
+    pub const fn from_index(index: usize) -> Self {
+        match index {
+            1 => Self::Percent,
+            _ => Self::Pixels,
+        }
+    }
+}
+
 /// One field's text as a pixel count, or `None` when it is not a usable size.
 ///
 /// Surrounding spaces are tolerated (the control is a text field a person types in), a leading
@@ -68,11 +92,82 @@ pub fn parse_size(text: &str) -> Option<u32> {
 ///
 /// Both fields must be usable for the panel's answer to be taken; otherwise the selection's size
 /// stands. A half-edited pair is not a request to scale to some other size.
-pub fn output_size(width_text: &str, height_text: &str, source: Size) -> Size {
-    match (parse_size(width_text), parse_size(height_text)) {
-        (Some(width), Some(height)) => Size::new(width, height),
-        _ => source,
+///
+/// In [`SizeMode::Percent`] each field is read as a share of the capture and the result is rounded
+/// the way the mockup rounds it (`:1165`, `:1166`): `round(original * percent / 100)`. A share that
+/// rounds to nothing becomes one pixel rather than an error, because a size of zero is the only
+/// answer the rest of the save cannot use.
+pub fn output_size(mode: SizeMode, width_text: &str, height_text: &str, source: Size) -> Size {
+    let (width, height) = match (parse_size(width_text), parse_size(height_text)) {
+        (Some(width), Some(height)) => (width, height),
+        _ => return source,
+    };
+    match mode {
+        SizeMode::Pixels => Size::new(width, height),
+        SizeMode::Percent => Size::new(
+            percent_of(source.width, width),
+            percent_of(source.height, height),
+        ),
     }
+}
+
+/// `round(base * percent / 100)`, at least one pixel.
+fn percent_of(base: u32, percent: u32) -> u32 {
+    let scaled = (u64::from(base) * u64::from(percent) + 50) / 100;
+    scaled.max(1) as u32
+}
+
+/// The text the two fields should show for `size` in `mode`.
+///
+/// The mockup switches mode by rewriting these two fields from the size it already has (`:1072`,
+/// `:1073`): `round(size / original * 100)` in percent, the pixel count otherwise. Returning text
+/// rather than a pair of numbers keeps the caller from formatting them its own way.
+pub fn display_text(mode: SizeMode, size: Size, source: Size) -> (String, String) {
+    match mode {
+        SizeMode::Pixels => (size.width.to_string(), size.height.to_string()),
+        SizeMode::Percent => (
+            share_percent(size.width, source.width).to_string(),
+            share_percent(size.height, source.height).to_string(),
+        ),
+    }
+}
+
+/// `round(part / whole * 100)`, and zero when the whole is zero rather than a division error.
+fn share_percent(part: u32, whole: u32) -> u32 {
+    if whole == 0 {
+        return 0;
+    }
+    ((u64::from(part) * 100 + u64::from(whole) / 2) / u64::from(whole)) as u32
+}
+
+/// `bgra` composited over `fill`, so nothing is left transparent.
+///
+/// JPEG has no alpha channel, so a transparent pixel would otherwise be encoded as whatever the
+/// encoder makes of a colour that was never composited — in practice a dark halo. The capture's
+/// pixels are **straight** alpha (`artifact.rs` spells that out), which is why the arithmetic
+/// multiplies the colour by the alpha here rather than assuming that has already happened.
+///
+/// The result is the same layout with every alpha at `255`, because a JPEG has nowhere to put
+/// anything else; pixels that were already opaque come back unchanged.
+pub fn over_fill(bgra: &[u8], fill: [u8; 3]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bgra.len());
+    for pixel in bgra.chunks_exact(4) {
+        let alpha = u32::from(pixel[3]);
+        if alpha == 255 {
+            out.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
+            continue;
+        }
+        let inverse = 255 - alpha;
+        for channel in 0..3 {
+            // `channel` indexes the buffer's own order (blue first), and the fill arrives in that
+            // same order, so no channel is reordered here.
+            let value =
+                (u32::from(pixel[channel]) * alpha + u32::from(fill[channel]) * inverse + 127) / 255;
+            out.push(value as u8);
+        }
+        out.push(255);
+    }
+    out
 }
 
 /// `frame.bgra` resampled to `frame.output`.
@@ -328,9 +423,112 @@ mod tests {
     #[test]
     fn an_unusable_pair_keeps_the_selections_size() {
         let source = Size::new(1200, 800);
-        assert_eq!(output_size("600", "400", source), Size::new(600, 400));
-        assert_eq!(output_size("600", "", source), source, "one field alone is not a size");
-        assert_eq!(output_size("abc", "400", source), source);
-        assert_eq!(output_size("", "", source), source);
+        assert_eq!(
+            output_size(SizeMode::Pixels, "600", "400", source),
+            Size::new(600, 400)
+        );
+        assert_eq!(
+            output_size(SizeMode::Pixels, "600", "", source),
+            source,
+            "one field alone is not a size"
+        );
+        assert_eq!(output_size(SizeMode::Pixels, "abc", "400", source), source);
+        assert_eq!(output_size(SizeMode::Pixels, "", "", source), source);
+    }
+
+    /// The same two numbers mean different sizes in the two modes, which is the whole point of the
+    /// switch: `50` is a width in one and half the capture in the other.
+    #[test]
+    fn the_mode_decides_what_the_numbers_mean() {
+        let source = Size::new(1200, 800);
+        assert_eq!(
+            output_size(SizeMode::Pixels, "600", "400", source),
+            Size::new(600, 400)
+        );
+        assert_eq!(
+            output_size(SizeMode::Percent, "600", "400", source),
+            Size::new(7200, 3200),
+            "600 percent of the capture, not 600 pixels"
+        );
+        assert_eq!(
+            output_size(SizeMode::Percent, "50", "25", source),
+            Size::new(600, 200)
+        );
+    }
+
+    /// Percent rounds the way the mockup rounds (`:1165`), and a share that rounds to nothing is one
+    /// pixel rather than an error the save cannot use.
+    #[test]
+    fn a_percentage_is_rounded_and_never_reaches_zero() {
+        let source = Size::new(1441, 901);
+        assert_eq!(
+            output_size(SizeMode::Percent, "50", "50", source),
+            Size::new(721, 451),
+            "1441 / 2 rounds up, 901 / 2 rounds up"
+        );
+        assert_eq!(
+            output_size(SizeMode::Percent, "1", "1", source),
+            Size::new(14, 9),
+            "one percent of these sizes rounds to 14 and 9"
+        );
+        assert_eq!(
+            output_size(SizeMode::Percent, "1", "1", Size::new(30, 30)),
+            Size::new(1, 1),
+            "a share of a small capture still leaves a pixel"
+        );
+    }
+
+    /// Switching the mode rewrites the two fields from the size that is already there, and leaves
+    /// that size alone (`:1072`, `:1073`).
+    #[test]
+    fn switching_the_mode_only_rewrites_the_numbers() {
+        let source = Size::new(1440, 900);
+        let half = Size::new(720, 450);
+        assert_eq!(
+            display_text(SizeMode::Pixels, half, source),
+            ("720".to_owned(), "450".to_owned())
+        );
+        assert_eq!(
+            display_text(SizeMode::Percent, half, source),
+            ("50".to_owned(), "50".to_owned())
+        );
+        assert_eq!(
+            display_text(SizeMode::Percent, source, source),
+            ("100".to_owned(), "100".to_owned()),
+            "the capture itself is one hundred percent"
+        );
+
+        // The round trip the handler performs: read with the old mode, write with the new one.
+        let size = output_size(SizeMode::Pixels, "720", "450", source);
+        assert_eq!(size, half);
+        assert_eq!(
+            display_text(SizeMode::Percent, size, source),
+            ("50".to_owned(), "50".to_owned())
+        );
+        let back = output_size(SizeMode::Percent, "50", "50", source);
+        assert_eq!(back, half, "the size survives the round trip through percent");
+    }
+
+    /// A transparent pixel takes the fill colour; an opaque one is left exactly as it was.
+    #[test]
+    fn a_transparent_pixel_takes_the_fill_colour() {
+        // Fully transparent, then fully opaque blue-ish.
+        let pixels = [0u8, 0, 0, 0, 9, 8, 7, 255];
+        assert_eq!(
+            over_fill(&pixels, [0, 0, 0]),
+            [0, 0, 0, 255, 9, 8, 7, 255],
+            "transparent becomes black, opaque is untouched"
+        );
+        assert_eq!(
+            over_fill(&pixels, [255, 255, 255]),
+            [255, 255, 255, 255, 9, 8, 7, 255],
+            "the fill is the chosen colour, not a constant"
+        );
+
+        // Half transparent, straight alpha: half the colour and half the fill.
+        let half = [100u8, 50, 0, 128];
+        let filled = over_fill(&half, [0, 0, 0]);
+        assert_eq!(&filled[..3], &[50, 25, 0], "half of a straight-alpha colour");
+        assert_eq!(filled[3], 255, "the result is opaque, because JPEG has no alpha");
     }
 }

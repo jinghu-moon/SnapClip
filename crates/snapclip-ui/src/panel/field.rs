@@ -1300,6 +1300,40 @@ pub fn size_mode_button_rect(
     }
 }
 
+/// Which size-mode button a point lands on, if any (`数值`, `百分比`, `:585`, `:586`).
+///
+/// Half-open on both axes, the same convention as every other hit test here, and it takes the widths
+/// the paint used so a click cannot answer a button that is not where it was drawn.
+pub fn size_mode_contains(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    widths: [i32; 2],
+    point: (i32, i32),
+) -> Option<usize> {
+    (0..SIZE_MODE_WORDS.len()).find(|index| {
+        let rect = size_mode_button_rect(metrics, rects, scale, widths, *index);
+        point.0 >= rect.left
+            && point.0 < rect.right
+            && point.1 >= rect.top
+            && point.1 < rect.bottom
+    })
+}
+
+/// Whether a point is on the reset button (`:589`, `.action { width: 24px; height: 24px }`, `:229`).
+///
+/// The button is larger than the arrow it draws, so the clickable area is the button rather than the
+/// glyph — the same division as the close button's twenty six dips around a fourteen dip picture.
+pub fn size_reset_contains(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    point: (i32, i32),
+) -> bool {
+    let rect = size_mode_reset_rect(metrics, rects, scale);
+    point.0 >= rect.left && point.0 < rect.right && point.1 >= rect.top && point.1 < rect.bottom
+}
+
 pub const QUALITY_SEG_RADIUS_DIP: f32 = 7.0;
 
 /// `--r-seg-inner: 4px` (`:58`) — the selected block's corner, and the options' own.
@@ -3476,6 +3510,57 @@ mod tests {
             assert!(
                 *blended > surface[index],
                 "the hint is lighter than the surface behind it"
+            );
+        }
+    }
+
+    /// Each mode button answers only inside itself, and the two never overlap.
+    #[test]
+    fn the_mode_buttons_answer_where_they_are_drawn() {
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            let rects = crate::panel::DEMO.rects(scale);
+            let widths = [52, 64];
+            for index in 0..SIZE_MODE_WORDS.len() {
+                let rect = size_mode_button_rect(&crate::panel::DEMO, &rects, scale, widths, index);
+                let centre = ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
+                assert_eq!(
+                    size_mode_contains(&crate::panel::DEMO, &rects, scale, widths, centre),
+                    Some(index),
+                    "{:?} answers its own centre at {scale}",
+                    SIZE_MODE_WORDS[index]
+                );
+                // A point just outside the left edge is the other button, or nothing.
+                let outside = (rect.left - 1, centre.1);
+                assert_ne!(
+                    size_mode_contains(&crate::panel::DEMO, &rects, scale, widths, outside),
+                    Some(index),
+                    "{:?} must not answer one pixel to its left at {scale}",
+                    SIZE_MODE_WORDS[index]
+                );
+            }
+        }
+    }
+
+    /// The reset answers on its own button, and that button is not inside either mode button.
+    #[test]
+    fn the_reset_answers_on_its_own_button() {
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            let rects = crate::panel::DEMO.rects(scale);
+            let widths = [52, 64];
+            let reset = size_mode_reset_rect(&crate::panel::DEMO, &rects, scale);
+            let centre = ((reset.left + reset.right) / 2, (reset.top + reset.bottom) / 2);
+            assert!(
+                size_reset_contains(&crate::panel::DEMO, &rects, scale, centre),
+                "the reset answers its own centre at {scale}"
+            );
+            assert_eq!(
+                size_mode_contains(&crate::panel::DEMO, &rects, scale, widths, centre),
+                None,
+                "a click on the reset is not a click on a mode at {scale}"
+            );
+            assert!(
+                !size_reset_contains(&crate::panel::DEMO, &rects, scale, (reset.left - 1, centre.1)),
+                "one pixel to the left is outside the reset at {scale}"
             );
         }
     }

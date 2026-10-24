@@ -437,6 +437,10 @@ pub struct Frame<'a> {
     /// measures once and hands the numbers over, so the chip a click lands on is the chip that was
     /// drawn. `None` measures here, for a caller that only paints.
     pub size_presets: Option<[i32; 4]>,
+    /// Which size unit the row's two mode buttons mark as chosen (`数值`, `百分比`, `:585`).
+    pub size_mode: usize,
+    /// The two mode buttons' widths, measured by the caller for the same reason as the shortcuts'.
+    pub size_mode_widths: Option<[i32; 2]>,
     /// The quality row's hint (`.hint-text`, ten dip, `:262`): the line that takes the segmented
     /// control's place when the format has no quality tier (`:638`, `:639`).
     pub hint: Option<&'a IDWriteTextFormat>,
@@ -914,13 +918,21 @@ impl Frame<'_> {
         // reserved. `数值` carries `is-on` (`:585`) and is drawn at the label weight, which is the
         // only difference the design makes between the two.
         if let (Some(chosen_format), Some(other_format)) = (self.row_label, self.chip) {
-            let chosen = crate::panel::SIZE_MODE_CHOSEN;
-            let mut widths = [0i32; 2];
-            for (index, word) in crate::panel::SIZE_MODE_WORDS.iter().enumerate() {
-                let format = if index == chosen { chosen_format } else { other_format };
-                let measured = painter.measure_text_width(word, format)?.round() as i32;
-                widths[index] = crate::panel::size_mode_button_width(self.scale, measured);
-            }
+            // Which unit is chosen is the window's answer, not this function's: the same flag moves
+            // the highlight here and decides how the save reads the two numbers.
+            let chosen = self.size_mode;
+            let widths = match self.size_mode_widths {
+                Some(widths) => widths,
+                None => {
+                    let mut measured = [0i32; 2];
+                    for (index, word) in crate::panel::SIZE_MODE_WORDS.iter().enumerate() {
+                        let format = if index == chosen { chosen_format } else { other_format };
+                        let text = painter.measure_text_width(word, format)?.round() as i32;
+                        measured[index] = crate::panel::size_mode_button_width(self.scale, text);
+                    }
+                    measured
+                }
+            };
             let radius = (crate::panel::SIZE_MODE_RADIUS_DIP as f32 * self.scale).round() as i32;
             let container = crate::panel::size_mode_rect(
                 self.metrics,
@@ -1547,6 +1559,28 @@ pub fn measure_size_presets(dwrite: &IDWriteFactory, dpi: f32) -> Result<[i32; 4
     Ok(widths)
 }
 
+/// The two size-mode buttons' widths (`数值`, `百分比`), measured once like the shortcuts above.
+///
+/// Each word is measured in the format it will be drawn in: the chosen one at the label weight
+/// (`:585`) and the other at the chip weight (`:226`). Both are words rather than numbers, so their
+/// widths differ, and the window that answers the click has to test the rectangles the paint drew.
+pub fn measure_size_mode(dwrite: &IDWriteFactory, dpi: f32) -> Result<[i32; 2]> {
+    let scale = (dpi / 96.0).max(0.5);
+    let chosen_format = row_label_format(dwrite, dpi)?;
+    let other_format = chip_format(dwrite, dpi)?;
+    let mut widths = [0i32; 2];
+    for (index, word) in crate::panel::field::SIZE_MODE_WORDS.iter().enumerate() {
+        let format = if index == crate::panel::SIZE_MODE_CHOSEN {
+            &chosen_format
+        } else {
+            &other_format
+        };
+        let measured = crate::panel::d2d::measure_text_width(dwrite, word, format)?.round() as i32;
+        widths[index] = crate::panel::field::size_mode_button_width(scale, measured);
+    }
+    Ok(widths)
+}
+
 fn properties(dpi: f32) -> D2D1_RENDER_TARGET_PROPERTIES {
     D2D1_RENDER_TARGET_PROPERTIES {
         r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
@@ -1601,6 +1635,10 @@ pub struct PaintInput<'a> {
     pub path_chips: Option<[i32; 3]>,
     /// The four size shortcuts' widths, measured by the window for the same reason as the footer's.
     pub size_presets: Option<[i32; 4]>,
+    /// Which size unit the row's two mode buttons mark as chosen.
+    pub size_mode: usize,
+    /// The two mode buttons' widths, measured by the window for the same reason as the footer's.
+    pub size_mode_widths: Option<[i32; 2]>,
 }
 
 impl<'a> PaintInput<'a> {
@@ -1620,6 +1658,8 @@ impl<'a> PaintInput<'a> {
             var_open: false,
             path_chips: None,
             size_presets: None,
+            size_mode: crate::panel::SIZE_MODE_CHOSEN,
+            size_mode_widths: None,
         }
     }
 }
@@ -1706,6 +1746,8 @@ pub fn paint_to_dc_with_preview(
         var_label: Some(&var_label),
         path_chips: input.path_chips,
         size_presets: input.size_presets,
+        size_mode: input.size_mode,
+        size_mode_widths: input.size_mode_widths,
         hint: Some(&hint),
         preset_label: Some(&preset_label),
         fields: input.fields,
@@ -2363,6 +2405,52 @@ mod tests {
             "the track has to extend past the last option, or the insets are not being applied"
         );
     }
+
+    /// The widths the mode buttons get in these tests. Fixed rather than measured, because a test
+    /// that measures the words through the device would be asserting the measurement against itself;
+    /// what matters is that the same pair reaches the paint and the test's own rectangles.
+    const SIZE_MODE_WIDTHS: [i32; 2] = [52, 64];
+
+    /// The chosen unit is the button with the fill behind it, and switching the choice moves the
+    /// fill. The point sampled is two dips in from the button's corner: inside the button, in its
+    /// padding, clear of the centred word (`:226` pads the word by ten).
+    #[test]
+    fn the_chosen_size_mode_is_the_one_that_is_filled() {
+        let canvas = Canvas::new(920, DEMO.panel_height());
+        let rects = DEMO.rects(1.0);
+        let corner = |index: usize| {
+            let rect = crate::panel::size_mode_button_rect(&DEMO, &rects, 1.0, SIZE_MODE_WIDTHS, index);
+            (rect.left + 2, rect.top + 2)
+        };
+
+        // 数值 chosen (`:585`, the design's default).
+        canvas.render_size_mode(0);
+        let px = canvas.pixels();
+        let (cx, cy) = corner(0);
+        assert_px(&px, cx, cy, fill_rgb(41, 41, 46), 6, "the chosen mode is --fill (:227)");
+        let (ox, oy) = corner(1);
+        assert_px(
+            &px,
+            ox,
+            oy,
+            fill_rgb(28, 28, 32),
+            6,
+            "the unchosen mode is the container's --surface (:225)",
+        );
+
+        // 百分比 chosen: the fill moves, which is the visible half of the switch.
+        canvas.render_size_mode(1);
+        let px = canvas.pixels();
+        assert_px(
+            &px,
+            cx,
+            cy,
+            fill_rgb(28, 28, 32),
+            6,
+            "the formerly chosen mode loses its fill",
+        );
+        assert_px(&px, ox, oy, fill_rgb(41, 41, 46), 6, "the newly chosen mode takes it");
+    }
     /// A click and the picture it produces, in one test. The state machine chooses the option and
     /// the painter is told that choice; splitting the two is how a control ends up clickable but
     /// unchanged on screen, which is the one failure of a self drawn control that no return value
@@ -2739,6 +2827,26 @@ mod tests {
         }
 
         /// Render with a captured picture in the preview card.
+        /// Render with a chosen size mode (`0` pixels, `1` percent), which is the state a click on
+        /// `数值` or `百分比` leaves behind.
+        fn render_size_mode(&self, mode: usize) {
+            let factory = factory().expect("a Direct2D factory");
+            let dwrite = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED) }
+                .expect("a DirectWrite factory");
+            paint_to_dc_with_preview(
+                &factory,
+                &dwrite,
+                self.dc,
+                Rect::new(0, 0, self.width, self.height),
+                &PaintInput {
+                    size_mode: mode,
+                    size_mode_widths: Some(SIZE_MODE_WIDTHS),
+                    ..PaintInput::idle(self.dpi)
+                },
+            )
+            .expect("the frame paints");
+        }
+
         fn render_preview(&self, bgra: &[u8], w: u32, h: u32) {
             let factory = factory().expect("a Direct2D factory");
             let dwrite = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED) }
@@ -3765,6 +3873,12 @@ impl PanelRenderer {
     /// chip the user can see, and the chip's width is its word's.
     pub fn measure_size_presets(&self, dpi: f32) -> Result<[i32; 4]> {
         measure_size_presets(&self.dwrite, dpi)
+    }
+
+    /// The two size-mode buttons' widths, for the same reason: a click on `百分比` has to land on the
+    /// button the user can see.
+    pub fn measure_size_mode(&self, dpi: f32) -> Result<[i32; 2]> {
+        measure_size_mode(&self.dwrite, dpi)
     }
 }
 

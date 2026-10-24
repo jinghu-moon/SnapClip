@@ -687,6 +687,7 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
         // The size row's four shortcuts, measured here for the same reason: a click on `50%` has to
         // land on the chip the paint drew, and each chip is as wide as its own word.
         let size_presets = measure_size_presets(hwnd, renderer.as_ref());
+    let size_mode_widths = measure_size_mode(hwnd, renderer.as_ref());
         // The child's background: the field's own fill, resolved from `--fill` over the surface.
         // A native `EDIT` cannot be translucent, so the composite is computed once here.
         let fill = snapclip_ui::panel::field_colours(
@@ -723,6 +724,8 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
             var_open: false,
             path_chips,
             size_presets,
+        size_mode: snapclip_ui::panel::SIZE_MODE_CHOSEN,
+        size_mode_widths,
             copy: options
                 .copy
                 .take()
@@ -953,6 +956,15 @@ struct WindowState {
     /// The four size shortcuts' widths, in the design's order (`:615`–`:618`), measured once beside
     /// the footer's for the same reason: the click handler tests the chips the paint drew.
     size_presets: [i32; 4],
+    /// Which unit the two size fields speak: an index into `SIZE_MODE_WORDS` (`数值`, `百分比`,
+    /// `:585`, `:586`).
+    ///
+    /// Only the meaning of the fields changes when this changes; the size itself does not, which is
+    /// why switching rewrites the two texts from the size that is already there (`:1072`).
+    size_mode: usize,
+    /// The two mode buttons' widths, measured once beside the shortcuts' for the same reason: the
+    /// click handler tests the rectangles the paint drew.
+    size_mode_widths: [i32; 2],
     /// Where the footer's copy button sends the picture. Behind a trait so a test can see what was
     /// asked for without writing to the user's clipboard.
     copy: std::sync::Arc<dyn ImageCopy>,
@@ -1024,6 +1036,76 @@ fn measure_size_presets(
             [0; 4]
         }
         None => [0; 4],
+    }
+}
+
+/// The two size-mode buttons' widths, measured once like the shortcuts above.
+fn measure_size_mode(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    renderer: Option<&snapclip_ui::panel::PanelRenderer>,
+) -> [i32; 2] {
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96) as f32;
+    match renderer.map(|renderer| renderer.measure_size_mode(dpi)) {
+        Some(Ok(widths)) => widths,
+        Some(Err(error)) => {
+            eprintln!("[save-panel] could not measure the size mode buttons: {error:?}");
+            [0; 2]
+        }
+        None => [0; 2],
+    }
+}
+
+/// Rewrite the two size fields in `index`'s unit, leaving the size itself alone (`:1072`, `:1201`).
+///
+/// The fields are read with the unit currently in force and written with the one being switched to.
+/// That is the whole of the mockup's behaviour: the numbers are a way of writing the size down, not
+/// the size, so switching units must not resize anything.
+fn switch_size_mode(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    state: &mut WindowState,
+    index: usize,
+) {
+    let (width, height) = match state.preview.as_ref() {
+        Some((_, width, height)) => (*width, *height),
+        None => return,
+    };
+    let source = super::scale::Size::new(width, height);
+    let size = super::scale::output_size(
+        super::scale::SizeMode::from_index(state.size_mode),
+        &control_text(state.control(snapclip_ui::panel::FieldId::SizeWidth)),
+        &control_text(state.control(snapclip_ui::panel::FieldId::SizeHeight)),
+        source,
+    );
+    let text = super::scale::display_text(
+        super::scale::SizeMode::from_index(index),
+        size,
+        source,
+    );
+    state.set_size_text(&text.0, &text.1);
+    state.size_mode = index;
+    unsafe {
+        windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0);
+    }
+}
+
+/// Put the capture's own size back into the two fields, in the unit the mode is in (`:1213`).
+///
+/// The mode is deliberately not reset: the mockup resets the size and re-renders the digits in
+/// whichever unit is showing, so resetting while in percentages lands on `100`, not on a pixel count.
+fn reset_size(hwnd: windows_sys::Win32::Foundation::HWND, state: &mut WindowState) {
+    let (width, height) = match state.preview.as_ref() {
+        Some((_, width, height)) => (*width, *height),
+        None => return,
+    };
+    let source = super::scale::Size::new(width, height);
+    let text = super::scale::display_text(
+        super::scale::SizeMode::from_index(state.size_mode),
+        source,
+        source,
+    );
+    state.set_size_text(&text.0, &text.1);
+    unsafe {
+        windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0);
     }
 }
 
@@ -1132,6 +1214,13 @@ fn local_date_and_time() -> (String, String) {
     )
 }
 
+/// The colour a transparent pixel becomes in a format that has no alpha channel.
+///
+/// The mockup's default (S.fill, :724) and what the two swatches beside it will offer once they
+/// are drawn: white. Kept here rather than in the window state because nothing can change it yet, and
+/// a field nobody writes is a field that eventually lies.
+const WHITE_FILL: [u8; 3] = [255, 255, 255];
+
 /// Which format a menu index stands for.
 ///
 /// The menu's order is the design's (FMT_OPTIONS, :717): PNG, JPG, WebP. The mapping lives here
@@ -1158,6 +1247,7 @@ fn panel_values<'a>(
     sequence: u32,
     format: SaveFormat,
     quality: u8,
+    fill: [u8; 3],
 ) -> PanelValues<'a> {
     PanelValues {
         directory,
@@ -1168,6 +1258,7 @@ fn panel_values<'a>(
         // The quality tier's number, mapped by the one function that knows `docs/42` D8.
         quality,
         conflict: ConflictPolicy::AutoRename,
+        fill,
         date,
         time,
         // Supplied by the shell's shared counter rather than assumed here: the number a save uses
@@ -1283,6 +1374,7 @@ fn save_from_panel(hwnd: windows_sys::Win32::Foundation::HWND) -> Option<service
     // user sees, and a half-edited pair falls back to the selection rather than to a guess.
     let source = super::scale::Size::new(*width, *height);
     let output = super::scale::output_size(
+        super::scale::SizeMode::from_index(s.size_mode),
         &control_text(s.control(snapclip_ui::panel::FieldId::SizeWidth)),
         &control_text(s.control(snapclip_ui::panel::FieldId::SizeHeight)),
         source,
@@ -1311,6 +1403,7 @@ fn save_from_panel(hwnd: windows_sys::Win32::Foundation::HWND) -> Option<service
         remembered.sequence.next(),
         format_of_index(s.format),
         super::assemble::quality_of_tier(s.chosen_quality()),
+        WHITE_FILL,
     );
     let frame = super::scale::Frame {
         bgra,
@@ -1482,6 +1575,7 @@ fn copy_picture(
     let (bgra, width, height) = state.preview.as_ref()?;
     let source = super::scale::Size::new(*width, *height);
     let output = super::scale::output_size(
+        super::scale::SizeMode::from_index(state.size_mode),
         &control_text(state.control(snapclip_ui::panel::FieldId::SizeWidth)),
         &control_text(state.control(snapclip_ui::panel::FieldId::SizeHeight)),
         source,
@@ -1610,18 +1704,21 @@ impl WindowState {
         snapclip_ui::panel::chosen_quality(&self.segment)
     }
 
-    /// Put a size into the two cells' controls, which is what a shortcut does.
+    /// Put a size into the two cells' controls, which is what a shortcut, a mode switch and the
+    /// reset all do.
     ///
-    /// The controls are where the size lives — the save reads their text — so a shortcut writes the
-    /// text rather than a second pair of numbers that the paint would then have to agree with. One
-    /// writer, and it is the one the user can also type into.
-    fn set_size_text(&self, width: u32, height: u32) {
+    /// The controls are where the size lives — the save reads their text — so these write the text
+    /// rather than a second pair of numbers that the paint would then have to agree with. One writer,
+    /// and it is the one the user can also type into. The words are the caller's, because what the
+    /// fields hold depends on the mode: pixels in one, percentages of the capture in the other
+    /// (`scale::display_text` decides, `:1072`).
+    fn set_size_text(&self, width: &str, height: &str) {
         use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW;
         for (id, value) in [
             (snapclip_ui::panel::FieldId::SizeWidth, width),
             (snapclip_ui::panel::FieldId::SizeHeight, height),
         ] {
-            let text: Vec<u16> = value.to_string().encode_utf16().chain([0]).collect();
+            let text: Vec<u16> = value.encode_utf16().chain([0]).collect();
             unsafe {
                 SetWindowTextW(self.control(id), text.as_ptr());
             }
@@ -1974,6 +2071,8 @@ extern "system" fn window_proc(
                                 var_open: s.var_open,
                                 path_chips: Some(s.path_chips),
                                 size_presets: Some(s.size_presets),
+                                size_mode: s.size_mode,
+                                size_mode_widths: Some(s.size_mode_widths),
                                 status: s
                                     .status
                                     .as_ref()
@@ -2233,13 +2332,50 @@ extern "system" fn window_proc(
                 ) {
                     if let Some(s) = state(hwnd) {
                         if let Some((_, width, height)) = s.preview.as_ref() {
-                            let size = snapclip_ui::panel::size_preset_size(
+                            let source = super::scale::Size::new(*width, *height);
+                            let (width, height) = snapclip_ui::panel::size_preset_size(
                                 snapclip_ui::panel::SIZE_PRESET_PCT[index],
                                 (*width, *height),
                             );
-                            s.set_size_text(size.0, size.1);
+                            // The shortcut names a share of the capture; the fields then say it in
+                            // whichever unit the mode is in, so a shortcut in percent mode shows the
+                            // percentage it was asked for rather than a pixel count.
+                            let text = super::scale::display_text(
+                                super::scale::SizeMode::from_index(s.size_mode),
+                                super::scale::Size::new(width, height),
+                                source,
+                            );
+                            s.set_size_text(&text.0, &text.1);
                             InvalidateRect(hwnd, std::ptr::null(), 0);
                         }
+                    }
+                    return 0;
+                }
+
+                // The two mode buttons (`数值`, `百分比`, `:585`, `:586`). Switching the unit does not
+                // change the size; it rewrites the two fields from the size that is already there
+                // (`:1072`), which is why they are read with the old unit and written with the new.
+                let mode_widths = state(hwnd).map(|s| s.size_mode_widths).unwrap_or([0; 2]);
+                if let Some(index) = snapclip_ui::panel::size_mode_contains(
+                    &metrics,
+                    &rects,
+                    scale,
+                    mode_widths,
+                    (point.x, point.y),
+                ) {
+                    if let Some(s) = state_mut(hwnd) {
+                        switch_size_mode(hwnd, s, index);
+                    }
+                    return 0;
+                }
+
+                // The reset (`:589`, `:1213`): both numbers back to the capture's own size, in
+                // whichever unit the mode is in — one hundred percent, when it is percentages. The
+                // mode itself is left alone, because the mockup leaves it alone.
+                if snapclip_ui::panel::size_reset_contains(&metrics, &rects, scale, (point.x, point.y))
+                {
+                    if let Some(s) = state_mut(hwnd) {
+                        reset_size(hwnd, s);
                     }
                     return 0;
                 }
@@ -2280,6 +2416,8 @@ extern "system" fn window_proc(
                 // The size shortcuts are words too, so their widths are pixels and go stale the same
                 // way.
                 s.size_presets = measure_size_presets(hwnd, s.renderer.as_ref());
+                // The two mode buttons are words as well, measured in two weights.
+                s.size_mode_widths = measure_size_mode(hwnd, s.renderer.as_ref());
             }
             apply_menu_occlusion(hwnd);
             0
@@ -2579,6 +2717,7 @@ mod tests {
             7,
             format_of_index(0),
             crate::save::assemble::quality_of_tier(0),
+            WHITE_FILL,
         );
         assert_eq!(values.directory, r"C:\shots");
         assert_eq!(values.name, "SnapClip_[日期]");
@@ -2856,6 +2995,8 @@ mod tests {
             var_open: false,
             path_chips: [40, 52, 64],
             size_presets: [40, 36, 36, 36],
+        size_mode: snapclip_ui::panel::SIZE_MODE_CHOSEN,
+        size_mode_widths: [56, 64],
             copy: std::sync::Arc::new(SystemImageCopy),
         };
 
@@ -2923,6 +3064,8 @@ mod tests {
             var_open: false,
             path_chips: [40, 52, 64],
             size_presets: [40, 36, 36, 36],
+        size_mode: snapclip_ui::panel::SIZE_MODE_CHOSEN,
+        size_mode_widths: [56, 64],
             copy: std::sync::Arc::new(SystemImageCopy),
         };
 
@@ -2994,6 +3137,8 @@ mod tests {
             var_open: false,
             path_chips: [40, 52, 64],
             size_presets: [40, 36, 36, 36],
+        size_mode: snapclip_ui::panel::SIZE_MODE_CHOSEN,
+        size_mode_widths: [56, 64],
             copy: std::sync::Arc::new(SystemImageCopy),
         };
 
@@ -3214,6 +3359,8 @@ mod tests {
             var_open: false,
             path_chips: [40, 52, 64],
             size_presets: [40, 36, 36, 36],
+        size_mode: snapclip_ui::panel::SIZE_MODE_CHOSEN,
+        size_mode_widths: [56, 64],
             copy: recorder.clone(),
         };
         state.controls.fill(std::ptr::null_mut());
