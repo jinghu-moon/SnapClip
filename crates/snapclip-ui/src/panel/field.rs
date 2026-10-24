@@ -1151,6 +1151,34 @@ pub fn footer_button_contains(
         && point.1 < rect.bottom
 }
 
+/// The footer's status line: the strip's left padding, up to one gap before the copy button.
+///
+/// `.status { flex: 1; min-width: 0 }` (`save-panel-demo-v3.html:275`) is the first child of the
+/// footer (`:675`), so it takes whatever the three buttons leave. The conflict link that the mockup
+/// puts between them is not drawn yet (`docs/41`), and it is only shown when a name is taken, so the
+/// status runs to the copy button for now.
+///
+/// The band is the buttons' own, because `.foot` is `align-items: center` (`:274`) and the status is
+/// a single line of eleven dip text: centring it in the same band is what puts it on their middle
+/// line rather than on the strip's.
+pub fn footer_status_rect(
+    metrics: &FrameMetrics,
+    scale: f32,
+    widths: [i32; 3],
+) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let strip = footer_rect(metrics, scale);
+    let buttons = footer_button_rect(metrics, scale, widths, FooterButton::Copy);
+    let left = strip.left + px(FOOTER_PAD_X_DIP);
+    let right = (buttons.left - px(FOOTER_GAP_DIP)).max(left);
+    Rect {
+        left,
+        right,
+        top: buttons.top,
+        bottom: buttons.bottom,
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // The format control: the button at the right of the name row and the menu it opens.
 //
@@ -1938,6 +1966,50 @@ mod tests {
             }
             assert!(copy.left < cancel.left && cancel.left < save.left);
         }
+    }
+
+    #[test]
+    fn the_footer_status_takes_the_space_the_buttons_leave() {
+        // `.status { flex: 1; min-width: 0 }` (`:275`) is the footer's first child (`:675`), so it
+        // runs from the strip's padding to one gap before the copy button, and never over a button.
+        for scale in FOOTER_SCALES {
+            let metrics = crate::panel::DEMO;
+            let widths = FOOTER_WIDTHS;
+            let strip = footer_rect(&metrics, scale);
+            let copy = footer_button_rect(&metrics, scale, widths, FooterButton::Copy);
+            let status = footer_status_rect(&metrics, scale, widths);
+            let px = |dip: i32| (dip as f32 * scale).round() as i32;
+
+            assert_eq!(
+                status.left,
+                strip.left + px(FOOTER_PAD_X_DIP),
+                ".foot has `padding: 12px 16px 12px` (:274)"
+            );
+            assert_eq!(
+                status.right,
+                copy.left - px(FOOTER_GAP_DIP),
+                "the status stops one gap before copy"
+            );
+            assert!(
+                status.right <= copy.left,
+                "the status must not run under a button at {scale}"
+            );
+            // `.foot { align-items: center }` (:274): the status shares the buttons' band, so its
+            // single line sits on their middle line.
+            assert_eq!(status.top, copy.top);
+            assert_eq!(status.bottom, copy.bottom);
+        }
+    }
+
+    #[test]
+    fn a_footer_status_that_would_be_negative_is_empty_rather_than_backwards() {
+        // A caller that has not measured the buttons yet passes zeros, and a very narrow panel
+        // would otherwise ask for a rectangle with its right edge left of its left edge. A backwards
+        // rectangle is not an empty one: it would fill the whole strip when it reached a painter.
+        let metrics = crate::panel::DEMO;
+        let scale = 2.0;
+        let zero = footer_status_rect(&metrics, scale, [0; 3]);
+        assert!(zero.right >= zero.left, "a status is never backwards");
     }
 
     #[test]

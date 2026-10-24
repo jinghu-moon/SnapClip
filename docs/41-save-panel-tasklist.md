@@ -671,10 +671,16 @@ cargo run -p codec-bench --release -- --assert
 | ~~A10~~ | ~~**格式下拉未画** ✗~~ ✓ **已画并可点**：按钮（`--fmt-w: 80` ✓ `:49`，等宽字 ✓ 箭头 ✓）在名字行右端，菜单（`156` ✓ `:180`）右对齐它、三项 `.PNG`/`.JPG`/`.WebP` ✓ `:717`，当前项打勾 ✓ `:184`，展开时描边变蓝 + 箭头**翻转** ✓ `:175`/`:178`（翻转在像素上做 ✓，见 `icons::flipped_180` ✓）；选中项**送进保存** ✓（`format_of_index` ✓ `save/window.rs` ✓）。缺口见 A15/A16 | — | 已完成 ✓ |
 | ~~A11~~ | ~~**`[序号]` 固定为 1** ✗~~ ✓ **已做**：`Sequence`（`save/assemble.rs` ✓）由 shell 的 `Arc<Mutex<Sequence>>` **跨面板共享** ✓（面板每次捕获一个 ✓），只在**保存成功且名字含 `[序号]`** 时 +1 ✓（见文末「序号」一节 ✓） | — | 已完成 ✓ |
 | ~~A11b~~ | ~~**名字模板不跨面板记住** ✗~~ ✓ 规格 `:201` 的另一半（"模板与序号随输入实时记住" ✗）⇒ **模板**那半是新缺口 ✓：现在每次开面板都是默认模板 ✓ | 需要 `EDIT` 的 `EN_CHANGE` ✓ 把文本写回共享状态 ✓ | 偏好批 ✓ |
-| A12 | **保存失败只记日志** ✗ —— `SaveError::Validation{copy}` 是**键** ✓，怎么呈现属 UI 设计 ✓ | `save_from_panel` 的 `Err` 分支 ✓ | 错误提示批 ✓ |
+| ~~A12~~ | ~~**保存失败只记日志** ✗~~ ✓ **已做**：底部的**状态行** ✓（`.status` ✓ `:275`/`:675`，`--fs-status: 11px` ✓ `:37`）显示 `status_of` 的结果 ✓ —— 校验错误用 `copy` 的句子 ✓（有 `detail` 用 `detail` ✓）、级别决定颜色 ✓（error `--danger` ✓ `:276`，warn `--warning` ✓ `:327`）、**取消与成功都不显示** ✓；**失败时面板不再关闭** ✓（关掉就把原因带走了 ✗） | — | 已完成 ✓ |
 | A13 | **悬停态未做** ✗（`.close:hover` ✓ `:97` ✓、`.btn:hover` ✓、`.fmt-btn:hover` ✓ `:174`） | 需要鼠标进入/离开消息 ✓ | 交互批 ✓ |
 | A15 | **格式菜单每项右侧的预估体积未画** ✗（`.fmt-item .val` ✓ `:186`，`:203` 要求"当前尺寸与质量下的预估体积"✓）—— 要先有体积模型 ✓ | `fmt_item_rect` 已给出每行矩形 ✓ | 预估批 ✓ |
 | A16 | **切换格式的连带变化未做** ✗（`:204`：质量行 ✓ 高级选项 ✓ JPG 填充行 ✓ 与重新估算 ✓）—— 后两者**还没画** ✓ | — | 高级项批 ✓ |
+| A17 | **行头 `.field-msg` 与修复胶囊未做** ✗（`:335`–`:341` ✓，`repair()` 已在 `copy.rs` 里备好 ✓）—— 失败目前只在**底部一行** ✓，指出**哪个字段**要等它 | 字段级提示需要一个"哪个字段出错"的来源 ✓ | 错误提示批其二 ✓ |
+| A18 | **字段边框变红未做** ✗（`.text-input.is-error { border-color: danger }` ✓ `:333`）—— `FieldState::Error` 的规则**早就写好** ✓，只差把失败接到具体字段上 ✓ | 同上 ✓（先要有"哪个字段"✓） | 与 A17 同批 ✓ |
+| A19 | **绘制入口的实参已经 13 个** ✗（`paint_to_dc_with_preview` ✓ `paint_to_target_with_preview` ✓ `paint_with_preview` ✓ 各一长串位置参数 ✓）—— 再加一项就是第 14 个 ✓，而位置参数**错一个不会编译不过**（同类型可以互换 ✗） | 收成一个 `PanelScene` 结构体 ✓ ⇒ 字段有名 ✓、默认值一处 ✓ | **下一个要给绘制加参数的批次先做它** ✓ |
+| A20 | **三种失败的状态文案是开发者语** ✗ —— `Capability` ✓ `UnsupportedFormat` ✓ `Io` ✓ 走的是 `SaveError::message()` ✓，那是 `Debug`/英文短句 ✓（ascii ✓ 所以能画 ✓），不是给用户看的措辞 ✓ | 规格 §8.2 没有这三条的句子 ✓ ⇒ 要先定文案 ✓（新增句子会牵动字形子集 ✓） | 文案批 ✓ |
+| A21 | **`detail` 可能引用用户输入** ✗ —— 例如 `illegal_chars("a*b")` ✓ 与 `reserved_name(名字)` ✓ ⇒ 用户打的字**不一定在子集里** ✗ ⇒ 会**回退系统字体** ✓（能显示 ✓，字形不是我们的 ✓） | 子集装不下任意输入 ✓；要么限定显示 ✓、要么接受回退 ✓ —— **先记录** ✓ | 文案批（与 A20 一起决定）✓ |
+| A22 | **两个黄色** ✗ —— `field_colours` 的 `WARNING` 是 `[255,191,0]` ✗，而 demo 的 `--warning` 是 `rgb(240,179,90)` ✓（`:23` ✓，`.status.is-warning` 与冲突链接都用它 ✓）；demo **没有**字段警告边框的规则 ✗ | 字段警告边框的规则**不在设计稿里** ✓ ⇒ 那个黄是**推断出来的** ✓，而本批的状态行用的是**设计稿的黄** ✓（`FramePalette::warning` ✓） | 画字段警告态时统一 ✓ |
 
 > **A10 的两条行为决定**（不是遗漏 ✓）：① 菜单打开时，**菜单外的一次点击只关闭菜单、不做别的** ✓ —— 菜单里的第一下属于菜单 ✓（与常见菜单一致 ✓）；② 菜单的**每项体积**与**悬停态**见 A15/A13 ✓。
 >
@@ -892,3 +898,37 @@ pub fn after<T>(self, result: &Result<T, SaveError>, template: &str) -> Self {
 - 去掉"名字要了才推进"这个条件 ✗ ⇒ `a_template_without_the_sequence_does_not_consume_a_number` **FAILED** ✓（`the name never asked for a number: left: 2 right: 1` ✓）。
 
 **仍缺的一半** ✗：规格同一句里的"**模板也要记住**" ✗ —— 现在每次开面板都是默认模板 ✓ ⇒ 新缺口 **A11b** ✓，需要 `EDIT` 的 `EN_CHANGE` 把文本写回共享状态 ✓。
+
+---
+
+#### 底部状态行（A12 ✓ 已完成）
+
+**问题** ✓：保存失败**只记日志** ✗ ⇒ 用户**看不见** ✗。而比"看不见"更糟的是：点「保存」后**无条件关面板** ✗（`PostMessageW(WM_CLOSE)` 在 `save_from_panel` 之后 ☑）⇒ **失败也把原因一起带走** ✗。
+
+**demo 的两处错误位** ✓：`.field-msg`（**行头** ✓ `:335`–`:341` ✓，带修复胶囊 ✓）与 `.status.is-error`（**红色状态行** ✓ `:276` ✓）；本批**只做后者** ✓（A17/A18 记前者 ✓）。
+
+**要画的** ✓：`.status` 是 footer 的**第一个子元素** ✓（`:675` ✓），`flex: 1` ✓ ⇒ 占三个按钮**剩下的那条** ✓；`--fs-status: 11px` ✓（`:37` ✓）；级别决定颜色 ✓（`is-error` ⇒ `--danger` ✓ `:276`、`is-warning` ⇒ `--warning` ✓ `:327`）。
+
+**几何** ✓：`footer_status_rect`（`field.rs` ✓）= 从 `strip.left + FOOTER_PAD_X_DIP` ✓ 到 `copy.left - FOOTER_GAP_DIP` ✓，**band 与按钮相同** ✓（`.foot { align-items: center }` ✓ `:274` ⇒ 单行文字落在按钮的中线上 ✓）；宽度为负时**退化成空的** ✓ 而不是"右边缘在左边缘左边"✗。
+
+**文案与级别** ✓：`status_of(&Result<SaveOutcome, SaveError>)`（`save/window.rs` ✓，**自由纯函数** ✓ —— 同一路数的第三个：`initial_text` ✓ `panel_values` ✓ 现在这个 ✓）。三条规则可见 ✓：
+- **成功 ⇒ `None`** ✓（面板要关 ✓，没有行可读 ✓）；
+- **取消 ⇒ `None`** ✓（`SaveError::Cancelled` 自己的注释写着"用户改主意了，不是错误"✓ —— 画成红色是**对事实的撒谎** ✗）；
+- 其余 ⇒ 有话说 ✓，级别来自**消息自己的规则** ✓（`ValidationCopy::level()` ✓）⇒ "不拦保存的警告"与"拦住保存的错误"**不会同色**✓；`detail` 有就用它 ✓（模板带 `{…}` 比没用还糟 ✗）。
+
+**行为改动** ✓：失败时**面板不关** ✓ + 重绘 ✓；成功才关 ✓。「每次点保存先把旧句子清掉」✓（否则会在一件即将成功的事上方挂着上次的失败 ✗）。
+
+**证据** ✓（`ui` **132/0** ✓（+4）、`app` **230/0/9** ✓（+5）、`capture` 545/0/80 ✓、`check` Finished ✓ **无死代码** ✓）：
+- `the_footer_status_takes_the_space_the_buttons_leave` ✓（四 DPI ✓：左=条带内边距 ✓、右=copy 左缘减一个 gap ✓、band 与按钮同 ✓）；
+- `a_footer_status_that_would_be_negative_is_empty_rather_than_backwards` ✓；
+- `the_footer_status_is_drawn_in_its_levels_colour` ✓（**2× 上采样** ✓：同一句 `文件名不能为空` 在 error 级 = `--danger` ✓、warn 级 = `--warning` ✓ —— **指名位置 + 颜色** ✓）；
+- `a_panel_without_a_message_leaves_the_status_space_clean` ✓（**框内每个像素都是表面色** ✓ —— 这条让上一条有意义 ✗：若那条线**永远有墨**✓，颜色断言会在"装饰"✗ 而不是"回答"✓ 上通过 ✓）；
+- app 侧五条 ✓：成功不说 ✓ / 取消不说 ✓ / 校验句与级别 ✓ / `detail` 胜出 ✓ / 没有键的失败也说 ✓。
+
+**两条变异都真红** ✓（都**先断言替换命中 1 处** ✓，还原**逐字节一致** ✓）：
+- 让取消也说 ✗ ⇒ `a_cancelled_save_says_nothing` **FAILED** ✓（`left: Some((Error, "cancelled")) / right: None` ✓）；
+- 让警告用错误色 ✗ ⇒ 位图那条 **FAILED** ✓（`must be drawn in --warning: the closest pixel … is Px{b:118,g:117,r:241}` ✓ = 抗锯齿后的 `--danger` ✓）。
+
+**一条被测试抓出来的真不一致** ✗✓：`field_colours` 的 `WARNING` 是 `[255,191,0]` ✗，而 demo 的 `--warning` 是 `rgb(240,179,90)` ✓ —— **两个黄** ✓。本条线用**设计稿的黄** ✓（`FramePalette::warning` ✓ + `warning_text` 笔刷 ✓），字段边框那个**不动** ✗（不在本批范围 ✓）⇒ 记入 **A22** ✓。
+
+**一条工程账** ✗：绘制入口的**位置参数已到 13 个** ✓ ⇒ 记入 **A19** ✓（下一个给绘制加参数的批次先把它们收成结构体 ✓ —— 位置参数错一个**不会编译不过** ✓，同类型可以互换 ✗）。

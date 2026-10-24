@@ -193,6 +193,13 @@ pub struct FramePalette {
     /// `--accent-text: rgb(94,162,245)` (`:29`) — the brighter blue the design uses for small marks
     /// on the dark surface, because the primary accent is only about 4:1 against it.
     pub accent_text: [u8; 4],
+    /// `--warning: rgb(240,179,90)` (`:23`) — the colour `.status.is-warning` (`:327`) and the
+    /// conflict link (`:328`) use.
+    ///
+    /// It is **not** the colour `field_colours` gives a warning field's border (`255,191,0`): that
+    /// token does not appear in the mockup at all and is recorded as an open question in `docs/41`.
+    /// Two different yellows for two different jobs is exactly how "the warning looks wrong" starts.
+    pub warning: [u8; 4],
 }
 
 pub const DEMO_PALETTE: FramePalette = FramePalette {
@@ -202,6 +209,7 @@ pub const DEMO_PALETTE: FramePalette = FramePalette {
     muted: [232, 236, 242, 158],
     label: [232, 236, 242, 189],
     accent_text: [94, 162, 245, 255],
+    warning: [240, 179, 90, 255],
 };
 
 /// Brushes the frame paints with. A brush belongs to the target that made it, so the caller
@@ -229,6 +237,8 @@ pub struct FrameBrushes {
     pub warning: ID2D1SolidColorBrush,
     /// `--accent-text` (`:29`), the locked link hub's icon colour.
     pub accent_text: ID2D1SolidColorBrush,
+    /// `--warning` (`:23`), the footer status line's warning colour (`:327`).
+    pub warning_text: ID2D1SolidColorBrush,
     /// The same colour as bytes, for the icon's tint, which is arithmetic rather than a brush.
     pub accent_text_rgba: [u8; 4],
     /// `--muted` as bytes, for icons tinted on the processor rather than by a brush.
@@ -275,6 +285,7 @@ impl FrameBrushes {
             danger: brush(target, error.border)?,
             warning: brush(target, warning.border)?,
             accent_text: brush(target, palette.accent_text)?,
+            warning_text: brush(target, palette.warning)?,
             accent_text_rgba: palette.accent_text,
             muted_rgba: palette.muted,
             checker_light: brush(target, CHECKER_LIGHT)?,
@@ -385,6 +396,15 @@ pub struct Frame<'a> {
     /// Whether the menu is open. Open draws the accent border, turns the chevron over and draws the
     /// menu itself; the message handler owns the flag, and the painter only reads it.
     pub format_open: bool,
+    /// The footer's one line of message, with the severity that decides its colour.
+    ///
+    /// The level comes from the message's own rule (`copy::ValidationCopy::level`), not from the
+    /// caller's opinion: a warning that does not block a save and an error that does should not both
+    /// be painted the same red. `None` draws nothing, which is the state of a panel that has not
+    /// failed at anything yet.
+    pub status: Option<(crate::copy::Level, &'a str)>,
+    /// The status line's format (`--fs-status: 11px`, `:37`).
+    pub status_format: Option<&'a IDWriteTextFormat>,
 }
 
 impl Frame<'_> {
@@ -772,6 +792,23 @@ impl Frame<'_> {
             let separator =
                 crate::panel::footer_separator_rect(self.metrics, self.scale, widths);
             painter.fill_round(separator, 0, &self.brushes.line_soft);
+
+            // The status line (`:275`, `:675`): the footer's first child, in the space the buttons
+            // leave. `.status.is-error` is `--danger` (`:276`) and `.is-warning` is `--warning`
+            // (`:327`), and the level travels with the message so the panel cannot pick its own
+            // colour for it.
+            if let (Some((level, text)), Some(format)) = (self.status, self.status_format) {
+                if !text.is_empty() {
+                    let rect = crate::panel::footer_status_rect(self.metrics, self.scale, widths);
+                    let colour = match level {
+                        crate::copy::Level::Error => &self.brushes.danger,
+                        // `--warning` (`:23`), not the field border's yellow: `.status.is-warning`
+                        // is the token the design uses for a warning *sentence*.
+                        crate::copy::Level::Warn => &self.brushes.warning_text,
+                    };
+                    painter.draw_text(text, format, rect, colour);
+                }
+            }
         }
 
         // The format control last, because its menu hangs over everything else. The button shares the
@@ -1041,6 +1078,15 @@ pub fn button_strong_format(dwrite: &IDWriteFactory, dpi: f32) -> Result<IDWrite
     Ok(format)
 }
 
+/// `--fs-status: 11px` (`save-panel-demo-v3.html:37`). The footer's one line of message.
+pub const STATUS_FONT_DIP: f32 = 11.0;
+
+/// The footer's status line: `--fs-status` at the body weight, leading-aligned because `.status` is
+/// a plain span that starts where its box does (`:275`).
+pub fn status_format(dwrite: &IDWriteFactory, dpi: f32) -> Result<IDWriteTextFormat> {
+    text_format(dwrite, dpi, STATUS_FONT_DIP, DWRITE_FONT_WEIGHT_NORMAL)
+}
+
 /// The footer buttons' widths, measured the way the painter measures them.
 ///
 /// A caller that paints and also answers clicks measures once here and hands the result to both, so
@@ -1162,7 +1208,9 @@ pub fn paint_to_dc_with_state(
     fill_surface: bool,
     fields: crate::panel::FieldStates,
 ) -> Result<()> {
-    paint_to_dc_with_preview(factory, dwrite, hdc, area, dpi, fill_surface, fields, None, 0, 0, false, None)
+    paint_to_dc_with_preview(
+        factory, dwrite, hdc, area, dpi, fill_surface, fields, None, 0, 0, false, None, None,
+    )
 }
 
 /// [`paint_to_dc_with_state`] with a captured picture for the preview card. The old signature
@@ -1189,6 +1237,7 @@ pub fn paint_to_dc_with_preview(
     format: usize,
     format_open: bool,
     footer_widths: Option<[i32; 3]>,
+    status: Option<(crate::copy::Level, &str)>,
 ) -> Result<()> {
     // DPI 96 on the target, deliberately: `rects(scale)` below already converts every dip to a
     // pixel, so a target carrying the real DPI would scale those pixels a second time. That is
@@ -1220,6 +1269,8 @@ pub fn paint_to_dc_with_preview(
     let button_strong = button_strong_format(dwrite, dpi)?;
     // The format control's word, in the numeric face (:173, :182).
     let format_label = format_label_format(dwrite, dpi)?;
+    // The footer's status line (`--fs-status: 11px`, :37).
+    let status_format = status_format(dwrite, dpi)?;
     let painter = PanelPainter {
         context: &target,
         text_factory: dwrite,
@@ -1247,6 +1298,8 @@ pub fn paint_to_dc_with_preview(
         format,
         format_open,
         footer_widths,
+        status,
+        status_format: Some(&status_format),
         fields,
         preview: preview.as_ref().map(|(b, w, h)| (b, *w, *h)),
         quality,
@@ -1268,11 +1321,23 @@ pub fn paint_to_target(
     dpi: f32,
     fill_surface: bool,
 ) -> Result<FrameRects> {
-    paint_to_target_with_preview(target, dwrite, dpi, fill_surface, None, 0, 0, false, None)
+    paint_to_target_with_preview(
+        target,
+        dwrite,
+        dpi,
+        fill_surface,
+        None,
+        0,
+        0,
+        false,
+        None,
+        None,
+    )
 }
 
 /// [`paint_to_target`] with a captured picture for the preview card. The old signature delegates
 /// here with `None`, so no existing caller or bitmap test has to change.
+#[allow(clippy::too_many_arguments)]
 pub fn paint_to_target_with_preview(
     target: &ID2D1RenderTarget,
     dwrite: &IDWriteFactory,
@@ -1283,6 +1348,7 @@ pub fn paint_to_target_with_preview(
     format: usize,
     format_open: bool,
     footer_widths: Option<[i32; 3]>,
+    status: Option<(crate::copy::Level, &str)>,
 ) -> Result<FrameRects> {
     let brushes = FrameBrushes::new(target, &DEMO_PALETTE)?;
     let scale = (dpi / 96.0).max(0.5);
@@ -1311,6 +1377,8 @@ pub fn paint_to_target_with_preview(
     let button_strong = button_strong_format(dwrite, dpi)?;
     // The format control's word, in the numeric face (:173, :182).
     let format_label = format_label_format(dwrite, dpi)?;
+    // The footer's status line (`--fs-status: 11px`, :37).
+    let status_format = status_format(dwrite, dpi)?;
     Frame {
         metrics: &metrics,
         rects: &rects,
@@ -1327,6 +1395,8 @@ pub fn paint_to_target_with_preview(
         format,
         format_open,
         footer_widths,
+        status,
+        status_format: Some(&status_format),
         fields: crate::panel::FieldStates::IDLE,
         preview: preview.as_ref().map(|(b, w, h)| (b, *w, *h)),
         quality,
@@ -1359,6 +1429,7 @@ mod tests {
                 0,
                 format,
                 open,
+                None,
                 None,
             )
             .expect("the frame paints with a chosen format");
@@ -1654,6 +1725,60 @@ mod tests {
             px.pixel(400, border_y + 6),
             "the footer must begin at its border"
         );
+    }
+
+    /// The footer's status line: the one place a failed save is visible at all.
+    ///
+    /// At double scale for the same reason the buttons' words are: eleven dip text at unit scale
+    /// antialiases to a fraction of its colour, so the assertion would have to accept a blend and
+    /// stop testing the colour.
+    ///
+    /// The two levels are the design's two colours: `.status.is-error` is `--danger` (`:276`) and
+    /// `.is-warning` is `--warning` (`:327`). The same sentence is drawn in both, because what
+    /// changes is the level, not the wording.
+    #[test]
+    fn the_footer_status_is_drawn_in_its_levels_colour() {
+        // A sentence that is in the embedded subset, so the pixels come from our own face: the
+        // glyph gate carries all eleven messages (`overlay_drawn_strings` collects `copy`).
+        let text = crate::copy::ValidationCopy::StemEmpty.message();
+        for (level, colour, name) in [
+            (crate::copy::Level::Error, fill_rgb(255, 123, 123), "--danger"),
+            (crate::copy::Level::Warn, fill_rgb(240, 179, 90), "--warning"),
+        ] {
+            let canvas = Canvas::new_at(1840, 1128, 192.0);
+            let widths = canvas.render_status(Some((level, text)));
+            let px = canvas.pixels();
+            let rect = crate::panel::footer_status_rect(&DEMO, 2.0, widths);
+            let (got, x, y) = strongest(&px, rect, colour);
+            assert!(
+                close(got, colour, 12),
+                "{text} at {level:?} must be drawn in {name}: the closest pixel in the status's \
+                 own box is {got:?} at ({x}, {y})"
+            );
+        }
+    }
+
+    /// A panel that has not failed at anything draws nothing in the status's space.
+    ///
+    /// This is what makes the assertion above mean something: if the line were always inked, the
+    /// colour test would pass while the message was a decoration rather than an answer.
+    #[test]
+    fn a_panel_without_a_message_leaves_the_status_space_clean() {
+        let canvas = Canvas::new_at(1840, 1128, 192.0);
+        let widths = canvas.render_status(None);
+        let px = canvas.pixels();
+        let rect = crate::panel::footer_status_rect(&DEMO, 2.0, widths);
+        let surface = fill_rgb(23, 23, 28);
+        // Every pixel in the status's box is the surface: nothing is drawn there.
+        for y in rect.top..rect.bottom {
+            for x in rect.left..rect.right {
+                assert!(
+                    close(px.pixel(x, y), surface, 6),
+                    "the status space is ink at ({x}, {y}) with no message to show: {:?}",
+                    px.pixel(x, y)
+                );
+            }
+        }
     }
 
     #[test]
@@ -2187,6 +2312,7 @@ mod tests {
                 0,
                 false,
                 None,
+                None,
             )
             .expect("the frame paints with a preview");
         }
@@ -2211,8 +2337,39 @@ mod tests {
                 0,
                 false,
                 None,
+                None,
             )
             .expect("the frame paints with a chosen quality");
+        }
+
+        /// Render with a footer status line, which is the state a failed save leaves behind.
+        ///
+        /// The widths are measured here and handed to the paint, so the rectangle the status is
+        /// given in the assertions below is the one it was drawn in: the status ends where the copy
+        /// button begins, and that number comes from the same rule the paint uses.
+        fn render_status(&self, status: Option<(crate::copy::Level, &str)>) -> [i32; 3] {
+            let factory = factory().expect("a Direct2D factory");
+            let dwrite = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED) }
+                .expect("a DirectWrite factory");
+            let widths = crate::panel::measure_footer_widths(&dwrite, self.dpi)
+                .expect("the footer's widths");
+            paint_to_dc_with_preview(
+                &factory,
+                &dwrite,
+                self.dc,
+                Rect::new(0, 0, self.width, self.height),
+                self.dpi,
+                true,
+                crate::panel::FieldStates::IDLE,
+                None,
+                0,
+                0,
+                false,
+                Some(widths),
+                status,
+            )
+            .expect("the frame paints with a status");
+            widths
         }
 
         /// The pixels, through the only view that exists. Deliberately no direct byte accessor:
@@ -3077,6 +3234,10 @@ impl PanelRenderer {
     ///
     /// `footer_widths` comes from [`PanelRenderer::measure_footer_widths`] so that the window can
     /// test a click against the same rectangles it paints.
+    ///
+    /// `status` is the footer's one line of message, with its level: the window decides *whether*
+    /// there is a message and *what* it says, and the frame only decides how the two levels look.
+    #[allow(clippy::too_many_arguments)]
     pub fn paint_with_preview(
         &self,
         hdc: *mut core::ffi::c_void,
@@ -3089,6 +3250,7 @@ impl PanelRenderer {
         format: usize,
         format_open: bool,
         footer_widths: [i32; 3],
+        status: Option<(crate::copy::Level, &str)>,
     ) -> Result<()> {
         paint_to_dc_with_preview(
             &self.factory,
@@ -3103,6 +3265,7 @@ impl PanelRenderer {
             format,
             format_open,
             Some(footer_widths),
+            status,
         )
     }
 

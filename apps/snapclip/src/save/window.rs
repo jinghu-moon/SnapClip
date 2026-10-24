@@ -689,6 +689,8 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
             format: 0,
             format_open: false,
             sequence: options.sequence.clone(),
+            // Nothing has been attempted yet, so the footer's status line has nothing to say.
+            status: None,
         }));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
 
@@ -830,6 +832,13 @@ struct WindowState {
     /// reads it when it saves and moves it only after a save succeeds, so a cancelled or failed
     /// attempt leaves the number where it was.
     sequence: std::sync::Arc<std::sync::Mutex<Sequence>>,
+    /// What the last save attempt has to say, and how loudly (`docs/41` A12).
+    ///
+    /// `None` is the panel that has not failed at anything: the status line's space is empty. A
+    /// failure fills it, and the panel **stays open** so the sentence can be read and the value that
+    /// caused it corrected — closing on failure, which is what it used to do, made every rejection
+    /// invisible.
+    status: Option<(snapclip_ui::copy::Level, String)>,
 }
 
 /// The footer buttons' widths for this window, or zeros if Direct2D never started.
@@ -925,18 +934,52 @@ fn panel_values<'a>(
     }
 }
 
+/// What a save attempt has to say in the footer's status line, if anything.
+///
+/// One place decides this, and it is a pure function so it can be asserted without a window — the
+/// same reason `panel_values` and `initial_text` are functions. Three rules are visible here:
+///
+/// - a **success** says nothing: the panel closes, so there is no line to read;
+/// - a **cancel** says nothing: nothing went wrong, the user changed their mind (`SaveError`'s own
+///   comment), and an error colour would be a lie about what happened;
+/// - everything else says something, at the level its own rule gives it, so a warning that does not
+///   block a save and an error that does cannot be painted the same red.
+///
+/// The wording comes from the two places that own it: the validation table's `copy` (with its filled
+/// `detail` when it has one), and `SaveError::message` for the rest.
+fn status_of(
+    result: &Result<service::SaveOutcome, service::SaveError>,
+) -> Option<(snapclip_ui::copy::Level, String)> {
+    match result {
+        Ok(_) => None,
+        Err(service::SaveError::Cancelled) => None,
+        Err(service::SaveError::Validation { copy, detail }) => Some((
+            copy.level(),
+            detail.clone().unwrap_or_else(|| copy.message().to_owned()),
+        )),
+        // The rest have no copy-table key: a capability refusal, a format this build cannot encode,
+        // a full disk, an I/O failure. Their `message` is developer-facing and ascii, which is
+        // recorded in `docs/41` as a gap rather than dressed up as user-facing wording here.
+        Err(error) => Some((snapclip_ui::copy::Level::Error, error.message())),
+    }
+}
+
 /// Save what the panel is showing, through the one path that writes files.
 ///
-/// The values come from the controls themselves, so what is saved is what the user sees. The name
-/// stays a template here and is expanded by the save step, which is why the date and time are read
-/// now rather than when the panel opened: a name means the day it was written.
-fn save_from_panel(hwnd: windows_sys::Win32::Foundation::HWND) {
+/// Returns the outcome so the caller can decide whether to close: a panel that closed on failure
+/// would take the reason with it.
+fn save_from_panel(hwnd: windows_sys::Win32::Foundation::HWND) -> Option<service::SaveOutcome> {
+    // Every attempt starts with a clean line: a sentence from the previous failure would otherwise
+    // sit above a save that is about to succeed, and the user would read the wrong outcome.
+    if let Some(state) = state_mut(hwnd) {
+        state.status = None;
+    }
     let Some(s) = state(hwnd) else {
-        return;
+        return None;
     };
     let Some((bgra, width, height)) = s.preview.as_ref() else {
         eprintln!("[save-panel] save with no capture: there is nothing to write");
-        return;
+        return None;
     };
     let name = control_text(s.control(snapclip_ui::panel::FieldId::Name));
     let directory = control_text(s.control(snapclip_ui::panel::FieldId::Path));
@@ -955,15 +998,26 @@ fn save_from_panel(hwnd: windows_sys::Win32::Foundation::HWND) {
     if let Ok(mut guard) = s.sequence.lock() {
         *guard = moved;
     }
-    match attempt {
+    // What the line says comes from `status_of`; this only records it. The panel is told to repaint
+    // by the caller, which is the only place that knows whether the window should stay open.
+    let status = status_of(&attempt);
+    if let Some(state) = state_mut(hwnd) {
+        state.status = status.clone();
+    }
+    match &attempt {
         Ok(outcome) => eprintln!(
             "[save-panel] saved {} bytes to {} as {}",
             outcome.bytes,
             outcome.path.display(),
             outcome.format.label()
         ),
-        Err(error) => eprintln!("[save-panel] save failed: {}", error.message()),
+        Err(error) => eprintln!(
+            "[save-panel] save failed: {} ({})",
+            status.as_ref().map(|(_, text)| text.as_str()).unwrap_or(""),
+            error.message()
+        ),
     }
+    attempt.ok()
 }
 
 impl WindowState {
@@ -1319,6 +1373,9 @@ extern "system" fn window_proc(
                             s.format,
                             s.format_open,
                             s.footer_widths,
+                            s.status
+                                .as_ref()
+                                .map(|(level, text)| (*level, text.as_str())),
                         )
                         .is_ok();
                 }
@@ -1444,10 +1501,17 @@ extern "system" fn window_proc(
                             );
                         }
                         snapclip_ui::panel::FooterButton::Save => {
-                            save_from_panel(hwnd);
-                            windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
-                                hwnd, WM_CLOSE, 0, 0,
-                            );
+                            let saved = save_from_panel(hwnd);
+                            if saved.is_some() {
+                                // The picture exists, so the panel has nothing left to ask.
+                                windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+                                    hwnd, WM_CLOSE, 0, 0,
+                                );
+                            } else {
+                                // The panel stays open with the reason in its footer: closing here
+                                // is what made every rejected save invisible (`docs/41` A12).
+                                InvalidateRect(hwnd, std::ptr::null(), 0);
+                            }
                         }
                     }
                     return 0;
@@ -1648,6 +1712,85 @@ fn read_u32(hwnd: isize, attribute: u32) -> Option<u32> {
 mod tests {
     use super::*;
 
+    /// A save that worked says nothing: the panel closes, so there would be no line to read.
+    #[test]
+    fn a_successful_save_leaves_the_status_line_alone() {
+        let saved = service::SaveOutcome {
+            path: std::path::PathBuf::from(r"C:\shots\SnapClip_2026-10-24.png"),
+            bytes: 12,
+            format: SaveFormat::Png,
+            warnings: Vec::new(),
+        };
+        assert_eq!(status_of(&Ok(saved)), None);
+    }
+
+    /// A cancel is not a failure: nothing went wrong, the user changed their mind, and painting it
+    /// in the error colour would be a claim about what happened that is not true.
+    #[test]
+    fn a_cancelled_save_says_nothing() {
+        assert_eq!(status_of(&Err(service::SaveError::Cancelled)), None);
+    }
+
+    /// A rejected save shows the sentence its key owns, at the level that key carries. The wording
+    /// is not re-spelled here: `copy` is the one place that has it.
+    #[test]
+    fn a_rejected_save_shows_the_copy_tables_sentence_and_level() {
+        let result = Err(service::SaveError::Validation {
+            copy: snapclip_ui::copy::ValidationCopy::StemEmpty,
+            detail: None,
+        });
+        assert_eq!(
+            status_of(&result),
+            Some((
+                snapclip_ui::copy::Level::Error,
+                "文件名不能为空".to_owned()
+            ))
+        );
+
+        // A warning key carries the warning level, and the panel paints it differently because of
+        // the level rather than because someone remembered to.
+        let warning = Err(service::SaveError::Validation {
+            copy: snapclip_ui::copy::ValidationCopy::DirectoryMissing,
+            detail: None,
+        });
+        assert_eq!(
+            status_of(&warning),
+            Some((
+                snapclip_ui::copy::Level::Warn,
+                snapclip_ui::copy::ValidationCopy::DirectoryMissing
+                    .message()
+                    .to_owned()
+            ))
+        );
+    }
+
+    /// The filled sentence wins over the template: `含非法字符 {…}` with the list spelled out is
+    /// what the user needs, and the template with its braces would be worse than useless.
+    #[test]
+    fn a_filled_detail_wins_over_the_keys_template() {
+        let result = Err(service::SaveError::Validation {
+            copy: snapclip_ui::copy::ValidationCopy::StemIllegalChars,
+            detail: Some(snapclip_ui::copy::illegal_chars("a*b")),
+        });
+        assert_eq!(
+            status_of(&result),
+            Some((
+                snapclip_ui::copy::Level::Error,
+                snapclip_ui::copy::illegal_chars("a*b")
+            ))
+        );
+    }
+
+    /// A failure with no copy-table key still says something rather than vanishing: its own message,
+    /// at error level. Those messages are developer-facing for now (`docs/41` A20).
+    #[test]
+    fn a_failure_without_a_key_still_says_something() {
+        let result = Err(service::SaveError::Io("disk on fire".to_owned()));
+        let (level, text) = status_of(&result).expect("an I/O failure is visible");
+        assert_eq!(level, snapclip_ui::copy::Level::Error);
+        assert!(text.contains("disk on fire"), "{text}");
+    }
+
     /// The directory and the name are both strings, so nothing about the types stops them being
     /// handed over the wrong way round. A save with them swapped looks entirely reasonable and
     /// writes somewhere else, which is why the pairing is asserted rather than noticed later.
@@ -1755,6 +1898,7 @@ mod tests {
             format: 0,
             format_open: false,
             sequence: std::sync::Arc::new(std::sync::Mutex::new(Sequence::FIRST)),
+            status: None,
         };
 
         // Every field has its own slot: no two fields share an index, which is what would let one
@@ -1816,6 +1960,7 @@ mod tests {
             format: 0,
             format_open: false,
             sequence: std::sync::Arc::new(std::sync::Mutex::new(Sequence::FIRST)),
+            status: None,
         };
 
         let centre = |index: usize| {
@@ -1881,6 +2026,7 @@ mod tests {
             format: 0,
             format_open: false,
             sequence: std::sync::Arc::new(std::sync::Mutex::new(Sequence::FIRST)),
+            status: None,
         };
 
         let metrics = snapclip_ui::panel::DEMO;
