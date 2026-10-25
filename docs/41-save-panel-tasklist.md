@@ -1794,3 +1794,52 @@ M1 第一版写成 `true`，结果红在 M2 那条断言上 —— **没隔离**
 - "面板开窗时真的从 `Remembered.after` 读初值"没有窗口级测试（要真窗口）；规则本身有断言，
   但**调用**只靠编译与类型约束。
 - 内缩是否真的消掉屏幕上那对直角，只能人眼：`EDIT` 由 GDI 画，位图断言看不到它。
+
+## 原生控件的填充色与"打开文件夹"选中文件（`P9-83`）
+
+### ① "还有一块原生背景" —— 颜色早就同源，剩下的成因是几何
+
+核实结论：`field_colours(..).fill` 已经由 `fill_over_surface` 返回 **alpha 255**（把 `--fill` 的
+8% 白在 surface 上合成好，再交给只能画不透明色的 GDI）⇒ 框与控件**同一个值**，颜色不是那块差异
+的来源。真正让它看起来像"贴片"的是**几何**：控件的直角矩形躺在圆角框里，所以 `EDIT` 的矩形必须
+整个落在圆角弧以内 —— 那条在 `P9-82` 已从 1.5 dip 提到 2 dip（`1.76 = 6·(1−1/√2)`）。
+
+本批补的是**断言**，不是颜色：
+
+- `the_control_is_filled_with_the_colour_the_frame_fills_its_box` —— 四个状态逐一断言
+  `fill[3] == 255`，并断言 `bgr(fill)` 与 `fill` 的三个通道一致（`bgr` 是控件被告知的那个数）。
+  它咬住的是"谁把半透明的值交给只画不透明色的控件"。
+- **仪表**：`WM_CTLCOLOREDIT` 每次打印
+  `[save-panel] fill child=… field=… state=… rgba=…`。它回答的是"控件到底有没有被问过"——
+  没被问过的控件，它的填充不是我们给的，那就不是颜色问题。
+
+**变异**：把 `fill_over_surface` 末位从 `255` 改成 `surface[3]`（=235）⇒
+`assertion left == right failed: Idle: a native control cannot paint a translucent fill…` ✓
+
+⚠️ 记一次自己的错：第一次变异写成 `255surface[3]]` ⇒ **语法错误** ⇒ 按清单第 1 条
+"变异没发生 ≠ 断言弱"，那次"没红"**不算证据**；改成整段替换才拿到红。
+
+### ② `打开文件夹` 要**选中**那个文件 —— 原写法只在没有空格时生效
+
+```
+std::process::Command::new("explorer").arg(format!("/select,{}", path))
+```
+
+- `Command::arg` 会给**含空格的参数**加引号 ⇒ 命令行成了 `explorer "/select,C:\My Files\a.png"`；
+- 而 `explorer` 的 `/select,` 是**前缀**，不能落在引号里 ⇒ 它当成普通路径 ⇒ **打开目录、什么都没
+  选中**；路径没有空格时看起来正常 —— 一个"有时能用"的 bug。
+
+改成 `SHParseDisplayName`（目录）+ `ILCreateFromPathW`（文件）+ `SHOpenFolderAndSelectItems`
+⇒ 没有引号这一层。决定抽成纯函数 `reveal_plan(path) -> Reveal`：文件在 ⇒ `Select(file)`；文件不在
+（被移走/改名）⇒ `Open(所在目录)` —— 没有可指的东西时，打开目录是老实话。
+
+测试用真临时文件断言两态，并断言"删掉之后打开的是目录"（这条是"不崩"的那一半）。
+
+**变异**：`reveal_plan` 里 `if path.is_file()` 改成 `if true` ⇒
+`left: Select(…\shot.png) / right: Open(…\snapclip-reveal-plan)` ✓
+
+### 仍未覆盖
+
+- `SHOpenFolderAndSelectItems` 的**真实效果**（资源管理器里真的高亮那个文件）没有窗口级测试，
+  只能人眼；`reveal_plan` 只保证"选的是文件、不是目录"。
+- `WM_CTLCOLOREDIT` 的仪表**没有测试**，它存在的意义就是让人眼一次读出来。

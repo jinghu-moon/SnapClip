@@ -1687,14 +1687,116 @@ fn run_after_save(hwnd: windows_sys::Win32::Foundation::HWND, path: &std::path::
         }
     }
     if after[1] {
-        // The shell's own selection verb, so the file is selected rather than the folder merely
-        // opened. /select, takes the path verbatim.
-        match std::process::Command::new("explorer")
-            .arg(format!("/select,{}", path.display()))
-            .spawn()
-        {
-            Ok(_) => eprintln!("[save-panel] revealed the saved file: {}", path.display()),
-            Err(error) => eprintln!("[save-panel] could not reveal the saved file: {error}"),
+        reveal(path);
+    }
+}
+
+/// What revealing a saved file means: select it in its folder when it is there, and open the folder
+/// when it is not, because a folder with nothing selected is the honest answer to a file that a
+/// later move took away.
+///
+/// Pure, so the decision can be asserted without a shell.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Reveal {
+    Select(std::path::PathBuf),
+    Open(std::path::PathBuf),
+}
+
+pub fn reveal_plan(path: &std::path::Path) -> Reveal {
+    if path.is_file() {
+        return Reveal::Select(path.to_path_buf());
+    }
+    Reveal::Open(
+        path.parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(|parent| parent.to_path_buf())
+            .unwrap_or_else(|| path.to_path_buf()),
+    )
+}
+
+/// Select a file in the folder that holds it, or open that folder.
+///
+/// This used to spawn `explorer` with a single argument of the shape `/select,<path>`. That works
+/// only while the path has no spaces: `Command::arg` quotes an argument that contains one, and the
+/// shell's selection verb is a prefix that cannot be inside quotes, so `explorer "/select,C:\My
+/// Files\a.png"` opens the folder and selects nothing. Passing the two identifiers to the shell
+/// function has no quoting layer at all, which is why it is the one used here.
+fn reveal(path: &std::path::Path) {
+    let wide = |text: &str| -> Vec<u16> { text.encode_utf16().chain(std::iter::once(0)).collect() };
+    match reveal_plan(path) {
+        Reveal::Open(folder) => {
+            let verb: Vec<u16> = "open\0".encode_utf16().collect();
+            let target: Vec<u16> = wide(&folder.display().to_string());
+            // SAFETY: `target` is NUL terminated and outlives the call.
+            let opened = unsafe {
+                windows_sys::Win32::UI::Shell::ShellExecuteW(
+                    std::ptr::null_mut(),
+                    verb.as_ptr(),
+                    target.as_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+                )
+            };
+            eprintln!(
+                "[save-panel] opened the folder that held the file: {} hresult={opened:p}",
+                folder.display()
+            );
+        }
+        Reveal::Select(file) => {
+            use windows_sys::Win32::UI::Shell::{
+                ILCreateFromPathW, ILFree, SHOpenFolderAndSelectItems, SHParseDisplayName,
+            };
+            let folder = file
+                .parent()
+                .map(|parent| parent.to_path_buf())
+                .unwrap_or_else(|| file.to_path_buf());
+            let folder_wide = wide(&folder.display().to_string());
+            let mut folder_pidl: *mut windows_sys::Win32::UI::Shell::Common::ITEMIDLIST =
+                std::ptr::null_mut();
+            let mut attributes: u32 = 0;
+            // SAFETY: the name is NUL terminated, the out pointer is valid, and the bind context is
+            // allowed to be null.
+            let parsed = unsafe {
+                SHParseDisplayName(
+                    folder_wide.as_ptr(),
+                    std::ptr::null_mut(),
+                    &mut folder_pidl,
+                    0,
+                    &mut attributes,
+                )
+            };
+            let file_wide = wide(&file.display().to_string());
+            // SAFETY: the path is NUL terminated; a failure is reported as a null pointer.
+            let file_pidl = unsafe { ILCreateFromPathW(file_wide.as_ptr()) };
+            if parsed < 0 || folder_pidl.is_null() || file_pidl.is_null() {
+                eprintln!(
+                    "[save-panel] could not reveal the saved file: parsed={parsed:#x} folder={} file={}",
+                    folder_pidl.is_null(),
+                    file_pidl.is_null()
+                );
+            } else {
+                let children = [file_pidl as *const _];
+                // SAFETY: both identifiers are valid for the duration of the call and the array
+                // holds exactly the count given.
+                let result = unsafe {
+                    SHOpenFolderAndSelectItems(folder_pidl, 1, children.as_ptr(), 0)
+                };
+                eprintln!(
+                    "[save-panel] revealed the saved file: {} hresult={result:#x}",
+                    file.display()
+                );
+            }
+            // SAFETY: each identifier was allocated by one of the two calls above and is freed
+            // exactly once, after the shell has finished with it.
+            unsafe {
+                if !folder_pidl.is_null() {
+                    windows_sys::Win32::System::Com::CoTaskMemFree(folder_pidl as *const _);
+                }
+                if !file_pidl.is_null() {
+                    ILFree(file_pidl as *const _);
+                }
+            }
         }
     }
 }
@@ -3910,6 +4012,18 @@ extern "system" fn window_proc(
                     .unwrap_or(snapclip_ui::panel::FieldState::Idle);
                 let colours = snapclip_ui::panel::field_colours(state_of_field, SURFACE_RGBA);
                 let child = wparam as windows_sys::Win32::Graphics::Gdi::HDC;
+                // A control that looks like a patch inside its box is a question about a colour,
+                // and the answer is one line: what the control is told to fill with, which state
+                // that came from, and which box it belongs to. It prints once per paint rather
+                // than per click, so a run's console says whether the control was ever asked at
+                // all — a control nobody asked is a control whose fill is not ours to read.
+                eprintln!(
+                    "[save-panel] fill child={:?} field={:?} state={:?} rgba={:?}",
+                    lparam as windows_sys::Win32::Foundation::HWND,
+                    s.field_of(lparam as windows_sys::Win32::Foundation::HWND),
+                    state_of_field,
+                    colours.fill
+                );
                 windows_sys::Win32::Graphics::Gdi::SetBkColor(child, bgr(colours.fill));
                 windows_sys::Win32::Graphics::Gdi::SetTextColor(child, bgr(colours.text));
                 // The brush comes from the same colour the background was just set to, by way of the
@@ -5405,4 +5519,55 @@ mod tests {
                 "message {other:#06x} has to reach the box's own procedure"
             );
         }
+    }
+
+    /// The one patch a native control cannot avoid is its rectangle inside a rounded box, so the
+    /// colour must not be a second patch: the box and the control are given the same fill.
+    ///
+    /// `SetBkColor` has no alpha channel, so a translucent fill would be painted opaque by the
+    /// control and translucent by the frame, and the difference is visible where the control's
+    /// rectangle sits. Every state's fill therefore has to be opaque, and it has to be the colour
+    /// the frame fills the box with rather than a second guess at it.
+    #[test]
+    fn the_control_is_filled_with_the_colour_the_frame_fills_its_box() {
+        use snapclip_ui::panel::{field_colours, FieldState};
+        for state in FieldState::ALL {
+            let colours = field_colours(state, SURFACE_RGBA);
+            assert_eq!(
+                colours.fill[3], 255,
+                "{state:?}: a native control cannot paint a translucent fill, so the frame and the \
+                 control have to agree on an opaque one"
+            );
+            // The same value the frame fills the box with, read from the one rule, so a change to
+            // the rule moves both. `bgr` is how the control is told.
+            assert_eq!(
+                bgr(colours.fill),
+                (u32::from(colours.fill[2]) << 16)
+                    | (u32::from(colours.fill[1]) << 8)
+                    | u32::from(colours.fill[0]),
+                "{state:?}: the colour handed to the control is the colour of the box's fill"
+            );
+        }
+    }
+
+    /// A saved file is selected inside its folder; a file that is no longer there leaves nothing to
+    /// select, so the folder it was saved to is opened instead.
+    #[test]
+    fn revealing_a_saved_file_selects_it_and_a_missing_one_opens_its_folder() {
+        let folder = std::env::temp_dir().join("snapclip-reveal-plan");
+        std::fs::create_dir_all(&folder).expect("a scratch folder");
+        let file = folder.join("shot.png");
+        std::fs::write(&file, b"png").expect("a scratch file");
+        assert_eq!(
+            reveal_plan(&file),
+            Reveal::Select(file.clone()),
+            "a file that is there is the thing to point at"
+        );
+        std::fs::remove_file(&file).expect("the scratch file is removable");
+        assert_eq!(
+            reveal_plan(&file),
+            Reveal::Open(folder.clone()),
+            "with nothing to select, the folder is the honest answer"
+        );
+        std::fs::remove_dir_all(&folder).expect("the scratch folder is removable");
     }
