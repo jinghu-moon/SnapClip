@@ -537,6 +537,15 @@ impl GpuiProbe {
             cx.observe(&input, |this, _, cx| this.schedule_remeasure(cx))
                 .detach();
         }
+        // The template is remembered as it is typed rather than when a save runs: the spec puts the
+        // template and the number in one sentence and asks for both to be remembered live
+        // ("模板与序号随输入实时记住", `:201`). No rule lives here — `remember_template` already
+        // compares the text and writes nothing when it matches, which is asserted where it is
+        // defined (`assemble.rs`), so this is a call rather than a second copy of the decision.
+        cx.observe(&probe.name, |_, observed, cx| {
+            crate::gpui_save::remember_template(&observed.read(cx).value().to_string());
+        })
+        .detach();
         probe
     }
 
