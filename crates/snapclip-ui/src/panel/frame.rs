@@ -726,6 +726,22 @@ impl Frame<'_> {
             }
             let field = id.frame_rect(self.metrics, self.rects, self.scale, self.path_change);
             let colours = crate::panel::field_colours(state, self.brushes.surface_rgba());
+            // The other half of the question the native control answers in `WM_CTLCOLOREDIT`: what
+            // the frame fills this box with. Printed for the one field that still has a control, so
+            // one run puts the two numbers side by side and says whether the patch is a colour at
+            // all rather than leaving it to be guessed at.
+            if id == crate::panel::FieldId::Name {
+                eprintln!(
+                    "[save-panel] box fill field={:?} state={:?} rect=({},{},{},{}) rgba={:?}",
+                    id,
+                    state,
+                    field.left,
+                    field.top,
+                    field.right,
+                    field.bottom,
+                    colours.fill
+                );
+            }
             // The fill has to be the state's own, because the native control inside this frame is
             // painted with exactly that colour: a single idle fill here left a bright square patch
             // wherever the control's fill disagreed with the frame's.

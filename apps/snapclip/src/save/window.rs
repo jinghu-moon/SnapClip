@@ -1747,6 +1747,18 @@ fn reveal(path: &std::path::Path) {
             use windows_sys::Win32::UI::Shell::{
                 ILCreateFromPathW, ILFree, SHOpenFolderAndSelectItems, SHParseDisplayName,
             };
+            // The shell function below documents an apartment requirement, and without one it
+            // reports success while doing nothing: the folder opens and nothing is selected. The
+            // dialog elsewhere in this file needs no apartment, which is why the call was missing
+            // rather than wrong. `S_FALSE` means this thread already had one, so only a success is
+            // paired with `CoUninitialize`; `RPC_E_CHANGED_MODE` is reported rather than hidden,
+            // because a thread in the other apartment is a different problem with a different fix.
+            let apartment = unsafe {
+                windows_sys::Win32::System::Com::CoInitializeEx(
+                    std::ptr::null(),
+                    windows_sys::Win32::System::Com::COINIT_APARTMENTTHREADED as u32,
+                )
+            };
             let folder = file
                 .parent()
                 .map(|parent| parent.to_path_buf())
@@ -1771,9 +1783,11 @@ fn reveal(path: &std::path::Path) {
             let file_pidl = unsafe { ILCreateFromPathW(file_wide.as_ptr()) };
             if parsed < 0 || folder_pidl.is_null() || file_pidl.is_null() {
                 eprintln!(
-                    "[save-panel] could not reveal the saved file: parsed={parsed:#x} folder={} file={}",
+                    "[save-panel] could not reveal the saved file: apartment={apartment:#x} parsed={parsed:#x} folder_null={} file_null={} folder={} file={}",
                     folder_pidl.is_null(),
-                    file_pidl.is_null()
+                    file_pidl.is_null(),
+                    folder.display(),
+                    file.display()
                 );
             } else {
                 let children = [file_pidl as *const _];
@@ -1783,7 +1797,7 @@ fn reveal(path: &std::path::Path) {
                     SHOpenFolderAndSelectItems(folder_pidl, 1, children.as_ptr(), 0)
                 };
                 eprintln!(
-                    "[save-panel] revealed the saved file: {} hresult={result:#x}",
+                    "[save-panel] revealed the saved file: apartment={apartment:#x} hresult={result:#x} file={}",
                     file.display()
                 );
             }
@@ -1795,6 +1809,11 @@ fn reveal(path: &std::path::Path) {
                 }
                 if !file_pidl.is_null() {
                     ILFree(file_pidl as *const _);
+                }
+                // Only a success is paired, because `S_FALSE` means the thread already had an
+                // apartment and this call did not add a reference to release.
+                if apartment >= 0 {
+                    windows_sys::Win32::System::Com::CoUninitialize();
                 }
             }
         }
@@ -4017,18 +4036,33 @@ extern "system" fn window_proc(
                 // that came from, and which box it belongs to. It prints once per paint rather
                 // than per click, so a run's console says whether the control was ever asked at
                 // all — a control nobody asked is a control whose fill is not ours to read.
+                let brush = s.fill_brushes[state_of_field.index()];
+                // Which brush the control is handed, and whether it is a real one. A null handle
+                // returned here looks on screen exactly like a wrong colour, because the control
+                // then falls back to its own default and paints a patch inside the frame.
                 eprintln!(
-                    "[save-panel] fill child={:?} field={:?} state={:?} rgba={:?}",
+                    "[save-panel] fill child={:?} field={:?} state={:?} rgba={:?} brush={:?}",
                     lparam as windows_sys::Win32::Foundation::HWND,
                     s.field_of(lparam as windows_sys::Win32::Foundation::HWND),
                     state_of_field,
-                    colours.fill
+                    colours.fill,
+                    brush
                 );
                 windows_sys::Win32::Graphics::Gdi::SetBkColor(child, bgr(colours.fill));
                 windows_sys::Win32::Graphics::Gdi::SetTextColor(child, bgr(colours.text));
+                // The experiment that settles whether the control uses the brush it is handed at
+                // all: with this set, it is given a solid red one, so the text box is either red
+                // (the brush is used, and the light patch comes from something else) or unchanged
+                // (the brush is ignored, and what shows is the control's own default).
+                if std::env::var_os("SNAPCLIP_DEBUG_EDIT_FILL").is_some() {
+                    let red =
+                        windows_sys::Win32::Graphics::Gdi::CreateSolidBrush(bgr([255, 0, 0, 255]));
+                    eprintln!("[save-panel] fill experiment: returning red brush {red:?}");
+                    return red as isize;
+                }
                 // The brush comes from the same colour the background was just set to, by way of the
                 // same index, so the two cannot disagree about which fill this state has.
-                return s.fill_brushes[state_of_field.index()] as isize;
+                return brush as isize;
             }
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
