@@ -935,18 +935,10 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
         ShowWindow(hwnd, SW_SHOW);
         // Collapse any selection the window manager established while activating the first EDIT.
         // The prototype opens with no selected text; leaving the initial value selected exposes
-        // the system highlight colour as a strip across the name field before user input.
-        let name = (*state).control(snapclip_ui::panel::FieldId::Name);
-        if !name.is_null() {
-            let length = windows_sys::Win32::UI::WindowsAndMessaging::GetWindowTextLengthW(name)
-                .max(0) as usize;
-            windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(
-                name,
-                0x00B1,
-                length,
-                length as isize,
-            );
-        }
+        // the system highlight colour as a strip across the name field before user input. This is
+        // one of three places that collapses it, because activation can select the contents again
+        // after the window is shown: see `collapse_native_selection`.
+        collapse_native_selection((*state).control(snapclip_ui::panel::FieldId::Name));
         // Keep focus on the panel itself after collapsing the EDIT selection. Clicking the field
         // still gives the native control its normal caret and selection behavior.
         windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(hwnd);
@@ -2483,6 +2475,43 @@ fn selection_is_empty(control: windows_sys::Win32::Foundation::HWND) -> bool {
     start == end
 }
 
+/// Where a selection should be collapsed to, given what the box reports.
+///
+/// `None` means the box already holds a caret and collapsing again would move it, so the three
+/// entry points that use this are idempotent. The target is the range's end rather than its start:
+/// after typing and after a click that placed the caret, that is where the caret already is, and
+/// jumping to zero would send it to the front of the field for someone who clicked mid-way.
+fn collapse_position(start: usize, end: usize) -> Option<usize> {
+    if start == end {
+        None
+    } else {
+        Some(end)
+    }
+}
+
+/// Collapse whatever a native text box has selected into a caret at the selection's end.
+///
+/// The window manager selects a box's contents when it activates it, and a selected range is
+/// painted in the system's highlight colour, which cannot be themed. Keeping that from showing is
+/// therefore not one call in one place: the panel collapses it after the window is shown, when the
+/// box takes focus, and when the window is activated again, and this is the one function all three
+/// use so a missed entry point would be a missing call rather than a different rule. Drawing-only
+/// fields have no control and their handle is null, which this returns from.
+fn collapse_native_selection(control: windows_sys::Win32::Foundation::HWND) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
+    const EM_SETSEL: u32 = 0x00B1;
+    if control.is_null() {
+        return;
+    }
+    let (start, end) = control_selection(control);
+    let Some(caret) = collapse_position(start, end) else {
+        return;
+    };
+    unsafe {
+        let _ = SendMessageW(control, EM_SETSEL, caret, caret as isize);
+    }
+}
+
 /// What a text box has selected, as `(start, end, len)`, for the log line that tells a highlight
 /// apart from a box painted in its own colour.
 ///
@@ -3294,6 +3323,10 @@ extern "system" fn window_proc(
             let active = (wparam & 0xFFFF) as u32;
             if active == WA_INACTIVE {
                 close_menus(hwnd, "the panel lost activation");
+            } else if let Some(panel) = state(hwnd) {
+                // Coming back to the panel is another activation, so the box may have been given
+                // its contents selected again; this is the third place that removes it.
+                collapse_native_selection(panel.control(snapclip_ui::panel::FieldId::Name));
             }
             0
         }
@@ -4222,9 +4255,11 @@ extern "system" fn window_proc(
                         s.fields.set_focus(id, focused);
                         repaint = s.fields.state_of(id) != before;
                         // A focused box selects nothing by itself, but the window manager selects
-                        // the box's contents when it activates one, so this line reports what the
-                        // box is holding the moment it takes focus.
+                        // the box's contents when it activates one, so the same collapse the panel
+                        // performs on its way up runs here too, and the log that follows reports
+                        // what the box holds after it rather than before.
                         if focused {
+                            collapse_native_selection(s.control(id));
                             match selection_log_values(s.control(id)) {
                                 Some((start, end, length)) => eprintln!(
                                     "[save-panel] edit selection field={id:?} start={start} end={end} len={length}"
@@ -4825,6 +4860,36 @@ mod tests {
             "the next panel opens with the remembered template"
         );
         assert_ne!(first, second, "the two panels do not open with the same text");
+    }
+
+    /// Where a selection is collapsed to, which is its end and never its start.
+    ///
+    /// The three entry points call this, and none of them moves the caret when nothing is selected,
+    /// so a field the user clicked into keeps its caret where it was. Collapsing to the start
+    /// instead would send that caret to the front of the field, which is a visible change nobody
+    /// asked for and the reason this is a rule rather than `EM_SETSEL(0, 0)`.
+    #[test]
+    fn a_selection_collapses_to_its_end_and_a_caret_is_left_alone() {
+        assert_eq!(
+            collapse_position(0, 12),
+            Some(12),
+            "a whole-field selection keeps the caret at the end, where typing left it"
+        );
+        assert_eq!(
+            collapse_position(3, 5),
+            Some(5),
+            "a partial selection keeps the caret at its end, not at the front of the field"
+        );
+        assert_eq!(
+            collapse_position(7, 7),
+            None,
+            "a caret is already collapsed, so collapsing again would move it"
+        );
+        assert_eq!(
+            collapse_position(0, 0),
+            None,
+            "an empty field has nothing to collapse"
+        );
     }
 
     /// Which notifications write the remembered template.
