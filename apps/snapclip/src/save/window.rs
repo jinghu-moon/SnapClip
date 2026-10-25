@@ -1891,38 +1891,43 @@ fn reveal(path: &std::path::Path) {
             }
             match revealed {
                 Some(hresult) => eprintln!(
-                    "[save-panel] revealed the saved file: hresult={hresult:#x} file={}",
+                    "[save-panel] the shell reported the file selected: hresult={hresult:#x} file={}",
                     file.display()
                 ),
-                // The shell call is the one that selects, and it can fail on a folder whose view
-                // has not caught up with the file that was just written. Explorer's own verb does
-                // open the folder in that case, so the row still shows where the file went even
-                // when the selection did not happen.
-                None => {
-                    use windows_sys::Win32::UI::Shell::ShellExecuteW;
-                    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-                    let verb: Vec<u16> = "open\0".encode_utf16().collect();
-                    let executable: Vec<u16> = "explorer.exe\0".encode_utf16().collect();
-                    let parameters: Vec<u16> = format!("{}\0", explorer_select_parameters(&file))
-                        .encode_utf16()
-                        .collect();
-                    // SAFETY: every string is NUL terminated and outlives the call.
-                    let opened = unsafe {
-                        ShellExecuteW(
-                            std::ptr::null_mut(),
-                            verb.as_ptr(),
-                            executable.as_ptr(),
-                            parameters.as_ptr(),
-                            std::ptr::null(),
-                            SW_SHOWNORMAL,
-                        )
-                    };
-                    eprintln!(
-                        "[save-panel] fell back to explorer: result={} file={}",
-                        opened as isize,
-                        file.display()
-                    );
-                }
+                None => eprintln!(
+                    "[save-panel] the shell did not select the file: file={}",
+                    file.display()
+                ),
+            }
+            // Asked either way, because a success from the shell call is not the same thing as a
+            // selected file: on this system it answers `S_OK` and the folder opens with nothing
+            // marked, which is also why the fallback that used to live in the `None` arm never ran.
+            // Explorer reuses the folder window the shell has just opened, so this is a selection
+            // rather than a second window.
+            {
+                use windows_sys::Win32::UI::Shell::ShellExecuteW;
+                use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+                let verb: Vec<u16> = "open\0".encode_utf16().collect();
+                let executable: Vec<u16> = "explorer.exe\0".encode_utf16().collect();
+                let parameters: Vec<u16> = format!("{}\0", explorer_select_parameters(&file))
+                    .encode_utf16()
+                    .collect();
+                // SAFETY: every string is NUL terminated and outlives the call.
+                let opened = unsafe {
+                    ShellExecuteW(
+                        std::ptr::null_mut(),
+                        verb.as_ptr(),
+                        executable.as_ptr(),
+                        parameters.as_ptr(),
+                        std::ptr::null(),
+                        SW_SHOWNORMAL,
+                    )
+                };
+                eprintln!(
+                    "[save-panel] asked explorer to select the file: result={} file={}",
+                    opened as isize,
+                    file.display()
+                );
             }
             // SAFETY: each identifier was allocated by one of the two calls above and is freed
             // exactly once, after the shell has finished with it.
@@ -4416,15 +4421,63 @@ const WM_NCDESTROY: u32 = 0x0082;
 /// quote the same pair the installation did; a constant is the only way they cannot drift.
 const CONTEXT_SUBCLASS_ID: usize = 1;
 
-/// Which messages the name box's subclass takes away from the box.
+/// `WM_ERASEBKGND`: a control is asking what to paint its background with.
+const WM_ERASEBKGND: u32 = 0x0014;
+
+/// What the name box's subclass does with one message.
 ///
-/// Exactly one, and only when it came from the mouse. The keyboard's context-menu key arrives with
-/// `lparam == -1`, and the panel has no caret geometry to place a menu at, so that path stays with
-/// the box. Written as a function rather than as conditions inside the procedure so the two halves
-/// — "what is taken" and "what is passed through" — can be asserted without a window.
+/// Two messages are taken and everything else is passed through, and the two that are taken are
+/// taken for different reasons: the context menu is forwarded so the panel can draw its own, and
+/// the background is painted here because a themed control ignores the brush its parent hands back
+/// and fills itself from the visual style instead — which shows as a strip of a different colour
+/// across the box.
+///
+/// The keyboard's context-menu key arrives with `lparam == -1`, and the panel has no caret geometry
+/// to place a menu at, so that path stays with the box. Written as a function rather than as
+/// conditions inside the procedure so the two halves — "what is taken" and "what is passed through"
+/// — can be asserted without a window.
 #[cfg(windows)]
-fn forwards_context_menu(message: u32, lparam: isize) -> bool {
-    message == WM_CONTEXTMENU && lparam != -1
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubclassAction {
+    /// Hand this one to the panel so it can place its own menu.
+    ForwardContextMenu,
+    /// Fill the box's client area with the panel's brush and tell the control it is done.
+    EraseBackground,
+    /// Everything else belongs to the control.
+    PassThrough,
+}
+
+#[cfg(windows)]
+fn subclass_action(message: u32, lparam: isize) -> SubclassAction {
+    if message == WM_CONTEXTMENU && lparam != -1 {
+        SubclassAction::ForwardContextMenu
+    } else if message == WM_ERASEBKGND {
+        SubclassAction::EraseBackground
+    } else {
+        SubclassAction::PassThrough
+    }
+}
+
+/// The brush the panel fills a given child's background with, found through the parent's state.
+///
+/// The subclass has no state of its own, so it reads the panel's, which keeps the fill coming from
+/// the one table the frame also paints from. A null handle means "not ours to paint", and the
+/// caller then lets the control do whatever it was going to do.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn child_fill_brush(hwnd: windows_sys::Win32::Foundation::HWND) -> Option<windows_sys::Win32::Graphics::Gdi::HBRUSH> {
+    let parent = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetParent(hwnd) };
+    if parent.is_null() {
+        return None;
+    }
+    let state = state(parent)?;
+    let id = state.field_of(hwnd)?;
+    let brush = state.fill_brushes[state.fields.state_of(id).index()];
+    if brush.is_null() {
+        None
+    } else {
+        Some(brush)
+    }
 }
 
 /// `WM_CONTEXTMENU` forwarded from the name box to the panel.
@@ -4446,16 +4499,45 @@ unsafe extern "system" fn edit_context_subclass(
     ref_data: usize,
 ) -> windows_sys::Win32::Foundation::LRESULT {
     use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass};
-    if forwards_context_menu(message, lparam) {
-        let parent = ref_data as windows_sys::Win32::Foundation::HWND;
-        if !parent.is_null() {
-            return unsafe {
-                windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(
-                    parent, WM_CONTEXTMENU, wparam, lparam,
-                )
-            };
+    match subclass_action(message, lparam) {
+        SubclassAction::ForwardContextMenu => {
+            let parent = ref_data as windows_sys::Win32::Foundation::HWND;
+            if !parent.is_null() {
+                return unsafe {
+                    windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(
+                        parent, WM_CONTEXTMENU, wparam, lparam,
+                    )
+                };
+            }
         }
-        return unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
+        SubclassAction::EraseBackground => {
+            // A themed edit control paints itself from the visual style and only uses the parent's
+            // brush behind its glyphs, so the rest of its rectangle came out a different colour
+            // from the frame around it. Filling the client area here and answering "done" is what
+            // makes the whole box one colour.
+            if let Some(brush) = child_fill_brush(hwnd) {
+                let mut rect = windows_sys::Win32::Foundation::RECT {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                };
+                let measured = unsafe {
+                    windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut rect)
+                };
+                if measured != 0 {
+                    unsafe {
+                        windows_sys::Win32::Graphics::Gdi::FillRect(
+                            wparam as windows_sys::Win32::Graphics::Gdi::HDC,
+                            &rect,
+                            brush,
+                        );
+                    }
+                    return 1;
+                }
+            }
+        }
+        SubclassAction::PassThrough => {}
     }
     if message == WM_NCDESTROY {
         unsafe { RemoveWindowSubclass(hwnd, Some(edit_context_subclass), CONTEXT_SUBCLASS_ID) };
@@ -5776,27 +5858,36 @@ mod tests {
     ///
     /// Everything else has to reach the box's own procedure, because typing, the caret, the
     /// selection, the clipboard and the undo stack are all implemented there. A subclass that
-    /// swallowed more than the context menu would not fail anything else in this file: it would
-    /// quietly stop the box being a text box.
+    /// swallowed more than the context menu and the background would not fail anything else in
+    /// this file: it would quietly stop the box being a text box.
     #[test]
-    fn the_box_gives_up_only_the_context_menu_it_can_place() {
-        assert!(
-            forwards_context_menu(WM_CONTEXTMENU, 100),
+    fn the_box_gives_up_only_the_menu_it_can_place_and_the_background_it_can_paint() {
+        assert_eq!(
+            subclass_action(WM_CONTEXTMENU, 100),
+            SubclassAction::ForwardContextMenu,
             "a right click belongs to the panel's own menu"
         );
-        assert!(
-            !forwards_context_menu(WM_CONTEXTMENU, -1),
+        assert_eq!(
+            subclass_action(WM_CONTEXTMENU, -1),
+            SubclassAction::PassThrough,
             "the keyboard's context key has no caret position to place a menu at"
+        );
+        assert_eq!(
+            subclass_action(WM_ERASEBKGND, 100),
+            SubclassAction::EraseBackground,
+            "a themed box ignores the brush it is handed, so the fill is painted here"
         );
         for other in [
             0x0102, // WM_CHAR
             0x0100, // WM_KEYDOWN
             0x0007, // WM_SETFOCUS
             0x0201, // WM_LBUTTONDOWN
+            0x000F, // WM_PAINT
             WM_NCDESTROY,
         ] {
-            assert!(
-                !forwards_context_menu(other, 100),
+            assert_eq!(
+                subclass_action(other, 100),
+                SubclassAction::PassThrough,
                 "message {other:#06x} has to reach the box's own procedure"
             );
         }

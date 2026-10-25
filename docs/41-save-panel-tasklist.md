@@ -1949,3 +1949,28 @@ pub const AFTER_SAVE_STEPS: [AfterSaveStep; 3] = [CopyPath, TellShell, Reveal];
 
 - `SetWindowTheme` 的效果**没有纯逻辑断言**（需要真窗口），只能人眼：名字框整块应是 `#29292E`。
 - "通知先于揭示"有断言，但**真实选中**仍要人眼；含空格的目录要试一次（旧写法的破绽在那里）。
+
+## 名字框那一块颜色，与"揭示选了却没有选"
+
+两件事在同一轮里被证伪了两次，最后都是"引擎在骗我们"而不是"我们算错了"。
+
+### 一、控件背景：主题在画，刷子在喂文字
+
+四条假设依次被排除：半透明合成不同源（`fill_over_surface` 早已合成成不透明 alpha 255）、刷子取错色（日志显示 brushed 非空且值等于框）、框叠了两次（`frame.rs` 对 `Name` 只填一次）、开窗全选（`CreateWindowExW` 的 `lpWindowName` 建初值，`EM_SETSEL(0,-1)` 只在右键菜单里）。
+
+红/绿双色实验才把机制分开：**刷子只影响文字那一条**，整块背景由**视觉样式**画。
+
+修法：`create_field_edit` 里 `SetWindowTheme(edit, L"", L"")`（**空串**才是"不用主题"，`NULL` 是"按系统设置"），并在 `WM_CTLCOLOREDIT` 对传进来的 HDC 调 `SetBkMode(OPAQUE)`；另加 `WM_ERASEBKGND` 子类分支，用面板的 `fill_brushes` 自己 `FillRect` 并 `return 1`——**不再依赖主题，也不依赖控件是否听话**。
+
+`subclass_action(message, lparam)` 是唯一判定（`ForwardContextMenu` / `EraseBackground` / `PassThrough`），测试走 `WM_CHAR`/`WM_KEYDOWN`/`WM_SETFOCUS`/`WM_LBUTTONDOWN`/`WM_PAINT`/`WM_NCDESTROY` 六条放行、两条拦截；变异（把 `EraseBackground` 分支关掉）真红：`left: PassThrough right: EraseBackground`。
+
+### 二、揭示：`S_OK` 但没选中，于是回退分支永远不执行
+
+`SHOpenFolderAndSelectItems` 在本机返回 `S_OK` 而不选中，`revealed = Some(0)`，因此"失败才回退"的 `None` 分支**从未执行**——而 `explorer_select_parameters`（`/select,"<path>"`，引号在路径外、开关在内）早就正确并被测过，只是没被用上。
+
+修法：shell 调用之后**总是**也走 `explorer.exe`（它复用刚打开的文件夹窗口，是选中而不是第二个窗口）；日志改成"shell 报告选中"与"shell 没有选中"两句，随后一句"请 explorer 选中"。
+
+### 仍未覆盖
+
+- `WM_ERASEBKGND` 的实际效果与 `SetWindowTheme` 一样，只能人眼：整块应是 `#29292E`。
+- "总是也问 explorer"没有纯逻辑断言（顺序与调用在窗口过程里），只有 `explorer_select_parameters` 的引号有断言。
