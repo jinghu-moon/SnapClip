@@ -13,7 +13,7 @@ publish = false
 [dependencies]
 # One dependency for the UI, as the Coding Guides require: GPUI itself is
 # `use gpui_kit::*;`, and the layers are gpui_kit::{component, base, assets, platform}.
-gpui-kit = "0.7"
+gpui-kit = "0.8"
 
 # Capability crates, not UI: the shell composes them and owns no feature logic of its own.
 snapclip-model = { path = "../../crates/snapclip-model" }
@@ -146,7 +146,7 @@ test-support = ["gpui-kit/test-support"]
 # Test-only: the model tests build payload references, which are keyed by a blake3 hash.
 blake3 = "1.5"
 # Same version and source as the normal dependency, with the helpers the guides require.
-gpui-kit = { version = "0.7", features = ["test-support"] }
+gpui-kit = { version = "0.8", features = ["test-support"] }
 # Test-only cross-decoder for the lossless WebP round-trip: decoding with the same library that
 # encoded would let a shared bug cancel itself out (docs/34 §13).
 image = { version = "0.25", default-features = false, features = ["webp", "png", "jpeg"] }
