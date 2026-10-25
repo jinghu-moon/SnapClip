@@ -968,6 +968,14 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
                 screen.right,
                 screen.bottom,
             );
+            // The box has just been shown and its initial value selected and collapsed, so this is
+            // the range a screenshot of the fresh panel would be showing.
+            match selection_log_values((*state).control(snapclip_ui::panel::FieldId::Name)) {
+                Some((start, end, length)) => eprintln!(
+                    "[save-panel] edit selection field=Name start={start} end={end} len={length}"
+                ),
+                None => eprintln!("[save-panel] edit selection field=Name control=null"),
+            }
             // Who is above us, and are they topmost? The capture side's overlay and dim layer are,
             // so if either is still up and visible the panel is painted underneath it no matter what
             // the window says about itself. Class names identify them: SnapClipCaptureOverlay and the
@@ -2473,6 +2481,33 @@ fn selection_is_empty(control: windows_sys::Win32::Foundation::HWND) -> bool {
         );
     }
     start == end
+}
+
+/// What a text box has selected, as `(start, end, len)`, for the log line that tells a highlight
+/// apart from a box painted in its own colour.
+///
+/// `EM_GETSEL` writes the range through two pointers rather than returning it, and the length comes
+/// from the control, which is why this is not a one-liner at the call site.
+fn selection_log_values(
+    control: windows_sys::Win32::Foundation::HWND,
+) -> Option<(u32, u32, usize)> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowTextLengthW, SendMessageW};
+    const EM_GETSEL: u32 = 0x00B0;
+    if control.is_null() {
+        return None;
+    }
+    let mut start: u32 = 0;
+    let mut end: u32 = 0;
+    unsafe {
+        let _ = SendMessageW(
+            control,
+            EM_GETSEL,
+            &mut start as *mut u32 as usize,
+            &mut end as *mut u32 as isize,
+        );
+    }
+    let length = unsafe { GetWindowTextLengthW(control) }.max(0) as usize;
+    Some((start, end, length))
 }
 
 /// Run one command from the name box's right-click menu by asking the control to do it.
@@ -4186,6 +4221,19 @@ extern "system" fn window_proc(
                         let before = s.fields.state_of(id);
                         s.fields.set_focus(id, focused);
                         repaint = s.fields.state_of(id) != before;
+                        // A focused box selects nothing by itself, but the window manager selects
+                        // the box's contents when it activates one, so this line reports what the
+                        // box is holding the moment it takes focus.
+                        if focused {
+                            match selection_log_values(s.control(id)) {
+                                Some((start, end, length)) => eprintln!(
+                                    "[save-panel] edit selection field={id:?} start={start} end={end} len={length}"
+                                ),
+                                None => {
+                                    eprintln!("[save-panel] edit selection field={id:?} control=null")
+                                }
+                            }
+                        }
                     }
                 }
             }
