@@ -23,6 +23,7 @@ pub mod capture;
 pub mod clipboard;
 pub mod clipboard_ingest;
 pub mod events;
+pub mod gpui_probe;
 pub mod history;
 pub mod pin;
 pub mod save;
@@ -525,6 +526,33 @@ pub fn run(options: StartupOptions) {
             gpui_kit::init(cx);
 
             cx.spawn(async move |cx| {
+                // The GPUI probe replaces the shell rather than sitting beside it: it answers a
+                // separate question, and two windows would ask the eye to compare two things
+                // instead of one. Unset, this branch is not taken and the shell is untouched.
+                if std::env::var_os("SNAPCLIP_GPUI_PROBE").is_some() {
+                    let probe_options = WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                            point(px(0.0), px(0.0)),
+                            size(px(gpui_probe::PROBE_WIDTH), px(gpui_probe::PROBE_HEIGHT)),
+                        ))),
+                        titlebar: Some(TitlebarOptions {
+                            title: Some(gpui_probe::PROBE_TITLE.into()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    };
+                    cx.open_window(probe_options, |window, cx| {
+                        let probe = cx.new(|cx| gpui_probe::GpuiProbe::new(window, cx));
+                        cx.new(|cx| Root::new(probe, window, cx))
+                    })
+                    .expect("failed to open the GPUI probe window");
+                    eprintln!(
+                        "[gpui-probe] opened {}x{}: type Chinese in the field, then Tab",
+                        gpui_probe::PROBE_WIDTH,
+                        gpui_probe::PROBE_HEIGHT
+                    );
+                    return;
+                }
                 // A fixed 360×640 window with a real title: the title is what the taskbar and
                 // Alt-Tab show, and `WindowOptions::default()` leaves it unnamed.
                 let options = WindowOptions {
