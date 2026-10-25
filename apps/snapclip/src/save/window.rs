@@ -1807,11 +1807,25 @@ fn reveal(path: &std::path::Path) {
             // SAFETY: the path is NUL terminated; a failure is reported as a null pointer.
             let file_pidl = unsafe { ILCreateFromPathW(file_wide.as_ptr()) };
             let mut revealed: Option<u64> = None;
-            if parsed >= 0 && !folder_pidl.is_null() && !file_pidl.is_null() {
+            // Which of the two ways to reveal is used. Explorer's own verb is known to select when
+            // the folder window already exists, and the shell call is the one with no quoting layer;
+            // a run cannot tell which of them failed to select without being able to choose. Left
+            // unset, the shell call is tried first and explorer is the fallback.
+            let mode = std::env::var("SNAPCLIP_DEBUG_REVEAL").unwrap_or_default();
+            let forced_explorer = mode == "explorer";
+            // Every step on one line, whether they succeed or not: the previous version only spoke
+            // when something failed, so a call that returned success and did nothing was silent.
+            eprintln!(
+                "[save-panel] reveal: apartment={apartment:#x} parsed={parsed:#x} folder_null={} file_null={} mode={mode:?}",
+                folder_pidl.is_null(),
+                file_pidl.is_null()
+            );
+            if !forced_explorer && parsed >= 0 && !folder_pidl.is_null() && !file_pidl.is_null() {
                 let children = [file_pidl as *const _];
                 // SAFETY: both identifiers are valid for the duration of the call and the array
                 // holds exactly the count given.
                 let result = unsafe { SHOpenFolderAndSelectItems(folder_pidl, 1, children.as_ptr(), 0) };
+                eprintln!("[save-panel] reveal: select={result:#x}");
                 if result >= 0 {
                     revealed = Some(result as u64);
                 } else {
@@ -1820,7 +1834,7 @@ fn reveal(path: &std::path::Path) {
                         file.display()
                     );
                 }
-            } else {
+            } else if !forced_explorer {
                 eprintln!(
                     "[save-panel] the shell could not name the file: parsed={parsed:#x} folder_null={} file_null={}",
                     folder_pidl.is_null(),
@@ -1856,7 +1870,8 @@ fn reveal(path: &std::path::Path) {
                         )
                     };
                     eprintln!(
-                        "[save-panel] fell back to explorer: result={} file={}",
+                        "[save-panel] fell back to explorer: forced={} result={} file={}",
+                        forced_explorer,
                         opened as isize,
                         file.display()
                     );
@@ -4172,16 +4187,29 @@ extern "system" fn window_proc(
                     colours.fill,
                     brush
                 );
-                windows_sys::Win32::Graphics::Gdi::SetBkColor(child, bgr(colours.fill));
+                // The experiment that separates the two things a control can fill with. A text box
+                // has two background paths, not one: the brush returned here, which fills its whole
+                // client area, and the colour set below, which fills behind the glyphs. The strip
+                // being chased is about one line of text tall, which is the shape of the second.
+                //
+                // With this set the two are made unmistakable rather than similar: the brush is
+                // solid red and the glyph background is solid green, so whatever appears in the box
+                // names its own source. Neither colour is reached without the switch.
+                let experiment = std::env::var_os("SNAPCLIP_DEBUG_EDIT_FILL").is_some();
+                let background = if experiment {
+                    [0u8, 255, 0, 255]
+                } else {
+                    colours.fill
+                };
+                windows_sys::Win32::Graphics::Gdi::SetBkColor(child, bgr(background));
                 windows_sys::Win32::Graphics::Gdi::SetTextColor(child, bgr(colours.text));
-                // The experiment that settles whether the control uses the brush it is handed at
-                // all: with this set, it is given a solid red one, so the text box is either red
-                // (the brush is used, and the light patch comes from something else) or unchanged
-                // (the brush is ignored, and what shows is the control's own default).
-                if std::env::var_os("SNAPCLIP_DEBUG_EDIT_FILL").is_some() {
+                if experiment {
                     let red =
                         windows_sys::Win32::Graphics::Gdi::CreateSolidBrush(bgr([255, 0, 0, 255]));
-                    eprintln!("[save-panel] fill experiment: returning red brush {red:?}");
+                    eprintln!(
+                        "[save-panel] fill experiment: brush=red background=green (rgba={:?}) brush={:?}",
+                        background, red
+                    );
                     return red as isize;
                 }
                 // The brush comes from the same colour the background was just set to, by way of the
