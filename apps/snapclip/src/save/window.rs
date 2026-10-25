@@ -973,9 +973,29 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
             // Three points on one column: just outside the box, just inside its top edge, and the
             // row the text sits on. Equal values mean no band; a different middle means the text
             // row is painted by something other than the fill.
+            //
+            // The paint has to happen first, and `GetWindowRect` already answers in screen
+            // coordinates, which is what a screen device context reads. Showing the window only
+            // queues a paint, so the first attempt read the desktop that was there before the
+            // panel, and reported near-white for a panel that is dark. `RedrawWindow` with
+            // `RDW_UPDATENOW` paints the window and its children before returning.
             {
+                use windows_sys::Win32::Graphics::Gdi::{
+                    RedrawWindow, RDW_ALLCHILDREN, RDW_INVALIDATE, RDW_UPDATENOW,
+                };
+                // SAFETY: a window handle and flags; no borrowed data crosses the call. The whole
+                // `shown` body is already inside an `unsafe` block, so this one would be redundant
+                // and `unnecessary_unsafe` warns.
+                RedrawWindow(
+                    hwnd,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
+                );
                 use windows_sys::Win32::Graphics::Gdi::{GetDC, GetPixel, ReleaseDC};
                 let control = (*state).control(snapclip_ui::panel::FieldId::Name);
+                // `GetWindowRect` returns screen coordinates, so no `ClientToScreen` is needed for
+                // a screen DC; the earlier suspicion that these were client coordinates was wrong.
                 let mut box_rect: windows_sys::Win32::Foundation::RECT = std::mem::zeroed();
                 if !control.is_null() && GetWindowRect(control, &mut box_rect) != 0 {
                     let screen = GetDC(std::ptr::null_mut());
@@ -985,7 +1005,11 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
                         let top_edge = GetPixel(screen, x, box_rect.top + 2);
                         let middle = GetPixel(screen, x, (box_rect.top + box_rect.bottom) / 2);
                         eprintln!(
-                            "[save-panel] screen: outside={outside:#08x} top_edge={top_edge:#08x} middle={middle:#08x} (COLORREF is 0x00BBGGRR)"
+                            "[save-panel] screen: outside={outside:#08x} top_edge={top_edge:#08x} middle={middle:#08x} box=({},{})-({},{}) (COLORREF is 0x00BBGGRR)",
+                            box_rect.left,
+                            box_rect.top,
+                            box_rect.right,
+                            box_rect.bottom,
                         );
                         ReleaseDC(std::ptr::null_mut(), screen);
                     }
@@ -1808,8 +1832,15 @@ pub fn reveal_plan(path: &std::path::Path) -> Reveal {
     )
 }
 
+/// The argument `explorer.exe` takes to select a file.
+///
+/// `/select,` alone asks the running explorer to put the selection on an item in a folder window
+/// it already has open, and it declines when it does: the folder window stays as it was and the
+/// call still reports success. `/e,` says "open a new window" first, and the selection inside that
+/// new window is honoured. The cost is a second window when one was already open, which is the
+/// price of the selection actually happening.
 fn explorer_select_parameters(file: &std::path::Path) -> String {
-    format!("/select,\"{}\"", file.display())
+    format!("/e,/select,\"{}\"", file.display())
 }
 
 /// Select a file in the folder that holds it, or open that folder.
@@ -1947,8 +1978,9 @@ fn reveal(path: &std::path::Path) {
                     )
                 };
                 eprintln!(
-                    "[save-panel] asked explorer to select the file: result={} file={}",
+                    "[save-panel] asked explorer to select the file: result={} args={} file={}",
                     opened as isize,
+                    explorer_select_parameters(&file),
                     file.display()
                 );
             }
@@ -5994,12 +6026,31 @@ mod tests {
 fn explorer_select_keeps_the_switch_outside_quoted_paths() {
     assert_eq!(
         explorer_select_parameters(std::path::Path::new(r"C:\shots\SnapClip.png")),
-        r#"/select,"C:\shots\SnapClip.png""#,
+        r#"/e,/select,"C:\shots\SnapClip.png""#,
         "the switch prefix must be parsed separately from the path"
     );
     assert_eq!(
         explorer_select_parameters(std::path::Path::new(r"C:\My Shots\截图.png")),
-        r#"/select,"C:\My Shots\截图.png""#,
+        r#"/e,/select,"C:\My Shots\截图.png""#,
         "spaces and Unicode belong inside the quoted path, not around /select"
+    );
+}
+
+/// `explorer` only honours a selection inside a window it just opened.
+///
+/// `/select,` on its own asks the running explorer to change the selection in a folder window it
+/// already has, and it does not: the call reports success and the window keeps whatever was
+/// selected before. `/e,` opens a new window and the selection inside that one takes effect, which
+/// is why the argument carries it even though a second window is the visible cost.
+#[test]
+fn explorer_select_opens_a_window_so_its_selection_is_honoured() {
+    let argument = explorer_select_parameters(std::path::Path::new(r"C:\shots\SnapClip.png"));
+    assert!(
+        argument.starts_with("/e,"),
+        "without /e, explorer reuses the open window and ignores the selection: {argument}"
+    );
+    assert!(
+        argument.contains("/select,"),
+        "the selection switch still has to be there: {argument}"
     );
 }

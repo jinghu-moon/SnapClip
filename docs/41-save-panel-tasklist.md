@@ -1974,3 +1974,25 @@ pub const AFTER_SAVE_STEPS: [AfterSaveStep; 3] = [CopyPath, TellShell, Reveal];
 
 - `WM_ERASEBKGND` 的实际效果与 `SetWindowTheme` 一样，只能人眼：整块应是 `#29292E`。
 - "总是也问 explorer"没有纯逻辑断言（顺序与调用在窗口过程里），只有 `explorer_select_parameters` 的引号有断言。
+
+## 读数本身错了两处：`screen:` 探针与 `/select,`
+
+### 一、`screen:` 读到的是窗口出现之前的桌面
+
+第一次的读数 `outside=0xfffbfa top_edge=0xfffbfa middle=0xeeeae9` 近乎纯白，而面板是 `(41,41,46)`，所以那条读数**不是面板**。
+
+- **时机** ✗：探针跟在 `shown` 那一行后面，而 `ShowWindow` 只是**排队**一次绘制 ⇒ 探针跑在首帧之前 ⇒ 读到桌面上原来的东西。修法：先 `RedrawWindow(RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN)`（**要 `RDW_ALLCHILDREN`**，否则子窗口 `EDIT` 还没画），再读。
+- **坐标** ✗→**不成立**：本来怀疑要 `ClientToScreen`，但 `GetWindowRect` 返回的就是**屏幕坐标**，而 `GetDC(NULL)` 的 `GetPixel` 也吃屏幕坐标 ⇒ **两处都对**。这条假设在代码里被否证，写进注释。
+
+读数现在多打一个 `box=(l,t,r,b)`，让"读的是哪一块"和数值一起可核。三个点同列：`outside`=框外 `left-2`、`top_edge`=上缘 `+2`、`middle`=文字行。
+
+### 二、`/select,` 在已打开的窗口里不重新选中
+
+用户两次测试都是"该文件夹已经打开"，而 `explorer /select,` 在这种情况**不改变选中**却仍返回成功（`ShellExecuteW` 的 `result=42 > 32`）⇒ 看起来一切都对，屏幕上什么都没发生。
+
+修法：参数改成 `/e,/select,"<path>"` —— `/e,` 要求**新开一个窗口**，新窗口里的选中才会生效；代价是文件夹已开时会多一个窗口。断言两条：`explorer_select_opens_a_window_so_its_selection_is_honoured`（必须以 `/e,` 开头且仍含 `/select,`）+ 既有的引号位置测试（示例同步改成 `/e,/select,…`）。日志补 `args=`，让引号与开关在日志里看得见。
+
+### 仍未覆盖
+
+- `RedrawWindow` 之后 `EDIT` 是否真的重画完，只能由用户读 `screen:` 三值：三者相同 ⇒ 屏幕上没有带子（截图/色彩管理的产物）；只有 `middle` 不同 ⇒ 带子在文字行；`top_edge` 也不同 ⇒ 带子是整个控件。
+- `/e,` 的实际效果只能人眼：新窗口里那个文件应被选中。
