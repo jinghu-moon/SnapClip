@@ -968,6 +968,29 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
                 ),
                 None => eprintln!("[save-panel] edit selection field=Name control=null"),
             }
+            // Read from the screen rather than from a screenshot: a capture of the panel can be
+            // colour managed, and the question is what the pixels around and inside the box are.
+            // Three points on one column: just outside the box, just inside its top edge, and the
+            // row the text sits on. Equal values mean no band; a different middle means the text
+            // row is painted by something other than the fill.
+            {
+                use windows_sys::Win32::Graphics::Gdi::{GetDC, GetPixel, ReleaseDC};
+                let control = (*state).control(snapclip_ui::panel::FieldId::Name);
+                let mut box_rect: windows_sys::Win32::Foundation::RECT = std::mem::zeroed();
+                if !control.is_null() && GetWindowRect(control, &mut box_rect) != 0 {
+                    let screen = GetDC(std::ptr::null_mut());
+                    if !screen.is_null() {
+                        let x = box_rect.right - 12;
+                        let outside = GetPixel(screen, box_rect.left - 2, (box_rect.top + box_rect.bottom) / 2);
+                        let top_edge = GetPixel(screen, x, box_rect.top + 2);
+                        let middle = GetPixel(screen, x, (box_rect.top + box_rect.bottom) / 2);
+                        eprintln!(
+                            "[save-panel] screen: outside={outside:#08x} top_edge={top_edge:#08x} middle={middle:#08x} (COLORREF is 0x00BBGGRR)"
+                        );
+                        ReleaseDC(std::ptr::null_mut(), screen);
+                    }
+                }
+            }
             // Who is above us, and are they topmost? The capture side's overlay and dim layer are,
             // so if either is still up and visible the panel is painted underneath it no matter what
             // the window says about itself. Class names identify them: SnapClipCaptureOverlay and the
@@ -3287,6 +3310,13 @@ fn create_field_edit(
         if unthemed != 0 {
             eprintln!("[save-panel] the control kept its visual style: hresult={unthemed:#x}");
         }
+        // Asked rather than assumed: a control that still reports a theme is still painted by
+        // it, and the empty names above would then have been accepted and ignored.
+        let kept_theme = windows_sys::Win32::UI::Controls::GetWindowTheme(edit);
+        eprintln!(
+            "[save-panel] theme after untheming: set={unthemed:#x} kept_null={}",
+            kept_theme == 0
+        );
 
         // The child is inside the frame's rect, so its own square corners are covered by the frame's
         // fill; nothing else has to be clipped.
