@@ -933,6 +933,23 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
         refresh_conflict(hwnd);
 
         ShowWindow(hwnd, SW_SHOW);
+        // Collapse any selection the window manager established while activating the first EDIT.
+        // The prototype opens with no selected text; leaving the initial value selected exposes
+        // the system highlight colour as a strip across the name field before user input.
+        let name = (*state).control(snapclip_ui::panel::FieldId::Name);
+        if !name.is_null() {
+            let length = windows_sys::Win32::UI::WindowsAndMessaging::GetWindowTextLengthW(name)
+                .max(0) as usize;
+            windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(
+                name,
+                0x00B1,
+                length,
+                length as isize,
+            );
+        }
+        // Keep focus on the panel itself after collapsing the EDIT selection. Clicking the field
+        // still gives the native control its normal caret and selection behavior.
+        windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(hwnd);
         {
             let mut rect: windows_sys::Win32::Foundation::RECT = std::mem::zeroed();
             let got = windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut rect);
@@ -1678,8 +1695,7 @@ fn shortcut_command(command: usize) -> Option<Shortcut> {
 ///
 /// The path is the one the save wrote rather than one assembled here, so what is copied or
 /// revealed cannot be a different file from the one that landed.
-fn run_after_save(hwnd: windows_sys::Win32::Foundation::HWND, path: &std::path::Path) {
-    let after = state(hwnd).map(|s| s.after).unwrap_or([false; 2]);
+fn run_after_save(after: [bool; 2], path: &std::path::Path) {
     if after[0] {
         match crate::clipboard::SystemClipboard.copy_text(&path.display().to_string()) {
             Ok(()) => eprintln!("[save-panel] copied the saved path: {}", path.display()),
@@ -1714,6 +1730,10 @@ pub fn reveal_plan(path: &std::path::Path) -> Reveal {
     )
 }
 
+fn explorer_select_parameters(file: &std::path::Path) -> String {
+    format!("/select,\"{}\"", file.display())
+}
+
 /// Select a file in the folder that holds it, or open that folder.
 ///
 /// This used to spawn `explorer` with a single argument of the shape `/select,<path>`. That works
@@ -1744,21 +1764,26 @@ fn reveal(path: &std::path::Path) {
             );
         }
         Reveal::Select(file) => {
+            use windows_sys::Win32::System::Com::{
+                CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_APARTMENTTHREADED,
+            };
             use windows_sys::Win32::UI::Shell::{
                 ILCreateFromPathW, ILFree, SHOpenFolderAndSelectItems, SHParseDisplayName,
             };
-            // The shell function below documents an apartment requirement, and without one it
-            // reports success while doing nothing: the folder opens and nothing is selected. The
-            // dialog elsewhere in this file needs no apartment, which is why the call was missing
-            // rather than wrong. `S_FALSE` means this thread already had one, so only a success is
-            // paired with `CoUninitialize`; `RPC_E_CHANGED_MODE` is reported rather than hidden,
-            // because a thread in the other apartment is a different problem with a different fix.
-            let apartment = unsafe {
-                windows_sys::Win32::System::Com::CoInitializeEx(
-                    std::ptr::null(),
-                    windows_sys::Win32::System::Com::COINIT_APARTMENTTHREADED as u32,
-                )
-            };
+            // The shell's select call needs a COM apartment on the thread that calls it, and
+            // without one it returns success and does nothing at all. This window has never
+            // initialised COM, because the comment beside the folder chooser correctly says that
+            // dialog does not need it; that reasoning does not carry over to this call, and taking
+            // it as if it did is what made the folder open with nothing selected.
+            //
+            // Every successful `CoInitializeEx` is balanced by one `CoUninitialize`, including the
+            // one that answers `S_FALSE` because the thread was already initialised: the call
+            // increments the count either way.
+            let apartment = unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) };
+            let owned_apartment = apartment >= 0;
+            if !owned_apartment {
+                eprintln!("[save-panel] no COM apartment for the reveal: hresult={apartment:#x}");
+            }
             let folder = file
                 .parent()
                 .map(|parent| parent.to_path_buf())
@@ -1781,39 +1806,73 @@ fn reveal(path: &std::path::Path) {
             let file_wide = wide(&file.display().to_string());
             // SAFETY: the path is NUL terminated; a failure is reported as a null pointer.
             let file_pidl = unsafe { ILCreateFromPathW(file_wide.as_ptr()) };
-            if parsed < 0 || folder_pidl.is_null() || file_pidl.is_null() {
-                eprintln!(
-                    "[save-panel] could not reveal the saved file: apartment={apartment:#x} parsed={parsed:#x} folder_null={} file_null={} folder={} file={}",
-                    folder_pidl.is_null(),
-                    file_pidl.is_null(),
-                    folder.display(),
-                    file.display()
-                );
-            } else {
+            let mut revealed: Option<u64> = None;
+            if parsed >= 0 && !folder_pidl.is_null() && !file_pidl.is_null() {
                 let children = [file_pidl as *const _];
                 // SAFETY: both identifiers are valid for the duration of the call and the array
                 // holds exactly the count given.
-                let result = unsafe {
-                    SHOpenFolderAndSelectItems(folder_pidl, 1, children.as_ptr(), 0)
-                };
+                let result = unsafe { SHOpenFolderAndSelectItems(folder_pidl, 1, children.as_ptr(), 0) };
+                if result >= 0 {
+                    revealed = Some(result as u64);
+                } else {
+                    eprintln!(
+                        "[save-panel] the shell would not select the file: hresult={result:#x} file={}",
+                        file.display()
+                    );
+                }
+            } else {
                 eprintln!(
-                    "[save-panel] revealed the saved file: apartment={apartment:#x} hresult={result:#x} file={}",
-                    file.display()
+                    "[save-panel] the shell could not name the file: parsed={parsed:#x} folder_null={} file_null={}",
+                    folder_pidl.is_null(),
+                    file_pidl.is_null()
                 );
+            }
+            match revealed {
+                Some(hresult) => eprintln!(
+                    "[save-panel] revealed the saved file: hresult={hresult:#x} file={}",
+                    file.display()
+                ),
+                // The shell call is the one that selects, and it can fail on a folder whose view
+                // has not caught up with the file that was just written. Explorer's own verb does
+                // open the folder in that case, so the row still shows where the file went even
+                // when the selection did not happen.
+                None => {
+                    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+                    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+                    let verb: Vec<u16> = "open\0".encode_utf16().collect();
+                    let executable: Vec<u16> = "explorer.exe\0".encode_utf16().collect();
+                    let parameters: Vec<u16> = format!("{}\0", explorer_select_parameters(&file))
+                        .encode_utf16()
+                        .collect();
+                    // SAFETY: every string is NUL terminated and outlives the call.
+                    let opened = unsafe {
+                        ShellExecuteW(
+                            std::ptr::null_mut(),
+                            verb.as_ptr(),
+                            executable.as_ptr(),
+                            parameters.as_ptr(),
+                            std::ptr::null(),
+                            SW_SHOWNORMAL,
+                        )
+                    };
+                    eprintln!(
+                        "[save-panel] fell back to explorer: result={} file={}",
+                        opened as isize,
+                        file.display()
+                    );
+                }
             }
             // SAFETY: each identifier was allocated by one of the two calls above and is freed
             // exactly once, after the shell has finished with it.
             unsafe {
                 if !folder_pidl.is_null() {
-                    windows_sys::Win32::System::Com::CoTaskMemFree(folder_pidl as *const _);
+                    CoTaskMemFree(folder_pidl as *const _);
                 }
                 if !file_pidl.is_null() {
                     ILFree(file_pidl as *const _);
                 }
-                // Only a success is paired, because `S_FALSE` means the thread already had an
-                // apartment and this call did not add a reference to release.
-                if apartment >= 0 {
-                    windows_sys::Win32::System::Com::CoUninitialize();
+                if owned_apartment {
+                    CoUninitialize();
                 }
             }
         }
@@ -1822,18 +1881,15 @@ fn reveal(path: &std::path::Path) {
 
 fn attempt_save(hwnd: windows_sys::Win32::Foundation::HWND) {
     if let Some(outcome) = save_from_panel(hwnd) {
-        // The switches ask for work that only makes sense once the file exists, so they run
-        // here rather than when they are pressed.
-        run_after_save(hwnd, &outcome.path);
-        // The picture exists, so the panel has nothing left to ask.
+        // Read the switches before destroying the window: WM_DESTROY releases the panel state.
+        let after = state(hwnd).map(|s| s.after).unwrap_or([false; 2]);
+        // Close synchronously before asking Explorer to reveal the file. Posting WM_CLOSE left the
+        // panel alive while the shell refreshed its directory asynchronously.
         unsafe {
-            windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
-                hwnd,
-                windows_sys::Win32::UI::WindowsAndMessaging::WM_CLOSE,
-                0,
-                0,
-            );
+            windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
         }
+        // The file has already been committed, and the switches now only need its final path.
+        run_after_save(after, &outcome.path);
     } else {
         // The panel stays open with the reason in its footer: closing here is what made every
         // rejected save invisible (`docs/41` A12).
@@ -5605,3 +5661,17 @@ mod tests {
         );
         std::fs::remove_dir_all(&folder).expect("the scratch folder is removable");
     }
+
+#[test]
+fn explorer_select_keeps_the_switch_outside_quoted_paths() {
+    assert_eq!(
+        explorer_select_parameters(std::path::Path::new(r"C:\shots\SnapClip.png")),
+        r#"/select,"C:\shots\SnapClip.png""#,
+        "the switch prefix must be parsed separately from the path"
+    );
+    assert_eq!(
+        explorer_select_parameters(std::path::Path::new(r"C:\My Shots\截图.png")),
+        r#"/select,"C:\My Shots\截图.png""#,
+        "spaces and Unicode belong inside the quoted path, not around /select"
+    );
+}
