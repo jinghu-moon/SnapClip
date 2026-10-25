@@ -1647,3 +1647,59 @@ M2 菜单永不向上翻      ⇒ the_context_menu_opens_upward_... FAILED（lef
 - **粘贴恒可用**：不查询剪贴板（那要新增 `Win32_System_DataExchange` 特性，为一个菜单项不值）；
   剪贴板为空时粘贴是一次无操作。剪切/复制按 `EM_GETSEL` 判定，无选中时**变暗且不响应**。
 - 菜单**无悬停高亮**、**无键盘导航**（`Dropdown` 的 `key()` 没接）⇒ 与格式菜单同一批缺口（A13）。
+
+---
+
+## 右键菜单被系统菜单顶掉：子类化只放行一条消息
+
+**现象**：在文件名框右键，弹的是系统 `EDIT` 的菜单（撤销/剪切/复制/粘贴/从右到左阅读顺序/汉字重选），
+不是面板画的那个。
+
+**根因**：父窗口确实收到了 `WM_CONTEXTMENU` 的分支，而且分支本身是对的（`field_of(wparam)` 判定
+`FieldId::Name`、`ScreenToClient`、测量宽度、遮挡、重绘都在）。问题在**消息根本到不了父窗口**：
+右键落在 `EDIT` 上时，`WM_CONTEXTMENU` 发给**子窗口**，`EDIT` 自己处理并弹系统菜单。
+父窗口那条分支因此**从未被执行过一次**——和 `Esc`/`Enter` 那次一样，是"处理函数在、链路不通"。
+
+**修法**：只给文件名框挂 `SetWindowSubclass`，进程里第一个子类化：
+
+```
+WM_CONTEXTMENU 且 lparam != -1  ⇒ 转发给父窗口（wparam 原样，即子窗口句柄；lparam 原样，是屏幕点）
+其它一切消息                     ⇒ DefSubclassProc（打字/光标/选区/剪贴板/撤销栈都在它自己的过程里）
+WM_NCDESTROY                    ⇒ RemoveWindowSubclass（句柄+id 用同一个常量，不可能分家）
+```
+
+`lparam == -1` 是键盘的上下文菜单键：面板没有"光标在哪"的几何来放置菜单，那条**留给控件自己**，
+记为缺口（`Shift+F10` 仍是系统菜单）。
+
+放行的判定抽成 `forwards_context_menu(message, lparam)`：一条纯函数，于是"拿走什么"与"放行什么"
+可以不用窗口就断言。测试 `the_box_gives_up_only_the_context_menu_it_can_place` 断言**恰好一条**：
+`WM_CHAR`/`WM_KEYDOWN`/`WM_SETFOCUS`/`WM_LBUTTONDOWN`/`WM_NCDESTROY` 都必须到达控件自己的过程——
+一个多吞消息的子类不会让别的测试红，它会**悄悄让这个框不再是输入框**。
+
+**变异**（都先断言锚点命中 1 处、`Compiling snapclip-app` 可见、还原后逐字节一致）：
+
+```
+M1 `lparam != -1`（拿走所有消息）        ⇒ message 0x0102 has to reach the box's own procedure
+M2 `message == WM_CONTEXTMENU`（连键盘键也拿走）⇒ the keyboard's context key has no caret position …
+```
+
+M1 第一版写成 `true`，结果红在 M2 那条断言上 —— **没隔离**"只拿一条"这件事，换成"只看 lparam"才拿到
+指向 `WM_CHAR` 的红。
+
+## 顺带修掉一个偶发：测试在数全进程共享的临时目录
+
+`no_master_is_left_in_the_temporary_folder` 数 `std::env::temp_dir()` 里 `snapclip-master-*` 的**数量差**。
+并行跑时另一次转码也在同一目录里放母版 ⇒ 前后的差被别人的文件扰动 ⇒ **串行绿、并行红**。
+证据：单独跑 3 次全绿，整套并行红，且 TEMP 里真的留下 1 个母版。这与"串行红/并行绿"是同一族的反面。
+
+修法是给 `to_bytes` 一个**可注入的目录**：`to_bytes_in(..., folder)`（公共 `to_bytes` 用 `temp_dir()`），
+测试用自己建的私有目录 ⇒ 数到的只可能是这次调用放的。测试改名
+`no_master_is_left_in_the_folder_it_was_parked_in`，因为它的新断言说的是另一件事。
+
+## 未覆盖
+
+- 子类化真的收到消息、转发后菜单真的弹出、命令真的剪贴/粘贴 —— 都要**真窗口 + 人眼**。
+- 键盘上下文菜单键（`Shift+F10`）仍走系统菜单。
+- `examples/component_gallery.rs` 的 4 条 `unused BOOL` 是既有 warning（文件未改）。
+- 顺带清掉了 `window.rs` 里 4 处 `unnecessary unsafe`（这个版本的 `windows-sys` 里
+  `SetWindowSubclass`/`ScreenToClient`/`GetClientRect`/`InvalidateRect` 都是安全函数）。

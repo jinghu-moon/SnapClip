@@ -18,7 +18,22 @@ use super::service::SaveError;
 /// `quality` only reaches JPEG: PNG is a byte copy and this project's WebP is lossless, which is
 /// why the panel has no tier for either of them (`docs/42` D1, spec `:94`).
 pub fn to_bytes(png: &[u8], format: SaveFormat, quality: u8) -> Result<Vec<u8>, SaveError> {
-    let master = master_path();
+    to_bytes_in(png, format, quality, &std::env::temp_dir())
+}
+
+/// The same transcode, parking its master in `folder`.
+///
+/// The folder is a parameter because the shared temporary folder is a **global** the tests were
+/// counting: two transcodes running at once each park a master there, so a test that compares the
+/// number before and after sees the other one's file appear or vanish and fails for a reason that
+/// has nothing to do with what it is checking. Passing the folder in makes that measurement local.
+fn to_bytes_in(
+    png: &[u8],
+    format: SaveFormat,
+    quality: u8,
+    folder: &std::path::Path,
+) -> Result<Vec<u8>, SaveError> {
+    let master = master_path_in(folder);
     std::fs::write(&master, png)
         .map_err(|error| SaveError::Io(format!("the master cannot be parked: {error}")))?;
     let mut bytes = Vec::new();
@@ -31,12 +46,12 @@ pub fn to_bytes(png: &[u8], format: SaveFormat, quality: u8) -> Result<Vec<u8>, 
 
 /// A name nothing else in this process is likely to pick: the process id, the clock, and the
 /// format's extension so a victim of a crash can be recognised by hand.
-fn master_path() -> std::path::PathBuf {
+fn master_path_in(folder: &std::path::Path) -> std::path::PathBuf {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_nanos())
         .unwrap_or(0);
-    std::env::temp_dir().join(format!(
+    folder.join(format!(
         "snapclip-master-{}-{stamp}.png",
         std::process::id()
     ))
@@ -93,15 +108,40 @@ mod tests {
     }
 
     /// No master is left behind, whether the transcode worked or not.
+    ///
+    /// The transcodes park their master in a folder this test owns, because the shared temporary
+    /// folder is a global: two transcodes running at once each park one there, and a count taken
+    /// around a single call then includes the other one's file appearing or vanishing. That is a
+    /// failure about scheduling, not about leftovers, and it is what made this test flaky.
     #[test]
-    fn no_master_is_left_in_the_temporary_folder() {
-        let before = count_masters();
-        let _ = to_bytes(&master(), SaveFormat::Jpeg, 92);
-        assert_eq!(count_masters(), before, "the parked master must be removed");
+    fn no_master_is_left_in_the_folder_it_was_parked_in() {
+        let folder = private_folder("left-behind");
+        let before = count_masters(&folder);
+        let _ = to_bytes_in(&master(), SaveFormat::Jpeg, 92, &folder);
+        assert_eq!(
+            count_masters(&folder),
+            before,
+            "the parked master must be removed"
+        );
+        let _ = std::fs::remove_dir_all(&folder);
     }
 
-    fn count_masters() -> usize {
-        std::fs::read_dir(std::env::temp_dir())
+    /// A folder no other test uses, so what is counted inside it is only this call's doing.
+    fn private_folder(what: &str) -> std::path::PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        let folder = std::env::temp_dir().join(format!(
+            "snapclip-{what}-test-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&folder).expect("a private folder");
+        folder
+    }
+
+    fn count_masters(folder: &std::path::Path) -> usize {
+        std::fs::read_dir(folder)
             .map(|entries| {
                 entries
                     .filter_map(Result::ok)

@@ -907,6 +907,16 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
                     id.face(),
                 );
                 s.set_control(id, control);
+                // A text box answers the context-menu message itself, with a menu in the system's
+                // colours that cannot be recoloured, so the panel never hears about a right click
+                // on it and the menu it draws is unreachable. The box is subclassed to forward
+                // that one message: see `edit_context_subclass`.
+                windows_sys::Win32::UI::Shell::SetWindowSubclass(
+                    control,
+                    Some(edit_context_subclass),
+                    CONTEXT_SUBCLASS_ID,
+                    hwnd as usize,
+                );
             }
         }
         // The controls now hold the name and the directory, so the question can be asked: the panel
@@ -3188,13 +3198,11 @@ extern "system" fn window_proc(
                     } else {
                         close_menus(hwnd, "a click landed outside the context menu");
                     }
-                    unsafe {
-                        windows_sys::Win32::Graphics::Gdi::InvalidateRect(
-                            hwnd,
-                            std::ptr::null(),
-                            0,
-                        );
-                    }
+                    windows_sys::Win32::Graphics::Gdi::InvalidateRect(
+                        hwnd,
+                        std::ptr::null(),
+                        0,
+                    );
                     return 0;
                 }
             }
@@ -3749,6 +3757,13 @@ extern "system" fn window_proc(
             let is_name = state(hwnd)
                 .and_then(|s| s.field_of(child))
                 .is_some_and(|id| id == snapclip_ui::panel::FieldId::Name);
+            // The box that owns the text answers this message itself, so a line here says the
+            // subclass forwarded it; silence says the panel is still being bypassed. One real
+            // right click settles which.
+            eprintln!(
+                "[save-panel] context menu asked: child={child:?} is_name={is_name} point={:#x}",
+                lparam as usize
+            );
             if !is_name {
                 return DefWindowProcW(hwnd, message, wparam, lparam);
             }
@@ -3757,9 +3772,7 @@ extern "system" fn window_proc(
                 x: (lparam & 0xffff) as i16 as i32,
                 y: ((lparam >> 16) & 0xffff) as i16 as i32,
             };
-            unsafe {
-                windows_sys::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut point);
-            }
+            windows_sys::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut point);
             let scale = dpi_scale(hwnd);
             let mut client = windows_sys::Win32::Foundation::RECT {
                 left: 0,
@@ -3767,11 +3780,7 @@ extern "system" fn window_proc(
                 right: 0,
                 bottom: 0,
             };
-            unsafe {
-                let _ = windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(
-                    hwnd, &mut client,
-                );
-            }
+            windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut client);
             // The width is measured, and measured before the state is borrowed mutably: the menu's
             // rows are the ones the painter draws, because both come from this one number.
             let width = match state(hwnd) {
@@ -3805,9 +3814,7 @@ extern "system" fn window_proc(
                 s.var_open = false;
             }
             apply_menu_occlusion(hwnd);
-            unsafe {
-                windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0);
-            }
+            windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0);
             0
         }
         WM_CTLCOLOREDIT => {
@@ -3949,6 +3956,62 @@ fn bgr(rgba: [u8; 4]) -> u32 {
 
 /// `WM_CONTEXTMENU`: the child asks its parent for a right-click menu.
 const WM_CONTEXTMENU: u32 = 0x007B;
+
+/// `WM_NCDESTROY`: the box is going away, so its subclass must be removed.
+const WM_NCDESTROY: u32 = 0x0082;
+
+/// The id the name box's subclass is registered under.
+///
+/// A subclass is addressed by handle and id together, so the removal at `WM_NCDESTROY` has to
+/// quote the same pair the installation did; a constant is the only way they cannot drift.
+const CONTEXT_SUBCLASS_ID: usize = 1;
+
+/// Which messages the name box's subclass takes away from the box.
+///
+/// Exactly one, and only when it came from the mouse. The keyboard's context-menu key arrives with
+/// `lparam == -1`, and the panel has no caret geometry to place a menu at, so that path stays with
+/// the box. Written as a function rather than as conditions inside the procedure so the two halves
+/// — "what is taken" and "what is passed through" — can be asserted without a window.
+#[cfg(windows)]
+fn forwards_context_menu(message: u32, lparam: isize) -> bool {
+    message == WM_CONTEXTMENU && lparam != -1
+}
+
+/// `WM_CONTEXTMENU` forwarded from the name box to the panel.
+///
+/// A text box handles this message itself and shows the system's own menu. That menu is drawn in
+/// the system's colours and cannot be recoloured, which is why the panel draws its own — but the
+/// panel only ever hears about a right click on itself, never on the box, so its menu was
+/// unreachable. This forwards exactly that one message to the panel, which places and paints the
+/// menu, and lets every other message go to the box's own procedure: typing, the caret, the
+/// selection, the clipboard and the undo stack all live there.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+unsafe extern "system" fn edit_context_subclass(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    message: u32,
+    wparam: windows_sys::Win32::Foundation::WPARAM,
+    lparam: windows_sys::Win32::Foundation::LPARAM,
+    _id: usize,
+    ref_data: usize,
+) -> windows_sys::Win32::Foundation::LRESULT {
+    use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass};
+    if forwards_context_menu(message, lparam) {
+        let parent = ref_data as windows_sys::Win32::Foundation::HWND;
+        if !parent.is_null() {
+            return unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(
+                    parent, WM_CONTEXTMENU, wparam, lparam,
+                )
+            };
+        }
+        return unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
+    }
+    if message == WM_NCDESTROY {
+        unsafe { RemoveWindowSubclass(hwnd, Some(edit_context_subclass), CONTEXT_SUBCLASS_ID) };
+    }
+    unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+}
 
 /// `WM_CTLCOLOREDIT`: the child asks its parent what to paint its background with.
 #[cfg(windows)]
@@ -5217,4 +5280,34 @@ mod tests {
             String::from_utf16_lossy(&path[..path.len() - 1]),
             r"C:\shots"
         );
+    }
+
+    /// The box's subclass takes exactly one message, and only from the mouse.
+    ///
+    /// Everything else has to reach the box's own procedure, because typing, the caret, the
+    /// selection, the clipboard and the undo stack are all implemented there. A subclass that
+    /// swallowed more than the context menu would not fail anything else in this file: it would
+    /// quietly stop the box being a text box.
+    #[test]
+    fn the_box_gives_up_only_the_context_menu_it_can_place() {
+        assert!(
+            forwards_context_menu(WM_CONTEXTMENU, 100),
+            "a right click belongs to the panel's own menu"
+        );
+        assert!(
+            !forwards_context_menu(WM_CONTEXTMENU, -1),
+            "the keyboard's context key has no caret position to place a menu at"
+        );
+        for other in [
+            0x0102, // WM_CHAR
+            0x0100, // WM_KEYDOWN
+            0x0007, // WM_SETFOCUS
+            0x0201, // WM_LBUTTONDOWN
+            WM_NCDESTROY,
+        ] {
+            assert!(
+                !forwards_context_menu(other, 100),
+                "message {other:#06x} has to reach the box's own procedure"
+            );
+        }
     }
