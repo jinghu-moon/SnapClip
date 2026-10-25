@@ -1560,9 +1560,11 @@ fn control_text(hwnd: windows_sys::Win32::Foundation::HWND) -> String {
 /// (`docs/design/…规格.md` names both). Local rather than UTC, because a file named for yesterday
 /// is a surprise; no separator in the time because a colon is not a legal file name character.
 /// The application's own name, which [软件名] expands to (:198) and the token menu shows.
-const APP_NAME: &str = "SnapClip";
+pub(crate) const APP_NAME: &str = "SnapClip";
 
-fn local_date_and_time() -> (String, String) {
+/// Shared with the GPUI probe (`gpui_save`), which saves through the same chain: the template's
+/// values have to come from one clock, or the two panels would disagree about the name of a file.
+pub(crate) fn local_date_and_time() -> (String, String) {
     let mut now: windows_sys::Win32::Foundation::SYSTEMTIME = unsafe { std::mem::zeroed() };
     unsafe { windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut now) };
     (
@@ -1576,7 +1578,7 @@ fn local_date_and_time() -> (String, String) {
 /// The menu's order is the design's (FMT_OPTIONS, :717): PNG, JPG, WebP. The mapping lives here
 /// rather than in the message handler because a click is not needed to check it, and because the
 /// index and the format are both small integers whose swap would save a file of the wrong kind.
-fn format_of_index(index: usize) -> SaveFormat {
+pub(crate) fn format_of_index(index: usize) -> SaveFormat {
     match index {
         1 => SaveFormat::Jpeg,
         2 => SaveFormat::Webp,

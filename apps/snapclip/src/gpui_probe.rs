@@ -60,6 +60,9 @@ pub const PROBE_TITLE: &str = "保存图片 · GPUI 探针";
 pub const PROBE_NAME: &str = "SnapClip_[日期]";
 /// The two footer buttons, named once so the label and the id cannot drift.
 pub const PROBE_CANCEL: &str = "取消";
+/// The footer's copy button, a ghost button before the separator (`:679`). Its tooltip in the
+/// mockup is `复制图片 (Ctrl+C)`; the probe shows the word only, like the buttons beside it.
+pub const PROBE_COPY: &str = "复制";
 /// See [`PROBE_CANCEL`].
 pub const PROBE_SAVE: &str = "保存";
 /// The path row's button, borrowed from the row that already draws it.
@@ -102,6 +105,114 @@ pub const PROBE_CARD_RADIUS: f32 = 10.0;
 pub const PROBE_CHECKER_LIGHT: u32 = 0x3236_3e;
 pub const PROBE_CHECKER_DARK: u32 = 0x2124_2a;
 
+/// How finely a square that reaches into one of the card's corner arcs is drawn.
+///
+/// The frame's `overflow_hidden` clips to a rectangle and does not read the border radius
+/// (`gpui-fast/src/style.rs`, the clip uses two corner points), so a square that straddles an arc
+/// keeps its own square corner. Such a square is redrawn as this many smaller squares of the same
+/// colour and the ones lying wholly outside the arc are left out, which turns one square nub into a
+/// staircase.
+///
+/// Eight is the coarsest split that actually drops something at this card's ten dip radius: a
+/// sixteen dip tile split eight ways is two, and the corner-most two dip square has its nearest
+/// point eight dips out on each axis, which is past the ten dip radius; at four dips the corner-most
+/// square is still inside the arc and nothing would be dropped at all.
+pub const CORNER_SUBDIVISIONS: usize = 8;
+
+/// Whether a square survives the card's rounded corner at its own corner of the card.
+///
+/// A square is left out only when it lies **wholly outside** one of the four arcs: the nearest
+/// point of the square to that arc's centre is farther than the radius. Anything the arc passes
+/// through is kept, because leaving out a square the arc only clips would show the surface behind
+/// the board instead of the board — the corner would go dark rather than round.
+///
+/// Both rectangles are `(left, top, right, bottom)` in dips, the order `fit_preview` uses.
+pub fn tile_clears_round_corner(
+    tile: (f32, f32, f32, f32),
+    card: (f32, f32, f32, f32),
+    radius: f32,
+) -> bool {
+    let (card_left, card_top, card_right, card_bottom) = card;
+    let (tile_left, tile_top, tile_right, tile_bottom) = tile;
+    // Each arc's centre, and which side of it the arc is on: the arc governs the quadrant beyond
+    // both of its centre's edges, so a square matters to it only when it lies wholly in there.
+    let arcs = [
+        (card_left + radius, card_top + radius, true, true),
+        (card_right - radius, card_top + radius, false, true),
+        (card_left + radius, card_bottom - radius, true, false),
+        (card_right - radius, card_bottom - radius, false, false),
+    ];
+    for (centre_x, centre_y, from_left, from_top) in arcs {
+        let wholly_beyond_x = if from_left {
+            tile_right <= centre_x
+        } else {
+            tile_left >= centre_x
+        };
+        let wholly_beyond_y = if from_top {
+            tile_bottom <= centre_y
+        } else {
+            tile_top >= centre_y
+        };
+        if !(wholly_beyond_x && wholly_beyond_y) {
+            continue;
+        }
+        let across = if from_left {
+            centre_x - tile_right
+        } else {
+            tile_left - centre_x
+        };
+        let down = if from_top {
+            centre_y - tile_bottom
+        } else {
+            tile_top - centre_y
+        };
+        if across * across + down * down > radius * radius {
+            return false;
+        }
+    }
+    true
+}
+
+/// The edge length to redraw a square at when it reaches into a corner arc, or `None` when it
+/// stays clear of all four and can be drawn whole.
+///
+/// The split is what makes the rule above useful: at this card's ten dip radius and sixteen dip
+/// tiles, the square in each corner contains its arc's centre and therefore has to be kept, so
+/// skipping whole squares alone would remove nothing and the corners would stay square.
+pub fn corner_step(
+    tile: (f32, f32, f32, f32),
+    card: (f32, f32, f32, f32),
+    radius: f32,
+) -> Option<f32> {
+    let (card_left, card_top, card_right, card_bottom) = card;
+    let (tile_left, tile_top, tile_right, tile_bottom) = tile;
+    let quadrants = [
+        (card_left, card_top, card_left + radius, card_top + radius),
+        (card_right - radius, card_top, card_right, card_top + radius),
+        (
+            card_left,
+            card_bottom - radius,
+            card_left + radius,
+            card_bottom,
+        ),
+        (
+            card_right - radius,
+            card_bottom - radius,
+            card_right,
+            card_bottom,
+        ),
+    ];
+    let overlaps = quadrants.iter().any(|quadrant| {
+        let (left, top, right, bottom) = *quadrant;
+        tile_left < right && tile_right > left && tile_top < bottom && tile_bottom > top
+    });
+    if overlaps {
+        Some((tile_right - tile_left) / CORNER_SUBDIVISIONS as f32)
+    } else {
+        None
+    }
+}
+
 /// The picture the probe shows inside the card.
 ///
 /// The repository has no photograph to hand, only the tracked icon set, so a 96 dip square is used
@@ -110,9 +221,6 @@ pub const PROBE_CHECKER_DARK: u32 = 0x2124_2a;
 /// up (`crates/snapclip-ui/src/panel/frame.rs` `fit_preview`, line 5438 `.min(1.0)`).
 pub const PROBE_PREVIEW_FILE: &str = "assets/icon/close.png";
 pub const PROBE_PREVIEW_SIZE: (f32, f32) = (96.0, 96.0);
-/// What the estimated size shows before anything has been measured (`:668` shows a real value,
-/// which this probe has no encoder to produce; the sample is the mockup's own).
-pub const PROBE_ESTIMATE_SAMPLE: &str = "227.31 KB";
 
 // A menu item's click handler is crate-private in this release — items carry an `action` instead,
 // and actions are dispatched to the focus owner through GPUI's action system. Binding that for two
@@ -287,6 +395,12 @@ pub struct GpuiProbe {
     mode: usize,
     /// Which of the saved-after switches are on.
     after: [bool; 2],
+    /// The picture a save would write. Synthetic: the probe captures nothing (see `gpui_save`).
+    picture: crate::gpui_save::Picture,
+    /// How heavy the file would be, as the note at the bottom of the form says.
+    estimate: Option<String>,
+    /// What the footer says after a save that did not happen, and nothing otherwise.
+    status: Option<String>,
 }
 
 impl GpuiProbe {
@@ -311,7 +425,7 @@ impl GpuiProbe {
         let height = cx.new(|cx| {
             InputState::new(window, cx).default_value(PROBE_ORIGINAL_SIZE.1.to_string())
         });
-        Self {
+        let mut probe = Self {
             focus,
             name,
             path,
@@ -320,7 +434,30 @@ impl GpuiProbe {
             format: 0,
             mode: 0,
             after: [false, false],
-        }
+            picture: crate::gpui_save::Picture::synthetic(),
+            estimate: None,
+            status: None,
+        };
+        probe.weigh(cx);
+        probe
+    }
+
+    /// How heavy the file would be, from a real encode of the picture a save would write.
+    ///
+    /// Named rather than inlined so the two places that need a fresh number (building the view and
+    /// changing the format) call the same thing: the note and the file cannot describe two
+    /// different pictures.
+    fn weigh(&mut self, cx: &App) {
+        let output = self.output_size(cx);
+        let (date, time) = crate::gpui_save::now();
+        let values = crate::gpui_save::values(
+            "",
+            PROBE_NAME,
+            crate::gpui_save::format_of(self.format),
+            &date,
+            &time,
+        );
+        self.estimate = crate::gpui_save::weight(&self.picture, &values, output);
     }
 
     /// Point the path field at one of the shortcuts' folders.
@@ -548,6 +685,9 @@ impl Render for GpuiProbe {
                                 h.update(cx, |state, cx| {
                                     state.set_value(height.to_string(), window, cx)
                                 });
+                                // A smaller picture is a smaller file, so the note is measured
+                                // again here rather than in the middle of a frame.
+                                this.weigh(cx);
                                 cx.notify();
                                 window.refresh();
                             }))
@@ -583,7 +723,13 @@ impl Render for GpuiProbe {
         };
         let quality_row = row(quality_header, quality_content, true, scale);
 
-        // 预估大小: the value sits at the row's right end (`:668`), as the mockup draws it.
+        // 预估大小: the value sits at the row's right end (`:668`), as the mockup draws it. It is
+        // the length of the file a save would write, from one real encode — not the mockup's sample
+        // number, which this probe used to show and no longer does.
+        let estimate_text = self
+            .estimate
+            .clone()
+            .unwrap_or_else(|| "—".to_owned());
         let estimate_row = row(
             row_label(PROBE_LABELS[5]),
             div()
@@ -591,7 +737,7 @@ impl Render for GpuiProbe {
                 .h_flex()
                 .items_center()
                 .justify_end()
-                .child(div().text_sm().child(PROBE_ESTIMATE_SAMPLE)),
+                .child(div().text_sm().child(estimate_text)),
             true,
             scale,
         );
@@ -615,12 +761,53 @@ impl Render for GpuiProbe {
                 } else {
                     PROBE_CHECKER_DARK
                 };
-                line = line.child(
-                    div()
-                        .w(px(dip(scale, tile)))
-                        .h(px(dip(scale, tile)))
-                        .bg(rgb(colour)),
-                );
+                let left = card_left + column_index as f32 * tile;
+                let top = card_top + row_index as f32 * tile;
+                let square = (left, top, left + tile, top + tile);
+                if !tile_clears_round_corner(square, PROBE_CARD, PROBE_CARD_RADIUS) {
+                    continue;
+                }
+                // A square the card's arc passes through cannot be clipped by the frame, so it is
+                // redrawn as a finer grid of the same colour: the squares wholly outside the arc
+                // drop out and the square nub becomes a staircase (`CORNER_SUBDIVISIONS`).
+                match corner_step(square, PROBE_CARD, PROBE_CARD_RADIUS) {
+                    None => {
+                        line = line.child(
+                            div()
+                                .w(px(dip(scale, tile)))
+                                .h(px(dip(scale, tile)))
+                                .bg(rgb(colour)),
+                        );
+                    }
+                    Some(step) => {
+                        let mut block = div()
+                            .w(px(dip(scale, tile)))
+                            .h(px(dip(scale, tile)))
+                            .v_flex();
+                        for sub_row in 0..CORNER_SUBDIVISIONS {
+                            let mut sub_line = div().h_flex();
+                            for sub_column in 0..CORNER_SUBDIVISIONS {
+                                let sub_left = left + sub_column as f32 * step;
+                                let sub_top = top + sub_row as f32 * step;
+                                let sub_square = (sub_left, sub_top, sub_left + step, sub_top + step);
+                                if tile_clears_round_corner(
+                                    sub_square,
+                                    PROBE_CARD,
+                                    PROBE_CARD_RADIUS,
+                                ) {
+                                    sub_line = sub_line.child(
+                                        div()
+                                            .w(px(dip(scale, step)))
+                                            .h(px(dip(scale, step)))
+                                            .bg(rgb(colour)),
+                                    );
+                                }
+                            }
+                            block = block.child(sub_line);
+                        }
+                        line = line.child(block);
+                    }
+                }
             }
             board = board.child(line);
         }
@@ -675,24 +862,43 @@ impl Render for GpuiProbe {
                             .child(estimate_row),
                     ),
             )
-            // The footer, which the mockup anchors to the window's bottom right (`:674`).
+            // The footer, which the mockup lays across the window's bottom (`:673`-`:687`): the
+            // status line takes the space the buttons leave, the copy button sits before a
+            // separator, and cancel and save are adjacent at the right end.
             .child(
                 div()
                     .absolute()
+                    .left(px(dip(scale, PROBE_PADDING)))
                     .right(px(dip(scale, PROBE_PADDING)))
                     .bottom(px(dip(scale, PROBE_PADDING)))
+                    .h(px(dip(scale, mockup::BUTTON_HEIGHT)))
                     .h_flex()
+                    .items_center()
                     .gap(px(dip(scale, mockup::HEADER_ACTION_GAP)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_sm()
+                            .child(self.status.clone().unwrap_or_default()),
+                    )
+                    .child(
+                        Button::new("probe-copy")
+                            .label(PROBE_COPY)
+                            .h(px(dip(scale, mockup::BUTTON_HEIGHT)))
+                            .on_click(cx.listener(|this, _, _, cx| this.copy_picture(cx))),
+                    )
                     .child(
                         Button::new("probe-cancel")
                             .label(PROBE_CANCEL)
-                            .h(px(dip(scale, mockup::BUTTON_HEIGHT))),
+                            .h(px(dip(scale, mockup::BUTTON_HEIGHT)))
+                            .on_click(cx.listener(|this, _, window, cx| this.cancel_probe(window, cx))),
                     )
                     .child(
                         Button::new("probe-save")
                             .primary()
                             .label(PROBE_SAVE)
-                            .h(px(dip(scale, mockup::BUTTON_HEIGHT))),
+                            .h(px(dip(scale, mockup::BUTTON_HEIGHT)))
+                            .on_click(cx.listener(|this, _, window, cx| this.save_probe(window, cx))),
                     ),
             )
             // The menus hand their item back as an action, which arrives here because this element
@@ -807,6 +1013,93 @@ impl GpuiProbe {
     fn choose_format(&mut self, index: usize, cx: &mut Context<Self>) {
         if index < FMT_OPTIONS.len() {
             self.format = index;
+            // The format decides what the file weighs, so the note has to be measured again; this
+            // is an event handler rather than part of drawing, because a full encode does not
+            // belong in a frame.
+            self.weigh(cx);
+            cx.notify();
+        }
+    }
+
+    /// The size a save would write, from the two cells and the mode (`:242`, `:226`/`:227`).
+    ///
+    /// Read through the panel's own rule, so `百分比` means what it means there and a cell that
+    /// holds something unreadable falls back to the capture's size instead of failing.
+    fn output_size(&self, cx: &App) -> crate::save::Size {
+        let width = self.width.read(cx).value().to_string();
+        let height = self.height.read(cx).value().to_string();
+        let mode = if self.mode == 1 {
+            crate::save::scale::SizeMode::Percent
+        } else {
+            crate::save::scale::SizeMode::Pixels
+        };
+        crate::save::output_size(
+            mode,
+            &width,
+            &height,
+            crate::save::Size::new(PROBE_ORIGINAL_SIZE.0, PROBE_ORIGINAL_SIZE.1),
+        )
+    }
+
+    /// The footer's copy button: the picture a save would write, at the size the panel asks for.
+    ///
+    /// The same picture and the same scaling the save uses, so what lands on the clipboard and what
+    /// lands on disk are the same image rather than two that look alike.
+    fn copy_picture(&mut self, cx: &mut Context<Self>) {
+        let output = self.output_size(cx);
+        let frame = self.picture.frame(output);
+        let scaled = crate::save::scale::scaled(&frame);
+        let image = crate::clipboard::ClipboardImage {
+            width: output.width,
+            height: output.height,
+            pixels: &scaled,
+            channels: crate::clipboard::Channels::Bgra,
+            png: None,
+        };
+        match crate::clipboard::SystemClipboard.copy_image(&image) {
+            Ok(()) => eprintln!("[gpui-probe] copied {}x{}", output.width, output.height),
+            Err(why) => eprintln!("[gpui-probe] could not copy: {why}"),
+        }
+        cx.notify();
+    }
+
+    /// The footer's cancel: the user changed their mind, so there is nothing to explain.
+    fn cancel_probe(&mut self, window: &mut Window, _: &mut Context<Self>) {
+        window.remove_window();
+    }
+
+    /// The footer's save: write the file, or say why not and stay open.
+    ///
+    /// The panel's rule (`docs/41`) is that a failed save keeps the window, because the window is
+    /// the only place the reason can be shown; a successful one closes it.
+    fn save_probe(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let output = self.output_size(cx);
+        let directory = self.path.read(cx).value().to_string();
+        let name = self.name.read(cx).value().to_string();
+        let (date, time) = crate::gpui_save::now();
+        let values = crate::gpui_save::values(
+            &directory,
+            &name,
+            crate::gpui_save::format_of(self.format),
+            &date,
+            &time,
+        );
+        let result = crate::gpui_save::save(&self.picture, &values, output);
+        match &result {
+            Ok(outcome) => {
+                eprintln!(
+                    "[gpui-probe] saved {} bytes to {} as {:?}",
+                    outcome.bytes,
+                    outcome.path.display(),
+                    outcome.format
+                );
+            }
+            Err(why) => eprintln!("[gpui-probe] the save did not happen: {why:?}"),
+        }
+        self.status = crate::gpui_save::status_of(&result);
+        if result.is_ok() {
+            window.remove_window();
+        } else {
             cx.notify();
         }
     }
@@ -1124,8 +1417,8 @@ mod preset_tests {
 mod preview_tests {
     // `use gpui_kit::*` exports a macro named `test`, which shadows the attribute.
     use super::{
-        PROBE_CARD, PROBE_CARD_RADIUS, PROBE_CHECKER_DARK, PROBE_CHECKER_LIGHT, PROBE_CHECKER_TILE,
-        fit_preview,
+        CORNER_SUBDIVISIONS, PROBE_CARD, PROBE_CARD_RADIUS, PROBE_CHECKER_DARK,
+        PROBE_CHECKER_LIGHT, PROBE_CHECKER_TILE, corner_step, fit_preview, tile_clears_round_corner,
     };
 
     /// The card is where the header, the body's padding and the card's own size put it.
@@ -1172,6 +1465,79 @@ mod preview_tests {
             fit_preview((1000.0, 1000.0), PROBE_CARD),
             (64.0, 48.0, 524.0, 508.0),
             "1000 square into 556 x 460: 460 wide, 16 + (556 - 460) / 2 across, flush vertically"
+        );
+    }
+
+    /// A square is left out only when the arc misses it entirely.
+    ///
+    /// The card here is a plain hundred dip square with a ten dip radius, so the arc's centre is at
+    /// ten from the corner and the numbers can be checked by hand: a square ending four dips from
+    /// the edge has its nearest point six dips out on each axis, which is within ten and is kept;
+    /// one ending two dips out is eight and eight, which is past ten and is dropped.
+    #[::core::prelude::v1::test]
+    fn a_square_wholly_outside_a_rounded_corner_is_left_out() {
+        let card = (0.0, 0.0, 100.0, 100.0);
+        assert!(
+            tile_clears_round_corner((40.0, 40.0, 56.0, 56.0), card, 10.0),
+            "the middle of the card is nowhere near an arc"
+        );
+        assert!(
+            tile_clears_round_corner((0.0, 0.0, 4.0, 4.0), card, 10.0),
+            "6 and 6 is 8.49 from the arc's centre, inside ten, so the arc still crosses it"
+        );
+        assert!(
+            !tile_clears_round_corner((0.0, 0.0, 2.0, 2.0), card, 10.0),
+            "8 and 8 is 11.31 from the arc's centre, past ten, so no part of it is inside the card"
+        );
+    }
+
+    /// The square holding an arc's centre always survives, which is why the corner is split.
+    ///
+    /// At this card's ten dip radius and sixteen dip tiles the corner square contains the arc's
+    /// centre at 26, 58, so its nearest point is zero dips away and skipping whole squares alone
+    /// would leave all four corners square. This test states that rather than leaving it to be
+    /// rediscovered.
+    #[::core::prelude::v1::test]
+    fn the_square_holding_the_arcs_centre_can_never_be_dropped() {
+        assert!(
+            tile_clears_round_corner((16.0, 48.0, 32.0, 64.0), PROBE_CARD, PROBE_CARD_RADIUS),
+            "the corner square contains 26, 58, the centre of the card's top left arc"
+        );
+    }
+
+    /// The split is fine enough that the square at the very tip of the arc is dropped.
+    ///
+    /// Sixteen dips split eight ways is two, and the corner-most square ends eight dips from each
+    /// edge: 8 and 8 is 11.31, past the ten dip radius, so it goes. The next one in ends six and
+    /// eight, which is exactly ten, and is kept because the arc touches it.
+    #[::core::prelude::v1::test]
+    fn the_corner_split_drops_the_square_at_the_arcs_tip() {
+        assert_eq!(
+            CORNER_SUBDIVISIONS, 8,
+            "a sixteen dip tile split eight ways is two, the coarsest split that drops anything"
+        );
+        assert_eq!(
+            corner_step((16.0, 48.0, 32.0, 64.0), PROBE_CARD, PROBE_CARD_RADIUS),
+            Some(2.0),
+            "sixteen dips over eight is two"
+        );
+        assert!(
+            !tile_clears_round_corner((16.0, 48.0, 18.0, 50.0), PROBE_CARD, PROBE_CARD_RADIUS),
+            "8 and 8 from the arc's centre is 11.31, outside the ten dip radius"
+        );
+        assert!(
+            tile_clears_round_corner((18.0, 48.0, 20.0, 50.0), PROBE_CARD, PROBE_CARD_RADIUS),
+            "6 and 8 is exactly ten, so the arc touches this square and it has to stay"
+        );
+    }
+
+    /// A square clear of every arc quadrant is drawn whole, at the mockup's tile size.
+    #[::core::prelude::v1::test]
+    fn a_square_in_the_middle_is_drawn_whole() {
+        assert_eq!(
+            corner_step((100.0, 200.0, 116.0, 216.0), PROBE_CARD, PROBE_CARD_RADIUS),
+            None,
+            "the middle of the card is more than a radius from every corner"
         );
     }
 }

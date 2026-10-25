@@ -24,6 +24,7 @@ pub mod clipboard;
 pub mod clipboard_ingest;
 pub mod events;
 pub mod gpui_probe;
+pub mod gpui_save;
 pub mod history;
 pub mod pin;
 pub mod save;
