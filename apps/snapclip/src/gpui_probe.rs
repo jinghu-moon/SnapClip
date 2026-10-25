@@ -121,6 +121,23 @@ pub const PROBE_CHECKER_DARK: u32 = 0x2124_2a;
 /// square is still inside the arc and nothing would be dropped at all.
 pub const CORNER_SUBDIVISIONS: usize = 8;
 
+/// How long a typed size waits before the note at the bottom of the form is measured again.
+///
+/// **This number is ours, not the mockup's** (the mockup has no note that is measured at all): the
+/// note comes from a real encode, so measuring on every keystroke would stall typing and measuring
+/// in every frame would stall everything. The gap is long enough to fall between two keystrokes of
+/// a fast typist and short enough to feel immediate once the typing stops.
+pub const REMEASURE_AFTER_MS: u64 = 250;
+
+/// Whether the note has to be measured again, because the text it describes changed.
+///
+/// Kept as a free function so the answer can be asserted without a window. The failure it exists to
+/// prevent is measuring when nothing changed: a note recalculated on every frame looks correct and
+/// makes the window unusable.
+pub fn should_remeasure(old: &str, new: &str) -> bool {
+    old != new
+}
+
 /// Whether a square survives the card's rounded corner at its own corner of the card.
 ///
 /// A square is left out only when it lies **wholly outside** one of the four arcs: the nearest
@@ -446,6 +463,18 @@ pub struct GpuiProbe {
     /// number, so turning it back on restores what the user chose. That is the panel's rule.
     limit_on: bool,
     limit: Entity<InputState>,
+    /// The three texts the note was last measured from: the name, the width and the height.
+    ///
+    /// The note describes a file built from these, so it says nothing about the file once one of
+    /// them changes. Comparing the current text with this is what makes "measure again" answerable
+    /// without a window, and what stops an unchanged frame from spending an encode.
+    weighed_texts: (String, String, String),
+    /// The debounce that is waiting to measure, if one is.
+    ///
+    /// Held rather than detached so a second keystroke does not start a second timer: the timer it
+    /// finds is left alone, and the measurement it runs reads the text at that moment, which is by
+    /// then the newest text.
+    pending_remeasure: Option<Task<()>>,
 }
 
 impl GpuiProbe {
@@ -496,9 +525,58 @@ impl GpuiProbe {
             status: None,
             limit_on: false,
             limit,
+            // Both are filled by the first `weigh`, which runs before the view is returned.
+            weighed_texts: (String::new(), String::new(), String::new()),
+            pending_remeasure: None,
         };
         probe.weigh(cx);
+        // The three boxes whose text the note describes. Observing them means the note is measured
+        // again after typing stops rather than in the middle of a frame; `should_remeasure` decides
+        // whether the change is one the note cares about.
+        for input in [probe.name.clone(), probe.width.clone(), probe.height.clone()] {
+            cx.observe(&input, |this, _, cx| this.schedule_remeasure(cx))
+                .detach();
+        }
         probe
+    }
+
+    /// The three texts the note is built from, in the order [`Self::weighed_texts`] stores them.
+    fn current_texts(&self, cx: &App) -> (String, String, String) {
+        (
+            self.name.read(cx).value().to_string(),
+            self.width.read(cx).value().to_string(),
+            self.height.read(cx).value().to_string(),
+        )
+    }
+
+    /// Whether any of the three texts changed since the note was last measured.
+    fn texts_changed(&self, cx: &App) -> bool {
+        let (name, width, height) = self.current_texts(cx);
+        should_remeasure(&self.weighed_texts.0, &name)
+            || should_remeasure(&self.weighed_texts.1, &width)
+            || should_remeasure(&self.weighed_texts.2, &height)
+    }
+
+    /// Wait out the debounce and measure, unless nothing changed or one is already waiting.
+    fn schedule_remeasure(&mut self, cx: &mut Context<Self>) {
+        if self.pending_remeasure.is_some() || !self.texts_changed(cx) {
+            return;
+        }
+        self.pending_remeasure = Some(cx.spawn(async move |this, cx: &mut AsyncApp| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(REMEASURE_AFTER_MS))
+                .await;
+            this.update(cx, |this, cx| {
+                this.pending_remeasure = None;
+                // Read again: the typing may have stopped on a different text than the one that
+                // started this wait, and the note has to describe what is on screen now.
+                if this.texts_changed(cx) {
+                    this.weigh(cx);
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
     }
 
     /// How heavy the file would be, from a real encode of the picture a save would write.
@@ -521,6 +599,8 @@ impl GpuiProbe {
             self.conflict,
         );
         self.estimate = crate::gpui_save::weight(&self.picture, &values, output);
+        // What the note now describes, so an unchanged frame can tell that it has nothing to do.
+        self.weighed_texts = self.current_texts(cx);
     }
 
     /// Point the path field at one of the shortcuts' folders.
@@ -1392,6 +1472,22 @@ mod tests {
     /// This is an absolute assertion on purpose: comparing a constant against the function that
     /// returns it can never fail, and the defect this whole exercise keeps finding is a number that
     /// looks plausible. Reading each value beside the line it came from is what makes a typo show.
+    #[::core::prelude::v1::test]
+    fn the_note_is_measured_only_when_the_text_it_describes_changed() {
+        // Unchanged text is the case that matters: recomputing then spends a whole encode on a
+        // frame that says the same thing, which is what makes the window feel stuck.
+        assert!(!should_remeasure("1440", "1440"), "the same text is not a reason to measure");
+        assert!(!should_remeasure("", ""), "two empty fields are also the same text");
+        assert!(should_remeasure("1440", "144"), "a shortened size is a new size");
+        assert!(should_remeasure("", "1440"), "a filled cell newly describes a file");
+        assert!(should_remeasure("SnapClip_[日期]", "SnapClip_2026-10-26"), "the name expands");
+        // The debounce is ours, not the mockup's: an encode per keystroke would stall typing.
+        assert_eq!(
+            REMEASURE_AFTER_MS, 250,
+            "the wait is the number we chose, and it is short enough to feel immediate"
+        );
+    }
+
     #[::core::prelude::v1::test]
     fn every_number_is_the_mockups() {
         let cases = [
