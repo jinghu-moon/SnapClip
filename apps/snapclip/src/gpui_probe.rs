@@ -94,6 +94,10 @@ pub const PROBE_CARD: (f32, f32, f32, f32) = (16.0, 48.0, 572.0, 508.0);
 /// `.preview-frame … 50% / 16px 16px` (`:111`): the checkerboard's tile, in dips.
 pub const PROBE_CHECKER_TILE: f32 = 16.0;
 
+/// `.preview-frame { border-radius: var(--r-card); overflow: hidden }` (`:111`) with
+/// `--r-card: 10px` (`:53`): the card's corner radius, in dips.
+pub const PROBE_CARD_RADIUS: f32 = 10.0;
+
 /// `repeating-conic-gradient(#32363e 0% 25%, #21242a 0% 50%)` (`:111`): the board's two colours.
 pub const PROBE_CHECKER_LIGHT: u32 = 0x3236_3e;
 pub const PROBE_CHECKER_DARK: u32 = 0x2124_2a;
@@ -631,7 +635,8 @@ impl Render for GpuiProbe {
             .w(px(dip(scale, card_w)))
             .h(px(dip(scale, card_h)))
             .relative()
-            .rounded(px(dip(scale, 10.0)))
+            .rounded(px(dip(scale, PROBE_CARD_RADIUS)))
+            .overflow_hidden()
             .border_1()
             .border_color(theme.border)
             .bg(rgb(PROBE_CHECKER_DARK))
@@ -1119,7 +1124,8 @@ mod preset_tests {
 mod preview_tests {
     // `use gpui_kit::*` exports a macro named `test`, which shadows the attribute.
     use super::{
-        PROBE_CARD, PROBE_CHECKER_DARK, PROBE_CHECKER_LIGHT, PROBE_CHECKER_TILE, fit_preview,
+        PROBE_CARD, PROBE_CARD_RADIUS, PROBE_CHECKER_DARK, PROBE_CHECKER_LIGHT, PROBE_CHECKER_TILE,
+        fit_preview,
     };
 
     /// The card is where the header, the body's padding and the card's own size put it.
@@ -1137,6 +1143,12 @@ mod preview_tests {
         assert_eq!(PROBE_CHECKER_TILE, 16.0, "`.preview-frame` tile (`:111`)");
         assert_eq!(PROBE_CHECKER_LIGHT, 0x3236_3e, "`:111` first stop");
         assert_eq!(PROBE_CHECKER_DARK, 0x2124_2a, "`:111` second stop");
+        // The mockup rounds this card and clips it in the same rule (`:111`), so the radius is
+        // part of the card's definition rather than a decoration the probe can drop.
+        assert_eq!(
+            PROBE_CARD_RADIUS, 10.0,
+            "`.preview-frame` takes `--r-card`, and `--r-card: 10px` (`:53`, `:111`)"
+        );
     }
 
     /// A picture smaller than the card is drawn at its own size, in the middle.
