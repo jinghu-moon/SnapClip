@@ -79,6 +79,28 @@ pub enum FieldState {
 }
 
 impl FieldState {
+    /// Every state a field can be in, in the order [`FieldState::index`] numbers them.
+    ///
+    /// The list exists so a caller holding one brush per state can build them by looping over this
+    /// instead of writing the variants out again; a fifth state then fails to compile in `index`
+    /// rather than silently leaving one of the brushes unresolved.
+    pub const ALL: [FieldState; 4] = [
+        FieldState::Idle,
+        FieldState::Focused,
+        FieldState::Error,
+        FieldState::Warning,
+    ];
+
+    /// Where this state sits in [`FieldState::ALL`], for indexing a table of per-state values.
+    pub fn index(self) -> usize {
+        match self {
+            FieldState::Idle => 0,
+            FieldState::Focused => 1,
+            FieldState::Error => 2,
+            FieldState::Warning => 3,
+        }
+    }
+
     /// Whether this state is a message about the value rather than about the cursor.
     ///
     /// The design lets both apply at once (`:169` focus, `:333`/`:334` the message), and the message
@@ -87,6 +109,33 @@ impl FieldState {
     /// also when the user needs to read it.
     pub fn is_message(self) -> bool {
         matches!(self, FieldState::Error | FieldState::Warning)
+    }
+}
+
+#[cfg(test)]
+mod field_state_tests {
+    use super::FieldState;
+
+    /// A table of brushes is indexed by this number, so the numbering has to be a bijection onto
+    /// the list: a duplicate would leave one state painting another state's fill, which is exactly
+    /// the lit band inside a field that the per-state table was introduced to remove.
+    #[test]
+    fn every_state_is_listed_once_and_indexed_by_its_position() {
+        for (position, state) in FieldState::ALL.iter().enumerate() {
+            assert_eq!(
+                state.index(),
+                position,
+                "a state's index is its position in ALL"
+            );
+        }
+        let mut seen: Vec<usize> = FieldState::ALL.iter().map(|state| state.index()).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            FieldState::ALL.len(),
+            "no two states share an index"
+        );
     }
 }
 

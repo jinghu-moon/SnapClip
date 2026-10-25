@@ -1572,3 +1572,25 @@ M2 把 WS_EX_TOOLWINDOW 加回去
 **没覆盖的**：
 - "`WS_MINIMIZEBOX` 不画东西"是**读文档 + 推理**（非客户区被 `WM_NCCALCSIZE` 认满），没有窗口可截图 ⇒ 只真人可见；
 - 任务栏按钮与 Alt+Tab 里的实际表现：要真机看。
+
+## 一批：字段背景的笔刷（每状态一支）
+
+用户报告：有些字段内部有一块比周围亮的底（"贴片"）。
+
+根因：`WM_CTLCOLOREDIT` 里 `SetBkColor` 用的是 `field_colours(state)` 的 `fill`（每个状态不同），
+而返回的笔刷 `s.fill_brush` 是**按 Idle 建的一支**。于是"告诉系统的背景色"与"实际刷上去的颜色"
+不是同一个来源 —— 聚焦/警告态的字段被告诉一个色、刷上另一个色。
+
+修法：`fill_brushes: [HBRUSH; FieldState::ALL.len()]`，用 `std::array::from_fn` 遍历
+`FieldState::ALL` 建笔；`WM_CTLCOLOREDIT` 用 `fill_brushes[state.index()]`。
+笔与 `SetBkColor` 现在来自**同一次** `field_colours` 调用、同一个索引，不可能分家。
+
+`FieldState` 因此新增 `ALL` 与 `index()`（照 `ConflictLink::index` 的先例）。
+断言 `every_state_is_listed_once_and_indexed_by_its_position` 钉住"编号是 ALL 里的位置、且两两不重复"；
+变异（把 `Warning => 3` 改成 `=> 0`）真红：`left: 0 right: 3`。
+
+## 未做（下一批）
+
+- ① "无损压缩"后面的浅色块**未定位**：`QualityLine::Hint` 分支只 `draw_text`，
+  没有 fill；`Limit` 字段也**没有原生控件**（只有 `Name` 有）。⇒ 需要真机像素或截图才能定位，未猜。
+- ② `Name` 的右键菜单（复用 `dropdown.rs`）未做；字号字重未核对完。

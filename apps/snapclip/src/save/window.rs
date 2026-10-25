@@ -775,15 +775,22 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
         // The conflict link's two words: the one drawn is the one clicked, so both are measured once
         // here rather than inside the paint.
         let conflict_widths = measure_conflict_link(hwnd, renderer.as_ref());
-        // The child's background: the field's own fill, resolved from `--fill` over the surface.
-        // A native `EDIT` cannot be translucent, so the composite is computed once here.
-        let fill = snapclip_ui::panel::field_colours(
-            snapclip_ui::panel::FieldState::Idle,
-            SURFACE_RGBA,
-        )
-        .fill;
-        let fill_colour = u32::from(fill[0]) | (u32::from(fill[1]) << 8) | (u32::from(fill[2]) << 16);
-        let fill_brush = windows_sys::Win32::Graphics::Gdi::CreateSolidBrush(fill_colour);
+        // The child's background, one brush per state. The field's fill is resolved from `--fill`
+        // over the surface, and a native `EDIT` cannot be translucent, so the composite is computed
+        // once here. One brush per state rather than one brush: the same call that decides what to
+        // paint the background with also returns the brush to paint it with, and a single brush
+        // built from the idle fill silently ignored the focused and warning fills.
+        let fill_brushes: [windows_sys::Win32::Graphics::Gdi::HBRUSH; snapclip_ui::panel::FieldState::ALL.len()] =
+            std::array::from_fn(|index| {
+                let fill = snapclip_ui::panel::field_colours(
+                    snapclip_ui::panel::FieldState::ALL[index],
+                    SURFACE_RGBA,
+                )
+                .fill;
+                let colour =
+                    u32::from(fill[0]) | (u32::from(fill[1]) << 8) | (u32::from(fill[2]) << 16);
+                windows_sys::Win32::Graphics::Gdi::CreateSolidBrush(colour)
+            });
         // The quality control starts on the first option, at this window's scale. It is built here
         // rather than lazily so the first paint has a real choice to mark.
         let scale = dpi_scale(hwnd);
@@ -795,7 +802,7 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
             preview: options.preview.take(),
             fields: snapclip_ui::panel::FieldStates::IDLE,
             controls: [std::ptr::null_mut(); snapclip_ui::panel::FieldId::ALL.len()],
-            fill_brush,
+            fill_brushes,
             fill: snapclip_ui::panel::FILL_WHITE,
             segment: snapclip_ui::panel::quality_segment_state(&metrics, &rects, scale, 0),
             segment_scale: scale,
@@ -1032,10 +1039,15 @@ struct WindowState {
     /// pressing it opens the folder chooser, which is all it ever did — so the value has to have a
     /// home that survives the row not being a control, and one reader per question.
     directory: String,
-    /// The brush `WM_CTLCOLOREDIT` returns. The child paints its own background, and on a dark panel
-    /// the default white would show as a lit rectangle, so the field's resolved fill is handed over
-    /// instead. Created once and owned by this state.
-    fill_brush: windows_sys::Win32::Graphics::Gdi::HBRUSH,
+    /// The brushes `WM_CTLCOLOREDIT` may return, one per [`FieldState`], indexed by
+    /// [`FieldState::index`]. The child paints its own background, and on a dark panel the default
+    /// white would show as a lit rectangle, so the field's resolved fill is handed over instead.
+    ///
+    /// One per state, because the same call that returns the colour for `SetBkColor` also decides
+    /// which of these is returned: with a single brush built from the idle fill, a focused or
+    /// warning field was told one background colour and then painted in another, which is the lit
+    /// band that showed through inside those fields.
+    fill_brushes: [windows_sys::Win32::Graphics::Gdi::HBRUSH; snapclip_ui::panel::FieldState::ALL.len()],
     /// The colour a transparent pixel becomes when the format cannot carry alpha (`S.fill`, `:724`).
     ///
     /// Straight order in the buffer's channels, which is what `PanelValues::fill` and the fill row's
@@ -3612,7 +3624,9 @@ extern "system" fn window_proc(
                 let child = wparam as windows_sys::Win32::Graphics::Gdi::HDC;
                 windows_sys::Win32::Graphics::Gdi::SetBkColor(child, bgr(colours.fill));
                 windows_sys::Win32::Graphics::Gdi::SetTextColor(child, bgr(colours.text));
-                return s.fill_brush as isize;
+                // The brush comes from the same colour the background was just set to, by way of the
+                // same index, so the two cannot disagree about which fill this state has.
+                return s.fill_brushes[state_of_field.index()] as isize;
             }
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
@@ -3802,7 +3816,7 @@ mod tests {
             focused_number: None,
             directory: String::new(),
             preview: None,
-            fill_brush: std::ptr::null_mut(),
+            fill_brushes: [std::ptr::null_mut(); snapclip_ui::panel::FieldState::ALL.len()],
             fill: snapclip_ui::panel::FILL_WHITE,
             segment: snapclip_ui::panel::quality_segment_state(
                 &snapclip_ui::panel::DEMO,
@@ -4283,7 +4297,7 @@ mod tests {
             focused_number: None,
             directory: String::new(),
             preview: None,
-            fill_brush: std::ptr::null_mut(),
+            fill_brushes: [std::ptr::null_mut(); snapclip_ui::panel::FieldState::ALL.len()],
             fill: snapclip_ui::panel::FILL_WHITE,
             segment: snapclip_ui::panel::quality_segment_state(
                 &snapclip_ui::panel::DEMO,
@@ -4363,7 +4377,7 @@ mod tests {
             focused_number: None,
             directory: String::new(),
             preview: None,
-            fill_brush: std::ptr::null_mut(),
+            fill_brushes: [std::ptr::null_mut(); snapclip_ui::panel::FieldState::ALL.len()],
             fill: snapclip_ui::panel::FILL_WHITE,
             segment: snapclip_ui::panel::quality_segment_state(
                 &snapclip_ui::panel::DEMO,
@@ -4447,7 +4461,7 @@ mod tests {
             focused_number: None,
             directory: String::new(),
             preview: None,
-            fill_brush: std::ptr::null_mut(),
+            fill_brushes: [std::ptr::null_mut(); snapclip_ui::panel::FieldState::ALL.len()],
             fill: snapclip_ui::panel::FILL_WHITE,
             segment: snapclip_ui::panel::quality_segment_state(
                 &snapclip_ui::panel::DEMO,
@@ -4680,7 +4694,7 @@ mod tests {
             focused_number: None,
             directory: String::new(),
             preview: Some((bgra.clone(), 4, 3)),
-            fill_brush: std::ptr::null_mut(),
+            fill_brushes: [std::ptr::null_mut(); snapclip_ui::panel::FieldState::ALL.len()],
             fill: snapclip_ui::panel::FILL_WHITE,
             segment: snapclip_ui::panel::quality_segment_state(
                 &snapclip_ui::panel::DEMO,
