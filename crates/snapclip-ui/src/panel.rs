@@ -117,6 +117,9 @@ pub use frame::{
     measure_size_presets, number_format,
     row_label_format, status_format, text_format_in, title_format, var_label_format, VAR_FONT_DIP,
     HINT_FONT_DIP, PRESET_FONT_DIP, hint_format, preset_label_format, HEADER_BUTTON_GAP_DIP,
+    // The fit rule for the preview card. Re-exported so a second renderer can ask the same function
+    // rather than restate the rule: the point of the migration is one geometry, not two.
+    fit_preview,
 };
 pub use icon_button::IconButton;
 pub use icons::{Glyph, ICON_BAKED_PX, ICON_COUNT};

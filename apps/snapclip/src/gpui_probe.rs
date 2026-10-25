@@ -28,6 +28,7 @@ use snapclip_ui::panel::{
     DEMO, FMT_OPTIONS, FMT_PNG_INDEX, QUALITY_HINT_TEXT, QUALITY_OPTION_WORDS, SIZE_MODE_WORDS,
     SIZE_PRESET_WORDS, VARIABLE_TOKENS,
 };
+use snapclip_ui::panel::fit_preview;
 
 // The menu items cannot carry a closure: the framework's own `on_click` for an item is crate
 // private in this release, and the documented route is an action dispatched along the focus chain.
@@ -81,6 +82,30 @@ pub const PROBE_SIZE_LABELS: [&str; 2] = ["宽", "高"];
 pub const PROBE_UNIT: &str = "px";
 /// The quality row's switch (`:631`-`:635`).
 pub const PROBE_LIMIT: &str = "限制体积";
+
+/// The preview card's rectangle in dips, as `(left, top, right, bottom)` — the order `fit_preview`
+/// takes, so the card can be handed to it unchanged.
+///
+/// The edges are `16` and `16 + 556` across, `48` and `48 + 460` down: the padding on the left, the
+/// header (`44`) plus the body's gap (`4`) above, and the mockup's `556 × 460` card. Written as a
+/// size instead of a rectangle the card comes out 540 wide, which is how the tests below caught it.
+pub const PROBE_CARD: (f32, f32, f32, f32) = (16.0, 48.0, 572.0, 508.0);
+
+/// `.preview-frame … 50% / 16px 16px` (`:111`): the checkerboard's tile, in dips.
+pub const PROBE_CHECKER_TILE: f32 = 16.0;
+
+/// `repeating-conic-gradient(#32363e 0% 25%, #21242a 0% 50%)` (`:111`): the board's two colours.
+pub const PROBE_CHECKER_LIGHT: u32 = 0x3236_3e;
+pub const PROBE_CHECKER_DARK: u32 = 0x2124_2a;
+
+/// The picture the probe shows inside the card.
+///
+/// The repository has no photograph to hand, only the tracked icon set, so a 96 dip square is used
+/// and the panel's own fit rule is what makes the interesting assertion: it refuses to enlarge, so
+/// a picture smaller than the card is drawn at its own size in the middle instead of being blown
+/// up (`crates/snapclip-ui/src/panel/frame.rs` `fit_preview`, line 5438 `.min(1.0)`).
+pub const PROBE_PREVIEW_FILE: &str = "assets/icon/close.png";
+pub const PROBE_PREVIEW_SIZE: (f32, f32) = (96.0, 96.0);
 /// What the estimated size shows before anything has been measured (`:668` shows a real value,
 /// which this probe has no encoder to produce; the sample is the mockup's own).
 pub const PROBE_ESTIMATE_SAMPLE: &str = "227.31 KB";
@@ -567,6 +592,60 @@ impl Render for GpuiProbe {
             scale,
         );
 
+        // The preview card: the mockup's checkerboard (`:111`), the picture fitted into it by the
+        // panel's own rule, and the card's rounded boundary.
+        let (card_left, card_top, card_right, card_bottom) = PROBE_CARD;
+        let card_w = card_right - card_left;
+        let card_h = card_bottom - card_top;
+        let (drawn_left, drawn_top, drawn_right, drawn_bottom) =
+            fit_preview(PROBE_PREVIEW_SIZE, PROBE_CARD);
+        let tile = PROBE_CHECKER_TILE;
+        let columns = (card_w / tile).ceil() as usize;
+        let tiles_high = (card_h / tile).ceil() as usize;
+        let mut board = div().v_flex();
+        for row_index in 0..tiles_high {
+            let mut line = div().h_flex();
+            for column_index in 0..columns {
+                let colour = if (row_index + column_index) % 2 == 0 {
+                    PROBE_CHECKER_LIGHT
+                } else {
+                    PROBE_CHECKER_DARK
+                };
+                line = line.child(
+                    div()
+                        .w(px(dip(scale, tile)))
+                        .h(px(dip(scale, tile)))
+                        .bg(rgb(colour)),
+                );
+            }
+            board = board.child(line);
+        }
+        // The probe runs from the repository root, so the file is resolved against the working
+        // directory rather than against the asset bundle, which does not carry it.
+        let preview_relative = std::path::Path::new(PROBE_PREVIEW_FILE);
+        let preview_source = match std::env::current_dir() {
+            Ok(directory) => directory.join(preview_relative),
+            Err(_) => preview_relative.to_path_buf(),
+        };
+        let preview_card = div()
+            .w(px(dip(scale, card_w)))
+            .h(px(dip(scale, card_h)))
+            .relative()
+            .rounded(px(dip(scale, 10.0)))
+            .border_1()
+            .border_color(theme.border)
+            .bg(rgb(PROBE_CHECKER_DARK))
+            .child(board)
+            .child(
+                img(preview_source.as_path())
+                    .object_fit(ObjectFit::Contain)
+                    .w(px(dip(scale, drawn_right - drawn_left)))
+                    .h(px(dip(scale, drawn_bottom - drawn_top)))
+                    .absolute()
+                    .left(px(dip(scale, drawn_left - card_left)))
+                    .top(px(dip(scale, drawn_top - card_top))),
+            );
+
         div()
             .relative()
             .size_full()
@@ -575,15 +654,21 @@ impl Render for GpuiProbe {
             .text_color(theme.foreground)
             .child(
                 div()
-                    .w(px(dip(scale, column_width())))
-                    .v_flex()
-                    .gap(px(dip(scale, mockup::ROW_GAP)))
-                    .child(path_row)
-                    .child(name_row)
-                    .child(saved_row)
-                    .child(size_row)
-                    .child(quality_row)
-                    .child(estimate_row),
+                    .h_flex()
+                    .gap(px(dip(scale, 12.0)))
+                    .child(preview_card)
+                    .child(
+                        div()
+                            .w(px(dip(scale, column_width())))
+                            .v_flex()
+                            .gap(px(dip(scale, mockup::ROW_GAP)))
+                            .child(path_row)
+                            .child(name_row)
+                            .child(saved_row)
+                            .child(size_row)
+                            .child(quality_row)
+                            .child(estimate_row),
+                    ),
             )
             // The footer, which the mockup anchors to the window's bottom right (`:674`).
             .child(
@@ -1027,5 +1112,54 @@ mod preset_tests {
     fn the_presets_are_the_mockups_four_in_its_order() {
         assert_eq!(PRESET_PERCENTS, [100, 75, 50, 25], "`:615`-`:618`");
         assert_eq!(PROBE_ORIGINAL_SIZE, (1440, 900), "`:593`");
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    // `use gpui_kit::*` exports a macro named `test`, which shadows the attribute.
+    use super::{
+        PROBE_CARD, PROBE_CHECKER_DARK, PROBE_CHECKER_LIGHT, PROBE_CHECKER_TILE, fit_preview,
+    };
+
+    /// The card is where the header, the body's padding and the card's own size put it.
+    ///
+    /// Written as literals because the numbers come from the mockup, not from the sum that builds
+    /// them: a card compared against its own arithmetic cannot fail.
+    #[::core::prelude::v1::test]
+    fn the_preview_card_is_where_the_mockups_parts_put_it() {
+        assert_eq!(
+            PROBE_CARD,
+            (16.0, 48.0, 572.0, 508.0),
+            "edges, not a size: padding 16 to 16 + 556 across, header 44 + body 4 to that plus 460 \
+             down (`DEMO` in the panel, lines 80-85)"
+        );
+        assert_eq!(PROBE_CHECKER_TILE, 16.0, "`.preview-frame` tile (`:111`)");
+        assert_eq!(PROBE_CHECKER_LIGHT, 0x3236_3e, "`:111` first stop");
+        assert_eq!(PROBE_CHECKER_DARK, 0x2124_2a, "`:111` second stop");
+    }
+
+    /// A picture smaller than the card is drawn at its own size, in the middle.
+    ///
+    /// This is the panel's rule, and the interesting half is that it refuses to enlarge: the scale
+    /// is capped at one. The numbers are literals worked out from the card, not a second copy of
+    /// the formula, so a change to the rule cannot silently agree with the test.
+    #[::core::prelude::v1::test]
+    fn a_picture_smaller_than_the_card_is_not_blown_up() {
+        assert_eq!(
+            fit_preview((96.0, 96.0), PROBE_CARD),
+            (246.0, 230.0, 342.0, 326.0),
+            "96 square, centred: 16 + (556 - 96) / 2 and 48 + (460 - 96) / 2, no enlargement"
+        );
+    }
+
+    /// A picture larger than the card is scaled down to fit and centred on the shorter side.
+    #[::core::prelude::v1::test]
+    fn a_picture_larger_than_the_card_is_fitted_and_centred() {
+        assert_eq!(
+            fit_preview((1000.0, 1000.0), PROBE_CARD),
+            (64.0, 48.0, 524.0, 508.0),
+            "1000 square into 556 x 460: 460 wide, 16 + (556 - 460) / 2 across, flush vertically"
+        );
     }
 }
