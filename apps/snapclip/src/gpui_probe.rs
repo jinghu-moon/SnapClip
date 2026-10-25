@@ -429,6 +429,11 @@ pub struct GpuiProbe {
     fill: usize,
     /// Which of the saved-after switches are on.
     after: [bool; 2],
+    /// What a taken name should do, which the footer's link toggles when it is shown at all.
+    ///
+    /// The panel's default is to rename, because a screenshot panel that replaces a file without
+    /// being asked is a data-loss bug; the link exists so the user can ask for the other.
+    conflict: crate::save::service::ConflictPolicy,
     /// The picture a save would write. Synthetic: the probe captures nothing (see `gpui_save`).
     picture: crate::gpui_save::Picture,
     /// How heavy the file would be, as the note at the bottom of the form says.
@@ -447,10 +452,14 @@ impl GpuiProbe {
     /// Build the view, seeding the name field with the template the panel uses.
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
+        // What was typed last time, not the default: the spec puts the template and the number in
+        // one sentence ("模板与序号随输入实时记住", `:201`), so a second window has to open with what
+        // the first one was left holding.
+        let template = crate::gpui_save::remembered_template();
         let name = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(PROBE_NAME)
-                .default_value(PROBE_NAME)
+                .default_value(template)
         });
         let path = cx.new(|cx| {
             InputState::new(window, cx)
@@ -480,7 +489,8 @@ impl GpuiProbe {
             mode: 0,
             quality: 0,
             fill: FILL_DEFAULT,
-            after: [false, false],
+            after: crate::gpui_save::remembered_after(),
+            conflict: crate::save::service::ConflictPolicy::AutoRename,
             picture: crate::gpui_save::Picture::synthetic(),
             estimate: None,
             status: None,
@@ -499,7 +509,7 @@ impl GpuiProbe {
     fn weigh(&mut self, cx: &App) {
         let output = self.output_size(cx);
         let (date, time) = crate::gpui_save::now();
-        let values = crate::gpui_save::values(
+        let values = crate::gpui_save::values_with(
             "",
             PROBE_NAME,
             crate::gpui_save::format_of(self.format),
@@ -507,6 +517,8 @@ impl GpuiProbe {
             &time,
             self.quality,
             FILL_SWATCHES[self.fill],
+            crate::gpui_save::next_sequence(),
+            self.conflict,
         );
         self.estimate = crate::gpui_save::weight(&self.picture, &values, output);
     }
@@ -1008,10 +1020,11 @@ impl Render for GpuiProbe {
                     ),
             )
             // The footer, which the mockup lays across the window's bottom (`:673`-`:687`): the
-            // status line takes the space the buttons leave, the copy button sits before a
-            // separator, and cancel and save are adjacent at the right end.
-            .child(
-                div()
+            // status line takes the space the buttons leave, the conflict link sits beside it
+            // (`:676`), the copy button follows before a separator, and cancel and save are
+            // adjacent at the right end.
+            .child({
+                let mut bar = div()
                     .absolute()
                     .left(px(dip(scale, PROBE_PADDING)))
                     .right(px(dip(scale, PROBE_PADDING)))
@@ -1025,27 +1038,37 @@ impl Render for GpuiProbe {
                             .flex_1()
                             .text_sm()
                             .child(self.status.clone().unwrap_or_default()),
-                    )
-                    .child(
-                        Button::new("probe-copy")
-                            .label(PROBE_COPY)
+                    );
+                // The link exists only while the plain name is taken, and its word is the action
+                // rather than the policy in force (`:1149`, `:1150`).
+                if let Some(text) = self.conflict_link(cx) {
+                    bar = bar.child(
+                        Button::new("probe-conflict")
+                            .label(text)
                             .h(px(dip(scale, mockup::BUTTON_HEIGHT)))
-                            .on_click(cx.listener(|this, _, _, cx| this.copy_picture(cx))),
-                    )
-                    .child(
-                        Button::new("probe-cancel")
-                            .label(PROBE_CANCEL)
-                            .h(px(dip(scale, mockup::BUTTON_HEIGHT)))
-                            .on_click(cx.listener(|this, _, window, cx| this.cancel_probe(window, cx))),
-                    )
-                    .child(
-                        Button::new("probe-save")
-                            .primary()
-                            .label(PROBE_SAVE)
-                            .h(px(dip(scale, mockup::BUTTON_HEIGHT)))
-                            .on_click(cx.listener(|this, _, window, cx| this.save_probe(window, cx))),
-                    ),
-            )
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_conflict(cx))),
+                    );
+                }
+                bar.child(
+                    Button::new("probe-copy")
+                        .label(PROBE_COPY)
+                        .h(px(dip(scale, mockup::BUTTON_HEIGHT)))
+                        .on_click(cx.listener(|this, _, _, cx| this.copy_picture(cx))),
+                )
+                .child(
+                    Button::new("probe-cancel")
+                        .label(PROBE_CANCEL)
+                        .h(px(dip(scale, mockup::BUTTON_HEIGHT)))
+                        .on_click(cx.listener(|this, _, window, cx| this.cancel_probe(window, cx))),
+                )
+                .child(
+                    Button::new("probe-save")
+                        .primary()
+                        .label(PROBE_SAVE)
+                        .h(px(dip(scale, mockup::BUTTON_HEIGHT)))
+                        .on_click(cx.listener(|this, _, window, cx| this.save_probe(window, cx))),
+                )
+            })
             // The menus hand their item back as an action, which arrives here because this element
             // is in the chain of the handle each menu was given.
             .track_focus(&self.focus)
@@ -1186,6 +1209,42 @@ impl GpuiProbe {
         )
     }
 
+    /// The footer's conflict link, when the name a save would write is already taken.
+    ///
+    /// The word is the policy that is *not* in force (`:1150`): showing the one that is would read
+    /// as a statement of fact rather than something to press.
+    fn conflict_link(&self, cx: &App) -> Option<&'static str> {
+        let output = self.output_size(cx);
+        let directory = self.path.read(cx).value().to_string();
+        let name = self.name.read(cx).value().to_string();
+        let (date, time) = crate::gpui_save::now();
+        let values = crate::gpui_save::values_with(
+            &directory,
+            &name,
+            crate::gpui_save::format_of(self.format),
+            &date,
+            &time,
+            self.quality,
+            FILL_SWATCHES[self.fill],
+            crate::gpui_save::next_sequence(),
+            self.conflict,
+        );
+        crate::gpui_save::conflict_link(&values, output.width, output.height, self.conflict)
+    }
+
+    /// Swap the policy for a taken name: replace instead of rename, or back.
+    fn toggle_conflict(&mut self, cx: &mut Context<Self>) {
+        self.conflict = match self.conflict {
+            crate::save::service::ConflictPolicy::AutoRename => {
+                crate::save::service::ConflictPolicy::Overwrite
+            }
+            crate::save::service::ConflictPolicy::Overwrite => {
+                crate::save::service::ConflictPolicy::AutoRename
+            }
+        };
+        cx.notify();
+    }
+
     /// The footer's copy button: the picture a save would write, at the size the panel asks for.
     ///
     /// The same picture and the same scaling the save uses, so what lands on the clipboard and what
@@ -1222,7 +1281,7 @@ impl GpuiProbe {
         let directory = self.path.read(cx).value().to_string();
         let name = self.name.read(cx).value().to_string();
         let (date, time) = crate::gpui_save::now();
-        let values = crate::gpui_save::values(
+        let values = crate::gpui_save::values_with(
             &directory,
             &name,
             crate::gpui_save::format_of(self.format),
@@ -1230,6 +1289,8 @@ impl GpuiProbe {
             &time,
             self.quality,
             FILL_SWATCHES[self.fill],
+            crate::gpui_save::next_sequence(),
+            self.conflict,
         );
         let result = {
             // The switch, not the field, decides whether a ceiling applies; the number is read
@@ -1256,9 +1317,17 @@ impl GpuiProbe {
                     outcome.path.display(),
                     outcome.format
                 );
+                // The switches' work, through the panel's own order and shell calls: the path is the
+                // one the save wrote, so what is copied or revealed cannot be another file.
+                crate::gpui_save::run_after_save(self.after, &outcome.path);
             }
             Err(why) => eprintln!("[gpui-probe] the save did not happen: {why:?}"),
         }
+        // The shell's record takes the template and moves the number by the panel's rule, which only
+        // advances on a success whose name asks for it.
+        crate::gpui_save::remember_template(&name);
+        crate::gpui_save::remember_after(self.after);
+        crate::gpui_save::note_attempt(&result, &name);
         self.status = crate::gpui_save::status_of(&result);
         if result.is_ok() {
             window.remove_window();

@@ -2150,3 +2150,24 @@ if std::env::var_os("SNAPCLIP_NO_BACKDROP").is_some() {
 还原后都见 `Compiling snapclip-app` ⇒ `318/0/9`。
 
 ⚠️ **变异脚本第一次没跑成** ✗：Python 默认按 **GBK** 解码 UTF-8 源码 ⇒ `UnicodeDecodeError` ⇒ 那次"仍绿"**不算证据**。写文件时同理（`UnicodeEncodeError`，但写入在打印之前，所以那一次**生效了**）。⇒ 读写一律显式 `encoding="utf-8"`，这一路已经栽过一次。
+
+## GPUI 探针：冲突链接、两个开关、序号与模板记忆（接线批）
+
+**冲突链接 ①**：`gpui_save::conflict_link(values, w, h, policy) -> Option<&'static str>` —— 判可见性用面板自己的 `service::plain_target`（"没被占用时会是哪个名字"），不是拼路径；**词是动作**（在用的是 `AutoRename` 就显示 `改为覆盖`），因为显示在用的那个会读成陈述而不是能按的东西（`:1149`、`:1150`）。底栏在**状态行之后**放它，点击只**切换策略**，不改别的。
+
+**两个开关 ②**：`gpui_save::run_after_save(after, path)` 转调面板的 `save::window::run_after_save`（**只把可见性改成 `pub(crate)`**，无行为变化），于是顺序（`CopyPath → TellShell → Reveal`）与两条 shell 调用**只有一份**；路径是**落盘的那个** `outcome.path`，所以复制的和揭示的不可能是另一个文件。
+
+**序号与模板 ③**：`gpui_save` 里一个 `OnceLock<Mutex<assemble::Remembered>>` 作为**进程级记录**（探针一次进程一个窗口，但有记录就能观测"关掉再开"）：开窗时模板从 `remembered_template()` 来，保存时 `remember_template` + `remember_after` + `note_attempt`（后者调 `Sequence::after`，**只有成功且名字要了号才前进**）。`values_with(…, sequence, conflict)` 是显式版，`values(…)` 保留七参转调它 —— 两个函数而不是默认参数（Rust 没有默认参数），短的那个让"没有意见"的调用者**没有机会传错**。
+
+**测试**：`the_chosen_number_and_policy_reach_the_save` —— 一条测试覆盖三件事，因为它们本是**一个决定**：`values_with(sequence=7, Overwrite)` ⇒ 序号与策略真的进值；同名文件在时链接给 `改为覆盖` / `改为重命名`；**真文件**：重命名 ⇒ 两个文件都在且哨兵 `last night` 未变（`left != right` 报的是**磁盘内容**）；覆盖 ⇒ 名字不变且字节被替换；删掉后链接变 `None`。
+
+**变异（两条都真红，锚点各命中 1 处，还原后 323/0）**
+
+| 变异 | 红的信息 |
+| --- | --- |
+| `values_with` 里把 `conflict` 写死 `AutoRename` | `assertion left == right failed: the choice travels with the values` |
+| `conflict_link` 恒返回 `改为覆盖` | `assertion left == right failed: an overwriting save offers to rename instead` |
+
+⚠️ 这一批的测试是**先写实现后写测试** ⇒ **不声称"先红后绿"**，证据只来自上面两条变异。
+
+**仍未做**：模板的"**随输入实时**记住"没接（要在名字框的实体上订阅变更，保存时才记住不是"实时"）；键入宽高后预估不刷新；按钮高度仍是框架默认（原型 24）；预览用的是仓库里的图标而不是真捕获图（探针无解码器）。

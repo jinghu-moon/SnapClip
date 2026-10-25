@@ -1746,7 +1746,7 @@ fn shortcut_command(command: usize) -> Option<Shortcut> {
 ///
 /// The path is the one the save wrote rather than one assembled here, so what is copied or
 /// revealed cannot be a different file from the one that landed.
-fn run_after_save(after: [bool; 2], path: &std::path::Path) {
+pub(crate) fn run_after_save(after: [bool; 2], path: &std::path::Path) {
     for step in AFTER_SAVE_STEPS {
         match step {
             AfterSaveStep::CopyPath if after[0] => {

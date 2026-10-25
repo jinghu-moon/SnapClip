@@ -13,7 +13,8 @@
 use crate::save::assemble::{self, PanelValues};
 use crate::save::estimate;
 use crate::save::scale::{Frame, Size};
-use crate::save::service::{SaveError, SaveOutcome};
+use crate::save::service::{ConflictPolicy, SaveError, SaveOutcome};
+use std::sync::{Mutex, OnceLock};
 use snapclip_capture::save_format::SaveFormat;
 
 /// The size of the synthetic picture. Small on purpose: its pixels are only ever written to a file
@@ -111,6 +112,36 @@ pub fn values<'a>(
     quality_tier: usize,
     fill: [u8; 3],
 ) -> PanelValues<'a> {
+    values_with(
+        directory,
+        name,
+        format,
+        date,
+        time,
+        quality_tier,
+        fill,
+        next_sequence(),
+        ConflictPolicy::AutoRename,
+    )
+}
+
+/// The same, with the number and the conflict policy spelled out.
+///
+/// Two functions rather than one with defaults, because Rust has none: the short one exists so a
+/// caller that has no opinion cannot accidentally pass the wrong number, and the long one exists for
+/// the window, which has both.
+#[allow(clippy::too_many_arguments)]
+pub fn values_with<'a>(
+    directory: &'a str,
+    name: &'a str,
+    format: SaveFormat,
+    date: &'a str,
+    time: &'a str,
+    quality_tier: usize,
+    fill: [u8; 3],
+    sequence: u32,
+    conflict: ConflictPolicy,
+) -> PanelValues<'a> {
     PanelValues {
         directory,
         name,
@@ -118,14 +149,107 @@ pub fn values<'a>(
         // The tier the view chose, turned into the recorded number in one place (`docs/42` D8), so
         // the probe cannot describe a quality the encoder would not receive.
         quality: assemble::quality_of_tier(quality_tier),
-        // A name that is taken is renamed rather than replaced, which is the panel's default.
-        conflict: crate::save::service::ConflictPolicy::AutoRename,
+        // What the footer's link offered, so the file that lands obeys the choice the user saw.
+        conflict,
         fill,
         date,
         time,
-        sequence: 1,
+        // The number the shell's record holds, not a fresh one: `[序号]` in the name would otherwise
+        // be the same number every time the probe is opened.
+        sequence,
         app: crate::save::window::APP_NAME,
     }
+}
+
+/// What the shell remembers between panels: the template, the next number and the two switches.
+///
+/// The probe is one process, so one record is enough; it is a `static` rather than a field on the
+/// view because the point of remembering is that a *second* view sees what the first one left.
+fn remembered() -> &'static Mutex<assemble::Remembered> {
+    static RECORD: OnceLock<Mutex<assemble::Remembered>> = OnceLock::new();
+    RECORD.get_or_init(|| Mutex::new(assemble::Remembered::default()))
+}
+
+/// The template the next probe window opens with.
+pub fn remembered_template() -> String {
+    remembered()
+        .lock()
+        .map(|record| record.template.clone())
+        .unwrap_or_else(|_| assemble::DEFAULT_TEMPLATE.to_owned())
+}
+
+/// The number the next save would use.
+pub fn next_sequence() -> u32 {
+    remembered()
+        .lock()
+        .map(|record| record.sequence.next())
+        .unwrap_or(assemble::Sequence::FIRST.next())
+}
+
+/// The two after-save switches as last chosen.
+pub fn remembered_after() -> [bool; 2] {
+    remembered()
+        .lock()
+        .map(|record| record.after)
+        .unwrap_or([false; 2])
+}
+
+/// Remember a typed template, reporting whether anything changed.
+pub fn remember_template(edited: &str) -> bool {
+    remembered()
+        .lock()
+        .map(|mut record| record.remember_template(edited))
+        .unwrap_or(false)
+}
+
+/// Remember the two switches, reporting whether anything changed.
+pub fn remember_after(after: [bool; 2]) -> bool {
+    remembered()
+        .lock()
+        .map(|mut record| record.remember_after(after))
+        .unwrap_or(false)
+}
+
+/// Move the number on after an attempt, and remember the template the attempt used.
+///
+/// The rule for when the number moves is [`assemble::Sequence::after`], which only advances on a
+/// success whose template actually asks for the number; running it here keeps every caller — the
+/// window and the tests — on the same rule.
+pub fn note_attempt<T>(result: &Result<T, SaveError>, template: &str) {
+    if let Ok(mut record) = remembered().lock() {
+        record.sequence = record.sequence.after(result, template);
+    }
+}
+
+/// The two switches' work after a successful save, in the panel's own order.
+///
+/// Passed to the panel's own implementation so the order and the shell calls exist once; the probe
+/// only decides which of the two is on.
+pub fn run_after_save(after: [bool; 2], path: &std::path::Path) {
+    crate::save::window::run_after_save(after, path);
+}
+
+/// Whether the footer offers to change the conflict policy, and which sentence it shows.
+///
+/// The rule is the panel's: the link exists only while the plain name is taken (`:1149`), and the
+/// word is the *action* rather than the state in force (`:1150`), because a state reads as a
+/// statement instead of something to press.
+pub fn conflict_link(
+    values: &PanelValues<'_>,
+    width: u32,
+    height: u32,
+    conflict: ConflictPolicy,
+) -> Option<&'static str> {
+    use crate::save::copy::ConflictLink;
+    let request = assemble::request_for(values, width as u64, height as u64).ok()?;
+    let plain = crate::save::service::plain_target(&request).ok()?;
+    if !plain.exists() {
+        return None;
+    }
+    Some(match conflict {
+        ConflictPolicy::AutoRename => ConflictLink::Overwrite.text(),
+        ConflictPolicy::Overwrite => ConflictLink::Rename.text(),
+    })
 }
 
 /// The date and time the naming template asks for, from the one place that reads the clock.
@@ -490,5 +614,96 @@ mod tests {
             0,
             "png keeps the transparency, so the fill is not applied to it"
         );
+    }
+
+    /// The number and the policy the view chose reach the values, and the link's word is the
+    /// policy that is *not* in force.
+    ///
+    /// Three facts in one test because they are one decision: what the footer offers and what the
+    /// save does have to be the same choice, and both come from these two fields.
+    #[gpui_kit::test]
+    fn the_chosen_number_and_policy_reach_the_save() {
+        let dir = temp_dir("policy");
+        let output = Size::new(96, 64);
+        let plain = dir.join("shot.png");
+
+        let chosen = values_with(
+            dir.to_str().expect("utf-8 path"),
+            "shot",
+            SaveFormat::Png,
+            "2026-10-26",
+            "0005",
+            0,
+            [0xff, 0xff, 0xff],
+            7,
+            ConflictPolicy::Overwrite,
+        );
+        assert_eq!(chosen.sequence, 7, "the number the shell holds is the one the name gets");
+        assert_eq!(chosen.conflict, ConflictPolicy::Overwrite, "the choice travels with the values");
+
+        std::fs::write(&plain, b"last night").expect("the test can write a sentinel");
+
+        // While the plain name is taken, the link offers the other policy, in words that are an
+        // action rather than a state (`:1150`).
+        let renaming = values_with(
+            dir.to_str().expect("utf-8 path"),
+            "shot",
+            SaveFormat::Png,
+            "2026-10-26",
+            "0005",
+            0,
+            [0xff, 0xff, 0xff],
+            1,
+            ConflictPolicy::AutoRename,
+        );
+        assert_eq!(
+            conflict_link(&renaming, output.width, output.height, ConflictPolicy::AutoRename),
+            Some("改为覆盖"),
+            "a taken name offers to overwrite"
+        );
+        assert_eq!(
+            conflict_link(&renaming, output.width, output.height, ConflictPolicy::Overwrite),
+            Some("改为重命名"),
+            "an overwriting save offers to rename instead"
+        );
+
+        // The choice really decides what lands: renaming keeps both files and the sentinel intact.
+        let kept = save(&Picture::synthetic(), &renaming, output).expect("the probe can save");
+        assert_ne!(kept.path, plain, "a taken name is not reused while renaming");
+        assert_eq!(
+            std::fs::read(&plain).expect("the sentinel is still there"),
+            b"last night",
+            "renaming has to leave the existing file alone"
+        );
+        assert!(kept.path.exists(), "and put the new one beside it");
+
+        // Overwriting keeps the name and replaces the bytes.
+        let overwriting = values_with(
+            dir.to_str().expect("utf-8 path"),
+            "shot",
+            SaveFormat::Png,
+            "2026-10-26",
+            "0005",
+            0,
+            [0xff, 0xff, 0xff],
+            1,
+            ConflictPolicy::Overwrite,
+        );
+        let replaced = save(&Picture::synthetic(), &overwriting, output).expect("the probe can save");
+        assert_eq!(replaced.path, plain, "overwriting keeps the name");
+        assert_ne!(
+            std::fs::read(&plain).expect("the file is there"),
+            b"last night",
+            "overwriting replaces the bytes"
+        );
+
+        // With the name free again the link has nothing to offer.
+        std::fs::remove_file(&plain).expect("the test can remove it");
+        assert_eq!(
+            conflict_link(&renaming, output.width, output.height, ConflictPolicy::AutoRename),
+            None,
+            "a free name has nothing to link to"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
