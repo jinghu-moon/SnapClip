@@ -25,8 +25,27 @@ use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu};
 use gpui_kit::*;
 use snapclip_ui::panel::{
-    DEMO, FMT_OPTIONS, QUALITY_HINT_TEXT, SIZE_MODE_WORDS, SIZE_PRESET_WORDS, VARIABLE_TOKENS,
+    DEMO, FMT_OPTIONS, FMT_PNG_INDEX, QUALITY_HINT_TEXT, QUALITY_OPTION_WORDS, SIZE_MODE_WORDS,
+    SIZE_PRESET_WORDS, VARIABLE_TOKENS,
 };
+
+// The menu items cannot carry a closure: the framework's own `on_click` for an item is crate
+// private in this release, and the documented route is an action dispatched along the focus chain.
+// One action per item rather than one action with a payload, because a payload needs `Deserialize`
+// and the derive, while an empty action needs neither.
+gpui_kit::actions!(
+    snapclip_probe,
+    [
+        PickDate,
+        PickTime,
+        PickSequence,
+        PickResolution,
+        PickApp,
+        FormatPng,
+        FormatJpeg,
+        FormatWebp
+    ]
+);
 
 /// The probe window's client size, matching the save panel so the eye compares like with like.
 pub const PROBE_WIDTH: f32 = 920.0;
@@ -211,8 +230,24 @@ fn row_label(text: &'static str) -> impl IntoElement {
     div().text_xs().child(text)
 }
 
+/// The size the two cells start with. The probe has no capture, so it uses the mockup's own
+/// sample size (`:593`, `1440 x 900`) instead of inventing dimensions; the presets scale this.
+pub const PROBE_ORIGINAL_SIZE: (u32, u32) = (1440, 900);
+
+/// The four size presets, as percentages (`:614`-`:619`: `data-pct="100|75|50|25"`).
+pub const PRESET_PERCENTS: [u32; 4] = [100, 75, 50, 25];
+
+/// The size a preset asks for: the capture's own size scaled by a percentage (`:1165` of the
+/// mockup's script rounds rather than truncates), never smaller than one pixel.
+pub fn preset_size(original: (u32, u32), percent: u32) -> (u32, u32) {
+    let side = |value: u32| ((value as u64 * percent as u64 + 50) / 100).max(1) as u32;
+    (side(original.0), side(original.1))
+}
+
 /// The probe's state: the fields it can edit, and the choices it shows.
 pub struct GpuiProbe {
+    /// The handle the menus hand their actions back to, so a chosen item reaches this view.
+    focus: FocusHandle,
     name: Entity<InputState>,
     path: Entity<InputState>,
     width: Entity<InputState>,
@@ -228,6 +263,7 @@ pub struct GpuiProbe {
 impl GpuiProbe {
     /// Build the view, seeding the name field with the template the panel uses.
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let focus = cx.focus_handle();
         let name = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(PROBE_NAME)
@@ -240,9 +276,14 @@ impl GpuiProbe {
         });
         // The size cells start at the capture's own size in the panel; this probe has no capture,
         // so it shows the size the mockup's own sample uses rather than inventing one.
-        let width = cx.new(|cx| InputState::new(window, cx).default_value("1440"));
-        let height = cx.new(|cx| InputState::new(window, cx).default_value("900"));
+        let width = cx.new(|cx| {
+            InputState::new(window, cx).default_value(PROBE_ORIGINAL_SIZE.0.to_string())
+        });
+        let height = cx.new(|cx| {
+            InputState::new(window, cx).default_value(PROBE_ORIGINAL_SIZE.1.to_string())
+        });
         Self {
+            focus,
             name,
             path,
             width,
@@ -265,6 +306,11 @@ impl GpuiProbe {
 impl Render for GpuiProbe {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
+        // The menus hand their chosen item back through this handle, so it is cloned before the
+        // closures that each need their own copy.
+        let focus = self.focus.clone();
+        let wand_focus = focus.clone();
+        let format_focus = focus.clone();
         let scale = window.scale_factor();
         let field_h = px(dip(scale, mockup::FIELD_HEIGHT));
         let ghost_h = px(dip(scale, mockup::GHOST_HEIGHT));
@@ -340,14 +386,14 @@ impl Render for GpuiProbe {
                     Button::new("probe-wand")
                         .label(PROBE_WAND)
                         .h(field_h)
-                        .dropdown_menu(|menu, _, _| variable_menu(menu)),
+                        .dropdown_menu(move |menu, _, _| variable_menu(menu, wand_focus.clone())),
                 )
                 .child(
                     Button::new("probe-format")
                         .label(FMT_OPTIONS[self.format])
                         .h(field_h)
                         .w(px(dip(scale, mockup::FORMAT_WIDTH)))
-                        .dropdown_menu(|menu, _, _| format_menu(menu)),
+                        .dropdown_menu(move |menu, _, _| format_menu(menu, format_focus.clone())),
                 ),
             false,
             scale,
@@ -457,26 +503,55 @@ impl Render for GpuiProbe {
                     .pl(px(dip(scale, mockup::PRESET_INDENT)))
                     .gap(px(dip(scale, mockup::PRESET_GAP)))
                     .children(SIZE_PRESET_WORDS.into_iter().enumerate().map(|(index, word)| {
+                        // The probe has no capture, so the "original" is the size its cells start
+                        // with; the panel scales the selection's size the same way (`:1165`).
+                        let percent = PRESET_PERCENTS[index];
+                        let (width, height) = preset_size(PROBE_ORIGINAL_SIZE, percent);
                         Button::new(format!("probe-preset-{index}"))
                             .label(word)
                             .h(chip_h)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                let w = this.width.clone();
+                                w.update(cx, |state, cx| {
+                                    state.set_value(width.to_string(), window, cx)
+                                });
+                                let h = this.height.clone();
+                                h.update(cx, |state, cx| {
+                                    state.set_value(height.to_string(), window, cx)
+                                });
+                                cx.notify();
+                                window.refresh();
+                            }))
                     })),
             );
         let size_row = row(size_header, size_content, false, scale);
 
-        // 质量: for PNG the mockup hides the tiers and states why (`:638`), so the row is that
-        // sentence and the limit switch, and nothing is a control that would do nothing.
+        // 质量: for PNG the mockup hides the tiers and states why (`:638`, `:639`); for the other
+        // formats it draws the three tiers instead (`:641`-`:643`). Which of the two is the same
+        // question in one place rather than a condition repeated at two call sites.
         let quality_header = div()
             .h_flex()
             .items_center()
             .gap(px(dip(scale, mockup::HEADER_ACTION_GAP)))
             .child(row_label(PROBE_LABELS[4]))
             .child(row_label(PROBE_LIMIT));
-        let quality_content = div()
-            .h(px(dip(scale, mockup::SEG_HEIGHT)))
-            .h_flex()
-            .items_center()
-            .child(div().text_xs().child(QUALITY_HINT_TEXT));
+        let quality_content = if quality_shows_tiers(self.format) {
+            div()
+                .h(px(dip(scale, mockup::SEG_HEIGHT)))
+                .h_flex()
+                .items_center()
+                .children(QUALITY_OPTION_WORDS.iter().enumerate().map(|(index, word)| {
+                    Button::new(("probe-tier", index))
+                        .label(*word)
+                        .h(px(dip(scale, mockup::SEG_HEIGHT)))
+                }))
+        } else {
+            div()
+                .h(px(dip(scale, mockup::SEG_HEIGHT)))
+                .h_flex()
+                .items_center()
+                .child(div().text_xs().child(QUALITY_HINT_TEXT))
+        };
         let quality_row = row(quality_header, quality_content, true, scale);
 
         // 预估大小: the value sits at the row's right end (`:668`), as the mockup draws it.
@@ -530,23 +605,121 @@ impl Render for GpuiProbe {
                             .h(px(dip(scale, mockup::BUTTON_HEIGHT))),
                     ),
             )
+            // The menus hand their item back as an action, which arrives here because this element
+            // is in the chain of the handle each menu was given.
+            .track_focus(&self.focus)
+            .on_action(cx.listener(Self::pick_date))
+            .on_action(cx.listener(Self::pick_time))
+            .on_action(cx.listener(Self::pick_sequence))
+            .on_action(cx.listener(Self::pick_resolution))
+            .on_action(cx.listener(Self::pick_app))
+            .on_action(cx.listener(Self::format_png))
+            .on_action(cx.listener(Self::format_jpeg))
+            .on_action(cx.listener(Self::format_webp))
     }
 }
 
-/// The five variables, as the mockup lists them (`:192`-`:198`).
-fn variable_menu(mut menu: PopupMenu) -> PopupMenu {
-    for token in VARIABLE_TOKENS {
-        menu = menu.label(token);
+/// The five variables, as the mockup lists them (`:192`-`:198`), each carrying its action.
+fn variable_menu(mut menu: PopupMenu, focus: FocusHandle) -> PopupMenu {
+    let actions: [Box<dyn Action>; 5] = [
+        Box::new(PickDate),
+        Box::new(PickTime),
+        Box::new(PickSequence),
+        Box::new(PickResolution),
+        Box::new(PickApp),
+    ];
+    for (token, action) in VARIABLE_TOKENS.iter().zip(actions) {
+        menu = menu.menu(*token, action);
     }
-    menu
+    menu.action_context(focus)
 }
 
-/// The three formats, as the format menu lists them (`:203`).
-fn format_menu(mut menu: PopupMenu) -> PopupMenu {
-    for word in FMT_OPTIONS {
-        menu = menu.label(word);
+/// The three formats, as the format menu lists them (`:203`), each carrying its action.
+fn format_menu(mut menu: PopupMenu, focus: FocusHandle) -> PopupMenu {
+    let actions: [Box<dyn Action>; 3] = [
+        Box::new(FormatPng),
+        Box::new(FormatJpeg),
+        Box::new(FormatWebp),
+    ];
+    for (word, action) in FMT_OPTIONS.iter().zip(actions) {
+        menu = menu.menu(*word, action);
     }
-    menu
+    menu.action_context(focus)
+}
+
+/// Whether the quality row shows its three tiers rather than the lossless note.
+///
+/// The mockup settles this by format alone: the tiers are hidden and the note shown for png
+/// (`:638`, `:639`), and the tiers are the row for everything else. A free function so the rule is
+/// asserted once instead of being a condition written at the two places that draw the row.
+pub fn quality_shows_tiers(format: usize) -> bool {
+    format != FMT_PNG_INDEX
+}
+
+/// What an inserted variable does to the name field.
+///
+/// `replace` is the whole rule rather than half of it: it applies to the active selection and
+/// leaves the caret after what it wrote, so a selection is replaced and a bare caret is inserted
+/// at — both of which the specification asks for (`:200`) — without the caller deciding which.
+fn insert_token(name: &Entity<InputState>, token: &'static str, window: &mut Window, cx: &mut App) {
+    name.update(cx, |state, cx| state.replace(token, window, cx));
+}
+
+/// The handlers the two menus reach through their actions.
+///
+/// Each one is the same three lines, because the action carries no payload: one action per item
+/// keeps the mapping visible at the call site and needs neither `Deserialize` nor the derive.
+impl GpuiProbe {
+    fn pick_date(&mut self, _: &PickDate, window: &mut Window, cx: &mut Context<Self>) {
+        insert_token(&self.name, VARIABLE_TOKENS[0], window, cx);
+        cx.notify();
+    }
+
+    fn pick_time(&mut self, _: &PickTime, window: &mut Window, cx: &mut Context<Self>) {
+        insert_token(&self.name, VARIABLE_TOKENS[1], window, cx);
+        cx.notify();
+    }
+
+    fn pick_sequence(&mut self, _: &PickSequence, window: &mut Window, cx: &mut Context<Self>) {
+        insert_token(&self.name, VARIABLE_TOKENS[2], window, cx);
+        cx.notify();
+    }
+
+    fn pick_resolution(
+        &mut self,
+        _: &PickResolution,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        insert_token(&self.name, VARIABLE_TOKENS[3], window, cx);
+        cx.notify();
+    }
+
+    fn pick_app(&mut self, _: &PickApp, window: &mut Window, cx: &mut Context<Self>) {
+        insert_token(&self.name, VARIABLE_TOKENS[4], window, cx);
+        cx.notify();
+    }
+
+    fn format_png(&mut self, _: &FormatPng, _: &mut Window, cx: &mut Context<Self>) {
+        self.choose_format(0, cx);
+    }
+
+    fn format_jpeg(&mut self, _: &FormatJpeg, _: &mut Window, cx: &mut Context<Self>) {
+        self.choose_format(1, cx);
+    }
+
+    fn format_webp(&mut self, _: &FormatWebp, _: &mut Window, cx: &mut Context<Self>) {
+        self.choose_format(2, cx);
+    }
+
+    /// Choosing a format changes the button's word and what the quality row shows, because the
+    /// design hides the tiers and shows the lossless note when the format is png (`:638`, `:639`).
+    fn choose_format(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index < FMT_OPTIONS.len() {
+            self.format = index;
+            cx.notify();
+        }
+    }
 }
 
 /// Which folder a shortcut stands for, by the panel's own order (`:739`-`:741`).
@@ -795,6 +968,23 @@ mod tests {
 
     /// The menus offer the mockup's words, in its order, and the actions follow them one by one.
     #[::core::prelude::v1::test]
+    #[::core::prelude::v1::test]
+    fn the_quality_row_shows_the_tiers_for_every_format_that_has_them() {
+        assert!(
+            quality_shows_tiers(1),
+            "jpg is offered the three tiers (`:641`-`:643`)"
+        );
+        assert!(
+            quality_shows_tiers(2),
+            "webp is offered the three tiers (`:641`-`:643`)"
+        );
+        assert!(
+            !quality_shows_tiers(FMT_PNG_INDEX),
+            "png hides the tiers and says why (`:638`, `:639`)"
+        );
+    }
+
+    #[::core::prelude::v1::test]
     fn the_menus_offer_the_mockups_words_in_order() {
         assert_eq!(
             VARIABLE_TOKENS,
@@ -810,5 +1000,32 @@ mod tests {
         assert_eq!(PROBE_SIZE_LABELS, ["宽", "高"], "`.cell-label` (`:237`)");
         assert_eq!(PROBE_UNIT, "px", "`.dim-unit` (`:243`)");
         assert_eq!(PROBE_LIMIT, "限制体积", "`.switch-text` (`:634`)");
+    }
+}
+
+#[cfg(test)]
+mod preset_tests {
+    // `use gpui_kit::*` exports a macro named `test`, which shadows the attribute.
+    use super::{preset_size, PRESET_PERCENTS, PROBE_ORIGINAL_SIZE};
+
+    #[::core::prelude::v1::test]
+    fn a_preset_is_the_captures_size_at_that_percentage() {
+        assert_eq!(preset_size((1440, 900), 50), (720, 450), "`:1165` halves both sides");
+        assert_eq!(preset_size((1440, 900), 100), (1440, 900));
+        assert_eq!(preset_size((1440, 900), 75), (1080, 675));
+        assert_eq!(preset_size((1440, 900), 25), (360, 225));
+    }
+
+    #[::core::prelude::v1::test]
+    fn a_preset_rounds_and_never_reaches_zero() {
+        // The mockup's script rounds (`:1165`); truncating would give 1 here and 2 below.
+        assert_eq!(preset_size((3, 3), 75), (2, 2));
+        assert_eq!(preset_size((1, 1), 25), (1, 1), "no side may reach zero");
+    }
+
+    #[::core::prelude::v1::test]
+    fn the_presets_are_the_mockups_four_in_its_order() {
+        assert_eq!(PRESET_PERCENTS, [100, 75, 50, 25], "`:615`-`:618`");
+        assert_eq!(PROBE_ORIGINAL_SIZE, (1440, 900), "`:593`");
     }
 }
