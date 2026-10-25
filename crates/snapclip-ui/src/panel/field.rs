@@ -2807,6 +2807,26 @@ mod click_tests;
 #[cfg(test)]
 mod tests {
 
+    /// A selection is the accent mixed into the field's fill, by the design's own two colours and
+    /// the written-down share.
+    ///
+    /// Written as literal numbers rather than as the two inputs again: a test that recomputed the mix
+    /// would agree with a wrong percentage as readily as with the right one, and the whole point of
+    /// pinning this here is that the painter's band colour can then be checked against it.
+    #[test]
+    fn a_selection_is_the_accent_mixed_into_the_field_fill() {
+        // `--accent` as rgb(31,117,219) (`:20`) over the field's resolved fill, at 35 percent.
+        let mixed = selection_over_field([41, 41, 46, 255], [31, 117, 219, 255]);
+        assert_eq!(mixed, [37, 67, 106, 255]);
+        // The ends of the range, both of them written out: no accent at all, and all of it.
+        assert_eq!(selection_over_field([10, 20, 30, 255], [10, 20, 30, 255]), [10, 20, 30, 255]);
+        assert_eq!(
+            selection_over_field([0, 0, 0, 255], [255, 255, 255, 255]),
+            [89, 89, 89, 255],
+            "thirty five percent of white over black"
+        );
+    }
+
     use super::*;
 
     const SURFACE: [u8; 4] = [23, 23, 28, 235];

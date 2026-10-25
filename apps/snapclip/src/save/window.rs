@@ -3748,6 +3748,140 @@ fn read_u32(hwnd: isize, attribute: u32) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A window state with nothing captured and no control created, for the rules that only need
+    /// the models and the field table.
+    fn bare_state() -> WindowState {
+        WindowState {
+            backdrop: false,
+            renderer: None,
+            fields: snapclip_ui::panel::FieldStates::IDLE,
+            controls: [std::ptr::null_mut(); snapclip_ui::panel::FieldId::ALL.len()],
+            numbers: NumericFields::default(),
+            focused_number: None,
+            preview: None,
+            fill_brush: std::ptr::null_mut(),
+            fill: snapclip_ui::panel::FILL_WHITE,
+            segment: snapclip_ui::panel::quality_segment_state(
+                &snapclip_ui::panel::DEMO,
+                &snapclip_ui::panel::DEMO.rects(1.0),
+                1.0,
+                0,
+            ),
+            segment_scale: 1.0,
+            footer_widths: [40, 52, 64],
+            path_change: 56,
+            format: 0,
+            format_open: false,
+            remembered: std::sync::Arc::new(std::sync::Mutex::new(Remembered::default())),
+            status: None,
+            var_open: false,
+            path_chips: [40, 52, 64],
+            size_presets: [40, 36, 36, 36],
+            size_mode: snapclip_ui::panel::SIZE_MODE_CHOSEN,
+            size_mode_widths: [56, 64],
+            limit_on: false,
+            conflict: ConflictPolicy::AutoRename,
+            conflict_shown: false,
+            conflict_widths: [0; 2],
+            limit_words: snapclip_ui::panel::LimitWidths::default(),
+            estimate: None,
+            over_limit: false,
+            copy: std::sync::Arc::new(SystemImageCopy),
+        }
+    }
+
+    /// The three numbers are drawn, so they have no child windows at all: nothing exists that could
+    /// sit above a self-drawn control and eat its clicks, which is the defect the name box had.
+    #[test]
+    fn the_three_numbers_have_no_controls() {
+        let state = bare_state();
+        for id in [
+            snapclip_ui::panel::FieldId::SizeWidth,
+            snapclip_ui::panel::FieldId::SizeHeight,
+            snapclip_ui::panel::FieldId::Limit,
+        ] {
+            assert!(
+                state.control(id).is_null(),
+                "{id:?} is drawn by the frame, so it must not have a control"
+            );
+        }
+    }
+
+    /// The models are where the three numbers live, and `set_size_text` writes one rather than a
+    /// control: the save, the estimate, the copy and the paint all read these.
+    #[test]
+    fn the_size_cells_read_and_write_their_models() {
+        let mut state = bare_state();
+        state.set_size_text("640", "480");
+        assert_eq!(
+            state.number_text(snapclip_ui::panel::FieldId::SizeWidth),
+            "640"
+        );
+        assert_eq!(
+            state.number_text(snapclip_ui::panel::FieldId::SizeHeight),
+            "480",
+            "the width is not the height: two numbers of the same type, kept apart by name"
+        );
+        let views = state.numbers.views();
+        assert_eq!(
+            views.width.map(|view| view.text),
+            Some("640"),
+            "the painter reads the same model the save does"
+        );
+        assert_eq!(views.limit.map(|view| view.text), Some(""), "the limit starts empty");
+    }
+
+    /// A click gives a drawn number the focus and selects it, so the first keystroke replaces the
+    /// number; losing the keyboard drops the selection and the caret with it.
+    #[test]
+    fn focusing_a_number_selects_it_and_losing_the_keyboard_drops_it() {
+        let mut state = bare_state();
+        state.numbers.width.set_text("1341");
+        state.focus_number(snapclip_ui::panel::FieldId::SizeWidth);
+        assert_eq!(
+            state.focused_number,
+            Some(snapclip_ui::panel::FieldId::SizeWidth)
+        );
+        assert!(state.numbers.width.focused());
+        assert_eq!(
+            state.numbers.width.selection(),
+            Some((0, 4)),
+            "gaining the focus selects everything, which is what makes typing replace"
+        );
+        assert_eq!(
+            state.fields.state_of(snapclip_ui::panel::FieldId::SizeWidth),
+            snapclip_ui::panel::FieldState::Focused,
+            "the frame's border follows the same state the native children wrote"
+        );
+        state.blur_number();
+        assert_eq!(state.focused_number, None);
+        assert_eq!(
+            state.fields.state_of(snapclip_ui::panel::FieldId::SizeWidth),
+            snapclip_ui::panel::FieldState::Idle
+        );
+        assert_eq!(state.numbers.width.text(), "1341", "losing the focus changes nothing");
+    }
+
+    /// Two drawn numbers never hold the focus at once, and moving between them moves the frame's
+    /// focus ring as well.
+    #[test]
+    fn only_one_drawn_number_has_the_focus() {
+        let mut state = bare_state();
+        state.focus_number(snapclip_ui::panel::FieldId::SizeWidth);
+        state.focus_number(snapclip_ui::panel::FieldId::SizeHeight);
+        assert_eq!(
+            state.focused_number,
+            Some(snapclip_ui::panel::FieldId::SizeHeight)
+        );
+        assert!(!state.numbers.width.focused(), "the first number gave the focus up");
+        assert!(state.numbers.height.focused());
+        assert_eq!(
+            state.fields.state_of(snapclip_ui::panel::FieldId::SizeWidth),
+            snapclip_ui::panel::FieldState::Idle,
+            "and its ring went with it"
+        );
+    }
     use super::*;
 
     /// A save that worked says nothing: the panel closes, so there would be no line to read.

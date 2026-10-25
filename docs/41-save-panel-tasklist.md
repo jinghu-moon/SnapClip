@@ -1329,7 +1329,8 @@ check --workspace --all-targets  Finished ✓  死代码 0 ✓
 
 **目标**：名字已被占用时，底栏出现一条链接；点它改变的是"这次保存要不要覆盖"。文件夹对话框从路径框当前的位置开始，而不是从系统默认。
 
-**一处逻辑**（service）：新增 	arget_of(request)（按请求的 conflict 解析）与 plain_target(request)（按覆盖解析，即"如果没有被占用会用哪个名字"）。两者都走 prepare + esolve，所以裁剪尾点、补扩展名、_2 编号只有一份。面板**不自己拼路径** ✗。
+**一处逻辑**（service）：新增 	arget_of(request)（按请求的 conflict 解析）与 plain_target(request)（按覆盖解析，即"如果没有被占用会用哪个名字"）。两者都走 prepare + 
+esolve，所以裁剪尾点、补扩展名、_2 编号只有一份。面板**不自己拼路径** ✗。
 
 **可见性**：plain_target(...).exists() 为真才显示链接（:1149）；名字一变自由，策略**自动回到重命名**（:1138），因为覆盖只有在存在文件时才是一个有意义的选择。
 
@@ -1473,3 +1474,27 @@ Name's text box { left: 584, right: 870 } reaches under the format button { left
 **未完成的验证**：`cargo test -p snapclip-ui` 200/0（含三条新断言：几何四档 DPI、命中半开区间、位图绝对色）；`icon-bake` 7/0、`capture` 545/0/80 都在加图标之后绿。但 **`snapclip-app` 此刻编译不过** —— 并行的"自绘数字框"批次正在中途（`NumericFields` / `numbers` / `focused_number` 未就绪），所以本批在 `window.rs` 的四处改动（`PANEL_STYLE`、创建处、最小化点击、样式断言）**还没有经过编译验证**，必须在那一批落地后重跑。
 
 另一个并行痕迹：`frame.rs` 的值列测试里有一行 `let muted = fill_rgb(152, 157, 161);` 重复了两次（2853 与 2858），第一行未使用 ⇒ `lib test` 一条 `unused variable` 警告。那是并行批次的半成品，我没有动。
+
+### 自绘数字框的断言（P9-72）
+
+上一提交把三个原生 `EDIT` 换成了自绘（`text_field.rs`），这一批补的是**能咬的断言**：
+
+- `field::a_selection_is_the_accent_mixed_into_the_field_fill` —— 选中色 = `--accent` 按 35% 混进字段填充，**写死字面量**（`[37,67,106,255]` 与两端各一条）。不重算，否则会和错的百分比一起对。
+- `frame::a_drawn_number_carries_its_selection_and_its_caret` —— **两侧**：有焦点 ⇒ 该颜色（由上面那条钉住的算式给出）在格子里出现；**失焦 ⇒ 一个都没有**。另外把选区收成光标后，`--accent-text` 的竖线必须出现。
+- `frame::a_drawn_number_in_warning_takes_the_warning_colour` —— 警告态的数字用 `--warning` 画，走 `field_colours` 的 `text` 而不是画家的第二套判断（`:241`）。
+- `window::the_three_numbers_have_no_controls` —— 三个数字字段的句柄都是空：没有子窗口，也就没有东西能压在自绘控件上吃掉点击（名字框那次就栽在这）。
+- `window::the_size_cells_read_and_write_their_models` · `focusing_a_number_selects_it_and_losing_the_keyboard_drops_it` · `only_one_drawn_number_has_the_focus` —— 模型是这三个数的**唯一**所在；聚焦即全选、失焦即收选区、同一时刻只有一个有焦点。
+
+**两条变异都真红**（各自先断言替换命中 1 处、还原后 `sha256` 逐字节相同、都见 `Compiling`）：
+
+```
+M1 输入时不吃选区（start,end 都取光标）
+   ⇒ gaining_the_focus_selects_everything_so_typing_replaces FAILED
+      left: "13419"  right: "9"        （"the first keystroke replaces the number"）
+
+M2 选区带用字段填充色画
+   ⇒ a_drawn_number_carries_its_selection_and_its_caret FAILED
+      "a selected number paints its highlight in the accent mixed into the field's fill"
+```
+
+**一处踩坑记下来**：`PaintInput::idle(dpi)` 的参数是 **DPI**，写 `idle(1.0)` 会让整帧按 0.5 缩放画，于是按 scale 1.0 算出来的采样矩形**整块是表面色**——第一次的位图断言就是这么“什么也没测到”的。

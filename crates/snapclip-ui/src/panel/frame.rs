@@ -2354,6 +2354,165 @@ pub fn paint_to_dc_with_preview(
 
 #[cfg(test)]
 mod tests {
+    /// A drawn number carries its selection and its caret, and neither when it is not focused.
+    ///
+    /// Two sided on purpose: a colour that is always painted would pass a "the selection is there"
+    /// assertion, so the unfocused render has to have none of it. The band's colour comes from
+    /// `selection_over_field`, whose arithmetic is pinned to literal numbers in `field`'s tests —
+    /// otherwise this would be asking the producer to confirm itself.
+    #[test]
+    fn a_drawn_number_carries_its_selection_and_its_caret() {
+        let canvas = Canvas::new(920, DEMO.panel_height());
+        let factory = factory().expect("a Direct2D factory");
+        let dwrite = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED) }
+            .expect("a DirectWrite factory");
+        let rects = DEMO.rects(1.0);
+        let cell = crate::panel::field::size_cell_input_rect(
+            &DEMO,
+            &rects,
+            1.0,
+            crate::panel::SizeCell::Width,
+        );
+        let fill =
+            crate::panel::field_colours(crate::panel::FieldState::Idle, DEMO_PALETTE.surface).fill;
+        let accent =
+            crate::panel::field_colours(crate::panel::FieldState::Focused, DEMO_PALETTE.surface)
+                .border;
+        let band = crate::panel::selection_over_field(fill, accent);
+
+        let paint = |field: &crate::panel::TextField, focused: bool| {
+            let mut view = field.view();
+            view.focused = focused;
+            let mut fields = crate::panel::FieldStates::IDLE;
+            if focused {
+                fields.set_focus(crate::panel::FieldId::SizeWidth, true);
+            }
+            paint_to_dc_with_preview(
+                &factory,
+                &dwrite,
+                canvas.dc,
+                Rect::new(0, 0, canvas.width, canvas.height),
+                &PaintInput {
+                    fields,
+                    numbers: crate::panel::NumberViews {
+                        width: Some(view),
+                        ..Default::default()
+                    },
+                    ..PaintInput::idle(96.0)
+                },
+            )
+            .expect("the frame paints");
+        };
+        let count = |expected: [u8; 4]| {
+            let pixels = canvas.pixels();
+            let mut found = 0;
+            for y in cell.top..cell.bottom {
+                for x in cell.left..cell.right {
+                    let pixel = pixels.pixel(x, y);
+                    if [pixel.r, pixel.g, pixel.b, pixel.a] == expected {
+                        found += 1;
+                    }
+                }
+            }
+            found
+        };
+
+        let mut selected = crate::panel::TextField::new("1341");
+        selected.set_focused(true);
+        assert_eq!(
+            selected.selection(),
+            Some((0, 4)),
+            "gaining the focus selects the number, which is what the band shows"
+        );
+        paint(&selected, true);
+        let with = count(band);
+        assert!(
+            with > 0,
+            "a selected number paints its highlight in the accent mixed into the field's fill"
+        );
+        paint(&selected, false);
+        let without = count(band);
+        assert_eq!(without, 0, "a number nobody is editing shows no highlight");
+
+        // A caret sits where the next digit would go: at the end when the selection is collapsed.
+        let mut careted = crate::panel::TextField::new("1341");
+        careted.set_focused(true);
+        careted.move_end();
+        assert_eq!(careted.selection(), None, "the caret is bare before it is drawn");
+        paint(&careted, true);
+        let mut caret_pixels = 0;
+        let pixels = canvas.pixels();
+        for y in cell.top..cell.bottom {
+            for x in cell.left..cell.right {
+                let pixel = pixels.pixel(x, y);
+                if [pixel.r, pixel.g, pixel.b, pixel.a] == DEMO_PALETTE.accent_text {
+                    caret_pixels += 1;
+                }
+            }
+        }
+        assert!(
+            caret_pixels > 0,
+            "a bare caret in a focused number has to be on screen"
+        );
+    }
+
+    /// A size cell in warning draws its number in the warning colour, through the field rule rather
+    /// than through a second opinion kept in the painter (`.cell.is-warning .dim-input`, `:241`).
+    #[test]
+    fn a_drawn_number_in_warning_takes_the_warning_colour() {
+        let canvas = Canvas::new(920, DEMO.panel_height());
+        let factory = factory().expect("a Direct2D factory");
+        let dwrite = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED) }
+            .expect("a DirectWrite factory");
+        let rects = DEMO.rects(1.0);
+        let cell = crate::panel::field::size_cell_input_rect(
+            &DEMO,
+            &rects,
+            1.0,
+            crate::panel::SizeCell::Width,
+        );
+        let warning =
+            crate::panel::field_colours(crate::panel::FieldState::Warning, DEMO_PALETTE.surface)
+                .text;
+        let field = crate::panel::TextField::new("1341");
+        let mut view = field.view();
+        view.focused = false;
+        let mut fields = crate::panel::FieldStates::IDLE;
+        fields.mark(Some((
+            crate::panel::FieldId::SizeWidth,
+            crate::panel::FieldState::Warning,
+        )));
+        paint_to_dc_with_preview(
+            &factory,
+            &dwrite,
+            canvas.dc,
+            Rect::new(0, 0, canvas.width, canvas.height),
+            &PaintInput {
+                fields,
+                numbers: crate::panel::NumberViews {
+                    width: Some(view),
+                    ..Default::default()
+                },
+                ..PaintInput::idle(96.0)
+            },
+        )
+        .expect("the frame paints");
+        let pixels = canvas.pixels();
+        let mut found = 0;
+        for y in cell.top..cell.bottom {
+            for x in cell.left..cell.right {
+                let pixel = pixels.pixel(x, y);
+                if [pixel.r, pixel.g, pixel.b, pixel.a] == warning {
+                    found += 1;
+                }
+            }
+        }
+        assert!(
+            found > 0,
+            "a cell the rule calls a warning draws its digits in --warning (:241)"
+        );
+    }
+
     /// A window keeps its pixels from one frame to the next and so erases before painting; an
     /// offscreen canvas does not, because the harness pre-fills it to stand in for the compositor's
     /// material.
