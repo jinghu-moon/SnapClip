@@ -13,7 +13,7 @@
 // `StyledExt` carries `v_flex`/`h_flex`, `ActiveTheme` carries `cx.theme()`.
 use gpui_kit::base::StyledExt as _;
 use gpui_kit::component::button::Button;
-use gpui_kit::component::{ActiveTheme, Root};
+use gpui_kit::component::{ActiveTheme, Root, Theme, ThemeMode};
 use gpui_kit::*;
 use std::sync::Arc;
 use std::time::Duration;
@@ -525,11 +525,20 @@ pub fn run(options: StartupOptions) {
             // MUST be first: component-backed views need the component runtime.
             gpui_kit::init(cx);
 
+            // The panel under comparison is dark, so the probe has to be dark too or the eye is
+            // comparing two themes rather than two renderers. The framework switches wholesale
+            // (`Theme::change`), and the call is inside the probe's own branch: a run without the
+            // variable keeps whatever theme the shell already has.
+            let probe = std::env::var_os("SNAPCLIP_GPUI_PROBE").is_some();
+            if probe {
+                Theme::change(ThemeMode::Dark, None, cx);
+            }
+
             cx.spawn(async move |cx| {
                 // The GPUI probe replaces the shell rather than sitting beside it: it answers a
                 // separate question, and two windows would ask the eye to compare two things
                 // instead of one. Unset, this branch is not taken and the shell is untouched.
-                if std::env::var_os("SNAPCLIP_GPUI_PROBE").is_some() {
+                if probe {
                     let probe_options = WindowOptions {
                         window_bounds: Some(WindowBounds::Windowed(Bounds::new(
                             point(px(0.0), px(0.0)),
