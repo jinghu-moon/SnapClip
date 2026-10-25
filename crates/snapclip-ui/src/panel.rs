@@ -33,6 +33,7 @@ mod segmented;
 mod slider;
 #[path = "panel/tag.rs"]
 mod tag;
+mod text_field;
 #[path = "panel/theme.rs"]
 mod theme;
 #[path = "panel/toggle.rs"]
@@ -69,6 +70,7 @@ pub use field::{
     SIZE_MODE_BORDER_DIP, SIZE_MODE_CHOSEN, SIZE_MODE_GAP_DIP, SIZE_MODE_PADDING_DIP,
     SIZE_MODE_RADIUS_DIP, SIZE_MODE_RESET_DIP, SIZE_MODE_RESET_ICON_DIP, SIZE_MODE_RESET_RADIUS_DIP,
     SIZE_MODE_WORDS, CLOSE_ICON_DIP, close_button_contains, close_icon_rect,
+    minimize_button_contains, minimize_icon_rect,
     FOOTER_BUTTON_HEIGHT_DIP, FOOTER_BUTTON_RADIUS_DIP, FOOTER_BUTTONS, FOOTER_GAP_DIP,
     FOOTER_PAD_X_DIP, FooterButton, footer_border_y, footer_button_contains, footer_button_rect,
     footer_button_width, footer_button_is_strong, footer_button_text, footer_copy_icon_rect,
@@ -91,6 +93,7 @@ pub use field::{
     SIZE_PRESET_WORDS, size_preset_contains, size_preset_rect, size_preset_size,
     size_preset_width, size_presets_rect,
     WARN_HINT_DIP, WARN_HINT_TEXT, warn_hint_icon_rect, warn_hint_rect, warn_hint_shown,
+    selection_over_field, SELECTION_PERCENT,
     warn_hint_text_rect,
     size_mode_button_rect, size_mode_button_width, size_mode_contains, size_mode_rect,
     size_mode_reset_icon_rect, size_mode_reset_rect, size_reset_contains,
@@ -106,7 +109,7 @@ pub use frame::{
     chip_format, factory, measure_footer_widths, measure_limit_words, measure_path_chips,
     measure_size_presets, number_format,
     row_label_format, status_format, text_format_in, title_format, var_label_format, VAR_FONT_DIP,
-    HINT_FONT_DIP, PRESET_FONT_DIP, hint_format, preset_label_format,
+    HINT_FONT_DIP, PRESET_FONT_DIP, hint_format, preset_label_format, HEADER_BUTTON_GAP_DIP,
 };
 pub use icon_button::IconButton;
 pub use icons::{Glyph, ICON_BAKED_PX, ICON_COUNT};
@@ -119,6 +122,10 @@ pub use segmented::{
 };
 pub use slider::{Slider, SliderKey};
 pub use tag::{Tag, TagState};
+pub use text_field::{
+    MAX_DIGITS, MAX_SIZE, MIN_SIZE, NumberView, NumberViews, TextField, digits, right_aligned_left,
+    value_of,
+};
 pub use theme::{FAMILY, PanelTheme};
 pub use toggle::{Switch, SwitchState, Toggle, ToggleState};
 

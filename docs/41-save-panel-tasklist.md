@@ -1455,3 +1455,21 @@ field_rect(Row::Name)            // .file-row 的整行
 ```
 Name's text box { left: 584, right: 870 } reaches under the format button { left: 824, ... } at 1x
 ```
+
+## 头部：移除系统自带的关闭钮，加最小化钮
+
+**现象**（用户实测）：面板右上角有一个**系统画的小 ×**，点了没反应 ✗。
+
+**根因**：创建窗口时样式是 `WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU` ✗。`WS_CAPTION` **必须保留** —— 它是 DWM 画圆角、阴影和材质的依据（`WM_NCCALCSIZE if wparam != 0 => 0` 那条注释写的就是这个）；而 `WS_SYSMENU` 让 DWM 在客户区上再画一个标题栏关闭框 ✗，同一个 `WM_NCCALCSIZE` 把非客户区压成 0 ⇒ **画得出、点不到** ✗。看得见却按不动的按钮比没有更糟，所以去掉这一位。
+
+**形状**：新增 `PANEL_STYLE` 常量（`WS_OVERLAPPED | WS_CAPTION`），创建处不再写字面量；`WS_MINIMIZEBOX` / `WS_MAXIMIZEBOX` / `WS_THICKFRAME` 在测试里断言为**零**，这样将来谁要加，必须说出来。
+
+**代价（如实记）**：没有系统菜单 ⇒ `Alt+F4` 不再关窗；面板自己有关闭钮、`Esc` 和「取消」，所以不走那条路。
+
+**最小化钮**：`rects.minimize` 与 `rects.close` **同尺寸**（26 dip，`:96`），间距用 `HEADER_BUTTON_GAP_DIP`，它**读的是** `field.rs` 已有的 `SIZE_MODE_GAP_DIP`（`.row-header-actions { gap: 8px }`，`:224`）—— 不是又写一个 8。设计稿的头部只有一个按钮（`:474`），所以没有可抄的头部间距，这是设计稿自己"一行两个小按钮"的那条 token。
+
+图标用已烘好的 `minus.png`（643 B，早已入库），新增 `Glyph::Minus`（`ICON_COUNT` 13 → 14）；绘制与关闭钮同一套 `muted_rgba`；命中测试在按钮矩形上，不在 14 dip 的图标上（与关闭钮同一分工）。行为是 `ShowWindow(SW_MINIMIZE)`。
+
+**未完成的验证**：`cargo test -p snapclip-ui` 200/0（含三条新断言：几何四档 DPI、命中半开区间、位图绝对色）；`icon-bake` 7/0、`capture` 545/0/80 都在加图标之后绿。但 **`snapclip-app` 此刻编译不过** —— 并行的"自绘数字框"批次正在中途（`NumericFields` / `numbers` / `focused_number` 未就绪），所以本批在 `window.rs` 的四处改动（`PANEL_STYLE`、创建处、最小化点击、样式断言）**还没有经过编译验证**，必须在那一批落地后重跑。
+
+另一个并行痕迹：`frame.rs` 的值列测试里有一行 `let muted = fill_rgb(152, 157, 161);` 重复了两次（2853 与 2858），第一行未使用 ⇒ `lib test` 一条 `unused variable` 警告。那是并行批次的半成品，我没有动。

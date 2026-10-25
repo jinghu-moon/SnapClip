@@ -1283,6 +1283,33 @@ pub fn close_button_contains(rects: &FrameRects, scale: f32, point: (i32, i32)) 
     point.0 >= button.left && point.0 < button.right && point.1 >= button.top && point.1 < button.bottom
 }
 
+/// The drawn minimize glyph, centred in `rects.minimize`.
+///
+/// Same picture-versus-target split as `close_icon_rect`: the button is 26 dip and the glyph 14.
+pub fn minimize_icon_rect(_metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let button = rects.minimize;
+    let side = px(CLOSE_ICON_DIP);
+    let left = button.left + (button.right - button.left - side) / 2;
+    let top = button.top + (button.bottom - button.top - side) / 2;
+    Rect {
+        left,
+        top,
+        right: left + side,
+        bottom: top + side,
+    }
+}
+
+/// Whether a client-area point is inside the minimize button.
+///
+/// The button is `rects.minimize`, the same size as the close and one header gap to its left, so
+/// the two cannot overlap however the header is laid out.
+pub fn minimize_button_contains(rects: &FrameRects, scale: f32, point: (i32, i32)) -> bool {
+    let _ = scale;
+    let button = rects.minimize;
+    point.0 >= button.left && point.0 < button.right && point.1 >= button.top && point.1 < button.bottom
+}
+
 /// `.size-mode { padding: 2px; border: 1px solid var(--line-soft); border-radius: var(--r-input) }`
 /// (`:225`, `:54`) — the two-button container at the end of the size row's header line.
 pub const SIZE_MODE_PADDING_DIP: i32 = 2;
@@ -1320,6 +1347,28 @@ pub fn line_soft_over_surface(surface: [u8; 4]) -> [u8; 4] {
 /// The footer's top border: `border-top: 1px solid rgba(255,255,255,.04)` (`:274`), resolved over
 /// the surface for the same reason as [`line_soft_over_surface`]. It is deliberately fainter than
 /// `--line-soft`: the footer is separated from the body by a hairline, not by an edge.
+/// How much of the accent a selection carries, in percent. The mockup styles no `::selection`
+/// (`:167`–`:172`), so a browser would have shown the system's own highlight — which is exactly the
+/// patch of blue-grey that made a drawn field worth doing at all. Tinting the accent into the
+/// field's fill keeps the panel's palette and stays readable under `--text`.
+pub const SELECTION_PERCENT: u16 = 35;
+
+/// What a selected run of digits looks like: `--accent` laid over the field's own fill.
+///
+/// Arithmetic on two colours the palette already has, rather than a new literal: a selection is a
+/// relationship between the accent and the fill, not a colour of its own.
+pub fn selection_over_field(fill: [u8; 4], accent: [u8; 4]) -> [u8; 4] {
+    let mix = |f: u8, a: u8| {
+        ((u16::from(a) * SELECTION_PERCENT + u16::from(f) * (100 - SELECTION_PERCENT)) / 100) as u8
+    };
+    [
+        mix(fill[0], accent[0]),
+        mix(fill[1], accent[1]),
+        mix(fill[2], accent[2]),
+        255,
+    ]
+}
+
 pub fn footer_line_over_surface(surface: [u8; 4]) -> [u8; 4] {
     let mix = |c: u8| ((u16::from(c) * 96 + 255 * 4) / 100) as u8;
     [mix(surface[0]), mix(surface[1]), mix(surface[2]), 255]

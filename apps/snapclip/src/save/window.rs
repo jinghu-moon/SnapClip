@@ -44,6 +44,20 @@ pub(crate) const PANEL_EX_STYLE: u32 = windows_sys::Win32::UI::WindowsAndMessagi
     // loose controls and its keyboard is whatever each control happens to do with it.
     | windows_sys::Win32::UI::WindowsAndMessaging::WS_EX_CONTROLPARENT;
 
+/// The window's own styles.
+///
+/// `WS_CAPTION` stays: it is what makes DWM draw the rounded corners, the shadow and the backdrop
+/// (`WM_NCCALCSIZE` below then claims the whole window as client area, so no caption is visible).
+/// `WS_SYSMENU` used to be here and is exactly why a small close button appeared in the corner: it
+/// tells DWM to draw the caption's close box over the client area, while the same
+/// `WM_NCCALCSIZE` leaves nothing there to click. A button that cannot be clicked is worse than no
+/// button, so the bit is gone and the panel's own header draws the two it has.
+///
+/// The minimize and maximize bits were never set, and are named here so that a later change has to
+/// say so out loud rather than inherit them from a caption.
+pub(crate) const PANEL_STYLE: u32 = windows_sys::Win32::UI::WindowsAndMessaging::WS_OVERLAPPED
+    | windows_sys::Win32::UI::WindowsAndMessaging::WS_CAPTION;
+
 /// Replace the panel in `slot`: **close the old one, then create the new one, then store it.**
 ///
 /// The order is the contract, not an implementation detail. A window handle is reused once its
@@ -76,9 +90,12 @@ pub(crate) fn replace_panel<T, E>(
 
 #[cfg(test)]
 mod panel_slot_tests {
-    use super::{PANEL_EX_STYLE, replace_panel};
+    use super::{PANEL_EX_STYLE, PANEL_STYLE, replace_panel};
     use std::sync::Mutex;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{WS_EX_TOOLWINDOW, WS_EX_TOPMOST};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        WS_CAPTION, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU,
+        WS_THICKFRAME,
+    };
 
     #[test]
     fn the_panel_asks_to_be_above_the_windows_it_replaces() {
@@ -92,6 +109,40 @@ mod panel_slot_tests {
             PANEL_EX_STYLE & WS_EX_TOOLWINDOW,
             0,
             "the panel stays out of the taskbar"
+        );
+    }
+
+    /// The panel's own header draws its two buttons, so the caption must not put a third one there.
+    /// `WS_SYSMENU` makes DWM draw the caption's close box over the client area, and the
+    /// `WM_NCCALCSIZE` that claims the whole window leaves nothing there to click: a button the user
+    /// can see and cannot press. `WS_CAPTION` stays because it is what keeps DWM's rounded corners,
+    /// shadow and backdrop, which is a different job from the buttons drawn in that frame.
+    #[test]
+    fn the_panel_style_leaves_the_caption_buttons_to_the_header() {
+        assert_ne!(
+            PANEL_STYLE & WS_CAPTION,
+            0,
+            "the caption is what keeps DWM's rounded corners, shadow and backdrop"
+        );
+        assert_eq!(
+            PANEL_STYLE & WS_SYSMENU,
+            0,
+            "the system menu is what drew a close button the client area could not answer"
+        );
+        assert_eq!(
+            PANEL_STYLE & WS_MINIMIZEBOX,
+            0,
+            "the header draws the minimize button, not the caption"
+        );
+        assert_eq!(
+            PANEL_STYLE & WS_MAXIMIZEBOX,
+            0,
+            "the panel is a fixed-size form and has no maximize"
+        );
+        assert_eq!(
+            PANEL_STYLE & WS_THICKFRAME,
+            0,
+            "a fixed-size dialog has no resize border"
         );
     }
 
@@ -585,7 +636,7 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
         GetWindowRect, IsDialogMessageW, LoadCursorW, RegisterClassW, SetWindowLongPtrW,
         SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWL_EXSTYLE,
         GWLP_USERDATA, GW_HWNDPREV, IDC_ARROW, MSG, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER,
-        WNDCLASSW, WS_CAPTION, WS_EX_TOPMOST, WS_OVERLAPPED, WS_SYSMENU,
+        WNDCLASSW, WS_EX_TOPMOST,
     };
 
     let class_name: Vec<u16> = "SnapClipSavePanel\0".encode_utf16().collect();
@@ -620,7 +671,7 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
             PANEL_EX_STYLE,
             class_name.as_ptr(),
             title.as_ptr(),
-            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+            PANEL_STYLE,
             0,
             0,
             64,
@@ -744,6 +795,10 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
             // thing that asks for one, and a number measured for a limit nobody asked about would be
             // work the panel does on every open for nothing.
             limit_on: false,
+            // The numbers start empty and are filled by the same `initial_text` the controls used to
+            // be given, in the loop below: one source for "what each field holds when it opens".
+            numbers: NumericFields::default(),
+            focused_number: None,
             conflict: ConflictPolicy::AutoRename,
             conflict_shown: false,
             conflict_widths,
@@ -797,10 +852,18 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
         };
         if let Some(s) = (state as *mut WindowState).as_mut() {
             for id in snapclip_ui::panel::FieldId::ALL {
+                let text = initial_text(id);
+                // The three numbers are drawn by the frame and answered by the window, so they get
+                // no child window at all: nothing to create, and nothing that could sit on top of a
+                // self-drawn control and eat its clicks.
+                if let Some(field) = s.numbers.get_mut(id) {
+                    field.set_text(&text);
+                    continue;
+                }
                 let control = create_field_edit(
                     hwnd,
                     id.rect(&metrics, &rects, scale, s.path_change),
-                    &initial_text(id),
+                    &text,
                     id.face(),
                 );
                 s.set_control(id, control);
@@ -1002,6 +1065,19 @@ struct WindowState {
     /// `不超过 [ 500 ] KB` group instead of the tier segment, and a save is required to fit — one
     /// flag, asked by the painter, the click handler and the save.
     limit_on: bool,
+    /// The three numbers the panel draws itself: the two size cells and the limit's box.
+    ///
+    /// A native `EDIT` carried its own background, font size and selection colour onto a panel that
+    /// draws all three, and a plain control has no per-instance selection colour to fix it with.
+    /// These three hold digits, which is what makes drawing them affordable: no composition, no
+    /// candidate window, no scrolling at seven characters (`text_field.rs`). The file name keeps its
+    /// control for exactly that reason.
+    numbers: NumericFields,
+    /// Which drawn number is being edited, if any.
+    ///
+    /// The panel holds the keyboard focus on the field's behalf, because a drawn field has no child
+    /// window to receive the keys: this is the other half of drawing it.
+    focused_number: Option<snapclip_ui::panel::FieldId>,
     /// Whether a taken name is reused (Overwrite) or numbered (AutoRename), which the footer's
     /// link flips (:989).
     conflict: ConflictPolicy,
@@ -1170,8 +1246,8 @@ fn switch_size_mode(
     let source = super::scale::Size::new(width, height);
     let size = super::scale::output_size(
         super::scale::SizeMode::from_index(state.size_mode),
-        &control_text(state.control(snapclip_ui::panel::FieldId::SizeWidth)),
-        &control_text(state.control(snapclip_ui::panel::FieldId::SizeHeight)),
+        &state.number_text(snapclip_ui::panel::FieldId::SizeWidth),
+        &state.number_text(snapclip_ui::panel::FieldId::SizeHeight),
         source,
     );
     let text = super::scale::display_text(
@@ -1600,8 +1676,8 @@ fn with_panel_request<T>(
     let source = super::scale::Size::new(*width, *height);
     let output = super::scale::output_size(
         super::scale::SizeMode::from_index(s.size_mode),
-        &control_text(s.control(snapclip_ui::panel::FieldId::SizeWidth)),
-        &control_text(s.control(snapclip_ui::panel::FieldId::SizeHeight)),
+        &s.number_text(snapclip_ui::panel::FieldId::SizeWidth),
+        &s.number_text(snapclip_ui::panel::FieldId::SizeHeight),
         source,
     );
     let (date, time) = local_date_and_time();
@@ -1658,7 +1734,7 @@ fn limit_bytes(hwnd: windows_sys::Win32::Foundation::HWND) -> Option<u64> {
     if !s.limit_on {
         return None;
     }
-    let text = control_text(s.control(snapclip_ui::panel::FieldId::Limit));
+    let text = s.number_text(snapclip_ui::panel::FieldId::Limit);
     Some(u64::from(limit_kilobytes(&text)) * 1024)
 }
 
@@ -2027,8 +2103,8 @@ fn copy_picture(
     let source = super::scale::Size::new(*width, *height);
     let output = super::scale::output_size(
         super::scale::SizeMode::from_index(state.size_mode),
-        &control_text(state.control(snapclip_ui::panel::FieldId::SizeWidth)),
-        &control_text(state.control(snapclip_ui::panel::FieldId::SizeHeight)),
+        &state.number_text(snapclip_ui::panel::FieldId::SizeWidth),
+        &state.number_text(snapclip_ui::panel::FieldId::SizeHeight),
         source,
     );
     let frame = super::scale::Frame {
@@ -2205,16 +2281,49 @@ impl WindowState {
     /// and it is the one the user can also type into. The words are the caller's, because what the
     /// fields hold depends on the mode: pixels in one, percentages of the capture in the other
     /// (`scale::display_text` decides, `:1072`).
-    fn set_size_text(&self, width: &str, height: &str) {
-        use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW;
-        for (id, value) in [
-            (snapclip_ui::panel::FieldId::SizeWidth, width),
-            (snapclip_ui::panel::FieldId::SizeHeight, height),
-        ] {
-            let text: Vec<u16> = value.encode_utf16().chain([0]).collect();
-            unsafe {
-                SetWindowTextW(self.control(id), text.as_ptr());
+    fn set_size_text(&mut self, width: &str, height: &str) {
+        self.numbers.width.set_text(width);
+        self.numbers.height.set_text(height);
+    }
+
+    /// What one numeric field says, as text.
+    ///
+    /// The models are the one place these three numbers live now: the save, the estimate, the copy
+    /// and the paint all read them here rather than each asking a control.
+    fn number_text(&self, id: snapclip_ui::panel::FieldId) -> String {
+        self.numbers
+            .get(id)
+            .map(|field| field.text().to_owned())
+            .unwrap_or_default()
+    }
+
+    /// Give a drawn number the focus, and the keyboard with it.
+    ///
+    /// Gaining the focus selects the whole number, so the first keystroke replaces it. The field
+    /// rule is told as well, through the same call the native children make from `WM_COMMAND`, so
+    /// the frame's border and the field's own state cannot disagree about who has the focus.
+    fn focus_number(&mut self, id: snapclip_ui::panel::FieldId) {
+        if let Some(previous) = self.focused_number.replace(id) {
+            if previous != id {
+                if let Some(field) = self.numbers.get_mut(previous) {
+                    field.set_focused(false);
+                }
+                self.fields.set_focus(previous, false);
             }
+        }
+        if let Some(field) = self.numbers.get_mut(id) {
+            field.set_focused(true);
+        }
+        self.fields.set_focus(id, true);
+    }
+
+    /// Take the focus away from a drawn number, dropping its selection with it.
+    fn blur_number(&mut self) {
+        if let Some(id) = self.focused_number.take() {
+            if let Some(field) = self.numbers.get_mut(id) {
+                field.set_focused(false);
+            }
+            self.fields.set_focus(id, false);
         }
     }
 
@@ -2246,6 +2355,220 @@ impl WindowState {
         let before = self.chosen_quality();
         let chosen = snapclip_ui::panel::quality_pointer(self.segment_at_scale(scale), event, point);
         chosen.is_some() && self.chosen_quality() != before
+    }
+}
+
+/// The three numbers the panel draws itself, and the views the painter reads.
+///
+/// One type for the three so that "which field is this" is answered once: a fourth numeric field is
+/// an arm here rather than a fourth copy of every read.
+#[derive(Clone, Debug, Default)]
+struct NumericFields {
+    width: snapclip_ui::panel::TextField,
+    height: snapclip_ui::panel::TextField,
+    limit: snapclip_ui::panel::TextField,
+}
+
+impl NumericFields {
+    fn get(&self, id: snapclip_ui::panel::FieldId) -> Option<&snapclip_ui::panel::TextField> {
+        match id {
+            snapclip_ui::panel::FieldId::SizeWidth => Some(&self.width),
+            snapclip_ui::panel::FieldId::SizeHeight => Some(&self.height),
+            snapclip_ui::panel::FieldId::Limit => Some(&self.limit),
+            _ => None,
+        }
+    }
+
+    fn get_mut(&mut self, id: snapclip_ui::panel::FieldId) -> Option<&mut snapclip_ui::panel::TextField> {
+        match id {
+            snapclip_ui::panel::FieldId::SizeWidth => Some(&mut self.width),
+            snapclip_ui::panel::FieldId::SizeHeight => Some(&mut self.height),
+            snapclip_ui::panel::FieldId::Limit => Some(&mut self.limit),
+            _ => None,
+        }
+    }
+
+    /// What the painter draws for the three fields.
+    fn views(&self) -> snapclip_ui::panel::NumberViews<'_> {
+        snapclip_ui::panel::NumberViews {
+            width: Some(self.width.view()),
+            height: Some(self.height.view()),
+            limit: Some(self.limit.view()),
+        }
+    }
+}
+
+/// One key applied to the number that has the focus.
+///
+/// The window owns the keyboard on the field's behalf, because a drawn field has no child window to
+/// send keys to. What each key *means* is in `text_field`; this only names the keys, which is why the
+/// behaviour can be asserted there without a window.
+///
+/// Returns whether the field changed, so the caller knows to repaint.
+fn number_key(
+    state: &mut WindowState,
+    message: u32,
+    wparam: usize,
+) -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetKeyState, VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_RIGHT, VK_SHIFT, VK_UP,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_CHAR;
+
+    let Some(id) = state.focused_number else {
+        return false;
+    };
+    let Some(field) = state.numbers.get_mut(id) else {
+        return false;
+    };
+    if message == WM_CHAR {
+        // The control characters a keyboard shortcut arrives as, which is how a window without a
+        // native control still gets Ctrl+A/C/V/X.
+        return match wparam as u32 {
+            0x01 => {
+                field.select_all();
+                true
+            }
+            0x03 => copy_selection(field, false),
+            0x08 => field.backspace(),
+            0x16 => paste_into(field),
+            0x18 => copy_selection(field, true),
+            code => char::from_u32(code)
+                .map(|character| field.insert_char(character))
+                .unwrap_or(false),
+        };
+    }
+    let shift = unsafe { GetKeyState(VK_SHIFT as i32) } < 0;
+    match wparam as u16 {
+        VK_BACK => field.backspace(),
+        VK_DELETE => field.delete(),
+        VK_LEFT => {
+            field.move_left();
+            true
+        }
+        VK_RIGHT => {
+            field.move_right();
+            true
+        }
+        VK_HOME => {
+            field.move_home();
+            true
+        }
+        VK_END => {
+            field.move_end();
+            true
+        }
+        // Ten at a time with `Shift`, one otherwise: the size row's numbers are hundreds and the
+        // gesture that walks them is the one every number box has.
+        VK_UP => {
+            field.step(if shift { 10 } else { 1 });
+            true
+        }
+        VK_DOWN => {
+            field.step(if shift { -10 } else { -1 });
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Copy the selected digits, and cut them when asked.
+fn copy_selection(field: &mut snapclip_ui::panel::TextField, cut: bool) -> bool {
+    let Some(text) = field.selected_text().map(str::to_owned) else {
+        return false;
+    };
+    if !set_clipboard_text(&text) {
+        return false;
+    }
+    if cut {
+        field.delete();
+    }
+    true
+}
+
+/// Put text on the clipboard.
+///
+/// The shell's clipboard port carries pictures, which is what the footer's copy button needs; a
+/// drawn number's selection is text and the port has no method for it, so the text form is written
+/// here — the mirror of `clipboard_text` below.
+fn set_clipboard_text(text: &str) -> bool {
+    use windows_sys::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    };
+    use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+    const CF_UNICODETEXT: u32 = 13;
+    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let bytes = wide.len() * std::mem::size_of::<u16>();
+    unsafe {
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return false;
+        }
+        if EmptyClipboard() == 0 {
+            let _ = CloseClipboard();
+            return false;
+        }
+        let handle = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if handle.is_null() {
+            let _ = CloseClipboard();
+            return false;
+        }
+        let pointer = GlobalLock(handle) as *mut u16;
+        if pointer.is_null() {
+            let _ = CloseClipboard();
+            return false;
+        }
+        std::ptr::copy_nonoverlapping(wide.as_ptr(), pointer, wide.len());
+        let _ = GlobalUnlock(handle);
+        // The clipboard owns the block from here; freeing it would be a double free.
+        let owned = SetClipboardData(CF_UNICODETEXT, handle);
+        let _ = CloseClipboard();
+        !owned.is_null()
+    }
+}
+
+/// Paste the clipboard's text into the number, keeping its digits.
+fn paste_into(field: &mut snapclip_ui::panel::TextField) -> bool {
+    match clipboard_text() {
+        Some(text) => field.insert(&text),
+        None => false,
+    }
+}
+
+/// The clipboard's text, when it has any.
+///
+/// A drawn field has no control to send `WM_PASTE` to, so the text is read here and then filtered:
+/// pasting `1920 x 1080` into a size cell has to land on `19201080`'s first seven digits rather than
+/// on nothing, which is what `TextField::insert` already does with a run of text.
+fn clipboard_text() -> Option<String> {
+    use windows_sys::Win32::System::DataExchange::{
+        CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+    };
+    use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+    const CF_UNICODETEXT: u32 = 13;
+    unsafe {
+        if IsClipboardFormatAvailable(CF_UNICODETEXT) == 0 {
+            return None;
+        }
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return None;
+        }
+        let handle = GetClipboardData(CF_UNICODETEXT);
+        let mut text = None;
+        if !handle.is_null() {
+            let pointer = GlobalLock(handle) as *const u16;
+            if !pointer.is_null() {
+                let mut length = 0usize;
+                while *pointer.add(length) != 0 {
+                    length += 1;
+                }
+                text = Some(String::from_utf16_lossy(std::slice::from_raw_parts(
+                    pointer, length,
+                )));
+                let _ = GlobalUnlock(handle);
+            }
+        }
+        let _ = CloseClipboard();
+        text
     }
 }
 
@@ -2505,7 +2828,8 @@ extern "system" fn window_proc(
         DefWindowProcW, DestroyWindow, GetWindowLongPtrW, PostQuitMessage, SetWindowPos,
         GWLP_USERDATA, HTCLIENT, HTCAPTION, SWP_NOACTIVATE, SWP_NOZORDER, WA_INACTIVE, WM_ACTIVATE,
         WM_CLOSE, WM_DESTROY,
-        WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_NCCALCSIZE,
+        DLGC_WANTARROWS, DLGC_WANTCHARS, WM_CHAR, WM_DPICHANGED, WM_ERASEBKGND, WM_GETDLGCODE,
+        WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_NCCALCSIZE,
         WM_NCHITTEST, WM_PAINT,
     };
 
@@ -2579,8 +2903,8 @@ extern "system" fn window_proc(
                         .unwrap_or(super::scale::Size::new(0, 0));
                     let output_size = super::scale::output_size(
                         super::scale::SizeMode::from_index(s.size_mode),
-                        &control_text(s.control(snapclip_ui::panel::FieldId::SizeWidth)),
-                        &control_text(s.control(snapclip_ui::panel::FieldId::SizeHeight)),
+                        &s.number_text(snapclip_ui::panel::FieldId::SizeWidth),
+                        &s.number_text(snapclip_ui::panel::FieldId::SizeHeight),
                         source_size,
                     );
                     let warn_hint = snapclip_ui::panel::warn_hint_shown(
@@ -2608,6 +2932,7 @@ extern "system" fn window_proc(
                                 // see `PaintInput::clear_first` for what the residue did.
                                 clear_first: true,
                                 fields: s.fields,
+                                numbers: s.numbers.views(),
                                 preview: s
                                     .preview
                                     .as_ref()
@@ -2706,6 +3031,60 @@ extern "system" fn window_proc(
                 {
                     windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(hwnd, WM_CLOSE, 0, 0);
                     return 0;
+                }
+                // The minimize button, one header gap to the close's left, drawn the same way and
+                // hit tested on the same 26 dip rectangle rather than on its glyph. The mockup has
+                // no such button (`:472`); the panel is a window that can be minimized, and its own
+                // header is where that belongs, since the frame no longer lets the system draw one.
+                if snapclip_ui::panel::minimize_button_contains(&rects, dpi_scale(hwnd), (point.x, point.y))
+                {
+                    windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
+                        hwnd,
+                        windows_sys::Win32::UI::WindowsAndMessaging::SW_MINIMIZE,
+                    );
+                    return 0;
+                }
+                // A drawn number takes the focus from a click anywhere in its box, and the panel
+                // takes the keyboard focus on its behalf. The box tested is the frame's own rectangle,
+                // so the target is the shape on screen. A click that lands anywhere else gives the
+                // focus up: a caret in a field the user just clicked away from would be a lie.
+                if let Some(s) = state_mut(hwnd) {
+                    let limit_shown = snapclip_ui::panel::quality_line(s.format, s.limit_on)
+                        == snapclip_ui::panel::QualityLine::Limit;
+                    let scale_now = dpi_scale(hwnd);
+                    let mut hit = None;
+                    for id in [
+                        snapclip_ui::panel::FieldId::SizeWidth,
+                        snapclip_ui::panel::FieldId::SizeHeight,
+                        snapclip_ui::panel::FieldId::Limit,
+                    ] {
+                        if id == snapclip_ui::panel::FieldId::Limit && !limit_shown {
+                            continue;
+                        }
+                        let rect = id.frame_rect(&metrics, &rects, scale_now, s.path_change);
+                        if snapclip_ui::panel::rect_contains(rect, (point.x, point.y)) {
+                            hit = Some(id);
+                            break;
+                        }
+                    }
+                    if let Some(id) = hit {
+                        s.focus_number(id);
+                        windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(hwnd);
+                        windows_sys::Win32::Graphics::Gdi::InvalidateRect(
+                            hwnd,
+                            std::ptr::null(),
+                            0,
+                        );
+                        return 0;
+                    }
+                    if s.focused_number.is_some() {
+                        s.blur_number();
+                        windows_sys::Win32::Graphics::Gdi::InvalidateRect(
+                            hwnd,
+                            std::ptr::null(),
+                            0,
+                        );
+                    }
                 }
                 // The conflict link (:989): a press flips the policy for the next save. Its word is
                 // the action, so the rectangle to test is the one for the word being drawn.
@@ -2953,12 +3332,16 @@ extern "system" fn window_proc(
                     presets,
                     (point.x, point.y),
                 ) {
-                    if let Some(s) = state(hwnd) {
-                        if let Some((_, width, height)) = s.preview.as_ref() {
-                            let source = super::scale::Size::new(*width, *height);
+                    if let Some(s) = state_mut(hwnd) {
+                        // The captured size is copied out before the fields are written: the preview
+                        // and the models are both the state's, and holding a borrow of one across a
+                        // change to the other is what the borrow checker is there to refuse.
+                        let captured = s.preview.as_ref().map(|(_, width, height)| (*width, *height));
+                        if let Some((width, height)) = captured {
+                            let source = super::scale::Size::new(width, height);
                             let (width, height) = snapclip_ui::panel::size_preset_size(
                                 snapclip_ui::panel::SIZE_PRESET_PCT[index],
-                                (*width, *height),
+                                (width, height),
                             );
                             // The shortcut names a share of the capture; the fields then say it in
                             // whichever unit the mode is in, so a shortcut in percent mode shows the
@@ -3115,8 +3498,50 @@ extern "system" fn window_proc(
         // `Esc` is a cancel, and at this layer cancelling the panel *is* closing it: the shell's
         // state machine owns what that means (`Shell::close`), and the window only has to stop
         // being a window. The close button arrives with the controls.
+        // A drawn number takes its characters here: the panel holds the keyboard focus on the
+        // field's behalf, because a drawn field has no child window to send them to.
+        WM_CHAR => {
+            if let Some(s) = state_mut(hwnd) {
+                if number_key(s, message, wparam) {
+                    windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+            }
+            0
+        }
+        // While a drawn number has the focus the panel answers the arrows and the characters itself,
+        // so the dialog rules have to hand them over rather than turn them into navigation. `Tab` is
+        // deliberately not asked for: it still has to walk between the native fields.
+        WM_GETDLGCODE => {
+            let wanted = match state(hwnd).and_then(|s| s.focused_number) {
+                Some(_) => (DLGC_WANTARROWS | DLGC_WANTCHARS) as isize,
+                None => 0,
+            };
+            if wanted == 0 {
+                DefWindowProcW(hwnd, message, wparam, lparam)
+            } else {
+                wanted
+            }
+        }
+        // The drawn number's caret leaves with the keyboard: a caret in a field that cannot take a
+        // keystroke would be a lie about where typing goes.
+        WM_KILLFOCUS => {
+            if let Some(s) = state_mut(hwnd) {
+                if s.focused_number.is_some() {
+                    s.blur_number();
+                    windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+            }
+            DefWindowProcW(hwnd, message, wparam, lparam)
+        }
         WM_KEYDOWN => {
             use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
+            // The number's own keys come first, and they do not take `Enter` or `Esc`: those still
+            // save and close, whatever has the focus.
+            if let Some(s) = state_mut(hwnd) {
+                if s.focused_number.is_some() && number_key(s, message, wparam) {
+                    windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+            }
             if wparam == VK_ESCAPE as usize {
                 windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(hwnd, WM_CLOSE, 0, 0);
             } else if wparam == VK_RETURN as usize {
@@ -3678,6 +4103,8 @@ mod tests {
             renderer: None,
             fields: snapclip_ui::panel::FieldStates::IDLE,
             controls: [std::ptr::null_mut(); snapclip_ui::panel::FieldId::ALL.len()],
+            numbers: NumericFields::default(),
+            focused_number: None,
             preview: None,
             fill_brush: std::ptr::null_mut(),
             fill: snapclip_ui::panel::FILL_WHITE,
@@ -3755,6 +4182,8 @@ mod tests {
             renderer: None,
             fields: snapclip_ui::panel::FieldStates::IDLE,
             controls: [std::ptr::null_mut(); snapclip_ui::panel::FieldId::ALL.len()],
+            numbers: NumericFields::default(),
+            focused_number: None,
             preview: None,
             fill_brush: std::ptr::null_mut(),
             fill: snapclip_ui::panel::FILL_WHITE,
@@ -3836,6 +4265,8 @@ mod tests {
             renderer: None,
             fields: snapclip_ui::panel::FieldStates::IDLE,
             controls: [std::ptr::null_mut(); snapclip_ui::panel::FieldId::ALL.len()],
+            numbers: NumericFields::default(),
+            focused_number: None,
             preview: None,
             fill_brush: std::ptr::null_mut(),
             fill: snapclip_ui::panel::FILL_WHITE,
@@ -4066,6 +4497,8 @@ mod tests {
             renderer: None,
             fields: snapclip_ui::panel::FieldStates::IDLE,
             controls: [std::ptr::null_mut(); snapclip_ui::panel::FieldId::ALL.len()],
+            numbers: NumericFields::default(),
+            focused_number: None,
             preview: Some((bgra.clone(), 4, 3)),
             fill_brush: std::ptr::null_mut(),
             fill: snapclip_ui::panel::FILL_WHITE,

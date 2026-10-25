@@ -148,6 +148,13 @@ impl FrameMetrics {
         );
         let close = px(self.close_size);
         let close_top = (body_top - close) / 2;
+        let close_left = px(self.panel_width) - px(self.pad_x) - close;
+        let minimize = Rect::new(
+            close_left - px(HEADER_BUTTON_GAP_DIP) - close,
+            close_top,
+            close_left - px(HEADER_BUTTON_GAP_DIP),
+            close_top + close,
+        );
         FrameRects {
             header: Rect::new(0, 0, px(self.panel_width), body_top),
             divider_y: body_top,
@@ -155,14 +162,21 @@ impl FrameMetrics {
             preview,
             form,
             close: Rect::new(
-                px(self.panel_width) - px(self.pad_x) - close,
+                close_left,
                 close_top,
                 px(self.panel_width) - px(self.pad_x),
                 close_top + close,
             ),
+            minimize,
         }
     }
 }
+
+/// The space between two small buttons that share one line: `.row-header-actions { gap: 8px }`
+/// (`:224`). The mockup's header holds only the close button (`:474`), so there is no header gap
+/// of its own to copy; this is the design's own spacing for that arrangement rather than a number
+/// chosen here, which is why it reads the token `field.rs` already keeps for the same row.
+pub const HEADER_BUTTON_GAP_DIP: i32 = crate::panel::field::SIZE_MODE_GAP_DIP;
 
 /// Resolved pixel geometry. No painting depends on anything else.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -174,6 +188,8 @@ pub struct FrameRects {
     pub preview: Rect,
     pub form: Rect,
     pub close: Rect,
+    /// The minimize button, the same size as the close and one header gap to its left.
+    pub minimize: Rect,
 }
 
 /// The colours the frame needs, straight from the design's tokens.
@@ -214,6 +230,16 @@ pub const DEMO_PALETTE: FramePalette = FramePalette {
 
 /// Brushes the frame paints with. A brush belongs to the target that made it, so the caller
 /// creates these from its own.
+/// The padding between a number and the box it is drawn in, and how far a selection reaches above
+/// and below the digits.
+///
+/// `.input-wrap` (`:240`) and `.text-input` (`:167`) both say `padding: 0 10px`, so a drawn number
+/// keeps the design's own inset now that no control adds one of its own. The selection inset is the
+/// panel's own reading of "a highlight": the design does not draw one (`::selection` is unstyled),
+/// and stopping short of the box's edge keeps it off the rounded corner.
+pub const NUMBER_PAD_DIP: f32 = 10.0;
+pub const SELECTION_INSET_DIP: f32 = 4.0;
+
 pub struct FrameBrushes {
     pub surface: ID2D1SolidColorBrush,
     pub line: ID2D1SolidColorBrush,
@@ -232,6 +258,10 @@ pub struct FrameBrushes {
     /// The field background, already composited: a native `EDIT` cannot be translucent, so the
     /// frame and the child both use this opaque value (`field.rs`).
     pub field_fill: ID2D1SolidColorBrush,
+    /// The highlight behind a selected run of digits in a drawn number: the accent mixed into the
+    /// field's fill (`field::selection_over_field`), because the system's own highlight colour is
+    /// what a native control brought and what the drawn fields replaced.
+    pub selection: ID2D1SolidColorBrush,
     /// `--accent`, the focused field's border and its inner ring.
     pub accent: ID2D1SolidColorBrush,
     /// `--danger`, the error field's border.
@@ -288,6 +318,10 @@ impl FrameBrushes {
                 crate::panel::footer_line_over_surface(palette.surface),
             )?,
             field_fill: brush(target, idle.fill)?,
+            selection: brush(
+                target,
+                crate::panel::selection_over_field(idle.fill, focused.border),
+            )?,
             accent: brush(target, focused.border)?,
             danger: brush(target, error.border)?,
             warning: brush(target, warning.border)?,
@@ -475,6 +509,9 @@ pub struct Frame<'a> {
     /// Supplied by the caller from the same values the save expands, so the menu cannot promise a
     /// date the file name would not get. `None` draws the labels on their own.
     pub var_values: Option<[&'a str; 5]>,
+    /// The three numbers the panel draws itself, with their selections and carets, in the fields a
+    /// native control used to occupy (`text_field.rs`).
+    pub numbers: crate::panel::NumberViews<'a>,
 }
 
 impl Frame<'_> {
@@ -599,6 +636,16 @@ impl Frame<'_> {
             self.brushes.muted_rgba,
         )?;
 
+        // The minimize glyph, to the left of the close and in the same colour. The mockup's header
+        // holds only the close button (`:472`–`:476`), so its shape and colour are borrowed from
+        // that button and the spacing comes from `HEADER_BUTTON_GAP_DIP`.
+        Self::draw_glyph(
+            painter,
+            crate::panel::icons::Glyph::Minus,
+            crate::panel::field::minimize_icon_rect(self.metrics, self.rects, self.scale),
+            self.brushes.muted_rgba,
+        )?;
+
         // Both field frames, in the mockup's order: the path row first and the name row second
         // (`:542`, `:556`), then the size row's two cells (`:235`, `:246`). Each child window sits
         // inside its own rect, inset by `EDIT_INSET_DIP`, and paints its own background with the same
@@ -609,9 +656,19 @@ impl Frame<'_> {
         // changing a rule changes the picture and the tests with it. Every field runs this one loop,
         // which is what keeps the second, third and fourth from becoming copies of the first.
         let field_radius = (crate::panel::INPUT_RADIUS_DIP * self.scale).round() as i32;
+        // One answer to "which line the quality row is showing", asked by the field loop below and
+        // by the line itself. The limit's box is drawn only while its line is: its input used to be
+        // a control that was hidden when the switch was off, which left the frame's own box behind.
+        let limit_line = crate::panel::quality_line(
+            self.format,
+            self.limit.map_or(false, |limit| limit.on),
+        );
         // The states come from the field list, one per field: a field that is added later is drawn
         // from its own entry rather than from whatever state the window tracked before.
         for (id, state) in self.fields.iter() {
+            if id == crate::panel::FieldId::Limit && limit_line != crate::panel::QualityLine::Limit {
+                continue;
+            }
             let field = id.frame_rect(self.metrics, self.rects, self.scale, self.path_change);
             let colours = crate::panel::field_colours(state, self.brushes.surface_rgba());
             painter.fill_round(field, field_radius, &self.brushes.field_fill);
@@ -674,6 +731,24 @@ impl Frame<'_> {
                     &self.brushes.muted,
                 );
             }
+        }
+
+        // The numbers themselves, drawn rather than controlled (`text_field.rs`). A native `EDIT`
+        // brought its own background, font size and selection colour onto a panel that draws all
+        // three, and none of them could be made to match: a plain control has no per-instance
+        // selection colour at all.
+        for (cell, view) in [
+            (crate::panel::SizeCell::Width, self.numbers.width),
+            (crate::panel::SizeCell::Height, self.numbers.height),
+        ] {
+            let Some(view) = view else { continue };
+            let rect =
+                crate::panel::field::size_cell_input_rect(self.metrics, self.rects, self.scale, cell);
+            let id = match cell {
+                crate::panel::SizeCell::Width => crate::panel::FieldId::SizeWidth,
+                crate::panel::SizeCell::Height => crate::panel::FieldId::SizeHeight,
+            };
+            self.draw_number(painter, rect, view, self.number, self.fields.state_of(id))?;
         }
 
         // The four shortcuts under the cells (`.size-presets`, `:614`). A chip is a pill with an
@@ -804,7 +879,7 @@ impl Frame<'_> {
         // limit group when the limit is on, the segment when the format has a quality, and the
         // explanation when it does not. One function decides which, and the click handler asks it,
         // so a line that is not drawn cannot be changed by a click.
-        match crate::panel::quality_line(self.format, self.limit.map_or(false, |limit| limit.on)) {
+        match limit_line {
             crate::panel::QualityLine::Limit => {
                 if let Some(format) = self.row_label {
                     painter.draw_text(
@@ -821,6 +896,21 @@ impl Frame<'_> {
                         crate::panel::limit_unit_rect(self.metrics, self.rects, self.scale),
                         &self.brushes.muted,
                     );
+                }
+                if let Some(view) = self.numbers.limit {
+                    let rect = crate::panel::FieldId::Limit.rect(
+                        self.metrics,
+                        self.rects,
+                        self.scale,
+                        self.path_change,
+                    );
+                    self.draw_number(
+                        painter,
+                        rect,
+                        view,
+                        self.number,
+                        self.fields.state_of(crate::panel::FieldId::Limit),
+                    )?;
                 }
             }
             crate::panel::QualityLine::Segment => {
@@ -1541,6 +1631,65 @@ impl Frame<'_> {
     /// panel paints through a DC render target, which has no colour matrix effect to tint with. The
     /// order of the tint's output and the bitmap's alpha mode are decided in one place, so the next
     /// icon does not have to remember either.
+    /// One drawn number: the selection behind the digits, the digits, the caret after them.
+    ///
+    /// Right aligned and inset by the design's own ten dips (`:167`, `:240`), which is what a native
+    /// control padded itself with. The digits take the field rule's text colour, so a cell in warning
+    /// (`.cell.is-warning .dim-input`, `:241`) turns orange through the rule that turns its border,
+    /// rather than through a second opinion kept here.
+    fn draw_number(
+        &self,
+        painter: &PanelPainter,
+        box_rect: Rect,
+        view: crate::panel::NumberView<'_>,
+        format: Option<&IDWriteTextFormat>,
+        state: crate::panel::FieldState,
+    ) -> Result<()> {
+        let Some(format) = format else {
+            return Ok(());
+        };
+        let pad = (NUMBER_PAD_DIP * self.scale).round() as i32;
+        let width = painter.measure_text_width(view.text, format)? as i32;
+        let left = crate::panel::right_aligned_left(box_rect, width, pad);
+        let inset = (SELECTION_INSET_DIP * self.scale).round() as i32;
+        let band = Rect::new(
+            left,
+            box_rect.top + inset,
+            box_rect.right - pad,
+            box_rect.bottom - inset,
+        );
+        if view.focused {
+            if let Some((start, end)) = view.selection {
+                let before = painter.measure_text_width(&view.text[..start], format)? as i32;
+                let after = painter.measure_text_width(&view.text[..end], format)? as i32;
+                painter.fill_round(
+                    Rect::new(left + before, band.top, left + after, band.bottom),
+                    0,
+                    &self.brushes.selection,
+                );
+            }
+            let before = painter.measure_text_width(&view.text[..view.caret], format)? as i32;
+            let hairline = self.scale.round().max(1.0) as i32;
+            painter.fill_round(
+                Rect::new(left + before, band.top, left + before + hairline, band.bottom),
+                0,
+                &self.brushes.accent_text,
+            );
+        }
+        let colours = crate::panel::field_colours(state, self.brushes.surface_rgba());
+        let brush = self
+            .brushes
+            .field_brush(colours.text)
+            .unwrap_or(&self.brushes.text);
+        painter.draw_text(
+            view.text,
+            format,
+            Rect::new(left, box_rect.top, box_rect.right - pad, box_rect.bottom),
+            brush,
+        );
+        Ok(())
+    }
+
     fn draw_glyph(
         painter: &PanelPainter,
         glyph: crate::panel::icons::Glyph,
@@ -2055,6 +2204,10 @@ pub struct PaintInput<'a> {
     pub warn_hint: bool,
     /// The five naming variables' current values, in `VARIABLE_LABELS` order (`:196`).
     pub variable_values: Option<[&'a str; 5]>,
+    /// The three numbers the panel now draws itself — the two size cells and the limit's box —
+    /// because a native `EDIT` carries its own background, font and selection colour into a panel
+    /// that draws all three (`text_field.rs`). Empty for a caller that shows none of them.
+    pub numbers: crate::panel::NumberViews<'a>,
 }
 
 impl<'a> PaintInput<'a> {
@@ -2083,6 +2236,7 @@ impl<'a> PaintInput<'a> {
             limit: None,
             warn_hint: false,
             variable_values: None,
+            numbers: crate::panel::NumberViews::default(),
         }
     }
 }
@@ -2189,6 +2343,7 @@ pub fn paint_to_dc_with_preview(
         warn_hint: input.warn_hint,
         var_values: input.variable_values,
         fields: input.fields,
+        numbers: input.numbers,
         preview: preview.as_ref().map(|(b, w, h)| (b, *w, *h)),
         quality: input.quality,
     }
@@ -2695,7 +2850,6 @@ mod tests {
             right: item.right - pad,
             bottom: item.bottom,
         };
-        let muted = fill_rgb(152, 157, 161);
         // Stated as a ceiling rather than as "some pixel is near --muted": the closest-pixel search
         // passes on an antialiased edge of text drawn in any colour, which is how this assertion
         // missed a value drawn in the label's colour. Nothing in the value's band may be brighter
@@ -2960,6 +3114,36 @@ let surface = fill_rgb(23, 23, 28);
             (icon.right - 1, icon.bottom - 1),
         ] {
             assert_not_any(&px, x, y, &[want], 40, "a corner of the close glyph's box");
+        }
+    }
+
+    /// The minimize glyph is the same 14 dip baked icon in the same button colour, one header gap
+    /// to the left of the close. Sampled the way the close is: an absolute colour at the middle of
+    /// its box, and clean corners, which is what tells a single bar from a painted block.
+    #[test]
+    fn the_minimize_glyph_is_drawn_in_the_buttons_colour() {
+        let canvas = Canvas::new_at(1840, 1040, 192.0);
+        canvas.render();
+        let px = canvas.pixels();
+        let rects = DEMO.rects(2.0);
+        let icon = crate::panel::field::minimize_icon_rect(&DEMO, &rects, 2.0);
+        let want = blend(DEMO_PALETTE.muted, [23, 23, 28, 255]);
+        let middle = ((icon.left + icon.right) / 2, (icon.top + icon.bottom) / 2);
+        assert_px(
+            &px,
+            middle.0,
+            middle.1,
+            want,
+            12,
+            "the bar of the minimize glyph crosses the middle of its box",
+        );
+        for (x, y) in [
+            (icon.left, icon.top),
+            (icon.right - 1, icon.top),
+            (icon.left, icon.bottom - 1),
+            (icon.right - 1, icon.bottom - 1),
+        ] {
+            assert_not_any(&px, x, y, &[want], 40, "a corner of the minimize glyph's box");
         }
     }
 

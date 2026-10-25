@@ -7,7 +7,7 @@
 pub const ICON_BAKED_PX: u32 = 96;
 
 /// How many glyphs are available to panel components.
-pub const ICON_COUNT: usize = 13;
+pub const ICON_COUNT: usize = 14;
 
 /// A panel glyph baked from `assets/icon/*.svg`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +40,10 @@ pub enum Glyph {
     Braces = 11,
     /// An info circle, for the size row's over-resolution hint (.warn-hint, :622).
     InfoCircle = 12,
+    /// A single bar, for the panel's minimize button. The mockup's header has only the close
+    /// button (`:474`), so this one has no design row of its own: it is the same 14 dip glyph in
+    /// the same 26 dip button, to the left of the close.
+    Minus = 13,
 }
 
 impl Glyph {
@@ -57,6 +61,7 @@ impl Glyph {
         Self::FolderOpen,
         Self::Braces,
         Self::InfoCircle,
+        Self::Minus,
     ];
 
     pub const fn index(self) -> usize {
@@ -78,6 +83,7 @@ impl Glyph {
             Self::FolderOpen => "folder-open",
             Self::Braces => "braces",
             Self::InfoCircle => "info-circle",
+            Self::Minus => "minus",
         }
     }
 
@@ -97,6 +103,7 @@ impl Glyph {
             Self::FolderOpen => include_bytes!("../../../../assets/icon/folder-open.png"),
             Self::Braces => include_bytes!("../../../../assets/icon/braces.png"),
             Self::InfoCircle => include_bytes!("../../../../assets/icon/info-circle.png"),
+            Self::Minus => include_bytes!("../../../../assets/icon/minus.png"),
         }
     }
 
@@ -121,6 +128,7 @@ impl Glyph {
             Self::FolderOpen => include_bytes!("../../../../assets/icon/folder-open.rgba"),
             Self::Braces => include_bytes!("../../../../assets/icon/braces.rgba"),
             Self::InfoCircle => include_bytes!("../../../../assets/icon/info-circle.rgba"),
+            Self::Minus => include_bytes!("../../../../assets/icon/minus.rgba"),
         }
     }
 }

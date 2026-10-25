@@ -262,3 +262,82 @@ fn a_closed_menu_hides_nothing() {
         "and the fields it does not cover stay visible"
     );
 }
+
+/// The minimize button is the close button's size, one header gap to its left, and it stays inside
+/// the header at every density. The gap is absolute rather than derived from the two rectangles, so
+/// a wrong constant cannot hide behind the arithmetic that also uses it: it is the number the design
+/// gives for two small buttons on one line (`.row-header-actions { gap: 8px }`, `:224`), and it is
+/// asserted to be the same token the size row already reads rather than a second 8 that happens to
+/// agree today.
+#[test]
+fn the_minimize_button_sits_one_gap_left_of_the_close() {
+    assert_eq!(crate::panel::HEADER_BUTTON_GAP_DIP, 8, ":224");
+    assert_eq!(
+        crate::panel::HEADER_BUTTON_GAP_DIP,
+        SIZE_MODE_GAP_DIP,
+        "the header gap and the size row's gap are one token, not two numbers that agree"
+    );
+    for scale in [1.0_f32, 1.25, 1.5, 2.0] {
+        let metrics = DEMO;
+        let rects = metrics.rects(scale);
+        let px = |dip: i32| (dip as f32 * scale).round() as i32;
+        let (close, minimize) = (rects.close, rects.minimize);
+        assert_eq!(
+            (minimize.width(), minimize.height()),
+            (close.width(), close.height()),
+            "the two header buttons are the same size at {scale}"
+        );
+        assert_eq!(
+            close.left - minimize.right,
+            px(crate::panel::HEADER_BUTTON_GAP_DIP),
+            "one header gap between them at {scale}"
+        );
+        assert_eq!(
+            (minimize.top, minimize.bottom),
+            (close.top, close.bottom),
+            "they share the header's line at {scale}"
+        );
+        assert!(
+            minimize.left >= 0 && minimize.top >= 0 && minimize.bottom <= rects.header.bottom,
+            "the minimize button stays inside the header at {scale}: {minimize:?}"
+        );
+        assert!(
+            minimize.right <= close.left,
+            "the two buttons cannot overlap at {scale}"
+        );
+    }
+}
+
+/// The picture and the target are different rectangles, the same way they are for the close, so
+/// aiming at a corner does not require hitting the 14 dip glyph; and a point on one button is never
+/// also a point on the other.
+#[test]
+fn the_minimize_button_answers_only_inside_itself() {
+    let metrics = DEMO;
+    for scale in [1.0_f32, 1.25, 1.5, 2.0] {
+        let rects = metrics.rects(scale);
+        let button = rects.minimize;
+        let middle = ((button.left + button.right) / 2, (button.top + button.bottom) / 2);
+        assert!(
+            minimize_button_contains(&rects, scale, middle),
+            "the middle of the button is the button at {scale}"
+        );
+        assert!(minimize_button_contains(&rects, scale, (button.left, button.top)));
+        assert!(
+            !minimize_button_contains(&rects, scale, (button.left - 1, middle.1)),
+            "one pixel left of the button is not the button at {scale}"
+        );
+        assert!(
+            !minimize_button_contains(&rects, scale, (button.right, middle.1)),
+            "the right edge belongs to the gap at {scale}"
+        );
+        let close_middle = (
+            (rects.close.left + rects.close.right) / 2,
+            (rects.close.top + rects.close.bottom) / 2,
+        );
+        assert!(
+            minimize_button_contains(&rects, scale, close_middle) == false,
+            "a click on the close is not a click on the minimize at {scale}"
+        );
+    }
+}
