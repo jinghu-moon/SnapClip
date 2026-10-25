@@ -765,6 +765,7 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
         // handler tests the chips the paint drew, and three words of different lengths make three
         // chips of different widths.
         let path_chips = measure_path_chips(hwnd, renderer.as_ref());
+    let after_chips = measure_after_chips(hwnd, renderer.as_ref());
         // The size row's four shortcuts, measured here for the same reason: a click on `50%` has to
         // land on the chip the paint drew, and each chip is as wide as its own word.
         let size_presets = measure_size_presets(hwnd, renderer.as_ref());
@@ -819,6 +820,8 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
             // Both menus start closed: the panel opens on the form, not on a popup.
             var_open: false,
             path_chips,
+        after_chips,
+        after: [false; 2],
             size_presets,
         size_mode: snapclip_ui::panel::SIZE_MODE_CHOSEN,
         size_mode_widths,
@@ -1114,6 +1117,11 @@ struct WindowState {
     /// Measured once beside the footer's, for the same reason: the click handler tests the chips
     /// that were drawn rather than a second measurement of the same three words.
     path_chips: [i32; 3],
+    /// The two after-save switches' widths, measured once like the buttons above.
+    after_chips: snapclip_ui::panel::AfterChips,
+    /// Which of them are switched on (`:573`, `:574`). The work they stand for runs when a
+    /// save succeeds, so a switch is a promise about the save rather than an action of its own.
+    after: [bool; 2],
     /// The four size shortcuts' widths, in the design's order (`:615`–`:618`), measured once beside
     /// the footer's for the same reason: the click handler tests the chips the paint drew.
     size_presets: [i32; 4],
@@ -1260,6 +1268,21 @@ fn measure_path_chips(
     }
 }
 
+/// The after-save switches' widths and the label they follow, measured once like the buttons above.
+fn measure_after_chips(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    renderer: Option<&snapclip_ui::panel::PanelRenderer>,
+) -> snapclip_ui::panel::AfterChips {
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96) as f32;
+    match renderer.map(|renderer| renderer.measure_after_chips(dpi)) {
+        Some(Ok(chips)) => chips,
+        Some(Err(error)) => {
+            eprintln!("[save-panel] could not measure the after-save switches: {error:?}");
+            snapclip_ui::panel::AfterChips { label: 0, widths: [0; 2] }
+        }
+        None => snapclip_ui::panel::AfterChips { label: 0, widths: [0; 2] },
+    }
+}
 /// The four size shortcuts' widths, measured once like the buttons above.
 fn measure_size_presets(
     hwnd: windows_sys::Win32::Foundation::HWND,
@@ -1645,8 +1668,36 @@ fn shortcut_command(command: usize) -> Option<Shortcut> {
 /// The footer's save button and the `Enter` key both land here, so the two cannot disagree about
 /// what a save does: success closes the panel, and a rejection leaves it open with the reason in the
 /// footer, which is what `docs/41` A12 is about.
+/// The two switches' work, done once a save succeeds (`:15`, `:573`, `:574`).
+///
+/// The path is the one the save wrote rather than one assembled here, so what is copied or
+/// revealed cannot be a different file from the one that landed.
+fn run_after_save(hwnd: windows_sys::Win32::Foundation::HWND, path: &std::path::Path) {
+    let after = state(hwnd).map(|s| s.after).unwrap_or([false; 2]);
+    if after[0] {
+        match crate::clipboard::SystemClipboard.copy_text(&path.display().to_string()) {
+            Ok(()) => eprintln!("[save-panel] copied the saved path: {}", path.display()),
+            Err(error) => eprintln!("[save-panel] could not copy the saved path: {error}"),
+        }
+    }
+    if after[1] {
+        // The shell's own selection verb, so the file is selected rather than the folder merely
+        // opened. /select, takes the path verbatim.
+        match std::process::Command::new("explorer")
+            .arg(format!("/select,{}", path.display()))
+            .spawn()
+        {
+            Ok(_) => eprintln!("[save-panel] revealed the saved file: {}", path.display()),
+            Err(error) => eprintln!("[save-panel] could not reveal the saved file: {error}"),
+        }
+    }
+}
+
 fn attempt_save(hwnd: windows_sys::Win32::Foundation::HWND) {
-    if save_from_panel(hwnd).is_some() {
+    if let Some(outcome) = save_from_panel(hwnd) {
+        // The switches ask for work that only makes sense once the file exists, so they run
+        // here rather than when they are pressed.
+        run_after_save(hwnd, &outcome.path);
         // The picture exists, so the panel has nothing left to ask.
         unsafe {
             windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -2834,10 +2885,12 @@ fn create_field_edit(
 
         let dpi = GetDpiForWindow(parent).max(96);
         let scale = f64::from(dpi) / 96.0;
-        let inset = (f64::from(snapclip_ui::panel::EDIT_INSET_DIP) * scale).round() as i32;
 
+        // A native control is set in the system face: the panel's embedded subset was cut down
+        // by `pyftsubset`, which strips the hinting GDI needs, and a control set in it rendered
+        // with visible aliasing beside the panel's own smooth text.
         let family_name = match face {
-            snapclip_ui::panel::FieldFace::Text => snapclip_ui::panel::FAMILY,
+            snapclip_ui::panel::FieldFace::Text => snapclip_ui::panel::NATIVE_FAMILY,
             snapclip_ui::panel::FieldFace::Number => snapclip_ui::panel::NUMBER_FAMILY,
         };
         let family: Vec<u16> = family_name
@@ -2868,6 +2921,11 @@ fn create_field_edit(
             family.as_ptr(),
         );
 
+        // The control is inset horizontally and only as tall as its text, centred in the frame:
+        // a single line edit draws its text against the top of its client, so a control as tall as
+        // the frame put the text against the frame's top edge.
+        let control = snapclip_ui::panel::edit_control_rect(field, height.abs(), scale as f32);
+
         let class: Vec<u16> = "EDIT\0".encode_utf16().collect();
         let text: Vec<u16> = format!("{text}\0").encode_utf16().collect();
         let edit = CreateWindowExW(
@@ -2881,10 +2939,10 @@ fn create_field_edit(
                 | WS_TABSTOP
                 | ES_AUTOHSCROLL as u32
                 | if face.right_aligned() { ES_RIGHT as u32 } else { 0 },
-            field.left + inset,
-            field.top + inset,
-            (field.right - field.left - inset * 2).max(1),
-            (field.bottom - field.top - inset * 2).max(1),
+            control.left,
+            control.top,
+            (control.right - control.left).max(1),
+            (control.bottom - control.top).max(1),
             parent,
             std::ptr::null_mut(),
             GetModuleHandleW(std::ptr::null()),
@@ -3114,6 +3172,8 @@ extern "system" fn window_proc(
                                 var_open: s.var_open,
                                 context: s.context,
                                 path_chips: Some(s.path_chips),
+        after_chips: Some(s.after_chips),
+        after: s.after,
                                 size_presets: Some(s.size_presets),
                                 size_mode: s.size_mode,
                                 size_mode_widths: Some(s.size_mode_widths),
@@ -3396,6 +3456,18 @@ extern "system" fn window_proc(
                     if let Some(directory) = shortcut_directory(index) {
                         set_directory(hwnd, &directory);
                     }
+                    return 0;
+                }
+                // The two after-save switches. They are switches (`:573`, `:574`), so a click
+                // turns one on or off, and the work it stands for runs when a save succeeds.
+                if let Some(index) = state(hwnd)
+                    .map(|s| s.after_chips.at(&metrics, &rects, scale, point))
+                    .unwrap_or(None)
+                {
+                    if let Some(s) = state_mut(hwnd) {
+                        s.after[index] = !s.after[index];
+                    }
+                    windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0);
                     return 0;
                 }
             }
@@ -4099,6 +4171,8 @@ mod tests {
             status: None,
             var_open: false,
             path_chips: [40, 52, 64],
+            after_chips: snapclip_ui::panel::AfterChips { label: 40, widths: [40, 52] },
+            after: [false; 2],
             size_presets: [40, 36, 36, 36],
             size_mode: snapclip_ui::panel::SIZE_MODE_CHOSEN,
             size_mode_widths: [56, 64],
@@ -4581,6 +4655,8 @@ mod tests {
             status: None,
             var_open: false,
             path_chips: [40, 52, 64],
+            after_chips: snapclip_ui::panel::AfterChips { label: 40, widths: [40, 52] },
+            after: [false; 2],
             size_presets: [40, 36, 36, 36],
         size_mode: snapclip_ui::panel::SIZE_MODE_CHOSEN,
         size_mode_widths: [56, 64],
@@ -4662,6 +4738,8 @@ mod tests {
             status: None,
             var_open: false,
             path_chips: [40, 52, 64],
+            after_chips: snapclip_ui::panel::AfterChips { label: 40, widths: [40, 52] },
+            after: [false; 2],
             size_presets: [40, 36, 36, 36],
         size_mode: snapclip_ui::panel::SIZE_MODE_CHOSEN,
         size_mode_widths: [56, 64],
@@ -4747,6 +4825,8 @@ mod tests {
             status: None,
             var_open: false,
             path_chips: [40, 52, 64],
+            after_chips: snapclip_ui::panel::AfterChips { label: 40, widths: [40, 52] },
+            after: [false; 2],
             size_presets: [40, 36, 36, 36],
         size_mode: snapclip_ui::panel::SIZE_MODE_CHOSEN,
         size_mode_widths: [56, 64],
@@ -4981,6 +5061,8 @@ mod tests {
             status: None,
             var_open: false,
             path_chips: [40, 52, 64],
+            after_chips: snapclip_ui::panel::AfterChips { label: 40, widths: [40, 52] },
+            after: [false; 2],
             size_presets: [40, 36, 36, 36],
         size_mode: snapclip_ui::panel::SIZE_MODE_CHOSEN,
         size_mode_widths: [56, 64],

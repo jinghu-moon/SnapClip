@@ -341,3 +341,79 @@ fn the_minimize_button_answers_only_inside_itself() {
         );
     }
 }
+/// The control's own rectangle: inset horizontally, and only as tall as its text, centred.
+///
+/// Absolute numbers rather than the constants compared with each other, because the defect this
+/// guards against was a control as tall as the frame with its text against the top edge — a
+/// relationship the two constants cannot state.
+#[test]
+fn a_native_control_is_inset_and_centred_at_its_text_height() {
+    let frame = Rect::new(100, 200, 320, 248);
+    let control = edit_control_rect(frame, 16, 1.0);
+    assert_eq!(control.left, 102, "one and a half dip in from the frame at 1x");
+    assert_eq!(control.right, 318, "and one and a half dip from the other side");
+    assert_eq!(control.bottom - control.top, 16, "only as tall as its text");
+    assert_eq!(control.top, 216, "centred in a forty eight dip frame");
+    // The height is the font's, so the text is not pushed against an edge: the two gaps above and
+    // below are equal save for the rounding an odd remainder forces.
+    let above = control.top - frame.top;
+    let below = frame.bottom - control.bottom;
+    assert!(
+        (above - below).abs() <= 1,
+        "the text sits in the middle: {above} above, {below} below"
+    );
+}
+
+/// A native control asks for a system face, not the panel's subset.
+///
+/// The subset was cut down by pyftsubset, which strips the hinting GDI needs, so a control set in
+/// it renders aliased beside the panel's own smooth text. The two names must stay apart.
+#[test]
+fn a_native_control_asks_for_a_system_face_rather_than_the_embedded_one() {
+    assert_ne!(
+        NATIVE_FAMILY,
+        crate::panel::theme::FAMILY,
+        "a native control cannot be set in the subset, which has no hinting for GDI"
+    );
+    assert!(
+        !NATIVE_FAMILY.is_empty(),
+        "the system face has to be named for the control to be created at all"
+    );
+}
+
+/// The two after-save switches are hit where they are drawn, and the gap between them belongs to
+/// neither.
+#[test]
+fn the_after_save_switches_are_hit_where_they_are_drawn() {
+    let metrics = DEMO;
+    for scale in [1.0f32, 1.25, 1.5, 2.0] {
+        let rects = metrics.rects(scale);
+        let chips = AfterChips { label: (40.0 * scale).round() as i32, widths: [(52.0 * scale).round() as i32, (64.0 * scale).round() as i32] };
+        for index in 0..2 {
+            let rect = chips.rect(&metrics, &rects, scale, index);
+            let middle = ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
+            assert_eq!(
+                chips.at(&metrics, &rects, scale, middle),
+                Some(index),
+                "the middle of switch {index} is that switch at {scale}"
+            );
+        }
+        let first = chips.rect(&metrics, &rects, scale, 0);
+        let second = chips.rect(&metrics, &rects, scale, 1);
+        assert_eq!(
+            chips.at(&metrics, &rects, scale, (first.right, (first.top + first.bottom) / 2)),
+            None,
+            "the right edge is the gap, not the next switch, at {scale}"
+        );
+        assert_eq!(
+            chips.at(&metrics, &rects, scale, (second.left, (second.top + second.bottom) / 2)),
+            Some(1),
+            "the next switch starts at its own left edge, at {scale}"
+        );
+        assert_eq!(
+            chips.at(&metrics, &rects, scale, (second.right + 8, (second.top + second.bottom) / 2)),
+            None,
+            "a point past the last switch hits neither at {scale}"
+        );
+    }
+}

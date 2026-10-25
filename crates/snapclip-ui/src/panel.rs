@@ -51,7 +51,8 @@ pub use fonts::{
     register_number_font,
 };
 pub use field::{
-    EDIT_FONT_DIP, EDIT_INSET_DIP, EDIT_PADDING_DIP, FieldColours, FieldFace, FieldId, FieldState,
+    EDIT_FONT_DIP, EDIT_INSET_DIP, EDIT_PADDING_DIP, NATIVE_FAMILY, AfterChips, edit_control_rect,
+    FieldColours, FieldFace, FieldId, FieldState,
     FieldStates, FORM_ROWS,
     problem_of, WARNING_RGBA,
     FMT_BUTTON_DIP, FMT_CHECK_DIP, FMT_CHEV_DIP, FMT_GAP_DIP, FMT_ITEM_DIP, FMT_MENU_DIP, FMT_RADIUS_DIP, FMT_RING_DIP,

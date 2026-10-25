@@ -376,9 +376,17 @@ fn field_brushes(
         crate::panel::FieldState::Warning,
     ] {
         let colours = crate::panel::field_colours(state, palette.surface);
-        for rgba in [Some(colours.border), Some(colours.text), colours.inset]
-            .into_iter()
-            .flatten()
+        // The fill belongs in this table: the frame paints a field's face with the state's own fill
+        // so it matches what the native control is given, and a table that lacked it silently drew
+        // no face at all.
+        for rgba in [
+            Some(colours.fill),
+            Some(colours.border),
+            Some(colours.text),
+            colours.inset,
+        ]
+        .into_iter()
+        .flatten()
         {
             if rgba[3] == 0 || made.iter().any(|(colour, _)| *colour == rgba) {
                 continue;
@@ -526,6 +534,9 @@ pub struct Frame<'a> {
     pub size_mode_widths: Option<[i32; 2]>,
     /// The size limit and the estimate, or `None` when this painter shows neither.
     pub limit: Option<LimitView<'a>>,
+    /// The after-save switches: their widths when the caller measured them, and which are on.
+    pub after_chips: Option<crate::panel::AfterChips>,
+    pub after: [bool; 2],
     /// The quality row's hint (`.hint-text`, ten dip, `:262`): the line that takes the segmented
     /// control's place when the format has no quality tier (`:638`, `:639`).
     pub hint: Option<&'a IDWriteTextFormat>,
@@ -715,7 +726,12 @@ impl Frame<'_> {
             }
             let field = id.frame_rect(self.metrics, self.rects, self.scale, self.path_change);
             let colours = crate::panel::field_colours(state, self.brushes.surface_rgba());
-            painter.fill_round(field, field_radius, &self.brushes.field_fill);
+            // The fill has to be the state's own, because the native control inside this frame is
+            // painted with exactly that colour: a single idle fill here left a bright square patch
+            // wherever the control's fill disagreed with the frame's.
+            if let Some(fill) = self.brushes.field_brush(colours.fill) {
+                painter.fill_round(field, field_radius, fill);
+            }
 
             // `:167` idle is transparent, so this branch simply does not run there.
             if let Some(border) = self.brushes.field_brush(colours.border) {
@@ -1202,11 +1218,19 @@ impl Frame<'_> {
             let label_width = painter
                 .measure_text_width(crate::panel::field::Row::Saved.label(), row_format)?
                 .round() as i32;
-            let mut widths = [0i32; 2];
-            for (index, word) in crate::panel::field::AFTER_CHIP_WORDS.iter().enumerate() {
-                let measured = painter.measure_text_width(word, chip_format)?.round() as i32;
-                widths[index] = crate::panel::after_chip_width(self.scale, measured);
-            }
+            // The caller's measurement when it measured, so the two switches are drawn where they
+            // are hit; measured here otherwise, for callers that never click them.
+            let widths = match self.after_chips {
+                Some(chips) => chips.widths,
+                None => {
+                    let mut measured = [0i32; 2];
+                    for (index, word) in crate::panel::field::AFTER_CHIP_WORDS.iter().enumerate() {
+                        let width = painter.measure_text_width(word, chip_format)?.round() as i32;
+                        measured[index] = crate::panel::after_chip_width(self.scale, width);
+                    }
+                    measured
+                }
+            };
             // `.chip { border-radius: 999px }` (`:192`): a pill, whose radius is half its height.
             let height = (crate::panel::field::AFTER_CHIP_HEIGHT_DIP as f32 * self.scale).round();
             let radius = (height / 2.0).round() as i32;
@@ -1219,8 +1243,15 @@ impl Frame<'_> {
                     widths,
                     index,
                 );
-                painter.stroke_round(rect, radius, &self.brushes.line_soft, line);
-                painter.draw_text(word, chip_format, rect, &self.brushes.muted);
+                // A switch that is on takes the accent fill and the text that sits on it (`:15`);
+                // off is the chip's own outline with a muted word (`:192`).
+                if self.after[index] {
+                    painter.fill_round(rect, radius, &self.brushes.accent);
+                    painter.draw_text(word, chip_format, rect, &self.brushes.accent_text);
+                } else {
+                    painter.stroke_round(rect, radius, &self.brushes.line_soft, line);
+                    painter.draw_text(word, chip_format, rect, &self.brushes.muted);
+                }
             }
         }
 
@@ -2038,6 +2069,28 @@ pub fn measure_path_chips(dwrite: &IDWriteFactory, dpi: f32) -> Result<[i32; 3]>
     Ok(widths)
 }
 
+/// The after-save switches' measurement: the label they follow and each switch's own width, taken
+/// with the format that draws them so the window can hit-test what the painter drew.
+pub fn measure_after_chips(
+    dwrite: &IDWriteFactory,
+    dpi: f32,
+) -> Result<crate::panel::AfterChips> {
+    let scale = (dpi / 96.0).max(0.5);
+    let label_format = row_label_format(dwrite, dpi)?;
+    let format = chip_format(dwrite, dpi)?;
+    let label = crate::panel::d2d::measure_text_width(
+        dwrite,
+        crate::panel::field::Row::Saved.label(),
+        &label_format,
+    )?
+    .round() as i32;
+    let mut widths = [0i32; 2];
+    for (index, word) in crate::panel::field::AFTER_CHIP_WORDS.iter().enumerate() {
+        let measured = crate::panel::d2d::measure_text_width(dwrite, word, &format)?.round() as i32;
+        widths[index] = crate::panel::field::after_chip_width(scale, measured);
+    }
+    Ok(crate::panel::AfterChips { label, widths })
+}
 /// The path row's `更改` button width, measured the way the painter measures it.
 ///
 /// The button is a word with twelve dip of padding (`:189`), and the input gives up exactly this
@@ -2382,6 +2435,12 @@ pub struct PaintInput<'a> {
     pub size_mode_widths: Option<[i32; 2]>,
     /// The size limit and the estimate, or `None` when this painter shows neither.
     pub limit: Option<LimitView<'a>>,
+    /// The two after-save switches' widths, measured by the caller so the rectangle that is drawn is
+    /// the rectangle that is hit. Measured here when absent, for callers that never click them.
+    pub after_chips: Option<crate::panel::AfterChips>,
+    /// Which of them are switched on (`:573`, `:574`). They are switches rather than buttons: the
+    /// action they stand for runs when a save succeeds, not when they are pressed.
+    pub after: [bool; 2],
     /// Whether the size row's over-resolution hint belongs on screen: either side of the output is
     /// larger than the capture (`field::warn_hint_shown`).
     ///
@@ -2430,6 +2489,8 @@ impl<'a> PaintInput<'a> {
             size_mode: crate::panel::SIZE_MODE_CHOSEN,
             size_mode_widths: None,
             limit: None,
+            after_chips: None,
+            after: [false; 2],
             warn_hint: false,
             variable_values: None,
             numbers: crate::panel::NumberViews::default(),
@@ -2540,6 +2601,8 @@ pub fn paint_to_dc_with_preview(
         size_mode: input.size_mode,
         limit: input.limit,
         size_mode_widths: input.size_mode_widths,
+        after_chips: input.after_chips,
+        after: input.after,
         hint: Some(&hint),
         preset_label: Some(&preset_label),
         warn_hint: input.warn_hint,
@@ -5305,6 +5368,10 @@ impl PanelRenderer {
 
     /// The three shortcut chips' widths, for the same reason: the click handler tests the chips the
     /// paint drew rather than a second measurement of the same words.
+    /// The after-save switches' widths and the label they follow, for the same reason.
+    pub fn measure_after_chips(&self, dpi: f32) -> Result<crate::panel::AfterChips> {
+        measure_after_chips(&self.dwrite, dpi)
+    }
     pub fn measure_path_chips(&self, dpi: f32) -> Result<[i32; 3]> {
         measure_path_chips(&self.dwrite, dpi)
     }

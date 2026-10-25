@@ -50,6 +50,31 @@ pub fn edit_font_height(scale: f32) -> i32 {
     edit_font_height_for(scale, EDIT_FONT_DIP)
 }
 
+/// The face a native control asks for, which is not the face the panel draws in.
+///
+/// The panel's own text goes through DirectWrite and can use the embedded subset, but GDI — which
+/// is what draws inside a native `EDIT` — wants the hinting and the embedded bitmaps that a subset
+/// built by `pyftsubset` no longer carries. Setting a control in the subset produced text with
+/// visible aliasing beside the panel's own smooth text. The system's UI face has the hinting, and
+/// covers Chinese, which is what this box has to accept.
+pub const NATIVE_FAMILY: &str = "Microsoft YaHei UI";
+
+/// The rectangle a native text control occupies inside its frame.
+///
+/// Horizontally it gives up `EDIT_INSET_DIP` on each side, which is the border plus enough of the
+/// corner that its square corners fall inside the frame's arc. Vertically it is only as tall as its
+/// text and centred in the frame, because a single line edit draws its text at the top of its
+/// client and has no way to centre it itself — the control used to fill the frame and its text sat
+/// against the top edge.
+pub fn edit_control_rect(frame: Rect, text_height: i32, scale: f32) -> Rect {
+    let inset = (EDIT_INSET_DIP * scale).round() as i32;
+    let height = text_height.abs().max(1);
+    let left = frame.left + inset;
+    let right = frame.right - inset;
+    let top = frame.top + ((frame.bottom - frame.top) - height) / 2;
+    Rect::new(left, top, right, top + height)
+}
+
 /// `--r-input: 6px` — `save-panel-demo-v3.html:54`. The frame's corner; the native child is inset
 /// so this is the corner the user actually sees.
 pub const INPUT_RADIUS_DIP: f32 = 6.0;
@@ -2877,7 +2902,45 @@ pub fn path_chip_at(
         .find(|index| rect_contains(path_chip_rect(metrics, rects, scale, widths, *index), point))
 }
 
-/// The variable button inside the name field (`:213`), which opens the token menu.
+
+/// The variable button inside the name field (`:213`), which opens the token menu./// The after-save switches' geometry (`:573`, `:574`): the label's width and each switch's
+/// width, measured by the code that draws them so that the rectangle drawn is the rectangle hit.
+///
+/// One value rather than two arguments, because the label's width and the switches' widths are
+/// always needed together and a pair of same-typed numbers passed side by side is how they get
+/// swapped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AfterChips {
+    /// The width of the 保存后 label the switches follow.
+    pub label: i32,
+    /// Each switch's own width, in AFTER_CHIP_WORDS order.
+    pub widths: [i32; 2],
+}
+
+impl AfterChips {
+    /// Where the switch at index is drawn, and therefore where it is clicked.
+    pub fn rect(
+        &self,
+        metrics: &FrameMetrics,
+        rects: &FrameRects,
+        scale: f32,
+        index: usize,
+    ) -> Rect {
+        after_chip_rect(metrics, rects, scale, self.label, self.widths, index)
+    }
+
+    /// Which switch a point lands on, or None.
+    pub fn at(
+        &self,
+        metrics: &FrameMetrics,
+        rects: &FrameRects,
+        scale: f32,
+        point: (i32, i32),
+    ) -> Option<usize> {
+        (0..self.widths.len())
+            .find(|index| rect_contains(self.rect(metrics, rects, scale, *index), point))
+    }
+}
 pub fn name_wand_contains(
     metrics: &FrameMetrics,
     rects: &FrameRects,
