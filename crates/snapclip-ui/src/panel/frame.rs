@@ -547,6 +547,14 @@ pub struct Frame<'a> {
     /// The three numbers the panel draws itself, with their selections and carets, in the fields a
     /// native control used to occupy (`text_field.rs`).
     pub numbers: crate::panel::NumberViews<'a>,
+    /// The name box's right-click menu while it is open.
+    ///
+    /// A native text box draws a light context menu over a dark panel, and the panel cannot recolour
+    /// it. This one is the panel's own: the same surface, the same border, the four commands a text
+    /// box has. The rectangles come from the window, so the row a click lands on is the row drawn.
+    pub context: Option<crate::panel::ContextMenuView>,
+    /// The context menu's label format (`.var-item`, twelve dip, `:219` — the panel's menu face).
+    pub context_label: Option<&'a IDWriteTextFormat>,
 }
 
 impl Frame<'_> {
@@ -1517,6 +1525,58 @@ impl Frame<'_> {
         // order between them is a statement about nothing, and the last thing drawn is the one that
         // would win if both ever were.
         self.paint_variables(painter)?;
+        // The right-click menu last of all: it is anchored at the click, so it can cover any control
+        // the panel draws, and it is open one at a time with the other two.
+        self.paint_context(painter)?;
+        Ok(())
+    }
+
+    /// The name box's right-click menu, drawn only while it is open.
+    ///
+    /// It is the panel's own menu because a native one is light, and the panel cannot recolour the
+    /// system's. The geometry is the window's, so what a click hits is what this drew.
+    fn paint_context(&self, painter: &PanelPainter) -> Result<()> {
+        let Some(context) = self.context else {
+            return Ok(());
+        };
+        let Some(label) = self.context_label else {
+            return Ok(());
+        };
+        // The same dip-to-pixel rule the geometry uses (`FrameMetrics::rects`): rounding, once.
+        let px = |dip: i32| (dip as f32 * self.scale).round() as i32;
+        // The same surface, border and radius the format menu uses: a menu is a menu.
+        painter.fill_round(
+            context.menu,
+            crate::panel::FMT_MENU_RADIUS_DIP,
+            &self.brushes.surface,
+        );
+        painter.stroke_round(
+            context.menu,
+            crate::panel::FMT_MENU_RADIUS_DIP,
+            &self.brushes.line,
+            crate::panel::FMT_MENU_LINE_DIP as f32,
+        );
+        for (index, item) in context.items.iter().enumerate() {
+            let inset = Rect {
+                left: item.left + px(crate::panel::CONTEXT_TEXT_PAD_DIP),
+                top: item.top,
+                right: item.right - px(crate::panel::CONTEXT_TEXT_PAD_DIP),
+                bottom: item.bottom,
+            };
+            // A command that cannot act is muted; one that can is the text colour, the way the
+            // format menu distinguishes its chosen row.
+            let brush = if context.enabled[index] {
+                &self.brushes.text
+            } else {
+                &self.brushes.muted
+            };
+            painter.draw_text(
+                crate::panel::CONTEXT_ITEMS[index],
+                label,
+                inset,
+                brush,
+            );
+        }
         Ok(())
     }
 
@@ -1966,6 +2026,22 @@ pub fn measure_path_change(dwrite: &IDWriteFactory, dpi: f32) -> Result<i32> {
 /// Both words are measured because the link shows the action rather than the policy: whichever
 /// policy is in force, the other word is what appears, so a caller that measured one would have the
 /// wrong width half the time.
+/// The right-click menu's width: its widest command plus the menu's own text inset on both sides.
+///
+/// Measured for the same reason every other control's width is: the window hit-tests the rectangles
+/// the painter draws, so one measurement has to reach both, and a menu whose width was guessed would
+/// answer clicks on rows it did not draw.
+pub fn measure_context_menu(dwrite: &IDWriteFactory, dpi: f32) -> Result<i32> {
+    let scale = (dpi / 96.0).max(0.5);
+    let format = var_label_format(dwrite, dpi)?;
+    let mut widest = 0i32;
+    for word in crate::panel::CONTEXT_ITEMS {
+        let measured = crate::panel::d2d::measure_text_width(dwrite, word, &format)?.round() as i32;
+        widest = widest.max(measured);
+    }
+    Ok(widest + 2 * (crate::panel::CONTEXT_TEXT_PAD_DIP as f32 * scale).round() as i32)
+}
+
 pub fn measure_conflict_link(dwrite: &IDWriteFactory, dpi: f32) -> Result<[i32; 2]> {
     let format = status_format(dwrite, dpi)?;
     let mut widths = [0i32; 2];
@@ -2280,6 +2356,9 @@ pub struct PaintInput<'a> {
     /// a caret, a selection colour and a background it never needed, and the box disagreed with the
     /// frame around it. `None` draws nothing, which is what a caller with no path to show wants.
     pub path_text: Option<&'a str>,
+    /// The name box's right-click menu, whose rectangles the window also hit-tests. `None` draws
+    /// no menu, which is the panel's state whenever nothing was right-clicked.
+    pub context: Option<crate::panel::ContextMenuView>,
 }
 
 impl<'a> PaintInput<'a> {
@@ -2310,6 +2389,7 @@ impl<'a> PaintInput<'a> {
             variable_values: None,
             numbers: crate::panel::NumberViews::default(),
             path_text: None,
+            context: None,
         }
     }
 }
@@ -2421,6 +2501,10 @@ pub fn paint_to_dc_with_preview(
         var_values: input.variable_values,
         fields: input.fields,
         numbers: input.numbers,
+        // The context menu's face is the token menu's: both are twelve dip menu rows (`:219`), and
+        // a second identical text format would be a second thing to keep in step.
+        context: input.context,
+        context_label: Some(&var_label),
         preview: preview.as_ref().map(|(b, w, h)| (b, *w, *h)),
         quality: input.quality,
     }
@@ -5180,6 +5264,10 @@ impl PanelRenderer {
         measure_path_chips(&self.dwrite, dpi)
     }
     /// The conflict link's two words, for the same reason: the link drawn is the link clicked.
+    pub fn measure_context_menu(&self, dpi: f32) -> Result<i32> {
+        measure_context_menu(&self.dwrite, dpi)
+    }
+
     pub fn measure_conflict_link(&self, dpi: f32) -> Result<[i32; 2]> {
         measure_conflict_link(&self.dwrite, dpi)
     }

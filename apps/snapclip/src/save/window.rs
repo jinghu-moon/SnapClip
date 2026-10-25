@@ -810,6 +810,7 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
             path_change,
             format: 0,
             format_open: false,
+            context: None,
             // Handed over rather than created here: the template and the counter are shared by every
             // panel of this shell, and a panel that made its own would start from the default again.
             remembered: options.remembered.clone(),
@@ -1094,6 +1095,10 @@ struct WindowState {
     /// Whether the token menu is open. Only one menu is open at a time, and opening this one closes
     /// the format's, because two popups over one form would be a puzzle rather than a menu.
     var_open: bool,
+    /// The name box's right-click menu, while it is open, together with the rectangles a click is
+    /// tested against. `None` is the closed state; the message handler is the only writer, and the
+    /// painter reads it, the division the other two menus already use.
+    context: Option<snapclip_ui::panel::ContextMenuView>,
     /// The three shortcut chips' widths, in the order `PATH_CHIP_WORDS` lists them.
     ///
     /// Measured once beside the footer's, for the same reason: the click handler tests the chips
@@ -1203,6 +1208,26 @@ fn measure_path_change(
         Some(Ok(width)) => width,
         Some(Err(error)) => {
             eprintln!("[save-panel] could not measure the path row's button: {error:?}");
+            0
+        }
+        None => 0,
+    }
+}
+
+/// The right-click menu's width, measured when it opens rather than at every resize.
+///
+/// A menu that is not on screen has no width worth keeping, and a right click is a user action, not a
+/// hot path — so this is measured where it is used instead of being carried in the state like the
+/// widths that decide a click on a control that is always drawn.
+fn measure_context_menu(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    renderer: Option<&snapclip_ui::panel::PanelRenderer>,
+) -> i32 {
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96) as f32;
+    match renderer.map(|renderer| renderer.measure_context_menu(dpi)) {
+        Some(Ok(width)) => width,
+        Some(Err(error)) => {
+            eprintln!("[save-panel] could not measure the context menu: {error:?}");
             0
         }
         None => 0,
@@ -2184,6 +2209,77 @@ fn shortcut_directory(index: usize) -> Option<String> {
     Some(directory)
 }
 
+/// Whether a text box has nothing selected.
+///
+/// `EM_GETSEL` writes the range through two pointers rather than returning it, which is why this is
+/// not a one-liner at the call site.
+fn selection_is_empty(control: windows_sys::Win32::Foundation::HWND) -> bool {
+    const EM_GETSEL: u32 = 0x00B0;
+    if control.is_null() {
+        return true;
+    }
+    let mut start: u32 = 0;
+    let mut end: u32 = 0;
+    unsafe {
+        let _ = windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(
+            control,
+            EM_GETSEL,
+            &mut start as *mut u32 as usize,
+            &mut end as *mut u32 as isize,
+        );
+    }
+    start == end
+}
+
+/// Run one command from the name box's right-click menu by asking the control to do it.
+///
+/// The messages rather than the text: the box owns its undo history and its clipboard handling, and
+/// rewriting its text from outside would leave both wrong. A command that cannot act does nothing,
+/// which is what a dimmed row means.
+fn run_context_command(hwnd: windows_sys::Win32::Foundation::HWND, index: usize) -> bool {
+    const WM_CUT: u32 = 0x0300;
+    const WM_COPY: u32 = 0x0301;
+    const WM_PASTE: u32 = 0x0302;
+    const EM_SETSEL: u32 = 0x00B1;
+    let Some(state) = state(hwnd) else {
+        return false;
+    };
+    let enabled = state
+        .context
+        .map(|context| context.enabled.get(index).copied().unwrap_or(false))
+        .unwrap_or(false);
+    let control = state.control(snapclip_ui::panel::FieldId::Name);
+    if !enabled || control.is_null() {
+        return false;
+    }
+    unsafe {
+        match index {
+            0 => {
+                let _ = windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(
+                    control, WM_CUT, 0, 0,
+                );
+            }
+            1 => {
+                let _ = windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(
+                    control, WM_COPY, 0, 0,
+                );
+            }
+            2 => {
+                let _ = windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(
+                    control, WM_PASTE, 0, 0,
+                );
+            }
+            _ => {
+                // `EM_SETSEL` with -1 selects everything: the emulation every text box uses.
+                let _ = windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(
+                    control, EM_SETSEL, 0, -1,
+                );
+            }
+        }
+    }
+    true
+}
+
 /// Hide the native text boxes a menu would be drawn underneath.
 ///
 /// Windows paints a window's children after the window itself, so a menu the frame draws cannot
@@ -2199,7 +2295,11 @@ fn apply_menu_occlusion(hwnd: windows_sys::Win32::Foundation::HWND) {
     let scale = dpi_scale(hwnd);
     let rects = metrics.rects(scale);
     let window_height = (metrics.panel_height() as f32 * scale).round() as i32;
-    let menu = if state.var_open {
+    // The right-click menu is the only one anchored at a click rather than at a control, and only
+    // one menu is open at a time, so it is asked first.
+    let menu = if let Some(context) = state.context {
+        Some(context.menu)
+    } else if state.var_open {
         Some(snapclip_ui::panel::var_menu_rect(&metrics, &rects, scale))
     } else if state.format_open {
         Some(snapclip_ui::panel::fmt_menu_rect(
@@ -2239,9 +2339,10 @@ fn apply_menu_occlusion(hwnd: windows_sys::Win32::Foundation::HWND) {
     // flags, the rectangle it covers and every box's new visibility on the same line, one real
     // click sequence says whether the state moved and whether the boxes came back.
     eprintln!(
-        "[save-panel] occlusion format_open={} var_open={} menu={:?} hidden={:?} shown={:?}",
+        "[save-panel] occlusion format_open={} var_open={} context_open={} menu={:?} hidden={:?} shown={:?}",
         state.format_open,
         state.var_open,
+        state.context.is_some(),
         menu.map(|rect| (rect.left, rect.top, rect.right, rect.bottom)),
         hidden,
         shown
@@ -2260,9 +2361,10 @@ fn close_menus(hwnd: windows_sys::Win32::Foundation::HWND, why: &str) -> bool {
         let Some(state) = state_mut(hwnd) else {
             return false;
         };
-        let open = state.format_open || state.var_open;
+        let open = state.format_open || state.var_open || state.context.is_some();
         state.format_open = false;
         state.var_open = false;
+        state.context = None;
         open
     };
     if open {
@@ -2693,7 +2795,7 @@ fn create_field_edit(
 ) -> windows_sys::Win32::Foundation::HWND {
     use windows_sys::Win32::Graphics::Gdi::{
         AddFontMemResourceEx, CreateFontW, CLEARTYPE_QUALITY, DEFAULT_CHARSET, FF_DONTCARE,
-        FW_SEMIBOLD,
+        FW_NORMAL,
     };
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
@@ -2742,7 +2844,9 @@ fn create_field_edit(
             0,
             0,
             0,
-            FW_SEMIBOLD as i32,
+            // `.text-input` sets no weight (`:167`), so the control inherits the page's normal
+            // weight. 600 was never in the mockup and made the value look bolder than its label.
+            FW_NORMAL as i32,
             0,
             0,
             0,
@@ -2998,6 +3102,7 @@ extern "system" fn window_proc(
                                 conflict: s.conflict_shown.then(|| conflict_link(s.conflict)),
                                 conflict_widths: Some(s.conflict_widths),
                                 var_open: s.var_open,
+                                context: s.context,
                                 path_chips: Some(s.path_chips),
                                 size_presets: Some(s.size_presets),
                                 size_mode: s.size_mode,
@@ -3071,6 +3176,28 @@ extern "system" fn window_proc(
             } else {
                 snapclip_ui::panel::PointerEvent::Up
             };
+            // A click while the right-click menu is open belongs to it: a command runs and the menu
+            // closes, and a click anywhere else dismisses the menu and does nothing else — the first
+            // click after a menu opens is the menu's, the rule the format menu already follows.
+            if event == snapclip_ui::panel::PointerEvent::Down {
+                if let Some(context) = state(hwnd).and_then(|s| s.context) {
+                    let hit = context.item_at((point.x, point.y));
+                    if let Some(index) = hit {
+                        run_context_command(hwnd, index);
+                        close_menus(hwnd, "a command was chosen");
+                    } else {
+                        close_menus(hwnd, "a click landed outside the context menu");
+                    }
+                    unsafe {
+                        windows_sys::Win32::Graphics::Gdi::InvalidateRect(
+                            hwnd,
+                            std::ptr::null(),
+                            0,
+                        );
+                    }
+                    return 0;
+                }
+            }
             // The close button is drawn by the frame, so its clicks arrive here too. The button is
             // hit tested, not the 14 dip glyph inside it: the mockup's button is 26 dip (`:96`) and
             // its svg is 14 (`:98`), and a corner target should be the size of the thing that looks
@@ -3614,6 +3741,75 @@ extern "system" fn window_proc(
         // `lparam` is the child's handle, and the answer is that child's own entry. Reading one shared
         // state here is what made a focused path row paint the name row's colours, and it would have
         // gone on being wrong for every field added afterwards.
+        // A right click in the name box asks for that box's commands. The system's menu is light and
+        // the panel cannot recolour it, so the panel draws its own (`paint_context`); this only
+        // decides which box asked and where the menu goes.
+        WM_CONTEXTMENU => {
+            let child = wparam as windows_sys::Win32::Foundation::HWND;
+            let is_name = state(hwnd)
+                .and_then(|s| s.field_of(child))
+                .is_some_and(|id| id == snapclip_ui::panel::FieldId::Name);
+            if !is_name {
+                return DefWindowProcW(hwnd, message, wparam, lparam);
+            }
+            // `lParam` is a screen point; the panel draws and hit-tests in its own client pixels.
+            let mut point = windows_sys::Win32::Foundation::POINT {
+                x: (lparam & 0xffff) as i16 as i32,
+                y: ((lparam >> 16) & 0xffff) as i16 as i32,
+            };
+            unsafe {
+                windows_sys::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut point);
+            }
+            let scale = dpi_scale(hwnd);
+            let mut client = windows_sys::Win32::Foundation::RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            unsafe {
+                let _ = windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(
+                    hwnd, &mut client,
+                );
+            }
+            // The width is measured, and measured before the state is borrowed mutably: the menu's
+            // rows are the ones the painter draws, because both come from this one number.
+            let width = match state(hwnd) {
+                Some(s) => measure_context_menu(hwnd, s.renderer.as_ref()),
+                None => 0,
+            };
+            let control = state(hwnd)
+                .map(|s| s.control(snapclip_ui::panel::FieldId::Name))
+                .unwrap_or(std::ptr::null_mut());
+            let menu = snapclip_ui::panel::context_menu_rect(
+                (point.x, point.y),
+                scale,
+                width,
+                client.bottom,
+                client.right,
+            );
+            let items = snapclip_ui::panel::context_item_rects(menu, scale);
+            // Pasting is offered whether or not the clipboard has text: asking the shell would mean a
+            // feature the panel does not otherwise use, and a paste with nothing to paste is the one
+            // no-op Windows itself allows. Cutting and copying are gated, because they act on the
+            // box's own selection, which the panel can see.
+            let enabled = snapclip_ui::panel::context_enabled(!selection_is_empty(control), true);
+            if let Some(s) = state_mut(hwnd) {
+                s.context = Some(snapclip_ui::panel::ContextMenuView {
+                    menu,
+                    items,
+                    enabled,
+                });
+                // One menu at a time: opening this one closes the other two.
+                s.format_open = false;
+                s.var_open = false;
+            }
+            apply_menu_occlusion(hwnd);
+            unsafe {
+                windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0);
+            }
+            0
+        }
         WM_CTLCOLOREDIT => {
             if let Some(s) = state(hwnd) {
                 let state_of_field = s
@@ -3651,6 +3847,9 @@ extern "system" fn window_proc(
             if control.is_null() {
                 match shortcut_command(wparam & 0xFFFF) {
                     Some(Shortcut::Save) => attempt_save(hwnd),
+                    // A menu is the innermost thing on screen: `Esc` dismisses it before it dismisses
+                    // the panel, the way every menu behaves, and the panel stays open.
+                    Some(Shortcut::Cancel) if close_menus(hwnd, "escape") => {}
                     Some(Shortcut::Cancel) => {
                         windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
                             hwnd, WM_CLOSE, 0, 0,
@@ -3748,6 +3947,9 @@ fn bgr(rgba: [u8; 4]) -> u32 {
     u32::from(rgba[0]) | (u32::from(rgba[1]) << 8) | (u32::from(rgba[2]) << 16)
 }
 
+/// `WM_CONTEXTMENU`: the child asks its parent for a right-click menu.
+const WM_CONTEXTMENU: u32 = 0x007B;
+
 /// `WM_CTLCOLOREDIT`: the child asks its parent what to paint its background with.
 #[cfg(windows)]
 const WM_CTLCOLOREDIT: u32 = 0x0133;
@@ -3829,6 +4031,7 @@ mod tests {
             path_change: 56,
             format: 0,
             format_open: false,
+            context: None,
             remembered: std::sync::Arc::new(std::sync::Mutex::new(Remembered::default())),
             status: None,
             var_open: false,
@@ -4310,6 +4513,7 @@ mod tests {
             path_change: 56,
             format: 0,
             format_open: false,
+            context: None,
             remembered: std::sync::Arc::new(std::sync::Mutex::new(Remembered::default())),
             status: None,
             var_open: false,
@@ -4390,6 +4594,7 @@ mod tests {
             path_change: 56,
             format: 0,
             format_open: false,
+            context: None,
             remembered: std::sync::Arc::new(std::sync::Mutex::new(Remembered::default())),
             status: None,
             var_open: false,
@@ -4474,6 +4679,7 @@ mod tests {
             path_change: 56,
             format: 0,
             format_open: false,
+            context: None,
             remembered: std::sync::Arc::new(std::sync::Mutex::new(Remembered::default())),
             status: None,
             var_open: false,
@@ -4707,6 +4913,7 @@ mod tests {
             path_change: 56,
             format: 0,
             format_open: false,
+            context: None,
             remembered: std::sync::Arc::new(std::sync::Mutex::new(Remembered::default())),
             status: None,
             var_open: false,

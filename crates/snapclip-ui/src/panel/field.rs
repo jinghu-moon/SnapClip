@@ -1644,6 +1644,10 @@ pub fn form_drawn_strings() -> Vec<&'static str> {
     // The size row's over-resolution hint (`:623`), drawn only when the output is larger than the
     // capture but reserved either way.
     all.push(WARN_HINT_TEXT);
+    // The name box's right-click menu. The mockup has no context menu, so these four words are text
+    // the design does not supply — they still have to reach the subset, or the system font supplies
+    // their shapes and the panel ends up half in one typeface.
+    all.extend(CONTEXT_ITEMS);
     // The four size shortcuts are drawn in the numeric face (`.size-presets .chip`, `:259`), so they
     // are not in this list: `number_characters` carries the digits and the percent sign they use,
     // and a test below holds the two lists together.
@@ -2691,6 +2695,104 @@ pub fn fmt_menu_contains(
     point: (i32, i32),
 ) -> bool {
     fmt_contains(fmt_menu_rect(metrics, rects, scale, window_height), point)
+}
+
+// -------------------------------------------------------------------------------------------------
+// The name box's right-click menu
+// -------------------------------------------------------------------------------------------------
+
+/// The commands a right click inside a text box offers, in order.
+///
+/// The mockup is a page and has no context menu, so these are the four every Windows text box
+/// offers (`dropdown.rs` is not consulted: a command list has no chosen item and no check column).
+/// The words are Chinese because every other word the panel shows is.
+pub const CONTEXT_ITEMS: [&str; 4] = ["剪切", "复制", "粘贴", "全选"];
+
+/// The menu's text inset, taken from the menu painter the panel already has
+/// (`dropdown::d2d::inset_text`, eight pixels) rather than chosen here.
+pub const CONTEXT_TEXT_PAD_DIP: i32 = 8;
+
+/// The menu's height in dip: the format menu's own padding and row height (`:180`, `:182`), for the
+/// same reason — a menu is a menu.
+pub fn context_menu_height_dip() -> i32 {
+    FMT_MENU_PAD_DIP * 2 + FMT_ITEM_DIP * CONTEXT_ITEMS.len() as i32
+}
+
+/// Where the menu goes: its top-left corner is the click, it opens downward, and it opens upward
+/// when the room below is too small for it — the rule the format menu already follows (`:902`).
+pub fn context_menu_rect(
+    anchor: (i32, i32),
+    scale: f32,
+    width: i32,
+    window_height: i32,
+    window_width: i32,
+) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let height = px(context_menu_height_dip());
+    let right = (anchor.0 + width).min(window_width);
+    let left = right - width;
+    let top = if anchor.1 + height > window_height {
+        anchor.1 - height
+    } else {
+        anchor.1
+    };
+    Rect::new(left, top.max(0), right, top.max(0) + height)
+}
+
+/// One item's rectangle. Half-open, so two neighbours cannot both answer for the pixel between
+/// them (`rect_contains` says the same thing, and one predicate answers both questions).
+pub fn context_item_rect(menu: Rect, scale: f32, index: usize) -> Rect {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    let top = menu.top + px(FMT_MENU_PAD_DIP) + px(FMT_ITEM_DIP) * index as i32;
+    Rect::new(
+        menu.left + px(FMT_MENU_PAD_DIP),
+        top,
+        menu.right - px(FMT_MENU_PAD_DIP),
+        top + px(FMT_ITEM_DIP),
+    )
+}
+
+/// All four items at once, which is what the painter and the hit test both walk.
+pub fn context_item_rects(menu: Rect, scale: f32) -> [Rect; CONTEXT_ITEMS.len()] {
+    std::array::from_fn(|index| context_item_rect(menu, scale, index))
+}
+
+/// Which command a point lands on, if any.
+pub fn context_item_at(menu: Rect, scale: f32, point: (i32, i32)) -> Option<usize> {
+    (0..CONTEXT_ITEMS.len()).find(|index| {
+        rect_contains(context_item_rect(menu, scale, *index), point)
+    })
+}
+
+/// Which commands can do anything right now.
+///
+/// Cutting and copying need a selection, because a box with nothing selected has nothing to put on
+/// the clipboard and an item that cannot act must not look like one that can. Pasting needs the
+/// clipboard to hold text. Selecting everything always works.
+pub fn context_enabled(has_selection: bool, clipboard_has_text: bool) -> [bool; CONTEXT_ITEMS.len()] {
+    [has_selection, has_selection, clipboard_has_text, true]
+}
+
+/// What the painter needs to draw the right-click menu, and nothing more.
+///
+/// The rectangles travel because the window answers clicks on the same numbers it hands the
+/// painter — the arrangement the footer's widths and every other measured control already use, so
+/// the item a click lands on is the item that was drawn. The face is the frame's to choose.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ContextMenuView {
+    pub menu: Rect,
+    pub items: [Rect; CONTEXT_ITEMS.len()],
+    /// One per item, in [`CONTEXT_ITEMS`] order: a command that cannot act is drawn dim and does
+    /// nothing, so it never looks pressable (`context_enabled`).
+    pub enabled: [bool; CONTEXT_ITEMS.len()],
+}
+
+impl ContextMenuView {
+    /// Which command a point lands on, if any. Disabled items still answer: the click is theirs, it
+    /// just does nothing, which keeps a click from falling through the menu onto the frame.
+    pub fn item_at(&self, point: (i32, i32)) -> Option<usize> {
+        (0..CONTEXT_ITEMS.len()).find(|index| rect_contains(self.items[*index], point))
+    }
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -4057,6 +4159,133 @@ mod tests {
                 "the padding is the menu but not an option"
             );
         }
+    }
+
+    /// The right-click menu is a command list: four rows, no check column, and a height built from
+    /// the format menu's own padding and row height rather than from numbers of its own.
+    #[test]
+    fn the_context_menu_lists_the_four_commands_a_text_box_has() {
+        assert_eq!(CONTEXT_ITEMS, ["剪切", "复制", "粘贴", "全选"], "four commands, in order");
+        assert_eq!(
+            context_menu_height_dip(),
+            5 * 2 + 30 * CONTEXT_ITEMS.len() as i32,
+            "two five dip paddings and one row per command (:180, :182)"
+        );
+
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            let metrics = metrics();
+            let window_height = (metrics.panel_height() as f32 * scale).round() as i32;
+            let window_width = (metrics.panel_width as f32 * scale).round() as i32;
+            let width = (120.0 * scale).round() as i32;
+            let menu = context_menu_rect((300, 200), scale, width, window_height, window_width);
+
+            assert_eq!(menu.right - menu.left, width, "the width is the measurement it was given");
+            assert_eq!(
+                menu.bottom - menu.top,
+                (context_menu_height_dip() as f32 * scale).round() as i32,
+                "the height is the rows and the padding (scale {scale})"
+            );
+
+            let items = context_item_rects(menu, scale);
+            for (index, item) in items.iter().enumerate() {
+                assert_eq!(item.left, menu.left + (5.0 * scale).round() as i32);
+                assert_eq!(item.right, menu.right - (5.0 * scale).round() as i32);
+                assert_eq!(
+                    item.bottom - item.top,
+                    (30.0 * scale).round() as i32,
+                    "one row is the format menu's own row height (index {index}, scale {scale})"
+                );
+            }
+            // Rows touch but do not overlap: the bottom of one is the top of the next.
+            for index in 1..items.len() {
+                assert_eq!(items[index].top, items[index - 1].bottom, "rows are contiguous");
+            }
+            assert_eq!(items[0].top, menu.top + (5.0 * scale).round() as i32);
+
+            // Exactly one row answers for any point inside it, and the padding answers for none.
+            for index in 0..items.len() {
+                let centre = |rect: Rect| ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
+                assert_eq!(context_item_at(menu, scale, centre(items[index])), Some(index));
+            }
+            assert_eq!(
+                context_item_at(menu, scale, (menu.left + 1, menu.top + 1)),
+                None,
+                "the menu's padding is the menu but not a command"
+            );
+        }
+    }
+
+    /// A menu with no room below opens upward, the rule the format menu already follows (`:902`).
+    #[test]
+    fn the_context_menu_opens_upward_when_there_is_no_room_below() {
+        let scale = 1.0f32;
+        let width = 120;
+        let height = context_menu_height_dip();
+        let roomy = 900;
+        let below = context_menu_rect((300, 200), scale, width, roomy, 920);
+        assert_eq!(below.top, 200, "room below, so it opens downward");
+
+        let tight = 200 + height - 1;
+        let above = context_menu_rect((300, 200), scale, width, tight, 920);
+        assert_eq!(above.top, 200 - height, "no room below, so it opens upward");
+        assert_eq!(above.bottom, 200, "and its bottom edge is the click");
+    }
+
+    /// Cutting and copying need something selected; pasting needs something on the clipboard;
+    /// selecting everything always works. An item that cannot act must not look like one that can.
+    #[test]
+    fn only_the_commands_that_can_act_are_enabled() {
+        assert_eq!(context_enabled(false, false), [false, false, false, true]);
+        assert_eq!(context_enabled(true, false), [true, true, false, true]);
+        assert_eq!(context_enabled(false, true), [false, false, true, true]);
+        assert_eq!(context_enabled(true, true), [true, true, true, true]);
+    }
+
+    /// The menu covers the box it was opened on, so that box has to be hidden while it is up: a child
+    /// window paints above its parent, and the menu would otherwise be behind the very box whose
+    /// commands it offers. This is the third menu to use that rule and the first anchored inside the
+    /// control rather than beside it.
+    #[test]
+    fn the_context_menu_covers_the_name_box_and_only_it() {
+        let metrics = crate::panel::DEMO;
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            let rects = metrics.rects(scale);
+            let window_height = (metrics.panel_height() as f32 * scale).round() as i32;
+            let window_width = (metrics.panel_width as f32 * scale).round() as i32;
+            let name = FieldId::Name.rect(&metrics, &rects, scale, 0);
+            // A menu opened in the middle of the box, which is where a right click lands.
+            let anchor = ((name.left + name.right) / 2, (name.top + name.bottom) / 2);
+            let width = (120.0 * scale).round() as i32;
+            let menu = context_menu_rect(anchor, scale, width, window_height, window_width);
+            let boxes: Vec<Rect> = FieldId::ALL
+                .iter()
+                .map(|id| id.rect(&metrics, &rects, scale, 0))
+                .collect();
+            let hidden = crate::panel::hidden_fields(Some(menu), &boxes);
+            let name_index = FieldId::ALL
+                .iter()
+                .position(|id| *id == FieldId::Name)
+                .expect("the name is one of the fields");
+            assert!(
+                hidden.contains(&name_index),
+                "the box a right click came from must be hidden under its menu (scale {scale})"
+            );
+            assert!(
+                hidden.len() < boxes.len(),
+                "a menu over the name row must not hide every box (scale {scale})"
+            );
+        }
+    }
+
+    /// `.text-input` sets the size and no weight (`:167`, `:39`): twelve dip, normal weight.
+    #[test]
+    fn the_name_box_is_set_at_the_mockups_size() {
+        assert_eq!(EDIT_FONT_DIP, 12.0, "--fs-input (:39, :167)");
+        assert_eq!(
+            FieldFace::Text.font_dip(),
+            EDIT_FONT_DIP,
+            "the face and the constant must not be two answers to one question"
+        );
     }
 
     /// The path row ends with its two buttons, and the input gives up exactly their room.
