@@ -1903,3 +1903,49 @@ assertion `left == right` failed: a whole-field selection keeps the caret at the
 - 三处入口的调用没有测试（见上）；`WM_ACTIVATE` 的激活分支同样只在真机上才走到。
 - 顺带解掉一个旧疑问：`capture` 的条数在 545/547 之间漂，是因为 `-p snapclip-capture` 不带
   feature、`--workspace` 会把 feature 统一起来；两套配置的条数本来就不同。
+
+## 控件背景的另一半：视觉样式，与"shell 还不知道文件存在"
+
+两件都是"**代码看着对、结果不对**"的一类，和前两次（`Esc`/`Enter` 消息不到、右键菜单被子窗口吃掉）同族。
+
+### ① 控件背景 `rgb(73,73,78)` 的来源
+
+四条假设被依次排除，靠的是**量**而不是读代码：
+
+| 假设 | 排除方式 |
+| --- | --- |
+| 颜色算错 | 日志里框与控件**被告知的是同一个** `[41,41,46,255]`，刷子句柄非零 |
+| 框叠了两次 | `frame.rs` 对 `Name` **只填一次**；四个状态同一个 `fill` |
+| 是选区高亮 | `EM_GETSEL` 在开窗与聚焦后都是 `start==end` |
+| 是我们选的全选 | 全仓 `EM_SETSEL(0,-1)` 只在右键菜单的"全选"项 |
+
+⇒ 用户的双色实验（刷子=红、`SetBkColor`=绿）判读：**只有文字那条变红** ⇒ 再叠约 15% 白正好是 73 ⇒
+**整块背景是 Windows 视觉样式（`EDIT` 主题部件）画的**，`WM_CTLCOLOREDIT` 返回的刷子**只影响字形背景**。
+
+修法：建控件时 `SetWindowTheme(edit, L"", L"")` —— **空串**才是"不用主题"，`NULL` 是"按系统设置"（相反）。
+随后在 `WM_CTLCOLOREDIT` 里显式 `SetBkMode(child, OPAQUE)`，让字形背景用同一个 `SetBkColor`（与刷子同索引、同值）。
+
+### ② 揭示不选中：shell 的目录列表早于文件
+
+用户观察是关键：**资源管理器先出现、文件随后才出现在列表里**。⇒ `SHOpenFolderAndSelectItems` 对一个
+**它还不知道的名字**作答：返回 `S_OK`、什么也不选。日志 `select=0x0` 因此看起来完全正常。
+
+修法：保存成功后**先** `SHChangeNotify(SHCNE_CREATE, SHCNF_PATHW, path, null)`，**再** reveal。
+顺序写成**数据**（`AFTER_SAVE_STEPS`）而不是行序，所以交换是行为变化而不是看不见的重排：
+
+```rust
+pub const AFTER_SAVE_STEPS: [AfterSaveStep; 3] = [CopyPath, TellShell, Reveal];
+```
+
+断言 `the_shell_is_told_about_the_file_before_it_is_asked_to_select_it` 钉住这个顺序；
+变异（交换后两项）⇒ `left: [CopyPath, Reveal, TellShell] / right: [CopyPath, TellShell, Reveal]` ✓。
+
+### 诊断代码的去留
+
+两个实验开关（`SNAPCLIP_DEBUG_EDIT_FILL`、`SNAPCLIP_DEBUG_REVEAL`）**已删除**；
+`reveal: apartment=… parsed=… select=…` 三行**保留**，因为它们让"返回成功却什么也没做"不再无声。
+
+### 仍未覆盖
+
+- `SetWindowTheme` 的效果**没有纯逻辑断言**（需要真窗口），只能人眼：名字框整块应是 `#29292E`。
+- "通知先于揭示"有断言，但**真实选中**仍要人眼；含空格的目录要试一次（旧写法的破绽在那里）。

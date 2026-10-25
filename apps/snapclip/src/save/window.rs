@@ -1696,15 +1696,70 @@ fn shortcut_command(command: usize) -> Option<Shortcut> {
 /// The path is the one the save wrote rather than one assembled here, so what is copied or
 /// revealed cannot be a different file from the one that landed.
 fn run_after_save(after: [bool; 2], path: &std::path::Path) {
-    if after[0] {
-        match crate::clipboard::SystemClipboard.copy_text(&path.display().to_string()) {
-            Ok(()) => eprintln!("[save-panel] copied the saved path: {}", path.display()),
-            Err(error) => eprintln!("[save-panel] could not copy the saved path: {error}"),
+    for step in AFTER_SAVE_STEPS {
+        match step {
+            AfterSaveStep::CopyPath if after[0] => {
+                match crate::clipboard::SystemClipboard.copy_text(&path.display().to_string()) {
+                    Ok(()) => eprintln!("[save-panel] copied the saved path: {}", path.display()),
+                    Err(error) => {
+                        eprintln!("[save-panel] could not copy the saved path: {error}")
+                    }
+                }
+            }
+            // The shell enumerated the folder's contents before this file was written, and the window
+            // it reuses shows that older list. Asking it to select a name its list does not hold is
+            // the case where the call answers success and selects nothing; telling it the file exists
+            // first is what puts the name there.
+            AfterSaveStep::TellShell if after[1] => notify_shell(path),
+            AfterSaveStep::Reveal if after[1] => reveal(path),
+            _ => {}
         }
     }
-    if after[1] {
-        reveal(path);
+}
+
+/// The steps a successful save runs, in order, as data rather than as the order of the lines that
+/// happen to call them: telling the shell and asking it to select are two calls, and the pair only
+/// works in one order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AfterSaveStep {
+    /// Put the saved path on the clipboard.
+    CopyPath,
+    /// Tell the shell a file appeared at this path.
+    TellShell,
+    /// Ask the shell to select it.
+    Reveal,
+}
+
+pub const AFTER_SAVE_STEPS: [AfterSaveStep; 3] = [
+    AfterSaveStep::CopyPath,
+    AfterSaveStep::TellShell,
+    AfterSaveStep::Reveal,
+];
+
+/// A path as a NUL terminated wide string, which is what every shell call here wants.
+fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Tell the shell that a file now exists at this path.
+///
+/// We wrote the file directly, so nothing in the shell knows it appeared; a folder window that was
+/// already open keeps the list it enumerated, and a select request against a name that list does not
+/// contain leaves nothing selected. This is the notification that puts the name there.
+fn notify_shell(path: &std::path::Path) {
+    use windows_sys::Win32::UI::Shell::{SHChangeNotify, SHCNE_CREATE, SHCNF_PATHW};
+    let wide_path = wide(&path.display().to_string());
+    // SAFETY: the path is NUL terminated and outlives the call; the second identifier is unused for
+    // this event, which is why it is null.
+    unsafe {
+        SHChangeNotify(
+            SHCNE_CREATE as i32,
+            SHCNF_PATHW,
+            wide_path.as_ptr() as *const core::ffi::c_void,
+            std::ptr::null(),
+        );
     }
+    eprintln!("[save-panel] told the shell the file exists: {}", path.display());
 }
 
 /// What revealing a saved file means: select it in its folder when it is there, and open the folder
@@ -1742,7 +1797,6 @@ fn explorer_select_parameters(file: &std::path::Path) -> String {
 /// Files\a.png"` opens the folder and selects nothing. Passing the two identifiers to the shell
 /// function has no quoting layer at all, which is why it is the one used here.
 fn reveal(path: &std::path::Path) {
-    let wide = |text: &str| -> Vec<u16> { text.encode_utf16().chain(std::iter::once(0)).collect() };
     match reveal_plan(path) {
         Reveal::Open(folder) => {
             let verb: Vec<u16> = "open\0".encode_utf16().collect();
@@ -1807,20 +1861,14 @@ fn reveal(path: &std::path::Path) {
             // SAFETY: the path is NUL terminated; a failure is reported as a null pointer.
             let file_pidl = unsafe { ILCreateFromPathW(file_wide.as_ptr()) };
             let mut revealed: Option<u64> = None;
-            // Which of the two ways to reveal is used. Explorer's own verb is known to select when
-            // the folder window already exists, and the shell call is the one with no quoting layer;
-            // a run cannot tell which of them failed to select without being able to choose. Left
-            // unset, the shell call is tried first and explorer is the fallback.
-            let mode = std::env::var("SNAPCLIP_DEBUG_REVEAL").unwrap_or_default();
-            let forced_explorer = mode == "explorer";
             // Every step on one line, whether they succeed or not: the previous version only spoke
             // when something failed, so a call that returned success and did nothing was silent.
             eprintln!(
-                "[save-panel] reveal: apartment={apartment:#x} parsed={parsed:#x} folder_null={} file_null={} mode={mode:?}",
+                "[save-panel] reveal: apartment={apartment:#x} parsed={parsed:#x} folder_null={} file_null={}",
                 folder_pidl.is_null(),
                 file_pidl.is_null()
             );
-            if !forced_explorer && parsed >= 0 && !folder_pidl.is_null() && !file_pidl.is_null() {
+            if parsed >= 0 && !folder_pidl.is_null() && !file_pidl.is_null() {
                 let children = [file_pidl as *const _];
                 // SAFETY: both identifiers are valid for the duration of the call and the array
                 // holds exactly the count given.
@@ -1834,7 +1882,7 @@ fn reveal(path: &std::path::Path) {
                         file.display()
                     );
                 }
-            } else if !forced_explorer {
+            } else {
                 eprintln!(
                     "[save-panel] the shell could not name the file: parsed={parsed:#x} folder_null={} file_null={}",
                     folder_pidl.is_null(),
@@ -1870,8 +1918,7 @@ fn reveal(path: &std::path::Path) {
                         )
                     };
                     eprintln!(
-                        "[save-panel] fell back to explorer: forced={} result={} file={}",
-                        forced_explorer,
+                        "[save-panel] fell back to explorer: result={} file={}",
                         opened as isize,
                         file.display()
                     );
@@ -3218,6 +3265,24 @@ fn create_field_edit(
         const WM_SETFONT: u32 = 0x0030;
         SendMessageW(edit, WM_SETFONT, font as usize, 1);
 
+        // The visual style paints an edit box's background itself and ignores the brush the parent
+        // returns to `WM_CTLCOLOREDIT`, so the box could never share the fill of the frame around it;
+        // what was on screen was the style's own colour with only the glyph strip taking ours.
+        //
+        // Empty sub-application and class names mean "no theme". A null there would mean "use the
+        // system default", which is the opposite request, so the empty strings are the whole point.
+        let no_theme: [u16; 1] = [0];
+        // Paired with the empty strings above: a failure here leaves the style in place, which is
+        // the old appearance rather than a broken one, so it is logged and not treated as fatal.
+        let unthemed = windows_sys::Win32::UI::Controls::SetWindowTheme(
+            edit,
+            no_theme.as_ptr(),
+            no_theme.as_ptr(),
+        );
+        if unthemed != 0 {
+            eprintln!("[save-panel] the control kept its visual style: hresult={unthemed:#x}");
+        }
+
         // The child is inside the frame's rect, so its own square corners are covered by the frame's
         // fill; nothing else has to be clipped.
         let mut client: windows_sys::Win32::Foundation::RECT = std::mem::zeroed();
@@ -4187,31 +4252,16 @@ extern "system" fn window_proc(
                     colours.fill,
                     brush
                 );
-                // The experiment that separates the two things a control can fill with. A text box
-                // has two background paths, not one: the brush returned here, which fills its whole
-                // client area, and the colour set below, which fills behind the glyphs. The strip
-                // being chased is about one line of text tall, which is the shape of the second.
-                //
-                // With this set the two are made unmistakable rather than similar: the brush is
-                // solid red and the glyph background is solid green, so whatever appears in the box
-                // names its own source. Neither colour is reached without the switch.
-                let experiment = std::env::var_os("SNAPCLIP_DEBUG_EDIT_FILL").is_some();
-                let background = if experiment {
-                    [0u8, 255, 0, 255]
-                } else {
-                    colours.fill
-                };
-                windows_sys::Win32::Graphics::Gdi::SetBkColor(child, bgr(background));
+                // The two backgrounds a text box has are given the same value here, from the same
+                // index: the brush fills its client area, and the colour set below fills behind the
+                // glyphs. Opaque mode is what makes the second of them use it rather than leave
+                // whatever was underneath.
+                windows_sys::Win32::Graphics::Gdi::SetBkMode(
+                    child,
+                    windows_sys::Win32::Graphics::Gdi::OPAQUE as i32,
+                );
+                windows_sys::Win32::Graphics::Gdi::SetBkColor(child, bgr(colours.fill));
                 windows_sys::Win32::Graphics::Gdi::SetTextColor(child, bgr(colours.text));
-                if experiment {
-                    let red =
-                        windows_sys::Win32::Graphics::Gdi::CreateSolidBrush(bgr([255, 0, 0, 255]));
-                    eprintln!(
-                        "[save-panel] fill experiment: brush=red background=green (rgba={:?}) brush={:?}",
-                        background, red
-                    );
-                    return red as isize;
-                }
                 // The brush comes from the same colour the background was just set to, by way of the
                 // same index, so the two cannot disagree about which fill this state has.
                 return brush as isize;
@@ -5781,11 +5831,27 @@ mod tests {
         }
     }
 
+    /// Telling the shell and asking it to select are two calls that only work in one order: the
+    /// folder window was enumerated before this file was written, so a select request against a list
+    /// that does not hold the name answers success and selects nothing. The order is data, so a swap
+    /// is a change of behaviour rather than a reordering of lines nobody can see.
+    #[test]
+    fn the_shell_is_told_about_the_file_before_it_is_asked_to_select_it() {
+        assert_eq!(
+            AFTER_SAVE_STEPS,
+            [
+                AfterSaveStep::CopyPath,
+                AfterSaveStep::TellShell,
+                AfterSaveStep::Reveal,
+            ],
+            "the notification has to come before the request it makes possible"
+        );
+    }
+
     /// A saved file is selected inside its folder; a file that is no longer there leaves nothing to
     /// select, so the folder it was saved to is opened instead.
     #[test]
-    fn revealing_a_saved_file_selects_it_and_a_missing_one_opens_its_folder() {
-        let folder = std::env::temp_dir().join("snapclip-reveal-plan");
+    fn revealing_a_saved_file_selects_it_and_a_missing_one_opens_its_folder() {        let folder = std::env::temp_dir().join("snapclip-reveal-plan");
         std::fs::create_dir_all(&folder).expect("a scratch folder");
         let file = folder.join("shot.png");
         std::fs::write(&file, b"png").expect("a scratch file");
