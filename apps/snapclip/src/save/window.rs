@@ -2163,7 +2163,7 @@ fn with_panel_request<T>(
 /// Empty, unparseable and below the design's floor all resolve to the floor (`:236`): a limit that
 /// nothing can meet would refuse every save, and refusing everything is not what an unreadable
 /// number should mean.
-fn limit_kilobytes(text: &str) -> u32 {
+pub(crate) fn limit_kilobytes(text: &str) -> u32 {
     text.trim()
         .parse::<u32>()
         .map(|kilobytes| kilobytes.max(MIN_LIMIT_KB))

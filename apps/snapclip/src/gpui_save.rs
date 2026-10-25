@@ -132,6 +132,41 @@ pub fn save(
     assemble::save_panel(values, &picture.frame(output))
 }
 
+/// The size that fits the limit, from a real encode at each candidate size.
+///
+/// The search is the panel's own (`estimate::fit_under`), so the probe cannot shrink differently
+/// from the drawn panel. Returns nothing when no candidate fits, which is the panel's answer too:
+/// it writes no file rather than one over the limit.
+pub fn shrink_to_fit(
+    picture: &Picture,
+    values: &PanelValues<'_>,
+    output: Size,
+    limit: u64,
+) -> Option<Size> {
+    estimate::fit_under(output, limit, |size| {
+        assemble::weigh(values, &picture.frame(size)).ok()
+    })
+    .map(|(size, _bytes)| size)
+}
+
+/// Write the file, shrinking it first when a limit is given.
+///
+/// A limit the picture already meets writes at its own size; one it does not writes at the size the
+/// search found, so the file on disk is under the limit the footer promised. `None` means no size
+/// fits, and nothing is written: the panel's own answer, recorded as a gap in `docs/41` because the
+/// mockup has no sentence for it.
+pub fn save_within(
+    picture: &Picture,
+    values: &PanelValues<'_>,
+    output: Size,
+    limit: Option<u64>,
+) -> Option<Result<SaveOutcome, SaveError>> {
+    let Some(limit) = limit else {
+        return Some(save(picture, values, output));
+    };
+    shrink_to_fit(picture, values, output, limit).map(|size| save(picture, values, size))
+}
+
 /// The sentence the footer shows, or nothing.
 ///
 /// A save that succeeded explains nothing, and a cancelled one is not a failure: the user changed
@@ -163,6 +198,52 @@ mod tests {
             u32::from_be_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
         };
         (word(16), word(20))
+    }
+
+    /// The ceiling is a real ceiling: what it lets through is under it, and what it cannot meet
+    /// writes nothing at all.
+    ///
+    /// The synthetic picture is small and compresses to a few hundred bytes, so a ceiling above it
+    /// must leave the size alone and one below it must refuse; both are read off the disk rather
+    /// than from the return value, because "the limit was applied" is a fact about the file.
+    #[gpui_kit::test]
+    fn the_ceiling_decides_what_lands_and_writes_nothing_when_it_cannot_be_met() {
+        let dir = temp_dir("ceiling");
+        let picture = Picture::synthetic();
+        let output = Size::new(96, 64);
+
+        let roomy = values(
+            dir.to_str().expect("utf-8 path"),
+            "roomy",
+            format_of(0),
+            "2026-10-26",
+            "0005",
+        );
+        let written = save_within(&picture, &roomy, output, Some(1024 * 1024))
+            .expect("a roomy ceiling still saves")
+            .expect("and the save succeeds");
+        let bytes = std::fs::read(&written.path).expect("the file is there");
+        assert!(bytes.len() as u64 <= 1024 * 1024, "the file is under the ceiling");
+        assert_eq!(png_size(&bytes), (96, 64), "a ceiling it already meets is not a reason to shrink");
+
+        let cramped = values(
+            dir.to_str().expect("utf-8 path"),
+            "cramped",
+            format_of(0),
+            "2026-10-26",
+            "0005",
+        );
+        let nothing = save_within(&picture, &cramped, output, Some(16));
+        assert!(nothing.is_none(), "sixteen bytes cannot hold a png, so nothing is written");
+        let landed = std::fs::read_dir(&dir)
+            .expect("the folder is readable")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("cramped"))
+            .count();
+        assert_eq!(landed, 0, "a ceiling nothing meets leaves no file behind");
+
+        let off = save_within(&picture, &roomy, output, None).expect("no ceiling always attempts");
+        assert_eq!(off.expect("and succeeds").bytes, written.bytes, "no ceiling is the plain save");
     }
 
     #[gpui_kit::test]

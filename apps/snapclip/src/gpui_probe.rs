@@ -85,6 +85,8 @@ pub const PROBE_SIZE_LABELS: [&str; 2] = ["宽", "高"];
 pub const PROBE_UNIT: &str = "px";
 /// The quality row's switch (`:631`-`:635`).
 pub const PROBE_LIMIT: &str = "限制体积";
+/// The ceiling the mockup's own field holds (`.limit-input`'s value, `:647`).
+pub const PROBE_LIMIT_DEFAULT: u32 = 500;
 
 /// The preview card's rectangle in dips, as `(left, top, right, bottom)` — the order `fit_preview`
 /// takes, so the card can be handed to it unchanged.
@@ -401,6 +403,12 @@ pub struct GpuiProbe {
     estimate: Option<String>,
     /// What the footer says after a save that did not happen, and nothing otherwise.
     status: Option<String>,
+    /// Whether the save honours a size ceiling, and the field that holds its number.
+    ///
+    /// The switch decides whether a limit applies, not the field: turning the switch off keeps the
+    /// number, so turning it back on restores what the user chose. That is the panel's rule.
+    limit_on: bool,
+    limit: Entity<InputState>,
 }
 
 impl GpuiProbe {
@@ -425,6 +433,11 @@ impl GpuiProbe {
         let height = cx.new(|cx| {
             InputState::new(window, cx).default_value(PROBE_ORIGINAL_SIZE.1.to_string())
         });
+        // The ceiling's field starts at the mockup's own number (`:647`), which is also the design's
+        // floor when nothing readable is typed (`:236`).
+        let limit = cx.new(|cx| {
+            InputState::new(window, cx).default_value(PROBE_LIMIT_DEFAULT.to_string())
+        });
         let mut probe = Self {
             focus,
             name,
@@ -437,6 +450,8 @@ impl GpuiProbe {
             picture: crate::gpui_save::Picture::synthetic(),
             estimate: None,
             status: None,
+            limit_on: false,
+            limit,
         };
         probe.weigh(cx);
         probe
@@ -704,7 +719,34 @@ impl Render for GpuiProbe {
             .gap(px(dip(scale, mockup::HEADER_ACTION_GAP)))
             .child(row_label(PROBE_LABELS[4]))
             .child(row_label(PROBE_LIMIT));
-        let quality_content = if quality_shows_tiers(self.format) {
+        // The mockup's `限制体积` is a switch (`:631`-`:635`), not a word: turning it on is what
+        // makes the `不超过 [500] KB` group appear (`:645`-`:649`) and what makes a save honour a
+        // ceiling at all. It sits on the row's header beside the label, as the mockup draws it, and
+        // its state is the same field the save reads, so the two cannot disagree.
+        let limit_switch = Button::new("probe-limit")
+            .label(if self.limit_on { "限制体积 开" } else { "限制体积 关" })
+            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                this.limit_on = !this.limit_on;
+                cx.notify();
+                window.refresh();
+            }));
+        let quality_header = quality_header.child(limit_switch);
+        let quality_content = if self.limit_on {
+            // `不超过 [500] KB` (`:645`-`:649`): the field keeps its number while the switch is off,
+            // which is what makes turning it back on restore what the user chose.
+            div()
+                .h(px(dip(scale, mockup::SEG_HEIGHT)))
+                .h_flex()
+                .items_center()
+                .gap(px(dip(scale, mockup::HEADER_GAP)))
+                .child(div().text_xs().child("不超过"))
+                .child(
+                    Input::new(&self.limit)
+                        .id("probe-limit-kb")
+                        .h(px(dip(scale, mockup::SEG_HEIGHT))),
+                )
+                .child(div().text_xs().child("KB"))
+        } else if quality_shows_tiers(self.format) {
             div()
                 .h(px(dip(scale, mockup::SEG_HEIGHT)))
                 .h_flex()
@@ -1084,7 +1126,23 @@ impl GpuiProbe {
             &date,
             &time,
         );
-        let result = crate::gpui_save::save(&self.picture, &values, output);
+        let result = {
+            // The switch, not the field, decides whether a ceiling applies; the number is read
+            // through the panel's own rule, so an unreadable one means the floor rather than
+            // refusing every save (`:236`). With the switch off this is a plain save.
+            let limit = if self.limit_on {
+                let text = self.limit.read(cx).value().to_string();
+                Some(crate::save::window::limit_kilobytes(&text) as u64 * 1024)
+            } else {
+                None
+            };
+            match crate::gpui_save::save_within(&self.picture, &values, output, limit) {
+                Some(result) => result,
+                // No candidate size fits the ceiling, so nothing is written: the panel's own answer,
+                // and the mockup has no sentence for it (`docs/41`, A43).
+                None => Err(crate::save::SaveError::Cancelled),
+            }
+        };
         match &result {
             Ok(outcome) => {
                 eprintln!(
