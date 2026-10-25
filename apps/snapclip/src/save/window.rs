@@ -821,7 +821,13 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
             var_open: false,
             path_chips,
         after_chips,
-        after: [false; 2],
+        // Read from the shell's record, not reset here: the switches describe the next save, so a
+        // panel that started them off would turn them off again after every capture.
+        after: options
+            .remembered
+            .lock()
+            .map(|remembered| remembered.after)
+            .unwrap_or([false; 2]),
             size_presets,
         size_mode: snapclip_ui::panel::SIZE_MODE_CHOSEN,
         size_mode_widths,
@@ -3466,6 +3472,13 @@ extern "system" fn window_proc(
                 {
                     if let Some(s) = state_mut(hwnd) {
                         s.after[index] = !s.after[index];
+                        // The switch is a setting that outlives this panel, so it is handed to the
+                        // shell in the same click that changes it; the panel keeps no copy of it
+                        // beyond the one the next paint reads.
+                        let chosen = s.after;
+                        if let Ok(mut remembered) = s.remembered.lock() {
+                            remembered.remember_after(chosen);
+                        }
                     }
                     windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0);
                     return 0;

@@ -21,10 +21,20 @@ use crate::panel::interaction::PointerEvent;
 use crate::panel::segmented::{Segment, SegmentState};
 use snapclip_model::geometry::{Point, Rect};
 
-/// How far the native `EDIT` sits inside its frame, in dip. One and a half, so a one dip border
-/// plus the inset leaves the rounded corner visible at every DPI we support without the child
-/// painting over it.
+/// How far the focus ring sits inside a field's frame, in dip.
+///
+/// A drawing, not a control: the ring is drawn by the panel one and a half dip in from the border,
+/// and it is its own constant because a native child needs more room than this to keep its square
+/// corners out of the frame's arc (see [`EDIT_CONTROL_INSET_DIP`]).
 pub const EDIT_INSET_DIP: f32 = 1.5;
+
+/// How far the native `EDIT` sits inside its frame, in dip.
+///
+/// A square child inside a rounded frame shows its corners wherever it reaches into the arc. The
+/// arc of a six dip corner (`--r-input`, `:54`) leaves `6·(1−1/√2) ≈ 1.76` dip of chord, so an
+/// inset of one and a half let the child's corners poke out and put a hard edge on a rounded
+/// field. Two dip clears it at every scale we support, and costs half a dip of horizontal shift.
+pub const EDIT_CONTROL_INSET_DIP: f32 = 2.0;
 
 /// The horizontal padding the design puts between the frame and the text.
 pub const EDIT_PADDING_DIP: f32 = 10.0;
@@ -61,13 +71,13 @@ pub const NATIVE_FAMILY: &str = "Microsoft YaHei UI";
 
 /// The rectangle a native text control occupies inside its frame.
 ///
-/// Horizontally it gives up `EDIT_INSET_DIP` on each side, which is the border plus enough of the
-/// corner that its square corners fall inside the frame's arc. Vertically it is only as tall as its
+/// Horizontally it gives up [`EDIT_CONTROL_INSET_DIP`] on each side, which is the border plus
+/// enough of the corner that its square corners fall inside the frame's arc. Vertically it is only as tall as its
 /// text and centred in the frame, because a single line edit draws its text at the top of its
 /// client and has no way to centre it itself — the control used to fill the frame and its text sat
 /// against the top edge.
 pub fn edit_control_rect(frame: Rect, text_height: i32, scale: f32) -> Rect {
-    let inset = (EDIT_INSET_DIP * scale).round() as i32;
+    let inset = (EDIT_CONTROL_INSET_DIP * scale).round() as i32;
     let height = text_height.abs().max(1);
     let left = frame.left + inset;
     let right = frame.right - inset;

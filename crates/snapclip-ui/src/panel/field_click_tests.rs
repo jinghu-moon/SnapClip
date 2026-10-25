@@ -350,10 +350,18 @@ fn the_minimize_button_answers_only_inside_itself() {
 fn a_native_control_is_inset_and_centred_at_its_text_height() {
     let frame = Rect::new(100, 200, 320, 248);
     let control = edit_control_rect(frame, 16, 1.0);
-    assert_eq!(control.left, 102, "one and a half dip in from the frame at 1x");
-    assert_eq!(control.right, 318, "and one and a half dip from the other side");
+    assert_eq!(control.left, 102, "two dip in from the frame at 1x");
+    assert_eq!(control.right, 318, "and two dip from the other side");
     assert_eq!(control.bottom - control.top, 16, "only as tall as its text");
     assert_eq!(control.top, 216, "centred in a forty eight dip frame");
+    // At one scale the two insets round to the same place, so this is the assertion that tells
+    // them apart: three dip at one and a half scale is two dip's inset, where one and a half dip
+    // would round to two. Without it the change to clear the corner's arc would be invisible to
+    // every test, which is how the square corners survived the first time.
+    let scaled = Rect::new(150, 300, 480, 372);
+    let wide = edit_control_rect(scaled, 24, 1.5);
+    assert_eq!(wide.left, 153, "two dip at one and a half scale is three pixels");
+    assert_eq!(wide.right, 477, "and the same on the other side");
     // The height is the font's, so the text is not pushed against an edge: the two gaps above and
     // below are equal save for the rounding an odd remainder forces.
     let above = control.top - frame.top;

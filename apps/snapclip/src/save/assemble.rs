@@ -100,6 +100,10 @@ pub struct Remembered {
     pub template: String,
     /// The number the next save will use.
     pub sequence: Sequence,
+    /// The two after-save switches, in the order the row draws them: copy the path, open the
+    /// folder. They are switches (`:573`, `:574`), so they describe the next save rather than
+    /// doing something now, and a switch that describes the next save is a setting.
+    pub after: [bool; 2],
 }
 
 impl Default for Remembered {
@@ -107,6 +111,7 @@ impl Default for Remembered {
         Self {
             template: DEFAULT_TEMPLATE.to_owned(),
             sequence: Sequence::FIRST,
+            after: [false; 2],
         }
     }
 }
@@ -123,6 +128,20 @@ impl Remembered {
             return false;
         }
         self.template = edited.to_owned();
+        true
+    }
+
+    /// Take the two after-save switches, reporting whether anything changed.
+    ///
+    /// Written as a rule for the same reason as the template: the panel holds the switches while
+    /// it is open and hands them over on each click, so the comparison that decides whether the
+    /// shell needs waking belongs somewhere that can be asserted without a window. The two are
+    /// kept as a pair because the row draws them as a pair and a click produces both values.
+    pub fn remember_after(&mut self, after: [bool; 2]) -> bool {
+        if after == self.after {
+            return false;
+        }
+        self.after = after;
         true
     }
 }
@@ -668,6 +687,47 @@ mod tests {
         assert_eq!(
             remembered.template, "我的_[序号]",
             "the template is the user's, not the save's"
+        );
+    }
+
+    /// A switch that describes the next save is a setting, so it outlives the panel it was set in.
+    ///
+    /// The panel is opened per capture, so a switch held only there would be off again next time
+    /// and would quietly do nothing after the first save.
+    #[test]
+    fn the_after_save_switches_are_remembered_and_unchanged_ones_are_not() {
+        let mut remembered = Remembered::default();
+        assert_eq!(
+            remembered.after,
+            [false; 2],
+            "a first run does nothing after saving"
+        );
+
+        assert!(
+            remembered.remember_after([true, false]),
+            "turning one on is a change"
+        );
+        assert_eq!(remembered.after, [true, false]);
+
+        assert!(
+            !remembered.remember_after([true, false]),
+            "the same pair again is not a change"
+        );
+        assert_eq!(remembered.after, [true, false]);
+    }
+
+    /// The two are stored separately, because they stand for different work: one copies the path
+    /// that was written, the other opens its folder. Sharing a slot would make the second click
+    /// undo the first.
+    #[test]
+    fn the_two_after_save_switches_do_not_share_a_slot() {
+        let mut remembered = Remembered::default();
+        remembered.remember_after([true, false]);
+        remembered.remember_after([false, true]);
+        assert_eq!(
+            remembered.after,
+            [false, true],
+            "each switch keeps its own value"
         );
     }
 
