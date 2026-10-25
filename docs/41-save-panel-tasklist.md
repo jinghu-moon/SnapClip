@@ -1996,3 +1996,36 @@ pub const AFTER_SAVE_STEPS: [AfterSaveStep; 3] = [CopyPath, TellShell, Reveal];
 
 - `RedrawWindow` 之后 `EDIT` 是否真的重画完，只能由用户读 `screen:` 三值：三者相同 ⇒ 屏幕上没有带子（截图/色彩管理的产物）；只有 `middle` 不同 ⇒ 带子在文字行；`top_edge` 也不同 ⇒ 带子是整个控件。
 - `/e,` 的实际效果只能人眼：新窗口里那个文件应被选中。
+
+
+## 实验：把 DWM 材质关掉（`SNAPCLIP_NO_BACKDROP`）
+
+### 为什么
+
+同一块屏幕上有两个读数：程序 `GetPixel` 读到 `(43,43,48)`（即 `(41,41,46)` + 抗锯齿），而用户 `PrintScreen → 画图` 取色读到 `(72,73,81)`，约 `+32`。两者不可能同时描述同一层像素，所以中间必有一层合成。材质**只作用于顶层窗口**，而原生 `EDIT` 的盒子是 GDI 不透明填充、**不被材质染**——这正好产生"框被提亮、控件没有"的差值。
+
+### 怎么做的
+
+`apply_backdrop` 里只跳过**材质与帧延伸**两项，其余（暗色模式、圆角、描边）**照旧**——单变量实验，否则变化里就分不清哪一项造成的。
+
+```rust
+if std::env::var_os("SNAPCLIP_NO_BACKDROP").is_some() {
+    eprintln!("[save-panel] backdrop disabled by env: the frame will paint its own surface");
+    return false;
+}
+```
+
+⇒ `apply_backdrop` 的返回值语义就是"有材质在显示"，所以返回 `false` **同时**让 `fill_surface = !s.backdrop` 变成 `true`，窗口自己填底色。**不需要第二处改动**——如果另写一个"填充开关"，两者就会有一天不一致。
+
+日志两侧都说话：`backdrop applied type=DWMSBT_TRANSIENTWINDOW` / `backdrop disabled by env`。
+
+### 判读
+
+用户跑 `$env:SNAPCLIP_NO_BACKDROP="1"` 后 `PrintScreen → 画图` 取色：
+
+- 名字框**一片均匀** ⇒ 材质就是成因 ⇒ 修法是让控件与框**都不受材质影响**（框不吃材质，或让控件区域由父窗口画）；
+- **带子还在** ⇒ 不是材质 ⇒ 回到"子窗口/父窗口合成差异"另查。
+
+### 不可测的部分
+
+材质与合成器的行为没有纯逻辑断言可写，只能靠这一对人眼读数。这条实验的全部价值在于**它只改一个变量**。

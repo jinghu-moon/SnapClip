@@ -3401,6 +3401,20 @@ fn apply_backdrop(hwnd: windows_sys::Win32::Foundation::HWND) -> bool {
         &border as *const u32 as *const _,
         size,
     );
+    // The material lays its own tint over everything the frame draws, while the box a native control
+    // fills is opaque and therefore untouched. That asymmetry is the only way two places told the
+    // same colour can still look different on screen, so the experiment is to leave the material out
+    // and look again. Only the material and the frame extension go: the dark mode, the corner and
+    // the border above are what the panel looks like, and dropping them would change the picture in
+    // ways that have nothing to do with the question.
+    //
+    // The caller reads this return value as "a material is showing", so saying no here also makes
+    // the paint fill its own surface; without that the window would compose to nothing.
+    if std::env::var_os("SNAPCLIP_NO_BACKDROP").is_some() {
+        eprintln!("[save-panel] backdrop disabled by env: the frame will paint its own surface");
+        return false;
+    }
+
     let attached = DwmSetWindowAttribute(
         hwnd,
         DWMWA_SYSTEMBACKDROP_TYPE,
@@ -3418,7 +3432,11 @@ fn apply_backdrop(hwnd: windows_sys::Win32::Foundation::HWND) -> bool {
         cyTopHeight: -1,
         cyBottomHeight: -1,
     };
-    DwmExtendFrameIntoClientArea(hwnd, &margins) == 0
+    let extended = DwmExtendFrameIntoClientArea(hwnd, &margins) == 0;
+    if extended {
+        eprintln!("[save-panel] backdrop applied type=DWMSBT_TRANSIENTWINDOW");
+    }
+    extended
     }
 }
 
