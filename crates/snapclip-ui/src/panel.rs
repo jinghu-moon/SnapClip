@@ -9,6 +9,8 @@ mod button;
 mod checkbox;
 #[path = "panel/dropdown.rs"]
 mod dropdown;
+#[path = "panel/elide.rs"]
+mod elide;
 #[path = "panel/field.rs"]
 mod field;
 #[path = "panel/fonts.rs"]
@@ -42,6 +44,7 @@ mod toggle;
 pub use button::{Button, ButtonState};
 pub use checkbox::{Checkbox, CheckboxState};
 pub use dropdown::{Dropdown, DropdownKey, DropdownTarget};
+pub use elide::elide_middle;
 pub use feedback::{Toast, Tooltip};
 pub use fonts::{
     NUMBER_CHARACTERS, NUMBER_FAMILY, NUMBER_FALLBACKS, NUMBER_SUBSET, number_characters,

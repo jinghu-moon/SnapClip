@@ -1498,3 +1498,36 @@ M2 选区带用字段填充色画
 ```
 
 **一处踩坑记下来**：`PaintInput::idle(dpi)` 的参数是 **DPI**，写 `idle(1.0)` 会让整帧按 0.5 缩放画，于是按 scale 1.0 算出来的采样矩形**整块是表面色**——第一次的位图断言就是这么“什么也没测到”的。
+
+## 路径行改成只读（`P9-75`）
+
+**为什么改**：`.text-input` 是给“能输入的东西”的形状。路径不能输入——整行的唯一动作是打开文件夹选择器，和它右边的 `更改` 一样——所以那个原生 `EDIT` 带来三样它用不上的东西：插入符、**系统选中色**、以及和自己圆角框对不上的底色。
+
+**形状**：
+- `FieldId::Path` 不再创建控件（`controls[Path]` 为空），值改由 `WindowState.directory` 承载，**一个写者**（`set_directory`，chips 与选择器都走它），四个读者（保存、`choose_folder` 的起点、文件夹钮、冲突重算）都读它；
+- 绘制在 `frame.rs`：`--fs-input` 12 dip、`--text`、`.text-input` 的 `padding: 0 10px`（`path_text_rect`）；
+- **过长时中间省略**（新 `panel/elide.rs`）：保住盘符与**尽可能多的尾部目录**，因为路径的两头才是信息（去哪个卷、进哪个文件夹）。`D:\100_Projects\110_Daily\SnapClip\assets\icon` 在 112 px 下得到 `D:\…\assets\icon`；更窄时 `D:\…\icon`；连最后一级都装不下才退到 `…SnapC`——**保留尾部片段的开头**，因为文件夹靠开头辨认，扩展名才靠结尾；
+- 整行可点：`rect_contains(path_field_rect, point)` 与 `更改` 走同一个 `choose_folder`；
+- 光标自然是箭头：去掉子窗口后客户区用窗口类的 `IDC_ARROW`，没有地方再设工字光标。
+
+**顺带纠正的一处“两种数法”**：`FORM_FIELD_TAB_STOPS` 写的是 **5**，而三个数字框早在 `P9-71` 就自绘了——那个数从那时起就在说谎。现在它是 **1**，测试改成 `FieldId::ALL.iter().filter(is_focusable).count()`：**哪个字段能拿键盘**与**有几个 tab 停靠**从此是同一个答案；`is_focusable()` 同时是“要不要建控件”的判据（`!id.is_focusable() → continue`），所以一个字段想变成控件，必须同时承认自己可聚焦。
+
+**新断言抓到的真缺陷**：`the_directory_row_draws_its_value_and_never_a_focus_ring` 第一版**红**——路径文字一个像素都没有。原因不在新代码：`FrameBrushes::field_brush` 只在**三个边框色**里查表，而规则要的是字段的 `text`（纯白），查不到返回 `None`，调用方把 `None` 当成“这条规则什么也不想画”，于是**静默不画**。修法是把规则能产生的**每个**颜色都建一支笔（`field_brushes()` 遍历四个状态 × border/text/inset 去重），而不是给这次的颜色打补丁——否则下一个新颜色还会静默消失。
+
+**变异（两条都真红；先断言锚点命中 1 处；还原后 SHA256 逐字节一致）**：
+```
+M1 取后缀的顺序反过来（丢盘符留尾巴）
+   ⇒ the_drive_and_the_last_segment_stay FAILED
+      left: "…icon"   right: "D:\\…\\assets\\icon"
+
+M2 让 Path 也算可聚焦
+   ⇒ the_form_declares_one_tab_stop_per_focusable_field FAILED
+      assertion `left == right` failed: every focusable field is a tab stop
+      left: 2   right: 1
+```
+第一次的变异写法**没编译过** ⇒ 按清单第 1 条**不算证据**，换成“改循环方向”才拿到红。
+
+**没覆盖的**：
+- “点击整行打开选择器”与“真的没有控件”只在有窗口时成立，测试装置没有窗口 ⇒ 靠编译（`!is_focusable()` 是唯一入口）与人眼；
+- 路径是**运行时数据**，字形子集只覆盖**字面量**：目录名里出现子集外的字会回退系统字体（与 A21 同一类）；
+- `hover` 显示完整路径与只读行的悬停态：未做，记 **A49 / A13**。

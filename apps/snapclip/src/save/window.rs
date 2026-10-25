@@ -799,6 +799,7 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
             // be given, in the loop below: one source for "what each field holds when it opens".
             numbers: NumericFields::default(),
             focused_number: None,
+            directory: options.directory.clone(),
             conflict: ConflictPolicy::AutoRename,
             conflict_shown: false,
             conflict_widths,
@@ -858,6 +859,14 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
                 // self-drawn control and eat its clicks.
                 if let Some(field) = s.numbers.get_mut(id) {
                     field.set_text(&text);
+                    continue;
+                }
+                // The path is a read-only row the frame draws (`elide.rs`): it opens the folder
+                // chooser and cannot be typed into, so it gets no control — and with no control
+                // there is nothing to paint over the row's own text. The rule is the same one the
+                // tab stops are counted by (`FieldId::is_focusable`), so a field that gains a
+                // control has to declare itself there and the count has to be raised with it.
+                if !id.is_focusable() {
                     continue;
                 }
                 let control = create_field_edit(
@@ -994,6 +1003,12 @@ struct WindowState {
     /// The captured picture, handed to the frame painter so the preview card shows the real
     /// selection rather than a stand-in.
     preview: Option<(Vec<u8>, u32, u32)>,
+    /// Where the file will be written, and the only place the shell reads it from.
+    ///
+    /// The path row used to be a text box and this value lived in it. The row is now read-only —
+    /// pressing it opens the folder chooser, which is all it ever did — so the value has to have a
+    /// home that survives the row not being a control, and one reader per question.
+    directory: String,
     /// The brush `WM_CTLCOLOREDIT` returns. The child paints its own background, and on a dark panel
     /// the default white would show as a lit rectangle, so the field's resolved fill is handed over
     /// instead. Created once and owned by this state.
@@ -1670,7 +1685,7 @@ fn with_panel_request<T>(
     let s = state(hwnd)?;
     let (bgra, width, height) = s.preview.as_ref()?;
     let name = control_text(s.control(snapclip_ui::panel::FieldId::Name));
-    let directory = control_text(s.control(snapclip_ui::panel::FieldId::Path));
+    let directory = s.directory.clone();
     // What the two size fields say, read at save time like the name is: the controls are what the
     // user sees, and a half-edited pair falls back to the selection rather than to a guess.
     let source = super::scale::Size::new(*width, *height);
@@ -1875,23 +1890,21 @@ fn shrink_to_fit(hwnd: windows_sys::Win32::Foundation::HWND) {
     unsafe { windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0) };
 }
 
-/// Put a directory into the path field.
+/// Put a directory into the path row.
 ///
-/// The field is the only place the shell reads the directory from, so a shortcut chip changes the
-/// field rather than a second copy of the path. That also means the user sees what the chip did,
-/// and can edit the result before saving.
+/// The row is read-only and has no control, so this writes the one copy the save reads. A shortcut
+/// chip calls it, as does the folder chooser, which is why the user sees what either did before
+/// saving.
 fn set_directory(hwnd: windows_sys::Win32::Foundation::HWND, directory: &str) {
-    let Some(state) = state(hwnd) else {
+    let Some(s) = state_mut(hwnd) else {
         return;
     };
-    let control = state.control(snapclip_ui::panel::FieldId::Path);
-    if control.is_null() {
-        return;
+    s.directory = directory.to_string();
+    unsafe {
+        windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0);
     }
-    let text: Vec<u16> = directory.encode_utf16().collect();
-    let caret = text.len();
-    set_control_text_and_caret(control, &text, caret);
-    unsafe { windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0) };
+    // The path is half of which file the link is about, so a new directory re-asks the question.
+    refresh_conflict(hwnd);
 }
 
 /// The word the conflict link shows, which is the action a press would take (:1150).
@@ -1997,7 +2010,7 @@ fn choose_folder(hwnd: windows_sys::Win32::Foundation::HWND) {
     // :1133 the dialog opens where the field already points, so correcting a folder that is nearly
     // right does not mean walking back from the shell's default every time.
     let current = state(hwnd)
-        .map(|s| control_text(s.control(snapclip_ui::panel::FieldId::Path)))
+        .map(|s| s.directory.clone())
         .unwrap_or_default();
     let initial = browse_initial_path(&current);
     let mut display = [0u16; 260];
@@ -2933,6 +2946,10 @@ extern "system" fn window_proc(
                                 clear_first: true,
                                 fields: s.fields,
                                 numbers: s.numbers.views(),
+                                // The row is drawn, not typed into: the value comes from the one
+                                // copy the save reads, and too long for its box means shortened in
+                                // the middle by the painter.
+                                path_text: Some(s.directory.as_str()),
                                 preview: s
                                     .preview
                                     .as_ref()
@@ -3176,9 +3193,9 @@ extern "system" fn window_proc(
                     return 0;
                 }
             }
-            // The path row's controls, before the footer and after the menus: the input is a native
-            // child, so a click that lands on it never arrives here, which is why only the three
-            // chips and the two drawn buttons are tested.
+            // The path row's controls, before the footer and after the menus. The row itself is
+            // drawn by the frame and is read-only, so the whole row is one target for the same
+            // chooser the `更改` button opens: there is nothing else a press on it could mean.
             if event == snapclip_ui::panel::PointerEvent::Down {
                 let metrics = snapclip_ui::panel::DEMO;
                 let scale = dpi_scale(hwnd);
@@ -3187,16 +3204,18 @@ extern "system" fn window_proc(
                 let (change, chips) = state(hwnd)
                     .map(|s| (s.path_change, s.path_chips))
                     .unwrap_or((0, [0; 3]));
-                if snapclip_ui::panel::path_change_contains(&metrics, &rects, scale, change, point) {
+                let row = snapclip_ui::panel::path_field_rect(&metrics, &rects, scale, change);
+                if snapclip_ui::panel::rect_contains(row, point)
+                    || snapclip_ui::panel::path_change_contains(&metrics, &rects, scale, change, point)
+                {
                     choose_folder(hwnd);
                     return 0;
                 }
                 if snapclip_ui::panel::path_open_contains(&metrics, &rects, scale, point) {
-                    open_directory(&control_text(
-                        state(hwnd)
-                            .map(|s| s.control(snapclip_ui::panel::FieldId::Path))
-                            .unwrap_or(std::ptr::null_mut()),
-                    ));
+                    let directory = state(hwnd)
+                        .map(|s| s.directory.clone())
+                        .unwrap_or_default();
+                    open_directory(&directory);
                     return 0;
                 }
                 if let Some(index) =
@@ -3618,12 +3637,11 @@ extern "system" fn window_proc(
                         if let Ok(mut remembered) = s.remembered.lock() {
                             note_edit(&mut remembered, id, true, &edited);
                         }
-                        // The name and the directory decide which file the link is about, so a change
-                        // to either re-asks the question; the other fields cannot move the target.
-                        conflict_dirty = matches!(
-                            id,
-                            snapclip_ui::panel::FieldId::Name | snapclip_ui::panel::FieldId::Path
-                        );
+                        // The name decides which file the link is about, so a change re-asks the
+                        // question; the other fields cannot move the target. The directory used to
+                        // arrive here too, but the path is no longer a control: `set_directory` asks
+                        // directly, because that is the only thing that can change it.
+                        conflict_dirty = matches!(id, snapclip_ui::panel::FieldId::Name);
                     }
                     // Focus is not allowed to overwrite a message about the value: the field would
                     // fall silent exactly while the user is fixing what it complained about.
@@ -3759,6 +3777,7 @@ mod tests {
             controls: [std::ptr::null_mut(); snapclip_ui::panel::FieldId::ALL.len()],
             numbers: NumericFields::default(),
             focused_number: None,
+            directory: String::new(),
             preview: None,
             fill_brush: std::ptr::null_mut(),
             fill: snapclip_ui::panel::FILL_WHITE,
@@ -4239,6 +4258,7 @@ mod tests {
             controls: [std::ptr::null_mut(); snapclip_ui::panel::FieldId::ALL.len()],
             numbers: NumericFields::default(),
             focused_number: None,
+            directory: String::new(),
             preview: None,
             fill_brush: std::ptr::null_mut(),
             fill: snapclip_ui::panel::FILL_WHITE,
@@ -4318,6 +4338,7 @@ mod tests {
             controls: [std::ptr::null_mut(); snapclip_ui::panel::FieldId::ALL.len()],
             numbers: NumericFields::default(),
             focused_number: None,
+            directory: String::new(),
             preview: None,
             fill_brush: std::ptr::null_mut(),
             fill: snapclip_ui::panel::FILL_WHITE,
@@ -4401,6 +4422,7 @@ mod tests {
             controls: [std::ptr::null_mut(); snapclip_ui::panel::FieldId::ALL.len()],
             numbers: NumericFields::default(),
             focused_number: None,
+            directory: String::new(),
             preview: None,
             fill_brush: std::ptr::null_mut(),
             fill: snapclip_ui::panel::FILL_WHITE,
@@ -4633,6 +4655,7 @@ mod tests {
             controls: [std::ptr::null_mut(); snapclip_ui::panel::FieldId::ALL.len()],
             numbers: NumericFields::default(),
             focused_number: None,
+            directory: String::new(),
             preview: Some((bgra.clone(), 4, 3)),
             fill_brush: std::ptr::null_mut(),
             fill: snapclip_ui::panel::FILL_WHITE,

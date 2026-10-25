@@ -286,7 +286,7 @@ pub struct FrameBrushes {
     /// colour a state gets; this only says how to paint it. Both sides are built from the same
     /// `field_colours` call, so a change to a state's colour reaches the painter by construction
     /// rather than by someone remembering to edit a second `match`.
-    field_brushes: [([u8; 4], ID2D1SolidColorBrush); 3],
+    field_brushes: Vec<([u8; 4], ID2D1SolidColorBrush)>,
 }
 
 impl FrameBrushes {
@@ -332,11 +332,7 @@ impl FrameBrushes {
             checker_light: brush(target, CHECKER_LIGHT)?,
             checker_dark: brush(target, CHECKER_DARK)?,
             surface_rgba: palette.surface,
-            field_brushes: [
-                (focused.border, brush(target, focused.border)?),
-                (error.border, brush(target, error.border)?),
-                (warning.border, brush(target, warning.border)?),
-            ],
+            field_brushes: field_brushes(target, palette)?,
         })
     }
 
@@ -358,6 +354,38 @@ impl FrameBrushes {
             .find(|(colour, _)| *colour == rgba)
             .map(|(_, brush)| brush)
     }
+}
+
+/// One brush per colour the field rules can produce, so a rule that names a colour always has
+/// something to paint it with.
+///
+/// This used to be the three border colours, and a rule that asked for anything else — the value's
+/// own `--text`, for instance — silently painted nothing, because the lookup returned `None` and
+/// the caller treated that as "the rule wanted nothing visible". Any colour the rules can name is
+/// now built; the ones they do not name, and the transparent ones, are skipped.
+fn field_brushes(
+    target: &ID2D1RenderTarget,
+    palette: &FramePalette,
+) -> Result<Vec<([u8; 4], ID2D1SolidColorBrush)>> {
+    let mut made: Vec<([u8; 4], ID2D1SolidColorBrush)> = Vec::new();
+    for state in [
+        crate::panel::FieldState::Idle,
+        crate::panel::FieldState::Focused,
+        crate::panel::FieldState::Error,
+        crate::panel::FieldState::Warning,
+    ] {
+        let colours = crate::panel::field_colours(state, palette.surface);
+        for rgba in [Some(colours.border), Some(colours.text), colours.inset]
+            .into_iter()
+            .flatten()
+        {
+            if rgba[3] == 0 || made.iter().any(|(colour, _)| *colour == rgba) {
+                continue;
+            }
+            made.push((rgba, brush(target, rgba)?));
+        }
+    }
+    Ok(made)
 }
 
 fn brush(target: &ID2D1RenderTarget, rgba: [u8; 4]) -> Result<ID2D1SolidColorBrush> {
@@ -422,6 +450,13 @@ pub struct Frame<'a> {
     /// footer's widths travel. Zero means "paint a button that is no wider than its padding"; the
     /// window always hands a real number.
     pub path_change: i32,
+    /// The save path's own text and the format it is set in (`--fs-input: 12px`, `:39`).
+    ///
+    /// The row has no child control any more: it is read-only, so a text box gave it a caret, a
+    /// system selection colour and a background that disagreed with the frame around it, for
+    /// nothing. Drawn here, the value is a value, and too long for its box means shortened in the
+    /// middle rather than scrolled to somewhere the reader cannot see.
+    pub path_text: Option<(&'a str, &'a IDWriteTextFormat)>,
     /// The state of every form field's frame. The native `EDIT` itself draws no border, no focus ring
     /// and no error state, so those belong to the frame (`field.rs`), and each field carries its own
     /// — one shared state is what made a focused path row draw the name row's frame.
@@ -692,6 +727,37 @@ impl Frame<'_> {
                     ring_brush,
                     line,
                 );
+            }
+        }
+
+        // The save path's value. The row is read-only — pressing it opens the folder chooser, which
+        // the `更改` button beside it does too — so there is no control to hold the text and the
+        // frame draws it in the input's own face (`--fs-input: 12px`, `:39`) and colour (`:167`).
+        //
+        // Shortened in the middle, because a path's two informative ends are the drive and the last
+        // folder; the middle is a run of parent folders the reader can reconstruct from those.
+        if let Some((text, format)) = self.path_text {
+            let rect = crate::panel::field::path_text_rect(
+                self.metrics,
+                self.rects,
+                self.scale,
+                self.path_change,
+            );
+            let colours = crate::panel::field_colours(
+                self.fields.state_of(crate::panel::FieldId::Path),
+                self.brushes.surface_rgba(),
+            );
+            if let Some(brush) = self.brushes.field_brush(colours.text) {
+                let room = rect.right - rect.left;
+                let shown = crate::panel::elide_middle(text, room, |candidate| {
+                    painter
+                        .measure_text_width(candidate, format)
+                        .map(|width| width.ceil() as i32)
+                        .unwrap_or(0)
+                });
+                if !shown.is_empty() {
+                    painter.draw_text(&shown, format, rect, brush);
+                }
             }
         }
 
@@ -2208,6 +2274,12 @@ pub struct PaintInput<'a> {
     /// because a native `EDIT` carries its own background, font and selection colour into a panel
     /// that draws all three (`text_field.rs`). Empty for a caller that shows none of them.
     pub numbers: crate::panel::NumberViews<'a>,
+    /// The save path's value, which the panel also draws itself now.
+    ///
+    /// The row is read-only — it opens the folder chooser and nothing else — so a text box gave it
+    /// a caret, a selection colour and a background it never needed, and the box disagreed with the
+    /// frame around it. `None` draws nothing, which is what a caller with no path to show wants.
+    pub path_text: Option<&'a str>,
 }
 
 impl<'a> PaintInput<'a> {
@@ -2237,6 +2309,7 @@ impl<'a> PaintInput<'a> {
             warn_hint: false,
             variable_values: None,
             numbers: crate::panel::NumberViews::default(),
+            path_text: None,
         }
     }
 }
@@ -2291,6 +2364,9 @@ pub fn paint_to_dc_with_preview(
     let preset_label = preset_label_format(dwrite, input.dpi)?;
     // The fill row's label (`.limit-label`, `:309`).
     let fill_label = fill_label_format(dwrite, input.dpi)?;
+    // The save path's value, in the input's own face: `--fs-input: 12px` (`:39`), body weight, with
+    // `.text-input`'s `--text` colour (`:167`).
+    let path_value = text_format(dwrite, input.dpi, 12.0, DWRITE_FONT_WEIGHT_NORMAL)?;
     let painter = PanelPainter {
         context: &target,
         text_factory: dwrite,
@@ -2327,6 +2403,7 @@ pub fn paint_to_dc_with_preview(
         fill_label: Some(&fill_label),
         footer_widths: input.footer_widths,
         path_change: input.path_change,
+        path_text: input.path_text.map(|text| (text, &path_value)),
         status: input.status,
         status_format: Some(&status_format),
         conflict: input.conflict,
@@ -3338,6 +3415,66 @@ let surface = fill_rgb(23, 23, 28);
         assert_idle_field(&px, field, "an idle directory field");
     }
 
+    /// The save path is drawn by the frame now, because the row is read-only: a text box gave it a
+    /// caret, a system selection colour and a background that disagreed with the corner drawn
+    /// around it, for a row whose only action is opening the folder chooser.
+    ///
+    /// Two things are asserted, and the second is the point of the change: the value lands in the
+    /// field's own text colour, and the row carries no focus ring — it cannot take focus, so an
+    /// accent border on it would promise something the keyboard does not do.
+    #[test]
+    fn the_directory_row_draws_its_value_and_never_a_focus_ring() {
+        let canvas = Canvas::new(920, DEMO.panel_height());
+        canvas.render_path("D:\\100_Projects\\110_Daily");
+        let px = canvas.pixels();
+        let rects = DEMO.rects(1.0);
+        let field = crate::panel::path_field_rect(&DEMO, &rects, 1.0, 56);
+        let text = crate::panel::field::path_text_rect(&DEMO, &rects, 1.0, 56);
+        let idle = crate::panel::field_colours(crate::panel::FieldState::Idle, DEMO_PALETTE.surface);
+        let want = Px {
+            b: idle.text[2],
+            g: idle.text[1],
+            r: idle.text[0],
+            a: idle.text[3],
+        };
+        // Inside the value's own box, a glyph's stem has to reach the text colour: the row is the
+        // only place the path is visible, so empty text there means the path is not shown at all.
+        let mut seen = None;
+        for x in text.left..text.right {
+            for y in (text.top + 8)..(text.bottom - 8) {
+                if close(px.pixel(x, y), want, 8) {
+                    seen = Some((x, y));
+                    break;
+                }
+            }
+            if seen.is_some() {
+                break;
+            }
+        }
+        let (x, y) = seen.unwrap_or_else(|| {
+            panic!("the directory value must be drawn in --text inside {text:?}")
+        });
+        assert_px(&px, x, y, want, 8, "the directory row's value");
+
+        // No ring. The focused border is the colour a ring would be drawn in, and the idle row has
+        // none of it on its border line.
+        let focused =
+            crate::panel::field_colours(crate::panel::FieldState::Focused, DEMO_PALETTE.surface);
+        let ring = Px {
+            b: focused.border[2],
+            g: focused.border[1],
+            r: focused.border[0],
+            a: focused.border[3],
+        };
+        for (x, y) in [
+            (field.left + 40, field.top),
+            (field.left + 40, field.bottom - 1),
+            (field.right - 40, field.top),
+        ] {
+            assert_not_any(&px, x, y, &[ring], 6, "the directory row's border without focus");
+        }
+    }
+
     #[test]
     fn the_size_cells_are_filled_and_have_no_border_when_idle() {
         let canvas = Canvas::new(920, DEMO.panel_height());
@@ -3916,6 +4053,26 @@ let surface = fill_rgb(23, 23, 28);
                 Rect::new(0, 0, self.width, self.height),
                 &PaintInput {
                     fields,
+                    ..PaintInput::idle(self.dpi)
+                },
+            )
+            .expect("the frame paints");
+        }
+
+        /// Render with a value in the path row, which is what the window hands over now that the row
+        /// has no control.
+        fn render_path(&self, text: &str) {
+            let factory = factory().expect("a Direct2D factory");
+            let dwrite = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED) }
+                .expect("a DirectWrite factory");
+            paint_to_dc_with_preview(
+                &factory,
+                &dwrite,
+                self.dc,
+                Rect::new(0, 0, self.width, self.height),
+                &PaintInput {
+                    path_text: Some(text),
+                    path_change: 56,
                     ..PaintInput::idle(self.dpi)
                 },
             )

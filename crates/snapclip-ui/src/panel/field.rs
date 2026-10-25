@@ -180,6 +180,17 @@ impl FieldId {
             FieldId::Path | FieldId::Name => FieldFace::Text,
         }
     }
+
+    /// Whether this field is a control the keyboard can land in.
+    ///
+    /// Only the name is: the path is a read-only row that opens the folder chooser, and the three
+    /// numbers are drawn and answered by the panel itself. The distinction matters because a native
+    /// child window takes part in `Tab` navigation by existing, and one that is not created cannot
+    /// — so "how many tab stops" and "which fields are focusable" are the same question, asked here
+    /// once instead of being counted by hand at the call sites.
+    pub fn is_focusable(self) -> bool {
+        matches!(self, FieldId::Name)
+    }
 }
 
 /// Which typeface a field's native control asks for.
@@ -536,6 +547,27 @@ pub fn path_field_rect(
         top: band.top,
         right: change.left - px(PATH_ROW_GAP_DIP),
         bottom: band.top + px(metrics.field_height),
+    }
+}
+
+/// Where the save path's own text goes: the field's box, inset by the input padding.
+///
+/// `.text-input { padding: 0 10px }` (`:167`). The row has no control, so this rectangle is what the
+/// frame draws the value in and what it measures the value against — one rectangle for both, the
+/// same rule the buttons follow.
+pub fn path_text_rect(
+    metrics: &FrameMetrics,
+    rects: &FrameRects,
+    scale: f32,
+    change_width: i32,
+) -> Rect {
+    let px = |dip: f32| (dip * scale).round() as i32;
+    let field = path_field_rect(metrics, rects, scale, change_width);
+    Rect {
+        left: field.left + px(EDIT_PADDING_DIP),
+        top: field.top,
+        right: field.right - px(EDIT_PADDING_DIP),
+        bottom: field.bottom,
     }
 }
 
@@ -2068,9 +2100,10 @@ pub fn estimate_label_rect(
 /// exactly that many `WS_TABSTOP` children; the test pins it so adding a field without adding it
 /// here fails rather than silently changing the tab order.
 ///
-/// Deliberately a literal rather than `FieldId::ALL.len()`: deriving it would make the guard a
-/// tautology, and the point of the number is that a sixth field has to be declared on purpose.
-pub const FORM_FIELD_TAB_STOPS: usize = 5;
+/// Deliberately a literal rather than a count of [`FieldId::is_focusable`]: deriving it would make
+/// the guard a tautology, and the point of the number is that a field that gains a control has to be
+/// declared on purpose.
+pub const FORM_FIELD_TAB_STOPS: usize = 1;
 
 // -------------------------------------------------------------------------------------------------
 // The footer: `:274`-`:288` and `:674`-`:687`
@@ -3049,18 +3082,22 @@ mod tests {
         }
     }
 
-    /// Four fields, four tab stops. Adding a field without declaring it here fails rather than
-    /// silently changing the tab order.
+    /// One tab stop, for the one field that still has a control. The two lists cannot disagree: the
+    /// path is a read-only row and the three numbers are drawn by the panel, so a fifth field that
+    /// wants the keyboard has to say so here.
     #[test]
-    fn the_form_declares_one_tab_stop_per_field() {
+    fn the_form_declares_one_tab_stop_per_focusable_field() {
         assert_eq!(
-            FORM_FIELD_TAB_STOPS, 5,
-            "the path, the name and the two size cells are focusable, and a fifth added without declaring it here fails"
+            FORM_FIELD_TAB_STOPS, 1,
+            "only the name is a native control, so only it can hold the keyboard"
         );
         assert_eq!(
-            FieldId::ALL.len(),
+            FieldId::ALL
+                .iter()
+                .filter(|id| id.is_focusable())
+                .count(),
             FORM_FIELD_TAB_STOPS,
-            "every field takes part in tab navigation, so the two lists cannot disagree"
+            "every focusable field is a tab stop, and nothing else is"
         );
     }
 
