@@ -24,7 +24,7 @@
 
 ## 0.4 UI 保真要求（用户明示，常驻）
 
-> 保存面板的视觉与交互必须**尽可能与 `docs/design/save-panel-demo-v3.html` 一致**，**扣除 docs/42 D13 记录的三条不可复现项**（圆角 12→系统≈8 dip、投影改用 DWM、模糊不可调）。
+> 保存面板的视觉与交互必须**尽可能与 `docs/design/save-panel-demo-v3.html` 一致**，**扣除 docs/42 D13 记录的四条不可复现项**（圆角 12→系统≈8 dip、投影改用 DWM、模糊随材质一起放弃、**不用 DWM 材质 ⇒ 面板为不透明纯色**）。
 > 任何"与 demo 不一致"的取舍都必须**写明理由**（例如原生 `EDIT` 的方角由外框遮住），不得默默偏离。
 
 验收分两档：
@@ -2029,3 +2029,44 @@ if std::env::var_os("SNAPCLIP_NO_BACKDROP").is_some() {
 ### 不可测的部分
 
 材质与合成器的行为没有纯逻辑断言可写，只能靠这一对人眼读数。这条实验的全部价值在于**它只改一个变量**。
+
+---
+
+## 采纳 B：永久不用 DWM 材质（D13 第四条偏离）
+
+### 用户实测的结论
+
+`SNAPCLIP_NO_BACKDROP=1` ⇒ 名字框**一片均匀** ✓ ⇒ **材质是那条亮带的成因** ✓✓
+
+机理：材质是 DWM 在**顶层窗口内容**上合成时加的一层（实测约 +32/通道）✓；原生 `EDIT` 是**独立子窗口** ✓ ⇒ 它自己的不透明填充**不进材质的染色范围** ✗ ⇒ **GDI 子窗口不可能被材质染色** ⇒ 二者**不可调和** ✓。
+
+⇒ 而面板**必须**保留一个原生控件（文件名要输中文 ✓ IME 不是自己该写的东西 ✓）⇒ 所以**放弃材质** ✓。
+
+### 落地
+
+| 件 | 改动 |
+| --- | --- |
+| `SNAPCLIP_NO_BACKDROP` | **删除** ✓（实验结束 ✓） |
+| `apply_backdrop` → **`apply_dwm_chrome`** | 不再设材质 ✓；**保留**暗色模式 ✓ 圆角 ✓ 描边 ✓；返回 `()` ✗（它不再决定任何事 ✓） |
+| `DWMWA_SYSTEMBACKDROP_TYPE` | 改成**显式请求 `DWMSBT_NONE`** ✓（`BACKDROP_TYPE = 1`）⇒ 将来的系统默认值不能把材质悄悄带回来 ✓ |
+| `DwmExtendFrameIntoClientArea` | **删除** ✓ —— 它只服务"让材质透进客户区" ✓。**圆角不依赖它** ✗✓：那条配方是 `WM_NCCALCSIZE` 返回 0 + `DWMWA_WINDOW_CORNER_PREFERENCE` ✓，帧延伸是另一件事 ✓ |
+| `WindowState.backdrop` | **删除字段** ✓（永远为 `false` ⇒ 留着就是无用实现 ✗） |
+| `WM_ERASEBKGND` | 恒定返回 `0` ✓（不再有"有材质时返回 1"的分支 ✓） |
+| `fill_surface` | 恒为 `true` ✓，注释指向 D13 第四条 ✓ |
+| `WM_PAINT` 的兜底填充 | `if !painted` ✓（去掉 `&& !backdrop` ✓） |
+
+### 证据
+
+- **新断言** `the_panel_asks_for_no_material` ✓：`BACKDROP_TYPE == 1` ✓ —— 用**绝对数字** ✗✓（与常量比就是和自己比 ✓）。
+- **变异真红** ✓：`BACKDROP_TYPE` 改成 `2` ⇒
+  ```
+  assertion `left == right` failed: DWMSBT_NONE is one and the acrylic that shows the seam is two
+    left: 2   right: 1
+  ```
+  还原后 **SHA256 逐字节一致** ✓（`b6685a57…` ✓）、**见 `Compiling snapclip-app`** ✓。
+- **真窗口读回** ✓：`the_panel_window_opens_and_closes` 里断言 `matches!(backdrop, None | Some(BACKDROP_TYPE))` ✗✓ ⇒ 有该属性的系统必须报告"无材质" ✓，没有该属性的系统报告 `None` ✓；报告 `Some(2)` 就说明接缝回来了 ✓。
+- 门禁 ✓：`app 295/0/9` ✓、`ui` ✓、`check --workspace --all-targets` **0 warning / 无 `never used`** ✓、串行 workspace 全绿 ✓。
+
+### 代价（写清 ✓）
+
+**面板失去毛玻璃** ✓ —— 但那 8% 的透明在"没有背景可透"的对话框里本来也没有意义 ✓；换来的是**名字框与周围完全一致** ✓，而那是用户连续三轮指出的问题 ✓。

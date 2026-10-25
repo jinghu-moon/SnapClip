@@ -8,8 +8,9 @@
 //!
 //! The panel and the capture frame are **mutually exclusive** (`docs/42` D11): the frame is gone
 //! before the panel appears, so the panel is an ordinary top-level window, not a layer inside a
-//! layered window. That is what makes native `EDIT` children possible at all, and it is also why
-//! the frosted backdrop the mock asks for is reachable — DWM backdrops require an ordinary window.
+//! layered window. That is what makes native `EDIT` children possible at all, and the same fact is
+//! why the mock's frosted material had to be given up: a material tints what the top level draws,
+//! and the one native control cannot be tinted with it (`docs/42` D13, fourth deviation).
 //!
 //! ## Geometry comes from the mock, with line numbers
 //!
@@ -50,8 +51,10 @@ pub(crate) const PANEL_EX_STYLE: u32 = windows_sys::Win32::UI::WindowsAndMessagi
 
 /// The window's own styles.
 ///
-/// `WS_CAPTION` stays: it is what makes DWM draw the rounded corners, the shadow and the backdrop
+/// `WS_CAPTION` stays: it is what makes DWM draw the rounded corners and the shadow
 /// (`WM_NCCALCSIZE` below then claims the whole window as client area, so no caption is visible).
+/// It used to be the material's footing as well, and the material is gone (`docs/42` D13, fourth
+/// deviation); the two things named above do not depend on it.
 /// `WS_SYSMENU` used to be here and is exactly why a small close button appeared in the corner: it
 /// tells DWM to draw the caption's close box over the client area, while the same
 /// `WM_NCCALCSIZE` leaves nothing there to click. A button that cannot be clicked is worse than no
@@ -135,14 +138,14 @@ mod panel_slot_tests {
     /// The panel's own header draws its two buttons, so the caption must not put a third one there.
     /// `WS_SYSMENU` makes DWM draw the caption's close box over the client area, and the
     /// `WM_NCCALCSIZE` that claims the whole window leaves nothing there to click: a button the user
-    /// can see and cannot press. `WS_CAPTION` stays because it is what keeps DWM's rounded corners,
-    /// shadow and backdrop, which is a different job from the buttons drawn in that frame.
+    /// can see and cannot press. `WS_CAPTION` stays because it is what keeps DWM's rounded corners
+    /// and shadow, which is a different job from the buttons drawn in that frame.
     #[test]
     fn the_panel_style_leaves_the_caption_buttons_to_the_header() {
         assert_ne!(
             PANEL_STYLE & WS_CAPTION,
             0,
-            "the caption is what keeps DWM's rounded corners, shadow and backdrop"
+            "the caption is what keeps DWM's rounded corners and shadow"
         );
         assert_eq!(
             PANEL_STYLE & WS_SYSMENU,
@@ -249,16 +252,18 @@ pub const PANEL_HEIGHT_DIP: f32 =
 
 /// `--surface: rgba(23,23,28,.92)` — `save-panel-demo-v3.html:25`.
 ///
-/// Kept as the four channels the mock states. The shell only uses this as the **fallback fill**
-/// when DWM cannot give us a backdrop: the mock's look is a translucent material over the desktop,
-/// and inventing a solid colour for the normal case would be a silent deviation.
+/// Kept as the four channels the mock states, and it is what the frame paints everywhere: with no
+/// material behind the window, nothing composites this colour with anything, so the eight percent
+/// of transparency the mock relies on shows the window's own opaque fill instead. That is the
+/// fourth deviation in `docs/42` D13, and it is why the seam it caused is gone.
 pub const SURFACE_RGBA: [u8; 4] = [23, 23, 28, 235];
 
 /// `--blur: 6px` — `save-panel-demo-v3.html:64`.
 ///
-/// Recorded because it is the mock's material, not because we can honour it: DWM's backdrops have
-/// their own radii and blurs and are not tunable to six pixels. The substitute is recorded where
-/// the backdrop is applied.
+/// Recorded as a value the panel does **not** honour, and the reason is not that a blur is
+/// untunable: the material that would carry it cannot be used at all, because it tints the top
+/// level while the one native control stays opaque (`docs/42` D13, fourth deviation). Kept as a
+/// number so the deviation names what was given up rather than describing it vaguely.
 pub const BACKDROP_BLUR_DIP: f32 = 6.0;
 
 /// The size limit's default and floor, in kilobytes (`:647`, `:236`).
@@ -747,10 +752,10 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
             SWP_NOZORDER | SWP_NOACTIVATE,
         );
 
-        // The material. `DWMWA_SYSTEMBACKDROP_TYPE` only exists on Windows 11 22H2 and later, so
-        // the failure is remembered rather than ignored: without a backdrop the window has to paint
-        // the mock's surface itself, and a silently transparent window would look broken.
-        let backdrop = apply_backdrop(hwnd);
+        // The window's own surface is the panel's surface. No DWM material is asked for, because a
+        // material tints what the top level draws while the one native control stays opaque, and
+        // that asymmetry shows as a seam across the field — `docs/42` D13, fourth deviation.
+        apply_dwm_chrome(hwnd);
         let renderer = snapclip_ui::panel::PanelRenderer::new().ok();
         // The footer buttons' widths, measured once, here. The paint and the click handling both
         // read these numbers, so a click can only land on the button whose rectangle is on screen
@@ -798,7 +803,6 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
         let metrics = snapclip_ui::panel::DEMO;
         let rects = metrics.rects(scale);
         let state = Box::into_raw(Box::new(WindowState {
-            backdrop,
             renderer,
             preview: options.preview.take(),
             fields: snapclip_ui::panel::FieldStates::IDLE,
@@ -1100,8 +1104,6 @@ impl ImageCopy for SystemImageCopy {
 /// the only way to carry Rust data into a Win32 callback without a global.
 #[cfg(windows)]
 struct WindowState {
-    /// Whether DWM agreed to draw a backdrop. When it did not, `WM_PAINT` fills the mock's surface.
-    backdrop: bool,
     /// The frame's painter. Absent only if Direct2D could not start, in which case the
     /// fallback fill still gives the window a readable surface.
     renderer: Option<snapclip_ui::panel::PanelRenderer>,
@@ -3358,14 +3360,30 @@ fn create_field_edit(
     }
 }
 
+/// The material the panel asks for, which is none.
+///
+/// `DWMSBT_TRANSIENTWINDOW` is the acrylic the mock's `--blur` was reaching for, and it cannot be
+/// used here. The material is laid over what the *top level* draws, while the box a native control
+/// fills is an opaque child window the material never reaches; two places told the same colour then
+/// come out about fifteen percent apart, which is a visible seam along the one control left. A
+/// child window cannot be made translucent by GDI, so the only way to have the two agree is to
+/// have no material at all — see `docs/42` D13, fourth deviation. `DWMSBT_NONE` is requested
+/// explicitly rather than left unset, so a future default cannot quietly bring the material back.
+pub const BACKDROP_TYPE: u32 = 1;
+
+/// Ask DWM for the parts of the panel's look that a plain window cannot draw itself.
+///
+/// Returns nothing: what it asks for is the entire story now. The dark mode makes DWM's own drawing
+/// dark, the corner preference is the only rounding a Win32 window can have, and the border colour
+/// removes the hairline DWM adds around the frame. The rounded corner does **not** depend on the
+/// frame being extended into the client area — that recipe is `WM_NCCALCSIZE` returning nought plus
+/// this attribute, and the extension only ever existed to let the material through — so removing
+/// the material takes the extension with it.
 #[cfg(windows)]
 #[allow(unsafe_code)]
-fn apply_backdrop(hwnd: windows_sys::Win32::Foundation::HWND) -> bool {
+fn apply_dwm_chrome(hwnd: windows_sys::Win32::Foundation::HWND) {
     unsafe {
-    use windows_sys::Win32::Graphics::Dwm::{DwmExtendFrameIntoClientArea, DwmSetWindowAttribute};
-    // `MARGINS` is declared with the controls bindings, which is where `DwmExtendFrameIntoClientArea`
-    // expects it from; the DWM module does not re-export it.
-    use windows_sys::Win32::UI::Controls::MARGINS as DwmMargins;
+    use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
 
     // Documented attribute ids. Spelled out rather than imported so that a missing constant in the
     // bindings cannot silently change what we ask for.
@@ -3374,13 +3392,11 @@ fn apply_backdrop(hwnd: windows_sys::Win32::Foundation::HWND) -> bool {
     const DWMWA_BORDER_COLOR: u32 = 34;
     const DWMWA_SYSTEMBACKDROP_TYPE: u32 = 38;
     const DWMWCP_ROUND: u32 = 2;
-    const DWMSBT_TRANSIENTWINDOW: u32 = 2;
     const DWMWA_COLOR_NONE: u32 = 0xFFFF_FFFE;
 
     let dark: i32 = 1;
     let corner: u32 = DWMWCP_ROUND;
     let border: u32 = DWMWA_COLOR_NONE;
-    let backdrop: u32 = DWMSBT_TRANSIENTWINDOW;
     let size = std::mem::size_of::<u32>() as u32;
 
     let _ = DwmSetWindowAttribute(
@@ -3401,42 +3417,21 @@ fn apply_backdrop(hwnd: windows_sys::Win32::Foundation::HWND) -> bool {
         &border as *const u32 as *const _,
         size,
     );
-    // The material lays its own tint over everything the frame draws, while the box a native control
-    // fills is opaque and therefore untouched. That asymmetry is the only way two places told the
-    // same colour can still look different on screen, so the experiment is to leave the material out
-    // and look again. Only the material and the frame extension go: the dark mode, the corner and
-    // the border above are what the panel looks like, and dropping them would change the picture in
-    // ways that have nothing to do with the question.
-    //
-    // The caller reads this return value as "a material is showing", so saying no here also makes
-    // the paint fill its own surface; without that the window would compose to nothing.
-    if std::env::var_os("SNAPCLIP_NO_BACKDROP").is_some() {
-        eprintln!("[save-panel] backdrop disabled by env: the frame will paint its own surface");
-        return false;
-    }
-
-    let attached = DwmSetWindowAttribute(
+    // A build older than Windows 11 22H2 has no such attribute and refuses it; that is the same
+    // outcome the panel wants, so the refusal is reported and not treated as a failure.
+    let no_material = DwmSetWindowAttribute(
         hwnd,
         DWMWA_SYSTEMBACKDROP_TYPE,
-        &backdrop as *const u32 as *const _,
+        &BACKDROP_TYPE as *const u32 as *const _,
         size,
     );
-    if attached != 0 {
-        return false;
+    if no_material == 0 {
+        eprintln!("[save-panel] dwm chrome: no material requested (DWMSBT_NONE)");
+    } else {
+        eprintln!(
+            "[save-panel] dwm chrome: this system has no backdrop attribute (hresult={no_material})"
+        );
     }
-    // The client area has no frame of its own, so the backdrop is extended into it. Without this
-    // the material only shows under the (removed) caption.
-    let margins = DwmMargins {
-        cxLeftWidth: -1,
-        cxRightWidth: -1,
-        cyTopHeight: -1,
-        cyBottomHeight: -1,
-    };
-    let extended = DwmExtendFrameIntoClientArea(hwnd, &margins) == 0;
-    if extended {
-        eprintln!("[save-panel] backdrop applied type=DWMSBT_TRANSIENTWINDOW");
-    }
-    extended
     }
 }
 
@@ -3496,12 +3491,10 @@ extern "system" fn window_proc(
             0
         }
         WM_ERASEBKGND => {
-            // With a backdrop the client must stay empty so DWM's material shows through.
-            if state(hwnd).map(|s| s.backdrop).unwrap_or(false) {
-                1
-            } else {
-                0
-            }
+            // Reported as "not erased" so the paint below is what owns every pixel, including the
+            // first frame. A window that let the system erase its background would paint the class
+            // brush under the frame and show through wherever the frame's own fill is translucent.
+            0
         }
         WM_PAINT => {
             let mut paint: PAINTSTRUCT = std::mem::zeroed();
@@ -3555,15 +3548,15 @@ extern "system" fn window_proc(
                         .to_string();
                     let resolution_text =
                         format!("{}x{}", output_size.width, output_size.height);
-                    // The surface fill is skipped when DWM is drawing the material, so a backdrop
-                    // keeps showing through while the frame's own lines still land on top of it.
+                    // The window is the surface: with no material behind it, every pixel has to come
+                    // from this paint. `docs/42` D13 fourth deviation is why there is no material.
                     painted = renderer
                         .paint_with_preview(
                             hdc as *mut _,
                             area,
                             &snapclip_ui::panel::PaintInput {
                                 dpi,
-                                fill_surface: !s.backdrop,
+                                fill_surface: true,
                                 // A window keeps its pixels between frames, so it erases first;
                                 // see `PaintInput::clear_first` for what the residue did.
                                 clear_first: true,
@@ -3635,8 +3628,8 @@ extern "system" fn window_proc(
                         .is_ok();
                 }
             }
-            if !painted && !state(hwnd).map(|s| s.backdrop).unwrap_or(false) {
-                // The mock's surface, as the fallback when DWM refused a backdrop.
+            if !painted {
+                // The mock's surface, as the fallback for a window whose painter could not start.
                 let [r, g, b, _a] = SURFACE_RGBA;
                 let colour = u32::from(r) | (u32::from(g) << 8) | (u32::from(b) << 16);
                 let brush = CreateSolidBrush(colour);
@@ -4685,7 +4678,6 @@ mod tests {
     /// the models and the field table.
     fn bare_state() -> WindowState {
         WindowState {
-            backdrop: false,
             renderer: None,
             fields: snapclip_ui::panel::FieldStates::IDLE,
             controls: [std::ptr::null_mut(); snapclip_ui::panel::FieldId::ALL.len()],
@@ -5199,7 +5191,6 @@ mod tests {
     #[test]
     fn the_control_table_answers_with_one_field_per_handle() {
         let mut state = WindowState {
-            backdrop: false,
             renderer: None,
             fields: snapclip_ui::panel::FieldStates::IDLE,
             controls: [std::ptr::null_mut(); snapclip_ui::panel::FieldId::ALL.len()],
@@ -5282,7 +5273,6 @@ mod tests {
     #[test]
     fn the_window_is_the_only_writer_of_the_quality_choice() {
         let mut state = WindowState {
-            backdrop: false,
             renderer: None,
             fields: snapclip_ui::panel::FieldStates::IDLE,
             controls: [std::ptr::null_mut(); snapclip_ui::panel::FieldId::ALL.len()],
@@ -5369,7 +5359,6 @@ mod tests {
     #[test]
     fn a_scale_change_rebuilds_the_geometry_and_keeps_the_choice() {
         let mut state = WindowState {
-            backdrop: false,
             renderer: None,
             fields: snapclip_ui::panel::FieldStates::IDLE,
             controls: [std::ptr::null_mut(); snapclip_ui::panel::FieldId::ALL.len()],
@@ -5546,6 +5535,19 @@ mod tests {
         assert_eq!(shell.outcome(), Some(Outcome::Cancelled));
     }
 
+    /// The panel asks for no material, and the number is the documented `DWMSBT_NONE`.
+    ///
+    /// Written as an absolute value on purpose: comparing it against the constant the code uses
+    /// would be a comparison with itself, and two wrong numbers agree with each other perfectly.
+    /// The acrylic the mock wanted is two, so a change to that is what this has to catch.
+    #[test]
+    fn the_panel_asks_for_no_material() {
+        assert_eq!(
+            BACKDROP_TYPE, 1,
+            "DWMSBT_NONE is one and the acrylic that shows the seam is two"
+        );
+    }
+
     #[test]
     #[ignore = "needs an interactive desktop"]
     fn the_panel_window_opens_and_closes() {
@@ -5568,6 +5570,13 @@ mod tests {
             let corner = corner_preference(hwnd);
             let backdrop = system_backdrop(hwnd);
             eprintln!("[save-panel] corner preference = {corner:?}, backdrop = {backdrop:?}");
+            // Read back rather than trusted: a system that honours the attribute has to report the
+            // type asked for, and one without it reports nothing. Reporting the acrylic here would
+            // mean the tint is back over half of the field.
+            assert!(
+                matches!(backdrop, None | Some(BACKDROP_TYPE)),
+                "the panel asked for no material, and DWM reports {backdrop:?}"
+            );
 
             shell.close();
 
@@ -5605,7 +5614,6 @@ mod tests {
         // Four by three BGRA, tightly packed: twelve pixels, forty eight bytes.
         let bgra = vec![0x7fu8; 4 * 3 * 4];
         let mut state = WindowState {
-            backdrop: false,
             renderer: None,
             fields: snapclip_ui::panel::FieldStates::IDLE,
             controls: [std::ptr::null_mut(); snapclip_ui::panel::FieldId::ALL.len()],
