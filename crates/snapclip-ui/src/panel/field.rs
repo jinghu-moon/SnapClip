@@ -1648,6 +1648,10 @@ pub fn form_drawn_strings() -> Vec<&'static str> {
     // the design does not supply — they still have to reach the subset, or the system font supplies
     // their shapes and the panel ends up half in one typeface.
     all.extend(CONTEXT_ITEMS);
+    // The keys printed at the right end of those rows. They are Latin, and the panel's interface
+    // face is a Chinese subset, so leaving them out would not overflow: it would silently hand each
+    // one to the system font, which is the difference between a menu and half a menu.
+    all.extend(CONTEXT_SHORTCUTS);
     // The four size shortcuts are drawn in the numeric face (`.size-presets .chip`, `:259`), so they
     // are not in this list: `number_characters` carries the digits and the percent sign they use,
     // and a test below holds the two lists together.
@@ -2711,6 +2715,30 @@ pub const CONTEXT_ITEMS: [&str; 4] = ["剪切", "复制", "粘贴", "全选"];
 /// The menu's text inset, taken from the menu painter the panel already has
 /// (`dropdown::d2d::inset_text`, eight pixels) rather than chosen here.
 pub const CONTEXT_TEXT_PAD_DIP: i32 = 8;
+
+/// The four commands' accelerators, in [`CONTEXT_ITEMS`] order.
+///
+/// A menu row that shows a command and not its key is half a row: the command can be run without
+/// the menu at all, and the one place that says so is where the command is offered. These are the
+/// keys the text box itself answers to, which is why they are written beside it rather than chosen.
+pub const CONTEXT_SHORTCUTS: [&str; 4] = ["Ctrl+X", "Ctrl+C", "Ctrl+V", "Ctrl+A"];
+
+/// `.var-item { justify-content: space-between; gap: 12px }` (`:219`): the least space between a
+/// menu row's word and the value printed at its right end. The context menu puts a command on the
+/// left and its key on the right the same way.
+pub const CONTEXT_ITEM_GAP_DIP: i32 = 12;
+
+/// How wide a right-click menu has to be to hold its widest word and its widest key side by side.
+///
+/// Two insets stack before any text is drawn: an item rectangle is the menu less [`FMT_MENU_PAD_DIP`]
+/// on each side, and the text starts [`CONTEXT_TEXT_PAD_DIP`] inside the item. Measuring the word
+/// plus the second inset alone — which is what this used to do — left the text ten dips narrower
+/// than the word it had to hold, so a two character command wrapped into a column of one character
+/// per line with nothing to show that a number was missing.
+pub fn context_menu_width(word: i32, shortcut: i32, scale: f32) -> i32 {
+    let px = |dip: i32| (dip as f32 * scale).round() as i32;
+    word + px(CONTEXT_ITEM_GAP_DIP) + shortcut + 2 * px(FMT_MENU_PAD_DIP + CONTEXT_TEXT_PAD_DIP)
+}
 
 /// The menu's height in dip: the format menu's own padding and row height (`:180`, `:182`), for the
 /// same reason — a menu is a menu.
@@ -4157,6 +4185,54 @@ mod tests {
                 fmt_item_at(&metrics, &rects, scale, window_height, true, (menu.left, menu.top)),
                 None,
                 "the padding is the menu but not an option"
+            );
+        }
+    }
+
+    /// A menu row has to hold its word, one gap and its key, and the menu's own padding is taken
+    /// twice before any text is drawn. Stated as absolute numbers because a width built from the
+    /// same constants it is checked against cannot catch a constant that is wrong — and one of the
+    /// two insets being left out is exactly the defect this row-width rule exists to prevent.
+    #[test]
+    fn a_menu_row_is_wide_enough_for_its_word_and_its_key() {
+        assert_eq!(
+            context_menu_width(40, 30, 1.0),
+            40 + 12 + 30 + 2 * (5 + 8),
+            "word, the design's gap (:219), the key, and both insets"
+        );
+        assert_eq!(
+            context_menu_width(40, 30, 2.0),
+            40 + 24 + 30 + 2 * 26,
+            "the gap and both insets double with the scale; the text widths are already pixels"
+        );
+        // The room a row leaves for text, which is what a word has to fit into.
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            let px = |dip: i32| (dip as f32 * scale).round() as i32;
+            let width = context_menu_width(40, 30, scale);
+            let insets = 2 * px(FMT_MENU_PAD_DIP + CONTEXT_TEXT_PAD_DIP);
+            assert!(
+                width - insets >= 40 + 30,
+                "a row of order {scale} has to fit a word and a key side by side, not one above the other"
+            );
+        }
+    }
+
+    /// The keys a menu row prints are the ones the box answers to, so the menu cannot advertise a
+    /// shortcut the panel does not implement.
+    #[test]
+    fn the_menu_rows_carry_the_keys_the_box_answers_to() {
+        assert_eq!(CONTEXT_SHORTCUTS, ["Ctrl+X", "Ctrl+C", "Ctrl+V", "Ctrl+A"]);
+        assert_eq!(
+            CONTEXT_SHORTCUTS.len(),
+            CONTEXT_ITEMS.len(),
+            "one key per command, in the same order"
+        );
+        for key in CONTEXT_SHORTCUTS {
+            assert!(key.starts_with("Ctrl+"), "{key} is a control-key combination");
+            assert_eq!(
+                key.rsplit('+').next().map(str::len),
+                Some(1),
+                "{key} names one letter after the last plus"
             );
         }
     }

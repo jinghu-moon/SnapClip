@@ -1703,3 +1703,57 @@ M1 第一版写成 `true`，结果红在 M2 那条断言上 —— **没隔离**
 - `examples/component_gallery.rs` 的 4 条 `unused BOOL` 是既有 warning（文件未改）。
 - 顺带清掉了 `window.rs` 里 4 处 `unnecessary unsafe`（这个版本的 `windows-sys` 里
   `SetWindowSubclass`/`ScreenToClient`/`GetClientRect`/`InvalidateRect` 都是安全函数）。
+
+## 右键菜单：宽度、快捷键（用户实测两处）
+
+### ① 窄到竖排 —— 两处内缩叠加，量宽时少算了一处
+
+```
+量宽  measure_context_menu:  widest + 2×CONTEXT_TEXT_PAD(8)                ✗ 只算了一处
+绘制  paint_context:         项矩形 = 菜单 − 2×FMT_MENU_PAD(5)             ✗ 第二处
+                            文字   = 项矩形 − 2×CONTEXT_TEXT_PAD(8)
+⇒ 文字可用宽 = widest − 10 ✗ ⇒ 差一丁点 ⇒ DirectWrite 默认换行 ⇒ 两字一行 ⇒ 竖排 ✓
+```
+
+而且**全仓没有一处 `SetWordWrapping`**：默认是"允许换行"，所以"差一点点"不会溢出成
+可见的错误，而是**折成两行**——这正是一个断言不会描述成"错"的错。
+
+**修法（两处，都是根因）**
+- `field::context_menu_width(word, shortcut, scale)`：**唯一**的宽度公式，把两处内缩都算进来
+  （`2×px(FMT_MENU_PAD_DIP + CONTEXT_TEXT_PAD_DIP)`）。`measure_context_menu` 改成**按行**量
+  （词 + 间距 + 键，取最宽那行），不再用"最宽词拼最宽键"（那描述的是不存在的行）。
+- `frame::no_wrap`：菜单行格式（`var_label_format`、`format_label_format`）设
+  `DWRITE_WORD_WRAPPING_NO_WRAP`。规则挂在格式上，因为**格式才是决定者**，一处答案服务所有行。
+
+### ② 快捷键 —— 菜单行是"词在左、键在右"
+
+`CONTEXT_SHORTCUTS = ["Ctrl+X", "Ctrl+C", "Ctrl+V", "Ctrl+A"]`，与 `CONTEXT_ITEMS` 同序；
+布局照 demo 的菜单行 token：`.var-item { justify-content: space-between; gap: 12px }`（`:219`）⇒
+`CONTEXT_ITEM_GAP_DIP = 12`，键**右对齐**、色 `--muted`（`.var-item .val`，`:221`），字号与菜单
+文字同一族（界面字，不是数字子集——那是只含 23 字符的等宽子集）。词矩形在键左侧再减一个间距，
+所以即使调用方给的宽度比量出来的窄，词与键也不会挤在一起。
+
+`form_drawn_strings()` 收进 `CONTEXT_SHORTCUTS`（先改生产者，门禁才看得见）；**门禁没有红**：
+`C t r l + X V A` 都已在既有子集里（327 codepoints），无需重建。
+
+### 证据
+
+- `a_menu_row_is_wide_enough_for_its_word_and_its_key`：**绝对数字**
+  `context_menu_width(40, 30, 1.0) == 40 + 12 + 30 + 2*(5+8)`，以及 2× 档
+  `== 40 + 24 + 30 + 2*26`（间距与两处内缩随 scale 走；**文字宽已是像素**，不再乘）。
+  用绝对数是因为"用同一组常量算出的宽度再去和这组常量比"抓不住一个错常量，而**漏掉一处内缩**
+  正是这个 bug 的形状。
+- `the_menu_rows_carry_the_keys_the_box_answers_to`：四条键逐字 + 与命令同长 + 每条是
+  `Ctrl+` 加一个字母。
+- **两条变异都真红**（各自先断言锚点命中恰好 1 处、还原后 SHA256 一致、`touch` 后见
+  `Compiling`）：
+  - M1 宽度忘掉菜单自己的 padding ⇒ 绝对数字那条 FAILED；
+  - M2 词与键的间距改成 0 ⇒ 同一条 FAILED。
+
+### 仍未覆盖（如实）
+
+- **"不换行"与"键右对齐"没有位图断言**：两者都在渲染层，需要设备上下文；位图断言要等
+  一个能画菜单的测试装置（现有几何测试只测矩形，不画）。
+- `measure_context_menu` 自身没有断言（需要 DWrite 工厂）；它的正确性由"宽度公式 + 按行量"
+  两处纯逻辑覆盖，**不是**由它的返回值覆盖。
+- 快捷键**不参与命中**：整行都是热区（`context_item_rect` 未改）。

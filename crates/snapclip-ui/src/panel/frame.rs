@@ -23,7 +23,8 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_ISOLATED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
     DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_FONT_WEIGHT_NORMAL,
     DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_CENTER,
-    DWRITE_TEXT_ALIGNMENT_LEADING, DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat,
+    DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_WORD_WRAPPING_NO_WRAP, DWriteCreateFactory, IDWriteFactory,
+    IDWriteTextFormat,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::HDC;
@@ -1570,12 +1571,28 @@ impl Frame<'_> {
             } else {
                 &self.brushes.muted
             };
-            painter.draw_text(
-                crate::panel::CONTEXT_ITEMS[index],
-                label,
-                inset,
-                brush,
-            );
+            // The key sits at the row's right end in the muted colour, which is what the token
+            // menu's value column is (`.var-item .val`, `:221`) — the same face, the same colour,
+            // one row.
+            let key = crate::panel::CONTEXT_SHORTCUTS[index];
+            let key_width = painter.measure_text_width(key, label)?.round() as i32;
+            let key_rect = Rect {
+                left: inset.right - key_width,
+                top: inset.top,
+                right: inset.right,
+                bottom: inset.bottom,
+            };
+            // The word ends one gap before the key (`.var-item { gap: 12px }`, `:219`), so a command
+            // and its key cannot run into each other even if a caller passes a narrower menu than
+            // the measurement asks for.
+            let word_rect = Rect {
+                left: inset.left,
+                top: inset.top,
+                right: key_rect.left - px(crate::panel::CONTEXT_ITEM_GAP_DIP),
+                bottom: inset.bottom,
+            };
+            painter.draw_text(crate::panel::CONTEXT_ITEMS[index], label, word_rect, brush);
+            painter.draw_text(key, label, key_rect, &self.brushes.muted);
         }
         Ok(())
     }
@@ -1985,7 +2002,25 @@ pub const VAR_FONT_DIP: f32 = 12.0;
 /// The token menu's labels: twelve dip at the body weight, leading-aligned because `.var-item` is
 /// `text-align: left` (`:219`) rather than centred like a button.
 pub fn var_label_format(dwrite: &IDWriteFactory, dpi: f32) -> Result<IDWriteTextFormat> {
-    text_format(dwrite, dpi, VAR_FONT_DIP, DWRITE_FONT_WEIGHT_NORMAL)
+    Ok(no_wrap(text_format(
+        dwrite,
+        dpi,
+        VAR_FONT_DIP,
+        DWRITE_FONT_WEIGHT_NORMAL,
+    )?))
+}
+
+/// A format that never wraps, for the rows of a menu.
+///
+/// DirectWrite wraps by default, so a row whose box comes out a few dips narrower than its word does
+/// not overflow: it breaks, and a two character command becomes a column of one character per line.
+/// That is what a right-click menu did. The rule belongs to the format rather than to each call site
+/// because the format is what decides, and one answer serves every menu row.
+fn no_wrap(format: IDWriteTextFormat) -> IDWriteTextFormat {
+    unsafe {
+        let _ = format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    }
+    format
 }
 
 /// The three shortcut chips' widths, measured once for the same reason the footer's are.
@@ -2034,12 +2069,22 @@ pub fn measure_path_change(dwrite: &IDWriteFactory, dpi: f32) -> Result<i32> {
 pub fn measure_context_menu(dwrite: &IDWriteFactory, dpi: f32) -> Result<i32> {
     let scale = (dpi / 96.0).max(0.5);
     let format = var_label_format(dwrite, dpi)?;
+    // Each row is measured as a row — its word, the design's gap, its key — and the menu takes the
+    // widest of them. Pairing the widest word with the widest key would describe a row that does
+    // not exist and leave the menu wider than it needs to be; the row that is measured here is the
+    // row that is drawn.
     let mut widest = 0i32;
-    for word in crate::panel::CONTEXT_ITEMS {
-        let measured = crate::panel::d2d::measure_text_width(dwrite, word, &format)?.round() as i32;
-        widest = widest.max(measured);
+    for (word, key) in crate::panel::CONTEXT_ITEMS
+        .iter()
+        .zip(crate::panel::CONTEXT_SHORTCUTS.iter())
+    {
+        let word_width = crate::panel::d2d::measure_text_width(dwrite, word, &format)?.round() as i32;
+        let key_width = crate::panel::d2d::measure_text_width(dwrite, key, &format)?.round() as i32;
+        widest = widest.max(crate::panel::context_menu_width(
+            word_width, key_width, scale,
+        ));
     }
-    Ok(widest + 2 * (crate::panel::CONTEXT_TEXT_PAD_DIP as f32 * scale).round() as i32)
+    Ok(widest)
 }
 
 pub fn measure_conflict_link(dwrite: &IDWriteFactory, dpi: f32) -> Result<[i32; 2]> {
@@ -2120,13 +2165,13 @@ pub fn format_label_format(dwrite: &IDWriteFactory, dpi: f32) -> Result<IDWriteT
     let families: Vec<&str> = std::iter::once(crate::panel::NUMBER_FAMILY)
         .chain(crate::panel::NUMBER_FALLBACKS)
         .collect();
-    text_format_in(
+    Ok(no_wrap(text_format_in(
         dwrite,
         dpi,
         BUTTON_FONT_DIP,
         DWRITE_FONT_WEIGHT_NORMAL,
         &families,
-    )
+    )?))
 }
 
 /// `.hint-text { font-size: 10px }` (`save-panel-demo-v3.html:262`). The quality row's explanation,
