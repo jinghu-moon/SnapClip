@@ -36,8 +36,12 @@ use snapclip_capture::save_format::SaveFormat;
 /// them and still reports `IsWindowVisible` as true, because every check that only asks the window
 /// about itself answers yes. That is exactly how a panel that is never seen passes every test, and
 /// it is why this is a constant with a test rather than a literal at the call site.
-pub(crate) const PANEL_EX_STYLE: u32 = windows_sys::Win32::UI::WindowsAndMessaging::WS_EX_TOOLWINDOW
-    | windows_sys::Win32::UI::WindowsAndMessaging::WS_EX_TOPMOST
+/// `WS_EX_TOOLWINDOW` is deliberately **absent**: it keeps a window out of the taskbar and out of
+/// Alt+Tab, and a window that is not in the taskbar has nowhere to go when it is minimised. The
+/// header's minimise button then did what the system does with a window that cannot minimise: it
+/// collapsed the panel into the corner of the desktop. A save dialog that can be sent away and
+/// brought back needs the taskbar entry that goes with it.
+pub(crate) const PANEL_EX_STYLE: u32 = windows_sys::Win32::UI::WindowsAndMessaging::WS_EX_TOPMOST
     // `IsDialogMessageW` only descends into the children of a window that says it is a container,
     // and descending is how `Tab` reaches the next field and how `Enter` and `Esc` become commands
     // at all (`Enter` is a save, `Esc` a cancel). Without the bit the panel is a window full of
@@ -53,10 +57,17 @@ pub(crate) const PANEL_EX_STYLE: u32 = windows_sys::Win32::UI::WindowsAndMessagi
 /// `WM_NCCALCSIZE` leaves nothing there to click. A button that cannot be clicked is worse than no
 /// button, so the bit is gone and the panel's own header draws the two it has.
 ///
-/// The minimize and maximize bits were never set, and are named here so that a later change has to
-/// say so out loud rather than inherit them from a caption.
+/// `WS_MINIMIZEBOX` is set, and it draws nothing: the caption button it would describe is drawn in
+/// the non-client area, which `WM_NCCALCSIZE` claims in full, so the header stays the only place a
+/// button appears. What the bit does is make the window minimisable, which is what gives the
+/// taskbar entry something to restore. It does not bring back the caption's close box — that was
+/// `WS_SYSMENU`, which stays out.
+///
+/// The maximize and thick-frame bits are still absent, and are named here so that a later change
+/// has to say so out loud rather than inherit them from a caption.
 pub(crate) const PANEL_STYLE: u32 = windows_sys::Win32::UI::WindowsAndMessaging::WS_OVERLAPPED
-    | windows_sys::Win32::UI::WindowsAndMessaging::WS_CAPTION;
+    | windows_sys::Win32::UI::WindowsAndMessaging::WS_CAPTION
+    | windows_sys::Win32::UI::WindowsAndMessaging::WS_MINIMIZEBOX;
 
 /// Replace the panel in `slot`: **close the old one, then create the new one, then store it.**
 ///
@@ -93,8 +104,8 @@ mod panel_slot_tests {
     use super::{PANEL_EX_STYLE, PANEL_STYLE, replace_panel};
     use std::sync::Mutex;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        WS_CAPTION, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU,
-        WS_THICKFRAME,
+        WS_CAPTION, WS_EX_CONTROLPARENT, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_MAXIMIZEBOX,
+        WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
     };
 
     #[test]
@@ -105,10 +116,19 @@ mod panel_slot_tests {
             "the capture overlay and its dim layer are topmost, so a panel without this bit is \
              painted underneath them and still reports itself visible"
         );
-        assert_ne!(
+        // This used to demand the opposite. A tool window is not in the taskbar, so minimising one
+        // has no destination and the system collapsed it into the corner of the desktop instead;
+        // the taskbar entry is what lets the panel be put away and brought back.
+        assert_eq!(
             PANEL_EX_STYLE & WS_EX_TOOLWINDOW,
             0,
-            "the panel stays out of the taskbar"
+            "the panel needs a taskbar entry so that minimising it has somewhere to go"
+        );
+        assert_ne!(
+            PANEL_EX_STYLE & WS_EX_CONTROLPARENT,
+            0,
+            "without the container bit `IsDialogMessageW` never descends to the fields, and then \
+             neither `Tab` nor `Enter` nor `Esc` means anything"
         );
     }
 
@@ -129,10 +149,13 @@ mod panel_slot_tests {
             0,
             "the system menu is what drew a close button the client area could not answer"
         );
-        assert_eq!(
+        // The opposite of what this asserted before, and the flip is the point: the bit makes the
+        // window minimisable, which is what the taskbar needs. It draws nothing here because the
+        // caption button lives in the non-client area that `WM_NCCALCSIZE` claims in full.
+        assert_ne!(
             PANEL_STYLE & WS_MINIMIZEBOX,
             0,
-            "the header draws the minimize button, not the caption"
+            "a window without this bit cannot be minimised, so it has no taskbar behaviour either"
         );
         assert_eq!(
             PANEL_STYLE & WS_MAXIMIZEBOX,

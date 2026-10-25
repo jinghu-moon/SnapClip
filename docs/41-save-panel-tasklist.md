@@ -1531,3 +1531,44 @@ M2 让 Path 也算可聚焦
 - “点击整行打开选择器”与“真的没有控件”只在有窗口时成立，测试装置没有窗口 ⇒ 靠编译（`!is_focusable()` 是唯一入口）与人眼；
 - 路径是**运行时数据**，字形子集只覆盖**字面量**：目录名里出现子集外的字会回退系统字体（与 A21 同一类）；
 - `hover` 显示完整路径与只读行的悬停态：未做，记 **A49 / A13**。
+
+---
+
+## 头部：最小化要真的能最小化
+
+用户报：**点最小化，窗口跑到屏幕左下角**，而不是最小化到任务栏。
+
+**两个位叠在一起**（`apps/snapclip/src/save/window.rs`）：
+
+| 位 | 改前 | 后果 |
+| --- | --- | --- |
+| `WS_EX_TOOLWINDOW` | **在** `PANEL_EX_STYLE` 里 | 工具窗口**不进任务栏**、不进 Alt+Tab ⇒ 最小化**没有目的地** ⇒ 折到桌面角落 |
+| `WS_MINIMIZEBOX` | **不在** `PANEL_STYLE` 里 | 窗口**不可最小化** ⇒ 任务栏也没有可恢复的对象 |
+
+⇒ 两件都要改：去掉 `WS_EX_TOOLWINDOW`（获得任务栏按钮 + Alt+Tab），加上 `WS_MINIMIZEBOX`（窗口可最小化）。
+
+**`WS_MINIMIZEBOX` 不会画出东西**：它描述的是**非客户区**的标题栏按钮，而 `WM_NCCALCSIZE` 把非客户区**全部**认作客户区 ⇒ 没有地方画。上一件那个小 × 是 **`WS_SYSMENU`** 带来的，与这一位无关，所以 `WS_SYSMENU` 仍然不在。
+
+**`WS_CAPTION` 不动**：DWM 的圆角、阴影、材质靠它。
+
+**没有波及别人**：`PANEL_STYLE` / `PANEL_EX_STYLE` 只在 `window.rs` 的创建处（`:671` / `:674`）使用，浮层用自己那套样式。owner 参数是 `null_mut()` ⇒ **无主窗口** ⇒ 去掉工具窗口位**确实**会得到任务栏按钮（有主窗口则不会）。
+
+**代价**：面板会**出现在任务栏与 Alt+Tab** 里。对"能最小化再叫回来"的保存对话框这是用户要的；对"永远浮在最上面的一次性面板"就不再成立。
+
+**变异（两条都真红；先断言锚点命中 1 处；还原后与 HEAD 的差异只有本节的改动）**：
+```
+M1 去掉 WS_MINIMIZEBOX
+   ⇒ the_panel_style_leaves_the_caption_buttons_to_the_header FAILED
+      assertion `left != right` failed: a window without this bit cannot be minimised
+      left: 0   right: 0
+
+M2 把 WS_EX_TOOLWINDOW 加回去
+   ⇒ the_panel_asks_to_be_above_the_windows_it_replaces FAILED
+      assertion `left == right` failed: the panel needs a taskbar entry
+      left: 128   right: 0
+```
+两条断言**都是反过来改的**：原来断言"有工具窗口位"与"没有最小化位"，现在断言相反的结论。这是**预期正确变化**，不是为了让实现通过——旧结论来自"头部自己画按钮，所以不要系统位"，而那条推理漏了"最小化需要任务栏"。
+
+**没覆盖的**：
+- "`WS_MINIMIZEBOX` 不画东西"是**读文档 + 推理**（非客户区被 `WM_NCCALCSIZE` 认满），没有窗口可截图 ⇒ 只真人可见；
+- 任务栏按钮与 Alt+Tab 里的实际表现：要真机看。
