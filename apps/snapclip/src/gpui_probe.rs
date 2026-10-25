@@ -376,6 +376,30 @@ pub const PROBE_ORIGINAL_SIZE: (u32, u32) = (1440, 900);
 /// The four size presets, as percentages (`:614`-`:619`: `data-pct="100|75|50|25"`).
 pub const PRESET_PERCENTS: [u32; 4] = [100, 75, 50, 25];
 
+/// The fill choices for a JPEG's transparent pixels (`:658` white, `:659` black).
+///
+/// The mockup's third swatch is a colour wheel that opens the system picker (`:660`); an arbitrary
+/// colour is not built, because a swatch that opens nothing would be a control that does not work.
+pub const FILL_SWATCHES: [[u8; 3]; 2] = [[0xff, 0xff, 0xff], [0x00, 0x00, 0x00]];
+
+/// The fill the panel starts with: white (`S.fill` at `:724`).
+pub const FILL_DEFAULT: usize = 0;
+
+/// `.fill-row`'s words: `透明区域填充` (`:656`).
+pub const FILL_LABEL: &str = "透明区域填充";
+
+/// `.bg-opt { width: 16px; height: 16px; border-radius: 4px }` (`:150`, `:58`).
+pub const SWATCH_SIZE: f32 = 16.0;
+/// See [`SWATCH_SIZE`]: `--r-input` at `:58` is the swatch's radius.
+pub const SWATCH_RADIUS: f32 = 4.0;
+
+/// How much the chosen swatch grows, in dip.
+///
+/// The mockup marks it with a ring (`:153`); the ring's styled helper is not among the ones this
+/// file uses, and a marker that has not been verified is worse than a bigger swatch, so the chosen
+/// one is drawn two dips wider instead. Recorded as a deviation rather than presented as the ring.
+pub const SWATCH_CHOSEN_GROWTH: f32 = 2.0;
+
 /// The size a preset asks for: the capture's own size scaled by a percentage (`:1165` of the
 /// mockup's script rounds rather than truncates), never smaller than one pixel.
 pub fn preset_size(original: (u32, u32), percent: u32) -> (u32, u32) {
@@ -395,6 +419,14 @@ pub struct GpuiProbe {
     format: usize,
     /// The chosen size mode, as an index into [`SIZE_MODE_WORDS`].
     mode: usize,
+    /// The chosen quality tier, as an index into [`QUALITY_OPTION_WORDS`] (`:641`-`:643`). Only
+    /// JPEG spends it; the tiers are hidden while PNG is chosen and the choice is kept, so coming
+    /// back to JPEG restores what was picked.
+    quality: usize,
+    /// The chosen fill for a JPEG's transparent pixels, as an index into [`FILL_SWATCHES`]
+    /// (`:658`/`:659`). The mockup's third swatch is a colour wheel (`:660`); picking an arbitrary
+    /// colour is not built, and that is recorded rather than faked with a colour that is not shown.
+    fill: usize,
     /// Which of the saved-after switches are on.
     after: [bool; 2],
     /// The picture a save would write. Synthetic: the probe captures nothing (see `gpui_save`).
@@ -446,6 +478,8 @@ impl GpuiProbe {
             height,
             format: 0,
             mode: 0,
+            quality: 0,
+            fill: FILL_DEFAULT,
             after: [false, false],
             picture: crate::gpui_save::Picture::synthetic(),
             estimate: None,
@@ -471,6 +505,8 @@ impl GpuiProbe {
             crate::gpui_save::format_of(self.format),
             &date,
             &time,
+            self.quality,
+            FILL_SWATCHES[self.fill],
         );
         self.estimate = crate::gpui_save::weight(&self.picture, &values, output);
     }
@@ -628,6 +664,23 @@ impl Render for GpuiProbe {
                             cx.notify();
                         }))
                     })),
+            )
+            // `.size-reset` sits at the row header's right end (`:232`) and puts the picture back
+            // to the capture's own size.
+            .child(
+                Button::new("probe-size-reset")
+                    .label("重置")
+                    .h(px(dip(scale, mockup::MODE_BUTTON_HEIGHT)))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        let (width, height) = PROBE_ORIGINAL_SIZE;
+                        let w = this.width.clone();
+                        w.update(cx, |state, cx| state.set_value(width.to_string(), window, cx));
+                        let h = this.height.clone();
+                        h.update(cx, |state, cx| state.set_value(height.to_string(), window, cx));
+                        this.weigh(cx);
+                        cx.notify();
+                        window.refresh();
+                    })),
             );
         let size_content = div()
             .v_flex()
@@ -747,15 +800,65 @@ impl Render for GpuiProbe {
                 )
                 .child(div().text_xs().child("KB"))
         } else if quality_shows_tiers(self.format) {
-            div()
-                .h(px(dip(scale, mockup::SEG_HEIGHT)))
+            // The tiers, and beneath them the fill for a JPEG's transparent pixels (`:655`-`:662`).
+            // Both live inside the same branch, so a format without tiers shows neither.
+            let mut tiers = div().h_flex().items_center().gap(px(dip(scale, mockup::QUALITY_LINE_GAP)));
+            for (index, word) in QUALITY_OPTION_WORDS.iter().enumerate() {
+                let button = Button::new(("probe-tier", index))
+                    .label(*word)
+                    .h(px(dip(scale, mockup::SEG_HEIGHT)));
+                let button = if self.quality == index {
+                    button.primary()
+                } else {
+                    button
+                };
+                tiers = tiers.child(button.on_click(cx.listener(move |this, _, _, cx| {
+                    this.quality = index;
+                    // Only JPEG spends the tier, so the note only changes for a format that does;
+                    // weighing is an encode and must not run per frame.
+                    this.weigh(cx);
+                    cx.notify();
+                })));
+            }
+            let mut swatches = div()
                 .h_flex()
                 .items_center()
-                .children(QUALITY_OPTION_WORDS.iter().enumerate().map(|(index, word)| {
-                    Button::new(("probe-tier", index))
-                        .label(*word)
-                        .h(px(dip(scale, mockup::SEG_HEIGHT)))
-                }))
+                .gap(px(dip(scale, mockup::QUALITY_LINE_GAP)))
+                .child(div().text_xs().child(FILL_LABEL));
+            for (index, colour) in FILL_SWATCHES.iter().enumerate() {
+                // A swatch is its own colour, so one that is chosen can be read at a glance; the
+                // chosen one grows instead of gaining a ring this file has no verified helper for.
+                let side = if self.fill == index {
+                    SWATCH_SIZE + SWATCH_CHOSEN_GROWTH
+                } else {
+                    SWATCH_SIZE
+                };
+                let swatch = div()
+                    .w(px(dip(scale, side)))
+                    .h(px(dip(scale, side)))
+                    .rounded(px(dip(scale, SWATCH_RADIUS)))
+                    .bg(gpui::Rgba {
+                        r: colour[0] as f32 / 255.0,
+                        g: colour[1] as f32 / 255.0,
+                        b: colour[2] as f32 / 255.0,
+                        a: 1.0,
+                    });
+                swatches = swatches.child(
+                    div()
+                        .id(("probe-fill", index))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.fill = index;
+                            this.weigh(cx);
+                            cx.notify();
+                        }))
+                        .child(swatch),
+                );
+            }
+            div()
+                .v_flex()
+                .gap(px(dip(scale, mockup::HEADER_GAP)))
+                .child(tiers)
+                .child(swatches)
         } else {
             div()
                 .h(px(dip(scale, mockup::SEG_HEIGHT)))
@@ -1125,6 +1228,8 @@ impl GpuiProbe {
             crate::gpui_save::format_of(self.format),
             &date,
             &time,
+            self.quality,
+            FILL_SWATCHES[self.fill],
         );
         let result = {
             // The switch, not the field, decides whether a ceiling applies; the number is read
@@ -1441,6 +1546,19 @@ mod tests {
         assert_eq!(PROBE_SIZE_LABELS, ["宽", "高"], "`.cell-label` (`:237`)");
         assert_eq!(PROBE_UNIT, "px", "`.dim-unit` (`:243`)");
         assert_eq!(PROBE_LIMIT, "限制体积", "`.switch-text` (`:634`)");
+    }
+}
+
+#[cfg(test)]
+mod reset_tests {
+    use super::PROBE_ORIGINAL_SIZE;
+
+    /// The reset goes back to the mockup's sample size, and the fields start there too, so the two
+    /// cannot part company: a reset that restored a different number than the fields began with
+    /// would look like it worked.
+    #[::core::prelude::v1::test]
+    fn the_reset_restores_the_size_the_fields_start_with() {
+        assert_eq!(PROBE_ORIGINAL_SIZE, (1440, 900), "`:593` is 1440 x 900");
     }
 }
 

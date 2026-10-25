@@ -42,6 +42,25 @@ impl Picture {
         }
     }
 
+    /// A picture whose middle is fully transparent, so a fill can be seen changing it.
+    ///
+    /// Test input, like [`Self::synthetic`]: the probe never shows it, and the only place it can be
+    /// observed is the file a save writes.
+    pub fn with_transparent_middle() -> Self {
+        let mut bgra = checker_bgra(PROBE_SOURCE);
+        let (w, _h) = (PROBE_SOURCE.width as usize, PROBE_SOURCE.height as usize);
+        for y in 16..48 {
+            for x in 16..48 {
+                let at = (y * w + x) * 4;
+                bgra[at..at + 4].copy_from_slice(&[0, 0, 0, 0]);
+            }
+        }
+        Self {
+            bgra,
+            source: PROBE_SOURCE,
+        }
+    }
+
     /// The pixels as the save chain wants them.
     pub fn frame(&self, output: Size) -> Frame<'_> {
         Frame {
@@ -89,17 +108,19 @@ pub fn values<'a>(
     format: SaveFormat,
     date: &'a str,
     time: &'a str,
+    quality_tier: usize,
+    fill: [u8; 3],
 ) -> PanelValues<'a> {
     PanelValues {
         directory,
         name,
         format,
-        // The probe shows the tiers but cannot pick one yet; the first tier is what the panel
-        // starts on, and only JPEG spends it.
-        quality: assemble::quality_of_tier(0),
+        // The tier the view chose, turned into the recorded number in one place (`docs/42` D8), so
+        // the probe cannot describe a quality the encoder would not receive.
+        quality: assemble::quality_of_tier(quality_tier),
         // A name that is taken is renamed rather than replaced, which is the panel's default.
         conflict: crate::save::service::ConflictPolicy::AutoRename,
-        fill: [0xff, 0xff, 0xff],
+        fill,
         date,
         time,
         sequence: 1,
@@ -218,6 +239,8 @@ mod tests {
             format_of(0),
             "2026-10-26",
             "0005",
+            0,
+            [0xff, 0xff, 0xff],
         );
         let written = save_within(&picture, &roomy, output, Some(1024 * 1024))
             .expect("a roomy ceiling still saves")
@@ -232,6 +255,8 @@ mod tests {
             format_of(0),
             "2026-10-26",
             "0005",
+            0,
+            [0xff, 0xff, 0xff],
         );
         let nothing = save_within(&picture, &cramped, output, Some(16));
         assert!(nothing.is_none(), "sixteen bytes cannot hold a png, so nothing is written");
@@ -261,6 +286,8 @@ mod tests {
                 format,
                 "2026-10-26",
                 "0005",
+            0,
+            [0xff, 0xff, 0xff],
             );
             let output = Size::new(96, 64);
             let outcome = save(&picture, &values, output).expect("the probe can save");
@@ -286,6 +313,8 @@ mod tests {
             SaveFormat::Png,
             "2026-10-26",
             "0005",
+            0,
+            [0xff, 0xff, 0xff],
         );
         let output = Size::new(64, 64);
         let note = weight(&picture, &values, output).expect("a small picture weighs something");
@@ -352,5 +381,114 @@ mod tests {
             };
             assert_eq!(format, expected, "{word} is the format at index {index}");
         }
+    }
+
+    /// The tier reaches the encoder: three tiers, three sizes, in order.
+    ///
+    /// The bytes are read from the files that landed, so a tier that is chosen but never used by
+    /// the encoder fails here rather than passing on a value that looks right.
+    #[test]
+    fn a_lower_quality_tier_writes_fewer_bytes() {
+        let dir = temp_dir("tiers");
+        // Noise compresses badly at every tier, so the three sizes differ rather than all hitting
+        // the same floor.
+        let mut bgra = Vec::new();
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        for _ in 0..(128 * 96) {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            bgra.push((seed & 0xff) as u8);
+            bgra.push(((seed >> 8) & 0xff) as u8);
+            bgra.push(((seed >> 16) & 0xff) as u8);
+            bgra.push(0xff);
+        }
+        let picture = Picture {
+            bgra,
+            source: Size::new(128, 96),
+        };
+        let mut sizes = Vec::new();
+        for tier in 0..3 {
+            let name = format!("tier-{tier}");
+            let values = values(
+                dir.to_str().expect("utf-8 path"),
+                &name,
+                format_of(1),
+                "2026-10-26",
+                "0005",
+                tier,
+                [0xff, 0xff, 0xff],
+            );
+            let written = save(&picture, &values, Size::new(128, 96)).expect("the save succeeds");
+            sizes.push(written.bytes);
+        }
+        assert!(
+            sizes[0] > sizes[1] && sizes[1] > sizes[2],
+            "each tier writes fewer bytes than the one above it: {sizes:?}"
+        );
+    }
+
+    /// The fill reaches the encoder, for a format that fills and not for one that does not.
+    #[test]
+    fn the_chosen_fill_colours_a_jpegs_transparent_pixels() {
+        let dir = temp_dir("fill");
+        let picture = Picture::with_transparent_middle();
+        let size = Size::new(64, 64);
+        let middle = |bytes: &[u8]| {
+            let image = image::load_from_memory(bytes).expect("the file decodes");
+            image.to_rgba8().get_pixel(32, 32).0
+        };
+
+        let black = values(
+            dir.to_str().expect("utf-8 path"),
+            "fill-black",
+            format_of(1),
+            "2026-10-26",
+            "0005",
+            0,
+            [0x00, 0x00, 0x00],
+        );
+        let written = save(&picture, &black, size).expect("the save succeeds");
+        let bytes = std::fs::read(&written.path).expect("the file is there");
+        let pixel = middle(&bytes);
+        assert!(
+            pixel[0] < 24 && pixel[1] < 24 && pixel[2] < 24,
+            "the transparent middle took the black fill: {pixel:?}"
+        );
+
+        let white = values(
+            dir.to_str().expect("utf-8 path"),
+            "fill-white",
+            format_of(1),
+            "2026-10-26",
+            "0005",
+            0,
+            [0xff, 0xff, 0xff],
+        );
+        let written = save(&picture, &white, size).expect("the save succeeds");
+        let bytes = std::fs::read(&written.path).expect("the file is there");
+        let pixel = middle(&bytes);
+        assert!(
+            pixel[0] > 180 && pixel[1] > 180 && pixel[2] > 180,
+            "the same pixel takes the white fill instead, so the fill is read: {pixel:?}"
+        );
+
+        let transparent = values(
+            dir.to_str().expect("utf-8 path"),
+            "fill-png",
+            format_of(0),
+            "2026-10-26",
+            "0005",
+            0,
+            [0x00, 0x00, 0x00],
+        );
+        let written = save(&picture, &transparent, size).expect("the save succeeds");
+        let bytes = std::fs::read(&written.path).expect("the file is there");
+        let image = image::load_from_memory(&bytes).expect("the file decodes");
+        assert_eq!(
+            image.to_rgba8().get_pixel(32, 32).0[3],
+            0,
+            "png keeps the transparency, so the fill is not applied to it"
+        );
     }
 }
