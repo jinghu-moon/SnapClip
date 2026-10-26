@@ -325,7 +325,11 @@ impl Shell {
             // is opened inside a task that owns the app handle.
             if std::env::var_os("SNAPCLIP_GPUI_PANEL").is_some() {
                 let (requests, incoming) = async_channel::unbounded::<crate::gpui_save::Picture>();
-                let _panel_task = cx.spawn(async move |_shell, cx: &mut AsyncApp| {
+                // Detached rather than bound to a local: a task that is dropped is cancelled, and
+                // it takes the receiver with it, which is why the next save reported a closed
+                // channel instead of opening a panel. Every other task in this file is detached
+                // for the same reason.
+                cx.spawn(async move |_shell, cx: &mut AsyncApp| {
                     while let Ok(picture) = incoming.recv().await {
                         let opened = cx.update(|cx| {
                             let options = WindowOptions {
@@ -361,7 +365,8 @@ impl Shell {
                             eprintln!("[save-panel] the framework panel did not open: {error:?}");
                         }
                     }
-                });
+                })
+                .detach();
                 events.set_save_opener(std::sync::Arc::new(move |pixels| {
                     let width = (pixels.region.right - pixels.region.left) as u32;
                     let height = (pixels.region.bottom - pixels.region.top) as u32;
