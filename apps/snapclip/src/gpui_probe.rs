@@ -1030,8 +1030,18 @@ impl Render for GpuiProbe {
         let (card_left, card_top, card_right, card_bottom) = PROBE_CARD;
         let card_w = card_right - card_left;
         let card_h = card_bottom - card_top;
+        // The rule fits the picture that is actually on the card, not the placeholder that stands
+        // in when the probe opens without one: fitting the placeholder made a captured picture
+        // keep the small box the icon would have had.
+        let source_size = match self.preview.is_some() {
+            true => {
+                let size = self.picture.size();
+                (size.width as f32, size.height as f32)
+            }
+            false => PROBE_PREVIEW_SIZE,
+        };
         let (drawn_left, drawn_top, drawn_right, drawn_bottom) =
-            fit_preview(PROBE_PREVIEW_SIZE, PROBE_CARD);
+            fit_preview(source_size, PROBE_CARD);
         let tile = PROBE_CHECKER_TILE;
         let columns = (card_w / tile).ceil() as usize;
         let tiles_high = (card_h / tile).ceil() as usize;
