@@ -299,6 +299,9 @@ pub mod mockup {
     pub const GHOST_ICON_WIDTH: f32 = 32.0;
     /// `.btn { height: var(--btn-h) }` (`:279`) with `--btn-h: 32px` (`:50`).
     pub const BUTTON_HEIGHT: f32 = 32.0;
+/// `.foot { padding: 12px 16px 12px; border-top: 1px solid … }` (`:274`) over a `32` button
+/// (`:279`): the footer is its own band at the window's bottom, not the last row of the form.
+pub const FOOTER_HEIGHT: f32 = 12.0 + BUTTON_HEIGHT + 12.0;
     /// `.row-header-actions { gap: 8px }` (`:224`).
     pub const HEADER_ACTION_GAP: f32 = 8.0;
     /// `.quality-line { gap: 12px }` (`:306`).
@@ -892,19 +895,25 @@ impl Render for GpuiProbe {
             .h_flex()
             .items_center()
             .gap(px(dip(scale, mockup::HEADER_ACTION_GAP)))
-            .child(row_label(PROBE_LABELS[4]))
-            .child(row_label(PROBE_LIMIT));
+            .child(row_label(PROBE_LABELS[4]));
         // The mockup's `限制体积` is a switch (`:631`-`:635`), not a word: turning it on is what
         // makes the `不超过 [500] KB` group appear (`:645`-`:649`) and what makes a save honour a
         // ceiling at all. It sits on the row's header beside the label, as the mockup draws it, and
         // its state is the same field the save reads, so the two cannot disagree.
         let limit_switch = Button::new("probe-limit")
-            .label(if self.limit_on { "限制体积 开" } else { "限制体积 关" })
+            .label(PROBE_LIMIT)
             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                 this.limit_on = !this.limit_on;
                 cx.notify();
                 window.refresh();
             }));
+        // The mockup's switch shows its state in the track, not in the word (`:631`-`:635`), so the
+        // on state is the button's emphasis rather than a suffix on the label.
+        let limit_switch = if self.limit_on {
+            limit_switch.primary()
+        } else {
+            limit_switch
+        };
         let quality_header = quality_header.child(limit_switch);
         let quality_content = if self.limit_on {
             // `不超过 [500] KB` (`:645`-`:649`): the field keeps its number while the switch is off,
@@ -1108,7 +1117,12 @@ impl Render for GpuiProbe {
         div()
             .relative()
             .size_full()
-            .p(px(dip(scale, PROBE_PADDING)))
+            .px(px(dip(scale, PROBE_PADDING)))
+            .pt(px(dip(scale, PROBE_PADDING)))
+            // The footer's band is reserved rather than painted over: the mockup's footer is the
+            // window's last child (`:274`), so the body simply ends above it. Without this the
+            // column ran underneath the footer and its last row was cut.
+            .pb(px(dip(scale, mockup::FOOTER_HEIGHT)))
             .bg(theme.background)
             .text_color(theme.foreground)
             .child(
@@ -1740,8 +1754,7 @@ mod tests {
         assert_eq!(SIZE_MODE_WORDS, ["数值", "百分比"], "`:226`/`:227`");
         assert_eq!(PROBE_SIZE_LABELS, ["宽", "高"], "`.cell-label` (`:237`)");
         assert_eq!(PROBE_UNIT, "px", "`.dim-unit` (`:243`)");
-        assert_eq!(PROBE_LIMIT, "限制体积", "`.switch-text` (`:634`)");
-    }
+        assert_eq!(PROBE_LIMIT, "限制体积", "`.switch-text` (`:634`)");    }
 }
 
 #[cfg(test)]
