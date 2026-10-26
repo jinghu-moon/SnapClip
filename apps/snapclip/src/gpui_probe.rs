@@ -329,6 +329,19 @@ pub const FOOTER_HEIGHT: f32 = 12.0 + BUTTON_HEIGHT + 12.0;
         ]
     }
 
+    /// The rows that open a group, so the extra margin above them is data rather than a flag
+    /// passed at a call site.
+    ///
+    /// The mockup groups the column as 路径 · 文件名 · 保存后, then 尺寸 · 质量, then 预估大小, and
+    /// puts the extra four dips above a row that opens a group (`:163`). Which rows those are was
+    /// previously a boolean at each call site, and it was passed the wrong way round: the margin
+    /// landed above 质量, which shares the size row's group. A name list cannot be swapped that way.
+    pub const GROUP_OPENERS: [&str; 2] = ["size", "estimate"];
+
+    /// Whether a row, by name, begins a group.
+    pub fn opens_group(row: &str) -> bool {
+        GROUP_OPENERS.contains(&row)
+    }
     /// How tall the whole column is: headers, the parts under them, and the gaps between rows.
     ///
     /// Every row pays a header and the gap under it, so those two are counted once per row; the
@@ -369,19 +382,19 @@ fn row(
     } else {
         0.0
     };
+    let header_node = div()
+        .h(px(dip(scale, mockup::HEADER_HEIGHT)))
+        .h_flex()
+        .items_center()
+        .justify_between()
+        .child(header);
+    let content_node = div().child(content);
     div()
         .v_flex()
         .mt(px(group_margin))
         .gap(px(dip(scale, mockup::HEADER_GAP)))
-        .child(
-            div()
-                .h(px(dip(scale, mockup::HEADER_HEIGHT)))
-                .h_flex()
-                .items_center()
-                .justify_between()
-                .child(header),
-        )
-        .child(content)
+        .child(header_node)
+        .child(content_node)
 }
 
 /// A row label, in the mockup's own type size.
@@ -726,6 +739,7 @@ impl Render for GpuiProbe {
 
         // 文件名: the box, the variable button and the format button, in that order (`:552`).
         let name_row = row(
+
             row_label(PROBE_LABELS[1]),
             div()
                 .h_flex()
@@ -750,6 +764,7 @@ impl Render for GpuiProbe {
 
         // 保存后: the two switches, which really toggle.
         let saved_row = row(
+
             row_label(PROBE_LABELS[2]),
             div()
                 .h_flex()
@@ -893,7 +908,9 @@ impl Render for GpuiProbe {
                             }))
                     })),
             );
-        let size_row = row(size_header, size_content, false, scale);
+        // 尺寸 opens the second group. The mockup puts the extra margin above this row (`:163`),
+        // not above the quality row, which shares the size row's group.
+        let size_row = row(size_header, size_content, mockup::opens_group("size"), scale);
 
         // 质量: for PNG the mockup hides the tiers and states why (`:638`, `:639`); for the other
         // formats it draws the three tiers instead (`:641`-`:643`). Which of the two is the same
@@ -1004,7 +1021,8 @@ impl Render for GpuiProbe {
                 .items_center()
                 .child(div().text_xs().child(QUALITY_HINT_TEXT))
         };
-        let quality_row = row(quality_header, quality_content, true, scale);
+        // The quality row sits inside the group the size row opened, so it pays no margin of its own.
+        let quality_row = row(quality_header, quality_content, mockup::opens_group("quality"), scale);
 
         // 预估大小: the value sits at the row's right end (`:668`), as the mockup draws it. It is
         // the length of the file a save would write, from one real encode — not the mockup's sample
@@ -1014,6 +1032,7 @@ impl Render for GpuiProbe {
             .clone()
             .unwrap_or_else(|| "—".to_owned());
         let estimate_row = row(
+
             row_label(PROBE_LABELS[5]),
             div()
                 .h(px(dip(scale, mockup::ESTIMATE_HEIGHT)))
@@ -1712,6 +1731,25 @@ mod tests {
         );
     }
 
+    /// The window the panel opens is the size the panel is laid out for.
+    ///
+    /// The panel's own metric is the source: the content is placed for that size rather than
+    /// reflowed, which is why the window is opened unresizable. If the two ever part company the
+    /// panel would be drawn in the corner of a frame of a different size.
+    #[::core::prelude::v1::test]
+    fn the_window_is_the_size_the_panel_is_laid_out_for() {
+        assert_eq!(
+            PROBE_HEIGHT,
+            DEMO.panel_height() as f32,
+            "the window's height is the panel's own (`panel_height`)"
+        );
+        assert_eq!(
+            PROBE_WIDTH - 2.0 * PROBE_PADDING - column_width(),
+            556.0 + 12.0,
+            "what the window keeps beyond the column is the preview and the gap"
+        );
+    }
+
     /// The column's width is the panel's metric, so the two renderers compare like with like.
     #[::core::prelude::v1::test]
     fn the_column_is_as_wide_as_the_panels() {
@@ -2017,7 +2055,8 @@ mod chip_bounds_tests {
                 px(super::mockup::CHIP_HEIGHT),
                 "a chip is drawn at the mockup's 24 dip (`.chip {{ height: 24px }}`, :192)"
             );
-        });
+        })
+        .expect("the chip's frame renders; a failed render would otherwise pass silently");
     }
 
     /// The column renders at the height the budget is computed from.
@@ -2051,6 +2090,35 @@ mod chip_bounds_tests {
                 column.size.height,
                 px(super::dip(scale, super::mockup::column_height()))
             );
-        });
+        })
+        .expect("the column's frame renders; a failed render would otherwise pass silently");
+    }
+}
+/// Which rows carry the extra margin, as data.
+///
+/// This is a pure assertion on purpose. Measuring the rendered gaps was tried and works when the
+/// test runs alone but not in the full suite: the harness registers test-support nodes in a way
+/// that depends on what ran before, and the lookup then reports an empty scope. Rather than pin a
+/// test on that ordering, the rows are a list and the list is asserted here; a call site that
+/// passes the wrong boolean is what the list cannot catch, and the note beside `row()` says so.
+#[cfg(test)]
+mod group_tests {
+    use super::mockup;
+
+    #[::core::prelude::v1::test]
+    fn the_rows_that_open_a_group_are_the_mockups_two() {
+        assert_eq!(
+            mockup::GROUP_OPENERS,
+            ["size", "estimate"],
+            "the mockup puts the group margin above 尺寸 and 预估大小 (`:163`)"
+        );
+        assert!(mockup::opens_group("size"), "尺寸 opens a group (`:163`)");
+        assert!(mockup::opens_group("estimate"), "预估大小 opens a group (`:163`)");
+        for shared in ["path", "name", "saved", "quality"] {
+            assert!(
+                !mockup::opens_group(shared),
+                "{shared} shares the group above it, so it pays no margin of its own"
+            );
+        }
     }
 }
