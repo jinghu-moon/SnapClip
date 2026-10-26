@@ -2187,3 +2187,18 @@ let _panel_task = cx.spawn(async move |_shell, cx: &mut AsyncApp| { … })
 ⚠️ 证据边界：**观察到的是**"绑定到局部 ⇒ 通道已关"，**改的是**"按同文件既有写法 detach"。至于"**任务被丢弃 ⇒ 被取消 ⇒ 接收端随之 drop**"这一步，**是推断**——没能在已安装的源码里找到 `Task` 的 `Drop` 实现（`gpui-fast-0.1.10` / `gpui-fast-platform` / `gpui-base-0.8.0` 都没有 `impl Drop for Task`，该类型在别处）。**结论按观察记，机制按推断记**。
 
 ⇒ 教训（这一条不依赖机制）：**`cx.spawn` 的返回值不是可以不管的句柄** —— 要么 `await`，要么 `detach`。
+
+## 探针：按钮高度与列高 —— 用 UI 集成测试量，而不是推断
+
+docs/41 的探针一节此前记过一条推断：「Button 的内部尺寸压过 \.h(24)\，所以三组 chip 每行实际 36 dip，列高 474+36=510 超过可用的 492」。这条推断**没有被证实**，而且用一条 \#[gpui_kit::test]\ 量下来是**错的**。
+
+量法（\pps/snapclip/src/gpui_probe.rs\ 的 \chip_bounds_tests\ 模块）：
+
+1. \_chip_button_is_as_tall_as_it_is_told\ —— 渲染一个 \.h(px(CHIP_HEIGHT))\ 的 \Button\，用 \window.find(...).bounds()\ 断言它的**渲染后高度 == 24**。**结果：绿。** ⇒ 按钮的尺寸没有被内部样式压过 ⇒ 那条推断作废 ⇒ **自绘 chip 的 A 方案不需要做**。
+2. \	he_column_renders_at_the_height_it_is_summed_from\ —— 渲染**真正的** \GpuiProbe\，断言右栏容器的渲染高度 **不高于** \mockup::column_height()\ 的和。**实测：916 px vs 948 px（即 458 dip vs 474 dip，测试窗口 scale 2.0）** ⇒ 列比求和**矮 16 dip** ⇒ 求和是**上界**，不是恒等 ⇒ 断言写成"不高于"，并把这个 16 dip 的差如实写在注释里（**没有人解释过它**）。
+
+⇒ 结论：**屏幕上的底栏重叠不是列超高造成的**。列没有超预算，重叠来自**底栏占位没有预留**（已在 \6574690\ 修掉：根容器 \.pb(FOOTER_HEIGHT)\）。这两条断言留在仓库里，将来谁再"推断某一行为什么高"，先让它变红。
+
+两处**仪器**教训（这一路的老朋友）：
+- \Button\ 不支持 \.test_support()\（trait bound 不满足）⇒ 用一个包住它的 \div\ 注册 id；\div\ 是包住子元素的高度，所以量到的就是按钮的渲染高度。
+- 同一个 id 注册两次会 **ambiguous \ElementId\**：\Button::new("chip")\ 本身已经带 id \chip\，包装的 \div\ 必须用另一个名字（\chip-box\）。

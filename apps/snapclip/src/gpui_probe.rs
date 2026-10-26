@@ -1152,6 +1152,8 @@ impl Render for GpuiProbe {
                     .child(preview_card)
                     .child(
                         div()
+                            .id("form-column")
+                            .test_support()
                             .w(px(dip(scale, column_width())))
                             .v_flex()
                             .gap(px(dip(scale, mockup::ROW_GAP)))
@@ -1966,5 +1968,89 @@ mod preview_tests {
             super::mockup::column_height(),
             available
         );
+    }
+}
+
+#[cfg(test)]
+mod chip_bounds_tests {
+    use gpui_kit::component::Root;
+    use gpui_kit::component::button::Button;
+    use gpui_kit::prelude::*;
+    use gpui_kit::test::{TestSupportExt, TestWindowExt};
+    use gpui_kit::{AppContext, Context, TestAppContext, Window, px, size};
+
+    /// A single button, asked for the mockup's chip height.
+    struct ChipProbe;
+
+    impl Render for ChipProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            gpui_kit::div().p_4().child(
+                gpui_kit::div()
+                    .id("chip-box")
+                    .test_support()
+                    .child(
+                        Button::new("chip")
+                            .label("桌面")
+                            .h(px(super::mockup::CHIP_HEIGHT)),
+                    ),
+            )
+        }
+    }
+
+    /// Whether a button's own sizing yields to `.h()`.
+    /// The column's height is summed from the mockup's `.chip { height: 24px }` (`:192`) and then
+    /// compared with the space above the footer. If a button renders taller than it is asked for,
+    /// that sum describes a column that does not exist, which is how the footer came to overlap
+    /// the preset row while the arithmetic said everything fitted.
+    #[gpui_kit::test]
+    fn a_chip_button_is_as_tall_as_it_is_told(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(320.), px(200.)), |window, cx| {
+            let view = cx.new(|_| ChipProbe);
+            Root::new(view, window, cx)
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let chip = window.find("chip-box").bounds();
+            assert_eq!(
+                chip.size.height,
+                px(super::mockup::CHIP_HEIGHT),
+                "a chip is drawn at the mockup's 24 dip (`.chip {{ height: 24px }}`, :192)"
+            );
+        });
+    }
+
+    /// The column renders at the height the budget is computed from.
+    ///
+    /// The footer's band is reserved using `column_height()`, so if the rows actually render
+    /// taller than that sum, the reservation is short and the footer overlaps the last row exactly
+    /// as it did on screen. This compares the sum with what the window lays out.
+    #[gpui_kit::test]
+    fn the_column_renders_at_the_height_it_is_summed_from(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(
+            size(px(super::PROBE_WIDTH), px(super::PROBE_HEIGHT)),
+            |window, cx| {
+                let probe = cx.new(|cx| {
+                    super::GpuiProbe::with_picture(crate::gpui_save::Picture::synthetic(), window, cx)
+                });
+                Root::new(probe, window, cx)
+            },
+        );
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let scale = window.scale_factor();
+            let column = window.find("form-column").bounds();
+            // Measured rather than derived: the rows render sixteen dips shorter than the sum
+            // they are computed from, so the sum is an upper bound and not an identity. Guarding
+            // the bound is what the footer's reservation needs; asserting equality would pin a
+            // discrepancy nobody has explained yet.
+            assert!(
+                column.size.height <= px(super::dip(scale, super::mockup::column_height())),
+                "the column renders at {:?} but the footer's band is computed from {:?}",
+                column.size.height,
+                px(super::dip(scale, super::mockup::column_height()))
+            );
+        });
     }
 }
