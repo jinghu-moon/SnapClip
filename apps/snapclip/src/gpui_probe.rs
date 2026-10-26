@@ -456,6 +456,11 @@ pub struct GpuiProbe {
     conflict: crate::save::service::ConflictPolicy,
     /// The picture a save would write. Synthetic: the probe captures nothing (see `gpui_save`).
     picture: crate::gpui_save::Picture,
+    /// The same picture encoded once into a temporary PNG, which is what the card displays.
+    ///
+    /// `None` until a captured picture arrives and when the encode fails; the card then keeps the
+    /// placeholder rather than showing a file left behind by a previous window.
+    preview: Option<std::path::PathBuf>,
     /// How heavy the file would be, as the note at the bottom of the form says.
     estimate: Option<String>,
     /// What the footer says after a save that did not happen, and nothing otherwise.
@@ -499,6 +504,7 @@ impl GpuiProbe {
             .height
             .update(cx, |state, cx| state.set_value(size.height.to_string(), &mut *window, cx));
         probe.picture = picture;
+        probe.preview = crate::gpui_save::preview_png(&probe.picture);
         probe
     }
 
@@ -545,6 +551,7 @@ impl GpuiProbe {
             after: crate::gpui_save::remembered_after(),
             conflict: crate::save::service::ConflictPolicy::AutoRename,
             picture: crate::gpui_save::Picture::synthetic(),
+            preview: None,
             estimate: None,
             status: None,
             limit_on: false,
@@ -1087,13 +1094,16 @@ impl Render for GpuiProbe {
             }
             board = board.child(line);
         }
-        // The probe runs from the repository root, so the file is resolved against the working
-        // directory rather than against the asset bundle, which does not carry it.
-        let preview_relative = std::path::Path::new(PROBE_PREVIEW_FILE);
-        let preview_source = match std::env::current_dir() {
-            Ok(directory) => directory.join(preview_relative),
-            Err(_) => preview_relative.to_path_buf(),
+        // The captured picture, encoded once into a temporary PNG, so the card shows a file the
+        // encoder produced rather than a placeholder. Without one the placeholder stays: the probe
+        // opens a window before a capture exists, and a card that showed nothing would look broken.
+        // Either way the file is resolved against the working directory rather than the asset
+        // bundle, which carries neither.
+        let placeholder = match std::env::current_dir() {
+            Ok(directory) => directory.join(std::path::Path::new(PROBE_PREVIEW_FILE)),
+            Err(_) => std::path::PathBuf::from(PROBE_PREVIEW_FILE),
         };
+        let preview_source = self.preview.clone().unwrap_or(placeholder);
         let preview_card = div()
             .w(px(dip(scale, card_w)))
             .h(px(dip(scale, card_h)))
@@ -1922,6 +1932,29 @@ mod preview_tests {
             corner_step((100.0, 200.0, 116.0, 216.0), PROBE_CARD, PROBE_CARD_RADIUS),
             None,
             "the middle of the card is more than a radius from every corner"
+        );
+    }
+
+    /// The footer's height is the mockup's, and the column fits in what the footer leaves.
+    ///
+    /// The first assertion names the number rather than deriving it, because the failure this
+    /// guards happened when the footer occupied space that nothing had reserved: the column ran
+    /// underneath it and the last row was clipped. The second asserts the budget itself, so a row
+    /// added later fails here instead of on screen.
+    #[::core::prelude::v1::test]
+    fn the_column_fits_above_the_footer() {
+        assert_eq!(
+            super::mockup::FOOTER_HEIGHT,
+            56.0,
+            "`.foot` is `padding: 12px 16px` (274) around a `.btn` of 32 (279)"
+        );
+        let available =
+            super::PROBE_HEIGHT - super::PROBE_PADDING - super::mockup::FOOTER_HEIGHT;
+        assert!(
+            super::mockup::column_height() <= available,
+            "the column is {} dip and the space above the footer is {}",
+            super::mockup::column_height(),
+            available
         );
     }
 }

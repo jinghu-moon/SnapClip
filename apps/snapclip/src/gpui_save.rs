@@ -289,6 +289,34 @@ pub fn save(
     assemble::save_panel(values, &picture.frame(output))
 }
 
+/// The picture as a PNG in a private temporary folder, so the preview shows a file the same encoder
+/// produced rather than a second decoding of the same pixels.
+///
+/// Encoded at the picture's own size, because the panel's preview shows the captured image and not
+/// the resized output: a preview sized to the current fields would describe a file nobody asked for.
+/// The name carries no variables, so the date, the time, the sequence and the application name are
+/// never read — they are filled with the values those fields have when nothing asks for them.
+pub fn preview_png(picture: &Picture) -> Option<std::path::PathBuf> {
+    let folder = std::env::temp_dir().join("snapclip-preview");
+    std::fs::create_dir_all(&folder).ok()?;
+    let values = PanelValues {
+        directory: folder.to_str()?,
+        name: "preview",
+        format: SaveFormat::Png,
+        quality: 0,
+        conflict: ConflictPolicy::Overwrite,
+        fill: [0xff, 0xff, 0xff],
+        date: "1970-01-01",
+        time: "0000",
+        sequence: 1,
+        app: "",
+    };
+    let size = picture.size();
+    assemble::save_panel(&values, &picture.frame(size))
+        .ok()
+        .map(|outcome| outcome.path)
+}
+
 /// The size that fits the limit, from a real encode at each candidate size.
 ///
 /// The search is the panel's own (`estimate::fit_under`), so the probe cannot shrink differently
@@ -717,5 +745,28 @@ mod tests {
             "a free name has nothing to link to"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The preview file is the picture at its own size, produced by the same chain a save uses, so
+    /// the card cannot show something the encoder would never write.
+    #[::core::prelude::v1::test]
+    fn the_preview_is_the_picture_at_its_own_size() {
+        let picture = Picture::synthetic();
+        let path = preview_png(&picture).expect("encoding the preview has to succeed");
+        let bytes = std::fs::read(&path).expect("the preview file has to be readable");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            &bytes[..8],
+            &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
+            "the preview has to be a png"
+        );
+        let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+        let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+        let size = picture.size();
+        assert_eq!(
+            (width, height),
+            (size.width, size.height),
+            "the preview has to be the picture's own size"
+        );
     }
 }
