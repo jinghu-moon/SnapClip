@@ -478,6 +478,27 @@ pub struct GpuiProbe {
 }
 
 impl GpuiProbe {
+    /// The same view, showing a picture a capture handed over instead of the synthetic one.
+    ///
+    /// A real capture starts the size cells at its own size, which is what the drawn panel does
+    /// with `capture_size`; the synthetic picture keeps the mockup's own numbers.
+    pub fn with_picture(
+        picture: crate::gpui_save::Picture,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut probe = Self::new(&mut *window, cx);
+        let size = picture.size();
+        probe
+            .width
+            .update(cx, |state, cx| state.set_value(size.width.to_string(), &mut *window, cx));
+        probe
+            .height
+            .update(cx, |state, cx| state.set_value(size.height.to_string(), &mut *window, cx));
+        probe.picture = picture;
+        probe
+    }
+
     /// Build the view, seeding the name field with the template the panel uses.
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();

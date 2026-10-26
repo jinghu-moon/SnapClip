@@ -319,6 +319,61 @@ impl Shell {
             // the number across saves (`:201`), and a panel is opened per capture, so neither can
             // live inside a panel.
             let save_remembered = std::sync::Arc::new(std::sync::Mutex::new(save::Remembered::default()));
+            // `SNAPCLIP_GPUI_PANEL=1` sends the capture to the framework-drawn panel instead of the
+            // drawn one. The two do not share a window: the request arrives on the capture thread
+            // and the framework runs its own, so the picture travels over a channel and the window
+            // is opened inside a task that owns the app handle.
+            if std::env::var_os("SNAPCLIP_GPUI_PANEL").is_some() {
+                let (requests, incoming) = async_channel::unbounded::<crate::gpui_save::Picture>();
+                let _panel_task = cx.spawn(async move |_shell, cx: &mut AsyncApp| {
+                    while let Ok(picture) = incoming.recv().await {
+                        let opened = cx.update(|cx| {
+                            let options = WindowOptions {
+                                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                                    point(px(0.0), px(0.0)),
+                                    size(
+                                        px(gpui_probe::PROBE_WIDTH),
+                                        px(gpui_probe::PROBE_HEIGHT),
+                                    ),
+                                ))),
+                                titlebar: Some(TitlebarOptions {
+                                    title: Some(gpui_probe::PROBE_TITLE.into()),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            };
+                            // The picture is taken out of a cell rather than moved in, so the
+                            // closures below stay plain borrows: a `move` closure would capture
+                            // `window` too, and it is needed again for `Root`.
+                            let pending = std::cell::RefCell::new(Some(picture));
+                            cx.open_window(options, |window, cx| {
+                                let taken = pending
+                                    .borrow_mut()
+                                    .take()
+                                    .expect("the panel window is opened once");
+                                let view = cx.new(|cx| {
+                                    gpui_probe::GpuiProbe::with_picture(taken, window, cx)
+                                });
+                                cx.new(|cx| Root::new(view, window, cx))
+                            })
+                        });
+                        if let Err(error) = opened {
+                            eprintln!("[save-panel] the framework panel did not open: {error:?}");
+                        }
+                    }
+                });
+                events.set_save_opener(std::sync::Arc::new(move |pixels| {
+                    let width = (pixels.region.right - pixels.region.left) as u32;
+                    let height = (pixels.region.bottom - pixels.region.top) as u32;
+                    let picture = crate::gpui_save::Picture::from_selection(
+                        pixels.bgra.clone(),
+                        crate::save::scale::Size::new(width, height),
+                    );
+                    requests
+                        .try_send(picture)
+                        .map_err(|error| format!("{error}"))
+                }));
+            } else {
             events.set_save_opener(std::sync::Arc::new(move |pixels| {
                 let width = (pixels.region.right - pixels.region.left) as u32;
                 let height = (pixels.region.bottom - pixels.region.top) as u32;
@@ -342,6 +397,7 @@ impl Shell {
                 )?;
                 Ok(())
             }));
+            }
         }
         Self {
             history,

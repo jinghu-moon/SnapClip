@@ -29,6 +29,7 @@ const CHECKER: [[u8; 4]; 2] = [[0x3e, 0x36, 0x32, 0xff], [0x2a, 0x24, 0x21, 0xff
 /// A struct rather than a bare `Vec<u8>` because [`Frame`] borrows the pixels: a function returning
 /// a `Frame` could not own them, and a caller assembling the two by hand could pass a buffer of one
 /// size with a caption of another.
+#[derive(Clone)]
 pub struct Picture {
     bgra: Vec<u8>,
     source: Size,
@@ -60,6 +61,17 @@ impl Picture {
             bgra,
             source: PROBE_SOURCE,
         }
+    }
+
+    /// The picture a capture handed over: `bgra` is top-down and tightly packed, which is exactly
+    /// what [`SelectionPixels::bgra`] promises, so no row walking happens here.
+    pub fn from_selection(bgra: Vec<u8>, source: Size) -> Self {
+        Self { bgra, source }
+    }
+
+    /// The capture's own size, which the size cells start at.
+    pub fn size(&self) -> Size {
+        self.source
     }
 
     /// The pixels as the save chain wants them.
