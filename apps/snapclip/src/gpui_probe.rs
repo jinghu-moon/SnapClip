@@ -1197,10 +1197,20 @@ impl Render for GpuiProbe {
                     .h(px(dip(scale, mockup::BUTTON_HEIGHT)))
                     .h_flex()
                     .items_center()
+                    // The bar clips too, so anything that does not fit is cut at the bar rather
+                    // than painted above it: the link used to appear over the row above, which is
+                    // overflow made visible, not a second line.
+                    .overflow_hidden()
                     .gap(px(dip(scale, mockup::HEADER_ACTION_GAP)))
                     .child(
+                        // `overflow_hidden` is what lets this shrink. A flex item's automatic
+                        // minimum width is its content's, so a long status sentence pushes the
+                        // buttons beside it out of the bar however small its flex basis is; the
+                        // automatic minimum becomes zero once the item clips, which is the same
+                        // rule the mockup relies on when it truncates the status line (`:277`).
                         div()
                             .flex_1()
+                            .overflow_hidden()
                             .text_sm()
                             .child(self.status.clone().unwrap_or_default()),
                     );
