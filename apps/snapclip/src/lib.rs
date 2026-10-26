@@ -344,6 +344,10 @@ impl Shell {
                                     title: Some(gpui_probe::PROBE_TITLE.into()),
                                     ..Default::default()
                                 }),
+                                // The panel is laid out for one size (`DEMO`, 920×564) and its
+                                // content is placed rather than reflowed, so a stretched window
+                                // would show the panel in the corner of an empty frame.
+                                is_resizable: false,
                                 ..Default::default()
                             };
                             // The picture is taken out of a cell rather than moved in, so the
@@ -601,6 +605,10 @@ pub fn run(options: StartupOptions) {
                 // separate question, and two windows would ask the eye to compare two things
                 // instead of one. Unset, this branch is not taken and the shell is untouched.
                 if probe {
+                    // The panel is laid out for one size (`DEMO`, 920×564), and its content is
+                    // placed rather than reflowed: a window the user can stretch would show the
+                    // same content in the top-left of a larger frame. So it is not resizable,
+                    // which also greys out the maximize button.
                     let probe_options = WindowOptions {
                         window_bounds: Some(WindowBounds::Windowed(Bounds::new(
                             point(px(0.0), px(0.0)),
@@ -610,6 +618,7 @@ pub fn run(options: StartupOptions) {
                             title: Some(gpui_probe::PROBE_TITLE.into()),
                             ..Default::default()
                         }),
+                        is_resizable: false,
                         ..Default::default()
                     };
                     cx.open_window(probe_options, |window, cx| {
