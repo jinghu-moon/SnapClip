@@ -1,0 +1,1150 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>SnapClip 保存面板 · 设计提案（拟议）</title>
+<!--
+  这个文件是**设计/核对用**的 demo，不是产品 UI。保存面板在代码里还不存在
+  （`crates/snapclip-capture/src/region.rs` 的 `Destination` 只有 `Copy` / `Pin`，
+  注释写着「保存面板还没做」；编码器也只有 PNG）。所以本 demo 的全部内容都是**拟议**，
+  落地时以 docs/23 的裁决为准，再反过来同步这里 —— 参照 §14.55.11 的同步口径。
+
+  沿用 `deepseek_html_20261017_989f8c.html` 的 token 与组件语汇，没有另起一套：
+  颜色 / 字号 / 几何 / 圆角全部取自下面同一个 `:root`，浮层复用 `.pop`，
+  图标按钮复用 `.action`，胶囊复用 `.chip`，分段器复用 `.seg`。
+
+  唯一补上的 token 是 `--seg-inset: 2px`：基线里 `.seg` 的 padding、`.block` 的 top/bottom、
+  `.opt` 的高度都引用它，但 `:root` 从未定义 —— 于是分段器的内边距和滑块定位实际是失效的。
+  PNG 下质量分段器 `display:none`，所以这个缺陷在基线里看不见。
+
+  基线还有第二处隐性缺陷，一并修掉：`$('quality-seg').setProperty('--index', …)` 少了 `.style`
+  （`setProperty` 属于 CSSStyleDeclaration，不属于元素）。PNG 下那行在 `display:none` 的分支里
+  被跳过，只有切到 JPG / WebP 才抛 TypeError —— 而且抛在 update() 中段，
+  体积读数、齿轮上的点、页脚状态行会跟着一起停摆。
+
+  ── 九项新增（编号对应提案清单）──────────────────────────────────────────
+  ① 页脚「复制」按钮：取消与保存之间，幽灵样式 + 图标（次级按钮，不抢主操作）。
+  ② 页脚「保存后打开文件夹」勾选：紧跟左侧路径读数。
+  ③ 文件名输入框右侧「插入变量」：弹 [日期] / [时间] / [随机码]，按光标位置插入**字面 token**，
+     解析发生在页脚路径读数上（命名*规则*要能存下来，插入即展开就退化成一次性文本了）。
+  ④ 路径行「在资源管理器中打开」图标按钮：在「更改」左侧。
+  ⑤ 预览「对比」：Tab 从两段扩成三段，对比模式用两个同 transform 的 thumb + clip-path inset
+     做拖拽分割线。分割位置存的是**图像比例**（0..1），所以缩放/平移时它跟着图走。
+  ⑥ 预览页脚左下角「背景切换」：深色 / 浅色 / 纯白 / 纯黑。
+  ⑦ 尺寸卡的 100 / 75 / 50 / 25% 快捷胶囊：两种模式都在（数值模式下读作「相对原图」），
+     与越界提示共用同一个槽位（警告优先叠在上面），所以模式切换不会让卡片跳高。
+  ⑧ 格式下拉右侧「高级选项」齿轮：浮层，按格式给不同项。非默认值时齿轮右上角亮一个点。
+     用浮层而不是手风琴：右栏只剩 38px 余量，展开式会顶高面板。
+  ⑨ 预估大小下方的体积差异：基线固定为「原始尺寸 + PNG 无损」，所以调尺寸和调格式都算得进去。
+
+  ── 高度账（面板必须仍是 920 × 569 dip）──────────────────────────────────
+  左栏预览 460 是高的那一侧，右栏表单 420 < 460，所以九项没有把面板顶高一行。
+  右栏：保存路径 90 + 文件名 60 + 尺寸 88 + 质量 56 + 预估大小 70 = 364，加 4 道 14 的行距 = 420。
+  ⑦ 的胶囊和越界提示共用预留槽，⑧ 走浮层，⑨ 只占 12px —— 三处都不新增行。
+-->
+<style>
+:root{
+  --accent: rgb(31,117,219);
+  --muted: rgba(232,236,242,.62);
+  --danger: rgb(255,123,123);
+  --warning: rgb(240,179,90);
+  --text: #fff;
+  --surface: rgba(23,23,28,.92);
+  --fill: rgba(255,255,255,.08);
+  --line: rgba(255,255,255,.30);
+
+  --fs-title: 12px;
+  --fs-card: 10px;
+  --fs-num: 20px;
+  --fs-label: 10px;
+  --fs-row: 10px;
+  --fs-chip: 11px;
+  --fs-status: 11px;
+  --fs-btn: 12px;
+  --fs-input: 12px;
+
+  --panel-w: 920px;
+  --pad: 16px;
+  --preview-w: 556px;
+  --preview-h: 460px;
+  --col-gap: 12px;
+  --value-row: 28px;
+  --row: 28px;
+  --icon: 22px;
+  --btn-w: 60px;
+  --fmt-w: 74px;          /* 基线是 80；实测 ".WebP" 36 + 左 10 右 8 内边距 + 6 间距 + 12 箭头 = 72，74 留 2px 余量。
+                             腾出来的宽度给文件名输入框：它要装得下 `SnapClip_[日期]_[时间]` 这种带 token 的名字。 */
+  --icon-btn-w: 26px;     /* ③④⑧ 三个图标按钮的宽度，高度一律跟输入框齐平（32）。
+                             26 是给文件名输入框让出来的：320px 的表单列里，输入框要装得下
+                             `SnapClip_[日期]_[时间]`（实测 166px），30 宽的按钮只剩 2px 余量。 */
+
+  --r-panel: 12px;
+  --r-card: 10px;
+  --r-input: 6px;
+  --r-menu: 10px;
+  --r-item: 6px;
+  --r-seg: 7px;
+  --r-seg-inner: 4px;
+  --r-btn: 6px;
+  --r-icon: 5px;
+
+  --seg-inset: 2px;       /* 基线漏定义，见文件头 */
+
+  --font: "HarmonyOS Sans SC", "Microsoft YaHei UI", "Segoe UI", system-ui, sans-serif;
+  --num: ui-monospace, "Cascadia Mono", Consolas, "Courier New", monospace;
+  --blur: 6px;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0; min-height: 100vh; background: #0e1014; color: #dfe5ee;
+  font: 13px/1.5 var(--font);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 顶栏与舞台 */
+.demo-head { display: flex; gap: 16px; align-items: center; padding: 12px 20px; background: #12141a; border-bottom: 1px solid rgba(255,255,255,.06); }
+.demo-head h1 { margin: 0; font-size: 13.5px; font-weight: 600; color: #fff; }
+.demo-head .hint { color: #8891a0; font-size: 12px; }
+.demo-head .spacer { flex: 1; }
+.demo-head .badge { font-size: 11px; color: #9cc7ff; background: rgba(31,117,219,.16); border: 1px solid rgba(31,117,219,.4); border-radius: 999px; padding: 2px 9px; }
+
+.stage { max-width: 1000px; margin: 0 auto; padding: 22px; display: flex; flex-direction: column; gap: 20px; }
+.frame > .cap { margin: 0 0 8px; color: #8891a0; font-size: 11.5px; }
+.scene { position: relative; padding: 26px; border-radius: 14px; overflow: hidden; display: flex; justify-content: center; align-items: flex-start; min-height: 680px; background: #14161a; }
+.scene .doc { position: absolute; inset: 22px 26px auto 26px; }
+.scene .doc .bar { height: 22px; border-radius: 4px 4px 0 0; background: rgba(127,140,160,.28); }
+.scene .doc .body { height: 220px; border-radius: 0 0 4px 4px; background: rgba(127,140,160,.14); }
+.scene .swatch { position: absolute; right: 26px; bottom: 24px; width: 130px; height: 76px; border-radius: 8px; background: linear-gradient(120deg, rgb(27,177,95), rgb(31,117,219) 55%, rgb(240,179,90)); opacity: .85; }
+.scene .panel { margin-top: 20px; }
+
+/* 面板 */
+.panel { position: relative; z-index: 2; width: var(--panel-w); background: var(--surface); border-radius: var(--r-panel); box-shadow: inset 0 0 0 1px var(--line), 0 24px 64px rgba(0,0,0,.55); -webkit-backdrop-filter: blur(var(--blur)); backdrop-filter: blur(var(--blur)); color: var(--text); user-select: none; }
+.panel input { user-select: text; }
+.head { display: flex; align-items: center; justify-content: space-between; padding: 10px 16px 8px; height: 44px; }
+.head .title { font-size: var(--fs-title); font-weight: 600; }
+.close { flex: none; width: 26px; height: 26px; display: grid; place-items: center; background: transparent; border: 0; border-radius: 6px; color: var(--muted); cursor: pointer; }
+.close:hover { background: var(--fill); color: var(--text); }
+.close svg { width: 14px; height: 14px; }
+
+.body { display: flex; gap: var(--col-gap); align-items: flex-start; padding: 4px 16px 12px; }
+
+/* ── 左预览 ─────────────────────────────────────────────────────────── */
+.preview { flex: none; width: var(--preview-w); height: var(--preview-h); position: relative; display: flex; flex-direction: column; gap: 8px; }
+.preview-tabs { position: absolute; top: 12px; left: 50%; transform: translateX(-50%); z-index: 5; display: flex; padding: 3px; background: var(--surface); border-radius: 999px; box-shadow: inset 0 0 0 1px var(--line), 0 4px 12px rgba(0,0,0,.4); }
+.preview-tab { height: 24px; padding: 0 16px; border-radius: 999px; display: grid; place-items: center; color: var(--muted); font-size: 11px; cursor: pointer; transition: background 140ms, color 140ms; }
+.preview-tab.is-on { background: var(--accent); color: var(--text); font-weight: 500; }
+.preview-frame { position: relative; flex: 1; width: 100%; height: 100%; border-radius: var(--r-card); box-shadow: inset 0 0 0 1px var(--line); overflow: hidden; cursor: grab; touch-action: none; }
+.preview-frame.is-drag { cursor: grabbing; }
+.preview-frame.is-drag .zoom-bar, .preview-frame.is-drag .split { pointer-events: none; }
+
+/* ⑥ 预览背景：四套底色，切换只换这一个类 */
+.preview-frame.bg-dark  { background: repeating-conic-gradient(#2a2d34 0% 25%, #22252b 0% 50%) 50% / 16px 16px; }
+.preview-frame.bg-light { background: repeating-conic-gradient(#e6e9ef 0% 25%, #dcdfe6 0% 50%) 50% / 16px 16px; }
+.preview-frame.bg-white { background: #fff; }
+.preview-frame.bg-black { background: #0a0a0c; }
+
+.thumb { position: absolute; left: 0; top: 0; transform-origin: 0 0; overflow: hidden; border-radius: 8px; background: #f2f4f8; box-shadow: 0 8px 24px rgba(0,0,0,.45); will-change: transform; }
+.thumb.is-compressed { filter: blur(1.5px) contrast(0.9); }
+.mock-bar { height: 36px; flex: none; background: #dfe4ec; display: flex; align-items: center; gap: 10px; padding: 0 20px; }
+.mock-dot { width: 12px; height: 12px; border-radius: 50%; background: #b9c1cf; }
+.mock-body { position: absolute; left: 0; right: 0; top: 36px; bottom: 0; padding: 60px; display: flex; flex-direction: column; gap: 28px; }
+.mock-line { flex: none; height: 14px; border-radius: 7px; background: #c8cfdb; }
+.mock-swatch { flex: 1; min-height: 0; border-radius: 12px; background: linear-gradient(120deg, #1bb15f, #1f75db 55%, #f0b35a); }
+
+/* ⑤ 对比分割线。左右两个角标只是标「哪边是什么」，所以钉在框的四角，不跟随图。 */
+.cmp-tag { position: absolute; top: 10px; z-index: 4; height: 20px; padding: 0 9px; display: none; align-items: center; font-size: 10px; color: var(--text); background: var(--surface); border-radius: 999px; box-shadow: inset 0 0 0 1px var(--line); pointer-events: none; }
+.preview-frame.is-cmp .cmp-tag { display: flex; }
+.cmp-tag.left { left: 10px; }
+.cmp-tag.right { right: 10px; }
+.split { position: absolute; z-index: 4; width: 20px; margin-left: -10px; display: none; align-items: center; justify-content: center; cursor: ew-resize; touch-action: none; }
+.preview-frame.is-cmp .split { display: flex; }
+.split .rule { position: absolute; top: 0; bottom: 0; left: 50%; width: 1px; margin-left: -.5px; background: var(--text); box-shadow: 0 0 0 1px rgba(0,0,0,.4); }
+.split .knob { position: relative; width: 20px; height: 20px; display: grid; place-items: center; background: var(--text); border-radius: 50%; box-shadow: 0 2px 6px rgba(0,0,0,.5); color: #14161a; }
+.split .knob svg { width: 14px; height: 14px; display: block; }
+
+.zoom-bar { position: absolute; right: 12px; bottom: 12px; z-index: 4; display: flex; align-items: center; gap: 2px; height: 26px; padding: 0 3px; background: var(--surface); border-radius: 7px; box-shadow: inset 0 0 0 1px var(--line), 0 6px 16px rgba(0,0,0,.4); }
+.zb { height: 22px; min-width: 22px; padding: 0 4px; display: grid; place-items: center; background: transparent; border: 0; border-radius: 5px; color: var(--muted); font: inherit; font-size: 11px; cursor: pointer; }
+.zb:hover { background: var(--fill); color: var(--text); }
+.zb.pct { min-width: 44px; font-family: var(--num); font-variant-numeric: tabular-nums; }
+.zb-sep { width: 1px; height: 14px; background: var(--line); margin: 0 2px; }
+.zb svg { width: 12px; height: 12px; display: block; }
+
+.preview-footer { display: flex; justify-content: space-between; align-items: center; gap: 8px; font-size: 11px; color: var(--muted); padding: 0 2px; }
+.preview-footer .left { display: flex; align-items: center; gap: 6px; min-width: 0; }
+#scale-info { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.link-btn { flex: none; background: transparent; border: 0; color: var(--muted); font: inherit; cursor: pointer; padding: 0; }
+.link-btn:hover { color: var(--text); text-decoration: underline; }
+/* ⑥ 的触发器：复用 .zb 的规格，只是站在页脚而不是框里 */
+.bg-btn { flex: none; width: 20px; height: 20px; display: grid; place-items: center; background: transparent; border: 0; border-radius: var(--r-icon); color: var(--muted); cursor: pointer; }
+.bg-btn:hover, .bg-btn[aria-expanded="true"] { background: var(--fill); color: var(--text); }
+.bg-btn svg { width: 13px; height: 13px; display: block; }
+
+/* ── 右表单 ─────────────────────────────────────────────────────────── */
+.form { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 14px; }
+.form-row { display: flex; flex-direction: column; gap: 6px; }
+.row-header { display: flex; align-items: center; justify-content: space-between; height: 22px; }
+.row-label { font-size: var(--fs-row); font-weight: 600; color: var(--muted); }
+.text-input { flex: 1; min-width: 0; height: 32px; background: var(--fill); border: 1px solid transparent; border-radius: var(--r-input); padding: 0 10px; color: var(--text); font-family: var(--font); font-size: var(--fs-input); outline: 0; }
+.text-input:hover { border-color: rgba(255,255,255,.18); }
+.text-input:focus { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+
+.file-row { display: flex; gap: 6px; }
+.file-row .text-input { font-family: var(--num); font-size: 12px; }
+.path-row { display: flex; gap: 8px; }
+
+/* ③④⑧ 共用的图标按钮：宽度收窄到 30，高度跟输入框齐平 */
+.icon-btn { position: relative; flex: none; width: var(--icon-btn-w); height: 32px; display: grid; place-items: center; background: var(--fill); border: 1px solid transparent; border-radius: var(--r-input); color: var(--muted); cursor: pointer; }
+.icon-btn:hover { border-color: rgba(255,255,255,.18); color: var(--text); }
+.icon-btn[aria-expanded="true"] { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); color: var(--accent); }
+.icon-btn svg { width: 15px; height: 15px; display: block; }
+/* ⑧ 齿轮右上角那个点：只在高级项偏离默认值时亮 */
+.icon-btn .dot { position: absolute; top: 4px; right: 4px; width: 5px; height: 5px; border-radius: 50%; background: var(--accent); display: none; }
+.icon-btn.has-custom .dot { display: block; }
+
+.fmt-btn { flex: none; width: var(--fmt-w); height: 32px; display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 0 8px 0 10px; background: var(--fill); border: 1px solid transparent; border-radius: var(--r-input); color: var(--text); font-family: var(--num); font-size: var(--fs-input); cursor: pointer; text-align: left; }
+.fmt-btn:hover { border-color: rgba(255,255,255,.18); }
+.fmt-btn[aria-expanded="true"] { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.fmt-btn .chev { flex: none; width: 12px; height: 12px; display: grid; place-items: center; color: var(--muted); }
+.fmt-btn .chev svg { width: 12px; height: 12px; display: block; }
+.fmt-btn[aria-expanded="true"] .chev { color: var(--accent); transform: rotate(180deg); }
+
+.btn-ghost { flex: none; height: 32px; padding: 0 12px; background: transparent; border: 1px solid var(--line); border-radius: var(--r-input); color: var(--text); font: inherit; font-size: 11px; cursor: pointer; }
+.btn-ghost:hover { border-color: var(--accent); background: var(--fill); }
+
+/* ── 浮层：格式 / 变量 / 高级 / 背景四张菜单共用这一套 ───────────────── */
+.pop { position: absolute; z-index: 8; padding: 5px; background: var(--surface); border-radius: var(--r-menu); box-shadow: inset 0 0 0 1px var(--line), 0 16px 40px rgba(0,0,0,.55), 0 4px 12px rgba(0,0,0,.35); display: flex; flex-direction: column; }
+.pop[hidden] { display: none; }
+.pop-title { padding: 4px 10px 6px; font-size: 10px; font-weight: 600; color: var(--muted); }
+.pop-item { position: relative; height: 30px; width: 100%; display: flex; align-items: center; gap: 8px; padding: 0 10px 0 26px; background: transparent; border: 0; border-radius: var(--r-item); font-family: var(--num); font-size: 12px; color: var(--text); text-align: left; cursor: pointer; }
+.pop-item:hover, .pop-item.is-selected { background: var(--fill); }
+.pop-item .check { position: absolute; left: 7px; width: 14px; height: 14px; display: grid; place-items: center; color: var(--accent); }
+.pop-item .check svg { width: 14px; height: 14px; display: block; }
+
+/* ③ 变量项：左边是 token 字面，右边是它当前会解析成什么 */
+.var-menu { width: 176px; }
+.var-menu .pop-item { justify-content: space-between; padding-left: 10px; font-size: 11px; }
+.var-menu .pv { color: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }
+
+/* ⑥ 背景项：左边一小块真实底色做样本 */
+.bg-menu { width: 112px; }
+.bg-menu .pop-item { padding-left: 8px; font-family: var(--font); font-size: 11px; gap: 8px; }
+.bg-menu .sw { flex: none; width: 16px; height: 16px; border-radius: 4px; box-shadow: inset 0 0 0 1px var(--line); }
+.bg-menu .sw.bg-dark  { background: repeating-conic-gradient(#2a2d34 0% 25%, #22252b 0% 50%) 50% / 8px 8px; }
+.bg-menu .sw.bg-light { background: repeating-conic-gradient(#e6e9ef 0% 25%, #dcdfe6 0% 50%) 50% / 8px 8px; }
+.bg-menu .sw.bg-white { background: #fff; }
+.bg-menu .sw.bg-black { background: #0a0a0c; }
+.bg-menu .pop-item .check { position: static; }
+
+/* ⑧ 高级选项 */
+.adv-menu { width: 218px; gap: 2px; }
+.adv-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; height: 30px; padding: 0 8px; }
+.adv-label { font-size: 11px; color: var(--muted); }
+.adv-seg { position: relative; display: flex; flex: none; height: 22px; padding: var(--seg-inset); background: var(--fill); border-radius: var(--r-seg); }
+.adv-seg .blk { position: absolute; top: var(--seg-inset); bottom: var(--seg-inset); left: var(--seg-inset); width: var(--w); border-radius: var(--r-seg-inner); background: var(--accent); transform: translateX(calc(var(--i, 0) * var(--w))); transition: transform 140ms cubic-bezier(.22,.61,.36,1); }
+.adv-seg button { position: relative; z-index: 1; width: var(--w); height: calc(22px - 2 * var(--seg-inset)); display: grid; place-items: center; background: transparent; border: 0; border-radius: var(--r-seg-inner); color: var(--muted); font: inherit; font-size: 10px; font-family: var(--num); cursor: pointer; }
+.adv-seg button.is-selected { color: var(--text); }
+.adv-tog { flex: none; position: relative; width: 30px; height: 16px; padding: 0; border: 0; border-radius: 999px; background: var(--fill); box-shadow: inset 0 0 0 1px var(--line); cursor: pointer; transition: background 160ms, box-shadow 160ms; }
+.adv-tog::after { content: ''; position: absolute; top: 2px; left: 2px; width: 12px; height: 12px; border-radius: 50%; background: var(--muted); transition: left 160ms cubic-bezier(.22,.61,.36,1), background 160ms; }
+.adv-tog[aria-checked="true"] { background: rgba(31,117,219,.28); box-shadow: inset 0 0 0 1px var(--accent); }
+.adv-tog[aria-checked="true"]::after { left: 16px; background: var(--accent); }
+.adv-foot { display: flex; justify-content: flex-end; padding: 2px 6px 0; }
+.adv-reset { background: transparent; border: 0; color: var(--muted); font: inherit; font-size: 10px; cursor: pointer; padding: 2px 4px; border-radius: 4px; }
+.adv-reset:hover { color: var(--text); background: var(--fill); }
+
+.path-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.chip { display: inline-flex; align-items: center; gap: 4px; height: 24px; padding: 0 10px; border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--muted); font-size: 11px; cursor: pointer; }
+.chip:hover, .chip.is-active { border-color: var(--accent); color: var(--accent); background: rgba(31,117,219,.1); }
+.chip svg { width: 12px; height: 12px; display: block; }
+.chip.add { padding: 0 8px; font-size: 14px; line-height: 1; }
+/* ⑦ 尺寸预设：和 .chip 同规格，只是数字走等宽 */
+.preset { font-family: var(--num); font-size: 11px; font-variant-numeric: tabular-nums; padding: 0 9px; }
+
+/* ══ 尺寸控制区（精炼下划线方案） ══ */
+.row-header-actions { display: flex; align-items: center; gap: 8px; }
+.size-mode { display: flex; background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-input); padding: 2px; }
+.size-mode-btn { padding: 0 10px; height: 20px; display: grid; place-items: center; border: 0; background: transparent; border-radius: 4px; color: var(--muted); font-size: 11px; cursor: pointer; transition: 0.2s; }
+.size-mode-btn.is-on { background: var(--fill); color: var(--text); font-weight: 500; }
+.actions { display: flex; gap: 2px; }
+.action { width: 24px; height: 24px; padding: 0; display: grid; place-items: center; background: transparent; border: 0; border-radius: var(--r-icon); color: var(--muted); cursor: pointer; }
+.action:hover { background: var(--fill); color: var(--text); }
+.action:disabled { opacity: 0.3; pointer-events: none; }
+.action svg { width: 14px; height: 14px; display: block; }
+
+/* 尺寸核心行 */
+.values { display: flex; align-items: center; width: 100%; margin-top: 4px; gap: 8px; }
+
+/* 标签（宽/高），不带下划线 */
+.cell-label {
+  font-family: var(--font); font-size: 13px; color: var(--muted);
+  font-weight: 500; user-select: none; white-space: nowrap;
+  width: 20px; text-align: left;
+}
+
+/* 可编辑区（下划线只罩这里） */
+.input-wrap {
+  flex: 1; display: flex; align-items: baseline; justify-content: flex-end;
+  height: var(--value-row); border-bottom: 1px solid var(--line);
+  transition: border-color 0.15s; padding: 0 4px;
+}
+.input-wrap:hover { border-bottom-color: rgba(255,255,255,.45); }
+.input-wrap:focus-within { border-bottom-width: 2px; border-bottom-color: var(--accent); }
+.cell.is-warning .input-wrap { border-bottom-color: var(--warning); }
+
+/* 输入框（数字） */
+.dim-input {
+  font-family: var(--num); font-size: var(--fs-num); font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -.03em; line-height: 1.1;
+  background: transparent; border: 0; padding: 0;
+  color: var(--text); text-align: right; width: 64px; outline: 0;
+}
+.cell.is-warning .dim-input { color: var(--warning); }
+
+/* 单位 */
+.dim-unit {
+  font-family: var(--num); font-size: 12px; color: var(--muted);
+  margin-left: 4px; font-weight: 500; user-select: none;
+}
+
+/* 核心枢纽：链环 / 断开 */
+.link-hub {
+  flex: none; width: 28px; height: 28px;
+  display: grid; place-items: center;
+  background: transparent; border: 0; cursor: pointer;
+  color: var(--muted); transition: all 0.2s; border-radius: var(--r-icon);
+}
+.link-hub:hover { background: var(--fill); }
+.link-hub.is-locked { color: var(--accent); }
+.link-hub svg { width: 16px; height: 16px; display: block; }
+
+/* 被动更新闪烁 */
+@keyframes flash-accent {
+  0% { border-bottom-color: var(--accent); border-bottom-width: 2px; }
+  100% { border-bottom-color: var(--line); border-bottom-width: 1px; }
+}
+.input-wrap.is-flash { animation: flash-accent 300ms ease-out; }
+
+/* ⑦ 尺寸卡底部的共用槽位：越界提示与预设胶囊都住这里。
+   预设两种模式都在（数值模式下它说的是「相对原图」），所以槽位永远有内容，
+   min-height 只是兜底；只有越界提示出现时卡片才会高 18px，而那是个警告状态。 */
+.size-extra { display: flex; flex-direction: column; gap: 4px; min-height: 24px; }
+.warn-hint {
+  display: none; font-size: 10px; color: var(--warning); height: 14px;
+  align-items: center; gap: 4px;
+}
+.warn-hint.is-on { display: flex; }
+.size-presets { display: flex; gap: 6px; height: 24px; align-items: center; }
+
+/* 质量/提示 */
+.hint-text { font-size: 11px; color: var(--muted); padding: 0; height: var(--row); display: flex; align-items: center; }
+.seg { position: relative; display: flex; flex: none; height: var(--row); padding: var(--seg-inset); background: var(--fill); border-radius: var(--r-seg); width: calc(var(--n, 3) * var(--seg-w) + 2 * var(--seg-inset)); }
+.seg.quality { --seg-w: 34px; }
+.seg .block { position: absolute; top: var(--seg-inset); bottom: var(--seg-inset); left: var(--seg-inset); width: var(--seg-w); border-radius: var(--r-seg-inner); background: var(--accent); transform: translateX(calc(var(--index, 0) * var(--seg-w))); transition: transform 140ms cubic-bezier(.22,.61,.36,1); }
+.seg .opt { position: relative; z-index: 1; width: var(--seg-w); height: calc(var(--row) - 2 * var(--seg-inset)); display: grid; place-items: center; background: transparent; border: 0; border-radius: var(--r-seg-inner); color: var(--muted); font: inherit; font-size: var(--fs-chip); cursor: pointer; }
+.seg .opt.is-selected { color: var(--text); }
+
+/* ⑨ 预估大小 + 体积差异 */
+.est-size { font-family: var(--num); font-size: 12px; color: var(--text); height: var(--row); display: flex; align-items: center; }
+.est-delta { display: flex; align-items: center; gap: 4px; height: 12px; font-family: var(--num); font-size: 10px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.est-delta.is-up { color: var(--warning); }
+
+/* 页脚 */
+.foot { display: flex; align-items: center; gap: 8px; padding: 10px 16px 11px; }
+.status { flex: 1; min-width: 0; font-size: var(--fs-status); color: var(--danger); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.status.is-info { color: var(--muted); }
+.status.is-ok { color: var(--accent); }
+
+/* ② 保存后打开文件夹 */
+.chk { flex: none; display: flex; align-items: center; gap: 6px; height: 28px; padding: 0 2px; background: transparent; border: 0; color: var(--muted); font: inherit; font-size: 11px; cursor: pointer; }
+.chk:hover { color: var(--text); }
+.chk .box { flex: none; width: 14px; height: 14px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 4px; background: transparent; transition: background 140ms, border-color 140ms; }
+.chk .box svg { width: 10px; height: 10px; display: block; color: var(--text); opacity: 0; }
+.chk[aria-checked="true"] { color: var(--text); }
+.chk[aria-checked="true"] .box { background: var(--accent); border-color: var(--accent); }
+.chk[aria-checked="true"] .box svg { opacity: 1; }
+
+.btn { flex: none; width: var(--btn-w); height: 28px; display: grid; place-items: center; border-radius: var(--r-btn); border: 1px solid transparent; font-family: var(--num); font-size: var(--fs-btn); cursor: pointer; }
+.btn.cancel { background: transparent; border-color: var(--line); color: var(--text); }
+.btn.cancel:hover { border-color: rgba(255,255,255,.5); }
+/* ① 复制：次级按钮，但带图标 —— 和「取消」同级，不抢「保存」的主操作地位 */
+.btn.copy { width: auto; padding: 0 12px; display: flex; align-items: center; justify-content: center; gap: 6px; background: transparent; border-color: var(--line); color: var(--text); }
+.btn.copy:hover { border-color: var(--accent); color: var(--accent); background: rgba(31,117,219,.1); }
+.btn.copy svg { width: 13px; height: 13px; display: block; }
+.btn.start { background: var(--accent); color: var(--text); font-weight: 600; }
+.btn.start:hover { box-shadow: inset 0 0 0 1.5px var(--line); }
+.btn.start:disabled, .btn.copy:disabled { background: var(--fill); color: var(--muted); cursor: not-allowed; box-shadow: none; border-color: transparent; }
+</style>
+</head>
+<body>
+
+<div class="demo-head">
+  <h1>保存图片</h1>
+  <span class="hint">九项新增的拟议稿：复制 / 打开文件夹 / 变量命名 / 对比滑块 / 背景切换 / 尺寸预设 / 高级格式 / 体积差异</span>
+  <span class="spacer"></span>
+  <span class="badge" id="badge">920 × 569 dip</span>
+</div>
+
+<div class="stage">
+  <div class="frame">
+    <p class="cap">面板尺寸由左栏预览（460）决定，右栏表单 420 —— 九项新增没有增加任何一行。</p>
+    <div class="scene">
+      <div class="doc"><div class="bar"></div><div class="body"><p>被截图的那块屏 —— 深色编辑器、暗色终端。</p></div></div>
+      <div class="swatch"></div>
+
+      <div class="panel" id="panel" role="dialog" aria-label="保存图片">
+        <div class="head">
+          <span class="title">保存图片</span>
+          <button class="close" id="close" aria-label="取消">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M4.5 4.5l7 7M11.5 4.5l-7 7"/></svg>
+          </button>
+        </div>
+
+        <div class="body">
+          <!-- 左预览 -->
+          <div class="preview">
+            <div class="preview-tabs" id="preview-tabs">
+              <div class="preview-tab is-on" data-tab="orig">原图</div>
+              <div class="preview-tab" data-tab="comp">编码后 👑</div>
+              <div class="preview-tab" data-tab="cmp">对比</div>
+            </div>
+            <div class="preview-frame bg-dark" id="frame">
+              <div class="thumb" id="thumb">
+                <div class="mock-bar"><span class="mock-dot"></span><span class="mock-dot"></span><span class="mock-dot"></span></div>
+                <div class="mock-body">
+                  <div class="mock-line" style="width:62%"></div>
+                  <div class="mock-line" style="width:84%"></div>
+                  <div class="mock-line" style="width:48%"></div>
+                  <div class="mock-swatch"></div>
+                </div>
+              </div>
+              <div class="thumb is-compressed" id="thumb-comp" style="display:none">
+                <div class="mock-bar"><span class="mock-dot"></span><span class="mock-dot"></span><span class="mock-dot"></span></div>
+                <div class="mock-body">
+                  <div class="mock-line" style="width:62%"></div>
+                  <div class="mock-line" style="width:84%"></div>
+                  <div class="mock-line" style="width:48%"></div>
+                  <div class="mock-swatch"></div>
+                </div>
+              </div>
+              <span class="cmp-tag left">原图</span>
+              <span class="cmp-tag right" id="cmp-tag-right">编码后</span>
+              <div class="split" id="split">
+                <span class="rule"></span>
+                <span class="knob">
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M6.4 5.6 4 8l2.4 2.4M9.6 5.6 12 8l-2.4 2.4"/></svg>
+                </span>
+              </div>
+              <div class="zoom-bar" id="zoom-bar">
+                <button class="zb" data-zoom="out" aria-label="缩小">−</button>
+                <button class="zb pct" id="pct" data-zoom="pct">100%</button>
+                <button class="zb" data-zoom="in" aria-label="放大">+</button>
+                <span class="zb-sep"></span>
+                <button class="zb" data-zoom="reset" aria-label="重置视图">
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3.2 8a4.8 4.8 0 1 0 1.5-3.5"/><path d="M3 3.6V7.8h4.2"/></svg>
+                </button>
+              </div>
+            </div>
+            <div class="preview-footer">
+              <span class="left">
+                <!-- ⑥ -->
+                <button class="bg-btn" id="bg-btn" aria-haspopup="menu" aria-expanded="false" aria-label="预览背景">
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"><rect x="2.6" y="2.6" width="10.8" height="10.8" rx="1.4"/><path d="M2.6 8h5.4v5.4M8 2.6h5.4V8H8z" fill="currentColor" stroke="none"/></svg>
+                </button>
+                <span id="scale-info">缩放：100% · 原始：1440 × 900</span>
+              </span>
+              <button class="link-btn" id="classic-dialog">使用经典对话框</button>
+            </div>
+          </div>
+
+          <!-- 右表单 -->
+          <div class="form">
+            <!-- 保存路径 -->
+            <div class="form-row">
+              <div class="row-header"><span class="row-label">保存路径</span></div>
+              <div class="path-row">
+                <input class="text-input" id="path-input" value="C:\Users\阿伟\Desktop" spellcheck="false">
+                <!-- ④ -->
+                <button class="icon-btn" id="open-folder" aria-label="在资源管理器中打开" title="在资源管理器中打开"></button>
+                <button class="btn-ghost" id="change-path">更改</button>
+              </div>
+              <div class="path-chips" id="path-chips"></div>
+            </div>
+
+            <!-- 文件名 -->
+            <div class="form-row">
+              <div class="row-header"><span class="row-label">文件名</span></div>
+              <div class="file-row">
+                <input class="text-input" id="name" value="SnapClip_2026-10-17" spellcheck="false">
+                <!-- ③ -->
+                <button class="icon-btn" id="var-btn" aria-haspopup="menu" aria-expanded="false" aria-label="插入命名变量" title="插入命名变量"></button>
+                <button class="fmt-btn" id="fmt-btn" aria-haspopup="listbox" aria-expanded="false" aria-label="保存格式">
+                  <span id="fmt-label">.PNG</span>
+                  <span class="chev"><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4.5L6 7.5L9 4.5"/></svg></span>
+                </button>
+                <!-- ⑧ -->
+                <button class="icon-btn" id="adv-btn" aria-haspopup="dialog" aria-expanded="false" aria-label="高级格式选项" title="高级格式选项"><span class="dot"></span></button>
+              </div>
+            </div>
+
+            <!-- 尺寸行（精炼下划线布局） -->
+            <div class="form-row">
+              <div class="row-header">
+                <span class="row-label">尺寸</span>
+                <div class="row-header-actions">
+                  <div class="size-mode" id="size-mode">
+                    <button class="size-mode-btn is-on" data-mode="num">数值</button>
+                    <button class="size-mode-btn" data-mode="pct">百分比</button>
+                  </div>
+                  <div class="actions">
+                    <button class="action" id="reset" aria-label="重置为原始大小"></button>
+                  </div>
+                </div>
+              </div>
+
+              <div class="values">
+                <!-- 宽 -->
+                <span class="cell-label" id="prefix-w">宽</span>
+                <label class="cell" id="cell-w">
+                  <div class="input-wrap" id="wrap-w">
+                    <input class="dim-input" id="width" value="1440" aria-label="宽度">
+                    <span class="dim-unit" id="unit-w">px</span>
+                  </div>
+                </label>
+
+                <!-- 枢纽 -->
+                <button class="link-hub is-locked" id="lock-hub" aria-label="锁定比例" aria-pressed="true"></button>
+
+                <!-- 高 -->
+                <span class="cell-label" id="prefix-h">高</span>
+                <label class="cell" id="cell-h">
+                  <div class="input-wrap" id="wrap-h">
+                    <input class="dim-input" id="height" value="900" aria-label="高度">
+                    <span class="dim-unit" id="unit-h">px</span>
+                  </div>
+                </label>
+              </div>
+
+              <!-- ⑦ 共用槽位 -->
+              <div class="size-extra">
+                <div class="warn-hint" id="warn-hint">
+                  <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 5.5v4M8 11.5v.5"/><circle cx="8" cy="8" r="6.5"/></svg>
+                  超过原始分辨率，放大将损失清晰度
+                </div>
+                <div class="size-presets" id="size-presets"></div>
+              </div>
+            </div>
+
+            <!-- 质量 -->
+            <div class="form-row">
+              <div class="row-header"><span class="row-label">质量</span></div>
+              <div id="quality-hint" class="hint-text">PNG 格式是无损压缩，不支持质量调整</div>
+              <div class="seg quality" id="quality-seg" style="display:none;">
+                <span class="block"></span>
+                <button class="opt is-selected" data-quality="0">高</button>
+                <button class="opt" data-quality="1">中</button>
+                <button class="opt" data-quality="2">低</button>
+              </div>
+            </div>
+
+            <!-- 预估大小 -->
+            <div class="form-row">
+              <div class="row-header"><span class="row-label">预估大小</span></div>
+              <div class="est-size" id="est-size">1.48 MB</div>
+              <!-- ⑨ -->
+              <div class="est-delta" id="est-delta"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="foot">
+          <span class="status is-info" id="status"></span>
+          <!-- ② -->
+          <button class="chk" id="open-after" role="checkbox" aria-checked="false">
+            <span class="box"><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 6l2.5 2.5L9.5 4"/></svg></span>
+            保存后打开文件夹
+          </button>
+          <button class="btn cancel" id="cancel">取消</button>
+          <!-- ① -->
+          <button class="btn copy" id="copy">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="5.6" y="5.6" width="7.4" height="7.4" rx="1.6"/><path d="M10.4 3.6a1.6 1.6 0 0 0-1.6-1.6H4.6A2.6 2.6 0 0 0 2 4.6v4.2a1.6 1.6 0 0 0 1.6 1.6"/></svg>
+            复制
+          </button>
+          <button class="btn start" id="save">保存</button>
+        </div>
+
+        <!-- 四张浮层 -->
+        <div class="pop fmt-menu" id="fmt-menu" role="listbox" style="width:100px" hidden></div>
+        <div class="pop var-menu" id="var-menu" role="menu" hidden></div>
+        <div class="pop adv-menu" id="adv-menu" role="dialog" aria-label="高级格式选项" hidden></div>
+        <div class="pop bg-menu" id="bg-menu" role="menu" hidden></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+'use strict';
+
+const $ = id => document.getElementById(id);
+const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
+
+const ICON = {
+  link: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6.5 9.5l3-3"/><path d="M7 5.5l1.5-1.5a3.5 3.5 0 0 1 5 5L12 10.5"/><path d="M9 10.5l-1.5 1.5a3.5 3.5 0 0 1-5-5L4 5.5"/></svg>',
+  unlink: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6.5 10.5l-1.5 1.5a3.5 3.5 0 0 1-5-5L2 5.5"/><path d="M9.5 5.5l1.5-1.5a3.5 3.5 0 0 1 5 5L14 10.5"/><path d="M2.5 2.5l11 11"/></svg>',
+  reset: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8a5 5 0 1 0 1.6-3.7"/><path d="M3 3.8V8h4.2"/></svg>',
+  folder: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M2 4.5h4l1.3 1.6H14v6.4H2z"/></svg>',
+  check: '<svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 6l2.5 2.5L9.5 4"/></svg>',
+  /* ④ 文件夹 + 向外箭头 = 「在资源管理器中打开」 */
+  folderOpen: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M6.8 3.4H3.4A1.4 1.4 0 0 0 2 4.8v6.6a1.2 1.2 0 0 0 1.2 1.2h9.4a1.2 1.2 0 0 0 1.2-1.2V7.6"/><path d="M2 6.6h11.8"/><path d="M10.2 2.4h3.4v3.4"/><path d="M13.6 2.4 9.8 6.2"/></svg>',
+  /* ③ 魔法棒：命名规则是「变出来的」，比花括号更好认 */
+  wand: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="m2.8 13.2 7-7"/><path d="m8.4 4.8 2.8 2.8"/><path d="M12.6 1.6v2M11.6 2.6h2"/><path d="M4.4 1.8v1.6M3.6 2.6h1.6"/><path d="M13.8 9.2v1.6M13 10h1.6"/></svg>',
+  /* ⑧ 齿轮 */
+  gear: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.5v1.9M8 12.6v1.9M14.5 8h-1.9M3.4 8H1.5M12.6 3.4l-1.3 1.3M4.7 11.3l-1.3 1.3M12.6 12.6l-1.3-1.3M4.7 4.7 3.4 3.4"/></svg>',
+};
+
+const FORMATS = ['.PNG', '.JPG', '.WebP'];
+const EXT = ['png', 'jpg', 'webp'];
+
+/* ③ 命名变量。token 以字面形式留在输入框里（规则要能被记住、被存进设置），
+   解析只发生在页脚那行路径读数上。随机码整个会话只生成一次，否则每敲一个字它都变。 */
+const pad2 = n => String(n).padStart(2, '0');
+const NOW = new Date();
+const TOKENS = [
+  { token: '[日期]', value: `${NOW.getFullYear()}-${pad2(NOW.getMonth() + 1)}-${pad2(NOW.getDate())}` },
+  { token: '[时间]', value: `${pad2(NOW.getHours())}${pad2(NOW.getMinutes())}` },
+  { token: '[随机码]', value: Math.random().toString(36).slice(2, 6).toUpperCase() },
+];
+const resolveName = n => TOKENS.reduce((acc, t) => acc.split(t.token).join(t.value), n);
+
+/* ⑥ 预览背景 */
+const BACKGROUNDS = [
+  { id: 'dark', label: '深色' },
+  { id: 'light', label: '浅色' },
+  { id: 'white', label: '纯白' },
+  { id: 'black', label: '纯黑' },
+];
+
+/* ⑦ 尺寸预设 */
+const PRESETS = [100, 75, 50, 25];
+
+/* ⑧ 高级选项：默认值就是「不显示齿轮上的那个点」的那一组 */
+const ADV_DEFAULT = {
+  0: { level: 1 },                    /* PNG  压缩等级：0 最快 / 1 平衡 / 2 最小 */
+  1: { sampling: 1, exif: false },    /* JPG  色度采样：0 4:4:4 / 1 4:2:0 */
+  2: { sampling: 1, lossless: false },/* WebP 色彩采样 + 无损 */
+};
+const ADV_SCHEMA = [
+  { fmt: 0, rows: [{ key: 'level', label: '压缩等级', opts: ['最快', '平衡', '最小'], w: 40 }] },
+  { fmt: 1, rows: [{ key: 'sampling', label: '色度采样', opts: ['4:4:4', '4:2:0'], w: 46 },
+                   { key: 'exif', label: '保留 EXIF', toggle: true }] },
+  { fmt: 2, rows: [{ key: 'sampling', label: '色彩采样', opts: ['4:4:4', '4:2:0'], w: 46 },
+                   { key: 'lossless', label: '无损', toggle: true }] },
+];
+
+const S = {
+  name: 'SnapClip_2026-10-17',
+  path: 'C:\\Users\\阿伟\\Desktop',
+  w: 1440, h: 900,
+  ow: 1440, oh: 900,
+  locked: true,
+  ratio: 1440 / 900,
+  format: 0,
+  quality: 0,
+  sizeMode: 'num',
+  previewMode: 'orig',
+  split: 0.5,          /* ⑤ 分割线位置，存图像比例而不是屏幕坐标 */
+  bg: 'dark',          /* ⑥ */
+  openAfter: false,    /* ② */
+  adv: JSON.parse(JSON.stringify(ADV_DEFAULT)),  /* ⑧ */
+};
+
+const CHIPS = [
+  { label: '桌面', path: 'C:\\Users\\阿伟\\Desktop' },
+  { label: '图片', path: 'C:\\Users\\阿伟\\Pictures' },
+  { label: '下载', path: 'C:\\Users\\阿伟\\Downloads' },
+];
+
+/* ── 体积模型 ──────────────────────────────────────────────────────────
+   基线固定为「原始尺寸 + PNG 无损」，所以调尺寸和调格式的收益都算得进去；
+   系数是编的，只为让读数随控件单调变化，落地时换成真实编码器的输出。 */
+const PNG_LEVEL = [1.06, 1.0, 0.94];
+function estimateKB(w, h, format, quality, adv) {
+  const px = w * h;
+  if (format === 0) return px * 1.2 / 1024 * PNG_LEVEL[adv[0].level];
+  if (format === 1) {
+    const sampling = adv[1].sampling === 0 ? 1.18 : 1.0;
+    return px * (0.15 + quality * 0.1) / 1024 * sampling + (adv[1].exif ? 8 : 0);
+  }
+  if (adv[2].lossless) return px * 0.55 / 1024;
+  const sampling = adv[2].sampling === 0 ? 1.15 : 1.0;
+  return px * (0.08 + quality * 0.05) / 1024 * sampling;
+}
+const baselineKB = () => estimateKB(S.ow, S.oh, 0, 0, ADV_DEFAULT);
+const isLossless = () => S.format === 0 || (S.format === 2 && S.adv[2].lossless);
+function formatKB(kb) {
+  return kb > 1024 ? (kb / 1024).toFixed(2) + ' MB' : kb.toFixed(2) + ' KB';
+}
+
+/* ── 预览视图 ────────────────────────────────────────────────────────── */
+const frame = $('frame');
+const thumb = $('thumb');
+const thumbComp = $('thumb-comp');
+const view = { zoom: 1, panX: 0, panY: 0 };
+
+function frameSize() { return { W: frame.clientWidth, H: frame.clientHeight }; }
+function applyView() {
+  const { W, H } = frameSize();
+  if (!W || !H) return;
+  const dw = S.w * view.zoom, dh = S.h * view.zoom;
+  const cx = (W - dw) / 2 + view.panX, cy = (H - dh) / 2 + view.panY;
+  const tf = `translate(${cx}px, ${cy}px) scale(${view.zoom})`;
+  for (const t of [thumb, thumbComp]) {
+    t.style.width = S.w + 'px';
+    t.style.height = S.h + 'px';
+    t.style.transform = tf;
+  }
+  /* ⑤ 上下留 2px 负值，免得 clip 把缩略图自己的投影切掉；左边用百分比，分割线才准 */
+  thumbComp.style.clipPath = `inset(-2px -2px -2px ${S.split * 100}%)`;
+  const split = $('split');
+  split.style.left = (cx + dw * S.split) + 'px';
+  split.style.top = cy + 'px';
+  split.style.height = Math.max(0, dh) + 'px';
+
+  $('pct').textContent = Math.round(view.zoom * 100) + '%';
+  $('scale-info').textContent = '缩放：' + Math.round(view.zoom * 100) + '% · 原始：' + S.ow + ' × ' + S.oh;
+}
+function fitView() {
+  const { W, H } = frameSize();
+  if (!W || !H) return;
+  view.zoom = clamp(Math.min(W / S.w, H / S.h) * 0.94, 0.05, 8);
+  view.panX = 0; view.panY = 0; applyView();
+}
+function zoomAt(factor, mx, my) {
+  const { W, H } = frameSize();
+  if (!W || !H) return;
+  const cx = (W - S.w * view.zoom) / 2 + view.panX, cy = (H - S.h * view.zoom) / 2 + view.panY;
+  const ix = (mx - cx) / view.zoom, iy = (my - cy) / view.zoom;
+  view.zoom = clamp(view.zoom * factor, 0.05, 8);
+  view.panX = (mx - ix * view.zoom) - (W - S.w * view.zoom) / 2;
+  view.panY = (my - iy * view.zoom) - (H - S.h * view.zoom) / 2;
+  applyView();
+}
+
+frame.addEventListener('wheel', e => { e.preventDefault(); const r = frame.getBoundingClientRect(); zoomAt(Math.exp(-e.deltaY * 0.0015), e.clientX - r.left, e.clientY - r.top); }, { passive: false });
+let drag = null;
+frame.addEventListener('pointerdown', e => {
+  if (e.button !== 0 || e.target.closest('.zoom-bar') || e.target.closest('.split')) return;
+  drag = { x: e.clientX, y: e.clientY, px: view.panX, py: view.panY };
+  frame.setPointerCapture(e.pointerId); frame.classList.add('is-drag');
+});
+frame.addEventListener('pointermove', e => {
+  if (!drag) return;
+  view.panX = drag.px + (e.clientX - drag.x); view.panY = drag.py + (e.clientY - drag.y); applyView();
+});
+function endDrag(e) { if (!drag) return; drag = null; frame.classList.remove('is-drag'); if (frame.hasPointerCapture(e.pointerId)) frame.releasePointerCapture(e.pointerId); }
+frame.addEventListener('pointerup', endDrag); frame.addEventListener('pointercancel', endDrag);
+frame.addEventListener('dblclick', e => { if (!e.target.closest('.zoom-bar')) fitView(); });
+
+/* ⑤ 拖分割线：换算回图像比例，所以缩放/平移后它还在同一个位置 */
+let splitDrag = false;
+$('split').addEventListener('pointerdown', e => {
+  if (e.button !== 0) return;
+  splitDrag = true;
+  $('split').setPointerCapture(e.pointerId);
+  moveSplit(e);
+});
+$('split').addEventListener('pointermove', e => { if (splitDrag) moveSplit(e); });
+$('split').addEventListener('pointerup', e => { splitDrag = false; if ($('split').hasPointerCapture(e.pointerId)) $('split').releasePointerCapture(e.pointerId); });
+$('split').addEventListener('pointercancel', () => { splitDrag = false; });
+function moveSplit(e) {
+  const { W } = frameSize();
+  const dw = S.w * view.zoom;
+  if (!dw) return;
+  const cx = (W - dw) / 2 + view.panX;
+  S.split = clamp((e.clientX - frame.getBoundingClientRect().left - cx) / dw, 0, 1);
+  applyView();
+}
+
+$('zoom-bar').addEventListener('click', e => {
+  const btn = e.target.closest('[data-zoom]'); if (!btn) return;
+  const { W, H } = frameSize(); const act = btn.dataset.zoom;
+  if (act === 'out') zoomAt(1 / 1.25, W / 2, H / 2);
+  else if (act === 'in') zoomAt(1.25, W / 2, H / 2);
+  else if (act === 'pct') zoomAt(1 / view.zoom, W / 2, H / 2);
+  else if (act === 'reset') fitView();
+});
+
+/* ⑤ 三段 Tab */
+$('preview-tabs').addEventListener('click', e => {
+  const tab = e.target.closest('[data-tab]'); if (!tab) return;
+  S.previewMode = tab.dataset.tab;
+  document.querySelectorAll('.preview-tab').forEach(el => el.classList.toggle('is-on', el === tab));
+  applyPreviewMode();
+});
+function applyPreviewMode() {
+  const m = S.previewMode;
+  frame.classList.toggle('is-cmp', m === 'cmp');
+  thumb.style.display = m === 'comp' ? 'none' : 'block';
+  thumbComp.style.display = m === 'orig' ? 'none' : 'block';
+  applyCompFilter();
+  applyView();
+}
+/* 无损输出没有「编码后」可看，但仍如实显示 —— 只是把话说清楚 */
+function applyCompFilter() {
+  const lossy = !isLossless();
+  thumbComp.classList.toggle('is-compressed', lossy);
+  $('cmp-tag-right').textContent = lossy ? '编码后' : '编码后 · 无损';
+}
+
+/* ── 浮层：四张菜单共用一套开合与定位 ─────────────────────────────────── */
+const POPS = ['fmt-menu', 'var-menu', 'adv-menu', 'bg-menu'].map($);
+let openPop = null;
+function placePop(pop, anchor, width) {
+  const pr = $('panel').getBoundingClientRect(), ar = anchor.getBoundingClientRect();
+  const top = ar.bottom + 6 + pop.offsetHeight > window.innerHeight;
+  pop.style.left = Math.max(6, Math.min(ar.right - pr.left - width, pr.width - width - 6)) + 'px';
+  pop.style.top = (top ? ar.top - pr.top - pop.offsetHeight - 6 : ar.bottom - pr.top + 6) + 'px';
+}
+function showPop(pop, anchor, width) {
+  hidePop();
+  pop.hidden = false;
+  openPop = { pop, anchor };
+  anchor.setAttribute('aria-expanded', 'true');
+  placePop(pop, anchor, width);
+}
+function hidePop() {
+  if (!openPop) return;
+  openPop.pop.hidden = true;
+  openPop.anchor.setAttribute('aria-expanded', 'false');
+  openPop = null;
+}
+document.addEventListener('click', e => {
+  if (openPop && !e.target.closest('.pop') && !openPop.anchor.contains(e.target)) hidePop();
+});
+document.addEventListener('keydown', e => { if (e.key === 'Escape') hidePop(); });
+
+/* 格式下拉 */
+const fmtMenu = $('fmt-menu'), fmtBtn = $('fmt-btn');
+function renderFmtMenu() {
+  fmtMenu.innerHTML = FORMATS.map((f, i) => `<button class="pop-item ${i === S.format ? 'is-selected' : ''}" role="option" aria-selected="${i === S.format}" data-fmt="${i}"><span class="check">${i === S.format ? ICON.check : ''}</span>${f}</button>`).join('');
+}
+fmtBtn.addEventListener('click', () => {
+  if (openPop && openPop.pop === fmtMenu) return hidePop();
+  renderFmtMenu(); showPop(fmtMenu, fmtBtn, 100);
+});
+fmtMenu.addEventListener('click', e => {
+  const i = e.target.closest('[data-fmt]'); if (!i) return;
+  S.format = Number(i.dataset.fmt); hidePop(); update();
+});
+
+/* ③ 变量插入 */
+const varMenu = $('var-menu'), varBtn = $('var-btn');
+varBtn.innerHTML = ICON.wand;
+function renderVarMenu() {
+  varMenu.innerHTML = '<div class="pop-title">插入命名变量</div>' + TOKENS.map(t =>
+    `<button class="pop-item" role="menuitem" data-token="${t.token}"><span>${t.token}</span><span class="pv">${t.value}</span></button>`
+  ).join('');
+}
+varBtn.addEventListener('click', () => {
+  if (openPop && openPop.pop === varMenu) return hidePop();
+  renderVarMenu(); showPop(varMenu, varBtn, 176);
+});
+varMenu.addEventListener('click', e => {
+  const item = e.target.closest('[data-token]'); if (!item) return;
+  insertToken(item.dataset.token);
+  hidePop();
+});
+/* 插在光标处，不是无脑追加到末尾：用户往往要在中间塞一个 [时间] */
+function insertToken(token) {
+  const el = $('name');
+  const start = el.selectionStart ?? el.value.length;
+  const end = el.selectionEnd ?? start;
+  el.value = el.value.slice(0, start) + token + el.value.slice(end);
+  S.name = el.value;
+  const caret = start + token.length;
+  el.focus();
+  el.setSelectionRange(caret, caret);
+  update();
+}
+
+/* ⑧ 高级格式选项 */
+const advMenu = $('adv-menu'), advBtn = $('adv-btn');
+advBtn.innerHTML = ICON.gear + '<span class="dot"></span>';
+const advIsCustom = () => {
+  const d = ADV_DEFAULT[S.format], a = S.adv[S.format];
+  return Object.keys(d).some(k => a[k] !== d[k]);
+};
+function renderAdvMenu() {
+  const schema = ADV_SCHEMA.find(s => s.fmt === S.format);
+  const state = S.adv[S.format];
+  advMenu.innerHTML = `<div class="pop-title">${FORMATS[S.format]} 高级选项</div>` + schema.rows.map(row => {
+    if (row.toggle) {
+      return `<div class="adv-row"><span class="adv-label">${row.label}</span>` +
+        `<button class="adv-tog" role="switch" aria-checked="${state[row.key]}" data-key="${row.key}" aria-label="${row.label}"></button></div>`;
+    }
+    return `<div class="adv-row"><span class="adv-label">${row.label}</span>` +
+      `<div class="adv-seg" style="--w:${row.w}px" data-key="${row.key}"><span class="blk" style="--i:${state[row.key]}"></span>` +
+      row.opts.map((o, i) => `<button class="${i === state[row.key] ? 'is-selected' : ''}" data-i="${i}">${o}</button>`).join('') +
+      `</div></div>`;
+  }).join('') + `<div class="adv-foot"><button class="adv-reset" id="adv-reset">恢复默认</button></div>`;
+}
+advBtn.addEventListener('click', () => {
+  if (openPop && openPop.pop === advMenu) return hidePop();
+  renderAdvMenu(); showPop(advMenu, advBtn, 218);
+});
+advMenu.addEventListener('click', e => {
+  if (e.target.closest('#adv-reset')) {
+    S.adv[S.format] = { ...ADV_DEFAULT[S.format] };
+    renderAdvMenu(); update(); return;
+  }
+  const opt = e.target.closest('.adv-seg button');
+  if (opt) {
+    const seg = opt.closest('.adv-seg');
+    S.adv[S.format][seg.dataset.key] = Number(opt.dataset.i);
+    seg.style.setProperty('--i', opt.dataset.i);
+    seg.querySelectorAll('button').forEach(b => b.classList.toggle('is-selected', b === opt));
+    update(); return;
+  }
+  const tog = e.target.closest('.adv-tog');
+  if (tog) {
+    S.adv[S.format][tog.dataset.key] = !S.adv[S.format][tog.dataset.key];
+    tog.setAttribute('aria-checked', String(S.adv[S.format][tog.dataset.key]));
+    update();
+  }
+});
+
+/* ⑥ 背景切换 */
+const bgMenu = $('bg-menu'), bgBtn = $('bg-btn');
+function renderBgMenu() {
+  bgMenu.innerHTML = '<div class="pop-title">预览背景</div>' + BACKGROUNDS.map(b =>
+    `<button class="pop-item" role="menuitem" data-bg="${b.id}"><span class="sw bg-${b.id}"></span>${b.label}<span class="check" style="margin-left:auto">${b.id === S.bg ? ICON.check : ''}</span></button>`
+  ).join('');
+}
+bgBtn.addEventListener('click', () => {
+  if (openPop && openPop.pop === bgMenu) return hidePop();
+  renderBgMenu(); showPop(bgMenu, bgBtn, 112);
+});
+bgMenu.addEventListener('click', e => {
+  const item = e.target.closest('[data-bg]'); if (!item) return;
+  S.bg = item.dataset.bg;
+  BACKGROUNDS.forEach(b => frame.classList.toggle('bg-' + b.id, b.id === S.bg));
+  hidePop();
+});
+
+/* ④ 路径一键打开 */
+$('open-folder').innerHTML = ICON.folderOpen;
+
+/* 快捷路径 */
+function renderChips() {
+  $('path-chips').innerHTML = CHIPS.map(c => `<button class="chip ${S.path === c.path ? 'is-active' : ''}" data-path="${c.path}">${ICON.folder} ${c.label}</button>`).join('') + '<button class="chip add" aria-label="添加常用路径">+</button>';
+}
+$('path-chips').addEventListener('click', e => {
+  const chip = e.target.closest('.chip'); if (!chip) return;
+  if (chip.classList.contains('add')) return;
+  S.path = chip.dataset.path; $('path-input').value = S.path; renderChips(); update();
+});
+
+/* ── 逻辑与刷新 ──────────────────────────────────────────────────────── */
+function fileName() { return (resolveName(S.name).trim() || '未命名') + '.' + EXT[S.format]; }
+function fullPath() { return S.path.replace(/[\\/]+$/, '') + '\\' + fileName(); }
+
+function update(flashField = null) {
+  const isPng = S.format === 0;
+  const isNum = S.sizeMode === 'num';
+  const lossless = isLossless();
+
+  // 越界检查
+  const isWarnW = S.w > S.ow;
+  const isWarnH = S.h > S.oh;
+  $('cell-w').classList.toggle('is-warning', isWarnW);
+  $('cell-h').classList.toggle('is-warning', isWarnH);
+  $('warn-hint').classList.toggle('is-on', isWarnW || isWarnH);
+
+  // ⑦ 预设两种模式都在：数值模式下它说的是「相对原图」，点一下把两个轴都设成那个比例。
+  //    槽位因此永远有内容，模式切换时卡片高度不跳。
+  renderPresets();
+
+  // 更新数值
+  if (document.activeElement !== $('width')) $('width').value = isNum ? S.w : Math.round(S.w / S.ow * 100);
+  if (document.activeElement !== $('height')) $('height').value = isNum ? S.h : Math.round(S.h / S.oh * 100);
+  $('unit-w').textContent = isNum ? 'px' : '%';
+  $('unit-h').textContent = isNum ? 'px' : '%';
+
+  // 锁定枢纽
+  const lockHub = $('lock-hub');
+  lockHub.innerHTML = S.locked ? ICON.link : ICON.unlink;
+  lockHub.classList.toggle('is-locked', S.locked);
+  lockHub.setAttribute('aria-pressed', String(S.locked));
+
+  // 重置按钮状态
+  const isOrig = S.w === S.ow && S.h === S.oh;
+  $('reset').disabled = isOrig;
+
+  // 格式与质量
+  $('fmt-label').textContent = FORMATS[S.format];
+  const hintText = isPng ? 'PNG 格式是无损压缩，不支持质量调整' : 'WebP 无损模式不支持质量调整';
+  $('quality-hint').textContent = hintText;
+  $('quality-hint').style.display = lossless ? 'flex' : 'none';
+  $('quality-seg').style.display = lossless ? 'none' : 'flex';
+  if (!lossless) $('quality-seg').style.setProperty('--index', S.quality);
+  $('quality-seg').querySelectorAll('.opt').forEach((o, i) => o.classList.toggle('is-selected', i === S.quality));
+
+  // ⑧ 齿轮上的点：本格式的高级项偏离默认值才亮
+  advBtn.classList.toggle('has-custom', advIsCustom());
+  if (openPop && openPop.pop === advMenu) renderAdvMenu();
+
+  // ⑨ 体积与差异
+  const cur = estimateKB(S.w, S.h, S.format, S.quality, S.adv);
+  const base = baselineKB();
+  $('est-size').textContent = formatKB(cur);
+  const delta = 1 - cur / base;
+  const d = $('est-delta');
+  if (Math.abs(delta) < 0.005) {
+    d.textContent = `原图 ${formatKB(base)} · 一致`;
+    d.classList.remove('is-up');
+  } else if (delta > 0) {
+    d.textContent = `原图 ${formatKB(base)} · 省 ${Math.round(delta * 100)}%`;
+    d.classList.remove('is-up');
+  } else {
+    d.textContent = `原图 ${formatKB(base)} · 大 ${Math.round(-delta * 100)}%`;
+    d.classList.add('is-up');
+  }
+
+  applyCompFilter();
+  applyView();
+
+  // 闪烁反馈
+  if (flashField) {
+    const wrap = flashField === 'w' ? $('wrap-w') : $('wrap-h');
+    wrap.classList.remove('is-flash');
+    void wrap.offsetWidth;
+    wrap.classList.add('is-flash');
+  }
+
+  // 页脚
+  const bad = !S.name.trim() || !S.path.trim() || S.w < 1 || S.h < 1;
+  setStatus(bad ? '名称或路径有误' : fullPath(), bad ? 'error' : 'info');
+  $('save').disabled = bad;
+  $('copy').disabled = bad;
+}
+
+function renderPresets() {
+  const cur = Math.round(S.w / S.ow * 100);
+  $('size-presets').innerHTML = PRESETS.map(p =>
+    `<button class="chip preset ${p === cur ? 'is-active' : ''}" data-pct="${p}">${p}%</button>`
+  ).join('');
+}
+$('size-presets').addEventListener('click', e => {
+  const b = e.target.closest('[data-pct]'); if (!b) return;
+  const p = Number(b.dataset.pct) / 100;
+  // 两个轴各自按原图算，锁没锁都一样 —— 预设说的是「相对原图」，不是「相对当前」
+  S.w = Math.max(1, Math.round(S.ow * p));
+  S.h = Math.max(1, Math.round(S.oh * p));
+  fitView(); update();
+});
+
+/* 页脚读数。flash 是临时消息（复制成功、已打开文件夹…），到点自己退回常规那行 */
+let statusTimer = 0;
+function setStatus(text, kind) {
+  const el = $('status');
+  el.textContent = text;
+  el.classList.toggle('is-info', kind === 'info');
+  el.classList.toggle('is-ok', kind === 'ok');
+}
+function flashStatus(text, kind = 'ok') {
+  clearTimeout(statusTimer);
+  setStatus(text, kind);
+  statusTimer = setTimeout(() => {
+    const bad = !S.name.trim() || !S.path.trim() || S.w < 1 || S.h < 1;
+    setStatus(bad ? '名称或路径有误' : fullPath(), bad ? 'error' : 'info');
+  }, 2400);
+}
+
+const handleSizeInput = (field, value) => {
+  const v = Math.floor(Number(value));
+  if (Number.isNaN(v) || v <= 0) return;
+
+  if (S.sizeMode === 'num') {
+    if (field === 'w') { S.w = v; if (S.locked) S.h = Math.round(S.w / S.ratio); }
+    else { S.h = v; if (S.locked) S.w = Math.round(S.h * S.ratio); }
+  } else {
+    if (field === 'w') { S.w = Math.round(S.ow * (v / 100)); if (S.locked) S.h = Math.round(S.oh * (v / 100)); }
+    else { S.h = Math.round(S.oh * (v / 100)); if (S.locked) S.w = Math.round(S.ow * (v / 100)); }
+  }
+  fitView();
+  update(S.locked ? (field === 'w' ? 'h' : 'w') : null);
+};
+
+$('width').addEventListener('input', e => handleSizeInput('w', e.target.value));
+$('height').addEventListener('input', e => handleSizeInput('h', e.target.value));
+for (const [id, field] of [['width', 'w'], ['height', 'h']]) {
+  $(id).addEventListener('keydown', e => {
+    if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+    e.preventDefault();
+    const delta = e.key === 'ArrowUp' ? (e.shiftKey ? 10 : 1) : (e.shiftKey ? -10 : -1);
+    handleSizeInput(field, Number($(id).value) + delta);
+  });
+  $(id).addEventListener('focus', e => e.target.select());
+}
+
+$('size-mode').addEventListener('click', e => {
+  const btn = e.target.closest('.size-mode-btn'); if (!btn) return;
+  S.sizeMode = btn.dataset.mode;
+  document.querySelectorAll('.size-mode-btn').forEach(el => el.classList.toggle('is-on', el === btn));
+  update();
+});
+
+$('lock-hub').addEventListener('click', () => {
+  S.locked = !S.locked;
+  if (S.locked) S.ratio = S.w / S.h;
+  update();
+});
+$('reset').innerHTML = ICON.reset;
+$('reset').addEventListener('click', () => {
+  S.w = S.ow; S.h = S.oh;
+  if (S.locked) S.ratio = S.ow / S.oh;
+  fitView(); update();
+});
+$('quality-seg').addEventListener('click', e => {
+  const b = e.target.closest('[data-quality]'); if (!b) return;
+  S.quality = Number(b.dataset.quality); update();
+});
+
+$('name').addEventListener('input', e => { S.name = e.target.value; update(); });
+$('path-input').addEventListener('input', e => { S.path = e.target.value; renderChips(); update(); });
+
+/* ── 页脚四个动作 ────────────────────────────────────────────────────── */
+$('open-after').addEventListener('click', () => {
+  S.openAfter = !S.openAfter;
+  $('open-after').setAttribute('aria-checked', String(S.openAfter));
+});
+/* ④ */
+$('open-folder').addEventListener('click', () => {
+  flashStatus('已在资源管理器中打开 ' + S.path.replace(/[\\/]+$/, ''));
+});
+/* ① 复制走的是当前这套输出设置，和「保存」同源 */
+$('copy').addEventListener('click', () => {
+  flashStatus(`已复制到剪贴板 · ${S.w} × ${S.h} · ${FORMATS[S.format]}`);
+});
+$('save').addEventListener('click', () => {
+  flashStatus((S.openAfter ? '已保存并打开文件夹 · ' : '已保存 · ') + fullPath());
+});
+$('cancel').addEventListener('click', () => flashStatus('已取消', 'info'));
+$('close').addEventListener('click', () => flashStatus('已取消', 'info'));
+$('classic-dialog').addEventListener('click', () => flashStatus('调用系统「另存为」对话框（拟议）', 'info'));
+$('change-path').addEventListener('click', () => flashStatus('打开目录选择器（拟议）', 'info'));
+
+/* ── 自检读数：面板高度必须仍是 569，右栏必须短于左栏 ───────────────── */
+function measure() {
+  const p = $('panel').getBoundingClientRect();
+  const form = document.querySelector('.form').getBoundingClientRect();
+  $('badge').textContent = `${Math.round(p.width)} × ${Math.round(p.height)} dip · 右栏 ${Math.round(form.height)}/${Math.round($('frame').parentElement.getBoundingClientRect().height)}`;
+}
+
+renderChips(); update();
+requestAnimationFrame(() => { fitView(); measure(); });
+window.addEventListener('resize', () => { if (!drag) fitView(); measure(); });
+</script>
+</body>
+</html>
