@@ -209,7 +209,7 @@ impl LabelDisplay {
         parts.join("  ")
     }
 
-    /// One item of the readout's own switch: `on` or off, everything else untouched (docs/23 §14.54).
+    /// 只切换一项可选标签的开合，其余标签保持原样（docs/23 §14.54）。
     pub fn set(self, toggle: LabelToggle, on: bool) -> Self {
         match toggle {
             LabelToggle::Size => Self {

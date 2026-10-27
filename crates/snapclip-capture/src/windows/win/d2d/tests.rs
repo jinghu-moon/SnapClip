@@ -1467,7 +1467,28 @@ fn overlay_drawn_strings() -> Vec<String> {
         "#ABCDEF".to_owned(),
         "rgb(255,0,0)".to_owned(),
         "hsl(359,100%,100%)".to_owned(),
+        "图片".to_owned(),
+        "圆角".to_owned(),
+        "自定义截图".to_owned(),
+        "尺寸".to_owned(),
+        "位置".to_owned(),
+        "×".to_owned(),
+        "去向".to_owned(),
+        "角标".to_owned(),
+        "延时".to_owned(),
+        "取消".to_owned(),
+        // The save panel's header title, drawn by `snapclip-ui`'s frame
+        // (`save-panel-demo-v3.html:473`), so the subset has to carry it too.
+        snapclip_ui::panel::TITLE.to_owned(),
     ];
+    // …and the save panel's form text: the four row labels (`:542`, `:553`, `:582`, `:630`) and the
+    // three quality options (`:641`–`:643`). Taken from the panel's own producer rather than copied,
+    // so a label added there without the subset being rebuilt fails the gate below.
+    drawn.extend(
+        snapclip_ui::panel::form_drawn_strings()
+            .into_iter()
+            .map(str::to_owned),
+    );
     // The hint row and the shortcut guide: every label, group, key and separator they can draw,
     // under any binding.
     drawn.extend(crate::keymap::drawn_strings());
@@ -1503,6 +1524,26 @@ fn overlay_drawn_strings() -> Vec<String> {
     drawn.push(level_hint(LevelReach { up: 8, down: 1 }));
     // …and the scroll panel and its toolbar (docs/33), listed by the module that lays them out.
     drawn.extend(crate::scroll::layout::drawn_strings());
+    // …and the save panel's copy (docs/41 §0.3). Called through the producers in `snapclip-ui`, so
+    // the sentences have one home: if the wording changes there, this list follows without anyone
+    // copying a string, and the coverage gate below cannot drift from what the panel renders.
+    for copy in snapclip_ui::copy::ValidationCopy::ALL {
+        drawn.push(copy.message().to_owned());
+        if let Some(repair) = copy.repair() {
+            drawn.push(repair.to_owned());
+        }
+    }
+    for link in [
+        snapclip_ui::copy::ConflictLink::Overwrite,
+        snapclip_ui::copy::ConflictLink::Rename,
+    ] {
+        drawn.push(link.text().to_owned());
+    }
+    // The filled forms, through their formatters: `{盘}` alone would not tell the subset it needs a
+    // digit and a unit, which only appear once the message is built.
+    drawn.push(snapclip_ui::copy::not_enough_space('C', "1 MB", "3 MB"));
+    drawn.push(snapclip_ui::copy::illegal_chars("<>"));
+    drawn.push(snapclip_ui::copy::reserved_name("CON"));
     drawn
 }
 
@@ -1551,6 +1592,25 @@ fn the_embedded_subset_covers_the_strings_the_overlay_draws() {
                 character as u32,
             );
         }
+    }
+}
+
+/// The save panel's numeric face is a second embedded subset with the same failure mode as the UI
+/// one: a character outside it is not an error anywhere, it renders per glyph in whatever the system
+/// falls back to, and only the screen shows it. The allowlist lives in the ui crate, beside the face
+/// it describes, so the font the panel asks for and the font checked here cannot drift apart.
+#[test]
+fn the_embedded_number_subset_covers_the_numbers_the_panel_shows() {
+    let covered = cmap_codepoints(snapclip_ui::panel::NUMBER_SUBSET);
+
+    for character in snapclip_ui::panel::number_characters() {
+        assert!(
+            covered.contains(&(character as u32)),
+            "the embedded numeric subset has no glyph for {character:?} (U+{:04X}), which the size \
+             row and the estimate row draw in that face: rebuild it with\n\
+             `python3 subfont/build_number_font.py`",
+            character as u32,
+        );
     }
 }
 
@@ -2354,7 +2414,7 @@ fn the_glyph_tint_follows_the_colour_it_is_given() {
             renderer.d2d.BeginDraw();
         }
         renderer
-            .draw_glyph(crate::icons::Glyph::Close, rect, brush, false)
+            .draw_glyph(snapclip_ui::panel::Glyph::Close, rect, brush, false)
             .unwrap();
         unsafe { renderer.d2d.EndDraw(None, None).unwrap() };
         drawn.push(renderer.device().read_back_bgra(&target.texture).unwrap());
@@ -2450,7 +2510,7 @@ fn the_cost_of_the_panel_icons() {
     let started = Instant::now();
     unsafe { d2d.BeginDraw() };
     for _ in 0..runs {
-        for (i, glyph) in crate::icons::Glyph::ALL.iter().enumerate() {
+        for (i, glyph) in snapclip_ui::panel::Glyph::ALL.iter().enumerate() {
             icons.draw(&d2d, *glyph, rects[i], colours[0], false).unwrap();
         }
     }
@@ -2486,8 +2546,8 @@ fn the_cost_of_the_panel_icons() {
     );
     eprintln!(
         "PANEL_ICONS vram: 源位图 {} KB + 色表 {} KB",
-        (crate::icons::ICON_COUNT as u32 * crate::icons::ICON_BAKED_PX * crate::icons::ICON_BAKED_PX * 4) / 1024,
-        (3 * 9 * crate::icons::ICON_BAKED_PX * crate::icons::ICON_BAKED_PX * 4) / 1024
+        (snapclip_ui::panel::ICON_COUNT as u32 * snapclip_ui::panel::ICON_BAKED_PX * snapclip_ui::panel::ICON_BAKED_PX * 4) / 1024,
+        (3 * 9 * snapclip_ui::panel::ICON_BAKED_PX * snapclip_ui::panel::ICON_BAKED_PX * 4) / 1024
     );
 }
 
@@ -2883,15 +2943,23 @@ fn render_countdown_frame() -> (Vec<u8>, u32, Rect) {
 
 /// 一帧普通画面（无 chrome、无面板），选区带圆角：用来量"遮罩的洞"是否跟着弧走。
 fn render_masked_frame(radius: i32) -> (Vec<u8>, u32) {
+    render_masked_with(radius, false, false)
+}
+
+/// 同上，但可以打开遮罩模糊、或换成棋盘底（量模糊用）。模糊开启时遮罩走
+/// `draw_bitmap_through`（PushLayer + 几何掩码）那条路径，而不是四条直边带。
+fn render_masked_with(radius: i32, mask_blur: bool, checker: bool) -> (Vec<u8>, u32) {
     let device =
         super::GraphicsDevice::create().expect("this test needs a D3D11 device (docs/31 D-14)");
     let (width, height) = (400u32, 300u32);
-    let background = [200u8, 200, 200, 255];
+    let background = if checker {
+        checkerboard_bgra(width, height, 4)
+    } else {
+        solid_bgra(width, height, [200u8, 200, 200, 255])
+    };
     let mut renderer = OverlayRenderer::new(std::sync::Arc::new(device), 96)
         .expect("this test needs a Direct2D overlay renderer (docs/31 D-14)");
-    renderer
-        .update_frame(width, height, &solid_bgra(width, height, background))
-        .unwrap();
+    renderer.update_frame(width, height, &background).unwrap();
     renderer.ensure_back_buffer(width, height).unwrap();
     let target = renderer
         .device()
@@ -2913,6 +2981,7 @@ fn render_masked_frame(radius: i32) -> (Vec<u8>, u32) {
     ));
     view.selection = Rect::new(60, 50, 340, 250);
     view.corner_radius = radius;
+    view.mask_blur = mask_blur;
     view.show_chrome = false;
     view.show_handles = false;
     view.show_size_label = false;
@@ -2953,6 +3022,134 @@ fn the_mask_hole_follows_the_rounded_selection() {
         assert!(px[0] + 30 < 200, "{label} 直边外必须压暗：{px:?}");
     }
 }
+
+/// 相邻像素水平差的均值 —— 局部对比度（模糊判据，与遮罩层那条同一套量法）。
+fn mean_horizontal_difference(pixels: &[u8], width: u32, x0: u32, x1: u32, y: u32) -> f32 {
+    let mut sum = 0u64;
+    let mut count = 0u64;
+    for x in x0..x1 {
+        let left = pixel_at(pixels, width, x, y);
+        let right = pixel_at(pixels, width, x + 1, y);
+        sum += (i32::from(left[0]) - i32::from(right[0])).unsigned_abs() as u64;
+        count += 1;
+    }
+    sum as f32 / count.max(1) as f32
+}
+
+/// 同一个渲染器上依次画多个半径，每次读回一帧 —— 用来验证几何缓存会随半径失效。
+fn render_masked_sequence(radii: &[i32]) -> Vec<(Vec<u8>, u32)> {
+    let device =
+        super::GraphicsDevice::create().expect("this test needs a D3D11 device (docs/31 D-14)");
+    let (width, height) = (400u32, 300u32);
+    let mut renderer = OverlayRenderer::new(std::sync::Arc::new(device), 96)
+        .expect("this test needs a Direct2D overlay renderer (docs/31 D-14)");
+    renderer
+        .update_frame(
+            width,
+            height,
+            &solid_bgra(width, height, [200u8, 200, 200, 255]),
+        )
+        .unwrap();
+    renderer.ensure_back_buffer(width, height).unwrap();
+    let target = renderer
+        .device()
+        .create_render_target_texture(width, height)
+        .unwrap();
+    let d2d_context = renderer.device().create_d2d_context().unwrap();
+    let target_bitmap = super::super::d3d11::create_bitmap_from_texture(
+        &d2d_context,
+        &target.texture,
+        D2D1_BITMAP_OPTIONS_TARGET,
+        D2D1_ALPHA_MODE_PREMULTIPLIED,
+    )
+    .unwrap();
+    let mut frames = Vec::new();
+    for radius in radii {
+        let mut view = RenderView::new(Rect::from_origin_size(
+            Point::new(0, 0),
+            width as i32,
+            height as i32,
+        ));
+        view.selection = Rect::new(60, 50, 340, 250);
+        view.corner_radius = *radius;
+        view.show_chrome = false;
+        view.show_handles = false;
+        view.show_size_label = false;
+        view.cursor_visible = false;
+        renderer.draw_to(&target_bitmap, &view).unwrap();
+        frames.push((
+            renderer.device().read_back_bgra(&target.texture).unwrap(),
+            width,
+        ));
+    }
+    frames
+}
+
+/// 模糊遮罩 + 圆角洞（docs/23 §14.55.24）：模糊开启时遮罩走 `draw_bitmap_through`
+/// （PushLayer + 几何掩码），几何判据必须与关闭时一致；并且模糊本身要真的发生。
+#[test]
+#[ignore = "L4 (docs/31 D-14): renders through the real D3D11/D2D path; run with --ignored on a machine with a GPU"]
+fn the_blurred_mask_follows_the_rounded_hole_and_keeps_its_blur() {
+    // 纯色底：模糊对纯色是恒等变换，所以亮度判据仍然成立 —— 但这条路径确实是
+    // `mask_blur = true` 的那条（`draw_bitmap_through`），不是四条直边带。
+    let (flat, width) = render_masked_with(0, true, false);
+    let (rounded, _) = render_masked_with(30, true, false);
+    let wedge = (63, 53);
+    let flat_px = pixel_at(&flat, width, wedge.0, wedge.1);
+    let round_px = pixel_at(&rounded, width, wedge.0, wedge.1);
+    assert!(
+        flat_px[0] >= 200,
+        "半径 0 时楔形属于洞里，应当还是原亮度：{flat_px:?}"
+    );
+    assert!(
+        round_px[0] + 30 < flat_px[0],
+        "半径 30 + 模糊时楔形在弧外，必须被压暗：{round_px:?} vs {flat_px:?}"
+    );
+    for (pixels, label) in [(&flat, "r0"), (&rounded, "r30")] {
+        let centre = pixel_at(pixels, width, 200, 150);
+        assert!(centre[0] >= 200, "{label} 洞里不该被压暗：{centre:?}");
+        let outside = pixel_at(pixels, width, 200, 20);
+        assert!(outside[0] + 30 < 200, "{label} 直边外必须压暗：{outside:?}");
+    }
+
+    // 棋盘底：洞外同一条带的高频，模糊版必须显著低于锐利版。
+    let (sharp, width) = render_masked_with(30, false, true);
+    let (blurred, _) = render_masked_with(30, true, true);
+    let sharp_diff = mean_horizontal_difference(&sharp, width, 100, 300, 20);
+    let blurred_diff = mean_horizontal_difference(&blurred, width, 100, 300, 20);
+    assert!(
+        sharp_diff > 20.0,
+        "棋盘底本身应当有高频（否则这条判据没有区分力）：{sharp_diff}"
+    );
+    assert!(
+        blurred_diff * 3.0 < sharp_diff,
+        "模糊没有生效：{blurred_diff} vs {sharp_diff}"
+    );
+}
+
+/// 几何缓存按（帧、洞、半径）失效（docs/23 §14.55.24）：同一个渲染器先画 r=0 再画 r=30，
+/// 第二帧必须等于"直接画 r=30"——否则楔形会被上一个形状的缓存漏过去（那正是这条最怕的 bug）。
+#[test]
+#[ignore = "L4 (docs/31 D-14): renders through the real D3D11/D2D path; run with --ignored on a machine with a GPU"]
+fn the_mask_ring_cache_does_not_keep_a_stale_shape() {
+    // 两个半径都必须非零：半径 0 走的是四条直边带那条路，压根不写这个缓存。
+    // 30 → 15 的次序让"15 那帧"存在复用 30 的旧形状的机会，这才是能失败的顺序。
+    let frames = render_masked_sequence(&[30, 15]);
+    let (after_radius_change, width) = (&frames[1].0, frames[1].1);
+    let (direct, _) = render_masked_with(15, false, false);
+    // 采样"在 r=15 的洞内、却在 r=30 的弧外"的那一小片：旧形状会把这里压暗。
+    for y in 51..55 {
+        for x in 72..79 {
+            let sequenced = pixel_at(after_radius_change, width, x, y);
+            let straight = pixel_at(&direct, width, x, y);
+            assert_eq!(
+                sequenced, straight,
+                "({x},{y}) 换了半径却复用了旧几何（缓存没失效）：{sequenced:?} vs {straight:?}"
+            );
+        }
+    }
+}
+
 
 /// 倒计时 HUD 的一帧：背景用棋盘（高频细节），这样任何多余的"冻结画面/遮罩"都会留下灰块。
 fn render_countdown_hud() -> (Vec<u8>, u32, Rect) {
@@ -3040,3 +3237,83 @@ fn the_countdown_hud_paints_only_the_frame_the_badge_and_the_number() {
     );
 }
 
+
+/// DIAGNOSTIC (docs/44, to keep or drop once the decision lands): what the overlay
+/// actually paints when every label item is switched off.
+#[test]
+fn with_every_label_item_off_no_badge_is_painted_and_no_menu_can_open() {
+    use crate::units::{LabelDisplay, LengthUnit};
+
+    let device =
+        super::GraphicsDevice::create().expect("this test needs a D3D11 device (docs/31 D-14)");
+    let width = 640u32;
+    let height = 480u32;
+    let background = [200u8, 180, 160, 255];
+    let mut renderer = OverlayRenderer::new(std::sync::Arc::new(device), 96)
+        .expect("this test needs a Direct2D overlay renderer (docs/31 D-14)");
+    renderer
+        .update_frame(width, height, &solid_bgra(width, height, background))
+        .unwrap();
+    renderer.ensure_back_buffer(width, height).unwrap();
+    let target = renderer
+        .device()
+        .create_render_target_texture(width, height)
+        .unwrap();
+    let d2d_context = renderer.device().create_d2d_context().unwrap();
+    let bitmap = super::super::d3d11::create_bitmap_from_texture(
+        &d2d_context,
+        &target.texture,
+        D2D1_BITMAP_OPTIONS_TARGET,
+        D2D1_ALPHA_MODE_PREMULTIPLIED,
+    )
+    .unwrap();
+
+    let mut view = RenderView::new(Rect::from_origin_size(
+        Point::new(0, 0),
+        width as i32,
+        height as i32,
+    ));
+    view.selection = Rect::new(200, 200, 400, 280);
+    view.show_chrome = true;
+    view.cursor_visible = false;
+
+    // All three items on: the badge exists and the menu has an anchor.
+    view.label = LabelDisplay {
+        length_unit: LengthUnit::Px,
+        show_size: true,
+        show_coordinates: true,
+        show_unit: true,
+    };
+    let with_items = renderer.size_label_bounds(&view).unwrap();
+    assert!(
+        with_items.is_some(),
+        "with items on the badge must have bounds; the menu hangs off them"
+    );
+
+    // All three off: the text is empty, so the badge is not placed.
+    view.label = LabelDisplay {
+        length_unit: LengthUnit::Px,
+        show_size: false,
+        show_coordinates: false,
+        show_unit: false,
+    };
+    let without_items = renderer.size_label_bounds(&view).unwrap();
+    assert_eq!(
+        without_items, None,
+        "with every item off the badge has no bounds, so no badge menu can be opened"
+    );
+
+    renderer.draw_to(&bitmap, &view).unwrap();
+    let composed = renderer.device().read_back_bgra(&target.texture).unwrap();
+    let panel = pixel_at(
+        &composed,
+        width,
+        (view.selection.left + 12) as u32,
+        (view.selection.top - 12) as u32,
+    );
+    assert_eq!(
+        panel,
+        masked(background),
+        "with every item off nothing is painted where the badge used to be"
+    );
+}

@@ -956,20 +956,8 @@ pub fn size_label_placement(
     })
 }
 
-/// 分段器选中块在两端之间插值；`t` 是 0..1 的原始进度（越界夹住，内部做 ease-out）。
-///
-/// 缓动用三次方 ease-out：起步快、落位稳，正是"滑过去停住"的手感。矩形是整数，插值后取整 ——
-/// 半像素的块挨着发丝线会看出抖动。纯函数：不碰时间、不碰设备，所以能单测（docs/23 §14.55.5）。
-pub fn segment_slide(from: Rect, to: Rect, t: f32) -> Rect {
-    let eased = 1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3);
-    let lerp = |a: i32, b: i32| (a as f32 + (b - a) as f32 * eased).round() as i32;
-    Rect::new(
-        lerp(from.left, to.left),
-        lerp(from.top, to.top),
-        lerp(from.right, to.right),
-        lerp(from.bottom, to.bottom),
-    )
-}
+pub use snapclip_ui::panel::segment_slide;
+use snapclip_ui::panel::{Button, Dropdown, DropdownTarget, Glyph, IconButton};
 
 /// 面板与它每个控件的矩形，都在窗口坐标里（dip × 显示器缩放）。
 ///
@@ -1062,7 +1050,6 @@ const REGION_UNIT_BUTTON_DIP: f32 = 32.0;
 /// 分段器里选中块相对容器的内缩：选中背景要缩在容器内，不能与容器等大。
 const REGION_UNIT_INSET_DIP: f32 = 3.0;
 /// 分段器的外层圆角（内层按嵌套规则减掉实际内缩）。
-const REGION_SEGMENT_RADIUS_DIP: f32 = 7.0;
 
 const REGION_SCALE_WIDTH_DIP: f32 = 46.0;
 
@@ -1125,7 +1112,7 @@ const REGION_SEGMENT_DIP: f32 = 30.0;
 
 /// 分段器每段里，文字两侧的内边距（dip）。量宽在设备层做：最宽选项的文本宽度 + 两侧这份内边距
 /// 就是每段的宽度 —— 两个分段器用同一条规矩（docs/23 §14.55.6）。
-pub const REGION_SEGMENT_PAD_DIP: f32 = 8.0;
+pub use snapclip_ui::panel::SEGMENT_PAD_DIP as REGION_SEGMENT_PAD_DIP;
 
 /// 分段器每段的宽度（物理像素），由设备层按**最宽选项**量出来。
 ///
@@ -1201,14 +1188,10 @@ pub fn pill_radius(rect: Rect) -> f32 {
 ///
 /// 两层同心，内块的圆弧才不会戳出外块。分段器（容器 + 选中块）走这一条，别再各写一个数；
 /// 它**不是**胶囊规则 —— 胶囊是 [`pill_radius`]（docs/23 §14.55.4）。
-pub fn segment_radius(outer: i32, inset: i32) -> i32 {
-    (outer - inset).max(0)
-}
+pub use snapclip_ui::panel::segment_radius;
 
 /// 分段器外层圆角，按显示器缩放取整。
-pub fn segment_outer_radius(scale: f32) -> i32 {
-    (REGION_SEGMENT_RADIUS_DIP * scale).round() as i32
-}
+pub use snapclip_ui::panel::segment_outer_radius;
 
 /// 按显示器 `scale` 排一块自定义截图面板。
 ///
@@ -1752,14 +1735,27 @@ impl RegionPanelLayout {
     ///
     /// 下拉展开时它压着下面的行，所以先问下拉。
     pub fn target_at(&self, point: Point) -> Option<RegionPanelTarget> {
-        if let Some(menu) = self.menu {
-            if menu.contains(point) {
-                for (index, item) in self.menu_items.iter().enumerate() {
-                    if item.contains(point) {
-                        return Some(RegionPanelTarget::MenuItem(index));
-                    }
+        let dropdown = Dropdown {
+            button: self.ratio,
+            menu: self.menu,
+            items: self.menu_items.to_vec(),
+            selected: None,
+            hovered: None,
+            open: self.menu.is_some(),
+            focused: false,
+            disabled: false,
+        };
+        if let Some(target) = dropdown.target_at(point) {
+            match target {
+                DropdownTarget::Button => {
+                    return Some(RegionPanelTarget::Slot(PanelSlot::Ratio));
                 }
-                return Some(RegionPanelTarget::MenuPadding);
+                DropdownTarget::Item(index) => {
+                    return Some(RegionPanelTarget::MenuItem(index));
+                }
+                DropdownTarget::Padding => {
+                    return Some(RegionPanelTarget::MenuPadding);
+                }
             }
         }
         for (unit, rect) in self.unit {
@@ -1767,11 +1763,14 @@ impl RegionPanelLayout {
                 return Some(RegionPanelTarget::Unit(unit));
             }
         }
-        if self.close.contains(point) {
+        if IconButton::new(self.close, Glyph::Close).hit_test(point) {
             return Some(RegionPanelTarget::Slot(PanelSlot::Cancel));
         }
         for (slot, rect) in self.actions {
-            if rect.contains(point) {
+            let Some(glyph) = action_glyph(slot) else {
+                continue;
+            };
+            if IconButton::new(rect, glyph).hit_test(point) {
                 return Some(RegionPanelTarget::Slot(slot));
             }
         }
@@ -1786,9 +1785,6 @@ impl RegionPanelLayout {
         }
         if self.radius_track.width() > 0 && self.radius_track.contains(point) {
             return Some(RegionPanelTarget::Radius(self.radius_at(point.x)));
-        }
-        if self.ratio.contains(point) {
-            return Some(RegionPanelTarget::Slot(PanelSlot::Ratio));
         }
         for (destination, rect) in self.destination {
             if rect.contains(point) {
@@ -1805,10 +1801,10 @@ impl RegionPanelLayout {
                 return Some(RegionPanelTarget::Slot(toggle.slot()));
             }
         }
-        if self.start.contains(point) {
+        if Button::new(self.start).hit_test(point) {
             return Some(RegionPanelTarget::Slot(PanelSlot::Start));
         }
-        if self.cancel.contains(point) {
+        if Button::new(self.cancel).hit_test(point) {
             return Some(RegionPanelTarget::Slot(PanelSlot::Cancel));
         }
         None
@@ -1820,6 +1816,15 @@ impl RegionPanelLayout {
         self.menu_items
             .iter()
             .position(|item| item.contains(point))
+    }
+}
+
+fn action_glyph(slot: PanelSlot) -> Option<Glyph> {
+    match slot {
+        PanelSlot::Swap => Some(Glyph::Swap),
+        PanelSlot::Center => Some(Glyph::Center),
+        PanelSlot::Origin => Some(Glyph::Origin),
+        _ => None,
     }
 }
 

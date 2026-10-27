@@ -31,8 +31,6 @@ pub mod artifact;
 pub mod diagnostics;
 pub mod error;
 pub mod geometry;
-// The panel's glyphs (`assets/icon/*.svg` baked to PNG): pure data, so it needs no GPU to test.
-pub mod icons;
 pub mod keymap;
 pub mod monitor_cache;
 // The overlay's typeface and its family stack: the one place both renderers (the D2D overlay and

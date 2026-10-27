@@ -66,13 +66,14 @@ use crate::ring_contrast::{
 use crate::scroll::layout::Layout;
 use crate::geometry::{
     REGION_SEGMENT_PAD_DIP, RegionPanelLayout, RegionPanelTarget, SegmentWidths, pill_radius,
-    segment_outer_radius, segment_radius,
 };
-use crate::icons::Glyph;
 use crate::region::{
     Delay, Destination, PanelSlot, Ratio, RegionField, RATIOS, RATIO_FREE_LABEL,
 };
 use crate::units::{LabelDisplay, LabelToggle, LengthUnit};
+use snapclip_ui::panel::{Glyph, PanelTheme, Segment, SegmentState, Tag, TagState};
+use snapclip_ui::panel::TagColors;
+use snapclip_ui::panel::d2d::{PanelPainter, SegmentColors};
 pub(crate) use guide_pass::{GUIDE_AVOID_DIP, GuideView};
 
 /// The font family used for the size label, per the tasklist (§6.3) — the same two families the
@@ -198,7 +199,7 @@ pub struct RegionPanelView {
     pub delay_slide: Option<(usize, f32)>,
     /// 宽高比是否锁定。
     pub locked: bool,
-    /// 三个显示开关的开合。
+    /// 三个可选标签的选中状态。
     pub toggles: [(LabelToggle, bool); 3],
     /// 页脚那句话（校验失败时）。
     pub status: Option<String>,
@@ -1690,30 +1691,21 @@ impl OverlayRenderer {
             // No room beside the box: dropping the label beats covering the pixels being chosen.
             return Ok(());
         };
-        unsafe {
+        {
             // 方向芯片（↑/↓）同样是胶囊：以前写死 3.0，所以三处芯片里只有一处是真胶囊。
             let radius = pill_radius(placement.rect);
-            let panel = D2D1_ROUNDED_RECT {
-                rect: to_d2d(placement.rect),
-                radiusX: radius,
-                radiusY: radius,
+            let painter = PanelPainter {
+                context: &self.d2d,
+                text_factory: &self.dwrite,
             };
-            self.d2d.FillRoundedRectangle(&panel, &background);
-            let wide = text.encode_utf16().collect::<Vec<u16>>();
+            painter.fill_round(placement.rect, radius.round() as i32, &background);
             let text_rect = D2D_RECT_F {
                 left: placement.rect.left as f32 + metrics.label_padding_x,
                 top: placement.rect.top as f32 + metrics.label_padding_y,
                 right: placement.rect.right as f32 - metrics.label_padding_x,
                 bottom: placement.rect.bottom as f32 - metrics.label_padding_y,
             };
-            self.d2d.DrawText(
-                &wide,
-                &format,
-                &text_rect,
-                &foreground,
-                D2D1_DRAW_TEXT_OPTIONS_NONE,
-                DWRITE_MEASURING_MODE_NATURAL,
-            );
+            painter.draw_text_rect(text, &format, text_rect, &foreground);
         }
         Ok(())
     }
@@ -1815,35 +1807,29 @@ impl OverlayRenderer {
 
     /// 填一块圆角矩形（面板、卡片、药丸都从这里走）。
     fn fill_round(&self, rect: Rect, radius: i32, brush: &ID2D1SolidColorBrush) {
-        let rounded = D2D1_ROUNDED_RECT {
-            rect: to_d2d(rect),
-            radiusX: radius as f32,
-            radiusY: radius as f32,
-        };
-        unsafe { self.d2d.FillRoundedRectangle(&rounded, brush) };
+        PanelPainter {
+            context: &self.d2d,
+            text_factory: &self.dwrite,
+        }
+        .fill_round(rect, radius, brush);
     }
 
     /// 描一块圆角矩形的边（发丝线、聚焦环、按钮轮廓）。
     fn stroke_round(&self, rect: Rect, radius: i32, brush: &ID2D1SolidColorBrush, width: f32) {
-        let rounded = D2D1_ROUNDED_RECT {
-            rect: to_d2d(rect),
-            radiusX: radius as f32,
-            radiusY: radius as f32,
-        };
-        unsafe { self.d2d.DrawRoundedRectangle(&rounded, brush, width, None) };
+        PanelPainter {
+            context: &self.d2d,
+            text_factory: &self.dwrite,
+        }
+        .stroke_round(rect, radius, brush, width);
     }
 
     /// 一条线（两点之间）：图标与分隔线都用它。
     fn line(&self, from: Point, to: Point, brush: &ID2D1SolidColorBrush, width: f32) {
-        unsafe {
-            self.d2d.DrawLine(
-                vector2(from.x as f32, from.y as f32),
-                vector2(to.x as f32, to.y as f32),
-                brush,
-                width,
-                None,
-            )
-        };
+        PanelPainter {
+            context: &self.d2d,
+            text_factory: &self.dwrite,
+        }
+        .line((from.x, from.y), (to.x, to.y), brush, width);
     }
 
     /// L3.7: the custom-region panel (docs/23 §14.54).
@@ -2290,7 +2276,7 @@ impl OverlayRenderer {
             },
         )?;
 
-        // ── 角标行：三个开关 + 角标预览 ──────────────────────────────────
+        // ── 角标行：三个可选标签 + 角标预览 ───────────────────────────────
         let toggle_format = self.info_text_format_mut(false, 11.0, DWRITE_FONT_WEIGHT_NORMAL, true)?;
         for (toggle, rect) in layout.toggles {
             let on = panel
@@ -2300,22 +2286,31 @@ impl OverlayRenderer {
                 .map(|(_, on)| *on)
                 .unwrap_or(false);
             let hovered = panel.hover == Some(RegionPanelTarget::Slot(toggle.slot()));
-            // 胶囊：半径 = 高度/2（三个开关与角标、分段器同一套算法）。
-            let radius = pill_radius(rect).round() as i32;
-            if on {
-                self.fill_round(rect, radius, &accent_fill);
-                self.stroke_round(rect, radius, &accent, 1.0);
-            } else {
-                // **静止的未选中芯片也有胶囊底**：它不该只是"细描边的文字"。悬停用白色 30% 那支
-                // 画刷当底色（现成资源，不新增），所以静止与悬停一眼可分（docs/23 §14.55.2）。
-                self.fill_round(rect, radius, if hovered { &line } else { &fill });
-                self.stroke_round(rect, radius, &line, 1.0);
-            }
+            Tag::new(rect).paint(
+                &PanelPainter {
+                    context: &self.d2d,
+                    text_factory: &self.dwrite,
+                },
+                TagState {
+                    selected: on,
+                    interaction: snapclip_ui::panel::InteractionState {
+                        hovered,
+                        focused: panel.focus == Some(toggle.slot()),
+                        ..Default::default()
+                    },
+                },
+                TagColors {
+                    off_fill: &fill,
+                    off_hover: &line,
+                    on_fill: &accent_fill,
+                    line: &line,
+                    on_line: &accent,
+                    focus: &accent,
+                    disabled: &muted,
+                },
+            );
             let brush = if on { &text } else { &muted };
             self.draw_text_in(toggle.label(), &toggle_format, to_d2d(rect), brush)?;
-            if panel.focus == Some(toggle.slot()) {
-                self.stroke_round(rect, radius, &accent, 2.0);
-            }
         }
         // 预览标签也是胶囊：与角标、方向芯片共用同一套半径算法。
 
@@ -2423,34 +2418,41 @@ impl OverlayRenderer {
         style: &SegmentStyle<'_>,
     ) -> Result<(), String> {
         let scale = self.metrics.dpi.max(96) as f32 / 96.0;
-        let outer = segment_outer_radius(scale);
-        // 内层半径 = 外层 − 实际内缩（由第一段到容器的左边距量出；横向纵向本来一致）。
-        let inset = segments.first().map_or(0, |(rect, _, _)| rect.left - track.left);
-        let inner = segment_radius(outer, inset);
-        self.fill_round(track, outer, style.track);
-        // 选中块：平移期间在"起点段"与"选中段"之间插值；文字与命中判定用的仍是布局矩形。
-        let selected = segments.iter().position(|(_, _, selected)| *selected);
-        let block = selected.map(|to| match slide {
-            Some((from, t)) if from != to && from < segments.len() => {
-                crate::geometry::segment_slide(segments[from].0, segments[to].0, t)
-            }
-            _ => segments[to].0,
-        });
-        if let Some(block) = block {
-            self.fill_round(block, inner, style.selected);
+        let format = self.info_text_format_mut(style.mono, style.size_dip, style.weight, true)?;
+        let state = SegmentState {
+            track,
+            segments: segments
+                .iter()
+                .map(|(rect, _, selected)| Segment {
+                    rect: *rect,
+                    selected: *selected,
+                    disabled: false,
+                })
+                .collect(),
+            hovered,
+            pressed: None,
+            focused,
+            slide,
+        };
+        let labels: Vec<&str> = segments.iter().map(|(_, label, _)| *label).collect();
+        PanelPainter {
+            context: &self.d2d,
+            text_factory: &self.dwrite,
         }
-        for (index, (rect, label, selected)) in segments.iter().enumerate() {
-            if !*selected && hovered == Some(index) {
-                self.fill_round(*rect, inner, style.hover);
-            }
-            let brush = if *selected { style.text } else { style.muted };
-            let format =
-                self.info_text_format_mut(style.mono, style.size_dip, style.weight, true)?;
-            self.draw_text_in(label, &format, to_d2d(*rect), brush)?;
-        }
-        if focused {
-            self.stroke_round(track, outer, style.focus, 2.0);
-        }
+        .segmented(
+            &state,
+            &labels,
+            &format,
+            SegmentColors {
+                track: style.track,
+                selected: style.selected,
+                hover: style.hover,
+                focus: style.focus,
+                text: style.text,
+                muted: style.muted,
+            },
+            scale,
+        );
         Ok(())
     }
 
@@ -2476,16 +2478,12 @@ impl OverlayRenderer {
         text: &str,
         format: &IDWriteTextFormat,
     ) -> Result<f32, String> {
-        let wide = text.encode_utf16().collect::<Vec<u16>>();
-        let layout = unsafe {
-            self.dwrite
-                .CreateTextLayout(&wide, format, f32::INFINITY, f32::INFINITY)
+        PanelPainter {
+            context: &self.d2d,
+            text_factory: &self.dwrite,
         }
-        .map_err(|error| super::hresult("IDWriteFactory::CreateTextLayout", &error))?;
-        let mut text_metrics = DWRITE_TEXT_METRICS::default();
-        unsafe { layout.GetMetrics(&mut text_metrics) }
-            .map_err(|error| super::hresult("IDWriteTextLayout::GetMetrics", &error))?;
-        Ok(text_metrics.width)
+        .measure_text_width(text, format)
+        .map_err(|error| super::hresult("IDWriteTextLayout::GetMetrics", &error))
     }
 
     fn draw_size_label(
@@ -2519,30 +2517,21 @@ impl OverlayRenderer {
             return Ok(());
         };
 
-        unsafe {
+        {
             // 胶囊：圆角取高度的一半（`geometry::pill_radius`）——三处芯片共用同一个算法。
             let radius = pill_radius(placement.rect);
-            let panel = D2D1_ROUNDED_RECT {
-                rect: to_d2d(placement.rect),
-                radiusX: radius,
-                radiusY: radius,
+            let painter = PanelPainter {
+                context: &self.d2d,
+                text_factory: &self.dwrite,
             };
-            self.d2d.FillRoundedRectangle(&panel, &background);
-            let wide = text.encode_utf16().collect::<Vec<u16>>();
+            painter.fill_round(placement.rect, radius.round() as i32, &background);
             let text_rect = D2D_RECT_F {
                 left: placement.rect.left as f32 + metrics.label_padding_x,
                 top: placement.rect.top as f32 + metrics.label_padding_y,
                 right: placement.rect.right as f32 - metrics.label_padding_x,
                 bottom: placement.rect.bottom as f32 - metrics.label_padding_y,
             };
-            self.d2d.DrawText(
-                &wide,
-                &format,
-                &text_rect,
-                &foreground,
-                D2D1_DRAW_TEXT_OPTIONS_NONE,
-                DWRITE_MEASURING_MODE_NATURAL,
-            );
+            painter.draw_text_rect(&text, &format, text_rect, &foreground);
         }
         Ok(())
     }
@@ -2823,17 +2812,11 @@ impl OverlayRenderer {
         if text.is_empty() {
             return Ok(());
         }
-        let wide = text.encode_utf16().collect::<Vec<u16>>();
-        unsafe {
-            self.d2d.DrawText(
-                &wide,
-                format,
-                &rect,
-                brush,
-                D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                DWRITE_MEASURING_MODE_NATURAL,
-            );
+        PanelPainter {
+            context: &self.d2d,
+            text_factory: &self.dwrite,
         }
+        .draw_text_rect(text, format, rect, brush);
         Ok(())
     }
 
@@ -2884,15 +2867,12 @@ impl OverlayRenderer {
     fn measure_label(&mut self, text: &str) -> Result<((i32, i32), IDWriteTextFormat), String> {
         let metrics = self.metrics;
         let format = self.label_text_format_mut()?;
-        let wide = text.encode_utf16().collect::<Vec<u16>>();
-        let layout = unsafe {
-            self.dwrite
-                .CreateTextLayout(&wide, &format, f32::INFINITY, f32::INFINITY)
+        let text_metrics = PanelPainter {
+            context: &self.d2d,
+            text_factory: &self.dwrite,
         }
-        .map_err(|error| super::hresult("IDWriteFactory::CreateTextLayout", &error))?;
-        let mut text_metrics = DWRITE_TEXT_METRICS::default();
-        unsafe { layout.GetMetrics(&mut text_metrics) }
-            .map_err(|error| super::hresult("IDWriteTextLayout::GetMetrics", &error))?;
+        .measure_text(text, &format)
+        .map_err(|error| super::hresult("IDWriteTextLayout::GetMetrics", &error))?;
         let width = text_metrics.width.ceil() as i32 + (metrics.label_padding_x * 2.0) as i32;
         let height = text_metrics.height.ceil() as i32 + (metrics.label_padding_y * 2.0) as i32;
         Ok(((width.max(1), height.max(1)), format))
@@ -3052,7 +3032,6 @@ impl OverlayRenderer {
             return Ok(());
         }
         let format = self.label_text_format_mut()?;
-        let wide = content.encode_utf16().collect::<Vec<u16>>();
         let fs = item.style.font_size;
         let approx_w = (content.chars().count() as f32 * fs * 0.55).max(10.0);
         let approx_h = fs * 2.0;
@@ -3062,16 +3041,11 @@ impl OverlayRenderer {
             right: position.x as f32 + approx_w,
             bottom: position.y as f32 + approx_h,
         };
-        unsafe {
-            self.d2d.DrawText(
-                &wide,
-                &format,
-                &text_rect,
-                stroke,
-                D2D1_DRAW_TEXT_OPTIONS_NONE,
-                DWRITE_MEASURING_MODE_NATURAL,
-            );
+        PanelPainter {
+            context: &self.d2d,
+            text_factory: &self.dwrite,
         }
+        .draw_text_rect(content, &format, text_rect, stroke);
         Ok(())
     }
 
@@ -3222,6 +3196,8 @@ impl OverlayRenderer {
         let accent = color_of(ACCENT_RGB, 1.0);
         let white = color(1.0, 1.0, 1.0, 1.0);
         let panel = color(0.09, 0.09, 0.11, 0.92);
+        let panel_theme = PanelTheme::DARK_OVERLAY;
+        let panel_color = |rgba: [f32; 4]| color(rgba[0], rgba[1], rgba[2], rgba[3]);
         let crosshair = color(1.0, 0.75, 0.0, 0.95);
         // Dark charcoal grid lines: keep them legible when the magnified
         // content is light (white-on-white was invisible on pale screens).
@@ -3267,14 +3243,14 @@ impl OverlayRenderer {
         self.label_text_brush = Some(self.create_brush(&white)?);
         // The custom-region panel: the accent marks whatever is currently selected or on, and the
         // muted white carries the labels the user is not editing (docs/23 §14.54).
-        self.panel_fill_brush = Some(self.create_brush(&color(1.0, 1.0, 1.0, 0.08))?);
-        self.panel_line_brush = Some(self.create_brush(&color(1.0, 1.0, 1.0, 0.30))?);
-        self.panel_accent_brush = Some(self.create_brush(&accent)?);
-        self.panel_muted_brush = Some(self.create_brush(&rgba(232, 236, 242, 0.62))?);
+        self.panel_fill_brush = Some(self.create_brush(&panel_color(panel_theme.fill))?);
+        self.panel_line_brush = Some(self.create_brush(&panel_color(panel_theme.line))?);
+        self.panel_accent_brush = Some(self.create_brush(&panel_color(panel_theme.accent))?);
+        self.panel_muted_brush = Some(self.create_brush(&panel_color(panel_theme.muted))?);
         self.panel_out_fill_brush = Some(self.create_brush(&color_of(ACCENT_RGB, 0.14))?);
         self.panel_out_line_brush = Some(self.create_brush(&color_of(ACCENT_RGB, 0.60))?);
         self.panel_out_title_brush = Some(self.create_brush(&rgba(124, 180, 243, 1.0))?);
-        self.panel_danger_brush = Some(self.create_brush(&rgba(255, 123, 123, 1.0))?);
+        self.panel_danger_brush = Some(self.create_brush(&panel_color(panel_theme.danger))?);
         // The panel's glyphs are *not* prepared here. Decoding and pre-tinting them costs a
         // measurable 1.6 ms, and this runs on the session-start path (F5 → overlay visible), so the
         // work moved to `prepare_panel_icons`, which the controller calls just before the frame that

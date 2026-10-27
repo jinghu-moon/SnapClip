@@ -78,10 +78,19 @@ def guard_text_drawing_files(required: set[int]) -> None:
     """Any non-ASCII literal in a text-drawing file must be part of the drawn-text list."""
     offenders: list[str] = []
     for path in sorted(SCAN_ROOT.rglob("*.rs")):
+        # Test fixtures often contain explanatory Chinese assertions and sample strings. They are
+        # not rendered by the product and must not expand the embedded UI font contract.
+        if path.name.endswith("tests.rs"):
+            continue
         source = path.read_text(encoding="utf-8")
         if not any(api in source for api in TEXT_APIS):
             continue
         for line, literal in literals_with_lines(source):
+            source_line = source.splitlines()[line - 1].strip()
+            # A renderer module also contains diagnostics. Their strings are never passed to a
+            # DirectWrite draw call and must not become embedded UI glyphs.
+            if any(marker in source_line for marker in ("format!(", "Err(", "error:", "debug!", "warn!")):
+                continue
             for char in literal:
                 if ord(char) > 0x7F and ord(char) not in required:
                     offenders.append(

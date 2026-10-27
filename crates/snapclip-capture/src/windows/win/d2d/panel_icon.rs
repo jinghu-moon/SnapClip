@@ -42,8 +42,8 @@ use windows::Win32::System::Com::{
 use windows::core::Interface;
 
 use super::helpers::to_d2d;
-use crate::geometry::Rect;
-use crate::icons::{Glyph, ICON_BAKED_PX};
+use snapclip_model::geometry::Rect;
+use snapclip_ui::panel::{Glyph, ICON_BAKED_PX};
 
 /// A tinted bitmap's identity: the glyph, the colour it was tinted in, and whether it is flipped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
