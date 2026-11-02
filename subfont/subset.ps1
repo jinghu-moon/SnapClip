@@ -6,8 +6,7 @@
 # below writes to `subfont/drawn-text.txt`. `build_subset.py` then builds the font from it, fails
 # if the artifact cannot cover it, guards against a string drawn inline but never listed, and
 # installs the result where `include_bytes!` reads it
-# (`crates/snapclip-capture/assets/harmonyos-sans-sc-subset.ttf`, which moved there with the
-# overlay in docs/23 T1.5) — the old script only wrote `subfont/`, which is why the shipped
+# (`crates/snapclip-ui/assets/harmonyos-sans-sc-subset.ttf`, shared by capture and pin) — the old script only wrote `subfont/`, which is why the shipped
 # copy had quietly gone stale.
 #
 # Requires: python3 with fontTools (pip install fonttools) and the source font at

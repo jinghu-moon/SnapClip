@@ -32,11 +32,12 @@ Set-Location (Split-Path -Parent $PSScriptRoot)
 # not touch the database) but is exactly what history is for; `arboard` is forbidden in
 # both because owning the clipboard belongs to the shell. Capability crates never depend
 # on each other: the shell wires them.
-$SHELL_ONLY = @("tauri", "wry", "gpui", "gpui-kit")
+$SHELL_ONLY = @("snapclip-app", "tauri", "wry", "gpui", "gpui-pre", "gpui-kit", "gpui-base", "gpui-component", "yue-component")
 $FORBIDDEN = @{
-    "snapclip-capture" = $SHELL_ONLY + @("rusqlite", "arboard", "snapclip-history", "snapclip-recognize")
-    "snapclip-history" = $SHELL_ONLY + @("arboard", "snapclip-capture", "snapclip-recognize")
-    "snapclip-model"   = $SHELL_ONLY + @("rusqlite", "arboard", "image", "windows", "windows-sys", "snapclip-capture", "snapclip-history", "snapclip-recognize")
+    "snapclip-pin"     = $SHELL_ONLY + @("rusqlite", "arboard", "snapclip-capture", "snapclip-history", "snapclip-recognize")
+    "snapclip-capture" = $SHELL_ONLY + @("snapclip-pin", "rusqlite", "arboard", "snapclip-history", "snapclip-recognize")
+    "snapclip-history" = $SHELL_ONLY + @("snapclip-pin", "arboard", "snapclip-capture", "snapclip-recognize")
+    "snapclip-model"   = $SHELL_ONLY + @("snapclip-pin", "rusqlite", "arboard", "image", "windows", "windows-sys", "snapclip-capture", "snapclip-history", "snapclip-recognize")
 }
 
 # `snapclip-model` is the bottom of the graph: value types and `serde`, nothing else.
@@ -63,7 +64,7 @@ function Get-PackageNames([string[]]$lines) {
 
 $failures = New-Object System.Collections.Generic.List[string]
 
-$targets = if ($Package) { @($Package) } else { @("snapclip-capture", "snapclip-history", "snapclip-model") }
+$targets = if ($Package) { @($Package) } else { @("snapclip-capture", "snapclip-history", "snapclip-model", "snapclip-pin") }
 
 foreach ($target in $targets) {
     $lines = Get-TreeLines $target

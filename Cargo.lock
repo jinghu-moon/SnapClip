@@ -2260,8 +2260,6 @@ dependencies = [
 [[package]]
 name = "gpui-base"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5cd7de73d5b2d3d18b94a928abf343922091fa77bc472f77b7d2e7e8b1823a7"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -2707,8 +2705,6 @@ dependencies = [
 [[package]]
 name = "gpui-pre"
 version = "0.3.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34f61c1cfd36fc9c436af09308c963822ae27a45a84feb21a77ba5c9e051f1c0"
 dependencies = [
  "accesskit",
  "anyhow",
@@ -6717,7 +6713,6 @@ dependencies = [
  "enough",
  "gpui-kit",
  "image",
- "parking_lot",
  "png 0.18.1",
  "rclip-rtf",
  "serde",
@@ -6725,9 +6720,11 @@ dependencies = [
  "snapclip-capture",
  "snapclip-history",
  "snapclip-model",
+ "snapclip-pin",
  "snapclip-ui",
  "win-icon-extractor",
  "windows-sys 0.59.0",
+ "yue-component",
  "zenjpeg",
  "zenwebp",
 ]
@@ -6767,6 +6764,18 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "snapclip-pin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "parking_lot",
+ "png 0.18.1",
+ "snapclip-model",
+ "snapclip-ui",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -9193,6 +9202,22 @@ dependencies = [
  "quote",
  "syn 3.0.6",
  "synstructure",
+]
+
+[[package]]
+name = "yue-component"
+version = "0.1.0"
+dependencies = [
+ "gpui-kit",
+ "lyon",
+ "yue-component-icons",
+]
+
+[[package]]
+name = "yue-component-icons"
+version = "0.1.0"
+dependencies = [
+ "gpui-kit",
 ]
 
 [[package]]

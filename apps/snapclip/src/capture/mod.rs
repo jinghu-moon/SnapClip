@@ -187,7 +187,7 @@ impl TakeSelection for SelectionHome {
 mod tests {
     use super::{start, SelectionHome, TakeSelection};
     use crate::events::EventBus;
-    use crate::pin::PinHome;
+    use snapclip_pin::PinHome;
     use snapclip_capture::window_detection::DetectionOptions;
     use snapclip_model::CaptureState;
     use std::sync::atomic::{AtomicUsize, Ordering};

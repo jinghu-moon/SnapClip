@@ -72,40 +72,9 @@ pub(crate) const PANEL_STYLE: u32 = windows_sys::Win32::UI::WindowsAndMessaging:
     | windows_sys::Win32::UI::WindowsAndMessaging::WS_CAPTION
     | windows_sys::Win32::UI::WindowsAndMessaging::WS_MINIMIZEBOX;
 
-/// Replace the panel in `slot`: **close the old one, then create the new one, then store it.**
-///
-/// The order is the contract, not an implementation detail. A window handle is reused once its
-/// window is destroyed, so closing a stale handle *after* the new panel exists can post
-/// `WM_CLOSE` to the panel that was just opened, because the system handed it the same number.
-/// Closing first removes the window the stale number could have referred to.
-///
-/// `create` is a factory rather than a value so that the whole sequence lives inside this
-/// function: a caller that builds the new panel before calling in would reintroduce the bug the
-/// order exists to prevent. The sequence is asserted in `panel_slot_tests` through the two
-/// closures, which the test supplies and therefore observes.
-pub(crate) fn replace_panel<T, E>(
-    slot: &std::sync::Mutex<Option<T>>,
-    create: impl FnOnce() -> Result<T, E>,
-    close: impl FnOnce(T),
-) -> Result<(), E> {
-    let previous = slot
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take();
-    if let Some(previous) = previous {
-        close(previous);
-    }
-    let next = create()?;
-    slot.lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .replace(next);
-    Ok(())
-}
-
 #[cfg(test)]
 mod panel_slot_tests {
-    use super::{PANEL_EX_STYLE, PANEL_STYLE, replace_panel};
-    use std::sync::Mutex;
+    use super::{PANEL_EX_STYLE, PANEL_STYLE};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         WS_CAPTION, WS_EX_CONTROLPARENT, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_MAXIMIZEBOX,
         WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
@@ -170,41 +139,6 @@ mod panel_slot_tests {
             0,
             "a fixed-size dialog has no resize border"
         );
-    }
-
-    #[test]
-    fn the_previous_panel_is_closed_before_the_new_one_exists() {
-        let slot: Mutex<Option<u32>> = Mutex::new(Some(1));
-        let order: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
-        // What the closer sees is the whole point: if the slot still names the old panel while
-        // the new window already exists, a stale handle can name the window that took its place.
-        let seen = Mutex::new(None);
-        replace_panel(
-            &slot,
-            || {
-                order.lock().unwrap().push("create");
-                Ok::<u32, ()>(2)
-            },
-            |previous| {
-                order.lock().unwrap().push("close");
-                *seen.lock().unwrap() = Some((previous, *slot.lock().unwrap()));
-            },
-        )
-        .unwrap();
-
-        assert_eq!(
-            *seen.lock().unwrap(),
-            Some((1, None)),
-            "the closer must run while the slot is empty: that is what keeps a stale handle from \
-             naming the panel that was just created"
-        );
-        assert_eq!(
-            *order.lock().unwrap(),
-            vec!["close", "create"],
-            "close, then create: creating before closing is how a stale handle ends up naming the \
-             new panel"
-        );
-        assert_eq!(*slot.lock().unwrap(), Some(2));
     }
 }
 
@@ -1562,7 +1496,7 @@ fn control_text(hwnd: windows_sys::Win32::Foundation::HWND) -> String {
 /// The application's own name, which [软件名] expands to (:198) and the token menu shows.
 pub(crate) const APP_NAME: &str = "SnapClip";
 
-/// Shared with the GPUI probe (`gpui_save`), which saves through the same chain: the template's
+/// Shared with the Yue save panel (`save_panel::source`), which saves through the same chain: the template's
 /// values have to come from one clock, or the two panels would disagree about the name of a file.
 pub(crate) fn local_date_and_time() -> (String, String) {
     let mut now: windows_sys::Win32::Foundation::SYSTEMTIME = unsafe { std::mem::zeroed() };
@@ -3246,7 +3180,7 @@ fn create_field_edit(
         // font, everything else in the UI font. Both are registered from memory and both stay
         // registered for the life of the process.
         let bytes = match face {
-            snapclip_ui::panel::FieldFace::Text => snapclip_capture::overlay_font::SUBSET,
+            snapclip_ui::panel::FieldFace::Text => snapclip_ui::font::SUBSET,
             snapclip_ui::panel::FieldFace::Number => snapclip_ui::panel::NUMBER_SUBSET,
         };
         let _ = AddFontMemResourceEx(

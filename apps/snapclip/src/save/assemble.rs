@@ -247,8 +247,12 @@ pub fn save_panel(values: &PanelValues<'_>, frame: &Frame<'_>) -> Result<SaveOut
     // Every other format is a transcode of the same PNG master, so the encoder that exists writes
     // the master and the transcoder spends the quality exactly once. The format's size limits are
     // asked here because the banded path asks them for its own (PNG) format.
-    super::caps::check(request.format, u64::from(output.width), u64::from(output.height))
-        .map_err(SaveError::Capability)?;
+    super::caps::check(
+        request.format,
+        u64::from(output.width),
+        u64::from(output.height),
+    )
+    .map_err(SaveError::Capability)?;
     let master = bands::encode_png_bands(&mut bands, output.width)?;
     let encoded = super::transcode::to_bytes(&master, request.format, values.quality)?;
     super::service::commit_bytes(&request, &encoded)
@@ -263,6 +267,11 @@ pub fn save_panel(values: &PanelValues<'_>, frame: &Frame<'_>) -> Result<SaveOut
 /// path deliberately avoids. It buys a number the panel can show before the user commits, and a
 /// test holds the two lengths equal so the two paths cannot drift apart quietly.
 pub fn weigh(values: &PanelValues<'_>, frame: &Frame<'_>) -> Result<u64, SaveError> {
+    encoded_bytes(values, frame).map(|bytes| bytes.len() as u64)
+}
+
+/// The exact encoded output for a preview. Saving retains its streaming PNG path.
+pub fn encoded_bytes(values: &PanelValues<'_>, frame: &Frame<'_>) -> Result<Vec<u8>, SaveError> {
     let output = frame.output;
     super::caps::check(
         values.format,
@@ -287,7 +296,7 @@ pub fn weigh(values: &PanelValues<'_>, frame: &Frame<'_>) -> Result<u64, SaveErr
     } else {
         super::transcode::to_bytes(&master, values.format, values.quality)?
     };
-    Ok(encoded.len() as u64)
+    Ok(encoded)
 }
 
 /// The pixels the panel already holds, offered to the encoder a band at a time.
@@ -331,7 +340,7 @@ impl BandSource for WholeImage<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::save::scale::{output_size, Size, SizeMode};
+    use crate::save::scale::{Size, SizeMode, output_size};
 
     fn values() -> PanelValues<'static> {
         PanelValues {
@@ -445,7 +454,11 @@ mod tests {
         assert_eq!(outcome.path.file_name().unwrap(), "shot_3x2.png");
         let written = std::fs::read(&outcome.path).expect("the saved file");
         assert_eq!(u64::try_from(written.len()).unwrap(), outcome.bytes);
-        assert_eq!(&written[1..4], b"PNG", "the file is a PNG, not a renamed body");
+        assert_eq!(
+            &written[1..4],
+            b"PNG",
+            "the file is a PNG, not a renamed body"
+        );
         // The IHDR payload starts at byte 16: width, then height, both big endian.
         let png_width = u32::from_be_bytes([written[16], written[17], written[18], written[19]]);
         let png_height = u32::from_be_bytes([written[20], written[21], written[22], written[23]]);
@@ -525,7 +538,11 @@ mod tests {
         assert_eq!(outcome.format, SaveFormat::Jpeg);
         assert_eq!(outcome.path.file_name().unwrap(), "SnapClip_2026-10-23.jpg");
         let written = std::fs::read(&outcome.path).expect("the saved file");
-        assert_eq!(&written[..2], &[0xFF, 0xD8], "the body is a JPEG, not a renamed PNG");
+        assert_eq!(
+            &written[..2],
+            &[0xFF, 0xD8],
+            "the body is a JPEG, not a renamed PNG"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -566,7 +583,10 @@ mod tests {
             let on_disk = std::fs::metadata(&outcome.path)
                 .expect("the saved file")
                 .len();
-            assert_eq!(on_disk, weighed, "{format:?}: and the file is that many bytes");
+            assert_eq!(
+                on_disk, weighed,
+                "{format:?}: and the file is that many bytes"
+            );
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
@@ -577,7 +597,11 @@ mod tests {
         assert_eq!(quality_of_tier(0), 92, "the project's measured default");
         assert_eq!(quality_of_tier(1), 75);
         assert_eq!(quality_of_tier(2), 50);
-        assert_eq!(quality_of_tier(9), 92, "an index outside the tiers is the first tier");
+        assert_eq!(
+            quality_of_tier(9),
+            92,
+            "an index outside the tiers is the first tier"
+        );
     }
 
     /// A band source that is asked for rows it does not have must refuse rather than hand back a
@@ -625,7 +649,10 @@ mod tests {
         let second = Sequence::FIRST.after(&Ok::<(), SaveError>(()), "SnapClip_[序号]");
         assert_eq!(second.next(), 2);
 
-        let cancelled = second.after(&Err::<(), SaveError>(SaveError::Cancelled), "SnapClip_[序号]");
+        let cancelled = second.after(
+            &Err::<(), SaveError>(SaveError::Cancelled),
+            "SnapClip_[序号]",
+        );
         assert_eq!(cancelled.next(), 2, "a cancelled save wrote no file");
 
         let failed: Result<(), SaveError> = Err(SaveError::Validation {
@@ -633,14 +660,21 @@ mod tests {
             detail: None,
         });
         let after_failure = second.after(&failed, "SnapClip_[序号]");
-        assert_eq!(after_failure.next(), 2, "a failed save wrote no file either");
+        assert_eq!(
+            after_failure.next(),
+            2,
+            "a failed save wrote no file either"
+        );
     }
 
     /// A first run opens with the spec's template, which is also the mockup's input value.
     #[test]
     fn a_first_run_starts_with_the_specs_template_and_the_specs_number() {
         let fresh = Remembered::default();
-        assert_eq!(fresh.template, "SnapClip_[日期]", "the spec's default (:68)");
+        assert_eq!(
+            fresh.template, "SnapClip_[日期]",
+            "the spec's default (:68)"
+        );
         assert_eq!(fresh.sequence.next(), 1, "the spec's next sequence is one");
     }
 
@@ -680,7 +714,9 @@ mod tests {
         let mut remembered = Remembered::default();
         remembered.remember_template("我的_[序号]");
 
-        let moved = remembered.sequence.after(&Ok::<(), SaveError>(()), "我的_[序号]");
+        let moved = remembered
+            .sequence
+            .after(&Ok::<(), SaveError>(()), "我的_[序号]");
         remembered.sequence = moved;
 
         assert_eq!(remembered.sequence.next(), 2, "the save consumed a number");
@@ -698,8 +734,7 @@ mod tests {
     fn the_after_save_switches_are_remembered_and_unchanged_ones_are_not() {
         let mut remembered = Remembered::default();
         assert_eq!(
-            remembered.after,
-            [false; 2],
+            remembered.after, [false; 2],
             "a first run does nothing after saving"
         );
 
@@ -743,7 +778,12 @@ mod tests {
         let mut bgra = Vec::new();
         for y in 0..source.height {
             for x in 0..source.width {
-                bgra.extend_from_slice(&[(x as u8).wrapping_mul(3), (y as u8).wrapping_mul(7), 90, 255]);
+                bgra.extend_from_slice(&[
+                    (x as u8).wrapping_mul(3),
+                    (y as u8).wrapping_mul(7),
+                    90,
+                    255,
+                ]);
             }
         }
         let output = output_size(SizeMode::Percent, "50", "25", source);

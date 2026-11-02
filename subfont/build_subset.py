@@ -44,8 +44,8 @@ SCAN_ROOT = ROOT / "crates" / "snapclip-capture" / "src"
 DRAWN = ROOT / "subfont" / "drawn-text.txt"
 SOURCE = ROOT / "refer" / "HarmonyOS_SansSC_Regular.ttf"
 BUILT = ROOT / "subfont" / "harmonyos-sans-sc-subset.ttf"
-# The exact path `crates/snapclip-capture/src/windows/win/d2d.rs` embeds with include_bytes!.
-INSTALLED = ROOT / "crates" / "snapclip-capture" / "assets" / "harmonyos-sans-sc-subset.ttf"
+# Shared by the capture overlay and independent pin host through snapclip-ui::font.
+INSTALLED = ROOT / "crates" / "snapclip-ui" / "assets" / "harmonyos-sans-sc-subset.ttf"
 
 # Tables the renderer never reads; dropping them keeps the blob small (see the original script).
 DROP_TABLES = (

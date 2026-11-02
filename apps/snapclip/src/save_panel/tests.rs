@@ -1,0 +1,754 @@
+use super::*;
+#[cfg(feature = "test-support")]
+use core::prelude::v1::test;
+
+#[::core::prelude::v1::test]
+fn preview_decodes_the_exact_bytes_written_by_each_encoder() {
+    let directory = std::env::temp_dir().join(format!(
+        "snapclip-yue-preview-roundtrip-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let picture = Arc::new(Picture::with_transparent_middle());
+    for format in [SaveFormat::Png, SaveFormat::Jpeg, SaveFormat::Webp] {
+        let export = Export {
+            picture: picture.clone(),
+            output: Size::new(96, 80),
+            directory: directory.to_string_lossy().into(),
+            name: format!("preview-{format:?}"),
+            format,
+            tier: 1,
+            fill: [17, 70, 180],
+            date: "2026-11-02".into(),
+            time: "1200".into(),
+            sequence: 1,
+            conflict: ConflictPolicy::Overwrite,
+            limit: None,
+        };
+        let preview = preview::encode(&export).unwrap();
+        let outcome = export.save().unwrap();
+        assert_eq!(
+            preview.bytes, outcome.bytes,
+            "preview measures the same bytes the file contains"
+        );
+        let bytes = std::fs::read(&outcome.path).unwrap();
+        assert_eq!(bytes.len() as u64, preview.bytes);
+        let decoded = image::load_from_memory(&bytes).unwrap().into_rgba8();
+        assert_eq!(decoded.dimensions(), (96, 80));
+        let center = decoded.get_pixel(48, 40).0;
+        if format == SaveFormat::Jpeg {
+            assert_eq!(center[3], 255);
+            assert!(
+                (i16::from(center[0]) - 180).abs() <= 4,
+                "the JPEG really applies the selected background"
+            );
+        } else {
+            assert_eq!(center[3], 0);
+        }
+    }
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[::core::prelude::v1::test]
+fn raw_preview_preserves_bgra_alpha_and_bounds_its_texture() {
+    let pixels = vec![17, 70, 180, 0, 93, 21, 45, 255];
+    let picture = Picture::from_selection(pixels.clone(), Size::new(2, 1));
+    let original = preview::original(&picture).unwrap();
+    assert_eq!(original.as_bytes(0).unwrap(), pixels);
+    assert_eq!(original.size(0), size(DevicePixels(2), DevicePixels(1)));
+
+    let picture = Picture::from_selection([17, 70, 180, 128].repeat(8192 * 2), Size::new(8192, 2));
+    let original = preview::original(&picture).unwrap();
+    assert_eq!(original.size(0), size(DevicePixels(2048), DevicePixels(1)));
+    assert!(
+        original
+            .as_bytes(0)
+            .unwrap()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|pixel| *pixel == [17, 70, 180, 128])
+    );
+}
+
+#[::core::prelude::v1::test]
+fn raw_preview_keeps_4k_pixels_without_cpu_resampling() {
+    let mut pixels = [17, 70, 180, 128].repeat(3840 * 2160);
+    pixels[..4].copy_from_slice(&[1, 2, 3, 0]);
+    let last = pixels.len() - 4;
+    pixels[last..].copy_from_slice(&[4, 5, 6, 255]);
+    let picture = Picture::from_selection(pixels, Size::new(3840, 2160));
+    let original = preview::original(&picture).unwrap();
+    assert_eq!(
+        original.size(0),
+        size(DevicePixels(3840), DevicePixels(2160))
+    );
+    assert_eq!(original.as_bytes(0).unwrap(), picture.pixels().0);
+}
+
+#[::core::prelude::v1::test]
+fn raw_preview_rejects_inconsistent_capture_buffers() {
+    for (source, pixels) in [
+        (Size::new(0, 1), vec![]),
+        (Size::new(1, 1), vec![0; 3]),
+        (Size::new(1, 1), vec![0; 8]),
+    ] {
+        assert!(preview::original(&Picture::from_selection(pixels, source)).is_err());
+    }
+}
+
+#[::core::prelude::v1::test]
+fn viewport_fit_and_zoom_remain_centered_for_a_non_demo_capture() {
+    let viewport = Bounds::new(point(px(20.), px(40.)), size(px(600.), px(400.)));
+    let source = Size::new(1600, 900);
+    let fit = preview::fitted_zoom(source, viewport);
+    let bounds = preview::image_bounds(source, viewport, fit, Point::default());
+    assert!(bounds.size.width <= viewport.size.width);
+    assert!(bounds.size.height <= viewport.size.height);
+    assert_eq!(bounds.center(), viewport.center());
+    let enlarged = preview::image_bounds(source, viewport, fit * 2., point(px(10.), px(-20.)));
+    assert_eq!(
+        enlarged.center(),
+        viewport.center() + point(px(10.), px(-20.))
+    );
+}
+
+#[cfg(feature = "test-support")]
+mod ui {
+    use super::*;
+    use gpui_kit::{component::Root, test::TestWindowExt};
+
+    fn setup(
+        cx: &mut TestAppContext,
+        width: f32,
+        height: f32,
+    ) -> (WindowHandle<Root>, Entity<SavePanel>) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_global(DirectoryPresets::default());
+            init(cx, true);
+        });
+        let mut view = None;
+        let handle = cx.open_window(size(px(width), px(height)), |window, cx| {
+            let picture = Picture::from_selection(vec![255; 800 * 600 * 4], Size::new(800, 600));
+            let panel = cx.new(|cx| SavePanel::new(picture, window, cx));
+            view = Some(panel.clone());
+            Root::new(panel, window, cx)
+        });
+        (handle, view.unwrap())
+    }
+
+    fn settle_preview(cx: &mut TestAppContext) {
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(250));
+        cx.run_until_parked();
+    }
+
+    #[gpui_kit::test]
+    fn the_format_focus_ring_fits_inside_the_form_scroll_clip(cx: &mut TestAppContext) {
+        let (handle, _) = setup(cx, 1000., 720.);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("save-format", cx);
+            window.press("escape", cx);
+            window.render_frame(cx);
+            let frame = window
+                .find("save-format")
+                .bounds()
+                .scale(window.scale_factor());
+            let ring_color: Hsla = yue_component::current_theme(cx)
+                .token("--input-focus-ring-color")
+                .unwrap()
+                .rgba()
+                .unwrap()
+                .into();
+            let rings = window
+                .painted_quads()
+                .into_iter()
+                .filter(|q| {
+                    q.border_color == ring_color
+                        && q.bounds.left() < frame.left()
+                        && q.bounds.right() > frame.right()
+                        && q.bounds.top() < frame.top()
+                        && q.bounds.bottom() > frame.bottom()
+                })
+                .collect::<Vec<_>>();
+            assert!(!rings.is_empty(), "the complete focus ring must be painted");
+            // GPUI splits a rounded border into multiple clipped paint quads.
+            let border = rings[0].bounds;
+            let half_width = rings[0].border_widths.top / 2.;
+            for point in [
+                point(border.left() + half_width, border.center().y),
+                point(border.right() - half_width, border.center().y),
+                point(border.center().x, border.top() + half_width),
+                point(border.center().x, border.bottom() - half_width),
+            ] {
+                assert!(
+                    rings
+                        .iter()
+                        .any(|quad| quad.content_mask.bounds.contains(&point)),
+                    "focus border at {point:?} must survive clipping: {rings:?}"
+                );
+            }
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn tags_and_the_after_save_caption_share_a_vertical_center(cx: &mut TestAppContext) {
+        let (handle, panel) = setup(cx, 1000., 720.);
+        for checked in [false, true] {
+            panel.update(cx, |panel, cx| {
+                panel.after = [checked; 2];
+                cx.notify();
+            });
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                let caption = window.find("after-save-label").bounds();
+                for id in ["after-copy-path", "after-open-folder"] {
+                    let tag = window.find(id).bounds();
+                    // GPUI rounds fractional line boxes to device-pixel positions.
+                    assert!(
+                        (tag.center().y - caption.center().y).abs() <= px(0.5),
+                        "{tag:?} vs {caption:?}"
+                    );
+                }
+            })
+            .unwrap();
+        }
+    }
+
+    #[gpui_kit::test]
+    fn save_panel_tags_have_pill_corners(cx: &mut TestAppContext) {
+        let (handle, _) = setup(cx, 1000., 720.);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            for id in [
+                "directory-desktop",
+                "directory-pictures",
+                "directory-downloads",
+                "overwrite-existing",
+                "after-copy-path",
+                "after-open-folder",
+                "preset-100",
+            ] {
+                let bounds = window.find(id).bounds().scale(window.scale_factor());
+                assert!(
+                    window.painted_quads().iter().any(|quad| {
+                        quad.bounds == bounds
+                            && quad.background.as_solid().is_some_and(|color| color.a > 0.)
+                            && quad.corner_radii.top_left >= bounds.size.height / 2.
+                            && quad.corner_radii.top_right >= bounds.size.height / 2.
+                    }),
+                    "{id} must use pill corners"
+                );
+            }
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn the_add_path_button_adds_a_working_shortcut_and_rejects_invalid_drafts(
+        cx: &mut TestAppContext,
+    ) {
+        let directory =
+            std::env::temp_dir().join(format!("snapclip-path-ui-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let (handle, panel) = setup(cx, 1000., 720.);
+        let path = directory.to_string_lossy().into_owned();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("save-directory", cx);
+            window.press("ctrl-a", cx);
+            window.input(&path, cx);
+            window.click("add-directory-preset", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(cx.global::<DirectoryPresets>().paths, [directory.clone()]);
+            assert!(!panel.read(cx).adding_directory);
+            assert!(!panel.read(cx).status_error);
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("directory-pictures", cx);
+            window.render_frame(cx);
+            let id: ElementId = (ElementId::from("directory-preset"), path.clone()).into();
+            window.click(id, cx);
+            assert_eq!(panel.read(cx).directory.read(cx).value().as_ref(), path);
+            window.click("add-directory-preset", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| assert_eq!(cx.global::<DirectoryPresets>().paths.len(), 1));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("save-directory", cx);
+            window.press("ctrl-a", cx);
+            window.input("not-an-absolute-directory", cx);
+            window.click("add-directory-preset", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(cx.global::<DirectoryPresets>().paths.len(), 1);
+            assert!(panel.read(cx).status_error);
+        });
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn closing_the_panel_does_not_cancel_a_requested_path_preset(cx: &mut TestAppContext) {
+        let directory =
+            std::env::temp_dir().join(format!("snapclip-path-close-ui-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let (handle, panel) = setup(cx, 1000., 720.);
+        cx.update_window(handle.into(), |_, window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.set_directory(directory.to_string_lossy().into_owned(), window, cx);
+                panel.add_directory_preset(cx);
+            });
+            window.remove_window();
+        })
+        .unwrap();
+        drop(panel);
+        cx.run_until_parked();
+        cx.update(|cx| assert_eq!(cx.global::<DirectoryPresets>().paths, [directory.clone()]));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn original_is_ready_before_the_export_debounce_and_survives_invalid_edits(
+        cx: &mut TestAppContext,
+    ) {
+        let (handle, panel) = setup(cx, 1000., 720.);
+        // Drain immediate work without advancing the 180ms export timer.
+        cx.run_until_parked();
+        let original = cx.update(|cx| {
+            let panel = panel.read(cx);
+            assert!(panel.measuring);
+            assert!(panel.bytes.is_none());
+            assert!(panel.preview.encoded.is_none());
+            panel
+                .preview
+                .original
+                .clone()
+                .expect("raw capture must not wait for encoding")
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("save-width", cx);
+            window.press("ctrl-a", cx);
+            window.input("0", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let panel = panel.read(cx);
+            assert!(panel.dimension_errors[0].is_some());
+            assert!(!panel.measuring);
+            assert!(Arc::ptr_eq(
+                panel.preview.original.as_ref().unwrap(),
+                &original
+            ));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn cancelling_export_before_it_starts_does_not_cancel_the_original_capture(
+        cx: &mut TestAppContext,
+    ) {
+        let (handle, panel) = setup(cx, 1000., 720.);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("save-width", cx);
+            window.press("ctrl-a", cx);
+            window.input("0", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let panel = panel.read(cx);
+            assert!(panel.preview.original.is_some());
+            assert!(panel.preview.encoded.is_none());
+            assert!(panel.bytes.is_none());
+            assert!(panel.dimension_errors[0].is_some());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn theme_colors_reach_the_painted_panel_and_preview_without_channel_shifts(
+        cx: &mut TestAppContext,
+    ) {
+        let (handle, _) = setup(cx, 1000., 720.);
+        for mode in [
+            yue_component::ThemeMode::Light,
+            yue_component::ThemeMode::Dark,
+        ] {
+            let theme = yue_component::YueTheme::new(mode, yue_component::Accent::Azure);
+            cx.update(|cx| yue_component::set_theme(cx, theme));
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                let scale = window.scale_factor();
+                let panel = window.find("yue-save-panel").bounds().scale(scale);
+                let preview = window.find("save-preview").bounds().scale(scale);
+                let quads = window.painted_quads();
+                let panel_fill = quads
+                    .iter()
+                    .rev()
+                    .find(|quad| quad.bounds == panel)
+                    .expect("panel background is painted")
+                    .background
+                    .as_solid();
+                assert_eq!(panel_fill, Some(rgb(theme.page()).into()), "{mode:?}");
+                assert!(
+                    quads.iter().any(|quad| {
+                        quad.bounds == preview
+                            && quad.background.as_solid()
+                                == Some(rgb(theme.surface_component()).into())
+                    }),
+                    "preview surface must preserve the theme's RGB channels: {mode:?}"
+                );
+                // GPUI submits the background and border as separate quads.
+                assert!(
+                    quads.iter().any(|quad| {
+                        quad.bounds == preview
+                            && quad.border_color == Hsla::from(rgb(theme.border_default()))
+                            && quad.border_widths.top > ScaledPixels(0.)
+                    }),
+                    "preview border must preserve the theme's RGB channels: {mode:?}"
+                );
+
+                // The headless text system does not rasterize ordinary glyphs.
+                // Assert real surface paint, including the existing YueInput,
+                // rather than claiming these quads prove text-pixel contrast.
+                let input = window.find("save-name").bounds().scale(scale);
+                let input_fill: Hsla = theme
+                    .token("--input-background")
+                    .unwrap()
+                    .rgba()
+                    .unwrap()
+                    .into();
+                assert!(
+                    quads.iter().any(|quad| quad.bounds == input
+                        && quad.background.as_solid() == Some(input_fill)),
+                    "the input surface must follow the same theme as the panel: {mode:?}",
+                );
+            })
+            .unwrap();
+        }
+    }
+
+    #[gpui_kit::test]
+    fn file_format_options_start_at_the_left_padding_and_remain_selectable(
+        cx: &mut TestAppContext,
+    ) {
+        let (handle, panel) = setup(cx, 1000., 720.);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("save-format", cx);
+            window.render_frame(cx);
+            let nodes = gpui_kit::base::test_support::snapshots(window);
+            let theme = yue_component::current_theme(cx);
+            let padding = px(theme
+                .token("--input-padding-inline-sm")
+                .unwrap()
+                .pixels()
+                .unwrap()
+                * f32::from(window.rem_size())
+                / 16.);
+            for key in ["png", "jpeg", "webp"] {
+                let id: ElementId =
+                    (ElementId::from("save-format"), format!("option:{key}")).into();
+                let text_id: ElementId = (id.clone(), "text").into();
+                let row = nodes
+                    .iter()
+                    .find(|n| n.path().last() == Some(&id))
+                    .unwrap()
+                    .bounds();
+                let text = nodes
+                    .iter()
+                    .find(|n| n.path().last() == Some(&text_id))
+                    .unwrap()
+                    .bounds();
+                assert!(
+                    (text.left() - row.left() - padding).abs() < px(0.01),
+                    "{key}: text starts at the normal left inset"
+                );
+            }
+            window.press("down", cx);
+            window.press("enter", cx);
+            assert!(!panel.read(cx).format_select.read(cx).is_open());
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| assert_eq!(panel.read(cx).format, SaveFormat::Jpeg));
+    }
+
+    #[gpui_kit::test]
+    fn opening_a_new_capture_closes_the_previous_idle_panel(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            init(cx, true);
+        });
+        let mut panels = PanelWindows::default();
+        let previous = cx.update(|cx| {
+            panels.open(Picture::synthetic(), cx).unwrap();
+            panels.current.as_ref().unwrap().0
+        });
+        cx.update(|cx| panels.open(Picture::synthetic(), cx).unwrap());
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(previous.update(cx, |_, _, _| ()).is_err());
+            assert_eq!(cx.windows().len(), 1);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn composition_enter_does_not_export_an_uncommitted_filename(cx: &mut TestAppContext) {
+        let directory =
+            std::env::temp_dir().join(format!("snapclip-yue-ime-ui-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let (handle, panel) = setup(cx, 1000., 720.);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("save-directory", cx);
+            window.press("ctrl-a", cx);
+            window.input(&directory.to_string_lossy(), cx);
+        })
+        .unwrap();
+        settle_preview(cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("save-name", cx);
+            let name = panel.read(cx).name.clone();
+            name.update(cx, |input, cx| {
+                let len = input.value().encode_utf16().count();
+                input.replace_and_mark_text_in_range(Some(0..len), "候选", Some(2..2), window, cx);
+            });
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(!panel.read(cx).busy);
+            assert!(panel.read(cx).saved_path.is_none());
+            assert_eq!(panel.read(cx).name.read(cx).value().as_ref(), "候选");
+        });
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn rapid_edits_publish_only_the_latest_output_preview(cx: &mut TestAppContext) {
+        let (handle, panel) = setup(cx, 1000., 720.);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("preset-25", cx);
+            window.click("preset-75", cx);
+            window.click("preset-50", cx);
+        })
+        .unwrap();
+        settle_preview(cx);
+        cx.update(|cx| {
+            let panel = panel.read(cx);
+            assert_eq!(panel.dimensions.output, Size::new(400, 300));
+            assert!(!panel.measuring);
+            let export = panel.export(cx);
+            let expected =
+                assemble::weigh(&export.values(), &export.picture.frame(export.output)).unwrap();
+            assert_eq!(panel.bytes, Some(expected));
+            assert!(panel.preview.encoded.is_some());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn save_writes_the_ui_size_once_and_reports_io_failure_without_losing_edits(
+        cx: &mut TestAppContext,
+    ) {
+        let directory =
+            std::env::temp_dir().join(format!("snapclip-yue-save-ui-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let blocked = directory.join("not-a-directory");
+        std::fs::write(&blocked, b"unchanged").unwrap();
+        let (handle, panel) = setup(cx, 1000., 720.);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("preset-50", cx);
+            window.click("save-directory", cx);
+            window.press("ctrl-a", cx);
+            window.input(&blocked.to_string_lossy(), cx);
+            window.click("save-name", cx);
+            window.press("ctrl-a", cx);
+            window.input("Yue_保存测试", cx);
+        })
+        .unwrap();
+        settle_preview(cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(!panel.read(cx).measuring);
+            assert!(panel.read(cx).bytes.is_some());
+            window.click("commit-save", cx);
+            assert!(panel.read(cx).busy);
+            assert!(panel.read(cx).format_select.read(cx).is_disabled());
+            window.click("commit-save", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(!panel.read(cx).busy);
+            assert!(panel.read(cx).saved_path.is_none());
+            assert!(panel.read(cx).status.is_some());
+            assert_eq!(window.find("save-name").value(), Some("Yue_保存测试"));
+            assert_eq!(window.find("save-width").value(), Some("400"));
+            window.click("save-directory", cx);
+            window.press("ctrl-a", cx);
+            window.input(&directory.to_string_lossy(), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("commit-save", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let path = cx.update(|cx| panel.read(cx).saved_path.clone().expect("recovered save"));
+        let image = image::open(path).unwrap();
+        assert_eq!((image.width(), image.height()), (400, 300));
+        assert_eq!(std::fs::read(&blocked).unwrap(), b"unchanged");
+        assert_eq!(
+            std::fs::read_dir(&directory).unwrap().count(),
+            2,
+            "double activation writes one file"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn presets_units_and_ratio_are_driven_through_yue_controls(cx: &mut TestAppContext) {
+        let (handle, panel) = setup(cx, 1000., 720.);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("save-width").value(), Some("800"));
+            window.click("preset-50", cx);
+            assert_eq!(panel.read(cx).dimensions.output, Size::new(400, 300));
+            assert_eq!(window.find("save-height").value(), Some("300"));
+            // Segmented option IDs are derived from the stable value.
+            window.click((ElementId::from("size-unit"), "percent"), cx);
+            assert_eq!(window.find("save-width").value(), Some("50"));
+            assert_eq!(panel.read(cx).dimensions.output, Size::new(400, 300));
+            window.click("reset-size", cx);
+            assert_eq!(panel.read(cx).dimensions.output, Size::new(800, 600));
+            assert_eq!(window.find("save-width").value(), Some("100"));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn tab_in_this_form_moves_focus_without_indenting_the_number(cx: &mut TestAppContext) {
+        let (handle, _) = setup(cx, 1000., 720.);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("save-width", cx);
+            window.press("tab", cx);
+            assert_eq!(window.find("save-width").value(), Some("800"));
+            assert_eq!(window.find("lock-ratio").focused(), Some(true));
+            window.press("shift-tab", cx);
+            assert_eq!(window.find("save-width").focused(), Some(true));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn typing_dimensions_updates_output_and_invalid_drafts_cannot_save(cx: &mut TestAppContext) {
+        let (handle, panel) = setup(cx, 1000., 720.);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("save-width", cx);
+            window.press("ctrl-a", cx);
+            window.input("400", cx);
+            assert_eq!(window.find("save-width").value(), Some("400"));
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(panel.read(cx).dimensions.output, Size::new(400, 300));
+            assert_eq!(window.find("save-height").value(), Some("300"));
+            window.press("ctrl-a", cx);
+            window.input("0", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(panel.read(cx).dimensions.output, Size::new(400, 300));
+            assert!(panel.read(cx).dimension_errors[0].is_some());
+            assert_eq!(window.find("commit-save").disabled(), Some(true));
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(!panel.read(cx).busy);
+            assert!(panel.read(cx).saved_path.is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn responsive_layout_keeps_footer_outside_the_scrolling_form(cx: &mut TestAppContext) {
+        for (width, height) in [(1000., 720.), (800., 520.), (1280., 900.)] {
+            let (handle, _) = setup(cx, width, height);
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                let form = window.find("save-form").bounds();
+                let preview = window.find("save-preview").bounds();
+                let save = window.find("commit-save").bounds();
+                assert!(preview.right() <= form.left(), "columns must never overlap");
+                assert!(
+                    form.bottom() <= save.top(),
+                    "footer must remain below form viewport"
+                );
+                assert!(
+                    save.bottom() <= px(height),
+                    "save action stays inside the window"
+                );
+                assert!(preview.size.width >= px(220.));
+                assert!(form.size.width >= px(300.));
+            })
+            .unwrap();
+        }
+    }
+
+    #[gpui_kit::test]
+    fn format_selection_changes_quality_controls_and_escape_only_closes_the_popup(
+        cx: &mut TestAppContext,
+    ) {
+        let (handle, panel) = setup(cx, 1000., 720.);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("save-format", cx);
+            window.press("down", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(panel.read(cx).format, SaveFormat::Jpeg);
+            assert!(window.find("jpeg-quality").visible());
+            assert!(
+                !panel.read(cx).busy,
+                "choosing a format must not submit the parent panel"
+            );
+            window.click("save-format", cx);
+            window.press("escape", cx);
+            assert!(!panel.read(cx).format_select.read(cx).is_open());
+            assert!(window.find("yue-save-panel").visible());
+        })
+        .unwrap();
+    }
+}

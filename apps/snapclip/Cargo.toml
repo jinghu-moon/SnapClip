@@ -11,15 +11,19 @@ publish = false
 # `snapclip` name.
 
 [dependencies]
-# One dependency for the UI, as the Coding Guides require: GPUI itself is
-# `use gpui_kit::*;`, and the layers are gpui_kit::{component, base, assets, platform}.
+# GPUI Kit supplies the shared runtime and the existing settings/history UI.
+# Yue supplies the save-panel controls; both resolve the same patched Base/GPUI.
 gpui-kit = "0.8"
+yue-component = { path = "../../../GPUI-Yue-Component/crates/yue-component", default-features = false }
+# Decode the actual encoded preview; the version is already used by GPUI.
+image = { version = "0.25", default-features = false, features = ["webp", "png", "jpeg"] }
 
 # Capability crates, not UI: the shell composes them and owns no feature logic of its own.
 snapclip-model = { path = "../../crates/snapclip-model" }
 snapclip-ui = { path = "../../crates/snapclip-ui" }
 snapclip-history = { path = "../../crates/snapclip-history" }
 snapclip-capture = { path = "../../crates/snapclip-capture" }
+snapclip-pin = { path = "../../crates/snapclip-pin" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
@@ -69,19 +73,13 @@ windows-sys = { version = "0.59", features = [
   "Win32_System_LibraryLoader",
   "Win32_System_Memory",
   "Win32_System_Ole",
-  "Win32_System_Performance",
   # `GetLocalTime` — the naming template's `[日期]` and `[时间]` mean the day the file was written,
   # and it must be the user's local day rather than UTC. The bindings put it here, next to the other
   # system information calls.
   "Win32_System_SystemInformation",
   "Win32_System_Threading",
   "Win32_UI_Input_KeyboardAndMouse",
-  # `WM_MOUSELEAVE` — the notification that says the cursor left the pin, which is when the
-  # mouse capture taken for wheel routing has to be handed back. It is odd but checked: this
-  # one message constant lives under `UI::Controls` in the bindings, not under
-  # `UI::WindowsAndMessaging` with every other `WM_*`. That is where the platform declares it
-  # (with the rest of the *shell* messages, `WM_MOUSEHOVER`/`WMN_*`), so there is nowhere
-  # smaller to get it from.
+  # Native edit-control theming (`SetWindowTheme` / `GetWindowTheme`).
   "Win32_UI_Controls",
   # The fill row's custom swatch opens the system colour picker (`:660` is an `<input
   # type="color">`); `ChooseColorW` lives behind this feature.
@@ -97,17 +95,7 @@ windows-sys = { version = "0.59", features = [
 # Source-app icons for history rows: 32px renders crisply in a 16px row.
 win-icon-extractor = { version = "0.3", default-features = false, features = ["png", "cache"] }
 
-# The pin host thread hands its `JoinHandle` across threads so `Drop` can join it. 0.12 is
-# already in this graph (a `gpui` dependency), so this adds a direct edge, not a second copy.
-# Chosen over `std::sync::Mutex` because it has no poisoning: a panic on the pin thread must not
-# turn the next `Drop` into a second panic.
-parking_lot = "0.12"
-
-# The pin module (docs/34) reports failures that cross three layers — capture, the
-# command handler, the window host thread — and the interesting part of each is the
-# chain, not the leaf. `anyhow` is what the GPUI stack already links (gpui-base and
-# gpui-kit both depend on it), so this adds a direct edge, not a second copy. The
-# capability crates keep their own typed errors; this is the shell's boundary only.
+# Error chains at the application boundary.
 anyhow = "1"
 
 # Clipboard writes belong to the shell; `mark_clipboard_excluded` (below, through
@@ -147,6 +135,3 @@ test-support = ["gpui-kit/test-support"]
 blake3 = "1.5"
 # Same version and source as the normal dependency, with the helpers the guides require.
 gpui-kit = { version = "0.8", features = ["test-support"] }
-# Test-only cross-decoder for the lossless WebP round-trip: decoding with the same library that
-# encoded would let a shared bug cancel itself out (docs/34 §13).
-image = { version = "0.25", default-features = false, features = ["webp", "png", "jpeg"] }

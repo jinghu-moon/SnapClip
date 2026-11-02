@@ -1,5 +1,7 @@
 # 34 贴图窗口
 
+> 2026-11-02 更新：贴图已独立为 `snapclip-pin`。当前 crate 边界、公开 API 与本轮验收以 [51 · 贴图能力独立](51-pin-crate.md) 为准。本文保留早期方案与故障记录；后文 P1/P2 和桌面测试状态是当时的阶段记录。
+
 贴图（pin / 钉图）：把一张图贴到屏幕上，无边框、置顶、不抢焦点。
 
 本文只有三部分：**核心不变量**（§2）、**最小实现**（§3–§5）、**可验证的验收条件**（§6–§8）。§1 列出这些设计所依赖的、不可再还原的仓库事实。
@@ -29,7 +31,7 @@
 | F10 | 覆盖层的窗口类只注册了 `CS_HREDRAW \| CS_VREDRAW`，没有 `CS_DBLCLKS`；覆盖层特意**不**用 `WS_EX_NOACTIVATE`，理由是"否则永远收不到 `WM_KEYDOWN`，Esc / Enter 会变成死键" | 同文件 `:543-545`、`:565-567` |
 | F19 | **`WS_POPUP` 不含可见性**：`CreateWindowExW` 只给 `WS_POPUP` 建出来的窗口是存在的、能收鼠标消息的、但**从不显示**的。要它上屏必须再给一次可见性——创建时带上 `WS_VISIBLE`，或用 `SetWindowPos(…, SWP_SHOWWINDOW)`。捕获侧走的是后者 | 覆盖层创建只给 `WS_POPUP`：`crates/snapclip-capture/src/windows/overlay/window_host.rs:563-581`，使它上屏的是 `crates/snapclip-capture/src/windows/overlay/window_restore.rs:65-76` 的 `SetWindowPos(…, SWP_SHOWWINDOW)` |
 | F18 | **用 `RegisterHotKey(null, …)` 注册的热键，`WM_HOTKEY` 是一条线程消息**（`MSG.hwnd` 为 null）。`DispatchMessageW` 对没有窗口的消息**静默丢弃**——它不会派发到任何窗口过程。覆盖层的消息泵为此显式判空并把线程消息自己交给控制器 | `crates/snapclip-capture/src/windows/overlay/window_host.rs:650-660`（注释原文 "carry no window handle, so `DispatchMessageW` would silently drop them"）；注册处 `crates/snapclip-capture/src/windows/hotkey.rs:351` |
-| F20 | **`WM_MOUSEWHEEL` 送到有焦点的窗口**（MSDN 原文 "sent to the window that has the focus"）。贴图窗口是 `WS_EX_NOACTIVATE`，永远没有焦点，所以它**收不到**滚轮消息——窗口过程里有那条分支也没用。要收必须先用 `SetCapture` 把鼠标消息接过来 | MSDN `WM_MOUSEWHEEL` 的 Remarks；贴图侧的做法见 §4.2.1（`apps/snapclip/src/pin/host.rs`）。仓里此前没有任何一处处理滚轮消息 |
+| F20 | **`WM_MOUSEWHEEL` 送到有焦点的窗口**（MSDN 原文 "sent to the window that has the focus"）。贴图窗口是 `WS_EX_NOACTIVATE`，永远没有焦点，所以它**收不到**滚轮消息——窗口过程里有那条分支也没用。要收必须先用 `SetCapture` 把鼠标消息接过来 | MSDN `WM_MOUSEWHEEL` 的 Remarks；贴图侧的做法见 §4.2.1（`crates/snapclip-pin/src/host.rs`）。仓里此前没有任何一处处理滚轮消息 |
 
 ### 1.3 数据模型
 
@@ -65,71 +67,40 @@
 
 ## 3. 最小实现
 
-### 3.1 结构：六个名字，一个线程
+### 3.1 当前结构：独立能力，一个宿主线程
 
 ```text
-apps/snapclip/src/pin/
-  mod.rs    PinManager   —— 窗口清单、编号、事件回收（**不在** UI 线程上跑宿主循环）
-            PinEvent     —— 宿主线程 → 外壳（窗口创建失败；正常关闭宿主自己知道）
-            PinHome      —— 「谁能交出刚截的那张图」，由外壳实现（§3.4）
-  source.rs ImageSource  —— 解码后的 BGRA 像素 + 尺寸（Arc 共享）
-  host.rs   PinWindowHost / HostState —— 宿主线程、消息泵、分层窗口
+crates/snapclip-pin/
+  src/lib.rs       公开边界、PinHome、PinSelection
+  src/source.rs    ImageSource：已解码像素与尺寸
+  src/host.rs      PinManager、宿主线程、消息泵、分层窗口和内部窗口状态
+  tests/windows_host.rs  显式运行的真实 Windows 生命周期测试
+
+apps/snapclip/src/capture/pin_source.rs
+  PinSource / TakeSelection：应用对截图选区的接线
+
+crates/snapclip-ui/src/font.rs
+  共享字体子集、族序、进程内注册与倍数徽标字体度量
 ```
 
-（`TakeSelection` / `PinSource` 在 `apps/snapclip/src/capture/pin_source.rs`，见 §3.4。）
-                        的 OverlayShared::selection 才是像素真正待的地方
-```
+- `PinManager` 直接持有宿主，不再叠一层 `PinWindowHost` 包装。克隆共享同一线程，最后一个管理器释放时关闭所有贴图并 join。
+- `PinHome` 由应用实现，F6 在宿主线程消费最近截图；`PinSelection` 保留屏幕物理坐标与拍摄时的圆角。
+- `ImageSource` 接收已解码像素。`create_pin(PinRequest)` 提交调用方准备好的图，宿主不读取截图或剪贴板。
+- F6 与直接创建共用编号器；调用方不能自行指定 ID。`PinHandle::id()` 与事件的 `id` 对应。
+- `PinPoster` 是弱句柄，投递与 F6 走同一取图处理逻辑；不延长宿主生命周期，宿主释放后投递报错。
+- `Created`、`Failed`、`Closed` 分开上报。创建返回句柄只表示已投递，真正上屏结果通过事件确认；无图的 F6 不发号，非法选区报 `Failed`。
+- 应用定期调用 `try_recv_event()` 或 `drain_events()`；有界 64 条队列满时记日志，不阻塞窗口线程。
 
-每个类型的职责边界就是第 2 节的不变量：
-
-- **`PinHome`**：回答"F6 该贴哪张图"。它是贴图模块唯一的取图接口，方向是**外壳实现、宿主调用**——这样贴图模块不认识 `snapclip-capture`，也不知道图是从剪贴板还是从刚截的选区来的。
-- **`ImageSource`**：只持有解好的像素与尺寸。不做缩放、不认识窗口、没有生命周期。`Arc` 的引用计数就是生命周期。
-- **`PinWindowHost` / `PinWindowState`**：宿主线程与每个窗口的状态（HWND、位置、`scale`、`Arc<ImageSource>`、穿透开关）。窗口过程、消息泵、DIB、提交都在这里；退出时一次性销毁全部 HWND 与 DIB。
-
-**线程模型**（一条命令通道，两个方向）：
+### 3.2 归属与依赖
 
 ```text
-UI 线程：PinManager                        宿主线程：PinWindowHost
-  ├─ PinCommand::{Create, Move, Destroy, ──────► GetMessageW 消息泵
-  │               SetClickThrough, …}            每个 HWND 一个 WndProc
-  │                                              DIB 合成 + UpdateLayeredWindow
-  └─ PinEvent::Closed(id)  ◄──────────────────── WM_NCDESTROY / 用户双击
-     （只删记录，不碰 HWND）
+snapclip-app ──→ snapclip-pin ──→ snapclip-model
+                         └───→ snapclip-ui
 ```
 
-- **`Create` 同步返回 `Result`。** "一个宿主线程"这个形态反而让错误可见：以前"每窗口一线程"时，创建失败只发生在别人的线程上，UI 线程拿不到；现在 DIB 分配结果与窗口创建结果直接回到 `PinManager`。
-- **`PinManager` 不持有 HWND。** 它只记"哪个 id 存在、在什么位置、什么 `scale`"。任何窗口操作都是命令。
-- **销毁是幂等的**：`Destroy` 之后收回来的 `Closed` 是正常路径，不是错误。
-- **应用退出**：`shutdown()` 发出 `DestroyAll` 并 **join 宿主线程**；宿主线程在自己的消息泵退出前销毁全部 HWND 与 DIB。这条路径要有测试（§6.1），它是最容易泄漏的一处。
+`snapclip-pin` 使用既有 `windows-sys 0.59` 实现分层窗口，不依赖 capture、history、app、GPUI 或 Yue。共享字体只有一份，位于 `snapclip-ui/assets/`；截图覆盖层与贴图均通过 `snapclip_ui::font` 使用它。`PinSource` 仍由应用实现，因为连接截图与贴图是应用的职责。
 
-**为什么不是每窗口一线程**：`SetWindowPos` 与 `UpdateLayeredWindow` 本身并不要求调用方持有该窗口的创建线程；真正要求线程亲和的是**窗口过程**与资源生命周期。既然如此，N 个窗口需要的是"它们的消息泵在同一个线程上"，而不是"N 个线程"。单宿主线程直接消灭三样东西：每窗口的线程与退出同步、跨线程的 z 序/关闭竞态、退出时的 N 路 join。
-
-代价必须写清：宿主线程成为唯一的串行点，一次 4K 整窗提交会挡住同线程上其它窗口的**命令处理**（不挡它们的绘制——DWM 已持有各自的表面）。若 P2 量到这个阻塞可见，再按窗口分线程，届时依据是数字。
-
-**实际落地的名字比上表少一个。** `PinCommand` 没有出现：宿主线程收的是 [`PinRequest`]（`dispatch`）与 [`PinHandle`]（`close_pin`）两种值，不是一个命令枚举。多一层枚举只是把同一件事说两遍；等 P2 的移动/缩放/穿透真的需要"按窗口 id 下发动作"时再加，那时它才有内容。
-
-| 设计名 | 落地 | 位置 |
-|---|---|---|
-| `PinSource` | `PinSource` / `TakeSelection` | `apps/snapclip/src/capture/pin_source.rs:60`、`:33` |
-| `ImageSource` | `ImageSource` | `apps/snapclip/src/pin/source.rs:23` |
-| `PinManager` | `PinManager` | `apps/snapclip/src/pin/mod.rs:46` |
-| `PinWindowHost` | `PinWindowHost` | `apps/snapclip/src/pin/host.rs:150` |
-| `PinWindowState` | `PinWindowState` / `HostState` | `apps/snapclip/src/pin/host.rs:328`、`:288` |
-| `PinEvent` | `PinEvent` | `apps/snapclip/src/pin/host.rs:134` |
-| — | `PinRequest`、`PinHandle` | `apps/snapclip/src/pin/host.rs:104`、`:142` |
-| — | `PinHome`、`PinSelection` | `apps/snapclip/src/pin/mod.rs:71`、`:47` |
-
-`PinSource` 不是原计划那个 `enum { Artifact, Blob }`：它是「刚确认的那张图」这一个槽位的**转发句柄**——像素留在捕获侧的 `OverlayShared::selection`（§3.4），`PinSource` 只把它接成贴图线程能调用的 `PinHome`，自己不存第二份。它落在外壳的 `capture/` 下而不是 `pin/` 下，因为它属于「捕获欠贴图的那一个方法」而不是贴图本身。原计划的两条取字节路径没有实现，原因见 §3.4 与 §3.5。
-
-### 3.2 归属：`apps/snapclip`，用现成的 `windows-sys 0.59`
-
-宿主线程放在外层应用里，**不**放进 `snapclip-capture`。
-
-`apps/snapclip` 已经在用 `windows-sys 0.59`（F15），分层窗口需要的 API 全在这个绑定里（F6 已确认 `UPDATELAYEREDWINDOWINFO` 与两个函数都在），不需要 `windows 0.61`，也不会引入第二套绑定。实际补进 feature 列表的是**五个**（`apps/snapclip/Cargo.toml:56-77`）：`Win32_Graphics_Gdi`（DIB 段与它需要的 `GetDC`/`CreateCompatibleDC`/`CreateDIBSection`/`SelectObject`/`DeleteObject`）、`Win32_UI_Input_KeyboardAndMouse`（`VK_F6`——`RegisterHotKey` 需要它，而它原本不在列表里；后来滚轮缩放要的 `SetCapture`/`ReleaseCapture`/`TrackMouseEvent`/`TME_LEAVE` 也在这个模块）、`Win32_System_Performance`（拖动账本的 `QueryPerformanceCounter`/`QueryPerformanceFrequency`）、`Win32_UI_Controls`（`WM_MOUSELEAVE` 反常地住在那里，见 §4.2.1）与既有的 `Win32_Foundation`，不是一个新依赖。**屏幕回读路径（`BitBlt`）随 §3.4 那次改正一起删掉了**，所以 `GetWindowRect` 一类也不再被用到。
-
-`Win32_Foundation` 与 `Win32_Graphics_Gdi` 在本轮之前**已经**在列表里（托盘要用 GDI 画图标），所以实际新增的只有 `Win32_UI_Input_KeyboardAndMouse` 一项。
-
-反向的代价本来更大：放进 `snapclip-capture` 会让它导出一个与捕获毫无语义关系的贴图窗口句柄，只为借它的 D2D/D3D11 栈，而我们选的路径根本不用 D2D。
+详细接口、迁移前后行为与测试边界见 [51 · 贴图能力独立](51-pin-crate.md)。
 
 ### 3.3 呈现：分层窗口，整窗提交
 
@@ -231,7 +202,7 @@ F9（可选）→ confirm() 重新读一次（此时可能已带注解）
 
 **双键的分工仍然是穷尽的**：左键只有拖动与双击两件事，右键第一版不出菜单，滚轮只有缩放一件事。这条"没有第三种解析"就是全部交互规则。
 
-**拖动位置从锚点算，不做累加**。这是实测踩到的故障：第一版写的是 `窗口 = 窗口 + 光标增量`，而窗口位置在每条 `WM_MOUSEMOVE` 之后都被改写，于是**上一次的结果又当成了下一次的基准**，每一段位移被重复计入。表现是贴图越拖越跑偏、最后完全不跟鼠标。改成 `窗口 = 拖动开始时的位置 + (当前光标 − 按下时光标)` 之后，位置对同一组输入永远给出同一个答案：丢消息、消息被合并、光标被屏幕边缘夹住都不会留下累积误差，鼠标回到按下点窗口就精确回到原处。抽成纯函数 `drag_position(anchor, cursor_down, cursor_now)` 才测得动，回归测试 `dragging_keeps_the_window_under_the_cursor` 与 `a_cumulative_drag_would_lose_the_cursor`（`apps/snapclip/src/pin/host.rs`）分别盯着"公式对"和"为什么必须给公式一个锚点"。另外 `SetWindowPos` 的返回值要检查：只有窗口真的动了才更新记录的 `position`，否则程序里的位置会变成"它想去的地方"，下一个动作就建在一个假事实上。
+**拖动位置从锚点算，不做累加**。这是实测踩到的故障：第一版写的是 `窗口 = 窗口 + 光标增量`，而窗口位置在每条 `WM_MOUSEMOVE` 之后都被改写，于是**上一次的结果又当成了下一次的基准**，每一段位移被重复计入。表现是贴图越拖越跑偏、最后完全不跟鼠标。改成 `窗口 = 拖动开始时的位置 + (当前光标 − 按下时光标)` 之后，位置对同一组输入永远给出同一个答案：丢消息、消息被合并、光标被屏幕边缘夹住都不会留下累积误差，鼠标回到按下点窗口就精确回到原处。抽成纯函数 `drag_position(anchor, cursor_down, cursor_now)` 才测得动，回归测试 `dragging_keeps_the_window_under_the_cursor` 与 `a_cumulative_drag_would_lose_the_cursor`（`crates/snapclip-pin/src/host.rs`）分别盯着"公式对"和"为什么必须给公式一个锚点"。另外 `SetWindowPos` 的返回值要检查：只有窗口真的动了才更新记录的 `position`，否则程序里的位置会变成"它想去的地方"，下一个动作就建在一个假事实上。
 
 - 双击时限取 `GetDoubleClickTime()`，不写死。
 - 「首击不移动」是双击唯一需要的补偿规则。上一版还有"双击后 100 ms 内拒绝拖动"与"位移事件判定"，那是在给一个还没出现过的问题预先打补丁——去掉。
@@ -247,7 +218,7 @@ F9（可选）→ confirm() 重新读一次（此时可能已带注解）
 
 而 §4.1 已经写明贴图窗口带 `WS_EX_NOACTIVATE`，**永远不会有焦点**。也就是说：就算窗口过程里那条分支写对了，消息也永远不会被送到它面前——症状是"悬停在贴图上滚轮，一点反应都没有"，和没写这条分支完全一样。这不是 Cargo-cult 的顾虑，是这一版**必须**绕开的前置条件。
 
-所以窗口过程自己把滚轮接过来，三步（`apps/snapclip/src/pin/host.rs`）：
+所以窗口过程自己把滚轮接过来，三步（`crates/snapclip-pin/src/host.rs`）：
 
 1. `WM_MOUSEMOVE` 里 `SetCapture(hwnd)`：捕获之后，鼠标消息（含滚轮）一律先送到这个窗口，不要求焦点。
 2. 同一条分支里 `TrackMouseEvent(TME_LEAVE)`：**捕获必须能还回去**。没有它，用户的光标早就移到别处了，窗口还攥着全系统的鼠标消息——别的程序点不动、拖不动，是比"缩放不生效"严重得多的事故。
@@ -292,7 +263,7 @@ F9（可选）→ confirm() 重新读一次（此时可能已带注解）
 
 "粗体"是 700：`FW_BOLD` 配放大镜那颗的 `DWRITE_FONT_WEIGHT_BOLD`。这里一度写的是 `FW_SEMIBOLD`（600）——字号、内边距、圆角、文案全照搬了，唯独笔画细一档，两个控件摆在一起就不是同一个东西（用户 m07964）。同一段光栅化代码只改这一个数，144 DPI 下 `8×` 的墨迹总量从 29790 涨到 32144、墨迹面积从 168 涨到 180；96 DPI（14 像素）下反而略少（18478 → 13248，掩码窄 2 像素）——**代码里只差权重这一个数，所以大小字号上粗细不单调是字体的行为**，不是两条路。选 700 的理由是"和放大镜那颗对齐"，不是"更黑"。**权重只决定了一半**：同一族、同一字重下，光栅化的质量档（系统默认的 ClearType 还是灰度反锯齿）还会把笔画加粗或减细一圈，见 §4.2.3 后半段（用户 m08364）。
 
-字体族也对齐了：两颗控件都取 `overlay_font::FAMILY`（内嵌的 `HarmonyOS Sans SC` 子集改成从内存私有注册，`AddFontMemResourceEx`；"Segoe UI Variable Display"/"Segoe UI" 只是回退）。贴图这边请 GDI 要同一个族名，但 GDI **不会**因为族名不认识而失败——它会静默换一个（本机既不注册子集、又没有那几个界面族时，`"HarmonyOS Sans SC"` 会落到 MS Sans Serif）——所以 `CreateFontW` 之后要用 `GetTextFaceW` 把 DC 里**真正**选中的族名读回来核对（`select_badge_font`），对上了才认。最后一个族无条件接受：能走到那一步说明读回校验本身在这个环境里失灵（族名被本地化、或 API 被挂钩），此时画一个替身字体总比整颗控件消失好。字面仍然不是同一张：GDI 与 DWrite 各自光栅化，族名一致也不会逐像素相同，但"族不同"是看得出来的那一种。
+字体族也对齐了：两颗控件都取 `snapclip_ui::font::FAMILY`（内嵌的 `HarmonyOS Sans SC` 子集改成从内存私有注册，`AddFontMemResourceEx`；"Segoe UI Variable Display"/"Segoe UI" 只是回退）。贴图这边请 GDI 要同一个族名，但 GDI **不会**因为族名不认识而失败——它会静默换一个（本机既不注册子集、又没有那几个界面族时，`"HarmonyOS Sans SC"` 会落到 MS Sans Serif）——所以 `CreateFontW` 之后要用 `GetTextFaceW` 把 DC 里**真正**选中的族名读回来核对（`select_badge_font`），对上了才认。最后一个族无条件接受：能走到那一步说明读回校验本身在这个环境里失灵（族名被本地化、或 API 被挂钩），此时画一个替身字体总比整颗控件消失好。字面仍然不是同一张：GDI 与 DWrite 各自光栅化，族名一致也不会逐像素相同，但"族不同"是看得出来的那一种。
 
 **实现完全不同**：放大镜在 D2D 上画，贴图只能往自己的 `u32` 缓冲里逐像素写，所以文字要自己光栅化——用 GDI 把字画进一张**白底黑字**的 DIB（黑有多少就是笔画覆盖率有多少），读三个通道的平均当覆盖率掩码，再按掩码把文字色混到缓冲上。
 
@@ -365,7 +336,7 @@ F9（可选）→ confirm() 重新读一次（此时可能已带注解）
 
 #### 更高阶的滤波器：对比过，**没换**
 
-"换成 Mitchell 或 Lanczos 会不会更清楚"不用猜：`filter_comparison_sheets` 出图，跑法 `cargo test --release -p snapclip-app --lib filter_comparison -- --ignored --nocapture`，落在 `target/filter-compare/`。同一张 96×56 的合成图案——**真实字形**（借控件那一套覆盖率掩码，所以图上文字的抗锯齿与控件上那颗字同源）、1 像素竖条纹、45° 斜线、圆轮廓、1 像素横线、渐变——用 nearest / triangle / Mitchell / Lanczos3 各放大一遍，四条带子叠成一张 PNG。
+"换成 Mitchell 或 Lanczos 会不会更清楚"不用猜：`filter_comparison_sheets` 出图，跑法 `cargo test --release -p snapclip-pin --lib filter_comparison -- --ignored --nocapture`，落在 `target/filter-compare/`。同一张 96×56 的合成图案——**真实字形**（借控件那一套覆盖率掩码，所以图上文字的抗锯齿与控件上那颗字同源）、1 像素竖条纹、45° 斜线、圆轮廓、1 像素横线、渐变——用 nearest / triangle / Mitchell / Lanczos3 各放大一遍，四条带子叠成一张 PNG。
 
 这张图**钉在生产实现上**：`the_reference_resampler_agrees_with_production` 要求参考实现（f64 权重，抽头几何逐条对齐 `plan_axis`）与 `paint_pin` 的输出**逐像素差不超过 1**。所以图里 `triangle` 那一带就是贴图现在画出来的东西，不是另一个实现。
 
@@ -422,7 +393,7 @@ F9（可选）→ confirm() 重新读一次（此时可能已带注解）
 
 ### 4.3 穿透：`HTTRANSPARENT`，**第一版不做**
 
-第一版 `WM_NCHITTEST` **无条件**回答 `HTCLIENT`（`apps/snapclip/src/pin/host.rs:852`）。这是有意选择，理由写在代码注释里，摘要如下：
+第一版 `WM_NCHITTEST` **无条件**回答 `HTCLIENT`（`crates/snapclip-pin/src/host.rs`）。这是有意选择，理由写在代码注释里，摘要如下：
 
 贴图窗口参与命中测试，落在它上面的鼠标由它自己处理。**如果它一开始就返回 `HTTRANSPARENT`，它就再也收不到任何鼠标消息**——拖动和双击都是鼠标消息，会一起失效。而"双击取消"是贴图唯一的撤销动作，它必须手到擒来。所以第一版选择可交互，把"看的时候不挡操作"整件事推到后面。
 
@@ -470,7 +441,7 @@ F9（可选）→ confirm() 重新读一次（此时可能已带注解）
 
 按不变量编号，每条都要能说清"它在守哪条不变量"。
 
-**这一张表的验收状态必须诚实记录**：P1 交付时，T1–T4、T6–T9 **一条都还没有**。已通过的是 `ImageSource` 输入的字节/尺寸校验（`apps/snapclip/src/pin/source.rs` 的 `rejects_*`/`accepts_matching_length` 一组）、钉住合成这块位图的纯函数测试（`apps/snapclip/src/pin/host.rs` 的 `pin::host::tests`：边框四边、图像行不串味、图比窗口大时夹取、窗口小到只剩边框，以及 T10 那条"回到 `1×` 就逐像素等于原图"的往返）、两条消息泵分派测试（`apps/snapclip/src/pin/host.rs` 的 `a_null_window_message_is_handled_here_and_never_dispatched` / `a_window_message_is_dispatched_to_the_window`，钉住"`hwnd` 为空的线程消息不被 `DispatchMessageW` 悄悄丢掉"这个已经踩过的坑），以及槽位语义（`apps/snapclip/src/capture/pin_source.rs` 的 `pin_source::tests`：取走即清空、新的覆盖旧的、滚动长图不被记住、**主显示器原点 `(0, 0)` 仍然能贴**，最后这条是 §3.4 第三次改正的回归）。窗口生命周期类测试全部要真实桌面，它们在 CI 上跑不了，落在这里是**待办**，不是**已验**。
+**这一张表的验收状态必须诚实记录**：P1 交付时，T1–T4、T6–T9 **一条都还没有**。已通过的是 `ImageSource` 输入的字节/尺寸校验（`crates/snapclip-pin/src/source.rs` 的 `rejects_*`/`accepts_matching_length` 一组）、钉住合成这块位图的纯函数测试（`crates/snapclip-pin/src/host.rs` 的 `host::tests`：边框四边、图像行不串味、图比窗口大时夹取、窗口小到只剩边框，以及 T10 那条"回到 `1×` 就逐像素等于原图"的往返）、两条消息泵分派测试（`crates/snapclip-pin/src/host.rs` 的 `a_null_window_message_is_handled_here_and_never_dispatched` / `a_window_message_is_dispatched_to_the_window`，钉住"`hwnd` 为空的线程消息不被 `DispatchMessageW` 悄悄丢掉"这个已经踩过的坑），以及槽位语义（`apps/snapclip/src/capture/pin_source.rs` 的 `pin_source::tests`：取走即清空、新的覆盖旧的、滚动长图不被记住、**主显示器原点 `(0, 0)` 仍然能贴**，最后这条是 §3.4 第三次改正的回归）。窗口生命周期类测试全部要真实桌面，它们在 CI 上跑不了，落在这里是**待办**，不是**已验**。
 
 | # | 守的不变量 | 测试 | 断言 | 状态 |
 |---|---|---|---|---|
@@ -478,19 +449,19 @@ F9（可选）→ confirm() 重新读一次（此时可能已带注解）
 | T2 | 2 | 应用退出清理 | `DestroyAll` 之后宿主线程 **join 成功**；没有残留 HWND（`IsWindow` 为假）；没有泄漏的 DIB/DC | 未实现 |
 | T3 | 2 | 创建失败路径 | 注入一次 DIB 分配失败（或非法尺寸），`Create` 必须返回 `Err` 且**不留下**半个窗口；随后创建一个正常窗口仍成功 | 未实现 |
 | T4 | 2 | 幂等销毁 | 对同一 id 连发两次 `Destroy`，第二次不是错误，也不产生第二个 `Closed` | 未实现 |
-| T5 | 3 | 位图格式 | 给定 BGRA 输入，DIB 的 stride = 宽 × 4、行序与字节序正确；用 `GetDIBits` 读回与输入逐字节相同（这条同时验 alpha 真的被提交，而不只是"看起来对"） | 未实现（`ImageSource` 侧的字节序已有 `apps/snapclip/src/pin/source.rs:178-193` 两条覆盖，DIB 那一半没有） |
+| T5 | 3 | 位图格式 | 给定 BGRA 输入，DIB 的 stride = 宽 × 4、行序与字节序正确；用 `GetDIBits` 读回与输入逐字节相同（这条同时验 alpha 真的被提交，而不只是"看起来对"） | 未实现（`ImageSource` 侧的字节序已有 `crates/snapclip-pin/src/source.rs` 两条覆盖，DIB 那一半没有） |
 | T6 | 5 | 内容缓存 | 同一内容被两个窗口引用时只解码一次；`Artifact` 路径大小写不同视为同一内容；`Blob` 用 `content_hash` | **随 §3.4 一起推迟**（第一版没有内容共享） |
 | T7 | 5 | 准入 | `decoded_total` 与 `window_count` 在边界上：刚好达标可创建，再一张被拒绝，且拒绝是用户可见的 | **随 §3.5 一起推迟**（第一版不设限） |
 | T8 | 4 | 命中测试 | 给一组坐标问宿主线程"这个点会落到谁身上"：穿透关闭时是贴图自己，穿透开启时是 `HTTRANSPARENT`；**按住鼠标键时穿透被拒绝**（F5） | **随 §4.3 一起推迟** |
 | T9 | 1 | 事件不含像素 | 编译期即可保证（`AppEvent` 无字节字段，F13），保留一条断言防止有人加回来 | 未实现 |
-| T10 | 3 | 缩放与重采样 | 任何缩放序列回到 `1.0` 之后的位图与原图**逐像素相同**（`1×` 走整行复制的快路），且纯色图在**任何**缩放下逐像素不变 | **已实现**（`zooming_up_interpolates_and_one_to_one_is_pixel_exact`、`a_flat_colour_survives_every_zoom_exactly`，`apps/snapclip/src/pin/host.rs`；§4.2.3 重采样另有"每个目标像素的权重归一化且都落在源图内"、"缩小是把盖住的像素平均掉而不是丢掉"、"打包混合与通用循环逐像素对拍"、"分段并行与串行画出同一块缓冲"、"文字掩码存在中间覆盖率"、"参考重采样与生产实现逐像素差不超过 1"六条；§4.2.1/§4.2.2 另有"光标底下那个像素不动"、"一档就是 0.1"、"上一档再下一档回到逐位相同的值"、"一格滚轮只走一档"、"一条消息带三格走三档"、"滚不动了就停在 `[0.1, 10.0]`"、"滚轮坐标负数不出错"，以及控件八条：`×` 文案与整档/半档格式、控件落在图像区右上角且不碰边框、图像区太小就整个不画、**字形不被上下翻转**、**四角圆角按覆盖率羽化而不是二值开关**（`rounding_feathers_the_edge_instead_of_switching_it_on_and_off`、`the_badge_corner_is_feathered_against_the_image_it_covers`）、**字在两个方向上都居中且不贴边**（`the_badge_label_is_centred_in_its_button`，96/120/144/192 四个 DPI）、**字体族与放大镜那颗是同族**（`the_badge_is_drawn_in_the_overlay_typeface`，另配一条反例 `a_family_gdi_does_not_have_does_not_read_back` 证明"读回 DC 里选中的族名"这道校验不是恒真）、**白字压在深底上看起来的重量与参考值差不到 5%**（`the_badge_text_weighs_the_same_as_on_the_badge_background`，质量档退回灰度反锯齿就会掉到 0.91）。跨显示器换 DPI **单测造不出来**——`WM_DPICHANGED` 是对"窗口跨屏"的回应，只能靠 §6.3 人工核对 1 与 `DPI_TRACE` 日志） |
+| T10 | 3 | 缩放与重采样 | 任何缩放序列回到 `1.0` 之后的位图与原图**逐像素相同**（`1×` 走整行复制的快路），且纯色图在**任何**缩放下逐像素不变 | **已实现**（`zooming_up_interpolates_and_one_to_one_is_pixel_exact`、`a_flat_colour_survives_every_zoom_exactly`，`crates/snapclip-pin/src/host.rs`；§4.2.3 重采样另有"每个目标像素的权重归一化且都落在源图内"、"缩小是把盖住的像素平均掉而不是丢掉"、"打包混合与通用循环逐像素对拍"、"分段并行与串行画出同一块缓冲"、"文字掩码存在中间覆盖率"、"参考重采样与生产实现逐像素差不超过 1"六条；§4.2.1/§4.2.2 另有"光标底下那个像素不动"、"一档就是 0.1"、"上一档再下一档回到逐位相同的值"、"一格滚轮只走一档"、"一条消息带三格走三档"、"滚不动了就停在 `[0.1, 10.0]`"、"滚轮坐标负数不出错"，以及控件八条：`×` 文案与整档/半档格式、控件落在图像区右上角且不碰边框、图像区太小就整个不画、**字形不被上下翻转**、**四角圆角按覆盖率羽化而不是二值开关**（`rounding_feathers_the_edge_instead_of_switching_it_on_and_off`、`the_badge_corner_is_feathered_against_the_image_it_covers`）、**字在两个方向上都居中且不贴边**（`the_badge_label_is_centred_in_its_button`，96/120/144/192 四个 DPI）、**字体族与放大镜那颗是同族**（`the_badge_is_drawn_in_the_overlay_typeface`，另配一条反例 `a_family_gdi_does_not_have_does_not_read_back` 证明"读回 DC 里选中的族名"这道校验不是恒真）、**白字压在深底上看起来的重量与参考值差不到 5%**（`the_badge_text_weighs_the_same_as_on_the_badge_background`，质量档退回灰度反锯齿就会掉到 0.91）。跨显示器换 DPI **单测造不出来**——`WM_DPICHANGED` 是对"窗口跨屏"的回应，只能靠 §6.3 人工核对 1 与 `DPI_TRACE` 日志） |
 
 **相对上一版删掉的测试**：`脏区并集`（脏区不做了）、`脏区面积 < 30%` 与 `2 ms` 门槛（没有基准）、`双击穷尽性`的"要么移动要么销毁"（不是普适正确性断言，改用 §6.3 的人工核对）。
 
 **真正验过的是这四类**（写在这里，免得把上面的"未实现"读成"什么都没验"）：
 
-1. **输入边界的拒绝路径**：`ImageSource::from_bgra_bytes` 的字节数非 4 的倍数、尺寸为零、像素个数与尺寸不符（`apps/snapclip/src/pin/source.rs` 的 `rejects_*`）；空选区在进宿主线程之前就被挡下——`pin_home_selection` 的 `width == 0 || height == 0` 是最后一道（`apps/snapclip/src/pin/host.rs:693-695`），`apps/snapclip/src/pin/mod.rs` 的 `an_empty_region_is_never_a_selection` 从 `Rect::is_empty` 那一侧盯着同一件事。
-2. **合成这块位图的正确性**：边框四边都在、图像行之间不串味、图比窗口大时会夹取、窗口小到只剩边框时不越界（`apps/snapclip/src/pin/host.rs` 的 `pin::host::tests`），加上 §4.2.2 的混色两端（覆盖率为 0 时逐位不动、为 255 时完全取源色、中间值不越界、alpha 恒为 255）、以及 §4.2.3 的重采样：权重归一化且抽头都落在源图内、纯色在任何缩放下逐像素不变、缩小是平均值而不是抽样、打包混合与通用循环一致、分段并行与串行一致、文字掩码读到中间覆盖率、掩码裁到墨迹之后控件里的字在两个方向上都居中、控件里的字与放大镜那颗同族（读回 DC 里选中的族名，另有一条反例盯着这道校验）。
+1. **输入边界的拒绝路径**：`ImageSource::from_bgra_bytes` 的字节数非 4 的倍数、尺寸为零、像素个数与尺寸不符（`crates/snapclip-pin/src/source.rs` 的 `rejects_*`）；空选区在进宿主线程之前就被挡下——`pin_home_selection` 的 `width == 0 || height == 0` 是最后一道（`crates/snapclip-pin/src/host.rs`），`crates/snapclip-pin/src/lib.rs` 的 `an_empty_region_is_never_a_selection` 从 `Rect::is_empty` 那一侧盯着同一件事。
+2. **合成这块位图的正确性**：边框四边都在、图像行之间不串味、图比窗口大时会夹取、窗口小到只剩边框时不越界（`crates/snapclip-pin/src/host.rs` 的 `host::tests`），加上 §4.2.2 的混色两端（覆盖率为 0 时逐位不动、为 255 时完全取源色、中间值不越界、alpha 恒为 255）、以及 §4.2.3 的重采样：权重归一化且抽头都落在源图内、纯色在任何缩放下逐像素不变、缩小是平均值而不是抽样、打包混合与通用循环一致、分段并行与串行一致、文字掩码读到中间覆盖率、掩码裁到墨迹之后控件里的字在两个方向上都居中、控件里的字与放大镜那颗同族（读回 DC 里选中的族名，另有一条反例盯着这道校验）。
 3. **缩放算术**（T10，§4.2.1）：任何缩放序列回到 `1×` 后逐像素等于原图、光标底下那个像素在缩放前后是同一个、滚轮坐标负数不错位、`zDelta` 的符号扩展、一格只走一档而余数跨消息累积、一条消息带三格走三档、步长恒为 0.1、上一档再下一档回到逐位相同的值、滚到头就停在 `[0.1, 10.0]`、`scaled_dimension` 不回绕。**这些全部是纯函数**——"悬停在贴图上滚轮真的会缩放"这一条要真实桌面，属于 §6.3 的人工核对第 8 项。
 4. **槽位语义**：取走即清空（贴一张只用一次）、新的选区覆盖旧的、`origin == None` 的滚动长图不被记住、`origin == Some((0, 0))`（主显示器）**必须**能贴（`apps/snapclip/src/capture/pin_source.rs` 的 `pin_source::tests`）。
 
@@ -510,7 +481,7 @@ F9（可选）→ confirm() 重新读一次（此时可能已带注解）
 **已经量到的三项不是这四行里的任何一行。** F6 的像素从捕获侧交到窗口之前要过两次全图搬运（`PinSelection` 自己那份 `Arc<Vec<u8>>`、以及 `ImageSource` 的 `u32` 重解释），这两项有数：
 
 ```text
-cargo test --release -p snapclip-app --lib pin_bytes_to_u32_throughput -- --ignored --nocapture
+cargo test --release -p snapclip-pin --lib pin_bytes_to_u32_throughput -- --ignored --nocapture
 # 测量条件：本机 release、单次运行、每档取 20 轮平均；数字随机器变，只作量级判断
 
 1459×1180（6.6 MiB）  pin_selection_clone 1148 µs（5721 MiB/s）  from_bgra_bytes  676 µs（9715 MiB/s）
@@ -522,7 +493,7 @@ cargo test --release -p snapclip-app --lib pin_bytes_to_u32_throughput -- --igno
 第三项是**一次缩放的代价**，数字与结论在 §4.2.3 的表里（本机 release、源图 1405×1137、打包混合 + 分段并行）：`1×` 0.8 ms、`2×` 7.7 ms、`5.6×` 47.3 ms，同一份基准里保留的旧最近邻参考实现在这三档分别是 2.2 / 8.8 / 69.4 ms。它同样不是本节四行里的任何一行，但它量到了一个与本节第 1 行相关的事实：**在 5.6× 这个量级上，耗时的大头是把 200 MB 的缓冲分配并写满，而不是采样本身**。跑法：
 
 ```text
-cargo test --release -p snapclip-app --lib paint_pin_cost -- --ignored --nocapture
+cargo test --release -p snapclip-pin --lib paint_pin_cost -- --ignored --nocapture
 ```
 
 > **数字与代码绑定的教训。** 上一版这两行写的是 `take_selection 复制 … µs` 与 `字节→u32 … µs`，而它们引用的 `pin_bytes_to_u32_throughput` 当时**已经从 `source.rs` 里被删掉了**——`ImageSource` 改成只持 `Arc<Vec<u32>>` 时，那两个测量对象少了一半。数字因此不是"过期"，是在描述一个不再存在的实现，而且没有任何门禁会失败。现在基准与文档同桌：改实现时它就在旁边，删基准时这段文字也必须一起改。
@@ -538,7 +509,7 @@ cargo test --release -p snapclip-app --lib paint_pin_cost -- --ignored --nocaptu
 5. 贴图开着时按 `F5` 截图：贴图出现在像素里吗？吸附时会不会吸到自己人（F16）？
 6. 贴图开着时退出程序：所有贴图都没了吗？进程没有残留吗？
 7. 源文件被删掉之后再贴一次同一张：给出的是"文件不在了"的明确提示，而不是静默失败？
-8. **悬停在贴图上滚轮**：那个像素留在光标底下吗？**画面在滚的过程中闪不闪**（§4.2.2：位置、尺寸、画面必须来自同一次 `UpdateLayeredWindow`）？**放大之后还有没有方块状的锯齿，缩小之后有没有摩尔纹**（§4.2.3：半径要跟着比例走，权重要归一化）？右上角的倍数控件跟着变吗、写法是 `1×` / `0.5×` / `1.9×` / `10×` 这种吗、字是**正着**的吗、笔画的边缘是**平滑**的吗、**笔画是粗体**吗（§4.2.2：700，与放大镜那颗同档）、**底色与放大镜那颗一样**吗（§4.2.2：放大镜是 `RGB(60,60,60)` + 82% 不透明，贴图目前是不透明的 `RGB(82,82,82)`——这一处还没照搬）、**笔画比放大镜那颗细不细**（§4.2.3：质量档要留在 ClearType——退回灰度反锯齿笔画细 12%、混到深底上只有参考值的 0.91，`the_badge_text_weighs_the_same_as_on_the_badge_background` 把这条钉在 5% 以内）、**字的形状与放大镜那颗是同一张面孔**吗（§4.2.2：族名同为 `overlay_font::FAMILY`，而 GDI 对不认识的族名会静默替换，所以代码把选中的族名读回来核对，机器上也可能落到回退族）（§4.2.3：覆盖率要取三个通道的平均）？**那圈圆角是光滑的弧线而不是一段台阶**吗（§4.2.4：圆角要按覆盖率羽化，不能是二值的画/不画）？**控件里的字在左右与上下都居中**吗（§4.2.4：掩码要裁到墨迹，不能拿整个行框去居中）？滚到头（`0.1` 与 `10.0`）就停住吗？往回滚能精确回到 `1×` 吗？**把光标移到贴图外面，别的程序还点得动、拖得动吗**（§4.2.1 的捕获必须还回去）？
+8. **悬停在贴图上滚轮**：那个像素留在光标底下吗？**画面在滚的过程中闪不闪**（§4.2.2：位置、尺寸、画面必须来自同一次 `UpdateLayeredWindow`）？**放大之后还有没有方块状的锯齿，缩小之后有没有摩尔纹**（§4.2.3：半径要跟着比例走，权重要归一化）？右上角的倍数控件跟着变吗、写法是 `1×` / `0.5×` / `1.9×` / `10×` 这种吗、字是**正着**的吗、笔画的边缘是**平滑**的吗、**笔画是粗体**吗（§4.2.2：700，与放大镜那颗同档）、**底色与放大镜那颗一样**吗（§4.2.2：放大镜是 `RGB(60,60,60)` + 82% 不透明，贴图目前是不透明的 `RGB(82,82,82)`——这一处还没照搬）、**笔画比放大镜那颗细不细**（§4.2.3：质量档要留在 ClearType——退回灰度反锯齿笔画细 12%、混到深底上只有参考值的 0.91，`the_badge_text_weighs_the_same_as_on_the_badge_background` 把这条钉在 5% 以内）、**字的形状与放大镜那颗是同一张面孔**吗（§4.2.2：族名同为 `snapclip_ui::font::FAMILY`，而 GDI 对不认识的族名会静默替换，所以代码把选中的族名读回来核对，机器上也可能落到回退族）（§4.2.3：覆盖率要取三个通道的平均）？**那圈圆角是光滑的弧线而不是一段台阶**吗（§4.2.4：圆角要按覆盖率羽化，不能是二值的画/不画）？**控件里的字在左右与上下都居中**吗（§4.2.4：掩码要裁到墨迹，不能拿整个行框去居中）？滚到头（`0.1` 与 `10.0`）就停住吗？往回滚能精确回到 `1×` 吗？**把光标移到贴图外面，别的程序还点得动、拖得动吗**（§4.2.1 的捕获必须还回去）？
 
 ## 7. 日志与指标
 
@@ -569,7 +540,7 @@ cargo test --release -p snapclip-app --lib paint_pin_cost -- --ignored --nocaptu
 
 原计划把 F6 挂在托盘线程上（F8：它是唯一长期存活、且有窗口能收 `WM_HOTKEY` 的线程），复用捕获 crate 现成的 `register_scoped`。
 
-**实际实现没有这么做**：`RegisterHotKey` 由宿主线程自己调用（`apps/snapclip/src/pin/host.rs:373`），编号 `0x5347`，不经过 `snapclip-capture`。
+**实际实现没有这么做**：`RegisterHotKey` 由宿主线程自己调用（`crates/snapclip-pin/src/host.rs`），编号 `0x5347`，不经过 `snapclip-capture`。
 
 理由：`WM_HOTKEY` 投给**注册它的那条线程**的消息队列，而宿主线程本来就是一条常年阻塞在 `GetMessageW` 上的消息泵——它天然满足这个条件。相比之下，借道托盘线程会引入一条 `apps/snapclip → snapclip-capture` 的依赖边，只为拿一个注册函数；而 `register_scoped` 的配对语义是给**会话级**热键设计的（覆盖层的 Esc 就是这么用的，F8），F6 是**进程级**的，生命周期与宿主线程完全相同，本来就是一对 `RegisterHotKey` / `UnregisterHotKey`。
 
@@ -614,18 +585,18 @@ cargo test --release -p snapclip-app --lib paint_pin_cost -- --ignored --nocaptu
 <!-- entity-map:start -->
 | 设计名 | 落地符号 | 位置 | 状态 |
 |---|---|---|---|
-| `PinManager` | `PinManager` | `apps/snapclip/src/pin/mod.rs` | 已实现 |
-| `PinCommand` | *(P2 计划)* | `apps/snapclip/src/pin/mod.rs` | *(P2 计划)* |
-| `PinEvent` | `PinEvent` | `apps/snapclip/src/pin/host.rs` | 已实现 |
+| `PinManager` | `PinManager` | `crates/snapclip-pin/src/host.rs` | 已实现 |
+| `PinCommand` | *(P2 计划)* | `crates/snapclip-pin/src/lib.rs` | *(P2 计划)* |
+| `PinEvent` | `PinEvent` | `crates/snapclip-pin/src/host.rs` | 已实现 |
 | `PinSource` | `PinSource` | `apps/snapclip/src/capture/pin_source.rs` | 已实现（转发句柄，形态与原计划不同，见 §3.4） |
 | `TakeSelection` | `TakeSelection` | `apps/snapclip/src/capture/pin_source.rs` | 已实现（捕获欠贴图的唯一一个方法） |
 | — | `OverlayShared::selection` | `crates/snapclip-capture/src/windows/overlay.rs` | 已实现（像素真正待的地方，`publish_selection` 写入） |
-| — | `PinSelection` | `apps/snapclip/src/pin/mod.rs` | 已实现 |
-| `ImageSource` | `ImageSource` | `apps/snapclip/src/pin/source.rs` | 已实现 |
-| `PinWindowHost` | `PinWindowHost` | `apps/snapclip/src/pin/host.rs` | 已实现 |
-| `PinWindowState` | `PinWindowState` | `apps/snapclip/src/pin/host.rs` | 已实现 |
-| — | `PinRequest` | `apps/snapclip/src/pin/host.rs` | 已实现（原计划的 `PinCommand` 位） |
-| — | `PinHandle` | `apps/snapclip/src/pin/host.rs` | 已实现 |
+| — | `PinSelection` | `crates/snapclip-pin/src/lib.rs` | 已实现 |
+| `ImageSource` | `ImageSource` | `crates/snapclip-pin/src/source.rs` | 已实现 |
+| 宿主句柄 | `PinManager` | `crates/snapclip-pin/src/host.rs` | 已合并到管理器，无额外包装 |
+| `PinWindowState` | `PinWindowState` | `crates/snapclip-pin/src/host.rs` | 已实现 |
+| — | `PinRequest` | `crates/snapclip-pin/src/host.rs` | 已实现（原计划的 `PinCommand` 位） |
+| — | `PinHandle` | `crates/snapclip-pin/src/host.rs` | 已实现 |
 | `PixelFormat` | `PixelFormat` | `crates/snapclip-model/src/capture.rs` | 已有 |
 | `PayloadRef` | `PayloadRef` | `crates/snapclip-model/src/payload.rs` | 已有 |
 | `ClipboardBlobStore` | `ClipboardBlobStore` | `crates/snapclip-history/src/blob_store.rs` | 已有 |

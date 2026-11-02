@@ -33,9 +33,7 @@ pub mod error;
 pub mod geometry;
 pub mod keymap;
 pub mod monitor_cache;
-// The overlay's typeface and its family stack: the one place both renderers (the D2D overlay and
-// the pin window) read the font family from.
-pub mod overlay_font;
+// Shared font resources belong to snapclip-ui, alongside the other native UI primitives.
 pub mod ports;
 pub mod preferences;
 // The custom-region panel's values and rules: four numbers, a unit, a delay, and the three things

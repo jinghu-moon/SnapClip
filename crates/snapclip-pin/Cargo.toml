@@ -1,0 +1,29 @@
+[package]
+name = "snapclip-pin"
+version = "0.1.0"
+description = "SnapClip's independent Windows pin-window capability"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+[dependencies]
+anyhow = "1"
+snapclip-model = { path = "../snapclip-model" }
+snapclip-ui = { path = "../snapclip-ui" }
+
+[target.'cfg(windows)'.dependencies]
+parking_lot = "0.12"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Performance",
+    "Win32_System_Threading",
+    "Win32_UI_Controls",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+# The existing opt-in filter-comparison test writes PNG sheets.
+png = "0.18"

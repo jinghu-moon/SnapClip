@@ -8,7 +8,7 @@
 //! 窗口」，帧从哪来是调用方的事。这条边界让窗口实现不需要 `snapclip-capture`
 //! 这个依赖，也让未来换来源（比如贴剪贴板里的图）不必动窗口代码。
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 /// 一张已经解码好、可以直接往上画的图。
 ///
@@ -47,11 +47,13 @@ impl ImageSource {
     /// DIB 用的是同一块缓冲），而这里要在不复制整张图的前提下把它变成对齐的 `u32`。
     /// 逐 4 字节重新解释是这次转换唯一要做的事。
     pub fn from_bgra_bytes(bytes: &[u8], width: u32, height: u32) -> Result<Self> {
-        if bytes.len() % 4 != 0 {
+        if !bytes.len().is_multiple_of(4) {
             bail!("BGRA 字节数必须是 4 的倍数，实际 {} 字节", bytes.len());
         }
         let pixels = bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect();
         Self::from_bgra(pixels, width, height)
@@ -63,7 +65,7 @@ impl ImageSource {
     /// （PNG 解码、剪贴板图像）用的通道，不是屏幕回读通道：屏幕回读走
     /// [`Self::from_bgra`]，那里 alpha 必须被强制成不透明。
     pub fn from_rgba(bytes: &[u8], width: u32, height: u32) -> Result<Self> {
-        if bytes.len() % 4 != 0 {
+        if !bytes.len().is_multiple_of(4) {
             bail!("RGBA 字节数必须是 4 的倍数，实际 {} 字节", bytes.len());
         }
         let expected = (width as usize)
@@ -78,7 +80,9 @@ impl ImageSource {
             );
         }
         let pixels = bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             // RGBA 字节 → 内存里的 BGRA（小端 u32 的第 4 字节是 A）。
             .map(|chunk| u32::from_le_bytes([chunk[2], chunk[1], chunk[0], chunk[3]]))
             .collect();
@@ -105,9 +109,8 @@ impl ImageSource {
     /// `ImageSource` 的所有权。与其为了这个签名去 `Clone` 一整张 4K 图，不如在类型上
     /// 说清"搬走内容"这件事——`Vec` 的所有权转移一次也没多。
     ///
-    /// 搬走之后 `self` 是一张 `0x0` 的空图：`pixels()` 返回空切片，`width()`/`height()`
-    /// 都是 0。调用点必须在搬走**之前**把尺寸读出来，`attach_window` 就是这么做的。
-    pub fn take_pixels(&mut self) -> Vec<u32> {
+    /// 搬走之后 `pixels()` 返回空切片，尺寸元数据仍保留。调用点必须在搬走**之前**把尺寸读出来，`attach_window` 就是这么做的。
+    pub(crate) fn take_pixels(&mut self) -> Vec<u32> {
         std::mem::take(&mut self.pixels)
     }
 
@@ -156,7 +159,7 @@ mod tests {
     /// `cargo test`。要拿数字就这样跑：
     ///
     /// ```text
-    /// cargo test --release -p snapclip-app --lib pin_bytes_to_u32_throughput -- --ignored --nocapture
+    /// cargo test --release -p snapclip-pin --lib pin_bytes_to_u32_throughput -- --ignored --nocapture
     /// ```
     ///
     /// 两块搬运分别是：

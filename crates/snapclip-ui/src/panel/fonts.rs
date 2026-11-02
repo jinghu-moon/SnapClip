@@ -8,7 +8,7 @@
 //! The face is Fira Code, reduced by `subfont/build_number_font.py` to the thirteen characters the
 //! row can show: three kilobytes instead of the two hundred and eighty three the source font
 //! carries. It is embedded verbatim and registered from memory, exactly like the UI subset in
-//! `snapclip-capture`'s `overlay_font`, so no machine needs it installed.
+//! `crate::font`, so no machine needs it installed.
 //!
 //! This lives in the ui crate rather than beside the UI font because both consumers are here: the
 //! panel draws the unit, and the application sets the face on the size cells' edit controls. The

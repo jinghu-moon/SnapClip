@@ -2,7 +2,7 @@
 //! 的小窗口，可以拖动，双击关掉。
 //!
 //! 设计依据：`docs/34-pin-window-design.md`。这里只实现那份文档里「已决定」的部分，
-//! 文档里标为「已推迟」的（缩放、右键菜单、阴影、按窗口截图）一律不做。
+//! 已包含拖动、缩放、DPI、圆角与倍数徽标；不在这里读取截图或剪贴板。
 //!
 //! # 为什么只有一条线程
 //!
@@ -20,51 +20,47 @@
 //! # 线程亲和性
 //!
 //! `LayeredBuffer` 里握着 HDC 和 DIB，只能在宿主线程上碰。为了从类型上堵住误用，
-//! `PinWindowHost::create_pin`（可以从任意线程调用）只把请求投进通道，真正操作
+//! `PinManager::create_pin`（可以从任意线程调用）只把请求投进通道，真正操作
 //! GDI 对象的代码全部在宿主线程内部，不对外暴露任何 GDI 句柄。
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
-use std::ffi::{c_void, CStr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::ffi::{CStr, c_void};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::thread::{self, JoinHandle};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use windows_sys::Win32::Foundation::{
     GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-    BLACK_BRUSH, BLENDFUNCTION, CLEARTYPE_QUALITY,
-    CLIP_DEFAULT_PRECIS, CreateCompatibleDC, CreateDIBSection, CreateFontW, DEFAULT_CHARSET,
-    DEFAULT_PITCH, DeleteDC, DeleteObject, DIB_RGB_COLORS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
-    DT_TOP, DrawTextW, FF_DONTCARE, FillRect, GetDC, GetStockObject, GetTextFaceW,
+    AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLACK_BRUSH, BLENDFUNCTION,
+    CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleDC, CreateDIBSection, CreateFontW,
+    DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_TOP,
+    DeleteDC, DeleteObject, DrawTextW, FF_DONTCARE, FillRect, GetDC, GetStockObject, GetTextFaceW,
     HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ, OUT_TT_PRECIS, ReleaseDC, SelectObject, SetBkMode,
     SetTextColor, TRANSPARENT, WHITE_BRUSH,
 };
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
-use windows_sys::Win32::System::Performance::{
-    QueryPerformanceCounter, QueryPerformanceFrequency,
-};
+use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    MOD_NOREPEAT, RegisterHotKey, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE,
-    TRACKMOUSEEVENT, UnregisterHotKey, VK_F6,
+    MOD_NOREPEAT, RegisterHotKey, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT,
+    TrackMouseEvent, UnregisterHotKey, VK_F6,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
-    GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, IsWindow,
-    LoadCursorW, PostThreadMessageW, RegisterClassW, SetWindowLongPtrW, SetWindowPos,
-    TranslateMessage, UnregisterClassW, UpdateLayeredWindow, CREATESTRUCTW, CS_DBLCLKS, HTCLIENT,
-    HWND_TOPMOST, IDC_ARROW, MSG, SM_CXDRAG, SM_CYDRAG, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, ULW_ALPHA, WM_APP, WM_DPICHANGED, WM_HOTKEY, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
-    WM_NCDESTROY, WM_NCHITTEST, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    CREATESTRUCTW, CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    GetCursorPos, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, HTCLIENT,
+    HWND_TOPMOST, IDC_ARROW, IsWindow, LoadCursorW, MSG, PostThreadMessageW, RegisterClassW,
+    SM_CXDRAG, SM_CYDRAG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowLongPtrW, SetWindowPos,
+    TranslateMessage, ULW_ALPHA, UnregisterClassW, UpdateLayeredWindow, WM_APP, WM_DPICHANGED,
+    WM_HOTKEY, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
-use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
 
 use super::source::ImageSource;
 use super::{PinHome, PinSelection};
@@ -142,7 +138,7 @@ fn wheel_delta(wparam: WPARAM) -> i32 {
 
 /// 「贴图没了」这条通道的容量。
 ///
-/// 见 `PinWindowHost::spawn` 里为什么它有界。
+/// 见 `PinManager::start` 里为什么它有界。
 const EVENT_QUEUE_CAPACITY: usize = 64;
 
 /// 从 `WNDCLASSW` 创建窗口时传给 `WndProc` 的初始化参数，经 `CreateWindowExW`
@@ -165,16 +161,28 @@ struct WindowSeed {
 /// 像素必须由调用方备好。这台宿主线程不回读屏幕，也不解析窗口——它上面运行的是
 /// 用户按下 F6 那一刻的窗口消息，而那一刻覆盖层可能还盖着整块显示器。图从哪来是
 /// [`PinHome`](super::PinHome) 的事，不是这里的。
+#[derive(Debug)]
 pub struct PinRequest {
-    /// 由调用方发的编号，见 `PinManager::take_id`。
-    pub id: u64,
-    /// 要显示的画面。
-    pub image: ImageSource,
-    /// 上屏位置（屏幕坐标），指的是**含边框**的窗口左上角。
-    pub position: (i32, i32),
-    /// 成图四角的圆角半径（原图的物理像素，0 = 直角）。窗口会把它按当前缩放放大后
-    /// 应用在整个合成结果上（图像 + 边框），所以贴图的圆角与保存出的图是同一个形状。
-    pub radius: i32,
+    image: ImageSource,
+    position: (i32, i32),
+    radius: i32,
+}
+
+impl PinRequest {
+    /// Prepare a pin at the window's top-left virtual-desktop physical coordinate.
+    pub fn new(image: ImageSource, position: (i32, i32)) -> Self {
+        Self {
+            image,
+            position,
+            radius: 0,
+        }
+    }
+
+    /// Set the corner radius in source-image physical pixels. Default: 0 (square corners).
+    pub fn radius(mut self, radius: i32) -> Self {
+        self.radius = radius.max(0);
+        self
+    }
 }
 
 /// 宿主线程发回来的事。
@@ -222,61 +230,61 @@ pub fn summarize(events: impl IntoIterator<Item = PinEvent>) -> PinReport {
 /// 一个已经上屏（或正在上屏）的贴图。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PinHandle {
-    pub id: u64,
+    id: u64,
+}
+
+impl PinHandle {
+    /// The host-allocated identifier used in lifecycle events. Unique within this host lifetime.
+    pub fn id(self) -> u64 {
+        self.id
+    }
 }
 
 /// 宿主线程的句柄。可以在任意线程上创建和销毁贴图。
 ///
 /// 克隆是廉价的：克隆出来的东西共享同一条宿主线程和同一份消息通道。
 #[derive(Clone)]
-pub struct PinWindowHost {
+pub struct PinManager {
     inner: Arc<HostInner>,
 }
 
 /// 「把刚截的那张贴出去」的跨线程手柄。
 ///
-/// 它做的事与用户按 `F6` **完全一样**：往贴图宿主线程投一条 `WM_HOTKEY`。留着这一层，
+/// 它做的事与用户按 `F6` **完全一样**：让宿主线程消费最近截图。留着这一层，
 /// 是为了让"消息号 + 热键号"只出现在本模块里——调用方只需要一个能跨线程调用的手柄，
 /// 而不是自己拼一条窗口消息（docs/23 §14.55.8）。
 ///
-/// 只带线程 id，不带 `Arc<HostInner>`：那个结构里有一个 `Receiver`，它不是 `Sync`，而这份
-/// 手柄要被事件出口（`Send + Sync`）持有。"线程还在不在"由 `PostThreadMessageW` 的返回值
-/// 回答——线程没了它就是失败，比事先查一个可能过期的标志更诚实。
-#[derive(Clone, Copy)]
+/// A weak reference to the owning host: shutdown makes further posts fail, even if Windows
+/// later reuses the old thread identifier. Posting does not extend the host lifetime.
+#[derive(Clone)]
 pub struct PinPoster {
-    thread_id: u32,
+    inner: Weak<HostInner>,
 }
 
 impl PinPoster {
-    /// 投递一次贴图请求。
-    ///
-    /// 宿主线程不在、或投递失败都返回错误：调用方必须把这件事说出来（延时截图到点了
-    /// 却贴不出来，是用户要能看见的失败，不是日志里的静默）。
+    /// Queue the same take-selection operation as F6. Returns an error after host shutdown.
+    /// Success means queued; the eventual window result is reported through `PinEvent`.
     pub fn post(&self) -> Result<()> {
-        let posted = unsafe {
-            PostThreadMessageW(self.thread_id, WM_HOTKEY, PIN_HOTKEY_ID as WPARAM, 0)
-        };
-        if posted == 0 {
-            bail!("PostThreadMessageW(WM_HOTKEY) 失败：{}", last_error());
-        }
-        Ok(())
+        self.inner
+            .upgrade()
+            .context("贴图宿主线程已经不在了")?
+            .send(HostCommand::PinLatest)
     }
 }
 
 struct HostInner {
     commands: Sender<HostCommand>,
     control: Sender<ControlMessage>,
-    events: Receiver<PinEvent>,
-    /// 宿主线程是否还活着。线程退出时置 false。
-    alive: AtomicBool,
-    /// 宿主线程 id。线程退出后会被系统复用，但只要 `alive` 还是 true，
-    /// 它就是我们要唤醒的那条线程。
+    events: parking_lot::Mutex<Receiver<PinEvent>>,
+    next_id: Arc<AtomicU64>,
+    /// Used only while a strong host reference keeps this host alive.
     thread_id: u32,
     thread: parking_lot::Mutex<Option<JoinHandle<()>>>,
 }
 
 enum HostCommand {
-    Create(Box<PinRequest>),
+    Create { id: u64, request: Box<PinRequest> },
+    PinLatest,
     Close(PinHandle),
 }
 
@@ -284,27 +292,28 @@ enum ControlMessage {
     Shutdown,
 }
 
-impl PinWindowHost {
+impl PinManager {
     /// 起一条宿主线程，并在返回之前确认它已经能收命令。
     ///
     /// 这里刻意**不**做「注册窗口类」之外的任何初始化：窗口在收到第一条命令时
     /// 才创建。没贴图的时候，这条线程只是一条阻塞在 `GetMessageW` 上的空泵。
-    pub fn spawn(home: Arc<dyn PinHome>) -> Result<Self> {
+    pub fn start(home: Arc<dyn PinHome>) -> Result<Self> {
         let (command_tx, command_rx) = mpsc::channel::<HostCommand>();
         let (control_tx, control_rx) = mpsc::channel::<ControlMessage>();
-        // 有界：这条通道只会因为「创建失败」而收到东西（正常关闭是调用方自己要求
-        // 的，它本来就知道），所以它绝不该积压。有界是防止它变成一条无界队列——
-        // 若哪天有人在这里加了一条每窗口都发的消息，满队列会立刻暴露这个错误，
-        // 而不是悄悄吃掉几百 KB。
+        // 创建、失败、关闭均上报；有界且不阻塞窗口线程，调用方必须定期排空。
         let (event_tx, event_rx) = mpsc::sync_channel::<PinEvent>(EVENT_QUEUE_CAPACITY);
         let (ready_tx, ready_rx) = mpsc::channel::<Result<HostReady, String>>();
 
+        let next_id = Arc::new(AtomicU64::new(1));
+        let host_ids = Arc::clone(&next_id);
         let thread = thread::Builder::new()
             .name("snapclip-pin".to_string())
             .spawn(move || {
-                if let Err(err) = run_host(&ready_tx, control_rx, command_rx, event_tx, home) {
+                if let Err(err) =
+                    run_host(&ready_tx, control_rx, command_rx, event_tx, home, host_ids)
+                {
                     // 线程跑起来之后才失败，已经没有调用方可以回报了，只能记日志。
-                    eprintln!("[snapclip-app][pin] 贴图宿主线程异常退出：{err:#}");
+                    eprintln!("[snapclip-pin] 贴图宿主线程异常退出：{err:#}");
                 }
             })
             .context("创建贴图宿主线程失败")?;
@@ -314,8 +323,8 @@ impl PinWindowHost {
                 inner: Arc::new(HostInner {
                     commands: command_tx,
                     control: control_tx,
-                    events: event_rx,
-                    alive: AtomicBool::new(true),
+                    events: parking_lot::Mutex::new(event_rx),
+                    next_id,
                     thread_id: ready.thread_id,
                     thread: parking_lot::Mutex::new(Some(thread)),
                 }),
@@ -331,29 +340,28 @@ impl PinWindowHost {
         }
     }
 
-    /// 把一次贴图请求投给宿主线程。
+    /// Queue prepared pixels and synchronously allocate their handle from the same counter as F6.
     ///
-    /// 返回即代表命令已经交给宿主线程，不代表窗口已经上屏——上屏结果通过
-    /// `try_recv_event` 的 `PinEvent::Closed` 反向汇报。
-    ///
-    /// 句柄不回传：调用方自己发号（见 [`PinRequest::id`]），所以它在投出请求的
-    /// 那一刻就已经知道句柄了，不需要为一次跨线程往返等在这个调用里。这也是
-    /// 句柄必须是同步返回的原因——阻塞调用方的消息循环去换一个编号是不必要的。
-    pub fn dispatch(&self, request: PinRequest) -> Result<PinHandle> {
-        let handle = PinHandle { id: request.id };
-        self.send(HostCommand::Create(Box::new(request)))?;
-        Ok(handle)
+    /// Returning a handle means queued, not displayed. Poll `try_recv_event` for `Created` or
+    /// `Failed`, or `drain_events` for aggregate counts. The request never supplies its own ID.
+    pub fn create_pin(&self, request: PinRequest) -> Result<PinHandle> {
+        let id = allocate_id(&self.inner.next_id)?;
+        self.inner.send(HostCommand::Create {
+            id,
+            request: Box::new(request),
+        })?;
+        Ok(PinHandle { id })
     }
 
     /// 主动关掉一个贴图。不存在的 id 会被忽略。
     pub fn close_pin(&self, handle: PinHandle) -> Result<()> {
-        self.send(HostCommand::Close(handle))
+        self.inner.send(HostCommand::Close(handle))
     }
 
     /// 拿一个可以跨线程调用的贴图手柄（见 [`PinPoster`]）。
     pub fn pin_poster(&self) -> PinPoster {
         PinPoster {
-            thread_id: self.inner.thread_id,
+            inner: Arc::downgrade(&self.inner),
         }
     }
 
@@ -362,20 +370,30 @@ impl PinWindowHost {
     /// 非阻塞轮询。贴图数量很少，调用方在自己的消息循环里顺手取一下即可，
     /// 不值得为它专门开一条等待线程。
     pub fn try_recv_event(&self) -> Option<PinEvent> {
-        self.inner.events.try_recv().ok()
+        self.inner.events.lock().try_recv().ok()
     }
 
+    /// Drain all currently queued lifecycle events. The queue is bounded at 64 events;
+    /// the application must poll regularly. Overflow is logged rather than blocking the host.
+    pub fn drain_events(&self) -> PinReport {
+        summarize(self.inner.events.lock().try_iter())
+    }
+}
+
+/// Shared by the direct and F6 paths; exhaustion is an error, never wraparound to an old ID.
+fn allocate_id(counter: &AtomicU64) -> Result<u64> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .map_err(|_| anyhow!("贴图编号已经耗尽"))
+}
+
+impl HostInner {
     fn send(&self, command: HostCommand) -> Result<()> {
-        if !self.inner.alive.load(Ordering::Acquire) {
-            bail!("贴图宿主线程已经不在了");
-        }
-        self.inner
-            .commands
+        self.commands
             .send(command)
             .map_err(|_| anyhow!("贴图宿主线程已经不在了"))?;
-        // 唤醒阻塞在 GetMessageW 上的消息泵。
-        unsafe {
-            PostThreadMessageW(self.inner.thread_id, WM_APP_PIN_WAKE, 0, 0);
+        if unsafe { PostThreadMessageW(self.thread_id, WM_APP_PIN_WAKE, 0, 0) } == 0 {
+            bail!("唤醒贴图宿主线程失败：{}", last_error());
         }
         Ok(())
     }
@@ -383,12 +401,11 @@ impl PinWindowHost {
 
 impl Drop for HostInner {
     fn drop(&mut self) {
-        self.alive.store(false, Ordering::Release);
-        let _ = self.control.send(ControlMessage::Shutdown);
-        unsafe {
-            PostThreadMessageW(self.thread_id, WM_APP_PIN_WAKE, 0, 0);
-        }
-        if let Some(thread) = self.thread.lock().take() {
+        if let Some(thread) = self.thread.get_mut().take() {
+            let _ = self.control.send(ControlMessage::Shutdown);
+            unsafe {
+                PostThreadMessageW(self.thread_id, WM_APP_PIN_WAKE, 0, 0);
+            }
             // 宿主线程会先销毁所有贴图窗口再退出，所以这里等得到。
             let _ = thread.join();
         }
@@ -408,12 +425,8 @@ struct HostState {
     windows: Vec<PinWindowState>,
     /// 往调用方汇报「某个贴图没了」的通道。
     events: SyncSender<PinEvent>,
-    /// 下一个贴图编号，**只给 F6 那条路径用**。
-    ///
-    /// F6 是窗口消息，直接落在宿主线程上，没有调用方站在旁边发号。调用方路径
-    /// 的编号在 [`PinManager::take_id`](super::PinManager::take_id) 上发。各自从
-    /// 1 开始是有意的：编号不跨路径，就没有需要解释的洞。
-    next_id: u64,
+    /// Shared with direct requests; no input path has a second identifier namespace.
+    next_id: Arc<AtomicU64>,
     /// F6 的取图来源。
     ///
     /// 宿主线程在收到 `WM_HOTKEY` 时现取现贴：图必须和「按下 F6 的那一刻」同时
@@ -424,13 +437,6 @@ struct HostState {
 impl HostState {
     fn position_of(&self, hwnd: HWND) -> Option<usize> {
         self.windows.iter().position(|w| w.hwnd == hwnd)
-    }
-
-    /// 取下一个贴图编号。
-    fn take_id(&mut self) -> u64 {
-        let id = self.next_id;
-        self.next_id += 1;
-        id
     }
 
     /// 上报「这个贴图没了」。
@@ -454,7 +460,7 @@ impl HostState {
     fn report(&mut self, event: PinEvent, id: u64, what: &str) {
         if self.events.try_send(event).is_err() {
             eprintln!(
-                "[snapclip-app][pin] {what}队列已满，丢弃 id={id}；\
+                "[snapclip-pin] {what}队列已满，丢弃 id={id}；\
                  这条通道是宿主线程回报生命周期的唯一通道，不该积压"
             );
         }
@@ -478,13 +484,11 @@ fn report_drag_perf(id: u64, perf: &DragPerf) {
     };
     // 到达率：每毫秒几条。小于 0.06 附近（约每 16 ms 一条）就说明消息本身就稀，
     // 瓶颈不在 SetWindowPos。
-    let per_second = if elapsed_ms == 0 {
-        0
-    } else {
-        u64::from(perf.moves) * 1000 / elapsed_ms
-    };
+    let per_second = (u64::from(perf.moves) * 1000)
+        .checked_div(elapsed_ms)
+        .unwrap_or(0);
     eprintln!(
-        "[snapclip-app][pin] drag id={id} moves={} moved={} elapsed_ms={elapsed_ms} \
+        "[snapclip-pin] drag id={id} moves={} moved={} elapsed_ms={elapsed_ms} \
          move_rate_per_s={per_second} set_position_us_avg={average_us} \
          set_position_us_max={} set_position_us_total={}",
         perf.moves, perf.moved, perf.set_position_max_us, perf.set_position_us
@@ -597,6 +601,7 @@ fn run_host(
     commands: Receiver<HostCommand>,
     events: SyncSender<PinEvent>,
     home: Arc<dyn PinHome>,
+    next_id: Arc<AtomicU64>,
 ) -> Result<()> {
     let class_name: Vec<u16> = PIN_WINDOW_CLASS
         .encode_utf16()
@@ -615,7 +620,7 @@ fn run_host(
     let thread_id = unsafe { GetCurrentThreadId() };
 
     // F6 注册在这条线程上：`WM_HOTKEY` 只会投到注册它的线程队列，而贴图的
-    // 屏幕回读与窗口创建都要在这条线程上按顺序发生（见 `PinRequest::WindowAtPoint`）。
+    // 取图与窗口创建都在这条线程上按顺序发生。
     //
     // `RegisterHotKey` 传的是空窗口，于是 F6 变成一条**线程消息**（`msg.hwnd` 为
     // null），这条线程的消息泵必须自己把它交给处理函数——`DispatchMessageW` 对
@@ -626,18 +631,24 @@ fn run_host(
     // 都还在，只是热键这条入口没了。热键被别的程序占着是可能的，所以这里只报告，
     // 不让整个模块起不来。
     //
-    // 代价要说清：第一版**只有 F6 这一条入口**（没有托盘菜单，见 `docs/34` §4.2），
-    // 所以注册失败就等于用户按不动任何东西。这条消息要能在日志里被一眼看到。
-    if unsafe { RegisterHotKey(std::ptr::null_mut(), PIN_HOTKEY_ID, MOD_NOREPEAT, VK_F6 as u32) } == 0
+    // 注册失败时，直接创建与 PinPoster 入口仍然可用；日志明确报告热键不可用。
+    if unsafe {
+        RegisterHotKey(
+            std::ptr::null_mut(),
+            PIN_HOTKEY_ID,
+            MOD_NOREPEAT,
+            VK_F6 as u32,
+        )
+    } == 0
     {
         eprintln!(
-            "[snapclip-app][pin] 注册 F6 失败（错误码 {}）：贴图热键不可用，其余功能照常",
+            "[snapclip-pin] 注册 F6 失败（错误码 {}）：贴图热键不可用，其余功能照常",
             last_error()
         );
     } else {
         // 成功的路径也要留一行：F5/F7/F9 都会打印注册结果，贴图这条不打印的话，
         // 「F6 按下去没反应」就只能靠猜是没注册上还是没收到。
-        eprintln!("[snapclip-app][pin] 注册全局热键 F6 id={PIN_HOTKEY_ID}");
+        eprintln!("[snapclip-pin] 注册全局热键 F6 id={PIN_HOTKEY_ID}");
     }
 
     let mut state = HostState {
@@ -645,7 +656,7 @@ fn run_host(
         instance,
         windows: Vec::new(),
         events,
-        next_id: 1,
+        next_id,
         home,
     };
 
@@ -664,16 +675,21 @@ fn run_host(
         pending.extend(commands.try_iter());
         while let Some(command) = pending.pop_front() {
             match command {
-                HostCommand::Create(request) => {
-                    let id = request.id;
-                    if let Err(err) = create_pin_window(&mut state, id, request.image, request.position, request.radius)
-                    {
-                        eprintln!("[snapclip-app][pin] 创建贴图窗口失败：{err:#}");
+                HostCommand::Create { id, request } => {
+                    if let Err(err) = create_pin_window(
+                        &mut state,
+                        id,
+                        request.image,
+                        request.position,
+                        request.radius,
+                    ) {
+                        eprintln!("[snapclip-pin] 创建贴图窗口失败：{err:#}");
                         // 创建失败单独记账：它是"没能创建"，不是"创建后被关闭"
                         //（这两件事以前混成一条，日志因此说谎，docs/23 §14.55.9.6）。
                         state.report_failed(id);
                     }
                 }
+                HostCommand::PinLatest => on_pin_hotkey(&mut state),
                 HostCommand::Close(handle) => {
                     if let Some(window) = state.windows.iter().find(|w| w.id == handle.id) {
                         let hwnd = window.hwnd;
@@ -696,7 +712,7 @@ fn run_host(
         if ret <= 0 {
             if ret < 0 {
                 eprintln!(
-                    "[snapclip-app][pin] 贴图宿主线程 GetMessageW 失败：{}",
+                    "[snapclip-pin] 贴图宿主线程 GetMessageW 失败：{}",
                     last_error()
                 );
             }
@@ -766,25 +782,31 @@ fn route_message(hwnd: HWND, _message: u32) -> MessageRoute {
 fn on_pin_hotkey(host: *mut HostState) {
     // 每一个 F6 都先留一行，再决定做什么：`RegisterHotKey` 成功但消息没到，
     // 和消息到了却还没有可贴的图，是两种完全不同的故障，日志必须能分开它们。
-    eprintln!("[snapclip-app][pin] WM_HOTKEY F6 received");
+    eprintln!("[snapclip-pin] latest-selection request received");
     let state = unsafe { &mut *host };
     let started = now_us();
     // 先取图再发号：没有图的时候什么都不发生，编号表里不该留下一个洞。
     let Some(selection) = state.home.take_selection() else {
-        eprintln!("[snapclip-app][pin] F6 还没有可贴的图：先按 F5 截一张");
+        eprintln!("[snapclip-pin] F6 还没有可贴的图：先按 F5 截一张");
         return;
     };
     let took_us = now_us().saturating_sub(started);
-    let id = state.take_id();
+    let id = match allocate_id(&state.next_id) {
+        Ok(id) => id,
+        Err(error) => {
+            eprintln!("[snapclip-pin] {error}");
+            return;
+        }
+    };
     let converted = now_us();
     if let Err(err) = pin_home_selection(state, id, selection) {
-        eprintln!("[snapclip-app][pin] F6 贴图失败：{err:#}");
-        state.report_closed(id);
+        eprintln!("[snapclip-pin] F6 贴图失败：{err:#}");
+        state.report_failed(id);
     }
     let total_us = now_us().saturating_sub(started);
     let convert_us = converted.saturating_sub(started).saturating_sub(took_us);
     eprintln!(
-        "[snapclip-app][pin] create stage=hotkey_to_window total_us={total_us} \
+        "[snapclip-pin] create stage=hotkey_to_window total_us={total_us} \
          take_us={took_us} convert_and_window_us={convert_us}"
     );
 }
@@ -798,7 +820,13 @@ fn pin_home_selection(state: &mut HostState, id: u64, selection: PinSelection) -
     let width = u32::try_from(region.width()).context("选区宽度非法")?;
     let height = u32::try_from(region.height()).context("选区高度非法")?;
     if width == 0 || height == 0 {
-        bail!("选区为空：({}, {}) - ({}, {})", region.left, region.top, region.right, region.bottom);
+        bail!(
+            "选区为空：({}, {}) - ({}, {})",
+            region.left,
+            region.top,
+            region.right,
+            region.bottom
+        );
     }
     let expected = width as usize * height as usize * 4;
     if selection.bytes().len() != expected {
@@ -811,12 +839,18 @@ fn pin_home_selection(state: &mut HostState, id: u64, selection: PinSelection) -
     let image = ImageSource::from_bgra_bytes(selection.bytes(), width, height)?;
     let convert_us = now_us().saturating_sub(started);
     let started = now_us();
-    create_pin_window(state, id, image, (region.left, region.top), selection.radius)?;
+    create_pin_window(
+        state,
+        id,
+        image,
+        (region.left, region.top),
+        selection.radius,
+    )?;
     let window_us = now_us().saturating_sub(started);
     // 拆开是为了定位瓶颈：`convert` 是字节→`u32` 的重解释与分配，`window` 是
     // DIB 建立、绘制、`UpdateLayeredWindow` 提交、`ShowWindow`。
     eprintln!(
-        "[snapclip-app][pin] create stage=decode_and_window size={width}x{height} \
+        "[snapclip-pin] create stage=decode_and_window size={width}x{height} \
          px={} convert_us={convert_us} window_us={window_us}",
         width as usize * height as usize
     );
@@ -877,7 +911,7 @@ fn create_pin_window(
     // 这一行及其之前的日志一切正常、屏幕上什么都没有——没有这行，日志里
     // "窗口建没建起来"这个问题就答不了。
     eprintln!(
-        "[snapclip-app][pin] created id={id} size={width}x{height} at=({}, {})",
+        "[snapclip-pin] created id={id} size={width}x{height} at=({}, {})",
         position.0, position.1
     );
     // 上屏是一次事件：账本要能把"创建"与"关闭"分开数（docs/23 §14.55.9.6）。
@@ -968,13 +1002,13 @@ fn on_message(
                 Ok(scaled) => {
                     if DPI_TRACE {
                         eprintln!(
-                            "[snapclip-app][pin] dpi id={} {previous} -> {dpi} buffer={}x{} at=({}, {})",
+                            "[snapclip-pin] dpi id={} {previous} -> {dpi} buffer={}x{} at=({}, {})",
                             window.id, scaled.0, scaled.1, position.0, position.1
                         );
                     }
                 }
                 Err(err) => {
-                    eprintln!("[snapclip-app][pin] 换 DPI 重画失败 id={}：{err:#}", window.id);
+                    eprintln!("[snapclip-pin] 换 DPI 重画失败 id={}：{err:#}", window.id);
                 }
             }
             0
@@ -1041,21 +1075,16 @@ fn on_message(
                         if !window.drag_moved {
                             // 先过系统拖动阈值再挪窗口：这样单击（按下又松开）
                             // 绝不会把贴图挪偏一两个像素。
-                            let threshold_x =
-                                unsafe { GetSystemMetrics(SM_CXDRAG) }.max(1);
-                            let threshold_y =
-                                unsafe { GetSystemMetrics(SM_CYDRAG) }.max(1);
+                            let threshold_x = unsafe { GetSystemMetrics(SM_CXDRAG) }.max(1);
+                            let threshold_y = unsafe { GetSystemMetrics(SM_CYDRAG) }.max(1);
                             if dx.abs() >= threshold_x || dy.abs() >= threshold_y {
                                 window.drag_moved = true;
                             }
                         }
                         if window.drag_moved {
                             // 从锚点算绝对位置，不做累加。
-                            let (x, y) = drag_position(
-                                window.drag_anchor,
-                                down,
-                                (point.x, point.y),
-                            );
+                            let (x, y) =
+                                drag_position(window.drag_anchor, down, (point.x, point.y));
                             let started = if DRAG_PROFILE { now_us() } else { 0 };
                             let landed = unsafe {
                                 SetWindowPos(
@@ -1158,7 +1187,7 @@ fn on_message(
                 let scaled = match unsafe { repaint_window(hwnd, window, moved) } {
                     Ok(scaled) => scaled,
                     Err(err) => {
-                        eprintln!("[snapclip-app][pin] 缩放失败 id={}：{err:#}", window.id);
+                        eprintln!("[snapclip-pin] 缩放失败 id={}：{err:#}", window.id);
                         return 0;
                     }
                 };
@@ -1174,7 +1203,7 @@ fn on_message(
                     let origin = window_origin(hwnd);
                     let style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
                     eprintln!(
-                        "[snapclip-app][pin] zoom id={} zoom={zoom:.4} delta={delta} cursor=({}, {}) \
+                        "[snapclip-pin] zoom id={} zoom={zoom:.4} delta={delta} cursor=({}, {}) \
                          want=({}, {}) origin=({}, {}) buffer={}x{} layered={} apply_us={}",
                         window.id,
                         cursor.0,
@@ -1220,7 +1249,7 @@ fn on_wm_nccreate(hwnd: HWND, lparam: LPARAM) -> LRESULT {
             return 0;
         }
         if let Err(err) = attach_window(hwnd, &mut *seed) {
-            eprintln!("[snapclip-app][pin] 贴图窗口初始化失败：{err:#}");
+            eprintln!("[snapclip-pin] 贴图窗口初始化失败：{err:#}");
             // 返回 0 让 `CreateWindowExW` 失败并回收这个窗口。
             return 0;
         }
@@ -1246,10 +1275,9 @@ fn on_wm_ncdestroy(host: *mut HostState, hwnd: HWND) {
     // 「销毁」必须和「创建」成对留在日志里。量贴图的内存时，`created` 出现了三次而
     // 读取内存的脚本看到 GDI 对象还是一个没少，这是两种完全不同的故障——是窗口没销毁，
     // 还是销毁了但资源没还——没有这一行就只能靠猜。
-    eprintln!(
-        "[snapclip-app][pin] destroyed id={id} remaining={}",
-        unsafe { (*host).windows.len() }
-    );
+    eprintln!("[snapclip-pin] destroyed id={id} remaining={}", unsafe {
+        (*host).windows.len()
+    });
     unsafe { notify_closed(host, id) };
 }
 
@@ -1358,7 +1386,7 @@ fn acquire_hover(hwnd: HWND, window: &mut PinWindowState) {
     };
     if unsafe { TrackMouseEvent(&mut track) } == 0 {
         eprintln!(
-            "[snapclip-app][pin] TrackMouseEvent 失败 id={} 错误码 {}",
+            "[snapclip-pin] TrackMouseEvent 失败 id={} 错误码 {}",
             window.id,
             last_error()
         );
@@ -1458,7 +1486,11 @@ unsafe fn repaint_window(
     );
 
     framebuffer
-        .submit(hwnd, Some(position), scaled_radius(window.radius, window.zoom))
+        .submit(
+            hwnd,
+            Some(position),
+            scaled_radius(window.radius, window.zoom),
+        )
         .context("提交重画后的贴图内容失败")?;
     window.position = position;
 
@@ -1474,7 +1506,11 @@ unsafe fn repaint_window(
 /// `WM_MOUSEMOVE` 都把上一次的结果又加上一遍位移，窗口以拖动距离的速率跑飞，
 /// 最后完全脱离光标。这里的写法对同一组输入永远给同一个答案，也是为什么它必须
 /// 收 `anchor`（拖动开始时窗口在哪）而不是收 `current`（窗口现在在哪）。
-fn drag_position(anchor: (i32, i32), cursor_down: (i32, i32), cursor_now: (i32, i32)) -> (i32, i32) {
+fn drag_position(
+    anchor: (i32, i32),
+    cursor_down: (i32, i32),
+    cursor_now: (i32, i32),
+) -> (i32, i32) {
     (
         anchor.0 + (cursor_now.0 - cursor_down.0),
         anchor.1 + (cursor_now.1 - cursor_down.1),
@@ -1600,11 +1636,7 @@ fn image_point_at_client(
 
 /// 原图像素坐标 → 客户端坐标。它是 [`image_point_at_client`] 的反函数，两者必须成对
 /// 使用，缩放的不变量（见 [`zoom_with_cursor`]）才成立。
-fn image_point_to_client(
-    zoom: f64,
-    border: i32,
-    image: (i32, i32),
-) -> (i32, i32) {
+fn image_point_to_client(zoom: f64, border: i32, image: (i32, i32)) -> (i32, i32) {
     let zoom = clamp_zoom(zoom);
     (
         (f64::from(image.0) * zoom).round() as i32 + border,
@@ -1692,6 +1724,10 @@ fn wheel_zoom(zoom: f64, remainder: i32, delta: i32) -> (f64, i32, i32) {
 /// 代价是重采样会让细节略微变软——但软了还认得出是什么字，锯齿就认不出了。
 /// 旧的方角版本：等价于半径 0，只给测试用。
 #[cfg(test)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Pixel kernels keep source, destination and sampling geometry explicit; no extra state owner is needed."
+)]
 fn paint_pin(
     buffer: &mut [u32],
     size: (i32, i32),
@@ -1789,6 +1825,10 @@ fn rounded_border_band(buffer: &mut [u32], size: (usize, usize), border: usize, 
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Pixel kernels keep source, destination and sampling geometry explicit; no extra state owner is needed."
+)]
 fn paint_pin_with_radius(
     buffer: &mut [u32],
     size: (i32, i32),
@@ -2041,6 +2081,10 @@ fn plan_axis(source_length: usize, destination_length: usize) -> AxisPlan {
 /// 读的源图和两张抽头表都是只读的。实测把它压到几十毫秒，比改画质之前的最近邻还快。
 ///
 /// 段的任务很短（一档一次），所以段数取可用核数并封顶；再多的段只会换来调度开销。
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Pixel kernels keep source, destination and sampling geometry explicit; no extra state owner is needed."
+)]
 fn resample_image(
     buffer: &mut [u32],
     row_pitch: usize,
@@ -2065,7 +2109,9 @@ fn resample_image(
         1
     };
     if threads <= 1 {
-        resample_band(rows, row_pitch, origin.0, 0, image, source, drawn, x_plan, y_plan);
+        resample_band(
+            rows, row_pitch, origin.0, 0, image, source, drawn, x_plan, y_plan,
+        );
         return;
     }
 
@@ -2112,7 +2158,9 @@ fn resample_band(
     y_plan: &AxisPlan,
 ) {
     if identity_plan(x_plan) && identity_plan(y_plan) {
-        resample_identity(buffer, row_pitch, origin_x, first_row, image, source.0, drawn, y_plan);
+        resample_identity(
+            buffer, row_pitch, origin_x, first_row, image, source.0, drawn, y_plan,
+        );
         return;
     }
     if two_tap_plan(x_plan) && two_tap_plan(y_plan) {
@@ -2146,6 +2194,10 @@ fn two_tap_plan(plan: &AxisPlan) -> bool {
 /// `first_row` 是这一段在**整幅目标**里的第一行，用来查 y 轴抽头；`buffer` 里的行号则是
 /// 从这一段自己算起的，所以写的位置是 `row * row_pitch`。分段并行之后这两个行号不再
 /// 相等，混用会让每一段都画到错的行上——而画面只是"某一档缩放画错了"，不报错。
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Pixel kernels keep source, destination and sampling geometry explicit; no extra state owner is needed."
+)]
 fn resample_identity(
     buffer: &mut [u32],
     row_pitch: usize,
@@ -2187,9 +2239,7 @@ fn blend_pixels(first: u32, second: u32, weight_second: u32) -> u32 {
     debug_assert!(weight_second <= BLEND_ONE);
     let weight_first = BLEND_ONE - weight_second;
     let round = 1 << (BLEND_SHIFT - 1);
-    let low = (first & 0x00FF_00FF) * weight_first
-        + (second & 0x00FF_00FF) * weight_second
-        + round;
+    let low = (first & 0x00FF_00FF) * weight_first + (second & 0x00FF_00FF) * weight_second + round;
     let high = ((first >> 8) & 0x00FF_00FF) * weight_first
         + ((second >> 8) & 0x00FF_00FF) * weight_second
         + round;
@@ -2350,7 +2400,7 @@ unsafe fn user32_proc(name: &CStr) -> Option<*const c_void> {
 // 是同一个东西；**实现完全不同**——放大镜在 D2D 上画，贴图只能往自己的 `u32` 缓冲里逐像素写。
 
 /// 控件文字的字号（DIP），与放大镜那颗一致。
-const BADGE_FONT_DIP: f64 = snapclip_capture::overlay_font::ZOOM_BADGE_FONT_SIZE_DIP as f64;
+const BADGE_FONT_DIP: f64 = snapclip_ui::font::ZOOM_BADGE_FONT_SIZE_DIP as f64;
 const BADGE_PAD_H_DIP: f64 = 8.0;
 const BADGE_PAD_V_DIP: f64 = 5.0;
 const BADGE_INSET_DIP: f64 = 6.0;
@@ -2455,22 +2505,22 @@ fn has_ink(pixel: &u32) -> bool {
 unsafe fn select_badge_font(memory_dc: HDC, font_height: i32) -> Option<(HFONT, HGDIOBJ)> {
     // 覆盖层那颗在渲染器启动时注册过，这里再调一次是幂等的——但贴图可以独立于覆盖层存在
     // （只开贴图不开截图），所以不能指望别人先注册。
-    snapclip_capture::overlay_font::register();
-    let families = snapclip_capture::overlay_font::FAMILIES;
+    snapclip_ui::font::register();
+    let families = snapclip_ui::font::FAMILIES;
     unsafe {
         for (index, family) in families.iter().enumerate() {
             let font = create_badge_face(font_height, family);
             if font.is_null() {
                 continue;
             }
-            let previous = SelectObject(memory_dc, font.into());
+            let previous = SelectObject(memory_dc, font);
             if index + 1 == families.len()
                 || face_name(memory_dc).is_some_and(|name| name == *family)
             {
                 return Some((font, previous));
             }
             SelectObject(memory_dc, previous);
-            DeleteObject(font.into());
+            DeleteObject(font);
         }
     }
     None
@@ -2488,7 +2538,7 @@ unsafe fn create_badge_face(font_height: i32, family: &str) -> HFONT {
             // （`magnifier_pass.rs` 里 `info_text_format_mut(false, ZOOM_BADGE_FONT_SIZE_DIP, …BOLD, true)`）。
             // 这里曾经是 `FW_SEMIBOLD`（600）：字号、内边距、圆角都照搬了，唯独笔画比放大镜
             // 那颗细一档，摆在一起看就不是同一个控件（用户 m07964）。
-            snapclip_capture::overlay_font::ZOOM_BADGE_FONT_WEIGHT,
+            snapclip_ui::font::ZOOM_BADGE_FONT_WEIGHT,
             0,
             0,
             0,
@@ -2594,7 +2644,7 @@ fn rasterize_text(text: &str, dpi: u32) -> Option<TextMask> {
                 let mask = if bitmap.is_null() || bits.is_null() {
                     None
                 } else {
-                    let previous_bitmap = SelectObject(memory_dc, bitmap.into());
+                    let previous_bitmap = SelectObject(memory_dc, bitmap);
                     let mut rect = RECT {
                         left: 0,
                         top: 0,
@@ -2654,7 +2704,7 @@ fn rasterize_text(text: &str, dpi: u32) -> Option<TextMask> {
                     }
 
                     SelectObject(memory_dc, previous_bitmap);
-                    DeleteObject(bitmap.into());
+                    DeleteObject(bitmap);
                     Some(TextMask {
                         coverage,
                         width: text_width as i32,
@@ -2663,7 +2713,7 @@ fn rasterize_text(text: &str, dpi: u32) -> Option<TextMask> {
                 };
                 SelectObject(memory_dc, previous_brush);
                 SelectObject(memory_dc, previous_font);
-                DeleteObject(font.into());
+                DeleteObject(font);
                 mask
             } else {
                 None
@@ -2711,13 +2761,15 @@ impl BadgeStyle {
 /// `None` 表示这一档放不下控件、整个不画（让位规则见 [`composite_badge`]）。宽度由字模
 /// 量出来的文字宽度决定，所以落点和字模只能一起算出来——这也正是它要能被问到的原因：
 /// 控件压在图像上，任何"整幅图像逐像素"的断言都必须先把这个矩形让出去。
+type BadgePlacement = (Arc<TextMask>, (i32, i32, i32, i32));
+
 fn badge_placement(
     image_width: u32,
     image_height: u32,
     zoom: f64,
     border: i32,
     dpi: u32,
-) -> Option<(Arc<TextMask>, (i32, i32, i32, i32))> {
+) -> Option<BadgePlacement> {
     let style = BadgeStyle::new(dpi);
     let mask = text_mask(&badge_label(zoom), dpi)?;
     let badge_width = mask.width + style.pad_h * 2;
@@ -2949,7 +3001,6 @@ fn mask_rounded_corners(buffer: &mut [u32], size: (i32, i32), radius: i32) {
 }
 
 /// 一块交给 `UpdateLayeredWindow` 的整窗位图。
-
 ///
 /// 用 `u32` 而不是 `u8` 持有 DIB 内存：`CreateDIBSection` 返回的缓冲区按 4 字节
 /// 对齐，用 `u32` 表达这个前提，就不用到处写 `bytemuck` 式的转换。
@@ -2964,8 +3015,7 @@ struct LayeredBuffer {
     len: usize,
 }
 
-// 所有 GDI 句柄只在宿主线程上用，`LayeredBuffer` 从不离开宿主线程。
-unsafe impl Send for LayeredBuffer {}
+// Raw GDI pointers keep LayeredBuffer !Send/!Sync; it never leaves its host thread.
 
 impl LayeredBuffer {
     /// `zeroed` 为 false 时不清零：调用方马上会把整块像素写满（屏幕回读就是），
@@ -3163,6 +3213,169 @@ fn last_error() -> u32 {
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct SelectionSlot(parking_lot::Mutex<Option<PinSelection>>);
+
+    impl PinHome for SelectionSlot {
+        fn take_selection(&self) -> Option<PinSelection> {
+            self.0.lock().take()
+        }
+    }
+
+    fn test_state(home: Arc<dyn PinHome>) -> (HostState, Receiver<PinEvent>) {
+        let (events, receiver) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
+        (
+            HostState {
+                class_name: Vec::new(),
+                instance: std::ptr::null_mut(),
+                windows: Vec::new(),
+                events,
+                next_id: Arc::new(AtomicU64::new(1)),
+                home,
+            },
+            receiver,
+        )
+    }
+
+    #[test]
+    fn ids_are_unique_and_start_at_one() {
+        let ids = AtomicU64::new(1);
+        assert_eq!(allocate_id(&ids).unwrap(), 1);
+        assert_eq!(allocate_id(&ids).unwrap(), 2);
+    }
+
+    #[test]
+    fn an_empty_region_is_never_a_selection() {
+        use snapclip_model::geometry::Rect;
+        assert!(Rect::new(10, 10, 10, 50).is_empty());
+        assert!(Rect::new(10, 10, 50, 10).is_empty());
+        assert!(!Rect::new(10, 10, 11, 11).is_empty());
+        let (mut state, receiver) = test_state(Arc::new(SelectionSlot::default()));
+        assert!(
+            pin_home_selection(
+                &mut state,
+                1,
+                PinSelection::new(Rect::new(10, 10, 10, 50), Arc::new(Vec::new()))
+            )
+            .is_err()
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn concurrent_request_paths_share_one_id_sequence() {
+        let ids = Arc::new(AtomicU64::new(1));
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let ids = Arc::clone(&ids);
+                thread::spawn(move || {
+                    (0..250)
+                        .map(|_| allocate_id(&ids).unwrap())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut result: Vec<_> = workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap())
+            .collect();
+        result.sort_unstable();
+        assert_eq!(result, (1..=1000).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn id_exhaustion_never_wraps_or_reuses_a_handle() {
+        let ids = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(allocate_id(&ids).unwrap(), u64::MAX - 1);
+        assert!(allocate_id(&ids).is_err());
+        assert!(allocate_id(&ids).is_err());
+        assert_eq!(ids.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn f6_without_a_selection_allocates_no_id_or_event() {
+        let (mut state, receiver) = test_state(Arc::new(SelectionSlot::default()));
+        on_pin_hotkey(&mut state);
+        assert_eq!(allocate_id(&state.next_id).unwrap(), 1);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn an_invalid_f6_selection_reports_failed_in_the_shared_sequence() {
+        use snapclip_model::geometry::Rect;
+        let slot = Arc::new(SelectionSlot::default());
+        *slot.0.lock() = Some(PinSelection::new(
+            Rect::new(-10, -20, -8, -18),
+            Arc::new(vec![0; 3]),
+        ));
+        let (mut state, receiver) = test_state(slot);
+        assert_eq!(allocate_id(&state.next_id).unwrap(), 1);
+        on_pin_hotkey(&mut state);
+        assert_eq!(receiver.try_recv().unwrap(), PinEvent::Failed { id: 2 });
+        assert!(receiver.try_recv().is_err());
+        on_pin_hotkey(&mut state);
+        assert_eq!(allocate_id(&state.next_id).unwrap(), 3);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_poster_does_not_keep_a_stopped_host_alive() {
+        let (commands, receiver) = mpsc::channel();
+        drop(receiver);
+        let (control, _) = mpsc::channel();
+        let (_, events) = mpsc::channel();
+        let manager = PinManager {
+            inner: Arc::new(HostInner {
+                commands,
+                control,
+                events: parking_lot::Mutex::new(events),
+                next_id: Arc::new(AtomicU64::new(1)),
+                thread_id: 0,
+                thread: parking_lot::Mutex::new(None),
+            }),
+        };
+        let poster = manager.pin_poster();
+        assert!(poster.post().is_err());
+        assert!(
+            manager
+                .create_pin(PinRequest::new(
+                    ImageSource::from_bgra(vec![0], 1, 1).unwrap(),
+                    (0, 0)
+                ))
+                .is_err()
+        );
+        let clone = manager.clone();
+        drop(manager);
+        assert!(poster.inner.upgrade().is_some());
+        drop(clone);
+        assert!(poster.inner.upgrade().is_none());
+        assert!(poster.post().is_err());
+    }
+
+    #[test]
+    fn the_public_handles_can_cross_threads() {
+        fn send_sync<T: Send + Sync>() {}
+        send_sync::<PinManager>();
+        send_sync::<PinPoster>();
+        send_sync::<PinRequest>();
+        send_sync::<PinSelection>();
+    }
+
+    #[test]
+    fn requests_and_selections_keep_negative_screen_origins_and_clamp_radius() {
+        use snapclip_model::geometry::Rect;
+        let selection =
+            PinSelection::new(Rect::new(-10, -20, -9, -19), Arc::new(vec![0; 4])).radius(-2);
+        assert_eq!(selection.region(), Rect::new(-10, -20, -9, -19));
+        assert_eq!(selection.corner_radius(), 0);
+        assert_eq!(selection.bytes(), &[0; 4]);
+        assert_eq!(selection.radius(8).corner_radius(), 8);
+        let request =
+            PinRequest::new(ImageSource::from_bgra(vec![0], 1, 1).unwrap(), (-10, -20)).radius(-1);
+        assert_eq!(request.position, (-10, -20));
+        assert_eq!(request.radius, 0);
+        assert_eq!(request.radius(8).radius, 8);
+    }
 
     /// 遮罩把四角变透明、边缘留下中间 alpha、中心一个字节不动。
     ///
@@ -3187,20 +3400,16 @@ mod tests {
         // 中心：一个字节都不动。
         assert_eq!(at(size.0 as usize / 2, size.1 as usize / 2), BORDER_COLOR);
         // 边缘：既有 alpha、又不是 0 也不是 255（抗锯齿而不是硬切）。
-        let edge = (0..radius as usize)
-            .map(|i| at(i, 0))
-            .find(|p| {
-                let a = p >> 24;
-                a > 0 && a < 255
-            });
+        let edge = (0..radius as usize).map(|i| at(i, 0)).find(|p| {
+            let a = p >> 24;
+            a > 0 && a < 255
+        });
         assert!(edge.is_some(), "边缘必须有中间 alpha，否则圆角是硬切的");
         // 半径 0 时整块缓冲逐字节不变。
         let mut untouched = before.clone();
         mask_rounded_corners(&mut untouched, size, 0);
         assert_eq!(untouched, before, "半径 0 必须什么都不改");
     }
-
-
 
     /// 账本必须把三件事分开：创建、关闭、没能创建（回归：曾经 created→destroyed 之后
     /// 还会打印"1 张贴图没能创建"，docs/23 §14.55.9.6）。
@@ -3209,7 +3418,11 @@ mod tests {
         let lifecycle = summarize([PinEvent::Created { id: 1 }, PinEvent::Closed { id: 1 }]);
         assert_eq!(
             lifecycle,
-            PinReport { created: 1, closed: 1, failed: 0 },
+            PinReport {
+                created: 1,
+                closed: 1,
+                failed: 0
+            },
             "创建后被关闭不算失败"
         );
         assert!(lifecycle.any());
@@ -3255,7 +3468,7 @@ mod tests {
                     0,
                     0,
                     0,
-                    snapclip_capture::overlay_font::ZOOM_BADGE_FONT_WEIGHT,
+                    snapclip_ui::font::ZOOM_BADGE_FONT_WEIGHT,
                     0,
                     0,
                     0,
@@ -3264,9 +3477,9 @@ mod tests {
                     CLIP_DEFAULT_PRECIS as u32,
                     quality,
                     DEFAULT_PITCH as u32 | FF_DONTCARE as u32,
-                    wide(snapclip_capture::overlay_font::FAMILY).as_ptr(),
+                    wide(snapclip_ui::font::FAMILY).as_ptr(),
                 );
-                let previous_font = SelectObject(memory_dc, font.into());
+                let previous_font = SelectObject(memory_dc, font);
                 let lines = font_height.unsigned_abs() * 2;
                 let width = 432;
                 let mut info: BITMAPINFO = std::mem::zeroed();
@@ -3277,9 +3490,15 @@ mod tests {
                 info.bmiHeader.biBitCount = 32;
                 info.bmiHeader.biCompression = BI_RGB;
                 let mut bits: *mut c_void = std::ptr::null_mut();
-                let bitmap =
-                    CreateDIBSection(memory_dc, &info, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
-                let previous_bitmap = SelectObject(memory_dc, bitmap.into());
+                let bitmap = CreateDIBSection(
+                    memory_dc,
+                    &info,
+                    DIB_RGB_COLORS,
+                    &mut bits,
+                    std::ptr::null_mut(),
+                    0,
+                );
+                let previous_bitmap = SelectObject(memory_dc, bitmap);
                 let stride = width as usize;
                 let rows = lines as usize;
                 let pixels = std::slice::from_raw_parts_mut(bits as *mut u32, stride * rows);
@@ -3302,9 +3521,9 @@ mod tests {
                 );
                 let copy = pixels.to_vec();
                 SelectObject(memory_dc, previous_bitmap);
-                DeleteObject(bitmap.into());
+                DeleteObject(bitmap);
                 SelectObject(memory_dc, previous_font);
-                DeleteObject(font.into());
+                DeleteObject(font);
                 DeleteDC(memory_dc);
                 ReleaseDC(std::ptr::null_mut(), screen_dc);
                 copy
@@ -3334,7 +3553,10 @@ mod tests {
             "控件白字压在底色上：掩码 {}x{}、有墨迹 {} 像素、看起来的重量比 {ratio:.3}、参考图上墨迹 {reference:.1}",
             mask.width,
             mask.height,
-            mask.coverage.iter().filter(|coverage| **coverage > 0).count(),
+            mask.coverage
+                .iter()
+                .filter(|coverage| **coverage > 0)
+                .count(),
         );
         assert!(
             (ratio - 1.0).abs() < 0.05,
@@ -3369,18 +3591,12 @@ mod tests {
         // 有窗口的消息仍然必须走 `DispatchMessageW`：贴图的拖动与双击都在窗口
         // 过程里，把它们也拦到自己手里就等于让窗口失效。
         let hwnd = 0x1234 as HWND;
-        assert_eq!(
-            route_message(hwnd, WM_MOUSEMOVE),
-            MessageRoute::Dispatch
-        );
+        assert_eq!(route_message(hwnd, WM_MOUSEMOVE), MessageRoute::Dispatch);
         assert_eq!(
             route_message(hwnd, WM_LBUTTONDBLCLK),
             MessageRoute::Dispatch
         );
-        assert_eq!(
-            route_message(hwnd, WM_NCHITTEST),
-            MessageRoute::Dispatch
-        );
+        assert_eq!(route_message(hwnd, WM_NCHITTEST), MessageRoute::Dispatch);
     }
 
     #[test]
@@ -3438,7 +3654,9 @@ mod tests {
 
     /// 一行像素的测试数据。
     fn image_of(width: u32, height: u32) -> Vec<u32> {
-        (0..(width * height)).map(|i| 0xFF00_0000 | (i + 1)).collect()
+        (0..(width * height))
+            .map(|i| 0xFF00_0000 | (i + 1))
+            .collect()
     }
 
     /// 圆角处必须有边框：遮罩只切外侧，方角边框会在弧内被一起切掉（docs/23 §14.55.22）。
@@ -3453,7 +3671,11 @@ mod tests {
         paint_pin_with_radius(&mut zero, (40, 40), 4, &image, 32, 32, 1.0, TEST_DPI, 0);
         assert_eq!(zero, square, "半径 0 必须与旧路径逐字节一致");
         assert_eq!(square[4 * 40 + 4], 0xFF00_FF00, "方角时图像角上是图像");
-        assert_eq!(rounded[4 * 40 + 4], BORDER_COLOR, "圆角时角上必须是边框，不是被裁掉");
+        assert_eq!(
+            rounded[4 * 40 + 4],
+            BORDER_COLOR,
+            "圆角时角上必须是边框，不是被裁掉"
+        );
         assert_eq!(rounded[20 * 40 + 4], 0xFF00_FF00, "直边中点的图像不动");
     }
 
@@ -3467,8 +3689,8 @@ mod tests {
             assert_eq!(buffer[y * 4 + x], BORDER, "({x},{y}) 应当是边框");
         }
         // 中间 2x2 是原图，逐像素对齐。
-        assert_eq!(buffer[1 * 4 + 1], image[0]);
-        assert_eq!(buffer[1 * 4 + 2], image[1]);
+        assert_eq!(buffer[4 + 1], image[0]);
+        assert_eq!(buffer[4 + 2], image[1]);
         assert_eq!(buffer[2 * 4 + 1], image[2]);
         assert_eq!(buffer[2 * 4 + 2], image[3]);
     }
@@ -3483,7 +3705,7 @@ mod tests {
         let mut buffer = vec![0u32; 5 * 4];
         paint_pin(&mut buffer, (5, 4), 1, &image, 3, 2, 1.0, TEST_DPI);
 
-        assert_eq!(&buffer[1 * 5 + 1..1 * 5 + 4], &[1, 1, 1]);
+        assert_eq!(&buffer[5 + 1..5 + 4], &[1, 1, 1]);
         assert_eq!(&buffer[2 * 5 + 1..2 * 5 + 4], &[2, 2, 2]);
         // 首末行仍是边框色。
         assert_eq!(buffer[0], BORDER);
@@ -3599,8 +3821,7 @@ mod tests {
         let position = (300, 200);
         // 光标压在窗口里 (40, 30) 处，也就是原图 (39, 29) 那个像素上。
         let cursor = (position.0 + 40, position.1 + 30);
-        let anchor_before =
-            image_point_at_client(image_width, image_height, 1.0, border, (40, 30));
+        let anchor_before = image_point_at_client(image_width, image_height, 1.0, border, (40, 30));
         assert_eq!(anchor_before, Some((39, 29)));
 
         let zoom_after = 3.0;
@@ -3760,7 +3981,9 @@ mod tests {
         let (image_width, image_height) = (4u32, 3u32);
         // 相邻像素差 20 个通道值。不能拿 `image_of` 那个逐像素加一的序列：它相邻只差 1，
         // 插值出来的"中间值"四舍五入之后就是端点本身，断言分不出插值与不插值。
-        let image: Vec<u32> = (0..12).map(|index| 0xFF00_0000 | (index * 20 + 10)).collect();
+        let image: Vec<u32> = (0..12)
+            .map(|index| 0xFF00_0000 | (index * 20 + 10))
+            .collect();
         let border = 1;
 
         let doubled = window_size(image_width, image_height, 2.0, border);
@@ -3996,7 +4219,7 @@ mod tests {
             "掩码里只有 0 和 255：字体平滑被关掉了，文字边缘会是硬锯齿"
         );
         assert!(
-            mask.coverage.iter().any(|value| *value == 0),
+            mask.coverage.contains(&0),
             "掩码里没有空白像素，多半是宽度量错了"
         );
         assert_eq!(
@@ -4021,11 +4244,11 @@ mod tests {
             let (font, previous) = select_badge_font(memory_dc, -height).expect("一个族都没要到");
             assert_eq!(
                 face_name(memory_dc).as_deref(),
-                Some(snapclip_capture::overlay_font::FAMILY),
+                Some(snapclip_ui::font::FAMILY),
                 "贴图的倍数控件与放大镜那颗不是同一个字体族"
             );
             SelectObject(memory_dc, previous);
-            DeleteObject(font.into());
+            DeleteObject(font);
             DeleteDC(memory_dc);
             ReleaseDC(std::ptr::null_mut(), screen_dc);
         }
@@ -4043,14 +4266,14 @@ mod tests {
             let memory_dc = CreateCompatibleDC(screen_dc);
             let font = create_badge_face(-height, "SnapClip No Such Font");
             assert!(!font.is_null(), "CreateFontW 连替身都不给");
-            let previous = SelectObject(memory_dc, font.into());
+            let previous = SelectObject(memory_dc, font);
             assert_ne!(
                 face_name(memory_dc).as_deref(),
                 Some("SnapClip No Such Font"),
                 "GDI 声称有一颗不存在的字体：读回校验这条路本身失灵了"
             );
             SelectObject(memory_dc, previous);
-            DeleteObject(font.into());
+            DeleteObject(font);
             DeleteDC(memory_dc);
             ReleaseDC(std::ptr::null_mut(), screen_dc);
         }
@@ -4243,7 +4466,7 @@ mod tests {
 
     /// 量一次重采样的成本，不断言什么。
     ///
-    /// 跑法：`cargo test --release -p snapclip-app --lib paint_pin_cost -- --ignored --nocapture`
+    /// 跑法：`cargo test --release -p snapclip-pin --lib paint_pin_cost -- --ignored --nocapture`
     ///
     /// 数字随机器变，只作量级判断。留在这里是因为"缩放卡不卡"最终只取决于这个函数：
     /// 缓冲大小按倍数的**平方**涨（1405x1137 放到 5.6× 就是 7872x6371），抽头数按缩小
@@ -4356,7 +4579,11 @@ mod tests {
         for x in 0..WIDTH {
             let value = (x * 255 / (WIDTH - 1)) as u32;
             for y in 44..HEIGHT {
-                put(x as i64, y as i64, 0xFF00_0000 | (value << 16) | (value << 8) | value);
+                put(
+                    x as i64,
+                    y as i64,
+                    0xFF00_0000 | (value << 16) | (value << 8) | value,
+                );
             }
         }
         (WIDTH, HEIGHT, image)
@@ -4378,7 +4605,8 @@ mod tests {
         const C: f64 = 1.0 / 3.0;
         let x = offset.abs();
         if x < 1.0 {
-            ((12.0 - 9.0 * B - 6.0 * C) * x * x * x + (-18.0 + 12.0 * B + 6.0 * C) * x * x
+            ((12.0 - 9.0 * B - 6.0 * C) * x * x * x
+                + (-18.0 + 12.0 * B + 6.0 * C) * x * x
                 + (6.0 - 2.0 * B))
                 / 6.0
         } else if x < 2.0 {
@@ -4403,7 +4631,11 @@ mod tests {
             }
         }
         let x = offset.abs();
-        if x >= 3.0 { 0.0 } else { sinc(x) * sinc(x / 3.0) }
+        if x >= 3.0 {
+            0.0
+        } else {
+            sinc(x) * sinc(x / 3.0)
+        }
     }
 
     /// 参考重采样：与生产**同一套几何**，但权重是 `f64`。
@@ -4485,12 +4717,7 @@ mod tests {
     fn write_comparison_png(path: &std::path::Path, width: usize, height: usize, pixels: &[u32]) {
         let mut rgba = Vec::with_capacity(width * height * 4);
         for pixel in pixels {
-            rgba.extend_from_slice(&[
-                (pixel >> 16) as u8,
-                (pixel >> 8) as u8,
-                *pixel as u8,
-                0xFF,
-            ]);
+            rgba.extend_from_slice(&[(pixel >> 16) as u8, (pixel >> 8) as u8, *pixel as u8, 0xFF]);
         }
         let file = std::fs::File::create(path).expect("建 PNG 文件");
         let mut encoder =
@@ -4506,7 +4733,7 @@ mod tests {
 
     /// 放大滤波器对比：同一张合成图案，用四种核各放大一遍，叠成一张 PNG。
     ///
-    /// 跑法：`cargo test --release -p snapclip-app --lib filter_comparison -- --ignored --nocapture`
+    /// 跑法：`cargo test --release -p snapclip-pin --lib filter_comparison -- --ignored --nocapture`
     ///
     /// 图落在 `target/filter-compare/`，**从上到下**是 nearest / triangle / mitchell /
     /// lanczos3 四条带子；最上面那条是"不滤波"的基线，另外三条都在跟它比"软化与阶梯的
@@ -4516,7 +4743,8 @@ mod tests {
     #[ignore = "出图而不是断言；用 --ignored --nocapture 手动跑"]
     fn filter_comparison_sheets() {
         let (width, height, image) = filter_comparison_pattern();
-        let filters: [(&str, f64, fn(f64) -> f64); 4] = [
+        type ReferenceFilter = (&'static str, f64, fn(f64) -> f64);
+        let filters: [ReferenceFilter; 4] = [
             ("nearest", 0.5, nearest_kernel),
             ("triangle", 1.0, triangle_kernel),
             ("mitchell", 2.0, mitchell_kernel),
@@ -4683,7 +4911,7 @@ mod tests {
         // 向上滚一格 = +120，向下 = -120。`wParam` 的高字是 `i16`。
         assert_eq!(wheel_delta((WHEEL_DELTA as usize) << 16), WHEEL_DELTA);
         assert_eq!(
-            wheel_delta(((-WHEEL_DELTA as i64 as u16 as usize) << 16) as usize),
+            wheel_delta((-WHEEL_DELTA as i64 as u16 as usize) << 16),
             -WHEEL_DELTA
         );
     }
@@ -4729,7 +4957,8 @@ mod tests {
     #[test]
     fn rounding_feathers_the_edge_instead_of_switching_it_on_and_off() {
         let (width, height, radius) = (20.0f32, 16.0f32, 6.0f32);
-        let coverage_at = |x: f32, y: f32| edge_coverage(rounded_distance(x, y, width, height, radius));
+        let coverage_at =
+            |x: f32, y: f32| edge_coverage(rounded_distance(x, y, width, height, radius));
         // 四角外那一块：距离为正，完全透明。
         for (x, y) in [(0.5, 0.5), (19.5, 0.5), (0.5, 15.5), (19.5, 15.5)] {
             assert_eq!(coverage_at(x, y), 0, "({x},{y}) 是圆角该切掉的那块");

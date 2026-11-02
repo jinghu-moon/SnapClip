@@ -71,7 +71,7 @@ function Format-Delta {
     return "$sign$([math]::Round($difference, 1))"
 }
 
-# 贴图窗口的类名，抄自 apps/snapclip/src/pin/host.rs 的 `PIN_WINDOW_CLASS`。
+# 贴图窗口的类名，抄自 crates/snapclip-pin/src/host.rs 的 `PIN_WINDOW_CLASS`。
 # 数窗口比数内存重要：内存涨了但没有窗口，和窗口还在没销毁，是两个不同的故障，
 # 而「GDI 对象数」在两者上都可能给出同一个读数。
 $pinWindowCount = 'unavailable'

@@ -1,30 +1,20 @@
-//! What the GPUI probe saves.
-//!
-//! The probe has no capture behind it, so the picture it writes is a synthetic one: a checker of
-//! two colours at a size this module names. That is a **test input**, not a number chosen to make
-//! the panel look complete — the panel shows no size for it anywhere, and the only thing the user
-//! sees about it is the file that lands on disk.
-//!
-//! Everything else here is the panel's own: the values come from the same [`PanelValues`] the
-//! direct-drawn panel builds, the weight is the same [`weigh`] that panel uses, the frame is the
-//! same [`Frame`], and the sentence for a failure is [`SaveError::message`], which already prefers
-//! the filled-in detail over the generic rule text. Nothing in this file decides anything twice.
+//! Capture data and the shared encoding/save pipeline used by the Yue save panel.
 
 use crate::save::assemble::{self, PanelValues};
 use crate::save::estimate;
 use crate::save::scale::{Frame, Size};
 use crate::save::service::{ConflictPolicy, SaveError, SaveOutcome};
-use std::sync::{Mutex, OnceLock};
 use snapclip_capture::save_format::SaveFormat;
+use std::sync::{Mutex, OnceLock};
 
 /// The size of the synthetic picture. Small on purpose: its pixels are only ever written to a file
 /// in a test, and a smaller source keeps the real-encode tests quick.
-pub const PROBE_SOURCE: Size = Size::new(64, 64);
+pub const FIXTURE_SIZE: Size = Size::new(64, 64);
 
 /// The two colours of the synthetic checker, `[blue, green, red, alpha]` like every buffer here.
 const CHECKER: [[u8; 4]; 2] = [[0x3e, 0x36, 0x32, 0xff], [0x2a, 0x24, 0x21, 0xff]];
 
-/// A picture the probe can save, and its size.
+/// A picture the panel can save, and its size.
 ///
 /// A struct rather than a bare `Vec<u8>` because [`Frame`] borrows the pixels: a function returning
 /// a `Frame` could not own them, and a caller assembling the two by hand could pass a buffer of one
@@ -36,21 +26,68 @@ pub struct Picture {
 }
 
 impl Picture {
-    /// The synthetic picture, `PROBE_SOURCE` in size.
+    /// Standalone preview accepts a real image path; otherwise it uses a clearly synthetic fixture.
+    pub fn preview_example() -> Self {
+        if let Some(path) = std::env::var_os("SNAPCLIP_YUE_IMAGE") {
+            let image = image::open(path)
+                .expect("decode SNAPCLIP_YUE_IMAGE")
+                .into_rgba8();
+            let source = Size::new(image.width(), image.height());
+            let mut bgra = image.into_raw();
+            for pixel in bgra.as_chunks_mut::<4>().0 {
+                pixel.swap(0, 2);
+            }
+            return Self::from_selection(bgra, source);
+        }
+        let source = Size::new(1200, 750);
+        let mut bgra = Vec::with_capacity(1200 * 750 * 4);
+        for y in 0..750 {
+            for x in 0..1200 {
+                let tile = x > 80 && x < 1120 && y > 80 && y < 670;
+                let pixel = if tile {
+                    if y < 130 {
+                        [54, 48, 42, 255]
+                    } else if x < 320 {
+                        [42, 36, 32, 255]
+                    } else if y > 200 && y < 500 && x > 400 && x < 1040 {
+                        [
+                            ((x - 400) * 180 / 640 + 50) as u8,
+                            ((y - 200) * 110 / 300 + 70) as u8,
+                            70,
+                            255,
+                        ]
+                    } else {
+                        [65, 58, 52, 255]
+                    }
+                } else {
+                    [
+                        (80 + x * 90 / 1200) as u8,
+                        (40 + y * 65 / 750) as u8,
+                        35,
+                        255,
+                    ]
+                };
+                bgra.extend_from_slice(&pixel);
+            }
+        }
+        Self { bgra, source }
+    }
+
+    /// The synthetic picture, `FIXTURE_SIZE` in size.
     pub fn synthetic() -> Self {
         Self {
-            bgra: checker_bgra(PROBE_SOURCE),
-            source: PROBE_SOURCE,
+            bgra: checker_bgra(FIXTURE_SIZE),
+            source: FIXTURE_SIZE,
         }
     }
 
     /// A picture whose middle is fully transparent, so a fill can be seen changing it.
     ///
-    /// Test input, like [`Self::synthetic`]: the probe never shows it, and the only place it can be
+    /// Test input, like [`Self::synthetic`]: the panel never shows it, and the only place it can be
     /// observed is the file a save writes.
     pub fn with_transparent_middle() -> Self {
-        let mut bgra = checker_bgra(PROBE_SOURCE);
-        let (w, _h) = (PROBE_SOURCE.width as usize, PROBE_SOURCE.height as usize);
+        let mut bgra = checker_bgra(FIXTURE_SIZE);
+        let (w, _h) = (FIXTURE_SIZE.width as usize, FIXTURE_SIZE.height as usize);
         for y in 16..48 {
             for x in 16..48 {
                 let at = (y * w + x) * 4;
@@ -59,7 +96,7 @@ impl Picture {
         }
         Self {
             bgra,
-            source: PROBE_SOURCE,
+            source: FIXTURE_SIZE,
         }
     }
 
@@ -106,6 +143,7 @@ pub fn checker_bgra(size: Size) -> Vec<u8> {
 /// The panel already owns this mapping ([`crate::save::window::format_of_index`]); it is called
 /// rather than repeated, because the index and the format are both small integers and a swap would
 /// write a file of the wrong kind without anything looking wrong.
+#[cfg(test)]
 pub fn format_of(index: usize) -> SaveFormat {
     crate::save::window::format_of_index(index)
 }
@@ -115,6 +153,7 @@ pub fn format_of(index: usize) -> SaveFormat {
 /// Named fields, and a function rather than a call site, for the same reason the panel has one: its
 /// two text fields are both strings, so a swap would save something entirely reasonable to the
 /// wrong place.
+#[cfg(test)]
 pub fn values<'a>(
     directory: &'a str,
     name: &'a str,
@@ -159,7 +198,7 @@ pub fn values_with<'a>(
         name,
         format,
         // The tier the view chose, turned into the recorded number in one place (`docs/42` D8), so
-        // the probe cannot describe a quality the encoder would not receive.
+        // the panel cannot describe a quality the encoder would not receive.
         quality: assemble::quality_of_tier(quality_tier),
         // What the footer's link offered, so the file that lands obeys the choice the user saw.
         conflict,
@@ -167,7 +206,7 @@ pub fn values_with<'a>(
         date,
         time,
         // The number the shell's record holds, not a fresh one: `[序号]` in the name would otherwise
-        // be the same number every time the probe is opened.
+        // be the same number every time the panel is opened.
         sequence,
         app: crate::save::window::APP_NAME,
     }
@@ -175,14 +214,14 @@ pub fn values_with<'a>(
 
 /// What the shell remembers between panels: the template, the next number and the two switches.
 ///
-/// The probe is one process, so one record is enough; it is a `static` rather than a field on the
+/// The panel is one process, so one record is enough; it is a `static` rather than a field on the
 /// view because the point of remembering is that a *second* view sees what the first one left.
 fn remembered() -> &'static Mutex<assemble::Remembered> {
     static RECORD: OnceLock<Mutex<assemble::Remembered>> = OnceLock::new();
     RECORD.get_or_init(|| Mutex::new(assemble::Remembered::default()))
 }
 
-/// The template the next probe window opens with.
+/// The template the next panel window opens with.
 pub fn remembered_template() -> String {
     remembered()
         .lock()
@@ -235,7 +274,7 @@ pub fn note_attempt<T>(result: &Result<T, SaveError>, template: &str) {
 
 /// The two switches' work after a successful save, in the panel's own order.
 ///
-/// Passed to the panel's own implementation so the order and the shell calls exist once; the probe
+/// Passed to the panel's own implementation so the order and the shell calls exist once; the panel
 /// only decides which of the two is on.
 pub fn run_after_save(after: [bool; 2], path: &std::path::Path) {
     crate::save::window::run_after_save(after, path);
@@ -246,6 +285,7 @@ pub fn run_after_save(after: [bool; 2], path: &std::path::Path) {
 /// The rule is the panel's: the link exists only while the plain name is taken (`:1149`), and the
 /// word is the *action* rather than the state in force (`:1150`), because a state reads as a
 /// statement instead of something to press.
+#[cfg(test)]
 pub fn conflict_link(
     values: &PanelValues<'_>,
     width: u32,
@@ -273,6 +313,7 @@ pub fn now() -> (String, String) {
 ///
 /// One real encode of the picture the save would write, not a model: the panel's own weighing
 /// function is used, so this number and the file cannot disagree.
+#[cfg(test)]
 pub fn weight(picture: &Picture, values: &PanelValues<'_>, output: Size) -> Option<String> {
     let frame = picture.frame(output);
     assemble::weigh(values, &frame)
@@ -289,37 +330,9 @@ pub fn save(
     assemble::save_panel(values, &picture.frame(output))
 }
 
-/// The picture as a PNG in a private temporary folder, so the preview shows a file the same encoder
-/// produced rather than a second decoding of the same pixels.
-///
-/// Encoded at the picture's own size, because the panel's preview shows the captured image and not
-/// the resized output: a preview sized to the current fields would describe a file nobody asked for.
-/// The name carries no variables, so the date, the time, the sequence and the application name are
-/// never read — they are filled with the values those fields have when nothing asks for them.
-pub fn preview_png(picture: &Picture) -> Option<std::path::PathBuf> {
-    let folder = std::env::temp_dir().join("snapclip-preview");
-    std::fs::create_dir_all(&folder).ok()?;
-    let values = PanelValues {
-        directory: folder.to_str()?,
-        name: "preview",
-        format: SaveFormat::Png,
-        quality: 0,
-        conflict: ConflictPolicy::Overwrite,
-        fill: [0xff, 0xff, 0xff],
-        date: "1970-01-01",
-        time: "0000",
-        sequence: 1,
-        app: "",
-    };
-    let size = picture.size();
-    assemble::save_panel(&values, &picture.frame(size))
-        .ok()
-        .map(|outcome| outcome.path)
-}
-
 /// The size that fits the limit, from a real encode at each candidate size.
 ///
-/// The search is the panel's own (`estimate::fit_under`), so the probe cannot shrink differently
+/// The search is the panel's own (`estimate::fit_under`), so the panel cannot shrink differently
 /// from the drawn panel. Returns nothing when no candidate fits, which is the panel's answer too:
 /// it writes no file rather than one over the limit.
 pub fn shrink_to_fit(
@@ -356,6 +369,7 @@ pub fn save_within(
 ///
 /// A save that succeeded explains nothing, and a cancelled one is not a failure: the user changed
 /// their mind, and the panel's rule (`docs/41`) is that only something to explain is drawn.
+#[cfg(test)]
 pub fn status_of(result: &Result<SaveOutcome, SaveError>) -> Option<String> {
     match result {
         Ok(_) => None,
@@ -370,7 +384,7 @@ mod tests {
     use crate::save::copy::ValidationCopy;
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("snapclip-gpui-probe-{name}"));
+        let dir = std::env::temp_dir().join(format!("snapclip-gpui-panel-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("the test can make a folder");
         dir
@@ -410,8 +424,15 @@ mod tests {
             .expect("a roomy ceiling still saves")
             .expect("and the save succeeds");
         let bytes = std::fs::read(&written.path).expect("the file is there");
-        assert!(bytes.len() as u64 <= 1024 * 1024, "the file is under the ceiling");
-        assert_eq!(png_size(&bytes), (96, 64), "a ceiling it already meets is not a reason to shrink");
+        assert!(
+            bytes.len() as u64 <= 1024 * 1024,
+            "the file is under the ceiling"
+        );
+        assert_eq!(
+            png_size(&bytes),
+            (96, 64),
+            "a ceiling it already meets is not a reason to shrink"
+        );
 
         let cramped = values(
             dir.to_str().expect("utf-8 path"),
@@ -423,7 +444,10 @@ mod tests {
             [0xff, 0xff, 0xff],
         );
         let nothing = save_within(&picture, &cramped, output, Some(16));
-        assert!(nothing.is_none(), "sixteen bytes cannot hold a png, so nothing is written");
+        assert!(
+            nothing.is_none(),
+            "sixteen bytes cannot hold a png, so nothing is written"
+        );
         let landed = std::fs::read_dir(&dir)
             .expect("the folder is readable")
             .filter_map(|entry| entry.ok())
@@ -432,11 +456,15 @@ mod tests {
         assert_eq!(landed, 0, "a ceiling nothing meets leaves no file behind");
 
         let off = save_within(&picture, &roomy, output, None).expect("no ceiling always attempts");
-        assert_eq!(off.expect("and succeeds").bytes, written.bytes, "no ceiling is the plain save");
+        assert_eq!(
+            off.expect("and succeeds").bytes,
+            written.bytes,
+            "no ceiling is the plain save"
+        );
     }
 
     #[gpui_kit::test]
-    fn the_probe_writes_the_size_and_the_format_it_was_given() {
+    fn the_panel_writes_the_size_and_the_format_it_was_given() {
         let dir = temp_dir("size");
         let picture = Picture::synthetic();
         for (index, suffix, magic) in [
@@ -446,21 +474,32 @@ mod tests {
             let format = format_of(index);
             let values = values(
                 dir.to_str().expect("utf-8 path"),
-                "probe_[日期]",
+                "panel_[日期]",
                 format,
                 "2026-10-26",
                 "0005",
-            0,
-            [0xff, 0xff, 0xff],
+                0,
+                [0xff, 0xff, 0xff],
             );
             let output = Size::new(96, 64);
-            let outcome = save(&picture, &values, output).expect("the probe can save");
+            let outcome = save(&picture, &values, output).expect("the panel can save");
             let bytes = std::fs::read(&outcome.path).expect("the file is there");
-            assert_eq!(outcome.path.extension().and_then(|e| e.to_str()), Some(suffix));
+            assert_eq!(
+                outcome.path.extension().and_then(|e| e.to_str()),
+                Some(suffix)
+            );
             assert_eq!(&bytes[..2], magic, "the file starts like a {suffix}");
-            assert_eq!(bytes.len() as u64, outcome.bytes, "the reported size is the file");
+            assert_eq!(
+                bytes.len() as u64,
+                outcome.bytes,
+                "the reported size is the file"
+            );
             if suffix == "png" {
-                assert_eq!(png_size(&bytes), (96, 64), "the file is the size the panel asked");
+                assert_eq!(
+                    png_size(&bytes),
+                    (96, 64),
+                    "the file is the size the panel asked"
+                );
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -473,7 +512,7 @@ mod tests {
         let picture = Picture::synthetic();
         let values = values(
             dir.to_str().expect("utf-8 path"),
-            "probe_[日期]",
+            "panel_[日期]",
             SaveFormat::Png,
             "2026-10-26",
             "0005",
@@ -524,10 +563,14 @@ mod tests {
     fn the_synthetic_picture_is_the_size_it_claims_and_is_opaque() {
         let picture = Picture::synthetic();
         let (pixels, size) = picture.pixels();
-        assert_eq!(size, PROBE_SOURCE);
+        assert_eq!(size, FIXTURE_SIZE);
         assert_eq!(pixels.len(), 64 * 64 * 4);
         assert!(
-            pixels.chunks_exact(4).all(|pixel| pixel[3] == 0xff),
+            pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| pixel[3] == 0xff),
             "every pixel is opaque, so a jpeg has nothing to fill"
         );
     }
@@ -541,7 +584,7 @@ mod tests {
                 ".PNG" => SaveFormat::Png,
                 ".JPG" => SaveFormat::Jpeg,
                 ".WebP" => SaveFormat::Webp,
-                other => panic!("a word the probe cannot map: {other}"),
+                other => panic!("a word the panel cannot map: {other}"),
             };
             assert_eq!(format, expected, "{word} is the format at index {index}");
         }
@@ -678,8 +721,15 @@ mod tests {
             7,
             ConflictPolicy::Overwrite,
         );
-        assert_eq!(chosen.sequence, 7, "the number the shell holds is the one the name gets");
-        assert_eq!(chosen.conflict, ConflictPolicy::Overwrite, "the choice travels with the values");
+        assert_eq!(
+            chosen.sequence, 7,
+            "the number the shell holds is the one the name gets"
+        );
+        assert_eq!(
+            chosen.conflict,
+            ConflictPolicy::Overwrite,
+            "the choice travels with the values"
+        );
 
         std::fs::write(&plain, b"last night").expect("the test can write a sentinel");
 
@@ -697,19 +747,32 @@ mod tests {
             ConflictPolicy::AutoRename,
         );
         assert_eq!(
-            conflict_link(&renaming, output.width, output.height, ConflictPolicy::AutoRename),
+            conflict_link(
+                &renaming,
+                output.width,
+                output.height,
+                ConflictPolicy::AutoRename
+            ),
             Some("改为覆盖"),
             "a taken name offers to overwrite"
         );
         assert_eq!(
-            conflict_link(&renaming, output.width, output.height, ConflictPolicy::Overwrite),
+            conflict_link(
+                &renaming,
+                output.width,
+                output.height,
+                ConflictPolicy::Overwrite
+            ),
             Some("改为重命名"),
             "an overwriting save offers to rename instead"
         );
 
         // The choice really decides what lands: renaming keeps both files and the sentinel intact.
-        let kept = save(&Picture::synthetic(), &renaming, output).expect("the probe can save");
-        assert_ne!(kept.path, plain, "a taken name is not reused while renaming");
+        let kept = save(&Picture::synthetic(), &renaming, output).expect("the panel can save");
+        assert_ne!(
+            kept.path, plain,
+            "a taken name is not reused while renaming"
+        );
         assert_eq!(
             std::fs::read(&plain).expect("the sentinel is still there"),
             b"last night",
@@ -729,7 +792,8 @@ mod tests {
             1,
             ConflictPolicy::Overwrite,
         );
-        let replaced = save(&Picture::synthetic(), &overwriting, output).expect("the probe can save");
+        let replaced =
+            save(&Picture::synthetic(), &overwriting, output).expect("the panel can save");
         assert_eq!(replaced.path, plain, "overwriting keeps the name");
         assert_ne!(
             std::fs::read(&plain).expect("the file is there"),
@@ -740,7 +804,12 @@ mod tests {
         // With the name free again the link has nothing to offer.
         std::fs::remove_file(&plain).expect("the test can remove it");
         assert_eq!(
-            conflict_link(&renaming, output.width, output.height, ConflictPolicy::AutoRename),
+            conflict_link(
+                &renaming,
+                output.width,
+                output.height,
+                ConflictPolicy::AutoRename
+            ),
             None,
             "a free name has nothing to link to"
         );
@@ -752,9 +821,17 @@ mod tests {
     #[::core::prelude::v1::test]
     fn the_preview_is_the_picture_at_its_own_size() {
         let picture = Picture::synthetic();
-        let path = preview_png(&picture).expect("encoding the preview has to succeed");
-        let bytes = std::fs::read(&path).expect("the preview file has to be readable");
-        let _ = std::fs::remove_file(&path);
+        let values = values(
+            "C:\\unused",
+            "preview",
+            SaveFormat::Png,
+            "2026-11-02",
+            "1200",
+            0,
+            [255; 3],
+        );
+        let bytes = assemble::encoded_bytes(&values, &picture.frame(picture.size()))
+            .expect("encode in memory");
         assert_eq!(
             &bytes[..8],
             &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],

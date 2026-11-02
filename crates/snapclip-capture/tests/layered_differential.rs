@@ -66,7 +66,7 @@ struct Layered {
 unsafe impl Send for Layered {}
 
 impl Layered {
-    /// 照 `apps/snapclip/src/pin/host.rs::create_pin_window` 的形状创建：
+    /// 照 `crates/snapclip-pin/src/host.rs::create_pin_window` 的形状创建：
     /// ex-style 由调用方给（对照窗口用贴图的那组），**普通样式位由 `visible_at_creation` 决定**
     /// —— 这正是本轮要单独验证的变量。
     fn new(

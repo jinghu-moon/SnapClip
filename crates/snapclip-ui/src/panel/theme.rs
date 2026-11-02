@@ -2,7 +2,7 @@
 ///
 /// The name lives here, in the lowest panel crate, so the overlay and the save panel ask for the
 /// same family; the overlay re-exports this constant rather than keeping a second copy. The
-/// embedded subset is registered under exactly this name by `snapclip-capture`'s `overlay_font`.
+/// embedded subset is registered under exactly this name by `crate::font`.
 pub const FAMILY: &str = "HarmonyOS Sans SC";
 
 /// Shared colors used by the screenshot panel and the save panel.

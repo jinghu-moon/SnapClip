@@ -28,9 +28,12 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 
-# docs/31 section 0.3 (2026-10-08). passed+ignored may only grow; failed must be 0.
+# docs/31 section 0.3 plus docs/51 (2026-11-02): 55/3 pin tests moved from app.
+# App baseline 316/9 - 55/3 = 261/6. Pin starts at its pre-move 55/3 floor.
+# The combined pre-move app floor is preserved, not reset to a smaller suite.
 $Baseline = [ordered]@{
-    'snapclip-app'     = @{ Passed = 56;  Ignored = 3 }
+    'snapclip-app'     = @{ Passed = 261; Ignored = 6 }
+    'snapclip-pin'     = @{ Passed = 55;  Ignored = 3 }
     'snapclip-capture' = @{ Passed = 347; Ignored = 7 }
     'snapclip-history' = @{ Passed = 51;  Ignored = 0 }
     'snapclip-model'   = @{ Passed = 23;  Ignored = 0 }

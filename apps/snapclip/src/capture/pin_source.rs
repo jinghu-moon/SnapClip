@@ -42,11 +42,11 @@ use std::sync::{Arc, Mutex};
 
 use snapclip_capture::artifact::SelectionPixels;
 
-use crate::pin::{PinHome, PinSelection};
+use snapclip_pin::{PinHome, PinSelection};
 
 /// 捕获侧「刚提交的选区」槽位，贴图只需要这一个能力。
 ///
-/// 定义在外壳而不是 [`crate::pin`]：这是捕获那边欠贴图的**一个**方法，不是贴图对捕获的
+/// 定义在外壳而不是 `snapclip-pin`：这是捕获那边欠贴图的**一个**方法，不是贴图对捕获的
 /// 一般依赖；把这个接口缩小到一个方法，才能让 `pin` 模块完全不认识 `snapclip-capture`。
 pub trait TakeSelection: Send + Sync + 'static {
     /// 取走最近一次提交的选区；没有就返回 `None`。
@@ -89,11 +89,10 @@ impl PinHome for PinSource {
         }
         // 这里是唯一一次拷贝：`PinSelection` 要的是自己那份 `Arc<Vec<u8>>`（贴图窗口要
         // 独立的生命周期，不能用借来的切片，而 `SelectionPixels` 会随捕获侧的槽位一起走）。
-        Some(PinSelection {
-            region,
-            pixels: Arc::new(selection.bgra.clone()),
-            radius: selection.corner_radius,
-        })
+        Some(
+            PinSelection::new(region, Arc::new(selection.bgra.clone()))
+                .radius(selection.corner_radius),
+        )
     }
 }
 
@@ -152,7 +151,7 @@ mod tests {
         let source = PinSource::new();
         source.set_home(home);
         let taken = source.take_selection().expect("槽位里有东西");
-        assert_eq!(taken.region, Rect::new(1010, 520, 1040, 550));
+        assert_eq!(taken.region(), Rect::new(1010, 520, 1040, 550));
         assert!(source.take_selection().is_none(), "第二次不该再拿到同一张");
     }
 
@@ -163,7 +162,7 @@ mod tests {
         source.set_home(home.clone());
         home.put(prepared(Some(Point::new(0, 1)), Rect::new(0, 0, 4, 4)));
         home.put(prepared(Some(Point::new(0, 1)), Rect::new(8, 8, 12, 12)));
-        assert_eq!(source.take_selection().unwrap().region, Rect::new(8, 9, 12, 13));
+        assert_eq!(source.take_selection().unwrap().region(), Rect::new(8, 9, 12, 13));
     }
 
     #[test]
@@ -188,7 +187,7 @@ mod tests {
         source.set_home(home);
         let taken = source.take_selection().expect("显示器选区必须能贴");
         // 屏幕坐标 = 显示器原点 + 帧内选区，见 `SelectionPixels::screen_region`。
-        assert_eq!(taken.region, Rect::new(1010, 520, 1040, 550));
+        assert_eq!(taken.region(), Rect::new(1010, 520, 1040, 550));
         assert_eq!(taken.bytes().len(), 30 * 30 * 4);
     }
 
@@ -206,7 +205,7 @@ mod tests {
         let taken = source
             .take_selection()
             .expect("主显示器原点 (0, 0) 是真实位置，必须能贴");
-        assert_eq!(taken.region, Rect::new(10, 20, 40, 50));
+        assert_eq!(taken.region(), Rect::new(10, 20, 40, 50));
     }
 
     fn frame(width: u32, height: u32) -> snapclip_capture::session::CapturedFrame {

@@ -6,7 +6,7 @@
 //!
 //! Rules this crate follows, because the Coding Guides make them requirements:
 //! `gpui_kit::init` runs first inside `run`, before any component-backed view exists;
-//! each window's first level is `Root`; the UI comes from `gpui_kit` alone.
+//! each window's first level is `Root`; Yue shares the shell's GPUI/Kit runtime.
 
 // Both traits are re-exported by `gpui-kit` itself (paths verified in gpui-base-0.7.1's
 // lib.rs and gpui-component-0.7.1's lib.rs), which is what the one-dependency rule wants:
@@ -15,6 +15,7 @@ use gpui_kit::base::StyledExt as _;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::{ActiveTheme, Root, Theme, ThemeMode};
 use gpui_kit::*;
+use snapclip_pin::PinManager;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,11 +24,9 @@ pub mod capture;
 pub mod clipboard;
 pub mod clipboard_ingest;
 pub mod events;
-pub mod gpui_probe;
-pub mod gpui_save;
 pub mod history;
-pub mod pin;
 pub mod save;
+pub mod save_panel;
 pub mod settings;
 pub mod startup;
 pub mod tray;
@@ -37,7 +36,7 @@ use history::model::HistoryState;
 use history::view::HistoryView;
 
 use events::EventBus;
-use startup::{subsystems, StartupOptions};
+use startup::{StartupOptions, subsystems};
 
 /// The same database and cache directories the Tauri host writes while both shells exist
 /// (docs/23 T4.9: they share only the capability crates and the data).
@@ -109,7 +108,7 @@ fn spawn_tray_commands(tray: &tray::Tray, window: &mut Window, cx: &mut Context<
 /// A 50 ms poll is deliberate. This loop costs one timer wake-up every 50 ms on the
 /// background executor, and the alternative (a Windows message to the shell's window) would
 /// add a second way to reach this state for no behavioural gain.
-fn spawn_pin_events(pins: &pin::PinManager, window: &mut Window, cx: &mut Context<Shell>) {
+fn spawn_pin_events(pins: &PinManager, window: &mut Window, cx: &mut Context<Shell>) {
     let pins = pins.clone();
     cx.spawn_in(window, async move |shell, cx| {
         loop {
@@ -168,7 +167,7 @@ pub struct Shell {
     /// The pin host: one thread that owns every pinned-image window. `None` when that
     /// thread could not be started, which is reported and survived — F5 capture does not
     /// depend on it.
-    pins: Option<pin::PinManager>,
+    pins: Option<PinManager>,
     /// Drains the capture events the overlay publishes, so a display setting changed on the size
     /// badge reaches the settings file (docs/23 §14.53). Held because dropping the task stops it.
     _label_sync: Task<()>,
@@ -209,11 +208,14 @@ impl Shell {
         let initial = settings_store.load();
         let settings = cx.new(|_| settings::SettingsView::new(settings::SettingsStore::new(&data)));
         // A saved change reaches the overlay from its next session on.
-        cx.subscribe(&settings, |this: &mut Self, _, event: &settings::SettingsChanged, _| {
-            if let Some(capture) = &this.capture {
-                capture.set_preferences(event.0.overlay_preferences());
-            }
-        })
+        cx.subscribe(
+            &settings,
+            |this: &mut Self, _, event: &settings::SettingsChanged, _| {
+                if let Some(capture) = &this.capture {
+                    capture.set_preferences(event.0.overlay_preferences());
+                }
+            },
+        )
         .detach();
         // Capture is hosted here from P6 on: F5, the overlay and the export chain belong to
         // this process, which is what lets the old Tauri shell be deleted.
@@ -287,7 +289,7 @@ impl Shell {
         // Without a capture there is no source, so pinning is not started at all: a host that
         // could never be given a picture is a thread and a hotkey that do nothing.
         let pins = match pin_source {
-            Some(pin_source) => match pin::PinManager::start(pin_source) {
+            Some(pin_source) => match PinManager::start(pin_source) {
                 Ok(pins) => {
                     spawn_pin_events(&pins, window, cx);
                     Some(pins)
@@ -308,105 +310,33 @@ impl Shell {
                     poster.post().map_err(|error| error.to_string())
                 }));
             }
-            // 用户按 `Ctrl+S` 之后：捕获侧只说"要开保存面板，并把这张选区图给你"，怎么开由这里
-            // 决定。句柄存在闭包捕获的槽里；替换走 `replace_panel`，它**先关旧的再存新的**——
-            // 顺序是契约：窗口句柄在窗口销毁后会被系统复用，先开新再关旧可能把 `WM_CLOSE`
-            // 打到刚开的那张上（那个 bug 的真机症状是"日志说已打开、人却看不见"）。
-            let save_panels: std::sync::Arc<
-                std::sync::Mutex<Option<save::window::ShellHandle>>,
-            > = std::sync::Arc::new(std::sync::Mutex::new(None));
-            // One record for every panel this shell opens: the spec remembers the name template and
-            // the number across saves (`:201`), and a panel is opened per capture, so neither can
-            // live inside a panel.
-            let save_remembered = std::sync::Arc::new(std::sync::Mutex::new(save::Remembered::default()));
-            // `SNAPCLIP_GPUI_PANEL=1` sends the capture to the framework-drawn panel instead of the
-            // drawn one. The two do not share a window: the request arrives on the capture thread
-            // and the framework runs its own, so the picture travels over a channel and the window
-            // is opened inside a task that owns the app handle.
-            if std::env::var_os("SNAPCLIP_GPUI_PANEL").is_some() {
-                let (requests, incoming) = async_channel::unbounded::<crate::gpui_save::Picture>();
-                // Detached rather than bound to a local: a task that is dropped is cancelled, and
-                // it takes the receiver with it, which is why the next save reported a closed
-                // channel instead of opening a panel. Every other task in this file is detached
-                // for the same reason.
-                cx.spawn(async move |_shell, cx: &mut AsyncApp| {
-                    while let Ok(picture) = incoming.recv().await {
-                        let opened = cx.update(|cx| {
-                            let options = WindowOptions {
-                                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
-                                    point(px(0.0), px(0.0)),
-                                    size(
-                                        px(gpui_probe::PROBE_WIDTH),
-                                        px(gpui_probe::PROBE_HEIGHT),
-                                    ),
-                                ))),
-                                titlebar: Some(TitlebarOptions {
-                                    title: Some(gpui_probe::PROBE_TITLE.into()),
-                                    ..Default::default()
-                                }),
-                                // The panel is laid out for one size (`DEMO`, 920×564) and its
-                                // content is placed rather than reflowed, so a stretched window
-                                // would show the panel in the corner of an empty frame.
-                                is_resizable: false,
-                                ..Default::default()
-                            };
-                            // The picture is taken out of a cell rather than moved in, so the
-                            // closures below stay plain borrows: a `move` closure would capture
-                            // `window` too, and it is needed again for `Root`.
-                            let pending = std::cell::RefCell::new(Some(picture));
-                            cx.open_window(options, |window, cx| {
-                                let taken = pending
-                                    .borrow_mut()
-                                    .take()
-                                    .expect("the panel window is opened once");
-                                let view = cx.new(|cx| {
-                                    gpui_probe::GpuiProbe::with_picture(taken, window, cx)
-                                });
-                                cx.new(|cx| Root::new(view, window, cx))
-                            })
-                        });
-                        if let Err(error) = opened {
-                            eprintln!("[save-panel] the framework panel did not open: {error:?}");
-                        }
+            // Capture hands pixels to the application. The Yue panel lives on the GPUI thread.
+            let (requests, incoming) = async_channel::bounded::<crate::save_panel::Picture>(1);
+            // Detached rather than bound to a local: a task that is dropped is cancelled, and
+            // it takes the receiver with it, which is why the next save reported a closed
+            // channel instead of opening a panel. Every other task in this file is detached
+            // for the same reason.
+            cx.spawn(async move |_shell, cx: &mut AsyncApp| {
+                let mut panels = save_panel::PanelWindows::default();
+                while let Ok(picture) = incoming.recv().await {
+                    let opened = cx.update(|cx| panels.open(picture, cx));
+                    if let Err(error) = opened {
+                        eprintln!("[save-panel] the framework panel did not open: {error:?}");
                     }
-                })
-                .detach();
-                events.set_save_opener(std::sync::Arc::new(move |pixels| {
-                    let width = (pixels.region.right - pixels.region.left) as u32;
-                    let height = (pixels.region.bottom - pixels.region.top) as u32;
-                    let picture = crate::gpui_save::Picture::from_selection(
-                        pixels.bgra.clone(),
-                        crate::save::scale::Size::new(width, height),
-                    );
-                    requests
-                        .try_send(picture)
-                        .map_err(|error| format!("{error}"))
-                }));
-            } else {
+                }
+            })
+            .detach();
             events.set_save_opener(std::sync::Arc::new(move |pixels| {
                 let width = (pixels.region.right - pixels.region.left) as u32;
                 let height = (pixels.region.bottom - pixels.region.top) as u32;
-                // Where the path field opens. Asked once per panel from the shell, because it is
-                // a fact about this machine rather than a constant of the design: the mockup's
-                // `C:\Users\阿伟\Desktop` (`:544`) is one person's desktop.
-                let directory = save::dirs::desktop();
-                let options = save::window::ShellOptions {
-                    preview: Some((pixels.bgra.clone(), width, height)),
-                    capture_size: Some((width, height)),
-                    remembered: save_remembered.clone(),
-                    directory: directory.clone(),
-                    ..Default::default()
-                };
-                // 先关旧、再建新、最后存 —— 顺序是契约，`replace_panel` 的文档与两条测试
-                // 写明了理由（句柄会被系统复用）。
-                save::window::replace_panel(
-                    &save_panels,
-                    || save::window::open(options).map_err(|error| format!("{error:?}")),
-                    |previous| previous.close(),
-                )?;
-                Ok(())
+                let picture = crate::save_panel::Picture::from_selection(
+                    pixels.bgra.clone(),
+                    crate::save::scale::Size::new(width, height),
+                );
+                requests
+                    .try_send(picture)
+                    .map_err(|error| format!("{error}"))
             }));
-            }
         }
         Self {
             history,
@@ -430,7 +360,10 @@ impl Shell {
     /// updated, and the page's own `SettingsChanged` subscriber hands it back to capture for the
     /// next session — one path for both places the setting can be changed from.
     fn adopt_overlay_label(&mut self, cx: &mut Context<Self>) {
-        let Some(preferences) = self.capture.as_ref().and_then(|capture| capture.preferences())
+        let Some(preferences) = self
+            .capture
+            .as_ref()
+            .and_then(|capture| capture.preferences())
         else {
             return;
         };
@@ -469,7 +402,7 @@ impl Shell {
     ///
     /// Read by whoever needs to know pins are reachable at all; holding the value is what
     /// keeps the pin host thread alive, the same way [`Self::tray`] keeps the icon alive.
-    pub fn pins(&self) -> Option<&pin::PinManager> {
+    pub fn pins(&self) -> Option<&PinManager> {
         self.pins.as_ref()
     }
 }
@@ -591,46 +524,18 @@ pub fn run(options: StartupOptions) {
             // MUST be first: component-backed views need the component runtime.
             gpui_kit::init(cx);
 
-            // The panel under comparison is dark, so the probe has to be dark too or the eye is
-            // comparing two themes rather than two renderers. The framework switches wholesale
-            // (`Theme::change`), and the call is inside the probe's own branch: a run without the
-            // variable keeps whatever theme the shell already has.
-            let probe = std::env::var_os("SNAPCLIP_GPUI_PROBE").is_some();
-            if probe {
+            let preview = std::env::var_os("SNAPCLIP_YUE_PREVIEW").is_some();
+            if preview {
                 Theme::change(ThemeMode::Dark, None, cx);
             }
+            let dark = cx.theme().mode == ThemeMode::Dark;
+            save_panel::init(cx, dark);
 
             cx.spawn(async move |cx| {
-                // The GPUI probe replaces the shell rather than sitting beside it: it answers a
-                // separate question, and two windows would ask the eye to compare two things
-                // instead of one. Unset, this branch is not taken and the shell is untouched.
-                if probe {
-                    // The panel is laid out for one size (`DEMO`, 920×564), and its content is
-                    // placed rather than reflowed: a window the user can stretch would show the
-                    // same content in the top-left of a larger frame. So it is not resizable,
-                    // which also greys out the maximize button.
-                    let probe_options = WindowOptions {
-                        window_bounds: Some(WindowBounds::Windowed(Bounds::new(
-                            point(px(0.0), px(0.0)),
-                            size(px(gpui_probe::PROBE_WIDTH), px(gpui_probe::PROBE_HEIGHT)),
-                        ))),
-                        titlebar: Some(TitlebarOptions {
-                            title: Some(gpui_probe::PROBE_TITLE.into()),
-                            ..Default::default()
-                        }),
-                        is_resizable: false,
-                        ..Default::default()
-                    };
-                    cx.open_window(probe_options, |window, cx| {
-                        let probe = cx.new(|cx| gpui_probe::GpuiProbe::new(window, cx));
-                        cx.new(|cx| Root::new(probe, window, cx))
-                    })
-                    .expect("failed to open the GPUI probe window");
-                    eprintln!(
-                        "[gpui-probe] opened {}x{}: type Chinese in the field, then Tab",
-                        gpui_probe::PROBE_WIDTH,
-                        gpui_probe::PROBE_HEIGHT
-                    );
+                if preview {
+                    let picture = save_panel::Picture::preview_example();
+                    cx.update(|cx| save_panel::PanelWindows::default().open(picture, cx))
+                        .expect("open Yue save panel");
                     return;
                 }
                 // A fixed 360×640 window with a real title: the title is what the taskbar and

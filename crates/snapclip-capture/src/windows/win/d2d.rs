@@ -58,7 +58,7 @@ use crate::geometry::{
     magnifier_geometry,
 };
 use crate::keymap::LoupeHint;
-use crate::overlay_font;
+use snapclip_ui::font as overlay_font;
 use crate::ring_contrast::{
     ACCENT_RGB, CAPTURE_RGB, CHAIN_RING_RGB, CHAIN_RING_SHADOW, HOVER_WASH_ALPHA, MASK_ALPHA,
     MASK_RGB, MASK_TINT_ALPHA, PREVIEW_WASH_ALPHA, PREVIEW_WASH_WALK_SCALE, Rgb, mix,
