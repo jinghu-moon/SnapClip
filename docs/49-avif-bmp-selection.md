@@ -1,4 +1,4 @@
-> **当前生产状态更正（2026-11-04）**：本文末尾的 AVIF 研究／实测不代表当前 GPUI 保存路径已经接入。当前 `SaveFormat` 只有 PNG/JPEG/WebP/BMP，App 和 Pin 没有 `zenavif` 生产依赖；HDR 导出仅放行 PNG16。新加入的可选 CPU 探针已确认固定候选的 10 位 Identity/RGB 解码数值失败，同一生成文件经独立 FFmpeg 解码正确；不能把历史“研究可用”推导为 HDR 可用。历史测量保留作研究记录，当前编解码、许可和 HDR 门禁见 `docs/53-hdr-capture.md` §20、§24 及 [候选验证报告](../tools/codec-bench/HDR-AVIF.md)。
+> **当前生产状态更正（2026-11-04）**：本文末尾的 AVIF 研究／实测不代表当前 GPUI 保存路径已经接入。当前 `SaveFormat` 只有 PNG/JPEG/WebP/BMP，App 和 Pin 没有 `zenavif` 生产依赖；HDR 导出仅放行 PNG16。可选 CPU 探针已修复固定候选的 Identity/GBR 解码、16 位编码平面顺序及 ICC/nclx 顺序问题，48 组独立格式矩阵通过，但整帧资源仍超过既有预算；不能把历史“研究可用”推导为 HDR 可用。历史测量保留作研究记录，当前编解码、许可和 HDR 门禁见 `docs/53-hdr-capture.md` §20、§24、§26 及 [候选验证报告](../tools/codec-bench/HDR-AVIF.md)。
 >
 > 历史研究结论：**BMP 自己写**（零依赖、可流式、预览免费）；**AVIF 的研究实现可用**（当时使用 `zenavif` 纯 Rust，编码与解码均有实测）。
 > **`zenavif` 的存在推翻了本文早期「解码必须引入 dav1d」的判断** —— 见文末「更正与实测」。

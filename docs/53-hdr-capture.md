@@ -1,6 +1,6 @@
 # 53 · HDR 捕获、母版、保存面板与贴图接入方案
 
-初次设计：2026-11-03；更新：2026-11-04。状态：**源像素与母版、WGC/D2D 内部高精度链路、输出能力快照、生产滚动来源合同、HDR PNG16、保存面板策略、F3/F6 共用 GPUI/Yue、SDR/HDR 复制、历史保真源、有界导出与登记失败恢复已分批实现。** F6 旧 GDI 宿主已删除，Pin 保留 FP16/scRGB 原始 Arc；当前证据和边界见 §12～§25。Release 4K/45MP CPU 归档／导出及 20 次原生窗口释放／空闲渲染已验证；workspace 两种模式的 all-targets strict Clippy 已通过。AVIF 已补独立 CPU 探针，候选 Identity/RGB 解码数值失败，尚未生产接线；真实 HDR/双屏/DPI/设备恢复、VRAM 及端到端性能仍未验收；**生产 HDR 捕获门禁保持关闭，不代表完整支持 HDR。**
+初次设计：2026-11-03；更新：2026-11-04。状态：**源像素与母版、WGC/D2D 内部高精度链路、输出能力快照、生产滚动来源合同、HDR PNG16、保存面板策略、F3/F6 共用 GPUI/Yue、SDR/HDR 复制、历史保真源、有界导出与登记失败恢复已分批实现。** F6 旧 GDI 宿主已删除，Pin 保留 FP16/scRGB 原始 Arc；当前证据和边界见 §12～§26。Release 4K/45MP CPU 归档／导出及 20 次原生窗口释放／空闲渲染已验证；workspace 两种模式的 all-targets strict Clippy 已通过。AVIF 已修复 Identity/GBR 解码、16 位彩色编码及 ICC 顺序问题，独立 CPU 格式矩阵通过；整帧资源预算仍失败，尚未生产接线；真实 HDR/双屏/DPI/设备恢复、VRAM 及端到端性能仍未验收；**生产 HDR 捕获门禁保持关闭，不代表完整支持 HDR。**
 
 通用像素、色彩、GPUI／Windows输出、依赖选择及官方资料统一见相邻Yue仓库的 [27 · Windows HDR图片与显示管线](../../GPUI-Yue-Component/docs/27-hdr-pipeline.md)。本文只定义SnapClip的业务和迁移，不复制第二套HDR框架。
 
@@ -768,6 +768,8 @@ cargo test -p snapclip-app --lib capture::artifact_writer::tests --locked --offl
 
 ## 24. AVIF 的软件资格验证及确定的数值阻塞（2026-11-04）
 
+**接续状态：本节保留首次失败基线；Identity 解码和新发现的彩色编码／ICC 顺序问题已在 §26 修复并回归。数值门槛通过，整帧资源门槛仍失败，AVIF 未生产接线。**
+
 §20 的“尚无候选证据”已继续推进，范围仅为 CPU 探针，**不是 AVIF 生产功能完成**。详细固定版本、feature、官方包 hash／许可证声明、输入、数值门禁、来源与复现步骤见 [HDR-AVIF.md](../tools/codec-bench/HDR-AVIF.md)。
 
 - 仅 `codec-bench` 的 opt-in `hdr-avif-probe` feature 增加 `zenavif =0.1.6`。App 的实际 normal 依赖图没有候选包，Yue／Pin／Capture 不增加 codec 接线。更新 lock 时保留原包版本，没有夹带 GPUI 或其他已有依赖升级。
@@ -812,3 +814,69 @@ cargo test -p snapclip-app --lib capture::artifact_writer::tests --locked --offl
 四条路径完整整图分配均为 **0**，两项用例各 **1 passed**；原 32 MiB 堆增量和 16 MiB 最大单次分配断言保持。Rust 堆数值与 §22 相同；四项单次耗时相对 §22 变化约 -1.14%～+1.52%，不足以据此宣称吞吐改善或退化。日志 `target/hdr-recovery-{4k,45mp}.log`，命令同 §21.1。
 
 这是合成行带的 CPU 归档／导出结果，working set 为 5ms 采样，仍不代表应用总内存、VRAM、真实照片吞吐、HDR 显示或端到端首帧。剩余软件工作是 §24 的 AVIF 解码数值／格式与资源资格验证；剩余实机工作仍按 §22.4 的矩阵推进，生产 HDR 捕获门禁继续关闭。
+
+## 26. AVIF 根因修复、完整小图矩阵与大图资源证据（2026-11-04）
+
+### 26.1 修改前后及边界
+
+继续按无需实机的范围执行；没有启动真实产品窗口、切换 HDR／DPI、读取系统剪贴板或提交本地 HDR-IMAGES。修改在消费者开发工具及其隔离 codec 依赖，未触碰并行 Yue 虚拟列表／图片资源测试工作。
+
+| 路径 | 真实失败基线 | 修复后 |
+| --- | --- | --- |
+| 10 位 Identity 解码 | 原黑色 `[0,0,0,32800]`→`[0,34721,0,32800]`；新增单元测试实际失败 | 8/10/12 位 GBR 直接读取，不进入 BT.601；原灰阶/PQ/Alpha 误差均 0 |
+| 16 位 RGB/RGBA 编码 | 4K 回读最大误差 768.011/1023；彩色单元测试首像素 `[0,16400,32800]`→`[32800,0,16400]` | 交给 raw-plane 接口的顺序改为 G/B/R；两个彩色入口和独立 libdav1d 回读所有通道误差均 0 |
+| ICC+nclx 双属性 | nclx 在前时 ICC 长度变成 0，nclx 在后时 ICC 保留；实际退出 1 | ICC 优先级不依赖 primary association 顺序，原 612 B ICC 与原始像素逐字节保留；matrix/range 继续取 AV1 位流 |
+| 编码额外副本 | RGB16／RGBA16 先构造完整 RGB 数组，RGBA 另构造 Alpha 数组 | 改为有序迭代器；仍有完整输入与 codec 内部帧，不声称流式完成 |
+
+没有改变原 `2/1023`、PQ 亮度 `max(0.02 nit,3%)` 门槛，没有删除旧断言或新增 allow/ignore。原灰阶 fixture/hash 保持不变；新彩色用例不跳过 Alpha=0 的隐藏 RGB，另验证两种编码入口的行 stride、padding 和输入不可变性。源码来自原固定发布包，补丁受仓库版本管理，不修改 Cargo registry。
+
+`vendor/zenavif 0.1.6` 保留 AGPL／商业双许可，`vendor/zenavif-parse 0.6.2` 保留 MPL-2.0。原版本和其他依赖不变，lock 仅将这两个包转为根 patch；原包 SHA-256／本地补丁 hash／实际修改文件均登记在 `tools/codec-bench/hdr-avif-sources.json`，`check-hdr-codec-vendor.py` 校验 80 份文件和补丁，Windows checkout 保留原字节。`Cargo tree -p snapclip-app -e normal` 无这组候选包；MIT Yue、App／Pin 的默认生产依赖和 PNG16 格式门禁均不变。详见 [候选报告](../tools/codec-bench/HDR-AVIF.md)及 [vendor 维护说明](../vendor/SNAPCLIP-PATCHES.md)。
+
+### 26.2 实际执行的数值／格式检查
+
+- `hdr-avif-probe`：**7 passed**，包含 2 项复用 allocator 测试、原 PQ 参考和盒边界、真实失败后修复的灰阶／彩色，以及两个编码入口的 stride／输入所有权测试。
+- `verify-hdr-avif.py`：原灰阶、RGB16 彩色、RGBA16 彩色三份独立 libdav1d 回读，RGB／辅助 Alpha 的最大码值误差都为 **0**；原 PQ 亮度误差 0。
+- `verify-hdr-avif-matrix.py`：**48 组通过**，8/10/12 位 × Identity/BT.709/BT.601/BT.2020-NCL × full/limited × 有/无 Alpha，37×19 非对齐尺寸；独立 libaom 无损生成，每个像素都比较，统一 **≤2 个原生码值**。YUV 与数学参考、libdav1d+zimg 对照；Identity 原生 GBR 必须与输入完全相等，再显式范围归一化，避免把 zimg 对 RGB 的 full-range 假设当作 limited-range 转换。
+- `verify-hdr-avif-metadata.py`：**3 项结构编辑器测试＋2 种双 colr 顺序通过**。真实修改 `meta/ipco/ipma/iloc` 的尺寸、关联和绝对偏移，不以任意子串或只有 ICC 的文件冒充双属性。
+- 原有开始／第 3 个 check 的取消、损坏／截断／像素预算拒绝均保留并通过。CLI 用有界 4 MiB worker stack 解决 Windows 主线程 1 MiB 栈下 debug AV1 调用栈溢出，未用崩溃结果冒充颜色失败。
+- 显式 feature all-targets strict Clippy `--no-deps -- -D warnings` 通过。锁定 magetypes 的弃用构造改成对应 `_t` API，没有屏蔽告警。
+
+可复现入口 `tools/test-hdr-avif.ps1` 默认完成来源、单元、严格 lint、Release、独立编码像素、双属性与 48 组矩阵；`-Resources` 加两种尺寸测量，`-EnforceStreamingBudget` 执行原资源限额。隔离本轮的调用为：
+
+```powershell
+.\tools\test-hdr-avif.ps1 `
+  -TargetDir C:/Users/seeyuer/AppData/Local/Temp/snapclip-hdr-avif-target `
+  -CargoConfig target/hdr-isolated.toml
+
+# 当前应明确失败，而非通过增加内存预算放行：
+.\tools\test-hdr-avif.ps1 `
+  -TargetDir C:/Users/seeyuer/AppData/Local/Temp/snapclip-hdr-avif-target `
+  -CargoConfig target/hdr-isolated.toml -EnforceStreamingBudget
+```
+
+当前机器使用 FFmpeg 8.1.1 的 libaom/libdav1d/zscale。需要这组外部验证工具，缺少能力时明确失败，不退回同一候选库自证。数值日志 `target/hdr-avif-final-suite.log`；每组夹具、SHA-256 和误差记录在 `target/hdr-avif-{fixtures,matrix}/`。修复前证据分别为 `hdr-avif-encoder-red.log`、`hdr-avif-metadata-red.log` 及 §24 的灰阶反例。
+
+### 26.3 Release 大图实际测量及未通过的门槛
+
+两个独立进程生成色块图，每个像素检查 RGBA 回读，不读取用户大图。输入为完整 RGBA16 数组，4K **66,355,200 B**、45MP **363,528,192 B**；堆增量以这份输入常驻后为基线，不能把它排除后称作总内存。进程 peak working set 由父进程每 5ms 查询 OS 当前值／进程峰值，包含输入、分配器保留和取消运行。
+
+| 尺寸／阶段 | 耗时 | Rust 堆增量峰值 | 最大单次分配 |
+| --- | ---: | ---: | ---: |
+| 3840×2160 编码 | 2373.711ms | 181,482,168 B | 18,837,504 B |
+| 3840×2160 解码 | 102.727ms | 217,589,078 B | 66,355,200 B |
+| 8256×5504 编码 | 12565.640ms | 912,643,264 B | 95,969,280 B |
+| 8256×5504 解码 | 573.228ms | 1,176,053,968 B | 363,528,192 B |
+
+两种尺寸全部像素最大误差 **0**；编码文件 **74,907／418,618 B**。完整进程 peak working set **298,115,072／1,554,968,576 B**。这不是照片压缩率、VRAM、真实截图或端到端应用吞吐。
+
+10ms deadline 下，运行中编码／解码分别在 **67.723／50.770ms**（4K）及 **368.576／277.428ms**（45MP）返回取消，均至少有一次成功 check 后才触发取消。它们证明取消后返回错误，没有证明 10ms 内中断；managed AV1 frame 调用没有 Stop 参数，当前必须等该帧完成后的检查点。每行 GBR 转换的可取消性不能解决已经进入的整帧 AV1 调用。
+
+因此，既有 **32 MiB 额外堆／16 MiB 单次分配**预算在两种尺寸都**失败**。`-EnforceStreamingBudget` 完成两种测量后明确退出 **1**，结果 JSON 中 `fits_streaming_budget=false`，没有放宽预算或把诊断程序退出 0 当成生产资源合格。数值通过和资源失败分开记录；§21／§25 的 PNG16 有界归档／导出预算未变。
+
+### 26.4 相关既有功能回归及接续
+
+冻结 Yue 的依赖配置保持原样，回归日志前缀 `target/hdr-avif-workspace-`：workspace ordinary lib **1226 passed**（App 288、Capture 568、Clipboard 13、History 46、Model 31、Pin 59、UI 221）；App／Pin headless **311／71 passed**；UI／regression baseline **10／2 passed**；History **66**；默认 codec-bench／icon-bake **28／7 passed**。普通和 headless 两组 workspace all-targets strict Clippy、第一方 fmt／diff 均通过，原 ignored 项保留。第三方原包中的 LICENSE／两个 examples 行尾空白及合法 unified-diff 空白 context 均逐项确认并保留原字节，用来源＋补丁校验而非全量清洗；没有增加 whitespace allow。没有把同一子进程或共享测试跨可执行程序重复计入生产测试总数。
+
+**仍未完成的软件工作**：有界 AVIF tile/grid 或另一确定候选的实际高位深／ICC／Alpha 行带接线、资源和运行中取消验收，以及其后的生产导出／预览／原子保存合同。现有 API 的全图输入＋完整输出在空间上随像素数增长，加线程或改变 UI 无法消除这个事实；下一步须先证明可按有限 tile/band 处理，不能用隐藏继续运行的任务或丢弃结果宣称取消。
+
+AVIF、生产 HDR 捕获入口继续关闭。真实 HDR／跨屏／DPI／设备恢复／实际剪贴板接收方仍按 §22.4 验收；本节已经完成的 CPU 格式矩阵与资源诊断不依赖实机，也不能替代那些显示层证据。
