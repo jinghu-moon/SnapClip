@@ -1,6 +1,6 @@
 # 53 · HDR 捕获、母版、保存面板与贴图接入方案
 
-初次设计：2026-11-03；更新：2026-11-04。状态：**源像素与母版、WGC/D2D 内部高精度链路、输出能力快照、生产滚动来源合同、HDR PNG16、保存面板策略、F3/F6 共用 GPUI/Yue、SDR/HDR 复制、历史保真源、有界导出与登记失败恢复已分批实现。** F6 旧 GDI 宿主已删除，Pin 保留 FP16/scRGB 原始 Arc；当前证据和边界见 §12～§27。Release 4K/45MP CPU 归档／导出及 20 次原生窗口释放／空闲渲染已验证；workspace 两种模式的 all-targets strict Clippy 已通过。AVIF 的 CPU 格式矩阵和有界 grid/Alpha/ICC 资格验证通过，包括 4K/45MP 合成色块、噪声超限拒绝及运行中取消；整帧预算仍失败，grid 仍有 4 MiB payload／5 MiB 文件限制，尚未生产接线。真实 HDR/双屏/DPI/设备恢复、VRAM 及端到端性能仍未验收；**生产 HDR 捕获门禁保持关闭，不代表完整支持 HDR。**
+初次设计：2026-11-03；更新：2026-11-04。状态：**源像素与母版、WGC/D2D 内部高精度链路、输出能力快照、生产滚动来源合同、HDR PNG16、保存面板策略、F3/F6 共用 GPUI/Yue、SDR/HDR 复制、历史保真源、有界导出与登记失败恢复已分批实现。** F6 旧 GDI 宿主已删除，Pin 保留 FP16/scRGB 原始 Arc；当前证据和边界见 §12～§28。Release 4K/45MP CPU 归档／导出及 20 次原生窗口释放／空闲渲染已验证；workspace 两种模式的 all-targets strict Clippy 已通过。AVIF 的 CPU 格式矩阵、有界 grid/Alpha/ICC 及真实 BandSource／SCPX 行带资格验证通过，包括 4K/45MP 逐行转换、来源变化／损坏拒绝和运行中取消；整帧预算仍失败，grid 仍有 4 MiB payload／5 MiB 文件限制，尚未生产接线。真实 HDR/双屏/DPI/设备恢复、VRAM 及端到端性能仍未验收；**生产 HDR 捕获门禁保持关闭，不代表完整支持 HDR。**
 
 通用像素、色彩、GPUI／Windows输出、依赖选择及官方资料统一见相邻Yue仓库的 [27 · Windows HDR图片与显示管线](../../GPUI-Yue-Component/docs/27-hdr-pipeline.md)。本文只定义SnapClip的业务和迁移，不复制第二套HDR框架。
 
@@ -943,9 +943,76 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/test-hdr-avif.ps1 `
 
 接续顺序：
 
-1. 将资格工具的像素回调接到现有 `BandSource`／母版行带，明确 RGBA16 与 FP16/scRGB→目标编码的颜色合同；不能为接线重新整帧展开。
+1. 将资格工具的像素回调接到现有 `BandSource`／母版行带，明确 RGBA16 与 FP16/scRGB→目标编码的颜色合同；不能为接线重新整帧展开。此项后续已按 §28 完成开发工具接线，生产导出开关仍未开放。
 2. 以磁盘后备或真正流写移除累计压缩 Vec 的 4 MiB 限制；sink、临时文件、取消及原子发布共用现有保存合同。不能直接增大上限代替有界设计。
 3. 补高复杂度真实输入、敌意元数据的分配预算、更多合法 grid／Alpha 布局和端到端 ICC→scRGB；当前几类明确拒绝不等于通用 AVIF 兼容性完成。
 4. 完成生产许可交付与导出／预览／错误／原子保存接线，再谈产品格式放行。真实 HDR／跨屏／DPI／VRAM 继续是独立实机验收。
 
 本批缩小的是尚未完成的软件范围，**没有完成生产 AVIF 或完整 HDR 支持**。
+
+## 28. AVIF 接入真实行带与 SCPX 母版（2026-11-04）
+
+### 28.1 来源、颜色与内存合同
+
+新增开发工具 `tools/codec-bench/src/avif_bands.rs`，直接消费既有 `snapclip_capture::ports::BandSource`，并用同一入口读取 `snapclip_history::pixel_master::PixelMaster`。没有新增产品 crate 或应用 AVIF 依赖。编码核心改为可失败的 tile provider；读取失败、来源变化、颜色超限或取消都会返回错误，不交付部分压缩结果。
+
+- 输入必须是绝对 FP16/scRGB，1.0=80 nit；拒绝把 relative LinearSrgb 或 BGRA8 当作 HDR。
+- 固定 source descriptor、generation 和总行数，每次读取前后及完成时核对。按请求尺寸验证紧密像素长度、有限浮点和 Alpha 范围；`PixelMaster` 仍校验原文件 fingerprint 和触及块的 hash。
+- Model 新增零输出分配的 `rec2020_pq16_pixels`。PNG16 与 AVIF 共用同一转换：预乘 Alpha 只解除一次，Rec.709/scRGB 转 Rec.2020，再做绝对 PQ 编码，Alpha 始终为线性 coverage。范围外的色彩明确失败，不能裁剪源母版。
+- 转换后的字节仅声明 Rec.2020/PQ/Identity/full-range，不附加已经不再描述这些像素的源 ICC。本批没有完成通用外部 ICC→scRGB 解码。
+- 源读取单次请求最多 **1 MiB**；缓存最多一条 128 行 PQ16 色带，单分配严格小于 **16 MiB**。每个实际源行只读取一次用于 BandSource 转换；SCPX 底层可能为相邻请求重复解压同一 4 MiB 存储块。大图不整帧展开，不能把小 fixture 的整图比较推广为任意大图路径。
+- 仍保留 §27 的 128×128 tile、4096 块、64 Mi 像素、4 MiB payload／5 MiB 容器限制。极宽图若超过色带单分配预算会在读像素前拒绝；没有抬高资源门槛。
+
+取消在源读取前后、逐行颜色转换、tile 编解码及最终返回处检查。既有同步 `BandSource::read_rows`／SCPX 文件校验与单个存储块解压本身不能在内部中断；不能把行间检查声称为任意 I/O 的硬实时取消。
+
+### 28.2 修改前后与独立数值验证
+
+修改前 Model／History lib **31／46 passed**，AVIF 探针 **17 passed**；资格输入仅能按坐标合成 RGBA16，无法报告真实源读取错误。修改后 Model **32 passed**、探针 **27 passed**；原 17 项保留，新增 10 项验证真实行带／母版、边缘 padding、预乘与透明零值、来源 generation／descriptor／高度变化、读失败／错误长度／NaN／非法 Alpha／不可表达色、开始／读后／已有压缩块后的取消、损坏母版及 tile provider 错误。关闭和错误均保留原母版。
+
+133×257 fixture 横跨 2 列×3 行 tile，含 80／1000／10000 nit、可表达的负 scRGB和彩色透明像素。从 BandSource 和 SCPX 读取生成的 AVIF **逐字节相等**，母版元数据／末行 bits／原文件逐字节保持。
+
+`tools/verify-hdr-avif-bands.py` 读取原始 FP16 文件，用独立 PQ 公式与另写的色域矩阵计算参考值。两条路径均由 FFprobe 报告完整网格，再由 libdav1d 解全部 **12** 条颜色／Alpha 流；与候选解码逐字节相等。最大 RGB 误差 **0.433813/1023**，Alpha **0.507324/1023**；原 **≤2/1023** 门槛不变。独立 EOTF／逆矩阵重建后的 scRGB 最大误差 **0.017489**，在原两码值经 EOTF 和色域变换传播的误差包络内，负 scRGB 未被裁掉。这是 PQ10 量化导出，不是 FP16 无损往返。
+
+共享颜色错误现在使用格式无关的 `outside Rec.2020/PQ range`。首次 workspace 回归暴露一条测试仍匹配 `outside HDR PNG`；只同步该文案断言，保留拒绝导出、旧目标逐字节不变、partial 清理和源 bits 断言。首次失败证据保留在 `target/hdr-avif-bands-before-error-wording.log`。
+
+### 28.3 Release 资源与耗时
+
+以下使用现有单线程 quality/alpha quality=100、speed=10；输入逐行生成，不预先分配整幅 FP16。每种尺寸在独立进程运行，仍执行 **32 MiB 额外堆峰值／16 MiB 单次分配**硬门槛。主流程包含真实 `CaptureArtifactStore::write_pixel_master`、`PixelMaster::open` fingerprint 校验、按行读取及 AVIF 编解码。仅小 fixture 独立比较会整图合成。
+
+| 尺寸／阶段 | 耗时 | 额外堆峰值 | 最大单次分配 |
+| --- | ---: | ---: | ---: |
+| 3840×2160 行带编码 | 5178.072ms | 8,445,028 B | 3,932,160 B |
+| 3840×2160 SCPX 写入 | 71.328ms | 4,661,642 B | 4,177,920 B |
+| 3840×2160 母版打开并编码 | 5194.427ms | 10,901,130 B | 4,177,920 B |
+| 3840×2160 逐块解码 | 111.932ms | 2,260,215 B | 487,134 B |
+| 8256×5504 行带编码 | 27586.169ms | 15,518,984 B | 8,454,144 B |
+| 8256×5504 SCPX 写入 | 373.917ms | 4,644,741 B | 4,161,024 B |
+| 8256×5504 母版打开并编码 | 28577.646ms | 17,395,851 B | 8,454,144 B |
+| 8256×5504 逐块解码 | 938.914ms | 5,566,099 B | 2,666,047 B |
+
+两种尺寸分别完整检查 **8,294,400／45,441,024** 像素，RGBA 最大误差 **0.499519/1023**；文件 **487,134／2,666,047 B**。源读取最大请求 **1,044,480／990,720 B**；进程 peak working set **26,935,296／35,844,096 B**，包含准备、压缩数据和分配器保留。原有合成 grid 成功／噪声拒绝路径也重新通过，原堆门槛不变。
+
+10ms deadline 在行带转换已开始后于 **10.273／10.604ms** 返回，两者都有真实源读取与成功 Stop 检查；另有真实 SCPX 读取后取消的确定性回归。它不包括把不可中断的 `PixelMaster::open` 当成可取消操作。耗时为单次 CPU 资格测量；首个 4K 阶段与 workspace 回归部分并行，不用于宣称吞吐改善。45MP 编码约 28 秒，**内存合格不等于交互延迟已合格**；生产延迟仍需剖析和端到端验收。
+
+复现完整入口：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/test-hdr-avif.ps1 `
+  -TargetDir C:/Users/seeyuer/AppData/Local/Temp/snapclip-hdr-avif-target `
+  -CargoConfig target/hdr-isolated.toml `
+  -Ffmpeg C:/A_Softwares/MSYS2/ucrt64/bin/ffmpeg.exe -GridResources -BandResources
+```
+
+Windows PowerShell **5.1** 入口退出 **0**，保留原 48 组矩阵、独立 grid/ICC、噪声拒绝并默认执行新的独立 FP16 行带检查；最后补入的 SCPX 读后取消回归另跑探针，最终 **27 passed**、opt-in all-targets strict Clippy 干净。日志 `target/hdr-avif-bands-full-suite.log`、`target/hdr-avif-bands-final-tests.log`，资源 JSON `target/hdr-avif-bands-resources/summary.json`。
+
+### 28.4 回归及剩余软件合同
+
+本批使用同一冻结 Yue 配置；workspace ordinary lib **1227 passed**（Model 多 1 项），App／Pin headless **311／71**，UI／基线 **10／2**，History **66**，默认工具 **28／7**。ordinary／headless all-targets strict Clippy、opt-in strict Clippy、fmt 和第一方 diff 均通过。保留原 ignored 项；未运行真实窗口、GPU、系统剪贴板或显示设置测试。
+
+下一步仍是明确的软件工作：
+
+1. 使用磁盘后备／真正流写替代压缩 Vec，移除 4 MiB 限制而不增加堆门槛；复用临时文件、取消和原子发布合同。
+2. 验证高复杂度真实输入、敌意元数据分配、更多合法 grid／Alpha 布局和外部 ICC→scRGB；当前只保证所列合同。
+3. 完成许可交付、生产导出／预览／保存错误接线与 CPU 耗时剖析，再讨论放行产品格式。真实 HDR／跨屏／DPI／VRAM 继续独立验收。
+
+本批完成真实来源的开发资格接线，**未开放生产 AVIF 或生产 HDR 捕获**。

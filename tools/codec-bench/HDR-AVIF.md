@@ -1,6 +1,6 @@
 # HDR AVIF 候选的 CPU 资格验证
 
-2026-11-04。**当前结论：CPU 像素和 48 组格式矩阵通过；新增有界 grid／Alpha／ICC 资格路径，独立解码已交叉核对。整帧候选仍超预算；grid 的压缩文件上限与尚未完成的生产合同见文末和消费者方案 §27，不接入生产。** 应用仍仅提供已验证的 HDR PNG16；MIT Yue 不新增这些编解码依赖。颜色正确、资源合格、真实显示验收是三个独立条件。
+2026-11-04。**当前结论：CPU 像素和 48 组格式矩阵通过；有界 grid／Alpha／ICC 及真实 BandSource／SCPX 行带资格路径均已独立核对。整帧候选仍超预算；grid 的压缩文件上限与尚未完成的生产合同见文末和消费者方案 §27～§28，不接入生产。** 应用仍仅提供已验证的 HDR PNG16；MIT Yue 不新增这些编解码依赖。颜色正确、资源合格、真实显示验收是三个独立条件。
 
 ## 固定的候选与来源
 
@@ -111,7 +111,7 @@ Rust/Cargo 1.98.1、Windows x86_64 MSVC、Release：
 
 `avif_grid.rs` 使用 **128×128** 原始 tile 和借用式逐块 sink，不创建完整原始输入／输出。parser 读取实际 grid item 描述和对应 Alpha；managed decoder 在提交 codec 前核对块尺寸／位深，裁切边缘，并返回实际 10 位／4:4:4 信息。`new_with_stop` 把取消传到网格构建；索引和已开始的 tile 编解码分别实测。默认 parser 仍为 1000 块，只有资格调用显式设置 4096 块。
 
-压缩数据仍有 **4 MiB payload／5 MiB 文件**上限，ICC 64 KiB；超过就明确失败。编码器和 decoder 只在这个资格合同内声明有界，尚未接到真实母版行带／生产原子保存，也不是任意大 AVIF 文件流式方案。
+压缩数据仍有 **4 MiB payload／5 MiB 文件**上限，ICC 64 KiB；超过就明确失败。编码器和 decoder 只在这个资格合同内声明有界。本节完成时尚未接到真实母版行带，接续见下；生产原子保存仍未接线，也不是任意大 AVIF 文件流式方案。
 
 修改前的 133×71、2×3 fixture 实际被猜成 6×1，修 parser 后又暴露 8 位元数据和 Alpha 丢失；这些路径均有回归。旧 serializer 的全文件占位符扫描改为只补已记录的 iloc，避免误改 ICC／压缩 payload。第三个 vendor 包也按固定原包＋最小补丁管理。
 
@@ -127,3 +127,22 @@ Rust/Cargo 1.98.1、Windows x86_64 MSVC、Release：
 初次 256×256 方案在噪声拒绝前分配到 **34,114,090 B**，原门槛真实失败，因而缩小工作单元。128×128 固定噪声在读取 557,056 像素后达到压缩上限并拒绝，4K／45MP 的堆峰值 **13,454,926／13,564,820 B**，最大单分配均 **1,572,864 B**。这是有界拒绝，不是噪声编码成功；没有增大 32 MiB／16 MiB 门槛。
 
 `tools/test-hdr-avif.ps1 -GridResources` 在 Windows PowerShell 5.1 完整退出 **0**；指定 FFmpeg 路径时自动取同目录 FFprobe，也可显式 `-Ffprobe`。日志 `target/hdr-avif-grid-full-suite.log`；独立布局验证 `tools/verify-hdr-avif-grid.py`；资源 JSON `target/hdr-avif-grid-resources/summary.json`。完整基线、命令、既有 workspace 回归和后续工作统一见 [消费者方案 §27](../../docs/53-hdr-capture.md#27-有界-avif-gridalpha-与构造阶段取消2026-11-04)。
+
+## 真实行带与 SCPX 接续（2026-11-04）
+
+`avif_bands.rs` 接入现有 `BandSource`／`PixelMaster`，共用 Model 的零输出分配 `rec2020_pq16_pixels` 与 PNG16 颜色转换。只接受绝对 FP16/scRGB：预乘只解除一次，转换为 Rec.2020/PQ，Alpha 保持线性。转换后只声明 nclx，不把源 ICC 误贴到新的色域／传递函数上。来源 generation、descriptor、行数在读取前后检查；错长、读失败、NaN、Alpha／色彩超限与取消均返回错误，不返回部分 AVIF。
+
+源请求最多 1 MiB，缓存一条 128 行转换色带，单次分配严格小于 16 MiB；极宽图明确拒绝。原 4 MiB payload／5 MiB 容器限额仍存在，未引入产品依赖。读取前后与逐行转换可取消，SCPX 同步文件 fingerprint／块解压内部还不能中断。
+
+最终探针 **27 passed**（原 17 保留），Model **32 passed**。新增 133×257、2×3 颜色／Alpha grid 从两类来源生成相同字节；独立 FFprobe/libdav1d 解码每份全部 12 条流，与候选逐字节一致。独立源 FP16→PQ 比较 RGB 最大 **0.433813/1023**、Alpha **0.507324/1023**；EOTF＋逆矩阵重建 scRGB 最大误差 **0.017489**，满足原两码值传播的误差包络，负 scRGB 保留。不能把 PQ10 量化文件当成 FP16 无损母版。
+
+| 路径 | 4K 堆峰值 | 45MP 堆峰值 |
+| --- | ---: | ---: |
+| 行带转换并编码 | 8,445,028 B | 15,518,984 B |
+| SCPX 写入 | 4,661,642 B | 4,644,741 B |
+| SCPX 打开、校验并编码 | 10,901,130 B | 17,395,851 B |
+| 逐块解码 | 2,260,215 B | 5,566,099 B |
+
+原 32 MiB／16 MiB 门槛通过；最大单分配 **8,454,144 B**。完整检查两图全部 RGBA，最大误差 **0.499519/1023**。45MP 编码约 **28 秒**，尚不能宣称产品延迟达标。工作集、取消边界与完整耗时见消费者方案 §28，不从堆计数推断 VRAM 或界面性能。
+
+`tools/test-hdr-avif.ps1 -GridResources -BandResources` 已在 PowerShell 5.1 完整退出 0；最终 SCPX 取消回归另行执行，27 项和 opt-in strict Clippy 均通过。完整日志 `target/hdr-avif-bands-full-suite.log`，资源 `target/hdr-avif-bands-resources/summary.json`，独立检查 `tools/verify-hdr-avif-bands.py`。仍需磁盘后备压缩数据、外部输入／ICC 验证、许可交付及生产保存接线，详见[消费者方案 §28](../../docs/53-hdr-capture.md#28-avif-接入真实行带与-scpx-母版2026-11-04)。
