@@ -1404,6 +1404,8 @@ mod tests {
             session_id: None,
             preferences: Default::default(),
             selection: None,
+            selection_session_id: None,
+            pinned_session_id: None,
         }));
         // The sender is dropped at the end of this function, which is what a controller with no
         // annotation surface would see.

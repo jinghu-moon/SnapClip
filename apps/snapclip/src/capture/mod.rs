@@ -9,13 +9,10 @@ pub mod artifact_writer;
 
 pub use artifact_writer::HistoryArtifactWriter;
 
-/// 把「刚截的那张图」留给 F6：捕获产物的写入器装饰器。
-///
-/// 它在这里的原因跟 [`HistoryArtifactWriter`] 不同：写盘是历史模块的事，把「刚截
-/// 的图在哪儿」告诉贴图是外壳的事，所以两者是装饰关系而不是一个结构体的两个字段。
+/// Two-phase screenshot handoff: reserve first, consume after destination creation.
 pub mod pin_source;
 
-pub use pin_source::{PinSource, TakeSelection};
+pub use pin_source::{PinSource, SelectionProvider};
 
 pub mod pixel_export;
 /// The scroll export port's encoder (`docs/31` P4.02, `docs/30` §17.7).
@@ -133,7 +130,7 @@ pub fn start(
     Ok((runtime, pin_source, capture_events))
 }
 
-/// [`TakeSelection`] 的宿主：把外壳持有的 [`CaptureRuntime`] 接在 [`PinSource`] 后面。
+/// [`SelectionProvider`] 的宿主：把外壳持有的 [`CaptureRuntime`] 接在 [`PinSource`] 后面。
 ///
 /// 运行时用 `Arc` 共享：外壳留一份（它 `Drop` 时要关掉覆盖层），贴图这边留一份。取选区
 /// 时先克隆出 `Arc` 再解锁——选区槽位在平台那一侧，不在这个互斥锁里。
@@ -157,36 +154,35 @@ impl SelectionHome {
     }
 }
 
-impl TakeSelection for SelectionHome {
-    fn take_selection(&self) -> Option<Arc<snapclip_capture::artifact::SelectionPixels>> {
-        let runtime = self
+impl SelectionProvider for SelectionHome {
+    fn selection(&self) -> Option<Arc<snapclip_capture::artifact::SelectionPixels>> {
+        self.runtime
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()?
+            .selection()
+    }
+    fn consume_selection(
+        &self,
+        expected: &Arc<snapclip_capture::artifact::SelectionPixels>,
+    ) -> Result<bool, String> {
+        let Some(runtime) = self
             .runtime
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()?;
-        let selection = runtime.take_selection()?;
-
-        // 取走了就把覆盖层关掉：用户的动作序列是「F5 框选 → F6 贴图」，F6 之后那张
-        // 覆盖层（整屏、置顶、可交互）没有任何用处，留着只会压住刚贴出来的图。
-        //
-        // 放在这里而不是放在贴图那边：结束截图会话是捕获侧的事，能结束它的东西
-        // （`CaptureRuntime`）本来就在这个适配器手里，贴图那边只该知道「有人给了我
-        // 一张图」。这也意味着一件事：**别的取图来源将来若接上这条路，也会顺带结束
-        // 会话**——这正是要的语义，F6 在任何情况下都表示「这次截图到此为止」。
-        //
-        // 先取选区再取消：取消会让会话释放冻结帧，选区是这里唯一的副本出口，
-        // 顺序反了就什么都没了。
-        if let Err(error) = runtime.cancel_capture() {
-            // 覆盖层没关掉不算致命：图已经在手上，贴图照样贴得出来。
-            eprintln!("[snapclip-app][pin] 取走选区后结束截图会话失败：{error}");
-        }
-        Some(selection)
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        else {
+            return Ok(false);
+        };
+        runtime
+            .consume_selection(expected)
+            .map_err(|e| e.to_string())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{SelectionHome, TakeSelection, start};
+    use super::{SelectionHome, SelectionProvider, start};
     use crate::events::EventBus;
     use snapclip_capture::window_detection::DetectionOptions;
     use snapclip_model::CaptureState;
@@ -216,7 +212,7 @@ mod tests {
         // Nothing is being selected until the user asks, so the honest state is Idle.
         assert_eq!(runtime.state(), CaptureState::Idle);
         // And nothing has been captured, so F6 has nothing to pin yet.
-        assert!(pin_source.take_selection().is_none());
+        assert!(pin_source.claim().is_none());
         // Dropping every handle shuts the overlay down (its own `Drop`), including the hotkey.
         // The pin source keeps the runtime alive by design, so both have to go.
         drop(pin_source);
@@ -251,11 +247,28 @@ mod tests {
         fn set_preferences(&self, _preferences: snapclip_capture::preferences::OverlayPreferences) {
         }
 
-        fn take_selection(&self) -> Option<Arc<snapclip_capture::artifact::SelectionPixels>> {
+        fn selection(&self) -> Option<Arc<snapclip_capture::artifact::SelectionPixels>> {
             self.selection
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take()
+                .clone()
+        }
+
+        fn consume_selection(
+            &self,
+            expected: &Arc<snapclip_capture::artifact::SelectionPixels>,
+        ) -> snapclip_capture::CaptureResult<bool> {
+            let mut current = self.selection.lock().unwrap();
+            if current
+                .as_ref()
+                .is_some_and(|source| Arc::ptr_eq(source, expected))
+            {
+                *current = None;
+                self.cancels.fetch_add(1, Ordering::SeqCst);
+                Ok(true)
+            } else {
+                Ok(false)
+            }
         }
 
         fn shutdown(&self) {}
@@ -305,33 +318,25 @@ mod tests {
         (runtime, cancels)
     }
 
-    /// F6 hands the selection over and the screenshot session has to end with it.
-    ///
-    /// The user's sequence is `F5` → drag → `F6`, and the overlay is a full-monitor
-    /// topmost interactive window. Leaving it up after `F6` buries the pin the user just
-    /// asked for, so taking the selection is what ends the session.
     #[test]
-    fn taking_a_selection_ends_the_capture_session() {
+    fn only_successful_creation_consumes_and_ends_the_capture_session() {
         let (runtime, cancels) = fake_overlay();
         let home = SelectionHome::new(runtime);
-
-        assert!(
-            home.take_selection().is_some(),
-            "the platform is holding a selection, so it must be handed over"
+        let first = home.selection().unwrap();
+        assert!(Arc::ptr_eq(&first, &home.selection().unwrap()));
+        assert_eq!(
+            cancels.load(Ordering::SeqCst),
+            0,
+            "reservation cannot end capture"
         );
+        assert!(home.consume_selection(&first).unwrap());
+        assert!(home.selection().is_none());
+        assert_eq!(cancels.load(Ordering::SeqCst), 1);
+        assert!(!home.consume_selection(&first).unwrap());
         assert_eq!(
             cancels.load(Ordering::SeqCst),
             1,
-            "handing the selection over is also what ends the screenshot session"
-        );
-        assert!(
-            home.take_selection().is_none(),
-            "taking is deliberate: the second reader gets nothing"
-        );
-        assert_eq!(
-            cancels.load(Ordering::SeqCst),
-            1,
-            "nothing was taken the second time, so nothing should be ended"
+            "one successful destination, one cancellation"
         );
     }
 }

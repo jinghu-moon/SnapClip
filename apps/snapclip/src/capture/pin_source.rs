@@ -1,100 +1,96 @@
-//! 把「刚确认的那张截图」留给贴图：外壳这边的一个转发句柄。
+//! Two-phase handoff of the most recently confirmed screenshot to F6.
 //!
-//! # 这里不存像素
-//!
-//! 像素存在捕获侧、覆盖层自己的共享槽位里（`OverlayShared::selection`），由
-//! `OverlayController::publish_selection` 在**手势提交的那一刻**写入（拖拽抬手或吸附
-//! 确认）——那时冻结帧还活着，是这些像素唯一的完整副本。
-//!
-//! 本模块的 [`PinSource`] 只是把那个槽位接成贴图线程能调用的
-//! [`PinSource`]：`take_selection` 时向捕获侧要一次，不复制、不缓存、不留第二份。
-//!
-//! # 为什么曾经不是这样
-//!
-//! 第一版把「记住这张图」挂在 [`ArtifactWriter::write`] 的装饰器上，理由是
-//! `prepared.bgra` 是这些像素在进程里唯一完整、已校验的副本。位置选错了：`write` 只在
-//! 用户按 F9 保存时被调用，而用户的流程是「F5 框选 → F6 贴图」，从不保存，于是槽位永远
-//! 是空的，F6 一路回答「还没有可贴的图」。写盘是保存那件事，F6 要的是「刚框出来」这件事。
-//!
-//! # 只留最近一次
-//!
-//! 槽位被更新的覆盖掉是正确行为：F6 贴的是「我刚截的那张」，不是「第一张」；旧的被
-//! 覆盖时它的 `Arc` 一起释放，所以同时最多只多留一张图的内存。
-//!
-//! 取走语义见 [`PinSource::take_selection`]：贴出去之后槽位就空了，想再贴一次要重新截。
-//!
-//! # 拼接长图被跳过
-//!
-//! 滚动长图的 `origin` 是 `None`（见 `SelectionPixels::origin`），意思是「这块像素不
-//! 属于屏幕上的任何位置」。没有位置就没地方把它钉回去，所以它不进槽位，F6 会说「还没有
-//! 可贴的图」——这是实话。顺带也躲开了那张图的内存：`1920×300,000` 的 `bgra` 有 2.15 GiB。
-//!
-//! 这条规则由捕获侧的 `publish_selection` 统一执行（它调用的 `prepare_selection` 会回填
-//! `origin`），本模块不再自己判断一次。
-//!
-//! # 曾经用 `(0, 0)` 当哨兵，把主显示器上的选区全丢了
-//!
-//! 第一版把「没有位置」写成 `origin == (0, 0)`。主显示器的原点**就是** `(0, 0)`——它是
-//! 最常见的那块屏——于是每一次在主屏上框选的图都被当成拼接长图丢掉，F6 永远回答「还没有
-//! 可贴的图」。`Option` 是唯一能区分「没有位置」和「位置就是原点」的表示。
-
-use std::sync::{Arc, Mutex};
-
+//! Capture owns the slot. A claim shares its immutable pixels and prevents duplicate
+//! in-flight creation; it does not consume the slot or end the capture session.
+//! Only a real Created acknowledgement commits the claim. Dropping it after rejection,
+//! asynchronous failure or cancellation releases the reservation and leaves a retry.
+//! Completion compares the exact source Arc, so an old window cannot consume a newer
+//! selection. Stitched captures have no screen origin and cannot be pinned in place.
 use snapclip_capture::artifact::SelectionPixels;
-
 use snapclip_pin::PinSelection;
+use std::sync::{Arc, Mutex, Weak};
 
-/// 捕获侧「刚提交的选区」槽位，贴图只需要这一个能力。
-///
-/// 定义在外壳而不是 `snapclip-pin`：这是捕获那边欠贴图的**一个**方法，不是贴图对捕获的
-/// 一般依赖；把这个接口缩小到一个方法，才能让 `pin` 模块完全不认识 `snapclip-capture`。
-pub trait TakeSelection: Send + Sync + 'static {
-    /// 取走最近一次提交的选区；没有就返回 `None`。
-    fn take_selection(&self) -> Option<Arc<SelectionPixels>>;
+/// Application-owned seam; neither capture nor pin depends on the other feature.
+pub trait SelectionProvider: Send + Sync + 'static {
+    fn selection(&self) -> Option<Arc<SelectionPixels>>;
+    /// Consume only this selection after successful creation. A replaced source returns false.
+    fn consume_selection(&self, expected: &Arc<SelectionPixels>) -> Result<bool, String>;
 }
 
-/// 贴图线程看到的「刚截的那张图」。
-///
-/// 被接上之前（`set_home` 还没调用）`take_selection` 诚实地返回 `None`：不知道去哪儿
-/// 取，就等于没有图，而不是猜一张。
 #[derive(Default)]
 pub struct PinSource {
-    home: Mutex<Option<Arc<dyn TakeSelection>>>,
+    home: Mutex<Option<Arc<dyn SelectionProvider>>>,
+    pending: Mutex<Vec<Weak<SelectionPixels>>>,
 }
-
 impl PinSource {
     pub fn new() -> Self {
         Self::default()
     }
-
-    /// 把捕获运行时接上。外壳在拿到 [`CaptureRuntime`] 之后调用一次。
-    pub fn set_home(&self, home: Arc<dyn TakeSelection>) {
-        *self
-            .home
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(home);
+    pub fn set_home(&self, home: Arc<dyn SelectionProvider>) {
+        *self.home.lock().unwrap_or_else(|e| e.into_inner()) = Some(home);
     }
-}
-
-impl PinSource {
-    pub fn take_selection(&self) -> Option<PinSelection> {
+    pub fn has_pending(&self) -> bool {
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|entry| entry.strong_count() != 0)
+    }
+    /// Reserve the current screenshot without taking its only retry path away.
+    pub fn claim(self: &Arc<Self>) -> Option<SelectionClaim> {
         let home = self
             .home
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|e| e.into_inner())
             .clone()?;
-        let selection = home.take_selection()?;
-        // 屏幕上没有位置（拼接长图）——没有地方钉，也就不该贴。这是 `None` 而不是
-        // `(0, 0)`：主显示器原点 `(0, 0)` 是一个真实的位置，两者必须能区分开。
-        let region = selection.screen_region()?;
+        let captured = home.selection()?;
+        let region = captured.screen_region()?;
         if region.is_empty() {
             return None;
         }
-        // Transfer shared ownership, including precision and acquisition generation.
-        // The pin outlives the capture slot without a second full-image allocation.
         let image =
-            snapclip_pin::PinImage::from_pixels(selection.source(), selection.pixels.clone())?;
-        Some(PinSelection::new(region, image).radius(selection.corner_radius))
+            snapclip_pin::PinImage::from_pixels(captured.source(), captured.pixels.clone())?;
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        pending.retain(|entry| entry.strong_count() != 0);
+        if pending
+            .iter()
+            .any(|entry| entry.ptr_eq(&Arc::downgrade(&captured)))
+        {
+            return None;
+        }
+        pending.push(Arc::downgrade(&captured));
+        Some(SelectionClaim {
+            selection: PinSelection::new(region, image).radius(captured.corner_radius),
+            captured,
+            home,
+            source: self.clone(),
+        })
+    }
+}
+
+/// One in-flight creation. Commit on Created; all failure paths drop it.
+pub struct SelectionClaim {
+    selection: PinSelection,
+    captured: Arc<SelectionPixels>,
+    home: Arc<dyn SelectionProvider>,
+    source: Arc<PinSource>,
+}
+impl SelectionClaim {
+    pub fn selection(&self) -> &PinSelection {
+        &self.selection
+    }
+    pub fn commit(self) -> Result<bool, String> {
+        self.home.consume_selection(&self.captured)
+    }
+}
+impl Drop for SelectionClaim {
+    fn drop(&mut self) {
+        let expected = Arc::downgrade(&self.captured);
+        self.source
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|entry| !entry.ptr_eq(&expected));
     }
 }
 
@@ -115,9 +111,21 @@ mod tests {
         }
     }
 
-    impl TakeSelection for FakeHome {
-        fn take_selection(&self) -> Option<Arc<SelectionPixels>> {
-            self.slot.lock().unwrap().take()
+    impl SelectionProvider for FakeHome {
+        fn selection(&self) -> Option<Arc<SelectionPixels>> {
+            self.slot.lock().unwrap().clone()
+        }
+        fn consume_selection(&self, expected: &Arc<SelectionPixels>) -> Result<bool, String> {
+            let mut slot = self.slot.lock().unwrap();
+            if slot
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, expected))
+            {
+                *slot = None;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
         }
     }
 
@@ -140,16 +148,16 @@ mod tests {
 
     #[test]
     fn the_slot_is_empty_until_something_is_published() {
-        let source = PinSource::new();
-        assert!(source.take_selection().is_none());
+        let source = Arc::new(PinSource::new());
+        assert!(source.claim().is_none());
     }
 
     #[test]
     fn without_a_home_there_is_nothing_to_take() {
         // 没接上捕获侧时不该猜一张图出来。
-        let source = PinSource::new();
+        let source = Arc::new(PinSource::new());
         source.set_home(Arc::new(FakeHome::default()));
-        assert!(source.take_selection().is_none());
+        assert!(source.claim().is_none());
     }
 
     #[test]
@@ -160,38 +168,58 @@ mod tests {
             Some(Point::new(1000, 500)),
             Rect::new(10, 20, 40, 50),
         ));
-        let source = PinSource::new();
+        let source = Arc::new(PinSource::new());
         source.set_home(home);
-        let taken = source.take_selection().expect("槽位里有东西");
-        assert_eq!(taken.region(), Rect::new(1010, 520, 1040, 550));
-        assert!(source.take_selection().is_none(), "第二次不该再拿到同一张");
+        let taken = source.claim().expect("槽位里有东西");
+        assert_eq!(taken.selection().region(), Rect::new(1010, 520, 1040, 550));
+        assert!(source.claim().is_none(), "创建进行中不能重复贴出同一张");
+        assert!(taken.commit().unwrap());
+        assert!(source.claim().is_none(), "成功后只消费一次");
+    }
+
+    #[test]
+    fn a_rejected_pin_keeps_the_selection_available_for_retry() {
+        let home = Arc::new(FakeHome::default());
+        home.put(prepared(Some(Point::new(0, 0)), Rect::new(0, 0, 4, 4)));
+        let source = Arc::new(PinSource::new());
+        source.set_home(home.clone());
+        // Window creation can reject HDR, exhaust its budget or fail asynchronously.
+        // Handing it the pixels is not evidence that a window was created.
+        let rejected = source.claim().unwrap();
+        drop(rejected);
+        assert!(
+            home.slot.lock().unwrap().is_some(),
+            "failed creation must not consume the screenshot"
+        );
+        assert!(!source.has_pending());
+        assert!(
+            source.claim().is_some(),
+            "retry must obtain the same source"
+        );
     }
 
     #[test]
     fn a_newer_selection_replaces_an_older_one() {
         let home = Arc::new(FakeHome::default());
-        let source = PinSource::new();
+        let source = Arc::new(PinSource::new());
         source.set_home(home.clone());
         home.put(prepared(Some(Point::new(0, 1)), Rect::new(0, 0, 4, 4)));
         home.put(prepared(Some(Point::new(0, 1)), Rect::new(8, 8, 12, 12)));
         assert_eq!(
-            source.take_selection().unwrap().region(),
+            source.claim().unwrap().selection().region(),
             Rect::new(8, 9, 12, 13)
         );
     }
 
     #[test]
     fn a_stitched_image_has_no_place_on_screen_and_is_not_pinned() {
-        // `origin == (0, 0)` 是拼接长图（见 `SelectionPixels::origin` 的说明）。
+        // 只有 origin=None 才表示拼接长图，(0, 0) 是有效的屏幕位置。
         // 它必须被跳过，否则 F6 会把一张不属于任何屏幕位置的图钉在 (0, 0)。
         let home = Arc::new(FakeHome::default());
         home.put(prepared(None, Rect::new(0, 0, 4, 4)));
-        let source = PinSource::new();
+        let source = Arc::new(PinSource::new());
         source.set_home(home);
-        assert!(
-            source.take_selection().is_none(),
-            "没有屏幕位置的长图不该被贴出来"
-        );
+        assert!(source.claim().is_none(), "没有屏幕位置的长图不该被贴出来");
     }
 
     #[test]
@@ -201,12 +229,15 @@ mod tests {
             Some(Point::new(1000, 500)),
             Rect::new(10, 20, 40, 50),
         ));
-        let source = PinSource::new();
+        let source = Arc::new(PinSource::new());
         source.set_home(home);
-        let taken = source.take_selection().expect("显示器选区必须能贴");
+        let taken = source.claim().expect("显示器选区必须能贴");
         // 屏幕坐标 = 显示器原点 + 帧内选区，见 `SelectionPixels::screen_region`。
-        assert_eq!(taken.region(), Rect::new(1010, 520, 1040, 550));
-        assert_eq!(taken.image().pixels().as_bytes().len(), 30 * 30 * 4);
+        assert_eq!(taken.selection().region(), Rect::new(1010, 520, 1040, 550));
+        assert_eq!(
+            taken.selection().image().pixels().as_bytes().len(),
+            30 * 30 * 4
+        );
     }
 
     /// 回归：主显示器的原点是 `(0, 0)`，那是一个**真实**的位置。
@@ -218,12 +249,12 @@ mod tests {
     fn a_selection_at_the_primary_monitor_origin_is_still_pinned() {
         let home = Arc::new(FakeHome::default());
         home.put(prepared(Some(Point::new(0, 0)), Rect::new(10, 20, 40, 50)));
-        let source = PinSource::new();
+        let source = Arc::new(PinSource::new());
         source.set_home(home);
         let taken = source
-            .take_selection()
+            .claim()
             .expect("主显示器原点 (0, 0) 是真实位置，必须能贴");
-        assert_eq!(taken.region(), Rect::new(10, 20, 40, 50));
+        assert_eq!(taken.selection().region(), Rect::new(10, 20, 40, 50));
     }
 
     #[test]
@@ -252,14 +283,37 @@ mod tests {
             origin: Some(Point::new(-100, 0)),
             corner_radius: 1,
         });
-        let source = PinSource::new();
+        let source = Arc::new(PinSource::new());
         source.set_home(home);
-        let selection = source.take_selection().unwrap();
-        assert_eq!(selection.region(), Rect::new(-100, 0, -99, 1));
-        assert!(Arc::ptr_eq(selection.image().pixels(), &pixels));
-        assert_eq!(selection.image().pixel_source().generation(), 91);
-        assert!(selection.image().is_hdr());
-        assert!(source.take_selection().is_none());
+        let selection = source.claim().unwrap();
+        assert_eq!(selection.selection().region(), Rect::new(-100, 0, -99, 1));
+        assert!(Arc::ptr_eq(selection.selection().image().pixels(), &pixels));
+        assert_eq!(
+            selection.selection().image().pixel_source().generation(),
+            91
+        );
+        assert!(selection.selection().image().is_hdr());
+        assert!(source.claim().is_none());
+        assert!(selection.commit().unwrap());
+        assert!(source.claim().is_none());
+    }
+
+    #[test]
+    fn a_new_selection_can_be_claimed_while_an_older_creation_is_pending() {
+        let home = Arc::new(FakeHome::default());
+        let source = Arc::new(PinSource::new());
+        source.set_home(home.clone());
+        home.put(prepared(Some(Point::new(0, 0)), Rect::new(0, 0, 4, 4)));
+        let old = source.claim().unwrap();
+        home.put(prepared(Some(Point::new(0, 0)), Rect::new(8, 8, 12, 12)));
+        let new = source.claim().unwrap();
+        assert!(
+            !old.commit().unwrap(),
+            "old completion cannot consume newer pixels"
+        );
+        assert!(source.claim().is_none(), "newer creation is still reserved");
+        drop(new);
+        assert!(source.claim().is_some(), "failed newer creation may retry");
     }
 
     fn frame(width: u32, height: u32) -> snapclip_capture::session::CapturedFrame {

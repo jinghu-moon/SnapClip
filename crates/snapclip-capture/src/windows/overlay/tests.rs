@@ -103,10 +103,106 @@ fn command_round_trips_through_wparam() {
         OverlayCommand::Confirm,
         OverlayCommand::Shutdown,
         OverlayCommand::FrameReady,
+        OverlayCommand::SelectionPinned,
     ] {
         assert_eq!(OverlayCommand::from_wparam(command as usize), Some(command));
     }
     assert_eq!(OverlayCommand::from_wparam(9999), None);
+}
+
+fn selection_slot_for_pin_tests() -> (OverlayShared, Arc<SelectionPixels>) {
+    let descriptor = snapclip_model::pixels::PixelDescriptor::bgra8();
+    let source = snapclip_model::pixels::PixelSource::new(descriptor, 71);
+    let pixels =
+        snapclip_model::pixels::PixelBuffer::from_tight(1, 1, descriptor, vec![0; 4]).unwrap();
+    let selection = Arc::new(SelectionPixels {
+        frame: crate::session::CapturedFrame {
+            width: 1,
+            height: 1,
+            source,
+            captured_at_unix_ms: 0,
+            provider: "pin-lifecycle-test",
+            origin: Some(Point::new(-10, 0)),
+        },
+        region: Rect::new(0, 0, 1, 1),
+        pixels: Arc::new(pixels),
+        origin: Some(Point::new(-10, 0)),
+        corner_radius: 0,
+    });
+    (
+        OverlayShared {
+            state: CaptureState::Selected,
+            session_id: Some("capture-old".into()),
+            preferences: Default::default(),
+            selection: Some(selection.clone()),
+            selection_session_id: Some("capture-old".into()),
+            pinned_session_id: None,
+        },
+        selection,
+    )
+}
+
+#[test]
+fn pin_acknowledgement_consumes_once_and_finishes_only_the_matching_session() {
+    let (mut slot, selection) = selection_slot_for_pin_tests();
+    let mut posts = 0;
+    assert!(
+        slot.consume_selection(&selection, || {
+            posts += 1;
+            Ok(())
+        })
+        .unwrap()
+    );
+    assert!(
+        !slot
+            .consume_selection(&selection, || {
+                posts += 1;
+                Ok(())
+            })
+            .unwrap()
+    );
+    assert_eq!(posts, 1);
+    assert!(slot.selection.is_none());
+    assert!(slot.take_pinned_session("capture-old"));
+    assert!(!slot.take_pinned_session("capture-old"));
+}
+
+#[test]
+fn failed_pin_wakeup_preserves_pixels_and_session_for_retry() {
+    let (mut slot, selection) = selection_slot_for_pin_tests();
+    assert!(
+        slot.consume_selection(&selection, || Err("pump is unavailable".into()))
+            .is_err()
+    );
+    assert!(Arc::ptr_eq(slot.selection.as_ref().unwrap(), &selection));
+    assert_eq!(slot.selection_session_id.as_deref(), Some("capture-old"));
+    assert!(slot.pinned_session_id.is_none());
+    assert!(slot.consume_selection(&selection, || Ok(())).unwrap());
+}
+
+#[test]
+fn stale_pin_completion_cannot_consume_or_cancel_a_newer_selection_or_session() {
+    let (mut slot, selection) = selection_slot_for_pin_tests();
+    let newer = Arc::new((*selection).clone());
+    slot.selection = Some(newer.clone());
+    assert!(
+        !slot
+            .consume_selection(&selection, || panic!("stale source must not post"))
+            .unwrap()
+    );
+    assert!(Arc::ptr_eq(slot.selection.as_ref().unwrap(), &newer));
+    assert!(slot.consume_selection(&newer, || Ok(())).unwrap());
+    // The message was posted for the old session; starting a new one must survive it.
+    slot.session_id = Some("capture-new".into());
+    assert!(!slot.take_pinned_session("capture-new"));
+
+    let (mut slot, selection) = selection_slot_for_pin_tests();
+    assert!(slot.consume_selection(&selection, || Ok(())).unwrap());
+    // A new gesture in the same session is also unpinned work, not permission to cancel.
+    slot.selection = Some(newer.clone());
+    slot.selection_session_id = Some("capture-old".into());
+    assert!(!slot.take_pinned_session("capture-old"));
+    assert!(Arc::ptr_eq(slot.selection.as_ref().unwrap(), &newer));
 }
 
 /// The deepest answer — what every preview starts as — is named, not counted.

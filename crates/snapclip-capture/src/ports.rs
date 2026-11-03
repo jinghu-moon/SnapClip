@@ -81,7 +81,7 @@ pub trait OverlayPlatform: Send + Sync + 'static {
         None
     }
 
-    /// Hand over the last selection the user confirmed, if this platform still holds one.
+    /// Borrow shared ownership of the latest confirmed selection without consuming it.
     ///
     /// This is the seam for **pinning what was just captured**: the overlay is the only
     /// thing that has the pixels (the frozen frame's texture dies with the session, and
@@ -89,11 +89,20 @@ pub trait OverlayPlatform: Send + Sync + 'static {
     /// the screen again — which is exactly the round trip that cannot work while the
     /// overlay still covers the monitor.
     ///
-    /// Taking is deliberate: the selection is megabytes, so a second reader would either
-    /// copy it or race for it. The default returns `None`, which is the honest answer for
-    /// platforms that do not keep one.
-    fn take_selection(&self) -> Option<std::sync::Arc<SelectionPixels>> {
+    /// Cloning the Arc does not duplicate the pixels. Creation may fail, so a consumer
+    /// must call `consume_selection` only after its destination acknowledges creation.
+    /// The default returns `None` for platforms that do not keep a selection.
+    fn selection(&self) -> Option<std::sync::Arc<SelectionPixels>> {
         None
+    }
+
+    /// Consume exactly this source and finish only its owning capture session.
+    /// A newer selection must remain available. Unsupported platforms return false.
+    fn consume_selection(
+        &self,
+        _expected: &std::sync::Arc<SelectionPixels>,
+    ) -> CaptureResult<bool> {
+        Ok(false)
     }
 
     fn shutdown(&self);

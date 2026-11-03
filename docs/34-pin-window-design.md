@@ -128,15 +128,17 @@ F5 确认选区（拖拽抬手 或 吸附确认）
   → CaptureService::prepare_selection(frozen, selection, FrozenFramePixels)
      （与导出是同一套裁剪/校验，这时冻结帧还活着）
   → shared.selection = Some(Arc<SelectionPixels>)   // 槽位留在覆盖层，活过会话
-F6 → 托盘线程发送应用命令，应用经 PinSource::take_selection 取走槽位里的那一张
-   → PinManager::open_selection 提交给私有图片宿主
-   → ImageSource::from_bgra_bytes(…)（逐 4 字节重解释成 u32，并强制 alpha 不透明）
+F6 → 托盘线程发送应用命令，应用经 PinSource::claim 预留该选区（不消费）
+   → PinManager::open_selection 提交，共享 PinImage 的 Arc<PixelBuffer>
+   → 当前 SDR native 宿主显式派生 SDR RGBA，再建立 u32 DIB；HDR 仍拒绝
    → 窗口落在选区自己的屏幕坐标上（region 的左上角）
+   → 收到 Created 才 SelectionClaim::commit → consume_selection → 结束匹配的捕获会话
+   → 拒绝 / Failed / 创建期间取消只释放 claim；原源可重试，新选区不受旧回执影响
 F9（可选）→ confirm() 重新读一次（此时可能已带注解）
    → 再次写 shared.selection，然后才走 ArtifactWriter::write 落盘
 ```
 
-**发布点在手势提交处，不在写盘处——这是第二次改正，第一次的错法也值得留着。** 第一版把 `remember` 挂在 `ArtifactWriter::write` 的装饰器上（`PinSourceWriter`）。那条路径依赖用户按 F9 保存：`write` 只在导出时被调用，而用户的流程是「框选 → F6」，从不保存，于是槽位**永远是空的**，F6 一路回答「还没有可贴的图」。写盘是用户按 F9 才发生的事，而 F6 要的是「刚框出来」这件事——把来源挂在写盘上是错的位置。那个装饰器已经删掉：现在只有一个写入者（覆盖层手势提交时）、一个槽位、一个读者（`PinSource::take_selection`），不再有"同一件事的第二遍"。
+**发布点在手势提交处，不在写盘处——这是第二次改正，第一次的错法也值得留着。** 第一版把 `remember` 挂在 `ArtifactWriter::write` 的装饰器上（`PinSourceWriter`）。那条路径依赖用户按 F9 保存：`write` 只在导出时被调用，而用户的流程是「框选 → F6」，从不保存，于是槽位**永远是空的**，F6 一路回答「还没有可贴的图」。写盘是用户按 F9 才发生的事，而 F6 要的是「刚框出来」这件事——把来源挂在写盘上是错的位置。那个装饰器已经删掉：现在只有一个写入者（覆盖层手势提交时）、一个槽位、一个交接入口（`PinSource::claim`），不再有"同一件事的第二遍"。
 
 **为什么必须在这时读回、不能等到 F6**：这些像素的唯一副本是冻结帧（`session.frozen`），它随会话释放（`release_session` 里 `self.frozen = None`，GPU 纹理一起走）。等到 F6 才读就只能回读屏幕，而覆盖层那时还盖着整块屏幕。代价是每次提交多一次选区大小的回读（实测 1441×900 选区约 1 ms，日志 `stage=selection_kept`），只发生在抬手时，不在鼠标移动路径上。
 
@@ -148,11 +150,11 @@ F9（可选）→ confirm() 重新读一次（此时可能已带注解）
 
 **第三次改正：`(0, 0)` 不能当"没有位置"的哨兵。** 第一版把「没有位置」写成 `origin == (0, 0)`。主显示器的原点**就是** `(0, 0)`，而它是最常见的那块屏——用户的主屏正是 `3840x2160 at (0, 0)`（实跑日志 `monitor bounds=3840x2160 at (0,0)`）。于是主屏上的**每一次**框选都被当成拼接长图丢掉，F6 永远回答「还没有可贴的图」，看起来和第二次的 bug 一模一样，其实是另一个原因。`origin` 因此从 `Point` 改成 `Option<Point>`：`None` 是"没有位置"，`Some((0, 0))` 是"位置就是原点"。这两件事在类型上必须能分开——用值域里的一个点表示"没有值"，就会吃掉那个点所代表的那块屏。`SelectionPixels::screen_region()` 相应返回 `Option<Rect>`。回归测试 `a_selection_at_the_primary_monitor_origin_is_still_pinned` 先在旧的哨兵写法上确认失败，再在 `Option` 上通过。
 
-**已知代价**：`prepare_selection` 会新建一个缓冲区（回读的结果，不是 `prepared.bgra` 的副本——它由 `CaptureService` 从冻结帧裁剪出来）。4K 全屏选区约 33 MB，每次 F5 提交一次；它与贴图窗口自己那份 `u32` DIB 是两笔不同的分配，都记进 §7 的账，第一版先量不猜。F6 真正贴出去时 `PinSource::take_selection` 还会把这段像素复制成 `PinSelection` 自己那份 `Arc<Vec<u8>>`（贴图窗口要独立的生命周期），那是第二笔，只在按 F6 时发生。
+**已知代价**：`prepare_selection` 会新建一个缓冲区（回读的结果，不是 `prepared.bgra` 的副本——它由 `CaptureService` 从冻结帧裁剪出来）。4K 全屏选区约 33 MB，每次 F5 提交一次；它与贴图窗口自己那份 `u32` DIB 是两笔不同的分配，都记进 §7 的账，第一版先量不猜。当前 F6 的 `PinSource::claim`／`PinSelection` 共享原 `Arc<PixelBuffer>`，不再为交接复制整张像素；FP16 原始源也可保留。旧 native GDI 宿主仍需 SDR 派生和 u32 DIB，这些分配并未因共享源而消失，HDR 原位贴图在 GPUI 迁移完成前仍被明确拒绝。
 
 **F6 路径仍保持的边界**：
 
-- **不做内容缓存**。每次 F5 覆盖槽位，每次 F6 取走并清空；不存在"同一张图被两个窗口引用"（不变量 5 因此暂时是空的）。
+- **不做内容缓存**。每次 F5 覆盖槽位，F6 在创建成功回执之后才消费。进行中的同一源只能有一个 claim，失败释放后可重试；原始像素可与截图结果共享，不再以复制保证生命周期。
 - **pin 不接管来源存储**。F3 现已通过应用提交不可变 `PinSnapshot`，不让图片宿主直接读 `Artifact`/`Blob`、剪贴板或历史数据库。
 - **不做"最近一帧"旁路**。槽位里的就是**这一帧的选区**（已裁剪、已验证、已交给导出路径），不是覆盖层内存里那整帧。
 
@@ -546,7 +548,7 @@ cargo test --release -p snapclip-pin --lib paint_pin_cost -- --ignored --nocaptu
 | 阶段 | 内容 | 出口条件 | 状态 |
 |---|---|---|---|
 | **P0** | 原型探针：单线程、单窗口、真实 `UpdateLayeredWindow`、真实 `HTTRANSPARENT` | §6.2 四行数字全部有值并写回文档 | 未做（§6.2 仍无数字） |
-| **P1** | `ImageSource` + `PinManager` + `PinWindowHost`（消息泵、DIB、整窗提交）+ 移动 + 双击关闭 + F6 贴 F5 刚截的选区（`PinHome` / `TakeSelection` / `OverlayShared::selection`） | T1–T5、T9、T10 通过；人工核对 1、2、6 通过 | **已实现，验收未达**：窗口能贴、能拖、双击能关（用户实跑确认）；F6 的选区分发走过三次修正（§3.4），前两次的故障都是"F6 永远说还没有可贴的图"，直到 `origin` 从哨兵改成 `Option<Point>` 才通。T1–T4 等桌面测试与人工核对 1、2、6 尚未逐条走完 |
+| **P1** | `ImageSource` + `PinManager` + `PinWindowHost`（消息泵、DIB、整窗提交）+ 移动 + 双击关闭 + F6 贴 F5 刚截的选区（`SelectionHome` / `SelectionProvider` / `OverlayShared::selection`） | T1–T5、T9、T10 通过；人工核对 1、2、6 通过 | **已实现，验收未达**：窗口能贴、能拖、双击能关（用户实跑确认）；F6 的选区分发走过三次修正（§3.4），前两次的故障都是"F6 永远说还没有可贴的图"，直到 `origin` 从哨兵改成 `Option<Point>` 才通。T1–T4 等桌面测试与人工核对 1、2、6 尚未逐条走完 |
 | **P1.5** | 原计划的 `PinSource { Artifact, Blob }`（两条取字节路径）**没有按原样落地**：F6 只需要"刚截的那一张"，所以落地成了捕获侧的槽位（§3.4） | 出现明确需求（"从剪贴板贴"/"从历史贴"）再补那两条读字节路径 | 未做（`PinSource` 本身已实现，形态不同） |
 | **P1.6** | 原计划的准入硬上限**被推迟**（§3.5）：两个常量要等 §6.2 的数字 | P3 拿数字后补齐 | 未做 |
 | **P2** | 右键菜单（复制 / 关闭）+ 穿透 + 托盘撤销 + 指标 | T6–T8 通过；人工核对 3、4、5、7 通过 | 未做；穿透的前置条件是先有托盘的"取消穿透"（§4.3）。**缩放原属这一阶段，已提前落地**（§4.2.1）：它不要命中测试，只要"鼠标在窗口里时把滚轮接过来"，与右键菜单/穿透没有共同的阻塞点 |
@@ -575,14 +577,14 @@ cargo test --release -p snapclip-pin --lib paint_pin_cost -- --ignored --nocaptu
 | 设计名 | 落地符号 | 位置 | 状态 |
 |---|---|---|---|
 | `PinManager` | `PinManager` | `crates/snapclip-pin/src/manager.rs` | 已实现（F3/F6 生命周期协调） |
-| `PinCommand` | *(P2 计划)* | `crates/snapclip-pin/src/lib.rs` | *(P2 计划)* |
+| `PinCommand` | `PinCommand` | `crates/snapclip-pin/src/manager.rs` | 已实现（复制命令由应用执行） |
 | `PinEvent` | `PinEvent` | `crates/snapclip-pin/src/host.rs` | 已实现 |
 | `PinSource` | `PinSource` | `apps/snapclip/src/capture/pin_source.rs` | 已实现（转发句柄，形态与原计划不同，见 §3.4） |
-| `TakeSelection` | `TakeSelection` | `apps/snapclip/src/capture/pin_source.rs` | 已实现（捕获欠贴图的唯一一个方法） |
+| `SelectionProvider` | `SelectionProvider` | `apps/snapclip/src/capture/pin_source.rs` | 已实现（共享源与创建成功后的条件消费） |
 | — | `OverlayShared::selection` | `crates/snapclip-capture/src/windows/overlay.rs` | 已实现（像素真正待的地方，`publish_selection` 写入） |
 | — | `PinSelection` | `crates/snapclip-pin/src/lib.rs` | 已实现 |
 | `ImageSource` | `ImageSource` | `crates/snapclip-pin/src/source.rs` | 已实现 |
-| 宿主句柄 | `PinManager` | `crates/snapclip-pin/src/host.rs` | 已合并到管理器，无额外包装 |
+| native 宿主句柄 | `NativeImages` | `crates/snapclip-pin/src/host.rs` | 已实现（当前 F6 SDR 宿主，迁移后删除） |
 | `PinWindowState` | `PinWindowState` | `crates/snapclip-pin/src/host.rs` | 已实现 |
 | — | `PinRequest` | `crates/snapclip-pin/src/host.rs` | 已实现（原计划的 `PinCommand` 位） |
 | — | `PinHandle` | `crates/snapclip-pin/src/host.rs` | 已实现 |

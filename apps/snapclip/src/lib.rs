@@ -365,17 +365,31 @@ impl Shell {
     }
 
     fn pin_last_selection(&mut self, position: (i32, i32), cx: &mut Context<Self>) {
-        let Some(selection) = self
-            .pin_source
-            .as_ref()
-            .and_then(|source| source.take_selection())
-        else {
-            snapclip_pin::show_feedback("还没有可贴的截图，请先按 F5 框选", position, cx);
+        let Some(pins) = &self.pins else {
+            snapclip_pin::show_feedback("贴图功能不可用，请重启后重试", position, cx);
             return;
         };
-        if let Some(pins) = &self.pins
-            && let Err(error) = PinManager::open_selection(selection, pins, cx)
-        {
+        let Some(claim) = self.pin_source.as_ref().and_then(|source| source.claim()) else {
+            let message = if self
+                .pin_source
+                .as_ref()
+                .is_some_and(|source| source.has_pending())
+            {
+                "正在创建贴图，请稍候"
+            } else {
+                "还没有可贴的截图，请先按 F5 框选"
+            };
+            snapclip_pin::show_feedback(message, position, cx);
+            return;
+        };
+        let selection = claim.selection().clone();
+        if let Err(error) = PinManager::open_selection(selection, pins, cx, move || {
+            if let Err(error) = claim.commit() {
+                eprintln!(
+                    "[snapclip-app][pin] created pin could not acknowledge its source: {error}"
+                );
+            }
+        }) {
             snapclip_pin::show_feedback(error.to_string(), position, cx);
         }
     }

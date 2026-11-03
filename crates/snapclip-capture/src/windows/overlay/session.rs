@@ -8,6 +8,17 @@ use super::*;
 use crate::windows::win::window::WindowRegion;
 
 impl OverlayController {
+    pub(super) fn on_selection_pinned(&mut self) {
+        let current = self.session_id();
+        let finish = self
+            .shared
+            .lock()
+            .is_ok_and(|mut shared| shared.take_pinned_session(&current));
+        if finish {
+            self.cancel("selection-pinned");
+        }
+    }
+
     pub(super) fn session_id(&self) -> String {
         self.session.id().to_string()
     }
@@ -592,6 +603,7 @@ impl OverlayController {
                 prepared.corner_radius = self.corner_radius_px as i32;
                 if let Ok(mut shared) = self.shared.lock() {
                     shared.selection = Some(Arc::new(prepared));
+                    shared.selection_session_id = Some(self.session_id());
                 }
             }
             // Not fatal: the pinned copy is a convenience, and the gesture itself
@@ -963,6 +975,7 @@ impl OverlayController {
         // dies with it, and the PNG the export writes is a different representation.
         if let Ok(mut shared) = self.shared.lock() {
             shared.selection = Some(Arc::new(prepared.clone()));
+            shared.selection_session_id = Some(self.session_id());
         }
         // The overlay is frozen at the confirmed selection until the export lands, so
         // cursor-follow repaints can neither race nor waste the hand-off.

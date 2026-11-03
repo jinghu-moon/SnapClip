@@ -166,6 +166,8 @@ enum OverlayCommand {
     /// Sentinel `wparam` on [`export_worker::EXPORT_READY_MESSAGE`]: the artifact was
     /// encoded and written off the UI thread.
     ExportReady,
+    /// A destination has acknowledged creation; finish only the matching capture session.
+    SelectionPinned,
 }
 
 impl OverlayCommand {
@@ -178,6 +180,7 @@ impl OverlayCommand {
             value if value == Self::Confirm as i32 => Some(Self::Confirm),
             value if value == Self::Annotation as i32 => Some(Self::Annotation),
             value if value == Self::Shutdown as i32 => Some(Self::Shutdown),
+            value if value == Self::SelectionPinned as i32 => Some(Self::SelectionPinned),
             _ => None,
         }
     }
@@ -203,6 +206,38 @@ struct OverlayShared {
     /// `Arc` because the pixels are megabytes and the reader is another thread; taking it
     /// is a refcount move, not a copy.
     selection: Option<Arc<SelectionPixels>>,
+    /// Session that produced the slot, independent of the currently active session.
+    selection_session_id: Option<String>,
+    /// Latest successful acknowledgement awaiting the overlay thread's cancellation step.
+    pinned_session_id: Option<String>,
+}
+
+impl OverlayShared {
+    fn consume_selection(
+        &mut self,
+        expected: &Arc<SelectionPixels>,
+        post: impl FnOnce() -> PostResult,
+    ) -> CaptureResult<bool> {
+        if !self
+            .selection
+            .as_ref()
+            .is_some_and(|source| Arc::ptr_eq(source, expected))
+        {
+            return Ok(false);
+        }
+        // Post while holding the same lock the receiver needs. If posting fails,
+        // neither the source nor its session metadata has been consumed.
+        post().map_err(CaptureError::InvalidState)?;
+        self.selection = None;
+        self.pinned_session_id = self.selection_session_id.take();
+        Ok(true)
+    }
+
+    fn take_pinned_session(&mut self, current: &str) -> bool {
+        self.pinned_session_id
+            .take()
+            .is_some_and(|session| session == current && self.selection.is_none())
+    }
 }
 
 /// The concrete `OverlayPlatform` used on Windows.
@@ -240,6 +275,8 @@ impl WindowsOverlay {
             session_id: None,
             preferences,
             selection: None,
+            selection_session_id: None,
+            pinned_session_id: None,
         }));
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         // Bounded so a stuck/slow overlay cannot let toolbar clicks pile up without
@@ -366,11 +403,18 @@ impl OverlayPlatform for WindowsOverlay {
             .map(|shared| shared.preferences.clone())
     }
 
-    fn take_selection(&self) -> Option<Arc<SelectionPixels>> {
+    fn selection(&self) -> Option<Arc<SelectionPixels>> {
         self.shared
             .lock()
             .ok()
-            .and_then(|mut shared| shared.selection.take())
+            .and_then(|shared| shared.selection.clone())
+    }
+
+    fn consume_selection(&self, expected: &Arc<SelectionPixels>) -> CaptureResult<bool> {
+        self.shared
+            .lock()
+            .map_err(|_| CaptureError::InvalidState("selection slot is poisoned".into()))?
+            .consume_selection(expected, || self.post(OverlayCommand::SelectionPinned))
     }
 
     fn shutdown(&self) {

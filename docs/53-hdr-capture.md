@@ -410,3 +410,22 @@ cargo clippy -p snapclip-model -p snapclip-clipboard -p snapclip-pin --all-targe
 ```
 
 本批没有改系统 HDR 设置、实际截屏或写系统剪贴板；headless 证明实体／命令／资源生命周期，不能证明 DWM 最终显示、无激活窗口或实际剪贴板格式优先级。尚需 F6 宿主迁移、倒计时 composition、SDR HEX、历史 DB 保真引用／回放、AVIF 生产证据、Release 资源性能，以及真实 HDR／双屏／DPI 验收。§11 清单保持未勾选表示这些是产品级验收项；本节只记录已完成的代码及测试层次。
+
+## 13. F6 迁移前置（P3-E，2026-11-03）
+
+第四批已提交并推送为 `c461313`。本批先解决截图源的创建交接，再验证 GPUI 无激活窗口合同；尚未替换 F6 的 native 图像宿主。
+
+原先读取选区就清空槽位并结束捕获，窗口同步拒绝或异步创建失败后无法重试。修改前回归 `hdr-p3e-source-before.log` 实际失败。现在 `SelectionProvider` 只提供共享源，`PinSource::claim` 保留一次创建资格；只有窗口 `Created` 后执行 `SelectionClaim::commit`。失败／取消释放资格而不消费源；同源不能重复创建，新选区可独立创建，旧回执不能消费新选区或取消新捕获会话。捕获线程 post 失败也保留原槽位。像素通过同一 Arc 传递。
+
+Yue core 增加 Windows `WindowOptions::is_activatable`，将持久无激活与初始 `focus` 分开。在 native 创建前设置 NOACTIVATE／TOOLWINDOW，初次与后续显示不抢焦点，鼠标消息返回 MA_NOACTIVATE，显式 activation 不进入设置焦点或模拟 Alt 的路径。详见 Yue `docs/performance/2026-11-03-pin-window-contracts.md`。短暂的真实 GPUI popup probe 已通过；它不是 F6 的完整 UI 验收。
+
+| 验证 | 实际结果 |
+| --- | --- |
+| 普通 workspace lib，串行、隔离依赖 | App 275、Capture 564、Clipboard 13、History 43、Model 31、Pin 73、UI 221，共 **1,220** 通过；子进程重复结果不另计 |
+| App／Pin headless lib | **295／76** 通过，另 5／4 ignored |
+| Pin all-targets strict Clippy | 带 headless feature，`--no-deps -D warnings` 通过；未宣称全仓 lint 通过 |
+| GPUI Windows 普通回归 | **51** 通过／3 ignored |
+| GPUI 无激活真实窗口 opt-in | **1** 通过；初始隐藏／显示、延后显示、实际 HWND 样式／消息及前台 HWND 不变；普通窗口作为负对照 |
+| 新测试脚本普通模式 | `tools/test-gpui-window.ps1 -CorePath ...`，1 通过／1 ignored |
+
+应用日志为 `target/hdr-p3e-{source-before,source-after,handoff-headless,workspace-final,pin-clippy}.log`。依赖隔离沿用 §12.3 快照，再叠加本批 core 激活选项与 Windows 后端；没有纳入并行虚拟列表改造，不能据此称默认依赖工作树已完整通过。没有切换系统 HDR、实际截屏或写剪贴板。真实 F6 的原位、DPI、拖动、0.1–10 倍鼠标锚定缩放、圆角、关闭／撤销与资源释放仍须迁移后逐项验收。

@@ -39,11 +39,25 @@ struct OpenPin {
     _closed: Option<Subscription>,
     derived_bytes: usize,
 }
+
+struct PendingPin {
+    snapshot: Arc<PinSnapshot>,
+    /// Dropping a failed/cancelled request drops its source claim without consuming it.
+    on_created: Option<Box<dyn FnOnce()>>,
+}
+impl PendingPin {
+    fn created(self) -> Arc<PinSnapshot> {
+        if let Some(on_created) = self.on_created {
+            on_created();
+        }
+        self.snapshot
+    }
+}
 /// One application-thread owner of live pins, pending native creations, undo and command delivery.
 pub struct PinManager {
     native: NativeImages,
     open: HashMap<u64, OpenPin>,
-    pending: HashMap<u64, Arc<PinSnapshot>>,
+    pending: HashMap<u64, PendingPin>,
     closed: Vec<Arc<PinSnapshot>>,
     commands: async_channel::Sender<PinCommand>,
     owner: Option<WeakEntity<Self>>,
@@ -77,6 +91,16 @@ impl PinManager {
         placement: PinPlacement,
         owner: &Entity<Self>,
         cx: &mut App,
+    ) -> anyhow::Result<PinHandle> {
+        Self::open_with_ready(snapshot, placement, owner, cx, None)
+    }
+
+    fn open_with_ready(
+        snapshot: Arc<PinSnapshot>,
+        placement: PinPlacement,
+        owner: &Entity<Self>,
+        cx: &mut App,
+        on_created: Option<Box<dyn FnOnce()>>,
     ) -> anyhow::Result<PinHandle> {
         match snapshot.content() {
             PinContent::Document(doc) if doc.text().is_empty() => {
@@ -131,7 +155,13 @@ impl PinManager {
                     .initial_zoom(1.),
             )?;
             owner.update(cx, |this, _| {
-                this.pending.insert(handle.id(), snapshot);
+                this.pending.insert(
+                    handle.id(),
+                    PendingPin {
+                        snapshot,
+                        on_created,
+                    },
+                );
             });
             return Ok(handle);
         }
@@ -208,12 +238,20 @@ impl PinManager {
                 },
             );
         });
+        if let Some(on_created) = on_created {
+            on_created();
+        }
         Ok(handle)
     }
+
+    /// Create an original-position pin. The callback runs once, only after creation
+    /// succeeds (including the native host's asynchronous Created acknowledgement).
+    /// Rejection, failure and pending cancellation drop the callback without invoking it.
     pub fn open_selection(
         selection: PinSelection,
         owner: &Entity<Self>,
         cx: &mut App,
+        on_created: impl FnOnce() + 'static,
     ) -> anyhow::Result<PinHandle> {
         let region = selection.region();
         let w = u32::try_from(region.width())?;
@@ -222,85 +260,91 @@ impl PinManager {
             anyhow::bail!("截图像素与尺寸不符");
         }
         let image = selection.image().clone();
-        Self::open(
+        Self::open_with_ready(
             Arc::new(PinSnapshot::new(PinContent::Image(image))),
             PinPlacement::Screenshot((region.left, region.top), selection.corner_radius()),
             owner,
             cx,
+            Some(Box::new(on_created)),
         )
     }
     pub fn poll(&mut self, cx: &mut App) -> crate::PinReport {
         let mut observed = vec![];
         while let Some(event) = self.native.try_recv_event() {
             observed.push(event);
-            match event {
-                PinEvent::Created { id } => {
-                    if let Some(snapshot) = self.pending.remove(&id) {
-                        self.open.insert(
-                            id,
-                            OpenPin {
-                                snapshot,
-                                surface: Surface::Image(PinHandle::from_id(id)),
-                                _closed: None,
-                                derived_bytes: 0,
-                            },
-                        );
-                    }
+            self.apply_native_event(event, cx);
+        }
+        crate::host::summarize(observed)
+    }
+
+    fn apply_native_event(&mut self, event: PinEvent, cx: &mut App) {
+        match event {
+            PinEvent::Created { id } => {
+                if let Some(pending) = self.pending.remove(&id) {
+                    let snapshot = pending.created();
+                    self.open.insert(
+                        id,
+                        OpenPin {
+                            snapshot,
+                            surface: Surface::Image(PinHandle::from_id(id)),
+                            _closed: None,
+                            derived_bytes: 0,
+                        },
+                    );
                 }
-                PinEvent::Closed { id } => self.released(id, cx),
-                PinEvent::Failed { id } => {
-                    eprintln!("[snapclip-pin] image window failed id={id}");
-                    if self.pending.remove(&id).is_some() {
+            }
+            PinEvent::Closed { id } => self.released(id, cx),
+            PinEvent::Failed { id } => {
+                eprintln!("[snapclip-pin] image window failed id={id}");
+                if self.pending.remove(&id).is_some() {
+                    crate::show_feedback(
+                        "无法创建图片贴图，请稍后重试",
+                        platform::cursor_position(),
+                        cx,
+                    );
+                }
+            }
+            PinEvent::CopyRequested { id } => {
+                if let Some(pin) = self.open.get(&id) {
+                    self.copy(id, CopyTarget::Content(pin.snapshot.clone()));
+                }
+            }
+            PinEvent::TextRequested { id } => {
+                if let Some(pin) = self.open.get(&id) {
+                    if let Some(text) = pin.snapshot.text().filter(|t| !t.is_empty()) {
+                        let mut snapshot = PinSnapshot::new(PinContent::Document(
+                            crate::PinDocument::new(text.into(), crate::DocumentMode::Text),
+                        ));
+                        if let PinContent::Image(image) = pin.snapshot.content() {
+                            snapshot = snapshot.with_image(image.clone());
+                        }
+                        let weak = self.owner.clone();
+                        cx.defer(move |cx| {
+                            if let Some(owner) = weak.and_then(|w| w.upgrade())
+                                && let Err(error) = Self::open(
+                                    Arc::new(snapshot),
+                                    PinPlacement::Pointer(platform::cursor_position()),
+                                    &owner,
+                                    cx,
+                                )
+                            {
+                                crate::show_feedback(
+                                    error.to_string(),
+                                    platform::cursor_position(),
+                                    cx,
+                                );
+                            }
+                        });
+                    } else {
                         crate::show_feedback(
-                            "无法创建图片贴图，请稍后重试",
+                            "该图片没有文字备选表示",
                             platform::cursor_position(),
                             cx,
                         );
                     }
                 }
-                PinEvent::CopyRequested { id } => {
-                    if let Some(pin) = self.open.get(&id) {
-                        self.copy(id, CopyTarget::Content(pin.snapshot.clone()));
-                    }
-                }
-                PinEvent::TextRequested { id } => {
-                    if let Some(pin) = self.open.get(&id) {
-                        if let Some(text) = pin.snapshot.text().filter(|t| !t.is_empty()) {
-                            let mut snapshot = PinSnapshot::new(PinContent::Document(
-                                crate::PinDocument::new(text.into(), crate::DocumentMode::Text),
-                            ));
-                            if let PinContent::Image(image) = pin.snapshot.content() {
-                                snapshot = snapshot.with_image(image.clone());
-                            }
-                            let weak = self.owner.clone();
-                            cx.defer(move |cx| {
-                                if let Some(owner) = weak.and_then(|w| w.upgrade())
-                                    && let Err(error) = Self::open(
-                                        Arc::new(snapshot),
-                                        PinPlacement::Pointer(platform::cursor_position()),
-                                        &owner,
-                                        cx,
-                                    )
-                                {
-                                    crate::show_feedback(
-                                        error.to_string(),
-                                        platform::cursor_position(),
-                                        cx,
-                                    );
-                                }
-                            });
-                        } else {
-                            crate::show_feedback(
-                                "该图片没有文字备选表示",
-                                platform::cursor_position(),
-                                cx,
-                            );
-                        }
-                    }
-                }
             }
         }
-        crate::host::summarize(observed)
     }
 
     pub fn is_open(&self, id: u64) -> bool {
@@ -442,7 +486,11 @@ impl PinManager {
         self.open
             .values()
             .map(|pin| pin.snapshot.retained_bytes() + pin.derived_bytes)
-            .chain(self.pending.values().map(|s| s.retained_bytes()))
+            .chain(
+                self.pending
+                    .values()
+                    .map(|pending| pending.snapshot.retained_bytes()),
+            )
             .chain(self.closed.iter().map(|s| s.retained_bytes()))
             .sum()
     }
@@ -450,6 +498,79 @@ impl PinManager {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "headless-tests")]
+    #[gpui_kit::test]
+    fn native_creation_receipts_commit_once_and_release_failed_or_cancelled_claims(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use super::*;
+        use std::{cell::Cell, rc::Rc};
+        struct Claim(Rc<Cell<usize>>);
+        impl Drop for Claim {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        let committed = Rc::new(Cell::new(0));
+        let released = Rc::new(Cell::new(0));
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            yue_component::init(
+                cx,
+                yue_component::YueTheme::new(
+                    yue_component::ThemeMode::Light,
+                    yue_component::Accent::Azure,
+                ),
+            )
+            .unwrap();
+            let (mut manager, _commands) = PinManager::new().unwrap();
+            let snapshot = Arc::new(PinSnapshot::new(PinContent::Document(
+                crate::PinDocument::new("creation-receipt".into(), crate::DocumentMode::Text),
+            )));
+            for id in 1..=3 {
+                let claim = Claim(released.clone());
+                let committed = committed.clone();
+                manager.pending.insert(
+                    id,
+                    PendingPin {
+                        snapshot: snapshot.clone(),
+                        on_created: Some(Box::new(move || {
+                            let _claim = claim;
+                            committed.set(committed.get() + 1);
+                        })),
+                    },
+                );
+            }
+            manager.apply_native_event(PinEvent::Created { id: 1 }, cx);
+            manager.apply_native_event(PinEvent::Created { id: 1 }, cx);
+            assert_eq!(
+                committed.get(),
+                1,
+                "a duplicate Created cannot consume twice"
+            );
+            assert!(manager.open.contains_key(&1));
+            manager.apply_native_event(PinEvent::Failed { id: 2 }, cx);
+            assert!(!manager.is_open(2));
+            manager.close(3, cx);
+            manager.apply_native_event(PinEvent::Created { id: 3 }, cx);
+            assert!(
+                !manager.is_open(3),
+                "a late acknowledgement cannot resurrect a cancelled pin"
+            );
+            assert!(manager.pending.is_empty());
+            assert_eq!(
+                committed.get(),
+                1,
+                "failure and cancellation must not commit"
+            );
+            assert_eq!(
+                released.get(),
+                3,
+                "every completion path must release its source claim"
+            );
+        });
+    }
+
     #[test]
     fn clipboard_images_fit_the_monitor_without_mutating_original_pixels() {
         assert_eq!(super::initial_image_zoom((100, 100), (1920, 1080)), 1.);

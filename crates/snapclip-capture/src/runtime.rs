@@ -56,13 +56,17 @@ impl CaptureRuntime {
         self.platform.preferences()
     }
 
-    /// Take the last selection the user confirmed, if one is still held.
-    ///
-    /// `F6`'s input: pin what was just captured, rather than reading the screen again
-    /// while the overlay still covers it. Taking rather than cloning keeps a multi-megabyte
-    /// buffer from being duplicated per pin (`OverlayPlatform::take_selection`).
-    pub fn take_selection(&self) -> Option<std::sync::Arc<crate::artifact::SelectionPixels>> {
-        self.platform.take_selection()
+    /// Share the latest confirmed selection; the original stays available for retries.
+    pub fn selection(&self) -> Option<std::sync::Arc<crate::artifact::SelectionPixels>> {
+        self.platform.selection()
+    }
+
+    /// Acknowledge destination creation without consuming a newer source.
+    pub fn consume_selection(
+        &self,
+        expected: &std::sync::Arc<crate::artifact::SelectionPixels>,
+    ) -> CaptureResult<bool> {
+        self.platform.consume_selection(expected)
     }
 
     /// Forward one low-frequency toolbar instruction to the active session's
