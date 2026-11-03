@@ -1,0 +1,374 @@
+//! Pixel-level verification against reference images
+//!
+//! **IMPORTANT:** This currently generates references FROM zenavif itself,
+//! so it's a regression test, not a correctness test!
+//!
+//! For true pixel accuracy verification, use libavif's avifdec:
+//! ```bash
+//! # Generate reference with libavif
+//! avifdec input.avif reference.png
+//!
+//! # Then compare with zenavif output
+//! cargo run --example decode input.avif zenavif-output.png
+//! compare -metric RMSE reference.png zenavif-output.png diff.png
+//! ```
+//!
+//! Run with: cargo test --features managed --test pixel_verification -- --ignored
+
+use enough::Unstoppable;
+use std::fs;
+use std::path::{Path, PathBuf};
+use zenavif::{DecoderConfig, decode_with};
+use zenpixels::{PixelBuffer, PixelDescriptor};
+
+/// Generate reference PNGs for a test file
+/// This should be run once to create the reference images
+fn generate_reference(
+    avif_path: &Path,
+    output_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Decode with zenavif
+    let data = fs::read(avif_path)?;
+    let config = DecoderConfig::new().threads(1);
+    let image = decode_with(&data, &config, &Unstoppable)?;
+
+    // Save as PNG using image crate
+    let output_path = output_dir.join(format!(
+        "{}.png",
+        avif_path.file_stem().unwrap().to_str().unwrap()
+    ));
+
+    // Convert to image-rs format and save
+    let desc = image.descriptor();
+    if desc.layout_compatible(PixelDescriptor::RGB8) {
+        let img = image.try_as_imgref::<rgb::Rgb<u8>>().unwrap();
+        let width = img.width() as u32;
+        let height = img.height() as u32;
+        let mut buffer = image::RgbImage::new(width, height);
+
+        for y in 0..height {
+            for x in 0..width {
+                let pixel = img[(x as usize, y as usize)];
+                buffer.put_pixel(x, y, image::Rgb([pixel.r, pixel.g, pixel.b]));
+            }
+        }
+
+        buffer.save(&output_path)?;
+    } else if desc.layout_compatible(PixelDescriptor::RGBA8) {
+        let img = image.try_as_imgref::<rgb::Rgba<u8>>().unwrap();
+        let width = img.width() as u32;
+        let height = img.height() as u32;
+        let mut buffer = image::RgbaImage::new(width, height);
+
+        for y in 0..height {
+            for x in 0..width {
+                let pixel = img[(x as usize, y as usize)];
+                buffer.put_pixel(x, y, image::Rgba([pixel.r, pixel.g, pixel.b, pixel.a]));
+            }
+        }
+
+        buffer.save(&output_path)?;
+    } else if desc.layout_compatible(PixelDescriptor::RGB16) {
+        let img = image.try_as_imgref::<rgb::Rgb<u16>>().unwrap();
+        // Convert 16-bit to 8-bit for PNG
+        let width = img.width() as u32;
+        let height = img.height() as u32;
+        let mut buffer = image::RgbImage::new(width, height);
+
+        for y in 0..height {
+            for x in 0..width {
+                let pixel = img[(x as usize, y as usize)];
+                // Scale from 16-bit to 8-bit
+                buffer.put_pixel(
+                    x,
+                    y,
+                    image::Rgb([
+                        (pixel.r >> 8) as u8,
+                        (pixel.g >> 8) as u8,
+                        (pixel.b >> 8) as u8,
+                    ]),
+                );
+            }
+        }
+
+        buffer.save(&output_path)?;
+    } else {
+        eprintln!("Unsupported format for reference generation");
+        return Ok(());
+    }
+
+    println!("Generated reference: {:?}", output_path);
+    Ok(())
+}
+
+/// Compare decoded image against reference PNG
+fn compare_against_reference(
+    image: &PixelBuffer,
+    reference_path: &Path,
+    max_diff: u8,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let reference = image::open(reference_path)?;
+
+    let desc = image.descriptor();
+    if desc.layout_compatible(PixelDescriptor::RGB8) {
+        let img = image.try_as_imgref::<rgb::Rgb<u8>>().unwrap();
+        let ref_rgb = reference.to_rgb8();
+        if img.width() != ref_rgb.width() as usize || img.height() != ref_rgb.height() as usize {
+            eprintln!(
+                "Dimension mismatch: {}x{} vs {}x{}",
+                img.width(),
+                img.height(),
+                ref_rgb.width(),
+                ref_rgb.height()
+            );
+            return Ok(false);
+        }
+
+        let mut max_error = 0u8;
+        let mut error_count = 0;
+
+        for y in 0..img.height() {
+            for x in 0..img.width() {
+                let our_pixel = img[(x, y)];
+                let ref_pixel = ref_rgb.get_pixel(x as u32, y as u32);
+
+                let diff_r = (our_pixel.r as i16 - ref_pixel[0] as i16).unsigned_abs() as u8;
+                let diff_g = (our_pixel.g as i16 - ref_pixel[1] as i16).unsigned_abs() as u8;
+                let diff_b = (our_pixel.b as i16 - ref_pixel[2] as i16).unsigned_abs() as u8;
+
+                let max_channel_diff = diff_r.max(diff_g).max(diff_b);
+
+                if max_channel_diff > max_diff {
+                    max_error = max_error.max(max_channel_diff);
+                    error_count += 1;
+                }
+            }
+        }
+
+        if error_count > 0 {
+            let total_pixels = img.width() * img.height();
+            let error_percent = (error_count as f64 / total_pixels as f64) * 100.0;
+            eprintln!(
+                "Pixel errors: {} ({:.2}%), max error: {}",
+                error_count, error_percent, max_error
+            );
+            return Ok(false);
+        }
+
+        Ok(true)
+    } else {
+        eprintln!("Format comparison not yet implemented");
+        Ok(true) // Skip for now
+    }
+}
+
+#[test]
+#[ignore]
+fn generate_references() {
+    // Generate reference images for a few test files
+    let test_files = vec![
+        "tests/vectors/libavif/sofa_grid1x5_420.avif",
+        "tests/vectors/libavif/colors-profile2-420-8-094.avif",
+        "tests/vectors/libavif/colors_hdr_srgb.avif",
+    ];
+
+    let output_dir = Path::new("tests/references");
+    fs::create_dir_all(output_dir).unwrap();
+
+    for file in test_files {
+        let path = Path::new(file);
+        if path.exists() {
+            match generate_reference(path, output_dir) {
+                Ok(()) => println!("✓ {}", path.display()),
+                Err(e) => eprintln!("✗ {}: {}", path.display(), e),
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn verify_pixel_accuracy() {
+    let test_cases = vec![
+        (
+            "tests/vectors/libavif/sofa_grid1x5_420.avif",
+            "tests/references/sofa_grid1x5_420.png",
+            1,
+        ),
+        (
+            "tests/vectors/libavif/colors-profile2-420-8-094.avif",
+            "tests/references/colors-profile2-420-8-094.png",
+            1,
+        ),
+    ];
+
+    let config = DecoderConfig::new().threads(1);
+    let mut passed = 0;
+    let mut failed = 0;
+
+    for (avif_file, ref_file, max_diff) in test_cases {
+        let avif_path = Path::new(avif_file);
+        let ref_path = Path::new(ref_file);
+
+        if !avif_path.exists() || !ref_path.exists() {
+            eprintln!("⊘ {} (reference not found)", avif_file);
+            continue;
+        }
+
+        eprint!("  {:50} ", avif_path.file_name().unwrap().to_str().unwrap());
+
+        match fs::read(avif_path) {
+            Ok(data) => match decode_with(&data, &config, &Unstoppable) {
+                Ok(image) => match compare_against_reference(&image, ref_path, max_diff) {
+                    Ok(true) => {
+                        eprintln!("✓ Pixels match");
+                        passed += 1;
+                    }
+                    Ok(false) => {
+                        eprintln!("✗ Pixel mismatch");
+                        failed += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("✗ Comparison error: {}", e);
+                        failed += 1;
+                    }
+                },
+                Err(e) => {
+                    eprintln!("✗ Decode error: {}", e);
+                    failed += 1;
+                }
+            },
+            Err(e) => {
+                eprintln!("✗ Read error: {}", e);
+                failed += 1;
+            }
+        }
+    }
+
+    eprintln!("\n📊 Pixel Verification Results:");
+    eprintln!("  Passed: {}", passed);
+    eprintln!("  Failed: {}", failed);
+
+    assert_eq!(failed, 0, "Pixel verification failed for {} files", failed);
+}
+
+/// Find all test vectors in the vectors directory
+fn find_test_vectors() -> Vec<PathBuf> {
+    let mut vectors = Vec::new();
+    let vectors_dir = Path::new("tests/vectors");
+
+    if !vectors_dir.exists() {
+        return vectors;
+    }
+
+    // Walk through all subdirectories
+    if let Ok(entries) = fs::read_dir(vectors_dir) {
+        for entry in entries.flatten() {
+            if let Ok(file_type) = entry.file_type() {
+                if file_type.is_dir() {
+                    // Check subdirectory for .avif files
+                    if let Ok(sub_entries) = fs::read_dir(entry.path()) {
+                        for sub_entry in sub_entries.flatten() {
+                            let path = sub_entry.path();
+                            if path.extension().and_then(|s| s.to_str()) == Some("avif") {
+                                vectors.push(path);
+                            }
+                        }
+                    }
+                } else if entry.path().extension().and_then(|s| s.to_str()) == Some("avif") {
+                    vectors.push(entry.path());
+                }
+            }
+        }
+    }
+
+    vectors.sort();
+    vectors
+}
+
+#[test]
+#[ignore]
+fn verify_against_libavif() {
+    let reference_dir = Path::new("tests/zenavif-references");
+
+    if !reference_dir.exists() {
+        eprintln!("\n⚠️  No libavif references found!");
+        eprintln!("Run: just generate-references");
+        eprintln!("Or:  just docker-build && just generate-references");
+        panic!("libavif references required for pixel verification");
+    }
+
+    let vectors = find_test_vectors();
+    if vectors.is_empty() {
+        eprintln!("\n⚠️  No test vectors found!");
+        eprintln!("Run: just download-vectors");
+        panic!("test vectors required for pixel verification");
+    }
+
+    let config = DecoderConfig::new().threads(1);
+
+    let mut passed = 0;
+    let mut failed = 0;
+    let mut skipped = 0;
+
+    eprintln!("\n📊 Verifying pixel accuracy against libavif...\n");
+
+    for avif_path in vectors {
+        let basename = avif_path.file_stem().unwrap().to_str().unwrap();
+        let ref_path = reference_dir.join(format!("{}.png", basename));
+
+        if !ref_path.exists() {
+            eprintln!("  {:50} ⊘ No libavif reference", basename);
+            skipped += 1;
+            continue;
+        }
+
+        eprint!("  {:50} ", basename);
+
+        let data = match fs::read(&avif_path) {
+            Ok(data) => data,
+            Err(e) => {
+                eprintln!("✗ Read error: {}", e);
+                failed += 1;
+                continue;
+            }
+        };
+
+        match decode_with(&data, &config, &Unstoppable) {
+            Ok(image) => match compare_against_reference(&image, &ref_path, 1) {
+                Ok(true) => {
+                    eprintln!("✓ Matches libavif");
+                    passed += 1;
+                }
+                Ok(false) => {
+                    eprintln!("✗ Pixel mismatch");
+                    failed += 1;
+                }
+                Err(e) => {
+                    eprintln!("✗ Compare error: {}", e);
+                    failed += 1;
+                }
+            },
+            Err(e) => {
+                eprintln!("✗ Decode failed: {}", e);
+                failed += 1;
+            }
+        }
+    }
+
+    eprintln!("\n📊 Pixel Accuracy vs libavif:");
+    eprintln!("  Matches:  {}", passed);
+    eprintln!("  Mismatch: {}", failed);
+    eprintln!("  Skipped:  {}", skipped);
+
+    if failed > 0 {
+        eprintln!("\n❌ {} files have pixel mismatches with libavif", failed);
+        eprintln!("This indicates potential bugs in:");
+        eprintln!("  - YUV to RGB conversion");
+        eprintln!("  - Color space handling");
+        eprintln!("  - Alpha channel processing");
+        eprintln!("  - Chroma upsampling");
+    }
+
+    assert_eq!(failed, 0, "Pixel verification failed for {} files", failed);
+}

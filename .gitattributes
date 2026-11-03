@@ -3,3 +3,7 @@
 # ending has to be pinned here rather than only asserted by scripts/verify-hooks.ps1.
 # See docs/31-scroll-capture-tdd-tasklist.md §4.3.
 /.githooks/* text eol=lf
+
+# Preserve upstream release bytes and reproducible local patches across Windows
+# checkouts; tools/check-hdr-codec-vendor.py verifies them against official tarballs.
+/vendor/** -text

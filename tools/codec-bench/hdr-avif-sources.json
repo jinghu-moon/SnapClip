@@ -11,7 +11,18 @@
       "src/decoder_managed.rs": true,
       "src/encoder.rs": true,
       "src/convert.rs": true
-    }
+    },
+    "vendor": "vendor/zenavif",
+    "archive_omissions": [
+      "Cargo.lock"
+    ],
+    "patch_files": [
+      "src/convert.rs",
+      "src/decoder_managed.rs",
+      "src/encoder.rs",
+      "src/yuv_convert.rs"
+    ],
+    "patch_checksum": "ce4d92dcc65bb9b12ac6d03124be5581de2d4010529d0bb971e92db816dd050c"
   },
   {
     "name": "zenravif",
@@ -33,7 +44,15 @@
     "source": "https://crates.io/api/v1/crates/zenavif-parse/0.6.2",
     "extracted_source_matches_verified_archive": {
       "Cargo.toml": true
-    }
+    },
+    "vendor": "vendor/zenavif-parse",
+    "archive_omissions": [
+      "Cargo.lock"
+    ],
+    "patch_files": [
+      "src/lib.rs"
+    ],
+    "patch_checksum": "8906c85f9ecc5165e20eba916654f81e12166760387ee2b168797ccf4e6ff844"
   },
   {
     "name": "zenavif-serialize",

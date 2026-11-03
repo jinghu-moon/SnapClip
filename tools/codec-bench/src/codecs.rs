@@ -13,6 +13,7 @@ pub struct Outcome {
     pub bytes: usize,
     pub millis: f64,
     pub peak_extra: usize,
+    pub largest_allocation: usize,
 }
 
 /// A JPEG quality and subsampling choice, so the report can name what it ran.

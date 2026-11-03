@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
+static LARGEST: AtomicUsize = AtomicUsize::new(0);
 
 /// Wraps the system allocator and keeps a live total plus a peak.
 pub struct Counting;
@@ -17,6 +18,7 @@ unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let pointer = unsafe { System.alloc(layout) };
         if !pointer.is_null() {
+            LARGEST.fetch_max(layout.size(), Ordering::Relaxed);
             account(layout.size());
         }
         pointer
@@ -30,6 +32,7 @@ unsafe impl GlobalAlloc for Counting {
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         let moved = unsafe { System.realloc(pointer, layout, new_size) };
         if !moved.is_null() {
+            LARGEST.fetch_max(new_size, Ordering::Relaxed);
             if new_size >= layout.size() {
                 account(new_size - layout.size());
             } else {
@@ -61,9 +64,15 @@ pub fn live() -> usize {
 pub fn peak_extra<T>(body: impl FnOnce() -> T) -> (T, usize) {
     let before = live();
     PEAK.store(before, Ordering::Relaxed);
+    LARGEST.store(0, Ordering::Relaxed);
     let value = body();
     let peak = PEAK.load(Ordering::Relaxed);
     (value, peak.saturating_sub(before))
+}
+
+/// Largest successful allocation/reallocation since `peak_extra` began.
+pub fn largest_allocation() -> usize {
+    LARGEST.load(Ordering::Relaxed)
 }
 
 /// Serialises the tests that read the process-wide peak.
@@ -87,6 +96,7 @@ mod tests {
         let (length, peak) = peak_extra(|| vec![7u8; 1 << 20].len());
         assert_eq!(length, 1 << 20);
         assert!(peak >= 1 << 20, "peak {peak} should cover the megabyte");
+        assert!(largest_allocation() >= 1 << 20);
         // Only the peak is asserted: the live counter is process-wide, so other test threads
         // allocate concurrently and an absolute total here would be flaky by construction.
         assert!(peak >= 1 << 20);

@@ -1,0 +1,24 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1843,7 +1843,20 @@
+         let track_config = animation_data.as_ref().map(|a| &a.codec_config);
+         let av1_config = find_prop!(AV1Config)
+             .or_else(|| track_config.and_then(|c| c.av1_config.clone()));
+-        let color_info = find_prop!(ColorInformation)
++        // ICC governs color management independently of property order. The
++        // decoder still obtains sample matrix/range from the AV1 bitstream.
++        let color_info = meta.properties.iter().find_map(|p| {
++            if p.item_id == meta.primary_item_id {
++                match &p.property {
++                    ItemProperty::ColorInformation(info @ ColorInformation::IccProfile(_)) => {
++                        Some(info.clone())
++                    }
++                    _ => None,
++                }
++            } else {
++                None
++            }
++        }).or_else(|| find_prop!(ColorInformation))
+             .or_else(|| track_config.and_then(|c| c.color_info.clone()));
+         let rotation = find_prop!(Rotation);
+         let mirror = find_prop!(Mirror);

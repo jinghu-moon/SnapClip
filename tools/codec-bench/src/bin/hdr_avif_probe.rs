@@ -2,6 +2,7 @@
 //! Synthetic fixtures are generated here; no user's image or clipboard is read.
 use almost_enough::StopToken;
 use enough::{Stop, StopReason, Unstoppable};
+use rgb::Rgb;
 use rgb::Rgba;
 use std::sync::{
     Arc,
@@ -11,6 +12,11 @@ use zenavif::{
     DecoderConfig, EncodeAlphaMode, EncodeBitDepth, EncodeColorModel, EncodePixelRange,
     EncoderConfig, ManagedAvifDecoder,
 };
+
+#[path = "../alloc_probe.rs"]
+mod alloc_probe;
+#[global_allocator]
+static ALLOCATOR: alloc_probe::Counting = alloc_probe::Counting;
 
 #[derive(Clone)]
 struct CancelAfter {
@@ -130,16 +136,41 @@ fn write_fixtures(
 }
 
 fn main() -> Result<(), String> {
+    // Windows' main thread has a 1 MiB stack. The safe AV1 decoder's debug
+    // frames exceed that; use a bounded worker stack for this diagnostic CLI.
+    std::thread::Builder::new()
+        .name("hdr-avif-qualification".into())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(run)
+        .map_err(|e| e.to_string())?
+        .join()
+        .map_err(|_| "qualification worker panicked")?
+}
+
+fn run() -> Result<(), String> {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if let [flag, width, height] = arguments.as_slice()
+        && flag == "--resources"
+    {
+        return resources(
+            width.parse().map_err(|_| "invalid width")?,
+            height.parse().map_err(|_| "invalid height")?,
+        );
+    }
+    if let [flag, input, output] = arguments.as_slice()
+        && flag == "--decode"
+    {
+        return decode_file(std::path::Path::new(input), std::path::Path::new(output));
+    }
     let pixels = fixture();
     let original = pixels.clone();
     let bytes = encode(&pixels, &config(), StopToken::new(Unstoppable));
-    let arguments: Vec<String> = std::env::args().skip(1).collect();
     match arguments.as_slice() {
         [] => {}
         [flag, directory] if flag == "--fixture-dir" => {
             write_fixtures(std::path::Path::new(directory), &pixels, &bytes)?
         }
-        _ => return Err("usage: hdr-avif-probe [--fixture-dir DIRECTORY]".into()),
+        _ => return Err("usage: hdr-avif-probe [--fixture-dir DIRECTORY | --decode INPUT OUTPUT | --resources WIDTH HEIGHT]".into()),
     }
     let mut decoder =
         ManagedAvifDecoder::new(&bytes, &decode_config()).map_err(|e| e.to_string())?;
@@ -196,6 +227,13 @@ fn main() -> Result<(), String> {
     }
     if pixels != original {
         failures.push("encoder changed its input".into());
+    }
+    let directory = match arguments.as_slice() {
+        [_, directory] => Some(std::path::Path::new(directory)),
+        _ => None,
+    };
+    if let Err(error) = check_color_encoders(directory) {
+        failures.push(error);
     }
     println!(
         "pq10_rgb_alpha bytes={} tags_ok={tags_ok} max_code_error={max_code_error:.6} max_nit_error={max_nit_error:.6}",
@@ -295,9 +333,358 @@ fn main() -> Result<(), String> {
     }
 }
 
+fn check_color_encoders(directory: Option<&std::path::Path>) -> Result<(), String> {
+    let source: Vec<Rgba<u16>> = (0..512)
+        .map(|index| {
+            let level = ((index % 32) / 4) as u16 * 128;
+            Rgba::new(
+                sample(level),
+                sample((level + 256) % 1024),
+                sample((level + 512) % 1024),
+                sample([0, 1, 512, 1023][(index / 4) % 4]),
+            )
+        })
+        .collect();
+    for alpha in [false, true] {
+        let expected: Vec<Rgba<u16>> = source
+            .iter()
+            .map(|p| Rgba::new(p.r, p.g, p.b, if alpha { p.a } else { u16::MAX }))
+            .collect();
+        let bytes = if alpha {
+            encode(&source, &config(), StopToken::new(Unstoppable))
+        } else {
+            let rgb: Vec<Rgb<u16>> = source.iter().map(|p| Rgb::new(p.r, p.g, p.b)).collect();
+            zenavif::encode_rgb16(
+                imgref::Img::new(rgb.as_slice(), 32, 16),
+                &config(),
+                StopToken::new(Unstoppable),
+            )
+            .map_err(|e| e.to_string())?
+            .avif_file
+        };
+        let name = if alpha {
+            "rgba10-colored"
+        } else {
+            "rgb10-colored"
+        };
+        // Write before the assertion so an independent decoder can determine
+        // whether a failure belongs to the encoder or the candidate decoder.
+        if let Some(directory) = directory {
+            std::fs::write(directory.join(format!("{name}.avif")), &bytes)
+                .map_err(|e| e.to_string())?;
+            let expected_bytes: Vec<u8> = expected
+                .iter()
+                .flat_map(|p| [p.r, p.g, p.b, p.a])
+                .flat_map(u16::to_le_bytes)
+                .collect();
+            std::fs::write(
+                directory.join(format!("{name}-expected.bin")),
+                expected_bytes,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        let mut decoder =
+            ManagedAvifDecoder::new(&bytes, &decode_config()).map_err(|e| e.to_string())?;
+        let (decoded, info) = decoder
+            .decode_full(&Unstoppable)
+            .map_err(|e| e.to_string())?;
+        if info.bit_depth != 10
+            || info.color_primaries.0 != 9
+            || info.transfer_characteristics.0 != 16
+            || info.matrix_coefficients.0 != 0
+            || info.color_range != zenavif::ColorRange::Full
+            || info.has_alpha != alpha
+            || info.premultiplied_alpha
+        {
+            return Err(format!(
+                "{name}: unexpected encoded color/Alpha metadata: {info:?}"
+            ));
+        }
+        let pixels: Vec<Rgba<u16>> = if alpha {
+            decoded
+                .try_as_imgref::<Rgba<u16>>()
+                .ok_or("expected RGBA16")?
+                .pixels()
+                .collect()
+        } else {
+            decoded
+                .try_as_imgref::<Rgb<u16>>()
+                .ok_or("expected RGB16")?
+                .pixels()
+                .map(|p| Rgba::new(p.r, p.g, p.b, u16::MAX))
+                .collect()
+        };
+        let max_error = expected
+            .iter()
+            .zip(&pixels)
+            .flat_map(|(a, b)| [(a.r, b.r), (a.g, b.g), (a.b, b.b), (a.a, b.a)])
+            .map(|(a, b)| f64::from(a.abs_diff(b)) * 1023. / 65535.)
+            .fold(0.0_f64, f64::max);
+        println!(
+            "{name} max_code_error={max_error:.6} expected_first={:?} actual_first={:?}",
+            expected[0], pixels[0]
+        );
+        if max_error > 2. {
+            return Err(format!("{name} exceeded unchanged 2/1023 budget"));
+        }
+    }
+    Ok(())
+}
+
+fn resources(width: usize, height: usize) -> Result<(), String> {
+    if !matches!((width, height), (3840, 2160) | (8256, 5504)) {
+        return Err("resource qualification accepts only 4K or 45MP synthetic input".into());
+    }
+    let _measurement = alloc_probe::test_guard();
+    let count = width.checked_mul(height).ok_or("pixel count overflow")?;
+    let pixels: Vec<Rgba<u16>> = (0..height)
+        .flat_map(|y| {
+            (0..width).map(move |x| {
+                let red = ((x / 128 + y / 128) % 8) as u16 * 128;
+                Rgba::new(
+                    sample(red),
+                    sample(((red / 128 + 2) % 8) * 128),
+                    sample(((red / 128 + 4) % 8) * 128),
+                    sample([0, 256, 512, 1023][(x / 128) % 4]),
+                )
+            })
+        })
+        .collect();
+    println!(
+        "resource_input width={width} height={height} pixels={count} input_bytes={}",
+        count * size_of::<Rgba<u16>>()
+    );
+    let begin = std::time::Instant::now();
+    let (result, peak) = alloc_probe::peak_extra(|| {
+        zenavif::encode_rgba16(
+            imgref::Img::new(pixels.as_slice(), width, height),
+            &config(),
+            StopToken::new(Unstoppable),
+        )
+    });
+    let bytes = result.map_err(|e| e.to_string())?.avif_file;
+    println!(
+        "resource_encode elapsed_ms={:.3} heap_peak_delta={peak} largest_allocation={} encoded_bytes={}",
+        begin.elapsed().as_secs_f64() * 1000.,
+        alloc_probe::largest_allocation(),
+        bytes.len()
+    );
+    let decode_config = decode_config().frame_size_limit(count as u32);
+    let begin = std::time::Instant::now();
+    let (result, peak) = alloc_probe::peak_extra(|| {
+        let mut decoder = ManagedAvifDecoder::new(&bytes, &decode_config)?;
+        decoder.decode_full(&Unstoppable)
+    });
+    let (decoded, info) = result.map_err(|e| e.to_string())?;
+    println!(
+        "resource_decode elapsed_ms={:.3} heap_peak_delta={peak} largest_allocation={}",
+        begin.elapsed().as_secs_f64() * 1000.,
+        alloc_probe::largest_allocation()
+    );
+    if info.width as usize != width || info.height as usize != height || info.bit_depth != 10 {
+        return Err("resource decode dimensions/depth changed".into());
+    }
+    let actual = decoded
+        .try_as_imgref::<Rgba<u16>>()
+        .ok_or("resource output is not RGBA16")?;
+    let max_error = pixels
+        .iter()
+        .zip(actual.pixels())
+        .flat_map(|(a, b)| [(a.r, b.r), (a.g, b.g), (a.b, b.b), (a.a, b.a)])
+        .map(|(a, b)| f64::from(a.abs_diff(b)) * 1023. / 65535.)
+        .fold(0.0_f64, f64::max);
+    println!("resource_roundtrip max_code_error={max_error:.6}");
+    if max_error > 2. {
+        return Err("resource roundtrip exceeded 2/1023".into());
+    }
+    drop(decoded);
+    for operation in ["encode", "decode"] {
+        let stop = TimedStop::new(std::time::Duration::from_millis(10));
+        let started = std::time::Instant::now();
+        let cancelled = if operation == "encode" {
+            zenavif::encode_rgba16(
+                imgref::Img::new(pixels.as_slice(), width, height),
+                &config(),
+                StopToken::new(stop.clone()),
+            )
+            .is_err_and(|e| e.to_string().to_lowercase().contains("cancel"))
+        } else {
+            let mut decoder =
+                ManagedAvifDecoder::new(&bytes, &decode_config).map_err(|e| e.to_string())?;
+            decoder
+                .decode_full(&stop)
+                .is_err_and(|e| e.to_string().to_lowercase().contains("cancel"))
+        };
+        let elapsed = started.elapsed().as_secs_f64() * 1000.;
+        println!(
+            "resource_cancel operation={operation} deadline_ms=10 elapsed_ms={elapsed:.3} checks={} successful_checks={} cancelled={cancelled}",
+            stop.calls.load(Ordering::Relaxed),
+            stop.passed.load(Ordering::Relaxed)
+        );
+        if !cancelled || stop.passed.load(Ordering::Relaxed) == 0 {
+            return Err(format!(
+                "{operation}: did not exercise cancellation after work started"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct TimedStop {
+    deadline: std::time::Instant,
+    calls: Arc<AtomicUsize>,
+    passed: Arc<AtomicUsize>,
+}
+impl TimedStop {
+    fn new(delay: std::time::Duration) -> Self {
+        Self {
+            deadline: std::time::Instant::now() + delay,
+            calls: Arc::new(AtomicUsize::new(0)),
+            passed: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+impl Stop for TimedStop {
+    fn check(&self) -> Result<(), StopReason> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        if std::time::Instant::now() >= self.deadline {
+            Err(StopReason::Cancelled)
+        } else {
+            self.passed.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+}
+
+// Qualification interface for independently generated 8/10/12-bit fixtures.
+// All outputs are straight, full-range RGBA64LE; no transfer function is applied.
+fn decode_file(input: &std::path::Path, output: &std::path::Path) -> Result<(), String> {
+    let bytes = std::fs::read(input).map_err(|e| e.to_string())?;
+    let mut decoder =
+        ManagedAvifDecoder::new(&bytes, &decode_config()).map_err(|e| e.to_string())?;
+    let (pixels, info) = decoder
+        .decode_full(&Unstoppable)
+        .map_err(|e| e.to_string())?;
+    let words: Vec<u16> = if let Some(image) = pixels.try_as_imgref::<Rgba<u16>>() {
+        image.pixels().flat_map(|p| [p.r, p.g, p.b, p.a]).collect()
+    } else if let Some(image) = pixels.try_as_imgref::<Rgb<u16>>() {
+        image
+            .pixels()
+            .flat_map(|p| [p.r, p.g, p.b, u16::MAX])
+            .collect()
+    } else if let Some(image) = pixels.try_as_imgref::<Rgba<u8>>() {
+        image
+            .pixels()
+            .flat_map(|p| [p.r, p.g, p.b, p.a].map(|v| u16::from(v) * 257))
+            .collect()
+    } else if let Some(image) = pixels.try_as_imgref::<Rgb<u8>>() {
+        image
+            .pixels()
+            .flat_map(|p| {
+                [
+                    u16::from(p.r) * 257,
+                    u16::from(p.g) * 257,
+                    u16::from(p.b) * 257,
+                    u16::MAX,
+                ]
+            })
+            .collect()
+    } else {
+        return Err("unsupported qualification pixel layout".into());
+    };
+    let output_bytes: Vec<u8> = words.into_iter().flat_map(u16::to_le_bytes).collect();
+    std::fs::write(output, output_bytes).map_err(|e| e.to_string())?;
+    std::fs::write(
+        output.with_extension("icc"),
+        info.icc_profile.as_deref().unwrap_or_default(),
+    )
+    .map_err(|e| e.to_string())?;
+    println!(
+        "{{\"width\":{},\"height\":{},\"depth\":{},\"primaries\":{},\"transfer\":{},\"matrix\":{},\"full\":{},\"alpha\":{},\"icc_bytes\":{}}}",
+        info.width,
+        info.height,
+        info.bit_depth,
+        info.color_primaries.0,
+        info.transfer_characteristics.0,
+        info.matrix_coefficients.0,
+        info.color_range == zenavif::ColorRange::Full,
+        info.has_alpha,
+        info.icc_profile.as_ref().map_or(0, Vec::len)
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn colored_rgb16_and_rgba16_encoders_preserve_channels_and_alpha_boundaries() {
+        check_color_encoders(None).unwrap();
+    }
+    #[test]
+    fn rgb16_and_rgba16_encoders_honor_stride_without_reading_padding_or_mutating_input() {
+        let expected = Rgba::new(sample(0), sample(256), sample(1023), sample(512));
+        let mut source = vec![Rgba::new(u16::MAX, 0, 0, u16::MAX); 40 * 16];
+        for row in source.as_chunks_mut::<40>().0 {
+            row[..32].fill(expected);
+        }
+        let original = source.clone();
+        let rgb: Vec<Rgb<u16>> = source.iter().map(|p| Rgb::new(p.r, p.g, p.b)).collect();
+        for alpha in [false, true] {
+            let bytes = if alpha {
+                zenavif::encode_rgba16(
+                    imgref::Img::new_stride(source.as_slice(), 32, 16, 40),
+                    &config(),
+                    StopToken::new(Unstoppable),
+                )
+                .unwrap()
+                .avif_file
+            } else {
+                zenavif::encode_rgb16(
+                    imgref::Img::new_stride(rgb.as_slice(), 32, 16, 40),
+                    &config(),
+                    StopToken::new(Unstoppable),
+                )
+                .unwrap()
+                .avif_file
+            };
+            let mut decoder = ManagedAvifDecoder::new(&bytes, &decode_config()).unwrap();
+            let (decoded, info) = decoder.decode_full(&Unstoppable).unwrap();
+            assert_eq!((info.width, info.height), (32, 16));
+            if alpha {
+                for actual in decoded.try_as_imgref::<Rgba<u16>>().unwrap().pixels() {
+                    assert_eq!(actual, expected);
+                }
+            } else {
+                for actual in decoded.try_as_imgref::<Rgb<u16>>().unwrap().pixels() {
+                    assert_eq!(actual, Rgb::new(expected.r, expected.g, expected.b));
+                }
+            }
+        }
+        assert_eq!(source, original);
+    }
+    #[test]
+    fn identity_rgb_keeps_black_gray_and_alpha_in_native_10bit_codes() {
+        let source = fixture();
+        let bytes = encode(&source, &config(), StopToken::new(Unstoppable));
+        let mut decoder = ManagedAvifDecoder::new(&bytes, &decode_config()).unwrap();
+        let (pixels, _) = decoder.decode_full(&Unstoppable).unwrap();
+        let image = pixels.try_as_imgref::<Rgba<u16>>().unwrap();
+        for (expected, actual) in source.iter().zip(image.pixels()) {
+            for (a, b) in [
+                (expected.r, actual.r),
+                (expected.g, actual.g),
+                (expected.b, actual.b),
+                (expected.a, actual.a),
+            ] {
+                assert!(
+                    f64::from(a.abs_diff(b)) * 1023.0 / 65535.0 <= 2.0,
+                    "expected={expected:?}, actual={actual:?}"
+                );
+            }
+        }
+    }
     #[test]
     fn independent_pq_reference_has_known_endpoints_and_preserves_alpha_codes() {
         assert!(nits(0.0).abs() < 1e-9);

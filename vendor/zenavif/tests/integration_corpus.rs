@@ -1,0 +1,231 @@
+//! Integration tests with real AVIF test vectors
+//!
+//! Run with: cargo test --features managed --test integration_corpus -- --ignored
+//! Or: just test-integration
+
+use enough::Unstoppable;
+use std::fs;
+use std::path::PathBuf;
+use zenavif::{DecoderConfig, decode_with};
+use zenpixels::PixelDescriptor;
+
+fn find_test_vectors() -> Vec<PathBuf> {
+    let mut vectors = Vec::new();
+    let test_dirs = [
+        "tests/vectors/libavif",
+        "tests/vectors/cavif",
+        "tests/vectors/avif-parse",
+    ];
+
+    for dir in &test_dirs {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("avif") {
+                    vectors.push(path);
+                }
+            }
+        }
+    }
+
+    vectors.sort();
+    vectors
+}
+
+#[test]
+#[ignore] // Run with: cargo test -- --ignored
+fn test_decode_all_vectors() {
+    let vectors = find_test_vectors();
+
+    if vectors.is_empty() {
+        eprintln!("⚠️  No test vectors found!");
+        eprintln!("Run: bash scripts/download-avif-test-vectors.sh");
+        eprintln!("Then re-run tests with: cargo test -- --ignored");
+        return;
+    }
+
+    eprintln!("\n🔍 Testing {} AVIF files...\n", vectors.len());
+
+    // Use single-threaded decoder to avoid rav1d-safe threading issues
+    let config = DecoderConfig::new().threads(1);
+
+    let mut passed = 0;
+    let mut failed = 0;
+    let mut failed_files = Vec::new();
+
+    for path in &vectors {
+        eprint!("  {:50} ", path.file_name().unwrap().to_string_lossy());
+
+        match fs::read(path) {
+            Ok(data) => {
+                let config = config.clone();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    decode_with(&data, &config, &Unstoppable)
+                }));
+                match result {
+                    Ok(Ok(image)) => {
+                        let desc = image.descriptor();
+                        let fmt = if desc.layout_compatible(PixelDescriptor::RGB8) {
+                            "RGB8"
+                        } else if desc.layout_compatible(PixelDescriptor::RGBA8) {
+                            "RGBA8"
+                        } else if desc.layout_compatible(PixelDescriptor::RGB16) {
+                            "RGB16"
+                        } else if desc.layout_compatible(PixelDescriptor::RGBA16) {
+                            "RGBA16"
+                        } else if desc.layout_compatible(PixelDescriptor::GRAY8) {
+                            "GRAY8"
+                        } else if desc.layout_compatible(PixelDescriptor::GRAY16) {
+                            "GRAY16"
+                        } else {
+                            "OTHER"
+                        };
+                        let info = format!("{:6} {}x{}", fmt, image.width(), image.height());
+                        eprintln!("✓ {}", info);
+                        passed += 1;
+                    }
+                    Ok(Err(e)) => {
+                        eprintln!("✗ {}", e);
+                        failed += 1;
+                        failed_files.push((path.clone(), e.to_string()));
+                    }
+                    Err(panic_info) => {
+                        let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                            s.to_string()
+                        } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "unknown panic".to_string()
+                        };
+                        eprintln!("✗ PANIC: {}", msg);
+                        failed += 1;
+                        failed_files.push((path.clone(), format!("PANIC: {}", msg)));
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("✗ Read error: {}", e);
+                failed += 1;
+                failed_files.push((path.clone(), format!("Read error: {}", e)));
+            }
+        }
+    }
+
+    eprintln!("\n📊 Results:");
+    eprintln!(
+        "  Passed: {} ({:.1}%)",
+        passed,
+        passed as f64 / vectors.len() as f64 * 100.0
+    );
+    eprintln!(
+        "  Failed: {} ({:.1}%)",
+        failed,
+        failed as f64 / vectors.len() as f64 * 100.0
+    );
+    eprintln!("  Total:  {}", vectors.len());
+
+    if !failed_files.is_empty() {
+        eprintln!("\n❌ Failed files:");
+        for (path, error) in &failed_files {
+            eprintln!("  - {:?}: {}", path.file_name().unwrap(), error);
+        }
+    }
+
+    // All 55 test vectors should decode successfully
+    assert!(
+        failed == 0,
+        "Expected 100% pass rate but {failed} files failed: {:?}",
+        failed_files
+            .iter()
+            .map(|(p, e)| format!("{}: {}", p.display(), e))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+#[ignore]
+fn test_decode_specific_formats() {
+    // Test specific important format combinations
+    let test_cases = vec![
+        ("8-bit 4:2:0", "tests/vectors/libavif/8bit_420.avif"),
+        ("10-bit 4:4:4", "tests/vectors/libavif/10bit_444.avif"),
+        ("With alpha", "tests/vectors/libavif/alpha.avif"),
+    ];
+
+    let config = DecoderConfig::new().threads(1);
+
+    for (name, path) in test_cases {
+        if let Ok(data) = fs::read(path) {
+            eprintln!("Testing {}...", name);
+            match decode_with(&data, &config, &Unstoppable) {
+                Ok(image) => {
+                    eprintln!("  ✓ {}x{}", image.width(), image.height());
+                }
+                Err(e) => {
+                    eprintln!("  ⚠️  {}", e);
+                }
+            }
+        } else {
+            eprintln!("  ⚠️  File not found: {}", path);
+        }
+    }
+}
+
+#[test]
+fn test_yuv_crate_sanity() {
+    use yuv::{YuvPlanarImage, YuvRange, YuvStandardMatrix};
+
+    let width = 4;
+    let height = 4;
+
+    // Test 1: Gray (128,128,128) should stay gray
+    let y_plane = vec![128u8; width * height];
+    let u_plane = vec![128u8; width * height];
+    let v_plane = vec![128u8; width * height];
+
+    let planar = YuvPlanarImage {
+        y_plane: &y_plane,
+        y_stride: width as u32,
+        u_plane: &u_plane,
+        u_stride: width as u32,
+        v_plane: &v_plane,
+        v_stride: width as u32,
+        width: width as u32,
+        height: height as u32,
+    };
+
+    let mut rgb = vec![0u8; width * height * 3];
+    let rgb_stride = (width * 3) as u32;
+
+    yuv::yuv444_to_rgb(
+        &planar,
+        &mut rgb,
+        rgb_stride,
+        YuvRange::Full,
+        YuvStandardMatrix::Bt601,
+    )
+    .unwrap();
+
+    eprintln!(
+        "Gray test: YUV (128, 128, 128) -> RGB ({}, {}, {})",
+        rgb[0], rgb[1], rgb[2]
+    );
+    eprintln!("Expected: RGB (128, 128, 128)");
+
+    // Allow small rounding error
+    assert!(
+        (rgb[0] as i16 - 128).abs() <= 1,
+        "Red channel off: {}",
+        rgb[0]
+    );
+    assert!(
+        (rgb[1] as i16 - 128).abs() <= 1,
+        "Green channel off: {}",
+        rgb[1]
+    );
+    assert!(
+        (rgb[2] as i16 - 128).abs() <= 1,
+        "Blue channel off: {}",
+        rgb[2]
+    );
+}

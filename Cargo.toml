@@ -30,11 +30,13 @@ members = [
     "tools/icon-bake",
     "tools/codec-bench",
 ]
-exclude = ["crates/rapid-ocr-rs"]
+exclude = ["crates/rapid-ocr-rs", "vendor/zenavif", "vendor/zenavif-parse"]
 
 # Yue and the existing Kit components share one GPUI/Base graph. Cargo patches
 # belong to the consuming workspace, not the path dependency's workspace.
 [patch.crates-io]
+zenavif = { path = "vendor/zenavif" }
+zenavif-parse = { path = "vendor/zenavif-parse" }
 gpui-base = { path = "../GPUI-Yue-Component/vendor/gpui-base" }
 gpui-pre = { path = "../GPUI-Yue-Component/vendor/gpui-pre" }
 gpui-pre-windows = { path = "../GPUI-Yue-Component/vendor/gpui-pre-windows" }

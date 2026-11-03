@@ -247,6 +247,7 @@ fn run_report() {
                             bytes: 0,
                             millis: f64::NAN,
                             peak_extra: usize::MAX,
+                            largest_allocation: usize::MAX,
                         },
                     ));
                 }
@@ -582,6 +583,7 @@ fn measure(
 ) -> Result<Outcome, String> {
     let mut times = Vec::with_capacity(iterations);
     let mut peak = 0usize;
+    let mut largest = 0usize;
     let mut bytes = 0usize;
     for _ in 0..iterations {
         let started = Instant::now();
@@ -594,6 +596,7 @@ fn measure(
         let (result, extra) = caught.map_err(|_| "panicked".to_string())?;
         bytes = result?;
         peak = peak.max(extra);
+        largest = largest.max(alloc_probe::largest_allocation());
         times.push(elapsed.as_secs_f64() * 1000.0);
     }
     times.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
@@ -607,6 +610,7 @@ fn measure(
         bytes,
         millis,
         peak_extra: peak,
+        largest_allocation: largest,
     })
 }
 
@@ -616,8 +620,8 @@ fn megabytes(bytes: usize) -> f64 {
 
 fn print_table(rows: &[(&'static str, String, Outcome)]) {
     println!(
-        "\n{:<12} {:<32} {:>11} {:>10} {:>11}",
-        "asset", "encoder", "bytes", "median ms", "peak +MB"
+        "\n{:<12} {:<32} {:>11} {:>10} {:>11} {:>11}",
+        "asset", "encoder", "bytes", "median ms", "peak +MB", "max alloc MB"
     );
     println!("{}", "-".repeat(80));
     for (asset, label, outcome) in rows {
@@ -626,12 +630,13 @@ fn print_table(rows: &[(&'static str, String, Outcome)]) {
             continue;
         }
         println!(
-            "{:<12} {:<32} {:>11} {:>10.1} {:>11.1}",
+            "{:<12} {:<32} {:>11} {:>10.1} {:>11.1} {:>11.1}",
             asset,
             label,
             outcome.bytes,
             outcome.millis,
-            megabytes(outcome.peak_extra)
+            megabytes(outcome.peak_extra),
+            megabytes(outcome.largest_allocation)
         );
     }
 }
