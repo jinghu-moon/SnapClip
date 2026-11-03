@@ -574,7 +574,7 @@ cargo test --release -p snapclip-pin --lib paint_pin_cost -- --ignored --nocaptu
 <!-- entity-map:start -->
 | 设计名 | 落地符号 | 位置 | 状态 |
 |---|---|---|---|
-| `PinManager` | `PinManager` | `crates/snapclip-pin/src/host.rs` | 已实现 |
+| `PinManager` | `PinManager` | `crates/snapclip-pin/src/manager.rs` | 已实现（F3/F6 生命周期协调） |
 | `PinCommand` | *(P2 计划)* | `crates/snapclip-pin/src/lib.rs` | *(P2 计划)* |
 | `PinEvent` | `PinEvent` | `crates/snapclip-pin/src/host.rs` | 已实现 |
 | `PinSource` | `PinSource` | `apps/snapclip/src/capture/pin_source.rs` | 已实现（转发句柄，形态与原计划不同，见 §3.4） |
