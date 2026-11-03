@@ -65,7 +65,9 @@ pub(crate) fn read_source(source: &CaptureSource) -> Result<PinImage, String> {
     let len = (row as u64)
         .checked_mul(u64::from(metadata.height))
         .filter(|n| *n > 0 && *n <= MAX_BYTES)
-        .ok_or("原始图片超过 256 MiB 交互预算，无法打开或复制；历史保真源仍保留，缩略图不会代替原图")?;
+        .ok_or(
+            "原始图片超过 256 MiB 交互预算，无法打开或复制；历史保真源仍保留，缩略图不会代替原图",
+        )?;
     let pixels = match source.artifact.mime.as_str() {
         "application/x-snapclip-pixels" => {
             let mut master = PixelMaster::open(&source.artifact).map_err(|e| e.to_string())?;

@@ -15,7 +15,7 @@
 //! 1. `A_CLASS` 覆盖了 [`BEHAVIOURS`] 这个**闭集**——多一个行为少一个行为都红，
 //!    没有通配分支（同 `snapclip-model` 里 `CaptureState` 的穷举测试）。
 //! 2. 每一行点名的文件存在、文件里真的有 `fn <test>(`。
-//! 3. 被冻住的测试**本身不是** `#[ignore]`——一个不跑的测试冻不住任何东西。
+//! 3. 普通测试不能 ignore；GPU 专用测试单独冻结并必须显式执行，不能虚报为普通测试。
 //! 4. [`DESKTOP_ONLY`] 里那些真实桌面探针仍然存在、**并且仍然被 `#[ignore]`**
 //!    （P6 退出条件 ①：不得出现非 `#[ignore]` 的真实桌面用例）。
 //!
@@ -129,16 +129,11 @@ const A_CLASS: &[Frozen] = &[
         file: "crates/snapclip-capture/src/windows/overlay/tests.rs",
         test: "the_preview_label_names_the_element_it_snapped_to",
     },
-    Frozen {
-        behaviour: "browser_window",
-        file: "crates/snapclip-capture/src/windows/win/d2d/tests.rs",
-        test: "an_element_preview_keeps_its_own_pixels_and_the_window_fallback_does_not",
-    },
     // 快捷键：F5 是本进程注册的全局热键，Esc/Enter 是会话内的键
     Frozen {
         behaviour: "hotkey",
         file: "crates/snapclip-capture/src/windows/hotkey.rs",
-        test: "f5_is_registered_without_modifiers_and_with_repeat_suppressed",
+        test: "the_second_hotkey_is_registered_with_the_same_discipline",
     },
     Frozen {
         behaviour: "hotkey",
@@ -148,7 +143,7 @@ const A_CLASS: &[Frozen] = &[
     Frozen {
         behaviour: "hotkey",
         file: "crates/snapclip-capture/src/windows/hotkey.rs",
-        test: "conflict_errors_are_distinguishable_from_other_failures",
+        test: "each_conflict_message_names_its_own_key",
     },
     // Cancel：Esc 从每个活跃状态回到 idle；窗口销毁与设备移除走同一条清理
     Frozen {
@@ -274,6 +269,15 @@ const DESKTOP_ONLY: &[Frozen] = &[
     },
 ];
 
+/// GPU pixels remain part of the frozen behaviour set, but cannot truthfully be
+/// called an ordinary test. D-14 already made this test opt-in; preserve both its
+/// name and that contract. Execute it explicitly alongside this manifest check.
+const GPU_A_CLASS: &[Frozen] = &[Frozen {
+    behaviour: "browser_window",
+    file: "crates/snapclip-capture/src/windows/win/d2d/tests.rs",
+    test: "an_element_preview_keeps_its_own_pixels_and_the_window_fallback_does_not",
+}];
+
 fn repo_root() -> PathBuf {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     // `apps/snapclip` -> the repository root
@@ -323,6 +327,10 @@ fn the_regression_suite_names_the_behaviours_it_freezes() {
         "the A-class list is empty: nothing is frozen, so `P6.03`/`P6.04` would be deleting \
          into an untested tree"
     );
+    assert!(
+        !GPU_A_CLASS.is_empty(),
+        "the frozen GPU behaviour set must remain explicit"
+    );
 
     // 1. Closed set: no row names an unknown behaviour, no behaviour is left unfrozen.
     let declared: BTreeSet<&str> = BEHAVIOURS.iter().copied().collect();
@@ -331,7 +339,11 @@ fn the_regression_suite_names_the_behaviours_it_freezes() {
         BEHAVIOURS.len(),
         "`BEHAVIOURS` repeats an entry"
     );
-    let named: BTreeSet<&str> = A_CLASS.iter().map(|row| row.behaviour).collect();
+    let named: BTreeSet<&str> = A_CLASS
+        .iter()
+        .chain(GPU_A_CLASS)
+        .map(|row| row.behaviour)
+        .collect();
     for behaviour in &named {
         assert!(
             declared.contains(behaviour),
@@ -345,8 +357,13 @@ fn the_regression_suite_names_the_behaviours_it_freezes() {
         );
     }
 
-    // 2. Every row resolves to a real test, and that test is not skipped.
-    for row in A_CLASS {
+    // 2. Ordinary rows run by default; GPU rows retain their explicit opt-in.
+    // Neither list may silently discard a frozen test or change its execution layer.
+    for (row, gpu) in A_CLASS
+        .iter()
+        .map(|row| (row, false))
+        .chain(GPU_A_CLASS.iter().map(|row| (row, true)))
+    {
         let source = read(row.file);
         assert!(
             defines_fn(&source, row.test),
@@ -355,9 +372,10 @@ fn the_regression_suite_names_the_behaviours_it_freezes() {
             row.test,
             row.behaviour
         );
-        assert!(
-            !is_ignored(&source, row.test),
-            "`{}` in `{}` is `#[ignore]`d, so it cannot freeze `{}`",
+        assert_eq!(
+            is_ignored(&source, row.test),
+            gpu,
+            "`{}` in `{}` has the wrong execution layer for `{}`",
             row.test,
             row.file,
             row.behaviour
@@ -367,10 +385,14 @@ fn the_regression_suite_names_the_behaviours_it_freezes() {
     // 3. The log carries the table: a green run still says what it froze.
     println!(
         "[P6.01] the A-class regression suite ({} rows):",
-        A_CLASS.len()
+        A_CLASS.len() + GPU_A_CLASS.len()
     );
     for behaviour in BEHAVIOURS {
-        for row in A_CLASS.iter().filter(|row| row.behaviour == *behaviour) {
+        for row in A_CLASS
+            .iter()
+            .chain(GPU_A_CLASS)
+            .filter(|row| row.behaviour == *behaviour)
+        {
             println!("[P6.01]   {behaviour}: {}::{}", row.file, row.test);
         }
     }

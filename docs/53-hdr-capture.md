@@ -573,3 +573,20 @@ CaptureArtifactStore 校验 owned 目录、尺寸/编码、完整文件 hash 和
 日志为 `target/hdr-history-{red,png-red,db-final,new-tests,replay-tests,save-ui,workspace,headless,check,clippy-final,ui-final,integration}.log` 和 `hdr-history-app-clippy.jsonl`。依赖隔离沿用 §12.3 本机快照，未混入 Yue 并行虚拟列表重构；快照/临时脚本/测试产物不提交。F6 Release probe 的新增成功证据为 `target/hdr-f6-native-release.log`。
 
 尚未验证的真实 HDR/双屏/DPI、系统剪贴板接收方行为、设备恢复、RSS/VRAM/20 次替换/空闲重绘仍保持未验收；注册失败可能留下未注册母版（明确报错并保留源，暂不自动扫除）。生产 HDR 捕获门禁继续关闭。
+
+## 18. 扩展回归暴露的既有问题（2026-11-04）
+
+§17 的两处失败已继续处理，原失败日志保留：
+
+- 设置页不是测试窗口太小，而是生产内容根本没有滚动容器。新增原生 GPUI 纵向滚动区域；测试保持 640×480，先断言底部开关不可见，再发真实滚轮事件、断言可见、点击并核对磁盘设置。不扩大窗口掩盖缺陷。补测 red（缺失滚动区域）见 `hdr-settings-scroll-red.log`，最终 UI integration **10 passed**。
+- regression_baseline 的条目已落后源码：D2D 像素用例按 D-14 成为 opt-in，却仍列入普通测试；两条 hotkey 测试已被更完整的表驱动测试取代，清单仍指旧名。保留同一批行为和测试总条目，明确拆为 ordinary 与 GPU_A_CLASS，各自严格检查正确的 ignore 状态；hotkey 映射改为 `the_second_hotkey_is_registered_with_the_same_discipline`（实际断言 F5/F7/MOD_NOREPEAT）及 `each_conflict_message_names_its_own_key`（实际断言 conflict/failed 区分和每键文案），没有改生产热键或弱化现有断言。清单检查最终 **2 passed**。
+- 冻结 GPU 用例另在真实 D3D11/D2D 离屏路径实际执行 **1 passed**，验证选区内原像素、选区外遮罩、hover 不染色及整窗 fallback。不把 opt-in 或清单存在当成像素测试已运行。
+
+日志：`target/hdr-regression-{manifest-green,integration-final,gpu-explicit}.log`、`hdr-settings-scroll-{red,green}.log`。GPU 显式复现：
+
+```powershell
+cargo test -p snapclip-capture --lib windows::win::d2d::tests::an_element_preview_keeps_its_own_pixels_and_the_window_fallback_does_not --locked --offline --config target/hdr-isolated.toml -- --ignored --exact --nocapture --test-threads=1
+cargo test -p snapclip-app --test regression_baseline --test ui --features test-support --locked --offline --config target/hdr-isolated.toml -- --test-threads=1
+```
+
+本机隔离配置仅用于剥离 Yue 并行虚拟列表改动，仍非产品默认构建配置。上述修复不代替剩余 HDR 实机和资源性能验收。

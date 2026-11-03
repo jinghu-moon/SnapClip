@@ -226,9 +226,11 @@ impl Render for SettingsView {
         let theme = cx.theme();
         let (background, foreground, muted) =
             (theme.background, theme.foreground, theme.muted_foreground);
-        div()
+        let panel = div()
+            .id("settings-scroll")
             .v_flex()
             .size_full()
+            .overflow_y_scroll()
             .gap_4()
             .p_4()
             .bg(background)
@@ -293,7 +295,10 @@ impl Render for SettingsView {
                     .text_xs()
                     .text_color(muted)
                     .child(format!("设置文件：{}", self.store.path().display())),
-            )
+            );
+        #[cfg(feature = "test-support")]
+        let panel = panel.test_support();
+        panel
     }
 }
 

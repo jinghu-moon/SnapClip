@@ -487,6 +487,16 @@ fn the_unit_suffix_switch_writes_to_disk(cx: &mut TestAppContext) {
         window.render_frame(cx);
         assert!(view.read(cx).settings().show_unit, "the default is on");
 
+        assert!(!window.find("label-unit-suffix").visible());
+        window.scroll(
+            "settings-scroll",
+            gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-600.))),
+            cx,
+        );
+        assert!(
+            window.find("label-unit-suffix").visible(),
+            "the lower setting must be reachable in a compact window"
+        );
         window.click("label-unit-suffix", cx);
 
         assert!(!view.read(cx).settings().show_unit);
